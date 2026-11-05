@@ -1,0 +1,253 @@
+// version: the version type and its parsers.
+//
+// semver_parse follows the grammar of Semantic Versioning 2.0.0 exactly
+// (https://semver.org/spec/v2.0.0.html). semver_parse_loose accepts what
+// node-semver accepts with { loose: true }, and semver_coerce finds a version
+// inside any text the way node-semver's coerce does.
+//
+// A parsed version keeps views into the text it came from (pre and build),
+// so that text must stay alive while the version is used.
+
+import "std/core";
+import "std/conv";
+
+export struct SemverVersion {
+  major: uint64;
+  minor: uint64;
+  patch: uint64;
+  pre: string;   // pre-release identifiers without the leading '-', or ""
+  build: string; // build metadata without the leading '+', or ""
+}
+
+// Why a parse failed: the byte offset where it went wrong and a short message.
+export struct SemverError {
+  at: int64;
+  why: string;
+}
+
+const SVV_MAX: uint64 = 18446744073709551615;
+
+export fn semver_err<T>(at: int64, why: string) -> Result<T, SemverError> {
+  var e: SemverError = { at: at, why: why };
+  return Err(e);
+}
+
+export fn semver_is_digit(c: char) -> bool {
+  return c >= '0' && c <= '9';
+}
+
+// The characters an identifier may hold: [0-9A-Za-z-].
+export fn semver_is_ident_char(c: char) -> bool {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-';
+}
+
+export fn semver_is_space(c: char) -> bool {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == (char)11 || c == (char)12;
+}
+
+// Reads digits at *pos into *out. Returns "" on success or the reason it
+// failed. With strict set, a number may not start with 0 unless it is 0.
+export fn semver_read_num(s: string, pos: int64*, strict: bool, out: uint64*) -> string {
+  var n: int64 = (int64)s.length;
+  var i: int64 = *pos;
+  var start: int64 = i;
+  var v: uint64 = 0;
+  while (i < n && semver_is_digit(s[i])) {
+    var d: uint64 = (uint64)((int32)s[i] - 48);
+    if (v > (SVV_MAX - d) / 10) { return "number too large"; }
+    v = v * 10 + d;
+    i = i + 1;
+  }
+  if (i == start) { return "expected a number"; }
+  if (strict && i - start > 1 && s[start] == '0') { return "leading zero"; }
+  *pos = i;
+  *out = v;
+  return "";
+}
+
+// Reads dot-separated identifiers starting at *pos and stops at the first
+// character that cannot be part of one. Returns "" on success. numeric_rule
+// rejects leading zeros in all-digit identifiers (pre-release, not build).
+export fn semver_read_idents(s: string, pos: int64*, numeric_rule: bool) -> string {
+  var n: int64 = (int64)s.length;
+  var i: int64 = *pos;
+  while (true) {
+    var start: int64 = i;
+    var digits: bool = true;
+    while (i < n && semver_is_ident_char(s[i])) {
+      if (!semver_is_digit(s[i])) { digits = false; }
+      i = i + 1;
+    }
+    if (i == start) { *pos = i; return "empty identifier"; }
+    if (numeric_rule && digits && i - start > 1 && s[start] == '0') {
+      *pos = start;
+      return "leading zero";
+    }
+    if (i < n && s[i] == '.') {
+      i = i + 1;
+    } else {
+      break;
+    }
+  }
+  *pos = i;
+  return "";
+}
+
+// Parses the pre-release and build parts that may follow a version's patch
+// number, starting at *pos.
+export fn semver_read_tail(s: string, pos: int64*, v: SemverVersion*) -> string {
+  var n: int64 = (int64)s.length;
+  var i: int64 = *pos;
+  if (i < n && s[i] == '-') {
+    i = i + 1;
+    var ps: int64 = i;
+    var why: string = semver_read_idents(s, &i, true);
+    if (why.length > 0) { *pos = i; return why; }
+    v->pre = str_slice(s, ps, i - ps);
+  }
+  if (i < n && s[i] == '+') {
+    i = i + 1;
+    var bs: int64 = i;
+    var why2: string = semver_read_idents(s, &i, false);
+    if (why2.length > 0) { *pos = i; return why2; }
+    v->build = str_slice(s, bs, i - bs);
+  }
+  *pos = i;
+  return "";
+}
+
+fn svv_zero() -> SemverVersion {
+  var v: SemverVersion = { major: 0, minor: 0, patch: 0, pre: "", build: "" };
+  return v;
+}
+
+// A version built from its three numbers.
+export fn semver_new(major: uint64, minor: uint64, patch: uint64) -> SemverVersion {
+  var v: SemverVersion = { major: major, minor: minor, patch: patch, pre: "", build: "" };
+  return v;
+}
+
+// Parses MAJOR.MINOR.PATCH[-PRE][+BUILD] exactly as SemVer 2.0.0 defines it.
+// Nothing else is allowed: no leading "v", no spaces, no leading zeros.
+export fn semver_parse(s: string) -> Result<SemverVersion, SemverError> {
+  var v: SemverVersion = svv_zero();
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var why: string = semver_read_num(s, &i, true, &v.major);
+  if (why.length > 0) { return semver_err<SemverVersion>(i, why); }
+  if (i >= n || s[i] != '.') { return semver_err<SemverVersion>(i, "expected '.'"); }
+  i = i + 1;
+  why = semver_read_num(s, &i, true, &v.minor);
+  if (why.length > 0) { return semver_err<SemverVersion>(i, why); }
+  if (i >= n || s[i] != '.') { return semver_err<SemverVersion>(i, "expected '.'"); }
+  i = i + 1;
+  why = semver_read_num(s, &i, true, &v.patch);
+  if (why.length > 0) { return semver_err<SemverVersion>(i, why); }
+  why = semver_read_tail(s, &i, &v);
+  if (why.length > 0) { return semver_err<SemverVersion>(i, why); }
+  if (i != n) { return semver_err<SemverVersion>(i, "unexpected character"); }
+  return Ok(v);
+}
+
+// True when s is a valid SemVer 2.0.0 version.
+export fn semver_valid(s: string) -> bool {
+  match (semver_parse(s)) {
+    case Ok(v): { return true; }
+    case Err(e): { return false; }
+  }
+}
+
+// Parses the way node-semver does with { loose: true }: spaces around the
+// version, any run of "v" and "=" before it, leading zeros in numbers, and a
+// pre-release with or without its '-' ("1.2.3beta").
+export fn semver_parse_loose(text: string) -> Result<SemverVersion, SemverError> {
+  var s: string = str_trim(text);
+  var off: int64 = (int64)(s.chars - text.chars);
+  var v: SemverVersion = svv_zero();
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n && (s[i] == 'v' || s[i] == '=' || semver_is_space(s[i]))) { i = i + 1; }
+  var why: string = semver_read_num(s, &i, false, &v.major);
+  if (why.length > 0) { return semver_err<SemverVersion>(off + i, why); }
+  if (i >= n || s[i] != '.') { return semver_err<SemverVersion>(off + i, "expected '.'"); }
+  i = i + 1;
+  why = semver_read_num(s, &i, false, &v.minor);
+  if (why.length > 0) { return semver_err<SemverVersion>(off + i, why); }
+  if (i >= n || s[i] != '.') { return semver_err<SemverVersion>(off + i, "expected '.'"); }
+  i = i + 1;
+  why = semver_read_num(s, &i, false, &v.patch);
+  if (why.length > 0) { return semver_err<SemverVersion>(off + i, why); }
+  // A pre-release may follow with or without '-'. Each identifier is either
+  // all digits or holds at least one letter or '-'.
+  var dash: bool = i < n && s[i] == '-';
+  if (dash || (i < n && semver_is_ident_char(s[i]))) {
+    // The '-' is optional, so "1.2.3-" has the pre-release "-".
+    if (dash && i + 1 < n && semver_is_ident_char(s[i + 1])) { i = i + 1; }
+    var ps: int64 = i;
+    why = semver_read_idents(s, &i, false);
+    if (why.length > 0) { return semver_err<SemverVersion>(off + i, why); }
+    v.pre = str_slice(s, ps, i - ps);
+  }
+  if (i < n && s[i] == '+') {
+    i = i + 1;
+    var bs: int64 = i;
+    why = semver_read_idents(s, &i, false);
+    if (why.length > 0) { return semver_err<SemverVersion>(off + i, why); }
+    v.build = str_slice(s, bs, i - bs);
+  }
+  if (i != n) { return semver_err<SemverVersion>(off + i, "unexpected character"); }
+  return Ok(v);
+}
+
+// Finds the first version-like run in any text, the way node-semver's coerce
+// does: up to three dot-separated numbers of at most 16 digits each, not
+// glued to other digits. Missing parts are 0. Pre-release and build are
+// dropped. "v2" gives 2.0.0, "release 1.2.3.4" gives 1.2.3, and "1.02"
+// gives nothing.
+export fn semver_coerce(s: string) -> Option<SemverVersion> {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    if (semver_is_digit(s[i]) && (i == 0 || !semver_is_digit(s[i - 1]))) {
+      var nums: uint64[3];
+      var count: int32 = 0;
+      var j: int64 = i;
+      var ok: bool = true;
+      var zero: bool = false;
+      while (count < 3) {
+        var st: int64 = j;
+        var val: uint64 = 0;
+        while (j < n && semver_is_digit(s[j]) && j - st < 16) {
+          val = val * 10 + (uint64)((int32)s[j] - 48);
+          j = j + 1;
+        }
+        if (j < n && semver_is_digit(s[j])) {
+          // More than 16 digits.
+          if (count == 0) { ok = false; }
+          j = st;
+          break;
+        }
+        if (j - st > 1 && s[st] == '0') { zero = true; }
+        nums[count] = val;
+        count = count + 1;
+        if (count < 3 && j + 1 < n && s[j] == '.' && semver_is_digit(s[j + 1])) {
+          j = j + 1;
+        } else {
+          break;
+        }
+      }
+      // node-semver re-parses what it found strictly, so a number with a
+      // leading zero gives no version at all.
+      if (ok && zero) { return None; }
+      if (ok && count > 0) {
+        var v: SemverVersion = svv_zero();
+        v.major = nums[0];
+        if (count > 1) { v.minor = nums[1]; }
+        if (count > 2) { v.patch = nums[2]; }
+        return Some(v);
+      }
+    }
+    i = i + 1;
+  }
+  return None;
+}

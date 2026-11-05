@@ -1,0 +1,15 @@
+//! MistPlot umbrella: one import for applications. It has no exports of its own, so it
+//! re-exports everything below: the chart object and its setters, frames and picking, the
+//! SVG, HTML, terminal and file renderers, and mp_chart_share.
+
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/chart/series";
+import "mistplot/chart/frame";
+import "mistplot/chart/pick";
+import "mistplot/render/svg";
+import "mistplot/render/html";
+import "mistplot/render/term";
+import "mistplot/render/file";
+import "mistplot/sync/share";

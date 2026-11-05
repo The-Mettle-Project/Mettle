@@ -1,0 +1,55 @@
+// EtchAnim: the frames of an animated image (APNG or GIF). Every frame is a
+// whole canvas-sized picture, already composed, ready to show as is.
+//
+//   var a: EtchAnim;
+//   etch_gif_decode_anim(p, n, &a, (EtchOpts*)0);
+//   for i in 0..a.count { show(&a.frames[i].img); wait(a.frames[i].delay_ms); }
+//   etch_anim_free(&a);
+
+import "std/mem";
+import "status";
+import "image";
+
+export struct EtchFrame {
+  img: EtchImage;
+  delay_ms: int32;    // how long to show this frame
+}
+
+export struct EtchAnim {
+  frames: EtchFrame*;
+  count: int32;
+  cap: int32;
+  width: int32;
+  height: int32;
+  loops: int32;       // times to play; 0 means forever
+}
+
+/// Adds a frame, taking ownership of img.
+export fn etch_anim_push(a: EtchAnim*, img: EtchImage*, delay_ms: int32) -> int32 {
+  if (a->count >= a->cap) {
+    var nc: int32 = a->cap * 2;
+    if (nc < 8) { nc = 8; }
+    var nf: EtchFrame* = (EtchFrame*)malloc((int64)nc * sizeof(EtchFrame));
+    if (nf == 0) { return ETCH_E_MEM; }
+    if (a->frames != 0) {
+      memcpy(nf, a->frames, (int64)a->count * sizeof(EtchFrame));
+      free(a->frames);
+    }
+    a->frames = nf;
+    a->cap = nc;
+  }
+  a->frames[a->count].img = *img;
+  a->frames[a->count].delay_ms = delay_ms;
+  a->count = a->count + 1;
+  return ETCH_OK;
+}
+
+/// Frees every frame and empties the animation.
+export fn etch_anim_free(a: EtchAnim*) {
+  if (a == 0) { return; }
+  for i in 0..a->count { etch_image_free(&a->frames[i].img); }
+  if (a->frames != 0) { free(a->frames); }
+  a->frames = (EtchFrame*)0;
+  a->count = 0;
+  a->cap = 0;
+}

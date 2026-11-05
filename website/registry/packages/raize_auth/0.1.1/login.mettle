@@ -1,0 +1,153 @@
+// raize_auth/login: password sign-in with lockout, and setting a password.
+// Framework-agnostic: it returns the user id; the caller starts the session
+// (raize: rz_session_login; plain: ses_create).
+//
+// Lockout is per login: after `lock_max` wrong passwords within `lock_window`
+// seconds, that login is refused for `lock_for` seconds without checking the
+// password. This stops guessing against one account, at the cost that anyone
+// can lock an account for a while; keep lock_for short (default 15 min).
+//
+// Unknown logins and disabled accounts take the same time as a wrong password
+// and get the same RA_E_DENIED, so sign-in does not reveal which logins exist.
+
+import "std/mem";
+import "cryptex/cryptex";
+import "status";
+import "password";
+import "store";
+import "config";
+
+/// Longest login ra_login accepts, in bytes.
+export const RA_LOGIN_MAX: int64 = 256;
+
+// The lockout counter key for a login: SHA-256("ra.login" 0x00 login).
+fn ra__lock_key(out: CrSha256*, login: string) -> int32 {
+  var buf: uint8[265];
+  memcpy(&buf[0], "ra.login".chars, 8);
+  buf[8] = (uint8)0;
+  if (login.length > 0) { memcpy(&buf[9], login.chars, (int64)login.length); }
+  if (cr_sha256(out, &buf[0], 9 + (int64)login.length) != CR_OK) { return RA_E_CRYPTO; }
+  return RA_OK;
+}
+
+// Records one wrong password for a login. Returns RA_OK or a store error.
+fn ra__lock_fail(a: RaAuth*, key: CrSha256*, now: int64) -> int32 {
+  var c: RaCounter;
+  var rc: int32 = ra_store_ctr_get(a->stores.counters, &key->b[0], &c);
+  if (rc == RA_E_NOT_FOUND || (rc == RA_OK && now - c.window_start >= a->cfg.lock_window)) {
+    memset((rawptr)&c, 0, sizeof(RaCounter));
+    memcpy(&c.key[0], &key->b[0], 32);
+    c.window_start = now;
+  } else if (rc != RA_OK) {
+    return rc;
+  }
+  c.failures = c.failures + 1;
+  if (c.failures >= a->cfg.lock_max) {
+    c.locked_until = now + a->cfg.lock_for;
+    c.failures = 0;
+    c.window_start = now;
+  }
+  return ra_store_ctr_put(a->stores.counters, &c);
+}
+
+/// Signs a user in with a login and password.
+///
+/// in:      a        an initialised handle
+///          login    the normalised login (the same form the store looks up),
+///                   1..RA_LOGIN_MAX bytes
+///          pw       the password as typed
+///          now      the current time, unix seconds
+///          owner    receives the user id on success, 0 otherwise
+/// returns: RA_OK (signed in; start a session for *owner);
+///          RA_E_DENIED (wrong password, unknown login or disabled account);
+///          RA_E_LOCKED (too many recent failures; the password was not checked);
+///          RA_E_USAGE (null argument, empty or too-long login);
+///          RA_E_CRYPTO, or the store's error (fails closed)
+/// owns:    writes *owner. On success it clears the login's counter and, when
+///          the stored hash is weaker than cfg.pw_preset, stores a new hash
+///          (a failed rehash does not fail the sign-in)
+/// thread:  as RaAuth
+/// example:
+///   var uid: int64 = 0;
+///   var rc: int32 = ra_login(&a, email, pw, now, &uid);
+///   if (rc == RA_OK) { rz_session_login(ctx, "{uid}"); }
+export fn ra_login(a: RaAuth*, login: string, pw: string, now: int64, owner: int64*) -> int32 {
+  if (owner != 0) { *owner = 0; }
+  if (a == 0 || owner == 0 || a->stores.creds == 0) { return RA_E_USAGE; }
+  if (login.length == 0 || (int64)login.length > RA_LOGIN_MAX) { return RA_E_USAGE; }
+
+  var key: CrSha256;
+  var rc: int32 = ra__lock_key(&key, login);
+  if (rc != RA_OK) { return rc; }
+  var ctr: RaCounter;
+  rc = ra_store_ctr_get(a->stores.counters, &key.b[0], &ctr);
+  if (rc == RA_OK && ctr.locked_until > now) { return RA_E_LOCKED; }
+  if (rc != RA_OK && rc != RA_E_NOT_FOUND) { return rc; }
+
+  var cred: RaCredential;
+  rc = ra_store_cred_get(a->stores.creds, login, &cred);
+  if (rc != RA_OK && rc != RA_E_NOT_FOUND) { return rc; }
+  var known: bool = rc == RA_OK;
+  var ok: bool = false;
+  if (known) {
+    ok = ra_password_verify(&cred.hash, pw);
+  } else {
+    ra_password_verify(&a->dummy, pw);   // same work as a real check
+  }
+  if (!ok || cred.disabled != 0) {
+    if (!ok) {
+      rc = ra__lock_fail(a, &key, now);
+      if (rc != RA_OK) { return rc; }
+    }
+    return RA_E_DENIED;
+  }
+
+  rc = ra_store_ctr_del(a->stores.counters, &key.b[0]);
+  if (rc != RA_OK && rc != RA_E_NOT_FOUND) { return rc; }
+  if (ra_password_needs_rehash(&cred.hash, a->cfg.pw_preset)) {
+    var h: CrPwHash;
+    if (ra_password_hash(&h, pw, a->cfg.pw_preset) == RA_OK) {
+      ra_store_cred_set_hash(a->stores.creds, cred.owner, &h);
+    }
+  }
+  *owner = cred.owner;
+  return RA_OK;
+}
+
+/// Sets a user's password (sign-up, change, or reset): checks the policy,
+/// hashes at cfg.pw_preset and stores the hash.
+///
+/// in:      a        an initialised handle; owner the user id; pw the new password
+/// returns: RA_OK; RA_E_INVALID (pw fails ra_password_ok); RA_E_NOT_FOUND (no
+///          such user); RA_E_USAGE; RA_E_CRYPTO; or the store's error
+/// owns:    nothing kept; the caller wipes pw when done
+/// thread:  as RaAuth
+/// example:
+///   if (ra_set_password(&a, uid, pw) != RA_OK) { return 1; }
+export fn ra_set_password(a: RaAuth*, owner: int64, pw: string) -> int32 {
+  if (a == 0 || a->stores.creds == 0) { return RA_E_USAGE; }
+  var h: CrPwHash;
+  var rc: int32 = ra_password_hash(&h, pw, a->cfg.pw_preset);
+  if (rc != RA_OK) { return rc; }
+  return ra_store_cred_set_hash(a->stores.creds, owner, &h);
+}
+
+/// Clears a login's lockout (an admin unlock, or after a password reset).
+///
+/// in:      a        an initialised handle; login the normalised login
+/// returns: RA_OK (cleared, or there was nothing to clear); RA_E_USAGE;
+///          RA_E_CRYPTO; or the store's error
+/// owns:    nothing
+/// thread:  as RaAuth
+/// example:
+///   ra_lockout_clear(&a, email);
+export fn ra_lockout_clear(a: RaAuth*, login: string) -> int32 {
+  if (a == 0 || a->stores.creds == 0) { return RA_E_USAGE; }
+  if (login.length == 0 || (int64)login.length > RA_LOGIN_MAX) { return RA_E_USAGE; }
+  var key: CrSha256;
+  var rc: int32 = ra__lock_key(&key, login);
+  if (rc != RA_OK) { return rc; }
+  rc = ra_store_ctr_del(a->stores.counters, &key.b[0]);
+  if (rc == RA_E_NOT_FOUND) { return RA_OK; }
+  return rc;
+}

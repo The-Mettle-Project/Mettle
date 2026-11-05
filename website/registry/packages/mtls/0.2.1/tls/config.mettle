@@ -1,0 +1,227 @@
+// MtlsConfig: what a connection may negotiate and who it trusts. One
+// config can be shared by many connections as long as nobody changes it
+// while they run.
+
+import "std/mem";
+import "cryptex/core/util";
+import "mtls/core/err";
+import "mtls/crypto/sig";
+import "mtls/crypto/kx";
+import "mtls/crypto/aead";
+import "mtls/tls/consts";
+import "mtls/x509/verify";
+import "mtls/x509/key";
+import "mtls/x509/rootfile";
+
+// How the peer's certificate is checked.
+export const MTLS_VERIFY_FULL: int32 = 0;  // chain to a trusted root, plus host name for clients
+export const MTLS_VERIFY_PIN: int32 = 1;   // the leaf's public key must match cfg.pin (SHA-256 of its SubjectPublicKeyInfo)
+export const MTLS_VERIFY_NONE: int32 = 2;  // no checks at all: for tests only, never in production
+
+// Whether a server asks clients for certificates (mutual TLS).
+export const MTLS_CLIENT_AUTH_NONE: int32 = 0;
+export const MTLS_CLIENT_AUTH_REQUEST: int32 = 1;  // ask, accept none
+export const MTLS_CLIENT_AUTH_REQUIRE: int32 = 2;  // ask, fail without one
+
+export const MTLS_MAX_CHAIN: int32 = 8;
+export const MTLS_MAX_ALPN: int32 = 8;
+
+export struct MtlsDer {
+  p: uint8*;
+  n: int64;
+}
+
+export struct MtlsConfig {
+  min_version: int32;
+  max_version: int32;
+  suites: int32[16];
+  nsuites: int32;
+  groups: int32[4];
+  ngroups: int32;
+  sigs: int32[16];
+  nsigs: int32;
+  alpn: string[8];
+  nalpn: int32;
+  // Trust: clients check servers against roots, servers check client
+  // certificates against roots. Not owned by the config.
+  roots: MtlsRoots*;
+  verify_mode: int32;
+  pin: uint8[32];
+  // Our own certificate chain (leaf first, DER) and its key.
+  chain: MtlsDer[8];
+  nchain: int32;
+  key: MtlsPrivKey;
+  has_key: bool;
+  owned_chain: MtlsCertList;   // set by the _pem and _files loaders
+  client_auth: int32;
+  // Resumption. Servers seal tickets with ticket_key; clients keep
+  // sessions in cache (an MtlsSessionCache*, 0 for none).
+  tickets: bool;
+  ticket_key: uint8[32];
+  ticket_lifetime: int32;
+  cache: rawptr;
+  // TLS 1.2 without the extended master secret is open to the triple
+  // handshake attack; refuse it unless this is set.
+  allow_no_ems: bool;
+  // Fixed clock for tests (unix seconds); 0 uses the real clock.
+  now: int64;
+}
+
+/// mtls_config_init: safe defaults: TLS 1.2 and 1.3, every suite this
+/// build supports, X25519, full certificate checks, tickets on.
+export fn mtls_config_init(cfg: MtlsConfig*) {
+  memset(cfg, 0, (int64)sizeof(MtlsConfig));
+  cfg->min_version = MTLS_TLS12;
+  cfg->max_version = MTLS_TLS13;
+  var all: int32[9] = [0x1301, 0x1302, 0x1303, 0xc02b, 0xc02c, 0xcca9, 0xc02f, 0xc030, 0xcca8];
+  var s: MtlsSuite;
+  for i in 0..9 {
+    if (mtls_suite_get(all[i], &s) && mtls_aead_supported(s.aead)) {
+      cfg->suites[cfg->nsuites] = all[i];
+      cfg->nsuites = cfg->nsuites + 1;
+    }
+  }
+  var groups: int32[3] = [MTLS_GROUP_X25519, MTLS_GROUP_SECP256R1, MTLS_GROUP_SECP384R1];
+  for i in 0..3 {
+    if (mtls_kx_supported(groups[i])) {
+      cfg->groups[cfg->ngroups] = groups[i];
+      cfg->ngroups = cfg->ngroups + 1;
+    }
+  }
+  var sigs: int32[9] = [MTLS_SIG_ED25519, MTLS_SIG_ECDSA_P256_SHA256, MTLS_SIG_ECDSA_P384_SHA384,
+    MTLS_SIG_RSA_PSS_RSAE_SHA256, MTLS_SIG_RSA_PSS_RSAE_SHA384, MTLS_SIG_RSA_PSS_RSAE_SHA512,
+    MTLS_SIG_RSA_PKCS1_SHA256, MTLS_SIG_RSA_PKCS1_SHA384, MTLS_SIG_RSA_PKCS1_SHA512];
+  for i in 0..9 {
+    if (mtls_scheme_supported(sigs[i])) {
+      cfg->sigs[cfg->nsigs] = sigs[i];
+      cfg->nsigs = cfg->nsigs + 1;
+    }
+  }
+  cfg->verify_mode = MTLS_VERIFY_FULL;
+  cfg->tickets = true;
+  cfg->ticket_lifetime = 86400;
+  // A fresh ticket key per config: tickets survive across connections that
+  // share the config, not across restarts. Set ticket_key to share them
+  // between processes.
+  if (cr_random_bytes(&cfg->ticket_key[0], 32) != 0) { cfg->tickets = false; }
+}
+
+/// mtls_config_add_alpn: offers (client) or accepts (server) a protocol
+/// such as "h2" or "http/1.1", in order of preference.
+export fn mtls_config_add_alpn(cfg: MtlsConfig*, proto: string) -> int32 {
+  if (proto.length == 0 || proto.length > 255) { return MTLS_E_ARG; }
+  if (cfg->nalpn >= MTLS_MAX_ALPN) { return MTLS_E_SPACE; }
+  cfg->alpn[cfg->nalpn] = proto;
+  cfg->nalpn = cfg->nalpn + 1;
+  return MTLS_OK;
+}
+
+/// mtls_config_set_suites: restricts the cipher suites, in order of
+/// preference. Unknown or unsupported ids are skipped.
+export fn mtls_config_set_suites(cfg: MtlsConfig*, ids: int32*, n: int32) -> int32 {
+  cfg->nsuites = 0;
+  var s: MtlsSuite;
+  for i in 0..n {
+    if (cfg->nsuites < 16 && mtls_suite_get(ids[i], &s) && mtls_aead_supported(s.aead)) {
+      cfg->suites[cfg->nsuites] = ids[i];
+      cfg->nsuites = cfg->nsuites + 1;
+    }
+  }
+  if (cfg->nsuites == 0) { return MTLS_E_UNSUPPORTED; }
+  return MTLS_OK;
+}
+
+/// mtls_config_set_cert: our certificate chain (leaf first, DER; the
+/// bytes must outlive the config) and private key. The key moves into the
+/// config: mtls_config_free wipes it, so do not free it yourself.
+export fn mtls_config_set_cert(cfg: MtlsConfig*, chain: MtlsDer*, n: int32, key: MtlsPrivKey*) -> int32 {
+  if (n < 1 || n > MTLS_MAX_CHAIN) { return MTLS_E_ARG; }
+  for i in 0..n { cfg->chain[i] = chain[i]; }
+  cfg->nchain = n;
+  cfg->key = *key;
+  cfg->has_key = true;
+  return MTLS_OK;
+}
+
+export fn mtls_config_has_suite(cfg: MtlsConfig*, id: int32) -> bool {
+  for i in 0..cfg->nsuites {
+    if (cfg->suites[i] == id) { return true; }
+  }
+  return false;
+}
+
+export fn mtls_config_has_group(cfg: MtlsConfig*, g: int32) -> bool {
+  for i in 0..cfg->ngroups {
+    if (cfg->groups[i] == g) { return true; }
+  }
+  return false;
+}
+
+export fn mtls_config_has_sig(cfg: MtlsConfig*, s: int32) -> bool {
+  for i in 0..cfg->nsigs {
+    if (cfg->sigs[i] == s) { return true; }
+  }
+  return false;
+}
+
+/// mtls_config_set_cert_pem: our certificate chain from PEM text (leaf
+/// first, as servers send it) and the private key from PEM text (PKCS#8,
+/// SEC 1 or PKCS#1). The config keeps copies; free with mtls_config_free.
+export fn mtls_config_set_cert_pem(cfg: MtlsConfig*, chain: uint8*, n: int64, key: uint8*, kn: int64) -> int32 {
+  var k: MtlsPrivKey;
+  var rc: int32 = mtls_key_load(key, kn, &k);
+  if (rc != MTLS_OK) { return rc; }
+  var l: MtlsCertList;
+  var cnt: int32 = mtls_certlist_from_pem(&l, chain, n);
+  if (cnt <= 0) {
+    mtls_privkey_free(&k);
+    return MTLS_E_DECODE;
+  }
+  if (cnt > MTLS_MAX_CHAIN) {
+    mtls_certlist_free(&l);
+    mtls_privkey_free(&k);
+    return MTLS_E_SPACE;
+  }
+  mtls_config_free(cfg);
+  cfg->owned_chain = l;
+  for i in 0..cnt {
+    cfg->chain[i].p = l.refs[i].p;
+    cfg->chain[i].n = l.refs[i].n;
+  }
+  cfg->nchain = cnt;
+  cfg->key = k;
+  cfg->has_key = true;
+  return MTLS_OK;
+}
+
+/// mtls_config_load_cert_files: mtls_config_set_cert_pem from two files.
+export fn mtls_config_load_cert_files(cfg: MtlsConfig*, chain_path: string, key_path: string) -> int32 {
+  var cp: uint8* = (uint8*)0;
+  var cn: int64 = 0;
+  var rc: int32 = mtls_file_read(chain_path, &cp, &cn);
+  if (rc != MTLS_OK) { return rc; }
+  var kp: uint8* = (uint8*)0;
+  var kn: int64 = 0;
+  rc = mtls_file_read(key_path, &kp, &kn);
+  if (rc != MTLS_OK) {
+    free(cp);
+    return rc;
+  }
+  rc = mtls_config_set_cert_pem(cfg, cp, cn, kp, kn);
+  free(cp);
+  cr_wipe(kp, kn);
+  free(kp);
+  return rc;
+}
+
+/// mtls_config_free: releases what the loaders allocated and wipes the key.
+/// The config can be loaded again afterwards.
+export fn mtls_config_free(cfg: MtlsConfig*) {
+  if (cfg->owned_chain.count > 0 || cfg->owned_chain.buf != 0) {
+    mtls_certlist_free(&cfg->owned_chain);
+    memset(&cfg->owned_chain, 0, (int64)sizeof(MtlsCertList));
+  }
+  if (cfg->has_key) { mtls_privkey_free(&cfg->key); }
+  cfg->has_key = false;
+  cfg->nchain = 0;
+}

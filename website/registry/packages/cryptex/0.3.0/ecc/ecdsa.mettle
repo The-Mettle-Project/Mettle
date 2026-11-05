@@ -1,0 +1,873 @@
+// ECDSA on NIST P-256 (secp256r1) and P-384 (secp384r1), in pure Mettle:
+// deterministic signatures (RFC 6979) with constant-time signing, and strict
+// verification.
+// Standards: FIPS 186-5 (ECDSA), SEC 1 v2, RFC 6979 (the nonce), RFC 3279
+// (the DER signature, SEQUENCE { INTEGER r, INTEGER s }).
+//
+// Ported from BearSSL (ecdsa_i31_sign_raw.c, ecdsa_i31_vrfy_raw.c,
+// ecdsa_i31_bits.c, ecdsa_rta.c, ecdsa_atr.c, hmac_drbg.c), Copyright (c) 2016
+// Thomas Pornin, MIT license; see NOTICE.
+//
+// A signature is DER: at most 72 bytes (CR_P256_ECDSA_SIG_MAX) on P-256 and
+// 104 bytes (CR_P384_ECDSA_SIG_MAX) on P-384. The message
+// is hashed inside, with SHA-256, SHA-384 or SHA-512 (CR_HASH_*); the same
+// hash drives the RFC 6979 nonce, so the same message, key and hash always
+// give the same signature. A public key is the uncompressed point 0x04 || X
+// || Y (65 bytes on P-256, 97 on P-384).
+
+import "cryptex/core/status";
+import "cryptex/core/types";
+import "cryptex/core/util";
+import "cryptex/ecc/i31";
+import "cryptex/ecc/p256";
+import "cryptex/ecc/p384";
+import "cryptex/hash/hash";
+import "cryptex/mac/mac";
+
+/// Largest DER signature cr_p256_ecdsa_sign can write: 72 bytes (a SEQUENCE
+/// of two INTEGERs of up to 33 bytes each).
+/// in: -
+/// returns: 72
+/// owns: nothing
+/// thread: constant
+/// example: var sig: uint8[72]; var sl: int64; cr_p256_ecdsa_sign(&sig[0], CR_P256_ECDSA_SIG_MAX, &sl, m, n, CR_HASH_SHA256, &sk);
+export const CR_P256_ECDSA_SIG_MAX: int64 = 72;
+
+/// Largest DER signature cr_p384_ecdsa_sign can write: 104 bytes (a SEQUENCE
+/// of two INTEGERs of up to 49 bytes each).
+/// in: -
+/// returns: 104
+/// owns: nothing
+/// thread: constant
+/// example: var sig: uint8[104]; var sl: int64; cr_p384_ecdsa_sign(&sig[0], CR_P384_ECDSA_SIG_MAX, &sl, m, n, CR_HASH_SHA384, &sk);
+export const CR_P384_ECDSA_SIG_MAX: int64 = 104;
+
+// Words of a 256-bit i31 integer: the header and nine data words; twelve
+// leaves slack and keeps the count even.
+const CRX_ECDSA_I31_LEN: int64 = 12;
+
+// ---------------------------------------------------------------------------
+// HMAC_DRBG (NIST SP 800-90A), as BearSSL's hmac_drbg.c, over cryptex HMAC
+// chosen by hash id.
+
+struct CrxDrbg {
+  k: uint8[64];
+  v: uint8[64];
+  hlen: int64;
+  id: int32;
+}
+
+// out = HMAC(key, a || b || c) for the hash id; each part may be empty
+// (length 0). out has room for the digest (hlen bytes).
+fn crx_drbg_hmac(out: uint8*, id: int32, key: uint8*, klen: int64, a: uint8*, alen: int64, b: uint8*, blen: int64, c: uint8*, clen: int64) {
+  if (id == CR_HASH_SHA256) {
+    var st: CrHmacSha256State;
+    var t: CrHmacSha256;
+    cr_hmac_sha256_init(&st, key, klen);
+    if (alen > 0) { cr_hmac_sha256_update(&st, a, alen); }
+    if (blen > 0) { cr_hmac_sha256_update(&st, b, blen); }
+    if (clen > 0) { cr_hmac_sha256_update(&st, c, clen); }
+    cr_hmac_sha256_final(&st, &t);
+    for i in 0..32 { out[i] = t.b[i]; }
+    cr_wipe(&t.b[0], 32);
+    cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+    return;
+  }
+  if (id == CR_HASH_SHA384) {
+    var st: CrHmacSha384State;
+    var t: CrHmacSha384;
+    cr_hmac_sha384_init(&st, key, klen);
+    if (alen > 0) { cr_hmac_sha384_update(&st, a, alen); }
+    if (blen > 0) { cr_hmac_sha384_update(&st, b, blen); }
+    if (clen > 0) { cr_hmac_sha384_update(&st, c, clen); }
+    cr_hmac_sha384_final(&st, &t);
+    for i in 0..48 { out[i] = t.b[i]; }
+    cr_wipe(&t.b[0], 48);
+    cr_wipe(cr_hmac_sha384_state_bytes(&st), 512);
+    return;
+  }
+  var st: CrHmacSha512State;
+  var t: CrHmacSha512;
+  cr_hmac_sha512_init(&st, key, klen);
+  if (alen > 0) { cr_hmac_sha512_update(&st, a, alen); }
+  if (blen > 0) { cr_hmac_sha512_update(&st, b, blen); }
+  if (clen > 0) { cr_hmac_sha512_update(&st, c, clen); }
+  cr_hmac_sha512_final(&st, &t);
+  for i in 0..64 { out[i] = t.b[i]; }
+  cr_wipe(&t.b[0], 64);
+  cr_wipe(cr_hmac_sha512_state_bytes(&st), 512);
+}
+
+// HMAC_DRBG update with a seed (len may be 0): K = HMAC(K, V || 0x00 ||
+// seed); V = HMAC(K, V); and, for a non-empty seed, K = HMAC(K, V || 0x01 ||
+// seed); V = HMAC(K, V).
+fn crx_drbg_update(d: CrxDrbg*, seed: uint8*, len: int64) {
+  var x: uint8[1];
+  var t: uint8[64];
+  x[0] = 0x00;
+  crx_drbg_hmac(&t[0], d->id, &d->k[0], d->hlen, &d->v[0], d->hlen, &x[0], 1, seed, len);
+  for i in 0..64 { d->k[i] = t[i]; }
+  crx_drbg_hmac(&t[0], d->id, &d->k[0], d->hlen, &d->v[0], d->hlen, 0, 0, 0, 0);
+  for i in 0..64 { d->v[i] = t[i]; }
+  if (len > 0) {
+    x[0] = 0x01;
+    crx_drbg_hmac(&t[0], d->id, &d->k[0], d->hlen, &d->v[0], d->hlen, &x[0], 1, seed, len);
+    for i in 0..64 { d->k[i] = t[i]; }
+    crx_drbg_hmac(&t[0], d->id, &d->k[0], d->hlen, &d->v[0], d->hlen, 0, 0, 0, 0);
+    for i in 0..64 { d->v[i] = t[i]; }
+  }
+  cr_wipe(&t[0], 64);
+}
+
+// Instantiates the DRBG: K = 0x00 ..., V = 0x01 ..., then update with the
+// seed. id is a valid CR_HASH_* id.
+fn crx_drbg_init(d: CrxDrbg*, id: int32, seed: uint8*, len: int64) {
+  d->id = id;
+  d->hlen = crx_hash_len(id);
+  for i in 0..64 {
+    d->k[i] = 0x00;
+    d->v[i] = 0x00;
+  }
+  for i in 0..d->hlen {
+    d->v[i] = 0x01;
+  }
+  crx_drbg_update(d, seed, len);
+}
+
+// Writes len bytes of output, then updates the state with an empty seed.
+fn crx_drbg_generate(d: CrxDrbg*, out: uint8*, len: int64) {
+  var x: uint8[1];
+  var t: uint8[64];
+  var pos: int64 = 0;
+  while (pos < len) {
+    crx_drbg_hmac(&t[0], d->id, &d->k[0], d->hlen, &d->v[0], d->hlen, 0, 0, 0, 0);
+    for i in 0..64 { d->v[i] = t[i]; }
+    var clen: int64 = d->hlen;
+    if (clen > len - pos) {
+      clen = len - pos;
+    }
+    for i in 0..clen { out[pos + i] = d->v[i]; }
+    pos = pos + clen;
+  }
+  x[0] = 0x00;
+  crx_drbg_hmac(&t[0], d->id, &d->k[0], d->hlen, &d->v[0], d->hlen, &x[0], 1, 0, 0);
+  for i in 0..64 { d->k[i] = t[i]; }
+  crx_drbg_hmac(&t[0], d->id, &d->k[0], d->hlen, &d->v[0], d->hlen, 0, 0, 0, 0);
+  for i in 0..64 { d->v[i] = t[i]; }
+  cr_wipe(&t[0], 64);
+}
+
+fn crx_drbg_wipe(d: CrxDrbg*) {
+  cr_wipe(&d->k[0], 64);
+  cr_wipe(&d->v[0], 64);
+}
+
+// ---------------------------------------------------------------------------
+// bits2int (ecdsa_i31_bits.c).
+
+/// internal: the "bits2int" of RFC 6979 (section 2.3.2): reads len bytes at
+/// src as a big-endian integer, keeps its leftmost bits so that it is no
+/// longer than the order (ebitlen is the encoded bit length of the modulus,
+/// x[0] of its i31 form), and stores it in x, which takes that size. The
+/// result is not reduced; it is below twice the modulus.
+export fn crx_ecdsa_bits2int(x: uint32*, src: uint8*, len_in: int64, ebitlen: uint32) {
+  var len: int64 = len_in;
+  var bitlen: uint32 = ebitlen - (ebitlen >> 5);
+  var hbitlen: uint32 = (uint32)len << 3;
+  var sc: int32 = 0;
+  if (hbitlen > bitlen) {
+    len = (int64)((bitlen + 7) >> 3);
+    sc = (int32)((hbitlen - bitlen) & 7);
+  }
+  crx_i31_zero(x, ebitlen);
+  crx_i31_decode(x, src, len);
+  crx_i31_rshift(x, sc);
+  x[0] = ebitlen;
+}
+
+// ---------------------------------------------------------------------------
+// DER conversion (ecdsa_rta.c, ecdsa_atr.c).
+
+// Length of the ASN.1 INTEGER content for the unsigned big-endian x: leading
+// zeros removed, one 0x00 added when the top bit would otherwise be set.
+fn crx_ecdsa_int_length(x: uint8*, xlen_in: int64) -> int64 {
+  var p: int64 = 0;
+  var xlen: int64 = xlen_in;
+  while (xlen > 0 && x[p] == 0) {
+    p = p + 1;
+    xlen = xlen - 1;
+  }
+  if (xlen == 0 || x[p] >= 0x80) {
+    xlen = xlen + 1;
+  }
+  return xlen;
+}
+
+/// internal: converts a raw signature r || s (sig_len bytes, r and s of equal
+/// length) to DER, in place; the buffer must have room for the DER form (at
+/// most 2 * sig_len / 2 + 9 bytes). Returns the DER length, or 0 on error
+/// (odd length, or an integer over 125 bytes).
+export fn crx_ecdsa_raw_to_asn1(buf: uint8*, sig_len: int64) -> int64 {
+  var tmp: uint8[257];
+  if ((sig_len & 1) != 0) {
+    return 0;
+  }
+  var hlen: int64 = sig_len >> 1;
+  var rlen: int64 = crx_ecdsa_int_length(&buf[0], hlen);
+  var slen: int64 = crx_ecdsa_int_length(&buf[hlen], hlen);
+  if (rlen > 125 || slen > 125) {
+    return 0;
+  }
+  tmp[0] = 0x30;
+  var zlen: int64 = rlen + slen + 4;
+  var off: int64 = 0;
+  if (zlen >= 0x80) {
+    tmp[1] = 0x81;
+    tmp[2] = (uint8)zlen;
+    off = 3;
+  } else {
+    tmp[1] = (uint8)zlen;
+    off = 2;
+  }
+  tmp[off] = 0x02;
+  off = off + 1;
+  tmp[off] = (uint8)rlen;
+  off = off + 1;
+  if (rlen > hlen) {
+    tmp[off] = 0x00;
+    for i in 0..hlen { tmp[off + 1 + i] = buf[i]; }
+  } else {
+    for i in 0..rlen { tmp[off + i] = buf[hlen - rlen + i]; }
+  }
+  off = off + rlen;
+  tmp[off] = 0x02;
+  off = off + 1;
+  tmp[off] = (uint8)slen;
+  off = off + 1;
+  if (slen > hlen) {
+    tmp[off] = 0x00;
+    for i in 0..hlen { tmp[off + 1 + i] = buf[hlen + i]; }
+  } else {
+    for i in 0..slen { tmp[off + i] = buf[sig_len - slen + i]; }
+  }
+  off = off + slen;
+  for i in 0..off { buf[i] = tmp[i]; }
+  return off;
+}
+
+/// internal: converts a DER signature (sig_len bytes) to the raw form r || s
+/// with r and s of equal length, in place. Lenient like BearSSL: it accepts
+/// a few non-minimal encodings (leading zeros in the integers), so a caller
+/// that needs strict DER must re-encode and compare. Returns the raw length,
+/// or 0 on error.
+export fn crx_ecdsa_asn1_to_raw(buf: uint8*, sig_len: int64) -> int64 {
+  var tmp: uint8[254];
+  if (sig_len < 8) {
+    return 0;
+  }
+  if (buf[0] != 0x30) {
+    return 0;
+  }
+  var zlen: int64 = (int64)buf[1];
+  var off: int64 = 0;
+  if (zlen > 0x80) {
+    if (zlen != 0x81) {
+      return 0;
+    }
+    zlen = (int64)buf[2];
+    if (zlen != sig_len - 3) {
+      return 0;
+    }
+    off = 3;
+  } else {
+    if (zlen != sig_len - 2) {
+      return 0;
+    }
+    off = 2;
+  }
+  if (buf[off] != 0x02) {
+    return 0;
+  }
+  off = off + 1;
+  var rlen: int64 = (int64)buf[off];
+  off = off + 1;
+  if (rlen >= 0x80) {
+    return 0;
+  }
+  var r: int64 = off;
+  off = off + rlen;
+  if (off + 2 > sig_len) {
+    return 0;
+  }
+  if (buf[off] != 0x02) {
+    return 0;
+  }
+  off = off + 1;
+  var slen: int64 = (int64)buf[off];
+  off = off + 1;
+  if (slen >= 0x80 || slen != sig_len - off) {
+    return 0;
+  }
+  var s: int64 = off;
+  while (rlen > 0 && buf[r] == 0) {
+    rlen = rlen - 1;
+    r = r + 1;
+  }
+  while (slen > 0 && buf[s] == 0) {
+    slen = slen - 1;
+    s = s + 1;
+  }
+  zlen = rlen;
+  if (slen > zlen) {
+    zlen = slen;
+  }
+  var raw_len: int64 = zlen << 1;
+  for i in 0..raw_len { tmp[i] = 0; }
+  for i in 0..rlen { tmp[zlen - rlen + i] = buf[r + i]; }
+  for i in 0..slen { tmp[raw_len - slen + i] = buf[s + i]; }
+  for i in 0..raw_len { buf[i] = tmp[i]; }
+  return raw_len;
+}
+
+// ---------------------------------------------------------------------------
+// Signature (ecdsa_i31_sign_raw.c).
+
+// n = the group order as an i31 integer; returns its ninv31.
+fn crx_ecdsa_order(n: uint32*) -> uint32 {
+  var nb: uint8[32];
+  crx_p256_order(&nb[0]);
+  crx_i31_decode(n, &nb[0], 32);
+  return crx_i31_ninv31(n[1]);
+}
+
+// x -= n when x >= n (x is below twice n).
+fn crx_ecdsa_reduce_once(x: uint32*, n: uint32*) {
+  crx_i31_sub(x, n, crx_i31_sub(x, n, 0) ^ 1);
+}
+
+/// internal: ECDSA signature over a hash value, raw form. hash_id is the
+/// CR_HASH_* id of the hash that produced hash (hash_len bytes) and also
+/// drives the RFC 6979 nonce; sk is the 32-byte big-endian secret scalar.
+/// Writes r || s (64 bytes) to sig and returns 64; returns 0 if the scalar is
+/// 0 or not lower than the order (sig is then untouched). Constant time in
+/// the scalar and the nonce; every temporary is wiped.
+export fn crx_ecdsa_p256_sign_raw(sig: uint8*, hash_id: int32, hash: uint8*, hash_len: int64, sk: uint8*) -> int64 {
+  var n: uint32[12];
+  var r: uint32[12];
+  var s: uint32[12];
+  var x: uint32[12];
+  var m: uint32[12];
+  var k: uint32[12];
+  var t1: uint32[12];
+  var t2: uint32[12];
+  var tt: uint8[64];
+  var eu: uint8[65];
+  var drbg: CrxDrbg;
+
+  var n0i: uint32 = crx_ecdsa_order(&n[0]);
+
+  // The private key as an i31 integer; it must be below the order and
+  // nonzero.
+  var ok: uint32 = crx_i31_decode_mod(&x[0], sk, 32, &n[0]);
+  ok = ok & crx_ct_not(crx_i31_iszero(&x[0]));
+  if (ok == 0) {
+    cr_wipe((uint8*)&x[0], 48);
+    return 0;
+  }
+
+  // Truncate the hash value and reduce it modulo the order.
+  crx_ecdsa_bits2int(&m[0], hash, hash_len, n[0]);
+  crx_ecdsa_reduce_once(&m[0], &n[0]);
+
+  // RFC 6979: HMAC_DRBG seeded with the private key and the reduced hash
+  // value, drawing 32-byte candidates until one is in [1, n-1].
+  crx_i31_encode(&tt[0], 32, &x[0]);
+  crx_i31_encode(&tt[32], 32, &m[0]);
+  crx_drbg_init(&drbg, hash_id, &tt[0], 64);
+  var found: bool = false;
+  while (!found) {
+    crx_drbg_generate(&drbg, &tt[0], 32);
+    crx_ecdsa_bits2int(&k[0], &tt[0], 32, n[0]);
+    if (crx_i31_iszero(&k[0]) == 0) {
+      if (crx_i31_sub(&k[0], &n[0], 0) != 0) {
+        found = true;
+      }
+    }
+  }
+
+  // k * G, its X coordinate reduced modulo the order (a single subtraction,
+  // the order being prime and close to the field size).
+  crx_i31_encode(&tt[0], 32, &k[0]);
+  var ulen: int64 = crx_p256_mulgen(&eu[0], &tt[0], 32);
+  crx_i31_zero(&r[0], n[0]);
+  crx_i31_decode(&r[0], &eu[1], ulen >> 1);
+  r[0] = n[0];
+  crx_ecdsa_reduce_once(&r[0], &n[0]);
+
+  // 1/k in double-Montgomery form: convert from Montgomery twice, then a
+  // modular exponentiation by n - 2.
+  crx_i31_from_monty(&k[0], &n[0], n0i);
+  crx_i31_from_monty(&k[0], &n[0], n0i);
+  crx_p256_order(&tt[0]);
+  tt[31] = tt[31] - 2;
+  crx_i31_modpow(&k[0], &tt[0], 32, &n[0], n0i, &t1[0], &t2[0]);
+
+  // s = (m + x * r) / k mod n. k holds R^2/k, so Montgomery products and
+  // conversions do it all.
+  crx_i31_from_monty(&m[0], &n[0], n0i);
+  crx_i31_montymul(&t1[0], &x[0], &r[0], &n[0], n0i);
+  var ctl: uint32 = crx_i31_add(&t1[0], &m[0], 1);
+  ctl = ctl | (crx_i31_sub(&t1[0], &n[0], 0) ^ 1);
+  crx_i31_sub(&t1[0], &n[0], ctl);
+  crx_i31_montymul(&s[0], &t1[0], &k[0], &n[0], n0i);
+
+  crx_i31_encode(sig, 32, &r[0]);
+  crx_i31_encode(&sig[32], 32, &s[0]);
+
+  crx_drbg_wipe(&drbg);
+  cr_wipe((uint8*)&n[0], 48);
+  cr_wipe((uint8*)&r[0], 48);
+  cr_wipe((uint8*)&s[0], 48);
+  cr_wipe((uint8*)&x[0], 48);
+  cr_wipe((uint8*)&m[0], 48);
+  cr_wipe((uint8*)&k[0], 48);
+  cr_wipe((uint8*)&t1[0], 48);
+  cr_wipe((uint8*)&t2[0], 48);
+  cr_wipe(&tt[0], 64);
+  cr_wipe(&eu[0], 65);
+  return 64;
+}
+
+// ---------------------------------------------------------------------------
+// Verification (ecdsa_i31_vrfy_raw.c).
+
+/// internal: verifies a raw ECDSA signature r || s (sig_len bytes, even, r
+/// and s of sig_len / 2 bytes each) over a hash value (hash_len bytes) with
+/// the 65-byte public key pk (0x04 || X || Y, fully validated). Returns 1 if
+/// valid, else 0. r and s must be in [1, n-1]. Uses public data only.
+export fn crx_ecdsa_p256_vrfy_raw(hash: uint8*, hash_len: int64, pk: uint8*, pk_len: int64, sig: uint8*, sig_len: int64) -> uint32 {
+  var n: uint32[12];
+  var r: uint32[12];
+  var s: uint32[12];
+  var t1: uint32[12];
+  var t2: uint32[12];
+  var tx: uint8[32];
+  var ty: uint8[32];
+  var eu: uint8[65];
+
+  if ((sig_len & 1) != 0) {
+    return 0;
+  }
+  var rlen: int64 = sig_len >> 1;
+  if (pk_len != 65) {
+    return 0;
+  }
+
+  // r and s must be below the order, and nonzero.
+  var n0i: uint32 = crx_ecdsa_order(&n[0]);
+  if (crx_i31_decode_mod(&r[0], sig, rlen, &n[0]) == 0) {
+    return 0;
+  }
+  if (crx_i31_decode_mod(&s[0], &sig[rlen], rlen, &n[0]) == 0) {
+    return 0;
+  }
+  if (crx_i31_iszero(&r[0]) != 0) {
+    return 0;
+  }
+  if (crx_i31_iszero(&s[0]) != 0) {
+    return 0;
+  }
+
+  // 1/s in Montgomery form: convert from Montgomery first, then invert by
+  // exponentiation to n - 2.
+  crx_i31_from_monty(&s[0], &n[0], n0i);
+  crx_p256_order(&tx[0]);
+  tx[31] = tx[31] - 2;
+  crx_i31_modpow(&s[0], &tx[0], 32, &n[0], n0i, &t1[0], &t2[0]);
+
+  // The hash value, truncated and reduced, times 1/s.
+  crx_ecdsa_bits2int(&t1[0], hash, hash_len, n[0]);
+  crx_ecdsa_reduce_once(&t1[0], &n[0]);
+  crx_i31_montymul(&t2[0], &t1[0], &s[0], &n[0], n0i);
+  crx_i31_encode(&ty[0], 32, &t2[0]);
+
+  // r times 1/s.
+  crx_i31_montymul(&t1[0], &r[0], &s[0], &n[0], n0i);
+  crx_i31_encode(&tx[0], 32, &t1[0]);
+
+  // The point (r/s) * Q + (h/s) * G.
+  for i in 0..65 { eu[i] = pk[i]; }
+  var res: uint32 = crx_p256_muladd(&eu[0], 0, 65, &tx[0], 32, &ty[0], 32);
+
+  // Its X coordinate modulo the order must be r.
+  crx_i31_zero(&t1[0], n[0]);
+  crx_i31_decode(&t1[0], &eu[1], 32);
+  t1[0] = n[0];
+  crx_ecdsa_reduce_once(&t1[0], &n[0]);
+  res = res & crx_ct_not(crx_i31_sub(&t1[0], &r[0], 1));
+  res = res & crx_i31_iszero(&t1[0]);
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// P-384 signature and verification: the same code on 48-byte scalars.
+
+// n = the P-384 group order as an i31 integer; returns its ninv31.
+fn crx_ecdsa_order384(n: uint32*) -> uint32 {
+  var nb: uint8[48];
+  crx_p384_order(&nb[0]);
+  crx_i31_decode(n, &nb[0], 48);
+  return crx_i31_ninv31(n[1]);
+}
+
+/// internal: ECDSA signature over a hash value on P-384, raw form. hash_id is
+/// the CR_HASH_* id of the hash that produced hash (hash_len bytes) and also
+/// drives the RFC 6979 nonce; sk is the 48-byte big-endian secret scalar.
+/// Writes r || s (96 bytes) to sig and returns 96; returns 0 if the scalar is
+/// 0 or not lower than the order (sig is then untouched). Constant time in
+/// the scalar and the nonce; every temporary is wiped.
+export fn crx_ecdsa_p384_sign_raw(sig: uint8*, hash_id: int32, hash: uint8*, hash_len: int64, sk: uint8*) -> int64 {
+  var n: uint32[16];
+  var r: uint32[16];
+  var s: uint32[16];
+  var x: uint32[16];
+  var m: uint32[16];
+  var k: uint32[16];
+  var t1: uint32[16];
+  var t2: uint32[16];
+  var tt: uint8[96];
+  var eu: uint8[97];
+  var drbg: CrxDrbg;
+
+  var n0i: uint32 = crx_ecdsa_order384(&n[0]);
+
+  // The private key as an i31 integer; it must be below the order and
+  // nonzero.
+  var ok: uint32 = crx_i31_decode_mod(&x[0], sk, 48, &n[0]);
+  ok = ok & crx_ct_not(crx_i31_iszero(&x[0]));
+  if (ok == 0) {
+    cr_wipe((uint8*)&x[0], 64);
+    return 0;
+  }
+
+  // Truncate the hash value and reduce it modulo the order.
+  crx_ecdsa_bits2int(&m[0], hash, hash_len, n[0]);
+  crx_ecdsa_reduce_once(&m[0], &n[0]);
+
+  // RFC 6979: HMAC_DRBG seeded with the private key and the reduced hash
+  // value, drawing 48-byte candidates until one is in [1, n-1].
+  crx_i31_encode(&tt[0], 48, &x[0]);
+  crx_i31_encode(&tt[48], 48, &m[0]);
+  crx_drbg_init(&drbg, hash_id, &tt[0], 96);
+  var found: bool = false;
+  while (!found) {
+    crx_drbg_generate(&drbg, &tt[0], 48);
+    crx_ecdsa_bits2int(&k[0], &tt[0], 48, n[0]);
+    if (crx_i31_iszero(&k[0]) == 0) {
+      if (crx_i31_sub(&k[0], &n[0], 0) != 0) {
+        found = true;
+      }
+    }
+  }
+
+  // k * G, its X coordinate reduced modulo the order (a single subtraction,
+  // the order being prime and close to the field size).
+  crx_i31_encode(&tt[0], 48, &k[0]);
+  var ulen: int64 = crx_p384_mulgen(&eu[0], &tt[0], 48);
+  crx_i31_zero(&r[0], n[0]);
+  crx_i31_decode(&r[0], &eu[1], ulen >> 1);
+  r[0] = n[0];
+  crx_ecdsa_reduce_once(&r[0], &n[0]);
+
+  // 1/k in double-Montgomery form: convert from Montgomery twice, then a
+  // modular exponentiation by n - 2.
+  crx_i31_from_monty(&k[0], &n[0], n0i);
+  crx_i31_from_monty(&k[0], &n[0], n0i);
+  crx_p384_order(&tt[0]);
+  tt[47] = tt[47] - 2;
+  crx_i31_modpow(&k[0], &tt[0], 48, &n[0], n0i, &t1[0], &t2[0]);
+
+  // s = (m + x * r) / k mod n. k holds R^2/k, so Montgomery products and
+  // conversions do it all.
+  crx_i31_from_monty(&m[0], &n[0], n0i);
+  crx_i31_montymul(&t1[0], &x[0], &r[0], &n[0], n0i);
+  var ctl: uint32 = crx_i31_add(&t1[0], &m[0], 1);
+  ctl = ctl | (crx_i31_sub(&t1[0], &n[0], 0) ^ 1);
+  crx_i31_sub(&t1[0], &n[0], ctl);
+  crx_i31_montymul(&s[0], &t1[0], &k[0], &n[0], n0i);
+
+  crx_i31_encode(sig, 48, &r[0]);
+  crx_i31_encode(&sig[48], 48, &s[0]);
+
+  crx_drbg_wipe(&drbg);
+  cr_wipe((uint8*)&n[0], 64);
+  cr_wipe((uint8*)&r[0], 64);
+  cr_wipe((uint8*)&s[0], 64);
+  cr_wipe((uint8*)&x[0], 64);
+  cr_wipe((uint8*)&m[0], 64);
+  cr_wipe((uint8*)&k[0], 64);
+  cr_wipe((uint8*)&t1[0], 64);
+  cr_wipe((uint8*)&t2[0], 64);
+  cr_wipe(&tt[0], 96);
+  cr_wipe(&eu[0], 97);
+  return 96;
+}
+
+/// internal: verifies a raw ECDSA signature r || s on P-384 (sig_len bytes,
+/// even, r and s of sig_len / 2 bytes each) over a hash value (hash_len
+/// bytes) with the 97-byte public key pk (0x04 || X || Y, fully validated).
+/// Returns 1 if valid, else 0. r and s must be in [1, n-1]. Uses public data
+/// only.
+export fn crx_ecdsa_p384_vrfy_raw(hash: uint8*, hash_len: int64, pk: uint8*, pk_len: int64, sig: uint8*, sig_len: int64) -> uint32 {
+  var n: uint32[16];
+  var r: uint32[16];
+  var s: uint32[16];
+  var t1: uint32[16];
+  var t2: uint32[16];
+  var tx: uint8[48];
+  var ty: uint8[48];
+  var eu: uint8[97];
+
+  if ((sig_len & 1) != 0) {
+    return 0;
+  }
+  var rlen: int64 = sig_len >> 1;
+  if (pk_len != 97) {
+    return 0;
+  }
+
+  // r and s must be below the order, and nonzero.
+  var n0i: uint32 = crx_ecdsa_order384(&n[0]);
+  if (crx_i31_decode_mod(&r[0], sig, rlen, &n[0]) == 0) {
+    return 0;
+  }
+  if (crx_i31_decode_mod(&s[0], &sig[rlen], rlen, &n[0]) == 0) {
+    return 0;
+  }
+  if (crx_i31_iszero(&r[0]) != 0) {
+    return 0;
+  }
+  if (crx_i31_iszero(&s[0]) != 0) {
+    return 0;
+  }
+
+  // 1/s in Montgomery form: convert from Montgomery first, then invert by
+  // exponentiation to n - 2.
+  crx_i31_from_monty(&s[0], &n[0], n0i);
+  crx_p384_order(&tx[0]);
+  tx[47] = tx[47] - 2;
+  crx_i31_modpow(&s[0], &tx[0], 48, &n[0], n0i, &t1[0], &t2[0]);
+
+  // The hash value, truncated and reduced, times 1/s.
+  crx_ecdsa_bits2int(&t1[0], hash, hash_len, n[0]);
+  crx_ecdsa_reduce_once(&t1[0], &n[0]);
+  crx_i31_montymul(&t2[0], &t1[0], &s[0], &n[0], n0i);
+  crx_i31_encode(&ty[0], 48, &t2[0]);
+
+  // r times 1/s.
+  crx_i31_montymul(&t1[0], &r[0], &s[0], &n[0], n0i);
+  crx_i31_encode(&tx[0], 48, &t1[0]);
+
+  // The point (r/s) * Q + (h/s) * G.
+  for i in 0..97 { eu[i] = pk[i]; }
+  var res: uint32 = crx_p384_muladd(&eu[0], 0, 97, &tx[0], 48, &ty[0], 48);
+
+  // Its X coordinate modulo the order must be r.
+  crx_i31_zero(&t1[0], n[0]);
+  crx_i31_decode(&t1[0], &eu[1], 48);
+  t1[0] = n[0];
+  crx_ecdsa_reduce_once(&t1[0], &n[0]);
+  res = res & crx_ct_not(crx_i31_sub(&t1[0], &r[0], 1));
+  res = res & crx_i31_iszero(&t1[0]);
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// Public API.
+
+/// Signs a message with ECDSA on P-256 and returns the signature in DER
+/// (SEQUENCE { INTEGER r, INTEGER s }, 8 to 72 bytes). The message is hashed
+/// with the chosen hash (CR_HASH_SHA256, CR_HASH_SHA384 or CR_HASH_SHA512);
+/// the nonce is deterministic (RFC 6979, HMAC_DRBG over the same hash), so a
+/// bad random source cannot leak the key, and the same inputs always give the
+/// same signature. The signing time does not depend on the secret scalar or
+/// the nonce.
+/// in: sig, writable for sig_cap bytes (CR_P256_ECDSA_SIG_MAX = 72 always
+///   suffices); sig_len, receives the length; msg readable for n bytes (msg
+///   may be 0 only when n == 0); hash a CR_HASH_* id; sk the secret scalar
+/// returns: CR_OK; CR_E_ARG (null pointer, negative n or sig_cap, unknown
+///   hash id); CR_E_KEY if the scalar is 0 or not lower than the group order;
+///   CR_E_SPACE if sig_cap is smaller than the DER length (nothing is
+///   written). On every error *sig_len is 0
+/// owns: sk is secret caller memory; every temporary (nonce, DRBG state,
+///   scalars) is wiped before return
+/// thread: any thread (no shared state)
+/// example: var sl: int64; if (cr_p256_ecdsa_sign(&sig[0], 72, &sl, m.chars, (int64)m.length, CR_HASH_SHA256, &sk) != CR_OK) { fail(); }
+export fn cr_p256_ecdsa_sign(sig: uint8*, sig_cap: int64, sig_len: int64*, msg: uint8*, n: int64, hash: int32, sk: CrP256Secret*) -> int32 {
+  if (sig_len == 0) { return CR_E_ARG; }
+  *sig_len = 0;
+  if (sig == 0 || sk == 0 || sig_cap < 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  if (crx_hash_len(hash) == 0) { return CR_E_ARG; }
+
+  var h: uint8[64];
+  var raw: uint8[80];
+  var hl: int64 = crx_hash_msg(&h[0], hash, msg, n);
+  if (hl == 0) {
+    return CR_E_ARG;
+  }
+  var rl: int64 = crx_ecdsa_p256_sign_raw(&raw[0], hash, &h[0], hl, &sk->b[0]);
+  cr_wipe(&h[0], 64);
+  if (rl == 0) {
+    cr_wipe(&raw[0], 80);
+    return CR_E_KEY;
+  }
+  var dl: int64 = crx_ecdsa_raw_to_asn1(&raw[0], rl);
+  if (dl == 0) {
+    cr_wipe(&raw[0], 80);
+    return CR_E_INTERNAL;
+  }
+  if (sig_cap < dl) {
+    cr_wipe(&raw[0], 80);
+    return CR_E_SPACE;
+  }
+  for i in 0..dl { sig[i] = raw[i]; }
+  *sig_len = dl;
+  cr_wipe(&raw[0], 80);
+  return CR_OK;
+}
+
+/// Verifies an ECDSA P-256 signature over a message. The message is hashed
+/// with the chosen hash (CR_HASH_SHA256, CR_HASH_SHA384 or CR_HASH_SHA512).
+/// The public key is the 65-byte point 0x04 || X || Y and is fully validated
+/// (coordinates below the field prime, on the curve). The signature must be
+/// strict DER: it is converted to r || s and encoded again, and the two
+/// encodings must be byte-identical (no leading zeros, no BER forms); r and s
+/// must be in [1, n-1]. Only public data is used.
+/// in: sig readable for sig_len bytes; msg readable for n bytes (msg may be 0
+///   only when n == 0); hash a CR_HASH_* id; pk readable for pk_len bytes
+/// returns: true only for a valid signature; false for an invalid one and for
+///   every error (null pointer, negative length, unknown hash, bad key or
+///   signature encoding): it fails closed
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (!cr_p256_ecdsa_verify(&sig[0], sl, m.chars, (int64)m.length, CR_HASH_SHA256, &pk[0], 65)) { reject(); }
+export fn cr_p256_ecdsa_verify(sig: uint8*, sig_len: int64, msg: uint8*, n: int64, hash: int32, pk: uint8*, pk_len: int64) -> bool {
+  if (sig == 0 || pk == 0 || sig_len < 0 || n < 0 || pk_len < 0) { return false; }
+  if (msg == 0 && n > 0) { return false; }
+  if (crx_hash_len(hash) == 0) { return false; }
+  if (pk_len != 65) { return false; }
+  // Longest DER the converter accepts: 3 header bytes and 255 content bytes.
+  if (sig_len < 8 || sig_len > 258) { return false; }
+
+  var h: uint8[64];
+  var hl: int64 = crx_hash_msg(&h[0], hash, msg, n);
+  if (hl == 0) { return false; }
+
+  // DER to raw, then raw back to DER: the result must equal the input, which
+  // makes the encoding canonical.
+  var buf: uint8[264];
+  var raw: uint8[256];
+  for i in 0..sig_len { buf[i] = sig[i]; }
+  var rawlen: int64 = crx_ecdsa_asn1_to_raw(&buf[0], sig_len);
+  if (rawlen == 0) { return false; }
+  for i in 0..rawlen { raw[i] = buf[i]; }
+  var dl: int64 = crx_ecdsa_raw_to_asn1(&buf[0], rawlen);
+  if (dl != sig_len) { return false; }
+  if (!cr_equal(&buf[0], sig, sig_len)) { return false; }
+
+  return crx_ecdsa_p256_vrfy_raw(&h[0], hl, pk, pk_len, &raw[0], rawlen) == 1;
+}
+
+
+/// Signs a message with ECDSA on P-384 and returns the signature in DER
+/// (SEQUENCE { INTEGER r, INTEGER s }, 8 to 104 bytes). The message is hashed
+/// with the chosen hash (CR_HASH_SHA256, CR_HASH_SHA384 or CR_HASH_SHA512);
+/// the nonce is deterministic (RFC 6979, HMAC_DRBG over the same hash), so a
+/// bad random source cannot leak the key, and the same inputs always give the
+/// same signature. The signing time does not depend on the secret scalar or
+/// the nonce.
+/// in: sig, writable for sig_cap bytes (CR_P384_ECDSA_SIG_MAX = 104 always
+///   suffices); sig_len, receives the length; msg readable for n bytes (msg
+///   may be 0 only when n == 0); hash a CR_HASH_* id; sk the secret scalar
+/// returns: CR_OK; CR_E_ARG (null pointer, negative n or sig_cap, unknown
+///   hash id); CR_E_KEY if the scalar is 0 or not lower than the group order;
+///   CR_E_SPACE if sig_cap is smaller than the DER length (nothing is
+///   written). On every error *sig_len is 0
+/// owns: sk is secret caller memory; every temporary (nonce, DRBG state,
+///   scalars) is wiped before return
+/// thread: any thread (no shared state)
+/// example: var sl: int64; if (cr_p384_ecdsa_sign(&sig[0], 104, &sl, m.chars, (int64)m.length, CR_HASH_SHA384, &sk) != CR_OK) { fail(); }
+export fn cr_p384_ecdsa_sign(sig: uint8*, sig_cap: int64, sig_len: int64*, msg: uint8*, n: int64, hash: int32, sk: CrP384Secret*) -> int32 {
+  if (sig_len == 0) { return CR_E_ARG; }
+  *sig_len = 0;
+  if (sig == 0 || sk == 0 || sig_cap < 0 || n < 0 || (msg == 0 && n > 0)) { return CR_E_ARG; }
+  if (crx_hash_len(hash) == 0) { return CR_E_ARG; }
+
+  var h: uint8[64];
+  var raw: uint8[112];
+  var hl: int64 = crx_hash_msg(&h[0], hash, msg, n);
+  if (hl == 0) {
+    return CR_E_ARG;
+  }
+  var rl: int64 = crx_ecdsa_p384_sign_raw(&raw[0], hash, &h[0], hl, &sk->b[0]);
+  cr_wipe(&h[0], 64);
+  if (rl == 0) {
+    cr_wipe(&raw[0], 112);
+    return CR_E_KEY;
+  }
+  var dl: int64 = crx_ecdsa_raw_to_asn1(&raw[0], rl);
+  if (dl == 0) {
+    cr_wipe(&raw[0], 112);
+    return CR_E_INTERNAL;
+  }
+  if (sig_cap < dl) {
+    cr_wipe(&raw[0], 112);
+    return CR_E_SPACE;
+  }
+  for i in 0..dl { sig[i] = raw[i]; }
+  *sig_len = dl;
+  cr_wipe(&raw[0], 112);
+  return CR_OK;
+}
+
+/// Verifies an ECDSA P-384 signature over a message. The message is hashed
+/// with the chosen hash (CR_HASH_SHA256, CR_HASH_SHA384 or CR_HASH_SHA512).
+/// The public key is the 97-byte point 0x04 || X || Y and is fully validated
+/// (coordinates below the field prime, on the curve). The signature must be
+/// strict DER: it is converted to r || s and encoded again, and the two
+/// encodings must be byte-identical (no leading zeros, no BER forms); r and s
+/// must be in [1, n-1]. Only public data is used.
+/// in: sig readable for sig_len bytes; msg readable for n bytes (msg may be 0
+///   only when n == 0); hash a CR_HASH_* id; pk readable for pk_len bytes
+/// returns: true only for a valid signature; false for an invalid one and for
+///   every error (null pointer, negative length, unknown hash, bad key or
+///   signature encoding): it fails closed
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (!cr_p384_ecdsa_verify(&sig[0], sl, m.chars, (int64)m.length, CR_HASH_SHA384, &pk[0], 97)) { reject(); }
+export fn cr_p384_ecdsa_verify(sig: uint8*, sig_len: int64, msg: uint8*, n: int64, hash: int32, pk: uint8*, pk_len: int64) -> bool {
+  if (sig == 0 || pk == 0 || sig_len < 0 || n < 0 || pk_len < 0) { return false; }
+  if (msg == 0 && n > 0) { return false; }
+  if (crx_hash_len(hash) == 0) { return false; }
+  if (pk_len != 97) { return false; }
+  // Longest DER the converter accepts: 3 header bytes and 255 content bytes.
+  if (sig_len < 8 || sig_len > 258) { return false; }
+
+  var h: uint8[64];
+  var hl: int64 = crx_hash_msg(&h[0], hash, msg, n);
+  if (hl == 0) { return false; }
+
+  // DER to raw, then raw back to DER: the result must equal the input, which
+  // makes the encoding canonical.
+  var buf: uint8[264];
+  var raw: uint8[256];
+  for i in 0..sig_len { buf[i] = sig[i]; }
+  var rawlen: int64 = crx_ecdsa_asn1_to_raw(&buf[0], sig_len);
+  if (rawlen == 0) { return false; }
+  for i in 0..rawlen { raw[i] = buf[i]; }
+  var dl: int64 = crx_ecdsa_raw_to_asn1(&buf[0], rawlen);
+  if (dl != sig_len) { return false; }
+  if (!cr_equal(&buf[0], sig, sig_len)) { return false; }
+
+  return crx_ecdsa_p384_vrfy_raw(&h[0], hl, pk, pk_len, &raw[0], rawlen) == 1;
+}

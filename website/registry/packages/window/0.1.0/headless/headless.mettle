@@ -1,0 +1,70 @@
+// headless: a backend with no display. Windows exist only in memory; events
+// come from window_inject. Used by tests and by programs that run on servers.
+import "std/mem";
+import "../core/types.mettle";
+
+export struct WindowHeadless {
+  clip: uint8*;
+  clip_len: int64;
+}
+
+var g_hl: WindowHeadless;
+
+export fn window_hl_init() -> bool { return true; }
+
+export fn window_hl_shutdown() {
+  if (g_hl.clip != 0) { free(g_hl.clip); g_hl.clip = (uint8*)0; }
+  g_hl.clip_len = 0;
+}
+
+export fn window_hl_monitors() {
+  var m: WindowMonitor* = (WindowMonitor*)malloc((int64)sizeof(WindowMonitor));
+  var z: WindowMonitor;
+  *m = z;
+  m->w = 1920; m->h = 1080; m->work_w = 1920; m->work_h = 1080;
+  m->mm_w = 508; m->mm_h = 286; m->refresh_mhz = 60000; m->scale = 1.0; m->primary = true;
+  var name: string = "headless";
+  for i in 0..8 { m->name[i] = name.chars[i]; }
+  m->name_len = 8;
+  window_set_monitors(m, 1);
+}
+
+export fn window_hl_create(w: Window*, cfg: WindowConfig*) -> bool {
+  w->w = cfg->w; w->h = cfg->h; w->fb_w = cfg->w; w->fb_h = cfg->h;
+  w->x = 0; w->y = 0;
+  if (cfg->x != WINDOW_POS_ANY && cfg->x != WINDOW_POS_CENTER) { w->x = cfg->x; }
+  if (cfg->y != WINDOW_POS_ANY && cfg->y != WINDOW_POS_CENTER) { w->y = cfg->y; }
+  w->visible = cfg->visible;
+  w->fullscreen = cfg->fullscreen;
+  w->text_input = true;
+  if (cfg->visible) {
+    var ev: WindowEvent;
+    ev.kind = WINDOW_EV_SHOWN; ev.win = w;
+    window_push_event(&ev);
+    w->redraw = true;
+  }
+  return true;
+}
+
+export fn window_hl_resize(w: Window*, width: int32, height: int32) {
+  var ev: WindowEvent;
+  ev.kind = WINDOW_EV_RESIZE; ev.win = w; ev.w = width; ev.h = height;
+  ev.fb_w = (int32)((float32)width * w->scale); ev.fb_h = (int32)((float32)height * w->scale);
+  window_push_event(&ev);
+}
+
+export fn window_hl_clipboard_set(s: uint8*, n: int64) {
+  if (g_hl.clip != 0) { free(g_hl.clip); }
+  g_hl.clip = (uint8*)malloc(n + 1);
+  for i: int64 in 0..n { g_hl.clip[i] = s[i]; }
+  g_hl.clip[n] = (uint8)0;
+  g_hl.clip_len = n;
+}
+
+export fn window_hl_clipboard_get() -> string {
+  var out: uint8* = (uint8*)malloc(g_hl.clip_len + 1);
+  for i: int64 in 0..g_hl.clip_len { out[i] = g_hl.clip[i]; }
+  out[g_hl.clip_len] = (uint8)0;
+  var s: string; s.chars = out; s.length = (uint64)g_hl.clip_len;
+  return s;
+}

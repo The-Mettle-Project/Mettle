@@ -1,0 +1,173 @@
+// EtchBuf: the growable byte buffer encoders write into, and the bounded
+// reader decoders read through.
+//
+//   var out: EtchBuf;                  // zeroed: empty, no limit
+//   etch_qoi_encode(&img, &out);
+//   ... out.data[0 .. out.len] ...
+//   etch_buf_free(&out);
+//
+// EtchRd never reads past its end: a read past it returns 0 and sets `bad`,
+// so a decoder can read a whole header and check once.
+
+import "std/mem";
+import "status";
+
+export struct EtchBuf {
+  data: uint8*;
+  len: int64;     // bytes in use
+  cap: int64;     // bytes allocated
+  limit: int64;   // most bytes len may reach; 0 means no limit
+}
+
+/// Frees the buffer's memory and leaves it empty. The limit stays.
+export fn etch_buf_free(b: EtchBuf*) {
+  if (b->data != 0) { free(b->data); }
+  b->data = (uint8*)0;
+  b->len = 0;
+  b->cap = 0;
+}
+
+/// Makes room for at least `extra` more bytes.
+export fn etch_buf_reserve(b: EtchBuf*, extra: int64) -> int32 {
+  if (extra < 0) { return ETCH_E_ARG; }
+  var need: int64 = b->len + extra;
+  if (need <= b->cap) { return ETCH_OK; }
+  if (b->limit > 0 && need > b->limit) { return ETCH_E_LIMIT; }
+  var ncap: int64 = b->cap * 2;
+  if (ncap < 256) { ncap = 256; }
+  if (ncap < need) { ncap = need; }
+  if (b->limit > 0 && ncap > b->limit) { ncap = b->limit; }
+  var nd: uint8* = (uint8*)malloc(ncap);
+  if (nd == 0) { return ETCH_E_MEM; }
+  if (b->data != 0) {
+    if (b->len > 0) { memcpy(nd, b->data, b->len); }
+    free(b->data);
+  }
+  b->data = nd;
+  b->cap = ncap;
+  return ETCH_OK;
+}
+
+/// Appends n bytes.
+export fn etch_buf_append(b: EtchBuf*, p: uint8*, n: int64) -> int32 {
+  if (n <= 0) { return ETCH_OK; }
+  var rc: int32 = etch_buf_reserve(b, n);
+  if (rc != ETCH_OK) { return rc; }
+  memcpy(b->data + b->len, p, n);
+  b->len = b->len + n;
+  return ETCH_OK;
+}
+
+/// Appends one byte.
+export fn etch_buf_push(b: EtchBuf*, v: int32) -> int32 {
+  if (b->len >= b->cap) {
+    var rc: int32 = etch_buf_reserve(b, 1);
+    if (rc != ETCH_OK) { return rc; }
+  }
+  b->data[b->len] = (uint8)v;
+  b->len = b->len + 1;
+  return ETCH_OK;
+}
+
+export fn etch_buf_u16le(b: EtchBuf*, v: int64) -> int32 {
+  etch_buf_push(b, (int32)(v & 255));
+  return etch_buf_push(b, (int32)((v >> 8) & 255));
+}
+
+export fn etch_buf_u32le(b: EtchBuf*, v: int64) -> int32 {
+  etch_buf_u16le(b, v & 65535);
+  return etch_buf_u16le(b, (v >> 16) & 65535);
+}
+
+export fn etch_buf_u16be(b: EtchBuf*, v: int64) -> int32 {
+  etch_buf_push(b, (int32)((v >> 8) & 255));
+  return etch_buf_push(b, (int32)(v & 255));
+}
+
+export fn etch_buf_u32be(b: EtchBuf*, v: int64) -> int32 {
+  etch_buf_u16be(b, (v >> 16) & 65535);
+  return etch_buf_u16be(b, v & 65535);
+}
+
+/// Writes a 32-bit big-endian value at p.
+export fn etch_put_u32be(p: uint8*, v: uint32) {
+  p[0] = (uint8)(v >> 24);
+  p[1] = (uint8)(v >> 16);
+  p[2] = (uint8)(v >> 8);
+  p[3] = (uint8)v;
+}
+
+/// Reads a 32-bit big-endian value at p.
+export fn etch_get_u32be(p: uint8*) -> uint32 {
+  return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+
+// ---- bounded reader ----
+
+export struct EtchRd {
+  p: uint8*;
+  n: int64;
+  pos: int64;
+  bad: bool;    // set by any read past the end
+}
+
+export fn etch_rd_init(r: EtchRd*, p: uint8*, n: int64) {
+  r->p = p;
+  r->n = n;
+  r->pos = 0;
+  r->bad = p == 0 || n < 0;
+  if (r->bad) { r->n = 0; }
+}
+
+/// Bytes left to read.
+export fn etch_rd_left(r: EtchRd*) -> int64 { return r->n - r->pos; }
+
+export fn etch_rd_u8(r: EtchRd*) -> int32 {
+  if (r->pos >= r->n) { r->bad = true; return 0; }
+  var v: int32 = (int32)r->p[r->pos];
+  r->pos = r->pos + 1;
+  return v;
+}
+
+export fn etch_rd_u16le(r: EtchRd*) -> int32 {
+  if (r->pos + 2 > r->n) { r->bad = true; r->pos = r->n; return 0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + 2;
+  return (int32)q[0] | ((int32)q[1] << 8);
+}
+
+export fn etch_rd_u16be(r: EtchRd*) -> int32 {
+  if (r->pos + 2 > r->n) { r->bad = true; r->pos = r->n; return 0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + 2;
+  return ((int32)q[0] << 8) | (int32)q[1];
+}
+
+export fn etch_rd_u32le(r: EtchRd*) -> int64 {
+  if (r->pos + 4 > r->n) { r->bad = true; r->pos = r->n; return 0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + 4;
+  return (int64)q[0] | ((int64)q[1] << 8) | ((int64)q[2] << 16) | ((int64)q[3] << 24);
+}
+
+export fn etch_rd_u32be(r: EtchRd*) -> int64 {
+  if (r->pos + 4 > r->n) { r->bad = true; r->pos = r->n; return 0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + 4;
+  return ((int64)q[0] << 24) | ((int64)q[1] << 16) | ((int64)q[2] << 8) | (int64)q[3];
+}
+
+/// Skips n bytes.
+export fn etch_rd_skip(r: EtchRd*, n: int64) {
+  if (n < 0 || r->pos + n > r->n) { r->bad = true; r->pos = r->n; return; }
+  r->pos = r->pos + n;
+}
+
+/// Address of the next n bytes and moves past them, or 0 (and bad) when
+/// fewer than n are left.
+export fn etch_rd_take(r: EtchRd*, n: int64) -> uint8* {
+  if (n < 0 || r->pos + n > r->n) { r->bad = true; r->pos = r->n; return (uint8*)0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + n;
+  return q;
+}

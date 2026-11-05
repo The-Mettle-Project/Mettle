@@ -1,0 +1,487 @@
+// CFF outlines: the CFF table and Type 2 charstrings.
+// Spec: Adobe Technical Note #5176 (CFF) and #5177 (Type 2 Charstrings),
+// and OpenType "CFF - Compact Font Format table".
+
+import "std/math";
+import "font/sfnt/face";
+import "path";
+
+// ---- INDEX ----
+
+/// Number of entries in the INDEX at o.
+fn idx_count(f: FontFace*, o: int64) -> int64 {
+  if (o == 0) { return 0; }
+  return (int64)font_u16(f, o);
+}
+
+fn idx_off(f: FontFace*, o: int64, i: int64) -> int64 {
+  var osz: int64 = (int64)font_u8(f, o + 2);
+  var p: int64 = o + 3 + i * osz;
+  if (osz == 1) { return (int64)font_u8(f, p); }
+  if (osz == 2) { return (int64)font_u16(f, p); }
+  if (osz == 3) { return (int64)font_u24(f, p); }
+  if (osz == 4) { return (int64)font_u32(f, p); }
+  return 0;
+}
+
+/// Byte range of entry i of the INDEX at o. False when out of range.
+fn idx_get(f: FontFace*, o: int64, i: int64, start: int64*, len: int64*) -> bool {
+  *start = 0; *len = 0;
+  var n: int64 = idx_count(f, o);
+  if (i < 0 || i >= n) { return false; }
+  var osz: int64 = (int64)font_u8(f, o + 2);
+  if (osz < 1 || osz > 4) { return false; }
+  var data: int64 = o + 3 + (n + 1) * osz - 1;
+  var a: int64 = idx_off(f, o, i);
+  var b: int64 = idx_off(f, o, i + 1);
+  if (a < 1 || b < a || data + b > f->len) { return false; }
+  *start = data + a;
+  *len = b - a;
+  return true;
+}
+
+/// Offset just past the INDEX at o.
+fn idx_end(f: FontFace*, o: int64) -> int64 {
+  var n: int64 = idx_count(f, o);
+  if (n == 0) { return o + 2; }
+  var osz: int64 = (int64)font_u8(f, o + 2);
+  if (osz < 1 || osz > 4) { return f->len; }
+  return o + 3 + (n + 1) * osz - 1 + idx_off(f, o, n);
+}
+
+// ---- DICT ----
+
+// Reads the operands of operator op (escaped ops are 1200 + second byte)
+// from the DICT at [p, e). Returns how many were found (up to 4).
+fn dict_find(f: FontFace*, p0: int64, e: int64, op: int32, vals: float64*) -> int32 {
+  var p: int64 = p0;
+  var n: int32 = 0;
+  while (p < e) {
+    var b: int32 = (int32)font_u8(f, p);
+    if (b <= 21) {
+      var o: int32 = b;
+      p = p + 1;
+      if (b == 12) { o = 1200 + (int32)font_u8(f, p); p = p + 1; }
+      if (o == op) { return n; }
+      n = 0;
+      continue;
+    }
+    var v: float64 = 0.0;
+    if (b == 28) { v = (float64)font_i16(f, p + 1); p = p + 3; }
+    else if (b == 29) { v = (float64)(int32)font_u32(f, p + 1); p = p + 5; }
+    else if (b == 30) {
+      // Real number: nibbles. We parse it roughly; reals are rare for the
+      // operators we need.
+      p = p + 1;
+      var mant: float64 = 0.0;
+      var neg: bool = false;
+      var frac: float64 = 0.0;
+      var expo: int32 = 0;
+      var eneg: bool = false;
+      var stage: int32 = 0;   // 0 int, 1 fraction, 2 exponent
+      var done: bool = false;
+      while (!done && p < e) {
+        var byte: int32 = (int32)font_u8(f, p);
+        p = p + 1;
+        for h in 0..2 {
+          var nib: int32 = (byte >> 4) & 15;
+          if (h == 1) { nib = byte & 15; }
+          if (done) { continue; }
+          if (nib <= 9) {
+            if (stage == 0) { mant = mant * 10.0 + (float64)nib; }
+            else if (stage == 1) { frac = frac * 10.0; mant = mant * 10.0 + (float64)nib; }
+            else { expo = expo * 10 + nib; }
+          } else if (nib == 10) { stage = 1; frac = 1.0; }
+          else if (nib == 11) { stage = 2; }
+          else if (nib == 12) { stage = 2; eneg = true; }
+          else if (nib == 14) { neg = true; }
+          else if (nib == 15) { done = true; }
+        }
+      }
+      if (stage >= 1 && frac > 0.0) { mant = mant / frac; }
+      if (eneg) { expo = -expo; }
+      v = mant * pow(10.0, (float64)expo);
+      if (neg) { v = -v; }
+    }
+    else if (b >= 32 && b <= 246) { v = (float64)(b - 139); p = p + 1; }
+    else if (b >= 247 && b <= 250) { v = (float64)((b - 247) * 256 + (int32)font_u8(f, p + 1) + 108); p = p + 2; }
+    else if (b >= 251 && b <= 254) { v = (float64)(-(b - 251) * 256 - (int32)font_u8(f, p + 1) - 108); p = p + 2; }
+    else { p = p + 1; }   // reserved
+    if (n < 4) { vals[n] = v; }
+    n = n + 1;
+  }
+  return -1;
+}
+
+fn dict_int(f: FontFace*, p: int64, e: int64, op: int32, dflt: int64) -> int64 {
+  var vals: float64[4];
+  if (dict_find(f, p, e, op, &vals[0]) >= 1) { return (int64)vals[0]; }
+  return dflt;
+}
+
+// Reads a Private DICT; sets *subrs and widths.
+fn read_private(f: FontFace*, size: int64, off: int64, subrs: int64*, dw: float32*, nw: float32*) {
+  *subrs = 0;
+  var c: FontCff* = &f->cff;
+  var p: int64 = c->base + off;
+  if (off <= 0 || size <= 0 || p + size > c->end) { return; }
+  var vals: float64[4];
+  if (dict_find(f, p, p + size, 19, &vals[0]) >= 1 && vals[0] > 0.0) { *subrs = p + (int64)vals[0]; }
+  if (dict_find(f, p, p + size, 20, &vals[0]) >= 1) { *dw = (float32)vals[0]; }
+  if (dict_find(f, p, p + size, 21, &vals[0]) >= 1) { *nw = (float32)vals[0]; }
+}
+
+/// Parses the CFF table found by font_init. Returns false when unusable.
+export fn font_cff_init(f: FontFace*) -> bool {
+  var c: FontCff* = &f->cff;
+  c->base = f->cff_off;
+  c->end = f->cff_off + f->cff_len;
+  if (font_u8(f, c->base) != 1) { return false; }   // CFF version 1 only
+  var names: int64 = c->base + (int64)font_u8(f, c->base + 2);
+  var tops: int64 = idx_end(f, names);
+  var strs: int64 = idx_end(f, tops);
+  c->gsubrs = idx_end(f, strs);
+  if (c->gsubrs >= c->end) { return false; }
+  var tp: int64 = 0;
+  var tl: int64 = 0;
+  if (!idx_get(f, tops, 0, &tp, &tl)) { return false; }
+  var te: int64 = tp + tl;
+  if (dict_int(f, tp, te, 1206, 2) != 2) { return false; }   // CharstringType
+  var cs: int64 = dict_int(f, tp, te, 17, 0);
+  if (cs <= 0) { return false; }
+  c->charstrings = c->base + cs;
+  if (idx_count(f, c->charstrings) < (int64)f->num_glyphs) { return false; }
+  var vals: float64[4];
+  c->default_width = 0.0;
+  c->nominal_width = 0.0;
+  if (dict_find(f, tp, te, 18, &vals[0]) >= 2) {
+    read_private(f, (int64)vals[0], (int64)vals[1], &c->subrs, &c->default_width, &c->nominal_width);
+  }
+  var fda: int64 = dict_int(f, tp, te, 1236, 0);
+  var fds: int64 = dict_int(f, tp, te, 1237, 0);
+  if (fda > 0 && fds > 0) {
+    c->fdarray = c->base + fda;
+    c->fdselect = c->base + fds;
+  }
+  return true;
+}
+
+// Font DICT number for glyph g in a CID font.
+fn fd_index(f: FontFace*, g: int32) -> int64 {
+  var c: FontCff* = &f->cff;
+  var fmt: uint32 = font_u8(f, c->fdselect);
+  if (fmt == 0) { return (int64)font_u8(f, c->fdselect + 1 + (int64)g); }
+  if (fmt == 3) {
+    var n: int64 = (int64)font_u16(f, c->fdselect + 1);
+    for i: int64 in 0..n {
+      var r: int64 = c->fdselect + 3 + i * 3;
+      var first: int64 = (int64)font_u16(f, r);
+      var next: int64 = (int64)font_u16(f, r + 3);
+      if ((int64)g >= first && (int64)g < next) { return (int64)font_u8(f, r + 2); }
+    }
+  }
+  return 0;
+}
+
+fn subr_bias(n: int64) -> int64 {
+  if (n < 1240) { return 107; }
+  if (n < 33900) { return 1131; }
+  return 32768;
+}
+
+// ---- Charstring interpreter ----
+
+struct Cs {
+  f: FontFace*;
+  path: FontPath*;
+  st: float32[48];
+  sp: int32;
+  x: float32; y: float32;
+  nstems: int32;
+  seen_width: bool;
+  subrs: int64;
+  ended: bool;
+  bad: bool;
+  ops: int64;     // work counter, stops endless loops
+}
+
+fn cs_move(c: Cs*, dx: float32, dy: float32) {
+  c->x = c->x + dx; c->y = c->y + dy;
+  font_path_move(c->path, c->x, c->y);
+}
+
+fn cs_line(c: Cs*, dx: float32, dy: float32) {
+  c->x = c->x + dx; c->y = c->y + dy;
+  font_path_line(c->path, c->x, c->y);
+}
+
+fn cs_curve(c: Cs*, dx1: float32, dy1: float32, dx2: float32, dy2: float32, dx3: float32, dy3: float32) {
+  var x1: float32 = c->x + dx1; var y1: float32 = c->y + dy1;
+  var x2: float32 = x1 + dx2; var y2: float32 = y1 + dy2;
+  c->x = x2 + dx3; c->y = y2 + dy3;
+  font_path_cubic(c->path, x1, y1, x2, y2, c->x, c->y);
+}
+
+// Drops the optional width operand the first stack-clearing operator may carry.
+fn cs_width(c: Cs*, odd_means_width: bool) {
+  if (c->seen_width) { return; }
+  c->seen_width = true;
+  var has: bool = false;
+  if (odd_means_width) { has = (c->sp % 2) == 1; } else { has = c->sp > 0; }
+  if (has) {
+    for i in 1..c->sp { c->st[i - 1] = c->st[i]; }
+    c->sp = c->sp - 1;
+  }
+}
+
+fn cs_run(c: Cs*, p0: int64, len: int64, depth: int32) {
+  var f: FontFace* = c->f;
+  if (depth > 10) { c->bad = true; return; }
+  var p: int64 = p0;
+  var e: int64 = p0 + len;
+  while (p < e && !c->ended && !c->bad) {
+    c->ops = c->ops + 1;
+    if (c->ops > 200000) { c->bad = true; return; }
+    var b: int32 = (int32)font_u8(f, p);
+    p = p + 1;
+    // Operands.
+    if (b >= 32 || b == 28) {
+      var v: float32 = 0.0;
+      if (b == 28) { v = (float32)font_i16(f, p); p = p + 2; }
+      else if (b <= 246) { v = (float32)(b - 139); }
+      else if (b <= 250) { v = (float32)((b - 247) * 256 + (int32)font_u8(f, p) + 108); p = p + 1; }
+      else if (b <= 254) { v = (float32)(-(b - 251) * 256 - (int32)font_u8(f, p) - 108); p = p + 1; }
+      else { v = (float32)(int32)font_u32(f, p) / 65536.0; p = p + 4; }   // 16.16 fixed
+      if (c->sp >= 48) { c->bad = true; return; }
+      c->st[c->sp] = v;
+      c->sp = c->sp + 1;
+      continue;
+    }
+    var sp: int32 = c->sp;
+    switch (b) {
+      case 1: { cs_width(c, true); c->nstems = c->nstems + c->sp / 2; c->sp = 0; }      // hstem
+      case 3: { cs_width(c, true); c->nstems = c->nstems + c->sp / 2; c->sp = 0; }      // vstem
+      case 18: { cs_width(c, true); c->nstems = c->nstems + c->sp / 2; c->sp = 0; }     // hstemhm
+      case 23: { cs_width(c, true); c->nstems = c->nstems + c->sp / 2; c->sp = 0; }     // vstemhm
+      case 19: {   // hintmask
+        cs_width(c, true);
+        c->nstems = c->nstems + c->sp / 2;
+        c->sp = 0;
+        p = p + (int64)((c->nstems + 7) / 8);
+      }
+      case 20: {   // cntrmask
+        cs_width(c, true);
+        c->nstems = c->nstems + c->sp / 2;
+        c->sp = 0;
+        p = p + (int64)((c->nstems + 7) / 8);
+      }
+      case 21: {   // rmoveto
+        if (!c->seen_width) { c->seen_width = true; if (sp > 2) { c->st[0] = c->st[1]; c->st[1] = c->st[2]; c->sp = 2; } }
+        if (c->sp < 2) { c->bad = true; return; }
+        cs_move(c, c->st[0], c->st[1]);
+        c->sp = 0;
+      }
+      case 22: {   // hmoveto
+        if (!c->seen_width) { c->seen_width = true; if (sp > 1) { c->st[0] = c->st[1]; c->sp = 1; } }
+        if (c->sp < 1) { c->bad = true; return; }
+        cs_move(c, c->st[0], 0.0);
+        c->sp = 0;
+      }
+      case 4: {    // vmoveto
+        if (!c->seen_width) { c->seen_width = true; if (sp > 1) { c->st[0] = c->st[1]; c->sp = 1; } }
+        if (c->sp < 1) { c->bad = true; return; }
+        cs_move(c, 0.0, c->st[0]);
+        c->sp = 0;
+      }
+      case 5: {    // rlineto
+        var i: int32 = 0;
+        while (i + 1 < sp) { cs_line(c, c->st[i], c->st[i + 1]); i = i + 2; }
+        c->sp = 0;
+      }
+      case 6: {    // hlineto: alternate horizontal and vertical
+        for i in 0..sp {
+          if (i % 2 == 0) { cs_line(c, c->st[i], 0.0); } else { cs_line(c, 0.0, c->st[i]); }
+        }
+        c->sp = 0;
+      }
+      case 7: {    // vlineto
+        for i in 0..sp {
+          if (i % 2 == 0) { cs_line(c, 0.0, c->st[i]); } else { cs_line(c, c->st[i], 0.0); }
+        }
+        c->sp = 0;
+      }
+      case 8: {    // rrcurveto
+        var i: int32 = 0;
+        while (i + 5 < sp) {
+          cs_curve(c, c->st[i], c->st[i + 1], c->st[i + 2], c->st[i + 3], c->st[i + 4], c->st[i + 5]);
+          i = i + 6;
+        }
+        c->sp = 0;
+      }
+      case 24: {   // rcurveline
+        var i: int32 = 0;
+        while (i + 5 < sp - 2) {
+          cs_curve(c, c->st[i], c->st[i + 1], c->st[i + 2], c->st[i + 3], c->st[i + 4], c->st[i + 5]);
+          i = i + 6;
+        }
+        if (i + 1 < sp) { cs_line(c, c->st[i], c->st[i + 1]); }
+        c->sp = 0;
+      }
+      case 25: {   // rlinecurve
+        var i: int32 = 0;
+        while (i + 1 < sp - 6) { cs_line(c, c->st[i], c->st[i + 1]); i = i + 2; }
+        if (i + 5 < sp) { cs_curve(c, c->st[i], c->st[i + 1], c->st[i + 2], c->st[i + 3], c->st[i + 4], c->st[i + 5]); }
+        c->sp = 0;
+      }
+      case 26: {   // vvcurveto
+        var i: int32 = 0;
+        var dx1: float32 = 0.0;
+        if (sp % 2 == 1) { dx1 = c->st[0]; i = 1; }
+        while (i + 3 < sp) {
+          cs_curve(c, dx1, c->st[i], c->st[i + 1], c->st[i + 2], 0.0, c->st[i + 3]);
+          dx1 = 0.0;
+          i = i + 4;
+        }
+        c->sp = 0;
+      }
+      case 27: {   // hhcurveto
+        var i: int32 = 0;
+        var dy1: float32 = 0.0;
+        if (sp % 2 == 1) { dy1 = c->st[0]; i = 1; }
+        while (i + 3 < sp) {
+          cs_curve(c, c->st[i], dy1, c->st[i + 1], c->st[i + 2], c->st[i + 3], 0.0);
+          dy1 = 0.0;
+          i = i + 4;
+        }
+        c->sp = 0;
+      }
+      case 30: { cs_hv(c, sp, false); }   // vhcurveto
+      case 31: { cs_hv(c, sp, true); }    // hvcurveto
+      case 10: {   // callsubr
+        if (sp < 1) { c->bad = true; return; }
+        c->sp = c->sp - 1;
+        var n: int64 = idx_count(f, c->subrs);
+        var k: int64 = (int64)c->st[c->sp] + subr_bias(n);
+        var s: int64 = 0;
+        var l: int64 = 0;
+        if (!idx_get(f, c->subrs, k, &s, &l)) { c->bad = true; return; }
+        cs_run(c, s, l, depth + 1);
+      }
+      case 29: {   // callgsubr
+        if (sp < 1) { c->bad = true; return; }
+        c->sp = c->sp - 1;
+        var n: int64 = idx_count(f, f->cff.gsubrs);
+        var k: int64 = (int64)c->st[c->sp] + subr_bias(n);
+        var s: int64 = 0;
+        var l: int64 = 0;
+        if (!idx_get(f, f->cff.gsubrs, k, &s, &l)) { c->bad = true; return; }
+        cs_run(c, s, l, depth + 1);
+      }
+      case 11: { return; }   // return
+      case 14: {   // endchar
+        cs_width(c, false);
+        // Four leftover operands would be the deprecated seac accent form,
+        // which we do not draw.
+        font_path_close(c->path);
+        c->ended = true;
+        return;
+      }
+      case 12: {
+        var b2: int32 = (int32)font_u8(f, p);
+        p = p + 1;
+        cs_escape(c, b2, sp);
+      }
+      default: { c->sp = 0; }   // reserved operator: clear the stack
+    }
+  }
+}
+
+// vhcurveto and hvcurveto: curves that start alternately vertical and horizontal.
+fn cs_hv(c: Cs*, sp: int32, h0: bool) {
+  var i: int32 = 0;
+  var h: bool = h0;
+  while (i + 3 < sp) {
+    var last: bool = i + 4 >= sp - 1;
+    var extra: float32 = 0.0;
+    if (last && sp - i == 5) { extra = c->st[i + 4]; }
+    if (h) {
+      cs_curve(c, c->st[i], 0.0, c->st[i + 1], c->st[i + 2], extra, c->st[i + 3]);
+    } else {
+      cs_curve(c, 0.0, c->st[i], c->st[i + 1], c->st[i + 2], c->st[i + 3], extra);
+    }
+    h = !h;
+    i = i + 4;
+  }
+  c->sp = 0;
+}
+
+fn cs_escape(c: Cs*, op: int32, sp: int32) {
+  var s: float32* = &c->st[0];
+  switch (op) {
+    case 35: {   // flex
+      if (sp >= 12) {
+        cs_curve(c, s[0], s[1], s[2], s[3], s[4], s[5]);
+        cs_curve(c, s[6], s[7], s[8], s[9], s[10], s[11]);
+      }
+    }
+    case 34: {   // hflex
+      if (sp >= 7) {
+        var y0: float32 = c->y;
+        cs_curve(c, s[0], 0.0, s[1], s[2], s[3], 0.0);
+        cs_curve(c, s[4], 0.0, s[5], y0 - c->y, s[6], 0.0);
+      }
+    }
+    case 36: {   // hflex1
+      if (sp >= 9) {
+        cs_curve(c, s[0], s[1], s[2], s[3], s[4], 0.0);
+        cs_curve(c, s[5], 0.0, s[6], s[7], s[8], -(s[1] + s[3] + s[7]));
+      }
+    }
+    case 37: {   // flex1: the last point returns to the start height or width
+      if (sp >= 11) {
+        var dx: float32 = s[0] + s[2] + s[4] + s[6] + s[8];
+        var dy: float32 = s[1] + s[3] + s[5] + s[7] + s[9];
+        cs_curve(c, s[0], s[1], s[2], s[3], s[4], s[5]);
+        if (f32_abs(dx) > f32_abs(dy)) {
+          cs_curve(c, s[6], s[7], s[8], s[9], s[10], -dy);
+        } else {
+          cs_curve(c, s[6], s[7], s[8], s[9], -dx, s[10]);
+        }
+      }
+    }
+    default: { }
+  }
+  c->sp = 0;
+}
+
+/// Appends the CFF outline of glyph g to path. False on damaged data.
+export fn font_cff_path(f: FontFace*, g: int32, path: FontPath*) -> bool {
+  if (g < 0 || g >= f->num_glyphs) { return false; }
+  var s: int64 = 0;
+  var l: int64 = 0;
+  if (!idx_get(f, f->cff.charstrings, (int64)g, &s, &l)) { return false; }
+  var c: Cs;
+  c.f = f;
+  c.path = path;
+  c.subrs = f->cff.subrs;
+  if (f->cff.fdarray != 0) {
+    var fd: int64 = fd_index(f, g);
+    var dp: int64 = 0;
+    var dl: int64 = 0;
+    c.subrs = 0;
+    if (idx_get(f, f->cff.fdarray, fd, &dp, &dl)) {
+      var vals: float64[4];
+      if (dict_find(f, dp, dp + dl, 18, &vals[0]) >= 2) {
+        var dw: float32 = 0.0;
+        var nw: float32 = 0.0;
+        read_private(f, (int64)vals[0], (int64)vals[1], &c.subrs, &dw, &nw);
+      }
+    }
+  }
+  var c0: int64 = path->cmds.len;
+  var p0: int64 = path->pts.len;
+  cs_run(&c, s, l, 0);
+  if (c.bad) { path->cmds.len = c0; path->pts.len = p0; path->open = false; return false; }
+  font_path_close(path);
+  return true;
+}

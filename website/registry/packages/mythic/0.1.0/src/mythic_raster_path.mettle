@@ -1,0 +1,162 @@
+// mythic_raster_path: signed-area coverage accumulation (font-rs style) for glyphs and
+// paths (DECISIONS §6). Lines and quadratics are accumulated into a float32 buffer; the prefix
+// sum per row with min(1, |acc|) gives nonzero-winding coverage.
+import "mythic_types";
+
+export struct MythicAccum { w: int32; h: int32; stride: int32; acc: float32*; cap: int64; }
+
+/// Prepares a zeroed w x h accumulation buffer (capacity is kept between uses).
+export fn mythic_r_acc_reset(a: MythicAccum*, w: int32, h: int32) {
+  a->w = w; a->h = h; a->stride = w + 2;
+  var need: int64 = (int64)a->stride * (int64)(h + 1);
+  if (need > a->cap) {
+    if (a->acc != 0) { free((rawptr)a->acc); }
+    var nc: int64 = need * 2;
+    if (nc < 4096) { nc = 4096; }
+    a->acc = (float32*)malloc(nc * 4);
+    a->cap = nc;
+  }
+  memset((rawptr)a->acc, 0, need * 4);
+}
+
+fn floori(x: float32) -> int32 {
+  var i: int32 = (int32)x;
+  if ((float32)i > x) { i = i - 1; }
+  return i;
+}
+
+/// Accumulates the line (x0,y0)-(x1,y1), in buffer pixel coordinates.
+/// A line that leaves the buffer sideways is split where it crosses x = 0 and x = w, so each
+/// piece lies on one side and clamping its x is exact: a piece left of the buffer becomes a
+/// vertical edge at x = 0 (full coverage to its right), one right of it a vertical edge at
+/// x = w (no visible coverage). Clamping the endpoints of an unsplit line would bend it.
+export fn mythic_r_acc_line(a: MythicAccum*, x0: float32, y0: float32, x1: float32, y1: float32) {
+  if (y0 == y1) { return; }
+  var maxx: float32 = (float32)a->w;
+  if ((x0 >= 0.0 && x1 >= 0.0 && x0 <= maxx && x1 <= maxx) || x0 == x1) {
+    acc_piece(a, x0, y0, x1, y1);
+    return;
+  }
+  // the crossings with x = 0 and x = w strictly inside the line, in order along it
+  var dx: float32 = x1 - x0;
+  var ta: float32 = 2.0; var xa: float32 = 0.0;
+  var tb: float32 = 2.0; var xb: float32 = maxx;
+  if ((x0 < 0.0 && x1 > 0.0) || (x0 > 0.0 && x1 < 0.0)) { ta = (0.0 - x0) / dx; }
+  if ((x0 < maxx && x1 > maxx) || (x0 > maxx && x1 < maxx)) { tb = (maxx - x0) / dx; }
+  if (tb < ta) { var tt: float32 = ta; ta = tb; tb = tt; xa = maxx; xb = 0.0; }
+  var dy: float32 = y1 - y0;
+  var px: float32 = x0; var py: float32 = y0;
+  if (ta < 1.0) {
+    var qy: float32 = y0 + ta * dy;
+    acc_piece(a, px, py, xa, qy);
+    px = xa; py = qy;
+  }
+  if (tb < 1.0) {
+    var ry: float32 = y0 + tb * dy;
+    acc_piece(a, px, py, xb, ry);
+    px = xb; py = ry;
+  }
+  acc_piece(a, px, py, x1, y1);
+}
+
+// One piece of a line that does not cross x = 0 or x = w (endpoints may lie outside).
+fn acc_piece(a: MythicAccum*, x0: float32, y0: float32, x1: float32, y1: float32) {
+  if (y0 == y1) { return; }
+  var dir: float32 = 1.0;
+  var ax: float32 = x0; var ay: float32 = y0; var bx: float32 = x1; var by: float32 = y1;
+  if (y0 > y1) { dir = -1.0; ax = x1; ay = y1; bx = x0; by = y0; }
+  var maxx: float32 = (float32)a->w;
+  if (ax < 0.0) { ax = 0.0; } if (bx < 0.0) { bx = 0.0; }
+  if (ax > maxx) { ax = maxx; } if (bx > maxx) { bx = maxx; }
+  var dxdy: float32 = (bx - ax) / (by - ay);
+  var x: float32 = ax;
+  var ystart: int32 = floori(ay);
+  if (ay < 0.0) { x = x - ay * dxdy; ystart = 0; }
+  var yend: int32 = floori(by);
+  if ((float32)yend < by) { yend = yend + 1; }
+  if (yend > a->h) { yend = a->h; }
+  var stride: int32 = a->stride;
+  var acc: float32* = a->acc;
+  var y: int32 = ystart;
+  while (y < yend) {
+    var ls: int64 = (int64)y * (int64)stride;
+    var fy: float32 = (float32)y;
+    var top: float32 = fy; if (ay > top) { top = ay; }
+    var bot: float32 = fy + 1.0; if (by < bot) { bot = by; }
+    var dy: float32 = bot - top;
+    var xnext: float32 = x + dxdy * dy;
+    // both ends were clamped to [0, w]; stepping can still round to about -1e-7, which would
+    // index acc[-1] (issue 21), so clamp the stepped values too
+    if (x < 0.0) { x = 0.0; } if (x > maxx) { x = maxx; }
+    if (xnext < 0.0) { xnext = 0.0; } if (xnext > maxx) { xnext = maxx; }
+    var d: float32 = dy * dir;
+    var xa: float32 = x; var xb: float32 = xnext;
+    if (xa > xb) { xa = xnext; xb = x; }
+    var xaf: float32 = (float32)floori(xa);
+    var xai: int32 = (int32)xaf;
+    var xbi: int32 = floori(xb);
+    if ((float32)xbi < xb) { xbi = xbi + 1; }
+    var xbc: float32 = (float32)xbi;
+    if (xbi <= xai + 1) {
+      var xmf: float32 = 0.5 * (x + xnext) - xaf;
+      acc[ls + (int64)xai] += d - d * xmf;
+      acc[ls + (int64)xai + 1] += d * xmf;
+    } else {
+      var s: float32 = 1.0 / (xb - xa);
+      var x0f: float32 = xa - xaf;
+      var a0: float32 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+      var x1f: float32 = xb - xbc + 1.0;
+      var am: float32 = 0.5 * s * x1f * x1f;
+      acc[ls + (int64)xai] += d * a0;
+      if (xbi == xai + 2) {
+        acc[ls + (int64)xai + 1] += d * (1.0 - a0 - am);
+      } else {
+        var a1: float32 = s * (1.5 - x0f);
+        acc[ls + (int64)xai + 1] += d * (a1 - a0);
+        var xi: int32 = xai + 2;
+        while (xi < xbi - 1) { acc[ls + (int64)xi] += d * s; xi = xi + 1; }
+        var a2: float32 = a1 + (float32)(xbi - xai - 3) * s;
+        acc[ls + (int64)xbi - 1] += d * (1.0 - a2 - am);
+      }
+      acc[ls + (int64)xbi] += d * am;
+    }
+    x = xnext;
+    y = y + 1;
+  }
+}
+
+/// Accumulates a quadratic bezier, flattened adaptively (font-rs tolerance rule).
+export fn mythic_r_acc_quad(a: MythicAccum*, x0: float32, y0: float32, cx: float32, cy: float32, x1: float32, y1: float32) {
+  var ddx: float32 = x0 - 2.0 * cx + x1;
+  var ddy: float32 = y0 - 2.0 * cy + y1;
+  var devsq: float32 = ddx * ddx + ddy * ddy;
+  if (devsq < 0.333) { mythic_r_acc_line(a, x0, y0, x1, y1); return; }
+  var n: int32 = 1 + (int32)mythic_sqrtf(mythic_sqrtf(3.0 * devsq));
+  var px: float32 = x0; var py: float32 = y0;
+  var inv: float32 = 1.0 / (float32)n;
+  for i: int32 in 1..n {
+    var t: float32 = (float32)i * inv;
+    var mt: float32 = 1.0 - t;
+    var qx: float32 = mt * mt * x0 + 2.0 * mt * t * cx + t * t * x1;
+    var qy: float32 = mt * mt * y0 + 2.0 * mt * t * cy + t * t * y1;
+    mythic_r_acc_line(a, px, py, qx, qy);
+    px = qx; py = qy;
+  }
+  mythic_r_acc_line(a, px, py, x1, y1);
+}
+
+/// Prefix-sums each row and writes 8-bit coverage (nonzero rule) into out[y*out_stride + x].
+export fn mythic_r_acc_to_a8(a: MythicAccum*, out: uint8*, out_stride: int32) {
+  for y: int32 in 0..a->h {
+    var s: float32 = 0.0;
+    var row: float32* = a->acc + (int64)y * (int64)a->stride;
+    var o: uint8* = out + (int64)y * (int64)out_stride;
+    for x: int32 in 0..a->w {
+      s = s + row[x];
+      var v: float32 = s;
+      if (v < 0.0) { v = -v; }
+      if (v > 1.0) { v = 1.0; }
+      o[x] = (uint8)(int32)(v * 255.0 + 0.5);
+    }
+  }
+}

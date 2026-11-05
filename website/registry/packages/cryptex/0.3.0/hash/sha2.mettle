@@ -1,0 +1,415 @@
+// SHA-256, SHA-384 and SHA-512 (FIPS 180-4) in pure Mettle: the incremental
+// engines behind cr_sha256, cr_sha384, cr_sha512 and the HMAC functions. Internal module (crx_
+// prefix): callers have already validated their arguments, these functions
+// do not. Words are loaded and stored big-endian with explicit shifts, all
+// arithmetic is on unsigned types and no index or branch depends on the
+// data, so the code is constant time for secret input.
+//
+// SHA-384 is SHA-512 with other initial values and the output cut to 48
+// bytes; it shares the SHA-512 compression.
+//
+// On x86-64 CPUs with SHA-NI, SHA-256 blocks go through
+// sha256_hw_x86_64.mettle instead; the output is the same.
+//
+// The SHA-512 round constants are stored as 32-bit halves (high, low) and
+// joined when used, because Mettle integer literals are 32-bit.
+
+import "cryptex/core/status";
+import "cryptex/core/util";
+import "cryptex/hash/sha256_hw_x86_64" if x86_64;
+import "cryptex/hash/sha256_hw_aarch64" if aarch64;
+
+var g_crx_k256: uint32[64] = [
+  (uint32)0x428a2f98, (uint32)0x71374491, (uint32)0xb5c0fbcf, (uint32)0xe9b5dba5,
+  (uint32)0x3956c25b, (uint32)0x59f111f1, (uint32)0x923f82a4, (uint32)0xab1c5ed5,
+  (uint32)0xd807aa98, (uint32)0x12835b01, (uint32)0x243185be, (uint32)0x550c7dc3,
+  (uint32)0x72be5d74, (uint32)0x80deb1fe, (uint32)0x9bdc06a7, (uint32)0xc19bf174,
+  (uint32)0xe49b69c1, (uint32)0xefbe4786, (uint32)0x0fc19dc6, (uint32)0x240ca1cc,
+  (uint32)0x2de92c6f, (uint32)0x4a7484aa, (uint32)0x5cb0a9dc, (uint32)0x76f988da,
+  (uint32)0x983e5152, (uint32)0xa831c66d, (uint32)0xb00327c8, (uint32)0xbf597fc7,
+  (uint32)0xc6e00bf3, (uint32)0xd5a79147, (uint32)0x06ca6351, (uint32)0x14292967,
+  (uint32)0x27b70a85, (uint32)0x2e1b2138, (uint32)0x4d2c6dfc, (uint32)0x53380d13,
+  (uint32)0x650a7354, (uint32)0x766a0abb, (uint32)0x81c2c92e, (uint32)0x92722c85,
+  (uint32)0xa2bfe8a1, (uint32)0xa81a664b, (uint32)0xc24b8b70, (uint32)0xc76c51a3,
+  (uint32)0xd192e819, (uint32)0xd6990624, (uint32)0xf40e3585, (uint32)0x106aa070,
+  (uint32)0x19a4c116, (uint32)0x1e376c08, (uint32)0x2748774c, (uint32)0x34b0bcb5,
+  (uint32)0x391c0cb3, (uint32)0x4ed8aa4a, (uint32)0x5b9cca4f, (uint32)0x682e6ff3,
+  (uint32)0x748f82ee, (uint32)0x78a5636f, (uint32)0x84c87814, (uint32)0x8cc70208,
+  (uint32)0x90befffa, (uint32)0xa4506ceb, (uint32)0xbef9a3f7, (uint32)0xc67178f2
+];
+
+var g_crx_h256: uint32[8] = [
+  (uint32)0x6a09e667, (uint32)0xbb67ae85, (uint32)0x3c6ef372, (uint32)0xa54ff53a,
+  (uint32)0x510e527f, (uint32)0x9b05688c, (uint32)0x1f83d9ab, (uint32)0x5be0cd19
+];
+
+var g_crx_k512: uint32[160] = [
+  (uint32)0x428a2f98, (uint32)0xd728ae22, (uint32)0x71374491, (uint32)0x23ef65cd,
+  (uint32)0xb5c0fbcf, (uint32)0xec4d3b2f, (uint32)0xe9b5dba5, (uint32)0x8189dbbc,
+  (uint32)0x3956c25b, (uint32)0xf348b538, (uint32)0x59f111f1, (uint32)0xb605d019,
+  (uint32)0x923f82a4, (uint32)0xaf194f9b, (uint32)0xab1c5ed5, (uint32)0xda6d8118,
+  (uint32)0xd807aa98, (uint32)0xa3030242, (uint32)0x12835b01, (uint32)0x45706fbe,
+  (uint32)0x243185be, (uint32)0x4ee4b28c, (uint32)0x550c7dc3, (uint32)0xd5ffb4e2,
+  (uint32)0x72be5d74, (uint32)0xf27b896f, (uint32)0x80deb1fe, (uint32)0x3b1696b1,
+  (uint32)0x9bdc06a7, (uint32)0x25c71235, (uint32)0xc19bf174, (uint32)0xcf692694,
+  (uint32)0xe49b69c1, (uint32)0x9ef14ad2, (uint32)0xefbe4786, (uint32)0x384f25e3,
+  (uint32)0x0fc19dc6, (uint32)0x8b8cd5b5, (uint32)0x240ca1cc, (uint32)0x77ac9c65,
+  (uint32)0x2de92c6f, (uint32)0x592b0275, (uint32)0x4a7484aa, (uint32)0x6ea6e483,
+  (uint32)0x5cb0a9dc, (uint32)0xbd41fbd4, (uint32)0x76f988da, (uint32)0x831153b5,
+  (uint32)0x983e5152, (uint32)0xee66dfab, (uint32)0xa831c66d, (uint32)0x2db43210,
+  (uint32)0xb00327c8, (uint32)0x98fb213f, (uint32)0xbf597fc7, (uint32)0xbeef0ee4,
+  (uint32)0xc6e00bf3, (uint32)0x3da88fc2, (uint32)0xd5a79147, (uint32)0x930aa725,
+  (uint32)0x06ca6351, (uint32)0xe003826f, (uint32)0x14292967, (uint32)0x0a0e6e70,
+  (uint32)0x27b70a85, (uint32)0x46d22ffc, (uint32)0x2e1b2138, (uint32)0x5c26c926,
+  (uint32)0x4d2c6dfc, (uint32)0x5ac42aed, (uint32)0x53380d13, (uint32)0x9d95b3df,
+  (uint32)0x650a7354, (uint32)0x8baf63de, (uint32)0x766a0abb, (uint32)0x3c77b2a8,
+  (uint32)0x81c2c92e, (uint32)0x47edaee6, (uint32)0x92722c85, (uint32)0x1482353b,
+  (uint32)0xa2bfe8a1, (uint32)0x4cf10364, (uint32)0xa81a664b, (uint32)0xbc423001,
+  (uint32)0xc24b8b70, (uint32)0xd0f89791, (uint32)0xc76c51a3, (uint32)0x0654be30,
+  (uint32)0xd192e819, (uint32)0xd6ef5218, (uint32)0xd6990624, (uint32)0x5565a910,
+  (uint32)0xf40e3585, (uint32)0x5771202a, (uint32)0x106aa070, (uint32)0x32bbd1b8,
+  (uint32)0x19a4c116, (uint32)0xb8d2d0c8, (uint32)0x1e376c08, (uint32)0x5141ab53,
+  (uint32)0x2748774c, (uint32)0xdf8eeb99, (uint32)0x34b0bcb5, (uint32)0xe19b48a8,
+  (uint32)0x391c0cb3, (uint32)0xc5c95a63, (uint32)0x4ed8aa4a, (uint32)0xe3418acb,
+  (uint32)0x5b9cca4f, (uint32)0x7763e373, (uint32)0x682e6ff3, (uint32)0xd6b2b8a3,
+  (uint32)0x748f82ee, (uint32)0x5defb2fc, (uint32)0x78a5636f, (uint32)0x43172f60,
+  (uint32)0x84c87814, (uint32)0xa1f0ab72, (uint32)0x8cc70208, (uint32)0x1a6439ec,
+  (uint32)0x90befffa, (uint32)0x23631e28, (uint32)0xa4506ceb, (uint32)0xde82bde9,
+  (uint32)0xbef9a3f7, (uint32)0xb2c67915, (uint32)0xc67178f2, (uint32)0xe372532b,
+  (uint32)0xca273ece, (uint32)0xea26619c, (uint32)0xd186b8c7, (uint32)0x21c0c207,
+  (uint32)0xeada7dd6, (uint32)0xcde0eb1e, (uint32)0xf57d4f7f, (uint32)0xee6ed178,
+  (uint32)0x06f067aa, (uint32)0x72176fba, (uint32)0x0a637dc5, (uint32)0xa2c898a6,
+  (uint32)0x113f9804, (uint32)0xbef90dae, (uint32)0x1b710b35, (uint32)0x131c471b,
+  (uint32)0x28db77f5, (uint32)0x23047d84, (uint32)0x32caab7b, (uint32)0x40c72493,
+  (uint32)0x3c9ebe0a, (uint32)0x15c9bebc, (uint32)0x431d67c4, (uint32)0x9c100d4c,
+  (uint32)0x4cc5d4be, (uint32)0xcb3e42b6, (uint32)0x597f299c, (uint32)0xfc657e2a,
+  (uint32)0x5fcb6fab, (uint32)0x3ad6faec, (uint32)0x6c44198c, (uint32)0x4a475817
+];
+
+var g_crx_h384: uint32[16] = [
+  (uint32)0xcbbb9d5d, (uint32)0xc1059ed8, (uint32)0x629a292a, (uint32)0x367cd507,
+  (uint32)0x9159015a, (uint32)0x3070dd17, (uint32)0x152fecd8, (uint32)0xf70e5939,
+  (uint32)0x67332667, (uint32)0xffc00b31, (uint32)0x8eb44a87, (uint32)0x68581511,
+  (uint32)0xdb0c2e0d, (uint32)0x64f98fa7, (uint32)0x47b5481d, (uint32)0xbefa4fa4
+];
+
+var g_crx_h512: uint32[16] = [
+  (uint32)0x6a09e667, (uint32)0xf3bcc908, (uint32)0xbb67ae85, (uint32)0x84caa73b,
+  (uint32)0x3c6ef372, (uint32)0xfe94f82b, (uint32)0xa54ff53a, (uint32)0x5f1d36f1,
+  (uint32)0x510e527f, (uint32)0xade682d1, (uint32)0x9b05688c, (uint32)0x2b3e6c1f,
+  (uint32)0x1f83d9ab, (uint32)0xfb41bd6b, (uint32)0x5be0cd19, (uint32)0x137e2179
+];
+
+/// internal: SHA-256 running state (chaining value, partial block, byte count).
+export struct CrxSha256 {
+  h: uint32[8];
+  buf: uint8[64];
+  buflen: int64;
+  total: uint64;
+}
+
+/// internal: SHA-512 running state (chaining value, partial block, byte count).
+export struct CrxSha512 {
+  h: uint64[8];
+  buf: uint8[128];
+  buflen: int64;
+  total: uint64;
+}
+
+/// internal: SHA-384 running state (same layout as CrxSha512, which it shares).
+export struct CrxSha384 {
+  h: uint64[8];
+  buf: uint8[128];
+  buflen: int64;
+  total: uint64;
+}
+
+fn crx_rotr32(x: uint32, n: int32) -> uint32 {
+  return (x >> n) | (x << (32 - n));
+}
+
+fn crx_rotr64(x: uint64, n: int32) -> uint64 {
+  return (x >> n) | (x << (64 - n));
+}
+
+fn crx_load32be(p: uint8*) -> uint32 {
+  return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+
+fn crx_store32be(p: uint8*, v: uint32) {
+  p[0] = (uint8)(v >> 24);
+  p[1] = (uint8)(v >> 16);
+  p[2] = (uint8)(v >> 8);
+  p[3] = (uint8)v;
+}
+
+fn crx_load64be(p: uint8*) -> uint64 {
+  return ((uint64)crx_load32be(p) << 32) | (uint64)crx_load32be(&p[4]);
+}
+
+fn crx_store64be(p: uint8*, v: uint64) {
+  crx_store32be(p, (uint32)(v >> 32));
+  crx_store32be(&p[4], (uint32)v);
+}
+
+// One 64-byte block.
+/// internal: the portable SHA-256 compression of one 64-byte block (also
+/// used by the tests to check the SHA-NI path).
+export fn crx_sha256_block_sw(s: CrxSha256*, blk: uint8*) {
+  var w: uint32[64];
+  for i in 0..16 {
+    w[i] = crx_load32be(&blk[i * 4]);
+  }
+  for i in 16..64 {
+    var w15: uint32 = w[i - 15];
+    var w2: uint32 = w[i - 2];
+    var s0: uint32 = crx_rotr32(w15, 7) ^ crx_rotr32(w15, 18) ^ (w15 >> 3);
+    var s1: uint32 = crx_rotr32(w2, 17) ^ crx_rotr32(w2, 19) ^ (w2 >> 10);
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+  }
+  var a: uint32 = s->h[0];
+  var b: uint32 = s->h[1];
+  var c: uint32 = s->h[2];
+  var d: uint32 = s->h[3];
+  var e: uint32 = s->h[4];
+  var f: uint32 = s->h[5];
+  var g: uint32 = s->h[6];
+  var h: uint32 = s->h[7];
+  for i in 0..64 {
+    var bs1: uint32 = crx_rotr32(e, 6) ^ crx_rotr32(e, 11) ^ crx_rotr32(e, 25);
+    var ch: uint32 = (e & f) ^ (~e & g);
+    var t1: uint32 = h + bs1 + ch + g_crx_k256[i] + w[i];
+    var bs0: uint32 = crx_rotr32(a, 2) ^ crx_rotr32(a, 13) ^ crx_rotr32(a, 22);
+    var maj: uint32 = (a & b) ^ (a & c) ^ (b & c);
+    var t2: uint32 = bs0 + maj;
+    h = g;
+    g = f;
+    f = e;
+    e = d + t1;
+    d = c;
+    c = b;
+    b = a;
+    a = t1 + t2;
+  }
+  s->h[0] = s->h[0] + a;
+  s->h[1] = s->h[1] + b;
+  s->h[2] = s->h[2] + c;
+  s->h[3] = s->h[3] + d;
+  s->h[4] = s->h[4] + e;
+  s->h[5] = s->h[5] + f;
+  s->h[6] = s->h[6] + g;
+  s->h[7] = s->h[7] + h;
+  cr_wipe((uint8*)&w[0], 256);
+}
+
+// One 128-byte block.
+fn crx_sha512_block(s: CrxSha512*, blk: uint8*) {
+  var w: uint64[80];
+  for i in 0..16 {
+    w[i] = crx_load64be(&blk[i * 8]);
+  }
+  for i in 16..80 {
+    var w15: uint64 = w[i - 15];
+    var w2: uint64 = w[i - 2];
+    var s0: uint64 = crx_rotr64(w15, 1) ^ crx_rotr64(w15, 8) ^ (w15 >> 7);
+    var s1: uint64 = crx_rotr64(w2, 19) ^ crx_rotr64(w2, 61) ^ (w2 >> 6);
+    w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+  }
+  var a: uint64 = s->h[0];
+  var b: uint64 = s->h[1];
+  var c: uint64 = s->h[2];
+  var d: uint64 = s->h[3];
+  var e: uint64 = s->h[4];
+  var f: uint64 = s->h[5];
+  var g: uint64 = s->h[6];
+  var h: uint64 = s->h[7];
+  for i in 0..80 {
+    var k: uint64 = ((uint64)g_crx_k512[i * 2] << 32) | (uint64)g_crx_k512[i * 2 + 1];
+    var bs1: uint64 = crx_rotr64(e, 14) ^ crx_rotr64(e, 18) ^ crx_rotr64(e, 41);
+    var ch: uint64 = (e & f) ^ (~e & g);
+    var t1: uint64 = h + bs1 + ch + k + w[i];
+    var bs0: uint64 = crx_rotr64(a, 28) ^ crx_rotr64(a, 34) ^ crx_rotr64(a, 39);
+    var maj: uint64 = (a & b) ^ (a & c) ^ (b & c);
+    var t2: uint64 = bs0 + maj;
+    h = g;
+    g = f;
+    f = e;
+    e = d + t1;
+    d = c;
+    c = b;
+    b = a;
+    a = t1 + t2;
+  }
+  s->h[0] = s->h[0] + a;
+  s->h[1] = s->h[1] + b;
+  s->h[2] = s->h[2] + c;
+  s->h[3] = s->h[3] + d;
+  s->h[4] = s->h[4] + e;
+  s->h[5] = s->h[5] + f;
+  s->h[6] = s->h[6] + g;
+  s->h[7] = s->h[7] + h;
+  cr_wipe((uint8*)&w[0], 640);
+}
+
+var g_crx_sha256_hw: uint32 = 0;
+
+fn crx_sha256_blocks(s: CrxSha256*, p: uint8*, nblocks: int64) {
+  var l: uint32 = g_crx_sha256_hw;
+  if (l == 0) {
+    l = crx_sha256_hw_available() + (uint32)1;
+    g_crx_sha256_hw = l;
+  }
+  if (l == 2) {
+    crx_sha256_hw_blocks(&s->h[0], p, nblocks, &g_crx_k256[0]);
+    return;
+  }
+  var i: int64 = 0;
+  while (i < nblocks) {
+    crx_sha256_block_sw(s, &p[i * 64]);
+    i = i + 1;
+  }
+}
+
+/// internal: starts a SHA-256 computation.
+export fn crx_sha256_init(s: CrxSha256*) {
+  for i in 0..8 {
+    s->h[i] = g_crx_h256[i];
+  }
+  for i in 0..64 {
+    s->buf[i] = 0;
+  }
+  s->buflen = 0;
+  s->total = 0;
+}
+
+/// internal: feeds n bytes into a SHA-256 computation.
+export fn crx_sha256_update(s: CrxSha256*, p: uint8*, n: int64) {
+  s->total = s->total + (uint64)n;
+  var pos: int64 = 0;
+  if (s->buflen > 0) {
+    while (pos < n && s->buflen < 64) {
+      s->buf[s->buflen] = p[pos];
+      s->buflen = s->buflen + 1;
+      pos = pos + 1;
+    }
+    if (s->buflen < 64) { return; }
+    crx_sha256_blocks(s, &s->buf[0], 1);
+    s->buflen = 0;
+  }
+  var nb: int64 = (n - pos) >> 6;
+  if (nb > 0) {
+    crx_sha256_blocks(s, &p[pos], nb);
+    pos = pos + (nb << 6);
+  }
+  while (pos < n) {
+    s->buf[s->buflen] = p[pos];
+    s->buflen = s->buflen + 1;
+    pos = pos + 1;
+  }
+}
+
+/// internal: finishes SHA-256: writes 32 bytes to out, then wipes s.
+export fn crx_sha256_final(s: CrxSha256*, out: uint8*) {
+  var bits: uint64 = s->total << 3;
+  var i: int64 = s->buflen;
+  s->buf[i] = 128;
+  i = i + 1;
+  if (i > 56) {
+    while (i < 64) { s->buf[i] = 0; i = i + 1; }
+    crx_sha256_blocks(s, &s->buf[0], 1);
+    i = 0;
+  }
+  while (i < 56) { s->buf[i] = 0; i = i + 1; }
+  crx_store64be(&s->buf[56], bits);
+  crx_sha256_blocks(s, &s->buf[0], 1);
+  for j in 0..8 {
+    crx_store32be(&out[j * 4], s->h[j]);
+  }
+  cr_wipe((uint8*)s, (int64)sizeof(CrxSha256));
+}
+
+/// internal: starts a SHA-512 computation.
+export fn crx_sha512_init(s: CrxSha512*) {
+  for i in 0..8 {
+    s->h[i] = ((uint64)g_crx_h512[i * 2] << 32) | (uint64)g_crx_h512[i * 2 + 1];
+  }
+  for i in 0..128 {
+    s->buf[i] = 0;
+  }
+  s->buflen = 0;
+  s->total = 0;
+}
+
+/// internal: feeds n bytes into a SHA-512 computation.
+export fn crx_sha512_update(s: CrxSha512*, p: uint8*, n: int64) {
+  s->total = s->total + (uint64)n;
+  var pos: int64 = 0;
+  if (s->buflen > 0) {
+    while (pos < n && s->buflen < 128) {
+      s->buf[s->buflen] = p[pos];
+      s->buflen = s->buflen + 1;
+      pos = pos + 1;
+    }
+    if (s->buflen < 128) { return; }
+    crx_sha512_block(s, &s->buf[0]);
+    s->buflen = 0;
+  }
+  while (n - pos >= 128) {
+    crx_sha512_block(s, &p[pos]);
+    pos = pos + 128;
+  }
+  while (pos < n) {
+    s->buf[s->buflen] = p[pos];
+    s->buflen = s->buflen + 1;
+    pos = pos + 1;
+  }
+}
+
+/// internal: finishes SHA-512: writes 64 bytes to out, then wipes s.
+export fn crx_sha512_final(s: CrxSha512*, out: uint8*) {
+  var bits: uint64 = s->total << 3;
+  var hibits: uint64 = s->total >> 61;
+  var i: int64 = s->buflen;
+  s->buf[i] = 128;
+  i = i + 1;
+  if (i > 112) {
+    while (i < 128) { s->buf[i] = 0; i = i + 1; }
+    crx_sha512_block(s, &s->buf[0]);
+    i = 0;
+  }
+  while (i < 112) { s->buf[i] = 0; i = i + 1; }
+  crx_store64be(&s->buf[112], hibits);
+  crx_store64be(&s->buf[120], bits);
+  crx_sha512_block(s, &s->buf[0]);
+  for j in 0..8 {
+    crx_store64be(&out[j * 8], s->h[j]);
+  }
+  cr_wipe((uint8*)s, (int64)sizeof(CrxSha512));
+}
+
+/// internal: starts a SHA-384 computation.
+export fn crx_sha384_init(s: CrxSha384*) {
+  for i in 0..8 {
+    s->h[i] = ((uint64)g_crx_h384[i * 2] << 32) | (uint64)g_crx_h384[i * 2 + 1];
+  }
+  for i in 0..128 {
+    s->buf[i] = 0;
+  }
+  s->buflen = 0;
+  s->total = 0;
+}
+
+/// internal: feeds n bytes into a SHA-384 computation.
+export fn crx_sha384_update(s: CrxSha384*, p: uint8*, n: int64) {
+  crx_sha512_update((CrxSha512*)s, p, n);
+}
+
+/// internal: finishes SHA-384: writes 48 bytes to out, then wipes s.
+export fn crx_sha384_final(s: CrxSha384*, out: uint8*) {
+  var full: uint8[64];
+  crx_sha512_final((CrxSha512*)s, &full[0]);
+  for i in 0..48 {
+    out[i] = full[i];
+  }
+  cr_wipe(&full[0], 64);
+}

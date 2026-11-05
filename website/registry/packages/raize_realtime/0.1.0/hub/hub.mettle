@@ -1,0 +1,315 @@
+// raize/hub — WebSocket connections on one event-loop thread.
+//
+// An app creates one hub, starts it, and mounts WebSocket routes with
+// rz_hub_upgrade from an ordinary router handler:
+//
+//   var hub: RzHub* = rz_hub_new(rz_hub_opts_default());
+//   rz_hub_start(hub);
+//   ...
+//   fn h_socket(ctx: RzContext*) -> int32 {
+//     return rz_hub_upgrade(ctx, g_hub, &g_echo_handler);
+//   }
+//
+// The HTTP worker validates the upgrade, writes the 101 on its own (still
+// blocking) socket, and posts the fd to the hub; then it goes back to
+// accept(). From there on every callback for that socket runs on the hub
+// thread (see types.mettle for the contract).
+//
+// Thread rules for the send API:
+//   rz_hub_send / rz_hub_broadcast / rz_hub_close   hub thread (callbacks)
+//   rz_hub_post_send / rz_hub_post_broadcast /
+//   rz_hub_post_close                               any thread
+// The post_* forms copy the payload and go through the mailbox, so they
+// return false when the mailbox is full instead of blocking.
+
+import "std/mem";
+import "std/thread";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "../ws/handshake";
+import "../ws/frame";
+import "../poll/sys";
+import "../poll/poll";
+import "types";
+import "loop";
+
+export fn rz_hub_new(opts: RzHubOpts) -> RzHub* {
+  if (opts.max_conns < 1) { opts.max_conns = 1; }
+  if (opts.max_conns > RZ_HUB_MAX_CONNS) { opts.max_conns = RZ_HUB_MAX_CONNS; }
+  var hub: RzHub* = (RzHub*)calloc(1, sizeof(RzHub));
+  if (hub == 0) { return 0; }
+  hub->opts = opts;
+  hub->poll = rz_poll_new(RZ_HUB_MAILBOX);
+  hub->slots = (RzHubSlot*)calloc((int64)opts.max_conns, sizeof(RzHubSlot));
+  if (hub->poll == 0 || hub->slots == 0) {
+    if (hub->poll != 0) { rz_poll_free(hub->poll); }
+    if (hub->slots != 0) { free((rawptr)hub->slots); }
+    free((rawptr)hub);
+    return 0;
+  }
+  return hub;
+}
+
+// Records the started thread. Behind a call for the same reason as
+// rz_server_mark_stopped: M0122 is intra-procedural, and the hub is shared
+// with its thread by design (the thread never reads these two fields).
+fn rz_hub_mark_started(hub: RzHub*, h: int64) {
+  hub->thread = h;
+  hub->running = 1;
+}
+
+// Starts the hub thread. Returns 0, or -1 if the thread could not be made.
+export fn rz_hub_start(hub: RzHub*) -> int32 {
+  if (hub == 0 || hub->running != 0) { return -1; }
+  var h: int64 = CreateThread(0, 0, &rz_hub_thread_main, (cstring)hub, 0, 0);
+  if (h <= 0) { return -1; }
+  rz_hub_mark_started(hub, h);
+  return 0;
+}
+
+// Closes every socket (1001), stops the thread and joins it. Call from the
+// thread that started the hub, after the HTTP server has stopped.
+export fn rz_hub_stop(hub: RzHub*) {
+  if (hub == 0 || hub->running == 0) { return; }
+  var m: RzPollMsg;
+  m.kind = RZ_HUB_MSG_STOP;
+  m.a = 0;
+  m.b = 0;
+  m.ptr = 0;
+  while (!rz_poll_post(hub->poll, m)) { thread_sleep_ms(1); }
+  thread_join_infinite(hub->thread);
+  thread_close(hub->thread);
+  hub->running = 0;
+}
+
+export fn rz_hub_free(hub: RzHub*) {
+  if (hub == 0) { return; }
+  rz_hub_stop(hub);
+  // Adoptions still in the mailbox own an fd and two allocations.
+  var m: RzPollMsg;
+  while (rz_poll_take(hub->poll, &m)) {
+    if (m.kind == RZ_HUB_MSG_ADOPT) {
+      var a: RzHubAdopt* = (RzHubAdopt*)m.ptr;
+      rz_sys_close(a->fd);
+      rz__hub_drop(a->drop, a->arg);
+      if (a->early != 0) { free((rawptr)a->early); }
+      free((rawptr)a);
+    } else if (m.kind == RZ_HUB_MSG_CALL) {
+      // Run it anyway so its argument is freed by its owner.
+      var call: RzHubCall* = (RzHubCall*)m.ptr;
+      call->fn_(hub, call->arg);
+      free((rawptr)call);
+    } else if (m.ptr != 0) {
+      var b: RzHubBytes* = (RzHubBytes*)m.ptr;
+      if (b->data != 0) { free((rawptr)b->data); }
+      free((rawptr)b);
+    }
+  }
+  rz_poll_free(hub->poll);
+  free((rawptr)hub->slots);
+  free((rawptr)hub);
+}
+
+// Number of open sockets (approximate from other threads).
+export fn rz_hub_open_count(hub: RzHub*) -> int32 {
+  if (hub == 0) { return 0; }
+  return hub->open;
+}
+
+// Runs on the HTTP worker after the handler returned (RzUpgrade.adopt):
+// writes the 101, makes the socket nonblocking and posts it to the hub.
+fn rz_hub_adopt_from_worker(up: RzUpgrade*, fd: int64, early: uint8*, early_len: int64) -> int32 {
+  var hub: RzHub* = (RzHub*)up->owner;
+  var hu: Rz_HubUp* = (Rz_HubUp*)up->arg;
+  var head: RzBuf* = rz_buf_new();
+  var fail: int32 = 0;
+  if (rz_ws_write_101(up->key, "", head) < 0) { fail = 1; }
+  var a: RzHubAdopt* = 0;
+  if (fail == 0) {
+    a = (RzHubAdopt*)calloc(1, sizeof(RzHubAdopt));
+    if (a == 0) { fail = 2; }
+  }
+  if (fail == 0 && early_len > 0) {
+    a->early = (uint8*)malloc(early_len);
+    if (a->early == 0) { fail = 3; }
+    if (fail == 0) {
+      memcpy((rawptr)a->early, (rawptr)early, early_len);
+      a->early_len = early_len;
+    }
+  }
+  if (fail != 0) {
+    rz_buf_free(head);
+    if (a != 0) { free((rawptr)a); }
+    rz__hub_drop(hu->drop, hu->arg);
+    atomic_dec_i32(&hub->reserved);
+    return -1;
+  }
+  // From the first byte of the 101 on, the socket is ours: failures below
+  // close it here and still report success, so the worker leaves it alone.
+  var sent: int64 = 0;
+  while (sent < head->len) {
+    var n: int64 = rz_sys_send(fd, head->data + sent, head->len - sent);
+    if (n == RZ_EINTR) { continue; }
+    if (n <= 0) { break; }
+    sent = sent + n;
+  }
+  var head_len: int64 = head->len;
+  rz_buf_free(head);
+  a->fd = fd;
+  a->handler = hu->handler;
+  a->arg = hu->arg;
+  a->drop = hu->drop;
+  var m: RzPollMsg;
+  m.kind = RZ_HUB_MSG_ADOPT;
+  m.a = 0;
+  m.b = 0;
+  m.ptr = (rawptr)a;
+  if (sent < head_len || rz_sys_set_nonblock(fd) < 0 || !rz_poll_post(hub->poll, m)) {
+    rz_sys_close(fd);
+    rz__hub_drop(a->drop, a->arg);
+    if (a->early != 0) { free((rawptr)a->early); }
+    free((rawptr)a);
+    atomic_dec_i32(&hub->reserved);
+  }
+  return 0;
+}
+
+// Accepts the current request as a WebSocket for `handler`, or answers the
+// refusal (400/405/426, or 503 when the hub is full or stopped). Returns the
+// status, as router handlers do: 101 when the upgrade was accepted. on_open
+// receives the handler pointer itself.
+export fn rz_hub_upgrade(ctx: RzContext*, hub: RzHub*, handler: RzHubHandler*) -> int32 {
+  return rz_hub_upgrade_with(ctx, hub, handler, (rawptr)handler, 0);
+}
+
+/// rz_hub_upgrade with a per-socket argument: on_open receives `arg` instead of the
+/// handler pointer (channels pass the socket's RzConn this way).
+///
+/// in:      ctx the upgrade request; hub the hub; handler the callbacks
+///          arg   handed to on_open on the hub thread
+///          drop  frees `arg` on every path where on_open never runs (refusal,
+///                full mailbox, hub freed first); 0 when `arg` needs no freeing
+/// returns: the status: 101 accepted, else the refusal already answered
+/// owns:    takes `arg`: on_open owns it after it ran, `drop` frees it otherwise
+///          (a request the server aborts after the handler returned leaks it)
+/// thread:  the HTTP worker serving the request
+/// example:
+///   return rz_hub_upgrade_with(ctx, hub, &h, (rawptr)st, &st_free);
+export fn rz_hub_upgrade_with(ctx: RzContext*, hub: RzHub*, handler: RzHubHandler*, arg: rawptr, drop: fn(rawptr) -> void) -> int32 {
+  if (ctx == 0) { rz__hub_drop(drop, arg); return -1; }
+  var status: int32 = rz_ws_check_upgrade(ctx->req);
+  if (status != RZ_WS_UPGRADE_OK) {
+    rz__hub_drop(drop, arg);
+    rz_ws_refuse(ctx->resp, status);
+    return status;
+  }
+  if (hub == 0 || hub->running == 0 || handler == 0) {
+    rz__hub_drop(drop, arg);
+    rz_resp_text(ctx->resp, 503, "websocket hub unavailable\n");
+    return 503;
+  }
+  var reserved: int32 = atomic_inc_i32(&hub->reserved);
+  if (hub->open + reserved > hub->opts.max_conns) {
+    atomic_dec_i32(&hub->reserved);
+    rz__hub_drop(drop, arg);
+    ctx->resp->close_after = true;
+    rz_resp_text(ctx->resp, 503, "too many websockets\n");
+    return 503;
+  }
+  var up: RzUpgrade* = (RzUpgrade*)rz_arena_alloc_zeroed(ctx->arena, sizeof(RzUpgrade));
+  var hu: Rz_HubUp* = (Rz_HubUp*)rz_arena_alloc_zeroed(ctx->arena, sizeof(Rz_HubUp));
+  if (up == 0 || hu == 0) {
+    atomic_dec_i32(&hub->reserved);
+    rz__hub_drop(drop, arg);
+    rz_resp_text(ctx->resp, 500, "out of memory\n");
+    return 500;
+  }
+  hu->handler = handler;
+  hu->arg = arg;
+  hu->drop = drop;
+  up->adopt = &rz_hub_adopt_from_worker;
+  up->owner = (rawptr)hub;
+  up->arg = (rawptr)hu;
+  up->key = rz_req_header(ctx->req, "sec-websocket-key");
+  ctx->upgrade = up;
+  ctx->resp->status = 101;
+  return 101;
+}
+
+// ---- hub thread ----------------------------------------------------------
+
+export fn rz_hub_send(hub: RzHub*, sock: int64, text: string) -> int32 {
+  return rz_hub_send_op(hub, sock, RZ_WS_OP_TEXT, text);
+}
+
+export fn rz_hub_broadcast(hub: RzHub*, text: string) -> int32 {
+  return rz_hub_broadcast_op(hub, RZ_WS_OP_TEXT, text);
+}
+
+export fn rz_hub_close(hub: RzHub*, sock: int64, code: int32) {
+  rz_hub_close_sock(hub, sock, code);
+}
+
+// ---- any thread ----------------------------------------------------------
+
+fn rz_hub_post_bytes(hub: RzHub*, kind: int32, sock: int64, text: string) -> bool {
+  if (hub == 0) { return false; }
+  var b: RzHubBytes* = (RzHubBytes*)calloc(1, sizeof(RzHubBytes));
+  if (b == 0) { return false; }
+  b->len = (int64)text.length;
+  if (b->len > 0) {
+    b->data = (uint8*)malloc(b->len);
+    if (b->data == 0) { free((rawptr)b); return false; }
+    memcpy((rawptr)b->data, (rawptr)text.chars, b->len);
+  }
+  var m: RzPollMsg;
+  m.kind = kind;
+  m.a = sock;
+  m.b = (int64)RZ_WS_OP_TEXT;
+  m.ptr = (rawptr)b;
+  if (!rz_poll_post(hub->poll, m)) {
+    if (b->data != 0) { free((rawptr)b->data); }
+    free((rawptr)b);
+    return false;
+  }
+  return true;
+}
+
+export fn rz_hub_post_send(hub: RzHub*, sock: int64, text: string) -> bool {
+  return rz_hub_post_bytes(hub, RZ_HUB_MSG_SEND, sock, text);
+}
+
+export fn rz_hub_post_broadcast(hub: RzHub*, text: string) -> bool {
+  return rz_hub_post_bytes(hub, RZ_HUB_MSG_BROADCAST, 0, text);
+}
+
+export fn rz_hub_post_close(hub: RzHub*, sock: int64, code: int32) -> bool {
+  if (hub == 0) { return false; }
+  var m: RzPollMsg;
+  m.kind = RZ_HUB_MSG_CLOSE;
+  m.a = sock;
+  m.b = (int64)code;
+  m.ptr = 0;
+  return rz_poll_post(hub->poll, m);
+}
+
+// Runs fn_(hub, arg) on the hub thread. fn_ owns arg (and frees it), also
+// when the hub is being freed before it ran. Returns false when the mailbox
+// is full; arg then still belongs to the caller.
+export fn rz_hub_post_call(hub: RzHub*, fn_: fn(RzHub*, rawptr) -> void, arg: rawptr) -> bool {
+  if (hub == 0 || fn_ == 0) { return false; }
+  var call: RzHubCall* = (RzHubCall*)calloc(1, sizeof(RzHubCall));
+  if (call == 0) { return false; }
+  call->fn_ = fn_;
+  call->arg = arg;
+  var m: RzPollMsg;
+  m.kind = RZ_HUB_MSG_CALL;
+  m.a = 0;
+  m.b = 0;
+  m.ptr = (rawptr)call;
+  if (!rz_poll_post(hub->poll, m)) {
+    free((rawptr)call);
+    return false;
+  }
+  return true;
+}

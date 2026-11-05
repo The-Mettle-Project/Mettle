@@ -1,0 +1,171 @@
+// raize/middleware/auth_token — reading the credential off the request.
+//
+// This is the *parsing* half of the auth hook, split out of auth.mettle when
+// that file crossed the 400-product-line rule (tests/lint.sh). It is a pure
+// move: the exported names, their behaviour and their signatures are
+// unchanged, and `auth.mettle` imports this file, so every consumer of
+// `framework/middleware/auth` still sees `rz_auth_bearer_token` and
+// `RZ_AUTH_SCHEME_BEARER` through the transitive import.
+//
+// What lives here, and only this:
+//
+//   * where the credential is on the wire (Authorization: Bearer <token>);
+//   * the scheme match — case-insensitive, exactly one SP or HTAB after it;
+//   * trimming OWS from the value and from the token;
+//   * the `fn(RzRequest*, string*) -> int32` extractor shape, so an app can
+//     replace it (a cookie, X-Api-Key, a signed query parameter).
+//
+// What does *not* live here: the verifier hook, the realm, the challenge
+// header, and 401/403 mapping. Those are policy and stay in auth.mettle.
+//
+// ## The extractor signature is a pointer on purpose
+//
+// `fn(RzRequest*, string*) -> int32` rather than `fn(RzRequest*) -> string`.
+// The extractor is called through a function pointer that was installed in a
+// different module, and Mettle v0.17.0 mis-handles an aggregate in that
+// position: a string *by value* argument fails codegen
+// (`call_indirect_unsupported`, probe_abi_call_indirect.mettle), and a string
+// *return* from another module compiles and then jumps to address 0
+// (probe_abi_bad_return.mettle). The full note is at the top of auth.mettle;
+// probes are in tests/fixtures/middleware/ with a README.
+//
+// Contract of an extractor:
+//
+//   * always writes *out (empty when there is no credential), so a caller that
+//     ignores the return value cannot read a stale view;
+//   * returns 1 when it found a credential, 0 when the request carries none;
+//   * the view it writes is borrowed from the request and dies with it (the
+//     request arena owns the header storage);
+//   * it never allocates and never echoes the credential anywhere.
+//
+// No credential is not a failure here: "no Authorization header" and
+// "Authorization: Basic ..." both mean "this hook has nothing to verify", and
+// the verifier decides what that costs. Distinguishing them would put policy in
+// the parser.
+
+import "../str/str";
+import "../context/context";
+import "headers";
+
+// The scheme token this extractor understands. A server may still challenge
+// with another scheme (RzAuth.scheme is separate, see auth.mettle); this name
+// is only what the default extractor matches.
+export const RZ_AUTH_SCHEME_BEARER: string = "Bearer";
+
+// The default extractor: Authorization: Bearer <token>. The scheme is matched
+// case-insensitively and one SP or HTAB is required after it; anything else
+// (Basic, a bare token, "BearerX") yields 0. The token is trimmed of
+// leading/trailing OWS. The view written to *out points into the request's
+// header storage and lives as long as the request.
+export fn rz_auth_bearer_token(req: RzRequest*, out: string*) -> int32 {
+  if (out == 0) { return 0; }
+  out->chars = 0;
+  out->length = 0;
+  if (req == 0) { return 0; }
+  var v: string = rz_hdr_in_get(req, "Authorization");
+  if (v.length == 0) { return 0; }
+  var t: string = rz_header_trim(v);
+  if ((int64)t.length <= 6) { return 0; }
+  var scheme: string = rz_str_sub(t, 0, 6);
+  if (!rz_str_eq_ci(scheme, RZ_AUTH_SCHEME_BEARER)) { return 0; }
+  var c: int32 = (int32)t.chars[6];
+  if (c != 32 && c != 9) { return 0; }
+  var tok: string = rz_header_trim(rz_str_sub(t, 6, (int64)t.length));
+  out->chars = tok.chars;
+  out->length = tok.length;
+  if ((int64)tok.length == 0) { return 0; }
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// Run: ./mettle-build/bin/mettle test framework/middleware/auth_token.mettle
+// (the tests in auth.mettle cover the hook and the challenge; these cover the
+// parsing layer only, including the exact byte boundary after the scheme)
+// ---------------------------------------------------------------------------
+
+fn t_tok_hdr(req: RzRequest*, name: string, value: string) {
+  var at: int32 = req->header_count;
+  req->headers[at].name = name;
+  req->headers[at].value = value;
+  req->header_count = at + 1;
+}
+
+@test fn t_rz_auth_bearer_extractor() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var tok: string = rz_str_empty();
+  // no header at all: 0, and *out is written empty
+  if (rz_auth_bearer_token(&req, &tok) != 0) { return 3; }
+  if (tok.length != 0) { return 4; }
+  t_tok_hdr(&req, "Authorization", "Bearer abc123");
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 5; }
+  if (!rz_str_eq(tok, "abc123")) { return 6; }
+  // the scheme is a case-insensitive token
+  req.headers[0].value = "bearer abc123";
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 7; }
+  if (!rz_str_eq(tok, "abc123")) { return 8; }
+  req.headers[0].value = "BEARER abc123";
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 9; }
+  // the separator is one SP or HTAB (more is trimmed as OWS on the token)
+  req.headers[0].value = "Bearer\tabc123";
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 10; }
+  req.headers[0].value = "Bearer    abc123";
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 11; }
+  if (!rz_str_eq(tok, "abc123")) { return 12; }
+  // anything that is not "Bearer <token>" is no credential, not a bad token
+  req.headers[0].value = "Basic dXNlcjpwdw==";
+  if (rz_auth_bearer_token(&req, &tok) != 0) { return 13; }
+  req.headers[0].value = "BearerX abc";
+  if (rz_auth_bearer_token(&req, &tok) != 0) { return 14; }
+  req.headers[0].value = "Bearer";
+  if (rz_auth_bearer_token(&req, &tok) != 0) { return 15; }
+  req.headers[0].value = "Bearer    ";
+  if (rz_auth_bearer_token(&req, &tok) != 0) { return 16; }
+  // surrounding OWS on the whole value and on the token is trimmed
+  req.headers[0].value = "  Bearer   tok  ";
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 17; }
+  if (!rz_str_eq(tok, "tok")) { return 18; }
+  // a failing call clears a view the caller still held (no stale credential)
+  req.headers[0].value = "Basic x";
+  if (rz_auth_bearer_token(&req, &tok) != 0) { return 19; }
+  if (tok.length != 0) { return 20; }
+  return 0;
+}
+
+@test fn t_rz_auth_bearer_edges() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var tok: string = rz_str_empty();
+  // a null request and a null out-pointer are refused, not dereferenced
+  if (rz_auth_bearer_token(0, &tok) != 0) { return 3; }
+  if (rz_auth_bearer_token(&req, 0) != 0) { return 4; }
+  // the scheme lookup is case-insensitive, so the header *name* is too
+  t_tok_hdr(&req, "authorization", "Bearer lower-name");
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 5; }
+  if (!rz_str_eq(tok, "lower-name")) { return 6; }
+  // a token with punctuation / JWT shape is passed through untouched: it is
+  // the verifier's job to judge it, not the parser's
+  req.headers[0].value = "Bearer eyJhbGciOi.eyJzdWIi-9_ok";
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 7; }
+  if (!rz_str_eq(tok, "eyJhbGciOi.eyJzdWIi-9_ok")) { return 8; }
+  // a token containing spaces is truncated at nothing — it is returned whole
+  // (a malformed token is the verifier's 401 to give, not a parser crash)
+  req.headers[0].value = "Bearer two words";
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 9; }
+  if (!rz_str_eq(tok, "two words")) { return 10; }
+  // only the first Authorization header is read here (headers[0] still holds
+  // "Bearer two words"); refusing a duplicate is auth.mettle's job, because
+  // RFC 7235 makes two of them malformed rather than "pick one"
+  t_tok_hdr(&req, "Authorization", "Bearer second");
+  if (rz_auth_bearer_token(&req, &tok) != 1) { return 11; }
+  if (!rz_str_eq(tok, "two words")) { return 12; }
+  return 0;
+}

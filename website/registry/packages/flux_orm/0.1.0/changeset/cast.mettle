@@ -1,0 +1,293 @@
+// flux_orm/changeset/cast.mettle — user text to RcValue, the one place that
+// may coerce.
+//
+// The adapter produces the canonical arm for a column, core/meta narrows with
+// a range check and refuses a mismatched arm, and this file parses the text a
+// form or a CLI hands in. Nothing else turns "42" into 42.
+//
+// Parsing is strict:
+//
+//   - no trimming: " 42" and "42 " are RC_ERR_CAST, not 42;
+//   - no float -> int: "4.5" into RC_T_I64 is RC_ERR_CAST;
+//   - no exponent syntax: "1e5" is RC_ERR_CAST (write "100000.0");
+//   - booleans are exactly "1", "0", "true", "false" (lowercase);
+//   - a time is integer unix microseconds, UTC;
+//   - an empty string is "absent" (RcNull), so it is only accepted on a
+//     nullable column: on RC_F_NOT_NULL it is RC_ERR_CONSTRAINT;
+//   - a source longer than RC_CS_MAX_TEXT is RC_ERR_RANGE.
+//
+// Ownership: RcText and RcBlob are borrowed views (see core/value). A text
+// result keeps the caller's bytes; this module never clones and never frees.
+// Every reason string it hands back is static.
+
+import "std/conv";
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+
+// Longest text rc_cast_text will parse, in bytes (1 MiB). Longer text is
+// RC_ERR_RANGE.
+export const RC_CS_MAX_TEXT: int64 = 1048576;
+
+// The field's coercion family. RC_T_I64 and RC_T_U64 stay apart (a negative
+// number is not a uint64), everything else is its own family. RC_T_NULL and
+// RC_T_UNSUPPORTED mean "this column has no castable wire type".
+fn rc_cast_family(f: RcField) -> int32 {
+  if (f.ty == RC_T_I64) { return RC_T_I64; }
+  if (f.ty == RC_T_U64) { return RC_T_U64; }
+  if (f.ty == RC_T_F64) { return RC_T_F64; }
+  if (f.ty == RC_T_BOOL) { return RC_T_BOOL; }
+  if (f.ty == RC_T_TEXT) { return RC_T_TEXT; }
+  if (f.ty == RC_T_TIME) { return RC_T_TIME; }
+  if (f.ty == RC_T_BLOB) { return RC_T_BLOB; }
+  return RC_T_UNSUPPORTED;
+}
+
+// --- numeric scanners --------------------------------------------------------
+// Hand-rolled because std/conv's str_to_i64 collapses "not a number" and "out
+// of range" into one Err(string), and the caller must be able to tell CAST
+// from RANGE. No terminator is read: Mettle strings are length-delimited.
+
+fn rc_cast_parse_i64(s: string, out: int64*, why: string*) -> int32 {
+  *out = 0;
+  var n: int64 = (int64)s.length;
+  if (n <= 0 || s.chars == 0) {
+    *why = "empty text is not an integer";
+    return RC_ERR_CAST;
+  }
+  var i: int64 = 0;
+  var negative: bool = false;
+  if (s[0] == '-') {
+    negative = true;
+    i = 1;
+  } else if (s[0] == '+') {
+    i = 1;
+  }
+  if (i >= n) {
+    *why = "sign with no digits";
+    return RC_ERR_CAST;
+  }
+  // 2^63-1 for a positive number, 2^63 for a negative one.
+  var limit: uint64 = (uint64)9223372036854775807;
+  if (negative) { limit = ((uint64)9223372036854775807) + (uint64)1; }
+  var value: uint64 = 0;
+  while (i < n) {
+    var c: char = s[i];
+    if (!is_digit(c)) {
+      *why = "not a decimal integer";
+      return RC_ERR_CAST;
+    }
+    var digit: uint64 = (uint64)char_to_digit(c);
+    if (value > (limit - digit) / (uint64)10) {
+      *why = "integer out of range";
+      return RC_ERR_RANGE;
+    }
+    value = value * 10 + digit;
+    i = i + 1;
+  }
+  if (negative) {
+    if (value == limit) {
+      *out = -9223372036854775808;
+    } else {
+      *out = 0 - (int64)value;
+    }
+    return RC_OK;
+  }
+  *out = (int64)value;
+  return RC_OK;
+}
+
+// Decimal only: [+-]digits[.digits]. Accumulates an integer mantissa and then
+// divides by 10^fraction_digits once, so 4.5 is exact. A mantissa above 1e18
+// is RC_ERR_RANGE (no silent precision loss).
+fn rc_cast_parse_f64(s: string, out: float64*, why: string*) -> int32 {
+  *out = 0.0;
+  var n: int64 = (int64)s.length;
+  if (n <= 0 || s.chars == 0) {
+    *why = "empty text is not a number";
+    return RC_ERR_CAST;
+  }
+  var i: int64 = 0;
+  var negative: bool = false;
+  if (s[0] == '-') {
+    negative = true;
+    i = 1;
+  } else if (s[0] == '+') {
+    i = 1;
+  }
+  if (i >= n) {
+    *why = "sign with no digits";
+    return RC_ERR_CAST;
+  }
+  var mant: uint64 = 0;
+  var frac: int32 = 0;
+  var digits: int32 = 0;
+  var seen_dot: bool = false;
+  var mant_max: uint64 = 1000000000000000000;
+  while (i < n) {
+    var c: char = s[i];
+    if (c == '.') {
+      if (seen_dot) {
+        *why = "more than one decimal point";
+        return RC_ERR_CAST;
+      }
+      seen_dot = true;
+    } else if (!is_digit(c)) {
+      *why = "not a decimal number";
+      return RC_ERR_CAST;
+    } else {
+      if (mant > (mant_max - (uint64)9) / (uint64)10) {
+        *why = "number out of range";
+        return RC_ERR_RANGE;
+      }
+      mant = mant * 10 + (uint64)char_to_digit(c);
+      digits = digits + 1;
+      if (seen_dot) { frac = frac + 1; }
+    }
+    i = i + 1;
+  }
+  if (digits == 0) {
+    *why = "no digits";
+    return RC_ERR_CAST;
+  }
+  var v: float64 = (float64)mant;
+  var k: int32 = 0;
+  while (k < frac) {
+    v = v / 10.0;
+    k = k + 1;
+  }
+  if (negative) { v = 0.0 - v; }
+  *out = v;
+  return RC_OK;
+}
+
+// Exact match only. MeoDB has no BOOL and the wire form is 0/1, so the textual
+// forms a form post actually sends are accepted and nothing else.
+fn rc_cast_parse_bool(s: string, out: bool*, why: string*) -> int32 {
+  *out = false;
+  if (s == "1" || s == "true") {
+    *out = true;
+    return RC_OK;
+  }
+  if (s == "0" || s == "false") { return RC_OK; }
+  *why = "not a boolean";
+  return RC_ERR_CAST;
+}
+
+// --- the seam ----------------------------------------------------------------
+
+// Checks that a value's arm belongs to a field's declared type, so it may go
+// straight into rc_changeset_put. Not a cast: RcText or RcFloat into an
+// RC_T_I64 field is refused (parse text with rc_changeset_cast). RcInt and
+// RcUint are accepted for each other, since core/meta range-checks the
+// narrowing later. RcNull is always accepted; NOT NULL is the changeset's
+// check.
+//   f   the field (from rc_meta_field)
+//   v   the value; only its arm is looked at
+// Returns RC_OK when it fits; RC_ERR_CAST when the arm is wrong;
+// RC_ERR_UNSUPPORTED when the field's type cannot be written.
+export fn rc_cast_fits(f: RcField, v: RcValue) -> int32 {
+  var fam: int32 = rc_cast_family(f);
+  if (fam == RC_T_UNSUPPORTED) { return RC_ERR_UNSUPPORTED; }
+  var vt: int32 = rc_value_type(v);
+  if (vt == RC_T_NULL) { return RC_OK; }
+  if (fam == vt) { return RC_OK; }
+  if (fam == RC_T_I64 && vt == RC_T_U64) { return RC_OK; }
+  if (fam == RC_T_U64 && vt == RC_T_I64) { return RC_OK; }
+  return RC_ERR_CAST;
+}
+
+// Parses text into the RcValue for a field's declared type, by the rules in
+// the header. rc_changeset_cast calls this and records the result.
+//   f    the field (from rc_meta_field)
+//   s    the text; borrowed. An RC_T_TEXT result is RcText(s), a view of it
+//   out  receives the value (RcNull on failure); must not be 0
+//   why  optional (may be 0); on failure receives a static reason such as
+//        "not a decimal integer", and is untouched on success
+// Returns RC_OK, or:
+//   RC_ERR_USAGE        out is 0
+//   RC_ERR_CAST         the text is not that kind of value, or the field is
+//                       a blob (blobs have no text form)
+//   RC_ERR_RANGE        the right kind, but it does not fit: outside int64
+//                       (also for RC_T_U64), negative for RC_T_U64, more
+//                       than 18 digits for RC_T_F64; or s is over
+//                       RC_CS_MAX_TEXT bytes
+//   RC_ERR_CONSTRAINT   empty text on an RC_F_NOT_NULL field
+//   RC_ERR_UNSUPPORTED  the field's type has no castable form
+export fn rc_cast_text(f: RcField, s: string, out: RcValue*, why: string*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = RcNull;
+  var fam: int32 = rc_cast_family(f);
+  if (fam == RC_T_UNSUPPORTED) {
+    if (why != 0) { *why = "field type is not supported"; }
+    return RC_ERR_UNSUPPORTED;
+  }
+  if ((int64)s.length > RC_CS_MAX_TEXT) {
+    if (why != 0) { *why = "text longer than RC_CS_MAX_TEXT"; }
+    return RC_ERR_RANGE;
+  }
+  var empty: bool = false;
+  if (s.length == (uint64)0 || s.chars == 0) { empty = true; }
+  if (empty) {
+    if ((f.flags & RC_F_NOT_NULL) != 0) {
+      if (why != 0) { *why = "not null"; }
+      return RC_ERR_CONSTRAINT;
+    }
+    // "Absent" is a NULL, and only a nullable column may hold one.
+    *out = RcNull;
+    return RC_OK;
+  }
+  if (fam == RC_T_TEXT) {
+    // Borrowed, not copied: `s` belongs to the caller.
+    *out = RcText(s);
+    return RC_OK;
+  }
+  var reason: string = "";
+  if (fam == RC_T_I64 || fam == RC_T_U64 || fam == RC_T_TIME) {
+    var x: int64 = 0;
+    var rc: int32 = rc_cast_parse_i64(s, &x, &reason);
+    if (rc != RC_OK) {
+      if (why != 0) { *why = reason; }
+      return rc;
+    }
+    if (fam == RC_T_TIME) {
+      // unix micros, UTC — the same int64 the wire carries.
+      *out = RcTime(x);
+      return RC_OK;
+    }
+    if (fam == RC_T_U64) {
+      if (x < 0) {
+        if (why != 0) { *why = "negative number for an unsigned field"; }
+        return RC_ERR_RANGE;
+      }
+      *out = RcUint((uint64)x);
+      return RC_OK;
+    }
+    *out = RcInt(x);
+    return RC_OK;
+  }
+  if (fam == RC_T_F64) {
+    var d: float64 = 0.0;
+    var rc: int32 = rc_cast_parse_f64(s, &d, &reason);
+    if (rc != RC_OK) {
+      if (why != 0) { *why = reason; }
+      return rc;
+    }
+    *out = RcFloat(d);
+    return RC_OK;
+  }
+  if (fam == RC_T_BOOL) {
+    var b: bool = false;
+    var rc: int32 = rc_cast_parse_bool(s, &b, &reason);
+    if (rc != RC_OK) {
+      if (why != 0) { *why = reason; }
+      return rc;
+    }
+    *out = RcBool(b);
+    return RC_OK;
+  }
+  // RC_T_BLOB: there is no text spelling of a blob, on purpose.
+  if (why != 0) { *why = "no text cast for this field type"; }
+  return RC_ERR_CAST;
+}

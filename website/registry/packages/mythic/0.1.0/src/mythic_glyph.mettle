@@ -1,0 +1,194 @@
+// mythic_glyph: glyph rasterization + atlas cache (DECISIONS §7).
+// Key = (font, glyph, size_q = round(size_px*4), xbin 0..3). Bitmaps live in 1024x1024 A8 atlas
+// pages packed with shelves. When more than MYTHIC_ATLAS_MAX_PAGES pages exist at frame begin, the
+// cache is cleared and `gen` is bumped (overflow during a frame just adds a page).
+import "mythic_types";
+import "mythic_ttf";
+import "mythic_raster_path";
+
+export const MYTHIC_ATLAS_SIZE: int32 = 1024;
+export const MYTHIC_ATLAS_MAX_PAGES: int32 = 4;
+
+// Bitmap of one glyph: placed at (pen_x_floor + left, baseline + top), w x h, in atlas `page`.
+export struct MythicGlyphEntry { page: int32; x: int32; y: int32; w: int32; h: int32; left: int32; top: int32; }
+export struct MythicAtlasShelf { y: int32; h: int32; x: int32; }
+export struct MythicAtlasPage { px: uint8*; shelves: MythicVec<MythicAtlasShelf>; next_y: int32; }
+export struct MythicGlyphCache {
+  map: MythicMap<MythicGlyphEntry>;
+  pages: MythicVec<MythicAtlasPage>;
+  live_pages: int32;                 // pages in use (buffers beyond this are kept for reuse)
+  gen: int32;
+  acc: MythicAccum;
+  outline: MythicTtfOutline;
+}
+
+/// Cache key for a glyph (never 0).
+export fn mythic_glyph_key(font: int32, glyph: int32, size_q: int32, xbin: int32) -> uint64 {
+  var k: uint64 = ((uint64)(font & 0xFF) << (uint64)56) | ((uint64)(glyph & 0xFFFF) << (uint64)40)
+                | ((uint64)(size_q & 0xFFFFFFF) << (uint64)8) | ((uint64)(xbin & 3) << (uint64)1) | (uint64)1;
+  return k;
+}
+
+fn atlas_alloc(c: MythicGlyphCache*, w: int32, h: int32, out_page: int32*, out_x: int32*, out_y: int32*) -> bool {
+  var W: int32 = MYTHIC_ATLAS_SIZE;
+  if (w > W || h > W) { return false; }
+  var pi: int32 = 0;
+  while (true) {
+    if (pi >= c->live_pages) {
+      if (pi >= (int32)c->pages.len) {
+        var np: MythicAtlasPage;
+        np.px = (uint8*)malloc((int64)W * (int64)W);
+        mythic_vec_push<MythicAtlasPage>(&c->pages, np);
+      }
+      var fresh: MythicAtlasPage* = &c->pages.data[pi];
+      mythic_vec_clear<MythicAtlasShelf>(&fresh->shelves);
+      fresh->next_y = 0;
+      c->live_pages = pi + 1;
+    }
+    var pg: MythicAtlasPage* = &c->pages.data[pi];
+    // best existing shelf: tallest-enough with least waste
+    var best: int64 = -1;
+    var best_h: int32 = 100000;
+    for s: int64 in 0..pg->shelves.len {
+      var sh: MythicAtlasShelf* = &pg->shelves.data[s];
+      if (sh->h >= h && sh->h <= h + h / 4 + 2 && sh->x + w <= W && sh->h < best_h) { best = s; best_h = sh->h; }
+    }
+    if (best < 0 && pg->next_y + h <= W) {
+      var ns: MythicAtlasShelf = { y: pg->next_y, h: h, x: 0 };
+      mythic_vec_push<MythicAtlasShelf>(&pg->shelves, ns);
+      pg->next_y = pg->next_y + h;
+      best = pg->shelves.len - 1;
+    }
+    if (best >= 0) {
+      var sh2: MythicAtlasShelf* = &pg->shelves.data[best];
+      *out_page = pi; *out_x = sh2->x; *out_y = sh2->y;
+      sh2->x = sh2->x + w;
+      return true;
+    }
+    pi = pi + 1;
+  }
+  return false;
+}
+
+fn emit_contour(c: MythicGlyphCache*, s: int64, e: int64, sc: float32, ox: float32, oy: float32) {
+  var pts: MythicTtfPt* = c->outline.pts.data;
+  var a: MythicAccum* = &c->acc;
+  var n: int64 = e - s + 1;
+  if (n < 2) { return; }
+  var startx: float32 = 0.0; var starty: float32 = 0.0;
+  var first: int64 = 0; var last: int64 = 0;     // iterate indices first..last (inclusive), in order
+  if (pts[s].on != 0) {
+    startx = pts[s].x; starty = pts[s].y; first = s + 1; last = e;
+  } else if (pts[e].on != 0) {
+    startx = pts[e].x; starty = pts[e].y; first = s; last = e - 1;
+  } else {
+    startx = (pts[s].x + pts[e].x) * 0.5; starty = (pts[s].y + pts[e].y) * 0.5; first = s; last = e;
+  }
+  var curx: float32 = startx; var cury: float32 = starty;
+  var cx: float32 = 0.0; var cy: float32 = 0.0;
+  var pending: bool = false;
+  var i: int64 = first;
+  while (i <= last) {
+    var px: float32 = pts[i].x; var py: float32 = pts[i].y;
+    if (pts[i].on != 0) {
+      if (pending) {
+        mythic_r_acc_quad(a, curx * sc + ox, oy - cury * sc, cx * sc + ox, oy - cy * sc, px * sc + ox, oy - py * sc);
+      } else {
+        mythic_r_acc_line(a, curx * sc + ox, oy - cury * sc, px * sc + ox, oy - py * sc);
+      }
+      curx = px; cury = py; pending = false;
+    } else {
+      if (pending) {
+        var mx: float32 = (cx + px) * 0.5; var my: float32 = (cy + py) * 0.5;
+        mythic_r_acc_quad(a, curx * sc + ox, oy - cury * sc, cx * sc + ox, oy - cy * sc, mx * sc + ox, oy - my * sc);
+        curx = mx; cury = my;
+      }
+      cx = px; cy = py; pending = true;
+    }
+    i = i + 1;
+  }
+  if (pending) {
+    mythic_r_acc_quad(a, curx * sc + ox, oy - cury * sc, cx * sc + ox, oy - cy * sc, startx * sc + ox, oy - starty * sc);
+  } else {
+    mythic_r_acc_line(a, curx * sc + ox, oy - cury * sc, startx * sc + ox, oy - starty * sc);
+  }
+}
+
+fn ifloor(x: float32) -> int32 {
+  var i: int32 = (int32)x;
+  if ((float32)i > x) { i = i - 1; }
+  return i;
+}
+
+/// Returns the cached bitmap for a glyph, rasterizing it on a miss. `size_q` = round(size_px*4).
+/// Entries with w == 0 have no ink. The pointer is valid until the next mythic_glyph_get.
+export fn mythic_glyph_get(c: MythicGlyphCache*, t: MythicTtf*, font: int32, glyph: int32, size_q: int32, xbin: int32) -> MythicGlyphEntry* {
+  var key: uint64 = mythic_glyph_key(font, glyph, size_q, xbin);
+  var hit: MythicGlyphEntry* = mythic_map_get<MythicGlyphEntry>(&c->map, key, false);
+  if (hit != 0) { return hit; }
+  var ent: MythicGlyphEntry;
+  mythic_vec_clear<MythicTtfPt>(&c->outline.pts);
+  mythic_vec_clear<int32>(&c->outline.ends);
+  mythic_ttf_outline(t, glyph, &c->outline);
+  var np: int64 = c->outline.pts.len;
+  if (np > 0) {
+    var sc: float32 = (float32)size_q * 0.25 / (float32)t->upem;
+    var sub: float32 = (float32)xbin * 0.25;
+    var mnx: float32 = 1.0e9; var mny: float32 = 1.0e9; var mxx: float32 = -1.0e9; var mxy: float32 = -1.0e9;
+    for k: int64 in 0..np {
+      var p: MythicTtfPt = c->outline.pts.data[k];
+      if (p.x < mnx) { mnx = p.x; } if (p.x > mxx) { mxx = p.x; }
+      if (p.y < mny) { mny = p.y; } if (p.y > mxy) { mxy = p.y; }
+    }
+    var x0: int32 = ifloor(mnx * sc + sub);
+    var x1: int32 = ifloor(mxx * sc + sub) + 1;
+    var y0: int32 = ifloor(-mxy * sc);
+    var y1: int32 = ifloor(-mny * sc) + 1;
+    var w: int32 = x1 - x0;
+    var h: int32 = y1 - y0;
+    var page: int32 = 0; var ax: int32 = 0; var ay: int32 = 0;
+    if (w > 0 && h > 0 && atlas_alloc(c, w, h, &page, &ax, &ay)) {
+      mythic_r_acc_reset(&c->acc, w, h);
+      var ox: float32 = sub - (float32)x0;
+      var oy: float32 = -(float32)y0;
+      var cs: int64 = 0;
+      for ci: int64 in 0..c->outline.ends.len {
+        var ce: int64 = (int64)c->outline.ends.data[ci];
+        emit_contour(c, cs, ce, sc, ox, oy);
+        cs = ce + 1;
+      }
+      var pg: MythicAtlasPage* = &c->pages.data[page];
+      mythic_r_acc_to_a8(&c->acc, pg->px + (int64)ay * (int64)MYTHIC_ATLAS_SIZE + (int64)ax, MYTHIC_ATLAS_SIZE);
+      ent.page = page; ent.x = ax; ent.y = ay; ent.w = w; ent.h = h; ent.left = x0; ent.top = y0;
+    }
+  }
+  var slot: MythicGlyphEntry* = mythic_map_get<MythicGlyphEntry>(&c->map, key, true);
+  *slot = ent;
+  return slot;
+}
+
+/// Frame-begin maintenance: when the atlas has grown past MYTHIC_ATLAS_MAX_PAGES, clear it.
+/// Returns true when the cache was cleared.
+export fn mythic_glyph_frame_begin(c: MythicGlyphCache*) -> bool {
+  if (c->live_pages <= MYTHIC_ATLAS_MAX_PAGES) { return false; }
+  mythic_map_clear<MythicGlyphEntry>(&c->map);
+  c->live_pages = 0;
+  c->gen = c->gen + 1;
+  return true;
+}
+
+/// Frees the atlas pages, the map and the rasterizer scratch.
+export fn mythic_glyph_cache_free(c: MythicGlyphCache*) {
+  for i: int64 in 0..c->pages.len {
+    var pg: MythicAtlasPage* = &c->pages.data[i];
+    if (pg->px != 0) { free((rawptr)pg->px); }
+    mythic_vec_free<MythicAtlasShelf>(&pg->shelves);
+  }
+  mythic_vec_free<MythicAtlasPage>(&c->pages);
+  mythic_map_free<MythicGlyphEntry>(&c->map);
+  if (c->acc.acc != 0) { free((rawptr)c->acc.acc); }
+  c->acc.acc = 0; c->acc.cap = 0;
+  mythic_vec_free<MythicTtfPt>(&c->outline.pts);
+  mythic_vec_free<int32>(&c->outline.ends);
+  c->live_pages = 0;
+}

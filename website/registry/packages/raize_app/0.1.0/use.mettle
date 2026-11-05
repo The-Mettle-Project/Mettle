@@ -1,0 +1,188 @@
+// raize/app/use — global middleware: rz_use and the facades over framework/middleware.
+// reference: app
+// thread: declarations in the declaration function only; the steps run on workers.
+//
+// The chain rz_run builds is: recover (always first) -> the rz_use* calls in
+// declaration order -> body cap (413) -> guards -> router. One process has one
+// chain, so the facades publish their configuration once, before serving.
+
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/context";
+import "raize_core/middleware/chain";
+import "raize_core/middleware/recover";
+import "raize_core/middleware/logging";
+import "raize_core/middleware/cors";
+import "raize_core/middleware/auth";
+import "raize_core/middleware/headers";
+import "types";
+import "declare";
+
+/// Adds a global middleware step. It runs for every request, after recover and
+/// the steps declared before it, and continues the request by calling next(ctx)
+/// (or answers it itself and returns that status without calling next).
+///
+/// in:      app   the app
+///          name  a label for errors and stats; copied
+///          step  fn(ctx, next) -> int32: `return next(ctx);` to continue
+/// returns: nothing; more than 7 steps or a duplicate name is reported by rz_run
+/// owns:    nothing kept from the caller
+/// thread:  the declaration function only; `step` runs on worker threads
+/// example:
+///   fn timing(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+///     var rc: int32 = next(ctx);
+///     rz_ctx_set_header(ctx, "X-Served-By", "raize");
+///     return rc;
+///   }
+///   rz_use(app, "timing", &timing);
+export fn rz_use(app: RzApp*, name: string, step: fn(RzContext*, fn(RzContext*) -> int32) -> int32) {
+  if (app == 0) { return; }
+  var st: Rz_AppState* = app->state;
+  if (step == 0) {
+    rz__app_error(app, "rz_use(\"{name}\"): no step function — pass &your_middleware");
+    return;
+  }
+  for i in 0..st->nmws {
+    if (rz_str_eq(st->mws[i].name, name)) {
+      rz__app_error(app, "rz_use(\"{name}\"): declared twice — use each middleware once");
+      return;
+    }
+  }
+  if (st->nmws >= RZ__APP_MAX_MIDDLEWARE) {
+    rz__app_error(app, "rz_use(\"{name}\"): more than {RZ__APP_MAX_MIDDLEWARE} middleware — combine steps, or use rz_guard for per-prefix checks");
+    return;
+  }
+  st->mws[st->nmws].name = rz_str_dup(name);
+  st->mws[st->nmws].step = step;
+  st->nmws = st->nmws + 1;
+}
+
+/// Logs one access line per request (verb, path, status, bytes, time) to stdout.
+///
+/// in:      app the app
+/// returns: nothing; declaring it twice is reported by rz_run
+/// owns:    nothing
+/// thread:  the declaration function only
+/// example:
+///   rz_use_logging(app);
+export fn rz_use_logging(app: RzApp*) {
+  rz_use(app, "logging", &rz_mw_logging);
+}
+
+/// Answers CORS preflights (204) and adds Access-Control-Allow-Origin to responses
+/// for cross-origin requests from `origin`. Credentials are not allowed.
+///
+/// in:      app     the app
+///          origin  "*" for any site, or one exact origin "https://app.example"; copied
+/// returns: nothing; an empty origin, one with CR/LF, or a second rz_use_cors is
+///          reported by rz_run
+/// owns:    nothing kept from the caller
+/// thread:  the declaration function only
+/// example:
+///   rz_use_cors(app, "*");
+export fn rz_use_cors(app: RzApp*, origin: string) {
+  if (app == 0) { return; }
+  var st: Rz_AppState* = app->state;
+  if (st->cors != 0) {
+    rz__app_error(app, "rz_use_cors(\"{origin}\"): declared twice — call it once");
+    return;
+  }
+  var c: RzCors* = rz_cors_new();
+  if (c == 0) { rz__app_error(app, "rz_use_cors: out of memory — add memory"); return; }
+  c->origin = rz_str_dup(origin);   // RzCors borrows; the app owns this copy
+  st->cors = c;
+  if (rz_cors_validate(c) != 0) {
+    rz__app_error(app, "rz_use_cors(\"{origin}\"): not an origin — pass \"*\" or one origin such as \"https://app.example\"");
+    return;
+  }
+  rz_use(app, "cors", &rz_mw_cors);
+}
+
+/// Adds a header to every response (security headers, for example). A handler
+/// that sets the same header replaces it. Repeat the call for more headers.
+///
+/// in:      app    the app
+///          name   a header token ("X-Frame-Options"); copied
+///          value  no CR, LF or NUL; copied
+/// returns: nothing; a bad name or value, or more than 8 headers, is reported by rz_run
+/// owns:    nothing kept from the caller
+/// thread:  the declaration function only
+/// example:
+///   rz_use_headers(app, "X-Content-Type-Options", "nosniff");
+export fn rz_use_headers(app: RzApp*, name: string, value: string) {
+  if (app == 0) { return; }
+  var st: Rz_AppState* = app->state;
+  if (!rz_header_name_ok(name) || !rz_hdr_crlf_ok(value)) {
+    rz__app_error(app, "rz_use_headers(\"{name}\"): not a valid header — use a token name and a value without line breaks");
+    return;
+  }
+  if (st->nheaders >= RZ__APP_MAX_HEADERS) {
+    rz__app_error(app, "rz_use_headers(\"{name}\"): more than {RZ__APP_MAX_HEADERS} headers — set the rest in a middleware");
+    return;
+  }
+  if (st->nheaders == 0) { rz_use(app, "headers", &rz__mw_app_headers); }
+  st->headers[st->nheaders].key = rz_str_dup(name);
+  st->headers[st->nheaders].value = rz_str_dup(value);
+  st->nheaders = st->nheaders + 1;
+}
+
+/// internal: app/use (the step rz_use_headers installs). Sets the declared headers,
+/// then continues; a handler's own value for the same name replaces them.
+/// in:      ctx the request; next the rest of the chain
+/// returns: next's status
+/// owns:    nothing
+export fn rz__mw_app_headers(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  var st: Rz_AppState* = rz__app_current()->state;
+  for i in 0..st->nheaders {
+    rz_resp_header_set(ctx->resp, st->headers[i].key, st->headers[i].value);
+  }
+  return next(ctx);
+}
+
+/// Requires `Authorization: Bearer <token>` on every request. `verify(ctx, token,
+/// user)` checks the token and returns 200 (allowed; set *user to the principal,
+/// which handlers read with rz_ctx_user), 401 or 403. Denials are answered with
+/// a WWW-Authenticate challenge. For per-prefix protection use rz_guard instead.
+///
+/// in:      app     the app
+///          verify  fn(ctx, token: string*, user: rawptr*) -> int32
+/// returns: nothing; a second call or a 0 verifier is reported by rz_run
+/// owns:    nothing
+/// thread:  the declaration function only; `verify` runs on worker threads
+/// example:
+///   rz_use_bearer_auth(app, &check_token);
+export fn rz_use_bearer_auth(app: RzApp*, verify: fn(RzContext*, string*, rawptr*) -> int32) {
+  if (app == 0) { return; }
+  var st: Rz_AppState* = app->state;
+  if (st->auth != 0) {
+    rz__app_error(app, "rz_use_bearer_auth: declared twice — call it once");
+    return;
+  }
+  var a: RzAuth* = rz_auth_new();
+  if (a == 0) { rz__app_error(app, "rz_use_bearer_auth: out of memory — add memory"); return; }
+  st->auth = a;
+  if (rz_auth_set_verifier(a, verify) != 0) {
+    rz__app_error(app, "rz_use_bearer_auth: no verifier — pass &your_verify");
+    return;
+  }
+  rz_use(app, "auth", &rz_mw_auth);
+}
+
+/// internal: app/run. Builds recover -> declared middleware -> `terminal` and
+/// publishes the CORS/auth configuration.
+/// in:      app the app; terminal the body cap + guards + router step
+/// returns: nothing; errors are recorded
+/// owns:    the chain belongs to the app
+export fn rz__app_build_chain(app: RzApp*, terminal: fn(RzContext*) -> int32) {
+  var st: Rz_AppState* = app->state;
+  if (st->cors != 0 && rz_cors_use(st->cors) != 0) { rz__app_error(app, "rz_use_cors: the CORS settings are invalid — pass \"*\" or one origin"); }
+  if (st->auth != 0 && rz_auth_use(st->auth) != 0) { rz__app_error(app, "rz_use_bearer_auth: the auth settings are invalid — pass a verifier"); }
+  st->chain = rz_chain_new();
+  if (st->chain == 0) { rz__app_error(app, "out of memory making the middleware chain — add memory"); return; }
+  var bad: bool = rz_chain_add(st->chain, "recover", &rz_mw_recover) != 0;
+  for i in 0..st->nmws {
+    if (rz_chain_add(st->chain, st->mws[i].name, st->mws[i].step) != 0) { bad = true; }
+  }
+  if (rz_chain_set_terminal(st->chain, terminal) != 0) { bad = true; }
+  if (bad) { rz__app_error(app, "cannot build the middleware chain — declare at most {RZ__APP_MAX_MIDDLEWARE} middleware"); }
+}

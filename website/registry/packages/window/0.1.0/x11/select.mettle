@@ -1,0 +1,400 @@
+// x11/select: the clipboard (ICCCM 2.0 section 2, "Peer-to-Peer Communication
+// by Means of Selections") and drag and drop (the XDND protocol, version 5,
+// freedesktop.org).
+//
+// A hidden helper window owns the CLIPBOARD selection, so copied text stays
+// available after the window that copied it closes (until the program exits).
+import "std/mem";
+import "../core/types.mettle";
+import "wire.mettle";
+
+const SEL_TIMEOUT_MS: int64 = 1000;
+
+// ---------- serving our clipboard ----------
+fn notify(requestor: int64, sel: int64, target: int64, prop: int64, time: int64) {
+  var e: uint8[32];
+  window_zero(&e[0], 32);
+  e[0] = (uint8)31;
+  window_wr32(&e[0], 4, time); window_wr32(&e[0], 8, requestor); window_wr32(&e[0], 12, sel);
+  window_wr32(&e[0], 16, target); window_wr32(&e[0], 20, prop);
+  window_x11_send_event(requestor, 0, &e[0]);
+}
+
+// Longest prefix that fits one ChangeProperty request, cut at a UTF-8 boundary.
+fn fit(s: uint8*, n: int64) -> int64 {
+  var lim: int64 = g_x11.max_req * 4 - 28;
+  if (n <= lim) { return n; }
+  return window_utf8_valid_prefix(s, lim);
+}
+
+fn to_latin1(s: uint8*, n: int64, out_len: int64*) -> uint8* {
+  var d: uint8* = (uint8*)malloc(n + 1);
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var b: int64 = (int64)s[i];
+    var cp: int64 = 63;
+    var adv: int64 = 1;
+    if (b < 0x80) { cp = b; }
+    else if (b >= 0xC0 && b < 0xE0 && i + 1 < n) { cp = ((b & 31) << 6) | ((int64)s[i + 1] & 63); adv = 2; }
+    else if (b >= 0xE0 && b < 0xF0) { adv = 3; }
+    else if (b >= 0xF0) { adv = 4; }
+    if (cp > 255) { cp = 63; }
+    d[o] = (uint8)cp;
+    o = o + 1;
+    i = i + adv;
+  }
+  *out_len = o;
+  return d;
+}
+
+fn serve(e: uint8*) {
+  var time: int64 = window_rd32(e, 4);
+  var requestor: int64 = window_rd32(e, 12);
+  var sel: int64 = window_rd32(e, 16);
+  var target: int64 = window_rd32(e, 20);
+  var prop: int64 = window_rd32(e, 24);
+  if (prop == 0) { prop = target; }                   // obsolete clients leave the property None
+  var owned: bool = sel == g_x11.a_clipboard && g_x11.own_clip;
+  var answer: int64 = 0;
+  if (owned && target == g_x11.a_targets) {
+    var a: int64[5];
+    a[0] = g_x11.a_targets; a[1] = g_x11.a_utf8; a[2] = 31; a[3] = g_x11.a_text; a[4] = g_x11.a_text_plain_utf8;
+    window_x11_set_atoms(requestor, prop, &a[0], 5);
+    answer = prop;
+  } else if (owned && (target == g_x11.a_utf8 || target == g_x11.a_text || target == g_x11.a_text_plain_utf8)) {
+    var ty: int64 = g_x11.a_utf8;
+    if (target == g_x11.a_text_plain_utf8) { ty = target; }
+    window_x11_change_property(requestor, prop, ty, 8, g_x11.clip, fit(g_x11.clip, g_x11.clip_len), 0);
+    answer = prop;
+  } else if (owned && target == 31) {
+    var ln: int64 = 0;
+    var l1: uint8* = to_latin1(g_x11.clip, g_x11.clip_len, &ln);
+    var lim: int64 = g_x11.max_req * 4 - 28;
+    if (ln > lim) { ln = lim; }
+    window_x11_change_property(requestor, prop, 31, 8, l1, ln, 0);
+    free(l1);
+    answer = prop;
+  }
+  notify(requestor, sel, target, answer, time);
+}
+
+// Called for SelectionClear / SelectionRequest even while waiting for a reply.
+fn sel_hook(e: uint8*) -> bool {
+  var t: int64 = (int64)e[0] & 127;
+  if (t == 30) {
+    if (window_rd32(e, 8) != g_x11.helper) { return false; }
+    serve(e);
+    return true;
+  }
+  if (t == 29) {
+    if (window_rd32(e, 8) != g_x11.helper) { return false; }
+    // A clear stamped before our newest SetSelectionOwner is about an older ownership.
+    if (g_x11.own_time != 0 && window_rd32(e, 4) < g_x11.own_time) { return true; }
+    if (window_rd32(e, 12) == g_x11.a_clipboard && g_x11.own_clip) {
+      g_x11.own_clip = false;
+      var ev: WindowEvent; ev.kind = WINDOW_EV_CLIPBOARD; window_push_event(&ev);
+    }
+    return true;
+  }
+  return false;
+}
+
+export fn window_x11_select_init() { g_x11_sel_hook = &sel_hook; }
+export fn window_x11_select_shutdown() { g_x11_sel_hook = (fn(uint8*) -> bool)0; }
+
+// ---------- clipboard API ----------
+fn get_owner(sel: int64) -> int64 {
+  var r: uint8[8];
+  window_x11_req(&r[0], 23, 0, 8);
+  window_wr32(&r[0], 4, sel);
+  var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 8));
+  if (p == 0) { return 0; }
+  var owner: int64 = window_rd32(p, 8);
+  free(p);
+  return owner;
+}
+
+fn set_owner(sel: int64, time: int64) {
+  var r: uint8[16];
+  window_x11_req(&r[0], 22, 0, 16);
+  window_wr32(&r[0], 4, g_x11.helper); window_wr32(&r[0], 8, sel); window_wr32(&r[0], 12, time);
+  window_x11_send(&r[0], 16);
+}
+
+export fn window_x11_clipboard_set(s: uint8*, n: int64) {
+  if (g_x11.dead) { return; }
+  if (g_x11.clip != 0) { free(g_x11.clip); }
+  var m: int64 = window_utf8_valid_prefix(s, n);
+  g_x11.clip = (uint8*)malloc(m + 1);
+  for i: int64 in 0..m { g_x11.clip[i] = s[i]; }
+  g_x11.clip[m] = (uint8)0;
+  g_x11.clip_len = m;
+  // CurrentTime, as GLFW and SDL do: a stale input time can make the server ignore us.
+  var t: int64 = 0;
+  set_owner(g_x11.a_clipboard, t);
+  var owner: int64 = get_owner(g_x11.a_clipboard);
+  g_x11.own_clip = owner == g_x11.helper;
+  g_x11.own_time = t;
+}
+
+// Waits for SelectionNotify (code 31) for `target` on the helper, or a
+// PropertyNotify NewValue (code 28) on `prop`. Other events are parked.
+fn wait_for(code: int64, target: int64, prop: int64, e: uint8*) -> bool {
+  var deadline: int64 = window_now_us() + SEL_TIMEOUT_MS * 1000;
+  while (!g_x11.dead) {
+    // Already parked?
+    var n: int64 = g_x11.rq_tail - g_x11.rq_head;
+    for i: int64 in 0..n {
+      var at: int64 = ((g_x11.rq_head + i) % 2048) * WINDOW_X11_EV_SIZE;
+      var p: uint8* = &g_x11.rq[at];
+      var t: int64 = (int64)p[0] & 127;
+      var hit: bool = false;
+      if (code == 31 && t == 31 && window_rd32(p, 8) == g_x11.helper && window_rd32(p, 16) == target) { hit = true; }
+      if (code == 28 && t == 28 && window_rd32(p, 4) == g_x11.helper && window_rd32(p, 8) == prop && p[16] == (uint8)0) { hit = true; }
+      if (hit) {
+        for k: int64 in 0..32 { e[k] = p[k]; }
+        p[0] = (uint8)127;                       // consumed: translate ignores code 127
+        return true;
+      }
+    }
+    var left: int64 = (deadline - window_now_us()) / 1000;
+    if (left <= 0) { return false; }
+    if (window_x11_readable(left)) { window_x11_read_pending(); }
+  }
+  return false;
+}
+
+fn read_incr(prop: int64, out: WindowBytes*, ptype: int64*) -> bool {
+  var cap: int64 = 4096;
+  out->data = (uint8*)malloc(cap);
+  out->data[0] = (uint8)0;
+  out->len = 0;
+  var e: uint8[32];
+  var guard: int32 = 0;
+  while (guard < 100000) {
+    guard = guard + 1;
+    var c: WindowBytes;
+    var fmt: int64 = 0;
+    if (!wait_for(28, 0, prop, &e[0]) || !window_x11_get_property(g_x11.helper, prop, true, &c, ptype, &fmt)) {
+      free(out->data);
+      out->data = (uint8*)0;
+      return false;
+    }
+    var n: int64 = c.len;
+    if (out->len + n + 1 > cap) {
+      var nc: int64 = (out->len + n + 1) * 2;
+      if (nc > 268435456) { free(c.data); free(out->data); out->data = (uint8*)0; return false; }
+      var nb: uint8* = (uint8*)malloc(nc);
+      for i: int64 in 0..out->len { nb[i] = out->data[i]; }
+      free(out->data);
+      out->data = nb;
+      cap = nc;
+    }
+    for i: int64 in 0..n { out->data[out->len + i] = c.data[i]; }
+    out->len = out->len + n;
+    out->data[out->len] = (uint8)0;
+    free(c.data);
+    if (n == 0) { return true; }
+  }
+  return false;
+}
+
+fn latin1_to_utf8(b: WindowBytes*) {
+  var d: uint8* = (uint8*)malloc(b->len * 2 + 1);
+  var o: int64 = 0;
+  for i: int64 in 0..b->len { o = o + (int64)window_utf8_encode((uint32)b->data[i], &d[o]); }
+  d[o] = (uint8)0;
+  free(b->data);
+  b->data = d;
+  b->len = o;
+}
+
+// 1 = got data, 0 = refused (or no owner), -1 = timeout or error.
+fn convert(sel: int64, target: int64, time: int64, out: WindowBytes*) -> int32 {
+  var r: uint8[24];
+  window_x11_req(&r[0], 24, 0, 24);
+  window_wr32(&r[0], 4, g_x11.helper); window_wr32(&r[0], 8, sel); window_wr32(&r[0], 12, target);
+  window_wr32(&r[0], 16, g_x11.a_sel); window_wr32(&r[0], 20, time);
+  window_x11_send(&r[0], 24);
+  var e: uint8[32];
+  if (!wait_for(31, target, 0, &e[0])) { return -1; }
+  var prop: int64 = window_rd32(&e[0], 20);
+  if (prop == 0) { return 0; }
+  var ty: int64 = 0;
+  var fmt: int64 = 0;
+  if (!window_x11_get_property(g_x11.helper, prop, true, out, &ty, &fmt)) { return -1; }
+  if (ty == g_x11.a_incr) {
+    free(out->data);
+    if (!read_incr(prop, out, &ty)) { return -1; }
+  }
+  if (ty == 31) { latin1_to_utf8(out); }
+  out->len = window_utf8_valid_prefix(out->data, out->len);
+  return 1;
+}
+
+export fn window_x11_clipboard_get() -> string {
+  var empty: string = "";
+  if (g_x11.dead) { return empty; }
+  window_x11_read_pending();
+  if (g_x11.own_clip) {
+    var d: uint8* = (uint8*)malloc(g_x11.clip_len + 1);
+    for i: int64 in 0..g_x11.clip_len + 1 { d[i] = g_x11.clip[i]; }
+    var s: string; s.chars = d; s.length = (uint64)g_x11.clip_len;
+    return s;
+  }
+  if (get_owner(g_x11.a_clipboard) == 0) { return empty; }
+  var b: WindowBytes;
+  var rc: int32 = convert(g_x11.a_clipboard, g_x11.a_utf8, 0, &b);
+  if (rc == 0) { rc = convert(g_x11.a_clipboard, 31, 0, &b); }
+  if (rc != 1) { return empty; }
+  var s2: string; s2.chars = b.data; s2.length = (uint64)b.len;
+  return s2;
+}
+
+// ---------- drag and drop (XDND 5) ----------
+fn dnd_win(w: Window*) -> int64 {
+  var native: WindowNative;
+  window_x11_native(w, &native);
+  return native.x11_window;
+}
+
+var g_dnd_win: Window*;
+var g_dnd_source: int64;
+var g_dnd_version: int64;
+var g_dnd_type: int64;
+var g_dnd_entered: bool;
+var g_dnd_x: float64;
+var g_dnd_y: float64;
+
+fn pick_type(t: int64, best: int64) -> int64 {
+  // Preference: file list, then UTF-8 text, then plain text.
+  if (t == 0) { return best; }
+  if (t == g_x11.a_uri_list) { return t; }
+  if (best == g_x11.a_uri_list) { return best; }
+  if (t == g_x11.a_utf8 || t == g_x11.a_text_plain_utf8) { return t; }
+  if (best == g_x11.a_utf8 || best == g_x11.a_text_plain_utf8) { return best; }
+  if (t == g_x11.a_text_plain || t == 31) { return t; }
+  return best;
+}
+
+fn finish(accepted: bool) {
+  var flag: int64 = 0;
+  var action: int64 = 0;
+  if (accepted) { flag = 1; action = g_x11.a_xdnd_copy; }
+  if (g_dnd_win != 0 && g_dnd_source != 0) {
+    window_x11_client_message(g_dnd_source, g_dnd_source, g_x11.a_xdnd_finished, dnd_win(g_dnd_win), flag, action, 0, 0, 0);
+  }
+  g_dnd_source = 0;
+  g_dnd_type = 0;
+  g_dnd_entered = false;
+}
+
+/// Handles an XdndEnter / Position / Leave / Drop ClientMessage for window w.
+export fn window_x11_dnd_message(w: Window*, e: uint8*) {
+  var mtype: int64 = window_rd32(e, 8);
+  var src: int64 = window_rd32(e, 12);
+  if (mtype == g_x11.a_xdnd_enter) {
+    g_dnd_win = w;
+    g_dnd_source = src;
+    g_dnd_version = (window_rd32(e, 16) >> 24) & 255;
+    g_dnd_type = 0;
+    g_dnd_entered = false;
+    if (g_dnd_version > 5) { g_dnd_source = 0; return; }
+    if ((window_rd32(e, 16) & 1) != 0) {
+      var b: WindowBytes; var ty: int64 = 0; var fmt: int64 = 0;
+      if (window_x11_get_property(src, g_x11.a_xdnd_typelist, false, &b, &ty, &fmt)) {
+        if (fmt == 32) {
+          var n: int64 = b.len / 4;
+          if (n > 64) { n = 64; }
+          for i: int64 in 0..n { g_dnd_type = pick_type(window_rd32(b.data, i * 4), g_dnd_type); }
+        }
+        free(b.data);
+      }
+    } else {
+      for i: int64 in 0..3 { g_dnd_type = pick_type(window_rd32(e, 20 + i * 4), g_dnd_type); }
+    }
+    return;
+  }
+  if (g_dnd_source == 0 || src != g_dnd_source || w != g_dnd_win) { return; }
+  if (mtype == g_x11.a_xdnd_position) {
+    var xy: int64 = window_rd32(e, 20);
+    var rx: int64 = (xy >> 16) & 0xFFFF;
+    var ry: int64 = xy & 0xFFFF;
+    if (rx >= 32768) { rx = rx - 65536; }
+    if (ry >= 32768) { ry = ry - 65536; }
+    g_dnd_x = (float64)(rx - (int64)w->x) / (float64)g_x11.scale;
+    g_dnd_y = (float64)(ry - (int64)w->y) / (float64)g_x11.scale;
+    var ev: WindowEvent;
+    ev.win = w; ev.x = g_dnd_x; ev.y = g_dnd_y;
+    ev.kind = WINDOW_EV_DROP_MOVE;
+    if (!g_dnd_entered) { ev.kind = WINDOW_EV_DROP_ENTER; g_dnd_entered = true; }
+    window_push_event(&ev);
+    var accept: int64 = 2;                            // keep sending positions
+    var action: int64 = 0;
+    if (g_dnd_type != 0) { accept = 3; action = g_x11.a_xdnd_copy; }
+    window_x11_client_message(src, src, g_x11.a_xdnd_status, dnd_win(w), accept, 0, 0, action, 0);
+    return;
+  }
+  if (mtype == g_x11.a_xdnd_leave) {
+    var lv: WindowEvent; lv.kind = WINDOW_EV_DROP_LEAVE; lv.win = w; window_push_event(&lv);
+    g_dnd_source = 0;
+    g_dnd_entered = false;
+    return;
+  }
+  if (mtype == g_x11.a_xdnd_drop) {
+    if (g_dnd_type == 0) {
+      var lv2: WindowEvent; lv2.kind = WINDOW_EV_DROP_LEAVE; lv2.win = w; window_push_event(&lv2);
+      finish(false);
+      return;
+    }
+    var time: int64 = 0;
+    if (g_dnd_version >= 1) { time = window_rd32(e, 20); }
+    var r: uint8[24];
+    window_x11_req(&r[0], 24, 0, 24);
+    window_wr32(&r[0], 4, dnd_win(w)); window_wr32(&r[0], 8, g_x11.a_xdnd_selection); window_wr32(&r[0], 12, g_dnd_type);
+    window_wr32(&r[0], 16, g_x11.a_dnd_prop); window_wr32(&r[0], 20, time);
+    window_x11_send(&r[0], 24);
+  }
+}
+
+// The XdndSelection data arrived (SelectionNotify for our drop).
+fn dnd_data(e: uint8*) {
+  var w: Window* = g_dnd_win;
+  if (w == 0 || g_dnd_source == 0) { return; }
+  var prop: int64 = window_rd32(e, 20);
+  if (prop == 0) { finish(false); return; }
+  var b: WindowBytes; var ty: int64 = 0; var fmt: int64 = 0;
+  if (!window_x11_get_property(dnd_win(w), prop, true, &b, &ty, &fmt)) { finish(false); return; }
+  var ev: WindowEvent;
+  ev.win = w; ev.x = g_dnd_x; ev.y = g_dnd_y;
+  if (g_dnd_type == g_x11.a_uri_list) {
+    var paths: uint8* = (uint8*)malloc(b.len + 1);
+    var n: int64 = window_uri_list_to_paths(b.data, b.len, paths);
+    free(b.data);
+    ev.kind = WINDOW_EV_DROP_FILES;
+    ev.data = paths; ev.data_len = n;
+  } else {
+    if (ty == 31 || g_dnd_type == g_x11.a_text_plain) { latin1_to_utf8(&b); }
+    b.len = window_utf8_valid_prefix(b.data, b.len);
+    ev.kind = WINDOW_EV_DROP_TEXT;
+    ev.data = b.data; ev.data_len = b.len;
+  }
+  if (g_window.drop_data != 0) { free(g_window.drop_data); }
+  g_window.drop_data = ev.data;
+  window_push_event(&ev);
+  finish(true);
+}
+
+/// SelectionClear / SelectionRequest / SelectionNotify from the normal event path.
+export fn window_x11_selection_event(e: uint8*) {
+  var t: int64 = (int64)e[0] & 127;
+  if (t == 29 || t == 30) {
+    if (!sel_hook(e) && t == 30) {
+      // A request for a window we do not serve: refuse it so the requestor does not hang.
+      notify(window_rd32(e, 12), window_rd32(e, 16), window_rd32(e, 20), 0, window_rd32(e, 4));
+    }
+    return;
+  }
+  if (t == 31 && window_rd32(e, 12) == g_x11.a_xdnd_selection) { dnd_data(e); }
+}

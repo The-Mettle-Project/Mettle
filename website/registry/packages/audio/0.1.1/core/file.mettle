@@ -1,0 +1,52 @@
+// Reading and writing whole files.
+
+import "std/io";
+import "std/mem";
+import "status";
+import "buf";
+
+// A NUL-terminated copy of a path for fopen. Caller frees.
+fn cpath(path: string) -> uint8* {
+  var n: int64 = (int64)path.length;
+  var p: uint8* = (uint8*)malloc(n + 1);
+  if (p == 0) { return p; }
+  // byte by byte: a path built with + has no allocation record under
+  // --safe, and memcpy on it would trap there
+  for i in 0..n { p[i] = (uint8)path[i]; }
+  p[n] = 0;
+  return p;
+}
+
+/// Appends the bytes of a file to `out`. out->limit caps the size.
+export fn audio_file_read(path: string, out: AudioBuf*) -> int32 {
+  var cp: uint8* = cpath(path);
+  if (cp == 0) { return AUDIO_E_MEM; }
+  var fp: cstring = fopen((cstring)cp, "rb");
+  free(cp);
+  if (fp == 0) { return AUDIO_E_IO; }
+  var rc: int32 = AUDIO_OK;
+  while (true) {
+    rc = audio_buf_reserve(out, 65536);
+    if (rc != AUDIO_OK) { break; }
+    var room: int64 = out->cap - out->len;
+    var got: int64 = fread((cstring)(out->data + out->len), 1, room, fp);
+    if (got <= 0) { break; }
+    out->len = out->len + got;
+  }
+  fclose(fp);
+  return rc;
+}
+
+/// Writes n bytes to a file, replacing it.
+export fn audio_file_write(path: string, p: uint8*, n: int64) -> int32 {
+  var cp: uint8* = cpath(path);
+  if (cp == 0) { return AUDIO_E_MEM; }
+  var fp: cstring = fopen((cstring)cp, "wb");
+  free(cp);
+  if (fp == 0) { return AUDIO_E_IO; }
+  var put: int64 = 0;
+  if (n > 0) { put = fwrite((cstring)p, 1, n, fp); }
+  var c: int32 = fclose(fp);
+  if (put != n || c != 0) { return AUDIO_E_IO; }
+  return AUDIO_OK;
+}

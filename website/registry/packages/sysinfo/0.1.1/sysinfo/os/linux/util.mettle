@@ -1,0 +1,585 @@
+// Shared helpers for the Linux backend: reading /proc and /sys files into
+// reusable buffers, a small text scanner, path building without allocation,
+// and string pools that own the strings handed to the caller.
+import "std/mem";
+import "std/file";
+import "std/fs";
+
+// ---- buffers and files -----------------------------------------------------
+
+// A growable byte buffer, reused between refreshes.
+export struct SysinfoLxBuf { p: uint8*; cap: int64; n: int64; }
+
+export fn sysinfo_lx_buf_init(b: SysinfoLxBuf*, cap: int64) {
+  b->p = (uint8*)malloc(cap);
+  b->cap = cap;
+  b->n = 0;
+}
+
+export fn sysinfo_lx_buf_free(b: SysinfoLxBuf*) {
+  if (b->p != 0) { free(b->p); }
+  b->p = (uint8*)0;
+  b->cap = 0;
+  b->n = 0;
+}
+
+fn sysinfo_lx_buf_grow(b: SysinfoLxBuf*) {
+  var cap: int64 = b->cap * 2;
+  if (cap < 4096) { cap = 4096; }
+  var p: uint8* = (uint8*)malloc(cap);
+  if (b->n > 0) { memcpy(p, b->p, b->n); }
+  if (b->p != 0) { free(b->p); }
+  b->p = p;
+  b->cap = cap;
+}
+
+// Reads everything from an open descriptor, starting at offset 0, into b.
+// Works for procfs and sysfs files kept open between refreshes. Returns the
+// length or a negative error.
+export fn sysinfo_lx_fd_slurp(fd: int64, b: SysinfoLxBuf*) -> int64 {
+  b->n = 0;
+  if (b->cap == 0) { sysinfo_lx_buf_grow(b); }
+  while (true) {
+    if (b->n == b->cap) { sysinfo_lx_buf_grow(b); }
+    var r: int64 = file_read_at(fd, b->p + b->n, b->cap - b->n, b->n);
+    if (r < 0) {
+      if (b->n > 0) { return b->n; }
+      return r;
+    }
+    if (r == 0) { break; }
+    b->n = b->n + r;
+  }
+  return b->n;
+}
+
+// Opens a file for reading. Returns the descriptor or a negative error.
+export fn sysinfo_lx_open(path: string) -> int64 {
+  return file_open(path, FILE_READ);
+}
+
+export fn sysinfo_lx_close(fd: int64) {
+  if (fd >= 0) { file_close(fd); }
+}
+
+// Reads a whole file into b. Returns the length or a negative error.
+export fn sysinfo_lx_slurp(path: string, b: SysinfoLxBuf*) -> int64 {
+  b->n = 0;
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return fd; }
+  var r: int64 = sysinfo_lx_fd_slurp(fd, b);
+  file_close(fd);
+  return r;
+}
+
+// Reads a short file (a sysfs attribute) into buf, without the trailing
+// newline. Returns the length, or a negative error.
+export fn sysinfo_lx_read_small(path: string, buf: uint8*, cap: int64) -> int64 {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return fd; }
+  var got: int64 = 0;
+  while (got < cap) {
+    var r: int64 = file_read_at(fd, buf + got, cap - got, got);
+    if (r <= 0) { break; }
+    got = got + r;
+  }
+  file_close(fd);
+  while (got > 0 && (buf[got - 1] == (uint8)10 || buf[got - 1] == (uint8)32)) { got = got - 1; }
+  return got;
+}
+
+// Reads an open short file again from the start.
+export fn sysinfo_lx_fd_small(fd: int64, buf: uint8*, cap: int64) -> int64 {
+  if (fd < 0) { return -1; }
+  var got: int64 = 0;
+  while (got < cap) {
+    var r: int64 = file_read_at(fd, buf + got, cap - got, got);
+    if (r < 0) { return r; }
+    if (r == 0) { break; }
+    got = got + r;
+  }
+  while (got > 0 && (buf[got - 1] == (uint8)10 || buf[got - 1] == (uint8)32)) { got = got - 1; }
+  return got;
+}
+
+// Parses a whole number at the start of buf[0..n] (leading blanks and a
+// sign allowed). ok says whether any digit was seen.
+export fn sysinfo_lx_parse_i64(buf: uint8*, n: int64, ok: bool*) -> int64 {
+  var s: SysinfoLxScan = sysinfo_lx_scan(buf, n);
+  sysinfo_lx_skip(&s);
+  var a: int64 = s.i;
+  if (s.i < s.n && s.p[s.i] == (uint8)45) { a = a + 1; }
+  var v: int64 = sysinfo_lx_i64(&s);
+  *ok = s.i > a;
+  return v;
+}
+
+// Reads a file that holds one whole number. Returns fallback when the file
+// is missing or holds no number.
+export fn sysinfo_lx_read_i64(path: string, fallback: int64) -> int64 {
+  var tmp: uint8[64];
+  var n: int64 = sysinfo_lx_read_small(path, &tmp[0], 64);
+  if (n <= 0) { return fallback; }
+  var ok: bool = false;
+  var v: int64 = sysinfo_lx_parse_i64(&tmp[0], n, &ok);
+  if (!ok) { return fallback; }
+  return v;
+}
+
+// The same for a file kept open.
+export fn sysinfo_lx_fd_i64(fd: int64, fallback: int64) -> int64 {
+  var tmp: uint8[64];
+  var n: int64 = sysinfo_lx_fd_small(fd, &tmp[0], 64);
+  if (n <= 0) { return fallback; }
+  var ok: bool = false;
+  var v: int64 = sysinfo_lx_parse_i64(&tmp[0], n, &ok);
+  if (!ok) { return fallback; }
+  return v;
+}
+
+// ---- views -----------------------------------------------------------------
+
+export fn sysinfo_lx_view(p: uint8*, n: int64) -> string {
+  var w: string;
+  w.chars = p;
+  w.length = (uint64)0;
+  if (n > 0) { w.length = (uint64)n; }
+  return w;
+}
+
+export fn sysinfo_lx_eq(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  for k in 0..a.length { if (a[k] != b[k]) { return false; } }
+  return true;
+}
+
+export fn sysinfo_lx_starts(a: string, pre: string) -> bool {
+  if (a.length < pre.length) { return false; }
+  for k in 0..pre.length { if (a[k] != pre[k]) { return false; } }
+  return true;
+}
+
+export fn sysinfo_lx_ends(a: string, suf: string) -> bool {
+  if (a.length < suf.length) { return false; }
+  var off: uint64 = a.length - suf.length;
+  for k in 0..suf.length { if (a[off + k] != suf[k]) { return false; } }
+  return true;
+}
+
+// True when every byte of s is a decimal digit (and s is not empty).
+export fn sysinfo_lx_all_digits(s: string) -> bool {
+  if (s.length == (uint64)0) { return false; }
+  for k in 0..s.length {
+    var c: uint8 = (uint8)s[k];
+    if (c < (uint8)48 || c > (uint8)57) { return false; }
+  }
+  return true;
+}
+
+// The part of s after the last '/'.
+export fn sysinfo_lx_base(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  var k: int64 = n;
+  while (k > 0 && s[k - 1] != '/') { k = k - 1; }
+  return sysinfo_lx_view(s.chars + k, n - k);
+}
+
+// ---- scanner ---------------------------------------------------------------
+
+// A cursor over text.
+export struct SysinfoLxScan { p: uint8*; n: int64; i: int64; }
+
+export fn sysinfo_lx_scan(p: uint8*, n: int64) -> SysinfoLxScan {
+  var s: SysinfoLxScan;
+  s.p = p;
+  s.n = n;
+  if (n < 0) { s.n = 0; }
+  s.i = 0;
+  return s;
+}
+
+export fn sysinfo_lx_scan_str(t: string) -> SysinfoLxScan {
+  return sysinfo_lx_scan(t.chars, (int64)t.length);
+}
+
+export fn sysinfo_lx_end(s: SysinfoLxScan*) -> bool { return s->i >= s->n; }
+
+fn sysinfo_lx_blank(c: uint8) -> bool { return c == (uint8)32 || c == (uint8)9; }
+
+// Skips spaces and tabs.
+export fn sysinfo_lx_skip(s: SysinfoLxScan*) {
+  while (s->i < s->n && sysinfo_lx_blank(s->p[s->i])) { s->i = s->i + 1; }
+}
+
+export fn sysinfo_lx_u64(s: SysinfoLxScan*) -> uint64 {
+  sysinfo_lx_skip(s);
+  var v: uint64 = (uint64)0;
+  while (s->i < s->n) {
+    var c: uint8 = s->p[s->i];
+    if (c < (uint8)48 || c > (uint8)57) { break; }
+    v = v * (uint64)10 + (uint64)(c - (uint8)48);
+    s->i = s->i + 1;
+  }
+  return v;
+}
+
+export fn sysinfo_lx_i64(s: SysinfoLxScan*) -> int64 {
+  sysinfo_lx_skip(s);
+  var neg: bool = false;
+  if (s->i < s->n && s->p[s->i] == (uint8)45) { neg = true; s->i = s->i + 1; }
+  var v: int64 = (int64)sysinfo_lx_u64(s);
+  if (neg) { return -v; }
+  return v;
+}
+
+// A decimal with an optional fraction, such as "3600.123".
+export fn sysinfo_lx_f64(s: SysinfoLxScan*) -> float64 {
+  sysinfo_lx_skip(s);
+  var neg: bool = false;
+  if (s->i < s->n && s->p[s->i] == (uint8)45) { neg = true; s->i = s->i + 1; }
+  var v: float64 = (float64)sysinfo_lx_u64(s);
+  if (s->i < s->n && s->p[s->i] == (uint8)46) {
+    s->i = s->i + 1;
+    var scale: float64 = 0.1;
+    while (s->i < s->n) {
+      var c: uint8 = s->p[s->i];
+      if (c < (uint8)48 || c > (uint8)57) { break; }
+      v = v + scale * (float64)(c - (uint8)48);
+      scale = scale / 10.0;
+      s->i = s->i + 1;
+    }
+  }
+  if (neg) { return -v; }
+  return v;
+}
+
+// A hexadecimal number, with or without "0x".
+export fn sysinfo_lx_hex(s: SysinfoLxScan*) -> uint64 {
+  sysinfo_lx_skip(s);
+  if (s->i + 1 < s->n && s->p[s->i] == (uint8)48 && (s->p[s->i + 1] == (uint8)120 || s->p[s->i + 1] == (uint8)88)) {
+    s->i = s->i + 2;
+  }
+  var v: uint64 = (uint64)0;
+  while (s->i < s->n) {
+    var c: uint8 = s->p[s->i];
+    var d: int32 = -1;
+    if (c >= (uint8)48 && c <= (uint8)57) { d = (int32)c - 48; }
+    else if (c >= (uint8)97 && c <= (uint8)102) { d = (int32)c - 87; }
+    else if (c >= (uint8)65 && c <= (uint8)70) { d = (int32)c - 55; }
+    if (d < 0) { break; }
+    v = (v << (uint64)4) | (uint64)d;
+    s->i = s->i + 1;
+  }
+  return v;
+}
+
+// The next word: bytes up to a blank or newline.
+export fn sysinfo_lx_word(s: SysinfoLxScan*) -> string {
+  sysinfo_lx_skip(s);
+  var a: int64 = s->i;
+  while (s->i < s->n) {
+    var c: uint8 = s->p[s->i];
+    if (sysinfo_lx_blank(c) || c == (uint8)10) { break; }
+    s->i = s->i + 1;
+  }
+  return sysinfo_lx_view(s->p + a, s->i - a);
+}
+
+// The rest of the line without its newline; moves past the newline.
+export fn sysinfo_lx_line(s: SysinfoLxScan*) -> string {
+  var a: int64 = s->i;
+  while (s->i < s->n && s->p[s->i] != (uint8)10) { s->i = s->i + 1; }
+  var w: string = sysinfo_lx_view(s->p + a, s->i - a);
+  if (s->i < s->n) { s->i = s->i + 1; }
+  return w;
+}
+
+export fn sysinfo_lx_next_line(s: SysinfoLxScan*) {
+  while (s->i < s->n && s->p[s->i] != (uint8)10) { s->i = s->i + 1; }
+  if (s->i < s->n) { s->i = s->i + 1; }
+}
+
+// Skips one byte if it is c.
+export fn sysinfo_lx_eat(s: SysinfoLxScan*, c: uint8) -> bool {
+  if (s->i < s->n && s->p[s->i] == c) { s->i = s->i + 1; return true; }
+  return false;
+}
+
+// True when the text at the cursor starts with t (the cursor stays).
+export fn sysinfo_lx_at(s: SysinfoLxScan*, t: string) -> bool {
+  if (s->i + (int64)t.length > s->n) { return false; }
+  for k in 0..t.length {
+    if (s->p[s->i + (int64)k] != (uint8)t[k]) { return false; }
+  }
+  return true;
+}
+
+// Moves past the next ':' on this line, then past blanks. Returns false if
+// the line has none.
+export fn sysinfo_lx_after_colon(s: SysinfoLxScan*) -> bool {
+  while (s->i < s->n && s->p[s->i] != (uint8)58 && s->p[s->i] != (uint8)10) { s->i = s->i + 1; }
+  if (!sysinfo_lx_eat(s, (uint8)58)) { return false; }
+  sysinfo_lx_skip(s);
+  return true;
+}
+
+// Trims blanks from both ends of a view.
+export fn sysinfo_lx_trim(t: string) -> string {
+  var a: int64 = 0;
+  var b: int64 = (int64)t.length;
+  while (a < b && (t[a] == ' ' || t[a] == '\t' || t[a] == '\n')) { a = a + 1; }
+  while (b > a && (t[b - 1] == ' ' || t[b - 1] == '\t' || t[b - 1] == '\n')) { b = b - 1; }
+  return sysinfo_lx_view(t.chars + a, b - a);
+}
+
+// ---- paths -----------------------------------------------------------------
+
+// Builds a path in a fixed buffer without allocating. Long paths are cut.
+export struct SysinfoLxPath { b: uint8[512]; n: int64; }
+
+export fn sysinfo_lx_path_reset(p: SysinfoLxPath*) { p->n = 0; }
+
+export fn sysinfo_lx_path_add(p: SysinfoLxPath*, t: string) {
+  for k in 0..t.length {
+    if (p->n >= 511) { return; }
+    p->b[p->n] = (uint8)t[k];
+    p->n = p->n + 1;
+  }
+}
+
+export fn sysinfo_lx_path_num(p: SysinfoLxPath*, v: int64) {
+  var tmp: uint8[24];
+  var n: int64 = sysinfo_lx_fmt_i64(&tmp[0], v);
+  sysinfo_lx_path_add(p, sysinfo_lx_view(&tmp[0], n));
+}
+
+export fn sysinfo_lx_path_str(p: SysinfoLxPath*) -> string {
+  return sysinfo_lx_view(&p->b[0], p->n);
+}
+
+// Starts a path with the root prefix (empty for the live system).
+export fn sysinfo_lx_path_at(p: SysinfoLxPath*, root: string, rest: string) {
+  p->n = 0;
+  sysinfo_lx_path_add(p, root);
+  sysinfo_lx_path_add(p, rest);
+}
+
+// Writes v in decimal. Returns the length (at most 20).
+export fn sysinfo_lx_fmt_i64(out: uint8*, v: int64) -> int64 {
+  var tmp: uint8[24];
+  var k: int32 = 0;
+  var neg: bool = v < 0;
+  var x: uint64 = (uint64)v;
+  if (neg) { x = (uint64)0 - (uint64)v; }
+  if (x == (uint64)0) { tmp[0] = (uint8)48; k = 1; }
+  while (x > (uint64)0) {
+    tmp[k] = (uint8)((uint64)48 + x % (uint64)10);
+    x = x / (uint64)10;
+    k = k + 1;
+  }
+  var n: int64 = 0;
+  if (neg) { out[0] = (uint8)45; n = 1; }
+  while (k > 0) { k = k - 1; out[n] = tmp[k]; n = n + 1; }
+  return n;
+}
+
+// ---- string pools ----------------------------------------------------------
+
+// Owns copies of strings. Chunks never move, so views stay valid until the
+// pool is reset. Each chunk starts with a pointer to the previous one.
+export struct SysinfoLxPool { head: uint8*; cur: uint8*; cap: int64; used: int64; }
+
+export fn sysinfo_lx_pool_add_bytes(pool: SysinfoLxPool*, p: uint8*, n: int64) -> string {
+  if (n <= 0) { return sysinfo_lx_view(p, 0); }
+  if (pool->used + n > pool->cap) {
+    var size: int64 = pool->cap * 2;
+    if (size < n + 64) { size = n + 64; }
+    if (size < 4096) { size = 4096; }
+    var c: uint8* = (uint8*)malloc(size + 8);
+    var link: uint8** = (uint8**)c;
+    *link = pool->head;
+    pool->head = c;
+    pool->cur = c + 8;
+    pool->cap = size;
+    pool->used = 0;
+  }
+  var dst: uint8* = pool->cur + pool->used;
+  memcpy(dst, p, n);
+  pool->used = pool->used + n;
+  return sysinfo_lx_view(dst, n);
+}
+
+export fn sysinfo_lx_pool_add(pool: SysinfoLxPool*, s: string) -> string {
+  return sysinfo_lx_pool_add_bytes(pool, s.chars, (int64)s.length);
+}
+
+// Forgets every string. Keeps the newest (largest) chunk for reuse.
+export fn sysinfo_lx_pool_reset(pool: SysinfoLxPool*) {
+  if (pool->head == 0) { return; }
+  var link: uint8** = (uint8**)pool->head;
+  var c: uint8* = *link;
+  while (c != 0) {
+    var next: uint8* = *((uint8**)c);
+    free(c);
+    c = next;
+  }
+  *link = (uint8*)0;
+  pool->used = 0;
+}
+
+export fn sysinfo_lx_pool_free(pool: SysinfoLxPool*) {
+  sysinfo_lx_pool_reset(pool);
+  if (pool->head != 0) { free(pool->head); }
+  pool->head = (uint8*)0;
+  pool->cur = (uint8*)0;
+  pool->cap = 0;
+  pool->used = 0;
+}
+
+// Two pools used in turn, so that strings from the last refresh can be
+// copied into the new one and the caller's views live one refresh longer.
+export struct SysinfoLxPools { a: SysinfoLxPool; b: SysinfoLxPool; flip: int32; }
+
+// Switches to the other pool and empties it. Returns it.
+export fn sysinfo_lx_pools_next(pp: SysinfoLxPools*) -> SysinfoLxPool* {
+  pp->flip = 1 - pp->flip;
+  var p: SysinfoLxPool* = &pp->a;
+  if (pp->flip == 1) { p = &pp->b; }
+  sysinfo_lx_pool_reset(p);
+  return p;
+}
+
+export fn sysinfo_lx_pools_free(pp: SysinfoLxPools*) {
+  sysinfo_lx_pool_free(&pp->a);
+  sysinfo_lx_pool_free(&pp->b);
+}
+
+// ---- arrays ----------------------------------------------------------------
+
+// Makes room for `need` elements of `elem` bytes. New space is zeroed.
+// Returns the (possibly new) array; *cap is updated.
+export fn sysinfo_lx_grow(arr: uint8*, cap: int32*, need: int32, elem: int64) -> uint8* {
+  if (need <= *cap && arr != 0) { return arr; }
+  var nc: int32 = *cap * 2;
+  if (nc < need) { nc = need; }
+  if (nc < 8) { nc = 8; }
+  var p: uint8* = (uint8*)malloc((int64)nc * elem);
+  memset(p, 0, (int64)nc * elem);
+  if (arr != 0) {
+    if (*cap > 0) { memcpy(p, arr, (int64)*cap * elem); }
+    free(arr);
+  }
+  *cap = nc;
+  return p;
+}
+
+// ---- rates -----------------------------------------------------------------
+
+// Change per second between two counters. A counter that went backwards
+// (a reset or a wrap) gives 0.
+export fn sysinfo_lx_rate(now: int64, before: int64, secs: float64) -> float64 {
+  if (secs <= 0.0 || now < before) { return 0.0; }
+  return (float64)(now - before) / secs;
+}
+
+export fn sysinfo_lx_fs_exists(path: string) -> bool { return fs_exists(path); }
+
+// ---- sorted directory listings ---------------------------------------------
+
+// The names in a directory, sorted so that "hwmon2" comes before "hwmon10".
+// Reused between calls.
+export struct SysinfoLxNames {
+  text: SysinfoLxBuf;
+  off: int64*;              // start of each name in text
+  len: int32*;
+  order: int32*;
+  n: int32;
+  cap: int32;
+}
+
+// Compares two names with digit runs taken as numbers.
+export fn sysinfo_lx_natcmp(a: string, b: string) -> int32 {
+  var i: int64 = 0;
+  var j: int64 = 0;
+  var na: int64 = (int64)a.length;
+  var nb: int64 = (int64)b.length;
+  while (i < na && j < nb) {
+    var ca: uint8 = (uint8)a[i];
+    var cb: uint8 = (uint8)b[j];
+    var da: bool = ca >= (uint8)48 && ca <= (uint8)57;
+    var db: bool = cb >= (uint8)48 && cb <= (uint8)57;
+    if (da && db) {
+      var x: uint64 = (uint64)0;
+      var y: uint64 = (uint64)0;
+      while (i < na && a[i] >= '0' && a[i] <= '9') { x = x * (uint64)10 + (uint64)((int32)a[i] - 48); i = i + 1; }
+      while (j < nb && b[j] >= '0' && b[j] <= '9') { y = y * (uint64)10 + (uint64)((int32)b[j] - 48); j = j + 1; }
+      if (x < y) { return -1; }
+      if (x > y) { return 1; }
+      continue;
+    }
+    if (ca < cb) { return -1; }
+    if (ca > cb) { return 1; }
+    i = i + 1;
+    j = j + 1;
+  }
+  if (na - i < nb - j) { return -1; }
+  if (na - i > nb - j) { return 1; }
+  return 0;
+}
+
+export fn sysinfo_lx_names_at(l: SysinfoLxNames*, i: int32) -> string {
+  var k: int32 = l->order[i];
+  return sysinfo_lx_view(l->text.p + l->off[k], (int64)l->len[k]);
+}
+
+// Lists a directory (without "." and ".."), names starting with `prefix`
+// only. Returns the count, or -1 when it cannot be opened.
+export fn sysinfo_lx_names(path: string, prefix: string, l: SysinfoLxNames*) -> int32 {
+  l->n = 0;
+  l->text.n = 0;
+  var d: FsDir;
+  var e: FsDirEntry;
+  if (fs_dir_open(path, &d) != 0) { return -1; }
+  while (fs_dir_next(&d, &e) == 1) {
+    if (!sysinfo_lx_starts(e.name, prefix)) { continue; }
+    var len: int64 = (int64)e.name.length;
+    while (l->text.n + len > l->text.cap) { sysinfo_lx_buf_grow(&l->text); }
+    memcpy(l->text.p + l->text.n, e.name.chars, len);
+    if (l->n >= l->cap) {
+      var c: int32 = l->cap;
+      l->off = (int64*)sysinfo_lx_grow((uint8*)l->off, &c, l->n + 1, 8);
+      c = l->cap;
+      l->len = (int32*)sysinfo_lx_grow((uint8*)l->len, &c, l->n + 1, 4);
+      c = l->cap;
+      l->order = (int32*)sysinfo_lx_grow((uint8*)l->order, &c, l->n + 1, 4);
+      l->cap = c;
+    }
+    l->off[l->n] = l->text.n;
+    l->len[l->n] = (int32)len;
+    l->order[l->n] = l->n;
+    l->text.n = l->text.n + len;
+    l->n = l->n + 1;
+  }
+  fs_dir_close(&d);
+  // insertion sort of the order
+  for i in 1..l->n {
+    var k: int32 = l->order[i];
+    var key: string = sysinfo_lx_view(l->text.p + l->off[k], (int64)l->len[k]);
+    var j: int32 = i;
+    while (j > 0) {
+      var o: int32 = l->order[j - 1];
+      if (sysinfo_lx_natcmp(sysinfo_lx_view(l->text.p + l->off[o], (int64)l->len[o]), key) <= 0) { break; }
+      l->order[j] = o;
+      j = j - 1;
+    }
+    l->order[j] = k;
+  }
+  return l->n;
+}
+
+export fn sysinfo_lx_names_free(l: SysinfoLxNames*) {
+  sysinfo_lx_buf_free(&l->text);
+  if (l->off != 0) { free(l->off); free(l->len); free(l->order); }
+  l->off = (int64*)0;
+  l->n = 0;
+  l->cap = 0;
+}

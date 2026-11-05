@@ -1,0 +1,190 @@
+// Tests for raize/ws/conn: the connection state machine, fed client frames.
+
+import "std/mem";
+import "raize_core/str/str";
+import "frame";
+import "conn";
+
+struct RzWstLog {
+  count: int32;
+  last_op: int32;
+  last: RzBuf*;
+}
+
+fn rz_wst_on_message(ctx: rawptr, op: int32, payload: string) -> int32 {
+  var log: RzWstLog* = (RzWstLog*)ctx;
+  log->count = log->count + 1;
+  log->last_op = op;
+  log->last->len = 0;
+  rz_buf_add(log->last, payload);
+  return 0;
+}
+
+// Appends a masked client frame (key 01 02 03 04).
+fn rz_wst_client(b: RzBuf*, fin: bool, op: int32, payload: string) {
+  var n: int64 = (int64)payload.length;
+  var b0: int32 = op;
+  if (fin) { b0 = b0 | 0x80; }
+  rz_buf_add_byte(b, b0);
+  if (n < 126) {
+    rz_buf_add_byte(b, 0x80 | (int32)n);
+  } else {
+    rz_buf_add_byte(b, 0x80 | 126);
+    rz_buf_add_byte(b, (int32)((n >> 8) & 255));
+    rz_buf_add_byte(b, (int32)(n & 255));
+  }
+  var key: uint8[4];
+  key[0] = (uint8)1; key[1] = (uint8)2; key[2] = (uint8)3; key[3] = (uint8)4;
+  rz_buf_add_bytes(b, &key[0], 4);
+  var start: int64 = b->len;
+  rz_buf_add(b, payload);
+  rz_ws_unmask(b->data + start, n, &key[0], 0);
+}
+
+// Reads the first server frame in c->out: its opcode, and for a close its code.
+fn rz_wst_out_frame(c: RzWsConn*, skip: int32, out_code: int32*) -> int32 {
+  var off: int64 = 0;
+  var i: int32 = 0;
+  var f: RzWsFrame;
+  while (true) {
+    if (rz_ws_frame_parse(c->out->data + off, c->out->len - off, 1 << 20, false, &f) != RZ_WS_FRAME_OK) { return -1; }
+    if (i == skip) { break; }
+    off = off + f.frame_len;
+    i = i + 1;
+  }
+  if (out_code != 0 && f.opcode == RZ_WS_OP_CLOSE) {
+    *out_code = rz_ws_close_code(c->out->data + off + f.head_len, f.payload_len);
+  }
+  return f.opcode;
+}
+
+fn rz_wst_new(log: RzWstLog*, max: int64) -> RzWsConn* {
+  log->count = 0;
+  log->last_op = 0;
+  log->last = rz_buf_new();
+  return rz_ws_conn_new(max, &rz_wst_on_message, (rawptr)log);
+}
+
+fn rz_wst_end(c: RzWsConn*, log: RzWstLog*, b: RzBuf*) {
+  rz_ws_conn_free(c);
+  rz_buf_free(log->last);
+  rz_buf_free(b);
+}
+
+@test fn t_rz_ws_conn_single_and_bytewise() -> int32 {
+  var log: RzWstLog;
+  var c: RzWsConn* = rz_wst_new(&log, 0);
+  var b: RzBuf* = rz_buf_new();
+  var fail: int32 = 0;
+  rz_wst_client(b, true, RZ_WS_OP_TEXT, "Hello");
+  rz_wst_client(b, true, RZ_WS_OP_BINARY, "World!");
+  // One byte at a time: nothing is delivered early, both arrive in order.
+  var i: int64 = 0;
+  while (i < b->len) {
+    if (rz_ws_conn_feed(c, b->data + i, 1) != 0) { fail = 1; }
+    if (i == 10 && log.count != 1) { fail = 2; }
+    i = i + 1;
+  }
+  if (fail == 0 && log.count != 2) { fail = 3; }
+  if (fail == 0 && (log.last_op != RZ_WS_OP_BINARY || !rz_str_eq(rz_buf_str(log.last), "World!"))) { fail = 4; }
+  if (fail == 0 && (c->inbuf->len != 0 || c->out->len != 0)) { fail = 5; }
+  rz_wst_end(c, &log, b);
+  return fail;
+}
+
+@test fn t_rz_ws_conn_fragments_with_ping() -> int32 {
+  var log: RzWstLog;
+  var c: RzWsConn* = rz_wst_new(&log, 0);
+  var b: RzBuf* = rz_buf_new();
+  var fail: int32 = 0;
+  rz_wst_client(b, false, RZ_WS_OP_TEXT, "Hel");
+  rz_wst_client(b, true, RZ_WS_OP_PING, "p1");
+  rz_wst_client(b, true, RZ_WS_OP_CONT, "lo");
+  if (rz_ws_conn_feed(c, b->data, b->len) != 0) { fail = 1; }
+  if (fail == 0 && (log.count != 1 || !rz_str_eq(rz_buf_str(log.last), "Hello"))) { fail = 2; }
+  if (fail == 0 && rz_wst_out_frame(c, 0, 0) != RZ_WS_OP_PONG) { fail = 3; }
+  if (fail == 0 && !rz_str_eq(rz_str_sub(rz_buf_str(c->out), 2, 4), "p1")) { fail = 4; }
+  rz_ws_conn_wrote(c, c->out->len);
+  if (fail == 0 && c->out->len != 0) { fail = 5; }
+  rz_wst_end(c, &log, b);
+  return fail;
+}
+
+@test fn t_rz_ws_conn_peer_close_echoed() -> int32 {
+  var log: RzWstLog;
+  var c: RzWsConn* = rz_wst_new(&log, 0);
+  var b: RzBuf* = rz_buf_new();
+  var fail: int32 = 0;
+  var payload: uint8[2];
+  payload[0] = (uint8)0x0F;    // 4000
+  payload[1] = (uint8)0xA0;
+  rz_wst_client(b, true, RZ_WS_OP_CLOSE, rz_str_view(&payload[0], 2));
+  rz_wst_client(b, true, RZ_WS_OP_TEXT, "after close");
+  if (rz_ws_conn_feed(c, b->data, b->len) != 1) { fail = 1; }
+  var code: int32 = 0;
+  if (fail == 0 && rz_wst_out_frame(c, 0, &code) != RZ_WS_OP_CLOSE) { fail = 2; }
+  if (fail == 0 && code != 4000) { fail = 3; }
+  if (fail == 0 && log.count != 0) { fail = 4; }
+  if (fail == 0 && !rz_ws_conn_done(c)) { fail = 5; }
+  rz_wst_end(c, &log, b);
+  return fail;
+}
+
+@test fn t_rz_ws_conn_server_close_waits() -> int32 {
+  var log: RzWstLog;
+  var c: RzWsConn* = rz_wst_new(&log, 0);
+  var b: RzBuf* = rz_buf_new();
+  var fail: int32 = 0;
+  rz_ws_conn_close(c, 1001, "restart");
+  if (rz_ws_conn_send_text(c, "late") != -1) { fail = 1; }
+  rz_wst_client(b, true, RZ_WS_OP_TEXT, "ignored");
+  if (fail == 0 && rz_ws_conn_feed(c, b->data, b->len) != 0) { fail = 2; }
+  if (fail == 0 && log.count != 0) { fail = 3; }
+  b->len = 0;
+  rz_wst_client(b, true, RZ_WS_OP_CLOSE, "");
+  if (fail == 0 && rz_ws_conn_feed(c, b->data, b->len) != 1) { fail = 4; }
+  // Exactly one close frame went out: ours.
+  var code: int32 = 0;
+  if (fail == 0 && (rz_wst_out_frame(c, 0, &code) != RZ_WS_OP_CLOSE || code != 1001)) { fail = 5; }
+  if (fail == 0 && rz_wst_out_frame(c, 1, 0) != -1) { fail = 6; }
+  rz_wst_end(c, &log, b);
+  return fail;
+}
+
+// Feeds `frames` to a fresh connection and returns the close code it sent.
+fn rz_wst_fail_code(b: RzBuf*, max: int64) -> int32 {
+  var log: RzWstLog;
+  var c: RzWsConn* = rz_wst_new(&log, max);
+  var code: int32 = 0;
+  if (rz_ws_conn_feed(c, b->data, b->len) == 1) {
+    rz_wst_out_frame(c, 0, &code);
+  }
+  rz_ws_conn_free(c);
+  rz_buf_free(log.last);
+  b->len = 0;
+  return code;
+}
+
+@test fn t_rz_ws_conn_failures() -> int32 {
+  var b: RzBuf* = rz_buf_new();
+  var fail: int32 = 0;
+  rz_wst_client(b, true, RZ_WS_OP_CONT, "x");                     // CONT with no message
+  if (rz_wst_fail_code(b, 0) != 1002) { fail = 1; }
+  rz_wst_client(b, false, RZ_WS_OP_TEXT, "a");
+  rz_wst_client(b, true, RZ_WS_OP_TEXT, "b");                     // TEXT inside a message
+  if (fail == 0 && rz_wst_fail_code(b, 0) != 1002) { fail = 2; }
+  var bad: uint8[2];
+  bad[0] = (uint8)0xC0;
+  bad[1] = (uint8)0xAF;
+  rz_wst_client(b, true, RZ_WS_OP_TEXT, rz_str_view(&bad[0], 2));
+  if (fail == 0 && rz_wst_fail_code(b, 0) != 1007) { fail = 3; }
+  rz_wst_client(b, false, RZ_WS_OP_BINARY, "abc");
+  rz_wst_client(b, true, RZ_WS_OP_CONT, "def");                   // 6 > max 4
+  if (fail == 0 && rz_wst_fail_code(b, 4) != 1009) { fail = 4; }
+  var one: uint8[1];
+  one[0] = (uint8)3;
+  rz_wst_client(b, true, RZ_WS_OP_CLOSE, rz_str_view(&one[0], 1));   // 1-byte close
+  if (fail == 0 && rz_wst_fail_code(b, 0) != 1002) { fail = 5; }
+  rz_buf_free(b);
+  return fail;
+}

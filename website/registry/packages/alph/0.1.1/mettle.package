@@ -1,0 +1,8 @@
+name = alph
+version = 0.1.1
+description = Erlang-style actors, supervision and self-healing, written in Mettle
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Alph
+compiler = 0.18.0
+platforms = linux
+require = cryptex 0.3.0

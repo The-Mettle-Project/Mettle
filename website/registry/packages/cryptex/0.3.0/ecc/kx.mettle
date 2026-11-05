@@ -1,0 +1,144 @@
+// Key exchange: X25519 (RFC 7748), in pure Mettle, and a session-key
+// derivation (BLAKE2b-512 of the X25519 point and both public
+// keys, split into a receive key and a transmit key).
+//
+// For a protocol, prefer cr_kx_*: it never hands out the raw shared point.
+// cr_x25519_shared exists for protocols that specify their own KDF (Noise).
+
+import "cryptex/core/status";
+import "cryptex/core/types";
+import "cryptex/core/util";
+import "cryptex/hash/blake2b";
+import "cryptex/ecc/curve25519";
+
+// True if the 32 bytes are all zero. The answer is public (it decides the
+// error), the scan itself touches every byte.
+fn cr_kx_is_zero(p: uint8*) -> bool {
+  var acc: uint8 = 0;
+  for i in 0..32 { acc = acc | p[i]; }
+  return acc == 0;
+}
+
+// h = BLAKE2b-512(q || client_pk || server_pk) with q = X25519(own_sk,
+// peer_pk). False (h untouched) if q is all zero. Wipes q.
+fn cr_kx_derive(h: uint8*, own_sk: uint8*, peer_pk: uint8*, client_pk: uint8*, server_pk: uint8*) -> bool {
+  var q: uint8[32];
+  crx_x25519(&q[0], own_sk, peer_pk);
+  if (cr_kx_is_zero(&q[0])) {
+    cr_wipe(&q[0], 32);
+    return false;
+  }
+  var st: CrxBlake2b;
+  crx_blake2b_init(&st, 64, 0, 0);
+  crx_blake2b_update(&st, &q[0], 32);
+  crx_blake2b_update(&st, client_pk, 32);
+  crx_blake2b_update(&st, server_pk, 32);
+  crx_blake2b_final(&st, h);
+  cr_wipe(&q[0], 32);
+  return true;
+}
+
+/// Generates a random X25519 key pair: 32 random secret bytes and their
+/// public key. The pair works for
+/// cr_x25519_shared and for cr_kx_*.
+/// in: pk, sk
+/// returns: CR_OK; CR_E_ARG (null pointer); CR_E_INTERNAL if the kernel random
+///   source fails
+/// owns: sk is secret caller memory: cr_wipe(&sk.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var pk: CrX25519Public; var sk: CrX25519Secret; cr_x25519_keypair(&pk, &sk);
+export fn cr_x25519_keypair(pk: CrX25519Public*, sk: CrX25519Secret*) -> int32 {
+  if (pk == 0 || sk == 0) { return CR_E_ARG; }
+  if (cr_random_bytes(&sk->b[0], 32) != CR_OK) {
+    cr_wipe(&sk->b[0], 32);
+    return CR_E_INTERNAL;
+  }
+  crx_x25519_base(&pk->b[0], &sk->b[0]);
+  return CR_OK;
+}
+
+/// Computes the public key of a secret scalar: X25519(sk, 9)
+/// (the scalar is clamped as RFC 7748 says).
+/// in: pk; sk
+/// returns: CR_OK; CR_E_ARG; CR_E_KEY if the result is zero
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: cr_x25519_public_from_secret(&pk, &sk);
+export fn cr_x25519_public_from_secret(pk: CrX25519Public*, sk: CrX25519Secret*) -> int32 {
+  if (pk == 0 || sk == 0) { return CR_E_ARG; }
+  crx_x25519_base(&pk->b[0], &sk->b[0]);
+  if (cr_kx_is_zero(&pk->b[0])) {
+    cr_wipe(&pk->b[0], 32);
+    return CR_E_KEY;
+  }
+  return CR_OK;
+}
+
+/// Computes the raw X25519 shared point X25519(sk, peer).
+/// This is not a key: feed it, with both public keys, into a KDF (as Noise
+/// does) or use cr_kx_* instead.
+/// in: out; sk, our secret; peer, the other side's public key
+/// returns: CR_OK; CR_E_ARG; CR_E_KEY if peer is a low-order
+///   point (the result would be all zero; out is wiped)
+/// owns: out is secret caller memory: cr_wipe(&out.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var s: CrX25519Shared; if (cr_x25519_shared(&s, &sk, &peer) != CR_OK) { reject(); }
+export fn cr_x25519_shared(out: CrX25519Shared*, sk: CrX25519Secret*, peer: CrX25519Public*) -> int32 {
+  if (out == 0 || sk == 0 || peer == 0) { return CR_E_ARG; }
+  crx_x25519(&out->b[0], &sk->b[0], &peer->b[0]);
+  if (cr_kx_is_zero(&out->b[0])) {
+    cr_wipe(&out->b[0], 32);
+    return CR_E_KEY;
+  }
+  return CR_OK;
+}
+
+/// Derives the client's session keys:
+/// rx decrypts what the server sends, tx encrypts what the client sends.
+/// The server's cr_kx_server_session_keys gives the mirror image
+/// (server rx == client tx, server tx == client rx).
+/// in: rx, tx; client_pk, client_sk (cr_x25519_keypair); server_pk
+/// returns: CR_OK; CR_E_ARG; CR_E_KEY if server_pk is unusable
+///   (rx and tx are wiped)
+/// owns: rx and tx are secret caller memory: wipe them when done
+/// thread: any thread (no shared state)
+/// example: var rx: CrKey32; var tx: CrKey32; cr_kx_client_session_keys(&rx, &tx, &cpk, &csk, &spk);
+export fn cr_kx_client_session_keys(rx: CrKey32*, tx: CrKey32*, client_pk: CrX25519Public*, client_sk: CrX25519Secret*, server_pk: CrX25519Public*) -> int32 {
+  if (rx == 0 || tx == 0 || client_pk == 0 || client_sk == 0 || server_pk == 0) { return CR_E_ARG; }
+  var h: uint8[64];
+  if (!cr_kx_derive(&h[0], &client_sk->b[0], &server_pk->b[0], &client_pk->b[0], &server_pk->b[0])) {
+    cr_wipe(&rx->b[0], 32);
+    cr_wipe(&tx->b[0], 32);
+    return CR_E_KEY;
+  }
+  for i in 0..32 {
+    rx->b[i] = h[i];
+    tx->b[i] = h[32 + i];
+  }
+  cr_wipe(&h[0], 64);
+  return CR_OK;
+}
+
+/// Derives the server's session keys:
+/// rx decrypts what the client sends, tx encrypts what the server sends.
+/// in: rx, tx; server_pk, server_sk; client_pk
+/// returns: CR_OK; CR_E_ARG; CR_E_KEY if client_pk is unusable
+///   (rx and tx are wiped)
+/// owns: rx and tx are secret caller memory: wipe them when done
+/// thread: any thread (no shared state)
+/// example: cr_kx_server_session_keys(&rx, &tx, &spk, &ssk, &cpk);
+export fn cr_kx_server_session_keys(rx: CrKey32*, tx: CrKey32*, server_pk: CrX25519Public*, server_sk: CrX25519Secret*, client_pk: CrX25519Public*) -> int32 {
+  if (rx == 0 || tx == 0 || server_pk == 0 || server_sk == 0 || client_pk == 0) { return CR_E_ARG; }
+  var h: uint8[64];
+  if (!cr_kx_derive(&h[0], &server_sk->b[0], &client_pk->b[0], &client_pk->b[0], &server_pk->b[0])) {
+    cr_wipe(&rx->b[0], 32);
+    cr_wipe(&tx->b[0], 32);
+    return CR_E_KEY;
+  }
+  for i in 0..32 {
+    tx->b[i] = h[i];
+    rx->b[i] = h[32 + i];
+  }
+  cr_wipe(&h[0], 64);
+  return CR_OK;
+}

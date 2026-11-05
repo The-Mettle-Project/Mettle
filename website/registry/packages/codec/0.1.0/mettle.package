@@ -1,0 +1,6 @@
+name = codec
+version = 0.1.0
+description = Serialization: Protocol Buffers with a .proto compiler and gRPC framing, MessagePack, a JSON writer and CBOR
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Codec
+compiler = 0.18.0

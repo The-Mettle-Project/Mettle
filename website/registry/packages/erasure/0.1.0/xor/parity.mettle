@@ -1,0 +1,61 @@
+// Simple XOR parity: k data shards and one parity shard that is their XOR,
+// as in RAID 5. Any one lost shard can be rebuilt. Cheaper than
+// Reed-Solomon with m = 1.
+
+import "erasure/core/status";
+
+// dst ^= src over n bytes, 8 bytes at a time.
+fn erasure_xor_into(dst: uint8*, src: uint8*, n: int64) {
+  var w: int64 = n >> 3;
+  var d8: uint64* = (uint64*)dst;
+  var s8: uint64* = (uint64*)src;
+  for i in 0..w { d8[i] = d8[i] ^ s8[i]; }
+  for i in (w << 3)..n { dst[i] = dst[i] ^ src[i]; }
+}
+
+fn erasure_xor_copy(dst: uint8*, src: uint8*, n: int64) {
+  var w: int64 = n >> 3;
+  var d8: uint64* = (uint64*)dst;
+  var s8: uint64* = (uint64*)src;
+  for i in 0..w { d8[i] = s8[i]; }
+  for i in (w << 3)..n { dst[i] = src[i]; }
+}
+
+/// Writes the XOR of shards[0..k) into shards[k]. Each shard is size bytes.
+export fn erasure_xor_encode(shards: uint8**, k: int32, size: int64) -> int32 {
+  if (shards == 0 || k < 1 || size < 0) { return ERASURE_E_ARG; }
+  for i in 0..(k + 1) { if (shards[i] == 0) { return ERASURE_E_ARG; } }
+  erasure_xor_copy(shards[k], shards[0], size);
+  for j in 1..k { erasure_xor_into(shards[k], shards[j], size); }
+  return ERASURE_OK;
+}
+
+/// ERASURE_OK when shards[k] is the XOR of the data shards, else
+/// ERASURE_E_VERIFY.
+export fn erasure_xor_verify(shards: uint8**, k: int32, size: int64) -> int32 {
+  if (shards == 0 || k < 1 || size < 0) { return ERASURE_E_ARG; }
+  for i in 0..(k + 1) { if (shards[i] == 0) { return ERASURE_E_ARG; } }
+  for i in 0..size {
+    var x: uint8 = 0;
+    for j in 0..(k + 1) { x = x ^ shards[j][i]; }
+    if (x != 0) { return ERASURE_E_VERIFY; }
+  }
+  return ERASURE_OK;
+}
+
+/// Rebuilds shard lost (0..k, where k is the parity shard) from the others.
+export fn erasure_xor_rebuild(shards: uint8**, k: int32, size: int64, lost: int32) -> int32 {
+  if (shards == 0 || k < 1 || size < 0 || lost < 0 || lost > k) { return ERASURE_E_ARG; }
+  for i in 0..(k + 1) { if (shards[i] == 0) { return ERASURE_E_ARG; } }
+  var first: bool = true;
+  for j in 0..(k + 1) {
+    if (j == lost) { continue; }
+    if (first) {
+      erasure_xor_copy(shards[lost], shards[j], size);
+      first = false;
+    } else {
+      erasure_xor_into(shards[lost], shards[j], size);
+    }
+  }
+  return ERASURE_OK;
+}

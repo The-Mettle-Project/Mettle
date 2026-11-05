@@ -1,0 +1,23 @@
+// canvas: 2D vector drawing into RGBA pixmaps, in pure Mettle.
+//
+//   import "canvas/canvas";
+//
+// Every name starts with canvas_, Canvas or CANVAS_. See docs/api.md.
+// Text is in "canvas/text" (needs font); image files in "canvas/image"
+// (needs Etch).
+import "canvas/core/base";
+import "canvas/core/color";
+import "canvas/core/pixmap";
+import "canvas/geom/transform";
+import "canvas/geom/path";
+import "canvas/geom/flatten";
+import "canvas/geom/stroke";
+import "canvas/geom/dash";
+import "canvas/geom/svg_path";
+import "canvas/raster/coverage";
+import "canvas/paint/gradient";
+import "canvas/paint/pattern";
+import "canvas/paint/blend";
+import "canvas/paint/paint";
+import "canvas/draw/blit";
+import "canvas/draw/context";

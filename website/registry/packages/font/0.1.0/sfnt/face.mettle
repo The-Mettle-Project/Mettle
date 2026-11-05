@@ -1,0 +1,154 @@
+// FontFace: one parsed font face, plus bounds-checked readers for its bytes.
+//
+// The font bytes are borrowed: keep them alive while the face is in use.
+// Every read checks the bounds and gives 0 when it would run past the end,
+// so damaged fonts give wrong answers but never crash.
+//
+// Spec: OpenType 1.9.1 (ISO/IEC 14496-22), "Font file" and table chapters.
+
+// Status codes.
+export const FONT_OK: int32 = 0;
+export const FONT_E_FORMAT: int32 = 1;    // not a font we understand
+export const FONT_E_MISSING: int32 = 2;   // a required table is missing or bad
+export const FONT_E_INDEX: int32 = 3;     // face index out of range
+export const FONT_E_MEM: int32 = 4;       // out of memory
+
+// What kind of outlines the face has.
+export const FONT_OUTLINE_NONE: int32 = 0;
+export const FONT_OUTLINE_GLYF: int32 = 1;   // TrueType quadratic outlines
+export const FONT_OUTLINE_CFF: int32 = 2;    // CFF cubic outlines
+
+// Table tags as big-endian numbers.
+export const FONT_TAG_HEAD: uint32 = 0x68656164;
+export const FONT_TAG_HHEA: uint32 = 0x68686561;
+export const FONT_TAG_MAXP: uint32 = 0x6D617870;
+export const FONT_TAG_HMTX: uint32 = 0x686D7478;
+export const FONT_TAG_LOCA: uint32 = 0x6C6F6361;
+export const FONT_TAG_GLYF: uint32 = 0x676C7966;
+export const FONT_TAG_CMAP: uint32 = 0x636D6170;
+export const FONT_TAG_KERN: uint32 = 0x6B65726E;
+export const FONT_TAG_GPOS: uint32 = 0x47504F53;
+export const FONT_TAG_GSUB: uint32 = 0x47535542;
+export const FONT_TAG_GDEF: uint32 = 0x47444546;
+export const FONT_TAG_OS2: uint32 = 0x4F532F32;
+export const FONT_TAG_NAME: uint32 = 0x6E616D65;
+export const FONT_TAG_POST: uint32 = 0x706F7374;
+export const FONT_TAG_CFF: uint32 = 0x43464620;
+export const FONT_TAG_VHEA: uint32 = 0x76686561;
+export const FONT_TAG_VMTX: uint32 = 0x766D7478;
+
+// Parsed CFF data (offsets are absolute in the font bytes, 0 = absent).
+export struct FontCff {
+  base: int64;          // start of the CFF table
+  end: int64;           // end of the CFF table
+  charstrings: int64;   // CharStrings INDEX
+  gsubrs: int64;        // global subroutine INDEX
+  subrs: int64;         // local subroutine INDEX (non-CID fonts)
+  fdarray: int64;       // Font DICT INDEX (CID fonts)
+  fdselect: int64;      // FDSelect (CID fonts)
+  nominal_width: float32;
+  default_width: float32;
+}
+
+export struct FontFace {
+  data: uint8*;
+  len: int64;
+  index: int32;         // face number inside a collection
+  dir: int64;           // offset of this face's table directory
+  outline: int32;       // FONT_OUTLINE_*
+
+  head: int64; hhea: int64; maxp: int64; os2: int64; post: int64;
+  hmtx: int64; hmtx_len: int64;
+  vhea: int64; vmtx: int64; vmtx_len: int64;
+  loca: int64; loca_len: int64;
+  glyf: int64; glyf_len: int64;
+  cmap: int64; cmap_len: int64;
+  kern: int64; kern_len: int64;
+  gpos: int64; gpos_len: int64;
+  gsub: int64; gsub_len: int64;
+  gdef: int64; gdef_len: int64;
+  name: int64; name_len: int64;
+  cff_off: int64; cff_len: int64;
+
+  upem: int32;
+  num_glyphs: int32;
+  loc_format: int32;
+  x_min: int32; y_min: int32; x_max: int32; y_max: int32;   // head bbox, font units
+  num_hmetrics: int32;
+  num_vmetrics: int32;
+
+  // Vertical metrics in font units. descent is negative (below the baseline).
+  ascent: int32; descent: int32; line_gap: int32;              // hhea
+  typo_ascent: int32; typo_descent: int32; typo_line_gap: int32; // OS/2
+  win_ascent: int32; win_descent: int32;                        // OS/2, both positive
+  use_typo: bool;           // OS/2 fsSelection USE_TYPO_METRICS
+  cap_height: int32; x_height: int32;
+  underline_pos: int32; underline_thick: int32;
+  strike_pos: int32; strike_thick: int32;
+  weight: int32;            // OS/2 usWeightClass (400 = regular)
+  italic_angle: float32;    // post, degrees (negative leans right)
+  mono: bool;               // post isFixedPitch
+
+  cmap_sub: int64;          // chosen cmap subtable (0 = none)
+  cmap_fmt: int32;
+  cmap_symbol: bool;        // (3,0) symbol subtable: U+F000 offset
+  cmap_uvs: int64;          // format 14 subtable (0 = none)
+
+  cff: FontCff;
+}
+
+/// Unsigned byte at o (0 when out of range).
+export fn font_u8(f: FontFace*, o: int64) -> uint32 {
+  if (o < 0 || o >= f->len) { return 0; }
+  return (uint32)f->data[o];
+}
+
+/// Big-endian uint16 at o (0 when out of range).
+export fn font_u16(f: FontFace*, o: int64) -> uint32 {
+  if (o < 0 || o + 2 > f->len) { return 0; }
+  return ((uint32)f->data[o] << 8) | (uint32)f->data[o + 1];
+}
+
+/// Big-endian int16 at o (0 when out of range).
+export fn font_i16(f: FontFace*, o: int64) -> int32 {
+  var v: int32 = (int32)font_u16(f, o);
+  if (v >= 32768) { v = v - 65536; }
+  return v;
+}
+
+/// Big-endian uint24 at o (0 when out of range).
+export fn font_u24(f: FontFace*, o: int64) -> uint32 {
+  if (o < 0 || o + 3 > f->len) { return 0; }
+  return ((uint32)f->data[o] << 16) | ((uint32)f->data[o + 1] << 8) | (uint32)f->data[o + 2];
+}
+
+/// Big-endian uint32 at o (0 when out of range).
+export fn font_u32(f: FontFace*, o: int64) -> uint32 {
+  if (o < 0 || o + 4 > f->len) { return 0; }
+  return ((uint32)f->data[o] << 24) | ((uint32)f->data[o + 1] << 16)
+       | ((uint32)f->data[o + 2] << 8) | (uint32)f->data[o + 3];
+}
+
+/// F2DOT14 fixed-point number at o.
+export fn font_f2dot14(f: FontFace*, o: int64) -> float32 {
+  return (float32)font_i16(f, o) / 16384.0;
+}
+
+/// Finds a table in this face's directory. Returns its offset and writes its
+/// length, or returns 0 when the table is missing or runs past the end.
+export fn font_find_table(f: FontFace*, tag: uint32, out_len: int64*) -> int64 {
+  *out_len = 0;
+  var n: int64 = (int64)font_u16(f, f->dir + 4);
+  for i: int64 in 0..n {
+    var rec: int64 = f->dir + 12 + i * 16;
+    if (rec + 16 > f->len) { return 0; }
+    if (font_u32(f, rec) == tag) {
+      var off: int64 = (int64)font_u32(f, rec + 8);
+      var ln: int64 = (int64)font_u32(f, rec + 12);
+      if (off <= 0 || off > f->len || ln > f->len - off) { return 0; }
+      *out_len = ln;
+      return off;
+    }
+  }
+  return 0;
+}

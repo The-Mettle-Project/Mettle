@@ -1,0 +1,7 @@
+name = log
+version = 0.1.1
+description = Structured logging for Mettle: levels, fields, RUST_LOG-style filters, async sinks, rotation, JSON, logfmt, syslog and journald
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Log
+compiler = 0.18.0
+require = codec 0.1.0

@@ -1,0 +1,82 @@
+// Picks the fastest multiply kernel this CPU and OS support.
+
+export const ERASURE_SIMD_NONE: int32 = 0;   // portable table lookups
+export const ERASURE_SIMD_AVX2: int32 = 1;   // AVX2 split tables (PSHUFB)
+export const ERASURE_SIMD_GFNI: int32 = 2;   // AVX2 + GFNI affine multiply
+export const ERASURE_SIMD_AVX512: int32 = 3; // AVX-512 + GFNI affine multiply
+
+var g_best: int32 = -1;
+var g_use: int32 = -1;
+
+var g_regs: int64[4];
+
+fn erasure_cpu_detect() -> int32 {
+  // The asm writes through a pointer, not into {local} operands: release
+  // builds of Mettle 0.18 drop values written to locals by asm.
+  var r: int64* = &g_regs[0];
+  asm {
+    mov r9, {r}
+    mov r8, rbx
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    mov [r9], rcx
+    mov eax, 7
+    xor ecx, ecx
+    cpuid
+    mov [r9 + 8], rbx
+    mov [r9 + 16], rcx
+    mov rbx, r8
+  }
+  // AVX needs OSXSAVE (bit 27) and AVX (bit 28), and the OS must save
+  // the XMM and YMM state (XCR0 bits 1 and 2).
+  if (((r[0] >> 27) & 3) != 3) { return ERASURE_SIMD_NONE; }
+  asm {
+    mov r9, {r}
+    xor ecx, ecx
+    xgetbv
+    mov [r9 + 24], rax
+  }
+  if ((r[3] & 6) != 6) { return ERASURE_SIMD_NONE; }
+  if (((r[1] >> 5) & 1) == 0) { return ERASURE_SIMD_NONE; }
+  if (((r[2] >> 8) & 1) == 0) { return ERASURE_SIMD_AVX2; }
+  // AVX-512 F and BW (leaf 7 EBX bits 16 and 30), and the OS must save the
+  // opmask and ZMM state (XCR0 bits 5, 6 and 7).
+  if (((r[1] >> 16) & 1) != 0 && ((r[1] >> 30) & 1) != 0 && (r[3] & 0xe0) == 0xe0) {
+    return ERASURE_SIMD_AVX512;
+  }
+  return ERASURE_SIMD_GFNI;
+}
+
+/// The best kernel level this machine supports.
+export fn erasure_simd_best() -> int32 {
+  if (g_best < 0) { g_best = erasure_cpu_detect(); }
+  return g_best;
+}
+
+/// The kernel level in use (the best one, unless lowered with
+/// erasure_simd_set).
+export fn erasure_simd_level() -> int32 {
+  if (g_use < 0) { g_use = erasure_simd_best(); }
+  return g_use;
+}
+
+/// Uses at most the given kernel level. Levels above what the CPU supports
+/// are lowered to the best one. Returns the level now in use. Meant for
+/// tests and benchmarks.
+export fn erasure_simd_set(level: int32) -> int32 {
+  var best: int32 = erasure_simd_best();
+  var v: int32 = level;
+  if (v > best) { v = best; }
+  if (v < 0) { v = 0; }
+  g_use = v;
+  return v;
+}
+
+/// A name for a kernel level.
+export fn erasure_simd_name(level: int32) -> string {
+  if (level == ERASURE_SIMD_AVX512) { return "avx512+gfni"; }
+  if (level == ERASURE_SIMD_GFNI) { return "avx2+gfni"; }
+  if (level == ERASURE_SIMD_AVX2) { return "avx2"; }
+  return "portable";
+}

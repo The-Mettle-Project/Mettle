@@ -1,0 +1,33 @@
+// Error codes shared by every Codec reader and writer. 0 means success.
+// Readers keep the first error they hit, so a caller can check once at the end.
+
+export const CODEC_OK = 0;
+export const CODEC_ERR_TRUNCATED = 1;  // the input ended inside a value
+export const CODEC_ERR_VARINT = 2;     // a varint longer than 10 bytes or wider than 64 bits
+export const CODEC_ERR_DEPTH = 3;      // nesting deeper than the limit
+export const CODEC_ERR_LIMIT = 4;      // a length, count or size over the limit
+export const CODEC_ERR_INVALID = 5;    // bytes that break the format
+export const CODEC_ERR_TYPE = 6;       // a value of another type than the one asked for
+export const CODEC_ERR_NOMEM = 7;      // an allocation failed
+export const CODEC_ERR_UTF8 = 8;       // a string that is not valid UTF-8
+export const CODEC_ERR_MISSING = 9;    // a proto2 required field is missing
+export const CODEC_ERR_STATE = 10;     // a writer call out of order (a key with no object, ...)
+
+// A short name for an error code, for messages and logs.
+export fn codec_error_name(code: int32) -> string {
+  switch (code) {
+    case 0: { return "ok"; }
+    case 1: { return "truncated input"; }
+    case 2: { return "bad varint"; }
+    case 3: { return "nesting too deep"; }
+    case 4: { return "over size limit"; }
+    case 5: { return "invalid data"; }
+    case 6: { return "wrong type"; }
+    case 7: { return "out of memory"; }
+    case 8: { return "invalid UTF-8"; }
+    case 9: { return "missing required field"; }
+    case 10: { return "writer call out of order"; }
+    default: { }
+  }
+  return "unknown error";
+}

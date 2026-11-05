@@ -1,0 +1,108 @@
+// Dialects: how a CSV file is spelled, for both reading and writing.
+//
+// RFC 4180 fixes comma, double quote, doubled quotes inside quoted fields and
+// CRLF line ends. Real files vary, so every one of those is a setting here,
+// along with the extras found in Python's csv module and Rust's csv crate:
+// escape characters, comments, initial-space skipping, trimming, headers,
+// byte order marks and blank-line handling.
+
+// Record terminators. Any value other than CSV_TERM_ANY is a single byte.
+export const CSV_TERM_ANY = 0;         // CR, LF or CRLF end a record (reading)
+
+// Trimming of ASCII whitespace around fields after parsing.
+export const CSV_TRIM_NONE = 0;
+export const CSV_TRIM_HEADERS = 1;
+export const CSV_TRIM_FIELDS = 2;
+export const CSV_TRIM_ALL = 3;
+
+// What an empty line means when reading.
+export const CSV_BLANK_SKIP = 0;       // skipped (Rust's csv crate)
+export const CSV_BLANK_EMPTY = 1;      // a record with no fields (Python's csv module)
+
+// When the writer puts quotes around a field.
+export const CSV_QUOTE_MINIMAL = 0;    // only when the field needs them
+export const CSV_QUOTE_ALL = 1;        // always
+export const CSV_QUOTE_NON_NUMERIC = 2; // unless the field is a number
+export const CSV_QUOTE_NEVER = 3;      // never; specials are escaped if an escape byte is set
+
+// Line ends the writer uses.
+export const CSV_EOL_CRLF = 0;
+export const CSV_EOL_LF = 1;
+export const CSV_EOL_CR = 2;
+
+export struct CsvDialect {
+  delimiter: uint8;            // field separator, ',' by default
+  quote: uint8;                // quote byte, '"' by default; 0 turns quoting off
+  escape: uint8;               // escape byte (often '\\'); 0 for none
+  double_quote: bool;          // "" inside a quoted field is one quote
+  comment: uint8;              // a record starting with this byte is skipped; 0 for none
+  terminator: uint8;           // CSV_TERM_ANY or one record-ending byte
+  skip_initial_space: bool;    // drop spaces right after a delimiter (Python)
+  trim: int32;                 // CSV_TRIM_*
+  strict: bool;                // report malformed quoting instead of repairing it
+  flexible: bool;              // allow records with different field counts
+  has_header: bool;            // the first record is a header
+  blank_lines: int32;          // CSV_BLANK_*
+  keep_bom: bool;              // keep a leading UTF-8 byte order mark as data
+  check_utf8: bool;            // report fields that are not valid UTF-8
+  max_record: int64;           // largest record in bytes; 0 for no limit
+  quote_style: int32;          // CSV_QUOTE_* (writer)
+  line_end: int32;             // CSV_EOL_* (writer)
+}
+
+// The default: RFC 4180 bytes, a header row, lenient repair of bad quoting
+// (as Rust's csv crate and Python's csv module do), CR/LF/CRLF accepted,
+// CRLF written, minimal quoting, blank lines skipped.
+export fn csv_dialect() -> CsvDialect {
+  var d: CsvDialect;
+  d.delimiter = (uint8)',';
+  d.quote = (uint8)'"';
+  d.escape = (uint8)0;
+  d.double_quote = true;
+  d.comment = (uint8)0;
+  d.terminator = (uint8)CSV_TERM_ANY;
+  d.skip_initial_space = false;
+  d.trim = CSV_TRIM_NONE;
+  d.strict = false;
+  d.flexible = false;
+  d.has_header = true;
+  d.blank_lines = CSV_BLANK_SKIP;
+  d.keep_bom = false;
+  d.check_utf8 = false;
+  d.max_record = 0;
+  d.quote_style = CSV_QUOTE_MINIMAL;
+  d.line_end = CSV_EOL_CRLF;
+  return d;
+}
+
+// RFC 4180 to the letter: malformed quoting and ragged rows are errors.
+export fn csv_dialect_rfc4180() -> CsvDialect {
+  var d: CsvDialect = csv_dialect();
+  d.strict = true;
+  return d;
+}
+
+// Python's csv.excel dialect as csv.reader sees it: no header handling,
+// ragged rows allowed, empty lines become empty records.
+export fn csv_dialect_python() -> CsvDialect {
+  var d: CsvDialect = csv_dialect();
+  d.has_header = false;
+  d.flexible = true;
+  d.blank_lines = CSV_BLANK_EMPTY;
+  return d;
+}
+
+// Tab-separated values, with a header row.
+export fn csv_dialect_tsv() -> CsvDialect {
+  var d: CsvDialect = csv_dialect();
+  d.delimiter = (uint8)'\t';
+  return d;
+}
+
+// Python's csv.unix_dialect for writing: LF line ends, every field quoted.
+export fn csv_dialect_unix() -> CsvDialect {
+  var d: CsvDialect = csv_dialect();
+  d.quote_style = CSV_QUOTE_ALL;
+  d.line_end = CSV_EOL_LF;
+  return d;
+}

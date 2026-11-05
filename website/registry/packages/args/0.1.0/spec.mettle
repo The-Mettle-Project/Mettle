@@ -1,0 +1,357 @@
+// Building a parser: the program describes its options, positional
+// arguments and subcommands. Each call adds to the current command (the
+// root at first). Defaults are written to the caller's variables right
+// away, so a value that is not given keeps its default.
+
+import "types";
+
+fn spec_fail(a: Args*, why: string) {
+  if (a->spec_err.length == (uint64)0) { a->spec_err = why; }
+}
+
+// Start a parser for program `name`. `about` is the first line of help.
+// -h and --help are added for every command.
+export fn args_init(a: Args*, name: string, about: string) {
+  a->name = name;
+  a->version = "";
+  a->nopts = 0;
+  a->npos = 0;
+  a->ncmds = 1;
+  a->cur = 0;
+  a->last_opt = -1;
+  a->last_pos = -1;
+  a->last_kind = 3;
+  a->abbrev = false;
+  a->posix = false;
+  a->width = 0;
+  a->comp_cmd = 0;
+  a->comp_shell = "";
+  a->cmd = 0;
+  a->err = 0;
+  a->err_opt = -1;
+  a->err_pos = -1;
+  a->err_token = "";
+  a->err_detail = "";
+  a->msg_len = 0;
+  a->spec_err = "";
+  var root: ArgsCmd* = &a->cmds[0];
+  root->parent = -1;
+  root->name = name;
+  root->help = about;
+  root->about = "";
+  root->aliases = "";
+  root->need_sub = false;
+  root->hidden = false;
+  var h: int32 = args_add_opt(a, ARGS_HELP, 104, "help", "print help", (rawptr)0);
+  if (h >= 0) { a->opts[h].global = true; }
+}
+
+fn name_ok(s: string) -> bool {
+  if (s.length == (uint64)0) { return true; }
+  if ((int32)s.chars[0] == 45) { return false; }
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c <= 32 || c == 61 || c >= 127) { return false; }
+  }
+  return true;
+}
+
+// Is cmd `anc` the command `c` or one of its parents?
+export fn args_is_ancestor(a: Args*, anc: int32, c: int32) -> bool {
+  var k: int32 = c;
+  while (k >= 0) {
+    if (k == anc) { return true; }
+    k = a->cmds[k].parent;
+  }
+  return false;
+}
+
+// Adds an option of any kind; the typed calls below wrap this. Returns its
+// index, or -1 when the spec is wrong (args_parse then reports ARGS_E_SPEC).
+export fn args_add_opt(a: Args*, kind: int32, short_name: int32, long_name: string,
+                       help: string, dest: rawptr) -> int32 {
+  if (a->nopts >= ARGS_MAX_OPTS) { spec_fail(a, "too many options"); return -1; }
+  if (short_name == 0 && long_name.length == (uint64)0) {
+    spec_fail(a, "an option needs a short or a long name");
+    return -1;
+  }
+  if (short_name != 0 && (short_name <= 32 || short_name >= 127 || short_name == 45 || short_name == 61)) {
+    spec_fail(a, "bad short option name");
+    return -1;
+  }
+  if (!name_ok(long_name)) { spec_fail(a, "bad long option name"); return -1; }
+  // A name may be used once in a command and its parents.
+  for i in 0..a->nopts {
+    var o: ArgsOpt* = &a->opts[i];
+    if (!args_is_ancestor(a, o->cmd, a->cur) && !args_is_ancestor(a, a->cur, o->cmd)) { continue; }
+    var clash: bool = false;
+    if (short_name != 0 && (int32)o->short_name == short_name) { clash = true; }
+    if (long_name.length > (uint64)0 && o->long_name == long_name) { clash = true; }
+    if (clash) {
+      // A command's own -h/--help or -V/--version can replace the built-in one.
+      if (o->kind == ARGS_HELP || o->kind == ARGS_VERSION) {
+        if (short_name != 0 && (int32)o->short_name == short_name) { o->short_name = (uint8)0; }
+        if (long_name.length > (uint64)0 && o->long_name == long_name) { o->long_name = ""; }
+        continue;
+      }
+      spec_fail(a, "an option name is used twice");
+      return -1;
+    }
+  }
+  var idx: int32 = a->nopts;
+  a->nopts = a->nopts + 1;
+  var o: ArgsOpt* = &a->opts[idx];
+  o->kind = kind;
+  o->cmd = a->cur;
+  o->short_name = (uint8)short_name;
+  o->long_name = long_name;
+  o->help = help;
+  o->metavar = "";
+  o->env = "";
+  o->dest = dest;
+  o->count_out = (int32*)0;
+  o->cap = 0;
+  o->choices = (string*)0;
+  o->nchoices = 0;
+  o->def_int = 0;
+  o->def_float = 0.0;
+  o->def_str = "";
+  o->has_def = false;
+  o->required = false;
+  o->hidden = false;
+  o->global = false;
+  o->seen = 0;
+  o->from_env = false;
+  a->last_opt = idx;
+  a->last_kind = 1;
+  return idx;
+}
+
+// --name / -n: *dest becomes true.
+export fn args_flag(a: Args*, dest: bool*, short_name: int32, long_name: string, help: string) -> int32 {
+  *dest = false;
+  return args_add_opt(a, ARGS_FLAG, short_name, long_name, help, (rawptr)dest);
+}
+
+// -v -v or -vv: *dest counts them.
+export fn args_count(a: Args*, dest: int64*, short_name: int32, long_name: string, help: string) -> int32 {
+  *dest = 0;
+  return args_add_opt(a, ARGS_COUNT, short_name, long_name, help, (rawptr)dest);
+}
+
+export fn args_int(a: Args*, dest: int64*, short_name: int32, long_name: string, def: int64, help: string) -> int32 {
+  *dest = def;
+  var i: int32 = args_add_opt(a, ARGS_INT, short_name, long_name, help, (rawptr)dest);
+  if (i >= 0) { a->opts[i].def_int = def; a->opts[i].has_def = true; }
+  return i;
+}
+
+export fn args_uint(a: Args*, dest: uint64*, short_name: int32, long_name: string, def: uint64, help: string) -> int32 {
+  *dest = def;
+  var i: int32 = args_add_opt(a, ARGS_UINT, short_name, long_name, help, (rawptr)dest);
+  if (i >= 0) { a->opts[i].def_int = (int64)def; a->opts[i].has_def = true; }
+  return i;
+}
+
+export fn args_float(a: Args*, dest: float64*, short_name: int32, long_name: string, def: float64, help: string) -> int32 {
+  *dest = def;
+  var i: int32 = args_add_opt(a, ARGS_FLOAT, short_name, long_name, help, (rawptr)dest);
+  if (i >= 0) { a->opts[i].def_float = def; a->opts[i].has_def = true; }
+  return i;
+}
+
+// A string option. An empty default is not shown in help.
+export fn args_str(a: Args*, dest: string*, short_name: int32, long_name: string, def: string, help: string) -> int32 {
+  *dest = def;
+  var i: int32 = args_add_opt(a, ARGS_STR, short_name, long_name, help, (rawptr)dest);
+  if (i >= 0) { a->opts[i].def_str = def; a->opts[i].has_def = def.length > (uint64)0; }
+  return i;
+}
+
+// One of a fixed set of names; *dest is the index of the one given.
+// `choices` must stay alive while the parser is used.
+export fn args_choice(a: Args*, dest: int32*, short_name: int32, long_name: string,
+                      choices: string[], def: int32, help: string) -> int32 {
+  *dest = def;
+  var i: int32 = args_add_opt(a, ARGS_CHOICE, short_name, long_name, help, (rawptr)dest);
+  if (i >= 0) {
+    a->opts[i].choices = choices.data;
+    a->opts[i].nchoices = (int32)choices.length;
+    a->opts[i].def_int = (int64)def;
+    a->opts[i].has_def = def >= 0 && (int64)def < (int64)choices.length;
+  }
+  return i;
+}
+
+// A repeated option: each value is stored in dest[0..cap). *count is how
+// many were given. `--tag a --tag b` and `-t a -tb` both give two.
+export fn args_list(a: Args*, dest: string*, cap: int32, count: int32*, short_name: int32,
+                    long_name: string, help: string) -> int32 {
+  *count = 0;
+  var i: int32 = args_add_opt(a, ARGS_LIST, short_name, long_name, help, (rawptr)dest);
+  if (i >= 0) { a->opts[i].cap = cap; a->opts[i].count_out = count; }
+  return i;
+}
+
+// An option whose value the program parses itself. `parse` gets the text
+// and `dest`, and returns 0 when the text is good.
+export fn args_custom(a: Args*, dest: rawptr, parse: fn(string, rawptr) -> int32, short_name: int32,
+                      long_name: string, metavar: string, help: string) -> int32 {
+  var i: int32 = args_add_opt(a, ARGS_CUSTOM, short_name, long_name, help, dest);
+  if (i >= 0) { a->opts[i].parse_fn = parse; a->opts[i].metavar = metavar; }
+  return i;
+}
+
+// Adds -V / --version, which prints "NAME VERSION".
+export fn args_version(a: Args*, version: string) -> int32 {
+  a->version = version;
+  var keep: int32 = a->cur;
+  a->cur = 0;
+  var i: int32 = args_add_opt(a, ARGS_VERSION, 86, "version", "print version", (rawptr)0);
+  a->cur = keep;
+  return i;
+}
+
+// --- modifiers for the option added last ---
+
+fn last(a: Args*) -> ArgsOpt* {
+  if (a->last_kind != 1 || a->last_opt < 0) { return (ArgsOpt*)0; }
+  return &a->opts[a->last_opt];
+}
+
+// Fall back on an environment variable when the option is not given.
+export fn args_env(a: Args*, var_name: string) {
+  var o: ArgsOpt* = last(a);
+  if (o != 0) { o->env = var_name; }
+}
+
+// The option or positional added last must be given.
+export fn args_required(a: Args*) {
+  if (a->last_kind == 1 && a->last_opt >= 0) { a->opts[a->last_opt].required = true; }
+  else if (a->last_kind == 2 && a->last_pos >= 0) { a->pos[a->last_pos].required = true; }
+}
+
+// The current command cannot run alone: one of its subcommands must follow.
+export fn args_need_sub(a: Args*) { a->cmds[a->cur].need_sub = true; }
+
+// Keep the option or command out of help and completions.
+export fn args_hidden(a: Args*) {
+  if (a->last_kind == 1 && a->last_opt >= 0) { a->opts[a->last_opt].hidden = true; }
+  else if (a->last_kind == 3) { a->cmds[a->cur].hidden = true; }
+}
+
+// Accept the option after this command's subcommands too.
+export fn args_global(a: Args*) {
+  var o: ArgsOpt* = last(a);
+  if (o != 0) { o->global = true; }
+}
+
+// The VALUE name shown in help, such as FILE or N.
+export fn args_metavar(a: Args*, name: string) {
+  if (a->last_kind == 1 && a->last_opt >= 0) { a->opts[a->last_opt].metavar = name; }
+  else if (a->last_kind == 2 && a->last_pos >= 0) { a->pos[a->last_pos].name = name; }
+}
+
+// --- positional arguments ---
+
+fn add_pos(a: Args*, dest: string*, cap: int32, count: int32*, name: string, help: string,
+           rest: bool, required: bool) -> int32 {
+  if (a->npos >= ARGS_MAX_POS) { spec_fail(a, "too many positionals"); return -1; }
+  for i in 0..a->npos {
+    if (a->pos[i].cmd == a->cur && a->pos[i].rest) {
+      spec_fail(a, "nothing can follow a rest positional");
+      return -1;
+    }
+    if (a->pos[i].cmd == a->cur && !a->pos[i].required && required) {
+      spec_fail(a, "a required positional cannot follow an optional one");
+      return -1;
+    }
+  }
+  var idx: int32 = a->npos;
+  a->npos = a->npos + 1;
+  var p: ArgsPos* = &a->pos[idx];
+  p->cmd = a->cur;
+  p->name = name;
+  p->help = help;
+  p->dest = dest;
+  p->count_out = count;
+  p->cap = cap;
+  p->rest = rest;
+  p->required = required;
+  p->seen = 0;
+  a->last_pos = idx;
+  a->last_kind = 2;
+  return idx;
+}
+
+// A required positional argument.
+export fn args_pos(a: Args*, dest: string*, name: string, help: string) -> int32 {
+  *dest = "";
+  return add_pos(a, dest, 1, (int32*)0, name, help, false, true);
+}
+
+// An optional positional argument with a default.
+export fn args_pos_opt(a: Args*, dest: string*, name: string, def: string, help: string) -> int32 {
+  *dest = def;
+  return add_pos(a, dest, 1, (int32*)0, name, help, false, false);
+}
+
+// Every remaining positional, up to cap of them. Must come last.
+// args_required after it means at least one.
+export fn args_rest(a: Args*, dest: string*, cap: int32, count: int32*, name: string, help: string) -> int32 {
+  *count = 0;
+  return add_pos(a, dest, cap, count, name, help, true, false);
+}
+
+// --- subcommands ---
+
+// Adds subcommand `name` under `parent` (0 is the root) and makes it the
+// current command, so the options added next belong to it. Returns its id.
+export fn args_cmd(a: Args*, parent: int32, name: string, help: string) -> int32 {
+  if (a->ncmds >= ARGS_MAX_CMDS) { spec_fail(a, "too many commands"); return 0; }
+  if (parent < 0 || parent >= a->ncmds) { spec_fail(a, "bad parent command"); return 0; }
+  if (name.length == (uint64)0 || !name_ok(name)) { spec_fail(a, "bad command name"); return 0; }
+  for i in 1..a->ncmds {
+    if (a->cmds[i].parent == parent && a->cmds[i].name == name) {
+      spec_fail(a, "a command name is used twice");
+      return 0;
+    }
+  }
+  var idx: int32 = a->ncmds;
+  a->ncmds = a->ncmds + 1;
+  var c: ArgsCmd* = &a->cmds[idx];
+  c->parent = parent;
+  c->name = name;
+  c->help = help;
+  c->about = "";
+  c->aliases = "";
+  c->need_sub = false;
+  c->hidden = false;
+  a->cur = idx;
+  a->last_kind = 3;
+  return idx;
+}
+
+// Make `cmd` the current command again.
+export fn args_use(a: Args*, cmd: int32) {
+  if (cmd >= 0 && cmd < a->ncmds) { a->cur = cmd; a->last_kind = 3; }
+}
+
+// Other names for the current command, separated by spaces ("b bld").
+export fn args_alias(a: Args*, names: string) { a->cmds[a->cur].aliases = names; }
+
+// Longer text shown under the usage line of the current command's help.
+export fn args_about(a: Args*, text: string) { a->cmds[a->cur].about = text; }
+
+// --- settings ---
+
+// Accept unique prefixes of long names (--verb for --verbose), as GNU
+// getopt_long and Python's argparse do. Off by default.
+export fn args_set_abbrev(a: Args*, on: bool) { a->abbrev = on; }
+
+// Stop reading options at the first positional, as POSIX getopt does.
+// Off by default: options may come after positionals (GNU style).
+export fn args_set_posix(a: Args*, on: bool) { a->posix = on; }
+
+// Help text width in columns. 0 uses $COLUMNS, else 80.
+export fn args_set_width(a: Args*, cols: int32) { a->width = cols; }

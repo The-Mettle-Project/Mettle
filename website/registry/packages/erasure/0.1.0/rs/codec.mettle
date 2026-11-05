@@ -1,0 +1,327 @@
+// Reed-Solomon erasure code over GF(2^8): k data shards plus m parity
+// shards, any k of the k + m shards rebuild the rest. k + m is at most 256.
+//
+// The method follows klauspost/reedsolomon and Backblaze JavaReedSolomon:
+// a systematic coding matrix (Vandermonde by default, Cauchy as an option),
+// parity = parity rows x data, and rebuild by inverting the rows of the
+// first k shards that survive. Inverted matrices are cached by loss pattern.
+//
+// A codec is not safe to share between threads while it rebuilds, because
+// the cache changes. Encode and verify do not change the codec.
+
+import "std/mem";
+import "erasure/core/status";
+import "erasure/gf8/field";
+import "erasure/gf8/matrix";
+import "erasure/gf8/plan";
+
+export const ERASURE_MATRIX_VANDERMONDE: int32 = 0;
+export const ERASURE_MATRIX_CAUCHY: int32 = 1;
+
+export const ERASURE_RS_MAX_SHARDS: int32 = 256;
+
+const ERASURE_CACHE_SLOTS: int32 = 32;
+
+// One cached rebuild plan, keyed by which shards were present.
+struct ErasureRsEntry {
+  used: bool;
+  data_only: bool;
+  key: uint64[4];      // bit i set when shard i was present
+  srcs: int32*;        // the k shard indexes the plan reads
+  outs: int32*;        // the shard indexes the plan writes
+  plan: ErasureGf8Plan;
+}
+
+export struct ErasureRS {
+  k: int32;
+  m: int32;
+  n: int32;
+  kind: int32;
+  matrix: uint8*;      // n x k coding matrix; the top k rows are the identity
+  enc: ErasureGf8Plan; // parity rows
+  cache: ErasureRsEntry*;
+  next_slot: int32;
+}
+
+/// Sets up a codec with k data and m parity shards using the Vandermonde
+/// matrix (the same shards as klauspost/reedsolomon's default and
+/// Backblaze). Returns ERASURE_OK, ERASURE_E_ARG or ERASURE_E_MEM.
+export fn erasure_rs_new(c: ErasureRS*, k: int32, m: int32) -> int32 {
+  return erasure_rs_new_with(c, k, m, ERASURE_MATRIX_VANDERMONDE);
+}
+
+/// Like erasure_rs_new, with the matrix kind (ERASURE_MATRIX_*).
+export fn erasure_rs_new_with(c: ErasureRS*, k: int32, m: int32, kind: int32) -> int32 {
+  if (c == 0) { return ERASURE_E_ARG; }
+  c->matrix = 0;
+  c->cache = 0;
+  c->enc.coef = 0;
+  c->enc.nib = 0;
+  c->enc.aff = 0;
+  c->enc.aff8 = 0;
+  if (k < 1 || m < 0 || k + m > ERASURE_RS_MAX_SHARDS) { return ERASURE_E_ARG; }
+  if (kind != ERASURE_MATRIX_VANDERMONDE && kind != ERASURE_MATRIX_CAUCHY) { return ERASURE_E_ARG; }
+  erasure_gf8_init();
+  c->k = k;
+  c->m = m;
+  c->n = k + m;
+  c->kind = kind;
+  c->next_slot = 0;
+  c->matrix = (uint8*)malloc((int64)c->n * k);
+  c->cache = (ErasureRsEntry*)calloc((int64)ERASURE_CACHE_SLOTS, sizeof(ErasureRsEntry));
+  if (c->matrix == 0 || c->cache == 0) { erasure_rs_free(c); return ERASURE_E_MEM; }
+  var rc: int32 = ERASURE_OK;
+  if (kind == ERASURE_MATRIX_CAUCHY) {
+    erasure_gf8_cauchy(c->matrix, k, m);
+  } else {
+    rc = erasure_gf8_vandermonde(c->matrix, k, m);
+  }
+  if (rc == ERASURE_OK) { rc = erasure_gf8_plan_init(&c->enc, c->matrix + (int64)k * k, m, k); }
+  if (rc != ERASURE_OK) { erasure_rs_free(c); }
+  return rc;
+}
+
+/// Frees everything the codec holds.
+export fn erasure_rs_free(c: ErasureRS*) {
+  if (c == 0) { return; }
+  if (c->cache != 0) {
+    for i in 0..ERASURE_CACHE_SLOTS {
+      var e: ErasureRsEntry* = &c->cache[i];
+      if (e->used) {
+        free(e->srcs);
+        free(e->outs);
+        erasure_gf8_plan_free(&e->plan);
+      }
+    }
+    free(c->cache);
+  }
+  if (c->matrix != 0) { free(c->matrix); }
+  erasure_gf8_plan_free(&c->enc);
+  c->cache = 0;
+  c->matrix = 0;
+}
+
+/// The coding-matrix entry for shard row r (0..n) and data column j.
+export fn erasure_rs_coef(c: ErasureRS*, r: int32, j: int32) -> uint8 {
+  return c->matrix[(int64)r * c->k + j];
+}
+
+/// Computes the m parity shards from the k data shards. shards holds
+/// k + m pointers, each to size bytes; the parity ones are overwritten.
+export fn erasure_rs_encode(c: ErasureRS*, shards: uint8**, size: int64) -> int32 {
+  return erasure_rs_encode_range(c, shards, 0, size);
+}
+
+/// Like erasure_rs_encode, for bytes off..off+n of every shard only.
+export fn erasure_rs_encode_range(c: ErasureRS*, shards: uint8**, off: int64, n: int64) -> int32 {
+  if (c == 0 || shards == 0 || off < 0 || n < 0) { return ERASURE_E_ARG; }
+  for i in 0..c->n { if (shards[i] == 0) { return ERASURE_E_ARG; } }
+  erasure_gf8_plan_apply(&c->enc, shards, shards + c->k, off, n);
+  return ERASURE_OK;
+}
+
+/// Checks that the parity shards match the data shards. Returns ERASURE_OK
+/// when they do, ERASURE_E_VERIFY when they do not.
+export fn erasure_rs_verify(c: ErasureRS*, shards: uint8**, size: int64) -> int32 {
+  if (c == 0 || shards == 0 || size < 0) { return ERASURE_E_ARG; }
+  for i in 0..c->n { if (shards[i] == 0) { return ERASURE_E_ARG; } }
+  if (c->m == 0 || size == 0) { return ERASURE_OK; }
+  var chunk: int64 = 65536;
+  if (size < chunk) { chunk = size; }
+  var tmp: uint8** = (uint8**)malloc((int64)c->m * 8);
+  if (tmp == 0) { return ERASURE_E_MEM; }
+  var block: uint8* = (uint8*)malloc((int64)c->m * chunk);
+  if (block == 0) { free(tmp); return ERASURE_E_MEM; }
+  var rc: int32 = ERASURE_OK;
+  var pos: int64 = 0;
+  while (pos < size && rc == ERASURE_OK) {
+    var len: int64 = size - pos;
+    if (len > chunk) { len = chunk; }
+    // Point the outputs so that byte pos lands at the start of the block.
+    for p in 0..c->m { tmp[p] = block + (int64)p * chunk - pos; }
+    erasure_gf8_plan_apply(&c->enc, shards, tmp, pos, len);
+    for p in 0..c->m {
+      var want: uint8* = shards[c->k + p] + pos;
+      var got: uint8* = block + (int64)p * chunk;
+      for i in 0..len {
+        if (want[i] != got[i]) { rc = ERASURE_E_VERIFY; break; }
+      }
+      if (rc != ERASURE_OK) { break; }
+    }
+    pos = pos + len;
+  }
+  free(block);
+  free(tmp);
+  return rc;
+}
+
+fn erasure_rs_key(present: bool*, n: int32, key: uint64*) {
+  for i in 0..4 { key[i] = 0; }
+  for i in 0..n {
+    if (present[i]) { key[i >> 6] = key[i >> 6] | ((uint64)1 << (uint64)(i & 63)); }
+  }
+}
+
+// Finds or builds the plan that rebuilds the missing shards from the first
+// k present ones. Returns 0 when out of memory.
+fn erasure_rs_entry(c: ErasureRS*, present: bool*, data_only: bool) -> ErasureRsEntry* {
+  var key: uint64[4];
+  erasure_rs_key(present, c->n, &key[0]);
+  for s in 0..ERASURE_CACHE_SLOTS {
+    var e: ErasureRsEntry* = &c->cache[s];
+    if (e->used && e->data_only == data_only && e->key[0] == key[0] && e->key[1] == key[1] &&
+        e->key[2] == key[2] && e->key[3] == key[3]) {
+      return e;
+    }
+  }
+  var k: int32 = c->k;
+  var srcs: int32* = (int32*)malloc((int64)k * 4);
+  var outs: int32* = (int32*)malloc((int64)c->n * 4);
+  var sub: uint8* = (uint8*)malloc((int64)k * k);
+  var coef: uint8* = (uint8*)malloc((int64)c->n * k + 1);
+  if (srcs == 0 || outs == 0 || sub == 0 || coef == 0) {
+    free(srcs); free(outs); free(sub); free(coef);
+    return (ErasureRsEntry*)0;
+  }
+  var ns: int32 = 0;
+  for i in 0..c->n {
+    if (present[i] && ns < k) { srcs[ns] = i; ns = ns + 1; }
+  }
+  // Rows of the coding matrix for the chosen shards, then invert: that gives
+  // each data shard in terms of the chosen shards.
+  for r in 0..k {
+    for j in 0..k { sub[(int64)r * k + j] = c->matrix[(int64)srcs[r] * k + j]; }
+  }
+  var rc: int32 = erasure_gf8_mat_invert(sub, k);
+  var no: int32 = 0;
+  if (rc == ERASURE_OK) {
+    for i in 0..k {
+      if (!present[i]) {
+        for j in 0..k { coef[(int64)no * k + j] = sub[(int64)i * k + j]; }
+        outs[no] = i;
+        no = no + 1;
+      }
+    }
+    if (!data_only) {
+      // A missing parity shard is its matrix row times the decode matrix,
+      // so it too comes straight from the chosen shards in the same pass.
+      for p in c->k..c->n {
+        if (present[p]) { continue; }
+        for j in 0..k {
+          var s: uint8 = 0;
+          for t in 0..k {
+            s = s ^ erasure_gf8_mul(c->matrix[(int64)p * k + t], sub[(int64)t * k + j]);
+          }
+          coef[(int64)no * k + j] = s;
+        }
+        outs[no] = p;
+        no = no + 1;
+      }
+    }
+  }
+  free(sub);
+  var e: ErasureRsEntry* = &c->cache[c->next_slot];
+  c->next_slot = (c->next_slot + 1) % ERASURE_CACHE_SLOTS;
+  if (e->used) {
+    free(e->srcs);
+    free(e->outs);
+    erasure_gf8_plan_free(&e->plan);
+    e->used = false;
+  }
+  if (rc == ERASURE_OK) { rc = erasure_gf8_plan_init(&e->plan, coef, no, k); }
+  free(coef);
+  if (rc != ERASURE_OK) { free(srcs); free(outs); return (ErasureRsEntry*)0; }
+  e->used = true;
+  e->data_only = data_only;
+  for i in 0..4 { e->key[i] = key[i]; }
+  e->srcs = srcs;
+  e->outs = outs;
+  return e;
+}
+
+fn erasure_rs_rebuild(c: ErasureRS*, shards: uint8**, present: bool*, off: int64, n: int64, data_only: bool) -> int32 {
+  if (c == 0 || shards == 0 || present == 0 || off < 0 || n < 0) { return ERASURE_E_ARG; }
+  var have: int32 = 0;
+  var need: int32 = 0;
+  for i in 0..c->n {
+    if (shards[i] == 0) { return ERASURE_E_ARG; }
+    if (present[i]) {
+      have = have + 1;
+    } else if (i < c->k || !data_only) {
+      need = need + 1;
+    }
+  }
+  if (need == 0) { return ERASURE_OK; }
+  if (have < c->k) { return ERASURE_E_SHARDS; }
+  var e: ErasureRsEntry* = erasure_rs_entry(c, present, data_only);
+  if (e == 0) { return ERASURE_E_MEM; }
+  var src: uint8** = (uint8**)malloc((int64)c->k * 8);
+  var dst: uint8** = (uint8**)malloc((int64)e->plan.rows * 8 + 8);
+  if (src == 0 || dst == 0) { free(src); free(dst); return ERASURE_E_MEM; }
+  for j in 0..c->k { src[j] = shards[e->srcs[j]]; }
+  for o in 0..e->plan.rows { dst[o] = shards[e->outs[o]]; }
+  erasure_gf8_plan_apply(&e->plan, src, dst, off, n);
+  free(src);
+  free(dst);
+  return ERASURE_OK;
+}
+
+/// Rebuilds every missing shard. present[i] says whether shard i holds good
+/// data; the buffers of the missing ones are overwritten. Every shard
+/// pointer must point at size bytes. Needs at least k present shards
+/// (ERASURE_E_SHARDS otherwise). present is not changed.
+export fn erasure_rs_reconstruct(c: ErasureRS*, shards: uint8**, present: bool*, size: int64) -> int32 {
+  return erasure_rs_rebuild(c, shards, present, 0, size, false);
+}
+
+/// Like erasure_rs_reconstruct, but rebuilds only the missing data shards.
+export fn erasure_rs_reconstruct_data(c: ErasureRS*, shards: uint8**, present: bool*, size: int64) -> int32 {
+  return erasure_rs_rebuild(c, shards, present, 0, size, true);
+}
+
+/// Like erasure_rs_reconstruct, for bytes off..off+n only. Streaming uses it.
+export fn erasure_rs_reconstruct_range(c: ErasureRS*, shards: uint8**, present: bool*, off: int64, n: int64, data_only: bool) -> int32 {
+  return erasure_rs_rebuild(c, shards, present, off, n, data_only);
+}
+
+/// The shard size needed to hold len bytes split over k data shards.
+export fn erasure_shard_size(len: int64, k: int32) -> int64 {
+  if (k < 1 || len <= 0) { return 0; }
+  return (len + (int64)k - 1) / (int64)k;
+}
+
+/// Copies len bytes of data into the k data shards in order, size bytes
+/// each, padding the end with zeros. size must be at least
+/// erasure_shard_size(len, k).
+export fn erasure_split(data: uint8*, len: int64, shards: uint8**, k: int32, size: int64) -> int32 {
+  if (shards == 0 || k < 1 || len < 0 || size < erasure_shard_size(len, k)) { return ERASURE_E_ARG; }
+  if (len > 0 && data == 0) { return ERASURE_E_ARG; }
+  var pos: int64 = 0;
+  for j in 0..k {
+    if (shards[j] == 0) { return ERASURE_E_ARG; }
+    var take: int64 = len - pos;
+    if (take > size) { take = size; }
+    if (take < 0) { take = 0; }
+    if (take > 0) { memcpy(shards[j], data + pos, take); }
+    for i in take..size { shards[j][i] = 0; }
+    pos = pos + take;
+  }
+  return ERASURE_OK;
+}
+
+/// Copies the first len bytes held by the k data shards into out. The
+/// reverse of erasure_split.
+export fn erasure_join(shards: uint8**, k: int32, size: int64, out: uint8*, len: int64) -> int32 {
+  if (shards == 0 || k < 1 || len < 0 || size < 0 || len > size * (int64)k) { return ERASURE_E_ARG; }
+  if (len > 0 && out == 0) { return ERASURE_E_ARG; }
+  var pos: int64 = 0;
+  for j in 0..k {
+    if (pos >= len) { break; }
+    if (shards[j] == 0) { return ERASURE_E_ARG; }
+    var take: int64 = len - pos;
+    if (take > size) { take = size; }
+    memcpy(out + pos, shards[j], take);
+    pos = pos + take;
+  }
+  return ERASURE_OK;
+}

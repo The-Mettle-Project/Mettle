@@ -1,0 +1,107 @@
+// The usual way to use args: parse the real command line, print help,
+// version or an error, and tell the program whether to go on.
+
+import "std/io";
+import "std/mem";
+import "std/env";
+import "types";
+import "out";
+import "spec";
+import "error";
+import "parse";
+import "help";
+import "complete";
+
+var g_argv: string[1024];
+
+// Adds a `completion SHELL` subcommand under the root that prints the
+// completion script for bash, zsh or fish. args_run handles it.
+export fn args_completion_cmd(a: Args*) -> int32 {
+  var keep: int32 = a->cur;
+  var c: int32 = args_cmd(a, 0, "completion", "print a shell completion script (bash, zsh, fish)");
+  args_pos(a, &a->comp_shell, "SHELL", "bash, zsh or fish");
+  a->comp_cmd = c;
+  a->cur = keep;
+  a->last_kind = 3;
+  return c;
+}
+
+// Exit code for each result: 0 for help and version, 2 for usage errors
+// (as clap, argparse and Go's flag package do).
+export fn args_exit_code(r: int32) -> int32 {
+  if (r == ARGS_SHOW_HELP || r == ARGS_SHOW_VERSION) { return 0; }
+  if (r == ARGS_OK) { return 0; }
+  return 2;
+}
+
+// After args_parse: print what the result calls for. Help and version go
+// to stdout; errors go to stderr with the usage line. Returns -1 when the
+// program should go on, else the exit code to return from main.
+export fn args_report(a: Args*, r: int32) -> int32 {
+  var w: ArgsOut;
+  if (r == ARGS_OK) {
+    if (a->comp_cmd > 0 && a->cmd == a->comp_cmd) {
+      var sh: int32 = args_shell_id(a->comp_shell);
+      if (sh == 0) {
+        args_out_stream(&w, get_stderr());
+        args_out_str(&w, "error: unknown shell '");
+        args_out_str(&w, a->comp_shell);
+        args_out_str(&w, "' (choose from bash, zsh, fish)\n");
+        args_out_flush(&w);
+        return 2;
+      }
+      args_out_stream(&w, get_stdout());
+      args_write_completion(a, sh, &w);
+      args_out_flush(&w);
+      return 0;
+    }
+    return -1;
+  }
+  if (r == ARGS_SHOW_HELP) {
+    args_out_stream(&w, get_stdout());
+    args_write_help(a, a->cmd, &w);
+    args_out_flush(&w);
+    return 0;
+  }
+  if (r == ARGS_SHOW_VERSION) {
+    args_out_stream(&w, get_stdout());
+    args_write_version(a, &w);
+    args_out_byte(&w, 10);
+    args_out_flush(&w);
+    return 0;
+  }
+  args_out_stream(&w, get_stderr());
+  args_out_str(&w, "error: ");
+  args_write_error(a, &w);
+  if (r != ARGS_E_SPEC) {
+    args_out_str(&w, "\n\nUsage: ");
+    args_write_usage(a, a->cmd, &w);
+    args_out_str(&w, "\n\nFor more information, try '");
+    args_write_cmd_path(a, a->cmd, &w);
+    args_out_str(&w, " --help'.");
+  }
+  args_out_byte(&w, 10);
+  args_out_flush(&w);
+  return args_exit_code(r);
+}
+
+// Parse this process's arguments and report. Returns -1 to go on, else
+// the exit code:
+//
+//   var code: int32 = args_run(&a);
+//   if (code >= 0) { return code; }
+export fn args_run(a: Args*) -> int32 {
+  var n: int32 = env_args(&g_argv[0], 1024);
+  var all: string* = &g_argv[0];
+  if (n > 1024) {
+    // Very long command lines: the one case that allocates.
+    all = (string*)malloc((int64)n * 16);
+    if (all == 0) { return 2; }
+    env_args(all, n);
+  }
+  var cnt: int64 = 0;
+  if (n > 1) { cnt = (int64)(n - 1); }
+  var words: string[] = { data: all + 1, length: cnt };
+  var r: int32 = args_parse(a, words);
+  return args_report(a, r);
+}

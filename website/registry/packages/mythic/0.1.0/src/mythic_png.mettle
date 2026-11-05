@@ -1,0 +1,114 @@
+// mythic_png: PNG writer (stored deflate, crc32, adler32) for goldens (DECISIONS §10).
+// Writes 8-bit RGBA (color type 6) from 0xAARRGGBB pixels.
+import "std/io";
+import "mythic_types";
+
+var g_mythic_crc_table: uint32* = 0;
+
+fn crc_init() {
+  if (g_mythic_crc_table != 0) { return; }
+  var t: uint32* = (uint32*)malloc(256 * 4);
+  for n: int32 in 0..256 {
+    var c: uint32 = (uint32)n;
+    for k: int32 in 0..8 {
+      if ((c & (uint32)1) != (uint32)0) { c = (uint32)0xEDB88320 ^ (c >> (uint32)1); }
+      else { c = c >> (uint32)1; }
+    }
+    t[n] = c;
+  }
+  g_mythic_crc_table = t;
+}
+
+/// CRC-32 (PNG / zlib polynomial) of `n` bytes.
+export fn mythic_crc32(p: uint8*, n: int64) -> uint32 {
+  crc_init();
+  var t: uint32* = g_mythic_crc_table;
+  var c: uint32 = 0xFFFFFFFF;
+  for i: int64 in 0..n { c = t[(c ^ (uint32)p[i]) & (uint32)0xFF] ^ (c >> (uint32)8); }
+  return c ^ (uint32)0xFFFFFFFF;
+}
+
+fn put32(p: uint8*, v: uint32) {
+  p[0] = (uint8)(v >> (uint32)24); p[1] = (uint8)(v >> (uint32)16);
+  p[2] = (uint8)(v >> (uint32)8); p[3] = (uint8)v;
+}
+
+// Writes a chunk whose type+data already sit at buf[4..8+len); fills length and CRC.
+fn chunk(fp: cstring, buf: uint8*, len: int64) -> bool {
+  put32(buf, (uint32)len);
+  put32(buf + 8 + len, mythic_crc32(buf + 4, len + 4));
+  return fwrite((cstring)buf, 1, len + 12, fp) == len + 12;
+}
+
+export fn mythic_png_write(path: string, px: uint32*, w: int32, h: int32, stride: int32) -> bool {
+  if (w <= 0 || h <= 0) { return false; }
+  // nul-terminated copy of the path (the caller's string is not retained)
+  var pl: int64 = (int64)path.length;
+  var cpath: uint8* = (uint8*)malloc(pl + 1);
+  memcpy((rawptr)cpath, (rawptr)path.chars, pl);
+  cpath[pl] = (uint8)0;
+  var fp: cstring = fopen((cstring)cpath, "wb");
+  free((rawptr)cpath);
+  if (fp == 0) { return false; }
+  var rowlen: int64 = 1 + (int64)w * 4;
+  var raw: int64 = rowlen * (int64)h;
+  var nblocks: int64 = (raw + 65534) / 65535;
+  var zlen: int64 = 2 + nblocks * 5 + raw + 4;
+  var buf: uint8* = (uint8*)malloc(zlen + 64);
+  var ok: bool = true;
+  // signature + IHDR
+  var sig: uint8[8] = [137, 80, 78, 71, 13, 10, 26, 10];
+  ok = ok && fwrite((cstring)&sig[0], 1, 8, fp) == 8;
+  var hd: uint8* = buf;
+  hd[4] = (uint8)73; hd[5] = (uint8)72; hd[6] = (uint8)68; hd[7] = (uint8)82;   // IHDR
+  put32(hd + 8, (uint32)w); put32(hd + 12, (uint32)h);
+  hd[16] = (uint8)8; hd[17] = (uint8)6; hd[18] = (uint8)0; hd[19] = (uint8)0; hd[20] = (uint8)0;
+  ok = ok && chunk(fp, hd, 13);
+  // IDAT: zlib stream of stored blocks
+  var d: uint8* = buf + 8;
+  d[0] = (uint8)0x78; d[1] = (uint8)0x01;
+  var o: int64 = 2;
+  var a1: uint32 = 1; var a2: uint32 = 0;
+  var remaining: int64 = raw;
+  var y: int32 = 0; var col: int64 = 0;   // position in the raw (filtered) stream
+  while (remaining > 0) {
+    var n: int64 = remaining;
+    if (n > 65535) { n = 65535; }
+    remaining = remaining - n;
+    var last: uint8 = 0;
+    if (remaining == 0) { last = 1; }
+    d[o] = last;
+    d[o + 1] = (uint8)(n & 255); d[o + 2] = (uint8)(n >> 8);
+    d[o + 3] = (uint8)(~n & 255); d[o + 4] = (uint8)((~n >> 8) & 255);
+    o = o + 5;
+    var k: int64 = 0;
+    while (k < n) {
+      var b: uint8 = 0;
+      if (col != 0) {
+        var pi: int64 = (col - 1) / 4;
+        var ch: int64 = (col - 1) % 4;
+        var p: uint32 = px[(int64)y * (int64)stride + pi];
+        if (ch == 0) { b = (uint8)(p >> (uint32)16); }
+        else if (ch == 1) { b = (uint8)(p >> (uint32)8); }
+        else if (ch == 2) { b = (uint8)p; }
+        else { b = (uint8)(p >> (uint32)24); }
+      }
+      d[o] = b;
+      a1 = (a1 + (uint32)b) % (uint32)65521;
+      a2 = (a2 + a1) % (uint32)65521;
+      o = o + 1;
+      col = col + 1;
+      if (col == rowlen) { col = 0; y = y + 1; }
+      k = k + 1;
+    }
+  }
+  put32(d + o, (a2 << (uint32)16) | a1);
+  o = o + 4;
+  buf[4] = (uint8)73; buf[5] = (uint8)68; buf[6] = (uint8)65; buf[7] = (uint8)84;   // IDAT
+  ok = ok && chunk(fp, buf, o);
+  buf[4] = (uint8)73; buf[5] = (uint8)69; buf[6] = (uint8)78; buf[7] = (uint8)68;   // IEND
+  ok = ok && chunk(fp, buf, 0);
+  free((rawptr)buf);
+  fclose(fp);
+  return ok;
+}

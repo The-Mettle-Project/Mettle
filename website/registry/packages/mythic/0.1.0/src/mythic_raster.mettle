@@ -1,0 +1,970 @@
+// mythic_raster: tile damage tracking + scanline rasterizer (DECISIONS §6, Appendix D).
+// Framebuffer pixels are 0xAARRGGBB. Colors in the list are straight alpha; blending is
+// source-over in plain sRGB space onto a premultiplied (normally opaque) destination.
+import "mythic_types";
+import "mythic_dl";
+import "mythic_ttf";
+import "mythic_fonts";
+import "mythic_glyph";
+import "mythic_image";
+import "mythic_raster_path";
+import "mythic_raster_shadow";
+
+export const MYTHIC_TILE: int32 = 64;
+
+// Opaque outside the renderer modules.
+export struct MythicRenderer {
+  fonts: MythicFonts*; images: MythicImages*;
+  w: int32; h: int32; tw: int32; th: int32; ntiles: int32;
+  hash_a: uint64*; hash_b: uint64*;       // previous / current tile hashes (swapped per frame)
+  tile_start: int32*;                     // ntiles + 1 bin offsets
+  tile_fill: int32*;
+  bins: MythicVec<int32>;
+  boxes: MythicVec<MythicRectI>;              // per command device box: x0, y0, x1 (w field), y1 (h field)
+  dirty: MythicVec<MythicRectI>;
+  dirty_tiles: uint8*;
+  gamma: uint8*;                          // 256-entry small-text darkening LUT
+  have_prev: bool;
+  stat_tiles: int32;                      // dirty tile count of the last render
+  shadows: MythicShadowCache;
+  acc: MythicAccum;                         // path fill accumulation
+  cov: float32*;                          // MYTHIC_TILE^2 coverage scratch (path strokes)
+  prof: float32*;                         // 4 * MYTHIC_TILE profile scratch (shadows)
+  layer: uint32*;                         // MYTHIC_TILE^2 premultiplied layer (rounded clips)
+}
+
+// ------------------------------------------------------------------ pixel helpers
+
+fn blend1(d: uint32, c: uint32, a: uint32) -> uint32 {
+  var ia: uint32 = (uint32)255 - a;
+  var rb: uint32 = (c & (uint32)0x00FF00FF) * a + (d & (uint32)0x00FF00FF) * ia + (uint32)0x00800080;
+  rb = ((rb + ((rb >> (uint32)8) & (uint32)0x00FF00FF)) >> (uint32)8) & (uint32)0x00FF00FF;
+  var cag: uint32 = ((c >> (uint32)8) & (uint32)0xFF) | (uint32)0x00FF0000;
+  var ag: uint32 = cag * a + ((d >> (uint32)8) & (uint32)0x00FF00FF) * ia + (uint32)0x00800080;
+  ag = ((ag + ((ag >> (uint32)8) & (uint32)0x00FF00FF)) >> (uint32)8) & (uint32)0x00FF00FF;
+  return rb | (ag << (uint32)8);
+}
+
+// Blends straight color c (its own alpha ignored) with effective alpha a (0..255) over a span.
+fn span(p: uint32*, n: int32, c: uint32, a: uint32) {
+  if (n <= 0 || a == (uint32)0) { return; }
+  if (a >= (uint32)255) {
+    var oc: uint32 = c | (uint32)0xFF000000;
+    for i: int32 in 0..n { p[i] = oc; }
+    return;
+  }
+  var ia: uint32 = (uint32)255 - a;
+  var crb: uint32 = (c & (uint32)0x00FF00FF) * a + (uint32)0x00800080;
+  var cag: uint32 = (((c >> (uint32)8) & (uint32)0xFF) | (uint32)0x00FF0000) * a + (uint32)0x00800080;
+  var m: uint32 = (uint32)0x00FF00FF;
+  for i: int32 in 0..n {
+    var d: uint32 = p[i];
+    var rb: uint32 = crb + (d & m) * ia;
+    rb = ((rb + ((rb >> (uint32)8) & m)) >> (uint32)8) & m;
+    var ag: uint32 = cag + ((d >> (uint32)8) & m) * ia;
+    ag = ((ag + ((ag >> (uint32)8) & m)) >> (uint32)8) & m;
+    p[i] = rb | (ag << (uint32)8);
+  }
+}
+
+fn ifloor(x: float32) -> int32 {
+  var i: int32 = (int32)x;
+  if ((float32)i > x) { i = i - 1; }
+  return i;
+}
+fn iceil(x: float32) -> int32 {
+  var i: int32 = (int32)x;
+  if ((float32)i < x) { i = i + 1; }
+  return i;
+}
+fn clamp01(x: float32) -> float32 {
+  if (x < 0.0) { return 0.0; }
+  if (x > 1.0) { return 1.0; }
+  return x;
+}
+
+// ------------------------------------------------------------------ rounded rects
+
+struct RShape { x0: float32; y0: float32; x1: float32; y1: float32; tl: float32; tr: float32; br: float32; bl: float32; }
+
+fn make_shape(x: float32, y: float32, w: float32, h: float32, rc: MythicCorners) -> RShape {
+  var s: RShape = { x0: x, y0: y, x1: x + w, y1: y + h,
+                    tl: mythic_maxf(rc.tl, 0.0), tr: mythic_maxf(rc.tr, 0.0), br: mythic_maxf(rc.br, 0.0), bl: mythic_maxf(rc.bl, 0.0) };
+  var f: float32 = 1.0;
+  if (s.tl + s.tr > w) { f = mythic_minf(f, w / (s.tl + s.tr)); }
+  if (s.bl + s.br > w) { f = mythic_minf(f, w / (s.bl + s.br)); }
+  if (s.tl + s.bl > h) { f = mythic_minf(f, h / (s.tl + s.bl)); }
+  if (s.tr + s.br > h) { f = mythic_minf(f, h / (s.tr + s.br)); }
+  if (f < 1.0) { s.tl = s.tl * f; s.tr = s.tr * f; s.br = s.br * f; s.bl = s.bl * f; }
+  return s;
+}
+
+fn corner_cov(cx: float32, cy: float32, ccx: float32, ccy: float32, r: float32) -> float32 {
+  var dx: float32 = cx - ccx;
+  var dy: float32 = cy - ccy;
+  return clamp01(0.5 - (mythic_sqrtf(dx * dx + dy * dy) - r));
+}
+
+// Coverage of pixel (px, py) by the rounded rect: exact box-filter area along straight edges,
+// analytic SDF clamp(0.5 - d) inside corner boxes (continuous at the boundary).
+fn rr_cov(s: RShape*, px: int32, py: int32) -> float32 {
+  var cx: float32 = (float32)px + 0.5;
+  var cy: float32 = (float32)py + 0.5;
+  if (cy < s->y0 + s->tl && cx < s->x0 + s->tl) { return corner_cov(cx, cy, s->x0 + s->tl, s->y0 + s->tl, s->tl); }
+  if (cy < s->y0 + s->tr && cx > s->x1 - s->tr) { return corner_cov(cx, cy, s->x1 - s->tr, s->y0 + s->tr, s->tr); }
+  if (cy > s->y1 - s->br && cx > s->x1 - s->br) { return corner_cov(cx, cy, s->x1 - s->br, s->y1 - s->br, s->br); }
+  if (cy > s->y1 - s->bl && cx < s->x0 + s->bl) { return corner_cov(cx, cy, s->x0 + s->bl, s->y1 - s->bl, s->bl); }
+  var fx: float32 = (float32)px;
+  var fy: float32 = (float32)py;
+  var cvx: float32 = clamp01(mythic_minf(fx + 1.0, s->x1) - mythic_maxf(fx, s->x0));
+  var cvy: float32 = clamp01(mythic_minf(fy + 1.0, s->y1) - mythic_maxf(fy, s->y0));
+  return cvx * cvy;
+}
+
+fn row_lr(s: RShape*, py: int32, left: bool) -> float32 {
+  var fy: float32 = (float32)py;
+  var r: float32 = 0.0;
+  var top: float32 = s->tr; var bot: float32 = s->br;
+  if (left) { top = s->tl; bot = s->bl; }
+  if (fy < s->y0 + top) { r = top; }
+  if (fy + 1.0 > s->y1 - bot && bot > r) { r = bot; }
+  return r;
+}
+
+// Fills `o` minus `in` (when has_in) clipped to [bx0,bx1) x [by0,by1).
+fn draw_rrect(fb: MythicFramebuffer, bx0: int32, by0: int32, bx1: int32, by1: int32, o: RShape*, in: RShape*, has_in: bool, color: uint32) {
+  var ca: float32 = (float32)(color >> (uint32)24);
+  var ry0: int32 = mythic_maxi(ifloor(o->y0), by0);
+  var ry1: int32 = mythic_mini(iceil(o->y1), by1);
+  var ox0: int32 = ifloor(o->x0);
+  var ox1: int32 = iceil(o->x1);
+  var py: int32 = ry0;
+  while (py < ry1) {
+    var fy: float32 = (float32)py;
+    var row: uint32* = fb.px + (int64)py * (int64)fb.stride;
+    var covy: float32 = clamp01(mythic_minf(fy + 1.0, o->y1) - mythic_maxf(fy, o->y0));
+    var mx0: int32 = iceil(o->x0 + row_lr(o, py, true));
+    var mx1: int32 = ifloor(o->x1 - row_lr(o, py, false));
+    var row_in: bool = false;
+    if (has_in) {
+      var ciy: float32 = clamp01(mythic_minf(fy + 1.0, in->y1) - mythic_maxf(fy, in->y0));
+      if (ciy > 0.0) {
+        row_in = true;
+        covy = covy - ciy;
+        mx0 = mythic_maxi(mx0, iceil(in->x0 + row_lr(in, py, true)));
+        mx1 = mythic_mini(mx1, ifloor(in->x1 - row_lr(in, py, false)));
+      }
+    }
+    if (mx1 < mx0) { mx0 = ox1; mx1 = ox1; }
+    // per-pixel zones: [ox0, mx0) and [mx1, ox1); constant zone [mx0, mx1)
+    var x: int32 = mythic_maxi(ox0, bx0);
+    var xe: int32 = mythic_mini(mx0, bx1);
+    var pass: int32 = 0;
+    while (pass < 2) {
+      while (x < xe) {
+        var cov: float32 = rr_cov(o, x, py);
+        if (row_in) { cov = cov - rr_cov(in, x, py); }
+        if (cov > 0.0) {
+          var a: uint32 = (uint32)(int32)(ca * cov + 0.5);
+          if (a >= (uint32)255) { row[x] = color | (uint32)0xFF000000; }
+          else if (a > (uint32)0) { row[x] = blend1(row[x], color, a); }
+        }
+        x = x + 1;
+      }
+      if (pass == 0) {
+        var s0: int32 = mythic_maxi(mx0, bx0);
+        var s1: int32 = mythic_mini(mx1, bx1);
+        if (s1 > s0 && covy > 0.0) {
+          span(row + (int64)s0, s1 - s0, color, (uint32)(int32)(ca * covy + 0.5));
+        }
+        x = mythic_maxi(mythic_maxi(mx1, mx0), bx0);
+        xe = mythic_mini(ox1, bx1);
+      }
+      pass = pass + 1;
+    }
+    py = py + 1;
+  }
+}
+
+fn draw_fill(fb: MythicFramebuffer, b: MythicRectI, c: MythicCmd*) {
+  var o: RShape = make_shape(c->x, c->y, c->w, c->h, c->radii);
+  draw_rrect(fb, b.x, b.y, b.w, b.h, &o, &o, false, c->color);
+}
+
+fn draw_stroke(fb: MythicFramebuffer, b: MythicRectI, c: MythicCmd*) {
+  var o: RShape = make_shape(c->x, c->y, c->w, c->h, c->radii);
+  var sw: float32 = c->a;
+  var iw: float32 = c->w - 2.0 * sw;
+  var ih: float32 = c->h - 2.0 * sw;
+  if (iw <= 0.0 || ih <= 0.0) {
+    draw_rrect(fb, b.x, b.y, b.w, b.h, &o, &o, false, c->color);
+    return;
+  }
+  var rc: MythicCorners = { tl: mythic_maxf(o.tl - sw, 0.0), tr: mythic_maxf(o.tr - sw, 0.0),
+                          br: mythic_maxf(o.br - sw, 0.0), bl: mythic_maxf(o.bl - sw, 0.0) };
+  var in: RShape = make_shape(c->x + sw, c->y + sw, iw, ih, rc);
+  draw_rrect(fb, b.x, b.y, b.w, b.h, &o, &in, true, c->color);
+}
+
+// Source-over of premultiplied s scaled by k (0..256) onto premultiplied d.
+fn blend_pm(d: uint32, s: uint32, k: uint32) -> uint32 {
+  var m: uint32 = (uint32)0x00FF00FF;
+  var srb: uint32 = (((s & m) * k) >> (uint32)8) & m;
+  var sag: uint32 = ((((s >> (uint32)8) & m) * k) >> (uint32)8) & m;
+  var ia: uint32 = (uint32)255 - (sag >> (uint32)16);
+  var t: uint32 = (d & m) * ia + (uint32)0x00800080;
+  t = ((t + ((t >> (uint32)8) & m)) >> (uint32)8) & m;
+  var u: uint32 = ((d >> (uint32)8) & m) * ia + (uint32)0x00800080;
+  u = ((u + ((u >> (uint32)8) & m)) >> (uint32)8) & m;
+  return (srb + t) | ((sag + u) << (uint32)8);
+}
+
+fn premul(c: uint32) -> uint32 {
+  var a: uint32 = c >> (uint32)24;
+  var m: uint32 = (uint32)0x00FF00FF;
+  var rb: uint32 = (c & m) * a + (uint32)0x00800080;
+  rb = ((rb + ((rb >> (uint32)8) & m)) >> (uint32)8) & m;
+  var g: uint32 = ((c >> (uint32)8) & (uint32)255) * a + (uint32)128;
+  g = (g + (g >> (uint32)8)) >> (uint32)8;
+  return (a << (uint32)24) | rb | (g << (uint32)8);
+}
+
+// 4x4 ordered-dither thresholds in (-0.5, 0.5).
+fn bayer(x: int32, y: int32) -> float32 {
+  var m: int32[16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+  return ((float32)m[(y & 3) * 4 + (x & 3)] + 0.5) / 16.0 - 0.5;
+}
+
+fn bilerp(a: uint32, b: uint32, f: uint32) -> uint32 {
+  var m: uint32 = (uint32)0x00FF00FF;
+  var g: uint32 = (uint32)256 - f;
+  var rb: uint32 = (((a & m) * g + (b & m) * f) >> (uint32)8) & m;
+  var ag: uint32 = ((((a >> (uint32)8) & m) * g + ((b >> (uint32)8) & m) * f) >> (uint32)8) & m;
+  return rb | (ag << (uint32)8);
+}
+
+struct Shade {
+  kind: int32;
+  // gradient
+  gx: float32; gy: float32; gdx: float32; gdy: float32;
+  c0: float32[4]; c1: float32[4];
+  // image
+  img: MythicImage*; ix: float32; iy: float32; isx: float32; isy: float32; op: float32;
+}
+
+fn shade_px(s: Shade*, x: int32, y: int32) -> uint32 {
+  var fx: float32 = (float32)x + 0.5;
+  var fy: float32 = (float32)y + 0.5;
+  if (s->kind == MYTHIC_CMD_GRADIENT) {
+    var t: float32 = clamp01((fx - s->gx) * s->gdx + (fy - s->gy) * s->gdy);
+    var d: float32 = bayer(x, y) + 0.5;
+    var a: int32 = (int32)(s->c0[0] + (s->c1[0] - s->c0[0]) * t + d);
+    var r: int32 = (int32)(s->c0[1] + (s->c1[1] - s->c0[1]) * t + d);
+    var g: int32 = (int32)(s->c0[2] + (s->c1[2] - s->c0[2]) * t + d);
+    var b: int32 = (int32)(s->c0[3] + (s->c1[3] - s->c0[3]) * t + d);
+    a = mythic_clampi(a, 0, 255);
+    r = mythic_clampi(r, 0, a); g = mythic_clampi(g, 0, a); b = mythic_clampi(b, 0, a);
+    return ((uint32)a << (uint32)24) | ((uint32)r << (uint32)16) | ((uint32)g << (uint32)8) | (uint32)b;
+  }
+  // image: bilinear, edge clamped, premultiplied
+  var im: MythicImage* = s->img;
+  var sx: float32 = s->ix + fx * s->isx - 0.5;
+  var sy: float32 = s->iy + fy * s->isy - 0.5;
+  var x0: int32 = ifloor(sx);
+  var y0: int32 = ifloor(sy);
+  var wx: uint32 = (uint32)(int32)((sx - (float32)x0) * 256.0);
+  var wy: uint32 = (uint32)(int32)((sy - (float32)y0) * 256.0);
+  var xa: int32 = mythic_clampi(x0, 0, im->w - 1);
+  var xb: int32 = mythic_clampi(x0 + 1, 0, im->w - 1);
+  var ya: int32 = mythic_clampi(y0, 0, im->h - 1);
+  var yb: int32 = mythic_clampi(y0 + 1, 0, im->h - 1);
+  var ra: uint32* = im->px + (int64)ya * (int64)im->w;
+  var rb: uint32* = im->px + (int64)yb * (int64)im->w;
+  return bilerp(bilerp(ra[xa], ra[xb], wx), bilerp(rb[xa], rb[xb], wx), wy);
+}
+
+// Rounded rect with a per-pixel source (gradient or image).
+fn draw_rrect_shaded(fb: MythicFramebuffer, b: MythicRectI, o: RShape*, s: Shade*, opacity: float32) {
+  var ry0: int32 = mythic_maxi(ifloor(o->y0), b.y);
+  var ry1: int32 = mythic_mini(iceil(o->y1), b.h);
+  var rx0: int32 = mythic_maxi(ifloor(o->x0), b.x);
+  var rx1: int32 = mythic_mini(iceil(o->x1), b.w);
+  for py: int32 in ry0..ry1 {
+    var fy: float32 = (float32)py;
+    var row: uint32* = fb.px + (int64)py * (int64)fb.stride;
+    var covy: float32 = clamp01(mythic_minf(fy + 1.0, o->y1) - mythic_maxf(fy, o->y0));
+    var mx0: int32 = iceil(o->x0 + row_lr(o, py, true));
+    var mx1: int32 = ifloor(o->x1 - row_lr(o, py, false));
+    for x: int32 in rx0..rx1 {
+      var cov: float32 = covy;
+      if (x < mx0 || x >= mx1) { cov = rr_cov(o, x, py); }
+      if (cov <= 0.0) { continue; }
+      var k: uint32 = (uint32)(int32)(cov * opacity * 256.0 + 0.5);
+      if (k == (uint32)0) { continue; }
+      row[x] = blend_pm(row[x], shade_px(s, x, py), k);
+    }
+  }
+}
+
+fn draw_gradient(fb: MythicFramebuffer, b: MythicRectI, c: MythicCmd*) {
+  var o: RShape = make_shape(c->x, c->y, c->w, c->h, c->radii);
+  var s: Shade;
+  s.kind = MYTHIC_CMD_GRADIENT;
+  s.gx = c->a; s.gy = c->b;
+  var dx: float32 = c->c - c->a;
+  var dy: float32 = c->d - c->b;
+  var l2: float32 = dx * dx + dy * dy;
+  if (l2 > 0.0) { s.gdx = dx / l2; s.gdy = dy / l2; }
+  var p0: uint32 = premul(c->color);
+  var p1: uint32 = premul(c->color2);
+  for i: int32 in 0..4 {
+    var sh: uint32 = (uint32)(24 - 8 * i);
+    s.c0[i] = (float32)((p0 >> sh) & (uint32)255);
+    s.c1[i] = (float32)((p1 >> sh) & (uint32)255);
+  }
+  draw_rrect_shaded(fb, b, &o, &s, 1.0);
+}
+
+fn draw_image(r: MythicRenderer*, fb: MythicFramebuffer, b: MythicRectI, c: MythicCmd*) {
+  var im: MythicImage* = mythic_images_get(r->images, c->res);
+  if (im == 0 || im->px == 0 || c->w <= 0.0 || c->h <= 0.0) { return; }
+  var o: RShape = make_shape(c->x, c->y, c->w, c->h, c->radii);
+  var s: Shade;
+  s.kind = MYTHIC_CMD_IMAGE;
+  s.img = im;
+  // source px = (u0 + (x - dest.x) / dest.w * (u1 - u0)) * iw
+  s.isx = (c->d - c->b) * (float32)im->w / c->w;
+  s.isy = (c->e - c->c) * (float32)im->h / c->h;
+  s.ix = c->b * (float32)im->w - c->x * s.isx;
+  s.iy = c->c * (float32)im->h - c->y * s.isy;
+  var op: float32 = clamp01(c->a) * (float32)(c->color >> (uint32)24) / 255.0;
+  draw_rrect_shaded(fb, b, &o, &s, op);
+}
+
+// ------------------------------------------------------------------ shadows
+
+fn q4(v: float32) -> float32 { return mythic_roundf(v * 4.0) * 0.25; }
+fn fq(v: float32) -> int32 { return mythic_iround((v - mythic_floorf(v)) * 4.0) & 3; }
+fn prof_at(t: MythicShadowTab, k: int32) -> float32 {
+  if (k < 0) { return 0.0; }
+  if (k >= t.w) { return 1.0; }
+  return t.a[k];
+}
+
+// Shadows are normally followed by an opaque fill of the same shape (DESIGN-SYSTEM §5): find
+// it (skipping further shadow layers of that shape) and return the box where it fully covers
+// every pixel, as rows [oy0, oy1) x cols [ox0, ox1) plus the corner-band column range.
+struct Occl { y0: int32; y1: int32; x0: int32; x1: int32; ya: int32; yb: int32; xa: int32; xb: int32; }
+
+fn shadow_occluder(dl: MythicDrawList*, ci: int32, o: Occl*) -> bool {
+  var c: MythicCmd* = &dl->cmds.data[(int64)ci];
+  var k: int64 = (int64)ci + 1;
+  while (k < dl->cmds.len) {
+    var n: MythicCmd* = &dl->cmds.data[k];
+    var same: bool = n->x == c->x && n->y == c->y && n->w == c->w && n->h == c->h && n->clip == c->clip
+                     && n->radii.tl == c->radii.tl && n->radii.tr == c->radii.tr && n->radii.br == c->radii.br && n->radii.bl == c->radii.bl;
+    if (!same) { return false; }
+    if (n->kind == MYTHIC_CMD_SHADOW) { k = k + 1; continue; }
+    if (n->kind != MYTHIC_CMD_FILL || (n->color >> (uint32)24) != (uint32)255) { return false; }
+    var sh: RShape = make_shape(n->x, n->y, n->w, n->h, n->radii);
+    var rt: float32 = mythic_maxf(sh.tl, sh.tr); var rb: float32 = mythic_maxf(sh.bl, sh.br);
+    var rl: float32 = mythic_maxf(sh.tl, sh.bl); var rr: float32 = mythic_maxf(sh.tr, sh.br);
+    o->y0 = iceil(sh.y0 + rt); o->y1 = ifloor(sh.y1 - rb);
+    o->x0 = iceil(sh.x0); o->x1 = ifloor(sh.x1);
+    o->ya = iceil(sh.y0); o->yb = ifloor(sh.y1);
+    o->xa = iceil(sh.x0 + rl); o->xb = ifloor(sh.x1 - rr);
+    return true;
+  }
+  return false;
+}
+
+fn draw_shadow(r: MythicRenderer*, fb: MythicFramebuffer, b: MythicRectI, c: MythicCmd*, has_oc: bool, oc: Occl*) {
+  var spread: float32 = c->d;
+  var sx0: float32 = q4(c->x + c->a - spread);
+  var sy0: float32 = q4(c->y + c->b - spread);
+  var sx1: float32 = q4(c->x + c->a + c->w + spread);
+  var sy1: float32 = q4(c->y + c->b + c->h + spread);
+  if (sx1 <= sx0 || sy1 <= sy0) { return; }
+  var rc: MythicCorners = c->radii;
+  if (rc.tl > 0.0) { rc.tl = mythic_maxf(rc.tl + spread, 0.0); }
+  if (rc.tr > 0.0) { rc.tr = mythic_maxf(rc.tr + spread, 0.0); }
+  if (rc.br > 0.0) { rc.br = mythic_maxf(rc.br + spread, 0.0); }
+  if (rc.bl > 0.0) { rc.bl = mythic_maxf(rc.bl + spread, 0.0); }
+  var o: RShape = make_shape(sx0, sy0, sx1 - sx0, sy1 - sy0, rc);
+  var sigma: float32 = c->c * 0.5;
+  if (sigma < 0.25) { draw_rrect(fb, b.x, b.y, b.w, b.h, &o, &o, false, c->color); return; }
+  var sq: int32 = mythic_iround(sigma * 8.0);
+  sigma = (float32)sq * 0.125;
+  var ca: float32 = (float32)(c->color >> (uint32)24);
+  var color: uint32 = c->color;
+  var cache: MythicShadowCache* = &r->shadows;
+  var M: int32 = mythic_shadow_margin(sigma);
+  // radii on the 1/4 px grid (cache keys)
+  var qtl: int32 = mythic_iround(o.tl * 4.0); var qtr: int32 = mythic_iround(o.tr * 4.0);
+  var qbr: int32 = mythic_iround(o.br * 4.0); var qbl: int32 = mythic_iround(o.bl * 4.0);
+  var Stl: int32 = M + mythic_shadow_inner((float32)qtl * 0.25, sigma);
+  var Str: int32 = M + mythic_shadow_inner((float32)qtr * 0.25, sigma);
+  var Sbr: int32 = M + mythic_shadow_inner((float32)qbr * 0.25, sigma);
+  var Sbl: int32 = M + mythic_shadow_inner((float32)qbl * 0.25, sigma);
+  var gl: int32 = ifloor(sx0) - M;          // first column of left tables
+  var gr: int32 = iceil(sx1) + M - 1;       // last column of right tables (mirrored index 0)
+  var gt: int32 = ifloor(sy0) - M;
+  var gb: int32 = iceil(sy1) + M - 1;
+  var ok: bool = gl + Stl <= gr + 1 - Str && gl + Sbl <= gr + 1 - Sbr && gt + Stl <= gb + 1 - Sbl && gt + Str <= gb + 1 - Sbr;
+  if (!ok) {
+    var sh: MythicSShape = { x0: sx0, y0: sy0, x1: sx1, y1: sy1, tl: o.tl, tr: o.tr, br: o.br, bl: o.bl };
+    var t: MythicShadowTab = mythic_shadow_small(cache, &sh, sq);
+    var tx: int32 = ifloor(sx0) - M;
+    var ty: int32 = ifloor(sy0) - M;
+    var y0: int32 = mythic_maxi(b.y, ty); var y1: int32 = mythic_mini(b.h, ty + t.h);
+    var x0: int32 = mythic_maxi(b.x, tx); var x1: int32 = mythic_mini(b.w, tx + t.w);
+    for y: int32 in y0..y1 {
+      var row: uint32* = fb.px + (int64)y * (int64)fb.stride;
+      var src: float32* = t.a + (int64)(y - ty) * (int64)t.w - (int64)tx;
+      for x: int32 in x0..x1 {
+        var a: uint32 = (uint32)(int32)(ca * src[x] + 0.5);
+        if (a > (uint32)0) { row[x] = blend1(row[x], color, a); }
+      }
+    }
+    return;
+  }
+  var fxl: int32 = fq(sx0); var fxr: int32 = (4 - fq(sx1)) & 3;
+  var fyt: int32 = fq(sy0); var fyb: int32 = (4 - fq(sy1)) & 3;
+  var pl: MythicShadowTab = mythic_shadow_profile(cache, sq, fxl);
+  var pr: MythicShadowTab = mythic_shadow_profile(cache, sq, fxr);
+  var pt: MythicShadowTab = mythic_shadow_profile(cache, sq, fyt);
+  var pb: MythicShadowTab = mythic_shadow_profile(cache, sq, fyb);
+  var ttl: MythicShadowTab = mythic_shadow_corner(cache, qtl, sq, fxl, fyt);
+  var ttr: MythicShadowTab = mythic_shadow_corner(cache, qtr, sq, fxr, fyt);
+  var tbr: MythicShadowTab = mythic_shadow_corner(cache, qbr, sq, fxr, fyb);
+  var tbl: MythicShadowTab = mythic_shadow_corner(cache, qbl, sq, fxl, fyb);
+  var cl: float32* = r->prof;
+  var cr: float32* = r->prof + (int64)MYTHIC_TILE;
+  var bw: int32 = b.w - b.x;
+  for i: int32 in 0..bw {
+    var x: int32 = b.x + i;
+    cl[i] = prof_at(pl, x - gl);
+    cr[i] = prof_at(pr, gr - x);
+  }
+  for y: int32 in b.y..b.h {
+    var row: uint32* = fb.px + (int64)y * (int64)fb.stride;
+    var jt: int32 = y - gt;
+    var jb: int32 = gb - y;
+    var rt: float32 = prof_at(pt, jt);
+    var rb: float32 = prof_at(pb, jb);
+    var vv: float32 = rt * rb;
+    // hidden columns (under the opaque fill that follows)
+    var h0: int32 = b.w; var h1: int32 = b.w;
+    if (has_oc) {
+      if (y >= oc->y0 && y < oc->y1) { h0 = oc->x0; h1 = oc->x1; }
+      else if (y >= oc->ya && y < oc->yb) { h0 = oc->xa; h1 = oc->xb; }
+      if (h1 <= h0) { h0 = b.w; h1 = b.w; }
+    }
+    // middle columns: beyond every corner tile and edge profile, the value is just vv
+    var m0: int32 = gl + mythic_maxi(Stl, Sbl);
+    var m1: int32 = gr + 1 - mythic_maxi(Str, Sbr);
+    m0 = mythic_maxi(m0, b.x); m1 = mythic_mini(m1, b.w);
+    if (m1 > m0) {
+      var av: uint32 = (uint32)(int32)(ca * vv + 0.5);
+      if (h1 > h0 && h0 < m1 && h1 > m0) {
+        span(row + (int64)m0, mythic_maxi(mythic_mini(h0, m1), m0) - m0, color, av);
+        var t0: int32 = mythic_mini(mythic_maxi(h1, m0), m1);
+        span(row + (int64)t0, m1 - t0, color, av);
+      } else {
+        span(row + (int64)m0, m1 - m0, color, av);
+      }
+    } else { m0 = b.w; m1 = b.w; }
+    var x: int32 = b.x;
+    while (x < b.w) {
+      if (x >= m0 && x < m1) { x = m1; continue; }
+      if (x >= h0 && x < h1) { x = h1; continue; }
+      var i: int32 = x - b.x;
+      x = x + 1;
+      var il: int32 = i + b.x - gl;
+      var ir: int32 = gr - (i + b.x);
+      var v: float32 = 0.0;
+      if (il < 0 || ir < 0 || jt < 0 || jb < 0) { continue; }
+      if (jt < Stl && il < Stl) { v = ttl.a[(int64)jt * (int64)Stl + (int64)il] * cr[i] * rb; }
+      else if (jt < Str && ir < Str) { v = ttr.a[(int64)jt * (int64)Str + (int64)ir] * cl[i] * rb; }
+      else if (jb < Sbr && ir < Sbr) { v = tbr.a[(int64)jb * (int64)Sbr + (int64)ir] * cl[i] * rt; }
+      else if (jb < Sbl && il < Sbl) { v = tbl.a[(int64)jb * (int64)Sbl + (int64)il] * cr[i] * rt; }
+      else { v = cl[i] * cr[i] * vv; }
+      var a: uint32 = (uint32)(int32)(ca * v + 0.5);
+      if (a > (uint32)0) { row[i + b.x] = blend1(row[i + b.x], color, a); }
+    }
+  }
+}
+
+// ------------------------------------------------------------------ paths
+
+fn draw_path_fill(r: MythicRenderer*, fb: MythicFramebuffer, b: MythicRectI, c: MythicCmd*, dl: MythicDrawList*) {
+  var w: int32 = b.w - b.x;
+  var h: int32 = b.h - b.y;
+  var a: MythicAccum* = &r->acc;
+  mythic_r_acc_reset(a, w, h);
+  var pts: MythicVec2* = &dl->points.data[(int64)c->first];
+  var n: int32 = c->count;
+  var ox: float32 = (float32)b.x;
+  var oy: float32 = (float32)b.y;
+  for i: int32 in 0..n {
+    var p: MythicVec2 = pts[i];
+    var q: MythicVec2 = pts[(i + 1) % n];
+    mythic_r_acc_line(a, p.x - ox, p.y - oy, q.x - ox, q.y - oy);
+  }
+  var ca: float32 = (float32)(c->color >> (uint32)24);
+  for y: int32 in 0..h {
+    var s: float32 = 0.0;
+    var arow: float32* = a->acc + (int64)y * (int64)a->stride;
+    var row: uint32* = fb.px + (int64)(y + b.y) * (int64)fb.stride + (int64)b.x;
+    for x: int32 in 0..w {
+      s = s + arow[x];
+      var v: float32 = s;
+      if (v < 0.0) { v = -v; }
+      if (v > 1.0) { v = 1.0; }
+      var al: uint32 = (uint32)(int32)(ca * v + 0.5);
+      if (al >= (uint32)255) { row[x] = c->color | (uint32)0xFF000000; }
+      else if (al > (uint32)0) { row[x] = blend1(row[x], c->color, al); }
+    }
+  }
+}
+
+fn seg_cov(buf: float32*, b: MythicRectI, ax: float32, ay: float32, bx: float32, by: float32, hw: float32) {
+  var bw: int32 = b.w - b.x;
+  var x0: int32 = mythic_maxi(ifloor(mythic_minf(ax, bx) - hw - 1.0), b.x);
+  var x1: int32 = mythic_mini(iceil(mythic_maxf(ax, bx) + hw + 1.0), b.w);
+  var y0: int32 = mythic_maxi(ifloor(mythic_minf(ay, by) - hw - 1.0), b.y);
+  var y1: int32 = mythic_mini(iceil(mythic_maxf(ay, by) + hw + 1.0), b.h);
+  var dx: float32 = bx - ax;
+  var dy: float32 = by - ay;
+  var l2: float32 = dx * dx + dy * dy;
+  var il2: float32 = 0.0;
+  if (l2 > 0.0) { il2 = 1.0 / l2; }
+  for y: int32 in y0..y1 {
+    var py: float32 = (float32)y + 0.5 - ay;
+    var brow: float32* = buf + (int64)(y - b.y) * (int64)bw - (int64)b.x;
+    for x: int32 in x0..x1 {
+      var px: float32 = (float32)x + 0.5 - ax;
+      var t: float32 = clamp01((px * dx + py * dy) * il2);
+      var ex: float32 = px - t * dx;
+      var ey: float32 = py - t * dy;
+      var cv: float32 = hw + 0.5 - mythic_sqrtf(ex * ex + ey * ey);
+      if (cv > brow[x]) { brow[x] = mythic_minf(cv, 1.0); }
+    }
+  }
+}
+
+fn draw_path_stroke(r: MythicRenderer*, fb: MythicFramebuffer, b: MythicRectI, c: MythicCmd*, dl: MythicDrawList*) {
+  var bw: int32 = b.w - b.x;
+  var bh: int32 = b.h - b.y;
+  var buf: float32* = r->cov;
+  memset((rawptr)buf, 0, (int64)bw * (int64)bh * 4);
+  var pts: MythicVec2* = &dl->points.data[(int64)c->first];
+  var n: int32 = c->count;
+  var hw: float32 = c->a * 0.5;
+  var left: float32 = c->b;           // draw-on length (0 = whole path)
+  var limited: bool = left > 0.0;
+  var nseg: int32 = n - 1;
+  if (c->res == 1) { nseg = n; }
+  for i: int32 in 0..nseg {
+    var p: MythicVec2 = pts[i];
+    var q: MythicVec2 = pts[(i + 1) % n];
+    if (limited) {
+      var dx: float32 = q.x - p.x;
+      var dy: float32 = q.y - p.y;
+      var l: float32 = mythic_sqrtf(dx * dx + dy * dy);
+      if (l > left) {
+        var f: float32 = 0.0;
+        if (l > 0.0) { f = left / l; }
+        q.x = p.x + dx * f; q.y = p.y + dy * f;
+        seg_cov(buf, b, p.x, p.y, q.x, q.y, hw);
+        break;
+      }
+      left = left - l;
+    }
+    seg_cov(buf, b, p.x, p.y, q.x, q.y, hw);
+  }
+  var ca: float32 = (float32)(c->color >> (uint32)24);
+  for y: int32 in 0..bh {
+    var brow: float32* = buf + (int64)y * (int64)bw;
+    var row: uint32* = fb.px + (int64)(y + b.y) * (int64)fb.stride + (int64)b.x;
+    for x: int32 in 0..bw {
+      var v: float32 = brow[x];
+      if (v <= 0.0) { continue; }
+      var al: uint32 = (uint32)(int32)(ca * v + 0.5);
+      if (al >= (uint32)255) { row[x] = c->color | (uint32)0xFF000000; }
+      else if (al > (uint32)0) { row[x] = blend1(row[x], c->color, al); }
+    }
+  }
+}
+
+// ------------------------------------------------------------------ glyphs
+
+fn draw_glyphs(r: MythicRenderer*, fb: MythicFramebuffer, b: MythicRectI, c: MythicCmd*, dl: MythicDrawList*) {
+  var f: MythicFonts* = r->fonts;
+  if (f == 0 || f->count == 0) { return; }
+  var font: int32 = c->res;
+  if (font < 0 || font >= f->count) { font = 0; }
+  var t: MythicTtf* = mythic_fonts_ttf(f, font);
+  var sc: float32 = c->a / (float32)t->upem;
+  var size_q: int32 = mythic_iround(c->a * 4.0);
+  var gxmin: float32 = (float32)t->x_min * sc - 1.0;
+  var gxmax: float32 = (float32)t->x_max * sc + 1.0;
+  var gymax: float32 = (float32)t->y_max * sc + 1.0;
+  var gymin: float32 = (float32)t->y_min * sc - 1.0;
+  var ca: uint32 = c->color >> (uint32)24;
+  var darken: bool = c->b != 0.0;
+  var lut: uint8* = r->gamma;
+  var cache: MythicGlyphCache* = &f->glyphs;
+  var fbx0: float32 = (float32)b.x; var fbx1: float32 = (float32)b.w;
+  var fby0: float32 = (float32)b.y; var fby1: float32 = (float32)b.h;
+  var color: uint32 = c->color;
+  for k: int32 in 0..c->count {
+    var gp: MythicGlyphPos = dl->glyphs.data[(int64)(c->first + k)];
+    if (gp.x + gxmax < fbx0 || gp.x + gxmin > fbx1) { continue; }
+    if (gp.y - gymax > fby1 || gp.y - gymin < fby0) { continue; }
+    var fx: int32 = ifloor(gp.x);
+    var bin: int32 = (int32)((gp.x - (float32)fx) * 4.0 + 0.5);
+    if (bin >= 4) { bin = 0; fx = fx + 1; }
+    var e: MythicGlyphEntry = *mythic_glyph_get(cache, t, font, gp.glyph, size_q, bin);
+    if (e.w == 0) { continue; }
+    var by: int32 = ifloor(gp.y + 0.5);
+    var gx0: int32 = fx + e.left;
+    var gy0: int32 = by + e.top;
+    var x0: int32 = mythic_maxi(gx0, b.x);
+    var x1: int32 = mythic_mini(gx0 + e.w, b.w);
+    var y0: int32 = mythic_maxi(gy0, b.y);
+    var y1: int32 = mythic_mini(gy0 + e.h, b.h);
+    if (x0 >= x1 || y0 >= y1) { continue; }
+    var src: uint8* = cache->pages.data[e.page].px;
+    for y: int32 in y0..y1 {
+      var srow: uint8* = src + (int64)(e.y + y - gy0) * (int64)MYTHIC_ATLAS_SIZE + (int64)(e.x - gx0);
+      var drow: uint32* = fb.px + (int64)y * (int64)fb.stride;
+      for x: int32 in x0..x1 {
+        var cv: uint32 = (uint32)srow[x];
+        if (cv != (uint32)0) {
+          if (darken) { cv = (uint32)lut[cv]; }
+          var a: uint32 = (cv * ca + (uint32)127) / (uint32)255;
+          if (a >= (uint32)255) { drow[x] = color | (uint32)0xFF000000; }
+          else if (a > (uint32)0) { drow[x] = blend1(drow[x], color, a); }
+        }
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------------ renderer
+
+export fn mythic_renderer_create(f: MythicFonts*, im: MythicImages*) -> MythicRenderer* {
+  var r: MythicRenderer* = new MythicRenderer;
+  r->fonts = f;
+  r->images = im;
+  r->gamma = (uint8*)malloc(256);
+  var T2: int64 = (int64)MYTHIC_TILE * (int64)MYTHIC_TILE;
+  r->cov = (float32*)malloc(T2 * 4);
+  r->prof = (float32*)malloc((int64)MYTHIC_TILE * 16);
+  r->layer = (uint32*)malloc(T2 * 4);
+  for i: int32 in 0..256 {
+    var v: float32 = mythic_powf((float32)i / 255.0, 1.0 / 1.25);
+    r->gamma[i] = (uint8)mythic_clampi(mythic_iround(v * 255.0), 0, 255);
+  }
+  return r;
+}
+
+fn resize(r: MythicRenderer*, w: int32, h: int32) {
+  if (r->hash_a != 0) {
+    free((rawptr)r->hash_a); free((rawptr)r->hash_b); free((rawptr)r->tile_start);
+    free((rawptr)r->tile_fill); free((rawptr)r->dirty_tiles);
+  }
+  r->w = w; r->h = h;
+  r->tw = (w + MYTHIC_TILE - 1) / MYTHIC_TILE;
+  r->th = (h + MYTHIC_TILE - 1) / MYTHIC_TILE;
+  r->ntiles = r->tw * r->th;
+  var n: int64 = (int64)r->ntiles + 1;
+  r->hash_a = (uint64*)calloc(n, 8);
+  r->hash_b = (uint64*)calloc(n, 8);
+  r->tile_start = (int32*)calloc(n, 4);
+  r->tile_fill = (int32*)calloc(n, 4);
+  r->dirty_tiles = (uint8*)calloc(n, 1);
+  r->have_prev = false;
+}
+
+fn hmix(h: uint64, v: uint64) -> uint64 {
+  var x: uint64 = (h ^ v) * (uint64)0x9E3779B97F4A7C15;
+  return x ^ (x >> (uint64)29);
+}
+
+fn cmd_hash(r: MythicRenderer*, dl: MythicDrawList*, c: MythicCmd*) -> uint64 {
+  var h: uint64 = 0x243F6A8885A308D3;
+  var w: uint64* = (uint64*)c;
+  for i: int32 in 0..10 { h = hmix(h, w[i]); }
+  var ns: int32 = mythic_dl_clip_shape_count(dl, c->clip);
+  var cl: uint32* = (uint32*)&dl->clips.data[(int64)(c->clip - ns)];
+  for i: int32 in 0..5 * (ns + 1) { h = hmix(h, (uint64)cl[i]); }
+  if (c->kind == MYTHIC_CMD_IMAGE) {
+    var im: MythicImage* = mythic_images_get(r->images, c->res);
+    if (im != 0) { h = hmix(h, (uint64)im->gen * (uint64)0x100000001 + (uint64)(int64)c->res); }
+  }
+  if (c->kind == MYTHIC_CMD_GLYPHS && c->count > 0) {
+    var gw: uint32* = (uint32*)&dl->glyphs.data[(int64)c->first];
+    var n: int32 = c->count * 3;
+    var i: int32 = 0;
+    while (i + 1 < n) { h = hmix(h, (uint64)gw[i] | ((uint64)gw[i + 1] << (uint64)32)); i = i + 2; }
+    if (i < n) { h = hmix(h, (uint64)gw[i]); }
+  }
+  if ((c->kind == MYTHIC_CMD_PATH_FILL || c->kind == MYTHIC_CMD_PATH_STROKE) && c->count > 0) {
+    var pw: uint64* = (uint64*)&dl->points.data[(int64)c->first];
+    for i: int32 in 0..c->count { h = hmix(h, pw[i]); }
+  }
+  return h;
+}
+
+// Device box of a command (x0, y0, x1, y1 stored in x, y, w, h), clipped; empty => x0 >= x1.
+fn cmd_box(r: MythicRenderer*, dl: MythicDrawList*, c: MythicCmd*) -> MythicRectI {
+  var x0: float32 = c->x; var y0: float32 = c->y;
+  var x1: float32 = c->x + c->w; var y1: float32 = c->y + c->h;
+  if (c->kind == MYTHIC_CMD_SHADOW) {
+    var g: float32 = c->d + 1.5 * c->c + 1.0;     // spread (signed) + 3 sigma + AA
+    x0 = x0 + c->a - g; x1 = x1 + c->a + g;
+    y0 = y0 + c->b - g; y1 = y1 + c->b + g;
+  } else if (c->kind == MYTHIC_CMD_PATH_FILL || c->kind == MYTHIC_CMD_PATH_STROKE) {
+    x0 = x0 - 1.0; y0 = y0 - 1.0; x1 = x1 + 1.0; y1 = y1 + 1.0;
+  }
+  var cl: MythicClip = dl->clips.data[(int64)c->clip];
+  var b: MythicRectI;
+  b.x = mythic_maxi(ifloor(x0), mythic_iround(cl.x));
+  b.y = mythic_maxi(ifloor(y0), mythic_iround(cl.y));
+  b.w = mythic_mini(iceil(x1), mythic_iround(cl.x + cl.w));
+  b.h = mythic_mini(iceil(y1), mythic_iround(cl.y + cl.h));
+  b.x = mythic_maxi(b.x, 0); b.y = mythic_maxi(b.y, 0);
+  b.w = mythic_mini(b.w, r->w); b.h = mythic_mini(b.h, r->h);
+  return b;
+}
+
+fn draw_kind(r: MythicRenderer*, fb: MythicFramebuffer, dl: MythicDrawList*, ci: int32, c: MythicCmd*, b: MythicRectI, masked: bool) {
+  var k: int32 = c->kind;
+  if (k == MYTHIC_CMD_FILL) { draw_fill(fb, b, c); }
+  else if (k == MYTHIC_CMD_STROKE) { draw_stroke(fb, b, c); }
+  else if (k == MYTHIC_CMD_GLYPHS) { draw_glyphs(r, fb, b, c, dl); }
+  else if (k == MYTHIC_CMD_SHADOW) {
+    var oc: Occl;
+    var has: bool = !masked && shadow_occluder(dl, ci, &oc);
+    draw_shadow(r, fb, b, c, has, &oc);
+  }
+  else if (k == MYTHIC_CMD_GRADIENT) { draw_gradient(fb, b, c); }
+  else if (k == MYTHIC_CMD_IMAGE) { draw_image(r, fb, b, c); }
+  else if (k == MYTHIC_CMD_PATH_FILL) { if (c->count >= 3) { draw_path_fill(r, fb, b, c, dl); } }
+  else if (k == MYTHIC_CMD_PATH_STROKE) { if (c->count >= 2) { draw_path_stroke(r, fb, b, c, dl); } }
+}
+
+fn clip_rshape(cl: MythicClip) -> RShape {
+  var rc: MythicCorners = { tl: cl.radius, tr: cl.radius, br: cl.radius, bl: cl.radius };
+  return make_shape(cl.x, cl.y, cl.w, cl.h, rc);
+}
+
+fn box_hits_corners(s: RShape*, b: MythicRectI) -> bool {
+  var x0: float32 = (float32)b.x; var x1: float32 = (float32)b.w;
+  var y0: float32 = (float32)b.y; var y1: float32 = (float32)b.h;
+  if (x0 < s->x0 + s->tl && y0 < s->y0 + s->tl) { return true; }
+  if (x1 > s->x1 - s->tr && y0 < s->y0 + s->tr) { return true; }
+  if (x1 > s->x1 - s->br && y1 > s->y1 - s->br) { return true; }
+  if (x0 < s->x0 + s->bl && y1 > s->y1 - s->bl) { return true; }
+  return false;
+}
+
+fn draw_cmd(r: MythicRenderer*, fb: MythicFramebuffer, dl: MythicDrawList*, ci: int32, tb: MythicRectI) {
+  var c: MythicCmd* = &dl->cmds.data[(int64)ci];
+  var cb: MythicRectI = r->boxes.data[(int64)ci];
+  var b: MythicRectI;
+  b.x = mythic_maxi(cb.x, tb.x); b.y = mythic_maxi(cb.y, tb.y);
+  b.w = mythic_mini(cb.w, tb.w); b.h = mythic_mini(cb.h, tb.h);
+  if (b.x >= b.w || b.y >= b.h) { return; }
+  var ns: int32 = mythic_dl_clip_shape_count(dl, c->clip);
+  var masked: bool = false;
+  for i: int32 in 0..ns {
+    var s: RShape = clip_rshape(mythic_dl_clip_shape(dl, c->clip, i));
+    if (box_hits_corners(&s, b)) { masked = true; }
+  }
+  if (!masked) { draw_kind(r, fb, dl, ci, c, b, false); return; }
+  // rounded clip: draw into a transparent tile layer, then composite through the clip mask
+  var T: int32 = MYTHIC_TILE;
+  var lfb: MythicFramebuffer = { px: r->layer - ((int64)tb.y * (int64)T + (int64)tb.x), w: fb.w, h: fb.h, stride: T };
+  for y: int32 in b.y..b.h {
+    var lrow: uint32* = lfb.px + (int64)y * (int64)T;
+    for x: int32 in b.x..b.w { lrow[x] = (uint32)0; }
+  }
+  draw_kind(r, lfb, dl, ci, c, b, true);
+  for y: int32 in b.y..b.h {
+    var lrow2: uint32* = lfb.px + (int64)y * (int64)T;
+    var row: uint32* = fb.px + (int64)y * (int64)fb.stride;
+    for x: int32 in b.x..b.w {
+      var src: uint32 = lrow2[x];
+      if (src == (uint32)0) { continue; }
+      var m: float32 = 1.0;
+      for i: int32 in 0..ns {
+        var s2: RShape = clip_rshape(mythic_dl_clip_shape(dl, c->clip, i));
+        m = m * rr_cov(&s2, x, y);
+      }
+      var k: uint32 = (uint32)(int32)(m * 256.0 + 0.5);
+      if (k > (uint32)0) { row[x] = blend_pm(row[x], src, k); }
+    }
+  }
+}
+
+// pass 1: command boxes, tile hashes and bin counts; marks the dirty tiles and returns their count
+fn damage_pass(r: MythicRenderer*, dl: MythicDrawList*, fw: int32, fh: int32, force_full: bool) -> int32 {
+  var force: bool = force_full;
+  if (fw != r->w || fh != r->h || r->hash_a == 0) { resize(r, fw, fh); force = true; }
+  if (!r->have_prev) { force = true; }
+  var T: int32 = MYTHIC_TILE;
+  var tw: int32 = r->tw;
+  var nt: int32 = r->ntiles;
+  var cur: uint64* = r->hash_b;
+  var prev: uint64* = r->hash_a;
+  for i: int32 in 0..nt { cur[i] = (uint64)0x9E3779B97F4A7C15; r->tile_start[i] = 0; }
+  r->tile_start[nt] = 0;
+  mythic_vec_clear<MythicRectI>(&r->boxes);
+  var ncmd: int32 = (int32)dl->cmds.len;
+  for ci: int32 in 0..ncmd {
+    var c: MythicCmd* = &dl->cmds.data[(int64)ci];
+    var b: MythicRectI = cmd_box(r, dl, c);
+    mythic_vec_push<MythicRectI>(&r->boxes, b);
+    if (b.x >= b.w || b.y >= b.h) { continue; }
+    var h: uint64 = cmd_hash(r, dl, c);
+    var tx0: int32 = b.x / T; var tx1: int32 = (b.w - 1) / T;
+    var ty0: int32 = b.y / T; var ty1: int32 = (b.h - 1) / T;
+    for ty: int32 in ty0..ty1 + 1 {
+      for tx: int32 in tx0..tx1 + 1 {
+        var ti: int32 = ty * tw + tx;
+        cur[ti] = hmix(cur[ti], h);
+        r->tile_start[ti + 1] += 1;
+      }
+    }
+  }
+  var ndirty: int32 = 0;
+  for ti: int32 in 0..nt {
+    r->dirty_tiles[ti] = (uint8)0;
+    if (force || cur[ti] != prev[ti]) { r->dirty_tiles[ti] = (uint8)1; ndirty = ndirty + 1; }
+  }
+  return ndirty;
+}
+
+// swaps the tile hashes and merges dirty tiles: horizontal runs, then vertically equal runs
+fn damage_finish(r: MythicRenderer*, ndirty: int32) -> int32 {
+  var T: int32 = MYTHIC_TILE;
+  var tw: int32 = r->tw;
+  r->stat_tiles = ndirty;
+  var cur: uint64* = r->hash_b;
+  r->hash_b = r->hash_a;
+  r->hash_a = cur;
+  r->have_prev = true;
+  mythic_vec_clear<MythicRectI>(&r->dirty);
+  var row_begin: int64 = 0;
+  for ty: int32 in 0..r->th {
+    var this_row: int64 = r->dirty.len;
+    var tx: int32 = 0;
+    while (tx < tw) {
+      if (r->dirty_tiles[ty * tw + tx] == (uint8)0) { tx = tx + 1; continue; }
+      var sx: int32 = tx;
+      while (tx < tw && r->dirty_tiles[ty * tw + tx] != (uint8)0) { tx = tx + 1; }
+      var rx: int32 = sx * T;
+      var rw: int32 = mythic_mini(tx * T, r->w) - rx;
+      var ry: int32 = ty * T;
+      var rh: int32 = mythic_mini(ry + T, r->h) - ry;
+      var merged: bool = false;
+      var q: int64 = row_begin;
+      while (q < this_row) {
+        var pr: MythicRectI* = &r->dirty.data[q];
+        if (pr->x == rx && pr->w == rw && pr->y + pr->h == ry) { pr->h = pr->h + rh; merged = true; break; }
+        q = q + 1;
+      }
+      if (!merged) {
+        var nr: MythicRectI = { x: rx, y: ry, w: rw, h: rh };
+        mythic_vec_push<MythicRectI>(&r->dirty, nr);
+      }
+    }
+    // rects extended this row stay candidates; rects that ended earlier cannot merge again
+    var keep: int64 = row_begin;
+    while (keep < r->dirty.len && r->dirty.data[keep].y + r->dirty.data[keep].h < ry_end(ty, T)) { keep = keep + 1; }
+    row_begin = keep;
+  }
+  return (int32)r->dirty.len;
+}
+
+/// Renders the dirty tiles of `dl` into `fb` and returns the number of dirty rects
+/// (see mythic_renderer_dirty). `force_full` re-renders every tile.
+export fn mythic_renderer_render(r: MythicRenderer*, dl: MythicDrawList*, fb: MythicFramebuffer, force_full: bool) -> int32 {
+  if (r->shadows.bytes > MYTHIC_SHADOW_CACHE_MAX) { mythic_shadow_cache_clear(&r->shadows); }
+  var ndirty: int32 = damage_pass(r, dl, fb.w, fb.h, force_full);
+  var T: int32 = MYTHIC_TILE;
+  var tw: int32 = r->tw;
+  var nt: int32 = r->ntiles;
+  var ncmd: int32 = (int32)dl->cmds.len;
+  for i: int32 in 0..nt { r->tile_start[i + 1] += r->tile_start[i]; r->tile_fill[i] = r->tile_start[i]; }
+  mythic_vec_reserve<int32>(&r->bins, (int64)r->tile_start[nt] + 1);
+  r->bins.len = (int64)r->tile_start[nt];
+  // pass 2: fill bins in command order
+  for ci: int32 in 0..ncmd {
+    var b: MythicRectI = r->boxes.data[(int64)ci];
+    if (b.x >= b.w || b.y >= b.h) { continue; }
+    var tx0: int32 = b.x / T; var tx1: int32 = (b.w - 1) / T;
+    var ty0: int32 = b.y / T; var ty1: int32 = (b.h - 1) / T;
+    for ty: int32 in ty0..ty1 + 1 {
+      for tx: int32 in tx0..tx1 + 1 {
+        var ti: int32 = ty * tw + tx;
+        r->bins.data[(int64)r->tile_fill[ti]] = ci;
+        r->tile_fill[ti] += 1;
+      }
+    }
+  }
+  // render dirty tiles
+  for ti: int32 in 0..nt {
+    if (r->dirty_tiles[ti] == (uint8)0) { continue; }
+    var tb: MythicRectI;
+    tb.x = (ti % tw) * T; tb.y = (ti / tw) * T;
+    tb.w = mythic_mini(tb.x + T, fb.w); tb.h = mythic_mini(tb.y + T, fb.h);
+    var s: int32 = r->tile_start[ti];
+    var e: int32 = r->tile_start[ti + 1];
+    if (s == e) {
+      for y: int32 in tb.y..tb.h {
+        var row: uint32* = fb.px + (int64)y * (int64)fb.stride;
+        for x: int32 in tb.x..tb.w { row[x] = (uint32)0xFF000000; }
+      }
+    }
+    for k: int32 in s..e { draw_cmd(r, fb, dl, r->bins.data[(int64)k], tb); }
+  }
+  return damage_finish(r, ndirty);
+}
+
+/// Damage only: computes the command boxes (mythic_renderer_box), tile hashes and dirty rects of
+/// `dl` for a w x h target without drawing anything. Returns the number of dirty rects. For
+/// renderers that draw the list another way (mythic_render_gl).
+export fn mythic_renderer_damage(r: MythicRenderer*, dl: MythicDrawList*, w: int32, h: int32, force_full: bool) -> int32 {
+  return damage_finish(r, damage_pass(r, dl, w, h, force_full));
+}
+
+/// Device box of command `ci` from the last render or damage call: x0, y0, x1, y1 in the
+/// x, y, w, h fields (empty when x0 >= x1), already cut by its clip and the screen.
+export fn mythic_renderer_box(r: MythicRenderer*, ci: int32) -> MythicRectI { return r->boxes.data[(int64)ci]; }
+
+fn ry_end(ty: int32, T: int32) -> int32 { return (ty + 1) * T; }
+
+export fn mythic_renderer_dirty(r: MythicRenderer*) -> MythicRectI* { return r->dirty.data; }
+
+/// Number of tiles re-rendered by the last mythic_renderer_render (for traces).
+export fn mythic_renderer_dirty_tiles(r: MythicRenderer*) -> int32 { return r->stat_tiles; }
+
+/// Frees the renderer and its caches (not the fonts or images it was created with).
+export fn mythic_renderer_destroy(r: MythicRenderer*) {
+  if (r == 0) { return; }
+  if (r->hash_a != 0) {
+    free((rawptr)r->hash_a); free((rawptr)r->hash_b); free((rawptr)r->tile_start);
+    free((rawptr)r->tile_fill); free((rawptr)r->dirty_tiles);
+  }
+  mythic_vec_free<int32>(&r->bins);
+  mythic_vec_free<MythicRectI>(&r->boxes);
+  mythic_vec_free<MythicRectI>(&r->dirty);
+  mythic_shadow_cache_free(&r->shadows);
+  if (r->acc.acc != 0) { free((rawptr)r->acc.acc); }
+  free((rawptr)r->gamma); free((rawptr)r->cov); free((rawptr)r->prof); free((rawptr)r->layer);
+  free((rawptr)r);
+}

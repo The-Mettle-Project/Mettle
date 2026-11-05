@@ -1,0 +1,158 @@
+// Small float32 vector and matrix math for GL programs, in the same layout GL
+// uses: a GlintMat4 is 16 floats, column by column, ready for
+// glUniformMatrix4fv(loc, 1, GL_FALSE, &m.m[0]). Angles are in radians.
+// It has its own sin/cos/sqrt so it does not pull std/math names into your program.
+
+export struct GlintVec3 { x: float32; y: float32; z: float32; }
+export struct GlintMat4 { m: float32[16]; }
+
+export const GLINT_PI: float32 = 3.14159265;
+
+export fn glint_radians(deg: float32) -> float32 { return deg * (GLINT_PI / 180.0); }
+
+export fn glint_sqrt(v: float32) -> float32 {
+  if (v <= 0.0) { return 0.0; }
+  var x: float64 = (float64)v;
+  var g: float64 = x;
+  if (g > 1.0) { g = x / 2.0; }
+  for i in 0..30 {
+    var n: float64 = 0.5 * (g + x / g);
+    if (n == g) { break; }
+    g = n;
+  }
+  return (float32)g;
+}
+
+// sin: reduce to [-pi/2, pi/2], then an odd polynomial (Taylor to x^15, error < 1e-9).
+// Each step has its own variable: the v0.17.0 Windows compiler in release mode
+// gets `x = x - k * tau` wrong right after k is made from x with an int cast.
+export fn glint_sin(a: float32) -> float32 {
+  var x: float64 = (float64)a;
+  var tau: float64 = 6.283185307179586;
+  var pi: float64 = 3.141592653589793;
+  var k: float64 = (float64)(int64)(x / tau);
+  var r: float64 = x - k * tau;                  // now in (-tau, tau)
+  var r2: float64 = r;
+  if (r > pi) { r2 = r - tau; }
+  if (r < -pi) { r2 = r + tau; }                 // now in [-pi, pi]
+  var y: float64 = r2;
+  if (r2 > pi / 2.0) { y = pi - r2; }
+  if (r2 < -pi / 2.0) { y = -pi - r2; }          // now in [-pi/2, pi/2], same sine
+  var y2: float64 = y * y;
+  var p: float64 = -1.0 / 1307674368000.0;
+  p = p * y2 + 1.0 / 6227020800.0;
+  p = p * y2 - 1.0 / 39916800.0;
+  p = p * y2 + 1.0 / 362880.0;
+  p = p * y2 - 1.0 / 5040.0;
+  p = p * y2 + 1.0 / 120.0;
+  p = p * y2 - 1.0 / 6.0;
+  p = p * y2 + 1.0;
+  return (float32)(y * p);
+}
+
+export fn glint_cos(a: float32) -> float32 { return glint_sin(a + GLINT_PI / 2.0); }
+export fn glint_tan(a: float32) -> float32 { return glint_sin(a) / glint_cos(a); }
+
+// ---- vectors ----
+
+export fn glint_vec3(x: float32, y: float32, z: float32) -> GlintVec3 {
+  var v: GlintVec3 = { x: x, y: y, z: z };
+  return v;
+}
+export fn glint_vec3_add(a: GlintVec3, b: GlintVec3) -> GlintVec3 { return glint_vec3(a.x + b.x, a.y + b.y, a.z + b.z); }
+export fn glint_vec3_sub(a: GlintVec3, b: GlintVec3) -> GlintVec3 { return glint_vec3(a.x - b.x, a.y - b.y, a.z - b.z); }
+export fn glint_vec3_scale(a: GlintVec3, s: float32) -> GlintVec3 { return glint_vec3(a.x * s, a.y * s, a.z * s); }
+export fn glint_vec3_dot(a: GlintVec3, b: GlintVec3) -> float32 { return a.x * b.x + a.y * b.y + a.z * b.z; }
+export fn glint_vec3_cross(a: GlintVec3, b: GlintVec3) -> GlintVec3 {
+  return glint_vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+export fn glint_vec3_length(a: GlintVec3) -> float32 { return glint_sqrt(glint_vec3_dot(a, a)); }
+export fn glint_vec3_normalize(a: GlintVec3) -> GlintVec3 {
+  var l: float32 = glint_vec3_length(a);
+  if (l == 0.0) { return a; }
+  return glint_vec3_scale(a, 1.0 / l);
+}
+
+// ---- matrices ----
+
+export fn glint_mat4_identity() -> GlintMat4 {
+  var r: GlintMat4;
+  r.m[0] = 1.0; r.m[5] = 1.0; r.m[10] = 1.0; r.m[15] = 1.0;
+  return r;
+}
+
+// a * b (b is applied first).
+export fn glint_mat4_mul(a: GlintMat4, b: GlintMat4) -> GlintMat4 {
+  var r: GlintMat4;
+  for c in 0..4 {
+    for row in 0..4 {
+      var s: float32 = 0.0;
+      for k in 0..4 { s = s + a.m[k * 4 + row] * b.m[c * 4 + k]; }
+      r.m[c * 4 + row] = s;
+    }
+  }
+  return r;
+}
+
+export fn glint_mat4_translate(v: GlintVec3) -> GlintMat4 {
+  var r: GlintMat4 = glint_mat4_identity();
+  r.m[12] = v.x; r.m[13] = v.y; r.m[14] = v.z;
+  return r;
+}
+
+export fn glint_mat4_scale(v: GlintVec3) -> GlintMat4 {
+  var r: GlintMat4 = glint_mat4_identity();
+  r.m[0] = v.x; r.m[5] = v.y; r.m[10] = v.z;
+  return r;
+}
+
+// Rotation of `angle` radians around `axis` (any length).
+export fn glint_mat4_rotate(angle: float32, axis: GlintVec3) -> GlintMat4 {
+  var a: GlintVec3 = glint_vec3_normalize(axis);
+  var c: float32 = glint_cos(angle);
+  var s: float32 = glint_sin(angle);
+  var t: float32 = 1.0 - c;
+  var r: GlintMat4 = glint_mat4_identity();
+  r.m[0] = c + a.x * a.x * t;       r.m[4] = a.x * a.y * t - a.z * s; r.m[8] = a.x * a.z * t + a.y * s;
+  r.m[1] = a.y * a.x * t + a.z * s; r.m[5] = c + a.y * a.y * t;       r.m[9] = a.y * a.z * t - a.x * s;
+  r.m[2] = a.z * a.x * t - a.y * s; r.m[6] = a.z * a.y * t + a.x * s; r.m[10] = c + a.z * a.z * t;
+  return r;
+}
+
+// Perspective projection like gluPerspective: fovy in radians, depth -1..1.
+export fn glint_mat4_perspective(fovy: float32, aspect: float32, near: float32, far: float32) -> GlintMat4 {
+  var f: float32 = 1.0 / glint_tan(fovy / 2.0);
+  var r: GlintMat4;
+  r.m[0] = f / aspect;
+  r.m[5] = f;
+  r.m[10] = (far + near) / (near - far);
+  r.m[11] = -1.0;
+  r.m[14] = (2.0 * far * near) / (near - far);
+  return r;
+}
+
+export fn glint_mat4_ortho(left: float32, right: float32, bottom: float32, top: float32, near: float32, far: float32) -> GlintMat4 {
+  var r: GlintMat4 = glint_mat4_identity();
+  r.m[0] = 2.0 / (right - left);
+  r.m[5] = 2.0 / (top - bottom);
+  r.m[10] = -2.0 / (far - near);
+  r.m[12] = -(right + left) / (right - left);
+  r.m[13] = -(top + bottom) / (top - bottom);
+  r.m[14] = -(far + near) / (far - near);
+  return r;
+}
+
+// A view matrix looking from eye at center, like gluLookAt.
+export fn glint_mat4_look_at(eye: GlintVec3, center: GlintVec3, up: GlintVec3) -> GlintMat4 {
+  var f: GlintVec3 = glint_vec3_normalize(glint_vec3_sub(center, eye));
+  var s: GlintVec3 = glint_vec3_normalize(glint_vec3_cross(f, up));
+  var u: GlintVec3 = glint_vec3_cross(s, f);
+  var r: GlintMat4 = glint_mat4_identity();
+  r.m[0] = s.x; r.m[4] = s.y; r.m[8] = s.z;
+  r.m[1] = u.x; r.m[5] = u.y; r.m[9] = u.z;
+  r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+  r.m[12] = -glint_vec3_dot(s, eye);
+  r.m[13] = -glint_vec3_dot(u, eye);
+  r.m[14] = glint_vec3_dot(f, eye);
+  return r;
+}

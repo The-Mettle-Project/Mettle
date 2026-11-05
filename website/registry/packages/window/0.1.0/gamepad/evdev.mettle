@@ -1,0 +1,435 @@
+// gamepad/evdev: Linux gamepads through the evdev interface
+// (Documentation/input/input.rst, event-codes.rst, gamepad.rst and
+// ff.rst in the Linux kernel). Hotplug is watched with inotify on /dev/input.
+// No libudev: a pad that the user's session may not read is skipped.
+import "std/mem";
+import "../core/types.mettle";
+
+const BTN_MISC: int64 = 0x100;
+const BTN_JOYSTICK: int64 = 0x120;
+const KEY_MAX: int64 = 0x2FF;
+const ABS_HAT0X: int64 = 0x10;
+const ABS_HAT3Y: int64 = 0x17;
+
+/// What a device can do (from its ioctls, or made by hand in tests).
+export struct WindowEvdevCaps {
+  keys: uint8[96];             // EV_KEY bits, codes 0..0x2FF
+  abs: uint8[8];               // EV_ABS bits, codes 0..0x3F
+  absinfo: int32[384];         // per ABS code: value, min, max, fuzz, flat, resolution
+  has_ff: bool;
+  bus: int32; vendor: int32; product: int32; version: int32;
+  name: uint8[128];
+  name_len: int32;
+}
+
+struct PadDev {
+  fd: int64;
+  node: int32;                 // N of /dev/input/eventN (-1 for test devices)
+  key_index: int16[768];       // key code -> raw button index, -1 none
+  abs_index: int8[64];         // abs code -> raw axis index, -1 none
+  caps: WindowEvdevCaps;
+  ff_id: int32;
+}
+
+var g_inotify: int64 = -1;
+
+export fn window_pad_platform_name() -> string { return "Linux"; }
+
+fn bit(b: uint8*, code: int64) -> bool { return ((int64)b[code >> 3] & ((int64)1 << (code & 7))) != 0; }
+fn dev(i: int32) -> PadDev* { return (PadDev*)g_pads[i].plat; }
+
+fn ioctl(fd: int64, req: int64, arg: rawptr) -> int64 { return syscall(16, fd, req, arg); }
+
+fn read_caps(fd: int64, c: WindowEvdevCaps*) -> bool {
+  var z: WindowEvdevCaps;
+  *c = z;
+  var types: uint8[4];
+  window_zero(&types[0], 4);
+  if (ioctl(fd, 0x80000000 | (4 << 16) | 0x4520, (rawptr)&types[0]) < 0) { return false; }
+  if (!bit(&types[0], 1) || !bit(&types[0], 3)) { return false; }    // needs EV_KEY and EV_ABS
+  ioctl(fd, 0x80000000 | (96 << 16) | 0x4521, (rawptr)&c->keys[0]);
+  ioctl(fd, 0x80000000 | (8 << 16) | 0x4523, (rawptr)&c->abs[0]);
+  c->has_ff = bit(&types[0], 0x15);
+  var id: uint8[8];
+  if (ioctl(fd, 0x80000000 | (8 << 16) | 0x4502, (rawptr)&id[0]) >= 0) {
+    c->bus = (int32)window_rd16(&id[0], 0); c->vendor = (int32)window_rd16(&id[0], 2);
+    c->product = (int32)window_rd16(&id[0], 4); c->version = (int32)window_rd16(&id[0], 6);
+  }
+  var nl: int64 = ioctl(fd, 0x80000000 | (127 << 16) | 0x4506, (rawptr)&c->name[0]);
+  if (nl > 0) {
+    var n: int64 = 0;
+    while (n < 127 && c->name[n] != (uint8)0) { n = n + 1; }
+    c->name_len = (int32)n;
+  }
+  for a: int64 in 0..64 {
+    if (!bit(&c->abs[0], a)) { continue; }
+    var info: uint8[24];
+    if (ioctl(fd, 0x80000000 | (24 << 16) | (0x4540 + a), (rawptr)&info[0]) >= 0) {
+      for k: int64 in 0..6 { c->absinfo[a * 6 + k] = (int32)window_rds32(&info[0], k * 4); }
+    }
+  }
+  return true;
+}
+
+fn looks_like_pad(c: WindowEvdevCaps*) -> bool {
+  var has_xy: bool = bit(&c->abs[0], 0) && bit(&c->abs[0], 1);
+  if (bit(&c->keys[0], 0x130)) { return true; }                       // BTN_GAMEPAD / BTN_SOUTH
+  if (has_xy && bit(&c->keys[0], 0x120)) { return true; }            // BTN_JOYSTICK / BTN_TRIGGER
+  return false;
+}
+
+// The Linux gamepad specification layout, in this device's raw indexes.
+fn bind_key(pad: WindowGamepad*, d: PadDev*, button: int32, code: int64) -> bool {
+  if (code < 0 || code > KEY_MAX || d->key_index[code] < 0) { return false; }
+  pad->map.buttons[button].kind = 1;
+  pad->map.buttons[button].index = (int32)d->key_index[code];
+  return true;
+}
+
+fn bind_abs(pad: WindowGamepad*, d: PadDev*, axis: int32, code: int64) -> bool {
+  if (d->abs_index[code] < 0) { return false; }
+  pad->map.axes[axis].kind = 2;
+  pad->map.axes[axis].index = (int32)d->abs_index[code];
+  return true;
+}
+
+fn bind_trigger_key(pad: WindowGamepad*, d: PadDev*, axis: int32, code: int64) {
+  if (d->key_index[code] < 0) { return; }
+  pad->map.axes[axis].kind = 1;
+  pad->map.axes[axis].index = (int32)d->key_index[code];
+}
+
+export fn window_gamepad_default_map(pad: WindowGamepad*) {
+  var z: WindowPadMap;
+  pad->map = z;
+  var d: PadDev* = (PadDev*)pad->plat;
+  if (d == 0) { return; }
+  bind_key(pad, d, WINDOW_PAD_SOUTH, 0x130);
+  bind_key(pad, d, WINDOW_PAD_EAST, 0x131);
+  bind_key(pad, d, WINDOW_PAD_NORTH, 0x133);
+  bind_key(pad, d, WINDOW_PAD_WEST, 0x134);
+  bind_key(pad, d, WINDOW_PAD_LEFT_SHOULDER, 0x136);
+  bind_key(pad, d, WINDOW_PAD_RIGHT_SHOULDER, 0x137);
+  bind_key(pad, d, WINDOW_PAD_BACK, 0x13A);
+  bind_key(pad, d, WINDOW_PAD_START, 0x13B);
+  bind_key(pad, d, WINDOW_PAD_GUIDE, 0x13C);
+  bind_key(pad, d, WINDOW_PAD_LEFT_STICK, 0x13D);
+  bind_key(pad, d, WINDOW_PAD_RIGHT_STICK, 0x13E);
+  if (!bind_key(pad, d, WINDOW_PAD_DPAD_UP, 0x220)) {
+    pad->map.buttons[WINDOW_PAD_DPAD_UP].kind = 3; pad->map.buttons[WINDOW_PAD_DPAD_UP].mask = 1;
+    pad->map.buttons[WINDOW_PAD_DPAD_RIGHT].kind = 3; pad->map.buttons[WINDOW_PAD_DPAD_RIGHT].mask = 2;
+    pad->map.buttons[WINDOW_PAD_DPAD_DOWN].kind = 3; pad->map.buttons[WINDOW_PAD_DPAD_DOWN].mask = 4;
+    pad->map.buttons[WINDOW_PAD_DPAD_LEFT].kind = 3; pad->map.buttons[WINDOW_PAD_DPAD_LEFT].mask = 8;
+  } else {
+    bind_key(pad, d, WINDOW_PAD_DPAD_DOWN, 0x221);
+    bind_key(pad, d, WINDOW_PAD_DPAD_LEFT, 0x222);
+    bind_key(pad, d, WINDOW_PAD_DPAD_RIGHT, 0x223);
+  }
+  bind_abs(pad, d, WINDOW_AXIS_LEFT_X, 0x00);
+  bind_abs(pad, d, WINDOW_AXIS_LEFT_Y, 0x01);
+  if (d->abs_index[0x03] >= 0) {
+    // ABS_RX/RY are the right stick, ABS_Z/RZ the analog triggers.
+    bind_abs(pad, d, WINDOW_AXIS_RIGHT_X, 0x03);
+    bind_abs(pad, d, WINDOW_AXIS_RIGHT_Y, 0x04);
+    if (!bind_abs(pad, d, WINDOW_AXIS_LEFT_TRIGGER, 0x02)) { bind_abs(pad, d, WINDOW_AXIS_LEFT_TRIGGER, 0x0A); }
+    if (!bind_abs(pad, d, WINDOW_AXIS_RIGHT_TRIGGER, 0x05)) { bind_abs(pad, d, WINDOW_AXIS_RIGHT_TRIGGER, 0x09); }
+  } else {
+    // Generic HID pads: Z/RZ are the right stick.
+    bind_abs(pad, d, WINDOW_AXIS_RIGHT_X, 0x02);
+    bind_abs(pad, d, WINDOW_AXIS_RIGHT_Y, 0x05);
+    bind_abs(pad, d, WINDOW_AXIS_LEFT_TRIGGER, 0x0A);
+    bind_abs(pad, d, WINDOW_AXIS_RIGHT_TRIGGER, 0x09);
+  }
+  if (pad->map.axes[WINDOW_AXIS_LEFT_TRIGGER].kind == 0) { bind_trigger_key(pad, d, WINDOW_AXIS_LEFT_TRIGGER, 0x138); }
+  if (pad->map.axes[WINDOW_AXIS_RIGHT_TRIGGER].kind == 0) { bind_trigger_key(pad, d, WINDOW_AXIS_RIGHT_TRIGGER, 0x139); }
+}
+
+fn norm(d: PadDev*, code: int64, value: int64) -> float32 {
+  var mn: int64 = (int64)d->caps.absinfo[code * 6 + 1];
+  var mx: int64 = (int64)d->caps.absinfo[code * 6 + 2];
+  var flat: int64 = (int64)d->caps.absinfo[code * 6 + 4];
+  if (mx <= mn) { return 0.0; }
+  var v: int64 = value;
+  if (v < mn) { v = mn; }
+  if (v > mx) { v = mx; }
+  var centre2: int64 = mn + mx;
+  var off2: int64 = v * 2 - centre2;
+  if (off2 < 0) { off2 = -off2; }
+  if (flat > 0 && off2 <= flat * 2) { return 0.0; }
+  return (float32)(2.0 * (float64)(v - mn) / (float64)(mx - mn) - 1.0);
+}
+
+fn set_abs(pad: WindowGamepad*, d: PadDev*, code: int64, value: int64) {
+  if (code < 0 || code >= 64) { return; }
+  if (code >= ABS_HAT0X && code <= ABS_HAT3Y) {
+    var h: int64 = (code - ABS_HAT0X) / 2;
+    var y: bool = ((code - ABS_HAT0X) & 1) == 1;
+    var bits: int32 = pad->raw_hats[h];
+    if (y) {
+      bits = bits & ~(1 | 4);
+      if (value < 0) { bits = bits | 1; }
+      if (value > 0) { bits = bits | 4; }
+    } else {
+      bits = bits & ~(2 | 8);
+      if (value < 0) { bits = bits | 8; }
+      if (value > 0) { bits = bits | 2; }
+    }
+    pad->raw_hats[h] = bits;
+    return;
+  }
+  var ai: int64 = (int64)d->abs_index[code];
+  if (ai >= 0) { pad->raw_axes[ai] = norm(d, code, value); }
+}
+
+/// Adds a gamepad that reads input_event records from fd. Returns its index or -1.
+/// Used for /dev/input devices and, in tests, for a pipe with made-up caps.
+export fn window_evdev_attach(fd: int64, node: int32, caps: WindowEvdevCaps*) -> int32 {
+  var idx: int32 = window_gamepad_slot();
+  if (idx < 0) { return -1; }
+  var d: PadDev* = new PadDev;
+  d->fd = fd;
+  d->node = node;
+  d->caps = *caps;
+  d->ff_id = -1;
+  var pad: WindowGamepad* = &g_pads[idx];
+  var nb: int32 = 0;
+  for c: int64 in 0..768 { d->key_index[c] = (int16)-1; }
+  for c: int64 in BTN_JOYSTICK..KEY_MAX + 1 {
+    if (bit(&caps->keys[0], c) && nb < 64) { d->key_index[c] = (int16)nb; nb = nb + 1; }
+  }
+  for c: int64 in BTN_MISC..BTN_JOYSTICK {
+    if (bit(&caps->keys[0], c) && nb < 64) { d->key_index[c] = (int16)nb; nb = nb + 1; }
+  }
+  var na: int32 = 0;
+  var nh: int32 = 0;
+  for c: int64 in 0..64 {
+    d->abs_index[c] = (int8)-1;
+    if (!bit(&caps->abs[0], c)) { continue; }
+    if (c >= ABS_HAT0X && c <= ABS_HAT3Y) { if (((c - ABS_HAT0X) & 1) == 0) { nh = nh + 1; } continue; }
+    if (na < 16) { d->abs_index[c] = (int8)na; na = na + 1; }
+  }
+  pad->plat = (rawptr)d;
+  pad->nraw_buttons = nb; pad->nraw_axes = na; pad->nraw_hats = nh;
+  var n: int32 = caps->name_len;
+  if (n > 127) { n = 127; }
+  for k in 0..n { pad->name[k] = caps->name[k]; }
+  pad->name_len = n;
+  window_wr16(&pad->guid[0], 0, (int64)caps->bus);
+  window_wr16(&pad->guid[0], 4, (int64)caps->vendor);
+  window_wr16(&pad->guid[0], 8, (int64)caps->product);
+  window_wr16(&pad->guid[0], 12, (int64)caps->version);
+  // Start from the device's current axis values.
+  for c: int64 in 0..64 {
+    if (bit(&caps->abs[0], c)) { set_abs(pad, d, c, (int64)caps->absinfo[c * 6]); }
+  }
+  pad->connected = true;
+  window_gamepad_choose_map(pad);
+  // Settle the starting state without events, then announce the pad.
+  for b in 0..WINDOW_PAD_BUTTON_COUNT { pad->buttons[b] = false; }
+  g_pad_quiet = true;
+  window_gamepad_update(idx);
+  g_pad_quiet = false;
+  window_gamepad_announce(idx, true);
+  return idx;
+}
+
+fn detach(i: int32) {
+  var d: PadDev* = dev(i);
+  if (d != 0) {
+    if (d->fd >= 0) { syscall(3, d->fd); }
+    free(d);
+  }
+  g_pads[i].plat = (rawptr)0;
+  g_pads[i].connected = false;
+  window_gamepad_announce(i, false);
+}
+
+fn open_node(n: int32) {
+  for i in 0..WINDOW_PAD_MAX {
+    if (g_pads[i].connected && dev((int32)i)->node == n) { return; }
+  }
+  var path: uint8[32];
+  var prefix: string = "/dev/input/event";
+  for k in 0..16 { path[k] = prefix.chars[k]; }
+  var digits: uint8[12];
+  var nd: int64 = 0;
+  var v: int32 = n;
+  if (v == 0) { digits[0] = (uint8)48; nd = 1; }
+  while (v > 0 && nd < 10) { digits[nd] = (uint8)(48 + v % 10); v = v / 10; nd = nd + 1; }
+  for k: int64 in 0..nd { path[16 + k] = digits[nd - 1 - k]; }
+  path[16 + nd] = (uint8)0;
+  var fd: int64 = syscall(2, &path[0], 2 | 0x800 | 0x80000, 0);      // O_RDWR | O_NONBLOCK | O_CLOEXEC
+  if (fd < 0) { fd = syscall(2, &path[0], 0x800 | 0x80000, 0); }
+  if (fd < 0) { return; }
+  var caps: WindowEvdevCaps;
+  if (!read_caps(fd, &caps) || !looks_like_pad(&caps)) { syscall(3, fd); return; }
+  if (window_evdev_attach(fd, n, &caps) < 0) { syscall(3, fd); }
+}
+
+fn node_number(name: uint8*, n: int64) -> int32 {
+  var p: string = "event";
+  if (n <= 5) { return -1; }
+  for k in 0..5 { if (name[k] != p.chars[k]) { return -1; } }
+  var v: int32 = 0;
+  for k: int64 in 5..n {
+    if (name[k] < (uint8)48 || name[k] > (uint8)57 || v > 100000) { return -1; }
+    v = v * 10 + ((int32)name[k] - 48);
+  }
+  return v;
+}
+
+fn scan() {
+  var dir: string = "/dev/input";
+  var c: uint8[16];
+  for k: int64 in 0..10 { c[k] = dir.chars[k]; }
+  c[10] = (uint8)0;
+  var fd: int64 = syscall(2, &c[0], 0x10000 | 0x80000, 0);          // O_DIRECTORY | O_CLOEXEC
+  if (fd < 0) { return; }
+  var buf: uint8[4096];
+  while (true) {
+    var r: int64 = syscall(217, fd, &buf[0], 4096);                  // getdents64
+    if (r <= 0) { break; }
+    var o: int64 = 0;
+    while (o + 19 < r) {
+      var reclen: int64 = window_rd16(&buf[0], o + 16);
+      if (reclen <= 0) { break; }
+      var nl: int64 = 0;
+      while (o + 19 + nl < o + reclen && buf[o + 19 + nl] != (uint8)0) { nl = nl + 1; }
+      var num: int32 = node_number(&buf[o + 19], nl);
+      if (num >= 0) { open_node(num); }
+      o = o + reclen;
+    }
+  }
+  syscall(3, fd);
+}
+
+export fn window_pad_plat_init() {
+  var dir: uint8[16];
+  var s: string = "/dev/input";
+  for k: int64 in 0..10 { dir[k] = s.chars[k]; }
+  dir[10] = (uint8)0;
+  g_inotify = syscall(294, 0x800 | 0x80000);                         // inotify_init1(NONBLOCK|CLOEXEC)
+  if (g_inotify >= 0) {
+    if (syscall(254, g_inotify, &dir[0], 0x100 | 0x4 | 0x200) < 0) { syscall(3, g_inotify); g_inotify = -1; }
+  }
+  scan();
+}
+
+export fn window_pad_plat_shutdown() {
+  for i in 0..WINDOW_PAD_MAX {
+    if (g_pads[i].connected) {
+      var d: PadDev* = dev((int32)i);
+      if (d != 0) { if (d->fd >= 0) { syscall(3, d->fd); } free(d); }
+      g_pads[i].plat = (rawptr)0;
+      g_pads[i].connected = false;
+    }
+  }
+  if (g_inotify >= 0) { syscall(3, g_inotify); g_inotify = -1; }
+}
+
+fn resync(i: int32) {
+  var d: PadDev* = dev(i);
+  var pad: WindowGamepad* = &g_pads[i];
+  var keys: uint8[96];
+  window_zero(&keys[0], 96);
+  if (ioctl(d->fd, 0x80000000 | (96 << 16) | 0x4518, (rawptr)&keys[0]) >= 0) {
+    for c: int64 in 0..768 {
+      var k: int64 = (int64)d->key_index[c];
+      if (k >= 0) { pad->raw_buttons[k] = bit(&keys[0], c); }
+    }
+  }
+  for a: int64 in 0..64 {
+    if (!bit(&d->caps.abs[0], a)) { continue; }
+    var info: uint8[24];
+    if (ioctl(d->fd, 0x80000000 | (24 << 16) | (0x4540 + a), (rawptr)&info[0]) >= 0) {
+      set_abs(pad, d, a, window_rds32(&info[0], 0));
+    }
+  }
+}
+
+fn read_pad(i: int32) {
+  var d: PadDev* = dev(i);
+  var pad: WindowGamepad* = &g_pads[i];
+  var buf: uint8[768];
+  var changed: bool = false;
+  var dropped: bool = false;
+  var guard: int32 = 0;
+  while (guard < 64) {
+    guard = guard + 1;
+    var r: int64 = syscall(0, d->fd, &buf[0], 768);
+    if (r == -4) { continue; }
+    if (r == -11) { break; }
+    if (r <= 0) { detach(i); return; }                              // ENODEV: unplugged
+    var n: int64 = r / 24;
+    for k: int64 in 0..n {
+      var e: uint8* = &buf[k * 24];
+      var ty: int64 = window_rd16(e, 16);
+      var code: int64 = window_rd16(e, 18);
+      var value: int64 = window_rds32(e, 20);
+      if (dropped) {
+        if (ty == 0 && code == 0) { dropped = false; resync(i); changed = true; }
+        continue;
+      }
+      if (ty == 1 && code <= KEY_MAX) {
+        var bi: int64 = (int64)d->key_index[code];
+        if (bi >= 0) { pad->raw_buttons[bi] = value != 0; changed = true; }
+      } else if (ty == 3) {
+        set_abs(pad, d, code, value);
+        changed = true;
+      } else if (ty == 0 && code == 3) {
+        dropped = true;                                              // SYN_DROPPED
+      }
+    }
+    if (r < 768) { break; }
+  }
+  if (changed) { window_gamepad_update(i); }
+}
+
+fn read_inotify() {
+  var buf: uint8[2048];
+  while (true) {
+    var r: int64 = syscall(0, g_inotify, &buf[0], 2048);
+    if (r <= 0) { return; }
+    var o: int64 = 0;
+    while (o + 16 <= r) {
+      var mask: int64 = window_rd32(&buf[0], o + 4);
+      var len: int64 = window_rd32(&buf[0], o + 12);
+      if (o + 16 + len > r) { return; }
+      var nl: int64 = 0;
+      while (nl < len && buf[o + 16 + nl] != (uint8)0) { nl = nl + 1; }
+      var num: int32 = node_number(&buf[o + 16], nl);
+      if (num >= 0 && (mask & (0x100 | 0x4)) != 0) { open_node(num); }
+      o = o + 16 + len;
+    }
+  }
+}
+
+export fn window_pad_plat_pump() {
+  if (g_inotify >= 0) { read_inotify(); }
+  for i in 0..WINDOW_PAD_MAX {
+    if (g_pads[i].connected && g_pads[i].plat != 0) { read_pad((int32)i); }
+  }
+}
+
+export fn window_pad_plat_rumble(i: int32, low: float32, high: float32, ms: int32) -> bool {
+  var d: PadDev* = dev(i);
+  if (d == 0 || !d->caps.has_ff || d->node < 0) { return false; }
+  var eff: uint8[48];
+  window_zero(&eff[0], 48);
+  window_wr16(&eff[0], 0, 0x50);                                     // FF_RUMBLE
+  window_wr16(&eff[0], 2, (int64)d->ff_id & 0xFFFF);
+  window_wr16(&eff[0], 10, (int64)ms);
+  window_wr16(&eff[0], 16, (int64)(high * 65535.0));                // strong motor
+  window_wr16(&eff[0], 18, (int64)(low * 65535.0));                 // weak motor
+  if (ioctl(d->fd, 0x40000000 | (48 << 16) | 0x4580, (rawptr)&eff[0]) < 0) {
+    if (d->ff_id < 0) { return false; }
+    d->ff_id = -1;
+    window_wr16(&eff[0], 2, 0xFFFF);
+    if (ioctl(d->fd, 0x40000000 | (48 << 16) | 0x4580, (rawptr)&eff[0]) < 0) { return false; }
+  }
+  d->ff_id = (int32)window_rds16(&eff[0], 2);
+  var ev: uint8[24];
+  window_zero(&ev[0], 24);
+  window_wr16(&ev[0], 16, 0x15); window_wr16(&ev[0], 18, (int64)d->ff_id); window_wr32(&ev[0], 20, 1);
+  return syscall(1, d->fd, &ev[0], 24) == 24;
+}

@@ -1,0 +1,144 @@
+// Glint's shared types: the context, its settings, window events and key codes.
+// Every name Glint exports starts with glint_, Glint or GLINT_ (Mettle exports are
+// global across the whole program, so a short name would clash).
+
+// Which system API made the context.
+export const GLINT_BACKEND_AUTO: int32 = 0;
+export const GLINT_BACKEND_EGL: int32 = 1;
+export const GLINT_BACKEND_GLX: int32 = 2;
+export const GLINT_BACKEND_WGL: int32 = 3;
+
+// What the context draws into.
+export const GLINT_KIND_WINDOW: int32 = 1;     // a window Glint made and owns
+export const GLINT_KIND_EXISTING: int32 = 2;   // a window the app already had
+export const GLINT_KIND_HEADLESS: int32 = 3;   // no window: an off-screen framebuffer
+
+// Event kinds (GlintEvent.kind).
+export const GLINT_EV_NONE: int32 = 0;
+export const GLINT_EV_CLOSE: int32 = 1;        // the user asked to close the window
+export const GLINT_EV_RESIZE: int32 = 2;       // w, h = new drawable size
+export const GLINT_EV_KEY_DOWN: int32 = 3;     // key, mods
+export const GLINT_EV_KEY_UP: int32 = 4;
+export const GLINT_EV_MOUSE_MOVE: int32 = 5;   // x, y
+export const GLINT_EV_MOUSE_DOWN: int32 = 6;   // button, x, y
+export const GLINT_EV_MOUSE_UP: int32 = 7;
+export const GLINT_EV_SCROLL: int32 = 8;       // dy = +1 up, -1 down
+export const GLINT_EV_FOCUS: int32 = 9;        // x = 1 gained, 0 lost
+
+export const GLINT_MOUSE_LEFT: int32 = 1;
+export const GLINT_MOUSE_MIDDLE: int32 = 2;
+export const GLINT_MOUSE_RIGHT: int32 = 3;
+
+export const GLINT_MOD_SHIFT: int32 = 1;
+export const GLINT_MOD_CTRL: int32 = 2;
+export const GLINT_MOD_ALT: int32 = 4;
+
+// Key codes. Letters and digits are their upper-case ASCII codes ('A' = 65,
+// '0' = 48), space is 32 and other printable keys are their ASCII code.
+export const GLINT_KEY_UNKNOWN: int32 = 0;
+export const GLINT_KEY_SPACE: int32 = 32;
+export const GLINT_KEY_ESCAPE: int32 = 256;
+export const GLINT_KEY_ENTER: int32 = 257;
+export const GLINT_KEY_TAB: int32 = 258;
+export const GLINT_KEY_BACKSPACE: int32 = 259;
+export const GLINT_KEY_INSERT: int32 = 260;
+export const GLINT_KEY_DELETE: int32 = 261;
+export const GLINT_KEY_RIGHT: int32 = 262;
+export const GLINT_KEY_LEFT: int32 = 263;
+export const GLINT_KEY_DOWN: int32 = 264;
+export const GLINT_KEY_UP: int32 = 265;
+export const GLINT_KEY_PAGE_UP: int32 = 266;
+export const GLINT_KEY_PAGE_DOWN: int32 = 267;
+export const GLINT_KEY_HOME: int32 = 268;
+export const GLINT_KEY_END: int32 = 269;
+export const GLINT_KEY_F1: int32 = 290;        // F1..F12 are 290..301
+export const GLINT_KEY_LEFT_SHIFT: int32 = 340;
+export const GLINT_KEY_LEFT_CTRL: int32 = 341;
+export const GLINT_KEY_LEFT_ALT: int32 = 342;
+export const GLINT_KEY_RIGHT_SHIFT: int32 = 344;
+export const GLINT_KEY_RIGHT_CTRL: int32 = 345;
+export const GLINT_KEY_RIGHT_ALT: int32 = 346;
+export const GLINT_KEY_COUNT: int32 = 512;
+
+// How to make a context. Start from glint_config() and change what you need.
+export struct GlintConfig {
+  major: int32;          // lowest GL version you accept (default 3.3)
+  minor: int32;
+  want_major: int32;     // version Glint tries first (default 4.6); it steps down to major.minor
+  want_minor: int32;
+  debug: bool;           // ask for a debug context (KHR_debug output)
+  vsync: int32;          // swap interval: 1 = wait for vblank, 0 = off
+  depth_bits: int32;     // default 24
+  stencil_bits: int32;   // default 8
+  samples: int32;        // MSAA samples, 0 = off
+  srgb: bool;            // sRGB-capable default framebuffer
+  resizable: bool;       // own window only (default true)
+  visible: bool;         // own window only (default true)
+  backend: int32;        // GLINT_BACKEND_*; AUTO picks EGL, then GLX (Linux), WGL (Windows)
+  place: bool;           // own window only: put its top-left corner at x, y (screen pixels)
+  x: int32;
+  y: int32;
+}
+
+export struct GlintEvent {
+  kind: int32;
+  key: int32;
+  mods: int32;
+  button: int32;
+  x: int32;
+  y: int32;
+  w: int32;
+  h: int32;
+  dy: int32;
+}
+
+// One GL context and what it draws into. Treat the fields as read-only.
+export struct GlintContext {
+  backend: int32;
+  kind: int32;
+  width: int32;
+  height: int32;
+  gl_major: int32;          // the version the driver gave
+  gl_minor: int32;
+  fbo: uint32;              // headless only: the framebuffer that stands in for 0
+  fbo_color: uint32;
+  fbo_depth: uint32;
+  should_close: bool;
+  // platform handles
+  x_dpy: rawptr;            // X11 Display* (Linux)
+  win: int64;               // X11 Window id or HWND
+  owns_win: bool;
+  egl_dpy: rawptr;
+  egl_ctx: rawptr;
+  egl_surf: rawptr;
+  glx_ctx: rawptr;
+  hdc: int64;               // Windows
+  hglrc: int64;
+  wm_delete: int64;         // X11 WM_DELETE_WINDOW atom
+  mouse_x: int32;
+  mouse_y: int32;
+  mods: int32;
+  keys: uint8[512];
+  buttons: uint8[8];
+  ev: GlintEvent[64];
+  ev_head: int32;
+  ev_count: int32;
+  // added after 0.1.0 (append only)
+  egl_cfg: rawptr;          // the EGL config, for shared contexts
+  glx_fbc: rawptr;          // the GLX FBConfig, for shared contexts
+  fbo_tex: bool;            // headless colour buffer is a texture (shared contexts)
+  borrowed: bool;           // x_dpy belongs to another context: don't close it
+  share: GlintContext*;     // while opening: the context to share objects with
+}
+
+// Pixel formats for glint_read_rect.
+export const GLINT_FORMAT_RGBA: int32 = 0;   // bytes R, G, B, A
+export const GLINT_FORMAT_BGRA: int32 = 1;   // bytes B, G, R, A (Windows DIBs, X11 32-bit visuals)
+
+// The settings Glint uses when you pass none.
+export fn glint_config() -> GlintConfig {
+  var c: GlintConfig = { major: 3, minor: 3, want_major: 4, want_minor: 6, debug: false, vsync: 1,
+                         depth_bits: 24, stencil_bits: 8, samples: 0, srgb: false, resizable: true,
+                         visible: true, backend: 0, place: false, x: 0, y: 0 };
+  return c;
+}

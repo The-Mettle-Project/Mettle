@@ -1,0 +1,355 @@
+// plat_linux: picks the Linux backend (Wayland, X11 or headless) and forwards
+// every platform call to it.
+import "std/mem";
+import "core/types.mettle";
+import "headless/headless.mettle";
+import "x11/backend.mettle";
+import "x11/wire.mettle";
+import "x11/select.mettle";
+import "x11/ext.mettle";
+import "wayland/wire.mettle";
+import "wayland/xkb.mettle";
+import "wayland/backend.mettle";
+
+// ---------- time ----------
+/// Monotonic clock in microseconds.
+export fn window_now_us() -> int64 {
+  var ts: int64[2];
+  syscall(228, 1, &ts[0]);                       // clock_gettime(CLOCK_MONOTONIC)
+  return ts[0] * 1000000 + ts[1] / 1000;
+}
+
+/// Sleeps for ms milliseconds.
+export fn window_sleep_ms(ms: int32) {
+  if (ms <= 0) { return; }
+  var ts: int64[2];
+  ts[0] = (int64)ms / 1000; ts[1] = ((int64)ms % 1000) * 1000000;
+  syscall(35, &ts[0], 0);
+}
+
+// ---------- environment (read from /proc/self/environ; no libc) ----------
+fn read_all(path: string, out_len: int64*) -> uint8* {
+  var cpath: uint8* = (uint8*)malloc((int64)path.length + 1);
+  for i: int64 in 0..(int64)path.length { cpath[i] = path.chars[i]; }
+  cpath[path.length] = (uint8)0;
+  var fd: int64 = syscall(2, cpath, 524288, 0);
+  free(cpath);
+  if (fd < 0) { return (uint8*)0; }
+  var cap: int64 = 4096;
+  var len: int64 = 0;
+  var buf: uint8* = (uint8*)malloc(cap);
+  while (true) {
+    if (len == cap) {
+      var nb: uint8* = (uint8*)malloc(cap * 2);
+      for i: int64 in 0..len { nb[i] = buf[i]; }
+      free(buf);
+      buf = nb;
+      cap = cap * 2;
+    }
+    var r: int64 = syscall(0, fd, &buf[len], cap - len);
+    if (r == -4) { continue; }
+    if (r <= 0) { break; }
+    len = len + r;
+  }
+  syscall(3, fd);
+  *out_len = len;
+  return buf;
+}
+
+/// Reads an environment variable. Returns "" when unset. The caller frees a
+/// non-empty result with free(s.chars). The value is nul-terminated.
+export fn window_getenv(name: string) -> string {
+  var empty: string = "";
+  var len: int64 = 0;
+  var env: uint8* = read_all("/proc/self/environ", &len);
+  if (env == 0) { return empty; }
+  var n: int64 = (int64)name.length;
+  var i: int64 = 0;
+  while (i < len) {
+    var j: int64 = i;
+    while (j < len && env[j] != (uint8)0) { j = j + 1; }
+    if (j - i > n && env[i + n] == (uint8)61) {
+      var same: bool = true;
+      for k: int64 in 0..n { if (env[i + k] != name.chars[k]) { same = false; } }
+      if (same) {
+        var vl: int64 = j - i - n - 1;
+        var v: uint8* = (uint8*)malloc(vl + 1);
+        for k: int64 in 0..vl { v[k] = env[i + n + 1 + k]; }
+        v[vl] = (uint8)0;
+        free(env);
+        var s: string; s.chars = v; s.length = (uint64)vl;
+        return s;
+      }
+    }
+    i = j + 1;
+  }
+  free(env);
+  return empty;
+}
+
+/// Waits on up to 8 file descriptors for input; returns a bit mask of the ready ones
+/// (0 on timeout). timeout_ms -1 waits forever.
+export fn window_linux_poll(fds: int64*, n: int32, timeout_ms: int32) -> int32 {
+  var pfd: uint8[64];
+  for i in 0..n {
+    window_wr32(&pfd[0], (int64)i * 8, fds[i]);
+    window_wr16(&pfd[0], (int64)i * 8 + 4, 1);
+    window_wr16(&pfd[0], (int64)i * 8 + 6, 0);
+  }
+  var r: int64 = syscall(7, &pfd[0], (int64)n, (int64)timeout_ms);
+  if (r <= 0) { return 0; }
+  var mask: int32 = 0;
+  for i in 0..n {
+    if (window_rd16(&pfd[0], (int64)i * 8 + 6) != 0) { mask = mask | (1 << i); }
+  }
+  return mask;
+}
+
+fn wake_open() {
+  if (g_window.wake_fd >= 0) { return; }
+  var fd: int64 = syscall(290, 0, 0x80800);     // eventfd2(0, EFD_CLOEXEC | EFD_NONBLOCK)
+  if (fd >= 0) { g_window.wake_fd = fd; }
+}
+
+/// Reads the wake counter; pushes WINDOW_EV_WAKE when window_wake was called.
+export fn window_linux_drain_wake() {
+  if (g_window.wake_fd < 0) { return; }
+  var v: int64 = 0;
+  var r: int64 = syscall(0, g_window.wake_fd, &v, 8);
+  if (r == 8 && v != 0) {
+    var ev: WindowEvent;
+    ev.kind = WINDOW_EV_WAKE;
+    window_push_event(&ev);
+  }
+}
+
+export fn window_plat_wake() {
+  if (g_window.wake_fd < 0) { return; }
+  var one: int64 = 1;
+  syscall(1, g_window.wake_fd, &one, 8);
+}
+
+fn env_is(name: string, value: string) -> bool {
+  var v: string = window_getenv(name);
+  var same: bool = v.length > 0 && v == value;
+  if (v.length > 0) { free(v.chars); }
+  return same;
+}
+
+fn is_x11() -> bool { return g_window.backend == WINDOW_BACKEND_X11; }
+fn is_hl() -> bool { return g_window.backend == WINDOW_BACKEND_HEADLESS; }
+fn is_wl() -> bool { return g_window.backend == WINDOW_BACKEND_WAYLAND; }
+
+fn display_override_is_x11() -> bool {
+  if (g_window.display_len == 0) { return false; }
+  var c: uint8 = g_window.display_name[0];
+  return c == (uint8)58 || (g_window.display_len > 5 && c == (uint8)117 && g_window.display_name[4] == (uint8)58);
+}
+
+// The Wayland socket path: WAYLAND_DISPLAY (or the window_set_display name),
+// relative to XDG_RUNTIME_DIR unless absolute. "" when there is none.
+fn wayland_path(out: uint8*) -> int64 {
+  var name: string = "";
+  var owned: bool = false;
+  if (g_window.display_len > 0 && !display_override_is_x11()) {
+    name.chars = &g_window.display_name[0]; name.length = (uint64)g_window.display_len;
+  } else if (g_window.display_len == 0) {
+    name = window_getenv("WAYLAND_DISPLAY");
+    owned = name.length > 0;
+  }
+  if (name.length == 0) { return 0; }
+  var n: int64 = 0;
+  if (name.chars[0] != (uint8)47) {
+    var dir: string = window_getenv("XDG_RUNTIME_DIR");
+    if (dir.length == 0 || dir.length > 80) { if (owned) { free(name.chars); } if (dir.length > 0) { free(dir.chars); } return 0; }
+    for i: int64 in 0..(int64)dir.length { out[n] = dir.chars[i]; n = n + 1; }
+    out[n] = (uint8)47; n = n + 1;
+    free(dir.chars);
+  }
+  if (n + (int64)name.length > 107) { if (owned) { free(name.chars); } return 0; }
+  for i: int64 in 0..(int64)name.length { out[n] = name.chars[i]; n = n + 1; }
+  out[n] = (uint8)0;
+  if (owned) { free(name.chars); }
+  return n;
+}
+
+fn start_wayland() -> bool {
+  var path: uint8[112];
+  var n: int64 = wayland_path(&path[0]);
+  if (n == 0) { window_set_error("no Wayland display: WAYLAND_DISPLAY is not set"); return false; }
+  var s: string; s.chars = &path[0]; s.length = (uint64)n;
+  return window_wl_init(s);
+}
+
+fn start_x11() -> bool {
+  var disp: string = window_getenv("DISPLAY");
+  if (g_window.display_len > 0) {
+    if (disp.length > 0) { free(disp.chars); }
+    disp.chars = &g_window.display_name[0];
+    disp.length = (uint64)g_window.display_len;
+  }
+  var xa: string = window_getenv("XAUTHORITY");
+  var home: string = window_getenv("HOME");
+  var ok: bool = disp.length > 0 && window_x11_init(disp, xa, home);
+  if (disp.length == 0) { window_set_error("no display: DISPLAY is not set"); }
+  if (disp.length > 0 && g_window.display_len == 0) { free(disp.chars); }
+  if (xa.length > 0) { free(xa.chars); }
+  if (home.length > 0) { free(home.chars); }
+  return ok;
+}
+
+export fn window_plat_init(backend: int32) -> bool {
+  wake_open();
+  var b: int32 = backend;
+  if (b == WINDOW_BACKEND_AUTO) {
+    if (env_is("WINDOW_BACKEND", "headless")) { b = WINDOW_BACKEND_HEADLESS; }
+    else if (env_is("WINDOW_BACKEND", "x11")) { b = WINDOW_BACKEND_X11; }
+    else if (env_is("WINDOW_BACKEND", "wayland")) { b = WINDOW_BACKEND_WAYLAND; }
+  }
+  if (b == WINDOW_BACKEND_HEADLESS) { g_window.backend = b; return window_hl_init(); }
+  if (b == WINDOW_BACKEND_WAYLAND) {
+    if (start_wayland()) { g_window.backend = b; return true; }
+    return false;
+  }
+  if (b == WINDOW_BACKEND_X11) {
+    if (start_x11()) { g_window.backend = b; return true; }
+    return false;
+  }
+  // AUTO: X11 while DISPLAY is set (GL through Glint needs it; XWayland covers
+  // Wayland desktops), else Wayland.
+  var have_x: bool = display_override_is_x11();
+  if (!have_x && g_window.display_len == 0) {
+    var d: string = window_getenv("DISPLAY");
+    have_x = d.length > 0;
+    if (d.length > 0) { free(d.chars); }
+  }
+  if (have_x && start_x11()) { g_window.backend = WINDOW_BACKEND_X11; return true; }
+  if (start_wayland()) { g_window.backend = WINDOW_BACKEND_WAYLAND; return true; }
+  if (!have_x) { window_set_error("no display: neither DISPLAY nor WAYLAND_DISPLAY is set"); }
+  window_set_error("this backend is not available on Linux");
+  return false;
+}
+
+export fn window_plat_shutdown() {
+  if (is_hl()) { window_hl_shutdown(); }
+  if (is_x11()) { window_x11_shutdown(); }
+  if (is_wl()) { window_wl_shutdown(); }
+  if (g_window.wake_fd >= 0) { syscall(3, g_window.wake_fd); g_window.wake_fd = -1; }
+}
+
+export fn window_plat_refresh_monitors() {
+  if (is_x11()) { window_x11_refresh_monitors(); return; }
+  if (is_wl()) { window_wl_refresh_monitors(); return; }
+  window_hl_monitors();
+}
+
+export fn window_plat_create(w: Window*, cfg: WindowConfig*) -> bool {
+  if (is_x11()) { return window_x11_create(w, cfg); }
+  if (is_wl()) { return window_wl_create(w, cfg); }
+  return window_hl_create(w, cfg);
+}
+
+export fn window_plat_destroy(w: Window*) {
+  if (is_x11()) { window_x11_destroy(w); }
+  if (is_wl()) { window_wl_destroy(w); }
+}
+
+export fn window_plat_pump(timeout_ms: int32) {
+  if (is_x11()) {
+    window_x11_pump(timeout_ms, g_window.wake_fd);
+  } else if (is_wl()) {
+    window_wl_pump(timeout_ms, g_window.wake_fd);
+  } else if (timeout_ms != 0 && g_window.wake_fd >= 0) {
+    var fds: int64[1];
+    fds[0] = g_window.wake_fd;
+    window_linux_poll(&fds[0], 1, timeout_ms);
+  }
+  window_linux_drain_wake();
+}
+
+export fn window_plat_set_title(w: Window*, title: string) { if (is_x11()) { window_x11_set_title(w, title); } if (is_wl()) { window_wl_set_title(w, title); } }
+export fn window_plat_set_size(w: Window*, width: int32, height: int32) {
+  if (is_x11()) { window_x11_set_size(w, width, height); return; }
+  if (is_wl()) { window_wl_set_size(w, width, height); return; }
+  window_hl_resize(w, width, height);
+}
+export fn window_plat_set_position(w: Window*, x: int32, y: int32) {
+  if (is_x11()) { window_x11_set_position(w, x, y); return; }
+  if (is_wl()) { return; }
+  var ev: WindowEvent; ev.kind = WINDOW_EV_MOVE; ev.win = w; ev.x = (float64)x; ev.y = (float64)y; window_push_event(&ev);
+}
+export fn window_plat_set_size_limits(w: Window*, a: int32, b: int32, c: int32, d: int32) {
+  if (is_x11()) { window_x11_set_size_limits(w, a, b, c, d); }
+  if (is_wl()) { window_wl_set_size_limits(w, a, b, c, d); }
+}
+export fn window_plat_set_visible(w: Window*, on: bool) {
+  if (is_x11()) { window_x11_set_visible(w, on); return; }
+  if (is_wl()) { window_wl_set_visible(w, on); return; }
+  var ev: WindowEvent; ev.win = w; ev.kind = WINDOW_EV_HIDDEN; if (on) { ev.kind = WINDOW_EV_SHOWN; } window_push_event(&ev);
+}
+export fn window_plat_minimize(w: Window*) {
+  if (is_x11()) { window_x11_minimize(w); return; }
+  if (is_wl()) { window_wl_minimize(w); return; }
+  var ev: WindowEvent; ev.kind = WINDOW_EV_MINIMIZE; ev.win = w; window_push_event(&ev);
+}
+export fn window_plat_maximize(w: Window*) {
+  if (is_x11()) { window_x11_maximize(w); return; }
+  if (is_wl()) { window_wl_maximize(w); return; }
+  var ev: WindowEvent; ev.kind = WINDOW_EV_MAXIMIZE; ev.win = w; window_push_event(&ev);
+}
+export fn window_plat_restore(w: Window*) {
+  if (is_x11()) { window_x11_restore(w); return; }
+  if (is_wl()) { window_wl_restore(w); return; }
+  var ev: WindowEvent; ev.kind = WINDOW_EV_RESTORE; ev.win = w; window_push_event(&ev);
+}
+export fn window_plat_focus(w: Window*) {
+  if (is_x11()) { window_x11_focus(w); return; }
+  if (is_wl()) { window_wl_focus(w); return; }
+  var ev: WindowEvent; ev.kind = WINDOW_EV_FOCUS_IN; ev.win = w; window_push_event(&ev);
+}
+export fn window_plat_attention(w: Window*) { if (is_x11()) { window_x11_attention(w); } if (is_wl()) { window_wl_attention(w); } }
+export fn window_plat_set_fullscreen(w: Window*, mode: int32, monitor: int32) {
+  if (is_x11()) { window_x11_set_fullscreen(w, mode, monitor); return; }
+  if (is_wl()) { window_wl_set_fullscreen(w, mode, monitor); return; }
+  w->fullscreen = mode;
+}
+export fn window_plat_set_icon(w: Window*, rgba: uint8*, width: int32, height: int32) {
+  if (is_x11()) { window_x11_set_icon(w, rgba, width, height); }
+}
+export fn window_plat_blit(w: Window*, rgba: uint8*, width: int32, height: int32, stride: int32) -> bool {
+  if (is_x11()) { return window_x11_blit(w, rgba, width, height, stride); }
+  if (is_wl()) { return window_wl_blit(w, rgba, width, height, stride); }
+  return true;
+}
+export fn window_plat_native(w: Window*, out: WindowNative*) -> bool {
+  if (is_x11()) { return window_x11_native(w, out); }
+  if (is_wl()) { return window_wl_native(w, out); }
+  return false;
+}
+export fn window_plat_text_input(w: Window*, on: bool) { if (is_wl()) { window_wl_text_input(w, on); } }
+export fn window_plat_text_rect(w: Window*, x: int32, y: int32, width: int32, height: int32) { if (is_wl()) { window_wl_text_rect(w, x, y, width, height); } }
+export fn window_plat_warp(w: Window*, x: float64, y: float64) {
+  if (is_x11()) { window_x11_warp(w, x, y); return; }
+  if (is_wl()) { return; }
+  var ev: WindowEvent; ev.kind = WINDOW_EV_MOUSE_MOVE; ev.win = w; ev.x = x; ev.y = y; window_push_event(&ev);
+}
+export fn window_plat_set_cursor(w: Window*, shape: int32) { if (is_x11()) { window_x11_set_cursor(w, shape); } if (is_wl()) { window_wl_set_cursor(w, shape); } }
+export fn window_plat_set_cursor_image(w: Window*, rgba: uint8*, width: int32, height: int32, hx: int32, hy: int32) -> bool {
+  if (is_x11()) { return window_x11_set_cursor_image(w, rgba, width, height, hx, hy); }
+  if (is_wl()) { return window_wl_set_cursor_image(w, rgba, width, height, hx, hy); }
+  return true;
+}
+export fn window_plat_set_cursor_mode(w: Window*, mode: int32, old: int32) {
+  if (is_x11()) { window_x11_set_cursor_mode(w, mode, old); }
+  if (is_wl()) { window_wl_set_cursor_mode(w, mode, old); }
+}
+export fn window_plat_clipboard_set(w: Window*, s: uint8*, n: int64) {
+  if (is_x11()) { window_x11_clipboard_set(s, n); return; }
+  if (is_wl()) { window_wl_clipboard_set(s, n); return; }
+  window_hl_clipboard_set(s, n);
+}
+export fn window_plat_clipboard_get(w: Window*) -> string {
+  if (is_x11()) { return window_x11_clipboard_get(); }
+  if (is_wl()) { return window_wl_clipboard_get(); }
+  return window_hl_clipboard_get();
+}

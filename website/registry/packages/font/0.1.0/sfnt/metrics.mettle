@@ -1,0 +1,134 @@
+// Glyph and font metrics: hmtx, vmtx, scale factors and the name table.
+// Spec: OpenType hmtx, vmtx, hhea, OS/2 and name chapters.
+
+import "face";
+import "font/core/utf8";
+import "font/outline/glyf";
+
+/// Advance width of glyph g in font units.
+export fn font_advance(f: FontFace*, g: int32) -> int32 {
+  if (g < 0 || g >= f->num_glyphs) { return 0; }
+  var i: int32 = g;
+  if (i >= f->num_hmetrics) { i = f->num_hmetrics - 1; }
+  return (int32)font_u16(f, f->hmtx + (int64)i * 4);
+}
+
+/// Left side bearing of glyph g in font units.
+export fn font_lsb(f: FontFace*, g: int32) -> int32 {
+  if (g < 0 || g >= f->num_glyphs) { return 0; }
+  if (g < f->num_hmetrics) { return font_i16(f, f->hmtx + (int64)g * 4 + 2); }
+  var o: int64 = (int64)f->num_hmetrics * 4 + (int64)(g - f->num_hmetrics) * 2;
+  if (o + 2 > f->hmtx_len) { return 0; }
+  return font_i16(f, f->hmtx + o);
+}
+
+/// Vertical advance of glyph g in font units (ascent - descent without vmtx).
+export fn font_advance_v(f: FontFace*, g: int32) -> int32 {
+  if (f->num_vmetrics == 0 || g < 0 || g >= f->num_glyphs) { return f->ascent - f->descent; }
+  var i: int32 = g;
+  if (i >= f->num_vmetrics) { i = f->num_vmetrics - 1; }
+  return (int32)font_u16(f, f->vmtx + (int64)i * 4);
+}
+
+/// Scale that turns font units into pixels for a font size in pixels per em.
+export fn font_scale_em(f: FontFace*, px: float32) -> float32 {
+  return px / (float32)f->upem;
+}
+
+/// Scale that makes ascent - descent equal `px` pixels (the stb_truetype
+/// "pixel height" convention).
+export fn font_scale_height(f: FontFace*, px: float32) -> float32 {
+  var h: int32 = f->ascent - f->descent;
+  if (h <= 0) { h = f->upem; }
+  return px / (float32)h;
+}
+
+/// Line metrics a text layout should use, in font units: ascent (up,
+/// positive), descent (down, negative) and line gap. Uses the OS/2 typo
+/// values when the font asks for them, else hhea, as most systems do.
+export fn font_line_metrics(f: FontFace*, ascent: int32*, descent: int32*, gap: int32*) {
+  if (f->use_typo) {
+    *ascent = f->typo_ascent; *descent = f->typo_descent; *gap = f->typo_line_gap;
+    return;
+  }
+  *ascent = f->ascent; *descent = f->descent; *gap = f->line_gap;
+  if (*ascent == 0 && *descent == 0) {
+    *ascent = f->typo_ascent; *descent = f->typo_descent; *gap = f->typo_line_gap;
+  }
+}
+
+/// Glyph box from the glyf header in font units. False for empty glyphs and
+/// for CFF fonts (use font_glyph_box in outline for any font).
+export fn font_glyf_box(f: FontFace*, g: int32, x0: int32*, y0: int32*, x1: int32*, y1: int32*) -> bool {
+  *x0 = 0; *y0 = 0; *x1 = 0; *y1 = 0;
+  var ln: int64 = 0;
+  var o: int64 = font_glyf_range(f, g, &ln);
+  if (o == 0 || ln < 10) { return false; }
+  *x0 = font_i16(f, o + 2); *y0 = font_i16(f, o + 4);
+  *x1 = font_i16(f, o + 6); *y1 = font_i16(f, o + 8);
+  return true;
+}
+
+// Name IDs.
+export const FONT_NAME_FAMILY: int32 = 1;
+export const FONT_NAME_SUBFAMILY: int32 = 2;
+export const FONT_NAME_FULL: int32 = 4;
+export const FONT_NAME_POSTSCRIPT: int32 = 6;
+export const FONT_NAME_TYPO_FAMILY: int32 = 16;
+export const FONT_NAME_TYPO_SUBFAMILY: int32 = 17;
+
+/// Copies name `id` as UTF-8 into out (cap bytes, always nul-terminated when
+/// cap > 0). Prefers Windows English, then any Unicode record, then Mac
+/// Roman (ASCII part). Returns the byte length, or -1 when missing.
+export fn font_name(f: FontFace*, id: int32, out: uint8*, cap: int64) -> int64 {
+  if (f->name == 0 || cap <= 0) { return -1; }
+  var n: int64 = (int64)font_u16(f, f->name + 2);
+  var strs: int64 = f->name + (int64)font_u16(f, f->name + 4);
+  var best: int64 = -1;
+  var best_rank: int32 = 0;
+  var best_utf16: bool = false;
+  for i: int64 in 0..n {
+    var r: int64 = f->name + 6 + i * 12;
+    if (r + 12 > f->name + f->name_len) { break; }
+    if ((int32)font_u16(f, r + 6) != id) { continue; }
+    var pid: uint32 = font_u16(f, r);
+    var eid: uint32 = font_u16(f, r + 2);
+    var lang: uint32 = font_u16(f, r + 4);
+    var rank: int32 = 0;
+    var utf16: bool = false;
+    if (pid == 3 && (eid == 1 || eid == 10)) { rank = 3; utf16 = true; if (lang == 0x409) { rank = 4; } }
+    else if (pid == 0) { rank = 2; utf16 = true; }
+    else if (pid == 1 && eid == 0) { rank = 1; }
+    if (rank > best_rank) { best_rank = rank; best = r; best_utf16 = utf16; }
+  }
+  if (best < 0) { return -1; }
+  var ln: int64 = (int64)font_u16(f, best + 8);
+  var p: int64 = strs + (int64)font_u16(f, best + 10);
+  var w: int64 = 0;
+  var tmp: uint8[4];
+  var i: int64 = 0;
+  while (i < ln) {
+    var cp: uint32 = 0;
+    if (best_utf16) {
+      if (i + 2 > ln) { break; }
+      cp = font_u16(f, p + i);
+      i = i + 2;
+      if (cp >= 0xD800 && cp <= 0xDBFF && i + 2 <= ln) {
+        var lo: uint32 = font_u16(f, p + i);
+        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          i = i + 2;
+        }
+      }
+    } else {
+      cp = font_u8(f, p + i);
+      i = i + 1;
+      if (cp >= 0x80) { cp = 0xFFFD; }
+    }
+    var k: int32 = font_utf8_encode(cp, &tmp[0]);
+    if (w + (int64)k >= cap) { break; }
+    for j in 0..k { out[w] = tmp[j]; w = w + 1; }
+  }
+  out[w] = 0;
+  return w;
+}

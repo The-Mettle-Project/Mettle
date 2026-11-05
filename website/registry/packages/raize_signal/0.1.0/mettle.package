@@ -1,0 +1,9 @@
+name = raize_signal
+version = 0.1.0
+description = Raize Signals: server-rendered real-time views (html literals, diff render, signal.js client)
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeSignal
+compiler = 0.18.0
+require = raize_core 0.1.0
+require = raize_realtime 0.1.0
+require = raize_template 0.1.0

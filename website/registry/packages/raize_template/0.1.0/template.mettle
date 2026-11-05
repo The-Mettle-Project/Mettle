@@ -1,0 +1,467 @@
+// raize/template — load at startup, render per request.
+//
+// Phase choice, stated once: a template file is read and compiled **at
+// startup**, into memory the router owns for the life of the process. There is
+// no per-render file read. Three reasons, all specific to this codebase:
+//
+//   1. A request-time read can fail after the response has started; there is
+//      no exception to unwind with, so the handler would have to emit broken
+//      HTML or a late 500. Startup failure means the process refuses to serve
+//      (this is requirement 6).
+//   2. Mettle has no growing-buffer exception path. The file is read through a
+//      fixed 4 KiB chunk buffer and refused above RZ_TEMPLATE_MAX_BYTES
+//      (64 KiB); a template cannot exhaust the process.
+//   3. The compiled form is read-only. Every worker thread shares one
+//      RzTemplate pointer after startup, exactly like the router, so there is
+//      no lock in the render path.
+//
+// Render contract: render into a RzBuf and hand back one owned string.
+//   rz_template_render(t, vars)        -> owned string (free with
+//                                         rz_str_free) or a null view
+//   rz_template_render_into(t, vars, b)-> append to a caller buffer (the
+//                                         response body, for zero extra copy)
+// A failed render returns chars == 0, never a half-written buffer.
+//
+// A missing name renders empty. The variable map is the only source of values
+// at render time; the startup map (`decls`) is a *declaration* used for one
+// warning, not a fallback. See compile.mettle for the grammar and bounds.
+//
+// Creation: rz_template_new() returns a zeroed heap value. A caller-owned
+// stack RzTemplate must be zeroed with rz_template_init() before compiling.
+
+import "std/io";
+import "std/mem";
+import "raize_core/str/str";
+import "vars";
+import "escape";
+import "compile";
+
+export const RZ_TEMPLATE_MAX_PATH: int64 = 1024;
+export const RZ_TEMPLATE_CHUNK: int64 = 4096;
+
+export fn rz_template_new() -> RzTemplate* {
+  var t: RzTemplate* = (RzTemplate*)calloc(1, sizeof(RzTemplate));
+  return t;
+}
+
+export fn rz_template_free(t: RzTemplate*) {
+  if (t == 0) { return; }
+  rz_template_reset(t);
+  free((rawptr)t);
+}
+
+export fn rz_template_error(t: RzTemplate*) -> int32 {
+  if (t == 0) { return RZ_TPL_E_ARG; }
+  return t->error;
+}
+
+export fn rz_template_error_at(t: RzTemplate*) -> int64 {
+  if (t == 0) { return -1; }
+  return t->error_at;
+}
+
+export fn rz_template_src_len(t: RzTemplate*) -> int64 {
+  if (t == 0) { return 0; }
+  return t->src_len;
+}
+
+// One startup report, idempotent: the second call is a no-op. It lists every
+// referenced name that was absent from the declared default map. Those names
+// will render empty, so the report is the only signal that a route forgot to
+// wire a value.
+export fn rz_template_report_undeclared(t: RzTemplate*) {
+  if (t == 0 || t->reported) { return; }
+  t->reported = true;
+  var i: int32 = 0;
+  while (i < t->undef_count) {
+    var off: int64 = t->undef[i].off;
+    var len: int64 = t->undef[i].len;
+    var name: string = rz_str_view(&t->src[off], len);
+    print_err("raize/template: variable '");
+    print_err(name);
+    print_err("' is referenced with no default; it renders empty\n");
+    i = i + 1;
+  }
+}
+
+// Reads `path` (capped) and compiles it. Returns 0 or an RZ_TPL_* code; on
+// failure rz_template_ok(t) is false and the caller must not install a route.
+// A successful load also makes the one undeclared-variable report.
+export fn rz_template_load(t: RzTemplate*, path: string, decls: RzVarMap*) -> int32 {
+  if (t == 0) { return RZ_TPL_E_ARG; }
+  var plen: int64 = (int64)path.length;
+  if (plen <= 0 || plen >= RZ_TEMPLATE_MAX_PATH) {
+    rz_template_reset(t);
+    t->error = RZ_TPL_E_PATH;
+    return t->error;
+  }
+  var pbuf: uint8[1024];
+  var i: int64 = 0;
+  while (i < plen) {
+    pbuf[i] = path.chars[i];
+    i = i + 1;
+  }
+  pbuf[plen] = 0;
+  var fp: cstring = fopen((cstring)&pbuf[0], "rb");
+  if (fp == 0) {
+    rz_template_reset(t);
+    t->error = RZ_TPL_E_IO;
+    return t->error;
+  }
+  var buf: RzBuf* = rz_buf_new_cap(RZ_TEMPLATE_CHUNK);
+  if (buf == 0) {
+    fclose(fp);
+    rz_template_reset(t);
+    t->error = RZ_TPL_E_NOMEM;
+    return t->error;
+  }
+  var chunk: uint8[4096];
+  var total: int64 = 0;
+  while (true) {
+    var got: int64 = fread((cstring)&chunk[0], 1, RZ_TEMPLATE_CHUNK, fp);
+    if (got <= 0) { break; }
+    total = total + got;
+    if (total > RZ_TEMPLATE_MAX_BYTES) {
+      fclose(fp);
+      rz_buf_free(buf);
+      rz_template_reset(t);
+      t->error = RZ_TPL_E_SIZE;
+      return t->error;
+    }
+    rz_buf_add_bytes(buf, &chunk[0], got);
+  }
+  fclose(fp);
+  var rc: int32 = rz_template_compile(t, rz_buf_str(buf), decls);
+  rz_buf_free(buf);
+  if (rc == RZ_TPL_OK) {
+    rz_template_report_undeclared(t);
+  }
+  return rc;
+}
+
+// Compile an in-memory source (tests, generated pages). Does not report; the
+// caller can call rz_template_report_undeclared explicitly.
+export fn rz_template_from_string(t: RzTemplate*, src: string, decls: RzVarMap*) -> int32 {
+  return rz_template_compile(t, src, decls);
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+fn rz_render_ops(t: RzTemplate*, vars: RzVarMap*, out: RzBuf*, from: int64, to: int64) -> int32 {
+  var i: int64 = from;
+  while (i < to) {
+    var kind: int32 = t->ops[i].kind;
+    if (kind == RZ_OP_TEXT) {
+      rz_buf_add_bytes(out, &t->src[t->ops[i].a], t->ops[i].b);
+    } else if (kind == RZ_OP_VAR) {
+      var name: string = rz_str_view(&t->src[t->ops[i].name_off], t->ops[i].name_len);
+      var v: string = rz_vars_get(vars, name);
+      if (v.length != 0) { rz_html_escape(out, v); }
+    } else if (kind == RZ_OP_RAW) {
+      var rname: string = rz_str_view(&t->src[t->ops[i].name_off], t->ops[i].name_len);
+      var rv: string = rz_vars_get(vars, rname);
+      if (rv.length != 0) { rz_html_append_raw(out, rv); }
+    } else if (kind == RZ_OP_SECTION) {
+      var sname: string = rz_str_view(&t->src[t->ops[i].name_off], t->ops[i].name_len);
+      var sv: string = rz_vars_get(vars, sname);
+      var body_end: int64 = t->ops[i].b;
+      if (sv.length != 0) {
+        var rc: int32 = rz_render_ops(t, vars, out, t->ops[i].a, body_end);
+        if (rc != RZ_TPL_OK) { return rc; }
+      }
+      // The body is either rendered by the recursive call or skipped; either
+      // way the outer walk continues after it, never through it.
+      i = body_end;
+      continue;
+    }
+    i = i + 1;
+  }
+  return RZ_TPL_OK;
+}
+
+export fn rz_template_render_into(t: RzTemplate*, vars: RzVarMap*, out: RzBuf*) -> int32 {
+  if (t == 0 || out == 0) { return RZ_TPL_E_ARG; }
+  if (!rz_template_ok(t)) { return t->error; }
+  return rz_render_ops(t, vars, out, 0, (int64)t->op_count);
+}
+
+// Owned result: free exactly once with rz_str_free. A null view (chars==0)
+// means the template is not servable; length 0 with chars!=0 is a successful
+// empty render and is still safe to free.
+export fn rz_template_render(t: RzTemplate*, vars: RzVarMap*) -> string {
+  var failed: string;
+  failed.chars = 0;
+  failed.length = 0;
+  if (!rz_template_ok(t)) { return failed; }
+  var out: RzBuf* = rz_buf_new_cap(t->src_len + 32);
+  if (out == 0) { return failed; }
+  if (rz_template_render_into(t, vars, out) != RZ_TPL_OK) {
+    rz_buf_free(out);
+    return failed;
+  }
+  return rz_buf_take(out);
+}
+
+// ---------------------------------------------------------------------------
+// Tests — every one runs in the compile-time interpreter:
+//   ./mettle-build/bin/mettle test framework/template/template.mettle
+// ---------------------------------------------------------------------------
+
+fn tpl_decls(name: string) -> RzVarMap* {
+  var m: RzVarMap* = new RzVarMap;
+  rz_vars_init(m);
+  rz_vars_set(m, name, "");
+  return m;
+}
+
+@test fn t_rz_template_variable() -> int32 {
+  var t: RzTemplate* = rz_template_new();
+  if (t == 0) { return 1; }
+  var decls: RzVarMap* = tpl_decls("name");
+  if (rz_template_compile(t, "Hello {{{{name}}!", decls) != RZ_TPL_OK) {
+    rz_template_free(t); free((rawptr)decls); return 2;
+  }
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  if (rz_vars_set(&vars, "name", "world") != 0) {
+    rz_template_free(t); free((rawptr)decls); return 3;
+  }
+  var s: string = rz_template_render(t, &vars);
+  if (s.chars == 0) { rz_template_free(t); free((rawptr)decls); return 4; }
+  if (!rz_str_eq(s, "Hello world!")) {
+    rz_str_free(s); rz_template_free(t); free((rawptr)decls); return 5;
+  }
+  rz_str_free(s);
+  rz_template_free(t);
+  free((rawptr)decls);
+  return 0;
+}
+
+@test fn t_rz_template_escaping_table() -> int32 {
+  if (!rz_str_eq(rz_html_entity(38), "&amp;")) { return 1; }
+  if (!rz_str_eq(rz_html_entity(60), "&lt;")) { return 2; }
+  if (!rz_str_eq(rz_html_entity(62), "&gt;")) { return 3; }
+  if (!rz_str_eq(rz_html_entity(34), "&quot;")) { return 4; }
+  if (!rz_str_eq(rz_html_entity(39), "&#x27;")) { return 5; }
+  if (!rz_str_eq(rz_html_entity(47), "&#x2F;")) { return 6; }
+  if (rz_html_entity(65).length != 0) { return 7; }   // 'A' untouched
+  if (rz_html_entity(32).length != 0) { return 8; }   // space untouched
+  return 0;
+}
+
+@test fn t_rz_template_escape_and_raw() -> int32 {
+  var t: RzTemplate* = rz_template_new();
+  if (t == 0) { return 1; }
+  var decls: RzVarMap* = tpl_decls("v");
+  rz_vars_set(decls, "raw", "");
+  if (rz_template_compile(t, "{{{{v}}|{{{{{{raw}}}", decls) != RZ_TPL_OK) {
+    rz_template_free(t); free((rawptr)decls); return 2;
+  }
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  rz_vars_set(&vars, "v", "a<b>c&d\"e'f/g");
+  rz_vars_set(&vars, "raw", "<em>raw</em>");
+  var s: string = rz_template_render(t, &vars);
+  if (s.chars == 0) { rz_template_free(t); free((rawptr)decls); return 3; }
+  if (!rz_str_eq(s, "a&lt;b&gt;c&amp;d&quot;e&#x27;f&#x2F;g|<em>raw</em>")) {
+    rz_str_free(s); rz_template_free(t); free((rawptr)decls); return 4;
+  }
+  rz_str_free(s);
+  rz_template_free(t);
+  free((rawptr)decls);
+  return 0;
+}
+
+@test fn t_rz_template_comment() -> int32 {
+  var t: RzTemplate* = rz_template_new();
+  if (t == 0) { return 1; }
+  var decls: RzVarMap;
+  rz_vars_init(&decls);
+  if (rz_template_compile(t, "a{{# hidden {{{{name}} and {{{{#x}} #}b", &decls) != RZ_TPL_OK) {
+    rz_template_free(t); return 2;
+  }
+  if (t->undef_count != 0) { rz_template_free(t); return 3; }   // comments reference nothing
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  var s: string = rz_template_render(t, &vars);
+  if (!rz_str_eq(s, "ab")) { rz_str_free(s); rz_template_free(t); return 4; }
+  rz_str_free(s);
+  rz_template_free(t);
+  return 0;
+}
+
+@test fn t_rz_template_section_on_off() -> int32 {
+  var t: RzTemplate* = rz_template_new();
+  if (t == 0) { return 1; }
+  var decls: RzVarMap* = tpl_decls("show");
+  rz_vars_set(decls, "name", "");
+  if (rz_template_compile(t, "{{{{#show}}hi {{{{name}}{{{{/show}}", decls) != RZ_TPL_OK) {
+    rz_template_free(t); free((rawptr)decls); return 2;
+  }
+  var on: RzVarMap;
+  rz_vars_init(&on);
+  rz_vars_set(&on, "show", "1");
+  rz_vars_set(&on, "name", "ya");
+  var s1: string = rz_template_render(t, &on);
+  if (!rz_str_eq(s1, "hi ya")) {
+    rz_str_free(s1); rz_template_free(t); free((rawptr)decls); return 3;
+  }
+  rz_str_free(s1);
+
+  var off: RzVarMap;
+  rz_vars_init(&off);
+  rz_vars_set(&off, "show", "");
+  rz_vars_set(&off, "name", "ya");
+  var s2: string = rz_template_render(t, &off);
+  if (s2.chars == 0) { rz_template_free(t); free((rawptr)decls); return 4; }
+  if (s2.length != 0) { rz_str_free(s2); rz_template_free(t); free((rawptr)decls); return 5; }
+  rz_str_free(s2);
+
+  // a missing section name is false, not an error
+  var missing: RzVarMap;
+  rz_vars_init(&missing);
+  var s3: string = rz_template_render(t, &missing);
+  if (s3.length != 0) { rz_str_free(s3); rz_template_free(t); free((rawptr)decls); return 6; }
+  rz_str_free(s3);
+  rz_template_free(t);
+  free((rawptr)decls);
+  return 0;
+}
+
+@test fn t_rz_template_unknown_name() -> int32 {
+  var t: RzTemplate* = rz_template_new();
+  if (t == 0) { return 1; }
+  if (rz_template_compile(t, "[{{{{nope}}]", 0) != RZ_TPL_OK) { rz_template_free(t); return 2; }
+  if (t->undef_count != 1) { rz_template_free(t); return 3; }
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  var s: string = rz_template_render(t, &vars);
+  if (!rz_str_eq(s, "[]")) { rz_str_free(s); rz_template_free(t); return 4; }
+  rz_str_free(s);
+  // reported once, idempotent
+  if (t->reported) { rz_template_free(t); return 5; }
+  rz_template_report_undeclared(t);
+  if (!t->reported) { rz_template_free(t); return 6; }
+  rz_template_report_undeclared(t);
+  if (t->undef_count != 1) { rz_template_free(t); return 7; }
+  // declaring a default suppresses the startup warning
+  var decls: RzVarMap;
+  rz_vars_init(&decls);
+  rz_vars_set(&decls, "nope", "");
+  if (rz_template_compile(t, "[{{{{nope}}]", &decls) != RZ_TPL_OK) { rz_template_free(t); return 8; }
+  if (t->undef_count != 0) { rz_template_free(t); return 9; }
+  rz_template_free(t);
+  return 0;
+}
+
+@test fn t_rz_template_unclosed_tag_refused() -> int32 {
+  var t: RzTemplate* = rz_template_new();
+  if (t == 0) { return 1; }
+  var rc: int32 = rz_template_compile(t, "{{{{name", 0);
+  if (rc != RZ_TPL_E_TAG) { rz_template_free(t); return 2; }
+  if (rz_template_ok(t)) { rz_template_free(t); return 3; }
+  if (rz_template_error(t) != RZ_TPL_E_TAG) { rz_template_free(t); return 4; }
+  if (rz_template_error_at(t) != 0) { rz_template_free(t); return 5; }
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  var s: string = rz_template_render(t, &vars);
+  if (s.chars != 0) { rz_template_free(t); return 6; }   // refuses to emit broken HTML
+
+  if (rz_template_compile(t, "{{# never closed", 0) != RZ_TPL_E_COMMENT) { rz_template_free(t); return 7; }
+  if (rz_template_compile(t, "{{{{^inverted}}", 0) != RZ_TPL_E_DIRECTIVE) { rz_template_free(t); return 8; }
+  if (rz_template_compile(t, "{{{{a+b}}", 0) != RZ_TPL_E_NAME) { rz_template_free(t); return 9; }
+  if (rz_template_compile(t, "{{{{#a}}x", 0) != RZ_TPL_E_SECTION) { rz_template_free(t); return 10; }
+  if (rz_template_compile(t, "{{{{#a}}x{{{{/b}}", 0) != RZ_TPL_E_SECTION) { rz_template_free(t); return 11; }
+  if (rz_template_compile(t, "{{{{#a}}{{{{#b}}x{{{{/b}}{{{{/a}}", 0) != RZ_TPL_E_SECTION) { rz_template_free(t); return 12; }
+  if (rz_template_compile(t, "{{{{/a}}", 0) != RZ_TPL_E_SECTION) { rz_template_free(t); return 13; }
+  rz_template_free(t);
+  return 0;
+}
+
+@test fn t_rz_template_vars_limit() -> int32 {
+  var m: RzVarMap;
+  rz_vars_init(&m);
+  // Each name must live in its own bytes: RzVarMap borrows names, so reusing
+  // one scratch buffer would make every entry alias the last value written.
+  var nb: uint8[128];
+  var i: int32 = 0;
+  while (i < RZ_TEMPLATE_MAX_VARS) {
+    var at: int64 = (int64)i * 4;
+    nb[at] = 118;                      // 'v'
+    nb[at + 1] = (uint8)(48 + i % 10);
+    nb[at + 2] = (uint8)(48 + i / 10);
+    var nm: string = rz_str_view(&nb[at], 3);
+    if (rz_vars_set(&m, nm, "x") != 0) { return 10 + i; }
+    i = i + 1;
+  }
+  if (rz_vars_count(&m) != RZ_TEMPLATE_MAX_VARS) { return 1; }
+  if (rz_vars_set(&m, "v99", "x") != -2) { return 2; }    // bounded, never grown
+  if (rz_vars_set(&m, "", "x") != -1) { return 3; }
+  if (rz_vars_set(0, "a", "x") != -1) { return 4; }
+  if (!rz_vars_has(&m, "v00")) { return 5; }
+  if (rz_vars_get(&m, "absent").length != 0) { return 6; }
+  return 0;
+}
+
+@test fn t_rz_template_name_cap() -> int32 {
+  var t: RzTemplate* = rz_template_new();
+  if (t == 0) { return 1; }
+  // 32 distinct references compile; the 33rd is refused by the same capacity
+  // as RzVarMap, so a template can never silently reference a name the map
+  // could not hold.
+  var buf: uint8[256];
+  var n: int64 = 0;
+  var i: int32 = 0;
+  while (i < RZ_TEMPLATE_MAX_VARS) {
+    buf[n] = 123; buf[n + 1] = 123;                    // {{
+    buf[n + 2] = 118;                                  // v
+    buf[n + 3] = (uint8)(48 + i / 10);
+    buf[n + 4] = (uint8)(48 + i % 10);
+    buf[n + 5] = 125; buf[n + 6] = 125;                // }}
+    n = n + 7;
+    i = i + 1;
+  }
+  var decls: RzVarMap;
+  rz_vars_init(&decls);
+  if (rz_template_compile(t, rz_str_view(&buf[0], n), &decls) != RZ_TPL_OK) {
+    rz_template_free(t); return 2;
+  }
+  if (t->undef_count != RZ_TEMPLATE_MAX_VARS) { rz_template_free(t); return 3; }
+
+  buf[n] = 123; buf[n + 1] = 123;
+  buf[n + 2] = 118;
+  buf[n + 3] = 51; buf[n + 4] = 50;                    // "v32", the 33rd
+  buf[n + 5] = 125; buf[n + 6] = 125;
+  n = n + 7;
+  if (rz_template_compile(t, rz_str_view(&buf[0], n), &decls) != RZ_TPL_E_NAME) {
+    rz_template_free(t); return 4;
+  }
+  rz_template_free(t);
+  return 0;
+}
+
+@test fn t_rz_template_render_into_owned() -> int32 {
+  var t: RzTemplate* = rz_template_new();
+  if (t == 0) { return 1; }
+  var decls: RzVarMap;
+  rz_vars_init(&decls);
+  if (rz_template_compile(t, "a{{{{v}}b", &decls) != RZ_TPL_OK) { rz_template_free(t); return 2; }
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  rz_vars_set(&vars, "v", "X");
+  var out: RzBuf* = rz_buf_new_cap(8);
+  if (out == 0) { rz_template_free(t); return 3; }
+  if (rz_template_render_into(t, &vars, out) != RZ_TPL_OK) {
+    rz_buf_free(out); rz_template_free(t); return 4;
+  }
+  if (!rz_str_eq(rz_buf_str(out), "aXb")) {
+    rz_buf_free(out); rz_template_free(t); return 5;
+  }
+  var s: string = rz_buf_take(out);
+  if (!rz_str_eq(s, "aXb")) { rz_str_free(s); rz_template_free(t); return 6; }
+  rz_str_free(s);
+  rz_template_free(t);
+  return 0;
+}

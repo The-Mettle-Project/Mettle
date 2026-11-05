@@ -1,0 +1,128 @@
+// mythic_types: shared plain types + constants. CONTRACT (DECISIONS Appendix A and B), frozen:
+// additions need orchestrator approval and only append.
+import "mythic_base";
+
+// ---- Appendix A ----
+export struct MythicVec2 { x: float32; y: float32; }
+export struct MythicRect { x: float32; y: float32; w: float32; h: float32; }
+export struct MythicRectI { x: int32; y: int32; w: int32; h: int32; }
+export struct MythicInsets { l: float32; t: float32; r: float32; b: float32; }
+export struct MythicCorners { tl: float32; tr: float32; br: float32; bl: float32; }
+export struct MythicBytes { data: uint8*; len: int64; }
+export struct MythicFramebuffer { px: uint32*; w: int32; h: int32; stride: int32; }  // stride in pixels
+// colors everywhere: uint32 0xAARRGGBB, straight alpha
+
+export struct MythicShadow { dx: float32; dy: float32; blur: float32; spread: float32; color: uint32; }
+export struct MythicSize { mode: int32; value: float32; min: float32; max: float32; }
+export const MYTHIC_FIT: int32 = 0;  export const MYTHIC_GROW: int32 = 1;
+export const MYTHIC_FIXED: int32 = 2; export const MYTHIC_PERCENT: int32 = 3;
+export const MYTHIC_DIR_COLUMN: int32 = 0; export const MYTHIC_DIR_ROW: int32 = 1;
+export const MYTHIC_ALIGN_START: int32 = 0; export const MYTHIC_ALIGN_CENTER: int32 = 1; export const MYTHIC_ALIGN_END: int32 = 2;
+
+export struct MythicFloat { attach: int32; target: uint64; self_anchor: int32; target_anchor: int32;
+                          dx: float32; dy: float32; z: int32; flip_y: bool; passthrough: bool; clamp_margin: float32; }
+export const MYTHIC_ATTACH_NONE: int32 = 0; export const MYTHIC_ATTACH_PARENT: int32 = 1;
+export const MYTHIC_ATTACH_ELEMENT: int32 = 2; export const MYTHIC_ATTACH_WINDOW: int32 = 3;
+// anchors: 0 TL,1 T,2 TR,3 L,4 C,5 R,6 BL,7 B,8 BR
+
+export struct MythicBox {
+  id: uint64; dir: int32; width: MythicSize; height: MythicSize; pad: MythicInsets; gap: float32;
+  align_x: int32; align_y: int32;
+  bg: uint32; border_color: uint32; border_width: float32; radius: MythicCorners;
+  shadow: MythicShadow; shadow2: MythicShadow;
+  clip: bool; scroll_x: bool; scroll_y: bool; floating: MythicFloat;
+}
+
+export struct MythicTextStyle { font: int32; size: float32; line_height: float32; tracking: float32; flags: int32; }
+export const MYTHIC_TEXT_WRAP: int32 = 1; export const MYTHIC_TEXT_ELLIPSIS: int32 = 2; export const MYTHIC_TEXT_TABULAR: int32 = 4;
+export const MYTHIC_FONT_REGULAR: int32 = 0; export const MYTHIC_FONT_MEDIUM: int32 = 1;
+export const MYTHIC_FONT_SEMIBOLD: int32 = 2; export const MYTHIC_FONT_MONO: int32 = 3;
+
+// ---- display list (device px) ----
+export struct MythicCmd {           // 20 x 4 = 80 bytes, no padding; hashed as raw bytes; zero-init before fill
+  kind: int32; clip: int32;
+  x: float32; y: float32; w: float32; h: float32;
+  radii: MythicCorners;
+  color: uint32; color2: uint32;
+  a: float32; b: float32; c: float32; d: float32; e: float32;
+  res: int32; first: int32; count: int32;
+}
+// kind      | rect      | radii | color | color2 | a      | b          | c,d        | e  | res     | first,count
+// FILL   1  | shape     | yes   | fill  |        |        |            |            |    |         |
+// STROKE 2  | shape     | yes   | line  |        | width  |            |            |    |         |
+// SHADOW 3  | shape     | yes   | shadow|        | dx     | dy         | blur,spread|    |         |
+// GRAD   4  | shape     | yes   | c0    | c1     | x0     | y0         | x1,y1      |    |         |
+// GLYPHS 5  | bbox      |       | text  |        | size_px| darken 0/1 |            |    | font id | glyphs
+// IMAGE  6  | dest      | yes   | tint  |        | opacity| u0         | v0,u1      | v1 | image id|
+// PFILL  7  | bbox      |       | fill  |        |        |            |            |    |         | points
+// PSTROKE 8 | bbox      |       | line  |        | width  | draw_len(0=all) |       |    | 1=closed| points
+export const MYTHIC_CMD_FILL: int32 = 1; export const MYTHIC_CMD_STROKE: int32 = 2; export const MYTHIC_CMD_SHADOW: int32 = 3;
+export const MYTHIC_CMD_GRADIENT: int32 = 4; export const MYTHIC_CMD_GLYPHS: int32 = 5; export const MYTHIC_CMD_IMAGE: int32 = 6;
+export const MYTHIC_CMD_PATH_FILL: int32 = 7; export const MYTHIC_CMD_PATH_STROKE: int32 = 8;
+export struct MythicClip { x: float32; y: float32; w: float32; h: float32; radius: float32; }
+export struct MythicGlyphPos { glyph: int32; x: float32; y: float32; }   // absolute device px, y = baseline
+export struct MythicDrawList {      // owned by caller, reused across frames (clear keeps capacity)
+  cmds: MythicVec<MythicCmd>; clips: MythicVec<MythicClip>; clip_stack: MythicVec<int32>;
+  glyphs: MythicVec<MythicGlyphPos>; points: MythicVec<MythicVec2>; width: int32; height: int32;
+}
+
+// ---- Appendix B ----
+export struct MythicEvent {
+  kind: int32; x: float32; y: float32;          // pointer pos, device px
+  wheel_x: float32; wheel_y: float32;           // notches (+y = scroll up / away from user)
+  precise: bool;                                // true = pixel deltas (apply directly, no smoothing)
+  button: int32;                                // 1 left, 2 middle, 3 right
+  key: int32; mods: int32; repeat: bool;        // MYTHIC_KEY_*, MYTHIC_MOD_*
+  codepoint: uint32;                            // TEXT
+  width: int32; height: int32;                  // RESIZE (device px)
+  scale: float32;                               // SCALE
+  time_us: int64;
+}
+export const MYTHIC_EV_MOUSE_MOVE: int32 = 1;  export const MYTHIC_EV_MOUSE_DOWN: int32 = 2;
+export const MYTHIC_EV_MOUSE_UP: int32 = 3;    export const MYTHIC_EV_WHEEL: int32 = 4;
+export const MYTHIC_EV_KEY_DOWN: int32 = 5;    export const MYTHIC_EV_KEY_UP: int32 = 6;
+export const MYTHIC_EV_TEXT: int32 = 7;        export const MYTHIC_EV_RESIZE: int32 = 8;
+export const MYTHIC_EV_SCALE: int32 = 9;       export const MYTHIC_EV_FOCUS_IN: int32 = 10;
+export const MYTHIC_EV_FOCUS_OUT: int32 = 11;  export const MYTHIC_EV_MOUSE_LEAVE: int32 = 12;
+export const MYTHIC_EV_CLOSE: int32 = 13;      export const MYTHIC_EV_EXPOSE: int32 = 14;
+export const MYTHIC_MOD_SHIFT: int32 = 1; export const MYTHIC_MOD_CTRL: int32 = 2;
+export const MYTHIC_MOD_ALT: int32 = 4;   export const MYTHIC_MOD_SUPER: int32 = 8;
+// keys: letters/digits use ASCII uppercase ('A'=65..'Z', '0'=48..'9'); specials from 256:
+export const MYTHIC_KEY_TAB: int32 = 256;    export const MYTHIC_KEY_ENTER: int32 = 257;
+export const MYTHIC_KEY_ESCAPE: int32 = 258; export const MYTHIC_KEY_BACKSPACE: int32 = 259;
+export const MYTHIC_KEY_DELETE: int32 = 260; export const MYTHIC_KEY_LEFT: int32 = 261;
+export const MYTHIC_KEY_RIGHT: int32 = 262;  export const MYTHIC_KEY_UP: int32 = 263;
+export const MYTHIC_KEY_DOWN: int32 = 264;   export const MYTHIC_KEY_HOME: int32 = 265;
+export const MYTHIC_KEY_END: int32 = 266;    export const MYTHIC_KEY_PAGE_UP: int32 = 267;
+export const MYTHIC_KEY_PAGE_DOWN: int32 = 268; export const MYTHIC_KEY_INSERT: int32 = 269;
+export const MYTHIC_KEY_SPACE: int32 = 32;   export const MYTHIC_KEY_F1: int32 = 290;  // F1..F12 = 290..301
+export const MYTHIC_CURSOR_ARROW: int32 = 0; export const MYTHIC_CURSOR_IBEAM: int32 = 1;
+export const MYTHIC_CURSOR_HAND: int32 = 2;  export const MYTHIC_CURSOR_RESIZE_H: int32 = 3;
+export const MYTHIC_CURSOR_RESIZE_V: int32 = 4; export const MYTHIC_CURSOR_MOVE: int32 = 5;
+export const MYTHIC_CURSOR_NOT_ALLOWED: int32 = 6; export const MYTHIC_CURSOR_WAIT: int32 = 7;
+
+export struct MythicWindowDesc { title: uint8*; title_len: int64; width: int32; height: int32;  // logical px
+                               min_width: int32; min_height: int32; resizable: bool; }
+export struct MythicPlatform {
+  self: rawptr;
+  open: fn(rawptr, MythicWindowDesc*) -> int32;        // 0 ok; else error printed to stderr
+  close: fn(rawptr) -> void;
+  wait: fn(rawptr, int32) -> void;                   // timeout ms; -1 forever; 0 poll
+  next_event: fn(rawptr, MythicEvent*) -> bool;
+  framebuffer: fn(rawptr) -> MythicFramebuffer;        // may block on previous present; contents retained
+  present: fn(rawptr, MythicRectI*, int32) -> void;    // n=0 => full
+  now_us: fn(rawptr) -> int64;
+  set_title: fn(rawptr, uint8*, int64) -> void;      // platform copies
+  set_cursor: fn(rawptr, int32) -> void;
+  clipboard_set: fn(rawptr, uint8*, int64) -> void;  // platform copies
+  clipboard_get: fn(rawptr, MythicBytes*) -> bool;     // malloc'd; caller frees data
+  getenv: fn(rawptr, uint8*, int64, MythicBytes*) -> bool;  // malloc'd value
+  refresh: fn(rawptr) -> void;                       // set by app; may be 0
+  refresh_ud: rawptr;
+}
+// constructors:
+//   export fn mythic_plat_native_create() -> MythicPlatform*                    (x11 / win32 file)
+//   export fn mythic_plat_headless_create(w: int32, h: int32, scale: float32) -> MythicPlatform*
+//   export fn mythic_headless_push(p: MythicPlatform*, ev: MythicEvent)
+//   export fn mythic_headless_advance_us(p: MythicPlatform*, us: int64)
+//   export fn mythic_headless_cursor(p: MythicPlatform*) -> int32

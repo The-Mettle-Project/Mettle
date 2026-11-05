@@ -1,0 +1,124 @@
+// Pieces of TLS 1.2 (RFC 5246, 5288, 7627, 7905, 8422) that client and
+// server share: master secret, key block, Finished, and signatures.
+
+import "std/mem";
+import "cryptex/core/util";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+import "mtls/crypto/aead";
+import "mtls/crypto/sig";
+import "mtls/tls/consts";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+
+/// mtls12_master: the master secret from c->pms. With the extended master
+/// secret it covers the session hash (the transcript so far).
+export fn mtls12_master(c: MtlsConn*) {
+  if (c->ems) {
+    var sh: uint8[64];
+    mtls_th_hash(c, &sh[0]);
+    mtls_prf12(c->suite.hash, &c->pms[0], c->pmslen, "extended master secret", &sh[0], mtls_hlen(c), &c->ms12[0], 48);
+  } else {
+    var seed: uint8[64];
+    memcpy(&seed[0], &c->crand[0], 32);
+    memcpy(&seed[32], &c->srand[0], 32);
+    mtls_prf12(c->suite.hash, &c->pms[0], c->pmslen, "master secret", &seed[0], 64, &c->ms12[0], 48);
+  }
+  cr_wipe(&c->pms[0], 48);
+  c->pmslen = 0;
+}
+
+fn mtls12_iv_len(c: MtlsConn*) -> int64 {
+  if (c->suite.aead == MTLS_AEAD_CHACHA20) { return 12; }
+  return 4;
+}
+
+/// mtls12_key_block: expands the master secret into c->kb.
+export fn mtls12_key_block(c: MtlsConn*) {
+  var seed: uint8[64];
+  memcpy(&seed[0], &c->srand[0], 32);
+  memcpy(&seed[32], &c->crand[0], 32);
+  var kl: int64 = (int64)mtls_aead_key_len(c->suite.aead);
+  mtls_prf12(c->suite.hash, &c->ms12[0], 48, "key expansion", &seed[0], 64, &c->kb[0], 2 * kl + 2 * mtls12_iv_len(c));
+}
+
+/// mtls12_set_dir: turns on protection for one direction from the key
+/// block: `client` picks the client-write half.
+export fn mtls12_set_dir(c: MtlsConn*, d: MtlsDir*, client: bool) -> int32 {
+  var kl: int64 = (int64)mtls_aead_key_len(c->suite.aead);
+  var il: int64 = mtls12_iv_len(c);
+  var key: uint8* = &c->kb[0];
+  var iv: uint8* = &c->kb[2 * kl];
+  if (!client) {
+    key = &c->kb[kl];
+    iv = &c->kb[2 * kl + il];
+  }
+  return mtls_dir_set12(d, &c->suite, key, iv);
+}
+
+/// mtls12_finished: verify_data for "client finished" or "server finished".
+export fn mtls12_finished(c: MtlsConn*, client: bool, out: uint8*) {
+  var h: uint8[64];
+  mtls_th_hash(c, &h[0]);
+  var label: string = "server finished";
+  if (client) { label = "client finished"; }
+  mtls_prf12(c->suite.hash, &c->ms12[0], 48, label, &h[0], mtls_hlen(c), out, 12);
+}
+
+/// mtls12_send_finished: our Finished message.
+export fn mtls12_send_finished(c: MtlsConn*) -> int32 {
+  var w: MtlsWr = mtls_hs_begin(c, MTLS_HS_FINISHED);
+  var v: uint8[12];
+  mtls12_finished(c, c->is_client, &v[0]);
+  mtls_wr_bytes(&w, &v[0], 12);
+  return mtls_hs_end(c, &w);
+}
+
+/// mtls12_check_finished: the peer's Finished.
+export fn mtls12_check_finished(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  if (n != 16) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  var v: uint8[12];
+  mtls12_finished(c, !c->is_client, &v[0]);
+  if (!cr_equal(&v[0], msg + 4, 12)) { return mtls_fail(c, MTLS_E_VERIFY, MTLS_ALERT_DECRYPT_ERROR); }
+  mtls_th_add(c, msg, n);
+  return MTLS_OK;
+}
+
+/// mtls12_scheme_fits: whether a signature scheme suits a key kind in
+/// TLS 1.2, where ECDSA schemes are not tied to one curve.
+export fn mtls12_scheme_fits(scheme: int32, kind: int32) -> bool {
+  var want: int32 = mtls_scheme_key(scheme);
+  if (want == MTLS_KEY_P256 || want == MTLS_KEY_P384) {
+    return kind == MTLS_KEY_P256 || kind == MTLS_KEY_P384;
+  }
+  return want != MTLS_KEY_NONE && want == kind;
+}
+
+/// mtls12_auth_fits: whether a key kind can serve a suite's auth family.
+export fn mtls12_auth_fits(auth: int32, kind: int32) -> bool {
+  if (auth == MTLS_AUTH_RSA) { return kind == MTLS_KEY_RSA; }
+  return kind == MTLS_KEY_ED25519 || kind == MTLS_KEY_P256 || kind == MTLS_KEY_P384;
+}
+
+/// mtls12_verify: checks a peer signature in TLS 1.2.
+export fn mtls12_verify(c: MtlsConn*, scheme: int32, msg: uint8*, n: int64, sig: uint8*, slen: int64) -> int32 {
+  if (!mtls_config_has_sig(c->cfg, scheme) || !mtls12_scheme_fits(scheme, c->peer_key.kind)) {
+    return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER);
+  }
+  var rc: int32 = mtls_verify_raw(&c->peer_key, mtls_scheme_hash(scheme), mtls_scheme_pad(scheme), msg, n, sig, slen);
+  if (rc != MTLS_OK) { return mtls_fail(c, MTLS_E_VERIFY, MTLS_ALERT_DECRYPT_ERROR); }
+  return MTLS_OK;
+}
+
+/// mtls12_write_cert: our Certificate in TLS 1.2 form.
+export fn mtls12_send_cert(c: MtlsConn*, send_chain: bool) -> int32 {
+  var w: MtlsWr = mtls_hs_begin(c, MTLS_HS_CERTIFICATE);
+  if (send_chain) {
+    mtls_write_cert_list(c, &w, false);
+    c->sent_cert = true;
+  } else {
+    mtls_wr_u24(&w, 0);
+  }
+  return mtls_hs_end(c, &w);
+}

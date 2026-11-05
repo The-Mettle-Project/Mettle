@@ -1,0 +1,237 @@
+// AES-128-GCM and AES-256-GCM (NIST SP 800-38D) with a 96-bit IV, in pure
+// Mettle and constant time: bitsliced AES with no lookup tables (aes.mettle)
+// and GHASH from masked 64-bit multiplications (ghash.mettle), both ported
+// from BearSSL. On an x86-64 CPU with AES-NI, PCLMULQDQ and SSSE3 (checked
+// once, in cr_aes_gcm_init) the same GCM runs on the hardware instructions
+// instead (aes_hw_x86_64.mettle, also ported from BearSSL); the output is
+// identical and neither path has a secret-dependent branch or address.
+//
+// The IV (a CrNonce12) must be unique per key: GCM is catastrophically
+// broken by reusing a key and IV pair, so never encrypt two messages with the
+// same pair, and with random IVs stop well before 2^32 messages per key.
+// A message is limited to 2^36 - 32 bytes. Decryption fails closed: the tag
+// is checked before any plaintext is produced.
+
+import "cryptex/core/status";
+import "cryptex/core/types";
+import "cryptex/core/util";
+import "cryptex/cipher/aes";
+import "cryptex/cipher/ghash";
+import "cryptex/cipher/aes_hw_x86_64" if x86_64;
+import "cryptex/cipher/aes_hw_aarch64" if aarch64;
+
+/// CrAesGcm: An AES-128-GCM or AES-256-GCM key, ready for cr_aes_gcm_*: the expanded AES round keys (bitsliced, and for AES-NI when the CPU has it) and the GHASH key. Initialize it once with cr_aes_gcm_init and use it for any number of messages.
+/// in: - (zeroed when declared: `var x: CrAesGcm;`; a zeroed context is not initialized and every use returns CR_E_ARG)
+/// returns: -
+/// owns: secret: wipe with cr_aes_gcm_wipe(&ctx) when done
+/// thread: any thread (no shared state)
+/// example: var ctx: CrAesGcm; cr_aes_gcm_init(&ctx, &key[0], 32); defer cr_aes_gcm_wipe(&ctx);
+export struct CrAesGcm {
+  skey: uint64[120];
+  h: uint8[16];
+  rounds: uint32;
+  ready: uint32;
+  hw: uint32;
+  rk: uint8[240];
+}
+
+// Largest message: 2^36 - 32 bytes (SP 800-38D: 2^32 - 2 counter blocks).
+const CR_AES_GCM_MAX_MSG: int64 = 68719476704;
+// Largest associated data: 2^61 - 1 bytes (its length in bits fits 64 bits).
+const CR_AES_GCM_MAX_AD: int64 = 2305843009213693951;
+const CR_AES_GCM_TAG_BYTES: int64 = 16;
+
+var g_cr_aes_gcm_empty: uint8[1];
+
+fn cr_aes_gcm_ptr(p: uint8*, n: int64) -> uint8* {
+  if (p == 0 || n == 0) { return &g_cr_aes_gcm_empty[0]; }
+  return p;
+}
+
+// The tag of (ad, ct) under the IV: GHASH_H(A || pad || C || pad || [len(A)]64
+// || [len(C)]64) xor AES_K(J0), with J0 = IV || 0x00000001. All lengths are
+// public; ct is the ciphertext whichever direction the caller is going.
+fn cr_aes_gcm_tag(tag: uint8*, ctx: CrAesGcm*, iv: uint8*, ad: uint8*, adlen: int64, ct: uint8*, clen: int64) {
+  var y: uint8[16];
+  var lens: uint8[16];
+  var i: int32 = 0;
+  while (i < 16) {
+    y[i] = 0;
+    i = i + 1;
+  }
+  crx_st64be(&lens[0], (uint64)adlen << 3);
+  crx_st64be(&lens[8], (uint64)clen << 3);
+  if (ctx->hw == 1) {
+    crx_ghash_hw(&y[0], &ctx->h[0], ad, adlen);
+    crx_ghash_hw(&y[0], &ctx->h[0], ct, clen);
+    crx_ghash_hw(&y[0], &ctx->h[0], &lens[0], 16);
+    crx_aes_hw_ctr_xor(&ctx->rk[0], ctx->rounds, iv, 1, &y[0], tag, 16);
+  } else {
+    crx_ghash_ctmul64(&y[0], &ctx->h[0], ad, adlen);
+    crx_ghash_ctmul64(&y[0], &ctx->h[0], ct, clen);
+    crx_ghash_ctmul64(&y[0], &ctx->h[0], &lens[0], 16);
+    crx_aes_ctr_xor(&ctx->skey[0], ctx->rounds, iv, 1, tag, &y[0], 16);
+  }
+  cr_wipe(&y[0], 16);
+  cr_wipe(&lens[0], 16);
+}
+
+/// Prepares an AES-128-GCM or AES-256-GCM key: expands the AES round keys
+/// and derives the GHASH key H = AES_K(0^128). The key is not kept in its
+/// original form. Any previous contents of ctx are replaced.
+/// in: ctx; key readable for keylen bytes; keylen, 16 (AES-128) or 32
+///   (AES-256)
+/// returns: CR_OK; CR_E_ARG (null ctx or key, keylen other than 16 or 32;
+///   ctx is then left zeroed and not initialized)
+/// owns: ctx is secret caller memory: cr_aes_gcm_wipe(&ctx) when done; the
+///   caller also wipes its copy of the key
+/// thread: any thread (no shared state)
+/// example: var ctx: CrAesGcm; if (cr_aes_gcm_init(&ctx, &key[0], 16) != CR_OK) { return 1; }
+export fn cr_aes_gcm_init(ctx: CrAesGcm*, key: uint8*, keylen: int64) -> int32 {
+  if (ctx == 0) { return CR_E_ARG; }
+  cr_aes_gcm_wipe(ctx);
+  if (key == 0) { return CR_E_ARG; }
+  if (keylen != 16 && keylen != 32) { return CR_E_ARG; }
+  var comp: uint64[30];
+  var zero: uint8[16];
+  var i: int32 = 0;
+  while (i < 30) {
+    comp[i] = 0;
+    i = i + 1;
+  }
+  i = 0;
+  while (i < 16) {
+    zero[i] = 0;
+    i = i + 1;
+  }
+  var rounds: uint32 = crx_aes_keysched(&comp[0], key, keylen);
+  crx_aes_skey_expand(&ctx->skey[0], rounds, &comp[0]);
+  ctx->rounds = rounds;
+  crx_aes_encrypt_block(&ctx->skey[0], rounds, &ctx->h[0], &zero[0]);
+  cr_wipe((uint8*)&comp[0], 240);
+  ctx->hw = crx_aes_hw_available();
+  if (ctx->hw == 1) {
+    crx_aes_hw_expand(&ctx->rk[0], key, keylen);
+  }
+  ctx->ready = 1;
+  return CR_OK;
+}
+
+/// Encrypts and authenticates msg, and authenticates (does not encrypt) ad,
+/// with AES-GCM (NIST SP 800-38D, 96-bit IV). Output is ciphertext || 16-byte
+/// tag. Never use the same key with the same nonce twice.
+/// in: ctx initialized with cr_aes_gcm_init; ct writable for ct_cap bytes,
+///   ct_cap >= mlen + 16 (ct may equal msg for in-place encryption; no other
+///   overlap); ct_len, where the ciphertext length goes; msg/mlen the
+///   plaintext (mlen <= 68719476704, 2^36 - 32); ad/adlen associated data
+///   (0, 0 for none); nonce, 12 bytes, unique per key
+/// returns: CR_OK and *ct_len = mlen + 16; CR_E_ARG (null pointer with a
+///   non-zero length, negative length, mlen above 68719476704, ctx not
+///   initialized, null ctx/nonce/ct_len); CR_E_SPACE if ct_cap is too small
+///   (nothing written, *ct_len = 0)
+/// owns: nothing; the caller owns every buffer and must wipe the plaintext
+///   when done
+/// thread: any thread (no shared state)
+/// example: cr_aes_gcm_encrypt(&ctx, &ct[0], 64, &clen, m.chars, (int64)m.length, 0, 0, &nonce);
+export fn cr_aes_gcm_encrypt(ctx: CrAesGcm*, ct: uint8*, ct_cap: int64, ct_len: int64*, msg: uint8*, mlen: int64, ad: uint8*, adlen: int64, nonce: CrNonce12*) -> int32 {
+  if (ct_len == 0) { return CR_E_ARG; }
+  *ct_len = 0;
+  if (ctx == 0 || ct == 0 || nonce == 0) { return CR_E_ARG; }
+  if (ctx->ready != 1) { return CR_E_ARG; }
+  if (mlen < 0 || adlen < 0 || ct_cap < 0) { return CR_E_ARG; }
+  if (mlen > CR_AES_GCM_MAX_MSG || adlen > CR_AES_GCM_MAX_AD) { return CR_E_ARG; }
+  if ((msg == 0 && mlen > 0) || (ad == 0 && adlen > 0)) { return CR_E_ARG; }
+  if (ct_cap - CR_AES_GCM_TAG_BYTES < mlen) { return CR_E_SPACE; }
+  // Counter blocks start at inc32(J0) = IV || 0x00000002.
+  if (ctx->hw == 1) {
+    crx_aes_hw_ctr_xor(&ctx->rk[0], ctx->rounds, &nonce->b[0], 2, cr_aes_gcm_ptr(msg, mlen), ct, mlen);
+  } else {
+    crx_aes_ctr_xor(&ctx->skey[0], ctx->rounds, &nonce->b[0], 2, ct, cr_aes_gcm_ptr(msg, mlen), mlen);
+  }
+  cr_aes_gcm_tag(&ct[mlen], ctx, &nonce->b[0], cr_aes_gcm_ptr(ad, adlen), adlen, ct, mlen);
+  *ct_len = mlen + CR_AES_GCM_TAG_BYTES;
+  return CR_OK;
+}
+
+/// Verifies and decrypts ct (ciphertext || tag) produced by
+/// cr_aes_gcm_encrypt with the same key, nonce and ad. The tag is checked
+/// (in constant time) before anything is decrypted. Fails closed.
+/// in: ctx initialized with cr_aes_gcm_init; pt writable for pt_cap bytes,
+///   pt_cap >= clen - 16 (pt may equal ct for in-place decryption); pt_len;
+///   ct/clen (clen - 16 <= 68719476704); ad/adlen; nonce
+/// returns: CR_OK and *pt_len = clen - 16; CR_E_VERIFY if the tag does not
+///   match (wrong key, nonce or ad, tampered or truncated ciphertext,
+///   clen < 16); CR_E_ARG (including ctx not initialized and a message above
+///   68719476704 bytes); CR_E_SPACE. On every failure *pt_len = 0 and the
+///   first pt_cap bytes of pt are wiped (cr_wipe), so no unauthenticated
+///   plaintext ever reaches the caller (when decrypting in place, pt == ct,
+///   that also wipes the ciphertext)
+/// owns: nothing; the caller owns every buffer and must wipe the plaintext
+///   when done
+/// thread: any thread (no shared state)
+/// example: if (cr_aes_gcm_decrypt(&ctx, &pt[0], 64, &plen, &ct[0], clen, 0, 0, &nonce) != CR_OK) { reject(); }
+export fn cr_aes_gcm_decrypt(ctx: CrAesGcm*, pt: uint8*, pt_cap: int64, pt_len: int64*, ct: uint8*, clen: int64, ad: uint8*, adlen: int64, nonce: CrNonce12*) -> int32 {
+  if (pt_len == 0) { return CR_E_ARG; }
+  *pt_len = 0;
+  if (pt == 0 || pt_cap < 0) { return CR_E_ARG; }
+  if (ctx == 0 || ct == 0 || nonce == 0 || clen < 0 || adlen < 0 || (ad == 0 && adlen > 0)) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_ARG;
+  }
+  if (ctx->ready != 1 || adlen > CR_AES_GCM_MAX_AD) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_ARG;
+  }
+  if (clen < CR_AES_GCM_TAG_BYTES) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_VERIFY;
+  }
+  if (clen - CR_AES_GCM_TAG_BYTES > CR_AES_GCM_MAX_MSG) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_ARG;
+  }
+  if (pt_cap < clen - CR_AES_GCM_TAG_BYTES) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_SPACE;
+  }
+  var mlen: int64 = clen - CR_AES_GCM_TAG_BYTES;
+  var tag: uint8[16];
+  cr_aes_gcm_tag(&tag[0], ctx, &nonce->b[0], cr_aes_gcm_ptr(ad, adlen), adlen, ct, mlen);
+  var ok: bool = cr_equal(&tag[0], &ct[mlen], 16);
+  cr_wipe(&tag[0], 16);
+  if (!ok) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_VERIFY;
+  }
+  if (ctx->hw == 1) {
+    crx_aes_hw_ctr_xor(&ctx->rk[0], ctx->rounds, &nonce->b[0], 2, ct, pt, mlen);
+  } else {
+    crx_aes_ctr_xor(&ctx->skey[0], ctx->rounds, &nonce->b[0], 2, pt, ct, mlen);
+  }
+  *pt_len = mlen;
+  return CR_OK;
+}
+
+/// Erases a CrAesGcm (both forms of the round keys and the GHASH key) and marks it uninitialized.
+/// Call it when the key is no longer needed.
+/// in: ctx, may be null (nothing happens)
+/// returns: -
+/// owns: nothing; the caller still owns ctx
+/// thread: any thread (no shared state)
+/// example: defer cr_aes_gcm_wipe(&ctx);
+export fn cr_aes_gcm_wipe(ctx: CrAesGcm*) {
+  if (ctx == 0) { return; }
+  cr_wipe((uint8*)&ctx->skey[0], 960);
+  cr_wipe(&ctx->rk[0], 240);
+  cr_wipe(&ctx->h[0], 16);
+  ctx->rounds = 0;
+  ctx->ready = 0;
+  ctx->hw = 0;
+}
+
+/// internal: makes ctx use the portable constant-time code even on a CPU with AES-NI; for tests that compare the two paths.
+/// in: ctx initialized with cr_aes_gcm_init, may be null (nothing happens)
+export fn crx_aes_gcm_force_portable(ctx: CrAesGcm*) {
+  if (ctx == 0) { return; }
+  ctx->hw = 0;
+}

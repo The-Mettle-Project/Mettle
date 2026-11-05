@@ -1,0 +1,414 @@
+// flux_orm/adapter/adapter.mettle — the driver bridge contract.
+//
+// An adapter is a vtable of plain function pointers, not a trait and not an
+// import cycle. The ORM never imports MeoDB; it holds an RcAdapter and calls
+// through it. That is also why there is exactly one place to add a second
+// store later.
+//
+// Two things in this file are load-bearing:
+//
+// 1. exec() materialises rows. It does not hand back a live cursor. MeoDB's
+//    cursors pin pager frames; a cursor that escapes into application code
+//    can exhaust the frame table and turn every later alloc into
+//    MEO_ERR_BUSY. Materialising at the adapter boundary is the only
+//    way the ORM can promise it never holds a pin across user code. Result
+//    sets are therefore owned, and freed with rc_result_free.
+//
+// 2. Arguments are RcValue, positionally bound. Placeholders are `?`. The
+//    query builder emits them; the adapter never sees a literal value inside
+//    statement text.
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "stmt";
+
+// Mettle has no async and no exceptions. Every call returns an RC_* code and
+// writes results through out-parameters.
+//
+// Transaction modes for rc_adapter_begin. DEFAULT is the store's own default;
+// DEFERRED and IMMEDIATE follow SQLite (take the write lock on the first write,
+// or at begin).
+export const RC_TX_DEFAULT: int32 = 0;
+export const RC_TX_DEFERRED: int32 = 1;
+export const RC_TX_IMMEDIATE: int32 = 2; // single-writer stores (MeoDB)
+
+// One result row: `values` is an owned array of `n` owned cells, column order.
+export struct RcRow { values: RcValue*; n: int32; }
+
+// A materialised result set. It owns its rows and every cell in them; free it
+// with rc_result_free. An exec that returns no rows leaves rows 0, n_rows 0.
+export struct RcResult {
+  rows: RcRow*;     // n_rows owned rows, or 0
+  n_rows: int32;    // rows returned
+  n_cols: int32;    // cells per row
+  affected: int32;  // rows changed by an INSERT/UPDATE/DELETE
+  last_id: int64;   // assigned auto key, 0 when the statement assigned none
+}
+
+// A driver as a vtable. Every slot takes `ud` first and returns an RC_* code;
+// a 0 slot is a capability the driver lacks (the rc_adapter_* wrappers return
+// RC_ERR_UNSUPPORTED for it). The driver allocates ud; free it with that
+// driver's own free function (rc_mem_free for the mem adapter).
+export struct RcAdapter {
+  name: string;                                        // driver name, "mem"
+  ud: rawptr;                                          // driver handle
+  open: fn(rawptr, string) -> int32 with alloc, syscall;               // (ud, dsn) -> RC_*
+  close: fn(rawptr) -> int32 with alloc, syscall;                      // (ud) close the store
+  // (ud, sql, argv, n_args, out): run SQL text, materialise rows into out
+  exec: fn(rawptr, string, RcValue*, int32, RcResult*) -> int32 with alloc, syscall;
+  begin: fn(rawptr, int32) -> int32 with alloc, syscall;               // (ud, RC_TX_*)
+  commit: fn(rawptr) -> int32 with alloc, syscall;                     // (ud) commit the tx
+  rollback: fn(rawptr) -> int32 with alloc, syscall;                   // (ud) roll back the tx
+  ping: fn(rawptr) -> int32 with alloc, syscall;                       // (ud) liveness check
+  // (ud, stmt, out): typed stores; 0 = text only
+  query: fn(rawptr, RcStmt*, RcResult*) -> int32 with alloc, syscall;
+}
+
+// A vtable with no capabilities: name "none", ud 0, every slot 0. Every
+// rc_adapter_* wrapper below answers RC_ERR_UNSUPPORTED for it, which is how a
+// phase-gated feature behaves before the driver implements it.
+// Returns the adapter by value; it owns nothing and needs no free.
+//
+// @noinline is required, not stylistic: on head 8f14c612, `--release` folds a
+// *local* aggregate whose function-pointer fields are 0 and then fails to lower
+// the indirect call ("call_indirect_unsupported"). Building it behind an
+// opaque call keeps the optimizer from seeing the null. Debug is unaffected,
+// which is exactly why release is in the test matrix.
+@noinline export fn rc_adapter_empty() -> RcAdapter {
+  var a: RcAdapter;
+  a.name = "none";
+  a.ud = 0;
+  a.open = 0;
+  a.close = 0;
+  a.exec = 0;
+  a.begin = 0;
+  a.commit = 0;
+  a.rollback = 0;
+  a.ping = 0;
+  a.query = 0;
+  return a;
+}
+
+// --- results -----------------------------------------------------------------
+
+// Sets r to the empty result: no rows, affected 0, last_id 0.
+//   r   the result; may be 0 (then nothing happens)
+// It does not free: calling it on a result that holds rows leaks them, so use
+// rc_result_free for that.
+export fn rc_result_init(r: RcResult*) {
+  if (r == 0) { return; }
+  r.rows = 0;
+  r.n_rows = 0;
+  r.n_cols = 0;
+  r.affected = 0;
+  r.last_id = 0;
+}
+
+// Gives r n_rows rows of n_cols cells, every cell RcNull. For adapters that
+// fill a result in place.
+//   r       the result; reset first with rc_result_init, so it must not hold
+//           rows (they would leak)
+//   n_rows  rows; 0 or less gives an empty result
+//   n_cols  cells per row; 0 or less gives an empty result
+// Returns RC_OK. RC_ERR_USAGE when r is 0. RC_ERR_NOMEM when an allocation
+// fails; r is then empty and safe to free. Free it with rc_result_free.
+export fn rc_result_alloc(r: RcResult*, n_rows: int32, n_cols: int32) -> int32 {
+  if (r == 0) { return RC_ERR_USAGE; }
+  rc_result_init(r);
+  if (n_rows <= 0 || n_cols <= 0) { return RC_OK; }
+  var rows: RcRow* = malloc((int64)n_rows * (int64)sizeof(RcRow));
+  if (rows == 0) { return RC_ERR_NOMEM; }
+  r.rows = rows;
+  r.n_rows = n_rows;
+  r.n_cols = n_cols;
+  var i: int32 = 0;
+  while (i < n_rows) {
+    rows[i].values = malloc((int64)n_cols * (int64)sizeof(RcValue));
+    if (rows[i].values == 0) {
+      // Free what was already built; leave the result empty and freeable.
+      var k: int32 = 0;
+      while (k < i) {
+        free(rows[k].values);
+        rows[k].values = 0;
+        k = k + 1;
+      }
+      free(rows);
+      r.rows = 0;
+      r.n_rows = 0;
+      r.n_cols = 0;
+      return RC_ERR_NOMEM;
+    }
+    rows[i].n = n_cols;
+    var j: int32 = 0;
+    while (j < n_cols) {
+      rows[i].values[j] = RcNull;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+// Releases every cell (rc_value_release), frees the rows and resets r to the
+// empty result.
+//   r   the result; may be 0. Safe to call twice.
+// Any view taken with rc_result_borrow or rc_result_text is invalid after.
+export fn rc_result_free(r: RcResult*) {
+  if (r == 0) { return; }
+  if (r.rows != 0) {
+    var i: int32 = 0;
+    while (i < r.n_rows) {
+      if (r.rows[i].values != 0) {
+        var j: int32 = 0;
+        while (j < r.rows[i].n) {
+          rc_value_release(r.rows[i].values[j]);
+          j = j + 1;
+        }
+        free(r.rows[i].values);
+      }
+      i = i + 1;
+    }
+    free(r.rows);
+  }
+  rc_result_init(r);
+}
+
+// Deep-copies a flat row-major value array into `out`. Used by adapters whose
+// source buffers are shorter-lived than the result (and by the test double).
+//   out       the result; reset first, so it must not hold rows
+//   src       n_rows * n_cols cells, row-major; borrowed, every text and blob
+//             is cloned
+//   n_rows    rows; with n_cols, 0 or less copies no cells
+//   n_cols    cells per row
+//   affected  stored in out.affected
+//   last_id   stored in out.last_id
+// Returns RC_OK; out then owns the copies (free with rc_result_free).
+// RC_ERR_USAGE when out is 0. RC_ERR_NOMEM when an allocation fails, or
+// RC_ERR_CAST for a cell with an unknown arm; out is then freed and empty.
+export fn rc_result_copy(out: RcResult*, src: RcValue*, n_rows: int32,
+                         n_cols: int32, affected: int32, last_id: int64) -> int32 {
+  if (n_rows > 0 && n_cols > 0 && src == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_result_alloc(out, n_rows, n_cols);
+  if (rc != RC_OK) { return rc; }
+  out.affected = affected;
+  out.last_id = last_id;
+  var i: int32 = 0;
+  while (i < n_rows) {
+    var j: int32 = 0;
+    while (j < n_cols) {
+      var v: RcValue = RcNull;
+      rc = rc_value_clone(src[i * n_cols + j], &v);
+      if (rc != RC_OK) {
+        rc_result_free(out);
+        return rc;
+      }
+      out.rows[i].values[j] = v;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+// Copies one cell out of a result.
+//   r     the result
+//   row   0-based row
+//   col   0-based column
+//   out   receives an owned clone; release it with rc_value_release
+// Returns RC_OK. RC_ERR_USAGE when r or out is 0, row or col is out of range,
+// or the row has no cells. RC_ERR_NOMEM when cloning text or a blob fails.
+export fn rc_result_get(r: RcResult*, row: int32, col: int32,
+                        out: RcValue*) -> int32 {
+  if (r == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (row < 0 || row >= r.n_rows) { return RC_ERR_USAGE; }
+  if (col < 0 || col >= r.n_cols) { return RC_ERR_USAGE; }
+  if (r.rows == 0 || r.rows[row].values == 0) { return RC_ERR_USAGE; }
+  return rc_value_clone(r.rows[row].values[col], out);
+}
+
+// One cell, borrowed, no clone. The returned text/blob is valid exactly as
+// long as the result is; do not pass it to rc_value_release. This is what a
+// model loader uses to adopt a cell without a copy, and why the result must
+// outlive the model.
+//   r     the result
+//   row   0-based row
+//   col   0-based column
+// Returns the cell, or RcNull when r is 0, row or col is out of range, or the
+// row has no cells (indistinguishable from a NULL cell; check the bounds first
+// if that matters).
+export fn rc_result_borrow(r: RcResult*, row: int32, col: int32) -> RcValue {
+  if (r == 0) { return RcNull; }
+  if (row < 0 || row >= r.n_rows) { return RcNull; }
+  if (col < 0 || col >= r.n_cols) { return RcNull; }
+  if (r.rows == 0 || r.rows[row].values == 0) { return RcNull; }
+  return r.rows[row].values[col];
+}
+
+// Reads a text cell without copying it.
+//   r     the result
+//   row   0-based row
+//   col   0-based column
+//   out   receives a borrowed view, valid until rc_result_free
+// Returns RC_OK. RC_ERR_USAGE when r or out is 0, or row or col is out of
+// range. RC_ERR_CAST when the cell is not RcText (RcNull included).
+export fn rc_result_text(r: RcResult*, row: int32, col: int32,
+                         out: string*) -> int32 {
+  if (r == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (row < 0 || row >= r.n_rows) { return RC_ERR_USAGE; }
+  if (col < 0 || col >= r.n_cols) { return RC_ERR_USAGE; }
+  if (r.rows == 0 || r.rows[row].values == 0) { return RC_ERR_USAGE; }
+  return rc_value_as_text(r.rows[row].values[col], out);
+}
+
+// Reads an integer cell.
+//   r     the result
+//   row   0-based row
+//   col   0-based column
+//   out   receives the value; RcInt and RcTime as is, RcBool as 0 or 1,
+//         RcUint when it fits
+// Returns RC_OK. RC_ERR_USAGE when r or out is 0, or row or col is out of
+// range. RC_ERR_RANGE for an RcUint above int64 max. RC_ERR_CAST for any other
+// arm (RcNull included).
+export fn rc_result_i64(r: RcResult*, row: int32, col: int32,
+                        out: int64*) -> int32 {
+  if (r == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (row < 0 || row >= r.n_rows) { return RC_ERR_USAGE; }
+  if (col < 0 || col >= r.n_cols) { return RC_ERR_USAGE; }
+  if (r.rows == 0 || r.rows[row].values == 0) { return RC_ERR_USAGE; }
+  return rc_value_as_i64(r.rows[row].values[col], out);
+}
+
+// --- guarded calls -----------------------------------------------------------
+// Every vtable entry is optional in principle; a phase-gated capability is a
+// zero pointer, and the wrapper turns that into RC_ERR_UNSUPPORTED instead of a
+// call through null. The vtable is a boundary, so it is checked.
+
+// Opens the store through the driver's `open` slot.
+//   a     the adapter; borrowed
+//   dsn   the driver's connection string; borrowed for the call
+// Returns the driver's code (RC_OK on success). RC_ERR_USAGE when a is 0.
+// RC_ERR_UNSUPPORTED when the driver has no `open` slot.
+export fn rc_adapter_open(a: RcAdapter*, dsn: string) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  if (a.open == 0) { return RC_ERR_UNSUPPORTED; }
+  return a.open(a.ud, dsn);
+}
+
+// Closes the store through the driver's `close` slot. It does not free the
+// adapter; the driver's free function does.
+//   a     the adapter; borrowed
+// Returns the driver's code (RC_OK on success). RC_ERR_USAGE when a is 0.
+// RC_ERR_UNSUPPORTED when the driver has no `close` slot.
+export fn rc_adapter_close(a: RcAdapter*) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  if (a.close == 0) { return RC_ERR_UNSUPPORTED; }
+  return a.close(a.ud);
+}
+
+// Runs one SQL statement with positional `?` arguments through the driver's
+// `exec` slot. Rows are materialised into out; no cursor escapes.
+//   a       the adapter; borrowed
+//   sql     the statement text; borrowed for the call
+//   args    n_args values, bound in order; borrowed, may be 0 when n_args is 0
+//   n_args  number of values, 0 or more
+//   out     reset to empty first (not freed, so it must not hold rows); on
+//           RC_OK the caller owns it and frees it with rc_result_free
+// Returns the driver's code (RC_OK on success). RC_ERR_USAGE when a or out is
+// 0, n_args < 0, or args is 0 with n_args > 0. RC_ERR_UNSUPPORTED when the
+// driver has no `exec` slot.
+export fn rc_adapter_exec(a: RcAdapter*, sql: string, args: RcValue*,
+                          n_args: int32, out: RcResult*) -> int32 {
+  if (a == 0 || out == 0) { return RC_ERR_USAGE; }
+  rc_result_init(out);
+  if (a.exec == 0) { return RC_ERR_UNSUPPORTED; }
+  if (n_args < 0) { return RC_ERR_USAGE; }
+  if (n_args > 0 && args == 0) { return RC_ERR_USAGE; }
+  return a.exec(a.ud, sql, args, n_args, out);
+}
+
+// Starts a transaction through the driver's `begin` slot.
+//   a      the adapter; borrowed
+//   mode   RC_TX_DEFAULT, RC_TX_DEFERRED or RC_TX_IMMEDIATE (the driver checks)
+// Returns the driver's code (RC_OK on success; RC_ERR_TX is the usual answer
+// to a nested begin). RC_ERR_USAGE when a is 0. RC_ERR_UNSUPPORTED when the
+// driver has no `begin` slot.
+export fn rc_adapter_begin(a: RcAdapter*, mode: int32) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  if (a.begin == 0) { return RC_ERR_UNSUPPORTED; }
+  return a.begin(a.ud, mode);
+}
+
+// Commits the open transaction through the driver's `commit` slot.
+//   a     the adapter; borrowed
+// Returns the driver's code (RC_OK on success; RC_ERR_TX is the usual answer
+// when no transaction is open). RC_ERR_USAGE when a is 0. RC_ERR_UNSUPPORTED
+// when the driver has no `commit` slot.
+export fn rc_adapter_commit(a: RcAdapter*) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  if (a.commit == 0) { return RC_ERR_UNSUPPORTED; }
+  return a.commit(a.ud);
+}
+
+// Rolls back the open transaction through the driver's `rollback` slot.
+//   a     the adapter; borrowed
+// Returns the driver's code (RC_OK on success; RC_ERR_TX is the usual answer
+// when no transaction is open). RC_ERR_USAGE when a is 0. RC_ERR_UNSUPPORTED
+// when the driver has no `rollback` slot.
+export fn rc_adapter_rollback(a: RcAdapter*) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  if (a.rollback == 0) { return RC_ERR_UNSUPPORTED; }
+  return a.rollback(a.ud);
+}
+
+// Checks that the store answers, through the driver's `ping` slot.
+//   a     the adapter; borrowed
+// Returns the driver's code (RC_OK when it answers; RC_ERR_CLOSED is the usual
+// answer before open). RC_ERR_USAGE when a is 0. RC_ERR_UNSUPPORTED when the
+// driver has no `ping` slot.
+export fn rc_adapter_ping(a: RcAdapter*) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  if (a.ping == 0) { return RC_ERR_UNSUPPORTED; }
+  return a.ping(a.ud);
+}
+
+// Runs a statement as data (an RcStmt) through the driver's `query` slot.
+//   a     the adapter; borrowed
+//   st    the statement, with st->args / st->n_args set; borrowed for the call
+//   out   reset to empty first (not freed, so it must not hold rows); on
+//         RC_OK the caller owns it and frees it with rc_result_free
+// Returns the driver's code (RC_OK on success). RC_ERR_USAGE when a, st or out
+// is 0, st->n_args < 0, or st->args is 0 with st->n_args > 0.
+// RC_ERR_UNSUPPORTED when the driver has no `query` slot.
+export fn rc_adapter_query(a: RcAdapter*, st: RcStmt*, out: RcResult*) -> int32 {
+  if (a == 0 || st == 0 || out == 0) { return RC_ERR_USAGE; }
+  rc_result_init(out);
+  if (a.query == 0) { return RC_ERR_UNSUPPORTED; }
+  if (st->n_args < 0) { return RC_ERR_USAGE; }
+  if (st->n_args > 0 && st->args == 0) { return RC_ERR_USAGE; }
+  return a.query(a.ud, st, out);
+}
+
+// Runs one statement whichever way the adapter takes it: the RcStmt through
+// rc_adapter_query when it has a `query` slot and st is not 0, the SQL text
+// through rc_adapter_exec otherwise. rc_query_exec calls this.
+//   a       the adapter; borrowed
+//   sql     the statement text; borrowed for the call
+//   st      the same statement as data, or 0; its args and n_args are
+//           overwritten with the two below
+//   args    n_args values, the argv of both forms; borrowed
+//   n_args  number of values
+//   out     as for rc_adapter_exec; free it with rc_result_free
+// Returns what rc_adapter_query or rc_adapter_exec returns. RC_ERR_USAGE when
+// a or out is 0.
+export fn rc_adapter_run(a: RcAdapter*, sql: string, st: RcStmt*, args: RcValue*,
+                         n_args: int32, out: RcResult*) -> int32 {
+  if (a == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (a.query != 0 && st != 0) {
+    st->args = args;
+    st->n_args = n_args;
+    return rc_adapter_query(a, st, out);
+  }
+  return rc_adapter_exec(a, sql, args, n_args, out);
+}

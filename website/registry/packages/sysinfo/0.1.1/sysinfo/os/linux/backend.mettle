@@ -1,0 +1,104 @@
+// The Linux backend: every Linux detail sits below this file. It exports
+// the sysinfo_os_* entry points the public API calls.
+import "std/mem";
+import "std/process";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+import "system.mettle";
+import "cpu.mettle";
+import "mem.mettle";
+import "disk.mettle";
+import "net.mettle";
+import "proc.mettle";
+import "sensors.mettle";
+import "gpu.mettle";
+import "battery.mettle";
+
+struct SysinfoLx {
+  ctx: SysinfoLxCtx;
+  ready: uint32;            // sections set up
+  sys: SysinfoLxSystem;
+  cpu: SysinfoLxCpu;
+  mem: SysinfoLxMem;
+  disk: SysinfoLxDisk;
+  net: SysinfoLxNet;
+  proc: SysinfoLxProc;
+  sensors: SysinfoLxSensors;
+  gpu: SysinfoLxGpu;
+  bat: SysinfoLxBattery;
+}
+
+fn sysinfo_lx_of(s: Sysinfo*) -> SysinfoLx* { return (SysinfoLx*)s->os; }
+
+// Sets up the sections in `what` that are not set up yet.
+fn sysinfo_lx_setup(s: Sysinfo*, x: SysinfoLx*, what: uint32) -> int32 {
+  var todo: uint32 = what & ~x->ready;
+  var c: SysinfoLxCtx* = &x->ctx;
+  var status: int32 = SYSINFO_OK;
+  var r: int32 = SYSINFO_OK;
+  if ((todo & (uint32)SYSINFO_SYSTEM) != (uint32)0) { r = sysinfo_lx_system_init(&x->sys, c, &s->system); if (r != 0) { status = r; } }
+  if ((todo & (uint32)SYSINFO_CPU) != (uint32)0) { r = sysinfo_lx_cpu_init(&x->cpu, c, &s->cpu); if (r != 0) { status = r; } }
+  if ((todo & (uint32)SYSINFO_MEM) != (uint32)0) { r = sysinfo_lx_mem_init(&x->mem, c, &s->mem); if (r != 0) { status = r; } }
+  if ((todo & (uint32)SYSINFO_DISK) != (uint32)0) { r = sysinfo_lx_disk_init(&x->disk, c, &s->disk); if (r != 0) { status = r; } }
+  if ((todo & (uint32)SYSINFO_NET) != (uint32)0) { r = sysinfo_lx_net_init(&x->net, c, &s->net); if (r != 0) { status = r; } }
+  if ((todo & (uint32)SYSINFO_PROC) != (uint32)0) { r = sysinfo_lx_proc_init(&x->proc, c, &s->procs, what); if (r != 0) { status = r; } }
+  if ((todo & (uint32)SYSINFO_SENSORS) != (uint32)0) { r = sysinfo_lx_sensors_init(&x->sensors, c, &s->sensors); if (r != 0) { status = r; } }
+  if ((todo & (uint32)SYSINFO_GPU) != (uint32)0) { r = sysinfo_lx_gpu_init(&x->gpu, c, &s->gpus, what); if (r != 0) { status = r; } }
+  if ((todo & (uint32)SYSINFO_BATTERY) != (uint32)0) { r = sysinfo_lx_battery_init(&x->bat, c, &s->power); if (r != 0) { status = r; } }
+  if ((x->ready & (uint32)SYSINFO_PROC) != (uint32)0) { sysinfo_lx_proc_extras(&x->proc, what); }
+  if ((x->ready & (uint32)SYSINFO_GPU) != (uint32)0 && c->live && (what & (uint32)SYSINFO_GPU_NVSMI) != (uint32)0) { x->gpu.nvsmi = true; }
+  x->ready = x->ready | (what & (uint32)SYSINFO_ALL);
+  return status;
+}
+
+export fn sysinfo_os_open(s: Sysinfo*, what: uint32, root: string) -> int32 {
+  var x: SysinfoLx* = new SysinfoLx;
+  if (x == 0) { return SYSINFO_E_NOMEM; }
+  s->os = (uint8*)x;
+  sysinfo_lx_ctx_init(&x->ctx, root);
+  sysinfo_lx_setup(s, x, what);
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_os_refresh(s: Sysinfo*, what: uint32) -> int32 {
+  var x: SysinfoLx* = sysinfo_lx_of(s);
+  var status: int32 = sysinfo_lx_setup(s, x, what);
+  var c: SysinfoLxCtx* = &x->ctx;
+  var r: int32 = SYSINFO_OK;
+  if ((what & (uint32)SYSINFO_SYSTEM) != (uint32)0) { r = sysinfo_lx_system_refresh(&x->sys, c, &s->system); if (r != 0) { status = r; } }
+  if ((what & (uint32)SYSINFO_CPU) != (uint32)0) { r = sysinfo_lx_cpu_refresh(&x->cpu, c, &s->cpu); if (r != 0) { status = r; } }
+  if ((what & (uint32)SYSINFO_MEM) != (uint32)0) { r = sysinfo_lx_mem_refresh(&x->mem, c, &s->mem); if (r != 0) { status = r; } }
+  if ((what & (uint32)SYSINFO_DISK) != (uint32)0) { r = sysinfo_lx_disk_refresh(&x->disk, c, &s->disk); if (r != 0) { status = r; } }
+  if ((what & (uint32)SYSINFO_NET) != (uint32)0) { r = sysinfo_lx_net_refresh(&x->net, c, &s->net); if (r != 0) { status = r; } }
+  if ((what & (uint32)SYSINFO_PROC) != (uint32)0) { r = sysinfo_lx_proc_refresh(&x->proc, c, &s->procs); if (r != 0) { status = r; } }
+  if ((what & (uint32)SYSINFO_SENSORS) != (uint32)0) { r = sysinfo_lx_sensors_refresh(&x->sensors, c, &s->sensors); if (r != 0) { status = r; } }
+  if ((what & (uint32)SYSINFO_GPU) != (uint32)0) { r = sysinfo_lx_gpu_refresh(&x->gpu, c, &s->gpus); if (r != 0) { status = r; } }
+  if ((what & (uint32)SYSINFO_BATTERY) != (uint32)0) { r = sysinfo_lx_battery_refresh(&x->bat, c, &s->power); if (r != 0) { status = r; } }
+  return status;
+}
+
+export fn sysinfo_os_close(s: Sysinfo*) {
+  var x: SysinfoLx* = sysinfo_lx_of(s);
+  if (x == 0) { return; }
+  if ((x->ready & (uint32)SYSINFO_SYSTEM) != (uint32)0) { sysinfo_lx_system_free(&x->sys); }
+  if ((x->ready & (uint32)SYSINFO_CPU) != (uint32)0) { sysinfo_lx_cpu_free(&x->cpu, &s->cpu); }
+  if ((x->ready & (uint32)SYSINFO_MEM) != (uint32)0) { sysinfo_lx_mem_free(&x->mem); }
+  if ((x->ready & (uint32)SYSINFO_DISK) != (uint32)0) { sysinfo_lx_disk_free(&x->disk, &s->disk); }
+  if ((x->ready & (uint32)SYSINFO_NET) != (uint32)0) { sysinfo_lx_net_free(&x->net, &s->net); }
+  if ((x->ready & (uint32)SYSINFO_PROC) != (uint32)0) { sysinfo_lx_proc_free(&x->proc, &s->procs); }
+  if ((x->ready & (uint32)SYSINFO_SENSORS) != (uint32)0) { sysinfo_lx_sensors_free(&x->sensors, &s->sensors); }
+  if ((x->ready & (uint32)SYSINFO_GPU) != (uint32)0) { sysinfo_lx_gpu_free(&x->gpu, &s->gpus); }
+  if ((x->ready & (uint32)SYSINFO_BATTERY) != (uint32)0) { sysinfo_lx_battery_free(&x->bat, &s->power); }
+  sysinfo_lx_ctx_free(&x->ctx);
+  free(x);
+  s->os = (uint8*)0;
+}
+
+export fn sysinfo_os_signal(pid: int64, sig: int32) -> int32 {
+  var r: int64 = proc_kill(pid, sig);
+  if (r == 0) { return SYSINFO_OK; }
+  if (r == -3) { return SYSINFO_E_NOTFOUND; }   // ESRCH
+  if (r == -1) { return SYSINFO_E_PERM; }       // EPERM
+  return SYSINFO_E_INVALID;
+}

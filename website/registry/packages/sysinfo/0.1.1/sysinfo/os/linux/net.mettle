@@ -1,0 +1,420 @@
+// Network: counters from /proc/net/dev, link details from
+// /sys/class/net/<if>/ (address, mtu, flags, operstate, speed), addresses
+// from an rtnetlink RTM_GETADDR dump (rtnetlink(7)), and socket counts from
+// /proc/net/sockstat and sockstat6. IPv6 text follows RFC 5952.
+import "std/mem";
+import "std/time";
+import "std/linux_sys";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+import "disk.mettle";
+
+struct SysinfoLxIfPrev {
+  key: uint64;
+  index: int32;
+  v: int64[8];              // rx bytes packets errs drops, tx the same
+}
+
+// One address from netlink.
+struct SysinfoLxRawAddr {
+  index: int32;
+  family: int32;            // 4 or 6
+  prefix: int32;
+  b: uint8[16];
+}
+
+export struct SysinfoLxNet {
+  pools: SysinfoLxPools;
+  fd_dev: int64;
+  fd_sock: int64;
+  fd_sock6: int64;
+  nl_fd: int64;             // netlink socket, -1 when unavailable
+  nl_seq: int32;
+  if_cap: int32;
+  prev: SysinfoLxIfPrev*;
+  n_prev: int32;
+  prev_cap: int32;
+  next: SysinfoLxIfPrev*;
+  next_cap: int32;
+  raw: SysinfoLxRawAddr*;
+  n_raw: int32;
+  raw_cap: int32;
+  addrs: SysinfoAddr*;
+  addr_cap: int32;
+  prev_ns: int64;
+}
+
+// ---- address text ----------------------------------------------------------
+
+fn sysinfo_lx_put(out: uint8*, n: int64, s: string) -> int64 {
+  var k: int64 = n;
+  for i in 0..s.length { out[k] = (uint8)s[i]; k = k + 1; }
+  return k;
+}
+
+// Dotted-quad text for 4 bytes. Returns the length (at most 15).
+export fn sysinfo_lx_fmt_ipv4(b: uint8*, out: uint8*) -> int64 {
+  var n: int64 = 0;
+  for k in 0..4 {
+    if (k > 0) { out[n] = (uint8)46; n = n + 1; }
+    n = n + sysinfo_lx_fmt_i64(out + n, (int64)b[k]);
+  }
+  return n;
+}
+
+// RFC 5952 text for 16 bytes: lower-case hex, no leading zeros, the longest
+// run of two or more zero groups (the first when tied) written as "::",
+// and IPv4-mapped addresses as ::ffff:a.b.c.d. Returns the length (<= 45).
+export fn sysinfo_lx_fmt_ipv6(b: uint8*, out: uint8*) -> int64 {
+  var g: int32[8];
+  for k in 0..8 { g[k] = (int32)b[2 * k] * 256 + (int32)b[2 * k + 1]; }
+  var best: int32 = -1;
+  var best_len: int32 = 0;
+  var k: int32 = 0;
+  while (k < 8) {
+    if (g[k] == 0) {
+      var j: int32 = k;
+      while (j < 8 && g[j] == 0) { j = j + 1; }
+      if (j - k > best_len) { best = k; best_len = j - k; }
+      k = j;
+    } else {
+      k = k + 1;
+    }
+  }
+  if (best_len < 2) { best = -1; }
+  var n: int64 = 0;
+  // ::ffff:a.b.c.d
+  if (best == 0 && best_len == 5 && g[5] == 65535) {
+    n = sysinfo_lx_put(out, 0, "::ffff:");
+    return n + sysinfo_lx_fmt_ipv4(b + 12, out + n);
+  }
+  var hex: string = "0123456789abcdef";
+  k = 0;
+  while (k < 8) {
+    if (k == best) {
+      out[n] = (uint8)58; out[n + 1] = (uint8)58; n = n + 2;
+      k = k + best_len;
+      continue;
+    }
+    if (k > 0 && (best < 0 || k != best + best_len)) { out[n] = (uint8)58; n = n + 1; }
+    var v: int32 = g[k];
+    var started: bool = false;
+    var sh: int32 = 12;
+    while (sh >= 0) {
+      var d: int32 = (v >> sh) & 15;
+      if (d != 0 || started || sh == 0) { out[n] = (uint8)hex[d]; n = n + 1; started = true; }
+      sh = sh - 4;
+    }
+    k = k + 1;
+  }
+  return n;
+}
+
+// "aa:bb:..." is kept as the kernel writes it; all-zero (no address) gives "".
+fn sysinfo_lx_mac_blank(m: string) -> bool {
+  for k in 0..m.length { if (m[k] != '0' && m[k] != ':') { return false; } }
+  return true;
+}
+
+// ---- netlink ---------------------------------------------------------------
+
+fn sysinfo_lx_u16(p: uint8*) -> int32 { return (int32)*((uint16*)p); }
+fn sysinfo_lx_u32(p: uint8*) -> int64 { return (int64)*((uint32*)p); }
+
+fn sysinfo_lx_raw_add(st: SysinfoLxNet*) -> SysinfoLxRawAddr* {
+  var cap: int32 = st->raw_cap;
+  st->raw = (SysinfoLxRawAddr*)sysinfo_lx_grow((uint8*)st->raw, &cap, st->n_raw + 1, sizeof(SysinfoLxRawAddr));
+  st->raw_cap = cap;
+  var r: SysinfoLxRawAddr* = &st->raw[st->n_raw];
+  st->n_raw = st->n_raw + 1;
+  return r;
+}
+
+// Parses one batch of netlink messages from an RTM_GETADDR dump into
+// st->raw. Returns 1 when the dump is over (NLMSG_DONE or an error), else 0.
+export fn sysinfo_lx_nl_parse(st: SysinfoLxNet*, p: uint8*, n: int64) -> int32 {
+  var off: int64 = 0;
+  while (off + 16 <= n) {
+    var len: int64 = sysinfo_lx_u32(p + off);
+    var typ: int32 = sysinfo_lx_u16(p + off + 4);
+    if (len < 16 || off + len > n) { return 1; }
+    if (typ == 3 || typ == 2) { return 1; }          // NLMSG_DONE, NLMSG_ERROR
+    if (typ == 20 && len >= 24) {                    // RTM_NEWADDR
+      var m: uint8* = p + off + 16;                  // struct ifaddrmsg
+      var fam: int32 = (int32)m[0];
+      var prefix: int32 = (int32)m[1];
+      var index: int32 = (int32)sysinfo_lx_u32(m + 4);
+      var want: int32 = 0;
+      if (fam == 2) { want = 4; }                    // AF_INET
+      if (fam == 10) { want = 16; }                  // AF_INET6
+      var a: int64 = 8;
+      var got_local: bool = false;
+      var slot: SysinfoLxRawAddr* = (SysinfoLxRawAddr*)0;
+      while (want > 0 && a + 4 <= len - 16) {
+        var alen: int32 = sysinfo_lx_u16(m + a);
+        var atyp: int32 = sysinfo_lx_u16(m + a + 2);
+        if (alen < 4 || a + (int64)alen > len - 16) { break; }
+        // IFA_LOCAL (2) is the interface's own address on point-to-point
+        // links; IFA_ADDRESS (1) otherwise.
+        if ((atyp == 1 && !got_local) || atyp == 2) {
+          if (alen - 4 >= want) {
+            if (slot == 0) { slot = sysinfo_lx_raw_add(st); }
+            slot->index = index;
+            slot->family = 4;
+            if (want == 16) { slot->family = 6; }
+            slot->prefix = prefix;
+            memcpy(&slot->b[0], m + a + 4, (int64)want);
+            if (atyp == 2) { got_local = true; }
+          }
+        }
+        a = a + (((int64)alen + 3) & ~(int64)3);
+      }
+    }
+    off = off + ((len + 3) & ~(int64)3);
+  }
+  return 0;
+}
+
+fn sysinfo_lx_nl_dump(st: SysinfoLxNet*, c: SysinfoLxCtx*) {
+  st->n_raw = 0;
+  if (st->nl_fd < 0) { return; }
+  var req: uint8[24];
+  memset(&req[0], 0, 24);
+  *((uint32*)&req[0]) = (uint32)24;
+  *((uint16*)&req[4]) = (uint16)22;          // RTM_GETADDR
+  *((uint16*)&req[6]) = (uint16)(1 | 768);   // NLM_F_REQUEST | NLM_F_DUMP
+  st->nl_seq = st->nl_seq + 1;
+  *((uint32*)&req[8]) = (uint32)st->nl_seq;
+  var sa: uint8[12];
+  memset(&sa[0], 0, 12);
+  *((uint16*)&sa[0]) = (uint16)16;           // AF_NETLINK
+  var r: int64 = syscall(LINUX_SYS_SENDTO, st->nl_fd, &req[0], 24, 0, &sa[0], 12);
+  if (r < 0) { return; }
+  if (c->buf2.cap < 32768) { sysinfo_lx_buf_free(&c->buf2); sysinfo_lx_buf_init(&c->buf2, 32768); }
+  var guard: int32 = 0;
+  while (guard < 4096) {
+    r = syscall(LINUX_SYS_RECVFROM, st->nl_fd, c->buf2.p, c->buf2.cap, 0, 0, 0);
+    if (r <= 0) { return; }
+    if (sysinfo_lx_nl_parse(st, c->buf2.p, r) != 0) { return; }
+    guard = guard + 1;
+  }
+}
+
+// ---- /proc/net -------------------------------------------------------------
+
+// Socket counts from /proc/net/sockstat (or sockstat6) text.
+export fn sysinfo_lx_parse_sockstat(out: SysinfoNet*, text: string) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  while (!sysinfo_lx_end(&s)) {
+    var tag: string = sysinfo_lx_word(&s);
+    var t: int32 = 0;
+    if (sysinfo_lx_eq(tag, "TCP:")) { t = 1; }
+    if (sysinfo_lx_eq(tag, "UDP:")) { t = 2; }
+    if (sysinfo_lx_eq(tag, "TCP6:")) { t = 3; }
+    if (sysinfo_lx_eq(tag, "UDP6:")) { t = 4; }
+    while (t != 0 && !sysinfo_lx_end(&s) && s.p[s.i] != (uint8)10) {
+      var key: string = sysinfo_lx_word(&s);
+      if (key.length == (uint64)0) { break; }
+      var v: int64 = sysinfo_lx_i64(&s);
+      if (sysinfo_lx_eq(key, "inuse")) {
+        if (t == 1) { out->tcp = v; }
+        if (t == 2) { out->udp = v; }
+        if (t == 3) { out->tcp6 = v; }
+        if (t == 4) { out->udp6 = v; }
+      } else if (t == 1 && sysinfo_lx_eq(key, "tw")) { out->tcp_time_wait = v; }
+      else if (t == 1 && sysinfo_lx_eq(key, "orphan")) { out->tcp_orphan = v; }
+    }
+    sysinfo_lx_next_line(&s);
+  }
+}
+
+fn sysinfo_lx_if_slot(st: SysinfoLxNet*, out: SysinfoNet*, i: int32) -> SysinfoNetIf* {
+  if (i >= st->if_cap || out->ifs == 0) {
+    var c: int32 = st->if_cap;
+    out->ifs = (SysinfoNetIf*)sysinfo_lx_grow((uint8*)out->ifs, &c, i + 1, sizeof(SysinfoNetIf));
+    st->if_cap = c;
+  }
+  return &out->ifs[i];
+}
+
+// Reads the sysfs details of one interface.
+fn sysinfo_lx_if_sysfs(c: SysinfoLxCtx*, pool: SysinfoLxPool*, f: SysinfoNetIf*) {
+  var p: SysinfoLxPath;
+  sysinfo_lx_path_at(&p, c->root, "/sys/class/net/");
+  sysinfo_lx_path_add(&p, f->name);
+  var base: int64 = p.n;
+  var tmp: uint8[128];
+  sysinfo_lx_path_add(&p, "/address");
+  var n: int64 = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &tmp[0], 128);
+  var mac: string = sysinfo_lx_view(&tmp[0], n);
+  if (n > 0 && !sysinfo_lx_mac_blank(mac)) { f->mac = sysinfo_lx_pool_add(pool, mac); }
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/mtu");
+  f->mtu = (int32)sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), -1);
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/ifindex");
+  f->index = (int32)sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), -1);
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/flags");
+  n = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &tmp[0], 128);
+  if (n > 0) {
+    var s: SysinfoLxScan = sysinfo_lx_scan(&tmp[0], n);
+    var fl: uint64 = sysinfo_lx_hex(&s);
+    f->up = (fl & (uint64)1) != (uint64)0;          // IFF_UP
+    f->loopback = (fl & (uint64)8) != (uint64)0;    // IFF_LOOPBACK
+  }
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/operstate");
+  n = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &tmp[0], 128);
+  var os: string = sysinfo_lx_view(&tmp[0], n);
+  f->running = sysinfo_lx_eq(os, "up") || (f->loopback && f->up && sysinfo_lx_eq(os, "unknown"));
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/speed");
+  f->speed_mbps = sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), -1);
+  if (f->speed_mbps <= 0) { f->speed_mbps = -1; }
+}
+
+fn sysinfo_lx_if_prev(st: SysinfoLxNet*, key: uint64, hint: int32) -> SysinfoLxIfPrev* {
+  if (hint < st->n_prev && st->prev[hint].key == key) { return &st->prev[hint]; }
+  for k in 0..st->n_prev { if (st->prev[k].key == key) { return &st->prev[k]; } }
+  return (SysinfoLxIfPrev*)0;
+}
+
+// Parses /proc/net/dev text into out->ifs, with rates against the last call.
+export fn sysinfo_lx_net_parse_dev(st: SysinfoLxNet*, c: SysinfoLxCtx*, out: SysinfoNet*, pool: SysinfoLxPool*, text: string, secs: float64) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  sysinfo_lx_next_line(&s);
+  sysinfo_lx_next_line(&s);
+  var n: int32 = 0;
+  while (!sysinfo_lx_end(&s)) {
+    sysinfo_lx_skip(&s);
+    var a: int64 = s.i;
+    while (s.i < s.n && s.p[s.i] != (uint8)58 && s.p[s.i] != (uint8)10) { s.i = s.i + 1; }
+    var name: string = sysinfo_lx_view(s.p + a, s.i - a);
+    if (!sysinfo_lx_eat(&s, (uint8)58) || name.length == (uint64)0) { sysinfo_lx_next_line(&s); continue; }
+    var v: int64[16];
+    for k in 0..16 { v[k] = sysinfo_lx_i64(&s); }
+    sysinfo_lx_next_line(&s);
+    var f: SysinfoNetIf* = sysinfo_lx_if_slot(st, out, n);
+    var blank: SysinfoNetIf;
+    *f = blank;
+    f->name = sysinfo_lx_pool_add(pool, name);
+    f->mac = sysinfo_lx_view(s.p, 0);
+    f->index = -1;
+    f->mtu = -1;
+    f->speed_mbps = -1;
+    f->rx_bytes = v[0]; f->rx_packets = v[1]; f->rx_errors = v[2]; f->rx_drops = v[3];
+    f->tx_bytes = v[8]; f->tx_packets = v[9]; f->tx_errors = v[10]; f->tx_drops = v[11];
+    sysinfo_lx_if_sysfs(c, pool, f);
+    var key: uint64 = sysinfo_lx_hash(name);
+    var old: SysinfoLxIfPrev* = sysinfo_lx_if_prev(st, key, n);
+    var cap: int32 = st->next_cap;
+    st->next = (SysinfoLxIfPrev*)sysinfo_lx_grow((uint8*)st->next, &cap, n + 1, sizeof(SysinfoLxIfPrev));
+    st->next_cap = cap;
+    var nx: SysinfoLxIfPrev* = &st->next[n];
+    nx->key = key;
+    nx->index = f->index;
+    nx->v[0] = v[0]; nx->v[1] = v[1]; nx->v[2] = v[2]; nx->v[3] = v[3];
+    nx->v[4] = v[8]; nx->v[5] = v[9]; nx->v[6] = v[10]; nx->v[7] = v[11];
+    if (old != 0) {
+      f->rx_bps = sysinfo_lx_rate(v[0], old->v[0], secs);
+      f->rx_pps = sysinfo_lx_rate(v[1], old->v[1], secs);
+      f->rx_errors_s = sysinfo_lx_rate(v[2], old->v[2], secs);
+      f->rx_drops_s = sysinfo_lx_rate(v[3], old->v[3], secs);
+      f->tx_bps = sysinfo_lx_rate(v[8], old->v[4], secs);
+      f->tx_pps = sysinfo_lx_rate(v[9], old->v[5], secs);
+      f->tx_errors_s = sysinfo_lx_rate(v[10], old->v[6], secs);
+      f->tx_drops_s = sysinfo_lx_rate(v[11], old->v[7], secs);
+    }
+    n = n + 1;
+  }
+  out->n_ifs = n;
+  var t: SysinfoLxIfPrev* = st->prev;
+  var tc: int32 = st->prev_cap;
+  st->prev = st->next;
+  st->prev_cap = st->next_cap;
+  st->next = t;
+  st->next_cap = tc;
+  st->n_prev = n;
+}
+
+// Hands the raw netlink addresses to their interfaces, as text.
+export fn sysinfo_lx_net_attach(st: SysinfoLxNet*, out: SysinfoNet*, pool: SysinfoLxPool*) {
+  var cap: int32 = st->addr_cap;
+  st->addrs = (SysinfoAddr*)sysinfo_lx_grow((uint8*)st->addrs, &cap, st->n_raw + 1, sizeof(SysinfoAddr));
+  st->addr_cap = cap;
+  var used: int32 = 0;
+  var tmp: uint8[64];
+  for i in 0..out->n_ifs {
+    var f: SysinfoNetIf* = &out->ifs[i];
+    f->addrs = &st->addrs[used];
+    f->n_addrs = 0;
+    if (f->index < 0) { continue; }
+    // IPv4 first, then IPv6, each in kernel order
+    for fam in 0..2 {
+      for k in 0..st->n_raw {
+        var r: SysinfoLxRawAddr* = &st->raw[k];
+        if (r->index != f->index) { continue; }
+        if ((fam == 0 && r->family != 4) || (fam == 1 && r->family != 6)) { continue; }
+        var n: int64 = 0;
+        if (r->family == 4) { n = sysinfo_lx_fmt_ipv4(&r->b[0], &tmp[0]); }
+        else { n = sysinfo_lx_fmt_ipv6(&r->b[0], &tmp[0]); }
+        var a: SysinfoAddr* = &st->addrs[used];
+        a->family = r->family;
+        a->prefix = r->prefix;
+        a->addr = sysinfo_lx_pool_add_bytes(pool, &tmp[0], n);
+        used = used + 1;
+        f->n_addrs = f->n_addrs + 1;
+      }
+    }
+  }
+}
+
+export fn sysinfo_lx_net_init(st: SysinfoLxNet*, c: SysinfoLxCtx*, out: SysinfoNet*) -> int32 {
+  var p: SysinfoLxPath;
+  st->fd_dev = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/net/dev"));
+  st->fd_sock = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/net/sockstat"));
+  st->fd_sock6 = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/net/sockstat6"));
+  st->nl_fd = -1;
+  if (c->live) {
+    // AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE
+    st->nl_fd = syscall(LINUX_SYS_SOCKET, 16, 3 | 524288, 0);
+    if (st->nl_fd < 0) { st->nl_fd = -1; }
+  }
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_net_refresh(st: SysinfoLxNet*, c: SysinfoLxCtx*, out: SysinfoNet*) -> int32 {
+  var status: int32 = SYSINFO_OK;
+  var pool: SysinfoLxPool* = sysinfo_lx_pools_next(&st->pools);
+  var n: int64 = sysinfo_lx_fd_slurp(st->fd_dev, &c->buf);
+  var t: int64 = time_mono_ns();
+  var secs: float64 = (float64)(t - st->prev_ns) / 1000000000.0;
+  st->prev_ns = t;
+  if (n > 0) { sysinfo_lx_net_parse_dev(st, c, out, pool, sysinfo_lx_view(c->buf.p, n), secs); }
+  else { out->n_ifs = 0; status = SYSINFO_E_IO; }
+  sysinfo_lx_nl_dump(st, c);
+  sysinfo_lx_net_attach(st, out, pool);
+  out->tcp = -1; out->tcp6 = -1; out->udp = -1; out->udp6 = -1; out->tcp_time_wait = -1; out->tcp_orphan = -1;
+  n = sysinfo_lx_fd_slurp(st->fd_sock, &c->buf);
+  if (n > 0) { sysinfo_lx_parse_sockstat(out, sysinfo_lx_view(c->buf.p, n)); }
+  n = sysinfo_lx_fd_slurp(st->fd_sock6, &c->buf);
+  if (n > 0) { sysinfo_lx_parse_sockstat(out, sysinfo_lx_view(c->buf.p, n)); }
+  out->status = status;
+  return status;
+}
+
+export fn sysinfo_lx_net_free(st: SysinfoLxNet*, out: SysinfoNet*) {
+  sysinfo_lx_close(st->fd_dev);
+  sysinfo_lx_close(st->fd_sock);
+  sysinfo_lx_close(st->fd_sock6);
+  if (st->nl_fd >= 0) { syscall(LINUX_SYS_CLOSE, st->nl_fd); }
+  sysinfo_lx_pools_free(&st->pools);
+  if (st->prev != 0) { free(st->prev); }
+  if (st->next != 0) { free(st->next); }
+  if (st->raw != 0) { free(st->raw); }
+  if (st->addrs != 0) { free(st->addrs); }
+  if (out->ifs != 0) { free(out->ifs); }
+  out->ifs = (SysinfoNetIf*)0;
+}

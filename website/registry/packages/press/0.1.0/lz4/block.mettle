@@ -1,0 +1,308 @@
+// LZ4 block format: compress and decompress one raw block.
+//
+//   var out: PressBuf;
+//   press_lz4_block_compress(src, n, 1, &out);               // level 1 = fast
+//   press_lz4_block_decompress(out.data, out.len, &back, n); // at most n bytes
+//
+// A block has no header and no checksum, so you must remember how big the
+// original was. The frame format (frame.mettle) adds those.
+//
+// Level 1 uses a hash table with one candidate per slot (fast). Levels 2..12
+// use hash chains (hc.mettle). All levels write the same block format.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "emit";
+import "hc";
+
+// The table has 4096 slots: the hash keeps the top 12 bits (shift by 64 - 12).
+const PLZ_PRIME5: uint64 = 889523592379;
+const PLZ_STORED: uint32 = 0x80000000;
+/// The most bytes a block of n input bytes can take.
+export fn press_lz4_block_bound(n: int64) -> int64 {
+  if (n < 0) { return 0; }
+  return n + n / 255 + 16;
+}
+
+@inline fn plz_hash5(p: uint8*) -> int64 {
+  return (int64)(((press_rd64(p) << 24) * PLZ_PRIME5) >> 52);
+}
+
+// Level 1: one pass, one candidate per hash slot, and the search steps faster
+// the longer it finds nothing (so random data costs little). dst must hold
+// press_lz4_block_bound(n) bytes. Returns the block length.
+fn plz_compress_fast(src: uint8*, n: int64, dst: uint8*) -> int64 {
+  var op: int64 = 0;
+  var anchor: int64 = 0;
+  if (n < 13) { return plz_emit_last(dst, 0, src, 0, n); }
+  var tbl: uint32[4096];
+  var t: uint32* = &tbl[0];
+  var mflimit1: int64 = n - 11;     // a match may start before this
+  var mend: int64 = n - 5;          // a match may not run past this
+  var ip: int64 = 1;
+  t[plz_hash5(src)] = 0;
+  var fwdh: int64 = plz_hash5(src + ip);
+  while (true) {
+    // Search for a match, stepping faster as misses pile up.
+    var fip: int64 = ip;
+    var step: int64 = 1;
+    var nb: int64 = 64;
+    var mtc: int64 = 0;
+    var got: bool = false;
+    while (true) {
+      var h: int64 = fwdh;
+      ip = fip;
+      fip = fip + step;
+      step = nb >> 6;
+      nb = nb + 1;
+      if (fip > mflimit1) { break; }
+      mtc = (int64)t[h];
+      fwdh = plz_hash5(src + fip);
+      t[h] = (uint32)ip;
+      if (ip - mtc <= 65535 && press_rd32(src + mtc) == press_rd32(src + ip)) {
+        got = true;
+        break;
+      }
+    }
+    if (!got) { break; }
+    // Grow the match backwards over equal literal bytes.
+    while (ip > anchor && mtc > 0 && src[ip - 1] == src[mtc - 1]) {
+      ip = ip - 1;
+      mtc = mtc - 1;
+    }
+    // Emit it, then keep checking for a match right after it.
+    while (true) {
+      var mlen: int64 = 4 + plz_count(src + ip + 4, src + mtc + 4, mend - ip - 4);
+      op = plz_emit(dst, op, src, anchor, ip - anchor, ip - mtc, mlen);
+      ip = ip + mlen;
+      anchor = ip;
+      if (ip >= mflimit1) { break; }
+      t[plz_hash5(src + ip - 2)] = (uint32)(ip - 2);
+      var h2: int64 = plz_hash5(src + ip);
+      mtc = (int64)t[h2];
+      t[h2] = (uint32)ip;
+      if (ip - mtc > 65535 || press_rd32(src + mtc) != press_rd32(src + ip)) { break; }
+    }
+    if (ip >= mflimit1) { break; }
+    ip = ip + 1;
+    fwdh = plz_hash5(src + ip);
+  }
+  return plz_emit_last(dst, op, src, anchor, n);
+}
+
+/// Compresses n bytes into dst (room for press_lz4_block_bound(n) bytes)
+/// at the given level. Returns the length, or -1 when memory runs out.
+export fn plz_compress(src: uint8*, n: int64, level: int32, dst: uint8*) -> int64 {
+  if (level <= 1) { return plz_compress_fast(src, n, dst); }
+  return plz_hc_compress(src, n, level, dst);
+}
+
+/// Makes room for a block and compresses it. With framed set, 4 bytes are
+/// left in front for the frame block size (filled in here: the size, or the
+/// size with the top bit set when the data is stored unchanged because it
+/// did not shrink). Without a limit this is one pass; if the output limit is
+/// in the way, the block goes through a temporary buffer.
+export fn plz_enc_block(src: uint8*, n: int64, level: int32, out: PressBuf*, framed: int32) -> int32 {
+  var extra: int64 = 0;
+  if (framed != 0) { extra = 4; }
+  var bound: int64 = press_lz4_block_bound(n);
+  var rc: int32 = press_buf_reserve(out, extra + bound);
+  var tmp: uint8* = (uint8*)0;
+  var base: uint8* = (uint8*)0;
+  if (rc == PRESS_OK) {
+    base = out->data + out->len + extra;
+  } else if (rc == PRESS_E_LIMIT) {
+    tmp = (uint8*)malloc(bound);
+    if (tmp == 0) { return PRESS_E_MEM; }
+    base = tmp;
+  } else {
+    return rc;
+  }
+  var clen: int64 = plz_compress(src, n, level, base);
+  if (clen < 0) {
+    if (tmp != 0) { free(tmp); }
+    return PRESS_E_MEM;
+  }
+  var store: bool = framed != 0 && clen >= n;
+  if (tmp == 0) {
+    if (store) {
+      memcpy(base, src, n);
+      press_wr32(out->data + out->len, PLZ_STORED | (uint32)n);
+      out->len = out->len + 4 + n;
+    } else {
+      if (framed != 0) { press_wr32(out->data + out->len, (uint32)clen); }
+      out->len = out->len + extra + clen;
+    }
+    return PRESS_OK;
+  }
+  // Slow path: append with exact limit checks.
+  var rc2: int32 = PRESS_OK;
+  if (store) {
+    rc2 = press_buf_put32(out, PLZ_STORED | (uint32)n);
+    if (rc2 == PRESS_OK) { rc2 = press_buf_append(out, src, n); }
+  } else {
+    if (framed != 0) { rc2 = press_buf_put32(out, (uint32)clen); }
+    if (rc2 == PRESS_OK) { rc2 = press_buf_append(out, tmp, clen); }
+  }
+  free(tmp);
+  return rc2;
+}
+
+/// Compresses n bytes into one raw LZ4 block and appends it to out.
+/// Level 1 is fast, 2..12 search harder; 0 or less means 1.
+export fn press_lz4_block_compress(src: uint8*, n: int64, level: int32, out: PressBuf*) -> int32 {
+  if (n < 0 || out == 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var lv: int32 = level;
+  if (lv < 1) { lv = 1; }
+  if (lv > 12) { lv = 12; }
+  return plz_enc_block(src, n, lv, out, 0);
+}
+
+// Copies a match of ml bytes from `offset` bytes back. Writes up to 7 bytes
+// past the end when there is room (capend), else copies exactly.
+@inline fn plz_copy_mtc(dst: uint8*, op: int64, offset: int64, ml: int64, capend: int64) {
+  var mp: int64 = op - offset;
+  var k: int64 = 0;
+  if (offset < 8) {
+    // The first 8 bytes go one by one. After that the pattern repeats with
+    // a period that is a multiple of offset and at least 8, so words work.
+    var c: int64 = ml;
+    if (c > 8) { c = 8; }
+    while (k < c) { dst[op + k] = dst[mp + k]; k = k + 1; }
+    if (ml <= 8) { return; }
+    var per: int64 = offset * ((8 + offset - 1) / offset);
+    mp = op - per;
+  }
+  if (op + ml + 8 <= capend) {
+    while (k < ml) {
+      press_wr64(dst + op + k, press_rd64(dst + mp + k));
+      k = k + 8;
+    }
+  } else {
+    while (k < ml) { dst[op + k] = dst[mp + k]; k = k + 1; }
+  }
+}
+
+/// The block decoder. src holds the n block bytes. Output goes to dst[op0..]:
+/// no byte at or past oend is written (over_rc is returned instead), and wild
+/// writes happen only where capend leaves room. Matches may reach back to
+/// index hist. On success *res is the end position.
+export fn plz_decode(src: uint8*, n: int64, dst: uint8*, op0: int64, oend: int64, capend: int64, hist: int64, over_rc: int32, res: int64*) -> int32 {
+  if (n <= 0) { return PRESS_E_TRUNC; }
+  var ip: int64 = 0;
+  var op: int64 = op0;
+  var fast_end: int64 = oend - 40;
+  var lo: int64 = hist;
+  while (true) {
+    if (ip >= n) { return PRESS_E_DATA; }   // the block must end with literals
+    var token: int64 = (int64)src[ip];
+    // Fast path: a short literal run and a short match, with room to spare
+    // on both sides, so whole words can be copied without further checks.
+    if (token < 240 && (token & 15) != 15 && ip + 19 <= n && op <= fast_end) {
+      var l: int64 = token >> 4;
+      press_wr64(dst + op, press_rd64(src + ip + 1));
+      press_wr64(dst + op + 8, press_rd64(src + ip + 9));
+      op = op + l;
+      var off: int64 = (int64)press_rd16(src + ip + 1 + l);
+      ip = ip + 3 + l;
+      if (off >= 8 && off <= op - lo) {
+        var mp: int64 = op - off;
+        press_wr64(dst + op, press_rd64(dst + mp));
+        press_wr64(dst + op + 8, press_rd64(dst + mp + 8));
+        press_wr64(dst + op + 16, press_rd64(dst + mp + 16));
+        op = op + (token & 15) + 4;
+        continue;
+      }
+      if (off == 0 || off > op - lo) { return PRESS_E_DATA; }
+      var ml0: int64 = (token & 15) + 4;
+      plz_copy_mtc(dst, op, off, ml0, capend);
+      op = op + ml0;
+      continue;
+    }
+    ip = ip + 1;
+    var lit: int64 = token >> 4;
+    if (lit == 15) {
+      while (true) {
+        if (ip >= n) { return PRESS_E_DATA; }
+        var b: int64 = (int64)src[ip];
+        ip = ip + 1;
+        lit = lit + b;
+        if (b != 255) { break; }
+      }
+    }
+    if (lit > n - ip) { return PRESS_E_DATA; }
+    if (lit > oend - op) { return over_rc; }
+    if (ip + lit + 8 <= n && op + lit + 8 <= capend) {
+      var i: int64 = 0;
+      while (i < lit) {
+        press_wr64(dst + op + i, press_rd64(src + ip + i));
+        i = i + 8;
+      }
+    } else if (lit > 0) {
+      memcpy(dst + op, src + ip, lit);
+    }
+    ip = ip + lit;
+    op = op + lit;
+    if (ip == n) { break; }
+    if (ip + 2 > n) { return PRESS_E_DATA; }
+    var offset: int64 = (int64)press_rd16(src + ip);
+    ip = ip + 2;
+    if (offset == 0 || offset > op - lo) { return PRESS_E_DATA; }
+    var ml: int64 = token & 15;
+    if (ml == 15) {
+      while (true) {
+        if (ip >= n) { return PRESS_E_DATA; }
+        var b2: int64 = (int64)src[ip];
+        ip = ip + 1;
+        ml = ml + b2;
+        if (b2 != 255) { break; }
+      }
+    }
+    ml = ml + 4;
+    if (ml > oend - op) { return over_rc; }
+    plz_copy_mtc(dst, op, offset, ml, capend);
+    op = op + ml;
+  }
+  *res = op;
+  return PRESS_OK;
+}
+
+/// Decodes one block and appends it to out. `want` is the most bytes the
+/// block can produce. Matches may reach back `hist_back` bytes before the
+/// start of the new output. If the buffer limit stops us from reserving
+/// `want` bytes, the decoder works exactly up to the limit and returns
+/// PRESS_E_LIMIT if the block needs more; otherwise running past `want`
+/// returns over_rc.
+export fn plz_decode_into(src: uint8*, n: int64, out: PressBuf*, want: int64, over_rc: int32, hist_back: int64) -> int32 {
+  var rc: int32 = press_buf_reserve(out, want + 16);
+  var room: int64 = want;
+  var slack: int64 = 16;
+  var orc: int32 = over_rc;
+  if (rc == PRESS_E_LIMIT) {
+    var avail: int64 = out->limit - out->len;
+    if (avail < 0) { avail = 0; }
+    slack = 0;
+    if (avail < want) {
+      room = avail;
+      orc = PRESS_E_LIMIT;
+    }
+    rc = press_buf_reserve(out, room);
+  }
+  if (rc != PRESS_OK) { return rc; }
+  var res: int64 = 0;
+  var op0: int64 = out->len;
+  rc = plz_decode(src, n, out->data, op0, op0 + room, op0 + room + slack, op0 - hist_back, orc, &res);
+  if (rc != PRESS_OK) { return rc; }
+  out->len = res;
+  return PRESS_OK;
+}
+
+/// Decompresses one raw LZ4 block and appends it to out. It appends at most
+/// max_out bytes; a block that would give more returns PRESS_E_LIMIT.
+export fn press_lz4_block_decompress(src: uint8*, n: int64, out: PressBuf*, max_out: int64) -> int32 {
+  if (n < 0 || max_out < 0 || out == 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var want: int64 = n * 255 + 64;     // no block can expand more than this
+  if (want > max_out) { want = max_out; }
+  return plz_decode_into(src, n, out, want, PRESS_E_LIMIT, 0);
+}

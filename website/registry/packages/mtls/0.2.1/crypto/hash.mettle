@@ -1,0 +1,218 @@
+// Hashes, HMAC and HKDF over the hash a cipher suite picks, plus the
+// TLS 1.3 key-derivation helpers (HKDF-Expand-Label, Derive-Secret) and the
+// TLS 1.2 PRF. The hash engines come from cryptex; this file only composes
+// them as RFC 2104, 5869, 8446 and 5246 describe.
+
+import "std/mem";
+import "cryptex/core/util";
+import "cryptex/hash/sha2";
+import "mtls/core/err";
+import "mtls/core/bytes";
+
+export const MTLS_SHA256: int32 = 1;
+export const MTLS_SHA384: int32 = 2;
+export const MTLS_SHA512: int32 = 3;
+
+export const MTLS_HASH_MAX: int32 = 64;
+
+export struct MtlsHash {
+  alg: int32;
+  s256: CrxSha256;
+  s384: CrxSha384;
+  s512: CrxSha512;
+}
+
+/// mtls_hash_len: output size in bytes (0 for an unknown hash).
+export fn mtls_hash_len(alg: int32) -> int32 {
+  if (alg == MTLS_SHA256) { return 32; }
+  if (alg == MTLS_SHA384) { return 48; }
+  if (alg == MTLS_SHA512) { return 64; }
+  return 0;
+}
+
+fn mtls_hash_block(alg: int32) -> int32 {
+  if (alg == MTLS_SHA256) { return 64; }
+  return 128;
+}
+
+export fn mtls_hash_init(h: MtlsHash*, alg: int32) {
+  h->alg = alg;
+  if (alg == MTLS_SHA256) {
+    crx_sha256_init(&h->s256);
+  } else if (alg == MTLS_SHA384) {
+    crx_sha384_init(&h->s384);
+  } else {
+    crx_sha512_init(&h->s512);
+  }
+}
+
+export fn mtls_hash_update(h: MtlsHash*, p: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  if (h->alg == MTLS_SHA256) {
+    crx_sha256_update(&h->s256, p, n);
+  } else if (h->alg == MTLS_SHA384) {
+    crx_sha384_update(&h->s384, p, n);
+  } else {
+    crx_sha512_update(&h->s512, p, n);
+  }
+}
+
+/// mtls_hash_final: writes mtls_hash_len(alg) bytes to out and wipes h.
+export fn mtls_hash_final(h: MtlsHash*, out: uint8*) {
+  if (h->alg == MTLS_SHA256) {
+    crx_sha256_final(&h->s256, out);
+    return;
+  }
+  if (h->alg == MTLS_SHA384) {
+    crx_sha384_final(&h->s384, out);
+    return;
+  }
+  crx_sha512_final(&h->s512, out);
+}
+
+/// mtls_hash_peek: the hash of everything so far, without ending h.
+export fn mtls_hash_peek(h: MtlsHash*, out: uint8*) {
+  var c: MtlsHash = *h;
+  mtls_hash_final(&c, out);
+}
+
+/// mtls_hash: one-shot hash.
+export fn mtls_hash(alg: int32, p: uint8*, n: int64, out: uint8*) {
+  var h: MtlsHash;
+  mtls_hash_init(&h, alg);
+  mtls_hash_update(&h, p, n);
+  mtls_hash_final(&h, out);
+}
+
+export struct MtlsHmac {
+  inner: MtlsHash;
+  outer: MtlsHash;
+}
+
+export fn mtls_hmac_init(m: MtlsHmac*, alg: int32, key: uint8*, klen: int64) {
+  var k: uint8[128];
+  memset(&k[0], 0, 128);
+  var bl: int32 = mtls_hash_block(alg);
+  if (klen > (int64)bl) {
+    mtls_hash(alg, key, klen, &k[0]);
+  } else if (klen > 0) {
+    memcpy(&k[0], key, klen);
+  }
+  var pad: uint8[128];
+  for i in 0..bl { pad[i] = k[i] ^ (uint8)0x36; }
+  mtls_hash_init(&m->inner, alg);
+  mtls_hash_update(&m->inner, &pad[0], (int64)bl);
+  for i in 0..bl { pad[i] = k[i] ^ (uint8)0x5c; }
+  mtls_hash_init(&m->outer, alg);
+  mtls_hash_update(&m->outer, &pad[0], (int64)bl);
+  cr_wipe(&k[0], 128);
+  cr_wipe(&pad[0], 128);
+}
+
+export fn mtls_hmac_update(m: MtlsHmac*, p: uint8*, n: int64) {
+  mtls_hash_update(&m->inner, p, n);
+}
+
+export fn mtls_hmac_final(m: MtlsHmac*, out: uint8*) {
+  var t: uint8[64];
+  var hl: int32 = mtls_hash_len(m->inner.alg);
+  mtls_hash_final(&m->inner, &t[0]);
+  mtls_hash_update(&m->outer, &t[0], (int64)hl);
+  mtls_hash_final(&m->outer, out);
+  cr_wipe(&t[0], 64);
+}
+
+export fn mtls_hmac(alg: int32, key: uint8*, klen: int64, p: uint8*, n: int64, out: uint8*) {
+  var m: MtlsHmac;
+  mtls_hmac_init(&m, alg, key, klen);
+  mtls_hmac_update(&m, p, n);
+  mtls_hmac_final(&m, out);
+}
+
+/// mtls_hkdf_extract: PRK = HMAC(salt, ikm). A missing salt is all zeros.
+export fn mtls_hkdf_extract(alg: int32, salt: uint8*, slen: int64, ikm: uint8*, ilen: int64, out: uint8*) {
+  var zero: uint8[64];
+  memset(&zero[0], 0, 64);
+  if (slen == 0) {
+    mtls_hmac(alg, &zero[0], (int64)mtls_hash_len(alg), ikm, ilen, out);
+  } else {
+    mtls_hmac(alg, salt, slen, ikm, ilen, out);
+  }
+}
+
+/// mtls_hkdf_expand: olen bytes of output keyed by prk (RFC 5869 2.3).
+export fn mtls_hkdf_expand(alg: int32, prk: uint8*, plen: int64, info: uint8*, ilen: int64, out: uint8*, olen: int64) -> int32 {
+  var hl: int64 = (int64)mtls_hash_len(alg);
+  if (hl == 0 || olen < 0 || olen > 255 * hl) { return MTLS_E_ARG; }
+  var t: uint8[64];
+  var tlen: int64 = 0;
+  var done: int64 = 0;
+  var ctr: uint8 = 1;
+  while (done < olen) {
+    var m: MtlsHmac;
+    mtls_hmac_init(&m, alg, prk, plen);
+    mtls_hmac_update(&m, &t[0], tlen);
+    mtls_hmac_update(&m, info, ilen);
+    mtls_hmac_update(&m, &ctr, 1);
+    mtls_hmac_final(&m, &t[0]);
+    tlen = hl;
+    var k: int64 = olen - done;
+    if (k > hl) { k = hl; }
+    memcpy(out + done, &t[0], k);
+    done = done + k;
+    ctr = ctr + 1;
+  }
+  cr_wipe(&t[0], 64);
+  return MTLS_OK;
+}
+
+/// mtls_expand_label: HKDF-Expand-Label from RFC 8446 7.1. The label is
+/// given without the "tls13 " prefix.
+export fn mtls_expand_label(alg: int32, secret: uint8*, label: string, ctx: uint8*, clen: int64, out: uint8*, olen: int64) -> int32 {
+  var info: uint8[600];
+  var w: MtlsWr = mtls_wr(&info[0], 600);
+  mtls_wr_u16(&w, olen);
+  var m: int64 = mtls_wr_open8(&w);
+  mtls_wr_str(&w, "tls13 ");
+  mtls_wr_str(&w, label);
+  mtls_wr_close8(&w, m);
+  m = mtls_wr_open8(&w);
+  mtls_wr_bytes(&w, ctx, clen);
+  mtls_wr_close8(&w, m);
+  if (w.bad) { return MTLS_E_ARG; }
+  return mtls_hkdf_expand(alg, secret, (int64)mtls_hash_len(alg), &info[0], w.len, out, olen);
+}
+
+/// mtls_derive_secret: Derive-Secret(secret, label, transcript hash).
+export fn mtls_derive_secret(alg: int32, secret: uint8*, label: string, thash: uint8*, out: uint8*) -> int32 {
+  var hl: int64 = (int64)mtls_hash_len(alg);
+  return mtls_expand_label(alg, secret, label, thash, hl, out, hl);
+}
+
+/// mtls_prf12: the TLS 1.2 PRF, P_hash(secret, label + seed) (RFC 5246 5).
+export fn mtls_prf12(alg: int32, secret: uint8*, slen: int64, label: string, seed: uint8*, sdlen: int64, out: uint8*, olen: int64) {
+  var hl: int64 = (int64)mtls_hash_len(alg);
+  var a: uint8[64];
+  var t: uint8[64];
+  // A(1) = HMAC(secret, label + seed)
+  var m: MtlsHmac;
+  mtls_hmac_init(&m, alg, secret, slen);
+  mtls_hmac_update(&m, label.chars, (int64)label.length);
+  mtls_hmac_update(&m, seed, sdlen);
+  mtls_hmac_final(&m, &a[0]);
+  var done: int64 = 0;
+  while (done < olen) {
+    mtls_hmac_init(&m, alg, secret, slen);
+    mtls_hmac_update(&m, &a[0], hl);
+    mtls_hmac_update(&m, label.chars, (int64)label.length);
+    mtls_hmac_update(&m, seed, sdlen);
+    mtls_hmac_final(&m, &t[0]);
+    var k: int64 = olen - done;
+    if (k > hl) { k = hl; }
+    memcpy(out + done, &t[0], k);
+    done = done + k;
+    mtls_hmac(alg, secret, slen, &a[0], hl, &a[0]);
+  }
+  cr_wipe(&a[0], 64);
+  cr_wipe(&t[0], 64);
+}

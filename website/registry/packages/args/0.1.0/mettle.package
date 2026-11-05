@@ -1,0 +1,6 @@
+name = args
+version = 0.1.0
+description = Command-line arguments in pure Mettle: flags, options, subcommands, help, completions
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Args
+compiler = 0.18.0

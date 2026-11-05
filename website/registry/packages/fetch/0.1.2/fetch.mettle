@@ -1,0 +1,8 @@
+// The facade: import "fetch/fetch" brings in the whole client.
+import "fetch/stream";
+import "fetch/pool";
+import "fetch/cookie";
+import "fetch/redirect";
+import "fetch/error";
+import "fetch/tls";
+import "fetch/client";

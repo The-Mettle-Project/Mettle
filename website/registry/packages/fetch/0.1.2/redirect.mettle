@@ -1,0 +1,221 @@
+// Redirect rules: which statuses are followed, what the next request is, and
+// how a Location value becomes a URL.
+
+import "std/core";
+import "std/arena";
+import "std/strbuf";
+import "std/http";
+
+export fn fetch_redirect_follows(status: int32) -> bool {
+  return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+// The method of the request that follows a redirect. 303 turns anything but
+// HEAD into GET, and 301 and 302 do so for POST. 307 and 308 keep the method.
+export fn fetch_redirect_method(status: int32, verb: string) -> string {
+  if (status == 303) {
+    if (verb == "HEAD") { return verb; }
+    return "GET";
+  }
+  if ((status == 301 || status == 302) && verb == "POST") { return "GET"; }
+  return verb;
+}
+
+// False when the redirected request has no body: the method changed to GET.
+export fn fetch_redirect_keeps_body(status: int32, verb: string) -> bool {
+  if (status == 303) { return false; }
+  if ((status == 301 || status == 302) && verb == "POST") { return false; }
+  return true;
+}
+
+fn rd_ieq(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)a.length) {
+    var x: int32 = (int32)a.chars[i];
+    var y: int32 = (int32)b.chars[i];
+    if (x >= 65 && x <= 90) { x = x + 32; }
+    if (y >= 65 && y <= 90) { y = y + 32; }
+    if (x != y) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// Same host name (any case) and same port. Credentials go no further than this.
+export fn fetch_url_same_host(a: HttpUrl*, b: HttpUrl*) -> bool {
+  return a->port == b->port && rd_ieq(a->host, b->host);
+}
+
+// Copies the headers into out (room for n) without the ones that must not
+// follow a redirect. drop_auth removes Authorization, Cookie and
+// Proxy-Authorization; drop_body removes the headers that describe a body.
+// Returns the count kept.
+export fn fetch_redirect_headers(h: HttpHeader*, n: int32, out: HttpHeader*, drop_auth: bool, drop_body: bool) -> int32 {
+  var kept: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var skip: bool = false;
+    if (drop_auth && (rd_ieq(h[i].name, "authorization") || rd_ieq(h[i].name, "cookie") || rd_ieq(h[i].name, "proxy-authorization"))) { skip = true; }
+    if (drop_body && (rd_ieq(h[i].name, "content-type") || rd_ieq(h[i].name, "content-encoding") || rd_ieq(h[i].name, "content-language"))) { skip = true; }
+    if (!skip) {
+      out[kept] = h[i];
+      kept = kept + 1;
+    }
+    i = i + 1;
+  }
+  return kept;
+}
+
+fn rd_at(s: string, i: int64, lit: string) -> bool {
+  var n: int64 = (int64)lit.length;
+  if (i + n > (int64)s.length) { return false; }
+  var k: int64 = 0;
+  while (k < n) {
+    if ((int32)s.chars[i + k] != (int32)lit.chars[k]) { return false; }
+    k = k + 1;
+  }
+  return true;
+}
+
+// RFC 3986 5.2.4. out holds at least path.length + 1 bytes. Returns the length.
+fn rd_remove_dots(path: string, out: uint8*) -> int64 {
+  var n: int64 = (int64)path.length;
+  var i: int64 = 0;
+  var o: int64 = 0;
+  while (i < n) {
+    var rem: int64 = n - i;
+    if (rd_at(path, i, "../")) {
+      i = i + 3;
+    } else if (rd_at(path, i, "./")) {
+      i = i + 2;
+    } else if (rd_at(path, i, "/./")) {
+      i = i + 2;
+    } else if (rem == 2 && rd_at(path, i, "/.")) {
+      out[o] = (uint8)47;
+      o = o + 1;
+      i = n;
+    } else if (rd_at(path, i, "/../") || (rem == 3 && rd_at(path, i, "/.."))) {
+      while (o > 0 && (int32)out[o - 1] != 47) { o = o - 1; }
+      if (o > 0) { o = o - 1; }
+      if (rem == 3) {
+        out[o] = (uint8)47;
+        o = o + 1;
+        i = n;
+      } else {
+        i = i + 3;
+      }
+    } else if ((rem == 1 && rd_at(path, i, ".")) || (rem == 2 && rd_at(path, i, ".."))) {
+      i = n;
+    } else {
+      out[o] = path.chars[i];
+      o = o + 1;
+      i = i + 1;
+      while (i < n && (int32)path.chars[i] != 47) {
+        out[o] = path.chars[i];
+        o = o + 1;
+        i = i + 1;
+      }
+    }
+  }
+  return o;
+}
+
+fn rd_has_scheme(s: string) -> bool {
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    var letter: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    if (c == 58) { return i > 0; }
+    if (!letter && !(i > 0 && ((c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46))) { return false; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// Appends scheme://host[:port] of u.
+fn rd_origin(sb: StrBuf*, u: HttpUrl*) {
+  if (u->tls != 0) {
+    strbuf_append_string(sb, "https://");
+  } else {
+    strbuf_append_string(sb, "http://");
+  }
+  if (u->ipv6 != 0) { strbuf_append_byte(sb, (uint8)91); }
+  strbuf_append_string(sb, u->host);
+  if (u->ipv6 != 0) { strbuf_append_byte(sb, (uint8)93); }
+  var def: int32 = 80;
+  if (u->tls != 0) { def = 443; }
+  if (u->port != def) {
+    strbuf_append_byte(sb, (uint8)58);
+    strbuf_append_int(sb, (int64)u->port);
+  }
+}
+
+// Resolves a Location value against the URL that was requested (RFC 3986
+// 5.2) and appends the absolute URL to sb. The fragment is dropped. Needs an
+// arena for scratch space. Returns 0, or HTTP_ERR_URL for an empty value, a
+// scheme other than http and https, or an out-of-memory.
+export fn fetch_url_resolve(arena: Arena*, base: HttpUrl*, location: string, sb: StrBuf*) -> int64 {
+  var a: int64 = 0;
+  var b: int64 = (int64)location.length;
+  while (a < b && ((int32)location.chars[a] == 32 || (int32)location.chars[a] == 9)) { a = a + 1; }
+  while (b > a && ((int32)location.chars[b - 1] == 32 || (int32)location.chars[b - 1] == 9)) { b = b - 1; }
+  var loc: string;
+  loc.chars = location.chars + a;
+  loc.length = (uint64)(b - a);
+  var i: int64 = 0;
+  while (i < (int64)loc.length && (int32)loc.chars[i] != 35) { i = i + 1; }
+  loc.length = (uint64)i;
+  if (loc.length == 0) { return HTTP_ERR_URL; }
+
+  if (rd_has_scheme(loc)) {
+    if (!rd_at(loc, 0, "http://") && !rd_at(loc, 0, "https://") && !rd_at(loc, 0, "HTTP://") && !rd_at(loc, 0, "HTTPS://")) { return HTTP_ERR_URL; }
+    strbuf_append_string(sb, loc);
+    return 0;
+  }
+  if (rd_at(loc, 0, "//")) {
+    if (base->tls != 0) {
+      strbuf_append_string(sb, "https:");
+    } else {
+      strbuf_append_string(sb, "http:");
+    }
+    strbuf_append_string(sb, loc);
+    return 0;
+  }
+
+  var q: int64 = 0;
+  while (q < (int64)loc.length && (int32)loc.chars[q] != 63) { q = q + 1; }
+  var rpath: string = loc;
+  rpath.length = (uint64)q;
+  var rquery: string = loc;
+  rquery.chars = loc.chars + q;
+  rquery.length = loc.length - (uint64)q;
+
+  rd_origin(sb, base);
+  if (rpath.length == 0) {
+    // only a query: keep the base path
+    strbuf_append_string(sb, base->path);
+    strbuf_append_string(sb, rquery);
+    return 0;
+  }
+  var merged: string = rpath;
+  if ((int32)rpath.chars[0] != 47) {
+    var cut: int64 = (int64)base->path.length;
+    while (cut > 0 && (int32)base->path.chars[cut - 1] != 47) { cut = cut - 1; }
+    var mb: StrBuf* = strbuf_new(arena, 128);
+    if (mb == 0) { return HTTP_ERR_URL; }
+    var dir: string = base->path;
+    dir.length = (uint64)cut;
+    if (cut == 0) { dir = "/"; }
+    strbuf_append_string(mb, dir);
+    strbuf_append_string(mb, rpath);
+    merged = strbuf_finish_string(mb);
+  }
+  var buf: uint8* = (uint8*)arena_alloc(arena, (int64)merged.length + 1);
+  if (buf == 0) { return HTTP_ERR_URL; }
+  var len: int64 = rd_remove_dots(merged, buf);
+  strbuf_append_bytes(sb, (cstring)buf, len);
+  strbuf_append_string(sb, rquery);
+  return 0;
+}

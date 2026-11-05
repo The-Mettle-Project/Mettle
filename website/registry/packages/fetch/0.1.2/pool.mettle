@@ -1,0 +1,159 @@
+// Idle keep-alive connections, kept per key (scheme, host and port).
+
+import "std/mem";
+import "std/socket";
+import "fetch/stream";
+
+export struct FetchConn {
+  stream: FetchStream;
+  key: string;            // owned
+  probe_fd: int64;        // the socket to test for a close while idle, or -1
+  idle_since: int64;      // net_now_ms when it went idle
+  next: FetchConn*;
+  uses: int32;            // requests answered on it so far
+}
+
+export struct FetchPool {
+  head: FetchConn*;        // newest first
+  count: int32;
+  max_idle_per_host: int32;
+  max_idle_total: int32;
+  idle_timeout_ms: int64;
+}
+
+export fn fetch_pool_init(p: FetchPool*) {
+  memset(p, 0, (int64)sizeof(FetchPool));
+  p->max_idle_per_host = 4;
+  p->max_idle_total = 32;
+  p->idle_timeout_ms = 30000;
+}
+
+// Wraps a stream. The key text is copied. Returns 0 when out of memory.
+export fn fetch_conn_new(s: FetchStream, key: string) -> FetchConn* {
+  var c: FetchConn* = (FetchConn*)malloc((int64)sizeof(FetchConn));
+  if (c == 0) { return (FetchConn*)0; }
+  memset(c, 0, (int64)sizeof(FetchConn));
+  var k: uint8* = (uint8*)malloc((int64)key.length + 1);
+  if (k == 0) {
+    free(c);
+    return (FetchConn*)0;
+  }
+  memcpy(k, key.chars, (int64)key.length);
+  k[key.length] = (uint8)0;
+  c->key.chars = k;
+  c->key.length = key.length;
+  c->stream = s;
+  c->probe_fd = s.fd;
+  return c;
+}
+
+// Closes the stream and frees the connection.
+export fn fetch_conn_close(c: FetchConn*) {
+  fetch_stream_close(&c->stream);
+  free(c->key.chars);
+  free(c);
+}
+
+fn pl_unlink(p: FetchPool*, c: FetchConn*) {
+  if (p->head == c) {
+    p->head = c->next;
+  } else {
+    var q: FetchConn* = p->head;
+    while (q != 0 && q->next != c) { q = q->next; }
+    if (q != 0) { q->next = c->next; }
+  }
+  c->next = (FetchConn*)0;
+  p->count = p->count - 1;
+}
+
+fn pl_oldest(p: FetchPool*, key: string, any: bool) -> FetchConn* {
+  var best: FetchConn* = (FetchConn*)0;
+  var q: FetchConn* = p->head;
+  while (q != 0) {
+    if (any || q->key == key) { best = q; }
+    q = q->next;
+  }
+  return best;
+}
+
+fn pl_count_key(p: FetchPool*, key: string) -> int32 {
+  var n: int32 = 0;
+  var q: FetchConn* = p->head;
+  while (q != 0) {
+    if (q->key == key) { n = n + 1; }
+    q = q->next;
+  }
+  return n;
+}
+
+// Closes the connections idle for longer than the timeout.
+export fn fetch_pool_prune(p: FetchPool*) {
+  var now: int64 = net_now_ms();
+  var q: FetchConn* = p->head;
+  while (q != 0) {
+    var next: FetchConn* = q->next;
+    if (now - q->idle_since > p->idle_timeout_ms) {
+      pl_unlink(p, q);
+      fetch_conn_close(q);
+    }
+    q = next;
+  }
+}
+
+// An idle connection for key, newest first, or 0. One the server has closed
+// or written to since is dropped: the socket is readable then.
+export fn fetch_pool_take(p: FetchPool*, key: string) -> FetchConn* {
+  fetch_pool_prune(p);
+  var q: FetchConn* = p->head;
+  while (q != 0) {
+    var next: FetchConn* = q->next;
+    if (q->key == key) {
+      pl_unlink(p, q);
+      var dead: bool = false;
+      if (q->probe_fd >= 0 && sock_wait(q->probe_fd, NET_POLL_IN, 0) != 0) { dead = true; }
+      if (!dead) { return q; }
+      fetch_conn_close(q);
+    }
+    q = next;
+  }
+  return (FetchConn*)0;
+}
+
+// Keeps c for reuse, or closes it when the pool is full. The oldest idle
+// connection of the host goes first, then the oldest overall.
+export fn fetch_pool_put(p: FetchPool*, c: FetchConn*) {
+  if (p->max_idle_per_host <= 0 || p->max_idle_total <= 0) {
+    fetch_conn_close(c);
+    return;
+  }
+  c->idle_since = net_now_ms();
+  c->next = p->head;
+  p->head = c;
+  p->count = p->count + 1;
+  while (pl_count_key(p, c->key) > p->max_idle_per_host) {
+    var old: FetchConn* = pl_oldest(p, c->key, false);
+    pl_unlink(p, old);
+    fetch_conn_close(old);
+  }
+  while (p->count > p->max_idle_total) {
+    var old2: FetchConn* = pl_oldest(p, c->key, true);
+    pl_unlink(p, old2);
+    fetch_conn_close(old2);
+  }
+}
+
+export fn fetch_pool_close_all(p: FetchPool*) {
+  while (p->head != 0) {
+    var c: FetchConn* = p->head;
+    pl_unlink(p, c);
+    fetch_conn_close(c);
+  }
+}
+
+export fn fetch_pool_count(p: FetchPool*) -> int32 {
+  return p->count;
+}
+
+export fn fetch_pool_count_key(p: FetchPool*, key: string) -> int32 {
+  return pl_count_key(p, key);
+}

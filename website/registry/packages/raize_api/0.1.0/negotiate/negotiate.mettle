@@ -1,0 +1,609 @@
+// raize_api/negotiate: content negotiation and compression.
+//
+// Follows RFC 9110:
+//   section 12.4.2  quality values (q=0 to q=1 with at most three decimals)
+//   section 12.5.1  Accept: media ranges, parameters, the most specific range wins
+//   section 12.5.3  Accept-Encoding: codings, "identity" and "*"
+//   section 8.4     Content-Encoding (gzip, deflate, zstd), x-gzip read as gzip
+//   section 15.5.7  406 Not Acceptable
+//   section 15.5.16 415 Unsupported Media Type
+// Compression itself is gzip (RFC 1952), deflate (zlib, RFC 1950) and
+// Zstandard (RFC 8878), done by the Press library.
+//
+//   rapi_use_negotiation(api);          // 406 when the client cannot take JSON
+//   rapi_use_compression(api, 1024);    // gzip/zstd responses >= 1 KiB, decode requests
+//
+// A malformed list element (a bad q value, a missing slash) is skipped, as if the
+// client had not sent it. A non-empty header with no usable element at all counts as
+// absent.
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/header";
+import "raize_core/context/response";
+import "press/press";
+import "../route/api";
+import "../route/dispatch";
+import "../problem/problem";
+import "../cors/cors";
+
+// ---------------------------------------------------------------------------
+// Parsing helpers
+// ---------------------------------------------------------------------------
+
+// Cuts `s` at the next `sep` that is outside a quoted string. Starts at *pos, moves
+// it past the separator and gives the piece in *out. False when s is used up.
+fn rapi__neg_piece(s: string, pos: int64*, sep: int32, out: string*) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = *pos;
+  if (i > n) { return false; }
+  var start: int64 = i;
+  var quoted: bool = false;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (quoted) {
+      if (c == 92 && i + 1 < n) {
+        i = i + 2;
+        continue;
+      }
+      if (c == 34) { quoted = false; }
+    } else {
+      if (c == 34) { quoted = true; }
+      else if (c == sep) { break; }
+    }
+    i = i + 1;
+  }
+  *out = rz_str_sub(s, start, i);
+  *pos = i + 1;
+  return true;
+}
+
+// A token (RFC 9110 section 5.6.2): one or more tchar.
+fn rapi__neg_token(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  for i in 0..s.length {
+    if (!rz_char_is_tchar((int32)s.chars[i])) { return false; }
+  }
+  return true;
+}
+
+// The text of a parameter value without its quotes.
+fn rapi__neg_unquote(v: string) -> string {
+  var n: int64 = (int64)v.length;
+  if (n >= 2 && v.chars[0] == 34 && v.chars[n - 1] == 34) { return rz_str_sub(v, 1, n - 1); }
+  return rz_str_sub(v, 0, n);
+}
+
+// A qvalue (RFC 9110 section 12.4.2) as 0..1000. "0", "0.5", "0.123", "1", "1.000" are
+// valid; "1.5", "0.1234", ".5", "-1" and "" are not.
+fn rapi__neg_qvalue(s: string, out: int32*) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n == 0) { return false; }
+  var c0: int32 = (int32)s.chars[0];
+  if (c0 != 48 && c0 != 49) { return false; }
+  var v: int32 = 0;
+  if (n > 1) {
+    if (s.chars[1] != 46) { return false; }
+    var digits: int64 = n - 2;
+    if (digits > 3) { return false; }
+    var i: int64 = 0;
+    while (i < digits) {
+      var d: int32 = (int32)s.chars[2 + i];
+      if (d < 48 || d > 57) { return false; }
+      v = v * 10 + (d - 48);
+      i = i + 1;
+    }
+    while (i < 3) {
+      v = v * 10;
+      i = i + 1;
+    }
+  }
+  if (c0 == 49) {
+    if (v != 0) { return false; }
+    *out = 1000;
+    return true;
+  }
+  *out = v;
+  return true;
+}
+
+// Splits "name=value" (both trimmed). False without an "=" or with an empty name.
+fn rapi__neg_pair(p: string, name: string*, value: string*) -> bool {
+  var eq: int64 = rz_str_find_byte(p, 61);
+  if (eq <= 0) { return false; }
+  *name = rz_header_trim(rz_str_sub(p, 0, eq));
+  *value = rz_header_trim(rz_str_from(p, eq + 1));
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Accept
+// ---------------------------------------------------------------------------
+
+// One media range of an Accept header.
+struct RapiAccItem {
+  kind: string;     // "application", or "*"
+  sub: string;      // "json", or "*"
+  params: string;   // the parameters before q, as written ("charset=utf-8")
+  q: int32;
+}
+
+// Reads one element ("application/json;charset=utf-8;q=0.5"). False when malformed.
+fn rapi__neg_acc_parse(elem: string, it: RapiAccItem*) -> bool {
+  var pos: int64 = 0;
+  var piece: string = rz_str_empty();
+  if (!rapi__neg_piece(elem, &pos, 59, &piece)) { return false; }
+  var range: string = rz_header_trim(piece);
+  if (range == "*") { range = "*/*"; }
+  var slash: int64 = rz_str_find_byte(range, 47);
+  if (slash <= 0) { return false; }
+  var k: string = rz_str_sub(range, 0, slash);
+  var sb: string = rz_str_from(range, slash + 1);
+  if (!rapi__neg_token(k) || !rapi__neg_token(sb)) { return false; }
+  if (k == "*" && sb != "*") { return false; }
+  it->kind = k;
+  it->sub = sb;
+  it->params = rz_str_empty();
+  it->q = 1000;
+  var pstart: int64 = pos;
+  var pend: int64 = (int64)elem.length;
+  while (true) {
+    var here: int64 = pos;
+    if (!rapi__neg_piece(elem, &pos, 59, &piece)) { break; }
+    var p: string = rz_header_trim(piece);
+    if (p.length == 0) { continue; }
+    var name: string = rz_str_empty();
+    var value: string = rz_str_empty();
+    if (!rapi__neg_pair(p, &name, &value)) { return false; }
+    if (!rapi__neg_token(name)) { return false; }
+    if (rz_str_eq_ci(name, "q")) {
+      var qv: int32 = 0;
+      if (!rapi__neg_qvalue(value, &qv)) { return false; }
+      it->q = qv;
+      pend = here - 1;
+      break;
+    }
+    if (value.length == 0) { return false; }
+  }
+  if (pend > pstart) { it->params = rz_str_sub(elem, pstart, pend); }
+  return true;
+}
+
+// Finds parameter `name` in "a=b;c=d". False when absent.
+fn rapi__neg_param_get(params: string, name: string, out: string*) -> bool {
+  var pos: int64 = 0;
+  var piece: string = rz_str_empty();
+  while (rapi__neg_piece(params, &pos, 59, &piece)) {
+    var p: string = rz_header_trim(piece);
+    var nm: string = rz_str_empty();
+    var vl: string = rz_str_empty();
+    if (!rapi__neg_pair(p, &nm, &vl)) { continue; }
+    if (rz_str_eq_ci(nm, name)) {
+      *out = rapi__neg_unquote(vl);
+      return true;
+    }
+  }
+  return false;
+}
+
+// How specifically a range fits the media type: -1 for no fit, else higher is more
+// specific (*/* 0, type/* 16, type/subtype 32, plus one per matching parameter).
+fn rapi__neg_acc_score(it: RapiAccItem*, mk: string, ms: string, mparams: string) -> int32 {
+  var score: int32 = 0;
+  if (it->kind != "*") {
+    if (!rz_str_eq_ci(it->kind, mk)) { return -1; }
+    if (it->sub == "*") {
+      score = 16;
+    } else {
+      if (!rz_str_eq_ci(it->sub, ms)) { return -1; }
+      score = 32;
+    }
+  }
+  var pos: int64 = 0;
+  var piece: string = rz_str_empty();
+  while (rapi__neg_piece(it->params, &pos, 59, &piece)) {
+    var p: string = rz_header_trim(piece);
+    if (p.length == 0) { continue; }
+    var nm: string = rz_str_empty();
+    var vl: string = rz_str_empty();
+    if (!rapi__neg_pair(p, &nm, &vl)) { return -1; }
+    var have: string = rz_str_empty();
+    if (!rapi__neg_param_get(mparams, nm, &have)) { return -1; }
+    if (!rz_str_eq_ci(have, rapi__neg_unquote(vl))) { return -1; }
+    score = score + 1;
+  }
+  return score;
+}
+
+/// The quality, 0 to 1000, that an Accept header gives `media` (RFC 9110 section 12.5.1).
+/// The most specific matching range decides: "application/json;v=2" over
+/// "application/json" over "application/*" over "*/*". An empty Accept means 1000, and
+/// so does one with no readable element. 0 means not acceptable.
+/// accept: the header value. media: one media type, with parameters if any
+///   ("application/json").
+export fn rapi_accept_q(accept: string, media: string) -> int32 {
+  var all: string = rz_header_trim(accept);
+  if (all.length == 0) { return 1000; }
+  var mpos: int64 = 0;
+  var mfirst: string = rz_str_empty();
+  if (!rapi__neg_piece(media, &mpos, 59, &mfirst)) { return 0; }
+  var mr: string = rz_header_trim(mfirst);
+  var slash: int64 = rz_str_find_byte(mr, 47);
+  if (slash <= 0) { return 0; }
+  var mk: string = rz_str_sub(mr, 0, slash);
+  var ms: string = rz_str_from(mr, slash + 1);
+  var mparams: string = rz_str_from(media, mpos);
+  var pos: int64 = 0;
+  var elem: string = rz_str_empty();
+  var best_score: int32 = -1;
+  var best_q: int32 = 0;
+  var any_valid: bool = false;
+  while (rapi__neg_piece(all, &pos, 44, &elem)) {
+    var e: string = rz_header_trim(elem);
+    if (e.length == 0) { continue; }
+    var it: RapiAccItem;
+    if (!rapi__neg_acc_parse(e, &it)) { continue; }
+    any_valid = true;
+    var sc: int32 = rapi__neg_acc_score(&it, mk, ms, mparams);
+    if (sc < 0) { continue; }
+    if (sc > best_score || (sc == best_score && it.q > best_q)) {
+      best_score = sc;
+      best_q = it.q;
+    }
+  }
+  if (!any_valid) { return 1000; }
+  if (best_score < 0) { return 0; }
+  return best_q;
+}
+
+// ---------------------------------------------------------------------------
+// Accept-Encoding
+// ---------------------------------------------------------------------------
+
+// Same coding name, with x-gzip meaning gzip (RFC 9110 section 8.4.1.3).
+fn rapi__neg_coding_is(name: string, want: string) -> bool {
+  if (rz_str_eq_ci(name, want)) { return true; }
+  if (rz_str_eq_ci(want, "gzip") && rz_str_eq_ci(name, "x-gzip")) { return true; }
+  if (rz_str_eq_ci(want, "x-gzip") && rz_str_eq_ci(name, "gzip")) { return true; }
+  return false;
+}
+
+/// The quality, 0 to 1000, that an Accept-Encoding header gives `coding` ("gzip", "zstd",
+/// "identity"), RFC 9110 section 12.5.3. A named coding beats "*". "identity" is
+/// acceptable unless it is listed with q=0 or "*;q=0" excludes it. An empty header
+/// accepts only identity. Callers treat a missing header as "send identity".
+/// ae: the header value ("gzip;q=0.5, zstd, identity;q=0, *"). coding: the coding asked about.
+export fn rapi_encoding_q(ae: string, coding: string) -> int32 {
+  var exact: int32 = -1;
+  var star: int32 = -1;
+  var pos: int64 = 0;
+  var elem: string = rz_str_empty();
+  while (rapi__neg_piece(ae, &pos, 44, &elem)) {
+    var e: string = rz_header_trim(elem);
+    if (e.length == 0) { continue; }
+    var ppos: int64 = 0;
+    var piece: string = rz_str_empty();
+    if (!rapi__neg_piece(e, &ppos, 59, &piece)) { continue; }
+    var name: string = rz_header_trim(piece);
+    if (!rapi__neg_token(name)) { continue; }
+    var q: int32 = 1000;
+    var good: bool = true;
+    while (rapi__neg_piece(e, &ppos, 59, &piece)) {
+      var p: string = rz_header_trim(piece);
+      if (p.length == 0) { continue; }
+      var pn: string = rz_str_empty();
+      var pv: string = rz_str_empty();
+      if (!rapi__neg_pair(p, &pn, &pv)) { good = false; break; }
+      if (rz_str_eq_ci(pn, "q")) {
+        if (!rapi__neg_qvalue(pv, &q)) { good = false; break; }
+      }
+    }
+    if (!good) { continue; }
+    if (name == "*") {
+      if (q > star) { star = q; }
+    } else if (rapi__neg_coding_is(name, coding)) {
+      if (q > exact) { exact = q; }
+    }
+  }
+  if (exact >= 0) { return exact; }
+  if (star >= 0) { return star; }
+  if (rz_str_eq_ci(coding, "identity")) { return 1000; }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 406: the client must be able to take what the operation sends
+// ---------------------------------------------------------------------------
+
+fn rapi__neg_ends_ci(s: string, suffix: string) -> bool {
+  if (s.length < suffix.length) { return false; }
+  return rz_str_eq_ci(rz_str_from(s, (int64)s.length - (int64)suffix.length), suffix);
+}
+
+// True when Accept holds a "+json" range (application/vnd.api+json) with q above 0.
+fn rapi__neg_json_suffix(accept: string) -> bool {
+  var pos: int64 = 0;
+  var elem: string = rz_str_empty();
+  while (rapi__neg_piece(accept, &pos, 44, &elem)) {
+    var e: string = rz_header_trim(elem);
+    if (e.length == 0) { continue; }
+    var it: RapiAccItem;
+    if (!rapi__neg_acc_parse(e, &it)) { continue; }
+    if (it.q > 0 && it.kind != "*" && rapi__neg_ends_ci(it.sub, "+json")) { return true; }
+  }
+  return false;
+}
+
+fn rapi__neg_list_add(b: RzBuf*, item: string) {
+  if (rz_header_has_token(rz_buf_str(b), item)) { return; }
+  if (b->len > 0) { rz_buf_add(b, ", "); }
+  rz_buf_add(b, item);
+}
+
+// The media types an operation can send, then application/problem+json for errors.
+fn rapi__neg_available(op: RapiOp*, b: RzBuf*) -> bool {
+  var json: bool = false;
+  for i in 0..op->nresps {
+    var rs: RapiResp* = &op->resps[i];
+    if (rs->type == 0 && rs->media.length == 0) { continue; }
+    var m: string = rs->media;
+    if (m.length == 0) { m = "application/json"; }
+    rapi__neg_list_add(b, m);
+    if (rapi_is_json_media(m)) { json = true; }
+  }
+  if (b->len == 0) {
+    rapi__neg_list_add(b, "application/json");
+    json = true;
+  }
+  rapi__neg_list_add(b, "application/problem+json");
+  return json;
+}
+
+fn rapi__neg_before(r: RapiReq*) -> int32 {
+  var ctx: RzContext* = r->ctx;
+  var accept: string = rz_ctx_header(ctx, "Accept");
+  if (rz_header_trim(accept).length == 0) { return RAPI_NEXT; }
+  var b: RzBuf* = rz_buf_new();
+  var json: bool = rapi__neg_available(r->op, b);
+  var ok: bool = false;
+  var pos: int64 = 0;
+  var item: string = rz_str_empty();
+  while (rapi__neg_piece(rz_buf_str(b), &pos, 44, &item)) {
+    var m: string = rz_header_trim(item);
+    if (m.length == 0) { continue; }
+    if (rapi_accept_q(accept, m) > 0) { ok = true; break; }
+  }
+  if (!ok && json && rapi__neg_json_suffix(accept)) { ok = true; }
+  if (ok) {
+    rz_buf_free(b);
+    return RAPI_NEXT;
+  }
+  var have: string = rz_arena_str(ctx->arena, rz_buf_str(b));
+  rz_buf_free(b);
+  return rapi_problem(ctx, 406, rz_arena_str(ctx->arena, "the server can send: {have}"));
+}
+
+/// Answers 406 Not Acceptable (RFC 9110 section 15.5.7) when the request's Accept header
+/// excludes everything the operation can send. The operation's media types come from
+/// its documented responses (JSON when it has none); application/problem+json is always
+/// counted, and a "+json" range such as application/vnd.api+json is taken for JSON.
+/// A request without Accept is never refused. The problem lists what is available.
+export fn rapi_use_negotiation(api: RapiApi*) {
+  rapi_before(api, &rapi__neg_before);
+}
+
+// ---------------------------------------------------------------------------
+// Compression
+// ---------------------------------------------------------------------------
+
+// What the hooks need, kept in api->compress for the life of the app.
+struct RapiCompress {
+  min_bytes: int64;
+}
+
+const RAPI_NEG_GZIP: int32 = 1;
+const RAPI_NEG_DEFLATE: int32 = 2;
+const RAPI_NEG_ZSTD: int32 = 3;
+
+fn rapi__neg_after(r: RapiReq*, status: int32) -> int32 {
+  var st: RapiCompress* = (RapiCompress*)r->api->compress;
+  if (st == 0) { return status; }
+  var ctx: RzContext* = r->ctx;
+  var resp: RzResponse* = ctx->resp;
+  if (status < 200 || status == 204 || status == 205 || status == 206 || status == 304) { return status; }
+  if (ctx->req->verb == "HEAD" || resp->body == 0) { return status; }
+  var n: int64 = resp->body->len;
+  if (n <= 0 || n < st->min_bytes) { return status; }
+  if (rz_resp_header_get(resp, "Content-Encoding").length > 0) { return status; }
+  if (rz_header_has_token(rz_resp_header_get(resp, "Cache-Control"), "no-transform")) { return status; }
+  var ae: string = rz_ctx_header(ctx, "Accept-Encoding");
+  if (ae.length == 0) { return status; }
+  var qz: int32 = rapi_encoding_q(ae, "zstd");
+  var qg: int32 = rapi_encoding_q(ae, "gzip");
+  if (qz <= 0 && qg <= 0) { return status; }
+  var use_zstd: bool = qz >= qg;    // on a tie zstd wins
+  var out: PressBuf;
+  var rc: int32 = PRESS_OK;
+  if (use_zstd) {
+    rc = press_zstd_compress(resp->body->data, n, 3, &out);
+  } else {
+    rc = press_gzip_compress(resp->body->data, n, 6, &out);
+  }
+  if (rc != PRESS_OK || out.len >= n) {
+    press_buf_free(&out);
+    return status;
+  }
+  var coding: string = "gzip";
+  if (use_zstd) { coding = "zstd"; }
+  if (rz_ctx_set_header(ctx, "Content-Encoding", coding) != RZ_OK) {
+    press_buf_free(&out);
+    return status;
+  }
+  resp->body->len = 0;
+  rz_buf_add_bytes(resp->body, out.data, out.len);
+  press_buf_free(&out);
+  rapi_vary_add(ctx, "Accept-Encoding");
+  // A strong ETag names the exact bytes; these are different bytes now (RFC 9110
+  // section 8.8.1, 8.8.3).
+  var tag: string = rz_resp_header_get(resp, "ETag");
+  if (tag.length > 0 && !rz_str_starts(tag, "W/")) {
+    var wb: RzBuf* = rz_buf_new();
+    rz_buf_add(wb, "W/");
+    rz_buf_add(wb, tag);
+    rz_ctx_set_header(ctx, "ETag", rz_buf_str(wb));
+    rz_buf_free(wb);
+  }
+  return status;
+}
+
+// Appends the decoded form of src[0..n] to out (whose limit is set). Press status.
+fn rapi__neg_decode_one(kind: int32, src: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (kind == RAPI_NEG_GZIP) { return press_gzip_decompress(src, n, out); }
+  if (kind == RAPI_NEG_ZSTD) { return press_zstd_decompress_ex(src, n, out, (int64)1 << 25); }
+  // "deflate" is zlib data (RFC 9110 section 8.4.1.2); some clients send raw DEFLATE.
+  var rc: int32 = rapi__neg_inflate(src, n, out, PRESS_FMT_AUTO);
+  if (rc == PRESS_E_LIMIT || rc == PRESS_E_MEM || rc == PRESS_OK) { return rc; }
+  press_buf_clear(out);
+  return rapi__neg_inflate(src, n, out, PRESS_FMT_RAW);
+}
+
+fn rapi__neg_inflate(src: uint8*, n: int64, out: PressBuf*, format: int32) -> int32 {
+  var d: PressDeflateDec;
+  var rc: int32 = press_deflate_dec_init(&d, format);
+  if (rc != PRESS_OK) { return rc; }
+  rc = press_deflate_dec_feed(&d, src, n, out);
+  if (rc == PRESS_OK) { rc = press_deflate_dec_finish(&d); }
+  press_deflate_dec_free(&d);
+  return rc;
+}
+
+// The content coding for a name, or 0 when we cannot decode it.
+fn rapi__neg_kind(name: string) -> int32 {
+  if (rapi__neg_coding_is(name, "gzip")) { return RAPI_NEG_GZIP; }
+  if (rz_str_eq_ci(name, "deflate")) { return RAPI_NEG_DEFLATE; }
+  if (rz_str_eq_ci(name, "zstd")) { return RAPI_NEG_ZSTD; }
+  return 0;
+}
+
+fn rapi__neg_kind_name(kind: int32) -> string {
+  if (kind == RAPI_NEG_GZIP) { return "gzip"; }
+  if (kind == RAPI_NEG_ZSTD) { return "zstd"; }
+  return "deflate";
+}
+
+// Marks the request's Content-Encoding as dealt with.
+fn rapi__neg_clear_encoding(req: RzRequest*) {
+  for i in 0..req->header_count {
+    if (rz_str_eq_ci(req->headers[i].name, "Content-Encoding")) { req->headers[i].value = "identity"; }
+  }
+}
+
+fn rapi__neg_before_body(r: RapiReq*) -> int32 {
+  var ctx: RzContext* = r->ctx;
+  var req: RzRequest* = ctx->req;
+  var ce: string = rz_ctx_header(ctx, "Content-Encoding");
+  if (ce.length == 0 || req->body.length == 0) { return RAPI_NEXT; }
+
+  // The codings in the order they were applied. Check them all before decoding.
+  var kinds: int32[4];
+  var nk: int32 = 0;
+  var pos: int64 = 0;
+  var piece: string = rz_str_empty();
+  while (rapi__neg_piece(ce, &pos, 44, &piece)) {
+    var tok: string = rz_header_trim(piece);
+    if (tok.length == 0 || rz_str_eq_ci(tok, "identity")) { continue; }
+    var kind: int32 = rapi__neg_kind(tok);
+    if (kind == 0 || nk >= 4) {
+      rz_ctx_set_header(ctx, "Accept-Encoding", "gzip, deflate, zstd");
+      return rapi_problem(ctx, 415, rz_arena_str(ctx->arena, "the content coding {tok} is not supported; use gzip, deflate or zstd"));
+    }
+    kinds[nk] = kind;
+    nk = nk + 1;
+  }
+  if (nk == 0) { return RAPI_NEXT; }
+
+  var limit: int64 = r->op->max_body;
+  if (limit <= 0) { limit = r->api->max_body; }
+  if (limit <= 0) { limit = 1048576; }
+
+  // Undo the last coding first.
+  var cur: uint8* = req->body.chars;
+  var curn: int64 = (int64)req->body.length;
+  var prev: PressBuf;
+  var have_prev: bool = false;
+  var rc: int32 = PRESS_OK;
+  var failed_kind: int32 = 0;
+  var i: int32 = nk - 1;
+  while (i >= 0) {
+    var out: PressBuf;
+    press_buf_limit(&out, limit);
+    rc = rapi__neg_decode_one(kinds[i], cur, curn, &out);
+    if (have_prev) { press_buf_free(&prev); }
+    have_prev = false;
+    if (rc != PRESS_OK) {
+      failed_kind = kinds[i];
+      press_buf_free(&out);
+      break;
+    }
+    prev = out;
+    have_prev = true;
+    cur = prev.data;
+    curn = prev.len;
+    i = i - 1;
+  }
+  if (rc != PRESS_OK) {
+    if (rc == PRESS_E_LIMIT) {
+      return rapi_problem(ctx, 413, rz_arena_str(ctx->arena, "the body is larger than {limit} bytes once decompressed"));
+    }
+    if (rc == PRESS_E_MEM) { return rapi_problem(ctx, 500, ""); }
+    var what: string = rapi__neg_kind_name(failed_kind);
+    return rapi_problem(ctx, 400, rz_arena_str(ctx->arena, "the body is not valid {what} data"));
+  }
+
+  var body: string = rz_str_empty();
+  if (curn > 0) {
+    // The arena holds at most RZ_ARENA_MAX_BYTES for the whole request.
+    if (rz_arena_used(ctx->arena) + curn + 64 > RZ_ARENA_MAX_BYTES) {
+      press_buf_free(&prev);
+      return rapi_problem(ctx, 413, "the body is too large to hold once decompressed");
+    }
+    body = rz_arena_bytes(ctx->arena, cur, curn);
+    if (body.length == 0) {
+      press_buf_free(&prev);
+      return rapi_problem(ctx, 413, "the body is too large to hold once decompressed");
+    }
+  }
+  if (have_prev) { press_buf_free(&prev); }
+  req->body = body;
+  req->body_len = curn;
+  rapi__neg_clear_encoding(req);
+  return RAPI_NEXT;
+}
+
+/// Turns on compression, both ways.
+/// Responses: when the body is at least `min_bytes`, the status allows a body (not 204,
+///   205, 206, 304; not HEAD), no Content-Encoding is set yet and Cache-Control does not
+///   say no-transform, the body is compressed with the best coding the client accepts
+///   (zstd over gzip on a tie; nothing when it would not get smaller). It sets
+///   Content-Encoding, adds Vary: Accept-Encoding and turns a strong ETag into a weak one.
+/// Requests: a body with Content-Encoding gzip, x-gzip, deflate or zstd (several are
+///   undone last first) is decompressed before the handler sees it, within the
+///   operation's body limit (else the API's): 413 when larger, 400 when corrupt, and
+///   415 with an Accept-Encoding header for any other coding. The decoded body is
+///   copied into the request arena, so it must also fit there (64 KiB per request).
+/// api: the API. min_bytes: the smallest response body worth compressing.
+/// Calling it again only changes min_bytes.
+export fn rapi_use_compression(api: RapiApi*, min_bytes: int64) {
+  var st: RapiCompress* = (RapiCompress*)api->compress;
+  if (st != 0) {
+    st->min_bytes = min_bytes;
+    return;
+  }
+  st = (RapiCompress*)calloc(1, sizeof(RapiCompress));
+  if (st == 0) { return; }
+  st->min_bytes = min_bytes;
+  api->compress = (rawptr)st;
+  rapi_before(api, &rapi__neg_before_body);
+  rapi_after(api, &rapi__neg_after);
+}

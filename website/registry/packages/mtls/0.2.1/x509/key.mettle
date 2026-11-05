@@ -1,0 +1,249 @@
+// Loading private keys: PKCS#8 ("PRIVATE KEY"), SEC1 ("EC PRIVATE KEY") and
+// PKCS#1 ("RSA PRIVATE KEY"), as PEM or raw DER, into MtlsPrivKey.
+//
+// Ed25519: the seed goes through cryptex to make the 64-byte secret and the
+// public key. EC: sk holds the scalar (left-padded to the field size) and
+// pub the point if the file had one (publen is 0 otherwise; ECDSA signing is
+// not available yet anyway). RSA: the DER is copied into k->der and the
+// parts point into it. Temporary copies of key material are wiped.
+
+import "std/mem";
+import "cryptex/core/types";
+import "cryptex/core/util";
+import "cryptex/ecc/sign";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/sig";
+import "mtls/x509/der";
+import "mtls/x509/pem";
+
+fn mtls_x_key_ed25519(k: MtlsPrivKey*, seed: uint8*, n: int64) -> int32 {
+  if (n != 32) { return MTLS_E_DECODE; }
+  var s: CrSeed32;
+  var pk: CrEd25519Public;
+  var sk: CrEd25519Secret;
+  memcpy(&s.b[0], seed, 32);
+  var rc: int32 = cr_ed25519_seed_keypair(&pk, &sk, &s);
+  if (rc == CR_OK) {
+    k->kind = MTLS_KEY_ED25519;
+    memcpy(&k->sk[0], &sk.b[0], 64);
+    memcpy(&k->pub[0], &pk.b[0], 32);
+    k->publen = 32;
+  }
+  cr_wipe(&s.b[0], 32);
+  cr_wipe(&sk.b[0], 64);
+  if (rc != CR_OK) { return MTLS_E_CRYPTO; }
+  return MTLS_OK;
+}
+
+// One RSAPrivateKey integer as a magnitude, nonzero.
+fn mtls_x_key_part(r: MtlsRd*, p: uint8**, n: int64*) -> bool {
+  if (!mtls_der_uint(r, p, n)) { return false; }
+  return *n > 0;
+}
+
+fn mtls_x_key_rsa(k: MtlsPrivKey*, der: uint8*, n: int64) -> int32 {
+  var copy: uint8* = malloc(n);
+  if (copy == 0) { return MTLS_E_NOMEM; }
+  memcpy(copy, der, n);
+  k->der = copy;
+  k->derlen = n;
+  var r: MtlsRd = mtls_rd(copy, n);
+  var seq: MtlsRd;
+  if (!mtls_der_seq(&r, &seq) || !mtls_rd_ok_end(&r)) { return MTLS_E_DECODE; }
+  var v: int64 = 0;
+  if (!mtls_der_small(&seq, &v)) { return MTLS_E_DECODE; }
+  if (v == 1) { return MTLS_E_UNSUPPORTED; }   // multi-prime
+  if (v != 0) { return MTLS_E_DECODE; }
+  if (!mtls_x_key_part(&seq, &k->n, &k->nlen)) { return MTLS_E_DECODE; }
+  if (!mtls_x_key_part(&seq, &k->e, &k->elen)) { return MTLS_E_DECODE; }
+  if (!mtls_x_key_part(&seq, &k->d, &k->dlen)) { return MTLS_E_DECODE; }
+  if (!mtls_x_key_part(&seq, &k->p, &k->plen)) { return MTLS_E_DECODE; }
+  if (!mtls_x_key_part(&seq, &k->q, &k->qlen)) { return MTLS_E_DECODE; }
+  if (!mtls_x_key_part(&seq, &k->dp, &k->dplen)) { return MTLS_E_DECODE; }
+  if (!mtls_x_key_part(&seq, &k->dq, &k->dqlen)) { return MTLS_E_DECODE; }
+  if (!mtls_x_key_part(&seq, &k->qinv, &k->qinvlen)) { return MTLS_E_DECODE; }
+  if (!mtls_rd_ok_end(&seq)) { return MTLS_E_DECODE; }
+  if (k->nlen < 128 || k->nlen > 2048) { return MTLS_E_DECODE; }
+  k->kind = MTLS_KEY_RSA;
+  return MTLS_OK;
+}
+
+// Curve kind from a namedCurve OID, or MTLS_KEY_NONE.
+fn mtls_x_curve(p: uint8*, n: int64) -> int32 {
+  if (mtls_der_oid_is(p, n, "2a8648ce3d030107")) { return MTLS_KEY_P256; }
+  if (mtls_der_oid_is(p, n, "2b81040022")) { return MTLS_KEY_P384; }
+  return MTLS_KEY_NONE;
+}
+
+// ECPrivateKey (RFC 5915). hint is the curve from a PKCS#8 wrapper, or none.
+fn mtls_x_key_sec1(k: MtlsPrivKey*, der: uint8*, n: int64, hint: int32) -> int32 {
+  var r: MtlsRd = mtls_rd(der, n);
+  var seq: MtlsRd;
+  if (!mtls_der_seq(&r, &seq) || !mtls_rd_ok_end(&r)) { return MTLS_E_DECODE; }
+  var v: int64 = 0;
+  if (!mtls_der_small(&seq, &v) || v != 1) { return MTLS_E_DECODE; }
+  var pp: uint8* = 0;
+  var pn: int64 = 0;
+  if (!mtls_der_octets(&seq, &pp, &pn)) { return MTLS_E_DECODE; }
+  var curve: int32 = hint;
+  var a0: MtlsRd;
+  if (mtls_der_opt(&seq, 0xa0, &a0)) {
+    var op: uint8* = 0;
+    var on: int64 = 0;
+    if (mtls_der_peek(&a0) != MTLS_ASN1_OID) { return MTLS_E_UNSUPPORTED; }
+    if (!mtls_der_oid(&a0, &op, &on) || !mtls_rd_ok_end(&a0)) { return MTLS_E_DECODE; }
+    var c2: int32 = mtls_x_curve(op, on);
+    if (c2 == MTLS_KEY_NONE) { return MTLS_E_UNSUPPORTED; }
+    if (hint != MTLS_KEY_NONE && hint != c2) { return MTLS_E_DECODE; }
+    curve = c2;
+  }
+  if (curve == MTLS_KEY_NONE) {
+    if (pn == 32) { curve = MTLS_KEY_P256; }
+    if (pn == 48) { curve = MTLS_KEY_P384; }
+  }
+  if (curve == MTLS_KEY_NONE) { return MTLS_E_UNSUPPORTED; }
+  var flen: int64 = 32;
+  var plen: int64 = 65;
+  if (curve == MTLS_KEY_P384) {
+    flen = 48;
+    plen = 97;
+  }
+  if (pn < 1 || pn > flen) { return MTLS_E_DECODE; }
+  memset(&k->sk[0], 0, 64);
+  memcpy(&k->sk[0] + (flen - pn), pp, pn);
+  k->kind = curve;
+  var a1: MtlsRd;
+  if (mtls_der_opt(&seq, 0xa1, &a1)) {
+    var bp: uint8* = 0;
+    var bn: int64 = 0;
+    if (!mtls_der_bits_bytes(&a1, &bp, &bn) || !mtls_rd_ok_end(&a1)) { return MTLS_E_DECODE; }
+    if (bn != plen || bp[0] != (uint8)4) { return MTLS_E_DECODE; }
+    memcpy(&k->pub[0], bp, bn);
+    k->publen = bn;
+  }
+  if (!mtls_rd_ok_end(&seq)) { return MTLS_E_DECODE; }
+  return MTLS_OK;
+}
+
+// PrivateKeyInfo (RFC 5208 / 5958).
+fn mtls_x_key_pkcs8(k: MtlsPrivKey*, der: uint8*, n: int64) -> int32 {
+  var r: MtlsRd = mtls_rd(der, n);
+  var seq: MtlsRd;
+  if (!mtls_der_seq(&r, &seq) || !mtls_rd_ok_end(&r)) { return MTLS_E_DECODE; }
+  var v: int64 = 0;
+  if (!mtls_der_small(&seq, &v) || v > 1) { return MTLS_E_DECODE; }
+  var ai: MtlsRd;
+  if (!mtls_der_seq(&seq, &ai)) { return MTLS_E_DECODE; }
+  var op: uint8* = 0;
+  var on: int64 = 0;
+  if (!mtls_der_oid(&ai, &op, &on)) { return MTLS_E_DECODE; }
+  var kp: uint8* = 0;
+  var kn: int64 = 0;
+  if (!mtls_der_octets(&seq, &kp, &kn)) { return MTLS_E_DECODE; }
+  // Optional attributes [0] and (v2) public key [1] are not needed.
+  var skip: MtlsRd;
+  mtls_der_opt(&seq, 0xa0, &skip);
+  mtls_der_opt(&seq, 0x81, &skip);
+  if (!mtls_rd_ok_end(&seq)) { return MTLS_E_DECODE; }
+
+  if (mtls_der_oid_is(op, on, "2b6570")) {
+    if (!mtls_rd_ok_end(&ai)) { return MTLS_E_DECODE; }
+    var ir: MtlsRd = mtls_rd(kp, kn);
+    var sp: uint8* = 0;
+    var sn: int64 = 0;
+    if (!mtls_der_octets(&ir, &sp, &sn) || !mtls_rd_ok_end(&ir)) { return MTLS_E_DECODE; }
+    return mtls_x_key_ed25519(k, sp, sn);
+  }
+  if (mtls_der_oid_is(op, on, "2a8648ce3d0201")) {
+    var cp: uint8* = 0;
+    var cn: int64 = 0;
+    if (mtls_der_peek(&ai) != MTLS_ASN1_OID) { return MTLS_E_UNSUPPORTED; }
+    if (!mtls_der_oid(&ai, &cp, &cn) || !mtls_rd_ok_end(&ai)) { return MTLS_E_DECODE; }
+    var curve: int32 = mtls_x_curve(cp, cn);
+    if (curve == MTLS_KEY_NONE) { return MTLS_E_UNSUPPORTED; }
+    return mtls_x_key_sec1(k, kp, kn, curve);
+  }
+  if (mtls_der_oid_is(op, on, "2a864886f70d010101")) {
+    return mtls_x_key_rsa(k, kp, kn);
+  }
+  return MTLS_E_UNSUPPORTED;
+}
+
+// shape: 0 = decide from the DER, 1 = PKCS#8, 2 = SEC1, 3 = PKCS#1.
+fn mtls_x_key_der(der: uint8*, n: int64, shape: int32, k: MtlsPrivKey*) -> int32 {
+  var s: int32 = shape;
+  if (s == 0) {
+    var r: MtlsRd = mtls_rd(der, n);
+    var seq: MtlsRd;
+    var v: int64 = 0;
+    if (!mtls_der_seq(&r, &seq) || !mtls_der_small(&seq, &v)) { return MTLS_E_DECODE; }
+    var t: int32 = mtls_der_peek(&seq);
+    if (t == MTLS_ASN1_SEQUENCE) { s = 1; }
+    if (t == MTLS_ASN1_OCTET_STRING) { s = 2; }
+    if (t == MTLS_ASN1_INTEGER) { s = 3; }
+    if (s == 0) { return MTLS_E_DECODE; }
+  }
+  if (s == 1) { return mtls_x_key_pkcs8(k, der, n); }
+  if (s == 2) { return mtls_x_key_sec1(k, der, n, MTLS_KEY_NONE); }
+  return mtls_x_key_rsa(k, der, n);
+}
+
+/// mtls_key_load_der: loads a private key from raw DER (PKCS#8, SEC1 or
+/// PKCS#1, told apart by their structure). On failure k is cleared and
+/// freed, so there is nothing to release.
+export fn mtls_key_load_der(der: uint8*, n: int64, k: MtlsPrivKey*) -> int32 {
+  memset(k, 0, (int64)sizeof(MtlsPrivKey));
+  if (der == 0 || n <= 0) { return MTLS_E_DECODE; }
+  var rc: int32 = mtls_x_key_der(der, n, 0, k);
+  if (rc != MTLS_OK) { mtls_privkey_free(k); }
+  return rc;
+}
+
+/// mtls_key_load_pem: loads the first private key block of a PEM buffer
+/// ("PRIVATE KEY", "EC PRIVATE KEY" or "RSA PRIVATE KEY"). Other blocks,
+/// such as certificates, are skipped. Encrypted keys give MTLS_E_UNSUPPORTED.
+export fn mtls_key_load_pem(pem: uint8*, n: int64, k: MtlsPrivKey*) -> int32 {
+  memset(k, 0, (int64)sizeof(MtlsPrivKey));
+  var it: MtlsPemIter;
+  var blk: MtlsPemBlock;
+  mtls_pem_iter(&it, pem, n);
+  while (true) {
+    var rc: int32 = mtls_pem_next(&it, &blk);
+    if (rc < 0) { return rc; }
+    if (rc == 0) { return MTLS_E_DECODE; }
+    var shape: int32 = 0;
+    if (blk.label == "PRIVATE KEY") { shape = 1; }
+    if (blk.label == "EC PRIVATE KEY") { shape = 2; }
+    if (blk.label == "RSA PRIVATE KEY") { shape = 3; }
+    if (blk.label == "ENCRYPTED PRIVATE KEY") { return MTLS_E_UNSUPPORTED; }
+    if (shape == 0) { continue; }
+    var der: uint8* = 0;
+    var dl: int64 = 0;
+    rc = mtls_pem_decode_alloc(&blk, &der, &dl);
+    if (rc != MTLS_OK) { return rc; }
+    rc = mtls_x_key_der(der, dl, shape, k);
+    cr_wipe(der, dl);
+    free(der);
+    if (rc != MTLS_OK) { mtls_privkey_free(k); }
+    return rc;
+  }
+  return MTLS_E_DECODE;
+}
+
+/// mtls_key_load: PEM if the buffer contains "-----BEGIN", otherwise DER.
+/// Free the result with mtls_privkey_free.
+export fn mtls_key_load(buf: uint8*, n: int64, k: MtlsPrivKey*) -> int32 {
+  if (buf == 0 || n <= 0) {
+    memset(k, 0, (int64)sizeof(MtlsPrivKey));
+    return MTLS_E_DECODE;
+  }
+  if (n >= 11) {
+    for i in 0..(n - 10) {
+      if (buf[i] == (uint8)45 && memcmp(buf + i, "-----BEGIN ".chars, 11) == 0) {
+        return mtls_key_load_pem(buf, n, k);
+      }
+    }
+  }
+  return mtls_key_load_der(buf, n, k);
+}

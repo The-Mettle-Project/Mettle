@@ -1,0 +1,523 @@
+// Trust store and certificate chain verification (an RFC 5280 subset, in the
+// spirit of what Go and rustls check).
+//
+// The chain is built from the leaf upward by matching issuer and subject
+// bytes, trying every candidate and backing out of dead ends. A root in
+// MtlsRoots is trusted because it is there: its own signature is not
+// looked at, but its dates, CA flag, key usage, extended key usage and name
+// constraints still count when it signs something.
+
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+import "mtls/crypto/sig";
+import "mtls/x509/der";
+import "mtls/x509/pem";
+import "mtls/x509/cert";
+import "mtls/x509/names";
+
+export const MTLS_PURPOSE_SERVER: int32 = 1;   // we check a server's certificate
+export const MTLS_PURPOSE_CLIENT: int32 = 2;   // we check a client's certificate
+
+export const MTLS_PIN_NONE: int32 = 0;
+export const MTLS_PIN_ONLY: int32 = 1;         // the pin alone decides: no chain, dates or host name checks
+export const MTLS_PIN_AND_CHAIN: int32 = 2;    // full chain checks, and the pin must match as well
+
+// Why a certificate was refused (MtlsVerifyResult.detail).
+export const MTLS_CV_OK: int32 = 0;
+export const MTLS_CV_MALFORMED: int32 = 1;
+export const MTLS_CV_EXPIRED: int32 = 2;
+export const MTLS_CV_NOT_YET_VALID: int32 = 3;
+export const MTLS_CV_UNKNOWN_ISSUER: int32 = 4;
+export const MTLS_CV_BAD_SIGNATURE: int32 = 5;
+export const MTLS_CV_NAME_MISMATCH: int32 = 6;
+export const MTLS_CV_NOT_CA: int32 = 7;
+export const MTLS_CV_PATH_LEN: int32 = 8;
+export const MTLS_CV_KEY_USAGE: int32 = 9;
+export const MTLS_CV_EKU: int32 = 10;
+export const MTLS_CV_UNKNOWN_CRITICAL: int32 = 11;
+export const MTLS_CV_NAME_CONSTRAINT: int32 = 12;
+export const MTLS_CV_UNSUPPORTED_SIG: int32 = 13;
+export const MTLS_CV_WEAK_KEY: int32 = 14;      // RSA modulus under 2048 or over 8192 bits
+export const MTLS_CV_TOO_LONG: int32 = 15;
+export const MTLS_CV_PIN_MISMATCH: int32 = 16;
+export const MTLS_CV_BAD_VERSION: int32 = 17;
+export const MTLS_CV_BAD_ARG: int32 = 18;
+
+const MTLS_X_MAX_INTER: int32 = 16;
+const MTLS_X_MAX_DEPTH: int32 = 10;   // certificates in a path, leaf and root included
+const MTLS_X_MAX_SIGS: int32 = 64;    // signature checks before giving up on a messy chain
+
+/// mtls_cv_text: a short English reason for a detail code.
+export fn mtls_cv_text(detail: int32) -> string {
+  switch (detail) {
+    case 0: { return "ok"; }
+    case 1: { return "malformed certificate"; }
+    case 2: { return "certificate has expired"; }
+    case 3: { return "certificate is not valid yet"; }
+    case 4: { return "unknown issuer (no trusted root found)"; }
+    case 5: { return "bad signature on certificate"; }
+    case 6: { return "certificate does not match the host name"; }
+    case 7: { return "issuer is not a CA"; }
+    case 8: { return "CA path length exceeded"; }
+    case 9: { return "CA key usage does not allow signing certificates"; }
+    case 10: { return "extended key usage does not allow this purpose"; }
+    case 11: { return "unknown critical extension"; }
+    case 12: { return "name constraint violated"; }
+    case 13: { return "unsupported signature or key algorithm"; }
+    case 14: { return "RSA key size is not acceptable (2048 to 8192 bits)"; }
+    case 15: { return "certificate chain is too long or too tangled"; }
+    case 16: { return "public key does not match the pin"; }
+    case 17: { return "certificate is not X.509 v3"; }
+    case 18: { return "bad argument"; }
+    default: { }
+  }
+  return "unknown certificate error";
+}
+
+/// mtls_cv_alert: the TLS alert to send for a detail code.
+export fn mtls_cv_alert(detail: int32) -> int32 {
+  switch (detail) {
+    case 0: { return 0; }
+    case 2: { return MTLS_ALERT_CERTIFICATE_EXPIRED; }
+    case 3: { return MTLS_ALERT_CERTIFICATE_EXPIRED; }
+    case 4: { return MTLS_ALERT_UNKNOWN_CA; }
+    case 11: { return MTLS_ALERT_UNSUPPORTED_CERTIFICATE; }
+    case 13: { return MTLS_ALERT_UNSUPPORTED_CERTIFICATE; }
+    case 14: { return MTLS_ALERT_INSUFFICIENT_SECURITY; }
+    case 18: { return MTLS_ALERT_INTERNAL_ERROR; }
+    default: { }
+  }
+  return MTLS_ALERT_BAD_CERTIFICATE;
+}
+
+// ---- trust store ----------------------------------------------------------
+
+/// MtlsRoots: trusted root certificates. Each one owns a copy of its DER.
+/// skipped counts blocks that mtls_roots_add_pem could not use.
+export struct MtlsRoots {
+  certs: MtlsCert*;
+  count: int32;
+  cap: int32;
+  skipped: int32;
+}
+
+export fn mtls_roots_init(r: MtlsRoots*) {
+  r->certs = 0;
+  r->count = 0;
+  r->cap = 0;
+  r->skipped = 0;
+}
+
+export fn mtls_roots_free(r: MtlsRoots*) {
+  for i in 0..r->count {
+    mtls_cert_free(&r->certs[i]);
+  }
+  if (r->certs != 0) { free(r->certs); }
+  mtls_roots_init(r);
+}
+
+/// mtls_roots_add_der: adds one DER certificate (copied). An exact
+/// duplicate is accepted and not stored twice. Fails with MTLS_E_DECODE if
+/// the certificate does not parse, which leaves the store as it was.
+export fn mtls_roots_add_der(r: MtlsRoots*, der: uint8*, n: int64) -> int32 {
+  var c: MtlsCert;
+  var rc: int32 = mtls_cert_parse_copy(&c, der, n);
+  if (rc != MTLS_OK) { return rc; }
+  for i in 0..r->count {
+    if (mtls_bytes_eq(r->certs[i].der, r->certs[i].derlen, c.der, c.derlen)) {
+      mtls_cert_free(&c);
+      return MTLS_OK;
+    }
+  }
+  if (r->count == r->cap) {
+    var ncap: int32 = r->cap * 2;
+    if (ncap < 16) { ncap = 16; }
+    var grown: MtlsCert* = realloc(r->certs, (int64)ncap * (int64)sizeof(MtlsCert));
+    if (grown == 0) {
+      mtls_cert_free(&c);
+      return MTLS_E_NOMEM;
+    }
+    r->certs = grown;
+    r->cap = ncap;
+  }
+  r->certs[r->count] = c;
+  r->count = r->count + 1;
+  return MTLS_OK;
+}
+
+/// mtls_roots_add_pem: adds every CERTIFICATE block in a PEM buffer. Returns
+/// how many were added; blocks that are broken or are not certificates are
+/// counted in r->skipped instead. Returns a negative MTLS_E_* only for
+/// out-of-memory.
+export fn mtls_roots_add_pem(r: MtlsRoots*, buf: uint8*, n: int64) -> int32 {
+  var it: MtlsPemIter;
+  var blk: MtlsPemBlock;
+  var added: int32 = 0;
+  mtls_pem_iter(&it, buf, n);
+  while (true) {
+    var rc: int32 = mtls_pem_next(&it, &blk);
+    if (rc == 0) { break; }
+    if (rc < 0) {
+      r->skipped = r->skipped + 1;
+      break;
+    }
+    if (blk.label != "CERTIFICATE" && blk.label != "TRUSTED CERTIFICATE" && blk.label != "X509 CERTIFICATE") {
+      continue;
+    }
+    var der: uint8* = 0;
+    var dl: int64 = 0;
+    rc = mtls_pem_decode_alloc(&blk, &der, &dl);
+    if (rc == MTLS_E_NOMEM) { return rc; }
+    if (rc != MTLS_OK) {
+      r->skipped = r->skipped + 1;
+      continue;
+    }
+    var before: int32 = r->count;
+    rc = mtls_roots_add_der(r, der, dl);
+    free(der);
+    if (rc == MTLS_E_NOMEM) { return rc; }
+    if (rc != MTLS_OK) {
+      r->skipped = r->skipped + 1;
+    } else if (r->count > before) {
+      added = added + 1;
+    }
+  }
+  return added;
+}
+
+// ---- verification -----------------------------------------------------------
+
+/// MtlsDerRef: one DER certificate somebody else holds (an intermediate from
+/// the peer's Certificate message).
+export struct MtlsDerRef {
+  p: uint8*;
+  n: int64;
+}
+
+export struct MtlsVerifyOpts {
+  now: int64;            // unix seconds
+  hostname: string;      // empty: skip the host name check
+  purpose: int32;        // MTLS_PURPOSE_*
+  pin_mode: int32;       // MTLS_PIN_*
+  pin: uint8[32];        // SHA-256 of the leaf's SubjectPublicKeyInfo
+}
+
+export struct MtlsVerifyResult {
+  detail: int32;         // MTLS_CV_*
+  depth: int32;          // which certificate was at fault: 0 is the leaf, 1 its issuer, ...
+  leaf: MtlsPubKey;      // the leaf's key; points into the leaf DER the caller passed in
+  leaf_spki_sha256: uint8[32];
+}
+
+struct MtlsChainCtx {
+  roots: MtlsRoots*;
+  leaf: MtlsCert;
+  inter: MtlsCert[16];
+  ninter: int32;
+  used: int32[16];
+  path: int32[12];     // -1 = leaf, 0..15 = intermediate, 1000 + i = root i
+  now: int64;
+  eku_flag: int32;
+  sigs: int32;
+  fail: int32;         // the first reason a candidate was refused
+  fail_depth: int32;
+  deepest: int32;      // deepest certificate that needed an issuer
+}
+
+fn mtls_x_at(ctx: MtlsChainCtx*, code: int32) -> MtlsCert* {
+  if (code < 0) { return &ctx->leaf; }
+  if (code >= 1000) { return &ctx->roots->certs[code - 1000]; }
+  return &ctx->inter[code];
+}
+
+fn mtls_x_note(ctx: MtlsChainCtx*, detail: int32, depth: int32) {
+  if (ctx->fail == MTLS_CV_OK) {
+    ctx->fail = detail;
+    ctx->fail_depth = depth;
+  }
+}
+
+fn mtls_x_family(kind: int32) -> int32 {
+  if (kind == MTLS_KEY_ED25519) { return MTLS_KEY_ED25519; }
+  if (kind == MTLS_KEY_P256 || kind == MTLS_KEY_P384) { return MTLS_XKEY_EC; }
+  if (kind == MTLS_KEY_RSA) { return MTLS_KEY_RSA; }
+  return MTLS_KEY_NONE;
+}
+
+fn mtls_x_rsa_bits(k: MtlsPubKey*) -> int64 {
+  var bits: int64 = (k->keylen - 1) * 8;
+  var b: int32 = (int32)k->key[0];
+  while (b != 0) {
+    bits = bits + 1;
+    b = b >> 1;
+  }
+  return bits;
+}
+
+fn mtls_x_check_dates(c: MtlsCert*, now: int64) -> int32 {
+  if (now < c->not_before) { return MTLS_CV_NOT_YET_VALID; }
+  if (now > c->not_after) { return MTLS_CV_EXPIRED; }
+  return MTLS_CV_OK;
+}
+
+fn mtls_x_check_eku(c: MtlsCert*, flag: int32) -> bool {
+  if (!c->has_eku) { return true; }
+  return (c->eku & (flag | MTLS_EKU_ANY)) != 0;
+}
+
+// Is `iss` allowed to sign `sub`? d is the depth of sub; iss would sit at d + 1.
+fn mtls_x_link(ctx: MtlsChainCtx*, sub: MtlsCert*, iss: MtlsCert*, d: int32, anchor: bool) -> int32 {
+  var rc: int32 = mtls_x_check_dates(iss, ctx->now);
+  if (rc != MTLS_CV_OK) { return rc; }
+  if (iss->version != 3 && !(anchor && iss->version == 1)) { return MTLS_CV_BAD_VERSION; }
+  if (iss->unknown_critical && !anchor) { return MTLS_CV_UNKNOWN_CRITICAL; }
+  if (!(iss->has_bc && iss->is_ca) && !(anchor && iss->version == 1)) { return MTLS_CV_NOT_CA; }
+  if (iss->has_ku && (iss->ku & MTLS_KU_KEY_CERT_SIGN) == 0) { return MTLS_CV_KEY_USAGE; }
+  if (!mtls_x_check_eku(iss, ctx->eku_flag)) { return MTLS_CV_EKU; }
+  if (iss->has_bc && iss->has_pathlen) {
+    var below: int32 = 0;
+    for j in 1..(d + 1) {
+      if (!mtls_x_at(ctx, ctx->path[j])->self_issued) { below = below + 1; }
+    }
+    if (below > iss->pathlen) { return MTLS_CV_PATH_LEN; }
+  }
+  if (iss->has_nc && iss->nc_other && iss->nc_critical) { return MTLS_CV_NAME_CONSTRAINT; }
+
+  // The signature, last because it costs the most.
+  if (sub->sig_key == MTLS_KEY_NONE) { return MTLS_CV_UNSUPPORTED_SIG; }
+  var fam: int32 = mtls_x_family(iss->pub.kind);
+  if (fam == MTLS_KEY_NONE) { return MTLS_CV_UNSUPPORTED_SIG; }
+  if (fam != sub->sig_key) { return MTLS_CV_BAD_SIGNATURE; }
+  if (fam == MTLS_KEY_RSA) {
+    var bits: int64 = mtls_x_rsa_bits(&iss->pub);
+    if (bits < 2048 || bits > 8192) { return MTLS_CV_WEAK_KEY; }
+  }
+  ctx->sigs = ctx->sigs + 1;
+  if (ctx->sigs > MTLS_X_MAX_SIGS) { return MTLS_CV_TOO_LONG; }
+  var vr: int32 = mtls_verify_raw(&iss->pub, sub->sig_hash, sub->sig_pad, sub->tbs, sub->tbslen, sub->sig, sub->siglen);
+  if (vr == MTLS_OK) { return MTLS_CV_OK; }
+  if (vr == MTLS_E_UNSUPPORTED) { return MTLS_CV_UNSUPPORTED_SIG; }
+  return MTLS_CV_BAD_SIGNATURE;
+}
+
+// The path is complete: path[0..top] with the anchor at top. Checks that need
+// the whole path.
+fn mtls_x_whole_path(ctx: MtlsChainCtx*, top: int32) -> bool {
+  for j in 1..(top + 1) {
+    var ca: MtlsCert* = mtls_x_at(ctx, ctx->path[j]);
+    if (!ca->has_nc) { continue; }
+    for m in 0..j {
+      var sub: MtlsCert* = mtls_x_at(ctx, ctx->path[m]);
+      // Self-issued CA certificates (key rollovers) are not constrained.
+      if (m > 0 && sub->self_issued) { continue; }
+      if (!mtls_nc_check(ca, sub)) {
+        mtls_x_note(ctx, MTLS_CV_NAME_CONSTRAINT, m);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Finds an issuer for the certificate at depth d. Anchors are tried first
+// (shortest path), then the intermediates the peer sent.
+fn mtls_x_extend(ctx: MtlsChainCtx*, d: int32) -> bool {
+  var cur: MtlsCert* = mtls_x_at(ctx, ctx->path[d]);
+  if (d > ctx->deepest) { ctx->deepest = d; }
+  for pass in 0..2 {
+    var anchor: bool = pass == 0;
+    var n: int32 = ctx->ninter;
+    if (anchor) { n = ctx->roots->count; }
+    for i in 0..n {
+      if (!anchor && ctx->used[i] != 0) { continue; }
+      var cand: MtlsCert* = &ctx->inter[0];
+      var code: int32 = i;
+      if (anchor) {
+        cand = &ctx->roots->certs[i];
+        code = 1000 + i;
+      } else {
+        cand = &ctx->inter[i];
+      }
+      if (!mtls_bytes_eq(cur->issuer, cur->issuerlen, cand->subject, cand->subjectlen)) { continue; }
+      // Key identifiers are only hints, but a mismatch rules a candidate out.
+      if (cur->akilen > 0 && cand->skilen > 0 && !mtls_bytes_eq(cur->aki, cur->akilen, cand->ski, cand->skilen)) { continue; }
+      var rc: int32 = mtls_x_link(ctx, cur, cand, d, anchor);
+      if (rc == MTLS_CV_TOO_LONG) {
+        mtls_x_note(ctx, rc, d + 1);
+        return false;
+      }
+      if (rc != MTLS_CV_OK) {
+        mtls_x_note(ctx, rc, d + 1);
+        continue;
+      }
+      ctx->path[d + 1] = code;
+      if (anchor) {
+        if (d + 2 > MTLS_X_MAX_DEPTH) {
+          mtls_x_note(ctx, MTLS_CV_TOO_LONG, d + 1);
+          continue;
+        }
+        if (mtls_x_whole_path(ctx, d + 1)) { return true; }
+        continue;
+      }
+      if (d + 3 > MTLS_X_MAX_DEPTH) {
+        mtls_x_note(ctx, MTLS_CV_TOO_LONG, d + 1);
+        continue;
+      }
+      ctx->used[i] = 1;
+      if (mtls_x_extend(ctx, d + 1)) { return true; }
+      ctx->used[i] = 0;
+      if (ctx->sigs > MTLS_X_MAX_SIGS) { return false; }
+    }
+  }
+  return false;
+}
+
+fn mtls_x_fail(res: MtlsVerifyResult*, detail: int32, depth: int32) -> int32 {
+  res->detail = detail;
+  res->depth = depth;
+  return MTLS_E_CERT;
+}
+
+/// mtls_chain_verify: checks a certificate chain as received in a TLS
+/// handshake. leaf is the peer's certificate, inter the other certificates it
+/// sent (any order; extras are fine), roots the trust store.
+///
+/// Returns MTLS_OK, or MTLS_E_CERT with res->detail saying why (see
+/// mtls_cv_text, mtls_cv_alert). On success res->leaf is the leaf's public
+/// key, ready for mtls_verify_scheme; it points into the leaf DER.
+///
+/// Checked: every signature, every validity window (the root's too), CA
+/// flag, path length, key usage, extended key usage for opts->purpose, DNS
+/// name constraints, unknown critical extensions, and opts->hostname against
+/// the subjectAltName. A pin (opts->pin_mode) is explained at MTLS_PIN_*.
+export fn mtls_chain_verify(roots: MtlsRoots*, leaf_der: uint8*, leaf_len: int64, inter: MtlsDerRef*, ninter: int32, opts: MtlsVerifyOpts*, res: MtlsVerifyResult*) -> int32 {
+  if (res == 0) { return MTLS_E_ARG; }
+  memset(res, 0, (int64)sizeof(MtlsVerifyResult));
+  res->leaf.kind = MTLS_KEY_NONE;
+  if (roots == 0 || leaf_der == 0 || opts == 0 || ninter < 0 || (ninter > 0 && inter == 0)) {
+    return mtls_x_fail(res, MTLS_CV_BAD_ARG, 0);
+  }
+  if (opts->purpose != MTLS_PURPOSE_SERVER && opts->purpose != MTLS_PURPOSE_CLIENT) {
+    return mtls_x_fail(res, MTLS_CV_BAD_ARG, 0);
+  }
+  if (ninter > MTLS_X_MAX_INTER) { return mtls_x_fail(res, MTLS_CV_TOO_LONG, 0); }
+
+  var ctx: MtlsChainCtx;
+  memset(&ctx, 0, (int64)sizeof(MtlsChainCtx));
+  ctx.roots = roots;
+  ctx.now = opts->now;
+  ctx.eku_flag = MTLS_EKU_SERVER;
+  if (opts->purpose == MTLS_PURPOSE_CLIENT) { ctx.eku_flag = MTLS_EKU_CLIENT; }
+  ctx.path[0] = -1;
+
+  if (mtls_cert_parse(&ctx.leaf, leaf_der, leaf_len) != MTLS_OK) {
+    return mtls_x_fail(res, MTLS_CV_MALFORMED, 0);
+  }
+  res->leaf = ctx.leaf.pub;
+  mtls_cert_spki_sha256(&ctx.leaf, &res->leaf_spki_sha256[0]);
+
+  if (opts->pin_mode != MTLS_PIN_NONE) {
+    if (memcmp(&res->leaf_spki_sha256[0], &opts->pin[0], 32) != 0) {
+      return mtls_x_fail(res, MTLS_CV_PIN_MISMATCH, 0);
+    }
+    if (opts->pin_mode == MTLS_PIN_ONLY) { return MTLS_OK; }
+  }
+
+  // A leaf that is itself in the trust store needs no chain.
+  var direct: bool = false;
+  for i in 0..roots->count {
+    if (mtls_bytes_eq(roots->certs[i].der, roots->certs[i].derlen, leaf_der, leaf_len)) { direct = true; }
+  }
+
+  var rc: int32 = mtls_x_check_dates(&ctx.leaf, ctx.now);
+  if (rc != MTLS_CV_OK) { return mtls_x_fail(res, rc, 0); }
+  if (!direct) {
+    if (ctx.leaf.version != 3) { return mtls_x_fail(res, MTLS_CV_BAD_VERSION, 0); }
+    if (ctx.leaf.unknown_critical) { return mtls_x_fail(res, MTLS_CV_UNKNOWN_CRITICAL, 0); }
+  }
+  if (!mtls_x_check_eku(&ctx.leaf, ctx.eku_flag)) { return mtls_x_fail(res, MTLS_CV_EKU, 0); }
+  if (opts->hostname.length > (uint64)0 && !mtls_cert_match_host(&ctx.leaf, opts->hostname)) {
+    return mtls_x_fail(res, MTLS_CV_NAME_MISMATCH, 0);
+  }
+  if (direct) { return MTLS_OK; }
+
+  ctx.ninter = ninter;
+  for i in 0..ninter {
+    if (mtls_cert_parse(&ctx.inter[i], inter[i].p, inter[i].n) != MTLS_OK) {
+      return mtls_x_fail(res, MTLS_CV_MALFORMED, i + 1);
+    }
+  }
+  if (mtls_x_extend(&ctx, 0)) { return MTLS_OK; }
+  if (ctx.fail != MTLS_CV_OK) { return mtls_x_fail(res, ctx.fail, ctx.fail_depth); }
+  return mtls_x_fail(res, MTLS_CV_UNKNOWN_ISSUER, ctx.deepest);
+}
+
+// ---- certificate lists ------------------------------------------------------
+
+/// MtlsCertList: the certificates of a PEM file as DER, for sending (a server's
+/// leaf followed by its intermediates). Owned; free with mtls_certlist_free.
+export struct MtlsCertList {
+  buf: uint8*;
+  refs: MtlsDerRef*;
+  count: int32;
+}
+
+export fn mtls_certlist_free(l: MtlsCertList*) {
+  if (l->buf != 0) { free(l->buf); }
+  if (l->refs != 0) { free(l->refs); }
+  l->buf = 0;
+  l->refs = 0;
+  l->count = 0;
+}
+
+/// mtls_certlist_from_pem: reads every CERTIFICATE block of a PEM buffer, in
+/// order. Each one has to parse as a certificate. Returns the count (at least
+/// 1), MTLS_E_DECODE for a broken block or a file with no certificate, or
+/// MTLS_E_NOMEM.
+export fn mtls_certlist_from_pem(l: MtlsCertList*, pem: uint8*, n: int64) -> int32 {
+  l->buf = 0;
+  l->refs = 0;
+  l->count = 0;
+  var it: MtlsPemIter;
+  var blk: MtlsPemBlock;
+  var total: int64 = 0;
+  var blocks: int32 = 0;
+  mtls_pem_iter(&it, pem, n);
+  while (true) {
+    var rc: int32 = mtls_pem_next(&it, &blk);
+    if (rc == 0) { break; }
+    if (rc < 0) { return rc; }
+    if (blk.label != "CERTIFICATE") { continue; }
+    total = total + mtls_pem_decoded_max(blk.bodylen);
+    blocks = blocks + 1;
+  }
+  if (blocks == 0) { return MTLS_E_DECODE; }
+  l->buf = malloc(total);
+  l->refs = malloc((int64)blocks * (int64)sizeof(MtlsDerRef));
+  if (l->buf == 0 || l->refs == 0) {
+    mtls_certlist_free(l);
+    return MTLS_E_NOMEM;
+  }
+  var used: int64 = 0;
+  mtls_pem_iter(&it, pem, n);
+  while (l->count < blocks) {
+    var rc: int32 = mtls_pem_next(&it, &blk);
+    if (rc <= 0) { break; }
+    if (blk.label != "CERTIFICATE") { continue; }
+    var got: int64 = 0;
+    var cert: MtlsCert;
+    rc = mtls_pem_decode(&blk, l->buf + used, total - used, &got);
+    if (rc == MTLS_OK && mtls_cert_parse(&cert, l->buf + used, got) != MTLS_OK) { rc = MTLS_E_DECODE; }
+    if (rc != MTLS_OK) {
+      mtls_certlist_free(l);
+      return MTLS_E_DECODE;
+    }
+    l->refs[l->count].p = l->buf + used;
+    l->refs[l->count].n = got;
+    l->count = l->count + 1;
+    used = used + got;
+  }
+  return l->count;
+}

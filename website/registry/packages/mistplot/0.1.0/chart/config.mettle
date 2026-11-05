@@ -1,0 +1,491 @@
+//! Chart-level setters: texts, theme, legend, grid, label formats, axis modes, fixed
+//! ranges, bar gap and margins. Each validates one field, copies strings, records a
+//! failure as the chart's sticky error and moves seq only when the value changed. Uses
+//! chart/chart and core.
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/str";
+import "mistplot/core/format";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/chart/chart";
+
+const CFG_TITLE: int32 = 0;
+const CFG_SUBTITLE: int32 = 1;
+const CFG_X_LABEL: int32 = 2;
+const CFG_Y_LABEL: int32 = 3;
+const CFG_FONT: int32 = 4;
+
+fn cfg_text_slot(c: MpChart*, which: int32) -> string* {
+  if (which == CFG_TITLE) { return &c->title; }
+  if (which == CFG_SUBTITLE) { return &c->subtitle; }
+  if (which == CFG_X_LABEL) { return &c->x_label; }
+  if (which == CFG_Y_LABEL) { return &c->y_label; }
+  return &c->font;
+}
+
+fn cfg_text(c: MpChart*, which: int32, text: string) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  var slot: string* = cfg_text_slot(c, which);
+  if ((int64)text.length > MP_MAX_TEXT) {
+    rc = MP_ERR_LIMIT;
+  } else if (*slot != text) {
+    rc = mp_str_assign(slot, text);
+    if (rc == MP_OK) { mp_chart_touch(c); }
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Sets the title: 15 px bold, top left; also the SVG's accessible name.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param text The title. Valid: up to MP_MAX_TEXT bytes of UTF-8; "" removes it.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0.
+/// @error MP_ERR_LIMIT text is longer than MP_MAX_TEXT; nothing changes.
+/// @error MP_ERR_ALLOC the copy failed; the old title stays.
+/// @mem text is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_title(c: MpChart*, text: string) -> int32 {
+  return cfg_text(c, CFG_TITLE, text);
+}
+
+/// Sets the subtitle: 12 px muted, under the title.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param text The subtitle. Valid: up to MP_MAX_TEXT bytes of UTF-8; "" removes it.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0.
+/// @error MP_ERR_LIMIT text is longer than MP_MAX_TEXT; nothing changes.
+/// @error MP_ERR_ALLOC the copy failed; the old subtitle stays.
+/// @mem text is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_subtitle(c: MpChart*, text: string) -> int32 {
+  return cfg_text(c, CFG_SUBTITLE, text);
+}
+
+/// Sets the x axis title, centred under the tick labels.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param text The title. Valid: up to MP_MAX_TEXT bytes of UTF-8; "" removes it.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0.
+/// @error MP_ERR_LIMIT text is longer than MP_MAX_TEXT; nothing changes.
+/// @error MP_ERR_ALLOC the copy failed; the old title stays.
+/// @mem text is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_x_label(c: MpChart*, text: string) -> int32 {
+  return cfg_text(c, CFG_X_LABEL, text);
+}
+
+/// Sets the y axis title, written horizontally above the y tick labels.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param text The title. Valid: up to MP_MAX_TEXT bytes of UTF-8; "" removes it.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0.
+/// @error MP_ERR_LIMIT text is longer than MP_MAX_TEXT; nothing changes.
+/// @error MP_ERR_ALLOC the copy failed; the old title stays.
+/// @mem text is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_y_label(c: MpChart*, text: string) -> int32 {
+  return cfg_text(c, CFG_Y_LABEL, text);
+}
+
+/// Sets the CSS font-family of the SVG output (layout still uses the target's measurer).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param text A font-family list. Valid: up to MP_MAX_TEXT bytes; "" means MP_FONT_STACK.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0.
+/// @error MP_ERR_LIMIT text is longer than MP_MAX_TEXT; nothing changes.
+/// @error MP_ERR_ALLOC the copy failed; the old font stays.
+/// @mem text is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_font(c: MpChart*, text: string) -> int32 {
+  return cfg_text(c, CFG_FONT, text);
+}
+
+fn cfg_theme(c: MpChart*, t: MpTheme*, explicit: bool) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (t->n_palette < 1 || t->n_palette > MP_PALETTE_MAX) {
+    rc = MP_ERR_ARG;
+  } else if (explicit || !c->theme_explicit) {
+    if (!mp_theme_eq(&c->theme, t)) {
+      c->theme = *t;
+      mp_chart_touch(c);
+    }
+    if (explicit && !c->theme_explicit) {
+      c->theme_explicit = true;
+      mp_chart_touch(c);
+    }
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Sets the theme explicitly; hosts then stop applying their own (mp_chart_set_host_theme)
+/// and the terminal renderer uses the theme's colours and background.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param t The theme, e.g. mp_theme_dark(). Valid: n_palette in 1 .. MP_PALETTE_MAX.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or the palette count is out of range; nothing changes.
+/// @mem t is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_theme(c: MpChart*, t: MpTheme) -> int32 {
+  var tt: MpTheme = t;
+  return cfg_theme(c, &tt, true);
+}
+
+/// A host's theme (e.g. MythicUI's light or dark mode); ignored once the user set one.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param t The host theme. Valid: n_palette in 1 .. MP_PALETTE_MAX.
+/// @return MP_OK (also when ignored), or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or the palette count is out of range; nothing changes.
+/// @mem t is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @internal
+export fn mp_chart_set_host_theme(c: MpChart*, t: MpTheme) -> int32 {
+  var tt: MpTheme = t;
+  return cfg_theme(c, &tt, false);
+}
+
+// Field ids for the integer and flag setters.
+const CFG_LEGEND: int32 = 0;
+const CFG_GRID: int32 = 1;
+const CFG_XFMT: int32 = 2;
+const CFG_YFMT: int32 = 3;
+const CFG_XLOG: int32 = 4;
+const CFG_YLOG: int32 = 5;
+const CFG_YZERO: int32 = 6;
+const CFG_HOVER: int32 = 7;
+const CFG_YEASE: int32 = 8;
+
+fn cfg_int_slot(c: MpChart*, which: int32) -> int32* {
+  if (which == CFG_LEGEND) { return &c->legend; }
+  if (which == CFG_GRID) { return &c->grid; }
+  if (which == CFG_XFMT) { return &c->x_fmt; }
+  return &c->y_fmt;
+}
+
+fn cfg_int(c: MpChart*, which: int32, v: int32, hi: int32) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  var slot: int32* = cfg_int_slot(c, which);
+  if (v < 0 || v > hi) {
+    rc = MP_ERR_ARG;
+  } else if (*slot != v) {
+    *slot = v;
+    mp_chart_touch(c);
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+fn cfg_flag_slot(c: MpChart*, which: int32) -> bool* {
+  if (which == CFG_XLOG) { return &c->x_log; }
+  if (which == CFG_YLOG) { return &c->y_log; }
+  if (which == CFG_YZERO) { return &c->y_zero; }
+  if (which == CFG_YEASE) { return &c->y_ease; }
+  return &c->hover;
+}
+
+fn cfg_flag(c: MpChart*, which: int32, on: bool) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var slot: bool* = cfg_flag_slot(c, which);
+  var v: bool = on != false;
+  if (*slot != v) {
+    *slot = v;
+    mp_chart_touch(c);
+  }
+  mp_chart_leave(c);
+  return MP_OK;
+}
+
+/// Sets the legend placement.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param pos MP_LEGEND_AUTO, NONE, TOP, RIGHT or BOTTOM. Valid: 0 .. 4.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or pos is unknown; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_legend(c: MpChart*, pos: int32) -> int32 {
+  return cfg_int(c, CFG_LEGEND, pos, MP_LEGEND_BOTTOM);
+}
+
+/// Sets which grid lines are drawn.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param mode MP_GRID_Y, NONE, X or XY. Valid: 0 .. 3.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or mode is unknown; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_grid(c: MpChart*, mode: int32) -> int32 {
+  return cfg_int(c, CFG_GRID, mode, MP_GRID_XY);
+}
+
+/// Sets the x tick label format (also used by mp_chart_readout_x).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param fmt MP_FMT_AUTO .. MP_FMT_TIME_TENTHS. Valid: 0 .. 4.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or fmt is unknown; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_x_format(c: MpChart*, fmt: int32) -> int32 {
+  return cfg_int(c, CFG_XFMT, fmt, MP_FMT_TIME_TENTHS);
+}
+
+/// Sets the y tick label format.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param fmt MP_FMT_AUTO .. MP_FMT_TIME_TENTHS. Valid: 0 .. 4.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or fmt is unknown; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_y_format(c: MpChart*, fmt: int32) -> int32 {
+  return cfg_int(c, CFG_YFMT, fmt, MP_FMT_TIME_TENTHS);
+}
+
+/// Turns the log x axis on or off; a domain that is not positive draws linear.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param on Whether x is logarithmic. Valid: any.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_x_log(c: MpChart*, on: bool) -> int32 {
+  return cfg_flag(c, CFG_XLOG, on);
+}
+
+/// Turns the log y axis on or off; a domain that is not positive draws linear. Bars are
+/// always linear.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param on Whether y is logarithmic. Valid: any.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_y_log(c: MpChart*, on: bool) -> int32 {
+  return cfg_flag(c, CFG_YLOG, on);
+}
+
+/// Whether an automatic y domain always includes 0 (default on; bars always do).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param on Include zero. Valid: any.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_y_zero(c: MpChart*, on: bool) -> int32 {
+  return cfg_flag(c, CFG_YZERO, on);
+}
+
+/// Whether a live chart eases its y domain (default on). Easing applies while a time is set
+/// (mp_chart_set_now) to a line, area or scatter chart whose y axis is automatic and linear;
+/// fixed ranges, log axes, bars and charts without a time keep the plain automatic domain.
+/// The target domain is the visible data (with 0 when mp_chart_set_y_zero is on) plus 15%
+/// of its height of headroom on each side that is not at 0, so data from 0 to m targets
+/// [0, 1.15 m]. Each frame moves each end towards its target by 1 - exp(-dt / tau), dt
+/// being the time since the previous frame: tau = 0.04 when the domain grows (about 35% of
+/// the gap per frame at 60 fps) and 0.8 when it shrinks (about 2%). It never stays inside
+/// the data: an end is pushed out at once to cover every visible point. The first frame,
+/// and a dt below 0 or above 1, jump to the target; a dt of 0 (another target, or a push
+/// at the same time) keeps the domain. The ticks are the nice values inside the eased
+/// domain, which is not widened to them, so grid lines and labels glide.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param on Ease the y domain of a live chart. Valid: any.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_y_ease(c: MpChart*, on: bool) -> int32 {
+  return cfg_flag(c, CFG_YEASE, on);
+}
+
+/// Whether interactive hosts show a hover readout (default on).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param on Show it. Valid: any.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_hover(c: MpChart*, on: bool) -> int32 {
+  return cfg_flag(c, CFG_HOVER, on);
+}
+
+fn cfg_range(c: MpChart*, y: bool, fixed: bool, lo: float64, hi: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (fixed && (is_finite(lo) == 0 || is_finite(hi) == 0 || is_finite(hi - lo) == 0 ||
+                !(hi > lo))) {
+    rc = MP_ERR_ARG;
+  }
+  if (rc == MP_OK) {
+    var f: bool* = &c->x_fixed;
+    var a: float64* = &c->x_lo;
+    var b: float64* = &c->x_hi;
+    if (y) {
+      f = &c->y_fixed;
+      a = &c->y_lo;
+      b = &c->y_hi;
+    }
+    if (*f != fixed || (fixed && (*a != lo || *b != hi))) {
+      *f = fixed;
+      if (fixed) {
+        *a = lo;
+        *b = hi;
+      }
+      mp_chart_touch(c);
+    }
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Fixes the x domain to [lo, hi] (a window, when set, still takes precedence). Bars ignore
+/// it. Lines are clipped at the plot edges; points outside are not drawn.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param lo Domain start. Units: data units. Valid: finite, < hi.
+/// @param hi Domain end. Units: data units. Valid: finite, > lo, hi - lo finite.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or the range is invalid; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_x_range(c: MpChart*, lo: float64, hi: float64) -> int32 {
+  return cfg_range(c, false, true, lo, hi);
+}
+
+/// Fixes the y domain to [lo, hi]; marks outside are clipped to the plot.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param lo Domain start. Units: data units. Valid: finite, < hi.
+/// @param hi Domain end. Units: data units. Valid: finite, > lo, hi - lo finite.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or the range is invalid; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_y_range(c: MpChart*, lo: float64, hi: float64) -> int32 {
+  return cfg_range(c, true, true, lo, hi);
+}
+
+/// Returns the x domain to automatic (the data extent).
+///
+/// @param c The chart. Valid: non-zero.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_x_auto(c: MpChart*) -> int32 {
+  return cfg_range(c, false, false, 0.0, 0.0);
+}
+
+/// Returns the y domain to automatic (data extent, zero and nice ticks).
+///
+/// @param c The chart. Valid: non-zero.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_y_auto(c: MpChart*) -> int32 {
+  return cfg_range(c, true, false, 0.0, 0.0);
+}
+
+/// Sets the empty fraction of each band between bar groups (default 0.2).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param frac Gap as a fraction of the band. Valid: 0 .. 0.9.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or frac is out of range; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_bar_gap(c: MpChart*, frac: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (!(frac >= 0.0 && frac <= 0.9)) {
+    rc = MP_ERR_ARG;
+  } else if (frac != c->bar_gap) {
+    c->bar_gap = frac;
+    mp_chart_touch(c);
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+fn cfg_inset_ok(v: float64) -> bool {
+  return v >= 0.0 && v < 1e6;
+}
+
+/// Uses fixed margins around the plot instead of the measured layout.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param m Insets from the chart edges to the plot. Units: px. Valid: each 0 .. 1e6.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or an inset is negative, too large or not finite; nothing
+///   changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_margins(c: MpChart*, m: MpInsets) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (!cfg_inset_ok(m.top) || !cfg_inset_ok(m.right) || !cfg_inset_ok(m.bottom) ||
+      !cfg_inset_ok(m.left)) {
+    rc = MP_ERR_ARG;
+  } else {
+    var o: MpInsets = c->margins;
+    if (c->margins_auto || o.top != m.top || o.right != m.right || o.bottom != m.bottom ||
+        o.left != m.left) {
+      c->margins = m;
+      c->margins_auto = false;
+      mp_chart_touch(c);
+    }
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Returns to margins measured from the text (the default).
+///
+/// @param c The chart. Valid: non-zero.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_margins_auto(c: MpChart*) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  if (!c->margins_auto) {
+    c->margins_auto = true;
+    mp_chart_touch(c);
+  }
+  mp_chart_leave(c);
+  return MP_OK;
+}

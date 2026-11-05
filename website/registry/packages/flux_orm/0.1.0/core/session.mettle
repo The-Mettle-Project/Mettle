@@ -1,0 +1,283 @@
+// flux_orm/core/session.mettle — one connection and its transaction.
+//
+// Make one session per connection and pass it around; it is not a global.
+//
+// Nesting is flattened here, because MeoDB and adapter/mem both refuse a
+// nested begin. Only the outermost begin/commit reaches the adapter; inner
+// levels only count depth. An inner rollback cannot undo part of a flat
+// transaction, so it dooms the whole one: the outer commit rolls back and
+// returns RC_ERR_TX.
+//
+// A failed commit leaves no transaction open: the session rolls back whatever
+// the adapter still holds. With a distributed store a failed commit can be
+// ambiguous (the write may have landed).
+//
+// One thread per session while a transaction is open: MeoDB's lock belongs
+// to the thread that called begin.
+//
+// Loaded rows: a model's text fields point into the result it was loaded
+// from, so the session keeps those results (rc_session_keep) until
+// rc_session_clear or rc_session_free. Clear when the models from a batch of
+// work are no longer used; every model loaded before that is invalid after.
+
+import "std/mem";
+
+import "status";
+import "../adapter/adapter";
+
+// One connection's session. Make it with rc_session_new and release it with
+// rc_session_free.
+// Something the session owns until rc_session_clear: `release(p)` frees it.
+export struct RcHeld {
+  p: rawptr;
+  release: fn(rawptr) -> void with alloc, syscall;
+}
+
+export struct RcSession {
+  adapter: RcAdapter*;
+  depth: int32;   // 0 = no transaction open; 1 = the adapter's transaction
+  doomed: bool;   // an inner level rolled back: the outer commit rolls back
+  mode: int32;    // RC_TX_* of the outermost begin
+  kept: RcHeld*;   // results loaded models point into, owned
+  // number of entries in `kept`
+  n_kept: int32;
+  // allocated length of `kept`
+  cap_kept: int32;
+}
+
+// Makes a session with no transaction open and nothing kept.
+//   a   the connected adapter; borrowed, must outlive the session. May be 0,
+//       but then begin, commit and rollback answer RC_ERR_USAGE.
+// Returns the session by value; allocates nothing until rc_session_keep.
+// Release it with rc_session_free.
+export fn rc_session_new(a: RcAdapter*) -> RcSession {
+  var s: RcSession;
+  s.adapter = a;
+  s.depth = 0;
+  s.doomed = false;
+  s.mode = RC_TX_DEFAULT;
+  s.kept = 0;
+  s.n_kept = 0;
+  s.cap_kept = 0;
+  return s;
+}
+
+// Hands the session an object to free at rc_session_clear: anything that
+// loaded models point into (results, preloaded relations).
+//   s        the session
+//   p        the owned object; the session calls release(p) once
+//   release  frees p, including p itself
+// Returns RC_OK; RC_ERR_USAGE when s, p or release is 0; RC_ERR_NOMEM when
+// the session cannot grow, in which case p is still yours.
+export fn rc_session_hold(s: RcSession*, p: rawptr,
+                          release: fn(rawptr) -> void with alloc, syscall) -> int32 {
+  if (s == 0 || p == 0 || release == 0) { return RC_ERR_USAGE; }
+  if (s->n_kept == s->cap_kept) {
+    var cap: int32 = s->cap_kept * 2;
+    if (cap < 8) { cap = 8; }
+    var q: rawptr = realloc((rawptr)s->kept, (int64)cap * (int64)sizeof(RcHeld));
+    if (q == 0) { return RC_ERR_NOMEM; }
+    s->kept = (RcHeld*)q;
+    s->cap_kept = cap;
+  }
+  s->kept[s->n_kept].p = p;
+  s->kept[s->n_kept].release = release;
+  s->n_kept = s->n_kept + 1;
+  return RC_OK;
+}
+
+fn rc_session_release_result(p: rawptr) {
+  var r: RcResult* = (RcResult*)p;
+  rc_result_free(r);
+  free(p);
+}
+
+// Moves a result into the session so models loaded from it stay valid.
+//   s     the session
+//   res   an owned result; on success it is left empty (nothing to free)
+//   out   receives a pointer to the kept result, valid until rc_session_clear
+//         or rc_session_free. Do not free it yourself.
+// Returns RC_OK; RC_ERR_USAGE when any argument is 0; RC_ERR_NOMEM when the
+// session cannot grow, in which case `*res` is untouched and still yours.
+export fn rc_session_keep(s: RcSession*, res: RcResult*, out: RcResult**) -> int32 {
+  if (s == 0 || res == 0 || out == 0) { return RC_ERR_USAGE; }
+  var r: RcResult* = malloc(sizeof(RcResult));
+  if (r == 0) { return RC_ERR_NOMEM; }
+  *r = *res;
+  var rc: int32 = rc_session_hold(s, (rawptr)r, &rc_session_release_result);
+  if (rc != RC_OK) {
+    free((rawptr)r);
+    return rc;
+  }
+  rc_result_init(res);
+  *out = r;
+  return RC_OK;
+}
+
+// Frees everything the session holds. Models loaded through this session are
+// invalid afterwards; the session itself stays usable.
+//   s   the session; 0 is ignored
+export fn rc_session_clear(s: RcSession*) {
+  if (s == 0) { return; }
+  var i: int32 = 0;
+  while (i < s->n_kept) {
+    s->kept[i].release(s->kept[i].p);
+    i = i + 1;
+  }
+  s->n_kept = 0;
+}
+
+// Clears and releases the session's own memory. It does not close the
+// adapter and does not roll back an open transaction; end that first.
+//   s   the session; 0 is ignored. Safe to call twice.
+export fn rc_session_free(s: RcSession*) {
+  if (s == 0) { return; }
+  rc_session_clear(s);
+  if (s->kept != 0) {
+    free(s->kept);
+    s->kept = 0;
+  }
+  s->cap_kept = 0;
+}
+
+// Number of objects the session is holding; 0 when `s` is 0.
+export fn rc_session_kept(s: RcSession*) -> int32 {
+  if (s == 0) { return 0; }
+  return s->n_kept;
+}
+
+// The session's adapter (borrowed); 0 when `s` is 0.
+export fn rc_session_adapter(s: RcSession*) -> RcAdapter* {
+  if (s == 0) { return 0; }
+  return s->adapter;
+}
+
+// Transaction nesting depth: 0 when none is open or `s` is 0, 1 for the
+// outermost level, more for each nested begin.
+export fn rc_session_depth(s: RcSession*) -> int32 {
+  if (s == 0) { return 0; }
+  return s->depth;
+}
+
+// True when a transaction is open; false when not or when `s` is 0.
+export fn rc_session_in_tx(s: RcSession*) -> bool {
+  if (s == 0) { return false; }
+  if (s->depth > 0) { return true; }
+  return false;
+}
+
+// True once an inner level has rolled back: the transaction can still run
+// statements, but it will not commit. False when `s` is 0.
+export fn rc_session_doomed(s: RcSession*) -> bool {
+  if (s == 0) { return false; }
+  return s->doomed;
+}
+
+// The adapter's state is unknown after a failed commit or rollback; this puts
+// the session back to "no transaction" either way.
+fn rc_session_end(s: RcSession*) {
+  s->depth = 0;
+  s->doomed = false;
+  s->mode = RC_TX_DEFAULT;
+}
+
+// Opens a transaction, or one more nested level of the open one.
+//   s      the session
+//   mode   RC_TX_DEFAULT, RC_TX_DEFERRED or RC_TX_IMMEDIATE (use IMMEDIATE
+//          for MeoDB writes). Checked at every level but only the outermost
+//          begin's mode reaches the adapter.
+// Returns RC_OK; RC_ERR_USAGE when `s` or its adapter is 0 or `mode` is not
+// an RC_TX_* value; RC_ERR_TX when the depth would overflow int32; for the
+// outermost begin, whatever the adapter's begin returns (RC_ERR_UNSUPPORTED
+// when it has no begin). On error no level is opened.
+export fn rc_session_begin(s: RcSession*, mode: int32) -> int32 {
+  if (s == 0 || s->adapter == 0) { return RC_ERR_USAGE; }
+  if (mode != RC_TX_DEFAULT && mode != RC_TX_DEFERRED && mode != RC_TX_IMMEDIATE) {
+    return RC_ERR_USAGE;
+  }
+  if (s->depth > 0) {
+    if (s->depth == 2147483647) { return RC_ERR_TX; }
+    s->depth = s->depth + 1;
+    return RC_OK;
+  }
+  var rc: int32 = rc_adapter_begin(s->adapter, mode);
+  if (rc != RC_OK) { return rc; }
+  s->depth = 1;
+  s->doomed = false;
+  s->mode = mode;
+  return RC_OK;
+}
+
+// Closes one level. Only the outermost commit reaches the adapter.
+//   s   the session
+// Returns RC_OK; RC_ERR_USAGE when `s` or its adapter is 0; RC_ERR_TX when no
+// transaction is open, or when an inner level rolled back (the session then
+// rolls the whole transaction back). If the adapter's commit fails, the
+// session rolls back and returns the commit's code. After the outermost
+// commit, failed or not, no transaction is open.
+export fn rc_session_commit(s: RcSession*) -> int32 {
+  if (s == 0 || s->adapter == 0) { return RC_ERR_USAGE; }
+  if (s->depth == 0) { return RC_ERR_TX; }
+  if (s->depth > 1) {
+    s->depth = s->depth - 1;
+    return RC_OK;
+  }
+  if (s->doomed) {
+    rc_adapter_rollback(s->adapter);
+    rc_session_end(s);
+    return RC_ERR_TX;
+  }
+  var rc: int32 = rc_adapter_commit(s->adapter);
+  if (rc != RC_OK) {
+    rc_adapter_rollback(s->adapter);
+  }
+  rc_session_end(s);
+  return rc;
+}
+
+// Rolls back one level. An inner rollback only dooms the transaction (the
+// outer commit will roll back and fail); the outermost one reaches the
+// adapter.
+//   s   the session
+// Returns RC_OK; RC_ERR_USAGE when `s` or its adapter is 0; RC_ERR_TX when no
+// transaction is open; for the outermost level, whatever the adapter's
+// rollback returns. After the outermost rollback no transaction is open, even
+// when the adapter failed.
+export fn rc_session_rollback(s: RcSession*) -> int32 {
+  if (s == 0 || s->adapter == 0) { return RC_ERR_USAGE; }
+  if (s->depth == 0) { return RC_ERR_TX; }
+  if (s->depth > 1) {
+    s->depth = s->depth - 1;
+    s->doomed = true;
+    return RC_OK;
+  }
+  var rc: int32 = rc_adapter_rollback(s->adapter);
+  rc_session_end(s);
+  return rc;
+}
+
+// Runs `body(ctx, s)` inside a transaction: begin, the body, then commit when
+// the body answers RC_OK and roll back otherwise. Inside an open transaction
+// this nests like any other begin, so a failing body dooms the outer one.
+//   s      the session
+//   mode   RC_TX_* for the begin (see rc_session_begin)
+//   body   the work; must not be 0. It may call rc_session_* on `s` but must
+//          leave the depth as it found it.
+//   ctx    passed to `body` untouched; may be 0
+// Returns RC_ERR_USAGE when `s` or `body` is 0; any error from
+// rc_session_begin (the body does not run); the body's own code when it is not
+// RC_OK, even if the rollback also fails; otherwise rc_session_commit's result
+// (RC_ERR_TX when an inner level was doomed, or the adapter's commit error).
+export fn rc_session_transaction(s: RcSession*, mode: int32,
+                                 body: fn(rawptr, RcSession*) -> int32 with alloc, syscall,
+                                 ctx: rawptr) -> int32 {
+  if (s == 0 || body == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_session_begin(s, mode);
+  if (rc != RC_OK) { return rc; }
+  var out: int32 = body(ctx, s);
+  if (out != RC_OK) {
+    rc_session_rollback(s);
+    return out;
+  }
+  return rc_session_commit(s);
+}

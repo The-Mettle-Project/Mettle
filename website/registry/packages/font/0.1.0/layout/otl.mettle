@@ -1,0 +1,490 @@
+// OpenType Layout common tables, shared by GSUB and GPOS: coverage, class
+// definitions, the script / language / feature lists, lookup flags with
+// GDEF glyph classes, and context matching.
+// Spec: OpenType "OpenType Layout Common Table Formats" and "GDEF".
+// The matching model (skipping glyphs per lookup flag, applying nested
+// lookups at matched positions) follows HarfBuzz's hb-ot-layout-gsubgpos.
+
+import "font/core/vec";
+import "font/sfnt/face";
+import "buffer";
+
+export const FONT_TAG_DFLT: uint32 = 0x44464C54;
+export const FONT_TAG_LATN: uint32 = 0x6C61746E;
+
+// Lookup flags.
+export const OTL_RTL: uint32 = 1;
+export const OTL_IGNORE_BASE: uint32 = 2;
+export const OTL_IGNORE_LIG: uint32 = 4;
+export const OTL_IGNORE_MARK: uint32 = 8;
+export const OTL_MARK_SET: uint32 = 0x10;
+
+/// Coverage index of glyph g in the Coverage table at o, or -1.
+export fn otl_coverage(f: FontFace*, o: int64, g: int32) -> int32 {
+  if (o == 0) { return -1; }
+  var fmt: uint32 = font_u16(f, o);
+  var n: int64 = (int64)font_u16(f, o + 2);
+  var gg: uint32 = (uint32)g;
+  if (fmt == 1) {
+    var lo: int64 = 0;
+    var hi: int64 = n - 1;
+    while (lo <= hi) {
+      var mid: int64 = (lo + hi) / 2;
+      var v: uint32 = font_u16(f, o + 4 + mid * 2);
+      if (gg < v) { hi = mid - 1; } else if (gg > v) { lo = mid + 1; } else { return (int32)mid; }
+    }
+    return -1;
+  }
+  if (fmt == 2) {
+    var lo: int64 = 0;
+    var hi: int64 = n - 1;
+    while (lo <= hi) {
+      var mid: int64 = (lo + hi) / 2;
+      var r: int64 = o + 4 + mid * 6;
+      var s: uint32 = font_u16(f, r);
+      var e: uint32 = font_u16(f, r + 2);
+      if (gg < s) { hi = mid - 1; } else if (gg > e) { lo = mid + 1; }
+      else { return (int32)(font_u16(f, r + 4) + (gg - s)); }
+    }
+  }
+  return -1;
+}
+
+/// Class of glyph g in the ClassDef table at o (0 when not listed).
+export fn otl_class(f: FontFace*, o: int64, g: int32) -> int32 {
+  if (o == 0) { return 0; }
+  var fmt: uint32 = font_u16(f, o);
+  var gg: uint32 = (uint32)g;
+  if (fmt == 1) {
+    var first: uint32 = font_u16(f, o + 2);
+    var n: uint32 = font_u16(f, o + 4);
+    if (gg < first || gg - first >= n) { return 0; }
+    return (int32)font_u16(f, o + 6 + (int64)(gg - first) * 2);
+  }
+  if (fmt == 2) {
+    var n: int64 = (int64)font_u16(f, o + 2);
+    var lo: int64 = 0;
+    var hi: int64 = n - 1;
+    while (lo <= hi) {
+      var mid: int64 = (lo + hi) / 2;
+      var r: int64 = o + 4 + mid * 6;
+      var s: uint32 = font_u16(f, r);
+      var e: uint32 = font_u16(f, r + 2);
+      if (gg < s) { hi = mid - 1; } else if (gg > e) { lo = mid + 1; }
+      else { return (int32)font_u16(f, r + 4); }
+    }
+  }
+  return 0;
+}
+
+// Offset of a 16-bit sub-table offset at p, relative to base (0 when null).
+export fn otl_off16(f: FontFace*, base: int64, p: int64) -> int64 {
+  var v: uint32 = font_u16(f, p);
+  if (v == 0) { return 0; }
+  return base + (int64)v;
+}
+
+/// GDEF glyph class (1 base, 2 ligature, 3 mark, 4 component; 0 unknown).
+export fn otl_glyph_class(f: FontFace*, g: int32) -> int32 {
+  if (f->gdef == 0) { return 0; }
+  return otl_class(f, otl_off16(f, f->gdef, f->gdef + 4), g);
+}
+
+/// GDEF mark attachment class.
+export fn otl_mark_class(f: FontFace*, g: int32) -> int32 {
+  if (f->gdef == 0) { return 0; }
+  return otl_class(f, otl_off16(f, f->gdef, f->gdef + 10), g);
+}
+
+// True when glyph g is in GDEF mark glyph set `set`.
+fn in_mark_set(f: FontFace*, set: int32, g: int32) -> bool {
+  if (f->gdef == 0 || font_u16(f, f->gdef + 2) < 2) { return false; }
+  var sets: int64 = otl_off16(f, f->gdef, f->gdef + 12);
+  if (sets == 0) { return false; }
+  var n: int32 = (int32)font_u16(f, sets + 2);
+  if (set < 0 || set >= n) { return false; }
+  var cov: uint32 = font_u32(f, sets + 4 + (int64)set * 4);
+  if (cov == 0) { return false; }
+  return otl_coverage(f, sets + (int64)cov, g) >= 0;
+}
+
+/// True when a lookup with this flag (and mark set) skips glyph x.
+export fn otl_skip(f: FontFace*, x: FontGlyph*, flag: uint32, markset: int32) -> bool {
+  var c: uint8 = x->cls;
+  if (c == (uint8)1 && (flag & OTL_IGNORE_BASE) != 0) { return true; }
+  if (c == (uint8)2 && (flag & OTL_IGNORE_LIG) != 0) { return true; }
+  if (c == (uint8)3) {
+    if ((flag & OTL_IGNORE_MARK) != 0) { return true; }
+    if ((flag & OTL_MARK_SET) != 0) { return !in_mark_set(f, markset, x->id); }
+    var want: uint32 = (flag >> 8) & 0xFF;
+    if (want != 0 && (uint32)x->mcls != want) { return true; }
+  }
+  return false;
+}
+
+// ---- Scripts, languages, features ----
+
+fn find_script(f: FontFace*, list: int64, tag: uint32) -> int64 {
+  var n: int64 = (int64)font_u16(f, list);
+  for i: int64 in 0..n {
+    var r: int64 = list + 2 + i * 6;
+    if (font_u32(f, r) == tag) { return otl_off16(f, list, r + 4); }
+  }
+  return 0;
+}
+
+/// Appends to `out` the lookup indices that the given features use for
+/// this script and language, in lookup order and without repeats.
+/// `table` is the GSUB or GPOS offset. Unknown scripts fall back to DFLT,
+/// then latn.
+export fn otl_collect(f: FontFace*, table: int64, script: uint32, lang: uint32,
+                      tags: uint32*, ntags: int32, out: FontVec<int32>*) {
+  out->len = 0;
+  if (table == 0) { return; }
+  var slist: int64 = otl_off16(f, table, table + 4);
+  var flist: int64 = otl_off16(f, table, table + 6);
+  var llist: int64 = otl_off16(f, table, table + 8);
+  if (slist == 0 || flist == 0 || llist == 0) { return; }
+  var sc: int64 = find_script(f, slist, script);
+  if (sc == 0) { sc = find_script(f, slist, FONT_TAG_DFLT); }
+  if (sc == 0) { sc = find_script(f, slist, 0x64666C74); }   // 'dflt'
+  if (sc == 0) { sc = find_script(f, slist, FONT_TAG_LATN); }
+  if (sc == 0) { return; }
+  var ls: int64 = otl_off16(f, sc, sc);   // default LangSys
+  if (lang != 0) {
+    var nl: int64 = (int64)font_u16(f, sc + 2);
+    for i: int64 in 0..nl {
+      var r: int64 = sc + 4 + i * 6;
+      if (font_u32(f, r) == lang) { ls = otl_off16(f, sc, r + 4); break; }
+    }
+  }
+  if (ls == 0) { return; }
+  var nlookups: int64 = (int64)font_u16(f, llist);
+  var nfeat: int64 = (int64)font_u16(f, flist);
+  // Mark used lookups in a bitmap so the result comes out sorted.
+  var used: FontVec<uint8>;
+  if (!font_vec_reserve<uint8>(&used, nlookups + 1)) { return; }
+  for i: int64 in 0..nlookups { used.data[i] = 0; }
+  var nfi: int64 = (int64)font_u16(f, ls + 4);
+  var req: uint32 = font_u16(f, ls + 2);
+  for k: int64 in -1..nfi {
+    var fi: uint32 = 0;
+    if (k < 0) { fi = req; if (fi == 0xFFFF) { continue; } }
+    else { fi = font_u16(f, ls + 6 + k * 2); }
+    if ((int64)fi >= nfeat) { continue; }
+    var fr: int64 = flist + 2 + (int64)fi * 6;
+    var ftag: uint32 = font_u32(f, fr);
+    var want: bool = k < 0;
+    for t in 0..ntags { if (tags[t] == ftag) { want = true; } }
+    if (!want) { continue; }
+    var ft: int64 = otl_off16(f, flist, fr + 4);
+    if (ft == 0) { continue; }
+    var nl: int64 = (int64)font_u16(f, ft + 2);
+    for j: int64 in 0..nl {
+      var li: int64 = (int64)font_u16(f, ft + 4 + j * 2);
+      if (li < nlookups) { used.data[li] = 1; }
+    }
+  }
+  for i: int64 in 0..nlookups {
+    if (used.data[i] != (uint8)0) { font_vec_push<int32>(out, (int32)i); }
+  }
+  font_vec_free<uint8>(&used);
+}
+
+/// Offset of lookup `index` in the table's LookupList (0 when bad).
+export fn otl_lookup(f: FontFace*, table: int64, index: int32) -> int64 {
+  var llist: int64 = otl_off16(f, table, table + 8);
+  if (llist == 0) { return 0; }
+  if (index < 0 || (int64)index >= (int64)font_u16(f, llist)) { return 0; }
+  return otl_off16(f, llist, llist + 2 + (int64)index * 2);
+}
+
+// ---- Context matching ----
+
+/// State shared while applying lookups.
+export struct OtlCtx {
+  f: FontFace*;
+  buf: FontBuffer*;
+  table: int64;
+  flag: uint32;
+  markset: int32;
+  depth: int32;
+  gsub: bool;        // GSUB keeps ZWNJ visible to matching; GPOS skips it too
+  around: bool;      // matching backtrack or lookahead (ZWNJ is skipped there)
+  work: int64;       // operations left before we give up (stops runaway fonts)
+  limit: int64;      // most glyphs the buffer may grow to
+  deleted: int64;    // glyphs marked deleted in this lookup pass
+  pos: FontVec<int64>;
+}
+
+// Default ignorables (ZWJ, variation selectors, ...) are passed over while
+// matching, except that ZWNJ stops GSUB matches (HarfBuzz auto-zwnj/zwj).
+fn ctx_skip(c: OtlCtx*, x: FontGlyph*) -> bool {
+  if ((x->uflags & FONT_UF_DELETED) != (uint8)0) { return true; }
+  if ((x->uflags & FONT_UF_IGNORABLE) != (uint8)0) {
+    if (!(c->gsub && !c->around && x->cp == 0x200C)) { return true; }
+  }
+  return otl_skip(c->f, x, c->flag, c->markset);
+}
+
+/// Next glyph after i that the current lookup does not skip, or -1.
+export fn otl_next(c: OtlCtx*, i: int64) -> int64 {
+  var j: int64 = i + 1;
+  while (j < c->buf->g.len) {
+    if (!ctx_skip(c, &c->buf->g.data[j])) { return j; }
+    j = j + 1;
+  }
+  return -1;
+}
+
+/// Previous glyph before i that the current lookup does not skip, or -1.
+export fn otl_prev(c: OtlCtx*, i: int64) -> int64 {
+  var j: int64 = i - 1;
+  while (j >= 0) {
+    if (!ctx_skip(c, &c->buf->g.data[j])) { return j; }
+    j = j - 1;
+  }
+  return -1;
+}
+
+// How one context element is matched.
+export const OTL_BY_GLYPH: int32 = 0;   // value is a glyph number
+export const OTL_BY_CLASS: int32 = 1;   // value is a class in classdef
+export const OTL_BY_COVER: int32 = 2;   // value is an offset to a Coverage
+
+fn elem_match(c: OtlCtx*, how: int32, classdef: int64, base: int64, val: uint32, g: int32) -> bool {
+  if (how == OTL_BY_GLYPH) { return (uint32)g == val; }
+  if (how == OTL_BY_CLASS) { return (uint32)otl_class(c->f, classdef, g) == val; }
+  return otl_coverage(c->f, base + (int64)val, g) >= 0;
+}
+
+/// Matches `n` elements read as 16-bit values at p (input sequence, after
+/// the first glyph) forward from glyph i. On success fills c->pos with the
+/// matched positions (i first) and returns the last position, else -1.
+export fn otl_match_input(c: OtlCtx*, i: int64, n: int64, p: int64, how: int32, classdef: int64, base: int64) -> int64 {
+  c->pos.len = 0;
+  font_vec_push<int64>(&c->pos, i);
+  var j: int64 = i;
+  for k: int64 in 0..n {
+    j = otl_next(c, j);
+    if (j < 0) { return -1; }
+    if (!elem_match(c, how, classdef, base, font_u16(c->f, p + k * 2), c->buf->g.data[j].id)) { return -1; }
+    font_vec_push<int64>(&c->pos, j);
+  }
+  return j;
+}
+
+/// Matches a backtrack sequence (n values at p, nearest first) before i.
+export fn otl_match_back(c: OtlCtx*, i: int64, n: int64, p: int64, how: int32, classdef: int64, base: int64) -> bool {
+  var j: int64 = i;
+  c->around = true;
+  for k: int64 in 0..n {
+    j = otl_prev(c, j);
+    if (j < 0 || !elem_match(c, how, classdef, base, font_u16(c->f, p + k * 2), c->buf->g.data[j].id)) { c->around = false; return false; }
+  }
+  c->around = false;
+  return true;
+}
+
+/// Matches a lookahead sequence (n values at p) after position e.
+export fn otl_match_ahead(c: OtlCtx*, e: int64, n: int64, p: int64, how: int32, classdef: int64, base: int64) -> bool {
+  var j: int64 = e;
+  c->around = true;
+  for k: int64 in 0..n {
+    j = otl_next(c, j);
+    if (j < 0 || !elem_match(c, how, classdef, base, font_u16(c->f, p + k * 2), c->buf->g.data[j].id)) { c->around = false; return false; }
+  }
+  c->around = false;
+  return true;
+}
+
+// A matched context rule: where its lookup records are and how many.
+export struct OtlRule { recs: int64; nrec: int64; last: int64; }
+
+/// Tries the context lookup sub-table at st (lookup type 5 in GSUB, 7 in
+/// GPOS, chained 6 / 8 when `chain`) at glyph i. On a match fills r and
+/// c->pos and returns true.
+export fn otl_context(c: OtlCtx*, st: int64, chain: bool, i: int64, r: OtlRule*) -> bool {
+  var f: FontFace* = c->f;
+  var fmt: uint32 = font_u16(f, st);
+  var g: int32 = c->buf->g.data[i].id;
+  if (fmt == 1 || fmt == 2) {
+    var cov: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+    if (cov < 0) { return false; }
+    var bcd: int64 = 0;
+    var icd: int64 = 0;
+    var lcd: int64 = 0;
+    var sets: int64 = st + 4;
+    var how: int32 = OTL_BY_GLYPH;
+    var key: int64 = (int64)cov;
+    if (fmt == 2) {
+      how = OTL_BY_CLASS;
+      if (chain) {
+        bcd = otl_off16(f, st, st + 4);
+        icd = otl_off16(f, st, st + 6);
+        lcd = otl_off16(f, st, st + 8);
+        sets = st + 10;
+      } else {
+        icd = otl_off16(f, st, st + 4);
+        bcd = icd; lcd = icd;
+        sets = st + 6;
+      }
+      key = (int64)otl_class(f, icd, g);
+    }
+    var nsets: int64 = (int64)font_u16(f, sets);
+    if (key >= nsets) { return false; }
+    var rs: int64 = otl_off16(f, st, sets + 2 + key * 2);
+    if (rs == 0) { return false; }
+    var nr: int64 = (int64)font_u16(f, rs);
+    for k: int64 in 0..nr {
+      var rule: int64 = otl_off16(f, rs, rs + 2 + k * 2);
+      if (rule == 0) { continue; }
+      c->work = c->work - 1;
+      if (c->work < 0) { return false; }
+      if (chain) {
+        var nb: int64 = (int64)font_u16(f, rule);
+        var pi: int64 = rule + 2 + nb * 2;
+        var ni: int64 = (int64)font_u16(f, pi);
+        if (ni == 0) { continue; }
+        var pl: int64 = pi + 2 + (ni - 1) * 2;
+        var nl: int64 = (int64)font_u16(f, pl);
+        var pr: int64 = pl + 2 + nl * 2;
+        if (!otl_match_back(c, i, nb, rule + 2, how, bcd, 0)) { continue; }
+        var e: int64 = otl_match_input(c, i, ni - 1, pi + 2, how, icd, 0);
+        if (e < 0) { continue; }
+        if (!otl_match_ahead(c, e, nl, pl + 2, how, lcd, 0)) { continue; }
+        r->nrec = (int64)font_u16(f, pr);
+        r->recs = pr + 2;
+        r->last = e;
+        return true;
+      } else {
+        var ni: int64 = (int64)font_u16(f, rule);
+        if (ni == 0) { continue; }
+        var nrec: int64 = (int64)font_u16(f, rule + 2);
+        var e: int64 = otl_match_input(c, i, ni - 1, rule + 4, how, icd, 0);
+        if (e < 0) { continue; }
+        r->nrec = nrec;
+        r->recs = rule + 4 + (ni - 1) * 2;
+        r->last = e;
+        return true;
+      }
+    }
+    return false;
+  }
+  if (fmt == 3) {
+    if (chain) {
+      var nb: int64 = (int64)font_u16(f, st + 2);
+      var pi: int64 = st + 4 + nb * 2;
+      var ni: int64 = (int64)font_u16(f, pi);
+      if (ni == 0) { return false; }
+      var pl: int64 = pi + 2 + ni * 2;
+      var nl: int64 = (int64)font_u16(f, pl);
+      var pr: int64 = pl + 2 + nl * 2;
+      if (otl_coverage(f, otl_off16(f, st, pi + 2), g) < 0) { return false; }
+      if (!otl_match_back(c, i, nb, st + 4, OTL_BY_COVER, 0, st)) { return false; }
+      var e: int64 = otl_match_input(c, i, ni - 1, pi + 4, OTL_BY_COVER, 0, st);
+      if (e < 0) { return false; }
+      if (!otl_match_ahead(c, e, nl, pl + 2, OTL_BY_COVER, 0, st)) { return false; }
+      r->nrec = (int64)font_u16(f, pr);
+      r->recs = pr + 2;
+      r->last = e;
+      return true;
+    }
+    var ni: int64 = (int64)font_u16(f, st + 2);
+    var nrec: int64 = (int64)font_u16(f, st + 4);
+    if (ni == 0) { return false; }
+    if (otl_coverage(f, otl_off16(f, st, st + 6), g) < 0) { return false; }
+    var e: int64 = otl_match_input(c, i, ni - 1, st + 8, OTL_BY_COVER, 0, st);
+    if (e < 0) { return false; }
+    r->nrec = nrec;
+    r->recs = st + 6 + ni * 2;
+    r->last = e;
+    return true;
+  }
+  return false;
+}
+
+// ---- Lookup digests ----
+// A digest is three 64-bit masks over different bits of the glyph number,
+// like HarfBuzz's hb_set_digest_t. When any mask lacks a glyph's bit, no
+// sub-table of the lookup can start at that glyph, so it is skipped
+// without reading the coverage tables.
+
+export struct OtlDigest { m0: uint64; m4: uint64; m9: uint64; }
+
+fn dg_bits(lo: uint32, hi: uint32, shift: uint32) -> uint64 {
+  var a: uint32 = lo >> shift;
+  var b: uint32 = hi >> shift;
+  if (b - a >= 63) { return 0xFFFFFFFFFFFFFFFF; }
+  var m: uint64 = 0;
+  var v: uint32 = a;
+  while (v <= b) { m = m | ((uint64)1 << (uint64)(v & 63)); v = v + 1; }
+  return m;
+}
+
+fn dg_add_range(d: OtlDigest*, lo: uint32, hi: uint32) {
+  d->m0 = d->m0 | dg_bits(lo, hi, 0);
+  d->m4 = d->m4 | dg_bits(lo, hi, 4);
+  d->m9 = d->m9 | dg_bits(lo, hi, 9);
+}
+
+fn dg_all(d: OtlDigest*) {
+  d->m0 = 0xFFFFFFFFFFFFFFFF; d->m4 = 0xFFFFFFFFFFFFFFFF; d->m9 = 0xFFFFFFFFFFFFFFFF;
+}
+
+fn dg_coverage(f: FontFace*, d: OtlDigest*, o: int64) {
+  if (o == 0) { return; }
+  var fmt: uint32 = font_u16(f, o);
+  var n: int64 = (int64)font_u16(f, o + 2);
+  if (fmt == 1) {
+    for i: int64 in 0..n { var g: uint32 = font_u16(f, o + 4 + i * 2); dg_add_range(d, g, g); }
+  } else if (fmt == 2) {
+    for i: int64 in 0..n {
+      var lo: uint32 = font_u16(f, o + 4 + i * 6);
+      var hi: uint32 = font_u16(f, o + 6 + i * 6);
+      if (hi >= lo) { dg_add_range(d, lo, hi); }
+    }
+  } else {
+    dg_all(d);
+  }
+}
+
+/// True when the digest may contain glyph g.
+export fn otl_digest_may(d: OtlDigest*, g: int32) -> bool {
+  var u: uint64 = (uint64)(uint32)g;
+  return ((d->m0 >> (u & 63)) & 1) != 0 && ((d->m4 >> ((u >> 4) & 63)) & 1) != 0 && ((d->m9 >> ((u >> 9) & 63)) & 1) != 0;
+}
+
+/// Digest of the glyphs that can start a match in lookup lk (GSUB when
+/// gpos is false). Unknown sub-table kinds accept every glyph.
+export fn otl_lookup_digest(f: FontFace*, lk: int64, gpos: bool, d: OtlDigest*) {
+  d->m0 = 0; d->m4 = 0; d->m9 = 0;
+  var typ: uint32 = font_u16(f, lk);
+  var n: int64 = (int64)font_u16(f, lk + 4);
+  var ext: uint32 = 7;
+  var ctx: uint32 = 5;
+  if (gpos) { ext = 9; ctx = 7; }
+  for s: int64 in 0..n {
+    var st: int64 = otl_off16(f, lk, lk + 6 + s * 2);
+    if (st == 0) { continue; }
+    var t: uint32 = typ;
+    if (t == ext) {
+      t = font_u16(f, st + 2);
+      st = st + (int64)font_u32(f, st + 4);
+    }
+    var fmt: uint32 = font_u16(f, st);
+    if ((t == ctx || t == ctx + 1) && fmt == 3) {
+      if (t == ctx) { dg_coverage(f, d, otl_off16(f, st, st + 6)); }
+      else {
+        var nb: int64 = (int64)font_u16(f, st + 2);
+        dg_coverage(f, d, otl_off16(f, st, st + 4 + nb * 2 + 2));
+      }
+    } else if (t >= 1 && t <= ctx + 1) {
+      dg_coverage(f, d, otl_off16(f, st, st + 2));
+    } else if (!gpos && t == 8) {
+      dg_coverage(f, d, otl_off16(f, st, st + 2));
+    } else {
+      dg_all(d);
+    }
+  }
+}

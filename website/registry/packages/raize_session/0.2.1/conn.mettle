@@ -1,0 +1,43 @@
+// raize_session/conn — reading the session from a socket's RzConn (a Signal mount,
+// a channel join), so a Signal page and its socket see the same session.
+// reference: sessions
+// thread: any thread (the hub thread for mounts and joins); it calls the app's
+// SesStore, which must be thread-safe.
+
+import "std/mem";
+import "ses/session";
+import "raize_core/str/str";
+import "raize_core/context/conn";
+import "state";
+
+/// A session value, read from the cookie the socket's upgrade request carried. Read
+/// only: no value is written back and no cookie changes. Expired or revoked sessions
+/// read as absent. The lookup is ses_peek's: read-only, so flash messages still pending
+/// for the session stay for the user's next page, and nothing is written or deleted.
+///
+/// in:      c the connection (a Signal's 2-arg mount, a channel join); key the name
+/// returns: the value, or "" when there is no session, no such key, or no
+///          rz_use_session
+/// owns:    an owned copy: free it with rz_str_free (in the Signal's leave, say)
+/// thread:  any (the hub thread for mounts and joins)
+/// example:
+///   fn board_mount(s: Board*, c: RzConn*) -> int32 {
+///     s->user = rz_conn_session_get(c, "user");
+///     if (s->user.length == 0) { return RZ_E_NOT_FOUND; }
+///     return RZ_OK;
+///   }
+export fn rz_conn_session_get(c: RzConn*, key: string) -> string {
+  var g: Rz_SesGlobal* = rz__ses_global();
+  if (g == 0 || c == 0 || c->state == 0) { return rz_str_empty(); }
+  var tok: string = rz_str_empty();
+  if (ses_cookie_find(c->state->cookie, g->cookie, &tok) != SES_OK) { return rz_str_empty(); }
+  var s: SesSession* = (SesSession*)calloc(1, sizeof(SesSession));
+  if (s == 0) { return rz_str_empty(); }
+  var out: string = rz_str_empty();
+  if (ses_peek(&g->m, tok, rz__ses_now(), s) == SES_OK) {
+    var v: string = rz_str_empty();
+    if (ses_data_get(s, key, &v) == SES_OK) { out = rz_str_dup(v); }
+  }
+  free((rawptr)s);
+  return out;
+}

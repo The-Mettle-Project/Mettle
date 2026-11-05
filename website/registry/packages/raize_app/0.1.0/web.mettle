@@ -1,0 +1,248 @@
+// raize/app/web — static directories, guards and channel declarations.
+// reference: app
+// thread: the declaration calls run in the declaration function only; the derived
+// handlers (rz__app_static, rz__app_run_guards) run on worker threads and only read.
+
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/context";
+import "raize_core/static/static";
+import "raize_realtime/channel/channel";
+import "types";
+import "declare";
+
+// A mount or guard prefix: "/x" or "/x/y", never ending in "/" ("/" alone allowed
+// when `root_ok`).
+fn rz__prefix_ok(prefix: string, root_ok: bool) -> bool {
+  var n: int64 = (int64)prefix.length;
+  if (n == 0 || prefix.chars[0] != 47) { return false; }
+  if (n == 1) { return root_ok; }
+  return prefix.chars[n - 1] != 47;
+}
+
+// True when `path` is `prefix` or lies under it ("/app" covers "/app" and "/app/x",
+// not "/apple"; "/" covers everything).
+fn rz__under(path: string, prefix: string) -> bool {
+  var n: int64 = (int64)prefix.length;
+  if (n == 1) { return true; }
+  if (!rz_str_starts(path, prefix)) { return false; }
+  return (int64)path.length == n || path.chars[n] == 47;
+}
+
+/// Serves the files under `dir` at `prefix` (GET `<prefix>/*path`; HEAD answers too), with
+/// ETag/304, Cache-Control from config `cache_max_age`, no directory listings and
+/// no way out of `dir`.
+///
+/// in:      app     the app
+///          prefix  the URL prefix, "/static" (starts with /, no trailing /); copied
+///          dir     the directory, relative to the working directory; copied
+/// returns: nothing; a bad prefix, a duplicate, or a directory that does not exist
+///          is reported by rz_run (exit 1)
+/// owns:    nothing kept from the caller
+/// thread:  the declaration function only
+/// example:
+///   rz_static(app, "/static", "examples/tasks/public");
+export fn rz_static(app: RzApp*, prefix: string, dir: string) {
+  if (app == 0) { return; }
+  var st: Rz_AppState* = app->state;
+  if (!rz__prefix_ok(prefix, false)) {
+    rz__app_error(app, "rz_static(\"{prefix}\"): the prefix must start with / and not end with / — e.g. \"/static\"");
+    return;
+  }
+  if (dir.length == 0) {
+    rz__app_error(app, "rz_static(\"{prefix}\", \"\"): no directory — pass the directory to serve, relative to the working directory");
+    return;
+  }
+  for i in 0..st->nstatics {
+    if (rz_str_eq(st->statics[i].prefix, prefix)) {
+      rz__app_error(app, "rz_static(\"{prefix}\"): mounted twice — mount each prefix once");
+      return;
+    }
+  }
+  if (st->nstatics >= RZ__APP_MAX_STATICS) {
+    rz__app_error(app, "rz_static(\"{prefix}\"): more than {RZ__APP_MAX_STATICS} static mounts — serve one parent directory instead");
+    return;
+  }
+  var m: Rz_StaticMount* = &st->statics[st->nstatics];
+  m->prefix = rz_str_dup(prefix);
+  m->dir = rz_str_dup(dir);
+  m->files = 0;
+  st->nstatics = st->nstatics + 1;
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, prefix);
+  rz_buf_add(b, "/*path");
+  rz_route(app, "GET", rz_buf_str(b), &rz__app_static);
+  rz_buf_free(b);
+}
+
+/// internal: app (the route of every rz_static mount). Serves the file from the
+/// mount whose prefix holds the request path.
+/// in:      ctx the request
+/// returns: the HTTP status set (200, 304, 404, 413)
+/// owns:    nothing
+export fn rz__app_static(ctx: RzContext*) -> int32 {
+  var st: Rz_AppState* = rz__app_current()->state;
+  var best: int32 = -1;
+  for i in 0..st->nstatics {
+    var m: Rz_StaticMount* = &st->statics[i];
+    if (m->files != 0 && rz__under(ctx->req->path, m->prefix)) {
+      if (best < 0 || m->prefix.length > st->statics[best].prefix.length) { best = (int32)i; }
+    }
+  }
+  if (best < 0) { return rz_ctx_not_found(ctx); }
+  return rz_static_handle(st->statics[best].files, ctx);
+}
+
+/// internal: app/run. Opens every static directory; a missing one is an error.
+/// in:      app the app (config resolved)
+/// returns: nothing; errors are recorded
+/// owns:    the RzStatic values belong to the app
+export fn rz__app_derive_statics(app: RzApp*) {
+  var st: Rz_AppState* = app->state;
+  for i in 0..st->nstatics {
+    var m: Rz_StaticMount* = &st->statics[i];
+    m->files = rz_static_new(m->dir, m->prefix, rz_config_cache_max_age(&st->config));
+    if (m->files == 0) {
+      rz__app_error(app, "rz_static(\"{m->prefix}\", \"{m->dir}\"): no directory {m->dir} under the working directory — create it, fix the path, or run from the directory that holds it");
+    }
+  }
+}
+
+/// Protects every route under `prefix` with `check`, which runs before the handler
+/// (after global middleware, in declaration order) and also before a WebSocket
+/// upgrade on a path under `prefix`. `check` either lets the request through
+/// (return RZ_OK, optionally after rz_ctx_set_user) or answers it itself and
+/// returns that status (`return rz_ctx_redirect(ctx, 303, "/login");`).
+///
+/// in:      app     the app
+///          prefix  "/app" covers /app and /app/...; "/" covers everything; copied
+///          check   fn(ctx) -> int32: RZ_OK to continue, else the status it answered
+/// returns: nothing; a bad prefix is reported by rz_run
+/// owns:    nothing kept from the caller
+/// thread:  the declaration function only; `check` runs on worker threads
+/// example:
+///   fn signed_in(ctx: RzContext*) -> int32 {
+///     var u: User* = find_session(rz_ctx_cookie(ctx, "sid"));
+///     if (u == 0) { return rz_ctx_redirect(ctx, 303, "/login"); }
+///     rz_ctx_set_user(ctx, (rawptr)u);
+///     return RZ_OK;
+///   }
+///   rz_guard(app, "/app", &signed_in);
+export fn rz_guard(app: RzApp*, prefix: string, check: fn(RzContext*) -> int32) {
+  if (app == 0) { return; }
+  var st: Rz_AppState* = app->state;
+  if (!rz__prefix_ok(prefix, true)) {
+    rz__app_error(app, "rz_guard(\"{prefix}\"): the prefix must start with / and not end with / — e.g. \"/app\" or \"/\"");
+    return;
+  }
+  if (check == 0) {
+    rz__app_error(app, "rz_guard(\"{prefix}\"): no check function — pass &your_guard");
+    return;
+  }
+  if (st->nguards >= RZ__APP_MAX_GUARDS) {
+    rz__app_error(app, "rz_guard(\"{prefix}\"): more than {RZ__APP_MAX_GUARDS} guards — combine checks into one guard");
+    return;
+  }
+  st->guards[st->nguards].prefix = rz_str_dup(prefix);
+  st->guards[st->nguards].check = check;
+  st->nguards = st->nguards + 1;
+}
+
+/// internal: app/run (before the router), framework/signal and framework/channel
+/// (P3-C: run with the *page* path a shared socket route serves). Runs, in
+/// declaration order, every guard whose prefix covers `path`.
+/// in:      ctx the request; path the path the guards are matched against
+/// returns: RZ_OK when every guard let it through, else the HTTP status the first
+///          refusing guard answered (a response is always built: a guard that returns
+///          a status without one gets an empty response with that status, or 500)
+/// owns:    nothing
+export fn rz__app_run_guards(ctx: RzContext*, path: string) -> int32 {
+  var app: RzApp* = rz__app_current();
+  if (app == 0) { return RZ_OK; }
+  var st: Rz_AppState* = app->state;
+  for i in 0..st->nguards {
+    if (rz__under(path, st->guards[i].prefix)) {
+      var rc: int32 = st->guards[i].check(ctx);
+      if (rc != RZ_OK) {
+        if (ctx->resp->status == 200 && rz_resp_body_len(ctx->resp) == 0 && rc != 200) {
+          if (rc < 100 || rc > 599) { rc = 500; }
+          rz_ctx_empty(ctx, rc);
+        }
+        return rc;
+      }
+    }
+  }
+  return RZ_OK;
+}
+
+/// Declares a channel topic pattern for Phoenix-protocol sockets ("room:*" matches
+/// "room:lobby"); rz_run serves every declared channel on GET /socket/websocket
+/// (phoenix.js's default path), behind any guard whose prefix covers it. join(ctx, payload) admits a member (RZ_OK) or refuses;
+/// handle_in(ctx, event, payload) handles each message; leave(ctx) cleans up.
+///
+/// in:      app        the app
+///          pattern    the topic or "<prefix>*"; copied
+///          join       runs on the hub thread when a client joins a matching topic
+///          handle_in  runs on the hub thread for each message from a member
+///          leave      runs on the hub thread when a member leaves or disconnects
+/// returns: nothing; mistakes are reported by rz_run
+/// owns:    nothing kept from the caller
+/// thread:  the declaration function only; callbacks run on the hub thread
+/// example:
+///   rz_channel(app, "room:*", &room_join, &room_in, &room_leave);
+export fn rz_channel(app: RzApp*, pattern: string, join: fn(RzChanCtx*, string) -> int32, handle_in: fn(RzChanCtx*, string, string) -> int32, leave: fn(RzChanCtx*) -> void) {
+  if (app == 0) { return; }
+  var st: Rz_AppState* = app->state;
+  if (pattern.length == 0 || join == 0 || handle_in == 0 || leave == 0) {
+    rz__app_error(app, "rz_channel(\"{pattern}\"): a topic pattern and all three callbacks are required — pass &join, &handle_in, &leave");
+    return;
+  }
+  for i in 0..st->nchannels {
+    if (rz_str_eq(st->channels[i].pattern, pattern)) {
+      rz__app_error(app, "rz_channel(\"{pattern}\"): declared twice — declare each pattern once");
+      return;
+    }
+  }
+  if (st->nchannels >= RZ__APP_MAX_CHANNELS) {
+    rz__app_error(app, "rz_channel(\"{pattern}\"): more than {RZ__APP_MAX_CHANNELS} channels — use one pattern with a wildcard");
+    return;
+  }
+  var d: Rz_ChannelDecl* = &st->channels[st->nchannels];
+  d->pattern = rz_str_dup(pattern);
+  d->join = join;
+  d->handle_in = handle_in;
+  d->leave = leave;
+  st->nchannels = st->nchannels + 1;
+}
+
+/// internal: the channel wiring in app/run. The recorded rz_channel
+/// declarations, in declaration order.
+/// in:      app the app; count receives how many
+/// returns: the first declaration (count of them follow), valid until rz_run returns
+/// owns:    nothing; the app owns the array and its pattern strings
+export fn rz__app_channels(app: RzApp*, count: int32*) -> Rz_ChannelDecl* {
+  *count = app->state->nchannels;
+  return &app->state->channels[0];
+}
+
+/// Broadcasts `event` with `payload_json` to every member of `topic`, from any thread
+/// (HTTP handlers, rz_every ticks, channel callbacks). Takes no app or context: one
+/// app runs per process (rz_run), so the call reads like Phoenix's
+/// Endpoint.broadcast and works where no RzContext exists (timers).
+///
+/// in:      topic         the exact topic ("room:lobby"); copied
+///          event         the event name; copied
+///          payload_json  a complete JSON value; copied
+/// returns: RZ_OK when queued (members get it on the hub thread, in call order);
+///          RZ_E_UNSUPPORTED when no channel or Signal is declared or rz_run is not
+///          serving; RZ_E_FULL when the hub's mailbox is full (nothing was queued)
+/// owns:    nothing kept from the caller
+/// thread:  any, while rz_run serves
+/// example:
+///   fn lobby_tick(n: int64) { rz_broadcast("room:lobby", "tick", "{{\"n\":{n}}"); }
+export fn rz_broadcast(topic: string, event: string, payload_json: string) -> int32 {
+  var app: RzApp* = rz__app_current();
+  if (app == 0 || app->state->chans == 0) { return RZ_E_UNSUPPORTED; }
+  if (!rz_chan_post_broadcast(app->state->chans, topic, event, payload_json)) { return RZ_E_FULL; }
+  return RZ_OK;
+}

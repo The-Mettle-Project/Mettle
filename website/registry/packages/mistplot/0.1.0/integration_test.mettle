@@ -1,0 +1,200 @@
+// integration_test — one chart goes through the whole stack in a single file (chart,
+// frame, scene, the SVG, HTML and terminal renderers), so a break between two layers
+// fails here even when each layer's own test is green.
+//
+// What is asserted
+//   1. the line fixture (2 series x 13 points, a title with `&` and `<`) builds a scene
+//      with finite coordinates, every node inside the 640x400 canvas, 2 series polylines
+//      of 13 points and the raw title;
+//   2. rendering twice is byte-identical (SVG, HTML and terminal), which the goldens and
+//      the debug/release comparison rely on;
+//   3. the SVG is well-formed at grep level: the exact root tag, one root, no NaN, no
+//      `e+`, the title escaped once and its raw form absent, no <script>, and the series-0
+//      stroke is palette colour 0 (#4269d0);
+//   4. mp_chart_html wraps exactly that document in a <figure>;
+//   5. the terminal output has exactly `rows` lines and draws series 0 in the same
+//      colour (ESC[38;2;66;105;208m);
+//   6. scatter and bar charts render through the same path.
+//
+// Pure: no files, no threads, no externs, so `mettle test` runs it in the interpreter.
+
+import "std/conv";
+import "mistplot/test/harness";
+import "mistplot/mistplot";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+
+fn it_title() -> string { return "Throughput & latency <budget>"; }
+
+fn it_has(s: string, needle: string) -> bool { return str_contains(s, needle) != 0; }
+
+fn it_line() -> MpChart* {
+  var api: float64[13] = [14.0, 22.0, 19.0, 31.0, 44.0, 39.0, 52.0, 63.0, 58.0, 71.0, 84.0,
+                          78.0, 93.0];
+  var cache: float64[13] = [9.0, 12.0, 17.0, 15.0, 24.0, 31.0, 28.0, 37.0, 45.0, 41.0, 52.0,
+                            61.0, 57.0];
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var a: int32 = mp_chart_series(c, "api");
+  var k: int32 = mp_chart_series(c, "cache");
+  mp_chart_push_n(c, a, 0, 0, 0);
+  var i: int32 = 0;
+  while (i < 13) {
+    mp_chart_push(c, a, (float64)i, api[i]);
+    mp_chart_push(c, k, (float64)i, cache[i]);
+    i = i + 1;
+  }
+  mp_chart_set_title(c, it_title());
+  mp_chart_set_subtitle(c, "13 samples, 2 series");
+  mp_chart_set_x_label(c, "seconds");
+  mp_chart_set_y_label(c, "req/s");
+  return c;
+}
+
+fn it_node_ok(nd: MpNode*, s: MpScene*) -> bool {
+  var v: float64 = nd->x + nd->y + nd->w + nd->h;
+  if (!(v - v == 0.0)) { return false; }
+  if (nd->kind == MP_NODE_TEXT) { return nd->y >= 0.0 && nd->y <= 400.0; }
+  if (!(nd->x >= 0.0 && nd->y >= 0.0 && nd->x + nd->w <= 640.0 && nd->y + nd->h <= 400.0)) {
+    return false;
+  }
+  var p: float64* = mp_scene_node_pts(s, nd);
+  var i: int64 = 0;
+  while (i < (int64)nd->pts_len) {
+    if (!(p[i] - p[i] == 0.0)) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn it_check_scene() {
+  var c: MpChart* = it_line();
+  var t: MpTarget = mp_target(640.0, 400.0);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  mp_expect("scene", s != 0);
+  var ok: bool = true;
+  var polys: int64 = 0;
+  var title: bool = false;
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (!it_node_ok(nd, s)) { ok = false; }
+    if (nd->kind == MP_NODE_POLY && nd->cls >= MP_CLS_SERIES && nd->pts_len == 26) {
+      polys = polys + 1;
+    }
+    if (nd->kind == MP_NODE_TEXT && mp_scene_node_text(s, nd) == it_title()) { title = true; }
+    i = i + 1;
+  }
+  mp_expect("finite and inside", ok);
+  mp_expect_i64("two series of 13 points", polys, 2);
+  mp_expect("raw title in the scene", title);
+  mp_chart_free(c);
+}
+
+fn it_check_svg() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = it_line();
+  var a: MpBuf* = mp_buf_new(64);
+  var b: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("svg", (int64)mp_chart_svg(c, 640.0, 400.0, a), (int64)MP_OK);
+  mp_chart_set_title(c, "other");
+  mp_chart_set_title(c, it_title());
+  mp_expect_i64("svg again", (int64)mp_chart_svg(c, 640.0, 400.0, b), (int64)MP_OK);
+  var doc: string = mp_buf_str(a);
+  mp_expect("deterministic", doc == mp_buf_str(b));
+  mp_expect("root", str_starts_with(doc, "<svg xmlns=\"http://www.w3.org/2000/svg\"") != 0);
+  mp_expect("root size", it_has(doc, " viewBox=\"0 0 640 400\" width=\"640\" height=\"400\""));
+  mp_expect_i64("one root", str_count(doc, "<svg"), 1);
+  mp_expect_i64("closed", str_count(doc, "</svg>\n"), 1);
+  mp_expect("no NaN", !it_has(doc, "NaN") && !it_has(doc, "nan") && !it_has(doc, "e+"));
+  mp_expect_i64("title escaped in text and label", str_count(doc,
+                "Throughput &amp; latency &lt;budget&gt;"), 2);
+  mp_expect("raw title absent", !it_has(doc, it_title()));
+  mp_expect("no script", !it_has(doc, "<script"));
+  mp_expect("series 0 stroke", it_has(doc, "stroke=\"#4269d0\" stroke-width=\"2\""));
+  mp_expect_i64("html", (int64)mp_chart_html(c, 640.0, 400.0, b), (int64)MP_OK);
+  var fig: string = mp_buf_str(b);
+  mp_expect_i64("one figure", str_count(fig, "<figure class=\"mp-figure\">\n"), 1);
+  mp_expect_i64("svg inside", str_count(fig, "\n  <svg "), 1);
+  mp_expect("figure ends", str_ends_with(fig, "  </svg>\n</figure>\n") != 0);
+  mp_buf_free(a);
+  mp_buf_free(b);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn it_check_term() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = it_line();
+  var a: MpBuf* = mp_buf_new(64);
+  var b: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("term", (int64)mp_chart_term(c, 80, 24, MP_TERM_BRAILLE, a), (int64)MP_OK);
+  mp_expect_i64("term again", (int64)mp_chart_term(c, 80, 24, MP_TERM_BRAILLE, b),
+                (int64)MP_OK);
+  var doc: string = mp_buf_str(a);
+  mp_expect("term deterministic", doc == mp_buf_str(b));
+  mp_expect_i64("24 rows", str_count(doc, "\n"), 24);
+  mp_expect("series 0 colour", it_has(doc, "[38;2;66;105;208m"));
+  mp_expect("title row", str_starts_with(doc, " Throughput & latency <budget>\n") != 0);
+  mp_buf_free(a);
+  mp_buf_free(b);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn it_check_kinds() {
+  var c: MpChart* = mp_chart_new(MP_SCATTER);
+  mp_chart_set_title(c, "a < b");
+  var s: int32 = mp_chart_series(c, "pts");
+  var i: int32 = 0;
+  while (i < 8) {
+    mp_chart_push(c, s, (float64)i, (float64)(i * 5 % 8));
+    i = i + 1;
+  }
+  var out: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("scatter", (int64)mp_chart_svg(c, 320.0, 200.0, out), (int64)MP_OK);
+  mp_expect_i64("8 circles", str_count(mp_buf_str(out), "<circle"), 8);
+  mp_expect("escaped", it_has(mp_buf_str(out), ">a &lt; b</text>"));
+  mp_chart_free(c);
+  c = mp_chart_new(MP_BAR);
+  s = mp_chart_series(c, "n");
+  mp_chart_set_value(c, s, "x", 2.0);
+  mp_chart_set_value(c, s, "y", 3.0);
+  mp_expect_i64("bars", (int64)mp_chart_svg(c, 320.0, 200.0, out), (int64)MP_OK);
+  mp_expect_i64("2 bars", str_count(mp_buf_str(out), "class=\"mp-c-series mp-s-0\""), 2);
+  mp_buf_free(out);
+  mp_chart_free(c);
+}
+
+fn it_run() {
+  it_check_scene();
+  it_check_svg();
+  it_check_term();
+  it_check_kinds();
+}
+
+export fn main() -> int32 {
+  it_run();
+  return mp_summary();
+}
+
+@test fn t_integration_scene() -> int32 {
+  it_check_scene();
+  it_check_kinds();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_integration_svg() -> int32 {
+  it_check_svg();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_integration_term() -> int32 {
+  it_check_term();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

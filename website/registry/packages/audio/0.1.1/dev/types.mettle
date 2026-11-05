@@ -1,0 +1,34 @@
+// The sound device record shared by the device front end and the
+// operating system back ends.
+
+export const AUDIO_DEV_PULSE: int32 = 1;    // PulseAudio, or PipeWire through its PulseAudio service
+export const AUDIO_DEV_ALSA: int32 = 2;
+export const AUDIO_DEV_WASAPI: int32 = 3;
+
+export struct AudioDevice {
+  playback: bool;     // false: capture
+  rate: int32;
+  ch: int32;
+  period: int32;      // frames per callback
+  // called on the device thread: playback fills buf; capture reads it
+  cb: fn(rawptr, float32*, int32, int32) -> void;
+  user: rawptr;
+  backend: int32;     // AUDIO_DEV_*
+  h: rawptr;          // back end handles
+  h2: rawptr;
+  h3: rawptr;
+  h4: rawptr;
+  ev: int64;          // Windows event
+  bufframes: int32;   // back end buffer size
+  buf: float32*;      // period * ch floats
+  sbuf: int16*;       // for back ends that want 16-bit
+  use_s16: bool;
+  remap: bool;        // ALSA 5.1/7.1 order differs from WAV order
+  thread: int64;
+  running: int32;     // 1 while the thread should run
+  alive: int32;       // 1 while the thread runs
+  err: int32;         // set by the thread when the device fails
+  name: uint8[256];   // device name, NUL-terminated ("" = default)
+  started: bool;
+  slot: int32;        // the back end's thread slot
+}

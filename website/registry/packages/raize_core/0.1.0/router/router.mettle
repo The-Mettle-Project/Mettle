@@ -1,0 +1,31 @@
+// raize/router — the facade the framework imports.
+//
+// Mettle imports are transitive and every module shares one flat namespace,
+// so importing this file (and nothing else from the router) provides the whole
+// exported surface, exactly as when the router was a single file:
+//
+//   trie.mettle    RzRouter/RzNode/RzLink/RzSlot/RzGroup, the RZ_MAX_* and
+//                  RZ_ROUTER_E_* detail codes, RZ_BIT_*/RZ_KIND_*, rz_method_bit,
+//                  rz_router_new/free/set_path_decoded/add/count/nodes/error/status
+//   match.mettle   rz_router_handle, rz_router_handle_path, rz_router_allow
+//   group.mettle   rz_router_group, rz_group_add, rz_group_end
+//   router.mettle  rz_router_strerror and the pass-through imports below
+//
+// The contracts (priority order, ambiguity refusals, trailing-slash policy,
+// decoding, methods/405/HEAD, capacities, param lifetime) are documented at
+// the top of trie.mettle and match.mettle, which is where they are enforced.
+
+import "trie";
+import "match";
+import "group";
+
+// Describes a registration detail code (rz_router_error), not a status.
+export fn rz_router_strerror(code: int32) -> string {
+  if (code == RZ_OK) { return "ok"; }
+  if (code == RZ_ROUTER_E_CAPACITY) { return "router capacity exceeded"; }
+  if (code == RZ_ROUTER_E_DUPLICATE) { return "duplicate route"; }
+  if (code == RZ_ROUTER_E_NAME_CONFLICT) { return "conflicting param/wildcard name"; }
+  if (code == RZ_ROUTER_E_PATTERN) { return "malformed route pattern"; }
+  if (code == RZ_ROUTER_E_METHOD) { return "unknown HTTP method"; }
+  return "unknown router error";
+}

@@ -1,0 +1,305 @@
+// Argon2id v1.3 (RFC 9106) in pure Mettle: internal core used by
+// cr_pwhash_* (pwhash.mettle). One lane (parallelism 1), no secret key and
+// no associated data. Not part of the public API.
+//
+// The memory matrix is mapped with the mmap system call (never the heap),
+// wiped and unmapped before the function returns. Raw system calls, not
+// std/osmem, so a self-contained AArch64 binary needs no libc.
+//
+// Argon2id picks its reference blocks from the data after the first half of
+// the first pass; that data-dependent addressing is part of the algorithm.
+// The password only reaches the matrix through BLAKE2b and the BlaMka
+// compression, which are branch-free and table-free.
+
+import "cryptex/core/sys_x86_64" if x86_64;
+import "cryptex/core/sys_aarch64" if aarch64;
+import "cryptex/core/status";
+import "cryptex/core/util";
+import "cryptex/hash/blake2b";
+
+// Smallest tag RFC 9106 allows, and the smallest salt.
+const CRX_A2_TAG_MIN: int64 = 4;
+const CRX_A2_SALT_MIN: int64 = 8;
+const CRX_A2_MAXLEN: int64 = 4294967295;
+const CRX_A2_LO32: uint64 = 4294967295;
+
+// BlaMka multiplication-hardened addition: a + b + 2 * lo32(a) * lo32(b).
+@inline fn a2_mk(a: uint64, b: uint64) -> uint64 {
+  return a + b + (uint64)2 * (a & CRX_A2_LO32) * (b & CRX_A2_LO32);
+}
+
+// One BlaMka G on words a, b, c, d of v.
+@inline fn a2_g(v: uint64*, a: int32, b: int32, c: int32, d: int32) {
+  var va: uint64 = v[a];
+  var vb: uint64 = v[b];
+  var vc: uint64 = v[c];
+  var vd: uint64 = v[d];
+  va = a2_mk(va, vb);
+  vd = vd ^ va;
+  vd = (vd >> 32) | (vd << 32);
+  vc = a2_mk(vc, vd);
+  vb = vb ^ vc;
+  vb = (vb >> 24) | (vb << 40);
+  va = a2_mk(va, vb);
+  vd = vd ^ va;
+  vd = (vd >> 16) | (vd << 48);
+  vc = a2_mk(vc, vd);
+  vb = vb ^ vc;
+  vb = (vb >> 63) | (vb << 1);
+  v[a] = va;
+  v[b] = vb;
+  v[c] = vc;
+  v[d] = vd;
+}
+
+// The permutation P (RFC 9106 section 3.5) on 16 words laid out as eight
+// pairs: pair q is the words at base + q * stride and base + q * stride + 1.
+// Rows of the 1024-byte block: base 16 * i, stride 2. Columns: base 2 * i,
+// stride 16.
+@inline fn a2_p(v: uint64*, base: int32, stride: int32) {
+  var i0: int32 = base;
+  var i2: int32 = base + stride;
+  var i4: int32 = i2 + stride;
+  var i6: int32 = i4 + stride;
+  var i8: int32 = i6 + stride;
+  var i10: int32 = i8 + stride;
+  var i12: int32 = i10 + stride;
+  var i14: int32 = i12 + stride;
+  a2_g(v, i0, i4, i8, i12);
+  a2_g(v, i0 + 1, i4 + 1, i8 + 1, i12 + 1);
+  a2_g(v, i2, i6, i10, i14);
+  a2_g(v, i2 + 1, i6 + 1, i10 + 1, i14 + 1);
+  a2_g(v, i0, i4 + 1, i10, i14 + 1);
+  a2_g(v, i0 + 1, i6, i10 + 1, i12);
+  a2_g(v, i2, i6 + 1, i8, i12 + 1);
+  a2_g(v, i2 + 1, i4, i8 + 1, i14);
+}
+
+// The compression G (RFC 9106 section 3.5), on blocks of 128 words:
+//   R = ref ^ prev; next = (xorflag ? next : 0) ^ R ^ P(R)
+// xm is all-ones to XOR into the old next (passes after the first), else 0.
+// next may alias ref or prev.
+fn a2_fill(prev: uint64*, ref: uint64*, next: uint64*, xm: uint64) {
+  var r: uint64[128];
+  for i in 0..128 {
+    var x: uint64 = ref[i] ^ prev[i];
+    r[i] = x;
+    next[i] = (next[i] & xm) ^ x;
+  }
+  for i in 0..8 { a2_p(&r[0], i * 16, 2); }
+  for i in 0..8 { a2_p(&r[0], i * 2, 16); }
+  for i in 0..128 { next[i] = next[i] ^ r[i]; }
+  cr_wipe((uint8*)&r[0], 1024);
+}
+
+// Next 128 addresses of the data-independent mode: counter + 1, then
+// addr = G(0, G(0, input)).
+fn a2_next_addresses(addr: uint64*, input: uint64*, zero: uint64*) {
+  input[6] = input[6] + (uint64)1;
+  a2_fill(zero, input, addr, (uint64)0);
+  a2_fill(zero, addr, addr, (uint64)0);
+}
+
+fn a2_put32(s: CrxBlake2b*, v: uint32) {
+  var b: uint8[4];
+  b[0] = (uint8)v;
+  b[1] = (uint8)(v >> 8);
+  b[2] = (uint8)(v >> 16);
+  b[3] = (uint8)(v >> 24);
+  crx_blake2b_update(s, &b[0], 4);
+}
+
+// H' (RFC 9106 section 3.3): a variable-length hash of in. outlen >= 1.
+fn a2_hprime(out: uint8*, outlen: int64, inp: uint8*, inlen: int64) {
+  var s: CrxBlake2b;
+  var v: uint8[64];
+  var first: int64 = outlen;
+  if (first > 64) { first = 64; }
+  crx_blake2b_init(&s, first, 0, 0);
+  a2_put32(&s, (uint32)outlen);
+  crx_blake2b_update(&s, inp, inlen);
+  if (outlen <= 64) {
+    crx_blake2b_final(&s, out);
+    return;
+  }
+  crx_blake2b_final(&s, &v[0]);
+  for i in 0..32 { out[i] = v[i]; }
+  var pos: int64 = 32;
+  var rem: int64 = outlen - 32;
+  while (rem > 64) {
+    crx_blake2b_init(&s, 64, 0, 0);
+    crx_blake2b_update(&s, &v[0], 64);
+    crx_blake2b_final(&s, &v[0]);
+    for i in 0..32 { out[pos + i] = v[i]; }
+    pos = pos + 32;
+    rem = rem - 32;
+  }
+  crx_blake2b_init(&s, rem, 0, 0);
+  crx_blake2b_update(&s, &v[0], 64);
+  crx_blake2b_final(&s, &out[pos]);
+  cr_wipe(&v[0], 64);
+}
+
+// 1024 little-endian bytes into 128 words, and back.
+fn a2_load(dst: uint64*, src: uint8*) {
+  for i in 0..128 {
+    var o: int32 = i * 8;
+    dst[i] = (uint64)src[o]
+      | ((uint64)src[o + 1] << 8)
+      | ((uint64)src[o + 2] << 16)
+      | ((uint64)src[o + 3] << 24)
+      | ((uint64)src[o + 4] << 32)
+      | ((uint64)src[o + 5] << 40)
+      | ((uint64)src[o + 6] << 48)
+      | ((uint64)src[o + 7] << 56);
+  }
+}
+
+fn a2_store(dst: uint8*, src: uint64*) {
+  for i in 0..128 {
+    var o: int32 = i * 8;
+    var w: uint64 = src[i];
+    dst[o] = (uint8)w;
+    dst[o + 1] = (uint8)(w >> 8);
+    dst[o + 2] = (uint8)(w >> 16);
+    dst[o + 3] = (uint8)(w >> 24);
+    dst[o + 4] = (uint8)(w >> 32);
+    dst[o + 5] = (uint8)(w >> 40);
+    dst[o + 6] = (uint8)(w >> 48);
+    dst[o + 7] = (uint8)(w >> 56);
+  }
+}
+
+// Fills the matrix: all passes, all slices of the single lane.
+fn a2_fill_all(mem: uint64*, seg: int64, t_cost: uint32, total: uint32) {
+  var lane_len: int64 = seg * 4;
+  var input: uint64[128];
+  var addr: uint64[128];
+  var zero: uint64[128];
+  for i in 0..128 { zero[i] = 0; }
+  var pass: int64 = 0;
+  while (pass < (int64)t_cost) {
+    var slice: int64 = 0;
+    while (slice < 4) {
+      var indep: bool = pass == 0 && slice < 2;
+      var first: int64 = 0;
+      if (indep) {
+        for i in 0..128 { input[i] = 0; addr[i] = 0; }
+        input[0] = (uint64)pass;
+        input[1] = 0;
+        input[2] = (uint64)slice;
+        input[3] = (uint64)total;
+        input[4] = (uint64)t_cost;
+        input[5] = 2;
+      }
+      if (pass == 0 && slice == 0) {
+        first = 2;
+        if (indep) { a2_next_addresses(&addr[0], &input[0], &zero[0]); }
+      }
+      var xm: uint64 = 0;
+      if (pass > 0) { xm = ~(uint64)0; }
+      var start: int64 = 0;
+      if (pass > 0 && slice < 3) { start = (slice + 1) * seg; }
+      var i: int64 = first;
+      while (i < seg) {
+        var curr: int64 = slice * seg + i;
+        var prev: int64 = curr - 1;
+        if (curr == 0) { prev = lane_len - 1; }
+        var rnd: uint64 = 0;
+        if (indep) {
+          if (i % 128 == 0) { a2_next_addresses(&addr[0], &input[0], &zero[0]); }
+          rnd = addr[i % 128];
+        } else {
+          rnd = mem[prev * 128];
+        }
+        // Size of the reference area (RFC 9106 section 3.4.2).
+        var area: int64 = 0;
+        if (pass == 0) {
+          area = slice * seg + i - 1;
+        } else {
+          area = lane_len - seg + i - 1;
+        }
+        var j1: uint64 = rnd & CRX_A2_LO32;
+        var rel: uint64 = (j1 * j1) >> 32;
+        rel = (uint64)area - (uint64)1 - (((uint64)area * rel) >> 32);
+        var refi: int64 = (start + (int64)rel) % lane_len;
+        a2_fill(&mem[prev * 128], &mem[refi * 128], &mem[curr * 128], xm);
+        i = i + 1;
+      }
+      slice = slice + 1;
+    }
+    pass = pass + 1;
+  }
+  cr_wipe((uint8*)&input[0], 1024);
+  cr_wipe((uint8*)&addr[0], 1024);
+}
+
+/// internal: Argon2id v1.3 (RFC 9106), parallelism 1, no key, no associated
+/// data. Writes outlen bytes of tag. Memory is m_kib KiB rounded down to a
+/// multiple of 4, mapped with the mmap system call and wiped and unmapped before returning.
+/// in: out writable for outlen bytes; outlen >= 4; pw readable for pwlen
+///   bytes (0 allowed when pwlen == 0); salt readable for saltlen >= 8 bytes;
+///   t_cost >= 1; m_kib >= 8
+/// returns: CR_OK; CR_E_ARG for invalid arguments; CR_E_INTERNAL if the
+///   memory could not be mapped. On error out is not written
+export fn crx_argon2id(out: uint8*, outlen: int64, pw: uint8*, pwlen: int64, salt: uint8*, saltlen: int64, t_cost: uint32, m_kib: uint32) -> int32 {
+  if (out == 0 || outlen < CRX_A2_TAG_MIN || outlen > CRX_A2_MAXLEN) { return CR_E_ARG; }
+  if (pwlen < 0 || (pw == 0 && pwlen > 0) || pwlen > CRX_A2_MAXLEN) { return CR_E_ARG; }
+  if (salt == 0 || saltlen < CRX_A2_SALT_MIN || saltlen > CRX_A2_MAXLEN) { return CR_E_ARG; }
+  if (t_cost < 1 || m_kib < 8) { return CR_E_ARG; }
+
+  var seg: int64 = (int64)(m_kib / 4);
+  var blocks: int64 = seg * 4;
+  var bytes: int64 = blocks * 1024;
+  var base: int64 = syscall(CRX_SYS_MMAP, 0, bytes, 3, 0x22, -1, 0);
+  if (base <= 0) { return CR_E_INTERNAL; }
+  var raw: uint8* = (uint8*)base;
+  crx_region_begin(raw, bytes);
+  var mem: uint64* = (uint64*)raw;
+
+  // H0 (RFC 9106 section 3.2)
+  var h0: uint8[72];
+  var st: CrxBlake2b;
+  crx_blake2b_init(&st, 64, 0, 0);
+  a2_put32(&st, 1);
+  a2_put32(&st, (uint32)outlen);
+  a2_put32(&st, m_kib);
+  a2_put32(&st, t_cost);
+  a2_put32(&st, 0x13);
+  a2_put32(&st, 2);
+  a2_put32(&st, (uint32)pwlen);
+  crx_blake2b_update(&st, pw, pwlen);
+  a2_put32(&st, (uint32)saltlen);
+  crx_blake2b_update(&st, salt, saltlen);
+  a2_put32(&st, 0);
+  a2_put32(&st, 0);
+  crx_blake2b_final(&st, &h0[0]);
+
+  // First two blocks: H'(H0 || block index || lane 0), 1024 bytes each.
+  var tmp: uint8[1024];
+  for k in 0..2 {
+    h0[64] = (uint8)k;
+    h0[65] = 0;
+    h0[66] = 0;
+    h0[67] = 0;
+    h0[68] = 0;
+    h0[69] = 0;
+    h0[70] = 0;
+    h0[71] = 0;
+    a2_hprime(&tmp[0], 1024, &h0[0], 72);
+    a2_load(&mem[k * 128], &tmp[0]);
+  }
+  cr_wipe(&h0[0], 72);
+
+  a2_fill_all(mem, seg, t_cost, (uint32)blocks);
+
+  // Tag = H'(last block).
+  a2_store(&tmp[0], &mem[(blocks - 1) * 128]);
+  a2_hprime(out, outlen, &tmp[0], 1024);
+  cr_wipe(&tmp[0], 1024);
+
+  cr_wipe(raw, bytes);
+  crx_region_end(raw);
+  syscall(CRX_SYS_MUNMAP, base, bytes);
+  return CR_OK;
+}

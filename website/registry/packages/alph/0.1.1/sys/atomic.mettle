@@ -1,0 +1,85 @@
+// alph/sys/atomic: 64-bit atomics on x86-64.
+//
+// Each operation is a @naked export function, so it runs exactly the
+// instructions written here, and the optimizer sees an opaque call that it
+// cannot move memory accesses across. x86-64 is TSO: a plain load already has
+// acquire order and a plain store has release order. Sequential consistency
+// needs a locked instruction or mfence, which store_sc, swap, cas and add use.
+// Pointers are passed as int64.
+
+// Reads *p. Acquire order: later reads and writes stay after it.
+// Thread: any.
+@naked export fn alph_atomic_load(p: int64*) -> int64 {
+  asm {
+    mov rax, [rdi]
+    ret
+  }
+}
+
+// Writes v to *p. Release order: earlier reads and writes stay before it.
+// A later load may still pass it; use alph_atomic_store_sc when that matters.
+// Thread: any.
+@naked export fn alph_atomic_store(p: int64*, v: int64) {
+  asm {
+    mov [rdi], rsi
+    ret
+  }
+}
+
+// Writes v to *p, sequentially consistent: no later load can be reordered
+// before it. Thread: any.
+@naked export fn alph_atomic_store_sc(p: int64*, v: int64) {
+  asm {
+    xchg [rdi], rsi
+    ret
+  }
+}
+
+// Stores v in *p and returns the value it replaced. Sequentially consistent.
+// Thread: any.
+@naked export fn alph_atomic_swap(p: int64*, v: int64) -> int64 {
+  asm {
+    mov rax, rsi
+    xchg [rdi], rax
+    ret
+  }
+}
+
+// Compare and swap: stores desired in *p if *p equals expected. Returns the
+// value *p held before, so the swap happened exactly when the result equals
+// expected. Sequentially consistent. Thread: any.
+@naked export fn alph_atomic_cas(p: int64*, expected: int64, desired: int64) -> int64 {
+  asm {
+    mov rax, rsi
+    lock cmpxchg [rdi], rdx
+    ret
+  }
+}
+
+// Adds delta to *p and returns the value from before the add. Sequentially
+// consistent. Thread: any.
+@naked export fn alph_atomic_add(p: int64*, delta: int64) -> int64 {
+  asm {
+    mov rax, rsi
+    lock xadd [rdi], rax
+    ret
+  }
+}
+
+// A full barrier: no load or store moves across it in either direction.
+// Thread: any.
+@naked export fn alph_atomic_fence() {
+  asm {
+    mfence
+    ret
+  }
+}
+
+// A hint inside spin loops: lets the sibling hyperthread run and saves
+// power. It has no effect on memory. Thread: any.
+@naked export fn alph_cpu_relax() {
+  asm {
+    pause
+    ret
+  }
+}

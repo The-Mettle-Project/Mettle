@@ -1,0 +1,194 @@
+// Alpha and color space: premultiplied alpha, sRGB and linear light.
+//
+// Every function works in place on any format and leaves alpha alone.
+// 8-bit sRGB to linear loses detail in the darks; convert to ETCH_RGBAF or
+// a 16-bit format first if that matters.
+
+import "std/math" as math;
+import "std/mem";
+import "../core/status";
+import "../core/image";
+
+/// Multiplies color by alpha. Does nothing for formats with no alpha.
+export fn etch_premultiply(img: EtchImage*) -> int32 {
+  if (img == 0 || img->data == 0) { return ETCH_E_ARG; }
+  var c: int64 = (int64)(img->format & 7);
+  if (c != 2 && c != 4) { return ETCH_OK; }
+  var kind: int32 = img->format >> 4;
+  var w: int64 = (int64)img->width;
+  for y in 0..img->height {
+    var row: uint8* = img->data + (int64)y * img->stride;
+    if (kind == 0) {
+      for x in 0..w {
+        var p: uint8* = row + x * c;
+        var a: int32 = (int32)p[c - 1];
+        for k in 0..(c - 1) {
+          var t: int32 = (int32)p[k] * a + 128;
+          p[k] = (uint8)((t + (t >> 8)) >> 8);
+        }
+      }
+    } else if (kind == 1) {
+      var r16: uint16* = (uint16*)row;
+      for x in 0..w {
+        var p: uint16* = r16 + x * c;
+        var a: int64 = (int64)p[c - 1];
+        for k in 0..(c - 1) { p[k] = (uint16)(((int64)p[k] * a + 32767) / 65535); }
+      }
+    } else {
+      var rf: float32* = (float32*)row;
+      for x in 0..w {
+        var p: float32* = rf + x * c;
+        var a: float32 = p[c - 1];
+        for k in 0..(c - 1) { p[k] = p[k] * a; }
+      }
+    }
+  }
+  return ETCH_OK;
+}
+
+/// Divides color by alpha (undoes etch_premultiply). Pixels with zero alpha
+/// become black.
+export fn etch_unpremultiply(img: EtchImage*) -> int32 {
+  if (img == 0 || img->data == 0) { return ETCH_E_ARG; }
+  var c: int64 = (int64)(img->format & 7);
+  if (c != 2 && c != 4) { return ETCH_OK; }
+  var kind: int32 = img->format >> 4;
+  var w: int64 = (int64)img->width;
+  for y in 0..img->height {
+    var row: uint8* = img->data + (int64)y * img->stride;
+    if (kind == 0) {
+      for x in 0..w {
+        var p: uint8* = row + x * c;
+        var a: int32 = (int32)p[c - 1];
+        if (a == 255) { continue; }
+        for k in 0..(c - 1) {
+          if (a == 0) { p[k] = 0; }
+          else {
+            var v: int32 = ((int32)p[k] * 255 + a / 2) / a;
+            if (v > 255) { v = 255; }
+            p[k] = (uint8)v;
+          }
+        }
+      }
+    } else if (kind == 1) {
+      var r16: uint16* = (uint16*)row;
+      for x in 0..w {
+        var p: uint16* = r16 + x * c;
+        var a: int64 = (int64)p[c - 1];
+        for k in 0..(c - 1) {
+          if (a == 0) { p[k] = 0; }
+          else {
+            var v: int64 = ((int64)p[k] * 65535 + a / 2) / a;
+            if (v > 65535) { v = 65535; }
+            p[k] = (uint16)v;
+          }
+        }
+      }
+    } else {
+      var rf: float32* = (float32*)row;
+      for x in 0..w {
+        var p: float32* = rf + x * c;
+        var a: float32 = p[c - 1];
+        for k in 0..(c - 1) {
+          if (a == 0.0) { p[k] = 0.0; } else { p[k] = p[k] / a; }
+        }
+      }
+    }
+  }
+  return ETCH_OK;
+}
+
+/// sRGB to linear for one value in 0..1.
+export fn etch_srgb_to_linear_f(v: float64) -> float64 {
+  if (v <= 0.04045) { return v / 12.92; }
+  return math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+/// Linear to sRGB for one value in 0..1.
+export fn etch_linear_to_srgb_f(v: float64) -> float64 {
+  if (v <= 0.0031308) { return v * 12.92; }
+  return 1.055 * math.pow(v, 1.0 / 2.4) - 0.055;
+}
+
+var g_lut8_lin: uint8* = 0;    // sRGB byte -> linear byte
+var g_lut8_srgb: uint8* = 0;   // linear byte -> sRGB byte
+var g_lut16_lin: uint16* = 0;
+var g_lut16_srgb: uint16* = 0;
+
+fn lut8(to_linear: bool) -> uint8* {
+  if (to_linear && g_lut8_lin != 0) { return g_lut8_lin; }
+  if (!to_linear && g_lut8_srgb != 0) { return g_lut8_srgb; }
+  var t: uint8* = (uint8*)malloc(256);
+  if (t == 0) { return t; }
+  for i in 0..256 {
+    var f: float64 = (float64)i / 255.0;
+    var o: float64 = 0.0;
+    if (to_linear) { o = etch_srgb_to_linear_f(f); } else { o = etch_linear_to_srgb_f(f); }
+    t[i] = (uint8)(int32)(o * 255.0 + 0.5);
+  }
+  if (to_linear) { g_lut8_lin = t; } else { g_lut8_srgb = t; }
+  return t;
+}
+
+fn lut16(to_linear: bool) -> uint16* {
+  if (to_linear && g_lut16_lin != 0) { return g_lut16_lin; }
+  if (!to_linear && g_lut16_srgb != 0) { return g_lut16_srgb; }
+  var t: uint16* = (uint16*)malloc(65536 * 2);
+  if (t == 0) { return t; }
+  for i in 0..65536 {
+    var f: float64 = (float64)i / 65535.0;
+    var o: float64 = 0.0;
+    if (to_linear) { o = etch_srgb_to_linear_f(f); } else { o = etch_linear_to_srgb_f(f); }
+    t[i] = (uint16)(int32)(o * 65535.0 + 0.5);
+  }
+  if (to_linear) { g_lut16_lin = t; } else { g_lut16_srgb = t; }
+  return t;
+}
+
+fn apply_curve(img: EtchImage*, to_linear: bool) -> int32 {
+  if (img == 0 || img->data == 0) { return ETCH_E_ARG; }
+  var c: int64 = (int64)(img->format & 7);
+  var colors: int64 = c;
+  if (c == 2 || c == 4) { colors = c - 1; }
+  var kind: int32 = img->format >> 4;
+  var w: int64 = (int64)img->width;
+  var t8: uint8* = (uint8*)0;
+  var t16: uint16* = (uint16*)0;
+  if (kind == 0) { t8 = lut8(to_linear); if (t8 == 0) { return ETCH_E_MEM; } }
+  if (kind == 1) { t16 = lut16(to_linear); if (t16 == 0) { return ETCH_E_MEM; } }
+  for y in 0..img->height {
+    var row: uint8* = img->data + (int64)y * img->stride;
+    if (kind == 0) {
+      for x in 0..w {
+        var p: uint8* = row + x * c;
+        for k in 0..colors { p[k] = t8[p[k]]; }
+      }
+    } else if (kind == 1) {
+      var r16: uint16* = (uint16*)row;
+      for x in 0..w {
+        var p: uint16* = r16 + x * c;
+        for k in 0..colors { p[k] = t16[p[k]]; }
+      }
+    } else {
+      var rf: float32* = (float32*)row;
+      for x in 0..w {
+        var p: float32* = rf + x * c;
+        for k in 0..colors {
+          var v: float64 = (float64)p[k];
+          var neg: bool = v < 0.0;
+          if (neg) { v = -v; }
+          if (to_linear) { v = etch_srgb_to_linear_f(v); } else { v = etch_linear_to_srgb_f(v); }
+          if (neg) { v = -v; }
+          p[k] = (float32)v;
+        }
+      }
+    }
+  }
+  return ETCH_OK;
+}
+
+/// Turns sRGB-encoded color into linear light, in place.
+export fn etch_srgb_to_linear(img: EtchImage*) -> int32 { return apply_curve(img, true); }
+
+/// Turns linear-light color into sRGB, in place.
+export fn etch_linear_to_srgb(img: EtchImage*) -> int32 { return apply_curve(img, false); }

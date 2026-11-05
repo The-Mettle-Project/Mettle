@@ -1,0 +1,120 @@
+// win32/api: the Windows API calls window uses (user32, gdi32, imm32, shell32 and
+// kernel32 for basics), with the structure layouts from the Windows SDK
+// headers (winuser.h, wingdi.h, imm.h). shcore and XInput are loaded at run
+// time with GetProcAddress, so older Windows versions still start.
+
+export struct W32Point { x: int32; y: int32; }
+export struct W32Rect { left: int32; top: int32; right: int32; bottom: int32; }
+export struct W32Msg { hwnd: int64; message: uint32; wparam: int64; lparam: int64; time: uint32; pt: W32Point; l_private: uint32; }
+export struct W32Paint { hdc: int64; erase: int32; rc_paint: W32Rect; restore: int32; inc_update: int32; reserved: uint8[32]; }
+export struct W32WndClassExW {
+  cb_size: uint32; style: uint32; wnd_proc: fn(int64, uint32, int64, int64) -> int64;
+  cls_extra: int32; wnd_extra: int32; instance: int64; icon: int64; cursor: int64; background: int64;
+  menu_name: uint16*; class_name: uint16*; icon_sm: int64;
+}
+export struct W32Bmi {
+  size: uint32; width: int32; height: int32; planes: uint16; bit_count: uint16; compression: uint32;
+  size_image: uint32; x_ppm: int32; y_ppm: int32; clr_used: uint32; clr_important: uint32;
+}
+export struct W32TrackMouse { cb_size: uint32; flags: uint32; hwnd: int64; hover_time: uint32; }
+export struct W32IconInfo { is_icon: int32; hot_x: uint32; hot_y: uint32; mask: int64; color: int64; }
+export struct W32MonitorInfoEx { cb_size: uint32; monitor: W32Rect; work: W32Rect; flags: uint32; device: uint16[32]; }
+export struct W32RawInputDevice { usage_page: uint16; usage: uint16; flags: uint32; target: int64; }
+export struct W32FlashInfo { cb_size: uint32; hwnd: int64; flags: uint32; count: uint32; timeout: uint32; }
+export struct W32CompositionForm { style: uint32; pos: W32Point; area: W32Rect; }
+export struct W32CandidateForm { index: uint32; style: uint32; pos: W32Point; area: W32Rect; }
+
+// kernel32
+export extern fn window_w32_GetModuleHandleW(name: uint16*) -> int64 = "GetModuleHandleW";
+export extern fn window_w32_LoadLibraryA(name: cstring) -> int64 = "LoadLibraryA";
+export extern fn window_w32_GetProcAddress(module: int64, name: cstring) -> int64 = "GetProcAddress";
+export extern fn window_w32_QueryPerformanceCounter(out: int64*) -> int32 = "QueryPerformanceCounter";
+export extern fn window_w32_QueryPerformanceFrequency(out: int64*) -> int32 = "QueryPerformanceFrequency";
+export extern fn window_w32_GlobalAlloc(flags: uint32, size: int64) -> int64 = "GlobalAlloc";
+export extern fn window_w32_GlobalLock(mem: int64) -> rawptr = "GlobalLock";
+export extern fn window_w32_GlobalUnlock(mem: int64) -> int32 = "GlobalUnlock";
+export extern fn window_w32_GlobalSize(mem: int64) -> int64 = "GlobalSize";
+export extern fn window_w32_GlobalFree(mem: int64) -> int64 = "GlobalFree";
+export extern fn window_w32_CreateEventW(attrs: rawptr, manual: int32, initial: int32, name: uint16*) -> int64 = "CreateEventW";
+export extern fn window_w32_SetEvent(ev: int64) -> int32 = "SetEvent";
+export extern fn window_w32_CloseHandle(h: int64) -> int32 = "CloseHandle";
+export extern fn window_w32_GetEnvironmentVariableA(name: cstring, buf: uint8*, size: uint32) -> uint32 = "GetEnvironmentVariableA";
+
+// user32
+export extern fn window_w32_RegisterClassExW(wc: W32WndClassExW*) -> uint16 = "RegisterClassExW";
+export extern fn window_w32_CreateWindowExW(ex_style: uint32, class_name: uint16*, title: uint16*, style: uint32, x: int32, y: int32, w: int32, h: int32, parent: int64, menu: int64, instance: int64, param: int64) -> int64 = "CreateWindowExW";
+export extern fn window_w32_DefWindowProcW(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "DefWindowProcW";
+export extern fn window_w32_DestroyWindow(hwnd: int64) -> int32 = "DestroyWindow";
+export extern fn window_w32_ShowWindow(hwnd: int64, cmd: int32) -> int32 = "ShowWindow";
+export extern fn window_w32_UpdateWindow(hwnd: int64) -> int32 = "UpdateWindow";
+export extern fn window_w32_PeekMessageW(msg: W32Msg*, hwnd: int64, lo: uint32, hi: uint32, remove: uint32) -> int32 = "PeekMessageW";
+export extern fn window_w32_PostMessageW(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int32 = "PostMessageW";
+export extern fn window_w32_SendMessageW(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "SendMessageW";
+export extern fn window_w32_TranslateMessage(msg: W32Msg*) -> int32 = "TranslateMessage";
+export extern fn window_w32_DispatchMessageW(msg: W32Msg*) -> int64 = "DispatchMessageW";
+export extern fn window_w32_MsgWaitForMultipleObjectsEx(count: uint32, handles: int64*, ms: uint32, wake_mask: uint32, flags: uint32) -> uint32 = "MsgWaitForMultipleObjectsEx";
+export extern fn window_w32_BeginPaint(hwnd: int64, ps: W32Paint*) -> int64 = "BeginPaint";
+export extern fn window_w32_EndPaint(hwnd: int64, ps: W32Paint*) -> int32 = "EndPaint";
+export extern fn window_w32_GetDC(hwnd: int64) -> int64 = "GetDC";
+export extern fn window_w32_ReleaseDC(hwnd: int64, hdc: int64) -> int32 = "ReleaseDC";
+export extern fn window_w32_GetClientRect(hwnd: int64, r: W32Rect*) -> int32 = "GetClientRect";
+export extern fn window_w32_GetWindowRect(hwnd: int64, r: W32Rect*) -> int32 = "GetWindowRect";
+export extern fn window_w32_ClientToScreen(hwnd: int64, p: W32Point*) -> int32 = "ClientToScreen";
+export extern fn window_w32_ScreenToClient(hwnd: int64, p: W32Point*) -> int32 = "ScreenToClient";
+export extern fn window_w32_AdjustWindowRectEx(r: W32Rect*, style: uint32, menu: int32, ex_style: uint32) -> int32 = "AdjustWindowRectEx";
+export extern fn window_w32_SetWindowPos(hwnd: int64, after: int64, x: int32, y: int32, w: int32, h: int32, flags: uint32) -> int32 = "SetWindowPos";
+export extern fn window_w32_SetWindowLongPtrW(hwnd: int64, index: int32, v: int64) -> int64 = "SetWindowLongPtrW";
+export extern fn window_w32_GetWindowLongPtrW(hwnd: int64, index: int32) -> int64 = "GetWindowLongPtrW";
+export extern fn window_w32_SetWindowTextW(hwnd: int64, s: uint16*) -> int32 = "SetWindowTextW";
+export extern fn window_w32_IsIconic(hwnd: int64) -> int32 = "IsIconic";
+export extern fn window_w32_IsZoomed(hwnd: int64) -> int32 = "IsZoomed";
+export extern fn window_w32_LoadCursorW(instance: int64, id: int64) -> int64 = "LoadCursorW";
+export extern fn window_w32_SetCursor(cursor: int64) -> int64 = "SetCursor";
+export extern fn window_w32_SetCursorPos(x: int32, y: int32) -> int32 = "SetCursorPos";
+export extern fn window_w32_ClipCursor(r: W32Rect*) -> int32 = "ClipCursor";
+export extern fn window_w32_SetCapture(hwnd: int64) -> int64 = "SetCapture";
+export extern fn window_w32_ReleaseCapture() -> int32 = "ReleaseCapture";
+export extern fn window_w32_TrackMouseEvent(t: W32TrackMouse*) -> int32 = "TrackMouseEvent";
+export extern fn window_w32_GetKeyState(vk: int32) -> int16 = "GetKeyState";
+export extern fn window_w32_MapVirtualKeyW(code: uint32, map_type: uint32) -> uint32 = "MapVirtualKeyW";
+export extern fn window_w32_SetForegroundWindow(hwnd: int64) -> int32 = "SetForegroundWindow";
+export extern fn window_w32_BringWindowToTop(hwnd: int64) -> int32 = "BringWindowToTop";
+export extern fn window_w32_SetFocus(hwnd: int64) -> int64 = "SetFocus";
+export extern fn window_w32_GetFocus() -> int64 = "GetFocus";
+export extern fn window_w32_GetForegroundWindow() -> int64 = "GetForegroundWindow";
+export extern fn window_w32_FlashWindowEx(f: W32FlashInfo*) -> int32 = "FlashWindowEx";
+export extern fn window_w32_CreateIconIndirect(info: W32IconInfo*) -> int64 = "CreateIconIndirect";
+export extern fn window_w32_DestroyIcon(icon: int64) -> int32 = "DestroyIcon";
+export extern fn window_w32_EnumDisplayMonitors(hdc: int64, clip: W32Rect*, cb: fn(int64, int64, rawptr, int64) -> int32, data: int64) -> int32 = "EnumDisplayMonitors";
+export extern fn window_w32_GetMonitorInfoW(mon: int64, info: W32MonitorInfoEx*) -> int32 = "GetMonitorInfoW";
+export extern fn window_w32_MonitorFromWindow(hwnd: int64, flags: uint32) -> int64 = "MonitorFromWindow";
+export extern fn window_w32_EnumDisplaySettingsW(device: uint16*, mode: uint32, dm: uint8*) -> int32 = "EnumDisplaySettingsW";
+export extern fn window_w32_RegisterRawInputDevices(devs: W32RawInputDevice*, n: uint32, size: uint32) -> int32 = "RegisterRawInputDevices";
+export extern fn window_w32_GetRawInputData(h: int64, cmd: uint32, data: rawptr, size: uint32*, header: uint32) -> uint32 = "GetRawInputData";
+export extern fn window_w32_OpenClipboard(hwnd: int64) -> int32 = "OpenClipboard";
+export extern fn window_w32_CloseClipboard() -> int32 = "CloseClipboard";
+export extern fn window_w32_EmptyClipboard() -> int32 = "EmptyClipboard";
+export extern fn window_w32_SetClipboardData(format: uint32, mem: int64) -> int64 = "SetClipboardData";
+export extern fn window_w32_GetClipboardData(format: uint32) -> int64 = "GetClipboardData";
+export extern fn window_w32_GetSystemMetrics(index: int32) -> int32 = "GetSystemMetrics";
+
+// gdi32
+export extern fn window_w32_SetDIBitsToDevice(hdc: int64, x: int32, y: int32, w: uint32, h: uint32, sx: int32, sy: int32, start_scan: uint32, lines: uint32, bits: rawptr, bmi: W32Bmi*, usage: uint32) -> int32 = "SetDIBitsToDevice";
+export extern fn window_w32_GetDeviceCaps(hdc: int64, index: int32) -> int32 = "GetDeviceCaps";
+export extern fn window_w32_CreateDIBSection(hdc: int64, bmi: W32Bmi*, usage: uint32, bits: rawptr*, section: int64, offset: uint32) -> int64 = "CreateDIBSection";
+export extern fn window_w32_CreateBitmap(w: int32, h: int32, planes: uint32, bpp: uint32, bits: rawptr) -> int64 = "CreateBitmap";
+export extern fn window_w32_DeleteObject(obj: int64) -> int32 = "DeleteObject";
+
+// shell32 (drag and drop of files)
+export extern fn window_w32_DragAcceptFiles(hwnd: int64, accept: int32) = "DragAcceptFiles";
+export extern fn window_w32_DragQueryFileW(hdrop: int64, index: uint32, buf: uint16*, len: uint32) -> uint32 = "DragQueryFileW";
+export extern fn window_w32_DragQueryPoint(hdrop: int64, pt: W32Point*) -> int32 = "DragQueryPoint";
+export extern fn window_w32_DragFinish(hdrop: int64) = "DragFinish";
+
+// imm32
+export extern fn window_w32_ImmGetContext(hwnd: int64) -> int64 = "ImmGetContext";
+export extern fn window_w32_ImmReleaseContext(hwnd: int64, himc: int64) -> int32 = "ImmReleaseContext";
+export extern fn window_w32_ImmGetCompositionStringW(himc: int64, index: uint32, buf: rawptr, len: uint32) -> int32 = "ImmGetCompositionStringW";
+export extern fn window_w32_ImmSetCompositionWindow(himc: int64, form: W32CompositionForm*) -> int32 = "ImmSetCompositionWindow";
+export extern fn window_w32_ImmSetCandidateWindow(himc: int64, form: W32CandidateForm*) -> int32 = "ImmSetCandidateWindow";
+export extern fn window_w32_ImmAssociateContextEx(hwnd: int64, himc: int64, flags: uint32) -> int32 = "ImmAssociateContextEx";

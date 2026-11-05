@@ -1,0 +1,222 @@
+// flux_orm/adapter/stmt.mettle — a statement as data, for stores without SQL.
+//
+// The builder, persist and migrations fill an RcStmt next to the SQL text. An
+// adapter with a `query` slot (MeoDB's typed API, and later its network
+// server) runs the RcStmt; a text adapter runs the SQL. Both see the same
+// argv: INSERT cells row-major, or SET values then the WHERE term arguments.
+//
+// Names are borrowed from RcMeta (static), the arrays are owned by the RcStmt
+// and freed by rc_stmt_free, and `args` is borrowed from the caller.
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+
+// Statement operations, for RcStmt.op. CREATE is CREATE TABLE with `cols` as
+// the column definitions; INSERT, SELECT, UPDATE, DELETE and COUNT match the
+// query builder's statements.
+export const RC_OP_CREATE: int32 = 1;
+export const RC_OP_INSERT: int32 = 2;
+export const RC_OP_SELECT: int32 = 3;
+export const RC_OP_UPDATE: int32 = 4;
+export const RC_OP_DELETE: int32 = 5;
+export const RC_OP_COUNT: int32 = 6;
+export const RC_OP_DROP: int32 = 7;          // DROP TABLE IF EXISTS
+export const RC_OP_ADD_COLUMN: int32 = 8;    // one column in cols
+export const RC_OP_CREATE_INDEX: int32 = 9;  // name, unique, cols = indexed columns
+export const RC_OP_DROP_INDEX: int32 = 10;   // name
+
+// Term operators, for RcStmtTerm.op. EQ..GE equal the builder's RC_CMP_* and
+// take one argument; IN takes n_args; NULL and NOT_NULL take none.
+export const RC_W_EQ: int32 = 0;
+export const RC_W_NE: int32 = 1;
+export const RC_W_LT: int32 = 2;
+export const RC_W_LE: int32 = 3;
+export const RC_W_GT: int32 = 4;
+export const RC_W_GE: int32 = 5;
+export const RC_W_IN: int32 = 6;
+export const RC_W_NULL: int32 = 7;
+export const RC_W_NOT_NULL: int32 = 8;
+
+// A column: CREATE definitions, INSERT columns, SELECT columns or UPDATE SET
+// columns. `ty` is RC_T_*, `flags` RC_F_* (CREATE uses PK, NOT_NULL, UNIQUE).
+export struct RcStmtCol {
+  name: string;  // column name; borrowed
+  ty: int32;     // RC_T_*
+  flags: int32;  // RC_F_*
+}
+
+// A WHERE term over args[arg0 .. arg0 + n_args).
+export struct RcStmtTerm {
+  col: string;   // column name; borrowed
+  op: int32;     // RC_W_*
+  arg0: int32;   // index of the term's first value in RcStmt.args
+  n_args: int32; // values the term uses: 1, the IN count, or 0
+}
+
+// One ORDER BY key.
+export struct RcStmtOrder {
+  col: string;  // column name; borrowed
+  desc: bool;   // true for DESC, false for ASC
+}
+
+// A statement as data. Make it with rc_stmt_new, add to it with rc_stmt_col,
+// rc_stmt_term and rc_stmt_order, free it with rc_stmt_free. Names and `args`
+// are borrowed; the cols, terms and order arrays are owned.
+export struct RcStmt {
+  op: int32;            // RC_OP_*, 0 = none
+  table: string;        // table name; borrowed
+  if_not_exists: bool;  // also IF EXISTS for the drops
+  name: string;         // index name, for the index ops
+  unique: bool;         // a unique index
+  cols: RcStmtCol*;     // owned; see RcStmtCol for what they mean per op
+  n_cols: int32;        // entries in cols
+  cap_cols: int32;      // capacity of cols
+  n_rows: int32;        // INSERT rows
+  terms: RcStmtTerm*;   // owned; WHERE terms, joined with AND
+  n_terms: int32;       // entries in terms
+  cap_terms: int32;     // capacity of terms
+  order: RcStmtOrder*;  // owned; ORDER BY keys in order
+  n_order: int32;       // entries in order
+  cap_order: int32;     // capacity of order
+  limit: int64;         // -1 = none
+  offset: int64;        // 0 = none
+  n_joins: int32;       // a store without joins refuses > 0
+  args: RcValue*;       // borrowed
+  n_args: int32;        // values in args
+}
+
+// Makes an empty statement: no columns, terms or order, no limit, offset 0.
+//   op      RC_OP_*, or 0 for none
+//   table   the table name; borrowed, must outlive the statement
+// Returns the statement by value. It allocates nothing until the first add;
+// free it with rc_stmt_free anyway.
+export fn rc_stmt_new(op: int32, table: string) -> RcStmt {
+  var st: RcStmt;
+  st.op = op;
+  st.table = table;
+  st.if_not_exists = false;
+  st.name = "";
+  st.unique = false;
+  st.cols = 0;
+  st.n_cols = 0;
+  st.cap_cols = 0;
+  st.n_rows = 0;
+  st.terms = 0;
+  st.n_terms = 0;
+  st.cap_terms = 0;
+  st.order = 0;
+  st.n_order = 0;
+  st.cap_order = 0;
+  st.limit = -1;
+  st.offset = 0;
+  st.n_joins = 0;
+  st.args = 0;
+  st.n_args = 0;
+  return st;
+}
+
+// Frees the cols, terms and order arrays and empties them. The names and
+// `args` are borrowed and left alone; the other fields keep their values.
+//   st   the statement; may be 0. Safe to call twice.
+export fn rc_stmt_free(st: RcStmt*) {
+  if (st == 0) { return; }
+  if (st->cols != 0) { free((rawptr)st->cols); }
+  if (st->terms != 0) { free((rawptr)st->terms); }
+  if (st->order != 0) { free((rawptr)st->order); }
+  st->cols = 0;
+  st->terms = 0;
+  st->order = 0;
+  st->n_cols = 0;
+  st->n_terms = 0;
+  st->n_order = 0;
+  st->cap_cols = 0;
+  st->cap_terms = 0;
+  st->cap_order = 0;
+}
+
+// Grows an array of `size`-byte items to hold one more.
+fn rc_stmt_grow(p: rawptr*, cap: int32*, n: int32, size: int64) -> int32 {
+  if (n < *cap) { return RC_OK; }
+  var c: int32 = *cap * 2;
+  if (c < 8) { c = 8; }
+  var q: rawptr = realloc(*p, (int64)c * size);
+  if (q == 0) { return RC_ERR_NOMEM; }
+  *p = q;
+  *cap = c;
+  return RC_OK;
+}
+
+// Appends a column to st->cols.
+//   st     the statement
+//   name   column name; borrowed, must outlive st
+//   ty     RC_T_*
+//   flags  RC_F_*
+// Returns RC_OK. RC_ERR_USAGE when st is 0. RC_ERR_NOMEM when the array cannot
+// grow; st is then unchanged.
+export fn rc_stmt_col(st: RcStmt*, name: string, ty: int32, flags: int32) -> int32 {
+  if (st == 0) { return RC_ERR_USAGE; }
+  var p: rawptr = (rawptr)st->cols;
+  var rc: int32 = rc_stmt_grow(&p, &st->cap_cols, st->n_cols, (int64)sizeof(RcStmtCol));
+  if (rc != RC_OK) { return rc; }
+  st->cols = (RcStmtCol*)p;
+  st->cols[st->n_cols].name = name;
+  st->cols[st->n_cols].ty = ty;
+  st->cols[st->n_cols].flags = flags;
+  st->n_cols = st->n_cols + 1;
+  return RC_OK;
+}
+
+// Appends a WHERE term over args[arg0 .. arg0 + n_args).
+//   st      the statement
+//   col     column name; borrowed, must outlive st
+//   op      RC_W_*
+//   arg0    index of the term's first value in the argv
+//   n_args  values the term uses (1, the IN count, or 0 for NULL tests)
+// Nothing is checked against the argv here; the caller keeps them in step.
+// Returns RC_OK. RC_ERR_USAGE when st is 0. RC_ERR_NOMEM when the array cannot
+// grow; st is then unchanged.
+// Appends a model field as a column: its column name, wire type and flags.
+//   st  the statement
+//   f   the field (from RcMeta.fields); its column name is borrowed
+// Returns RC_OK; RC_ERR_USAGE when st is 0; RC_ERR_NOMEM.
+export fn rc_stmt_field(st: RcStmt*, f: RcField) -> int32 {
+  return rc_stmt_col(st, f.column, f.ty, f.flags);
+}
+
+export fn rc_stmt_term(st: RcStmt*, col: string, op: int32, arg0: int32,
+                       n_args: int32) -> int32 {
+  if (st == 0) { return RC_ERR_USAGE; }
+  var p: rawptr = (rawptr)st->terms;
+  var size: int64 = (int64)sizeof(RcStmtTerm);
+  var rc: int32 = rc_stmt_grow(&p, &st->cap_terms, st->n_terms, size);
+  if (rc != RC_OK) { return rc; }
+  st->terms = (RcStmtTerm*)p;
+  st->terms[st->n_terms].col = col;
+  st->terms[st->n_terms].op = op;
+  st->terms[st->n_terms].arg0 = arg0;
+  st->terms[st->n_terms].n_args = n_args;
+  st->n_terms = st->n_terms + 1;
+  return RC_OK;
+}
+
+// Appends an ORDER BY key.
+//   st     the statement
+//   col    column name; borrowed, must outlive st
+//   desc   true for DESC, false for ASC
+// Returns RC_OK. RC_ERR_USAGE when st is 0. RC_ERR_NOMEM when the array cannot
+// grow; st is then unchanged.
+export fn rc_stmt_order(st: RcStmt*, col: string, desc: bool) -> int32 {
+  if (st == 0) { return RC_ERR_USAGE; }
+  var p: rawptr = (rawptr)st->order;
+  var size: int64 = (int64)sizeof(RcStmtOrder);
+  var rc: int32 = rc_stmt_grow(&p, &st->cap_order, st->n_order, size);
+  if (rc != RC_OK) { return rc; }
+  st->order = (RcStmtOrder*)p;
+  st->order[st->n_order].col = col;
+  st->order[st->n_order].desc = desc;
+  st->n_order = st->n_order + 1;
+  return RC_OK;
+}

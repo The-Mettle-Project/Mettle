@@ -1,0 +1,259 @@
+// Text layout: shaped glyphs placed into lines.
+//
+// The text is cut into paragraphs at hard breaks (UAX #14 mandatory
+// breaks), each paragraph is shaped, and lines are filled greedily, ending
+// at the last allowed break that fits (UAX #14). Spaces at the end of a
+// line hang past the edge and do not count towards its width. A word
+// longer than the line is cut between clusters. Lines are aligned left,
+// centre or right. Bidirectional reordering is not done: a right-to-left
+// paragraph is laid out as one shaped run.
+
+import "std/mem";
+import "std/math";
+import "font/core/vec";
+import "font/sfnt/face";
+import "font/sfnt/metrics";
+import "font/layout/buffer";
+import "shape";
+import "breaks";
+
+export const FONT_ALIGN_LEFT: int32 = 0;
+export const FONT_ALIGN_CENTER: int32 = 1;
+export const FONT_ALIGN_RIGHT: int32 = 2;
+
+/// A placed glyph. (x, y) is its pen position in pixels with offsets
+/// applied, y down from the top of the layout to the glyph's baseline.
+export struct FontPlacedGlyph {
+  id: int32;
+  cluster: int32;    // byte offset in the text
+  line: int32;
+  x: float32;
+  y: float32;
+  adv: float32;      // advance in pixels
+}
+
+export struct FontLine {
+  first: int64;      // first glyph
+  count: int64;      // number of glyphs
+  start: int64;      // first byte of the text on this line
+  end: int64;        // byte just past the line (before a hard break)
+  x: float32;        // left edge after alignment
+  width: float32;    // width without trailing spaces
+  baseline: float32; // y of the baseline
+  top: float32;      // y of the line box top
+  height: float32;   // line box height
+}
+
+export struct FontLayout {
+  glyphs: FontVec<FontPlacedGlyph>;
+  lines: FontVec<FontLine>;
+  width: float32;    // widest line
+  height: float32;   // total height
+  len: int64;        // text length in bytes
+}
+
+export struct FontLayoutOpts {
+  size: float32;          // pixels per em (required)
+  max_width: float32;     // wrap width in pixels, 0 = no wrapping
+  align: int32;           // FONT_ALIGN_*
+  line_height: float32;   // multiple of the font's natural line height, 0 = 1
+  shape: FontShapeOpts;   // script, language, direction, features
+}
+
+/// Frees a layout's memory.
+export fn font_layout_free(l: FontLayout*) {
+  font_vec_free<FontPlacedGlyph>(&l->glyphs);
+  font_vec_free<FontLine>(&l->lines);
+  l->width = 0.0;
+  l->height = 0.0;
+}
+
+fn is_space_cp(cp: uint32) -> bool {
+  return cp == 32 || cp == 9 || cp == 0x3000 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x205F;
+}
+
+fn is_newline_byte(c: uint8) -> bool { return c == (uint8)10 || c == (uint8)13; }
+
+// Appends one line of glyphs buf[a..b) to the layout.
+fn emit_line(l: FontLayout*, buf: FontBuffer*, a: int64, b: int64, s: float32, start: int64, end: int64, y: float32, lh: float32, asc: float32) {
+  var line: FontLine;
+  line.first = l->glyphs.len;
+  line.count = 0;
+  line.start = start;
+  line.end = end;
+  line.top = y;
+  line.height = lh;
+  line.baseline = y + asc;
+  var pen: float32 = 0.0;
+  var width: float32 = 0.0;
+  for k: int64 in a..b {
+    var x: FontGlyph* = &buf->g.data[k];
+    var pg: FontPlacedGlyph;
+    pg.id = x->id;
+    pg.cluster = x->cluster;
+    pg.line = (int32)l->lines.len;
+    pg.x = pen + (float32)x->x_off * s;
+    pg.y = line.baseline - (float32)x->y_off * s;
+    pg.adv = (float32)x->x_adv * s;
+    font_vec_push<FontPlacedGlyph>(&l->glyphs, pg);
+    pen = pen + pg.adv;
+    if (!is_space_cp(x->cp)) { width = pen; }
+  }
+  line.count = l->glyphs.len - line.first;
+  line.width = width;
+  line.x = 0.0;
+  font_vec_push<FontLine>(&l->lines, line);
+  if (width > l->width) { l->width = width; }
+}
+
+/// Lays out UTF-8 text with face f. Returns false when out of memory or
+/// when opts->size is not positive.
+export fn font_layout(f: FontFace*, text: uint8*, len: int64, opts: FontLayoutOpts*, out: FontLayout*) -> bool {
+  out->glyphs.len = 0;
+  out->lines.len = 0;
+  out->width = 0.0;
+  out->height = 0.0;
+  out->len = len;
+  if (opts->size <= 0.0) { return false; }
+  var s: float32 = opts->size / (float32)f->upem;
+  var asc_u: int32 = 0; var desc_u: int32 = 0; var gap_u: int32 = 0;
+  font_line_metrics(f, &asc_u, &desc_u, &gap_u);
+  var lhm: float32 = opts->line_height;
+  if (lhm <= 0.0) { lhm = 1.0; }
+  var asc: float32 = (float32)asc_u * s;
+  var natural: float32 = (float32)(asc_u - desc_u + gap_u) * s;
+  var lh: float32 = natural * lhm;
+  // Half of any extra leading goes above the text.
+  var lead: float32 = (lh - (float32)(asc_u - desc_u) * s) * 0.5;
+  var brk: uint8* = (uint8*)malloc(len + 1);
+  if (brk == 0) { return false; }
+  font_line_breaks(text, len, brk);
+  var buf: FontBuffer;
+  var y: float32 = 0.0;
+  var ps: int64 = 0;
+  var ok: bool = true;
+  while (ps <= len) {
+    // Paragraph: up to the next hard break.
+    var pe: int64 = ps;
+    var next: int64 = len + 1;
+    var k: int64 = ps + 1;
+    while (k <= len) {
+      if (brk[k] == FONT_BREAK_MANDATORY) { next = k; break; }
+      k = k + 1;
+    }
+    if (next > len) { pe = len; } else { pe = next; }
+    // Leave the newline characters out of the shaped text.
+    var te: int64 = pe;
+    while (te > ps && is_newline_byte(text[te - 1])) { te = te - 1; }
+    if (te > ps && text[te - 1] == (uint8)0x85 && te - 2 >= ps && text[te - 2] == (uint8)0xC2) { te = te - 2; }
+    if (!font_shape(f, text + ps, te - ps, &opts->shape, &buf)) { ok = false; break; }
+    for q: int64 in 0..buf.g.len { buf.g.data[q].cluster = buf.g.data[q].cluster + (int32)ps; }
+    // Fill lines greedily.
+    var a: int64 = 0;
+    var n: int64 = buf.g.len;
+    if (n == 0) {
+      emit_line(out, &buf, 0, 0, s, ps, te, y + lead, lh, asc);
+      y = y + lh;
+    }
+    while (a < n) {
+      var b: int64 = n;
+      if (opts->max_width > 0.0) {
+        var pen: float32 = 0.0;
+        var last_ok: int64 = -1;   // glyph index where a break is allowed
+        var k2: int64 = a;
+        while (k2 < n) {
+          var g: FontGlyph* = &buf.g.data[k2];
+          var cl: int64 = (int64)g->cluster;
+          // A break is allowed before this glyph when its cluster starts
+          // at an allowed break and the glyph before it is in another cluster.
+          if (k2 > a && cl < len && brk[cl] == FONT_BREAK_ALLOWED && buf.g.data[k2 - 1].cluster != g->cluster) { last_ok = k2; }
+          pen = pen + (float32)g->x_adv * s;
+          if (pen > opts->max_width && !is_space_cp(g->cp) && k2 > a) {
+            if (last_ok > a) { b = last_ok; }
+            else {
+              // No break point: cut before this cluster.
+              b = k2;
+              while (b > a + 1 && buf.g.data[b - 1].cluster == buf.g.data[b].cluster) { b = b - 1; }
+            }
+            break;
+          }
+          k2 = k2 + 1;
+        }
+      }
+      var start: int64 = (int64)buf.g.data[a].cluster;
+      var end: int64 = te;
+      if (b < n) { end = (int64)buf.g.data[b].cluster; }
+      emit_line(out, &buf, a, b, s, start, end, y + lead, lh, asc);
+      y = y + lh;
+      a = b;
+    }
+    // The break at the very end only starts another (empty) line when the
+    // text ends with a newline.
+    if (next >= len && (len == 0 || te == pe)) { break; }
+    ps = next;
+  }
+  free(brk);
+  font_buffer_free(&buf);
+  // Alignment.
+  var box: float32 = opts->max_width;
+  if (box <= 0.0) { box = out->width; }
+  for i: int64 in 0..out->lines.len {
+    var line: FontLine* = &out->lines.data[i];
+    var dx: float32 = 0.0;
+    if (opts->align == FONT_ALIGN_CENTER) { dx = (box - line->width) * 0.5; }
+    else if (opts->align == FONT_ALIGN_RIGHT) { dx = box - line->width; }
+    if (dx != 0.0) {
+      line->x = dx;
+      for g: int64 in line->first..line->first + line->count { out->glyphs.data[g].x = out->glyphs.data[g].x + dx; }
+    }
+  }
+  out->height = y;
+  return ok;
+}
+
+/// Width and height in pixels of text at `px` pixels per em, on one line
+/// per hard break, without wrapping.
+export fn font_measure(f: FontFace*, text: uint8*, len: int64, px: float32, w: float32*, h: float32*) -> bool {
+  var o: FontLayoutOpts;
+  o.size = px;
+  var l: FontLayout;
+  var ok: bool = font_layout(f, text, len, &o, &l);
+  *w = l.width;
+  *h = l.height;
+  font_layout_free(&l);
+  return ok;
+}
+
+/// Byte offset in the text closest to point (x, y) in layout pixels: the
+/// caret position a click there should give.
+export fn font_layout_hit(l: FontLayout*, x: float32, y: float32) -> int64 {
+  if (l->lines.len == 0) { return 0; }
+  var li: int64 = 0;
+  while (li + 1 < l->lines.len && y >= l->lines.data[li].top + l->lines.data[li].height) { li = li + 1; }
+  var line: FontLine* = &l->lines.data[li];
+  for g: int64 in line->first..line->first + line->count {
+    var pg: FontPlacedGlyph* = &l->glyphs.data[g];
+    // Pen position of this glyph without its offset.
+    var pen: float32 = line->x;
+    for k: int64 in line->first..g { pen = pen + l->glyphs.data[k].adv; }
+    if (x < pen + pg->adv * 0.5) { return (int64)pg->cluster; }
+  }
+  return line->end;
+}
+
+/// Caret position for byte offset `at`: x and the line's top and height.
+export fn font_layout_caret(l: FontLayout*, at: int64, x: float32*, top: float32*, height: float32*) {
+  *x = 0.0; *top = 0.0; *height = 0.0;
+  if (l->lines.len == 0) { return; }
+  var li: int64 = 0;
+  while (li + 1 < l->lines.len && at >= l->lines.data[li + 1].start) { li = li + 1; }
+  var line: FontLine* = &l->lines.data[li];
+  *top = line->top;
+  *height = line->height;
+  var pen: float32 = line->x;
+  for g: int64 in line->first..line->first + line->count {
+    if ((int64)l->glyphs.data[g].cluster >= at) { *x = pen; return; }
+    pen = pen + l->glyphs.data[g].adv;
+  }
+  *x = pen;
+}

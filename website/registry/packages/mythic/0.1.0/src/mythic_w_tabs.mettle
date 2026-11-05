@@ -1,0 +1,240 @@
+// mythic_w_tabs: underline tabs with a sliding indicator (DESIGN-SYSTEM §7.14, motion §6.2).
+import "mythic_base";
+import "mythic_types";
+import "mythic_ctx";
+import "mythic_anim";
+import "mythic_paint";
+import "mythic_layout";
+import "mythic_dl";
+import "mythic_text";
+import "mythic_w_basic";
+
+// zero = defaults
+export struct MythicTabsOpts {
+  size: int32;          // MYTHIC_CTRL_MD (height 36) / MYTHIC_CTRL_SM (32)
+  disabled: uint64;     // bit i disables tab i: text.disabled, not clickable, skipped by arrow keys
+}
+
+// one tab label (arena)
+struct TabPaint { text: string; style: MythicTextStyle; color: uint32; }
+
+// the tab list: baseline, indicator and focus ring, drawn under the labels (arena)
+struct TabsPaint {
+  items: MythicNode**; focus: float32*; n: int32;
+  sel: int32; from_x: float32; from_w: float32; k: float32;   // indicator: from (relative x, w) toward sel
+  line: uint32; ind: uint32; ring: uint32;
+}
+
+fn tab_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: TabPaint* = (TabPaint*)data;
+  var base: float32 = mythic_paint_control_baseline(p, d->style, r.y, r.h);
+  mythic_paint_text_baseline(p, d->text, d->style, r.x, base, d->color);
+}
+
+fn tabs_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: TabsPaint* = (TabsPaint*)data;
+  var z: MythicCorners;
+  var hair: float32 = mythic_paint_line_w(p, 1.0) / p->scale;
+  var bot: float32 = mythic_paint_snap(p, r.y + r.h) / p->scale;
+  var bl: MythicRect = { x: r.x, y: bot - hair, w: r.w, h: hair };
+  mythic_paint_fill(p, bl, z, d->line);
+  if (d->sel >= 0 && d->sel < d->n) {
+    // the indicator covers the baseline; it slides on unsnapped x while moving
+    var to: MythicRect = d->items[d->sel]->rect;
+    var x: float32 = r.x + d->from_x + (to.x - r.x - d->from_x) * d->k;
+    var w: float32 = d->from_w + (to.w - d->from_w) * d->k;
+    var ir: MythicRect = { x: x, y: bot - 2.0, w: w, h: 2.0 };
+    mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, r), 0.0);
+    if (d->k >= 1.0) { mythic_paint_fill(p, ir, mythic_radius(1.0), d->ind); }
+    else { mythic_paint_fill_exact(p, ir, mythic_radius(1.0), d->ind); }
+    mythic_dl_pop_clip(p->dl);
+  }
+  // focus ring: the tab rect grown 6 px sideways, inset 4 px top and 6 px bottom, radius 6. Tabs
+  // the list cuts off get none, and a cut one's ring ends 6 px past the list
+  var rr: MythicRect = { x: r.x - 6.0, y: r.y, w: r.w + 12.0, h: r.h };
+  mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, rr), 0.0);
+  for i: int32 in 0..d->n {
+    var a: float32 = d->focus[i];
+    if (a <= 0.0) { continue; }
+    var tr: MythicRect = d->items[i]->rect;
+    if (tr.x >= r.x + r.w) { continue; }
+    var fr: MythicRect = { x: tr.x - 6.0, y: tr.y + 4.0, w: tr.w + 12.0, h: tr.h - 10.0 };
+    var rc: float32 = (float32)(d->ring >> 24) * mythic_clampf(a, 0.0, 1.0);
+    var col: uint32 = ((uint32)mythic_iround(rc) << 24) | (d->ring & (uint32)0x00FFFFFF);
+    mythic_paint_stroke(p, fr, mythic_radius(6.0), 2.0, col);
+  }
+  mythic_dl_pop_clip(p->dl);
+}
+
+fn tab_off(o: MythicTabsOpts, i: int32) -> bool {
+  if (i < 0 || i >= 64) { return false; }
+  return ((o.disabled >> (uint64)i) & (uint64)1) != (uint64)0;
+}
+
+// the next enabled tab from `from` in steps of dir (wrapping); -1 when there is none
+fn tab_step(o: MythicTabsOpts, n: int32, from: int32, dir: int32) -> int32 {
+  var j: int32 = from;
+  for k: int32 in 0..n {
+    j = (j + dir + n) % n;
+    if (!tab_off(o, j)) { return j; }
+  }
+  return -1;
+}
+
+/// Tab list with options (DESIGN-SYSTEM §7.14). `labels` are the tab titles (text after "##" is not
+/// shown); `selected` is the active index. The list fills its parent's width and clips tabs that
+/// don't fit. It is one Tab stop at the active tab; Left/Right (wrapping), Home and End move and
+/// select. Returns true when the selection changed.
+export fn mythic_tabs_ex(ui: MythicUi*, id_label: string, labels: string[], selected: int32*, o: MythicTabsOpts) -> bool {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: MythicColors* = &t->colors;
+  var id: uint64 = mythic_id(ui, id_label);
+  var n: int32 = (int32)labels.length;
+  var h: float32 = 36.0;
+  var gap: float32 = 24.0;
+  var style: MythicTextStyle = t->type.label;
+  if (o.size == MYTHIC_CTRL_SM) { h = 32.0; gap = 20.0; style = t->type.label_sm; }
+  var sc: float32 = ui->scale;
+  if (sc <= 0.0) { sc = 1.0; }
+  var input: bool = ui->pass == 0 && ui->disabled_depth == 0;
+  var changed: bool = false;
+  // keyboard on the focused tab, before anything is declared so this pass shows the result
+  var fi: int32 = -1;
+  for i: int32 in 0..n {
+    if (ui->focus_id == mythic_hash_u64(id, (uint64)i)) { fi = i; }
+  }
+  if (input && fi >= 0) {
+    var j: int32 = -1;
+    if (mythic_key_consume(ui, MYTHIC_KEY_LEFT, 0)) { j = tab_step(o, n, fi, -1); }
+    else if (mythic_key_consume(ui, MYTHIC_KEY_RIGHT, 0)) { j = tab_step(o, n, fi, 1); }
+    else if (mythic_key_consume(ui, MYTHIC_KEY_HOME, 0)) { j = tab_step(o, n, -1, 1); }
+    else if (mythic_key_consume(ui, MYTHIC_KEY_END, 0)) { j = tab_step(o, n, 0, -1); }
+    if (j >= 0) {
+      if (j != *selected) { *selected = j; changed = true; }
+      mythic_focus_set(ui, mythic_hash_u64(id, (uint64)j));
+    }
+  }
+  var d: TabsPaint* = (TabsPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(TabsPaint));
+  d->n = n;
+  d->items = (MythicNode**)mythic_arena_alloc_zero(ui->arena, (int64)mythic_maxi(n, 1) * 8);
+  d->focus = (float32*)mythic_arena_alloc_zero(ui->arena, (int64)mythic_maxi(n, 1) * 4);
+  var rel: float32* = (float32*)mythic_arena_alloc_zero(ui->arena, (int64)mythic_maxi(n, 1) * 8);
+  var b: MythicBox;
+  b.id = id;
+  b.width = mythic_grow();
+  b.height = mythic_fixed(h);
+  mythic_box_begin(ui, b);
+  var outer: MythicNode* = ui->cur;
+  var row: MythicBox;
+  row.dir = MYTHIC_DIR_ROW;
+  row.gap = gap;
+  row.clip = true;
+  row.width = mythic_grow();
+  row.height = mythic_grow();
+  mythic_box_begin(ui, row);
+  var any_hover: bool = false;
+  var any_focus: bool = false;
+  var at: float32 = 0.0;
+  var clicked: int32 = -1;
+  for i: int32 in 0..n {
+    var tid: uint64 = mythic_hash_u64(id, (uint64)i);
+    var off: bool = tab_off(o, i);
+    var tp: TabPaint* = (TabPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(TabPaint));
+    tp->text = mythic_arena_strn(ui->arena, labels[i], mythic_label_len(labels[i]));
+    tp->style = style;
+    var tw: float32 = 0.0;
+    if (ui->fonts != 0 && tp->text.length > (uint64)0) {
+      tw = mythic_text_width(ui->fonts, mythic_paint_text_spec(sc, style), tp->text) / sc;
+    }
+    // tabs have fixed widths in a start-aligned row, so their offsets are known here
+    rel[i * 2] = at;
+    rel[i * 2 + 1] = tw;
+    at = at + tw + gap;
+    var tb: MythicBox;
+    tb.id = tid;
+    tb.width = mythic_fixed(tw);
+    tb.height = mythic_grow();
+    mythic_box_begin(ui, tb);
+    var r: MythicResp;
+    if (!off) {
+      r = mythic_interact(ui, tid, MYTHIC_FOCUS_ACTIVATE_SPACE | MYTHIC_FOCUS_ACTIVATE_ENTER | MYTHIC_SENSE_CLICK);
+      mythic_focusable_group(ui, tid, MYTHIC_FOCUS_ACTIVATE_SPACE | MYTHIC_FOCUS_ACTIVATE_ENTER | MYTHIC_FOCUS_WANTS_ARROWS,
+                             id, (int64)i, i == *selected);
+    }
+    if (r.clicked) { clicked = i; }
+    if (r.hovered) { any_hover = true; }
+    if (r.focused) { any_focus = true; }
+    var sa: MythicStateAnim = mythic_anim_states(ui, tid, r);
+    d->focus[i] = sa.focus;
+    if (off) { tp->color = c->text_disabled; }
+    else if (i == *selected) { tp->color = c->text_primary; }
+    else { tp->color = mythic_color_lerp(c->text_secondary, c->text_primary, mythic_maxf(sa.hover, sa.press)); }
+    d->items[i] = ui->cur;
+    mythic_end(ui);
+    mythic_node_paint(ui, &tab_paint, (rawptr)tp);
+  }
+  mythic_end(ui);
+  if (clicked >= 0 && clicked != *selected) {
+    *selected = clicked;
+    changed = true;
+  }
+  // labels declared before a click drew the old selection
+  if (changed) { mythic_request_repass(ui); }
+  // indicator: from the rect shown when the selection last changed toward the selected tab,
+  // timed `out-strong` (§6.2); f[0..1] = from (x, w), f[2..3] = the target it was heading to
+  var sel: int32 = *selected;
+  d->sel = sel;
+  d->k = 1.0;
+  var st: MythicWState* = mythic_state(ui, id);
+  if (sel >= 0 && sel < n) {
+    var tx: float32 = rel[sel * 2];
+    var twd: float32 = rel[sel * 2 + 1];
+    var k: float32 = 1.0;
+    var dur_us: int64 = (int64)(t->motion.tab_ms * 1000.0);
+    if (mythic_reduced_motion(ui)) { dur_us = 0; }
+    if (st->i[1] != 0 && dur_us > 0 && ui->time_us - st->i[1] < dur_us) {
+      k = mythic_ease(MYTHIC_CURVE_OUT_STRONG, (float32)(ui->time_us - st->i[1]) / (float32)dur_us);
+    }
+    if (st->i[0] != (int64)sel + 1) {
+      if (st->i[0] == 0) {
+        st->f[0] = tx; st->f[1] = twd; st->i[1] = 0;
+      } else {
+        // retarget mid-flight from where the indicator is now
+        st->f[0] = st->f[0] + (st->f[2] - st->f[0]) * k;
+        st->f[1] = st->f[1] + (st->f[3] - st->f[1]) * k;
+        st->i[1] = ui->time_us;
+        k = 0.0;
+        if (dur_us == 0) { k = 1.0; }
+      }
+      st->i[0] = (int64)sel + 1;
+    }
+    st->f[2] = tx; st->f[3] = twd;
+    if (k < 1.0) {
+      ui->anim_active = true;
+      mythic_request_frame_in(ui, 16);
+    } else {
+      st->f[0] = tx; st->f[1] = twd; st->i[1] = 0;
+    }
+    d->from_x = st->f[0]; d->from_w = st->f[1]; d->k = k;
+  }
+  d->line = c->border_subtle;
+  d->ind = c->text_primary;
+  d->ring = c->focus_ring;
+  mythic_end(ui);
+  outer->paint = &tabs_paint;
+  outer->paint_data = (rawptr)d;
+  // a tooltip after the tabs attaches to the whole list
+  var lr: MythicResp;
+  lr.id = id;
+  lr.hovered = any_hover;
+  lr.focused = any_focus;
+  lr.changed = changed;
+  ui->last = lr;
+  return changed;
+}
+
+/// Underline tabs with default options; see mythic_tabs_ex.
+export fn mythic_tabs(ui: MythicUi*, id_label: string, labels: string[], selected: int32*) -> bool {
+  var o: MythicTabsOpts;
+  return mythic_tabs_ex(ui, id_label, labels, selected, o);
+}

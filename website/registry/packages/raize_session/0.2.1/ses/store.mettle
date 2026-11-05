@@ -1,0 +1,203 @@
+// SesStore: the pluggable storage interface. This library has no storage of
+// its own; the application supplies a SesStore (a MeoSQL / flux_orm table,
+// a future alph table, a key-value service, or a test double).
+//
+// CONTRACT for an implementation:
+//
+// * Vtable. Fill every function pointer; `ctx` is passed back as the first
+//   argument of each. Only pointers, int64s and string views cross it:
+//     put(ctx, rec)               insert or replace the record whose hash is
+//                                 rec->hash; SES_OK
+//     get(ctx, hash, out)         hash: 32 bytes; copy the record into *out;
+//                                 SES_OK or SES_E_NOT_FOUND
+//     del(ctx, hash)              delete by hash; SES_OK or SES_E_NOT_FOUND
+//     del_subject(ctx, subject)   delete every record of that subject; the
+//                                 count deleted (>= 0)
+//     prune(ctx, before)          delete records with revoked != 0 or
+//                                 expires <= before; the count deleted (>= 0)
+// * Ownership. Inputs are borrowed for the call only: copy *rec, the 32
+//   hash bytes and the subject bytes if you keep them; never keep the
+//   pointers. Outputs go into caller storage: get copies a whole SesRecord
+//   into *out (use ses_record_set_* or memcpy; SesRecord holds no
+//   pointers). The library never frees anything a store returns.
+// * Keys. The key is always SHA-256 of the token; the token itself never
+//   reaches the store. Look records up by exact 32-byte key. Index subject
+//   for del_subject and expires for prune.
+// * Errors. Return only SES_OK, SES_E_NOT_FOUND (get/del of a missing
+//   hash), SES_E_LIMIT (store full) or SES_E_STORE (any backend failure),
+//   or a count >= 0 from del_subject/prune. A store must not print, exit
+//   or call back into ses_*.
+// * Threads. The library makes one store call at a time and never locks;
+//   ses_* calls (and the crypto under them) work on any thread, so a store
+//   that is shared between threads must be thread-safe: lock inside each
+//   function.
+// * Atomicity. ses_rotate calls put(new record) then del(old hash); if del
+//   fails it deletes the new record again and reports the error. A store
+//   with transactions may wrap nothing: each call is independent.
+
+import "std/mem";
+import "std/conv";
+import "status";
+import "types";
+
+/// SesStore: the store vtable (see the contract at the top of store.mettle).
+/// in: - (the application fills ctx and every function pointer)
+/// returns: -
+/// owns: the application owns the SesStore and whatever ctx points to; the
+///   library only borrows them for each call and never frees them
+/// thread: as the implementation; the library calls it from whichever thread
+///   calls ses_*, so a shared store must be thread-safe
+/// example: var st: SesStore; st.ctx = (rawptr)db; st.put = &db_put; st.get = &db_get; ...
+export struct SesStore {
+  ctx: rawptr;
+  put: fn(rawptr, SesRecord*) -> int32;
+  get: fn(rawptr, uint8*, SesRecord*) -> int32;
+  del: fn(rawptr, uint8*) -> int32;
+  del_subject: fn(rawptr, string) -> int32;
+  prune: fn(rawptr, int64) -> int32;
+}
+
+/// Checks that every function pointer of a store is set.
+/// in: s, a store
+/// returns: true when s is non-null and put/get/del/del_subject/prune are set
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: if (!ses_store_complete(&st)) { return 1; }
+export fn ses_store_complete(s: SesStore*) -> bool {
+  if (s == 0) { return false; }
+  if (s->put == 0 || s->get == 0 || s->del == 0) { return false; }
+  if (s->del_subject == 0 || s->prune == 0) { return false; }
+  return true;
+}
+
+/// Stores (inserts or replaces) a record through the vtable.
+/// in: s, a complete store; r, the record (r->hash decides which)
+/// returns: SES_OK, SES_E_ARG (null s or r), or the store's error
+/// owns: the store copies *r during the call
+/// thread: as the store (the library: any thread; a shared store must be
+///   thread-safe)
+/// example: rc = ses_store_put(&st, &s.rec);
+export fn ses_store_put(s: SesStore*, r: SesRecord*) -> int32 {
+  if (s == 0 || r == 0 || s->put == 0) { return SES_E_ARG; }
+  return s->put(s->ctx, r);
+}
+
+/// Fetches a record by token hash through the vtable.
+/// in: s; hash, 32 bytes; out, the record to fill
+/// returns: SES_OK, SES_E_NOT_FOUND, SES_E_ARG, or the store's error
+/// owns: the store copies into *out
+/// thread: as the store
+/// example: var r: SesRecord; rc = ses_store_get(&st, &h.b[0], &r);
+export fn ses_store_get(s: SesStore*, hash: uint8*, out: SesRecord*) -> int32 {
+  if (s == 0 || hash == 0 || out == 0 || s->get == 0) { return SES_E_ARG; }
+  return s->get(s->ctx, hash, out);
+}
+
+/// Deletes a record by token hash through the vtable.
+/// in: s; hash, 32 bytes
+/// returns: SES_OK, SES_E_NOT_FOUND, SES_E_ARG, or the store's error
+/// owns: nothing
+/// thread: as the store
+/// example: ses_store_del(&st, &r.hash[0]);
+export fn ses_store_del(s: SesStore*, hash: uint8*) -> int32 {
+  if (s == 0 || hash == 0 || s->del == 0) { return SES_E_ARG; }
+  return s->del(s->ctx, hash);
+}
+
+/// Deletes every record of one subject through the vtable.
+/// in: s; subject, 1..SES_SUBJECT_CAP bytes
+/// returns: the number deleted (>= 0), SES_E_ARG, or the store's error
+/// owns: the subject view is borrowed for the call
+/// thread: as the store
+/// example: var n: int32 = ses_store_del_subject(&st, uid);
+export fn ses_store_del_subject(s: SesStore*, subject: string) -> int32 {
+  if (s == 0 || s->del_subject == 0) { return SES_E_ARG; }
+  if (subject.length == 0 || subject.length > (uint64)SES_SUBJECT_CAP) { return SES_E_ARG; }
+  return s->del_subject(s->ctx, subject);
+}
+
+/// Deletes revoked records and records with expires <= before.
+/// in: s; before, unix seconds (normally now)
+/// returns: the number deleted (>= 0), SES_E_ARG, or the store's error
+/// owns: nothing
+/// thread: as the store
+/// example: ses_store_prune(&st, now);
+export fn ses_store_prune(s: SesStore*, before: int64) -> int32 {
+  if (s == 0 || s->prune == 0) { return SES_E_ARG; }
+  return s->prune(s->ctx, before);
+}
+
+/// Views a record's subject.
+/// in: r, a record
+/// returns: the subject bytes ("" for none or a corrupt length)
+/// owns: the view borrows r; never free it
+/// thread: any thread (pure)
+/// example: db_bind_text(stmt, 2, ses_record_subject(r));
+export fn ses_record_subject(r: SesRecord*) -> string {
+  if (r == 0 || r->subject_len <= 0 || r->subject_len > (int64)SES_SUBJECT_CAP) { return ""; }
+  return str_from_bytes((cstring)&r->subject[0], r->subject_len);
+}
+
+/// Views a record's encoded data map (opaque bytes for the store to keep).
+/// in: r, a record
+/// returns: the encoded bytes ("" when empty or corrupt)
+/// owns: the view borrows r; never free it
+/// thread: any thread (pure)
+/// example: db_bind_blob(stmt, 3, ses_record_data(r));
+export fn ses_record_data(r: SesRecord*) -> string {
+  if (r == 0 || r->data_len <= 0 || r->data_len > (int64)SES_DATA_CAP) { return ""; }
+  return str_from_bytes((cstring)&r->data[0], r->data_len);
+}
+
+/// Views a record's encoded pending flash messages (opaque bytes).
+/// in: r, a record
+/// returns: the encoded bytes ("" when empty or corrupt)
+/// owns: the view borrows r; never free it
+/// thread: any thread (pure)
+/// example: db_bind_blob(stmt, 4, ses_record_flash(r));
+export fn ses_record_flash(r: SesRecord*) -> string {
+  if (r == 0 || r->flash_len <= 0 || r->flash_len > (int64)SES_FLASH_CAP) { return ""; }
+  return str_from_bytes((cstring)&r->flash[0], r->flash_len);
+}
+
+/// Copies a subject into a record (for a store's get).
+/// in: r; v, 0..SES_SUBJECT_CAP bytes
+/// returns: SES_OK; SES_E_ARG (null r); SES_E_LIMIT (too long, r unchanged)
+/// owns: copies v
+/// thread: any thread (pure)
+/// example: ses_record_set_subject(out, row_text(row, 2));
+export fn ses_record_set_subject(r: SesRecord*, v: string) -> int32 {
+  if (r == 0) { return SES_E_ARG; }
+  if (v.length > (uint64)SES_SUBJECT_CAP) { return SES_E_LIMIT; }
+  if (v.length > 0) { memcpy(&r->subject[0], v.chars, (int64)v.length); }
+  r->subject_len = (int64)v.length;
+  return SES_OK;
+}
+
+/// Copies encoded data bytes (from ses_record_data) back into a record.
+/// in: r; v, 0..SES_DATA_CAP bytes exactly as ses_record_data gave them
+/// returns: SES_OK; SES_E_ARG (null r); SES_E_LIMIT (too long, r unchanged)
+/// owns: copies v
+/// thread: any thread (pure)
+/// example: ses_record_set_data(out, row_blob(row, 3));
+export fn ses_record_set_data(r: SesRecord*, v: string) -> int32 {
+  if (r == 0) { return SES_E_ARG; }
+  if (v.length > (uint64)SES_DATA_CAP) { return SES_E_LIMIT; }
+  if (v.length > 0) { memcpy(&r->data[0], v.chars, (int64)v.length); }
+  r->data_len = (int64)v.length;
+  return SES_OK;
+}
+
+/// Copies encoded flash bytes (from ses_record_flash) back into a record.
+/// in: r; v, 0..SES_FLASH_CAP bytes exactly as ses_record_flash gave them
+/// returns: SES_OK; SES_E_ARG (null r); SES_E_LIMIT (too long, r unchanged)
+/// owns: copies v
+/// thread: any thread (pure)
+/// example: ses_record_set_flash(out, row_blob(row, 4));
+export fn ses_record_set_flash(r: SesRecord*, v: string) -> int32 {
+  if (r == 0) { return SES_E_ARG; }
+  if (v.length > (uint64)SES_FLASH_CAP) { return SES_E_LIMIT; }
+  if (v.length > 0) { memcpy(&r->flash[0], v.chars, (int64)v.length); }
+  r->flash_len = (int64)v.length;
+  return SES_OK;
+}

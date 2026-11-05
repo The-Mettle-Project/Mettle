@@ -1,0 +1,93 @@
+// log/field: key-value fields.
+//
+// LogField has the same layout and kind numbers (0..3) as telemetry's TmKV,
+// so an array of one can be passed as the other with a pointer cast.
+//
+// Fields are borrowed: the caller owns the array (usually the arguments of
+// one log call) and every key and string. A sink that keeps one must copy it.
+
+export const LOG_INT = 0;
+export const LOG_F64 = 1;
+export const LOG_BOOL = 2;
+export const LOG_STR = 3;
+export const LOG_UINT = 4;
+export const LOG_DUR = 5;     // a duration in nanoseconds, in i
+
+export struct LogValue {
+  kind: int32;
+  i: int64;      // INT, UINT (same bits), BOOL (0 or 1), DUR
+  f: float64;
+  s: string;
+}
+
+export struct LogField {
+  key: string;
+  val: LogValue;
+}
+
+@inline export fn log_int(key: string, v: int64) -> LogField {
+  var kv: LogField;
+  kv.key = key;
+  kv.val.kind = LOG_INT;
+  kv.val.i = v;
+  return kv;
+}
+
+@inline export fn log_uint(key: string, v: uint64) -> LogField {
+  var kv: LogField;
+  kv.key = key;
+  kv.val.kind = LOG_UINT;
+  kv.val.i = (int64)v;
+  return kv;
+}
+
+@inline export fn log_f64(key: string, v: float64) -> LogField {
+  var kv: LogField;
+  kv.key = key;
+  kv.val.kind = LOG_F64;
+  kv.val.f = v;
+  return kv;
+}
+
+@inline export fn log_bool(key: string, v: bool) -> LogField {
+  var kv: LogField;
+  kv.key = key;
+  kv.val.kind = LOG_BOOL;
+  if (v) { kv.val.i = 1; }
+  return kv;
+}
+
+@inline export fn log_str(key: string, v: string) -> LogField {
+  var kv: LogField;
+  kv.key = key;
+  kv.val.kind = LOG_STR;
+  kv.val.s = v;
+  return kv;
+}
+
+// A duration in nanoseconds: text output reads "1.5ms", JSON gets the number.
+@inline export fn log_dur(key: string, ns: int64) -> LogField {
+  var kv: LogField;
+  kv.key = key;
+  kv.val.kind = LOG_DUR;
+  kv.val.i = ns;
+  return kv;
+}
+
+// An error message under the key "error", as slog and zap name it.
+@inline export fn log_err(msg: string) -> LogField {
+  return log_str("error", msg);
+}
+
+// One log event as sinks see it. Every view is borrowed for the call.
+export struct LogRecord {
+  level: int32;
+  target: string;
+  msg: string;
+  ctx: LogField*;        // the logger's own fields (log_with), written first
+  n_ctx: int32;
+  fields: LogField*;     // the call's fields
+  n_fields: int32;
+  time_ns: int64;        // wall clock, unix nanoseconds
+  thread: uint32;        // operating-system thread id
+}

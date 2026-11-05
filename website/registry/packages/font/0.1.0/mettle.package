@@ -1,0 +1,6 @@
+name = font
+version = 0.1.0
+description = Fonts and text in pure Mettle: TrueType/OpenType parsing, kerning, rasterising, SDF, glyph atlas, layout
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Font
+compiler = 0.18.0

@@ -1,0 +1,7 @@
+name = etch
+version = 0.1.1
+description = Images in pure Mettle: PNG, APNG, JPEG, QOI, BMP, TGA, GIF, HDR; convert, flip, crop, resize, sRGB
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Etch
+compiler = 0.18.0
+require = press 0.1.0

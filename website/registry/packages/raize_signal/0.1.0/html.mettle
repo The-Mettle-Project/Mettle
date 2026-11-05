@@ -1,0 +1,200 @@
+// raize/signal/html — the rendered tree a view returns.
+//
+// A view's html"""...""" literal is compiled (by tools/rzpp today, by a
+// compiler metafunction later) into calls to this builder. The result is a
+// tree with the shape Phoenix's diff protocol has:
+//
+//   RzHtml    statics (a const string array made at build time, never copied)
+//             + one dynamic slot between each pair of statics
+//   slot      TEXT   already-escaped text
+//             NODE   a nested RzHtml (an if branch, a component)
+//             LIST   a comprehension: one shared statics array (the for body)
+//                    and N entries, each an RzHtml using those statics
+//
+// Every RzHtml owns its slots, children and lists; rz_html_free releases the
+// whole tree. Statics are never owned (they are program constants).
+//
+// Values reach a slot through rz_html_put, which dispatches on the hole's
+// type with the RzHtmlPut trait: strings and numbers are escaped text, an
+// RzHtml* is a child node. Unescaped text needs rz_html_put_raw, by name.
+
+import "std/mem";
+import "raize_core/str/str";
+import "raize_template/escape";
+
+export const RZ_SLOT_EMPTY: int32 = 0;
+export const RZ_SLOT_TEXT: int32 = 1;
+export const RZ_SLOT_NODE: int32 = 2;
+export const RZ_SLOT_LIST: int32 = 3;
+
+export struct RzHtmlList {
+  statics: string*;
+  nstatics: int32;
+  fp: int64;
+  items: RzHtml**;
+  count: int32;
+  cap: int32;
+}
+
+export struct RzHtmlSlot {
+  kind: int32;
+  text: string;          // TEXT: owned, escaped
+  node: RzHtml*;         // NODE: owned
+  list: RzHtmlList*;     // LIST: owned
+}
+
+export struct RzHtml {
+  statics: string*;      // program constant
+  nstatics: int32;
+  fp: int64;             // fingerprint of the statics, computed at build time
+  slots: RzHtmlSlot*;    // nstatics - 1 of them
+}
+
+// A node over `n` statics with fingerprint `fp`. Every slot starts empty.
+export fn rz_html_node(statics: string*, n: int32, fp: int64) -> RzHtml* {
+  var h: RzHtml* = (RzHtml*)calloc(1, sizeof(RzHtml));
+  if (h == 0) { return 0; }
+  h->statics = statics;
+  h->nstatics = n;
+  h->fp = fp;
+  if (n > 1) { h->slots = (RzHtmlSlot*)calloc((int64)(n - 1), sizeof(RzHtmlSlot)); }
+  return h;
+}
+
+export fn rz_html_slot_count(h: RzHtml*) -> int32 {
+  if (h == 0 || h->nstatics < 1) { return 0; }
+  return h->nstatics - 1;
+}
+
+fn rz_html_list_free(l: RzHtmlList*) {
+  if (l == 0) { return; }
+  var i: int32 = 0;
+  while (i < l->count) {
+    rz_html_free(l->items[i]);
+    i = i + 1;
+  }
+  if (l->items != 0) { free((rawptr)l->items); }
+  free((rawptr)l);
+}
+
+fn rz_html_slot_clear(s: RzHtmlSlot*) {
+  if (s->kind == RZ_SLOT_TEXT) { rz_str_free(s->text); }
+  if (s->kind == RZ_SLOT_NODE) { rz_html_free(s->node); }
+  if (s->kind == RZ_SLOT_LIST) { rz_html_list_free(s->list); }
+  memset((rawptr)s, 0, sizeof(RzHtmlSlot));
+}
+
+export fn rz_html_free(h: RzHtml*) {
+  if (h == 0) { return; }
+  var i: int32 = 0;
+  var n: int32 = rz_html_slot_count(h);
+  while (i < n) {
+    rz_html_slot_clear(&h->slots[i]);
+    i = i + 1;
+  }
+  if (h->slots != 0) { free((rawptr)h->slots); }
+  free((rawptr)h);
+}
+
+fn rz_html_slot(h: RzHtml*, i: int32) -> RzHtmlSlot* {
+  if (h == 0 || i < 0 || i >= rz_html_slot_count(h)) { return 0; }
+  var s: RzHtmlSlot* = &h->slots[i];
+  rz_html_slot_clear(s);
+  return s;
+}
+
+// Slot i gets `s` escaped.
+export fn rz_html_put_text(h: RzHtml*, i: int32, s: string) {
+  var slot: RzHtmlSlot* = rz_html_slot(h, i);
+  if (slot == 0) { return; }
+  var b: RzBuf* = rz_buf_new_cap((int64)s.length + 16);
+  rz_html_escape(b, s);
+  slot->kind = RZ_SLOT_TEXT;
+  slot->text = rz_buf_take(b);
+}
+
+// Slot i gets `s` as is. The only way to insert unescaped markup.
+export fn rz_html_put_raw(h: RzHtml*, i: int32, s: string) {
+  var slot: RzHtmlSlot* = rz_html_slot(h, i);
+  if (slot == 0) { return; }
+  slot->kind = RZ_SLOT_TEXT;
+  slot->text = rz_str_dup(s);
+}
+
+// Slot i gets a child node (owned from now on). A null child is empty.
+export fn rz_html_put_node(h: RzHtml*, i: int32, child: RzHtml*) {
+  var slot: RzHtmlSlot* = rz_html_slot(h, i);
+  if (slot == 0) {
+    rz_html_free(child);
+    return;
+  }
+  if (child == 0) { return; }
+  slot->kind = RZ_SLOT_NODE;
+  slot->node = child;
+}
+
+// Slot i becomes a comprehension over the given body statics.
+export fn rz_html_list(h: RzHtml*, i: int32, statics: string*, n: int32, fp: int64) -> RzHtmlList* {
+  var slot: RzHtmlSlot* = rz_html_slot(h, i);
+  if (slot == 0) { return 0; }
+  var l: RzHtmlList* = (RzHtmlList*)calloc(1, sizeof(RzHtmlList));
+  if (l == 0) { return 0; }
+  l->statics = statics;
+  l->nstatics = n;
+  l->fp = fp;
+  slot->kind = RZ_SLOT_LIST;
+  slot->list = l;
+  return l;
+}
+
+// Appends one entry to a comprehension and returns it for its slots.
+export fn rz_html_item(l: RzHtmlList*) -> RzHtml* {
+  if (l == 0) { return 0; }
+  if (l->count == l->cap) {
+    var nc: int32 = l->cap * 2;
+    if (nc < 8) { nc = 8; }
+    var grown: RzHtml** = (RzHtml**)realloc((rawptr)l->items, (int64)nc * 8);
+    if (grown == 0) { return 0; }
+    l->items = grown;
+    l->cap = nc;
+  }
+  var e: RzHtml* = rz_html_node(l->statics, l->nstatics, l->fp);
+  if (e == 0) { return 0; }
+  l->items[l->count] = e;
+  l->count = l->count + 1;
+  return e;
+}
+
+// ---------------------------------------------------------------------------
+// Hole values: one generic entry point, dispatched by type.
+// ---------------------------------------------------------------------------
+
+export trait RzHtmlPut { fn rz_put_into(self: Self, h: RzHtml*, i: int32); }
+
+impl RzHtmlPut for string {
+  fn rz_put_into(self: Self, h: RzHtml*, i: int32) { rz_html_put_text(h, i, self); }
+}
+impl RzHtmlPut for int32 {
+  fn rz_put_into(self: Self, h: RzHtml*, i: int32) {
+    var b: uint8[24];
+    rz_html_put_raw(h, i, rz_int_buf((int64)self, &b[0], 24));
+  }
+}
+impl RzHtmlPut for int64 {
+  fn rz_put_into(self: Self, h: RzHtml*, i: int32) {
+    var b: uint8[24];
+    rz_html_put_raw(h, i, rz_int_buf(self, &b[0], 24));
+  }
+}
+impl RzHtmlPut for bool {
+  fn rz_put_into(self: Self, h: RzHtml*, i: int32) {
+    if (self) { rz_html_put_raw(h, i, "true"); } else { rz_html_put_raw(h, i, "false"); }
+  }
+}
+impl RzHtmlPut for RzHtml* {
+  fn rz_put_into(self: Self, h: RzHtml*, i: int32) { rz_html_put_node(h, i, self); }
+}
+
+export fn rz_html_put<T: RzHtmlPut>(h: RzHtml*, i: int32, v: T) {
+  v.rz_put_into(h, i);
+}

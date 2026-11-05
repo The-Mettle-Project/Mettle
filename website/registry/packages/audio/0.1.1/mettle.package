@@ -1,0 +1,7 @@
+name = audio
+version = 0.1.1
+description = Sound in pure Mettle: WAV, FLAC, Vorbis, Opus, MP3; resampling, mixing, playback and capture
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Audio
+compiler = 0.18.0
+platforms = linux windows

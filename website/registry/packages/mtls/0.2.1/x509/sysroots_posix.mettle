@@ -1,0 +1,97 @@
+// The system trust store on Linux and macOS: PEM bundle files and
+// directories of PEM files, the way OpenSSL-based programs find them.
+
+import "std/core";
+import "std/mem";
+import "std/env";
+import "std/fs";
+import "mtls/core/err";
+import "mtls/x509/verify";
+import "mtls/x509/rootfile";
+
+// Where distributions put the bundle, in the order we try them.
+const MTLS_X_BUNDLE_COUNT: int32 = 5;
+
+fn mtls_x_bundle_path(i: int32) -> string {
+  if (i == 0) { return "/etc/ssl/certs/ca-certificates.crt"; }
+  if (i == 1) { return "/etc/pki/tls/certs/ca-bundle.crt"; }
+  if (i == 2) { return "/etc/ssl/ca-bundle.pem"; }
+  if (i == 3) { return "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"; }
+  return "/etc/ssl/cert.pem";
+}
+
+// Adds every file in dir (symlinks followed, since "hash.0" names are links).
+fn mtls_x_load_dir(r: MtlsRoots*, dir: string) -> int32 {
+  var d: FsDir;
+  if (fs_dir_open(dir, &d) < 0) { return MTLS_E_IO; }
+  var e: FsDirEntry;
+  var total: int32 = 0;
+  var path: uint8[4096];
+  while (fs_dir_next(&d, &e) == 1) {
+    if (e.kind != FS_FILE && e.kind != FS_SYMLINK) { continue; }
+    var dn: int64 = (int64)dir.length;
+    var en: int64 = (int64)e.name.length;
+    if (dn + 1 + en >= 4096) { continue; }
+    memcpy(&path[0], dir.chars, dn);
+    path[dn] = (uint8)47;
+    memcpy(&path[dn + 1], e.name.chars, en);
+    var p: string;
+    p.chars = &path[0];
+    p.length = (uint64)(dn + 1 + en);
+    var rc: int32 = mtls_roots_add_file(r, p);
+    if (rc > 0) { total = total + rc; }
+  }
+  fs_dir_close(&d);
+  return total;
+}
+
+/// mtls_sysroots_native: loads the operating system's roots into r. Returns
+/// how many certificates were added, or MTLS_E_IO if no source could be
+/// read. $SSL_CERT_FILE replaces the default bundle files, $SSL_CERT_DIR (a
+/// colon separated list) adds directories; without any bundle file the
+/// directory /etc/ssl/certs is used.
+export fn mtls_sysroots_native(r: MtlsRoots*) -> int32 {
+  var total: int32 = 0;
+  var have: bool = false;
+  match (env_get("SSL_CERT_FILE")) {
+    case Some(v): {
+      var rc: int32 = mtls_roots_add_file(r, v);
+      if (rc >= 0) {
+        total = total + rc;
+        have = true;
+      }
+    }
+    case None: { }
+  }
+  if (!have) {
+    for i in 0..MTLS_X_BUNDLE_COUNT {
+      var rc: int32 = mtls_roots_add_file(r, mtls_x_bundle_path(i));
+      if (rc >= 0) {
+        total = total + rc;
+        have = true;
+        break;
+      }
+    }
+  }
+  var dirs: string = env_get_or("SSL_CERT_DIR", "");
+  if (dirs.length == (uint64)0 && !have) { dirs = "/etc/ssl/certs"; }
+  var start: int64 = 0;
+  var n: int64 = (int64)dirs.length;
+  for i in 0..(n + 1) {
+    if (i == n || dirs.chars[i] == (uint8)58) {
+      if (i > start) {
+        var one: string;
+        one.chars = dirs.chars + start;
+        one.length = (uint64)(i - start);
+        var rc: int32 = mtls_x_load_dir(r, one);
+        if (rc >= 0) {
+          total = total + rc;
+          have = true;
+        }
+      }
+      start = i + 1;
+    }
+  }
+  if (!have) { return MTLS_E_IO; }
+  return total;
+}

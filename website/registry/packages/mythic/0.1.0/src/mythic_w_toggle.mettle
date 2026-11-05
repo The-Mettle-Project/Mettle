@@ -1,0 +1,433 @@
+// mythic_w_toggle: checkbox, switch, radio, slider (DESIGN-SYSTEM §7.4–§7.7, motion §6.2).
+import "mythic_base";
+import "mythic_types";
+import "mythic_ctx";
+import "mythic_anim";
+import "mythic_paint";
+import "mythic_layout";
+import "mythic_icons";
+import "mythic_w_basic";
+
+// min == max (e.g. both 0) means 0..1; step 0 = continuous (keyboard step 1% of range)
+export struct MythicSliderOpts { min: float32; max: float32; step: float32; width: MythicSize; size: int32; }
+// checkbox / switch / radio options; zero = defaults
+export struct MythicToggleOpts {
+  size: int32;          // MYTHIC_CTRL_MD / MYTHIC_CTRL_SM
+  mixed: bool;          // checkbox: indeterminate (dash); a click sets the value to true
+  error: bool;          // checkbox: unchecked border uses `danger`
+}
+
+// ---------------------------------------------------------------- shared row (indicator + label)
+
+// opens the clickable row (hit area = whole row, min height 24) and declares the indicator leaf;
+// returns the indicator node. The caller declares nothing else and calls row_end.
+fn row_begin(ui: MythicUi*, id: uint64, ind_w: float32, ind_h: float32) -> MythicNode* {
+  var b: MythicBox;
+  b.id = id;
+  b.dir = MYTHIC_DIR_ROW;
+  b.gap = 8.0;
+  b.align_y = MYTHIC_ALIGN_CENTER;
+  b.height.min = 24.0;
+  mythic_box_begin(ui, b);
+  var n: MythicNode* = mythic_ctx_node_add(ui, MYTHIC_NODE_SPACER);
+  n->box.width = mythic_fixed(ind_w);
+  n->box.height = mythic_fixed(ind_h);
+  return n;
+}
+
+fn row_end(ui: MythicUi*, label: string, ind: MythicNode*, mythic_paint_cb: fn(MythicUi*, MythicPainter*, MythicRect, rawptr) -> void, data: rawptr) {
+  var shown: string = mythic_arena_strn(ui->arena, label, mythic_label_len(label));
+  if (shown.length > (uint64)0) {
+    var t: MythicTheme* = mythic_theme(ui);
+    var st: MythicTextStyle = t->type.body;
+    st.flags = MYTHIC_TEXT_ELLIPSIS;
+    mythic_text(ui, shown, st, t->colors.text_primary);
+  }
+  ind->paint = mythic_paint_cb;
+  ind->paint_data = data;
+  mythic_end(ui);
+}
+
+fn alpha_mul(c: uint32, a: float32) -> uint32 {
+  var v: float32 = (float32)(c >> 24) * mythic_clampf(a, 0.0, 1.0);
+  return ((uint32)mythic_iround(v) << 24) | (c & (uint32)0x00FFFFFF);
+}
+
+// rect snapped to whole device px, in logical px (rest geometry stays crisp)
+fn snap_rect(p: MythicPainter*, r: MythicRect) -> MythicRect {
+  var d: MythicRect = mythic_paint_dev_rect(p, r);
+  var o: MythicRect = { x: d.x / p->scale, y: d.y / p->scale, w: d.w / p->scale, h: d.h / p->scale };
+  return o;
+}
+
+fn scale_rect(r: MythicRect, s: float32) -> MythicRect {
+  var o: MythicRect = { x: r.x + r.w * (1.0 - s) / 2.0, y: r.y + r.h * (1.0 - s) / 2.0, w: r.w * s, h: r.h * s };
+  return o;
+}
+
+// ---------------------------------------------------------------- checkbox
+
+struct CheckPaint {
+  fill: uint32; border: uint32; overlay: uint32; on_fill: uint32; mark_color: uint32; ring: uint32;
+  fill_a: float32; draw: float32; mark_a: float32; scale: float32; focus: float32; radius: float32;
+  mark: int32;
+}
+
+fn check_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: CheckPaint* = (CheckPaint*)data;
+  var base: MythicRect = snap_rect(p, r);
+  var b: MythicRect = scale_rect(base, d->scale);
+  var rad: MythicCorners = mythic_radius(d->radius * d->scale);
+  mythic_paint_fill_exact(p, b, rad, d->fill);
+  if ((d->overlay >> 24) != (uint32)0) { mythic_paint_fill_exact(p, b, rad, d->overlay); }
+  mythic_paint_stroke_exact(p, b, rad, 1.0, d->border);
+  if (d->fill_a > 0.0) { mythic_paint_fill_exact(p, b, rad, alpha_mul(d->on_fill, d->fill_a)); }
+  if (d->mark_a > 0.0 && d->draw > 0.0) { mythic_paint_icon(p, d->mark, b, alpha_mul(d->mark_color, d->mark_a), d->draw); }
+  mythic_paint_focus_ring(p, base, d->radius, d->ring, d->focus);
+}
+
+/// Checkbox with options (DESIGN-SYSTEM §7.4). Returns true when the user toggled it.
+export fn mythic_checkbox_ex(ui: MythicUi*, label: string, v: bool*, o: MythicToggleOpts) -> bool {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: MythicColors* = &t->colors;
+  var m: MythicMotion* = &t->motion;
+  var id: uint64 = mythic_id(ui, label);
+  var sz: float32 = 16.0;
+  if (o.size == MYTHIC_CTRL_SM) { sz = 14.0; }
+  var ind: MythicNode* = row_begin(ui, id, sz, sz);
+  var fl: int32 = MYTHIC_FOCUS_ACTIVATE_SPACE;
+  var r: MythicResp = mythic_interact(ui, id, fl | MYTHIC_SENSE_CLICK);
+  mythic_focusable(ui, id, fl);
+  var changed: bool = false;
+  if (r.clicked) {
+    if (o.mixed) { *v = true; } else { *v = !*v; }
+    changed = true;
+  }
+  var on: bool = *v || o.mixed;
+  var st: MythicWState* = mythic_state(ui, id);
+  if (on) { st->flags = 0; if (o.mixed && !*v) { st->flags = 1; } }
+  var sa: MythicStateAnim = mythic_anim_states(ui, id, r);
+  var d: CheckPaint* = (CheckPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(CheckPaint));
+  d->radius = t->radius.sm;
+  d->mark = MYTHIC_ICON_CHECK;
+  if (st->flags == 1) { d->mark = MYTHIC_ICON_INDETERMINATE; }
+  // timed check: fill over the first 100 ms, stroke draws on 40..180 ms; uncheck fades 120 ms
+  var target: float32 = 0.0;
+  var dur: float32 = m->uncheck_ms;
+  if (on) { target = 1.0; dur = m->check_ms; }
+  var k: float32 = mythic_anim_timed(ui, id, 3 | MYTHIC_ANIM_COLOR, target, dur, MYTHIC_CURVE_LINEAR);
+  if (on) {
+    var ms: float32 = k * m->check_ms;
+    d->fill_a = mythic_ease(MYTHIC_CURVE_OUT, ms / m->check_fill_ms);
+    d->draw = mythic_ease(MYTHIC_CURVE_OUT, (ms - m->check_draw_start_ms) / (m->check_ms - m->check_draw_start_ms));
+    d->mark_a = 1.0;
+  } else {
+    d->fill_a = k;
+    d->mark_a = k;
+    d->draw = 1.0;
+  }
+  if (k >= 1.0) { d->draw = 1.0; d->fill_a = 1.0; }
+  d->fill = c->bg_input;
+  d->border = mythic_color_lerp(c->border_control, c->border_control_hover, sa.hover);
+  if (o.error) { d->border = c->danger; }
+  d->overlay = alpha_mul(c->bg_pressed, sa.press);
+  d->on_fill = mythic_color_lerp(mythic_color_lerp(c->accent, c->accent_hover, sa.hover), c->accent_pressed, sa.press);
+  d->mark_color = c->text_on_accent;
+  d->ring = c->focus_ring;
+  d->focus = sa.focus;
+  d->scale = 1.0;
+  if (!mythic_reduced_motion(ui)) { d->scale = 1.0 - (1.0 - m->press_scale) * sa.press; }
+  row_end(ui, label, ind, &check_paint, (rawptr)d);
+  return changed;
+}
+
+/// Checkbox bound to `v`. Returns true when the user toggled it.
+export fn mythic_checkbox(ui: MythicUi*, label: string, v: bool*) -> bool {
+  var o: MythicToggleOpts;
+  return mythic_checkbox_ex(ui, label, v, o);
+}
+
+// ---------------------------------------------------------------- switch
+
+struct SwitchPaint { track: uint32; knob: uint32; ring: uint32; pos: float32; stretch: float32; focus: float32;
+                     knob_d: float32; inset: float32; shadow: bool; e2: MythicElevLevel; }
+
+fn switch_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: SwitchPaint* = (SwitchPaint*)data;
+  var b: MythicRect = snap_rect(p, r);
+  var tr: float32 = b.h / 2.0;
+  mythic_paint_fill_exact(p, b, mythic_radius(tr), d->track);
+  var kw: float32 = d->knob_d + d->stretch;
+  var kx: float32 = b.x + d->inset + (b.w - 2.0 * d->inset - kw) * d->pos;
+  var kr: MythicRect = { x: kx, y: b.y + d->inset, w: kw, h: d->knob_d };
+  var krad: MythicCorners = mythic_radius(d->knob_d / 2.0);
+  if (d->shadow) {
+    for i: int32 in 0..d->e2.count { mythic_paint_shadow_exact(p, kr, krad, d->e2.s[i]); }
+  }
+  mythic_paint_fill_exact(p, kr, krad, d->knob);
+  mythic_paint_focus_ring(p, b, tr, d->ring, d->focus);
+}
+
+/// Switch with options (DESIGN-SYSTEM §7.6). Space or a click anywhere on the row toggles.
+export fn mythic_switch_ex(ui: MythicUi*, label: string, v: bool*, o: MythicToggleOpts) -> bool {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: MythicColors* = &t->colors;
+  var m: MythicMotion* = &t->motion;
+  var id: uint64 = mythic_id(ui, label);
+  var tw: float32 = 36.0; var th: float32 = 20.0; var kd: float32 = 16.0;
+  if (o.size == MYTHIC_CTRL_SM) { tw = 28.0; th = 16.0; kd = 12.0; }
+  var ind: MythicNode* = row_begin(ui, id, tw, th);
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_FOCUS_ACTIVATE_SPACE | MYTHIC_SENSE_CLICK);
+  mythic_focusable(ui, id, MYTHIC_FOCUS_ACTIVATE_SPACE);
+  var changed: bool = false;
+  if (r.clicked) { *v = !*v; changed = true; }
+  var target: float32 = 0.0;
+  if (*v) { target = 1.0; }
+  var sa: MythicStateAnim = mythic_anim_states(ui, id, r);
+  var d: SwitchPaint* = (SwitchPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(SwitchPaint));
+  d->pos = mythic_anim_timed(ui, id, 3 | MYTHIC_ANIM_MOVE, target, m->switch_ms, MYTHIC_CURVE_OUT_STRONG);
+  var cm: float32 = mythic_anim_timed(ui, id, 4 | MYTHIC_ANIM_COLOR, target, m->switch_ms, MYTHIC_CURVE_OUT_STRONG);
+  var pt: float32 = 0.0;
+  if (r.pressed && r.hovered) { pt = 1.0; }
+  d->stretch = mythic_anim_smooth(ui, id, 5 | MYTHIC_ANIM_MOVE, pt, m->switch_press_tau, m->switch_press_tau) * 3.0;
+  var off: uint32 = mythic_color_lerp(c->control_track, c->switch_track_off_hover, sa.hover);
+  var onc: uint32 = mythic_color_lerp(c->accent, c->accent_hover, sa.hover);
+  d->track = mythic_color_lerp(off, onc, cm);
+  d->knob = mythic_color_lerp(c->switch_knob_off, c->switch_knob_on, cm);
+  d->ring = c->focus_ring;
+  d->focus = sa.focus;
+  d->knob_d = kd;
+  d->inset = 2.0;
+  d->shadow = ui->disabled_depth == 0;
+  d->e2 = t->elevation.e2;
+  row_end(ui, label, ind, &switch_paint, (rawptr)d);
+  return changed;
+}
+
+export fn mythic_switch(ui: MythicUi*, label: string, v: bool*) -> bool {
+  var o: MythicToggleOpts;
+  return mythic_switch_ex(ui, label, v, o);
+}
+
+// ---------------------------------------------------------------- radio
+
+struct RadioPaint { fill: uint32; overlay: uint32; border: uint32; on_fill: uint32; dot: uint32; ring: uint32;
+                    sel: float32; dot_scale: float32; focus: float32; }
+
+fn radio_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: RadioPaint* = (RadioPaint*)data;
+  var b: MythicRect = snap_rect(p, r);
+  var rr: float32 = b.w / 2.0;
+  var ctr: MythicVec2 = { x: b.x + rr, y: b.y + rr };
+  var rad: MythicCorners = mythic_radius(rr);
+  mythic_paint_circle(p, ctr, rr, d->fill);
+  if ((d->overlay >> 24) != (uint32)0) { mythic_paint_circle(p, ctr, rr, d->overlay); }
+  mythic_paint_stroke_exact(p, b, rad, 1.0, d->border);
+  if (d->sel > 0.0) {
+    mythic_paint_circle(p, ctr, rr, alpha_mul(d->on_fill, d->sel));
+    mythic_paint_circle(p, ctr, 3.0 * rr / 8.0 * d->dot_scale, alpha_mul(d->dot, d->sel));
+  }
+  mythic_paint_focus_ring(p, b, rr, d->ring, d->focus);
+}
+
+/// Radio button of the group bound to `current`; selected when *current == value. Arrow keys
+/// move the selection (and focus) inside the group; the group is one Tab stop (§7.5).
+/// Returns true when this call changed *current.
+export fn mythic_radio_ex(ui: MythicUi*, label: string, current: int32*, value: int32, o: MythicToggleOpts) -> bool {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: MythicColors* = &t->colors;
+  var m: MythicMotion* = &t->motion;
+  var id: uint64 = mythic_id(ui, label);
+  var sz: float32 = 16.0;
+  if (o.size == MYTHIC_CTRL_SM) { sz = 14.0; }
+  var ind: MythicNode* = row_begin(ui, id, sz, sz);
+  var fl: int32 = MYTHIC_FOCUS_ACTIVATE_SPACE | MYTHIC_FOCUS_WANTS_ARROWS;
+  var r: MythicResp = mythic_interact(ui, id, fl | MYTHIC_SENSE_CLICK);
+  var group: uint64 = (uint64)(rawptr)current;
+  mythic_focusable_group(ui, id, fl, group, (int64)value, *current == value);
+  var changed: bool = false;
+  if (r.clicked && *current != value) { *current = value; changed = true; }
+  if (r.focused && ui->focus_id == id) {
+    var dir: int32 = 0;
+    if (mythic_key_consume(ui, MYTHIC_KEY_DOWN, -1) || mythic_key_consume(ui, MYTHIC_KEY_RIGHT, -1)) { dir = 1; }
+    else if (mythic_key_consume(ui, MYTHIC_KEY_UP, -1) || mythic_key_consume(ui, MYTHIC_KEY_LEFT, -1)) { dir = -1; }
+    if (dir != 0) {
+      var e: MythicFocusEnt* = mythic_focus_group_step(ui, group, id, dir);
+      if (e != 0) {
+        *current = (int32)e->value;
+        mythic_focus_set(ui, e->id);
+        changed = true;
+      }
+    }
+  }
+  var target: float32 = 0.0;
+  if (*current == value) { target = 1.0; }
+  var sa: MythicStateAnim = mythic_anim_states(ui, id, r);
+  var d: RadioPaint* = (RadioPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(RadioPaint));
+  d->sel = mythic_anim_timed(ui, id, 3 | MYTHIC_ANIM_COLOR, target, m->radio_ms, MYTHIC_CURVE_OUT_STRONG);
+  d->dot_scale = 1.0;
+  if (!mythic_reduced_motion(ui)) { d->dot_scale = 0.4 + 0.6 * d->sel; }
+  d->fill = c->bg_input;
+  d->overlay = alpha_mul(c->bg_pressed, sa.press);
+  d->border = mythic_color_lerp(c->border_control, c->border_control_hover, sa.hover);
+  d->on_fill = mythic_color_lerp(mythic_color_lerp(c->accent, c->accent_hover, sa.hover), c->accent_pressed, sa.press);
+  d->dot = c->radio_dot;
+  d->ring = c->focus_ring;
+  d->focus = sa.focus;
+  row_end(ui, label, ind, &radio_paint, (rawptr)d);
+  return changed;
+}
+
+export fn mythic_radio(ui: MythicUi*, label: string, current: int32*, value: int32) -> bool {
+  var o: MythicToggleOpts;
+  return mythic_radio_ex(ui, label, current, value, o);
+}
+
+// ---------------------------------------------------------------- slider
+
+/// Clamps `v` to [min, max] and snaps it to the step grid from min (step 0 = continuous).
+export fn mythic_slider_snap(v: float32, min: float32, max: float32, step: float32) -> float32 {
+  var lo: float32 = mythic_minf(min, max);
+  var hi: float32 = mythic_maxf(min, max);
+  var o: float32 = mythic_clampf(v, lo, hi);
+  if (step > 0.0) {
+    o = lo + mythic_roundf((o - lo) / step) * step;
+    if (o > hi) { o = o - step; }
+    o = mythic_clampf(o, lo, hi);
+  }
+  return o;
+}
+
+/// Value under pointer x for a track starting at x0 with width w (logical px).
+export fn mythic_slider_value_at(x: float32, x0: float32, w: float32, min: float32, max: float32, step: float32) -> float32 {
+  var f: float32 = 0.0;
+  if (w > 0.0) { f = mythic_clampf((x - x0) / w, 0.0, 1.0); }
+  return mythic_slider_snap(min + (max - min) * f, min, max, step);
+}
+
+/// Value after keyboard `key`: arrows ±step (1% of range when step is 0), PageUp/PageDown ±10%,
+/// Home/End = min/max. Other keys return `v` unchanged.
+export fn mythic_slider_key(v: float32, key: int32, min: float32, max: float32, step: float32) -> float32 {
+  var range: float32 = max - min;
+  var st: float32 = step;
+  if (st <= 0.0) { st = range / 100.0; }
+  var o: float32 = v;
+  if (key == MYTHIC_KEY_LEFT || key == MYTHIC_KEY_DOWN) { o = v - st; }
+  else if (key == MYTHIC_KEY_RIGHT || key == MYTHIC_KEY_UP) { o = v + st; }
+  else if (key == MYTHIC_KEY_PAGE_UP) { o = v + mythic_maxf(st, range * 0.1); }
+  else if (key == MYTHIC_KEY_PAGE_DOWN) { o = v - mythic_maxf(st, range * 0.1); }
+  else if (key == MYTHIC_KEY_HOME) { o = min; }
+  else if (key == MYTHIC_KEY_END) { o = max; }
+  else { return v; }
+  return mythic_slider_snap(o, min, max, step);
+}
+
+struct SliderPaint { pos: float32; track: uint32; fill: uint32; thumb: uint32; thumb_border: uint32; halo: uint32;
+                     ring: uint32; focus: float32; shadow: bool; e2: MythicElevLevel; }
+
+fn slider_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: SliderPaint* = (SliderPaint*)data;
+  var b: MythicRect = snap_rect(p, r);
+  var cy: float32 = b.y + b.h / 2.0;
+  var x0: float32 = b.x + 8.0;
+  var tw: float32 = mythic_maxf(0.0, b.w - 16.0);
+  var track: MythicRect = { x: x0, y: cy - 2.0, w: tw, h: 4.0 };
+  var trad: MythicCorners = mythic_radius(2.0);
+  mythic_paint_fill(p, track, trad, d->track);
+  var cx: float32 = x0 + tw * d->pos;
+  if (cx > x0) {
+    var fr: MythicRect = { x: x0, y: cy - 2.0, w: cx - x0, h: 4.0 };
+    mythic_paint_fill_exact(p, fr, trad, d->fill);
+  }
+  var ctr: MythicVec2 = { x: cx, y: cy };
+  if ((d->halo >> 24) != (uint32)0) { mythic_paint_circle(p, ctr, 14.0, d->halo); }
+  var th: MythicRect = { x: cx - 8.0, y: cy - 8.0, w: 16.0, h: 16.0 };
+  var thr: MythicCorners = mythic_radius(8.0);
+  if (d->shadow) {
+    for i: int32 in 0..d->e2.count { mythic_paint_shadow_exact(p, th, thr, d->e2.s[i]); }
+  }
+  mythic_paint_circle(p, ctr, 8.0, d->thumb);
+  mythic_paint_stroke_exact(p, th, thr, 1.0, d->thumb_border);
+  mythic_paint_focus_ring(p, th, 8.0, d->ring, d->focus);
+}
+
+/// Slider with options (DESIGN-SYSTEM §7.7): drag, click to jump, arrows/PageUp/PageDown/Home/End.
+/// A non-empty label shows a header row (label left, percentage of the range right).
+/// Returns true when the user changed *v.
+export fn mythic_slider_ex(ui: MythicUi*, label: string, v: float32*, o: MythicSliderOpts) -> bool {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: MythicColors* = &t->colors;
+  var m: MythicMotion* = &t->motion;
+  var mn: float32 = o.min; var mx: float32 = o.max;
+  if (mn == mx) { mn = 0.0; mx = 1.0; }
+  var id: uint64 = mythic_id(ui, label);
+  var shown: string = mythic_arena_strn(ui->arena, label, mythic_label_len(label));
+  var has_w: bool = o.width.mode != MYTHIC_FIT || o.width.value != 0.0;
+  var col: bool = shown.length > (uint64)0;
+  var frac0: float32 = 0.0;
+  if (mx != mn) { frac0 = mythic_clampf((*v - mn) / (mx - mn), 0.0, 1.0); }
+  if (col) {
+    var cb: MythicBox = { width: mythic_grow(), gap: 4 };
+    cb.width.min = 120.0;
+    if (has_w) { cb.width = o.width; }
+    mythic_column_begin(ui, cb);
+    mythic_value_header(ui, shown, mythic_fmt_pct(ui, frac0));
+  }
+  var b: MythicBox;
+  b.id = id;
+  b.height = mythic_fixed(24.0);
+  b.width = mythic_grow();
+  b.width.min = 120.0;
+  if (has_w && !col) { b.width = o.width; }
+  mythic_box_begin(ui, b);
+  var fl: int32 = MYTHIC_FOCUS_WANTS_ARROWS;
+  var r: MythicResp = mythic_interact(ui, id, fl | MYTHIC_SENSE_DRAG | MYTHIC_SENSE_CLICK);
+  mythic_focusable(ui, id, fl);
+  mythic_end(ui);
+  var nv: float32 = *v;
+  var dragging: bool = false;
+  if (ui->disabled_depth == 0 && ui->active_id == id && ui->in.mouse_down[1] && r.rect.w > 16.0) {
+    nv = mythic_slider_value_at(ui->in.mouse.x, r.rect.x + 8.0, r.rect.w - 16.0, mn, mx, o.step);
+    dragging = true;
+  }
+  if (r.focused && ui->focus_id == id && !dragging) {
+    var keys: int32[8] = [MYTHIC_KEY_LEFT, MYTHIC_KEY_RIGHT, MYTHIC_KEY_UP, MYTHIC_KEY_DOWN, MYTHIC_KEY_PAGE_UP, MYTHIC_KEY_PAGE_DOWN, MYTHIC_KEY_HOME, MYTHIC_KEY_END];
+    for i: int32 in 0..8 {
+      while (mythic_key_consume(ui, keys[i], -1)) {
+        nv = mythic_slider_key(nv, keys[i], mn, mx, o.step);
+        ui->focus_visible = true;
+      }
+    }
+  }
+  var changed: bool = false;
+  if (nv != *v) { *v = nv; changed = true; }
+  var frac: float32 = 0.0;
+  if (mx != mn) { frac = mythic_clampf((*v - mn) / (mx - mn), 0.0, 1.0); }
+  var d: SliderPaint* = (SliderPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(SliderPaint));
+  if (dragging) { mythic_anim_set(ui, id, 4 | MYTHIC_ANIM_MOVE, frac); d->pos = frac; }
+  else { d->pos = mythic_anim_timed(ui, id, 4 | MYTHIC_ANIM_MOVE, frac, m->slider_key_ms, MYTHIC_CURVE_OUT); }
+  var sa: MythicStateAnim = mythic_anim_states(ui, id, r);
+  var ht: float32 = 0.0;
+  if (r.hovered || dragging) { ht = 1.0; }
+  var halo: float32 = mythic_anim_smooth(ui, id, 5 | MYTHIC_ANIM_COLOR, ht, m->slider_halo_tau, m->slider_halo_tau);
+  var pt: float32 = 0.0;
+  if (dragging) { pt = 1.0; }
+  var hp: float32 = mythic_anim_smooth(ui, id, 6 | MYTHIC_ANIM_COLOR, pt, m->slider_halo_tau, m->slider_halo_tau);
+  d->halo = mythic_color_lerp(mythic_color_lerp(c->slider_halo_hover & (uint32)0x00FFFFFF, c->slider_halo_hover, halo), c->slider_halo_pressed, hp);
+  d->track = c->control_track;
+  d->fill = c->accent;
+  d->thumb = c->slider_thumb;
+  d->thumb_border = c->slider_thumb_border;
+  d->ring = c->focus_ring;
+  d->focus = sa.focus;
+  d->shadow = ui->disabled_depth == 0;
+  d->e2 = t->elevation.e2;
+  mythic_node_paint(ui, &slider_paint, (rawptr)d);
+  if (col) { mythic_end(ui); }
+  return changed;
+}
+
+export fn mythic_slider(ui: MythicUi*, label: string, v: float32*, min: float32, max: float32) -> bool {
+  var o: MythicSliderOpts = { min: min, max: max };
+  return mythic_slider_ex(ui, label, v, o);
+}

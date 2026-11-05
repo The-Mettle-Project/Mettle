@@ -1,0 +1,100 @@
+// State every Linux collector shares: the root prefix, scratch buffers, and
+// facts read once (clock tick, page size, boot time, CPU count, memory size).
+import "std/mem";
+import "util.mettle";
+
+export struct SysinfoLxCtx {
+  root: string;            // "" for the live system, else a test tree
+  live: bool;              // root is empty: system calls may be used
+  buf: SysinfoLxBuf;       // scratch, reused by every collector
+  buf2: SysinfoLxBuf;
+  clk_tck: int64;          // clock ticks per second (USER_HZ)
+  page_size: int64;
+  boot_time: int64;        // Unix seconds
+  ncpu: int32;             // online logical CPUs
+  mem_total: int64;        // bytes
+}
+
+// Reads the auxiliary vector for the page size and clock tick.
+fn sysinfo_lx_ctx_auxv(c: SysinfoLxCtx*) {
+  var p: SysinfoLxPath;
+  sysinfo_lx_path_at(&p, c->root, "/proc/self/auxv");
+  var n: int64 = sysinfo_lx_slurp(sysinfo_lx_path_str(&p), &c->buf);
+  var k: int64 = 0;
+  while (k + 16 <= n) {
+    var t: uint64* = (uint64*)(c->buf.p + k);
+    if (t[0] == (uint64)6 && t[1] > (uint64)0) { c->page_size = (int64)t[1]; }
+    if (t[0] == (uint64)17 && t[1] > (uint64)0) { c->clk_tck = (int64)t[1]; }
+    if (t[0] == (uint64)0) { break; }
+    k = k + 16;
+  }
+}
+
+// Boot time and CPU count from the text of /proc/stat.
+export fn sysinfo_lx_ctx_parse_stat(c: SysinfoLxCtx*, text: string) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  var n: int32 = 0;
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, "cpu") && s.i + 3 < s.n && s.p[s.i + 3] >= (uint8)48 && s.p[s.i + 3] <= (uint8)57) {
+      n = n + 1;
+    } else if (sysinfo_lx_at(&s, "btime ")) {
+      s.i = s.i + 6;
+      c->boot_time = sysinfo_lx_i64(&s);
+    }
+    sysinfo_lx_next_line(&s);
+  }
+  if (n > 0) { c->ncpu = n; }
+}
+
+// The value in kB of a "Key:   123 kB" line of /proc/meminfo, in bytes, or -1.
+export fn sysinfo_lx_meminfo_key(text: string, key: string) -> int64 {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, key) && s.i + (int64)key.length < s.n && s.p[s.i + (int64)key.length] == (uint8)58) {
+      s.i = s.i + (int64)key.length + 1;
+      return (int64)sysinfo_lx_u64(&s) * 1024;
+    }
+    sysinfo_lx_next_line(&s);
+  }
+  return -1;
+}
+
+export fn sysinfo_lx_ctx_init(c: SysinfoLxCtx*, root: string) {
+  var n: int64 = (int64)root.length;
+  // a trailing '/' would double up with the absolute paths added later
+  while (n > 0 && root[n - 1] == '/') { n = n - 1; }
+  if (n > 0) {
+    var p: uint8* = (uint8*)malloc(n);
+    memcpy(p, root.chars, n);
+    c->root = sysinfo_lx_view(p, n);
+  } else {
+    c->root = sysinfo_lx_view((uint8*)0, 0);
+  }
+  c->live = n == 0;
+  sysinfo_lx_buf_init(&c->buf, 65536);
+  sysinfo_lx_buf_init(&c->buf2, 65536);
+  c->clk_tck = 100;
+  c->page_size = 4096;
+  c->ncpu = 1;
+  c->mem_total = -1;
+  sysinfo_lx_ctx_auxv(c);
+  var p: SysinfoLxPath;
+  sysinfo_lx_path_at(&p, c->root, "/proc/stat");
+  var r: int64 = sysinfo_lx_slurp(sysinfo_lx_path_str(&p), &c->buf);
+  if (r > 0) { sysinfo_lx_ctx_parse_stat(c, sysinfo_lx_view(c->buf.p, r)); }
+  sysinfo_lx_path_at(&p, c->root, "/proc/meminfo");
+  r = sysinfo_lx_slurp(sysinfo_lx_path_str(&p), &c->buf);
+  if (r > 0) { c->mem_total = sysinfo_lx_meminfo_key(sysinfo_lx_view(c->buf.p, r), "MemTotal"); }
+}
+
+export fn sysinfo_lx_ctx_free(c: SysinfoLxCtx*) {
+  if (c->root.length > (uint64)0) { free(c->root.chars); }
+  sysinfo_lx_buf_free(&c->buf);
+  sysinfo_lx_buf_free(&c->buf2);
+}
+
+// A path under the root.
+export fn sysinfo_lx_ctx_path(c: SysinfoLxCtx*, p: SysinfoLxPath*, rest: string) -> string {
+  sysinfo_lx_path_at(p, c->root, rest);
+  return sysinfo_lx_path_str(p);
+}

@@ -1,0 +1,138 @@
+// flux_orm/migration/ddl.mettle — CREATE TABLE from metadata.
+//
+// The DDL is generated from the same RcMeta the write path uses, so a table
+// cannot drift from the model it was declared for: the column list, the order,
+// the key and the nullability all come from one source.
+//
+// Affinity is the SQLite family (INTEGER/REAL/TEXT/BLOB), which is also what
+// MeoDB stores. The *wire* type decides the column, never the Mettle type: a
+// `bool` is INTEGER because MeoDB has no BOOL, and an `int64` overridden to
+// RC_T_TIME is INTEGER because micros are an integer.
+//
+// Nothing here interpolates a value. Identifiers go through rc_buf_ident, the
+// same helper query/'s default dialect uses, so there is exactly one quoting
+// rule in the codebase and it doubles an embedded quote.
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/buf";
+import "../adapter/stmt";
+
+// Maps a wire type to its SQL column affinity.
+//   ty  an RC_T_* wire type
+// Returns "INTEGER" (I64, BOOL, TIME, U64), "REAL" (F64), "TEXT" or "BLOB", a
+// static string. RC_T_UNSUPPORTED, and any wire type a later phase adds
+// without teaching this table about it, returns ""; callers treat that as a
+// refusal rather than emitting a column with no type.
+export fn rc_migration_affinity(ty: int32) -> string {
+  if (ty == RC_T_I64 || ty == RC_T_BOOL || ty == RC_T_TIME || ty == RC_T_U64) {
+    return "INTEGER";
+  }
+  if (ty == RC_T_F64) { return "REAL"; }
+  if (ty == RC_T_TEXT) { return "TEXT"; }
+  if (ty == RC_T_BLOB) { return "BLOB"; }
+  return "";
+}
+
+// Appends `CREATE TABLE IF NOT EXISTS "<table>" (...)` for `m` to `b`. Lower
+// level than rc_migration_create, which builds and runs it.
+//   m  the model's meta
+//   b  the caller's buffer; appended to, not cleared
+// Returns RC_OK, or:
+//   RC_ERR_USAGE        b is 0, or rc_meta_check finds m malformed
+//   RC_ERR_UNSUPPORTED  rc_meta_check refuses m (over RC_MAX_FIELDS fields,
+//                       or a field type the wire cannot carry, e.g. a slice),
+//                       or a field has no affinity
+//   RC_ERR_NOMEM        the buffer could not grow; b may hold a partial
+//                       statement
+// The meta and affinity refusals happen before a single byte is written, so
+// they never leave a half-built statement in the caller's buffer.
+//
+// Column spelling, in this order: quoted column, one space, affinity, then
+// ` PRIMARY KEY` (only on meta.pk), then ` NOT NULL` (when RC_F_NOT_NULL and
+// not already implied by PRIMARY KEY), then ` UNIQUE`.
+//
+// RC_F_AUTO adds no keyword: `INTEGER PRIMARY KEY` is the whole story. The
+// store assigns the rowid, so emitting AUTOINCREMENT would create a second
+// sequence that the ledger, the model and the store would then have to agree
+// about — and there is nothing to agree with.
+export fn rc_migration_create_table(m: RcMeta, b: RcBuf*) -> int32 {
+  if (b == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (rc_migration_affinity(m.fields[i].ty).length == (uint64)0) {
+      return RC_ERR_UNSUPPORTED;
+    }
+    i = i + 1;
+  }
+
+  rc = rc_buf_put(b, "CREATE TABLE IF NOT EXISTS ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_ident(b, m.table);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(b, " (");
+  if (rc != RC_OK) { return rc; }
+
+  i = 0;
+  while (i < m.n_fields) {
+    var f: RcField = m.fields[i];
+    if (i > 0) {
+      rc = rc_buf_put(b, ", ");
+      if (rc != RC_OK) { return rc; }
+    }
+    rc = rc_buf_ident(b, f.column);
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_put(b, " ");
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_put(b, rc_migration_affinity(f.ty));
+    if (rc != RC_OK) { return rc; }
+
+    var is_pk: bool = false;
+    if (i == m.pk) {
+      is_pk = true;
+      rc = rc_buf_put(b, " PRIMARY KEY");
+      if (rc != RC_OK) { return rc; }
+    }
+    // NOT NULL comes before UNIQUE: `"email" TEXT NOT NULL UNIQUE`.
+    if ((f.flags & RC_F_NOT_NULL) != 0 && !is_pk) {
+      rc = rc_buf_put(b, " NOT NULL");
+      if (rc != RC_OK) { return rc; }
+    }
+    if ((f.flags & RC_F_UNIQUE) != 0) {
+      rc = rc_buf_put(b, " UNIQUE");
+      if (rc != RC_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  return rc_buf_put(b, ")");
+}
+
+// Builds the same CREATE TABLE IF NOT EXISTS as an RcStmt, for adapters with
+// a `query` slot (MeoDB). Lower level than rc_migration_create.
+//   m    the model's meta; its names are borrowed by the statement
+//   out  receives the statement; overwritten, not freed
+// Returns RC_OK, or RC_ERR_USAGE (out is 0, or m malformed), RC_ERR_UNSUPPORTED
+// (too many fields, or a field type the wire or DDL cannot carry), or
+// RC_ERR_NOMEM. Unless out is 0, free *out with rc_stmt_free whatever the
+// result. RC_F_AUTO and other flags beyond PK / NOT NULL / UNIQUE are dropped.
+export fn rc_migration_create_stmt(m: RcMeta, out: RcStmt*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  *out = rc_stmt_new(RC_OP_CREATE, m.table);
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+  out->if_not_exists = true;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var f: RcField = m.fields[i];
+    if (rc_migration_affinity(f.ty).length == (uint64)0) { return RC_ERR_UNSUPPORTED; }
+    var keep: int32 = RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE;
+    rc = rc_stmt_col(out, f.column, f.ty, f.flags & keep);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}

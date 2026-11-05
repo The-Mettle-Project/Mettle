@@ -1,0 +1,64 @@
+// raize_telemetry/value: measurement and metadata values.
+//
+// A TmKV array is owned by the caller (usually on its stack) and borrowed by
+// tm_execute for the call only. Keys and string values are views: a handler
+// that keeps one must copy it.
+
+export const TM_INT = 0;
+export const TM_F64 = 1;
+export const TM_BOOL = 2;
+export const TM_STR = 3;
+
+// A plain struct, not a tagged enum: indirect calls with a tagged enum passed
+// by value hit a codegen ICE (raize reports/016). `i` also holds bool (0/1).
+export struct TmValue {
+  kind: int32;
+  i: int64;
+  f: float64;
+  s: string;
+}
+
+export struct TmKV {
+  key: string;
+  val: TmValue;
+}
+
+export fn tm_int(key: string, v: int64) -> TmKV {
+  var kv: TmKV;
+  kv.key = key;
+  kv.val.kind = TM_INT;
+  kv.val.i = v;
+  return kv;
+}
+
+export fn tm_f64(key: string, v: float64) -> TmKV {
+  var kv: TmKV;
+  kv.key = key;
+  kv.val.kind = TM_F64;
+  kv.val.f = v;
+  return kv;
+}
+
+export fn tm_bool(key: string, v: bool) -> TmKV {
+  var kv: TmKV;
+  kv.key = key;
+  kv.val.kind = TM_BOOL;
+  if (v) { kv.val.i = 1; }
+  return kv;
+}
+
+export fn tm_str(key: string, v: string) -> TmKV {
+  var kv: TmKV;
+  kv.key = key;
+  kv.val.kind = TM_STR;
+  kv.val.s = v;
+  return kv;
+}
+
+// The first entry with this key, or 0 if there is none. Linear scan.
+export fn tm_kv_find(kvs: TmKV*, n: int32, key: string) -> TmKV* {
+  for i in 0..n {
+    if (kvs[i].key == key) { return &kvs[i]; }
+  }
+  return (TmKV*)0;
+}

@@ -1,0 +1,263 @@
+// TLS 1.2 client: ECDHE key exchange with AEAD suites only, the extended
+// master secret, and ticket resumption (RFC 5077).
+
+import "std/mem";
+import "cryptex/core/util";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+import "mtls/crypto/kx";
+import "mtls/crypto/sig";
+import "mtls/tls/consts";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+import "mtls/tls/hello";
+import "mtls/tls/peer";
+import "mtls/tls/session";
+import "mtls/tls/tls12";
+
+export fn mtls12_client_on_sh(c: MtlsConn*, sh: MtlsSH*, msg: uint8*, n: int64) -> int32 {
+  var cfg: MtlsConfig* = c->cfg;
+  c->version = MTLS_TLS12;
+  var s: MtlsSuite;
+  if (!mtls_config_has_suite(cfg, sh->suite) || !mtls_suite_get(sh->suite, &s) || s.v13 || sh->comp != 0) {
+    return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER);
+  }
+  if (sh->bad_ext >= 0 || sh->has_ks || sh->psk_sel >= 0 || sh->has_cookie) {
+    return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNSUPPORTED_EXTENSION);
+  }
+  if (sh->has_ticket && !cfg->tickets) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNSUPPORTED_EXTENSION); }
+  if (sh->has_reneg && sh->reneg_len != 0) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_HANDSHAKE_FAILURE); }
+  if (!sh->ems && !cfg->allow_no_ems) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_HANDSHAKE_FAILURE); }
+  c->ems = sh->ems;
+  if (sh->has_alpn) {
+    var name: MtlsRd = mtls_rd_vec8(&sh->alpn);
+    if (!mtls_rd_ok_end(&sh->alpn) || name.n == 0) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+    var ok: bool = false;
+    for i in 0..cfg->nalpn {
+      if (mtls_str_eq_bytes(cfg->alpn[i], name.p, name.n)) { ok = true; }
+    }
+    if (!ok) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER); }
+    memcpy(&c->alpn[0], name.p, name.n);
+    c->alpnlen = (int32)name.n;
+  }
+  c->suite = s;
+  memcpy(&c->srand[0], &sh->random[0], 32);
+  c->keep_raw = true;
+  mtls_th_start(c, s.hash);
+  mtls_th_add(c, msg, n);
+  c->ticket12_expected = sh->has_ticket;
+  // Resumption: the server echoes the session id we sent with the ticket.
+  var resumed: bool = c->sess.valid && c->sess.version == MTLS_TLS12 && c->sidlen > 0 &&
+    mtls_bytes_eq(sh->sid.p, sh->sid.n, &c->sid[0], (int64)c->sidlen);
+  if (resumed) {
+    if (c->sess.suite != s.id || c->sess.ems != c->ems) {
+      return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER);
+    }
+    c->resumed = true;
+    memcpy(&c->ms12[0], &c->sess.secret[0], 48);
+    mtls12_key_block(c);
+    if (c->ticket12_expected) {
+      c->state = MTLS_ST_C12_WAIT_TICKET;
+    } else {
+      c->state = MTLS_ST_C12_WAIT_CCS;
+    }
+    return MTLS_OK;
+  }
+  c->state = MTLS_ST_C12_WAIT_CERT;
+  return MTLS_OK;
+}
+
+fn mtls12_client_on_cert(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  var r: MtlsRd = mtls_rd(msg + 4, n - 4);
+  var list: MtlsRd = mtls_rd_vec24(&r);
+  if (!mtls_rd_ok_end(&r)) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  if (!mtls_store_peer_chain(c, &list, false) || c->npchain == 0) {
+    return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR);
+  }
+  mtls_th_add(c, msg, n);
+  var rc: int32 = mtls_verify_peer(c);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, mtls_peer_alert(c)); }
+  if (!mtls12_auth_fits(c->suite.auth, c->peer_key.kind)) {
+    return mtls_fail(c, MTLS_E_CERT, MTLS_ALERT_UNSUPPORTED_CERTIFICATE);
+  }
+  c->state = MTLS_ST_C12_WAIT_SKE;
+  return MTLS_OK;
+}
+
+fn mtls12_client_on_ske(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  var r: MtlsRd = mtls_rd(msg + 4, n - 4);
+  var ctype: int32 = mtls_rd_u8(&r);
+  var group: int32 = mtls_rd_u16(&r);
+  var pub: MtlsRd = mtls_rd_vec8(&r);
+  var plen: int64 = r.pos;
+  var scheme: int32 = mtls_rd_u16(&r);
+  var sig: MtlsRd = mtls_rd_vec16(&r);
+  if (!mtls_rd_ok_end(&r)) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  if (ctype != 3 || !mtls_config_has_group(c->cfg, group)) {
+    return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER);
+  }
+  // Signed: client_random || server_random || params.
+  var signed: uint8[400];
+  memcpy(&signed[0], &c->crand[0], 32);
+  memcpy(&signed[32], &c->srand[0], 32);
+  memcpy(&signed[64], msg + 4, plen);
+  var rc: int32 = mtls12_verify(c, scheme, &signed[0], 64 + plen, sig.p, sig.n);
+  if (rc != MTLS_OK) { return rc; }
+  c->group = group;
+  rc = mtls_kx_new(&c->kx, group);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+  rc = mtls_kx_shared(&c->kx, pub.p, pub.n, &c->pms[0], &c->pmslen);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  mtls_th_add(c, msg, n);
+  c->state = MTLS_ST_C12_WAIT_SHD;
+  return MTLS_OK;
+}
+
+fn mtls12_client_on_cr(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  var r: MtlsRd = mtls_rd(msg + 4, n - 4);
+  var types: MtlsRd = mtls_rd_vec8(&r);
+  if (types.bad || !mtls_read_sig_list(c, &r)) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  var cas: MtlsRd = mtls_rd_vec16(&r);
+  if (cas.bad || !mtls_rd_ok_end(&r)) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  if (c->cert_requested) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+  c->cert_requested = true;
+  mtls_th_add(c, msg, n);
+  return MTLS_OK;
+}
+
+// After ServerHelloDone: our Certificate, ClientKeyExchange,
+// CertificateVerify, ChangeCipherSpec and Finished.
+fn mtls12_client_flight(c: MtlsConn*) -> int32 {
+  var rc: int32 = MTLS_OK;
+  var scheme: int32 = 0;
+  if (c->cert_requested) {
+    if (c->cfg->has_key) { scheme = mtls_pick_sig(c, &c->cfg->key, false); }
+    rc = mtls12_send_cert(c, scheme != 0);
+    if (rc != MTLS_OK) { return rc; }
+  }
+  var w: MtlsWr = mtls_hs_begin(c, MTLS_HS_CLIENT_KEY_EXCHANGE);
+  var m: int64 = mtls_wr_open8(&w);
+  mtls_wr_bytes(&w, &c->kx.pk[0], (int64)c->kx.pklen);
+  mtls_wr_close8(&w, m);
+  rc = mtls_hs_end(c, &w);
+  if (rc != MTLS_OK) { return rc; }
+  mtls_kx_wipe(&c->kx);
+  mtls12_master(c);
+  if (scheme != 0) {
+    // TLS 1.2 CertificateVerify signs every handshake message so far.
+    var sig: uint8[1024];
+    var slen: int64 = 0;
+    rc = mtls_sign(&c->cfg->key, scheme, c->pend, c->pendlen, &sig[0], 1024, &slen);
+    if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+    w = mtls_hs_begin(c, MTLS_HS_CERTIFICATE_VERIFY);
+    mtls_wr_u16(&w, (int64)scheme);
+    m = mtls_wr_open16(&w);
+    mtls_wr_bytes(&w, &sig[0], slen);
+    mtls_wr_close16(&w, m);
+    rc = mtls_hs_end(c, &w);
+    if (rc != MTLS_OK) { return rc; }
+  }
+  mtls12_key_block(c);
+  rc = mtls_send_ccs(c);
+  if (rc != MTLS_OK) { return rc; }
+  rc = mtls12_set_dir(c, &c->wr, true);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+  rc = mtls12_send_finished(c);
+  if (rc != MTLS_OK) { return rc; }
+  if (c->ticket12_expected) {
+    c->state = MTLS_ST_C12_WAIT_TICKET;
+  } else {
+    c->state = MTLS_ST_C12_WAIT_CCS;
+  }
+  return MTLS_OK;
+}
+
+fn mtls12_client_on_ticket(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  var r: MtlsRd = mtls_rd(msg + 4, n - 4);
+  var lifetime: int64 = mtls_rd_u32(&r);
+  var ticket: MtlsRd = mtls_rd_vec16(&r);
+  if (!mtls_rd_ok_end(&r)) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  mtls_th_add(c, msg, n);
+  c->state = MTLS_ST_C12_WAIT_CCS;
+  if (c->cfg->cache == 0 || ticket.n == 0 || ticket.n > 1024) { return MTLS_OK; }
+  var s: MtlsSession;
+  memset(&s, 0, (int64)sizeof(MtlsSession));
+  s.version = MTLS_TLS12;
+  s.suite = c->suite.id;
+  memcpy(&s.secret[0], &c->ms12[0], 48);
+  s.secretlen = 48;
+  memcpy(&s.ticket[0], ticket.p, ticket.n);
+  s.ticketlen = (int32)ticket.n;
+  s.issued = mtls_now(c);
+  if (lifetime == 0 || lifetime > 86400) { lifetime = 86400; }
+  s.lifetime = (int32)lifetime;
+  s.ems = c->ems;
+  memcpy(&s.host[0], &c->host[0], (int64)c->hostlen);
+  s.hostlen = c->hostlen;
+  s.valid = true;
+  mtls_cache_put((MtlsSessionCache*)c->cfg->cache, &s);
+  cr_wipe((uint8*)&s, (int64)sizeof(MtlsSession));
+  return MTLS_OK;
+}
+
+export fn mtls12_client_on_ccs(c: MtlsConn*) -> int32 {
+  if (c->state != MTLS_ST_C12_WAIT_CCS) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+  var rc: int32 = mtls12_set_dir(c, &c->rd, false);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+  c->state = MTLS_ST_C12_WAIT_FIN;
+  return MTLS_OK;
+}
+
+fn mtls12_client_on_fin(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  var rc: int32 = mtls12_check_finished(c, msg, n);
+  if (rc != MTLS_OK) { return rc; }
+  if (c->resumed) {
+    rc = mtls_send_ccs(c);
+    if (rc != MTLS_OK) { return rc; }
+    rc = mtls12_set_dir(c, &c->wr, true);
+    if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+    rc = mtls12_send_finished(c);
+    if (rc != MTLS_OK) { return rc; }
+  }
+  cr_wipe(&c->kb[0], 128);
+  c->state = MTLS_ST_CONNECTED;
+  c->hs_done = true;
+  // The raw transcript is no longer needed.
+  if (c->pend != 0) {
+    cr_wipe(c->pend, c->pendcap);
+    free(c->pend);
+    c->pend = (uint8*)0;
+    c->pendlen = 0;
+    c->pendcap = 0;
+  }
+  c->keep_raw = false;
+  return MTLS_OK;
+}
+
+export fn mtls12_client_on_msg(c: MtlsConn*, t: int32, msg: uint8*, n: int64) -> int32 {
+  switch (c->state) {
+    case 10: {
+      if (t == MTLS_HS_CERTIFICATE) { return mtls12_client_on_cert(c, msg, n); }
+    }
+    case 11: {
+      if (t == MTLS_HS_SERVER_KEY_EXCHANGE) { return mtls12_client_on_ske(c, msg, n); }
+    }
+    case 12: {
+      if (t == MTLS_HS_CERTIFICATE_REQUEST) { return mtls12_client_on_cr(c, msg, n); }
+      if (t == MTLS_HS_SERVER_HELLO_DONE) {
+        if (n != 4) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+        mtls_th_add(c, msg, n);
+        return mtls12_client_flight(c);
+      }
+    }
+    case 15: {
+      if (t == MTLS_HS_NEW_SESSION_TICKET) { return mtls12_client_on_ticket(c, msg, n); }
+    }
+    case 14: {
+      if (t == MTLS_HS_FINISHED) { return mtls12_client_on_fin(c, msg, n); }
+    }
+    default: { }
+  }
+  return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE);
+}

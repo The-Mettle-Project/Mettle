@@ -1,0 +1,470 @@
+// AudioStream: one way to read every format audio decodes.
+//
+//   var s: AudioStream;
+//   audio_stream_open_file(&s, "music.ogg");
+//   var got: int64 = audio_stream_read(&s, buf, 1024);   // float frames
+//   audio_stream_seek(&s, 44100 * 10);
+//   audio_stream_close(&s);
+//
+// The format is found from the data (not the file name): WAV (RIFF, RF64),
+// FLAC, Ogg Vorbis, Ogg Opus and MP3 (MPEG audio, with or without tags).
+//
+// For whole sounds, audio_load and audio_load_file give an AudioPcm: in
+// the file's own integer format for WAV and FLAC (lossless), in float for
+// the others.
+//
+// Each decoder follows the same contract: open(d, data, size) reads the
+// headers into d.info; next(d) decodes one block into d.out (float) or
+// d.outi (full-scale int32) with d.out_frames frames, or returns AUDIO_END;
+// seek(d, frame) makes the next block start at that frame, exactly;
+// close(d) frees it.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../core/bits";
+import "../core/pcm";
+import "../core/file";
+import "../dsp/convert";
+import "../dsp/resample";
+import "../dsp/channels";
+import "wav";
+import "flac";
+import "mp3";
+import "ogg";
+import "vorbis";
+import "opus";
+
+export const AUDIO_FMT_NONE: int32 = 0;
+export const AUDIO_FMT_WAV: int32 = 1;
+export const AUDIO_FMT_FLAC: int32 = 2;
+export const AUDIO_FMT_VORBIS: int32 = 3;
+export const AUDIO_FMT_OPUS: int32 = 4;
+export const AUDIO_FMT_MP3: int32 = 5;
+
+export struct AudioStream {
+  info: AudioInfo;
+  kind: int32;          // AUDIO_FMT_*
+  dec: rawptr;          // the decoder
+  own: AudioBuf;        // the file bytes, when the stream read the file
+  pos: int64;           // frames handed out
+  blk: float32*;        // the current block, as float
+  blk_n: int32;         // frames in blk
+  blk_at: int32;        // frames of blk already handed out
+  blk_cap: int64;       // floats blk holds
+}
+
+/// Finds the format of a block of data (AUDIO_FMT_*).
+export fn audio_probe(p: uint8*, n: int64) -> int32 {
+  if (p == 0 || n < 4) { return AUDIO_FMT_NONE; }
+  if (n >= 12 && (audio_bytes_is(p, 4, "RIFF") || audio_bytes_is(p, 4, "RF64") || audio_bytes_is(p, 4, "BW64")) && audio_bytes_is(p + 8, 4, "WAVE")) {
+    return AUDIO_FMT_WAV;
+  }
+  var at: int64 = 0;
+  // ID3v2 tags may sit in front of FLAC and MP3
+  while (n - at >= 10 && audio_bytes_is(p + at, 3, "ID3")) {
+    var q: uint8* = p + at;
+    var sz: int64 = ((int64)(q[6] & 127) << 21) | ((int64)(q[7] & 127) << 14) | ((int64)(q[8] & 127) << 7) | (int64)(q[9] & 127);
+    at = at + 10 + sz;
+    if ((q[5] & 0x10) != 0) { at = at + 10; }
+  }
+  if (n - at >= 4 && audio_bytes_is(p + at, 4, "fLaC")) { return AUDIO_FMT_FLAC; }
+  if (audio_bytes_is(p, 4, "OggS")) {
+    var o: AudioOgg;
+    audio_ogg_init(&o, p, n);
+    var pk: AudioOggPacket;
+    var kind: int32 = AUDIO_FMT_NONE;
+    if (audio_ogg_packet(&o, &pk) == AUDIO_OK) {
+      if (pk.len >= 7 && pk.data[0] == 1 && audio_bytes_is(pk.data + 1, 6, "vorbis")) { kind = AUDIO_FMT_VORBIS; }
+      if (pk.len >= 8 && audio_bytes_is(pk.data, 8, "OpusHead")) { kind = AUDIO_FMT_OPUS; }
+    }
+    audio_ogg_free(&o);
+    return kind;
+  }
+  // MPEG audio: a frame sync where the data starts (after tags)
+  if (n - at >= 4) {
+    var q: uint8* = p + at;
+    if (q[0] == 0xFF && (q[1] & 0xE0) == 0xE0 && ((q[1] >> 1) & 3) != 0 && (q[2] >> 4) != 15 && ((q[2] >> 2) & 3) != 3) {
+      return AUDIO_FMT_MP3;
+    }
+  }
+  if (at > 0) { return AUDIO_FMT_MP3; }   // tags and then something: let the MP3 reader search
+  return AUDIO_FMT_NONE;
+}
+
+fn st_close_dec(s: AudioStream*) {
+  if (s->dec == 0) { return; }
+  switch (s->kind) {
+    case 1: { audio_wav_close((AudioWav*)s->dec); }
+    case 2: { audio_flac_close((AudioFlac*)s->dec); }
+    case 3: { audio_vorbis_close((AudioVorbis*)s->dec); }
+    case 4: { audio_opus_close((AudioOpus*)s->dec); }
+    case 5: { audio_mp3_close((AudioMp3*)s->dec); }
+    default: { }
+  }
+  free(s->dec);
+  s->dec = (rawptr)0;
+}
+
+/// Opens a stream over data in memory (which must outlive the stream).
+export fn audio_stream_open(s: AudioStream*, p: uint8*, n: int64) -> int32 {
+  memset(s, 0, sizeof(AudioStream));
+  return st_open(s, p, n);
+}
+
+fn st_open(s: AudioStream*, p: uint8*, n: int64) -> int32 {
+  var kind: int32 = audio_probe(p, n);
+  if (kind == AUDIO_FMT_NONE) { return AUDIO_E_FORMAT; }
+  s->kind = kind;
+  var rc: int32 = AUDIO_E_FORMAT;
+  if (kind == AUDIO_FMT_WAV) {
+    var d: AudioWav* = (AudioWav*)calloc(1, sizeof(AudioWav));
+    if (d == 0) { return AUDIO_E_MEM; }
+    s->dec = (rawptr)d;
+    rc = audio_wav_open(d, p, n);
+    s->info = d->info;
+  } else if (kind == AUDIO_FMT_FLAC) {
+    var d: AudioFlac* = (AudioFlac*)calloc(1, sizeof(AudioFlac));
+    if (d == 0) { return AUDIO_E_MEM; }
+    s->dec = (rawptr)d;
+    rc = audio_flac_open(d, p, n);
+    s->info = d->info;
+  } else if (kind == AUDIO_FMT_VORBIS) {
+    var d: AudioVorbis* = (AudioVorbis*)calloc(1, sizeof(AudioVorbis));
+    if (d == 0) { return AUDIO_E_MEM; }
+    s->dec = (rawptr)d;
+    rc = audio_vorbis_open(d, p, n);
+    s->info = d->info;
+  } else if (kind == AUDIO_FMT_OPUS) {
+    var d: AudioOpus* = (AudioOpus*)calloc(1, sizeof(AudioOpus));
+    if (d == 0) { return AUDIO_E_MEM; }
+    s->dec = (rawptr)d;
+    rc = audio_opus_open(d, p, n);
+    s->info = d->info;
+  } else {
+    var d: AudioMp3* = (AudioMp3*)calloc(1, sizeof(AudioMp3));
+    if (d == 0) { return AUDIO_E_MEM; }
+    s->dec = (rawptr)d;
+    rc = audio_mp3_open(d, p, n);
+    s->info = d->info;
+  }
+  if (rc != AUDIO_OK) { st_close_dec(s); return rc; }
+  if (s->info.channels < 1 || s->info.channels > AUDIO_MAX_CHANNELS) { st_close_dec(s); return AUDIO_E_UNSUPPORTED; }
+  return AUDIO_OK;
+}
+
+/// Reads a whole file and opens a stream over it. The stream keeps the
+/// bytes and frees them on close.
+export fn audio_stream_open_file(s: AudioStream*, path: string) -> int32 {
+  memset(s, 0, sizeof(AudioStream));
+  var rc: int32 = audio_file_read(path, &s->own);
+  if (rc != AUDIO_OK) { audio_buf_free(&s->own); return rc; }
+  rc = st_open(s, s->own.data, s->own.len);
+  if (rc != AUDIO_OK) { audio_buf_free(&s->own); }
+  return rc;
+}
+
+export fn audio_stream_close(s: AudioStream*) {
+  st_close_dec(s);
+  audio_buf_free(&s->own);
+  if (s->blk != 0) { free(s->blk); }
+  s->blk = (float32*)0;
+}
+
+// Decodes the next block into s->blk. AUDIO_END at the end.
+fn st_next(s: AudioStream*) -> int32 {
+  var rc: int32 = AUDIO_END;
+  var f: float32* = (float32*)0;
+  var iv: int32* = (int32*)0;
+  var n: int32 = 0;
+  switch (s->kind) {
+    case 1: {
+      var d: AudioWav* = (AudioWav*)s->dec;
+      rc = audio_wav_next(d);
+      f = d->out; iv = d->outi; n = d->out_frames;
+    }
+    case 2: {
+      var d: AudioFlac* = (AudioFlac*)s->dec;
+      rc = audio_flac_next(d);
+      iv = d->outi; n = d->out_frames;
+    }
+    case 3: {
+      var d: AudioVorbis* = (AudioVorbis*)s->dec;
+      rc = audio_vorbis_next(d);
+      f = d->out; n = d->out_frames;
+    }
+    case 4: {
+      var d: AudioOpus* = (AudioOpus*)s->dec;
+      rc = audio_opus_next(d);
+      f = d->out; n = d->out_frames;
+    }
+    case 5: {
+      var d: AudioMp3* = (AudioMp3*)s->dec;
+      rc = audio_mp3_next(d);
+      f = d->out; n = d->out_frames;
+    }
+    default: { }
+  }
+  s->blk_n = 0;
+  s->blk_at = 0;
+  if (rc != AUDIO_OK) { return rc; }
+  if (n <= 0) { return AUDIO_OK; }
+  var ns: int64 = (int64)n * (int64)s->info.channels;
+  if (ns > s->blk_cap) {
+    if (s->blk != 0) { free(s->blk); }
+    s->blk = (float32*)malloc(ns * 4);
+    if (s->blk == 0) { s->blk_cap = 0; return AUDIO_E_MEM; }
+    s->blk_cap = ns;
+  }
+  if (f != 0) { memcpy(s->blk, f, ns * 4); }
+  else if (iv != 0) { audio_convert_samples((uint8*)iv, AUDIO_S32, (uint8*)s->blk, AUDIO_F32, ns); }
+  else { return AUDIO_E_DATA; }
+  s->blk_n = n;
+  return AUDIO_OK;
+}
+
+/// Reads up to `frames` interleaved float frames. Returns how many (0 at
+/// the end), or an error.
+export fn audio_stream_read(s: AudioStream*, out: float32*, frames: int64) -> int64 {
+  if (s->dec == 0) { return (int64)AUDIO_E_ARG; }
+  var ch: int64 = (int64)s->info.channels;
+  var got: int64 = 0;
+  var empty: int32 = 0;
+  while (got < frames) {
+    if (s->blk_at >= s->blk_n) {
+      var rc: int32 = st_next(s);
+      if (rc == AUDIO_END) { break; }
+      if (rc < 0) {
+        if (got > 0) { break; }
+        return (int64)rc;
+      }
+      if (s->blk_n == 0) {
+        empty = empty + 1;
+        if (empty > 1000) { break; }   // a stream of silent packets that never ends
+        continue;
+      }
+    }
+    var k: int64 = (int64)(s->blk_n - s->blk_at);
+    if (k > frames - got) { k = frames - got; }
+    memcpy(out + got * ch, s->blk + (int64)s->blk_at * ch, k * ch * 4);
+    s->blk_at = s->blk_at + (int32)k;
+    got = got + k;
+  }
+  s->pos = s->pos + got;
+  return got;
+}
+
+/// Moves to a frame; the next read starts there.
+export fn audio_stream_seek(s: AudioStream*, frame: int64) -> int32 {
+  if (s->dec == 0 || frame < 0) { return AUDIO_E_ARG; }
+  var rc: int32 = AUDIO_E_ARG;
+  switch (s->kind) {
+    case 1: { rc = audio_wav_seek((AudioWav*)s->dec, frame); }
+    case 2: { rc = audio_flac_seek((AudioFlac*)s->dec, frame); }
+    case 3: { rc = audio_vorbis_seek((AudioVorbis*)s->dec, frame); }
+    case 4: { rc = audio_opus_seek((AudioOpus*)s->dec, frame); }
+    case 5: { rc = audio_mp3_seek((AudioMp3*)s->dec, frame); }
+    default: { }
+  }
+  s->blk_n = 0;
+  s->blk_at = 0;
+  if (rc == AUDIO_OK) { s->pos = frame; }
+  return rc;
+}
+
+/// Frames read so far (or the frame last sought to).
+export fn audio_stream_tell(s: AudioStream*) -> int64 { return s->pos; }
+
+// ---- whole sounds ----
+
+/// Decodes a whole sound. WAV and FLAC keep their own sample format; the
+/// lossy formats give AUDIO_F32.
+export fn audio_load(p: uint8*, n: int64, pcm: AudioPcm*) -> int32 {
+  var kind: int32 = audio_probe(p, n);
+  if (kind == AUDIO_FMT_WAV) { return audio_wav_decode(p, n, pcm); }
+  if (kind == AUDIO_FMT_FLAC) { return audio_flac_decode(p, n, pcm, false); }
+  var s: AudioStream;
+  var rc: int32 = audio_stream_open(&s, p, n);
+  if (rc != AUDIO_OK) { audio_stream_close(&s); return rc; }
+  defer audio_stream_close(&s);
+  var ch: int64 = (int64)s.info.channels;
+  var cap: int64 = s.info.frames;
+  if (cap < 0) { cap = 65536; }
+  // a lossy file is never longer than ~2000 frames per byte of input
+  if (cap > n * 2000 + 65536) { cap = n * 2000 + 65536; }
+  rc = audio_pcm_alloc(pcm, cap, s.info.channels, s.info.rate, AUDIO_F32);
+  if (rc != AUDIO_OK) { return rc; }
+  pcm->mask = s.info.mask;
+  var at: int64 = 0;
+  while (true) {
+    if (at == pcm->frames) {
+      var nc: int64 = pcm->frames * 2;
+      if (nc < 4096) { nc = 4096; }
+      var nd: uint8* = (uint8*)malloc(nc * ch * 4);
+      if (nd == 0) { return AUDIO_E_MEM; }
+      memcpy(nd, pcm->data, at * ch * 4);
+      free(pcm->data);
+      pcm->data = nd;
+      pcm->frames = nc;
+    }
+    var got: int64 = audio_stream_read(&s, (float32*)pcm->data + at * ch, pcm->frames - at);
+    if (got < 0) { rc = (int32)got; break; }
+    if (got == 0) { break; }
+    at = at + got;
+  }
+  pcm->frames = at;
+  return rc;
+}
+
+/// Reads and decodes a whole sound file.
+export fn audio_load_file(path: string, pcm: AudioPcm*) -> int32 {
+  var b: AudioBuf;
+  var rc: int32 = audio_file_read(path, &b);
+  if (rc == AUDIO_OK) { rc = audio_load(b.data, b.len, pcm); }
+  audio_buf_free(&b);
+  return rc;
+}
+
+/// Loads a sound ready for the mixer: float, `channels` channels (1 or 2)
+/// at `rate` Hz.
+export fn audio_load_for_mixer(path: string, rate: int32, channels: int32, pcm: AudioPcm*) -> int32 {
+  var raw: AudioPcm;
+  var rc: int32 = audio_load_file(path, &raw);
+  if (rc != AUDIO_OK) { return rc; }
+  var mixed: AudioPcm;
+  if (raw.channels != channels) {
+    rc = audio_pcm_channels(&raw, channels, &mixed);
+    audio_pcm_free(&raw);
+    if (rc != AUDIO_OK) { return rc; }
+  } else if (raw.fmt != AUDIO_F32) {
+    rc = audio_pcm_convert(&raw, AUDIO_F32, &mixed);
+    audio_pcm_free(&raw);
+    if (rc != AUDIO_OK) { return rc; }
+  } else {
+    mixed = raw;
+  }
+  if (mixed.rate == rate) { *pcm = mixed; return AUDIO_OK; }
+  rc = audio_pcm_resample(&mixed, rate, 5, pcm);
+  audio_pcm_free(&mixed);
+  return rc;
+}
+
+// ---- playing a stream through the mixer ----
+
+// AudioPlayer: a stream turned into the mixer's rate and channels, for
+// audio_mixer_play_stream. Decoding happens on the audio thread, a block
+// at a time, which suits the formats here (a block costs well under a
+// millisecond).
+export struct AudioPlayer {
+  s: AudioStream;
+  rs: AudioResampler;
+  resample: bool;
+  rate: int32;
+  ch: int32;
+  m: float32[64];       // channel matrix
+  src: float32*;        // decoded frames waiting
+  src_n: int64;
+  src_at: int64;
+  mixed: float32*;      // after the channel matrix
+  cap: int64;
+  looping: bool;
+  eof: bool;            // the stream has no more frames
+  done: bool;
+  in_total: int64;      // frames read from the stream
+  out_total: int64;     // frames handed to the mixer
+}
+
+/// Opens a file for streaming into a mixer of `rate` Hz and `channels`.
+export fn audio_player_open(pl: AudioPlayer*, path: string, rate: int32, channels: int32, looping: bool) -> int32 {
+  memset(pl, 0, sizeof(AudioPlayer));
+  var rc: int32 = audio_stream_open_file(&pl->s, path);
+  if (rc != AUDIO_OK) { return rc; }
+  pl->rate = rate;
+  pl->ch = channels;
+  pl->looping = looping;
+  rc = audio_channel_matrix(pl->s.info.channels, pl->s.info.mask, channels, 0, &pl->m[0]);
+  if (rc == AUDIO_OK && pl->s.info.rate != rate) {
+    rc = audio_resampler_init(&pl->rs, channels, pl->s.info.rate, rate, 4);
+    pl->resample = true;
+    if (rc == AUDIO_OK) { audio_resampler_skip_latency(&pl->rs); }
+  }
+  pl->cap = 1024;
+  pl->src = (float32*)malloc(pl->cap * 8 * 4);
+  pl->mixed = (float32*)malloc(pl->cap * 8 * 4);
+  if (pl->src == 0 || pl->mixed == 0) { rc = AUDIO_E_MEM; }
+  if (rc != AUDIO_OK) { audio_player_close(pl); }
+  return rc;
+}
+
+export fn audio_player_close(pl: AudioPlayer*) {
+  audio_stream_close(&pl->s);
+  if (pl->resample) { audio_resampler_free(&pl->rs); }
+  if (pl->src != 0) { free(pl->src); }
+  if (pl->mixed != 0) { free(pl->mixed); }
+  pl->src = (float32*)0;
+  pl->mixed = (float32*)0;
+}
+
+// Refills pl->mixed with decoded frames in the mixer's channels.
+fn pl_refill(pl: AudioPlayer*) -> bool {
+  var got: int64 = audio_stream_read(&pl->s, pl->src, pl->cap);
+  if (got <= 0 && pl->looping) {
+    audio_stream_seek(&pl->s, 0);
+    if (audio_stream_tell(&pl->s) != 0) { return false; }
+    got = audio_stream_read(&pl->s, pl->src, pl->cap);
+  }
+  if (got <= 0) { return false; }
+  audio_mix_channels(pl->src, pl->s.info.channels, pl->mixed, pl->ch, got, &pl->m[0]);
+  pl->in_total = pl->in_total + got;
+  pl->src_n = got;
+  pl->src_at = 0;
+  return true;
+}
+
+/// The fill function for audio_mixer_play_stream (user = the AudioPlayer).
+export fn audio_player_fill(user: rawptr, out: float32*, frames: int32, ch: int32) -> int32 {
+  var pl: AudioPlayer* = (AudioPlayer*)user;
+  if (pl->done || ch != pl->ch) { return 0; }
+  var c: int64 = (int64)ch;
+  var made: int64 = 0;
+  var guard: int32 = 0;
+  while (made < (int64)frames && guard < 256) {
+    guard = guard + 1;
+    if (pl->src_at >= pl->src_n && !pl->eof) {
+      if (!pl_refill(pl)) { pl->eof = true; }
+    }
+    if (pl->eof) {
+      if (!pl->resample) { pl->done = true; break; }
+      // the frames still inside the resampler, then its tail, up to the
+      // exact length in time
+      var want: int64 = (pl->in_total * (int64)pl->rate + (int64)pl->s.info.rate - 1) / (int64)pl->s.info.rate;
+      var left: int64 = want - pl->out_total;
+      if (left <= 0) { pl->done = true; break; }
+      var room: int64 = (int64)frames - made;
+      if (room > left) { room = left; }
+      var z: int64 = (int64)pl->rs.filt;
+      if (z > pl->cap) { z = pl->cap; }
+      for i in 0..z * c { pl->mixed[i] = 0.0; }
+      var used: int64 = 0;
+      var k: int64 = audio_resample(&pl->rs, pl->mixed, z, &used, out + made * c, room);
+      made = made + k;
+      pl->out_total = pl->out_total + k;
+      continue;
+    }
+    var k: int64 = 0;
+    if (pl->resample) {
+      var used: int64 = 0;
+      k = audio_resample(&pl->rs, pl->mixed + pl->src_at * c, pl->src_n - pl->src_at, &used,
+        out + made * c, (int64)frames - made);
+      pl->src_at = pl->src_at + used;
+    } else {
+      k = pl->src_n - pl->src_at;
+      if (k > (int64)frames - made) { k = (int64)frames - made; }
+      memcpy(out + made * c, pl->mixed + pl->src_at * c, k * c * 4);
+      pl->src_at = pl->src_at + k;
+    }
+    made = made + k;
+    pl->out_total = pl->out_total + k;
+  }
+  return (int32)made;
+}

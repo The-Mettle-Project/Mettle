@@ -1,0 +1,83 @@
+// The record ciphers: AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305.
+// Each record uses a fresh 12-byte nonce built from the static IV and the
+// record number (RFC 8446 5.3), so a key/nonce pair is never reused.
+
+import "std/mem";
+import "cryptex/core/types";
+import "cryptex/core/status";
+import "cryptex/core/util";
+import "cryptex/cipher/aead";
+import "cryptex/cipher/gcm";
+import "mtls/core/err";
+
+export const MTLS_AEAD_AES128GCM: int32 = 1;
+export const MTLS_AEAD_AES256GCM: int32 = 2;
+export const MTLS_AEAD_CHACHA20: int32 = 3;
+
+export const MTLS_TAG_LEN: int64 = 16;
+
+export fn mtls_aead_key_len(alg: int32) -> int32 {
+  if (alg == MTLS_AEAD_AES128GCM) { return 16; }
+  return 32;
+}
+
+/// mtls_aead_supported: whether this build can run the cipher.
+export fn mtls_aead_supported(alg: int32) -> bool {
+  return alg == MTLS_AEAD_CHACHA20 || alg == MTLS_AEAD_AES128GCM || alg == MTLS_AEAD_AES256GCM;
+}
+
+/// MtlsAeadKey: a record key, expanded once (AES) and used for many records.
+export struct MtlsAeadKey {
+  alg: int32;
+  key: CrKey32;
+  gcm: CrAesGcm;
+}
+
+export fn mtls_aead_init(k: MtlsAeadKey*, alg: int32, key: uint8*) -> int32 {
+  mtls_aead_wipe(k);
+  k->alg = alg;
+  if (alg == MTLS_AEAD_CHACHA20) {
+    memcpy(&k->key.b[0], key, 32);
+    return MTLS_OK;
+  }
+  if (alg != MTLS_AEAD_AES128GCM && alg != MTLS_AEAD_AES256GCM) { return MTLS_E_UNSUPPORTED; }
+  if (cr_aes_gcm_init(&k->gcm, key, (int64)mtls_aead_key_len(alg)) != CR_OK) { return MTLS_E_CRYPTO; }
+  return MTLS_OK;
+}
+
+export fn mtls_aead_wipe(k: MtlsAeadKey*) {
+  cr_wipe((uint8*)k, (int64)sizeof(MtlsAeadKey));
+}
+
+/// mtls_aead_seal: writes ptlen + 16 bytes (ciphertext then tag) to out.
+/// out may equal pt.
+export fn mtls_aead_seal(k: MtlsAeadKey*, nonce: uint8*, ad: uint8*, adlen: int64, pt: uint8*, ptlen: int64, out: uint8*) -> int32 {
+  var nn: CrNonce12;
+  memcpy(&nn.b[0], nonce, 12);
+  var olen: int64 = 0;
+  var rc: int32 = CR_E_ARG;
+  if (k->alg == MTLS_AEAD_CHACHA20) {
+    rc = cr_chacha20poly1305_encrypt(out, ptlen + 16, &olen, pt, ptlen, ad, adlen, &nn, &k->key);
+  } else if (k->alg == MTLS_AEAD_AES128GCM || k->alg == MTLS_AEAD_AES256GCM) {
+    rc = cr_aes_gcm_encrypt(&k->gcm, out, ptlen + 16, &olen, pt, ptlen, ad, adlen, &nn);
+  }
+  if (rc != CR_OK) { return MTLS_E_CRYPTO; }
+  return MTLS_OK;
+}
+
+/// mtls_aead_open: checks the tag and writes ctlen - 16 bytes to out.
+/// Fails with MTLS_E_VERIFY on a bad tag; out may equal ct.
+export fn mtls_aead_open(k: MtlsAeadKey*, nonce: uint8*, ad: uint8*, adlen: int64, ct: uint8*, ctlen: int64, out: uint8*) -> int32 {
+  if (ctlen < 16) { return MTLS_E_VERIFY; }
+  var nn: CrNonce12;
+  memcpy(&nn.b[0], nonce, 12);
+  var olen: int64 = 0;
+  var rc: int32 = CR_E_ARG;
+  if (k->alg == MTLS_AEAD_CHACHA20) {
+    rc = cr_chacha20poly1305_decrypt(out, ctlen - 16, &olen, ct, ctlen, ad, adlen, &nn, &k->key);
+  } else if (k->alg == MTLS_AEAD_AES128GCM || k->alg == MTLS_AEAD_AES256GCM) {
+    rc = cr_aes_gcm_decrypt(&k->gcm, out, ctlen - 16, &olen, ct, ctlen, ad, adlen, &nn);
+  }
+  if (rc != CR_OK) { return MTLS_E_VERIFY; }
+  return MTLS_OK;
+}

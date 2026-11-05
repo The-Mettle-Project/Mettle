@@ -1,0 +1,8 @@
+name = mythic
+version = 0.1.0
+description = Immediate-mode GUI library for Mettle on Windows and Linux
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/MythicUI
+compiler = 0.18.0
+platforms = linux windows
+require = glint 0.1.1

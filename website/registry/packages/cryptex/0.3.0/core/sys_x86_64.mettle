@@ -1,0 +1,13 @@
+/// internal: getrandom(2) system call number on Linux x86-64.
+export const CRX_SYS_GETRANDOM: int64 = 318;
+/// internal: mmap(2) system call number on Linux x86-64.
+export const CRX_SYS_MMAP: int64 = 9;
+/// internal: munmap(2) system call number on Linux x86-64.
+export const CRX_SYS_MUNMAP: int64 = 11;
+
+import "std/mem";
+
+/// internal: tells Mettle's memory-safety runtime about memory mapped outside the heap.
+export fn crx_region_begin(p: uint8*, n: int64) { memory_region(p, n); }
+/// internal: ends a region started with crx_region_begin.
+export fn crx_region_end(p: uint8*) { memory_region_end(p); }

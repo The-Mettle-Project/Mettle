@@ -1,0 +1,178 @@
+// Fixed-size value types. Sizes are part of the type, so a nonce cannot be
+// passed where a key is expected and no length can be mixed up. Each type is
+// one field, `b`, the raw bytes; address them as &v.b[0].
+//
+// Secret types (keys, seeds, shared points, secret keys) live wherever the
+// caller puts them. This library never copies them to the heap and never
+// keeps them; the caller must cr_wipe them when done.
+
+/// CrKey32: A 32-byte symmetric secret key: XChaCha20-Poly1305 keys and the session keys cr_kx_* derive.
+/// in: - (zeroed when declared: `var x: CrKey32;`)
+/// returns: -
+/// owns: secret: wipe with cr_wipe(&k.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var k: CrKey32; cr_aead_keygen(&k);
+export struct CrKey32 {
+  b: uint8[32];
+}
+
+/// CrNonce24: A 24-byte XChaCha20-Poly1305 nonce. Random nonces of this size are safe to generate per message.
+/// in: - (zeroed when declared: `var x: CrNonce24;`)
+/// returns: -
+/// owns: public: sent alongside the ciphertext
+/// thread: any thread (no shared state)
+/// example: var n: CrNonce24; cr_aead_nonce(&n);
+export struct CrNonce24 {
+  b: uint8[24];
+}
+
+/// CrNonce12: A 12-byte IETF ChaCha20-Poly1305 nonce (RFC 8439). Never reuse a key/nonce pair. Meant for protocols with counter nonces such as Noise; for random nonces use CrNonce24 and cr_aead_*.
+/// in: - (zeroed when declared: `var x: CrNonce12;`)
+/// returns: -
+/// owns: public: sent alongside the ciphertext, or implied by a message counter
+/// thread: any thread (no shared state)
+/// example: var n: CrNonce12; n.b[4] = 1; // Noise: 4 zero bytes || 64-bit LE counter
+export struct CrNonce12 {
+  b: uint8[12];
+}
+
+/// CrSha256: A SHA-256 digest.
+/// in: - (zeroed when declared: `var x: CrSha256;`)
+/// returns: -
+/// owns: public
+/// thread: any thread (no shared state)
+/// example: var d: CrSha256; cr_sha256(&d, msg, len);
+export struct CrSha256 {
+  b: uint8[32];
+}
+
+/// CrSha384: A SHA-384 digest.
+/// in: - (zeroed when declared: `var x: CrSha384;`)
+/// returns: -
+/// owns: public
+/// thread: any thread (no shared state)
+/// example: var d: CrSha384; cr_sha384(&d, msg, len);
+export struct CrSha384 {
+  b: uint8[48];
+}
+
+/// CrSha512: A SHA-512 digest.
+/// in: - (zeroed when declared: `var x: CrSha512;`)
+/// returns: -
+/// owns: public
+/// thread: any thread (no shared state)
+/// example: var d: CrSha512; cr_sha512(&d, msg, len);
+export struct CrSha512 {
+  b: uint8[64];
+}
+
+/// CrHmacSha256: An HMAC-SHA256 tag.
+/// in: - (zeroed when declared: `var x: CrHmacSha256;`)
+/// returns: -
+/// owns: public, but compare it only with cr_hmac_sha256_verify or cr_equal
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha256; cr_hmac_sha256(&t, key, klen, msg, mlen);
+export struct CrHmacSha256 {
+  b: uint8[32];
+}
+
+/// CrHmacSha384: An HMAC-SHA384 tag.
+/// in: - (zeroed when declared: `var x: CrHmacSha384;`)
+/// returns: -
+/// owns: public, but compare it only with cr_hmac_sha384_verify or cr_equal
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha384; cr_hmac_sha384(&t, key, klen, msg, mlen);
+export struct CrHmacSha384 {
+  b: uint8[48];
+}
+
+/// CrHmacSha512: An HMAC-SHA512 tag.
+/// in: - (zeroed when declared: `var x: CrHmacSha512;`)
+/// returns: -
+/// owns: public, but compare it only with cr_hmac_sha512_verify or cr_equal
+/// thread: any thread (no shared state)
+/// example: var t: CrHmacSha512; cr_hmac_sha512(&t, key, klen, msg, mlen);
+export struct CrHmacSha512 {
+  b: uint8[64];
+}
+
+/// CrX25519Public: An X25519 (Curve25519 Diffie-Hellman) public key; also the key type of cr_kx_*.
+/// in: - (zeroed when declared: `var x: CrX25519Public;`)
+/// returns: -
+/// owns: public
+/// thread: any thread (no shared state)
+/// example: var pk: CrX25519Public; var sk: CrX25519Secret; cr_x25519_keypair(&pk, &sk);
+export struct CrX25519Public {
+  b: uint8[32];
+}
+
+/// CrX25519Secret: An X25519 secret scalar; also the key type of cr_kx_*.
+/// in: - (zeroed when declared: `var x: CrX25519Secret;`)
+/// returns: -
+/// owns: secret: wipe with cr_wipe(&sk.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var sk: CrX25519Secret; cr_x25519_keypair(&pk, &sk);
+export struct CrX25519Secret {
+  b: uint8[32];
+}
+
+/// CrX25519Shared: A raw X25519 shared point. Not a key: hash it (with both public keys) or use cr_kx_* session keys instead of using it directly.
+/// in: - (zeroed when declared: `var x: CrX25519Shared;`)
+/// returns: -
+/// owns: secret: wipe with cr_wipe(&s.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var s: CrX25519Shared; cr_x25519_shared(&s, &sk, &peer);
+export struct CrX25519Shared {
+  b: uint8[32];
+}
+
+/// CrEd25519Public: An Ed25519 public (verification) key.
+/// in: - (zeroed when declared: `var x: CrEd25519Public;`)
+/// returns: -
+/// owns: public
+/// thread: any thread (no shared state)
+/// example: var pk: CrEd25519Public; var sk: CrEd25519Secret; cr_ed25519_keypair(&pk, &sk);
+export struct CrEd25519Public {
+  b: uint8[32];
+}
+
+/// CrEd25519Secret: An Ed25519 secret key in the 64-byte layout: the 32-byte seed followed by the 32-byte public key (RFC 8032).
+/// in: - (zeroed when declared: `var x: CrEd25519Secret;`)
+/// returns: -
+/// owns: secret: wipe with cr_wipe(&sk.b[0], 64) when done
+/// thread: any thread (no shared state)
+/// example: var sk: CrEd25519Secret; cr_ed25519_keypair(&pk, &sk);
+export struct CrEd25519Secret {
+  b: uint8[64];
+}
+
+/// CrSeed32: A 32-byte seed for deterministic key generation (cr_ed25519_seed_keypair). Equal to the RFC 8032 private key.
+/// in: - (zeroed when declared: `var x: CrSeed32;`)
+/// returns: -
+/// owns: secret: wipe with cr_wipe(&s.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var s: CrSeed32; cr_random_bytes(&s.b[0], 32);
+export struct CrSeed32 {
+  b: uint8[32];
+}
+
+/// CrEd25519Sig: A detached Ed25519 signature.
+/// in: - (zeroed when declared: `var x: CrEd25519Sig;`)
+/// returns: -
+/// owns: public
+/// thread: any thread (no shared state)
+/// example: var sig: CrEd25519Sig; cr_ed25519_sign(&sig, msg, len, &sk);
+export struct CrEd25519Sig {
+  b: uint8[64];
+}
+
+/// CrPwHash: An Argon2id password hash in its self-describing, nul-terminated PHC string form ($argon2id$v=19$m=...,t=...,p=1$salt$hash). Store cr_pwhash_text(&h); the salt and costs travel inside it.
+/// in: - (zeroed when declared: `var x: CrPwHash;`)
+/// returns: -
+/// owns: not secret, but treat as sensitive (offline guessing)
+/// thread: any thread (no shared state)
+/// example: var h: CrPwHash; cr_pwhash_str(&h, pw.chars, (int64)pw.length, CR_PW_INTERACTIVE);
+export struct CrPwHash {
+  b: uint8[128];
+}
+

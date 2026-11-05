@@ -1,0 +1,146 @@
+// PNM: binary PGM (P5), PPM (P6) and PAM (P7), 8 or 16 bits. A handy plain
+// format for tests and for piping to other tools.
+
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "../core/buf";
+import "../ops/convert";
+import "common";
+
+/// True when the bytes start like a binary PNM file.
+export fn etch_pnm_is(p: uint8*, n: int64) -> bool {
+  return n >= 3 && p[0] == 'P' && (p[1] == '5' || p[1] == '6' || p[1] == '7') &&
+    (p[2] == ' ' || p[2] == '\n' || p[2] == '\r' || p[2] == '\t');
+}
+
+fn space(c: uint8) -> bool { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
+
+// Reads the next number, skipping white space and # comments.
+fn num(p: uint8*, n: int64, pos: int64*) -> int64 {
+  var i: int64 = *pos;
+  while (i < n) {
+    if (space(p[i])) { i = i + 1; continue; }
+    if (p[i] == '#') { while (i < n && p[i] != '\n') { i = i + 1; } continue; }
+    break;
+  }
+  var v: int64 = -1;
+  while (i < n && p[i] >= '0' && p[i] <= '9') {
+    if (v < 0) { v = 0; }
+    v = v * 10 + (int64)(p[i] - '0');
+    if (v > 1000000000) { *pos = n; return -1; }
+    i = i + 1;
+  }
+  *pos = i;
+  return v;
+}
+
+fn word_is(p: uint8*, n: int64, i: int64, w: string) -> bool {
+  if (i + (int64)w.length > n) { return false; }
+  for k in 0..w.length { if (p[i + (int64)k] != w.chars[k]) { return false; } }
+  return true;
+}
+
+/// Decodes a PGM, PPM or PAM file (gray, gray+alpha, RGB or RGBA).
+export fn etch_pnm_decode(p: uint8*, n: int64, out: EtchImage*, o: EtchOpts*) -> int32 {
+  if (p == 0 || out == 0 || n < 0) { return ETCH_E_ARG; }
+  if (!etch_pnm_is(p, n)) { return ETCH_E_DATA; }
+  var kind: uint8 = p[1];
+  var pos: int64 = 2;
+  var w: int64 = -1;
+  var h: int64 = -1;
+  var maxv: int64 = -1;
+  var ch: int64 = 1;
+  if (kind == '6') { ch = 3; }
+  if (kind == '7') {
+    ch = -1;
+    while (pos < n) {
+      while (pos < n && space(p[pos])) { pos = pos + 1; }
+      if (pos < n && p[pos] == '#') { while (pos < n && p[pos] != '\n') { pos = pos + 1; } continue; }
+      if (word_is(p, n, pos, "ENDHDR")) { pos = pos + 6; break; }
+      if (word_is(p, n, pos, "WIDTH")) { pos = pos + 5; w = num(p, n, &pos); }
+      else if (word_is(p, n, pos, "HEIGHT")) { pos = pos + 6; h = num(p, n, &pos); }
+      else if (word_is(p, n, pos, "DEPTH")) { pos = pos + 5; ch = num(p, n, &pos); }
+      else if (word_is(p, n, pos, "MAXVAL")) { pos = pos + 6; maxv = num(p, n, &pos); }
+      else { while (pos < n && p[pos] != '\n') { pos = pos + 1; } }   // TUPLTYPE and others
+    }
+  } else {
+    w = num(p, n, &pos);
+    h = num(p, n, &pos);
+    maxv = num(p, n, &pos);
+  }
+  if (pos >= n) { return ETCH_E_TRUNC; }
+  if (w <= 0 || h <= 0 || maxv <= 0 || maxv > 65535 || ch < 1 || ch > 4) { return ETCH_E_DATA; }
+  pos = pos + 1;   // the single white space byte before the data
+  var wide: bool = maxv > 255;
+  var fmt: int32 = etch_format_make((int32)ch, ETCH_U8);
+  if (wide) { fmt = etch_format_make((int32)ch, ETCH_U16); }
+  var img: EtchImage;
+  var rc: int32 = etch_alloc_checked(&img, w, h, fmt, o);
+  if (rc != ETCH_OK) { return rc; }
+  var rb: int64 = w * ch;
+  if (wide) { rb = rb * 2; }
+  if (pos + rb * h > n) { etch_image_free(&img); return ETCH_E_TRUNC; }
+  for y in 0..h {
+    var s: uint8* = p + pos + y * rb;
+    var d: uint8* = img.data + y * img.stride;
+    if (!wide) {
+      if (maxv == 255) { memcpy(d, s, rb); }
+      else { for i in 0..rb { var v: int64 = (int64)s[i]; if (v > maxv) { v = maxv; } d[i] = (uint8)((v * 255 + maxv / 2) / maxv); } }
+    } else {
+      var d16: uint16* = (uint16*)d;
+      for i in 0..(w * ch) {
+        var v: int64 = ((int64)s[i * 2] << 8) | (int64)s[i * 2 + 1];
+        if (v > maxv) { v = maxv; }
+        if (maxv != 65535) { v = (v * 65535 + maxv / 2) / maxv; }
+        d16[i] = (uint16)v;
+      }
+    }
+  }
+  *out = img;
+  return etch_finish(out, o);
+}
+
+/// Encodes as PGM (gray), PPM (RGB) or PAM (with alpha). 16-bit formats stay
+/// 16-bit; float becomes 16-bit.
+export fn etch_pnm_encode(src: EtchImage*, out: EtchBuf*) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0 || !etch_format_ok(src->format)) { return ETCH_E_ARG; }
+  var img: EtchImage = *src;
+  var conv: bool = false;
+  if ((src->format >> 4) == ETCH_F32) {
+    var rc0: int32 = etch_convert(src, etch_format_make(src->format & 7, ETCH_U16), &img);
+    if (rc0 != ETCH_OK) { return rc0; }
+    conv = true;
+  }
+  var ch: int64 = (int64)(img.format & 7);
+  var wide: bool = (img.format >> 4) == ETCH_U16;
+  var maxv: int32 = 255;
+  if (wide) { maxv = 65535; }
+  var hdr: string = "";
+  if (ch == 1) { hdr = "P5\n{img.width} {img.height}\n{maxv}\n"; }
+  else if (ch == 3) { hdr = "P6\n{img.width} {img.height}\n{maxv}\n"; }
+  else {
+    var tt: string = "GRAYSCALE_ALPHA";
+    if (ch == 4) { tt = "RGB_ALPHA"; }
+    hdr = "P7\nWIDTH {img.width}\nHEIGHT {img.height}\nDEPTH {ch}\nMAXVAL {maxv}\nTUPLTYPE {tt}\nENDHDR\n";
+  }
+  var rc: int32 = etch_buf_append(out, hdr.chars, (int64)hdr.length);
+  free(hdr.chars);
+  var rb: int64 = etch_image_row_bytes(&img);
+  if (rc == ETCH_OK) { rc = etch_buf_reserve(out, rb * (int64)img.height); }
+  if (rc == ETCH_OK) {
+    for y in 0..img.height {
+      var s: uint8* = img.data + (int64)y * img.stride;
+      var d: uint8* = out->data + out->len;
+      if (wide) {
+        var s16: uint16* = (uint16*)s;
+        for i in 0..(rb / 2) { d[i * 2] = (uint8)(s16[i] >> 8); d[i * 2 + 1] = (uint8)s16[i]; }
+      } else {
+        memcpy(d, s, rb);
+      }
+      out->len = out->len + rb;
+    }
+  }
+  if (conv) { etch_image_free(&img); }
+  return rc;
+}

@@ -1,0 +1,45 @@
+// CanvasPaint: what a fill or stroke puts down. The source is a gradient
+// when one is set, else a pattern when one is set, else the solid color.
+
+import "../core/color";
+import "gradient";
+import "pattern";
+import "blend";
+
+export struct CanvasPaint {
+  color: CanvasColor;
+  gradient: CanvasGradient*;
+  pattern: CanvasPattern*;
+  blend: int32;          // a CANVAS_* blend mode; source-over by default
+  opacity: float32;      // 0 to 1, multiplies the source alpha
+  anti_alias: bool;
+}
+
+/// Paint with a solid color, source-over, opaque, anti-aliased.
+export fn canvas_paint(c: CanvasColor) -> CanvasPaint {
+  var p: CanvasPaint;
+  p.color = c;
+  p.gradient = (CanvasGradient*)0;
+  p.pattern = (CanvasPattern*)0;
+  p.blend = CANVAS_SRC_OVER;
+  p.opacity = 1.0;
+  p.anti_alias = true;
+  return p;
+}
+
+/// Paint with a solid color given as 0xRRGGBBAA.
+export fn canvas_paint_hex(v: uint32) -> CanvasPaint { return canvas_paint(canvas_hex(v)); }
+
+/// Paint with a gradient.
+export fn canvas_paint_gradient(g: CanvasGradient*) -> CanvasPaint {
+  var p: CanvasPaint = canvas_paint(canvas_rgba(0.0, 0.0, 0.0, 1.0));
+  p.gradient = g;
+  return p;
+}
+
+/// Paint with an image pattern.
+export fn canvas_paint_pattern(pt: CanvasPattern*) -> CanvasPaint {
+  var p: CanvasPaint = canvas_paint(canvas_rgba(0.0, 0.0, 0.0, 1.0));
+  p.pattern = pt;
+  return p;
+}

@@ -1,0 +1,17 @@
+Glint
+Copyright 2026 Lex Dellimere. Licensed under the Apache License 2.0 (see LICENSE).
+
+This project includes registry/gl.xml, the OpenGL API Registry from
+https://github.com/KhronosGroup/OpenGL-Registry
+Copyright 2013-2026 The Khronos Group Inc.
+SPDX-License-Identifier: Apache-2.0
+
+src/glint_gl.mettle and src/glint_ext.mettle are generated from that file
+by tools/glgen.py.
+
+src/assets/glint_font.bin is a bitmap of ASCII glyphs rendered from DejaVu Sans
+Mono (tools/fontgen.py). DejaVu fonts are based on Bitstream Vera:
+Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved. Bitstream Vera is a
+trademark of Bitstream, Inc. DejaVu changes are in the public domain. The font
+license allows redistribution and derived works; the full text is at
+https://dejavu-fonts.github.io/License.html

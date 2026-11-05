@@ -1,0 +1,348 @@
+// raize/server/conn — one connection, from accept to close.
+//
+// The loop is deliberately tiny and synchronous:
+//
+//   recv -> rz_parse -> (body?) -> handler -> serialize -> send -> keep-alive?
+//
+// Everything it needs is allocated once per connection and reused (one receive
+// buffer, one arena, one response, one head buffer), so a keep-alive connection
+// serves N requests with zero allocations in the common case. The only
+// per-request allocation is a body larger than the receive buffer, and that is
+// freed before the next request is read.
+//
+// Limits are enforced here as well as in the parser, because the parser only
+// knows the compile-time caps: the receive buffer (opts.buf_cap) is what turns
+// "the head never ends" into 431 instead of an ever-growing buffer, and a
+// Content-Length the buffer cannot hold is read into exactly one allocation of
+// body_len bytes (already bounded by RZ_MAX_BODY = 1 MiB) or refused.
+//
+// Order of operations per request, and why:
+//   1. reset the arena (views from the previous request die here),
+//   2. read + parse until COMPLETE / refusal / timeout,
+//   3. build the context, call the handler,
+//   4. decide keep-alive *before* writing, so the last response can say
+//      `Connection: close` and the client is not surprised,
+//   5. serialize the head, send it, send the body unless HEAD/204/304,
+//   6. shift any pipelined bytes to the front of the receive buffer.
+//
+// A timeout with zero bytes of a request received closes silently; a timeout
+// with a partial request answers 408 and closes. Both free the worker.
+
+import "std/mem";
+import "std/net";
+import "../str/str";
+import "../context/arena";
+import "../context/date";
+import "../context/header";
+import "../context/request";
+import "../context/response";
+import "../context/context";
+import "parse";
+import "types";
+
+// Connection-level outcomes that are not HTTP results (negative on purpose:
+// the parser's codes are 0..5).
+export const RZ_CONN_CLOSED: int32 = -1;   // peer closed; write nothing
+export const RZ_CONN_TIMEOUT: int32 = -2;  // partial request timed out -> 408
+export const RZ_CONN_ERROR: int32 = -3;    // socket error; write nothing
+
+// rz_conn_serve's return when a handler upgraded the connection and the
+// socket was handed off (ctx->upgrade): the worker must not close it.
+export const RZ_CONN_DETACHED: int64 = -2;
+
+// Reads once, retrying EINTR. Returns the byte count, or 0 with *out_err set.
+fn rz_conn_recv(fd: int64, p: uint8*, n: int64, out_err: int32*) -> int64 {
+  if (out_err != 0) { *out_err = RZ_CONN_ERROR; }
+  while (true) {
+    var got: int32 = recv(fd, (cstring)p, (int32)n, 0);
+    if (got > 0) { return (int64)got; }
+    if (got == 0) {
+      if (out_err != 0) { *out_err = RZ_CONN_CLOSED; }
+      return 0;
+    }
+    var e: int32 = net_last_error();
+    if (e == 4) { continue; }                       // EINTR
+    if (e == 11) {                                  // EAGAIN: SO_RCVTIMEO
+      if (out_err != 0) { *out_err = RZ_CONN_TIMEOUT; }
+      return 0;
+    }
+    if (out_err != 0) { *out_err = RZ_CONN_ERROR; }
+    return 0;
+  }
+}
+
+// send_all with MSG_NOSIGNAL: a client that closed its read side must not kill
+// the process with SIGPIPE, and a partial write must be finished, not dropped.
+fn rz_conn_send(fd: int64, p: uint8*, n: int64) -> int64 {
+  var sent: int64 = 0;
+  while (sent < n) {
+    var chunk: int32 = send(fd, (cstring)(p + sent), (int32)(n - sent), MSG_NOSIGNAL());
+    if (chunk <= 0) {
+      if (chunk < 0 && net_last_error() == 4) { continue; }   // EINTR
+      return -1;
+    }
+    sent = sent + (int64)chunk;
+  }
+  return sent;
+}
+
+fn rz_conn_refusal_text(status: int32) -> string {
+  if (status == 400) { return "bad request\n"; }
+  if (status == 408) { return "request timeout\n"; }
+  if (status == 413) { return "content too large\n"; }
+  if (status == 414) { return "uri too long\n"; }
+  if (status == 431) { return "request header fields too large\n"; }
+  if (status == 501) { return "not implemented\n"; }
+  if (status == 503) { return "service unavailable\n"; }
+  return "internal server error\n";
+}
+
+// Serializes the head into `out` and writes head + body. Returns bytes written
+// or -1. `is_head` suppresses the body but keeps the headers (RFC 9110 §9.3.2).
+fn rz_conn_write(fd: int64, resp: RzResponse*, out: RzBuf*, keepalive: bool, is_head: bool, now_secs: int64) -> int64 {
+  if (out == 0 || resp == 0) { return -1; }
+  out->len = 0;
+  rz_resp_serialize_head(resp, out, keepalive, now_secs);
+  var total: int64 = rz_conn_send(fd, out->data, out->len);
+  if (total < 0) { return -1; }
+  if (is_head) { return total; }
+  if (rz_resp_status_bodyless(resp->status)) { return total; }
+  var blen: int64 = rz_resp_body_len(resp);
+  if (blen > 0) {
+    var sent: int64 = rz_conn_send(fd, resp->body->data, blen);
+    if (sent < 0) { return -1; }
+    total = total + sent;
+  }
+  return total;
+}
+
+// Writes a minimal refusal response and returns the byte count. The connection
+// is always closed after a refusal (caller's job).
+fn rz_conn_fail(fd: int64, resp: RzResponse*, out: RzBuf*, status: int32, now_secs: int64) -> int64 {
+  rz_response_reset(resp);
+  resp->status = status;
+  resp->close_after = true;
+  rz_resp_set_content_type(resp, RZ_CT_TEXT);
+  rz_resp_set_body(resp, rz_conn_refusal_text(status));
+  return rz_conn_write(fd, resp, out, false, false, now_secs);
+}
+
+// Reads and parses one request.
+//
+//   returns RZ_PARSE_COMPLETE and sets req->body (a view into buf or into
+//           *out_body, which the caller frees), and *have = bytes of the *next*
+//           request already sitting in buf (pipelining);
+//   returns RZ_PARSE_* refusal codes;
+//   returns RZ_CONN_* for socket outcomes.
+fn rz_conn_read_request(fd: int64, buf: uint8*, cap: int64, have: int64*, req: RzRequest*, arena: RzArena*, out_body: uint8**) -> int32 {
+  var h: int64 = *have;
+  var sent_continue: bool = false;
+  if (out_body != 0) { *out_body = 0; }
+  while (true) {
+    var rc: int32 = rz_parse(buf, h, req, arena);
+    if (rc == RZ_PARSE_COMPLETE) {
+      var consumed: int64 = req->head_len + req->body_len;
+      if (h > consumed) {
+        var leftover: int64 = h - consumed;
+        memmove((rawptr)buf, (rawptr)(buf + consumed), leftover);
+        *have = leftover;
+      } else {
+        *have = 0;
+      }
+      return RZ_PARSE_COMPLETE;
+    }
+    if (rc != RZ_PARSE_NEED_MORE) { return rc; }
+
+    if (req->head_len > 0) {
+      // Head is complete, body is not.
+      var need: int64 = req->body_len;
+      if (need > RZ_MAX_BODY) { return RZ_PARSE_LIMIT_BODY; }
+      var avail: int64 = h - req->head_len;
+      if (avail > need) { avail = need; }
+      if (avail >= need) {
+        // All bytes are present; rz_parse would have completed. Defensive.
+        return RZ_PARSE_MALFORMED;
+      }
+      if (!sent_continue) {
+        sent_continue = true;
+        if (rz_header_has_token(rz_req_header(req, "expect"), "100-continue")) {
+          var cont: string = "HTTP/1.1 100 Continue\r\n\r\n";
+          if (rz_conn_send(fd, cont.chars, (int64)cont.length) < 0) { return RZ_CONN_ERROR; }
+        }
+      }
+      if (need <= cap - req->head_len) {
+        // It fits in the receive buffer: read in place and re-parse.
+        var err: int32 = 0;
+        var got: int64 = rz_conn_recv(fd, buf + h, cap - h, &err);
+        if (got <= 0) {
+          if (err == RZ_CONN_TIMEOUT) { return RZ_CONN_TIMEOUT; }
+          return err;
+        }
+        h = h + got;
+        continue;
+      }
+      // Larger than the buffer: one allocation of exactly body_len bytes.
+      var bb: uint8* = (uint8*)malloc(need);
+      if (bb == 0) { return RZ_PARSE_LIMIT_BODY; }
+      if (avail > 0) {
+        memcpy((rawptr)bb, (rawptr)(buf + req->head_len), avail);
+      }
+      var total: int64 = avail;
+      while (total < need) {
+        var err2: int32 = 0;
+        var got2: int64 = rz_conn_recv(fd, bb + total, need - total, &err2);
+        if (got2 <= 0) {
+          free((rawptr)bb);
+          if (err2 == RZ_CONN_TIMEOUT) { return RZ_CONN_TIMEOUT; }
+          return err2;
+        }
+        total = total + got2;
+      }
+      req->body = rz_str_view(bb, need);
+      *out_body = bb;
+      // Nothing beyond the body was taken from buf, so any tail is pipelined.
+      var consumed2: int64 = req->head_len + avail;
+      if (h > consumed2) {
+        var leftover2: int64 = h - consumed2;
+        memmove((rawptr)buf, (rawptr)(buf + consumed2), leftover2);
+        *have = leftover2;
+      } else {
+        *have = 0;
+      }
+      return RZ_PARSE_COMPLETE;
+    }
+
+    // Need more head bytes.
+    if (h >= cap) { return RZ_PARSE_LIMIT_HEADERS; }
+    var err3: int32 = 0;
+    var got3: int64 = rz_conn_recv(fd, buf + h, cap - h, &err3);
+    if (got3 <= 0) {
+      // Nothing of this request arrived: idle close, not a 408.
+      if (err3 == RZ_CONN_TIMEOUT && h == 0) { return RZ_CONN_CLOSED; }
+      return err3;
+    }
+    h = h + got3;
+  }
+}
+
+/// internal: server (rz_worker_main). Serves requests on one accepted socket until close.
+/// in:      srv the server; fd the accepted socket; peer its IPv4 address (bytes
+///          a.b.c.d in memory order, 0 unknown), copied into every request's ctx->peer
+/// returns: response bytes written, -1 if the connection died before any response,
+///          or RZ_CONN_DETACHED when a handler upgraded it (the socket is then not ours)
+/// owns:    nothing; the caller closes `fd` unless it was detached
+export fn rz_conn_serve(srv: RzServer*, fd: int64, peer: uint32) -> int64 {
+  if (srv == 0 || fd < 0) { return -1; }
+
+  var cap: int64 = srv->opts.buf_cap;
+  if (cap < 1024) { cap = 1024; }
+  if (cap > RZ_MAX_CONN_BUF) { cap = RZ_MAX_CONN_BUF; }
+
+  var buf: uint8* = (uint8*)malloc(cap);
+  if (buf == 0) { return -1; }
+  defer free((rawptr)buf);
+
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return -1; }
+  defer rz_arena_free(arena);
+
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return -1; }
+  defer rz_response_free(resp);
+
+  var out: RzBuf* = rz_buf_new_cap(1024);
+  if (out == 0) { return -1; }
+  defer rz_buf_free(out);
+
+  var have: int64 = 0;
+  var served: int32 = 0;
+  var written: int64 = 0;
+  var keep: bool = true;
+  var now_secs: int64 = rz_time_epoch();
+
+  while (keep) {
+    rz_arena_reset(arena);
+    var req: RzRequest;
+    if (!rz_request_init(&req, arena)) {
+      // Arena exhausted before a single byte was parsed: refuse, do not grow.
+      written = written + rz_conn_fail(fd, resp, out, 431, now_secs);
+      atomic_inc_i32(&srv->stats.too_large_headers);
+      break;
+    }
+    var body: uint8* = 0;
+    var rc: int32 = rz_conn_read_request(fd, buf, cap, &have, &req, arena, &body);
+
+    if (rc != RZ_PARSE_COMPLETE) {
+      if (body != 0) { free((rawptr)body); }
+      if (rc == RZ_CONN_TIMEOUT) {
+        atomic_inc_i32(&srv->stats.timeouts);
+        written = written + rz_conn_fail(fd, resp, out, 408, now_secs);
+      } else if (rc == RZ_CONN_CLOSED || rc == RZ_CONN_ERROR) {
+        // nothing to say; the socket is gone
+      } else {
+        var status: int32 = rz_parse_status(rc);
+        if (status == 400) { atomic_inc_i32(&srv->stats.bad_requests); }
+        if (status == 413) { atomic_inc_i32(&srv->stats.too_large_body); }
+        if (status == 414) { atomic_inc_i32(&srv->stats.too_long_target); }
+        if (status == 431) { atomic_inc_i32(&srv->stats.too_large_headers); }
+        written = written + rz_conn_fail(fd, resp, out, status, now_secs);
+      }
+      keep = false;
+      break;
+    }
+
+    // ---- handler ----------------------------------------------------------
+    rz_response_reset(resp);
+    var ctx: RzContext;
+    rz_ctx_init(&ctx, &req, resp, arena);
+    ctx.peer = peer;
+    var hr: int32 = 0;
+    if (srv->handler != 0) {
+      hr = srv->handler(&ctx);
+    }
+    if (hr != 0 && !ctx.aborted && resp->status == 200 && rz_resp_body_len(resp) == 0) {
+      // A handler that failed without building a response gets a 500, never an
+      // empty 200.
+      rz_resp_text(resp, 500, rz_conn_refusal_text(500));
+      atomic_inc_i32(&srv->stats.handler_errors);
+    }
+    if (ctx.status == 0) { ctx.status = resp->status; }
+
+    // ---- protocol upgrade: hand the socket over --------------------------
+    if (ctx.upgrade != 0 && !ctx.aborted && ctx.upgrade->adopt != 0) {
+      if (ctx.upgrade->adopt(ctx.upgrade, fd, buf, have) == 0) {
+        if (body != 0) { free((rawptr)body); }
+        ctx.status = 101;
+        atomic_inc_i32(&srv->stats.requests);
+        return RZ_CONN_DETACHED;
+      }
+      rz_response_reset(resp);
+      rz_resp_text(resp, 500, rz_conn_refusal_text(500));
+      resp->close_after = true;
+      atomic_inc_i32(&srv->stats.handler_errors);
+    }
+
+    // ---- keep-alive decision (before writing) -----------------------------
+    var ka: bool = req.keepalive;
+    if (resp->close_after) { ka = false; }
+    if (srv->opts.keepalive_max > 0 && served + 1 >= srv->opts.keepalive_max) { ka = false; }
+
+    var is_head: bool = rz_req_is_head(&req);
+    var w: int64 = rz_conn_write(fd, resp, out, ka, is_head, now_secs);
+    if (body != 0) {
+      free((rawptr)body);
+      body = 0;
+    }
+    if (w < 0) {
+      atomic_inc_i32(&srv->stats.write_errors);
+      keep = false;
+      break;
+    }
+    written = written + w;
+    ctx.bytes_written = w;
+    atomic_inc_i32(&srv->stats.requests);
+    served = served + 1;
+    if (!ka) { keep = false; }
+  }
+  return written;
+}

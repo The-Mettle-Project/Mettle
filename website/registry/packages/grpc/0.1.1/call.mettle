@@ -1,0 +1,264 @@
+// A call, shared by the client and server sides, and interceptors.
+//
+// Messages cross the API as bytes (GrpcBytes); generated stubs turn them
+// into protobuf types. A call owns an arena that lives as long as it does;
+// metadata, the status message and other strings of the call live there.
+import "std/mem";
+import "grpc/arena";
+import "press/core/buf";
+import "press/core/status";
+import "grpc/status";
+import "grpc/metadata";
+import "grpc/deadline";
+import "grpc/message";
+import "grpc/svcconfig";
+
+export struct GrpcBytes {
+  data: uint8*;
+  len: int64;
+}
+
+export fn grpc_bytes(s: string) -> GrpcBytes {
+  var b: GrpcBytes;
+  b.data = s.chars;
+  b.len = (int64)s.length;
+  return b;
+}
+
+export fn grpc_bytes_str(b: GrpcBytes) -> string {
+  var s: string;
+  s.chars = b.data;
+  s.length = (uint64)b.len;
+  return s;
+}
+
+// The four kinds of method (doc/PROTOCOL-HTTP2.md works the same for all;
+// the kind only says how many messages flow each way).
+export const GRPC_UNARY = 0;
+export const GRPC_SERVER_STREAMING = 1;
+export const GRPC_CLIENT_STREAMING = 2;
+export const GRPC_BIDI_STREAMING = 3;
+
+// Hooks run around every call. Any may be 0. on_start, on_send and on_recv
+// return false to fail the call with the status they fill in. on_start
+// and on_send run in list order; on_headers, on_recv and on_close in
+// reverse, so the first interceptor wraps all the others.
+//
+// Client side: on_start may add request metadata (call->send_md);
+// on_headers sees call->headers; on_close may rewrite the final status.
+// Server side: on_start sees the request metadata (call->headers), and is
+// where authentication goes; on_close sees the status about to be sent.
+export struct GrpcInterceptor {
+  user: rawptr;
+  on_start: fn(rawptr, GrpcCall*, GrpcStatus*) -> bool;
+  on_send: fn(rawptr, GrpcCall*, GrpcBytes*, GrpcStatus*) -> bool;
+  on_headers: fn(rawptr, GrpcCall*) -> void;
+  on_recv: fn(rawptr, GrpcCall*, GrpcBytes*, GrpcStatus*) -> bool;
+  on_close: fn(rawptr, GrpcCall*, GrpcStatus*) -> void;
+}
+
+// One try of a client call on one HTTP/2 stream (retries and hedging make
+// more than one).
+export struct GrpcAttempt {
+  stream: int64;          // 0 when not started or finished
+  live: bool;
+  got_headers: bool;
+  wpos: int64;            // how much of the call's send log this stream has taken
+  end_sent: bool;
+  deframer: GrpcDeframer;
+  code: int32;
+  message: string;
+  details: string;
+  pushback_ns: int64;     // -2 none, -1 "do not retry", else a delay
+  refused: bool;          // never reached the server: retry for free
+}
+
+export const GRPC_MAX_ATTEMPTS = 8;
+
+export struct GrpcCall {
+  arena: GrpcArena*;
+  is_server: bool;
+  kind: int32;
+  path: string;
+  ctx: GrpcContext;
+  user: rawptr;
+
+  send_md: GrpcMetadata;     // client: request metadata; server: response headers
+  trailer_md: GrpcMetadata;  // server: trailers to send
+  headers: GrpcMetadata;     // client: response headers; server: request metadata
+  trailers: GrpcMetadata;    // client: response trailers
+
+  send_enc: int32;
+  compress: bool;            // compress what we send with send_enc
+  recv_enc: int32;
+  peer_accept: string;       // the peer's grpc-accept-encoding
+  max_send: int64;
+  max_recv: int64;
+
+  inbox: PressBuf;           // received messages: [8-byte length][bytes]...
+  inbox_off: int64;
+  inbox_count: int64;
+  last: GrpcBytes;
+
+  done: bool;
+  status: GrpcStatus;
+  interceptors: GrpcInterceptor*;
+  ninterceptors: int64;
+  closed_run: bool;          // on_close ran
+
+  // Client side.
+  owner: rawptr;             // the GrpcChannel
+  authority: string;
+  mc: GrpcMethodConfig*;     // from the service config, or 0
+  sendlog: PressBuf;         // every framed message sent; replayed by retries
+  log_base: int64;           // bytes dropped from the front of sendlog
+  half_closed: bool;
+  committed: int32;          // the attempt that won, or -1
+  attempts: GrpcAttempt[8];
+  nattempts: int32;          // started, including transparent retries
+  counted: int32;            // started, counting toward maxAttempts
+  next_at: int64;            // when to start the next attempt; 0 none
+  wait_slot: bool;
+  begun: bool;
+  headers_seen: bool;
+
+  // Server side.
+  stream: int64;
+  conn: rawptr;              // the GrpcServerConn
+  mdesc: rawptr;             // the GrpcMethodDesc
+  sent_headers: bool;
+  out: PressBuf;             // framed bytes not yet taken by the transport
+  out_off: int64;
+  ending: bool;              // trailers wait for out to drain
+  end_status: GrpcStatus;
+  got_half_close: bool;
+  nrecv: int64;
+  cancelled: bool;
+  prev_attempts: int32;      // attempts the client made before this one
+  compress_pref: int32;      // grpc_srv_compress: -1 not set, 0 off, 1 on
+  recv_compressed: bool;     // the message just delivered came compressed
+}
+
+// A fresh call with its own arena.
+export fn grpc_call_alloc(is_server: bool) -> GrpcCall* {
+  var c: GrpcCall* = new GrpcCall;
+  c->arena = grpc_arena_new();
+  c->is_server = is_server;
+  c->committed = -1;
+  grpc_md_init(&c->send_md, c->arena);
+  grpc_md_init(&c->trailer_md, c->arena);
+  grpc_md_init(&c->headers, c->arena);
+  grpc_md_init(&c->trailers, c->arena);
+  grpc_ctx_init(&c->ctx, GRPC_NO_DEADLINE);
+  c->max_send = 2147483647;
+  c->max_recv = GRPC_DEFAULT_MAX_RECV;
+  return c;
+}
+
+export fn grpc_call_release(c: GrpcCall*) {
+  for i in 0..c->nattempts { grpc_deframer_free(&c->attempts[i].deframer); }
+  press_buf_free(&c->inbox);
+  press_buf_free(&c->sendlog);
+  press_buf_free(&c->out);
+  grpc_arena_free(c->arena);
+  free(c);
+}
+
+// Copies s into the call's arena.
+export fn grpc_call_keep(c: GrpcCall*, s: string) -> string {
+  var r: string;
+  if (s.length == 0) { return r; }
+  var p: uint8* = (uint8*)grpc_arena_alloc(c->arena, (int64)s.length);
+  memcpy(p, s.chars, (int64)s.length);
+  r.chars = p;
+  r.length = s.length;
+  return r;
+}
+
+// Adds a received message to the inbox. False when out of memory.
+export fn grpc_inbox_put(c: GrpcCall*, p: uint8*, n: int64) -> bool {
+  var lenb: uint8[8];
+  for i in 0..8 { lenb[i] = (uint8)((n >> (int64)(i * 8)) & 255); }
+  if (press_buf_append(&c->inbox, &lenb[0], 8) != PRESS_OK) { return false; }
+  if (n > 0 && press_buf_append(&c->inbox, p, n) != PRESS_OK) { return false; }
+  c->inbox_count = c->inbox_count + 1;
+  return true;
+}
+
+// Takes the next message out of the inbox; it stays valid until the next take.
+export fn grpc_inbox_take(c: GrpcCall*, out: GrpcBytes*) -> bool {
+  if (c->inbox_count == 0) {
+    c->inbox.len = 0;
+    c->inbox_off = 0;
+    return false;
+  }
+  var h: uint8* = c->inbox.data + c->inbox_off;
+  var n: int64 = 0;
+  for i in 0..8 { n = n | ((int64)h[i] << (int64)(i * 8)); }
+  out->data = h + 8;
+  out->len = n;
+  c->inbox_off = c->inbox_off + 8 + n;
+  c->inbox_count = c->inbox_count - 1;
+  return true;
+}
+
+// ---- interceptor runners ------------------------------------------------------
+
+export fn grpc_ic_start(c: GrpcCall*, st: GrpcStatus*) -> bool {
+  for i in 0..c->ninterceptors {
+    var ic: GrpcInterceptor* = &c->interceptors[i];
+    if (ic->on_start != 0 && !ic->on_start(ic->user, c, st)) { return false; }
+  }
+  return true;
+}
+
+export fn grpc_ic_send(c: GrpcCall*, b: GrpcBytes*, st: GrpcStatus*) -> bool {
+  for i in 0..c->ninterceptors {
+    var ic: GrpcInterceptor* = &c->interceptors[i];
+    if (ic->on_send != 0 && !ic->on_send(ic->user, c, b, st)) { return false; }
+  }
+  return true;
+}
+
+export fn grpc_ic_headers(c: GrpcCall*) {
+  var i: int64 = c->ninterceptors - 1;
+  while (i >= 0) {
+    var ic: GrpcInterceptor* = &c->interceptors[i];
+    if (ic->on_headers != 0) { ic->on_headers(ic->user, c); }
+    i = i - 1;
+  }
+}
+
+export fn grpc_ic_recv(c: GrpcCall*, b: GrpcBytes*, st: GrpcStatus*) -> bool {
+  var i: int64 = c->ninterceptors - 1;
+  while (i >= 0) {
+    var ic: GrpcInterceptor* = &c->interceptors[i];
+    if (ic->on_recv != 0 && !ic->on_recv(ic->user, c, b, st)) { return false; }
+    i = i - 1;
+  }
+  return true;
+}
+
+export fn grpc_ic_close(c: GrpcCall*, st: GrpcStatus*) {
+  if (c->closed_run) { return; }
+  c->closed_run = true;
+  var i: int64 = c->ninterceptors - 1;
+  while (i >= 0) {
+    var ic: GrpcInterceptor* = &c->interceptors[i];
+    if (ic->on_close != 0) { ic->on_close(ic->user, c, st); }
+    i = i - 1;
+  }
+}
+
+// ---- accessors ------------------------------------------------------------------
+
+// Client: request metadata to send. Server: response headers to send.
+export fn grpc_call_md(c: GrpcCall*) -> GrpcMetadata* { return &c->send_md; }
+// Server: trailers to send with the status.
+export fn grpc_call_trailer_md(c: GrpcCall*) -> GrpcMetadata* { return &c->trailer_md; }
+// Client: response headers. Server: request metadata.
+export fn grpc_call_headers_md(c: GrpcCall*) -> GrpcMetadata* { return &c->headers; }
+// Client: response trailers.
+export fn grpc_call_trailers_md(c: GrpcCall*) -> GrpcMetadata* { return &c->trailers; }
+export fn grpc_call_context(c: GrpcCall*) -> GrpcContext* { return &c->ctx; }
+export fn grpc_call_path(c: GrpcCall*) -> string { return c->path; }

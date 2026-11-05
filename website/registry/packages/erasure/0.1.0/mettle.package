@@ -1,0 +1,7 @@
+name = erasure
+version = 0.1.0
+description = Erasure coding in pure Mettle: Reed-Solomon over GF(2^8) and GF(2^16), XOR parity
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Erasure
+compiler = 0.18.0
+platforms = linux windows

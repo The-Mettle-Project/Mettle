@@ -1,0 +1,175 @@
+// QOI, the "Quite OK Image" format (qoiformat.org): 8-bit RGB or RGBA,
+// lossless, very fast both ways.
+
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "../core/buf";
+import "common";
+
+/// True when the bytes start like a QOI file.
+export fn etch_qoi_is(p: uint8*, n: int64) -> bool {
+  return n >= 14 && p[0] == 'q' && p[1] == 'o' && p[2] == 'i' && p[3] == 'f';
+}
+
+/// Decodes a QOI file into RGB8 or RGBA8 (as the file says).
+export fn etch_qoi_decode(p: uint8*, n: int64, out: EtchImage*, o: EtchOpts*) -> int32 {
+  if (p == 0 || out == 0 || n < 0) { return ETCH_E_ARG; }
+  if (n < 22) { return ETCH_E_TRUNC; }
+  if (!etch_qoi_is(p, n)) { return ETCH_E_DATA; }
+  var w: int64 = (int64)etch_get_u32be(p + 4);
+  var h: int64 = (int64)etch_get_u32be(p + 8);
+  var ch: int32 = (int32)p[12];
+  if (ch != 3 && ch != 4) { return ETCH_E_DATA; }
+  if (p[13] > 1) { return ETCH_E_DATA; }
+  var fmt: int32 = ETCH_RGBA8;
+  if (ch == 3) { fmt = ETCH_RGB8; }
+  var img: EtchImage;
+  var rc: int32 = etch_alloc_checked(&img, w, h, fmt, o);
+  if (rc != ETCH_OK) { return rc; }
+  var index: uint8[256];
+  for i in 0..256 { index[i] = 0; }
+  var r: int32 = 0;
+  var g: int32 = 0;
+  var b: int32 = 0;
+  var a: int32 = 255;
+  var pos: int64 = 14;
+  var end: int64 = n - 8;           // the 8-byte end marker follows the data
+  var d: uint8* = img.data;
+  var total: int64 = w * h;
+  var run: int64 = 0;
+  var c64: int64 = (int64)ch;
+  var px: int64 = 0;
+  while (px < total) {
+    if (run > 0) {
+      run = run - 1;
+    } else {
+      if (pos >= end) { break; }
+      var b1: int32 = (int32)p[pos];
+      pos = pos + 1;
+      if (b1 == 254) {
+        if (pos + 3 > end) { pos = end + 1; break; }
+        r = (int32)p[pos]; g = (int32)p[pos + 1]; b = (int32)p[pos + 2];
+        pos = pos + 3;
+      } else if (b1 == 255) {
+        if (pos + 4 > end) { pos = end + 1; break; }
+        r = (int32)p[pos]; g = (int32)p[pos + 1]; b = (int32)p[pos + 2]; a = (int32)p[pos + 3];
+        pos = pos + 4;
+      } else {
+        var op: int32 = b1 & 192;
+        if (op == 0) {
+          var q: int32 = (b1 & 63) * 4;
+          r = (int32)index[q]; g = (int32)index[q + 1]; b = (int32)index[q + 2]; a = (int32)index[q + 3];
+        } else if (op == 64) {
+          r = (r + ((b1 >> 4) & 3) - 2) & 255;
+          g = (g + ((b1 >> 2) & 3) - 2) & 255;
+          b = (b + (b1 & 3) - 2) & 255;
+        } else if (op == 128) {
+          if (pos >= end) { pos = end + 1; break; }
+          var b2: int32 = (int32)p[pos];
+          pos = pos + 1;
+          var vg: int32 = (b1 & 63) - 32;
+          r = (r + vg - 8 + ((b2 >> 4) & 15)) & 255;
+          g = (g + vg) & 255;
+          b = (b + vg - 8 + (b2 & 15)) & 255;
+        } else {
+          run = (int64)(b1 & 63);
+        }
+      }
+      var hq: int32 = ((r * 3 + g * 5 + b * 7 + a * 11) & 63) * 4;
+      index[hq] = (uint8)r; index[hq + 1] = (uint8)g; index[hq + 2] = (uint8)b; index[hq + 3] = (uint8)a;
+    }
+    var o2: uint8* = d + px * c64;
+    o2[0] = (uint8)r; o2[1] = (uint8)g; o2[2] = (uint8)b;
+    if (ch == 4) { o2[3] = (uint8)a; }
+    px = px + 1;
+  }
+  if (px < total) { etch_image_free(&img); return ETCH_E_TRUNC; }
+  *out = img;
+  return etch_finish(out, o);
+}
+
+/// Encodes an image as QOI. Formats other than RGB8 and RGBA8 are converted
+/// first. `linear` sets the header's colorspace byte.
+export fn etch_qoi_encode(src: EtchImage*, out: EtchBuf*, linear: bool) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0) { return ETCH_E_ARG; }
+  var img: EtchImage;
+  var conv: bool = false;
+  var rc: int32 = etch_as_rgb8(src, &img, &conv);
+  if (rc != ETCH_OK) { return rc; }
+  var ch: int64 = (int64)(img.format & 7);
+  var w: int64 = (int64)img.width;
+  var h: int64 = (int64)img.height;
+  // Worst case is 5 bytes a pixel, plus header and end marker.
+  rc = etch_buf_reserve(out, w * h * (ch + 1) + 22);
+  if (rc != ETCH_OK) { if (conv) { etch_image_free(&img); } return rc; }
+  var q: uint8* = out->data + out->len;
+  q[0] = 'q'; q[1] = 'o'; q[2] = 'i'; q[3] = 'f';
+  etch_put_u32be(q + 4, (uint32)w);
+  etch_put_u32be(q + 8, (uint32)h);
+  q[12] = (uint8)ch;
+  q[13] = 0;
+  if (linear) { q[13] = 1; }
+  var pos: int64 = 14;
+  var index: uint8[256];
+  for i in 0..256 { index[i] = 0; }
+  var pr: int32 = 0;
+  var pg: int32 = 0;
+  var pb: int32 = 0;
+  var pa: int32 = 255;
+  var run: int32 = 0;
+  for y in 0..h {
+    var row: uint8* = img.data + y * img.stride;
+    for x in 0..w {
+      var s: uint8* = row + x * ch;
+      var r: int32 = (int32)s[0];
+      var g: int32 = (int32)s[1];
+      var b: int32 = (int32)s[2];
+      var a: int32 = 255;
+      if (ch == 4) { a = (int32)s[3]; }
+      if (r == pr && g == pg && b == pb && a == pa) {
+        run = run + 1;
+        if (run == 62) { q[pos] = (uint8)(192 + run - 1); pos = pos + 1; run = 0; }
+        continue;
+      }
+      if (run > 0) { q[pos] = (uint8)(192 + run - 1); pos = pos + 1; run = 0; }
+      var hq: int32 = ((r * 3 + g * 5 + b * 7 + a * 11) & 63) * 4;
+      if ((int32)index[hq] == r && (int32)index[hq + 1] == g && (int32)index[hq + 2] == b && (int32)index[hq + 3] == a) {
+        q[pos] = (uint8)(hq / 4);
+        pos = pos + 1;
+      } else {
+        index[hq] = (uint8)r; index[hq + 1] = (uint8)g; index[hq + 2] = (uint8)b; index[hq + 3] = (uint8)a;
+        if (a == pa) {
+          // differences wrap like bytes
+          var vr: int32 = ((r - pr + 128) & 255) - 128;
+          var vg: int32 = ((g - pg + 128) & 255) - 128;
+          var vb: int32 = ((b - pb + 128) & 255) - 128;
+          var vgr: int32 = vr - vg;
+          var vgb: int32 = vb - vg;
+          if (vr > -3 && vr < 2 && vg > -3 && vg < 2 && vb > -3 && vb < 2) {
+            q[pos] = (uint8)(64 | ((vr + 2) << 4) | ((vg + 2) << 2) | (vb + 2));
+            pos = pos + 1;
+          } else if (vgr > -9 && vgr < 8 && vg > -33 && vg < 32 && vgb > -9 && vgb < 8) {
+            q[pos] = (uint8)(128 | (vg + 32));
+            q[pos + 1] = (uint8)(((vgr + 8) << 4) | (vgb + 8));
+            pos = pos + 2;
+          } else {
+            q[pos] = 254; q[pos + 1] = (uint8)r; q[pos + 2] = (uint8)g; q[pos + 3] = (uint8)b;
+            pos = pos + 4;
+          }
+        } else {
+          q[pos] = 255; q[pos + 1] = (uint8)r; q[pos + 2] = (uint8)g; q[pos + 3] = (uint8)b; q[pos + 4] = (uint8)a;
+          pos = pos + 5;
+        }
+      }
+      pr = r; pg = g; pb = b; pa = a;
+    }
+  }
+  if (run > 0) { q[pos] = (uint8)(192 + run - 1); pos = pos + 1; }
+  for i in 0..7 { q[pos + i] = 0; }
+  q[pos + 7] = 1;
+  pos = pos + 8;
+  out->len = out->len + pos;
+  if (conv) { etch_image_free(&img); }
+  return ETCH_OK;
+}

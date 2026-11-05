@@ -1,0 +1,125 @@
+// gamepad/xinput: Windows gamepads through XInput ("XInput Game Controller
+// APIs", learn.microsoft.com). XInput 1.4 is loaded at run time, falling back
+// to 9.1.0, so a system without it simply has no pads.
+import "../core/types.mettle";
+import "../win32/api.mettle";
+
+var g_xi_get: int64 = 0;
+var g_xi_set: int64 = 0;
+var g_slot: int32[4];             // window pad index per XInput user, -1 none
+var g_packet: int64[4];
+var g_next_scan: int64 = 0;
+var g_rumble_end: int64[4];
+
+export fn window_pad_platform_name() -> string { return "Windows"; }
+
+export fn window_pad_plat_init() {
+  for i in 0..4 { g_slot[i] = -1; g_packet[i] = -1; g_rumble_end[i] = 0; }
+  var lib: int64 = window_w32_LoadLibraryA("xinput1_4.dll");
+  if (lib == 0) { lib = window_w32_LoadLibraryA("xinput9_1_0.dll"); }
+  if (lib == 0) { return; }
+  g_xi_get = window_w32_GetProcAddress(lib, "XInputGetState");
+  g_xi_set = window_w32_GetProcAddress(lib, "XInputSetState");
+  g_next_scan = 0;
+  window_pad_plat_pump();
+}
+
+export fn window_pad_plat_shutdown() {
+  for i in 0..4 {
+    if (g_slot[i] >= 0) { window_pad_plat_rumble(g_slot[i], 0.0, 0.0, 0); g_pads[g_slot[i]].connected = false; g_slot[i] = -1; }
+  }
+}
+
+// The fixed XInput layout: raw button b is our button b, raw axis a our axis a.
+export fn window_gamepad_default_map(pad: WindowGamepad*) {
+  var z: WindowPadMap;
+  pad->map = z;
+  for b in 0..WINDOW_PAD_BUTTON_COUNT { pad->map.buttons[b].kind = 1; pad->map.buttons[b].index = (int32)b; }
+  for a in 0..WINDOW_AXIS_COUNT { pad->map.axes[a].kind = 2; pad->map.axes[a].index = (int32)a; }
+}
+
+fn stick(v: int64, dead: int64) -> float32 {
+  if (v > -dead && v < dead) { return 0.0; }
+  var f: float32 = (float32)v / 32767.0;
+  if (f < -1.0) { f = -1.0; }
+  return f;
+}
+
+fn attach(user: int32) {
+  var idx: int32 = window_gamepad_slot();
+  if (idx < 0) { return; }
+  var pad: WindowGamepad* = &g_pads[idx];
+  var name: string = "XInput Controller";
+  for k in 0..17 { pad->name[k] = name.chars[k]; }
+  pad->name_len = 17;
+  var tag: string = "xinput";
+  for k in 0..6 { pad->guid[k] = tag.chars[k]; }
+  pad->guid[15] = (uint8)user;
+  pad->nraw_buttons = 16;
+  pad->nraw_axes = 6;
+  pad->connected = true;
+  pad->raw_axes[4] = -1.0; pad->raw_axes[5] = -1.0;
+  window_gamepad_choose_map(pad);
+  g_slot[user] = idx;
+  window_gamepad_announce(idx, true);
+}
+
+export fn window_pad_plat_pump() {
+  if (g_xi_get == 0) { return; }
+  var get: fn(uint32, uint8*) -> uint32 = (fn(uint32, uint8*) -> uint32)g_xi_get;
+  var now: int64 = window_now_us();
+  // Asking an empty user slot is slow, so look for new pads once a second.
+  var scan: bool = now >= g_next_scan;
+  if (scan) { g_next_scan = now + 1000000; }
+  for u in 0..4 {
+    if (g_slot[u] < 0 && !scan) { continue; }
+    var st: uint8[16];
+    var r: uint32 = get((uint32)u, &st[0]);
+    if (r != (uint32)0) {
+      if (g_slot[u] >= 0) {
+        var gone: int32 = g_slot[u];
+        g_pads[gone].connected = false;
+        g_slot[u] = -1;
+        window_gamepad_announce(gone, false);
+      }
+      continue;
+    }
+    if (g_slot[u] < 0) { attach((int32)u); }
+    var idx: int32 = g_slot[u];
+    if (idx < 0) { continue; }
+    if (g_rumble_end[u] != 0 && now >= g_rumble_end[u]) { window_pad_plat_rumble(idx, 0.0, 0.0, 0); }
+    var packet: int64 = window_rd32(&st[0], 0);
+    if (packet == g_packet[u]) { continue; }
+    g_packet[u] = packet;
+    var pad: WindowGamepad* = &g_pads[idx];
+    var bits: int64 = window_rd16(&st[0], 4);
+    var order: int64[16] = [0x1000, 0x2000, 0x4000, 0x8000, 0x20, 0x400, 0x10, 0x40, 0x80, 0x100, 0x200, 0x1, 0x2, 0x4, 0x8, 0];
+    for b in 0..16 { pad->raw_buttons[b] = order[b] != 0 && (bits & order[b]) != 0; }
+    var lt: int64 = (int64)st[6];
+    var rt: int64 = (int64)st[7];
+    if (lt < 30) { lt = 0; }
+    if (rt < 30) { rt = 0; }
+    pad->raw_axes[4] = (float32)lt / 127.5 - 1.0;
+    pad->raw_axes[5] = (float32)rt / 127.5 - 1.0;
+    pad->raw_axes[0] = stick(window_rds16(&st[0], 8), 7849);
+    pad->raw_axes[1] = -stick(window_rds16(&st[0], 10), 7849);    // XInput: up is positive
+    pad->raw_axes[2] = stick(window_rds16(&st[0], 12), 8689);
+    pad->raw_axes[3] = -stick(window_rds16(&st[0], 14), 8689);
+    window_gamepad_update(idx);
+  }
+}
+
+export fn window_pad_plat_rumble(i: int32, low: float32, high: float32, ms: int32) -> bool {
+  if (g_xi_set == 0) { return false; }
+  var user: int32 = -1;
+  for u in 0..4 { if (g_slot[u] == i) { user = (int32)u; } }
+  if (user < 0) { return false; }
+  var set: fn(uint32, uint8*) -> uint32 = (fn(uint32, uint8*) -> uint32)g_xi_set;
+  var v: uint8[4];
+  window_wr16(&v[0], 0, (int64)(high * 65535.0));                 // left motor: the strong, low-frequency one
+  window_wr16(&v[0], 2, (int64)(low * 65535.0));
+  var ok: bool = set((uint32)user, &v[0]) == (uint32)0;
+  g_rumble_end[user] = 0;
+  if (ok && ms > 0 && (low > 0.0 || high > 0.0)) { g_rumble_end[user] = window_now_us() + (int64)ms * 1000; }
+  return ok;
+}

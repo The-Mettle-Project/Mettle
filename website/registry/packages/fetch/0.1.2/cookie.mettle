@@ -1,0 +1,664 @@
+// A cookie jar (RFC 6265). It parses Set-Cookie lines, keeps the cookies,
+// and builds the Cookie header for a request.
+//
+// There is no public suffix list. A Domain attribute with no dot, such as
+// "com", is refused unless it is the request host itself.
+
+import "std/core";
+import "std/arena";
+import "std/strbuf";
+import "std/mem";
+import "std/time";
+
+export const FETCH_SAMESITE_UNSET = 0;
+export const FETCH_SAMESITE_LAX = 1;
+export const FETCH_SAMESITE_STRICT = 2;
+export const FETCH_SAMESITE_NONE = 3;
+
+export const FETCH_COOKIE_OK = 0;
+export const FETCH_COOKIE_DELETED = 1;         // an expired cookie removed the stored one
+export const FETCH_COOKIE_ERR_SYNTAX = -1;
+export const FETCH_COOKIE_ERR_DOMAIN = -2;
+export const FETCH_COOKIE_ERR_SECURE = -3;
+export const FETCH_COOKIE_ERR_SIZE = -4;
+export const FETCH_COOKIE_ERR_NOMEM = -5;
+
+export struct FetchCookie {
+  name: string;
+  value: string;
+  domain: string;       // lower case, no leading dot
+  path: string;
+  host_only: int32;     // 1 when no Domain attribute was given
+  secure: int32;
+  http_only: int32;
+  same_site: int32;     // HTTP_SAMESITE_*
+  persistent: int32;    // 1 when Expires or Max-Age was given
+  expires: int64;       // unix seconds, used when persistent
+  created: int64;       // order of creation, for sorting and eviction
+}
+
+export struct FetchCookieJar {
+  items: FetchCookie**;
+  count: int32;
+  cap: int32;
+  seq: int64;
+  now: int64;               // unix seconds; 0 reads the clock, tests set it
+  max_total: int32;
+  max_per_domain: int32;
+}
+
+fn ck_lower(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) { return c + 32; }
+  return c;
+}
+
+fn ck_view(p: uint8*, from: int64, len: int64) -> string {
+  var s: string;
+  s.chars = p + from;
+  s.length = (uint64)len;
+  return s;
+}
+
+fn ck_ieq(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  var n: int64 = (int64)a.length;
+  var i: int64 = 0;
+  while (i < n) {
+    if (ck_lower((int32)a.chars[i]) != ck_lower((int32)b.chars[i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn ck_trim(s: string) -> string {
+  var a: int64 = 0;
+  var b: int64 = (int64)s.length;
+  while (a < b && ((int32)s.chars[a] == 32 || (int32)s.chars[a] == 9)) { a = a + 1; }
+  while (b > a && ((int32)s.chars[b - 1] == 32 || (int32)s.chars[b - 1] == 9)) { b = b - 1; }
+  return ck_view(s.chars, a, b - a);
+}
+
+fn ck_index(s: string, c: int32) -> int64 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    if ((int32)s.chars[i] == c) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn ck_copy(a: Arena*, s: string, lower: bool) -> string {
+  var out: string;
+  var n: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)arena_alloc(a, n + 1);
+  if (p == 0) { return out; }
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (lower) { c = ck_lower(c); }
+    p[i] = (uint8)c;
+    i = i + 1;
+  }
+  p[n] = (uint8)0;
+  out.chars = p;
+  out.length = s.length;
+  return out;
+}
+
+fn ck_has_ctl(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if ((c < 32 && c != 9) || c == 127) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn ck_starts_ieq(s: string, prefix: string) -> bool {
+  if (s.length < prefix.length) { return false; }
+  return ck_ieq(ck_view(s.chars, 0, (int64)prefix.length), prefix);
+}
+
+// An IPv4 or IPv6 literal. Such a host matches only itself.
+fn ck_is_ip(host: string) -> bool {
+  if (ck_index(host, 58) >= 0) { return true; }
+  var n: int64 = (int64)host.length;
+  if (n == 0) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)host.chars[i];
+    if (c != 46 && (c < 48 || c > 57)) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// RFC 6265 5.1.3. Both strings are lower case.
+fn ck_domain_match(host: string, dom: string) -> bool {
+  if (host == dom) { return true; }
+  if (ck_is_ip(host)) { return false; }
+  var hn: int64 = (int64)host.length;
+  var dn: int64 = (int64)dom.length;
+  if (hn <= dn + 1) { return false; }
+  if ((int32)host.chars[hn - dn - 1] != 46) { return false; }
+  return ck_view(host.chars, hn - dn, dn) == dom;
+}
+
+// RFC 6265 5.1.4. The request path has no query.
+fn ck_path_match(req: string, cpath: string) -> bool {
+  if (req == cpath) { return true; }
+  var cn: int64 = (int64)cpath.length;
+  if ((int64)req.length < cn) { return false; }
+  if (ck_view(req.chars, 0, cn) != cpath) { return false; }
+  if (cn > 0 && (int32)cpath.chars[cn - 1] == 47) { return true; }
+  return (int64)req.length > cn && (int32)req.chars[cn] == 47;
+}
+
+fn ck_no_query(path: string) -> string {
+  var q: int64 = ck_index(path, 63);
+  if (q < 0) { return path; }
+  return ck_view(path.chars, 0, q);
+}
+
+// RFC 6265 5.1.4: the request path up to its last slash.
+fn ck_default_path(path: string) -> string {
+  var p: string = ck_no_query(path);
+  if (p.length == 0 || (int32)p.chars[0] != 47) { return "/"; }
+  var last: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)p.length) {
+    if ((int32)p.chars[i] == 47) { last = i; }
+    i = i + 1;
+  }
+  if (last == 0) { return "/"; }
+  return ck_view(p.chars, 0, last);
+}
+
+fn ck_delim(c: int32) -> bool {
+  return c == 9 || (c >= 32 && c <= 47) || (c >= 59 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+}
+
+fn ck_digit(c: int32) -> bool {
+  return c >= 48 && c <= 57;
+}
+
+// 1 to maxd digits at the start of t, then a non-digit or the end.
+fn ck_num(t: string, maxd: int64, out: int32*) -> bool {
+  var n: int64 = (int64)t.length;
+  var i: int64 = 0;
+  var v: int32 = 0;
+  while (i < n && ck_digit((int32)t.chars[i])) {
+    v = v * 10 + ((int32)t.chars[i] - 48);
+    i = i + 1;
+    if (i > maxd) { return false; }
+  }
+  if (i == 0) { return false; }
+  *out = v;
+  return true;
+}
+
+// hh:mm:ss with one or two digits each, then a non-digit or the end.
+fn ck_time(t: string, h: int32*, m: int32*, s: int32*) -> bool {
+  var n: int64 = (int64)t.length;
+  var parts: int32[3];
+  var i: int64 = 0;
+  var k: int32 = 0;
+  while (k < 3) {
+    var d: int64 = 0;
+    var v: int32 = 0;
+    while (i < n && ck_digit((int32)t.chars[i])) {
+      v = v * 10 + ((int32)t.chars[i] - 48);
+      i = i + 1;
+      d = d + 1;
+      if (d > 2) { return false; }
+    }
+    if (d == 0) { return false; }
+    parts[k] = v;
+    k = k + 1;
+    if (k < 3) {
+      if (i >= n || (int32)t.chars[i] != 58) { return false; }
+      i = i + 1;
+    }
+  }
+  if (i < n && ck_digit((int32)t.chars[i])) { return false; }
+  *h = parts[0];
+  *m = parts[1];
+  *s = parts[2];
+  return true;
+}
+
+fn ck_month(t: string) -> int32 {
+  if (t.length < 3) { return 0; }
+  var names: string = "janfebmaraprmayjunjulaugsepoctnovdec";
+  var k: int32 = 0;
+  while (k < 12) {
+    var hit: bool = true;
+    var c: int32 = 0;
+    while (c < 3) {
+      if (ck_lower((int32)t.chars[c]) != (int32)names.chars[k * 3 + c]) { hit = false; }
+      c = c + 1;
+    }
+    if (hit) { return k + 1; }
+    k = k + 1;
+  }
+  return 0;
+}
+
+// The lenient cookie date of RFC 6265 5.1.1, such as "Wed, 09 Jun 2021
+// 10:18:14 GMT". Sets *out to unix seconds and returns true, or returns false.
+export fn fetch_cookie_parse_date(s: string, out: int64*) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var found_time: bool = false;
+  var found_day: bool = false;
+  var found_month: bool = false;
+  var found_year: bool = false;
+  var hh: int32 = 0;
+  var mm: int32 = 0;
+  var ss: int32 = 0;
+  var day: int32 = 0;
+  var month: int32 = 0;
+  var year: int32 = 0;
+  while (i < n) {
+    while (i < n && ck_delim((int32)s.chars[i])) { i = i + 1; }
+    var t0: int64 = i;
+    while (i < n && !ck_delim((int32)s.chars[i])) { i = i + 1; }
+    if (i == t0) { break; }
+    var tok: string = ck_view(s.chars, t0, i - t0);
+    if (!found_time && ck_time(tok, &hh, &mm, &ss)) {
+      found_time = true;
+    } else if (!found_day && ck_num(tok, 2, &day)) {
+      found_day = true;
+    } else if (!found_month && ck_month(tok) != 0) {
+      found_month = true;
+      month = ck_month(tok);
+    } else if (!found_year && ck_num(tok, 4, &year)) {
+      found_year = true;
+    }
+  }
+  if (!found_time || !found_day || !found_month || !found_year) { return false; }
+  if (year >= 70 && year <= 99) { year = year + 1900; }
+  if (year >= 0 && year <= 69) { year = year + 2000; }
+  if (day < 1 || day > 31 || year < 1601 || hh > 23 || mm > 59 || ss > 59) { return false; }
+  var days: int64 = time_days_from_civil((int64)year, month, day);
+  *out = days * 86400 + (int64)hh * 3600 + (int64)mm * 60 + (int64)ss;
+  return true;
+}
+
+// Max-Age: an optional minus sign and digits. False for anything else.
+fn ck_max_age(v: string, out: int64*) -> bool {
+  var n: int64 = (int64)v.length;
+  var i: int64 = 0;
+  var neg: bool = false;
+  if (n > 0 && (int32)v.chars[0] == 45) {
+    neg = true;
+    i = 1;
+  }
+  if (i >= n) { return false; }
+  var x: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)v.chars[i];
+    if (!ck_digit(c)) { return false; }
+    if (x < 100000000000) { x = x * 10 + (int64)(c - 48); }
+    i = i + 1;
+  }
+  if (neg) { x = -x; }
+  *out = x;
+  return true;
+}
+
+fn ck_host_char(c: int32) -> bool {
+  return ck_digit(c) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95;
+}
+
+// Parses one Set-Cookie line received from host for a request to path. The
+// strings in *out are copies in arena. secure_req says the response came over
+// TLS. now is unix seconds, for Max-Age. Returns FETCH_COOKIE_OK or an
+// HTTP_COOKIE_ERR_* code; the cookie is not to be stored after an error.
+export fn fetch_cookie_parse(arena: Arena*, line: string, host: string, path: string, secure_req: bool, now: int64, out: FetchCookie*) -> int32 {
+  if (line.length > 8192) { return FETCH_COOKIE_ERR_SIZE; }
+  memset(out, 0, (int64)sizeof(FetchCookie));
+  var n: int64 = (int64)line.length;
+  var i: int64 = 0;
+  while (i < n && (int32)line.chars[i] != 59) { i = i + 1; }
+  var pair: string = ck_view(line.chars, 0, i);
+  var eq: int64 = ck_index(pair, 61);
+  if (eq < 0) { return FETCH_COOKIE_ERR_SYNTAX; }
+  var name: string = ck_trim(ck_view(pair.chars, 0, eq));
+  var value: string = ck_trim(ck_view(pair.chars, eq + 1, (int64)pair.length - eq - 1));
+  if (name.length == 0 || ck_has_ctl(name) || ck_has_ctl(value)) { return FETCH_COOKIE_ERR_SYNTAX; }
+  if (name.length + value.length > 4096) { return FETCH_COOKIE_ERR_SIZE; }
+
+  var dom_attr: string;
+  var path_attr: string;
+  var has_domain: bool = false;
+  var max_age_set: bool = false;
+  var max_age: int64 = 0;
+  var exp_set: bool = false;
+  var expires: int64 = 0;
+  var secure: bool = false;
+  var http_only: bool = false;
+  var same_site: int32 = FETCH_SAMESITE_UNSET;
+  while (i < n) {
+    i = i + 1;
+    var j: int64 = i;
+    while (j < n && (int32)line.chars[j] != 59) { j = j + 1; }
+    var seg: string = ck_trim(ck_view(line.chars, i, j - i));
+    i = j;
+    var e2: int64 = ck_index(seg, 61);
+    var aname: string = seg;
+    var aval: string = ck_view(seg.chars, 0, 0);
+    if (e2 >= 0) {
+      aname = ck_trim(ck_view(seg.chars, 0, e2));
+      aval = ck_trim(ck_view(seg.chars, e2 + 1, (int64)seg.length - e2 - 1));
+    }
+    if (ck_ieq(aname, "expires")) {
+      var t: int64 = 0;
+      if (fetch_cookie_parse_date(aval, &t)) {
+        exp_set = true;
+        expires = t;
+      }
+    } else if (ck_ieq(aname, "max-age")) {
+      var d: int64 = 0;
+      if (ck_max_age(aval, &d)) {
+        max_age_set = true;
+        max_age = d;
+      }
+    } else if (ck_ieq(aname, "domain")) {
+      has_domain = true;
+      dom_attr = aval;
+    } else if (ck_ieq(aname, "path")) {
+      path_attr = aval;
+    } else if (ck_ieq(aname, "secure")) {
+      secure = true;
+    } else if (ck_ieq(aname, "httponly")) {
+      http_only = true;
+    } else if (ck_ieq(aname, "samesite")) {
+      if (ck_ieq(aval, "lax")) { same_site = FETCH_SAMESITE_LAX; }
+      if (ck_ieq(aval, "strict")) { same_site = FETCH_SAMESITE_STRICT; }
+      if (ck_ieq(aval, "none")) { same_site = FETCH_SAMESITE_NONE; }
+    }
+  }
+
+  var h: string = ck_copy(arena, host, true);
+  if (h.chars == 0) { return FETCH_COOKIE_ERR_NOMEM; }
+  out->host_only = 1;
+  out->domain = h;
+  if (has_domain) {
+    var d0: int64 = 0;
+    if (dom_attr.length > 0 && (int32)dom_attr.chars[0] == 46) { d0 = 1; }
+    var dom: string = ck_copy(arena, ck_view(dom_attr.chars, d0, (int64)dom_attr.length - d0), true);
+    if (dom.chars == 0) { return FETCH_COOKIE_ERR_NOMEM; }
+    if (dom.length > 0) {
+      var k: int64 = 0;
+      while (k < (int64)dom.length) {
+        if (!ck_host_char((int32)dom.chars[k])) { return FETCH_COOKIE_ERR_DOMAIN; }
+        k = k + 1;
+      }
+      if (ck_index(dom, 46) < 0) {
+        if (dom != h) { return FETCH_COOKIE_ERR_DOMAIN; }
+      } else if (ck_is_ip(h) || ck_is_ip(dom)) {
+        if (dom != h) { return FETCH_COOKIE_ERR_DOMAIN; }
+      } else {
+        if (!ck_domain_match(h, dom)) { return FETCH_COOKIE_ERR_DOMAIN; }
+        out->host_only = 0;
+        out->domain = dom;
+      }
+    }
+  }
+
+  if (path_attr.length > 0 && (int32)path_attr.chars[0] == 47) {
+    out->path = ck_copy(arena, path_attr, false);
+  } else {
+    out->path = ck_copy(arena, ck_default_path(path), false);
+  }
+  if (out->path.chars == 0) { return FETCH_COOKIE_ERR_NOMEM; }
+
+  if (secure && !secure_req) { return FETCH_COOKIE_ERR_SECURE; }
+  if (ck_starts_ieq(name, "__Secure-") && !(secure && secure_req)) { return FETCH_COOKIE_ERR_SECURE; }
+  if (ck_starts_ieq(name, "__Host-")) {
+    if (!(secure && secure_req) || out->host_only == 0 || path_attr != "/") { return FETCH_COOKIE_ERR_SECURE; }
+  }
+
+  out->name = ck_copy(arena, name, false);
+  out->value = ck_copy(arena, value, false);
+  if (out->name.chars == 0 || out->value.chars == 0) { return FETCH_COOKIE_ERR_NOMEM; }
+  out->secure = 0;
+  if (secure) { out->secure = 1; }
+  out->http_only = 0;
+  if (http_only) { out->http_only = 1; }
+  out->same_site = same_site;
+  if (max_age_set) {
+    out->persistent = 1;
+    if (max_age <= 0) {
+      out->expires = 0;
+    } else {
+      out->expires = now + max_age;
+    }
+  } else if (exp_set) {
+    out->persistent = 1;
+    out->expires = expires;
+  }
+  return FETCH_COOKIE_OK;
+}
+
+// ---- The jar ----
+
+export fn fetch_cookie_jar_init(j: FetchCookieJar*) {
+  memset(j, 0, (int64)sizeof(FetchCookieJar));
+  j->max_total = 3000;
+  j->max_per_domain = 50;
+}
+
+fn ck_remove_at(j: FetchCookieJar*, i: int32) {
+  free(j->items[i]);
+  var k: int32 = i;
+  while (k + 1 < j->count) {
+    j->items[k] = j->items[k + 1];
+    k = k + 1;
+  }
+  j->count = j->count - 1;
+}
+
+export fn fetch_cookie_jar_clear(j: FetchCookieJar*) {
+  while (j->count > 0) { ck_remove_at(j, j->count - 1); }
+}
+
+export fn fetch_cookie_jar_free(j: FetchCookieJar*) {
+  fetch_cookie_jar_clear(j);
+  if (j->items != 0) { free(j->items); }
+  j->items = (FetchCookie**)0;
+  j->cap = 0;
+}
+
+fn ck_now(j: FetchCookieJar*) -> int64 {
+  if (j->now != 0) { return j->now; }
+  return time_unix();
+}
+
+fn ck_expired(c: FetchCookie*, now: int64) -> bool {
+  return c->persistent != 0 && c->expires <= now;
+}
+
+// Removes every expired cookie.
+export fn fetch_cookie_jar_expire(j: FetchCookieJar*) {
+  var now: int64 = ck_now(j);
+  var i: int32 = 0;
+  while (i < j->count) {
+    if (ck_expired(j->items[i], now)) {
+      ck_remove_at(j, i);
+    } else {
+      i = i + 1;
+    }
+  }
+}
+
+export fn fetch_cookie_jar_count(j: FetchCookieJar*) -> int32 {
+  return j->count;
+}
+
+export fn fetch_cookie_jar_get(j: FetchCookieJar*, i: int32) -> FetchCookie* {
+  if (i < 0 || i >= j->count) { return (FetchCookie*)0; }
+  return j->items[i];
+}
+
+fn ck_find(j: FetchCookieJar*, name: string, dom: string, path: string) -> int32 {
+  var i: int32 = 0;
+  while (i < j->count) {
+    var c: FetchCookie* = j->items[i];
+    if (c->name == name && c->domain == dom && c->path == path) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// The stored cookie with this name, domain and path, or 0.
+export fn fetch_cookie_jar_find(j: FetchCookieJar*, name: string, domain: string, path: string) -> FetchCookie* {
+  var at: int32 = ck_find(j, name, domain, path);
+  if (at < 0) { return (FetchCookie*)0; }
+  return j->items[at];
+}
+
+fn ck_oldest(j: FetchCookieJar*, dom: string, any: bool) -> int32 {
+  var best: int32 = -1;
+  var i: int32 = 0;
+  while (i < j->count) {
+    var c: FetchCookie* = j->items[i];
+    if ((any || c->domain == dom) && (best < 0 || c->created < j->items[best]->created)) { best = i; }
+    i = i + 1;
+  }
+  return best;
+}
+
+fn ck_domain_count(j: FetchCookieJar*, dom: string) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < j->count) {
+    if (j->items[i]->domain == dom) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+// Stores a copy of c. A cookie that has already expired removes the stored
+// one with the same name, domain and path instead (FETCH_COOKIE_DELETED).
+export fn fetch_cookie_jar_add(j: FetchCookieJar*, c: FetchCookie*) -> int32 {
+  var now: int64 = ck_now(j);
+  var at: int32 = ck_find(j, c->name, c->domain, c->path);
+  if (ck_expired(c, now)) {
+    if (at >= 0) { ck_remove_at(j, at); }
+    return FETCH_COOKIE_DELETED;
+  }
+  var created: int64 = 0;
+  if (at >= 0) {
+    created = j->items[at]->created;
+    ck_remove_at(j, at);
+  } else {
+    j->seq = j->seq + 1;
+    created = j->seq;
+    fetch_cookie_jar_expire(j);
+    while (j->max_per_domain > 0 && ck_domain_count(j, c->domain) >= j->max_per_domain) {
+      ck_remove_at(j, ck_oldest(j, c->domain, false));
+    }
+    while (j->max_total > 0 && j->count >= j->max_total) {
+      ck_remove_at(j, ck_oldest(j, c->domain, true));
+    }
+  }
+
+  var extra: int64 = (int64)(c->name.length + c->value.length + c->domain.length + c->path.length);
+  var hdr: int64 = (int64)sizeof(FetchCookie);
+  var block: uint8* = (uint8*)malloc(hdr + extra);
+  if (block == 0) { return FETCH_COOKIE_ERR_NOMEM; }
+  if (j->count == j->cap) {
+    var ncap: int32 = j->cap * 2;
+    if (ncap < 8) { ncap = 8; }
+    var grown: FetchCookie** = (FetchCookie**)realloc(j->items, (int64)ncap * (int64)sizeof(FetchCookie*));
+    if (grown == 0) {
+      free(block);
+      return FETCH_COOKIE_ERR_NOMEM;
+    }
+    j->items = grown;
+    j->cap = ncap;
+  }
+  var d: FetchCookie* = (FetchCookie*)block;
+  *d = *c;
+  var w: int64 = hdr;
+  memcpy(block + w, c->name.chars, (int64)c->name.length);
+  d->name = ck_view(block, w, (int64)c->name.length);
+  w = w + (int64)c->name.length;
+  memcpy(block + w, c->value.chars, (int64)c->value.length);
+  d->value = ck_view(block, w, (int64)c->value.length);
+  w = w + (int64)c->value.length;
+  memcpy(block + w, c->domain.chars, (int64)c->domain.length);
+  d->domain = ck_view(block, w, (int64)c->domain.length);
+  w = w + (int64)c->domain.length;
+  memcpy(block + w, c->path.chars, (int64)c->path.length);
+  d->path = ck_view(block, w, (int64)c->path.length);
+  d->created = created;
+  j->items[j->count] = d;
+  j->count = j->count + 1;
+  return FETCH_COOKIE_OK;
+}
+
+// Parses a Set-Cookie line from a response to a request for host and path
+// (secure: it went over TLS) and stores the cookie.
+export fn fetch_cookie_jar_set(j: FetchCookieJar*, line: string, host: string, path: string, secure: bool) -> int32 {
+  var arena: Arena* = arena_init((int64)0);
+  if (arena == 0) { return FETCH_COOKIE_ERR_NOMEM; }
+  var c: FetchCookie;
+  var rc: int32 = fetch_cookie_parse(arena, line, host, path, secure, ck_now(j), &c);
+  if (rc == FETCH_COOKIE_OK) { rc = fetch_cookie_jar_add(j, &c); }
+  arena_free(arena);
+  return rc;
+}
+
+// Whether c is to be sent to host (lower case) for the request path.
+export fn fetch_cookie_matches(c: FetchCookie*, host: string, path: string, secure: bool) -> bool {
+  if (c->secure != 0 && !secure) { return false; }
+  if (c->host_only != 0) {
+    if (host != c->domain) { return false; }
+  } else if (!ck_domain_match(host, c->domain)) {
+    return false;
+  }
+  return ck_path_match(ck_no_query(path), c->path);
+}
+
+// The Cookie header value for a request to host and path, or "" when no
+// cookie applies. Longer paths come first, then older cookies. Expired
+// cookies are dropped on the way. The result is allocated in arena.
+export fn fetch_cookie_jar_header(j: FetchCookieJar*, arena: Arena*, host: string, path: string, secure: bool) -> string {
+  fetch_cookie_jar_expire(j);
+  var h: string = ck_copy(arena, host, true);
+  var pick: FetchCookie** = (FetchCookie**)arena_alloc(arena, ((int64)j->count + 1) * (int64)sizeof(FetchCookie*));
+  if (h.chars == 0 || pick == 0) { return ""; }
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < j->count) {
+    var c: FetchCookie* = j->items[i];
+    if (fetch_cookie_matches(c, h, path, secure)) {
+      var k: int32 = n;
+      while (k > 0 && (pick[k - 1]->path.length < c->path.length || (pick[k - 1]->path.length == c->path.length && pick[k - 1]->created > c->created))) {
+        pick[k] = pick[k - 1];
+        k = k - 1;
+      }
+      pick[k] = c;
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  if (n == 0) { return ""; }
+  var sb: StrBuf* = strbuf_new(arena, 128);
+  if (sb == 0) { return ""; }
+  i = 0;
+  while (i < n) {
+    if (i > 0) { strbuf_append_bytes(sb, "; ", 2); }
+    strbuf_append_string(sb, pick[i]->name);
+    strbuf_append_byte(sb, (uint8)61);
+    strbuf_append_string(sb, pick[i]->value);
+    i = i + 1;
+  }
+  return strbuf_finish_string(sb);
+}

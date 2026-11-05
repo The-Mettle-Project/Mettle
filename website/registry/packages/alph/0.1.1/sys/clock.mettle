@@ -1,0 +1,198 @@
+// alph/sys/clock: monotonic time and futex parking.
+
+import "alph/sys/linux";
+
+const ALPH_NS_PER_S: int64 = 1000000000;
+const ALPH_NS_PER_MS: int64 = 1000000;
+
+// Where the kernel's vDSO clock_gettime is: 0 before the first look, -1
+// when there is none (the system call is used), else its address.
+var alph_vdso_clock: int64 = 0;
+
+const ALPH_AT_SYSINFO_EHDR: int64 = 33;
+
+// The value for key in this process's auxiliary vector, or 0.
+fn alph_auxv(key: int64) -> int64 {
+  var buf: int64[128];
+  var fd: int64 = syscall(ALPH_SYS_OPEN, (int64)"/proc/self/auxv\0".chars, 0, 0);
+  if (fd < 0) {
+    return 0;
+  }
+  var n: int64 = syscall(ALPH_SYS_READ, fd, (int64)&buf[0], 1024);
+  syscall(ALPH_SYS_CLOSE, fd);
+  var i: int64 = 0;
+  while (i + 1 < n / 8) {
+    if (buf[i] == key) {
+      return buf[i + 1];
+    }
+    i = i + 2;
+  }
+  return 0;
+}
+
+fn alph_rd16(p: int64) -> int64 {
+  return (int64)*(uint16*)p;
+}
+
+fn alph_rd32(p: int64) -> int64 {
+  return (int64)*(uint32*)p;
+}
+
+fn alph_rd64(p: int64) -> int64 {
+  return *(int64*)p;
+}
+
+fn alph_cstr_is(p: int64, want: string) -> bool {
+  var c: uint8* = (uint8*)p;
+  for i: int64 in 0..want.length {
+    if (c[i] != want.chars[i]) {
+      return false;
+    }
+  }
+  return c[want.length] == 0;
+}
+
+// The address of the symbol want in the ELF image the kernel mapped at base
+// (the vDSO), found through its DT_HASH symbol count, or 0.
+fn alph_vdso_sym(base: int64, want: string) -> int64 {
+  var phoff: int64 = alph_rd64(base + 32);
+  var phnum: int64 = alph_rd16(base + 56);
+  var bias: int64 = -1;
+  var dyn: int64 = 0;
+  for i: int64 in 0..phnum {
+    var ph: int64 = base + phoff + i * 56;
+    var kind: int64 = alph_rd32(ph);
+    if (kind == 1 && bias < 0) {
+      bias = base + alph_rd64(ph + 8) - alph_rd64(ph + 16);  // PT_LOAD: offset - vaddr
+    } else if (kind == 2) {
+      dyn = base + alph_rd64(ph + 8);  // PT_DYNAMIC
+    }
+  }
+  if (bias < 0 || dyn == 0) {
+    return 0;
+  }
+  var symtab: int64 = 0;
+  var strtab: int64 = 0;
+  var hash: int64 = 0;
+  while (alph_rd64(dyn) != 0) {
+    var tag: int64 = alph_rd64(dyn);
+    var val: int64 = bias + alph_rd64(dyn + 8);
+    if (tag == 6) {
+      symtab = val;
+    } else if (tag == 5) {
+      strtab = val;
+    } else if (tag == 4) {
+      hash = val;
+    }
+    dyn = dyn + 16;
+  }
+  if (symtab == 0 || strtab == 0 || hash == 0) {
+    return 0;
+  }
+  var count: int64 = alph_rd32(hash + 4);  // nchain: one per symbol
+  for i: int64 in 0..count {
+    var sym: int64 = symtab + i * 24;
+    var value: int64 = alph_rd64(sym + 8);
+    if (value != 0 && alph_cstr_is(strtab + alph_rd32(sym), want)) {
+      return bias + value;
+    }
+  }
+  return 0;
+}
+
+fn alph_vdso_find() -> int64 {
+  var base: int64 = alph_auxv(ALPH_AT_SYSINFO_EHDR);
+  if (base == 0) {
+    return -1;
+  }
+  var at: int64 = alph_vdso_sym(base, "__vdso_clock_gettime");  // x86-64
+  if (at == 0) {
+    at = alph_vdso_sym(base, "__kernel_clock_gettime");         // aarch64
+  }
+  if (at == 0) {
+    return -1;
+  }
+  return at;
+}
+
+// Monotonic time in nanoseconds. Only differences between two readings mean
+// anything; it never goes backwards. It reads the clock through the kernel's
+// vDSO, about 20 ns, and falls back to the system call (about 150-190 ns)
+// where there is none; the kernel picks the clock source either way.
+// Thread: any.
+export fn alph_now_ns() -> int64 {
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  var at: int64 = alph_vdso_clock;
+  if (at == 0) {
+    at = alph_vdso_find();  // every thread finds the same; a race only repeats the look
+    alph_vdso_clock = at;
+  }
+  if (at > 0) {
+    // The vDSO may itself fall back to the system call.
+    var gettime: fn(int64, int64*) -> int64 with syscall = (fn(int64, int64*) -> int64 with syscall)(rawptr)at;
+    if (gettime(ALPH_CLOCK_MONOTONIC, &ts[0]) == 0) {
+      return ts[0] * ALPH_NS_PER_S + ts[1];
+    }
+  }
+  syscall(ALPH_SYS_CLOCK_GETTIME, ALPH_CLOCK_MONOTONIC, (int64)&ts[0]);
+  return ts[0] * ALPH_NS_PER_S + ts[1];
+}
+
+// Wall-clock time (CLOCK_REALTIME) in nanoseconds since 1970, read as
+// alph_now_ns reads the monotonic clock. It may jump when the system's time
+// is set; use it only to convert kernel timestamps, which are in it.
+// Thread: any.
+export fn alph_realtime_ns() -> int64 {
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 0;
+  var at: int64 = alph_vdso_clock;
+  if (at == 0) {
+    at = alph_vdso_find();
+    alph_vdso_clock = at;
+  }
+  if (at > 0) {
+    // The vDSO may itself fall back to the system call.
+    var gettime: fn(int64, int64*) -> int64 with syscall = (fn(int64, int64*) -> int64 with syscall)(rawptr)at;
+    if (gettime(0, &ts[0]) == 0) {
+      return ts[0] * ALPH_NS_PER_S + ts[1];
+    }
+  }
+  syscall(ALPH_SYS_CLOCK_GETTIME, 0, (int64)&ts[0]);
+  return ts[0] * ALPH_NS_PER_S + ts[1];
+}
+
+// Monotonic time in milliseconds, as alph_now_ns.
+// Thread: any.
+export fn alph_now_ms() -> int64 {
+  return alph_now_ns() / ALPH_NS_PER_MS;
+}
+
+// Sleeps while the low 32 bits of *word equal expected.
+//
+//   word        the futex word; only its low 32 bits are compared
+//   expected    the value that means "keep sleeping"
+//   timeout_ns  longest sleep in nanoseconds, or a negative number for none
+//
+// Returns on a wake, a timeout, a signal, or because *word already differs,
+// so callers re-check their condition in a loop.
+// Thread: any. Used by the schedulers to park.
+export fn alph_futex_wait(word: int64*, expected: int64, timeout_ns: int64) {
+  var low: int64 = expected & (((int64)1 << 32) - 1);
+  if (timeout_ns < 0) {
+    syscall(ALPH_SYS_FUTEX, (int64)word, ALPH_FUTEX_WAIT_PRIVATE, low, 0);
+    return;
+  }
+  var ts: int64[2];
+  ts[0] = timeout_ns / ALPH_NS_PER_S;
+  ts[1] = timeout_ns % ALPH_NS_PER_S;
+  syscall(ALPH_SYS_FUTEX, (int64)word, ALPH_FUTEX_WAIT_PRIVATE, low, (int64)&ts[0]);
+}
+
+// Wakes up to count threads sleeping in alph_futex_wait on word.
+// Thread: any.
+export fn alph_futex_wake(word: int64*, count: int64) {
+  syscall(ALPH_SYS_FUTEX, (int64)word, ALPH_FUTEX_WAKE_PRIVATE, count);
+}

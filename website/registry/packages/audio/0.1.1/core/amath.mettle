@@ -1,0 +1,25 @@
+// The float64 math functions of std/math under audio_ names. std/math is
+// imported under an alias here, so its names (sin, log, min ...) never
+// clash with a program's own, and every part of audio can use these.
+
+import "std/math" as m;
+
+export fn audio_sin(x: float64) -> float64 { return m.sin(x); }
+export fn audio_cos(x: float64) -> float64 { return m.cos(x); }
+export fn audio_tan(x: float64) -> float64 { return m.tan(x); }
+export fn audio_atan(x: float64) -> float64 { return m.atan(x); }
+export fn audio_atan2(y: float64, x: float64) -> float64 { return m.atan2(y, x); }
+export fn audio_sqrt(x: float64) -> float64 { return m.sqrt(x); }
+export fn audio_exp(x: float64) -> float64 { return m.exp(x); }
+export fn audio_exp2(x: float64) -> float64 { return m.exp2(x); }
+export fn audio_log(x: float64) -> float64 { return m.log(x); }
+export fn audio_log2(x: float64) -> float64 { return m.log2(x); }
+export fn audio_log10(x: float64) -> float64 { return m.log10(x); }
+export fn audio_pow(x: float64, y: float64) -> float64 { return m.pow(x, y); }
+export fn audio_floor(x: float64) -> float64 { return m.floor(x); }
+export fn audio_ceil(x: float64) -> float64 { return m.ceil(x); }
+export fn audio_fabs(x: float64) -> float64 { return m.fabs(x); }
+export fn audio_ldexp(x: float64, e: int32) -> float64 { return m.ldexp(x, e); }
+export fn audio_frexp(x: float64, e: int32*) -> float64 { return m.frexp(x, e); }
+
+export fn audio_pi() -> float64 { return 3.141592653589793; }

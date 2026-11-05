@@ -1,0 +1,50 @@
+// flux_orm/core/status.mettle — the one error taxonomy.
+//
+// Mettle has no exceptions: every call returns int32 and every failure is one
+// of these codes. Adapters map their own codes into this range; nothing above
+// the adapter ever sees a MeoDB status or an errno.
+
+// Status codes. RC_OK (0) is success and every failure is negative.
+// RC_ERR_NOT_FOUND: no row matched. RC_ERR_CLOSED: the connection or handle is
+// closed. RC_ERR_NOMEM: an allocation failed.
+export const RC_OK: int32 = 0;
+export const RC_ERR: int32 = -1;             // unspecified, always a bug
+export const RC_ERR_CAST: int32 = -2;        // RcValue arm does not fit the field
+export const RC_ERR_RANGE: int32 = -3;       // numeric narrowing would lose data
+export const RC_ERR_NOT_FOUND: int32 = -4;
+export const RC_ERR_CONFLICT: int32 = -5;    // unique violation, stale write
+export const RC_ERR_CONSTRAINT: int32 = -6;  // not-null / foreign key
+export const RC_ERR_UNSUPPORTED: int32 = -7; // field type or capability not shipped
+export const RC_ERR_USAGE: int32 = -8;       // caller misuse; no state changed
+export const RC_ERR_CLOSED: int32 = -9;
+export const RC_ERR_TX: int32 = -10;         // transaction state machine refused
+export const RC_ERR_NOMEM: int32 = -11;
+export const RC_ERR_ADAPTER: int32 = -12;    // adapter reported a failure
+export const RC_ERR_SCRIPT: int32 = -13;     // reserved for test doubles
+export const RC_ERR_BUSY: int32 = -14;       // nothing free in time (rc_pool_checkout)
+
+// Short lowercase name of a status code, for logs and test output.
+//   code   any int32; need not be an RC_* code
+// Returns a static string ("ok", "not_found", ...) or "unknown" for a code
+// that is not listed above. Never allocates; do not free the result.
+export fn rc_status_name(code: int32) -> string {
+  if (code == RC_OK) { return "ok"; }
+  if (code == RC_ERR) { return "error"; }
+  if (code == RC_ERR_CAST) { return "cast"; }
+  if (code == RC_ERR_RANGE) { return "range"; }
+  if (code == RC_ERR_NOT_FOUND) { return "not_found"; }
+  if (code == RC_ERR_CONFLICT) { return "conflict"; }
+  if (code == RC_ERR_CONSTRAINT) { return "constraint"; }
+  if (code == RC_ERR_UNSUPPORTED) { return "unsupported"; }
+  if (code == RC_ERR_USAGE) { return "usage"; }
+  if (code == RC_ERR_CLOSED) { return "closed"; }
+  if (code == RC_ERR_TX) { return "tx"; }
+  if (code == RC_ERR_NOMEM) { return "nomem"; }
+  if (code == RC_ERR_ADAPTER) { return "adapter"; }
+  if (code == RC_ERR_SCRIPT) { return "script"; }
+  if (code == RC_ERR_BUSY) { return "busy"; }
+  return "unknown";
+}
+
+// True when `code` is RC_OK, false for any other value.
+export fn rc_status_ok(code: int32) -> bool { return code == RC_OK; }

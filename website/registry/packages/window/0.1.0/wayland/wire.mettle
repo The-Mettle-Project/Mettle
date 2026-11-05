@@ -1,0 +1,419 @@
+// wayland/wire: the Wayland wire protocol ("The Wayland Protocol", chapter
+// "Wire Format") over a Unix socket, with file descriptors passed as
+// SCM_RIGHTS. No libwayland: messages are encoded and decoded here.
+//
+// Incoming messages are checked against their stated size and the object's
+// known interface; a broken compositor ends the connection, never the program.
+import "std/mem";
+import "../core/types.mettle";
+
+const WL_RBUF: int64 = 65536;
+const WL_MAX_FDS: int64 = 64;
+
+// Interfaces we know (object table "kind").
+export const WL_NONE = 0;
+export const WL_DISPLAY = 1;
+export const WL_REGISTRY = 2;
+export const WL_CALLBACK = 3;
+export const WL_COMPOSITOR = 4;
+export const WL_SURFACE = 5;
+export const WL_SHM = 6;
+export const WL_SHM_POOL = 7;
+export const WL_BUFFER = 8;
+export const WL_XDG_WM_BASE = 9;
+export const WL_XDG_SURFACE = 10;
+export const WL_XDG_TOPLEVEL = 11;
+export const WL_SEAT = 12;
+export const WL_POINTER = 13;
+export const WL_KEYBOARD = 14;
+export const WL_OUTPUT = 15;
+export const WL_DECO_MANAGER = 16;
+export const WL_DECORATION = 17;
+export const WL_DATA_DEVICE_MANAGER = 18;
+export const WL_DATA_DEVICE = 19;
+export const WL_DATA_OFFER = 20;
+export const WL_DATA_SOURCE = 21;
+export const WL_CURSOR_SHAPE_MANAGER = 22;
+export const WL_CURSOR_SHAPE_DEVICE = 23;
+export const WL_FRACTIONAL_MANAGER = 24;
+export const WL_FRACTIONAL = 25;
+export const WL_VIEWPORTER = 26;
+export const WL_VIEWPORT = 27;
+export const WL_RELATIVE_MANAGER = 28;
+export const WL_RELATIVE_POINTER = 29;
+export const WL_CONSTRAINTS = 30;
+export const WL_LOCKED_POINTER = 31;
+export const WL_CONFINED_POINTER = 32;
+export const WL_TEXT_INPUT_MANAGER = 33;
+export const WL_TEXT_INPUT = 34;
+export const WL_ACTIVATION = 35;
+export const WL_ACTIVATION_TOKEN = 36;
+export const WL_REGION = 37;
+
+export struct WindowWlObj {
+  kind: int32;
+  data: rawptr;           // what the object belongs to (a Window*, an offer, ...)
+}
+
+export struct WindowWl {
+  fd: int64;
+  dead: bool;
+  rbuf: uint8*;
+  rpos: int64;
+  rlen: int64;
+  fds: int32[64];         // received descriptors not yet taken
+  nfds: int64;
+  objs: WindowWlObj*;
+  nobjs: int64;           // table size
+  next_id: int64;
+  free_ids: int64*;
+  nfree: int64;
+  wbuf: uint8*;           // outgoing message being built
+  wlen: int64;
+  wfds: int32[8];
+  nwfds: int64;
+  error_code: int64;
+}
+
+export var g_wl: WindowWl;
+
+// Objects the server creates (ids from 0xFF000000) are few: a short list.
+var g_srv_ids: int64[64];
+var g_srv_kinds: int32[64];
+var g_srv_data: rawptr[64];
+
+// ---------- object table ----------
+const WL_MAX_OBJS: int64 = 1048576;
+
+fn grow_objs(need: int64) -> bool {
+  if (need < g_wl.nobjs) { return true; }
+  if (need >= WL_MAX_OBJS) { return false; }
+  var n: int64 = g_wl.nobjs * 2;
+  if (n < 256) { n = 256; }
+  while (n <= need) { n = n * 2; }
+  var t: WindowWlObj* = (WindowWlObj*)malloc(n * (int64)sizeof(WindowWlObj));
+  if (t == 0) { return false; }
+  for i: int64 in 0..n {
+    if (i < g_wl.nobjs) { t[i] = g_wl.objs[i]; } else { t[i].kind = WL_NONE; t[i].data = (rawptr)0; }
+  }
+  if (g_wl.objs != 0) { free(g_wl.objs); }
+  g_wl.objs = t;
+  g_wl.nobjs = n;
+  return true;
+}
+
+/// A new client object id of the given kind.
+export fn window_wl_new_id(kind: int32, data: rawptr) -> int64 {
+  var id: int64 = 0;
+  if (g_wl.nfree > 0) {
+    g_wl.nfree = g_wl.nfree - 1;
+    id = g_wl.free_ids[g_wl.nfree];
+  } else {
+    id = g_wl.next_id;
+    g_wl.next_id = g_wl.next_id + 1;
+  }
+  if (!grow_objs(id)) { g_wl.dead = true; return 0; }
+  g_wl.objs[id].kind = kind;
+  g_wl.objs[id].data = data;
+  return id;
+}
+
+/// Registers an object the server created (a new_id in an event).
+export fn window_wl_server_obj(id: int64, kind: int32, data: rawptr) {
+  if (id <= 0 || id > 0xFFFFFFFF) { return; }
+  if (id >= 0xFF000000) {
+    var slot: int64 = -1;
+    for i: int64 in 0..64 { if (g_srv_ids[i] == id) { slot = i; } }
+    if (slot < 0) { for i: int64 in 0..64 { if (slot < 0 && g_srv_ids[i] == 0) { slot = i; } } }
+    if (slot < 0) { slot = 0; }
+    g_srv_ids[slot] = id; g_srv_kinds[slot] = kind; g_srv_data[slot] = data;
+  }
+  // Ids below 0xFF000000 belong to the client: a server that uses one is broken, so ignore it.
+}
+
+fn srv_slot(id: int64) -> int64 {
+  for i: int64 in 0..64 { if (g_srv_ids[i] == id) { return i; } }
+  return -1;
+}
+
+export fn window_wl_kind(id: int64) -> int32 {
+  if (id >= 0xFF000000) { var s: int64 = srv_slot(id); if (s < 0) { return WL_NONE; } return g_srv_kinds[s]; }
+  if (id <= 0 || id >= g_wl.nobjs) { return WL_NONE; }
+  return g_wl.objs[id].kind;
+}
+
+export fn window_wl_data(id: int64) -> rawptr {
+  if (id >= 0xFF000000) { var s: int64 = srv_slot(id); if (s < 0) { return (rawptr)0; } return g_srv_data[s]; }
+  if (id <= 0 || id >= g_wl.nobjs) { return (rawptr)0; }
+  return g_wl.objs[id].data;
+}
+
+/// Forgets an object after a destructor request; the id comes back with delete_id.
+export fn window_wl_forget(id: int64) {
+  if (id >= 0xFF000000) { var s: int64 = srv_slot(id); if (s >= 0) { g_srv_ids[s] = 0; g_srv_kinds[s] = WL_NONE; g_srv_data[s] = (rawptr)0; } return; }
+  if (id <= 0 || id >= g_wl.nobjs) { return; }
+  g_wl.objs[id].kind = WL_NONE;
+  g_wl.objs[id].data = (rawptr)0;
+}
+
+/// Puts an id back for reuse (wl_display.delete_id).
+export fn window_wl_release_id(id: int64) {
+  if (id <= 1 || id >= g_wl.nobjs || id >= 0xFF000000) { return; }
+  g_wl.objs[id].kind = WL_NONE;
+  g_wl.objs[id].data = (rawptr)0;
+  if (g_wl.free_ids == 0) { g_wl.free_ids = (int64*)malloc(8 * 4096); }
+  if (g_wl.nfree < 4096) { g_wl.free_ids[g_wl.nfree] = id; g_wl.nfree = g_wl.nfree + 1; }
+}
+
+// ---------- connecting ----------
+/// Connects to a compositor socket path. True on success.
+export fn window_wl_connect(path: string) -> bool {
+  var empty: WindowWl;
+  g_wl = empty;
+  g_wl.fd = -1;
+  g_wl.next_id = 2;
+  var n: int64 = (int64)path.length;
+  if (n == 0 || n > 107) { window_set_error("bad Wayland socket path"); return false; }
+  var fd: int64 = syscall(41, 1, 1 | 524288, 0);
+  if (fd < 0) { window_set_error("cannot make a socket"); return false; }
+  var addr: uint8[110];
+  window_zero(&addr[0], 110);
+  addr[0] = (uint8)1;
+  for i: int64 in 0..n { addr[2 + i] = path.chars[i]; }
+  if (syscall(42, fd, &addr[0], 2 + n + 1) < 0) {
+    syscall(3, fd);
+    window_set_error("cannot connect to the Wayland compositor");
+    return false;
+  }
+  g_wl.fd = fd;
+  g_wl.rbuf = (uint8*)malloc(WL_RBUF);
+  g_wl.wbuf = (uint8*)malloc(4096 + 64);
+  grow_objs(256);
+  if (g_wl.objs == 0) { window_wl_disconnect(); return false; }
+  g_wl.objs[1].kind = WL_DISPLAY;
+  return true;
+}
+
+export fn window_wl_disconnect() {
+  if (g_wl.fd >= 0) { syscall(3, g_wl.fd); }
+  g_wl.fd = -1;
+  for i: int64 in 0..g_wl.nfds { syscall(3, (int64)g_wl.fds[i]); }
+  g_wl.nfds = 0;
+  if (g_wl.rbuf != 0) { free(g_wl.rbuf); g_wl.rbuf = (uint8*)0; }
+  if (g_wl.wbuf != 0) { free(g_wl.wbuf); g_wl.wbuf = (uint8*)0; }
+  if (g_wl.objs != 0) { free(g_wl.objs); g_wl.objs = (WindowWlObj*)0; }
+  if (g_wl.free_ids != 0) { free(g_wl.free_ids); g_wl.free_ids = (int64*)0; }
+  g_wl.nobjs = 0;
+  g_wl.nfree = 0;
+  for i: int64 in 0..64 { g_srv_ids[i] = 0; g_srv_kinds[i] = WL_NONE; }
+  g_wl.dead = true;
+}
+
+// ---------- building requests ----------
+/// Starts a request: object id and opcode.
+export fn window_wl_begin(obj: int64, opcode: int64) {
+  g_wl.wlen = 8;
+  g_wl.nwfds = 0;
+  window_wr32(g_wl.wbuf, 0, obj);
+  window_wr32(g_wl.wbuf, 4, opcode);
+}
+
+export fn window_wl_u32(v: int64) {
+  if (g_wl.wlen + 4 > 4096) { return; }
+  window_wr32(g_wl.wbuf, g_wl.wlen, v);
+  g_wl.wlen = g_wl.wlen + 4;
+}
+
+export fn window_wl_fixed(v: float64) { window_wl_u32((int64)(v * 256.0) & 0xFFFFFFFF); }
+
+/// A string argument (UTF-8, length counts the NUL). Long strings are cut.
+export fn window_wl_str(s: uint8*, n: int64) {
+  var m: int64 = n;
+  if (m > 3000) { m = window_utf8_valid_prefix(s, 3000); }
+  if (g_wl.wlen + 4 + window_pad4(m + 1) > 4096) { return; }
+  window_wr32(g_wl.wbuf, g_wl.wlen, m + 1);
+  for i: int64 in 0..m { g_wl.wbuf[g_wl.wlen + 4 + i] = s[i]; }
+  for i: int64 in m..window_pad4(m + 1) { g_wl.wbuf[g_wl.wlen + 4 + i] = (uint8)0; }
+  g_wl.wlen = g_wl.wlen + 4 + window_pad4(m + 1);
+}
+
+export fn window_wl_string(s: string) { window_wl_str(s.chars, (int64)s.length); }
+
+/// A null string or object argument.
+export fn window_wl_null() { window_wl_u32(0); }
+
+export fn window_wl_fd(fd: int64) {
+  if (g_wl.nwfds < 8) { g_wl.wfds[g_wl.nwfds] = (int32)fd; g_wl.nwfds = g_wl.nwfds + 1; }
+}
+
+/// Sends the request built since window_wl_begin.
+export fn window_wl_send() {
+  if (g_wl.dead || g_wl.fd < 0) { return; }
+  var op: int64 = window_rd32(g_wl.wbuf, 4) & 0xFFFF;
+  window_wr32(g_wl.wbuf, 4, (g_wl.wlen << 16) | op);
+  var iov: int64[2];
+  iov[0] = (int64)g_wl.wbuf;
+  iov[1] = g_wl.wlen;
+  var cbuf: uint8[64];
+  var msg: int64[7];
+  msg[0] = 0; msg[1] = 0;
+  msg[2] = (int64)&iov[0]; msg[3] = 1;
+  msg[4] = 0; msg[5] = 0; msg[6] = 0;
+  if (g_wl.nwfds > 0) {
+    window_zero(&cbuf[0], 64);
+    var clen: int64 = 16 + g_wl.nwfds * 4;
+    window_wr32(&cbuf[0], 0, clen); window_wr32(&cbuf[0], 4, 0);
+    window_wr32(&cbuf[0], 8, 1); window_wr32(&cbuf[0], 12, 1);     // SOL_SOCKET, SCM_RIGHTS
+    for i: int64 in 0..g_wl.nwfds { window_wr32(&cbuf[0], 16 + i * 4, (int64)g_wl.wfds[i]); }
+    msg[4] = (int64)&cbuf[0];
+    msg[5] = (clen + 7) & ~7;
+  }
+  var sent: int64 = 0;
+  var guard: int32 = 0;
+  while (sent < g_wl.wlen && guard < 1000) {
+    guard = guard + 1;
+    var r: int64 = syscall(46, g_wl.fd, &msg[0], 0x4000);          // sendmsg, MSG_NOSIGNAL
+    if (r == -4) { continue; }
+    if (r == -11) {
+      var pfd: uint8[8];
+      window_wr32(&pfd[0], 0, g_wl.fd); window_wr16(&pfd[0], 4, 4); window_wr16(&pfd[0], 6, 0);
+      syscall(7, &pfd[0], 1, 100);
+      continue;
+    }
+    if (r <= 0) { g_wl.dead = true; return; }
+    sent = sent + r;
+    if (sent < g_wl.wlen) {
+      iov[0] = (int64)g_wl.wbuf + sent;
+      iov[1] = g_wl.wlen - sent;
+      msg[4] = 0; msg[5] = 0;                                      // the fds went with the first part
+    }
+  }
+}
+
+// ---------- reading events ----------
+/// Reads what the socket has (waiting up to timeout_ms). False when the connection died.
+export fn window_wl_read(timeout_ms: int64) -> bool {
+  if (g_wl.dead) { return false; }
+  if (timeout_ms != 0) {
+    var pfd: uint8[8];
+    window_wr32(&pfd[0], 0, g_wl.fd); window_wr16(&pfd[0], 4, 1); window_wr16(&pfd[0], 6, 0);
+    if (syscall(7, &pfd[0], 1, timeout_ms) <= 0) { return true; }
+  }
+  if (g_wl.rpos > 0) {
+    var left: int64 = g_wl.rlen - g_wl.rpos;
+    for i: int64 in 0..left { g_wl.rbuf[i] = g_wl.rbuf[g_wl.rpos + i]; }
+    g_wl.rlen = left;
+    g_wl.rpos = 0;
+  }
+  if (g_wl.rlen >= WL_RBUF) { g_wl.dead = true; return false; }
+  var iov: int64[2];
+  iov[0] = (int64)g_wl.rbuf + g_wl.rlen;
+  iov[1] = WL_RBUF - g_wl.rlen;
+  var cbuf: uint8[512];
+  window_zero(&cbuf[0], 512);
+  var msg: int64[7];
+  msg[0] = 0; msg[1] = 0; msg[2] = (int64)&iov[0]; msg[3] = 1;
+  msg[4] = (int64)&cbuf[0]; msg[5] = 512; msg[6] = 0;
+  var r: int64 = syscall(47, g_wl.fd, &msg[0], 0x40000000 | 0x40); // recvmsg, MSG_CMSG_CLOEXEC | MSG_DONTWAIT
+  if (r == -11 || r == -4) { return true; }
+  if (r <= 0) { g_wl.dead = true; return false; }
+  g_wl.rlen = g_wl.rlen + r;
+  // Collect passed descriptors.
+  var clen: int64 = msg[5];
+  var o: int64 = 0;
+  while (o + 16 <= clen && o + 16 <= 512) {
+    var len: int64 = window_rd32(&cbuf[0], o);
+    if (len < 16 || o + len > 512) { break; }
+    if (window_rd32(&cbuf[0], o + 8) == 1 && window_rd32(&cbuf[0], o + 12) == 1) {
+      var n: int64 = (len - 16) / 4;
+      for i: int64 in 0..n {
+        var fd: int64 = window_rd32(&cbuf[0], o + 16 + i * 4);
+        if (g_wl.nfds < WL_MAX_FDS) { g_wl.fds[g_wl.nfds] = (int32)fd; g_wl.nfds = g_wl.nfds + 1; }
+        else { syscall(3, fd); }
+      }
+    }
+    o = o + ((len + 7) & ~7);
+  }
+  return true;
+}
+
+/// Takes the oldest received descriptor (-1 when none came).
+export fn window_wl_take_fd() -> int64 {
+  if (g_wl.nfds == 0) { return -1; }
+  var fd: int64 = (int64)g_wl.fds[0];
+  for i: int64 in 1..g_wl.nfds { g_wl.fds[i - 1] = g_wl.fds[i]; }
+  g_wl.nfds = g_wl.nfds - 1;
+  return fd;
+}
+
+/// The next whole message in the buffer: object, opcode, body pointer and size.
+/// False when no whole message is buffered.
+export fn window_wl_next_message(obj: int64*, opcode: int64*, body: uint8**, size: int64*) -> bool {
+  if (g_wl.rlen - g_wl.rpos < 8) { return false; }
+  var p: uint8* = &g_wl.rbuf[g_wl.rpos];
+  var sz: int64 = (window_rd32(p, 4) >> 16) & 0xFFFF;
+  if (sz < 8 || (sz & 3) != 0) { g_wl.dead = true; return false; }
+  if (g_wl.rlen - g_wl.rpos < sz) { return false; }
+  *obj = window_rd32(p, 0);
+  *opcode = window_rd32(p, 4) & 0xFFFF;
+  *body = &p[8];
+  *size = sz - 8;
+  g_wl.rpos = g_wl.rpos + sz;
+  return true;
+}
+
+// ---------- reading arguments ----------
+/// A cursor over one message body. Reads past the end give 0 and set bad.
+export struct WindowWlArgs {
+  p: uint8*;
+  n: int64;
+  at: int64;
+  bad: bool;
+}
+
+export fn window_wl_args(p: uint8*, n: int64) -> WindowWlArgs {
+  var a: WindowWlArgs;
+  a.p = p; a.n = n; a.at = 0; a.bad = false;
+  return a;
+}
+
+export fn window_wl_arg_u32(a: WindowWlArgs*) -> int64 {
+  if (a->at + 4 > a->n) { a->bad = true; return 0; }
+  var v: int64 = window_rd32(a->p, a->at);
+  a->at = a->at + 4;
+  return v;
+}
+
+export fn window_wl_arg_i32(a: WindowWlArgs*) -> int64 {
+  var v: int64 = window_wl_arg_u32(a);
+  if (v >= 2147483648) { v = v - 4294967296; }
+  return v;
+}
+
+export fn window_wl_arg_fixed(a: WindowWlArgs*) -> float64 { return (float64)window_wl_arg_i32(a) / 256.0; }
+
+/// A string argument as a view into the message (no NUL in the length). Empty for null.
+export fn window_wl_arg_str(a: WindowWlArgs*, out: uint8**, out_len: int64*) {
+  *out = (uint8*)0;
+  *out_len = 0;
+  var len: int64 = window_wl_arg_u32(a);
+  if (len == 0) { return; }
+  if (a->at + window_pad4(len) > a->n || len > a->n) { a->bad = true; return; }
+  *out = &a->p[a->at];
+  var m: int64 = len - 1;
+  if (m < 0) { m = 0; }
+  *out_len = window_utf8_valid_prefix(&a->p[a->at], m);
+  a->at = a->at + window_pad4(len);
+}
+
+/// An array argument: pointer and byte length into the message.
+export fn window_wl_arg_array(a: WindowWlArgs*, out: uint8**, out_len: int64*) {
+  *out = (uint8*)0;
+  *out_len = 0;
+  var len: int64 = window_wl_arg_u32(a);
+  if (len == 0) { return; }
+  if (a->at + window_pad4(len) > a->n || len > a->n) { a->bad = true; return; }
+  *out = &a->p[a->at];
+  *out_len = len;
+  a->at = a->at + window_pad4(len);
+}

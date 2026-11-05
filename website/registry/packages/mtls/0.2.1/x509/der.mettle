@@ -1,0 +1,431 @@
+// Strict DER reading on top of MtlsRd.
+//
+// Every function here either returns true with its outputs filled, or
+// returns false and marks the reader bad, so a parser can run a whole
+// structure and check `bad` once at the end. Only the encodings that DER
+// allows are accepted: minimal lengths, no indefinite length, no high tag
+// numbers, minimal INTEGERs, BOOLEAN 0x00 / 0xff only.
+
+import "std/mem";
+import "mtls/core/bytes";
+
+export const MTLS_ASN1_BOOLEAN: int32 = 0x01;
+export const MTLS_ASN1_INTEGER: int32 = 0x02;
+export const MTLS_ASN1_BIT_STRING: int32 = 0x03;
+export const MTLS_ASN1_OCTET_STRING: int32 = 0x04;
+export const MTLS_ASN1_NULL: int32 = 0x05;
+export const MTLS_ASN1_OID: int32 = 0x06;
+export const MTLS_ASN1_UTF8_STRING: int32 = 0x0c;
+export const MTLS_ASN1_PRINTABLE_STRING: int32 = 0x13;
+export const MTLS_ASN1_T61_STRING: int32 = 0x14;
+export const MTLS_ASN1_IA5_STRING: int32 = 0x16;
+export const MTLS_ASN1_UTC_TIME: int32 = 0x17;
+export const MTLS_ASN1_GENERALIZED_TIME: int32 = 0x18;
+export const MTLS_ASN1_SEQUENCE: int32 = 0x30;
+export const MTLS_ASN1_SET: int32 = 0x31;
+
+/// MtlsDerTlv: one element. full = header + content, body = content only.
+export struct MtlsDerTlv {
+  tag: int32;
+  full: uint8*;
+  fulllen: int64;
+  body: uint8*;
+  bodylen: int64;
+}
+
+/// mtls_der_ctx: tag byte of constructed context-specific [n] (EXPLICIT, or
+/// IMPLICIT over a SEQUENCE).
+export fn mtls_der_ctx(n: int32) -> int32 {
+  return 0xa0 | n;
+}
+
+/// mtls_der_ctx_prim: tag byte of primitive context-specific [n] (IMPLICIT
+/// over a primitive type).
+export fn mtls_der_ctx_prim(n: int32) -> int32 {
+  return 0x80 | n;
+}
+
+fn mtls_x_dead_rd() -> MtlsRd {
+  return mtls_rd(0, 1);
+}
+
+/// mtls_der_tlv: reads the next element of any tag.
+export fn mtls_der_tlv(r: MtlsRd*, t: MtlsDerTlv*) -> bool {
+  t->tag = 0;
+  t->full = mtls_rd_cur(r);
+  t->fulllen = 0;
+  t->body = t->full;
+  t->bodylen = 0;
+  if (r->bad) { return false; }
+  var start: int64 = r->pos;
+  var tag: int32 = mtls_rd_u8(r);
+  var b: int32 = mtls_rd_u8(r);
+  if (r->bad) { return false; }
+  if ((tag & 0x1f) == 0x1f) {
+    r->bad = true;
+    return false;
+  }
+  var len: int64 = 0;
+  if (b < 128) {
+    len = (int64)b;
+  } else {
+    var nb: int32 = b & 0x7f;
+    if (nb == 0 || nb > 4) {
+      r->bad = true;
+      return false;
+    }
+    var first: int32 = mtls_rd_u8(r);
+    if (first == 0) {
+      r->bad = true;
+      return false;
+    }
+    len = (int64)first;
+    for i in 1..nb {
+      len = (len << 8) | (int64)mtls_rd_u8(r);
+    }
+    if (len < 128) {
+      r->bad = true;
+      return false;
+    }
+  }
+  if (r->bad) { return false; }
+  var body: uint8* = mtls_rd_cur(r);
+  mtls_rd_skip(r, len);
+  if (r->bad) { return false; }
+  t->tag = tag;
+  t->full = r->p + start;
+  t->fulllen = r->pos - start;
+  t->body = body;
+  t->bodylen = len;
+  return true;
+}
+
+/// mtls_der_peek: the tag of the next element without reading it, or -1 at
+/// the end or when the reader is bad.
+export fn mtls_der_peek(r: MtlsRd*) -> int32 {
+  if (r->bad || r->pos >= r->n) { return -1; }
+  return (int32)r->p[r->pos];
+}
+
+/// mtls_der_expect: reads an element that must have this tag and returns
+/// its content as a reader. A different tag makes r bad.
+export fn mtls_der_expect(r: MtlsRd*, tag: int32, body: MtlsRd*) -> bool {
+  var t: MtlsDerTlv;
+  *body = mtls_x_dead_rd();
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  if (t.tag != tag) {
+    r->bad = true;
+    return false;
+  }
+  *body = mtls_rd(t.body, t.bodylen);
+  return true;
+}
+
+/// mtls_der_opt: like expect, but when the next element has another tag (or
+/// there is none) it reads nothing and returns false without marking r bad.
+export fn mtls_der_opt(r: MtlsRd*, tag: int32, body: MtlsRd*) -> bool {
+  if (mtls_der_peek(r) != tag) {
+    *body = mtls_x_dead_rd();
+    return false;
+  }
+  return mtls_der_expect(r, tag, body);
+}
+
+export fn mtls_der_seq(r: MtlsRd*, body: MtlsRd*) -> bool {
+  return mtls_der_expect(r, MTLS_ASN1_SEQUENCE, body);
+}
+
+export fn mtls_der_set(r: MtlsRd*, body: MtlsRd*) -> bool {
+  return mtls_der_expect(r, MTLS_ASN1_SET, body);
+}
+
+/// mtls_der_int: INTEGER content bytes as they are (two's complement,
+/// minimal). Rejects empty and padded encodings.
+export fn mtls_der_int(r: MtlsRd*, p: uint8**, n: int64*) -> bool {
+  var t: MtlsDerTlv;
+  *p = mtls_rd_cur(r);
+  *n = 0;
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  if (t.tag != MTLS_ASN1_INTEGER || t.bodylen < 1) {
+    r->bad = true;
+    return false;
+  }
+  if (t.bodylen > 1) {
+    var b0: int32 = (int32)t.body[0];
+    var b1: int32 = (int32)t.body[1];
+    if ((b0 == 0 && (b1 & 0x80) == 0) || (b0 == 0xff && (b1 & 0x80) != 0)) {
+      r->bad = true;
+      return false;
+    }
+  }
+  *p = t.body;
+  *n = t.bodylen;
+  return true;
+}
+
+/// mtls_der_uint: a non-negative INTEGER with its sign byte removed, as a
+/// big-endian magnitude. The value 0 gives n = 0.
+export fn mtls_der_uint(r: MtlsRd*, p: uint8**, n: int64*) -> bool {
+  if (!mtls_der_int(r, p, n)) { return false; }
+  if (((int32)(*p)[0] & 0x80) != 0) {
+    r->bad = true;
+    *n = 0;
+    return false;
+  }
+  if ((*p)[0] == (uint8)0) {
+    *p = *p + 1;
+    *n = *n - 1;
+  }
+  return true;
+}
+
+/// mtls_der_small: a non-negative INTEGER below 2^62.
+export fn mtls_der_small(r: MtlsRd*, v: int64*) -> bool {
+  var p: uint8* = 0;
+  var n: int64 = 0;
+  *v = 0;
+  if (!mtls_der_uint(r, &p, &n)) { return false; }
+  if (n > 8) {
+    r->bad = true;
+    return false;
+  }
+  var x: int64 = 0;
+  for i in 0..n {
+    x = (x << 8) | (int64)p[i];
+  }
+  if (x < 0 || x >= ((int64)1 << 62)) {
+    r->bad = true;
+    return false;
+  }
+  *v = x;
+  return true;
+}
+
+/// mtls_der_oid: OID content bytes, checked for well-formed arcs.
+export fn mtls_der_oid(r: MtlsRd*, p: uint8**, n: int64*) -> bool {
+  var t: MtlsDerTlv;
+  *p = mtls_rd_cur(r);
+  *n = 0;
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  if (t.tag != MTLS_ASN1_OID || t.bodylen < 1) {
+    r->bad = true;
+    return false;
+  }
+  var start: bool = true;
+  for i in 0..t.bodylen {
+    var b: int32 = (int32)t.body[i];
+    if (start && b == 0x80) {
+      r->bad = true;
+      return false;
+    }
+    start = (b & 0x80) == 0;
+  }
+  if (!start) {
+    r->bad = true;
+    return false;
+  }
+  *p = t.body;
+  *n = t.bodylen;
+  return true;
+}
+
+fn mtls_x_hexv(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return -1;
+}
+
+/// mtls_der_oid_is: whether OID content bytes equal a lowercase hex string,
+/// for example "2a864886f70d010101" (rsaEncryption).
+export fn mtls_der_oid_is(p: uint8*, n: int64, hex: string) -> bool {
+  if ((int64)hex.length != n * 2) { return false; }
+  for i in 0..n {
+    var hi: int32 = mtls_x_hexv((int32)hex[i * 2]);
+    var lo: int32 = mtls_x_hexv((int32)hex[i * 2 + 1]);
+    if (hi < 0 || lo < 0) { return false; }
+    if ((int32)p[i] != hi * 16 + lo) { return false; }
+  }
+  return true;
+}
+
+/// mtls_der_bool: BOOLEAN, which DER restricts to 0x00 and 0xff.
+export fn mtls_der_bool(r: MtlsRd*, v: bool*) -> bool {
+  var t: MtlsDerTlv;
+  *v = false;
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  if (t.tag != MTLS_ASN1_BOOLEAN || t.bodylen != 1) {
+    r->bad = true;
+    return false;
+  }
+  var b: int32 = (int32)t.body[0];
+  if (b == 0xff) {
+    *v = true;
+  } else if (b != 0) {
+    r->bad = true;
+    return false;
+  }
+  return true;
+}
+
+/// mtls_der_bits: BIT STRING content (after the unused-bits byte). The
+/// unused bits themselves must be zero, as DER says.
+export fn mtls_der_bits(r: MtlsRd*, p: uint8**, n: int64*, unused: int32*) -> bool {
+  var t: MtlsDerTlv;
+  *p = mtls_rd_cur(r);
+  *n = 0;
+  *unused = 0;
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  if (t.tag != MTLS_ASN1_BIT_STRING || t.bodylen < 1) {
+    r->bad = true;
+    return false;
+  }
+  var u: int32 = (int32)t.body[0];
+  if (u > 7 || (t.bodylen == 1 && u != 0)) {
+    r->bad = true;
+    return false;
+  }
+  if (u != 0) {
+    var last: int32 = (int32)t.body[t.bodylen - 1];
+    if ((last & ((1 << u) - 1)) != 0) {
+      r->bad = true;
+      return false;
+    }
+  }
+  *p = t.body + 1;
+  *n = t.bodylen - 1;
+  *unused = u;
+  return true;
+}
+
+/// mtls_der_bits_bytes: a BIT STRING that holds whole bytes (keys and
+/// signatures), so the unused-bits count must be 0.
+export fn mtls_der_bits_bytes(r: MtlsRd*, p: uint8**, n: int64*) -> bool {
+  var u: int32 = 0;
+  if (!mtls_der_bits(r, p, n, &u)) { return false; }
+  if (u != 0) {
+    r->bad = true;
+    return false;
+  }
+  return true;
+}
+
+export fn mtls_der_octets(r: MtlsRd*, p: uint8**, n: int64*) -> bool {
+  var t: MtlsDerTlv;
+  *p = mtls_rd_cur(r);
+  *n = 0;
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  if (t.tag != MTLS_ASN1_OCTET_STRING) {
+    r->bad = true;
+    return false;
+  }
+  *p = t.body;
+  *n = t.bodylen;
+  return true;
+}
+
+export fn mtls_der_null(r: MtlsRd*) -> bool {
+  var t: MtlsDerTlv;
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  if (t.tag != MTLS_ASN1_NULL || t.bodylen != 0) {
+    r->bad = true;
+    return false;
+  }
+  return true;
+}
+
+/// mtls_der_skip: reads one element of any kind and drops it.
+export fn mtls_der_skip(r: MtlsRd*) -> bool {
+  var t: MtlsDerTlv;
+  return mtls_der_tlv(r, &t);
+}
+
+fn mtls_x_is_leap(y: int64) -> bool {
+  if (y % 4 != 0) { return false; }
+  if (y % 100 != 0) { return true; }
+  return y % 400 == 0;
+}
+
+fn mtls_x_month_days(y: int64, m: int64) -> int64 {
+  switch (m) {
+    case 2: {
+      if (mtls_x_is_leap(y)) { return 29; }
+      return 28;
+    }
+    case 4: { return 30; }
+    case 6: { return 30; }
+    case 9: { return 30; }
+    case 11: { return 30; }
+    default: { }
+  }
+  return 31;
+}
+
+/// mtls_der_unix: unix seconds of a UTC calendar time (proleptic Gregorian).
+/// The fields must already be in range.
+export fn mtls_der_unix(year: int64, mon: int64, day: int64, hour: int64, min: int64, sec: int64) -> int64 {
+  var y: int64 = year;
+  if (mon <= 2) { y = y - 1; }
+  var era: int64 = y / 400;
+  if (y < 0) { era = (y - 399) / 400; }
+  var yoe: int64 = y - era * 400;
+  var mp: int64 = mon + 9;
+  if (mon > 2) { mp = mon - 3; }
+  var doy: int64 = (153 * mp + 2) / 5 + day - 1;
+  var doe: int64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  var days: int64 = era * 146097 + doe - 719468;
+  return days * 86400 + hour * 3600 + min * 60 + sec;
+}
+
+fn mtls_x_dig2(p: uint8*, at: int64, out: int64*) -> bool {
+  var a: int32 = (int32)p[at];
+  var b: int32 = (int32)p[at + 1];
+  if (a < 48 || a > 57 || b < 48 || b > 57) { return false; }
+  *out = (int64)((a - 48) * 10 + (b - 48));
+  return true;
+}
+
+/// mtls_der_time: UTCTime (YYMMDDHHMMSSZ) or GeneralizedTime
+/// (YYYYMMDDHHMMSSZ) to unix seconds. Only the Z forms with seconds are
+/// accepted (RFC 5280 4.1.2.5); a two-digit year of 50 or more means 19YY.
+export fn mtls_der_time(r: MtlsRd*, out: int64*) -> bool {
+  var t: MtlsDerTlv;
+  *out = 0;
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  var ok: bool = true;
+  var year: int64 = 0;
+  var at: int64 = 0;
+  if (t.tag == MTLS_ASN1_UTC_TIME && t.bodylen == 13) {
+    var yy: int64 = 0;
+    ok = mtls_x_dig2(t.body, 0, &yy);
+    year = 2000 + yy;
+    if (yy >= 50) { year = 1900 + yy; }
+    at = 2;
+  } else if (t.tag == MTLS_ASN1_GENERALIZED_TIME && t.bodylen == 15) {
+    var hi: int64 = 0;
+    var lo: int64 = 0;
+    ok = mtls_x_dig2(t.body, 0, &hi) && mtls_x_dig2(t.body, 2, &lo);
+    year = hi * 100 + lo;
+    at = 4;
+  } else {
+    ok = false;
+  }
+  var mon: int64 = 0;
+  var day: int64 = 0;
+  var hour: int64 = 0;
+  var min: int64 = 0;
+  var sec: int64 = 0;
+  if (ok) {
+    ok = mtls_x_dig2(t.body, at, &mon) && mtls_x_dig2(t.body, at + 2, &day) && mtls_x_dig2(t.body, at + 4, &hour) && mtls_x_dig2(t.body, at + 6, &min) && mtls_x_dig2(t.body, at + 8, &sec);
+  }
+  if (ok && (int32)t.body[t.bodylen - 1] != 90) { ok = false; }
+  if (ok) {
+    if (mon < 1 || mon > 12 || day < 1 || day > mtls_x_month_days(year, mon)) { ok = false; }
+    if (hour > 23 || min > 59 || sec > 59) { ok = false; }
+  }
+  if (!ok) {
+    r->bad = true;
+    return false;
+  }
+  *out = mtls_der_unix(year, mon, day, hour, min, sec);
+  return true;
+}

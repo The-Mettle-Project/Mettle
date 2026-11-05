@@ -1,0 +1,72 @@
+// mp_chart_share with real threads: two producers push while the main thread renders and
+// batches calls under mp_chart_lock; every sample arrives, the lock nests on its owner and
+// is free afterwards. Uses std/thread, so it runs only in the native builds.
+
+import "std/thread";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/render/svg";
+import "mistplot/sync/share";
+
+const SHARE_N: int32 = 20000;
+
+var g_chart: MpChart* = 0;
+
+fn producer(arg: cstring) -> uint32 {
+  var s: int32 = (int32)(int64)arg;
+  var i: int32 = 0;
+  while (i < SHARE_N) {
+    mp_chart_push(g_chart, s, (float64)i, (float64)(i % 13));
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn check_share() {
+  var base: int64 = mp_alloc_live();
+  g_chart = mp_chart_new(MP_LINE);
+  mp_expect_i64("share", (int64)mp_chart_share(g_chart), (int64)MP_OK);
+  mp_expect_i64("share twice", (int64)mp_chart_share(g_chart), (int64)MP_OK);
+  var a: int32 = mp_chart_series(g_chart, "a");
+  var b: int32 = mp_chart_series(g_chart, "b");
+  // mp_alloc's counters are plain globals: the main thread allocates only under the chart
+  // lock while the producers run.
+  var out: MpBuf* = mp_buf_new(1024);
+  var tid: uint32 = 0;
+  var h1: int64 = CreateThread(0, 0, &producer, (cstring)(int64)a, 0, &tid);
+  var h2: int64 = CreateThread(0, 0, &producer, (cstring)(int64)b, 0, &tid);
+  var frames: int32 = 0;
+  while (frames < 20) {
+    mp_chart_lock(g_chart);
+    mp_chart_lock(g_chart);
+    mp_chart_set_title(g_chart, "shared");
+    var v: string = mp_chart_svg_view(g_chart, 200.0, 100.0);
+    if ((int64)v.length > 0) { frames = frames + 1; }
+    mp_chart_unlock(g_chart);
+    mp_chart_unlock(g_chart);
+    mp_chart_svg(g_chart, 200.0, 100.0, out);
+  }
+  thread_join_infinite(h1);
+  thread_join_infinite(h2);
+  thread_close(h1);
+  thread_close(h2);
+  mp_expect_i64("all of a", mp_chart_len(g_chart, a), (int64)SHARE_N);
+  mp_expect_i64("all of b", mp_chart_len(g_chart, b), (int64)SHARE_N);
+  mp_expect_i64("lock free", (int64)g_chart->sync_word, 0);
+  mp_expect_i64("no depth", (int64)g_chart->sync_depth, 0);
+  mp_expect_i64("no error", (int64)mp_chart_error(g_chart), (int64)MP_OK);
+  mp_buf_free(out);
+  mp_chart_free(g_chart);
+  g_chart = 0;
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+export fn main() -> int32 {
+  check_share();
+  return mp_summary();
+}

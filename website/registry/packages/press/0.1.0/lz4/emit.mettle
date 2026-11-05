@@ -1,0 +1,96 @@
+// Pieces shared by the LZ4 block compressors: match counting and sequence output.
+
+import "std/mem";
+import "../core/buf";
+
+const PLZ_DEBRUIJN: uint64 = 0x03f79d71b4cb0a89;
+
+// Table that turns a de Bruijn product into "index of the lowest set bit / 8".
+fn plz_make_ctz() -> uint8[64] {
+  var t: uint8[64];
+  for i in 0..64 {
+    var idx: uint64 = (((uint64)1 << (uint64)i) * PLZ_DEBRUIJN) >> 58;
+    t[idx] = (uint8)(i >> 3);
+  }
+  return t;
+}
+
+const PLZ_CTZ: uint8[64] = plz_make_ctz();
+
+/// Index of the first differing byte given the xor of two words (x != 0).
+@inline export fn plz_diff_byte(x: uint64) -> int64 {
+  var low: uint64 = x & (~x + 1);
+  var t: uint8* = &PLZ_CTZ[0];
+  return (int64)t[(low * PLZ_DEBRUIJN) >> 58];
+}
+
+/// Number of equal bytes at p and q, looking at no more than maxn bytes.
+@inline export fn plz_count(p: uint8*, q: uint8*, maxn: int64) -> int64 {
+  var i: int64 = 0;
+  while (i + 8 <= maxn) {
+    var x: uint64 = press_rd64(p + i) ^ press_rd64(q + i);
+    if (x != 0) { return i + plz_diff_byte(x); }
+    i = i + 8;
+  }
+  while (i < maxn && p[i] == q[i]) { i = i + 1; }
+  return i;
+}
+
+/// Writes one sequence (literals, then a match). Returns the new output
+/// position. It may write up to 7 bytes past the literals (wild copy), which
+/// the block bound leaves room for. mlen counts all match bytes (at least 4).
+@inline export fn plz_emit(dst: uint8*, op0: int64, src: uint8*, lit: int64, litlen: int64, offset: int64, mlen: int64) -> int64 {
+  var op: int64 = op0;
+  var tpos: int64 = op;
+  op = op + 1;
+  var tok: int32 = 0;
+  if (litlen >= 15) {
+    tok = 0xF0;
+    var l: int64 = litlen - 15;
+    while (l >= 255) { dst[op] = 255; op = op + 1; l = l - 255; }
+    dst[op] = (uint8)l;
+    op = op + 1;
+  } else {
+    tok = (int32)litlen << 4;
+  }
+  var i: int64 = 0;
+  while (i < litlen) {
+    press_wr64(dst + op + i, press_rd64(src + lit + i));
+    i = i + 8;
+  }
+  op = op + litlen;
+  press_wr16(dst + op, (uint32)offset);
+  op = op + 2;
+  var ml: int64 = mlen - 4;
+  if (ml >= 15) {
+    tok = tok | 15;
+    var m: int64 = ml - 15;
+    while (m >= 255) { dst[op] = 255; op = op + 1; m = m - 255; }
+    dst[op] = (uint8)m;
+    op = op + 1;
+  } else {
+    tok = tok | (int32)ml;
+  }
+  dst[tpos] = (uint8)tok;
+  return op;
+}
+
+/// Writes the final literal-only sequence. Returns the new output position.
+export fn plz_emit_last(dst: uint8*, op0: int64, src: uint8*, start: int64, n: int64) -> int64 {
+  var op: int64 = op0;
+  var litlen: int64 = n - start;
+  if (litlen >= 15) {
+    dst[op] = 0xF0;
+    op = op + 1;
+    var l: int64 = litlen - 15;
+    while (l >= 255) { dst[op] = 255; op = op + 1; l = l - 255; }
+    dst[op] = (uint8)l;
+    op = op + 1;
+  } else {
+    dst[op] = (uint8)(litlen << 4);
+    op = op + 1;
+  }
+  if (litlen > 0) { memcpy(dst + op, src + start, litlen); }
+  return op + litlen;
+}
+

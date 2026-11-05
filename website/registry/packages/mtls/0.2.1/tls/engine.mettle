@@ -1,0 +1,396 @@
+// The record intake loop and the public, I/O-free connection API.
+//
+// Typical use without sockets:
+//   feed network bytes with mtls_conn_feed (or write into
+//   mtls_conn_in_space and call mtls_conn_in_commit),
+//   send whatever mtls_conn_out_peek shows, then mtls_conn_out_done,
+//   read and write application data with mtls_conn_read / _write.
+
+import "std/mem";
+import "std/sync";
+import "cryptex/core/util";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+import "mtls/tls/consts";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+import "mtls/tls/ks13";
+import "mtls/tls/client";
+import "mtls/tls/server";
+import "mtls/tls/client12";
+import "mtls/tls/server12";
+
+/// mtls_client_new: a client connection; call mtls_client_start next.
+export fn mtls_client_new(cfg: MtlsConfig*) -> MtlsConn* {
+  return mtls_conn_alloc(cfg, true);
+}
+
+/// mtls_server_new: a server connection; it waits for a ClientHello.
+export fn mtls_server_new(cfg: MtlsConfig*) -> MtlsConn* {
+  return mtls_conn_alloc(cfg, false);
+}
+
+fn mtls_on_key_update(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  if (n != 5) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  var req: int32 = (int32)msg[4];
+  if (req > 1) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  var secret: uint8* = &c->c_ap[0];
+  if (c->is_client) { secret = &c->s_ap[0]; }
+  if (mtls13_next_secret(c, secret) != MTLS_OK) { return mtls_fail(c, MTLS_E_CRYPTO, MTLS_ALERT_INTERNAL_ERROR); }
+  mtls_dir_set13(&c->rd, &c->suite, secret);
+  if (req == 1 && !c->we_closed) { return mtls_conn_key_update(c, false); }
+  return MTLS_OK;
+}
+
+/// mtls_conn_key_update: switches our sending keys (TLS 1.3 only). With
+/// ask_peer the peer switches its keys too.
+export fn mtls_conn_key_update(c: MtlsConn*, ask_peer: bool) -> int32 {
+  if (c->err != 0) { return c->err; }
+  if (!c->hs_done || c->version != MTLS_TLS13) { return MTLS_E_STATE; }
+  var m: uint8[5];
+  m[0] = (uint8)MTLS_HS_KEY_UPDATE;
+  m[1] = 0;
+  m[2] = 0;
+  m[3] = 1;
+  m[4] = 0;
+  if (ask_peer) { m[4] = 1; }
+  // The message goes out under the old key and every later record under
+  // the new one, so both steps happen under the write lock.
+  sync_mutex_lock(&c->wlock);
+  var rc: int32 = mtls_send_record_nl(c, MTLS_CT_HANDSHAKE, &m[0], 5);
+  var secret: uint8* = &c->s_ap[0];
+  if (c->is_client) { secret = &c->c_ap[0]; }
+  if (rc == MTLS_OK) { rc = mtls13_next_secret(c, secret); }
+  if (rc == MTLS_OK) { rc = mtls_dir_set13(&c->wr, &c->suite, secret); }
+  sync_mutex_unlock(&c->wlock);
+  if (rc != MTLS_OK) { return mtls_fail(c, MTLS_E_CRYPTO, -1); }
+  return MTLS_OK;
+}
+
+fn mtls_dispatch(c: MtlsConn*, t: int32, msg: uint8*, n: int64) -> int32 {
+  if (c->hs_done) {
+    if (c->version == MTLS_TLS13) {
+      if (t == MTLS_HS_KEY_UPDATE) { return mtls_on_key_update(c, msg, n); }
+      if (t == MTLS_HS_NEW_SESSION_TICKET && c->is_client) { return mtls_client_on_msg(c, t, msg, n); }
+      return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE);
+    }
+    // TLS 1.2: renegotiation is refused politely (RFC 5746 allows that).
+    if ((c->is_client && t == MTLS_HS_HELLO_REQUEST && n == 4) || (!c->is_client && t == MTLS_HS_CLIENT_HELLO)) {
+      return mtls_send_alert(c, 1, 100);
+    }
+    return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE);
+  }
+  if (c->is_client) {
+    if (t == MTLS_HS_HELLO_REQUEST && c->version == MTLS_TLS12) { return MTLS_OK; }
+    return mtls_client_on_msg(c, t, msg, n);
+  }
+  return mtls_server_on_msg(c, t, msg, n);
+}
+
+fn mtls_on_handshake_data(c: MtlsConn*, p: uint8*, n: int64) -> int32 {
+  if (n == 0) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+  if (c->hscap - c->hslen < n) {
+    var want: int64 = c->hscap;
+    while (want - c->hslen < n) { want = want * 2; }
+    if (want > MTLS_MAX_HS + 4 + 32768) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+    var q: uint8* = (uint8*)realloc(c->hs, want);
+    if (q == 0) { return mtls_fail(c, MTLS_E_NOMEM, MTLS_ALERT_INTERNAL_ERROR); }
+    c->hs = q;
+    c->hscap = want;
+  }
+  memcpy(c->hs + c->hslen, p, n);
+  c->hslen = c->hslen + n;
+  var off: int64 = 0;
+  while (c->err == 0 && c->hslen - off >= 4) {
+    var t: int32 = (int32)c->hs[off];
+    var mlen: int64 = (int64)mtls_load24(c->hs + off + 1);
+    if (mlen > MTLS_MAX_HS) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_DECODE_ERROR); }
+    if (c->hslen - off < 4 + mlen) { break; }
+    var key_before: uint8[12];
+    memcpy(&key_before[0], &c->rd.iv[0], 12);
+    var on_before: bool = c->rd.on;
+    var rc: int32 = mtls_dispatch(c, t, c->hs + off, 4 + mlen);
+    if (rc != MTLS_OK) { return rc; }
+    off = off + 4 + mlen;
+    // A key change must fall on a record boundary (RFC 8446 5.1).
+    if ((c->rd.on != on_before || memcmp(&key_before[0], &c->rd.iv[0], 12) != 0) && off != c->hslen) {
+      return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE);
+    }
+  }
+  if (off > 0) {
+    memmove(c->hs, c->hs + off, c->hslen - off);
+    c->hslen = c->hslen - off;
+  }
+  return c->err;
+}
+
+fn mtls_on_alert(c: MtlsConn*, p: uint8*, n: int64) -> int32 {
+  if (n != 2) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  var level: int32 = (int32)p[0];
+  var desc: int32 = (int32)p[1];
+  if (desc == MTLS_ALERT_CLOSE_NOTIFY) {
+    c->peer_closed = true;
+    // Closing before the handshake is done is the peer giving up.
+    if (!c->hs_done) {
+      c->we_closed = true;
+      return mtls_fail(c, MTLS_E_CLOSED, -1);
+    }
+    return MTLS_OK;
+  }
+  if (desc == MTLS_ALERT_USER_CANCELED && c->version == MTLS_TLS13) { return MTLS_OK; }
+  if (level == 1 && c->version == MTLS_TLS12) { return MTLS_OK; }
+  c->alert_recv = desc;
+  c->we_closed = true;
+  return mtls_fail(c, MTLS_E_ALERT, -1);
+}
+
+// One whole record at c->inb (header + len bytes).
+fn mtls_on_record(c: MtlsConn*, ctype: int32, len: int64) -> int32 {
+  var hdr: uint8* = c->inb;
+  if (c->peer_closed) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+  if (ctype == MTLS_CT_CCS) {
+    if (len != 1 || hdr[5] != 1) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+    if (c->version == MTLS_TLS12) {
+      if (c->hslen != 0) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+      if (c->is_client) { return mtls12_client_on_ccs(c); }
+      return mtls12_server_on_ccs(c);
+    }
+    // TLS 1.3 middlebox compatibility: one CCS during the handshake is ignored.
+    if (c->hs_done || c->ccs_seen) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+    c->ccs_seen = true;
+    return MTLS_OK;
+  }
+  var pstart: uint8* = hdr + 5;
+  var plen: int64 = len;
+  if (c->rd.on) {
+    var rc: int32 = mtls_open_record(c, hdr, len, &ctype, &pstart, &plen);
+    if (rc != MTLS_OK) { return rc; }
+  } else {
+    if (ctype == MTLS_CT_APPDATA) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+    if (len > MTLS_MAX_PLAIN) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_RECORD_OVERFLOW); }
+  }
+  if (plen == 0) {
+    c->empty_recs = c->empty_recs + 1;
+    if (c->empty_recs > 32) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+  } else {
+    c->empty_recs = 0;
+  }
+  if (ctype == MTLS_CT_ALERT) {
+    if (c->hslen != 0) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+    return mtls_on_alert(c, pstart, plen);
+  }
+  if (ctype == MTLS_CT_HANDSHAKE) { return mtls_on_handshake_data(c, pstart, plen); }
+  if (ctype == MTLS_CT_APPDATA) {
+    if (!c->hs_done || c->hslen != 0) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE); }
+    if (plen > 0) {
+      memcpy(c->app, pstart, plen);
+      c->apppos = 0;
+      c->applen = plen;
+    }
+    return MTLS_OK;
+  }
+  return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE);
+}
+
+/// mtls_conn_process: handles every whole record in the input buffer.
+/// Stops early while decrypted application data waits to be read.
+export fn mtls_conn_process(c: MtlsConn*) -> int32 {
+  var off: int64 = 0;
+  while (c->err == 0 && c->apppos >= c->applen && !c->peer_closed) {
+    if (c->inlen - off < 5) { break; }
+    var h: uint8* = c->inb + off;
+    var ctype: int32 = (int32)h[0];
+    var len: int64 = (int64)mtls_load16(h + 3);
+    if (ctype < 20 || ctype > 23 || h[1] != 3) {
+      mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR);
+      break;
+    }
+    if (len > MTLS_MAX_PLAIN + 2048) {
+      mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_RECORD_OVERFLOW);
+      break;
+    }
+    if (c->inlen - off < 5 + len) { break; }
+    if (off > 0) {
+      memmove(c->inb, c->inb + off, c->inlen - off);
+      c->inlen = c->inlen - off;
+      off = 0;
+    }
+    mtls_on_record(c, ctype, len);
+    off = 5 + len;
+  }
+  if (off > 0) {
+    memmove(c->inb, c->inb + off, c->inlen - off);
+    c->inlen = c->inlen - off;
+  }
+  return c->err;
+}
+
+/// mtls_conn_in_space: where the next network bytes can go, and how many
+/// fit. Write into it, then call mtls_conn_in_commit.
+export fn mtls_conn_in_space(c: MtlsConn*, p: uint8**) -> int64 {
+  *p = c->inb + c->inlen;
+  return MTLS_IN_CAP - c->inlen;
+}
+
+/// mtls_conn_in_commit: n bytes were written at mtls_conn_in_space.
+export fn mtls_conn_in_commit(c: MtlsConn*, n: int64) -> int32 {
+  if (n < 0 || n > MTLS_IN_CAP - c->inlen) { return MTLS_E_ARG; }
+  c->inlen = c->inlen + n;
+  return mtls_conn_process(c);
+}
+
+/// mtls_conn_feed: copies network bytes in and processes them. Returns
+/// how many were taken (fewer than n when the buffer is full: read
+/// application data, then feed the rest) or a negative error.
+export fn mtls_conn_feed(c: MtlsConn*, p: uint8*, n: int64) -> int64 {
+  if (c->err != 0) { return (int64)c->err; }
+  var k: int64 = MTLS_IN_CAP - c->inlen;
+  if (k > n) { k = n; }
+  if (k > 0) { memcpy(c->inb + c->inlen, p, k); }
+  c->inlen = c->inlen + k;
+  var rc: int32 = mtls_conn_process(c);
+  if (rc != MTLS_OK && mtls_out_pending(c) == 0) { return (int64)rc; }
+  return k;
+}
+
+/// mtls_conn_out_peek: the bytes waiting to be sent; returns the count.
+export fn mtls_conn_out_peek(c: MtlsConn*, p: uint8**) -> int64 {
+  *p = c->out + c->outpos;
+  return c->outlen - c->outpos;
+}
+
+/// mtls_conn_out_done: n bytes from mtls_conn_out_peek were sent.
+export fn mtls_conn_out_done(c: MtlsConn*, n: int64) {
+  if (n <= 0) { return; }
+  var left: int64 = c->outlen - c->outpos;
+  if (n > left) { n = left; }
+  c->outpos = c->outpos + n;
+  if (c->outpos == c->outlen) {
+    c->outpos = 0;
+    c->outlen = 0;
+  }
+}
+
+/// mtls_conn_take_out: copies up to cap waiting bytes to dst.
+export fn mtls_conn_take_out(c: MtlsConn*, dst: uint8*, cap: int64) -> int64 {
+  var p: uint8* = (uint8*)0;
+  var n: int64 = mtls_conn_out_peek(c, &p);
+  if (n > cap) { n = cap; }
+  if (n > 0) { memcpy(dst, p, n); }
+  mtls_conn_out_done(c, n);
+  return n;
+}
+
+/// mtls_conn_read: copies decrypted application data to dst. Returns the
+/// count, 0 at a clean end (the peer sent close_notify), MTLS_E_WANT_IO
+/// when more network input is needed, or another negative error.
+export fn mtls_conn_read(c: MtlsConn*, dst: uint8*, cap: int64) -> int64 {
+  if (c->apppos >= c->applen && c->err == 0) { mtls_conn_process(c); }
+  if (c->apppos < c->applen) {
+    var k: int64 = c->applen - c->apppos;
+    if (k > cap) { k = cap; }
+    memcpy(dst, c->app + c->apppos, k);
+    c->apppos = c->apppos + k;
+    if (c->apppos >= c->applen) {
+      cr_wipe(c->app, c->applen);
+      c->apppos = 0;
+      c->applen = 0;
+      if (c->err == 0) { mtls_conn_process(c); }
+    }
+    return k;
+  }
+  if (c->err != 0) { return (int64)c->err; }
+  if (c->peer_closed) { return 0; }
+  return (int64)MTLS_E_WANT_IO;
+}
+
+/// mtls_conn_write: encrypts n bytes of application data into the output
+/// queue. Returns n, or a negative error. Flush the output afterwards.
+export fn mtls_conn_write(c: MtlsConn*, src: uint8*, n: int64) -> int64 {
+  if (c->err != 0) { return (int64)c->err; }
+  if (!c->hs_done) { return (int64)MTLS_E_STATE; }
+  if (c->we_closed) { return (int64)MTLS_E_CLOSED; }
+  if (n <= 0) { return 0; }
+  var rc: int32 = mtls_send_record(c, MTLS_CT_APPDATA, src, n);
+  if (rc != MTLS_OK) { return (int64)rc; }
+  return n;
+}
+
+/// mtls_conn_close: queues close_notify. Reading stays possible until
+/// the peer closes too.
+export fn mtls_conn_close(c: MtlsConn*) -> int32 {
+  if (c->we_closed) { return MTLS_OK; }
+  c->we_closed = true;
+  if (c->err != 0) { return c->err; }
+  return mtls_send_alert(c, 1, MTLS_ALERT_CLOSE_NOTIFY);
+}
+
+/// mtls_conn_handshaking: true until the handshake finished or failed.
+export fn mtls_conn_handshaking(c: MtlsConn*) -> bool {
+  return !c->hs_done && c->err == 0;
+}
+
+export fn mtls_conn_error(c: MtlsConn*) -> int32 { return c->err; }
+export fn mtls_conn_version(c: MtlsConn*) -> int32 { return c->version; }
+export fn mtls_conn_suite(c: MtlsConn*) -> int32 { return c->suite.id; }
+export fn mtls_conn_resumed(c: MtlsConn*) -> bool { return c->resumed; }
+export fn mtls_conn_alert_sent(c: MtlsConn*) -> int32 { return c->alert_sent; }
+export fn mtls_conn_alert_received(c: MtlsConn*) -> int32 { return c->alert_recv; }
+export fn mtls_conn_peer_closed(c: MtlsConn*) -> bool { return c->peer_closed; }
+
+/// mtls_conn_alpn: the negotiated protocol ("" if none).
+export fn mtls_conn_alpn(c: MtlsConn*) -> string {
+  var s: string = "";
+  s.chars = &c->alpn[0];
+  s.length = (uint64)c->alpnlen;
+  return s;
+}
+
+/// mtls_conn_server_name: the host name (SNI) the client asked for.
+export fn mtls_conn_server_name(c: MtlsConn*) -> string {
+  var s: string = "";
+  s.chars = &c->host[0];
+  s.length = (uint64)c->hostlen;
+  return s;
+}
+
+/// mtls_conn_peer_cert: the peer's i-th certificate (0 = leaf) as DER.
+export fn mtls_conn_peer_cert(c: MtlsConn*, i: int32) -> MtlsDer {
+  var d: MtlsDer;
+  d.p = (uint8*)0;
+  d.n = 0;
+  if (i >= 0 && i < c->npchain) { d = c->pchain[i]; }
+  return d;
+}
+
+export fn mtls_conn_peer_cert_count(c: MtlsConn*) -> int32 { return c->npchain; }
+
+/// mtls_conn_cert_error: why the peer's certificate was refused, as an
+/// MTLS_CV_* code (mtls_cv_text gives the words); 0 if it was not.
+export fn mtls_conn_cert_error(c: MtlsConn*) -> int32 { return c->cert_detail; }
+
+/// mtls_conn_peer_verified: true when the peer's chain was checked and
+/// accepted (false with MTLS_VERIFY_NONE, or when the peer sent none).
+export fn mtls_conn_peer_verified(c: MtlsConn*) -> bool { return c->peer_verified; }
+
+/// mtls_conn_export: keying material for another protocol (RFC 8446 7.5).
+export fn mtls_conn_export(c: MtlsConn*, label: string, ctx: uint8*, clen: int64, out: uint8*, olen: int64) -> int32 {
+  if (!c->hs_done || c->err != 0) { return MTLS_E_STATE; }
+  if (c->version != MTLS_TLS13) { return MTLS_E_UNSUPPORTED; }
+  return mtls13_export(c, label, ctx, clen, out, olen);
+}
+
+export const MTLS_WANT_READ: int32 = 1;
+export const MTLS_WANT_WRITE: int32 = 2;
+
+/// mtls_conn_wants: what the connection needs from the socket next, as
+/// MTLS_WANT_READ | MTLS_WANT_WRITE bits. An event loop arms the socket
+/// for these (with alph: alph_io_arm with ALPH_IO_IN / ALPH_IO_OUT).
+/// 0 means nothing: the connection failed or both sides closed.
+export fn mtls_conn_wants(c: MtlsConn*) -> int32 {
+  var w: int32 = 0;
+  if (c->outlen - c->outpos > 0) { w = w | MTLS_WANT_WRITE; }
+  if (c->err == 0 && !c->peer_closed && c->apppos >= c->applen && c->inlen < MTLS_IN_CAP) { w = w | MTLS_WANT_READ; }
+  return w;
+}

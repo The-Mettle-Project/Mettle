@@ -1,0 +1,358 @@
+// Linux sound back ends. PulseAudio is tried first: it is the sound server
+// on most desktops, and PipeWire serves the same interface. ALSA is the
+// fall back (and is chosen by a device name like "hw:0" or "alsa:NAME").
+// Both libraries are loaded at run time with dlopen, so a program still
+// starts on a machine without them and just gets AUDIO_E_DEVICE.
+//
+// The device thread is a pthread (the sound libraries need one).
+
+import "std/mem";
+import "std/thread_posix" as pt;
+import "std/thread" as th;
+import "../core/status";
+import "types";
+
+// The device each thread serves. The thread gets its slot number, not a
+// pointer: a pointer passed through the thread start argument loses its
+// allocation record in bounds-checked (--safe) builds, while one read from
+// a global keeps it.
+const DEV_SLOTS = 32;
+var g_devs: AudioDevice*[32];
+var g_dev_used: int32[32];
+
+fn dev_claim(d: AudioDevice*) -> int32 {
+  for i in 0..DEV_SLOTS {
+    if (th.InterlockedCompareExchange(&g_dev_used[i], 1, 0) == 0) {
+      g_devs[i] = d;
+      return (int32)i;
+    }
+  }
+  return -1;
+}
+
+fn dev_release(slot: int32) {
+  if (slot < 0 || slot >= DEV_SLOTS) { return; }
+  g_devs[slot] = (AudioDevice*)0;
+  th.InterlockedExchange(&g_dev_used[slot], 0);
+}
+
+extern fn audio_dlopen(path: cstring, flags: int32) -> rawptr = "dlopen";
+extern fn audio_dlsym(h: rawptr, name: cstring) -> rawptr = "dlsym";
+
+struct PulseApi {
+  new_: fn(cstring, cstring, int32, cstring, cstring, uint8*, uint8*, uint8*, int32*) -> rawptr;
+  write: fn(rawptr, rawptr, int64, int32*) -> int32;
+  read: fn(rawptr, rawptr, int64, int32*) -> int32;
+  drain: fn(rawptr, int32*) -> int32;
+  free_: fn(rawptr) -> void;
+}
+
+struct AlsaApi {
+  open: fn(rawptr*, cstring, int32, int32) -> int32;
+  set_params: fn(rawptr, int32, int32, uint32, uint32, int32, uint32) -> int32;
+  writei: fn(rawptr, rawptr, int64) -> int64;
+  readi: fn(rawptr, rawptr, int64) -> int64;
+  recover: fn(rawptr, int32, int32) -> int32;
+  drain: fn(rawptr) -> int32;
+  close: fn(rawptr) -> int32;
+  get_params: fn(rawptr, int64*, int64*) -> int32;
+}
+
+var g_pa: PulseApi;
+var g_pa_lib: rawptr = 0;
+var g_pa_tried: bool = false;
+var g_al: AlsaApi;
+var g_al_lib: rawptr = 0;
+var g_al_tried: bool = false;
+
+fn load_pulse() -> bool {
+  if (g_pa_tried) { return g_pa_lib != 0; }
+  g_pa_tried = true;
+  var h: rawptr = audio_dlopen("libpulse-simple.so.0", 2);
+  if (h == 0) { return false; }
+  g_pa.new_ = (fn(cstring, cstring, int32, cstring, cstring, uint8*, uint8*, uint8*, int32*) -> rawptr)audio_dlsym(h, "pa_simple_new");
+  g_pa.write = (fn(rawptr, rawptr, int64, int32*) -> int32)audio_dlsym(h, "pa_simple_write");
+  g_pa.read = (fn(rawptr, rawptr, int64, int32*) -> int32)audio_dlsym(h, "pa_simple_read");
+  g_pa.drain = (fn(rawptr, int32*) -> int32)audio_dlsym(h, "pa_simple_drain");
+  g_pa.free_ = (fn(rawptr) -> void)audio_dlsym(h, "pa_simple_free");
+  if (g_pa.new_ == 0 || g_pa.write == 0 || g_pa.read == 0 || g_pa.free_ == 0) { return false; }
+  g_pa_lib = h;
+  return true;
+}
+
+fn load_alsa() -> bool {
+  if (g_al_tried) { return g_al_lib != 0; }
+  g_al_tried = true;
+  var h: rawptr = audio_dlopen("libasound.so.2", 2);
+  if (h == 0) { return false; }
+  g_al.open = (fn(rawptr*, cstring, int32, int32) -> int32)audio_dlsym(h, "snd_pcm_open");
+  g_al.set_params = (fn(rawptr, int32, int32, uint32, uint32, int32, uint32) -> int32)audio_dlsym(h, "snd_pcm_set_params");
+  g_al.writei = (fn(rawptr, rawptr, int64) -> int64)audio_dlsym(h, "snd_pcm_writei");
+  g_al.readi = (fn(rawptr, rawptr, int64) -> int64)audio_dlsym(h, "snd_pcm_readi");
+  g_al.recover = (fn(rawptr, int32, int32) -> int32)audio_dlsym(h, "snd_pcm_recover");
+  g_al.drain = (fn(rawptr) -> int32)audio_dlsym(h, "snd_pcm_drain");
+  g_al.close = (fn(rawptr) -> int32)audio_dlsym(h, "snd_pcm_close");
+  g_al.get_params = (fn(rawptr, int64*, int64*) -> int32)audio_dlsym(h, "snd_pcm_get_params");
+  if (g_al.open == 0 || g_al.set_params == 0 || g_al.writei == 0 || g_al.readi == 0 || g_al.close == 0) { return false; }
+  g_al_lib = h;
+  return true;
+}
+
+fn put32(p: uint8*, v: int64) {
+  p[0] = (uint8)v; p[1] = (uint8)(v >> 8); p[2] = (uint8)(v >> 16); p[3] = (uint8)(v >> 24);
+}
+
+// PulseAudio channel positions for the WAV order of each channel count.
+fn pulse_map(ch: int32, map: uint8*) {
+  memset(map, 0, 132);
+  map[0] = (uint8)ch;
+  var pos: int32[8] = [1, 2, 3, 7, 5, 6, 10, 11];   // FL FR FC LFE RL RR SL SR
+  if (ch == 1) { put32(map + 4, 0); return; }
+  if (ch == 4) {
+    var q: int32[4] = [1, 2, 5, 6];
+    for i in 0..4 { put32(map + 4 + 4 * (int64)i, (int64)q[i]); }
+    return;
+  }
+  if (ch == 5) {
+    var q: int32[5] = [1, 2, 3, 5, 6];
+    for i in 0..5 { put32(map + 4 + 4 * (int64)i, (int64)q[i]); }
+    return;
+  }
+  if (ch == 7) {
+    var q: int32[7] = [1, 2, 3, 7, 4, 10, 11];
+    for i in 0..7 { put32(map + 4 + 4 * (int64)i, (int64)q[i]); }
+    return;
+  }
+  for i in 0..ch { put32(map + 4 + 4 * (int64)i, (int64)pos[i]); }
+}
+
+fn open_pulse(d: AudioDevice*) -> int32 {
+  if (!load_pulse()) { return AUDIO_E_DEVICE; }
+  var ss: uint8[12];
+  memset(&ss[0], 0, 12);
+  put32(&ss[0], 5);                  // PA_SAMPLE_FLOAT32LE
+  put32(&ss[4], (int64)d->rate);
+  ss[8] = (uint8)d->ch;
+  var map: uint8[132];
+  pulse_map(d->ch, &map[0]);
+  // buffer: about four periods, so the server keeps our latency low
+  var bytes: int64 = (int64)d->period * (int64)d->ch * 4;
+  var attr: uint8[20];
+  for i in 0..20 { attr[i] = 0xFF; }  // (uint32)-1 = server default
+  if (d->playback) {
+    put32(&attr[4], bytes * 4);      // tlength
+    put32(&attr[12], bytes);         // minreq
+  } else {
+    put32(&attr[16], bytes);         // fragsize
+  }
+  var dir: int32 = 1;                // PA_STREAM_PLAYBACK
+  if (!d->playback) { dir = 2; }     // PA_STREAM_RECORD
+  var dev: cstring = (cstring)0;
+  if (d->name[0] != 0) { dev = (cstring)&d->name[0]; }
+  var err: int32 = 0;
+  var s: rawptr = g_pa.new_((cstring)0, "Mettle audio", dir, dev, "audio", &ss[0], &map[0], &attr[0], &err);
+  if (s == 0) { return AUDIO_E_DEVICE; }
+  d->h = s;
+  d->backend = AUDIO_DEV_PULSE;
+  d->bufframes = d->period * 4;
+  return AUDIO_OK;
+}
+
+fn has_prefix(d: AudioDevice*, p: string) -> bool {
+  for i in 0..(int64)p.length {
+    if (d->name[i] != (uint8)p[i]) { return false; }
+  }
+  return true;
+}
+
+fn open_alsa(d: AudioDevice*) -> int32 {
+  if (!load_alsa()) { return AUDIO_E_DEVICE; }
+  var name: cstring = "default";
+  if (d->name[0] != 0) {
+    name = (cstring)&d->name[0];
+    if (has_prefix(d, "alsa:")) { name = (cstring)&d->name[5]; }
+  }
+  var pcm: rawptr = 0;
+  var stream: int32 = 0;
+  if (!d->playback) { stream = 1; }
+  if (g_al.open(&pcm, name, stream, 0) < 0 || pcm == 0) { return AUDIO_E_DEVICE; }
+  var lat: uint32 = (uint32)((int64)d->period * 4 * 1000000 / (int64)d->rate);
+  // float first, then 16-bit for devices without a float path
+  var rc: int32 = g_al.set_params(pcm, 14, 3, (uint32)d->ch, (uint32)d->rate, 1, lat);
+  if (rc < 0) {
+    rc = g_al.set_params(pcm, 2, 3, (uint32)d->ch, (uint32)d->rate, 1, lat);
+    if (rc < 0) { g_al.close(pcm); return AUDIO_E_DEVICE; }
+    d->use_s16 = true;
+    d->sbuf = (int16*)malloc((int64)d->period * (int64)d->ch * 2);
+    if (d->sbuf == 0) { g_al.close(pcm); return AUDIO_E_MEM; }
+  }
+  d->h = pcm;
+  d->backend = AUDIO_DEV_ALSA;
+  d->remap = d->ch == 6 || d->ch == 8;
+  d->bufframes = d->period * 4;
+  if (g_al.get_params != 0) {
+    var bs: int64 = 0;
+    var ps: int64 = 0;
+    if (g_al.get_params(pcm, &bs, &ps) == 0 && bs > 0) { d->bufframes = (int32)bs; }
+  }
+  return AUDIO_OK;
+}
+
+/// Opens the back end for d (name, rate, ch, period and playback set).
+export fn audio_os_open(d: AudioDevice*) -> int32 {
+  var alsa_name: bool = has_prefix(d, "alsa:") || has_prefix(d, "hw:") || has_prefix(d, "plughw:") || has_prefix(d, "default") || has_prefix(d, "null");
+  if (!alsa_name) {
+    if (open_pulse(d) == AUDIO_OK) { return AUDIO_OK; }
+  }
+  return open_alsa(d);
+}
+
+// WAV order (FL FR FC LFE BL BR SL SR) to ALSA order (FL FR BL BR FC LFE SL SR).
+fn alsa_order(f: float32*, frames: int32, ch: int32) {
+  for i in 0..(int64)frames {
+    var q: float32* = f + i * (int64)ch;
+    var fc: float32 = q[2];
+    var lfe: float32 = q[3];
+    q[2] = q[4];
+    q[3] = q[5];
+    q[4] = fc;
+    q[5] = lfe;
+  }
+}
+
+fn alsa_unorder(f: float32*, frames: int32, ch: int32) {
+  for i in 0..(int64)frames {
+    var q: float32* = f + i * (int64)ch;
+    var bl: float32 = q[2];
+    var br: float32 = q[3];
+    q[2] = q[4];
+    q[3] = q[5];
+    q[4] = bl;
+    q[5] = br;
+  }
+}
+
+fn to_s16(f: float32*, s: int16*, n: int64) {
+  for i in 0..n {
+    var x: float32 = f[i] * 32768.0;
+    if (x > 32767.0) { x = 32767.0; }
+    if (x < -32768.0) { x = -32768.0; }
+    if (x >= 0.0) { s[i] = (int16)(x + 0.5); } else { s[i] = (int16)(x - 0.5); }
+  }
+}
+
+fn from_s16(s: int16*, f: float32*, n: int64) {
+  for i in 0..n { f[i] = (float32)s[i] * 0.000030517578125; }
+}
+
+// Moves one period. False when the device failed for good.
+fn step(d: AudioDevice*) -> bool {
+  var n: int32 = d->period;
+  var ns: int64 = (int64)n * (int64)d->ch;
+  var err: int32 = 0;
+  if (d->playback) {
+    d->cb(d->user, d->buf, n, d->ch);
+    if (d->backend == AUDIO_DEV_PULSE) {
+      return g_pa.write(d->h, (rawptr)d->buf, ns * 4, &err) >= 0;
+    }
+    if (d->remap) { alsa_order(d->buf, n, d->ch); }
+    var src: rawptr = (rawptr)d->buf;
+    if (d->use_s16) { to_s16(d->buf, d->sbuf, ns); src = (rawptr)d->sbuf; }
+    var done: int64 = 0;
+    var tries: int32 = 0;
+    while (done < (int64)n && tries < 8) {
+      var ss: int64 = 4;
+      if (d->use_s16) { ss = 2; }
+      var r: int64 = g_al.writei(d->h, (rawptr)((uint8*)src + done * (int64)d->ch * ss), (int64)n - done);
+      if (r < 0) {
+        tries = tries + 1;
+        if (g_al.recover(d->h, (int32)r, 1) < 0) { return false; }
+        continue;
+      }
+      done = done + r;
+    }
+    return true;
+  }
+  if (d->backend == AUDIO_DEV_PULSE) {
+    if (g_pa.read(d->h, (rawptr)d->buf, ns * 4, &err) < 0) { return false; }
+  } else {
+    var dst: rawptr = (rawptr)d->buf;
+    if (d->use_s16) { dst = (rawptr)d->sbuf; }
+    var done: int64 = 0;
+    var tries: int32 = 0;
+    while (done < (int64)n && tries < 8) {
+      var ss: int64 = 4;
+      if (d->use_s16) { ss = 2; }
+      var r: int64 = g_al.readi(d->h, (rawptr)((uint8*)dst + done * (int64)d->ch * ss), (int64)n - done);
+      if (r < 0) {
+        tries = tries + 1;
+        if (g_al.recover(d->h, (int32)r, 1) < 0) { return false; }
+        continue;
+      }
+      done = done + r;
+    }
+    if (d->use_s16) { from_s16(d->sbuf, d->buf, ns); }
+    if (d->remap) { alsa_unorder(d->buf, n, d->ch); }
+  }
+  d->cb(d->user, d->buf, n, d->ch);
+  return true;
+}
+
+fn dev_thread(arg: cstring) -> cstring {
+  var slot: int64 = (int64)arg - 1;
+  if (slot < 0 || slot >= DEV_SLOTS) { return (cstring)0; }
+  var d: AudioDevice* = g_devs[slot];
+  while (th.InterlockedCompareExchange(&d->running, 0, 0) != 0) {
+    if (!step(d)) {
+      th.InterlockedExchange(&d->err, AUDIO_E_DEVICE);
+      break;
+    }
+  }
+  th.InterlockedExchange(&d->alive, 0);
+  return (cstring)0;
+}
+
+/// Starts the device thread.
+export fn audio_os_start(d: AudioDevice*) -> int32 {
+  var slot: int32 = dev_claim(d);
+  if (slot < 0) { return AUDIO_E_LIMIT; }
+  d->slot = slot;
+  th.InterlockedExchange(&d->running, 1);
+  th.InterlockedExchange(&d->alive, 1);
+  var t: int64 = 0;
+  if (pt.pthread_create(&t, (cstring)0, &dev_thread, (cstring)(int64)(slot + 1)) != 0) {
+    th.InterlockedExchange(&d->running, 0);
+    th.InterlockedExchange(&d->alive, 0);
+    dev_release(slot);
+    return AUDIO_E_DEVICE;
+  }
+  d->thread = t;
+  return AUDIO_OK;
+}
+
+/// Stops the device thread and waits for it.
+export fn audio_os_stop(d: AudioDevice*) {
+  th.InterlockedExchange(&d->running, 0);
+  if (d->thread != 0) {
+    pt.pthread_join(d->thread, (cstring)0);
+    d->thread = 0;
+    dev_release(d->slot);
+  }
+}
+
+/// Closes the back end.
+export fn audio_os_close(d: AudioDevice*) {
+  var err: int32 = 0;
+  if (d->h != 0) {
+    if (d->backend == AUDIO_DEV_PULSE) {
+      if (d->playback && g_pa.drain != 0) { g_pa.drain(d->h, &err); }
+      g_pa.free_(d->h);
+    } else if (d->backend == AUDIO_DEV_ALSA) {
+      if (d->playback && g_al.drain != 0) { g_al.drain(d->h); }
+      g_al.close(d->h);
+    }
+  }
+  d->h = 0;
+  if (d->sbuf != 0) { free(d->sbuf); }
+  d->sbuf = (int16*)0;
+}

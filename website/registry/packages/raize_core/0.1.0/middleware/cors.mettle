@@ -1,0 +1,536 @@
+// raize/middleware/cors — the cross-origin answer, and nothing else.
+//
+// This middleware makes exactly two decisions per request and then gets out of
+// the way:
+//
+//   preflight  verb == OPTIONS and an Access-Control-Request-Method header is
+//              present. It answers 204 itself (never calling next) with
+//              Access-Control-Allow-Origin / -Methods / -Headers and, when
+//              configured, -Max-Age and -Credentials.
+//
+//   simple     anything else that carries an Origin header. It adds
+//              Access-Control-Allow-Origin (and -Credentials when enabled) to
+//              the response the rest of the chain builds, then calls next. The
+//              headers are set *before* next runs, so they survive on a 4xx/5xx
+//              the handler produces — which is the case a browser needs them
+//              most, since without them the page cannot even read the error.
+//
+// A request with no Origin header is not a CORS request and this middleware
+// only calls next: no headers, no noise, no Vary.
+//
+// ## The wildcard rule (the one that matters)
+//
+// `Access-Control-Allow-Origin: *` and `Access-Control-Allow-Credentials: true`
+// are forbidden together by the Fetch standard, and every browser enforces it.
+// A server that emits both is not "permissive", it is broken — and it is the
+// classic way an API accidentally opens itself to every site with cookies.
+//
+// So the combination is refused twice:
+//
+//   * at startup, rz_cors_use() returns -1 and the config is not published, so
+//     a process with the bad combination cannot serve a single request;
+//   * at request time, rz_cors_allow_origin() returns empty for it, so even a
+//     config mutated behind our back can never put `*` next to credentials.
+//
+// `*` with credentials *disabled* is fine and is the default.
+//
+// ## Matching
+//
+// With a single configured origin ("https://app.example") the request's Origin
+// must match it exactly, case-insensitively (scheme and host are
+// case-insensitive; the value is a plain origin, no path). Up to
+// RZ_CORS_MAX_ORIGINS extra exact origins can be registered with
+// rz_cors_add_origin for a multi-tenant app whose tenants are known at startup.
+// Anything else gets no Allow-Origin at all — which is how a browser is told
+// "not allowed" — and is counted as `refused`.
+//
+// Every value that reaches a response header goes through rz_hdr_set, which
+// refuses CR/LF/NUL. The Origin value is client-controlled, so this is not
+// theoretical: it is the response-splitting sink in this file.
+
+import "std/mem";
+import "std/thread";
+import "../str/str";
+import "../context/context";
+import "headers";
+
+export const RZ_CORS_MAX_ORIGINS: int32 = 4;
+export const RZ_CORS_DEFAULT_MAX_AGE: int32 = 600;
+export const RZ_CORS_DEFAULT_METHODS: string = "GET, POST, HEAD, PUT, PATCH, DELETE, OPTIONS";
+export const RZ_CORS_DEFAULT_HEADERS: string = "content-type, authorization";
+
+export struct RzCorsStats {
+  preflights: int32;        // OPTIONS + Access-Control-Request-Method answered
+  simple: int32;            // non-preflight requests given CORS headers
+  refused: int32;           // Origin not allowed: no Allow-Origin emitted
+  wildcard_refused: int32;  // credentials + "*" seen at request time
+  header_rejected: int32;   // a header write was refused (CRLF/name/full)
+}
+
+export struct RzCors {
+  origin: string;            // "*" or one exact origin; borrowed, must outlive
+  methods: string;           // Access-Control-Allow-Methods
+  headers: string;           // Access-Control-Allow-Headers
+  max_age: int32;            // Access-Control-Max-Age seconds; <= 0 omits it
+  credentials: bool;
+  extra_origins: string[4];  // RZ_CORS_MAX_ORIGINS
+  extra_count: int32;
+  stats: RzCorsStats;
+}
+
+var g_rz_cors: RzCors* = 0;
+
+export fn rz_cors_new() -> RzCors* {
+  var c: RzCors* = (RzCors*)calloc(1, sizeof(RzCors));
+  if (c == 0) { return 0; }
+  c->origin = "*";
+  c->methods = RZ_CORS_DEFAULT_METHODS;
+  c->headers = RZ_CORS_DEFAULT_HEADERS;
+  c->max_age = RZ_CORS_DEFAULT_MAX_AGE;
+  c->credentials = false;
+  c->extra_count = 0;
+  return c;
+}
+
+export fn rz_cors_free(c: RzCors*) {
+  if (c == 0) { return; }
+  if (g_rz_cors == c) { g_rz_cors = 0; }
+  free((rawptr)c);
+}
+
+export fn rz_cors_stats(c: RzCors*) -> RzCorsStats {
+  var s: RzCorsStats;
+  if (c == 0) { return s; }
+  s = c->stats;
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration. Every setter validates at the point of the set: a config
+// value that could split a header can never be stored.
+// ---------------------------------------------------------------------------
+
+export fn rz_cors_set_origin(c: RzCors*, origin: string) -> int32 {
+  if (c == 0) { return -1; }
+  if (origin.length == 0) { return -1; }
+  if (!rz_hdr_crlf_ok(origin)) { return -1; }
+  c->origin = origin;
+  return 0;
+}
+
+export fn rz_cors_set_methods(c: RzCors*, methods: string) -> int32 {
+  if (c == 0) { return -1; }
+  if (methods.length == 0) { return -1; }
+  if (!rz_hdr_crlf_ok(methods)) { return -1; }
+  c->methods = methods;
+  return 0;
+}
+
+export fn rz_cors_set_headers(c: RzCors*, headers: string) -> int32 {
+  if (c == 0) { return -1; }
+  if (headers.length == 0) { return -1; }
+  if (!rz_hdr_crlf_ok(headers)) { return -1; }
+  c->headers = headers;
+  return 0;
+}
+
+export fn rz_cors_set_max_age(c: RzCors*, seconds: int32) -> int32 {
+  if (c == 0) { return -1; }
+  c->max_age = seconds;
+  return 0;
+}
+
+export fn rz_cors_set_credentials(c: RzCors*, on: bool) -> int32 {
+  if (c == 0) { return -1; }
+  c->credentials = on;
+  return 0;
+}
+
+// 0 added, -1 null/empty/CRLF, -2 list full.
+export fn rz_cors_add_origin(c: RzCors*, origin: string) -> int32 {
+  if (c == 0 || origin.length == 0) { return -1; }
+  if (!rz_hdr_crlf_ok(origin)) { return -1; }
+  if (c->extra_count >= RZ_CORS_MAX_ORIGINS) { return -2; }
+  c->extra_origins[c->extra_count] = origin;
+  c->extra_count = c->extra_count + 1;
+  return 0;
+}
+
+// 0 valid; negative identifies the one broken setting:
+//   -1 credentials with a "*" origin (the wildcard rule)
+//   -2 empty origin
+//   -3 empty methods
+//   -4 empty headers
+//   -5 a value that would split a header (CR/LF/NUL)
+export fn rz_cors_validate(c: RzCors*) -> int32 {
+  if (c == 0) { return -1; }
+  if (c->origin.length == 0) { return -2; }
+  if (c->methods.length == 0) { return -3; }
+  if (c->headers.length == 0) { return -4; }
+  if (!rz_hdr_crlf_ok(c->origin)) { return -5; }
+  if (!rz_hdr_crlf_ok(c->methods)) { return -5; }
+  if (!rz_hdr_crlf_ok(c->headers)) { return -5; }
+  var i: int32 = 0;
+  while (i < c->extra_count) {
+    if (!rz_hdr_crlf_ok(c->extra_origins[i])) { return -5; }
+    i = i + 1;
+  }
+  if (c->credentials && rz_str_eq(c->origin, "*")) { return -1; }
+  return 0;
+}
+
+// Validates and publishes. A process that fails this must not serve: the
+// alternative is a runtime 500 on every cross-origin request.
+export fn rz_cors_use(c: RzCors*) -> int32 {
+  var rc: int32 = rz_cors_validate(c);
+  if (rc != 0) { return rc; }
+  g_rz_cors = c;
+  return 0;
+}
+
+fn rz_cors_cfg() -> RzCors* {
+  return g_rz_cors;
+}
+
+// ---------------------------------------------------------------------------
+// Decision
+// ---------------------------------------------------------------------------
+
+// The value to put in Access-Control-Allow-Origin, or empty for "not allowed".
+// Empty is also the answer for credentials + "*", which is why the wildcard
+// rule cannot be bypassed by a config the validators never saw.
+export fn rz_cors_allow_origin(c: RzCors*, req_origin: string) -> string {
+  if (c == 0) { return rz_str_empty(); }
+  if (req_origin.length == 0) { return rz_str_empty(); }
+  if (c->origin.length == 0) { return rz_str_empty(); }
+  var wildcard: bool = rz_str_eq(c->origin, "*");
+  if (wildcard) {
+    if (c->credentials) {
+      atomic_inc_i32(&c->stats.wildcard_refused);
+      return rz_str_empty();
+    }
+    return "*";
+  }
+  // Exact match, case-insensitive: the wire form of the request's own origin is
+  // what goes back (that is what the Fetch standard compares byte-for-byte).
+  if (rz_str_eq_ci(c->origin, req_origin)) { return req_origin; }
+  var i: int32 = 0;
+  while (i < c->extra_count) {
+    if (rz_str_eq_ci(c->extra_origins[i], req_origin)) { return req_origin; }
+    i = i + 1;
+  }
+  return rz_str_empty();
+}
+
+// Writes the header set for `allow`. Returns 0 when all of them were stored,
+// or the first rz_hdr_* failure (the caller counts it and keeps going: a full
+// header table must not turn a preflight into a 500).
+fn rz_cors_apply(ctx: RzContext*, c: RzCors*, allow: string, preflight: bool) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return RZ_HDR_REJECTED; }
+  var resp: RzResponse* = ctx->resp;
+  var rc: int32 = rz_hdr_set(resp, "Access-Control-Allow-Origin", allow);
+  if (rc != RZ_HDR_OK) { return rc; }
+  // A response that varies by Origin must say so or a shared cache will serve
+  // one tenant's answer to another.
+  rz_hdr_append(resp, "Vary", "Origin");
+  if (c->credentials) {
+    rz_hdr_set(resp, "Access-Control-Allow-Credentials", "true");
+  }
+  if (!preflight) { return RZ_HDR_OK; }
+  rz_hdr_set(resp, "Access-Control-Allow-Methods", c->methods);
+  rz_hdr_set(resp, "Access-Control-Allow-Headers", c->headers);
+  if (c->max_age > 0) {
+    var nb: uint8[24];
+    var n: string = rz_int_buf((int64)c->max_age, &nb[0], 24);
+    rz_hdr_set(resp, "Access-Control-Max-Age", n);
+  }
+  return RZ_HDR_OK;
+}
+
+// The preflight predicate, exported because the fixture and the tests assert
+// it directly: an OPTIONS with Access-Control-Request-Method is a preflight,
+// an OPTIONS without it is an ordinary (usually 405) request.
+export fn rz_cors_is_preflight(req: RzRequest*) -> bool {
+  if (req == 0) { return false; }
+  if (!rz_req_verb_is(req, "OPTIONS")) { return false; }
+  return rz_hdr_in_has(req, "Access-Control-Request-Method");
+}
+
+// ---------------------------------------------------------------------------
+// The middleware
+// ---------------------------------------------------------------------------
+
+export fn rz_mw_cors(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  var c: RzCors* = rz_cors_cfg();
+  if (c == 0 || ctx == 0 || ctx->req == 0) { return next(ctx); }
+  var req: RzRequest* = ctx->req;
+  var origin: string = rz_hdr_in_get(req, "Origin");
+  if (rz_cors_is_preflight(req)) {
+    atomic_inc_i32(&c->stats.preflights);
+    var allow: string = rz_cors_allow_origin(c, origin);
+    if (allow.length == 0) {
+      // Not allowed (or a misconfigured wildcard+credentials). Answer the
+      // OPTIONS with a plain 204 and no CORS headers: the browser then blocks
+      // the real request. A 4xx here would be wrong — an OPTIONS is legal for
+      // anyone, and CORS is a browser policy, not server authorisation.
+      atomic_inc_i32(&c->stats.refused);
+      rz_ctx_empty(ctx, 204);
+      ctx->aborted = true;
+      return 0;
+    }
+    var rc: int32 = rz_cors_apply(ctx, c, allow, true);
+    if (rc != RZ_HDR_OK) { atomic_inc_i32(&c->stats.header_rejected); }
+    rz_ctx_empty(ctx, 204);
+    ctx->aborted = true;
+    return 0;
+  }
+  if (origin.length > 0) {
+    var allow2: string = rz_cors_allow_origin(c, origin);
+    if (allow2.length == 0) {
+      atomic_inc_i32(&c->stats.refused);
+    } else {
+      var rc2: int32 = rz_cors_apply(ctx, c, allow2, false);
+      if (rc2 != RZ_HDR_OK) { atomic_inc_i32(&c->stats.header_rejected); }
+      atomic_inc_i32(&c->stats.simple);
+    }
+  }
+  return next(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// Run: ./mettle-build/bin/mettle test framework/middleware/cors.mettle
+// ---------------------------------------------------------------------------
+
+// Adds one request header (the request table is the server's, arena-backed).
+fn t_cors_add_header(req: RzRequest*, name: string, value: string) {
+  var at: int32 = req->header_count;
+  req->headers[at].name = name;
+  req->headers[at].value = value;
+  req->header_count = at + 1;
+}
+
+fn t_cors_term(ctx: RzContext*) -> int32 {
+  if (ctx->resp != 0) {
+    rz_resp_write(ctx->resp, "T");
+    ctx->resp->status = 200;
+  }
+  ctx->status = 200;
+  return 200;
+}
+
+@test fn t_rz_cors_config_validation() -> int32 {
+  var c: RzCors* = rz_cors_new();
+  if (c == 0) { return 1; }
+  defer rz_cors_free(c);
+  // defaults: "*" with credentials off is the only permissive-but-legal pair
+  if (!rz_str_eq(c->origin, "*")) { return 2; }
+  if (rz_cors_validate(c) != 0) { return 3; }
+  if (rz_cors_set_origin(c, "") != -1) { return 4; }
+  if (rz_cors_set_origin(c, "https://a.test\r\nX: 1") != -1) { return 5; }
+  if (rz_cors_set_methods(c, "") != -1) { return 6; }
+  if (rz_cors_set_headers(c, "x\r\nY: 1") != -1) { return 7; }
+  if (rz_cors_add_origin(c, "") != -1) { return 8; }
+  if (rz_cors_add_origin(c, "https://b.test\n") != -1) { return 9; }
+  // the wildcard rule: "*" and credentials are refused together, at startup
+  if (rz_cors_set_credentials(c, true) != 0) { return 10; }
+  if (rz_cors_validate(c) != -1) { return 11; }
+  if (rz_cors_use(c) != -1) { return 12; }
+  // one exact origin makes the pair legal again
+  if (rz_cors_set_origin(c, "https://app.test") != 0) { return 13; }
+  if (rz_cors_validate(c) != 0) { return 14; }
+  if (rz_cors_use(c) != 0) { return 15; }
+  // (c is freed by the defer; g_rz_cors is cleared by that same free)
+  return 0;
+}
+
+@test fn t_rz_cors_allow_origin_rules() -> int32 {
+  var c: RzCors* = rz_cors_new();
+  if (c == 0) { return 1; }
+  defer rz_cors_free(c);
+  // wildcard, no credentials
+  if (!rz_str_eq(rz_cors_allow_origin(c, "https://x.test"), "*")) { return 2; }
+  if (rz_cors_allow_origin(c, "").length != 0) { return 3; }
+  // a single exact origin: the request's own spelling comes back (byte-for-byte
+  // comparison is what the browser does), matched case-insensitively
+  if (rz_cors_set_origin(c, "https://app.test") != 0) { return 4; }
+  if (!rz_str_eq(rz_cors_allow_origin(c, "https://app.test"), "https://app.test")) { return 5; }
+  if (!rz_str_eq(rz_cors_allow_origin(c, "HTTPS://APP.TEST"), "HTTPS://APP.TEST")) { return 6; }
+  if (rz_cors_allow_origin(c, "https://evil.test").length != 0) { return 7; }
+  // registered extra origins
+  if (rz_cors_add_origin(c, "https://b.test") != 0) { return 8; }
+  if (!rz_str_eq(rz_cors_allow_origin(c, "https://b.test"), "https://b.test")) { return 9; }
+  var i: int32 = 1;
+  while (i < RZ_CORS_MAX_ORIGINS) {
+    if (rz_cors_add_origin(c, "https://c.test") != 0) { return 10; }
+    i = i + 1;
+  }
+  // the list is fixed: one more is refused, never silently dropped
+  if (rz_cors_add_origin(c, "https://over.test") != -2) { return 11; }
+  // credentials + "*": no Allow-Origin can ever be produced, even when the
+  // config is mutated behind the validator's back
+  var d: RzCors* = rz_cors_new();
+  if (d == 0) { return 12; }
+  defer rz_cors_free(d);
+  d->credentials = true;
+  if (rz_cors_allow_origin(d, "https://x.test").length != 0) { return 13; }
+  var st: RzCorsStats = rz_cors_stats(d);
+  if (st.wildcard_refused != 1) { return 14; }
+  return 0;
+}
+
+@test fn t_rz_cors_preflight_predicate() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  if (rz_cors_is_preflight(&req)) { return 3; }
+  req.verb = "OPTIONS";
+  if (rz_cors_is_preflight(&req)) { return 4; }   // no Access-Control-Request-Method
+  t_cors_add_header(&req, "Access-Control-Request-Method", "POST");
+  if (!rz_cors_is_preflight(&req)) { return 5; }
+  req.verb = "GET";
+  if (rz_cors_is_preflight(&req)) { return 6; }
+  if (rz_cors_is_preflight(0)) { return 7; }
+  return 0;
+}
+
+// The whole middleware, on a real preflight: 204, the three headers, Vary, and
+// the terminal never runs.
+@test fn t_rz_cors_preflight_answers() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var c: RzCors* = rz_cors_new();
+  if (c == 0) { return 4; }
+  defer rz_cors_free(c);
+  if (rz_cors_use(c) != 0) { return 5; }
+
+  req.verb = "OPTIONS";
+  t_cors_add_header(&req, "Origin", "https://x.test");
+  t_cors_add_header(&req, "Access-Control-Request-Method", "POST");
+  t_cors_add_header(&req, "Access-Control-Request-Headers", "x-custom");
+  var st: int32 = rz_mw_cors(&ctx, &t_cors_term);
+  if (st != 0) { return 6; }              // "answered", the chain stops
+  if (!ctx.aborted) { return 7; }
+  if (resp->status != 204) { return 8; }
+  if (rz_buf_str(resp->body).length != 0) { return 9; }   // next() never ran
+  if (!rz_str_eq(rz_hdr_get(resp, "Access-Control-Allow-Origin"), "*")) { return 10; }
+  if (!rz_str_eq(rz_hdr_get(resp, "Access-Control-Allow-Methods"), RZ_CORS_DEFAULT_METHODS)) { return 11; }
+  if (!rz_str_eq(rz_hdr_get(resp, "Access-Control-Allow-Headers"), RZ_CORS_DEFAULT_HEADERS)) { return 12; }
+  if (!rz_str_eq(rz_hdr_get(resp, "Access-Control-Max-Age"), "600")) { return 13; }
+  if (!rz_str_eq(rz_hdr_get(resp, "Vary"), "Origin")) { return 14; }
+  if (rz_hdr_get(resp, "Access-Control-Allow-Credentials").length != 0) { return 15; }
+  var cs: RzCorsStats = rz_cors_stats(c);
+  if (cs.preflights != 1) { return 16; }
+  return 0;
+}
+
+@test fn t_rz_cors_preflight_refused_origin() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var c: RzCors* = rz_cors_new();
+  if (c == 0) { return 4; }
+  defer rz_cors_free(c);
+  if (rz_cors_set_origin(c, "https://app.test") != 0) { return 5; }
+  if (rz_cors_use(c) != 0) { return 6; }
+  req.verb = "OPTIONS";
+  t_cors_add_header(&req, "Origin", "https://evil.test");
+  t_cors_add_header(&req, "Access-Control-Request-Method", "POST");
+  if (rz_mw_cors(&ctx, &t_cors_term) != 0) { return 7; }
+  // still a 204 (an OPTIONS is legal for anyone); the browser blocks because
+  // there is no Allow-Origin
+  if (resp->status != 204) { return 8; }
+  if (rz_hdr_get(resp, "Access-Control-Allow-Origin").length != 0) { return 9; }
+  var cs: RzCorsStats = rz_cors_stats(c);
+  if (cs.refused != 1) { return 10; }
+  return 0;
+}
+
+@test fn t_rz_cors_simple_and_no_origin() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var c: RzCors* = rz_cors_new();
+  if (c == 0) { return 4; }
+  defer rz_cors_free(c);
+  if (rz_cors_use(c) != 0) { return 5; }
+
+  // no Origin: not a CORS request, no headers, no Vary, nothing to count
+  req.verb = "GET";
+  if (rz_mw_cors(&ctx, &t_cors_term) != 200) { return 6; }
+  if (!rz_str_eq(rz_buf_str(resp->body), "T")) { return 7; }
+  if (rz_hdr_get(resp, "Access-Control-Allow-Origin").length != 0) { return 8; }
+  if (rz_hdr_get(resp, "Vary").length != 0) { return 9; }
+  if (rz_hdr_get(resp, "Access-Control-Allow-Methods").length != 0) { return 10; }
+
+  // a simple request: Allow-Origin now, before the handler runs, so it survives
+  // whatever status the handler produces
+  resp->body->len = 0;
+  resp->header_count = 0;
+  req.header_count = 0;
+  t_cors_add_header(&req, "Origin", "https://x.test");
+  if (rz_mw_cors(&ctx, &t_cors_term) != 200) { return 11; }
+  if (!rz_str_eq(rz_hdr_get(resp, "Access-Control-Allow-Origin"), "*")) { return 12; }
+  if (rz_hdr_get(resp, "Access-Control-Allow-Methods").length != 0) { return 13; }
+  var cs: RzCorsStats = rz_cors_stats(c);
+  if (cs.simple != 1) { return 14; }
+  if (cs.preflights != 0) { return 15; }
+  return 0;
+}
+
+@test fn t_rz_cors_credentials_never_wildcard() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var c: RzCors* = rz_cors_new();
+  if (c == 0) { return 4; }
+  defer rz_cors_free(c);
+  if (rz_cors_set_origin(c, "https://app.test") != 0) { return 5; }
+  if (rz_cors_set_credentials(c, true) != 0) { return 6; }
+  if (rz_cors_use(c) != 0) { return 7; }
+  req.verb = "OPTIONS";
+  t_cors_add_header(&req, "Origin", "https://app.test");
+  t_cors_add_header(&req, "Access-Control-Request-Method", "POST");
+  if (rz_mw_cors(&ctx, &t_cors_term) != 0) { return 8; }
+  // the exact origin, never "*", and credentials announced
+  if (!rz_str_eq(rz_hdr_get(resp, "Access-Control-Allow-Origin"), "https://app.test")) { return 9; }
+  var i: int32 = 0;
+  while (i < resp->header_count) {
+    if (rz_str_eq(resp->headers[i].value, "*")) { return 10; }   // never a wildcard
+    i = i + 1;
+  }
+  if (!rz_str_eq(rz_hdr_get(resp, "Access-Control-Allow-Credentials"), "true")) { return 11; }
+  return 0;
+}

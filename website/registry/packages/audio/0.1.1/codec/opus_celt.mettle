@@ -1,0 +1,2043 @@
+// The CELT layer of Opus (RFC 6716 section 4.3): band energies, bit
+// allocation, PVQ shapes, the inverse MDCT and the pitch post-filter.
+// A port of the float decoder of libopus (BSD): celt_decoder.c, bands.c,
+// vq.c, cwrs.c, rate.c, quant_bands.c, mdct.c and kiss_fft.c. CELT works
+// on a signal scaled to +-32768; the output here is scaled to +-1.
+
+import "std/mem";
+import "../core/status";
+import "../core/amath";
+import "opus_rc";
+import "opus_celt_tab";
+
+const NBANDS = 21;
+const OVERLAP = 120;
+const BUFSIZE = 2048;          // decode history per channel
+const MEMCH = 2168;            // BUFSIZE + OVERLAP
+const BITRES = 3;
+const FINE_OFFSET = 21;
+const MAX_FINE_BITS = 8;
+const QTHETA_OFFSET = 4;
+const QTHETA_OFFSET_TWOPHASE = 16;
+const SPREAD_NONE = 0;
+const SPREAD_AGGRESSIVE = 3;
+const COMB_MINPERIOD = 15;
+const PVQ_ROWS = 131;          // U(n, k) for min(n, k) < PVQ_ROWS
+const PVQ_COLS = 180;          // and max(n, k) < PVQ_COLS
+
+export struct AudioOpusCelt {
+  channels: int32;          // channels written out (1 or 2)
+  stream_channels: int32;   // channels coded in the stream (1 or 2)
+  start: int32;             // first coded band (17 in hybrid mode)
+  end: int32;               // one past the last coded band
+  disable_inv: int32;
+  rng: uint32;
+  loss_count: int32;
+  pf_period: int32;
+  pf_period_old: int32;
+  pf_gain: float32;
+  pf_gain_old: float32;
+  pf_tapset: int32;
+  pf_tapset_old: int32;
+  preemph: float32[2];
+  mem: float32[4336];       // 2 x (BUFSIZE + OVERLAP)
+  old_band: float32[42];
+  old_log: float32[42];
+  old_log2: float32[42];
+  background: float32[42];
+  // scratch, so a frame never allocates
+  xbuf: float32[1920];
+  freq: float32[960];
+  norm: float32[1600];
+  tmp: float32[176];
+  iy: int32[176];
+  masks: uint8[42];
+  tf_res: int32[21];
+  cap: int32[21];
+  offsets: int32[21];
+  fine_quant: int32[21];
+  fine_prio: int32[21];
+  pulses: int32[21];
+  bits1: int32[21];
+  bits2: int32[21];
+  thresh: int32[21];
+  trim_off: int32[21];
+}
+
+// ---- tables built once ----
+
+var g_ready: bool = false;
+var g_window: float32[120];
+var g_trig: float32[1800];            // MDCT twiddles for the 4 sizes
+var g_tw_r: float32[480];             // FFT twiddles of the 480-point FFT
+var g_tw_i: float32[480];
+var g_bitrev: int16[900];             // 480 + 240 + 120 + 60
+var g_factors: int32[64];             // 4 x 16
+var g_pvq: uint32[23580];             // PVQ_ROWS x PVQ_COLS
+
+fn fft_factor(n0: int32, fac: int32*) {
+  var n: int32 = n0;
+  var p: int32 = 4;
+  var stages: int32 = 0;
+  while (true) {
+    while (n % p != 0) {
+      if (p == 4) { p = 2; } else if (p == 2) { p = 3; } else { p = p + 2; }
+      if (p > 32000 || p * p > n) { p = n; }
+    }
+    n = n / p;
+    fac[2 * stages] = p;
+    if (p == 2 && stages > 1) {
+      fac[2 * stages] = 4;
+      fac[2] = 2;
+    }
+    stages = stages + 1;
+    if (n <= 1) { break; }
+  }
+  n = n0;
+  for i in 0..stages / 2 {
+    var t: int32 = fac[2 * i];
+    fac[2 * i] = fac[2 * (stages - i - 1)];
+    fac[2 * (stages - i - 1)] = t;
+  }
+  for i in 0..stages {
+    n = n / fac[2 * i];
+    fac[2 * i + 1] = n;
+  }
+}
+
+fn fft_bitrev(fout: int32, f: int16*, fstride: int32, fac: int32*) {
+  var p: int32 = fac[0];
+  var m: int32 = fac[1];
+  var at: int32 = fout;
+  var fp: int16* = f;
+  if (m == 1) {
+    for j in 0..p {
+      *fp = (int16)(at + j);
+      fp = fp + fstride;
+    }
+  } else {
+    for j in 0..p {
+      fft_bitrev(at, fp, fstride * p, fac + 2);
+      fp = fp + fstride;
+      at = at + m;
+    }
+  }
+}
+
+@inline fn pvq_u(n: int32, k: int32) -> uint32 {
+  var a: int32 = n;
+  var b: int32 = k;
+  if (a > b) { a = k; b = n; }
+  if (a >= PVQ_ROWS || b >= PVQ_COLS) { return 0xFFFFFFFF; }
+  return g_pvq[a * PVQ_COLS + b];
+}
+
+fn celt_tables() {
+  var pi: float64 = audio_pi();
+  for i in 0..OVERLAP {
+    var s: float64 = audio_sin(0.5 * pi * ((float64)i + 0.5) / 120.0);
+    g_window[i] = (float32)audio_sin(0.5 * pi * s * s);
+  }
+  var n: int32 = 1920;
+  var at: int32 = 0;
+  for shift in 0..4 {
+    var n2: int32 = n >> 1;
+    for i in 0..n2 {
+      g_trig[at + i] = (float32)audio_cos(2.0 * pi * ((float64)i + 0.125) / (float64)n);
+    }
+    at = at + n2;
+    n = n >> 1;
+  }
+  for i in 0..480 {
+    var ph: float64 = (-2.0 * 3.14159265358979323846264338327 / 480.0) * (float64)i;
+    g_tw_r[i] = (float32)audio_cos(ph);
+    g_tw_i[i] = (float32)audio_sin(ph);
+  }
+  var boff: int32 = 0;
+  for s in 0..4 {
+    var nf: int32 = 480 >> s;
+    fft_factor(nf, &g_factors[16 * s]);
+    fft_bitrev(0, &g_bitrev[boff], 1, &g_factors[16 * s]);
+    boff = boff + nf;
+  }
+  // U(n, k): U(0,0) = 1, U(0,k) = 0, U(n,k) = U(n-1,k) + U(n,k-1) + U(n-1,k-1)
+  for r in 0..PVQ_ROWS {
+    for c in 0..PVQ_COLS {
+      var v: uint32 = 0;
+      if (r == 0 || c == 0) {
+        if (r == 0 && c == 0) { v = 1; }
+      } else {
+        // U is symmetric: fetch the neighbours through pvq_u
+        v = pvq_get(r - 1, c) + pvq_get(r, c - 1) + pvq_get(r - 1, c - 1);
+      }
+      g_pvq[r * PVQ_COLS + c] = v;
+    }
+  }
+  g_ready = true;
+}
+
+// U(n, k) while the table is being built (rows below r are done)
+fn pvq_get(n: int32, k: int32) -> uint32 {
+  if (n < 0 || k < 0) { return 0; }
+  if (n <= k) { return g_pvq[n * PVQ_COLS + k]; }
+  if (k < PVQ_ROWS && n < PVQ_COLS) { return g_pvq[k * PVQ_COLS + n]; }
+  return 0;
+}
+
+/// Builds the shared tables (safe to call often).
+export fn audio_opus_celt_tables() {
+  if (!g_ready) { celt_tables(); }
+}
+
+/// The CELT overlap window (120 values), used for cross-fades.
+export fn audio_opus_celt_window(i: int32) -> float32 {
+  if (i < 0 || i >= OVERLAP) { return 0.0; }
+  return g_window[i];
+}
+
+// ---- small math ----
+
+@inline fn imin(a: int32, b: int32) -> int32 { if (a < b) { return a; } return b; }
+@inline fn imax(a: int32, b: int32) -> int32 { if (a > b) { return a; } return b; }
+@inline fn fmin32(a: float32, b: float32) -> float32 { if (a < b) { return a; } return b; }
+@inline fn fmax32(a: float32, b: float32) -> float32 { if (a > b) { return a; } return b; }
+
+/// Square root, correctly rounded for float32 (Newton steps in float64).
+export fn audio_opus_sqrtf(x: float32) -> float32 {
+  if (!(x > 0.0)) { return 0.0; }
+  var d: float64 = (float64)x;
+  var pd: float64* = &d;
+  var bits: int64 = *(int64*)pd;
+  var gb: int64 = (bits >> 1) + 0x1FF8000000000000;
+  var pg: int64* = &gb;
+  var y: float64 = *(float64*)pg;
+  y = 0.5 * (y + d / y);
+  y = 0.5 * (y + d / y);
+  y = 0.5 * (y + d / y);
+  y = 0.5 * (y + d / y);
+  return (float32)y;
+}
+
+// 2^x with the polynomial of the reference (mathops.h, FLOAT_APPROX):
+// the reference decoder as built by distributions uses it.
+fn celt_exp2(x: float32) -> float32 {
+  var fl: float32 = (float32)(int32)x;
+  if (fl > x) { fl = fl - 1.0; }
+  var integer: int32 = (int32)fl;
+  if (integer < -50) { return 0.0; }
+  var frac: float32 = x - fl;
+  var r: float32 = 0.99992522 + frac * (0.69583354 + frac * (0.22606716 + 0.078024523 * frac));
+  var pr: float32* = &r;
+  var bits: uint32 = *(uint32*)pr;
+  bits = (bits + ((uint32)integer << 23)) & 0x7fffffff;
+  var pb: uint32* = &bits;
+  return *(float32*)pb;
+}
+
+@inline fn frac_mul16(a: int32, b: int32) -> int32 {
+  return (16384 + (int32)(int16)a * (int32)(int16)b) >> 15;
+}
+
+fn bitexact_cos(x: int32) -> int32 {
+  var tmp: int32 = (4096 + x * x) >> 13;
+  var x2: int32 = tmp;
+  x2 = (32767 - x2) + frac_mul16(x2, (-7651 + frac_mul16(x2, (8277 + frac_mul16(-626, x2)))));
+  return 1 + x2;
+}
+
+fn bitexact_log2tan(isin0: int32, icos0: int32) -> int32 {
+  var lc: int32 = audio_opus_ilog((uint32)icos0);
+  var ls: int32 = audio_opus_ilog((uint32)isin0);
+  var icos: int32 = icos0 << (15 - lc);
+  var isin: int32 = isin0 << (15 - ls);
+  return (ls - lc) * (1 << 11) + frac_mul16(isin, frac_mul16(isin, -2597) + 7932) -
+    frac_mul16(icos, frac_mul16(icos, -2597) + 7932);
+}
+
+fn isqrt32(v0: uint32) -> uint32 {
+  var v: uint32 = v0;
+  var g: uint32 = 0;
+  var bshift: int32 = (audio_opus_ilog(v) - 1) >> 1;
+  if (bshift < 0) { return 0; }
+  var b: uint32 = (uint32)1 << bshift;
+  while (true) {
+    var t: uint32 = ((g << 1) + b) << bshift;
+    if (t <= v) { g = g + b; v = v - t; }
+    b = b >> 1;
+    bshift = bshift - 1;
+    if (bshift < 0) { break; }
+  }
+  return g;
+}
+
+@inline fn lcg(seed: uint32) -> uint32 { return 1664525 * seed + 1013904223; }
+
+// ---- FFT and inverse MDCT (kiss_fft.c, mdct.c) ----
+
+fn bfly2(f: float32*, n: int32) {
+  var tw: float32 = 0.7071067812;
+  var fo: float32* = f;
+  for i in 0..n {
+    var g: float32* = fo + 8;
+    var tr: float32 = g[0];
+    var ti: float32 = g[1];
+    g[0] = fo[0] - tr; g[1] = fo[1] - ti;
+    fo[0] = fo[0] + tr; fo[1] = fo[1] + ti;
+
+    tr = (g[2] + g[3]) * tw;
+    ti = (g[3] - g[2]) * tw;
+    g[2] = fo[2] - tr; g[3] = fo[3] - ti;
+    fo[2] = fo[2] + tr; fo[3] = fo[3] + ti;
+
+    tr = g[5];
+    ti = -g[4];
+    g[4] = fo[4] - tr; g[5] = fo[5] - ti;
+    fo[4] = fo[4] + tr; fo[5] = fo[5] + ti;
+
+    tr = (g[7] - g[6]) * tw;
+    ti = -(g[7] + g[6]) * tw;
+    g[6] = fo[6] - tr; g[7] = fo[7] - ti;
+    fo[6] = fo[6] + tr; fo[7] = fo[7] + ti;
+    fo = fo + 16;
+  }
+}
+
+fn bfly4(f: float32*, fstride: int32, m: int32, n: int32, mm: int32) {
+  if (m == 1) {
+    var fo: float32* = f;
+    for i in 0..n {
+      var s0r: float32 = fo[0] - fo[4];
+      var s0i: float32 = fo[1] - fo[5];
+      fo[0] = fo[0] + fo[4];
+      fo[1] = fo[1] + fo[5];
+      var s1r: float32 = fo[2] + fo[6];
+      var s1i: float32 = fo[3] + fo[7];
+      fo[4] = fo[0] - s1r;
+      fo[5] = fo[1] - s1i;
+      fo[0] = fo[0] + s1r;
+      fo[1] = fo[1] + s1i;
+      s1r = fo[2] - fo[6];
+      s1i = fo[3] - fo[7];
+      fo[2] = s0r + s1i;
+      fo[3] = s0i - s1r;
+      fo[6] = s0r - s1i;
+      fo[7] = s0i + s1r;
+      fo = fo + 8;
+    }
+    return;
+  }
+  var m2: int32 = 2 * m;
+  var m3: int32 = 3 * m;
+  for i in 0..n {
+    var fo: float32* = f + 2 * i * mm;
+    var t1: int32 = 0;
+    var t2: int32 = 0;
+    var t3: int32 = 0;
+    for j in 0..m {
+      var ar: float32 = fo[2 * m];
+      var ai: float32 = fo[2 * m + 1];
+      var s0r: float32 = ar * g_tw_r[t1] - ai * g_tw_i[t1];
+      var s0i: float32 = ar * g_tw_i[t1] + ai * g_tw_r[t1];
+      ar = fo[2 * m2];
+      ai = fo[2 * m2 + 1];
+      var s1r: float32 = ar * g_tw_r[t2] - ai * g_tw_i[t2];
+      var s1i: float32 = ar * g_tw_i[t2] + ai * g_tw_r[t2];
+      ar = fo[2 * m3];
+      ai = fo[2 * m3 + 1];
+      var s2r: float32 = ar * g_tw_r[t3] - ai * g_tw_i[t3];
+      var s2i: float32 = ar * g_tw_i[t3] + ai * g_tw_r[t3];
+
+      var s5r: float32 = fo[0] - s1r;
+      var s5i: float32 = fo[1] - s1i;
+      fo[0] = fo[0] + s1r;
+      fo[1] = fo[1] + s1i;
+      var s3r: float32 = s0r + s2r;
+      var s3i: float32 = s0i + s2i;
+      var s4r: float32 = s0r - s2r;
+      var s4i: float32 = s0i - s2i;
+      fo[2 * m2] = fo[0] - s3r;
+      fo[2 * m2 + 1] = fo[1] - s3i;
+      t1 = t1 + fstride;
+      t2 = t2 + fstride * 2;
+      t3 = t3 + fstride * 3;
+      fo[0] = fo[0] + s3r;
+      fo[1] = fo[1] + s3i;
+      fo[2 * m] = s5r + s4i;
+      fo[2 * m + 1] = s5i - s4r;
+      fo[2 * m3] = s5r - s4i;
+      fo[2 * m3 + 1] = s5i + s4r;
+      fo = fo + 2;
+    }
+  }
+}
+
+fn bfly3(f: float32*, fstride: int32, m: int32, n: int32, mm: int32) {
+  var m2: int32 = 2 * m;
+  var epi3i: float32 = g_tw_i[fstride * m];
+  for i in 0..n {
+    var fo: float32* = f + 2 * i * mm;
+    var t1: int32 = 0;
+    var t2: int32 = 0;
+    for k in 0..m {
+      var ar: float32 = fo[2 * m];
+      var ai: float32 = fo[2 * m + 1];
+      var s1r: float32 = ar * g_tw_r[t1] - ai * g_tw_i[t1];
+      var s1i: float32 = ar * g_tw_i[t1] + ai * g_tw_r[t1];
+      ar = fo[2 * m2];
+      ai = fo[2 * m2 + 1];
+      var s2r: float32 = ar * g_tw_r[t2] - ai * g_tw_i[t2];
+      var s2i: float32 = ar * g_tw_i[t2] + ai * g_tw_r[t2];
+      var s3r: float32 = s1r + s2r;
+      var s3i: float32 = s1i + s2i;
+      var s0r: float32 = s1r - s2r;
+      var s0i: float32 = s1i - s2i;
+      t1 = t1 + fstride;
+      t2 = t2 + fstride * 2;
+      fo[2 * m] = fo[0] - s3r * 0.5;
+      fo[2 * m + 1] = fo[1] - s3i * 0.5;
+      s0r = s0r * epi3i;
+      s0i = s0i * epi3i;
+      fo[0] = fo[0] + s3r;
+      fo[1] = fo[1] + s3i;
+      fo[2 * m2] = fo[2 * m] + s0i;
+      fo[2 * m2 + 1] = fo[2 * m + 1] - s0r;
+      fo[2 * m] = fo[2 * m] - s0i;
+      fo[2 * m + 1] = fo[2 * m + 1] + s0r;
+      fo = fo + 2;
+    }
+  }
+}
+
+fn bfly5(f: float32*, fstride: int32, m: int32, n: int32, mm: int32) {
+  var yar: float32 = g_tw_r[fstride * m];
+  var yai: float32 = g_tw_i[fstride * m];
+  var ybr: float32 = g_tw_r[fstride * 2 * m];
+  var ybi: float32 = g_tw_i[fstride * 2 * m];
+  for i in 0..n {
+    var f0: float32* = f + 2 * i * mm;
+    var f1: float32* = f0 + 2 * m;
+    var f2: float32* = f0 + 4 * m;
+    var f3: float32* = f0 + 6 * m;
+    var f4: float32* = f0 + 8 * m;
+    for u in 0..m {
+      var s0r: float32 = f0[0];
+      var s0i: float32 = f0[1];
+      var t: int32 = u * fstride;
+      var s1r: float32 = f1[0] * g_tw_r[t] - f1[1] * g_tw_i[t];
+      var s1i: float32 = f1[0] * g_tw_i[t] + f1[1] * g_tw_r[t];
+      t = 2 * u * fstride;
+      var s2r: float32 = f2[0] * g_tw_r[t] - f2[1] * g_tw_i[t];
+      var s2i: float32 = f2[0] * g_tw_i[t] + f2[1] * g_tw_r[t];
+      t = 3 * u * fstride;
+      var s3r: float32 = f3[0] * g_tw_r[t] - f3[1] * g_tw_i[t];
+      var s3i: float32 = f3[0] * g_tw_i[t] + f3[1] * g_tw_r[t];
+      t = 4 * u * fstride;
+      var s4r: float32 = f4[0] * g_tw_r[t] - f4[1] * g_tw_i[t];
+      var s4i: float32 = f4[0] * g_tw_i[t] + f4[1] * g_tw_r[t];
+
+      var s7r: float32 = s1r + s4r;
+      var s7i: float32 = s1i + s4i;
+      var s10r: float32 = s1r - s4r;
+      var s10i: float32 = s1i - s4i;
+      var s8r: float32 = s2r + s3r;
+      var s8i: float32 = s2i + s3i;
+      var s9r: float32 = s2r - s3r;
+      var s9i: float32 = s2i - s3i;
+
+      f0[0] = f0[0] + (s7r + s8r);
+      f0[1] = f0[1] + (s7i + s8i);
+
+      var s5r: float32 = s0r + (s7r * yar + s8r * ybr);
+      var s5i: float32 = s0i + (s7i * yar + s8i * ybr);
+      var s6r: float32 = s10i * yai + s9i * ybi;
+      var s6i: float32 = -(s10r * yai + s9r * ybi);
+      f1[0] = s5r - s6r;
+      f1[1] = s5i - s6i;
+      f4[0] = s5r + s6r;
+      f4[1] = s5i + s6i;
+
+      var s11r: float32 = s0r + (s7r * ybr + s8r * yar);
+      var s11i: float32 = s0i + (s7i * ybr + s8i * yar);
+      var s12r: float32 = s9i * yai - s10i * ybi;
+      var s12i: float32 = s10r * ybi - s9r * yai;
+      f2[0] = s11r + s12r;
+      f2[1] = s11i + s12i;
+      f3[0] = s11r - s12r;
+      f3[1] = s11i - s12i;
+      f0 = f0 + 2; f1 = f1 + 2; f2 = f2 + 2; f3 = f3 + 2; f4 = f4 + 2;
+    }
+  }
+}
+
+fn fft_impl(f: float32*, shift: int32) {
+  var fac: int32* = &g_factors[16 * shift];
+  var fstride: int32[8];
+  fstride[0] = 1;
+  var l: int32 = 0;
+  var m: int32 = 0;
+  while (true) {
+    var p: int32 = fac[2 * l];
+    m = fac[2 * l + 1];
+    fstride[l + 1] = fstride[l] * p;
+    l = l + 1;
+    if (m == 1 || l >= 7) { break; }
+  }
+  m = fac[2 * l - 1];
+  var i: int32 = l - 1;
+  while (i >= 0) {
+    var m2: int32 = 1;
+    if (i != 0) { m2 = fac[2 * i - 1]; }
+    var p: int32 = fac[2 * i];
+    if (p == 2) {
+      bfly2(f, fstride[i]);
+    } else if (p == 4) {
+      bfly4(f, fstride[i] << shift, m, fstride[i], m2);
+    } else if (p == 3) {
+      bfly3(f, fstride[i] << shift, m, fstride[i], m2);
+    } else if (p == 5) {
+      bfly5(f, fstride[i] << shift, m, fstride[i], m2);
+    }
+    m = m2;
+    i = i - 1;
+  }
+}
+
+// Inverse MDCT of the coefficients in[0], in[stride], ... into out, with
+// the windowed overlap-add of the first OVERLAP samples (clt_mdct_backward).
+fn mdct_backward(inp: float32*, out: float32*, shift: int32, stride: int32) {
+  var n: int32 = 1920;
+  var toff: int32 = 0;
+  for i in 0..shift {
+    n = n >> 1;
+    toff = toff + n;
+  }
+  var trig: float32* = &g_trig[toff];
+  var n2: int32 = n >> 1;
+  var n4: int32 = n >> 2;
+  var boff: int32 = 0;
+  for s in 0..shift { boff = boff + (480 >> s); }
+  var bitrev: int16* = &g_bitrev[boff];
+  // pre-rotation into bit-reversed order
+  var yp: float32* = out + (OVERLAP >> 1);
+  var x1: int32 = 0;
+  var x2: int32 = stride * (n2 - 1);
+  for i in 0..n4 {
+    var rev: int32 = (int32)bitrev[i];
+    var a: float32 = inp[x2];
+    var b: float32 = inp[x1];
+    var yr: float32 = a * trig[i] + b * trig[n4 + i];
+    var yi: float32 = b * trig[i] - a * trig[n4 + i];
+    yp[2 * rev + 1] = yr;
+    yp[2 * rev] = yi;
+    x1 = x1 + 2 * stride;
+    x2 = x2 - 2 * stride;
+  }
+  fft_impl(yp, shift);
+  // post-rotation, from both ends at once
+  var p0: float32* = yp;
+  var p1: float32* = yp + n2 - 2;
+  for i in 0..(n4 + 1) >> 1 {
+    var re: float32 = p0[1];
+    var im: float32 = p0[0];
+    var t0: float32 = trig[i];
+    var t1: float32 = trig[n4 + i];
+    var yr: float32 = re * t0 + im * t1;
+    var yi: float32 = re * t1 - im * t0;
+    re = p1[1];
+    im = p1[0];
+    p0[0] = yr;
+    p1[1] = yi;
+    t0 = trig[n4 - i - 1];
+    t1 = trig[n2 - i - 1];
+    yr = re * t0 + im * t1;
+    yi = re * t1 - im * t0;
+    p1[0] = yr;
+    p0[1] = yi;
+    p0 = p0 + 2;
+    p1 = p1 - 2;
+  }
+  // mirror on both sides for TDAC
+  var xp: int32 = OVERLAP - 1;
+  var yq: int32 = 0;
+  for i in 0..OVERLAP / 2 {
+    var w1: float32 = g_window[i];
+    var w2: float32 = g_window[OVERLAP - 1 - i];
+    var v1: float32 = out[xp];
+    var v2: float32 = out[yq];
+    out[yq] = w2 * v2 - w1 * v1;
+    out[xp] = w1 * v2 + w2 * v1;
+    yq = yq + 1;
+    xp = xp - 1;
+  }
+}
+
+// ---- PVQ (cwrs.c, vq.c) ----
+
+// Decodes the pulse vector for index i (cwrsi); returns the squared norm.
+fn cwrsi(n0: int32, k0in: int32, i0: uint32, y: int32*) -> float32 {
+  var n: int32 = n0;
+  var k: int32 = k0in;
+  var idx: uint32 = i0;
+  var yy: float32 = 0.0;
+  var yi: int32 = 0;
+  while (n > 2) {
+    var p: uint32 = 0;
+    var k0: int32 = k;
+    var neg: bool = false;
+    if (k >= n) {
+      p = pvq_u(n, k + 1);
+      neg = idx >= p;
+      if (neg) { idx = idx - p; }
+      var q: uint32 = pvq_u(n, n);
+      if (q > idx) {
+        k = n;
+        while (true) {
+          k = k - 1;
+          p = pvq_u(k, n);
+          if (!(p > idx) || k <= 0) { break; }
+        }
+      } else {
+        p = pvq_u(n, k);
+        while (p > idx && k > 0) {
+          k = k - 1;
+          p = pvq_u(n, k);
+        }
+      }
+      idx = idx - p;
+      var v: int32 = k0 - k;
+      if (neg) { v = -v; }
+      y[yi] = v;
+      yi = yi + 1;
+      yy = yy + (float32)(v * v);
+    } else {
+      p = pvq_u(k, n);
+      var q: uint32 = pvq_u(k + 1, n);
+      if (p <= idx && idx < q) {
+        idx = idx - p;
+        y[yi] = 0;
+        yi = yi + 1;
+      } else {
+        neg = idx >= q;
+        if (neg) { idx = idx - q; }
+        while (true) {
+          k = k - 1;
+          p = pvq_u(k, n);
+          if (!(p > idx) || k <= 0) { break; }
+        }
+        idx = idx - p;
+        var v: int32 = k0 - k;
+        if (neg) { v = -v; }
+        y[yi] = v;
+        yi = yi + 1;
+        yy = yy + (float32)(v * v);
+      }
+    }
+    n = n - 1;
+  }
+  // n == 2
+  var p2: uint32 = (uint32)(2 * k + 1);
+  var neg2: bool = idx >= p2;
+  if (neg2) { idx = idx - p2; }
+  var kk0: int32 = k;
+  k = (int32)((idx + 1) >> 1);
+  if (k != 0) { idx = idx - (uint32)(2 * k - 1); }
+  var v2: int32 = kk0 - k;
+  if (neg2) { v2 = -v2; }
+  y[yi] = v2;
+  yy = yy + (float32)(v2 * v2);
+  // n == 1
+  var v3: int32 = k;
+  if (idx != 0) { v3 = -k; }
+  y[yi + 1] = v3;
+  yy = yy + (float32)(v3 * v3);
+  return yy;
+}
+
+fn exp_rotation1(x: float32*, len: int32, stride: int32, c: float32, s: float32) {
+  var ms: float32 = -s;
+  var i: int32 = 0;
+  while (i < len - stride) {
+    var x1: float32 = x[i];
+    var x2: float32 = x[i + stride];
+    x[i + stride] = c * x2 + s * x1;
+    x[i] = c * x1 + ms * x2;
+    i = i + 1;
+  }
+  i = len - 2 * stride - 1;
+  while (i >= 0) {
+    var x1: float32 = x[i];
+    var x2: float32 = x[i + stride];
+    x[i + stride] = c * x2 + s * x1;
+    x[i] = c * x1 + ms * x2;
+    i = i - 1;
+  }
+}
+
+fn exp_rotation(x: float32*, len0: int32, dir: int32, stride: int32, k: int32, spread: int32) {
+  if (2 * k >= len0 || spread == SPREAD_NONE) { return; }
+  var factor: int32 = 15;
+  if (spread == 2) { factor = 10; } else if (spread == 3) { factor = 5; }
+  var gain: float32 = (float32)len0 / (float32)(len0 + factor * k);
+  var theta: float32 = 0.5 * (gain * gain);
+  var c: float32 = (float32)audio_cos(0.5 * audio_pi() * (float64)theta);
+  var s: float32 = (float32)audio_cos(0.5 * audio_pi() * (float64)(1.0 - theta));
+  var stride2: int32 = 0;
+  if (len0 >= 8 * stride) {
+    stride2 = 1;
+    while ((stride2 * stride2 + stride2) * stride + (stride >> 2) < len0) { stride2 = stride2 + 1; }
+  }
+  var len: int32 = len0 / stride;
+  for i in 0..stride {
+    var xp: float32* = x + i * len;
+    if (dir < 0) {
+      if (stride2 != 0) { exp_rotation1(xp, len, stride2, s, c); }
+      exp_rotation1(xp, len, 1, c, s);
+    } else {
+      exp_rotation1(xp, len, 1, c, -s);
+      if (stride2 != 0) { exp_rotation1(xp, len, stride2, s, -c); }
+    }
+  }
+}
+
+fn renormalise(x: float32*, n: int32, gain: float32) {
+  var e: float32 = 1e-15;
+  for i in 0..n { e = e + x[i] * x[i]; }
+  var g: float32 = gain / audio_opus_sqrtf(e);
+  for i in 0..n { x[i] = g * x[i]; }
+}
+
+fn alg_unquant(st: AudioOpusCelt*, x: float32*, n: int32, k: int32, spread: int32, b: int32, dec: AudioOpusRc*, gain: float32) -> uint32 {
+  var iy: int32* = &st->iy[0];
+  var v: uint32 = pvq_u(n, k) + pvq_u(n, k + 1);
+  var idx: uint32 = audio_opus_rc_uint(dec, v);
+  var ryy: float32 = cwrsi(n, k, idx, iy);
+  var g: float32 = gain / audio_opus_sqrtf(ryy);
+  for i in 0..n { x[i] = g * (float32)iy[i]; }
+  exp_rotation(x, n, -1, b, k, spread);
+  if (b <= 1) { return 1; }
+  var n0: int32 = n / b;
+  var mask: uint32 = 0;
+  for i in 0..b {
+    var t: int32 = 0;
+    for j in 0..n0 { t = t | iy[i * n0 + j]; }
+    if (t != 0) { mask = mask | ((uint32)1 << i); }
+  }
+  return mask;
+}
+
+// ---- band shapes (bands.c) ----
+
+struct CeltBand {
+  st: AudioOpusCelt*;
+  dec: AudioOpusRc*;
+  i: int32;
+  intensity: int32;
+  spread: int32;
+  tf_change: int32;
+  remaining: int32;
+  seed: uint32;
+  disable_inv: int32;
+}
+
+fn haar1(x: float32*, n0: int32, stride: int32) {
+  var n: int32 = n0 >> 1;
+  var k: float32 = 0.70710678;
+  for i in 0..stride {
+    for j in 0..n {
+      var t1: float32 = k * x[stride * 2 * j + i];
+      var t2: float32 = k * x[stride * (2 * j + 1) + i];
+      x[stride * 2 * j + i] = t1 + t2;
+      x[stride * (2 * j + 1) + i] = t1 - t2;
+    }
+  }
+}
+
+fn deinterleave_hadamard(st: AudioOpusCelt*, x: float32*, n0: int32, stride: int32, hadamard: bool) {
+  var n: int32 = n0 * stride;
+  var tmp: float32* = &st->tmp[0];
+  if (hadamard) {
+    var ord: int32 = stride - 2;
+    for i in 0..stride {
+      var o: int32 = AUDIO_OPUS_ORDERY[ord + i];
+      for j in 0..n0 { tmp[o * n0 + j] = x[j * stride + i]; }
+    }
+  } else {
+    for i in 0..stride {
+      for j in 0..n0 { tmp[i * n0 + j] = x[j * stride + i]; }
+    }
+  }
+  for i in 0..n { x[i] = tmp[i]; }
+}
+
+fn interleave_hadamard(st: AudioOpusCelt*, x: float32*, n0: int32, stride: int32, hadamard: bool) {
+  var n: int32 = n0 * stride;
+  var tmp: float32* = &st->tmp[0];
+  if (hadamard) {
+    var ord: int32 = stride - 2;
+    for i in 0..stride {
+      var o: int32 = AUDIO_OPUS_ORDERY[ord + i];
+      for j in 0..n0 { tmp[j * stride + i] = x[o * n0 + j]; }
+    }
+  } else {
+    for i in 0..stride {
+      for j in 0..n0 { tmp[j * stride + i] = x[i * n0 + j]; }
+    }
+  }
+  for i in 0..n { x[i] = tmp[i]; }
+}
+
+fn compute_qn(n: int32, b: int32, offset: int32, pulse_cap: int32, stereo: bool) -> int32 {
+  var n2: int32 = 2 * n - 1;
+  if (stereo && n == 2) { n2 = n2 - 1; }
+  var qb: int32 = (b + n2 * offset) / n2;
+  qb = imin(b - pulse_cap - (4 << BITRES), qb);
+  qb = imin(8 << BITRES, qb);
+  if (qb < (1 << BITRES >> 1)) { return 1; }
+  var qn: int32 = AUDIO_OPUS_EXP2_TABLE8[qb & 7] >> (14 - (qb >> BITRES));
+  return (qn + 1) >> 1 << 1;
+}
+
+struct CeltSplit {
+  inv: int32;
+  imid: int32;
+  iside: int32;
+  delta: int32;
+  itheta: int32;
+  qalloc: int32;
+}
+
+fn compute_theta(ctx: CeltBand*, sc: CeltSplit*, n: int32, b: int32*, bb: int32, b0: int32, lm: int32, stereo: bool, fill: int32*) {
+  var dec: AudioOpusRc* = ctx->dec;
+  var i: int32 = ctx->i;
+  var pulse_cap: int32 = (int32)AUDIO_OPUS_LOGN[i] + lm * (1 << BITRES);
+  var offset: int32 = (pulse_cap >> 1) - QTHETA_OFFSET;
+  if (stereo && n == 2) { offset = (pulse_cap >> 1) - QTHETA_OFFSET_TWOPHASE; }
+  var qn: int32 = compute_qn(n, *b, offset, pulse_cap, stereo);
+  if (stereo && i >= ctx->intensity) { qn = 1; }
+  var itheta: int32 = 0;
+  var inv: int32 = 0;
+  var tell: int32 = audio_opus_rc_tell_frac(dec);
+  if (qn != 1) {
+    if (stereo && n > 2) {
+      var p0: int32 = 3;
+      var x0: int32 = qn / 2;
+      var ft: int32 = p0 * (x0 + 1) + x0;
+      var fs: int32 = (int32)audio_opus_rc_decode(dec, (uint32)ft);
+      var x: int32 = 0;
+      if (fs < (x0 + 1) * p0) { x = fs / p0; } else { x = x0 + 1 + (fs - (x0 + 1) * p0); }
+      var fl: int32 = 0;
+      var fh: int32 = 0;
+      if (x <= x0) { fl = p0 * x; fh = p0 * (x + 1); } else { fl = (x - 1 - x0) + (x0 + 1) * p0; fh = (x - x0) + (x0 + 1) * p0; }
+      audio_opus_rc_update(dec, (uint32)fl, (uint32)fh, (uint32)ft);
+      itheta = x;
+    } else if (b0 > 1 || stereo) {
+      itheta = (int32)audio_opus_rc_uint(dec, (uint32)(qn + 1));
+    } else {
+      var ft: int32 = ((qn >> 1) + 1) * ((qn >> 1) + 1);
+      var fm: int32 = (int32)audio_opus_rc_decode(dec, (uint32)ft);
+      var fs: int32 = 1;
+      var fl: int32 = 0;
+      if (fm < ((qn >> 1) * ((qn >> 1) + 1) >> 1)) {
+        itheta = ((int32)isqrt32(8 * (uint32)fm + 1) - 1) >> 1;
+        fs = itheta + 1;
+        fl = itheta * (itheta + 1) >> 1;
+      } else {
+        itheta = (2 * (qn + 1) - (int32)isqrt32(8 * (uint32)(ft - fm - 1) + 1)) >> 1;
+        fs = qn + 1 - itheta;
+        fl = ft - ((qn + 1 - itheta) * (qn + 2 - itheta) >> 1);
+      }
+      audio_opus_rc_update(dec, (uint32)fl, (uint32)(fl + fs), (uint32)ft);
+    }
+    itheta = (int32)((uint32)(itheta * 16384) / (uint32)qn);
+  } else if (stereo) {
+    if (*b > 2 << BITRES && ctx->remaining > 2 << BITRES) {
+      inv = audio_opus_rc_bit_logp(dec, 2);
+    }
+    if (ctx->disable_inv != 0) { inv = 0; }
+    itheta = 0;
+  }
+  var qalloc: int32 = audio_opus_rc_tell_frac(dec) - tell;
+  *b = *b - qalloc;
+  var imid: int32 = 0;
+  var iside: int32 = 0;
+  var delta: int32 = 0;
+  if (itheta == 0) {
+    imid = 32767;
+    iside = 0;
+    *fill = *fill & ((1 << bb) - 1);
+    delta = -16384;
+  } else if (itheta == 16384) {
+    imid = 0;
+    iside = 32767;
+    *fill = *fill & (((1 << bb) - 1) << bb);
+    delta = 16384;
+  } else {
+    imid = bitexact_cos(itheta);
+    iside = bitexact_cos(16384 - itheta);
+    delta = frac_mul16((n - 1) << 7, bitexact_log2tan(iside, imid));
+  }
+  sc->inv = inv;
+  sc->imid = imid;
+  sc->iside = iside;
+  sc->delta = delta;
+  sc->itheta = itheta;
+  sc->qalloc = qalloc;
+}
+
+fn quant_band_n1(ctx: CeltBand*, x: float32*, y: float32*, lowband_out: float32*) -> uint32 {
+  var xp: float32* = x;
+  var nch: int32 = 1;
+  if (y != 0) { nch = 2; }
+  for c in 0..nch {
+    var sign: uint32 = 0;
+    if (ctx->remaining >= 1 << BITRES) {
+      sign = audio_opus_rc_bits(ctx->dec, 1);
+      ctx->remaining = ctx->remaining - (1 << BITRES);
+    }
+    if (sign != 0) { xp[0] = -1.0; } else { xp[0] = 1.0; }
+    xp = y;
+  }
+  if (lowband_out != 0) { lowband_out[0] = x[0]; }
+  return 1;
+}
+
+@inline fn bits2pulses(band: int32, lm: int32, bits0: int32) -> int32 {
+  var ci: int32 = (int32)AUDIO_OPUS_CACHE_INDEX[(lm + 1) * NBANDS + band];
+  if (ci < 0) { return 0; }
+  var lo: int32 = 0;
+  var hi: int32 = (int32)AUDIO_OPUS_CACHE_BITS[ci];
+  var bits: int32 = bits0 - 1;
+  for i in 0..6 {
+    var mid: int32 = (lo + hi + 1) >> 1;
+    if ((int32)AUDIO_OPUS_CACHE_BITS[ci + mid] >= bits) { hi = mid; } else { lo = mid; }
+  }
+  var lov: int32 = -1;
+  if (lo != 0) { lov = (int32)AUDIO_OPUS_CACHE_BITS[ci + lo]; }
+  if (bits - lov <= (int32)AUDIO_OPUS_CACHE_BITS[ci + hi] - bits) { return lo; }
+  return hi;
+}
+
+@inline fn pulses2bits(band: int32, lm: int32, pulses: int32) -> int32 {
+  if (pulses == 0) { return 0; }
+  var ci: int32 = (int32)AUDIO_OPUS_CACHE_INDEX[(lm + 1) * NBANDS + band];
+  if (ci < 0) { return 0; }
+  return (int32)AUDIO_OPUS_CACHE_BITS[ci + pulses] + 1;
+}
+
+@inline fn get_pulses(i: int32) -> int32 {
+  if (i < 8) { return i; }
+  return (8 + (i & 7)) << ((i >> 3) - 1);
+}
+
+fn quant_partition(ctx: CeltBand*, x: float32*, n0: int32, b0: int32, bb0: int32, lowband: float32*, lm0: int32, gain: float32, fill0: int32) -> uint32 {
+  var n: int32 = n0;
+  var b: int32 = b0;
+  var bb: int32 = bb0;
+  var lm: int32 = lm0;
+  var fill: int32 = fill0;
+  var i: int32 = ctx->i;
+  var cm: uint32 = 0;
+  var ci: int32 = (int32)AUDIO_OPUS_CACHE_INDEX[(lm + 1) * NBANDS + i];
+  var cmax: int32 = 0;
+  if (ci >= 0) { cmax = (int32)AUDIO_OPUS_CACHE_BITS[ci + (int32)AUDIO_OPUS_CACHE_BITS[ci]]; }
+  if (lm != -1 && b > cmax + 12 && n > 2) {
+    var sc: CeltSplit;
+    n = n >> 1;
+    var y: float32* = x + n;
+    lm = lm - 1;
+    if (bb == 1) { fill = (fill & 1) | (fill << 1); }
+    bb = (bb + 1) >> 1;
+    compute_theta(ctx, &sc, n, &b, bb, bb0, lm, false, &fill);
+    var mid: float32 = (float32)sc.imid * (float32)(1.0 / 32768.0);
+    var side: float32 = (float32)sc.iside * (float32)(1.0 / 32768.0);
+    var delta: int32 = sc.delta;
+    var itheta: int32 = sc.itheta;
+    if (bb0 > 1 && (itheta & 0x3fff) != 0) {
+      if (itheta > 8192) {
+        delta = delta - (delta >> (4 - lm));
+      } else {
+        delta = imin(0, delta + (n << BITRES >> (5 - lm)));
+      }
+    }
+    var mbits: int32 = imax(0, imin(b, (b - delta) / 2));
+    var sbits: int32 = b - mbits;
+    ctx->remaining = ctx->remaining - sc.qalloc;
+    var next_lowband2: float32* = (float32*)0;
+    if (lowband != 0) { next_lowband2 = lowband + n; }
+    var rebalance: int32 = ctx->remaining;
+    if (mbits >= sbits) {
+      cm = quant_partition(ctx, x, n, mbits, bb, lowband, lm, gain * mid, fill);
+      rebalance = mbits - (rebalance - ctx->remaining);
+      if (rebalance > 3 << BITRES && itheta != 0) { sbits = sbits + rebalance - (3 << BITRES); }
+      cm = cm | (quant_partition(ctx, y, n, sbits, bb, next_lowband2, lm, gain * side, fill >> bb) << (bb0 >> 1));
+    } else {
+      cm = quant_partition(ctx, y, n, sbits, bb, next_lowband2, lm, gain * side, fill >> bb) << (bb0 >> 1);
+      rebalance = sbits - (rebalance - ctx->remaining);
+      if (rebalance > 3 << BITRES && itheta != 16384) { mbits = mbits + rebalance - (3 << BITRES); }
+      cm = cm | quant_partition(ctx, x, n, mbits, bb, lowband, lm, gain * mid, fill);
+    }
+    return cm;
+  }
+  var q: int32 = bits2pulses(i, lm, b);
+  var curr: int32 = pulses2bits(i, lm, q);
+  ctx->remaining = ctx->remaining - curr;
+  while (ctx->remaining < 0 && q > 0) {
+    ctx->remaining = ctx->remaining + curr;
+    q = q - 1;
+    curr = pulses2bits(i, lm, q);
+    ctx->remaining = ctx->remaining - curr;
+  }
+  if (q != 0) {
+    var k: int32 = get_pulses(q);
+    return alg_unquant(ctx->st, x, n, k, ctx->spread, bb, ctx->dec, gain);
+  }
+  // no pulses: fill the band anyway
+  var cm_mask: uint32 = ((uint32)1 << bb) - 1;
+  fill = fill & (int32)cm_mask;
+  if (fill == 0) {
+    for j in 0..n { x[j] = 0.0; }
+    return 0;
+  }
+  if (lowband == 0) {
+    for j in 0..n {
+      ctx->seed = lcg(ctx->seed);
+      x[j] = (float32)((int32)ctx->seed >> 20);
+    }
+    cm = cm_mask;
+  } else {
+    for j in 0..n {
+      ctx->seed = lcg(ctx->seed);
+      var t: float32 = 1.0 / 256.0;
+      if ((ctx->seed & 0x8000) == 0) { t = -t; }
+      x[j] = lowband[j] + t;
+    }
+    cm = (uint32)fill;
+  }
+  renormalise(x, n, gain);
+  return cm;
+}
+
+fn quant_band(ctx: CeltBand*, x: float32*, n: int32, b: int32, bb0: int32, lowband0: float32*, lm: int32, lowband_out: float32*, gain: float32, lowband_scratch: float32*, fill0: int32) -> uint32 {
+  var st: AudioOpusCelt* = ctx->st;
+  var n0: int32 = n;
+  var bb: int32 = bb0;
+  var lowband: float32* = lowband0;
+  var fill: int32 = fill0;
+  var tf_change: int32 = ctx->tf_change;
+  var long_blocks: bool = bb0 == 1;
+  var n_b: int32 = n / bb;
+  if (n == 1) { return quant_band_n1(ctx, x, (float32*)0, lowband_out); }
+  var recombine: int32 = 0;
+  if (tf_change > 0) { recombine = tf_change; }
+  if (lowband_scratch != 0 && lowband != 0 && (recombine != 0 || ((n_b & 1) == 0 && tf_change < 0) || bb0 > 1)) {
+    for j in 0..n { lowband_scratch[j] = lowband[j]; }
+    lowband = lowband_scratch;
+  }
+  for k in 0..recombine {
+    if (lowband != 0) { haar1(lowband, n >> k, 1 << k); }
+    fill = (int32)AUDIO_OPUS_BIT_INTERLEAVE[fill & 0xF] | ((int32)AUDIO_OPUS_BIT_INTERLEAVE[(fill >> 4) & 0xF] << 2);
+  }
+  bb = bb >> recombine;
+  n_b = n_b << recombine;
+  var time_divide: int32 = 0;
+  while ((n_b & 1) == 0 && tf_change < 0) {
+    if (lowband != 0) { haar1(lowband, n_b, bb); }
+    fill = fill | (fill << bb);
+    bb = bb << 1;
+    n_b = n_b >> 1;
+    time_divide = time_divide + 1;
+    tf_change = tf_change + 1;
+  }
+  var b0: int32 = bb;
+  var n_b0: int32 = n_b;
+  if (b0 > 1 && lowband != 0) {
+    deinterleave_hadamard(st, lowband, n_b >> recombine, b0 << recombine, long_blocks);
+  }
+  var cm: uint32 = quant_partition(ctx, x, n, b, bb, lowband, lm, gain, fill);
+  if (b0 > 1) { interleave_hadamard(st, x, n_b >> recombine, b0 << recombine, long_blocks); }
+  n_b = n_b0;
+  bb = b0;
+  for k in 0..time_divide {
+    bb = bb >> 1;
+    n_b = n_b << 1;
+    cm = cm | (cm >> bb);
+    haar1(x, n_b, bb);
+  }
+  for k in 0..recombine {
+    cm = (uint32)AUDIO_OPUS_BIT_DEINTERLEAVE[cm & 0xF];
+    haar1(x, n0 >> k, 1 << k);
+  }
+  bb = bb << recombine;
+  if (lowband_out != 0) {
+    var nn: float32 = audio_opus_sqrtf((float32)n0);
+    for j in 0..n0 { lowband_out[j] = nn * x[j]; }
+  }
+  return cm & (((uint32)1 << bb) - 1);
+}
+
+fn stereo_merge(x: float32*, y: float32*, mid: float32, n: int32) {
+  var xp: float32 = 0.0;
+  var side: float32 = 0.0;
+  for j in 0..n {
+    xp = xp + y[j] * x[j];
+    side = side + y[j] * y[j];
+  }
+  xp = mid * xp;
+  var mid2: float32 = mid;
+  var el: float32 = mid2 * mid2 + side - 2.0 * xp;
+  var er: float32 = mid2 * mid2 + side + 2.0 * xp;
+  if (er < 6e-4 || el < 6e-4) {
+    for j in 0..n { y[j] = x[j]; }
+    return;
+  }
+  var lgain: float32 = 1.0 / audio_opus_sqrtf(el);
+  var rgain: float32 = 1.0 / audio_opus_sqrtf(er);
+  for j in 0..n {
+    var l: float32 = mid * x[j];
+    var r: float32 = y[j];
+    x[j] = lgain * (l - r);
+    y[j] = rgain * (l + r);
+  }
+}
+
+fn quant_band_stereo(ctx: CeltBand*, x: float32*, y: float32*, n: int32, b0: int32, bb: int32, lowband: float32*, lm: int32, lowband_out: float32*, lowband_scratch: float32*, fill0: int32) -> uint32 {
+  var b: int32 = b0;
+  var fill: int32 = fill0;
+  if (n == 1) { return quant_band_n1(ctx, x, y, lowband_out); }
+  var orig_fill: int32 = fill;
+  var sc: CeltSplit;
+  compute_theta(ctx, &sc, n, &b, bb, bb, lm, true, &fill);
+  var mid: float32 = (float32)sc.imid * (float32)(1.0 / 32768.0);
+  var side: float32 = (float32)sc.iside * (float32)(1.0 / 32768.0);
+  var itheta: int32 = sc.itheta;
+  var cm: uint32 = 0;
+  if (n == 2) {
+    var mbits: int32 = b;
+    var sbits: int32 = 0;
+    if (itheta != 0 && itheta != 16384) { sbits = 1 << BITRES; }
+    mbits = mbits - sbits;
+    var c: bool = itheta > 8192;
+    ctx->remaining = ctx->remaining - (sc.qalloc + sbits);
+    var x2: float32* = x;
+    var y2: float32* = y;
+    if (c) { x2 = y; y2 = x; }
+    var sign: int32 = 0;
+    if (sbits != 0) { sign = (int32)audio_opus_rc_bits(ctx->dec, 1); }
+    var sg: float32 = (float32)(1 - 2 * sign);
+    cm = quant_band(ctx, x2, n, mbits, bb, lowband, lm, lowband_out, 1.0, lowband_scratch, orig_fill);
+    y2[0] = -sg * x2[1];
+    y2[1] = sg * x2[0];
+    x[0] = mid * x[0];
+    x[1] = mid * x[1];
+    y[0] = side * y[0];
+    y[1] = side * y[1];
+    var t: float32 = x[0];
+    x[0] = t - y[0];
+    y[0] = t + y[0];
+    t = x[1];
+    x[1] = t - y[1];
+    y[1] = t + y[1];
+  } else {
+    var mbits2: int32 = imax(0, imin(b, (b - sc.delta) / 2));
+    var sbits2: int32 = b - mbits2;
+    ctx->remaining = ctx->remaining - sc.qalloc;
+    var rebalance: int32 = ctx->remaining;
+    if (mbits2 >= sbits2) {
+      cm = quant_band(ctx, x, n, mbits2, bb, lowband, lm, lowband_out, 1.0, lowband_scratch, fill);
+      rebalance = mbits2 - (rebalance - ctx->remaining);
+      if (rebalance > 3 << BITRES && itheta != 0) { sbits2 = sbits2 + rebalance - (3 << BITRES); }
+      cm = cm | quant_band(ctx, y, n, sbits2, bb, (float32*)0, lm, (float32*)0, side, (float32*)0, fill >> bb);
+    } else {
+      cm = quant_band(ctx, y, n, sbits2, bb, (float32*)0, lm, (float32*)0, side, (float32*)0, fill >> bb);
+      rebalance = sbits2 - (rebalance - ctx->remaining);
+      if (rebalance > 3 << BITRES && itheta != 16384) { mbits2 = mbits2 + rebalance - (3 << BITRES); }
+      cm = cm | quant_band(ctx, x, n, mbits2, bb, lowband, lm, lowband_out, 1.0, lowband_scratch, fill);
+    }
+  }
+  if (n != 2) { stereo_merge(x, y, mid, n); }
+  if (sc.inv != 0) {
+    for j in 0..n { y[j] = -y[j]; }
+  }
+  return cm;
+}
+
+fn quant_all_bands(st: AudioOpusCelt*, start: int32, end: int32, xs: float32*, ys: float32*, masks: uint8*, pulses: int32*, short_blocks: bool, spread: int32, dual0: int32, intensity: int32, tf_res: int32*, total_bits: int32, balance0: int32, dec: AudioOpusRc*, lm: int32, coded_bands: int32) {
+  var m: int32 = 1 << lm;
+  var bb: int32 = 1;
+  if (short_blocks) { bb = m; }
+  var c2: int32 = 1;
+  if (ys != 0) { c2 = 2; }
+  var balance: int32 = balance0;
+  var dual: int32 = dual0;
+  var norm_offset: int32 = m * (int32)AUDIO_OPUS_EBANDS[start];
+  var norm: float32* = &st->norm[0];
+  var norm2: float32* = norm + m * (int32)AUDIO_OPUS_EBANDS[NBANDS - 1] - norm_offset;
+  var lowband_scratch: float32* = xs + m * (int32)AUDIO_OPUS_EBANDS[NBANDS - 1];
+  var lowband_offset: int32 = 0;
+  var update_lowband: bool = true;
+  var ctx: CeltBand;
+  ctx.st = st;
+  ctx.dec = dec;
+  ctx.intensity = intensity;
+  ctx.seed = st->rng;
+  ctx.spread = spread;
+  ctx.disable_inv = st->disable_inv;
+  for i in start..end {
+    ctx.i = i;
+    var last: bool = i == end - 1;
+    var x: float32* = xs + m * (int32)AUDIO_OPUS_EBANDS[i];
+    var y: float32* = (float32*)0;
+    if (ys != 0) { y = ys + m * (int32)AUDIO_OPUS_EBANDS[i]; }
+    var n: int32 = m * (int32)AUDIO_OPUS_EBANDS[i + 1] - m * (int32)AUDIO_OPUS_EBANDS[i];
+    var tell: int32 = audio_opus_rc_tell_frac(dec);
+    if (i != start) { balance = balance - tell; }
+    var remaining: int32 = total_bits - tell - 1;
+    ctx.remaining = remaining;
+    var b: int32 = 0;
+    if (i <= coded_bands - 1) {
+      var curr_balance: int32 = balance / imin(3, coded_bands - i);
+      b = imax(0, imin(16383, imin(remaining + 1, pulses[i] + curr_balance)));
+    }
+    if ((m * (int32)AUDIO_OPUS_EBANDS[i] - n >= m * (int32)AUDIO_OPUS_EBANDS[start] || i == start + 1) && (update_lowband || lowband_offset == 0)) {
+      lowband_offset = i;
+    }
+    if (i == start + 1) {
+      // special_hybrid_folding
+      var n1: int32 = m * ((int32)AUDIO_OPUS_EBANDS[start + 1] - (int32)AUDIO_OPUS_EBANDS[start]);
+      var n2: int32 = m * ((int32)AUDIO_OPUS_EBANDS[start + 2] - (int32)AUDIO_OPUS_EBANDS[start + 1]);
+      if (n2 > n1) {
+        for j in 0..n2 - n1 { norm[n1 + j] = norm[2 * n1 - n2 + j]; }
+        if (dual != 0) {
+          for j in 0..n2 - n1 { norm2[n1 + j] = norm2[2 * n1 - n2 + j]; }
+        }
+      }
+    }
+    var tf_change: int32 = tf_res[i];
+    ctx.tf_change = tf_change;
+    var scratch: float32* = lowband_scratch;
+    if (last) { scratch = (float32*)0; }
+    var effective_lowband: int32 = -1;
+    var x_cm: uint32 = 0;
+    var y_cm: uint32 = 0;
+    if (lowband_offset != 0 && (spread != SPREAD_AGGRESSIVE || bb > 1 || tf_change < 0)) {
+      effective_lowband = imax(0, m * (int32)AUDIO_OPUS_EBANDS[lowband_offset] - norm_offset - n);
+      var fold_start: int32 = lowband_offset;
+      while (true) {
+        fold_start = fold_start - 1;
+        if (fold_start <= 0 || !(m * (int32)AUDIO_OPUS_EBANDS[fold_start] > effective_lowband + norm_offset)) { break; }
+      }
+      var fold_end: int32 = lowband_offset - 1;
+      while (true) {
+        fold_end = fold_end + 1;
+        if (!(fold_end < i && m * (int32)AUDIO_OPUS_EBANDS[fold_end] < effective_lowband + norm_offset + n)) { break; }
+      }
+      var fi: int32 = fold_start;
+      while (true) {
+        x_cm = x_cm | (uint32)masks[fi * c2];
+        y_cm = y_cm | (uint32)masks[fi * c2 + c2 - 1];
+        fi = fi + 1;
+        if (fi >= fold_end) { break; }
+      }
+    } else {
+      x_cm = ((uint32)1 << bb) - 1;
+      y_cm = x_cm;
+    }
+    if (dual != 0 && i == intensity) {
+      dual = 0;
+      for j in 0..m * (int32)AUDIO_OPUS_EBANDS[i] - norm_offset { norm[j] = 0.5 * (norm[j] + norm2[j]); }
+    }
+    var lb1: float32* = (float32*)0;
+    var lb2: float32* = (float32*)0;
+    if (effective_lowband != -1) {
+      lb1 = norm + effective_lowband;
+      lb2 = norm2 + effective_lowband;
+    }
+    var out1: float32* = (float32*)0;
+    var out2: float32* = (float32*)0;
+    if (!last) {
+      out1 = norm + m * (int32)AUDIO_OPUS_EBANDS[i] - norm_offset;
+      out2 = norm2 + m * (int32)AUDIO_OPUS_EBANDS[i] - norm_offset;
+    }
+    if (dual != 0) {
+      x_cm = quant_band(&ctx, x, n, b / 2, bb, lb1, lm, out1, 1.0, scratch, (int32)x_cm);
+      y_cm = quant_band(&ctx, y, n, b / 2, bb, lb2, lm, out2, 1.0, scratch, (int32)y_cm);
+    } else {
+      if (y != 0) {
+        x_cm = quant_band_stereo(&ctx, x, y, n, b, bb, lb1, lm, out1, scratch, (int32)(x_cm | y_cm));
+      } else {
+        x_cm = quant_band(&ctx, x, n, b, bb, lb1, lm, out1, 1.0, scratch, (int32)(x_cm | y_cm));
+      }
+      y_cm = x_cm;
+    }
+    masks[i * c2] = (uint8)(x_cm & 255);
+    masks[i * c2 + c2 - 1] = (uint8)(y_cm & 255);
+    balance = balance + pulses[i] + tell;
+    update_lowband = b > (n << BITRES);
+  }
+  st->rng = ctx.seed;
+}
+
+// ---- energies (quant_bands.c) ----
+
+fn unquant_coarse(st: AudioOpusCelt*, start: int32, end: int32, intra: int32, dec: AudioOpusRc*, c2: int32, lm: int32) {
+  var pbase: int32 = (lm * 2 + intra) * 42;
+  var prev: float32[2];
+  prev[0] = 0.0;
+  prev[1] = 0.0;
+  var coef: float32 = 0.0;
+  var beta: float32 = (float32)(4915.0 / 32768.0);
+  if (intra == 0) {
+    if (lm == 0) { coef = (float32)(29440.0 / 32768.0); beta = (float32)(30147.0 / 32768.0); }
+    if (lm == 1) { coef = (float32)(26112.0 / 32768.0); beta = (float32)(22282.0 / 32768.0); }
+    if (lm == 2) { coef = (float32)(21248.0 / 32768.0); beta = (float32)(12124.0 / 32768.0); }
+    if (lm == 3) { coef = (float32)(16384.0 / 32768.0); beta = (float32)(6554.0 / 32768.0); }
+  }
+  var budget: int32 = (int32)dec->storage * 8;
+  for i in start..end {
+    for c in 0..c2 {
+      var tell: int32 = audio_opus_rc_tell(dec);
+      var qi: int32 = 0;
+      if (budget - tell >= 15) {
+        var pi: int32 = 2 * imin(i, 20);
+        qi = audio_opus_rc_laplace(dec, (uint32)AUDIO_OPUS_EPROB[pbase + pi] << 7, (int32)AUDIO_OPUS_EPROB[pbase + pi + 1] << 6);
+      } else if (budget - tell >= 2) {
+        qi = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SMALL_ENERGY_ICDF[0], 2);
+        qi = (qi >> 1) ^ -(qi & 1);
+      } else if (budget - tell >= 1) {
+        qi = -audio_opus_rc_bit_logp(dec, 1);
+      } else {
+        qi = -1;
+      }
+      var q: float32 = (float32)qi;
+      var k: int32 = i + c * NBANDS;
+      st->old_band[k] = fmax32(-9.0, st->old_band[k]);
+      var tmp: float32 = coef * st->old_band[k] + prev[c] + q;
+      st->old_band[k] = tmp;
+      prev[c] = prev[c] + q - beta * q;
+    }
+  }
+}
+
+fn unquant_fine(st: AudioOpusCelt*, start: int32, end: int32, fine: int32*, dec: AudioOpusRc*, c2: int32) {
+  for i in start..end {
+    if (fine[i] <= 0) { continue; }
+    for c in 0..c2 {
+      var q2: int32 = (int32)audio_opus_rc_bits(dec, fine[i]);
+      var offset: float32 = ((float32)q2 + 0.5) * (float32)(1 << (14 - fine[i])) * (float32)(1.0 / 16384.0) - 0.5;
+      st->old_band[i + c * NBANDS] = st->old_band[i + c * NBANDS] + offset;
+    }
+  }
+}
+
+fn unquant_finalise(st: AudioOpusCelt*, start: int32, end: int32, fine: int32*, prio: int32*, bits_left0: int32, dec: AudioOpusRc*, c2: int32) {
+  var bits_left: int32 = bits_left0;
+  for p in 0..2 {
+    var i: int32 = start;
+    while (i < end && bits_left >= c2) {
+      if (fine[i] >= MAX_FINE_BITS || prio[i] != p) { i = i + 1; continue; }
+      for c in 0..c2 {
+        var q2: int32 = (int32)audio_opus_rc_bits(dec, 1);
+        var offset: float32 = ((float32)q2 - 0.5) * (float32)(1 << (14 - fine[i] - 1)) * (float32)(1.0 / 16384.0);
+        st->old_band[i + c * NBANDS] = st->old_band[i + c * NBANDS] + offset;
+        bits_left = bits_left - 1;
+      }
+      i = i + 1;
+    }
+  }
+}
+
+// ---- bit allocation (rate.c) ----
+
+fn compute_allocation(st: AudioOpusCelt*, start: int32, end: int32, offsets: int32*, cap: int32*, alloc_trim: int32, intensity: int32*, dual: int32*, total0: int32, balance_out: int32*, bits: int32*, ebits: int32*, prio: int32*, c2: int32, lm: int32, dec: AudioOpusRc*) -> int32 {
+  var total: int32 = imax(total0, 0);
+  var skip_start: int32 = start;
+  var skip_rsv: int32 = 0;
+  if (total >= 1 << BITRES) { skip_rsv = 1 << BITRES; }
+  total = total - skip_rsv;
+  var intensity_rsv: int32 = 0;
+  var dual_rsv: int32 = 0;
+  if (c2 == 2) {
+    intensity_rsv = (int32)AUDIO_OPUS_LOG2_FRAC[end - start];
+    if (intensity_rsv > total) {
+      intensity_rsv = 0;
+    } else {
+      total = total - intensity_rsv;
+      if (total >= 1 << BITRES) { dual_rsv = 1 << BITRES; }
+      total = total - dual_rsv;
+    }
+  }
+  var bits1: int32* = &st->bits1[0];
+  var bits2: int32* = &st->bits2[0];
+  var thresh: int32* = &st->thresh[0];
+  var trim_offset: int32* = &st->trim_off[0];
+  for j in start..end {
+    var w: int32 = (int32)AUDIO_OPUS_EBANDS[j + 1] - (int32)AUDIO_OPUS_EBANDS[j];
+    thresh[j] = imax(c2 << BITRES, (3 * w << lm << BITRES) >> 4);
+    trim_offset[j] = c2 * w * (alloc_trim - 5 - lm) * (end - j - 1) * (1 << (lm + BITRES)) >> 6;
+    if (w << lm == 1) { trim_offset[j] = trim_offset[j] - (c2 << BITRES); }
+  }
+  var lo: int32 = 1;
+  var hi: int32 = 10;
+  while (lo <= hi) {
+    var done: bool = false;
+    var psum: int32 = 0;
+    var mid: int32 = (lo + hi) >> 1;
+    var j: int32 = end - 1;
+    while (j >= start) {
+      var w: int32 = (int32)AUDIO_OPUS_EBANDS[j + 1] - (int32)AUDIO_OPUS_EBANDS[j];
+      var bitsj: int32 = c2 * w * (int32)AUDIO_OPUS_ALLOC[mid * NBANDS + j] << lm >> 2;
+      if (bitsj > 0) { bitsj = imax(0, bitsj + trim_offset[j]); }
+      bitsj = bitsj + offsets[j];
+      if (bitsj >= thresh[j] || done) {
+        done = true;
+        psum = psum + imin(bitsj, cap[j]);
+      } else {
+        if (bitsj >= c2 << BITRES) { psum = psum + (c2 << BITRES); }
+      }
+      j = j - 1;
+    }
+    if (psum > total) { hi = mid - 1; } else { lo = mid + 1; }
+  }
+  hi = lo;
+  lo = lo - 1;
+  for j in start..end {
+    var w: int32 = (int32)AUDIO_OPUS_EBANDS[j + 1] - (int32)AUDIO_OPUS_EBANDS[j];
+    var bits1j: int32 = c2 * w * (int32)AUDIO_OPUS_ALLOC[lo * NBANDS + j] << lm >> 2;
+    var bits2j: int32 = cap[j];
+    if (hi < 11) { bits2j = c2 * w * (int32)AUDIO_OPUS_ALLOC[hi * NBANDS + j] << lm >> 2; }
+    if (bits1j > 0) { bits1j = imax(0, bits1j + trim_offset[j]); }
+    if (bits2j > 0) { bits2j = imax(0, bits2j + trim_offset[j]); }
+    if (lo > 0) { bits1j = bits1j + offsets[j]; }
+    bits2j = bits2j + offsets[j];
+    if (offsets[j] > 0) { skip_start = j; }
+    bits2j = imax(0, bits2j - bits1j);
+    bits1[j] = bits1j;
+    bits2[j] = bits2j;
+  }
+  // interp_bits2pulses
+  var alloc_floor: int32 = c2 << BITRES;
+  var stereo: int32 = 0;
+  if (c2 > 1) { stereo = 1; }
+  var log_m: int32 = lm << BITRES;
+  lo = 0;
+  hi = 1 << 6;
+  for it in 0..6 {
+    var mid: int32 = (lo + hi) >> 1;
+    var psum: int32 = 0;
+    var done: bool = false;
+    var j: int32 = end - 1;
+    while (j >= start) {
+      var tmp: int32 = bits1[j] + (mid * bits2[j] >> 6);
+      if (tmp >= thresh[j] || done) {
+        done = true;
+        psum = psum + imin(tmp, cap[j]);
+      } else {
+        if (tmp >= alloc_floor) { psum = psum + alloc_floor; }
+      }
+      j = j - 1;
+    }
+    if (psum > total) { hi = mid; } else { lo = mid; }
+  }
+  var psum2: int32 = 0;
+  var done2: bool = false;
+  var jj: int32 = end - 1;
+  while (jj >= start) {
+    var tmp: int32 = bits1[jj] + (lo * bits2[jj] >> 6);
+    if (tmp < thresh[jj] && !done2) {
+      if (tmp >= alloc_floor) { tmp = alloc_floor; } else { tmp = 0; }
+    } else {
+      done2 = true;
+    }
+    tmp = imin(tmp, cap[jj]);
+    bits[jj] = tmp;
+    psum2 = psum2 + tmp;
+    jj = jj - 1;
+  }
+  var coded: int32 = end;
+  while (true) {
+    var j: int32 = coded - 1;
+    if (j <= skip_start) {
+      total = total + skip_rsv;
+      break;
+    }
+    var left: int32 = total - psum2;
+    var span: int32 = (int32)AUDIO_OPUS_EBANDS[coded] - (int32)AUDIO_OPUS_EBANDS[start];
+    var percoeff: int32 = (int32)((uint32)left / (uint32)span);
+    left = left - span * percoeff;
+    var rem: int32 = imax(left - ((int32)AUDIO_OPUS_EBANDS[j] - (int32)AUDIO_OPUS_EBANDS[start]), 0);
+    var band_width: int32 = (int32)AUDIO_OPUS_EBANDS[coded] - (int32)AUDIO_OPUS_EBANDS[j];
+    var band_bits: int32 = bits[j] + percoeff * band_width + rem;
+    if (band_bits >= imax(thresh[j], alloc_floor + (1 << BITRES))) {
+      if (audio_opus_rc_bit_logp(dec, 1) != 0) { break; }
+      psum2 = psum2 + (1 << BITRES);
+      band_bits = band_bits - (1 << BITRES);
+    }
+    psum2 = psum2 - (bits[j] + intensity_rsv);
+    if (intensity_rsv > 0) { intensity_rsv = (int32)AUDIO_OPUS_LOG2_FRAC[j - start]; }
+    psum2 = psum2 + intensity_rsv;
+    if (band_bits >= alloc_floor) {
+      psum2 = psum2 + alloc_floor;
+      bits[j] = alloc_floor;
+    } else {
+      bits[j] = 0;
+    }
+    coded = coded - 1;
+  }
+  if (intensity_rsv > 0) {
+    *intensity = start + (int32)audio_opus_rc_uint(dec, (uint32)(coded + 1 - start));
+  } else {
+    *intensity = 0;
+  }
+  if (*intensity <= start) {
+    total = total + dual_rsv;
+    dual_rsv = 0;
+  }
+  if (dual_rsv > 0) { *dual = audio_opus_rc_bit_logp(dec, 1); } else { *dual = 0; }
+  var left2: int32 = total - psum2;
+  var span2: int32 = (int32)AUDIO_OPUS_EBANDS[coded] - (int32)AUDIO_OPUS_EBANDS[start];
+  var percoeff2: int32 = (int32)((uint32)left2 / (uint32)span2);
+  left2 = left2 - span2 * percoeff2;
+  for j in start..coded {
+    bits[j] = bits[j] + percoeff2 * ((int32)AUDIO_OPUS_EBANDS[j + 1] - (int32)AUDIO_OPUS_EBANDS[j]);
+  }
+  for j in start..coded {
+    var tmp: int32 = imin(left2, (int32)AUDIO_OPUS_EBANDS[j + 1] - (int32)AUDIO_OPUS_EBANDS[j]);
+    bits[j] = bits[j] + tmp;
+    left2 = left2 - tmp;
+  }
+  var balance: int32 = 0;
+  var j2: int32 = start;
+  while (j2 < coded) {
+    var j: int32 = j2;
+    var n0: int32 = (int32)AUDIO_OPUS_EBANDS[j + 1] - (int32)AUDIO_OPUS_EBANDS[j];
+    var n: int32 = n0 << lm;
+    var bit: int32 = bits[j] + balance;
+    var excess: int32 = 0;
+    if (n > 1) {
+      excess = imax(bit - cap[j], 0);
+      bits[j] = bit - excess;
+      var den: int32 = c2 * n;
+      if (c2 == 2 && n > 2 && *dual == 0 && j < *intensity) { den = den + 1; }
+      var nclogn: int32 = den * ((int32)AUDIO_OPUS_LOGN[j] + log_m);
+      var offset: int32 = (nclogn >> 1) - den * FINE_OFFSET;
+      if (n == 2) { offset = offset + (den << BITRES >> 2); }
+      if (bits[j] + offset < den * 2 << BITRES) {
+        offset = offset + (nclogn >> 2);
+      } else if (bits[j] + offset < den * 3 << BITRES) {
+        offset = offset + (nclogn >> 3);
+      }
+      ebits[j] = imax(0, bits[j] + offset + (den << (BITRES - 1)));
+      ebits[j] = (int32)((uint32)ebits[j] / (uint32)den) >> BITRES;
+      if (c2 * ebits[j] > (bits[j] >> BITRES)) { ebits[j] = bits[j] >> stereo >> BITRES; }
+      ebits[j] = imin(ebits[j], MAX_FINE_BITS);
+      prio[j] = 0;
+      if (ebits[j] * (den << BITRES) >= bits[j] + offset) { prio[j] = 1; }
+      bits[j] = bits[j] - (c2 * ebits[j] << BITRES);
+    } else {
+      excess = imax(0, bit - (c2 << BITRES));
+      bits[j] = bit - excess;
+      ebits[j] = 0;
+      prio[j] = 1;
+    }
+    if (excess > 0) {
+      var extra_fine: int32 = imin(excess >> (stereo + BITRES), MAX_FINE_BITS - ebits[j]);
+      ebits[j] = ebits[j] + extra_fine;
+      var extra_bits: int32 = extra_fine * c2 << BITRES;
+      prio[j] = 0;
+      if (extra_bits >= excess - balance) { prio[j] = 1; }
+      excess = excess - extra_bits;
+    }
+    balance = excess;
+    j2 = j2 + 1;
+  }
+  *balance_out = balance;
+  while (j2 < end) {
+    ebits[j2] = bits[j2] >> stereo >> BITRES;
+    bits[j2] = 0;
+    prio[j2] = 0;
+    if (ebits[j2] < 1) { prio[j2] = 1; }
+    j2 = j2 + 1;
+  }
+  return coded;
+}
+
+// ---- synthesis ----
+
+fn denormalise(x: float32*, freq: float32*, band_e: float32*, start: int32, end0: int32, m: int32, silence: bool) {
+  var n: int32 = m * 120;
+  var end: int32 = end0;
+  var st0: int32 = start;
+  var bound: int32 = m * (int32)AUDIO_OPUS_EBANDS[end];
+  if (silence) {
+    bound = 0;
+    st0 = 0;
+    end = 0;
+  }
+  var f: int32 = 0;
+  var lim: int32 = m * (int32)AUDIO_OPUS_EBANDS[st0];
+  while (f < lim) { freq[f] = 0.0; f = f + 1; }
+  var xi: int32 = lim;
+  for i in st0..end {
+    var j: int32 = m * (int32)AUDIO_OPUS_EBANDS[i];
+    var band_end: int32 = m * (int32)AUDIO_OPUS_EBANDS[i + 1];
+    var lg: float32 = band_e[i] + AUDIO_OPUS_EMEANS[i];
+    var g: float32 = celt_exp2(fmin32(32.0, lg));
+    while (j < band_end) {
+      freq[f] = x[xi] * g;
+      f = f + 1;
+      xi = xi + 1;
+      j = j + 1;
+    }
+  }
+  var k: int32 = bound;
+  while (k < n) { freq[k] = 0.0; k = k + 1; }
+}
+
+fn celt_synthesis(st: AudioOpusCelt*, x: float32*, out0: float32*, out1: float32*, start: int32, end: int32, c2: int32, cc: int32, transient: bool, lm: int32, silence: bool) {
+  var m: int32 = 1 << lm;
+  var n: int32 = 120 << lm;
+  var bcount: int32 = 1;
+  var nb: int32 = n;
+  var shift: int32 = 3 - lm;
+  if (transient) {
+    bcount = m;
+    nb = 120;
+    shift = 3;
+  }
+  var freq: float32* = &st->freq[0];
+  if (cc == 2 && c2 == 1) {
+    denormalise(x, freq, &st->old_band[0], start, end, m, silence);
+    var freq2: float32* = out1 + OVERLAP / 2;
+    for i in 0..n { freq2[i] = freq[i]; }
+    for b in 0..bcount { mdct_backward(freq2 + b, out0 + nb * b, shift, bcount); }
+    for b in 0..bcount { mdct_backward(freq + b, out1 + nb * b, shift, bcount); }
+  } else if (cc == 1 && c2 == 2) {
+    var freq2: float32* = out0 + OVERLAP / 2;
+    denormalise(x, freq, &st->old_band[0], start, end, m, silence);
+    denormalise(x + n, freq2, &st->old_band[NBANDS], start, end, m, silence);
+    for i in 0..n { freq[i] = 0.5 * freq[i] + 0.5 * freq2[i]; }
+    for b in 0..bcount { mdct_backward(freq + b, out0 + nb * b, shift, bcount); }
+  } else {
+    for c in 0..cc {
+      var out: float32* = out0;
+      if (c == 1) { out = out1; }
+      denormalise(x + c * n, freq, &st->old_band[c * NBANDS], start, end, m, silence);
+      for b in 0..bcount { mdct_backward(freq + b, out + nb * b, shift, bcount); }
+    }
+  }
+}
+
+fn comb_filter(y: float32*, x: float32*, t0in: int32, t1in: int32, n: int32, g0: float32, g1: float32, tap0: int32, tap1: int32, overlap0: int32) {
+  if (g0 == 0.0 && g1 == 0.0) { return; }   // in place: nothing to do
+  var t0: int32 = imax(t0in, COMB_MINPERIOD);
+  var t1: int32 = imax(t1in, COMB_MINPERIOD);
+  var g00: float32 = g0 * AUDIO_OPUS_COMB_GAINS[tap0 * 3];
+  var g01: float32 = g0 * AUDIO_OPUS_COMB_GAINS[tap0 * 3 + 1];
+  var g02: float32 = g0 * AUDIO_OPUS_COMB_GAINS[tap0 * 3 + 2];
+  var g10: float32 = g1 * AUDIO_OPUS_COMB_GAINS[tap1 * 3];
+  var g11: float32 = g1 * AUDIO_OPUS_COMB_GAINS[tap1 * 3 + 1];
+  var g12: float32 = g1 * AUDIO_OPUS_COMB_GAINS[tap1 * 3 + 2];
+  var x1: float32 = x[-t1 + 1];
+  var x2: float32 = x[-t1];
+  var x3: float32 = x[-t1 - 1];
+  var x4: float32 = x[-t1 - 2];
+  var overlap: int32 = overlap0;
+  if (g0 == g1 && t0 == t1 && tap0 == tap1) { overlap = 0; }
+  var i: int32 = 0;
+  while (i < overlap) {
+    var x0: float32 = x[i - t1 + 2];
+    var f: float32 = g_window[i] * g_window[i];
+    var nf: float32 = 1.0 - f;
+    y[i] = x[i] + (nf * g00) * x[i - t0] +
+      (nf * g01) * (x[i - t0 + 1] + x[i - t0 - 1]) +
+      (nf * g02) * (x[i - t0 + 2] + x[i - t0 - 2]) +
+      (f * g10) * x2 +
+      (f * g11) * (x1 + x3) +
+      (f * g12) * (x0 + x4);
+    x4 = x3;
+    x3 = x2;
+    x2 = x1;
+    x1 = x0;
+    i = i + 1;
+  }
+  if (g1 == 0.0) { return; }
+  // the constant part (comb_filter_const)
+  x4 = x[i - t1 - 2];
+  x3 = x[i - t1 - 1];
+  x2 = x[i - t1];
+  x1 = x[i - t1 + 1];
+  while (i < n) {
+    var x0: float32 = x[i - t1 + 2];
+    y[i] = x[i] + g10 * x2 + g11 * (x1 + x3) + g12 * (x0 + x4);
+    x4 = x3;
+    x3 = x2;
+    x2 = x1;
+    x1 = x0;
+    i = i + 1;
+  }
+}
+
+fn deemphasis(st: AudioOpusCelt*, out0: float32*, out1: float32*, pcm: float32*, n: int32, cc: int32) {
+  var coef: float32 = 0.85000610;
+  var scale: float32 = (float32)(1.0 / 32768.0);
+  for c in 0..cc {
+    var x: float32* = out0;
+    if (c == 1) { x = out1; }
+    var m: float32 = st->preemph[c];
+    for j in 0..n {
+      var tmp: float32 = x[j] + (float32)1e-30 + m;
+      m = coef * tmp;
+      pcm[j * cc + c] = tmp * scale;
+    }
+    st->preemph[c] = m;
+  }
+}
+
+// ---- the decoder ----
+
+/// Clears the decoder history (OPUS_RESET_STATE).
+export fn audio_opus_celt_reset(st: AudioOpusCelt*) {
+  st->rng = 0;
+  st->loss_count = 0;
+  st->pf_period = 0;
+  st->pf_period_old = 0;
+  st->pf_gain = 0.0;
+  st->pf_gain_old = 0.0;
+  st->pf_tapset = 0;
+  st->pf_tapset_old = 0;
+  st->preemph[0] = 0.0;
+  st->preemph[1] = 0.0;
+  for i in 0..4336 { st->mem[i] = 0.0; }
+  for i in 0..42 {
+    st->old_band[i] = 0.0;
+    st->old_log[i] = -28.0;
+    st->old_log2[i] = -28.0;
+    st->background[i] = 0.0;
+  }
+}
+
+export fn audio_opus_celt_init(st: AudioOpusCelt*, channels: int32) {
+  audio_opus_celt_tables();
+  st->channels = channels;
+  st->stream_channels = channels;
+  st->start = 0;
+  st->end = NBANDS;
+  st->disable_inv = 0;
+  if (channels == 1) { st->disable_inv = 1; }
+  audio_opus_celt_reset(st);
+}
+
+// Concealment for a missing frame: noise shaped by the last energies
+// (the noise branch of the reference's celt_decode_lost).
+fn celt_lost(st: AudioOpusCelt*, pcm: float32*, n: int32, lm: int32) {
+  var cc: int32 = st->channels;
+  var c2: int32 = st->stream_channels;
+  var start: int32 = st->start;
+  var end: int32 = st->end;
+  var decay: float32 = 1.5;
+  if (st->loss_count != 0) { decay = 0.5; }
+  for c in 0..c2 {
+    for i in start..end {
+      var k: int32 = c * NBANDS + i;
+      st->old_band[k] = fmax32(st->background[k], st->old_band[k] - decay);
+    }
+  }
+  var seed: uint32 = st->rng;
+  var x: float32* = &st->xbuf[0];
+  for c in 0..c2 {
+    for i in start..end {
+      var boffs: int32 = n * c + ((int32)AUDIO_OPUS_EBANDS[i] << lm);
+      var blen: int32 = ((int32)AUDIO_OPUS_EBANDS[i + 1] - (int32)AUDIO_OPUS_EBANDS[i]) << lm;
+      for j in 0..blen {
+        seed = lcg(seed);
+        x[boffs + j] = (float32)((int32)seed >> 20);
+      }
+      renormalise(x + boffs, blen, 1.0);
+    }
+  }
+  st->rng = seed;
+  var out0: float32* = &st->mem[BUFSIZE - n];
+  var out1: float32* = &st->mem[MEMCH + BUFSIZE - n];
+  for c in 0..cc {
+    var d: float32* = &st->mem[c * MEMCH];
+    memmove(d, d + n, (int64)(BUFSIZE - n + OVERLAP / 2) * 4);
+  }
+  celt_synthesis(st, x, out0, out1, start, end, c2, cc, false, lm, false);
+  deemphasis(st, out0, out1, pcm, n, cc);
+  st->loss_count = st->loss_count + 1;
+}
+
+/// Decodes one CELT frame of `frame_size` samples (120, 240, 480 or 960)
+/// into pcm (interleaved, st->channels). `dec` is the range decoder when
+/// the frame shares it with SILK (hybrid), else 0. data == 0 conceals a
+/// lost frame. Returns the samples written or a negative status.
+export fn audio_opus_celt_decode(st: AudioOpusCelt*, data: uint8*, len: int32, pcm: float32*, frame_size: int32, dec0: AudioOpusRc*) -> int32 {
+  var cc: int32 = st->channels;
+  var c2: int32 = st->stream_channels;
+  var start: int32 = st->start;
+  var end: int32 = st->end;
+  var lm: int32 = 0;
+  while (lm <= 3) {
+    if ((120 << lm) == frame_size) { break; }
+    lm = lm + 1;
+  }
+  if (lm > 3) { return AUDIO_E_ARG; }
+  var m: int32 = 1 << lm;
+  if (len < 0 || len > 1275) { return AUDIO_E_DATA; }
+  var n: int32 = m * 120;
+  if (data == 0 || len <= 1) {
+    celt_lost(st, pcm, n, lm);
+    return frame_size;
+  }
+  var rdec: AudioOpusRc;
+  var dec: AudioOpusRc* = dec0;
+  if (dec == 0) {
+    audio_opus_rc_init(&rdec, data, len);
+    dec = &rdec;
+  }
+  if (c2 == 1) {
+    for i in 0..NBANDS { st->old_band[i] = fmax32(st->old_band[i], st->old_band[NBANDS + i]); }
+  }
+  var total_bits: int32 = len * 8;
+  var tell: int32 = audio_opus_rc_tell(dec);
+  var silence: bool = false;
+  if (tell >= total_bits) {
+    silence = true;
+  } else if (tell == 1) {
+    silence = audio_opus_rc_bit_logp(dec, 15) != 0;
+  }
+  if (silence) {
+    tell = len * 8;
+    dec->nbits_total = dec->nbits_total + tell - audio_opus_rc_tell(dec);
+  }
+  var pf_gain: float32 = 0.0;
+  var pf_pitch: int32 = 0;
+  var pf_tapset: int32 = 0;
+  if (start == 0 && tell + 16 <= total_bits) {
+    if (audio_opus_rc_bit_logp(dec, 1) != 0) {
+      var octave: int32 = (int32)audio_opus_rc_uint(dec, 6);
+      pf_pitch = (16 << octave) + (int32)audio_opus_rc_bits(dec, 4 + octave) - 1;
+      var qg: int32 = (int32)audio_opus_rc_bits(dec, 3);
+      if (audio_opus_rc_tell(dec) + 2 <= total_bits) {
+        pf_tapset = audio_opus_rc_icdf(dec, &AUDIO_OPUS_TAPSET_ICDF[0], 2);
+      }
+      pf_gain = (float32)0.09375 * (float32)(qg + 1);
+    }
+    tell = audio_opus_rc_tell(dec);
+  }
+  var transient: bool = false;
+  if (lm > 0 && tell + 3 <= total_bits) {
+    transient = audio_opus_rc_bit_logp(dec, 3) != 0;
+    tell = audio_opus_rc_tell(dec);
+  }
+  var intra: int32 = 0;
+  if (tell + 3 <= total_bits) { intra = audio_opus_rc_bit_logp(dec, 3); }
+  if (intra == 0 && st->loss_count != 0) {
+    for c in 0..2 {
+      var safety: float32 = 0.0;
+      var missing: int32 = imin(10, st->loss_count >> lm);
+      if (lm == 0) { safety = 1.5; } else if (lm == 1) { safety = 0.5; }
+      for i in start..end {
+        var k: int32 = c * NBANDS + i;
+        if (st->old_band[k] < fmax32(st->old_log[k], st->old_log2[k])) {
+          var e0: float32 = st->old_band[k];
+          var e1: float32 = st->old_log[k];
+          var e2: float32 = st->old_log2[k];
+          var slope: float32 = fmax32(e1 - e0, 0.5 * (e2 - e0));
+          e0 = e0 - fmax32(0.0, (float32)(1 + missing) * slope);
+          st->old_band[k] = fmax32(-20.0, e0);
+        } else {
+          st->old_band[k] = fmin32(fmin32(st->old_band[k], st->old_log[k]), st->old_log2[k]);
+        }
+        st->old_band[k] = st->old_band[k] - safety;
+      }
+    }
+  }
+  unquant_coarse(st, start, end, intra, dec, c2, lm);
+
+  // tf_decode
+  var tf_res: int32* = &st->tf_res[0];
+  {
+    var budget: uint32 = dec->storage * 8;
+    var tl: uint32 = (uint32)audio_opus_rc_tell(dec);
+    var logp: int32 = 4;
+    if (transient) { logp = 2; }
+    var rsv: int32 = 0;
+    if (lm > 0 && tl + (uint32)logp + 1 <= budget) { rsv = 1; }
+    budget = budget - (uint32)rsv;
+    var changed: int32 = 0;
+    var curr: int32 = 0;
+    for i in start..end {
+      if (tl + (uint32)logp <= budget) {
+        curr = curr ^ audio_opus_rc_bit_logp(dec, logp);
+        tl = (uint32)audio_opus_rc_tell(dec);
+        changed = changed | curr;
+      }
+      tf_res[i] = curr;
+      if (transient) { logp = 4; } else { logp = 5; }
+    }
+    var tsel: int32 = 0;
+    var ti: int32 = 0;
+    if (transient) { ti = 4; }
+    if (rsv != 0 && AUDIO_OPUS_TF_SELECT[lm * 8 + ti + changed] != AUDIO_OPUS_TF_SELECT[lm * 8 + ti + 2 + changed]) {
+      tsel = audio_opus_rc_bit_logp(dec, 1);
+    }
+    for i in start..end {
+      tf_res[i] = (int32)AUDIO_OPUS_TF_SELECT[lm * 8 + ti + 2 * tsel + tf_res[i]];
+    }
+  }
+
+  tell = audio_opus_rc_tell(dec);
+  var spread: int32 = 2;
+  if (tell + 4 <= total_bits) { spread = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SPREAD_ICDF[0], 5); }
+
+  var cap: int32* = &st->cap[0];
+  for i in 0..NBANDS {
+    var w: int32 = ((int32)AUDIO_OPUS_EBANDS[i + 1] - (int32)AUDIO_OPUS_EBANDS[i]) << lm;
+    cap[i] = ((int32)AUDIO_OPUS_CACHE_CAPS[NBANDS * (2 * lm + c2 - 1) + i] + 64) * c2 * w >> 2;
+  }
+  var offsets: int32* = &st->offsets[0];
+  var dynalloc_logp: int32 = 6;
+  total_bits = total_bits << BITRES;
+  tell = audio_opus_rc_tell_frac(dec);
+  for i in start..end {
+    var width: int32 = c2 * ((int32)AUDIO_OPUS_EBANDS[i + 1] - (int32)AUDIO_OPUS_EBANDS[i]) << lm;
+    var quanta: int32 = imin(width << BITRES, imax(6 << BITRES, width));
+    var loop_logp: int32 = dynalloc_logp;
+    var boost: int32 = 0;
+    while (tell + (loop_logp << BITRES) < total_bits && boost < cap[i]) {
+      var flag: int32 = audio_opus_rc_bit_logp(dec, loop_logp);
+      tell = audio_opus_rc_tell_frac(dec);
+      if (flag == 0) { break; }
+      boost = boost + quanta;
+      total_bits = total_bits - quanta;
+      loop_logp = 1;
+    }
+    offsets[i] = boost;
+    if (boost > 0) { dynalloc_logp = imax(2, dynalloc_logp - 1); }
+  }
+  var alloc_trim: int32 = 5;
+  if (tell + (6 << BITRES) <= total_bits) { alloc_trim = audio_opus_rc_icdf(dec, &AUDIO_OPUS_TRIM_ICDF[0], 7); }
+
+  var bits: int32 = ((len * 8) << BITRES) - audio_opus_rc_tell_frac(dec) - 1;
+  var anti_rsv: int32 = 0;
+  if (transient && lm >= 2 && bits >= ((lm + 2) << BITRES)) { anti_rsv = 1 << BITRES; }
+  bits = bits - anti_rsv;
+  var intensity: int32 = 0;
+  var dual: int32 = 0;
+  var balance: int32 = 0;
+  var pulses: int32* = &st->pulses[0];
+  var fine_quant: int32* = &st->fine_quant[0];
+  var fine_prio: int32* = &st->fine_prio[0];
+  var coded: int32 = compute_allocation(st, start, end, offsets, cap, alloc_trim, &intensity, &dual, bits, &balance, pulses, fine_quant, fine_prio, c2, lm, dec);
+  unquant_fine(st, start, end, fine_quant, dec, c2);
+
+  for c in 0..cc {
+    var d: float32* = &st->mem[c * MEMCH];
+    memmove(d, d + n, (int64)(BUFSIZE - n + OVERLAP / 2) * 4);
+  }
+
+  var x: float32* = &st->xbuf[0];
+  var y: float32* = (float32*)0;
+  if (c2 == 2) { y = x + n; }
+  quant_all_bands(st, start, end, x, y, &st->masks[0], pulses, transient, spread, dual, intensity, tf_res, len * (8 << BITRES) - anti_rsv, balance, dec, lm, coded);
+
+  var anti_on: int32 = 0;
+  if (anti_rsv > 0) { anti_on = (int32)audio_opus_rc_bits(dec, 1); }
+  unquant_finalise(st, start, end, fine_quant, fine_prio, len * 8 - audio_opus_rc_tell(dec), dec, c2);
+
+  if (anti_on != 0) {
+    // anti_collapse
+    var seed: uint32 = st->rng;
+    for i in start..end {
+      var n0: int32 = (int32)AUDIO_OPUS_EBANDS[i + 1] - (int32)AUDIO_OPUS_EBANDS[i];
+      var depth: int32 = (int32)((uint32)(1 + pulses[i]) / (uint32)n0) >> lm;
+      var thresh: float32 = 0.5 * celt_exp2(-0.125 * (float32)depth);
+      var sqrt_1: float32 = 1.0 / audio_opus_sqrtf((float32)(n0 << lm));
+      for c in 0..c2 {
+        var prev1: float32 = st->old_log[c * NBANDS + i];
+        var prev2: float32 = st->old_log2[c * NBANDS + i];
+        if (c2 == 1) {
+          prev1 = fmax32(prev1, st->old_log[NBANDS + i]);
+          prev2 = fmax32(prev2, st->old_log2[NBANDS + i]);
+        }
+        var ediff: float32 = st->old_band[c * NBANDS + i] - fmin32(prev1, prev2);
+        ediff = fmax32(0.0, ediff);
+        var r: float32 = 2.0 * celt_exp2(-ediff);
+        if (lm == 3) { r = r * (float32)1.41421356; }
+        r = fmin32(thresh, r);
+        r = r * sqrt_1;
+        var xb: float32* = x + c * n + ((int32)AUDIO_OPUS_EBANDS[i] << lm);
+        var renorm: bool = false;
+        for k in 0..(1 << lm) {
+          if (((int32)st->masks[i * c2 + c] & (1 << k)) == 0) {
+            for j in 0..n0 {
+              seed = lcg(seed);
+              if ((seed & 0x8000) != 0) { xb[(j << lm) + k] = r; } else { xb[(j << lm) + k] = -r; }
+            }
+            renorm = true;
+          }
+        }
+        if (renorm) { renormalise(xb, n0 << lm, 1.0); }
+      }
+    }
+  }
+  if (silence) {
+    for i in 0..c2 * NBANDS { st->old_band[i] = -28.0; }
+  }
+  var out0: float32* = &st->mem[BUFSIZE - n];
+  var out1: float32* = &st->mem[MEMCH + BUFSIZE - n];
+  celt_synthesis(st, x, out0, out1, start, end, c2, cc, transient, lm, silence);
+
+  for c in 0..cc {
+    var o: float32* = out0;
+    if (c == 1) { o = out1; }
+    st->pf_period = imax(st->pf_period, COMB_MINPERIOD);
+    st->pf_period_old = imax(st->pf_period_old, COMB_MINPERIOD);
+    comb_filter(o, o, st->pf_period_old, st->pf_period, 120, st->pf_gain_old, st->pf_gain, st->pf_tapset_old, st->pf_tapset, OVERLAP);
+    if (lm != 0) {
+      comb_filter(o + 120, o + 120, st->pf_period, pf_pitch, n - 120, st->pf_gain, pf_gain, st->pf_tapset, pf_tapset, OVERLAP);
+    }
+  }
+  st->pf_period_old = st->pf_period;
+  st->pf_gain_old = st->pf_gain;
+  st->pf_tapset_old = st->pf_tapset;
+  st->pf_period = pf_pitch;
+  st->pf_gain = pf_gain;
+  st->pf_tapset = pf_tapset;
+  if (lm != 0) {
+    st->pf_period_old = st->pf_period;
+    st->pf_gain_old = st->pf_gain;
+    st->pf_tapset_old = st->pf_tapset;
+  }
+  if (c2 == 1) {
+    for i in 0..NBANDS { st->old_band[NBANDS + i] = st->old_band[i]; }
+  }
+  if (!transient) {
+    for i in 0..42 {
+      st->old_log2[i] = st->old_log[i];
+      st->old_log[i] = st->old_band[i];
+    }
+  } else {
+    for i in 0..42 { st->old_log[i] = fmin32(st->old_log[i], st->old_band[i]); }
+  }
+  var max_bg: float32 = (float32)imin(160, st->loss_count + m) * (float32)0.001;
+  for i in 0..42 { st->background[i] = fmin32(st->background[i] + max_bg, st->old_band[i]); }
+  for c in 0..2 {
+    for i in 0..start {
+      st->old_band[c * NBANDS + i] = 0.0;
+      st->old_log[c * NBANDS + i] = -28.0;
+      st->old_log2[c * NBANDS + i] = -28.0;
+    }
+    for i in end..NBANDS {
+      st->old_band[c * NBANDS + i] = 0.0;
+      st->old_log[c * NBANDS + i] = -28.0;
+      st->old_log2[c * NBANDS + i] = -28.0;
+    }
+  }
+  st->rng = dec->rng;
+  deemphasis(st, out0, out1, pcm, n, cc);
+  st->loss_count = 0;
+  if (audio_opus_rc_tell(dec) > 8 * len) { return AUDIO_E_DATA; }
+  return frame_size;
+}

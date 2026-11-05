@@ -1,0 +1,140 @@
+// CodecRev: a byte buffer that grows toward the front. The protobuf encoder
+// writes a message back to front, last field first, as upb does. A nested
+// message is then written before its length, so the length is known when it
+// is written and no size pass is needed.
+//
+// The output is data[pos..cap). Failed writes set `err` and later writes do
+// nothing.
+import "std/mem";
+import "codec/core/status";
+import "codec/core/varint";
+
+export struct CodecRev {
+  data: uint8*;
+  pos: int64;
+  cap: int64;
+  err: int32;
+  limit: int64;   // most bytes this buffer may hold; 0 means no limit
+}
+
+export fn codec_rev_init(w: CodecRev*, cap: int64) {
+  w->data = (uint8*)0;
+  w->pos = 0;
+  w->cap = 0;
+  w->err = CODEC_OK;
+  w->limit = 0;
+  if (cap > 0) {
+    w->data = (uint8*)malloc(cap);
+    if (w->data == 0) { w->err = CODEC_ERR_NOMEM; } else { w->cap = cap; w->pos = cap; }
+  }
+}
+
+export fn codec_rev_free(w: CodecRev*) {
+  if (w->data != 0) { free(w->data); }
+  w->data = (uint8*)0;
+  w->pos = 0;
+  w->cap = 0;
+  w->err = CODEC_OK;
+}
+
+// Empties the buffer, keeps its memory, clears the error.
+export fn codec_rev_clear(w: CodecRev*) {
+  w->pos = w->cap;
+  w->err = CODEC_OK;
+}
+
+// Bytes written so far.
+@inline export fn codec_rev_len(w: CodecRev*) -> int64 {
+  return w->cap - w->pos;
+}
+
+// The bytes written so far, as a view into the buffer.
+export fn codec_rev_view(w: CodecRev*) -> string {
+  var s: string;
+  s.chars = w->data + w->pos;
+  s.length = (uint64)(w->cap - w->pos);
+  return s;
+}
+
+// Copies the output into a new malloc block (free it with free(s.chars)).
+export fn codec_rev_copy(w: CodecRev*) -> string {
+  var n: int64 = w->cap - w->pos;
+  var s: string;
+  var p: uint8* = (uint8*)malloc(n + 1);
+  if (p == 0) { return s; }
+  memcpy(p, w->data + w->pos, n);
+  p[n] = (uint8)0;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+@noinline export fn codec_rev_grow(w: CodecRev*, n: int64) -> bool {
+  if (w->err != CODEC_OK) { return false; }
+  var used: int64 = w->cap - w->pos;
+  var need: int64 = used + n;
+  if (n < 0 || need < used || (w->limit > 0 && need > w->limit)) {
+    w->err = CODEC_ERR_LIMIT;
+    return false;
+  }
+  if (n <= w->pos) { return true; }
+  var nc: int64 = w->cap * 2;
+  if (nc < 256) { nc = 256; }
+  if (nc < need) { nc = need; }
+  if (w->limit > 0 && nc > w->limit) { nc = w->limit; }
+  var p: uint8* = (uint8*)malloc(nc);
+  if (p == 0) {
+    w->err = CODEC_ERR_NOMEM;
+    return false;
+  }
+  if (used > 0) { memcpy(p + nc - used, w->data + w->pos, used); }
+  if (w->data != 0) { free(w->data); }
+  w->data = p;
+  w->pos = nc - used;
+  w->cap = nc;
+  return true;
+}
+
+// Makes room for n bytes in front of what is written and returns where they
+// go (the caller must fill all n), or 0 if they do not fit.
+@inline export fn codec_rev_reserve(w: CodecRev*, n: int64) -> uint8* {
+  if (w->pos < n || w->err != CODEC_OK) {
+    if (!codec_rev_grow(w, n)) { return (uint8*)0; }
+  }
+  w->pos = w->pos - n;
+  return w->data + w->pos;
+}
+
+@inline export fn codec_rev_byte(w: CodecRev*, v: uint8) {
+  var p: uint8* = codec_rev_reserve(w, 1);
+  if (p != 0) { p[0] = v; }
+}
+
+export fn codec_rev_bytes(w: CodecRev*, src: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  var p: uint8* = codec_rev_reserve(w, n);
+  if (p != 0) { memcpy(p, src, n); }
+}
+
+export fn codec_rev_string(w: CodecRev*, s: string) {
+  codec_rev_bytes(w, s.chars, (int64)s.length);
+}
+
+@inline export fn codec_rev_varint(w: CodecRev*, v: uint64) {
+  if (v < 128) {
+    codec_rev_byte(w, (uint8)v);
+    return;
+  }
+  var p: uint8* = codec_rev_reserve(w, codec_varint_size(v));
+  if (p != 0) { codec_put_varint(p, v); }
+}
+
+@inline export fn codec_rev_le32(w: CodecRev*, v: uint32) {
+  var p: uint8* = codec_rev_reserve(w, 4);
+  if (p != 0) { codec_put_le32(p, v); }
+}
+
+@inline export fn codec_rev_le64(w: CodecRev*, v: uint64) {
+  var p: uint8* = codec_rev_reserve(w, 8);
+  if (p != 0) { codec_put_le64(p, v); }
+}

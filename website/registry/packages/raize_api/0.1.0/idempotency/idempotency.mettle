@@ -1,0 +1,415 @@
+// raize_api/idempotency: safe retries with the Idempotency-Key header.
+//
+//   rapi_use_idempotency(api, 86400, 10000);          // keep results for a day, 10000 keys
+//   var op: RapiOp* = rapi_post(api, "/payments", &create_payment);
+//   rapi_idempotent(op, true);                        // the key is required
+//
+// Follows draft-ietf-httpapi-idempotency-key-header (the Idempotency-Key HTTP header
+// field, version 08 at the time of writing):
+//   - the value is a Structured Fields Item that is a String (RFC 9651 section 3.3.3):
+//     Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324". Only \" and \\ are
+//     escapes, printable ASCII only. A bare token is accepted too, to be lenient.
+//     The key is at most 255 characters.
+//   - a missing key on an operation that needs one is 400, a key reused with a
+//     different request is 422, a request that is still running for the key is 409.
+//     Each answer is a problem details document (RFC 9457). The draft registers no
+//     problem types, so these use urn:raize-api:problem:... types and the draft's titles.
+//   - a retry with the same key and the same request gets the stored response again,
+//     marked with Idempotent-Replayed: true, and the handler does not run.
+//
+// A request is the same request when the 64-bit hash of its verb, path, query and body
+// matches. Keys are scoped to the caller (r->subject), so two callers can use the same
+// key. Anonymous callers share one scope, so use this with authentication for anything
+// that matters, and register the auth hooks first so the subject is known.
+//
+// Hooks: register this before hooks that rewrite the response (such as compression),
+// so the stored copy is the plain response.
+//
+// Store: a fixed table behind a mutex. An entry is "in flight" from the moment its
+// request is accepted until the response is known, then "completed" for the ttl.
+// When the table is full the expired entries go first, then the oldest completed
+// one. In-flight entries are never evicted; if every entry is in flight the answer is
+// 503. Responses with a status of 500 or more are not kept (the entry is released, so
+// the client can retry), and neither are bodies over 1 MiB. Memory use is bounded by
+// capacity times 1 MiB.
+import "std/mem";
+import "std/thread";
+import "std/time";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/header";
+import "raize_core/context/response";
+import "../types/type";
+import "../route/api";
+import "../problem/problem";
+
+/// The longest key, in characters after unescaping.
+export const RAPI_IDEM_KEY_MAX: int32 = 255;
+/// Bodies larger than this many bytes are not stored.
+export const RAPI_IDEM_BODY_MAX: int64 = 1048576;
+
+const RAPI_IDEM_FREE: int32 = 0;
+const RAPI_IDEM_FLIGHT: int32 = 1;
+const RAPI_IDEM_DONE: int32 = 2;
+
+// Outcomes of looking a key up.
+const RAPI_IDEM_RESERVED: int32 = 0;
+const RAPI_IDEM_REPLAYED: int32 = 1;
+const RAPI_IDEM_BUSY: int32 = 2;
+const RAPI_IDEM_REUSED: int32 = 3;
+const RAPI_IDEM_FULL: int32 = 4;
+
+struct RapiIdemEntry {
+  state: int32;
+  khash: uint64;        // hash of subject and key, to skip most string compares
+  fp: uint64;           // hash of the request
+  key: string;          // owned
+  subject: string;      // owned
+  seq: int64;           // order of completion, the smallest goes first when full
+  expires: int64;       // milliseconds on the store's clock
+  status: int32;
+  ctype: string;        // owned
+  location: string;     // owned
+  body: uint8*;         // owned, 0 for none
+  body_len: int64;
+}
+
+struct RapiIdem {
+  lock: int64;
+  cap: int32;
+  tab: RapiIdemEntry*;
+  ttl_ms: int64;
+  seq: int64;
+  clock: fn() -> int64;   // milliseconds
+}
+
+fn rapi__idem_now() -> int64 { return time_unix_ms(); }
+
+// ---------------------------------------------------------------------------
+// Hashing (FNV-1a, 64 bits)
+// ---------------------------------------------------------------------------
+
+fn rapi__idem_basis() -> uint64 {
+  return ((uint64)3421674724 << 32) + (uint64)2216829733;
+}
+
+fn rapi__idem_mix(h: uint64, s: string) -> uint64 {
+  var prime: uint64 = ((uint64)1 << 40) + (uint64)435;
+  var x: uint64 = h;
+  var n: int64 = (int64)s.length;
+  for i in 0..n {
+    x = (x ^ (uint64)s.chars[i]) * prime;
+  }
+  // A separator no text part ends with, so ("ab", "c") and ("a", "bc") differ.
+  x = (x ^ (uint64)255) * prime;
+  return x;
+}
+
+// ---------------------------------------------------------------------------
+// The key
+// ---------------------------------------------------------------------------
+
+/// Reads an Idempotency-Key header value: an sf-string in double quotes (RFC 9651),
+/// or a bare token. Strict: only printable ASCII, only the escapes \" and \\, nothing
+/// after the closing quote, 1 to 255 characters.
+///
+/// in:      raw    the header value, surrounding spaces already removed
+///          arena  where the key text is copied
+/// out:     out    the key, unescaped
+/// returns: false when the value is not a valid key
+export fn rapi_idem_parse(raw: string, arena: RzArena*, out: string*) -> bool {
+  var n: int64 = (int64)raw.length;
+  if (n == 0 || n > (int64)RAPI_IDEM_KEY_MAX * 2 + 2) { return false; }
+  var b: RzBuf* = rz_buf_new();
+  var ok: bool = true;
+  if (raw.chars[0] == 34) {
+    var done: bool = false;
+    var i: int64 = 1;
+    while (i < n && ok && !done) {
+      var c: int32 = (int32)raw.chars[i];
+      if (c == 34) {
+        // The closing quote has to be the last character.
+        if (i != n - 1) { ok = false; }
+        done = true;
+      } else if (c == 92) {
+        if (i + 1 >= n) { ok = false; }
+        else {
+          var d: int32 = (int32)raw.chars[i + 1];
+          if (d == 34 || d == 92) { rz_buf_add_byte(b, d); i = i + 2; }
+          else { ok = false; }
+        }
+      } else if (c < 32 || c > 126) {
+        ok = false;
+      } else {
+        rz_buf_add_byte(b, c);
+        i = i + 1;
+      }
+    }
+    if (!done) { ok = false; }
+  } else {
+    for i in 0..n {
+      var c: int32 = (int32)raw.chars[i];
+      if (!rz_char_is_tchar(c) && c != 58 && c != 47) { ok = false; break; }
+      rz_buf_add_byte(b, c);
+    }
+  }
+  if (ok && (b->len == 0 || b->len > (int64)RAPI_IDEM_KEY_MAX)) { ok = false; }
+  if (ok) {
+    var copy: string = rz_arena_str(arena, rz_buf_str(b));
+    if (copy.length == 0) { ok = false; } else { *out = copy; }
+  }
+  rz_buf_free(b);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// The store (call these with the lock held)
+// ---------------------------------------------------------------------------
+
+fn rapi__idem_release(e: RapiIdemEntry*) {
+  rz_str_free(e->key);
+  rz_str_free(e->subject);
+  rz_str_free(e->ctype);
+  rz_str_free(e->location);
+  if (e->body != 0) { free((rawptr)e->body); }
+  memset((rawptr)e, 0, sizeof(RapiIdemEntry));
+}
+
+// Sends the stored response again.
+fn rapi__idem_replay(r: RapiReq*, e: RapiIdemEntry*) {
+  var ctx: RzContext* = r->ctx;
+  if (e->body_len > 0) {
+    var ct: string = e->ctype;
+    if (ct.length == 0) { ct = RZ_CT_BYTES; }
+    rz_ctx_bytes(ctx, e->status, ct, rz_str_view(e->body, e->body_len));
+  } else {
+    rz_ctx_empty(ctx, e->status);
+    if (e->ctype.length > 0) { rz_ctx_set_header(ctx, "Content-Type", e->ctype); }
+  }
+  if (e->location.length > 0) { rz_ctx_set_header(ctx, "Location", e->location); }
+  rz_ctx_set_header(ctx, "Idempotent-Replayed", "true");
+}
+
+// Finds the key, or reserves an entry for it. Returns one of RAPI_IDEM_*. On
+// RAPI_IDEM_RESERVED the slot goes into r->idem_slot; on RAPI_IDEM_REPLAYED the
+// response is already written and *status holds its status.
+fn rapi__idem_enter(st: RapiIdem*, r: RapiReq*, key: string, fp: uint64, status: int32*) -> int32 {
+  var kh: uint64 = rapi__idem_mix(rapi__idem_mix(rapi__idem_basis(), r->subject), key);
+  var clk: fn() -> int64 = st->clock;
+  mutex_lock_infinite(st->lock);
+  var now: int64 = clk();
+  var hit: int32 = -1;
+  var spare: int32 = -1;
+  var oldest: int32 = -1;
+  for i in 0..st->cap {
+    var e: RapiIdemEntry* = &st->tab[i];
+    // Expired results go first.
+    if (e->state == RAPI_IDEM_DONE && now >= e->expires) { rapi__idem_release(e); }
+    if (e->state == RAPI_IDEM_FREE) {
+      if (spare < 0) { spare = i; }
+      continue;
+    }
+    if (e->khash == kh && rz_str_eq(e->key, key) && rz_str_eq(e->subject, r->subject)) {
+      hit = i;
+      break;
+    }
+    if (e->state == RAPI_IDEM_DONE) {
+      if (oldest < 0 || e->seq < st->tab[oldest].seq) { oldest = i; }
+    }
+  }
+  var outcome: int32 = RAPI_IDEM_RESERVED;
+  if (hit >= 0) {
+    var h: RapiIdemEntry* = &st->tab[hit];
+    if (h->state == RAPI_IDEM_FLIGHT) { outcome = RAPI_IDEM_BUSY; }
+    else if (h->fp != fp) { outcome = RAPI_IDEM_REUSED; }
+    else {
+      rapi__idem_replay(r, h);
+      *status = h->status;
+      outcome = RAPI_IDEM_REPLAYED;
+    }
+  } else {
+    var slot: int32 = spare;
+    if (slot < 0) { slot = oldest; }
+    if (slot < 0) {
+      outcome = RAPI_IDEM_FULL;
+    } else {
+      var e2: RapiIdemEntry* = &st->tab[slot];
+      rapi__idem_release(e2);
+      e2->state = RAPI_IDEM_FLIGHT;
+      e2->khash = kh;
+      e2->fp = fp;
+      e2->key = rz_str_dup(key);
+      e2->subject = rz_str_dup(r->subject);
+      r->idem_slot = slot;
+    }
+  }
+  mutex_unlock(st->lock);
+  return outcome;
+}
+
+// ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+fn rapi__idem_problem(r: RapiReq*, status: int32, slug: string, title: string, detail: string) -> int32 {
+  return rapi_problem_typed(r->ctx, status, rz_arena_str(r->ctx->arena, "urn:raize-api:problem:{slug}"), title, detail);
+}
+
+fn rapi__idem_fingerprint(req: RzRequest*) -> uint64 {
+  var h: uint64 = rapi__idem_basis();
+  h = rapi__idem_mix(h, req->verb);
+  h = rapi__idem_mix(h, req->path);
+  h = rapi__idem_mix(h, req->query);
+  h = rapi__idem_mix(h, req->body);
+  return h;
+}
+
+fn rapi__idem_before(r: RapiReq*) -> int32 {
+  var op: RapiOp* = r->op;
+  if (op->idem <= 0) { return RAPI_NEXT; }
+  var st: RapiIdem* = (RapiIdem*)r->api->idem;
+  if (st == 0) { return RAPI_NEXT; }
+  var ctx: RzContext* = r->ctx;
+  var req: RzRequest* = ctx->req;
+
+  var count: int32 = rz_header_count_named(req->headers, req->header_count, "Idempotency-Key");
+  if (count == 0) {
+    if (op->idem >= 2) {
+      return rapi__idem_problem(r, 400, "idempotency-key-missing", "Idempotency-Key is missing.",
+        "this operation needs an Idempotency-Key header, for example Idempotency-Key: \"8e03978e-40d5-43e8-bc93-6894a57f9324\"");
+    }
+    return RAPI_NEXT;
+  }
+  var key: string = "";
+  if (count > 1 || !rapi_idem_parse(rz_ctx_header(ctx, "Idempotency-Key"), ctx->arena, &key)) {
+    return rapi__idem_problem(r, 400, "idempotency-key-invalid", "Idempotency-Key is invalid.",
+      "send one Idempotency-Key header holding a quoted string of 1 to 255 printable ASCII characters");
+  }
+
+  var status: int32 = 0;
+  var outcome: int32 = rapi__idem_enter(st, r, key, rapi__idem_fingerprint(req), &status);
+  if (outcome == RAPI_IDEM_RESERVED) { return RAPI_NEXT; }
+  if (outcome == RAPI_IDEM_REPLAYED) { return status; }
+  if (outcome == RAPI_IDEM_BUSY) {
+    return rapi__idem_problem(r, 409, "idempotency-key-busy", "A request is outstanding for this Idempotency-Key.",
+      "the first request with this key is still being handled; retry when it has finished");
+  }
+  if (outcome == RAPI_IDEM_REUSED) {
+    return rapi__idem_problem(r, 422, "idempotency-key-reused", "Idempotency-Key is already used.",
+      "this key was used for a different request; send a new key for a new request");
+  }
+  rz_ctx_set_header(ctx, "Retry-After", "1");
+  return rapi_problem(ctx, 503, "too many requests with an Idempotency-Key are running; retry shortly");
+}
+
+fn rapi__idem_after(r: RapiReq*, status: int32) -> int32 {
+  if (r->idem_slot < 0) { return status; }
+  var st: RapiIdem* = (RapiIdem*)r->api->idem;
+  if (st == 0) { return status; }
+  var slot: int32 = r->idem_slot;
+  r->idem_slot = -1;
+  var res: RzResponse* = r->ctx->resp;
+  var blen: int64 = rz_resp_body_len(res);
+
+  // Copy what is kept before taking the lock.
+  var keep: bool = status < 500 && blen <= RAPI_IDEM_BODY_MAX;
+  var body: uint8* = (uint8*)0;
+  var ctype: string = "";
+  var loc: string = "";
+  if (keep && blen > 0) {
+    body = (uint8*)malloc(blen);
+    if (body == 0) { keep = false; }
+    else { memcpy((rawptr)body, (rawptr)res->body->data, blen); }
+  }
+  if (keep) {
+    ctype = rz_str_dup(rz_resp_header_get(res, "Content-Type"));
+    loc = rz_str_dup(rz_resp_header_get(res, "Location"));
+  }
+
+  var clk: fn() -> int64 = st->clock;
+  var stored: bool = false;
+  mutex_lock_infinite(st->lock);
+  var e: RapiIdemEntry* = &st->tab[slot];
+  if (keep && e->state == RAPI_IDEM_FLIGHT) {
+    st->seq = st->seq + 1;
+    e->state = RAPI_IDEM_DONE;
+    e->seq = st->seq;
+    e->expires = clk() + st->ttl_ms;
+    e->status = status;
+    e->ctype = ctype;
+    e->location = loc;
+    e->body = body;
+    e->body_len = blen;
+    stored = true;
+  } else {
+    rapi__idem_release(e);
+  }
+  mutex_unlock(st->lock);
+
+  if (!stored) {
+    if (body != 0) { free((rawptr)body); }
+    rz_str_free(ctype);
+    rz_str_free(loc);
+  }
+  return status;
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+/// Turns on Idempotency-Key handling for the API. Only operations marked with
+/// rapi_idempotent take part.
+///
+/// in:      api       the API
+///          ttl_secs  how long a finished response is kept (seconds, at least 1)
+///          capacity  how many keys are kept at once (at least 1)
+export fn rapi_use_idempotency(api: RapiApi*, ttl_secs: int64, capacity: int32) {
+  if (api->idem != 0) { rapi__set_error(api, "rapi_use_idempotency was called twice"); return; }
+  var cap: int32 = capacity;
+  if (cap < 1) { cap = 1; }
+  if (cap > 1048576) { cap = 1048576; }
+  var ttl: int64 = ttl_secs;
+  if (ttl < 1) { ttl = 1; }
+  var st: RapiIdem* = (RapiIdem*)calloc(1, sizeof(RapiIdem));
+  st->lock = mutex_create();
+  st->cap = cap;
+  st->tab = (RapiIdemEntry*)calloc((int64)cap, sizeof(RapiIdemEntry));
+  st->ttl_ms = ttl * 1000;
+  st->clock = &rapi__idem_now;
+  api->idem = (rawptr)st;
+  rapi_before(api, &rapi__idem_before);
+  rapi_after(api, &rapi__idem_after);
+}
+
+/// Marks an operation as taking an Idempotency-Key. With `required` a request
+/// without the key is answered 400; otherwise the key is optional. Also lists the
+/// header in the OpenAPI document.
+export fn rapi_idempotent(op: RapiOp*, required: bool) {
+  if (op == 0) { return; }
+  if (required) { op->idem = 2; } else { op->idem = 1; }
+  rapi_header_param(op, "Idempotency-Key", rapi_string_t(), required,
+    "A unique key for this request, a quoted string (RFC 9651) such as \"8e03978e-40d5-43e8-bc93-6894a57f9324\". Retrying with the same key and request returns the first response.");
+}
+
+/// Replaces the store's clock, which returns milliseconds (for tests).
+export fn rapi_idem_clock(api: RapiApi*, clock: fn() -> int64) {
+  var st: RapiIdem* = (RapiIdem*)api->idem;
+  if (st == 0) { return; }
+  st->clock = clock;
+}
+
+/// How many keys the store holds now, in flight and completed (expired ones that
+/// nobody has needed the space of yet are counted too).
+export fn rapi_idem_count(api: RapiApi*) -> int32 {
+  var st: RapiIdem* = (RapiIdem*)api->idem;
+  if (st == 0) { return 0; }
+  var n: int32 = 0;
+  mutex_lock_infinite(st->lock);
+  for i in 0..st->cap {
+    if (st->tab[i].state != RAPI_IDEM_FREE) { n = n + 1; }
+  }
+  mutex_unlock(st->lock);
+  return n;
+}

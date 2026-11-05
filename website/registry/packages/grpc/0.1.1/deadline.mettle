@@ -1,0 +1,165 @@
+// Deadlines, the grpc-timeout header, and cancellation.
+//
+// A deadline is a point on the monotonic clock in nanoseconds; 0 means none.
+// grpc-timeout is 1 to 8 ASCII digits and a unit: H M S m u n
+// (doc/PROTOCOL-HTTP2.md). A server receiving one sets its own deadline
+// from it, so a deadline carries on to every call the handler makes.
+import "std/time";
+import "grpc/status";
+
+export const GRPC_NO_DEADLINE: int64 = 0;
+const MAX_I64: int64 = 9223372036854775807;
+
+export fn grpc_now_ns() -> int64 {
+  return time_mono_ns();
+}
+
+// A deadline timeout_ns from now. A timeout of zero or less is already past.
+export fn grpc_deadline_after(timeout_ns: int64) -> int64 {
+  var now: int64 = grpc_now_ns();
+  if (timeout_ns <= 0) { return now; }
+  if (timeout_ns > MAX_I64 - now) { return MAX_I64; }
+  return now + timeout_ns;
+}
+
+// Nanoseconds left; MAX for no deadline, 0 once it has passed.
+export fn grpc_deadline_left(deadline: int64) -> int64 {
+  if (deadline == GRPC_NO_DEADLINE) { return MAX_I64; }
+  var left: int64 = deadline - grpc_now_ns();
+  if (left < 0) { return 0; }
+  return left;
+}
+
+export fn grpc_deadline_passed(deadline: int64) -> bool {
+  return deadline != GRPC_NO_DEADLINE && grpc_now_ns() >= deadline;
+}
+
+// The earlier of two deadlines, treating 0 as none.
+export fn grpc_deadline_min(a: int64, b: int64) -> int64 {
+  if (a == GRPC_NO_DEADLINE) { return b; }
+  if (b == GRPC_NO_DEADLINE) { return a; }
+  if (a < b) { return a; }
+  return b;
+}
+
+const UNIT_NS: int64[6] = [1, 1000, 1000000, 1000000000, 60000000000, 3600000000000];
+const UNIT_CH: string = "numSMH";
+
+// Writes the grpc-timeout value for ns (8 bytes of room plus the unit, so
+// 9 bytes) into out and returns its length. It uses the finest unit that
+// fits in 8 digits, rounding up so the server never gets more time than
+// the client. Zero or less is written as "0n".
+export fn grpc_timeout_encode(ns: int64, out: uint8*) -> int64 {
+  var v: int64 = ns;
+  var unit: int32 = 0;
+  if (v < 0) { v = 0; }
+  while (unit < 5) {
+    var q: int64 = v / UNIT_NS[unit];
+    if (v % UNIT_NS[unit] != 0) { q = q + 1; }
+    if (q <= 99999999) {
+      v = q;
+      break;
+    }
+    unit = unit + 1;
+  }
+  if (unit == 5) {
+    var h: int64 = v / UNIT_NS[5];
+    if (v % UNIT_NS[5] != 0) { h = h + 1; }
+    if (h > 99999999) { h = 99999999; }
+    v = h;
+  }
+  var tmp: uint8[8];
+  var n: int64 = 0;
+  if (v == 0) {
+    tmp[0] = 48;
+    n = 1;
+  }
+  while (v > 0) {
+    tmp[n] = (uint8)(48 + v % 10);
+    v = v / 10;
+    n = n + 1;
+  }
+  for i in 0..n { out[i] = tmp[n - 1 - i]; }
+  out[n] = UNIT_CH.chars[unit];
+  return n + 1;
+}
+
+// Reads a grpc-timeout value into nanoseconds, or -1 if it is not valid.
+// Values past the int64 range saturate.
+export fn grpc_timeout_decode(s: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  if (n < 2 || n > 9) { return -1; }
+  var unit: int32 = -1;
+  for k in 0..6 {
+    if (s.chars[n - 1] == UNIT_CH.chars[k]) { unit = (int32)k; }
+  }
+  if (unit < 0) { return -1; }
+  var v: int64 = 0;
+  for i in 0..n - 1 {
+    var c: uint8 = s.chars[i];
+    if (c < 48 || c > 57) { return -1; }
+    v = v * 10 + (int64)(c - 48);
+  }
+  if (v > MAX_I64 / UNIT_NS[unit]) { return MAX_I64; }
+  return v * UNIT_NS[unit];
+}
+
+// ---- cancellation -----------------------------------------------------------
+
+// A cancel signal. Cancelling a parent cancels every child that points at
+// it. Set once; reading it from another thread is safe because the flag
+// only ever goes from 0 to 1 after the code is stored.
+export struct GrpcCancel {
+  done: int32;
+  code: int32;
+  parent: GrpcCancel*;
+}
+
+export fn grpc_cancel_init(c: GrpcCancel*, parent: GrpcCancel*) {
+  c->done = 0;
+  c->code = GRPC_OK;
+  c->parent = parent;
+}
+
+// Cancels with a status code (usually CANCELLED). A second call does nothing.
+export fn grpc_cancel(c: GrpcCancel*, code: int32) {
+  if (c->done != 0) { return; }
+  c->code = code;
+  c->done = 1;
+}
+
+// The code it was cancelled with, its own or an ancestor's, or GRPC_OK.
+export fn grpc_cancel_code(c: GrpcCancel*) -> int32 {
+  var p: GrpcCancel* = c;
+  while (p != 0) {
+    if (p->done != 0) { return p->code; }
+    p = p->parent;
+  }
+  return GRPC_OK;
+}
+
+// The context of a call: its deadline and cancel signal. A child context
+// (a call made while handling another) never outlives its parent.
+export struct GrpcContext {
+  deadline: int64;
+  cancel: GrpcCancel;
+}
+
+export fn grpc_ctx_init(ctx: GrpcContext*, deadline: int64) {
+  ctx->deadline = deadline;
+  grpc_cancel_init(&ctx->cancel, (GrpcCancel*)0);
+}
+
+export fn grpc_ctx_child(ctx: GrpcContext*, parent: GrpcContext*, deadline: int64) {
+  ctx->deadline = grpc_deadline_min(parent->deadline, deadline);
+  grpc_cancel_init(&ctx->cancel, &parent->cancel);
+}
+
+// GRPC_OK while the call may go on; otherwise the code to end it with
+// (CANCELLED or DEADLINE_EXCEEDED, or whatever code it was cancelled with).
+export fn grpc_ctx_err(ctx: GrpcContext*) -> int32 {
+  var c: int32 = grpc_cancel_code(&ctx->cancel);
+  if (c != GRPC_OK) { return c; }
+  if (grpc_deadline_passed(ctx->deadline)) { return GRPC_DEADLINE_EXCEEDED; }
+  return GRPC_OK;
+}

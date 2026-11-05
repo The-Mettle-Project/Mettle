@@ -1,0 +1,85 @@
+// AudioRing: a single-producer, single-consumer ring of float frames. One
+// thread writes and one thread reads, with no locks: each side moves only
+// its own counter, published with an atomic exchange.
+//
+// Used between a decoder thread and the device callback, and for capture.
+
+import "std/mem";
+import "std/thread" as th;
+import "../core/status";
+
+export struct AudioRing {
+  data: float32*;
+  ch: int32;
+  cap: int32;       // frames, a power of two
+  w: int32;         // frames written (wraps)
+  r: int32;         // frames read (wraps)
+}
+
+/// Makes a ring for at least `frames` frames of ch channels.
+export fn audio_ring_init(q: AudioRing*, ch: int32, frames: int32) -> int32 {
+  memset(q, 0, sizeof(AudioRing));
+  if (ch < 1 || frames < 1 || frames > (1 << 26)) { return AUDIO_E_ARG; }
+  var cap: int32 = 1;
+  while (cap < frames) { cap = cap << 1; }
+  q->data = (float32*)calloc((int64)cap * (int64)ch, 4);
+  if (q->data == 0) { return AUDIO_E_MEM; }
+  q->ch = ch;
+  q->cap = cap;
+  return AUDIO_OK;
+}
+
+export fn audio_ring_free(q: AudioRing*) {
+  if (q->data != 0) { free(q->data); }
+  q->data = (float32*)0;
+}
+
+fn ring_load(p: int32*) -> int32 {
+  // an exchange that changes nothing gives a fresh value with a barrier
+  return th.InterlockedCompareExchange(p, 0, 0);
+}
+
+/// Frames that can be read now.
+export fn audio_ring_count(q: AudioRing*) -> int32 {
+  return ring_load(&q->w) - ring_load(&q->r);
+}
+
+/// Frames that can be written now.
+export fn audio_ring_space(q: AudioRing*) -> int32 {
+  return q->cap - audio_ring_count(q);
+}
+
+/// Writes up to n frames; returns how many fit.
+export fn audio_ring_write(q: AudioRing*, src: float32*, n: int32) -> int32 {
+  var w: int32 = q->w;
+  var r: int32 = ring_load(&q->r);
+  var room: int32 = q->cap - (w - r);
+  var k: int32 = n;
+  if (k > room) { k = room; }
+  if (k <= 0) { return 0; }
+  var ch: int64 = (int64)q->ch;
+  var at: int32 = w & (q->cap - 1);
+  var first: int32 = q->cap - at;
+  if (first > k) { first = k; }
+  memcpy(q->data + (int64)at * ch, src, (int64)first * ch * 4);
+  if (k > first) { memcpy(q->data, src + (int64)first * ch, (int64)(k - first) * ch * 4); }
+  th.InterlockedExchange(&q->w, w + k);
+  return k;
+}
+
+/// Reads up to n frames; returns how many there were.
+export fn audio_ring_read(q: AudioRing*, dst: float32*, n: int32) -> int32 {
+  var r: int32 = q->r;
+  var w: int32 = ring_load(&q->w);
+  var k: int32 = w - r;
+  if (k > n) { k = n; }
+  if (k <= 0) { return 0; }
+  var ch: int64 = (int64)q->ch;
+  var at: int32 = r & (q->cap - 1);
+  var first: int32 = q->cap - at;
+  if (first > k) { first = k; }
+  memcpy(dst, q->data + (int64)at * ch, (int64)first * ch * 4);
+  if (k > first) { memcpy(dst + (int64)first * ch, q->data, (int64)(k - first) * ch * 4); }
+  th.InterlockedExchange(&q->r, r + k);
+  return k;
+}

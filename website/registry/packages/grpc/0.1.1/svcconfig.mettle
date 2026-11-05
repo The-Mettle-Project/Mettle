@@ -1,0 +1,566 @@
+// gRPC service config: per-method timeouts, retries and hedging, the retry
+// throttle, and the load balancing policy name.
+//
+// The JSON format is grpc/grpc doc/service_config.md; the retry and hedging
+// rules are gRFC A6. Parsing is strict: a field of the wrong type or a
+// value out of range rejects the whole config. Unknown keys are ignored.
+import "std/mem";
+import "grpc/arena";
+import "grpc/json";
+import "grpc/status";
+
+const MAX_I64: int64 = 9223372036854775807;
+const MAX_ATTEMPTS_CAP: int64 = 5;
+
+// A method a config applies to. method "" means every method of the
+// service; both "" means every method.
+export struct GrpcMethodName {
+  service: string;
+  method_name: string;
+}
+
+export struct GrpcRetryPolicy {
+  max_attempts: int32;
+  initial_backoff_ns: int64;
+  max_backoff_ns: int64;
+  multiplier: float64;
+  codes: uint32;            // bit (1 << code) set for each retryable status code
+}
+
+export struct GrpcHedgingPolicy {
+  max_attempts: int32;
+  delay_ns: int64;
+  non_fatal: uint32;        // bit (1 << code) set for each non-fatal status code
+}
+
+export struct GrpcMethodConfig {
+  names: GrpcMethodName*;
+  nnames: int64;
+  wait_for_ready: int32;    // -1 unset, 0 false, 1 true
+  timeout_ns: int64;        // 0 = unset
+  max_request_bytes: int64; // 0 = unset
+  max_response_bytes: int64; // 0 = unset
+  has_retry: bool;
+  retry: GrpcRetryPolicy;
+  has_hedging: bool;
+  hedging: GrpcHedgingPolicy;
+}
+
+export struct GrpcServiceConfig {
+  methods: GrpcMethodConfig*;
+  nmethods: int64;
+  lb_policy: string;
+  has_throttle: bool;
+  max_tokens: float64;
+  token_ratio: float64;
+}
+
+// ---- durations --------------------------------------------------------------
+
+// Reads a proto3 JSON Duration ("1s", "0.5s", "1.000000001s") into
+// nanoseconds. Returns -1 if it is not valid: no 's' at the end, no digits,
+// more than 9 fraction digits, a sign, or more than the proto limit of
+// 315576000000 seconds. A value too big for int64 nanoseconds saturates.
+export fn grpc_duration_parse(s: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  if (n < 2 || s.chars[n - 1] != 115) { return -1; }
+  var i: int64 = 0;
+  var secs: int64 = 0;
+  while (i < n - 1 && s.chars[i] >= 48 && s.chars[i] <= 57) {
+    secs = secs * 10 + (int64)(s.chars[i] - 48);
+    if (secs > 315576000000) { return -1; }
+    i = i + 1;
+  }
+  if (i == 0) { return -1; }
+  var frac: int64 = 0;
+  if (i < n - 1) {
+    if (s.chars[i] != 46) { return -1; }
+    i = i + 1;
+    var digits: int64 = 0;
+    while (i < n - 1 && s.chars[i] >= 48 && s.chars[i] <= 57) {
+      if (digits >= 9) { return -1; }
+      frac = frac * 10 + (int64)(s.chars[i] - 48);
+      digits = digits + 1;
+      i = i + 1;
+    }
+    if (digits == 0 || i != n - 1) { return -1; }
+    while (digits < 9) {
+      frac = frac * 10;
+      digits = digits + 1;
+    }
+  }
+  if (secs > (MAX_I64 - frac) / 1000000000) { return MAX_I64; }
+  return secs * 1000000000 + frac;
+}
+
+// ---- status code masks ------------------------------------------------------
+
+export fn grpc_code_in(mask: uint32, code: int32) -> bool {
+  if (code < 0 || code > 31) { return false; }
+  var bit: uint32 = (uint32)1 << code;
+  return (mask & bit) != 0;
+}
+
+// ---- retry math -------------------------------------------------------------
+
+// The wait before retry number retry_n (1 for the first retry):
+// rnd * min(initial * multiplier^(retry_n - 1), max). rnd is in [0, 1).
+export fn grpc_retry_backoff_ns(p: GrpcRetryPolicy*, retry_n: int32, rnd: float64) -> int64 {
+  if (p->initial_backoff_ns <= 0 || p->max_backoff_ns <= 0 || rnd <= 0.0) { return 0; }
+  var cap: float64 = (float64)p->max_backoff_ns;
+  // multiplier^(retry_n - 1) by squaring; a float overflow to infinity
+  // only ends up clamped by the cap.
+  var factor: float64 = 1.0;
+  var base: float64 = p->multiplier;
+  var e: int32 = retry_n - 1;
+  while (e > 0) {
+    if ((e & 1) != 0) { factor = factor * base; }
+    base = base * base;
+    e = e >> 1;
+  }
+  var d: float64 = (float64)p->initial_backoff_ns * factor;
+  if (d > cap) { d = cap; }
+  var r: float64 = rnd * d;
+  if (r >= 9.2e18) { return MAX_I64; }
+  return (int64)r;
+}
+
+// The retry throttle of a channel (gRFC A6). Every failed attempt takes a
+// token; every success gives ratio back. Retries are allowed while more
+// than half the tokens are left.
+export struct GrpcRetryThrottle {
+  tokens: float64;
+  max_tokens: float64;
+  ratio: float64;
+}
+
+export fn grpc_throttle_init(t: GrpcRetryThrottle*, max_tokens: float64, ratio: float64) {
+  t->tokens = max_tokens;
+  t->max_tokens = max_tokens;
+  t->ratio = ratio;
+}
+
+export fn grpc_throttle_failure(t: GrpcRetryThrottle*) {
+  t->tokens = t->tokens - 1.0;
+  if (t->tokens < 0.0) { t->tokens = 0.0; }
+}
+
+export fn grpc_throttle_success(t: GrpcRetryThrottle*) {
+  t->tokens = t->tokens + t->ratio;
+  if (t->tokens > t->max_tokens) { t->tokens = t->max_tokens; }
+}
+
+export fn grpc_throttle_allows(t: GrpcRetryThrottle*) -> bool {
+  return t->tokens > t->max_tokens / 2.0;
+}
+
+// The delay a grpc-retry-pushback-ms value asks for, in nanoseconds. A
+// value that is not a plain non-negative decimal integer (negative, empty,
+// junk) means "do not retry" and gives -1. Huge values saturate.
+export fn grpc_pushback_parse(v: string) -> int64 {
+  var n: int64 = (int64)v.length;
+  if (n == 0) { return -1; }
+  var ms: int64 = 0;
+  var over: bool = false;
+  for i in 0..n {
+    var c: uint8 = v.chars[i];
+    if (c < 48 || c > 57) { return -1; }
+    var d: int64 = (int64)(c - 48);
+    if (ms > (MAX_I64 - d) / 10) {
+      over = true;
+    } else {
+      ms = ms * 10 + d;
+    }
+  }
+  if (over || ms > MAX_I64 / 1000000) { return MAX_I64; }
+  return ms * 1000000;
+}
+
+// ---- lookup -----------------------------------------------------------------
+
+// True if s[from .. from+len) equals t.
+fn sc_same(s: string, from: int64, len: int64, t: string) -> bool {
+  if ((int64)t.length != len) { return false; }
+  for i in 0..len {
+    if (s.chars[from + i] != t.chars[i]) { return false; }
+  }
+  return true;
+}
+
+// The config for a call path "/pkg.Service/Method": an entry naming the
+// method, else one naming its service, else the default entry. Returns 0
+// if none applies. A path that is not of that form only gets the default.
+export fn grpc_svc_config_find(c: GrpcServiceConfig*, path: string) -> GrpcMethodConfig* {
+  var n: int64 = (int64)path.length;
+  var well_formed: bool = false;
+  var slash: int64 = -1;
+  if (n >= 1 && path.chars[0] == 47) {
+    for i in 1..n {
+      if (slash < 0 && path.chars[i] == 47) { slash = i; }
+    }
+    well_formed = slash > 0;
+  }
+  if (well_formed) {
+    var s_from: int64 = 1;
+    var s_len: int64 = slash - 1;
+    var m_from: int64 = slash + 1;
+    var m_len: int64 = n - slash - 1;
+    for i in 0..c->nmethods {
+      var m: GrpcMethodConfig* = &c->methods[i];
+      for j in 0..m->nnames {
+        var nm: GrpcMethodName* = &m->names[j];
+        if (nm->method_name.length > 0 && sc_same(path, s_from, s_len, nm->service) && sc_same(path, m_from, m_len, nm->method_name)) {
+          return m;
+        }
+      }
+    }
+    for i in 0..c->nmethods {
+      var m: GrpcMethodConfig* = &c->methods[i];
+      for j in 0..m->nnames {
+        var nm: GrpcMethodName* = &m->names[j];
+        if (nm->method_name.length == 0 && nm->service.length > 0 && sc_same(path, s_from, s_len, nm->service)) {
+          return m;
+        }
+      }
+    }
+  }
+  for i in 0..c->nmethods {
+    var m: GrpcMethodConfig* = &c->methods[i];
+    for j in 0..m->nnames {
+      var nm: GrpcMethodName* = &m->names[j];
+      if (nm->service.length == 0 && nm->method_name.length == 0) { return m; }
+    }
+  }
+  return (GrpcMethodConfig*)0;
+}
+
+// ---- parsing ----------------------------------------------------------------
+
+// An integer from a JSON number, or from a string of digits (proto3 JSON
+// writes 64-bit integers as strings). Returns false for anything else,
+// for a fraction, and for a value past int64.
+fn sc_int(j: GrpcJson*, out: int64*) -> bool {
+  if (j->kind == GRPC_JSON_NUMBER) {
+    var v: float64 = j->num;
+    if (v < -9.0e18 || v > 9.0e18) { return false; }
+    var iv: int64 = (int64)v;
+    if ((float64)iv != v) { return false; }
+    *out = iv;
+    return true;
+  }
+  if (j->kind == GRPC_JSON_STRING) {
+    var n: int64 = (int64)j->str.length;
+    var neg: bool = false;
+    var i: int64 = 0;
+    if (n > 0 && j->str.chars[0] == 45) {
+      neg = true;
+      i = 1;
+    }
+    if (i >= n) { return false; }
+    var v: int64 = 0;
+    while (i < n) {
+      var c: uint8 = j->str.chars[i];
+      if (c < 48 || c > 57) { return false; }
+      var d: int64 = (int64)(c - 48);
+      if (v > (MAX_I64 - d) / 10) { return false; }
+      v = v * 10 + d;
+      i = i + 1;
+    }
+    if (neg) { v = -v; }
+    *out = v;
+    return true;
+  }
+  return false;
+}
+
+// A Duration field. Absent gives ok with *out = 0 and *present = false.
+// Returns false if it is there but not a valid Duration string.
+fn sc_duration(o: GrpcJson*, key: string, out: int64*, present: bool*) -> bool {
+  var j: GrpcJson* = grpc_json_get(o, key);
+  *present = false;
+  *out = 0;
+  if (j == 0) { return true; }
+  if (j->kind != GRPC_JSON_STRING) { return false; }
+  var d: int64 = grpc_duration_parse(j->str);
+  if (d < 0) { return false; }
+  *out = d;
+  *present = true;
+  return true;
+}
+
+// A non-negative size limit field; 0 when absent.
+fn sc_limit(o: GrpcJson*, key: string, out: int64*) -> bool {
+  var j: GrpcJson* = grpc_json_get(o, key);
+  *out = 0;
+  if (j == 0) { return true; }
+  var v: int64 = 0;
+  if (!sc_int(j, &v) || v < 0) { return false; }
+  *out = v;
+  return true;
+}
+
+// Reads a mask of status codes from an array of names (any case) or
+// integers 0..16. Returns false on any other element.
+fn sc_codes(arr: GrpcJson*, mask: uint32*) -> bool {
+  var m: uint32 = 0;
+  if (arr->kind != GRPC_JSON_ARRAY) { return false; }
+  for i in 0..arr->count {
+    var e: GrpcJson* = &arr->items[i];
+    var code: int32 = -1;
+    if (e->kind == GRPC_JSON_STRING) {
+      code = grpc_code_parse(e->str);
+    } else if (e->kind == GRPC_JSON_NUMBER) {
+      var v: int64 = 0;
+      if (sc_int(e, &v) && v >= 0 && v <= 16) { code = (int32)v; }
+    }
+    if (code < 0) { return false; }
+    m = m | ((uint32)1 << code);
+  }
+  *mask = m;
+  return true;
+}
+
+// maxAttempts for retry and hedging: an integer above 1, capped at 5.
+fn sc_attempts(o: GrpcJson*, out: int32*) -> bool {
+  var j: GrpcJson* = grpc_json_get(o, "maxAttempts");
+  if (j == 0) { return false; }
+  var v: int64 = 0;
+  if (!sc_int(j, &v) || v <= 1) { return false; }
+  if (v > MAX_ATTEMPTS_CAP) { v = MAX_ATTEMPTS_CAP; }
+  *out = (int32)v;
+  return true;
+}
+
+fn sc_retry(o: GrpcJson*, r: GrpcRetryPolicy*) -> string {
+  if (o->kind != GRPC_JSON_OBJECT) { return "retryPolicy must be an object"; }
+  if (!sc_attempts(o, &r->max_attempts)) {
+    return "retryPolicy: maxAttempts must be an integer greater than 1";
+  }
+  var present: bool = false;
+  if (!sc_duration(o, "initialBackoff", &r->initial_backoff_ns, &present) || !present || r->initial_backoff_ns <= 0) {
+    return "retryPolicy: initialBackoff must be a Duration greater than 0";
+  }
+  if (!sc_duration(o, "maxBackoff", &r->max_backoff_ns, &present) || !present || r->max_backoff_ns <= 0) {
+    return "retryPolicy: maxBackoff must be a Duration greater than 0";
+  }
+  var mult: GrpcJson* = grpc_json_get(o, "backoffMultiplier");
+  if (mult == 0 || mult->kind != GRPC_JSON_NUMBER || !(mult->num > 0.0)) {
+    return "retryPolicy: backoffMultiplier must be a number greater than 0";
+  }
+  r->multiplier = mult->num;
+  var codes: GrpcJson* = grpc_json_get(o, "retryableStatusCodes");
+  if (codes == 0 || codes->kind != GRPC_JSON_ARRAY || codes->count == 0) {
+    return "retryPolicy: retryableStatusCodes must be a non-empty array";
+  }
+  if (!sc_codes(codes, &r->codes)) {
+    return "retryPolicy: retryableStatusCodes has an unknown status code";
+  }
+  return "";
+}
+
+fn sc_hedging(o: GrpcJson*, h: GrpcHedgingPolicy*) -> string {
+  if (o->kind != GRPC_JSON_OBJECT) { return "hedgingPolicy must be an object"; }
+  if (!sc_attempts(o, &h->max_attempts)) {
+    return "hedgingPolicy: maxAttempts must be an integer greater than 1";
+  }
+  var present: bool = false;
+  if (!sc_duration(o, "hedgingDelay", &h->delay_ns, &present)) {
+    return "hedgingPolicy: hedgingDelay must be a Duration";
+  }
+  var codes: GrpcJson* = grpc_json_get(o, "nonFatalStatusCodes");
+  if (codes != 0 && !sc_codes(codes, &h->non_fatal)) {
+    return "hedgingPolicy: nonFatalStatusCodes has an unknown status code";
+  }
+  return "";
+}
+
+// True if (service, method) is already named by one of the first n configs.
+fn sc_name_seen(ms: GrpcMethodConfig*, n: int64, service: string, meth: string) -> bool {
+  for i in 0..n {
+    for j in 0..ms[i].nnames {
+      if (ms[i].names[j].service == service && ms[i].names[j].method_name == meth) { return true; }
+    }
+  }
+  return false;
+}
+
+// Reads methodConfig object o into ms[idx]. Its names must not repeat any
+// name of the configs before it (ms[0..idx)).
+fn sc_method(a: GrpcArena*, o: GrpcJson*, ms: GrpcMethodConfig*, idx: int64) -> string {
+  var m: GrpcMethodConfig* = &ms[idx];
+  if (o->kind != GRPC_JSON_OBJECT) { return "must be an object"; }
+  m->wait_for_ready = -1;
+
+  var names: GrpcJson* = grpc_json_get(o, "name");
+  if (names == 0 || names->kind != GRPC_JSON_ARRAY || names->count == 0) {
+    return "name must be a non-empty array";
+  }
+  m->names = (GrpcMethodName*)grpc_arena_alloc_zeroed(a, names->count * sizeof(GrpcMethodName));
+  m->nnames = names->count;
+  for i in 0..names->count {
+    var e: GrpcJson* = &names->items[i];
+    if (e->kind != GRPC_JSON_OBJECT) { return "name entries must be objects"; }
+    var sj: GrpcJson* = grpc_json_get(e, "service");
+    var mj: GrpcJson* = grpc_json_get(e, "method");
+    if (sj != 0 && sj->kind != GRPC_JSON_STRING) { return "name: service must be a string"; }
+    if (mj != 0 && mj->kind != GRPC_JSON_STRING) { return "name: method must be a string"; }
+    if (sj != 0) { m->names[i].service = sj->str; }
+    if (mj != 0) { m->names[i].method_name = mj->str; }
+    if (m->names[i].method_name.length > 0 && m->names[i].service.length == 0) {
+      return "name: method without service";
+    }
+    if (sc_name_seen(ms, idx, m->names[i].service, m->names[i].method_name)) {
+      return "name appears more than once";
+    }
+    // Also against the earlier names of this same config.
+    for k in 0..i {
+      if (m->names[k].service == m->names[i].service && m->names[k].method_name == m->names[i].method_name) {
+        return "name appears more than once";
+      }
+    }
+  }
+
+  var wfr: GrpcJson* = grpc_json_get(o, "waitForReady");
+  if (wfr != 0) {
+    if (wfr->kind != GRPC_JSON_BOOL) { return "waitForReady must be a bool"; }
+    if (wfr->b) { m->wait_for_ready = 1; } else { m->wait_for_ready = 0; }
+  }
+  var present: bool = false;
+  if (!sc_duration(o, "timeout", &m->timeout_ns, &present)) {
+    return "timeout must be a Duration such as \"1.5s\"";
+  }
+  if (!sc_limit(o, "maxRequestMessageBytes", &m->max_request_bytes)) {
+    return "maxRequestMessageBytes must be a non-negative integer";
+  }
+  if (!sc_limit(o, "maxResponseMessageBytes", &m->max_response_bytes)) {
+    return "maxResponseMessageBytes must be a non-negative integer";
+  }
+
+  var rp: GrpcJson* = grpc_json_get(o, "retryPolicy");
+  var hp: GrpcJson* = grpc_json_get(o, "hedgingPolicy");
+  if (rp != 0 && hp != 0) { return "retryPolicy and hedgingPolicy cannot both be set"; }
+  if (rp != 0) {
+    var e: string = sc_retry(rp, &m->retry);
+    if (e != "") { return e; }
+    m->has_retry = true;
+  }
+  if (hp != 0) {
+    var e: string = sc_hedging(hp, &m->hedging);
+    if (e != "") { return e; }
+    m->has_hedging = true;
+  }
+  return "";
+}
+
+// Copies s into the arena.
+fn sc_copy(a: GrpcArena*, s: string) -> string {
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)s.length + 1);
+  if (s.length > 0) { memcpy(p, s.chars, (int64)s.length); }
+  var r: string;
+  r.chars = p;
+  r.length = s.length;
+  return r;
+}
+
+// "<where>: <what>" in the arena.
+fn sc_error_at(a: GrpcArena*, where_: string, what: string) -> string {
+  var m: string = "{where_}: {what}";
+  var r: string = sc_copy(a, m);
+  free(m.chars);
+  return r;
+}
+
+fn sc_lower(a: GrpcArena*, s: string) -> string {
+  var r: string = sc_copy(a, s);
+  for i in 0..(int64)r.length {
+    if (r.chars[i] >= 65 && r.chars[i] <= 90) { r.chars[i] = r.chars[i] + 32; }
+  }
+  return r;
+}
+
+// "retryThrottling" into the config.
+fn sc_throttle(o: GrpcJson*, out: GrpcServiceConfig*) -> string {
+  if (o->kind != GRPC_JSON_OBJECT) { return "must be an object"; }
+  var mt: GrpcJson* = grpc_json_get(o, "maxTokens");
+  var tr: GrpcJson* = grpc_json_get(o, "tokenRatio");
+  if (mt == 0 || mt->kind != GRPC_JSON_NUMBER || !(mt->num > 0.0) || mt->num > 1000.0) {
+    return "maxTokens must be a number in (0, 1000]";
+  }
+  if (tr == 0 || tr->kind != GRPC_JSON_NUMBER || !(tr->num > 0.0)) {
+    return "tokenRatio must be a number greater than 0";
+  }
+  // Keep three decimals, cutting the rest. The nudge absorbs binary
+  // rounding (0.57 is stored a hair below 0.57).
+  var milli: float64 = (float64)(int64)(tr->num * 1000.0 + 1e-6);
+  if (milli < 1.0) { return "tokenRatio must be at least 0.001"; }
+  out->has_throttle = true;
+  out->max_tokens = mt->num;
+  out->token_ratio = milli / 1000.0;
+  return "";
+}
+
+// "loadBalancingConfig" or the legacy "loadBalancingPolicy" into lb_policy.
+fn sc_lb(a: GrpcArena*, o: GrpcJson*, out: GrpcServiceConfig*) -> string {
+  var lbc: GrpcJson* = grpc_json_get(o, "loadBalancingConfig");
+  if (lbc != 0) {
+    if (lbc->kind != GRPC_JSON_ARRAY || lbc->count == 0) {
+      return "loadBalancingConfig must be a non-empty array";
+    }
+    for i in 0..lbc->count {
+      var e: GrpcJson* = &lbc->items[i];
+      if (e->kind != GRPC_JSON_OBJECT || e->count != 1) {
+        return "loadBalancingConfig entries must be objects with one key";
+      }
+    }
+    out->lb_policy = lbc->items[0].keys[0];
+    return "";
+  }
+  var lbp: GrpcJson* = grpc_json_get(o, "loadBalancingPolicy");
+  if (lbp != 0) {
+    if (lbp->kind != GRPC_JSON_STRING || lbp->str.length == 0) {
+      return "loadBalancingPolicy must be a non-empty string";
+    }
+    out->lb_policy = sc_lower(a, lbp->str);
+  }
+  return "";
+}
+
+// Parses a service config document into *out (allocated from a). Returns
+// "" on success, otherwise a message saying what is wrong.
+export fn grpc_svc_config_parse(a: GrpcArena*, json: string, out: GrpcServiceConfig*) -> string {
+  var zero: GrpcServiceConfig;
+  *out = zero;
+  out->lb_policy = "pick_first";
+  var root: GrpcJson* = (GrpcJson*)0;
+  var err: string = grpc_json_parse(a, json, &root);
+  if (err != "") { return err; }
+  if (root->kind != GRPC_JSON_OBJECT) { return "service config must be a JSON object"; }
+
+  var e: string = sc_lb(a, root, out);
+  if (e != "") { return sc_error_at(a, "service config", e); }
+
+  var rt: GrpcJson* = grpc_json_get(root, "retryThrottling");
+  if (rt != 0) {
+    e = sc_throttle(rt, out);
+    if (e != "") { return sc_error_at(a, "retryThrottling", e); }
+  }
+
+  var mc: GrpcJson* = grpc_json_get(root, "methodConfig");
+  if (mc != 0) {
+    if (mc->kind != GRPC_JSON_ARRAY) { return "methodConfig must be an array"; }
+    if (mc->count > 0) {
+      out->methods = (GrpcMethodConfig*)grpc_arena_alloc_zeroed(a, mc->count * sizeof(GrpcMethodConfig));
+      out->nmethods = mc->count;
+    }
+    for i in 0..mc->count {
+      e = sc_method(a, &mc->items[i], out->methods, i);
+      if (e != "") {
+        var where_: string = "methodConfig[{i}]";
+        var w: string = sc_copy(a, where_);
+        free(where_.chars);
+        return sc_error_at(a, w, e);
+      }
+    }
+  }
+  return "";
+}

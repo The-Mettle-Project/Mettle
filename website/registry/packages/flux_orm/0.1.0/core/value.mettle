@@ -1,0 +1,448 @@
+// flux_orm/core/value.mettle — the only representation a value has at a seam.
+//
+// Every model field, query argument and result cell is an RcValue. This is the
+// impedance-matching layer between Mettle's static types and the database's
+// serial types:
+//
+//   Mettle                 RcValue arm     wire type (MeoDB)
+//   int8..int64, enum      RcInt           INTEGER (signed 64)
+//   uint8..uint64          RcUint          INTEGER (unsigned, range-checked)
+//   float32, float64       RcFloat         REAL (ieee-754 binary64)
+//   bool                   RcBool          INTEGER 0/1 (MeoDB has no BOOL)
+//   string                 RcText          TEXT (UTF-8 bytes, length-prefixed)
+//   uint8[] (blob)         RcBlob          BLOB
+//   declared Timestamp     RcTime          INTEGER unix micros, UTC
+//   absent / NULL          RcNull          NULL
+//
+// Ownership rule, and it is not optional: RcText and RcBlob hold *borrowed*
+// views (Mettle strings are 16-byte views with no terminator). A value that
+// must outlive the buffer it came from is made with rc_value_clone and freed
+// with rc_value_release. Results from an adapter are always owned; callers
+// release them with rc_result_free (adapter/adapter).
+
+import "std/mem";
+import "std/conv";
+
+import "status";
+
+// Wire types, stored in RcField.ty and returned by rc_value_type.
+// RC_T_UNSUPPORTED marks a field kind with no mapping; rc_meta_check refuses
+// it.
+export const RC_T_NULL: int32 = 0;
+export const RC_T_I64: int32 = 1;
+export const RC_T_F64: int32 = 2;
+export const RC_T_BOOL: int32 = 3;
+export const RC_T_TEXT: int32 = 4;
+export const RC_T_BLOB: int32 = 5;
+export const RC_T_TIME: int32 = 6;
+export const RC_T_U64: int32 = 7;
+export const RC_T_UNSUPPORTED: int32 = -1;
+
+// A byte range: the payload of RcBlob.
+//   data   first byte; borrowed unless made by rc_blob_dup / rc_value_clone
+//   len    length in bytes
+export struct RcBytes { data: uint8*; len: int64; }
+
+// One value at a seam: a model field, a query argument or a result cell. Text
+// and blob arms are borrowed views (see the ownership rule above).
+export enum RcValue {
+  RcNull,
+  RcInt(int64),
+  RcFloat(float64),
+  RcBool(bool),
+  RcText(string),
+  RcBlob(RcBytes),
+  RcTime(int64),
+  RcUint(uint64),
+}
+
+// Short lowercase name of a wire type ("i64", "text", ...), for logs and test
+// output. Returns "unsupported" for any other value. Static; do not free.
+export fn rc_value_type_name(ty: int32) -> string {
+  if (ty == RC_T_NULL) { return "null"; }
+  if (ty == RC_T_I64) { return "i64"; }
+  if (ty == RC_T_F64) { return "f64"; }
+  if (ty == RC_T_BOOL) { return "bool"; }
+  if (ty == RC_T_TEXT) { return "text"; }
+  if (ty == RC_T_BLOB) { return "blob"; }
+  if (ty == RC_T_TIME) { return "time"; }
+  if (ty == RC_T_U64) { return "u64"; }
+  return "unsupported";
+}
+
+// The wire type of a value's arm: RC_T_NULL, RC_T_I64 (RcInt), RC_T_F64,
+// RC_T_BOOL, RC_T_TEXT, RC_T_BLOB, RC_T_TIME or RC_T_U64 (RcUint).
+export fn rc_value_type(v: RcValue) -> int32 {
+  match (v) {
+    case RcNull: { return RC_T_NULL; }
+    case RcInt(_i): { return RC_T_I64; }
+    case RcFloat(_f): { return RC_T_F64; }
+    case RcBool(_b): { return RC_T_BOOL; }
+    case RcText(s): {
+      return RC_T_TEXT;
+    }
+    case RcBlob(_b): { return RC_T_BLOB; }
+    case RcTime(_t): { return RC_T_TIME; }
+    case RcUint(_u): { return RC_T_U64; }
+  }
+  return RC_T_UNSUPPORTED;
+}
+
+// True when `v` is RcNull.
+export fn rc_value_is_null(v: RcValue) -> bool {
+  match (v) {
+    case RcNull: { return true; }
+    case RcInt(_i): { return false; }
+    case RcFloat(_f): { return false; }
+    case RcBool(_b): { return false; }
+    case RcText(_s): { return false; }
+    case RcBlob(_b): { return false; }
+    case RcTime(_t): { return false; }
+    case RcUint(_u): { return false; }
+  }
+  return false;
+}
+
+// --- text/blob buffers -------------------------------------------------------
+// Mettle strings are views: these are the only two functions that own text.
+
+// Copies a string into a new heap buffer.
+//   s   text to copy; borrowed
+// Returns an owned copy the caller frees with rc_text_free. An empty `s`, an
+// `s` with no bytes, or a failed allocation all return an empty string (no
+// buffer); compare lengths to tell a failure from empty input.
+export fn rc_text_dup(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  if (n <= 0) {
+    return str_from_bytes((cstring)0, 0);
+  }
+  if (s.chars == 0) {
+    return str_from_bytes((cstring)0, 0);
+  }
+  var p: uint8* = malloc(n);
+  if (p == 0) {
+    return str_from_bytes((cstring)0, 0);
+  }
+  memcpy((rawptr)p, (rawptr)s.chars, n);
+  return str_from_bytes((cstring)p, n);
+}
+
+// Frees text produced by rc_text_dup or rc_value_clone.
+//   s   owned text; an empty string is a no-op. Never pass a literal or any
+//       other borrowed view, and never free the same text twice.
+export fn rc_text_free(s: string) {
+  if (s.length > (uint64)0 && s.chars != 0) {
+    free(s.chars);
+  }
+}
+
+// True when two byte ranges hold the same bytes.
+//   a, alen   first range; `a` may be 0 when `alen` is 0
+//   b, blen   second range; same rule
+// Two empty ranges are equal. A non-empty range with a 0 pointer is never
+// equal to anything.
+export fn rc_bytes_equal(a: uint8*, alen: int64, b: uint8*, blen: int64) -> bool {
+  if (alen != blen) { return false; }
+  if (alen <= 0) { return true; }
+  if (a == 0 || b == 0) { return false; }
+  if (memcmp((rawptr)a, (rawptr)b, alen) == 0) { return true; }
+  return false;
+}
+
+// Copies a byte range into a new heap buffer.
+//   b   bytes to copy; borrowed
+// Returns an owned copy; free its `data` with free(), or wrap it in RcBlob and
+// use rc_value_release. An empty `b`, a 0 `b.data`, or a failed allocation
+// return {0, 0}.
+export fn rc_blob_dup(b: RcBytes) -> RcBytes {
+  var out: RcBytes;
+  out.data = 0;
+  out.len = 0;
+  if (b.len <= 0) { return out; }
+  if (b.data == 0) { return out; }
+  var p: uint8* = malloc(b.len);
+  if (p == 0) { return out; }
+  memcpy((rawptr)p, (rawptr)b.data, b.len);
+  out.data = p;
+  out.len = b.len;
+  return out;
+}
+
+// --- casts -------------------------------------------------------------------
+// Strict on purpose. There is no implicit numeric coercion across RcValue
+// arms; changeset/ owns coercion policy. The only widening allowed here is
+// within one numeric family, and only when it is lossless, plus the bool and
+// time arms each function lists.
+//
+// Each rc_value_as_* writes `*out` only on RC_OK and returns RC_ERR_USAGE
+// when `out` is 0.
+
+// Reads `v` as a signed integer.
+//   v     RcInt, RcUint, RcBool (1/0) or RcTime (Unix micros)
+//   out   receives the value
+// Returns RC_OK; RC_ERR_RANGE for an RcUint above int64 max; RC_ERR_CAST for
+// RcNull, RcFloat, RcText or RcBlob; RC_ERR_USAGE when `out` is 0.
+export fn rc_value_as_i64(v: RcValue, out: int64*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  match (v) {
+    case RcInt(x): { *out = x; return RC_OK; }
+    case RcUint(x): {
+      if (x > (uint64)9223372036854775807) { return RC_ERR_RANGE; }
+      *out = (int64)x;
+      return RC_OK;
+    }
+    case RcBool(b): {
+      if (b) { *out = 1; } else { *out = 0; }
+      return RC_OK;
+    }
+    case RcTime(t): { *out = t; return RC_OK; }
+    case RcNull: { return RC_ERR_CAST; }
+    case RcFloat(_f): { return RC_ERR_CAST; }
+    case RcText(_s): { return RC_ERR_CAST; }
+    case RcBlob(_b): { return RC_ERR_CAST; }
+  }
+  return RC_ERR_CAST;
+}
+
+// Reads `v` as an unsigned integer.
+//   v     RcUint, RcInt, RcBool (1/0) or RcTime
+//   out   receives the value
+// Returns RC_OK; RC_ERR_RANGE for a negative RcInt or RcTime; RC_ERR_CAST for
+// RcNull, RcFloat, RcText or RcBlob; RC_ERR_USAGE when `out` is 0.
+export fn rc_value_as_u64(v: RcValue, out: uint64*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  match (v) {
+    case RcUint(x): { *out = x; return RC_OK; }
+    case RcInt(x): {
+      if (x < 0) { return RC_ERR_RANGE; }
+      *out = (uint64)x;
+      return RC_OK;
+    }
+    case RcBool(b): {
+      if (b) { *out = (uint64)1; } else { *out = (uint64)0; }
+      return RC_OK;
+    }
+    case RcTime(t): {
+      if (t < 0) { return RC_ERR_RANGE; }
+      *out = (uint64)t;
+      return RC_OK;
+    }
+    case RcNull: { return RC_ERR_CAST; }
+    case RcFloat(_f): { return RC_ERR_CAST; }
+    case RcText(_s): { return RC_ERR_CAST; }
+    case RcBlob(_b): { return RC_ERR_CAST; }
+  }
+  return RC_ERR_CAST;
+}
+
+// Reads `v` as a float.
+//   v     RcFloat, or RcInt / RcUint within +-2^53 (exactly representable)
+//   out   receives the value
+// Returns RC_OK; RC_ERR_RANGE for an integer beyond +-2^53; RC_ERR_CAST for
+// RcNull, RcBool, RcTime, RcText or RcBlob; RC_ERR_USAGE when `out` is 0.
+export fn rc_value_as_f64(v: RcValue, out: float64*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  match (v) {
+    case RcFloat(f): { *out = f; return RC_OK; }
+    case RcInt(x): {
+      if (x > (int64)9007199254740992) { return RC_ERR_RANGE; }
+      if (x < (int64)-9007199254740992) { return RC_ERR_RANGE; }
+      *out = (float64)x;
+      return RC_OK;
+    }
+    case RcUint(x): {
+      if (x > (uint64)9007199254740992) { return RC_ERR_RANGE; }
+      *out = (float64)x;
+      return RC_OK;
+    }
+    case RcNull: { return RC_ERR_CAST; }
+    case RcBool(_b): { return RC_ERR_CAST; }
+    case RcTime(_t): { return RC_ERR_CAST; }
+    case RcText(_s): { return RC_ERR_CAST; }
+    case RcBlob(_b): { return RC_ERR_CAST; }
+  }
+  return RC_ERR_CAST;
+}
+
+// Reads `v` as a bool. Only RcBool converts; integers do not.
+// Returns RC_OK; RC_ERR_CAST for every other arm; RC_ERR_USAGE when `out` is 0.
+export fn rc_value_as_bool(v: RcValue, out: bool*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  match (v) {
+    case RcBool(b): { *out = b; return RC_OK; }
+    case RcNull: { return RC_ERR_CAST; }
+    case RcInt(_i): { return RC_ERR_CAST; }
+    case RcUint(_u): { return RC_ERR_CAST; }
+    case RcFloat(_f): { return RC_ERR_CAST; }
+    case RcTime(_t): { return RC_ERR_CAST; }
+    case RcText(_s): { return RC_ERR_CAST; }
+    case RcBlob(_b): { return RC_ERR_CAST; }
+  }
+  return RC_ERR_CAST;
+}
+
+// Reads `v` as text. Only RcText converts.
+//   out   receives a view that borrows `v`'s bytes; do not free it
+// Returns RC_OK; RC_ERR_CAST for every other arm; RC_ERR_USAGE when `out` is 0.
+export fn rc_value_as_text(v: RcValue, out: string*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  match (v) {
+    case RcText(s): { *out = s; return RC_OK; }
+    case RcNull: { return RC_ERR_CAST; }
+    case RcBool(_b): { return RC_ERR_CAST; }
+    case RcInt(_i): { return RC_ERR_CAST; }
+    case RcUint(_u): { return RC_ERR_CAST; }
+    case RcFloat(_f): { return RC_ERR_CAST; }
+    case RcTime(_t): { return RC_ERR_CAST; }
+    case RcBlob(_b): { return RC_ERR_CAST; }
+  }
+  return RC_ERR_CAST;
+}
+
+// Reads `v` as a blob. Only RcBlob converts.
+//   out   receives a range that borrows `v`'s bytes; do not free it
+// Returns RC_OK; RC_ERR_CAST for every other arm; RC_ERR_USAGE when `out` is 0.
+export fn rc_value_as_blob(v: RcValue, out: RcBytes*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  match (v) {
+    case RcBlob(b): { *out = b; return RC_OK; }
+    case RcNull: { return RC_ERR_CAST; }
+    case RcBool(_b): { return RC_ERR_CAST; }
+    case RcInt(_i): { return RC_ERR_CAST; }
+    case RcUint(_u): { return RC_ERR_CAST; }
+    case RcFloat(_f): { return RC_ERR_CAST; }
+    case RcTime(_t): { return RC_ERR_CAST; }
+    case RcText(_s): { return RC_ERR_CAST; }
+  }
+  return RC_ERR_CAST;
+}
+
+// --- ownership ---------------------------------------------------------------
+
+// Makes a value that owns its bytes, so it can outlive its source.
+//   v     the value; borrowed
+//   out   receives the copy. Scalars are copied as is; text and blob get a
+//         new heap buffer the caller frees with rc_value_release.
+// Returns RC_OK; RC_ERR_USAGE when `out` is 0; RC_ERR_NOMEM when the copy of
+// a non-empty text or blob cannot be allocated (`*out` untouched).
+export fn rc_value_clone(v: RcValue, out: RcValue*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  match (v) {
+    case RcNull: { *out = RcNull; return RC_OK; }
+    case RcInt(x): { *out = RcInt(x); return RC_OK; }
+    case RcUint(x): { *out = RcUint(x); return RC_OK; }
+    case RcFloat(x): { *out = RcFloat(x); return RC_OK; }
+    case RcBool(x): { *out = RcBool(x); return RC_OK; }
+    case RcTime(x): { *out = RcTime(x); return RC_OK; }
+    case RcText(s): {
+      var c: string = rc_text_dup(s);
+      if (c.chars == 0 && s.length > (uint64)0) { return RC_ERR_NOMEM; }
+      *out = RcText(c);
+      return RC_OK;
+    }
+    case RcBlob(b): {
+      var c: RcBytes = rc_blob_dup(b);
+      if (c.data == 0 && b.len > 0) { return RC_ERR_NOMEM; }
+      *out = RcBlob(c);
+      return RC_OK;
+    }
+  }
+  return RC_ERR_CAST;
+}
+
+// Frees the buffers of a value produced by rc_value_clone. Scalars and empty
+// text or blobs are no-ops. Never pass a borrowed value, such as one from
+// rc_result_borrow or a model field.
+export fn rc_value_release(v: RcValue) {
+  match (v) {
+    case RcText(s): { rc_text_free(s); }
+    case RcBlob(b): {
+      if (b.len > 0 && b.data != 0) { free(b.data); }
+    }
+    case RcNull: {}
+    case RcInt(_i): {}
+    case RcUint(_u): {}
+    case RcFloat(_f): {}
+    case RcBool(_b): {}
+    case RcTime(_t): {}
+  }
+}
+
+// --- comparison --------------------------------------------------------------
+// rc_value_same is *identity*: NULL equals NULL here. SQL three-valued logic
+// (NULL = NULL is UNKNOWN) is the query builder's job, not the value layer's.
+
+// True when `a` and `b` have the same arm and the same content. Text and blobs
+// compare bytes; floats compare with ==, so NaN is never the same as itself.
+// RcInt(1) and RcUint(1) differ (different arms).
+export fn rc_value_same(a: RcValue, b: RcValue) -> bool {
+  var ta: int32 = rc_value_type(a);
+  if (ta != rc_value_type(b)) { return false; }
+  if (ta == RC_T_NULL) { return true; }
+  if (ta == RC_T_TEXT) {
+    var sa: string;
+    var sb: string;
+    if (rc_value_as_text(a, &sa) != RC_OK) { return false; }
+    if (rc_value_as_text(b, &sb) != RC_OK) { return false; }
+    if (sa == sb) { return true; }
+    return false;
+  }
+  if (ta == RC_T_BLOB) {
+    var ba: RcBytes;
+    var bb: RcBytes;
+    if (rc_value_as_blob(a, &ba) != RC_OK) { return false; }
+    if (rc_value_as_blob(b, &bb) != RC_OK) { return false; }
+    return rc_bytes_equal(ba.data, ba.len, bb.data, bb.len);
+  }
+  if (ta == RC_T_F64) {
+    var fa: float64 = 0.0;
+    var fb: float64 = 0.0;
+    if (rc_value_as_f64(a, &fa) != RC_OK) { return false; }
+    if (rc_value_as_f64(b, &fb) != RC_OK) { return false; }
+    return fa == fb;
+  }
+  if (ta == RC_T_BOOL) {
+    var x: bool = false;
+    var y: bool = false;
+    if (rc_value_as_bool(a, &x) != RC_OK) { return false; }
+    if (rc_value_as_bool(b, &y) != RC_OK) { return false; }
+    return x == y;
+  }
+  if (ta == RC_T_U64) {
+    var ua: uint64 = 0;
+    var ub: uint64 = 0;
+    if (rc_value_as_u64(a, &ua) != RC_OK) { return false; }
+    if (rc_value_as_u64(b, &ub) != RC_OK) { return false; }
+    return ua == ub;
+  }
+  var ia: int64 = 0;
+  var ib: int64 = 0;
+  if (rc_value_as_i64(a, &ia) != RC_OK) { return false; }
+  if (rc_value_as_i64(b, &ib) != RC_OK) { return false; }
+  return ia == ib;
+}
+
+// --- constructors ------------------------------------------------------------
+// Each wraps its argument in one RcValue arm and cannot fail.
+
+// RcNull.
+export fn rc_value_null() -> RcValue { return RcNull; }
+// RcInt(v).
+export fn rc_value_int(v: int64) -> RcValue { return RcInt(v); }
+// RcUint(v).
+export fn rc_value_uint(v: uint64) -> RcValue { return RcUint(v); }
+// RcFloat(v).
+export fn rc_value_float(v: float64) -> RcValue { return RcFloat(v); }
+// RcBool(v).
+export fn rc_value_bool(v: bool) -> RcValue { return RcBool(v); }
+// RcText(v). Borrows `v`: its bytes must outlive the value.
+export fn rc_value_text(v: string) -> RcValue { return RcText(v); }
+// RcTime(v), `v` in Unix microseconds (UTC).
+export fn rc_value_time(v: int64) -> RcValue { return RcTime(v); }
+// RcBlob over `len` bytes at `data`. Borrows: the bytes must outlive the value.
+export fn rc_value_blob(data: uint8*, len: int64) -> RcValue {
+  var b: RcBytes;
+  b.data = data;
+  b.len = len;
+  return RcBlob(b);
+}

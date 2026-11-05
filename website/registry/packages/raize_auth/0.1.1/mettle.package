@@ -1,0 +1,7 @@
+name = raize_auth
+version = 0.1.1
+description = Authentication and authorization: Argon2id passwords (via crypto); store interface; lockout, API tokens and policies to follow
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeAuth
+compiler = 0.18.0
+require = cryptex 0.3.0

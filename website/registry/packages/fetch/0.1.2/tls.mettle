@@ -1,0 +1,137 @@
+// https for the client, over mtls. A TLS connection is an FetchStream whose
+// context is an MtlsStream.
+//
+// The first https request builds the TLS config, so set roots and insecure
+// before it. Certificates are checked against the roots, and the host name
+// from the URL is the name checked and the SNI sent. ALPN offers http/1.1.
+
+import "std/core";
+import "std/mem";
+import "std/arena";
+import "std/strbuf";
+import "std/socket";
+import "std/http";
+import "mtls/mtls";
+import "fetch/stream";
+import "fetch/pool";
+import "fetch/error";
+
+export struct FetchTlsConfig {
+  roots: MtlsRoots*;      // trust anchors; 0 uses the system's
+  insecure: int32;        // 1 skips every certificate check: for tests only
+  ready: int32;
+  sys_loaded: int32;
+  sys: MtlsRoots;
+  cfg: MtlsConfig;
+}
+
+export fn fetch_tls_init(t: FetchTlsConfig*) {
+  memset(t, 0, (int64)sizeof(FetchTlsConfig));
+}
+
+export fn fetch_tls_free(t: FetchTlsConfig*) {
+  if (t->ready != 0) { mtls_config_free(&t->cfg); }
+  if (t->sys_loaded != 0) { mtls_roots_free(&t->sys); }
+  t->ready = 0;
+  t->sys_loaded = 0;
+}
+
+fn ht_prepare(t: FetchTlsConfig*) {
+  if (t->ready != 0) { return; }
+  mtls_config_init(&t->cfg);
+  mtls_config_add_alpn(&t->cfg, "http/1.1");
+  if (t->insecure != 0) { t->cfg.verify_mode = MTLS_VERIFY_NONE; }
+  if (t->roots != 0) {
+    t->cfg.roots = t->roots;
+  } else {
+    mtls_roots_init(&t->sys);
+    mtls_roots_load_system(&t->sys);
+    t->sys_loaded = 1;
+    t->cfg.roots = &t->sys;
+  }
+  t->ready = 1;
+}
+
+fn ht_read(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var r: int64 = mtls_stream_read((MtlsStream*)ctx, p, n);
+  if (r == (int64)MTLS_E_EOF) { return 0; }
+  if (r == (int64)MTLS_E_TIMEOUT) { return -(int64)NET_EAGAIN; }
+  return r;
+}
+
+fn ht_write(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var r: int64 = mtls_stream_write((MtlsStream*)ctx, p, n);
+  if (r < 0) { return -(int64)NET_EPIPE; }
+  return r;
+}
+
+fn ht_close(ctx: rawptr) -> int64 {
+  var s: MtlsStream* = (MtlsStream*)ctx;
+  mtls_stream_close(s);
+  free(s);
+  return 0;
+}
+
+fn ht_text(arena: Arena*, a: string, b: string) -> string {
+  var sb: StrBuf* = strbuf_new(arena, 64);
+  if (sb == 0) { return a; }
+  strbuf_append_string(sb, a);
+  strbuf_append_string(sb, b);
+  return strbuf_finish_string(sb);
+}
+
+// Connects to host:port and runs the TLS handshake. On failure returns an
+// HTTP error code and puts the reason in *detail. timeout_ms is -1 for no limit.
+export fn fetch_tls_dial(t: FetchTlsConfig*, arena: Arena*, host: string, port: int32, timeout_ms: int64, key: string, out: FetchConn**, detail: string*) -> int64 {
+  ht_prepare(t);
+  var fd: int64 = -1;
+  match (tcp_connect(host, port, timeout_ms)) {
+    case Ok(s): { fd = s; }
+    case Err(e): {
+      *detail = ht_text(arena, "", e.message);
+      return HTTP_ERR_CONNECT;
+    }
+  }
+  if (timeout_ms > 0) { sock_set_timeout(fd, timeout_ms, timeout_ms); }
+  var ms: MtlsStream* = (MtlsStream*)malloc((int64)sizeof(MtlsStream));
+  if (ms == 0) {
+    sock_close(fd);
+    return HTTP_ERR_NOMEM;
+  }
+  memset(ms, 0, (int64)sizeof(MtlsStream));
+  var rc: int32 = mtls_stream_client(ms, fd, &t->cfg, host);
+  ms->owns_fd = true;
+  if (rc != MTLS_OK) {
+    var code: int64 = 0;
+    *detail = ht_text(arena, "", mtls_err_text(rc));
+    if (ms->c != 0) {
+      var cv: int32 = mtls_conn_cert_error(ms->c);
+      if (cv != 0) {
+        *detail = ht_text(arena, "", mtls_cv_text(cv));
+        code = FETCH_CLIENT_ERR_CERT;
+      }
+    }
+    if (code == 0) {
+      code = FETCH_CLIENT_ERR_HANDSHAKE;
+      if (rc == MTLS_E_TIMEOUT) { code = HTTP_ERR_TIMEOUT; }
+    }
+    mtls_stream_close(ms);
+    free(ms);
+    return code;
+  }
+  var st: FetchStream;
+  st.ctx = (rawptr)ms;
+  st.read = &ht_read;
+  st.write = &ht_write;
+  st.close = &ht_close;
+  st.fd = -1;
+  var conn: FetchConn* = fetch_conn_new(st, key);
+  if (conn == 0) {
+    mtls_stream_close(ms);
+    free(ms);
+    return HTTP_ERR_NOMEM;
+  }
+  conn->probe_fd = fd;
+  *out = conn;
+  return 0;
+}

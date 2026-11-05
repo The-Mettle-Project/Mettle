@@ -1,0 +1,249 @@
+// mythic_paint: MythicPainter wraps the draw list + scale + opacity. Painter functions take
+// logical px, snap rect edges to whole device px, apply the opacity to colors, and call the
+// dl builders, which take device px (DECISIONS §3, §6, §7).
+import "mythic_base";
+import "mythic_types";
+import "mythic_dl";
+import "mythic_fonts";
+import "mythic_text";
+
+export struct MythicPainter { dl: MythicDrawList*; fonts: MythicFonts*; scale: float32; opacity: float32; arena: MythicArena*; }
+
+/// Logical -> device px, rounded to a whole device pixel.
+export fn mythic_paint_snap(p: MythicPainter*, v: float32) -> float32 { return mythic_roundf(v * p->scale); }
+
+/// Device rect of a logical rect with every edge snapped to whole device px.
+export fn mythic_paint_dev_rect(p: MythicPainter*, r: MythicRect) -> MythicRect {
+  var x0: float32 = mythic_roundf(r.x * p->scale);
+  var y0: float32 = mythic_roundf(r.y * p->scale);
+  var x1: float32 = mythic_roundf((r.x + r.w) * p->scale);
+  var y1: float32 = mythic_roundf((r.y + r.h) * p->scale);
+  var o: MythicRect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  return o;
+}
+
+fn dev_radii(p: MythicPainter*, c: MythicCorners) -> MythicCorners {
+  var s: float32 = p->scale;
+  var o: MythicCorners = { tl: c.tl * s, tr: c.tr * s, br: c.br * s, bl: c.bl * s };
+  return o;
+}
+
+/// Hairline/stroke width in device px: max(1, round(width * scale)).
+export fn mythic_paint_line_w(p: MythicPainter*, width: float32) -> float32 {
+  return mythic_maxf(1.0, mythic_roundf(width * p->scale));
+}
+
+/// Applies the painter opacity to a straight-alpha ARGB color.
+export fn mythic_paint_color(p: MythicPainter*, color: uint32) -> uint32 {
+  if (p->opacity >= 1.0) { return color; }
+  var a: float32 = (float32)(color >> 24) * mythic_clampf(p->opacity, 0.0, 1.0);
+  return ((uint32)mythic_iround(a) << 24) | (color & (uint32)0x00FFFFFF);
+}
+
+/// Lerps straight sRGB channels and alpha (DESIGN-SYSTEM §6.2).
+export fn mythic_color_lerp(a: uint32, b: uint32, t: float32) -> uint32 {
+  if (t <= 0.0) { return a; }
+  if (t >= 1.0) { return b; }
+  var o: uint32 = 0;
+  for i: int32 in 0..4 {
+    var sh: uint32 = (uint32)(i * 8);
+    var ca: float32 = (float32)((a >> sh) & (uint32)255);
+    var cb: float32 = (float32)((b >> sh) & (uint32)255);
+    o = o | ((uint32)mythic_iround(ca + (cb - ca) * t) << sh);
+  }
+  return o;
+}
+
+/// `over` (straight alpha) composited onto `base` in sRGB; keeps base alpha.
+export fn mythic_color_over(base: uint32, over: uint32) -> uint32 {
+  var a: float32 = (float32)(over >> 24) / 255.0;
+  var o: uint32 = base & (uint32)0xFF000000;
+  for i: int32 in 0..3 {
+    var sh: uint32 = (uint32)(i * 8);
+    var cb: float32 = (float32)((base >> sh) & (uint32)255);
+    var co: float32 = (float32)((over >> sh) & (uint32)255);
+    o = o | ((uint32)mythic_iround(cb + (co - cb) * a) << sh);
+  }
+  return o;
+}
+
+export fn mythic_paint_fill(p: MythicPainter*, r: MythicRect, radii: MythicCorners, color: uint32) {
+  var c: uint32 = mythic_paint_color(p, color);
+  if ((c >> 24) == (uint32)0) { return; }
+  var d: MythicRect = mythic_paint_dev_rect(p, r);
+  if (d.w <= 0.0 || d.h <= 0.0) { return; }
+  mythic_dl_fill(p->dl, d, dev_radii(p, radii), c);
+}
+
+/// Inside stroke of the rounded rect; width in logical px (rendered as whole device px).
+export fn mythic_paint_stroke(p: MythicPainter*, r: MythicRect, radii: MythicCorners, width: float32, color: uint32) {
+  var c: uint32 = mythic_paint_color(p, color);
+  if ((c >> 24) == (uint32)0 || width <= 0.0) { return; }
+  var d: MythicRect = mythic_paint_dev_rect(p, r);
+  if (d.w <= 0.0 || d.h <= 0.0) { return; }
+  mythic_dl_stroke(p->dl, d, dev_radii(p, radii), mythic_paint_line_w(p, width), c);
+}
+
+export fn mythic_paint_shadow(p: MythicPainter*, r: MythicRect, radii: MythicCorners, s: MythicShadow) {
+  var c: uint32 = mythic_paint_color(p, s.color);
+  if ((c >> 24) == (uint32)0) { return; }
+  var d: MythicRect = mythic_paint_dev_rect(p, r);
+  var k: float32 = p->scale;
+  var ds: MythicShadow = { dx: s.dx * k, dy: s.dy * k, blur: s.blur * k, spread: s.spread * k, color: c };
+  mythic_dl_shadow(p->dl, d, dev_radii(p, radii), ds);
+}
+
+export fn mythic_paint_gradient(p: MythicPainter*, r: MythicRect, radii: MythicCorners, p0: MythicVec2, p1: MythicVec2, c0: uint32, c1: uint32) {
+  var d: MythicRect = mythic_paint_dev_rect(p, r);
+  var k: float32 = p->scale;
+  var q0: MythicVec2 = { x: p0.x * k, y: p0.y * k };
+  var q1: MythicVec2 = { x: p1.x * k, y: p1.y * k };
+  mythic_dl_gradient(p->dl, d, dev_radii(p, radii), q0, q1, mythic_paint_color(p, c0), mythic_paint_color(p, c1));
+}
+
+/// Device-px text spec for a logical style (the text APIs work in device px, §7).
+export fn mythic_paint_text_spec(scale: float32, style: MythicTextStyle) -> MythicTextSpec {
+  var sp: MythicTextSpec = { font: style.font, size_px: style.size * scale, line_height_px: style.line_height * scale,
+                           tracking_px: style.tracking * scale, flags: style.flags };
+  return sp;
+}
+
+fn luminance(c: uint32) -> float32 {
+  var r: float32 = (float32)((c >> 16) & (uint32)255);
+  var g: float32 = (float32)((c >> 8) & (uint32)255);
+  var b: float32 = (float32)(c & (uint32)255);
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+}
+
+/// Single-line text with its baseline at `baseline_dev` (device px, whole) and pen x at `x`
+/// (logical px). Small dark text gets the darkening flag (DESIGN-SYSTEM §3.4).
+export fn mythic_paint_text_baseline(p: MythicPainter*, s: string, style: MythicTextStyle, x: float32, baseline_dev: float32, color: uint32) {
+  var c: uint32 = mythic_paint_color(p, color);
+  if ((c >> 24) == (uint32)0 || s.length == (uint64)0 || p->fonts == 0) { return; }
+  var sp: MythicTextSpec = mythic_paint_text_spec(p->scale, style);
+  var l: MythicTextLayout* = mythic_text_layout(p->fonts, sp, s);
+  if (l == 0) { return; }
+  var lb0: float32 = 0.0;
+  if (l->line_count > 0 && l->line_baseline != 0) { lb0 = l->line_baseline[0]; }
+  var origin: MythicVec2 = { x: x * p->scale, y: baseline_dev - lb0 };
+  var darken: bool = style.size <= 15.0 && luminance(color) < 0.5;
+  mythic_text_emit(p->dl, p->fonts, l, sp, origin, c, darken);
+}
+
+/// Baseline (device px) of a line box whose top is `top` (logical): the line-box rule
+/// baseline = top + round_dpx((line_height - (asc + desc)) / 2 + asc) (DESIGN-SYSTEM §3.2).
+export fn mythic_paint_line_baseline(p: MythicPainter*, style: MythicTextStyle, top: float32) -> float32 {
+  var sp: MythicTextSpec = mythic_paint_text_spec(p->scale, style);
+  var asc: float32 = sp.size_px * 0.96875;
+  var desc: float32 = sp.size_px * 0.2412;
+  if (p->fonts != 0) {
+    var m: MythicFontMetrics = mythic_fonts_metrics(p->fonts, style.font, sp.size_px);
+    if (m.ascent > 0.0) { asc = m.ascent; desc = mythic_absf(m.descent); }
+  }
+  return mythic_roundf(top * p->scale) + mythic_roundf((sp.line_height_px - (asc + desc)) / 2.0 + asc);
+}
+
+/// Baseline (device px) of single-line text centered in a control of height h whose top is
+/// `top` (logical): the control rule baseline = top + round_dpx((h + cap) / 2) (DESIGN-SYSTEM §3.2).
+export fn mythic_paint_control_baseline(p: MythicPainter*, style: MythicTextStyle, top: float32, h: float32) -> float32 {
+  var sp: MythicTextSpec = mythic_paint_text_spec(p->scale, style);
+  var cap: float32 = sp.size_px * 0.7275;
+  if (p->fonts != 0) {
+    var m: MythicFontMetrics = mythic_fonts_metrics(p->fonts, style.font, sp.size_px);
+    if (m.cap_height > 0.0) { cap = m.cap_height; }
+  }
+  return mythic_roundf(top * p->scale) + mythic_roundf((h * p->scale + cap) / 2.0);
+}
+
+/// Text whose line box top-left is `pos` (logical), placed by the line-box rule.
+export fn mythic_paint_text(p: MythicPainter*, s: string, style: MythicTextStyle, pos: MythicVec2, color: uint32) {
+  mythic_paint_text_baseline(p, s, style, pos.x, mythic_paint_line_baseline(p, style, pos.y), color);
+}
+
+fn dev_points(p: MythicPainter*, pts: MythicVec2*, n: int32) -> MythicVec2* {
+  var o: MythicVec2* = (MythicVec2*)mythic_arena_alloc(p->arena, (int64)n * 8);
+  for i: int32 in 0..n { o[i].x = pts[i].x * p->scale; o[i].y = pts[i].y * p->scale; }
+  return o;
+}
+
+export fn mythic_paint_path_fill(p: MythicPainter*, pts: MythicVec2*, n: int32, color: uint32) {
+  if (n < 3 || p->arena == 0) { return; }
+  mythic_dl_path_fill(p->dl, dev_points(p, pts, n), n, mythic_paint_color(p, color));
+}
+
+/// Polyline stroke; width in logical px (fractional allowed, not snapped); draw_len logical px (0 = all).
+export fn mythic_paint_path_stroke(p: MythicPainter*, pts: MythicVec2*, n: int32, width: float32, color: uint32, closed: bool, draw_len: float32) {
+  if (n < 2 || p->arena == 0) { return; }
+  mythic_dl_path_stroke(p->dl, dev_points(p, pts, n), n, width * p->scale, mythic_paint_color(p, color), closed, draw_len * p->scale);
+}
+
+/// Keyboard focus ring (DESIGN-SYSTEM §7): 2 px stroke outset 2 px from `r` (the gap shows what
+/// is beneath); `radius` is the control's radius; `alpha` is the ring's animated visibility.
+export fn mythic_paint_focus_ring(p: MythicPainter*, r: MythicRect, radius: float32, color: uint32, alpha: float32) {
+  if (alpha <= 0.0) { return; }
+  var a: float32 = (float32)(color >> 24) * mythic_clampf(alpha, 0.0, 1.0);
+  var c: uint32 = ((uint32)mythic_iround(a) << 24) | (color & (uint32)0x00FFFFFF);
+  var fr: MythicRect = { x: r.x - 4.0, y: r.y - 4.0, w: r.w + 8.0, h: r.h + 8.0 };
+  var rr: float32 = radius + 4.0;
+  var rad: MythicCorners = { tl: rr, tr: rr, br: rr, bl: rr };
+  mythic_paint_stroke(p, fr, rad, 2.0, c);
+}
+
+/// Fills a circle with center `c` and radius `r` (logical px, not snapped: exact geometry).
+export fn mythic_paint_circle(p: MythicPainter*, c: MythicVec2, r: float32, color: uint32) {
+  var col: uint32 = mythic_paint_color(p, color);
+  if ((col >> 24) == (uint32)0 || r <= 0.0) { return; }
+  var k: float32 = p->scale;
+  var d: MythicRect = { x: (c.x - r) * k, y: (c.y - r) * k, w: 2.0 * r * k, h: 2.0 * r * k };
+  var rr: float32 = r * k;
+  var rad: MythicCorners = { tl: rr, tr: rr, br: rr, bl: rr };
+  mythic_dl_fill(p->dl, d, rad, col);
+}
+
+/// Fills a rounded rect without snapping its edges (animated geometry: knob stretch, press scale).
+export fn mythic_paint_fill_exact(p: MythicPainter*, r: MythicRect, radii: MythicCorners, color: uint32) {
+  var c: uint32 = mythic_paint_color(p, color);
+  if ((c >> 24) == (uint32)0 || r.w <= 0.0 || r.h <= 0.0) { return; }
+  var k: float32 = p->scale;
+  var d: MythicRect = { x: r.x * k, y: r.y * k, w: r.w * k, h: r.h * k };
+  mythic_dl_fill(p->dl, d, dev_radii(p, radii), c);
+}
+
+/// Inside stroke of a rounded rect without snapping (width in logical px, whole device px).
+export fn mythic_paint_stroke_exact(p: MythicPainter*, r: MythicRect, radii: MythicCorners, width: float32, color: uint32) {
+  var c: uint32 = mythic_paint_color(p, color);
+  if ((c >> 24) == (uint32)0 || r.w <= 0.0 || r.h <= 0.0) { return; }
+  var k: float32 = p->scale;
+  var d: MythicRect = { x: r.x * k, y: r.y * k, w: r.w * k, h: r.h * k };
+  mythic_dl_stroke(p->dl, d, dev_radii(p, radii), mythic_paint_line_w(p, width), c);
+}
+
+/// Shadow under an unsnapped rect.
+export fn mythic_paint_shadow_exact(p: MythicPainter*, r: MythicRect, radii: MythicCorners, s: MythicShadow) {
+  var c: uint32 = mythic_paint_color(p, s.color);
+  if ((c >> 24) == (uint32)0) { return; }
+  var k: float32 = p->scale;
+  var d: MythicRect = { x: r.x * k, y: r.y * k, w: r.w * k, h: r.h * k };
+  var ds: MythicShadow = { dx: s.dx * k, dy: s.dy * k, blur: s.blur * k, spread: s.spread * k, color: c };
+  mythic_dl_shadow(p->dl, d, dev_radii(p, radii), ds);
+}
+
+/// Text constrained to the box `r` (logical): wraps (MYTHIC_TEXT_WRAP) or ellipsizes
+/// (MYTHIC_TEXT_ELLIPSIS) at r.w; the first line box starts at r.y (line-box rule).
+export fn mythic_paint_text_box(p: MythicPainter*, s: string, style: MythicTextStyle, r: MythicRect, color: uint32) {
+  var c: uint32 = mythic_paint_color(p, color);
+  if ((c >> 24) == (uint32)0 || s.length == (uint64)0 || p->fonts == 0) { return; }
+  var sp: MythicTextSpec = mythic_paint_text_spec(p->scale, style);
+  if ((style.flags & (MYTHIC_TEXT_WRAP | MYTHIC_TEXT_ELLIPSIS)) != 0) {
+    sp.max_width = r.w * p->scale + 0.5;
+    if ((style.flags & MYTHIC_TEXT_WRAP) == 0) { sp.max_lines = 1; }
+  }
+  var l: MythicTextLayout* = mythic_text_layout(p->fonts, sp, s);
+  if (l == 0) { return; }
+  var lb0: float32 = 0.0;
+  if (l->line_count > 0 && l->line_baseline != 0) { lb0 = l->line_baseline[0]; }
+  var base: float32 = mythic_paint_line_baseline(p, style, r.y);
+  var origin: MythicVec2 = { x: r.x * p->scale, y: base - lb0 };
+  var darken: bool = style.size <= 15.0 && luminance(color) < 0.5;
+  mythic_text_emit(p->dl, p->fonts, l, sp, origin, c, darken);
+}

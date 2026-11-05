@@ -1,0 +1,315 @@
+// Ogg Opus decoder (RFC 7845 over RFC 6716, with the RFC 8251 fixes).
+// Output is always 48000 Hz float32, interleaved.
+//
+//   var d: AudioOpus;
+//   memset(&d, 0, sizeof(AudioOpus));
+//   if (audio_opus_open(&d, data, size) == AUDIO_OK) {
+//     while (audio_opus_next(&d) == AUDIO_OK) { ... d.out[0 .. d.out_frames * channels] ... }
+//   }
+//   audio_opus_close(&d);
+//
+// Pre-skip, the output gain and end trimming (from the last granule
+// position) are applied, so the output has exactly info.frames frames.
+// Channel order: mapping family 1 uses Vorbis order, which is changed to
+// WAV order here:
+//   3: L C R            -> L R C
+//   5: FL C FR RL RR    -> FL FR C RL RR
+//   6: FL C FR RL RR LFE -> FL FR C LFE RL RR
+//   7: FL C FR SL SR RC LFE -> FL FR C LFE RC SL SR
+//   8: FL C FR SL SR RL RR LFE -> FL FR C LFE RL RR SL SR
+// Families 0, 2 and 255 keep the stream order.
+
+import "std/mem";
+import "../core/status";
+import "../core/pcm";
+import "../core/amath";
+import "ogg";
+import "opus_pkt";
+import "opus_ms";
+
+export struct AudioOpus {
+  info: AudioInfo;
+  out: float32*;
+  out_frames: int32;
+  // stream
+  p: uint8*;
+  n: int64;
+  ogg: AudioOgg;
+  ms: AudioOpusMs;
+  family: int32;
+  pre_skip: int32;
+  gain: float32;
+  order: int32[8];      // output channel c is decoded channel order[c]
+  pcm: float32*;        // one packet, 5760 frames
+  start: int64;         // granule of the first decoded sample
+  pos: int64;           // granule of the next decoded sample
+  keep_from: int64;     // drop samples before this granule
+  first_page: int64;    // offset of the first audio page
+  ended: bool;
+}
+
+const VORBIS_TO_WAV: int32[64] = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 1, 0, 0, 0, 0, 0, 0,
+  0, 2, 1, 0, 0, 0, 0, 0,
+  0, 1, 2, 3, 0, 0, 0, 0,
+  0, 2, 1, 3, 4, 0, 0, 0,
+  0, 2, 1, 5, 3, 4, 0, 0,
+  0, 2, 1, 6, 5, 3, 4, 0,
+  0, 2, 1, 7, 5, 6, 3, 4
+];
+
+// Frames in a packet from its first bytes (0 if it cannot be told).
+fn opus_packet_frames(p: uint8*, len: int64) -> int32 {
+  if (len < 1) { return 0; }
+  var toc: int32 = (int32)p[0];
+  var count: int32 = 1;
+  var c: int32 = toc & 3;
+  if (c == 1 || c == 2) {
+    count = 2;
+  } else if (c == 3) {
+    if (len < 2) { return 0; }
+    count = (int32)p[1] & 0x3F;
+  }
+  var total: int32 = count * audio_opus_toc_frame_size(toc);
+  if (total > 5760) { return 0; }
+  return total;
+}
+
+// Reads OpusHead and OpusTags from a fresh reader.
+fn opus_headers(d: AudioOpus*, o: AudioOgg*, setup: bool) -> int32 {
+  var pk: AudioOggPacket;
+  if (audio_ogg_packet(o, &pk) != AUDIO_OK) { return AUDIO_E_FORMAT; }
+  if (pk.len < 19 || !audio_bytes_is(pk.data, pk.len, "OpusHead")) { return AUDIO_E_FORMAT; }
+  if (setup) {
+    var h: uint8* = pk.data;
+    if ((h[8] & 0xF0) != 0) { return AUDIO_E_UNSUPPORTED; }
+    var ch: int32 = (int32)h[9];
+    if (ch < 1) { return AUDIO_E_DATA; }
+    d->pre_skip = (int32)h[10] | ((int32)h[11] << 8);
+    var g: int32 = (int32)(int16)((int32)h[16] | ((int32)h[17] << 8));
+    d->gain = (float32)audio_pow(10.0, (float64)g / 5120.0);
+    d->family = (int32)h[18];
+    var map: uint8[8];
+    var nstreams: int32 = 1;
+    var ncoupled: int32 = 0;
+    if (ch > 8) { return AUDIO_E_UNSUPPORTED; }
+    if (d->family == 0) {
+      if (ch > 2) { return AUDIO_E_DATA; }
+      ncoupled = ch - 1;
+      map[0] = 0;
+      map[1] = 1;
+    } else {
+      if (d->family == 3) { return AUDIO_E_UNSUPPORTED; }
+      if (pk.len < 21 + (int64)ch) { return AUDIO_E_DATA; }
+      nstreams = (int32)h[19];
+      ncoupled = (int32)h[20];
+      for c in 0..ch { map[c] = h[21 + c]; }
+    }
+    var rc: int32 = audio_opus_ms_init(&d->ms, ch, nstreams, ncoupled, &map[0]);
+    if (rc != AUDIO_OK) { return rc; }
+    for c in 0..8 { d->order[c] = c; }
+    if (d->family == 1) {
+      for c in 0..ch { d->order[c] = VORBIS_TO_WAV[(ch - 1) * 8 + c]; }
+    }
+    d->info.channels = ch;
+  }
+  if (audio_ogg_packet(o, &pk) != AUDIO_OK) { return AUDIO_E_TRUNC; }
+  if (!audio_bytes_is(pk.data, pk.len, "OpusTags")) { return AUDIO_E_DATA; }
+  return AUDIO_OK;
+}
+
+// Back to the first audio packet.
+fn opus_rewind(d: AudioOpus*) -> int32 {
+  audio_ogg_free(&d->ogg);
+  audio_ogg_init(&d->ogg, d->p, d->n);
+  var rc: int32 = opus_headers(d, &d->ogg, false);
+  if (rc != AUDIO_OK) { return rc; }
+  audio_opus_ms_reset(&d->ms);
+  d->pos = d->start;
+  d->keep_from = d->start + (int64)d->pre_skip;
+  d->ended = false;
+  return AUDIO_OK;
+}
+
+export fn audio_opus_close(d: AudioOpus*) {
+  audio_ogg_free(&d->ogg);
+  audio_opus_ms_free(&d->ms);
+  if (d->pcm != 0) { free(d->pcm); }
+  if (d->out != 0) { free(d->out); }
+  d->pcm = (float32*)0;
+  d->out = (float32*)0;
+  d->out_frames = 0;
+}
+
+/// Reads the headers of an Ogg Opus stream in memory (kept by the caller).
+export fn audio_opus_open(d: AudioOpus*, p: uint8*, n: int64) -> int32 {
+  memset(d, 0, sizeof(AudioOpus));
+  if (p == 0 || n <= 0) { return AUDIO_E_ARG; }
+  d->p = p;
+  d->n = n;
+  audio_ogg_init(&d->ogg, p, n);
+  var rc: int32 = opus_headers(d, &d->ogg, true);
+  if (rc != AUDIO_OK) { audio_opus_close(d); return rc; }
+  var ch: int32 = d->info.channels;
+  d->pcm = (float32*)calloc(5760 * (int64)ch, 4);
+  d->out = (float32*)calloc(5760 * (int64)ch, 4);
+  if (d->pcm == 0 || d->out == 0) { audio_opus_close(d); return AUDIO_E_MEM; }
+  d->info.rate = 48000;
+  d->info.fmt = AUDIO_F32;
+  d->info.bits = 0;
+  d->info.mask = 0;
+  // The first audio page says where the stream starts: its granule minus
+  // the samples of the packets that end on it.
+  d->first_page = d->ogg.pos;
+  var o: AudioOgg;
+  audio_ogg_init(&o, p, n);
+  var start: int64 = 0;
+  if (opus_headers(d, &o, false) == AUDIO_OK) {
+    var sum: int64 = 0;
+    var pk: AudioOggPacket;
+    var guard: int32 = 0;
+    while (audio_ogg_packet(&o, &pk) == AUDIO_OK && guard < 100000) {
+      guard = guard + 1;
+      sum = sum + (int64)opus_packet_frames(pk.data, pk.len);
+      if (pk.granule != -1) {
+        start = pk.granule - sum;
+        if (start < 0) { start = 0; }
+        break;
+      }
+    }
+  }
+  audio_ogg_free(&o);
+  d->start = start;
+  d->pos = start;
+  d->keep_from = start + (int64)d->pre_skip;
+  var last: int64 = audio_ogg_last_granule(&d->ogg);
+  d->info.frames = -1;
+  if (last >= 0) {
+    var f: int64 = last - start - (int64)d->pre_skip;
+    if (f < 0) { f = 0; }
+    d->info.frames = f;
+  }
+  return AUDIO_OK;
+}
+
+/// Decodes the next packet into d->out. AUDIO_END at the end.
+export fn audio_opus_next(d: AudioOpus*) -> int32 {
+  d->out_frames = 0;
+  if (d->pcm == 0) { return AUDIO_E_ARG; }
+  var ch: int32 = d->info.channels;
+  while (true) {
+    if (d->ended) { return AUDIO_END; }
+    var pk: AudioOggPacket;
+    var rc: int32 = audio_ogg_packet(&d->ogg, &pk);
+    if (rc == AUDIO_END) { d->ended = true; return AUDIO_END; }
+    if (rc < 0) { return rc; }
+    if (pk.len <= 0) { continue; }
+    var nf: int32 = 0;
+    if (pk.len <= 1275 * 8 * 48) {
+      nf = audio_opus_ms_decode(&d->ms, pk.data, (int32)pk.len, d->pcm, 0);
+    } else {
+      nf = AUDIO_E_LIMIT;
+    }
+    if (nf <= 0) {
+      // a broken packet: conceal it if its length can be told
+      var want: int32 = opus_packet_frames(pk.data, pk.len);
+      if (want <= 0 || want % 120 != 0) { continue; }
+      nf = audio_opus_ms_decode(&d->ms, (uint8*)0, 0, d->pcm, want);
+      if (nf <= 0) { continue; }
+    }
+    var g0: int64 = d->pos;
+    var g1: int64 = d->pos + (int64)nf;
+    d->pos = g1;
+    var lim: int64 = g1;
+    if (pk.eos && pk.granule != -1 && pk.granule < lim) { lim = pk.granule; }
+    if (pk.eos) { d->ended = true; }
+    var from: int64 = g0;
+    if (from < d->keep_from) { from = d->keep_from; }
+    if (from >= lim) {
+      if (d->ended) { return AUDIO_END; }
+      continue;
+    }
+    var k0: int32 = (int32)(from - g0);
+    var cnt: int32 = (int32)(lim - from);
+    var gain: float32 = d->gain;
+    for i in 0..cnt {
+      var src: float32* = d->pcm + (int64)(k0 + i) * (int64)ch;
+      var dst: float32* = d->out + (int64)i * (int64)ch;
+      for c in 0..ch { dst[c] = src[d->order[c]] * gain; }
+    }
+    d->out_frames = cnt;
+    return AUDIO_OK;
+  }
+  return AUDIO_END;
+}
+
+/// Seeks so the next audio_opus_next starts exactly at `frame`. Decoding
+/// starts at least 80 ms (3840 samples) earlier so the decoder settles.
+export fn audio_opus_seek(d: AudioOpus*, frame: int64) -> int32 {
+  if (d->pcm == 0) { return AUDIO_E_ARG; }
+  if (frame < 0) { return AUDIO_E_ARG; }
+  var target: int64 = d->start + (int64)d->pre_skip + frame;
+  var want: int64 = target - 3840;
+  // find the last page whose granule is at most `want` (bisection)
+  var best_off: int64 = -1;
+  var best_gran: int64 = -1;
+  if (want > d->start) {
+    var lo: int64 = d->first_page;
+    var hi: int64 = d->n;
+    var pg: AudioOggPage;
+    while (hi - lo > 8192) {
+      var mid: int64 = lo + (hi - lo) / 2;
+      var at: int64 = mid;
+      var found: bool = false;
+      while (audio_ogg_find_page(&d->ogg, at, &pg) == AUDIO_OK && pg.off < hi) {
+        if (pg.serial == d->ogg.serial && pg.granule != -1) { found = true; break; }
+        at = pg.off + pg.size;
+      }
+      if (!found || pg.off >= hi) {
+        hi = mid;
+      } else if (pg.granule <= want) {
+        best_off = pg.off;
+        best_gran = pg.granule;
+        lo = pg.off + pg.size;
+      } else {
+        hi = mid;
+      }
+    }
+    var at2: int64 = lo;
+    while (audio_ogg_find_page(&d->ogg, at2, &pg) == AUDIO_OK) {
+      if (pg.serial == d->ogg.serial && pg.granule != -1) {
+        if (pg.granule > want) { break; }
+        best_off = pg.off;
+        best_gran = pg.granule;
+      }
+      at2 = pg.off + pg.size;
+    }
+  }
+  if (best_off < d->first_page || best_gran < d->start) {
+    var rc: int32 = opus_rewind(d);
+    if (rc != AUDIO_OK) { return rc; }
+  } else {
+    // start reading at that page and drop packets up to the one that ends
+    // on it: the next packet starts at its granule
+    audio_ogg_seek_byte(&d->ogg, best_off);
+    var pk: AudioOggPacket;
+    var ok: bool = false;
+    var guard: int32 = 0;
+    while (guard < 10000 && audio_ogg_packet(&d->ogg, &pk) == AUDIO_OK) {
+      guard = guard + 1;
+      if (pk.granule != -1) { ok = true; break; }
+    }
+    if (!ok) {
+      var rc2: int32 = opus_rewind(d);
+      if (rc2 != AUDIO_OK) { return rc2; }
+    } else {
+      // after the last packet there is nothing left to give
+      audio_opus_ms_reset(&d->ms);
+      d->pos = pk.granule;
+      d->ended = pk.eos;
+    }
+  }
+  d->keep_from = target;
+  return AUDIO_OK;
+}

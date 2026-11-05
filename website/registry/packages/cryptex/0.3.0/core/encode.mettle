@@ -1,0 +1,254 @@
+// Encodings for tokens and keys: lowercase hex and base64url without padding
+// (RFC 4648 section 5). Pure Mettle and constant time in the data: characters
+// and values are converted with arithmetic masks only, with no table lookup
+// and no branch on a byte's value, so encoding or decoding a secret does not
+// leak it through timing. Branches depend on lengths only.
+//
+// Decoding is strict: no whitespace or other ignored characters, the whole
+// input must be consumed, hex must have an even number of digits, base64url
+// must have no '=' padding, no length of the form 4k+1, and zero trailing
+// bits. Anything else is CR_E_DECODE.
+//
+// Encoders write a terminating nul after the text (so the output can go
+// straight to C), which is why the capacity needs one extra byte; the
+// reported length excludes it.
+
+import "cryptex/core/status";
+import "cryptex/core/util";
+
+
+// Inputs above this are refused, so no size computation can overflow.
+const CR_ENC_MAX: int64 = 1152921504606846975;
+
+// All-ones (-1) if lo <= c <= hi, else 0. Arithmetic only; c, lo and hi are
+// small, so the subtractions cannot overflow.
+fn enc_in(c: int32, lo: int32, hi: int32) -> int32 {
+  return ~((c - lo) >> 31) & ((c - hi - 1) >> 31);
+}
+
+// All-ones if x >= k, else 0 (small values).
+fn enc_ge(x: int32, k: int32) -> int32 {
+  return ~((x - k) >> 31);
+}
+
+// Lowercase hex digit for a nibble x in 0..15: '0'..'9', 'a'..'f'.
+fn enc_hex_char(x: int32) -> uint8 {
+  return (uint8)(87 + x + (((x - 10) >> 8) & ~38));
+}
+
+// Base64url character for a 6-bit value x in 0..63.
+fn enc_b64_char(x: int32) -> uint8 {
+  var c: int32 = x + 65;
+  c = c + (enc_ge(x, 26) & 6);
+  c = c + (enc_ge(x, 52) & -75);
+  c = c + (enc_ge(x, 62) & -13);
+  c = c + (enc_ge(x, 63) & 49);
+  return (uint8)c;
+}
+
+// Hex digit value of c (either case) in the low bits; *bad gets all-ones OR-ed
+// in when c is not a hex digit.
+fn enc_hex_val(c: int32, bad: int32*) -> int32 {
+  var d: int32 = enc_in(c, 48, 57);
+  var l: int32 = enc_in(c, 97, 102);
+  var u: int32 = enc_in(c, 65, 70);
+  *bad = *bad | ~(d | l | u);
+  return (d & (c - 48)) | (l & (c - 87)) | (u & (c - 55));
+}
+
+// Base64url value of c; *bad gets all-ones OR-ed in when c is outside the
+// alphabet.
+fn enc_b64_val(c: int32, bad: int32*) -> int32 {
+  var up: int32 = enc_in(c, 65, 90);
+  var lo: int32 = enc_in(c, 97, 122);
+  var dg: int32 = enc_in(c, 48, 57);
+  var mi: int32 = enc_in(c, 45, 45);
+  var un: int32 = enc_in(c, 95, 95);
+  *bad = *bad | ~(up | lo | dg | mi | un);
+  return (up & (c - 65)) | (lo & (c - 71)) | (dg & (c + 4)) | (mi & 62) | (un & 63);
+}
+
+/// Capacity cr_hex_encode needs for n input bytes: 2n + 1 (the nul).
+/// in: n >= 0
+/// returns: 2n + 1, or -1 for a negative or absurdly large n
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: var cap: int64 = cr_hex_encoded_cap(32);  // 65
+export fn cr_hex_encoded_cap(n: int64) -> int64 {
+  if (n < 0 || n > CR_ENC_MAX) { return -1; }
+  return n * 2 + 1;
+}
+
+/// Capacity cr_base64url_encode needs for n input bytes, nul included:
+/// (4n + 2) / 3 + 1.
+/// in: n >= 0
+/// returns: the capacity, or -1 for a negative or absurdly large n
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: var cap: int64 = cr_base64url_encoded_cap(32);  // 44
+export fn cr_base64url_encoded_cap(n: int64) -> int64 {
+  if (n < 0 || n > CR_ENC_MAX) { return -1; }
+  return (n * 4 + 2) / 3 + 1;
+}
+
+/// Encodes n bytes as lowercase hex.
+/// in: out writable for out_cap >= cr_hex_encoded_cap(n) bytes; out_len;
+///   bin/n
+/// returns: CR_OK and *out_len = 2n (text followed by a nul); CR_E_ARG;
+///   CR_E_SPACE if out_cap is too small (nothing written). On error
+///   *out_len = 0
+/// owns: nothing; the caller owns out
+/// thread: any thread (no shared state)
+/// example: var hx: uint8[65]; var hl: int64; cr_hex_encode(&hx[0], 65, &hl, &d.b[0], 32);
+export fn cr_hex_encode(out: uint8*, out_cap: int64, out_len: int64*, bin: uint8*, n: int64) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || n < 0 || n > CR_ENC_MAX || (bin == 0 && n > 0)) { return CR_E_ARG; }
+  if (out_cap < cr_hex_encoded_cap(n)) { return CR_E_SPACE; }
+  var i: int64 = 0;
+  while (i < n) {
+    var x: int32 = (int32)bin[i];
+    out[i * 2] = enc_hex_char(x >> 4);
+    out[i * 2 + 1] = enc_hex_char(x & 15);
+    i = i + 1;
+  }
+  out[n * 2] = 0;
+  *out_len = n * 2;
+  return CR_OK;
+}
+
+/// Decodes hex (either case) strictly.
+/// in: out writable for out_cap bytes; out_len; text/n, the hex digits
+///   (no nul needed)
+/// returns: CR_OK and *out_len = n / 2; CR_E_DECODE for an odd length or
+///   any non-hex character (including spaces and a trailing nul);
+///   CR_E_SPACE if out_cap < n / 2; CR_E_ARG. On error
+///   *out_len = 0 and out's first out_cap bytes are wiped
+/// owns: nothing; the caller owns out
+/// thread: any thread (no shared state)
+/// example: var k: uint8[32]; var kl: int64; cr_hex_decode(&k[0], 32, &kl, s.chars, (int64)s.length);
+export fn cr_hex_decode(out: uint8*, out_cap: int64, out_len: int64*, text: uint8*, n: int64) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || out_cap < 0 || n < 0 || n > CR_ENC_MAX || (text == 0 && n > 0)) { return CR_E_ARG; }
+  if (n % 2 != 0) {
+    cr_wipe(out, out_cap);
+    return CR_E_DECODE;
+  }
+  if (out_cap < n / 2) {
+    cr_wipe(out, out_cap);
+    return CR_E_SPACE;
+  }
+  if (n == 0) { return CR_OK; }
+  var bad: int32 = 0;
+  var i: int64 = 0;
+  while (i < n / 2) {
+    var hi: int32 = enc_hex_val((int32)text[i * 2], &bad);
+    var lo: int32 = enc_hex_val((int32)text[i * 2 + 1], &bad);
+    out[i] = (uint8)((hi << 4) | lo);
+    i = i + 1;
+  }
+  // One decision at the end.
+  if (bad != 0) {
+    cr_wipe(out, out_cap);
+    return CR_E_DECODE;
+  }
+  *out_len = n / 2;
+  return CR_OK;
+}
+
+/// Encodes n bytes as base64url without padding (alphabet A-Z a-z 0-9 - _),
+/// the form used in URLs, cookies and tokens.
+/// in: out writable for out_cap >= cr_base64url_encoded_cap(n) bytes;
+///   out_len; bin/n
+/// returns: CR_OK and *out_len = the text length (a nul follows it);
+///   CR_E_ARG; CR_E_SPACE if out_cap is too small (nothing written). On error
+///   *out_len = 0
+/// owns: nothing; the caller owns out
+/// thread: any thread (no shared state)
+/// example: var t: uint8[44]; var tl: int64; cr_base64url_encode(&t[0], 44, &tl, &raw[0], 32);
+export fn cr_base64url_encode(out: uint8*, out_cap: int64, out_len: int64*, bin: uint8*, n: int64) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || n < 0 || n > CR_ENC_MAX || (bin == 0 && n > 0)) { return CR_E_ARG; }
+  var need: int64 = cr_base64url_encoded_cap(n);
+  if (out_cap < need) { return CR_E_SPACE; }
+  var i: int64 = 0;
+  var o: int64 = 0;
+  while (i + 3 <= n) {
+    var w: int32 = ((int32)bin[i] << 16) | ((int32)bin[i + 1] << 8) | (int32)bin[i + 2];
+    out[o] = enc_b64_char((w >> 18) & 63);
+    out[o + 1] = enc_b64_char((w >> 12) & 63);
+    out[o + 2] = enc_b64_char((w >> 6) & 63);
+    out[o + 3] = enc_b64_char(w & 63);
+    i = i + 3;
+    o = o + 4;
+  }
+  if (n - i == 1) {
+    var w1: int32 = (int32)bin[i] << 16;
+    out[o] = enc_b64_char((w1 >> 18) & 63);
+    out[o + 1] = enc_b64_char((w1 >> 12) & 63);
+    o = o + 2;
+  }
+  if (n - i == 2) {
+    var w2: int32 = ((int32)bin[i] << 16) | ((int32)bin[i + 1] << 8);
+    out[o] = enc_b64_char((w2 >> 18) & 63);
+    out[o + 1] = enc_b64_char((w2 >> 12) & 63);
+    out[o + 2] = enc_b64_char((w2 >> 6) & 63);
+    o = o + 3;
+  }
+  out[o] = 0;
+  *out_len = need - 1;
+  return CR_OK;
+}
+
+/// Decodes unpadded base64url strictly.
+/// in: out writable for out_cap bytes; out_len; text/n (no nul needed)
+/// returns: CR_OK and *out_len = the decoded length; CR_E_DECODE for any
+///   character outside the base64url alphabet (including '=', '+', '/',
+///   spaces), a length of the form 4k+1, or non-zero trailing bits;
+///   CR_E_SPACE if out_cap < floor(3n / 4); CR_E_ARG. On error
+///   *out_len = 0 and out's first out_cap bytes are wiped
+/// owns: nothing; the caller owns out
+/// thread: any thread (no shared state)
+/// example: var raw: uint8[32]; var rl: int64; cr_base64url_decode(&raw[0], 32, &rl, t.chars, (int64)t.length);
+export fn cr_base64url_decode(out: uint8*, out_cap: int64, out_len: int64*, text: uint8*, n: int64) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || out_cap < 0 || n < 0 || n > CR_ENC_MAX || (text == 0 && n > 0)) { return CR_E_ARG; }
+  if (n % 4 == 1) {
+    cr_wipe(out, out_cap);
+    return CR_E_DECODE;
+  }
+  if (out_cap < (n / 4) * 3 + ((n % 4) * 3) / 4) {
+    cr_wipe(out, out_cap);
+    return CR_E_SPACE;
+  }
+  if (n == 0) { return CR_OK; }
+  var bad: int32 = 0;
+  var acc: uint32 = 0;
+  var bits: int32 = 0;
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = enc_b64_val((int32)text[i], &bad);
+    acc = (acc << 6) | (uint32)v;
+    bits = bits + 6;
+    // bits depends on the position only, never on the data.
+    if (bits >= 8) {
+      bits = bits - 8;
+      out[o] = (uint8)((acc >> (uint32)bits) & 255);
+      o = o + 1;
+    }
+    i = i + 1;
+  }
+  // The 0, 2 or 4 leftover bits must be zero.
+  var rest: uint32 = acc & (((uint32)1 << (uint32)bits) - 1);
+  bad = bad | (int32)rest;
+  if (bad != 0) {
+    cr_wipe(out, out_cap);
+    return CR_E_DECODE;
+  }
+  *out_len = o;
+  return CR_OK;
+}

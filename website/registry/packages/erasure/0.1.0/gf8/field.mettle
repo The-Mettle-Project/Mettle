@@ -1,0 +1,66 @@
+// Arithmetic in GF(2^8) with the polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11D)
+// and generator 2. This is the field used by ISA-L, klauspost/reedsolomon,
+// Backblaze JavaReedSolomon and Jerasure's w=8 codes, so shards made here
+// match theirs.
+
+import "std/mem";
+
+export const ERASURE_GF8_POLY: int32 = 0x11d;
+
+var g_exp: uint8[512];       // g_exp[i] = 2^i, doubled so log sums need no mod
+var g_log: uint8[256];       // g_log[x] for x != 0
+var g_mul: uint8* = 0;       // g_mul[a * 256 + b] = a * b (64 KB)
+var g_inv: uint8[256];
+var g_ready: bool = false;
+
+/// Builds the tables. Safe to call many times; every codec calls it.
+export fn erasure_gf8_init() {
+  if (g_ready) { return; }
+  var x: int32 = 1;
+  for i in 0..255 {
+    g_exp[i] = (uint8)x;
+    g_exp[i + 255] = (uint8)x;
+    g_log[x] = (uint8)i;
+    x = x << 1;
+    if (x >= 256) { x = x ^ ERASURE_GF8_POLY; }
+  }
+  g_exp[510] = g_exp[0];
+  g_exp[511] = g_exp[1];
+  var t: uint8* = (uint8*)malloc(65536);
+  for a in 0..256 {
+    for b in 0..256 {
+      var v: uint8 = 0;
+      if (a != 0 && b != 0) { v = g_exp[(int32)g_log[a] + (int32)g_log[b]]; }
+      t[a * 256 + b] = v;
+    }
+  }
+  g_inv[0] = 0;
+  for a in 1..256 { g_inv[a] = g_exp[255 - (int32)g_log[a]]; }
+  g_mul = t;
+  g_ready = true;
+}
+
+/// a * b.
+export fn erasure_gf8_mul(a: uint8, b: uint8) -> uint8 {
+  if (a == 0 || b == 0) { return 0; }
+  return g_exp[(int32)g_log[a] + (int32)g_log[b]];
+}
+
+/// 1 / a. The inverse of 0 is given as 0.
+export fn erasure_gf8_inv(a: uint8) -> uint8 { return g_inv[a]; }
+
+/// a / b. Division by 0 gives 0.
+export fn erasure_gf8_div(a: uint8, b: uint8) -> uint8 {
+  if (a == 0 || b == 0) { return 0; }
+  return g_exp[(int32)g_log[a] + 255 - (int32)g_log[b]];
+}
+
+/// a to the power n (0^0 is 1).
+export fn erasure_gf8_pow(a: uint8, n: int32) -> uint8 {
+  if (n == 0) { return 1; }
+  if (a == 0) { return 0; }
+  return g_exp[((int32)g_log[a] * n) % 255];
+}
+
+/// The row of the multiply table for c: row[b] = c * b.
+export fn erasure_gf8_mul_row(c: uint8) -> uint8* { return g_mul + (int64)c * 256; }

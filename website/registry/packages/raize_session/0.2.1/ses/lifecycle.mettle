@@ -1,0 +1,292 @@
+// Session lifecycle for one request: create (login), lookup (each request),
+// touch and save (end of request). Rotation, revocation and pruning are in
+// admin.mettle.
+//
+// Expiry: a session is expired when now >= abs_expires (created +
+// absolute_lifetime, never extended) or now >= last_seen + idle_timeout.
+// last_seen is persisted at most once per touch_interval, so the effective
+// idle timeout can be up to touch_interval shorter than configured (never
+// longer).
+
+import "std/mem";
+import "std/conv";
+import "cryptex/cryptex";
+import "status";
+import "types";
+import "store";
+import "config";
+import "token";
+
+fn ses_lc_min(a: int64, b: int64) -> int64 {
+  if (a < b) { return a; }
+  return b;
+}
+
+/// Computes the expires field a record should carry: the earlier of its
+/// idle deadline (last_seen + idle_timeout) and its absolute deadline.
+/// in: m, an initialized manager; r, a record
+/// returns: unix seconds; 0 for a null argument
+/// owns: nothing
+/// thread: any thread (no crypto call)
+/// example: r.expires = ses_record_deadline(&m, &r);
+export fn ses_record_deadline(m: SesManager*, r: SesRecord*) -> int64 {
+  if (m == 0 || r == 0) { return 0; }
+  return ses_lc_min(r->last_seen + m->cfg.idle_timeout, r->abs_expires);
+}
+
+/// Creates a session for a subject (on login) and returns its token once.
+/// in: m, an initialized manager; subject, the owner id (1..SES_SUBJECT_CAP
+///   bytes, opaque to the library, e.g. a user id); now, unix seconds;
+///   tok, receives the token; out, receives the live session
+/// returns: SES_OK; SES_E_ARG (null pointer, manager not initialized,
+///   empty or oversized subject); SES_E_CRYPTO; or the store's error. On
+///   error tok is wiped and out is not live
+/// owns: tok is the only copy of the token: send it to the client (cookie)
+///   and wipe it; the store receives only SHA-256 of it. out is the caller's
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0; the store must be
+///   thread-safe if shared)
+/// example: var t: SesToken; var s: SesSession; rc = ses_create(&m, uid, now, &t, &s);
+export fn ses_create(m: SesManager*, subject: string, now: int64, tok: SesToken*, out: SesSession*) -> int32 {
+  if (m == 0 || tok == 0 || out == 0 || !m->ready) { return SES_E_ARG; }
+  memset((rawptr)out, 0, sizeof(SesSession));
+  if (subject.length == 0 || subject.length > (uint64)SES_SUBJECT_CAP) { return SES_E_ARG; }
+  var h: CrSha256;
+  var rc: int32 = ses_token_new(m->cfg.token_bytes, tok, &h);
+  if (rc != SES_OK) { return rc; }
+  var r: SesRecord* = &out->rec;
+  memcpy(&r->hash[0], &h.b[0], 32);
+  if (cr_random_bytes(&r->csrf[0], 32) != CR_OK) {
+    ses_token_wipe(tok);
+    return SES_E_CRYPTO;
+  }
+  ses_record_set_subject(r, subject);
+  r->created = now;
+  r->last_seen = now;
+  r->abs_expires = now + m->cfg.absolute_lifetime;
+  r->rotated = now;
+  r->revoked = 0;
+  r->expires = ses_record_deadline(m, r);
+  rc = ses_store_put(m->store, r);
+  if (rc != SES_OK) {
+    ses_token_wipe(tok);
+    memset((rawptr)out, 0, sizeof(SesSession));
+    return rc;
+  }
+  out->saved_seen = now;
+  out->dirty = false;
+  out->live = true;
+  return SES_OK;
+}
+
+/// Reports whether a record is past its idle or absolute expiry at now.
+/// in: m, an initialized manager; r, a record; now, unix seconds
+/// returns: true when expired (and for a null argument)
+/// owns: nothing
+/// thread: any thread (no crypto call)
+/// example: if (ses_record_expired(&m, &r, now)) { ... }
+export fn ses_record_expired(m: SesManager*, r: SesRecord*, now: int64) -> bool {
+  if (m == 0 || r == 0) { return true; }
+  if (now >= r->abs_expires) { return true; }
+  if (now >= r->last_seen + m->cfg.idle_timeout) { return true; }
+  return false;
+}
+
+// Shared by ses_lookup and ses_peek: hash, store get, constant-time confirm,
+// revoked and expiry checks. On success out->rec is the stored record and
+// out->saved_seen is set; on any other result out is zeroed. Only when
+// delete_expired is true does it delete an expired record.
+fn ses_lc_load(m: SesManager*, tok: string, now: int64, out: SesSession*, delete_expired: bool) -> int32 {
+  memset((rawptr)out, 0, sizeof(SesSession));
+  var h: CrSha256;
+  var rc: int32 = ses_token_hash(tok, &h);
+  if (rc != SES_OK) { return rc; }
+  var r: SesRecord* = &out->rec;
+  rc = ses_store_get(m->store, &h.b[0], r);
+  if (rc != SES_OK) {
+    memset((rawptr)out, 0, sizeof(SesSession));
+    return rc;
+  }
+  // The store found it by hash; confirm in constant time anyway, so a store
+  // with a looser index (prefix, case folding) cannot match another token.
+  if (!cr_equal(&r->hash[0], &h.b[0], 32)) {
+    memset((rawptr)out, 0, sizeof(SesSession));
+    return SES_E_NOT_FOUND;
+  }
+  if (r->revoked != 0) {
+    memset((rawptr)out, 0, sizeof(SesSession));
+    return SES_E_REVOKED;
+  }
+  if (ses_record_expired(m, r, now)) {
+    if (delete_expired) { ses_store_del(m->store, &h.b[0]); }
+    memset((rawptr)out, 0, sizeof(SesSession));
+    return SES_E_EXPIRED;
+  }
+  out->saved_seen = r->last_seen;
+  return SES_OK;
+}
+
+/// Looks up the session for a presented token (on every request). Pending
+/// flash messages move into out (read them with ses_flash_count /
+/// ses_flash_at) and are cleared in the store right away, so they show once.
+/// in: m, an initialized manager; tok, the token text the client sent (for
+///   example from ses_cookie_find); now, unix seconds; out, receives the
+///   session
+/// returns: SES_OK (out is live); SES_E_NOT_FOUND (unknown or malformed
+///   token); SES_E_EXPIRED (idle or absolute; the record is deleted);
+///   SES_E_REVOKED; SES_E_ARG; SES_E_CRYPTO; or the store's error. Only
+///   SES_OK means "signed in"; on every other result out is zeroed
+/// owns: tok is borrowed; out is the caller's
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0; the store must be
+///   thread-safe if shared)
+/// example: var s: SesSession; if (ses_lookup(&m, tok, now, &s) != SES_OK) { return login(); }
+export fn ses_lookup(m: SesManager*, tok: string, now: int64, out: SesSession*) -> int32 {
+  if (m == 0 || out == 0 || !m->ready) { return SES_E_ARG; }
+  var rc: int32 = ses_lc_load(m, tok, now, out, true);
+  if (rc != SES_OK) { return rc; }
+  var r: SesRecord* = &out->rec;
+  if (r->flash_len > 0 && r->flash_len <= (int64)SES_FLASH_CAP) {
+    memcpy(&out->flash_in[0], &r->flash[0], r->flash_len);
+    out->flash_in_len = r->flash_len;
+    memset((rawptr)&r->flash[0], 0, (int64)SES_FLASH_CAP);
+    r->flash_len = 0;
+    rc = ses_store_put(m->store, r);
+    if (rc != SES_OK) {
+      memset((rawptr)out, 0, sizeof(SesSession));
+      return rc;
+    }
+  }
+  out->live = true;
+  return SES_OK;
+}
+
+/// Looks up the session for a presented token for a read-only view (for
+/// example a WebSocket page reading the session's values while the user's
+/// next page request still has to show the flash). Same checks and results
+/// as ses_lookup, but strictly read-only: it never takes pending flash out
+/// of the record (the next ses_lookup still gets it; the peeked session's
+/// ses_flash_count is 0), never deletes an expired record, never updates
+/// last_seen, and never writes to the store. The returned session is marked
+/// read-only: ses_save, ses_touch, ses_set_subject and ses_rotate refuse it
+/// with SES_E_ARG (ses_revoke still works), so a peek can never write stale
+/// state back over a newer record.
+/// in: m, an initialized manager; tok, the token text the client sent; now,
+///   unix seconds; out, receives the read-only session
+/// returns: SES_OK (out is live and read-only); SES_E_NOT_FOUND (unknown or
+///   malformed token); SES_E_EXPIRED (idle or absolute; the record is left
+///   in the store); SES_E_REVOKED; SES_E_ARG; SES_E_CRYPTO; or the store's
+///   error. On every other result out is zeroed
+/// owns: tok is borrowed; out is the caller's
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0; the store must be
+///   thread-safe if shared)
+/// example: var s: SesSession; if (ses_peek(&m, tok, now, &s) == SES_OK) { uid = ses_subject(&s); }
+export fn ses_peek(m: SesManager*, tok: string, now: int64, out: SesSession*) -> int32 {
+  if (m == 0 || out == 0 || !m->ready) { return SES_E_ARG; }
+  var rc: int32 = ses_lc_load(m, tok, now, out, false);
+  if (rc != SES_OK) { return rc; }
+  out->readonly = true;
+  out->live = true;
+  return SES_OK;
+}
+
+/// Views a live session's subject (the id given to ses_create).
+/// in: s, a session
+/// returns: the subject ("" when s is not live)
+/// owns: the view borrows s; copy it to keep it
+/// thread: any thread (pure)
+/// example: var uid: string = ses_subject(&s);
+export fn ses_subject(s: SesSession*) -> string {
+  if (s == 0 || !s->live) { return ""; }
+  return ses_record_subject(&s->rec);
+}
+
+/// Changes a live session's subject (the owner id), for a session that was
+/// anonymous when created and gains a user at login. Persisted by the next
+/// ses_save / ses_touch like other changes, after which ses_revoke_subject
+/// reaches it. Apps should rotate on login: use ses_rotate right after
+/// this (it also saves), so the pre-login token and CSRF token die and
+/// session fixation is closed.
+/// in: m, an initialized manager; s, a live session; subject,
+///   1..SES_SUBJECT_CAP bytes (the limit ses_create enforces)
+/// returns: SES_OK (s is dirty); SES_E_INVALID (s not live); SES_E_ARG (null
+///   pointer, manager not initialized, empty or oversized subject, or a
+///   read-only session from ses_peek); s is unchanged on error
+/// owns: subject is borrowed; it is copied into s
+/// thread: any thread (no crypto call)
+/// example: ses_set_subject(&m, &s, uid); ses_rotate(&m, &s, now, &t);  // on login
+export fn ses_set_subject(m: SesManager*, s: SesSession*, subject: string) -> int32 {
+  if (m == 0 || s == 0 || !m->ready) { return SES_E_ARG; }
+  if (!s->live) { return SES_E_INVALID; }
+  if (s->readonly) { return SES_E_ARG; }
+  if (subject.length == 0 || subject.length > (uint64)SES_SUBJECT_CAP) { return SES_E_ARG; }
+  ses_record_set_subject(&s->rec, subject);
+  s->dirty = true;
+  return SES_OK;
+}
+
+/// Reports whether a session handle is live (created or looked up, not
+/// revoked since).
+/// in: s, a session
+/// returns: true when live
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: if (!ses_is_live(&s)) { return login(); }
+export fn ses_is_live(s: SesSession*) -> bool {
+  if (s == 0) { return false; }
+  return s->live;
+}
+
+/// Writes a live session's changes (data, flash, touch) to the store if it
+/// has any. Call it at the end of a request; ses_touch calls it for you.
+/// in: m, an initialized manager; s, a live session
+/// returns: SES_OK (also when there was nothing to write); SES_E_INVALID (s
+///   not live); SES_E_ARG (also for a read-only session from ses_peek: it is
+///   never written); or the store's error (s stays dirty)
+/// owns: the store copies s->rec
+/// thread: any thread (the store must be thread-safe if shared)
+/// example: ses_data_set(&s, "cart", id); ses_save(&m, &s);
+export fn ses_save(m: SesManager*, s: SesSession*) -> int32 {
+  if (m == 0 || s == 0 || !m->ready) { return SES_E_ARG; }
+  if (!s->live) { return SES_E_INVALID; }
+  if (s->readonly) { return SES_E_ARG; }
+  if (!s->dirty) { return SES_OK; }
+  s->rec.expires = ses_record_deadline(m, &s->rec);
+  var rc: int32 = ses_store_put(m->store, &s->rec);
+  if (rc != SES_OK) { return rc; }
+  s->dirty = false;
+  s->saved_seen = s->rec.last_seen;
+  return SES_OK;
+}
+
+/// Records activity: extends the idle expiry to now + idle_timeout (never
+/// past the absolute expiry), then saves. The new last_seen is written
+/// only when touch_interval seconds have passed since the last write, so a
+/// busy session costs one store write per interval, not one per request.
+/// in: m, an initialized manager; s, a live session; now, unix seconds
+/// returns: as ses_save
+/// owns: as ses_save
+/// thread: any thread (the store must be thread-safe if shared)
+/// example: ses_touch(&m, &s, now);  // at the end of each request
+export fn ses_touch(m: SesManager*, s: SesSession*, now: int64) -> int32 {
+  if (m == 0 || s == 0 || !m->ready) { return SES_E_ARG; }
+  if (!s->live) { return SES_E_INVALID; }
+  if (s->readonly) { return SES_E_ARG; }
+  if (now - s->saved_seen >= m->cfg.touch_interval && now > s->rec.last_seen) {
+    s->rec.last_seen = now;
+    s->dirty = true;
+  }
+  return ses_save(m, s);
+}
+
+/// Seconds until a live session's absolute expiry: the Max-Age for its
+/// cookie (ses_cookie_format).
+/// in: m, an initialized manager; s, a session; now, unix seconds
+/// returns: seconds (>= 0; 0 when s is not live)
+/// owns: nothing
+/// thread: any thread (no crypto call)
+/// example: o.max_age = ses_max_age(&m, &s, now);
+export fn ses_max_age(m: SesManager*, s: SesSession*, now: int64) -> int64 {
+  if (m == 0 || s == 0 || !s->live) { return 0; }
+  var left: int64 = s->rec.abs_expires - now;
+  if (left < 0) { return 0; }
+  return left;
+}

@@ -1,0 +1,6 @@
+name = csv
+version = 0.1.0
+description = RFC 4180 CSV for Mettle: fast streaming reader, correct writer, dialects, typed rows
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Csv
+compiler = 0.18.0

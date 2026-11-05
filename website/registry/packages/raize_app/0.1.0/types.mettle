@@ -1,0 +1,230 @@
+// raize/app/types — what an app declared, recorded before anything runs.
+// reference: app
+// thread: built by the declaration function on the main thread; read-only once rz_run
+// starts serving.
+
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/config/config";
+import "raize_core/router/router";
+import "raize_core/server/server";
+import "raize_core/middleware/chain";
+import "raize_core/middleware/cors";
+import "raize_core/middleware/auth";
+import "raize_core/static/static";
+import "raize_realtime/hub/hub";
+import "raize_realtime/channel/channel";
+import "raize_signal/html";
+import "raize_resource/resource";
+
+/// internal: app. Most routes, defaults, Signals, layers and API mounts an app records.
+export const RZ__APP_MAX_ROUTES: int32 = 64;
+/// internal: app. Most rz_default calls.
+export const RZ__APP_MAX_DEFAULTS: int32 = 32;
+/// internal: app. Most Signals mounted.
+export const RZ__APP_MAX_SIGNALS: int32 = 16;
+/// internal: app. Most app-owned data layers and JSON API mounts.
+export const RZ__APP_MAX_LAYERS: int32 = 16;
+
+/// internal: app. One declared route.
+export struct Rz_Route {
+  verb: string;                         // "GET" ...; owned
+  path: string;                         // the pattern; owned
+  handler: fn(RzContext*) -> int32;     // the app's or generated handler
+}
+
+/// internal: app. One rz_default(key, value).
+export struct Rz_Default {
+  key: string;     // owned
+  value: string;   // owned
+}
+
+/// internal: app. One mounted Signal (registered on the channel router at derive).
+export struct Rz_SignalMount {
+  name: string;                                  // snake name, topic "signal:<name>"; owned
+  path: string;                                  // the page route; owned
+  head: string;                                  // extra <head> markup; owned
+  size: int64;                                   // sizeof the state struct
+  mount: fn(rawptr, RzConn*) -> int32;           // generated typed wrappers (A9)
+  handle: fn(rawptr, string, string) -> int32;
+  view: fn(rawptr) -> RzHtml*;
+  leave: fn(rawptr) -> void;
+}
+
+/// internal: app. Most static mounts, guards, channels, timers, middleware and
+/// rz_use_headers entries an app records.
+export const RZ__APP_MAX_STATICS: int32 = 8;
+/// internal: app. Most guards.
+export const RZ__APP_MAX_GUARDS: int32 = 16;
+/// internal: app. Most channel declarations.
+export const RZ__APP_MAX_CHANNELS: int32 = 16;
+/// internal: app. Most rz_every timers.
+export const RZ__APP_MAX_TIMERS: int32 = 16;
+/// internal: app. Most declared middleware (the chain holds 8 steps; recover is one).
+export const RZ__APP_MAX_MIDDLEWARE: int32 = 7;
+/// internal: app. Most rz_use_headers headers.
+export const RZ__APP_MAX_HEADERS: int32 = 8;
+
+/// internal: app. One rz_static mount.
+export struct Rz_StaticMount {
+  prefix: string;    // "/static"; owned
+  dir: string;       // cwd-relative directory; owned
+  files: RzStatic*;  // made at derive; owned
+}
+
+/// internal: app. One rz_guard.
+export struct Rz_Guard {
+  prefix: string;                  // "/app"; owned
+  check: fn(RzContext*) -> int32;  // RZ_OK continues, else the status it answered
+}
+
+/// internal: app, read by the channel wiring in app/run through rz__app_channels.
+/// One rz_channel declaration.
+export struct Rz_ChannelDecl {
+  pattern: string;                                // "room:*"; owned
+  join: fn(RzChanCtx*, string) -> int32;          // (ctx, payload)
+  handle_in: fn(RzChanCtx*, string, string) -> int32;  // (ctx, event, payload)
+  leave: fn(RzChanCtx*) -> void;
+}
+
+/// internal: app/timer. One rz_every timer.
+export struct Rz_Timer {
+  every_ms: int64;          // period
+  tick: fn(int64) -> void;  // called with 1, 2, 3, ...
+  next_ms: int64;           // monotonic deadline of the next call
+  n: int64;                 // calls made
+}
+
+/// internal: app/timer. Every timer, run by one timer thread.
+export struct Rz_Timers {
+  items: Rz_Timer[16];  // RZ__APP_MAX_TIMERS
+  count: int32;         // timers declared
+  stop: int32;          // 1 = the thread returns (atomic)
+}
+
+/// internal: app/use. One declared middleware step.
+export struct Rz_Middleware {
+  name: string;                                              // owned
+  step: fn(RzContext*, fn(RzContext*) -> int32) -> int32;    // calls next to continue
+}
+
+/// internal: app. Everything an app declared and derived; behind RzApp.
+export struct Rz_AppState {
+  name: string;                          // the program name, prefixes every message; borrowed (static)
+  errors: RzStrList*;                    // declaration and startup errors, "<what> — <fix>"; owned
+  routes: Rz_Route[64];                  // RZ__APP_MAX_ROUTES
+  nroutes: int32;                        // routes recorded
+  defaults: Rz_Default[32];              // RZ__APP_MAX_DEFAULTS
+  ndefaults: int32;                      // defaults recorded
+  signals: Rz_SignalMount[16];           // RZ__APP_MAX_SIGNALS
+  nsignals: int32;                       // Signals recorded
+  layers: rawptr[16];                    // app-owned RzDataLayer*, freed at exit
+  nlayers: int32;                        // layers recorded
+  apis: rawptr[16];                      // RzResourceDef* of each JSON API mount
+  napis: int32;                          // API mounts recorded
+  statics: Rz_StaticMount[8];            // RZ__APP_MAX_STATICS
+  nstatics: int32;                       // static mounts recorded
+  guards: Rz_Guard[16];                  // RZ__APP_MAX_GUARDS, declaration order
+  nguards: int32;                        // guards recorded
+  channels: Rz_ChannelDecl[16];          // RZ__APP_MAX_CHANNELS
+  nchannels: int32;                      // channels recorded
+  timers: Rz_Timers;                     // rz_every; run by one thread while serving
+  mws: Rz_Middleware[7];                 // RZ__APP_MAX_MIDDLEWARE, chain order
+  nmws: int32;                           // middleware recorded
+  headers: Rz_Default[8];                // rz_use_headers name/value pairs
+  nheaders: int32;                       // headers recorded
+  cors: RzCors*;                         // rz_use_cors; owned
+  auth: RzAuth*;                         // rz_use_bearer_auth; owned
+  config: RzConfig;                      // resolved at startup, then frozen
+  router: RzRouter*;                     // derived; owned
+  chain: RzChain*;                       // derived; owned
+  hub: RzHub*;                           // derived when a Signal or channel exists; owned
+  chans: RzChanRouter*;                  // derived with the hub; owned
+  server: RzServer*;                     // derived; owned
+}
+
+/// The app being declared. Opaque: an app receives the pointer in its declaration
+/// function and passes it to rz_* declaration calls; it never reads the field.
+export struct RzApp {
+  state: Rz_AppState*;   // owned; `impl` (A6) is a Mettle keyword
+}
+
+/// internal: app/declare, app/run. Records an error, "<what> — <fix>".
+/// in:      app the app; text the message (copied)
+/// returns: nothing
+/// owns:    copies `text`
+export fn rz__app_error(app: RzApp*, text: string) {
+  rz_strlist_push(app->state->errors, rz_str_dup(text));
+}
+
+/// internal: app/run. A zeroed app named `name`.
+/// in:      name the program name; static
+/// returns: the app, or 0 when out of memory
+/// owns:    the caller frees it with rz__app_free
+export fn rz__app_new(name: string) -> RzApp* {
+  var app: RzApp* = (RzApp*)calloc(1, sizeof(RzApp));
+  if (app == 0) { return 0; }
+  var st: Rz_AppState* = (Rz_AppState*)calloc(1, sizeof(Rz_AppState));
+  if (st == 0) { free((rawptr)app); return 0; }
+  app->state = st;
+  st->name = name;
+  st->errors = rz_strlist_new();
+  st->config = rz_config_default();
+  return app;
+}
+
+fn rz__app_free_lists(st: Rz_AppState*) {
+  for i in 0..st->nroutes {
+    rz_str_free(st->routes[i].verb);
+    rz_str_free(st->routes[i].path);
+  }
+  for i in 0..st->ndefaults {
+    rz_str_free(st->defaults[i].key);
+    rz_str_free(st->defaults[i].value);
+  }
+  for i in 0..st->nsignals {
+    rz_str_free(st->signals[i].name);
+    rz_str_free(st->signals[i].path);
+    rz_str_free(st->signals[i].head);
+  }
+  for i in 0..st->nstatics {
+    if (st->statics[i].files != 0) { rz_static_free(st->statics[i].files); }
+    rz_str_free(st->statics[i].prefix);
+    rz_str_free(st->statics[i].dir);
+  }
+  for i in 0..st->nguards { rz_str_free(st->guards[i].prefix); }
+  for i in 0..st->nchannels { rz_str_free(st->channels[i].pattern); }
+  for i in 0..st->nmws { rz_str_free(st->mws[i].name); }
+  for i in 0..st->nheaders {
+    rz_str_free(st->headers[i].key);
+    rz_str_free(st->headers[i].value);
+  }
+  for i in 0..st->errors->len { rz_str_free(st->errors->items[i]); }
+  rz_strlist_free(st->errors);
+}
+
+/// internal: app/run. Frees the app and everything it owns, in reverse order of
+/// creation. Call only after the server and the timer thread have stopped.
+/// in:      app the app; 0 is ignored
+/// returns: nothing
+/// owns:    takes `app`
+export fn rz__app_free(app: RzApp*) {
+  if (app == 0) { return; }
+  var st: Rz_AppState* = app->state;
+  if (st->server != 0) { rz_server_free(st->server); }
+  if (st->chain != 0) { rz_chain_free(st->chain); }
+  if (st->hub != 0) { rz_hub_stop(st->hub); }   // members are dropped after the hub stops
+  if (st->chans != 0) { rz_chan_router_free(st->chans); }
+  if (st->hub != 0) { rz_hub_free(st->hub); }
+  if (st->router != 0) { rz_router_free(st->router); }
+  if (st->auth != 0) { rz_auth_free(st->auth); }
+  if (st->cors != 0) {
+    rz_str_free(st->cors->origin);   // the copy rz_use_cors made
+    rz_cors_free(st->cors);
+  }
+  for i in 0..st->nlayers { rz_data_layer_free((RzDataLayer*)st->layers[i]); }
+  rz__app_free_lists(st);
+  free((rawptr)st);
+  free((rawptr)app);
+}

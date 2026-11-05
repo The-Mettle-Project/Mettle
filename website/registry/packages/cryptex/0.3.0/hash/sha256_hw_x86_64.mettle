@@ -1,0 +1,238 @@
+// SHA-256 compression on x86-64 with the SHA extensions (SHA-NI), chosen at
+// run time (crx_sha256_hw_available). The portable code in sha2.mettle stays
+// the fallback. Ported from the public-domain SHA-Intrinsics code by Jeffrey
+// Walton (sha256-x86.c, after Intel's sample by Sean Gulley): the state is
+// kept as ABEF and CDGH, sha256rnds2 does two rounds with the message words
+// in xmm0, and sha256msg1/sha256msg2 build the message schedule four words
+// at a time. The C intrinsics are written as assembly.
+//
+// The Mettle assembler does not know the SHA, pshufb, pshufd, palignr or
+// pblendw instructions, so those are db bytes from GNU as, with the
+// instruction beside each line. There is no branch, address or table lookup
+// that depends on the data, so this path is constant time.
+
+/// internal: 1 if this CPU has SHA-NI, SSSE3 and SSE4.1 (CPUID leaf 7 EBX
+/// bit 29, leaf 1 ECX bits 9 and 19), else 0.
+@naked export fn crx_sha256_hw_available() -> uint32 {
+  asm {
+    push rbx
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    xor r8d, r8d
+    and ecx, 0x00080200
+    cmp ecx, 0x00080200
+    jne done
+    mov eax, 7
+    xor ecx, ecx
+    cpuid
+    test ebx, 0x20000000
+    jz done
+    mov r8d, 1
+  done:
+    mov eax, r8d
+    pop rbx
+    ret
+  }
+}
+
+/// internal: runs the SHA-256 compression over nblocks 64-byte blocks of
+/// data, updating the 8-word chaining value h in place. k is the 64 round
+/// constants. Needs crx_sha256_hw_available() == 1.
+/// in: h 8 words; data readable for nblocks * 64 bytes; nblocks >= 0
+@naked export fn crx_sha256_hw_blocks(h: uint32*, data: uint8*, nblocks: int64, k: uint32*) {
+  asm {
+    test rdx, rdx
+    jz done
+    sub rsp, 16
+    mov rax, 0x0405060700010203
+    mov [rsp+0], rax
+    mov rax, 0x0c0d0e0f08090a0b
+    mov [rsp+8], rax
+    movdqu xmm8, [rsp]
+    add rsp, 16
+    movdqu xmm7, [rdi]
+    movdqu xmm2, [rdi+16]
+    db 0x66, 0x0f, 0x70, 0xff, 0xb1   ; pshufd xmm7, xmm7, 0xb1
+    db 0x66, 0x0f, 0x70, 0xd2, 0x1b   ; pshufd xmm2, xmm2, 0x1b
+    movdqa xmm1, xmm7
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xca, 0x08   ; palignr xmm1, xmm2, 8
+    db 0x66, 0x0f, 0x3a, 0x0e, 0xd7, 0xf0   ; pblendw xmm2, xmm7, 0xf0
+  next:
+    movdqa xmm9, xmm1
+    movdqa xmm10, xmm2
+    movdqu xmm3, [rsi+0]
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xd8   ; pshufb xmm3, xmm8
+    movdqu xmm0, [rcx+0]
+    paddd xmm0, xmm3
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    movdqu xmm4, [rsi+16]
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xe0   ; pshufb xmm4, xmm8
+    movdqu xmm0, [rcx+16]
+    paddd xmm0, xmm4
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xdc   ; sha256msg1 xmm3, xmm4
+    movdqu xmm5, [rsi+32]
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xe8   ; pshufb xmm5, xmm8
+    movdqu xmm0, [rcx+32]
+    paddd xmm0, xmm5
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xe5   ; sha256msg1 xmm4, xmm5
+    movdqu xmm6, [rsi+48]
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xf0   ; pshufb xmm6, xmm8
+    movdqu xmm0, [rcx+48]
+    paddd xmm0, xmm6
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm6
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfd, 0x04   ; palignr xmm7, xmm5, 4
+    paddd xmm3, xmm7
+    db 0x0f, 0x38, 0xcd, 0xde   ; sha256msg2 xmm3, xmm6
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xee   ; sha256msg1 xmm5, xmm6
+    movdqu xmm0, [rcx+64]
+    paddd xmm0, xmm3
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm3
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfe, 0x04   ; palignr xmm7, xmm6, 4
+    paddd xmm4, xmm7
+    db 0x0f, 0x38, 0xcd, 0xe3   ; sha256msg2 xmm4, xmm3
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xf3   ; sha256msg1 xmm6, xmm3
+    movdqu xmm0, [rcx+80]
+    paddd xmm0, xmm4
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm4
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfb, 0x04   ; palignr xmm7, xmm3, 4
+    paddd xmm5, xmm7
+    db 0x0f, 0x38, 0xcd, 0xec   ; sha256msg2 xmm5, xmm4
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xdc   ; sha256msg1 xmm3, xmm4
+    movdqu xmm0, [rcx+96]
+    paddd xmm0, xmm5
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm5
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfc, 0x04   ; palignr xmm7, xmm4, 4
+    paddd xmm6, xmm7
+    db 0x0f, 0x38, 0xcd, 0xf5   ; sha256msg2 xmm6, xmm5
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xe5   ; sha256msg1 xmm4, xmm5
+    movdqu xmm0, [rcx+112]
+    paddd xmm0, xmm6
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm6
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfd, 0x04   ; palignr xmm7, xmm5, 4
+    paddd xmm3, xmm7
+    db 0x0f, 0x38, 0xcd, 0xde   ; sha256msg2 xmm3, xmm6
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xee   ; sha256msg1 xmm5, xmm6
+    movdqu xmm0, [rcx+128]
+    paddd xmm0, xmm3
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm3
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfe, 0x04   ; palignr xmm7, xmm6, 4
+    paddd xmm4, xmm7
+    db 0x0f, 0x38, 0xcd, 0xe3   ; sha256msg2 xmm4, xmm3
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xf3   ; sha256msg1 xmm6, xmm3
+    movdqu xmm0, [rcx+144]
+    paddd xmm0, xmm4
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm4
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfb, 0x04   ; palignr xmm7, xmm3, 4
+    paddd xmm5, xmm7
+    db 0x0f, 0x38, 0xcd, 0xec   ; sha256msg2 xmm5, xmm4
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xdc   ; sha256msg1 xmm3, xmm4
+    movdqu xmm0, [rcx+160]
+    paddd xmm0, xmm5
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm5
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfc, 0x04   ; palignr xmm7, xmm4, 4
+    paddd xmm6, xmm7
+    db 0x0f, 0x38, 0xcd, 0xf5   ; sha256msg2 xmm6, xmm5
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xe5   ; sha256msg1 xmm4, xmm5
+    movdqu xmm0, [rcx+176]
+    paddd xmm0, xmm6
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm6
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfd, 0x04   ; palignr xmm7, xmm5, 4
+    paddd xmm3, xmm7
+    db 0x0f, 0x38, 0xcd, 0xde   ; sha256msg2 xmm3, xmm6
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xee   ; sha256msg1 xmm5, xmm6
+    movdqu xmm0, [rcx+192]
+    paddd xmm0, xmm3
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm3
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfe, 0x04   ; palignr xmm7, xmm6, 4
+    paddd xmm4, xmm7
+    db 0x0f, 0x38, 0xcd, 0xe3   ; sha256msg2 xmm4, xmm3
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    db 0x0f, 0x38, 0xcc, 0xf3   ; sha256msg1 xmm6, xmm3
+    movdqu xmm0, [rcx+208]
+    paddd xmm0, xmm4
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm4
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfb, 0x04   ; palignr xmm7, xmm3, 4
+    paddd xmm5, xmm7
+    db 0x0f, 0x38, 0xcd, 0xec   ; sha256msg2 xmm5, xmm4
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    movdqu xmm0, [rcx+224]
+    paddd xmm0, xmm5
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    movdqa xmm7, xmm5
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xfc, 0x04   ; palignr xmm7, xmm4, 4
+    paddd xmm6, xmm7
+    db 0x0f, 0x38, 0xcd, 0xf5   ; sha256msg2 xmm6, xmm5
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    movdqu xmm0, [rcx+240]
+    paddd xmm0, xmm6
+    db 0x0f, 0x38, 0xcb, 0xd1   ; sha256rnds2 xmm2, xmm1
+    db 0x66, 0x0f, 0x70, 0xc0, 0x0e   ; pshufd xmm0, xmm0, 0x0e
+    db 0x0f, 0x38, 0xcb, 0xca   ; sha256rnds2 xmm1, xmm2
+    paddd xmm1, xmm9
+    paddd xmm2, xmm10
+    add rsi, 64
+    dec rdx
+    jnz next
+    db 0x66, 0x0f, 0x70, 0xf9, 0x1b   ; pshufd xmm7, xmm1, 0x1b
+    db 0x66, 0x0f, 0x70, 0xd2, 0xb1   ; pshufd xmm2, xmm2, 0xb1
+    movdqa xmm1, xmm7
+    db 0x66, 0x0f, 0x3a, 0x0e, 0xca, 0xf0   ; pblendw xmm1, xmm2, 0xf0
+    db 0x66, 0x0f, 0x3a, 0x0f, 0xd7, 0x08   ; palignr xmm2, xmm7, 8
+    movdqu [rdi], xmm1
+    movdqu [rdi+16], xmm2
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    pxor xmm3, xmm3
+    pxor xmm4, xmm4
+    pxor xmm5, xmm5
+    pxor xmm6, xmm6
+    pxor xmm7, xmm7
+    pxor xmm8, xmm8
+    pxor xmm9, xmm9
+    pxor xmm10, xmm10
+  done:
+    ret
+  }
+}

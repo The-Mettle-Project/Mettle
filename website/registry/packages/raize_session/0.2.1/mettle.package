@@ -1,0 +1,9 @@
+name = raize_session
+version = 0.2.1
+description = Raize sessions: cookie middleware, CSRF guard, flash and Signal reads over the session library
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeSession
+compiler = 0.18.0
+require = raize_app 0.1.0
+require = raize_core 0.1.0
+require = cryptex 0.3.0

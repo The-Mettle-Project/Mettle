@@ -1,0 +1,109 @@
+// mythic_w_tooltip: delayed floating tooltip attached to the last item (DESIGN-SYSTEM §7.15, §6.2).
+import "mythic_base";
+import "mythic_types";
+import "mythic_ctx";
+import "mythic_anim";
+import "mythic_paint";
+import "mythic_layout";
+
+const TIP_Z: int32 = 1000000;
+// MythicWState.flags bits; i[0] = when the trigger began (us), i[1] = the frame it began in
+const TIP_SHOWN: int32 = 1;
+const TIP_DISMISSED: int32 = 2;
+
+/// Tooltip for the last interactive item (DESIGN-SYSTEM §7.15). Call it right after the item,
+/// every frame. It shows after the hover or keyboard-focus delay (at once in warm mode), below the
+/// item and flipped above or clamped to stay in the window, and hides on pointer leave, press,
+/// key press, scroll, Escape or window deactivation. Returns true while it shows or fades out.
+export fn mythic_tooltip(ui: MythicUi*, text: string) -> bool {
+  var target: MythicResp = ui->last;
+  var target_node: MythicNode* = ui->last_node;
+  if (target.id == 0 || text.length == (uint64)0) { return false; }
+  var t: MythicTheme* = mythic_theme(ui);
+  var m: MythicMotion* = &t->motion;
+  var c: MythicColors* = &t->colors;
+  var id: uint64 = mythic_hash_u64(target.id, (uint64)0x7469703A);
+  var st: MythicWState* = mythic_state(ui, id);
+  var now: int64 = ui->time_us;
+  var trig: bool = (target.hovered || (target.focused && ui->focus_visible)) && !ui->deactivated && ui->disabled_depth == 0;
+  var shown: bool = (st->flags & TIP_SHOWN) != 0;
+  // input is applied on the first pass only
+  var wheel: bool = false;
+  if (ui->pass == 0) {
+    wheel = ui->in.wheel.x != 0.0 || ui->in.wheel.y != 0.0 || ui->in.wheel_px.x != 0.0 || ui->in.wheel_px.y != 0.0;
+  }
+  // scrolling ends warm mode: items moving under a still pointer don't show theirs at once
+  if (wheel) { ui->tip_closed_us = 0; }
+  if (trig) {
+    if (st->i[0] == 0) { st->i[0] = now; st->i[1] = ui->frame; }
+    // a key press that started this trigger (the Tab that focused the item) does not count; one
+    // the item consumed (an arrow key on tabs) does
+    if (ui->pass == 0) {
+      var press: bool = ui->in.mouse_pressed[1] || ui->in.mouse_pressed[2] || ui->in.mouse_pressed[3] || target.pressed;
+      if (shown && mythic_key_consume(ui, MYTHIC_KEY_ESCAPE, -1)) { st->flags = st->flags | TIP_DISMISSED; }
+      if (press || wheel || (ui->in.key_downs > 0 && st->i[1] < ui->frame)) { st->flags = st->flags | TIP_DISMISSED; }
+    }
+  } else {
+    st->i[0] = 0;
+    st->flags = st->flags & ~TIP_DISMISSED;
+  }
+  var want: bool = false;
+  if (trig && (st->flags & TIP_DISMISSED) == 0) {
+    // warm mode: another tooltip is open or closed less than tooltip_warm_ms ago
+    var warm: bool = (ui->tip_open != 0 && ui->tip_open != id && ui->tip_open_frame >= ui->frame - 1) ||
+                     (ui->tip_closed_us != 0 && now - ui->tip_closed_us < (int64)(m->tooltip_warm_ms * 1000.0));
+    var due: int64 = st->i[0] + (int64)(m->tooltip_delay_ms * 1000.0);
+    if (shown || warm || now >= due) { want = true; }
+    else { mythic_request_frame_in(ui, (int32)((due - now + 999) / 1000)); }
+  }
+  if (want) {
+    st->flags = st->flags | TIP_SHOWN;
+    ui->tip_open = id;
+    ui->tip_open_frame = ui->frame;
+  } else if (shown) {
+    st->flags = st->flags & ~TIP_SHOWN;
+    if (!wheel) { ui->tip_closed_us = now; }
+    if (ui->tip_open == id) { ui->tip_open = 0; }
+  }
+  // in: 120 ms `out`, alpha and a 4 px move toward the item; out: 80 ms linear, alpha only
+  var a: float32 = 0.0;
+  var shift: float32 = 0.0;
+  if (want) {
+    a = mythic_anim_timed(ui, id, 0 | MYTHIC_ANIM_COLOR, 1.0, m->tooltip_in_ms, MYTHIC_CURVE_OUT);
+    if (!mythic_reduced_motion(ui)) { shift = m->tooltip_shift * (1.0 - a); }
+  } else {
+    a = mythic_anim_timed(ui, id, 0 | MYTHIC_ANIM_COLOR, 0.0, m->tooltip_out_ms, MYTHIC_CURVE_LINEAR);
+  }
+  if (a <= 0.0) { return want; }
+  var b: MythicBox;
+  b.id = id;
+  b.width.max = 280.0;
+  b.pad = mythic_pad_xy(8.0, 4.0);
+  b.bg = c->bg_tooltip;
+  b.radius = mythic_radius(t->radius.md);
+  if ((c->tooltip_border >> 24) != (uint32)0) { b.border_width = 1.0; b.border_color = c->tooltip_border; }
+  var e: MythicElevLevel = t->elevation.e3;
+  if (e.count > 0) { b.shadow = e.s[0]; }
+  if (e.count > 1) { b.shadow2 = e.s[1]; }
+  b.floating.attach = MYTHIC_ATTACH_ELEMENT;
+  b.floating.target = target.id;
+  b.floating.self_anchor = 1;
+  b.floating.target_anchor = 7;
+  b.floating.dy = 6.0;
+  b.floating.z = TIP_Z;
+  b.floating.flip_y = true;
+  b.floating.passthrough = true;
+  b.floating.clamp_margin = 8.0;
+  mythic_opacity_push(ui, a);
+  mythic_box_begin(ui, b);
+  ui->cur->float_shift = shift;
+  var ts: MythicTextStyle = t->type.caption_strong;
+  ts.flags = MYTHIC_TEXT_WRAP;
+  mythic_text(ui, text, ts, c->text_tooltip);
+  mythic_end(ui);
+  mythic_opacity_pop(ui);
+  // the tooltip is not an item: later calls still see the target
+  ui->last = target;
+  ui->last_node = target_node;
+  return true;
+}

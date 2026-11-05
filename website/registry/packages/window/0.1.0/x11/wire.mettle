@@ -1,0 +1,774 @@
+// x11/wire: an X11 client over a Unix socket, written from the X Window System
+// Protocol specification (X11R7, "X Window System Protocol, Version 11").
+// No libX11 or xcb: raw syscalls, our own request encoding and reply parsing.
+//
+// Everything the server sends is checked against the bytes actually read, so a
+// broken or hostile server can end the connection but cannot crash the program.
+import "std/mem";
+import "../core/types.mettle";
+
+const X_RBUF = 65536;
+const X_RQCAP = 2048;            // parked event packets
+export const WINDOW_X11_EV_SIZE = 128;  // bytes kept per parked event (GenericEvent bodies are cut there)
+
+/// The connection. One per process (g_x11).
+export struct WindowX11 {
+  fd: int64;
+  dead: bool;
+  seq: int64;
+  setup: uint8*;
+  setup_len: int64;
+  id_base: int64; id_mask: int64; id_next: int64;
+  max_req: int64;                  // in 4-byte units
+  root: int64; root_visual: int64; root_depth: int64;
+  screen_w: int64; screen_h: int64; screen_mm_w: int64; screen_mm_h: int64;
+  argb_visual: int64;              // a 32-bit TrueColor visual, 0 when none
+  blit_ok: bool;                   // root visual is 24/32-bit TrueColor, 32 bpp, BGRX
+  min_kc: int64; max_kc: int64;
+  keymap: uint8*; keymap_len: int64; kspk: int64;
+  numlock_mask: int64; modeswitch_mask: int64; level3_mask: int64;
+  rbuf: uint8*; rpos: int64; rlen: int64;
+  rq: uint8*; rq_head: int64; rq_tail: int64;
+  err_code: int64; err_seq: int64; quiet_from: int64; quiet_to: int64;
+  last_time: int64;
+  scale: float32;
+  display_name: uint8[64];
+  helper: int64;                   // hidden window that owns selections
+  have_wm: bool;
+  xkb_ok: bool; xkb_major: int64; xkb_event: int64;
+  xi_ok: bool; xi_opcode: int64;
+  randr_ok: bool; randr_major: int64; randr_event: int64;
+  render_ok: bool; render_major: int64; argb_format: int64;
+  font_cursors: int64[16];
+  blank_cursor: int64;
+  // atoms
+  a_protocols: int64; a_delete: int64; a_ping: int64; a_net_wm_name: int64; a_net_icon_name: int64;
+  a_utf8: int64; a_wm_state: int64; a_change_state: int64; a_state: int64; a_fullscreen: int64;
+  a_max_v: int64; a_max_h: int64; a_hidden: int64; a_above: int64; a_attention: int64;
+  a_active: int64; a_pid: int64; a_icon: int64; a_motif: int64; a_bypass: int64;
+  a_wm_check: int64; a_fs_monitors: int64; a_workarea: int64; a_supported: int64;
+  a_clipboard: int64; a_targets: int64; a_text: int64; a_incr: int64; a_sel: int64;
+  a_xdnd_aware: int64; a_xdnd_enter: int64; a_xdnd_position: int64; a_xdnd_status: int64;
+  a_xdnd_leave: int64; a_xdnd_drop: int64; a_xdnd_finished: int64; a_xdnd_selection: int64;
+  a_xdnd_copy: int64; a_xdnd_typelist: int64; a_uri_list: int64; a_text_plain_utf8: int64; a_text_plain: int64;
+  a_dnd_prop: int64; a_resource_manager: int64; a_net_wm_type: int64; a_type_normal: int64;
+  a_frame_extents: int64; a_clipboard_manager: int64; a_save_targets: int64;
+  // clipboard
+  clip: uint8*; clip_len: int64; own_clip: bool; own_primary: bool; own_time: int64;
+}
+
+export var g_x11: WindowX11;
+
+// ---------- socket I/O ----------
+fn poll_one(fd: int64, events: int64, timeout_ms: int64) -> int64 {
+  var pfd: uint8[8];
+  window_wr32(&pfd[0], 0, fd); window_wr16(&pfd[0], 4, events); window_wr16(&pfd[0], 6, 0);
+  return syscall(7, &pfd[0], 1, timeout_ms);
+}
+
+fn write_all(p: uint8*, n: int64) -> bool {
+  if (g_x11.dead) { return false; }
+  var done: int64 = 0;
+  while (done < n) {
+    // sendto with MSG_NOSIGNAL: a vanished server gives EPIPE, not a fatal SIGPIPE
+    var r: int64 = syscall(44, g_x11.fd, &p[done], n - done, 0x4000, 0, 0);
+    if (r == -4) { continue; }
+    if (r == -11) { poll_one(g_x11.fd, 4, 100); continue; }
+    if (r <= 0) { g_x11.dead = true; return false; }
+    done = done + r;
+  }
+  return true;
+}
+
+/// Sends one request; returns its sequence number (16 bits).
+export fn window_x11_send(p: uint8*, n: int64) -> int64 {
+  write_all(p, n);
+  g_x11.seq = (g_x11.seq + 1) & 65535;
+  return g_x11.seq;
+}
+
+/// Waits up to timeout_ms for the socket to be readable (true when it is, or data is buffered).
+export fn window_x11_readable(timeout_ms: int64) -> bool {
+  if (g_x11.dead) { return false; }
+  if (g_x11.rpos < g_x11.rlen) { return true; }
+  return poll_one(g_x11.fd, 1, timeout_ms) > 0;
+}
+
+fn read_exact(dst: uint8*, n: int64) -> bool {
+  var got: int64 = 0;
+  while (got < n) {
+    if (g_x11.dead) { return false; }
+    if (g_x11.rpos == g_x11.rlen) {
+      g_x11.rpos = 0;
+      g_x11.rlen = 0;
+      var r: int64 = syscall(0, g_x11.fd, g_x11.rbuf, X_RBUF);
+      if (r == -4) { continue; }
+      if (r == -11) { poll_one(g_x11.fd, 1, 1000); continue; }
+      if (r <= 0) { g_x11.dead = true; return false; }
+      g_x11.rlen = r;
+    }
+    var take: int64 = g_x11.rlen - g_x11.rpos;
+    if (take > n - got) { take = n - got; }
+    for i: int64 in 0..take { dst[got + i] = g_x11.rbuf[g_x11.rpos + i]; }
+    g_x11.rpos = g_x11.rpos + take;
+    got = got + take;
+  }
+  return true;
+}
+
+fn skip_bytes(n: int64) -> bool {
+  var tmp: uint8[256];
+  var left: int64 = n;
+  while (left > 0) {
+    var k: int64 = left;
+    if (k > 256) { k = 256; }
+    if (!read_exact(&tmp[0], k)) { return false; }
+    left = left - k;
+  }
+  return true;
+}
+
+// Reads one packet. The first 32 bytes go to hdr (sized WINDOW_X11_EV_SIZE). A reply
+// is returned whole in a malloc'd block; for an event or error the result is 0.
+// GenericEvents (code 35) keep up to WINDOW_X11_EV_SIZE bytes in hdr and the rest is skipped.
+const X_MAX_REPLY: int64 = 268435456;   // 256 MB: anything larger is a broken server
+fn read_packet(hdr: uint8*) -> uint8* {
+  if (!read_exact(hdr, 32)) { return (uint8*)0; }
+  var t: int64 = (int64)hdr[0] & 127;
+  if (t == 1) {
+    var extra: int64 = window_rd32(hdr, 4) * 4;
+    if (extra < 0 || extra > X_MAX_REPLY) { g_x11.dead = true; return (uint8*)0; }
+    var p: uint8* = (uint8*)malloc(32 + extra + 1);
+    for i: int64 in 0..32 { p[i] = hdr[i]; }
+    if (extra > 0 && !read_exact(&p[32], extra)) { free(p); return (uint8*)0; }
+    p[32 + extra] = (uint8)0;
+    return p;
+  }
+  if (t == 35) {
+    var extra2: int64 = window_rd32(hdr, 4) * 4;
+    if (extra2 < 0 || extra2 > X_MAX_REPLY) { g_x11.dead = true; return (uint8*)0; }
+    var keep: int64 = extra2;
+    if (keep > WINDOW_X11_EV_SIZE - 32) { keep = WINDOW_X11_EV_SIZE - 32; }
+    if (keep > 0 && !read_exact(&hdr[32], keep)) { return (uint8*)0; }
+    for i: int64 in 32 + keep..WINDOW_X11_EV_SIZE { hdr[i] = (uint8)0; }
+    skip_bytes(extra2 - keep);
+  }
+  return (uint8*)0;
+}
+
+/// The length of a reply returned by window_x11_wait_reply (32 + extra).
+export fn window_x11_reply_len(p: uint8*) -> int64 { return 32 + window_rd32(p, 4) * 4; }
+
+fn rq_push(e: uint8*) {
+  if (g_x11.rq_tail - g_x11.rq_head >= X_RQCAP) { return; }
+  var slot: int64 = (g_x11.rq_tail % X_RQCAP) * WINDOW_X11_EV_SIZE;
+  for i: int64 in 0..WINDOW_X11_EV_SIZE { g_x11.rq[slot + i] = e[i]; }
+  g_x11.rq_tail = g_x11.rq_tail + 1;
+}
+
+/// Takes the oldest parked event (WINDOW_X11_EV_SIZE bytes into e).
+export fn window_x11_rq_pop(e: uint8*) -> bool {
+  if (g_x11.rq_head == g_x11.rq_tail) { return false; }
+  var slot: int64 = (g_x11.rq_head % X_RQCAP) * WINDOW_X11_EV_SIZE;
+  for i: int64 in 0..WINDOW_X11_EV_SIZE { e[i] = g_x11.rq[slot + i]; }
+  g_x11.rq_head = g_x11.rq_head + 1;
+  return true;
+}
+
+/// A pointer to the next parked event without taking it, or 0.
+export fn window_x11_rq_peek() -> uint8* {
+  if (g_x11.rq_head == g_x11.rq_tail) { return (uint8*)0; }
+  return &g_x11.rq[(g_x11.rq_head % X_RQCAP) * WINDOW_X11_EV_SIZE];
+}
+
+fn note_error(e: uint8*) {
+  g_x11.err_code = (int64)e[1];
+  g_x11.err_seq = window_rd16(e, 2);
+}
+
+// Handler for selection traffic while waiting (set by x11/select so a paste from
+// another client is answered even while we wait for a reply of our own).
+export var g_x11_sel_hook: fn(uint8*) -> bool;
+
+fn park(e: uint8*) {
+  var t: int64 = (int64)e[0] & 127;
+  if (t == 0) { note_error(e); return; }
+  if ((t == 29 || t == 30) && g_x11_sel_hook != 0) {
+    if (g_x11_sel_hook(e)) { return; }
+  }
+  rq_push(e);
+}
+
+/// Waits for the reply to request `seq`. Events read meanwhile are parked.
+/// Returns 0 when the request failed (an X error) or the connection died.
+export fn window_x11_wait_reply(seq: int64) -> uint8* {
+  var hdr: uint8[128];
+  while (!g_x11.dead) {
+    var p: uint8* = read_packet(&hdr[0]);
+    if (g_x11.dead) { if (p != 0) { free(p); } break; }
+    if (p != 0) {
+      if (window_rd16(p, 2) == seq) { return p; }
+      free(p);
+    } else {
+      var t: int64 = (int64)hdr[0];
+      park(&hdr[0]);
+      if (t == 0 && window_rd16(&hdr[0], 2) == seq) { return (uint8*)0; }
+    }
+  }
+  return (uint8*)0;
+}
+
+/// Reads whatever the server has sent, without waiting, into the event queue.
+export fn window_x11_read_pending() {
+  var hdr: uint8[128];
+  while (!g_x11.dead && window_x11_readable(0)) {
+    var p: uint8* = read_packet(&hdr[0]);
+    if (p != 0) { free(p); continue; }
+    if (g_x11.dead) { break; }
+    park(&hdr[0]);
+  }
+}
+
+/// Round trip: when it returns, the server has handled every earlier request.
+export fn window_x11_sync() {
+  var r: uint8[4];
+  r[0] = (uint8)43; r[1] = (uint8)0; window_wr16(&r[0], 2, 1);   // GetInputFocus
+  var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 4));
+  if (p != 0) { free(p); }
+}
+
+/// A new resource id (window, pixmap, cursor, ...).
+export fn window_x11_new_id() -> int64 {
+  var id: int64 = g_x11.id_base | (g_x11.id_next & g_x11.id_mask);
+  g_x11.id_next = g_x11.id_next + 1;
+  return id;
+}
+
+// ---------- connection ----------
+fn try_connect(path: uint8*, plen: int64, abstract: bool) -> bool {
+  var fd: int64 = syscall(41, 1, 1 | 524288, 0);   // socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC)
+  if (fd < 0) { return false; }
+  var addr: uint8[110];
+  window_zero(&addr[0], 110);
+  addr[0] = (uint8)1;
+  var o: int64 = 2;
+  if (abstract) { o = 3; }
+  for i: int64 in 0..plen { addr[o + i] = path[i]; }
+  var alen: int64 = o + plen;
+  if (!abstract) { alen = alen + 1; }
+  var rc: int64 = syscall(42, fd, &addr[0], alen);
+  if (rc < 0) { syscall(3, fd); return false; }
+  g_x11.fd = fd;
+  return true;
+}
+
+fn read_file(path: uint8*, plen: int64, out: WindowBytes*) -> bool {
+  var cpath: uint8* = (uint8*)malloc(plen + 1);
+  for i: int64 in 0..plen { cpath[i] = path[i]; }
+  cpath[plen] = (uint8)0;
+  var fd: int64 = syscall(2, cpath, 524288, 0);
+  free(cpath);
+  if (fd < 0) { return false; }
+  var cap: int64 = 4096;
+  var len: int64 = 0;
+  var buf: uint8* = (uint8*)malloc(cap);
+  while (len < 16777216) {
+    if (len == cap) {
+      var nb: uint8* = (uint8*)malloc(cap * 2);
+      for i: int64 in 0..len { nb[i] = buf[i]; }
+      free(buf);
+      buf = nb;
+      cap = cap * 2;
+    }
+    var r: int64 = syscall(0, fd, &buf[len], cap - len);
+    if (r == -4) { continue; }
+    if (r <= 0) { break; }
+    len = len + r;
+  }
+  syscall(3, fd);
+  out->data = buf;
+  out->len = len;
+  return true;
+}
+
+fn rdbe16(b: uint8*, o: int64) -> int64 { return ((int64)b[o] << 8) | (int64)b[o + 1]; }
+
+// Finds the MIT-MAGIC-COOKIE-1 for display `num` in the Xauthority file
+// (format: Xau, from libXau's AuthRead). 16 bytes into cookie.
+fn find_cookie(xauth: string, home: string, num: uint8*, nlen: int64, cookie: uint8*) -> bool {
+  var pbuf: uint8[512];
+  var plen: int64 = 0;
+  if (xauth.length > 0 && xauth.length < 500) {
+    for i: int64 in 0..(int64)xauth.length { pbuf[i] = xauth.chars[i]; }
+    plen = (int64)xauth.length;
+  } else if (home.length > 0 && home.length < 480) {
+    var suffix: string = "/.Xauthority";
+    for i: int64 in 0..(int64)home.length { pbuf[i] = home.chars[i]; }
+    for i: int64 in 0..(int64)suffix.length { pbuf[(int64)home.length + i] = suffix.chars[i]; }
+    plen = (int64)home.length + (int64)suffix.length;
+  } else {
+    return false;
+  }
+  var f: WindowBytes;
+  if (!read_file(&pbuf[0], plen, &f)) { return false; }
+  var uts: uint8[390];
+  window_zero(&uts[0], 390);
+  syscall(63, &uts[0]);                     // uname: nodename at offset 65
+  var host: uint8* = &uts[65];
+  var hlen: int64 = 0;
+  while (hlen < 64 && host[hlen] != (uint8)0) { hlen = hlen + 1; }
+  var mname: string = "MIT-MAGIC-COOKIE-1";
+  var best: int32 = 0;                      // 2 = this host, 1 = any host
+  var o: int64 = 0;
+  while (o + 2 <= f.len && best < 2) {
+    var family: int64 = rdbe16(f.data, o);
+    var fl: int64[4];
+    var fo: int64[4];
+    var p: int64 = o + 2;
+    var ok: bool = true;
+    for k in 0..4 {
+      if (p + 2 > f.len) { ok = false; break; }
+      fl[k] = rdbe16(f.data, p);
+      fo[k] = p + 2;
+      p = p + 2 + fl[k];
+      if (p > f.len) { ok = false; break; }
+    }
+    if (!ok) { break; }
+    o = p;
+    var name_ok: bool = fl[2] == (int64)mname.length && fl[3] == 16;
+    if (name_ok) { for k: int64 in 0..fl[2] { if (f.data[fo[2] + k] != mname.chars[k]) { name_ok = false; } } }
+    var num_ok: bool = fl[1] == 0 || fl[1] == nlen;
+    if (num_ok) { for k: int64 in 0..fl[1] { if (f.data[fo[1] + k] != num[k]) { num_ok = false; } } }
+    if (!name_ok || !num_ok) { continue; }
+    var rank: int32 = 0;
+    if (family == 65535) { rank = 1; }
+    if (family == 256 && fl[0] == hlen) {
+      var same: bool = true;
+      for k: int64 in 0..hlen { if (f.data[fo[0] + k] != host[k]) { same = false; } }
+      if (same) { rank = 2; }
+    }
+    if (rank > best) {
+      best = rank;
+      for k: int64 in 0..16 { cookie[k] = f.data[fo[3] + k]; }
+    }
+  }
+  free(f.data);
+  return best > 0;
+}
+
+// Parses the setup reply. Every offset is checked against the length read.
+/// Parses the connection setup reply (exported for the fuzz tests).
+export fn window_x11_parse_setup(s: uint8*, n: int64) -> bool {
+  if (n < 40) { return false; }
+  g_x11.id_base = window_rd32(s, 12);
+  g_x11.id_mask = window_rd32(s, 16);
+  g_x11.max_req = window_rd16(s, 26);
+  g_x11.min_kc = (int64)s[34];
+  g_x11.max_kc = (int64)s[35];
+  if (g_x11.max_kc < g_x11.min_kc) { return false; }
+  var image_lsb: bool = s[30] == (uint8)0;
+  var nformats: int64 = (int64)s[29];
+  var fo: int64 = 40 + window_pad4(window_rd16(s, 24));
+  var off: int64 = fo + nformats * 8;
+  if (off + 40 > n) { return false; }
+  g_x11.root = window_rd32(s, off);
+  g_x11.screen_w = window_rd16(s, off + 20);
+  g_x11.screen_h = window_rd16(s, off + 22);
+  g_x11.screen_mm_w = window_rd16(s, off + 24);
+  g_x11.screen_mm_h = window_rd16(s, off + 26);
+  g_x11.root_visual = window_rd32(s, off + 32);
+  g_x11.root_depth = (int64)s[off + 38];
+  var bpp32: bool = false;
+  for k: int64 in 0..nformats {
+    if (fo + k * 8 + 2 > n) { return false; }
+    if ((int64)s[fo + k * 8] == g_x11.root_depth && s[fo + k * 8 + 1] == (uint8)32) { bpp32 = true; }
+  }
+  var root_ok: bool = false;
+  var ndepths: int64 = (int64)s[off + 39];
+  var d: int64 = off + 40;
+  for k: int64 in 0..ndepths {
+    if (d + 8 > n) { return false; }
+    var dd: int64 = (int64)s[d];
+    var nv: int64 = window_rd16(s, d + 2);
+    var v: int64 = d + 8;
+    for j: int64 in 0..nv {
+      if (v + 24 > n) { return false; }
+      var vid: int64 = window_rd32(s, v);
+      var truecolor: bool = s[v + 4] == (uint8)4;
+      var rgb: bool = window_rd32(s, v + 8) == 0xFF0000 && window_rd32(s, v + 12) == 0xFF00 && window_rd32(s, v + 16) == 0xFF;
+      if (vid == g_x11.root_visual && dd == g_x11.root_depth) { root_ok = truecolor && rgb; }
+      if (dd == 32 && truecolor && rgb && g_x11.argb_visual == 0) { g_x11.argb_visual = vid; }
+      v = v + 24;
+    }
+    d = v;
+  }
+  g_x11.blit_ok = image_lsb && bpp32 && root_ok && (g_x11.root_depth == 24 || g_x11.root_depth == 32);
+  return true;
+}
+
+/// Connects to the X server named by `display` (":0", "unix:1", ":97.0").
+/// xauth / home are $XAUTHORITY and $HOME ("" when unset).
+export fn window_x11_connect(display: string, xauth: string, home: string) -> bool {
+  var empty: WindowX11;
+  g_x11 = empty;
+  g_x11.fd = -1;
+  g_x11.scale = 1.0;
+  var dn: int64 = (int64)display.length;
+  if (dn == 0) { window_set_error("DISPLAY is not set"); return false; }
+  if (dn > 63) { window_set_error("DISPLAY is too long"); return false; }
+  for i: int64 in 0..dn { g_x11.display_name[i] = display.chars[i]; }
+  g_x11.display_name[dn] = (uint8)0;
+  var colon: int64 = -1;
+  for i: int64 in 0..dn { if (display.chars[i] == (uint8)58) { colon = i; } }
+  if (colon < 0) { window_set_error("cannot parse DISPLAY"); return false; }
+  var host_ok: bool = colon == 0;
+  if (colon == 4 && display.chars[0] == (uint8)117 && display.chars[1] == (uint8)110 && display.chars[2] == (uint8)105 && display.chars[3] == (uint8)120) { host_ok = true; }
+  if (!host_ok) { window_set_error("only local X11 displays (:N or unix:N) are supported"); return false; }
+  var num: uint8[16];
+  var nlen: int64 = 0;
+  var i: int64 = colon + 1;
+  while (i < dn && display.chars[i] >= (uint8)48 && display.chars[i] <= (uint8)57 && nlen < 15) { num[nlen] = display.chars[i]; nlen = nlen + 1; i = i + 1; }
+  if (nlen == 0) { window_set_error("cannot parse the DISPLAY number"); return false; }
+  var prefix: string = "/tmp/.X11-unix/X";
+  var path: uint8[64];
+  var plen: int64 = (int64)prefix.length;
+  for k: int64 in 0..plen { path[k] = prefix.chars[k]; }
+  for k: int64 in 0..nlen { path[plen + k] = num[k]; }
+  plen = plen + nlen;
+  if (!try_connect(&path[0], plen, true) && !try_connect(&path[0], plen, false)) {
+    window_set_error("cannot connect to the X server");
+    return false;
+  }
+  g_x11.rbuf = (uint8*)malloc(X_RBUF);
+  g_x11.rq = (uint8*)malloc(X_RQCAP * WINDOW_X11_EV_SIZE);
+  var cookie: uint8[16];
+  var have_cookie: bool = find_cookie(xauth, home, &num[0], nlen, &cookie[0]);
+  var req: uint8[48];
+  window_zero(&req[0], 48);
+  req[0] = (uint8)108;                       // 'l': little-endian
+  window_wr16(&req[0], 2, 11);
+  var rlen: int64 = 12;
+  if (have_cookie) {
+    var mname: string = "MIT-MAGIC-COOKIE-1";
+    window_wr16(&req[0], 6, 18);
+    window_wr16(&req[0], 8, 16);
+    for k: int64 in 0..18 { req[12 + k] = mname.chars[k]; }
+    for k: int64 in 0..16 { req[32 + k] = cookie[k]; }
+    rlen = 48;
+  }
+  write_all(&req[0], rlen);
+  var head: uint8[8];
+  if (!read_exact(&head[0], 8)) { window_set_error("the X server closed the connection during setup"); window_x11_disconnect(); return false; }
+  var extra: int64 = window_rd16(&head[0], 6) * 4;
+  var s: uint8* = (uint8*)malloc(8 + extra + 1);
+  for k: int64 in 0..8 { s[k] = head[k]; }
+  if (!read_exact(&s[8], extra)) { free(s); window_set_error("the X server closed the connection during setup"); window_x11_disconnect(); return false; }
+  g_x11.setup = s;
+  g_x11.setup_len = 8 + extra;
+  if (head[0] != (uint8)1) {
+    if (have_cookie) { window_set_error("the X server refused the connection"); }
+    else { window_set_error("the X server refused the connection (no MIT-MAGIC-COOKIE-1 in $XAUTHORITY or ~/.Xauthority)"); }
+    window_x11_disconnect();
+    return false;
+  }
+  if (!window_x11_parse_setup(s, 8 + extra)) { window_set_error("bad X setup reply"); window_x11_disconnect(); return false; }
+  return true;
+}
+
+export fn window_x11_disconnect() {
+  if (g_x11.fd >= 0) { syscall(3, g_x11.fd); }
+  g_x11.fd = -1;
+  if (g_x11.setup != 0) { free(g_x11.setup); g_x11.setup = (uint8*)0; }
+  if (g_x11.rbuf != 0) { free(g_x11.rbuf); g_x11.rbuf = (uint8*)0; }
+  if (g_x11.rq != 0) { free(g_x11.rq); g_x11.rq = (uint8*)0; }
+  if (g_x11.keymap != 0) { free(g_x11.keymap); g_x11.keymap = (uint8*)0; }
+  if (g_x11.clip != 0) { free(g_x11.clip); g_x11.clip = (uint8*)0; }
+  g_x11.dead = true;
+}
+
+// ---------- common requests ----------
+/// Starts a request in buf: opcode, data byte and length in 4-byte units.
+export fn window_x11_req(b: uint8*, op: int64, data: int64, bytes: int64) {
+  window_zero(b, bytes);
+  b[0] = (uint8)op; b[1] = (uint8)data;
+  window_wr16(b, 2, bytes / 4);
+}
+
+/// Sends InternAtom for every name, then collects the replies (one round trip).
+export fn window_x11_intern_many(names: string[], out: int64*) {
+  var seqs: int64[96];
+  var n: int64 = (int64)names.length;
+  if (n > 96) { n = 96; }
+  for i: int64 in 0..n {
+    var name: string = names[i];
+    var nl: int64 = (int64)name.length;
+    if (nl > 200) { nl = 200; }
+    var len: int64 = 8 + window_pad4(nl);
+    var r: uint8[208];
+    window_x11_req(&r[0], 16, 0, len);
+    window_wr16(&r[0], 4, nl);
+    for k: int64 in 0..nl { r[8 + k] = name.chars[k]; }
+    seqs[i] = window_x11_send(&r[0], len);
+  }
+  for i: int64 in 0..n {
+    var p: uint8* = window_x11_wait_reply(seqs[i]);
+    out[i] = 0;
+    if (p != 0) { out[i] = window_rd32(p, 8); free(p); }
+  }
+}
+
+export fn window_x11_intern(name: string, only_if_exists: bool) -> int64 {
+  var nl: int64 = (int64)name.length;
+  if (nl > 200) { return 0; }
+  var len: int64 = 8 + window_pad4(nl);
+  var r: uint8[208];
+  var flag: int64 = 0;
+  if (only_if_exists) { flag = 1; }
+  window_x11_req(&r[0], 16, flag, len);
+  window_wr16(&r[0], 4, nl);
+  for k: int64 in 0..nl { r[8 + k] = name.chars[k]; }
+  var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], len));
+  if (p == 0) { return 0; }
+  var atom: int64 = window_rd32(p, 8);
+  free(p);
+  return atom;
+}
+
+/// ChangeProperty (mode 0 = replace, 2 = append). nbytes is the data size in bytes.
+export fn window_x11_change_property(win: int64, prop: int64, ptype: int64, format: int64, data: uint8*, nbytes: int64, mode: int64) {
+  var len: int64 = 24 + window_pad4(nbytes);
+  if (len / 4 > g_x11.max_req) { return; }
+  var r: uint8* = (uint8*)malloc(len);
+  window_x11_req(r, 18, mode, len);
+  window_wr32(r, 4, win); window_wr32(r, 8, prop); window_wr32(r, 12, ptype);
+  r[16] = (uint8)format;
+  window_wr32(r, 20, nbytes / (format / 8));
+  for i: int64 in 0..nbytes { r[24 + i] = data[i]; }
+  window_x11_send(r, len);
+  free(r);
+}
+
+export fn window_x11_set_atoms(win: int64, prop: int64, atoms: int64*, n: int64) {
+  var b: uint8[64];
+  var k: int64 = n;
+  if (k > 16) { k = 16; }
+  for i: int64 in 0..k { window_wr32(&b[0], i * 4, atoms[i]); }
+  window_x11_change_property(win, prop, 4, 32, &b[0], k * 4, 0);
+}
+
+export fn window_x11_delete_property(win: int64, prop: int64) {
+  var r: uint8[12];
+  window_x11_req(&r[0], 19, 0, 12);
+  window_wr32(&r[0], 4, win); window_wr32(&r[0], 8, prop);
+  window_x11_send(&r[0], 12);
+}
+
+/// Reads a whole property (any type) into out (malloc'd, nul-terminated).
+/// ptype gets its type and format its format (8, 16 or 32). False when absent.
+export fn window_x11_get_property(win: int64, prop: int64, delete: bool, out: WindowBytes*, ptype: int64*, format: int64*) -> bool {
+  var cap: int64 = 64;
+  out->data = (uint8*)malloc(cap);
+  out->data[0] = (uint8)0;
+  out->len = 0;
+  var off: int64 = 0;
+  var found: bool = false;
+  var guard: int32 = 0;
+  while (guard < 64) {
+    guard = guard + 1;
+    var r: uint8[24];
+    var del: int64 = 0;
+    if (delete) { del = 1; }
+    window_x11_req(&r[0], 20, del, 24);
+    window_wr32(&r[0], 4, win); window_wr32(&r[0], 8, prop); window_wr32(&r[0], 12, 0);
+    window_wr32(&r[0], 16, off); window_wr32(&r[0], 20, 1048576);
+    var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 24));
+    if (p == 0) { break; }
+    var plen: int64 = window_x11_reply_len(p);
+    var fmt: int64 = (int64)p[1];
+    *ptype = window_rd32(p, 8);
+    *format = fmt;
+    if (*ptype == 0) { free(p); break; }
+    found = true;
+    var unit: int64 = fmt / 8;
+    var n: int64 = window_rd32(p, 16) * unit;
+    if (unit == 0 || n < 0 || 32 + n > plen) { free(p); break; }
+    if (out->len + n + 1 > cap) {
+      var nc: int64 = cap * 2;
+      if (nc < out->len + n + 1) { nc = out->len + n + 1; }
+      var nb: uint8* = (uint8*)malloc(nc);
+      for i: int64 in 0..out->len { nb[i] = out->data[i]; }
+      free(out->data);
+      out->data = nb;
+      cap = nc;
+    }
+    for i: int64 in 0..n { out->data[out->len + i] = p[32 + i]; }
+    out->len = out->len + n;
+    out->data[out->len] = (uint8)0;
+    var after: int64 = window_rd32(p, 12);
+    free(p);
+    if (after == 0 || n == 0) { break; }
+    off = off + n / 4;
+  }
+  if (!found) { free(out->data); out->data = (uint8*)0; out->len = 0; }
+  return found;
+}
+
+/// QueryExtension: returns the major opcode (0 when absent); first event and error codes out.
+export fn window_x11_query_extension(name: string, first_event: int64*) -> int64 {
+  var nl: int64 = (int64)name.length;
+  var len: int64 = 8 + window_pad4(nl);
+  var r: uint8[64];
+  window_x11_req(&r[0], 98, 0, len);
+  window_wr16(&r[0], 4, nl);
+  for i: int64 in 0..nl { r[8 + i] = name.chars[i]; }
+  var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], len));
+  if (p == 0) { return 0; }
+  var present: int64 = (int64)p[8];
+  var major: int64 = (int64)p[9];
+  *first_event = (int64)p[10];
+  free(p);
+  if (present == 0) { return 0; }
+  return major;
+}
+
+/// SendEvent of a 32-byte ClientMessage to `dest` with the given mask.
+export fn window_x11_client_message(dest: int64, win: int64, mtype: int64, d0: int64, d1: int64, d2: int64, d3: int64, d4: int64, mask: int64) {
+  var r: uint8[44];
+  window_x11_req(&r[0], 25, 0, 44);
+  window_wr32(&r[0], 4, dest);
+  window_wr32(&r[0], 8, mask);
+  r[12] = (uint8)33; r[13] = (uint8)32;
+  window_wr32(&r[0], 16, win); window_wr32(&r[0], 20, mtype);
+  window_wr32(&r[0], 24, d0); window_wr32(&r[0], 28, d1); window_wr32(&r[0], 32, d2);
+  window_wr32(&r[0], 36, d3); window_wr32(&r[0], 40, d4);
+  window_x11_send(&r[0], 44);
+}
+
+/// Sends a raw 32-byte event to `dest`.
+export fn window_x11_send_event(dest: int64, mask: int64, ev: uint8*) {
+  var r: uint8[44];
+  window_x11_req(&r[0], 25, 0, 44);
+  window_wr32(&r[0], 4, dest);
+  window_wr32(&r[0], 8, mask);
+  for i: int64 in 0..32 { r[12 + i] = ev[i]; }
+  window_x11_send(&r[0], 44);
+}
+
+// ---------- keyboard mapping ----------
+export fn window_x11_load_keymap() {
+  if (g_x11.keymap != 0) { free(g_x11.keymap); g_x11.keymap = (uint8*)0; }
+  var r: uint8[8];
+  window_x11_req(&r[0], 101, 0, 8);
+  r[4] = (uint8)g_x11.min_kc; r[5] = (uint8)(g_x11.max_kc - g_x11.min_kc + 1);
+  var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 8));
+  g_x11.kspk = 0;
+  if (p == 0) { return; }
+  g_x11.keymap = p;
+  g_x11.keymap_len = window_x11_reply_len(p);
+  g_x11.kspk = (int64)p[1];
+  // Which modifier bits are Num_Lock, Mode_switch and ISO_Level3_Shift (GetModifierMapping).
+  g_x11.numlock_mask = 16; g_x11.modeswitch_mask = 0; g_x11.level3_mask = 0;
+  var m: uint8[4];
+  window_x11_req(&m[0], 119, 0, 4);
+  var q: uint8* = window_x11_wait_reply(window_x11_send(&m[0], 4));
+  if (q == 0) { return; }
+  var per: int64 = (int64)q[1];
+  var qlen: int64 = window_x11_reply_len(q);
+  for mi: int64 in 0..8 {
+    for k: int64 in 0..per {
+      var o: int64 = 32 + mi * per + k;
+      if (o >= qlen) { break; }
+      var kc: int64 = (int64)q[o];
+      if (kc == 0) { continue; }
+      for col: int64 in 0..g_x11.kspk {
+        var ks: int64 = window_x11_keysym_at(kc, col);
+        if (ks == 0xFF7F) { g_x11.numlock_mask = (int64)1 << mi; }
+        if (ks == 0xFF7E) { g_x11.modeswitch_mask = (int64)1 << mi; }
+        if (ks == 0xFE03) { g_x11.level3_mask = (int64)1 << mi; }
+      }
+    }
+  }
+  free(q);
+}
+
+export fn window_x11_keysym_at(kc: int64, col: int64) -> int64 {
+  if (g_x11.keymap == 0 || kc < g_x11.min_kc || kc > g_x11.max_kc || col >= g_x11.kspk) { return 0; }
+  var o: int64 = 32 + ((kc - g_x11.min_kc) * g_x11.kspk + col) * 4;
+  if (o + 4 > g_x11.keymap_len) { return 0; }
+  return window_rd32(g_x11.keymap, o);
+}
+
+fn is_keypad(ks: int64) -> bool { return (ks >= 0xFF80 && ks <= 0xFFBD) || (ks >= 0x11000000 && ks <= 0x1100FFFF); }
+fn lower_ks(ks: int64) -> int64 { if (ks >= 65 && ks <= 90) { return ks + 32; } if (ks >= 192 && ks <= 222 && ks != 215) { return ks + 32; } return ks; }
+fn upper_ks(ks: int64) -> int64 { if (ks >= 97 && ks <= 122) { return ks - 32; } if (ks >= 224 && ks <= 254 && ks != 247) { return ks - 32; } return ks; }
+
+/// Keycode + state -> keysym, by the core protocol's rules (section 5 of the
+/// protocol spec, "Keyboards"): group from the XKB group bits or Mode_switch,
+/// Shift and Lock pick the level, NumLock flips keypad keys.
+export fn window_x11_keysym(kc: int64, state: int64) -> int64 {
+  var group: int64 = (state >> 13) & 3;
+  if (g_x11.modeswitch_mask != 0 && (state & g_x11.modeswitch_mask) != 0) { group = 1; }
+  var base: int64 = group * 2;
+  if (base + 1 >= g_x11.kspk) { base = 0; }
+  var ks0: int64 = window_x11_keysym_at(kc, base);
+  var ks1: int64 = window_x11_keysym_at(kc, base + 1);
+  if (ks0 == 0 && base != 0) { ks0 = window_x11_keysym_at(kc, 0); ks1 = window_x11_keysym_at(kc, 1); }
+  // A lone letter keysym means "lower in column 0, upper in column 1".
+  if (ks1 == 0) {
+    var lo: int64 = lower_ks(ks0);
+    var up: int64 = upper_ks(lo);
+    if (lo != up) { ks0 = lo; ks1 = up; } else { ks1 = ks0; }
+  }
+  // AltGr (ISO_Level3_Shift) picks columns 4 and 5 when the map has them.
+  if (g_x11.level3_mask != 0 && (state & g_x11.level3_mask) != 0 && g_x11.kspk >= 6 && group == 0) {
+    var l3: int64 = window_x11_keysym_at(kc, 4);
+    var l4: int64 = window_x11_keysym_at(kc, 5);
+    if (l3 != 0) {
+      if ((state & 1) != 0 && l4 != 0) { return l4; }
+      return l3;
+    }
+  }
+  var shift: bool = (state & 1) != 0;
+  var lock: bool = (state & 2) != 0;
+  if ((state & g_x11.numlock_mask) != 0 && is_keypad(ks1)) {
+    if (shift) { return ks0; }
+    return ks1;
+  }
+  if (!shift && !lock) { return ks0; }
+  if (!shift && lock) { return upper_ks(ks0); }
+  if (shift && lock) { return upper_ks(ks1); }
+  return ks1;
+}
+
+// ---------- Xft.dpi ----------
+/// Xft.dpi from the root window's RESOURCE_MANAGER property (0 when absent).
+export fn window_x11_xft_dpi() -> float32 {
+  if (g_x11.a_resource_manager == 0) { return 0.0; }
+  var b: WindowBytes;
+  var ty: int64 = 0;
+  var fmt: int64 = 0;
+  if (!window_x11_get_property(g_x11.root, g_x11.a_resource_manager, false, &b, &ty, &fmt)) { return 0.0; }
+  var key: string = "Xft.dpi:";
+  var dpi: float32 = 0.0;
+  var n: int64 = b.len;
+  for i: int64 in 0..n {
+    if (i + 8 > n) { break; }
+    if (i > 0 && b.data[i - 1] != (uint8)10) { continue; }
+    var ok: bool = true;
+    for j: int64 in 0..8 { if (b.data[i + j] != key.chars[j]) { ok = false; } }
+    if (!ok) { continue; }
+    var k: int64 = i + 8;
+    while (k < n && (b.data[k] == (uint8)32 || b.data[k] == (uint8)9)) { k = k + 1; }
+    var v: float32 = 0.0;
+    while (k < n && b.data[k] >= (uint8)48 && b.data[k] <= (uint8)57 && v < 10000.0) { v = v * 10.0 + (float32)((int32)b.data[k] - 48); k = k + 1; }
+    if (k < n && b.data[k] == (uint8)46) {
+      k = k + 1;
+      var f: float32 = 0.1;
+      while (k < n && b.data[k] >= (uint8)48 && b.data[k] <= (uint8)57) { v = v + f * (float32)((int32)b.data[k] - 48); f = f * 0.1; k = k + 1; }
+    }
+    dpi = v;
+    break;
+  }
+  free(b.data);
+  return dpi;
+}

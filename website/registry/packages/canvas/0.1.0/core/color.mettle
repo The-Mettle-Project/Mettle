@@ -1,0 +1,82 @@
+// Colors. CanvasColor is straight (not premultiplied) RGBA, each 0 to 1.
+// Inside the library a color is a premultiplied 32-bit value with red in
+// the low byte, so it reads R, G, B, A in memory.
+
+import "base";
+
+export struct CanvasColor { r: float32; g: float32; b: float32; a: float32; }
+
+/// A color from floats 0 to 1 (clamped).
+export fn canvas_rgba(r: float32, g: float32, b: float32, a: float32) -> CanvasColor {
+  var c: CanvasColor;
+  c.r = canvas_clampf(r, 0.0, 1.0);
+  c.g = canvas_clampf(g, 0.0, 1.0);
+  c.b = canvas_clampf(b, 0.0, 1.0);
+  c.a = canvas_clampf(a, 0.0, 1.0);
+  if (!canvas_finite(r)) { c.r = 0.0; }
+  if (!canvas_finite(g)) { c.g = 0.0; }
+  if (!canvas_finite(b)) { c.b = 0.0; }
+  if (!canvas_finite(a)) { c.a = 0.0; }
+  return c;
+}
+
+/// A color from bytes 0 to 255.
+export fn canvas_rgba8(r: int32, g: int32, b: int32, a: int32) -> CanvasColor {
+  var k: float32 = 1.0 / 255.0;
+  return canvas_rgba((float32)r * k, (float32)g * k, (float32)b * k, (float32)a * k);
+}
+
+/// A color from 0xRRGGBBAA.
+export fn canvas_hex(v: uint32) -> CanvasColor {
+  return canvas_rgba8((int32)((v >> 24) & 255), (int32)((v >> 16) & 255), (int32)((v >> 8) & 255), (int32)(v & 255));
+}
+
+@inline fn to8(v: float32) -> uint32 {
+  var x: float32 = v * 255.0 + 0.5;
+  if (x <= 0.0) { return 0; }
+  if (x >= 255.0) { return 255; }
+  return (uint32)x;
+}
+
+/// Packs a straight color, scaled by opacity, as premultiplied 32-bit.
+export fn canvas_color_pack(c: CanvasColor, opacity: float32) -> uint32 {
+  var a: float32 = canvas_clampf(c.a * opacity, 0.0, 1.0);
+  var a8: uint32 = to8(a);
+  var r8: uint32 = to8(c.r * a);
+  var g8: uint32 = to8(c.g * a);
+  var b8: uint32 = to8(c.b * a);
+  if (r8 > a8) { r8 = a8; }
+  if (g8 > a8) { g8 = a8; }
+  if (b8 > a8) { b8 = a8; }
+  return r8 | (g8 << 8) | (b8 << 16) | (a8 << 24);
+}
+
+/// Packs premultiplied floats 0 to 1 (clamped, color kept <= alpha).
+export fn canvas_pm_pack(r: float32, g: float32, b: float32, a: float32) -> uint32 {
+  var a8: uint32 = to8(a);
+  var r8: uint32 = to8(r);
+  var g8: uint32 = to8(g);
+  var b8: uint32 = to8(b);
+  if (r8 > a8) { r8 = a8; }
+  if (g8 > a8) { g8 = a8; }
+  if (b8 > a8) { b8 = a8; }
+  return r8 | (g8 << 8) | (b8 << 16) | (a8 << 24);
+}
+
+/// Unpacks a premultiplied 32-bit value to a straight color.
+export fn canvas_color_unpack(p: uint32) -> CanvasColor {
+  var c: CanvasColor;
+  var a: uint32 = p >> 24;
+  if (a == 0) { return c; }
+  var k: float32 = 1.0 / (float32)a;
+  c.r = canvas_minf((float32)(p & 255) * k, 1.0);
+  c.g = canvas_minf((float32)((p >> 8) & 255) * k, 1.0);
+  c.b = canvas_minf((float32)((p >> 16) & 255) * k, 1.0);
+  c.a = (float32)a / 255.0;
+  return c;
+}
+
+/// Swaps the red and blue bytes (RGBA <-> BGRA).
+@inline export fn canvas_swap_rb(p: uint32) -> uint32 {
+  return (p & 0xff00ff00) | ((p >> 16) & 255) | ((p & 255) << 16);
+}

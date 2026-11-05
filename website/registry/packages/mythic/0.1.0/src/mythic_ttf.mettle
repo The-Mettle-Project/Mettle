@@ -1,0 +1,352 @@
+// mythic_ttf: TrueType parser (head, hhea, hmtx, maxp, cmap 4/12, loca, glyf, kern, OS/2).
+// All values are in font units. The font bytes are borrowed and must outlive the MythicTtf.
+import "mythic_types";
+
+export struct MythicTtf {
+  data: uint8*; len: int64;
+  upem: int32; num_glyphs: int32; loc_format: int32;
+  x_min: int32; y_min: int32; x_max: int32; y_max: int32;     // head bbox (all glyphs)
+  ascent: int32; descent: int32; line_gap: int32;             // hhea (descent is negative)
+  cap_height: int32; x_height: int32;
+  num_hmetrics: int32;
+  hmtx: int64; loca: int64; glyf: int64; glyf_len: int64;
+  cmap4: int64; cmap12: int64;                                // subtable offsets (0 = absent)
+  kern_pairs: int64; kern_count: int32;                       // format-0 pair array
+}
+
+// One outline point in font units (composite transforms applied). on = 1 for on-curve.
+export struct MythicTtfPt { x: float32; y: float32; on: int32; }
+export struct MythicTtfOutline { pts: MythicVec<MythicTtfPt>; ends: MythicVec<int32>; }  // ends = last point index per contour
+
+fn rd16(t: MythicTtf*, o: int64) -> uint32 {
+  if (o < 0 || o + 2 > t->len) { return 0; }
+  return ((uint32)t->data[o] << (uint32)8) | (uint32)t->data[o + 1];
+}
+fn rds16(t: MythicTtf*, o: int64) -> int32 {
+  var v: int32 = (int32)rd16(t, o);
+  if (v >= 32768) { v = v - 65536; }
+  return v;
+}
+fn rd32(t: MythicTtf*, o: int64) -> uint32 {
+  if (o < 0 || o + 4 > t->len) { return 0; }
+  return ((uint32)t->data[o] << (uint32)24) | ((uint32)t->data[o + 1] << (uint32)16)
+       | ((uint32)t->data[o + 2] << (uint32)8) | (uint32)t->data[o + 3];
+}
+
+fn find_table(t: MythicTtf*, tag: uint32, out_len: int64*) -> int64 {
+  var n: int64 = (int64)rd16(t, 4);
+  for i: int64 in 0..n {
+    var rec: int64 = 12 + i * 16;
+    if (rd32(t, rec) == tag) {
+      var off: int64 = (int64)rd32(t, rec + 8);
+      var ln: int64 = (int64)rd32(t, rec + 12);
+      if (off + ln > t->len) { return 0; }
+      *out_len = ln;
+      return off;
+    }
+  }
+  return 0;
+}
+
+fn tag4(a: int32, b: int32, c: int32, d: int32) -> uint32 {
+  return ((uint32)a << (uint32)24) | ((uint32)b << (uint32)16) | ((uint32)c << (uint32)8) | (uint32)d;
+}
+
+/// Parses the table directory and the metric tables. Returns false when the data is not a
+/// usable TrueType (glyf) font.
+export fn mythic_ttf_init(t: MythicTtf*, data: uint8*, len: int64) -> bool {
+  t->data = data; t->len = len;
+  if (len < 12) { return false; }
+  var ver: uint32 = rd32(t, 0);
+  if (ver != (uint32)0x00010000 && ver != tag4(116, 114, 117, 101)) { return false; }   // 'true'
+  var ln: int64 = 0;
+  var head: int64 = find_table(t, tag4(104, 101, 97, 100), &ln);   // head
+  var hhea: int64 = find_table(t, tag4(104, 104, 101, 97), &ln);   // hhea
+  var maxp: int64 = find_table(t, tag4(109, 97, 120, 112), &ln);   // maxp
+  t->hmtx = find_table(t, tag4(104, 109, 116, 120), &ln);          // hmtx
+  t->loca = find_table(t, tag4(108, 111, 99, 97), &ln);            // loca
+  var glen: int64 = 0;
+  t->glyf = find_table(t, tag4(103, 108, 121, 102), &glen);        // glyf
+  t->glyf_len = glen;
+  var cmap: int64 = find_table(t, tag4(99, 109, 97, 112), &ln);    // cmap
+  if (head == 0 || hhea == 0 || maxp == 0 || t->hmtx == 0 || t->loca == 0 || t->glyf == 0 || cmap == 0) {
+    return false;
+  }
+  t->upem = (int32)rd16(t, head + 18);
+  if (t->upem <= 0) { return false; }
+  t->x_min = rds16(t, head + 36); t->y_min = rds16(t, head + 38);
+  t->x_max = rds16(t, head + 40); t->y_max = rds16(t, head + 42);
+  t->loc_format = rds16(t, head + 50);
+  t->num_glyphs = (int32)rd16(t, maxp + 4);
+  t->ascent = rds16(t, hhea + 4);
+  t->descent = rds16(t, hhea + 6);
+  t->line_gap = rds16(t, hhea + 8);
+  t->num_hmetrics = (int32)rd16(t, hhea + 34);
+  if (t->num_hmetrics <= 0) { return false; }
+  // OS/2: capHeight / xHeight (version >= 2); fall back to fractions of the em
+  t->cap_height = (t->upem * 7) / 10;
+  t->x_height = t->upem / 2;
+  var os2: int64 = find_table(t, tag4(79, 83, 47, 50), &ln);        // OS/2
+  if (os2 != 0 && rd16(t, os2) >= (uint32)2 && ln >= 90) {
+    t->x_height = rds16(t, os2 + 86);
+    t->cap_height = rds16(t, os2 + 88);
+  }
+  // cmap: prefer (3,10) format 12, else (3,1) / (0,*) format 4
+  t->cmap4 = 0; t->cmap12 = 0;
+  var nsub: int64 = (int64)rd16(t, cmap + 2);
+  for i: int64 in 0..nsub {
+    var rec: int64 = cmap + 4 + i * 8;
+    var pid: uint32 = rd16(t, rec);
+    var eid: uint32 = rd16(t, rec + 2);
+    var sub: int64 = cmap + (int64)rd32(t, rec + 4);
+    var fmt: uint32 = rd16(t, sub);
+    if (fmt == (uint32)12 && (pid == (uint32)0 || (pid == (uint32)3 && eid == (uint32)10))) { t->cmap12 = sub; }
+    if (fmt == (uint32)4 && (pid == (uint32)0 || (pid == (uint32)3 && eid == (uint32)1))) {
+      if (t->cmap4 == 0) { t->cmap4 = sub; }
+    }
+  }
+  if (t->cmap4 == 0 && t->cmap12 == 0) { return false; }
+  // kern: version 0, first horizontal format-0 subtable
+  t->kern_pairs = 0; t->kern_count = 0;
+  var kern: int64 = find_table(t, tag4(107, 101, 114, 110), &ln);   // kern
+  if (kern != 0 && rd16(t, kern) == (uint32)0) {
+    var nt: int64 = (int64)rd16(t, kern + 2);
+    var st: int64 = kern + 4;
+    for i: int64 in 0..nt {
+      var slen: int64 = (int64)rd16(t, st + 2);
+      var cov: uint32 = rd16(t, st + 4);
+      if ((cov >> (uint32)8) == (uint32)0 && (cov & (uint32)1) == (uint32)1 && t->kern_pairs == 0) {
+        t->kern_count = (int32)rd16(t, st + 6);
+        t->kern_pairs = st + 14;
+        if (t->kern_pairs + (int64)t->kern_count * 6 > t->len) { t->kern_pairs = 0; t->kern_count = 0; }
+      }
+      st = st + slen;
+    }
+  }
+  return true;
+}
+
+/// Glyph index for a code point (0 = .notdef / missing).
+export fn mythic_ttf_glyph_index(t: MythicTtf*, cp: uint32) -> int32 {
+  if (t->cmap12 != 0) {
+    var ng: int64 = (int64)rd32(t, t->cmap12 + 12);
+    var lo: int64 = 0;
+    var hi: int64 = ng - 1;
+    while (lo <= hi) {
+      var mid: int64 = (lo + hi) / 2;
+      var g: int64 = t->cmap12 + 16 + mid * 12;
+      var sc: uint32 = rd32(t, g);
+      var ec: uint32 = rd32(t, g + 4);
+      if (cp < sc) { hi = mid - 1; }
+      else if (cp > ec) { lo = mid + 1; }
+      else { return (int32)(rd32(t, g + 8) + (cp - sc)); }
+    }
+    return 0;
+  }
+  if (cp > (uint32)0xFFFF) { return 0; }
+  var sub: int64 = t->cmap4;
+  var segx2: int64 = (int64)rd16(t, sub + 6);
+  var nseg: int64 = segx2 / 2;
+  var ends: int64 = sub + 14;
+  var starts: int64 = ends + segx2 + 2;
+  var deltas: int64 = starts + segx2;
+  var ranges: int64 = deltas + segx2;
+  var lo: int64 = 0;
+  var hi: int64 = nseg - 1;
+  while (lo < hi) {   // first segment with endCode >= cp
+    var mid: int64 = (lo + hi) / 2;
+    if (rd16(t, ends + mid * 2) < cp) { lo = mid + 1; } else { hi = mid; }
+  }
+  var start: uint32 = rd16(t, starts + lo * 2);
+  if (cp < start || cp > rd16(t, ends + lo * 2)) { return 0; }
+  var delta: uint32 = rd16(t, deltas + lo * 2);
+  var ro: uint32 = rd16(t, ranges + lo * 2);
+  if (ro == (uint32)0) { return (int32)((cp + delta) & (uint32)0xFFFF); }
+  var ga: int64 = ranges + lo * 2 + (int64)ro + (int64)(cp - start) * 2;
+  var g: uint32 = rd16(t, ga);
+  if (g == (uint32)0) { return 0; }
+  return (int32)((g + delta) & (uint32)0xFFFF);
+}
+
+/// Advance width in font units.
+export fn mythic_ttf_advance(t: MythicTtf*, g: int32) -> int32 {
+  if (g < 0 || g >= t->num_glyphs) { return 0; }
+  var i: int32 = g;
+  if (i >= t->num_hmetrics) { i = t->num_hmetrics - 1; }
+  return (int32)rd16(t, t->hmtx + (int64)i * 4);
+}
+
+/// Left side bearing in font units.
+export fn mythic_ttf_lsb(t: MythicTtf*, g: int32) -> int32 {
+  if (g < 0 || g >= t->num_glyphs) { return 0; }
+  if (g < t->num_hmetrics) { return rds16(t, t->hmtx + (int64)g * 4 + 2); }
+  return rds16(t, t->hmtx + (int64)t->num_hmetrics * 4 + (int64)(g - t->num_hmetrics) * 2);
+}
+
+/// Legacy kern value for the pair (left, right) in font units (0 when none).
+export fn mythic_ttf_kern(t: MythicTtf*, left: int32, right: int32) -> int32 {
+  if (t->kern_count == 0) { return 0; }
+  var key: uint32 = ((uint32)left << (uint32)16) | (uint32)right;
+  var lo: int64 = 0;
+  var hi: int64 = (int64)t->kern_count - 1;
+  while (lo <= hi) {
+    var mid: int64 = (lo + hi) / 2;
+    var p: int64 = t->kern_pairs + mid * 6;
+    var k: uint32 = rd32(t, p);
+    if (k < key) { lo = mid + 1; }
+    else if (k > key) { hi = mid - 1; }
+    else { return rds16(t, p + 4); }
+  }
+  return 0;
+}
+
+fn glyph_range(t: MythicTtf*, g: int32, out_len: int64*) -> int64 {
+  *out_len = 0;
+  if (g < 0 || g >= t->num_glyphs) { return 0; }
+  var a: int64 = 0;
+  var b: int64 = 0;
+  if (t->loc_format == 0) {
+    a = (int64)rd16(t, t->loca + (int64)g * 2) * 2;
+    b = (int64)rd16(t, t->loca + (int64)g * 2 + 2) * 2;
+  } else {
+    a = (int64)rd32(t, t->loca + (int64)g * 4);
+    b = (int64)rd32(t, t->loca + (int64)g * 4 + 4);
+  }
+  if (b <= a || b > t->glyf_len) { return 0; }
+  *out_len = b - a;
+  return t->glyf + a;
+}
+
+/// Glyph bounding box from the glyf header (font units). False for empty glyphs (space).
+export fn mythic_ttf_glyph_box(t: MythicTtf*, g: int32, x0: int32*, y0: int32*, x1: int32*, y1: int32*) -> bool {
+  var ln: int64 = 0;
+  var o: int64 = glyph_range(t, g, &ln);
+  *x0 = 0; *y0 = 0; *x1 = 0; *y1 = 0;
+  if (o == 0 || ln < 10) { return false; }
+  *x0 = rds16(t, o + 2); *y0 = rds16(t, o + 4); *x1 = rds16(t, o + 6); *y1 = rds16(t, o + 8);
+  return true;
+}
+
+/// True when glyph `g` is a composite glyph.
+export fn mythic_ttf_is_composite(t: MythicTtf*, g: int32) -> bool {
+  var ln: int64 = 0;
+  var o: int64 = glyph_range(t, g, &ln);
+  if (o == 0 || ln < 10) { return false; }
+  return rds16(t, o) < 0;
+}
+
+fn simple_glyph(t: MythicTtf*, o: int64, ln: int64, out: MythicTtfOutline*) -> bool {
+  var nc: int64 = (int64)rds16(t, o);
+  var endp: int64 = o + 10;
+  var npts: int64 = (int64)rd16(t, endp + (nc - 1) * 2) + 1;
+  var ilen: int64 = (int64)rd16(t, endp + nc * 2);
+  var fp: int64 = endp + nc * 2 + 2 + ilen;
+  var lim: int64 = o + ln;
+  var base: int64 = out->pts.len;
+  // flags
+  var fl: uint8* = new uint8[npts].data;
+  var i: int64 = 0;
+  while (i < npts) {
+    if (fp >= lim) { free((rawptr)fl); return false; }
+    var f: uint8 = t->data[fp]; fp = fp + 1;
+    fl[i] = f; i = i + 1;
+    if ((f & (uint8)8) != (uint8)0) {
+      if (fp >= lim) { free((rawptr)fl); return false; }
+      var rep: int64 = (int64)t->data[fp]; fp = fp + 1;
+      while (rep > 0 && i < npts) { fl[i] = f; i = i + 1; rep = rep - 1; }
+    }
+  }
+  var zero: MythicTtfPt;
+  for k: int64 in 0..npts {
+    var p: MythicTtfPt* = mythic_vec_push<MythicTtfPt>(&out->pts, zero);
+    p->on = (int32)(fl[k] & (uint8)1);
+  }
+  // x coordinates
+  var v: int32 = 0;
+  for k: int64 in 0..npts {
+    var f: uint8 = fl[k];
+    if ((f & (uint8)2) != (uint8)0) {
+      var dx: int32 = (int32)t->data[fp]; fp = fp + 1;
+      if ((f & (uint8)16) != (uint8)0) { v = v + dx; } else { v = v - dx; }
+    } else if ((f & (uint8)16) == (uint8)0) {
+      v = v + rds16(t, fp); fp = fp + 2;
+    }
+    out->pts.data[base + k].x = (float32)v;
+  }
+  v = 0;
+  for k: int64 in 0..npts {
+    var f: uint8 = fl[k];
+    if ((f & (uint8)4) != (uint8)0) {
+      var dy: int32 = (int32)t->data[fp]; fp = fp + 1;
+      if ((f & (uint8)32) != (uint8)0) { v = v + dy; } else { v = v - dy; }
+    } else if ((f & (uint8)32) == (uint8)0) {
+      v = v + rds16(t, fp); fp = fp + 2;
+    }
+    out->pts.data[base + k].y = (float32)v;
+  }
+  free((rawptr)fl);
+  if (fp > lim) { out->pts.len = base; return false; }
+  for c: int64 in 0..nc {
+    mythic_vec_push<int32>(&out->ends, (int32)(base + (int64)rd16(t, endp + c * 2)));
+  }
+  return true;
+}
+
+fn f2dot14(t: MythicTtf*, o: int64) -> float32 { return (float32)rds16(t, o) / 16384.0; }
+
+fn glyph_outline(t: MythicTtf*, g: int32, out: MythicTtfOutline*, depth: int32) -> bool {
+  if (depth > 4) { return false; }
+  var ln: int64 = 0;
+  var o: int64 = glyph_range(t, g, &ln);
+  if (o == 0 || ln < 10) { return true; }   // empty glyph
+  var nc: int32 = rds16(t, o);
+  if (nc >= 0) {
+    if (nc == 0) { return true; }
+    return simple_glyph(t, o, ln, out);
+  }
+  var p: int64 = o + 10;
+  var more: bool = true;
+  while (more) {
+    var flags: uint32 = rd16(t, p);
+    var cg: int32 = (int32)rd16(t, p + 2);
+    p = p + 4;
+    var dx: float32 = 0.0;
+    var dy: float32 = 0.0;
+    if ((flags & (uint32)1) != (uint32)0) {
+      dx = (float32)rds16(t, p); dy = (float32)rds16(t, p + 2); p = p + 4;
+    } else {
+      var bx: int32 = (int32)t->data[p]; var by: int32 = (int32)t->data[p + 1];
+      if (bx >= 128) { bx = bx - 256; }
+      if (by >= 128) { by = by - 256; }
+      dx = (float32)bx; dy = (float32)by; p = p + 2;
+    }
+    if ((flags & (uint32)2) == (uint32)0) { dx = 0.0; dy = 0.0; }   // point matching: unsupported
+    var a: float32 = 1.0; var b: float32 = 0.0; var c: float32 = 0.0; var d: float32 = 1.0;
+    if ((flags & (uint32)8) != (uint32)0) {
+      a = f2dot14(t, p); d = a; p = p + 2;
+    } else if ((flags & (uint32)0x40) != (uint32)0) {
+      a = f2dot14(t, p); d = f2dot14(t, p + 2); p = p + 4;
+    } else if ((flags & (uint32)0x80) != (uint32)0) {
+      a = f2dot14(t, p); b = f2dot14(t, p + 2); c = f2dot14(t, p + 4); d = f2dot14(t, p + 6); p = p + 8;
+    }
+    var first: int64 = out->pts.len;
+    if (!glyph_outline(t, cg, out, depth + 1)) { return false; }
+    var k: int64 = first;
+    while (k < out->pts.len) {
+      var q: MythicTtfPt* = &out->pts.data[k];
+      var x: float32 = q->x;
+      var y: float32 = q->y;
+      q->x = a * x + c * y + dx;
+      q->y = b * x + d * y + dy;
+      k = k + 1;
+    }
+    more = (flags & (uint32)0x20) != (uint32)0;
+  }
+  return true;
+}
+
+/// Appends the outline of glyph `g` (composites expanded) to `out` (not cleared). False on
+/// malformed data.
+export fn mythic_ttf_outline(t: MythicTtf*, g: int32, out: MythicTtfOutline*) -> bool {
+  return glyph_outline(t, g, out, 0);
+}

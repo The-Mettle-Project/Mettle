@@ -1,0 +1,100 @@
+// Wire numbers from RFC 8446 and RFC 5246, and the cipher suite table.
+
+import "mtls/crypto/hash";
+import "mtls/crypto/aead";
+
+export const MTLS_TLS12: int32 = 0x0303;
+export const MTLS_TLS13: int32 = 0x0304;
+
+// Record content types.
+export const MTLS_CT_CCS: int32 = 20;
+export const MTLS_CT_ALERT: int32 = 21;
+export const MTLS_CT_HANDSHAKE: int32 = 22;
+export const MTLS_CT_APPDATA: int32 = 23;
+
+// Handshake message types.
+export const MTLS_HS_HELLO_REQUEST: int32 = 0;
+export const MTLS_HS_CLIENT_HELLO: int32 = 1;
+export const MTLS_HS_SERVER_HELLO: int32 = 2;
+export const MTLS_HS_NEW_SESSION_TICKET: int32 = 4;
+export const MTLS_HS_END_OF_EARLY_DATA: int32 = 5;
+export const MTLS_HS_ENCRYPTED_EXTENSIONS: int32 = 8;
+export const MTLS_HS_CERTIFICATE: int32 = 11;
+export const MTLS_HS_SERVER_KEY_EXCHANGE: int32 = 12;
+export const MTLS_HS_CERTIFICATE_REQUEST: int32 = 13;
+export const MTLS_HS_SERVER_HELLO_DONE: int32 = 14;
+export const MTLS_HS_CERTIFICATE_VERIFY: int32 = 15;
+export const MTLS_HS_CLIENT_KEY_EXCHANGE: int32 = 16;
+export const MTLS_HS_FINISHED: int32 = 20;
+export const MTLS_HS_KEY_UPDATE: int32 = 24;
+export const MTLS_HS_MESSAGE_HASH: int32 = 254;
+
+// Extensions.
+export const MTLS_EXT_SERVER_NAME: int32 = 0;
+export const MTLS_EXT_STATUS_REQUEST: int32 = 5;
+export const MTLS_EXT_SUPPORTED_GROUPS: int32 = 10;
+export const MTLS_EXT_EC_POINT_FORMATS: int32 = 11;
+export const MTLS_EXT_SIGNATURE_ALGORITHMS: int32 = 13;
+export const MTLS_EXT_ALPN: int32 = 16;
+export const MTLS_EXT_EXTENDED_MASTER_SECRET: int32 = 23;
+export const MTLS_EXT_SESSION_TICKET: int32 = 35;
+export const MTLS_EXT_PRE_SHARED_KEY: int32 = 41;
+export const MTLS_EXT_EARLY_DATA: int32 = 42;
+export const MTLS_EXT_SUPPORTED_VERSIONS: int32 = 43;
+export const MTLS_EXT_COOKIE: int32 = 44;
+export const MTLS_EXT_PSK_MODES: int32 = 45;
+export const MTLS_EXT_CERTIFICATE_AUTHORITIES: int32 = 47;
+export const MTLS_EXT_SIGNATURE_ALGORITHMS_CERT: int32 = 50;
+export const MTLS_EXT_KEY_SHARE: int32 = 51;
+export const MTLS_EXT_RENEGOTIATION_INFO: int32 = 0xff01;
+
+// Signature key families a TLS 1.2 suite asks for.
+export const MTLS_AUTH_ANY: int32 = 0;    // TLS 1.3: the certificate decides
+export const MTLS_AUTH_ECDSA: int32 = 1;  // ECDSA or Ed25519 certificates
+export const MTLS_AUTH_RSA: int32 = 2;
+
+export struct MtlsSuite {
+  id: int32;
+  aead: int32;
+  hash: int32;
+  v13: bool;
+  auth: int32;
+}
+
+/// mtls_suite_get: looks up a suite we implement; false if unknown.
+export fn mtls_suite_get(id: int32, out: MtlsSuite*) -> bool {
+  out->id = id;
+  out->v13 = false;
+  out->auth = MTLS_AUTH_ANY;
+  out->hash = MTLS_SHA256;
+  switch (id) {
+    case 0x1301: { out->aead = MTLS_AEAD_AES128GCM; out->v13 = true; }
+    case 0x1302: { out->aead = MTLS_AEAD_AES256GCM; out->hash = MTLS_SHA384; out->v13 = true; }
+    case 0x1303: { out->aead = MTLS_AEAD_CHACHA20; out->v13 = true; }
+    case 0xc02b: { out->aead = MTLS_AEAD_AES128GCM; out->auth = MTLS_AUTH_ECDSA; }
+    case 0xc02c: { out->aead = MTLS_AEAD_AES256GCM; out->hash = MTLS_SHA384; out->auth = MTLS_AUTH_ECDSA; }
+    case 0xc02f: { out->aead = MTLS_AEAD_AES128GCM; out->auth = MTLS_AUTH_RSA; }
+    case 0xc030: { out->aead = MTLS_AEAD_AES256GCM; out->hash = MTLS_SHA384; out->auth = MTLS_AUTH_RSA; }
+    case 0xcca8: { out->aead = MTLS_AEAD_CHACHA20; out->auth = MTLS_AUTH_RSA; }
+    case 0xcca9: { out->aead = MTLS_AEAD_CHACHA20; out->auth = MTLS_AUTH_ECDSA; }
+    default: { return false; }
+  }
+  return true;
+}
+
+/// mtls_suite_name: the IANA name of a suite.
+export fn mtls_suite_name(id: int32) -> string {
+  switch (id) {
+    case 0x1301: { return "TLS_AES_128_GCM_SHA256"; }
+    case 0x1302: { return "TLS_AES_256_GCM_SHA384"; }
+    case 0x1303: { return "TLS_CHACHA20_POLY1305_SHA256"; }
+    case 0xc02b: { return "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"; }
+    case 0xc02c: { return "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"; }
+    case 0xc02f: { return "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"; }
+    case 0xc030: { return "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"; }
+    case 0xcca8: { return "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"; }
+    case 0xcca9: { return "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"; }
+    default: { }
+  }
+  return "unknown";
+}

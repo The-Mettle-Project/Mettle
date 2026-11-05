@@ -1,0 +1,75 @@
+// FontBuffer: the glyph run that shaping fills in.
+// Positions and advances are in font units until the caller scales them.
+
+import "font/core/vec";
+
+export struct FontGlyph {
+  id: int32;        // glyph number
+  cluster: int32;   // byte offset in the text of the first character it came from
+  cp: uint32;       // that character
+  cls: uint8;       // GDEF class: 0 unknown, 1 base, 2 ligature, 3 mark, 4 component
+  mcls: uint8;      // GDEF mark attachment class
+  lig_id: uint8;    // ligature this glyph belongs to (0 = none)
+  lig_comp: uint8;  // for marks inside a ligature: which component (1-based)
+  x_adv: int32; y_adv: int32;
+  x_off: int32; y_off: int32;
+  attach: int32;    // index of the glyph this one hangs from (marks, cursive), -1 = none
+  atype: uint8;     // 1 = mark attachment, 2 = cursive
+  gc: uint8;        // Unicode general category of cp (FONT_GC_*)
+  ccc: uint8;       // canonical combining class of cp
+  uflags: uint8;    // FONT_UF_* below
+}
+
+export const FONT_UF_IGNORABLE: uint8 = 1;     // default ignorable character
+export const FONT_UF_CONTINUE: uint8 = 2;      // continues the grapheme before it
+export const FONT_UF_DELETED: uint8 = 0x80;    // removed by GSUB, dropped at the end of the lookup
+
+export struct FontBuffer {
+  g: FontVec<FontGlyph>;
+  next_lig: int32;
+}
+
+/// Empties the buffer but keeps its memory.
+export fn font_buffer_clear(b: FontBuffer*) {
+  b->g.len = 0;
+  b->next_lig = 0;
+}
+
+/// Frees the buffer's memory.
+export fn font_buffer_free(b: FontBuffer*) {
+  font_vec_free<FontGlyph>(&b->g);
+  b->next_lig = 0;
+}
+
+/// Inserts `count` copies of glyph `at` right after it. Returns false when
+/// memory runs out.
+export fn font_buffer_insert(b: FontBuffer*, at: int64, count: int64) -> bool {
+  if (count <= 0) { return true; }
+  if (!font_vec_reserve<FontGlyph>(&b->g, b->g.len + count)) { return false; }
+  var i: int64 = b->g.len - 1;
+  while (i > at) {
+    b->g.data[i + count] = b->g.data[i];
+    i = i - 1;
+  }
+  for k: int64 in 1..count + 1 { b->g.data[at + k] = b->g.data[at]; }
+  b->g.len = b->g.len + count;
+  return true;
+}
+
+/// Drops glyphs marked FONT_UF_DELETED, keeping the order of the rest.
+export fn font_buffer_compact(b: FontBuffer*) {
+  var w: int64 = 0;
+  for i: int64 in 0..b->g.len {
+    if ((b->g.data[i].uflags & FONT_UF_DELETED) != (uint8)0) { continue; }
+    if (w != i) { b->g.data[w] = b->g.data[i]; }
+    w = w + 1;
+  }
+  b->g.len = w;
+}
+
+/// Removes glyph `at`.
+export fn font_buffer_remove(b: FontBuffer*, at: int64) {
+  if (at < 0 || at >= b->g.len) { return; }
+  for i: int64 in at..b->g.len - 1 { b->g.data[i] = b->g.data[i + 1]; }
+  b->g.len = b->g.len - 1;
+}

@@ -1,0 +1,923 @@
+// FLAC encoder (RFC 9639), with the compression levels of libFLAC.
+//
+//   var out: AudioBuf;
+//   audio_flac_encode(&pcm, 5, &out);    // level 0 (fastest) to 8 (smallest)
+//
+// The search follows libFLAC: for each block, the four stereo choices
+// (left/right, left/side, side/right, mid/side) are all coded and the
+// smallest kept; each channel tries a constant, the five fixed predictors
+// and LPC from a windowed autocorrelation (tukey(0.5), then partial and
+// punchout tukey windows at the higher levels) through Levinson-Durbin,
+// with the order chosen from the expected bits per residual; residuals use
+// the best Rice partition order and parameters. Output is in the streamable
+// subset and carries the MD5 of the samples and a seek table.
+
+import "std/mem";
+import "../core/amath";
+import "../core/status";
+import "../core/buf";
+import "../core/bitw";
+import "../core/bits";
+import "../core/pcm";
+import "../core/md5";
+
+const FE_MAX_ORDER = 32;
+
+struct FlacCfg {
+  block: int32;
+  max_lpc: int32;
+  max_po: int32;
+  stereo: bool;
+  windows: int32;     // 1 tukey(0.5); 2 + partial_tukey(2); 3 + punchout_tukey(3)
+}
+
+// One way to code a channel of a block.
+struct FlacPlan {
+  kind: int32;        // 0 constant, 1 verbatim, 2 fixed, 3 lpc
+  order: int32;
+  prec: int32;
+  shift: int32;
+  coef: int32[32];
+  po: int32;          // partition order
+  rp: int32[256];     // Rice parameter of each partition
+  wide: bool;         // 5-bit parameters
+  bits: int64;        // size in bits
+}
+
+struct FlacEnc {
+  cfg: FlacCfg;
+  bps: int32;
+  ch: int32;
+  win: float64*;      // window samples, cfg.block per window, up to 6 windows
+  nwin: int32;
+  win_n: int32;       // block size the windows were made for
+  wtmp: float64*;
+  res: int32*;        // residual being tried
+  best: int32*[4];    // residual of the best plan per channel
+  u: uint32*;         // folded residual
+  sums: uint64*;      // partition sums
+  sm: int32*[4];      // L, R, mid, side samples of the block
+  wsm: int32*;        // a channel with its wasted bits removed
+}
+
+fn flac_cfg(level: int32) -> FlacCfg {
+  var c: FlacCfg;
+  c.block = 4096;
+  c.max_lpc = 8;
+  c.max_po = 5;
+  c.stereo = true;
+  c.windows = 1;
+  switch (level) {
+    case 0: { c.block = 1152; c.max_lpc = 0; c.max_po = 3; c.stereo = false; }
+    case 1: { c.block = 1152; c.max_lpc = 0; c.max_po = 3; }
+    case 2: { c.block = 1152; c.max_lpc = 0; c.max_po = 3; }
+    case 3: { c.max_lpc = 6; c.max_po = 4; c.stereo = false; }
+    case 4: { c.max_po = 4; }
+    case 5: { }
+    case 6: { c.max_po = 6; c.windows = 2; }
+    case 7: { c.max_lpc = 12; c.max_po = 6; c.windows = 2; }
+    default: { c.max_lpc = 12; c.max_po = 6; c.windows = 3; }
+  }
+  return c;
+}
+
+// tukey(p) over [from, from+len) of a window of n samples; zero elsewhere.
+fn fe_tukey(w: float64*, n: int32, from: int32, len: int32, p: float64) {
+  for i in 0..n { w[i] = 0.0; }
+  var t: int32 = (int32)(p * (float64)len / 2.0);
+  for i in 0..len {
+    var v: float64 = 1.0;
+    if (t > 0 && i < t) { v = 0.5 - 0.5 * audio_cos(3.141592653589793 * (float64)i / (float64)t); }
+    else if (t > 0 && i >= len - t) { v = 0.5 - 0.5 * audio_cos(3.141592653589793 * (float64)(len - 1 - i) / (float64)t); }
+    w[from + i] = v;
+  }
+}
+
+// The windows for a block of n samples.
+fn fe_windows(e: FlacEnc*, n: int32) {
+  if (e->win_n == n) { return; }
+  e->win_n = n;
+  var w: float64* = e->win;
+  e->nwin = 1;
+  fe_tukey(w, n, 0, n, 0.5);
+  if (e->cfg.windows >= 2) {
+    // partial_tukey(2): each half on its own
+    fe_tukey(w + (int64)n, n, 0, n / 2, 0.5);
+    fe_tukey(w + 2 * (int64)n, n, n / 2, n - n / 2, 0.5);
+    e->nwin = 3;
+  }
+  if (e->cfg.windows >= 3) {
+    // punchout_tukey(3): each third left out in turn
+    for k in 0..3 {
+      var q: float64* = w + (int64)(3 + k) * (int64)n;
+      fe_tukey(q, n, 0, n, 0.5);
+      var a: int32 = (int32)k * n / 3;
+      var b: int32 = ((int32)k + 1) * n / 3;
+      for i in a..b { q[i] = 0.0; }
+    }
+    e->nwin = 6;
+  }
+}
+
+// Small loops in the shape the vectorizer takes (pointers, a count, an
+// int64 counter from 0).
+fn fe_mac(a: int32*, b: int32*, c: int32, n: int64) {
+  @simd for i: int64 in 0..n { a[i] = a[i] + c * b[i]; }
+}
+
+fn fe_dot(a: float64*, b: float64*, n: int64) -> float64 {
+  var s: float64 = 0.0;
+  @simd for i: int64 in 0..n { s = s + a[i] * b[i]; }
+  return s;
+}
+
+fn fe_window_mul(dst: float64*, x: int32*, w: float64*, n: int64) {
+  @simd for i: int64 in 0..n { dst[i] = (float64)x[i] * w[i]; }
+}
+
+fn fe_fold_loop(u: uint32*, r: int32*, n: int64) {
+  @simd for i: int64 in 0..n { u[i] = ((uint32)r[i] << 1) ^ (uint32)(r[i] >> 31); }
+}
+
+fn fe_sum_u(u: uint32*, n: int64) -> uint64 {
+  var t: uint64 = 0;
+  @simd for i: int64 in 0..n { t = t + (uint64)u[i]; }
+  return t;
+}
+
+fn ilog2(v: uint64) -> int32 {
+  var r: int32 = 0;
+  var x: uint64 = v;
+  while (x > 1) { x = x >> 1; r = r + 1; }
+  return r;
+}
+
+// Best Rice coding of u[0 .. n) with the first `order` values left out.
+// Fills plan.po, plan.rp, plan.wide and returns the bits.
+fn fe_rice_plan(e: FlacEnc*, n: int32, order: int32, pl: FlacPlan*) -> int64 {
+  var u: uint32* = e->u;
+  // the deepest partition order allowed
+  var top: int32 = e->cfg.max_po;
+  while (top > 0 && ((n & ((1 << top) - 1)) != 0 || (n >> top) <= order)) { top = top - 1; }
+  if (top > 8) { top = 8; }
+  var parts: int32 = 1 << top;
+  var per: int32 = n >> top;
+  var s: uint64* = e->sums;
+  var at: int32 = order;
+  for p in 0..parts {
+    var end: int32 = ((int32)p + 1) * per;
+    s[p] = fe_sum_u(u + at, (int64)(end - at));
+    at = end;
+  }
+  var best: int64 = -1;
+  var po: int32 = top;
+  var rp: int32[256];
+  while (po >= 0) {
+    var np: int32 = 1 << po;
+    var pn: int32 = n >> po;
+    var bits: int64 = 6;
+    var wide: bool = false;
+    for p in 0..np {
+      var cnt: int64 = (int64)pn;
+      if (p == 0) { cnt = cnt - (int64)order; }
+      var sum: uint64 = s[p];
+      var k: int32 = 0;
+      if (cnt > 0 && sum > (uint64)cnt) { k = ilog2(sum / (uint64)cnt); }
+      if (k > 30) { k = 30; }
+      // try the neighbours of the estimate
+      var bk: int32 = k;
+      var bb: int64 = cnt * (int64)(k + 1) + (int64)(sum >> (uint64)k);
+      if (k > 0) {
+        var c1: int64 = cnt * (int64)k + (int64)(sum >> (uint64)(k - 1));
+        if (c1 < bb) { bb = c1; bk = k - 1; }
+      }
+      if (k < 30) {
+        var c2: int64 = cnt * (int64)(k + 2) + (int64)(sum >> (uint64)(k + 1));
+        if (c2 < bb) { bb = c2; bk = k + 1; }
+      }
+      if (bk >= 15) { wide = true; }
+      rp[p] = bk;
+      bits = bits + bb;
+    }
+    if (wide) { bits = bits + 5 * (int64)np; } else { bits = bits + 4 * (int64)np; }
+    if (best < 0 || bits < best) {
+      best = bits;
+      pl->po = po;
+      pl->wide = wide;
+      for p in 0..np { pl->rp[p] = rp[p]; }
+    }
+    if (po == 0) { break; }
+    // merge pairs for the next order up
+    for p in 0..np / 2 { s[p] = s[2 * p] + s[2 * p + 1]; }
+    po = po - 1;
+  }
+  return best;
+}
+
+fn fe_fold(e: FlacEnc*, r: int32*, n: int32) {
+  fe_fold_loop(e->u, r, (int64)n);
+}
+
+// The fixed order (0-4) with the smallest sum of absolute residuals; the
+// sum goes to *sum.
+fn fe_best_fixed(x: int32*, n: int32, sum: uint64*) -> int32 {
+  *sum = 0;
+  if (n < 5) { return 0; }
+  var s0: int64 = 0; var s1: int64 = 0; var s2: int64 = 0; var s3: int64 = 0; var s4: int64 = 0;
+  var a: int64 = (int64)x[3];
+  var b: int64 = a - (int64)x[2];
+  var c: int64 = b - ((int64)x[2] - (int64)x[1]);
+  var d: int64 = c - (((int64)x[2] - (int64)x[1]) - ((int64)x[1] - (int64)x[0]));
+  for i in 4..n {
+    var e0: int64 = (int64)x[i];
+    var e1: int64 = e0 - a;
+    var e2: int64 = e1 - b;
+    var e3: int64 = e2 - c;
+    var e4: int64 = e3 - d;
+    a = e0; b = e1; c = e2; d = e3;
+    s0 = s0 + ((e0 ^ (e0 >> 63)) - (e0 >> 63));
+    s1 = s1 + ((e1 ^ (e1 >> 63)) - (e1 >> 63));
+    s2 = s2 + ((e2 ^ (e2 >> 63)) - (e2 >> 63));
+    s3 = s3 + ((e3 ^ (e3 >> 63)) - (e3 >> 63));
+    s4 = s4 + ((e4 ^ (e4 >> 63)) - (e4 >> 63));
+  }
+  var bo: int32 = 0;
+  var bs: int64 = s0;
+  if (s1 < bs) { bs = s1; bo = 1; }
+  if (s2 < bs) { bs = s2; bo = 2; }
+  if (s3 < bs) { bs = s3; bo = 3; }
+  if (s4 < bs) { bs = s4; bo = 4; }
+  *sum = (uint64)bs;
+  return bo;
+}
+
+// Rough bits for a channel from its best fixed residual (to pick the
+// stereo coding without coding all four channels in full).
+fn fe_estimate(x: int32*, n: int32) -> uint64 {
+  var s: uint64 = 0;
+  fe_best_fixed(x, n, &s);
+  // about n * (log2(mean) + 2) bits for a Rice code
+  var mean: uint64 = s / (uint64)n;
+  return (uint64)n * (uint64)(ilog2(mean + 1) + 2);
+}
+
+// log2 for the order estimate: exponent bits plus a quadratic for the
+// mantissa (error under 0.01, plenty to rank orders).
+fn fe_log2(x: float64) -> float64 {
+  var b: uint64 = *(uint64*)&x;
+  var ex: int64 = (int64)((b >> 52) & 2047) - 1023;
+  var mb: uint64 = (b & 0xFFFFFFFFFFFFF) | 0x3FF0000000000000;
+  var m: float64 = *(float64*)&mb - 1.0;
+  return (float64)ex + m * (1.4426950408889634 - m * 0.4426950408889634);
+}
+
+// Fixed predictor residual of order o into e->res.
+fn fe_fixed_res(x: int32*, n: int32, o: int32, r: int32*) {
+  for i in 0..o { r[i] = x[i]; }
+  if (o == 0) { for i in 0..n { r[i] = x[i]; } }
+  else if (o == 1) { for i in 1..n { r[i] = x[i] - x[i - 1]; } }
+  else if (o == 2) { for i in 2..n { r[i] = x[i] - 2 * x[i - 1] + x[i - 2]; } }
+  else if (o == 3) { for i in 3..n { r[i] = x[i] - 3 * x[i - 1] + 3 * x[i - 2] - x[i - 3]; } }
+  else { for i in 4..n { r[i] = x[i] - 4 * x[i - 1] + 6 * x[i - 2] - 4 * x[i - 3] + x[i - 4]; } }
+}
+
+// LPC residual into r. The precision is clamped so that bps + precision +
+// log2(order) fits 32 bits (as libFLAC does), so the sums fit in int32 and
+// each coefficient's pass over the block is a simple loop.
+fn fe_lpc_res(e: FlacEnc*, x: int32*, n: int32, o: int32, c: int32*, shift: int32, r: int32*) -> bool {
+  var acc: int32* = (int32*)e->u;
+  for i in o..n { acc[i] = 0; }
+  for j in 0..o {
+    var cj: int32 = c[j];
+    var xs: int32* = x - 1 - (int32)j;
+    fe_mac(acc + o, xs + o, cj, (int64)(n - o));
+  }
+  for i in 0..o { r[i] = x[i]; }
+  var lim: int32 = 1073741823;
+  for i in o..n {
+    var v: int32 = x[i] - (acc[i] >> shift);
+    if (v > lim || v < -lim) { return false; }
+    r[i] = v;
+  }
+  return true;
+}
+
+// Quantizes LPC coefficients to `prec` bits (libFLAC's rule, with the
+// rounding error carried forward). Returns the shift, or -1.
+fn fe_quant(lp: float64*, o: int32, prec: int32, q: int32*) -> int32 {
+  var cmax: float64 = 0.0;
+  for i in 0..o {
+    var a: float64 = lp[i];
+    if (a < 0.0) { a = -a; }
+    if (a > cmax) { cmax = a; }
+  }
+  if (cmax <= 0.0) { return -1; }
+  // floor(log2(cmax)) + 1 like frexp
+  var l2: int32 = 0;
+  var c: float64 = cmax;
+  while (c >= 1.0) { c = c / 2.0; l2 = l2 + 1; }
+  while (c < 0.5) { c = c * 2.0; l2 = l2 - 1; }
+  var shift: int32 = prec - 1 - l2;
+  if (shift > 15) { shift = 15; }
+  if (shift < 0) { return -1; }
+  var qmax: int32 = (1 << (prec - 1)) - 1;
+  var qmin: int32 = -(1 << (prec - 1));
+  var err: float64 = 0.0;
+  var scale: float64 = (float64)((int64)1 << shift);
+  for i in 0..o {
+    err = err + lp[i] * scale;
+    var v: int32 = 0;
+    if (err >= 0.0) { v = (int32)(err + 0.5); } else { v = (int32)(err - 0.5); }
+    if (v > qmax) { v = qmax; }
+    if (v < qmin) { v = qmin; }
+    err = err - (float64)v;
+    q[i] = v;
+  }
+  return shift;
+}
+
+fn fe_copy_plan(dst: FlacPlan*, src: FlacPlan*) {
+  memcpy(dst, src, sizeof(FlacPlan));
+}
+
+// Finds the smallest coding of x (n samples, bps bits). The residual of the
+// result is left in `keep`.
+fn fe_channel(e: FlacEnc*, x: int32*, n: int32, bps: int32, out: FlacPlan*, keep: int32*) {
+  var trial: FlacPlan;
+  memset(out, 0, sizeof(FlacPlan));
+  // constant
+  var same: bool = true;
+  for i in 1..n { if (x[i] != x[0]) { same = false; break; } }
+  if (same) {
+    out->kind = 0;
+    out->bits = (int64)bps;
+    return;
+  }
+  out->kind = 1;
+  out->bits = (int64)bps * (int64)n;
+  // fixed: the order with the smallest residual sum (one pass over all five,
+  // like libFLAC), then its Rice cost
+  var fsum: uint64 = 0;
+  var bo: int32 = fe_best_fixed(x, n, &fsum);
+  fe_fixed_res(x, n, bo, e->res);
+  fe_fold(e, e->res, n);
+  memset(&trial, 0, sizeof(FlacPlan));
+  trial.kind = 2;
+  trial.order = bo;
+  trial.bits = (int64)bps * (int64)bo + fe_rice_plan(e, n, bo, &trial);
+  if (trial.bits < out->bits) {
+    fe_copy_plan(out, &trial);
+    memcpy(keep, e->res, (int64)n * 4);
+  }
+  // LPC
+  var maxl: int32 = e->cfg.max_lpc;
+  if (maxl >= n) { maxl = n - 1; }
+  if (maxl <= 0) { return; }
+  var prec: int32 = 13;
+  if (n <= 192) { prec = 7; } else if (n <= 384) { prec = 8; } else if (n <= 576) { prec = 9; }
+  else if (n <= 1152) { prec = 10; } else if (n <= 2304) { prec = 11; } else if (n <= 4608) { prec = 12; }
+  if (bps > 16) { prec = prec + 2; }
+  if (prec > 15) { prec = 15; }
+  var ac: float64[33];
+  var lp: float64[1056];
+  var errs: float64[33];
+  var q: int32[32];
+  for wi in 0..e->nwin {
+    var w: float64* = e->win + (int64)wi * (int64)e->cfg.block;
+    var wx: float64* = e->wtmp;
+    fe_window_mul(wx, x, w, (int64)n);
+    for lag in 0..=maxl {
+      ac[lag] = fe_dot(wx + (int32)lag, wx, (int64)(n - (int32)lag));
+    }
+    if (ac[0] <= 0.0) { continue; }
+    // Levinson-Durbin: lp[(o-1)*32 + j] are the coefficients for order o
+    var err: float64 = ac[0];
+    var a: float64[33];
+    for i in 0..33 { a[i] = 0.0; }
+    var top: int32 = 0;
+    for o in 0..maxl {
+      var r: float64 = -ac[o + 1];
+      for j in 0..o { r = r - a[j] * ac[o - (int32)j]; }
+      if (err <= 0.0) { break; }
+      r = r / err;
+      a[o] = r;
+      for j in 0..o / 2 {
+        var t: float64 = a[j];
+        a[j] = a[j] + r * a[o - 1 - (int32)j];
+        a[o - 1 - (int32)j] = a[o - 1 - (int32)j] + r * t;
+      }
+      if ((o & 1) != 0) { a[o / 2] = a[o / 2] + a[o / 2] * r; }
+      err = err * (1.0 - r * r);
+      for j in 0..=o { lp[o * 32 + (int32)j] = -a[j]; }
+      errs[o] = err;
+      top = (int32)o + 1;
+    }
+    if (top == 0) { continue; }
+    // the order with the fewest expected bits
+    var bestk: int32 = 1;
+    var bestb: float64 = 0.0;
+    for o in 1..=top {
+      var ev: float64 = errs[o - 1];
+      var bpr: float64 = 0.0;
+      if (ev > 0.0) {
+        bpr = 0.5 * fe_log2(ev * 0.5 / (float64)n);
+        if (bpr < 0.0) { bpr = 0.0; }
+      }
+      var b: float64 = bpr * (float64)(n - (int32)o) + (float64)((int32)o * (prec + bps));
+      if (o == 1 || b < bestb) { bestb = b; bestk = (int32)o; }
+    }
+    var tries: int32[2] = [bestk, top];
+    var ntry: int32 = 1;
+    if (e->cfg.windows >= 3 && top != bestk) { ntry = 2; }
+    for ti in 0..ntry {
+      var o: int32 = tries[ti];
+      var p: int32 = prec;
+      // keep bps + precision + log2(order) within 32 bits like libFLAC
+      while (p > 5 && bps + p + ilog2((uint64)o) > 32) { p = p - 1; }
+      var sh: int32 = fe_quant(&lp[(o - 1) * 32], o, p, &q[0]);
+      if (sh < 0) { continue; }
+      if (!fe_lpc_res(e, x, n, o, &q[0], sh, e->res)) { continue; }
+      fe_fold(e, e->res, n);
+      memset(&trial, 0, sizeof(FlacPlan));
+      trial.kind = 3;
+      trial.order = o;
+      trial.prec = p;
+      trial.shift = sh;
+      for j in 0..o { trial.coef[j] = q[j]; }
+      trial.bits = (int64)bps * (int64)o + 9 + (int64)(p * o) + fe_rice_plan(e, n, o, &trial);
+      if (trial.bits < out->bits) {
+        fe_copy_plan(out, &trial);
+        memcpy(keep, e->res, (int64)n * 4);
+      }
+    }
+  }
+}
+
+// Writes n Rice codes with parameter k. The bit accumulator is kept in
+// locals and the buffer room is made once, so the loop does no calls.
+fn fe_put_rice(w: AudioBitW*, r: int32*, n: int32, k: int32) {
+  if (n <= 0) { return; }
+  var b: AudioBuf* = w->out;
+  // worst case for codes that fit one put: 32 bits each
+  if (audio_buf_reserve(b, (int64)n * 4 + 16) != AUDIO_OK) { w->err = AUDIO_E_MEM; return; }
+  var acc: uint64 = w->acc;
+  var cnt: int32 = w->n;
+  var mask: uint32 = (uint32)(((uint64)1 << k) - 1);
+  var lim: uint32 = (uint32)(31 - k);
+  var q8: uint8* = b->data;
+  var len: int64 = b->len;
+  for i in 0..n {
+    var v: int32 = r[i];
+    var u: uint32 = ((uint32)v << 1) ^ (uint32)(v >> 31);
+    var q: uint32 = u >> k;
+    if (q <= lim) {
+      var bits: int32 = (int32)q + 1 + k;
+      acc = (acc << bits) | (uint64)(((uint32)1 << k) | (u & mask));
+      cnt = cnt + bits;
+      if (cnt >= 32) {
+        var x: uint64 = acc >> (cnt - 32);
+        q8[len] = (uint8)(x >> 24);
+        q8[len + 1] = (uint8)(x >> 16);
+        q8[len + 2] = (uint8)(x >> 8);
+        q8[len + 3] = (uint8)x;
+        len = len + 4;
+        cnt = cnt - 32;
+      }
+    } else {
+      // a long code: through the general writer
+      b->len = len;
+      w->acc = acc;
+      w->n = cnt;
+      audio_bitw_unary(w, q);
+      audio_bitw_put(w, u, k);
+      if (audio_buf_reserve(b, (int64)(n - (int32)i) * 4 + 16) != AUDIO_OK) { w->err = AUDIO_E_MEM; return; }
+      q8 = b->data;
+      len = b->len;
+      acc = w->acc;
+      cnt = w->n;
+    }
+  }
+  b->len = len;
+  w->acc = acc;
+  w->n = cnt;
+}
+
+fn fe_write_sub(w: AudioBitW*, pl: FlacPlan*, x: int32*, r: int32*, n: int32, bps: int32, wasted: int32) {
+  var t: int32 = 1;
+  if (pl->kind == 0) { t = 0; }
+  else if (pl->kind == 2) { t = 8 + pl->order; }
+  else if (pl->kind == 3) { t = 31 + pl->order; }
+  audio_bitw_put(w, 0, 1);
+  audio_bitw_put(w, (uint32)t, 6);
+  if (wasted > 0) { audio_bitw_put(w, 1, 1); audio_bitw_unary(w, (uint32)(wasted - 1)); }
+  else { audio_bitw_put(w, 0, 1); }
+  if (pl->kind == 0) { audio_bitw_sput(w, x[0], bps); return; }
+  if (pl->kind == 1) {
+    for i in 0..n { audio_bitw_sput(w, x[i], bps); }
+    return;
+  }
+  for i in 0..pl->order { audio_bitw_sput(w, x[i], bps); }
+  if (pl->kind == 3) {
+    audio_bitw_put(w, (uint32)(pl->prec - 1), 4);
+    audio_bitw_sput(w, pl->shift, 5);
+    for i in 0..pl->order { audio_bitw_sput(w, pl->coef[i], pl->prec); }
+  }
+  // residual
+  var pbits: int32 = 4;
+  if (pl->wide) { audio_bitw_put(w, 1, 2); pbits = 5; } else { audio_bitw_put(w, 0, 2); }
+  audio_bitw_put(w, (uint32)pl->po, 4);
+  var np: int32 = 1 << pl->po;
+  var per: int32 = n >> pl->po;
+  var at: int32 = pl->order;
+  for p in 0..np {
+    var k: int32 = pl->rp[p];
+    audio_bitw_put(w, (uint32)k, pbits);
+    var end: int32 = ((int32)p + 1) * per;
+    fe_put_rice(w, r + at, end - at, k);
+    at = end;
+  }
+}
+
+// Removes the wasted low zero bits of a channel into dst; returns how many.
+fn fe_wasted(x: int32*, n: int32, dst: int32*) -> int32 {
+  var o: int32 = 0;
+  for i in 0..n { o = o | x[i]; }
+  var k: int32 = 0;
+  if (o != 0) {
+    while ((o & 1) == 0) { o = o >> 1; k = k + 1; }
+  }
+  for i in 0..n { dst[i] = x[i] >> k; }
+  return k;
+}
+
+fn fe_utf8(w: AudioBitW*, v: int64) {
+  if (v < 0x80) { audio_bitw_put(w, (uint32)v, 8); return; }
+  var bytes: int32 = 2;
+  while (bytes < 7 && v >= ((int64)1 << (5 * bytes + 1))) { bytes = bytes + 1; }
+  var lead: uint32 = (uint32)((0xFF00 >> bytes) & 0xFF);
+  var sh: int32 = 6 * (bytes - 1);
+  audio_bitw_put(w, lead | (uint32)(v >> sh), 8);
+  while (sh > 0) {
+    sh = sh - 6;
+    audio_bitw_put(w, 0x80 | (uint32)((v >> sh) & 0x3F), 8);
+  }
+}
+
+fn fe_rate_code(rate: int32) -> int32 {
+  switch (rate) {
+    case 88200: { return 1; }
+    case 176400: { return 2; }
+    case 192000: { return 3; }
+    case 8000: { return 4; }
+    case 16000: { return 5; }
+    case 22050: { return 6; }
+    case 24000: { return 7; }
+    case 32000: { return 8; }
+    case 44100: { return 9; }
+    case 48000: { return 10; }
+    case 96000: { return 11; }
+    default: { }
+  }
+  if (rate % 1000 == 0 && rate / 1000 <= 255) { return 12; }
+  if (rate <= 65535) { return 13; }
+  if (rate % 10 == 0 && rate / 10 <= 65535) { return 14; }
+  return 0;
+}
+
+fn fe_bps_code(bps: int32) -> int32 {
+  switch (bps) {
+    case 8: { return 1; }
+    case 12: { return 2; }
+    case 16: { return 4; }
+    case 20: { return 5; }
+    case 24: { return 6; }
+    case 32: { return 7; }
+    default: { }
+  }
+  return 0;
+}
+
+// Codes one frame of n samples per channel (in e->sm) as frame number fno.
+fn fe_frame(e: FlacEnc*, out: AudioBuf*, fno: int64, n: int32, rate: int32) -> int32 {
+  var start: int64 = out->len;
+  var w: AudioBitW;
+  audio_bitw_init(&w, out);
+  var bps: int32 = e->bps;
+  // choose how to code the channels
+  var plans: FlacPlan[4];
+  var wasted: int32[4];
+  var assign: int32 = e->ch - 1;
+  var nch: int32 = e->ch;
+  var cand: int32 = nch;
+  var stereo: bool = e->cfg.stereo && nch == 2 && bps < 32;
+  if (stereo) {
+    var l: int32* = e->sm[0];
+    var r: int32* = e->sm[1];
+    var m: int32* = e->sm[2];
+    var s: int32* = e->sm[3];
+    for i in 0..n {
+      m[i] = (l[i] + r[i]) >> 1;
+      s[i] = l[i] - r[i];
+    }
+    cand = 4;
+  }
+  // per candidate channel: wasted bits removed, then the best plan
+  var xs: int32*[4];
+  var use: bool[4] = [true, true, true, true];
+  var order: int32[2] = [0, 1];
+  var quick: bool = stereo && e->cfg.max_lpc < 12;
+  if (quick) {
+    // pick the stereo coding from estimates, then code only its two channels
+    var est: uint64[4];
+    for c in 0..4 { est[c] = fe_estimate(e->sm[c], n); }
+    assign = 1;
+    var best: uint64 = est[0] + est[1];
+    if (est[0] + est[3] < best) { best = est[0] + est[3]; assign = 8; order[0] = 0; order[1] = 3; }
+    if (est[1] + est[3] < best) { best = est[1] + est[3]; assign = 9; order[0] = 3; order[1] = 1; }
+    if (est[2] + est[3] < best) { best = est[2] + est[3]; assign = 10; order[0] = 2; order[1] = 3; }
+    for c in 0..4 { use[c] = c == order[0] || c == order[1]; }
+  }
+  for c in 0..cand {
+    if (!use[c]) { continue; }
+    var cb: int32 = bps;
+    if (c == 3) { cb = bps + 1; }
+    var tmp: int32* = e->wsm + (int64)c * (int64)e->cfg.block;
+    wasted[c] = fe_wasted(e->sm[c], n, tmp);
+    xs[c] = tmp;
+    fe_channel(e, tmp, n, cb - wasted[c], &plans[c], e->best[c]);
+  }
+  if (stereo && !quick) {
+    var lr: int64 = plans[0].bits + plans[1].bits;
+    var ls: int64 = plans[0].bits + plans[3].bits;
+    var rs: int64 = plans[1].bits + plans[3].bits;
+    var ms: int64 = plans[2].bits + plans[3].bits;
+    assign = 1;
+    var best: int64 = lr;
+    if (ls < best) { best = ls; assign = 8; order[0] = 0; order[1] = 3; }
+    if (rs < best) { best = rs; assign = 9; order[0] = 3; order[1] = 1; }
+    if (ms < best) { best = ms; assign = 10; order[0] = 2; order[1] = 3; }
+  }
+  // header
+  audio_bitw_put(&w, 0xFFF8, 16);
+  var bsc: int32 = 7;
+  if (n == 192) { bsc = 1; }
+  else if (n == 576) { bsc = 2; } else if (n == 1152) { bsc = 3; } else if (n == 2304) { bsc = 4; } else if (n == 4608) { bsc = 5; }
+  else if (n == 256) { bsc = 8; } else if (n == 512) { bsc = 9; } else if (n == 1024) { bsc = 10; } else if (n == 2048) { bsc = 11; }
+  else if (n == 4096) { bsc = 12; } else if (n == 8192) { bsc = 13; } else if (n == 16384) { bsc = 14; } else if (n == 32768) { bsc = 15; }
+  else if (n <= 256) { bsc = 6; }
+  var rcode: int32 = fe_rate_code(rate);
+  audio_bitw_put(&w, (uint32)bsc, 4);
+  audio_bitw_put(&w, (uint32)rcode, 4);
+  audio_bitw_put(&w, (uint32)assign, 4);
+  audio_bitw_put(&w, (uint32)fe_bps_code(bps), 3);
+  audio_bitw_put(&w, 0, 1);
+  fe_utf8(&w, fno);
+  if (bsc == 6) { audio_bitw_put(&w, (uint32)(n - 1), 8); }
+  if (bsc == 7) { audio_bitw_put(&w, (uint32)(n - 1), 16); }
+  if (rcode == 12) { audio_bitw_put(&w, (uint32)(rate / 1000), 8); }
+  if (rcode == 13) { audio_bitw_put(&w, (uint32)rate, 16); }
+  if (rcode == 14) { audio_bitw_put(&w, (uint32)(rate / 10), 16); }
+  audio_bitw_flush(&w);
+  if (w.err != AUDIO_OK) { return w.err; }
+  var crc: uint32 = audio_crc8(0, out->data + start, out->len - start);
+  audio_bitw_put(&w, crc, 8);
+  // subframes
+  if (stereo) {
+    for k in 0..2 {
+      var c: int32 = order[k];
+      var cb: int32 = bps;
+      if (c == 3) { cb = bps + 1; }
+      fe_write_sub(&w, &plans[c], xs[c], e->best[c], n, cb - wasted[c], wasted[c]);
+    }
+  } else {
+    for c in 0..nch {
+      fe_write_sub(&w, &plans[c], xs[c], e->best[c], n, bps - wasted[c], wasted[c]);
+    }
+  }
+  audio_bitw_flush(&w);
+  if (w.err != AUDIO_OK) { return w.err; }
+  var crc16: uint32 = audio_crc16(0, out->data + start, out->len - start);
+  audio_buf_u16be(out, (int64)crc16);
+  return AUDIO_OK;
+}
+
+/// Encodes pcm (U8, S16, S24 or S32; pcm.bits from 4 to 32 says how many
+/// bits are real) as a FLAC file. Level 0 is fastest, 8 smallest; 5 is the
+/// usual choice.
+export fn audio_flac_encode(pcm: AudioPcm*, level: int32, out: AudioBuf*) -> int32 {
+  var ss: int32 = audio_fmt_size(pcm->fmt);
+  if (pcm->fmt == AUDIO_F32 || pcm->fmt == AUDIO_F64 || ss == 0) { return AUDIO_E_ARG; }
+  if (pcm->channels < 1 || pcm->channels > 8 || pcm->rate < 1 || pcm->rate > 1048575) { return AUDIO_E_ARG; }
+  if (pcm->data == 0 && pcm->frames > 0) { return AUDIO_E_ARG; }
+  var bps: int32 = ss * 8;
+  if (pcm->bits >= 4 && pcm->bits < bps) { bps = pcm->bits; }
+  var e: FlacEnc;
+  memset(&e, 0, sizeof(FlacEnc));
+  e.cfg = flac_cfg(level);
+  e.bps = bps;
+  e.ch = pcm->channels;
+  var bl: int64 = (int64)e.cfg.block;
+  // working memory
+  var ok: bool = true;
+  e.win = (float64*)malloc(bl * 6 * 8);
+  e.wtmp = (float64*)malloc(bl * 8);
+  e.res = (int32*)malloc(bl * 4);
+  e.u = (uint32*)malloc(bl * 4);
+  e.sums = (uint64*)malloc(256 * 8);
+  e.wsm = (int32*)malloc(bl * 4 * 4);
+  if (e.win == 0 || e.wtmp == 0 || e.res == 0 || e.u == 0 || e.sums == 0 || e.wsm == 0) { ok = false; }
+  for c in 0..4 {
+    e.best[c] = (int32*)malloc(bl * 4);
+    if (e.best[c] == 0) { ok = false; }
+  }
+  for c in 0..8 {
+    if (c < 4 || c < pcm->channels) {
+      var q: int32* = (int32*)malloc(bl * 4);
+      if (q == 0) { ok = false; }
+      if (c < 4) { e.sm[c] = q; } else { free(q); }
+    }
+  }
+  var chans: int32*[8];
+  for c in 0..8 { chans[c] = (int32*)0; }
+  for c in 0..pcm->channels {
+    if (c < 4) { chans[c] = e.sm[c]; }
+    else {
+      chans[c] = (int32*)malloc(bl * 4);
+      if (chans[c] == 0) { ok = false; }
+    }
+  }
+  var rc: int32 = AUDIO_OK;
+  if (!ok) { rc = AUDIO_E_MEM; }
+  // metadata: STREAMINFO, SEEKTABLE (a point every 10 s), VORBIS_COMMENT
+  var start: int64 = out->len;
+  var npts: int64 = 0;
+  if (pcm->frames > 0) { npts = (pcm->frames + (int64)pcm->rate * 10 - 1) / ((int64)pcm->rate * 10); }
+  if (npts > 65536) { npts = 65536; }
+  var vendor: string = "Mettle audio";
+  if (rc == AUDIO_OK) {
+    audio_buf_str(out, "fLaC");
+    audio_buf_push(out, 0);
+    audio_buf_u24be(out, 34);
+    var info: int64 = out->len;
+    for i in 0..34 { audio_buf_push(out, 0); }
+    if (npts > 0) {
+      audio_buf_push(out, 3);
+      audio_buf_u24be(out, npts * 18);
+      for i in 0..npts * 18 { audio_buf_push(out, 0); }
+    }
+    audio_buf_push(out, 0x84);
+    audio_buf_u24be(out, 4 + (int64)vendor.length + 4);
+    audio_buf_u32le(out, (int64)vendor.length);
+    audio_buf_str(out, vendor);
+    rc = audio_buf_u32le(out, 0);
+  }
+  var first: int64 = out->len;
+  var md: AudioMd5;
+  audio_md5_init(&md);
+  var minf: int64 = -1;
+  var maxf: int64 = 0;
+  var pt: int64 = 0;
+  var tmp: uint8[256];
+  var bytes: int64 = (int64)((bps + 7) / 8);
+  var fno: int64 = 0;
+  var at: int64 = 0;
+  var fs: int64 = (int64)ss * (int64)pcm->channels;
+  while (rc == AUDIO_OK && at < pcm->frames) {
+    var n: int32 = e.cfg.block;
+    if (pcm->frames - at < (int64)n) { n = (int32)(pcm->frames - at); }
+    fe_windows(&e, n);
+    // samples, at bps bits
+    var src: uint8* = pcm->data + at * fs;
+    var sh: int32 = ss * 8 - bps;
+    var nc: int64 = (int64)pcm->channels;
+    if (ss == 2) {
+      var q16: int16* = (int16*)src;
+      for c in 0..nc {
+        var dst: int32* = chans[c];
+        for i in 0..(int64)n { dst[i] = (int32)q16[i * nc + c] >> sh; }
+      }
+    } else {
+      for i in 0..n {
+        for c in 0..pcm->channels {
+          var q: uint8* = src + ((int64)i * nc + (int64)c) * (int64)ss;
+          var v: int32 = 0;
+          if (ss == 1) { v = (int32)q[0] - 128; }
+          else if (ss == 3) { v = ((int32)(((uint32)q[0] << 8) | ((uint32)q[1] << 16) | ((uint32)q[2] << 24))) >> 8; }
+          else { v = (int32)((uint32)q[0] | ((uint32)q[1] << 8) | ((uint32)q[2] << 16) | ((uint32)q[3] << 24)); }
+          chans[c][i] = v >> sh;
+        }
+      }
+    }
+    if (sh == 0 && ss >= 2) {
+      // the MD5 input is the samples as stored
+      audio_md5_add(&md, src, (int64)n * fs);
+    } else {
+      var t: int64 = 0;
+      for i in 0..n {
+        for c in 0..pcm->channels {
+          var v: int32 = chans[c][i];
+          for j in 0..bytes { tmp[t] = (uint8)(v >> (8 * (int32)j)); t = t + 1; }
+          if (t > 240) { audio_md5_add(&md, &tmp[0], t); t = 0; }
+        }
+      }
+      audio_md5_add(&md, &tmp[0], t);
+    }
+    // channels past the first four are coded alone: shift them in turn
+    var fstart: int64 = out->len;
+    if (pcm->channels <= 4) {
+      rc = fe_frame(&e, out, fno, n, pcm->rate);
+    } else {
+      rc = fe_frame_many(&e, out, fno, n, pcm->rate, &chans[0]);
+    }
+    var flen: int64 = out->len - fstart;
+    if (minf < 0 || flen < minf) { minf = flen; }
+    if (flen > maxf) { maxf = flen; }
+    if (pt < npts && at >= pt * (int64)pcm->rate * 10) {
+      var q: uint8* = out->data + first - 4 - (int64)vendor.length - 4 - 4 - npts * 18 + pt * 18;
+      var off: int64 = fstart - first;
+      for i in 0..8 { q[i] = (uint8)((at >> (56 - 8 * (int32)i)) & 255); }
+      for i in 0..8 { q[8 + i] = (uint8)((off >> (56 - 8 * (int32)i)) & 255); }
+      q[16] = (uint8)((n >> 8) & 255);
+      q[17] = (uint8)(n & 255);
+      pt = pt + 1;
+    }
+    at = at + (int64)n;
+    fno = fno + 1;
+  }
+  // unused seek points become placeholders
+  if (rc == AUDIO_OK) {
+    while (pt < npts) {
+      var q: uint8* = out->data + first - 4 - (int64)vendor.length - 4 - 4 - npts * 18 + pt * 18;
+      for i in 0..8 { q[i] = 0xFF; }
+      pt = pt + 1;
+    }
+    // fill in STREAMINFO
+    var q: uint8* = out->data + start + 8;
+    var bs: int64 = (int64)e.cfg.block;
+    if (pcm->frames < bs) { bs = pcm->frames; if (bs < 16) { bs = 16; } }
+    q[0] = (uint8)(bs >> 8); q[1] = (uint8)bs;
+    q[2] = (uint8)(bs >> 8); q[3] = (uint8)bs;
+    if (minf < 0) { minf = 0; }
+    q[4] = (uint8)(minf >> 16); q[5] = (uint8)(minf >> 8); q[6] = (uint8)minf;
+    q[7] = (uint8)(maxf >> 16); q[8] = (uint8)(maxf >> 8); q[9] = (uint8)maxf;
+    var a: int64 = ((int64)pcm->rate << 44) | ((int64)(pcm->channels - 1) << 41) | ((int64)(bps - 1) << 36) | (pcm->frames & 0xFFFFFFFFF);
+    for i in 0..8 { q[10 + i] = (uint8)((a >> (56 - 8 * (int32)i)) & 255); }
+    var dg: uint8[16];
+    audio_md5_end(&md, &dg[0]);
+    for i in 0..16 { q[18 + i] = dg[i]; }
+  }
+  if (e.win != 0) { free(e.win); }
+  if (e.wtmp != 0) { free(e.wtmp); }
+  if (e.res != 0) { free(e.res); }
+  if (e.u != 0) { free(e.u); }
+  if (e.sums != 0) { free(e.sums); }
+  if (e.wsm != 0) { free(e.wsm); }
+  for c in 0..4 {
+    if (e.best[c] != 0) { free(e.best[c]); }
+    if (e.sm[c] != 0) { free(e.sm[c]); }
+  }
+  for c in 4..8 { if (chans[c] != 0) { free(chans[c]); } }
+  return rc;
+}
+
+// A frame of more than four channels: each is coded alone.
+fn fe_frame_many(e: FlacEnc*, out: AudioBuf*, fno: int64, n: int32, rate: int32, chans: int32**) -> int32 {
+  // fe_frame works on e->sm[0..ch); swap the channel blocks in a group of
+  // four at a time is not possible in one frame, so code all channels
+  // through slot 0 here
+  var start: int64 = out->len;
+  var w: AudioBitW;
+  audio_bitw_init(&w, out);
+  var bps: int32 = e->bps;
+  audio_bitw_put(&w, 0xFFF8, 16);
+  var bsc: int32 = 7;
+  if (n == 4096) { bsc = 12; } else if (n == 1152) { bsc = 3; } else if (n <= 256) { bsc = 6; }
+  var rcode: int32 = fe_rate_code(rate);
+  audio_bitw_put(&w, (uint32)bsc, 4);
+  audio_bitw_put(&w, (uint32)rcode, 4);
+  audio_bitw_put(&w, (uint32)(e->ch - 1), 4);
+  audio_bitw_put(&w, (uint32)fe_bps_code(bps), 3);
+  audio_bitw_put(&w, 0, 1);
+  fe_utf8(&w, fno);
+  if (bsc == 6) { audio_bitw_put(&w, (uint32)(n - 1), 8); }
+  if (bsc == 7) { audio_bitw_put(&w, (uint32)(n - 1), 16); }
+  if (rcode == 12) { audio_bitw_put(&w, (uint32)(rate / 1000), 8); }
+  if (rcode == 13) { audio_bitw_put(&w, (uint32)rate, 16); }
+  if (rcode == 14) { audio_bitw_put(&w, (uint32)(rate / 10), 16); }
+  audio_bitw_flush(&w);
+  if (w.err != AUDIO_OK) { return w.err; }
+  var crc: uint32 = audio_crc8(0, out->data + start, out->len - start);
+  audio_bitw_put(&w, crc, 8);
+  var pl: FlacPlan;
+  for c in 0..e->ch {
+    var x: int32* = e->wsm;
+    var ws: int32 = fe_wasted(chans[c], n, x);
+    fe_channel(e, x, n, bps - ws, &pl, e->best[0]);
+    fe_write_sub(&w, &pl, x, e->best[0], n, bps - ws, ws);
+  }
+  audio_bitw_flush(&w);
+  if (w.err != AUDIO_OK) { return w.err; }
+  var crc16: uint32 = audio_crc16(0, out->data + start, out->len - start);
+  audio_buf_u16be(out, (int64)crc16);
+  return AUDIO_OK;
+}

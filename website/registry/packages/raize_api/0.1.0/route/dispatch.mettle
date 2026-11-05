@@ -1,0 +1,271 @@
+// raize_api/route/dispatch: one request through an API.
+//
+//   edge hooks -> match -> 404 / 405 / OPTIONS -> before hooks -> parameters (400)
+//   -> body: size (413), media type (415), JSON (400), checks (422) -> handler
+//   -> after hooks
+//
+// Matching picks, among the templates that fit the path, the one with literal text
+// at the earliest segment where they differ ("/tasks/new" beats "/tasks/{id}"), the
+// same priority raize's router uses. HEAD runs the GET operation.
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/date";
+import "raize_app/types";
+import "raize_app/declare";
+import "codec/core/buf";
+import "codec/core/status";
+import "../types/type";
+import "../types/decode";
+import "../problem/problem";
+import "../openapi/openapi";
+import "api";
+import "request";
+
+/// Makes an API under `base` ("/api"; "" serves from the root) and, when `app` is not
+/// 0, mounts it on raize: one route per verb, `<base>/*rest`, so the API's own matcher
+/// answers every path under base, with problem details for 404 and 405.
+/// Call it in the declaration function, then declare operations.
+export fn rapi_new(app: RzApp*, base: string, title: string, version: string) -> RapiApi* {
+  var api: RapiApi* = rapi__api_alloc(app, base, title, version);
+  if (app != 0) {
+    var pat: string = api->base + "/*rapi_rest";
+    rz_route(app, "GET", pat, &rapi__entry);
+    rz_route(app, "POST", pat, &rapi__entry);
+    rz_route(app, "PUT", pat, &rapi__entry);
+    rz_route(app, "PATCH", pat, &rapi__entry);
+    rz_route(app, "DELETE", pat, &rapi__entry);
+    rz_route(app, "OPTIONS", pat, &rapi__entry);
+  }
+  return api;
+}
+
+// The raize handler behind every mounted API: picks the API with the longest base
+// that holds the path.
+fn rapi__entry(ctx: RzContext*) -> int32 {
+  var n: int32 = 0;
+  var apis: RapiApi** = rapi__apis(&n);
+  var best: RapiApi* = (RapiApi*)0;
+  var path: string = ctx->req->path;
+  for i in 0..n {
+    var a: RapiApi* = apis[i];
+    if (a->app == 0) { continue; }
+    if (!rapi__under(path, a->base)) { continue; }
+    if (best == 0 || a->base.length > best->base.length) { best = a; }
+  }
+  if (best == 0) { return rapi_problem(ctx, 404, ""); }
+  return rapi_handle(best, ctx);
+}
+
+fn rapi__under(path: string, base: string) -> bool {
+  if (base.length == 0) { return true; }
+  if (!rz_str_starts(path, base)) { return false; }
+  return path.length == base.length || path.chars[base.length] == 47;
+}
+
+// Splits the path after the base into segments. -1 when there are too many.
+fn rapi__path_segs(rel: string, out: string*) -> int32 {
+  var n: int32 = 0;
+  var len: int64 = (int64)rel.length;
+  if (len <= 1) { return 0; }
+  var i: int64 = 1;
+  while (i <= len) {
+    var j: int64 = i;
+    while (j < len && rel.chars[j] != 47) { j = j + 1; }
+    if (n >= RAPI_SEGS_MAX) { return -1; }
+    out[n] = rz_str_sub(rel, i, j);
+    n = n + 1;
+    i = j + 1;
+  }
+  return n;
+}
+
+fn rapi__fits(op: RapiOp*, segs: string*, n: int32) -> bool {
+  if (op->nsegs != n) { return false; }
+  for i in 0..n {
+    if (op->is_param[i]) {
+      if (segs[i].length == 0) { return false; }
+    } else if (!rz_str_eq(op->segs[i], segs[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True when a has literal text earlier than b (a wins).
+fn rapi__beats(a: RapiOp*, b: RapiOp*) -> bool {
+  for i in 0..a->nsegs {
+    if (a->is_param[i] != b->is_param[i]) { return !a->is_param[i]; }
+  }
+  return false;
+}
+
+/// The verbs served at `rel` (a path under the base), as an Allow value
+/// ("GET, HEAD, POST"), or "" when no operation fits the path.
+export fn rapi_allowed(api: RapiApi*, rel: string) -> string {
+  var segs: string[16];
+  var n: int32 = rapi__path_segs(rel, &segs[0]);
+  if (n < 0) { return ""; }
+  var verbs: string[6] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+  var have: bool[6];
+  var any: bool = false;
+  for i in 0..api->nops {
+    var op: RapiOp* = api->ops[i];
+    if (!rapi__fits(op, &segs[0], n)) { continue; }
+    any = true;
+    for k in 0..5 {
+      if (op->verb == verbs[k]) { have[k] = true; }
+    }
+  }
+  if (!any) { return ""; }
+  var b: RzBuf* = rz_buf_new();
+  for k in 0..5 {
+    if (!have[k]) { continue; }
+    if (rz_buf_str(b).length > 0) { rz_buf_add(b, ", "); }
+    rz_buf_add(b, verbs[k]);
+    if (k == 0) { rz_buf_add(b, ", HEAD"); }
+  }
+  rz_buf_add(b, ", OPTIONS");
+  var out: string = rz_str_dup(rz_buf_str(b));
+  rz_buf_free(b);
+  return out;
+}
+
+/// The part of the request path under the API's base ("/v1/tasks/7").
+export fn rapi_rel_path(api: RapiApi*, ctx: RzContext*) -> string {
+  var path: string = ctx->req->path;
+  var rel: string = rz_str_from(path, (int64)api->base.length);
+  if (rel.length == 0) { rel = "/"; }
+  return rel;
+}
+
+fn rapi__deprecation_headers(r: RapiReq*) {
+  var op: RapiOp* = r->op;
+  if (!op->deprecated) { return; }
+  if (op->deprecated_at > 0) {
+    rz_ctx_set_header(r->ctx, "Deprecation", rz_arena_str(r->ctx->arena, "@{op->deprecated_at}"));
+  }
+  if (op->sunset_at > 0) {
+    var buf: uint8[40];
+    var d: string = rz_http_date(&buf[0], 40, op->sunset_at);
+    rz_ctx_set_header(r->ctx, "Sunset", rz_arena_str(r->ctx->arena, d));
+  }
+}
+
+/// True for application/json and any +json media type (RFC 6839).
+export fn rapi_is_json_media(media: string) -> bool {
+  var m: string = rz_str_lower(rz_str_trim(media));
+  return m == "application/json" || rz_str_ends(m, "+json");
+}
+
+fn rapi__body(r: RapiReq*) -> int32 {
+  var op: RapiOp* = r->op;
+  var ctx: RzContext* = r->ctx;
+  var req: RzRequest* = ctx->req;
+  var limit: int64 = op->max_body;
+  if (limit <= 0) { limit = r->api->max_body; }
+  if ((int64)req->body.length > limit) {
+    return rapi_problem(ctx, 413, rz_arena_str(ctx->arena, "the body is larger than {limit} bytes"));
+  }
+  if (req->body.length == 0) {
+    if (op->body_required) {
+      rapi_errors_body(r->errs, "#", "a request body is required");
+      return rapi_problem_errors(ctx, 400, "", r->errs);
+    }
+    return RAPI_NEXT;
+  }
+  var media: string = rz_req_media_type(req);
+  if (!rapi_is_json_media(media)) {
+    rz_ctx_set_header(ctx, "Accept-Post", "application/json");
+    return rapi_problem(ctx, 415, "send the body as application/json");
+  }
+  var t: RapiType* = op->body;
+  if (op->body_list) { t = (RapiType*)op->ud2; }
+  var out: rawptr = (rawptr)rz_arena_alloc_zeroed(ctx->arena, t->size);
+  if (out == 0) { return rapi_problem(ctx, 500, ""); }
+  var rc: int32 = rapi_decode(t, req->body, out, ctx->arena, r->errs, &r->present);
+  if (rc == RAPI_DECODE_SYNTAX) { return rapi_problem_errors(ctx, 400, "the body is not valid JSON", r->errs); }
+  if (rc == RAPI_DECODE_INVALID) { return rapi_problem_errors(ctx, 422, "the body has invalid values", r->errs); }
+  r->body = out;
+  return RAPI_NEXT;
+}
+
+/// Serves one request with `api`. raize calls this through the mounted routes; tests
+/// and other front ends may call it directly with a prepared context.
+/// returns: the response status
+export fn rapi_handle(api: RapiApi*, ctx: RzContext*) -> int32 {
+  for i in 0..api->nedges {
+    var st0: int32 = api->edges[i](api, ctx);
+    if (st0 != RAPI_NEXT) { return st0; }
+  }
+  var rel: string = rapi_rel_path(api, ctx);
+  var verb: string = ctx->req->verb;
+  var want: string = verb;
+  if (verb == "HEAD") { want = "GET"; }
+
+  if (want == "GET" && api->openapi_path.length > 0 && rel == api->openapi_path) {
+    return rapi_openapi_send(api, ctx);
+  }
+  if (want == "GET" && api->docs_path.length > 0 && rel == api->docs_path) {
+    return rapi_docs_send(api, ctx);
+  }
+
+  var segs: string[16];
+  var n: int32 = rapi__path_segs(rel, &segs[0]);
+  if (n < 0) { return rapi_problem(ctx, 404, ""); }
+  var found: RapiOp* = (RapiOp*)0;
+  var any: bool = false;
+  for i in 0..api->nops {
+    var op: RapiOp* = api->ops[i];
+    if (!rapi__fits(op, &segs[0], n)) { continue; }
+    any = true;
+    if (op->verb != want) { continue; }
+    if (found == 0 || rapi__beats(op, found)) { found = op; }
+  }
+  if (!any) { return rapi_problem(ctx, 404, ""); }
+  if (found == 0) {
+    var allow: string = rz_arena_str(ctx->arena, rapi_allowed(api, rel));
+    rz_ctx_set_header(ctx, "Allow", allow);
+    if (verb == "OPTIONS") { return rz_ctx_empty(ctx, 204); }
+    return rapi_problem(ctx, 405, rz_arena_str(ctx->arena, "use one of: {allow}"));
+  }
+
+  var r: RapiReq* = (RapiReq*)rz_arena_alloc_zeroed(ctx->arena, sizeof(RapiReq));
+  var errs: RapiErrors* = (RapiErrors*)rz_arena_alloc_zeroed(ctx->arena, sizeof(RapiErrors));
+  if (r == 0 || errs == 0) { return rapi_problem(ctx, 500, ""); }
+  r->ctx = ctx;
+  r->api = api;
+  r->op = found;
+  r->errs = errs;
+  r->subject = "";
+  r->scopes = "";
+  r->idem_slot = -1;
+  r->mask = -1;
+  rapi__deprecation_headers(r);
+
+  for i in 0..api->nbefores {
+    var st1: int32 = api->befores[i](r);
+    if (st1 != RAPI_NEXT) { return rapi__after(r, st1); }
+  }
+  if (!rapi__parse_params(r, &segs[0])) {
+    return rapi__after(r, rapi_problem_errors(ctx, 400, "some parameters are invalid", r->errs));
+  }
+  if (found->body != 0) {
+    var st2: int32 = rapi__body(r);
+    if (st2 != RAPI_NEXT) { return rapi__after(r, st2); }
+  }
+  var st: int32 = found->handler(r);
+  if (st >= 200 && st < 300 && found->cache_control.length > 0 && rz_resp_header_get(ctx->resp, "Cache-Control").length == 0) {
+    rz_ctx_set_header(ctx, "Cache-Control", found->cache_control);
+  }
+  return rapi__after(r, st);
+}
+
+fn rapi__after(r: RapiReq*, status: int32) -> int32 {
+  var st: int32 = status;
+  for i in 0..r->api->nafters {
+    st = r->api->afters[i](r, st);
+  }
+  return st;
+}

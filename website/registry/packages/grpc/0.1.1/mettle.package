@@ -1,0 +1,10 @@
+name = grpc
+version = 0.1.1
+description = GRPC clients and servers in pure Mettle
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Grpc
+compiler = 0.18.0
+require = press 0.1.0
+require = codec 0.1.0
+require = mtls 0.2.1
+require = cryptex 0.3.0

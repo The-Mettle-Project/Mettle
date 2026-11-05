@@ -1,0 +1,116 @@
+// raize/template/types — the compiled form, its bounds, and its errors.
+//
+// Split out of compile.mettle so the scanner, the compile entry point and the
+// renderer each stay under the one-responsibility line budget. The ownership
+// rule lives here because this is where the type lives:
+//
+//   RzTemplate owns exactly two allocations, `src` (a NUL-terminated copy of
+//   the template text) and `ops` (RZ_TEMPLATE_MAX_OPS fixed-size op records).
+//   Both are made at startup by rz_template_compile and released by
+//   rz_template_reset / rz_template_free. Rendering allocates neither.
+//
+// Bounds are named constants, not implementation details:
+//
+//   RZ_TEMPLATE_MAX_BYTES  64 KiB of template source
+//   RZ_TEMPLATE_MAX_OPS    1024 compiled operations
+//   RZ_TEMPLATE_MAX_VARS   distinct names; 32, matching RzVarMap
+//   RZ_TEMPLATE_MAX_NAME   64 bytes in one name
+//
+// A struct field extent must be a literal in Mettle, so RzTemplate.undef is
+// written 32 and RZ_TEMPLATE_MAX_VARS must stay 32 (a test asserts it).
+
+import "std/mem";
+
+export const RZ_TEMPLATE_MAX_BYTES: int64 = 65536;
+export const RZ_TEMPLATE_MAX_OPS: int32 = 1024;
+
+export const RZ_TPL_OK: int32 = 0;
+export const RZ_TPL_E_ARG: int32 = 1;
+export const RZ_TPL_E_TAG: int32 = 2;
+export const RZ_TPL_E_SECTION: int32 = 3;
+export const RZ_TPL_E_DIRECTIVE: int32 = 4;
+export const RZ_TPL_E_COMMENT: int32 = 5;
+export const RZ_TPL_E_OPS: int32 = 6;
+export const RZ_TPL_E_SIZE: int32 = 7;
+export const RZ_TPL_E_NAME: int32 = 8;
+export const RZ_TPL_E_NOMEM: int32 = 9;
+export const RZ_TPL_E_IO: int32 = 10;
+export const RZ_TPL_E_PATH: int32 = 11;
+
+export const RZ_OP_TEXT: int32 = 1;
+export const RZ_OP_VAR: int32 = 2;
+export const RZ_OP_RAW: int32 = 3;
+export const RZ_OP_SECTION: int32 = 4;
+
+export struct RzTemplateOp {
+  kind: int32;
+  name_off: int64;   // VAR/RAW/SECTION: name range in src
+  name_len: int64;
+  a: int64;          // TEXT: offset      SECTION: first body op
+  b: int64;          // TEXT: length      SECTION: end body op (exclusive)
+}
+
+export struct RzTemplateRef {
+  off: int64;
+  len: int64;
+}
+
+// The literal 32 is RZ_TEMPLATE_MAX_VARS (a struct field extent cannot be a
+// constant in Mettle). t_rz_template_vars_limit asserts the boundary.
+export struct RzTemplate {
+  src: uint8*;                 // owned copy, NUL-terminated for diagnostics
+  src_len: int64;
+  ops: RzTemplateOp*;          // owned, RZ_TEMPLATE_MAX_OPS entries
+  op_count: int32;
+  error: int32;                // RZ_TPL_*; 0 means "safe to serve"
+  error_at: int64;             // byte offset of the first refusal
+  undef: RzTemplateRef[32];    // referenced names with no declared default
+  undef_count: int32;
+  reported: bool;              // the one startup report has been made
+}
+
+// Frees the two owned buffers but leaves `error`/`error_at` intact, so a
+// failed compile can still be reported with its offset.
+export fn rz_template_release(t: RzTemplate*) {
+  if (t->src != 0) {
+    free(t->src);
+    t->src = 0;
+  }
+  if (t->ops != 0) {
+    free(t->ops);
+    t->ops = 0;
+  }
+  t->src_len = 0;
+  t->op_count = 0;
+}
+
+export fn rz_template_reset(t: RzTemplate*) {
+  if (t == 0) { return; }
+  rz_template_release(t);
+  t->error = RZ_TPL_OK;
+  t->error_at = 0;
+  t->undef_count = 0;
+  t->reported = false;
+}
+
+export fn rz_template_strerror(code: int32) -> string {
+  if (code == RZ_TPL_OK) { return "ok"; }
+  if (code == RZ_TPL_E_ARG) { return "null template or buffer"; }
+  if (code == RZ_TPL_E_TAG) { return "unclosed or malformed tag"; }
+  if (code == RZ_TPL_E_SECTION) { return "unmatched, mismatched or nested section"; }
+  if (code == RZ_TPL_E_DIRECTIVE) { return "unknown directive"; }
+  if (code == RZ_TPL_E_COMMENT) { return "unclosed comment"; }
+  if (code == RZ_TPL_E_OPS) { return "template too complex (op capacity)"; }
+  if (code == RZ_TPL_E_SIZE) { return "template too large"; }
+  if (code == RZ_TPL_E_NAME) { return "invalid or too many variable names"; }
+  if (code == RZ_TPL_E_NOMEM) { return "out of memory"; }
+  if (code == RZ_TPL_E_IO) { return "cannot read template file"; }
+  if (code == RZ_TPL_E_PATH) { return "template path invalid or too long"; }
+  return "unknown template error";
+}
+
+export fn rz_template_ok(t: RzTemplate*) -> bool {
+  if (t == 0) { return false; }
+  return t->error == RZ_TPL_OK;
+}
+

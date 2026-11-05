@@ -1,0 +1,255 @@
+// TGA (Truevision Targa). Decodes color-mapped, true-color and gray images,
+// raw or RLE, 8 to 32 bits, any origin corner. Encodes gray, RGB and RGBA,
+// raw or RLE.
+
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "../core/buf";
+import "../ops/convert";
+import "common";
+
+/// TGA has no magic number, so this checks that the header makes sense.
+export fn etch_tga_is(p: uint8*, n: int64) -> bool {
+  if (n < 18) { return false; }
+  var cm: int32 = (int32)p[1];
+  var t: int32 = (int32)p[2];
+  if (cm > 1) { return false; }
+  if (t != 1 && t != 2 && t != 3 && t != 9 && t != 10 && t != 11) { return false; }
+  if ((t == 1 || t == 9) && cm != 1) { return false; }
+  var d: int32 = (int32)p[16];
+  if (d != 8 && d != 15 && d != 16 && d != 24 && d != 32) { return false; }
+  if (cm == 1) {
+    var cd: int32 = (int32)p[7];
+    if (cd != 15 && cd != 16 && cd != 24 && cd != 32) { return false; }
+  }
+  var w: int32 = (int32)p[12] | ((int32)p[13] << 8);
+  var h: int32 = (int32)p[14] | ((int32)p[15] << 8);
+  return w > 0 && h > 0;
+}
+
+// Reads one color of `bits` from q into rgba.
+fn read_color(q: uint8*, bits: int32, gray: bool, rgba: uint8*) {
+  if (gray) {
+    rgba[0] = q[0]; rgba[1] = q[0]; rgba[2] = q[0];
+    if (bits == 16) { rgba[3] = q[1]; } else { rgba[3] = 255; }
+    return;
+  }
+  if (bits == 15 || bits == 16) {
+    var v: int32 = (int32)q[0] | ((int32)q[1] << 8);
+    var r: int32 = (v >> 10) & 31;
+    var g: int32 = (v >> 5) & 31;
+    var b: int32 = v & 31;
+    rgba[0] = (uint8)((r << 3) | (r >> 2));
+    rgba[1] = (uint8)((g << 3) | (g >> 2));
+    rgba[2] = (uint8)((b << 3) | (b >> 2));
+    rgba[3] = 255;
+    if (bits == 16 && (v & 32768) == 0) { rgba[3] = 0; }
+    return;
+  }
+  rgba[0] = q[2]; rgba[1] = q[1]; rgba[2] = q[0];
+  if (bits == 32) { rgba[3] = q[3]; } else { rgba[3] = 255; }
+}
+
+/// Decodes a TGA file into GRAY8, GA8, RGB8 or RGBA8.
+export fn etch_tga_decode(p: uint8*, n: int64, out: EtchImage*, o: EtchOpts*) -> int32 {
+  if (p == 0 || out == 0 || n < 0) { return ETCH_E_ARG; }
+  if (n < 18) { return ETCH_E_TRUNC; }
+  if (!etch_tga_is(p, n)) { return ETCH_E_DATA; }
+  var idlen: int64 = (int64)p[0];
+  var cmtype: int32 = (int32)p[1];
+  var t: int32 = (int32)p[2];
+  var cmfirst: int64 = (int64)p[3] | ((int64)p[4] << 8);
+  var cmlen: int64 = (int64)p[5] | ((int64)p[6] << 8);
+  var cmbits: int32 = (int32)p[7];
+  var w: int64 = (int64)p[12] | ((int64)p[13] << 8);
+  var h: int64 = (int64)p[14] | ((int64)p[15] << 8);
+  var bits: int32 = (int32)p[16];
+  var desc: int32 = (int32)p[17];
+  var rle: bool = t >= 9;
+  var base: int32 = t & 7;
+  var gray: bool = base == 3;
+  var mapped: bool = base == 1;
+  if (mapped && bits != 8 && bits != 16) { return ETCH_E_DATA; }
+  if (gray && bits != 8 && bits != 16) { return ETCH_E_DATA; }
+  if (base == 2 && bits == 8) { return ETCH_E_DATA; }
+  var pos: int64 = 18 + idlen;
+  // The color map.
+  var cmap: uint8* = (uint8*)0;
+  var cmbytes: int64 = (int64)((cmbits + 7) / 8);
+  if (cmtype == 1) {
+    var sz: int64 = cmlen * cmbytes;
+    if (pos + sz > n) { return ETCH_E_TRUNC; }
+    if (mapped) {
+      cmap = (uint8*)malloc((cmfirst + cmlen) * 4 + 4);
+      if (cmap == 0) { return ETCH_E_MEM; }
+      memset(cmap, 0, (cmfirst + cmlen) * 4 + 4);
+      for i in 0..cmlen {
+        read_color(p + pos + i * cmbytes, cmbits, false, cmap + (cmfirst + i) * 4);
+      }
+    }
+    pos = pos + sz;
+  }
+  var color_bits: int32 = bits;
+  if (mapped) { color_bits = cmbits; }
+  var fmt: int32 = ETCH_RGB8;
+  if (gray) {
+    fmt = ETCH_GRAY8;
+    if (bits == 16) { fmt = ETCH_GA8; }
+  } else if (color_bits == 32 || (color_bits == 16 && (desc & 15) > 0)) {
+    fmt = ETCH_RGBA8;
+  }
+  var img: EtchImage;
+  var rc: int32 = etch_alloc_checked(&img, w, h, fmt, o);
+  if (rc != ETCH_OK) { if (cmap != 0) { free(cmap); } return rc; }
+  var ch: int64 = (int64)(fmt & 7);
+  var pbytes: int64 = (int64)((bits + 7) / 8);
+  var right_to_left: bool = (desc & 16) != 0;
+  var top_down: bool = (desc & 32) != 0;
+  var total: int64 = w * h;
+  var i: int64 = 0;
+  var run: int64 = 0;      // pixels left in the current packet
+  var repeat: bool = false;
+  var px: uint8[4];
+  var bad: bool = false;
+  var cmsize: int64 = cmfirst + cmlen;
+  while (i < total) {
+    var q: uint8* = (uint8*)0;
+    if (rle) {
+      if (run == 0) {
+        if (pos >= n) { bad = true; break; }
+        var hdr: int64 = (int64)p[pos];
+        pos = pos + 1;
+        run = (hdr & 127) + 1;
+        repeat = (hdr & 128) != 0;
+        if (repeat) {
+          if (pos + pbytes > n) { bad = true; break; }
+          q = p + pos;
+          pos = pos + pbytes;
+        }
+      }
+      if (!repeat) {
+        if (pos + pbytes > n) { bad = true; break; }
+        q = p + pos;
+        pos = pos + pbytes;
+      }
+      run = run - 1;
+    } else {
+      if (pos + pbytes > n) { bad = true; break; }
+      q = p + pos;
+      pos = pos + pbytes;
+    }
+    if (q != 0) {
+      if (mapped) {
+        var idx: int64 = (int64)q[0];
+        if (bits == 16) { idx = idx | ((int64)q[1] << 8); }
+        if (idx >= cmsize) { bad = true; break; }
+        px[0] = cmap[idx * 4]; px[1] = cmap[idx * 4 + 1]; px[2] = cmap[idx * 4 + 2]; px[3] = cmap[idx * 4 + 3];
+      } else {
+        read_color(q, bits, gray, &px[0]);
+      }
+    }
+    var x: int64 = i % w;
+    var y: int64 = i / w;
+    if (right_to_left) { x = w - 1 - x; }
+    if (!top_down) { y = h - 1 - y; }
+    var d: uint8* = img.data + y * img.stride + x * ch;
+    if (ch == 1) { d[0] = px[0]; }
+    else if (ch == 2) { d[0] = px[0]; d[1] = px[3]; }
+    else {
+      d[0] = px[0]; d[1] = px[1]; d[2] = px[2];
+      if (ch == 4) { d[3] = px[3]; }
+    }
+    i = i + 1;
+  }
+  if (cmap != 0) { free(cmap); }
+  if (bad) { etch_image_free(&img); return ETCH_E_TRUNC; }
+  *out = img;
+  return etch_finish(out, o);
+}
+
+/// Encodes an image as TGA, top-left origin. GRAY8 stays gray; anything with
+/// alpha becomes 32-bit, the rest 24-bit. `rle` turns on run-length packing.
+export fn etch_tga_encode(src: EtchImage*, out: EtchBuf*, rle: bool) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0) { return ETCH_E_ARG; }
+  var img: EtchImage;
+  var conv: bool = false;
+  var rc: int32 = ETCH_OK;
+  if (src->format == ETCH_GRAY8) { img = *src; }
+  else if (src->format == ETCH_GRAY16 || src->format == ETCH_GRAYF) {
+    rc = etch_convert(src, ETCH_GRAY8, &img);
+    conv = true;
+  } else {
+    rc = etch_as_rgb8(src, &img, &conv);
+  }
+  if (rc != ETCH_OK) { return rc; }
+  var ch: int64 = (int64)(img.format & 7);
+  var w: int64 = (int64)img.width;
+  var h: int64 = (int64)img.height;
+  if (w > 65535 || h > 65535) { if (conv) { etch_image_free(&img); } return ETCH_E_ARG; }
+  rc = etch_buf_reserve(out, 18 + w * h * (ch + 1) + h * 2 + 26);
+  if (rc != ETCH_OK) { if (conv) { etch_image_free(&img); } return rc; }
+  var t: int32 = 2;
+  if (ch == 1) { t = 3; }
+  if (rle) { t = t + 8; }
+  etch_buf_push(out, 0);
+  etch_buf_push(out, 0);
+  etch_buf_push(out, t);
+  for k in 0..9 { etch_buf_push(out, 0); }
+  etch_buf_u16le(out, w);
+  etch_buf_u16le(out, h);
+  etch_buf_push(out, (int32)(ch * 8));
+  var desc: int32 = 32;
+  if (ch == 4) { desc = 32 | 8; }
+  etch_buf_push(out, desc);
+  var d: uint8* = out->data;
+  var pos: int64 = out->len;
+  for y in 0..h {
+    var s: uint8* = img.data + y * img.stride;
+    var x: int64 = 0;
+    while (x < w) {
+      if (!rle) {
+        var q: uint8* = s + x * ch;
+        if (ch == 1) { d[pos] = q[0]; }
+        else { d[pos] = q[2]; d[pos + 1] = q[1]; d[pos + 2] = q[0]; if (ch == 4) { d[pos + 3] = q[3]; } }
+        pos = pos + ch;
+        x = x + 1;
+        continue;
+      }
+      // Count equal pixels from x (packets stay within a row).
+      var same: int64 = 1;
+      while (x + same < w && same < 128 && memcmp(s + x * ch, s + (x + same) * ch, ch) == 0) { same = same + 1; }
+      var cnt: int64 = 1;
+      if (same >= 2) {
+        cnt = same;
+        d[pos] = (uint8)(128 | (cnt - 1));
+        pos = pos + 1;
+      } else {
+        // a literal run until two equal pixels start
+        while (x + cnt < w && cnt < 128) {
+          if (x + cnt + 1 < w && memcmp(s + (x + cnt) * ch, s + (x + cnt + 1) * ch, ch) == 0) { break; }
+          cnt = cnt + 1;
+        }
+        d[pos] = (uint8)(cnt - 1);
+        pos = pos + 1;
+      }
+      var lits: int64 = cnt;
+      if (same >= 2) { lits = 1; }
+      for k in 0..lits {
+        var q: uint8* = s + (x + k) * ch;
+        if (ch == 1) { d[pos] = q[0]; }
+        else { d[pos] = q[2]; d[pos + 1] = q[1]; d[pos + 2] = q[0]; if (ch == 4) { d[pos + 3] = q[3]; } }
+        pos = pos + ch;
+      }
+      x = x + cnt;
+    }
+  }
+  out->len = pos;
+  // TGA 2.0 footer.
+  for k in 0..8 { etch_buf_push(out, 0); }
+  var sig: string = "TRUEVISION-XFILE.";
+  etch_buf_append(out, sig.chars, 17);
+  etch_buf_push(out, 0);
+  if (conv) { etch_image_free(&img); }
+  return ETCH_OK;
+}

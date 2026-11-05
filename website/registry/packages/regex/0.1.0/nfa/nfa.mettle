@@ -1,0 +1,612 @@
+// Thompson NFA over bytes, compiled from the HIR.
+//
+// As in Rust's regex-automata, the NFA works on bytes, so Unicode classes
+// become small UTF-8 automata. Those are built from a trie of UTF-8 range
+// sequences, with identical states shared (hash-consing), which keeps
+// classes like \w small. The same code builds the reverse NFA used to find
+// where a match starts.
+
+import "std/mem";
+import "regex/core/vec";
+import "regex/hir/class";
+import "regex/hir/hir";
+
+export const RX_S_RANGE = 1;    // lo..hi byte, then next
+export const RX_S_SPARSE = 2;   // lo = first transition, hi = count; follows every match
+export const RX_S_SPLIT = 3;    // next is preferred over alt
+export const RX_S_LOOK = 4;     // lo = look kind
+export const RX_S_CAPTURE = 5;  // lo = slot
+export const RX_S_MATCH = 6;
+export const RX_S_FAIL = 7;
+export const RX_S_EMPTY = 8;
+
+export struct RxState {
+  kind: int32;
+  lo: int32;
+  hi: int32;
+  next: int32;
+  alt: int32;
+}
+
+export struct RxTrans {
+  lo: int32;
+  hi: int32;
+  next: int32;
+}
+
+export struct RxNfa {
+  st: RxVec<RxState>;
+  tr: RxVec<RxTrans>;
+  start: int32;         // anchored start
+  ustart: int32;        // unanchored start: a lazy any-byte loop, then start
+  nslots: int32;        // capture slots (2 per group, group 0 included)
+  looks: uint32;        // look kinds used (bit 1 << kind)
+  reverse: bool;
+  too_big: bool;
+  limit: int64;         // most bytes the states may use
+  bmap: uint8*;         // 256 entries: byte -> equivalence class
+  nclass: int32;        // number of byte classes
+}
+
+struct RxFrag {
+  start: int32;
+  end: int32;
+}
+
+struct RxSeq {
+  n: int32;
+  lo: uint8[4];
+  hi: uint8[4];
+}
+
+struct RxTNode {
+  first: int32;
+  last: int32;
+}
+
+struct RxTTrans {
+  lo: int32;
+  hi: int32;
+  child: int32;
+  sib: int32;
+}
+
+struct RxComp {
+  nfa: RxNfa*;
+  h: RxHir*;
+  captures: bool;
+  // scratch for Unicode classes
+  seqs: RxVec<RxSeq>;
+  tnodes: RxVec<RxTNode>;
+  ttrans: RxVec<RxTTrans>;
+  tmp: RxVec<RxTrans>;
+  hash: int32*;
+  hcap: int64;
+}
+
+fn emit(c: RxComp*, kind: int32, lo: int32, hi: int32, next: int32, alt: int32) -> int32 {
+  var s: RxState = { kind: kind, lo: lo, hi: hi, next: next, alt: alt };
+  var n: RxNfa* = c->nfa;
+  rx_vpush(&n->st, s);
+  var used: int64 = n->st.len * (int64)sizeof(RxState) + n->tr.len * (int64)sizeof(RxTrans);
+  if (used > n->limit) { n->too_big = true; }
+  return (int32)(n->st.len - 1);
+}
+
+fn patch(c: RxComp*, at: int32, target: int32) {
+  c->nfa->st.data[at].next = target;
+}
+
+fn frag(s: int32, e: int32) -> RxFrag {
+  var f: RxFrag = { start: s, end: e };
+  return f;
+}
+
+fn empty_frag(c: RxComp*) -> RxFrag {
+  var e: int32 = emit(c, RX_S_EMPTY, 0, 0, -1, -1);
+  return frag(e, e);
+}
+
+fn utf8_encode(cp: uint32, out: uint8*) -> int32 {
+  if (cp < 0x80) { out[0] = (uint8)cp; return 1; }
+  if (cp < 0x800) {
+    out[0] = (uint8)(0xC0 | (cp >> 6));
+    out[1] = (uint8)(0x80 | (cp & 0x3F));
+    return 2;
+  }
+  if (cp < 0x10000) {
+    out[0] = (uint8)(0xE0 | (cp >> 12));
+    out[1] = (uint8)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (uint8)(0x80 | (cp & 0x3F));
+    return 3;
+  }
+  out[0] = (uint8)(0xF0 | (cp >> 18));
+  out[1] = (uint8)(0x80 | ((cp >> 12) & 0x3F));
+  out[2] = (uint8)(0x80 | ((cp >> 6) & 0x3F));
+  out[3] = (uint8)(0x80 | (cp & 0x3F));
+  return 4;
+}
+
+fn push_seq(c: RxComp*, s: uint32, e: uint32) {
+  var a: uint8[4];
+  var b: uint8[4];
+  var n: int32 = utf8_encode(s, &a[0]);
+  utf8_encode(e, &b[0]);
+  var q: RxSeq;
+  q.n = n;
+  for i in 0..n {
+    q.lo[i] = a[i];
+    q.hi[i] = b[i];
+  }
+  rx_vpush(&c->seqs, q);
+}
+
+// Splits a code point range into UTF-8 byte range sequences, in order.
+// This is the algorithm of Rust's utf8-ranges (also used by RE2).
+fn utf8_sequences(c: RxComp*, lo: uint32, hi: uint32) {
+  var stack: uint32[64];
+  var sp: int32 = 0;
+  stack[0] = lo;
+  stack[1] = hi;
+  sp = 2;
+  while (sp > 0) {
+    sp = sp - 2;
+    var s: uint32 = stack[sp];
+    var e: uint32 = stack[sp + 1];
+    if (s >= 0xD800 && s <= 0xDFFF) { s = 0xE000; }
+    if (e >= 0xD800 && e <= 0xDFFF) { e = 0xD7FF; }
+    if (s > e) { continue; }
+    if (s < 0xD800 && e > 0xDFFF) {
+      stack[sp] = 0xE000;
+      stack[sp + 1] = e;
+      sp = sp + 2;
+      e = 0xD7FF;
+    }
+    var again: bool = true;
+    while (again) {
+      again = false;
+      if (s <= 0x7F && 0x7F < e) { stack[sp] = 0x80; stack[sp + 1] = e; sp = sp + 2; e = 0x7F; }
+      else if (s <= 0x7FF && 0x7FF < e) { stack[sp] = 0x800; stack[sp + 1] = e; sp = sp + 2; e = 0x7FF; }
+      else if (s <= 0xFFFF && 0xFFFF < e) { stack[sp] = 0x10000; stack[sp + 1] = e; sp = sp + 2; e = 0xFFFF; }
+      if (e <= 0x7F) {
+        push_seq(c, s, e);
+        break;
+      }
+      for i in 1..4 {
+        var m: uint32 = ((uint32)1 << (uint32)(6 * i)) - 1;
+        if ((s & ~m) != (e & ~m)) {
+          if ((s & m) != 0) {
+            stack[sp] = (s | m) + 1;
+            stack[sp + 1] = e;
+            sp = sp + 2;
+            e = s | m;
+            again = true;
+            break;
+          }
+          if ((e & m) != m) {
+            stack[sp] = e & ~m;
+            stack[sp + 1] = e;
+            sp = sp + 2;
+            e = (e & ~m) - 1;
+            again = true;
+            break;
+          }
+        }
+      }
+      if (!again) { push_seq(c, s, e); }
+    }
+  }
+}
+
+fn tnode(c: RxComp*) -> int32 {
+  var n: RxTNode = { first: -1, last: -1 };
+  rx_vpush(&c->tnodes, n);
+  return (int32)(c->tnodes.len - 1);
+}
+
+fn trie_insert(c: RxComp*, q: RxSeq*, reverse: bool) {
+  var node: int32 = 0;
+  for k in 0..q->n {
+    var i: int32 = k;
+    if (reverse) { i = q->n - 1 - k; }
+    var lo: int32 = (int32)q->lo[i];
+    var hi: int32 = (int32)q->hi[i];
+    var leaf: bool = k == q->n - 1;
+    var t: int32 = c->tnodes.data[node].last;
+    if (!leaf && t >= 0) {
+      var tt: RxTTrans = c->ttrans.data[t];
+      if (tt.lo == lo && tt.hi == hi && tt.child >= 0) {
+        node = tt.child;
+        continue;
+      }
+    }
+    var child: int32 = -1;
+    if (!leaf) { child = tnode(c); }
+    var nt: RxTTrans = { lo: lo, hi: hi, child: child, sib: -1 };
+    rx_vpush(&c->ttrans, nt);
+    var id: int32 = (int32)(c->ttrans.len - 1);
+    if (c->tnodes.data[node].last >= 0) {
+      c->ttrans.data[c->tnodes.data[node].last].sib = id;
+    } else {
+      c->tnodes.data[node].first = id;
+    }
+    c->tnodes.data[node].last = id;
+    node = child;
+  }
+}
+
+fn hash_trans(t: RxTrans*, n: int64) -> uint64 {
+  var h: uint64 = 1469598103934665603;
+  for i in 0..n {
+    h = (h ^ (uint64)t[i].lo) * 1099511628211;
+    h = (h ^ (uint64)t[i].hi) * 1099511628211;
+    h = (h ^ (uint64)t[i].next) * 1099511628211;
+  }
+  return h;
+}
+
+// Same transitions as state id?
+fn same_state(c: RxComp*, id: int32, t: RxTrans*, n: int64) -> bool {
+  var s: RxState = c->nfa->st.data[id];
+  if (n == 1) {
+    return s.kind == RX_S_RANGE && s.lo == t[0].lo && s.hi == t[0].hi && s.next == t[0].next;
+  }
+  if (s.kind != RX_S_SPARSE || (int64)s.hi != n) { return false; }
+  for i in 0..n {
+    var x: RxTrans = c->nfa->tr.data[(int64)s.lo + i];
+    if (x.lo != t[i].lo || x.hi != t[i].hi || x.next != t[i].next) { return false; }
+  }
+  return true;
+}
+
+// Returns a state with exactly these transitions, reusing an equal one.
+fn intern(c: RxComp*, t: RxTrans*, n: int64) -> int32 {
+  var h: uint64 = hash_trans(t, n);
+  var mask: uint64 = (uint64)c->hcap - 1;
+  var i: uint64 = h & mask;
+  while (c->hash[i] >= 0) {
+    if (same_state(c, c->hash[i], t, n)) { return c->hash[i]; }
+    i = (i + 1) & mask;
+  }
+  var id: int32 = 0;
+  if (n == 1) {
+    id = emit(c, RX_S_RANGE, t[0].lo, t[0].hi, t[0].next, -1);
+  } else {
+    var first: int64 = c->nfa->tr.len;
+    for k in 0..n { rx_vpush(&c->nfa->tr, t[k]); }
+    id = emit(c, RX_S_SPARSE, (int32)first, (int32)n, -1, -1);
+  }
+  c->hash[i] = id;
+  return id;
+}
+
+fn compile_tnode(c: RxComp*, node: int32, end: int32) -> int32 {
+  // Children first, so their ids are known.
+  var targets: RxVec<int32>;
+  var t: int32 = c->tnodes.data[node].first;
+  while (t >= 0) {
+    var tt: RxTTrans = c->ttrans.data[t];
+    var tg: int32 = end;
+    if (tt.child >= 0) { tg = compile_tnode(c, tt.child, end); }
+    rx_vpush(&targets, tg);
+    t = tt.sib;
+  }
+  var base: int64 = c->tmp.len;
+  t = c->tnodes.data[node].first;
+  var k: int64 = 0;
+  while (t >= 0) {
+    var tt2: RxTTrans = c->ttrans.data[t];
+    var x: RxTrans = { lo: tt2.lo, hi: tt2.hi, next: targets.data[k] };
+    rx_vpush(&c->tmp, x);
+    k = k + 1;
+    t = tt2.sib;
+  }
+  var id: int32 = intern(c, c->tmp.data + base, k);
+  c->tmp.len = base;
+  rx_vfree(&targets);
+  return id;
+}
+
+fn compile_class(c: RxComp*, cls: RxClass*, bytes: bool) -> RxFrag {
+  var n: int64 = cls->r.len;
+  if (n == 0) {
+    var f: int32 = emit(c, RX_S_FAIL, 0, 0, -1, -1);
+    return frag(f, f);
+  }
+  var ascii: bool = bytes || cls->r.data[n - 1].hi < 128;
+  if (ascii) {
+    if (n == 1) {
+      var r: int32 = emit(c, RX_S_RANGE, (int32)cls->r.data[0].lo, (int32)cls->r.data[0].hi, -1, -1);
+      return frag(r, r);
+    }
+    var end: int32 = emit(c, RX_S_EMPTY, 0, 0, -1, -1);
+    var first: int64 = c->nfa->tr.len;
+    for i in 0..n {
+      var hi: uint32 = cls->r.data[i].hi;
+      if (hi > 255) { hi = 255; }
+      var x: RxTrans = { lo: (int32)cls->r.data[i].lo, hi: (int32)hi, next: end };
+      if (cls->r.data[i].lo <= 255) { rx_vpush(&c->nfa->tr, x); }
+    }
+    var sp: int32 = emit(c, RX_S_SPARSE, (int32)first, (int32)(c->nfa->tr.len - first), -1, -1);
+    return frag(sp, end);
+  }
+  c->seqs.len = 0;
+  for i in 0..n { utf8_sequences(c, cls->r.data[i].lo, cls->r.data[i].hi); }
+  c->tnodes.len = 0;
+  c->ttrans.len = 0;
+  tnode(c);
+  for i in 0..c->seqs.len { trie_insert(c, &c->seqs.data[i], c->nfa->reverse); }
+  var need: int64 = 16;
+  while (need < c->ttrans.len * 2 + 16) { need = need * 2; }
+  if (need > c->hcap) {
+    if (c->hash != 0) { free(c->hash); }
+    c->hash = (int32*)malloc(4 * need);
+    c->hcap = need;
+  }
+  for i in 0..c->hcap { c->hash[i] = -1; }
+  var end2: int32 = emit(c, RX_S_EMPTY, 0, 0, -1, -1);
+  var start: int32 = compile_tnode(c, 0, end2);
+  return frag(start, end2);
+}
+
+fn compile_lit(c: RxComp*, cp: uint32, isbyte: bool) -> RxFrag {
+  var b: uint8[4];
+  var n: int32 = 1;
+  if (isbyte) { b[0] = (uint8)cp; } else { n = utf8_encode(cp, &b[0]); }
+  var first: int32 = -1;
+  var prev: int32 = -1;
+  for k in 0..n {
+    var i: int32 = k;
+    if (c->nfa->reverse) { i = n - 1 - k; }
+    var s: int32 = emit(c, RX_S_RANGE, (int32)b[i], (int32)b[i], -1, -1);
+    if (prev >= 0) { patch(c, prev, s); } else { first = s; }
+    prev = s;
+  }
+  return frag(first, prev);
+}
+
+
+fn split(c: RxComp*, greedy: bool) -> int32 {
+  return emit(c, RX_S_SPLIT, (int32)greedy, 0, -1, -1);
+}
+
+// Points split s at `body` and `exit`, preferring body when greedy.
+fn set_split(c: RxComp*, s: int32, body: int32, exit: int32) {
+  var greedy: bool = c->nfa->st.data[s].lo != 0;
+  if (greedy) {
+    c->nfa->st.data[s].next = body;
+    c->nfa->st.data[s].alt = exit;
+  } else {
+    c->nfa->st.data[s].next = exit;
+    c->nfa->st.data[s].alt = body;
+  }
+}
+
+/// Can HIR node id match the empty string?
+export fn rx_can_be_empty(h: RxHir*, id: int32) -> bool {
+  return can_be_empty(h, id);
+}
+
+// Can node id match the empty string?
+fn can_be_empty(h: RxHir*, id: int32) -> bool {
+  var nd: RxNode = h->nodes.data[id];
+  switch (nd.kind) {
+    case 0: { return true; }
+    case 3: { return true; }
+    case 4: { return nd.x == 0 || can_be_empty(h, nd.sub); }
+    case 5: { return can_be_empty(h, nd.sub); }
+    case 6: {
+      var k: int32 = nd.sub;
+      while (k >= 0) {
+        if (!can_be_empty(h, k)) { return false; }
+        k = h->nodes.data[k].next;
+      }
+      return true;
+    }
+    case 7: {
+      var k2: int32 = nd.sub;
+      while (k2 >= 0) {
+        if (can_be_empty(h, k2)) { return true; }
+        k2 = h->nodes.data[k2].next;
+      }
+      return false;
+    }
+    default: { }
+  }
+  return false;
+}
+
+fn compile_repeat(c: RxComp*, nd: RxNode) -> RxFrag {
+  var greedy: bool = nd.flag != 0;
+  var min: int32 = nd.x;
+  var max: int32 = nd.y;
+  if (max == 0) { return empty_frag(c); }
+  var start: int32 = -1;
+  var tail: int32 = -1;
+  // The required copies (one less when the tail is a + loop).
+  var req: int32 = min;
+  if (max < 0 && min > 0) { req = min - 1; }
+  for i in 0..req {
+    if (c->nfa->too_big) { return empty_frag(c); }
+    var f: RxFrag = compile(c, nd.sub);
+    if (tail >= 0) { patch(c, tail, f.start); } else { start = f.start; }
+    tail = f.end;
+  }
+  if (max < 0) {
+    var end: int32 = emit(c, RX_S_EMPTY, 0, 0, -1, -1);
+    var s: int32 = split(c, greedy);
+    var body: RxFrag = compile(c, nd.sub);
+    patch(c, body.end, s);
+    set_split(c, s, body.start, end);
+    var entry: int32 = s;
+    if (min > 0) { entry = body.start; }
+    else if (can_be_empty(c->h, nd.sub)) {
+      // e* where e can match empty is compiled as (e+)?, as Rust does, so
+      // an empty iteration exits the loop instead of being cut off.
+      var opt: int32 = split(c, greedy);
+      set_split(c, opt, body.start, end);
+      entry = opt;
+    }
+    if (tail >= 0) { patch(c, tail, entry); } else { start = entry; }
+    return frag(start, end);
+  }
+  if (max == min) { return frag(start, tail); }
+  var end2: int32 = emit(c, RX_S_EMPTY, 0, 0, -1, -1);
+  for i in 0..max - min {
+    if (c->nfa->too_big) { return empty_frag(c); }
+    var s2: int32 = split(c, greedy);
+    var b2: RxFrag = compile(c, nd.sub);
+    set_split(c, s2, b2.start, end2);
+    if (tail >= 0) { patch(c, tail, s2); } else { start = s2; }
+    tail = b2.end;
+  }
+  patch(c, tail, end2);
+  return frag(start, end2);
+}
+
+fn compile(c: RxComp*, id: int32) -> RxFrag {
+  if (c->nfa->too_big) { return empty_frag(c); }
+  var nd: RxNode = c->h->nodes.data[id];
+  switch (nd.kind) {
+    case 0: { return empty_frag(c); }
+    case 1: { return compile_lit(c, (uint32)nd.x, nd.flag != 0); }
+    case 2: { return compile_class(c, &c->h->classes.data[nd.x], nd.flag != 0); }
+    case 3: {
+      var k: int32 = nd.x;
+      if (c->nfa->reverse) { k = rx_look_reverse(k); }
+      var l: int32 = emit(c, RX_S_LOOK, k, 0, -1, -1);
+      return frag(l, l);
+    }
+    case 4: { return compile_repeat(c, nd); }
+    case 5: {
+      if (!c->captures) { return compile(c, nd.sub); }
+      var open: int32 = emit(c, RX_S_CAPTURE, nd.x * 2, 0, -1, -1);
+      var body: RxFrag = compile(c, nd.sub);
+      var close: int32 = emit(c, RX_S_CAPTURE, nd.x * 2 + 1, 0, -1, -1);
+      patch(c, open, body.start);
+      patch(c, body.end, close);
+      return frag(open, close);
+    }
+    case 6: {
+      // Children in order, or backwards for the reverse NFA.
+      var kids: RxVec<int32>;
+      var k2: int32 = nd.sub;
+      while (k2 >= 0) { rx_vpush(&kids, k2); k2 = c->h->nodes.data[k2].next; }
+      var start: int32 = -1;
+      var tail: int32 = -1;
+      for j in 0..kids.len {
+        var idx: int64 = j;
+        if (c->nfa->reverse) { idx = kids.len - 1 - j; }
+        var f: RxFrag = compile(c, kids.data[idx]);
+        if (tail >= 0) { patch(c, tail, f.start); } else { start = f.start; }
+        tail = f.end;
+      }
+      rx_vfree(&kids);
+      return frag(start, tail);
+    }
+    case 7: {
+      var end: int32 = emit(c, RX_S_EMPTY, 0, 0, -1, -1);
+      var start2: int32 = -1;
+      var prev_split: int32 = -1;
+      var k3: int32 = nd.sub;
+      while (k3 >= 0) {
+        var nx: int32 = c->h->nodes.data[k3].next;
+        var f2: RxFrag = compile(c, k3);
+        patch(c, f2.end, end);
+        var entry: int32 = f2.start;
+        if (nx >= 0) {
+          var s: int32 = emit(c, RX_S_SPLIT, 1, 0, f2.start, -1);
+          entry = s;
+        }
+        if (prev_split >= 0) { c->nfa->st.data[prev_split].alt = entry; } else { start2 = entry; }
+        if (nx >= 0) { prev_split = entry; }
+        k3 = nx;
+      }
+      return frag(start2, end);
+    }
+    default: { }
+  }
+  return empty_frag(c);
+}
+
+// Builds equivalence classes of bytes: two bytes share a class when no
+// transition or assertion can tell them apart.
+fn byte_classes(n: RxNfa*) {
+  var cut: bool[257];
+  for i in 0..257 { cut[i] = false; }
+  for i in 0..n->st.len {
+    var s: RxState = n->st.data[i];
+    if (s.kind == RX_S_RANGE) {
+      cut[s.lo] = true;
+      cut[s.hi + 1] = true;
+    }
+  }
+  for i in 0..n->tr.len {
+    cut[n->tr.data[i].lo] = true;
+    cut[n->tr.data[i].hi + 1] = true;
+  }
+  var lines: uint32 = ((uint32)1 << 3) | ((uint32)1 << 4) | ((uint32)1 << 5) | ((uint32)1 << 6);
+  if ((n->looks & lines) != 0) {
+    cut[10] = true; cut[11] = true; cut[13] = true; cut[14] = true;
+  }
+  if ((n->looks & ~(lines | 6)) != 0) {
+    cut[48] = true; cut[58] = true; cut[65] = true; cut[91] = true;
+    cut[95] = true; cut[96] = true; cut[97] = true; cut[123] = true; cut[128] = true;
+  }
+  n->bmap = (uint8*)malloc(256);
+  var cls: int32 = 0;
+  for b in 0..256 {
+    if (b > 0 && cut[b]) { cls = cls + 1; }
+    n->bmap[b] = (uint8)cls;
+  }
+  n->nclass = cls + 1;
+}
+
+/// Compiles h into nfa. reverse builds the program that reads backwards;
+/// captures adds capture states. Returns false if the program is bigger
+/// than `limit` bytes.
+export fn rx_nfa_build(h: RxHir*, nfa: RxNfa*, reverse: bool, captures: bool, limit: int64) -> bool {
+  var c: RxComp;
+  c.nfa = nfa;
+  c.h = h;
+  c.captures = captures && !reverse;
+  c.hash = (int32*)0;
+  c.hcap = 0;
+  nfa->reverse = reverse;
+  nfa->limit = limit;
+  nfa->too_big = false;
+  nfa->looks = h->looks;
+  nfa->nslots = (int32)h->names.len * 2;
+  var root: RxNode;
+  root.kind = RX_H_CAPTURE;
+  root.x = 0;
+  root.sub = h->root;
+  root.next = -1;
+  rx_vpush(&h->nodes, root);
+  var rid: int32 = (int32)(h->nodes.len - 1);
+  var f: RxFrag = compile(&c, rid);
+  h->nodes.len = h->nodes.len - 1;
+  var m: int32 = emit(&c, RX_S_MATCH, 0, 0, -1, -1);
+  patch(&c, f.end, m);
+  nfa->start = f.start;
+  // Unanchored start: (?s-u:.)*? then the pattern.
+  var u: int32 = emit(&c, RX_S_SPLIT, 0, 0, f.start, -1);
+  var any: int32 = emit(&c, RX_S_RANGE, 0, 255, u, -1);
+  nfa->st.data[u].alt = any;
+  nfa->ustart = u;
+  rx_vfree(&c.seqs);
+  rx_vfree(&c.tnodes);
+  rx_vfree(&c.ttrans);
+  rx_vfree(&c.tmp);
+  if (c.hash != 0) { free(c.hash); }
+  if (nfa->too_big) { return false; }
+  byte_classes(nfa);
+  return true;
+}
+
+export fn rx_nfa_free(n: RxNfa*) {
+  rx_vfree(&n->st);
+  rx_vfree(&n->tr);
+  if (n->bmap != 0) { free(n->bmap); }
+  n->bmap = (uint8*)0;
+}

@@ -1,0 +1,218 @@
+// raize/ws/frame — WebSocket frames (RFC 6455 §5), decode and encode.
+//
+// Pure functions over bytes, like the HTTP parser: the socket layer feeds a
+// buffer, rz_ws_frame_parse says "need more", "here is one frame" or "close
+// the connection with this code". It never allocates and never reads past n.
+//
+//   0                   1                   2                   3
+//   +-+-+-+-+-------+-+-------------+-------------------------------+
+//   |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+//   |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+//   +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
+//   |     masking key (0 or 4 bytes)  |          payload ...         |
+//
+// Rules enforced here (each a protocol error, close 1002, unless noted):
+//   * RSV1-3 must be 0 (no extensions are negotiated).
+//   * Opcodes 3-7 and 11-15 are reserved.
+//   * Control frames (close/ping/pong) are unfragmented and <= 125 bytes.
+//   * Frames from a client must be masked; a server's frames are not.
+//   * Lengths use the minimal encoding, and a 64-bit length has its top bit 0.
+//   * A payload larger than the caller's max is 1009 (message too big).
+//
+// Reassembly of fragmented messages and UTF-8 checks of text messages are the
+// connection's job (they need state across frames); see utf8.mettle.
+
+import "std/mem";
+import "raize_core/str/str";
+
+export const RZ_WS_OP_CONT: int32 = 0;
+export const RZ_WS_OP_TEXT: int32 = 1;
+export const RZ_WS_OP_BINARY: int32 = 2;
+export const RZ_WS_OP_CLOSE: int32 = 8;
+export const RZ_WS_OP_PING: int32 = 9;
+export const RZ_WS_OP_PONG: int32 = 10;
+
+export const RZ_WS_MAX_CONTROL: int64 = 125;
+export const RZ_WS_MAX_HEAD: int64 = 14;          // 2 + 8 + 4
+
+// Parse results.
+export const RZ_WS_NEED_MORE: int32 = 0;
+export const RZ_WS_FRAME_OK: int32 = 1;
+export const RZ_WS_E_PROTOCOL: int32 = 2;         // close 1002
+export const RZ_WS_E_TOO_BIG: int32 = 3;          // close 1009
+
+// Close codes the framework sends.
+export const RZ_WS_CLOSE_NORMAL: int32 = 1000;
+export const RZ_WS_CLOSE_GOING_AWAY: int32 = 1001;
+export const RZ_WS_CLOSE_PROTOCOL: int32 = 1002;
+export const RZ_WS_CLOSE_BAD_DATA: int32 = 1007;
+export const RZ_WS_CLOSE_POLICY: int32 = 1008;
+export const RZ_WS_CLOSE_TOO_BIG: int32 = 1009;
+export const RZ_WS_CLOSE_ERROR: int32 = 1011;
+export const RZ_WS_CLOSE_NONE: int32 = 1005;      // received an empty close
+
+export struct RzWsFrame {
+  fin: bool;
+  opcode: int32;
+  masked: bool;
+  mask: uint8[4];
+  head_len: int64;       // bytes before the payload
+  payload_len: int64;
+  frame_len: int64;      // head_len + payload_len: bytes to consume
+}
+
+export fn rz_ws_opcode_is_control(op: int32) -> bool {
+  return op >= 8;
+}
+
+fn rz_ws_opcode_known(op: int32) -> bool {
+  if (op == RZ_WS_OP_CONT || op == RZ_WS_OP_TEXT || op == RZ_WS_OP_BINARY) { return true; }
+  return op == RZ_WS_OP_CLOSE || op == RZ_WS_OP_PING || op == RZ_WS_OP_PONG;
+}
+
+// Parses one frame header from p[0..n]. On RZ_WS_FRAME_OK, `out` describes the
+// frame and the payload is p[out.head_len .. out.frame_len], still masked
+// (call rz_ws_unmask). `max_payload` bounds a data frame; `from_client`
+// requires the mask bit.
+export fn rz_ws_frame_parse(p: uint8*, n: int64, max_payload: int64, from_client: bool, out: RzWsFrame*) -> int32 {
+  if (out == 0 || n < 2 || p == 0) { return RZ_WS_NEED_MORE; }
+  memset((rawptr)out, 0, sizeof(RzWsFrame));
+  var b0: int32 = (int32)p[0];
+  var b1: int32 = (int32)p[1];
+  if ((b0 & 0x70) != 0) { return RZ_WS_E_PROTOCOL; }
+  var op: int32 = b0 & 15;
+  if (!rz_ws_opcode_known(op)) { return RZ_WS_E_PROTOCOL; }
+  out->fin = (b0 & 0x80) != 0;
+  out->opcode = op;
+  out->masked = (b1 & 0x80) != 0;
+  if (from_client && !out->masked) { return RZ_WS_E_PROTOCOL; }
+  if (!from_client && out->masked) { return RZ_WS_E_PROTOCOL; }
+
+  var len7: int64 = (int64)(b1 & 127);
+  var pos: int64 = 2;
+  var len: int64 = len7;
+  if (len7 == 126) {
+    if (n < 4) { return RZ_WS_NEED_MORE; }
+    len = ((int64)p[2] << 8) | (int64)p[3];
+    if (len < 126) { return RZ_WS_E_PROTOCOL; }
+    pos = 4;
+  } else if (len7 == 127) {
+    if (n < 10) { return RZ_WS_NEED_MORE; }
+    if ((p[2] & (uint8)0x80) != (uint8)0) { return RZ_WS_E_PROTOCOL; }
+    // A length past 2^40 is beyond any bound we accept; refuse it before
+    // shifting it into an int64 that could wrap.
+    if (p[2] != (uint8)0 || p[3] != (uint8)0 || p[4] != (uint8)0) { return RZ_WS_E_TOO_BIG; }
+    len = 0;
+    var i: int64 = 5;
+    while (i < 10) {
+      len = (len << 8) | (int64)p[i];
+      i = i + 1;
+    }
+    if (len < 65536) { return RZ_WS_E_PROTOCOL; }
+    pos = 10;
+  }
+
+  if (rz_ws_opcode_is_control(op)) {
+    if (!out->fin) { return RZ_WS_E_PROTOCOL; }
+    if (len > RZ_WS_MAX_CONTROL) { return RZ_WS_E_PROTOCOL; }
+  } else if (len > max_payload) {
+    return RZ_WS_E_TOO_BIG;
+  }
+
+  if (out->masked) {
+    if (n < pos + 4) { return RZ_WS_NEED_MORE; }
+    out->mask[0] = p[pos];
+    out->mask[1] = p[pos + 1];
+    out->mask[2] = p[pos + 2];
+    out->mask[3] = p[pos + 3];
+    pos = pos + 4;
+  }
+  out->head_len = pos;
+  out->payload_len = len;
+  out->frame_len = pos + len;
+  if (n < out->frame_len) { return RZ_WS_NEED_MORE; }
+  return RZ_WS_FRAME_OK;
+}
+
+// XORs n bytes in place with the 4-byte key, starting at key offset `phase`
+// (so a payload can be unmasked in pieces). Returns the next phase.
+export fn rz_ws_unmask(p: uint8*, n: int64, mask: uint8*, phase: int64) -> int64 {
+  var i: int64 = 0;
+  var k: int64 = phase & 3;
+  while (i < n) {
+    p[i] = p[i] ^ mask[k];
+    k = (k + 1) & 3;
+    i = i + 1;
+  }
+  return k;
+}
+
+// Writes an unmasked (server) frame head for `len` payload bytes into out
+// (RZ_WS_MAX_HEAD bytes suffice). Returns the head length, or -1.
+export fn rz_ws_frame_head(fin: bool, opcode: int32, len: int64, out: uint8*, cap: int64) -> int64 {
+  if (out == 0 || len < 0 || cap < RZ_WS_MAX_HEAD) { return -1; }
+  if (!rz_ws_opcode_known(opcode)) { return -1; }
+  if (rz_ws_opcode_is_control(opcode) && (len > RZ_WS_MAX_CONTROL || !fin)) { return -1; }
+  var b0: int32 = opcode;
+  if (fin) { b0 = b0 | 0x80; }
+  out[0] = (uint8)b0;
+  if (len < 126) {
+    out[1] = (uint8)len;
+    return 2;
+  }
+  if (len < 65536) {
+    out[1] = (uint8)126;
+    out[2] = (uint8)((len >> 8) & 255);
+    out[3] = (uint8)(len & 255);
+    return 4;
+  }
+  out[1] = (uint8)127;
+  var i: int64 = 0;
+  while (i < 8) {
+    out[9 - i] = (uint8)((len >> (i * 8)) & 255);
+    i = i + 1;
+  }
+  return 10;
+}
+
+// Appends one complete, unfragmented server frame to `b`.
+export fn rz_ws_frame_append(b: RzBuf*, opcode: int32, payload: string) -> int64 {
+  if (b == 0) { return -1; }
+  var head: uint8[16];
+  var h: int64 = rz_ws_frame_head(true, opcode, (int64)payload.length, &head[0], 16);
+  if (h < 0) { return -1; }
+  rz_buf_add_bytes(b, &head[0], h);
+  rz_buf_add(b, payload);
+  return h + (int64)payload.length;
+}
+
+// A close code a peer may send (RFC 6455 §7.4): 1000-1003, 1007-1014 and the
+// 3000-4999 registered/private ranges. 1004-1006 and 1015 never appear on the
+// wire.
+export fn rz_ws_close_code_ok(code: int32) -> bool {
+  if (code >= 1000 && code <= 1003) { return true; }
+  if (code >= 1007 && code <= 1014) { return true; }
+  return code >= 3000 && code <= 4999;
+}
+
+// Reads the status code from an (unmasked) close payload: 1005 when empty,
+// -1 when malformed (one byte, or a code that is not allowed on the wire).
+export fn rz_ws_close_code(p: uint8*, n: int64) -> int32 {
+  if (n == 0) { return RZ_WS_CLOSE_NONE; }
+  if (n == 1 || p == 0) { return -1; }
+  var code: int32 = ((int32)p[0] << 8) | (int32)p[1];
+  if (!rz_ws_close_code_ok(code)) { return -1; }
+  return code;
+}
+
+// Appends a close frame carrying `code` and a reason (truncated so the
+// payload stays within 125 bytes).
+export fn rz_ws_close_append(b: RzBuf*, code: int32, reason: string) -> int64 {
+  var payload: uint8[125];
+  payload[0] = (uint8)((code >> 8) & 255);
+  payload[1] = (uint8)(code & 255);
+  var rn: int64 = (int64)reason.length;
+  if (rn > 123) { rn = 123; }
+  if (rn > 0) { memcpy((rawptr)&payload[2], (rawptr)reason.chars, rn); }
+  return rz_ws_frame_append(b, RZ_WS_OP_CLOSE, rz_str_view(&payload[0], rn + 2));
+}

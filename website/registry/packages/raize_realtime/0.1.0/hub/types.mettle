@@ -1,0 +1,132 @@
+// raize/hub/types — the hub's values: options, the handler contract, slots.
+//
+// The hub is one thread running the framework/poll loop that owns every
+// upgraded (WebSocket) connection in the process. It is split three ways so
+// each file keeps one job and no import cycle forms:
+//
+//   types  these structs and constants
+//   loop   the hub thread: reading, writing, closing slots, mailbox
+//   hub    the public API: create/start/stop, upgrade from a route, send
+//
+// Handler contract (docs/design/realtime.md §5). Every callback runs on the
+// hub thread, one at a time, and must not block:
+//
+//   on_open(hub, sock, arg) -> rawptr     after the 101 is sent; `arg` is the
+//                                         handler pointer itself (so a struct
+//                                         that embeds RzHubHandler first can
+//                                         find itself); returns the
+//                                         per-socket state (may be 0)
+//   on_message(hub, sock, state, opcode, payload) -> int32
+//                                         a complete message; the payload
+//                                         view dies when it returns; non-zero
+//                                         closes the socket with 1011
+//   on_close(hub, sock, state)            once, when the socket is gone;
+//                                         free the state here
+//
+// `sock` is an id, not an fd or an index: slot index plus a generation, so an
+// id kept after its socket closed matches nothing instead of a stranger.
+
+import "../ws/conn";
+import "../poll/poll";
+
+export const RZ_HUB_MAX_CONNS: int32 = 4096;
+export const RZ_HUB_DEFAULT_CONNS: int32 = 1024;
+export const RZ_HUB_MAILBOX: int32 = 4096;
+
+// Mailbox message kinds (RzPollMsg.kind).
+export const RZ_HUB_MSG_ADOPT: int32 = 1;      // ptr: RzHubAdopt*
+export const RZ_HUB_MSG_SEND: int32 = 2;       // a: sock, b: opcode, ptr: RzHubBytes*
+export const RZ_HUB_MSG_BROADCAST: int32 = 3;  // b: opcode, ptr: RzHubBytes*
+export const RZ_HUB_MSG_CLOSE: int32 = 4;      // a: sock, b: close code
+export const RZ_HUB_MSG_STOP: int32 = 5;
+export const RZ_HUB_MSG_CALL: int32 = 6;       // ptr: RzHubCall*
+
+export struct RzHubHandler {
+  on_open: fn(RzHub*, int64, rawptr) -> rawptr;
+  on_message: fn(RzHub*, int64, rawptr, int32, string) -> int32;
+  on_close: fn(RzHub*, int64, rawptr) -> void;
+}
+
+export struct RzHubOpts {
+  max_conns: int32;       // slots; beyond this an upgrade is refused (503)
+  max_message: int64;     // per-message bound (close 1009 above it)
+  idle_ms: int32;         // close a socket silent this long (0 = never)
+}
+
+export struct RzHubSlot {
+  used: bool;
+  fd: int64;
+  gen: int64;
+  id: int64;
+  ws: RzWsConn*;
+  handler: RzHubHandler*;
+  state: rawptr;
+  want_out: bool;
+  last_ms: int64;         // last time bytes arrived
+  hub: RzHub*;
+}
+
+// A socket handed over by a worker (owned by the mailbox until adopted).
+export struct RzHubAdopt {
+  fd: int64;
+  handler: RzHubHandler*;
+  arg: rawptr;
+  early: uint8*;          // bytes read past the upgrade request (owned)
+  early_len: int64;
+  drop: fn(rawptr) -> void;   // frees `arg` when the socket never opens (0 = nothing to free)
+}
+
+// internal: hub. What rz_hub_upgrade_with hands the worker's adopt step (arena-owned).
+export struct Rz_HubUp {
+  handler: RzHubHandler*;
+  arg: rawptr;                // passed to on_open
+  drop: fn(rawptr) -> void;   // frees `arg` on every path where on_open never runs
+}
+
+// "Run this on the hub thread": the general way in from another thread
+// (channels use it for cross-thread broadcasts). `fn` owns `arg` and frees it.
+export struct RzHubCall {
+  fn_: fn(RzHub*, rawptr) -> void;
+  arg: rawptr;
+}
+
+// An owned byte copy that crosses threads.
+export struct RzHubBytes {
+  len: int64;
+  data: uint8*;
+}
+
+export struct RzHub {
+  opts: RzHubOpts;
+  poll: RzPoll*;
+  slots: RzHubSlot*;
+  open: int32;            // sockets in use (hub thread writes, atomics read)
+  reserved: int32;        // upgrades admitted but not yet adopted
+  thread: int64;
+  running: int32;
+  next_gen: int64;
+  stats_opened: int32;
+  stats_closed: int32;
+  stats_refused: int32;
+}
+
+export fn rz_hub_opts_default() -> RzHubOpts {
+  var o: RzHubOpts;
+  o.max_conns = RZ_HUB_DEFAULT_CONNS;
+  o.max_message = RZ_WS_DEFAULT_MAX_MSG;
+  o.idle_ms = 0;
+  return o;
+}
+
+export fn rz_hub_sock_slot(sock: int64) -> int32 {
+  return (int32)(sock & 0xFFFF);
+}
+
+/// internal: hub/hub, hub/loop. Frees an adoption's on_open argument when the socket
+/// will never open (refused, mailbox full, hub freed first).
+/// in:      drop the free function (0 = nothing to free); arg its argument
+/// returns: nothing
+/// owns:    takes `arg` when drop is set
+export fn rz__hub_drop(drop: fn(rawptr) -> void, arg: rawptr) {
+  if (drop != 0) { drop(arg); }
+}

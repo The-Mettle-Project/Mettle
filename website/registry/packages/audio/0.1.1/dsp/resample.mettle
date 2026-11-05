@@ -1,0 +1,289 @@
+// Resampling: change the sample rate of float samples.
+//
+// A polyphase windowed-sinc resampler after the one in speexdsp (BSD):
+// the same quality levels 0-10 (filter length, pass band and Kaiser
+// window), the rate ratio reduced to whole numbers, and the filter
+// stretched and narrowed when going down in rate so nothing aliases. When
+// the reduced output rate is small enough each output phase gets its own
+// exact filter row (44100 -> 48000 is 147/160); otherwise an oversampled
+// filter is read with cubic interpolation between its points.
+//
+//   var r: AudioResampler;
+//   audio_resampler_init(&r, 2, 44100, 48000, 5);
+//   var used: int64 = 0;
+//   var made: int64 = audio_resample(&r, in, in_frames, &used, out, out_cap);
+//   audio_resampler_free(&r);
+//
+// The output trails the input by about half a filter length; use
+// audio_resampler_latency, or audio_pcm_resample for a whole sound with
+// the delay removed.
+
+import "std/mem";
+import "../core/amath";
+import "../core/status";
+import "../core/pcm";
+import "convert";
+
+const RS_BASE: int32[11] = [8, 16, 32, 48, 64, 80, 96, 128, 160, 192, 256];
+const RS_OVER: int32[11] = [4, 4, 4, 8, 8, 16, 16, 16, 16, 32, 32];
+const RS_DOWN: float64[11] = [0.830, 0.850, 0.882, 0.895, 0.921, 0.922, 0.940, 0.950, 0.960, 0.968, 0.975];
+const RS_UP: float64[11] = [0.860, 0.880, 0.910, 0.917, 0.940, 0.940, 0.945, 0.950, 0.960, 0.968, 0.975];
+const RS_BETA: float64[11] = [6.0, 6.0, 6.0, 8.0, 8.0, 10.0, 10.0, 10.0, 10.0, 12.0, 12.0];
+const RS_CHUNK = 4096;
+
+export struct AudioResampler {
+  ch: int32;
+  in_rate: int32;
+  out_rate: int32;
+  num: int64;           // input rate / gcd
+  den: int64;           // output rate / gcd
+  filt: int32;          // taps
+  over: int32;          // points per tap in the interpolated table
+  direct: bool;
+  table: float32*;
+  hist: float32*;       // per channel: cap samples
+  cap: int32;
+  have: int32;          // samples held per channel
+  last: int32;          // where the next filter window starts
+  frac: int64;          // output phase, 0 .. den-1
+  adv_int: int32;
+  adv_frac: int64;
+}
+
+fn rs_i0(x: float64) -> float64 {
+  // the series for the modified Bessel function of order 0
+  var sum: float64 = 1.0;
+  var term: float64 = 1.0;
+  var q: float64 = x * x / 4.0;
+  for k in 1..60 {
+    term = term * q / (float64)(k * k);
+    sum = sum + term;
+    if (term < sum * 0.0000000000000001) { break; }
+  }
+  return sum;
+}
+
+fn rs_sinc(cutoff: float64, x: float64, n: int32, beta: float64, i0b: float64) -> float64 {
+  var ax: float64 = x;
+  if (ax < 0.0) { ax = -ax; }
+  if (ax < 0.000001) { return cutoff; }
+  if (ax > 0.5 * (float64)n) { return 0.0; }
+  var xx: float64 = x * cutoff * 3.141592653589793;
+  var t: float64 = 2.0 * ax / (float64)n;
+  var w: float64 = rs_i0(beta * audio_sqrt(1.0 - t * t)) / i0b;
+  return cutoff * audio_sin(xx) / xx * w;
+}
+
+fn rs_gcd(a: int64, b: int64) -> int64 {
+  var x: int64 = a;
+  var y: int64 = b;
+  while (y != 0) { var t: int64 = x % y; x = y; y = t; }
+  return x;
+}
+
+/// Sets up a resampler for ch channels from in_rate to out_rate. Quality
+/// is 0 (fast) to 10 (best); 4 or 5 suits games, 10 offline work.
+export fn audio_resampler_init(r: AudioResampler*, ch: int32, in_rate: int32, out_rate: int32, quality: int32) -> int32 {
+  memset(r, 0, sizeof(AudioResampler));
+  if (ch < 1 || ch > AUDIO_MAX_CHANNELS || in_rate < 1 || out_rate < 1 || in_rate > 1000000 || out_rate > 1000000) { return AUDIO_E_ARG; }
+  var q: int32 = quality;
+  if (q < 0) { q = 0; }
+  if (q > 10) { q = 10; }
+  r->ch = ch;
+  r->in_rate = in_rate;
+  r->out_rate = out_rate;
+  var g: int64 = rs_gcd((int64)in_rate, (int64)out_rate);
+  r->num = (int64)in_rate / g;
+  r->den = (int64)out_rate / g;
+  r->filt = RS_BASE[q];
+  r->over = RS_OVER[q];
+  var cutoff: float64 = RS_UP[q];
+  if (r->num > r->den) {
+    // going down: narrow the pass band and stretch the filter to match
+    cutoff = RS_DOWN[q] * (float64)r->den / (float64)r->num;
+    var fl: int64 = (int64)r->filt * r->num / r->den;
+    if (fl > 8192) { fl = 8192; }
+    r->filt = (int32)(((fl - 1) & ~(int64)7) + 8);
+    if (2 * r->den < r->num) { r->over = r->over >> 1; }
+    if (4 * r->den < r->num) { r->over = r->over >> 1; }
+    if (8 * r->den < r->num) { r->over = r->over >> 1; }
+    if (16 * r->den < r->num) { r->over = r->over >> 1; }
+    if (r->over < 1) { r->over = 1; }
+  }
+  var beta: float64 = RS_BETA[q];
+  var i0b: float64 = rs_i0(beta);
+  var n: int32 = r->filt;
+  r->direct = r->den * (int64)n <= 262144;
+  if (r->direct) {
+    r->table = (float32*)malloc(r->den * (int64)n * 4);
+    if (r->table == 0) { return AUDIO_E_MEM; }
+    for i in 0..r->den {
+      for j in 0..n {
+        var x: float64 = (float64)((int32)j - n / 2 + 1) - (float64)i / (float64)r->den;
+        r->table[i * (int64)n + (int64)j] = (float32)rs_sinc(cutoff, x, n, beta, i0b);
+      }
+    }
+  } else {
+    var size: int64 = (int64)r->over * (int64)n + 8;
+    r->table = (float32*)malloc(size * 4);
+    if (r->table == 0) { return AUDIO_E_MEM; }
+    for i in 0..size {
+      var x: float64 = (float64)((int32)i - 4) / (float64)r->over - (float64)(n / 2);
+      r->table[i] = (float32)rs_sinc(cutoff, x, n, beta, i0b);
+    }
+  }
+  r->adv_int = (int32)(r->num / r->den);
+  r->adv_frac = r->num % r->den;
+  r->cap = RS_CHUNK + n;
+  r->hist = (float32*)calloc((int64)r->cap * (int64)ch, 4);
+  if (r->hist == 0) { audio_resampler_free(r); return AUDIO_E_MEM; }
+  r->have = n - 1;   // history starts as silence
+  return AUDIO_OK;
+}
+
+export fn audio_resampler_free(r: AudioResampler*) {
+  if (r->table != 0) { free(r->table); }
+  if (r->hist != 0) { free(r->hist); }
+  r->table = (float32*)0;
+  r->hist = (float32*)0;
+}
+
+/// Input frames by which the output trails the input.
+export fn audio_resampler_latency(r: AudioResampler*) -> int32 { return r->filt / 2; }
+
+/// Starts with no delay: the first output frame lines up with the first
+/// input frame. Call right after init.
+export fn audio_resampler_skip_latency(r: AudioResampler*) {
+  r->last = r->filt / 2;
+}
+
+fn rs_dot(a: float32*, b: float32*, n: int64) -> float32 {
+  var s: float32 = 0.0;
+  @simd for i: int64 in 0..n { s = s + a[i] * b[i]; }
+  return s;
+}
+
+/// Resamples up to in_frames interleaved input frames into at most out_cap
+/// output frames. *used gets how many input frames were taken. Returns the
+/// output frames made. Call again with the rest of the input.
+export fn audio_resample(r: AudioResampler*, src: float32*, in_frames: int64, used: int64*, dst: float32*, out_cap: int64) -> int64 {
+  var ch: int64 = (int64)r->ch;
+  var n: int32 = r->filt;
+  var made: int64 = 0;
+  var took: int64 = 0;
+  while (true) {
+    // take input while there is room
+    var room: int64 = (int64)(r->cap - r->have);
+    var k: int64 = in_frames - took;
+    if (k > room) { k = room; }
+    if (k > 0) {
+      for c in 0..ch {
+        var h: float32* = r->hist + c * (int64)r->cap + (int64)r->have;
+        var s: float32* = src + took * ch + c;
+        for i in 0..k { h[i] = s[i * ch]; }
+      }
+      r->have = r->have + (int32)k;
+      took = took + k;
+    }
+    // make output while a whole window is held
+    var before: int64 = made;
+    while (made < out_cap && r->last + n <= r->have) {
+      if (r->direct) {
+        var row: float32* = r->table + r->frac * (int64)n;
+        for c in 0..ch {
+          var h: float32* = r->hist + c * (int64)r->cap + (int64)r->last;
+          dst[made * ch + c] = rs_dot(row, h, (int64)n);
+        }
+      } else {
+        var over: int64 = (int64)r->over;
+        var off: int64 = r->frac * over / r->den;
+        var fr: float32 = (float32)((float64)((r->frac * over) % r->den) / (float64)r->den);
+        var x2: float32 = fr * fr;
+        var x3: float32 = x2 * fr;
+        var i0: float32 = -0.16667 * fr + 0.16667 * x3;
+        var i1: float32 = fr + 0.5 * x2 - 0.5 * x3;
+        var i3: float32 = -0.33333 * fr + 0.5 * x2 - 0.16667 * x3;
+        var i2: float32 = 1.0 - i0 - i1 - i3;
+        for c in 0..ch {
+          var h: float32* = r->hist + c * (int64)r->cap + (int64)r->last;
+          var a0: float32 = 0.0; var a1: float32 = 0.0; var a2: float32 = 0.0; var a3: float32 = 0.0;
+          for j in 0..(int64)n {
+            var t: float32* = r->table + 4 + (j + 1) * over - off;
+            var v: float32 = h[j];
+            a0 = a0 + v * t[-2];
+            a1 = a1 + v * t[-1];
+            a2 = a2 + v * t[0];
+            a3 = a3 + v * t[1];
+          }
+          dst[made * ch + c] = i0 * a0 + i1 * a1 + i2 * a2 + i3 * a3;
+        }
+      }
+      made = made + 1;
+      r->last = r->last + r->adv_int;
+      r->frac = r->frac + r->adv_frac;
+      if (r->frac >= r->den) { r->frac = r->frac - r->den; r->last = r->last + 1; }
+    }
+    // drop what no window needs any more
+    var drop: int32 = r->last;
+    if (drop > r->have) { drop = r->have; }
+    if (drop > 0) {
+      for c in 0..ch {
+        var h: float32* = r->hist + c * (int64)r->cap;
+        memmove(h, h + drop, (int64)(r->have - drop) * 4);
+      }
+      r->have = r->have - drop;
+      r->last = r->last - drop;
+    }
+    if (made >= out_cap || took >= in_frames) {
+      if (made == before && took >= in_frames) { break; }
+      if (made >= out_cap) { break; }
+    }
+  }
+  *used = took;
+  return made;
+}
+
+/// Makes dst a float copy of src at another rate, the same length in time
+/// (ceil(frames * rate / src.rate) frames) and with no delay.
+export fn audio_pcm_resample(src: AudioPcm*, rate: int32, quality: int32, dst: AudioPcm*) -> int32 {
+  if (src == dst || (src->data == 0 && src->frames > 0) || rate < 1 || src->rate < 1) { return AUDIO_E_ARG; }
+  var tmp: AudioPcm;
+  var f: float32* = (float32*)src->data;
+  var rc: int32 = AUDIO_OK;
+  if (src->fmt != AUDIO_F32) {
+    rc = audio_pcm_convert(src, AUDIO_F32, &tmp);
+    if (rc != AUDIO_OK) { return rc; }
+    f = (float32*)tmp.data;
+  }
+  var r: AudioResampler;
+  rc = audio_resampler_init(&r, src->channels, src->rate, rate, quality);
+  var total: int64 = (src->frames * (int64)rate + (int64)src->rate - 1) / (int64)src->rate;
+  if (rc == AUDIO_OK) { rc = audio_pcm_alloc(dst, total, src->channels, rate, AUDIO_F32); }
+  if (rc == AUDIO_OK) {
+    dst->mask = src->mask;
+    audio_resampler_skip_latency(&r);
+    var o: float32* = (float32*)dst->data;
+    var ch: int64 = (int64)src->channels;
+    var made: int64 = 0;
+    var at: int64 = 0;
+    while (at < src->frames && made < total) {
+      var used: int64 = 0;
+      made = made + audio_resample(&r, f + at * ch, src->frames - at, &used, o + made * ch, total - made);
+      at = at + used;
+      if (used == 0) { break; }
+    }
+    // push silence through for the tail
+    var zeros: float32* = (float32*)calloc((int64)r.filt * ch + 1, 4);
+    var guard: int32 = 0;
+    while (zeros != 0 && made < total && guard < 64) {
+      var used: int64 = 0;
+      made = made + audio_resample(&r, zeros, (int64)r.filt, &used, o + made * ch, total - made);
+      guard = guard + 1;
+    }
+    if (zeros != 0) { free(zeros); }
+    dst->frames = made;
+  }
+  audio_resampler_free(&r);
+  if (src->fmt != AUDIO_F32) { audio_pcm_free(&tmp); }
+  return rc;
+}

@@ -1,0 +1,164 @@
+// raize/channel/wire — Phoenix channel messages (serializer v2), in and out.
+//
+// Every text frame on a channel socket is one JSON array:
+//
+//   [join_ref, ref, topic, event, payload]
+//
+//   join_ref  the ref of the join that opened this channel (string or null)
+//   ref       this message's ref, echoed in the reply (string or null)
+//   topic     "room:lobby"; "phoenix" for the socket-level heartbeat
+//   event     "phx_join", "phx_leave", "heartbeat", or an app event
+//   payload   any JSON value, usually an object
+//
+// Server to client:
+//
+//   reply      [join_ref, ref, topic, "phx_reply", {"status": "ok", "response": {...}}]
+//   push       [join_ref, null, topic, event, payload]
+//   broadcast  [null, null, topic, event, payload]
+//   error      [join_ref, join_ref, topic, "phx_error", {}]
+//   close      [join_ref, join_ref, topic, "phx_close", {}]
+//
+// This is exactly what phoenix.js speaks, so its client is a drop-in.
+// join_ref and ref are kept as raw JSON (`"3"` or `null`) because the server
+// only ever echoes them; topic and event are decoded strings.
+
+import "raize_core/str/str";
+import "raize_core/context/arena";
+import "raize_core/context/json";
+
+export const RZ_CHAN_MAX_TOPIC: int64 = 256;
+export const RZ_CHAN_MAX_EVENT: int64 = 128;
+
+export struct RzChanMsg {
+  join_ref: string;     // raw JSON
+  ref: string;          // raw JSON
+  topic: string;        // decoded
+  event: string;        // decoded
+  payload: string;      // raw JSON
+}
+
+fn rz_chan_ref_ok(raw: string) -> bool {
+  if (rz_str_eq(raw, "null")) { return true; }
+  return raw.length >= 2 && raw.chars[0] == 34;
+}
+
+fn rz_chan_str(raw: string, arena: RzArena*, max: int64, out: string*) -> bool {
+  if (raw.length < 2 || raw.chars[0] != 34 || raw.chars[raw.length - 1] != 34) { return false; }
+  var inner: string = rz_str_sub(raw, 1, (int64)raw.length - 1);
+  var v: string = rz_json_unescape(inner, arena);
+  if (v.length == 0 || (int64)v.length > max) { return false; }
+  *out = v;
+  return true;
+}
+
+// Decodes one message. Strings that need unescaping are copied into `arena`;
+// everything else is a view into `text`. Returns false when the frame is not
+// a well-formed 5-element v2 message.
+export fn rz_chan_decode(text: string, arena: RzArena*, out: RzChanMsg*) -> bool {
+  if (out == 0) { return false; }
+  var topic_raw: string = rz_str_empty();
+  var event_raw: string = rz_str_empty();
+  if (!rz_json_array_at(text, 0, &out->join_ref)) { return false; }
+  if (!rz_json_array_at(text, 1, &out->ref)) { return false; }
+  if (!rz_json_array_at(text, 2, &topic_raw)) { return false; }
+  if (!rz_json_array_at(text, 3, &event_raw)) { return false; }
+  if (!rz_json_array_at(text, 4, &out->payload)) { return false; }
+  if (rz_json_array_at(text, 5, 0)) { return false; }
+  if (!rz_chan_ref_ok(out->join_ref) || !rz_chan_ref_ok(out->ref)) { return false; }
+  if (!rz_chan_str(topic_raw, arena, RZ_CHAN_MAX_TOPIC, &out->topic)) { return false; }
+  if (!rz_chan_str(event_raw, arena, RZ_CHAN_MAX_EVENT, &out->event)) { return false; }
+  return true;
+}
+
+fn rz_chan_quoted(b: RzBuf*, s: string) {
+  rz_buf_add_byte(b, 34);
+  rz_json_escape_into(b, s);
+  rz_buf_add_byte(b, 34);
+}
+
+fn rz_chan_raw_or_null(b: RzBuf*, raw: string) {
+  if (raw.length == 0) {
+    rz_buf_add(b, "null");
+  } else {
+    rz_buf_add(b, raw);
+  }
+}
+
+// Appends [join_ref, ref, topic, event, payload]. An empty raw ref or payload
+// is written as null / {}.
+export fn rz_chan_encode(b: RzBuf*, join_ref: string, ref: string, topic: string, event: string, payload: string) {
+  rz_buf_add_byte(b, 91);
+  rz_chan_raw_or_null(b, join_ref);
+  rz_buf_add_byte(b, 44);
+  rz_chan_raw_or_null(b, ref);
+  rz_buf_add_byte(b, 44);
+  rz_chan_quoted(b, topic);
+  rz_buf_add_byte(b, 44);
+  rz_chan_quoted(b, event);
+  rz_buf_add_byte(b, 44);
+  if (payload.length == 0) {
+    rz_buf_add(b, "{{}");
+  } else {
+    rz_buf_add(b, payload);
+  }
+  rz_buf_add_byte(b, 93);
+}
+
+// Appends the reply to `m`: status "ok" or "error", response a raw JSON value
+// (empty means {}).
+export fn rz_chan_reply(b: RzBuf*, m: RzChanMsg*, status: string, response: string) {
+  var p: RzBuf* = rz_buf_new();
+  rz_buf_add(p, "{{\"status\":");
+  rz_chan_quoted(p, status);
+  rz_buf_add(p, ",\"response\":");
+  if (response.length == 0) {
+    rz_buf_add(p, "{{}");
+  } else {
+    rz_buf_add(p, response);
+  }
+  rz_buf_add_byte(p, 125);
+  rz_chan_encode(b, m->join_ref, m->ref, m->topic, "phx_reply", rz_buf_str(p));
+  rz_buf_free(p);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+@test fn t_rz_chan_decode() -> int32 {
+  var a: RzArena* = rz_arena_new();
+  var m: RzChanMsg;
+  var fail: int32 = 0;
+  if (!rz_chan_decode("[\"1\",\"1\",\"room:lobby\",\"phx_join\",{{\"user\":\"ann\"}]", a, &m)) { fail = 1; }
+  if (fail == 0 && !rz_str_eq(m.topic, "room:lobby")) { fail = 2; }
+  if (fail == 0 && !rz_str_eq(m.event, "phx_join")) { fail = 3; }
+  if (fail == 0 && !rz_str_eq(m.join_ref, "\"1\"")) { fail = 4; }
+  if (fail == 0 && !rz_str_eq(m.payload, "{{\"user\":\"ann\"}")) { fail = 5; }
+  if (fail == 0 && !rz_chan_decode("[null,\"7\",\"phoenix\",\"heartbeat\",{{}]", a, &m)) { fail = 6; }
+  if (fail == 0 && !rz_str_eq(m.join_ref, "null")) { fail = 7; }
+  if (fail == 0 && !rz_chan_decode("[null, null, \"a\\\"b\", \"ev\", 42]", a, &m)) { fail = 8; }
+  if (fail == 0 && !rz_str_eq(m.topic, "a\"b")) { fail = 9; }
+  if (fail == 0 && rz_chan_decode("[null,null,\"t\",\"e\"]", a, &m)) { fail = 10; }
+  if (fail == 0 && rz_chan_decode("[null,null,\"t\",\"e\",{{},1]", a, &m)) { fail = 11; }
+  if (fail == 0 && rz_chan_decode("[1,null,\"t\",\"e\",{{}]", a, &m)) { fail = 12; }
+  if (fail == 0 && rz_chan_decode("[null,null,\"\",\"e\",{{}]", a, &m)) { fail = 13; }
+  if (fail == 0 && rz_chan_decode("{{\"topic\":\"t\"}", a, &m)) { fail = 14; }
+  rz_arena_free(a);
+  return fail;
+}
+
+@test fn t_rz_chan_encode_and_reply() -> int32 {
+  var b: RzBuf* = rz_buf_new();
+  var fail: int32 = 0;
+  rz_chan_encode(b, "", "", "room:lobby", "new_msg", "{{\"body\":\"hi\"}");
+  if (!rz_str_eq(rz_buf_str(b), "[null,null,\"room:lobby\",\"new_msg\",{{\"body\":\"hi\"}]")) { fail = 1; }
+  b->len = 0;
+  var a: RzArena* = rz_arena_new();
+  var m: RzChanMsg;
+  rz_chan_decode("[\"3\",\"4\",\"room:x\",\"phx_join\",{{}]", a, &m);
+  rz_chan_reply(b, &m, "ok", "");
+  if (fail == 0 && !rz_str_eq(rz_buf_str(b), "[\"3\",\"4\",\"room:x\",\"phx_reply\",{{\"status\":\"ok\",\"response\":{{}}]")) { fail = 2; }
+  rz_arena_free(a);
+  rz_buf_free(b);
+  return fail;
+}

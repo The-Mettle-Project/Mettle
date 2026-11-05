@@ -1,0 +1,187 @@
+// ulid: ULIDs (https://github.com/ulid/spec), a 128-bit id that sorts by time.
+//
+// 48 bits of Unix milliseconds, then 80 random bits, written as 26
+// characters of Crockford base32 (0-9 and A-Z without I, L, O and U).
+// Decoding ignores case. The largest ULID is 7ZZZZZZZZZZZZZZZZZZZZZZZZZ;
+// anything above it is refused. A ULID has the same 16 bytes as a UUID, so
+// it converts both ways for free, though it carries no version or variant.
+
+import "std/core";
+import "std/mem";
+import "std/conv";
+import "std/random";
+import "std/time";
+import "std/sync";
+import "core";
+import "text";
+
+export struct UuidUlid {
+  b: uint8[16];
+}
+
+const UL_ALPHA: string = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+// Value of each byte as a base32 digit, 255 if it is not one.
+const UL_DEC: uint8[128] = [
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, 255, 255, 255, 255, 255,
+  255, 10, 11, 12, 13, 14, 15, 16, 17, 255, 18, 19, 255, 20, 21, 255,
+  22, 23, 24, 25, 26, 255, 27, 28, 29, 30, 31, 255, 255, 255, 255, 255,
+  255, 10, 11, 12, 13, 14, 15, 16, 17, 255, 18, 19, 255, 20, 21, 255,
+  22, 23, 24, 25, 26, 255, 27, 28, 29, 30, 31, 255, 255, 255, 255, 255
+];
+
+fn ul_hi(u: UuidUlid) -> uint64 {
+  var v: uint64 = 0;
+  for i in 0..8 { v = (v << (uint64)8) | (uint64)u.b[i]; }
+  return v;
+}
+
+fn ul_lo(u: UuidUlid) -> uint64 {
+  var v: uint64 = 0;
+  for i in 0..8 { v = (v << (uint64)8) | (uint64)u.b[i + 8]; }
+  return v;
+}
+
+fn ul_set(u: UuidUlid*, hi: uint64, lo: uint64) {
+  for i in 0..8 {
+    u->b[i] = (uint8)(hi >> (uint64)(56 - 8 * i));
+    u->b[i + 8] = (uint8)(lo >> (uint64)(56 - 8 * i));
+  }
+}
+
+// A ULID from its parts: 48-bit milliseconds and 10 random bytes.
+export fn uuid_ulid_from(unix_ms: uint64, rand10: uint8*) -> UuidUlid {
+  var u: UuidUlid;
+  for i in 0..6 { u.b[i] = (uint8)(unix_ms >> (uint64)(40 - 8 * i)); }
+  for i in 0..10 { u.b[i + 6] = rand10[i]; }
+  return u;
+}
+
+export fn uuid_ulid_ms(u: UuidUlid) -> uint64 {
+  return ul_hi(u) >> (uint64)16;
+}
+
+export fn uuid_ulid_to_uuid(u: UuidUlid) -> Uuid {
+  return uuid_from_bytes(&u.b[0]);
+}
+
+export fn uuid_ulid_from_uuid(x: Uuid) -> UuidUlid {
+  var u: UuidUlid;
+  for i in 0..16 { u.b[i] = x.b[i]; }
+  return u;
+}
+
+export fn uuid_ulid_cmp(a: UuidUlid, b: UuidUlid) -> int32 {
+  return uuid_cmp(uuid_ulid_to_uuid(a), uuid_ulid_to_uuid(b));
+}
+
+export fn uuid_ulid_eq(a: UuidUlid, b: UuidUlid) -> bool {
+  return uuid_ulid_cmp(a, b) == 0;
+}
+
+// Writes the 26 characters to buf. No terminating zero.
+export fn uuid_ulid_encode(u: UuidUlid, buf: uint8*) {
+  var hi: uint64 = ul_hi(u);
+  var lo: uint64 = ul_lo(u);
+  // Take 5 bits at a time from the low end; the first character gets the
+  // top 3 bits.
+  var k: int64 = 25;
+  while (k >= 0) {
+    buf[k] = (uint8)UL_ALPHA[(int64)(lo & (uint64)31)];
+    lo = (lo >> (uint64)5) | (hi << (uint64)59);
+    hi = hi >> (uint64)5;
+    k = k - 1;
+  }
+}
+
+// A new 26-character string. The caller owns it (free its chars).
+export fn uuid_ulid_to_string(u: UuidUlid) -> string {
+  var buf: uint8* = (uint8*)malloc(27);
+  uuid_ulid_encode(u, buf);
+  buf[26] = 0;
+  return str_from_bytes((cstring)buf, 26);
+}
+
+export fn uuid_ulid_parse_into(s: string, out: UuidUlid*, e: UuidError*) -> bool {
+  if (s.length != 26) {
+    e->at = 0;
+    e->why = "wrong length: a ULID is 26 characters";
+    return false;
+  }
+  var hi: uint64 = 0;
+  var lo: uint64 = 0;
+  for k in 0..26 {
+    var c: uint8 = (uint8)s[k];
+    var d: uint8 = 255;
+    if (c < (uint8)128) { d = UL_DEC[c]; }
+    if (d == (uint8)255) {
+      e->at = (int64)k;
+      e->why = "expected a base32 digit";
+      return false;
+    }
+    if (k == 0 && d > (uint8)7) {
+      e->at = 0;
+      e->why = "too large: the first digit must be 0 to 7";
+      return false;
+    }
+    hi = (hi << (uint64)5) | (lo >> (uint64)59);
+    lo = (lo << (uint64)5) | (uint64)d;
+  }
+  ul_set(out, hi, lo);
+  return true;
+}
+
+export fn uuid_ulid_try_parse(s: string, out: UuidUlid*) -> bool {
+  var e: UuidError;
+  return uuid_ulid_parse_into(s, out, &e);
+}
+
+export fn uuid_ulid_parse(s: string) -> Result<UuidUlid, UuidError> {
+  var u: UuidUlid;
+  var e: UuidError;
+  if (uuid_ulid_parse_into(s, &u, &e)) { return Ok(u); }
+  return Err(e);
+}
+
+// A monotonic ULID generator, as the spec describes: in the same
+// millisecond the 80 random bits go up by one. If they would overflow, or
+// the clock steps back, the generator keeps counting from the last value,
+// moving to the next millisecond when needed, so it never fails and never
+// goes down. Zero-initialised is ready to use. Not locked.
+export struct UuidUlidGen {
+  last: UuidUlid;
+  used: bool;
+}
+
+export fn uuid_ulid_next(g: UuidUlidGen*, unix_ms: uint64) -> UuidUlid {
+  var ms: uint64 = unix_ms & (uint64)0xFFFFFFFFFFFF;
+  if (!g->used || ms > uuid_ulid_ms(g->last)) {
+    var r: uint8[10];
+    random_bytes(&r[0], 10);
+    g->last = uuid_ulid_from(ms, &r[0]);
+    g->used = true;
+    return g->last;
+  }
+  // Add one to the whole 128-bit value: a carry out of the random part
+  // moves the time on by a millisecond.
+  var hi: uint64 = ul_hi(g->last);
+  var lo: uint64 = ul_lo(g->last) + 1;
+  if (lo == (uint64)0) { hi = hi + 1; }
+  ul_set(&g->last, hi, lo);
+  return g->last;
+}
+
+var ul_gen: UuidUlidGen;
+var ul_lock: SyncMutex;
+
+// A ULID for now. Values from this process only ever go up.
+export fn uuid_ulid() -> UuidUlid {
+  var ms: uint64 = (uint64)time_unix_ms();
+  sync_mutex_lock(&ul_lock);
+  var u: UuidUlid = uuid_ulid_next(&ul_gen, ms);
+  sync_mutex_unlock(&ul_lock);
+  return u;
+}

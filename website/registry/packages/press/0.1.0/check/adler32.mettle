@@ -1,0 +1,42 @@
+// Adler-32 (the zlib checksum).
+//
+//   var a: uint32 = press_adler32(1, p, n);     // start value is 1
+//   a = press_adler32(a, more, m);
+
+const PRESS_ADLER_MOD: uint32 = 65521;
+const PRESS_ADLER_NMAX: int64 = 5552;   // most bytes before the sums can overflow 32 bits
+
+/// Adler-32 of n bytes at p, continuing from adler (pass 1 to start).
+export fn press_adler32(adler: uint32, p: uint8*, n: int64) -> uint32 {
+  var a: uint32 = adler & 65535;
+  var b: uint32 = adler >> 16;
+  if (p == 0 || n <= 0) { return adler; }
+  var i: int64 = 0;
+  while (i < n) {
+    var e: int64 = n;
+    if (e - i > PRESS_ADLER_NMAX) { e = i + PRESS_ADLER_NMAX; }
+    // 32 bytes at a time: b gains 32 copies of a, plus each byte weighted
+    // by how many sums it is part of.
+    while (i + 32 <= e) {
+      var s: uint32 = 0;
+      var w: uint32 = 0;
+      var q: uint8* = p + i;
+      for j: int64 in 0..32 {
+        var x: uint32 = (uint32)q[j];
+        s = s + x;
+        w = w + (uint32)(32 - j) * x;
+      }
+      b = b + a * 32 + w;
+      a = a + s;
+      i = i + 32;
+    }
+    while (i < e) {
+      a = a + (uint32)p[i];
+      b = b + a;
+      i = i + 1;
+    }
+    a = a % PRESS_ADLER_MOD;
+    b = b % PRESS_ADLER_MOD;
+  }
+  return (b << 16) | a;
+}

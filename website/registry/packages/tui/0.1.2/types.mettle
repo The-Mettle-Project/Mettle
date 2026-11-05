@@ -1,0 +1,77 @@
+// The basic types every other module uses: colours, styles, cells,
+// rectangles and the buffer of cells that a frame is drawn into.
+
+// A colour is one uint32. The top byte says what kind it is:
+//   0x00......  the terminal's default colour
+//   0x01....NN  palette index NN (0-15 are the 16 basic colours, 16-255 xterm)
+//   0x02RRGGBB  24-bit true colour
+export const TUI_DEFAULT: uint32 = 0;
+export const TUI_KIND_INDEX: uint32 = 0x01000000;
+export const TUI_KIND_RGB: uint32 = 0x02000000;
+
+// Attribute bits for TuiStyle.attrs.
+export const TUI_BOLD: uint16 = 1;
+export const TUI_DIM: uint16 = 2;
+export const TUI_ITALIC: uint16 = 4;
+export const TUI_UNDERLINE: uint16 = 8;
+export const TUI_BLINK: uint16 = 16;
+export const TUI_REVERSE: uint16 = 32;
+export const TUI_STRIKE: uint16 = 64;
+
+export struct TuiStyle {
+  fg: uint32;
+  bg: uint32;
+  attrs: uint16;
+}
+
+// One screen cell. text holds the UTF-8 bytes of one grapheme (a base
+// character plus any combining marks). width is 1 or 2; the cell to the
+// right of a wide character has width 0 and no text.
+export const TUI_CELL_BYTES = 24;
+
+export struct TuiCell {
+  text: uint8[24];
+  len: uint8;
+  width: uint8;
+  style: TuiStyle;
+}
+
+export struct TuiRect {
+  x: int32;
+  y: int32;
+  w: int32;
+  h: int32;
+}
+
+// A grid of cells, row by row.
+export struct TuiBuf {
+  w: int32;
+  h: int32;
+  cells: TuiCell*;
+}
+
+export fn tui_rect(x: int32, y: int32, w: int32, h: int32) -> TuiRect {
+  var r: TuiRect = { x: x, y: y, w: w, h: h };
+  if (r.w < 0) { r.w = 0; }
+  if (r.h < 0) { r.h = 0; }
+  return r;
+}
+
+export fn tui_style(fg: uint32, bg: uint32, attrs: uint16) -> TuiStyle {
+  var s: TuiStyle = { fg: fg, bg: bg, attrs: attrs };
+  return s;
+}
+
+export fn tui_style_fg(fg: uint32) -> TuiStyle {
+  var s: TuiStyle = { fg: fg, bg: TUI_DEFAULT, attrs: (uint16)0 };
+  return s;
+}
+
+export fn tui_style_default() -> TuiStyle {
+  var s: TuiStyle;
+  return s;
+}
+
+export fn tui_style_eq(a: TuiStyle, b: TuiStyle) -> bool {
+  return a.fg == b.fg && a.bg == b.bg && a.attrs == b.attrs;
+}

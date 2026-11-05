@@ -1,0 +1,434 @@
+// mythic_base: arena, MythicVec<T>, MythicMap<V>, hashing, float math.
+// Imports only std/mem (DECISIONS §1). No std/math.
+import "std/mem";
+
+// ---------------------------------------------------------------- arena (§5)
+// Chunked bump allocator. Chunks are kept on reset, so reset is O(1) and capacity persists.
+export const MYTHIC_ARENA_CHUNK: int64 = 1048576;
+
+export struct MythicArenaChunk { next: MythicArenaChunk*; cap: int64; data: uint8*; }
+export struct MythicArena { first: MythicArenaChunk*; cur: MythicArenaChunk*; used: int64; total: int64; }
+
+fn arena_new_chunk(min_size: int64) -> MythicArenaChunk* {
+  var cap: int64 = MYTHIC_ARENA_CHUNK;
+  if (min_size > cap) { cap = min_size; }
+  var c: MythicArenaChunk* = new MythicArenaChunk;
+  c->cap = cap;
+  c->data = (uint8*)malloc(cap);
+  return c;
+}
+
+/// Allocates `n` bytes (16-byte aligned, not zeroed) valid until the next reset.
+export fn mythic_arena_alloc(a: MythicArena*, n: int64) -> rawptr {
+  var size: int64 = (n + 15) & ~(int64)15;
+  if (size <= 0) { size = 16; }
+  if (a->cur == 0) {
+    if (a->first == 0) { a->first = arena_new_chunk(size); a->total = a->first->cap; }
+    a->cur = a->first; a->used = 0;
+  }
+  if (a->used + size > a->cur->cap) {
+    // move to the next retained chunk that fits; otherwise insert a fresh one after cur
+    var nx: MythicArenaChunk* = a->cur->next;
+    if (nx != 0 && nx->cap >= size) {
+      a->cur = nx;
+    } else {
+      var c: MythicArenaChunk* = arena_new_chunk(size);
+      c->next = nx;
+      a->cur->next = c;
+      a->cur = c;
+      a->total = a->total + c->cap;
+    }
+    a->used = 0;
+  }
+  var p: uint8* = a->cur->data + a->used;
+  a->used = a->used + size;
+  return (rawptr)p;
+}
+
+/// Like mythic_arena_alloc but zero-filled.
+export fn mythic_arena_alloc_zero(a: MythicArena*, n: int64) -> rawptr {
+  var p: rawptr = mythic_arena_alloc(a, n);
+  memset(p, 0, n);
+  return p;
+}
+
+/// Copies the bytes of `s` into the arena (the §5 string rule) and returns the copy.
+export fn mythic_arena_str(a: MythicArena*, s: string) -> string {
+  return mythic_arena_strn(a, s, (int64)s.length);
+}
+
+/// Copies the first `len` bytes of `s` (clamped to its length) into the arena and returns the copy.
+/// Lets a caller take a prefix of a string parameter without building a view of it (Amendment 20).
+export fn mythic_arena_strn(a: MythicArena*, s: string, len: int64) -> string {
+  var n: int64 = len;
+  if (n > (int64)s.length) { n = (int64)s.length; }
+  if (n < 0) { n = 0; }
+  var out: string;
+  var p: uint8* = (uint8*)mythic_arena_alloc(a, n + 1);
+  if (n > 0) { memcpy((rawptr)p, (rawptr)s.chars, n); }
+  p[n] = (uint8)0;
+  out.chars = (cstring)p;
+  out.length = (uint64)n;
+  return out;
+}
+
+/// O(1): rewinds to the first chunk; keeps every chunk.
+export fn mythic_arena_reset(a: MythicArena*) {
+  a->cur = a->first;
+  a->used = 0;
+}
+
+export fn mythic_arena_free(a: MythicArena*) {
+  var c: MythicArenaChunk* = a->first;
+  while (c != 0) {
+    var nx: MythicArenaChunk* = c->next;
+    free((rawptr)c->data);
+    free((rawptr)c);
+    c = nx;
+  }
+  a->first = 0; a->cur = 0; a->used = 0; a->total = 0;
+}
+
+// ---------------------------------------------------------------- MythicVec<T> (§5, P2)
+export struct MythicVec<T> { data: T*; len: int64; cap: int64; }
+
+/// Ensures capacity for at least `n` elements (doubling growth).
+export fn mythic_vec_reserve<T>(v: MythicVec<T>*, n: int64) {
+  if (n <= v->cap) { return; }
+  var nc: int64 = v->cap * 2;
+  if (nc < 16) { nc = 16; }
+  while (nc < n) { nc = nc * 2; }
+  var fresh: T[] = new T[nc];
+  if (v->len > 0) { for i: int64 in 0..v->len { fresh.data[i] = v->data[i]; } }
+  if (v->data != 0) { free((rawptr)v->data); }
+  v->data = fresh.data;
+  v->cap = nc;
+}
+
+/// Appends `x` and returns a pointer to the stored element (valid until the next push).
+export fn mythic_vec_push<T>(v: MythicVec<T>*, x: T) -> T* {
+  if (v->len == v->cap) { mythic_vec_reserve<T>(v, v->len + 1); }
+  v->data[v->len] = x;
+  v->len = v->len + 1;
+  return &v->data[v->len - 1];
+}
+
+/// Sets len to 0; keeps capacity.
+export fn mythic_vec_clear<T>(v: MythicVec<T>*) { v->len = 0; }
+
+export fn mythic_vec_free<T>(v: MythicVec<T>*) {
+  if (v->data != 0) { free((rawptr)v->data); }
+  v->data = 0; v->len = 0; v->cap = 0;
+}
+
+// ---------------------------------------------------------------- hashing (§2, CONTRACT)
+// FNV-1a 64 over (8 seed bytes, then data), then the splitmix64 finalizer; 0 maps to 1.
+
+/// splitmix64 finalizer.
+export fn mythic_hash_mix(x: uint64) -> uint64 {
+  var z: uint64 = x;
+  z = z ^ (z >> 30);
+  z = z * (uint64)0xbf58476d1ce4e5b9;
+  z = z ^ (z >> 27);
+  z = z * (uint64)0x94d049bb133111eb;
+  z = z ^ (z >> 31);
+  return z;
+}
+
+fn fnv_seed(seed: uint64) -> uint64 {
+  var h: uint64 = 0xcbf29ce484222325;
+  var prime: uint64 = 0x100000001b3;
+  for i: int32 in 0..8 {
+    h = h ^ ((seed >> (uint64)(i * 8)) & (uint64)0xFF);
+    h = h * prime;
+  }
+  return h;
+}
+
+fn hash_final(h: uint64) -> uint64 {
+  var r: uint64 = mythic_hash_mix(h);
+  if (r == (uint64)0) { r = (uint64)1; }
+  return r;
+}
+
+/// ID hash of `len` bytes under `seed` (the parent ID). Never returns 0.
+export fn mythic_hash(seed: uint64, data: uint8*, len: int64) -> uint64 {
+  var h: uint64 = fnv_seed(seed);
+  var prime: uint64 = 0x100000001b3;
+  var i: int64 = 0;
+  while (i < len) {
+    h = h ^ (uint64)data[i];
+    h = h * prime;
+    i = i + 1;
+  }
+  return hash_final(h);
+}
+
+export fn mythic_hash_str(seed: uint64, s: string) -> uint64 {
+  return mythic_hash(seed, (uint8*)s.chars, (int64)s.length);
+}
+
+/// Hash of the 8 little-endian bytes of `v` under `seed`.
+export fn mythic_hash_u64(seed: uint64, v: uint64) -> uint64 {
+  var h: uint64 = fnv_seed(seed);
+  var prime: uint64 = 0x100000001b3;
+  for i: int32 in 0..8 {
+    h = h ^ ((v >> (uint64)(i * 8)) & (uint64)0xFF);
+    h = h * prime;
+  }
+  return hash_final(h);
+}
+
+// ---------------------------------------------------------------- MythicMap<V> (§5)
+// Open addressing, linear probing, power-of-2 capacity, key 0 = empty, load factor <= 0.5.
+export struct MythicMap<V> { keys: uint64*; vals: V*; cap: int64; count: int64; }
+
+fn map_insert_slot(keys: uint64*, cap: int64, key: uint64) -> int64 {
+  var mask: uint64 = (uint64)(cap - 1);
+  var i: uint64 = mythic_hash_mix(key) & mask;
+  while (keys[i] != (uint64)0 && keys[i] != key) { i = (i + (uint64)1) & mask; }
+  return (int64)i;
+}
+
+fn map_rehash<V>(m: MythicMap<V>*, nc: int64, mythic_keep_cb: fn(rawptr) -> bool, use_keep: bool) {
+  var ok: uint64* = m->keys;
+  var ov: V* = m->vals;
+  var oc: int64 = m->cap;
+  var nk: uint64[] = new uint64[nc];
+  var nv: V[] = new V[nc];
+  var count: int64 = 0;
+  for i: int64 in 0..oc {
+    if (ok[i] != (uint64)0) {
+      var take: bool = true;
+      if (use_keep) { take = mythic_keep_cb((rawptr)&ov[i]); }
+      if (take) {
+        var s: int64 = map_insert_slot(nk.data, nc, ok[i]);
+        nk.data[s] = ok[i];
+        nv.data[s] = ov[i];
+        count = count + 1;
+      }
+    }
+  }
+  if (ok != 0) { free((rawptr)ok); }
+  if (ov != 0) { free((rawptr)ov); }
+  m->keys = nk.data;
+  m->vals = nv.data;
+  m->cap = nc;
+  m->count = count;
+}
+
+fn map_keep_all(p: rawptr) -> bool { return true; }
+
+/// Returns the value for `key`; inserts a zeroed value when missing and `create` is true;
+/// returns 0 when missing and `create` is false. Key 0 is never stored (returns 0).
+/// The pointer is valid until the next insert or sweep.
+export fn mythic_map_get<V>(m: MythicMap<V>*, key: uint64, create: bool) -> V* {
+  if (key == (uint64)0) { return 0; }
+  if (m->cap > 0) {
+    var mask: uint64 = (uint64)(m->cap - 1);
+    var i: uint64 = mythic_hash_mix(key) & mask;
+    while (m->keys[i] != (uint64)0) {
+      if (m->keys[i] == key) { return &m->vals[i]; }
+      i = (i + (uint64)1) & mask;
+    }
+  }
+  if (!create) { return 0; }
+  if ((m->count + 1) * 2 > m->cap) {
+    var nc: int64 = m->cap * 2;
+    if (nc < 64) { nc = 64; }
+    map_rehash<V>(m, nc, &map_keep_all, false);
+  }
+  var s: int64 = map_insert_slot(m->keys, m->cap, key);
+  m->keys[s] = key;   // empty slots always hold zeroed values (fresh arrays on rehash/clear)
+  m->count = m->count + 1;
+  return &m->vals[s];
+}
+
+/// Removes every entry for which `mythic_keep_cb(V*)` returns false. Capacity is kept.
+/// DEVIATION: the callback takes `rawptr` (cast to V* inside) because Mettle cannot spell
+/// `fn(V*) -> bool` with a generic V.
+export fn mythic_map_sweep<V>(m: MythicMap<V>*, mythic_keep_cb: fn(rawptr) -> bool) {
+  if (m->cap == 0) { return; }
+  map_rehash<V>(m, m->cap, mythic_keep_cb, true);
+}
+
+export fn mythic_map_clear<V>(m: MythicMap<V>*) {
+  if (m->cap == 0) { return; }
+  memset((rawptr)m->keys, 0, m->cap * 8);
+  free((rawptr)m->vals);
+  var nv: V[] = new V[m->cap];
+  m->vals = nv.data;
+  m->count = 0;
+}
+
+export fn mythic_map_free<V>(m: MythicMap<V>*) {
+  if (m->keys != 0) { free((rawptr)m->keys); }
+  if (m->vals != 0) { free((rawptr)m->vals); }
+  m->keys = 0; m->vals = 0; m->cap = 0; m->count = 0;
+}
+
+// ---------------------------------------------------------------- float math (§1, §6)
+// float32 API. Transcendentals evaluate in float64 internally for accuracy.
+
+export const MYTHIC_PI: float32 = 3.14159265358979;
+export const MYTHIC_TAU: float32 = 6.28318530717959;
+
+export fn mythic_absf(x: float32) -> float32 { if (x < 0.0) { return -x; } return x; }
+export fn mythic_minf(a: float32, b: float32) -> float32 { if (a < b) { return a; } return b; }
+export fn mythic_maxf(a: float32, b: float32) -> float32 { if (a > b) { return a; } return b; }
+export fn mythic_clampf(x: float32, lo: float32, hi: float32) -> float32 {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+export fn mythic_lerpf(a: float32, b: float32, t: float32) -> float32 { return a + (b - a) * t; }
+export fn mythic_mini(a: int32, b: int32) -> int32 { if (a < b) { return a; } return b; }
+export fn mythic_maxi(a: int32, b: int32) -> int32 { if (a > b) { return a; } return b; }
+export fn mythic_clampi(x: int32, lo: int32, hi: int32) -> int32 {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+
+fn floor64(x: float64) -> float64 {
+  if (x >= 4503599627370496.0 || x <= -4503599627370496.0) { return x; }
+  var t: float64 = (float64)(int64)x;
+  if (t > x) { t = t - 1.0; }
+  return t;
+}
+
+export fn mythic_floorf(x: float32) -> float32 { return (float32)floor64((float64)x); }
+export fn mythic_ceilf(x: float32) -> float32 { return (float32)(-floor64(-(float64)x)); }
+/// Round half away from zero.
+export fn mythic_roundf(x: float32) -> float32 {
+  if (x < 0.0) { return (float32)(-floor64(0.5 - (float64)x)); }
+  return (float32)floor64((float64)x + 0.5);
+}
+export fn mythic_truncf(x: float32) -> float32 {
+  if (x < 0.0) { return mythic_ceilf(x); }
+  return mythic_floorf(x);
+}
+/// Rounds to the nearest int32 (half away from zero).
+export fn mythic_iround(x: float32) -> int32 { return (int32)mythic_roundf(x); }
+
+/// Fast sqrt: bit-trick reciprocal sqrt + 2 Newton steps (P3). Returns 0 for x <= 0.
+export fn mythic_sqrtf(x: float32) -> float32 {
+  if (x <= 0.0) { return 0.0; }
+  var v: float32 = x;
+  var bits: uint32 = *(uint32*)&v;
+  bits = (uint32)0x5f3759df - (bits >> 1);
+  var y: float32 = *(float32*)&bits;
+  var half: float32 = x * 0.5;
+  y = y * (1.5 - half * y * y);
+  y = y * (1.5 - half * y * y);
+  return x * y;
+}
+
+fn exp64(x: float64) -> float64 {
+  if (x > 709.0) { return 1.0e308; }
+  if (x < -745.0) { return 0.0; }
+  var ln2: float64 = 0.6931471805599453;
+  var k: float64 = floor64(x / ln2 + 0.5);
+  var r: float64 = x - k * ln2;
+  // Taylor to r^11 on |r| <= ln2/2: error < 1e-13
+  var p: float64 = 1.0 + r * (1.0 + r * (0.5 + r * (0.16666666666666666 + r * (0.041666666666666664
+                   + r * (0.008333333333333333 + r * (0.001388888888888889 + r * (0.0001984126984126984
+                   + r * (0.0000248015873015873 + r * (0.000002755731922398589 + r * (2.755731922398589e-7
+                   + r * 2.505210838544172e-8))))))))));
+  var ki: int64 = (int64)k;
+  // scale by 2^k via exponent bits; split to stay in range
+  while (ki > 1000) { p = p * 1.0715086071862673e301; ki = ki - 1000; }
+  while (ki < -1000) { p = p * 9.332636185032189e-302; ki = ki + 1000; }
+  var bits: uint64 = (uint64)(ki + 1023) << (uint64)52;
+  var scale: float64 = *(float64*)&bits;
+  return p * scale;
+}
+
+fn log64(x: float64) -> float64 {
+  if (x <= 0.0) { return -1.0e308; }
+  var v: float64 = x;
+  var bits: uint64 = *(uint64*)&v;
+  var e: int64 = (int64)((bits >> (uint64)52) & (uint64)0x7FF) - 1023;
+  if (e == -1023) {
+    // subnormal: normalize
+    v = v * 18014398509481984.0;   // 2^54
+    bits = *(uint64*)&v;
+    e = (int64)((bits >> (uint64)52) & (uint64)0x7FF) - 1023 - 54;
+  }
+  var mb: uint64 = (bits & (uint64)0x000FFFFFFFFFFFFF) | ((uint64)1023 << (uint64)52);
+  var m: float64 = *(float64*)&mb;           // [1, 2)
+  if (m > 1.4142135623730951) { m = m * 0.5; e = e + 1; }
+  var s: float64 = (m - 1.0) / (m + 1.0);
+  var s2: float64 = s * s;
+  var series: float64 = 1.0 + s2 * (0.3333333333333333 + s2 * (0.2 + s2 * (0.14285714285714285
+                        + s2 * (0.1111111111111111 + s2 * (0.09090909090909091 + s2 * 0.07692307692307693)))));
+  return 2.0 * s * series + (float64)e * 0.6931471805599453;
+}
+
+export fn mythic_expf(x: float32) -> float32 { return (float32)exp64((float64)x); }
+export fn mythic_logf(x: float32) -> float32 { return (float32)log64((float64)x); }
+/// x^y for x > 0 (returns 0 for x <= 0 unless y == 0).
+export fn mythic_powf(x: float32, y: float32) -> float32 {
+  if (y == 0.0) { return 1.0; }
+  if (x <= 0.0) { return 0.0; }
+  return (float32)exp64((float64)y * log64((float64)x));
+}
+
+/// erf, Abramowitz–Stegun 7.1.26 (|error| < 1.5e-7).
+export fn mythic_erff(x: float32) -> float32 {
+  var ax: float64 = (float64)x;
+  var neg: bool = false;
+  if (ax < 0.0) { ax = -ax; neg = true; }
+  var t: float64 = 1.0 / (1.0 + 0.3275911 * ax);
+  var poly: float64 = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+  var y: float64 = 1.0 - poly * exp64(-ax * ax);
+  if (neg) { y = -y; }
+  return (float32)y;
+}
+
+fn sin_poly(r: float64) -> float64 {
+  var r2: float64 = r * r;
+  return r * (1.0 + r2 * (-0.16666666666666666 + r2 * (0.008333333333333333 + r2 * (-0.0001984126984126984
+         + r2 * (0.0000027557319223985893 + r2 * -2.505210838544172e-8)))));
+}
+fn cos_poly(r: float64) -> float64 {
+  var r2: float64 = r * r;
+  return 1.0 + r2 * (-0.5 + r2 * (0.041666666666666664 + r2 * (-0.001388888888888889
+         + r2 * (0.0000248015873015873 + r2 * (-2.755731922398589e-7 + r2 * 2.08767569878681e-9)))));
+}
+fn sincos64(x: float64, want_cos: bool) -> float64 {
+  var half_pi: float64 = 1.5707963267948966;
+  var k: float64 = floor64(x / half_pi + 0.5);
+  var r: float64 = x - k * half_pi;
+  var q: int64 = (int64)k;
+  if (want_cos) { q = q + 1; }
+  q = q & 3;
+  if (q == 0) { return sin_poly(r); }
+  if (q == 1) { return cos_poly(r); }
+  if (q == 2) { return -sin_poly(r); }
+  return -cos_poly(r);
+}
+export fn mythic_sinf(x: float32) -> float32 { return (float32)sincos64((float64)x, false); }
+export fn mythic_cosf(x: float32) -> float32 { return (float32)sincos64((float64)x, true); }
+
+/// atan2(y, x) in radians.
+export fn mythic_atan2f(y: float32, x: float32) -> float32 {
+  var ay: float64 = (float64)y; var ax: float64 = (float64)x;
+  if (ax == 0.0 && ay == 0.0) { return 0.0; }
+  var aay: float64 = ay; if (aay < 0.0) { aay = -aay; }
+  var aax: float64 = ax; if (aax < 0.0) { aax = -aax; }
+  var swap: bool = aay > aax;
+  var z: float64 = aay / aax;
+  if (swap) { z = aax / aay; }
+  // reduce z in [0,1] further: atan(z) = pi/4 + atan((z-1)/(z+1)) for z > tan(pi/8)
+  var off: float64 = 0.0;
+  if (z > 0.4142135623730951) { z = (z - 1.0) / (z + 1.0); off = 0.7853981633974483; }
+  var z2: float64 = z * z;
+  var a: float64 = off + z * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.2 + z2 * (-0.14285714285714285
+                   + z2 * (0.1111111111111111 + z2 * (-0.09090909090909091 + z2 * (0.07692307692307693
+                   + z2 * -0.06666666666666667)))))));
+  if (swap) { a = 1.5707963267948966 - a; }
+  if (ax < 0.0) { a = 3.141592653589793 - a; }
+  if (ay < 0.0) { a = -a; }
+  return (float32)a;
+}

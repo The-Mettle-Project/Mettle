@@ -1,0 +1,399 @@
+//! The growable byte buffer that holds every emitted string (scene text, SVG, terminal
+//! output, export payloads). Uses core/error, core/mem (counted), core/color and
+//! core/format. Every put either appends fully or changes nothing: growth happens before
+//! any byte is written. Invariant: cap >= len + 1, so mp_buf_cstr can write a NUL at
+//! data[len] without advancing len.
+
+import "std/conv";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/color";
+import "mistplot/core/format";
+
+/// A growable byte buffer owned by whoever created it.
+///
+/// @mem data is owned by the buffer and freed by mp_buf_free; read it through mp_buf_str.
+export struct MpBuf {
+  data: uint8*;   /// the bytes; reallocated when the buffer grows
+  len: int64;     /// bytes in use
+  cap: int64;     /// bytes allocated; always >= len + 1
+}
+
+/// Creates an empty buffer.
+///
+/// @param cap Initial capacity. Units: bytes. Valid: any up to MP_MAX_COUNT * 8; values
+///   below 64 use 64, larger values return 0.
+/// @return The buffer, or 0 when cap is too large or the allocation failed.
+/// @mem The caller owns the buffer and releases it with mp_buf_free.
+/// @thread Safe from any thread.
+/// @cost Two allocations.
+export fn mp_buf_new(cap: int64) -> MpBuf* {
+  if (cap > MP_MAX_COUNT * 8) { return 0; }
+  var b: MpBuf* = (MpBuf*)mp_alloc(sizeof(MpBuf));
+  if (b == 0) { return 0; }
+  var c: int64 = cap;
+  if (c < 64) { c = 64; }
+  var d: uint8* = (uint8*)mp_alloc(c);
+  if (d == 0) {
+    mp_free((rawptr)b);
+    return 0;
+  }
+  b->data = d;
+  b->len = 0;
+  b->cap = c;
+  return b;
+}
+
+/// Releases a buffer and its bytes.
+///
+/// @param b The buffer. Valid: a buffer from mp_buf_new, or 0 (ignored).
+/// @mem b and every view returned by mp_buf_str / mp_buf_cstr are invalid afterwards.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_free(b: MpBuf*) {
+  if (b == 0) { return; }
+  if (b->data != 0) { mp_free((rawptr)b->data); }
+  mp_free((rawptr)b);
+}
+
+/// Empties a buffer, keeping its capacity.
+///
+/// @param b The buffer. Valid: any; 0 is ignored.
+/// @mem No memory is released; earlier views now read stale bytes.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_clear(b: MpBuf*) {
+  if (b == 0) { return; }
+  b->len = 0;
+}
+
+/// Number of bytes in a buffer.
+///
+/// @param b The buffer. Valid: any; 0 gives 0.
+/// @return The length in bytes.
+/// @mem b is only read.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_len(b: MpBuf*) -> int64 {
+  if (b == 0) { return 0; }
+  return b->len;
+}
+
+/// Whether a buffer pointer is usable.
+///
+/// @param b The buffer. Valid: any.
+/// @return false when b is 0 or has no bytes allocated.
+/// @mem b is only read.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_ok(b: MpBuf*) -> bool {
+  if (b == 0) { return false; }
+  if (b->data == 0) { return false; }
+  return true;
+}
+
+/// Makes room for extra more bytes (plus the NUL slot) without writing any.
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param extra Bytes to reserve. Units: bytes. Valid: 0 .. MP_MAX_COUNT * 8 - len - 1.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0 or extra < 0; nothing changes.
+/// @error MP_ERR_ALLOC the total would pass MP_MAX_COUNT * 8 or growth failed; the buffer
+///   is unchanged.
+/// @mem May move data; earlier views are invalid after growth.
+/// @thread One thread at a time per buffer.
+/// @cost Amortized O(1): capacity doubles.
+export fn mp_buf_reserve(b: MpBuf*, extra: int64) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  if (extra < 0) { return MP_ERR_ARG; }
+  if (extra > MP_MAX_COUNT * 8 - b->len - 1) { return MP_ERR_ALLOC; }
+  var need: int64 = b->len + extra + 1;
+  if (need <= b->cap) { return MP_OK; }
+  var ncap: int64 = b->cap;
+  if (ncap < 64) { ncap = 64; }
+  while (ncap < need) { ncap = ncap * 2; }
+  var p: uint8* = (uint8*)mp_realloc((rawptr)b->data, ncap);
+  if (p == 0) { return MP_ERR_ALLOC; }
+  b->data = p;
+  b->cap = ncap;
+  return MP_OK;
+}
+
+/// Appends n raw bytes.
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param p The bytes. Valid: n readable bytes; may be 0 when n is 0.
+/// @param n Count. Units: bytes. Valid: >= 0.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0, n < 0, or p is 0 with n > 0; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; nothing changes.
+/// @mem The bytes are copied; p is not retained.
+/// @thread One thread at a time per buffer.
+/// @cost O(n).
+export fn mp_buf_put(b: MpBuf*, p: uint8*, n: int64) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  if (n < 0) { return MP_ERR_ARG; }
+  if (n == 0) { return MP_OK; }
+  if (p == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_buf_reserve(b, n);
+  if (rc != MP_OK) { return rc; }
+  var i: int64 = 0;
+  while (i < n) {
+    b->data[b->len + i] = p[i];
+    i = i + 1;
+  }
+  b->len = b->len + n;
+  return MP_OK;
+}
+
+/// Appends one byte.
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param c The byte. Valid: any; only the low 8 bits are written.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; nothing changes.
+/// @mem Nothing is retained.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_putc(b: MpBuf*, c: int32) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_buf_reserve(b, 1);
+  if (rc != MP_OK) { return rc; }
+  b->data[b->len] = (uint8)(c & 0xFF);
+  b->len = b->len + 1;
+  return MP_OK;
+}
+
+/// Appends a string's bytes.
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param s The text. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; nothing changes.
+/// @mem The bytes are copied; s is not retained.
+/// @thread One thread at a time per buffer.
+/// @cost O(len(s)).
+export fn mp_buf_puts(b: MpBuf*, s: string) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var n: int64 = (int64)s.length;
+  if (n == 0) { return MP_OK; }
+  return mp_buf_put(b, s.chars, n);
+}
+
+/// Appends a decimal integer.
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param v The value. Valid: any int64.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; nothing changes.
+/// @mem Nothing is retained.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_put_i64(b: MpBuf*, v: int64) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var tmp: uint8[40];
+  var s: string = mp_fmt_int(v, &tmp[0], 40);
+  if (s.length == 0) { return MP_ERR_STATE; }
+  return mp_buf_put(b, s.chars, (int64)s.length);
+}
+
+/// Appends a number with a fixed count of decimals (as mp_fmt_fixed).
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param v The value. Valid: any; non-finite values write "NaN", "inf" or "-inf".
+/// @param decimals Digits after the point. Valid: 0 .. 9; values outside are clamped.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; nothing changes.
+/// @mem Nothing is retained.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_put_f64(b: MpBuf*, v: float64, decimals: int32) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var tmp: uint8[64];
+  var s: string = mp_fmt_fixed(v, decimals, &tmp[0], 64);
+  if (s.length == 0) { return MP_ERR_STATE; }
+  return mp_buf_put(b, s.chars, (int64)s.length);
+}
+
+// Writes the decimal digits of a non-negative v at the end of b; room is reserved.
+fn buf_digits(b: MpBuf*, v: int64) {
+  var tmp: uint8[24];
+  var n: int64 = 0;
+  var u: int64 = v;
+  if (u == 0) {
+    tmp[0] = 48;
+    n = 1;
+  }
+  while (u > 0) {
+    tmp[n] = (uint8)(48 + u % 10);
+    n = n + 1;
+    u = u / 10;
+  }
+  while (n > 0) {
+    n = n - 1;
+    b->data[b->len] = tmp[n];
+    b->len = b->len + 1;
+  }
+}
+
+/// Appends a compact coordinate: rounded to 0.01, trailing zeros trimmed.
+/// -0 and values that round to 0 write "0"; non-finite values and |v| >= 1e9 write "0".
+/// Never writes an exponent.
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param v The value. Units: any (scene px in practice). Valid: |v| < 1e9; see above.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; nothing changes.
+/// @mem Nothing is retained.
+/// @thread One thread at a time per buffer.
+/// @cost O(1); integers take a fast path.
+export fn mp_buf_put_num(b: MpBuf*, v: float64) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_buf_reserve(b, 16);
+  if (rc != MP_OK) { return rc; }
+  if (v != v || v >= 1e9 || v <= -1e9) {
+    buf_digits(b, 0);
+    return MP_OK;
+  }
+  var neg: bool = v < 0.0;
+  var a: float64 = v;
+  if (neg) { a = 0.0 - v; }
+  var iv: int64 = (int64)a;
+  var r: int64 = iv * 100;
+  if ((float64)iv != a) { r = (int64)(a * 100.0 + 0.5); }
+  if (r == 0) {
+    buf_digits(b, 0);
+    return MP_OK;
+  }
+  if (neg) {
+    b->data[b->len] = 45;
+    b->len = b->len + 1;
+  }
+  buf_digits(b, r / 100);
+  var frac: int64 = r % 100;
+  if (frac == 0) { return MP_OK; }
+  b->data[b->len] = 46;
+  b->data[b->len + 1] = (uint8)(48 + frac / 10);
+  b->len = b->len + 2;
+  if (frac % 10 != 0) {
+    b->data[b->len] = (uint8)(48 + frac % 10);
+    b->len = b->len + 1;
+  }
+  return MP_OK;
+}
+
+/// Appends one Unicode code point encoded as UTF-8 (1 to 4 bytes).
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param cp The code point. Valid: 0 .. 0x10FFFF except the surrogates 0xD800 .. 0xDFFF;
+///   anything else is rejected.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0 or cp is not a valid code point; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; nothing changes.
+/// @mem Nothing is retained.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_put_utf8(b: MpBuf*, cp: int32) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  if (cp < 0 || cp > 0x10FFFF) { return MP_ERR_ARG; }
+  if (cp >= 0xD800 && cp <= 0xDFFF) { return MP_ERR_ARG; }
+  var rc: int32 = mp_buf_reserve(b, 4);
+  if (rc != MP_OK) { return rc; }
+  var d: uint8* = b->data;
+  var at: int64 = b->len;
+  if (cp < 0x80) {
+    d[at] = (uint8)cp;
+    b->len = at + 1;
+  } else if (cp < 0x800) {
+    d[at] = (uint8)(0xC0 | (cp >> 6));
+    d[at + 1] = (uint8)(0x80 | (cp & 0x3F));
+    b->len = at + 2;
+  } else if (cp < 0x10000) {
+    d[at] = (uint8)(0xE0 | (cp >> 12));
+    d[at + 1] = (uint8)(0x80 | ((cp >> 6) & 0x3F));
+    d[at + 2] = (uint8)(0x80 | (cp & 0x3F));
+    b->len = at + 3;
+  } else {
+    d[at] = (uint8)(0xF0 | (cp >> 18));
+    d[at + 1] = (uint8)(0x80 | ((cp >> 12) & 0x3F));
+    d[at + 2] = (uint8)(0x80 | ((cp >> 6) & 0x3F));
+    d[at + 3] = (uint8)(0x80 | (cp & 0x3F));
+    b->len = at + 4;
+  }
+  return MP_OK;
+}
+
+/// Appends text with the XML/HTML special characters escaped.
+/// & < > " ' become &amp; &lt; &gt; &quot; &#39;; every other byte is copied.
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param s The text. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; the bytes escaped so far stay appended.
+/// @mem The bytes are copied; s is not retained.
+/// @thread One thread at a time per buffer.
+/// @cost O(len(s)).
+export fn mp_buf_put_esc(b: MpBuf*, s: string) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    var c: uint8 = s.chars[i];
+    var rc: int32 = MP_OK;
+    var ch: int32 = (int32)c;
+    switch (ch) {
+      case 38: { rc = mp_buf_puts(b, "&amp;"); }
+      case 60: { rc = mp_buf_puts(b, "&lt;"); }
+      case 62: { rc = mp_buf_puts(b, "&gt;"); }
+      case 34: { rc = mp_buf_puts(b, "&quot;"); }
+      case 39: { rc = mp_buf_puts(b, "&#39;"); }
+      default: { rc = mp_buf_putc(b, (int32)c); }
+    }
+    if (rc != MP_OK) { return rc; }
+    i = i + 1;
+  }
+  return MP_OK;
+}
+
+/// View of a buffer's bytes as a string (not NUL-terminated).
+///
+/// @param b The buffer. Valid: any; 0 gives "".
+/// @return A view of data[0 .. len).
+/// @mem Borrowed: valid until the next write to, or the free of, b. Never free it.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_str(b: MpBuf*) -> string {
+  if (b == 0) { return ""; }
+  if (b->data == 0) { return ""; }
+  return str_from_bytes((cstring)b->data, b->len);
+}
+
+/// NUL-terminated view of a buffer's bytes.
+/// Writes data[len] = 0 without advancing len.
+///
+/// @param b The buffer. Valid: any; 0 gives 0.
+/// @return data as a cstring, or 0 when b is 0 or the one-byte reserve fails.
+/// @mem Borrowed: valid until the next write to, or the free of, b. Never free it.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_cstr(b: MpBuf*) -> cstring {
+  if (b == 0) { return 0; }
+  if (b->data == 0) { return 0; }
+  var rc: int32 = mp_buf_reserve(b, 0);
+  if (rc != MP_OK) { return 0; }
+  b->data[b->len] = 0;
+  return (cstring)b->data;
+}
+
+/// Appends a colour as CSS (as mp_color_css: #rrggbb when opaque, else rgba(...)).
+///
+/// @param b The buffer. Valid: non-zero.
+/// @param c The colour. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0; nothing changes.
+/// @error MP_ERR_ALLOC growth failed; nothing changes.
+/// @mem Nothing is retained.
+/// @thread One thread at a time per buffer.
+export fn mp_buf_put_color(b: MpBuf*, c: MpColor) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var tmp: uint8[48];
+  var s: string = mp_color_css(c, &tmp[0], 48);
+  if (s.length == 0) { return MP_ERR_STATE; }
+  return mp_buf_put(b, s.chars, (int64)s.length);
+}

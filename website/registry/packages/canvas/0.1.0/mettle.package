@@ -1,0 +1,8 @@
+name = canvas
+version = 0.1.0
+description = 2D vector drawing in pure Mettle: paths, fills, strokes, gradients, clipping, blend modes, SVG path data
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Canvas
+compiler = 0.18.0
+require = etch 0.1.1
+require = font 0.1.0

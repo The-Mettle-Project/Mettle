@@ -1,0 +1,1215 @@
+// flux_orm/query/builder.mettle — statement text plus bound arguments. No I/O.
+//
+// A query is text plus argv: one growable RcBuf for the statement and one
+// growable array of borrowed RcValue cells for the `?` values. It also fills
+// an RcStmt (adapter/stmt) with the same statement as data. Nothing here talks
+// to a store; rc_query_exec hands all of it to the adapter in one call.
+//
+// Typical use:
+//
+//   var q: RcQuery = rc_query_select(user_meta());
+//   defer rc_query_free(&q);
+//   rc_query_where(&q, "age", RC_CMP_GT, RcInt(18));
+//   rc_query_order_by(&q, "name", RC_ASC);
+//   rc_query_limit(&q, 10);
+//   var r: RcResult;
+//   var rc: int32 = rc_query_exec(&q, adapter, &r);
+//   ... read r, then rc_result_free(&r);
+//
+// Constructors return RcQuery by value. A failed constructor sets `q.err`;
+// every later call on that query returns the same code and does nothing, and
+// rc_query_exec returns it without touching the adapter.
+//
+// ---------------------------------------------------------------------------
+// Statement shapes (frozen; relation/ and changeset/ rely on them verbatim)
+// ---------------------------------------------------------------------------
+//
+//   SELECT "id", "email", ... FROM "users"
+//     +  " WHERE \"col\" = ?"        (first term)  /  " AND \"col\" = ?"
+//     +  " WHERE \"col\" < ?"        (also <=, >, >=, <>: rc_query_where)
+//     +  " WHERE \"col\" IS NULL"    /  " AND \"col\" IS NULL"
+//     +  " WHERE \"col\" IS NOT NULL"/  " AND \"col\" IS NOT NULL"
+//     +  " WHERE \"col\" IN (?, ?)"  /  " AND \"col\" IN (?, ?)"
+//     +  " ORDER BY \"col\" ASC"     /  ", \"col2\" DESC"
+//     +  " LIMIT 10"                 (literal, not a placeholder)
+//     +  " OFFSET 5"                 (literal)
+//     +  " JOIN \"posts\" ON \"users\".\"id\" = \"posts\".\"user_id\""
+//     +  " LEFT JOIN ..."
+//
+//   INSERT INTO "users" ("email", "name", ...) VALUES (?, ?, ...), (?, ?, ...)
+//
+//   UPDATE "users" SET "name" = ?, "age" = ?
+//     +  WHERE terms as for SELECT (at least one)
+//
+//   DELETE FROM "users"  + WHERE terms (at least one)
+//   SELECT COUNT(*) FROM "users"  + WHERE terms
+//
+// Clause order in the text is always
+//   SELECT .. FROM .. [JOIN ..] [WHERE ..] [ORDER BY ..] [LIMIT n] [OFFSET n]
+// whatever order the calls came in: a JOIN added after a WHERE is spliced in
+// front of it. A call that would break the order (a WHERE after ORDER BY, a
+// second LIMIT) is refused with RC_ERR_USAGE instead of emitting bad text.
+//
+// ---------------------------------------------------------------------------
+// Argument order
+// ---------------------------------------------------------------------------
+//
+//   An UPDATE binds its SET values first, then its WHERE values; a WHERE term
+//   is refused until every SET value is in.
+//
+//   JOIN emits no placeholders, so `q->args` is in the order of the calls that
+//   added a placeholder, which is also the order of the `?` in the text: WHERE
+//   terms bind left to right, and an IN list binds in the caller's array order.
+//   A query built join-then-where is byte-identical to the same query built
+//   where-then-join (tests/t_query.mettle asserts both).
+//
+// ---------------------------------------------------------------------------
+// NULL (three-valued logic)
+// ---------------------------------------------------------------------------
+//
+// SQL says `col = NULL` is UNKNOWN, never true, so a NULL value never binds:
+// `rc_query_where(q, "col", RC_CMP_EQ, RcNull)` emits `"col" IS NULL` (the
+// same text as rc_query_where_null), and RC_CMP_NE against RcNull emits
+// `IS NOT NULL`. `= NULL` can never appear in the text. An ordering (LT, LE,
+// GT, GE) against RcNull matches no row, so it is refused with RC_ERR_USAGE.
+// An IN list is not rewritten: a NULL element binds as a NULL placeholder,
+// which SQL treats as UNKNOWN.
+//
+// ---------------------------------------------------------------------------
+// Ownership and allocation
+// ---------------------------------------------------------------------------
+//
+//   `q->args` holds borrowed RcValue cells. rc_query_push_arg, rc_query_set
+//   and the WHERE calls copy the 24-byte cell, never the text or blob behind
+//   it, so the caller keeps those alive until the query has run.
+//   rc_query_free frees the text buffer, the argv array and the RcStmt arrays,
+//   and never calls rc_value_release on a cell.
+//
+//   The RcMeta is copied by value but its field array and names are borrowed:
+//   they must outlive the query (generated metas are static).
+//
+//   A query starts with an 8-cell argv and a 256-byte text buffer, both grown
+//   by doubling. A typical statement (eight columns, three predicates, ORDER
+//   BY, LIMIT, OFFSET) never grows either after rc_query_select; the RcStmt
+//   term and order arrays do allocate on their first entry.
+//
+//   rc_query_sql returns a borrowed view into the text buffer, valid until the
+//   next call that changes the query or rc_query_free.
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/buf";
+import "../core/clock";
+import "../adapter/adapter";
+import "../adapter/stmt";
+import "dialect";
+
+// JOIN kinds for rc_query_join: INNER emits ` JOIN`, LEFT ` LEFT JOIN`.
+// relation/ names them at its call sites.
+export const RC_JOIN_INNER: int32 = 0;
+export const RC_JOIN_LEFT: int32 = 1;
+
+// Comparison operators for rc_query_where. They equal stmt's RC_W_EQ..RC_W_GE.
+export const RC_CMP_EQ: int32 = 0; // =
+export const RC_CMP_NE: int32 = 1; // <>
+export const RC_CMP_LT: int32 = 2; // <
+export const RC_CMP_LE: int32 = 3; // <=
+export const RC_CMP_GT: int32 = 4; // >
+export const RC_CMP_GE: int32 = 5; // >=
+
+// Sort direction for rc_query_order_by: ` ASC` or ` DESC`.
+export const RC_ASC: int32 = 0;
+export const RC_DESC: int32 = 1;
+
+// Internal statement kinds and clause phases. Not exported: they are not part
+// of the seam and they are not status codes.
+const Q_KIND_SELECT: int32 = 0;
+const Q_KIND_INSERT: int32 = 1;
+const Q_KIND_UPDATE: int32 = 2;
+const Q_KIND_DELETE: int32 = 3;
+const Q_KIND_COUNT: int32 = 4;
+
+const Q_PHASE_FROM: int32 = 0;   // base text only; JOIN still allowed
+const Q_PHASE_WHERE: int32 = 1;  // WHERE ...; more AND terms allowed
+const Q_PHASE_ORDER: int32 = 2;  // ORDER BY ...
+const Q_PHASE_LIMIT: int32 = 3;  // LIMIT ...
+const Q_PHASE_OFFSET: int32 = 4; // OFFSET ...
+
+// Construction values; both are pre-sized so a typical statement (eight-column
+// SELECT + three predicates + ORDER BY + LIMIT) does not reallocate while being
+// built. test "query: no growth after construction" pins that: it asserts the
+// buffer capacity and argv capacity do not move.
+const Q_ARG_CAP: int32 = 8;
+const Q_TEXT_CAP: int64 = 256;
+
+// One statement being built: text, borrowed argv and the RcStmt twin. Make it
+// with a constructor (rc_query_select and friends), free it with
+// rc_query_free. Read it through the accessors; the fields are internal.
+export struct RcQuery {
+  meta: RcMeta;    // the table the statement is about
+  dial: RcDialect; // quoting / placeholder / LIMIT support
+  buf: RcBuf;      // statement text
+  args: RcValue*;  // borrowed cells, ownership stays with the caller
+  n_args: int32;   // cells in use in args
+  n_cap: int32;    // argv capacity in cells
+  kind: int32;     // Q_KIND_*
+  phase: int32;    // Q_PHASE_*, enforces clause order
+  tail: int64;     // insertion point for JOIN clauses (end of FROM ... JOIN ..)
+  n_order: int32;  // ORDER BY terms already emitted
+  n_rows: int32;   // batch INSERT: rows; UPDATE: 1; SELECT: 0
+  n_cols: int32;   // batch INSERT: columns per row; UPDATE: SET columns
+  err: int32;      // sticky construction failure; RC_OK when the query is usable
+  st: RcStmt;      // the same statement as data, for adapters with `query`
+  open_set: bool;  // update_all: SET columns are still being added
+  set_mask: uint64; // update_all: fields already in SET
+}
+
+// --- internal helpers --------------------------------------------------------
+
+fn rc_query_put(q: RcQuery*, s: string) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_buf_put(&q->buf, s);
+}
+
+fn rc_query_put_ident(q: RcQuery*, s: string) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_dialect_ident(q->dial, &q->buf, s);
+}
+
+fn rc_query_put_question(q: RcQuery*) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_dialect_placeholder(q->dial, &q->buf);
+}
+
+// Grows the argv array geometrically. The cells are borrowed, so a grow is a
+// realloc of the array only — never a value copy of the text behind a cell.
+fn rc_query_args_reserve(q: RcQuery*, need: int32) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (need < 0) { return RC_ERR_USAGE; }
+  if (need == 0) { return RC_OK; }
+  if (q->n_args > 2147483647 - need) { return RC_ERR_RANGE; }
+  var want: int32 = q->n_args + need;
+  if (want <= q->n_cap) { return RC_OK; }
+  var cap: int32 = q->n_cap;
+  if (cap < Q_ARG_CAP) { cap = Q_ARG_CAP; }
+  while (cap < want) {
+    if (cap > 1073741823) { return RC_ERR_RANGE; }
+    cap = cap * 2;
+  }
+  var p: rawptr = realloc((rawptr)q->args, (int64)cap * (int64)sizeof(RcValue));
+  if (p == 0) { return RC_ERR_NOMEM; }
+  q->args = (RcValue*)p;
+  q->n_cap = cap;
+  return RC_OK;
+}
+
+// Reserves + appends one borrowed cell. Callers reserve before they touch the
+// text, so a failure here leaves both the text and the argv untouched.
+fn rc_query_take_arg(q: RcQuery*, v: RcValue) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_query_args_reserve(q, 1);
+  if (rc != RC_OK) { return rc; }
+  q->args[q->n_args] = v;
+  q->n_args = q->n_args + 1;
+  return RC_OK;
+}
+
+fn rc_query_fail(q: RcQuery*, code: int32) -> RcQuery {
+  rc_query_free(q);
+  q->err = code;
+  return *q;
+}
+
+fn rc_query_init(m: RcMeta, kind: int32) -> RcQuery {
+  var q: RcQuery;
+  q.meta = m;
+  q.dial = rc_dialect_default();
+  q.buf = rc_buf_new(Q_TEXT_CAP);
+  q.args = 0;
+  q.n_args = 0;
+  q.n_cap = 0;
+  q.kind = kind;
+  q.phase = Q_PHASE_FROM;
+  q.tail = 0;
+  q.n_order = 0;
+  q.n_rows = 0;
+  q.n_cols = 0;
+  q.err = RC_OK;
+  q.open_set = false;
+  q.set_mask = (uint64)0;
+  var op: int32 = RC_OP_SELECT;
+  if (kind == Q_KIND_INSERT) { op = RC_OP_INSERT; }
+  if (kind == Q_KIND_UPDATE) { op = RC_OP_UPDATE; }
+  if (kind == Q_KIND_DELETE) { op = RC_OP_DELETE; }
+  if (kind == Q_KIND_COUNT) { op = RC_OP_COUNT; }
+  q.st = rc_stmt_new(op, m.table);
+  if (q.buf.data == 0) {
+    q.err = RC_ERR_NOMEM;
+    return q;
+  }
+  var rc: int32 = rc_query_args_reserve(&q, Q_ARG_CAP);
+  if (rc != RC_OK) {
+    rc_buf_free(&q.buf);
+    q.err = rc;
+  }
+  return q;
+}
+
+// Every SELECT-side mutation starts with this: a constructed query, of the
+// right kind, whose construction did not fail.
+fn rc_query_ready_select(q: RcQuery*) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind != Q_KIND_SELECT) { return RC_ERR_USAGE; }
+  return RC_OK;
+}
+
+// WHERE terms are allowed on a SELECT, and on an UPDATE once every SET value
+// has been pushed, so the argv order always matches the `?` order.
+fn rc_query_ready_where(q: RcQuery*) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind == Q_KIND_SELECT) { return RC_OK; }
+  if (q->kind == Q_KIND_UPDATE) {
+    if (q->open_set) { return RC_OK; }   // closed by the first valid term
+    if (q->n_args < q->n_cols) { return RC_ERR_USAGE; }
+    return RC_OK;
+  }
+  if (q->kind == Q_KIND_DELETE || q->kind == Q_KIND_COUNT) { return RC_OK; }
+  return RC_ERR_USAGE;
+}
+
+fn rc_query_put_columns(q: RcQuery*, m: RcMeta) -> int32 {
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (i > 0) {
+      var sep: int32 = rc_query_put(q, ", ");
+      if (sep != RC_OK) { return sep; }
+    }
+    var rc: int32 = rc_query_put_ident(q, m.fields[i].column);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+fn rc_query_is_auto_col(m: RcMeta, i: int32) -> bool {
+  if ((m.fields[i].flags & RC_F_AUTO) != 0) { return true; }
+  return false;
+}
+
+fn rc_query_count_insert_cols(m: RcMeta) -> int32 {
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (!rc_query_is_auto_col(m, i)) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+// " WHERE " for the first term, " AND " for the rest. Refuses once ORDER BY /
+// LIMIT / OFFSET has been emitted: a WHERE after ORDER BY is a caller bug, and
+// quietly appending it would build a statement that does not parse.
+fn rc_query_begin_where(q: RcQuery*) -> int32 {
+  if (q->phase > Q_PHASE_WHERE) { return RC_ERR_USAGE; }
+  var rc: int32 = RC_OK;
+  if (q->phase == Q_PHASE_FROM) {
+    rc = rc_query_put(q, " WHERE ");
+  } else {
+    rc = rc_query_put(q, " AND ");
+  }
+  if (rc != RC_OK) { return rc; }
+  q->phase = Q_PHASE_WHERE;
+  return RC_OK;
+}
+
+// In-place byte reversal, used to splice a JOIN in front of an already-written
+// WHERE/ORDER BY tail without a temporary allocation.
+fn rc_query_reverse(p: uint8*, n: int64) {
+  if (n <= 1) { return; }
+  var i: int64 = 0;
+  var j: int64 = n - 1;
+  while (i < j) {
+    var t: uint8 = p[i];
+    p[i] = p[j];
+    p[j] = t;
+    i = i + 1;
+    j = j - 1;
+  }
+}
+
+// Rotates [p, p+n) left by k bytes: [A][B] -> [B][A] where |A| == k. Three
+// reversals, no scratch space, so a join costs no allocation.
+fn rc_query_rotate_left(p: uint8*, n: int64, k: int64) {
+  if (n <= 1 || k <= 0 || k >= n) { return; }
+  rc_query_reverse(p, k);
+  rc_query_reverse(p + k, n - k);
+  rc_query_reverse(p, n);
+}
+
+// --- constructors ------------------------------------------------------------
+
+// Starts `SELECT "a", "b", ... FROM "table"` with every column in RcMeta
+// order, the same list core/persist uses.
+//   m   the table; its fields and names are borrowed and must outlive the query
+// Returns the query by value; free it with rc_query_free. Failure is reported
+// in `q.err` (rc_query_exec then returns it, and rc_query_sql is ""):
+// RC_ERR_USAGE or RC_ERR_UNSUPPORTED when m fails rc_meta_check, RC_ERR_NOMEM
+// when an allocation fails. There is no error out-parameter on purpose: a
+// broken table is a startup bug, not a per-statement branch.
+export fn rc_query_select(m: RcMeta) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_SELECT);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, "SELECT ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put_columns(&q, m);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, " FROM ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put_ident(&q, m.table);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  var c: int32 = 0;
+  while (c < m.n_fields) {
+    rc = rc_stmt_field(&q.st, m.fields[c]);
+    if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    c = c + 1;
+  }
+  // JOIN clauses are spliced in here, in call order.
+  q.tail = q.buf.len;
+  return q;
+}
+
+// Builds `INSERT INTO "t" (cols) VALUES (?, ..), (?, ..)` for n_rows rows.
+// Every RC_F_AUTO column is left out: batch rows share one column list, so
+// there is no per-row null bitmap to consult (rc_persist_insert, by contrast,
+// omits the auto key only when that entity's key is absent).
+//   m       the table; borrowed, must outlive the query
+//   n_rows  rows to insert, at least 1
+// Then push n_rows * columns values with rc_query_push_arg, row by row, each
+// row's values in field order without the RC_F_AUTO columns.
+// Returns the query by value; free it with rc_query_free. Failure is reported
+// in `q.err` (rc_query_exec then returns it): the rc_meta_check code
+// (RC_ERR_USAGE / RC_ERR_UNSUPPORTED); RC_ERR_USAGE when n_rows <= 0, every
+// column is RC_F_AUTO, or n_rows * columns overflows int32; RC_ERR_NOMEM.
+export fn rc_query_insert_batch(m: RcMeta, n_rows: int32) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_INSERT);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  if (n_rows <= 0) { return rc_query_fail(&q, RC_ERR_USAGE); }
+  var n_cols: int32 = rc_query_count_insert_cols(m);
+  if (n_cols <= 0) { return rc_query_fail(&q, RC_ERR_USAGE); }
+  if (n_rows > 2147483647 / n_cols) { return rc_query_fail(&q, RC_ERR_USAGE); }
+
+  rc = rc_query_put(&q, "INSERT INTO ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put_ident(&q, m.table);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, " (");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  var first: bool = true;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (!rc_query_is_auto_col(m, i)) {
+      if (!first) {
+        rc = rc_query_put(&q, ", ");
+        if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      }
+      rc = rc_query_put_ident(&q, m.fields[i].column);
+      if (rc == RC_OK) { rc = rc_stmt_field(&q.st, m.fields[i]); }
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      first = false;
+    }
+    i = i + 1;
+  }
+  rc = rc_query_put(&q, ") VALUES ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  var r: int32 = 0;
+  while (r < n_rows) {
+    if (r > 0) {
+      rc = rc_query_put(&q, ", ");
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    }
+    rc = rc_query_put(&q, "(");
+    if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    var c: int32 = 0;
+    while (c < n_cols) {
+      if (c > 0) {
+        rc = rc_query_put(&q, ", ");
+        if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      }
+      rc = rc_query_put_question(&q);
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      c = c + 1;
+    }
+    rc = rc_query_put(&q, ")");
+    if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    r = r + 1;
+  }
+  q.n_rows = n_rows;
+  q.n_cols = n_cols;
+  q.st.n_rows = n_rows;
+  q.tail = q.buf.len;
+  return q;
+}
+
+// Builds `UPDATE "t" SET "a" = ?, "b" = ?` for one row: the fields whose bit is
+// set in `mask`, in field order, then every RC_F_UPDATED column, then the
+// RC_F_VERSION column if the table has one.
+//   m     the table; borrowed, must outlive the query
+//   mask  a changeset's dirty mask: bit i set means field i is written
+// Then push the values with rc_query_push_arg in that order (the dirty values,
+// the time for each RC_F_UPDATED column, the new version; rc_changeset_save
+// does this), then add at least one WHERE term: rc_query_exec refuses an
+// UPDATE without one, because it would rewrite every row.
+// Returns the query by value; free it with rc_query_free. Failure is reported
+// in `q.err` (rc_query_exec then returns it): the rc_meta_check code;
+// RC_ERR_USAGE for an empty mask, a bit at or past n_fields, the primary key
+// (the WHERE needs it), an RC_F_READ_ONLY or RC_F_CREATED field (never written
+// after insert), or an RC_F_UPDATED or RC_F_VERSION field (the ORM sets them);
+// RC_ERR_NOMEM.
+export fn rc_query_update(m: RcMeta, mask: uint64) -> RcQuery {
+  return rc_query_update_build(m, mask);
+}
+
+// Starts `UPDATE "t" SET ...` for every row the WHERE terms match (Ecto's
+// update_all). Add columns with rc_query_set, then WHERE terms, then run it
+// with rc_repo_update_all:
+//
+//   var q: RcQuery = rc_query_update_all(user_meta());
+//   rc_query_set(&q, "active", RcBool(false));
+//   rc_query_where(&q, "created_at", RC_CMP_LT, RcTime(cutoff));
+//
+//   m   the table; borrowed, must outlive the query
+// The first WHERE term closes the SET list and sets every RC_F_UPDATED column
+// to core/clock's time (that term fails with RC_ERR_USAGE if no clock is
+// installed or no column was set).
+// Returns the query by value; free it with rc_query_free. Failure is reported
+// in `q.err` (rc_query_exec then returns it): the rc_meta_check code;
+// RC_ERR_UNSUPPORTED for a table with RC_F_VERSION (each row would need its
+// own version + 1); RC_ERR_NOMEM.
+export fn rc_query_update_all(m: RcMeta) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_UPDATE);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  if (rc_meta_version(m) >= 0) { return rc_query_fail(&q, RC_ERR_UNSUPPORTED); }
+  rc = rc_query_put(&q, "UPDATE ");
+  if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.table); }
+  if (rc == RC_OK) { rc = rc_query_put(&q, " SET "); }
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  q.n_rows = 1;
+  q.n_cols = 0;
+  q.open_set = true;
+  q.tail = q.buf.len;
+  return q;
+}
+
+// Can `i` be a SET column? Not the key, and not a field the ORM owns.
+fn rc_query_settable(m: RcMeta, i: int32) -> bool {
+  if (i == m.pk) { return false; }
+  var owned: int32 = RC_F_READ_ONLY | RC_F_VERSION | RC_F_CREATED | RC_F_UPDATED;
+  if ((m.fields[i].flags & owned) != 0) { return false; }
+  return true;
+}
+
+fn rc_query_put_set(q: RcQuery*, i: int32, v: RcValue) -> int32 {
+  var rc: int32 = rc_query_args_reserve(q, 1);
+  if (rc != RC_OK) { return rc; }
+  var mark: int64 = q->buf.len;
+  if (q->n_cols > 0) { rc = rc_query_put(q, ", "); }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[i].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " = "); }
+  if (rc == RC_OK) { rc = rc_query_put_question(q); }
+  if (rc == RC_OK) {
+    rc = rc_stmt_field(&q->st, q->meta.fields[i]);
+  }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  q->n_cols = q->n_cols + 1;
+  q->tail = q->buf.len;
+  return rc_query_take_arg(q, v);  // reserved above, so it cannot fail
+}
+
+// Adds `"column" = ?` to the SET list of an rc_query_update_all query.
+//   q       the query
+//   column  a field name, or a column name from the override table
+//   v       the value; borrowed, it must stay valid until the query has run
+//   e.g. rc_query_set(&q, "active", RcBool(false))
+// Returns RC_OK, or `q->err` if construction failed. RC_ERR_USAGE: q is 0, not
+// an update_all query, a WHERE term was already added, an unknown column, a
+// column already set, or a column the ORM owns (the key, RC_F_READ_ONLY,
+// RC_F_CREATED, RC_F_UPDATED, RC_F_VERSION). RC_ERR_NOMEM or RC_ERR_RANGE when
+// the text or argv cannot grow. On failure the query is unchanged.
+export fn rc_query_set(q: RcQuery*, column: string, v: RcValue) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_query_set_field(q, rc_meta_find(q->meta, column), v);
+}
+
+// rc_query_set by field: `field` is a 0-based field index in RcMeta order.
+// For generated code; apps use rc_query_set. Same rules and codes, with an
+// index outside 0..n_fields-1 as RC_ERR_USAGE.
+export fn rc_query_set_field(q: RcQuery*, field: int32, v: RcValue) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind != Q_KIND_UPDATE || !q->open_set) { return RC_ERR_USAGE; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  if (!rc_query_settable(q->meta, field)) { return RC_ERR_USAGE; }
+  if (rc_nulls_has(q->set_mask, field)) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_query_put_set(q, field, v);
+  if (rc == RC_OK) { q->set_mask = rc_nulls_set(q->set_mask, field); }
+  return rc;
+}
+
+// Ends the SET list of an update_all: refuses an empty one and adds the
+// RC_F_UPDATED columns with the clock's time.
+fn rc_query_close_set(q: RcQuery*) -> int32 {
+  if (!q->open_set) { return RC_OK; }
+  if (q->n_cols == 0) { return RC_ERR_USAGE; }
+  if (rc_meta_any(q->meta, RC_F_UPDATED)) {
+    var now: int64 = 0;
+    var rc: int32 = rc_clock_now(&now);
+    if (rc != RC_OK) { return rc; }
+    var i: int32 = 0;
+    while (i < q->meta.n_fields) {
+      if ((q->meta.fields[i].flags & RC_F_UPDATED) != 0) {
+        rc = rc_query_put_set(q, i, RcTime(now));
+        if (rc != RC_OK) { return rc; }
+      }
+      i = i + 1;
+    }
+  }
+  q->open_set = false;
+  return RC_OK;
+}
+
+// Starts `DELETE FROM "t"`. Add at least one WHERE term: rc_query_exec refuses
+// a DELETE without one.
+//   m   the table; borrowed, must outlive the query
+// Returns the query by value; free it with rc_query_free. Failure is reported
+// in `q.err` (rc_query_exec then returns it): the rc_meta_check code
+// (RC_ERR_USAGE / RC_ERR_UNSUPPORTED) or RC_ERR_NOMEM.
+export fn rc_query_delete(m: RcMeta) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_DELETE);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, "DELETE FROM ");
+  if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.table); }
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  q.tail = q.buf.len;
+  return q;
+}
+
+// Starts `SELECT COUNT(*) FROM "t"`; WHERE terms are optional. The result is
+// one row with one integer cell.
+//   m   the table; borrowed, must outlive the query
+// Returns the query by value; free it with rc_query_free. Failure is reported
+// in `q.err` (rc_query_exec then returns it): the rc_meta_check code
+// (RC_ERR_USAGE / RC_ERR_UNSUPPORTED) or RC_ERR_NOMEM.
+export fn rc_query_count(m: RcMeta) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_COUNT);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, "SELECT COUNT(*) FROM ");
+  if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.table); }
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  q.tail = q.buf.len;
+  return q;
+}
+
+fn rc_query_update_build(m: RcMeta, mask: uint64) -> RcQuery {
+  var q: RcQuery = rc_query_init(m, Q_KIND_UPDATE);
+  if (q.err != RC_OK) { return q; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  if (mask == (uint64)0) { return rc_query_fail(&q, RC_ERR_USAGE); }
+  var i: int32 = m.n_fields;
+  while (i < RC_MAX_FIELDS) {
+    if (rc_nulls_has(mask, i)) { return rc_query_fail(&q, RC_ERR_USAGE); }
+    i = i + 1;
+  }
+
+  rc = rc_query_put(&q, "UPDATE ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put_ident(&q, m.table);
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  rc = rc_query_put(&q, " SET ");
+  if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+  var n_cols: int32 = 0;
+  i = 0;
+  while (i < m.n_fields) {
+    if (rc_nulls_has(mask, i)) {
+      if (i == m.pk) { return rc_query_fail(&q, RC_ERR_USAGE); }
+      if ((m.fields[i].flags & RC_F_READ_ONLY) != 0) {
+        return rc_query_fail(&q, RC_ERR_USAGE);
+      }
+      if ((m.fields[i].flags & (RC_F_VERSION | RC_F_CREATED | RC_F_UPDATED)) != 0) {
+        return rc_query_fail(&q, RC_ERR_USAGE);
+      }
+      if (n_cols > 0) {
+        rc = rc_query_put(&q, ", ");
+        if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      }
+      rc = rc_query_put_ident(&q, m.fields[i].column);
+      if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
+      if (rc == RC_OK) { rc = rc_query_put_question(&q); }
+      if (rc == RC_OK) { rc = rc_stmt_field(&q.st, m.fields[i]); }
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      n_cols = n_cols + 1;
+    }
+    i = i + 1;
+  }
+  i = 0;
+  while (i < m.n_fields) {
+    if ((m.fields[i].flags & RC_F_UPDATED) != 0) {
+      rc = rc_query_put(&q, ", ");
+      if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.fields[i].column); }
+      if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
+      if (rc == RC_OK) { rc = rc_query_put_question(&q); }
+      if (rc == RC_OK) { rc = rc_stmt_field(&q.st, m.fields[i]); }
+      if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+      n_cols = n_cols + 1;
+    }
+    i = i + 1;
+  }
+  var vf: int32 = rc_meta_version(m);
+  if (vf >= 0) {
+    rc = rc_query_put(&q, ", ");
+    if (rc == RC_OK) { rc = rc_query_put_ident(&q, m.fields[vf].column); }
+    if (rc == RC_OK) { rc = rc_query_put(&q, " = "); }
+    if (rc == RC_OK) { rc = rc_query_put_question(&q); }
+    if (rc == RC_OK) { rc = rc_stmt_field(&q.st, m.fields[vf]); }
+    if (rc != RC_OK) { return rc_query_fail(&q, rc); }
+    n_cols = n_cols + 1;
+  }
+  q.n_rows = 1;
+  q.n_cols = n_cols;
+  q.tail = q.buf.len;
+  return q;
+}
+
+// Appends the next value: one cell of a batch INSERT (row-major), or the next
+// SET value of an rc_query_update query, in the column order the constructor
+// emitted.
+//   q   the query
+//   v   the value; borrowed, it must stay valid until the query has run
+// Returns RC_OK, or `q->err` if construction failed. RC_ERR_USAGE: q is 0, the
+// query is not an INSERT or UPDATE, it is an update_all query (use
+// rc_query_set), or every value is already in, so a full statement cannot be
+// overfilled. RC_ERR_NOMEM or RC_ERR_RANGE when the argv cannot grow.
+export fn rc_query_push_arg(q: RcQuery*, v: RcValue) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind != Q_KIND_INSERT && q->kind != Q_KIND_UPDATE) { return RC_ERR_USAGE; }
+  if (q->open_set) { return RC_ERR_USAGE; }   // update_all takes rc_query_set
+  if (q->n_rows <= 0 || q->n_cols <= 0) { return RC_ERR_USAGE; }
+  var want: int32 = q->n_rows * q->n_cols;
+  if (q->n_args >= want) { return RC_ERR_USAGE; }
+  return rc_query_take_arg(q, v);
+}
+
+// --- WHERE -------------------------------------------------------------------
+
+// The operator's text with its surrounding spaces, or "" for an unknown op.
+fn rc_query_cmp_text(op: int32) -> string {
+  if (op == RC_CMP_EQ) { return " = "; }
+  if (op == RC_CMP_NE) { return " <> "; }
+  if (op == RC_CMP_LT) { return " < "; }
+  if (op == RC_CMP_LE) { return " <= "; }
+  if (op == RC_CMP_GT) { return " > "; }
+  if (op == RC_CMP_GE) { return " >= "; }
+  return "";
+}
+
+// rc_query_where by field index: adds `"col" <op> ?`.
+// For generated code: `field` is a 0-based field index in RcMeta order, and
+// one outside 0..n_fields-1 is RC_ERR_USAGE. Apps use rc_query_where,
+// which documents the rules and codes.
+export fn rc_query_where_field(q: RcQuery*, field: int32, op: int32,
+                               v: RcValue) -> int32 {
+  var rc: int32 = rc_query_ready_where(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  var text: string = rc_query_cmp_text(op);
+  if (text == "") { return RC_ERR_USAGE; }
+  if (rc_value_is_null(v)) {
+    if (op == RC_CMP_EQ) { return rc_query_where_null_field(q, field); }
+    if (op == RC_CMP_NE) { return rc_query_where_not_null_field(q, field); }
+    return RC_ERR_USAGE;
+  }
+  rc = rc_query_close_set(q);
+  if (rc != RC_OK) { return rc; }
+
+  // Reserve the argv cell before touching the text: if anything below fails,
+  // the text is rolled back to its exact previous length and no arg was taken.
+  rc = rc_query_args_reserve(q, 1);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_stmt_term(&q->st, q->meta.fields[field].column, op, q->n_args, 1);
+  if (rc != RC_OK) { return rc; }
+  var mark: int64 = q->buf.len;
+  rc = rc_query_begin_where(q);
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, text); }
+  if (rc == RC_OK) { rc = rc_query_put_question(q); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    q->st.n_terms = q->st.n_terms - 1;
+    return rc;
+  }
+  return rc_query_take_arg(q, v);  // reserved above, so it cannot fail
+}
+
+// rc_query_where_null by field index: adds `"col" IS NULL`.
+// For generated code: `field` is a 0-based field index in RcMeta order, and
+// one outside 0..n_fields-1 is RC_ERR_USAGE. Apps use rc_query_where_null,
+// which documents the rules and codes.
+export fn rc_query_where_null_field(q: RcQuery*, field: int32) -> int32 {
+  var rc: int32 = rc_query_ready_where(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  rc = rc_query_close_set(q);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_stmt_term(&q->st, q->meta.fields[field].column, RC_W_NULL, q->n_args, 0);
+  if (rc != RC_OK) { return rc; }
+  var mark: int64 = q->buf.len;
+  rc = rc_query_begin_where(q);
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " IS NULL"); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    q->st.n_terms = q->st.n_terms - 1;
+    return rc;
+  }
+  return RC_OK;
+}
+
+// rc_query_where_not_null by field index: adds `"col" IS NOT NULL`.
+// For generated code: `field` is a 0-based field index in RcMeta order, and
+// one outside 0..n_fields-1 is RC_ERR_USAGE. Apps use rc_query_where_not_null,
+// which documents the rules and codes.
+export fn rc_query_where_not_null_field(q: RcQuery*, field: int32) -> int32 {
+  var rc: int32 = rc_query_ready_where(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  rc = rc_query_close_set(q);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_stmt_term(&q->st, q->meta.fields[field].column, RC_W_NOT_NULL, q->n_args, 0);
+  if (rc != RC_OK) { return rc; }
+  var mark: int64 = q->buf.len;
+  rc = rc_query_begin_where(q);
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " IS NOT NULL"); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    q->st.n_terms = q->st.n_terms - 1;
+    return rc;
+  }
+  return RC_OK;
+}
+
+// rc_query_where_in by field index: adds `"col" IN (?, ?, ...)`.
+// For generated code: `field` is a 0-based field index in RcMeta order, and
+// one outside 0..n_fields-1 is RC_ERR_USAGE. Apps use rc_query_where_in,
+// which documents the rules and codes.
+export fn rc_query_where_in_field(q: RcQuery*, field: int32, vals: RcValue*,
+                                  n: int32) -> int32 {
+  var rc: int32 = rc_query_ready_where(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  if (n <= 0) { return RC_ERR_USAGE; }
+  if (vals == 0) { return RC_ERR_USAGE; }
+
+  rc = rc_query_close_set(q);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_query_args_reserve(q, n);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_stmt_term(&q->st, q->meta.fields[field].column, RC_W_IN, q->n_args, n);
+  if (rc != RC_OK) { return rc; }
+  var mark: int64 = q->buf.len;
+  rc = rc_query_begin_where(q);
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " IN ("); }
+  var i: int32 = 0;
+  while (rc == RC_OK && i < n) {
+    if (i > 0) { rc = rc_query_put(q, ", "); }
+    if (rc == RC_OK) { rc = rc_query_put_question(q); }
+    i = i + 1;
+  }
+  if (rc == RC_OK) { rc = rc_query_put(q, ")"); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    q->st.n_terms = q->st.n_terms - 1;
+    return rc;
+  }
+  i = 0;
+  while (i < n) {
+    q->args[q->n_args] = vals[i];
+    q->n_args = q->n_args + 1;
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+// --- ORDER BY / LIMIT / OFFSET ----------------------------------------------
+
+// rc_query_order_by by field index: adds `"col" ASC` or `"col" DESC`.
+// For generated code: `field` is a 0-based field index in RcMeta order, and
+// one outside 0..n_fields-1 is RC_ERR_USAGE. Apps use rc_query_order_by,
+// which documents the rules and codes.
+export fn rc_query_order_by_field(q: RcQuery*, field: int32, dir: int32) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  if (dir != RC_ASC && dir != RC_DESC) { return RC_ERR_USAGE; }
+  var asc: bool = dir == RC_ASC;
+  // ORDER BY before LIMIT; refused once LIMIT/OFFSET has been emitted.
+  if (q->phase > Q_PHASE_ORDER) { return RC_ERR_USAGE; }
+  var mark: int64 = q->buf.len;
+  if (q->n_order == 0) {
+    rc = rc_query_put(q, " ORDER BY ");
+  } else {
+    rc = rc_query_put(q, ", ");
+  }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.fields[field].column); }
+  if (rc == RC_OK) {
+    if (asc) {
+      rc = rc_query_put(q, " ASC");
+    } else {
+      rc = rc_query_put(q, " DESC");
+    }
+  }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  rc = rc_stmt_order(&q->st, q->meta.fields[field].column, !asc);
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  q->n_order = q->n_order + 1;
+  q->phase = Q_PHASE_ORDER;
+  return RC_OK;
+}
+
+// Adds ` LIMIT n` to a SELECT. The number is written into the text, not bound:
+// it is a caller-counted int64, not user data, so this is the one place a
+// literal appears instead of a placeholder.
+//   q   a SELECT query
+//   n   the row limit, 0 or more
+//   e.g. rc_query_limit(&q, 10)
+// Returns RC_OK, or `q->err` if construction failed. RC_ERR_USAGE: q is 0, not
+// a SELECT (COUNT, UPDATE and DELETE included), n < 0, or LIMIT or OFFSET was
+// already added. RC_ERR_UNSUPPORTED when the dialect has no LIMIT.
+// RC_ERR_NOMEM when the text cannot grow. On failure the query is unchanged.
+export fn rc_query_limit(q: RcQuery*, n: int64) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (n < 0) { return RC_ERR_USAGE; }
+  if (!q->dial.has_limit) { return RC_ERR_UNSUPPORTED; }
+  if (q->phase > Q_PHASE_ORDER) { return RC_ERR_USAGE; }  // limit twice is a bug
+  var mark: int64 = q->buf.len;
+  rc = rc_query_put(q, " LIMIT ");
+  if (rc == RC_OK) { rc = rc_buf_put_i64(&q->buf, n); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  q->phase = Q_PHASE_LIMIT;
+  q->st.limit = n;
+  return RC_OK;
+}
+
+// Adds ` OFFSET n` to a SELECT, as a literal like LIMIT. It goes after LIMIT
+// when there is one; it does not require one.
+//   q   a SELECT query
+//   n   rows to skip, 0 or more
+//   e.g. rc_query_offset(&q, 20)
+// Returns RC_OK, or `q->err` if construction failed. RC_ERR_USAGE: q is 0, not
+// a SELECT, n < 0, or OFFSET was already added. RC_ERR_NOMEM when the text
+// cannot grow. On failure the query is unchanged.
+export fn rc_query_offset(q: RcQuery*, n: int64) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (n < 0) { return RC_ERR_USAGE; }
+  if (q->phase > Q_PHASE_LIMIT) { return RC_ERR_USAGE; }  // offset twice
+  var mark: int64 = q->buf.len;
+  rc = rc_query_put(q, " OFFSET ");
+  if (rc == RC_OK) { rc = rc_buf_put_i64(&q->buf, n); }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+  q->phase = Q_PHASE_OFFSET;
+  q->st.offset = n;
+  return RC_OK;
+}
+
+// --- JOIN --------------------------------------------------------------------
+
+// rc_query_join by field index. `local_field` is a 0-based field index in
+// q's RcMeta order and `foreign_field` one in target's; either out of range is
+// RC_ERR_USAGE. For generated code; apps use rc_query_join, which documents
+// the rules and codes.
+export fn rc_query_join_field(q: RcQuery*, target: RcMeta, local_field: int32,
+                              foreign_field: int32, kind: int32) -> int32 {
+  var rc: int32 = rc_query_ready_select(q);
+  if (rc != RC_OK) { return rc; }
+  if (kind != RC_JOIN_INNER && kind != RC_JOIN_LEFT) { return RC_ERR_USAGE; }
+  if (local_field < 0 || local_field >= q->meta.n_fields) { return RC_ERR_USAGE; }
+  if (foreign_field < 0 || foreign_field >= target.n_fields) {
+    return RC_ERR_USAGE;
+  }
+  // Not after LIMIT/OFFSET: the statement is closed at that point.
+  if (q->phase > Q_PHASE_ORDER) { return RC_ERR_USAGE; }
+
+  var mark: int64 = q->buf.len;
+  if (kind == RC_JOIN_LEFT) {
+    rc = rc_query_put(q, " LEFT JOIN ");
+  } else {
+    rc = rc_query_put(q, " JOIN ");
+  }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, target.table); }
+  if (rc == RC_OK) { rc = rc_query_put(q, " ON "); }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, q->meta.table); }
+  if (rc == RC_OK) { rc = rc_query_put(q, "."); }
+  if (rc == RC_OK) {
+    rc = rc_query_put_ident(q, q->meta.fields[local_field].column);
+  }
+  if (rc == RC_OK) { rc = rc_query_put(q, " = "); }
+  if (rc == RC_OK) { rc = rc_query_put_ident(q, target.table); }
+  if (rc == RC_OK) { rc = rc_query_put(q, "."); }
+  if (rc == RC_OK) {
+    rc = rc_query_put_ident(q, target.fields[foreign_field].column);
+  }
+  if (rc != RC_OK) {
+    q->buf.len = mark;
+    return rc;
+  }
+
+  // The clause was appended at the end; rotate it back in front of any
+  // WHERE/ORDER BY tail that is already there.
+  var at: int64 = q->tail;
+  var jlen: int64 = q->buf.len - mark;
+  var la: int64 = mark - at;
+  if (la > 0) {
+    rc_query_rotate_left(q->buf.data + at, la + jlen, la);
+  }
+  q->tail = at + jlen;
+  q->st.n_joins = q->st.n_joins + 1;
+  return RC_OK;
+}
+
+// --- by column name ----------------------------------------------------------
+// The calls an app uses. Each resolves `column` (a field name, or a column
+// name from the override table) and does what its _field twin does. An
+// unknown name is RC_ERR_USAGE.
+//
+// Every WHERE call works on SELECT, COUNT, DELETE and UPDATE queries, joins
+// terms with AND, and shares these failures (on top of its own):
+//   q->err                  construction failed; nothing is added
+//   RC_ERR_USAGE            q is 0, an unknown column, an INSERT query, a
+//                           SELECT that already has ORDER BY, LIMIT or OFFSET,
+//                           an rc_query_update whose SET values are not all
+//                           pushed, or an update_all with no SET column, or
+//                           with RC_F_UPDATED columns and no clock installed
+//                           (its first term closes the SET list and stamps
+//                           those columns)
+//   RC_ERR_NOMEM            the text, argv or RcStmt cannot grow
+//   RC_ERR_RANGE            the argv would need more than 2^31-1 cells
+// On failure the text and argv are as before, except that an update_all's SET
+// list stays closed once a WHERE call got past the checks above.
+
+fn rc_query_find(q: RcQuery*, column: string) -> int32 {
+  if (q == 0) { return -1; }
+  return rc_meta_find(q->meta, column);
+}
+
+// Adds `"column" <op> ?` to the WHERE clause and binds v.
+//   q       the query
+//   column  a field name, or a column name from the override table
+//   op      RC_CMP_EQ, _NE, _LT, _LE, _GT or _GE
+//   v       the value; borrowed, it must stay valid until the query has run
+//   e.g. rc_query_where(&q, "age", RC_CMP_GT, RcInt(18))
+// A NULL v never binds: RC_CMP_EQ emits `IS NULL`, RC_CMP_NE `IS NOT NULL`.
+// Returns RC_OK. RC_ERR_USAGE for an unknown op or an ordering op against
+// RcNull, plus the shared WHERE failures above.
+export fn rc_query_where(q: RcQuery*, column: string, op: int32, v: RcValue) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_query_where_field(q, rc_query_find(q, column), op, v);
+}
+
+// Adds `"column" IN (?, ?, ...)` with one placeholder per value, in array
+// order. A NULL element binds as a NULL placeholder (SQL: UNKNOWN), it is not
+// rewritten to IS NULL.
+//   q       the query
+//   column  a field name, or a column name from the override table
+//   vals    n values; the array is copied, the cells are borrowed and must
+//           stay valid until the query has run
+//   n       number of values, at least 1
+//   e.g. rc_query_where_in(&q, "role", &roles[0], 3)
+// Returns RC_OK. RC_ERR_USAGE when n <= 0 or vals is 0: `IN ()` is a syntax
+// error, and "match nothing" is the caller's call to make. Plus the shared
+// WHERE failures above.
+export fn rc_query_where_in(q: RcQuery*, column: string, vals: RcValue*,
+                            n: int32) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_query_where_in_field(q, rc_query_find(q, column), vals, n);
+}
+
+// Adds `"column" IS NULL` to the WHERE clause. Binds nothing.
+//   q       the query
+//   column  a field name, or a column name from the override table
+//   e.g. rc_query_where_null(&q, "deleted_at")
+// Returns RC_OK, or one of the shared WHERE failures above.
+export fn rc_query_where_null(q: RcQuery*, column: string) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_query_where_null_field(q, rc_query_find(q, column));
+}
+
+// Adds `"column" IS NOT NULL` to the WHERE clause. Binds nothing.
+//   q       the query
+//   column  a field name, or a column name from the override table
+//   e.g. rc_query_where_not_null(&q, "email")
+// Returns RC_OK, or one of the shared WHERE failures above.
+export fn rc_query_where_not_null(q: RcQuery*, column: string) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_query_where_not_null_field(q, rc_query_find(q, column));
+}
+
+// Adds a sort key to a SELECT: ` ORDER BY "column" ASC` the first time,
+// `, "column" DESC` after that.
+//   q       a SELECT query
+//   column  a field name, or a column name from the override table
+//   dir     RC_ASC or RC_DESC
+//   e.g. rc_query_order_by(&q, "name", RC_ASC)
+// Returns RC_OK, or `q->err` if construction failed. RC_ERR_USAGE: q is 0, not
+// a SELECT (COUNT included), an unknown column, a bad dir, or LIMIT or OFFSET
+// was already added. RC_ERR_NOMEM when the text or RcStmt cannot grow. On
+// failure the query is unchanged.
+export fn rc_query_order_by(q: RcQuery*, column: string, dir: int32) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_query_order_by_field(q, rc_query_find(q, column), dir);
+}
+
+// Adds ` JOIN "target" ON "t"."local" = "target"."foreign"` to a SELECT, or
+// ` LEFT JOIN ...` for RC_JOIN_LEFT. The clause goes right after FROM (and any
+// earlier JOIN) even when WHERE or ORDER BY text is already there, and it binds
+// nothing, so the argv order does not depend on when it was called. The
+// SELECT list stays q's own columns, unqualified. The RcStmt only counts
+// joins, so an adapter that runs RcStmt and has no joins refuses the query.
+//   q        a SELECT query
+//   target   the joined table; read during the call only
+//   local    a field or column name in q's table
+//   foreign  a field or column name in target
+//   kind     RC_JOIN_INNER or RC_JOIN_LEFT
+//   e.g. rc_query_join(&q, post_meta(), "id", "user_id", RC_JOIN_INNER)
+// Returns RC_OK, or `q->err` if construction failed. RC_ERR_USAGE: q is 0, not
+// a SELECT, a bad kind, an unknown local or foreign name, or LIMIT or OFFSET
+// was already added. RC_ERR_NOMEM when the text cannot grow. On failure the
+// query is unchanged.
+export fn rc_query_join(q: RcQuery*, target: RcMeta, local: string, foreign: string,
+                        kind: int32) -> int32 {
+  if (q == 0) { return RC_ERR_USAGE; }
+  return rc_query_join_field(q, target, rc_query_find(q, local),
+                             rc_meta_find(target, foreign), kind);
+}
+
+// --- accessors ---------------------------------------------------------------
+
+// The statement text so far.
+//   q   the query; may be 0
+// Returns a borrowed view into q's buffer, valid until the next call that
+// changes q or rc_query_free; "" when q is 0 or construction failed.
+export fn rc_query_sql(q: RcQuery*) -> string {
+  if (q == 0) { return ""; }
+  return rc_buf_text(&q->buf);
+}
+
+// The bound values so far, in `?` order; rc_query_n_args gives the count.
+//   q   the query; may be 0
+// Returns q's argv array (0 when q is 0 or nothing is allocated). The query
+// owns the array and may move it on the next call that adds a value; the
+// caller owns what the cells point at. Do not free either.
+export fn rc_query_args(q: RcQuery*) -> RcValue* {
+  if (q == 0) { return 0; }
+  return q->args;
+}
+
+// The number of values bound so far.
+//   q   the query; may be 0
+// Returns the count, 0 when q is 0.
+export fn rc_query_n_args(q: RcQuery*) -> int32 {
+  if (q == 0) { return 0; }
+  return q->n_args;
+}
+
+// --- execution ---------------------------------------------------------------
+
+// Runs the query: one rc_adapter_run call with the text, the RcStmt and the
+// argv (the adapter takes the RcStmt if it has a `query` slot, the text
+// otherwise).
+//   q    the query; its values must still be valid
+//   a    the adapter; borrowed
+//   out  receives the result; it is overwritten, not freed, so pass an empty
+//        or already freed RcResult. Free it with rc_result_free.
+// Returns RC_OK or the adapter's code. Before calling the adapter it returns
+// `q->err` if construction failed, and RC_ERR_USAGE when q, a or out is 0, a
+// batch INSERT does not have exactly n_rows * columns values (a short argv is
+// a driver error, not a partial insert), an UPDATE is missing SET values or
+// has no WHERE term, or a DELETE has no WHERE term (either would touch every
+// row). Through rc_adapter_run it can also return RC_ERR_UNSUPPORTED when the
+// adapter has no exec or query slot.
+export fn rc_query_exec(q: RcQuery*, a: RcAdapter*, out: RcResult*) -> int32 {
+  if (q == 0 || a == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (q->err != RC_OK) { return q->err; }
+  if (q->kind == Q_KIND_INSERT) {
+    if (q->n_rows <= 0 || q->n_cols <= 0) { return RC_ERR_USAGE; }
+    if (q->n_args != q->n_rows * q->n_cols) { return RC_ERR_USAGE; }
+  }
+  if (q->kind == Q_KIND_UPDATE) {
+    if (q->open_set) { return RC_ERR_USAGE; }   // no WHERE term yet
+    if (q->n_args < q->n_cols) { return RC_ERR_USAGE; }
+    if (q->phase != Q_PHASE_WHERE) { return RC_ERR_USAGE; }
+  }
+  if (q->kind == Q_KIND_DELETE && q->phase != Q_PHASE_WHERE) { return RC_ERR_USAGE; }
+  return rc_adapter_run(a, rc_buf_text(&q->buf), &q->st, q->args, q->n_args, out);
+}
+
+// The statement as data, with its argv filled in.
+//   q   the query; may be 0
+// Returns a pointer into q (0 when q is 0), valid until the next call that
+// changes q or rc_query_free. Its arrays belong to q; do not rc_stmt_free it.
+export fn rc_query_stmt(q: RcQuery*) -> RcStmt* {
+  if (q == 0) { return 0; }
+  q->st.args = q->args;
+  q->st.n_args = q->n_args;
+  return &q->st;
+}
+
+// Frees the text buffer, the argv array and the RcStmt arrays.
+//   q   the query; may be 0
+// It does not release the cells: they are borrowed, and releasing them here
+// would double-free the caller's text. Safe to call twice, and on a query
+// whose construction failed.
+export fn rc_query_free(q: RcQuery*) {
+  if (q == 0) { return; }
+  rc_buf_free(&q->buf);
+  rc_stmt_free(&q->st);
+  if (q->args != 0) {
+    free(q->args);
+    q->args = 0;
+  }
+  q->n_args = 0;
+  q->n_cap = 0;
+}

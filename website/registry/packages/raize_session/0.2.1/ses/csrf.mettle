@@ -1,0 +1,51 @@
+// CSRF protection (synchronizer token): each session record carries 32
+// random bytes; the token is their base64url text (43 characters). Put it
+// in forms or a request header; verify what comes back. Nothing extra to
+// store: it travels with the session and changes on ses_rotate.
+
+import "cryptex/cryptex";
+import "status";
+import "types";
+
+/// Gives a live session's CSRF token, for a hidden form field or an
+/// X-CSRF-Token header.
+/// in: s, a live session; out, receives the token
+/// returns: SES_OK; SES_E_INVALID (s not live); SES_E_ARG; SES_E_CRYPTO
+/// owns: writes out; the token is a secret of this session: send it only to
+///   its own client, inside the page or response
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: var c: SesToken; ses_csrf_token(&s, &c); html_hidden("csrf", ses_token_str(&c));
+export fn ses_csrf_token(s: SesSession*, out: SesToken*) -> int32 {
+  if (s == 0 || out == 0) { return SES_E_ARG; }
+  out->len = 0;
+  if (!s->live) { return SES_E_INVALID; }
+  var n: int64 = 0;
+  if (cr_base64url_encode(&out->b[0], (int64)SES_TOKEN_CAP, &n, &s->rec.csrf[0], 32) != CR_OK) { return SES_E_CRYPTO; }
+  out->len = n;
+  return SES_OK;
+}
+
+/// Verifies a presented CSRF value against a live session, in constant
+/// time (cr_equal over the decoded 32 bytes).
+/// in: s, the session the request belongs to; presented, the value from
+///   the form field or header
+/// returns: true only when it is this session's current token; false for a
+///   wrong, malformed, other-session or rotated-away value, and for a
+///   session that is not live (fails closed)
+/// owns: presented is borrowed; the decoded bytes are wiped
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: if (is_post && !ses_csrf_verify(&s, form_value("csrf"))) { return http_403(); }
+export fn ses_csrf_verify(s: SesSession*, presented: string) -> bool {
+  if (s == 0 || !s->live) { return false; }
+  if (presented.length != 43) { return false; }
+  var raw: uint8[48];
+  var n: int64 = 0;
+  if (cr_base64url_decode(&raw[0], 48, &n, presented.chars, 43) != CR_OK) {
+    cr_wipe(&raw[0], 48);
+    return false;
+  }
+  var ok: bool = n == 32;
+  if (ok) { ok = cr_equal(&raw[0], &s->rec.csrf[0], 32); }
+  cr_wipe(&raw[0], 48);
+  return ok;
+}

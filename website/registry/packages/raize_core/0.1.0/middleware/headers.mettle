@@ -1,0 +1,278 @@
+// raize/middleware/headers — the header policy layer the middleware uses.
+//
+// framework/context/header.mettle already owns the *mechanics*: tchar and
+// name validation, the CR/LF/NUL value guard, case-insensitive lookup, token
+// lookup in comma lists. framework/context/response.mettle owns set/get/del on
+// the response table. Nothing here re-implements any of that; this file exists
+// for the three things those layers do not provide, which every middleware in
+// this directory needs:
+//
+//   1. **append.** rz_resp_header_set *replaces* a header in place. Some headers
+//      are legitimately repeated (Set-Cookie, Vary, Warning) and some are
+//      comma-joined (Cache-Control); a replace-only API silently loses the
+//      first Set-Cookie. rz_hdr_append adds a second entry under the same name,
+//      which the serializer writes as its own line — the correct wire form for
+//      a repeatable header.
+//
+//   2. **named outcomes.** rz_resp_header_set returns 0 / -1 / -2, but "the name
+//      is not a token", "the value contains CR or LF" and "the table is full"
+//      are three different bugs and a middleware that cannot tell them apart
+//      logs "header failed" for all of them. The constants below name them.
+//
+//   3. **the CRLF guard as a callable.** The response-splitting guard already
+//      runs inside rz_resp_header_set. But a middleware that *builds* a value
+//      from request data (CORS echoing Origin, auth echoing a realm) should be
+//      able to refuse before it even calls set, and a test should be able to
+//      assert the guard directly. rz_hdr_crlf_ok is that name.
+//
+// The guard is not optional and not bypassable: there is no "set unchecked"
+// variant in this file. Every value a middleware puts on a response goes
+// through rz_resp_header_set, which refuses CR, LF and NUL (that is how a
+// header value could end a response head early and inject a whole second
+// response — response splitting).
+//
+// Fixed capacity: the response header table is RZ_MAX_RESP_HEADERS = 16 entries
+// (RzResponse.headers is a literal array, so it cannot grow). A seventeenth
+// header is RZ_HDR_FULL, never a truncation.
+
+import "../str/str";
+import "../context/context";
+
+// rz_hdr_set / rz_hdr_append outcomes.
+export const RZ_HDR_OK: int32 = 0;         // stored
+export const RZ_HDR_REJECTED: int32 = -1;  // bad name, or CR/LF/NUL in the value
+export const RZ_HDR_FULL: int32 = -2;      // RZ_MAX_RESP_HEADERS reached
+
+// The explicit response-splitting guard. False when `v` contains CR (13), LF
+// (10) or NUL (0) — the three bytes that can end a field line or the head.
+// rz_header_value_ok (context) is the same check; this name exists so a
+// middleware can say *why* it refused and so a test can call it by name.
+export fn rz_hdr_crlf_ok(v: string) -> bool {
+  return rz_header_value_ok(v);
+}
+
+// Set-or-replace, case-insensitively. The value is copied into the response
+// arena when one is attached (rz_ctx_init always attaches one), so a value
+// built in a stack buffer cannot dangle.
+export fn rz_hdr_set(resp: RzResponse*, name: string, value: string) -> int32 {
+  if (resp == 0) { return RZ_HDR_REJECTED; }
+  if (!rz_hdr_crlf_ok(value)) { return RZ_HDR_REJECTED; }
+  return rz_resp_header_set(resp, name, value);
+}
+
+// Case-insensitive read; empty when absent.
+export fn rz_hdr_get(resp: RzResponse*, name: string) -> string {
+  if (resp == 0) { return rz_str_empty(); }
+  return rz_resp_header_get(resp, name);
+}
+
+// Add a header *entry* even when the name already exists. Use for headers that
+// are repeated on the wire (Set-Cookie) or where a duplicate line is valid
+// (Vary). A caller that wants the comma-joined form builds the joined value
+// itself and calls rz_hdr_set.
+export fn rz_hdr_append(resp: RzResponse*, name: string, value: string) -> int32 {
+  if (resp == 0) { return RZ_HDR_REJECTED; }
+  if (!rz_header_name_ok(name)) { return RZ_HDR_REJECTED; }
+  if (!rz_hdr_crlf_ok(value)) { return RZ_HDR_REJECTED; }
+  var sn: string = name;
+  var sv: string = value;
+  if (resp->arena != 0) {
+    sn = rz_arena_str(resp->arena, name);
+    sv = rz_arena_str(resp->arena, value);
+    if (sn.chars == 0 || sv.chars == 0) { return RZ_HDR_REJECTED; }
+  }
+  if (resp->header_count >= RZ_MAX_RESP_HEADERS) { return RZ_HDR_FULL; }
+  var at: int32 = resp->header_count;
+  resp->headers[at].name = sn;
+  resp->headers[at].value = sv;
+  resp->header_count = at + 1;
+  return RZ_HDR_OK;
+}
+
+// Append `name: value` only when the response does not already carry the name
+// (a default that a handler may override). 0 written or already present, else
+// the rz_hdr_set outcome.
+export fn rz_hdr_set_default(resp: RzResponse*, name: string, value: string) -> int32 {
+  if (resp == 0) { return RZ_HDR_REJECTED; }
+  if (rz_resp_header_get(resp, name).length != 0) { return RZ_HDR_OK; }
+  return rz_hdr_set(resp, name, value);
+}
+
+// ---------------------------------------------------------------------------
+// Request-side reads. The request table is (RzHeader*, count) — the server's
+// parser owns it — so these are thin, named wrappers and nothing more.
+// ---------------------------------------------------------------------------
+
+export fn rz_hdr_in_get(req: RzRequest*, name: string) -> string {
+  if (req == 0) { return rz_str_empty(); }
+  return rz_header_get(req->headers, req->header_count, name);
+}
+
+export fn rz_hdr_in_count(req: RzRequest*, name: string) -> int32 {
+  if (req == 0) { return 0; }
+  return rz_header_count_named(req->headers, req->header_count, name);
+}
+
+export fn rz_hdr_in_has(req: RzRequest*, name: string) -> bool {
+  if (req == 0) { return false; }
+  return rz_header_has(req->headers, req->header_count, name);
+}
+
+// True when a comma-separated request header contains `token`
+// (case-insensitive, OWS trimmed). The only correct way to read Connection,
+// Transfer-Encoding and Expect.
+export fn rz_hdr_in_token(req: RzRequest*, name: string, token: string) -> bool {
+  var v: string = rz_hdr_in_get(req, name);
+  if (v.length == 0) { return false; }
+  return rz_header_has_token(v, token);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// Run: ./mettle-build/bin/mettle test framework/middleware/headers.mettle
+// (compile-time interpreter: no sockets, no clock, no codegen)
+// ---------------------------------------------------------------------------
+
+@test fn t_rz_hdr_crlf_guard() -> int32 {
+  if (!rz_hdr_crlf_ok("text/plain; charset=utf-8")) { return 1; }
+  if (!rz_hdr_crlf_ok("")) { return 2; }
+  // The two bytes that can end a field line: a value containing either one can
+  // append a whole second response to this one (response splitting).
+  if (rz_hdr_crlf_ok("a\r\nX-Injected: 1")) { return 3; }
+  if (rz_hdr_crlf_ok("a\nb")) { return 4; }
+  if (rz_hdr_crlf_ok("a\rb")) { return 5; }
+  if (rz_hdr_crlf_ok("text/plain\r\n\r\n<html>pwned</html>")) { return 6; }
+  // Leading/trailing CR/LF are just as fatal as embedded ones.
+  if (rz_hdr_crlf_ok("\nX: 1")) { return 7; }
+  if (rz_hdr_crlf_ok("v\n")) { return 8; }
+  return 0;
+}
+
+@test fn t_rz_hdr_set_get_case_insensitive() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var r: RzResponse* = rz_response_new();
+  if (r == 0) { return 2; }
+  defer rz_response_free(r);
+  r->arena = arena;
+
+  if (rz_hdr_set(r, "X-Test", "one") != RZ_HDR_OK) { return 3; }
+  if (!rz_str_eq(rz_hdr_get(r, "x-test"), "one")) { return 4; }
+  if (!rz_str_eq(rz_hdr_get(r, "X-TEST"), "one")) { return 5; }
+  if (rz_hdr_get(r, "x-missing").length != 0) { return 6; }
+  // set *replaces* (keeps one entry), it does not append
+  if (rz_hdr_set(r, "x-tEst", "two") != RZ_HDR_OK) { return 7; }
+  if (r->header_count != 1) { return 8; }
+  if (!rz_str_eq(rz_hdr_get(r, "X-Test"), "two")) { return 9; }
+  // a value built in a stack buffer is copied into the arena (no dangling view)
+  var scratch: uint8[4];
+  scratch[0] = 65;
+  var view: string = rz_str_view(&scratch[0], 1);
+  if (rz_hdr_set(r, "X-Copy", view) != RZ_HDR_OK) { return 10; }
+  scratch[0] = 66;
+  if (!rz_str_eq(rz_hdr_get(r, "X-Copy"), "A")) { return 11; }
+  return 0;
+}
+
+@test fn t_rz_hdr_append_keeps_every_entry() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var r: RzResponse* = rz_response_new();
+  if (r == 0) { return 2; }
+  defer rz_response_free(r);
+  r->arena = arena;
+  if (rz_hdr_append(r, "Set-Cookie", "a=1; Path=/") != RZ_HDR_OK) { return 3; }
+  if (rz_hdr_append(r, "set-cookie", "b=2; Path=/") != RZ_HDR_OK) { return 4; }
+  if (r->header_count != 2) { return 5; }
+  if (rz_header_count_named(&r->headers[0], r->header_count, "SET-COOKIE") != 2) { return 6; }
+  // append tolerates an existing name (that is the point); set-default does not
+  if (!rz_str_eq(rz_hdr_get(r, "Set-Cookie"), "a=1; Path=/")) { return 7; }
+  return 0;
+}
+
+@test fn t_rz_hdr_refuses_split_values() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var r: RzResponse* = rz_response_new();
+  if (r == 0) { return 2; }
+  defer rz_response_free(r);
+  r->arena = arena;
+  if (rz_hdr_set(r, "X-Ok", "v") != RZ_HDR_OK) { return 3; }
+  var before: int32 = r->header_count;
+  // the response-splitting sink: set and append both refuse, and the table is
+  // untouched (a rejected value never becomes a half-written entry)
+  if (rz_hdr_set(r, "X-Bad", "v\r\nX-Injected: 1") != RZ_HDR_REJECTED) { return 4; }
+  if (rz_hdr_append(r, "X-Bad", "v\r\nX-Injected: 1") != RZ_HDR_REJECTED) { return 5; }
+  if (rz_hdr_append(r, "X-Bad", "v\nX-Injected: 1") != RZ_HDR_REJECTED) { return 6; }
+  if (rz_hdr_set(r, "X Bad", "v") != RZ_HDR_REJECTED) { return 7; }
+  if (rz_hdr_append(r, "X Bad", "v") != RZ_HDR_REJECTED) { return 8; }
+  if (r->header_count != before) { return 9; }
+  if (rz_hdr_get(r, "X-Bad").length != 0) { return 10; }
+  if (rz_resp_header_get(r, "X-Injected").length != 0) { return 11; }
+  return 0;
+}
+
+@test fn t_rz_hdr_full_is_a_bound() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var r: RzResponse* = rz_response_new();
+  if (r == 0) { return 2; }
+  defer rz_response_free(r);
+  r->arena = arena;
+  var i: int32 = 0;
+  while (i < RZ_MAX_RESP_HEADERS) {
+    if (rz_hdr_append(r, "X-N", "v") != RZ_HDR_OK) { return 3; }
+    i = i + 1;
+  }
+  if (r->header_count != RZ_MAX_RESP_HEADERS) { return 4; }
+  if (rz_hdr_append(r, "X-One-More", "v") != RZ_HDR_FULL) { return 5; }
+  if (r->header_count != RZ_MAX_RESP_HEADERS) { return 6; }
+  return 0;
+}
+
+@test fn t_rz_hdr_set_default() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var r: RzResponse* = rz_response_new();
+  if (r == 0) { return 2; }
+  defer rz_response_free(r);
+  r->arena = arena;
+  if (rz_hdr_set_default(r, "Cache-Control", "no-store") != RZ_HDR_OK) { return 3; }
+  if (!rz_str_eq(rz_hdr_get(r, "cache-control"), "no-store")) { return 4; }
+  // a second call is a no-op: the handler's value wins
+  if (rz_hdr_set_default(r, "cache-control", "max-age=60") != RZ_HDR_OK) { return 5; }
+  if (!rz_str_eq(rz_hdr_get(r, "Cache-Control"), "no-store")) { return 6; }
+  if (r->header_count != 1) { return 7; }
+  return 0;
+}
+
+@test fn t_rz_hdr_request_side() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  req.headers[0].name = "Connection";
+  req.headers[0].value = "keep-alive, Upgrade";
+  req.headers[1].name = "X-Twice";
+  req.headers[1].value = "1";
+  req.headers[2].name = "x-twice";
+  req.headers[2].value = "2";
+  req.header_count = 3;
+  if (!rz_str_eq(rz_hdr_in_get(&req, "CONNECTION"), "keep-alive, Upgrade")) { return 3; }
+  if (rz_hdr_in_get(&req, "Host").length != 0) { return 4; }
+  if (!rz_hdr_in_has(&req, "x-twice")) { return 5; }
+  if (rz_hdr_in_count(&req, "X-Twice") != 2) { return 6; }
+  if (!rz_hdr_in_token(&req, "connection", "upgrade")) { return 7; }
+  if (!rz_hdr_in_token(&req, "Connection", "KEEP-ALIVE")) { return 8; }
+  if (rz_hdr_in_token(&req, "Connection", "close")) { return 9; }
+  if (rz_hdr_in_get(0, "Host").length != 0) { return 10; }
+  if (rz_hdr_in_get(&req, "").length != 0) { return 11; }
+  return 0;
+}

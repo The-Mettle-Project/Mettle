@@ -1,0 +1,693 @@
+// Vorbis setup: the identification header and the setup header
+// (codebooks, floors, residues, mappings and modes) of the Vorbis I
+// specification, unpacked into tables the packet decoder reads.
+//
+// Codebooks follow stb_vorbis: codewords are built from the lengths with
+// its "lowest free leaf" walk, codes of up to VB_FAST bits are found with
+// one table lookup, and longer codes by a binary search over the sorted,
+// bit-reversed long codes. Only the entries that have a codeword get a
+// slot, so sparse books stay small, and VQ vectors (lookup types 1 and 2)
+// are unpacked at setup into one row per slot.
+
+import "std/mem";
+import "../core/amath";
+import "../core/status";
+import "../core/bits";
+
+// Bits of the one-lookup Huffman table.
+export const AUDIO_VORBIS_FAST: int32 = 10;
+// Setup memory allowed, against hostile headers.
+const VB_SETUP_LIMIT: int64 = 96000000;
+const VB_MAX_ENTRIES: int64 = 1048576;
+const VB_PI: float64 = 3.14159265358979323846;
+
+export struct AudioVorbisBook {
+  dim: int32;
+  entries: int32;
+  used: int32;        // entries with a codeword = slots
+  lookup: int32;      // 0: scalar only, else vq holds a vector per slot
+  single: int32;      // length of the only codeword if there is one slot, else 0
+  fast: int32*;       // [1 << FAST]: slot << 6 | length, or -1
+  nlong: int32;
+  lcode: uint32*;     // sorted long codes, first bit at the top
+  lslot: int32*;      // their slots
+  slen: uint8*;       // [used] codeword length per slot
+  sym: int32*;        // [used] entry number per slot
+  vq: float32*;       // [used * dim]
+}
+
+export struct AudioVorbisFloor {
+  kind: int32;        // 0 or 1
+  // floor 0
+  order: int32;
+  rate: int32;
+  bark: int32;
+  amp_bits: int32;
+  amp_off: int32;
+  nbooks: int32;
+  books: int32[16];
+  map: int32*[2];     // per block size: bark index of each of n/2 bins, then -1
+  cosw: float32*[2];  // cos(omega) of each bin
+  // floor 1
+  parts: int32;
+  pclass: int32[32];
+  cdim: int32[16];
+  csub: int32[16];
+  cmaster: int32[16];
+  cbooks: int32[128]; // [class * 8 + k], -1 = none
+  mult: int32;
+  values: int32;
+  x: int32[256];
+  sorted: int32[256]; // indexes in order of x
+  lo: int32[256];     // neighbours
+  hi: int32[256];
+}
+
+export struct AudioVorbisResidue {
+  kind: int32;
+  begin: int32;
+  end: int32;
+  psize: int32;
+  nclass: int32;
+  classbook: int32;
+  books: int32[512];  // [class * 8 + pass], -1 = none
+  classdata: uint8*;  // [classbook slot * classwords] class numbers
+}
+
+export struct AudioVorbisMapping {
+  submaps: int32;
+  steps: int32;
+  mag: uint8[256];
+  ang: uint8[256];
+  mux: int32[8];
+  floor: int32[16];
+  residue: int32[16];
+}
+
+export struct AudioVorbisMode {
+  blockflag: int32;
+  mapping: int32;
+}
+
+export struct AudioVorbisSetup {
+  channels: int32;
+  rate: int32;
+  bs: int32[2];
+  nbooks: int32;
+  books: AudioVorbisBook*;
+  nfloors: int32;
+  floors: AudioVorbisFloor*;
+  nres: int32;
+  res: AudioVorbisResidue*;
+  nmaps: int32;
+  maps: AudioVorbisMapping*;
+  nmodes: int32;
+  modes: AudioVorbisMode[64];
+  mode_bits: int32;
+  max_parts: int32;   // most partitions any residue reads in one channel vector
+  max_floor: int32;   // most floor 1 values, or floor 0 order
+  // every block allocated for the setup, freed together
+  ptrs: uint8**;
+  nptr: int32;
+  cptr: int32;
+  mem: int64;
+}
+
+/// ilog from the specification: bits needed for v (ilog(0) = 0).
+export fn audio_vorbis_ilog(v: int64) -> int32 {
+  var r: int32 = 0;
+  var x: int64 = v;
+  while (x > 0) { r = r + 1; x = x >> 1; }
+  return r;
+}
+
+export fn audio_vorbis_rev32(v: uint32) -> uint32 {
+  var n: uint32 = v;
+  n = ((n & 0xAAAAAAAA) >> 1) | ((n & 0x55555555) << 1);
+  n = ((n & 0xCCCCCCCC) >> 2) | ((n & 0x33333333) << 2);
+  n = ((n & 0xF0F0F0F0) >> 4) | ((n & 0x0F0F0F0F) << 4);
+  n = ((n & 0xFF00FF00) >> 8) | ((n & 0x00FF00FF) << 8);
+  return (n >> 16) | (n << 16);
+}
+
+// Zeroed memory counted against the setup limit. 0 when over it.
+fn vs_alloc(s: AudioVorbisSetup*, bytes: int64) -> uint8* {
+  if (bytes < 0 || s->mem + bytes > VB_SETUP_LIMIT) { return (uint8*)0; }
+  if (s->nptr >= s->cptr) {
+    var nc: int32 = s->cptr * 2;
+    if (nc < 64) { nc = 64; }
+    var np: uint8** = (uint8**)calloc((int64)nc, 8);
+    if (np == 0) { return (uint8*)0; }
+    if (s->ptrs != 0) {
+      for i in 0..s->nptr { np[i] = s->ptrs[i]; }
+      free(s->ptrs);
+    }
+    s->ptrs = np;
+    s->cptr = nc;
+  }
+  var sz: int64 = bytes;
+  if (sz < 1) { sz = 1; }
+  var p: uint8* = (uint8*)calloc(sz, 1);
+  if (p == 0) { return p; }
+  s->ptrs[s->nptr] = p;
+  s->nptr = s->nptr + 1;
+  s->mem = s->mem + sz;
+  return p;
+}
+
+/// Frees everything the setup holds.
+export fn audio_vorbis_setup_free(s: AudioVorbisSetup*) {
+  if (s->ptrs != 0) {
+    for i in 0..s->nptr { free(s->ptrs[i]); }
+    free(s->ptrs);
+  }
+  s->ptrs = (uint8**)0;
+  s->nptr = 0;
+  s->cptr = 0;
+  s->mem = 0;
+  s->books = (AudioVorbisBook*)0;
+  s->floors = (AudioVorbisFloor*)0;
+  s->res = (AudioVorbisResidue*)0;
+  s->maps = (AudioVorbisMapping*)0;
+}
+
+fn vs_bits(b: AudioBitsL*, k: int32) -> int64 {
+  return (int64)audio_bitsl_get(b, k);
+}
+
+fn vs_float(x: uint32) -> float32 {
+  var mant: int64 = (int64)(x & 0x1FFFFF);
+  var e: int32 = (int32)((x & 0x7FE00000) >> 21);
+  var m: float64 = (float64)mant;
+  if ((x & 0x80000000) != 0) { m = -m; }
+  return (float32)audio_ldexp(m, e - 788);
+}
+
+// r^dim <= limit, without overflow.
+fn vs_pow_le(r: int64, dim: int32, limit: int64) -> bool {
+  var acc: int64 = 1;
+  for i in 0..dim {
+    acc = acc * r;
+    if (acc > limit) { return false; }
+  }
+  return true;
+}
+
+// The largest r with r^dim <= entries.
+fn vs_lookup1(entries: int64, dim: int32) -> int64 {
+  if (entries <= 0 || dim <= 0) { return 0; }
+  var r: int64 = (int64)audio_floor(audio_exp(audio_log((float64)entries) / (float64)dim));
+  if (r < 1) { r = 1; }
+  while (r > 1 && !vs_pow_le(r, dim, entries)) { r = r - 1; }
+  while (vs_pow_le(r + 1, dim, entries)) { r = r + 1; }
+  return r;
+}
+
+// Heap sort of 64-bit keys.
+fn vs_sort(a: uint64*, n: int32) {
+  if (n < 2) { return; }
+  var start: int32 = n / 2;
+  var end: int32 = n;
+  while (end > 1) {
+    if (start > 0) {
+      start = start - 1;
+    } else {
+      end = end - 1;
+      var t: uint64 = a[0];
+      a[0] = a[end];
+      a[end] = t;
+    }
+    var root: int32 = start;
+    while (root * 2 + 1 < end) {
+      var child: int32 = root * 2 + 1;
+      if (child + 1 < end && a[child] < a[child + 1]) { child = child + 1; }
+      if (a[root] < a[child]) {
+        var t2: uint64 = a[root];
+        a[root] = a[child];
+        a[child] = t2;
+        root = child;
+      } else {
+        break;
+      }
+    }
+  }
+}
+
+// One codebook. Returns AUDIO_OK or an error.
+fn vs_book(s: AudioVorbisSetup*, b: AudioBitsL*, c: AudioVorbisBook*) -> int32 {
+  if (vs_bits(b, 24) != 0x564342) { return AUDIO_E_DATA; }
+  var dim: int64 = vs_bits(b, 16);
+  var entries: int64 = vs_bits(b, 24);
+  if (b->over > 0) { return AUDIO_E_TRUNC; }
+  if (dim == 0 && entries != 0) { return AUDIO_E_DATA; }
+  if (entries > VB_MAX_ENTRIES) { return AUDIO_E_LIMIT; }
+  c->dim = (int32)dim;
+  c->entries = (int32)entries;
+  var ordered: bool = vs_bits(b, 1) != 0;
+  var lens: uint8* = (uint8*)calloc(entries + 1, 1);
+  if (lens == 0) { return AUDIO_E_MEM; }
+  defer free(lens);
+  var used: int64 = 0;
+  if (ordered) {
+    var cur: int64 = 0;
+    var clen: int64 = vs_bits(b, 5) + 1;
+    while (cur < entries) {
+      var num: int64 = vs_bits(b, audio_vorbis_ilog(entries - cur));
+      if (b->over > 0) { return AUDIO_E_TRUNC; }
+      if (clen > 32 || cur + num > entries) { return AUDIO_E_DATA; }
+      for j in cur..(cur + num) { lens[j] = (uint8)clen; }
+      cur = cur + num;
+      clen = clen + 1;
+    }
+    used = entries;
+  } else {
+    var sparse: bool = vs_bits(b, 1) != 0;
+    // each entry takes at least one bit
+    if (entries > audio_bitsl_left(b)) { return AUDIO_E_TRUNC; }
+    for j in 0..entries {
+      var present: bool = true;
+      if (sparse) { present = vs_bits(b, 1) != 0; }
+      if (present) {
+        lens[j] = (uint8)(vs_bits(b, 5) + 1);
+        used = used + 1;
+      }
+    }
+    if (b->over > 0) { return AUDIO_E_TRUNC; }
+  }
+  c->used = (int32)used;
+  c->slen = vs_alloc(s, used);
+  c->sym = (int32*)vs_alloc(s, used * 4);
+  c->fast = (int32*)vs_alloc(s, (int64)4 << AUDIO_VORBIS_FAST);
+  var codes: uint32* = (uint32*)calloc(used + 1, 4);
+  if (c->slen == 0 || c->sym == 0 || c->fast == 0 || codes == 0) {
+    if (codes != 0) { free(codes); }
+    return AUDIO_E_LIMIT;
+  }
+  defer free(codes);
+  var k: int32 = 0;
+  for j in 0..entries {
+    if (lens[j] != 0) {
+      c->sym[k] = (int32)j;
+      c->slen[k] = lens[j];
+      k = k + 1;
+    }
+  }
+  var fsize: int32 = 1 << AUDIO_VORBIS_FAST;
+  for i in 0..fsize { c->fast[i] = -1; }
+  if (used == 1) {
+    c->single = (int32)c->slen[0];
+  } else if (used > 1) {
+    // codewords: take the lowest free leaf at each length (stb_vorbis)
+    var avail: uint32[33];
+    for i in 1..=(int32)c->slen[0] { avail[i] = (uint32)1 << (32 - i); }
+    codes[0] = 0;
+    for i in 1..c->used {
+      var z: int32 = (int32)c->slen[i];
+      var want: int32 = z;
+      while (z > 0 && avail[z] == 0) { z = z - 1; }
+      if (z == 0) { return AUDIO_E_DATA; }
+      var res: uint32 = avail[z];
+      avail[z] = 0;
+      codes[i] = res;
+      var y: int32 = want;
+      while (y > z) {
+        avail[y] = res + ((uint32)1 << (32 - y));
+        y = y - 1;
+      }
+    }
+    // the tree must be full
+    for i in 1..33 {
+      if (avail[i] != 0) { return AUDIO_E_DATA; }
+    }
+    var nlong: int32 = 0;
+    for i in 0..c->used {
+      var l: int32 = (int32)c->slen[i];
+      if (l <= AUDIO_VORBIS_FAST) {
+        var zz: uint32 = audio_vorbis_rev32(codes[i]);
+        var step: uint32 = (uint32)1 << l;
+        while (zz < (uint32)fsize) {
+          c->fast[zz] = (i << 6) | l;
+          zz = zz + step;
+        }
+      } else {
+        nlong = nlong + 1;
+      }
+    }
+    c->nlong = nlong;
+    if (nlong > 0) {
+      c->lcode = (uint32*)vs_alloc(s, (int64)nlong * 4);
+      c->lslot = (int32*)vs_alloc(s, (int64)nlong * 4);
+      var keys: uint64* = (uint64*)calloc((int64)nlong, 8);
+      if (c->lcode == 0 || c->lslot == 0 || keys == 0) {
+        if (keys != 0) { free(keys); }
+        return AUDIO_E_LIMIT;
+      }
+      var q: int32 = 0;
+      for i in 0..c->used {
+        if ((int32)c->slen[i] > AUDIO_VORBIS_FAST) {
+          keys[q] = ((uint64)codes[i] << 32) | (uint64)i;
+          q = q + 1;
+        }
+      }
+      vs_sort(keys, nlong);
+      for i in 0..nlong {
+        c->lcode[i] = (uint32)(keys[i] >> 32);
+        c->lslot[i] = (int32)(keys[i] & 0xFFFFFFFF);
+      }
+      free(keys);
+    }
+  }
+  // vector lookup
+  var lt: int64 = vs_bits(b, 4);
+  if (lt > 2) { return AUDIO_E_DATA; }
+  c->lookup = (int32)lt;
+  if (lt == 0) { return AUDIO_OK; }
+  var minv: float32 = vs_float((uint32)vs_bits(b, 32));
+  var delta: float32 = vs_float((uint32)vs_bits(b, 32));
+  var vbits: int32 = (int32)vs_bits(b, 4) + 1;
+  var seqp: bool = vs_bits(b, 1) != 0;
+  if (b->over > 0) { return AUDIO_E_TRUNC; }
+  var lv: int64 = 0;
+  if (lt == 1) { lv = vs_lookup1(entries, c->dim); } else { lv = entries * dim; }
+  if (lv <= 0) { return AUDIO_E_DATA; }
+  if (lv * (int64)vbits > audio_bitsl_left(b)) { return AUDIO_E_TRUNC; }
+  var mults: uint32* = (uint32*)calloc(lv, 4);
+  if (mults == 0) { return AUDIO_E_MEM; }
+  defer free(mults);
+  for j in 0..lv { mults[j] = audio_bitsl_get(b, vbits); }
+  if (used * dim > (int64)16 * VB_MAX_ENTRIES) { return AUDIO_E_LIMIT; }
+  c->vq = (float32*)vs_alloc(s, used * dim * 4);
+  if (c->vq == 0 && used * dim > 0) { return AUDIO_E_LIMIT; }
+  for sl in 0..c->used {
+    var e: int64 = (int64)c->sym[sl];
+    var last: float32 = 0.0;
+    var div: int64 = 1;
+    for i in 0..c->dim {
+      var off: int64 = 0;
+      if (lt == 1) {
+        off = (e / div) % lv;
+        if (div <= entries) { div = div * lv; }
+      } else {
+        off = e * dim + (int64)i;
+      }
+      var val: float32 = (float32)mults[off] * delta + minv + last;
+      if (seqp) { last = val; }
+      c->vq[(int64)sl * dim + (int64)i] = val;
+    }
+  }
+  return AUDIO_OK;
+}
+
+fn vs_bark(x: float64) -> float64 {
+  return 13.1 * audio_atan(0.00074 * x) + 2.24 * audio_atan(0.0000000185 * x * x) + 0.0001 * x;
+}
+
+fn vs_floor0_maps(s: AudioVorbisSetup*, f: AudioVorbisFloor*) -> int32 {
+  for k in 0..2 {
+    var n: int32 = s->bs[k] / 2;
+    var m: int32* = (int32*)vs_alloc(s, (int64)(n + 1) * 4);
+    var cw: float32* = (float32*)vs_alloc(s, (int64)(n + 1) * 4);
+    if (m == 0 || cw == 0) { return AUDIO_E_LIMIT; }
+    var top: float64 = vs_bark(0.5 * (float64)f->rate);
+    for i in 0..n {
+      var v: float64 = vs_bark((float64)f->rate * (float64)i / (2.0 * (float64)n)) * (float64)f->bark / top;
+      var mi: int32 = (int32)audio_floor(v);
+      if (mi > f->bark - 1) { mi = f->bark - 1; }
+      if (mi < 0) { mi = 0; }
+      m[i] = mi;
+      cw[i] = (float32)audio_cos(VB_PI * (float64)mi / (float64)f->bark);
+    }
+    m[n] = -1;
+    f->map[k] = m;
+    f->cosw[k] = cw;
+  }
+  return AUDIO_OK;
+}
+
+fn vs_floor(s: AudioVorbisSetup*, b: AudioBitsL*, f: AudioVorbisFloor*) -> int32 {
+  var kind: int64 = vs_bits(b, 16);
+  if (kind > 1) { return AUDIO_E_DATA; }
+  f->kind = (int32)kind;
+  if (kind == 0) {
+    f->order = (int32)vs_bits(b, 8);
+    f->rate = (int32)vs_bits(b, 16);
+    f->bark = (int32)vs_bits(b, 16);
+    f->amp_bits = (int32)vs_bits(b, 6);
+    f->amp_off = (int32)vs_bits(b, 8);
+    f->nbooks = (int32)vs_bits(b, 4) + 1;
+    for j in 0..f->nbooks {
+      f->books[j] = (int32)vs_bits(b, 8);
+      if (f->books[j] >= s->nbooks) { return AUDIO_E_DATA; }
+    }
+    if (b->over > 0) { return AUDIO_E_TRUNC; }
+    if (f->order < 1 || f->rate < 1 || f->bark < 1) { return AUDIO_E_DATA; }
+    if (f->order > s->max_floor) { s->max_floor = f->order; }
+    return vs_floor0_maps(s, f);
+  }
+  f->parts = (int32)vs_bits(b, 5);
+  var maxc: int32 = -1;
+  for j in 0..f->parts {
+    f->pclass[j] = (int32)vs_bits(b, 4);
+    if (f->pclass[j] > maxc) { maxc = f->pclass[j]; }
+  }
+  for j in 0..=maxc {
+    f->cdim[j] = (int32)vs_bits(b, 3) + 1;
+    f->csub[j] = (int32)vs_bits(b, 2);
+    f->cmaster[j] = -1;
+    if (f->csub[j] != 0) {
+      f->cmaster[j] = (int32)vs_bits(b, 8);
+      if (f->cmaster[j] >= s->nbooks) { return AUDIO_E_DATA; }
+    }
+    for k in 0..8 { f->cbooks[j * 8 + k] = -1; }
+    for k in 0..(1 << f->csub[j]) {
+      var bk: int32 = (int32)vs_bits(b, 8) - 1;
+      if (bk >= s->nbooks) { return AUDIO_E_DATA; }
+      f->cbooks[j * 8 + k] = bk;
+    }
+  }
+  f->mult = (int32)vs_bits(b, 2) + 1;
+  var rb: int32 = (int32)vs_bits(b, 4);
+  f->x[0] = 0;
+  f->x[1] = 1 << rb;
+  var v: int32 = 2;
+  for j in 0..f->parts {
+    var cl: int32 = f->pclass[j];
+    for k in 0..f->cdim[cl] {
+      f->x[v] = (int32)vs_bits(b, rb);
+      v = v + 1;
+    }
+  }
+  if (b->over > 0) { return AUDIO_E_TRUNC; }
+  f->values = v;
+  if (v > s->max_floor) { s->max_floor = v; }
+  // order by x (insertion sort, at most 250 values); x must be unique
+  for j in 0..v { f->sorted[j] = j; }
+  for j in 1..v {
+    var t: int32 = f->sorted[j];
+    var i: int32 = j - 1;
+    while (i >= 0 && f->x[f->sorted[i]] > f->x[t]) {
+      f->sorted[i + 1] = f->sorted[i];
+      i = i - 1;
+    }
+    f->sorted[i + 1] = t;
+  }
+  for j in 1..v {
+    if (f->x[f->sorted[j]] == f->x[f->sorted[j - 1]]) { return AUDIO_E_DATA; }
+  }
+  // neighbours: the closest earlier values below and above
+  for j in 2..v {
+    var low: int32 = 0;
+    var high: int32 = 1;
+    var lx: int32 = -1;
+    var hx: int32 = 65536;
+    for i in 0..j {
+      if (f->x[i] > lx && f->x[i] < f->x[j]) { low = i; lx = f->x[i]; }
+      if (f->x[i] < hx && f->x[i] > f->x[j]) { high = i; hx = f->x[i]; }
+    }
+    f->lo[j] = low;
+    f->hi[j] = high;
+  }
+  return AUDIO_OK;
+}
+
+fn vs_residue(s: AudioVorbisSetup*, b: AudioBitsL*, r: AudioVorbisResidue*) -> int32 {
+  var kind: int64 = vs_bits(b, 16);
+  if (kind > 2) { return AUDIO_E_DATA; }
+  r->kind = (int32)kind;
+  r->begin = (int32)vs_bits(b, 24);
+  r->end = (int32)vs_bits(b, 24);
+  r->psize = (int32)vs_bits(b, 24) + 1;
+  r->nclass = (int32)vs_bits(b, 6) + 1;
+  r->classbook = (int32)vs_bits(b, 8);
+  if (b->over > 0) { return AUDIO_E_TRUNC; }
+  if (r->end < r->begin || r->classbook >= s->nbooks) { return AUDIO_E_DATA; }
+  var casc: int32[64];
+  for j in 0..r->nclass {
+    var low: int32 = (int32)vs_bits(b, 3);
+    var high: int32 = 0;
+    if (vs_bits(b, 1) != 0) { high = (int32)vs_bits(b, 5); }
+    casc[j] = high * 8 + low;
+  }
+  for j in 0..r->nclass {
+    for k in 0..8 {
+      r->books[j * 8 + k] = -1;
+      if ((casc[j] & (1 << k)) != 0) {
+        var bk: int32 = (int32)vs_bits(b, 8);
+        if (bk >= s->nbooks) { return AUDIO_E_DATA; }
+        r->books[j * 8 + k] = bk;
+      }
+    }
+  }
+  if (b->over > 0) { return AUDIO_E_TRUNC; }
+  // class numbers of each classbook entry, most significant first
+  var cb: AudioVorbisBook* = &s->books[r->classbook];
+  var cw: int64 = (int64)cb->dim;
+  if (cw < 1) { return AUDIO_E_DATA; }
+  r->classdata = vs_alloc(s, (int64)cb->used * cw);
+  if (r->classdata == 0 && cb->used > 0) { return AUDIO_E_LIMIT; }
+  for sl in 0..cb->used {
+    var t: int64 = (int64)cb->sym[sl];
+    var k: int64 = cw - 1;
+    while (k >= 0) {
+      r->classdata[(int64)sl * cw + k] = (uint8)(t % (int64)r->nclass);
+      t = t / (int64)r->nclass;
+      k = k - 1;
+    }
+  }
+  // partitions read per vector, for the scratch space
+  var size: int64 = (int64)s->bs[1] / 2;
+  if (kind == 2) { size = size * (int64)s->channels; }
+  var lb: int64 = (int64)r->begin;
+  var le: int64 = (int64)r->end;
+  if (lb > size) { lb = size; }
+  if (le > size) { le = size; }
+  var parts: int64 = (le - lb) / (int64)r->psize;
+  if (parts > (int64)s->max_parts) { s->max_parts = (int32)parts; }
+  return AUDIO_OK;
+}
+
+fn vs_mapping(s: AudioVorbisSetup*, b: AudioBitsL*, m: AudioVorbisMapping*) -> int32 {
+  if (vs_bits(b, 16) != 0) { return AUDIO_E_DATA; }
+  var ch: int32 = s->channels;
+  m->submaps = 1;
+  if (vs_bits(b, 1) != 0) { m->submaps = (int32)vs_bits(b, 4) + 1; }
+  m->steps = 0;
+  if (vs_bits(b, 1) != 0) {
+    m->steps = (int32)vs_bits(b, 8) + 1;
+    var cb: int32 = audio_vorbis_ilog((int64)(ch - 1));
+    for k in 0..m->steps {
+      var mg: int32 = (int32)vs_bits(b, cb);
+      var an: int32 = (int32)vs_bits(b, cb);
+      if (mg >= ch || an >= ch || mg == an) { return AUDIO_E_DATA; }
+      m->mag[k] = (uint8)mg;
+      m->ang[k] = (uint8)an;
+    }
+  }
+  if (vs_bits(b, 2) != 0) { return AUDIO_E_DATA; }
+  for j in 0..ch {
+    m->mux[j] = 0;
+    if (m->submaps > 1) {
+      m->mux[j] = (int32)vs_bits(b, 4);
+      if (m->mux[j] >= m->submaps) { return AUDIO_E_DATA; }
+    }
+  }
+  for j in 0..m->submaps {
+    vs_bits(b, 8);
+    m->floor[j] = (int32)vs_bits(b, 8);
+    m->residue[j] = (int32)vs_bits(b, 8);
+    if (m->floor[j] >= s->nfloors || m->residue[j] >= s->nres) { return AUDIO_E_DATA; }
+  }
+  if (b->over > 0) { return AUDIO_E_TRUNC; }
+  return AUDIO_OK;
+}
+
+// "vorbis" after the packet type byte.
+fn vs_magic(p: uint8*, n: int64, kind: int32) -> bool {
+  if (n < 7 || (int32)p[0] != kind) { return false; }
+  return p[1] == 'v' && p[2] == 'o' && p[3] == 'r' && p[4] == 'b' && p[5] == 'i' && p[6] == 's';
+}
+
+/// Reads the identification header. Fills channels, rate and block sizes.
+export fn audio_vorbis_parse_id(s: AudioVorbisSetup*, p: uint8*, n: int64) -> int32 {
+  if (!vs_magic(p, n, 1)) { return AUDIO_E_FORMAT; }
+  if (n < 30) { return AUDIO_E_TRUNC; }
+  var b: AudioBitsL;
+  audio_bitsl_init(&b, p + 7, n - 7);
+  var version: int64 = vs_bits(&b, 32);
+  var ch: int64 = vs_bits(&b, 8);
+  var rate: int64 = vs_bits(&b, 32);
+  vs_bits(&b, 32);
+  vs_bits(&b, 32);
+  vs_bits(&b, 32);
+  var b0: int32 = (int32)vs_bits(&b, 4);
+  var b1: int32 = (int32)vs_bits(&b, 4);
+  var framing: int64 = vs_bits(&b, 1);
+  if (version != 0 || ch == 0 || rate == 0 || rate > 0x7FFFFFFF) { return AUDIO_E_DATA; }
+  if (b0 < 6 || b0 > 13 || b1 < 6 || b1 > 13 || b0 > b1 || framing == 0) { return AUDIO_E_DATA; }
+  if (ch > 8) { return AUDIO_E_UNSUPPORTED; }
+  s->channels = (int32)ch;
+  s->rate = (int32)rate;
+  s->bs[0] = 1 << b0;
+  s->bs[1] = 1 << b1;
+  return AUDIO_OK;
+}
+
+/// True for a comment header.
+export fn audio_vorbis_is_comment(p: uint8*, n: int64) -> bool {
+  return vs_magic(p, n, 3);
+}
+
+/// Reads the setup header (after audio_vorbis_parse_id).
+export fn audio_vorbis_parse_setup(s: AudioVorbisSetup*, p: uint8*, n: int64) -> int32 {
+  if (!vs_magic(p, n, 5)) { return AUDIO_E_DATA; }
+  var b: AudioBitsL;
+  audio_bitsl_init(&b, p + 7, n - 7);
+  var bp: AudioBitsL* = &b;
+  var rc: int32 = AUDIO_OK;
+  // codebooks
+  s->nbooks = (int32)vs_bits(bp, 8) + 1;
+  s->books = (AudioVorbisBook*)vs_alloc(s, (int64)s->nbooks * sizeof(AudioVorbisBook));
+  if (s->books == 0) { return AUDIO_E_MEM; }
+  for i in 0..s->nbooks {
+    rc = vs_book(s, bp, &s->books[i]);
+    if (rc != AUDIO_OK) { return rc; }
+  }
+  // time domain transforms: placeholders that must be zero
+  var nt: int32 = (int32)vs_bits(bp, 6) + 1;
+  for i in 0..nt {
+    if (vs_bits(bp, 16) != 0) { return AUDIO_E_DATA; }
+  }
+  s->nfloors = (int32)vs_bits(bp, 6) + 1;
+  s->floors = (AudioVorbisFloor*)vs_alloc(s, (int64)s->nfloors * sizeof(AudioVorbisFloor));
+  if (s->floors == 0) { return AUDIO_E_MEM; }
+  for i in 0..s->nfloors {
+    rc = vs_floor(s, bp, &s->floors[i]);
+    if (rc != AUDIO_OK) { return rc; }
+  }
+  s->nres = (int32)vs_bits(bp, 6) + 1;
+  s->res = (AudioVorbisResidue*)vs_alloc(s, (int64)s->nres * sizeof(AudioVorbisResidue));
+  if (s->res == 0) { return AUDIO_E_MEM; }
+  for i in 0..s->nres {
+    rc = vs_residue(s, bp, &s->res[i]);
+    if (rc != AUDIO_OK) { return rc; }
+  }
+  s->nmaps = (int32)vs_bits(bp, 6) + 1;
+  s->maps = (AudioVorbisMapping*)vs_alloc(s, (int64)s->nmaps * sizeof(AudioVorbisMapping));
+  if (s->maps == 0) { return AUDIO_E_MEM; }
+  for i in 0..s->nmaps {
+    rc = vs_mapping(s, bp, &s->maps[i]);
+    if (rc != AUDIO_OK) { return rc; }
+  }
+  s->nmodes = (int32)vs_bits(bp, 6) + 1;
+  for i in 0..s->nmodes {
+    s->modes[i].blockflag = (int32)vs_bits(bp, 1);
+    var wt: int64 = vs_bits(bp, 16);
+    var tt: int64 = vs_bits(bp, 16);
+    s->modes[i].mapping = (int32)vs_bits(bp, 8);
+    if (wt != 0 || tt != 0 || s->modes[i].mapping >= s->nmaps) { return AUDIO_E_DATA; }
+  }
+  if (vs_bits(bp, 1) != 1) { return AUDIO_E_DATA; }   // framing bit
+  if (b.over > 0) { return AUDIO_E_TRUNC; }
+  s->mode_bits = audio_vorbis_ilog((int64)(s->nmodes - 1));
+  return AUDIO_OK;
+}

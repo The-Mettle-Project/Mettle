@@ -1,0 +1,251 @@
+// raize/server — the worker pool and the public entry points.
+//
+// Concurrency model, stated once so nobody looks for an event loop:
+//
+//   * `opts.workers` threads are created at startup. Every one of them blocks
+//     in accept() on the *same* listening fd. That is safe because accept() on
+//     a shared fd is a kernel operation: exactly one thread is woken per
+//     connection. Mettle has no poll/select/epoll (notes/04-net-web.md §6), so
+//     this is not an optimisation, it is the only model available.
+//   * While a worker is serving a connection it is not accepting. With W
+//     workers, at most W requests are in flight; the kernel's accept queue
+//     (opts.backlog) holds the rest, and beyond that the kernel refuses the
+//     connection. There is no user-space queue and no 503-on-overload logic,
+//     because a queue you cannot drain without an event loop is just a longer
+//     stall. Size the backlog for your burst, or run more workers.
+//   * Every accepted socket gets SO_RCVTIMEO/SO_SNDTIMEO = opts.read_timeout_ms
+//     before a single byte is read. A stalled client costs one worker for at
+//     most that long, then the connection is closed and the worker accepts
+//     again.
+//   * Threads are joined, never detached: thread_close on a running thread
+//     leaks its 1 MiB stack (notes/issues/02-thread-close-detach-leak.md).
+//   * Shutdown is `rz_server_stop`: set the flag, then close the listening fd.
+//     A worker blocked in accept() sees accept() = -1 and returns; a worker in
+//     a connection finishes it first (bounded by the keep-alive and read
+//     timeouts).
+//
+// The handler contract the router implements:
+//
+//     export fn rz_router_handle(ctx: RzContext*) -> int32
+//
+//   return 0   -> the handler built a response in ctx->resp (status, headers,
+//                 body); the server writes it
+//   return !=0 -> the handler failed; if it also built nothing, the server
+//                 answers 500 instead of an empty 200
+//
+//   Build responses with rz_ctx_text / rz_ctx_json / rz_ctx_html /
+//   rz_ctx_empty / rz_ctx_redirect (framework/context/context.mettle), or set
+//   ctx->resp->status and headers yourself. Do not write to the socket; the
+//   server owns it. A header set from the handler is copied into the request
+//   arena, so it is safe to build a value in a stack buffer.
+
+import "std/io";
+import "std/mem";
+import "std/net";
+import "std/thread";
+import "../str/str";
+import "../context/context";
+import "../context/date";
+import "types";
+import "listener";
+import "conn";
+
+// Creates the server. The handler is installed separately with
+// rz_server_set_handler, because the router (which the handler wraps) is built
+// after the server in every app: opts first, then the dependency.
+export fn rz_server_new(opts: RzServerOpts) -> RzServer* {
+  var srv: RzServer* = (RzServer*)calloc(1, sizeof(RzServer));
+  if (srv == 0) { return 0; }
+  srv->listen_fd = -1;
+  srv->handler = 0;
+  srv->opts = opts;
+  srv->stop = 0;
+  srv->last_error = 0;
+  rz_server_stats_reset(&srv->stats);
+  return srv;
+}
+
+// The one slot the router (or a middleware chain wrapping it) fills. Must be
+// `fn(ctx: RzContext*) -> int32`; see the contract at the top of this file.
+export fn rz_server_set_handler(srv: RzServer*, handler: fn(RzContext*) -> int32) -> int32 {
+  if (srv == 0) { return -1; }
+  if (handler == 0) { return -1; }
+  srv->handler = handler;
+  return 0;
+}
+
+export fn rz_server_free(srv: RzServer*) {
+  if (srv == 0) { return; }
+  if (srv->listen_fd >= 0) {
+    rz_listener_close(srv->listen_fd);
+    srv->listen_fd = -1;
+  }
+  free((rawptr)srv);
+}
+
+export fn rz_server_listen_fd(srv: RzServer*) -> int64 {
+  if (srv == 0) { return -1; }
+  return srv->listen_fd;
+}
+
+export fn rz_server_stats(srv: RzServer*) -> RzServerStats {
+  var s: RzServerStats;
+  rz_server_stats_reset(&s);
+  if (srv == 0) { return s; }
+  s = srv->stats;
+  return s;
+}
+
+export fn rz_server_last_error(srv: RzServer*) -> int32 {
+  if (srv == 0) { return -1; }
+  return srv->last_error;
+}
+
+// Sets the stop flag and closes the listener, which is what wakes a worker
+// blocked in accept(). Idempotent and safe to call from another thread.
+export fn rz_server_stop(srv: RzServer*) {
+  if (srv == 0) { return; }
+  atomic_exchange_i32(&srv->stop, 1);
+  if (srv->listen_fd >= 0) {
+    rz_listener_close(srv->listen_fd);
+    srv->listen_fd = -1;
+  }
+}
+
+/// internal: server (CreateThread needs a plain function value). One worker: accept
+/// (recording the peer's IPv4 address), serve, close, repeat.
+/// in:      arg the RzServer*
+/// returns: the number of connections served
+/// owns:    each accepted socket until it is closed or detached
+export fn rz_worker_main(arg: cstring) -> uint32 {
+  var srv: RzServer* = (RzServer*)arg;
+  if (srv == 0) { return 1; }
+  var served: int64 = 0;
+  while (true) {
+    if (srv->stop != 0) { break; }
+    // sockaddr_in: family(2) port(2) addr(4) zero(8); the address bytes are a.b.c.d.
+    var addr: uint8[16];
+    var addrlen: int32 = 16;
+    var fd: int64 = accept(srv->listen_fd, (cstring)&addr[0], (cstring)&addrlen);
+    if (fd < 0) { break; }   // listener closed (or a signal interrupted us)
+    var peer: uint32 = 0;
+    if (addrlen >= 8 && addr[0] == 2) { peer = *(uint32*)&addr[4]; }   // AF_INET
+    // Timeouts first: a socket with no SO_RCVTIMEO is a worker pinned forever
+    // by one client.
+    rz_set_recv_timeout(fd, srv->opts.read_timeout_ms);
+    rz_set_send_timeout(fd, srv->opts.read_timeout_ms);
+    atomic_inc_i32(&srv->stats.conns);
+    var active: int32 = atomic_inc_i32(&srv->stats.active);
+    if (active > srv->stats.peak_active) {
+      // Best effort: a lost update on a peak watermark is harmless.
+      srv->stats.peak_active = active;
+    }
+    var w: int64 = rz_conn_serve(srv, fd, peer);
+    if (w == RZ_CONN_DETACHED) {
+      // Upgraded: the socket now belongs to the hub (framework/hub).
+      atomic_dec_i32(&srv->stats.active);
+      served = served + 1;
+      continue;
+    }
+    shutdown(fd, SD_SEND());
+    closesocket(fd);
+    atomic_dec_i32(&srv->stats.active);
+    if (w < 0) {
+      atomic_inc_i32(&srv->stats.write_errors);
+    }
+    served = served + 1;
+  }
+  return (uint32)served;
+}
+
+// Runs only after every worker has been joined (or when none was created).
+// The write is behind a call because M0122 is intra-procedural and cannot see
+// that no task is alive any more; passing `srv` itself would be flagged as a
+// concurrent write to a task argument.
+fn rz_server_mark_stopped(srv: RzServer*) {
+  if (srv == 0) { return; }
+  srv->listen_fd = -1;
+}
+
+/// internal: app/run, server. Binds and listens on opts.port, so a bind failure is
+/// known before anything is printed or started (A4). Clears a stop requested earlier.
+/// in:      srv the server
+/// returns: 0 bound; -1 bind/listen failed (errno in rz_server_last_error)
+/// owns:    the listening socket belongs to `srv` (closed by stop or free)
+export fn rz_server_bind(srv: RzServer*) -> int32 {
+  if (srv == 0) { return -1; }
+  var err: int32 = 0;
+  var fd: int64 = rz_listen(srv->opts.port, srv->opts.backlog, &err);
+  if (fd < 0) {
+    srv->last_error = err;
+    return -1;
+  }
+  srv->listen_fd = fd;
+  srv->stop = 0;
+  return 0;
+}
+
+/// internal: app/run, server. Spawns the workers on the socket rz_server_bind made
+/// and blocks until they have all been joined (after rz_server_stop).
+/// in:      srv a bound server with a handler
+/// returns: 0 after a clean stop; -2 no worker thread could be created;
+///          -3 no handler; -4 not bound (or stopped before serving)
+/// owns:    nothing new
+export fn rz_server_serve(srv: RzServer*) -> int32 {
+  if (srv == 0) { return -1; }
+  if (srv->handler == 0) { return -3; }   // a server with nobody to answer
+  if (srv->listen_fd < 0 || srv->stop != 0) { return -4; }
+  var fd: int64 = srv->listen_fd;
+
+  var workers: int32 = srv->opts.workers;
+  if (workers < 1) { workers = 1; }
+  if (workers > RZ_MAX_WORKERS) { workers = RZ_MAX_WORKERS; }
+
+  // Handles live on this frame, not in RzServer: the workers are given `srv`,
+  // and the task rules refuse a write through a pointer after it was handed
+  // over (M0122). A local handle array is exactly what "join every thread you
+  // start" wants anyway. The literal 64 is RZ_MAX_WORKERS.
+  var handles: int64[64];
+  var nthreads: int32 = 0;
+  var i: int32 = 0;
+  while (i < workers) {
+    var h: int64 = CreateThread(0, 0, &rz_worker_main, (cstring)srv, 0, 0);
+    if (h <= 0) { break; }
+    handles[nthreads] = h;
+    nthreads = nthreads + 1;
+    i = i + 1;
+  }
+  if (nthreads == 0) {
+    rz_listener_close(fd);
+    rz_server_mark_stopped(srv);
+    return -2;
+  }
+
+  // Join every thread. Nothing here may detach: thread_close on a running
+  // thread leaks its stack, and a leak per worker is a leak per restart.
+  i = 0;
+  while (i < nthreads) {
+    thread_join_infinite(handles[i]);
+    thread_close(handles[i]);
+    i = i + 1;
+  }
+  if (srv->listen_fd >= 0) {
+    rz_listener_close(srv->listen_fd);
+    rz_server_mark_stopped(srv);
+  }
+  return 0;
+}
+
+/// internal: examples that predate rz_run (rz_run itself calls rz_server_bind and
+/// rz_server_serve). Binds, spawns the workers, joins them. Blocks for the life of
+/// the server: stop it from another thread with rz_server_stop.
+/// in:      srv the server, with a handler
+/// returns: 0 after a stop; -1 bind/listen failed (see rz_server_last_error); -2 no
+///          worker thread could be created; -3 no handler
+/// owns:    nothing new
+export fn rz_server_run(srv: RzServer*) -> int32 {
+  if (srv == 0) { return -1; }
+  if (srv->handler == 0) { return -3; }
+  if (rz_server_bind(srv) != 0) { return -1; }
+  return rz_server_serve(srv);
+}

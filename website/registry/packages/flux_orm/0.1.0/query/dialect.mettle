@@ -1,0 +1,95 @@
+// flux_orm/query/dialect.mettle — the SQL text flavour, as a value.
+//
+// One dialect ships: "meodb". It is a value rather than a pile of string
+// literals so the text builder has exactly one place that knows what a quoted
+// identifier and a placeholder look like, and so a store's differences (does
+// it spell LIMIT that way?) live here and not in the builder.
+//
+// Byte-equality contract: `rc_dialect_ident(rc_dialect_default(), b, s)` must
+// produce exactly the same bytes as `rc_buf_ident(b, s)`. Routing every
+// identifier through the dialect is a refactor, not a behaviour change, and
+// tests/t_query.mettle asserts that equality on a plain name, a name with an
+// embedded double quote, the empty string, and a name with a backslash.
+//
+// `quote` is one *character*, not a string: it is the opening delimiter, and an
+// embedded delimiter is doubled. That is the SQL standard rule and it is what
+// core/buf already does.
+
+import "../core/status";
+import "../core/buf";
+
+// How a store spells identifiers, placeholders and LIMIT. Get one from
+// rc_dialect_default; the strings are borrowed (static literals there).
+export struct RcDialect {
+  name: string;        // "meodb"
+  quote: string;       // "\""
+  placeholder: string; // "?"
+  has_limit: bool;     // true — the store understands literal LIMIT n
+}
+
+// The one shipped dialect, "meodb": double-quoted identifiers, `?`
+// placeholders, literal LIMIT. Every query starts with it.
+// Returns the dialect by value; it owns nothing and needs no free.
+export fn rc_dialect_default() -> RcDialect {
+  var d: RcDialect;
+  d.name = "meodb";
+  d.quote = "\"";
+  d.placeholder = "?";
+  d.has_limit = true;
+  return d;
+}
+
+// The dialect's name, e.g. "meodb".
+//   d   the dialect
+// Returns d.name, a borrowed view with d's lifetime.
+export fn rc_dialect_name(d: RcDialect) -> string { return d.name; }
+
+// The opening delimiter byte. A dialect with an empty `quote` falls back to the
+// double quote rather than emitting an unquoted identifier: refusing to quote
+// is how a column name becomes SQL.
+fn rc_dialect_quote_char(d: RcDialect) -> uint8 {
+  if (d.quote.length == (uint64)0) { return (uint8)34; }
+  if (d.quote.chars == 0) { return (uint8)34; }
+  return d.quote.chars[0];
+}
+
+// Appends `name` to b as a quoted identifier: the quote byte, the name with
+// each embedded quote byte doubled, the quote byte. With the default dialect
+// the bytes equal rc_buf_ident's. An empty name gives `""`.
+//   d     the dialect; only the first byte of d.quote is used, '"' when empty
+//   b     the buffer to append to; borrowed
+//   name  the identifier; borrowed, copied into b
+// Returns RC_OK. RC_ERR_USAGE when b is 0 or name has a length but no bytes.
+// RC_ERR_NOMEM when b cannot grow; b then holds a partial identifier, so the
+// caller rolls back its length (the builder does).
+export fn rc_dialect_ident(d: RcDialect, b: RcBuf*, name: string) -> int32 {
+  if (b == 0) { return RC_ERR_USAGE; }
+  if (name.length > (uint64)0 && name.chars == 0) { return RC_ERR_USAGE; }
+  var q: uint8 = rc_dialect_quote_char(d);
+  var rc: int32 = rc_buf_putc(b, q);
+  if (rc != RC_OK) { return rc; }
+  var i: int64 = 0;
+  var n: int64 = (int64)name.length;
+  while (i < n) {
+    var c: uint8 = name.chars[i];
+    if (c == q) {
+      rc = rc_buf_putc(b, q);
+      if (rc != RC_OK) { return rc; }
+    }
+    rc = rc_buf_putc(b, c);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return rc_buf_putc(b, q);
+}
+
+// Appends the dialect's placeholder (`?` for meodb) to b.
+//   d   the dialect
+//   b   the buffer to append to; borrowed
+// Returns RC_OK. RC_ERR_USAGE when b is 0 or d.placeholder is empty.
+// RC_ERR_NOMEM when b cannot grow.
+export fn rc_dialect_placeholder(d: RcDialect, b: RcBuf*) -> int32 {
+  if (b == 0) { return RC_ERR_USAGE; }
+  if (d.placeholder.length == (uint64)0) { return RC_ERR_USAGE; }
+  return rc_buf_put(b, d.placeholder);
+}

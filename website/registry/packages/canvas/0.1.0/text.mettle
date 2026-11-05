@@ -1,0 +1,3 @@
+// canvas/text: everything in canvas/canvas, plus drawing text with font.
+import "canvas/canvas";
+import "canvas/draw/text";

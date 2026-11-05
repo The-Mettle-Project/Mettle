@@ -1,0 +1,222 @@
+// Message framing and compression.
+//
+// On an HTTP/2 stream each gRPC message is a 5-byte prefix (a compressed
+// flag and a big-endian 32-bit length) and the message bytes
+// (doc/PROTOCOL-HTTP2.md, "Length-Prefixed-Message"). A message may be
+// compressed with the stream's grpc-encoding (doc/compression.md); this
+// file supports identity, gzip and deflate (zlib format), through Press.
+//
+// The deframer takes DATA bytes in any pieces and hands back whole
+// messages, decompressed, refusing anything bigger than its limit before
+// it is buffered or inflated.
+import "std/mem";
+import "press/core/status";
+import "press/core/buf";
+import "press/deflate/wrap";
+import "grpc/status";
+
+export const GRPC_ENC_IDENTITY = 0;
+export const GRPC_ENC_GZIP = 1;
+export const GRPC_ENC_DEFLATE = 2;
+
+export const GRPC_DEFAULT_MAX_RECV: int64 = 4194304;   // 4 MiB, as grpc-go and grpc-java
+
+// The encoding a grpc-encoding value names, or -1 if not supported.
+export fn grpc_encoding_parse(name: string) -> int32 {
+  if (name == "identity") { return GRPC_ENC_IDENTITY; }
+  if (name == "gzip") { return GRPC_ENC_GZIP; }
+  if (name == "deflate") { return GRPC_ENC_DEFLATE; }
+  return -1;
+}
+
+export fn grpc_encoding_name(enc: int32) -> string {
+  if (enc == GRPC_ENC_GZIP) { return "gzip"; }
+  if (enc == GRPC_ENC_DEFLATE) { return "deflate"; }
+  return "identity";
+}
+
+// The grpc-accept-encoding value this library sends.
+export const GRPC_ACCEPT_ENCODING: string = "gzip,deflate";
+
+// True if a grpc-accept-encoding value lists enc. identity is always
+// accepted.
+export fn grpc_accept_has(value: string, enc: int32) -> bool {
+  if (enc == GRPC_ENC_IDENTITY) { return true; }
+  var want: string = grpc_encoding_name(enc);
+  var start: int64 = 0;
+  var n: int64 = (int64)value.length;
+  for i in 0..n + 1 {
+    if (i == n || value.chars[i] == 44) {
+      var a: int64 = start;
+      var b: int64 = i;
+      while (a < b && (value.chars[a] == 32 || value.chars[a] == 9)) { a = a + 1; }
+      while (b > a && (value.chars[b - 1] == 32 || value.chars[b - 1] == 9)) { b = b - 1; }
+      if (b - a == (int64)want.length) {
+        var same: bool = true;
+        for k in 0..b - a {
+          if (value.chars[a + k] != want.chars[k]) { same = false; }
+        }
+        if (same) { return true; }
+      }
+      start = i + 1;
+    }
+  }
+  return false;
+}
+
+fn put_prefix(p: uint8*, n: int64, compressed: bool) {
+  if (compressed) { p[0] = 1; } else { p[0] = 0; }
+  p[1] = (uint8)((n >> 24) & 255);
+  p[2] = (uint8)((n >> 16) & 255);
+  p[3] = (uint8)((n >> 8) & 255);
+  p[4] = (uint8)(n & 255);
+}
+
+// Appends one framed message to out. With compress set and an encoding
+// other than identity the body is compressed, unless that makes it no
+// smaller, in which case it goes out plain (the flag allows either).
+// Returns GRPC_OK, or GRPC_RESOURCE_EXHAUSTED for a message over 4 GiB,
+// or GRPC_INTERNAL if compression fails.
+export fn grpc_frame(p: uint8*, n: int64, enc: int32, compress: bool, out: PressBuf*) -> int32 {
+  if (n < 0 || n > 4294967295) { return GRPC_RESOURCE_EXHAUSTED; }
+  var start: int64 = out->len;
+  if (compress && enc != GRPC_ENC_IDENTITY && n > 0) {
+    if (press_buf_reserve(out, 5) != PRESS_OK) { return GRPC_RESOURCE_EXHAUSTED; }
+    out->len = start + 5;
+    var rc: int32 = PRESS_OK;
+    if (enc == GRPC_ENC_GZIP) {
+      rc = press_gzip_compress(p, n, -1, out);
+    } else {
+      rc = press_zlib_compress(p, n, -1, out);
+    }
+    if (rc != PRESS_OK) {
+      out->len = start;
+      return GRPC_INTERNAL;
+    }
+    var clen: int64 = out->len - start - 5;
+    if (clen < n) {
+      put_prefix(out->data + start, clen, true);
+      return GRPC_OK;
+    }
+    out->len = start;
+  }
+  if (press_buf_reserve(out, n + 5) != PRESS_OK) { return GRPC_RESOURCE_EXHAUSTED; }
+  put_prefix(out->data + start, n, false);
+  if (n > 0) { memcpy(out->data + start + 5, p, n); }
+  out->len = start + 5 + n;
+  return GRPC_OK;
+}
+
+export const GRPC_DF_MORE = 0;      // need more bytes
+export const GRPC_DF_MESSAGE = 1;   // a message is ready
+export const GRPC_DF_ERROR = 2;     // the stream is broken: end the call with d.code
+
+// One message handed back by the deframer; the bytes stay valid until the
+// next call on it.
+export struct GrpcMsg {
+  data: uint8*;
+  len: int64;
+  was_compressed: bool;
+}
+
+export struct GrpcDeframer {
+  buf: PressBuf;       // bytes not yet handed out
+  off: int64;          // where the next prefix starts in buf
+  plain: PressBuf;     // the last inflated message
+  max_message: int64;  // after decompression
+  enc: int32;          // the stream's grpc-encoding
+  code: int32;         // after GRPC_DF_ERROR
+  message: string;
+}
+
+export fn grpc_deframer_init(d: GrpcDeframer*, max_message: int64, enc: int32) {
+  var z: PressBuf;
+  d->buf = z;
+  d->plain = z;
+  d->off = 0;
+  d->max_message = max_message;
+  if (max_message <= 0) { d->max_message = GRPC_DEFAULT_MAX_RECV; }
+  d->enc = enc;
+  d->code = GRPC_OK;
+}
+
+export fn grpc_deframer_free(d: GrpcDeframer*) {
+  press_buf_free(&d->buf);
+  press_buf_free(&d->plain);
+}
+
+fn fail(d: GrpcDeframer*, code: int32, msg: string) -> int32 {
+  d->code = code;
+  d->message = msg;
+  return GRPC_DF_ERROR;
+}
+
+// Adds DATA bytes. Returns GRPC_OK, or an error code (also kept in d->code).
+export fn grpc_deframer_feed(d: GrpcDeframer*, p: uint8*, n: int64) -> int32 {
+  if (d->code != GRPC_OK) { return d->code; }
+  // Drop what has been handed out before growing.
+  if (d->off > 0) {
+    var keep: int64 = d->buf.len - d->off;
+    if (keep > 0) { memmove(d->buf.data, d->buf.data + d->off, keep); }
+    d->buf.len = keep;
+    d->off = 0;
+  }
+  if (n <= 0) { return GRPC_OK; }
+  if (press_buf_append(&d->buf, p, n) != PRESS_OK) {
+    fail(d, GRPC_RESOURCE_EXHAUSTED, "out of memory for message");
+    return d->code;
+  }
+  return GRPC_OK;
+}
+
+// The next whole message, if one is buffered.
+export fn grpc_deframer_next(d: GrpcDeframer*, m: GrpcMsg*) -> int32 {
+  if (d->code != GRPC_OK) { return GRPC_DF_ERROR; }
+  var have: int64 = d->buf.len - d->off;
+  if (have < 5) { return GRPC_DF_MORE; }
+  var h: uint8* = d->buf.data + d->off;
+  if (h[0] > 1) { return fail(d, GRPC_INTERNAL, "bad compressed flag"); }
+  var len: int64 = ((int64)h[1] << 24) | ((int64)h[2] << 16) | ((int64)h[3] << 8) | (int64)h[4];
+  var compressed: bool = h[0] == 1;
+  // A plain message over the limit can be refused at once. A compressed
+  // one is only refused if its compressed form alone is too big.
+  if (len > d->max_message) {
+    return fail(d, GRPC_RESOURCE_EXHAUSTED, "message larger than max");
+  }
+  if (have < 5 + len) { return GRPC_DF_MORE; }
+  var body: uint8* = h + 5;
+  d->off = d->off + 5 + len;
+  m->was_compressed = compressed;
+  if (!compressed) {
+    m->data = body;
+    m->len = len;
+    return GRPC_DF_MESSAGE;
+  }
+  if (d->enc == GRPC_ENC_IDENTITY) {
+    return fail(d, GRPC_INTERNAL, "compressed message without grpc-encoding");
+  }
+  press_buf_clear(&d->plain);
+  press_buf_limit(&d->plain, d->max_message);
+  var rc: int32 = PRESS_OK;
+  if (d->enc == GRPC_ENC_GZIP) {
+    rc = press_gzip_decompress(body, len, &d->plain);
+  } else {
+    rc = press_zlib_decompress(body, len, &d->plain);
+  }
+  if (rc == PRESS_E_LIMIT) { return fail(d, GRPC_RESOURCE_EXHAUSTED, "decompressed message larger than max"); }
+  if (rc != PRESS_OK) { return fail(d, GRPC_INTERNAL, "cannot decompress message"); }
+  m->data = d->plain.data;
+  m->len = d->plain.len;
+  return GRPC_DF_MESSAGE;
+}
+
+// At the end of the stream: GRPC_OK, or GRPC_INTERNAL if part of a
+// message is left over.
+export fn grpc_deframer_finish(d: GrpcDeframer*) -> int32 {
+  if (d->code != GRPC_OK) { return d->code; }
+  if (d->buf.len - d->off != 0) {
+    fail(d, GRPC_INTERNAL, "stream ended inside a message");
+    return d->code;
+  }
+  return GRPC_OK;
+}

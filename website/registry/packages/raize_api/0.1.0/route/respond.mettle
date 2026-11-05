@@ -1,0 +1,90 @@
+// raize_api/route/respond: what handlers send.
+//
+//   return rapi_json(r, 200, Task_rapi(), (rawptr)&task);
+//   return rapi_created(r, "/api/v1/tasks/7", Task_rapi(), (rawptr)&task);
+//   return rapi_fail(r, 404, "no task 7");
+//
+// JSON goes through Codec's writer. Bodies are copied into the request arena.
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "codec/core/buf";
+import "codec/core/status";
+import "codec/json/write";
+import "../types/type";
+import "../types/encode";
+import "../problem/problem";
+import "api";
+
+fn rapi__mask_for(r: RapiReq*, t: RapiType*) -> int64 {
+  if (r->mask_type != 0 && r->mask_type == t) { return r->mask; }
+  return -1;
+}
+
+fn rapi__send_buf(r: RapiReq*, status: int32, ct: string, b: CodecBuf*, rc: int32) -> int32 {
+  if (rc != CODEC_OK) {
+    codec_buf_free(b);
+    return rapi_problem(r->ctx, 500, "");
+  }
+  var body: string = rz_arena_str(r->ctx->arena, codec_buf_view(b));
+  codec_buf_free(b);
+  return rz_ctx_bytes(r->ctx, status, ct, body);
+}
+
+/// Sends `v` (a struct described by `t`) as JSON with `status`.
+export fn rapi_json(r: RapiReq*, status: int32, t: RapiType*, v: rawptr) -> int32 {
+  var b: CodecBuf;
+  codec_buf_init(&b, 256);
+  var w: CodecJson;
+  codec_json_init_flags(&w, &b, CODEC_JSON_LOSSY_UTF8);
+  rapi_encode_into(&w, t, v, rapi__mask_for(r, t));
+  return rapi__send_buf(r, status, RZ_CT_JSON, &b, codec_json_finish(&w));
+}
+
+/// Sends `n` structs of type `t`, back to back at `items`, as a JSON array.
+export fn rapi_json_list(r: RapiReq*, status: int32, t: RapiType*, items: rawptr, n: int64) -> int32 {
+  var b: CodecBuf;
+  codec_buf_init(&b, 1024);
+  var w: CodecJson;
+  codec_json_init_flags(&w, &b, CODEC_JSON_LOSSY_UTF8);
+  rapi_encode_list_into(&w, t, items, n, rapi__mask_for(r, t));
+  return rapi__send_buf(r, status, RZ_CT_JSON, &b, codec_json_finish(&w));
+}
+
+/// Sends text that is already JSON.
+export fn rapi_json_text(r: RapiReq*, status: int32, json: string) -> int32 {
+  return rz_ctx_bytes(r->ctx, status, RZ_CT_JSON, rz_arena_str(r->ctx->arena, json));
+}
+
+/// Builds the body yourself with Codec's writer: start with rapi_writer_begin, write
+/// one value, then rapi_writer_send.
+export fn rapi_writer_begin(b: CodecBuf*, w: CodecJson*) {
+  codec_buf_init(b, 1024);
+  codec_json_init_flags(w, b, CODEC_JSON_LOSSY_UTF8);
+}
+
+/// Sends what the writer holds (and frees the buffer).
+export fn rapi_writer_send(r: RapiReq*, status: int32, b: CodecBuf*, w: CodecJson*) -> int32 {
+  return rapi__send_buf(r, status, RZ_CT_JSON, b, codec_json_finish(w));
+}
+
+/// 201 Created with a Location header and the new resource.
+export fn rapi_created(r: RapiReq*, location: string, t: RapiType*, v: rawptr) -> int32 {
+  rz_ctx_set_header(r->ctx, "Location", location);
+  return rapi_json(r, 201, t, v);
+}
+
+/// 204 No Content.
+export fn rapi_no_content(r: RapiReq*) -> int32 {
+  return rz_ctx_empty(r->ctx, 204);
+}
+
+/// A problem-details response with `status` and `detail` ("" to leave out).
+export fn rapi_fail(r: RapiReq*, status: int32, detail: string) -> int32 {
+  return rapi_problem(r->ctx, status, detail);
+}
+
+/// Sets a response header.
+export fn rapi_set_header(r: RapiReq*, name: string, value: string) {
+  rz_ctx_set_header(r->ctx, name, value);
+}

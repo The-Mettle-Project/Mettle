@@ -1,0 +1,174 @@
+// mythic_raster_shadow: gaussian rounded-rect shadows (DECISIONS §6, DESIGN-SYSTEM §5).
+// Analytic form (Evan Wallace): erf along x of each shape row, gaussian integrated along y,
+// sigma = blur / 2. Results are cached as float alpha tables:
+// - kind 1: corner tile of a quarter-plane with a rounded corner (canonical top-left
+//   orientation; the renderer mirrors it), key (radius, sigma, x frac, y frac);
+// - kind 2: 1-D edge profile Phi(u / sigma) around an edge, key (sigma, frac);
+// - kind 3: whole bitmap of a small shape (too small for the nine-slice), key = its geometry.
+// Shape edges are snapped to 1/4 device px so fractional positions share entries.
+import "mythic_types";
+
+export struct MythicShadowTab { w: int32; h: int32; a: float32*; }
+export struct MythicShadowCache { map: MythicMap<MythicShadowTab>; bytes: int64; }
+
+// Geometry of the shadow shape after offset and spread (device px, edges on 1/4 px).
+export struct MythicSShape { x0: float32; y0: float32; x1: float32; y1: float32; tl: float32; tr: float32; br: float32; bl: float32; }
+
+export const MYTHIC_SHADOW_CACHE_MAX: int64 = 48 * 1024 * 1024;
+
+/// Outward margin (whole px) of the alpha tables for `sigma`.
+export fn mythic_shadow_margin(sigma: float32) -> int32 { return (int32)mythic_ceilf(3.0 * sigma) + 1; }
+
+fn row_extent(s: MythicSShape*, y: float32, xl: float32*, xr: float32*) -> bool {
+  if (y <= s->y0 || y >= s->y1) { return false; }
+  var l: float32 = s->x0;
+  var r: float32 = s->x1;
+  if (y < s->y0 + s->tl) {
+    var d: float32 = s->y0 + s->tl - y;
+    l = s->x0 + s->tl - mythic_sqrtf(mythic_maxf(s->tl * s->tl - d * d, 0.0));
+  } else if (y > s->y1 - s->bl) {
+    var d2: float32 = y - (s->y1 - s->bl);
+    l = s->x0 + s->bl - mythic_sqrtf(mythic_maxf(s->bl * s->bl - d2 * d2, 0.0));
+  }
+  if (y < s->y0 + s->tr) {
+    var d3: float32 = s->y0 + s->tr - y;
+    r = s->x1 - s->tr + mythic_sqrtf(mythic_maxf(s->tr * s->tr - d3 * d3, 0.0));
+  } else if (y > s->y1 - s->br) {
+    var d4: float32 = y - (s->y1 - s->br);
+    r = s->x1 - s->br + mythic_sqrtf(mythic_maxf(s->br * s->br - d4 * d4, 0.0));
+  }
+  *xl = l; *xr = r;
+  return r > l;
+}
+
+/// Shadow alpha (0..1) of the rounded shape at point (px, py) for gaussian `sigma` > 0.
+export fn mythic_shadow_eval(s: MythicSShape*, sigma: float32, px: float32, py: float32) -> float32 {
+  var ext: float32 = 3.0 * sigma;
+  var ya: float32 = mythic_maxf(py - ext, s->y0);
+  var yb: float32 = mythic_minf(py + ext, s->y1);
+  if (yb <= ya) { return 0.0; }
+  var N: int32 = 24;
+  var step: float32 = (yb - ya) / (float32)N;
+  var inv: float64 = 1.0 / ((float64)sigma * 1.4142135623730951);
+  var k2: float64 = -1.0 / (2.0 * (float64)sigma * (float64)sigma);
+  var sum: float64 = 0.0;
+  for i: int32 in 0..N {
+    var y: float32 = ya + ((float32)i + 0.5) * step;
+    var xl: float32 = 0.0; var xr: float32 = 0.0;
+    if (!row_extent(s, y, &xl, &xr)) { continue; }
+    var t: float64 = (float64)(y - py);
+    var w: float64 = (float64)mythic_expf((float32)(t * t * k2));
+    var e0: float32 = mythic_erff((float32)((float64)(px - xl) * inv));
+    var e1: float32 = mythic_erff((float32)((float64)(px - xr) * inv));
+    sum = sum + w * 0.5 * (float64)(e0 - e1);
+  }
+  var v: float64 = sum * (float64)step / ((float64)sigma * 2.5066282746310002 * 0.9973002);
+  if (v > 1.0) { v = 1.0; }
+  if (v < 0.0) { v = 0.0; }
+  return (float32)v;
+}
+
+fn put(c: MythicShadowCache*, key: uint64, w: int32, h: int32) -> MythicShadowTab {
+  var t: MythicShadowTab = { w: w, h: h, a: (float32*)malloc((int64)w * (int64)h * 4) };
+  var slot: MythicShadowTab* = mythic_map_get<MythicShadowTab>(&c->map, key, true);
+  *slot = t;
+  c->bytes = c->bytes + (int64)w * (int64)h * 4;
+  return t;
+}
+
+fn key3(kind: int32, a: int32, b: int32, c: int32) -> uint64 {
+  var h: uint64 = mythic_hash_u64((uint64)kind, (uint64)a);
+  h = mythic_hash_u64(h, (uint64)b);
+  h = mythic_hash_u64(h, (uint64)c);
+  return h | (uint64)1;
+}
+
+/// Edge profile: a[k] = Phi(u / sigma) with u = k - M + 0.5 - frac (M = margin), k in 0..2M.
+export fn mythic_shadow_profile(c: MythicShadowCache*, sigma_q: int32, frac_q: int32) -> MythicShadowTab {
+  var key: uint64 = key3(2, sigma_q, frac_q, 0);
+  var hit: MythicShadowTab* = mythic_map_get<MythicShadowTab>(&c->map, key, false);
+  if (hit != 0) { return *hit; }
+  var sigma: float32 = (float32)sigma_q * 0.125;
+  var M: int32 = mythic_shadow_margin(sigma);
+  var t: MythicShadowTab = put(c, key, 2 * M, 1);
+  var inv: float32 = 1.0 / (sigma * 1.41421356);
+  for k: int32 in 0..2 * M {
+    var u: float32 = (float32)(k - M) + 0.5 - (float32)frac_q * 0.25;
+    t.a[k] = 0.5 * (1.0 + mythic_erff(u * inv));
+  }
+  return t;
+}
+
+/// Corner tile (top-left orientation): S x S with S = M + ceil(r + 3 sigma) + 1; entry (i, j)
+/// is the alpha at u = i - M + 0.5 - fx, v = j - M + 0.5 - fy from the corner of a quarter
+/// plane with corner radius r.
+export fn mythic_shadow_corner(c: MythicShadowCache*, r_q: int32, sigma_q: int32, fx_q: int32, fy_q: int32) -> MythicShadowTab {
+  var key: uint64 = key3(1, r_q, sigma_q, fx_q * 4 + fy_q);
+  var hit: MythicShadowTab* = mythic_map_get<MythicShadowTab>(&c->map, key, false);
+  if (hit != 0) { return *hit; }
+  var sigma: float32 = (float32)sigma_q * 0.125;
+  var r: float32 = (float32)r_q * 0.25;
+  var M: int32 = mythic_shadow_margin(sigma);
+  var S: int32 = M + mythic_shadow_inner(r, sigma);
+  var t: MythicShadowTab = put(c, key, S, S);
+  var sh: MythicSShape = { x0: 0.0, y0: 0.0, x1: 1.0e6, y1: 1.0e6, tl: r, tr: 0.0, br: 0.0, bl: 0.0 };
+  var fx: float32 = (float32)fx_q * 0.25;
+  var fy: float32 = (float32)fy_q * 0.25;
+  for j: int32 in 0..S {
+    var v: float32 = (float32)(j - M) + 0.5 - fy;
+    for i: int32 in 0..S {
+      var u: float32 = (float32)(i - M) + 0.5 - fx;
+      t.a[(int64)j * (int64)S + (int64)i] = mythic_shadow_eval(&sh, sigma, u, v);
+    }
+  }
+  return t;
+}
+
+/// Inward extent (whole px) of a corner tile.
+export fn mythic_shadow_inner(r: float32, sigma: float32) -> int32 { return (int32)mythic_ceilf(r + 3.0 * sigma) + 1; }
+
+/// Whole bitmap for a small shape; covers [floor(x0) - M, ceil(x1) + M) x [floor(y0) - M, ceil(y1) + M).
+export fn mythic_shadow_small(c: MythicShadowCache*, s: MythicSShape*, sigma_q: int32) -> MythicShadowTab {
+  var q: int32[10];
+  q[0] = mythic_iround(s->x0 * 4.0); q[1] = mythic_iround(s->y0 * 4.0);
+  q[2] = mythic_iround(s->x1 * 4.0); q[3] = mythic_iround(s->y1 * 4.0);
+  // translation invariant: key on the fractional part and the size
+  var ix: int32 = (int32)mythic_floorf(s->x0);
+  var iy: int32 = (int32)mythic_floorf(s->y0);
+  var h: uint64 = key3(3, q[0] - ix * 4, q[1] - iy * 4, sigma_q);
+  h = mythic_hash_u64(h, (uint64)(q[2] - q[0]));
+  h = mythic_hash_u64(h, (uint64)(q[3] - q[1]));
+  h = mythic_hash_u64(h, (uint64)mythic_iround(s->tl * 4.0));
+  h = mythic_hash_u64(h, (uint64)mythic_iround(s->tr * 4.0));
+  h = mythic_hash_u64(h, (uint64)mythic_iround(s->br * 4.0));
+  h = mythic_hash_u64(h, (uint64)mythic_iround(s->bl * 4.0)) | (uint64)1;
+  var hit: MythicShadowTab* = mythic_map_get<MythicShadowTab>(&c->map, h, false);
+  if (hit != 0) { return *hit; }
+  var sigma: float32 = (float32)sigma_q * 0.125;
+  var M: int32 = mythic_shadow_margin(sigma);
+  var gx: int32 = ix - M;
+  var gy: int32 = iy - M;
+  var W: int32 = (int32)mythic_ceilf(s->x1) + M - gx;
+  var H: int32 = (int32)mythic_ceilf(s->y1) + M - gy;
+  var t: MythicShadowTab = put(c, h, W, H);
+  for j: int32 in 0..H {
+    for i: int32 in 0..W {
+      t.a[(int64)j * (int64)W + (int64)i] = mythic_shadow_eval(s, sigma, (float32)(gx + i) + 0.5, (float32)(gy + j) + 0.5);
+    }
+  }
+  return t;
+}
+
+/// Frees every table (call when bytes exceed MYTHIC_SHADOW_CACHE_MAX, or on destroy).
+export fn mythic_shadow_cache_clear(c: MythicShadowCache*) {
+  for i: int64 in 0..c->map.cap {
+    if (c->map.keys[i] != (uint64)0 && c->map.vals[i].a != 0) { free((rawptr)c->map.vals[i].a); }
+  }
+  mythic_map_clear<MythicShadowTab>(&c->map);
+  c->bytes = 0;
+}
+
+export fn mythic_shadow_cache_free(c: MythicShadowCache*) {
+  mythic_shadow_cache_clear(c);
+  mythic_map_free<MythicShadowTab>(&c->map);
+}

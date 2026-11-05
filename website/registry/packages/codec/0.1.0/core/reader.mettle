@@ -1,0 +1,157 @@
+// CodecReader: a bounds-checked cursor over input bytes. Every read checks
+// the remaining length first, so bad input can never read past the end. On
+// the first error the reader records it, jumps to the end, and every later
+// read returns 0. Check `err` once when done.
+import "codec/core/status";
+import "codec/core/varint";
+
+export struct CodecReader {
+  data: uint8*;
+  pos: int64;
+  len: int64;
+  err: int32;
+}
+
+export fn codec_rd_init(r: CodecReader*, data: uint8*, n: int64) {
+  r->data = data;
+  r->pos = 0;
+  r->len = n;
+  r->err = CODEC_OK;
+  if (n < 0 || (data == 0 && n > 0)) {
+    r->len = 0;
+    r->err = CODEC_ERR_INVALID;
+  }
+}
+
+export fn codec_rd_init_string(r: CodecReader*, s: string) {
+  codec_rd_init(r, s.chars, (int64)s.length);
+}
+
+// Records err (if it is the first) and stops the reader.
+@noinline export fn codec_rd_fail(r: CodecReader*, err: int32) {
+  if (r->err == CODEC_OK) { r->err = err; }
+  r->pos = r->len;
+}
+
+@inline export fn codec_rd_left(r: CodecReader*) -> int64 {
+  return r->len - r->pos;
+}
+
+@inline export fn codec_rd_done(r: CodecReader*) -> bool {
+  return r->pos >= r->len;
+}
+
+@inline export fn codec_rd_u8(r: CodecReader*) -> uint8 {
+  if (r->pos >= r->len) {
+    codec_rd_fail(r, CODEC_ERR_TRUNCATED);
+    return (uint8)0;
+  }
+  var v: uint8 = r->data[r->pos];
+  r->pos = r->pos + 1;
+  return v;
+}
+
+// Returns a pointer to the next n bytes and moves past them, without copying.
+// Returns 0 (and fails the reader) if fewer than n bytes are left.
+@inline export fn codec_rd_take(r: CodecReader*, n: int64) -> uint8* {
+  if (n < 0 || n > r->len - r->pos) {
+    codec_rd_fail(r, CODEC_ERR_TRUNCATED);
+    return (uint8*)0;
+  }
+  var p: uint8* = r->data + r->pos;
+  r->pos = r->pos + n;
+  return p;
+}
+
+// The next n bytes as a string view into the input (no copy).
+@inline export fn codec_rd_string(r: CodecReader*, n: int64) -> string {
+  var s: string;
+  var p: uint8* = codec_rd_take(r, n);
+  if (p != 0) {
+    s.chars = p;
+    s.length = (uint64)n;
+  }
+  return s;
+}
+
+export fn codec_rd_skip(r: CodecReader*, n: int64) {
+  codec_rd_take(r, n);
+}
+
+// The slow path of codec_rd_varint: fewer than 10 bytes left.
+@noinline fn codec_rd_varint_slow(r: CodecReader*) -> uint64 {
+  var v: uint64 = 0;
+  var shift: uint64 = 0;
+  var i: int64 = r->pos;
+  while (i < r->len) {
+    var b: uint64 = (uint64)r->data[i];
+    i = i + 1;
+    v = v | ((b & 127) << shift);
+    if (b < 128) {
+      r->pos = i;
+      return v;
+    }
+    shift = shift + 7;
+  }
+  codec_rd_fail(r, CODEC_ERR_TRUNCATED);
+  return (uint64)0;
+}
+
+// Reads a varint of up to 10 bytes. More than 10 bytes, or a 10th byte with
+// bits past 64, is CODEC_ERR_VARINT.
+@inline export fn codec_rd_varint(r: CodecReader*) -> uint64 {
+  if (r->pos < r->len) {
+    var b0: uint64 = (uint64)r->data[r->pos];
+    if (b0 < 128) {
+      r->pos = r->pos + 1;
+      return b0;
+    }
+  }
+  if (r->len - r->pos < 10) { return codec_rd_varint_slow(r); }
+  // At least 10 bytes are there: no length checks inside the loop.
+  var p: uint8* = r->data + r->pos;
+  var v: uint64 = 0;
+  var i: int64 = 0;
+  while (i < 9) {
+    var b: uint64 = (uint64)p[i];
+    v = v | ((b & 127) << (uint64)(7 * i));
+    i = i + 1;
+    if (b < 128) {
+      r->pos = r->pos + i;
+      return v;
+    }
+  }
+  var last: uint64 = (uint64)p[9];
+  if (last > 1) {
+    codec_rd_fail(r, CODEC_ERR_VARINT);
+    return (uint64)0;
+  }
+  r->pos = r->pos + 10;
+  return v | (last << 63);
+}
+
+@inline export fn codec_rd_le32(r: CodecReader*) -> uint32 {
+  var p: uint8* = codec_rd_take(r, 4);
+  if (p == 0) { return (uint32)0; }
+  return codec_get_le32(p);
+}
+@inline export fn codec_rd_le64(r: CodecReader*) -> uint64 {
+  var p: uint8* = codec_rd_take(r, 8);
+  if (p == 0) { return (uint64)0; }
+  return codec_get_le64(p);
+}
+@inline export fn codec_rd_be16(r: CodecReader*) -> uint16 {
+  var p: uint8* = codec_rd_take(r, 2);
+  if (p == 0) { return (uint16)0; }
+  return codec_get_be16(p);
+}
+@inline export fn codec_rd_be32(r: CodecReader*) -> uint32 {
+  var p: uint8* = codec_rd_take(r, 4);
+  if (p == 0) { return (uint32)0; }
+  return codec_get_be32(p);
+}
+@inline export fn codec_rd_be64(r: CodecReader*) -> uint64 {
+  var p: uint8* = codec_rd_take(r, 8);
+  if (p == 0) { return (uint64)0; }
+  return codec_get_be64(p);
+}

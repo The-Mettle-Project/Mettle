@@ -1,0 +1,25 @@
+// Status codes. Every erasure function that can fail returns one of these.
+// ERASURE_OK is zero and every error is negative, so `rc < 0` means failure.
+
+export const ERASURE_OK: int32 = 0;
+export const ERASURE_E_ARG: int32 = -1;       // a bad argument (null pointer, bad count, bad size)
+export const ERASURE_E_SHARDS: int32 = -2;    // too few shards to rebuild from
+export const ERASURE_E_VERIFY: int32 = -3;    // parity does not match the data
+export const ERASURE_E_MEM: int32 = -4;       // out of memory
+export const ERASURE_E_IO: int32 = -5;        // a stream read or write failed
+export const ERASURE_E_SIZE: int32 = -6;      // shards of different sizes, or a short stream
+
+/// A short English message for a status code.
+export fn erasure_error_text(rc: int32) -> string {
+  switch (rc) {
+    case 0: { return "ok"; }
+    case -1: { return "bad argument"; }
+    case -2: { return "too few shards"; }
+    case -3: { return "parity does not match"; }
+    case -4: { return "out of memory"; }
+    case -5: { return "stream read or write failed"; }
+    case -6: { return "shard sizes do not match"; }
+    default: { }
+  }
+  return "unknown error";
+}

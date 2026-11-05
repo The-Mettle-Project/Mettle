@@ -1,0 +1,12 @@
+name = raize_api
+version = 0.1.0
+description = JSON APIs on raize: typed requests, problem details, OpenAPI 3.1, pagination
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeAPI
+compiler = 0.18.0
+require = raize_core 0.1.0
+require = raize_resource 0.1.0
+require = raize_app 0.1.0
+require = codec 0.1.0
+require = press 0.1.0
+require = json 1.0.0

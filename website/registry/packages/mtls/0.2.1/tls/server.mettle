@@ -1,0 +1,451 @@
+// TLS server: reads the ClientHello, picks the version, and runs the
+// TLS 1.3 handshake (RFC 8446 4). TLS 1.2 goes to server12.
+
+import "std/mem";
+import "cryptex/core/util";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+import "mtls/crypto/kx";
+import "mtls/crypto/sig";
+import "mtls/tls/consts";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+import "mtls/tls/hello";
+import "mtls/tls/ks13";
+import "mtls/tls/peer";
+import "mtls/tls/ticket";
+import "mtls/tls/client";
+import "mtls/tls/server12";
+
+fn mtls_ch_has_suite(ch: MtlsCH*, id: int32) -> bool {
+  var r: MtlsRd = ch->suites;
+  while (mtls_rd_left(&r) > 0) {
+    if (mtls_rd_u16(&r) == id) { return true; }
+  }
+  return false;
+}
+
+fn mtls_ch_offers_version(ch: MtlsCH*, v: int32) -> bool {
+  var r: MtlsRd = ch->sv;
+  while (mtls_rd_left(&r) > 0) {
+    if (mtls_rd_u16(&r) == v) { return true; }
+  }
+  return false;
+}
+
+/// mtls_server_pick_alpn: chooses ALPN by our preference. Returns false if
+/// the client offered protocols and none is ours (no_application_protocol).
+export fn mtls_server_pick_alpn(c: MtlsConn*, ch: MtlsCH*) -> bool {
+  c->alpnlen = 0;
+  if (!ch->has_alpn || c->cfg->nalpn == 0) { return true; }
+  for i in 0..c->cfg->nalpn {
+    var r: MtlsRd = ch->alpn;
+    while (mtls_rd_left(&r) > 0) {
+      var name: MtlsRd = mtls_rd_vec8(&r);
+      if (!name.bad && mtls_str_eq_bytes(c->cfg->alpn[i], name.p, name.n)) {
+        memcpy(&c->alpn[0], name.p, name.n);
+        c->alpnlen = (int32)name.n;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// mtls_server_take_sni: keeps the requested host name.
+export fn mtls_server_take_sni(c: MtlsConn*, ch: MtlsCH*) -> bool {
+  if (!ch->has_sni) { return true; }
+  if (ch->sni.n == 0 || ch->sni.n > 255) { return false; }
+  memcpy(&c->host[0], ch->sni.p, ch->sni.n);
+  c->hostlen = (int32)ch->sni.n;
+  return true;
+}
+
+// The client's share for our group, if it sent one.
+fn mtls_ch_find_share(ch: MtlsCH*, group: int32, out: MtlsRd*) -> bool {
+  var r: MtlsRd = ch->ks;
+  while (mtls_rd_left(&r) > 0) {
+    var g: int32 = mtls_rd_u16(&r);
+    var pub: MtlsRd = mtls_rd_vec16(&r);
+    if (r.bad) { return false; }
+    if (g == group) {
+      *out = pub;
+      return true;
+    }
+  }
+  return false;
+}
+
+fn mtls_ch_has_group(ch: MtlsCH*, group: int32) -> bool {
+  var r: MtlsRd = ch->groups;
+  while (mtls_rd_left(&r) > 0) {
+    if (mtls_rd_u16(&r) == group) { return true; }
+  }
+  return false;
+}
+
+// Tries the client's first PSK identity. Returns 0 if accepted, 1 if not
+// usable (fall back to a full handshake), or a negative failure.
+fn mtls_server_try_psk(c: MtlsConn*, ch: MtlsCH*, msg: uint8*, n: int64) -> int32 {
+  if (!ch->has_psk) { return 1; }
+  // RFC 8446 4.2.9: a PSK offer without psk_key_exchange_modes is an error.
+  if (!ch->has_psk_modes) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_MISSING_EXTENSION); }
+  // Every identity needs its binder.
+  var ic: MtlsRd = ch->psk_ids;
+  var bc: MtlsRd = ch->psk_binders;
+  var nid: int32 = 0;
+  var nb: int32 = 0;
+  while (mtls_rd_left(&ic) > 0) { mtls_rd_vec16(&ic); mtls_rd_u32(&ic); nid = nid + 1; }
+  while (mtls_rd_left(&bc) > 0) { mtls_rd_vec8(&bc); nb = nb + 1; }
+  if (ic.bad || bc.bad || nid == 0 || nid != nb) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  if (!c->cfg->tickets) { return 1; }
+  var modes: MtlsRd = ch->psk_modes;
+  var dhe: bool = false;
+  while (mtls_rd_left(&modes) > 0) {
+    if (mtls_rd_u8(&modes) == 1) { dhe = true; }
+  }
+  if (!dhe) { return 1; }
+  var ids: MtlsRd = ch->psk_ids;
+  var id: MtlsRd = mtls_rd_vec16(&ids);
+  var obf: int64 = mtls_rd_u32(&ids);
+  var binders: MtlsRd = ch->psk_binders;
+  var b0: MtlsRd = mtls_rd_vec8(&binders);
+  if (id.bad || ids.bad || b0.bad || id.n == 0) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  var s: MtlsSession;
+  if (!mtls_ticket_open(c->cfg, id.p, id.n, &s)) { return 1; }
+  var ps: MtlsSuite;
+  var now: int64 = mtls_now(c);
+  var usable: bool = s.version == MTLS_TLS13 && mtls_suite_get(s.suite, &ps) && ps.hash == c->suite.hash;
+  if (now < s.issued || now - s.issued >= (int64)s.lifetime) { usable = false; }
+  // The client's view of the ticket age must be close to ours (10 s).
+  var age_ms: int64 = (int64)(((uint64)obf - (uint64)s.age_add) & (uint64)0xffffffff);
+  var real_ms: int64 = (now - s.issued) * 1000;
+  if (age_ms > real_ms + 10000 || age_ms + 10000 < real_ms - 1000) { usable = false; }
+  if (!usable) {
+    cr_wipe((uint8*)&s, (int64)sizeof(MtlsSession));
+    return 1;
+  }
+  var hl: int64 = mtls_hlen(c);
+  if (b0.n != hl) { return mtls_fail(c, MTLS_E_VERIFY, MTLS_ALERT_DECRYPT_ERROR); }
+  var h: MtlsHash = c->th;
+  mtls_hash_update(&h, msg, ch->binders_off);
+  var th: uint8[64];
+  mtls_hash_final(&h, &th[0]);
+  mtls13_early(c, &s.secret[0], (int64)s.secretlen);
+  var bk: uint8[48];
+  mtls13_binder_key(c, &bk[0]);
+  var fk: uint8[48];
+  mtls_expand_label(c->suite.hash, &bk[0], "finished", (uint8*)0, 0, &fk[0], hl);
+  var want: uint8[64];
+  mtls_hmac(c->suite.hash, &fk[0], hl, &th[0], hl, &want[0]);
+  cr_wipe(&bk[0], 48);
+  cr_wipe(&fk[0], 48);
+  if (!cr_equal(&want[0], b0.p, hl)) {
+    cr_wipe((uint8*)&s, (int64)sizeof(MtlsSession));
+    return mtls_fail(c, MTLS_E_VERIFY, MTLS_ALERT_DECRYPT_ERROR);
+  }
+  c->sess = s;
+  c->resumed = true;
+  cr_wipe((uint8*)&s, (int64)sizeof(MtlsSession));
+  return 0;
+}
+
+fn mtls_server_send_hrr(c: MtlsConn*, ch: MtlsCH*, msg: uint8*, n: int64) -> int32 {
+  mtls13_hrr_reset(c, msg, n);
+  var w: MtlsWr = mtls_hs_begin(c, MTLS_HS_SERVER_HELLO);
+  mtls_wr_u16(&w, 0x0303);
+  var rnd: uint8[32];
+  mtls_hrr_random(&rnd[0]);
+  mtls_wr_bytes(&w, &rnd[0], 32);
+  var m: int64 = mtls_wr_open8(&w);
+  mtls_wr_bytes(&w, ch->sid.p, ch->sid.n);
+  mtls_wr_close8(&w, m);
+  mtls_wr_u16(&w, (int64)c->suite.id);
+  mtls_wr_u8(&w, 0);
+  var e: int64 = mtls_wr_open16(&w);
+  mtls_wr_u16(&w, (int64)MTLS_EXT_SUPPORTED_VERSIONS);
+  mtls_wr_u16(&w, 2);
+  mtls_wr_u16(&w, (int64)MTLS_TLS13);
+  mtls_wr_u16(&w, (int64)MTLS_EXT_KEY_SHARE);
+  mtls_wr_u16(&w, 2);
+  mtls_wr_u16(&w, (int64)c->group);
+  mtls_wr_close16(&w, e);
+  var rc: int32 = mtls_hs_end(c, &w);
+  if (rc != MTLS_OK) { return rc; }
+  if (ch->sid.n > 0) {
+    mtls_send_ccs(c);
+    c->ccs_sent = true;
+  }
+  c->hrr_done = true;
+  c->state = MTLS_ST_S_WAIT_CH2;
+  return MTLS_OK;
+}
+
+fn mtls_server13(c: MtlsConn*, ch: MtlsCH*, msg: uint8*, n: int64) -> int32 {
+  var cfg: MtlsConfig* = c->cfg;
+  var second: bool = c->hrr_done;
+  // Suite, by our preference.
+  var s: MtlsSuite;
+  var found: bool = false;
+  for i in 0..cfg->nsuites {
+    if (!found && mtls_suite_get(cfg->suites[i], &s) && s.v13 && mtls_ch_has_suite(ch, s.id)) { found = true; }
+  }
+  if (!found) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_HANDSHAKE_FAILURE); }
+  if (second && s.id != c->suite.id) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  c->suite = s;
+  if (!ch->has_sigs || !ch->has_groups || !ch->has_ks) {
+    return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_MISSING_EXTENSION);
+  }
+  var sr: MtlsRd = ch->sigs;
+  if (!mtls_read_sig_list(c, &sr)) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  if (ch->comp.n != 1 || ch->comp.p[0] != 0) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  if (ch->early_data && second) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  // Group: a share the client already sent, else ask for one (HRR).
+  var pub: MtlsRd;
+  var have: bool = false;
+  if (second) {
+    have = mtls_ch_find_share(ch, c->group, &pub);
+    if (!have) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  } else {
+    for i in 0..cfg->ngroups {
+      if (!have && mtls_ch_find_share(ch, cfg->groups[i], &pub)) {
+        have = true;
+        c->group = cfg->groups[i];
+      }
+    }
+    if (!have) {
+      for i in 0..cfg->ngroups {
+        if (c->group == 0 && mtls_ch_has_group(ch, cfg->groups[i])) { c->group = cfg->groups[i]; }
+      }
+      if (c->group == 0) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_HANDSHAKE_FAILURE); }
+      if (!mtls_server_take_sni(c, ch)) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+      return mtls_server_send_hrr(c, ch, msg, n);
+    }
+  }
+  if (!mtls_server_take_sni(c, ch)) { return mtls_fail(c, MTLS_E_DECODE, MTLS_ALERT_DECODE_ERROR); }
+  if (!mtls_server_pick_alpn(c, ch)) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_NO_APPLICATION_PROTOCOL); }
+  if (!c->th_on) { mtls_th_start(c, s.hash); }
+  var prc: int32 = mtls_server_try_psk(c, ch, msg, n);
+  if (prc < 0) { return prc; }
+  mtls_th_add(c, msg, n);
+  if (!c->resumed) {
+    if (!cfg->has_key || mtls_pick_sig(c, &cfg->key, true) == 0) {
+      return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_HANDSHAKE_FAILURE);
+    }
+    mtls13_early(c, (uint8*)0, 0);
+  }
+  var rc: int32 = mtls_kx_new(&c->kx, c->group);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+  var shared: uint8[48];
+  var slen: int64 = 0;
+  rc = mtls_kx_shared(&c->kx, pub.p, pub.n, &shared[0], &slen);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  // ServerHello.
+  if (cr_random_bytes(&c->srand[0], 32) != 0) { return mtls_fail(c, MTLS_E_CRYPTO, MTLS_ALERT_INTERNAL_ERROR); }
+  var w: MtlsWr = mtls_hs_begin(c, MTLS_HS_SERVER_HELLO);
+  mtls_wr_u16(&w, 0x0303);
+  mtls_wr_bytes(&w, &c->srand[0], 32);
+  var m: int64 = mtls_wr_open8(&w);
+  mtls_wr_bytes(&w, ch->sid.p, ch->sid.n);
+  mtls_wr_close8(&w, m);
+  mtls_wr_u16(&w, (int64)s.id);
+  mtls_wr_u8(&w, 0);
+  var e: int64 = mtls_wr_open16(&w);
+  mtls_wr_u16(&w, (int64)MTLS_EXT_SUPPORTED_VERSIONS);
+  mtls_wr_u16(&w, 2);
+  mtls_wr_u16(&w, (int64)MTLS_TLS13);
+  mtls_wr_u16(&w, (int64)MTLS_EXT_KEY_SHARE);
+  var ek: int64 = mtls_wr_open16(&w);
+  mtls_wr_u16(&w, (int64)c->group);
+  var pk: int64 = mtls_wr_open16(&w);
+  mtls_wr_bytes(&w, &c->kx.pk[0], (int64)c->kx.pklen);
+  mtls_wr_close16(&w, pk);
+  mtls_wr_close16(&w, ek);
+  if (c->resumed) {
+    mtls_wr_u16(&w, (int64)MTLS_EXT_PRE_SHARED_KEY);
+    mtls_wr_u16(&w, 2);
+    mtls_wr_u16(&w, 0);
+  }
+  mtls_wr_close16(&w, e);
+  rc = mtls_hs_end(c, &w);
+  if (rc != MTLS_OK) { return rc; }
+  mtls_kx_wipe(&c->kx);
+  if (ch->sid.n > 0 && !c->ccs_sent) {
+    mtls_send_ccs(c);
+    c->ccs_sent = true;
+  }
+  rc = mtls13_handshake(c, &shared[0], slen);
+  cr_wipe(&shared[0], 48);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+  c->version = MTLS_TLS13;
+  mtls_dir_set13(&c->wr, &c->suite, &c->s_hs[0]);
+  mtls_dir_set13(&c->rd, &c->suite, &c->c_hs[0]);
+  // EncryptedExtensions.
+  w = mtls_hs_begin(c, MTLS_HS_ENCRYPTED_EXTENSIONS);
+  e = mtls_wr_open16(&w);
+  if (c->alpnlen > 0) {
+    mtls_wr_u16(&w, (int64)MTLS_EXT_ALPN);
+    var ea: int64 = mtls_wr_open16(&w);
+    var la: int64 = mtls_wr_open16(&w);
+    var na: int64 = mtls_wr_open8(&w);
+    mtls_wr_bytes(&w, &c->alpn[0], (int64)c->alpnlen);
+    mtls_wr_close8(&w, na);
+    mtls_wr_close16(&w, la);
+    mtls_wr_close16(&w, ea);
+  }
+  mtls_wr_close16(&w, e);
+  rc = mtls_hs_end(c, &w);
+  if (rc != MTLS_OK) { return rc; }
+  if (!c->resumed) {
+    if (cfg->client_auth != MTLS_CLIENT_AUTH_NONE) {
+      w = mtls_hs_begin(c, MTLS_HS_CERTIFICATE_REQUEST);
+      mtls_wr_u8(&w, 0);
+      e = mtls_wr_open16(&w);
+      mtls_wr_u16(&w, (int64)MTLS_EXT_SIGNATURE_ALGORITHMS);
+      var es: int64 = mtls_wr_open16(&w);
+      mtls_write_sig_list(c, &w);
+      mtls_wr_close16(&w, es);
+      mtls_wr_close16(&w, e);
+      rc = mtls_hs_end(c, &w);
+      if (rc != MTLS_OK) { return rc; }
+      c->cert_requested = true;
+    }
+    rc = mtls13_send_cert_and_cv(c);
+    if (rc != MTLS_OK) { return rc; }
+  }
+  rc = mtls13_send_finished(c, &c->s_hs[0]);
+  if (rc != MTLS_OK) { return rc; }
+  rc = mtls13_master(c);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+  mtls_dir_set13(&c->wr, &c->suite, &c->s_ap[0]);
+  if (c->cert_requested) {
+    c->state = MTLS_ST_S_WAIT_CERT;
+  } else {
+    c->state = MTLS_ST_S_WAIT_FIN;
+  }
+  return MTLS_OK;
+}
+
+/// mtls13_send_ticket: one NewSessionTicket for the session just made.
+export fn mtls13_send_ticket(c: MtlsConn*) -> int32 {
+  var s: MtlsSession;
+  memset(&s, 0, (int64)sizeof(MtlsSession));
+  s.version = MTLS_TLS13;
+  s.suite = c->suite.id;
+  s.secretlen = (int32)mtls_hlen(c);
+  var nonce: uint8[1];
+  nonce[0] = (uint8)c->tickets_sent;
+  if (mtls13_ticket_psk(c, &nonce[0], 1, &s.secret[0]) != MTLS_OK) { return MTLS_OK; }
+  var aa: uint8[4];
+  cr_random_bytes(&aa[0], 4);
+  s.age_add = ((uint32)aa[0] << 24) | ((uint32)aa[1] << 16) | ((uint32)aa[2] << 8) | (uint32)aa[3];
+  s.issued = mtls_now(c);
+  s.lifetime = c->cfg->ticket_lifetime;
+  memcpy(&s.alpn[0], &c->alpn[0], (int64)c->alpnlen);
+  s.alpnlen = c->alpnlen;
+  var t: uint8[512];
+  var tlen: int64 = mtls_ticket_seal(c->cfg, &s, &t[0], 512);
+  cr_wipe((uint8*)&s.secret[0], 48);
+  if (tlen == 0) { return MTLS_OK; }
+  var w: MtlsWr = mtls_hs_begin(c, MTLS_HS_NEW_SESSION_TICKET);
+  mtls_wr_u32(&w, (int64)c->cfg->ticket_lifetime);
+  mtls_wr_u32(&w, (int64)s.age_add);
+  mtls_wr_u8(&w, 1);
+  mtls_wr_u8(&w, (int64)nonce[0]);
+  var m: int64 = mtls_wr_open16(&w);
+  mtls_wr_bytes(&w, &t[0], tlen);
+  mtls_wr_close16(&w, m);
+  mtls_wr_u16(&w, 0);
+  if (w.bad) { return MTLS_OK; }
+  var k: int64 = w.len - 4;
+  w.p[1] = (uint8)(k >> 16);
+  w.p[2] = (uint8)((k >> 8) & 255);
+  w.p[3] = (uint8)(k & 255);
+  c->tickets_sent = c->tickets_sent + 1;
+  // Post-handshake messages are not part of the transcript.
+  return mtls_send_record(c, MTLS_CT_HANDSHAKE, w.p, w.len);
+}
+
+fn mtls_server_on_fin(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  var rc: int32 = mtls13_check_finished(c, &c->c_hs[0], msg, n);
+  if (rc != MTLS_OK) { return rc; }
+  rc = mtls13_resumption(c);
+  if (rc != MTLS_OK) { return mtls_fail(c, rc, MTLS_ALERT_INTERNAL_ERROR); }
+  mtls_dir_set13(&c->rd, &c->suite, &c->c_ap[0]);
+  cr_wipe(&c->c_hs[0], 48);
+  cr_wipe(&c->s_hs[0], 48);
+  c->state = MTLS_ST_CONNECTED;
+  c->hs_done = true;
+  if (c->cfg->tickets) {
+    rc = mtls13_send_ticket(c);
+    if (rc != MTLS_OK) { return rc; }
+  }
+  return MTLS_OK;
+}
+
+fn mtls_server_on_ch(c: MtlsConn*, msg: uint8*, n: int64) -> int32 {
+  var ch: MtlsCH;
+  var rc: int32 = mtls_parse_ch(msg, n, &ch);
+  if (rc != MTLS_OK) { return mtls_fail(c, MTLS_E_DECODE, mtls_parse_alert(rc)); }
+  var cfg: MtlsConfig* = c->cfg;
+  memcpy(&c->crand[0], ch.random, 32);
+  var v: int32 = 0;
+  if (ch.has_sv) {
+    if (cfg->max_version >= MTLS_TLS13 && mtls_ch_offers_version(&ch, MTLS_TLS13)) {
+      v = MTLS_TLS13;
+    } else if (cfg->min_version <= MTLS_TLS12 && mtls_ch_offers_version(&ch, MTLS_TLS12)) {
+      v = MTLS_TLS12;
+    }
+  } else if (ch.ver >= MTLS_TLS12 && cfg->min_version <= MTLS_TLS12) {
+    v = MTLS_TLS12;
+  }
+  if (c->hrr_done && v != MTLS_TLS13) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_ILLEGAL_PARAMETER); }
+  if (v == 0) { return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_PROTOCOL_VERSION); }
+  if (v == MTLS_TLS13) { return mtls_server13(c, &ch, msg, n); }
+  // A client that fell back from a version we support (RFC 7507).
+  if (cfg->max_version >= MTLS_TLS13 && mtls_ch_has_suite(&ch, 0x5600)) {
+    return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_INAPPROPRIATE_FALLBACK);
+  }
+  return mtls12_server_on_ch(c, &ch, msg, n);
+}
+
+/// mtls_server_on_msg: one whole handshake message for the server.
+export fn mtls_server_on_msg(c: MtlsConn*, t: int32, msg: uint8*, n: int64) -> int32 {
+  if (c->version == MTLS_TLS12) { return mtls12_server_on_msg(c, t, msg, n); }
+  switch (c->state) {
+    case 20: {
+      if (t == MTLS_HS_CLIENT_HELLO) { return mtls_server_on_ch(c, msg, n); }
+    }
+    case 21: {
+      if (t == MTLS_HS_CLIENT_HELLO) { return mtls_server_on_ch(c, msg, n); }
+    }
+    case 22: {
+      if (t == MTLS_HS_CERTIFICATE) {
+        var rc: int32 = mtls13_on_peer_cert(c, msg, n);
+        if (rc != MTLS_OK) { return rc; }
+        if (c->npchain == 0) {
+          if (c->cfg->client_auth == MTLS_CLIENT_AUTH_REQUIRE) {
+            return mtls_fail(c, MTLS_E_CERT, MTLS_ALERT_CERTIFICATE_REQUIRED);
+          }
+          c->state = MTLS_ST_S_WAIT_FIN;
+        } else {
+          c->state = MTLS_ST_S_WAIT_CV;
+        }
+        return MTLS_OK;
+      }
+    }
+    case 23: {
+      if (t == MTLS_HS_CERTIFICATE_VERIFY) {
+        var rc: int32 = mtls13_on_peer_cv(c, msg, n);
+        if (rc == MTLS_OK) { c->state = MTLS_ST_S_WAIT_FIN; }
+        return rc;
+      }
+    }
+    case 24: {
+      if (t == MTLS_HS_FINISHED) { return mtls_server_on_fin(c, msg, n); }
+    }
+    default: { }
+  }
+  return mtls_fail(c, MTLS_E_PROTOCOL, MTLS_ALERT_UNEXPECTED_MESSAGE);
+}

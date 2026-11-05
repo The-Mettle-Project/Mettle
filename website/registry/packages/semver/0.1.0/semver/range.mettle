@@ -1,0 +1,295 @@
+// range: comparators, ranges, matching and picking the best version.
+//
+// A range is a list of sets joined by OR; a set is a list of comparators
+// joined by AND. npm ranges ("^1.2 || >=3") are turned into plain
+// comparators when parsed; Cargo requirements ("1.2, <1.5") keep their
+// operators and partial versions, and match the way the semver crate does.
+
+import "std/core";
+import "std/mem";
+import "std/collections";
+import "version";
+import "compare";
+
+export const SEMVER_EQ: int32 = 1;
+export const SEMVER_GT: int32 = 2;
+export const SEMVER_GE: int32 = 3;
+export const SEMVER_LT: int32 = 4;
+export const SEMVER_LE: int32 = 5;
+export const SEMVER_TILDE: int32 = 6;
+export const SEMVER_CARET: int32 = 7;
+export const SEMVER_WILD: int32 = 8; // Cargo "1.*" and "1.2.*"
+export const SEMVER_ANY: int32 = 9;  // matches every version ("*" or "")
+
+export const SEMVER_STYLE_NPM: int32 = 1;
+export const SEMVER_STYLE_CARGO: int32 = 2;
+
+export struct SemverComparator {
+  op: int32;
+  parts: int32; // how many of major, minor, patch were given (0 to 3)
+  major: uint64;
+  minor: uint64;
+  patch: uint64;
+  pre: string;
+}
+
+export struct SemverRange {
+  cmps: List<SemverComparator>;
+  ends: List<int64>; // set k is cmps[ends[k - 1] .. ends[k]]
+  style: int32;
+  include_pre: bool;
+  owned: uint8*; // the range's own copy of its text, or 0
+}
+
+export fn semver_cmp_new(op: int32, parts: int32, major: uint64, minor: uint64, patch: uint64, pre: string) -> SemverComparator {
+  var c: SemverComparator = { op: op, parts: parts, major: major, minor: minor, patch: patch, pre: pre };
+  return c;
+}
+
+export fn semver_range_new(style: int32, include_pre: bool) -> SemverRange {
+  var r: SemverRange;
+  r.cmps = list_init<SemverComparator>();
+  r.ends = list_init<int64>();
+  r.style = style;
+  r.include_pre = include_pre;
+  r.owned = (uint8*)0;
+  return r;
+}
+
+// Releases the memory a parsed range holds.
+export fn semver_range_free(r: SemverRange*) {
+  list_free<SemverComparator>(&r->cmps);
+  list_free<int64>(&r->ends);
+  if (r->owned != (uint8*)0) {
+    free(r->owned);
+    r->owned = (uint8*)0;
+  }
+}
+
+export fn semver_range_sets(r: SemverRange*) -> int64 { return r->ends.length; }
+
+export fn semver_range_set_start(r: SemverRange*, k: int64) -> int64 {
+  if (k == 0) { return 0; }
+  return r->ends.data[k - 1];
+}
+
+export fn semver_range_set_end(r: SemverRange*, k: int64) -> int64 { return r->ends.data[k]; }
+
+export fn semver_range_cmp(r: SemverRange*, i: int64) -> SemverComparator { return r->cmps.data[i]; }
+
+// The rest of this file ports the matching rules of the semver crate
+// (eval.rs). With full versions they are plain precedence comparisons, so
+// npm comparators use them too.
+
+fn svr_exact(c: SemverComparator*, v: SemverVersion*) -> bool {
+  if (v->major != c->major) { return false; }
+  if (c->parts >= 2 && v->minor != c->minor) { return false; }
+  if (c->parts >= 3 && v->patch != c->patch) { return false; }
+  return semver_cmp_pre(v->pre, c->pre) == 0;
+}
+
+fn svr_greater(c: SemverComparator*, v: SemverVersion*) -> bool {
+  if (v->major != c->major) { return v->major > c->major; }
+  if (c->parts < 2) { return false; }
+  if (v->minor != c->minor) { return v->minor > c->minor; }
+  if (c->parts < 3) { return false; }
+  if (v->patch != c->patch) { return v->patch > c->patch; }
+  return semver_cmp_pre(v->pre, c->pre) > 0;
+}
+
+fn svr_less(c: SemverComparator*, v: SemverVersion*) -> bool {
+  if (v->major != c->major) { return v->major < c->major; }
+  if (c->parts < 2) { return false; }
+  if (v->minor != c->minor) { return v->minor < c->minor; }
+  if (c->parts < 3) { return false; }
+  if (v->patch != c->patch) { return v->patch < c->patch; }
+  return semver_cmp_pre(v->pre, c->pre) < 0;
+}
+
+fn svr_tilde(c: SemverComparator*, v: SemverVersion*) -> bool {
+  if (v->major != c->major) { return false; }
+  if (c->parts >= 2 && v->minor != c->minor) { return false; }
+  if (c->parts >= 3 && v->patch != c->patch) { return v->patch > c->patch; }
+  return semver_cmp_pre(v->pre, c->pre) >= 0;
+}
+
+fn svr_caret(c: SemverComparator*, v: SemverVersion*) -> bool {
+  if (v->major != c->major) { return false; }
+  if (c->parts < 2) { return true; }
+  if (c->parts < 3) {
+    if (c->major > 0) { return v->minor >= c->minor; }
+    return v->minor == c->minor;
+  }
+  if (c->major > 0) {
+    if (v->minor != c->minor) { return v->minor > c->minor; }
+    if (v->patch != c->patch) { return v->patch > c->patch; }
+  } else if (c->minor > 0) {
+    if (v->minor != c->minor) { return false; }
+    if (v->patch != c->patch) { return v->patch > c->patch; }
+  } else if (v->minor != c->minor || v->patch != c->patch) {
+    return false;
+  }
+  return semver_cmp_pre(v->pre, c->pre) >= 0;
+}
+
+// True when v passes the comparator's test, before the pre-release rule.
+export fn semver_cmp_test(c: SemverComparator*, v: SemverVersion*) -> bool {
+  switch (c->op) {
+    case 1: { return svr_exact(c, v); }
+    case 2: { return svr_greater(c, v); }
+    case 3: { return svr_exact(c, v) || svr_greater(c, v); }
+    case 4: { return svr_less(c, v); }
+    case 5: { return svr_exact(c, v) || svr_less(c, v); }
+    case 6: { return svr_tilde(c, v); }
+    case 7: { return svr_caret(c, v); }
+    case 8: { return svr_exact(c, v); }
+    default: { return true; }
+  }
+  return true;
+}
+
+// A pre-release version may only match a set that names a pre-release of
+// the same MAJOR.MINOR.PATCH. This keeps "^1.2.3" from picking 1.3.0-beta.
+fn svr_pre_ok(c: SemverComparator*, v: SemverVersion*) -> bool {
+  return c->op != SEMVER_ANY && c->parts == 3 && c->pre.length > 0 &&
+    c->major == v->major && c->minor == v->minor && c->patch == v->patch;
+}
+
+fn svr_test_set(r: SemverRange*, k: int64, v: SemverVersion*) -> bool {
+  var st: int64 = semver_range_set_start(r, k);
+  var en: int64 = semver_range_set_end(r, k);
+  for i in st..en {
+    if (!semver_cmp_test(&r->cmps.data[i], v)) { return false; }
+  }
+  if (v->pre.length == 0 || r->include_pre) { return true; }
+  for i in st..en {
+    if (svr_pre_ok(&r->cmps.data[i], v)) { return true; }
+  }
+  return false;
+}
+
+// True when v is in the range.
+export fn semver_satisfies(r: SemverRange*, v: SemverVersion) -> bool {
+  for k in 0..r->ends.length {
+    if (svr_test_set(r, k, &v)) { return true; }
+  }
+  return false;
+}
+
+// The index of the highest version in the list that is in the range, or -1.
+export fn semver_max_satisfying(r: SemverRange*, list: SemverVersion*, n: int64) -> int64 {
+  var best: int64 = -1;
+  for i in 0..n {
+    if (semver_satisfies(r, list[i]) && (best < 0 || semver_cmp(list[i], list[best]) > 0)) { best = i; }
+  }
+  return best;
+}
+
+// The index of the lowest version in the list that is in the range, or -1.
+export fn semver_min_satisfying(r: SemverRange*, list: SemverVersion*, n: int64) -> int64 {
+  var best: int64 = -1;
+  for i in 0..n {
+    if (semver_satisfies(r, list[i]) && (best < 0 || semver_cmp(list[i], list[best]) < 0)) { best = i; }
+  }
+  return best;
+}
+
+// The index of the highest version, preferring releases over pre-releases
+// when include_pre is false, or -1 for an empty list.
+export fn semver_max(list: SemverVersion*, n: int64, include_pre: bool) -> int64 {
+  var best: int64 = -1;
+  for pass in 0..2 {
+    for i in 0..n {
+      var skip: bool = pass == 0 && !include_pre && list[i].pre.length > 0;
+      if (!skip && (best < 0 || semver_cmp(list[i], list[best]) > 0)) { best = i; }
+    }
+    if (best >= 0) { return best; }
+  }
+  return best;
+}
+
+// Sorts the list in place, lowest first, with build metadata as the tie
+// break (semver_cmp_build). Stable insertion sort, fine for version lists.
+export fn semver_sort(list: SemverVersion*, n: int64) {
+  for i in 1..n {
+    var x: SemverVersion = list[i];
+    var j: int64 = i - 1;
+    while (j >= 0 && semver_cmp_build(list[j], x) > 0) {
+      list[j + 1] = list[j];
+      j = j - 1;
+    }
+    list[j + 1] = x;
+  }
+}
+
+// Like semver_sort, highest first.
+export fn semver_sort_desc(list: SemverVersion*, n: int64) {
+  semver_sort(list, n);
+  var i: int64 = 0;
+  var j: int64 = n - 1;
+  while (i < j) {
+    var t: SemverVersion = list[i];
+    list[i] = list[j];
+    list[j] = t;
+    i = i + 1;
+    j = j - 1;
+  }
+}
+
+fn svr_op_text(op: int32) -> string {
+  switch (op) {
+    case 1: { return "="; }
+    case 2: { return ">"; }
+    case 3: { return ">="; }
+    case 4: { return "<"; }
+    case 5: { return "<="; }
+    case 6: { return "~"; }
+    case 7: { return "^"; }
+    default: { return ""; }
+  }
+  return "";
+}
+
+// One comparator as text. npm style writes "=" as nothing and ANY as "";
+// Cargo style matches the semver crate's Display.
+export fn semver_cmp_format(c: SemverComparator, style: int32) -> string {
+  if (c.op == SEMVER_ANY) {
+    if (style == SEMVER_STYLE_CARGO) { return "*"; }
+    return "";
+  }
+  var op: string = svr_op_text(c.op);
+  if (style == SEMVER_STYLE_NPM && c.op == SEMVER_EQ) { op = ""; }
+  var s: string = op + "{c.major}";
+  if (c.parts >= 2) {
+    s = s + ".{c.minor}";
+  } else if (c.op == SEMVER_WILD) {
+    s = s + ".*";
+  }
+  if (c.parts >= 3) {
+    s = s + ".{c.patch}";
+  } else if (c.op == SEMVER_WILD && c.parts == 2) {
+    s = s + ".*";
+  }
+  if (c.pre.length > 0) { s = s + "-" + c.pre; }
+  return s;
+}
+
+// The whole range as text: npm style joins comparators with " " and sets
+// with "||" (like node-semver's range.range); Cargo style joins with ", ".
+export fn semver_range_format(r: SemverRange*) -> string {
+  var out: string = "";
+  var sep: string = " ";
+  if (r->style == SEMVER_STYLE_CARGO) {
+    sep = ", ";
+    if (r->cmps.length == 0) { return "*"; }
+  }
+  for k in 0..r->ends.length {
+    if (k > 0) { out = out + "||"; }
+    var st: int64 = semver_range_set_start(r, k);
+    for i in st..semver_range_set_end(r, k) {
+      if (i > st) { out = out + sep; }
+      out = out + semver_cmp_format(r->cmps.data[i], r->style);
+    }
+  }
+  return out;
+}

@@ -1,0 +1,26 @@
+// Press: fast compression for Mettle, written in pure Mettle.
+//
+//   import "press/press";
+//
+// This file has no exports of its own, so it re-exports every module below.
+// All exported names start with press_, Press or PRESS_.
+//
+//   core/     status codes (PRESS_OK, PRESS_E_*) and PressBuf
+//   check/    press_crc32, press_adler32, press_xxh32, press_xxh64
+//   deflate/  DEFLATE (RFC 1951), zlib (RFC 1950) and gzip (RFC 1952)
+//   lz4/      LZ4 blocks and frames
+//   zstd/     Zstandard frames (RFC 8878)
+
+import "press/core/status";
+import "press/core/buf";
+import "press/check/crc32";
+import "press/check/adler32";
+import "press/check/xxhash";
+import "press/deflate/tables";
+import "press/deflate/huff";
+import "press/deflate/inflate";
+import "press/deflate/deflate";
+import "press/deflate/wrap";
+import "press/deflate/stream";
+import "press/lz4/lz4";
+import "press/zstd/zstd";

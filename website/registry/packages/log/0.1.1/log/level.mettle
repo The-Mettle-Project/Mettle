@@ -1,0 +1,105 @@
+// log/level: severity levels.
+//
+// The numbers are OpenTelemetry's SeverityNumber from the logs data model:
+// each named level is the first number of a range of four, and a bigger
+// number is more severe. Levels from other systems map in and out without
+// loss, and a filter test is one integer compare.
+import "std/core";
+
+export const LOG_TRACE = 1;
+export const LOG_DEBUG = 5;
+export const LOG_INFO = 9;
+export const LOG_WARN = 13;
+export const LOG_ERROR = 17;
+export const LOG_FATAL = 21;
+export const LOG_OFF = 25;      // above every level: nothing passes
+
+// The named level a number falls in: 10 is still INFO.
+export fn log_level_base(level: int32) -> int32 {
+  if (level < LOG_DEBUG) { return LOG_TRACE; }
+  if (level < LOG_INFO) { return LOG_DEBUG; }
+  if (level < LOG_WARN) { return LOG_INFO; }
+  if (level < LOG_ERROR) { return LOG_WARN; }
+  if (level < LOG_FATAL) { return LOG_ERROR; }
+  if (level < LOG_OFF) { return LOG_FATAL; }
+  return LOG_OFF;
+}
+
+// Upper-case name, for people: "INFO".
+export fn log_level_name(level: int32) -> string {
+  switch (log_level_base(level)) {
+    case 1: { return "TRACE"; }
+    case 5: { return "DEBUG"; }
+    case 9: { return "INFO"; }
+    case 13: { return "WARN"; }
+    case 17: { return "ERROR"; }
+    case 21: { return "FATAL"; }
+    default: { }
+  }
+  return "OFF";
+}
+
+// Lower-case name, for machines (JSON and logfmt): "info".
+export fn log_level_key(level: int32) -> string {
+  switch (log_level_base(level)) {
+    case 1: { return "trace"; }
+    case 5: { return "debug"; }
+    case 9: { return "info"; }
+    case 13: { return "warn"; }
+    case 17: { return "error"; }
+    case 21: { return "fatal"; }
+    default: { }
+  }
+  return "off";
+}
+
+fn log__lower(c: char) -> int32 {
+  var v: int32 = (int32)c;
+  if (v >= 65 && v <= 90) { return v + 32; }
+  return v;
+}
+
+fn log__ieq(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  for i in 0..a.length {
+    if (log__lower(a[i]) != log__lower(b[i])) { return false; }
+  }
+  return true;
+}
+
+// Reads a level name, any case: trace, debug, info, warn or warning,
+// error or err, fatal, critical or crit, off or none; or a number 1..25.
+// Returns -1 for anything else.
+export fn log_level_parse(s: string) -> int32 {
+  if (s.length == 0) { return -1; }
+  if (s[0] >= '0' && s[0] <= '9') {
+    if (s.length > 2) { return -1; }
+    var n: int32 = 0;
+    for i in 0..s.length {
+      if (s[i] < '0' || s[i] > '9') { return -1; }
+      n = n * 10 + ((int32)s[i] - 48);
+    }
+    if (n < 1 || n > LOG_OFF) { return -1; }
+    return n;
+  }
+  if (log__ieq(s, "trace")) { return LOG_TRACE; }
+  if (log__ieq(s, "debug")) { return LOG_DEBUG; }
+  if (log__ieq(s, "info")) { return LOG_INFO; }
+  if (log__ieq(s, "warn") || log__ieq(s, "warning")) { return LOG_WARN; }
+  if (log__ieq(s, "error") || log__ieq(s, "err")) { return LOG_ERROR; }
+  if (log__ieq(s, "fatal") || log__ieq(s, "critical") || log__ieq(s, "crit")) { return LOG_FATAL; }
+  if (log__ieq(s, "off") || log__ieq(s, "none")) { return LOG_OFF; }
+  return -1;
+}
+
+// The syslog severity (RFC 5424 section 6.2.1) for a level.
+export fn log_level_syslog(level: int32) -> int32 {
+  switch (log_level_base(level)) {
+    case 21: { return 2; }   // critical
+    case 17: { return 3; }   // error
+    case 13: { return 4; }   // warning
+    case 9: { return 6; }    // informational
+    default: { }
+  }
+  return 7;                  // debug (and trace)
+}

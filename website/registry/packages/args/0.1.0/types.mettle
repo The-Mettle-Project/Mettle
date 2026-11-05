@@ -1,0 +1,138 @@
+// The data args works on. A program fills one Args with its options,
+// positional arguments and subcommands, then parses argv into it.
+//
+// Everything lives in fixed tables inside Args, so building and parsing
+// never allocate. Values are views into argv and are written straight into
+// the caller's variables, like Go's flag package.
+
+// Table sizes. Raise them here if a program needs more.
+export const ARGS_MAX_OPTS = 256;
+export const ARGS_MAX_POS = 64;
+export const ARGS_MAX_CMDS = 64;
+export const ARGS_MSG_CAP = 512;
+
+// Option kinds.
+export const ARGS_FLAG = 1;     // bool: set to true when given
+export const ARGS_COUNT = 2;    // int64: one more each time (-vvv is 3)
+export const ARGS_INT = 3;      // int64
+export const ARGS_UINT = 4;     // uint64
+export const ARGS_FLOAT = 5;    // float64
+export const ARGS_STR = 6;      // string
+export const ARGS_CHOICE = 7;   // int32: index into a list of names
+export const ARGS_LIST = 8;     // string, repeated: each value is stored
+export const ARGS_CUSTOM = 9;   // the caller's own parse function
+export const ARGS_HELP = 10;    // -h / --help
+export const ARGS_VERSION = 11; // -V / --version
+
+// What args_parse returns.
+export const ARGS_OK = 0;
+export const ARGS_SHOW_HELP = 1;    // help was asked for; nothing is wrong
+export const ARGS_SHOW_VERSION = 2; // version was asked for
+// Errors. args_error_text explains each one.
+export const ARGS_E_UNKNOWN = 10;     // --nope
+export const ARGS_E_NO_VALUE = 11;    // --out with nothing after it
+export const ARGS_E_BAD_VALUE = 12;   // --jobs=abc
+export const ARGS_E_EXTRA_VALUE = 13; // --help=yes
+export const ARGS_E_MISSING = 14;     // a required option was not given
+export const ARGS_E_MISSING_POS = 15; // a required positional was not given
+export const ARGS_E_TOO_MANY = 16;    // more positionals than expected
+export const ARGS_E_FULL = 17;        // a repeated option's storage is full
+export const ARGS_E_UNKNOWN_CMD = 18; // no such subcommand
+export const ARGS_E_NEED_CMD = 19;    // a subcommand is required
+export const ARGS_E_AMBIGUOUS = 20;   // --ve could be --verbose or --version
+export const ARGS_E_SPEC = 21;        // the program's own spec is wrong (table full, bad name)
+
+// A custom value parser: gets the text and the caller's pointer, and
+// returns 0 when the text is good.
+export struct ArgsParseFn { call: fn(string, rawptr) -> int32; }
+
+export struct ArgsOpt {
+  kind: int32;
+  cmd: int32;          // the command it belongs to
+  short_name: uint8;   // 0 for none
+  long_name: string;   // empty for none
+  help: string;
+  metavar: string;     // VALUE name in help; empty means the default for the kind
+  env: string;         // environment variable to fall back on; empty for none
+  dest: rawptr;        // where the value goes
+  count_out: int32*;   // ARGS_LIST: number of values stored
+  cap: int32;          // ARGS_LIST: room in dest
+  choices: string*;    // ARGS_CHOICE: the names
+  nchoices: int32;
+  parse_fn: fn(string, rawptr) -> int32; // ARGS_CUSTOM
+  def_int: int64;      // defaults, kept for help text
+  def_float: float64;
+  def_str: string;
+  has_def: bool;
+  required: bool;
+  hidden: bool;
+  global: bool;        // also accepted after the command's subcommands
+  seen: int32;         // times given on the command line
+  from_env: bool;      // the value came from the environment
+}
+
+export struct ArgsPos {
+  cmd: int32;
+  name: string;        // shown as NAME in usage
+  help: string;
+  dest: string*;
+  count_out: int32*;   // rest positionals: number stored
+  cap: int32;          // 1 for a single value, more for a rest list
+  rest: bool;          // takes every remaining word
+  required: bool;
+  seen: int32;
+}
+
+export struct ArgsCmd {
+  parent: int32;       // -1 for the root
+  name: string;
+  help: string;
+  about: string;       // longer text for this command's help page
+  aliases: string;     // other names, separated by spaces
+  need_sub: bool;      // a subcommand must be given
+  hidden: bool;
+}
+
+export struct Args {
+  name: string;        // program name for usage lines
+  version: string;
+  opts: ArgsOpt[256];
+  nopts: int32;
+  pos: ArgsPos[64];
+  npos: int32;
+  cmds: ArgsCmd[64];
+  ncmds: int32;
+  cur: int32;          // the command that new specs go into
+  last_opt: int32;     // the option that modifiers act on
+  last_pos: int32;
+  last_kind: int32;    // 1 = option, 2 = positional, 3 = command
+  // settings
+  abbrev: bool;        // accept unique prefixes of long names
+  posix: bool;         // stop at the first positional (POSIX), else options may follow
+  width: int32;        // help text width; 0 = COLUMNS or 80
+  comp_cmd: int32;     // the `completion` subcommand, or 0
+  comp_shell: string;  // its SHELL argument
+  // result
+  cmd: int32;          // the command that was chosen
+  err: int32;
+  err_opt: int32;      // the option the error is about, or -1
+  err_pos: int32;      // the positional the error is about, or -1
+  err_token: string;   // the argv word the error is about
+  err_detail: string;  // why a value was refused
+  short_tok: uint8[4]; // "-x" for an unknown short option
+  msg: uint8[512];
+  msg_len: int32;
+  spec_err: string;    // set when a builder call was wrong
+}
+
+// A writer that fills a caller's buffer, or flushes to a stream when one
+// is given. len counts every byte asked for, so a too-small buffer still
+// reports the size it needed.
+export struct ArgsOut {
+  buf: uint8*;
+  cap: int64;
+  len: int64;          // bytes asked for so far
+  used: int64;         // bytes in buf now
+  fp: cstring;         // stream to flush to, or 0
+  tmp: uint8[1024];
+}

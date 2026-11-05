@@ -1,0 +1,91 @@
+// Playback and capture devices.
+//
+//   var dev: AudioDevice;
+//   audio_device_open_mixer(&dev, &mixer, 256);   // plays the mixer, 256-frame periods
+//   audio_device_start(&dev);
+//   ...
+//   audio_device_close(&dev);
+//
+// Linux: PulseAudio (also PipeWire's PulseAudio service), then ALSA.
+// Windows: WASAPI. The callback runs on the device's own thread and must
+// not block: fill (or read) `frames` interleaved float frames and return.
+
+import "std/mem";
+import "std/thread" as th;
+import "../core/status";
+import "../core/pcm";
+import "../mix/mixer";
+import "types";
+import "os_linux.mettle" if linux;
+import "os_windows.mettle" if windows;
+
+/// Opens a device. name "" is the default device (on Linux an ALSA name
+/// like "hw:0,0" or "alsa:NAME" picks ALSA). period is the frames per
+/// callback; 256 at 48 kHz is about 5 ms.
+export fn audio_device_open(d: AudioDevice*, playback: bool, name: string, rate: int32, channels: int32, period: int32,
+    cb: fn(rawptr, float32*, int32, int32) -> void, user: rawptr) -> int32 {
+  memset(d, 0, sizeof(AudioDevice));
+  if (rate < 8000 || rate > 384000 || channels < 1 || channels > AUDIO_MAX_CHANNELS || period < 16 || period > 65536 || cb == 0) {
+    return AUDIO_E_ARG;
+  }
+  if (name.length > 255) { return AUDIO_E_ARG; }
+  for i in 0..(int64)name.length { d->name[i] = (uint8)name[i]; }
+  d->playback = playback;
+  d->rate = rate;
+  d->ch = channels;
+  d->period = period;
+  d->cb = cb;
+  d->user = user;
+  d->buf = (float32*)calloc((int64)period * (int64)channels, 4);
+  if (d->buf == 0) { return AUDIO_E_MEM; }
+  var rc: int32 = audio_os_open(d);
+  if (rc != AUDIO_OK) { free(d->buf); d->buf = (float32*)0; }
+  return rc;
+}
+
+fn mixer_cb(user: rawptr, out: float32*, frames: int32, ch: int32) {
+  audio_mixer_mix((AudioMixer*)user, out, frames);
+}
+
+/// Opens the default playback device at the mixer's rate and channels,
+/// playing the mixer.
+export fn audio_device_open_mixer(d: AudioDevice*, m: AudioMixer*, period: int32) -> int32 {
+  return audio_device_open(d, true, "", m->rate, m->ch, period, &mixer_cb, (rawptr)m);
+}
+
+/// Starts calling the callback.
+export fn audio_device_start(d: AudioDevice*) -> int32 {
+  if (d->buf == 0) { return AUDIO_E_ARG; }
+  if (d->started) { return AUDIO_OK; }
+  var rc: int32 = audio_os_start(d);
+  if (rc == AUDIO_OK) { d->started = true; }
+  return rc;
+}
+
+/// Stops the callbacks (waits for the one running).
+export fn audio_device_stop(d: AudioDevice*) {
+  if (!d->started) { return; }
+  audio_os_stop(d);
+  d->started = false;
+}
+
+/// AUDIO_OK, or AUDIO_E_DEVICE once the device has failed (unplugged ...).
+export fn audio_device_status(d: AudioDevice*) -> int32 {
+  return th.InterlockedCompareExchange(&d->err, 0, 0);
+}
+
+/// The back end in use: AUDIO_DEV_PULSE, AUDIO_DEV_ALSA or AUDIO_DEV_WASAPI.
+export fn audio_device_backend(d: AudioDevice*) -> int32 { return d->backend; }
+
+/// About how many milliseconds of sound are buffered ahead of the speakers.
+export fn audio_device_latency_ms(d: AudioDevice*) -> int32 {
+  return (int32)((int64)d->bufframes * 1000 / (int64)d->rate);
+}
+
+/// Stops and closes the device.
+export fn audio_device_close(d: AudioDevice*) {
+  audio_device_stop(d);
+  audio_os_close(d);
+  if (d->buf != 0) { free(d->buf); }
+  d->buf = (float32*)0;
+}

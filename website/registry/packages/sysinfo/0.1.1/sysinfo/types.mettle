@@ -1,0 +1,356 @@
+// The public data of sysinfo: what each section holds, the flags that pick
+// sections, and the status codes.
+//
+// Missing data never stops a refresh. A number that could not be read is
+// SYSINFO_NA (-1 for whole numbers, -1.0 for rates and percentages) and a
+// temperature that could not be read is SYSINFO_NA_TEMP. A string that could
+// not be read is empty. Strings are views owned by the Sysinfo; each stays
+// valid until the second refresh of its section after the one that set it,
+// so copy one you keep longer.
+
+// ---- sections (the `what` flags) -------------------------------------------
+export const SYSINFO_SYSTEM = 1;      // host, OS, kernel, uptime, load, users
+export const SYSINFO_CPU = 2;
+export const SYSINFO_MEM = 4;
+export const SYSINFO_DISK = 8;
+export const SYSINFO_NET = 16;
+export const SYSINFO_PROC = 32;
+export const SYSINFO_SENSORS = 64;
+export const SYSINFO_GPU = 128;
+export const SYSINFO_BATTERY = 256;
+export const SYSINFO_ALL = 511;
+// Extras: costly details that are off unless asked for.
+export const SYSINFO_PROC_IO = 1024;      // per-process I/O (often needs root)
+export const SYSINFO_PROC_FILES = 2048;   // per-process open file count
+export const SYSINFO_GPU_NVSMI = 4096;    // run nvidia-smi for NVIDIA figures
+export const SYSINFO_PROC_SHARED = 8192;  // per-process shared memory (one more read each)
+
+// ---- status codes ----------------------------------------------------------
+export const SYSINFO_OK = 0;
+export const SYSINFO_E_UNSUPPORTED = -1;  // not implemented on this platform
+export const SYSINFO_E_INVALID = -2;      // a bad argument
+export const SYSINFO_E_NOMEM = -3;
+export const SYSINFO_E_IO = -4;           // a source could not be read
+export const SYSINFO_E_NOTFOUND = -5;     // no such process or device
+export const SYSINFO_E_PERM = -6;         // not allowed
+export const SYSINFO_E_NOTOPEN = -7;      // sysinfo_open was not called
+
+// ---- missing values --------------------------------------------------------
+export const SYSINFO_NA = -1;
+export const SYSINFO_NA_TEMP = -273.15;
+
+// ---- system ----------------------------------------------------------------
+export struct SysinfoSystem {
+  status: int32;
+  hostname: string;
+  os_name: string;          // "Debian GNU/Linux"
+  os_version: string;       // "13"
+  os_id: string;            // "debian"
+  os_pretty: string;        // "Debian GNU/Linux 13 (trixie)"
+  kernel_name: string;      // "Linux"
+  kernel_version: string;   // "6.12.115+deb13.1-amd64"
+  arch: string;             // "x86_64", "aarch64"
+  uptime_s: float64;
+  boot_time: int64;         // Unix seconds
+  load1: float64;
+  load5: float64;
+  load15: float64;
+  users: int32;             // logged-in sessions
+  procs_running: int32;
+  procs_total: int32;       // tasks, threads included
+}
+
+// ---- CPU -------------------------------------------------------------------
+// Shares of time over the last interval, in percent. busy is everything but
+// idle and iowait. guest time is also counted inside user, as the kernel does.
+export struct SysinfoCpuUsage {
+  busy: float64;
+  user: float64;
+  nice: float64;
+  system: float64;
+  irq: float64;
+  softirq: float64;
+  iowait: float64;
+  idle: float64;
+  steal: float64;
+  guest: float64;
+}
+
+export struct SysinfoCore {
+  cpu: int32;               // logical CPU number
+  core_id: int32;           // physical core within its package, or -1
+  package_id: int32;        // socket, or -1
+  usage: SysinfoCpuUsage;
+  freq_mhz: float64;
+  freq_min_mhz: float64;
+  freq_max_mhz: float64;
+  temp_c: float64;          // the temperature of its core, when known
+}
+
+export struct SysinfoCpu {
+  status: int32;
+  model: string;
+  vendor: string;           // "GenuineIntel", "AuthenticAMD", "ARM"
+  logical: int32;           // online logical CPUs
+  physical: int32;          // physical cores, or -1
+  packages: int32;          // sockets, or -1
+  total: SysinfoCpuUsage;
+  cores: SysinfoCore*;      // logical entries
+  pkg_temp_c: float64;
+  temp_crit_c: float64;     // the package's critical mark, when known
+  ctx_switches: int64;      // since boot
+  interrupts: int64;
+  ctx_switches_s: float64;  // per second
+  interrupts_s: float64;
+}
+
+// ---- memory (bytes) --------------------------------------------------------
+export struct SysinfoMem {
+  status: int32;
+  total: int64;
+  used: int64;              // total - available
+  available: int64;
+  free: int64;
+  buffers: int64;
+  cached: int64;            // page cache plus reclaimable slab
+  shared: int64;
+  used_pct: float64;
+  swap_total: int64;
+  swap_used: int64;
+  swap_free: int64;
+  swap_used_pct: float64;
+  swap_in_s: float64;       // bytes per second
+  swap_out_s: float64;
+}
+
+// ---- disks -----------------------------------------------------------------
+export struct SysinfoFs {
+  device: string;           // "/dev/nvme0n1p2"
+  mount: string;            // "/"
+  fstype: string;           // "ext4"
+  options: string;          // "rw,relatime"
+  read_only: bool;
+  total: int64;             // bytes
+  used: int64;
+  free: int64;              // free for root
+  avail: int64;             // free for ordinary users
+  used_pct: float64;        // used / (used + avail), as df shows it
+  inodes_total: int64;
+  inodes_used: int64;
+  inodes_free: int64;
+}
+
+export struct SysinfoBlock {
+  name: string;             // "nvme0n1", "sda1"
+  partition: bool;
+  reads: int64;             // completed, since boot
+  writes: int64;
+  read_bytes: int64;
+  write_bytes: int64;
+  read_bps: float64;        // bytes per second
+  write_bps: float64;
+  read_iops: float64;
+  write_iops: float64;
+  busy_pct: float64;        // time the device had I/O in flight
+}
+
+export struct SysinfoDisk {
+  status: int32;
+  fs: SysinfoFs*;
+  n_fs: int32;
+  dev: SysinfoBlock*;
+  n_dev: int32;
+}
+
+// ---- network ---------------------------------------------------------------
+export struct SysinfoAddr {
+  family: int32;            // 4 or 6
+  addr: string;             // "192.168.1.5", "fe80::1"
+  prefix: int32;            // prefix length
+}
+
+export struct SysinfoNetIf {
+  name: string;
+  index: int32;
+  mac: string;              // "aa:bb:cc:dd:ee:ff", empty when none
+  mtu: int32;
+  up: bool;                 // administratively up
+  running: bool;            // carrier present (operstate up)
+  loopback: bool;
+  speed_mbps: int64;        // link speed, or -1
+  addrs: SysinfoAddr*;
+  n_addrs: int32;
+  rx_bytes: int64;
+  tx_bytes: int64;
+  rx_packets: int64;
+  tx_packets: int64;
+  rx_errors: int64;
+  tx_errors: int64;
+  rx_drops: int64;
+  tx_drops: int64;
+  rx_bps: float64;          // bytes per second
+  tx_bps: float64;
+  rx_pps: float64;          // packets per second
+  tx_pps: float64;
+  rx_errors_s: float64;
+  tx_errors_s: float64;
+  rx_drops_s: float64;
+  tx_drops_s: float64;
+}
+
+export struct SysinfoNet {
+  status: int32;
+  ifs: SysinfoNetIf*;
+  n_ifs: int32;
+  tcp: int64;               // IPv4 TCP sockets in use
+  tcp6: int64;
+  tcp_time_wait: int64;
+  tcp_orphan: int64;
+  udp: int64;
+  udp6: int64;
+}
+
+// ---- processes -------------------------------------------------------------
+export struct SysinfoProc {
+  pid: int32;
+  ppid: int32;
+  name: string;             // the kernel's short name (comm)
+  cmdline: string;          // arguments joined by spaces
+  exe: string;              // empty when not allowed
+  state: uint8;             // 'R', 'S', 'D', 'Z', 'T', 'I' ...
+  uid: int32;
+  gid: int32;
+  user: string;             // the name for uid, or the number
+  group: string;
+  nice: int32;
+  priority: int32;
+  threads: int32;
+  start_time: int64;        // Unix seconds
+  utime_s: float64;         // CPU time in user mode, seconds
+  stime_s: float64;
+  cpu_pct: float64;         // percent of one core; 400 means four busy cores
+  cpu_total_pct: float64;   // percent of the whole machine
+  rss: int64;               // bytes
+  vms: int64;
+  shared: int64;            // with SYSINFO_PROC_SHARED, else -1
+  mem_pct: float64;         // rss / total memory
+  io_read_bytes: int64;     // storage bytes, with SYSINFO_PROC_IO
+  io_write_bytes: int64;
+  io_read_bps: float64;
+  io_write_bps: float64;
+  open_files: int32;        // with SYSINFO_PROC_FILES
+  // The tree, as indexes into SysinfoProcs.list (-1 for none).
+  parent: int32;
+  first_child: int32;
+  next_sibling: int32;
+  start_ticks: int64;       // internal: start in clock ticks after boot
+}
+
+export struct SysinfoProcs {
+  status: int32;
+  list: SysinfoProc*;       // sorted by pid
+  n: int32;
+  threads: int32;           // sum over all processes
+  running: int32;
+  sleeping: int32;
+  zombies: int32;
+}
+
+// ---- sensors ---------------------------------------------------------------
+export const SYSINFO_SENSOR_TEMP = 1;     // degrees C
+export const SYSINFO_SENSOR_FAN = 2;      // RPM
+export const SYSINFO_SENSOR_VOLT = 3;     // volts
+export const SYSINFO_SENSOR_POWER = 4;    // watts
+export const SYSINFO_SENSOR_CURRENT = 5;  // amperes
+
+export struct SysinfoSensor {
+  chip: string;             // "coretemp", "nvme", "amdgpu"
+  label: string;            // "Package id 0", "Composite", or "temp1"
+  kind: int32;              // SYSINFO_SENSOR_*
+  value: float64;           // NA (or NA_TEMP) when the read failed
+  min: float64;
+  max: float64;
+  crit: float64;
+}
+
+export struct SysinfoSensors {
+  status: int32;
+  list: SysinfoSensor*;
+  n: int32;
+}
+
+// ---- GPU -------------------------------------------------------------------
+export const SYSINFO_GPU_OTHER = 0;
+export const SYSINFO_GPU_AMD = 1;
+export const SYSINFO_GPU_INTEL = 2;
+export const SYSINFO_GPU_NVIDIA = 3;
+
+export struct SysinfoGpu {
+  vendor: int32;            // SYSINFO_GPU_*
+  vendor_name: string;
+  name: string;
+  driver: string;           // "amdgpu", "i915", "xe", "nvidia"
+  pci_slot: string;         // "0000:03:00.0"
+  util_pct: float64;
+  mem_used: int64;          // bytes of video memory
+  mem_total: int64;
+  temp_c: float64;
+  power_w: float64;
+  power_cap_w: float64;
+  clock_core_mhz: float64;
+  clock_mem_mhz: float64;
+}
+
+export struct SysinfoGpus {
+  status: int32;
+  list: SysinfoGpu*;
+  n: int32;
+}
+
+// ---- battery ---------------------------------------------------------------
+export const SYSINFO_BAT_UNKNOWN = 0;
+export const SYSINFO_BAT_CHARGING = 1;
+export const SYSINFO_BAT_DISCHARGING = 2;
+export const SYSINFO_BAT_FULL = 3;
+export const SYSINFO_BAT_NOT_CHARGING = 4;
+
+export struct SysinfoBattery {
+  name: string;             // "BAT0"
+  present: bool;
+  status: int32;            // SYSINFO_BAT_*
+  capacity_pct: float64;
+  rate_w: float64;          // charge or discharge rate, always positive
+  voltage_v: float64;
+  energy_wh: float64;       // now
+  energy_full_wh: float64;
+  energy_design_wh: float64;
+  health_pct: float64;      // full / design
+  time_to_empty_s: float64; // while discharging
+  time_to_full_s: float64;  // while charging
+  cycles: int32;
+  technology: string;
+  model: string;
+  manufacturer: string;
+}
+
+export struct SysinfoPower {
+  status: int32;
+  ac_online: int32;         // 1, 0, or -1 when there is no mains supply entry
+  list: SysinfoBattery*;
+  n: int32;
+}
+
+// ---- the sampler -----------------------------------------------------------
+export struct Sysinfo {
+  what: uint32;             // sections opened
+  system: SysinfoSystem;
+  cpu: SysinfoCpu;
+  mem: SysinfoMem;
+  disk: SysinfoDisk;
+  net: SysinfoNet;
+  procs: SysinfoProcs;
+  sensors: SysinfoSensors;
+  gpus: SysinfoGpus;
+  power: SysinfoPower;
+  os: uint8*;               // the platform backend's private state
+}

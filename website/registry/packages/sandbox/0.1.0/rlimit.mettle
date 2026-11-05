@@ -1,0 +1,38 @@
+// Resource limits (setrlimit) for the current process; a sandboxed child
+// sets its own after clone. The limits are inherited across exec.
+
+import "sys.mettle";
+
+export const SANDBOX_RLIMIT_CPU = 0;      // CPU seconds, then SIGXCPU and SIGKILL
+export const SANDBOX_RLIMIT_FSIZE = 1;    // largest file it may write, in bytes
+export const SANDBOX_RLIMIT_DATA = 2;     // data segment and heap, in bytes
+export const SANDBOX_RLIMIT_STACK = 3;    // stack, in bytes
+export const SANDBOX_RLIMIT_CORE = 4;     // core dump size; 0 turns dumps off
+export const SANDBOX_RLIMIT_NPROC = 6;    // processes for this user id
+export const SANDBOX_RLIMIT_NOFILE = 7;   // open file descriptors
+export const SANDBOX_RLIMIT_MEMLOCK = 8;  // locked memory, in bytes
+export const SANDBOX_RLIMIT_AS = 9;       // address space, in bytes
+export const SANDBOX_RLIMIT_COUNT = 16;   // resource numbers are below this
+
+export const SANDBOX_RLIM_INFINITY: uint64 = 0xffffffffffffffff;
+
+struct SbxRlim { cur: uint64; max: uint64; }
+
+// Sets one limit on the current process. Raising the hard limit needs
+// CAP_SYS_RESOURCE; lowering it never comes back. Returns 0 or -errno.
+export fn sandbox_rlimit_set(resource: int32, soft: uint64, hard: uint64) -> int64 {
+  if (resource < 0 || resource >= SANDBOX_RLIMIT_COUNT || soft > hard) { return -SANDBOX_EINVAL; }
+  var l: SbxRlim = { cur: soft, max: hard };
+  return syscall(SBX_NR_PRLIMIT64, 0, (int64)resource, &l, 0);
+}
+
+// Reads one limit of the current process. Returns 0 or -errno.
+export fn sandbox_rlimit_get(resource: int32, soft: uint64*, hard: uint64*) -> int64 {
+  if (resource < 0 || resource >= SANDBOX_RLIMIT_COUNT) { return -SANDBOX_EINVAL; }
+  var l: SbxRlim;
+  var r: int64 = syscall(SBX_NR_PRLIMIT64, 0, (int64)resource, 0, &l);
+  if (r < 0) { return r; }
+  *soft = l.cur;
+  *hard = l.max;
+  return 0;
+}

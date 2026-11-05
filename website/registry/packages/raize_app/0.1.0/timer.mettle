@@ -1,0 +1,110 @@
+// raize/app/timer — rz_every: periodic callbacks on one timer thread.
+// reference: app
+// thread: rz_every in the declaration function; the callbacks run on the timer
+// thread, which rz_run starts after binding and joins before returning.
+//
+// One thread serves every timer: it sleeps until the nearest deadline (at most
+// 20 ms at a time, so a stop is noticed quickly), then calls each due timer with
+// its call count. A callback that overruns delays the others; a timer that falls
+// behind skips the missed periods instead of firing in a burst.
+
+import "std/thread";
+import "std/bench";
+import "raize_core/str/str";
+import "types";
+import "declare";
+
+const RZ__TIMER_SLICE_MS: int64 = 20;
+const RZ__TIMER_MAX_MS: int64 = 86400000;
+
+/// Calls `tick(n)` every `every_ms` milliseconds while the app serves, with n = 1,
+/// 2, 3, ... The first call comes one period after the server starts listening.
+///
+/// in:      app       the app
+///          every_ms  the period, 1..86400000 (one day)
+///          tick      fn(n: int64); runs on the timer thread, so it may call only
+///                    any-thread APIs (`<signal>_publish`, rz_broadcast, data layers)
+/// returns: nothing; a bad period or more than 16 timers is reported by rz_run
+/// owns:    nothing
+/// thread:  the declaration function only; `tick` on the timer thread
+/// example:
+///   fn tick(n: int64) { todos_publish("todos", Tick((int32)n)); }
+///   rz_every(app, 1000, &tick);
+export fn rz_every(app: RzApp*, every_ms: int64, tick: fn(int64) -> void) {
+  if (app == 0) { return; }
+  var t: Rz_Timers* = &app->state->timers;
+  if (every_ms < 1 || every_ms > RZ__TIMER_MAX_MS) {
+    rz__app_error(app, "rz_every({every_ms}): the period must be 1..86400000 ms — pass milliseconds, e.g. 1000");
+    return;
+  }
+  if (tick == 0) {
+    rz__app_error(app, "rz_every({every_ms}): no callback — pass &your_tick");
+    return;
+  }
+  if (t->count >= RZ__APP_MAX_TIMERS) {
+    rz__app_error(app, "rz_every({every_ms}): more than {RZ__APP_MAX_TIMERS} timers — drive several jobs from one tick");
+    return;
+  }
+  t->items[t->count].every_ms = every_ms;
+  t->items[t->count].tick = tick;
+  t->items[t->count].n = 0;
+  t->count = t->count + 1;
+}
+
+fn rz__now_ms() -> int64 {
+  return bench_time_us() / 1000;
+}
+
+// Runs the due timers; returns the time of the next deadline.
+fn rz__timers_fire(t: Rz_Timers*, now: int64) -> int64 {
+  var next: int64 = now + RZ__TIMER_SLICE_MS;
+  for i in 0..t->count {
+    var it: Rz_Timer* = &t->items[i];
+    if (now >= it->next_ms) {
+      it->n = it->n + 1;
+      it->tick(it->n);
+      it->next_ms = it->next_ms + it->every_ms;
+      if (it->next_ms <= now) { it->next_ms = now + it->every_ms; }   // fell behind: skip
+    }
+    if (it->next_ms < next) { next = it->next_ms; }
+  }
+  return next;
+}
+
+fn rz__timers_main(arg: cstring) -> uint32 {
+  var t: Rz_Timers* = (Rz_Timers*)arg;
+  while (t->stop == 0) {
+    var now: int64 = rz__now_ms();
+    var wait: int64 = rz__timers_fire(t, now) - rz__now_ms();
+    if (wait > RZ__TIMER_SLICE_MS) { wait = RZ__TIMER_SLICE_MS; }
+    if (wait > 0) { thread_sleep_ms((uint32)wait); }
+  }
+  return 0;
+}
+
+/// internal: app/run. Starts the timer thread when any timer is declared.
+/// in:      app the app (declarations done)
+/// returns: the thread handle, 0 when there are no timers; -1 when no thread could
+///          be created
+/// owns:    the caller joins it with rz__timers_stop
+export fn rz__timers_start(app: RzApp*) -> int64 {
+  var t: Rz_Timers* = &app->state->timers;
+  if (t->count == 0) { return 0; }
+  var now: int64 = rz__now_ms();
+  for i in 0..t->count { t->items[i].next_ms = now + t->items[i].every_ms; }
+  t->stop = 0;
+  var h: int64 = CreateThread(0, 0, &rz__timers_main, (cstring)t, 0, 0);
+  if (h <= 0) { return -1; }
+  return h;
+}
+
+/// internal: app/run. Stops and joins the timer thread (after the running callback).
+/// in:      app the app; h the handle from rz__timers_start (<= 0 is ignored)
+/// returns: nothing
+/// owns:    closes `h`
+export fn rz__timers_stop(app: RzApp*, h: int64) {
+  if (h <= 0) { return; }
+  atomic_exchange_i32(&app->state->timers.stop, 1);
+  thread_join_infinite(h);
+  thread_close(h);
+}

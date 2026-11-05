@@ -1,0 +1,7 @@
+name = sysinfo
+version = 0.1.1
+description = System information for Mettle: CPU, memory, disks, network, processes, sensors, GPUs and batteries
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Sysinfo
+compiler = 0.18.0
+platforms = linux

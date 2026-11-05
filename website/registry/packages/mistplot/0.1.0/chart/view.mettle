@@ -1,0 +1,263 @@
+//! View building: picks the visible x range of a frame (window at the caller's time or at
+//! the newest sample, fixed range or the data extent) and reduces each series to at most
+//! about four points per pixel column into its own grow-only view arrays. A series of at most MP_SUMMARY_MIN_LEN samples is scanned
+//! directly; a longer sorted line, area or scatter series goes through its MpSummary
+//! (O(width)); anything else falls back to mp_col_decimate (O(n)). Uses chart/chart and
+//! data. Steady frames allocate nothing.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/data/col";
+import "mistplot/data/summary";
+import "mistplot/data/decimate";
+import "mistplot/chart/chart";
+
+const VIEW_LOWEST: float64 = -1.7e308;
+
+/// The data range one frame shows, as found by mp_view_build.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpViewRange {
+  any: bool;        /// some series has a finite visible point
+  x0: float64;      /// visible x start, data units (bars: 0)
+  x1: float64;      /// visible x end, data units (bars: band count)
+  y0: float64;      /// smallest finite visible y
+  y1: float64;      /// largest finite visible y
+  bands: int32;     /// bars: band count (longest series), else 0
+  windowed: bool;   /// x0, x1 come from mp_chart_window
+}
+
+fn view_reserve(d: MpSeriesData*, cap: int64) -> int32 {
+  if (cap <= d->vcap && d->vx != 0) { return MP_OK; }
+  var nx: float64* = (float64*)mp_alloc(cap * 8);
+  if (nx == 0) { return MP_ERR_ALLOC; }
+  var ny: float64* = (float64*)mp_alloc(cap * 8);
+  if (ny == 0) {
+    mp_free((rawptr)nx);
+    return MP_ERR_ALLOC;
+  }
+  if (d->vx != 0) { mp_free((rawptr)d->vx); }
+  if (d->vy != 0) { mp_free((rawptr)d->vy); }
+  d->vx = nx;
+  d->vy = ny;
+  d->vcap = cap;
+  d->vn = 0;
+  return MP_OK;
+}
+
+// Smallest and largest finite x of a column; false when it has none.
+fn view_col_x(col: MpCol*, lo: float64*, hi: float64*) -> bool {
+  var n: int64 = mp_col_len(col);
+  if (mp_col_sorted(col)) {
+    var i: int64 = mp_col_lower_bound(col, VIEW_LOWEST);
+    if (i >= n || !col->has_last) { return false; }
+    *lo = mp_col_x(col, i);
+    *hi = col->last_x;
+    return true;
+  }
+  var found: bool = false;
+  var j: int64 = 0;
+  while (j < n) {
+    var x: float64 = mp_col_x(col, j);
+    if (is_finite(x) != 0) {
+      if (!found || x < *lo) { *lo = x; }
+      if (!found || x > *hi) { *hi = x; }
+      found = true;
+    }
+    j = j + 1;
+  }
+  return found;
+}
+
+fn view_extent(c: MpChart*, x0: float64*, x1: float64*) -> bool {
+  var found: bool = false;
+  var i: int32 = 0;
+  while (i < c->n_series) {
+    var a: float64 = 0.0;
+    var b: float64 = 0.0;
+    if (view_col_x(&c->series[(int64)i].col, &a, &b)) {
+      if (!found || a < *x0) { *x0 = a; }
+      if (!found || b > *x1) { *x1 = b; }
+      found = true;
+    }
+    i = i + 1;
+  }
+  return found;
+}
+
+// The window [latest - span, latest], its start clamped up to the oldest retained x.
+fn view_window(c: MpChart*, x0: float64*, x1: float64*) -> bool {
+  var lo: float64 = 0.0;
+  var hi: float64 = 0.0;
+  if (!view_extent(c, &lo, &hi)) { return false; }
+  var b: float64 = c->latest_x;
+  var a: float64 = b - c->span;
+  if (lo > a) { a = lo; }
+  if (!(b > a)) {
+    a = b;
+    b = a + c->span;
+  }
+  if (is_finite(a) == 0 || is_finite(b) == 0 || !(b > a)) { return false; }
+  *x0 = a;
+  *x1 = b;
+  return true;
+}
+
+// Moves a lead point (left of x0) onto x0 along its segment to the next point.
+fn view_clip_lead(d: MpSeriesData*, x0: float64) {
+  if (d->vn < 2 || !(d->vx[0] < x0)) { return; }
+  var xa: float64 = d->vx[0];
+  var xb: float64 = d->vx[1];
+  if (!(xb > xa)) { return; }
+  var t: float64 = (x0 - xa) / (xb - xa);
+  d->vy[0] = d->vy[0] + (d->vy[1] - d->vy[0]) * t;
+  d->vx[0] = x0;
+}
+
+// With a caller time, a line to the first sample after x1 ends on x1 instead of at the
+// last sample before it (the view has one spare slot for this).
+fn view_clip_trail(d: MpSeriesData*, x1: float64) {
+  var col: MpCol* = &d->col;
+  if (d->vn < 1 || !mp_col_sorted(col)) { return; }
+  var xa: float64 = d->vx[d->vn - 1];
+  var ya: float64 = d->vy[d->vn - 1];
+  if (!(xa < x1) || is_finite(ya) == 0) { return; }
+  var i: int64 = mp_col_lower_bound(col, x1);
+  if (i >= mp_col_len(col)) { return; }
+  var xb: float64 = mp_col_x(col, i);
+  var yb: float64 = mp_col_y(col, i);
+  if (!(xb > x1) || is_finite(xb) == 0 || is_finite(yb) == 0) { return; }
+  d->vx[d->vn] = x1;
+  d->vy[d->vn] = ya + (yb - ya) * ((x1 - xa) / (xb - xa));
+  d->vn = d->vn + 1;
+}
+
+fn view_series(c: MpChart*, d: MpSeriesData*, r: MpViewRange*, cols: int32,
+               lead: bool) -> int32 {
+  var cap: int64 = (int64)cols * 4 + 2;
+  var rc: int32 = view_reserve(d, cap + 1);
+  if (rc != MP_OK) { return rc; }
+  var col: MpCol* = &d->col;
+  var n: int64 = 0;
+  var big: bool = mp_col_len(col) > MP_SUMMARY_MIN_LEN && mp_col_sorted(col);
+  if (big) {
+    var span: float64 = 0.0;
+    if (r->windowed) { span = c->span; }
+    mp_summary_set_span(&d->sum, span);
+    n = mp_summary_emit(&d->sum, col, r->x0, r->x1, cols, lead, d->vx, d->vy, cap);
+  } else {
+    n = mp_col_decimate(col, r->x0, r->x1, cols, lead, d->vx, d->vy, cap);
+  }
+  if (n < 0) {
+    d->vn = 0;
+    return (int32)(0 - n);
+  }
+  d->vn = n;
+  if (lead) { view_clip_lead(d, r->x0); }
+  if (lead && r->windowed && c->has_now) { view_clip_trail(d, r->x1); }
+  return MP_OK;
+}
+
+fn view_y(d: MpSeriesData*, r: MpViewRange*) {
+  var i: int64 = 0;
+  while (i < d->vn) {
+    var x: float64 = d->vx[i];
+    var y: float64 = d->vy[i];
+    if (is_finite(x) != 0 && is_finite(y) != 0) {
+      if (!r->any || y < r->y0) { r->y0 = y; }
+      if (!r->any || y > r->y1) { r->y1 = y; }
+      r->any = true;
+    }
+    i = i + 1;
+  }
+}
+
+// Bars: the view is every sample, x = its band index.
+fn view_bars(c: MpChart*, r: MpViewRange*) -> int32 {
+  var i: int32 = 0;
+  while (i < c->n_series) {
+    var d: MpSeriesData* = &c->series[(int64)i];
+    var n: int64 = mp_col_len(&d->col);
+    if (n > (int64)MP_MAX_CATEGORIES) { n = (int64)MP_MAX_CATEGORIES; }
+    var rc: int32 = view_reserve(d, n + 1);
+    if (rc != MP_OK) { return rc; }
+    var j: int64 = 0;
+    while (j < n) {
+      d->vx[j] = (float64)j;
+      d->vy[j] = mp_col_y(&d->col, j);
+      j = j + 1;
+    }
+    d->vn = n;
+    if ((int32)n > r->bands) { r->bands = (int32)n; }
+    view_y(d, r);
+    i = i + 1;
+  }
+  r->x0 = 0.0;
+  r->x1 = (float64)r->bands;
+  return MP_OK;
+}
+
+fn view_range(c: MpChart*, r: MpViewRange*) -> bool {
+  if (c->span > 0.0 && c->has_now && is_finite(c->now - c->span) != 0) {
+    r->x0 = c->now - c->span;
+    r->x1 = c->now;
+    r->windowed = true;
+    return r->x1 > r->x0;
+  }
+  if (c->span > 0.0 && c->has_latest && view_window(c, &r->x0, &r->x1)) {
+    r->windowed = true;
+    return true;
+  }
+  if (c->x_fixed) {
+    r->x0 = c->x_lo;
+    r->x1 = c->x_hi;
+    return true;
+  }
+  return view_extent(c, &r->x0, &r->x1);
+}
+
+/// Fills every series' view for one frame and reports the visible range.
+///
+/// @param c The chart. Valid: non-zero, entered.
+/// @param cols Pixel columns of the target (device px across, at most MP_SUMMARY_BUCKETS).
+///   Valid: >= 1; smaller counts as 1.
+/// @param out Receives the range. Valid: non-zero.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG c or out is 0.
+/// @error MP_ERR_ALLOC a view or summary could not grow; views of later series are empty.
+/// @mem Views grow only (4 * cols + 2 points per series) and belong to the chart.
+/// @thread Call with the chart entered.
+/// @cost O(cols) per large sorted series, O(n) for small or unsorted ones.
+export fn mp_view_build(c: MpChart*, cols: int32, out: MpViewRange*) -> int32 {
+  if (c == 0 || out == 0) { return MP_ERR_ARG; }
+  var r: MpViewRange;
+  r.any = false;
+  r.x0 = 0.0;
+  r.x1 = 0.0;
+  r.y0 = 0.0;
+  r.y1 = 0.0;
+  r.bands = 0;
+  r.windowed = false;
+  var k: int32 = cols;
+  if (k < 1) { k = 1; }
+  if (k > MP_SUMMARY_BUCKETS) { k = MP_SUMMARY_BUCKETS; }
+  var rc: int32 = MP_OK;
+  if (c->kind == MP_BAR) {
+    rc = view_bars(c, &r);
+  } else {
+    var have: bool = view_range(c, &r);
+    var lead: bool = c->kind != MP_SCATTER && (r.windowed || c->x_fixed);
+    var i: int32 = 0;
+    while (i < c->n_series && rc == MP_OK) {
+      var d: MpSeriesData* = &c->series[(int64)i];
+      d->vn = 0;
+      if (have) { rc = view_series(c, d, &r, k, lead); }
+      view_y(d, &r);
+      i = i + 1;
+    }
+  }
+  *out = r;
+  return rc;
+}

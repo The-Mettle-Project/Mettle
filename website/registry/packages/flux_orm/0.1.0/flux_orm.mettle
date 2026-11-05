@@ -1,0 +1,32 @@
+// flux_orm: the import root. An app imports this one file to get the whole ORM:
+// values and metadata, the adapter interface, queries, changesets, relations,
+// migrations and the repo.
+//
+// Not included, import them where you use them:
+//   core/clock_linux  the real clock for rc_clock_set (a syscall)
+//   adapter/meodb    the MeoDB network adapter (pulls in std/net and
+//                     adapter/wire)
+//   adapter/mem       the in-memory test adapter
+
+import "core/status";
+import "core/value";
+import "core/meta";
+import "core/schema";
+import "core/entity";
+import "core/buf";
+import "core/clock";
+import "core/session";
+import "core/persist";
+import "adapter/adapter";
+import "query/dialect";
+import "query/builder";
+import "changeset/cast";
+import "changeset/changeset";
+import "changeset/validate";
+import "relation/relation";
+import "relation/load";
+import "migration/ddl";
+import "migration/version";
+import "migration/schema";
+import "repo/repo";
+import "repo/multi";

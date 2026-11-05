@@ -1,0 +1,69 @@
+// The transport a call runs on: one HTTP/2 connection, seen as streams.
+//
+// grpc never touches frames itself. A transport is a table of functions
+// over some HTTP/2 connection (std/http2 over TCP or mtls, or the
+// in-memory pair in grpc/memtransport used by the tests). Every function
+// takes the transport's `user` pointer first.
+import "std/hpack";
+
+export const GRPC_TEV_NONE = 0;
+export const GRPC_TEV_HEADERS = 1;   // headers or trailers for a stream (end_stream marks trailers)
+export const GRPC_TEV_DATA = 2;      // DATA bytes for a stream
+export const GRPC_TEV_RESET = 3;     // the peer reset a stream (code = HTTP/2 error code)
+export const GRPC_TEV_GOAWAY = 4;    // the peer is going away (last_stream, code)
+export const GRPC_TEV_PING_ACK = 5;  // our ping came back (rtt_ns)
+export const GRPC_TEV_PING = 6;      // the peer pinged us (already answered)
+export const GRPC_TEV_WRITABLE = 7;  // a stream (0 = the connection) can take more DATA
+export const GRPC_TEV_SLOT = 8;      // a concurrent-stream slot is free again
+export const GRPC_TEV_CLOSED = 9;    // the connection is gone
+
+// HTTP/2 error codes grpc uses (RFC 9113 section 7).
+export const GRPC_H2_NO_ERROR = 0;
+export const GRPC_H2_PROTOCOL_ERROR = 1;
+export const GRPC_H2_INTERNAL_ERROR = 2;
+export const GRPC_H2_FLOW_CONTROL_ERROR = 3;
+export const GRPC_H2_REFUSED_STREAM = 7;
+export const GRPC_H2_CANCEL = 8;
+export const GRPC_H2_ENHANCE_YOUR_CALM = 11;
+export const GRPC_H2_INADEQUATE_SECURITY = 12;
+
+// open_stream results below zero.
+export const GRPC_T_NO_SLOT: int64 = -2;   // at MAX_CONCURRENT_STREAMS; wait for GRPC_TEV_SLOT
+export const GRPC_T_CLOSED: int64 = -3;    // the connection is gone or going away
+
+export struct GrpcTEvent {
+  kind: int32;
+  stream: int64;
+  headers: HpackHeader*;   // valid until the next poll
+  nheaders: int64;
+  end_stream: bool;
+  data: uint8*;            // valid until the next poll
+  len: int64;
+  code: int64;             // HTTP/2 error code (RESET, GOAWAY, CLOSED)
+  last_stream: int64;      // GOAWAY: streams above this were never processed
+  rtt_ns: int64;           // PING_ACK
+}
+
+export struct GrpcTransport {
+  user: rawptr;
+  // Client: starts a stream with request headers. Returns the stream id,
+  // GRPC_T_NO_SLOT or GRPC_T_CLOSED.
+  open_stream: fn(rawptr, HpackHeader*, int64, bool) -> int64;
+  // Headers on a stream: server response headers, or trailers when the
+  // bool (end_stream) is set. Returns 0 or a negative error.
+  send_headers: fn(rawptr, int64, HpackHeader*, int64, bool) -> int32;
+  // DATA on a stream. Returns how many bytes it took (flow control may
+  // take fewer, even none: wait for GRPC_TEV_WRITABLE), or below zero if
+  // the stream is gone. end_stream applies only once all n are taken.
+  send_data: fn(rawptr, int64, uint8*, int64, bool) -> int64;
+  // RST_STREAM with an HTTP/2 error code.
+  reset: fn(rawptr, int64, int64) -> void;
+  // The application used n DATA bytes of a stream: open the windows.
+  consumed: fn(rawptr, int64, int64) -> void;
+  ping: fn(rawptr) -> int32;
+  goaway: fn(rawptr, int64, string) -> void;
+  // Waits up to timeout_ns (0 = do not wait, below 0 = forever) for the
+  // next event. Returns 1 with an event, 0 on timeout, below 0 when closed.
+  poll: fn(rawptr, GrpcTEvent*, int64) -> int32;
+  close: fn(rawptr) -> void;
+}

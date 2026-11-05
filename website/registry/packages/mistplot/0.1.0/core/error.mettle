@@ -1,0 +1,40 @@
+//! Error codes shared by every MistPlot function, the element-count limit, and their
+//! English text. Imports nothing and allocates nothing; it is the bottom of the graph.
+//! Every function that can fail returns one of the MP_* codes (or -1 for an index).
+
+/// Success.
+export const MP_OK: int32 = 0;
+/// An argument is out of its documented range (a null pointer, a bad index or mode).
+export const MP_ERR_ARG: int32 = 1;
+/// An allocation failed or would exceed MP_MAX_COUNT.
+export const MP_ERR_ALLOC: int32 = 2;
+/// The call is not valid in the object's current state.
+export const MP_ERR_STATE: int32 = 3;
+/// A file or stream operation failed.
+export const MP_ERR_IO: int32 = 4;
+/// A documented size limit (series, categories, text length, cells) was exceeded.
+export const MP_ERR_LIMIT: int32 = 5;
+
+/// Largest element count of any MistPlot array (2^28).
+/// Every count * size computed from a caller's number is checked against it first, so
+/// the product cannot wrap into a small allocation. Byte buffers allow MP_MAX_COUNT * 8.
+export const MP_MAX_COUNT: int64 = 268435456;
+
+/// English text for an error code.
+///
+/// @param code An MP_* code. Valid: any; an unknown code gives "unknown error".
+/// @return A static literal such as "invalid argument"; never empty.
+/// @mem The text is a static literal: never free it, valid for the whole program.
+/// @thread Safe from any thread.
+/// @cost O(1); no allocation.
+export fn mp_error_str(code: int32) -> string {
+  switch (code) {
+    case 0: { return "ok"; }
+    case 1: { return "invalid argument"; }
+    case 2: { return "out of memory"; }
+    case 3: { return "invalid state"; }
+    case 4: { return "i/o error"; }
+    case 5: { return "limit exceeded"; }
+    default: { return "unknown error"; }
+  }
+}

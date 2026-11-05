@@ -1,0 +1,206 @@
+// raize/context/cookie — reading the Cookie header, writing Set-Cookie.
+// reference: handlers
+// thread: every function runs on the worker serving the request (rz__cookie_find
+// is pure and any-thread).
+//
+// Values are not encoded or decoded: a cookie value is opaque bytes to raize. A
+// value that could end the attribute list or the header (CR, LF, `;`, NUL) is
+// refused, never escaped. Each rz_ctx_set_cookie adds its own Set-Cookie line, so
+// one response can set several cookies.
+
+import "../str/str";
+import "../core/status";
+import "arena";
+import "header";
+import "request";
+import "response";
+import "context";
+
+/// Attributes of a cookie being set. Start from rz_cookie_defaults() and change
+/// what differs.
+export struct RzCookie {
+  max_age_s: int32;    // seconds until it expires; 0 = a session cookie (no Max-Age)
+  path: string;        // the Path attribute ("/"); borrowed for the call
+  http_only: bool;     // not readable from JavaScript (default true)
+  secure: bool;        // HTTPS only (default false; set it in production)
+  same_site: string;   // "Lax" (default), "Strict", "None" (needs secure) or "" to omit; borrowed
+}
+
+/// The safe defaults: session cookie, Path=/, HttpOnly, not Secure, SameSite=Lax.
+///
+/// in:      nothing
+/// returns: the options, to adjust and pass to rz_ctx_set_cookie
+/// owns:    nothing; the strings are literals
+/// thread:  any
+/// example:
+///   var o: RzCookie = rz_cookie_defaults();
+///   o.max_age_s = 86400;
+export fn rz_cookie_defaults() -> RzCookie {
+  var o: RzCookie;
+  o.max_age_s = 0;
+  o.path = "/";
+  o.http_only = true;
+  o.secure = false;
+  o.same_site = "Lax";
+  return o;
+}
+
+// True when every byte may appear in a cookie value or attribute.
+fn rz__cookie_bytes_ok(s: string) -> bool {
+  for i in 0..(int64)s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 13 || c == 10 || c == 59 || c == 0) { return false; }
+  }
+  return true;
+}
+
+/// internal: context/cookie, context/conn. Finds cookie `name` in a Cookie header
+/// value ("a=1; b=2"); surrounding double quotes on the value are removed.
+/// in:      header the Cookie header value; name the cookie; out receives the value
+/// returns: true when found (*out is "" otherwise)
+/// owns:    *out is a view into `header`
+export fn rz__cookie_find(header: string, name: string, out: string*) -> bool {
+  *out = rz_str_empty();
+  var n: int64 = (int64)header.length;
+  var start: int64 = 0;
+  for k in 0..(n + 1) {
+    if (k == n || header.chars[k] == 59) {
+      var pair: string = rz_header_trim(rz_str_sub(header, start, k));
+      var eq: int64 = rz_str_find_byte(pair, 61);
+      if (eq > 0 && rz_str_eq(rz_header_trim(rz_str_sub(pair, 0, eq)), name)) {
+        var v: string = rz_header_trim(rz_str_from(pair, eq + 1));
+        var vn: int64 = (int64)v.length;
+        if (vn >= 2 && v.chars[0] == 34 && v.chars[vn - 1] == 34) { v = rz_str_sub(v, 1, vn - 1); }
+        *out = v;
+        return true;
+      }
+      start = k + 1;
+    }
+  }
+  return false;
+}
+
+/// A cookie the browser sent, by name. When a name appears more than once the
+/// first is returned (browsers send the most specific path first).
+///
+/// in:      ctx   the request
+///          name  the cookie name, matched exactly
+/// returns: the value, or "" when absent
+/// owns:    a view into the request; valid until the handler returns (copy to keep)
+/// thread:  the worker serving the request
+/// example:
+///   var sid: string = rz_ctx_cookie(ctx, "sid");
+export fn rz_ctx_cookie(ctx: RzContext*, name: string) -> string {
+  if (ctx == 0 || ctx->req == 0) { return rz_str_empty(); }
+  var req: RzRequest* = ctx->req;
+  var v: string = rz_str_empty();
+  for i in 0..req->header_count {
+    if (rz_str_eq_ci(req->headers[i].name, "cookie") && rz__cookie_find(req->headers[i].value, name, &v)) {
+      return v;
+    }
+  }
+  return rz_str_empty();
+}
+
+// Adds one Set-Cookie line (never replaces: several cookies need several lines).
+fn rz__cookie_add_line(resp: RzResponse*, line: string) -> int32 {
+  if (resp->header_count >= RZ_MAX_RESP_HEADERS) { return RZ_E_FULL; }
+  var v: string = line;
+  if (resp->arena != 0) {
+    v = rz_arena_str(resp->arena, line);
+    if (v.chars == 0) { return RZ_E_NOMEM; }
+  }
+  var at: int32 = resp->header_count;
+  resp->headers[at].name = "Set-Cookie";
+  resp->headers[at].value = v;
+  resp->header_count = at + 1;
+  return RZ_OK;
+}
+
+fn rz__cookie_write(ctx: RzContext*, name: string, value: string, opts: RzCookie, max_age: int32, clear: bool) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return RZ_E_USAGE; }
+  if (!rz_header_name_ok(name) || !rz__cookie_bytes_ok(value) || !rz__cookie_bytes_ok(opts.path)) { return RZ_E_INVALID; }
+  var ss: string = opts.same_site;
+  var ss_ok: bool = ss.length == 0 || rz_str_eq(ss, "Lax") || rz_str_eq(ss, "Strict") || rz_str_eq(ss, "None");
+  if (!ss_ok || (rz_str_eq(ss, "None") && !opts.secure) || max_age < 0) { return RZ_E_INVALID; }
+  var b: RzBuf* = rz_buf_new_cap(128);
+  rz_buf_add(b, name);
+  rz_buf_add_byte(b, 61);
+  rz_buf_add(b, value);
+  if (opts.path.length > 0) { rz_buf_add(b, "; Path="); rz_buf_add(b, opts.path); }
+  if (max_age > 0 || clear) { rz_buf_add(b, "; Max-Age="); rz_buf_add_int(b, (int64)max_age); }
+  if (opts.http_only) { rz_buf_add(b, "; HttpOnly"); }
+  if (opts.secure) { rz_buf_add(b, "; Secure"); }
+  if (ss.length > 0) { rz_buf_add(b, "; SameSite="); rz_buf_add(b, ss); }
+  var rc: int32 = rz__cookie_add_line(ctx->resp, rz_buf_str(b));
+  rz_buf_free(b);
+  return rc;
+}
+
+/// Sets a cookie on the response (one Set-Cookie line per call).
+///
+/// in:      ctx    the request
+///          name   a token (letters, digits, `!#$%&'*+-.^_|~`)
+///          value  any bytes except CR, LF, `;` and NUL; not encoded (base64url or
+///                 hex it yourself when it is arbitrary data)
+///          opts   attributes; start from rz_cookie_defaults()
+/// returns: RZ_OK; RZ_E_INVALID for a bad name, value, path, same_site, a negative
+///          max_age_s or SameSite=None without secure (nothing is set);
+///          RZ_E_FULL when the response already has 16 headers
+/// owns:    nothing kept; the line is copied into the request arena
+/// thread:  the worker serving the request
+/// example:
+///   var o: RzCookie = rz_cookie_defaults();
+///   o.max_age_s = 3600;
+///   rz_ctx_set_cookie(ctx, "sid", token, o);
+export fn rz_ctx_set_cookie(ctx: RzContext*, name: string, value: string, opts: RzCookie) -> int32 {
+  return rz__cookie_write(ctx, name, value, opts, opts.max_age_s, false);
+}
+
+/// Tells the browser to delete a cookie that was set with the default Path=/.
+///
+/// in:      ctx   the request
+///          name  the cookie name
+/// returns: RZ_OK; RZ_E_INVALID for a bad name; RZ_E_FULL when 16 headers are set
+/// owns:    nothing kept
+/// thread:  the worker serving the request
+/// example:
+///   rz_ctx_clear_cookie(ctx, "sid");
+///   return rz_ctx_redirect(ctx, 303, "/login");
+export fn rz_ctx_clear_cookie(ctx: RzContext*, name: string) -> int32 {
+  return rz__cookie_write(ctx, name, "", rz_cookie_defaults(), 0, true);
+}
+
+@test fn t_rz_cookie_find() -> int32 {
+  var v: string = rz_str_empty();
+  if (!rz__cookie_find("a=1; sid=\"xyz\" ;b=2", "sid", &v)) { return 1; }
+  if (!rz_str_eq(v, "xyz")) { return 2; }
+  if (!rz__cookie_find("a=1;b=2", "b", &v) || !rz_str_eq(v, "2")) { return 3; }
+  if (rz__cookie_find("ab=1", "a", &v)) { return 4; }
+  if (rz__cookie_find("", "a", &v)) { return 5; }
+  return 0;
+}
+
+@test fn t_rz_cookie_set_validates() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  var req: RzRequest;
+  rz_request_init(&req, arena);
+  var resp: RzResponse* = rz_response_new();
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var o: RzCookie = rz_cookie_defaults();
+  if (rz_ctx_set_cookie(&ctx, "sid", "a;b", o) != RZ_E_INVALID) { return 1; }
+  if (rz_ctx_set_cookie(&ctx, "s id", "x", o) != RZ_E_INVALID) { return 2; }
+  o.same_site = "None";
+  if (rz_ctx_set_cookie(&ctx, "sid", "x", o) != RZ_E_INVALID) { return 3; }
+  o = rz_cookie_defaults();
+  o.max_age_s = 60;
+  if (rz_ctx_set_cookie(&ctx, "sid", "abc", o) != RZ_OK) { return 4; }
+  if (rz_ctx_clear_cookie(&ctx, "old") != RZ_OK) { return 5; }
+  if (resp->header_count != 2) { return 6; }
+  if (!rz_str_eq(resp->headers[0].value, "sid=abc; Path=/; Max-Age=60; HttpOnly; SameSite=Lax")) { return 7; }
+  if (!rz_str_eq(resp->headers[1].value, "old=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")) { return 8; }
+  rz_response_free(resp);
+  rz_arena_free(arena);
+  return 0;
+}

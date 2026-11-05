@@ -1,0 +1,122 @@
+// Signed values: "value.SIG" where SIG is base64url (43 characters) of
+//   HMAC-SHA256(key, le64(len(purpose)) || purpose || value)
+// under the config secret (cr_hmac_sha256_* from the crypto library). The
+// purpose string separates uses ("remember-me", "unsubscribe-link"), so a
+// value signed for one cannot be replayed as another. The value is not
+// encrypted: anyone can read it; only the key holder can produce it.
+//
+// Key rotation: ses_verify accepts the current key, then prev_key while
+// cfg.has_prev_key, and reports which one matched so the caller can re-sign.
+
+import "std/conv";
+import "cryptex/cryptex";
+import "status";
+import "types";
+import "config";
+
+/// SES_SIG_LEN: bytes a signature adds to a value ('.' + 43 base64url).
+/// in: -
+/// returns: 44
+/// owns: nothing
+/// thread: constant
+/// example: var cap: int64 = (int64)v.length + (int64)SES_SIG_LEN;
+export const SES_SIG_LEN: int32 = 44;
+
+fn ses_sig_tag(out: CrHmacSha256*, key: CrKey32*, purpose: string, value: string) -> int32 {
+  var st: CrHmacSha256State;
+  if (cr_hmac_sha256_init(&st, &key->b[0], 32) != CR_OK) { return SES_E_CRYPTO; }
+  var pl: uint8[8];
+  var n: int64 = (int64)purpose.length;
+  for i in 0..8 {
+    pl[i] = (uint8)((n >> (i * 8)) & 255);
+  }
+  var rc: int32 = cr_hmac_sha256_update(&st, &pl[0], 8);
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, purpose.chars, n); }
+  if (rc == CR_OK) { rc = cr_hmac_sha256_update(&st, value.chars, (int64)value.length); }
+  if (rc != CR_OK) {
+    cr_wipe(cr_hmac_sha256_state_bytes(&st), 256);
+    return SES_E_CRYPTO;
+  }
+  if (cr_hmac_sha256_final(&st, out) != CR_OK) { return SES_E_CRYPTO; }
+  return SES_OK;
+}
+
+/// Signs a value: writes "value.SIG" into out.
+/// in: m, an initialized manager; purpose, 1..255 bytes naming the use;
+///   value, any bytes (keep it cookie-safe if it goes in a cookie);
+///   out/cap, the output buffer (needs value.length + SES_SIG_LEN bytes);
+///   out_len, receives the written length
+/// returns: SES_OK; SES_E_SPACE (nothing written); SES_E_ARG (null pointer,
+///   manager not initialized, bad purpose length); SES_E_CRYPTO
+/// owns: out is the caller's; the tag temporaries are wiped
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: var b: uint8[256]; var n: int64; ses_sign(&m, "remember", uid, &b[0], 256, &n);
+export fn ses_sign(m: SesManager*, purpose: string, value: string, out: uint8*, cap: int64, out_len: int64*) -> int32 {
+  if (m == 0 || out == 0 || out_len == 0 || !m->ready) { return SES_E_ARG; }
+  *out_len = 0;
+  if (purpose.length == 0 || purpose.length > 255) { return SES_E_ARG; }
+  var vl: int64 = (int64)value.length;
+  if (cap < vl + (int64)SES_SIG_LEN) { return SES_E_SPACE; }
+  var tag: CrHmacSha256;
+  var rc: int32 = ses_sig_tag(&tag, &m->cfg.key, purpose, value);
+  if (rc != SES_OK) { return rc; }
+  var enc: uint8[48];
+  var en: int64 = 0;
+  rc = cr_base64url_encode(&enc[0], 48, &en, &tag.b[0], 32);
+  cr_wipe(&tag.b[0], 32);
+  if (rc != CR_OK || en != 43) { return SES_E_CRYPTO; }
+  for i in 0..vl {
+    out[i] = value.chars[i];
+  }
+  out[vl] = (uint8)'.';
+  for j in 0..43 {
+    out[vl + 1 + (int64)j] = enc[j];
+  }
+  *out_len = vl + 44;
+  return SES_OK;
+}
+
+/// Verifies a signed value in constant time and returns the value part.
+/// in: m, an initialized manager; purpose, the same purpose it was signed
+///   for; signed_value, "value.SIG"; out_value, receives the value;
+///   used_prev, receives true when only prev_key matched (may be 0)
+/// returns: SES_OK; SES_E_INVALID (tampered, wrong key, wrong purpose,
+///   malformed; *out_value is ""); SES_E_ARG; SES_E_CRYPTO
+/// owns: *out_value is a view into signed_value; copy it to keep it
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: var uid: string; var old: bool; if (ses_verify(&m, "remember", c, &uid, &old) != SES_OK) { ... }
+export fn ses_verify(m: SesManager*, purpose: string, signed_value: string, out_value: string*, used_prev: bool*) -> int32 {
+  if (m == 0 || out_value == 0 || !m->ready) { return SES_E_ARG; }
+  *out_value = "";
+  if (used_prev != 0) { *used_prev = false; }
+  if (purpose.length == 0 || purpose.length > 255) { return SES_E_ARG; }
+  var total: int64 = (int64)signed_value.length;
+  if (total < (int64)SES_SIG_LEN) { return SES_E_INVALID; }
+  var vl: int64 = total - (int64)SES_SIG_LEN;
+  if (signed_value.chars[vl] != (uint8)'.') { return SES_E_INVALID; }
+  var got: uint8[48];
+  var gn: int64 = 0;
+  if (cr_base64url_decode(&got[0], 48, &gn, &signed_value.chars[vl + 1], 43) != CR_OK || gn != 32) {
+    return SES_E_INVALID;
+  }
+  var value: string = str_from_bytes((cstring)signed_value.chars, vl);
+  var want: CrHmacSha256;
+  var rc: int32 = ses_sig_tag(&want, &m->cfg.key, purpose, value);
+  if (rc != SES_OK) { return rc; }
+  var ok: bool = cr_equal(&want.b[0], &got[0], 32);
+  var prev: bool = false;
+  if (!ok && m->cfg.has_prev_key) {
+    rc = ses_sig_tag(&want, &m->cfg.prev_key, purpose, value);
+    if (rc != SES_OK) {
+      cr_wipe(&want.b[0], 32);
+      return rc;
+    }
+    ok = cr_equal(&want.b[0], &got[0], 32);
+    prev = ok;
+  }
+  cr_wipe(&want.b[0], 32);
+  if (!ok) { return SES_E_INVALID; }
+  *out_value = value;
+  if (used_prev != 0) { *used_prev = prev; }
+  return SES_OK;
+}

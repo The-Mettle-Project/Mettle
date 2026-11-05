@@ -1,0 +1,457 @@
+// One Opus stream (RFC 6716 sections 3 and 4): the TOC byte, frame
+// packing codes 0 to 3, and the glue between SILK and CELT (hybrid mode,
+// redundant CELT frames at mode switches, cross-fades). A port of
+// opus_decoder.c of libopus (BSD), float build. Output is float, 48 kHz.
+
+import "std/mem";
+import "../core/status";
+import "opus_rc";
+import "opus_celt";
+import "opus_silk";
+
+export const AUDIO_OPUS_MODE_SILK: int32 = 1000;
+export const AUDIO_OPUS_MODE_HYBRID: int32 = 1001;
+export const AUDIO_OPUS_MODE_CELT: int32 = 1002;
+
+// bandwidths: 0 narrow (4 kHz), 1 medium (6), 2 wide (8), 3 super wide (12), 4 full (20)
+
+export struct AudioOpusDec {
+  channels: int32;          // output channels, 1 or 2
+  stream_channels: int32;   // channels coded in the current packet
+  mode: int32;
+  prev_mode: int32;         // 0 before the first packet
+  bandwidth: int32;
+  frame_size: int32;        // samples per frame of the current packet
+  prev_redundancy: int32;
+  final_range: uint32;      // range coder state after the last frame
+  celt: AudioOpusCelt;
+  silk: AudioOpusSilk;
+  silk_pcm: int16[5760];    // 60 ms of SILK output, 2 channels
+  trans: float32[480];      // 5 ms, 2 channels
+  red: float32[480];
+}
+
+/// Prepares a stream decoder for 1 or 2 output channels.
+export fn audio_opus_dec_init(st: AudioOpusDec*, channels: int32) -> int32 {
+  if (channels < 1 || channels > 2) { return AUDIO_E_ARG; }
+  st->channels = channels;
+  st->stream_channels = channels;
+  audio_opus_celt_init(&st->celt, channels);
+  audio_opus_silk_init(&st->silk, channels);
+  audio_opus_dec_reset(st);
+  return AUDIO_OK;
+}
+
+/// Forgets all history (used when seeking).
+export fn audio_opus_dec_reset(st: AudioOpusDec*) {
+  audio_opus_celt_reset(&st->celt);
+  audio_opus_silk_reset(&st->silk);
+  st->stream_channels = st->channels;
+  st->mode = 0;
+  st->prev_mode = 0;
+  st->bandwidth = 0;
+  st->frame_size = 960;
+  st->prev_redundancy = 0;
+  st->final_range = 0;
+}
+
+/// Samples per frame (at 48 kHz) of a packet with this TOC byte.
+export fn audio_opus_toc_frame_size(toc: int32) -> int32 {
+  if ((toc & 0x80) != 0) {
+    return (48000 << ((toc >> 3) & 3)) / 400;
+  }
+  if ((toc & 0x60) == 0x60) {
+    if ((toc & 0x08) != 0) { return 960; }
+    return 480;
+  }
+  var a: int32 = (toc >> 3) & 3;
+  if (a == 3) { return 2880; }
+  return (48000 << a) / 100;
+}
+
+fn toc_mode(toc: int32) -> int32 {
+  if ((toc & 0x80) != 0) { return AUDIO_OPUS_MODE_CELT; }
+  if ((toc & 0x60) == 0x60) { return AUDIO_OPUS_MODE_HYBRID; }
+  return AUDIO_OPUS_MODE_SILK;
+}
+
+fn toc_bandwidth(toc: int32) -> int32 {
+  if ((toc & 0x80) != 0) {
+    var bw: int32 = 1 + ((toc >> 5) & 3);
+    if (bw == 1) { bw = 0; }
+    return bw;
+  }
+  if ((toc & 0x60) == 0x60) {
+    if ((toc & 0x10) != 0) { return 4; }
+    return 3;
+  }
+  return (toc >> 5) & 3;
+}
+
+// The frames of one packet.
+export struct AudioOpusFrames {
+  toc: int32;
+  count: int32;
+  size: int32[48];
+  offset: int32[48];      // where each frame starts in the packet
+  packet_len: int32;      // bytes this packet takes (with padding)
+}
+
+fn parse_size(p: uint8*, len: int32, size: int32*) -> int32 {
+  if (len < 1) { *size = -1; return -1; }
+  if (p[0] < 252) { *size = (int32)p[0]; return 1; }
+  if (len < 2) { *size = -1; return -1; }
+  *size = 4 * (int32)p[1] + (int32)p[0];
+  return 2;
+}
+
+/// Splits a packet into frames (opus_packet_parse). A self-delimited
+/// packet (all streams but the last in a multistream packet) has the size
+/// of its last frame written out. Returns the frame count or < 0.
+export fn audio_opus_parse(data: uint8*, len0: int32, self_delim: bool, f: AudioOpusFrames*) -> int32 {
+  if (len0 <= 0) { return AUDIO_E_DATA; }
+  var len: int32 = len0;
+  var framesize: int32 = audio_opus_toc_frame_size((int32)data[0]);
+  var toc: int32 = (int32)data[0];
+  var pos: int32 = 1;
+  len = len - 1;
+  var last_size: int32 = len;
+  var count: int32 = 1;
+  var cbr: bool = false;
+  var pad: int32 = 0;
+  var c: int32 = toc & 3;
+  if (c == 1) {
+    count = 2;
+    cbr = true;
+    if (!self_delim) {
+      if ((len & 1) != 0) { return AUDIO_E_DATA; }
+      last_size = len / 2;
+      f->size[0] = last_size;
+    }
+  } else if (c == 2) {
+    count = 2;
+    var bytes: int32 = parse_size(data + pos, len, &f->size[0]);
+    if (bytes < 0) { return AUDIO_E_DATA; }
+    len = len - bytes;
+    if (f->size[0] < 0 || f->size[0] > len) { return AUDIO_E_DATA; }
+    pos = pos + bytes;
+    last_size = len - f->size[0];
+  } else if (c == 3) {
+    if (len < 1) { return AUDIO_E_DATA; }
+    var ch: int32 = (int32)data[pos];
+    pos = pos + 1;
+    count = ch & 0x3F;
+    if (count <= 0 || framesize * count > 5760) { return AUDIO_E_DATA; }
+    len = len - 1;
+    if ((ch & 0x40) != 0) {
+      while (true) {
+        if (len <= 0) { return AUDIO_E_DATA; }
+        var p: int32 = (int32)data[pos];
+        pos = pos + 1;
+        len = len - 1;
+        var tmp: int32 = p;
+        if (p == 255) { tmp = 254; }
+        len = len - tmp;
+        pad = pad + tmp;
+        if (p != 255) { break; }
+      }
+    }
+    if (len < 0) { return AUDIO_E_DATA; }
+    cbr = (ch & 0x80) == 0;
+    if (!cbr) {
+      last_size = len;
+      for i in 0..count - 1 {
+        var bytes: int32 = parse_size(data + pos, len, &f->size[i]);
+        if (bytes < 0) { return AUDIO_E_DATA; }
+        len = len - bytes;
+        if (f->size[i] < 0 || f->size[i] > len) { return AUDIO_E_DATA; }
+        pos = pos + bytes;
+        last_size = last_size - (bytes + f->size[i]);
+      }
+      if (last_size < 0) { return AUDIO_E_DATA; }
+    } else if (!self_delim) {
+      last_size = len / count;
+      if (last_size * count != len) { return AUDIO_E_DATA; }
+      for i in 0..count - 1 { f->size[i] = last_size; }
+    }
+  }
+  if (self_delim) {
+    var bytes: int32 = parse_size(data + pos, len, &f->size[count - 1]);
+    if (bytes < 0) { return AUDIO_E_DATA; }
+    len = len - bytes;
+    if (f->size[count - 1] < 0 || f->size[count - 1] > len) { return AUDIO_E_DATA; }
+    pos = pos + bytes;
+    if (cbr) {
+      if (f->size[count - 1] * count > len) { return AUDIO_E_DATA; }
+      for i in 0..count - 1 { f->size[i] = f->size[count - 1]; }
+    } else if (bytes + f->size[count - 1] > last_size) {
+      return AUDIO_E_DATA;
+    }
+  } else {
+    if (last_size > 1275) { return AUDIO_E_DATA; }
+    f->size[count - 1] = last_size;
+  }
+  for i in 0..count {
+    if (f->size[i] > 1275) { return AUDIO_E_DATA; }
+    f->offset[i] = pos;
+    pos = pos + f->size[i];
+  }
+  if (pos > len0) { return AUDIO_E_DATA; }
+  f->toc = toc;
+  f->count = count;
+  f->packet_len = pos + pad;
+  if (f->packet_len > len0) { f->packet_len = len0; }
+  return count;
+}
+
+// out = in1 faded out and in2 faded in over n samples (smooth_fade)
+fn smooth_fade(in1: float32*, in2: float32*, out: float32*, n: int32, channels: int32) {
+  for c in 0..channels {
+    for i in 0..n {
+      var w0: float32 = audio_opus_celt_window(i);
+      var w: float32 = w0 * w0;
+      out[i * channels + c] = w * in2[i * channels + c] + (1.0 - w) * in1[i * channels + c];
+    }
+  }
+}
+
+fn celt_end_band(bw: int32) -> int32 {
+  if (bw == 0) { return 13; }
+  if (bw == 1 || bw == 2) { return 17; }
+  if (bw == 3) { return 19; }
+  return 21;
+}
+
+// Decodes one frame (opus_decode_frame). data == 0 conceals a frame.
+fn decode_frame(st: AudioOpusDec*, data0: uint8*, len0: int32, pcm: float32*, frame_size0: int32) -> int32 {
+  var data: uint8* = data0;
+  var len: int32 = len0;
+  var frame_size: int32 = frame_size0;
+  var nch: int32 = st->channels;
+  var f20: int32 = 960;
+  var f10: int32 = 480;
+  var f5: int32 = 240;
+  var f2_5: int32 = 120;
+  if (frame_size < f2_5) { return AUDIO_E_ARG; }
+  if (frame_size > 2880) { frame_size = 2880; }
+  if (len <= 1) {
+    data = (uint8*)0;
+    if (frame_size > st->frame_size) { frame_size = st->frame_size; }
+  }
+  var audiosize: int32 = 0;
+  var mode: int32 = 0;
+  var bandwidth: int32 = 0;
+  var dec: AudioOpusRc;
+  audio_opus_rc_init(&dec, (uint8*)0, 0);
+  if (data != 0) {
+    audiosize = st->frame_size;
+    mode = st->mode;
+    bandwidth = st->bandwidth;
+    audio_opus_rc_init(&dec, data, len);
+  } else {
+    audiosize = frame_size;
+    mode = st->prev_mode;
+    if (st->prev_redundancy != 0) { mode = AUDIO_OPUS_MODE_CELT; }
+    bandwidth = -1;
+    if (mode == 0) {
+      for i in 0..audiosize * nch { pcm[i] = 0.0; }
+      return audiosize;
+    }
+    if (audiosize > f20) {
+      var left: int32 = audiosize;
+      var at: float32* = pcm;
+      while (left > 0) {
+        var want: int32 = left;
+        if (want > f20) { want = f20; }
+        var ret: int32 = decode_frame(st, (uint8*)0, 0, at, want);
+        if (ret <= 0) { return AUDIO_E_DATA; }
+        at = at + ret * nch;
+        left = left - ret;
+      }
+      return frame_size;
+    } else if (audiosize < f20) {
+      if (audiosize > f10) {
+        audiosize = f10;
+      } else if (mode != AUDIO_OPUS_MODE_SILK && audiosize > f5 && audiosize < f10) {
+        audiosize = f5;
+      }
+    }
+  }
+
+  var transition: bool = false;
+  if (data != 0 && st->prev_mode > 0 && ((mode == AUDIO_OPUS_MODE_CELT && st->prev_mode != AUDIO_OPUS_MODE_CELT && st->prev_redundancy == 0) || (mode != AUDIO_OPUS_MODE_CELT && st->prev_mode == AUDIO_OPUS_MODE_CELT))) {
+    transition = true;
+  }
+  var trans_n: int32 = f5;
+  if (audiosize < trans_n) { trans_n = audiosize; }
+  if (transition && mode == AUDIO_OPUS_MODE_CELT) {
+    decode_frame(st, (uint8*)0, 0, &st->trans[0], trans_n);
+  }
+  if (audiosize > frame_size) { return AUDIO_E_ARG; }
+  frame_size = audiosize;
+
+  // SILK
+  if (mode != AUDIO_OPUS_MODE_CELT) {
+    var silk_ptr: int16* = &st->silk_pcm[0];
+    if (st->prev_mode == AUDIO_OPUS_MODE_CELT) { audio_opus_silk_reset(&st->silk); }
+    var payload_ms: int32 = 1000 * audiosize / 48000;
+    if (payload_ms < 10) { payload_ms = 10; }
+    var rate: int32 = 16000;
+    if (data != 0) {
+      if (mode == AUDIO_OPUS_MODE_SILK) {
+        if (bandwidth == 0) { rate = 8000; } else if (bandwidth == 1) { rate = 12000; }
+      }
+      st->silk.internal_rate = rate;
+      st->silk.internal_channels = st->stream_channels;
+    }
+    st->silk.payload_ms = payload_ms;
+    var lost: int32 = 0;
+    if (data == 0) { lost = 1; }
+    var decoded: int32 = 0;
+    var room: int32 = 2880;
+    while (decoded < frame_size) {
+      var got: int32 = 0;
+      var rc: int32 = audio_opus_silk_decode(&st->silk, lost, decoded == 0, &dec, silk_ptr, room - decoded, &got);
+      if (rc < 0 || got <= 0) {
+        if (lost != 0 || rc >= 0) {
+          got = frame_size - decoded;
+          for i in 0..got * nch { silk_ptr[i] = 0; }
+        } else {
+          return AUDIO_E_DATA;
+        }
+      }
+      silk_ptr = silk_ptr + got * nch;
+      decoded = decoded + got;
+    }
+  }
+
+  var start_band: int32 = 0;
+  var redundancy: int32 = 0;
+  var celt_to_silk: int32 = 0;
+  var red_bytes: int32 = 0;
+  if (data != 0 && mode != AUDIO_OPUS_MODE_CELT) {
+    var extra: int32 = 0;
+    if (st->mode == AUDIO_OPUS_MODE_HYBRID) { extra = 20; }
+    if (audio_opus_rc_tell(&dec) + 17 + extra <= 8 * len) {
+      if (mode == AUDIO_OPUS_MODE_HYBRID) { redundancy = audio_opus_rc_bit_logp(&dec, 12); } else { redundancy = 1; }
+      if (redundancy != 0) {
+        celt_to_silk = audio_opus_rc_bit_logp(&dec, 1);
+        if (mode == AUDIO_OPUS_MODE_HYBRID) {
+          red_bytes = (int32)audio_opus_rc_uint(&dec, 256) + 2;
+        } else {
+          red_bytes = len - ((audio_opus_rc_tell(&dec) + 7) >> 3);
+        }
+        len = len - red_bytes;
+        if (len * 8 < audio_opus_rc_tell(&dec) || red_bytes < 0) {
+          len = 0;
+          red_bytes = 0;
+          redundancy = 0;
+        }
+        dec.storage = dec.storage - (uint32)red_bytes;
+      }
+    }
+  }
+  if (mode != AUDIO_OPUS_MODE_CELT) { start_band = 17; }
+  if (redundancy != 0) { transition = false; }
+  if (transition && mode != AUDIO_OPUS_MODE_CELT) {
+    decode_frame(st, (uint8*)0, 0, &st->trans[0], trans_n);
+  }
+  if (bandwidth >= 0) { st->celt.end = celt_end_band(bandwidth); }
+  st->celt.stream_channels = st->stream_channels;
+
+  var red_rng: uint32 = 0;
+  if (redundancy != 0 && celt_to_silk != 0) {
+    st->celt.start = 0;
+    audio_opus_celt_decode(&st->celt, data + len, red_bytes, &st->red[0], f5, (AudioOpusRc*)0);
+    red_rng = st->celt.rng;
+  }
+  st->celt.start = start_band;
+
+  var celt_ret: int32 = 0;
+  if (mode != AUDIO_OPUS_MODE_SILK) {
+    var celt_n: int32 = frame_size;
+    if (celt_n > f20) { celt_n = f20; }
+    if (mode != st->prev_mode && st->prev_mode > 0 && st->prev_redundancy == 0) {
+      audio_opus_celt_reset(&st->celt);
+    }
+    if (data != 0) {
+      celt_ret = audio_opus_celt_decode(&st->celt, data, len, pcm, celt_n, &dec);
+    } else {
+      celt_ret = audio_opus_celt_decode(&st->celt, (uint8*)0, 0, pcm, celt_n, (AudioOpusRc*)0);
+    }
+  } else {
+    for i in 0..frame_size * nch { pcm[i] = 0.0; }
+    if (st->prev_mode == AUDIO_OPUS_MODE_HYBRID && !(redundancy != 0 && celt_to_silk != 0 && st->prev_redundancy != 0)) {
+      // let the CELT MDCT fade out by decoding a silent frame
+      var silence: uint8[2];
+      silence[0] = 0xFF;
+      silence[1] = 0xFF;
+      st->celt.start = 0;
+      audio_opus_celt_decode(&st->celt, &silence[0], 2, pcm, f2_5, (AudioOpusRc*)0);
+    }
+  }
+  if (mode != AUDIO_OPUS_MODE_CELT) {
+    var k: float32 = (float32)(1.0 / 32768.0);
+    for i in 0..frame_size * nch { pcm[i] = pcm[i] + k * (float32)st->silk_pcm[i]; }
+  }
+  if (redundancy != 0 && celt_to_silk == 0) {
+    audio_opus_celt_reset(&st->celt);
+    st->celt.start = 0;
+    audio_opus_celt_decode(&st->celt, data + len, red_bytes, &st->red[0], f5, (AudioOpusRc*)0);
+    red_rng = st->celt.rng;
+    var o: int32 = nch * (frame_size - f2_5);
+    smooth_fade(pcm + o, &st->red[nch * f2_5], pcm + o, f2_5, nch);
+  }
+  if (redundancy != 0 && celt_to_silk != 0 && (st->prev_mode != AUDIO_OPUS_MODE_SILK || st->prev_redundancy != 0)) {
+    for i in 0..f2_5 * nch { pcm[i] = st->red[i]; }
+    smooth_fade(&st->red[nch * f2_5], pcm + nch * f2_5, pcm + nch * f2_5, f2_5, nch);
+  }
+  if (transition) {
+    if (audiosize >= f5) {
+      for i in 0..nch * f2_5 { pcm[i] = st->trans[i]; }
+      smooth_fade(&st->trans[nch * f2_5], pcm + nch * f2_5, pcm + nch * f2_5, f2_5, nch);
+    } else {
+      smooth_fade(&st->trans[0], pcm, pcm, f2_5, nch);
+    }
+  }
+  if (len <= 1) {
+    st->final_range = 0;
+  } else {
+    st->final_range = dec.rng ^ red_rng;
+  }
+  st->prev_mode = mode;
+  st->prev_redundancy = 0;
+  if (redundancy != 0 && celt_to_silk == 0) { st->prev_redundancy = 1; }
+  if (celt_ret < 0) { return celt_ret; }
+  return audiosize;
+}
+
+/// Decodes one packet into pcm (interleaved, st->channels), which must
+/// hold `max_frames` frames. `self_delim` is for multistream packets.
+/// Sets *used to the bytes the packet took. Returns frames or < 0.
+export fn audio_opus_dec_packet(st: AudioOpusDec*, data: uint8*, len: int32, pcm: float32*, max_frames: int32, self_delim: bool, used: int32*) -> int32 {
+  var fr: AudioOpusFrames;
+  var count: int32 = audio_opus_parse(data, len, self_delim, &fr);
+  if (count < 0) { return count; }
+  *used = fr.packet_len;
+  var toc: int32 = fr.toc;
+  var fs: int32 = audio_opus_toc_frame_size(toc);
+  if (count * fs > max_frames) { return AUDIO_E_LIMIT; }
+  st->mode = toc_mode(toc);
+  st->bandwidth = toc_bandwidth(toc);
+  st->frame_size = fs;
+  st->stream_channels = 1;
+  if ((toc & 4) != 0) { st->stream_channels = 2; }
+  var nb: int32 = 0;
+  for i in 0..count {
+    var ret: int32 = decode_frame(st, data + fr.offset[i], fr.size[i], pcm + nb * st->channels, max_frames - nb);
+    if (ret < 0) { return ret; }
+    nb = nb + ret;
+  }
+  return nb;
+}
+
+/// Conceals a lost packet of `frames` samples (a multiple of 120).
+export fn audio_opus_dec_lost(st: AudioOpusDec*, pcm: float32*, frames: int32) -> int32 {
+  return decode_frame(st, (uint8*)0, 0, pcm, frames);
+}

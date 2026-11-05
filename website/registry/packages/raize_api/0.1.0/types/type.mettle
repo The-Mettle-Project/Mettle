@@ -1,0 +1,306 @@
+// raize_api/types: descriptions of the values an API reads and writes.
+//
+// A RapiType says what a JSON value looks like (JSON Schema 2020-12) and, for
+// objects, where each member lives in a Mettle struct, so one description drives
+// decoding, validation, encoding and the OpenAPI document.
+//
+//   var t: RapiType* = rapi_object("NewTask", sizeof(NewTask));
+//   rapi_field(t, "title", rapi_string_t(), offsetof...)   // usually written by @rapi_model
+//
+// Storage of each kind inside a struct:
+//   RAPI_T_STRING   string (a view into the request arena after decoding)
+//   RAPI_T_INT      int32 or int64 (size 4 or 8)
+//   RAPI_T_NUMBER   float64
+//   RAPI_T_BOOL     bool
+//   RAPI_T_OBJECT   the struct inline (size = sizeof the struct)
+//   RAPI_T_ARRAY    CodecList<T> layout: data pointer, len int64, cap int64
+//
+// Types are built once at startup and never freed.
+import "std/mem";
+import "raize_core/str/str";
+
+export const RAPI_T_ANY: int32 = 0;
+export const RAPI_T_STRING: int32 = 1;
+export const RAPI_T_INT: int32 = 2;
+export const RAPI_T_NUMBER: int32 = 3;
+export const RAPI_T_BOOL: int32 = 4;
+export const RAPI_T_OBJECT: int32 = 5;
+export const RAPI_T_ARRAY: int32 = 6;
+
+export const RAPI_FIELDS_MAX: int32 = 32;
+export const RAPI_ENUM_MAX: int32 = 16;
+export const RAPI_UNSET: int64 = -9223372036854775807;
+
+/// One member of an object type.
+export struct RapiField {
+  name: string;        // JSON member name
+  type: RapiType*;     // its type
+  offset: int64;       // bytes from the start of the struct
+  required: bool;      // must be present in a request body
+  read_only: bool;     // written in responses, refused in requests
+  desc: string;        // description for the docs
+}
+
+/// A value type. Make one with the rapi_*_t constructors.
+export struct RapiType {
+  kind: int32;              // RAPI_T_*
+  name: string;             // component name ("Task") for objects shown in OpenAPI, else ""
+  format: string;           // "int32", "int64", "double", "date-time", "email", "uuid", "uri" or ""
+  desc: string;             // description
+  size: int64;              // bytes of the stored value
+  nullable: bool;           // JSON null is accepted (decoded as the zero value)
+  min_len: int64;           // strings: least UTF-8 code points, RAPI_UNSET when free
+  max_len: int64;           // strings: most code points
+  minimum: int64;           // ints: least value, RAPI_UNSET when free
+  maximum: int64;           // ints: most value
+  min_items: int64;         // arrays
+  max_items: int64;
+  enum_vals: string[16];    // strings: allowed values (RAPI_ENUM_MAX), count in nenum
+  nenum: int32;
+  items: RapiType*;         // arrays: element type
+  fields: RapiField[32];    // objects (RAPI_FIELDS_MAX)
+  nfields: int32;
+  closed: bool;             // objects: unknown members are an error (additionalProperties false)
+  example: string;          // an example value, already JSON, or ""
+}
+
+// Compile-time rules build types and must free them again. While tracking is on,
+// every allocation here and every cached type slot is remembered, and
+// rapi__track_end frees them and empties the slots.
+var g_rapi_track: bool = false;
+var g_rapi_track_ptrs: rawptr[1024];
+var g_rapi_track_np: int32 = 0;
+var g_rapi_track_slots: (RapiType**)[128];
+var g_rapi_track_ns: int32 = 0;
+
+fn rapi__remember(p: rawptr) {
+  if (g_rapi_track && g_rapi_track_np < 1024) {
+    g_rapi_track_ptrs[g_rapi_track_np] = p;
+    g_rapi_track_np = g_rapi_track_np + 1;
+  }
+}
+
+/// internal: generated code. Starts tracking type allocations.
+export fn rapi__track_begin() {
+  g_rapi_track = true;
+  g_rapi_track_np = 0;
+  g_rapi_track_ns = 0;
+}
+
+/// internal: generated code. A type was cached in `slot`.
+export fn rapi__type_cached(slot: RapiType**) {
+  if (g_rapi_track && g_rapi_track_ns < 128) {
+    g_rapi_track_slots[g_rapi_track_ns] = slot;
+    g_rapi_track_ns = g_rapi_track_ns + 1;
+  }
+}
+
+/// internal: generated code. Frees what was built since rapi__track_begin.
+export fn rapi__track_end() {
+  for i in 0..g_rapi_track_ns { *g_rapi_track_slots[i] = (RapiType*)0; }
+  for i in 0..g_rapi_track_np { free(g_rapi_track_ptrs[i]); }
+  g_rapi_track = false;
+  g_rapi_track_np = 0;
+  g_rapi_track_ns = 0;
+}
+
+// A copy of s that lives as long as the type.
+fn rapi__dup(s: string) -> string {
+  if (s.length == 0) { return ""; }
+  var p: uint8* = (uint8*)malloc((int64)s.length);
+  memcpy((rawptr)p, (rawptr)s.chars, (int64)s.length);
+  rapi__remember((rawptr)p);
+  return rz_str_view(p, (int64)s.length);
+}
+
+fn rapi__type_new(kind: int32, size: int64) -> RapiType* {
+  var t: RapiType* = (RapiType*)calloc(1, sizeof(RapiType));
+  rapi__remember((rawptr)t);
+  t->kind = kind;
+  t->size = size;
+  t->name = "";
+  t->format = "";
+  t->desc = "";
+  t->example = "";
+  t->min_len = RAPI_UNSET;
+  t->max_len = RAPI_UNSET;
+  t->minimum = RAPI_UNSET;
+  t->maximum = RAPI_UNSET;
+  t->min_items = RAPI_UNSET;
+  t->max_items = RAPI_UNSET;
+  return t;
+}
+
+/// A string (stored as `string`).
+export fn rapi_string_t() -> RapiType* { return rapi__type_new(RAPI_T_STRING, (int64)sizeof(string)); }
+
+/// A 64-bit integer (stored as `int64`).
+export fn rapi_int64_t() -> RapiType* {
+  var t: RapiType* = rapi__type_new(RAPI_T_INT, 8);
+  t->format = "int64";
+  return t;
+}
+
+/// A 32-bit integer (stored as `int32`).
+export fn rapi_int32_t() -> RapiType* {
+  var t: RapiType* = rapi__type_new(RAPI_T_INT, 4);
+  t->format = "int32";
+  t->minimum = -2147483648;
+  t->maximum = 2147483647;
+  return t;
+}
+
+/// A number (stored as `float64`).
+export fn rapi_number_t() -> RapiType* {
+  var t: RapiType* = rapi__type_new(RAPI_T_NUMBER, 8);
+  t->format = "double";
+  return t;
+}
+
+/// A boolean (stored as `bool`).
+export fn rapi_bool_t() -> RapiType* { return rapi__type_new(RAPI_T_BOOL, 1); }
+
+/// Any JSON value, kept as its raw text (stored as `string`).
+export fn rapi_any_t() -> RapiType* { return rapi__type_new(RAPI_T_ANY, (int64)sizeof(string)); }
+
+/// An array of `items` (stored as CodecList<T>: data, len, cap).
+export fn rapi_array_t(items: RapiType*) -> RapiType* {
+  var t: RapiType* = rapi__type_new(RAPI_T_ARRAY, 24);
+  t->items = items;
+  return t;
+}
+
+/// An object stored as a struct of `size` bytes. `name` ("Task") makes it a named
+/// schema in OpenAPI's components; "" keeps it inline.
+export fn rapi_object_t(name: string, size: int64) -> RapiType* {
+  var t: RapiType* = rapi__type_new(RAPI_T_OBJECT, size);
+  t->name = rapi__dup(name);
+  return t;
+}
+
+/// Adds member `name` of type `ft` at `offset` in the struct. Returns the field, or 0
+/// when the object is full or not an object.
+export fn rapi_field(t: RapiType*, name: string, ft: RapiType*, offset: int64, required: bool) -> RapiField* {
+  if (t == 0 || t->kind != RAPI_T_OBJECT || t->nfields >= RAPI_FIELDS_MAX) { return (RapiField*)0; }
+  var f: RapiField* = &t->fields[t->nfields];
+  f->name = rapi__dup(name);
+  f->type = ft;
+  f->offset = offset;
+  f->required = required;
+  f->read_only = false;
+  f->desc = "";
+  t->nfields = t->nfields + 1;
+  return f;
+}
+
+/// The field named `name`, or 0.
+export fn rapi_field_get(t: RapiType*, name: string) -> RapiField* {
+  if (t == 0) { return (RapiField*)0; }
+  for i in 0..t->nfields {
+    if (rz_str_eq(t->fields[i].name, name)) { return &t->fields[i]; }
+  }
+  return (RapiField*)0;
+}
+
+/// Index of field `name`, or -1.
+export fn rapi_field_index(t: RapiType*, name: string) -> int32 {
+  if (t == 0) { return -1; }
+  for i in 0..t->nfields {
+    if (rz_str_eq(t->fields[i].name, name)) { return (int32)i; }
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Constraints. Each returns its type so calls can be chained into a field.
+// ---------------------------------------------------------------------------
+
+/// Strings: length limits in code points (RAPI_UNSET for no limit).
+export fn rapi_len(t: RapiType*, min: int64, max: int64) -> RapiType* {
+  t->min_len = min;
+  t->max_len = max;
+  return t;
+}
+
+/// Integers: value limits (RAPI_UNSET for no limit).
+export fn rapi_range(t: RapiType*, min: int64, max: int64) -> RapiType* {
+  t->minimum = min;
+  t->maximum = max;
+  return t;
+}
+
+/// Arrays: item count limits.
+export fn rapi_items(t: RapiType*, min: int64, max: int64) -> RapiType* {
+  t->min_items = min;
+  t->max_items = max;
+  return t;
+}
+
+/// Strings: adds an allowed value.
+export fn rapi_enum(t: RapiType*, value: string) -> RapiType* {
+  if (t->nenum < RAPI_ENUM_MAX) {
+    t->enum_vals[t->nenum] = rapi__dup(value);
+    t->nenum = t->nenum + 1;
+  }
+  return t;
+}
+
+/// Sets the format ("date-time", "email", "uuid", "uri"). Formats are checked
+/// on decode where the format is one of those four.
+export fn rapi_format(t: RapiType*, format: string) -> RapiType* {
+  t->format = rapi__dup(format);
+  return t;
+}
+
+/// Sets the description shown in the docs.
+export fn rapi_desc(t: RapiType*, desc: string) -> RapiType* {
+  t->desc = rapi__dup(desc);
+  return t;
+}
+
+/// Sets an example (already JSON: "\"buy milk\"", "42").
+export fn rapi_example(t: RapiType*, json: string) -> RapiType* {
+  t->example = rapi__dup(json);
+  return t;
+}
+
+/// Accepts JSON null.
+export fn rapi_nullable(t: RapiType*) -> RapiType* {
+  t->nullable = true;
+  return t;
+}
+
+/// Objects: unknown members are an error instead of being ignored.
+export fn rapi_closed(t: RapiType*) -> RapiType* {
+  t->closed = true;
+  return t;
+}
+
+/// Marks field `name` required or optional.
+export fn rapi_require(t: RapiType*, name: string, required: bool) -> RapiType* {
+  var f: RapiField* = rapi_field_get(t, name);
+  if (f != 0) { f->required = required; }
+  return t;
+}
+
+/// Marks field `name` read-only: written in responses, refused in request bodies.
+export fn rapi_read_only(t: RapiType*, name: string) -> RapiType* {
+  var f: RapiField* = rapi_field_get(t, name);
+  if (f != 0) { f->read_only = true; f->required = false; }
+  return t;
+}
+
+/// Sets the type of an existing field, keeping its offset. For refining a field
+/// that @rapi_model wrote (a string that is really an enum, an int with a range).
+export fn rapi_retype(t: RapiType*, name: string, ft: RapiType*) -> RapiType* {
+  var f: RapiField* = rapi_field_get(t, name);
+  if (f != 0 && ft != 0) { f->type = ft; }
+  return t;
+}
+
+/// The type of field `name` (to add constraints in place), or 0.
+export fn rapi_field_type(t: RapiType*, name: string) -> RapiType* {
+  var f: RapiField* = rapi_field_get(t, name);
+  if (f == 0) { return (RapiType*)0; }
+  return f->type;
+}

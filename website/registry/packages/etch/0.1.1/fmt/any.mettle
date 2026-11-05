@@ -1,0 +1,162 @@
+// Format detection, and loading and saving by file name.
+//
+//   var img: EtchImage;
+//   etch_load("photo.jpg", &img, (EtchOpts*)0);
+//   etch_save("photo.png", &img);
+
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "../core/buf";
+import "../core/file";
+import "../core/anim";
+import "png";
+import "jpeg";
+import "qoi";
+import "bmp";
+import "tga";
+import "pnm";
+import "gif";
+import "hdr";
+
+export const ETCH_FMT_UNKNOWN: int32 = 0;
+export const ETCH_FMT_PNG: int32 = 1;
+export const ETCH_FMT_JPEG: int32 = 2;
+export const ETCH_FMT_QOI: int32 = 3;
+export const ETCH_FMT_BMP: int32 = 4;
+export const ETCH_FMT_TGA: int32 = 5;
+export const ETCH_FMT_GIF: int32 = 6;
+export const ETCH_FMT_HDR: int32 = 7;
+export const ETCH_FMT_PNM: int32 = 8;
+
+/// Which format the bytes are in, from their first bytes. TGA has no magic
+/// number, so it is tried last.
+export fn etch_detect(p: uint8*, n: int64) -> int32 {
+  if (p == 0 || n <= 0) { return ETCH_FMT_UNKNOWN; }
+  if (etch_png_is(p, n)) { return ETCH_FMT_PNG; }
+  if (etch_jpeg_is(p, n)) { return ETCH_FMT_JPEG; }
+  if (etch_qoi_is(p, n)) { return ETCH_FMT_QOI; }
+  if (etch_gif_is(p, n)) { return ETCH_FMT_GIF; }
+  if (etch_hdr_is(p, n)) { return ETCH_FMT_HDR; }
+  if (etch_bmp_is(p, n)) { return ETCH_FMT_BMP; }
+  if (etch_pnm_is(p, n)) { return ETCH_FMT_PNM; }
+  if (etch_tga_is(p, n)) { return ETCH_FMT_TGA; }
+  return ETCH_FMT_UNKNOWN;
+}
+
+/// Decodes an image in any supported format (the first frame of an
+/// animation).
+export fn etch_decode(p: uint8*, n: int64, out: EtchImage*, o: EtchOpts*) -> int32 {
+  switch (etch_detect(p, n)) {
+    case 1: { return etch_png_decode(p, n, out, o); }
+    case 2: { return etch_jpeg_decode(p, n, out, o); }
+    case 3: { return etch_qoi_decode(p, n, out, o); }
+    case 4: { return etch_bmp_decode(p, n, out, o); }
+    case 5: { return etch_tga_decode(p, n, out, o); }
+    case 6: { return etch_gif_decode(p, n, out, o); }
+    case 7: { return etch_hdr_decode(p, n, out, o); }
+    case 8: { return etch_pnm_decode(p, n, out, o); }
+    default: { }
+  }
+  return ETCH_E_FORMAT;
+}
+
+/// Decodes every frame of an animated PNG or GIF. Other formats give one
+/// frame.
+export fn etch_decode_anim(p: uint8*, n: int64, a: EtchAnim*, o: EtchOpts*) -> int32 {
+  if (a == 0) { return ETCH_E_ARG; }
+  var f: int32 = etch_detect(p, n);
+  if (f == ETCH_FMT_PNG) { return etch_png_decode_anim(p, n, a, o); }
+  if (f == ETCH_FMT_GIF) { return etch_gif_decode_anim(p, n, a, o); }
+  memset(a, 0, sizeof(EtchAnim));
+  var img: EtchImage;
+  var rc: int32 = etch_decode(p, n, &img, o);
+  if (rc != ETCH_OK) { return rc; }
+  a->width = img.width;
+  a->height = img.height;
+  rc = etch_anim_push(a, &img, 0);
+  if (rc != ETCH_OK) { etch_image_free(&img); }
+  return rc;
+}
+
+// Reads a file under the size the limits allow.
+fn read_limited(path: string, o: EtchOpts*, buf: EtchBuf*) -> int32 {
+  var l: EtchLimits* = etch_opts_limits(o);
+  buf->limit = 0;
+  if (l->max_bytes > 0) { buf->limit = l->max_bytes + 65536; }
+  return etch_file_read(path, buf);
+}
+
+/// Reads and decodes an image file.
+export fn etch_load(path: string, out: EtchImage*, o: EtchOpts*) -> int32 {
+  var buf: EtchBuf;
+  memset(&buf, 0, sizeof(EtchBuf));
+  var rc: int32 = read_limited(path, o, &buf);
+  if (rc == ETCH_OK) { rc = etch_decode(buf.data, buf.len, out, o); }
+  etch_buf_free(&buf);
+  return rc;
+}
+
+/// Reads and decodes every frame of an image file.
+export fn etch_load_anim(path: string, a: EtchAnim*, o: EtchOpts*) -> int32 {
+  var buf: EtchBuf;
+  memset(&buf, 0, sizeof(EtchBuf));
+  var rc: int32 = read_limited(path, o, &buf);
+  if (rc == ETCH_OK) { rc = etch_decode_anim(buf.data, buf.len, a, o); }
+  etch_buf_free(&buf);
+  return rc;
+}
+
+fn lower(c: uint8) -> uint8 {
+  if (c >= 'A' && c <= 'Z') { return c + 32; }
+  return c;
+}
+
+fn ends_with(s: string, ext: string) -> bool {
+  if (s.length < ext.length) { return false; }
+  var off: int64 = (int64)s.length - (int64)ext.length;
+  for i in 0..ext.length { if (lower(s.chars[off + (int64)i]) != ext.chars[i]) { return false; } }
+  return true;
+}
+
+/// The format a file name asks for, from its extension.
+export fn etch_format_of_name(path: string) -> int32 {
+  if (ends_with(path, ".png") || ends_with(path, ".apng")) { return ETCH_FMT_PNG; }
+  if (ends_with(path, ".jpg") || ends_with(path, ".jpeg") || ends_with(path, ".jpe") || ends_with(path, ".jfif")) { return ETCH_FMT_JPEG; }
+  if (ends_with(path, ".qoi")) { return ETCH_FMT_QOI; }
+  if (ends_with(path, ".bmp") || ends_with(path, ".dib")) { return ETCH_FMT_BMP; }
+  if (ends_with(path, ".tga") || ends_with(path, ".targa")) { return ETCH_FMT_TGA; }
+  if (ends_with(path, ".gif")) { return ETCH_FMT_GIF; }
+  if (ends_with(path, ".hdr") || ends_with(path, ".pic")) { return ETCH_FMT_HDR; }
+  if (ends_with(path, ".ppm") || ends_with(path, ".pgm") || ends_with(path, ".pam") || ends_with(path, ".pnm")) { return ETCH_FMT_PNM; }
+  return ETCH_FMT_UNKNOWN;
+}
+
+/// Encodes an image in a format, with default settings (PNG level 6, JPEG
+/// quality 90, QOI, BMP, TGA with RLE, Radiance HDR, PNM).
+export fn etch_encode(img: EtchImage*, fmt: int32, out: EtchBuf*) -> int32 {
+  switch (fmt) {
+    case 1: { return etch_png_encode(img, out, 6); }
+    case 2: { return etch_jpeg_encode(img, out, 90, true); }
+    case 3: { return etch_qoi_encode(img, out, false); }
+    case 4: { return etch_bmp_encode(img, out); }
+    case 5: { return etch_tga_encode(img, out, true); }
+    case 7: { return etch_hdr_encode(img, out); }
+    case 8: { return etch_pnm_encode(img, out); }
+    default: { }
+  }
+  return ETCH_E_UNSUPPORTED;
+}
+
+/// Encodes an image and writes it to a file, picking the format from the
+/// file name's extension.
+export fn etch_save(path: string, img: EtchImage*) -> int32 {
+  var f: int32 = etch_format_of_name(path);
+  if (f == ETCH_FMT_UNKNOWN) { return ETCH_E_FORMAT; }
+  var buf: EtchBuf;
+  memset(&buf, 0, sizeof(EtchBuf));
+  var rc: int32 = etch_encode(img, f, &buf);
+  if (rc == ETCH_OK) { rc = etch_file_write(path, buf.data, buf.len); }
+  etch_buf_free(&buf);
+  return rc;
+}

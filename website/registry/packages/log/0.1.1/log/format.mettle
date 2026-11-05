@@ -1,0 +1,489 @@
+// log/format: turns a LogRecord into bytes.
+//
+//   LOG_FMT_TEXT     2026-11-05T10:53:01.123456Z  INFO net/http: connected peer=10.0.0.2
+//   LOG_FMT_LOGFMT   time=... level=info target=net/http msg=connected peer=10.0.0.2
+//   LOG_FMT_JSON     {"time":"...","level":"info","target":"net/http","msg":"connected",...}
+//   LOG_FMT_SYSLOG   <14>app[123]: connected peer=10.0.0.2   (local socket, RFC 3164 style)
+//   LOG_FMT_RFC5424  <14>1 2026-...Z host app 123 net/http - connected peer=10.0.0.2
+//   LOG_FMT_JOURNAL  PRIORITY=6\nMESSAGE=connected\nPEER=10.0.0.2\n... (journald native)
+//
+// Text, logfmt and JSON records end with a newline; datagram formats do not.
+// Control characters in messages and values are escaped in every format, so
+// one record is always one line (CWE-117, log injection).
+import "std/mem";
+import "std/time";
+import "codec/core/buf";
+import "codec/json/write";
+import "level";
+import "field";
+
+export const LOG_FMT_TEXT = 0;
+export const LOG_FMT_LOGFMT = 1;
+export const LOG_FMT_JSON = 2;
+export const LOG_FMT_SYSLOG = 3;
+export const LOG_FMT_RFC5424 = 4;
+export const LOG_FMT_JOURNAL = 5;
+
+// Format flags.
+export const LOG_COLOR = 1;       // ANSI colours (text only)
+export const LOG_NO_TIME = 2;     // leave the timestamp out
+export const LOG_THREAD = 4;      // add the thread id
+export const LOG_NO_TARGET = 8;   // leave the target out
+
+// Syslog facilities (RFC 5424 section 6.2.1).
+export const LOG_FAC_USER = 1;
+export const LOG_FAC_DAEMON = 3;
+export const LOG_FAC_LOCAL0 = 16;
+
+export struct LogFormat {
+  kind: int32;
+  flags: int32;
+  tag: string;        // syslog APP-NAME / SYSLOG_IDENTIFIER
+  host: string;       // RFC 5424 HOSTNAME; empty writes "-"
+  facility: int32;
+  pid: int64;
+}
+
+// ---- small writers ----------------------------------------------------------
+
+// Short pieces are copied by hand: a memcpy call costs more than the copy.
+@inline fn log__s(b: CodecBuf*, s: string) {
+  var n: int64 = (int64)s.length;
+  if (n > 32) { codec_buf_bytes(b, s.chars, n); return; }
+  if (b->cap - b->len < n || b->err != 0) {
+    if (codec_buf_reserve(b, n) == 0) { return; }
+  }
+  var d: uint8* = b->data + b->len;
+  for i: int64 in 0..n { d[i] = s.chars[i]; }
+  b->len = b->len + n;
+}
+
+@inline fn log__c(b: CodecBuf*, c: int32) {
+  if (b->len < b->cap && b->err == 0) {
+    b->data[b->len] = (uint8)c;
+    b->len = b->len + 1;
+    return;
+  }
+  codec_buf_byte(b, (uint8)c);
+}
+
+fn log__i64(b: CodecBuf*, v: int64) {
+  var p: uint8* = codec_buf_reserve(b, 24);
+  if (p == 0) { return; }
+  b->len = b->len + (int64)codec_format_i64(v, p);
+}
+
+fn log__u64(b: CodecBuf*, v: uint64) {
+  var p: uint8* = codec_buf_reserve(b, 24);
+  if (p == 0) { return; }
+  b->len = b->len + (int64)codec_format_u64(v, p);
+}
+
+fn log__f64(b: CodecBuf*, v: float64) {
+  if (v != v) { log__s(b, "NaN"); return; }
+  var p: uint8* = codec_buf_reserve(b, 40);
+  if (p == 0) { return; }
+  var n: int32 = codec_format_f64(v, p);
+  if (n == 0) {
+    if (v > 0.0) { log__s(b, "+Inf"); } else { log__s(b, "-Inf"); }
+    return;
+  }
+  b->len = b->len + (int64)n;
+}
+
+fn log__dur(b: CodecBuf*, ns: int64) {
+  var p: uint8* = codec_buf_reserve(b, TIME_FORMAT_MAX);
+  if (p == 0) { return; }
+  var n: int64 = time_format_duration(ns, p, TIME_FORMAT_MAX);
+  if (n > 0) { b->len = b->len + n; }
+}
+
+fn log__d2(p: uint8*, at: int64, v: int64) {
+  p[at] = (uint8)(48 + v / 10);
+  p[at + 1] = (uint8)(48 + v % 10);
+}
+
+// RFC 3339 UTC with microseconds: 2026-11-05T10:53:01.123456Z (27 bytes).
+// The date comes from Howard Hinnant's civil_from_days, which is exact for
+// the proleptic Gregorian calendar and much faster than a general formatter.
+// Years outside 0000..9999 fall back to std/datetime.
+export fn log_put_time(b: CodecBuf*, unix_ns: int64) {
+  var secs: int64 = time_floor_div(unix_ns, TIME_SECOND);
+  var us: int64 = (unix_ns - secs * TIME_SECOND) / 1000;
+  var days: int64 = time_floor_div(secs, (int64)86400);
+  var sod: int64 = secs - days * (int64)86400;
+  var z: int64 = days + (int64)719468;
+  var era: int64 = time_floor_div(z, (int64)146097);
+  var doe: int64 = z - era * (int64)146097;
+  var yoe: int64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  var y: int64 = yoe + era * (int64)400;
+  var doy: int64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  var mp: int64 = (5 * doy + 2) / 153;
+  var d: int64 = doy - (153 * mp + 2) / 5 + 1;
+  var m: int64 = mp + 3;
+  if (mp >= 10) { m = mp - 9; }
+  if (m <= 2) { y = y + 1; }
+  if (y < 0 || y > 9999) {
+    var q: uint8* = codec_buf_reserve(b, TIME_FORMAT_MAX);
+    if (q == 0) { return; }
+    var n: int64 = time_format_iso8601(time_utc(unix_ns), 6, q, TIME_FORMAT_MAX);
+    if (n > 0) { b->len = b->len + n; }
+    return;
+  }
+  var p: uint8* = codec_buf_reserve(b, 27);
+  if (p == 0) { return; }
+  log__d2(p, 0, y / 100);
+  log__d2(p, 2, y % 100);
+  p[4] = (uint8)45;
+  log__d2(p, 5, m);
+  p[7] = (uint8)45;
+  log__d2(p, 8, d);
+  p[10] = (uint8)84;
+  log__d2(p, 11, sod / 3600);
+  p[13] = (uint8)58;
+  log__d2(p, 14, (sod / 60) % 60);
+  p[16] = (uint8)58;
+  log__d2(p, 17, sod % 60);
+  p[19] = (uint8)46;
+  log__d2(p, 20, us / 10000);
+  log__d2(p, 22, (us / 100) % 100);
+  log__d2(p, 24, us % 100);
+  p[26] = (uint8)90;
+  b->len = b->len + 27;
+}
+
+// An ANSI SGR escape (ECMA-48): ESC [ code m
+fn log__sgr(b: CodecBuf*, code: string) {
+  log__c(b, 27);
+  log__c(b, 91);
+  log__s(b, code);
+  log__c(b, 109);
+}
+
+fn log__hex(b: CodecBuf*, v: int32) {
+  var digits: string = "0123456789abcdef";
+  log__s(b, "\\u00");
+  log__c(b, (int32)digits[(v >> 4) & 15]);
+  log__c(b, (int32)digits[v & 15]);
+}
+
+// Writes s with control characters escaped, no quotes.
+fn log__esc(b: CodecBuf*, s: string, quoted: bool) {
+  var start: int64 = 0;
+  var n: int64 = (int64)s.length;
+  for i: int64 in 0..n {
+    var c: int32 = (int32)(uint8)s[i];
+    var special: bool = c < 32 || c == 127;
+    if (quoted && (c == 34 || c == 92)) { special = true; }
+    if (special) {
+      if (i > start) { codec_buf_bytes(b, s.chars + start, i - start); }
+      if (c == 10) { log__s(b, "\\n"); }
+      else if (c == 13) { log__s(b, "\\r"); }
+      else if (c == 9) { log__s(b, "\\t"); }
+      else if (c == 34) { log__s(b, "\\\""); }
+      else if (c == 92) { log__s(b, "\\\\"); }
+      else { log__hex(b, c); }
+      start = i + 1;
+    }
+  }
+  if (n > start) { codec_buf_bytes(b, s.chars + start, n - start); }
+}
+
+// logfmt quoting: quote when empty or when it holds a space, '=', '"' or a
+// control character.
+fn log__needs_quote(s: string) -> bool {
+  if (s.length == 0) { return true; }
+  for c in s {
+    var v: int32 = (int32)(uint8)c;
+    if (v <= 32 || v == 61 || v == 34 || v == 127) { return true; }
+  }
+  return false;
+}
+
+fn log__val_str(b: CodecBuf*, s: string) {
+  if (log__needs_quote(s)) {
+    log__c(b, 34);
+    log__esc(b, s, true);
+    log__c(b, 34);
+  } else {
+    log__s(b, s);
+  }
+}
+
+// A key for logfmt and text: spaces, '=', '"' and control bytes become '_'.
+fn log__key(b: CodecBuf*, k: string) {
+  if (k.length == 0) { log__c(b, 95); return; }
+  if (!log__needs_quote(k)) { codec_buf_bytes(b, k.chars, (int64)k.length); return; }
+  for c in k {
+    var v: int32 = (int32)(uint8)c;
+    if (v <= 32 || v == 61 || v == 34 || v == 127) { v = 95; }
+    log__c(b, v);
+  }
+}
+
+fn log__value(b: CodecBuf*, v: LogValue*) {
+  switch (v->kind) {
+    case 0: { log__i64(b, v->i); }
+    case 1: { log__f64(b, v->f); }
+    case 2: { if (v->i != 0) { log__s(b, "true"); } else { log__s(b, "false"); } }
+    case 3: { log__val_str(b, v->s); }
+    case 4: { log__u64(b, (uint64)v->i); }
+    case 5: { log__dur(b, v->i); }
+    default: { log__s(b, "?"); }
+  }
+}
+
+fn log__kvs(b: CodecBuf*, fs: LogField*, n: int32, color: bool) {
+  for i in 0..n {
+    log__c(b, 32);
+    if (color) { log__sgr(b, "2"); }
+    log__key(b, fs[i].key);
+    log__c(b, 61);
+    if (color) { log__sgr(b, "0"); }
+    log__value(b, &fs[i].val);
+  }
+}
+
+// ---- text and logfmt --------------------------------------------------------
+
+fn log__color_of(level: int32) -> string {
+  switch (log_level_base(level)) {
+    case 1: { return "35"; }      // magenta
+    case 5: { return "34"; }      // blue
+    case 9: { return "32"; }      // green
+    case 13: { return "33"; }     // yellow
+    case 17: { return "31"; }     // red
+    default: { }
+  }
+  return "1;31";                  // bold red
+}
+
+fn log__text(f: LogFormat*, r: LogRecord*, b: CodecBuf*) {
+  var color: bool = (f->flags & LOG_COLOR) != 0;
+  if ((f->flags & LOG_NO_TIME) == 0) {
+    if (color) { log__sgr(b, "2"); }
+    log_put_time(b, r->time_ns);
+    if (color) { log__sgr(b, "0"); }
+    log__c(b, 32);
+  }
+  var name: string = log_level_name(r->level);
+  if (color) { log__sgr(b, log__color_of(r->level)); }
+  var pad: int64 = 5 - (int64)name.length;
+  while (pad > 0) { log__c(b, 32); pad = pad - 1; }
+  log__s(b, name);
+  if (color) { log__sgr(b, "0"); }
+  if ((f->flags & LOG_THREAD) != 0) {
+    log__s(b, " [");
+    log__u64(b, (uint64)r->thread);
+    log__c(b, 93);
+  }
+  if ((f->flags & LOG_NO_TARGET) == 0 && r->target.length > 0) {
+    log__c(b, 32);
+    if (color) { log__sgr(b, "1"); }
+    log__esc(b, r->target, false);
+    log__c(b, 58);
+    if (color) { log__sgr(b, "0"); }
+  }
+  log__c(b, 32);
+  log__esc(b, r->msg, false);
+  log__kvs(b, r->ctx, r->n_ctx, color);
+  log__kvs(b, r->fields, r->n_fields, color);
+  log__c(b, 10);
+}
+
+fn log__logfmt(f: LogFormat*, r: LogRecord*, b: CodecBuf*) {
+  if ((f->flags & LOG_NO_TIME) == 0) {
+    log__s(b, "time=");
+    log_put_time(b, r->time_ns);
+    log__c(b, 32);
+  }
+  log__s(b, "level=");
+  log__s(b, log_level_key(r->level));
+  if ((f->flags & LOG_THREAD) != 0) {
+    log__s(b, " thread=");
+    log__u64(b, (uint64)r->thread);
+  }
+  if ((f->flags & LOG_NO_TARGET) == 0 && r->target.length > 0) {
+    log__s(b, " target=");
+    log__val_str(b, r->target);
+  }
+  log__s(b, " msg=");
+  log__val_str(b, r->msg);
+  log__kvs(b, r->ctx, r->n_ctx, false);
+  log__kvs(b, r->fields, r->n_fields, false);
+  log__c(b, 10);
+}
+
+// ---- JSON lines -------------------------------------------------------------
+
+fn log__json_fields(w: CodecJson*, fs: LogField*, n: int32) {
+  for i in 0..n {
+    var v: LogValue* = &fs[i].val;
+    codec_json_key(w, fs[i].key);
+    switch (v->kind) {
+      case 0: { codec_json_int(w, v->i); }
+      case 1: { codec_json_float(w, v->f); }
+      case 2: { codec_json_bool(w, v->i != 0); }
+      case 3: { codec_json_string(w, v->s); }
+      case 4: { codec_json_uint(w, (uint64)v->i); }
+      case 5: { codec_json_int(w, v->i); }
+      default: { codec_json_null(w); }
+    }
+  }
+}
+
+fn log__json(f: LogFormat*, r: LogRecord*, b: CodecBuf*) {
+  var w: CodecJson;
+  codec_json_init_flags(&w, b, CODEC_JSON_LOSSY_UTF8);
+  codec_json_object(&w);
+  if ((f->flags & LOG_NO_TIME) == 0) {
+    codec_json_key(&w, "time");
+    var tb: uint8[48];
+    var tbuf: CodecBuf;
+    codec_buf_fixed(&tbuf, &tb[0], 48);
+    log_put_time(&tbuf, r->time_ns);
+    codec_json_bytes_as_string(&w, &tb[0], tbuf.len);
+  }
+  codec_json_field_string(&w, "level", log_level_key(r->level));
+  if ((f->flags & LOG_THREAD) != 0) { codec_json_field_uint(&w, "thread", (uint64)r->thread); }
+  if ((f->flags & LOG_NO_TARGET) == 0 && r->target.length > 0) {
+    codec_json_field_string(&w, "target", r->target);
+  }
+  codec_json_field_string(&w, "msg", r->msg);
+  log__json_fields(&w, r->ctx, r->n_ctx);
+  log__json_fields(&w, r->fields, r->n_fields);
+  codec_json_end(&w);
+  codec_json_finish(&w);
+  log__c(b, 10);
+}
+
+// ---- syslog -----------------------------------------------------------------
+
+fn log__pri(f: LogFormat*, r: LogRecord*, b: CodecBuf*) {
+  log__c(b, 60);
+  log__i64(b, (int64)(f->facility * 8 + log_level_syslog(r->level)));
+  log__c(b, 62);
+}
+
+// RFC 5424 header fields are printable US-ASCII (33..126) or "-".
+fn log__header(b: CodecBuf*, s: string, max: int64) {
+  if (s.length == 0) { log__c(b, 45); return; }
+  var n: int64 = (int64)s.length;
+  if (n > max) { n = max; }
+  for i: int64 in 0..n {
+    var v: int32 = (int32)(uint8)s[i];
+    if (v < 33 || v > 126) { v = 95; }
+    log__c(b, v);
+  }
+}
+
+// What a local syslog daemon expects on /dev/log, as glibc's syslog(3)
+// sends it, without the timestamp (journald and rsyslog stamp it on
+// arrival): <PRI>TAG[PID]: MSG
+fn log__syslog(f: LogFormat*, r: LogRecord*, b: CodecBuf*) {
+  log__pri(f, r, b);
+  log__header(b, f->tag, 48);
+  log__c(b, 91);
+  log__i64(b, f->pid);
+  log__s(b, "]: ");
+  log__esc(b, r->msg, false);
+  log__kvs(b, r->ctx, r->n_ctx, false);
+  log__kvs(b, r->fields, r->n_fields, false);
+}
+
+// RFC 5424 section 6: <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID SD MSG.
+// The target is the MSGID; fields follow the message in logfmt.
+fn log__rfc5424(f: LogFormat*, r: LogRecord*, b: CodecBuf*) {
+  log__pri(f, r, b);
+  log__s(b, "1 ");
+  log_put_time(b, r->time_ns);
+  log__c(b, 32);
+  log__header(b, f->host, 255);
+  log__c(b, 32);
+  log__header(b, f->tag, 48);
+  log__c(b, 32);
+  log__i64(b, f->pid);
+  log__c(b, 32);
+  log__header(b, r->target, 32);
+  log__s(b, " - ");
+  log__esc(b, r->msg, false);
+  log__kvs(b, r->ctx, r->n_ctx, false);
+  log__kvs(b, r->fields, r->n_fields, false);
+}
+
+// ---- journald native protocol -----------------------------------------------
+
+// Field names are upper-case A-Z, 0-9 and '_', at most 64 bytes, and may not
+// start with '_' or a digit.
+fn log__jkey(b: CodecBuf*, k: string) {
+  var n: int64 = (int64)k.length;
+  if (n > 62) { n = 62; }
+  if (n == 0 || k[0] == '_' || (k[0] >= '0' && k[0] <= '9')) { log__s(b, "F_"); }
+  for i: int64 in 0..n {
+    var v: int32 = (int32)(uint8)k[i];
+    if (v >= 97 && v <= 122) { v = v - 32; }
+    else if (!((v >= 65 && v <= 90) || (v >= 48 && v <= 57))) { v = 95; }
+    log__c(b, v);
+  }
+}
+
+// A string value: KEY=value\n, or the binary form when it holds a newline.
+fn log__jstr(b: CodecBuf*, s: string) {
+  var nl: bool = false;
+  for c in s { if (c == '\n') { nl = true; } }
+  if (!nl) {
+    log__c(b, 61);
+    log__s(b, s);
+    log__c(b, 10);
+    return;
+  }
+  log__c(b, 10);
+  var n: uint64 = s.length;
+  for i in 0..8 { log__c(b, (int32)((n >> (uint64)(i * 8)) & (uint64)255)); }
+  log__s(b, s);
+  log__c(b, 10);
+}
+
+fn log__jfields(b: CodecBuf*, fs: LogField*, n: int32) {
+  for i in 0..n {
+    log__jkey(b, fs[i].key);
+    if (fs[i].val.kind == LOG_STR) {
+      log__jstr(b, fs[i].val.s);
+    } else {
+      log__c(b, 61);
+      log__value(b, &fs[i].val);
+      log__c(b, 10);
+    }
+  }
+}
+
+fn log__journal(f: LogFormat*, r: LogRecord*, b: CodecBuf*) {
+  log__s(b, "PRIORITY=");
+  log__i64(b, (int64)log_level_syslog(r->level));
+  log__c(b, 10);
+  if (f->tag.length > 0) {
+    log__s(b, "SYSLOG_IDENTIFIER");
+    log__jstr(b, f->tag);
+  }
+  if (r->target.length > 0) {
+    log__s(b, "TARGET");
+    log__jstr(b, r->target);
+  }
+  log__s(b, "MESSAGE");
+  log__jstr(b, r->msg);
+  log__jfields(b, r->ctx, r->n_ctx);
+  log__jfields(b, r->fields, r->n_fields);
+}
+
+// Appends one formatted record to b. Check b->err afterwards: a fixed
+// buffer that ran out of room has CODEC_ERR_LIMIT set.
+export fn log_format(f: LogFormat*, r: LogRecord*, b: CodecBuf*) {
+  switch (f->kind) {
+    case 1: { log__logfmt(f, r, b); }
+    case 2: { log__json(f, r, b); }
+    case 3: { log__syslog(f, r, b); }
+    case 4: { log__rfc5424(f, r, b); }
+    case 5: { log__journal(f, r, b); }
+    default: { log__text(f, r, b); }
+  }
+}

@@ -1,0 +1,68 @@
+// AudioBitW: writes bits most significant first into an AudioBuf (FLAC).
+
+import "status";
+import "buf";
+
+export struct AudioBitW {
+  out: AudioBuf*;
+  acc: uint64;      // pending bits at the bottom
+  n: int32;         // how many
+  err: int32;
+}
+
+export fn audio_bitw_init(w: AudioBitW*, out: AudioBuf*) {
+  w->out = out;
+  w->acc = 0;
+  w->n = 0;
+  w->err = AUDIO_OK;
+}
+
+@inline fn bitw_flush32(w: AudioBitW*) {
+  var b: AudioBuf* = w->out;
+  if (b->cap - b->len < 4) {
+    var rc: int32 = audio_buf_reserve(b, 4096);
+    if (rc != AUDIO_OK) { w->err = rc; w->n = w->n - 32; return; }
+  }
+  var v: uint64 = w->acc >> (w->n - 32);
+  var q: uint8* = b->data + b->len;
+  q[0] = (uint8)(v >> 24);
+  q[1] = (uint8)(v >> 16);
+  q[2] = (uint8)(v >> 8);
+  q[3] = (uint8)v;
+  b->len = b->len + 4;
+  w->n = w->n - 32;
+}
+
+/// Writes the low k bits of v (k is 0..32).
+export fn audio_bitw_put(w: AudioBitW*, v: uint32, k: int32) {
+  if (k <= 0) { return; }
+  var m: uint64 = (uint64)v;
+  if (k < 32) { m = m & (((uint64)1 << k) - 1); }
+  w->acc = (w->acc << k) | m;
+  w->n = w->n + k;
+  if (w->n >= 32) { bitw_flush32(w); }
+}
+
+/// Writes v as a k-bit two's complement number.
+export fn audio_bitw_sput(w: AudioBitW*, v: int32, k: int32) {
+  audio_bitw_put(w, (uint32)v, k);
+}
+
+/// Writes z zero bits then a 1.
+export fn audio_bitw_unary(w: AudioBitW*, z: uint32) {
+  var left: uint32 = z;
+  while (left >= 32) { audio_bitw_put(w, 0, 32); left = left - 32; }
+  audio_bitw_put(w, 1, (int32)left + 1);
+}
+
+/// Pads with zero bits to a byte boundary and writes out every pending bit.
+export fn audio_bitw_flush(w: AudioBitW*) {
+  var r: int32 = w->n & 7;
+  if (r != 0) { audio_bitw_put(w, 0, 8 - r); }
+  while (w->n >= 8) {
+    var v: uint64 = (w->acc >> (w->n - 8)) & 255;
+    if (audio_buf_push(w->out, (int64)v) != AUDIO_OK) { w->err = AUDIO_E_MEM; }
+    w->n = w->n - 8;
+  }
+  w->acc = 0;
+}

@@ -1,0 +1,345 @@
+// GPOS: glyph positioning. Lookup types 1 (single), 2 (pair), 3 (cursive),
+// 4 (mark to base), 5 (mark to ligature), 6 (mark to mark), 7 (context),
+// 8 (chained context) and 9 (extension). Device tables and variation data
+// are skipped (they only matter for hinted or variable fonts).
+// Spec: OpenType "GPOS - Glyph Positioning Table". Attachment offsets are
+// resolved at the end like HarfBuzz's propagate_attachment_offsets.
+
+import "font/core/vec";
+import "font/sfnt/face";
+import "buffer";
+import "otl";
+
+fn vr_size(fmt: uint32) -> int64 {
+  var n: int64 = 0;
+  var v: uint32 = fmt & 0xFF;
+  while (v != 0) { n = n + (int64)(v & 1); v = v >> 1; }
+  return n * 2;
+}
+
+// Adds the value record at p (format fmt) to glyph x.
+fn vr_apply(f: FontFace*, fmt: uint32, p: int64, x: FontGlyph*) {
+  var q: int64 = p;
+  if ((fmt & 1) != 0) { x->x_off = x->x_off + font_i16(f, q); q = q + 2; }
+  if ((fmt & 2) != 0) { x->y_off = x->y_off + font_i16(f, q); q = q + 2; }
+  if ((fmt & 4) != 0) { x->x_adv = x->x_adv + font_i16(f, q); q = q + 2; }
+  if ((fmt & 8) != 0) { x->y_adv = x->y_adv + font_i16(f, q); q = q + 2; }
+}
+
+fn anchor(f: FontFace*, a: int64, x: int32*, y: int32*) -> bool {
+  if (a == 0) { return false; }
+  var fmt: uint32 = font_u16(f, a);
+  if (fmt < 1 || fmt > 3) { return false; }
+  *x = font_i16(f, a + 2);
+  *y = font_i16(f, a + 4);
+  return true;
+}
+
+// Attaches mark i to glyph j: mark anchor (from markArray) meets base anchor.
+fn attach_mark(c: OtlCtx*, i: int64, j: int64, mark_array: int64, mark_idx: int32, base_anchor: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var mr: int64 = mark_array + 2 + (int64)mark_idx * 4;
+  var ma: int64 = otl_off16(f, mark_array, mr + 2);
+  var mx: int32 = 0; var my: int32 = 0; var bx: int32 = 0; var by: int32 = 0;
+  if (!anchor(f, ma, &mx, &my) || !anchor(f, base_anchor, &bx, &by)) { return -1; }
+  var m: FontGlyph* = &c->buf->g.data[i];
+  m->x_off = bx - mx;
+  m->y_off = by - my;
+  m->attach = (int32)j;
+  m->atype = (uint8)1;
+  return i + 1;
+}
+
+fn pos_single(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var b: FontBuffer* = c->buf;
+  var g: int32 = b->g.data[i].id;
+  var cov: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (cov < 0) { return -1; }
+  var fmt: uint32 = font_u16(f, st);
+  var vf: uint32 = font_u16(f, st + 4);
+  if (fmt == 1) { vr_apply(f, vf, st + 6, &b->g.data[i]); return i + 1; }
+  if (fmt == 2) {
+    if ((int64)cov >= (int64)font_u16(f, st + 6)) { return -1; }
+    vr_apply(f, vf, st + 8 + (int64)cov * vr_size(vf), &b->g.data[i]);
+    return i + 1;
+  }
+  return -1;
+}
+
+fn pos_pair(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var b: FontBuffer* = c->buf;
+  var g: int32 = b->g.data[i].id;
+  var cov: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (cov < 0) { return -1; }
+  var j: int64 = otl_next(c, i);
+  if (j < 0) { return -1; }
+  var g2: int32 = b->g.data[j].id;
+  var fmt: uint32 = font_u16(f, st);
+  var vf1: uint32 = font_u16(f, st + 4);
+  var vf2: uint32 = font_u16(f, st + 6);
+  var s1: int64 = vr_size(vf1);
+  var s2: int64 = vr_size(vf2);
+  if (fmt == 1) {
+    if ((int64)cov >= (int64)font_u16(f, st + 8)) { return -1; }
+    var ps: int64 = otl_off16(f, st, st + 10 + (int64)cov * 2);
+    if (ps == 0) { return -1; }
+    var n: int64 = (int64)font_u16(f, ps);
+    var rs: int64 = 2 + s1 + s2;
+    var lo: int64 = 0;
+    var hi: int64 = n - 1;
+    while (lo <= hi) {
+      var mid: int64 = (lo + hi) / 2;
+      var r: int64 = ps + 2 + mid * rs;
+      var sg: uint32 = font_u16(f, r);
+      if ((uint32)g2 < sg) { hi = mid - 1; } else if ((uint32)g2 > sg) { lo = mid + 1; }
+      else {
+        vr_apply(f, vf1, r + 2, &b->g.data[i]);
+        vr_apply(f, vf2, r + 2 + s1, &b->g.data[j]);
+        if (vf2 != 0) { return j + 1; }
+        return j;
+      }
+    }
+    return -1;
+  }
+  if (fmt == 2) {
+    var cd1: int64 = otl_off16(f, st, st + 8);
+    var cd2: int64 = otl_off16(f, st, st + 10);
+    var n1: int64 = (int64)font_u16(f, st + 12);
+    var n2: int64 = (int64)font_u16(f, st + 14);
+    var c1: int64 = (int64)otl_class(f, cd1, g);
+    var c2: int64 = (int64)otl_class(f, cd2, g2);
+    if (c1 >= n1 || c2 >= n2) { return -1; }
+    var r: int64 = st + 16 + (c1 * n2 + c2) * (s1 + s2);
+    vr_apply(f, vf1, r, &b->g.data[i]);
+    vr_apply(f, vf2, r + s1, &b->g.data[j]);
+    if (vf2 != 0) { return j + 1; }
+    return j;
+  }
+  return -1;
+}
+
+fn pos_cursive(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var b: FontBuffer* = c->buf;
+  var g: int32 = b->g.data[i].id;
+  var covi: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (covi < 0) { return -1; }
+  var j: int64 = otl_next(c, i);
+  if (j < 0) { return -1; }
+  var covj: int32 = otl_coverage(f, otl_off16(f, st, st + 2), b->g.data[j].id);
+  if (covj < 0) { return -1; }
+  var n: int64 = (int64)font_u16(f, st + 4);
+  if ((int64)covi >= n || (int64)covj >= n) { return -1; }
+  var exit_a: int64 = otl_off16(f, st, st + 6 + (int64)covi * 4 + 2);
+  var entry_a: int64 = otl_off16(f, st, st + 6 + (int64)covj * 4);
+  var ex: int32 = 0; var ey: int32 = 0; var nx: int32 = 0; var ny: int32 = 0;
+  if (!anchor(f, exit_a, &ex, &ey) || !anchor(f, entry_a, &nx, &ny)) { return -1; }
+  var a: FontGlyph* = &b->g.data[i];
+  var z: FontGlyph* = &b->g.data[j];
+  a->x_adv = ex + a->x_off;
+  var d: int32 = nx + z->x_off;
+  z->x_adv = z->x_adv - d;
+  z->x_off = z->x_off - d;
+  // The second glyph hangs from the first vertically.
+  z->y_off = ey - ny;
+  z->attach = (int32)i;
+  z->atype = (uint8)2;
+  return j;
+}
+
+fn pos_mark_base(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var b: FontBuffer* = c->buf;
+  var g: int32 = b->g.data[i].id;
+  var mi: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (mi < 0) { return -1; }
+  // The base is the closest earlier glyph that is not a mark.
+  var j: int64 = i - 1;
+  while (j >= 0 && (b->g.data[j].cls == (uint8)3 || (b->g.data[j].uflags & FONT_UF_IGNORABLE) != (uint8)0)) { j = j - 1; }
+  if (j < 0) { return -1; }
+  var bi: int32 = otl_coverage(f, otl_off16(f, st, st + 4), b->g.data[j].id);
+  if (bi < 0) { return -1; }
+  var ncls: int64 = (int64)font_u16(f, st + 6);
+  var marks: int64 = otl_off16(f, st, st + 8);
+  var bases: int64 = otl_off16(f, st, st + 10);
+  if ((int64)mi >= (int64)font_u16(f, marks) || (int64)bi >= (int64)font_u16(f, bases)) { return -1; }
+  var mc: int64 = (int64)font_u16(f, marks + 2 + (int64)mi * 4);
+  if (mc >= ncls) { return -1; }
+  var ba: int64 = otl_off16(f, bases, bases + 2 + ((int64)bi * ncls + mc) * 2);
+  return attach_mark(c, i, j, marks, mi, ba);
+}
+
+fn pos_mark_lig(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var b: FontBuffer* = c->buf;
+  var g: int32 = b->g.data[i].id;
+  var mi: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (mi < 0) { return -1; }
+  var j: int64 = i - 1;
+  while (j >= 0 && (b->g.data[j].cls == (uint8)3 || (b->g.data[j].uflags & FONT_UF_IGNORABLE) != (uint8)0)) { j = j - 1; }
+  if (j < 0) { return -1; }
+  var li: int32 = otl_coverage(f, otl_off16(f, st, st + 4), b->g.data[j].id);
+  if (li < 0) { return -1; }
+  var ncls: int64 = (int64)font_u16(f, st + 6);
+  var marks: int64 = otl_off16(f, st, st + 8);
+  var ligs: int64 = otl_off16(f, st, st + 10);
+  if ((int64)mi >= (int64)font_u16(f, marks) || (int64)li >= (int64)font_u16(f, ligs)) { return -1; }
+  var mc: int64 = (int64)font_u16(f, marks + 2 + (int64)mi * 4);
+  if (mc >= ncls) { return -1; }
+  var la: int64 = otl_off16(f, ligs, ligs + 2 + (int64)li * 2);
+  if (la == 0) { return -1; }
+  var ncomp: int64 = (int64)font_u16(f, la);
+  if (ncomp == 0) { return -1; }
+  // Use the component the mark followed when we know it, else the last.
+  var comp: int64 = ncomp - 1;
+  var m: FontGlyph* = &b->g.data[i];
+  if (m->lig_id != (uint8)0 && m->lig_id == b->g.data[j].lig_id && m->lig_comp > (uint8)0) {
+    comp = (int64)m->lig_comp - 1;
+    if (comp >= ncomp) { comp = ncomp - 1; }
+  }
+  var ba: int64 = otl_off16(f, la, la + 2 + (comp * ncls + mc) * 2);
+  return attach_mark(c, i, j, marks, mi, ba);
+}
+
+fn pos_mark_mark(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var b: FontBuffer* = c->buf;
+  var g: int32 = b->g.data[i].id;
+  var mi: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (mi < 0) { return -1; }
+  var j: int64 = otl_prev(c, i);
+  if (j < 0 || b->g.data[j].cls != (uint8)3) { return -1; }
+  var bi: int32 = otl_coverage(f, otl_off16(f, st, st + 4), b->g.data[j].id);
+  if (bi < 0) { return -1; }
+  var ncls: int64 = (int64)font_u16(f, st + 6);
+  var marks: int64 = otl_off16(f, st, st + 8);
+  var bases: int64 = otl_off16(f, st, st + 10);
+  if ((int64)mi >= (int64)font_u16(f, marks) || (int64)bi >= (int64)font_u16(f, bases)) { return -1; }
+  var mc: int64 = (int64)font_u16(f, marks + 2 + (int64)mi * 4);
+  if (mc >= ncls) { return -1; }
+  var ba: int64 = otl_off16(f, bases, bases + 2 + ((int64)bi * ncls + mc) * 2);
+  return attach_mark(c, i, j, marks, mi, ba);
+}
+
+fn apply_sub(c: OtlCtx*, typ: uint32, st: int64, i: int64) -> int64 {
+  if (typ == 1) { return pos_single(c, st, i); }
+  if (typ == 2) { return pos_pair(c, st, i); }
+  if (typ == 3) { return pos_cursive(c, st, i); }
+  if (typ == 4) { return pos_mark_base(c, st, i); }
+  if (typ == 5) { return pos_mark_lig(c, st, i); }
+  if (typ == 6) { return pos_mark_mark(c, st, i); }
+  if (typ == 7) { return apply_context(c, st, false, i); }
+  if (typ == 8) { return apply_context(c, st, true, i); }
+  if (typ == 9) {
+    var t2: uint32 = font_u16(c->f, st + 2);
+    var off: int64 = st + (int64)font_u32(c->f, st + 4);
+    if (t2 == 9 || off == st) { return -1; }
+    return apply_sub(c, t2, off, i);
+  }
+  return -1;
+}
+
+fn set_flag(c: OtlCtx*, lk: int64) {
+  c->flag = font_u16(c->f, lk + 2);
+  c->markset = 0;
+  if ((c->flag & OTL_MARK_SET) != 0) {
+    var n: int64 = (int64)font_u16(c->f, lk + 4);
+    c->markset = (int32)font_u16(c->f, lk + 6 + n * 2);
+  }
+}
+
+fn apply_nested(c: OtlCtx*, li: int32, i: int64) {
+  if (c->depth >= 8 || i < 0 || i >= c->buf->g.len) { return; }
+  var lk: int64 = otl_lookup(c->f, c->table, li);
+  if (lk == 0) { return; }
+  var saved_flag: uint32 = c->flag;
+  var saved_set: int32 = c->markset;
+  c->depth = c->depth + 1;
+  set_flag(c, lk);
+  var typ: uint32 = font_u16(c->f, lk);
+  var n: int64 = (int64)font_u16(c->f, lk + 4);
+  if (!otl_skip(c->f, &c->buf->g.data[i], c->flag, c->markset)) {
+    for s: int64 in 0..n {
+      var st: int64 = otl_off16(c->f, lk, lk + 6 + s * 2);
+      if (st != 0 && apply_sub(c, typ, st, i) >= 0) { break; }
+    }
+  }
+  c->depth = c->depth - 1;
+  c->flag = saved_flag;
+  c->markset = saved_set;
+}
+
+fn apply_context(c: OtlCtx*, st: int64, chain: bool, i: int64) -> int64 {
+  var r: OtlRule;
+  if (!otl_context(c, st, chain, i, &r)) { return -1; }
+  var pos: FontVec<int64>;
+  for k: int64 in 0..c->pos.len { font_vec_push<int64>(&pos, c->pos.data[k]); }
+  for k: int64 in 0..r.nrec {
+    var seq: int64 = (int64)font_u16(c->f, r.recs + k * 4);
+    var li: int32 = (int32)font_u16(c->f, r.recs + k * 4 + 2);
+    if (seq < pos.len) { apply_nested(c, li, pos.data[seq]); }
+  }
+  font_vec_free<int64>(&pos);
+  return r.last + 1;
+}
+
+/// Applies the given GPOS lookups (in order) to the whole buffer. Glyph
+/// advances must already be set.
+export fn font_gpos_apply(f: FontFace*, buf: FontBuffer*, lookups: FontVec<int32>*) {
+  if (f->gpos == 0) { return; }
+  var c: OtlCtx;
+  c.f = f;
+  c.buf = buf;
+  c.table = f->gpos;
+  c.work = 200000 + buf->g.len * 64;
+  c.limit = buf->g.len;
+  for li: int64 in 0..lookups->len {
+    var lk: int64 = otl_lookup(f, f->gpos, lookups->data[li]);
+    if (lk == 0) { continue; }
+    var typ: uint32 = font_u16(f, lk);
+    var n: int64 = (int64)font_u16(f, lk + 4);
+    set_flag(&c, lk);
+    var dg: OtlDigest;
+    otl_lookup_digest(f, lk, true, &dg);
+    var i: int64 = 0;
+    while (i < buf->g.len) {
+      c.work = c.work - 1;
+      if (c.work < 0) { font_vec_free<int64>(&c.pos); return; }
+      var next: int64 = -1;
+      if (otl_digest_may(&dg, buf->g.data[i].id) && !otl_skip(f, &buf->g.data[i], c.flag, c.markset)) {
+        for s: int64 in 0..n {
+          var st: int64 = otl_off16(f, lk, lk + 6 + s * 2);
+          if (st == 0) { continue; }
+          c.depth = 0;
+          next = apply_sub(&c, typ, st, i);
+          set_flag(&c, lk);
+          if (next >= 0) { break; }
+        }
+      }
+      if (next <= i) { i = i + 1; } else { i = next; }
+    }
+  }
+  font_vec_free<int64>(&c.pos);
+}
+
+/// Turns attachments into final offsets: a mark's offset becomes relative
+/// to its own pen position, and chains (mark on mark, cursive runs) add up.
+/// Call once after all GPOS lookups, for a left-to-right glyph order.
+export fn font_gpos_resolve(buf: FontBuffer*) {
+  var n: int64 = buf->g.len;
+  for i: int64 in 0..n {
+    var x: FontGlyph* = &buf->g.data[i];
+    var j: int64 = (int64)x->attach;
+    if (x->atype == (uint8)0 || j < 0 || j >= i) { continue; }
+    var base: FontGlyph* = &buf->g.data[j];
+    x->y_off = x->y_off + base->y_off;
+    if (x->atype == (uint8)1) {
+      // Pen distance from the base to this mark.
+      var dist: int32 = 0;
+      for k: int64 in j..i { dist = dist + buf->g.data[k].x_adv; }
+      x->x_off = x->x_off + base->x_off - dist;
+    }
+  }
+}

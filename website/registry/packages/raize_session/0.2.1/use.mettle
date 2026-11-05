@@ -1,0 +1,240 @@
+// raize_session/use — declaring sessions: RzSessionConfig, rz_session_defaults,
+// rz_use_session, rz_csrf_exempt, and the middleware step they install.
+// reference: sessions
+// thread: declarations in the declaration function only; the step runs on workers,
+// the prune tick on the timer thread. Both call the app's SesStore, which must lock.
+//
+// Per request the step: finds the cookie (ses_cookie_find) and looks the session up
+// (ses_lookup: expiry, revocation, flash hand-off); refuses an unsafe method without
+// a valid CSRF token (403) unless the path is exempt; runs the rest of the chain;
+// then rotates when the policy says so (ses_needs_rotation), touches and saves
+// (ses_touch), and writes the cookie when the token changed or clears a stale one.
+// A WebSocket upgrade (an Upgrade header) uses ses_peek instead: read-only, no flash taken.
+
+import "std/mem";
+import "ses/session";
+import "cryptex/cryptex";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/request";
+import "raize_core/context/context";
+import "raize_app/types";
+import "raize_app/use";
+import "raize_app/timer";
+import "state";
+
+/// Session settings for rz_use_session. Start from rz_session_defaults() and set
+/// `store`.
+export struct RzSessionConfig {
+  cookie: string;      // cookie name ("rz_session"); a token, `__Host-` prefix welcome
+  idle_s: int64;       // seconds without a request before a session expires (> 0)
+  max_age_s: int64;    // seconds after creation before it expires anyway (>= idle_s)
+  secure: bool;        // Secure attribute (default true; false only for plain-HTTP dev)
+  same_site: string;   // "Lax" (default), "Strict" or "None" (needs secure)
+  store: SesStore*;    // the app's store (required); borrowed for the process
+}
+
+/// The safe defaults: cookie "rz_session", 30 minutes idle, 8 hours absolute,
+/// Secure, SameSite=Lax, no store (set one).
+///
+/// in:      nothing
+/// returns: the settings, to adjust and pass to rz_use_session
+/// owns:    nothing; the strings are literals
+/// thread:  any
+/// example:
+///   var cfg: RzSessionConfig = rz_session_defaults();
+///   cfg.store = &g_store;
+export fn rz_session_defaults() -> RzSessionConfig {
+  var c: RzSessionConfig;
+  c.cookie = "rz_session";
+  c.idle_s = 1800;
+  c.max_age_s = 28800;
+  c.secure = true;
+  c.same_site = "Lax";
+  c.store = 0;
+  return c;
+}
+
+fn rz__ses_same_site(s: string) -> int32 {
+  if (rz_str_eq(s, "Lax")) { return SES_SAMESITE_LAX; }
+  if (rz_str_eq(s, "Strict")) { return SES_SAMESITE_STRICT; }
+  if (rz_str_eq(s, "None")) { return SES_SAMESITE_NONE; }
+  return 0;
+}
+
+fn rz__ses_prune_tick(n: int64) {
+  var g: Rz_SesGlobal* = rz__ses_global();
+  if (g != 0) { ses_prune(&g->m, rz__ses_now()); }
+}
+
+/// Turns on sessions: a middleware step (after the ones declared before it, before
+/// guards and handlers) loads the session from the cookie, refuses unsafe methods
+/// (POST, PUT, PATCH, DELETE) without a valid CSRF token with 403, and after the
+/// handler rotates, saves and sets the cookie. Revoked and expired records are
+/// pruned from the store once a minute.
+///
+/// in:      app  the app
+///          cfg  the settings; cfg.store must be a complete SesStore that outlives
+///               the app and is safe to call from several threads at once
+/// returns: RZ_OK; RZ_E_USAGE (second call, no store) or RZ_E_INVALID (bad
+///          setting); every error is also reported by rz_run, which then refuses
+///          to start
+/// owns:    copies the cookie name; borrows cfg.store for the process
+/// thread:  the declaration function only; the store is then called from worker
+///          threads, the hub thread (rz_conn_session_get) and the timer thread
+/// example:
+///   var cfg: RzSessionConfig = rz_session_defaults();
+///   cfg.store = &g_store;   // your SesStore over your database
+///   rz_use_session(app, cfg);
+export fn rz_use_session(app: RzApp*, cfg: RzSessionConfig) -> int32 {
+  if (app == 0) { return RZ_E_USAGE; }
+  if (rz__ses_global() != 0) {
+    rz__app_error(app, "rz_use_session: declared twice — call it once");
+    return RZ_E_USAGE;
+  }
+  if (!ses_store_complete(cfg.store)) {
+    rz__app_error(app, "rz_use_session: no complete store — set cfg.store to a SesStore with all five functions");
+    return RZ_E_USAGE;
+  }
+  var ss: int32 = rz__ses_same_site(cfg.same_site);
+  if (!ses_cookie_name_ok(cfg.cookie) || ss == 0 || (ss == SES_SAMESITE_NONE && !cfg.secure)) {
+    rz__app_error(app, "rz_use_session(\"{cfg.cookie}\"): bad cookie settings — use a token name and same_site \"Lax\", \"Strict\" or \"None\" (None needs secure)");
+    return RZ_E_INVALID;
+  }
+  var sc: SesConfig;
+  ses_config_defaults(&sc);
+  sc.idle_timeout = cfg.idle_s;
+  sc.absolute_lifetime = cfg.max_age_s;
+  sc.touch_interval = 0;
+  if (cfg.idle_s > 120) { sc.touch_interval = 60; }
+  // The key only signs ses_sign values, which raize does not hand out.
+  if (cr_random_bytes(&sc.key.b[0], 32) != CR_OK) {
+    rz__app_error(app, "rz_use_session: no random bytes for the session key — check getrandom");
+    return RZ_E_IO;
+  }
+  var g: Rz_SesGlobal* = (Rz_SesGlobal*)calloc(1, sizeof(Rz_SesGlobal));
+  if (g == 0) { rz__app_error(app, "rz_use_session: out of memory — add memory"); return RZ_E_NOMEM; }
+  var rc: int32 = ses_init(&g->m, &sc, cfg.store);
+  cr_wipe(&sc.key.b[0], 32);
+  if (rc != SES_OK) {
+    free((rawptr)g);
+    var why: string = ses_status_name(rc);
+    rz__app_error(app, "rz_use_session: idle_s {cfg.idle_s} / max_age_s {cfg.max_age_s} refused ({why}) — idle_s > 0 and max_age_s >= idle_s");
+    return RZ_E_INVALID;
+  }
+  g->cookie = rz_str_dup(cfg.cookie);
+  g->secure = cfg.secure;
+  g->same_site = ss;
+  rz__ses_publish(g);
+  rz_use(app, "session", &rz__mw_session);
+  rz_every(app, 60000, &rz__ses_prune_tick);
+  return RZ_OK;
+}
+
+/// Skips the CSRF check for every route under `prefix`: for APIs authenticated by a
+/// token header (rz_use_bearer_auth), which a browser never sends on its own.
+///
+/// in:      app     the app
+///          prefix  "/api" covers /api and /api/...; starts with /; copied
+/// returns: nothing; before rz_use_session, a bad prefix or more than 8 is
+///          reported by rz_run
+/// owns:    nothing kept from the caller
+/// thread:  the declaration function only
+/// example:
+///   rz_csrf_exempt(app, "/api");
+export fn rz_csrf_exempt(app: RzApp*, prefix: string) {
+  if (app == 0) { return; }
+  var g: Rz_SesGlobal* = rz__ses_global();
+  if (g == 0) {
+    rz__app_error(app, "rz_csrf_exempt(\"{prefix}\"): no sessions yet — call rz_use_session first");
+    return;
+  }
+  var n: int64 = (int64)prefix.length;
+  if (n == 0 || prefix.chars[0] != (uint8)'/' || (n > 1 && prefix.chars[n - 1] == (uint8)'/')) {
+    rz__app_error(app, "rz_csrf_exempt(\"{prefix}\"): the prefix must start with / and not end with / — e.g. \"/api\"");
+    return;
+  }
+  if (g->nexempt >= RZ__SES_MAX_EXEMPT) {
+    rz__app_error(app, "rz_csrf_exempt(\"{prefix}\"): more than {RZ__SES_MAX_EXEMPT} prefixes — group the APIs under one prefix");
+    return;
+  }
+  g->exempt[g->nexempt] = rz_str_dup(prefix);
+  g->nexempt = g->nexempt + 1;
+}
+
+fn rz__ses_under(path: string, prefix: string) -> bool {
+  if (rz_str_eq(prefix, "/")) { return true; }
+  if (!rz_str_starts(path, prefix)) { return false; }
+  var n: int64 = (int64)prefix.length;
+  return (int64)path.length == n || path.chars[n] == (uint8)'/';
+}
+
+// True when the request changes state and its path is not exempt.
+fn rz__ses_csrf_needed(ctx: RzContext*) -> bool {
+  var req: RzRequest* = ctx->req;
+  if (req == 0) { return false; }
+  var writes: bool = rz_req_verb_is(req, "POST") || rz_req_verb_is(req, "PUT") || rz_req_verb_is(req, "PATCH") || rz_req_verb_is(req, "DELETE");
+  if (!writes) { return false; }
+  var g: Rz_SesGlobal* = rz__ses_global();
+  for i in 0..g->nexempt {
+    if (rz__ses_under(req->path, g->exempt[i])) { return false; }
+  }
+  return true;
+}
+
+// The x-csrf-token header, else the _csrf form field.
+fn rz__ses_csrf_ok(ctx: RzContext*, r: Rz_SesReq*) -> bool {
+  var v: string = rz_ctx_header(ctx, "x-csrf-token");
+  if (v.length == 0) { rz_ctx_form(ctx, "_csrf", &v); }
+  return ses_csrf_verify(&r->s, v);
+}
+
+fn rz__ses_finish(ctx: RzContext*, r: Rz_SesReq*) {
+  var g: Rz_SesGlobal* = rz__ses_global();
+  if (ses_is_live(&r->s)) {
+    // An upgrade's 101 cannot carry a new cookie, so it never rotates.
+    if (!r->set_cookie && ctx->upgrade == 0 && ses_needs_rotation(&g->m, &r->s, r->now)) {
+      if (ses_rotate(&g->m, &r->s, r->now, &r->tok) == SES_OK) { r->set_cookie = true; }
+    }
+    ses_touch(&g->m, &r->s, r->now);
+    if (r->set_cookie && ctx->upgrade == 0) { rz__ses_write_cookie(ctx, r, false); }
+  } else if (r->clear && ctx->upgrade == 0) {
+    rz__ses_write_cookie(ctx, r, true);
+  }
+}
+
+/// internal: raize_session/use (the step rz_use_session installs).
+/// in:      ctx the request; next the rest of the chain
+/// returns: next's status, or 403 / 500 when the step answered itself
+/// owns:    the request state, freed before returning
+export fn rz__mw_session(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  var g: Rz_SesGlobal* = rz__ses_global();
+  if (g == 0) { return next(ctx); }
+  var r: Rz_SesReq* = (Rz_SesReq*)calloc(1, sizeof(Rz_SesReq));
+  if (r == 0) { return rz_ctx_text(ctx, 500, "out of memory\n"); }
+  r->now = rz__ses_now();
+  var tok: string = rz_str_empty();
+  var found: int32 = ses_cookie_find(rz_ctx_header(ctx, "cookie"), g->cookie, &tok);
+  if (found == SES_OK) {
+    // A WebSocket upgrade only reads the session (the page it belongs to takes the
+    // flash): ses_peek leaves flash, last_seen and the record alone, and its
+    // read-only session refuses every write-back below.
+    var is_upgrade: bool = rz_ctx_header(ctx, "upgrade").length > 0;
+    var lrc: int32 = SES_OK;
+    if (is_upgrade) { lrc = ses_peek(&g->m, tok, r->now, &r->s); }
+    else { lrc = ses_lookup(&g->m, tok, r->now, &r->s); }
+    if (lrc != SES_OK) { r->clear = true; }
+  }
+  ctx->session = (rawptr)r;
+  var rc: int32 = 0;
+  if (rz__ses_csrf_needed(ctx) && !rz__ses_csrf_ok(ctx, r)) {
+    rc = rz_ctx_text(ctx, 403, "invalid or missing CSRF token\n");
+  } else {
+    rc = next(ctx);
+  }
+  rz__ses_finish(ctx, r);
+  ctx->session = 0;
+  ses_token_wipe(&r->tok);
+  free((rawptr)r);
+  return rc;
+}

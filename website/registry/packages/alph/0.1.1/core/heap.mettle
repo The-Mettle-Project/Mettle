@@ -1,0 +1,342 @@
+// alph/core/heap: per-actor heaps, per-scheduler chunk pools and scratch.
+//
+// Every actor owns an AlphHeap. Only that actor allocates from it, so
+// allocation takes no lock: blocks come from size-class free lists or are
+// carved from the heap's current chunk. When the actor exits, its chunks go
+// back to a pool as a whole. Nothing is collected and nothing ever pauses
+// other actors.
+//
+// Chunks come from an AlphPool, one per scheduler, which carves them from
+// large mmap'd slabs and keeps freed ones for reuse. A pool has a spin lock,
+// but only its scheduler uses it in the normal course, so it is uncontended.
+// Blocks over 32 KiB bypass chunks and are mapped on their own.
+//
+// Internal to the runtime: actors use alph_alloc, alph_free, alph_realloc
+// and alph_scratch from alph/core/node.
+
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/linux";
+
+const ALPH_HEADER: int64 = 16;           // before every block; keeps 16-byte alignment
+const ALPH_CLASSES: int64 = 11;          // blocks of 32 << class bytes, 32 B to 32 KiB
+const ALPH_CHUNK_SIZES: int64 = 3;       // 1 KiB, 8 KiB, 64 KiB
+const ALPH_SLAB_SIZE: int64 = 1048576;   // pools map slabs of 1 MiB
+const ALPH_CHUNK_HEADER: int64 = 16;     // next chunk, chunk size
+const ALPH_LARGE_MARK: int64 = -1;       // header class of a block mapped on its own
+const ALPH_LARGE_HEADER: int64 = 32;     // next, prev, mark, mapped size
+
+// Every block's size class sits 16 bytes before it: a class number, or
+// ALPH_LARGE_MARK for a block mapped on its own. A free block keeps its
+// free-list link in the header's second word.
+
+// Free chunks of each size, ready for reuse. One per scheduler.
+export struct AlphPool {
+  lock: int64;
+  free: int64[3];  // a list per chunk size
+  slab: int64;     // the slab being carved
+  slab_end: int64;
+}
+
+// One actor's memory.
+export struct AlphHeap {
+  free: int64[11];  // a free list per size class
+  cur: int64;       // bump pointer in the current chunk
+  end: int64;
+  chunks: int64;    // every chunk the heap owns, linked through their headers
+  next_size: int64; // index of the next chunk size to take
+  large: int64;     // blocks mapped on their own, a doubly linked list
+  used: int64;      // bytes in blocks handed out, headers included
+  limit: int64;     // 0 for none
+}
+
+// Memory valid until the scratch is reset: after every handler call.
+export struct AlphScratch {
+  first: int64;     // the chunk kept across resets
+  cur: int64;
+  end: int64;
+  extra: int64;     // further chunks, returned on reset
+}
+
+fn alph_chunk_size(index: int64) -> int64 {
+  if (index == 0) {
+    return 1024;
+  }
+  if (index == 1) {
+    return 8192;
+  }
+  return 65536;
+}
+
+fn alph_word(at: int64) -> int64* {
+  return (int64*)at;
+}
+
+fn alph_map(size: int64) -> int64 {
+  var got: int64 = syscall(ALPH_SYS_MMAP, 0, size, ALPH_PROT_READ_WRITE,
+                           ALPH_MAP_PRIVATE_ANONYMOUS, -1, 0);
+  if (got < 0) {
+    return 0;
+  }
+  return got;
+}
+
+// ---- pools ----------------------------------------------------------------
+
+// Hands out a chunk of the given size index, or 0 when memory ran out.
+// Thread: any; the pool's lock is taken.
+export fn alph_pool_take(pool: AlphPool*, index: int64) -> int64 {
+  var size: int64 = alph_chunk_size(index);
+  while (alph_atomic_cas(&pool->lock, 0, 1) != 0) {
+    alph_cpu_relax();
+  }
+  var chunk: int64 = pool->free[index];
+  if (chunk != 0) {
+    pool->free[index] = *alph_word(chunk);
+  } else {
+    if (pool->slab == 0 || pool->slab + size > pool->slab_end) {
+      pool->slab = alph_map(ALPH_SLAB_SIZE);
+      pool->slab_end = pool->slab + ALPH_SLAB_SIZE;
+    }
+    if (pool->slab != 0) {
+      chunk = pool->slab;
+      pool->slab = pool->slab + size;
+    }
+  }
+  alph_atomic_store(&pool->lock, 0);
+  if (chunk != 0) {
+    *alph_word(chunk) = 0;
+    *alph_word(chunk + 8) = index;
+  }
+  return chunk;
+}
+
+// Gives back a list of chunks linked through their first word.
+// Thread: any; the pool's lock is taken.
+export fn alph_pool_give(pool: AlphPool*, chunks: int64) {
+  while (alph_atomic_cas(&pool->lock, 0, 1) != 0) {
+    alph_cpu_relax();
+  }
+  var chunk: int64 = chunks;
+  while (chunk != 0) {
+    var next: int64 = *alph_word(chunk);
+    var index: int64 = *alph_word(chunk + 8);
+    *alph_word(chunk) = pool->free[index];
+    pool->free[index] = chunk;
+    chunk = next;
+  }
+  alph_atomic_store(&pool->lock, 0);
+}
+
+// ---- heaps ----------------------------------------------------------------
+
+// The size class whose blocks fit total bytes, or ALPH_CLASSES when none does.
+fn alph_class_of(total: int64) -> int64 {
+  var class: int64 = 0;
+  var size: int64 = 32;
+  while (size < total && class < ALPH_CLASSES) {
+    size = size * 2;
+    class = class + 1;
+  }
+  return class;
+}
+
+fn alph_class_size(class: int64) -> int64 {
+  return (int64)32 << class;
+}
+
+// Makes heap empty with the given byte limit (0 for none). It owns nothing.
+export fn alph_heap_init(heap: AlphHeap*, limit: int64) {
+  memset((rawptr)heap, 0, (int64)sizeof(AlphHeap));
+  heap->limit = limit;
+}
+
+// Takes a new chunk big enough for need bytes into the heap.
+fn alph_heap_grow(heap: AlphHeap*, pool: AlphPool*, need: int64) -> bool {
+  var index: int64 = heap->next_size;
+  while (index < ALPH_CHUNK_SIZES - 1 && alph_chunk_size(index) - ALPH_CHUNK_HEADER < need) {
+    index = index + 1;
+  }
+  var chunk: int64 = alph_pool_take(pool, index);
+  if (chunk == 0) {
+    return false;
+  }
+  *alph_word(chunk) = heap->chunks;
+  heap->chunks = chunk;
+  heap->cur = chunk + ALPH_CHUNK_HEADER;
+  heap->end = chunk + alph_chunk_size(index);
+  if (index + 1 < ALPH_CHUNK_SIZES) {
+    heap->next_size = index + 1;
+  }
+  return true;
+}
+
+fn alph_heap_large(heap: AlphHeap*, size: int64) -> rawptr {
+  var total: int64 = (size + ALPH_LARGE_HEADER + ALPH_PAGE_SIZE - 1) & -ALPH_PAGE_SIZE;
+  if (heap->limit > 0 && heap->used + total > heap->limit) {
+    return (rawptr)0;
+  }
+  var block: int64 = alph_map(total);
+  if (block == 0) {
+    return (rawptr)0;
+  }
+  *alph_word(block) = heap->large;
+  *alph_word(block + 8) = 0;
+  *alph_word(block + 16) = ALPH_LARGE_MARK;
+  *alph_word(block + 24) = total;
+  if (heap->large != 0) {
+    *alph_word(heap->large + 8) = block;
+  }
+  heap->large = block;
+  heap->used = heap->used + total;
+  return (rawptr)(block + ALPH_LARGE_HEADER);
+}
+
+// Allocates size bytes, 16-byte aligned and not zeroed. Returns 0 when the
+// heap's limit would be passed or memory ran out.
+// Thread: the heap's owner.
+export fn alph_heap_alloc(heap: AlphHeap*, pool: AlphPool*, size: int64) -> rawptr {
+  if (size < 0) {
+    return (rawptr)0;
+  }
+  var class: int64 = alph_class_of(size + ALPH_HEADER);
+  if (class >= ALPH_CLASSES) {
+    return alph_heap_large(heap, size);
+  }
+  var total: int64 = alph_class_size(class);
+  if (heap->limit > 0 && heap->used + total > heap->limit) {
+    return (rawptr)0;
+  }
+  var block: int64 = heap->free[class];
+  if (block != 0) {
+    heap->free[class] = *alph_word(block + 8);
+  } else {
+    if (heap->cur + total > heap->end && !alph_heap_grow(heap, pool, total)) {
+      return (rawptr)0;
+    }
+    block = heap->cur;
+    heap->cur = heap->cur + total;
+  }
+  *alph_word(block) = class;
+  heap->used = heap->used + total;
+  return (rawptr)(block + ALPH_HEADER);
+}
+
+// The usable size of a block from alph_heap_alloc.
+export fn alph_heap_size(ptr: rawptr) -> int64 {
+  var mark: int64 = *alph_word((int64)ptr - ALPH_HEADER);
+  if (mark == ALPH_LARGE_MARK) {
+    return *alph_word((int64)ptr - 8) - ALPH_LARGE_HEADER;
+  }
+  return alph_class_size(mark) - ALPH_HEADER;
+}
+
+// Returns a block to the heap. ptr must come from this heap; 0 is ignored.
+// Thread: the heap's owner.
+export fn alph_heap_free(heap: AlphHeap*, ptr: rawptr) {
+  if (ptr == 0) {
+    return;
+  }
+  var mark: int64 = *alph_word((int64)ptr - ALPH_HEADER);
+  if (mark == ALPH_LARGE_MARK) {
+    var block: int64 = (int64)ptr - ALPH_LARGE_HEADER;
+    var next: int64 = *alph_word(block);
+    var prev: int64 = *alph_word(block + 8);
+    var total: int64 = *alph_word(block + 24);
+    if (prev != 0) {
+      *alph_word(prev) = next;
+    } else {
+      heap->large = next;
+    }
+    if (next != 0) {
+      *alph_word(next + 8) = prev;
+    }
+    heap->used = heap->used - total;
+    syscall(ALPH_SYS_MUNMAP, block, total);
+    return;
+  }
+  var block: int64 = (int64)ptr - ALPH_HEADER;
+  *alph_word(block + 8) = heap->free[mark];
+  heap->free[mark] = block;
+  heap->used = heap->used - alph_class_size(mark);
+}
+
+// Releases everything the heap owns: chunks go back to pool, mapped blocks
+// to the system. The heap is empty afterwards, with the same limit.
+// Thread: any thread that is the only one touching heap.
+export fn alph_heap_release(heap: AlphHeap*, pool: AlphPool*) {
+  var block: int64 = heap->large;
+  while (block != 0) {
+    var next: int64 = *alph_word(block);
+    syscall(ALPH_SYS_MUNMAP, block, *alph_word(block + 24));
+    block = next;
+  }
+  if (heap->chunks != 0) {
+    alph_pool_give(pool, heap->chunks);
+  }
+  alph_heap_init(heap, heap->limit);
+}
+
+// ---- scratch --------------------------------------------------------------
+
+// Allocates size bytes valid until the next alph_scratch_reset, 16-byte
+// aligned and not zeroed. Returns 0 when memory ran out.
+// Thread: the scratch's owner.
+export fn alph_scratch_alloc(s: AlphScratch*, pool: AlphPool*, size: int64) -> rawptr {
+  var total: int64 = (size + 15) & -16;
+  if (s->cur + total <= s->end) {
+    var at: int64 = s->cur;
+    s->cur = s->cur + total;
+    return (rawptr)at;
+  }
+  if (total > alph_chunk_size(2) - ALPH_CHUNK_HEADER) {
+    // Too big for a chunk: map it on its own, unmapped at the next reset.
+    var block: int64 = alph_map(total + ALPH_CHUNK_HEADER);
+    if (block == 0) {
+      return (rawptr)0;
+    }
+    *alph_word(block) = s->extra;
+    *alph_word(block + 8) = -(total + ALPH_CHUNK_HEADER);
+    s->extra = block;
+    return (rawptr)(block + ALPH_CHUNK_HEADER);
+  }
+  var chunk: int64 = alph_pool_take(pool, 2);
+  if (chunk == 0) {
+    return (rawptr)0;
+  }
+  if (s->first == 0) {
+    s->first = chunk;
+  } else {
+    *alph_word(chunk) = s->extra;
+    s->extra = chunk;
+  }
+  s->cur = chunk + ALPH_CHUNK_HEADER + total;
+  s->end = chunk + alph_chunk_size(2);
+  return (rawptr)(chunk + ALPH_CHUNK_HEADER);
+}
+
+// Frees everything allocated since the last reset, keeping the first chunk.
+// Thread: the scratch's owner.
+export fn alph_scratch_reset(s: AlphScratch*, pool: AlphPool*) {
+  var chunk: int64 = s->extra;
+  var pooled: int64 = 0;
+  while (chunk != 0) {
+    var next: int64 = *alph_word(chunk);
+    var kind: int64 = *alph_word(chunk + 8);
+    if (kind < 0) {
+      syscall(ALPH_SYS_MUNMAP, chunk, -kind);
+    } else {
+      *alph_word(chunk) = pooled;
+      pooled = chunk;
+    }
+    chunk = next;
+  }
+  if (pooled != 0) {
+    alph_pool_give(pool, pooled);
+  }
+  s->extra = 0;
+  if (s->first != 0) {
+    s->cur = s->first + ALPH_CHUNK_HEADER;
+    s->end = s->first + alph_chunk_size(2);
+  }
+}

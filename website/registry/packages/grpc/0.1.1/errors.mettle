@@ -1,0 +1,71 @@
+// Rich errors: a google.rpc.Status with typed details (ErrorInfo,
+// RetryInfo, BadRequest... from google/rpc/error_details.proto) carried in
+// the grpc-status-details-bin trailer. This is the error model of
+// https://cloud.google.com/apis/design/errors, which grpc-go, grpc-java
+// and tonic all read.
+import "std/mem";
+import "codec/core/list";
+import "codec/core/rev";
+import "codec/core/status";
+import "grpc/status";
+import "grpc/gen/google/protobuf/any_pb";
+import "grpc/gen/google/rpc/status_pb";
+
+fn own(s: string) -> string {
+  var r: string;
+  if (s.length == 0) { return r; }
+  var p: uint8* = (uint8*)malloc((int64)s.length);
+  memcpy(p, s.chars, (int64)s.length);
+  r.chars = p;
+  r.length = s.length;
+  return r;
+}
+
+// Fills an Any with a serialized message of the given full type name
+// ("google.rpc.ErrorInfo"). The strings are used as given, not copied.
+export fn grpc_any_pack(a: GrpcPbAny*, type_name: string, bytes: string) {
+  GrpcPbAny_init(a);
+  a->type_url = "type.googleapis.com/" + type_name;
+  a->value = bytes;
+}
+
+// True if the Any holds the given full type name.
+export fn grpc_any_is(a: GrpcPbAny*, type_name: string) -> bool {
+  var u: string = a->type_url;
+  if (u.length < type_name.length + 1) { return false; }
+  var off: int64 = (int64)u.length - (int64)type_name.length;
+  if (u.chars[off - 1] != 47) { return false; }
+  for i in 0..(int64)type_name.length {
+    if (u.chars[off + i] != type_name.chars[i]) { return false; }
+  }
+  return true;
+}
+
+// A status whose details hold a google.rpc.Status with the given details.
+// The returned status owns its message and details: grpc_status_free.
+export fn grpc_status_rich(code: int32, message: string, details: GrpcPbAny*, n: int64) -> GrpcStatus {
+  var pb: GrpcPbStatus;
+  GrpcPbStatus_init(&pb);
+  pb.code = code;
+  pb.message = message;
+  for i in 0..n { codec_list_push(&pb.details, details[i]); }
+  var w: CodecRev;
+  var bytes: string = GrpcPbStatus_serialize(&pb, &w);
+  var st: GrpcStatus;
+  st.code = code;
+  st.message = own(message);
+  st.details = own(bytes);
+  codec_rev_free(&w);
+  codec_list_free(&pb.details);
+  return st;
+}
+
+// Decodes the google.rpc.Status in st->details into out (init'd by the
+// caller; free with GrpcPbStatus_free). False if there are none, they do
+// not decode, or their code disagrees with the call's status (the spec
+// says to ignore them then).
+export fn grpc_status_details(st: GrpcStatus*, out: GrpcPbStatus*) -> bool {
+  if (st->details.length == 0) { return false; }
+  if (GrpcPbStatus_decode(out, st->details) != CODEC_OK) { return false; }
+  return out->code == st->code;
+}

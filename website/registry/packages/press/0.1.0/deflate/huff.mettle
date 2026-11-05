@@ -1,0 +1,136 @@
+// Huffman code building for the DEFLATE encoder: code lengths limited to a
+// maximum (15 for data, 7 for the code-length code) and canonical codes.
+
+// Builds code lengths for n symbols from their frequencies. Symbols with a
+// zero frequency get length 0. At least two symbols always get a code, so
+// every decoder accepts the result.
+export fn pdf_make_lens(freq: uint32*, n: int64, maxbits: int64, lens: uint8*) {
+  var keys: uint64[288];
+  var cnt: int64 = 0;
+  for s in 0..n {
+    lens[s] = 0;
+    if (freq[s] != 0) { keys[cnt] = ((uint64)freq[s] << 16) | (uint64)s; cnt = cnt + 1; }
+  }
+  if (cnt < 2) {
+    // One or no used symbols: give two symbols one-bit codes.
+    var a: int64 = 0;
+    if (cnt == 1) { a = (int64)(keys[0] & 65535); }
+    var b: int64 = 0;
+    if (a == 0) { b = 1; }
+    lens[a] = 1;
+    lens[b] = 1;
+    return;
+  }
+  // Shell sort by frequency, then symbol.
+  var gap: int64 = 1;
+  while (gap < cnt / 3) { gap = gap * 3 + 1; }
+  while (gap > 0) {
+    for i in gap..cnt {
+      var k: uint64 = keys[i];
+      var j: int64 = i;
+      while (j >= gap && keys[j - gap] > k) { keys[j] = keys[j - gap]; j = j - gap; }
+      keys[j] = k;
+    }
+    gap = gap / 3;
+  }
+  // Moffat and Katajainen: code lengths in place, in O(n).
+  var a2: uint64[288];
+  for i in 0..cnt { a2[i] = keys[i] >> 16; }
+  a2[0] = a2[0] + a2[1];
+  var root: int64 = 0;
+  var leaf: int64 = 2;
+  for next in 1..(cnt - 1) {
+    if (leaf >= cnt || a2[root] < a2[leaf]) {
+      a2[next] = a2[root];
+      a2[root] = (uint64)next;
+      root = root + 1;
+    } else {
+      a2[next] = a2[leaf];
+      leaf = leaf + 1;
+    }
+    if (leaf >= cnt || (root < next && a2[root] < a2[leaf])) {
+      a2[next] = a2[next] + a2[root];
+      a2[root] = (uint64)next;
+      root = root + 1;
+    } else {
+      a2[next] = a2[next] + a2[leaf];
+      leaf = leaf + 1;
+    }
+  }
+  a2[cnt - 2] = 0;
+  var nx: int64 = cnt - 3;
+  while (nx >= 0) { a2[nx] = a2[(int64)a2[nx]] + 1; nx = nx - 1; }
+  var avail: int64 = 1;
+  var used: int64 = 0;
+  var depth: uint64 = 0;
+  root = cnt - 2;
+  nx = cnt - 1;
+  while (avail > 0) {
+    while (root >= 0 && a2[root] == depth) { used = used + 1; root = root - 1; }
+    while (avail > used) { a2[nx] = depth; nx = nx - 1; avail = avail - 1; }
+    avail = 2 * used;
+    depth = depth + 1;
+    used = 0;
+  }
+  // a2[i] is now the length for the i-th rarest symbol. Limit to maxbits.
+  var count: int64[64];
+  var over: bool = false;
+  for i in 0..cnt {
+    var l: int64 = (int64)a2[i];
+    if (l > 63) { l = 63; }
+    if (l > maxbits) { over = true; }
+    count[l] = count[l] + 1;
+  }
+  if (over) {
+    for l in (maxbits + 1)..64 { count[maxbits] = count[maxbits] + count[l]; count[l] = 0; }
+    var total: int64 = 0;
+    for l in 1..(maxbits + 1) { total = total + (count[l] << (uint64)(maxbits - l)); }
+    var full: int64 = (int64)1 << (uint64)maxbits;
+    while (total != full) {
+      count[maxbits] = count[maxbits] - 1;
+      var l2: int64 = maxbits - 1;
+      while (l2 > 0) {
+        if (count[l2] > 0) {
+          count[l2] = count[l2] - 1;
+          count[l2 + 1] = count[l2 + 1] + 2;
+          break;
+        }
+        l2 = l2 - 1;
+      }
+      total = total - 1;
+    }
+  }
+  // Rarest symbols get the longest codes.
+  var idx: int64 = 0;
+  var len: int64 = maxbits;
+  if (!over) { len = 63; }
+  while (len >= 1) {
+    for k in 0..count[len] {
+      lens[(int64)(keys[idx] & 65535)] = (uint8)len;
+      idx = idx + 1;
+    }
+    len = len - 1;
+  }
+}
+
+// Canonical codes for the given lengths, bit-reversed for LSB-first output.
+export fn pdf_make_codes(lens: uint8*, n: int64, codes: uint16*) {
+  var count: int64[16];
+  var next: int64[16];
+  for s in 0..n { count[(int64)lens[s]] = count[(int64)lens[s]] + 1; }
+  count[0] = 0;
+  var code: int64 = 0;
+  for l in 1..16 {
+    code = (code + count[l - 1]) << 1;
+    next[l] = code;
+  }
+  for s in 0..n {
+    var l: int64 = (int64)lens[s];
+    if (l == 0) { codes[s] = 0; continue; }
+    var c: int64 = next[l];
+    next[l] = c + 1;
+    var r: int64 = 0;
+    for k in 0..l { r = (r << 1) | ((c >> (uint64)k) & 1); }
+    codes[s] = (uint16)r;
+  }
+}

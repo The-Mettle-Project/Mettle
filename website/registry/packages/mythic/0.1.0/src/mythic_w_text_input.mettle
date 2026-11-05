@@ -1,0 +1,669 @@
+// mythic_w_text_input: single-line text input and the MythicTextBuf helpers (DESIGN-SYSTEM §7.8).
+import "std/mem";
+import "mythic_base";
+import "mythic_types";
+import "mythic_ctx";
+import "mythic_anim";
+import "mythic_paint";
+import "mythic_layout";
+import "mythic_text";
+import "mythic_fonts";
+import "mythic_utf8";
+import "mythic_dl";
+import "mythic_icons";
+import "mythic_w_basic";
+
+// zero value = default (md, grow width, no placeholder, no icon)
+export struct MythicInputOpts {
+  placeholder: string;  // copied each frame, never stored (§5 string rule)
+  size: int32;          // MYTHIC_CTRL_*
+  icon: int32;          // leading MYTHIC_ICON_*; 0 = none
+  width: MythicSize;
+  error: bool;
+  read_only: bool;
+}
+
+// undo run kinds: consecutive edits of the same kind coalesce into one undo step
+const RUN_NONE: int32 = 0;
+const RUN_TYPE: int32 = 1;
+const RUN_BACK: int32 = 2;
+const RUN_DEL: int32 = 3;
+const RUN_GAP_US: int64 = 1000000;   // a pause this long starts a new step
+
+// ---------------------------------------------------------------- buffer
+
+// room for n bytes plus the NUL that keeps data usable as a cstring
+fn buf_reserve(buf: MythicTextBuf*, n: int64) -> bool {
+  if (n + 1 <= buf->cap) { return true; }
+  var c: int64 = buf->cap * 2;
+  if (c < 32) { c = 32; }
+  while (c < n + 1) { c = c * 2; }
+  var p: uint8* = (uint8*)malloc(c);
+  if (p == 0) { return false; }
+  if (buf->data != 0) {
+    if (buf->len > 0) { memcpy((rawptr)p, (rawptr)buf->data, buf->len); }
+    free((rawptr)buf->data);
+  }
+  buf->data = p;
+  buf->cap = c;
+  return true;
+}
+
+fn buf_assign(buf: MythicTextBuf*, s: uint8*, n: int64) {
+  if (!buf_reserve(buf, n)) { return; }
+  if (n > 0) { memcpy((rawptr)buf->data, (rawptr)s, n); }
+  buf->len = n;
+  buf->data[n] = (uint8)0;
+}
+
+// replaces bytes [lo, hi) with s[0..n)
+fn buf_replace(buf: MythicTextBuf*, lo: int64, hi: int64, s: uint8*, n: int64) -> bool {
+  var nl: int64 = buf->len - (hi - lo) + n;
+  if (!buf_reserve(buf, nl)) { return false; }
+  memmove((rawptr)(buf->data + lo + n), (rawptr)(buf->data + hi), buf->len - hi);
+  if (n > 0) { memcpy((rawptr)(buf->data + lo), (rawptr)s, n); }
+  buf->len = nl;
+  buf->data[nl] = (uint8)0;
+  return true;
+}
+
+fn buf_view(buf: MythicTextBuf*) -> string {
+  var s: string = "";
+  if (buf->data != 0 && buf->len > 0) { s.chars = (cstring)buf->data; s.length = (uint64)buf->len; }
+  return s;
+}
+
+// longest prefix of s[0..n) that fits in `room` bytes without splitting a code point
+fn fit_bytes(s: uint8*, n: int64, room: int64) -> int64 {
+  if (n <= room) { return n; }
+  var j: int64 = 0;
+  while (j < n) {
+    var nx: int64 = mythic_utf8_next(s, n, j);
+    if (nx > room) { break; }
+    j = nx;
+  }
+  return j;
+}
+
+/// Replaces the contents with a copy of `s` (truncated to max_len at a code point boundary).
+export fn mythic_textbuf_set(buf: MythicTextBuf*, s: string) {
+  var n: int64 = (int64)s.length;
+  if (buf->max_len > 0) { n = fit_bytes((uint8*)s.chars, n, buf->max_len); }
+  buf_assign(buf, (uint8*)s.chars, n);
+}
+
+/// A view of the contents (valid until the buffer changes); "" when empty.
+export fn mythic_textbuf_str(buf: MythicTextBuf*) -> string { return buf_view(buf); }
+
+/// Frees the bytes; the buffer is empty and reusable afterwards (max_len is kept).
+export fn mythic_textbuf_free(buf: MythicTextBuf*) {
+  if (buf->data != 0) { free((rawptr)buf->data); }
+  buf->data = (uint8*)0;
+  buf->len = 0;
+  buf->cap = 0;
+}
+
+// ---------------------------------------------------------------- caret stops and words
+
+// nearest caret stop at or before i
+fn snap_off(buf: MythicTextBuf*, i: int64) -> int64 {
+  if (i <= 0) { return 0; }
+  if (i >= buf->len) { return buf->len; }
+  // i is inside a code point only if a lead byte up to 3 back decodes past it
+  var k: int64 = 1;
+  while (k <= 3 && i - k >= 0) {
+    var b: uint8 = buf->data[i - k];
+    if ((b & (uint8)0xC0) != (uint8)0x80) {
+      if (mythic_utf8_next(buf->data, buf->len, i - k) > i) { return i - k; }
+      return i;
+    }
+    k = k + 1;
+  }
+  return i;
+}
+
+// 0 space, 1 word, 2 punctuation
+fn char_class(cp: uint32) -> int32 {
+  if (cp == (uint32)32 || cp == (uint32)9 || cp == (uint32)0xA0 || cp == (uint32)0x3000) { return 0; }
+  if ((cp >= (uint32)48 && cp <= (uint32)57) || (cp >= (uint32)65 && cp <= (uint32)90) || (cp >= (uint32)97 && cp <= (uint32)122)) { return 1; }
+  if (cp == (uint32)95 || cp >= (uint32)0x80) { return 1; }
+  return 2;
+}
+
+fn class_at(buf: MythicTextBuf*, i: int64) -> int32 {
+  var cp: uint32 = 0;
+  mythic_utf8_decode(buf->data, buf->len, i, &cp);
+  return char_class(cp);
+}
+
+fn class_before(buf: MythicTextBuf*, i: int64) -> int32 { return class_at(buf, mythic_utf8_prev(buf->data, buf->len, i)); }
+
+// Ctrl+Left: start of the previous word (spaces before it are skipped)
+fn word_left(buf: MythicTextBuf*, i: int64) -> int64 {
+  var j: int64 = i;
+  while (j > 0 && class_before(buf, j) == 0) { j = mythic_utf8_prev(buf->data, buf->len, j); }
+  if (j == 0) { return 0; }
+  var c: int32 = class_before(buf, j);
+  while (j > 0 && class_before(buf, j) == c) { j = mythic_utf8_prev(buf->data, buf->len, j); }
+  return j;
+}
+
+// Ctrl+Right: end of the next word
+fn word_right(buf: MythicTextBuf*, i: int64) -> int64 {
+  var j: int64 = i;
+  while (j < buf->len && class_at(buf, j) == 0) { j = mythic_utf8_next(buf->data, buf->len, j); }
+  if (j >= buf->len) { return buf->len; }
+  var c: int32 = class_at(buf, j);
+  while (j < buf->len && class_at(buf, j) == c) { j = mythic_utf8_next(buf->data, buf->len, j); }
+  return j;
+}
+
+// the run of same-class characters around i (double-click)
+fn word_at(buf: MythicTextBuf*, i: int64, a: int64*, b: int64*) {
+  *a = i; *b = i;
+  if (buf->len == 0) { return; }
+  var c: int32 = 0;
+  if (i < buf->len) { c = class_at(buf, i); } else { c = class_before(buf, i); }
+  var j: int64 = i;
+  while (j > 0 && class_before(buf, j) == c) { j = mythic_utf8_prev(buf->data, buf->len, j); }
+  var k: int64 = i;
+  while (k < buf->len && class_at(buf, k) == c) { k = mythic_utf8_next(buf->data, buf->len, k); }
+  *a = j; *b = k;
+}
+
+// ---------------------------------------------------------------- undo ring
+
+fn snap_take(buf: MythicTextBuf*, e: MythicEditState*) -> MythicEditSnap {
+  var s: MythicEditSnap;
+  s.cursor = e->cursor;
+  s.anchor = e->anchor;
+  if (buf->len > 0) {
+    s.data = (uint8*)malloc(buf->len);
+    if (s.data != 0) { memcpy((rawptr)s.data, (rawptr)buf->data, buf->len); s.len = buf->len; }
+  }
+  return s;
+}
+
+fn snap_free(s: MythicEditSnap*) {
+  if (s->data != 0) { free((rawptr)s->data); }
+  s->data = (uint8*)0;
+  s->len = 0;
+}
+
+fn undo_slot(e: MythicEditState*, i: int32) -> MythicEditSnap* { return &e->undo[(e->undo_first + i) % 32]; }
+
+// records the state before an edit step; drops the redo entries and, when full, the oldest step
+fn undo_push(e: MythicEditState*, buf: MythicTextBuf*) {
+  for i: int32 in e->undo_pos..e->undo_count { snap_free(undo_slot(e, i)); }
+  e->undo_count = e->undo_pos;
+  if (e->undo_count == 32) {
+    snap_free(undo_slot(e, 0));
+    e->undo_first = (e->undo_first + 1) % 32;
+    e->undo_count = 31;
+  }
+  *undo_slot(e, e->undo_count) = snap_take(buf, e);
+  e->undo_count = e->undo_count + 1;
+  e->undo_pos = e->undo_count;
+}
+
+// Undo and redo swap the live text with one slot: the slot then holds the state to go back to,
+// so one ring serves both directions.
+fn undo_swap(e: MythicEditState*, buf: MythicTextBuf*, i: int32) {
+  var cur: MythicEditSnap = snap_take(buf, e);
+  var s: MythicEditSnap* = undo_slot(e, i);
+  buf_assign(buf, s->data, s->len);
+  e->cursor = s->cursor;
+  e->anchor = s->anchor;
+  snap_free(s);
+  *s = cur;
+}
+
+// Starts an edit of `kind`. A step joins the previous one while the kind repeats with the caret
+// unmoved (any move resets run_kind) and less than a second apart; `fresh` forces a new step.
+fn edit_begin(ui: MythicUi*, buf: MythicTextBuf*, kind: int32, fresh: bool) {
+  var e: MythicEditState* = &ui->edit;
+  var join: bool = !fresh && kind != RUN_NONE && kind == e->run_kind && ui->time_us - e->run_us < RUN_GAP_US;
+  if (!join) { undo_push(e, buf); }
+  e->run_kind = kind;
+  e->run_us = ui->time_us;
+}
+
+// ---------------------------------------------------------------- edits
+
+fn touch(ui: MythicUi*) {
+  ui->edit.blink_t0 = ui->time_us;
+  ui->edit.last_input_us = ui->time_us;
+}
+
+fn sel_lo(e: MythicEditState*) -> int64 { if (e->cursor < e->anchor) { return e->cursor; } return e->anchor; }
+fn sel_hi(e: MythicEditState*) -> int64 { if (e->cursor > e->anchor) { return e->cursor; } return e->anchor; }
+
+// valid UTF-8 without control characters (single line: newlines and tabs are dropped); arena
+fn clean_text(ui: MythicUi*, s: string) -> string {
+  var n: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)mythic_arena_alloc(ui->arena, n * 3 + 1);
+  var o: int64 = 0;
+  var i: int64 = 0;
+  var cp: uint32 = 0;
+  while (i < n) {
+    i = mythic_utf8_decode((uint8*)s.chars, n, i, &cp);
+    if (cp < (uint32)32 || cp == (uint32)127) { continue; }
+    o = o + (int64)mythic_utf8_encode(cp, p + o);
+  }
+  p[o] = (uint8)0;
+  var out: string;
+  out.chars = (cstring)p;
+  out.length = (uint64)o;
+  return out;
+}
+
+// replaces the selection with `s` (cleaned, cut to max_len); true when the text changed
+fn edit_insert(ui: MythicUi*, buf: MythicTextBuf*, s: string, kind: int32) -> bool {
+  var e: MythicEditState* = &ui->edit;
+  var t: string = clean_text(ui, s);
+  var lo: int64 = sel_lo(e);
+  var hi: int64 = sel_hi(e);
+  var n: int64 = (int64)t.length;
+  if (buf->max_len > 0) {
+    var room: int64 = buf->max_len - (buf->len - (hi - lo));
+    if (room < 0) { room = 0; }
+    n = fit_bytes((uint8*)t.chars, n, room);
+  }
+  if (n == 0 && lo == hi) { return false; }
+  // typing starts a new step at each word start, so undo removes a word at a time
+  var fresh: bool = lo != hi;
+  if (kind == RUN_TYPE && n > 0 && lo > 0 && class_before(buf, lo) == 0 && char_class((uint32)t.chars[0]) != 0) { fresh = true; }
+  edit_begin(ui, buf, kind, fresh);
+  if (!buf_replace(buf, lo, hi, (uint8*)t.chars, n)) { return false; }
+  e->cursor = lo + n;
+  e->anchor = e->cursor;
+  return true;
+}
+
+fn edit_delete(ui: MythicUi*, buf: MythicTextBuf*, lo: int64, hi: int64, kind: int32) -> bool {
+  if (hi <= lo) { return false; }
+  edit_begin(ui, buf, kind, false);
+  buf_replace(buf, lo, hi, (uint8*)0, 0);
+  ui->edit.cursor = lo;
+  ui->edit.anchor = lo;
+  return true;
+}
+
+fn copy_sel(ui: MythicUi*, buf: MythicTextBuf*) {
+  var e: MythicEditState* = &ui->edit;
+  var lo: int64 = sel_lo(e);
+  var hi: int64 = sel_hi(e);
+  if (hi <= lo) { return; }
+  var v: string;
+  v.chars = (cstring)(buf->data + lo);
+  v.length = (uint64)(hi - lo);
+  mythic_clipboard_set(ui, v);
+}
+
+fn move_to(e: MythicEditState*, pos: int64, extend: bool) {
+  e->cursor = pos;
+  if (!extend) { e->anchor = pos; }
+  e->run_kind = RUN_NONE;
+}
+
+// one key for the focused input; false when it is not ours (left for other handlers)
+fn edit_key(ui: MythicUi*, buf: MythicTextBuf*, k: MythicKeyEvent, ro: bool, changed: bool*, submitted: bool*) -> bool {
+  var e: MythicEditState* = &ui->edit;
+  var ctrl: bool = (k.mods & MYTHIC_MOD_CTRL) != 0;
+  var shift: bool = (k.mods & MYTHIC_MOD_SHIFT) != 0;
+  if ((k.mods & (MYTHIC_MOD_ALT | MYTHIC_MOD_SUPER)) != 0) { return false; }
+  var lo: int64 = sel_lo(e);
+  var hi: int64 = sel_hi(e);
+  var key: int32 = k.key;
+  var ch: bool = false;
+  if (key == MYTHIC_KEY_LEFT) {
+    if (!shift && lo != hi) { move_to(e, lo, false); }
+    else if (ctrl) { move_to(e, word_left(buf, e->cursor), shift); }
+    else { move_to(e, mythic_utf8_prev(buf->data, buf->len, e->cursor), shift); }
+  } else if (key == MYTHIC_KEY_RIGHT) {
+    if (!shift && lo != hi) { move_to(e, hi, false); }
+    else if (ctrl) { move_to(e, word_right(buf, e->cursor), shift); }
+    else { move_to(e, mythic_utf8_next(buf->data, buf->len, e->cursor), shift); }
+  } else if (key == MYTHIC_KEY_HOME) {
+    move_to(e, 0, shift);
+  } else if (key == MYTHIC_KEY_END) {
+    move_to(e, buf->len, shift);
+  } else if (key == MYTHIC_KEY_BACKSPACE) {
+    if (ro) { return true; }
+    if (lo != hi) { ch = edit_delete(ui, buf, lo, hi, RUN_NONE); }
+    else if (ctrl) { ch = edit_delete(ui, buf, word_left(buf, lo), lo, RUN_NONE); }
+    else { ch = edit_delete(ui, buf, mythic_utf8_prev(buf->data, buf->len, lo), lo, RUN_BACK); }
+  } else if (key == MYTHIC_KEY_DELETE) {
+    if (ro) { return true; }
+    if (lo != hi) { ch = edit_delete(ui, buf, lo, hi, RUN_NONE); }
+    else if (ctrl) { ch = edit_delete(ui, buf, hi, word_right(buf, hi), RUN_NONE); }
+    else { ch = edit_delete(ui, buf, hi, mythic_utf8_next(buf->data, buf->len, hi), RUN_DEL); }
+  } else if (key == MYTHIC_KEY_ENTER) {
+    *submitted = true;
+  } else if (key == MYTHIC_KEY_ESCAPE) {
+    ui->focus_id = 0;
+  } else if (ctrl && key == 65) {          // A
+    e->anchor = 0;
+    move_to(e, buf->len, true);
+  } else if (ctrl && key == 67) {          // C
+    copy_sel(ui, buf);
+  } else if (ctrl && key == 88) {          // X
+    copy_sel(ui, buf);
+    if (!ro) { ch = edit_delete(ui, buf, lo, hi, RUN_NONE); }
+  } else if (ctrl && key == 86) {          // V
+    if (!ro) { ch = edit_insert(ui, buf, mythic_clipboard_get(ui), RUN_NONE); e->run_kind = RUN_NONE; }
+  } else if (ctrl && ((key == 90 && shift) || key == 89)) {   // Shift+Z, Y: redo
+    if (!ro && e->undo_pos < e->undo_count) {
+      undo_swap(e, buf, e->undo_pos);
+      e->undo_pos = e->undo_pos + 1;
+      ch = true;
+    }
+    e->run_kind = RUN_NONE;
+  } else if (ctrl && key == 90) {          // Z
+    if (!ro && e->undo_pos > 0) {
+      e->undo_pos = e->undo_pos - 1;
+      undo_swap(e, buf, e->undo_pos);
+      ch = true;
+    }
+    e->run_kind = RUN_NONE;
+  } else {
+    return false;
+  }
+  if (ch) { *changed = true; }
+  touch(ui);
+  return true;
+}
+
+// ---------------------------------------------------------------- paint
+
+// resolved per-frame visuals, handed to the paint callback (arena)
+struct InputPaint {
+  text: string; placeholder: string; style: MythicTextStyle;
+  bg: uint32; border: uint32; halo: uint32; fg: uint32; ph: uint32; icon_color: uint32; sel: uint32; caret: uint32;
+  radius: float32; pad_l: float32; pad_r: float32; icon: int32; icon_size: float32;
+  scroll: float32; caret_a: float32; cursor: int64; sel_lo: int64; sel_hi: int64;
+}
+
+fn alpha_mul(c: uint32, a: float32) -> uint32 {
+  var v: float32 = (float32)(c >> 24) * mythic_clampf(a, 0.0, 1.0);
+  return ((uint32)mythic_iround(v) << 24) | (c & (uint32)0x00FFFFFF);
+}
+
+fn input_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: InputPaint* = (InputPaint*)data;
+  var rad: MythicCorners = mythic_radius(d->radius);
+  if ((d->halo >> 24) != (uint32)0) {
+    // 3 px halo straight outside the border, no gap
+    var hr: MythicRect = { x: r.x - 3.0, y: r.y - 3.0, w: r.w + 6.0, h: r.h + 6.0 };
+    mythic_paint_stroke(p, hr, mythic_radius(d->radius + 3.0), 3.0, d->halo);
+  }
+  mythic_paint_fill(p, r, rad, d->bg);
+  mythic_paint_stroke(p, r, rad, 1.0, d->border);
+  if (d->icon != 0) {
+    var pad: float32 = d->pad_l - d->icon_size - 8.0;
+    var ix: float32 = mythic_roundf((r.x + pad) * p->scale) / p->scale;
+    var iy: float32 = mythic_roundf((r.y + (r.h - d->icon_size) / 2.0) * p->scale) / p->scale;
+    var ir: MythicRect = { x: ix, y: iy, w: d->icon_size, h: d->icon_size };
+    mythic_paint_icon(p, d->icon, ir, d->icon_color, 1.0);
+  }
+  if (p->fonts == 0) { return; }
+  var box: MythicRect = { x: r.x + d->pad_l, y: r.y, w: r.w - d->pad_l - d->pad_r, h: r.h };
+  var clip: MythicRect = mythic_paint_dev_rect(p, box);
+  if (clip.w <= 0.0) { return; }
+  var base: float32 = mythic_paint_control_baseline(p, d->style, r.y, r.h);
+  var sp: MythicTextSpec = mythic_paint_text_spec(p->scale, d->style);
+  var m: MythicFontMetrics = mythic_fonts_metrics(p->fonts, d->style.font, sp.size_px);
+  var y0: float32 = base - mythic_roundf(m.ascent);
+  var y1: float32 = base + mythic_roundf(mythic_absf(m.descent));
+  var ox: float32 = mythic_roundf((box.x - d->scroll) * p->scale);
+  var z: MythicCorners;
+  mythic_dl_push_clip(p->dl, clip, 0.0);
+  var cx: float32 = ox;
+  if (d->text.length == (uint64)0) {
+    mythic_paint_text_baseline(p, d->placeholder, d->style, ox / p->scale, base, d->ph);
+  } else {
+    var l: MythicTextLayout* = mythic_text_layout(p->fonts, sp, d->text);
+    if (d->sel_lo != d->sel_hi) {
+      var xa: float32 = mythic_roundf(ox + mythic_text_caret_pos(l, d->sel_lo).x);
+      var xb: float32 = mythic_roundf(ox + mythic_text_caret_pos(l, d->sel_hi).x);
+      var sr: MythicRect = { x: xa, y: y0, w: xb - xa, h: y1 - y0 };
+      var sc: uint32 = mythic_paint_color(p, d->sel);
+      if (sr.w > 0.0 && (sc >> 24) != (uint32)0) { mythic_dl_fill(p->dl, sr, z, sc); }
+    }
+    mythic_paint_text_baseline(p, d->text, d->style, ox / p->scale, base, d->fg);
+    cx = ox + mythic_text_caret_pos(l, d->cursor).x;
+  }
+  if (d->caret_a > 0.0) {
+    var cc: uint32 = mythic_paint_color(p, alpha_mul(d->caret, d->caret_a));
+    var cr: MythicRect = { x: mythic_roundf(cx), y: y0, w: mythic_paint_line_w(p, 1.0), h: y1 - y0 };
+    if ((cc >> 24) != (uint32)0) { mythic_dl_fill(p->dl, cr, z, cc); }
+  }
+  mythic_dl_pop_clip(p->dl);
+}
+
+// caret alpha per DESIGN-SYSTEM §6.2; schedules the next blink frame. After caret_idle_ms
+// without input the caret stays solid and no frames are requested, so an idle app sleeps.
+fn caret_alpha(ui: MythicUi*) -> float32 {
+  if (mythic_reduced_motion(ui)) { return 1.0; }
+  var m: MythicMotion* = &mythic_theme(ui)->motion;
+  var e: MythicEditState* = &ui->edit;
+  var idle: float32 = (float32)(ui->time_us - e->last_input_us) / 1000.0;
+  if (idle >= m->caret_idle_ms) { return 1.0; }
+  var wait: float32 = m->caret_idle_ms - idle;
+  var a: float32 = 1.0;
+  var el: float32 = (float32)(ui->time_us - e->blink_t0) / 1000.0;
+  if (el < m->caret_solid_ms) {
+    wait = mythic_minf(wait, m->caret_solid_ms - el);
+  } else {
+    var on: float32 = m->caret_on_ms;
+    var fade: float32 = m->caret_fade_ms;
+    var per: float32 = on * 2.0;
+    var x: float32 = el - m->caret_solid_ms;
+    var ph: float32 = x - per * mythic_floorf(x / per);
+    if (ph < on - fade) { wait = mythic_minf(wait, on - fade - ph); }
+    else if (ph < on) { a = (on - ph) / fade; wait = mythic_minf(wait, 16.0); }
+    else if (ph < per - fade) { a = 0.0; wait = mythic_minf(wait, per - fade - ph); }
+    else { a = (ph - (per - fade)) / fade; wait = mythic_minf(wait, 16.0); }
+  }
+  var ms: int32 = (int32)mythic_ceilf(wait);
+  if (ms < 1) { ms = 1; }
+  mythic_request_frame_in(ui, ms);
+  return mythic_clampf(a, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------- widget
+
+export fn mythic_text_input(ui: MythicUi*, label: string, buf: MythicTextBuf*) -> bool {
+  var o: MythicInputOpts;
+  return mythic_text_input_ex(ui, label, buf, o);
+}
+
+/// Single-line text input (DESIGN-SYSTEM §7.8). Text before "##" in `label` is shown above the
+/// box. Returns true when the user changed the text; mythic_last(ui).submitted is set on Enter.
+export fn mythic_text_input_ex(ui: MythicUi*, label: string, buf: MythicTextBuf*, o: MythicInputOpts) -> bool {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: MythicColors* = &t->colors;
+  var cs: MythicControlSize = t->ctrl.md;
+  if (o.size == MYTHIC_CTRL_SM) { cs = t->ctrl.sm; } else if (o.size == MYTHIC_CTRL_LG) { cs = t->ctrl.lg; }
+  var st: MythicTextStyle = t->type.body;
+  if (o.size == MYTHIC_CTRL_SM) { st = t->type.label_sm; st.font = MYTHIC_FONT_REGULAR; }
+  var id: uint64 = mythic_id(ui, label);
+  var shown: string = mythic_arena_strn(ui->arena, label, mythic_label_len(label));
+  var has_w: bool = o.width.mode != MYTHIC_FIT || o.width.value != 0.0;
+  var col: bool = shown.length > (uint64)0;
+  var dis: bool = ui->disabled_depth > 0;
+  if (col) {
+    var cb: MythicBox = { width: mythic_grow(), gap: 6 };
+    cb.width.min = 160.0;
+    if (has_w) { cb.width = o.width; }
+    mythic_column_begin(ui, cb);
+    var lc: uint32 = c->text_primary;
+    if (dis) { lc = c->text_disabled; }
+    mythic_text(ui, shown, t->type.label_sm, lc);
+    if (dis) { ui->last_node->opacity = ui->opacity_base; }
+  }
+  var pad_l: float32 = cs.pad_x_input;
+  if (o.icon != 0) { pad_l = pad_l + cs.icon + 8.0; }
+  var b: MythicBox;
+  b.id = id;
+  b.height = mythic_fixed(cs.height);
+  b.width = mythic_grow();
+  b.width.min = 160.0;
+  if (has_w && !col) { b.width = o.width; }
+  mythic_box_begin(ui, b);
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK | MYTHIC_SENSE_DRAG);
+  mythic_focusable(ui, id, MYTHIC_FOCUS_WANTS_TEXT | MYTHIC_FOCUS_WANTS_ARROWS);
+  mythic_end(ui);
+
+  var e: MythicEditState* = &ui->edit;
+  var focused: bool = !dis && ui->focus_id == id;
+  var changed: bool = false;
+  var submitted: bool = false;
+  var sc: float32 = ui->scale;
+  if (sc <= 0.0) { sc = 1.0; }
+  var sp: MythicTextSpec = mythic_paint_text_spec(sc, st);
+  if (focused && e->id != id) {
+    // a new edit: keyboard focus selects all, a click places the caret (below)
+    mythic_edit_clear(ui);
+    e->id = id;
+    e->cursor = buf->len;
+    e->anchor = buf->len;
+    if (ui->focus_visible) { e->anchor = 0; }
+    touch(ui);
+  }
+  var own: bool = e->id == id;
+  if (own) {
+    // the app may have changed the buffer since the last frame
+    e->cursor = snap_off(buf, e->cursor);
+    e->anchor = snap_off(buf, e->anchor);
+  }
+  var ws: MythicWState* = mythic_state(ui, id);
+  var cx0: float32 = r.rect.x + pad_l;
+  var cw: float32 = r.rect.w - pad_l - cs.pad_x_input;
+  if (!dis && (r.hovered || (ui->active_id == id && ui->in.mouse_down[1]))) { mythic_set_cursor(ui, MYTHIC_CURSOR_IBEAM); }
+  if (focused && own && ui->fonts != 0) {
+    var org: float32 = mythic_roundf((cx0 - ws->f[0]) * sc);
+    var pressed: bool = r.hovered && ui->in.mouse_pressed[1];
+    var dragging: bool = !pressed && ui->active_id == id && ui->in.mouse_down[1];
+    if (pressed || dragging) {
+      var l: MythicTextLayout* = mythic_text_layout(ui->fonts, sp, buf_view(buf));
+      var pt: MythicVec2 = { x: ui->in.mouse.x * sc - org, y: 0.0 };
+      var off: int64 = snap_off(buf, mythic_text_offset_at(l, pt));
+      var wa: int64 = 0;
+      var wb: int64 = 0;
+      if (pressed) {
+        var n: int32 = (ui->click_count - 1) % 3 + 1;
+        if (n == 2) {
+          word_at(buf, off, &wa, &wb);
+          e->word_a = wa; e->word_b = wb;
+          e->anchor = wa; e->cursor = wb;
+        } else if (n == 3) {
+          e->anchor = 0; e->cursor = buf->len;
+        } else {
+          e->cursor = off;
+          if ((ui->in.mods & MYTHIC_MOD_SHIFT) == 0) { e->anchor = off; }
+        }
+        e->drag_mode = n;
+        e->run_kind = RUN_NONE;
+        touch(ui);
+      } else {
+        var old: int64 = e->cursor;
+        if (e->drag_mode == 1) {
+          e->cursor = off;
+        } else if (e->drag_mode == 2) {
+          // word-wise drag after a double-click
+          word_at(buf, off, &wa, &wb);
+          if (wa < e->word_a) { e->anchor = e->word_b; e->cursor = wa; }
+          else {
+            e->anchor = e->word_a;
+            e->cursor = e->word_b;
+            if (wb > e->word_b) { e->cursor = wb; }
+          }
+        }
+        if (e->cursor != old) { e->run_kind = RUN_NONE; touch(ui); }
+      }
+    }
+    var typed: string = mythic_take_text(ui);
+    if (typed.length > (uint64)0 && !o.read_only) {
+      if (edit_insert(ui, buf, typed, RUN_TYPE)) { changed = true; }
+      touch(ui);
+    }
+    var keys: MythicVec<MythicKeyEvent>* = &ui->in.keys;
+    var kept: int64 = 0;
+    for i: int64 in 0..keys->len {
+      var k: MythicKeyEvent = keys->data[i];
+      if (!edit_key(ui, buf, k, o.read_only, &changed, &submitted)) { keys->data[kept] = k; kept = kept + 1; }
+    }
+    keys->len = kept;
+  }
+  focused = !dis && ui->focus_id == id;
+  // horizontal scroll keeps the caret at least 2 px inside the text area
+  if (focused && own && cw > 4.0 && ui->fonts != 0) {
+    var l2: MythicTextLayout* = mythic_text_layout(ui->fonts, sp, buf_view(buf));
+    var cx: float32 = 0.0;
+    var tw: float32 = 0.0;
+    if (buf->len > 0) { cx = mythic_text_caret_pos(l2, e->cursor).x / sc; tw = l2->width / sc; }
+    var s: float32 = ws->f[0];
+    if (cx - s < 2.0) { s = cx - 2.0; }
+    if (cx - s > cw - 2.0) { s = cx - cw + 2.0; }
+    s = mythic_minf(s, mythic_maxf(0.0, tw - cw + 2.0));
+    ws->f[0] = mythic_maxf(0.0, s);
+  } else if (!focused) {
+    ws->f[0] = 0.0;
+  }
+
+  var m: MythicMotion* = &t->motion;
+  var ht: float32 = 0.0;
+  if (r.hovered) { ht = 1.0; }
+  var ft: float32 = 0.0;
+  if (focused) { ft = 1.0; }
+  var h: float32 = mythic_anim_smooth(ui, id, 0 | MYTHIC_ANIM_COLOR, ht, m->hover_in_tau, m->hover_out_tau);
+  var f: float32 = mythic_anim_smooth(ui, id, 2 | MYTHIC_ANIM_COLOR, ft, m->focus_tau, m->focus_tau);
+  var d: InputPaint* = (InputPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(InputPaint));
+  d->text = mythic_arena_str(ui->arena, buf_view(buf));
+  d->placeholder = mythic_arena_str(ui->arena, o.placeholder);
+  d->style = st;
+  d->radius = cs.radius;
+  d->pad_l = pad_l;
+  d->pad_r = cs.pad_x_input;
+  d->icon = o.icon;
+  d->icon_size = cs.icon;
+  d->scroll = ws->f[0];
+  d->bg = c->bg_input;
+  if (o.read_only) { d->bg = c->bg_surface_sunken; }
+  var fb: uint32 = c->input_border_focus;
+  var glow: uint32 = c->focus_glow;
+  d->border = mythic_color_lerp(c->border_default, c->border_strong, h);
+  if (o.error) { d->border = c->danger; fb = c->danger; glow = c->danger_glow; }
+  d->border = mythic_color_lerp(d->border, fb, f);
+  d->halo = alpha_mul(glow, f);
+  d->fg = c->text_primary;
+  d->ph = c->text_tertiary;
+  d->icon_color = c->text_secondary;
+  if (dis) {
+    d->bg = c->bg_surface_sunken;
+    d->border = c->border_subtle;
+    d->halo = 0;
+    d->fg = c->text_disabled;
+    d->ph = c->text_disabled;
+    d->icon_color = c->text_disabled;
+  }
+  if (own) {
+    d->cursor = e->cursor;
+    d->sel_lo = sel_lo(e);
+    d->sel_hi = sel_hi(e);
+    d->sel = c->selection_inactive;
+    if (focused) { d->sel = c->selection; }
+    if (dis) { d->sel_lo = 0; d->sel_hi = 0; }
+  }
+  d->caret = c->caret;
+  if (focused && own && !o.read_only) { d->caret_a = caret_alpha(ui); }
+  mythic_node_paint(ui, &input_paint, (rawptr)d);
+  if (dis) { ui->last_node->opacity = ui->opacity_base; }
+  if (col) { mythic_end(ui); }
+  r.focused = focused;
+  r.changed = changed;
+  r.submitted = submitted;
+  ui->last = r;
+  return changed;
+}

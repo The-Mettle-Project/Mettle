@@ -1,0 +1,617 @@
+// alph/sched/exec: a work-stealing task executor, with no actors.
+//
+// Worker threads run plain tasks: a function and one word, run to the end.
+// Each worker keeps its own deque of tasks (Chase-Lev): it pushes and pops
+// at one end, and idle workers steal from the other, so a busy worker's
+// backlog spreads without a shared queue. Tasks from outside threads go
+// through one injection queue. Each worker also owns an alph/io reactor, so
+// a task can wait for a socket or a timer without blocking its thread: the
+// reactor runs the next task when the fd is ready or the time comes. Idle
+// workers spin briefly, then sleep in their reactor; nothing busy-waits.
+//
+// For compilers, build tools and batch work, groups give fork and join: a
+// thread waits for a group with alph_group_wait, and a task that needs its
+// subtasks' results helps run tasks until they are done (alph_task_help).
+//
+//   fn compile(tc: AlphTaskCtx*, unit: int64) -> int64 ... { ...; return 0; }
+//   var ex: AlphExec;
+//   var cfg: AlphExecConfig;
+//   alph_exec_config(&cfg);
+//   alph_exec_start(&ex, &cfg);
+//   var g: AlphGroup;
+//   alph_group_init(&g);
+//   for u: int64 in 0..units { alph_exec_spawn_in(&ex, &g, u, &compile); }
+//   alph_group_wait(&g);
+//   alph_exec_stop(&ex);
+//
+// Tasks are not isolated like actors: a crash in a task ends the process.
+// Use alph/core/node when work must survive its own failures.
+
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/sys/thread";
+import "alph/io/reactor";
+
+// How to run an executor. Fill it with alph_exec_config, then change what
+// you need:
+//
+//   threads     worker threads; default one per CPU
+//   spin_us     how long an idle worker looks for work before it sleeps;
+//               default 50
+//   stack_size  bytes of stack per worker; default 1 MiB
+export struct AlphExecConfig {
+  threads: int64;
+  spin_us: int64;
+  stack_size: int64;
+}
+
+// What a task gets besides its word. Read these fields:
+//
+//   exec    the executor, for alph_exec_ functions
+//   worker  the index of the worker running it
+//   events  for a task started by alph_task_on_ready: what was ready
+//           (ALPH_RX_READ, ALPH_RX_WRITE, ...); else 0
+//
+// The rest is the runtime's own. ctx is valid until the task returns.
+export struct AlphTaskCtx {
+  exec: AlphExec*;
+  worker: int64;
+  events: int64;
+  self: int64;
+}
+
+// A group of tasks to wait for. Start it with alph_group_init; tasks join it
+// when spawned with an _in function and leave when they return.
+export struct AlphGroup {
+  pending: int64;
+}
+
+// One queued task.
+struct AlphJob {
+  f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm;
+  arg: int64;
+  group: int64;  // AlphGroup*, or 0
+}
+
+const ALPH_DEQ_CAP: int64 = 4096;  // a power of two; past it, tasks go to the injection queue
+const ALPH_EXEC_POLL_EVERY: int64 = 64;  // a busy worker looks at its reactor after this many tasks
+
+struct AlphWorker {
+  top: int64;        // thieves take from here
+  pad_a: int64[7];
+  bottom: int64;     // the owner pushes and pops here
+  pad_b: int64[7];
+  ring: int64;       // AlphJob[ALPH_DEQ_CAP]
+  rx: AlphReactor;
+  rxev: int64;       // AlphRxEvent[64]
+  sleeping: int64;   // 0 awake, 1 asleep in its reactor, 2 asleep and already woken
+  exec: int64;
+  index: int64;
+  rng: int64;
+  ran: int64;
+  thread: AlphThread;
+  handle: int64;
+}
+
+// An executor. Declare one, start it with alph_exec_start, and keep it in
+// place until alph_exec_stop returns. Its fields are the runtime's own.
+export struct AlphExec {
+  workers: int64;    // AlphWorker array
+  count: int64;
+  spin_ns: int64;
+  stop: int64;
+  sleepers: int64;   // workers asleep now
+  pending: int64;    // tasks queued or running, for alph_exec_wait_idle
+  inj_lock: int64;
+  inj: int64;        // AlphJob ring, grown under inj_lock
+  inj_head: int64;
+  inj_len: int64;
+  inj_cap: int64;
+}
+
+fn alph_exec_worker(ex: AlphExec*, i: int64) -> AlphWorker* {
+  return (AlphWorker*)(ex->workers + i * (int64)sizeof(AlphWorker));
+}
+
+fn alph_deq_slot(w: AlphWorker*, i: int64) -> AlphJob* {
+  return (AlphJob*)(w->ring + (i & (ALPH_DEQ_CAP - 1)) * (int64)sizeof(AlphJob));
+}
+
+fn alph_exec_lock(lock: int64*) {
+  while (alph_atomic_cas(lock, 0, 1) != 0) {
+    alph_cpu_relax();
+  }
+}
+
+fn alph_exec_unlock(lock: int64*) {
+  alph_atomic_store(lock, 0);
+}
+
+// ---- the injection queue -----------------------------------------------------
+
+fn alph_inj_push(ex: AlphExec*, job: AlphJob*) -> bool {
+  alph_exec_lock(&ex->inj_lock);
+  if (ex->inj_len == ex->inj_cap) {
+    var cap: int64 = ex->inj_cap * 2;
+    if (cap < 256) {
+      cap = 256;
+    }
+    var ring: int64 = (int64)malloc(cap * (int64)sizeof(AlphJob));
+    if (ring == 0) {
+      alph_exec_unlock(&ex->inj_lock);
+      return false;
+    }
+    for i: int64 in 0..ex->inj_len {
+      var from: AlphJob* = (AlphJob*)(ex->inj + ((ex->inj_head + i) % ex->inj_cap) * (int64)sizeof(AlphJob));
+      *(AlphJob*)(ring + i * (int64)sizeof(AlphJob)) = *from;
+    }
+    free((rawptr)ex->inj);
+    ex->inj = ring;
+    ex->inj_head = 0;
+    ex->inj_cap = cap;
+  }
+  var at: AlphJob* = (AlphJob*)(ex->inj + ((ex->inj_head + ex->inj_len) % ex->inj_cap) * (int64)sizeof(AlphJob));
+  *at = *job;
+  alph_atomic_store(&ex->inj_len, ex->inj_len + 1);
+  alph_exec_unlock(&ex->inj_lock);
+  return true;
+}
+
+fn alph_inj_pop(ex: AlphExec*, out: AlphJob*) -> bool {
+  if (alph_atomic_load(&ex->inj_len) == 0) {
+    return false;
+  }
+  alph_exec_lock(&ex->inj_lock);
+  if (ex->inj_len == 0) {
+    alph_exec_unlock(&ex->inj_lock);
+    return false;
+  }
+  *out = *(AlphJob*)(ex->inj + ex->inj_head * (int64)sizeof(AlphJob));
+  ex->inj_head = (ex->inj_head + 1) % ex->inj_cap;
+  alph_atomic_store(&ex->inj_len, ex->inj_len - 1);
+  alph_exec_unlock(&ex->inj_lock);
+  return true;
+}
+
+// ---- the work-stealing deque (Chase and Lev) --------------------------------
+
+// Pushes at the bottom; the owner only. Returns false when the deque is full.
+fn alph_deq_push(w: AlphWorker*, job: AlphJob*) -> bool {
+  var b: int64 = w->bottom;
+  var t: int64 = alph_atomic_load(&w->top);
+  if (b - t >= ALPH_DEQ_CAP) {
+    return false;
+  }
+  *alph_deq_slot(w, b) = *job;
+  alph_atomic_store(&w->bottom, b + 1);  // x86 keeps the slot's stores before this one
+  return true;
+}
+
+// Pops at the bottom; the owner only.
+fn alph_deq_pop(w: AlphWorker*, out: AlphJob*) -> bool {
+  var b: int64 = w->bottom - 1;
+  alph_atomic_store_sc(&w->bottom, b);  // a full fence: the top load cannot pass it
+  var t: int64 = alph_atomic_load(&w->top);
+  if (t > b) {
+    alph_atomic_store(&w->bottom, b + 1);  // empty
+    return false;
+  }
+  *out = *alph_deq_slot(w, b);
+  if (t == b) {
+    // The last one: race the thieves for it.
+    var won: bool = alph_atomic_cas(&w->top, t, t + 1) == t;
+    alph_atomic_store(&w->bottom, b + 1);
+    return won;
+  }
+  return true;
+}
+
+// Steals at the top; any thread.
+fn alph_deq_steal(w: AlphWorker*, out: AlphJob*) -> bool {
+  var t: int64 = alph_atomic_load(&w->top);
+  var b: int64 = alph_atomic_load(&w->bottom);
+  if (t >= b) {
+    return false;
+  }
+  var job: AlphJob = *alph_deq_slot(w, t);  // may be torn if we lose; then it is dropped
+  if (alph_atomic_cas(&w->top, t, t + 1) != t) {
+    return false;
+  }
+  *out = job;
+  return true;
+}
+
+// ---- running tasks -----------------------------------------------------------
+
+fn alph_exec_finish(ex: AlphExec*, job: AlphJob*) {
+  if (job->group != 0) {
+    var g: AlphGroup* = (AlphGroup*)job->group;
+    if (alph_atomic_add(&g->pending, -1) == 1) {
+      alph_futex_wake(&g->pending, 2147483647);
+    }
+  }
+  if (alph_atomic_add(&ex->pending, -1) == 1) {
+    alph_futex_wake(&ex->pending, 2147483647);
+  }
+}
+
+fn alph_exec_run(ex: AlphExec*, w: AlphWorker*, job: AlphJob*, events: int64) {
+  var tc: AlphTaskCtx;
+  tc.exec = ex;
+  tc.worker = w->index;
+  tc.events = events;
+  tc.self = (int64)w;
+  job->f(&tc, job->arg);
+  alph_exec_finish(ex, job);
+}
+
+// Wakes one sleeping worker, if any, so it can take new work.
+fn alph_exec_wake_one(ex: AlphExec*) {
+  // The push before this must be visible before sleepers is read, or a
+  // worker going to sleep could miss both the task and the wake. Pairs
+  // with the sequentially consistent sleeping store in alph_exec_main.
+  alph_atomic_fence();
+  if (alph_atomic_load(&ex->sleepers) == 0) {
+    return;
+  }
+  for i: int64 in 0..ex->count {
+    var w: AlphWorker* = alph_exec_worker(ex, i);
+    if (alph_atomic_load(&w->sleeping) == 1 && alph_atomic_cas(&w->sleeping, 1, 2) == 1) {
+      alph_rx_wake(&w->rx);
+      return;
+    }
+  }
+}
+
+// Turns reactor events into queued tasks: a ready fd or a due timer runs
+// the task boxed in its data. Runs them at once rather than queueing, which
+// keeps their order and their events.
+fn alph_exec_poll(ex: AlphExec*, w: AlphWorker*, timeout_ns: int64) {
+  var ev: AlphRxEvent* = (AlphRxEvent*)w->rxev;
+  var n: int64 = alph_rx_wait(&w->rx, ev, 64, timeout_ns);
+  for i: int64 in 0..n {
+    if (ev[i].kind == ALPH_RX_FD || ev[i].kind == ALPH_RX_TIMER) {
+      var box: AlphJob* = (AlphJob*)ev[i].data;
+      var job: AlphJob = *box;
+      free((rawptr)box);
+      var events: int64 = 0;
+      if (ev[i].kind == ALPH_RX_FD) {
+        events = ev[i].events;
+      }
+      alph_atomic_add(&ex->pending, 1);
+      alph_exec_run(ex, w, &job, events);
+    }
+  }
+}
+
+// Finds a task for w: its own deque, then the injection queue, then another
+// worker's deque. Returns false when there is none.
+fn alph_exec_find(ex: AlphExec*, w: AlphWorker*, out: AlphJob*) -> bool {
+  if (alph_deq_pop(w, out) || alph_inj_pop(ex, out)) {
+    return true;
+  }
+  w->rng = (w->rng * (int64)1103515245 + (int64)12345) & (int64)2147483647;
+  var start: int64 = w->rng % ex->count;
+  for k: int64 in 0..ex->count {
+    var v: AlphWorker* = alph_exec_worker(ex, (start + k) % ex->count);
+    if (v != w && alph_deq_steal(v, out)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Whether any work is waiting anywhere: checked before sleeping.
+fn alph_exec_has_work(ex: AlphExec*) -> bool {
+  if (alph_atomic_load(&ex->inj_len) > 0) {
+    return true;
+  }
+  for i: int64 in 0..ex->count {
+    var v: AlphWorker* = alph_exec_worker(ex, i);
+    if (alph_atomic_load(&v->top) < alph_atomic_load(&v->bottom)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+fn alph_exec_main(arg: int64) -> int64 {
+  var w: AlphWorker* = (AlphWorker*)arg;
+  var ex: AlphExec* = (AlphExec*)w->exec;
+  var job: AlphJob;
+  while (alph_atomic_load(&ex->stop) == 0) {
+    if (alph_exec_find(ex, w, &job)) {
+      alph_exec_run(ex, w, &job, 0);
+      w->ran = w->ran + 1;
+      if (w->ran % ALPH_EXEC_POLL_EVERY == 0) {
+        alph_exec_poll(ex, w, 0);
+      }
+      continue;
+    }
+    // Idle: look for work for a while, then sleep in the reactor.
+    var until: int64 = alph_now_ns() + ex->spin_ns;
+    var found: bool = false;
+    var spins: int64 = 0;
+    while (!found && alph_now_ns() < until && alph_atomic_load(&ex->stop) == 0) {
+      alph_cpu_relax();
+      spins = spins + 1;
+      if (spins % 16 == 0) {
+        found = alph_exec_find(ex, w, &job);
+      }
+      if (spins % 64 == 0) {
+        alph_exec_poll(ex, w, 0);
+      }
+    }
+    if (found) {
+      alph_exec_run(ex, w, &job, 0);
+      continue;
+    }
+    // Spawners push, then wake a worker whose sleeping is 1; setting it
+    // first and looking once more closes the gap.
+    alph_atomic_add(&ex->sleepers, 1);
+    alph_atomic_store_sc(&w->sleeping, 1);
+    if (!alph_exec_has_work(ex) && alph_atomic_load(&ex->stop) == 0) {
+      alph_exec_poll(ex, w, -1);
+    }
+    alph_atomic_store(&w->sleeping, 0);
+    alph_atomic_add(&ex->sleepers, -1);
+  }
+  return 0;
+}
+
+// ---- public API --------------------------------------------------------------
+
+// Fills cfg with the defaults listed at AlphExecConfig. Thread: any.
+export fn alph_exec_config(cfg: AlphExecConfig*) {
+  cfg->threads = alph_cpu_count();
+  if (cfg->threads < 1) {
+    cfg->threads = 1;
+  }
+  cfg->spin_us = 50;
+  cfg->stack_size = 1048576;
+}
+
+// Starts an executor with cfg->threads workers. Returns false when threads,
+// reactors or memory cannot be had. Thread: any.
+export fn alph_exec_start(ex: AlphExec*, cfg: AlphExecConfig*) -> bool {
+  memset((rawptr)ex, 0, (int64)sizeof(AlphExec));
+  if (cfg->threads < 1) {
+    return false;
+  }
+  ex->count = cfg->threads;
+  ex->spin_ns = cfg->spin_us * 1000;
+  ex->workers = (int64)calloc(ex->count, (int64)sizeof(AlphWorker));
+  if (ex->workers == 0) {
+    return false;
+  }
+  for i: int64 in 0..ex->count {
+    var w: AlphWorker* = alph_exec_worker(ex, i);
+    w->exec = (int64)ex;
+    w->index = i;
+    w->rng = i * 7919 + 1;
+    w->ring = (int64)malloc(ALPH_DEQ_CAP * (int64)sizeof(AlphJob));
+    w->rxev = (int64)malloc(64 * (int64)sizeof(AlphRxEvent));
+    if (w->ring == 0 || w->rxev == 0 || !alph_rx_init(&w->rx)) {
+      return false;
+    }
+  }
+  for i: int64 in 0..ex->count {
+    var w: AlphWorker* = alph_exec_worker(ex, i);
+    w->handle = alph_thread_start(&w->thread, &alph_exec_main, (int64)w, cfg->stack_size);
+    if (w->handle == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Queues a task from any thread: f(ctx, arg) runs on some worker. Returns
+// false when memory runs out. Thread: any.
+export fn alph_exec_spawn(ex: AlphExec*, arg: int64,
+                          f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> bool {
+  return alph_exec_spawn_in(ex, (AlphGroup*)0, arg, f);
+}
+
+// As alph_exec_spawn, and the task joins group g (0 for none) until it
+// returns. Thread: any.
+export fn alph_exec_spawn_in(ex: AlphExec*, g: AlphGroup*, arg: int64,
+                             f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> bool {
+  var job: AlphJob;
+  job.f = f;
+  job.arg = arg;
+  job.group = (int64)g;
+  if (g != 0) {
+    alph_atomic_add(&g->pending, 1);
+  }
+  alph_atomic_add(&ex->pending, 1);
+  if (!alph_inj_push(ex, &job)) {
+    alph_exec_finish(ex, &job);
+    return false;
+  }
+  alph_exec_wake_one(ex);
+  return true;
+}
+
+// Queues a subtask from inside a task, on this worker's own deque, where it
+// runs next unless another worker steals it first (work-first, as Cilk and
+// Tokio do). It joins group g (0 for none). Returns false when memory runs
+// out. Thread: a task.
+export fn alph_task_spawn_in(tc: AlphTaskCtx*, g: AlphGroup*, arg: int64,
+                             f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> bool {
+  var ex: AlphExec* = tc->exec;
+  var w: AlphWorker* = (AlphWorker*)tc->self;
+  var job: AlphJob;
+  job.f = f;
+  job.arg = arg;
+  job.group = (int64)g;
+  if (g != 0) {
+    alph_atomic_add(&g->pending, 1);
+  }
+  alph_atomic_add(&ex->pending, 1);
+  if (!alph_deq_push(w, &job) && !alph_inj_push(ex, &job)) {
+    alph_exec_finish(ex, &job);
+    return false;
+  }
+  alph_exec_wake_one(ex);
+  return true;
+}
+
+// As alph_task_spawn_in with no group. Thread: a task.
+export fn alph_task_spawn(tc: AlphTaskCtx*, arg: int64,
+                          f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> bool {
+  return alph_task_spawn_in(tc, (AlphGroup*)0, arg, f);
+}
+
+// Starts group g empty. Thread: any.
+export fn alph_group_init(g: AlphGroup*) {
+  alph_atomic_store(&g->pending, 0);
+}
+
+// Tasks in g not yet finished. Thread: any.
+export fn alph_group_pending(g: AlphGroup*) -> int64 {
+  return alph_atomic_load(&g->pending);
+}
+
+// Blocks the calling thread until every task in g has returned. Not for a
+// task: a worker blocked here runs nothing; use alph_task_help.
+// Thread: any thread that is not a worker.
+export fn alph_group_wait(g: AlphGroup*) {
+  while (true) {
+    var n: int64 = alph_atomic_load(&g->pending);
+    if (n == 0) {
+      return;
+    }
+    alph_futex_wait(&g->pending, n, -1);
+  }
+}
+
+// From inside a task: runs other tasks until every task in g has returned,
+// so a task can wait for its subtasks without holding up its worker.
+// Thread: a task.
+export fn alph_task_help(tc: AlphTaskCtx*, g: AlphGroup*) {
+  var ex: AlphExec* = tc->exec;
+  var w: AlphWorker* = (AlphWorker*)tc->self;
+  var job: AlphJob;
+  var idle: int64 = 0;
+  while (alph_atomic_load(&g->pending) != 0) {
+    if (alph_exec_find(ex, w, &job)) {
+      alph_exec_run(ex, w, &job, 0);
+      idle = 0;
+    } else {
+      alph_cpu_relax();
+      idle = idle + 1;
+      if (idle % 64 == 0) {
+        alph_exec_poll(ex, w, 0);  // a subtask may wait on an fd or a timer here
+      }
+    }
+  }
+}
+
+// Blocks the calling thread until no task is queued or running (tasks
+// waiting on fds or timers do not count). Thread: any thread that is not a
+// worker.
+export fn alph_exec_wait_idle(ex: AlphExec*) {
+  while (true) {
+    var n: int64 = alph_atomic_load(&ex->pending);
+    if (n == 0) {
+      return;
+    }
+    alph_futex_wait(&ex->pending, n, -1);
+  }
+}
+
+// Boxes a task for the reactor: its data is the box.
+fn alph_task_box(arg: int64, f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> AlphJob* {
+  var box: AlphJob* = (AlphJob*)malloc((int64)sizeof(AlphJob));
+  if (box != 0) {
+    box->f = f;
+    box->arg = arg;
+    box->group = 0;
+  }
+  return box;
+}
+
+// From inside a task: runs f(ctx, arg) on this worker once fd is ready for
+// events (ALPH_RX_READ, ALPH_RX_WRITE), with ctx->events saying what is
+// ready. One shot: call again to wait again, but only after the previous
+// wait on fd has run (a wait replaced before it runs is lost, with its
+// memory). fd must be non-blocking and
+// stay with this worker's tasks while it is watched; alph_rx_remove it from
+// alph_task_reactor(tc) before closing it. Returns 0, or a negative errno.
+// Thread: a task.
+export fn alph_task_on_ready(tc: AlphTaskCtx*, fd: int64, events: int64, arg: int64,
+                             f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> int64 {
+  var w: AlphWorker* = (AlphWorker*)tc->self;
+  var box: AlphJob* = alph_task_box(arg, f);
+  if (box == 0) {
+    return -12;
+  }
+  var r: int64 = alph_rx_modify(&w->rx, fd, events, ALPH_RX_ONESHOT, (int64)box);
+  if (r == -2) {  // ENOENT: not watched yet
+    r = alph_rx_add(&w->rx, fd, events, ALPH_RX_ONESHOT, (int64)box);
+  }
+  if (r != 0) {
+    free((rawptr)box);
+  }
+  return r;
+}
+
+// From inside a task: runs f(ctx, arg) on this worker after ns nanoseconds.
+// Returns the timer's id for alph_task_cancel, or 0 when memory runs out.
+// Thread: a task.
+export fn alph_task_after(tc: AlphTaskCtx*, ns: int64, arg: int64,
+                          f: fn(AlphTaskCtx*, int64) -> int64 with alloc, syscall, asm) -> int64 {
+  var w: AlphWorker* = (AlphWorker*)tc->self;
+  var box: AlphJob* = alph_task_box(arg, f);
+  if (box == 0) {
+    return 0;
+  }
+  var id: int64 = alph_rx_timer(&w->rx, ns, (int64)box);
+  if (id == 0) {
+    free((rawptr)box);
+  }
+  return id;
+}
+
+// Cancels a timer from alph_task_after, on the worker that started it.
+// Returns false when it already ran or was cancelled. Thread: a task on the
+// same worker.
+export fn alph_task_cancel(tc: AlphTaskCtx*, id: int64) -> bool {
+  var w: AlphWorker* = (AlphWorker*)tc->self;
+  var data: int64 = 0;
+  if (!alph_rx_cancel_data(&w->rx, id, &data)) {
+    return false;
+  }
+  free((rawptr)data);
+  return true;
+}
+
+// This worker's reactor, to add or remove fds directly. Thread: a task.
+export fn alph_task_reactor(tc: AlphTaskCtx*) -> AlphReactor* {
+  return &((AlphWorker*)tc->self)->rx;
+}
+
+// Stops the executor: workers finish the task they are running and exit,
+// and this returns once all have. Queued tasks are dropped; call
+// alph_exec_wait_idle first to let them run. Thread: any thread that is not
+// a worker.
+export fn alph_exec_stop(ex: AlphExec*) {
+  alph_atomic_store_sc(&ex->stop, 1);
+  for i: int64 in 0..ex->count {
+    alph_rx_wake(&alph_exec_worker(ex, i)->rx);
+  }
+  for i: int64 in 0..ex->count {
+    var w: AlphWorker* = alph_exec_worker(ex, i);
+    if (w->handle != 0) {
+      alph_thread_join(w->handle, &w->thread);
+    }
+    alph_rx_free(&w->rx);
+    free((rawptr)w->ring);
+    free((rawptr)w->rxev);
+  }
+  free((rawptr)ex->workers);
+  free((rawptr)ex->inj);
+  ex->workers = 0;
+  ex->count = 0;
+}

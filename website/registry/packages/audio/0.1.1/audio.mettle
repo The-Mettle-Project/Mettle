@@ -1,0 +1,36 @@
+// audio: sound for Mettle, written in pure Mettle.
+//
+//   import "audio/audio";
+//
+// This file has no exports of its own, so it re-exports every module below.
+// All exported names start with audio_, Audio or AUDIO_.
+//
+//   core/   status codes, AudioPcm and formats, AudioBuf, bit readers, files
+//   dsp/    format conversion, channel mixing, resampling
+//   codec/  WAV, FLAC, Ogg, Vorbis, Opus, MP3, and loading by name
+//   mix/    the low-latency mixer and ring buffer
+//   dev/    playback and capture devices
+
+import "core/status";
+import "core/amath";
+import "core/buf";
+import "core/bits";
+import "core/pcm";
+import "core/file";
+import "core/md5";
+import "core/bitw";
+import "dsp/convert";
+import "dsp/channels";
+import "dsp/resample";
+import "mix/ring";
+import "mix/mixer";
+import "dev/types";
+import "dev/device";
+import "codec/ogg";
+import "codec/wav";
+import "codec/flac";
+import "codec/flac_enc";
+import "codec/mp3";
+import "codec/vorbis";
+import "codec/opus";
+import "codec/stream";

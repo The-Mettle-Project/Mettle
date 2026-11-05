@@ -1,0 +1,647 @@
+// raize/server/parse — the HTTP/1.1 request parser, a pure function.
+//
+// The entire parser is `rz_parse(buf, len, out, arena)`: bytes in, a filled
+// RzRequest or a result code out. No sockets, no globals, no clock. That is
+// deliberate — it is the one decision that makes the whole request path
+// testable with `mettle test` in the interpreter, where sockets are stubbed.
+//
+// Result codes (the seam):
+//
+//   RZ_PARSE_COMPLETE        0   request fully parsed (head + body)
+//   RZ_PARSE_NEED_MORE       1   not enough bytes yet; call again after recv
+//   RZ_PARSE_MALFORMED       2   -> 400 (refused, close the connection)
+//   RZ_PARSE_LIMIT_HEADERS   3   -> 431 (header block or count over the cap)
+//   RZ_PARSE_LIMIT_TARGET    4   -> 414 (request line or target too long)
+//   RZ_PARSE_LIMIT_BODY      5   -> 413 (Content-Length over the cap)
+//
+// Aparse result is never "2 or 3 and hope": every refusal names which limit
+// was hit, and `rz_parse_status` maps it to the status line the connection
+// writes. `RZ_PARSE_NEED_MORE` maps to 0 (write nothing, keep reading).
+//
+// Rules this parser enforces (v1, deliberately strict):
+//   * method: 1..RZ_MAX_METHOD tchars; target: 1..RZ_MAX_TARGET; version is
+//     exactly HTTP/1.0 or HTTP/1.1 (anything else -> 400).
+//   * header block terminated by CRLFCRLF; a bare LF or a bare CR inside it is
+//     a 400, never silently repaired.
+//   * obs-fold (a line starting with SP or HTAB) is a 400.
+//   * field name must be a token; a space before ':' fails the token test.
+//   * control bytes other than HTAB/CR/LF inside the head are a 400.
+//   * at most RZ_MAX_HEADERS fields and RZ_MAX_HEADER_BYTES of head -> 431.
+//   * `Transfer-Encoding` at all is a 400 (chunked is refused, not ignored;
+//     a body we do not understand must never be left in the buffer).
+//   * more than one `Content-Length` is a 400 (last-wins is a smuggling bug).
+//   * Content-Length must be digits only, 0..RZ_MAX_BODY -> 413 if larger.
+//   * HTTP/1.1 requires exactly one non-empty `Host` (400 otherwise).
+//   * `Expect` may only be `100-continue` (400 otherwise); the connection loop
+//     writes the interim 100 response before reading the body.
+//   * path is percent-decoded and normalized; an escape above the root or a
+//     NUL byte is a 400. `OPTIONS *` is accepted as path "*".
+//
+// `rz_parse` never reads past buf+len. When the head is complete but the body
+// is not, `out->head_len` and `out->body_len` are already set and the result
+// is NEED_MORE, so the connection loop can decide whether to read the body in
+// place or into a per-request buffer.
+
+import "std/mem";
+import "../str/str";
+import "../context/arena";
+import "../context/header";
+import "../context/request";
+import "../context/query";
+
+// Scratch arena behind rz_parse_pure. Declared with the other module-level
+// state, never between functions.
+var g_rz_parse_arena: RzArena* = 0;
+
+export const RZ_PARSE_COMPLETE: int32 = 0;
+export const RZ_PARSE_NEED_MORE: int32 = 1;
+export const RZ_PARSE_MALFORMED: int32 = 2;
+export const RZ_PARSE_LIMIT_HEADERS: int32 = 3;
+export const RZ_PARSE_LIMIT_TARGET: int32 = 4;
+export const RZ_PARSE_LIMIT_BODY: int32 = 5;
+
+// The status line a result code turns into. 0 means "write nothing".
+export fn rz_parse_status(code: int32) -> int32 {
+  if (code == RZ_PARSE_COMPLETE) { return 200; }
+  if (code == RZ_PARSE_NEED_MORE) { return 0; }
+  if (code == RZ_PARSE_LIMIT_HEADERS) { return 431; }
+  if (code == RZ_PARSE_LIMIT_TARGET) { return 414; }
+  if (code == RZ_PARSE_LIMIT_BODY) { return 413; }
+  return 400;
+}
+
+fn rz_parse_byte(buf: uint8*, i: int64) -> int32 {
+  return (int32)buf[i];
+}
+
+// Locates the CRLFCRLF that ends the head.
+//
+//   >= 0  index of the first CR
+//   -1    not found yet (need more bytes)
+//   -2    malformed: bare LF, bare CR, or a control byte that cannot appear
+//
+// The scan is bounded by `limit` (never by the buffer's capacity), which is
+// what keeps a partial read from reading uninitialised memory.
+fn rz_parse_head_end(buf: uint8*, len: int64) -> int64 {
+  var i: int64 = 0;
+  while (i < len) {
+    var c: int32 = rz_parse_byte(buf, i);
+    if (c == 13) {
+      if (i + 1 >= len) { return -1; }
+      if (rz_parse_byte(buf, i + 1) != 10) { return -2; }   // bare CR
+      if (i + 3 < len) {
+        if (rz_parse_byte(buf, i + 2) == 13 && rz_parse_byte(buf, i + 3) == 10) {
+          return i;
+        }
+      }
+      // Skip the whole CRLF: the LF of a legal pair is not a "bare LF".
+      i = i + 2;
+      continue;
+    }
+    if (c == 10) { return -2; }                             // bare LF
+    if (c == 0) { return -2; }
+    if (c < 32 && c != 9) { return -2; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// Index of the next CR that ends a line, starting at `from`, or -1 when the
+// line is not terminated before `limit`.
+fn rz_parse_line_end(buf: uint8*, from: int64, limit: int64) -> int64 {
+  var i: int64 = from;
+  while (i < limit) {
+    if (rz_parse_byte(buf, i) == 13) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// Digits-only Content-Length. Returns -1 on a non-digit, -2 on overflow.
+fn rz_parse_content_length(v: string) -> int64 {
+  var n: int64 = (int64)v.length;
+  if (n <= 0) { return -1; }
+  if (n > 18) { return -2; }
+  var acc: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)v.chars[i];
+    if (c < 48 || c > 57) { return -1; }
+    if (acc > 922337203685477580) { return -2; }
+    acc = acc * 10 + (int64)(c - 48);
+    i = i + 1;
+  }
+  return acc;
+}
+
+fn rz_parse_version_ok(v: string) -> bool {
+  if (v.length != 8) { return false; }
+  if (!rz_str_eq(rz_str_sub(v, 0, 7), "HTTP/1.")) { return false; }
+  var c: int32 = (int32)v.chars[7];
+  return c == 48 || c == 49;
+}
+
+// The parser proper. `arena` owns the decoded path; the header values are
+// views into `buf`, which the caller must keep alive for the request.
+export fn rz_parse(buf: uint8*, len: int64, out: RzRequest*, arena: RzArena*) -> int32 {
+  if (out == 0 || arena == 0) { return RZ_PARSE_MALFORMED; }
+  if (buf == 0 || len < 0) { return RZ_PARSE_MALFORMED; }
+
+  if (out->headers == 0) {
+    if (!rz_request_init(out, arena)) { return RZ_PARSE_LIMIT_HEADERS; }
+  } else {
+    rz_request_reset(out);
+  }
+
+  // --- 1. head terminator ---------------------------------------------------
+  var head_end: int64 = rz_parse_head_end(buf, len);
+  if (head_end == -2) { return RZ_PARSE_MALFORMED; }
+  if (head_end < 0) {
+    if (len >= RZ_MAX_HEADER_BYTES) { return RZ_PARSE_LIMIT_HEADERS; }
+    out->head_len = 0;
+    return RZ_PARSE_NEED_MORE;
+  }
+  if (head_end + 4 > RZ_MAX_HEADER_BYTES) { return RZ_PARSE_LIMIT_HEADERS; }
+  out->head_len = head_end + 4;
+
+  // --- 2. request line ------------------------------------------------------
+  var line_end: int64 = rz_parse_line_end(buf, 0, head_end + 2);
+  if (line_end < 0) { return RZ_PARSE_MALFORMED; }
+  if (line_end + 2 > RZ_MAX_REQUEST_LINE) { return RZ_PARSE_LIMIT_TARGET; }
+  var sp1: int64 = -1;
+  var sp2: int64 = -1;
+  var i: int64 = 0;
+  while (i < line_end) {
+    if (rz_parse_byte(buf, i) == 32) {
+      if (sp1 < 0) { sp1 = i; } else if (sp2 < 0) { sp2 = i; }
+    }
+    i = i + 1;
+  }
+  if (sp1 <= 0 || sp2 <= sp1 + 1) { return RZ_PARSE_MALFORMED; }
+  var verb: string = rz_str_view(buf, sp1);
+  var target: string = rz_str_view(buf + sp1 + 1, sp2 - sp1 - 1);
+  var version: string = rz_str_view(buf + sp2 + 1, line_end - sp2 - 1);
+  if ((int64)verb.length > (int64)RZ_MAX_METHOD) { return RZ_PARSE_MALFORMED; }
+  if (!rz_header_name_ok(verb)) { return RZ_PARSE_MALFORMED; }   // methods are tokens
+  if (target.length == 0 || (int64)target.length > RZ_MAX_TARGET) { return RZ_PARSE_LIMIT_TARGET; }
+  if (!rz_parse_version_ok(version)) { return RZ_PARSE_MALFORMED; }
+  out->verb = verb;
+  out->target = target;
+  out->version_major = 1;
+  var minor: int32 = (int32)version.chars[7] - 48;
+  out->version_minor = minor;
+
+  // --- 3. header fields -----------------------------------------------------
+  i = line_end + 2;
+  while (i < head_end) {
+    var end: int64 = rz_parse_line_end(buf, i, head_end + 2);
+    if (end < 0) { return RZ_PARSE_MALFORMED; }
+    if (rz_parse_byte(buf, i) == 32 || rz_parse_byte(buf, i) == 9) { return RZ_PARSE_MALFORMED; }
+    var colon: int64 = -1;
+    var k: int64 = i;
+    while (k < end) {
+      if (rz_parse_byte(buf, k) == 58) { colon = k; break; }
+      k = k + 1;
+    }
+    if (colon <= i) { return RZ_PARSE_MALFORMED; }
+    var raw_name: string = rz_str_view(buf + i, colon - i);
+    var raw_value: string = rz_str_view(buf + colon + 1, end - colon - 1);
+    if (!rz_header_name_ok(raw_name)) { return RZ_PARSE_MALFORMED; }
+    if (!rz_header_value_ok(raw_value)) { return RZ_PARSE_MALFORMED; }
+    if (out->header_count >= RZ_MAX_HEADERS) { return RZ_PARSE_LIMIT_HEADERS; }
+    if (out->header_bytes + (end - i + 2) > RZ_MAX_HEADER_BYTES) { return RZ_PARSE_LIMIT_HEADERS; }
+    var idx: int32 = out->header_count;
+    out->headers[idx].name = raw_name;
+    out->headers[idx].value = rz_header_trim(raw_value);
+    out->header_count = idx + 1;
+    out->header_bytes = out->header_bytes + (end - i + 2);
+    i = end + 2;
+  }
+
+  // --- 4. framing -----------------------------------------------------------
+  if (rz_header_has(out->headers, out->header_count, "transfer-encoding")) {
+    return RZ_PARSE_MALFORMED;
+  }
+  var cl_count: int32 = rz_header_count_named(out->headers, out->header_count, "content-length");
+  if (cl_count > 1) { return RZ_PARSE_MALFORMED; }
+  var body_len: int64 = 0;
+  if (cl_count == 1) {
+    var cl: string = rz_header_get(out->headers, out->header_count, "content-length");
+    body_len = rz_parse_content_length(cl);
+    if (body_len < 0) { return RZ_PARSE_MALFORMED; }
+    if (body_len > RZ_MAX_BODY) { return RZ_PARSE_LIMIT_BODY; }
+  }
+  out->body_len = body_len;
+
+  var host_count: int32 = rz_header_count_named(out->headers, out->header_count, "host");
+  if (host_count > 1) { return RZ_PARSE_MALFORMED; }
+  if (minor == 1) {
+    if (host_count == 0) { return RZ_PARSE_MALFORMED; }
+    if (rz_header_get(out->headers, out->header_count, "host").length == 0) {
+      return RZ_PARSE_MALFORMED;
+    }
+  }
+
+  var conn_value: string = rz_header_get(out->headers, out->header_count, "connection");
+  if (rz_header_has_token(conn_value, "close")) {
+    out->keepalive = false;
+  } else if (minor == 0) {
+    out->keepalive = rz_header_has_token(conn_value, "keep-alive");
+  } else {
+    out->keepalive = true;
+  }
+
+  var expect_value: string = rz_header_get(out->headers, out->header_count, "expect");
+  if (expect_value.length > 0) {
+    if (!rz_str_eq_ci(expect_value, "100-continue")) { return RZ_PARSE_MALFORMED; }
+  }
+
+  // --- 5. target, path, query -----------------------------------------------
+  var raw_path: string = target;
+  var query: string = rz_str_empty();
+  if (!rz_str_eq(target, "*")) {
+    var qmark: int64 = rz_str_find_byte(target, 63);
+    if (qmark >= 0) {
+      raw_path = rz_str_sub(target, 0, qmark);
+      query = rz_str_from(target, qmark + 1);
+    }
+    if (raw_path.length == 0) { return RZ_PARSE_MALFORMED; }
+    var path: string = rz_path_normalize(raw_path, arena);
+    if (path.length == 0) { return RZ_PARSE_MALFORMED; }
+    out->path = path;
+    out->query = query;
+  } else {
+    if (!rz_req_verb_is(out, "OPTIONS")) { return RZ_PARSE_MALFORMED; }
+    out->path = "*";
+    out->query = rz_str_empty();
+  }
+
+  // --- 6. body --------------------------------------------------------------
+  var available: int64 = len - out->head_len;
+  if (available < 0) { available = 0; }
+  if (available < body_len) {
+    return RZ_PARSE_NEED_MORE;
+  }
+  if (body_len > 0) {
+    out->body = rz_str_view(buf + out->head_len, body_len);
+  } else {
+    out->body = rz_str_empty();
+  }
+  return RZ_PARSE_COMPLETE;
+}
+
+// ---------------------------------------------------------------------------
+// A 3-argument variant for callers that own no arena (unit tests, tools).
+//
+// It uses one process-wide scratch arena, reset at the start of every call, so
+// every view in `out` stays valid until the next rz_parse_pure call. It is
+// bounded by RZ_ARENA_MAX_BYTES exactly like a request arena, and it does not
+// leak: the first block is reused forever and rz_parse_pure_free() releases
+// even that. A server never calls this; the connection loop owns a real arena.
+// ---------------------------------------------------------------------------
+
+export fn rz_parse_pure(buf: uint8*, len: int64, out: RzRequest*) -> int32 {
+  if (g_rz_parse_arena == 0) {
+    g_rz_parse_arena = rz_arena_new();
+    if (g_rz_parse_arena == 0) { return RZ_PARSE_MALFORMED; }
+  }
+  rz_arena_reset(g_rz_parse_arena);
+  return rz_parse(buf, len, out, g_rz_parse_arena);
+}
+
+export fn rz_parse_pure_free() {
+  if (g_rz_parse_arena != 0) {
+    rz_arena_free(g_rz_parse_arena);
+    g_rz_parse_arena = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// Copies a string literal into a writable byte buffer so tests can build a
+// request that is byte-exact (and, for the fuzz test, mutable).
+fn rz_test_bytes(src: string, dst: uint8*, cap: int64) -> int64 {
+  var n: int64 = (int64)src.length;
+  if (n > cap) { n = cap; }
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = src.chars[i];
+    i = i + 1;
+  }
+  return n;
+}
+
+fn rz_test_arena() -> RzArena* {
+  return rz_arena_new();
+}
+
+struct RzParseCase {
+  raw: string;
+  want: int32;
+  want_status: int32;
+}
+
+// Table of every refusal the gate (tests/http_edges.sh) checks, plus the
+// partial-read cases. Each row asserts both the result code and the status
+// line it maps to.
+fn rz_run_case(c: RzParseCase, arena: RzArena*, scratch: uint8*, cap: int64) -> int32 {
+  var n: int64 = rz_test_bytes(c.raw, scratch, cap);
+  var req: RzRequest;
+  var got: int32 = rz_parse(scratch, n, &req, arena);
+  if (got != c.want) { return 1; }
+  if (rz_parse_status(got) != c.want_status) { return 2; }
+  return 0;
+}
+
+@test fn t_rz_parse_table() -> int32 {
+  var arena: RzArena* = rz_test_arena();
+  if (arena == 0) { return 1; }
+  var buf: uint8[16384];
+  var cap: int64 = 16384;
+
+  // 1: a well-formed request with two headers
+  var n: int64 = rz_test_bytes("GET /a/b?x=1 HTTP/1.1\r\nHost: t\r\nX-A: v\r\n\r\n", &buf[0], cap);
+  var req: RzRequest;
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 2; }
+  if (!rz_str_eq(req.verb, "GET")) { rz_arena_free(arena); return 3; }
+  if (!rz_str_eq(req.path, "/a/b")) { rz_arena_free(arena); return 4; }
+  if (!rz_str_eq(req.query, "x=1")) { rz_arena_free(arena); return 5; }
+  if (req.header_count != 2) { rz_arena_free(arena); return 6; }
+  if (req.body_len != 0) { rz_arena_free(arena); return 7; }
+  if (!req.keepalive) { rz_arena_free(arena); return 8; }
+  if (req.version_minor != 1) { rz_arena_free(arena); return 9; }
+  if (req.head_len != n) { rz_arena_free(arena); return 10; }
+  if (!rz_str_eq(rz_req_header(&req, "host"), "t")) { rz_arena_free(arena); return 11; }
+
+  // 2: partial head -> NEED_MORE
+  n = rz_test_bytes("GET / HTTP/1.1\r\nHost: t\r\n", &buf[0], cap);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_NEED_MORE) { rz_arena_free(arena); return 12; }
+
+  // 3: complete head, partial body -> NEED_MORE with framing visible
+  n = rz_test_bytes("POST /x HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhe", &buf[0], cap);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_NEED_MORE) { rz_arena_free(arena); return 13; }
+  if (req.body_len != 5) { rz_arena_free(arena); return 14; }
+  if (req.head_len <= 0) { rz_arena_free(arena); return 15; }
+
+  // 4: ... and complete once the body arrives
+  n = rz_test_bytes("POST /x HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello", &buf[0], cap);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 16; }
+  if (!rz_str_eq(req.body, "hello")) { rz_arena_free(arena); return 17; }
+  if (req.body_len != 5) { rz_arena_free(arena); return 18; }
+
+  // 5: body longer than the head buffer is still COMPLETE when all bytes are
+  //    present (the connection loop decides where to put it)
+  n = rz_test_bytes("POST /x HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabcGET / HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], cap);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 19; }
+  if (!rz_str_eq(req.body, "abc")) { rz_arena_free(arena); return 20; }
+
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_parse_refusals() -> int32 {
+  var arena: RzArena* = rz_test_arena();
+  if (arena == 0) { return 1; }
+  var buf: uint8[16384];
+  var cap: int64 = 16384;
+
+  var cases: RzParseCase[9];
+  cases[0].raw = "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\nhello";
+  cases[0].want = RZ_PARSE_MALFORMED;
+  cases[0].want_status = 400;
+  cases[1].raw = "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+  cases[1].want = RZ_PARSE_MALFORMED;
+  cases[1].want_status = 400;
+  cases[2].raw = "GET / HTTP/1.1\r\nHost: t\r\nX-A: one\r\n two\r\n\r\n";
+  cases[2].want = RZ_PARSE_MALFORMED;
+  cases[2].want_status = 400;
+  cases[3].raw = "GET / HTTP/1.1\nHost: t\n\n";
+  cases[3].want = RZ_PARSE_MALFORMED;
+  cases[3].want_status = 400;
+  cases[4].raw = "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: +5\r\n\r\nhello";
+  cases[4].want = RZ_PARSE_MALFORMED;
+  cases[4].want_status = 400;
+  cases[5].raw = "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 5x\r\n\r\nhello";
+  cases[5].want = RZ_PARSE_MALFORMED;
+  cases[5].want_status = 400;
+  cases[6].raw = "GET / HTTP/1.1\r\nHost : t\r\n\r\n";
+  cases[6].want = RZ_PARSE_MALFORMED;
+  cases[6].want_status = 400;
+  cases[7].raw = "GET / HTTP/1.1\r\nX-A: v\r\n\r\n";       // HTTP/1.1 without Host
+  cases[7].want = RZ_PARSE_MALFORMED;
+  cases[7].want_status = 400;
+  cases[8].raw = "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 2097152\r\n\r\n";
+  cases[8].want = RZ_PARSE_LIMIT_BODY;
+  cases[8].want_status = 413;
+
+  var i: int32 = 0;
+  while (i < 9) {
+    var rc: int32 = rz_run_case(cases[i], arena, &buf[0], cap);
+    if (rc != 0) { rz_arena_free(arena); return 100 + i; }
+    i = i + 1;
+  }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_parse_limit_header_bytes() -> int32 {
+  var arena: RzArena* = rz_test_arena();
+  if (arena == 0) { return 1; }
+  var buf: uint8[16384];
+  var req: RzRequest;
+  var n: int64 = 0;
+  n = n + rz_test_bytes("GET / HTTP/1.1\r\nHost: t\r\nX-Big: ", &buf[n], 16384 - n);
+  while (n < RZ_MAX_HEADER_BYTES + 64) {
+    buf[n] = 65;   // 'A'
+    n = n + 1;
+  }
+  n = n + rz_test_bytes("\r\n\r\n", &buf[n], 16384 - n);
+  var rc: int32 = rz_parse(&buf[0], n, &req, arena);
+  if (rc != RZ_PARSE_LIMIT_HEADERS) { rz_arena_free(arena); return 2; }
+  if (rz_parse_status(rc) != 431) { rz_arena_free(arena); return 3; }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_parse_limit_header_count() -> int32 {
+  var arena: RzArena* = rz_test_arena();
+  if (arena == 0) { return 1; }
+  var buf: uint8[4096];
+  var req: RzRequest;
+  var n: int64 = 0;
+  n = n + rz_test_bytes("GET / HTTP/1.1\r\nHost: t\r\n", &buf[n], 4096 - n);
+  var h: int32 = 0;
+  while (h < RZ_MAX_HEADERS) {
+    buf[n] = 88; buf[n + 1] = 45;                     // "X-"
+    buf[n + 2] = (uint8)(65 + (h / 10) % 26);
+    buf[n + 3] = (uint8)(48 + h % 10);
+    n = n + 4;
+    n = n + rz_test_bytes(": v\r\n", &buf[n], 4096 - n);
+    h = h + 1;
+  }
+  n = n + rz_test_bytes("\r\n", &buf[n], 4096 - n);
+  var rc: int32 = rz_parse(&buf[0], n, &req, arena);
+  if (rc != RZ_PARSE_LIMIT_HEADERS) { rz_arena_free(arena); return 2; }
+  if (rz_parse_status(rc) != 431) { rz_arena_free(arena); return 3; }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_parse_limit_target() -> int32 {
+  var arena: RzArena* = rz_test_arena();
+  if (arena == 0) { return 1; }
+  var buf: uint8[8192];
+  var req: RzRequest;
+  var n: int64 = 0;
+  n = n + rz_test_bytes("GET /", &buf[n], 8192 - n);
+  var k: int64 = 0;
+  while (k < 5000) {
+    buf[n] = 97;   // 'a'
+    n = n + 1;
+    k = k + 1;
+  }
+  n = n + rz_test_bytes(" HTTP/1.1\r\nHost: t\r\n\r\n", &buf[n], 8192 - n);
+  var rc: int32 = rz_parse(&buf[0], n, &req, arena);
+  if (rc != RZ_PARSE_LIMIT_TARGET) { rz_arena_free(arena); return 2; }
+  if (rz_parse_status(rc) != 414) { rz_arena_free(arena); return 3; }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_parse_keepalive_and_host() -> int32 {
+  var arena: RzArena* = rz_test_arena();
+  if (arena == 0) { return 1; }
+  var buf: uint8[4096];
+  var req: RzRequest;
+  var n: int64 = 0;
+
+  n = rz_test_bytes("GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 2; }
+  if (req.keepalive) { rz_arena_free(arena); return 3; }
+
+  n = rz_test_bytes("GET / HTTP/1.0\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 4; }
+  if (req.keepalive) { rz_arena_free(arena); return 5; }
+  if (req.version_minor != 0) { rz_arena_free(arena); return 6; }
+
+  n = rz_test_bytes("GET / HTTP/1.0\r\nHost: t\r\nConnection: keep-alive\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 7; }
+  if (!req.keepalive) { rz_arena_free(arena); return 8; }
+
+  n = rz_test_bytes("GET / HTTP/1.1\r\nHost: t\r\nHost: u\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 9; }
+
+  n = rz_test_bytes("GET / HTTP/1.1\r\nHost:\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 10; }
+
+  n = rz_test_bytes("GET / HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 11; }
+  if (!rz_str_eq(rz_req_header(&req, "expect"), "100-continue")) { rz_arena_free(arena); return 12; }
+
+  n = rz_test_bytes("GET / HTTP/1.1\r\nHost: t\r\nExpect: something\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 13; }
+
+  // OPTIONS * is allowed; * with another verb is not
+  n = rz_test_bytes("OPTIONS * HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 14; }
+  if (!rz_str_eq(req.path, "*")) { rz_arena_free(arena); return 15; }
+  n = rz_test_bytes("GET * HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 16; }
+
+  // path traversal and absolute-form targets
+  n = rz_test_bytes("GET /../etc HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 17; }
+  n = rz_test_bytes("GET http://x/y HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 18; }
+  n = rz_test_bytes("GET /a/./b/%2e%2e/c?q=1 HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_COMPLETE) { rz_arena_free(arena); return 19; }
+  if (!rz_str_eq(req.path, "/a/c")) { rz_arena_free(arena); return 20; }
+  if (!rz_str_eq(req.query, "q=1")) { rz_arena_free(arena); return 21; }
+
+  // method token rules
+  n = rz_test_bytes("G T / HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 22; }
+  n = rz_test_bytes("GET / HTTP/9.9\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 23; }
+  n = rz_test_bytes("GET  / HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], 4096);
+  if (rz_parse(&buf[0], n, &req, arena) != RZ_PARSE_MALFORMED) { rz_arena_free(arena); return 24; }
+
+  rz_arena_free(arena);
+  return 0;
+}
+
+// Deterministic fuzz: 20000 pseudo-random byte strings. The parser must never
+// crash, must never report COMPLETE on data it did not see the end of, and
+// must always return one of the six documented codes.
+@test fn t_rz_parse_fuzz() -> int32 {
+  var arena: RzArena* = rz_test_arena();
+  if (arena == 0) { return 1; }
+  var buf: uint8[512];
+  var req: RzRequest;
+  var seed: int64 = 12345;
+  var round: int32 = 0;
+  while (round < 100) {
+    seed = (seed * 1103515245 + 12345) & 2147483647;
+    var n: int64 = seed % 256;
+    var i: int64 = 0;
+    while (i < n) {
+      seed = (seed * 1103515245 + 12345) & 2147483647;
+      buf[i] = (uint8)(seed % 256);
+      i = i + 1;
+    }
+    var rc: int32 = rz_parse(&buf[0], n, &req, arena);
+    if (rc < 0 || rc > 5) { rz_arena_free(arena); return 2; }
+    if (rc == RZ_PARSE_COMPLETE && n < 4) { rz_arena_free(arena); return 3; }
+    round = round + 1;
+  }
+  // ASCII-only fuzz, which actually reaches the header parser.
+  round = 0;
+  seed = 999;
+  while (round < 100) {
+    seed = (seed * 1103515245 + 12345) & 2147483647;
+    var n2: int64 = seed % 128;
+    var k: int64 = 0;
+    while (k < n2) {
+      seed = (seed * 1103515245 + 12345) & 2147483647;
+      var pick: int64 = seed % 40;
+      if (pick < 33) {
+        buf[k] = (uint8)(32 + pick);
+      } else if (pick == 33) {
+        buf[k] = 13;
+      } else if (pick == 34) {
+        buf[k] = 10;
+      } else if (pick == 35) {
+        buf[k] = 58;   // ':'
+      } else if (pick == 36) {
+        buf[k] = 47;   // '/'
+      } else if (pick == 37) {
+        buf[k] = 63;   // '?'
+      } else if (pick == 38) {
+        buf[k] = 9;
+      } else {
+        buf[k] = 0;
+      }
+      k = k + 1;
+    }
+    var rc2: int32 = rz_parse(&buf[0], n2, &req, arena);
+    if (rc2 < 0 || rc2 > 5) { rz_arena_free(arena); return 4; }
+    round = round + 1;
+  }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_parse_pure_scratch() -> int32 {
+  var buf: uint8[256];
+  var n: int64 = rz_test_bytes("GET /pure HTTP/1.1\r\nHost: t\r\n\r\n", &buf[0], 256);
+  var req: RzRequest;
+  if (rz_parse_pure(&buf[0], n, &req) != RZ_PARSE_COMPLETE) { rz_parse_pure_free(); return 1; }
+  if (!rz_str_eq(req.path, "/pure")) { rz_parse_pure_free(); return 2; }
+  // the scratch arena is reused, so a second call is still cheap and correct
+  var req2: RzRequest;
+  if (rz_parse_pure(&buf[0], n, &req2) != RZ_PARSE_COMPLETE) { rz_parse_pure_free(); return 3; }
+  rz_parse_pure_free();
+  return 0;
+}

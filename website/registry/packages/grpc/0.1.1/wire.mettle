@@ -1,0 +1,266 @@
+// The HTTP/2 headers of a gRPC call (doc/PROTOCOL-HTTP2.md): what a client
+// sends, what a server answers, and the trailers that carry the status.
+import "grpc/arena";
+import "std/hpack";
+import "grpc/status";
+import "grpc/metadata";
+import "grpc/deadline";
+import "grpc/message";
+
+export const GRPC_USER_AGENT: string = "grpc-mettle/0.1.0";
+export const GRPC_CONTENT_TYPE: string = "application/grpc";
+
+fn lower_eq(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  for i in 0..(int64)a.length {
+    var c: uint8 = a.chars[i];
+    if (c >= 65 && c <= 90) { c = c + 32; }
+    if (c != b.chars[i]) { return false; }
+  }
+  return true;
+}
+
+// True for application/grpc and application/grpc+anything (also ;params).
+export fn grpc_content_type_ok(v: string) -> bool {
+  var base: string = GRPC_CONTENT_TYPE;
+  if (v.length < base.length) { return false; }
+  var head: string = v;
+  head.length = base.length;
+  if (!lower_eq(head, base)) { return false; }
+  if (v.length == base.length) { return true; }
+  var c: uint8 = v.chars[base.length];
+  return c == 43 || c == 59;
+}
+
+fn copy_str(a: GrpcArena*, p: uint8*, n: int64) -> string {
+  var r: string;
+  if (n <= 0) { return r; }
+  var d: uint8* = (uint8*)grpc_arena_alloc(a, n);
+  for i in 0..n { d[i] = p[i]; }
+  r.chars = d;
+  r.length = (uint64)n;
+  return r;
+}
+
+// What a client puts on a new stream.
+export struct GrpcRequestHead {
+  path: string;          // "/pkg.Service/Method"
+  authority: string;
+  scheme: string;        // "http" or "https"
+  deadline: int64;       // GRPC_NO_DEADLINE or a monotonic time
+  send_enc: int32;       // grpc-encoding of the messages we send
+  user_agent: string;    // put before the library's own; may be empty
+}
+
+export fn grpc_request_headers(h: GrpcRequestHead*, md: GrpcMetadata*, out: GrpcHeaderList*) {
+  grpc_hl_add(out, ":method", "POST");
+  grpc_hl_add(out, ":scheme", h->scheme);
+  grpc_hl_add(out, ":path", h->path);
+  grpc_hl_add(out, ":authority", h->authority);
+  grpc_hl_add(out, "te", "trailers");
+  grpc_hl_add(out, "content-type", GRPC_CONTENT_TYPE);
+  if (h->user_agent.length > 0) {
+    grpc_hl_add(out, "user-agent", h->user_agent + " " + GRPC_USER_AGENT);
+  } else {
+    grpc_hl_add(out, "user-agent", GRPC_USER_AGENT);
+  }
+  if (h->deadline != GRPC_NO_DEADLINE) {
+    var buf: uint8[12];
+    var n: int64 = grpc_timeout_encode(grpc_deadline_left(h->deadline), &buf[0]);
+    grpc_hl_add(out, "grpc-timeout", copy_str(out->arena, &buf[0], n));
+  }
+  if (h->send_enc != GRPC_ENC_IDENTITY) {
+    grpc_hl_add(out, "grpc-encoding", grpc_encoding_name(h->send_enc));
+  }
+  grpc_hl_add(out, "grpc-accept-encoding", GRPC_ACCEPT_ENCODING);
+  grpc_md_to_headers(md, out);
+}
+
+// What a server reads from request headers.
+export struct GrpcRequestInfo {
+  path: string;
+  authority: string;
+  deadline: int64;
+  recv_enc: int32;        // -1: an encoding we do not support
+  recv_enc_name: string;
+  accept: string;         // the client's grpc-accept-encoding
+  prev_attempts: int32;   // grpc-previous-rpc-attempts (gRFC A6), 0 if none
+  http_status: int32;     // 0 if fine, else answer with this HTTP status and no gRPC
+  code: int32;            // GRPC_OK, or the status to end the call with at once
+  message: string;
+}
+
+// Reads request headers into info and md (custom metadata). Problems are
+// reported in info: http_status for requests that are not gRPC at all
+// (wrong method or content type), code for gRPC-level errors.
+export fn grpc_request_parse(hs: HpackHeader*, n: int64, md: GrpcMetadata*, info: GrpcRequestInfo*) {
+  var hmethod: string;
+  var ctype: string;
+  var have_ct: bool = false;
+  info->deadline = GRPC_NO_DEADLINE;
+  info->recv_enc = GRPC_ENC_IDENTITY;
+  info->http_status = 0;
+  info->code = GRPC_OK;
+  for i in 0..n {
+    var name: string = hs[i].name;
+    var v: string = hs[i].value;
+    if (name == ":method") { hmethod = v; continue; }
+    if (name == ":path") { info->path = v; continue; }
+    if (name == ":authority") { info->authority = v; continue; }
+    if (name == "host") {
+      if (info->authority.length == 0) { info->authority = v; }
+      continue;
+    }
+    if (name == "content-type") { ctype = v; have_ct = true; continue; }
+    if (name == "grpc-timeout") {
+      var ns: int64 = grpc_timeout_decode(v);
+      if (ns < 0) {
+        info->code = GRPC_INTERNAL;
+        info->message = "malformed grpc-timeout";
+      } else {
+        info->deadline = grpc_deadline_after(ns);
+      }
+      continue;
+    }
+    if (name == "grpc-encoding") {
+      info->recv_enc_name = v;
+      info->recv_enc = grpc_encoding_parse(v);
+      continue;
+    }
+    if (name == "grpc-accept-encoding") { info->accept = v; continue; }
+    if (name == "grpc-previous-rpc-attempts") {
+      var pa: int32 = 0;
+      for k in 0..(int64)v.length {
+        var ch: uint8 = v.chars[k];
+        if (ch >= 48 && ch <= 57 && pa < 100) { pa = pa * 10 + (int32)(ch - 48); }
+      }
+      info->prev_attempts = pa;
+      continue;
+    }
+    if (grpc_md_add_wire(md, name, v) != GRPC_MD_OK) {
+      info->code = GRPC_INTERNAL;
+      info->message = "malformed metadata " + name;
+    }
+  }
+  if (hmethod != "POST") {
+    info->http_status = 405;
+    return;
+  }
+  if (!have_ct || !grpc_content_type_ok(ctype)) {
+    info->http_status = 415;
+    return;
+  }
+  if (info->path.length < 2 || info->path.chars[0] != 47) {
+    info->code = GRPC_UNIMPLEMENTED;
+    info->message = "malformed path";
+    return;
+  }
+  if (info->recv_enc < 0 && info->code == GRPC_OK) {
+    info->code = GRPC_UNIMPLEMENTED;
+    info->message = "unsupported grpc-encoding " + info->recv_enc_name;
+  }
+}
+
+// Server response headers (sent before the first message).
+export fn grpc_response_headers(send_enc: int32, md: GrpcMetadata*, out: GrpcHeaderList*) {
+  grpc_hl_add(out, ":status", "200");
+  grpc_hl_add(out, "content-type", GRPC_CONTENT_TYPE);
+  if (send_enc != GRPC_ENC_IDENTITY) {
+    grpc_hl_add(out, "grpc-encoding", grpc_encoding_name(send_enc));
+  }
+  grpc_hl_add(out, "grpc-accept-encoding", GRPC_ACCEPT_ENCODING);
+  grpc_md_to_headers(md, out);
+}
+
+// Trailers. With trailers_only the :status and content-type go first, for
+// a response that sends no headers or messages before its status.
+export fn grpc_trailers(st: GrpcStatus*, md: GrpcMetadata*, trailers_only: bool, out: GrpcHeaderList*) {
+  if (trailers_only) {
+    grpc_hl_add(out, ":status", "200");
+    grpc_hl_add(out, "content-type", GRPC_CONTENT_TYPE);
+    // doc/compression.md: an UNIMPLEMENTED for an unknown encoding must say
+    // which ones the server takes; harmless on every other status.
+    grpc_hl_add(out, "grpc-accept-encoding", GRPC_ACCEPT_ENCODING);
+  }
+  var code: int32 = st->code;
+  if (code < 0 || code > 16) { code = GRPC_UNKNOWN; }
+  var buf: uint8[4];
+  var k: int64 = 0;
+  if (code >= 10) {
+    buf[0] = (uint8)(48 + code / 10);
+    k = 1;
+  }
+  buf[k] = (uint8)(48 + code % 10);
+  grpc_hl_add(out, "grpc-status", copy_str(out->arena, &buf[0], k + 1));
+  if (st->message.length > 0) {
+    grpc_hl_add(out, "grpc-message", grpc_message_encode_in(out->arena, st->message));
+  }
+  if (st->details.length > 0) {
+    var n: int64 = grpc_b64_len((int64)st->details.length);
+    var p: uint8* = (uint8*)grpc_arena_alloc(out->arena, n);
+    grpc_b64_encode(st->details.chars, (int64)st->details.length, p);
+    var v: string;
+    v.chars = p;
+    v.length = (uint64)n;
+    grpc_hl_add(out, "grpc-status-details-bin", v);
+  }
+  grpc_md_to_headers(md, out);
+}
+
+// A plain HTTP answer for a request that is not gRPC (405, 415).
+export fn grpc_http_error_headers(http_status: int32, out: GrpcHeaderList*) {
+  if (http_status == 405) {
+    grpc_hl_add(out, ":status", "405");
+  } else {
+    grpc_hl_add(out, ":status", "415");
+  }
+  grpc_hl_add(out, "content-type", "text/plain");
+}
+
+// What a client reads from response headers or trailers.
+export struct GrpcResponseInfo {
+  http_status: int32;
+  is_grpc: bool;          // content-type was application/grpc...
+  recv_enc: int32;        // -1: an encoding we do not support
+  accept: string;
+  has_status: bool;       // grpc-status was present (trailers, or trailers-only)
+  code: int32;
+  message: string;
+  details: string;        // raw google.rpc.Status bytes
+}
+
+// Reads a HEADERS block from the server. md gets custom metadata.
+export fn grpc_response_parse(a: GrpcArena*, hs: HpackHeader*, n: int64, md: GrpcMetadata*, info: GrpcResponseInfo*) {
+  for i in 0..n {
+    var name: string = hs[i].name;
+    var v: string = hs[i].value;
+    if (name == ":status") {
+      var s: int32 = 0;
+      for k in 0..(int64)v.length {
+        var c: uint8 = v.chars[k];
+        if (c >= 48 && c <= 57) { s = s * 10 + (int32)(c - 48); }
+      }
+      info->http_status = s;
+      continue;
+    }
+    if (name == "content-type") { info->is_grpc = grpc_content_type_ok(v); continue; }
+    if (name == "grpc-encoding") { info->recv_enc = grpc_encoding_parse(v); continue; }
+    if (name == "grpc-accept-encoding") { info->accept = v; continue; }
+    if (name == "grpc-status") {
+      info->has_status = true;
+      info->code = grpc_code_from_wire(v);
+      continue;
+    }
+    if (name == "grpc-message") { info->message = grpc_message_decode_in(a, v); continue; }
+    if (name == "grpc-status-details-bin") {
+      var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)v.length + 3);
+      var got: int64 = grpc_b64_decode(v.chars, (int64)v.length, p);
+      if (got >= 0) {
+        info->details.chars = p;
+        info->details.length = (uint64)got;
+      }
+      continue;
+    }
+    grpc_md_add_wire(md, name, v);
+  }
+}

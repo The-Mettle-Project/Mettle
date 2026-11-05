@@ -1,0 +1,134 @@
+// mythic_fonts: font registry; embeds the shipped faces (DECISIONS §7, Appendix D).
+// Also owns the glyph cache and the per-frame text arenas used by mythic_text.
+import "mythic_types";
+import "mythic_ttf";
+import "mythic_glyph";
+
+// Second built-in monospace: IBM Plex Mono, embedded renamed as "Mythic Mono Alt" (OFL §3,
+// Reserved Font Name "Plex"). Pick it with `theme.type.mono.font = MYTHIC_FONT_MONO_ALT`.
+export const MYTHIC_FONT_MONO_ALT: int32 = 4;
+
+// Geist Serif ships one weight, so the medium and semibold roles (labels, buttons, titles) use
+// Geist Sans, which has the same vertical metrics.
+var g_mythic_font_serif: string = import_str "../assets/fonts/GeistSerif-Regular.ttf";
+var g_mythic_font_medium: string = import_str "../assets/fonts/Geist-Medium.ttf";
+var g_mythic_font_semibold: string = import_str "../assets/fonts/Geist-SemiBold.ttf";
+var g_mythic_font_mono: string = import_str "../assets/fonts/JetBrainsMono-Regular.ttf";
+var g_mythic_font_mono_alt: string = import_str "../assets/fonts/MythicMonoAlt-Regular.ttf";
+
+// Opaque outside the text modules.
+export struct MythicFonts {
+  count: int32; frame: int64;
+  ttfs: MythicVec<MythicTtf>;
+  glyphs: MythicGlyphCache;
+  arena0: MythicArena; arena1: MythicArena;   // text layouts; alternate per frame
+  cur_arena: int32;
+  tnum: MythicVec<int32>;                   // per font: max digit advance (font units)
+  layouts: MythicMap<MythicTextCacheEnt>;     // text layout cache (mythic_text)
+}
+// One cached text layout: a single malloc block owned by the cache.
+export struct MythicTextCacheEnt { block: rawptr; frame: int64; }
+
+var g_mythic_text_keep_from: int64 = 0;
+
+fn text_cache_keep(p: rawptr) -> bool {
+  var e: MythicTextCacheEnt* = (MythicTextCacheEnt*)p;
+  if (e->frame >= g_mythic_text_keep_from) { return true; }
+  if (e->block != 0) { free(e->block); }
+  return false;
+}
+export struct MythicFontMetrics { ascent: float32; descent: float32; line_gap: float32; cap_height: float32; x_height: float32; }
+
+fn add_str(f: MythicFonts*, s: string) -> int32 {
+  return mythic_fonts_add(f, (uint8*)s.chars, (int64)s.length);
+}
+
+export fn mythic_fonts_create() -> MythicFonts* {          // registers the embedded faces as ids 0..4
+  var f: MythicFonts* = new MythicFonts;
+  var se: string = g_mythic_font_serif;
+  var md: string = g_mythic_font_medium;
+  var sb: string = g_mythic_font_semibold;
+  var mo: string = g_mythic_font_mono;
+  var ma: string = g_mythic_font_mono_alt;
+  add_str(f, se);
+  add_str(f, md);
+  add_str(f, sb);
+  add_str(f, mo);
+  add_str(f, ma);
+  return f;
+}
+
+export fn mythic_fonts_add(f: MythicFonts*, data: uint8*, len: int64) -> int32 {   // -1 on parse failure
+  if (f == 0 || f->count >= 255) { return -1; }
+  var t: MythicTtf;
+  if (!mythic_ttf_init(&t, data, len)) { return -1; }
+  mythic_vec_push<MythicTtf>(&f->ttfs, t);
+  var tn: int32 = 0;
+  for d: uint32 in 48..58 {
+    var a: int32 = mythic_ttf_advance(&t, mythic_ttf_glyph_index(&t, d));
+    if (a > tn) { tn = a; }
+  }
+  mythic_vec_push<int32>(&f->tnum, tn);
+  f->count = f->count + 1;
+  return f->count - 1;
+}
+
+/// The parsed face for `font` (falls back to font 0 for unknown ids).
+export fn mythic_fonts_ttf(f: MythicFonts*, font: int32) -> MythicTtf* {
+  var i: int32 = font;
+  if (i < 0 || i >= f->count) { i = 0; }
+  return &f->ttfs.data[i];
+}
+
+export fn mythic_fonts_metrics(f: MythicFonts*, font: int32, size_px: float32) -> MythicFontMetrics {
+  var m: MythicFontMetrics;
+  if (f == 0 || f->count == 0) { return m; }
+  var t: MythicTtf* = mythic_fonts_ttf(f, font);
+  var s: float32 = size_px / (float32)t->upem;
+  m.ascent = (float32)t->ascent * s;
+  m.descent = -(float32)t->descent * s;
+  m.line_gap = (float32)t->line_gap * s;
+  m.cap_height = (float32)t->cap_height * s;
+  m.x_height = (float32)t->x_height * s;
+  return m;
+}
+
+/// Current per-frame arena for text layouts (valid for this frame and the next).
+export fn mythic_fonts_arena(f: MythicFonts*) -> MythicArena* {
+  if (f->cur_arena == 0) { return &f->arena0; }
+  return &f->arena1;
+}
+
+export fn mythic_fonts_frame_begin(f: MythicFonts*, frame: int64) {                  // cache GC / atlas reset point
+  if (f == 0) { return; }
+  f->frame = frame;
+  f->cur_arena = 1 - f->cur_arena;
+  mythic_arena_reset(mythic_fonts_arena(f));
+  mythic_glyph_frame_begin(&f->glyphs);
+  // text layouts not used in the previous frame are freed (layouts stay valid one extra frame)
+  g_mythic_text_keep_from = frame - 1;
+  if (f->layouts.count > 0) { mythic_map_sweep<MythicTextCacheEnt>(&f->layouts, &text_cache_keep); }
+}
+
+/// Tabular figure advance of `font` in font units (the widest digit).
+export fn mythic_fonts_tnum(f: MythicFonts*, font: int32) -> int32 {
+  var i: int32 = font;
+  if (i < 0 || i >= f->count) { i = 0; }
+  return f->tnum.data[i];
+}
+
+/// Frees the registry, the glyph atlas and every cached text layout. Font bytes passed to
+/// mythic_fonts_add are not owned and are not freed.
+export fn mythic_fonts_destroy(f: MythicFonts*) {
+  if (f == 0) { return; }
+  for i: int64 in 0..f->layouts.cap {
+    if (f->layouts.keys[i] != (uint64)0 && f->layouts.vals[i].block != 0) { free(f->layouts.vals[i].block); }
+  }
+  mythic_map_free<MythicTextCacheEnt>(&f->layouts);
+  mythic_glyph_cache_free(&f->glyphs);
+  mythic_vec_free<MythicTtf>(&f->ttfs);
+  mythic_vec_free<int32>(&f->tnum);
+  mythic_arena_free(&f->arena0);
+  mythic_arena_free(&f->arena1);
+  free((rawptr)f);
+}

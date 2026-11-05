@@ -1,0 +1,32 @@
+// Etch: images for Mettle, written in pure Mettle.
+//
+//   import "etch/etch";
+//
+// This file has no exports of its own, so it re-exports every module below.
+// All exported names start with etch_, Etch or ETCH_.
+//
+//   core/  status codes, EtchImage and formats, EtchBuf, files, EtchAnim
+//   ops/   convert, flip, crop, rotate, resize, alpha, sRGB, OpenGL formats
+//   fmt/   PNG, APNG, JPEG, QOI, BMP, TGA, GIF, HDR, PNM, and loading by name
+
+import "etch/core/status";
+import "etch/core/image";
+import "etch/core/buf";
+import "etch/core/file";
+import "etch/core/anim";
+import "etch/ops/convert";
+import "etch/ops/transform";
+import "etch/ops/color";
+import "etch/ops/resize";
+import "etch/ops/gl";
+import "etch/fmt/common";
+import "etch/fmt/png";
+import "etch/fmt/jpeg";
+import "etch/fmt/jpeg_enc";
+import "etch/fmt/qoi";
+import "etch/fmt/bmp";
+import "etch/fmt/tga";
+import "etch/fmt/gif";
+import "etch/fmt/hdr";
+import "etch/fmt/pnm";
+import "etch/fmt/any";

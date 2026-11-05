@@ -1,0 +1,30 @@
+// raize_telemetry/sys/clock: monotonic and wall-clock time in nanoseconds (Linux).
+//
+// There is no std/time yet (Mettle 018). The runtime's clock_gettime is a
+// raw syscall with no libc, the same one std/bench and raize use. Replace
+// with std/time when it lands. Both functions return 0 if the clock cannot be
+// read. They do not work in the `mettle test` interpreter.
+
+struct TmTimespec {
+  sec: int64;
+  nsec: int64;
+}
+
+extern fn tm__clock_gettime(clk_id: int32, ts: cstring) -> int32 = "clock_gettime";
+
+fn tm__clock_ns(clk_id: int32) -> int64 {
+  var ts: TmTimespec;
+  if (tm__clock_gettime(clk_id, (cstring)&ts) != 0) { return 0; }
+  return ts.sec * (int64)1000000000 + ts.nsec;
+}
+
+// CLOCK_MONOTONIC: for durations. Never goes backwards. Thread: any.
+export fn tm_monotonic_ns() -> int64 {
+  return tm__clock_ns(1);
+}
+
+// CLOCK_REALTIME: nanoseconds since the Unix epoch, for timestamps only.
+// It can step when the clock is corrected. Thread: any.
+export fn tm_system_time_ns() -> int64 {
+  return tm__clock_ns(0);
+}

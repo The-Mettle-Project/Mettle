@@ -1,0 +1,96 @@
+// Picking and readouts over the last frame: nearest sample, bars by band, nothing before
+// a frame, clock and category x readouts, fixed-decimal y readouts.
+
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/scale";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/chart/frame";
+import "mistplot/chart/pick";
+
+fn check_line_pick() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  var p: MpPickPoint;
+  mp_expect("nothing before a frame", !mp_chart_pick(c, s, 50.0, &p));
+  var i: int32 = 0;
+  while (i < 11) {
+    mp_chart_push(c, s, (float64)i * 10.0, (float64)(i * i));
+    i = i + 1;
+  }
+  var t: MpTarget = mp_target(400.0, 240.0);
+  mp_chart_scene(c, &t);
+  var info: MpChartInfo;
+  mp_chart_info(c, &info);
+  var px: float64 = mp_scale_map(info.x, 41.0);
+  mp_expect("pick", mp_chart_pick(c, s, px, &p));
+  mp_expect("nearest sample", p.x == 40.0 && p.y == 16.0);
+  mp_expect("scene x", p.px == mp_scale_map(info.x, 40.0));
+  mp_expect("scene y inside the plot", p.py >= info.plot.y && p.py <= info.plot.y + info.plot.h);
+  mp_expect("far left clamps to the first", mp_chart_pick(c, s, -500.0, &p) && p.x == 0.0);
+  mp_expect("bad series", !mp_chart_pick(c, 3, px, &p));
+  var b: uint8[64];
+  mp_expect_str("y readout decimals", mp_chart_readout_y(c, 16.0, &b[0], 64), "16.0");
+  mp_expect_str("x readout", mp_chart_readout_x(c, 40.0, &b[0], 64), "40");
+  mp_expect_str("short buffer", mp_chart_readout_x(c, 40.0, &b[0], 8), "");
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_time_readout() {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_x_format(c, MP_FMT_TIME);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_push(c, s, 60.0, 1.0);
+  mp_chart_push(c, s, 90.0, 2.0);
+  var t: MpTarget = mp_target(300.0, 200.0);
+  mp_chart_scene(c, &t);
+  var b: uint8[64];
+  mp_expect_str("tenths under a minute", mp_chart_readout_x(c, 75.24, &b[0], 64), "01:15.2");
+  mp_chart_push(c, s, 400.0, 2.0);
+  mp_chart_scene(c, &t);
+  mp_expect_str("seconds over a minute", mp_chart_readout_x(c, 75.25, &b[0], 64), "01:15");
+  mp_chart_free(c);
+}
+
+fn check_bar_pick() {
+  var c: MpChart* = mp_chart_new(MP_BAR);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_set_value(c, s, "north", 4.0);
+  mp_chart_set_value(c, s, "south", 9.0);
+  var t: MpTarget = mp_target(300.0, 200.0);
+  mp_chart_scene(c, &t);
+  var info: MpChartInfo;
+  mp_chart_info(c, &info);
+  var p: MpPickPoint;
+  var px: float64 = mp_scale_band_center(info.x, 1);
+  mp_expect("bar pick", mp_chart_pick(c, s, px, &p));
+  mp_expect("band 1", p.x == 1.0 && p.y == 9.0 && p.px == px);
+  var b: uint8[64];
+  mp_expect_str("category readout", mp_chart_readout_x(c, p.x, &b[0], 64), "south");
+  mp_expect("outside the bands", !mp_chart_pick(c, s, info.plot.x + info.plot.w + 50.0, &p));
+  mp_chart_free(c);
+}
+
+fn run_all() {
+  check_line_pick();
+  check_time_readout();
+  check_bar_pick();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_pick() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

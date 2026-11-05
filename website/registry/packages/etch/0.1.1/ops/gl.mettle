@@ -1,0 +1,77 @@
+// OpenGL upload helpers: the enums glTexImage2D wants for an EtchImage.
+// Etch does not call OpenGL (Glint does); it only knows the numbers.
+//
+//   var t: EtchGlFormat = etch_gl_format(img.format, true);
+//   glPixelStorei(GL_UNPACK_ALIGNMENT, etch_gl_alignment(&img));
+//   glPixelStorei(GL_UNPACK_ROW_LENGTH, etch_gl_row_length(&img));
+//   glTexImage2D(GL_TEXTURE_2D, 0, (int32)t.internal, img.width, img.height,
+//                0, t.format, t.type, img.data);
+//
+// Rows in Etch run top to bottom; GL's texture origin is the bottom left.
+// Flip with etch_flip_v, or flip your texture coordinates.
+
+import "../core/image";
+
+export struct EtchGlFormat {
+  internal: uint32;   // e.g. GL_SRGB8_ALPHA8
+  format: uint32;     // e.g. GL_RGBA
+  type: uint32;       // GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT or GL_FLOAT
+}
+
+/// The GL internal format, pixel format and type for an Etch format. With
+/// `srgb`, 8-bit RGB and RGBA use the sRGB internal formats, so the GPU
+/// turns them to linear light when sampling (what color images want; not
+/// for normal maps or data). Gray formats map to GL_RED and GL_RG.
+export fn etch_gl_format(fmt: int32, srgb: bool) -> EtchGlFormat {
+  var r: EtchGlFormat;
+  var c: int32 = fmt & 7;
+  var kind: int32 = fmt >> 4;
+  // GL_RED, GL_RG, GL_RGB, GL_RGBA
+  if (c == 1) { r.format = 0x1903; } else if (c == 2) { r.format = 0x8227; }
+  else if (c == 3) { r.format = 0x1907; } else { r.format = 0x1908; }
+  if (kind == 0) {
+    r.type = 0x1401;                                   // GL_UNSIGNED_BYTE
+    if (c == 1) { r.internal = 0x8229; }               // GL_R8
+    else if (c == 2) { r.internal = 0x822B; }          // GL_RG8
+    else if (c == 3) {
+      r.internal = 0x8051;                             // GL_RGB8
+      if (srgb) { r.internal = 0x8C41; }               // GL_SRGB8
+    } else {
+      r.internal = 0x8058;                             // GL_RGBA8
+      if (srgb) { r.internal = 0x8C43; }               // GL_SRGB8_ALPHA8
+    }
+  } else if (kind == 1) {
+    r.type = 0x1403;                                   // GL_UNSIGNED_SHORT
+    if (c == 1) { r.internal = 0x822A; }               // GL_R16
+    else if (c == 2) { r.internal = 0x822C; }          // GL_RG16
+    else if (c == 3) { r.internal = 0x8054; }          // GL_RGB16
+    else { r.internal = 0x805B; }                      // GL_RGBA16
+  } else {
+    r.type = 0x1406;                                   // GL_FLOAT
+    if (c == 1) { r.internal = 0x822E; }               // GL_R32F
+    else if (c == 2) { r.internal = 0x8230; }          // GL_RG32F
+    else if (c == 3) { r.internal = 0x8815; }          // GL_RGB32F
+    else { r.internal = 0x8814; }                      // GL_RGBA32F
+  }
+  return r;
+}
+
+/// The largest GL_UNPACK_ALIGNMENT (8, 4, 2 or 1) that fits the image's
+/// stride and data address.
+export fn etch_gl_alignment(img: EtchImage*) -> int32 {
+  var a: int64 = 8;
+  var addr: int64 = (int64)img->data;
+  while (a > 1 && (img->stride % a != 0 || addr % a != 0)) { a = a / 2; }
+  return (int32)a;
+}
+
+/// GL_UNPACK_ROW_LENGTH for the image: 0 when rows are tightly packed
+/// (or padded only to the alignment), else the stride in pixels.
+export fn etch_gl_row_length(img: EtchImage*) -> int32 {
+  var bpp: int64 = (int64)etch_format_bpp(img->format);
+  var row: int64 = (int64)img->width * bpp;
+  var al: int64 = (int64)etch_gl_alignment(img);
+  var padded: int64 = (row + al - 1) / al * al;
+  if (img->stride == padded) { return 0; }
+  return (int32)(img->stride / bpp);
+}

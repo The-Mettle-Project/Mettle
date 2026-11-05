@@ -1,0 +1,79 @@
+// raize/server/types — the server's own values.
+//
+// Kept in a separate module so `conn` and `server` can both see RzServer
+// without a circular import (Mettle refuses import cycles): types -> context,
+// conn -> types + context + parse, server -> types + conn + listener.
+//
+// What a worker does, in one sentence: block in accept() on the shared
+// listening fd, set a receive timeout on the accepted socket, serve requests
+// on that socket until the client asks to close or the keep-alive budget runs
+// out, then shutdown+close and go back to accept(). There is no queue, no
+// event loop and no scheduler — Mettle has none — so the *kernel's* accept
+// queue (opts.backlog) is the only backpressure, and `workers` is the hard
+// bound on concurrent requests. That is the whole concurrency model.
+
+import "std/mem";
+import "../context/context";
+
+// The worker array inside RzServer has a literal extent (a Mettle struct field
+// cannot be sized by a constant), so this number must match the literal 64.
+export const RZ_MAX_WORKERS: int32 = 64;
+
+// Upper bound on the per-connection receive buffer. opts.buf_cap is clamped to
+// this; a request head larger than RZ_MAX_HEADER_BYTES is refused anyway, so
+// a buffer bigger than this buys nothing.
+export const RZ_MAX_CONN_BUF: int64 = 65536;
+
+// The knobs the example app sets. There are no others: limits are the exported
+// RZ_MAX_* constants, so the caps cannot be widened by a careless config.
+export struct RzServerOpts {
+  port: int32;             // bind address is INADDR_ANY (no DNS, no hostname)
+  workers: int32;          // accept threads, bounded by RZ_MAX_WORKERS
+  read_timeout_ms: int32;  // SO_RCVTIMEO/SO_SNDTIMEO per accepted socket
+  keepalive_max: int32;    // requests per connection before Connection: close
+  buf_cap: int64;          // per-connection receive buffer
+  backlog: int32;          // listen(2) backlog: the accept queue bound
+}
+
+export fn rz_server_opts_default() -> RzServerOpts {
+  var o: RzServerOpts;
+  o.port = 8080;
+  o.workers = 4;
+  o.read_timeout_ms = 5000;
+  o.keepalive_max = 100;
+  o.buf_cap = 16384;
+  o.backlog = 64;
+  return o;
+}
+
+// 32-bit counters on purpose: Mettle's atomics are 32-bit and sequentially
+// consistent. A 64-bit total would need a spin lock, and a request counter
+// that wraps after 2^31 requests is not this project's problem.
+export struct RzServerStats {
+  requests: int32;        // responses written
+  conns: int32;           // accepted sockets
+  active: int32;          // in-flight connections (workers busy)
+  peak_active: int32;
+  bad_requests: int32;    // 400s
+  too_large_headers: int32;  // 431s
+  too_large_body: int32;     // 413s
+  too_long_target: int32;    // 414s
+  timeouts: int32;        // 408s and idle closes
+  handler_errors: int32;  // handler returned non-zero
+  write_errors: int32;
+}
+
+export struct RzServer {
+  listen_fd: int64;
+  opts: RzServerOpts;
+  handler: fn(RzContext*) -> int32;
+  stop: int32;             // 0 running, 1 stopping (atomic exchange)
+  stats: RzServerStats;
+  start_ms: int64;
+  last_error: int32;
+}
+
+export fn rz_server_stats_reset(s: RzServerStats*) {
+  if (s == 0) { return; }
+  memset((rawptr)s, 0, sizeof(RzServerStats));
+}

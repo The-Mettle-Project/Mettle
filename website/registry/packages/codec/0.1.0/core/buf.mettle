@@ -1,0 +1,136 @@
+// CodecBuf: a byte buffer that grows at the end. The MessagePack, JSON and
+// CBOR writers append to one. A failed write sets `err` and later writes do
+// nothing, so a caller checks `err` once when done.
+import "std/mem";
+import "codec/core/status";
+import "codec/core/varint";
+
+export struct CodecBuf {
+  data: uint8*;
+  len: int64;
+  cap: int64;
+  err: int32;     // CODEC_OK, or the first error (CODEC_ERR_NOMEM, CODEC_ERR_LIMIT)
+  fixed: bool;    // the memory belongs to the caller and never grows
+  limit: int64;   // most bytes this buffer may hold; 0 means no limit
+}
+
+// Starts an empty buffer that owns its memory. cap is a first size hint.
+export fn codec_buf_init(b: CodecBuf*, cap: int64) {
+  b->data = (uint8*)0;
+  b->len = 0;
+  b->cap = 0;
+  b->err = CODEC_OK;
+  b->fixed = false;
+  b->limit = 0;
+  if (cap > 0) {
+    b->data = (uint8*)malloc(cap);
+    if (b->data == 0) { b->err = CODEC_ERR_NOMEM; } else { b->cap = cap; }
+  }
+}
+
+// Writes into caller memory: mem[0..cap). Running out sets CODEC_ERR_LIMIT.
+export fn codec_buf_fixed(b: CodecBuf*, mem: uint8*, cap: int64) {
+  b->data = mem;
+  b->len = 0;
+  b->cap = cap;
+  b->err = CODEC_OK;
+  b->fixed = true;
+  b->limit = 0;
+}
+
+// Frees owned memory. The buffer is empty and usable again afterwards.
+export fn codec_buf_free(b: CodecBuf*) {
+  if (!b->fixed && b->data != 0) { free(b->data); }
+  b->data = (uint8*)0;
+  b->len = 0;
+  b->cap = 0;
+  b->err = CODEC_OK;
+  b->fixed = false;
+}
+
+// Empties the buffer but keeps its memory, and clears the error.
+export fn codec_buf_clear(b: CodecBuf*) {
+  b->len = 0;
+  b->err = CODEC_OK;
+}
+
+// The bytes written so far, as a view into the buffer.
+export fn codec_buf_view(b: CodecBuf*) -> string {
+  var s: string;
+  s.chars = b->data;
+  s.length = (uint64)b->len;
+  return s;
+}
+
+// Hands the bytes to the caller (free them with free(s.chars)) and empties
+// the buffer. A fixed buffer returns a view of the caller's own memory.
+export fn codec_buf_take(b: CodecBuf*) -> string {
+  var s: string = codec_buf_view(b);
+  if (!b->fixed) {
+    b->data = (uint8*)0;
+    b->cap = 0;
+  }
+  b->len = 0;
+  return s;
+}
+
+// The slow path of codec_buf_reserve: grow to fit n more bytes.
+@noinline export fn codec_buf_grow(b: CodecBuf*, n: int64) -> bool {
+  if (b->err != CODEC_OK) { return false; }
+  var need: int64 = b->len + n;
+  if (n < 0 || need < b->len || (b->limit > 0 && need > b->limit)) {
+    b->err = CODEC_ERR_LIMIT;
+    return false;
+  }
+  if (need <= b->cap) { return true; }
+  if (b->fixed) {
+    b->err = CODEC_ERR_LIMIT;
+    return false;
+  }
+  var nc: int64 = b->cap + b->cap / 2;
+  if (nc < 64) { nc = 64; }
+  if (nc < need) { nc = need; }
+  if (b->limit > 0 && nc > b->limit) { nc = b->limit; }
+  var p: uint8* = (uint8*)realloc(b->data, nc);
+  if (p == 0) {
+    b->err = CODEC_ERR_NOMEM;
+    return false;
+  }
+  b->data = p;
+  b->cap = nc;
+  return true;
+}
+
+// Returns where n more bytes can go, or 0 if they cannot. The caller writes
+// them and then adds n to b->len.
+@inline export fn codec_buf_reserve(b: CodecBuf*, n: int64) -> uint8* {
+  if (b->cap - b->len < n || b->err != CODEC_OK) {
+    if (!codec_buf_grow(b, n)) { return (uint8*)0; }
+  }
+  return b->data + b->len;
+}
+
+@inline export fn codec_buf_byte(b: CodecBuf*, v: uint8) {
+  var p: uint8* = codec_buf_reserve(b, 1);
+  if (p == 0) { return; }
+  p[0] = v;
+  b->len = b->len + 1;
+}
+
+export fn codec_buf_bytes(b: CodecBuf*, src: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  var p: uint8* = codec_buf_reserve(b, n);
+  if (p == 0) { return; }
+  memcpy(p, src, n);
+  b->len = b->len + n;
+}
+
+export fn codec_buf_string(b: CodecBuf*, s: string) {
+  codec_buf_bytes(b, s.chars, (int64)s.length);
+}
+
+@inline export fn codec_buf_varint(b: CodecBuf*, v: uint64) {
+  var p: uint8* = codec_buf_reserve(b, 10);
+  if (p == 0) { return; }
+  b->len = b->len + codec_put_varint(p, v);
+}

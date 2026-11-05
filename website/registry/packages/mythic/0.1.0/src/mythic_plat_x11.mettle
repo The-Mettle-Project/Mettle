@@ -1,0 +1,1575 @@
+// mythic_plat_x11: pure wire-protocol X11 backend (DECISIONS §8, Appendix B).
+// Compiled only on linux (guarded import in mythic_plat). No libX11/xcb: raw syscalls over AF_UNIX.
+import "std/mem";
+import "std/io";
+import "mythic_types";
+import "mythic_plat_x11_keys";
+import "mythic_utf8";
+
+const X_RBUF = 65536;
+const X_RQCAP = 1024;            // parked raw event packets (32 bytes each)
+const X_EQCAP = 4096;            // translated MythicEvents
+const X_STRIP_BYTES = 262144;    // PutImage strip request size
+const X_EVENT_MASK = 6520959;    // key, button, enter/leave, motion, exposure, visibility, structure, focus, property
+const X_SEL_TIMEOUT_MS = 500;    // paste: wait for SelectionNotify
+const X_INCR_TIMEOUT_MS = 1000;  // paste: wait for each INCR chunk
+
+export struct MythicX11 {
+  plat: MythicPlatform;
+  fd: int32;
+  dead: bool;
+  opened: bool;
+  seq: int64;
+  setup: uint8*;
+  id_base: int64; id_mask: int64; id_next: int64;
+  max_req: int64;
+  root: int64; visual: int64; depth: int64;
+  min_kc: int64; max_kc: int64;
+  win: int64; gc: int64;
+  a_protocols: int64; a_delete: int64; a_net_wm_name: int64; a_utf8: int64;
+  keymap: uint8*; kspk: int64;
+  rbuf: uint8*; rpos: int64; rlen: int64;
+  rq: uint8*; rq_head: int64; rq_tail: int64;
+  eq: MythicEvent*; eq_head: int64; eq_tail: int64;
+  err_seq: int64; err_code: int64; quiet_seq: int64;
+  scale: float32;
+  win_w: int32; win_h: int32;
+  px: uint32*; fb_w: int32; fb_h: int32; fb_valid: bool;
+  shm_major: int64; shm_event: int64; shm_ok: bool; shm_seg: int64; shm_addr: int64; shm_pending: bool;
+  send: uint8*;
+  focused: bool;
+  cursor_shape: int32;
+  cursors: int64[8];
+  dead_close_sent: bool;
+  a_clipboard: int64; a_targets: int64; a_text: int64; a_incr: int64; a_sel: int64;
+  clip: uint8*; clip_len: int64; own_clip: bool; own_primary: bool; own_time: int64;
+  last_time: int64;                 // server time of the newest input event
+  gl_visual: int64; gl_depth: int64;  // window visual for GL (mythic_plat_gl_prepare); 0 = root visual
+  connected: int32;                 // 0 not tried, 1 connected (mythic_plat_gl_connect or open), -1 failed
+  mapped: bool;                     // MapNotify / UnmapNotify (a WM unmaps on workspace switch, iconify)
+  obscured: bool;                   // VisibilityNotify FullyObscured (no compositor: nothing of it shows)
+  gl_active: bool;                  // a GL context draws the window: Expose must not put the CPU framebuffer
+}
+
+// ---------- byte packing (little-endian; we send 'l') ----------
+fn rd8(b: uint8*, o: int64) -> int64 { return (int64)b[o]; }
+fn rd16(b: uint8*, o: int64) -> int64 { return (int64)b[o] | ((int64)b[o + 1] << 8); }
+fn rds16(b: uint8*, o: int64) -> int64 { var v: int64 = rd16(b, o); if (v >= 32768) { v = v - 65536; } return v; }
+fn rd32(b: uint8*, o: int64) -> int64 {
+  return (int64)b[o] | ((int64)b[o + 1] << 8) | ((int64)b[o + 2] << 16) | ((int64)b[o + 3] << 24);
+}
+fn rdbe16(b: uint8*, o: int64) -> int64 { return ((int64)b[o] << 8) | (int64)b[o + 1]; }
+fn wr8(b: uint8*, o: int64, v: int64) { b[o] = (uint8)(v & 255); }
+fn wr16(b: uint8*, o: int64, v: int64) { b[o] = (uint8)(v & 255); b[o + 1] = (uint8)((v >> 8) & 255); }
+fn wr32(b: uint8*, o: int64, v: int64) {
+  b[o] = (uint8)(v & 255); b[o + 1] = (uint8)((v >> 8) & 255);
+  b[o + 2] = (uint8)((v >> 16) & 255); b[o + 3] = (uint8)((v >> 24) & 255);
+}
+fn pad4(n: int64) -> int64 { return (n + 3) & ~3; }
+fn zero(b: uint8*, n: int64) { for i: int64 in 0..n { b[i] = (uint8)0; } }
+
+fn now_mono_us() -> int64 {
+  var ts: int64[2];
+  syscall(228, 1, &ts[0]);       // clock_gettime(CLOCK_MONOTONIC)
+  return ts[0] * 1000000 + ts[1] / 1000;
+}
+
+fn err_str(msg: string) { print_err("MythicUI: "); print_err(msg); print_err("\n"); }
+
+// ---------- environment and files (no libc: /proc/self/environ, raw open/read) ----------
+fn read_file_raw(path: uint8*, plen: int64, out_len: int64*) -> uint8* {
+  var cpath: uint8* = (uint8*)malloc(plen + 1);
+  for i: int64 in 0..plen { cpath[i] = path[i]; }
+  cpath[plen] = (uint8)0;
+  var fd: int64 = syscall(2, cpath, 524288, 0);   // open(O_RDONLY|O_CLOEXEC)
+  free(cpath);
+  if (fd < 0) { return 0; }
+  var cap: int64 = 4096;
+  var len: int64 = 0;
+  var buf: uint8* = (uint8*)malloc(cap);
+  while (true) {
+    if (len == cap) { cap = cap * 2; buf = (uint8*)realloc((rawptr)buf, cap); }
+    var r: int64 = syscall(0, fd, &buf[len], cap - len);
+    if (r == -4) { continue; }
+    if (r <= 0) { break; }
+    len = len + r;
+  }
+  syscall(3, fd);
+  *out_len = len;
+  return buf;
+}
+
+/// Looks up an environment variable from /proc/self/environ. Malloc'd, nul-terminated value.
+export fn mythic_x11_getenv(name: uint8*, n: int64, out: MythicBytes*) -> bool {
+  var path: string = "/proc/self/environ";
+  var len: int64 = 0;
+  var env: uint8* = read_file_raw(path.chars, (int64)path.length, &len);
+  if (env == 0) { return false; }
+  var i: int64 = 0;
+  var found: bool = false;
+  while (i < len && !found) {
+    var j: int64 = i;
+    while (j < len && env[j] != (uint8)0) { j = j + 1; }
+    if (j - i > n && env[i + n] == (uint8)61) {
+      var same: bool = true;
+      for k: int64 in 0..n { if (env[i + k] != name[k]) { same = false; } }
+      if (same) {
+        var vl: int64 = j - i - n - 1;
+        var v: uint8* = (uint8*)malloc(vl + 1);
+        for k: int64 in 0..vl { v[k] = env[i + n + 1 + k]; }
+        v[vl] = (uint8)0;
+        out->data = v;
+        out->len = vl;
+        found = true;
+      }
+    }
+    i = j + 1;
+  }
+  free(env);
+  return found;
+}
+
+fn env_str(name: string, out: MythicBytes*) -> bool { return mythic_x11_getenv(name.chars, (int64)name.length, out); }
+
+// ---------- socket I/O ----------
+fn poll_out(x: MythicX11*) {
+  var pfd: uint8[8];
+  wr32(&pfd[0], 0, (int64)x->fd); wr16(&pfd[0], 4, 4); wr16(&pfd[0], 6, 0);   // POLLOUT
+  syscall(7, &pfd[0], 1, 100);
+}
+
+fn write_all(x: MythicX11*, p: uint8*, n: int64) -> bool {
+  if (x->dead) { return false; }
+  var done: int64 = 0;
+  while (done < n) {
+    // sendto(..., MSG_NOSIGNAL): a vanished server yields EPIPE instead of a fatal SIGPIPE
+    var r: int64 = syscall(44, x->fd, &p[done], n - done, 0x4000, 0, 0);
+    if (r == -4) { continue; }
+    if (r == -11) { poll_out(x); continue; }
+    if (r <= 0) { x->dead = true; return false; }
+    done = done + r;
+  }
+  return true;
+}
+
+fn send_req(x: MythicX11*, p: uint8*, n: int64) -> int64 {
+  write_all(x, p, n);
+  x->seq = (x->seq + 1) & 65535;
+  return x->seq;
+}
+
+fn poll_fd(x: MythicX11*, timeout_ms: int64) -> int64 {
+  var pfd: uint8[8];
+  wr32(&pfd[0], 0, (int64)x->fd); wr16(&pfd[0], 4, 1); wr16(&pfd[0], 6, 0);
+  return syscall(7, &pfd[0], 1, timeout_ms);
+}
+
+fn read_exact(x: MythicX11*, dst: uint8*, n: int64) -> bool {
+  var got: int64 = 0;
+  while (got < n) {
+    if (x->dead) { return false; }
+    if (x->rpos == x->rlen) {
+      x->rpos = 0;
+      x->rlen = 0;
+      var r: int64 = syscall(0, x->fd, x->rbuf, X_RBUF);
+      if (r == -4 || r == -11) { continue; }
+      if (r <= 0) { x->dead = true; return false; }
+      x->rlen = r;
+    }
+    var take: int64 = x->rlen - x->rpos;
+    if (take > n - got) { take = n - got; }
+    for i: int64 in 0..take { dst[got + i] = x->rbuf[x->rpos + i]; }
+    x->rpos = x->rpos + take;
+    got = got + take;
+  }
+  return true;
+}
+
+// Reads one packet: 32 bytes into hdr. For replies returns a malloc'd copy of the whole reply.
+fn read_packet(x: MythicX11*, hdr: uint8*) -> uint8* {
+  if (!read_exact(x, hdr, 32)) { return 0; }
+  if (hdr[0] != (uint8)1) { return 0; }
+  var extra: int64 = rd32(hdr, 4) * 4;
+  var p: uint8* = (uint8*)malloc(32 + extra);
+  for i: int64 in 0..32 { p[i] = hdr[i]; }
+  if (extra > 0) { read_exact(x, &p[32], extra); }
+  return p;
+}
+
+fn rq_push(x: MythicX11*, e: uint8*) {
+  if (x->rq_tail - x->rq_head >= X_RQCAP) { return; }
+  var slot: int64 = (x->rq_tail % X_RQCAP) * 32;
+  for i: int64 in 0..32 { x->rq[slot + i] = e[i]; }
+  x->rq_tail = x->rq_tail + 1;
+}
+
+fn rq_pop(x: MythicX11*, e: uint8*) -> bool {
+  if (x->rq_head == x->rq_tail) { return false; }
+  var slot: int64 = (x->rq_head % X_RQCAP) * 32;
+  for i: int64 in 0..32 { e[i] = x->rq[slot + i]; }
+  x->rq_head = x->rq_head + 1;
+  return true;
+}
+
+fn print_xerror(x: MythicX11*, e: uint8*) {
+  var code: int64 = rd8(e, 1);
+  var es: int64 = rd16(e, 2);
+  x->err_seq = es;
+  x->err_code = code;
+  if (es == x->quiet_seq) { return; }
+  print_err("MythicUI: X error code={code} seq={es} bad={rd32(e, 4)} major={rd8(e, 10)} minor={rd16(e, 8)}\n");
+}
+
+// Handles one non-reply packet read while waiting for something else: errors are reported,
+// ShmCompletion clears the pending flag, selection traffic is answered at once (so a paste from
+// another client never waits on our frame loop), everything else is parked for translation.
+fn park(x: MythicX11*, e: uint8*) {
+  var t: int64 = rd8(e, 0) & 127;
+  if (t == 0) { print_xerror(x, e); return; }
+  if (x->shm_ok && t == x->shm_event) { x->shm_pending = false; return; }
+  if (t == 29) { sel_clear(x, e); return; }
+  if (t == 30) { sel_request(x, e); return; }
+  rq_push(x, e);
+}
+
+fn wait_reply(x: MythicX11*, seq: int64) -> uint8* {
+  var hdr: uint8[32];
+  while (!x->dead) {
+    var p: uint8* = read_packet(x, &hdr[0]);
+    if (x->dead) { break; }
+    if (p != 0) {
+      if (rd16(p, 2) == seq) { return p; }
+      free(p);
+    } else {
+      var t: int64 = rd8(&hdr[0], 0);
+      park(x, &hdr[0]);
+      if (t == 0 && rd16(&hdr[0], 2) == seq) { return 0; }
+    }
+  }
+  return 0;
+}
+
+fn xsync(x: MythicX11*) {
+  var r: uint8[4];
+  wr8(&r[0], 0, 43); wr8(&r[0], 1, 0); wr16(&r[0], 2, 1);   // GetInputFocus
+  var p: uint8* = wait_reply(x, send_req(x, &r[0], 4));
+  if (p != 0) { free(p); }
+}
+
+fn new_id(x: MythicX11*) -> int64 {
+  var id: int64 = x->id_base | (x->id_next & x->id_mask);
+  x->id_next = x->id_next + 1;
+  return id;
+}
+
+// ---------- connection ----------
+fn try_connect(x: MythicX11*, path: uint8*, plen: int64, abstract: bool) -> bool {
+  var fd: int64 = syscall(41, 1, 1 | 524288, 0);   // socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC)
+  if (fd < 0) { return false; }
+  var addr: uint8[110];
+  zero(&addr[0], 110);
+  addr[0] = (uint8)1;
+  var o: int64 = 2;
+  if (abstract) { o = 3; }
+  for i: int64 in 0..plen { addr[o + i] = path[i]; }
+  var alen: int64 = 2 + plen + 1;
+  var rc: int64 = syscall(42, fd, &addr[0], alen);
+  if (rc < 0) { syscall(3, fd); return false; }
+  x->fd = (int32)fd;
+  return true;
+}
+
+// Finds the MIT-MAGIC-COOKIE-1 for display `num` in the Xauthority file. 16 bytes into cookie.
+fn find_cookie(num: uint8*, nlen: int64, cookie: uint8*) -> bool {
+  var path: MythicBytes;
+  var have: bool = env_str("XAUTHORITY", &path);
+  if (!have || path.len == 0) {
+    var home: MythicBytes;
+    if (!env_str("HOME", &home)) { return false; }
+    var suffix: string = "/.Xauthority";
+    var pl: int64 = home.len + (int64)suffix.length;
+    var pp: uint8* = (uint8*)malloc(pl + 1);
+    for i: int64 in 0..home.len { pp[i] = home.data[i]; }
+    for i: int64 in 0..(int64)suffix.length { pp[home.len + i] = suffix.chars[i]; }
+    free(home.data);
+    path.data = pp;
+    path.len = pl;
+  }
+  var flen: int64 = 0;
+  var f: uint8* = read_file_raw(path.data, path.len, &flen);
+  free(path.data);
+  if (f == 0) { return false; }
+  var uts: uint8[390];
+  zero(&uts[0], 390);
+  syscall(63, &uts[0]);                    // uname: nodename at offset 65
+  var host: uint8* = &uts[65];
+  var hlen: int64 = 0;
+  while (hlen < 64 && host[hlen] != (uint8)0) { hlen = hlen + 1; }
+  var mname: string = "MIT-MAGIC-COOKIE-1";
+  var best: int32 = 0;                     // 2 = local match, 1 = wild match
+  var o: int64 = 0;
+  while (o + 2 <= flen && best < 2) {
+    var family: int64 = rdbe16(f, o);
+    var fl: int64[4];
+    var fo: int64[4];
+    var p: int64 = o + 2;
+    var ok: bool = true;
+    for k in 0..4 {
+      if (p + 2 > flen) { ok = false; break; }
+      fl[k] = rdbe16(f, p);
+      fo[k] = p + 2;
+      p = p + 2 + fl[k];
+      if (p > flen) { ok = false; break; }
+    }
+    if (!ok) { break; }
+    o = p;
+    var name_ok: bool = fl[2] == (int64)mname.length && fl[3] == 16;
+    if (name_ok) { for k: int64 in 0..fl[2] { if (f[fo[2] + k] != mname.chars[k]) { name_ok = false; } } }
+    var num_ok: bool = fl[1] == 0 || fl[1] == nlen;
+    if (num_ok) { for k: int64 in 0..fl[1] { if (f[fo[1] + k] != num[k]) { num_ok = false; } } }
+    if (!name_ok || !num_ok) { continue; }
+    var rank: int32 = 0;
+    if (family == 65535) { rank = 1; }
+    if (family == 256 && fl[0] == hlen) {
+      var same: bool = true;
+      for k: int64 in 0..hlen { if (f[fo[0] + k] != host[k]) { same = false; } }
+      if (same) { rank = 2; }
+    }
+    if (rank > best) {
+      best = rank;
+      for k: int64 in 0..16 { cookie[k] = f[fo[3] + k]; }
+    }
+  }
+  free(f);
+  return best > 0;
+}
+
+fn x_connect(x: MythicX11*) -> bool {
+  var disp: MythicBytes;
+  if (!env_str("DISPLAY", &disp) || disp.len == 0) { err_str("DISPLAY is not set; cannot open an X11 window"); return false; }
+  var colon: int64 = -1;
+  for i: int64 in 0..disp.len { if (disp.data[i] == (uint8)58) { colon = i; } }
+  if (colon < 0) { err_str("cannot parse DISPLAY"); free(disp.data); return false; }
+  var host_ok: bool = colon == 0;
+  if (colon == 4 && disp.data[0] == (uint8)117 && disp.data[1] == (uint8)110 && disp.data[2] == (uint8)105 && disp.data[3] == (uint8)120) { host_ok = true; }
+  if (!host_ok) { err_str("only local X11 displays (:N or unix:N) are supported"); free(disp.data); return false; }
+  var num: uint8[16];
+  var nlen: int64 = 0;
+  var i: int64 = colon + 1;
+  while (i < disp.len && disp.data[i] >= (uint8)48 && disp.data[i] <= (uint8)57 && nlen < 15) { num[nlen] = disp.data[i]; nlen = nlen + 1; i = i + 1; }
+  free(disp.data);
+  if (nlen == 0) { err_str("cannot parse DISPLAY number"); return false; }
+  var prefix: string = "/tmp/.X11-unix/X";
+  var path: uint8[64];
+  var plen: int64 = (int64)prefix.length;
+  for k: int64 in 0..plen { path[k] = prefix.chars[k]; }
+  for k: int64 in 0..nlen { path[plen + k] = num[k]; }
+  plen = plen + nlen;
+  if (!try_connect(x, &path[0], plen, true)) {
+    if (!try_connect(x, &path[0], plen, false)) {
+      print_err("MythicUI: cannot connect to X server :");
+      syscall(1, 2, &num[0], nlen);
+      print_err("\n");
+      return false;
+    }
+  }
+  var cookie: uint8[16];
+  var have_cookie: bool = find_cookie(&num[0], nlen, &cookie[0]);
+  var req: uint8[48];
+  zero(&req[0], 48);
+  req[0] = (uint8)108;
+  wr16(&req[0], 2, 11);
+  var rlen: int64 = 12;
+  if (have_cookie) {
+    var mname: string = "MIT-MAGIC-COOKIE-1";
+    wr16(&req[0], 6, 18);
+    wr16(&req[0], 8, 16);
+    for k: int64 in 0..18 { req[12 + k] = mname.chars[k]; }
+    for k: int64 in 0..16 { req[32 + k] = cookie[k]; }
+    rlen = 48;
+  }
+  write_all(x, &req[0], rlen);
+  var head: uint8[8];
+  if (!read_exact(x, &head[0], 8)) { err_str("X server closed the connection during setup"); return false; }
+  var extra: int64 = rd16(&head[0], 6) * 4;
+  var s: uint8* = (uint8*)malloc(8 + extra);
+  for k: int64 in 0..8 { s[k] = head[k]; }
+  if (!read_exact(x, &s[8], extra)) { err_str("X server closed the connection during setup"); return false; }
+  x->setup = s;
+  if (head[0] != (uint8)1) {
+    var rl: int64 = rd8(s, 1);
+    print_err("MythicUI: X server refused the connection: ");
+    syscall(1, 2, &s[8], rl);
+    if (!have_cookie) { print_err(" (no MIT-MAGIC-COOKIE-1 found in $XAUTHORITY or ~/.Xauthority)"); }
+    print_err("\n");
+    return false;
+  }
+  x->id_base = rd32(s, 12);
+  x->id_mask = rd32(s, 16);
+  x->max_req = rd16(s, 26);
+  x->min_kc = rd8(s, 34);
+  x->max_kc = rd8(s, 35);
+  if (rd8(s, 30) != 0) { err_str("X server image byte order is MSB-first; unsupported"); return false; }
+  var nformats: int64 = rd8(s, 29);
+  var fo: int64 = 40 + pad4(rd16(s, 24));
+  var off: int64 = fo + nformats * 8;
+  x->root = rd32(s, off);
+  x->visual = rd32(s, off + 32);
+  x->depth = rd8(s, off + 38);
+  var bpp_ok: bool = false;
+  for k: int64 in 0..nformats {
+    if (rd8(s, fo + k * 8) == x->depth && rd8(s, fo + k * 8 + 1) == 32) { bpp_ok = true; }
+  }
+  var vis_ok: bool = false;
+  var ndepths: int64 = rd8(s, off + 39);
+  var d: int64 = off + 40;
+  for k: int64 in 0..ndepths {
+    var dd: int64 = rd8(s, d);
+    var nv: int64 = rd16(s, d + 2);
+    var v: int64 = d + 8;
+    for j: int64 in 0..nv {
+      if (rd32(s, v) == x->visual && dd == x->depth) {
+        vis_ok = rd8(s, v + 4) == 4 && rd32(s, v + 8) == 16711680 && rd32(s, v + 12) == 65280 && rd32(s, v + 16) == 255;
+      }
+      v = v + 24;
+    }
+    d = v;
+  }
+  if (!bpp_ok || !vis_ok || (x->depth != 24 && x->depth != 32)) {
+    err_str("X server default visual is not 24/32-bit TrueColor with 32 bpp pixels; unsupported");
+    return false;
+  }
+  return true;
+}
+
+fn intern_atom(x: MythicX11*, name: string, only_if_exists: bool) -> int64 {
+  var n: int64 = (int64)name.length;
+  var len: int64 = 8 + pad4(n);
+  var r: uint8[96];
+  zero(&r[0], 96);
+  wr8(&r[0], 0, 16);
+  if (only_if_exists) { wr8(&r[0], 1, 1); }
+  wr16(&r[0], 2, len / 4);
+  wr16(&r[0], 4, n);
+  for i: int64 in 0..n { r[8 + i] = name.chars[i]; }
+  var p: uint8* = wait_reply(x, send_req(x, &r[0], len));
+  if (p == 0) { return 0; }
+  var atom: int64 = rd32(p, 8);
+  free(p);
+  return atom;
+}
+
+fn change_property(x: MythicX11*, prop: int64, ptype: int64, format: int64, data: uint8*, nbytes: int64) {
+  change_property_on(x, x->win, prop, ptype, format, data, nbytes);
+}
+
+fn change_property_on(x: MythicX11*, win: int64, prop: int64, ptype: int64, format: int64, data: uint8*, nbytes: int64) {
+  var len: int64 = 24 + pad4(nbytes);
+  var r: uint8* = (uint8*)malloc(len);
+  zero(r, len);
+  wr8(r, 0, 18); wr8(r, 1, 0); wr16(r, 2, len / 4);
+  wr32(r, 4, win); wr32(r, 8, prop); wr32(r, 12, ptype);
+  wr8(r, 16, format);
+  wr32(r, 20, nbytes / (format / 8));
+  for i: int64 in 0..nbytes { r[24 + i] = data[i]; }
+  send_req(x, r, len);
+  free(r);
+}
+
+fn query_extension(x: MythicX11*, name: string, first_event: int64*) -> int64 {
+  var n: int64 = (int64)name.length;
+  var len: int64 = 8 + pad4(n);
+  var r: uint8[64];
+  zero(&r[0], 64);
+  wr8(&r[0], 0, 98); wr16(&r[0], 2, len / 4); wr16(&r[0], 4, n);
+  for i: int64 in 0..n { r[8 + i] = name.chars[i]; }
+  var p: uint8* = wait_reply(x, send_req(x, &r[0], len));
+  if (p == 0) { return 0; }
+  var present: int64 = rd8(p, 8);
+  var major: int64 = rd8(p, 9);
+  *first_event = rd8(p, 10);
+  free(p);
+  if (present == 0) { return 0; }
+  return major;
+}
+
+fn load_keymap(x: MythicX11*) {
+  if (x->keymap != 0) { free(x->keymap); x->keymap = 0; }
+  var r: uint8[8];
+  wr8(&r[0], 0, 101); wr8(&r[0], 1, 0); wr16(&r[0], 2, 2);
+  wr8(&r[0], 4, x->min_kc); wr8(&r[0], 5, x->max_kc - x->min_kc + 1); wr16(&r[0], 6, 0);
+  x->keymap = wait_reply(x, send_req(x, &r[0], 8));
+  x->kspk = 0;
+  if (x->keymap != 0) { x->kspk = rd8(x->keymap, 1); }
+}
+
+fn keysym_at(x: MythicX11*, kc: int64, col: int64) -> int64 {
+  if (x->keymap == 0 || kc < x->min_kc || kc > x->max_kc || col >= x->kspk) { return 0; }
+  return rd32(x->keymap, 32 + ((kc - x->min_kc) * x->kspk + col) * 4);
+}
+
+// Core-protocol group-1 rule: Shift picks column 1 (fallback column 0); Lock uppercases letters.
+fn keycode_to_keysym(x: MythicX11*, kc: int64, state: int64) -> int64 {
+  var ks0: int64 = keysym_at(x, kc, 0);
+  var ks1: int64 = keysym_at(x, kc, 1);
+  if (ks1 == 0) { ks1 = ks0; }
+  var ks: int64 = ks0;
+  if ((state & 1) != 0) { ks = ks1; }
+  if ((state & 2) != 0 && (state & 1) == 0 && ks0 >= 97 && ks0 <= 122) { ks = ks1; }
+  // NumLock (Mod2): keypad keys take column 1 unless Shift is held
+  var kp1: bool = (ks1 >= 0xFF80 && ks1 <= 0xFFBD) || (ks1 >= 0x11000000 && ks1 <= 0x1100FFFF);
+  if ((state & 16) != 0 && kp1) {
+    if ((state & 1) != 0) { ks = ks0; } else { ks = ks1; }
+  }
+  return ks;
+}
+
+// Xft.dpi from the root RESOURCE_MANAGER property; 0 when absent.
+fn read_xft_dpi(x: MythicX11*) -> float32 {
+  var rm: int64 = intern_atom(x, "RESOURCE_MANAGER", true);
+  if (rm == 0) { return 0.0; }
+  var r: uint8[24];
+  wr8(&r[0], 0, 20); wr8(&r[0], 1, 0); wr16(&r[0], 2, 6);
+  wr32(&r[0], 4, x->root); wr32(&r[0], 8, rm); wr32(&r[0], 12, 0);
+  wr32(&r[0], 16, 0); wr32(&r[0], 20, 100000);
+  var p: uint8* = wait_reply(x, send_req(x, &r[0], 24));
+  if (p == 0) { return 0.0; }
+  var n: int64 = rd32(p, 16);
+  var key: string = "Xft.dpi:";
+  var dpi: float32 = 0.0;
+  for i: int64 in 0..n {
+    if (i + 8 > n) { break; }
+    if (i > 0 && p[32 + i - 1] != (uint8)10) { continue; }
+    var ok: bool = true;
+    for j: int64 in 0..8 { if (p[32 + i + j] != key.chars[j]) { ok = false; } }
+    if (!ok) { continue; }
+    var k: int64 = i + 8;
+    while (k < n && (p[32 + k] == (uint8)32 || p[32 + k] == (uint8)9)) { k = k + 1; }
+    var v: float32 = 0.0;
+    while (k < n && p[32 + k] >= (uint8)48 && p[32 + k] <= (uint8)57) { v = v * 10.0 + (float32)((int32)p[32 + k] - 48); k = k + 1; }
+    if (k < n && p[32 + k] == (uint8)46) {
+      k = k + 1;
+      var f: float32 = 0.1;
+      while (k < n && p[32 + k] >= (uint8)48 && p[32 + k] <= (uint8)57) { v = v + f * (float32)((int32)p[32 + k] - 48); f = f * 0.1; k = k + 1; }
+    }
+    dpi = v;
+    break;
+  }
+  free(p);
+  return dpi;
+}
+
+fn parse_float(b: uint8*, n: int64) -> float32 {
+  var v: float32 = 0.0;
+  var k: int64 = 0;
+  while (k < n && b[k] >= (uint8)48 && b[k] <= (uint8)57) { v = v * 10.0 + (float32)((int32)b[k] - 48); k = k + 1; }
+  if (k < n && b[k] == (uint8)46) {
+    k = k + 1;
+    var f: float32 = 0.1;
+    while (k < n && b[k] >= (uint8)48 && b[k] <= (uint8)57) { v = v + f * (float32)((int32)b[k] - 48); f = f * 0.1; k = k + 1; }
+  }
+  return v;
+}
+
+// ---------- events ----------
+fn push_ev(x: MythicX11*, ev: MythicEvent) {
+  var e: MythicEvent = ev;
+  e.time_us = now_mono_us();
+  if (e.kind == MYTHIC_EV_MOUSE_MOVE && x->eq_tail > x->eq_head) {
+    var last: MythicEvent* = &x->eq[(x->eq_tail - 1) % X_EQCAP];
+    if (last->kind == MYTHIC_EV_MOUSE_MOVE) { *last = e; return; }
+  }
+  if (x->eq_tail - x->eq_head >= X_EQCAP) { return; }
+  x->eq[x->eq_tail % X_EQCAP] = e;
+  x->eq_tail = x->eq_tail + 1;
+}
+
+fn mods_of(state: int64) -> int32 {
+  var m: int32 = 0;
+  if ((state & 1) != 0) { m = m | MYTHIC_MOD_SHIFT; }
+  if ((state & 4) != 0) { m = m | MYTHIC_MOD_CTRL; }
+  if ((state & 8) != 0) { m = m | MYTHIC_MOD_ALT; }
+  if ((state & 64) != 0) { m = m | MYTHIC_MOD_SUPER; }
+  return m;
+}
+
+fn key_press(x: MythicX11*, e: uint8*, repeat: bool) {
+  var kc: int64 = rd8(e, 1);
+  var st: int64 = rd16(e, 28);
+  var mods: int32 = mods_of(st);
+  var key: int32 = mythic_x11_keysym_to_key((uint32)keysym_at(x, kc, 0));
+  if (key == 0) { key = mythic_x11_keysym_to_key((uint32)keycode_to_keysym(x, kc, st)); }
+  if (keysym_at(x, kc, 0) == 0xFE20) { mods = mods | MYTHIC_MOD_SHIFT; }   // ISO_Left_Tab = back-tab
+  if (key != 0) {
+    var ev: MythicEvent;
+    ev.kind = MYTHIC_EV_KEY_DOWN; ev.key = key; ev.mods = mods; ev.repeat = repeat;
+    ev.x = (float32)rds16(e, 24); ev.y = (float32)rds16(e, 26);
+    push_ev(x, ev);
+  }
+  if ((mods & (MYTHIC_MOD_CTRL | MYTHIC_MOD_ALT)) != 0) { return; }
+  var cp: uint32 = mythic_x11_keysym_to_ucs((uint32)keycode_to_keysym(x, kc, st));
+  if (cp >= (uint32)32 && cp != (uint32)127) {
+    var tv: MythicEvent;
+    tv.kind = MYTHIC_EV_TEXT; tv.codepoint = cp; tv.mods = mods; tv.repeat = repeat;
+    push_ev(x, tv);
+  }
+}
+
+// Ensures the next raw packet (if any is immediately available) is parked; returns its slot or -1.
+fn peek_next(x: MythicX11*) -> int64 {
+  if (x->rq_head < x->rq_tail) { return (x->rq_head % X_RQCAP) * 32; }
+  if (x->rpos == x->rlen && poll_fd(x, 0) <= 0) { return -1; }
+  var hdr: uint8[32];
+  var p: uint8* = read_packet(x, &hdr[0]);
+  if (p != 0) { free(p); return -1; }
+  if (x->dead) { return -1; }
+  park(x, &hdr[0]);
+  if (x->rq_head < x->rq_tail) { return (x->rq_head % X_RQCAP) * 32; }
+  return -1;
+}
+
+fn translate(x: MythicX11*, e: uint8*) {
+  var code: int64 = rd8(e, 0) & 127;
+  if (code >= 2 && code <= 8) { x->last_time = rd32(e, 4); }
+  if (code == 28) { x->last_time = rd32(e, 12); }
+  switch (code) {
+    case 2: { key_press(x, e, false); }
+    case 3: {
+      // auto-repeat: a release immediately followed by a press of the same key with the same time
+      var slot: int64 = peek_next(x);
+      if (slot >= 0) {
+        var nx: uint8* = &x->rq[slot];
+        if ((rd8(nx, 0) & 127) == 2 && rd8(nx, 1) == rd8(e, 1) && rd32(nx, 4) == rd32(e, 4)) {
+          var tmp: uint8[32];
+          rq_pop(x, &tmp[0]);
+          key_press(x, &tmp[0], true);
+          return;
+        }
+      }
+      var kc: int64 = rd8(e, 1);
+      var st: int64 = rd16(e, 28);
+      var key: int32 = mythic_x11_keysym_to_key((uint32)keysym_at(x, kc, 0));
+      if (key == 0) { key = mythic_x11_keysym_to_key((uint32)keycode_to_keysym(x, kc, st)); }
+      if (key != 0) {
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_KEY_UP; ev.key = key; ev.mods = mods_of(st);
+        push_ev(x, ev);
+      }
+    }
+    case 4: {
+      var b: int64 = rd8(e, 1);
+      var ev: MythicEvent;
+      ev.x = (float32)rds16(e, 24); ev.y = (float32)rds16(e, 26); ev.mods = mods_of(rd16(e, 28));
+      if (b >= 1 && b <= 3) { ev.kind = MYTHIC_EV_MOUSE_DOWN; ev.button = (int32)b; push_ev(x, ev); }
+      else if (b >= 4 && b <= 7) {
+        ev.kind = MYTHIC_EV_WHEEL;
+        if (b == 4) { ev.wheel_y = 1.0; }
+        if (b == 5) { ev.wheel_y = -1.0; }
+        if (b == 6) { ev.wheel_x = -1.0; }
+        if (b == 7) { ev.wheel_x = 1.0; }
+        push_ev(x, ev);
+      }
+    }
+    case 5: {
+      var b: int64 = rd8(e, 1);
+      if (b >= 1 && b <= 3) {
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_MOUSE_UP; ev.button = (int32)b;
+        ev.x = (float32)rds16(e, 24); ev.y = (float32)rds16(e, 26); ev.mods = mods_of(rd16(e, 28));
+        push_ev(x, ev);
+      }
+    }
+    case 6: {
+      var ev: MythicEvent;
+      ev.kind = MYTHIC_EV_MOUSE_MOVE; ev.x = (float32)rds16(e, 24); ev.y = (float32)rds16(e, 26);
+      ev.mods = mods_of(rd16(e, 28));
+      push_ev(x, ev);
+    }
+    case 7: {
+      var ev: MythicEvent;
+      ev.kind = MYTHIC_EV_MOUSE_MOVE; ev.x = (float32)rds16(e, 24); ev.y = (float32)rds16(e, 26);
+      push_ev(x, ev);
+    }
+    case 8: {
+      if (rd8(e, 1) != 2) {         // ignore NotifyInferior
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_MOUSE_LEAVE; ev.x = (float32)rds16(e, 24); ev.y = (float32)rds16(e, 26);
+        push_ev(x, ev);
+      }
+    }
+    case 9: {
+      var detail: int64 = rd8(e, 1);
+      var mode: int64 = rd8(e, 8);
+      if (detail != 0 && detail != 5 && mode != 1 && mode != 2 && !x->focused) {
+        x->focused = true;
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_FOCUS_IN;
+        push_ev(x, ev);
+      }
+    }
+    case 10: {
+      var detail: int64 = rd8(e, 1);
+      var mode: int64 = rd8(e, 8);
+      if (detail != 0 && detail != 5 && mode != 1 && mode != 2 && x->focused) {
+        x->focused = false;
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_FOCUS_OUT;
+        push_ev(x, ev);
+      }
+    }
+    case 12: {
+      if (rd16(e, 16) == 0) {
+        if (!x->gl_active && x->fb_valid && x->fb_w == x->win_w && x->fb_h == x->win_h) { present_rects(x, (MythicRectI*)0, 0); }
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_EXPOSE;
+        push_ev(x, ev);
+      }
+    }
+    case 15: {
+      // VisibilityNotify: 0 Unobscured, 1 PartiallyObscured, 2 FullyObscured (a compositor
+      // redirects windows and they stay Unobscured, so this only throttles where nothing shows)
+      if (rd32(e, 4) == x->win) { x->obscured = rd8(e, 8) == 2; }
+    }
+    case 18: { if (rd32(e, 8) == x->win) { x->mapped = false; } }
+    case 19: { if (rd32(e, 8) == x->win) { x->mapped = true; } }
+    case 22: {
+      if (rd32(e, 4) == x->win) {
+        var nw: int32 = (int32)rd16(e, 20);
+        var nh: int32 = (int32)rd16(e, 22);
+        if (nw != x->win_w || nh != x->win_h) {
+          x->win_w = nw;
+          x->win_h = nh;
+          x->fb_valid = false;
+          var ev: MythicEvent;
+          ev.kind = MYTHIC_EV_RESIZE; ev.width = nw; ev.height = nh;
+          push_ev(x, ev);
+        }
+      }
+    }
+    case 33: {
+      if (rd32(e, 8) == x->a_protocols && rd32(e, 12) == x->a_delete) {
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_CLOSE;
+        push_ev(x, ev);
+      }
+    }
+    case 34: {
+      if (rd8(e, 4) == 1) { load_keymap(x); }
+    }
+    default: { }
+  }
+}
+
+// ---------- framebuffer + present ----------
+fn shm_release(x: MythicX11*) {
+  if (x->shm_addr == 0) { return; }
+  var r: uint8[8];
+  wr8(&r[0], 0, x->shm_major); wr8(&r[0], 1, 2); wr16(&r[0], 2, 2); wr32(&r[0], 4, x->shm_seg); // ShmDetach
+  send_req(x, &r[0], 8);
+  xsync(x);
+  syscall(67, x->shm_addr);      // shmdt
+  x->shm_addr = 0;
+  x->px = (uint32*)0;
+}
+
+fn shm_create(x: MythicX11*, w: int32, h: int32) -> bool {
+  var size: int64 = (int64)w * (int64)h * 4;
+  var shmid: int64 = syscall(29, 0, size, 896);      // shmget(IPC_PRIVATE, size, IPC_CREAT|0600)
+  if (shmid < 0) { return false; }
+  var addr: int64 = syscall(30, shmid, 0, 0);        // shmat
+  if (addr < 0 && addr > -4096) { syscall(31, shmid, 0, 0); return false; }
+  var seg: int64 = new_id(x);
+  var a: uint8[16];
+  wr8(&a[0], 0, x->shm_major); wr8(&a[0], 1, 1); wr16(&a[0], 2, 4);   // ShmAttach
+  wr32(&a[0], 4, seg); wr32(&a[0], 8, shmid); wr32(&a[0], 12, 0);
+  var aseq: int64 = send_req(x, &a[0], 16);
+  x->quiet_seq = aseq;
+  x->err_seq = -1;
+  xsync(x);
+  x->quiet_seq = -1;
+  syscall(31, shmid, 0, 0);                          // IPC_RMID: freed once both sides detach
+  if (x->err_seq == aseq) { syscall(67, addr); return false; }
+  x->shm_seg = seg;
+  x->shm_addr = addr;
+  x->px = (uint32*)addr;
+  return true;
+}
+
+fn wait_shm_completion(x: MythicX11*) {
+  var hdr: uint8[32];
+  while (x->shm_pending && !x->dead) {
+    var p: uint8* = read_packet(x, &hdr[0]);
+    if (p != 0) { free(p); continue; }
+    if (x->dead) { break; }
+    park(x, &hdr[0]);
+  }
+  x->shm_pending = false;
+}
+
+fn x11_framebuffer(self: rawptr) -> MythicFramebuffer {
+  var x: MythicX11* = (MythicX11*)self;
+  if (x->shm_pending) { wait_shm_completion(x); }
+  var w: int32 = x->win_w;
+  var h: int32 = x->win_h;
+  if (w < 1) { w = 1; }
+  if (h < 1) { h = 1; }
+  if (x->px == 0 || x->fb_w != w || x->fb_h != h) {
+    if (x->shm_ok) {
+      shm_release(x);
+      if (!shm_create(x, w, h)) {
+        x->shm_ok = false;
+        err_str("MIT-SHM attach failed; falling back to PutImage");
+      }
+    } else if (x->px != 0) {
+      free(x->px);
+      x->px = (uint32*)0;
+    }
+    if (!x->shm_ok) { x->px = (uint32*)malloc((int64)w * (int64)h * 4); }
+    x->fb_w = w;
+    x->fb_h = h;
+    x->fb_valid = false;
+  }
+  var fb: MythicFramebuffer;
+  fb.px = x->px;
+  fb.w = x->fb_w;
+  fb.h = x->fb_h;
+  fb.stride = x->fb_w;
+  return fb;
+}
+
+fn put_image_rect(x: MythicX11*, rx: int32, ry: int32, rw: int32, rh: int32) {
+  var limit: int64 = x->max_req * 4;
+  if (limit > X_STRIP_BYTES) { limit = X_STRIP_BYTES; }
+  var rows_per: int64 = (limit - 24) / ((int64)rw * 4);
+  if (rows_per < 1) { rows_per = 1; }
+  var y: int64 = (int64)ry;
+  var y1: int64 = (int64)ry + (int64)rh;
+  while (y < y1) {
+    var rows: int64 = rows_per;
+    if (y + rows > y1) { rows = y1 - y; }
+    var nbytes: int64 = (int64)rw * rows * 4;
+    var b: uint8* = x->send;
+    wr8(b, 0, 72); wr8(b, 1, 2); wr16(b, 2, 6 + nbytes / 4);
+    wr32(b, 4, x->win); wr32(b, 8, x->gc);
+    wr16(b, 12, (int64)rw); wr16(b, 14, rows);
+    wr16(b, 16, (int64)rx); wr16(b, 18, y);
+    wr8(b, 20, 0); wr8(b, 21, x->depth); wr16(b, 22, 0);
+    var dst: uint32* = (uint32*)&b[24];
+    for r: int64 in 0..rows {
+      var src: uint32* = x->px + (y + r) * (int64)x->fb_w + (int64)rx;
+      var d: uint32* = dst + r * (int64)rw;
+      for c: int64 in 0..(int64)rw { d[c] = src[c]; }
+    }
+    send_req(x, b, 24 + nbytes);
+    y = y + rows;
+  }
+}
+
+fn shm_put_rect(x: MythicX11*, rx: int32, ry: int32, rw: int32, rh: int32, completion: bool) {
+  var r: uint8[40];
+  wr8(&r[0], 0, x->shm_major); wr8(&r[0], 1, 3); wr16(&r[0], 2, 10);   // ShmPutImage
+  wr32(&r[0], 4, x->win); wr32(&r[0], 8, x->gc);
+  wr16(&r[0], 12, (int64)x->fb_w); wr16(&r[0], 14, (int64)x->fb_h);
+  wr16(&r[0], 16, (int64)rx); wr16(&r[0], 18, (int64)ry);
+  wr16(&r[0], 20, (int64)rw); wr16(&r[0], 22, (int64)rh);
+  wr16(&r[0], 24, (int64)rx); wr16(&r[0], 26, (int64)ry);
+  wr8(&r[0], 28, x->depth); wr8(&r[0], 29, 2);
+  var se: int64 = 0;
+  if (completion) { se = 1; }
+  wr8(&r[0], 30, se); wr8(&r[0], 31, 0);
+  wr32(&r[0], 32, x->shm_seg); wr32(&r[0], 36, 0);
+  send_req(x, &r[0], 40);
+}
+
+fn present_rects(x: MythicX11*, rects: MythicRectI*, n: int32) {
+  if (x->px == 0 || x->dead) { return; }
+  var full: MythicRectI = { x: 0, y: 0, w: x->fb_w, h: x->fb_h };
+  var list: MythicRectI* = rects;
+  var cnt: int32 = n;
+  if (cnt <= 0 || list == 0) { list = &full; cnt = 1; }
+  if (x->shm_pending) { wait_shm_completion(x); }
+  var last: int32 = -1;
+  for i: int32 in 0..cnt {
+    var r: MythicRectI = list[i];
+    if (r.x < 0) { r.w = r.w + r.x; r.x = 0; }
+    if (r.y < 0) { r.h = r.h + r.y; r.y = 0; }
+    if (r.x + r.w > x->fb_w) { r.w = x->fb_w - r.x; }
+    if (r.y + r.h > x->fb_h) { r.h = x->fb_h - r.y; }
+    if (r.w > 0 && r.h > 0) { last = i; }
+  }
+  for i: int32 in 0..cnt {
+    var r: MythicRectI = list[i];
+    if (r.x < 0) { r.w = r.w + r.x; r.x = 0; }
+    if (r.y < 0) { r.h = r.h + r.y; r.y = 0; }
+    if (r.x + r.w > x->fb_w) { r.w = x->fb_w - r.x; }
+    if (r.y + r.h > x->fb_h) { r.h = x->fb_h - r.y; }
+    if (r.w <= 0 || r.h <= 0) { continue; }
+    if (x->shm_ok) { shm_put_rect(x, r.x, r.y, r.w, r.h, i == last); }
+    else { put_image_rect(x, r.x, r.y, r.w, r.h); }
+  }
+  if (x->shm_ok && last >= 0) { x->shm_pending = true; }
+  x->fb_valid = true;
+}
+
+fn x11_present(self: rawptr, rects: MythicRectI*, n: int32) {
+  var x: MythicX11* = (MythicX11*)self;
+  present_rects(x, rects, n);
+}
+
+// ---------- window ----------
+fn set_title_props(x: MythicX11*, s: uint8*, n: int64) {
+  change_property(x, x->a_net_wm_name, x->a_utf8, 8, s, n);
+  // WM_NAME as Latin-1 (non-Latin-1 code points become '?')
+  var l1: uint8* = (uint8*)malloc(n + 1);
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int64 = (int64)s[i];
+    var cp: int64 = c;
+    var len: int64 = 1;
+    if (c >= 0xF0) { len = 4; cp = 63; }
+    else if (c >= 0xE0) { len = 3; cp = 63; }
+    else if (c >= 0xC0 && i + 1 < n) { len = 2; cp = ((c & 31) << 6) | ((int64)s[i + 1] & 63); }
+    else if (c >= 0x80) { cp = 63; }
+    l1[o] = (uint8)cp;
+    o = o + 1;
+    i = i + len;
+  }
+  change_property(x, 39, 31, 8, l1, o);   // WM_NAME, STRING
+  free(l1);
+}
+
+// buffers and the server connection, once (open, or mythic_plat_gl_connect before it)
+fn x11_connect_once(x: MythicX11*) -> bool {
+  if (x->connected != 0) { return x->connected > 0; }
+  x->connected = -1;
+  x->fd = -1;
+  x->quiet_seq = -1;
+  x->rbuf = (uint8*)malloc(X_RBUF);
+  x->rq = (uint8*)malloc(X_RQCAP * 32);
+  x->eq = (MythicEvent*)malloc(sizeof(MythicEvent) * X_EQCAP);
+  x->send = (uint8*)malloc(X_STRIP_BYTES);
+  x->cursor_shape = -1;
+  if (!x_connect(x)) {
+    if (x->fd >= 0) { syscall(3, (int64)x->fd); }
+    x->fd = -1;
+    return false;
+  }
+  x->id_next = 1;
+  x->connected = 1;
+  return true;
+}
+
+fn x11_open(self: rawptr, desc: MythicWindowDesc*) -> int32 {
+  var x: MythicX11* = (MythicX11*)self;
+  if (!x11_connect_once(x)) { return 1; }
+  // scale: MYTHIC_SCALE overrides Xft.dpi / 96; default 1.0
+  var scale: float32 = 1.0;
+  var dpi: float32 = read_xft_dpi(x);
+  if (dpi > 0.0) { scale = dpi / 96.0; }
+  var sv: MythicBytes;
+  if (env_str("MYTHIC_SCALE", &sv)) {
+    var f: float32 = parse_float(sv.data, sv.len);
+    if (f > 0.0) { scale = f; }
+    free(sv.data);
+  }
+  if (scale < 0.5) { scale = 0.5; }
+  if (scale > 8.0) { scale = 8.0; }
+  x->scale = scale;
+  var w: int32 = (int32)((float32)desc->width * scale + 0.5);
+  var h: int32 = (int32)((float32)desc->height * scale + 0.5);
+  if (w < 1) { w = 1; }
+  if (h < 1) { h = 1; }
+  x->win_w = w;
+  x->win_h = h;
+
+  x->a_protocols = intern_atom(x, "WM_PROTOCOLS", false);
+  x->a_delete = intern_atom(x, "WM_DELETE_WINDOW", false);
+  x->a_net_wm_name = intern_atom(x, "_NET_WM_NAME", false);
+  x->a_utf8 = intern_atom(x, "UTF8_STRING", false);
+  x->a_clipboard = intern_atom(x, "CLIPBOARD", false);
+  x->a_targets = intern_atom(x, "TARGETS", false);
+  x->a_text = intern_atom(x, "TEXT", false);
+  x->a_incr = intern_atom(x, "INCR", false);
+  x->a_sel = intern_atom(x, "MYTHIC_SEL", false);
+
+  x->win = new_id(x);
+  var r: uint8[52];
+  zero(&r[0], 52);
+  if (x->gl_visual != 0 && x->gl_visual != x->visual) {
+    // GL wants another visual: the window needs its own colormap and a border pixel
+    var cmap: int64 = new_id(x);
+    var cm: uint8[16];
+    wr8(&cm[0], 0, 78); wr8(&cm[0], 1, 0); wr16(&cm[0], 2, 4);     // CreateColormap, alloc None
+    wr32(&cm[0], 4, cmap); wr32(&cm[0], 8, x->root); wr32(&cm[0], 12, x->gl_visual);
+    send_req(x, &cm[0], 16);
+    x->visual = x->gl_visual;
+    x->depth = x->gl_depth;
+    wr16(&r[0], 2, 13);
+    wr32(&r[0], 28, 1 | 8 | 16 | 2048 | 8192);   // back-pixmap | border-pixel | bit-gravity | event-mask | colormap
+    wr32(&r[0], 32, 0);
+    wr32(&r[0], 36, 0);
+    wr32(&r[0], 40, 1);
+    wr32(&r[0], 44, X_EVENT_MASK);
+    wr32(&r[0], 48, cmap);
+  } else {
+    wr16(&r[0], 2, 11);
+    wr32(&r[0], 28, 1 | 16 | 2048);          // back-pixmap | bit-gravity | event-mask
+    wr32(&r[0], 32, 0);                      // background None
+    wr32(&r[0], 36, 1);                      // NorthWest
+    wr32(&r[0], 40, X_EVENT_MASK);
+  }
+  wr8(&r[0], 0, 1); wr8(&r[0], 1, x->depth);
+  wr32(&r[0], 4, x->win); wr32(&r[0], 8, x->root);
+  wr16(&r[0], 12, 100); wr16(&r[0], 14, 100);
+  wr16(&r[0], 16, (int64)w); wr16(&r[0], 18, (int64)h);
+  wr16(&r[0], 20, 0); wr16(&r[0], 22, 1);
+  wr32(&r[0], 24, x->visual);
+  send_req(x, &r[0], rd16(&r[0], 2) * 4);
+
+  set_title_props(x, desc->title, desc->title_len);
+  var cls: string = "mythic";
+  var cb: uint8[14];
+  for i: int64 in 0..6 { cb[i] = cls.chars[i]; cb[7 + i] = cls.chars[i]; }
+  cb[6] = (uint8)0; cb[13] = (uint8)0;
+  change_property(x, 67, 31, 8, &cb[0], 14);            // WM_CLASS
+  var d: uint8[4];
+  wr32(&d[0], 0, x->a_delete);
+  change_property(x, x->a_protocols, 4, 32, &d[0], 4);  // WM_PROTOCOLS = [WM_DELETE_WINDOW]
+  var hints: uint8[72];
+  zero(&hints[0], 72);
+  var flags: int64 = 16;                                // PMinSize
+  var minw: int64 = (int64)((float32)desc->min_width * scale + 0.5);
+  var minh: int64 = (int64)((float32)desc->min_height * scale + 0.5);
+  if (minw < 1) { minw = 1; }
+  if (minh < 1) { minh = 1; }
+  wr32(&hints[0], 20, minw); wr32(&hints[0], 24, minh);
+  if (!desc->resizable) {
+    flags = flags | 32;                                 // PMaxSize
+    wr32(&hints[0], 20, (int64)w); wr32(&hints[0], 24, (int64)h);
+    wr32(&hints[0], 28, (int64)w); wr32(&hints[0], 32, (int64)h);
+  }
+  wr32(&hints[0], 0, flags);
+  change_property(x, 40, 41, 32, &hints[0], 72);        // WM_NORMAL_HINTS, WM_SIZE_HINTS
+
+  x->gc = new_id(x);
+  var g: uint8[20];
+  wr8(&g[0], 0, 55); wr8(&g[0], 1, 0); wr16(&g[0], 2, 5);
+  wr32(&g[0], 4, x->gc); wr32(&g[0], 8, x->win);
+  wr32(&g[0], 12, 65536); wr32(&g[0], 16, 0);           // graphics-exposures off
+  send_req(x, &g[0], 20);
+
+  var mp: uint8[8];
+  wr8(&mp[0], 0, 8); wr8(&mp[0], 1, 0); wr16(&mp[0], 2, 2); wr32(&mp[0], 4, x->win);
+  send_req(x, &mp[0], 8);                               // MapWindow
+  x->mapped = true;                                     // until an UnmapNotify says otherwise
+  x->obscured = false;
+  load_keymap(x);
+
+  var no_shm: MythicBytes;
+  var force_strips: bool = env_str("MYTHIC_NO_SHM", &no_shm);
+  if (force_strips) { free(no_shm.data); }
+  x->shm_major = 0;
+  if (!force_strips) { x->shm_major = query_extension(x, "MIT-SHM", &x->shm_event); }
+  x->shm_ok = x->shm_major != 0;
+  xsync(x);
+  if (x->dead) { err_str("X connection lost during window setup"); return 1; }
+  x->opened = true;
+
+  x11_set_cursor((rawptr)x, MYTHIC_CURSOR_ARROW);   // left_ptr (None would show the root's cursor)
+  var se: MythicEvent;
+  se.kind = MYTHIC_EV_SCALE; se.scale = scale;
+  push_ev(x, se);
+  var re: MythicEvent;
+  re.kind = MYTHIC_EV_RESIZE; re.width = w; re.height = h;
+  push_ev(x, re);
+  return 0;
+}
+
+fn x11_close(self: rawptr) {
+  var x: MythicX11* = (MythicX11*)self;
+  if (!x->opened) { return; }
+  x->opened = false;
+  if (!x->dead) {
+    if (x->shm_pending) { wait_shm_completion(x); }
+    if (x->shm_ok) { shm_release(x); }
+    var dr: uint8[8];
+    wr8(&dr[0], 0, 4); wr8(&dr[0], 1, 0); wr16(&dr[0], 2, 2); wr32(&dr[0], 4, x->win);
+    send_req(x, &dr[0], 8);
+    xsync(x);
+  }
+  if (!x->shm_ok && x->px != 0) { free(x->px); }
+  x->px = (uint32*)0;
+  if (x->clip != 0) { free(x->clip); }
+  x->clip = (uint8*)0;
+  x->clip_len = 0;
+  x->own_clip = false;
+  x->own_primary = false;
+  if (x->fd >= 0) { syscall(3, (int64)x->fd); }
+  x->fd = -1;
+  x->connected = 0;
+}
+
+fn x11_wait(self: rawptr, timeout_ms: int32) {
+  var x: MythicX11* = (MythicX11*)self;
+  var deadline: int64 = now_mono_us() + (int64)timeout_ms * 1000;
+  var hdr: uint8[32];
+  var drained: int32 = 0;
+  while (true) {
+    while (x->rq_head < x->rq_tail) {
+      rq_pop(x, &hdr[0]);
+      translate(x, &hdr[0]);
+    }
+    if (x->dead || !x->opened) { break; }
+    if (x->eq_tail > x->eq_head) {
+      // Something is queued: also take everything else the server has already sent, so a slow
+      // frame sees the whole backlog (motion coalesces in push_ev, buttons trickle in the ctx)
+      // instead of one event per frame, which let a drag crawl on long after the release.
+      // The queue keeps room for one more packet's events, and a stream that never pauses
+      // cannot hold the loop here: the rest stays in the socket for the next wait.
+      if (x->eq_tail - x->eq_head >= X_EQCAP - 8 || drained >= X_RQCAP) { break; }
+      if (x->rpos == x->rlen && poll_fd(x, 0) <= 0) { break; }
+      drained = drained + 1;
+    } else if (x->rpos == x->rlen) {
+      var remaining: int64 = -1;
+      if (timeout_ms >= 0) {
+        remaining = (deadline - now_mono_us() + 999) / 1000;
+        if (remaining < 0) { remaining = 0; }
+      }
+      var pr: int64 = poll_fd(x, remaining);
+      if (pr == -4) { continue; }
+      if (pr <= 0) { break; }
+    }
+    var p: uint8* = read_packet(x, &hdr[0]);
+    if (p != 0) { free(p); continue; }
+    if (x->dead) { break; }
+    park(x, &hdr[0]);
+  }
+  if (x->dead && x->opened) {
+    // Dead platform (Amendment 13): report once, deliver a CLOSE (repeat = true marks it forced).
+    x->opened = false;
+    x->dead_close_sent = true;
+    err_str("lost connection to X server");
+    var ev: MythicEvent;
+    ev.kind = MYTHIC_EV_CLOSE;
+    ev.repeat = true;
+    push_ev(x, ev);
+  } else if (x->dead_close_sent && x->eq_tail == x->eq_head) {
+    // The app consumed the forced CLOSE and kept running (mythic_cancel_close): there is no display
+    // to draw to and nothing to wait on, so exit instead of spinning.
+    syscall(231, 1);
+  }
+}
+
+fn x11_next_event(self: rawptr, ev: MythicEvent*) -> bool {
+  var x: MythicX11* = (MythicX11*)self;
+  if (x->eq_head == x->eq_tail) { return false; }
+  *ev = x->eq[x->eq_head % X_EQCAP];
+  x->eq_head = x->eq_head + 1;
+  return true;
+}
+
+fn x11_now_us(self: rawptr) -> int64 { return now_mono_us(); }
+
+fn x11_set_title(self: rawptr, s: uint8*, n: int64) {
+  var x: MythicX11* = (MythicX11*)self;
+  if (!x->opened) { return; }
+  set_title_props(x, s, n);
+}
+
+fn cursor_glyph(shape: int32) -> int64 {
+  switch (shape) {
+    case 1: { return 152; }   // xterm
+    case 2: { return 60; }    // hand2
+    case 3: { return 108; }   // sb_h_double_arrow
+    case 4: { return 116; }   // sb_v_double_arrow
+    case 5: { return 52; }    // fleur
+    case 6: { return 0; }     // X_cursor
+    case 7: { return 150; }   // watch
+    default: { return 68; }   // left_ptr
+  }
+  return 68;
+}
+
+fn x11_set_cursor(self: rawptr, cursor: int32) {
+  var x: MythicX11* = (MythicX11*)self;
+  if (!x->opened || x->dead || cursor == x->cursor_shape || cursor < 0 || cursor > 7) { return; }
+  x->cursor_shape = cursor;
+  if (x->cursors[cursor] == 0) {
+    var font: int64 = new_id(x);
+    var name: string = "cursor";
+    var r: uint8[20];
+    zero(&r[0], 20);
+    wr8(&r[0], 0, 45); wr16(&r[0], 2, 5); wr32(&r[0], 4, font); wr16(&r[0], 8, 6);
+    for i: int64 in 0..6 { r[12 + i] = name.chars[i]; }
+    send_req(x, &r[0], 20);                          // OpenFont
+    var id: int64 = new_id(x);
+    var glyph: int64 = cursor_glyph(cursor);
+    var c: uint8[32];
+    zero(&c[0], 32);
+    wr8(&c[0], 0, 94); wr16(&c[0], 2, 8);
+    wr32(&c[0], 4, id); wr32(&c[0], 8, font); wr32(&c[0], 12, font);
+    wr16(&c[0], 16, glyph); wr16(&c[0], 18, glyph + 1);
+    wr16(&c[0], 26, 65535); wr16(&c[0], 28, 65535); wr16(&c[0], 30, 65535);
+    send_req(x, &c[0], 32);                          // CreateGlyphCursor
+    var f: uint8[8];
+    wr8(&f[0], 0, 46); wr8(&f[0], 1, 0); wr16(&f[0], 2, 2); wr32(&f[0], 4, font);
+    send_req(x, &f[0], 8);                           // CloseFont
+    x->cursors[cursor] = id;
+  }
+  var cur: int64 = x->cursors[cursor];
+  var w: uint8[16];
+  wr8(&w[0], 0, 2); wr8(&w[0], 1, 0); wr16(&w[0], 2, 4);
+  wr32(&w[0], 4, x->win); wr32(&w[0], 8, 16384); wr32(&w[0], 12, cur);   // CWCursor
+  send_req(x, &w[0], 16);
+}
+
+// ---------- clipboard (ICCCM selections: CLIPBOARD, and PRIMARY on copy) ----------
+fn set_owner(x: MythicX11*, sel: int64, time: int64) {
+  var r: uint8[16];
+  wr8(&r[0], 0, 22); wr8(&r[0], 1, 0); wr16(&r[0], 2, 4);
+  wr32(&r[0], 4, x->win); wr32(&r[0], 8, sel); wr32(&r[0], 12, time);
+  send_req(x, &r[0], 16);
+}
+
+fn get_owner(x: MythicX11*, sel: int64) -> int64 {
+  var r: uint8[8];
+  wr8(&r[0], 0, 23); wr8(&r[0], 1, 0); wr16(&r[0], 2, 2); wr32(&r[0], 4, sel);
+  var p: uint8* = wait_reply(x, send_req(x, &r[0], 8));
+  if (p == 0) { return 0; }
+  var owner: int64 = rd32(p, 8);
+  free(p);
+  return owner;
+}
+
+fn delete_property(x: MythicX11*, prop: int64) {
+  var r: uint8[12];
+  wr8(&r[0], 0, 19); wr8(&r[0], 1, 0); wr16(&r[0], 2, 3); wr32(&r[0], 4, x->win); wr32(&r[0], 8, prop);
+  send_req(x, &r[0], 12);
+}
+
+fn bytes_append(b: MythicBytes*, cap: int64*, src: uint8*, n: int64) {
+  if (b->len + n + 1 > *cap) {
+    var nc: int64 = *cap * 2;
+    if (nc < b->len + n + 1) { nc = b->len + n + 1; }
+    b->data = (uint8*)realloc((rawptr)b->data, nc);
+    *cap = nc;
+  }
+  for i: int64 in 0..n { b->data[b->len + i] = src[i]; }
+  b->len = b->len + n;
+  b->data[b->len] = (uint8)0;
+}
+
+// Reads a whole property of our window (in 4 MB pieces). Malloc'd, nul-terminated.
+fn read_property(x: MythicX11*, prop: int64, out: MythicBytes*, ptype: int64*) -> bool {
+  var cap: int64 = 64;
+  out->data = (uint8*)malloc(cap);
+  out->data[0] = (uint8)0;
+  out->len = 0;
+  var off: int64 = 0;
+  while (true) {
+    var r: uint8[24];
+    wr8(&r[0], 0, 20); wr8(&r[0], 1, 0); wr16(&r[0], 2, 6);
+    wr32(&r[0], 4, x->win); wr32(&r[0], 8, prop); wr32(&r[0], 12, 0);
+    wr32(&r[0], 16, off); wr32(&r[0], 20, 1048576);
+    var p: uint8* = wait_reply(x, send_req(x, &r[0], 24));
+    if (p == 0) { free(out->data); out->data = (uint8*)0; return false; }
+    *ptype = rd32(p, 8);
+    var n: int64 = rd32(p, 16) * (rd8(p, 1) / 8);
+    bytes_append(out, &cap, &p[32], n);
+    var after: int64 = rd32(p, 12);
+    free(p);
+    if (after == 0 || n == 0) { break; }
+    off = off + n / 4;
+  }
+  return true;
+}
+
+fn latin1_to_utf8(s: uint8*, n: int64, out: MythicBytes*) {
+  var d: uint8* = (uint8*)malloc(n * 2 + 1);
+  var o: int64 = 0;
+  for i: int64 in 0..n { o = o + (int64)mythic_utf8_encode((uint32)s[i], &d[o]); }
+  d[o] = (uint8)0;
+  out->data = d;
+  out->len = o;
+}
+
+// Non-Latin-1 code points become '?'.
+fn utf8_to_latin1(s: uint8*, n: int64, out_len: int64*) -> uint8* {
+  var d: uint8* = (uint8*)malloc(n + 1);
+  var o: int64 = 0;
+  var i: int64 = 0;
+  var cp: uint32 = 0;
+  while (i < n) {
+    i = mythic_utf8_decode(s, n, i, &cp);
+    if (cp > (uint32)255) { cp = 63; }
+    d[o] = (uint8)cp;
+    o = o + 1;
+  }
+  *out_len = o;
+  return d;
+}
+
+// Longest prefix that fits in one ChangeProperty request. We do not send INCR, so larger copies
+// are truncated (at a UTF-8 boundary when `utf8`).
+fn sel_fit(x: MythicX11*, s: uint8*, n: int64, utf8: bool) -> int64 {
+  var lim: int64 = x->max_req * 4 - 24;
+  if (n <= lim) { return n; }
+  var k: int64 = lim;
+  while (utf8 && k > 0 && (s[k] & (uint8)0xC0) == (uint8)0x80) { k = k - 1; }
+  return k;
+}
+
+fn sel_clear(x: MythicX11*, e: uint8*) {
+  if (rd32(e, 8) != x->win) { return; }
+  // a clear stamped before our latest SetSelectionOwner is about an ownership we already replaced
+  if (x->own_time != 0 && rd32(e, 4) < x->own_time) { return; }
+  var sel: int64 = rd32(e, 12);
+  if (sel == x->a_clipboard) { x->own_clip = false; }
+  if (sel == 1) { x->own_primary = false; }
+}
+
+fn sel_request(x: MythicX11*, e: uint8*) {
+  var time: int64 = rd32(e, 4);
+  var requestor: int64 = rd32(e, 12);
+  var sel: int64 = rd32(e, 16);
+  var target: int64 = rd32(e, 20);
+  var prop: int64 = rd32(e, 24);
+  if (prop == 0) { prop = target; }    // obsolete requestors leave the property None
+  var owned: bool = (sel == x->a_clipboard && x->own_clip) || (sel == 1 && x->own_primary);
+  var answer: int64 = 0;
+  if (owned && target == x->a_targets) {
+    var a: uint8[16];
+    wr32(&a[0], 0, x->a_targets); wr32(&a[0], 4, x->a_utf8); wr32(&a[0], 8, 31); wr32(&a[0], 12, x->a_text);
+    change_property_on(x, requestor, prop, 4, 32, &a[0], 16);    // type ATOM
+    answer = prop;
+  } else if (owned && (target == x->a_utf8 || target == x->a_text)) {
+    change_property_on(x, requestor, prop, x->a_utf8, 8, x->clip, sel_fit(x, x->clip, x->clip_len, true));
+    answer = prop;
+  } else if (owned && target == 31) {
+    var ln: int64 = 0;
+    var l1: uint8* = utf8_to_latin1(x->clip, x->clip_len, &ln);
+    change_property_on(x, requestor, prop, 31, 8, l1, sel_fit(x, l1, ln, false));
+    free(l1);
+    answer = prop;
+  }
+  var r: uint8[44];
+  zero(&r[0], 44);
+  wr8(&r[0], 0, 25); wr8(&r[0], 1, 0); wr16(&r[0], 2, 11);    // SendEvent, no propagate, mask 0
+  wr32(&r[0], 4, requestor);
+  wr8(&r[0], 12, 31);                                          // SelectionNotify
+  wr32(&r[0], 16, time); wr32(&r[0], 20, requestor); wr32(&r[0], 24, sel);
+  wr32(&r[0], 28, target); wr32(&r[0], 32, answer);
+  send_req(x, &r[0], 44);
+}
+
+// Handles whatever is already readable without blocking (a pending SelectionClear, say).
+fn pump_pending(x: MythicX11*) {
+  var hdr: uint8[32];
+  while (!x->dead && (x->rpos < x->rlen || poll_fd(x, 0) > 0)) {
+    var p: uint8* = read_packet(x, &hdr[0]);
+    if (p != 0) { free(p); continue; }
+    if (!x->dead) { park(x, &hdr[0]); }
+  }
+}
+
+// Waits for our SelectionNotify for `target` (code 31) or a NewValue on `prop` (code 28).
+// Other events are parked for the normal path; property noise on `prop` is dropped.
+fn wait_sel_event(x: MythicX11*, code: int64, target: int64, prop: int64, timeout_ms: int64, e: uint8*) -> bool {
+  var deadline: int64 = now_mono_us() + timeout_ms * 1000;
+  while (!x->dead) {
+    if (x->rpos == x->rlen) {
+      var rem: int64 = (deadline - now_mono_us() + 999) / 1000;
+      if (rem <= 0) { return false; }
+      var pr: int64 = poll_fd(x, rem);
+      if (pr == -4) { continue; }
+      if (pr <= 0) { return false; }
+    }
+    var p: uint8* = read_packet(x, e);
+    if (p != 0) { free(p); continue; }
+    if (x->dead) { break; }
+    var t: int64 = rd8(e, 0) & 127;
+    if (t == 31 && rd32(e, 8) == x->win && rd32(e, 12) == x->a_clipboard && rd32(e, 16) == target) {
+      if (code == 31) { return true; }
+      continue;
+    }
+    if (t == 28 && rd32(e, 4) == x->win && rd32(e, 8) == prop) {
+      if (code == 28 && rd8(e, 16) == 0) { return true; }
+      continue;
+    }
+    park(x, e);
+  }
+  return false;
+}
+
+// INCR receive: deleting the INCR property asks for the first chunk; each NewValue is a chunk,
+// and a zero-length chunk ends the transfer.
+fn read_incr(x: MythicX11*, prop: int64, out: MythicBytes*, ptype: int64*) -> bool {
+  var cap: int64 = 4096;
+  out->data = (uint8*)malloc(cap);
+  out->data[0] = (uint8)0;
+  out->len = 0;
+  var e: uint8[32];
+  while (true) {
+    var c: MythicBytes;
+    if (!wait_sel_event(x, 28, 0, prop, X_INCR_TIMEOUT_MS, &e[0]) || !read_property(x, prop, &c, ptype)) {
+      free(out->data);
+      out->data = (uint8*)0;
+      return false;
+    }
+    delete_property(x, prop);
+    var n: int64 = c.len;
+    bytes_append(out, &cap, c.data, n);
+    free(c.data);
+    if (n == 0) { break; }
+  }
+  return true;
+}
+
+// 1 = got data, 0 = the owner refused the target (or there is no owner), -1 = timeout or error.
+fn convert_sel(x: MythicX11*, target: int64, out: MythicBytes*) -> int32 {
+  var r: uint8[24];
+  wr8(&r[0], 0, 24); wr8(&r[0], 1, 0); wr16(&r[0], 2, 6);
+  wr32(&r[0], 4, x->win); wr32(&r[0], 8, x->a_clipboard); wr32(&r[0], 12, target);
+  wr32(&r[0], 16, x->a_sel); wr32(&r[0], 20, 0);
+  send_req(x, &r[0], 24);
+  var e: uint8[32];
+  if (!wait_sel_event(x, 31, target, x->a_sel, X_SEL_TIMEOUT_MS, &e[0])) { return -1; }
+  var prop: int64 = rd32(&e[0], 20);
+  if (prop == 0) { return 0; }
+  var b: MythicBytes;
+  var ty: int64 = 0;
+  if (!read_property(x, prop, &b, &ty)) { return -1; }
+  delete_property(x, prop);
+  if (ty == x->a_incr) {
+    free(b.data);
+    if (!read_incr(x, prop, &b, &ty)) { return -1; }
+  }
+  if (ty == 31) {
+    var u: MythicBytes;
+    latin1_to_utf8(b.data, b.len, &u);
+    free(b.data);
+    b = u;
+  }
+  *out = b;
+  return 1;
+}
+
+fn x11_clipboard_set(self: rawptr, s: uint8*, n: int64) {
+  var x: MythicX11* = (MythicX11*)self;
+  if (!x->opened || x->dead) { return; }
+  if (x->clip != 0) { free(x->clip); }
+  x->clip = (uint8*)malloc(n + 1);
+  for i: int64 in 0..n { x->clip[i] = s[i]; }
+  x->clip[n] = (uint8)0;
+  x->clip_len = n;
+  var t: int64 = x->last_time;
+  set_owner(x, x->a_clipboard, t);
+  set_owner(x, 1, t);
+  var c: int64 = get_owner(x, x->a_clipboard);
+  if (c != x->win && t != 0) {
+    // our last input timestamp predates the current owner's: the server ignored us, so use CurrentTime
+    t = 0;
+    set_owner(x, x->a_clipboard, 0);
+    set_owner(x, 1, 0);
+    c = get_owner(x, x->a_clipboard);
+  }
+  x->own_clip = c == x->win;
+  x->own_primary = get_owner(x, 1) == x->win;
+  x->own_time = t;
+}
+
+fn x11_clipboard_get(self: rawptr, out: MythicBytes*) -> bool {
+  var x: MythicX11* = (MythicX11*)self;
+  out->data = (uint8*)0;
+  out->len = 0;
+  if (!x->opened || x->dead) { return false; }
+  pump_pending(x);
+  if (x->own_clip) {
+    if (x->clip_len == 0) { return false; }
+    out->data = (uint8*)malloc(x->clip_len + 1);
+    for i: int64 in 0..x->clip_len + 1 { out->data[i] = x->clip[i]; }
+    out->len = x->clip_len;
+    return true;
+  }
+  var r: int32 = convert_sel(x, x->a_utf8, out);
+  if (r == 0) { r = convert_sel(x, 31, out); }   // owners without UTF8_STRING: Latin-1 STRING
+  if (r == 1 && out->len == 0) { free(out->data); out->data = (uint8*)0; }
+  return r == 1 && out->len > 0;
+}
+fn x11_getenv(self: rawptr, name: uint8*, n: int64, out: MythicBytes*) -> bool { return mythic_x11_getenv(name, n, out); }
+
+export fn mythic_plat_native_create() -> MythicPlatform* {
+  var x: MythicX11* = new MythicX11;
+  x->fd = -1;
+  var p: MythicPlatform* = &x->plat;
+  p->self = (rawptr)x;
+  p->open = &x11_open;
+  p->close = &x11_close;
+  p->wait = &x11_wait;
+  p->next_event = &x11_next_event;
+  p->framebuffer = &x11_framebuffer;
+  p->present = &x11_present;
+  p->now_us = &x11_now_us;
+  p->set_title = &x11_set_title;
+  p->set_cursor = &x11_set_cursor;
+  p->clipboard_set = &x11_clipboard_set;
+  p->clipboard_get = &x11_clipboard_get;
+  p->getenv = &x11_getenv;
+  return p;
+}
+
+/// GL (mythic_app): connect to the X server before Glint's visual probe. Glint's probe is a second
+/// connection; if it were the server's only client, closing it would reset the server (Xvfb, a bare
+/// xinit) and drop our connection while it is being set up. False when `p` is not this platform.
+export fn mythic_plat_gl_connect(p: MythicPlatform*) -> bool {
+  if (p == 0 || p->open != &x11_open) { return false; }
+  return x11_connect_once((MythicX11*)p->self);
+}
+
+/// GL (mythic_app): open the window with this visual and depth (from glint_x11_visual) instead
+/// of the root visual. Call before open. False when `p` is not this platform or there is no visual.
+export fn mythic_plat_gl_prepare(p: MythicPlatform*, visual: int64, depth: int32) -> bool {
+  if (p == 0 || p->open != &x11_open || visual == 0) { return false; }
+  var x: MythicX11* = (MythicX11*)p->self;
+  x->gl_visual = visual;
+  x->gl_depth = (int64)depth;
+  return true;
+}
+
+/// The X11 window id a GL context draws into (0 when `p` is not this platform or not open).
+export fn mythic_plat_gl_handle(p: MythicPlatform*) -> int64 {
+  if (p == 0 || p->open != &x11_open) { return 0; }
+  var x: MythicX11* = (MythicX11*)p->self;
+  if (!x->opened) { return 0; }
+  return x->win;
+}
+
+/// True while nothing of the window can show: unmapped (iconified, another workspace) or fully
+/// covered with no compositor. mythic_app skips drawing and slows timer frames then. False when
+/// `p` is not this platform.
+export fn mythic_plat_hidden(p: MythicPlatform*) -> bool {
+  if (p == 0 || p->open != &x11_open) { return false; }
+  var x: MythicX11* = (MythicX11*)p->self;
+  return x->opened && (!x->mapped || x->obscured);
+}
+
+/// GL (mythic_app): a GL context now draws the window (on), or the CPU renderer again (off).
+/// While on, Expose leaves the window to GL instead of putting the CPU framebuffer, which holds
+/// a frame from before GL started, and that framebuffer is freed.
+export fn mythic_plat_gl_active(p: MythicPlatform*, on: bool) {
+  if (p == 0 || p->open != &x11_open) { return; }
+  var x: MythicX11* = (MythicX11*)p->self;
+  x->gl_active = on;
+  if (!on || x->px == 0) { return; }
+  if (x->shm_pending && !x->dead) { wait_shm_completion(x); }
+  if (x->shm_ok) { if (!x->dead) { shm_release(x); } }
+  else { free(x->px); }
+  x->px = (uint32*)0;
+  x->fb_w = 0;
+  x->fb_h = 0;
+  x->fb_valid = false;
+}
+
+/// The process environment, whatever the platform object (malloc'd, nul-terminated value).
+export fn mythic_plat_env(name: uint8*, n: int64, out: MythicBytes*) -> bool { return mythic_x11_getenv(name, n, out); }

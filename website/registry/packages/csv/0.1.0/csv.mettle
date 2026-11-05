@@ -1,0 +1,20 @@
+// csv: reading and writing CSV for Mettle, in pure Mettle.
+//
+//   import "csv/csv";
+//
+// This file re-exports every module below. All exported names start with
+// csv_, Csv or CSV_.
+//
+//   csv/dialect  CsvDialect and presets: delimiters, quoting, comments...
+//   csv/error    CsvError with byte, line, column, record and field
+//   csv/reader   streaming reader, zero-copy records
+//   csv/writer   writer with correct quoting
+//   csv/num      exact number parsing and shortest float formatting
+//   csv/typed    typed fields and struct rows
+
+import "csv/dialect";
+import "csv/error";
+import "csv/num";
+import "csv/reader";
+import "csv/writer";
+import "csv/typed";

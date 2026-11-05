@@ -1,0 +1,119 @@
+// raize/config — the facade a program imports.
+//
+//     import "framework/config/config";
+//
+// Mettle imports are transitive, so this one line provides types, env and
+// validate plus the startup helpers below:
+//
+//   types.mettle     RzConfig, RzConfigError(s), defaults, accessors, strerror
+//   env.mettle       the exact RAIZE_* overlay and its strict parsing
+//   validate.mettle  the pre-bind checks
+//   config.mettle    load order, set, to_opts (this file)
+//
+// ## Load order (the later wins)
+//
+// For an app run by rz_run (framework/app/run, D2), operators always win:
+//
+//   1. framework defaults       rz_config_default()
+//   2. app defaults             rz_config_apply() per rz_default(app, key, value)
+//   3. environment overlay      rz_config_from_env()      RAIZE_*
+//   4. command line             rz_config_apply("port")   --port N
+//   5. validate, freeze         rz_config_validate(), rz_config_freeze()
+//
+// The older hand-wired order below (rz_config_set after the environment, so
+// program code beats RAIZE_*) remains only for the examples that predate rz_run:
+//
+//   1. defaults                 rz_config_default()
+//   2. environment overlay      rz_config_from_env()      RAIZE_*
+//   3. explicit set             rz_config_set()           program
+//   4. validate                 rz_config_validate()
+//   5. freeze                   rz_config_freeze()        end of startup
+//
+// `rz_config_load_defaults_env` performs steps 1-4 in one call; freezing is
+// deliberately NOT implied, so a caller can still override a value from its
+// own flags before sealing the struct. After freeze, load/set/validate refuse.
+//
+// An app's whole startup is:
+//
+//     var c: RzConfig = rz_config_default();
+//     var errs: RzConfigErrors;
+//     rz_config_errors_reset(&errs);
+//     if (rz_config_load_defaults_env(&c, &errs) != 0) {
+//       rz_config_print_errors(&errs);
+//       return 1;
+//     }
+//     var opts: RzServerOpts = rz_server_opts_default();
+//     rz_config_to_opts(&c, &opts);
+//     rz_config_freeze(&c);
+//
+// ## Immutable afterwards
+//
+// After rz_config_freeze the struct is read-only and no lock is needed on the
+// request path: every component receives the pointer and only reads it.
+
+import "types";
+import "env";
+import "validate";
+import "../server/types";
+
+// The explicit program call (step 3). Wins over the environment because it
+// runs after rz_config_from_env. Returns RZ_CFG_OK, a field code, or
+// RZ_CFG_E_FROZEN / RZ_CFG_E_UNKNOWN_KEY.
+export fn rz_config_set(c: RzConfig*, key: string, value: string) -> int32 {
+  return rz_config_set_e(c, key, value, 0);
+}
+
+// Same, but records the message (naming the key) in `e` when non-null. This is
+// how a misspelling such as "RAISE_PORT" is reported rather than ignored.
+export fn rz_config_set_e(c: RzConfig*, key: string, value: string, e: RzConfigErrors*) -> int32 {
+  if (c == 0) { return RZ_CFG_E_ARGS; }
+  if (c->frozen) {
+    rz_cfg_err_str_pub(e, "config", "frozen after startup; set refused");
+    return RZ_CFG_E_FROZEN;
+  }
+  return rz_config_apply(c, key, key, value, e);
+}
+
+// Small public wrapper so config.mettle does not have to export a private
+// helper from types.mettle just for the frozen message.
+fn rz_cfg_err_str_pub(e: RzConfigErrors*, label: string, reason: string) {
+  if (e == 0) { return; }
+  var i: int32 = rz_cfg_err_new(e, label);
+  rz_cfg_err_add(e, i, label);
+  rz_cfg_err_add(e, i, ": ");
+  rz_cfg_err_add(e, i, reason);
+}
+
+// Steps 1-4 in one call: defaults, then the environment overlay, then
+// validation. Resets `e` first, so the list describes this call only. Freeze
+// is NOT performed; the app calls rz_config_freeze explicitly when startup is
+// done. Returns 0 clean, -1 when at least one error was recorded.
+export fn rz_config_load_defaults_env(c: RzConfig*, e: RzConfigErrors*) -> int32 {
+  if (c == 0) { return RZ_CFG_E_ARGS; }
+  if (c->frozen) { return RZ_CFG_E_FROZEN; }
+  rz_config_errors_reset(e);
+
+  var d: RzConfig = rz_config_default();
+  *c = d;
+
+  var erc: int32 = rz_config_from_env(c, e);
+  var vrc: int32 = rz_config_validate(c, e);
+  if (erc != 0 || vrc != 0) { return -1; }
+  return 0;
+}
+
+// Fills every field of the server options from the config. Nothing is left
+// unset: port, workers, read_timeout_ms, keepalive_max, buf_cap and backlog
+// are all assigned. `backlog` has no config field, so it takes the documented
+// default (64); it is still assigned so a caller cannot inherit garbage.
+// `bind` is not part of RzServerOpts (the listener is INADDR_ANY today).
+export fn rz_config_to_opts(c: RzConfig*, opts: RzServerOpts*) -> int32 {
+  if (c == 0 || opts == 0) { return RZ_CFG_E_ARGS; }
+  opts->port = c->port;
+  opts->workers = c->workers;
+  opts->read_timeout_ms = c->read_timeout_ms;
+  opts->keepalive_max = c->keepalive_max;
+  opts->buf_cap = rz_config_buf_cap(c);
+  opts->backlog = RZ_CFG_DEFAULT_BACKLOG;
+  return RZ_CFG_OK;
+}

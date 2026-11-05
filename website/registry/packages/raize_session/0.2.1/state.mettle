@@ -1,0 +1,147 @@
+// raize_session/state — the settings rz_use_session publishes and the per-request
+// state its middleware keeps behind ctx->session.
+// reference: sessions
+// thread: the settings are written once by rz_use_session / rz_csrf_exempt in the
+// declaration function (main thread, before any worker, hub or timer thread starts)
+// and only read afterwards, so no lock is needed. A request's state is allocated,
+// used and freed by the one worker serving it. The SesStore behind the manager is
+// called from every worker, the hub thread and the timer thread: it must lock.
+
+import "std/mem";
+import "ses/session";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/arena";
+import "raize_core/context/header";
+import "raize_core/context/response";
+import "raize_core/context/context";
+import "raize_core/context/date";
+
+/// internal: raize_session. Most rz_csrf_exempt prefixes.
+export const RZ__SES_MAX_EXEMPT: int32 = 8;
+
+/// internal: raize_session. The subject an anonymous session is created with;
+/// rz_session_login replaces it with the user (ses_set_subject).
+export const RZ__SES_SUBJECT: string = "raize";
+
+/// internal: raize_session. The published settings (one app per process).
+export struct Rz_SesGlobal {
+  m: SesManager;          // checked copy of the policy and a random signing key
+  cookie: string;         // cookie name; owned
+  secure: bool;           // Secure attribute
+  same_site: int32;       // SES_SAMESITE_*
+  exempt: string[8];      // RZ__SES_MAX_EXEMPT CSRF-exempt prefixes; owned
+  nexempt: int32;         // prefixes recorded
+}
+
+/// internal: raize_session. One request's session, behind ctx->session.
+export struct Rz_SesReq {
+  s: SesSession;          // live when the cookie named a session or one was created
+  tok: SesToken;          // the new token to send when set_cookie
+  now: int64;             // unix seconds when the request started
+  set_cookie: bool;       // the token changed (create, rotate): send it
+  clear: bool;            // send a clearing cookie (logout, stale cookie)
+  taken: int32;           // bit i: flash message i was taken by rz_flash_take
+}
+
+var g_rz_ses: Rz_SesGlobal* = 0;
+
+/// internal: raize_session. The published settings, or 0 before rz_use_session.
+/// in:      nothing
+/// returns: the settings
+/// owns:    nothing; they live for the process
+export fn rz__ses_global() -> Rz_SesGlobal* {
+  return g_rz_ses;
+}
+
+/// internal: raize_session/use. Publishes the settings (declaration function only).
+/// in:      g the settings, or 0 to unpublish
+/// returns: nothing
+/// owns:    takes `g`
+export fn rz__ses_publish(g: Rz_SesGlobal*) {
+  g_rz_ses = g;
+}
+
+/// internal: raize_session. The request's state, or 0 outside the session middleware.
+/// in:      ctx the request
+/// returns: the state
+/// owns:    nothing; the middleware frees it after the response is built
+export fn rz__ses_req(ctx: RzContext*) -> Rz_SesReq* {
+  if (ctx == 0 || g_rz_ses == 0) { return 0; }
+  return (Rz_SesReq*)ctx->session;
+}
+
+/// internal: raize_session. The request's state with a live session, creating one
+/// (and queuing its cookie) when the request has none.
+/// in:      ctx the request
+/// returns: the state, or 0 outside the middleware or when the store refused
+/// owns:    nothing
+export fn rz__ses_ensure(ctx: RzContext*) -> Rz_SesReq* {
+  var r: Rz_SesReq* = rz__ses_req(ctx);
+  if (r == 0) { return 0; }
+  if (ses_is_live(&r->s)) { return r; }
+  if (ses_create(&g_rz_ses->m, RZ__SES_SUBJECT, r->now, &r->tok, &r->s) != SES_OK) { return 0; }
+  r->set_cookie = true;
+  r->clear = false;
+  r->taken = 0;
+  return r;
+}
+
+/// internal: raize_session. Maps a SES_* status to an RZ_* one.
+/// in:      rc a session status
+/// returns: RZ_OK, RZ_E_INVALID (bad argument or limit), RZ_E_NOT_FOUND, RZ_E_FULL
+///          (store full) or RZ_E_IO (store or crypto failure)
+/// owns:    nothing
+export fn rz__ses_status(rc: int32) -> int32 {
+  if (rc == SES_OK) { return RZ_OK; }
+  if (rc == SES_E_NOT_FOUND || rc == SES_E_EXPIRED || rc == SES_E_REVOKED) { return RZ_E_NOT_FOUND; }
+  if (rc == SES_E_LIMIT) { return RZ_E_INVALID; }
+  if (rc == SES_E_ARG || rc == SES_E_INVALID || rc == SES_E_SPACE) { return RZ_E_INVALID; }
+  return RZ_E_IO;
+}
+
+// Adds one Set-Cookie line, copied into the request arena.
+fn rz__ses_add_line(ctx: RzContext*, line: string) -> int32 {
+  var resp: RzResponse* = ctx->resp;
+  if (resp == 0) { return RZ_E_USAGE; }
+  if (resp->header_count >= RZ_MAX_RESP_HEADERS) { return RZ_E_FULL; }
+  var v: string = rz_arena_str(ctx->arena, line);
+  if (v.chars == 0) { return RZ_E_NOMEM; }
+  var at: int32 = resp->header_count;
+  resp->headers[at].name = "Set-Cookie";
+  resp->headers[at].value = v;
+  resp->header_count = at + 1;
+  return RZ_OK;
+}
+
+/// internal: raize_session/use. Writes the session cookie (or its clearing line) on
+/// the response, with the published attributes and ses_cookie_format's rules.
+/// in:      ctx the request; r its state; clear true for the clearing line
+/// returns: RZ_OK, or RZ_E_FULL / RZ_E_INVALID / RZ_E_NOMEM (no cookie set)
+/// owns:    nothing kept
+export fn rz__ses_write_cookie(ctx: RzContext*, r: Rz_SesReq*, clear: bool) -> int32 {
+  var g: Rz_SesGlobal* = g_rz_ses;
+  var o: SesCookieOpts;
+  ses_cookie_defaults(&o);
+  o.secure = g->secure;
+  o.same_site = g->same_site;
+  var b: uint8[512];
+  var n: int64 = 0;
+  var rc: int32 = SES_OK;
+  if (clear) {
+    rc = ses_cookie_clear(&b[0], 512, &n, g->cookie, &o);
+  } else {
+    o.max_age = ses_max_age(&g->m, &r->s, r->now);
+    rc = ses_cookie_format(&b[0], 512, &n, g->cookie, ses_token_str(&r->tok), &o);
+  }
+  if (rc != SES_OK) { return rz__ses_status(rc); }
+  return rz__ses_add_line(ctx, rz_str_view(&b[0], n));
+}
+
+/// internal: raize_session. The current unix time (the session library takes `now`).
+/// in:      nothing
+/// returns: unix seconds
+/// owns:    nothing
+export fn rz__ses_now() -> int64 {
+  return rz_time_epoch();
+}

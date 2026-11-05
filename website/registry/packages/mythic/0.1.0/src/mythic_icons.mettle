@@ -1,0 +1,153 @@
+// mythic_icons: built-in stroke icons on the 16x16 geometry of DESIGN-SYSTEM §7.1, drawn with
+// PATH_STROKE / PATH_FILL (stroke 1.5, round caps and joins; the check and dash use stroke 2).
+import "mythic_base";
+import "mythic_types";
+import "mythic_ctx";
+import "mythic_paint";
+import "mythic_layout";
+
+export const MYTHIC_ICON_NONE: int32 = 0;
+export const MYTHIC_ICON_CHECK: int32 = 1;
+export const MYTHIC_ICON_INDETERMINATE: int32 = 2;
+export const MYTHIC_ICON_CHEVRON_DOWN: int32 = 3;
+export const MYTHIC_ICON_CHEVRON_UP: int32 = 4;
+export const MYTHIC_ICON_CHEVRON_LEFT: int32 = 5;
+export const MYTHIC_ICON_CHEVRON_RIGHT: int32 = 6;
+export const MYTHIC_ICON_CLOSE: int32 = 7;
+export const MYTHIC_ICON_PLUS: int32 = 8;
+export const MYTHIC_ICON_MINUS: int32 = 9;
+export const MYTHIC_ICON_SEARCH: int32 = 10;
+export const MYTHIC_ICON_INFO: int32 = 11;
+export const MYTHIC_ICON_WARNING: int32 = 12;
+export const MYTHIC_ICON_ARROW_RIGHT: int32 = 13;
+export const MYTHIC_ICON_MENU: int32 = 14;
+export const MYTHIC_ICON_COUNT: int32 = 15;
+
+/// Path length of the checkbox check in the 16-box (DESIGN-SYSTEM §7.1).
+export const MYTHIC_ICON_CHECK_LEN: float32 = 11.86;
+
+// a polyline in icon space being mapped into the destination rect
+struct IconPen { p: MythicPainter*; ox: float32; oy: float32; k: float32; color: uint32; width: float32; pts: MythicVec2[40]; n: int32; }
+
+fn pt(g: IconPen*, x: float32, y: float32) {
+  if (g->n >= 40) { return; }
+  g->pts[g->n].x = g->ox + x * g->k;
+  g->pts[g->n].y = g->oy + y * g->k;
+  g->n = g->n + 1;
+}
+
+fn stroke(g: IconPen*, closed: bool, draw_len: float32) {
+  if (g->n >= 2) { mythic_paint_path_stroke(g->p, &g->pts[0], g->n, g->width * g->k, g->color, closed, draw_len); }
+  g->n = 0;
+}
+
+fn line(g: IconPen*, x0: float32, y0: float32, x1: float32, y1: float32) {
+  pt(g, x0, y0); pt(g, x1, y1); stroke(g, false, 0.0);
+}
+
+fn circle(g: IconPen*, cx: float32, cy: float32, r: float32) {
+  var segs: int32 = 32;
+  for i: int32 in 0..segs {
+    var a: float32 = (float32)i * 6.2831853 / (float32)segs;
+    pt(g, cx + r * mythic_cosf(a), cy + r * mythic_sinf(a));
+  }
+  stroke(g, true, 0.0);
+}
+
+fn dot(g: IconPen*, cx: float32, cy: float32, r: float32) {
+  var segs: int32 = 16;
+  for i: int32 in 0..segs {
+    var a: float32 = (float32)i * 6.2831853 / (float32)segs;
+    pt(g, cx + r * mythic_cosf(a), cy + r * mythic_sinf(a));
+  }
+  if (g->n >= 3) { mythic_paint_path_fill(g->p, &g->pts[0], g->n, g->color); }
+  g->n = 0;
+}
+
+// chevron (4,6)->(8,10)->(12,6) rotated about (8,8) by `quarter` quarter turns
+fn chevron(g: IconPen*, quarter: int32) {
+  var xs: float32[3] = [4.0, 8.0, 12.0];
+  var ys: float32[3] = [6.0, 10.0, 6.0];
+  for i: int32 in 0..3 {
+    var dx: float32 = xs[i] - 8.0;
+    var dy: float32 = ys[i] - 8.0;
+    var q: int32 = quarter;
+    while (q > 0) { var t: float32 = dx; dx = -dy; dy = t; q = q - 1; }
+    pt(g, 8.0 + dx, 8.0 + dy);
+  }
+  stroke(g, false, 0.0);
+}
+
+/// Paints `icon` scaled into `r` (logical px; the 16-box maps onto r.w). `draw` in [0,1] draws
+/// the check / dash on (1 = complete; used by the checkbox draw-on animation).
+export fn mythic_paint_icon(p: MythicPainter*, icon: int32, r: MythicRect, color: uint32, draw: float32) {
+  if (draw <= 0.0 || icon <= 0 || icon >= MYTHIC_ICON_COUNT) { return; }
+  var g: IconPen;
+  g.p = p; g.ox = r.x; g.oy = r.y; g.k = r.w / 16.0; g.color = color; g.width = 1.5; g.n = 0;
+  var dl: float32 = 0.0;
+  if (icon == MYTHIC_ICON_CHECK) {
+    g.width = 2.0;
+    if (draw < 1.0) { dl = MYTHIC_ICON_CHECK_LEN * g.k * draw; }
+    pt(&g, 4.0, 8.5); pt(&g, 6.75, 11.25); pt(&g, 12.0, 5.25);
+    stroke(&g, false, dl);
+  } else if (icon == MYTHIC_ICON_INDETERMINATE) {
+    g.width = 2.0;
+    if (draw < 1.0) { dl = 7.0 * g.k * draw; }
+    pt(&g, 4.5, 8.0); pt(&g, 11.5, 8.0);
+    stroke(&g, false, dl);
+  } else if (icon == MYTHIC_ICON_CHEVRON_DOWN) { chevron(&g, 0); }
+  else if (icon == MYTHIC_ICON_CHEVRON_LEFT) { chevron(&g, 1); }
+  else if (icon == MYTHIC_ICON_CHEVRON_UP) { chevron(&g, 2); }
+  else if (icon == MYTHIC_ICON_CHEVRON_RIGHT) { chevron(&g, 3); }
+  else if (icon == MYTHIC_ICON_CLOSE) {
+    line(&g, 4.5, 4.5, 11.5, 11.5);
+    line(&g, 11.5, 4.5, 4.5, 11.5);
+  } else if (icon == MYTHIC_ICON_PLUS) {
+    line(&g, 8.0, 3.5, 8.0, 12.5);
+    line(&g, 3.5, 8.0, 12.5, 8.0);
+  } else if (icon == MYTHIC_ICON_MINUS) {
+    line(&g, 3.5, 8.0, 12.5, 8.0);
+  } else if (icon == MYTHIC_ICON_SEARCH) {
+    circle(&g, 7.0, 7.0, 4.25);
+    line(&g, 10.25, 10.25, 13.0, 13.0);
+  } else if (icon == MYTHIC_ICON_INFO) {
+    circle(&g, 8.0, 8.0, 6.25);
+    line(&g, 8.0, 7.25, 8.0, 11.0);
+    dot(&g, 8.0, 5.25, 0.9);
+  } else if (icon == MYTHIC_ICON_WARNING) {
+    pt(&g, 8.0, 2.5); pt(&g, 14.0, 13.0); pt(&g, 2.0, 13.0);
+    stroke(&g, true, 0.0);
+    line(&g, 8.0, 6.5, 8.0, 9.25);
+    dot(&g, 8.0, 11.25, 0.9);
+  } else if (icon == MYTHIC_ICON_ARROW_RIGHT) {
+    line(&g, 3.5, 8.0, 12.5, 8.0);
+    pt(&g, 8.5, 4.0); pt(&g, 12.5, 8.0); pt(&g, 8.5, 12.0);
+    stroke(&g, false, 0.0);
+  } else if (icon == MYTHIC_ICON_MENU) {
+    line(&g, 3.0, 4.5, 13.0, 4.5);
+    line(&g, 3.0, 8.0, 13.0, 8.0);
+    line(&g, 3.0, 11.5, 13.0, 11.5);
+  }
+}
+
+struct IconPaint { icon: int32; color: uint32; }
+
+fn icon_node_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: IconPaint* = (IconPaint*)data;
+  mythic_paint_icon(p, d->icon, r, d->color, 1.0);
+}
+
+/// An icon leaf of `size` x `size` logical px (0 = 16) in `color` (0 = text.secondary, or
+/// text.disabled inside a disabled scope).
+export fn mythic_icon(ui: MythicUi*, icon: int32, size: float32, color: uint32) {
+  var s: float32 = size;
+  if (s <= 0.0) { s = 16.0; }
+  var d: IconPaint* = (IconPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(IconPaint));
+  d->icon = icon;
+  d->color = color;
+  if (color == 0) { d->color = mythic_theme(ui)->colors.text_secondary; }
+  var n: MythicNode* = mythic_ctx_node_add(ui, MYTHIC_NODE_SPACER);
+  n->box.width = mythic_fixed(s);
+  n->box.height = mythic_fixed(s);
+  mythic_node_paint(ui, &icon_node_paint, (rawptr)d);
+}

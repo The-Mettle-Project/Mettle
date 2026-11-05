@@ -1,0 +1,273 @@
+//! Per-series style setters: name, colour, width, dash, marker, smoothing and fill, and the
+//! name getter. Same rules as the chart setters: one field each, strings copied, the first
+//! failure recorded as the sticky error, seq moved only by a real change. Uses chart/chart
+//! and core.
+
+import "std/conv";
+import "mistplot/core/error";
+import "mistplot/core/str";
+import "mistplot/core/color";
+import "mistplot/scene/scene";
+import "mistplot/chart/chart";
+
+// The series, or 0 after recording MP_ERR_ARG; call with the chart entered.
+fn ser_get(c: MpChart*, s: int32) -> MpSeriesData* {
+  if (s < 0 || s >= c->n_series) {
+    mp_chart_fail(c, MP_ERR_ARG);
+    return 0;
+  }
+  return &c->series[(int64)s];
+}
+
+/// Renames series s (its legend label).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param name The name. Valid: up to MP_MAX_TEXT bytes of UTF-8; "" draws no label.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or s is out of range; nothing changes.
+/// @error MP_ERR_LIMIT name is longer than MP_MAX_TEXT; nothing changes.
+/// @error MP_ERR_ALLOC the copy failed; the old name stays.
+/// @mem name is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_series_set_name(c: MpChart*, s: int32, name: string) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  var d: MpSeriesData* = ser_get(c, s);
+  if (d != 0) {
+    rc = MP_OK;
+    if ((int64)name.length > MP_MAX_TEXT) {
+      rc = MP_ERR_LIMIT;
+    } else if (d->name != name) {
+      rc = mp_str_assign(&d->name, name);
+      if (rc == MP_OK) { mp_chart_touch(c); }
+    }
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Copies the name of series s into out, so a host can read it without touching the chart.
+/// A name longer than cap is cut at a code point boundary.
+///
+/// @param c The chart. Valid: non-zero; 0 gives "".
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1; others give "".
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable; 0 gives "".
+/// @param cap Size of out. Units: bytes. Valid: > 0; MP_MAX_TEXT always fits the name.
+/// @return A view of the copied bytes in out ("" for a series without a name), or "" for a
+///   bad chart, index or buffer. Not NUL-terminated.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it. The
+///   chart keeps its own copy of the name.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(name length).
+export fn mp_series_name(c: MpChart*, s: int32, out: uint8*, cap: int64) -> string {
+  if (c == 0 || out == 0 || cap <= 0) { return ""; }
+  mp_chart_enter(c);
+  var n: int64 = 0;
+  if (s >= 0 && s < c->n_series) {
+    var name: string = c->series[(int64)s].name;
+    n = (int64)name.length;
+    if (n > cap) {
+      n = cap;
+      // Back off over continuation bytes so the cut keeps whole code points.
+      while (n > 0 && ((int32)name.chars[n] & 0xC0) == 0x80) { n = n - 1; }
+    }
+    var i: int64 = 0;
+    while (i < n) {
+      out[i] = name.chars[i];
+      i = i + 1;
+    }
+  }
+  mp_chart_leave(c);
+  if (n == 0) { return ""; }
+  return str_from_bytes((cstring)out, n);
+}
+
+/// Sets the colour of series s; alpha 0 returns it to the theme palette.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param color The colour. Valid: any; alpha below 255 draws translucent.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or s is out of range; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_series_set_color(c: MpChart*, s: int32, color: MpColor) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  var d: MpSeriesData* = ser_get(c, s);
+  if (d != 0) {
+    rc = MP_OK;
+    var col: MpColor = color;
+    if (col.a == 0) { col = mp_rgba(0, 0, 0, 0); }
+    if (!mp_color_eq(d->color, col)) {
+      d->color = col;
+      mp_chart_touch(c);
+    }
+  }
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Sets the line width of series s (default 2).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param px Width. Units: logical px. Valid: 0.25 .. 32.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0, s is out of range or px is out of range; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_series_set_width(c: MpChart*, s: int32, px: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  var d: MpSeriesData* = ser_get(c, s);
+  if (d != 0) {
+    if (px >= 0.25 && px <= 32.0) {
+      rc = MP_OK;
+      if (d->width != px) {
+        d->width = px;
+        mp_chart_touch(c);
+      }
+    }
+    mp_chart_fail(c, rc);
+  }
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Sets the dash pattern of series s (terminals draw every pattern solid).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param dash MP_DASH_SOLID, MP_DASH_DASHED or MP_DASH_DOTTED. Valid: 0 .. 2.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0, s is out of range or dash is unknown; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_series_set_dash(c: MpChart*, s: int32, dash: int32) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  var d: MpSeriesData* = ser_get(c, s);
+  if (d != 0) {
+    if (dash >= MP_DASH_SOLID && dash <= MP_DASH_DOTTED) {
+      rc = MP_OK;
+      if (d->dash != dash) {
+        d->dash = dash;
+        mp_chart_touch(c);
+      }
+    }
+    mp_chart_fail(c, rc);
+  }
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Sets the marker of series s: drawn at every point of a scatter series, and at the points
+/// of a line or area series while they are at least 3 px apart on average.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param shape MP_MARK_NONE, CIRCLE, SQUARE or DIAMOND. Valid: 0 .. 3 (scatter treats NONE
+///   as CIRCLE).
+/// @param radius Half the marker box. Units: logical px. Valid: 0.5 .. 32.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0, s, shape or radius is out of range; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_series_set_marker(c: MpChart*, s: int32, shape: int32, radius: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  var d: MpSeriesData* = ser_get(c, s);
+  if (d != 0) {
+    if (shape >= MP_MARK_NONE && shape <= MP_MARK_DIAMOND && radius >= 0.5 &&
+        radius <= 32.0) {
+      rc = MP_OK;
+      if (d->marker != shape || d->marker_r != radius) {
+        d->marker = shape;
+        d->marker_r = radius;
+        mp_chart_touch(c);
+      }
+    }
+    mp_chart_fail(c, rc);
+  }
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Turns monotone cubic smoothing on or off for a line or area series. It applies only
+/// while the visible samples are at most one per 3 px of plot width.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param on Smooth. Valid: any.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or s is out of range; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_series_set_smooth(c: MpChart*, s: int32, on: bool) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  var d: MpSeriesData* = ser_get(c, s);
+  var v: bool = on != false;
+  if (d != 0) {
+    rc = MP_OK;
+    if (d->smooth != v) {
+      d->smooth = v;
+      mp_chart_touch(c);
+    }
+  }
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Turns the gradient fill under a line or area series on or off (MP_AREA starts on).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param on Fill. Valid: any.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or s is out of range; nothing changes.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_series_set_fill(c: MpChart*, s: int32, on: bool) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  var d: MpSeriesData* = ser_get(c, s);
+  var v: bool = on != false;
+  if (d != 0) {
+    rc = MP_OK;
+    if (d->fill != v) {
+      d->fill = v;
+      mp_chart_touch(c);
+    }
+  }
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// The colour series s is drawn in: its own colour, or the theme palette's.
+///
+/// @param c The chart. Valid: non-zero; 0 gives transparent black.
+/// @param s Series index. Valid: any; an index without a series gives its palette colour.
+/// @return The effective colour.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_series_color(c: MpChart*, s: int32) -> MpColor {
+  if (c == 0) { return mp_rgba(0, 0, 0, 0); }
+  mp_chart_enter(c);
+  var col: MpColor = mp_theme_series(&c->theme, s);
+  if (s >= 0 && s < c->n_series && c->series[(int64)s].color.a != 0) {
+    col = c->series[(int64)s].color;
+  }
+  mp_chart_leave(c);
+  return col;
+}

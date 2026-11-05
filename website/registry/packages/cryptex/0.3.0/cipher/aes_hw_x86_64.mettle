@@ -1,0 +1,1091 @@
+// AES-128-GCM and AES-256-GCM on x86-64 with AES-NI and PCLMULQDQ, chosen at
+// run time (crx_aes_hw_available). The constant-time portable code in
+// aes.mettle and ghash.mettle stays the fallback. Every function here is
+// ported from BearSSL (aes_x86ni.c key schedule and block encryption,
+// aes_x86ni_ctr.c four-block CTR, ghash_pclmul.c Karatsuba GHASH with a
+// four-block aggregated reduction); the C intrinsics are written as inline
+// assembly. The Mettle assembler does not know the AES, PCLMULQDQ, PSHUFB,
+// PSHUFD, shift and unpack opcodes, so those are `db` bytes taken from GNU as,
+// with the instruction beside each line. There is no table lookup and no
+// branch or address that depends on key or data, so these paths are constant
+// time. Internal: the public entry points are cr_aes_gcm_* in gcm.mettle.
+//
+// Ported from BearSSL, Copyright (c) 2016 Thomas Pornin, MIT license; see
+// NOTICE.
+
+/// internal: 1 if this CPU has AES-NI, PCLMULQDQ and SSSE3 (CPUID leaf 1,
+/// ECX bits 25, 1 and 9), else 0.
+@naked export fn crx_aes_hw_available() -> uint32 {
+  asm {
+    push rbx
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    and ecx, 0x02000202
+    cmp ecx, 0x02000202
+    sete al
+    movzx eax, al
+    pop rbx
+    ret
+  }
+}
+
+/// internal: AES key schedule with AES-NI (encryption direction). Writes
+/// 16 * (rounds + 1) bytes of round keys.
+/// in: rk writable for 240 bytes; key readable for keylen bytes; keylen 16
+///   or 32
+/// returns: the number of rounds, 10 or 14; 0 for any other keylen (rk is
+///   then untouched)
+@naked export fn crx_aes_hw_expand(rk: uint8*, key: uint8*, keylen: int64) -> uint32 {
+  asm {
+    cmp rdx, 16
+    je k128
+    cmp rdx, 32
+    je k256
+    xor eax, eax
+    ret
+  k128:
+    movdqu xmm0, [rsi]
+    movdqu [rdi], xmm0
+    ; round key 1
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x01   ; aeskeygenassist xmm1, xmm0, 0x01
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+16], xmm0
+    ; round key 2
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x02   ; aeskeygenassist xmm1, xmm0, 0x02
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+32], xmm0
+    ; round key 3
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x04   ; aeskeygenassist xmm1, xmm0, 0x04
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+48], xmm0
+    ; round key 4
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x08   ; aeskeygenassist xmm1, xmm0, 0x08
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+64], xmm0
+    ; round key 5
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x10   ; aeskeygenassist xmm1, xmm0, 0x10
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+80], xmm0
+    ; round key 6
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x20   ; aeskeygenassist xmm1, xmm0, 0x20
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+96], xmm0
+    ; round key 7
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x40   ; aeskeygenassist xmm1, xmm0, 0x40
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+112], xmm0
+    ; round key 8
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x80   ; aeskeygenassist xmm1, xmm0, 0x80
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+128], xmm0
+    ; round key 9
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x1b   ; aeskeygenassist xmm1, xmm0, 0x1b
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+144], xmm0
+    ; round key 10
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xc8, 0x36   ; aeskeygenassist xmm1, xmm0, 0x36
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    movdqa xmm2, xmm0
+    db 0x66, 0x0f, 0x73, 0xfa, 0x04   ; pslldq xmm2, 4
+    pxor xmm0, xmm2
+    db 0x66, 0x0f, 0x70, 0xc9, 0xff   ; pshufd xmm1, xmm1, 0xff
+    pxor xmm0, xmm1
+    movdqu [rdi+160], xmm0
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    mov eax, 10
+    ret
+  k256:
+    movdqu xmm0, [rsi]
+    movdqu xmm1, [rsi+16]
+    movdqu [rdi], xmm0
+    ; round keys 1 and 2
+    movdqu [rdi+16], xmm1
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd1, 0x01   ; aeskeygenassist xmm2, xmm1, 0x01
+    db 0x66, 0x0f, 0x70, 0xd2, 0xff   ; pshufd xmm2, xmm2, 0xff
+    movdqa xmm3, xmm0
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    pxor xmm0, xmm2
+    movdqu [rdi+32], xmm0
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd8, 0x00   ; aeskeygenassist xmm3, xmm0, 0x00
+    db 0x66, 0x0f, 0x70, 0xd3, 0xaa   ; pshufd xmm2, xmm3, 0xaa
+    movdqa xmm3, xmm1
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    pxor xmm1, xmm2
+    ; round keys 3 and 4
+    movdqu [rdi+48], xmm1
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd1, 0x02   ; aeskeygenassist xmm2, xmm1, 0x02
+    db 0x66, 0x0f, 0x70, 0xd2, 0xff   ; pshufd xmm2, xmm2, 0xff
+    movdqa xmm3, xmm0
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    pxor xmm0, xmm2
+    movdqu [rdi+64], xmm0
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd8, 0x00   ; aeskeygenassist xmm3, xmm0, 0x00
+    db 0x66, 0x0f, 0x70, 0xd3, 0xaa   ; pshufd xmm2, xmm3, 0xaa
+    movdqa xmm3, xmm1
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    pxor xmm1, xmm2
+    ; round keys 5 and 6
+    movdqu [rdi+80], xmm1
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd1, 0x04   ; aeskeygenassist xmm2, xmm1, 0x04
+    db 0x66, 0x0f, 0x70, 0xd2, 0xff   ; pshufd xmm2, xmm2, 0xff
+    movdqa xmm3, xmm0
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    pxor xmm0, xmm2
+    movdqu [rdi+96], xmm0
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd8, 0x00   ; aeskeygenassist xmm3, xmm0, 0x00
+    db 0x66, 0x0f, 0x70, 0xd3, 0xaa   ; pshufd xmm2, xmm3, 0xaa
+    movdqa xmm3, xmm1
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    pxor xmm1, xmm2
+    ; round keys 7 and 8
+    movdqu [rdi+112], xmm1
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd1, 0x08   ; aeskeygenassist xmm2, xmm1, 0x08
+    db 0x66, 0x0f, 0x70, 0xd2, 0xff   ; pshufd xmm2, xmm2, 0xff
+    movdqa xmm3, xmm0
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    pxor xmm0, xmm2
+    movdqu [rdi+128], xmm0
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd8, 0x00   ; aeskeygenassist xmm3, xmm0, 0x00
+    db 0x66, 0x0f, 0x70, 0xd3, 0xaa   ; pshufd xmm2, xmm3, 0xaa
+    movdqa xmm3, xmm1
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    pxor xmm1, xmm2
+    ; round keys 9 and 10
+    movdqu [rdi+144], xmm1
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd1, 0x10   ; aeskeygenassist xmm2, xmm1, 0x10
+    db 0x66, 0x0f, 0x70, 0xd2, 0xff   ; pshufd xmm2, xmm2, 0xff
+    movdqa xmm3, xmm0
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    pxor xmm0, xmm2
+    movdqu [rdi+160], xmm0
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd8, 0x00   ; aeskeygenassist xmm3, xmm0, 0x00
+    db 0x66, 0x0f, 0x70, 0xd3, 0xaa   ; pshufd xmm2, xmm3, 0xaa
+    movdqa xmm3, xmm1
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    pxor xmm1, xmm2
+    ; round keys 11 and 12
+    movdqu [rdi+176], xmm1
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd1, 0x20   ; aeskeygenassist xmm2, xmm1, 0x20
+    db 0x66, 0x0f, 0x70, 0xd2, 0xff   ; pshufd xmm2, xmm2, 0xff
+    movdqa xmm3, xmm0
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    pxor xmm0, xmm2
+    movdqu [rdi+192], xmm0
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd8, 0x00   ; aeskeygenassist xmm3, xmm0, 0x00
+    db 0x66, 0x0f, 0x70, 0xd3, 0xaa   ; pshufd xmm2, xmm3, 0xaa
+    movdqa xmm3, xmm1
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm1, xmm3
+    pxor xmm1, xmm2
+    ; round keys 13 and 14
+    movdqu [rdi+208], xmm1
+    db 0x66, 0x0f, 0x3a, 0xdf, 0xd1, 0x40   ; aeskeygenassist xmm2, xmm1, 0x40
+    db 0x66, 0x0f, 0x70, 0xd2, 0xff   ; pshufd xmm2, xmm2, 0xff
+    movdqa xmm3, xmm0
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    db 0x66, 0x0f, 0x73, 0xfb, 0x04   ; pslldq xmm3, 4
+    pxor xmm0, xmm3
+    pxor xmm0, xmm2
+    movdqu [rdi+224], xmm0
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    pxor xmm3, xmm3
+    mov eax, 14
+    ret
+  }
+}
+
+/// internal: encrypts one 16-byte block with AES-NI.
+/// in: rk and rounds from crx_aes_hw_expand; in16 readable and out16
+///   writable for 16 bytes (they may be the same)
+@naked export fn crx_aes_hw_encrypt_block(rk: uint8*, rounds: uint32, in16: uint8*, out16: uint8*) {
+  asm {
+    movdqu xmm0, [rdx]
+    movdqu xmm1, [rdi]
+    pxor xmm0, xmm1
+    mov r8d, esi
+    shl r8, 4
+    add r8, rdi
+    add rdi, 16
+  mid:
+    cmp rdi, r8
+    je fin
+    movdqu xmm1, [rdi]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc1   ; aesenc xmm0, xmm1
+    add rdi, 16
+    jmp mid
+  fin:
+    movdqu xmm1, [r8]
+    db 0x66, 0x0f, 0x38, 0xdd, 0xc1   ; aesenclast xmm0, xmm1
+    movdqu [rcx], xmm0
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    ret
+  }
+}
+
+// CTR over whole blocks, four at a time. blk is the first counter block
+// (12 IV bytes then the 32-bit big-endian counter); the counter wraps modulo
+// 2^32. dst[i] = src[i] xor keystream[i] for nblocks * 16 bytes; src may
+// equal dst.
+@naked fn crx_aes_hw_ctr_blocks(rk: uint8*, rounds: uint32, blk: uint8*, src: uint8*, dst: uint8*, nblocks: int64) {
+  asm {
+    test r9, r9
+    jz done
+    ; xmm12: pshufb mask that byte-swaps a 32-bit value into the last dword
+    mov rax, 0x0001020380808080
+    push rax
+    mov rax, 0x8080808080808080
+    push rax
+    movdqu xmm12, [rsp]
+    ; xmm9: pshufb mask that keeps the 12 IV bytes and clears the counter dword
+    mov rax, 0x808080800b0a0908
+    push rax
+    mov rax, 0x0706050403020100
+    push rax
+    movdqu xmm9, [rsp]
+    add rsp, 32
+    movdqu xmm10, [rdx]
+    mov eax, [rdx+12]
+    bswap eax
+    db 0x66, 0x45, 0x0f, 0x38, 0x00, 0xd1   ; pshufb xmm10, xmm9
+    movdqa xmm9, xmm10
+    movdqu xmm13, [rdi]
+    mov r11d, esi
+    shl r11, 4
+    add r11, rdi
+  loop4:
+    cmp r9, 4
+    jb loop1
+    movd xmm0, eax
+    lea r10d, [rax+1]
+    movd xmm1, r10d
+    lea r10d, [rax+2]
+    movd xmm2, r10d
+    lea r10d, [rax+3]
+    movd xmm3, r10d
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xc4   ; pshufb xmm0, xmm12
+    por xmm0, xmm9
+    pxor xmm0, xmm13
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xcc   ; pshufb xmm1, xmm12
+    por xmm1, xmm9
+    pxor xmm1, xmm13
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xd4   ; pshufb xmm2, xmm12
+    por xmm2, xmm9
+    pxor xmm2, xmm13
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xdc   ; pshufb xmm3, xmm12
+    por xmm3, xmm9
+    pxor xmm3, xmm13
+    movdqu xmm4, [rdi+16]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    movdqu xmm4, [rdi+32]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    movdqu xmm4, [rdi+48]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    movdqu xmm4, [rdi+64]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    movdqu xmm4, [rdi+80]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    movdqu xmm4, [rdi+96]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    movdqu xmm4, [rdi+112]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    movdqu xmm4, [rdi+128]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    movdqu xmm4, [rdi+144]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    lea r10, [rdi+160]
+  mid4:
+    cmp r10, r11
+    je fin4
+    movdqu xmm4, [r10]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xcc   ; aesenc xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xd4   ; aesenc xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdc, 0xdc   ; aesenc xmm3, xmm4
+    add r10, 16
+    jmp mid4
+  fin4:
+    movdqu xmm4, [r11]
+    db 0x66, 0x0f, 0x38, 0xdd, 0xc4   ; aesenclast xmm0, xmm4
+    db 0x66, 0x0f, 0x38, 0xdd, 0xcc   ; aesenclast xmm1, xmm4
+    db 0x66, 0x0f, 0x38, 0xdd, 0xd4   ; aesenclast xmm2, xmm4
+    db 0x66, 0x0f, 0x38, 0xdd, 0xdc   ; aesenclast xmm3, xmm4
+    movdqu xmm5, [rcx+0]
+    movdqu xmm6, [rcx+16]
+    movdqu xmm7, [rcx+32]
+    movdqu xmm8, [rcx+48]
+    pxor xmm0, xmm5
+    pxor xmm1, xmm6
+    pxor xmm2, xmm7
+    pxor xmm3, xmm8
+    movdqu [r8+0], xmm0
+    movdqu [r8+16], xmm1
+    movdqu [r8+32], xmm2
+    movdqu [r8+48], xmm3
+    add rcx, 64
+    add r8, 64
+    add eax, 4
+    sub r9, 4
+    jmp loop4
+  loop1:
+    test r9, r9
+    jz clear
+    movd xmm0, eax
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xc4   ; pshufb xmm0, xmm12
+    por xmm0, xmm9
+    pxor xmm0, xmm13
+    movdqu xmm4, [rdi+16]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    movdqu xmm4, [rdi+32]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    movdqu xmm4, [rdi+48]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    movdqu xmm4, [rdi+64]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    movdqu xmm4, [rdi+80]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    movdqu xmm4, [rdi+96]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    movdqu xmm4, [rdi+112]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    movdqu xmm4, [rdi+128]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    movdqu xmm4, [rdi+144]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    lea r10, [rdi+160]
+  mid1:
+    cmp r10, r11
+    je fin1
+    movdqu xmm4, [r10]
+    db 0x66, 0x0f, 0x38, 0xdc, 0xc4   ; aesenc xmm0, xmm4
+    add r10, 16
+    jmp mid1
+  fin1:
+    movdqu xmm4, [r11]
+    db 0x66, 0x0f, 0x38, 0xdd, 0xc4   ; aesenclast xmm0, xmm4
+    movdqu xmm5, [rcx]
+    pxor xmm0, xmm5
+    movdqu [r8], xmm0
+    add rcx, 16
+    add r8, 16
+    add eax, 1
+    sub r9, 1
+    jmp loop1
+  clear:
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    pxor xmm3, xmm3
+    pxor xmm4, xmm4
+    pxor xmm5, xmm5
+    pxor xmm6, xmm6
+    pxor xmm7, xmm7
+    pxor xmm8, xmm8
+    pxor xmm9, xmm9
+    pxor xmm13, xmm13
+  done:
+    ret
+  }
+}
+
+/// internal: AES-CTR keystream XOR with AES-NI, as GCM uses it: the counter
+/// block is iv[0..12) followed by the 32-bit big-endian counter ctr, ctr + 1,
+/// ... (wrapping modulo 2^32). dst[i] = src[i] xor keystream[i] for i < len;
+/// len need not be a multiple of 16 (a partial last block goes through a
+/// 16-byte stack buffer, which is wiped).
+/// in: rk and rounds from crx_aes_hw_expand; iv 12 bytes; src and dst
+///   readable/writable for len bytes (dst may equal src, no other overlap);
+///   len >= 0
+/// returns: the counter after the last whole block, as crx_aes_ctr_xor does
+export fn crx_aes_hw_ctr_xor(rk: uint8*, rounds: uint32, iv: uint8*, ctr: uint32, src: uint8*, dst: uint8*, len: int64) -> uint32 {
+  var blk: uint8[16];
+  var tmp: uint8[16];
+  var i: int64 = 0;
+  while (i < 12) {
+    blk[i] = iv[i];
+    i = i + 1;
+  }
+  var nblocks: int64 = len >> 4;
+  var full: int64 = nblocks << 4;
+  var next: uint32 = ctr + (uint32)nblocks;
+  blk[12] = (uint8)(ctr >> 24);
+  blk[13] = (uint8)(ctr >> 16);
+  blk[14] = (uint8)(ctr >> 8);
+  blk[15] = (uint8)ctr;
+  if (nblocks > 0) {
+    crx_aes_hw_ctr_blocks(rk, rounds, &blk[0], src, dst, nblocks);
+  }
+  var rem: int64 = len - full;
+  if (rem > 0) {
+    i = 0;
+    while (i < 16) {
+      tmp[i] = 0;
+      if (i < rem) { tmp[i] = src[full + i]; }
+      i = i + 1;
+    }
+    blk[12] = (uint8)(next >> 24);
+    blk[13] = (uint8)(next >> 16);
+    blk[14] = (uint8)(next >> 8);
+    blk[15] = (uint8)next;
+    crx_aes_hw_ctr_blocks(rk, rounds, &blk[0], &tmp[0], &tmp[0], 1);
+    i = 0;
+    while (i < rem) {
+      dst[full + i] = tmp[i];
+      i = i + 1;
+    }
+    i = 0;
+    while (i < 16) {
+      tmp[i] = 0;
+      i = i + 1;
+    }
+  }
+  return next;
+}
+
+// GHASH over whole 16-byte blocks: y = (y xor X) * h for each block X of
+// data, len a multiple of 16. Four blocks per pass with h, h^2, h^3, h^4.
+@naked fn crx_ghash_hw_blocks(y: uint8*, h: uint8*, data: uint8*, len: int64) {
+  asm {
+    test rcx, rcx
+    jz done
+    ; xmm8: pshufb mask that reverses the 16 bytes
+    mov rax, 0x0001020304050607
+    push rax
+    mov rax, 0x08090a0b0c0d0e0f
+    push rax
+    movdqu xmm8, [rsp]
+    add rsp, 16
+    movdqu xmm13, [rdi]
+    db 0x66, 0x45, 0x0f, 0x38, 0x00, 0xe8   ; pshufb xmm13, xmm8
+    movdqu xmm0, [rsi]
+    db 0x66, 0x41, 0x0f, 0x38, 0x00, 0xc0   ; pshufb xmm0, xmm8
+    db 0x66, 0x0f, 0x70, 0xc8, 0x0e   ; pshufd xmm1, xmm0, 0x0e
+    pxor xmm1, xmm0
+    mov r9, rcx
+    shr r9, 6
+    shr rcx, 4
+    and rcx, 3
+    test r9, r9
+    jz single
+    ; h2 = h1 * h1
+    movdqa xmm9, xmm0
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xc8, 0x11   ; pclmulqdq xmm9, xmm0, 0x11
+    movdqa xmm11, xmm0
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xd8, 0x00   ; pclmulqdq xmm11, xmm0, 0x00
+    db 0x66, 0x45, 0x0f, 0x70, 0xe1, 0x0e   ; pshufd xmm12, xmm9, 0x0e
+    db 0x66, 0x45, 0x0f, 0x70, 0xd3, 0x0e   ; pshufd xmm10, xmm11, 0x0e
+    movdqa xmm14, xmm9
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf4, 0x01   ; psllq xmm12, 1
+    por xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf1, 0x01   ; psllq xmm9, 1
+    por xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf2, 0x01   ; psllq xmm10, 1
+    por xmm10, xmm14
+    db 0x66, 0x41, 0x0f, 0x73, 0xf3, 0x01   ; psllq xmm11, 1
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm9, xmm14
+    pxor xmm9, xmm11
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm12, xmm14
+    pxor xmm12, xmm10
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm9, xmm14
+    movdqa xmm2, xmm9
+    db 0x66, 0x41, 0x0f, 0x6c, 0xd4   ; punpcklqdq xmm2, xmm12
+    movdqa xmm3, xmm12
+    pxor xmm3, xmm9
+    ; h3 = h1 * h2
+    movdqa xmm9, xmm0
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xca, 0x11   ; pclmulqdq xmm9, xmm2, 0x11
+    movdqa xmm11, xmm0
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xda, 0x00   ; pclmulqdq xmm11, xmm2, 0x00
+    movdqa xmm10, xmm1
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xd3, 0x00   ; pclmulqdq xmm10, xmm3, 0x00
+    pxor xmm10, xmm9
+    pxor xmm10, xmm11
+    db 0x66, 0x45, 0x0f, 0x70, 0xe1, 0x0e   ; pshufd xmm12, xmm9, 0x0e
+    db 0x66, 0x45, 0x0f, 0x70, 0xf2, 0x0e   ; pshufd xmm14, xmm10, 0x0e
+    pxor xmm9, xmm14
+    db 0x66, 0x45, 0x0f, 0x70, 0xf3, 0x0e   ; pshufd xmm14, xmm11, 0x0e
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm9
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf4, 0x01   ; psllq xmm12, 1
+    por xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf1, 0x01   ; psllq xmm9, 1
+    por xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf2, 0x01   ; psllq xmm10, 1
+    por xmm10, xmm14
+    db 0x66, 0x41, 0x0f, 0x73, 0xf3, 0x01   ; psllq xmm11, 1
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm9, xmm14
+    pxor xmm9, xmm11
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm12, xmm14
+    pxor xmm12, xmm10
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm9, xmm14
+    movdqa xmm4, xmm9
+    db 0x66, 0x41, 0x0f, 0x6c, 0xe4   ; punpcklqdq xmm4, xmm12
+    movdqa xmm5, xmm12
+    pxor xmm5, xmm9
+    ; h4 = h2 * h2
+    movdqa xmm9, xmm2
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xca, 0x11   ; pclmulqdq xmm9, xmm2, 0x11
+    movdqa xmm11, xmm2
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xda, 0x00   ; pclmulqdq xmm11, xmm2, 0x00
+    db 0x66, 0x45, 0x0f, 0x70, 0xe1, 0x0e   ; pshufd xmm12, xmm9, 0x0e
+    db 0x66, 0x45, 0x0f, 0x70, 0xd3, 0x0e   ; pshufd xmm10, xmm11, 0x0e
+    movdqa xmm14, xmm9
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf4, 0x01   ; psllq xmm12, 1
+    por xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf1, 0x01   ; psllq xmm9, 1
+    por xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf2, 0x01   ; psllq xmm10, 1
+    por xmm10, xmm14
+    db 0x66, 0x41, 0x0f, 0x73, 0xf3, 0x01   ; psllq xmm11, 1
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm9, xmm14
+    pxor xmm9, xmm11
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm12, xmm14
+    pxor xmm12, xmm10
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm9, xmm14
+    movdqa xmm6, xmm9
+    db 0x66, 0x41, 0x0f, 0x6c, 0xf4   ; punpcklqdq xmm6, xmm12
+    movdqa xmm7, xmm12
+    pxor xmm7, xmm9
+  loop4:
+    pxor xmm9, xmm9
+    pxor xmm10, xmm10
+    pxor xmm11, xmm11
+    movdqu xmm12, [rdx+0]
+    db 0x66, 0x45, 0x0f, 0x38, 0x00, 0xe0   ; pshufb xmm12, xmm8
+    pxor xmm12, xmm13
+    db 0x66, 0x45, 0x0f, 0x70, 0xec, 0x0e   ; pshufd xmm13, xmm12, 0x0e
+    pxor xmm13, xmm12
+    movdqa xmm14, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xf6, 0x11   ; pclmulqdq xmm14, xmm6, 0x11
+    pxor xmm9, xmm14
+    movdqa xmm15, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xfe, 0x00   ; pclmulqdq xmm15, xmm6, 0x00
+    pxor xmm11, xmm15
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xef, 0x00   ; pclmulqdq xmm13, xmm7, 0x00
+    pxor xmm10, xmm13
+    movdqu xmm12, [rdx+16]
+    db 0x66, 0x45, 0x0f, 0x38, 0x00, 0xe0   ; pshufb xmm12, xmm8
+    db 0x66, 0x45, 0x0f, 0x70, 0xec, 0x0e   ; pshufd xmm13, xmm12, 0x0e
+    pxor xmm13, xmm12
+    movdqa xmm14, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xf4, 0x11   ; pclmulqdq xmm14, xmm4, 0x11
+    pxor xmm9, xmm14
+    movdqa xmm15, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xfc, 0x00   ; pclmulqdq xmm15, xmm4, 0x00
+    pxor xmm11, xmm15
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xed, 0x00   ; pclmulqdq xmm13, xmm5, 0x00
+    pxor xmm10, xmm13
+    movdqu xmm12, [rdx+32]
+    db 0x66, 0x45, 0x0f, 0x38, 0x00, 0xe0   ; pshufb xmm12, xmm8
+    db 0x66, 0x45, 0x0f, 0x70, 0xec, 0x0e   ; pshufd xmm13, xmm12, 0x0e
+    pxor xmm13, xmm12
+    movdqa xmm14, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xf2, 0x11   ; pclmulqdq xmm14, xmm2, 0x11
+    pxor xmm9, xmm14
+    movdqa xmm15, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xfa, 0x00   ; pclmulqdq xmm15, xmm2, 0x00
+    pxor xmm11, xmm15
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xeb, 0x00   ; pclmulqdq xmm13, xmm3, 0x00
+    pxor xmm10, xmm13
+    movdqu xmm12, [rdx+48]
+    db 0x66, 0x45, 0x0f, 0x38, 0x00, 0xe0   ; pshufb xmm12, xmm8
+    db 0x66, 0x45, 0x0f, 0x70, 0xec, 0x0e   ; pshufd xmm13, xmm12, 0x0e
+    pxor xmm13, xmm12
+    movdqa xmm14, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xf0, 0x11   ; pclmulqdq xmm14, xmm0, 0x11
+    pxor xmm9, xmm14
+    movdqa xmm15, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xf8, 0x00   ; pclmulqdq xmm15, xmm0, 0x00
+    pxor xmm11, xmm15
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xe9, 0x00   ; pclmulqdq xmm13, xmm1, 0x00
+    pxor xmm10, xmm13
+    add rdx, 64
+    pxor xmm10, xmm9
+    pxor xmm10, xmm11
+    db 0x66, 0x45, 0x0f, 0x70, 0xe1, 0x0e   ; pshufd xmm12, xmm9, 0x0e
+    db 0x66, 0x45, 0x0f, 0x70, 0xf2, 0x0e   ; pshufd xmm14, xmm10, 0x0e
+    pxor xmm9, xmm14
+    db 0x66, 0x45, 0x0f, 0x70, 0xf3, 0x0e   ; pshufd xmm14, xmm11, 0x0e
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm9
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf4, 0x01   ; psllq xmm12, 1
+    por xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf1, 0x01   ; psllq xmm9, 1
+    por xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf2, 0x01   ; psllq xmm10, 1
+    por xmm10, xmm14
+    db 0x66, 0x41, 0x0f, 0x73, 0xf3, 0x01   ; psllq xmm11, 1
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm9, xmm14
+    pxor xmm9, xmm11
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm12, xmm14
+    pxor xmm12, xmm10
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm9, xmm14
+    movdqa xmm13, xmm9
+    db 0x66, 0x45, 0x0f, 0x6c, 0xec   ; punpcklqdq xmm13, xmm12
+    sub r9, 1
+    jnz loop4
+  single:
+  loop1:
+    test rcx, rcx
+    jz store
+    movdqu xmm12, [rdx]
+    db 0x66, 0x45, 0x0f, 0x38, 0x00, 0xe0   ; pshufb xmm12, xmm8
+    pxor xmm12, xmm13
+    db 0x66, 0x45, 0x0f, 0x70, 0xfc, 0x0e   ; pshufd xmm15, xmm12, 0x0e
+    pxor xmm15, xmm12
+    movdqa xmm9, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xc8, 0x11   ; pclmulqdq xmm9, xmm0, 0x11
+    movdqa xmm11, xmm12
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xd8, 0x00   ; pclmulqdq xmm11, xmm0, 0x00
+    movdqa xmm10, xmm15
+    db 0x66, 0x44, 0x0f, 0x3a, 0x44, 0xd1, 0x00   ; pclmulqdq xmm10, xmm1, 0x00
+    pxor xmm10, xmm9
+    pxor xmm10, xmm11
+    db 0x66, 0x45, 0x0f, 0x70, 0xe1, 0x0e   ; pshufd xmm12, xmm9, 0x0e
+    db 0x66, 0x45, 0x0f, 0x70, 0xf2, 0x0e   ; pshufd xmm14, xmm10, 0x0e
+    pxor xmm9, xmm14
+    db 0x66, 0x45, 0x0f, 0x70, 0xf3, 0x0e   ; pshufd xmm14, xmm11, 0x0e
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm9
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf4, 0x01   ; psllq xmm12, 1
+    por xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf1, 0x01   ; psllq xmm9, 1
+    por xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x3f   ; psrlq xmm14, 63
+    db 0x66, 0x41, 0x0f, 0x73, 0xf2, 0x01   ; psllq xmm10, 1
+    por xmm10, xmm14
+    db 0x66, 0x41, 0x0f, 0x73, 0xf3, 0x01   ; psllq xmm11, 1
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm9, xmm14
+    pxor xmm9, xmm11
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm11
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm10, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x01   ; psrlq xmm14, 1
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x02   ; psrlq xmm14, 2
+    pxor xmm12, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xd6, 0x07   ; psrlq xmm14, 7
+    pxor xmm12, xmm14
+    pxor xmm12, xmm10
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3f   ; psllq xmm14, 63
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x3e   ; psllq xmm14, 62
+    pxor xmm9, xmm14
+    movdqa xmm14, xmm10
+    db 0x66, 0x41, 0x0f, 0x73, 0xf6, 0x39   ; psllq xmm14, 57
+    pxor xmm9, xmm14
+    movdqa xmm13, xmm9
+    db 0x66, 0x45, 0x0f, 0x6c, 0xec   ; punpcklqdq xmm13, xmm12
+    add rdx, 16
+    sub rcx, 1
+    jmp loop1
+  store:
+    db 0x66, 0x45, 0x0f, 0x38, 0x00, 0xe8   ; pshufb xmm13, xmm8
+    movdqu [rdi], xmm13
+    pxor xmm0, xmm0
+    pxor xmm1, xmm1
+    pxor xmm2, xmm2
+    pxor xmm3, xmm3
+    pxor xmm4, xmm4
+    pxor xmm5, xmm5
+    pxor xmm6, xmm6
+    pxor xmm7, xmm7
+    pxor xmm8, xmm8
+    pxor xmm9, xmm9
+    pxor xmm10, xmm10
+    pxor xmm11, xmm11
+    pxor xmm12, xmm12
+    pxor xmm13, xmm13
+    pxor xmm14, xmm14
+    pxor xmm15, xmm15
+  done:
+    ret
+  }
+}
+
+/// internal: GHASH update with PCLMULQDQ, same meaning as crx_ghash_ctmul64:
+/// for each 16-byte block X of data (a final partial block is padded with
+/// zeros), y = (y xor X) * h in GF(2^128).
+/// in: y 16 bytes, the running state, updated in place; h 16 bytes, the hash
+///   key; data readable for len bytes; len >= 0
+export fn crx_ghash_hw(y: uint8*, h: uint8*, data: uint8*, len: int64) {
+  var tmp: uint8[16];
+  var full: int64 = (len >> 4) << 4;
+  if (full > 0) {
+    crx_ghash_hw_blocks(y, h, data, full);
+  }
+  var rem: int64 = len - full;
+  if (rem > 0) {
+    var i: int64 = 0;
+    while (i < 16) {
+      tmp[i] = 0;
+      if (i < rem) { tmp[i] = data[full + i]; }
+      i = i + 1;
+    }
+    crx_ghash_hw_blocks(y, h, &tmp[0], 16);
+  }
+}

@@ -1,0 +1,166 @@
+// BLAKE2b (RFC 7693) in pure Mettle: internal core used by cr_blake2b
+// (hash.mettle) and, later, Argon2id. Output length 1..64, key 0..64 bytes.
+// Callers validate arguments. Not part of the public API.
+
+import "cryptex/core/status";
+import "cryptex/core/util";
+
+/// internal: BLAKE2b streaming state. Treat as opaque; init, update, final.
+export struct CrxBlake2b {
+  h: uint64[8];
+  t: uint64[2];
+  buf: uint8[128];
+  buflen: int64;
+  outlen: int64;
+}
+
+// IV: the SHA-512 initial hash values, from 32-bit halves.
+var g_crx_b2b_iv: uint64[8] = [
+  ((uint64)0x6a09e667 << 32) | (uint64)0xf3bcc908,
+  ((uint64)0xbb67ae85 << 32) | (uint64)0x84caa73b,
+  ((uint64)0x3c6ef372 << 32) | (uint64)0xfe94f82b,
+  ((uint64)0xa54ff53a << 32) | (uint64)0x5f1d36f1,
+  ((uint64)0x510e527f << 32) | (uint64)0xade682d1,
+  ((uint64)0x9b05688c << 32) | (uint64)0x2b3e6c1f,
+  ((uint64)0x1f83d9ab << 32) | (uint64)0xfb41bd6b,
+  ((uint64)0x5be0cd19 << 32) | (uint64)0x137e2179
+];
+
+// Message schedule, 12 rounds (rounds 10 and 11 reuse rows 0 and 1).
+var g_crx_b2b_sigma: uint8[192] = [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+  14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3,
+  11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4,
+  7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8,
+  9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13,
+  2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9,
+  12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11,
+  13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10,
+  6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5,
+  10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0,
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+  14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3
+];
+
+fn crx_b2b_g(v: uint64*, a: int32, b: int32, c: int32, d: int32, x: uint64, y: uint64) {
+  var va: uint64 = v[a];
+  var vb: uint64 = v[b];
+  var vc: uint64 = v[c];
+  var vd: uint64 = v[d];
+  va = va + vb + x;
+  vd = vd ^ va;
+  vd = (vd >> 32) | (vd << 32);
+  vc = vc + vd;
+  vb = vb ^ vc;
+  vb = (vb >> 24) | (vb << 40);
+  va = va + vb + y;
+  vd = vd ^ va;
+  vd = (vd >> 16) | (vd << 48);
+  vc = vc + vd;
+  vb = vb ^ vc;
+  vb = (vb >> 63) | (vb << 1);
+  v[a] = va;
+  v[b] = vb;
+  v[c] = vc;
+  v[d] = vd;
+}
+
+fn crx_b2b_compress(s: CrxBlake2b*, blk: uint8*, last: bool) {
+  var m: uint64[16];
+  var v: uint64[16];
+  for i in 0..16 {
+    var o: int32 = i * 8;
+    m[i] = (uint64)blk[o]
+      | ((uint64)blk[o + 1] << 8)
+      | ((uint64)blk[o + 2] << 16)
+      | ((uint64)blk[o + 3] << 24)
+      | ((uint64)blk[o + 4] << 32)
+      | ((uint64)blk[o + 5] << 40)
+      | ((uint64)blk[o + 6] << 48)
+      | ((uint64)blk[o + 7] << 56);
+  }
+  for i in 0..8 {
+    v[i] = s->h[i];
+    v[i + 8] = g_crx_b2b_iv[i];
+  }
+  v[12] = v[12] ^ s->t[0];
+  v[13] = v[13] ^ s->t[1];
+  if (last) { v[14] = ~v[14]; }
+  for r in 0..12 {
+    var o: int32 = r * 16;
+    crx_b2b_g(&v[0], 0, 4, 8, 12, m[g_crx_b2b_sigma[o]], m[g_crx_b2b_sigma[o + 1]]);
+    crx_b2b_g(&v[0], 1, 5, 9, 13, m[g_crx_b2b_sigma[o + 2]], m[g_crx_b2b_sigma[o + 3]]);
+    crx_b2b_g(&v[0], 2, 6, 10, 14, m[g_crx_b2b_sigma[o + 4]], m[g_crx_b2b_sigma[o + 5]]);
+    crx_b2b_g(&v[0], 3, 7, 11, 15, m[g_crx_b2b_sigma[o + 6]], m[g_crx_b2b_sigma[o + 7]]);
+    crx_b2b_g(&v[0], 0, 5, 10, 15, m[g_crx_b2b_sigma[o + 8]], m[g_crx_b2b_sigma[o + 9]]);
+    crx_b2b_g(&v[0], 1, 6, 11, 12, m[g_crx_b2b_sigma[o + 10]], m[g_crx_b2b_sigma[o + 11]]);
+    crx_b2b_g(&v[0], 2, 7, 8, 13, m[g_crx_b2b_sigma[o + 12]], m[g_crx_b2b_sigma[o + 13]]);
+    crx_b2b_g(&v[0], 3, 4, 9, 14, m[g_crx_b2b_sigma[o + 14]], m[g_crx_b2b_sigma[o + 15]]);
+  }
+  for i in 0..8 {
+    s->h[i] = s->h[i] ^ v[i] ^ v[i + 8];
+  }
+  cr_wipe((uint8*)&m[0], 128);
+  cr_wipe((uint8*)&v[0], 128);
+}
+
+/// internal: starts a BLAKE2b hash with outlen bytes of output (1..64) and an
+/// optional key (keylen 0..64; key may be 0 when keylen == 0). A key is
+/// padded to one block and fed first (RFC 7693 section 3.3).
+export fn crx_blake2b_init(s: CrxBlake2b*, outlen: int64, key: uint8*, keylen: int64) {
+  for i in 0..8 { s->h[i] = g_crx_b2b_iv[i]; }
+  s->h[0] = s->h[0] ^ (uint64)0x01010000 ^ ((uint64)keylen << 8) ^ (uint64)outlen;
+  s->t[0] = 0;
+  s->t[1] = 0;
+  s->buflen = 0;
+  s->outlen = outlen;
+  for i in 0..128 { s->buf[i] = 0; }
+  if (keylen > 0) {
+    for i in 0..keylen { s->buf[i] = key[i]; }
+    s->buflen = 128;
+  }
+}
+
+/// internal: absorbs n bytes (n >= 0; p may be 0 when n == 0). A full block
+/// is compressed only when more input follows, so the last block is never
+/// compressed early.
+export fn crx_blake2b_update(s: CrxBlake2b*, p: uint8*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    if (s->buflen == 128) {
+      s->t[0] = s->t[0] + (uint64)128;
+      if (s->t[0] < (uint64)128) { s->t[1] = s->t[1] + (uint64)1; }
+      crx_b2b_compress(s, &s->buf[0], false);
+      s->buflen = 0;
+    }
+    var take: int64 = 128 - s->buflen;
+    if (take > n - i) { take = n - i; }
+    var j: int64 = 0;
+    while (j < take) {
+      s->buf[s->buflen + j] = p[i + j];
+      j = j + 1;
+    }
+    s->buflen = s->buflen + take;
+    i = i + take;
+  }
+}
+
+/// internal: finishes the hash, writes outlen bytes to out and wipes s.
+export fn crx_blake2b_final(s: CrxBlake2b*, out: uint8*) {
+  s->t[0] = s->t[0] + (uint64)s->buflen;
+  if (s->t[0] < (uint64)s->buflen) { s->t[1] = s->t[1] + (uint64)1; }
+  var i: int64 = s->buflen;
+  while (i < 128) {
+    s->buf[i] = 0;
+    i = i + 1;
+  }
+  crx_b2b_compress(s, &s->buf[0], true);
+  for k in 0..s->outlen {
+    out[k] = (uint8)(s->h[k >> 3] >> ((uint64)(k & 7) * 8));
+  }
+  cr_wipe((uint8*)&s->h[0], 64);
+  cr_wipe((uint8*)&s->t[0], 16);
+  cr_wipe(&s->buf[0], 128);
+  s->buflen = 0;
+  s->outlen = 0;
+}

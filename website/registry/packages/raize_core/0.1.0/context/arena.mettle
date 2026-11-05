@@ -1,0 +1,202 @@
+// raize/context/arena — the per-request bump allocator.
+//
+// Why an arena at all: Mettle strings are borrowed 16-byte views
+// (pointer + length), so every parsed name, value, decoded path and header
+// list needs an owner with a lifetime. The connection loop owns exactly one
+// arena and resets it between requests, which makes the contract simple and
+// provable:
+//
+//     a view returned by the parser is valid until rz_arena_reset()
+//
+// Bounds are part of the contract, not an implementation detail:
+//
+//   * RZ_ARENA_BLOCK bytes per block, at most RZ_ARENA_MAX_BLOCKS blocks,
+//     so a request can never allocate more than RZ_ARENA_MAX_BYTES here.
+//   * The block list is a fixed array inside the arena struct (a struct
+//     field's array extent must be a literal in Mettle, hence the literal 8
+//     below and the matching RZ_ARENA_MAX_BLOCKS constant).
+//   * Allocation failure is reported, never papered over: the caller turns
+//     a failed allocation into a 4xx/5xx, it never retries with a bigger
+//     buffer.
+//
+// Every block is malloc'd and every block is freed by rz_arena_free, which
+// the connection loop calls on every exit path (`defer`). reset() keeps the
+// first block (the common case costs no syscall) and frees the rest.
+
+import "std/mem";
+import "../str/str";
+
+export const RZ_ARENA_BLOCK: int64 = 8192;
+export const RZ_ARENA_MAX_BLOCKS: int32 = 8;
+export const RZ_ARENA_MAX_BYTES: int64 = 65536;
+
+export struct RzArenaBlock {
+  data: uint8*;
+  cap: int64;
+  used: int64;
+}
+
+// The fixed array extent must be a literal; keep it equal to
+// RZ_ARENA_MAX_BLOCKS (asserted by t_rz_arena_bounds).
+export struct RzArena {
+  blocks: RzArenaBlock[8];
+  count: int32;
+  used: int64;
+  failed: bool;
+}
+
+export fn rz_arena_new() -> RzArena* {
+  var a: RzArena* = (RzArena*)calloc(1, sizeof(RzArena));
+  return a;
+}
+
+// Bytes are zeroed before they are handed out. A zeroed arena means a parse
+// failure can never leave a header list pointing at stack garbage.
+export fn rz_arena_alloc(a: RzArena*, n: int64) -> uint8* {
+  if (a == 0) { return 0; }
+  if (n < 0) { a->failed = true; return 0; }
+  var want: int64 = (n + 7) & ~(int64)7;
+  if (want == 0) { want = 8; }
+  if (a->used + want > RZ_ARENA_MAX_BYTES) { a->failed = true; return 0; }
+  var i: int32 = a->count - 1;
+  if (i >= 0) {
+    if (a->blocks[i].used + want <= a->blocks[i].cap) {
+      var p: uint8* = a->blocks[i].data + a->blocks[i].used;
+      a->blocks[i].used = a->blocks[i].used + want;
+      a->used = a->used + want;
+      memset((rawptr)p, 0, want);
+      return p;
+    }
+  }
+  if (a->count >= RZ_ARENA_MAX_BLOCKS) { a->failed = true; return 0; }
+  var cap: int64 = RZ_ARENA_BLOCK;
+  if (want > cap) { cap = want; }
+  var data: uint8* = (uint8*)malloc(cap);
+  if (data == 0) { a->failed = true; return 0; }
+  var idx: int32 = a->count;
+  a->blocks[idx].data = data;
+  a->blocks[idx].cap = cap;
+  a->blocks[idx].used = want;
+  a->count = idx + 1;
+  a->used = a->used + want;
+  memset((rawptr)data, 0, want);
+  return data;
+}
+
+export fn rz_arena_alloc_zeroed(a: RzArena*, n: int64) -> uint8* {
+  return rz_arena_alloc(a, n);
+}
+
+// Copy bytes into the arena. The result carries no NUL terminator; use
+// rz_arena_cstr when a C string is required.
+export fn rz_arena_bytes(a: RzArena*, p: uint8*, n: int64) -> string {
+  if (n <= 0) { return rz_str_empty(); }
+  var d: uint8* = rz_arena_alloc(a, n);
+  if (d == 0) { return rz_str_empty(); }
+  memcpy((rawptr)d, (rawptr)p, n);
+  return rz_str_view(d, n);
+}
+
+export fn rz_arena_str(a: RzArena*, s: string) -> string {
+  return rz_arena_bytes(a, s.chars, (int64)s.length);
+}
+
+// NUL-terminated copy, for anything that has to cross to a C signature.
+export fn rz_arena_cstr(a: RzArena*, s: string) -> cstring {
+  var n: int64 = (int64)s.length;
+  var d: uint8* = rz_arena_alloc(a, n + 1);
+  if (d == 0) { return 0; }
+  if (n > 0) { memcpy((rawptr)d, (rawptr)s.chars, n); }
+  d[n] = 0;
+  return (cstring)d;
+}
+
+// Frees every block but the first and rewinds the bump pointer. Call between
+// requests; every view previously handed out by this arena is dead after it.
+export fn rz_arena_reset(a: RzArena*) {
+  if (a == 0) { return; }
+  var i: int32 = 1;
+  while (i < a->count) {
+    if (a->blocks[i].data != 0) {
+      free((rawptr)a->blocks[i].data);
+    }
+    a->blocks[i].data = 0;
+    a->blocks[i].cap = 0;
+    a->blocks[i].used = 0;
+    i = i + 1;
+  }
+  if (a->count > 0) {
+    a->blocks[0].used = 0;
+    a->count = 1;
+  } else {
+    a->count = 0;
+  }
+  a->used = 0;
+  a->failed = false;
+}
+
+export fn rz_arena_free(a: RzArena*) {
+  if (a == 0) { return; }
+  var i: int32 = 0;
+  while (i < a->count) {
+    if (a->blocks[i].data != 0) {
+      free((rawptr)a->blocks[i].data);
+      a->blocks[i].data = 0;
+    }
+    i = i + 1;
+  }
+  a->count = 0;
+  a->used = 0;
+  free((rawptr)a);
+}
+
+export fn rz_arena_used(a: RzArena*) -> int64 {
+  if (a == 0) { return 0; }
+  return a->used;
+}
+
+export fn rz_arena_ok(a: RzArena*) -> bool {
+  if (a == 0) { return false; }
+  return !a->failed;
+}
+
+@test fn t_rz_arena_bounds() -> int32 {
+  if (RZ_ARENA_MAX_BYTES != RZ_ARENA_BLOCK * (int64)RZ_ARENA_MAX_BLOCKS) { return 1; }
+  if (sizeof(RzArenaBlock) != 24) { return 2; }
+  var a: RzArena* = rz_arena_new();
+  if (a == 0) { return 3; }
+  // 64 KiB is the ceiling; the request that asks for 64 KiB + 8 is refused.
+  var p: uint8* = rz_arena_alloc(a, RZ_ARENA_MAX_BYTES);
+  if (p == 0) { rz_arena_free(a); return 4; }
+  if (rz_arena_alloc(a, 8) != 0) { rz_arena_free(a); return 5; }
+  if (rz_arena_ok(a)) { rz_arena_free(a); return 6; }
+  if (a->used != RZ_ARENA_MAX_BYTES) { rz_arena_free(a); return 7; }
+  // reset rewinds and clears the failure flag; the first block is reused.
+  rz_arena_reset(a);
+  if (!rz_arena_ok(a)) { rz_arena_free(a); return 8; }
+  if (rz_arena_used(a) != 0) { rz_arena_free(a); return 9; }
+  var q: uint8* = rz_arena_alloc(a, 64);
+  if (q == 0) { rz_arena_free(a); return 10; }
+  if (q != a->blocks[0].data) { rz_arena_free(a); return 11; }
+  // Handing out the same bytes twice within a request must not happen.
+  var r: uint8* = rz_arena_alloc(a, 64);
+  if (r == q) { rz_arena_free(a); return 12; }
+  rz_arena_free(a);
+  return 0;
+}
+
+@test fn t_rz_arena_copy() -> int32 {
+  var a: RzArena* = rz_arena_new();
+  if (a == 0) { return 1; }
+  var src: string = "hello arena";
+  var d: string = rz_arena_str(a, src);
+  if (!rz_str_eq(d, src)) { rz_arena_free(a); return 2; }
+  // The copy does not alias the literal.
+  if (d.chars == src.chars) { rz_arena_free(a); return 3; }
+  var c: cstring = rz_arena_cstr(a, src);
+  if (c == 0) { rz_arena_free(a); return 4; }
+  if (c[11] != 0) { rz_arena_free(a); return 5; }
+  rz_arena_reset(a);
+  rz_arena_free(a);
+  return 0;
+}

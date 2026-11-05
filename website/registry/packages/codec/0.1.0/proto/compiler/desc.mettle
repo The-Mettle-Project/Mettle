@@ -1,0 +1,130 @@
+// What the .proto parser builds: every message, enum and service from a set
+// of .proto files, in flat lists that refer to each other by index. The
+// generator reads this. Names are views into the file text or new strings.
+import "codec/core/list";
+
+// Field types, numbered as in descriptor.proto.
+export const CODEC_PBT_DOUBLE = 1;
+export const CODEC_PBT_FLOAT = 2;
+export const CODEC_PBT_INT64 = 3;
+export const CODEC_PBT_UINT64 = 4;
+export const CODEC_PBT_INT32 = 5;
+export const CODEC_PBT_FIXED64 = 6;
+export const CODEC_PBT_FIXED32 = 7;
+export const CODEC_PBT_BOOL = 8;
+export const CODEC_PBT_STRING = 9;
+export const CODEC_PBT_GROUP = 10;
+export const CODEC_PBT_MESSAGE = 11;
+export const CODEC_PBT_BYTES = 12;
+export const CODEC_PBT_UINT32 = 13;
+export const CODEC_PBT_ENUM = 14;
+export const CODEC_PBT_SFIXED32 = 15;
+export const CODEC_PBT_SFIXED64 = 16;
+export const CODEC_PBT_SINT32 = 17;
+export const CODEC_PBT_SINT64 = 18;
+
+// Field labels. NONE is a proto3 field without a label, a oneof member or a
+// map entry's key or value.
+export const CODEC_PBL_NONE = 0;
+export const CODEC_PBL_OPTIONAL = 1;
+export const CODEC_PBL_REQUIRED = 2;
+export const CODEC_PBL_REPEATED = 3;
+
+export struct CodecPbcField {
+  name: string;
+  number: int32;
+  label: int32;
+  kind: int32;            // CODEC_PBT_*; 0 until a named type is resolved
+  type_name: string;      // a message, enum or group type, as written
+  ref: int32;             // index into messages or enums once resolved, else -1
+  oneof: int32;           // index into the message's oneofs, or -1
+  presence: bool;         // has a has_ flag: proto2 optional, proto3 optional
+  packed: int32;          // [packed = ...]: -1 not given, 0 false, 1 true
+  default_text: string;   // [default = ...] as written (strings unescaped)
+  has_default: bool;
+  line: int32;
+  col: int32;
+}
+
+export struct CodecPbcOneof {
+  name: string;
+  synthetic: bool;        // made for a proto3 `optional` field
+}
+
+export struct CodecPbcMessage {
+  name: string;
+  full: string;           // "pkg.Outer.Inner"
+  mettle: string;         // "Outer_Inner", the generated struct name
+  file: int32;
+  parent: int32;          // enclosing message, or -1
+  fields: CodecList<CodecPbcField>;
+  oneofs: CodecList<CodecPbcOneof>;
+  map_entry: bool;
+  syntax: int32;          // 2 or 3
+}
+
+export struct CodecPbcEnumValue {
+  name: string;
+  number: int32;
+}
+
+export struct CodecPbcEnum {
+  name: string;
+  full: string;
+  mettle: string;
+  file: int32;
+  values: CodecList<CodecPbcEnumValue>;
+  closed: bool;           // proto2: unknown values are kept as unknown fields
+}
+
+export struct CodecPbcMethod {
+  name: string;
+  input: string;
+  output: string;
+  in_ref: int32;
+  out_ref: int32;
+  client_stream: bool;
+  server_stream: bool;
+}
+
+export struct CodecPbcService {
+  name: string;
+  full: string;
+  mettle: string;
+  file: int32;
+  methods: CodecList<CodecPbcMethod>;
+}
+
+export struct CodecPbcFile {
+  path: string;           // the import name, such as "google/protobuf/empty.proto"
+  disk: string;           // where it was read from
+  package: string;
+  syntax: int32;
+  imports: CodecList<string>;
+  text: string;
+}
+
+export struct CodecPbcSet {
+  files: CodecList<CodecPbcFile>;
+  messages: CodecList<CodecPbcMessage>;
+  enums: CodecList<CodecPbcEnum>;
+  services: CodecList<CodecPbcService>;
+  include: CodecList<string>;   // directories searched for imports
+  prefix: string;               // put before every generated type name
+  error: string;                // the first error, "file:line:col: message"
+  failed: bool;
+}
+
+export fn codec_pbc_msg(s: CodecPbcSet*, i: int32) -> CodecPbcMessage* {
+  return &s->messages.data[i];
+}
+
+export fn codec_pbc_enum(s: CodecPbcSet*, i: int32) -> CodecPbcEnum* {
+  return &s->enums.data[i];
+}
+
+export fn codec_pbc_fail(s: CodecPbcSet*, at: string, msg: string) {
+  if (s->failed) { return; }
+  s->failed = true;
+  s->error = at + ": " + msg;
+}

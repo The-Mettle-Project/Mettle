@@ -1,0 +1,341 @@
+// mythic_text: shaping, measuring, line breaking, emission (DECISIONS §7, Appendix D).
+// All units are device px. Line breaking (MYTHIC_TEXT_WRAP with max_width > 0): break after
+// spaces (spaces at a soft break hang and do not count), after '-', '/' and U+2014, hard break
+// on '\n'; an overlong word breaks between characters. MYTHIC_TEXT_ELLIPSIS with max_width > 0
+// truncates a line at the last whole glyph that fits with U+2026 (single-line text: every
+// overflowing line; wrapped text: the last line kept by max_lines). MYTHIC_TEXT_TABULAR gives
+// digits the widest digit advance, centered. align 0/1/2 = start/center/end within max_width
+// (or the layout width when max_width is 0). Layouts are cached by (text bytes, spec) and are
+// freed when unused for a frame (mythic_fonts_frame_begin).
+//
+// Conventions:
+// - glyph x is the pen position (float) relative to the layout origin; glyph y is the line
+//   baseline relative to the layout origin (a whole number).
+// - baseline of line i = round(i*lh + (lh - (ascent+descent))/2 + ascent), lh = line_height_px,
+//   or ascent+descent when line_height_px is 0. height = line_count * lh.
+// - tracking is added between glyphs (not after the last one of a line).
+// - an ellipsis glyph carries the byte offset of the first dropped character.
+// - glyphs[glyph_count] and offsets[glyph_count] are a sentinel (end of text: x = end of the
+//   last line, offset = byte length). '\n' gets a glyph entry with glyph = -1 (no ink).
+import "mythic_types";
+import "mythic_utf8";
+import "mythic_ttf";
+import "mythic_fonts";
+import "mythic_glyph";
+import "mythic_dl";
+
+export struct MythicTextSpec { font: int32; size_px: float32; line_height_px: float32; tracking_px: float32;
+                             flags: int32; max_width: float32; max_lines: int32; align: int32; }  // max_width 0 = none
+export struct MythicTextLayout { width: float32; height: float32; min_width: float32; line_count: int32;
+                               glyph_count: int32; glyphs: MythicGlyphPos*; offsets: int32*;   // byte offset per glyph
+                               line_first: int32*; line_baseline: float32*; }                // relative to layout origin
+
+fn line_metrics(t: MythicTtf*, spec: MythicTextSpec, lh_out: float32*) -> float32 {
+  var s: float32 = spec.size_px / (float32)t->upem;
+  var asc: float32 = (float32)t->ascent * s;
+  var nat: float32 = asc - (float32)t->descent * s;
+  var lh: float32 = spec.line_height_px;
+  if (lh <= 0.0) { lh = nat; }
+  *lh_out = lh;
+  return (lh - nat) * 0.5 + asc;     // unrounded baseline offset within a line box
+}
+
+// One shaped character before line breaking.
+struct TItem { g: int32; cp: uint32; off: int32; kern: float32; adv: float32; dx: float32; x: float32; }
+
+var g_mythic_text_items: MythicVec<TItem>;
+var g_mythic_text_lines: MythicVec<int32>;
+var g_mythic_text_lw: MythicVec<float32>;
+
+fn is_space(cp: uint32) -> bool { return cp == (uint32)32 || cp == (uint32)9 || cp == (uint32)0xA0; }
+fn is_break_after(cp: uint32) -> bool {
+  return is_space(cp) || cp == (uint32)45 || cp == (uint32)47 || cp == (uint32)0x2014;
+}
+
+// Right edge of line [a, e) (items have x set), excluding '\n' and, when `hang`, trailing spaces.
+fn line_right(it: TItem*, a: int32, e: int32, hang: bool) -> float32 {
+  var k: int32 = e - 1;
+  while (k >= a && (it[k].g < 0 || (hang && is_space(it[k].cp)))) { k = k - 1; }
+  if (k < a) { return 0.0; }
+  return it[k].x + it[k].adv;
+}
+
+fn build(f: MythicFonts*, spec: MythicTextSpec, s: uint8*, len: int64) -> MythicTextLayout* {
+  var t: MythicTtf* = mythic_fonts_ttf(f, spec.font);
+  var sc: float32 = spec.size_px / (float32)t->upem;
+  var lh: float32 = 0.0;
+  var base0: float32 = line_metrics(t, spec, &lh);
+  var tr: float32 = spec.tracking_px;
+  var tabular: bool = (spec.flags & MYTHIC_TEXT_TABULAR) != 0;
+  var fig_adv: float32 = (float32)mythic_fonts_tnum(f, spec.font) * sc;
+  var maxw: float32 = spec.max_width;
+  var wrap: bool = (spec.flags & MYTHIC_TEXT_WRAP) != 0 && maxw > 0.0;
+  var ellip: bool = (spec.flags & MYTHIC_TEXT_ELLIPSIS) != 0 && maxw > 0.0;
+  var n: int32 = (int32)mythic_utf8_count(s, len);
+  mythic_vec_reserve<TItem>(&g_mythic_text_items, (int64)n + 1);
+  mythic_vec_reserve<int32>(&g_mythic_text_lines, (int64)n + 2);
+  var it: TItem* = g_mythic_text_items.data;
+  var ls: int32* = g_mythic_text_lines.data;
+  // pass 1: decode, cmap, advances, kerning
+  var i: int64 = 0;
+  var k: int32 = 0;
+  var cp: uint32 = 0;
+  var prev: int32 = -1;
+  var min_w: float32 = 0.0;
+  var word_x: float32 = -1.0;
+  var pen: float32 = 0.0;          // unbroken pen, for min width
+  while (i < len) {
+    var at: int64 = i;
+    i = mythic_utf8_decode(s, len, i, &cp);
+    var e: TItem* = &it[k];
+    e->cp = cp; e->off = (int32)at; e->kern = 0.0; e->dx = 0.0; e->x = 0.0;
+    if (cp == (uint32)10) {
+      e->g = -1; e->adv = 0.0; prev = -1;
+      if (word_x >= 0.0) { min_w = mythic_maxf(min_w, pen - tr - word_x); word_x = -1.0; }
+      pen = 0.0;
+      k = k + 1;
+      continue;
+    }
+    var g: int32 = mythic_ttf_glyph_index(t, cp);
+    if (prev >= 0) { e->kern = (float32)mythic_ttf_kern(t, prev, g) * sc; }
+    var adv: float32 = (float32)mythic_ttf_advance(t, g) * sc;
+    if (tabular && cp >= (uint32)48 && cp <= (uint32)57) { e->dx = (fig_adv - adv) * 0.5; adv = fig_adv; }
+    e->g = g; e->adv = adv;
+    pen = pen + e->kern;
+    if (is_space(cp)) {
+      if (word_x >= 0.0) { min_w = mythic_maxf(min_w, pen - tr - word_x); word_x = -1.0; }
+    } else if (word_x < 0.0) { word_x = pen; }
+    pen = pen + adv + tr;
+    prev = g;
+    k = k + 1;
+  }
+  if (word_x >= 0.0) { min_w = mythic_maxf(min_w, pen - tr - word_x); }
+  // pass 2: line breaking (sets x; ls[] = first item of each line)
+  var nl: int32 = 1;
+  ls[0] = 0;
+  var a: int32 = 0;            // first item of the current line
+  var brk: int32 = -1;         // first item after the last break opportunity in this line
+  var x: float32 = 0.0;        // pen
+  var j: int32 = 0;
+  while (j < n) {
+    var e2: TItem* = &it[j];
+    if (e2->g < 0) {
+      e2->x = x - tr; if (j == a) { e2->x = 0.0; }
+      a = j + 1; brk = -1; x = 0.0;
+      ls[nl] = a; nl = nl + 1;
+      j = j + 1;
+      continue;
+    }
+    var gx: float32 = x;
+    if (j > a) { gx = gx + e2->kern; }
+    if (wrap && j > a && !is_space(e2->cp) && gx + e2->adv > maxw + 0.001) {
+      var na: int32 = j;
+      if (brk > a && brk <= j) { na = brk; }
+      a = na; brk = -1; x = 0.0;
+      ls[nl] = a; nl = nl + 1;
+      j = a;
+      continue;
+    }
+    e2->x = gx;
+    x = gx + e2->adv + tr;
+    if (is_break_after(e2->cp)) { brk = j + 1; }
+    j = j + 1;
+  }
+  ls[nl] = n;
+  // max_lines
+  var truncated: bool = false;
+  if (spec.max_lines > 0 && nl > spec.max_lines) {
+    nl = spec.max_lines;
+    truncated = true;
+  }
+  // output
+  var ell_g: int32 = mythic_ttf_glyph_index(t, 0x2026);
+  var ell_adv: float32 = (float32)mythic_ttf_advance(t, ell_g) * sc;
+  var cap: int64 = (int64)n + (int64)nl + 1;
+  var bytes: int64 = 64 + cap * 12 + cap * 4 + ((int64)nl + 1) * 8 + 32;
+  var blk: uint8* = (uint8*)malloc(bytes);
+  var l: MythicTextLayout* = (MythicTextLayout*)blk;
+  l->glyphs = (MythicGlyphPos*)(blk + 64);
+  l->offsets = (int32*)(blk + 64 + cap * 12);
+  l->line_first = (int32*)(blk + 64 + cap * 16);
+  l->line_baseline = (float32*)(blk + 64 + cap * 16 + ((int64)nl + 1) * 4);
+  mythic_vec_reserve<float32>(&g_mythic_text_lw, (int64)nl + 1);
+  var lws: float32* = g_mythic_text_lw.data;
+  var out: int32 = 0;
+  var width: float32 = 0.0;
+  var endx: float32 = 0.0;
+  var baseline: float32 = 0.0;
+  for li: int32 in 0..nl {
+    var la: int32 = ls[li];
+    var le: int32 = ls[li + 1];
+    baseline = mythic_roundf((float32)li * lh + base0);
+    var soft: bool = le < n && it[le - 1].g >= 0 && li + 1 < nl;   // ends at a soft wrap
+    if (le > la && it[le - 1].g < 0) { soft = false; }
+    var cut: int32 = le;                 // items kept: [la, cut)
+    var add_ell: bool = false;
+    var lw: float32 = line_right(it, la, le, soft || wrap);
+    if (ellip && ((li == nl - 1 && truncated) || (!wrap && lw > maxw + 0.001))) {
+      var e_end: int32 = le;
+      if (e_end > la && it[e_end - 1].g < 0) { e_end = e_end - 1; }
+      cut = e_end;
+      while (cut > la) {
+        var rr: float32 = line_right(it, la, cut, true);
+        if (rr + tr + ell_adv <= maxw + 0.001) { break; }
+        cut = cut - 1;
+      }
+      while (cut > la && is_space(it[cut - 1].cp)) { cut = cut - 1; }
+      add_ell = true;
+      lw = line_right(it, la, cut, true);
+      if (cut > la) { lw = lw + tr; }
+      lw = lw + ell_adv;
+    }
+    l->line_first[li] = out;
+    l->line_baseline[li] = baseline;
+    for q: int32 in la..cut {
+      l->glyphs[out].glyph = it[q].g;
+      l->glyphs[out].x = it[q].x + it[q].dx;
+      if (it[q].g < 0) { l->glyphs[out].x = lw; }
+      l->glyphs[out].y = baseline;
+      l->offsets[out] = it[q].off;
+      out = out + 1;
+    }
+    endx = line_right(it, la, cut, false);
+    if (add_ell) {
+      var ex: float32 = 0.0;
+      if (cut > la) { ex = line_right(it, la, cut, true) + tr; }
+      l->glyphs[out].glyph = ell_g;
+      l->glyphs[out].x = ex;
+      l->glyphs[out].y = baseline;
+      var eo: int32 = (int32)len;
+      if (cut < n) { eo = it[cut].off; }
+      l->offsets[out] = eo;
+      out = out + 1;
+      endx = lw;
+    }
+    if (lw > width) { width = lw; }
+    lws[li] = lw;
+  }
+  // sentinel
+  l->glyphs[out].glyph = -1;
+  l->glyphs[out].x = endx;
+  l->glyphs[out].y = baseline;
+  l->offsets[out] = (int32)len;
+  l->line_first[nl] = out;
+  // alignment
+  if (spec.align != 0) {
+    var box: float32 = width;
+    if (maxw > 0.0) { box = maxw; }
+    for li2: int32 in 0..nl {
+      var ga: int32 = l->line_first[li2];
+      var ge: int32 = l->line_first[li2 + 1];
+      var sh: float32 = box - lws[li2];
+      if (spec.align == 1) { sh = sh * 0.5; }
+      if (sh < 0.0) { sh = 0.0; }
+      sh = mythic_roundf(sh * 4.0) * 0.25;
+      var qe: int32 = ge;
+      if (li2 == nl - 1) { qe = ge + 1; }   // include the sentinel
+      for q3: int32 in ga..qe { l->glyphs[q3].x = l->glyphs[q3].x + sh; }
+    }
+  }
+  l->width = width;
+  l->min_width = min_w;
+  l->height = (float32)nl * lh;
+  l->line_count = nl;
+  l->glyph_count = out;
+  return l;
+}
+
+fn spec_key(spec: MythicTextSpec, s: uint8*, len: int64) -> uint64 {
+  var h: uint64 = mythic_hash(0x5445585443414348, s, len);
+  h = mythic_hash(h, (uint8*)&spec, sizeof(MythicTextSpec));
+  h = mythic_hash_u64(h, (uint64)len);
+  return h | (uint64)1;
+}
+
+/// Shapes and lays out `text` (cached by text bytes + spec). The layout stays valid this frame
+/// and the next (mythic_fonts_frame_begin frees layouts unused for a frame). The text bytes are
+/// not retained.
+export fn mythic_text_layout(f: MythicFonts*, spec: MythicTextSpec, text: string) -> MythicTextLayout* {  // cached; valid this frame
+  var len: int64 = (int64)text.length;
+  var s: uint8* = (uint8*)text.chars;
+  var key: uint64 = spec_key(spec, s, len);
+  var hit: MythicTextCacheEnt* = mythic_map_get<MythicTextCacheEnt>(&f->layouts, key, false);
+  if (hit != 0 && hit->block != 0) {
+    hit->frame = f->frame;
+    return (MythicTextLayout*)hit->block;
+  }
+  var l: MythicTextLayout* = build(f, spec, s, len);
+  var slot: MythicTextCacheEnt* = mythic_map_get<MythicTextCacheEnt>(&f->layouts, key, true);
+  slot->block = (rawptr)l;
+  slot->frame = f->frame;
+  return l;
+}
+
+/// Width of the widest line of `text` (device px). Uses the layout cache.
+export fn mythic_text_width(f: MythicFonts*, spec: MythicTextSpec, text: string) -> float32 {
+  return mythic_text_layout(f, spec, text)->width;
+}
+
+/// Appends one GLYPHS command. Baselines are snapped: y = round(origin.y) + line baseline.
+/// `darken` selects the small-size text gamma (the caller decides per DESIGN-SYSTEM §3.4).
+export fn mythic_text_emit(dl: MythicDrawList*, f: MythicFonts*, l: MythicTextLayout*, spec: MythicTextSpec, origin: MythicVec2, color: uint32, darken: bool) {
+  if (l == 0 || l->glyph_count == 0 || (color >> (uint32)24) == (uint32)0) { return; }
+  var t: MythicTtf* = mythic_fonts_ttf(f, spec.font);
+  var sc: float32 = spec.size_px / (float32)t->upem;
+  var oy: float32 = mythic_roundf(origin.y);
+  var first: int32 = (int32)dl->glyphs.len;
+  var x0: float32 = 1.0e9; var x1: float32 = -1.0e9; var b0: float32 = 1.0e9; var b1: float32 = -1.0e9;
+  for i: int32 in 0..l->glyph_count {
+    var gp: MythicGlyphPos = l->glyphs[i];
+    if (gp.glyph < 0) { continue; }
+    gp.x = gp.x + origin.x;
+    gp.y = gp.y + oy;
+    mythic_vec_push<MythicGlyphPos>(&dl->glyphs, gp);
+    x0 = mythic_minf(x0, gp.x); x1 = mythic_maxf(x1, gp.x);
+    b0 = mythic_minf(b0, gp.y); b1 = mythic_maxf(b1, gp.y);
+  }
+  var count: int32 = (int32)dl->glyphs.len - first;
+  if (count == 0) { return; }
+  var p: MythicCmd* = mythic_dl_cmd(dl, MYTHIC_CMD_GLYPHS);
+  var bx0: float32 = mythic_floorf(x0 + (float32)t->x_min * sc) - 1.0;
+  var bx1: float32 = mythic_ceilf(x1 + (float32)t->x_max * sc) + 2.0;
+  var by0: float32 = mythic_floorf(b0 - (float32)t->y_max * sc) - 1.0;
+  var by1: float32 = mythic_ceilf(b1 - (float32)t->y_min * sc) + 1.0;
+  p->x = bx0; p->y = by0; p->w = bx1 - bx0; p->h = by1 - by0;
+  p->color = color;
+  p->a = spec.size_px;
+  if (darken) { p->b = 1.0; }
+  p->res = spec.font;
+  p->first = first;
+  p->count = count;
+}
+
+/// Byte offset of the caret position nearest to `p` (layout-relative device px).
+export fn mythic_text_offset_at(l: MythicTextLayout*, p: MythicVec2) -> int64 {
+  if (l == 0 || l->line_count == 0) { return 0; }
+  var line: int32 = 0;
+  while (line + 1 < l->line_count && p.y >= (l->line_baseline[line] + l->line_baseline[line + 1]) * 0.5 + 0.0) {
+    line = line + 1;
+  }
+  var a: int32 = l->line_first[line];
+  var b: int32 = l->line_first[line + 1];   // exclusive; for the last line this is the sentinel
+  var i: int32 = a;
+  while (i < b) {
+    var nx: float32 = l->glyphs[i + 1].x;
+    if (l->glyphs[i].glyph < 0) { return (int64)l->offsets[i]; }   // '\n' ends the line
+    if (p.x < (l->glyphs[i].x + nx) * 0.5) { return (int64)l->offsets[i]; }
+    i = i + 1;
+  }
+  return (int64)l->offsets[b];
+}
+
+/// Caret position (x, baseline) for a byte offset (layout-relative device px).
+export fn mythic_text_caret_pos(l: MythicTextLayout*, offset: int64) -> MythicVec2 {   // x, baseline
+  var v: MythicVec2;
+  if (l == 0) { return v; }
+  var i: int32 = 0;
+  while (i < l->glyph_count && (int64)l->offsets[i] < offset) { i = i + 1; }
+  v.x = l->glyphs[i].x;
+  v.y = l->glyphs[i].y;
+  return v;
+}

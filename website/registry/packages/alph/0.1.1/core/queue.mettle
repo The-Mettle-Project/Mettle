@@ -1,0 +1,67 @@
+// alph/core/queue: intrusive multi-producer, single-consumer queue (Vyukov).
+//
+// A node is any struct whose first field is `next: int64`. Push is wait-free
+// and may run on any thread. Pop runs only on the queue's one consumer. The
+// node uses it for run queues and signal queues; actors never touch it.
+
+import "alph/sys/atomic";
+
+// A queue holds the address of its own stub, so it must not move after
+// alph_queue_init.
+export struct AlphQueue {
+  head: int64;  // last pushed node; producers swap it
+  tail: int64;  // next node to pop; consumer only
+  stub: int64;  // a node made of just a next field
+}
+
+// Makes q empty. Thread: any, before q is used.
+export fn alph_queue_init(q: AlphQueue*) {
+  q->stub = 0;
+  q->head = (int64)&q->stub;
+  q->tail = (int64)&q->stub;
+}
+
+// Appends node, whose first field must be `next: int64`. The queue keeps the
+// node until it is popped; do not push it again before then. Thread: any.
+export fn alph_queue_push(q: AlphQueue*, node: rawptr) {
+  var at: int64 = (int64)node;
+  alph_atomic_store((int64*)at, 0);
+  var prev: int64 = alph_atomic_swap(&q->head, at);
+  // A plain store is a release store on x86-64, and the swap call above
+  // keeps the compiler from moving it earlier. Writing it as a typed pointer
+  // store also shows the memory analyser that the node is kept, not leaked.
+  var link: rawptr* = (rawptr*)prev;
+  *link = node;
+}
+
+// Removes and returns the oldest node, or 0 when the queue is empty. It also
+// returns 0 while a push is between its two steps; every pusher wakes the
+// consumer after it finishes, so treating that 0 as empty loses nothing.
+// Thread: the queue's one consumer.
+export fn alph_queue_pop(q: AlphQueue*) -> int64 {
+  var stub: int64 = (int64)&q->stub;
+  var tail: int64 = q->tail;
+  var next: int64 = alph_atomic_load((int64*)tail);
+  if (tail == stub) {
+    if (next == 0) {
+      return 0;
+    }
+    q->tail = next;
+    tail = next;
+    next = alph_atomic_load((int64*)next);
+  }
+  if (next != 0) {
+    q->tail = next;
+    return tail;
+  }
+  if (tail != alph_atomic_load(&q->head)) {
+    return 0;
+  }
+  alph_queue_push(q, (rawptr)stub);
+  next = alph_atomic_load((int64*)tail);
+  if (next != 0) {
+    q->tail = next;
+    return tail;
+  }
+  return 0;
+}

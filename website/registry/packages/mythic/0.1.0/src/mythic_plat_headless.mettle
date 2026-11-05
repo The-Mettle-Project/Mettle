@@ -1,0 +1,181 @@
+// mythic_plat_headless: in-memory platform with a virtual clock for tests (DECISIONS §8).
+// Deterministic: wait never blocks, time moves only through mythic_headless_advance_us, getenv
+// always reports "unset". Tests may inspect the recorded state through (MythicHeadless*)p->self.
+import "std/mem";
+import "mythic_types";
+
+const HL_EQCAP = 4096;
+
+export struct MythicHeadless {
+  plat: MythicPlatform;
+  width: int32; height: int32; scale: float32;
+  now_us: int64;
+  cursor: int32;
+  opened: bool;
+  eq: MythicEvent*; eq_head: int64; eq_tail: int64;
+  px: uint32*; fb_w: int32; fb_h: int32;
+  present_count: int64;          // number of present calls
+  present_rects: int64;          // rects received in total (n = 0 counts as 1)
+  last_rect: MythicRectI;          // last rect presented (whole buffer for n = 0)
+  title: MythicBytes;              // copy of the last title
+  clip: MythicBytes;               // in-memory clipboard
+  wait_calls: int64;
+  last_wait_ms: int32;
+}
+
+fn hl_copy(dst: MythicBytes*, s: uint8*, n: int64) {
+  if (dst->data != 0) { free(dst->data); }
+  dst->data = (uint8*)malloc(n + 1);
+  for i: int64 in 0..n { dst->data[i] = s[i]; }
+  dst->data[n] = (uint8)0;
+  dst->len = n;
+}
+
+fn hl_push(hl: MythicHeadless*, ev: MythicEvent) {
+  if (hl->eq == 0) { hl->eq = (MythicEvent*)malloc(sizeof(MythicEvent) * HL_EQCAP); }
+  if (hl->eq_tail - hl->eq_head >= HL_EQCAP) { return; }
+  var e: MythicEvent = ev;
+  if (e.time_us == 0) { e.time_us = hl->now_us; }
+  hl->eq[hl->eq_tail % HL_EQCAP] = e;
+  hl->eq_tail = hl->eq_tail + 1;
+}
+
+fn hl_open(self: rawptr, desc: MythicWindowDesc*) -> int32 {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  hl->opened = true;
+  hl_copy(&hl->title, desc->title, desc->title_len);
+  var se: MythicEvent;
+  se.kind = MYTHIC_EV_SCALE; se.scale = hl->scale;
+  hl_push(hl, se);
+  var re: MythicEvent;
+  re.kind = MYTHIC_EV_RESIZE; re.width = hl->width; re.height = hl->height;
+  hl_push(hl, re);
+  return 0;
+}
+
+fn hl_close(self: rawptr) {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  hl->opened = false;
+}
+
+fn hl_wait(self: rawptr, timeout_ms: int32) {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  hl->wait_calls = hl->wait_calls + 1;
+  hl->last_wait_ms = timeout_ms;
+}
+
+fn hl_next_event(self: rawptr, ev: MythicEvent*) -> bool {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  if (hl->eq_head == hl->eq_tail) { return false; }
+  *ev = hl->eq[hl->eq_head % HL_EQCAP];
+  hl->eq_head = hl->eq_head + 1;
+  return true;
+}
+
+fn hl_framebuffer(self: rawptr) -> MythicFramebuffer {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  var w: int32 = hl->width;
+  var h: int32 = hl->height;
+  if (w < 1) { w = 1; }
+  if (h < 1) { h = 1; }
+  if (hl->px == 0 || hl->fb_w != w || hl->fb_h != h) {
+    if (hl->px != 0) { free(hl->px); }
+    hl->px = (uint32*)calloc((int64)w * (int64)h, 4);
+    hl->fb_w = w;
+    hl->fb_h = h;
+  }
+  var fb: MythicFramebuffer;
+  fb.px = hl->px;
+  fb.w = hl->fb_w;
+  fb.h = hl->fb_h;
+  fb.stride = hl->fb_w;
+  return fb;
+}
+
+fn hl_present(self: rawptr, rects: MythicRectI*, n: int32) {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  hl->present_count = hl->present_count + 1;
+  if (n <= 0 || rects == 0) {
+    hl->present_rects = hl->present_rects + 1;
+    var full: MythicRectI = { x: 0, y: 0, w: hl->fb_w, h: hl->fb_h };
+    hl->last_rect = full;
+    return;
+  }
+  hl->present_rects = hl->present_rects + (int64)n;
+  hl->last_rect = rects[n - 1];
+}
+
+fn hl_now_us(self: rawptr) -> int64 {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  return hl->now_us;
+}
+
+fn hl_set_title(self: rawptr, s: uint8*, n: int64) {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  hl_copy(&hl->title, s, n);
+}
+
+fn hl_set_cursor(self: rawptr, cursor: int32) {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  hl->cursor = cursor;
+}
+
+fn hl_clipboard_set(self: rawptr, s: uint8*, n: int64) {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  hl_copy(&hl->clip, s, n);
+}
+
+fn hl_clipboard_get(self: rawptr, out: MythicBytes*) -> bool {
+  var hl: MythicHeadless* = (MythicHeadless*)self;
+  if (hl->clip.data == 0) { return false; }
+  out->data = (uint8*)0;
+  out->len = 0;
+  hl_copy(out, hl->clip.data, hl->clip.len);
+  return true;
+}
+
+fn hl_getenv(self: rawptr, name: uint8*, n: int64, out: MythicBytes*) -> bool { return false; }
+
+/// Creates the headless platform: w x h device px at the given scale, virtual clock at 0.
+export fn mythic_plat_headless_create(w: int32, h: int32, scale: float32) -> MythicPlatform* {
+  var hl: MythicHeadless* = new MythicHeadless;
+  hl->width = w;
+  hl->height = h;
+  hl->scale = scale;
+  var p: MythicPlatform* = &hl->plat;
+  p->self = (rawptr)hl;
+  p->open = &hl_open;
+  p->close = &hl_close;
+  p->wait = &hl_wait;
+  p->next_event = &hl_next_event;
+  p->framebuffer = &hl_framebuffer;
+  p->present = &hl_present;
+  p->now_us = &hl_now_us;
+  p->set_title = &hl_set_title;
+  p->set_cursor = &hl_set_cursor;
+  p->clipboard_set = &hl_clipboard_set;
+  p->clipboard_get = &hl_clipboard_get;
+  p->getenv = &hl_getenv;
+  return p;
+}
+
+/// Queues an event. time_us 0 is stamped with the virtual clock. RESIZE and SCALE events also
+/// change the headless window size / scale, as a real platform would.
+export fn mythic_headless_push(p: MythicPlatform*, ev: MythicEvent) {
+  var hl: MythicHeadless* = (MythicHeadless*)p->self;
+  if (ev.kind == MYTHIC_EV_RESIZE) { hl->width = ev.width; hl->height = ev.height; }
+  if (ev.kind == MYTHIC_EV_SCALE) { hl->scale = ev.scale; }
+  hl_push(hl, ev);
+}
+
+/// Advances the virtual clock.
+export fn mythic_headless_advance_us(p: MythicPlatform*, us: int64) {
+  var hl: MythicHeadless* = (MythicHeadless*)p->self;
+  hl->now_us = hl->now_us + us;
+}
+
+/// Returns the last cursor shape set through set_cursor (MYTHIC_CURSOR_*).
+export fn mythic_headless_cursor(p: MythicPlatform*) -> int32 {
+  var hl: MythicHeadless* = (MythicHeadless*)p->self;
+  return hl->cursor;
+}

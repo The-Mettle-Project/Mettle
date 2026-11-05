@@ -1,0 +1,70 @@
+// Opaque tokens: generation, validation and hashing. A session token is
+// base64url (no padding) of token_bytes random bytes from the crypto library (cryptex); the
+// store only ever receives SHA-256 of the token text. All of it is crypto
+// library calls: cr_random_bytes, cr_base64url_encode/_decode, cr_sha256,
+// cr_wipe.
+
+import "cryptex/cryptex";
+import "status";
+import "types";
+
+/// Wipes a token (text and length).
+/// in: t, a token (0 is ignored)
+/// returns: nothing
+/// owns: nothing; t stays the caller's
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: defer ses_token_wipe(&t);
+export fn ses_token_wipe(t: SesToken*) {
+  if (t == 0) { return; }
+  cr_wipe(&t->b[0], (int64)SES_TOKEN_CAP);
+  t->len = 0;
+}
+
+/// Makes a fresh random token and its storage hash.
+/// in: nbytes, random bytes (32..64); out, the token text to fill;
+///   hash, the SHA-256 of out's text to fill
+/// returns: SES_OK; SES_E_ARG (null pointer, nbytes outside 32..64);
+///   SES_E_CRYPTO (the crypto library failed; out is wiped)
+/// owns: writes out and hash; the raw random bytes are wiped before return
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: var t: SesToken; var h: CrSha256; ses_token_new(32, &t, &h);
+export fn ses_token_new(nbytes: int64, out: SesToken*, hash: CrSha256*) -> int32 {
+  if (out == 0 || hash == 0 || nbytes < 32 || nbytes > 64) { return SES_E_ARG; }
+  var raw: uint8[64];
+  if (cr_random_bytes(&raw[0], nbytes) != CR_OK) { return SES_E_CRYPTO; }
+  var n: int64 = 0;
+  var rc: int32 = cr_base64url_encode(&out->b[0], (int64)SES_TOKEN_CAP, &n, &raw[0], nbytes);
+  cr_wipe(&raw[0], 64);
+  if (rc != CR_OK) {
+    ses_token_wipe(out);
+    return SES_E_CRYPTO;
+  }
+  out->len = n;
+  if (cr_sha256(hash, &out->b[0], n) != CR_OK) {
+    ses_token_wipe(out);
+    return SES_E_CRYPTO;
+  }
+  return SES_OK;
+}
+
+/// Validates a presented token and computes its storage hash. Strict: the
+/// text must be canonical base64url without padding of 32..64 bytes
+/// (43..86 characters), so junk is rejected before any store call.
+/// in: tok, the text the client sent; hash, where SHA-256(tok) goes
+/// returns: SES_OK; SES_E_NOT_FOUND for a malformed token (the same answer
+///   as an unknown one); SES_E_ARG (null hash); SES_E_CRYPTO
+/// owns: tok is borrowed; the decoded bytes are wiped
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: var h: CrSha256; if (ses_token_hash(cookie, &h) != SES_OK) { login(); }
+export fn ses_token_hash(tok: string, hash: CrSha256*) -> int32 {
+  if (hash == 0) { return SES_E_ARG; }
+  if (tok.length < 43 || tok.length > 86) { return SES_E_NOT_FOUND; }
+  var raw: uint8[96];
+  var n: int64 = 0;
+  var rc: int32 = cr_base64url_decode(&raw[0], 96, &n, tok.chars, (int64)tok.length);
+  cr_wipe(&raw[0], 96);
+  if (rc != CR_OK) { return SES_E_NOT_FOUND; }
+  if (n < 32 || n > 64) { return SES_E_NOT_FOUND; }
+  if (cr_sha256(hash, tok.chars, (int64)tok.length) != CR_OK) { return SES_E_CRYPTO; }
+  return SES_OK;
+}

@@ -1,0 +1,103 @@
+// ArgsOut: writes text without allocating. It fills a caller's buffer, or
+// a small internal one that it flushes to a stream (stdout, stderr).
+
+import "std/io";
+import "types";
+
+// Write into buf (up to cap bytes). o->len ends as the full size wanted.
+export fn args_out_buf(o: ArgsOut*, buf: uint8*, cap: int64) {
+  o->buf = buf;
+  o->cap = cap;
+  o->len = 0;
+  o->used = 0;
+  o->fp = (cstring)0;
+}
+
+// Write to a stream such as get_stdout(). Call args_out_flush at the end.
+export fn args_out_stream(o: ArgsOut*, fp: cstring) {
+  o->buf = &o->tmp[0];
+  o->cap = 1024;
+  o->len = 0;
+  o->used = 0;
+  o->fp = fp;
+}
+
+export fn args_out_flush(o: ArgsOut*) {
+  if (o->fp != 0 && o->used > 0) {
+    fwrite((cstring)o->buf, 1, o->used, o->fp);
+    o->used = 0;
+  }
+}
+
+export fn args_out_byte(o: ArgsOut*, c: int32) {
+  o->len = o->len + 1;
+  if (o->used >= o->cap) {
+    if (o->fp == 0) { return; }
+    args_out_flush(o);
+  }
+  o->buf[o->used] = (uint8)c;
+  o->used = o->used + 1;
+}
+
+export fn args_out_str(o: ArgsOut*, s: string) {
+  for i in 0..s.length { args_out_byte(o, (int32)s.chars[i]); }
+}
+
+export fn args_out_spaces(o: ArgsOut*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) { args_out_byte(o, 32); i = i + 1; }
+}
+
+export fn args_out_int(o: ArgsOut*, v: int64) {
+  if (v < 0) {
+    args_out_byte(o, 45);
+    // -(min int64) does not fit; write it through uint64
+    args_out_uint(o, (uint64)0 - (uint64)v);
+    return;
+  }
+  args_out_uint(o, (uint64)v);
+}
+
+export fn args_out_uint(o: ArgsOut*, v: uint64) {
+  var d: uint8[24];
+  var n: int32 = 0;
+  var x: uint64 = v;
+  if (x == (uint64)0) { args_out_byte(o, 48); return; }
+  while (x > (uint64)0) {
+    d[n] = (uint8)((uint64)48 + x % (uint64)10);
+    x = x / (uint64)10;
+    n = n + 1;
+  }
+  while (n > 0) { n = n - 1; args_out_byte(o, (int32)d[n]); }
+}
+
+// A float with up to 6 decimals and no trailing zeros (2.5, 0.125, 3).
+export fn args_out_float(o: ArgsOut*, v: float64) {
+  var x: float64 = v;
+  if (x != x) { args_out_str(o, "nan"); return; }
+  if (x < 0.0) { args_out_byte(o, 45); x = 0.0 - x; }
+  if (x > 1.0e18) { args_out_str(o, "inf"); return; }
+  var scaled: float64 = x * 1000000.0 + 0.5;
+  var whole: uint64 = (uint64)scaled;
+  var ip: uint64 = whole / (uint64)1000000;
+  var fp: uint64 = whole % (uint64)1000000;
+  args_out_uint(o, ip);
+  if (fp == (uint64)0) { return; }
+  var digits: uint8[6];
+  for i in 0..6 {
+    digits[5 - i] = (uint8)((uint64)48 + fp % (uint64)10);
+    fp = fp / (uint64)10;
+  }
+  var last: int32 = 5;
+  while (last > 0 && digits[last] == (uint8)48) { last = last - 1; }
+  args_out_byte(o, 46);
+  for i in 0..=last { args_out_byte(o, (int32)digits[i]); }
+}
+
+// The text written so far, for buffer writers.
+export fn args_out_text(o: ArgsOut*) -> string {
+  var s: string;
+  s.chars = o->buf;
+  s.length = (uint64)o->used;
+  return s;
+}

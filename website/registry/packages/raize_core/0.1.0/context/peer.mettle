@@ -1,0 +1,148 @@
+// raize/context/peer — who sent the request: the socket's IPv4 address, and the
+// X-Forwarded-For rule for apps behind one trusted reverse proxy.
+// reference: handlers
+// thread: rz__peer_set_trusted runs once in rz_run before serving; everything else
+// is read-only on worker threads.
+//
+// The server records the accepted socket's address in ctx->peer (A12). A client
+// can write any X-Forwarded-For it likes, so the header is believed only when the
+// socket peer *is* the configured proxy (config `trusted_proxy`, RAIZE_TRUSTED_PROXY);
+// then the client is the rightmost entry that is not the proxy itself.
+
+import "../str/str";
+import "arena";
+import "header";
+import "request";
+import "context";
+
+// The trusted proxy, bytes a.b.c.d in memory order; 0 = none. Set before serving.
+var g_rz_trusted_proxy: uint32 = 0;
+
+/// internal: context/peer, config/validate, app/run. Parses a dotted quad
+/// ("10.0.0.1") into bytes a.b.c.d in memory order.
+/// in:      s the text (no spaces); out receives the address
+/// returns: true when `s` is exactly four decimal parts 0..255
+/// owns:    nothing
+export fn rz__ipv4_parse(s: string, out: uint32*) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n < 7 || n > 15) { return false; }
+  var parts: uint8[4];
+  var part: int32 = 0;
+  var val: int32 = 0;
+  var digits: int32 = 0;
+  for i in 0..n {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 46) {
+      if (digits == 0 || part >= 3) { return false; }
+      parts[part] = (uint8)val;
+      part = part + 1;
+      val = 0;
+      digits = 0;
+    } else if (c >= 48 && c <= 57) {
+      val = val * 10 + (c - 48);
+      digits = digits + 1;
+      if (digits > 3 || val > 255) { return false; }
+    } else {
+      return false;
+    }
+  }
+  if (digits == 0 || part != 3) { return false; }
+  parts[3] = (uint8)val;
+  var p: uint8* = (uint8*)out;
+  for k in 0..4 { p[k] = parts[k]; }
+  return true;
+}
+
+/// internal: context/peer, context/conn. Formats an address as "a.b.c.d" in the arena.
+/// in:      ip bytes a.b.c.d in memory order; arena where the text goes
+/// returns: the text, or "" when the arena is exhausted
+/// owns:    the text lives in `arena`
+export fn rz__ipv4_format(ip: uint32, arena: RzArena*) -> string {
+  var tmp: uint32 = ip;
+  var p: uint8* = (uint8*)&tmp;
+  var b: RzBuf* = rz_buf_new_cap(16);
+  for k in 0..4 {
+    if (k > 0) { rz_buf_add_byte(b, 46); }
+    rz_buf_add_int(b, (int64)p[k]);
+  }
+  var s: string = rz_arena_str(arena, rz_buf_str(b));
+  rz_buf_free(b);
+  return s;
+}
+
+/// internal: app/run. Publishes the trusted proxy before the workers start.
+/// in:      ip the proxy's address (rz__ipv4_parse), or 0 for none
+/// returns: nothing
+/// owns:    nothing
+export fn rz__peer_set_trusted(ip: uint32) {
+  g_rz_trusted_proxy = ip;
+}
+
+// The last X-Forwarded-For line (the proxy appends; earlier lines are the client's).
+fn rz__xff_last(req: RzRequest*) -> string {
+  var v: string = rz_str_empty();
+  for i in 0..req->header_count {
+    if (rz_str_eq_ci(req->headers[i].name, "x-forwarded-for")) { v = req->headers[i].value; }
+  }
+  return v;
+}
+
+// Rightmost entry of `list` that is a valid address and not the proxy; 0 when none.
+fn rz__xff_client(list: string, proxy: uint32) -> uint32 {
+  var end: int64 = (int64)list.length;
+  var k: int64 = end - 1;
+  while (k >= -1) {
+    if (k < 0 || list.chars[k] == 44) {
+      var entry: string = rz_header_trim(rz_str_sub(list, k + 1, end));
+      var ip: uint32 = 0;
+      if (!rz__ipv4_parse(entry, &ip)) { return 0; }   // garbage: trust nothing further left
+      if (ip != proxy) { return ip; }
+      end = k;
+    }
+    k = k - 1;
+  }
+  return 0;
+}
+
+/// The client's IPv4 address as "a.b.c.d". It is the socket's peer, except when
+/// that peer is the configured `trusted_proxy` (RAIZE_TRUSTED_PROXY): then it is the
+/// rightmost X-Forwarded-For entry that is not the proxy (the socket peer when the
+/// header is missing or unreadable). Without trusted_proxy the header is ignored.
+///
+/// in:      ctx the request
+/// returns: the address, or "" when the server did not record one
+/// owns:    text in the request arena; valid until the handler returns
+/// thread:  the worker serving the request
+/// example:
+///   println("login from {rz_ctx_peer(ctx)}");
+export fn rz_ctx_peer(ctx: RzContext*) -> string {
+  if (ctx == 0 || ctx->peer == 0) { return rz_str_empty(); }
+  var ip: uint32 = ctx->peer;
+  if (g_rz_trusted_proxy != 0 && ip == g_rz_trusted_proxy && ctx->req != 0) {
+    var client: uint32 = rz__xff_client(rz__xff_last(ctx->req), g_rz_trusted_proxy);
+    if (client != 0) { ip = client; }
+  }
+  return rz__ipv4_format(ip, ctx->arena);
+}
+
+@test fn t_rz_ipv4_roundtrip() -> int32 {
+  var ip: uint32 = 0;
+  if (!rz__ipv4_parse("127.0.0.1", &ip)) { return 1; }
+  var p: uint8* = (uint8*)&ip;
+  if (p[0] != 127 || p[3] != 1) { return 2; }
+  if (rz__ipv4_parse("256.0.0.1", &ip)) { return 3; }
+  if (rz__ipv4_parse("1.2.3", &ip)) { return 4; }
+  if (rz__ipv4_parse("1.2.3.4.5", &ip)) { return 5; }
+  if (rz__ipv4_parse("1..3.4", &ip)) { return 6; }
+  if (rz__ipv4_parse(" 1.2.3.4", &ip)) { return 7; }
+  var a: RzArena* = rz_arena_new();
+  rz__ipv4_parse("10.20.30.40", &ip);
+  if (!rz_str_eq(rz__ipv4_format(ip, a), "10.20.30.40")) { rz_arena_free(a); return 8; }
+  var proxy: uint32 = 0;
+  rz__ipv4_parse("127.0.0.1", &proxy);
+  var c: uint32 = rz__xff_client("9.9.9.9, 10.20.30.40, 127.0.0.1", proxy);
+  if (!rz_str_eq(rz__ipv4_format(c, a), "10.20.30.40")) { rz_arena_free(a); return 9; }
+  if (rz__xff_client("junk", proxy) != 0) { rz_arena_free(a); return 10; }
+  rz_arena_free(a);
+  return 0;
+}

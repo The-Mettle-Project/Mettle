@@ -1,0 +1,94 @@
+// raize/template/vars — the variable map a template is rendered against.
+//
+// Fixed capacity, by design: RZ_TEMPLATE_MAX_VARS names. A struct field's
+// array extent must be a literal in Mettle, so the literal 32 below and the
+// constant must agree (t_rz_template_vars_limit asserts the boundary).
+//
+// Lifetime: the map *borrows* every name and value. It does not copy, so a
+// value may be a view into the request arena for the duration of one handler
+// call. If a map must outlive its source bytes (a startup default set, say),
+// the caller keeps the literals alive or copies with rz_str_dup.
+//
+// Lookup is a linear scan. At 32 entries that is fewer comparisons than a hash
+// would cost in setup, and it keeps the type allocation-free: an RzVarMap is
+// a stack value of 32 * 16 + 4 bytes, safe to build per request.
+
+import "raize_core/str/str";
+
+export const RZ_TEMPLATE_MAX_VARS: int32 = 32;
+export const RZ_TEMPLATE_MAX_NAME: int64 = 64;
+
+export struct RzVar {
+  name: string;
+  value: string;
+}
+
+// The literal 32 is RZ_TEMPLATE_MAX_VARS.
+export struct RzVarMap {
+  items: RzVar[32];
+  count: int32;
+}
+
+export fn rz_vars_init(m: RzVarMap*) {
+  if (m == 0) { return; }
+  m->count = 0;
+}
+
+// 0 stored or replaced, -1 bad name, -2 full. Setting an existing name
+// replaces its value in place, keeping insertion order.
+export fn rz_vars_set(m: RzVarMap*, name: string, value: string) -> int32 {
+  if (m == 0) { return -1; }
+  var n: int64 = (int64)name.length;
+  if (n <= 0) { return -1; }
+  if (n > RZ_TEMPLATE_MAX_NAME) { return -1; }
+  var i: int32 = 0;
+  while (i < m->count) {
+    if (rz_str_eq(m->items[i].name, name)) {
+      m->items[i].value = value;
+      return 0;
+    }
+    i = i + 1;
+  }
+  if (m->count >= RZ_TEMPLATE_MAX_VARS) { return -2; }
+  var at: int32 = m->count;
+  m->items[at].name = name;
+  m->items[at].value = value;
+  m->count = at + 1;
+  return 0;
+}
+
+// Empty view when absent. A present-but-empty value and a missing name are
+// deliberately indistinguishable at render time: both produce no output and
+// both make a section false. The startup check (compile.mettle) is what tells
+// a wiring mistake apart from an intentional empty value.
+export fn rz_vars_get(m: RzVarMap*, name: string) -> string {
+  if (m == 0) { return rz_str_empty(); }
+  var i: int32 = 0;
+  while (i < m->count) {
+    if (rz_str_eq(m->items[i].name, name)) {
+      return m->items[i].value;
+    }
+    i = i + 1;
+  }
+  return rz_str_empty();
+}
+
+export fn rz_vars_has(m: RzVarMap*, name: string) -> bool {
+  if (m == 0) { return false; }
+  var i: int32 = 0;
+  while (i < m->count) {
+    if (rz_str_eq(m->items[i].name, name)) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+export fn rz_vars_count(m: RzVarMap*) -> int32 {
+  if (m == 0) { return 0; }
+  return m->count;
+}
+
+export fn rz_vars_clear(m: RzVarMap*) {
+  if (m == 0) { return; }
+  m->count = 0;
+}

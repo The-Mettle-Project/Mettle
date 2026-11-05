@@ -1,0 +1,214 @@
+// SVG path data ("M10 10 L20 20 Z") to a CanvasPath, following the grammar
+// in SVG 2, section 9.3.9 (and SVG 1.1 section 8.3.9). On an error the
+// path keeps every segment before it, as SVG's error rules say, and the
+// result is CANVAS_E_PARSE.
+
+import "../core/base";
+import "path";
+
+struct Rd { p: uint8*; n: int64; i: int64; }
+
+@inline fn is_ws(c: uint8) -> bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 12; }
+
+fn skip_ws(r: Rd*) {
+  while (r->i < r->n && is_ws(r->p[r->i])) { r->i = r->i + 1; }
+}
+
+// Skips spaces and at most one comma.
+fn skip_sep(r: Rd*) {
+  skip_ws(r);
+  if (r->i < r->n && r->p[r->i] == 44) { r->i = r->i + 1; skip_ws(r); }
+}
+
+fn pow10(e: int32) -> float64 {
+  var r: float64 = 1.0;
+  var b: float64 = 10.0;
+  var k: int32 = e;
+  if (k < 0) { k = -k; }
+  if (k > 400) { k = 400; }
+  while (k > 0) {
+    if ((k & 1) != 0) { r = r * b; }
+    b = b * b;
+    k = k >> 1;
+  }
+  if (e < 0) { return 1.0 / r; }
+  return r;
+}
+
+// A number; false (position unchanged) when there is none.
+fn number(r: Rd*, out: float32*) -> bool {
+  var i: int64 = r->i;
+  var neg: bool = false;
+  if (i < r->n && (r->p[i] == 43 || r->p[i] == 45)) { neg = r->p[i] == 45; i = i + 1; }
+  var mant: float64 = 0.0;
+  var digits: int32 = 0;
+  var scale: int32 = 0;
+  while (i < r->n && r->p[i] >= 48 && r->p[i] <= 57) {
+    if (digits < 18) { mant = mant * 10.0 + (float64)(r->p[i] - 48); digits = digits + 1; }
+    else { scale = scale + 1; }
+    i = i + 1;
+  }
+  var had_int: bool = i > r->i && !(i == r->i + 1 && (r->p[r->i] == 43 || r->p[r->i] == 45));
+  var had_frac: bool = false;
+  if (i < r->n && r->p[i] == 46) {
+    var j: int64 = i + 1;
+    while (j < r->n && r->p[j] >= 48 && r->p[j] <= 57) {
+      if (digits < 18) { mant = mant * 10.0 + (float64)(r->p[j] - 48); digits = digits + 1; scale = scale - 1; }
+      j = j + 1;
+      had_frac = true;
+    }
+    if (had_frac || had_int) { i = j; }
+  }
+  if (!had_int && !had_frac) { return false; }
+  if (i < r->n && (r->p[i] == 101 || r->p[i] == 69)) {
+    var j2: int64 = i + 1;
+    var eneg: bool = false;
+    if (j2 < r->n && (r->p[j2] == 43 || r->p[j2] == 45)) { eneg = r->p[j2] == 45; j2 = j2 + 1; }
+    if (j2 < r->n && r->p[j2] >= 48 && r->p[j2] <= 57) {
+      var e: int32 = 0;
+      while (j2 < r->n && r->p[j2] >= 48 && r->p[j2] <= 57) {
+        if (e < 10000) { e = e * 10 + (int32)(r->p[j2] - 48); }
+        j2 = j2 + 1;
+      }
+      if (eneg) { e = -e; }
+      scale = scale + e;
+      i = j2;
+    }
+  }
+  var v: float64 = mant;
+  if (scale != 0 && mant != 0.0) { v = mant * pow10(scale); }
+  if (neg) { v = -v; }
+  if (v > 3.0e38) { v = 3.0e38; }
+  if (v < -3.0e38) { v = -3.0e38; }
+  *out = (float32)v;
+  r->i = i;
+  return true;
+}
+
+// An arc flag: a single '0' or '1'.
+fn flag(r: Rd*, out: bool*) -> bool {
+  if (r->i >= r->n) { return false; }
+  var c: uint8 = r->p[r->i];
+  if (c != 48 && c != 49) { return false; }
+  *out = c == 49;
+  r->i = r->i + 1;
+  return true;
+}
+
+// Reads k numbers separated by optional commas.
+fn nums(r: Rd*, v: float32*, k: int32) -> bool {
+  for j in 0..k {
+    if (j > 0) { skip_sep(r); }
+    if (!number(r, &v[j])) { return false; }
+  }
+  return true;
+}
+
+@inline fn is_cmd(c: uint8) -> bool {
+  return c == 77 || c == 109 || c == 90 || c == 122 || c == 76 || c == 108 || c == 72 || c == 104 ||
+         c == 86 || c == 118 || c == 67 || c == 99 || c == 83 || c == 115 || c == 81 || c == 113 ||
+         c == 84 || c == 116 || c == 65 || c == 97;
+}
+
+/// Parses SVG path data from n bytes at s, appending to p.
+export fn canvas_svg_path_bytes(s: uint8*, n: int64, p: CanvasPath*) -> int32 {
+  var r: Rd;
+  r.p = s; r.n = n; r.i = 0;
+  if (s == 0) { r.n = 0; }
+  var cmd: uint8 = 0;
+  var cx: float32 = 0.0; var cy: float32 = 0.0;      // current point
+  var sx: float32 = 0.0; var sy: float32 = 0.0;      // subpath start
+  var lcx: float32 = 0.0; var lcy: float32 = 0.0;    // last control point
+  var last: uint8 = 0;                               // previous command, upper case
+  var first: bool = true;
+  var v: float32[7];
+  skip_ws(&r);
+  while (r.i < r.n) {
+    var c: uint8 = r.p[r.i];
+    if (is_cmd(c)) {
+      cmd = c;
+      r.i = r.i + 1;
+      skip_ws(&r);
+    } else if (cmd == 0 || cmd == 90 || cmd == 122) {
+      return CANVAS_E_PARSE;
+    }
+    if (first && cmd != 77 && cmd != 109) { return CANVAS_E_PARSE; }
+    first = false;
+    var rel: bool = cmd >= 97;
+    var up: uint8 = cmd;
+    if (rel) { up = (uint8)(cmd - 32); }
+    var ox: float32 = 0.0; var oy: float32 = 0.0;
+    if (rel) { ox = cx; oy = cy; }
+    if (up == 90) {
+      canvas_close(p);
+      cx = sx; cy = sy;
+      last = up;
+      skip_ws(&r);
+      continue;
+    }
+    if (up == 77) {
+      if (!nums(&r, &v[0], 2)) { return CANVAS_E_PARSE; }
+      cx = v[0] + ox; cy = v[1] + oy;
+      canvas_move_to(p, cx, cy);
+      sx = cx; sy = cy;
+      // later pairs are line-tos
+      if (rel) { cmd = 108; } else { cmd = 76; }
+    } else if (up == 76) {
+      if (!nums(&r, &v[0], 2)) { return CANVAS_E_PARSE; }
+      cx = v[0] + ox; cy = v[1] + oy;
+      canvas_line_to(p, cx, cy);
+    } else if (up == 72) {
+      if (!nums(&r, &v[0], 1)) { return CANVAS_E_PARSE; }
+      cx = v[0] + ox;
+      canvas_line_to(p, cx, cy);
+    } else if (up == 86) {
+      if (!nums(&r, &v[0], 1)) { return CANVAS_E_PARSE; }
+      cy = v[0] + oy;
+      canvas_line_to(p, cx, cy);
+    } else if (up == 67) {
+      if (!nums(&r, &v[0], 6)) { return CANVAS_E_PARSE; }
+      canvas_cubic_to(p, v[0] + ox, v[1] + oy, v[2] + ox, v[3] + oy, v[4] + ox, v[5] + oy);
+      lcx = v[2] + ox; lcy = v[3] + oy;
+      cx = v[4] + ox; cy = v[5] + oy;
+    } else if (up == 83) {
+      if (!nums(&r, &v[0], 4)) { return CANVAS_E_PARSE; }
+      var k1x: float32 = cx; var k1y: float32 = cy;
+      if (last == 67 || last == 83) { k1x = 2.0 * cx - lcx; k1y = 2.0 * cy - lcy; }
+      canvas_cubic_to(p, k1x, k1y, v[0] + ox, v[1] + oy, v[2] + ox, v[3] + oy);
+      lcx = v[0] + ox; lcy = v[1] + oy;
+      cx = v[2] + ox; cy = v[3] + oy;
+    } else if (up == 81) {
+      if (!nums(&r, &v[0], 4)) { return CANVAS_E_PARSE; }
+      canvas_quad_to(p, v[0] + ox, v[1] + oy, v[2] + ox, v[3] + oy);
+      lcx = v[0] + ox; lcy = v[1] + oy;
+      cx = v[2] + ox; cy = v[3] + oy;
+    } else if (up == 84) {
+      if (!nums(&r, &v[0], 2)) { return CANVAS_E_PARSE; }
+      var qx: float32 = cx; var qy: float32 = cy;
+      if (last == 81 || last == 84) { qx = 2.0 * cx - lcx; qy = 2.0 * cy - lcy; }
+      canvas_quad_to(p, qx, qy, v[0] + ox, v[1] + oy);
+      lcx = qx; lcy = qy;
+      cx = v[0] + ox; cy = v[1] + oy;
+    } else if (up == 65) {
+      if (!nums(&r, &v[0], 3)) { return CANVAS_E_PARSE; }
+      var large: bool = false;
+      var sweep: bool = false;
+      skip_sep(&r);
+      if (!flag(&r, &large)) { return CANVAS_E_PARSE; }
+      skip_sep(&r);
+      if (!flag(&r, &sweep)) { return CANVAS_E_PARSE; }
+      skip_sep(&r);
+      if (!nums(&r, &v[3], 2)) { return CANVAS_E_PARSE; }
+      canvas_svg_arc_to(p, v[0], v[1], v[2], large, sweep, v[3] + ox, v[4] + oy);
+      cx = v[3] + ox; cy = v[4] + oy;
+    }
+    last = up;
+    skip_sep(&r);
+  }
+  return CANVAS_OK;
+}
+
+/// Parses SVG path data, appending to p.
+export fn canvas_svg_path(text: string, p: CanvasPath*) -> int32 {
+  return canvas_svg_path_bytes(text.chars, (int64)text.length, p);
+}

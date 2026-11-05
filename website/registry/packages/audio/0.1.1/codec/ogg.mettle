@@ -1,0 +1,233 @@
+// Ogg: the page and packet layer under Vorbis, Opus and Ogg FLAC
+// (RFC 3533). Pages are checked with their CRC; a bad page is skipped and
+// the reader finds the next "OggS". Only the first logical stream is read.
+//
+//   var o: AudioOgg;
+//   audio_ogg_init(&o, data, size);
+//   var pk: AudioOggPacket;
+//   while (audio_ogg_packet(&o, &pk) == AUDIO_OK) { ... pk.data[0 .. pk.len] ... }
+//   audio_ogg_free(&o);
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../core/bits";
+
+export struct AudioOggPage {
+  off: int64;       // where the page starts
+  size: int64;      // header + data
+  data: int64;      // where the page's data starts
+  nseg: int32;
+  flags: int32;     // 1 continued, 2 first page, 4 last page
+  granule: int64;   // -1 when no packet ends on this page
+  serial: uint32;
+  seq: uint32;
+}
+
+export struct AudioOggPacket {
+  data: uint8*;     // valid until the next call
+  len: int64;
+  granule: int64;   // the page granule if this is the last packet ending on its page, else -1
+  bos: bool;        // from the stream's first page
+  eos: bool;        // last packet of the stream
+}
+
+export struct AudioOgg {
+  p: uint8*;
+  n: int64;
+  pos: int64;       // where to look for the next page
+  serial: uint32;
+  locked: bool;
+  pg: AudioOggPage;
+  have: bool;       // pg holds a page with segments still to read
+  segi: int32;
+  dpos: int64;      // data offset of segment segi
+  last_end: int32;  // last segment on the page that ends a packet, or -1
+  pk: AudioBuf;
+  part: bool;       // pk holds the start of a packet
+  skip: bool;       // drop segments until the next packet starts
+  prev_seq: int64;
+  done: bool;       // saw the last page
+}
+
+export fn audio_ogg_init(o: AudioOgg*, p: uint8*, n: int64) {
+  memset(o, 0, sizeof(AudioOgg));
+  o->p = p;
+  o->n = n;
+  if (n < 0) { o->n = 0; }
+  o->prev_seq = -1;
+}
+
+export fn audio_ogg_free(o: AudioOgg*) {
+  audio_buf_free(&o->pk);
+}
+
+/// Reads and checks the page header at `off`.
+export fn audio_ogg_page_at(o: AudioOgg*, off: int64, pg: AudioOggPage*) -> int32 {
+  if (off < 0 || o->n - off < 27) { return AUDIO_E_TRUNC; }
+  var h: uint8* = o->p + off;
+  if (h[0] != 'O' || h[1] != 'g' || h[2] != 'g' || h[3] != 'S') { return AUDIO_E_DATA; }
+  if (h[4] != 0) { return AUDIO_E_DATA; }
+  var nseg: int32 = (int32)h[26];
+  if (o->n - off < 27 + (int64)nseg) { return AUDIO_E_TRUNC; }
+  var body: int64 = 0;
+  for i in 0..nseg { body = body + (int64)h[27 + i]; }
+  var size: int64 = 27 + (int64)nseg + body;
+  if (o->n - off < size) { return AUDIO_E_TRUNC; }
+  // CRC over the page with its CRC field as zero
+  var crc: uint32 = audio_crc32_ogg(0, h, 22);
+  var z: uint8[4] = [0, 0, 0, 0];
+  crc = audio_crc32_ogg(crc, &z[0], 4);
+  crc = audio_crc32_ogg(crc, h + 26, size - 26);
+  var want: uint32 = (uint32)h[22] | ((uint32)h[23] << 8) | ((uint32)h[24] << 16) | ((uint32)h[25] << 24);
+  if (crc != want) { return AUDIO_E_CHECK; }
+  var g: uint64 = 0;
+  for i in 0..8 { g = g | ((uint64)h[6 + i] << (8 * (int32)i)); }
+  pg->off = off;
+  pg->size = size;
+  pg->data = off + 27 + (int64)nseg;
+  pg->nseg = nseg;
+  pg->flags = (int32)h[5];
+  pg->granule = (int64)g;
+  pg->serial = (uint32)h[14] | ((uint32)h[15] << 8) | ((uint32)h[16] << 16) | ((uint32)h[17] << 24);
+  pg->seq = (uint32)h[18] | ((uint32)h[19] << 8) | ((uint32)h[20] << 16) | ((uint32)h[21] << 24);
+  return AUDIO_OK;
+}
+
+/// Finds the next good page at or after `off`. AUDIO_END when there is none.
+export fn audio_ogg_find_page(o: AudioOgg*, off: int64, pg: AudioOggPage*) -> int32 {
+  var at: int64 = off;
+  if (at < 0) { at = 0; }
+  while (o->n - at >= 27) {
+    var q: uint8* = o->p + at;
+    if (q[0] == 'O' && q[1] == 'g' && q[2] == 'g' && q[3] == 'S') {
+      if (audio_ogg_page_at(o, at, pg) == AUDIO_OK) { return AUDIO_OK; }
+    }
+    at = at + 1;
+  }
+  return AUDIO_END;
+}
+
+// Takes the next page of our stream into o->pg.
+fn next_page(o: AudioOgg*) -> int32 {
+  while (true) {
+    if (o->done) { return AUDIO_END; }
+    var pg: AudioOggPage;
+    if (audio_ogg_find_page(o, o->pos, &pg) != AUDIO_OK) { o->pos = o->n; return AUDIO_END; }
+    o->pos = pg.off + pg.size;
+    if (!o->locked) {
+      if ((pg.flags & 2) == 0) { continue; }
+      o->serial = pg.serial;
+      o->locked = true;
+    }
+    if (pg.serial != o->serial) { continue; }
+    o->pg = pg;
+    o->have = true;
+    o->segi = 0;
+    o->dpos = pg.data;
+    o->last_end = -1;
+    var lace: uint8* = o->p + pg.off + 27;
+    for i in 0..pg.nseg {
+      if (lace[i] < 255) { o->last_end = (int32)i; }
+    }
+    // a gap in page numbers loses the packet in progress
+    var gap: bool = o->prev_seq >= 0 && (int64)pg.seq != ((o->prev_seq + 1) & 0xFFFFFFFF);
+    o->prev_seq = (int64)pg.seq;
+    if (gap) { o->part = false; o->pk.len = 0; }
+    var cont: bool = (pg.flags & 1) != 0;
+    if (cont && !o->part) { o->skip = true; }
+    if (!cont && o->part) { o->part = false; o->pk.len = 0; }
+    return AUDIO_OK;
+  }
+  return AUDIO_END;
+}
+
+/// Reads the next packet of the stream. AUDIO_END at the end.
+export fn audio_ogg_packet(o: AudioOgg*, out: AudioOggPacket*) -> int32 {
+  while (true) {
+    if (!o->have || o->segi >= o->pg.nseg) {
+      o->have = false;
+      if ((o->pg.flags & 4) != 0 && o->locked && o->pg.serial == o->serial && o->pg.size > 0) { o->done = true; }
+      var rc: int32 = next_page(o);
+      if (rc != AUDIO_OK) { return rc; }
+      continue;
+    }
+    var lace: uint8* = o->p + o->pg.off + 27;
+    // gather segments up to the end of a packet or of the page
+    var start: int64 = o->dpos;
+    var len: int64 = 0;
+    var ended: bool = false;
+    var endseg: int32 = -1;
+    while (o->segi < o->pg.nseg) {
+      var l: int64 = (int64)lace[o->segi];
+      len = len + l;
+      o->segi = o->segi + 1;
+      if (l < 255) { ended = true; endseg = o->segi - 1; break; }
+    }
+    o->dpos = start + len;
+    if (o->skip) {
+      if (ended) { o->skip = false; }
+      continue;
+    }
+    if (!ended) {
+      if (audio_buf_append(&o->pk, o->p + start, len) != AUDIO_OK) { return AUDIO_E_MEM; }
+      o->part = true;
+      continue;
+    }
+    if (o->part) {
+      if (audio_buf_append(&o->pk, o->p + start, len) != AUDIO_OK) { return AUDIO_E_MEM; }
+      out->data = o->pk.data;
+      out->len = o->pk.len;
+      o->pk.len = 0;
+      o->part = false;
+    } else {
+      out->data = o->p + start;
+      out->len = len;
+    }
+    out->granule = -1;
+    if (endseg == o->last_end) { out->granule = o->pg.granule; }
+    out->bos = (o->pg.flags & 2) != 0;
+    out->eos = (o->pg.flags & 4) != 0 && endseg == o->last_end;
+    return AUDIO_OK;
+  }
+  return AUDIO_END;
+}
+
+/// Moves the reader to the first page at or after byte `off`. The packet
+/// in progress is dropped, and reading starts at the next packet that
+/// starts on a page.
+export fn audio_ogg_seek_byte(o: AudioOgg*, off: int64) {
+  o->pos = off;
+  if (o->pos < 0) { o->pos = 0; }
+  if (o->pos > o->n) { o->pos = o->n; }
+  o->have = false;
+  o->part = false;
+  o->skip = false;
+  o->pk.len = 0;
+  o->prev_seq = -1;
+  o->done = false;
+  o->pg.size = 0;
+  o->pg.flags = 0;
+}
+
+/// The granule of the last page of the stream with one, or -1.
+export fn audio_ogg_last_granule(o: AudioOgg*) -> int64 {
+  var chunk: int64 = 65536;
+  var end: int64 = o->n;
+  while (end > 0) {
+    var from: int64 = end - chunk;
+    if (from < 0) { from = 0; }
+    var best: int64 = -1;
+    var at: int64 = from;
+    var pg: AudioOggPage;
+    while (at < end && audio_ogg_find_page(o, at, &pg) == AUDIO_OK && pg.off < end) {
+      if ((!o->locked || pg.serial == o->serial) && pg.granule != -1) { best = pg.granule; }
+      at = pg.off + pg.size;
+    }
+    if (best != -1) { return best; }
+    if (from == 0) { break; }
+    end = from + 27;   // pages may straddle the chunk edge
+    chunk = chunk * 2;
+  }
+  return -1;
+}

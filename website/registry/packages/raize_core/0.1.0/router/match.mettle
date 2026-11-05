@@ -1,0 +1,392 @@
+// raize/router/match — one request: decode, match, dispatch.
+//
+// Nothing here allocates. Matching walks the trie in place with an explicit
+// frame stack (max RZ_MAX_SEGS deep) and backtracks, so a failed exact branch
+// still falls back to the :param branch at the same node. trie.mettle stores
+// children in priority order, so a linear scan is exactly "exact, then
+// :param, then *wildcard".
+//
+// Decoding (the default; rz_router_set_path_decoded(rt, false)) percent-
+// decodes, collapses runs of '/', then refuses NUL, "." and ".." with 400, so
+// "%2e%2e" is rejected *after* decoding. "%2F" stays encoded: decoding it
+// would turn data into a path separator. With path_decoded = true the server
+// already decoded, so this file only re-checks structure and never decodes
+// twice. Param values are views into req->path (arena, whole request) or, in
+// fallback mode, into this call's stack scratch (handler-scoped only); the
+// router never mutates req->path.
+//
+// Dispatch mirrors the returned status into ctx->status and resp->status and
+// builds no error body (middleware's/server's job).
+
+import "../str/str";
+import "../context/context";
+import "trie";
+
+struct RzCursor {
+  off: int64;
+  start: int64;
+  len: int64;
+  more: bool;
+}
+
+struct RzMatch {
+  node: int32;
+  ncap: int32;
+}
+
+// Appends `s` to buf when it fits; returns the new length.
+fn rz_put(buf: uint8*, cap: int64, n: int64, s: string) -> int64 {
+  var m: int64 = (int64)s.length;
+  if (n + m + 1 > cap) { return n; }
+  var i: int64 = 0;
+  while (i < m) {
+    buf[n + i] = s.chars[i];
+    i = i + 1;
+  }
+  return n + m;
+}
+
+// Builds the Allow header value for a *registered-method bitmask*, in the
+// canonical order GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS, CONNECT, TRACE.
+// Nothing is synthesised: a GET-only route answers "GET", not "GET, HEAD" —
+// HEAD is dispatched as a GET fallback (see the file header) but Allow
+// advertises what was registered. Returns a view into buf (caller-owned); a
+// 96-byte buffer holds every combination.
+export fn rz_router_allow(mask: int32, buf: uint8*, cap: int64) -> string {
+  var m: int32 = mask;
+  var n: int64 = 0;
+  var b: int32 = 1;
+  var i: int32 = 0;
+  while (i < RZ_METHOD_SLOTS) {
+    if ((m & b) != 0) {
+      if (n > 0) { n = rz_put(buf, cap, n, ", "); }
+      n = rz_put(buf, cap, n, rz_method_name(b));
+    }
+    b = b * 2;
+    i = i + 1;
+  }
+  return rz_str_view(buf, n);
+}
+
+// ---------------------------------------------------------------------------
+// Decoding and normalization
+// ---------------------------------------------------------------------------
+
+fn rz_hex_val(c: uint8) -> int32 {
+  var v: int32 = (int32)c;
+  if (v >= 48 && v <= 57) { return v - 48; }
+  if (v >= 97 && v <= 102) { return v - 87; }
+  if (v >= 65 && v <= 70) { return v - 55; }
+  return -1;
+}
+
+// Percent-decodes src into dst, collapsing runs of '/' to one. "%2F" is left
+// encoded (three literal bytes) so it can never become a separator. Returns
+// the decoded length, or -1 for a bad escape or a NUL byte.
+fn rz_decode_path(src: string, dst: uint8*, cap: int64) -> int64 {
+  var n: int64 = (int64)src.length;
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: uint8 = src.chars[i];
+    if (c == 37) {
+      if (i + 2 >= n) { return -1; }
+      var hi: int32 = rz_hex_val(src.chars[i + 1]);
+      var lo: int32 = rz_hex_val(src.chars[i + 2]);
+      if (hi < 0 || lo < 0) { return -1; }
+      var v: int32 = hi * 16 + lo;
+      if (v == 0) { return -1; }
+      if (v == 47) {
+        // Keep "%2F" verbatim: decoding it would change the path structure.
+        if (o + 3 > cap) { return -1; }
+        dst[o] = 37;
+        dst[o + 1] = src.chars[i + 1];
+        dst[o + 2] = src.chars[i + 2];
+        o = o + 3;
+        i = i + 3;
+        continue;
+      }
+      if (o + 1 > cap) { return -1; }
+      dst[o] = (uint8)v;
+      o = o + 1;
+      i = i + 3;
+      continue;
+    }
+    if (c == 0) { return -1; }
+    if (c == 47 && o > 0 && dst[o - 1] == 47) {
+      i = i + 1;
+      continue;
+    }
+    if (o + 1 > cap) { return -1; }
+    dst[o] = c;
+    o = o + 1;
+    i = i + 1;
+  }
+  return o;
+}
+
+// First segment of a path. "/" and "" have none.
+fn rz_cursor_first(path: string) -> RzCursor {
+  var c: RzCursor;
+  c.off = 0;
+  c.start = 0;
+  c.len = 0;
+  c.more = false;
+  var n: int64 = (int64)path.length;
+  if (n <= 1) { return c; }
+  var i: int64 = 1;
+  var s: int64 = i;
+  while (i < n && path.chars[i] != 47) { i = i + 1; }
+  c.start = s;
+  c.len = i - s;
+  c.off = i;
+  c.more = true;
+  return c;
+}
+
+// The segment after cur. A trailing slash yields one final empty segment.
+fn rz_cursor_next(path: string, cur: RzCursor) -> RzCursor {
+  var c: RzCursor;
+  c.start = 0;
+  c.len = 0;
+  c.more = false;
+  var n: int64 = (int64)path.length;
+  if (!cur.more) {
+    c.off = cur.off;
+    return c;
+  }
+  var i: int64 = cur.off;
+  if (i >= n) {
+    c.off = n;
+    return c;
+  }
+  i = i + 1;
+  var s: int64 = i;
+  while (i < n && path.chars[i] != 47) { i = i + 1; }
+  c.start = s;
+  c.len = i - s;
+  c.off = i;
+  c.more = true;
+  return c;
+}
+
+fn rz_seg_eq(path: string, cur: RzCursor, seg: string) -> bool {
+  if (cur.len != (int64)seg.length) { return false; }
+  var i: int64 = 0;
+  while (i < cur.len) {
+    if (path.chars[cur.start + i] != seg.chars[i]) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// Refuses NUL, "." and ".." segments. Called on every request, decoded or
+// not, so a server that pre-decodes cannot smuggle "../" past the router.
+fn rz_path_sane(path: string) -> bool {
+  var n: int64 = (int64)path.length;
+  var i: int64 = 0;
+  while (i < n) {
+    if (path.chars[i] == 0) { return false; }
+    i = i + 1;
+  }
+  var cur: RzCursor = rz_cursor_first(path);
+  while (cur.more) {
+    if (cur.len == 1 && path.chars[cur.start] == 46) { return false; }
+    if (cur.len == 2 && path.chars[cur.start] == 46 && path.chars[cur.start + 1] == 46) {
+      return false;
+    }
+    cur = rz_cursor_next(path, cur);
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Matching
+// ---------------------------------------------------------------------------
+
+// Walks the trie with backtracking. Children are stored in priority order, so
+// a linear scan per node is exactly "exact, then :param, then *wildcard".
+// Captures are recorded and rolled back with the frames.
+fn rz_trie_match(rt: RzRouter*, path: string, cap_node: int32*, cap_start: int64*, cap_len: int64*) -> RzMatch {
+  var res: RzMatch;
+  res.node = -1;
+  res.ncap = 0;
+
+  var f_node: int32[34];
+  var f_child: int32[34];
+  var f_cap: int32[34];
+  var f_off: int64[34];
+  var f_start: int64[34];
+  var f_len: int64[34];
+  var f_more: bool[34];
+
+  var node: int32 = 0;
+  var cur: RzCursor = rz_cursor_first(path);
+  var child: int32 = 0;
+  var cap_n: int32 = 0;
+  var depth: int32 = 0;
+  var n: int64 = (int64)path.length;
+
+  while (true) {
+    var descended: bool = false;
+    if (!cur.more) {
+      if (rt->nodes[node].methods != 0) {
+        res.node = node;
+        res.ncap = cap_n;
+        return res;
+      }
+    } else {
+      while (child < rt->nodes[node].child_count) {
+        var link: RzLink = rt->nodes[node].children[child];
+        child = child + 1;
+        if (link.kind == RZ_KIND_EXACT) {
+          if (rz_seg_eq(path, cur, rt->nodes[link.node].seg)) {
+            if (depth < RZ_MAX_SEGS) {
+              f_node[depth] = node;
+              f_child[depth] = child;
+              f_cap[depth] = cap_n;
+              f_off[depth] = cur.off;
+              f_start[depth] = cur.start;
+              f_len[depth] = cur.len;
+              f_more[depth] = cur.more;
+              depth = depth + 1;
+              node = link.node;
+              cur = rz_cursor_next(path, cur);
+              child = 0;
+              descended = true;
+            }
+            break;
+          }
+        } else if (link.kind == RZ_KIND_PARAM) {
+          if (cur.len > 0 && cap_n < RZ_MAX_SEGS && depth < RZ_MAX_SEGS) {
+            f_node[depth] = node;
+            f_child[depth] = child;
+            f_cap[depth] = cap_n;
+            f_off[depth] = cur.off;
+            f_start[depth] = cur.start;
+            f_len[depth] = cur.len;
+            f_more[depth] = cur.more;
+            depth = depth + 1;
+            cap_node[cap_n] = link.node;
+            cap_start[cap_n] = cur.start;
+            cap_len[cap_n] = cur.len;
+            cap_n = cap_n + 1;
+            node = link.node;
+            cur = rz_cursor_next(path, cur);
+            child = 0;
+            descended = true;
+            break;
+          }
+        } else {
+          if (rt->nodes[link.node].methods != 0 && cap_n < RZ_MAX_SEGS) {
+            cap_node[cap_n] = link.node;
+            cap_start[cap_n] = cur.start;
+            cap_len[cap_n] = n - cur.start;
+            res.node = link.node;
+            res.ncap = cap_n + 1;
+            return res;
+          }
+          break;
+        }
+      }
+      if (descended) { continue; }
+    }
+    if (depth == 0) { return res; }
+    depth = depth - 1;
+    node = f_node[depth];
+    child = f_child[depth];
+    cap_n = f_cap[depth];
+    cur.off = f_off[depth];
+    cur.start = f_start[depth];
+    cur.len = f_len[depth];
+    cur.more = f_more[depth];
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+fn rz_fail(ctx: RzContext*, code: int32) -> int32 {
+  ctx->status = code;
+  if (ctx->resp != 0) { ctx->resp->status = code; }
+  return code;
+}
+
+// The entry point the server/middleware layer calls. Matches, fills params,
+// dispatches the handler and returns its status. 400/404/405/414/500 are
+// returned as statuses; the body is the caller's business.
+export fn rz_router_handle_path(rt: RzRouter*, ctx: RzContext*, raw_path: string) -> int32 {
+  if (ctx != 0) { ctx->status = 0; }
+  if (rt == 0 || ctx == 0 || ctx->req == 0) { return 500; }
+  var req: RzRequest* = ctx->req;
+  // Nothing is carried between requests on a keep-alive connection.
+  req->param_count = 0;
+  var cap: int32 = 0;
+  if (req->params != 0) { cap = RZ_MAX_PARAMS; }
+
+  var scratch: uint8[2048];
+  var path: string = raw_path;
+  if (!rt->path_decoded) {
+    var dn: int64 = rz_decode_path(raw_path, &scratch[0], RZ_MAX_PATH);
+    if (dn < 0) { return rz_fail(ctx, 400); }
+    path = rz_str_view(&scratch[0], dn);
+  }
+  if ((int64)path.length == 0) { return rz_fail(ctx, 400); }
+  if (path.chars[0] != 47) { return rz_fail(ctx, 400); }
+  if ((int64)path.length > RZ_MAX_PATH) { return rz_fail(ctx, 414); }
+  if (!rz_path_sane(path)) { return rz_fail(ctx, 400); }
+
+  var cap_node: int32[RZ_MAX_SEGS];
+  var cap_start: int64[RZ_MAX_SEGS];
+  var cap_len: int64[RZ_MAX_SEGS];
+  var m: RzMatch = rz_trie_match(rt, path, &cap_node[0], &cap_start[0], &cap_len[0]);
+  if (m.node < 0) { return rz_fail(ctx, 404); }
+
+  var node: int32 = m.node;
+  var want: int32 = rz_method_bit(req->verb);
+  var have: int32 = rt->nodes[node].methods;
+  var use: int32 = 0;
+  if (want != 0 && (have & want) != 0) {
+    use = want;
+  } else if (want == RZ_BIT_HEAD && (have & RZ_BIT_GET) != 0) {
+    use = RZ_BIT_GET;
+  }
+  if (use == 0) {
+    var abuf: uint8[96];
+    var allow: string = rz_router_allow(have, &abuf[0], 96);
+    if (ctx->resp != 0) {
+      // The value is built from method names, so it can never fail the CRLF
+      // guard; a full header table (-2) leaves the 405 without Allow rather
+      // than turning a protocol answer into a 500.
+      rz_resp_header_set(ctx->resp, "Allow", allow);
+    }
+    return rz_fail(ctx, 405);
+  }
+
+  if (m.ncap > cap) { return rz_fail(ctx, 500); }
+  var i: int32 = 0;
+  while (i < m.ncap) {
+    req->params[i].name = rt->nodes[cap_node[i]].name;
+    req->params[i].value = rz_str_view(&path.chars[cap_start[i]], cap_len[i]);
+    i = i + 1;
+  }
+  req->param_count = m.ncap;
+
+  var slot: int32 = rz_slot_of(use);
+  if (slot < 0) { return rz_fail(ctx, 500); }
+  var h: fn(RzContext*) -> int32 = rt->nodes[node].slots[slot].h;
+  var st: int32 = h(ctx);
+  // A handler must return a status; anything else is a server error rather
+  // than a forged status line.
+  if (st < 100 || st > 599) { st = 500; }
+  ctx->status = st;
+  if (ctx->resp != 0) { ctx->resp->status = st; }
+  return st;
+}
+
+export fn rz_router_handle(rt: RzRouter*, ctx: RzContext*) -> int32 {
+  if (rt == 0 || ctx == 0 || ctx->req == 0) { return 500; }
+  return rz_router_handle_path(rt, ctx, ctx->req->path);
+}

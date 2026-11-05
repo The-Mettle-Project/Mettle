@@ -1,0 +1,57 @@
+// cryptex: a misuse-resistant cryptography API, pure Mettle.
+//
+//   import "cryptex/cryptex";
+//
+// Everything is written in Mettle: no C code and no shared library. There is
+// no global state, so every function is safe to call from any thread.
+//
+// This facade has no exports of its own, so it re-exports every module
+// below (Mettle's rule for export-free modules). Each module documents its
+// functions with a /// contract (summary, in, returns, owns, thread,
+// example).
+//
+//   core/      status (CR_OK, CR_E_*), types (Cr* structs), util (cr_random_*,
+//              cr_equal, cr_is_zero, cr_wipe), encode (hex, base64url)
+//   hash/      cr_sha256, cr_sha512 (FIPS 180-4), cr_blake2b (RFC 7693),
+//              one-shot and streaming; legacy: cr_md5, cr_sha1 (not for
+//              security; RFC 9562 UUIDs)
+//   mac/       mac: cr_hmac_sha256*, cr_hmac_sha512* (RFC 2104)
+//              kdf: cr_hkdf_sha256* (RFC 5869)
+//   cipher/    aead: cr_aead_* (XChaCha20-Poly1305) and cr_chacha20poly1305_*
+//              (RFC 8439); gcm: cr_aes_gcm_* (AES-128/256-GCM, NIST SP 800-38D);
+//              chacha, poly1305, aes and ghash are internal
+//   ecc/       kx: cr_x25519_*, cr_kx_* (RFC 7748); sign: cr_ed25519_*
+//              (RFC 8032); p256: cr_p256_* (key pairs and ECDH on NIST
+//              P-256, FIPS 186-5); p384: cr_p384_* (key pairs and
+//              ECDH on P-384); ecdsa: cr_p256_ecdsa_* and cr_p384_ecdsa_*
+//              (DER, RFC 6979 nonces); curve25519 and i31 (big integers) are
+//              internal
+//   password/  pwhash: cr_pwhash_* (Argon2id, RFC 9106); argon2 is internal
+//   rsa/       cr_rsa_verify_pkcs1, cr_rsa_verify_pss, cr_rsa_sign_pss,
+//              cr_rsa_sign_pkcs1 (RFC 8017)
+//   recipes/   signed (signed values), token (tokens and recovery codes),
+//              seal (cr_seal, cr_open), totp (2FA codes, RFC 4226 and 6238)
+//
+// Internal helpers start with crx_ and are not part of the API.
+
+import "cryptex/core/status";
+import "cryptex/core/types";
+import "cryptex/core/util";
+import "cryptex/hash/hash";
+import "cryptex/hash/legacy";
+import "cryptex/mac/mac";
+import "cryptex/mac/kdf";
+import "cryptex/password/pwhash";
+import "cryptex/cipher/aead";
+import "cryptex/cipher/gcm";
+import "cryptex/ecc/kx";
+import "cryptex/ecc/sign";
+import "cryptex/ecc/p256";
+import "cryptex/ecc/p384";
+import "cryptex/ecc/ecdsa";
+import "cryptex/rsa/rsa";
+import "cryptex/core/encode";
+import "cryptex/recipes/signed";
+import "cryptex/recipes/token";
+import "cryptex/recipes/seal";
+import "cryptex/recipes/totp";

@@ -1,0 +1,53 @@
+// A small client-side cache of sessions for resumption, keyed by host
+// name. TLS 1.3 tickets are used once and then dropped (RFC 8446 C.4).
+
+import "std/mem";
+import "cryptex/core/util";
+import "mtls/core/bytes";
+import "mtls/tls/conn";
+
+export const MTLS_CACHE_SLOTS: int32 = 16;
+
+export struct MtlsSessionCache {
+  s: MtlsSession[16];
+  next: int32;
+}
+
+/// mtls_cache_new: an empty cache; free with mtls_cache_free.
+export fn mtls_cache_new() -> MtlsSessionCache* {
+  return (MtlsSessionCache*)calloc(1, (int64)sizeof(MtlsSessionCache));
+}
+
+export fn mtls_cache_free(k: MtlsSessionCache*) {
+  if (k == 0) { return; }
+  cr_wipe((uint8*)k, (int64)sizeof(MtlsSessionCache));
+  free(k);
+}
+
+/// mtls_cache_put: stores a session, replacing the oldest slot.
+export fn mtls_cache_put(k: MtlsSessionCache*, s: MtlsSession*) {
+  if (k == 0 || !s->valid) { return; }
+  k->s[k->next] = *s;
+  k->next = (k->next + 1) % MTLS_CACHE_SLOTS;
+}
+
+/// mtls_cache_take: finds the newest live session for host, copies it to
+/// out and removes it from the cache.
+export fn mtls_cache_take(k: MtlsSessionCache*, host: uint8*, hostlen: int32, now: int64, out: MtlsSession*) -> bool {
+  if (k == 0) { return false; }
+  var best: int32 = -1;
+  for i in 0..MTLS_CACHE_SLOTS {
+    var s: MtlsSession* = &k->s[i];
+    if (!s->valid) { continue; }
+    if (now - s->issued >= (int64)s->lifetime || now < s->issued) {
+      cr_wipe((uint8*)s, (int64)sizeof(MtlsSession));
+      continue;
+    }
+    if (!mtls_bytes_eq(&s->host[0], (int64)s->hostlen, host, (int64)hostlen)) { continue; }
+    if (best < 0 || s->issued >= k->s[best].issued) { best = i; }
+  }
+  if (best < 0) { return false; }
+  *out = k->s[best];
+  cr_wipe((uint8*)&k->s[best], (int64)sizeof(MtlsSession));
+  return true;
+}

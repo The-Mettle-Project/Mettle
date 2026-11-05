@@ -1,0 +1,320 @@
+// The stroker: turns polylines into the outline of a stroke, filled with
+// the non-zero rule. It follows Skia's SkStroke: each contour gives an
+// outer and an inner offset side; joins go on the outer side, and the
+// inner side passes through the corner point, so overlaps keep the same
+// winding and fill solid. Joins and caps follow SVG 2 (miter with a miter
+// limit falling back to bevel, round, bevel; butt, round, square caps).
+// Points inside a flattened curve get round joins, so curves stay smooth
+// at any width.
+
+import "std/mem";
+import "../core/base";
+import "flatten";
+
+export const CANVAS_JOIN_MITER: int32 = 0;
+export const CANVAS_JOIN_ROUND: int32 = 1;
+export const CANVAS_JOIN_BEVEL: int32 = 2;
+
+export const CANVAS_CAP_BUTT: int32 = 0;
+export const CANVAS_CAP_ROUND: int32 = 1;
+export const CANVAS_CAP_SQUARE: int32 = 2;
+
+/// The most points a stroke outline may have; past it a stroke is refused
+/// (CANVAS_E_LIMIT), so absurd input (a huge width with tiny round-capped
+/// dashes) cannot eat all memory and time.
+export const CANVAS_MAX_OUTLINE: int64 = 4000000;
+
+export struct CanvasStroke {
+  width: float32;        // 0 draws a hairline one device pixel wide
+  miter_limit: float32;  // SVG's stroke-miterlimit; 0 means 4
+  join: int32;
+  cap: int32;
+  dashes: float32*;      // dash and gap lengths, or 0 for a solid line
+  ndashes: int32;
+  dash_offset: float32;
+}
+
+/// A solid stroke of width w with miter joins, butt caps and miter limit 4.
+export fn canvas_stroke(w: float32) -> CanvasStroke {
+  var s: CanvasStroke;
+  s.width = w;
+  s.miter_limit = 4.0;
+  s.join = CANVAS_JOIN_MITER;
+  s.cap = CANVAS_CAP_BUTT;
+  s.dashes = (float32*)0;
+  s.ndashes = 0;
+  s.dash_offset = 0.0;
+  return s;
+}
+
+// One side of the outline, in order.
+struct Side { xy: float32*; n: int64; cap: int64; failed: bool; }
+
+fn side_add(s: Side*, x: float32, y: float32) {
+  if (s->failed) { return; }
+  if (s->n >= s->cap) {
+    var c: int64 = s->cap * 2;
+    if (c < 64) { c = 64; }
+    var p: float32* = (float32*)realloc(s->xy, c * 8);
+    if (p == 0) { s->failed = true; return; }
+    s->xy = p;
+    s->cap = c;
+  }
+  s->xy[s->n * 2] = x;
+  s->xy[s->n * 2 + 1] = y;
+  s->n = s->n + 1;
+}
+
+export struct CanvasStroker {
+  left: Side;
+  right: Side;
+  pts: float32*;    // the cleaned contour
+  flg: uint8*;
+  cap_pts: int64;
+  hw: float32;      // half width
+  tol: float32;
+  miter: float32;
+  join: int32;
+  capstyle: int32;
+}
+
+export fn canvas_stroker_free(k: CanvasStroker*) {
+  if (k->left.xy != 0) { free(k->left.xy); }
+  if (k->right.xy != 0) { free(k->right.xy); }
+  if (k->pts != 0) { free(k->pts); }
+  if (k->flg != 0) { free(k->flg); }
+  memset(k, 0, sizeof(CanvasStroker));
+}
+
+// Points of an arc around (cx, cy) from vector (ax, ay) turning by angle
+// ang (signed), not including the first point, including the last.
+fn arc_pts(k: CanvasStroker*, s: Side*, cx: float32, cy: float32, ax: float32, ay: float32, ang: float32) {
+  var r: float32 = k->hw;
+  // step so the chord strays at most tol from the circle
+  var e: float32 = 1.0 - k->tol / r;
+  var step: float32 = CANVAS_PI / 2.0;
+  if (e > 0.0) { step = 2.0 * canvas_acos(e); }
+  if (step > CANVAS_PI / 2.0) { step = CANVAS_PI / 2.0; }
+  if (step < 0.01) { step = 0.01; }
+  var n: int32 = canvas_ceil_i(canvas_absf(ang) / step);
+  if (n < 1) { n = 1; }
+  if (n > 400) { n = 400; }
+  var da: float32 = ang / (float32)n;
+  var c: float32 = canvas_cos(da);
+  var sn: float32 = canvas_sin(da);
+  var x: float32 = ax;
+  var y: float32 = ay;
+  for i in 1..n {
+    var nx: float32 = x * c - y * sn;
+    var ny: float32 = x * sn + y * c;
+    x = nx; y = ny;
+    side_add(s, cx + x, cy + y);
+  }
+  var ex: float32 = ax * canvas_cos(ang) - ay * canvas_sin(ang);
+  var ey: float32 = ax * canvas_sin(ang) + ay * canvas_cos(ang);
+  side_add(s, cx + ex, cy + ey);
+}
+
+// The join at point (px, py) between directions u0 and u1 (unit vectors).
+// l0 and l1 are the lengths of the segments before and after.
+fn join_at(k: CanvasStroker*, px: float32, py: float32, u0x: float32, u0y: float32, u1x: float32, u1y: float32, l0: float32, l1: float32, smooth: bool) {
+  var hw: float32 = k->hw;
+  var n0x: float32 = -u0y * hw; var n0y: float32 = u0x * hw;
+  var n1x: float32 = -u1y * hw; var n1y: float32 = u1x * hw;
+  var cross: float32 = u0x * u1y - u0y * u1x;
+  var dot: float32 = u0x * u1x + u0y * u1y;
+  if (canvas_absf(cross) < 1.0e-6 && dot > 0.0) {
+    side_add(&k->left, px + n1x, py + n1y);
+    side_add(&k->right, px - n1x, py - n1y);
+    return;
+  }
+  // the side the path turns away from is the outer side
+  var outer: Side* = &k->left;
+  var inner: Side* = &k->right;
+  var sg: float32 = 1.0;
+  if (cross > 0.0) { outer = &k->right; inner = &k->left; sg = -1.0; }
+  // Inner side. Where the two inner offset lines cross within both
+  // segments, that crossing is the corner: no overlap, so pixels on the
+  // inner edge get exact coverage (an area rasteriser over-covers where a
+  // path overlaps itself at an edge). Otherwise go through the corner
+  // point, as Skia does; the overlap then fills solid with non-zero.
+  var t: float32 = hw * canvas_absf(cross) / (1.0 + dot);
+  if (dot > -0.99 && t <= 0.5 * l0 && t <= 0.5 * l1) {
+    var f0: float32 = 1.0 / (1.0 + dot);
+    side_add(inner, px - sg * (n0x + n1x) * f0, py - sg * (n0y + n1y) * f0);
+  } else {
+    side_add(inner, px - sg * n0x, py - sg * n0y);
+    side_add(inner, px, py);
+    side_add(inner, px - sg * n1x, py - sg * n1y);
+  }
+  // outer side
+  var ax: float32 = sg * n0x; var ay: float32 = sg * n0y;
+  var bx: float32 = sg * n1x; var by: float32 = sg * n1y;
+  side_add(outer, px + ax, py + ay);
+  var j: int32 = k->join;
+  if (smooth) { j = CANVAS_JOIN_ROUND; }
+  if (j == CANVAS_JOIN_ROUND) {
+    var ang: float32 = canvas_atan2(ax * by - ay * bx, ax * bx + ay * by);
+    arc_pts(k, outer, px, py, ax, ay, ang);
+    return;
+  }
+  if (j == CANVAS_JOIN_MITER && dot > -0.9999) {
+    // miter length / width = 1 / sin(theta / 2) = 1 / sqrt((1 + dot) / 2)
+    var q: float32 = (1.0 + dot) * 0.5;
+    if (q * k->miter * k->miter >= 1.0) {
+      var f: float32 = 1.0 / (1.0 + dot);
+      side_add(outer, px + (ax + bx) * f, py + (ay + by) * f);
+    }
+  }
+  side_add(outer, px + bx, py + by);
+}
+
+// A cap at point (px, py) going out along unit direction (ux, uy), from
+// the side at +n to the side at -n, where n is the left normal of u.
+fn cap_at(k: CanvasStroker*, s: Side*, px: float32, py: float32, ux: float32, uy: float32) {
+  var hw: float32 = k->hw;
+  var nx: float32 = -uy * hw; var ny: float32 = ux * hw;
+  if (k->capstyle == CANVAS_CAP_SQUARE) {
+    side_add(s, px + nx + ux * hw, py + ny + uy * hw);
+    side_add(s, px - nx + ux * hw, py - ny + uy * hw);
+  } else if (k->capstyle == CANVAS_CAP_ROUND) {
+    arc_pts(k, s, px, py, nx, ny, -CANVAS_PI);
+    return;
+  }
+  side_add(s, px - nx, py - ny);
+}
+
+fn emit(out: CanvasPoly*, s: Side*, from: int64, to: int64, back: bool) {
+  if (!back) {
+    var i: int64 = from;
+    while (i < to) { canvas_poly_add(out, s->xy[i * 2], s->xy[i * 2 + 1], 0); i = i + 1; }
+  } else {
+    var j: int64 = to - 1;
+    while (j >= from) { canvas_poly_add(out, s->xy[j * 2], s->xy[j * 2 + 1], 0); j = j - 1; }
+  }
+}
+
+// A dot for a zero-length contour with round or square caps.
+fn dot_at(k: CanvasStroker*, out: CanvasPoly*, px: float32, py: float32) {
+  if (k->capstyle == CANVAS_CAP_BUTT) { return; }
+  var hw: float32 = k->hw;
+  canvas_poly_begin(out);
+  if (k->capstyle == CANVAS_CAP_SQUARE) {
+    canvas_poly_add(out, px - hw, py - hw, 0);
+    canvas_poly_add(out, px + hw, py - hw, 0);
+    canvas_poly_add(out, px + hw, py + hw, 0);
+    canvas_poly_add(out, px - hw, py + hw, 0);
+    return;
+  }
+  k->left.n = 0;
+  side_add(&k->left, px + hw, py);
+  arc_pts(k, &k->left, px, py, hw, 0.0, CANVAS_TAU);
+  emit(out, &k->left, 0, k->left.n - 1, false);
+}
+
+fn unit(dx: float32, dy: float32, ux: float32*, uy: float32*) -> float32 {
+  var l: float32 = canvas_sqrt(dx * dx + dy * dy);
+  *ux = dx / l;
+  *uy = dy / l;
+  return l;
+}
+
+/// Strokes every contour of q into out (added to what is there), with
+/// line width w. tol is the flattening tolerance for round parts.
+export fn canvas_stroke_poly(k: CanvasStroker*, q: CanvasPoly*, st: CanvasStroke*, w: float32, tol: float32, out: CanvasPoly*) -> bool {
+  k->hw = w * 0.5;
+  k->tol = canvas_maxf(tol, 0.001);
+  if (k->tol > k->hw) { k->tol = k->hw; }
+  k->miter = st->miter_limit;
+  if (!(k->miter >= 1.0)) { k->miter = 4.0; }
+  k->join = st->join;
+  k->capstyle = st->cap;
+  if (!(k->hw > 0.0)) { return true; }
+  var eps: float32 = canvas_maxf(k->hw * 1.0e-4, 1.0e-6);
+  for c in 0..q->nconts {
+    var ct: CanvasContour* = q->conts + c;
+    if (ct->count < 1) { continue; }
+    if (ct->count > k->cap_pts) {
+      if (k->pts != 0) { free(k->pts); }
+      if (k->flg != 0) { free(k->flg); }
+      k->pts = (float32*)malloc(ct->count * 8);
+      k->flg = (uint8*)malloc(ct->count);
+      if (k->pts == 0 || k->flg == 0) { k->cap_pts = 0; return false; }
+      k->cap_pts = ct->count;
+    }
+    // drop repeated points
+    var src: float32* = q->xy + ct->start * 2;
+    var n: int64 = 0;
+    for i in 0..ct->count {
+      var x: float32 = src[i * 2];
+      var y: float32 = src[i * 2 + 1];
+      if (n > 0 && canvas_absf(x - k->pts[(n - 1) * 2]) <= eps && canvas_absf(y - k->pts[(n - 1) * 2 + 1]) <= eps) { continue; }
+      k->pts[n * 2] = x;
+      k->pts[n * 2 + 1] = y;
+      k->flg[n] = q->flags[ct->start + i];
+      n = n + 1;
+    }
+    var closed: bool = ct->closed;
+    if (closed && n > 1 && canvas_absf(k->pts[(n - 1) * 2] - k->pts[0]) <= eps && canvas_absf(k->pts[(n - 1) * 2 + 1] - k->pts[1]) <= eps) {
+      n = n - 1;
+    }
+    var p: float32* = k->pts;
+    if (n == 1) { dot_at(k, out, p[0], p[1]); continue; }
+    k->left.n = 0;
+    k->right.n = 0;
+    var ux: float32 = 0.0; var uy: float32 = 0.0;
+    var vx: float32 = 0.0; var vy: float32 = 0.0;
+    if (!closed) {
+      var la: float32 = unit(p[2] - p[0], p[3] - p[1], &ux, &uy);
+      side_add(&k->left, p[0] - uy * k->hw, p[1] + ux * k->hw);
+      side_add(&k->right, p[0] + uy * k->hw, p[1] - ux * k->hw);
+      var su: float32 = ux; var sv: float32 = uy;
+      for i in 1..(n - 1) {
+        var lb: float32 = unit(p[(i + 1) * 2] - p[i * 2], p[(i + 1) * 2 + 1] - p[i * 2 + 1], &vx, &vy);
+        // the first and last segments have no join at their far end
+        var ea: float32 = la; var eb: float32 = lb;
+        if (i == 1) { ea = 2.0 * la; }
+        if (i == n - 2) { eb = 2.0 * lb; }
+        join_at(k, p[i * 2], p[i * 2 + 1], ux, uy, vx, vy, ea, eb, k->flg[i] != 0);
+        ux = vx; uy = vy;
+        la = lb;
+      }
+      var ex: float32 = p[(n - 1) * 2]; var ey: float32 = p[(n - 1) * 2 + 1];
+      side_add(&k->left, ex - uy * k->hw, ey + ux * k->hw);
+      side_add(&k->right, ex + uy * k->hw, ey - ux * k->hw);
+      // outline: left forward, end cap, right backward, start cap
+      canvas_poly_begin(out);
+      emit(out, &k->left, 0, k->left.n, false);
+      var capside: Side;
+      memset(&capside, 0, sizeof(Side));
+      cap_at(k, &capside, ex, ey, ux, uy);
+      if (capside.n > 0) { emit(out, &capside, 0, capside.n - 1, false); }
+      emit(out, &k->right, 0, k->right.n, true);
+      capside.n = 0;
+      cap_at(k, &capside, p[0], p[1], -su, -sv);
+      if (capside.n > 0) { emit(out, &capside, 0, capside.n - 1, false); }
+      if (capside.xy != 0) { free(capside.xy); }
+      canvas_poly_close(out);
+    } else {
+      // closed: join at every point, first point last
+      var lc: float32 = unit(p[0] - p[(n - 1) * 2], p[1] - p[(n - 1) * 2 + 1], &ux, &uy);
+      for i in 0..n {
+        var j: int64 = i + 1;
+        if (j == n) { j = 0; }
+        var ld: float32 = unit(p[j * 2] - p[i * 2], p[j * 2 + 1] - p[i * 2 + 1], &vx, &vy);
+        join_at(k, p[i * 2], p[i * 2 + 1], ux, uy, vx, vy, lc, ld, k->flg[i] != 0);
+        ux = vx; uy = vy;
+        lc = ld;
+      }
+      canvas_poly_begin(out);
+      emit(out, &k->left, 0, k->left.n, false);
+      canvas_poly_close(out);
+      canvas_poly_begin(out);
+      emit(out, &k->right, 0, k->right.n, true);
+      canvas_poly_close(out);
+    }
+    if (k->left.failed || k->right.failed) { return false; }
+    if (out->n > CANVAS_MAX_OUTLINE) { return false; }
+  }
+  return !out->failed;
+}

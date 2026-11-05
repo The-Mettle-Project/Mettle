@@ -1,0 +1,191 @@
+// raize/resource/mem — the in-memory data layer: fixed capacity, ids from 1, insertion order.
+// reference: resources
+// thread: every operation takes the layer's spin lock, so any thread may call it.
+//
+// Records are stored back to back in one heap block; strings are the layer's own heap
+// copies, freed on remove, on modify (the replaced value) and on close. Nothing in raize
+// is called while the lock is held except the modify `apply` callback, whose change
+// functions only edit fields. rz_mem_layer_new is @noinline and sets every vtable
+// slot in one place, as flux_orm found --release needs.
+
+import "std/mem";
+import "std/thread";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/arena";
+import "def";
+import "layer";
+
+struct Rz_MemStore {
+  def: RzResourceDef*;   // static
+  lock: int32;           // spin lock over everything below
+  cap: int32;            // records the block holds
+  count: int32;          // records stored
+  next_id: int64;        // the next id to assign, from 1
+  recs: uint8*;          // cap * def->size bytes; owned
+}
+
+fn rz__mem_rec(m: Rz_MemStore*, i: int32) -> rawptr {
+  return (rawptr)(m->recs + (int64)i * m->def->size);
+}
+
+fn rz__mem_id(m: Rz_MemStore*, i: int32) -> int64 {
+  return rz_field_get_int(rz__mem_rec(m, i), &m->def->fields[0]);
+}
+
+fn rz__mem_find(m: Rz_MemStore*, id: int64) -> int32 {
+  for i in 0..m->count {
+    if (rz__mem_id(m, (int32)i) == id) { return (int32)i; }
+  }
+  return -1;
+}
+
+fn rz__mem_insert(ud: rawptr, rec: rawptr, out_id: int64*) -> int32 {
+  var m: Rz_MemStore* = (Rz_MemStore*)ud;
+  spin_lock(&m->lock);
+  if (m->count >= m->cap) { spin_unlock(&m->lock); return RZ_E_FULL; }
+  var dst: rawptr = rz__mem_rec(m, m->count);
+  var rc: int32 = rz__record_own(m->def, dst, rec);
+  if (rc != RZ_OK) {
+    rz__record_free_strings(m->def, dst);
+    spin_unlock(&m->lock);
+    return rc;
+  }
+  var id: int64 = m->next_id;
+  rz_field_set_int(dst, &m->def->fields[0], id);
+  m->next_id = id + 1;
+  m->count = m->count + 1;
+  spin_unlock(&m->lock);
+  if (out_id != 0) { *out_id = id; }
+  return RZ_OK;
+}
+
+fn rz__mem_get(ud: rawptr, id: int64, out: rawptr, arena: RzArena*) -> int32 {
+  var m: Rz_MemStore* = (Rz_MemStore*)ud;
+  spin_lock(&m->lock);
+  var i: int32 = rz__mem_find(m, id);
+  var rc: int32 = RZ_E_NOT_FOUND;
+  if (i >= 0) { rc = rz_record_copy_into(m->def, out, rz__mem_rec(m, i), arena); }
+  spin_unlock(&m->lock);
+  return rc;
+}
+
+// Works on an arena copy and owns the result in a second buffer before touching the
+// stored record, so any failure (apply, validation, memory) leaves the record as it was.
+fn rz__mem_modify(ud: rawptr, id: int64, apply: fn(rawptr, rawptr) -> int32, arg: rawptr, arena: RzArena*) -> int32 {
+  var m: Rz_MemStore* = (Rz_MemStore*)ud;
+  var def: RzResourceDef* = m->def;
+  var work: rawptr = (rawptr)rz_arena_alloc_zeroed(arena, def->size);
+  var fresh: rawptr = (rawptr)rz_arena_alloc_zeroed(arena, def->size);
+  if (work == 0 || fresh == 0) { return RZ_E_NOMEM; }
+  spin_lock(&m->lock);
+  var i: int32 = rz__mem_find(m, id);
+  if (i < 0) { spin_unlock(&m->lock); return RZ_E_NOT_FOUND; }
+  var stored: rawptr = rz__mem_rec(m, i);
+  var rc: int32 = rz_record_copy_into(def, work, stored, arena);
+  if (rc == RZ_OK) { rc = apply(arg, work); }
+  if (rc == RZ_OK) {
+    rz_field_set_int(work, &def->fields[0], id);
+    rc = rz__record_own(def, fresh, work);
+    if (rc == RZ_OK) {
+      rz__record_free_strings(def, stored);
+      memcpy(stored, fresh, def->size);
+    } else {
+      rz__record_free_strings(def, fresh);
+    }
+  }
+  spin_unlock(&m->lock);
+  return rc;
+}
+
+fn rz__mem_remove(ud: rawptr, id: int64) -> int32 {
+  var m: Rz_MemStore* = (Rz_MemStore*)ud;
+  var size: int64 = m->def->size;
+  spin_lock(&m->lock);
+  var i: int32 = rz__mem_find(m, id);
+  if (i < 0) { spin_unlock(&m->lock); return RZ_E_NOT_FOUND; }
+  rz__record_free_strings(m->def, rz__mem_rec(m, i));
+  var tail: int64 = (int64)(m->count - i - 1) * size;
+  if (tail > 0) { memmove(rz__mem_rec(m, i), rz__mem_rec(m, i + 1), tail); }
+  m->count = m->count - 1;
+  spin_unlock(&m->lock);
+  return RZ_OK;
+}
+
+fn rz__mem_scan(ud: rawptr, out: RzRecords*, arena: RzArena*) -> int32 {
+  var m: Rz_MemStore* = (Rz_MemStore*)ud;
+  var size: int64 = m->def->size;
+  out->items = 0;
+  out->count = 0;
+  spin_lock(&m->lock);
+  var n: int32 = m->count;
+  var rc: int32 = RZ_OK;
+  if (n > 0) {
+    var items: uint8* = rz_arena_alloc_zeroed(arena, (int64)n * size);
+    if (items == 0) { rc = RZ_E_NOMEM; }
+    var k: int32 = 0;
+    while (rc == RZ_OK && k < n) {
+      rc = rz_record_copy_into(m->def, (rawptr)(items + (int64)k * size), rz__mem_rec(m, k), arena);
+      k = k + 1;
+    }
+    if (rc == RZ_OK) { out->items = (rawptr)items; out->count = n; }
+  }
+  spin_unlock(&m->lock);
+  return rc;
+}
+
+fn rz__mem_count(ud: rawptr) -> int32 {
+  var m: Rz_MemStore* = (Rz_MemStore*)ud;
+  spin_lock(&m->lock);
+  var n: int32 = m->count;
+  spin_unlock(&m->lock);
+  return n;
+}
+
+fn rz__mem_close(ud: rawptr) {
+  var m: Rz_MemStore* = (Rz_MemStore*)ud;
+  if (m == 0) { return; }
+  for i in 0..m->count { rz__record_free_strings(m->def, rz__mem_rec(m, (int32)i)); }
+  free((rawptr)m->recs);
+  free((rawptr)m);
+}
+
+/// Makes an in-memory data layer for one resource. Ids start at 1; records keep
+/// insertion order; a full layer refuses inserts with RZ_E_FULL.
+///
+/// in:      def       the resource (`note_resource()`); must be built
+///          capacity  most records, 1..1000000
+/// returns: the layer, or 0 when `def` is 0 or not built, capacity is out of range, or
+///          memory runs out
+/// owns:    the caller owns the layer: free it with rz_data_layer_free (or use
+///          rz_mem_layer(app, ...) for one the app frees)
+/// thread:  any; the layer itself is safe on every thread
+/// example:
+///   s->todos = rz_mem_layer_new(todo_resource(), 32);
+@noinline export fn rz_mem_layer_new(def: RzResourceDef*, capacity: int32) -> RzDataLayer* {
+  if (def == 0 || !def->ready || def->status != RZ_OK || capacity < 1 || capacity > 1000000) { return 0; }
+  var m: Rz_MemStore* = (Rz_MemStore*)calloc(1, sizeof(Rz_MemStore));
+  if (m == 0) { return 0; }
+  m->recs = (uint8*)calloc((int64)capacity, def->size);
+  var dl: RzDataLayer* = (RzDataLayer*)calloc(1, sizeof(RzDataLayer));
+  if (m->recs == 0 || dl == 0) {
+    free((rawptr)m->recs);
+    free((rawptr)m);
+    free((rawptr)dl);
+    return 0;
+  }
+  m->def = def;
+  m->cap = capacity;
+  m->next_id = 1;
+  dl->name = "memory";
+  dl->ud = (rawptr)m;
+  dl->def = def;
+  dl->insert = &rz__mem_insert;
+  dl->get = &rz__mem_get;
+  dl->modify = &rz__mem_modify;
+  dl->remove = &rz__mem_remove;
+  dl->scan = &rz__mem_scan;
+  dl->count = &rz__mem_count;
+  dl->close = &rz__mem_close;
+  return dl;
+}

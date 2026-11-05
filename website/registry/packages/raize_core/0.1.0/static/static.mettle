@@ -1,0 +1,335 @@
+// raize/static — a bounded, traversal-safe file server for RzContext.
+//
+// It produces values only through the existing context types: the handler
+// fills ctx->resp (status, headers, body) with rz_resp_* helpers and never
+// touches a socket, never forks a Response type. HEAD is handled by the
+// server's serializer (it sends the headers and suppresses the body), so this
+// handler builds the full body exactly as for GET; Content-Length is therefore
+// correct on a HEAD response.
+//
+// Reads are capped. RZ_STATIC_MAX_BYTES is 8 MiB (the architecture review's
+// static in-memory cap); a file above it is refused with 413 after the cap is
+// crossed, never buffered to completion. The read is chunked through a stack
+// buffer and appended to the response body, so peak memory is the response
+// body (<= cap) plus 4 KiB, not 2x the file.
+//
+// ETag is a content hash, not (size, mtime): raize has no stat wrapper it can
+// call safely across platforms, and a hash also notices a same-size rewrite.
+// The value is `"<size-hex>-<fnv1a32-hex>"`, stable across processes. A
+// matching If-None-Match (weak comparison; `*` matches) produces 304 with an
+// empty body.
+//
+// Range requests are explicitly out of scope for this phase. A Range header is
+// ignored and the full body is returned with 200; Accept-Ranges is not
+// advertised, so no client is told a lie about byte ranges.
+//
+// Directories are 404, never a listing. Missing files are 404 with a small
+// text body. Traversal is refused twice: rz_static_rel_ok is lexical, then the
+// realpath result must be strictly inside the canonical root.
+
+import "std/io";
+import "std/mem";
+import "std/dir";
+import "../str/str";
+import "../context/context";
+import "mime";
+import "path";
+
+extern fn realpath(path: cstring, resolved: cstring) -> cstring = "realpath";
+
+export const RZ_STATIC_MAX_BYTES: int64 = 8388608;
+export const RZ_STATIC_MAX_ROOT: int64 = 512;
+export const RZ_STATIC_MAX_PREFIX: int64 = 128;
+export const RZ_STATIC_CHUNK: int64 = 4096;
+export const RZ_STATIC_ETAG_MAX: int64 = 96;
+export const RZ_STATIC_CC_MAX: int64 = 64;
+
+// root and prefix are owned copies; free the whole value with one call.
+export struct RzStatic {
+  root: string;      // canonical (realpath'd), no trailing '/'
+  prefix: string;    // "" or "/mount" without a trailing '/'
+  max_age: int32;    // seconds, >= 0
+}
+
+fn rz_static_copy_cstr(s: string, buf: uint8*, cap: int64) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n < 0 || n + 1 > cap) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    buf[i] = s.chars[i];
+    i = i + 1;
+  }
+  buf[n] = 0;
+  return true;
+}
+
+// Owned copy that reports failure with a null view, so a later
+// rz_str_free never sees a string literal. (rz_str_dup returns an empty
+// literal on malloc failure, which is not safe to free.)
+fn rz_static_dup(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)malloc(n + 1);
+  var out: string;
+  if (p == 0) {
+    out.chars = 0;
+    out.length = 0;
+    return out;
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    p[i] = s.chars[i];
+    i = i + 1;
+  }
+  p[n] = 0;
+  return rz_str_view(p, n);
+}
+
+fn rz_static_cstr_len(p: cstring, cap: int64) -> int64 {
+  if (p == 0) { return 0; }
+  var n: int64 = 0;
+  while (n < cap && p[n] != 0) { n = n + 1; }
+  return n;
+}
+
+// Resolves `root` once, at startup, so every request compares against the same
+// canonical string. Returns 0 (and allocates nothing) when root is not a
+// directory that exists.
+export fn rz_static_new(root: string, prefix: string, max_age: int32) -> RzStatic* {
+  var rn: int64 = (int64)root.length;
+  if (rn <= 0 || rn > RZ_STATIC_MAX_ROOT) { return 0; }
+  var pn: int64 = (int64)prefix.length;
+  if (pn > RZ_STATIC_MAX_PREFIX) { return 0; }
+  if (pn > 0 && prefix.chars[0] != 47) { return 0; }
+  while (pn > 0 && prefix.chars[pn - 1] == 47) { pn = pn - 1; }
+
+  var rootbuf: uint8[1024];
+  if (!rz_static_copy_cstr(root, &rootbuf[0], 1024)) { return 0; }
+  var resolved: uint8[4096];
+  var rp: cstring = realpath((cstring)&rootbuf[0], (cstring)&resolved[0]);
+  if (rp == 0) { return 0; }
+  var clen: int64 = rz_static_cstr_len(rp, RZ_STATIC_MAX_PATH - 1);
+  if (clen <= 0) { return 0; }
+  while (clen > 1 && resolved[clen - 1] == 47) { clen = clen - 1; }
+  var canon: string = rz_str_view(&resolved[0], clen);
+  if (mettle_dir_exists((cstring)&resolved[0]) == 0) { return 0; }
+
+  var st: RzStatic* = (RzStatic*)calloc(1, sizeof(RzStatic));
+  if (st == 0) { return 0; }
+  st->root = rz_static_dup(canon);
+  st->prefix = rz_static_dup(rz_str_sub(prefix, 0, pn));
+  if (st->root.chars == 0 || st->prefix.chars == 0) {
+    if (st->root.chars != 0) { free(st->root.chars); }
+    if (st->prefix.chars != 0) { free(st->prefix.chars); }
+    free((rawptr)st);
+    return 0;
+  }
+  st->max_age = max_age;
+  if (st->max_age < 0) { st->max_age = 0; }
+  return st;
+}
+
+export fn rz_static_free(st: RzStatic*) {
+  if (st == 0) { return; }
+  rz_str_free(st->root);
+  rz_str_free(st->prefix);
+  free((rawptr)st);
+}
+
+// ---------------------------------------------------------------------------
+// Cache metadata
+// ---------------------------------------------------------------------------
+
+export fn rz_static_cache_control(max_age: int32, buf: uint8*, cap: int64) -> string {
+  var lit: string = "public, max-age=";
+  var ln: int64 = (int64)lit.length;
+  var tmp: uint8[24];
+  var num: string = rz_int_buf((int64)max_age, &tmp[0], 24);
+  var total: int64 = ln + (int64)num.length;
+  if (buf == 0 || total + 1 > cap || num.length == 0) { return rz_str_empty(); }
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < ln) { buf[o] = lit.chars[i]; o = o + 1; i = i + 1; }
+  i = 0;
+  while (i < (int64)num.length) { buf[o] = num.chars[i]; o = o + 1; i = i + 1; }
+  buf[o] = 0;
+  return rz_str_view(buf, o);
+}
+
+// `"<size-hex>-<hash-hex>"` into caller storage. Deterministic: same bytes and
+// size give the same tag in every process, which is what a validator needs.
+export fn rz_static_etag(size: int64, hash: uint64, buf: uint8*, cap: int64) -> string {
+  if (buf == 0 || cap < 16) { return rz_str_empty(); }
+  var tmp: uint8[24];
+  var o: int64 = 0;
+  buf[o] = 34;
+  o = o + 1;
+  var s1: string = rz_hex_buf((uint64)size, &tmp[0], 24);
+  var i: int64 = 0;
+  while (i < (int64)s1.length) { buf[o] = s1.chars[i]; o = o + 1; i = i + 1; }
+  buf[o] = 45;
+  o = o + 1;
+  var s2: string = rz_hex_buf(hash, &tmp[0], 24);
+  i = 0;
+  while (i < (int64)s2.length) { buf[o] = s2.chars[i]; o = o + 1; i = i + 1; }
+  buf[o] = 34;
+  o = o + 1;
+  buf[o] = 0;
+  return rz_str_view(buf, o);
+}
+
+// If-None-Match is a comma list. Comparison is weak (RFC 9110 §13.1.2): an
+// optional `W/` on either side is ignored, and `*` matches any existing
+// representation. No tag means no match.
+export fn rz_static_etag_match(header: string, etag: string) -> bool {
+  if (etag.length == 0) { return false; }
+  var n: int64 = (int64)header.length;
+  var i: int64 = 0;
+  var start: int64 = 0;
+  while (i <= n) {
+    var at_end: bool = i == n;
+    var c: int32 = 0;
+    if (!at_end) { c = (int32)header.chars[i]; }
+    if (at_end || c == 44) {
+      var a: int64 = start;
+      var b: int64 = i;
+      while (a < b) {
+        var x: int32 = (int32)header.chars[a];
+        if (x == 32 || x == 9) { a = a + 1; } else { break; }
+      }
+      while (b > a) {
+        var y: int32 = (int32)header.chars[b - 1];
+        if (y == 32 || y == 9) { b = b - 1; } else { break; }
+      }
+      if (b > a) {
+        var piece: string = rz_str_sub(header, a, b);
+        if (rz_str_eq(piece, "*")) { return true; }
+        if (piece.length >= 2 && piece.chars[0] == 87 && piece.chars[1] == 47) {
+          piece = rz_str_from(piece, 2);
+        }
+        if (rz_str_eq(piece, etag)) { return true; }
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
+
+fn rz_static_fail(ctx: RzContext*, status: int32, body: string) -> int32 {
+  rz_resp_text(ctx->resp, status, body);
+  ctx->status = status;
+  return status;
+}
+
+fn rz_static_405(ctx: RzContext*) -> int32 {
+  // HEAD is dispatched as a GET fallback by the router, so both are allowed.
+  rz_resp_header_set(ctx->resp, "Allow", "GET, HEAD");
+  return rz_static_fail(ctx, 405, "method not allowed\n");
+}
+
+// Serves one relative path. Public so an app that already extracted a
+// wildcard param can pass it directly; rz_static_handle computes it from the
+// mount prefix and is the usual entry point.
+export fn rz_static_serve(st: RzStatic*, ctx: RzContext*, rel: string) -> int32 {
+  if (st == 0 || ctx == 0 || ctx->req == 0 || ctx->resp == 0) { return 500; }
+  if (ctx->resp->body == 0) { return 500; }
+  var verb: string = ctx->req->verb;
+  if (!rz_str_eq(verb, "GET") && !rz_str_eq(verb, "HEAD")) {
+    return rz_static_405(ctx);
+  }
+  if (!rz_static_rel_ok(rel)) { return rz_static_fail(ctx, 404, "not found\n"); }
+
+  var full: uint8[4096];
+  var flen: int64 = rz_static_join(st->root, rel, &full[0], RZ_STATIC_MAX_PATH);
+  if (flen < 0) { return rz_static_fail(ctx, 404, "not found\n"); }
+
+  // Resolve symlinks and confirm the target is still under the canonical root.
+  var resolved: uint8[4096];
+  var rp: cstring = realpath((cstring)&full[0], (cstring)&resolved[0]);
+  if (rp == 0) { return rz_static_fail(ctx, 404, "not found\n"); }
+  var rlen: int64 = rz_static_cstr_len(rp, RZ_STATIC_MAX_PATH - 1);
+  if (!rz_static_within(st->root, rz_str_view(&resolved[0], rlen))) {
+    return rz_static_fail(ctx, 404, "not found\n");
+  }
+  if (mettle_dir_exists((cstring)&resolved[0]) != 0) {
+    return rz_static_fail(ctx, 404, "not found\n");   // no directory listing
+  }
+
+  var fp: cstring = fopen((cstring)&resolved[0], "rb");
+  if (fp == 0) { return rz_static_fail(ctx, 404, "not found\n"); }
+
+  var resp: RzResponse* = ctx->resp;
+  var chunk: uint8[4096];
+  var total: int64 = 0;
+  var hash: uint32 = 2166136261;
+  while (true) {
+    var got: int64 = fread((cstring)&chunk[0], 1, RZ_STATIC_CHUNK, fp);
+    if (got <= 0) { break; }
+    total = total + got;
+    if (total > RZ_STATIC_MAX_BYTES) {
+      fclose(fp);
+      if (resp->body != 0) { resp->body->len = 0; }
+      return rz_static_fail(ctx, 413, "content too large\n");
+    }
+    var k: int64 = 0;
+    while (k < got) {
+      hash = hash ^ (uint32)chunk[k];
+      hash = hash * (uint32)16777619;
+      k = k + 1;
+    }
+    rz_buf_add_bytes(resp->body, &chunk[0], got);
+  }
+  fclose(fp);
+
+  var ebuf: uint8[96];
+  var etag: string = rz_static_etag(total, (uint64)hash, &ebuf[0], RZ_STATIC_ETAG_MAX);
+  var cbuf: uint8[64];
+  var cc: string = rz_static_cache_control(st->max_age, &cbuf[0], RZ_STATIC_CC_MAX);
+  rz_resp_header_set(resp, "ETag", etag);
+  rz_resp_header_set(resp, "Cache-Control", cc);
+
+  var inm: string = rz_req_header(ctx->req, "if-none-match");
+  if (rz_static_etag_match(inm, etag)) {
+    if (resp->body != 0) { resp->body->len = 0; }   // 304 carries no body
+    resp->status = 304;
+    ctx->status = 304;
+    return 304;
+  }
+
+  rz_resp_set_content_type(resp, rz_static_mime(rel));
+  resp->status = 200;
+  ctx->status = 200;
+  return 200;
+}
+
+// The mount-prefix entry point: strips st->prefix from req->path and serves
+// the remainder. A request exactly equal to the prefix (a directory) is 404.
+export fn rz_static_handle(st: RzStatic*, ctx: RzContext*) -> int32 {
+  if (st == 0 || ctx == 0 || ctx->req == 0 || ctx->resp == 0) { return 500; }
+  var path: string = ctx->req->path;
+  var plen: int64 = (int64)path.length;
+  var pn: int64 = (int64)st->prefix.length;
+  var off: int64 = 0;
+  if (pn > 0) {
+    if (plen < pn) { return rz_static_fail(ctx, 404, "not found\n"); }
+    if (!rz_str_eq(rz_str_sub(path, 0, pn), st->prefix)) {
+      return rz_static_fail(ctx, 404, "not found\n");
+    }
+    off = pn;
+    // The prefix must end on a segment boundary: "/static" must not capture
+    // "/staticX/foo". (The router would not dispatch that path here, but this
+    // entry point is public and must not depend on the router for safety.)
+    if (off < plen && path.chars[off] != 47) {
+      return rz_static_fail(ctx, 404, "not found\n");
+    }
+    if (off < plen) { off = off + 1; }
+  } else {
+    if (off < plen && path.chars[off] == 47) { off = off + 1; }
+  }
+  if (off >= plen) { return rz_static_fail(ctx, 404, "not found\n"); }
+  return rz_static_serve(st, ctx, rz_str_from(path, off));
+}

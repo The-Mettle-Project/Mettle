@@ -1,0 +1,203 @@
+// raize/ws/conn — one WebSocket connection as a pure state machine.
+//
+// The socket layer (the hub's event loop) does only two things with it:
+//
+//   rz_ws_conn_feed(c, bytes)   bytes read from the socket go in; complete
+//                               messages come out through the callback,
+//                               replies (pong, close) are queued in c->out
+//   c->out                      bytes the loop must write to the socket
+//
+// and closes the socket once rz_ws_conn_done(c) is true and c->out is
+// flushed. Nothing here touches a file descriptor, so all of the protocol's
+// stateful rules are tested in the interpreter:
+//
+//   * fragmentation: a data frame with FIN=0 opens a message, CONT frames
+//     extend it, a new TEXT/BINARY inside an open message (or a CONT outside
+//     one) is a protocol error (1002). Control frames may arrive between
+//     fragments.
+//   * size: a message larger than max_msg in total is 1009.
+//   * text: validated incrementally as UTF-8; invalid is 1007.
+//   * ping is answered with a pong carrying the same payload.
+//   * close: a valid close is echoed (with its code) and the connection is
+//     done. A server-initiated close (rz_ws_conn_close) waits for the peer's
+//     close, ignoring data meanwhile. A protocol failure sends its close and
+//     is done at once: RFC 6455 §7.1.7 "fail the WebSocket connection".
+
+import "std/mem";
+import "raize_core/str/str";
+import "frame";
+import "utf8";
+
+export const RZ_WS_DEFAULT_MAX_MSG: int64 = 1048576;
+
+// on_message(ctx, opcode, payload). The payload view is valid only for the
+// duration of the call.
+export struct RzWsConn {
+  inbuf: RzBuf*;         // received, not yet consumed
+  msg: RzBuf*;           // reassembly of a fragmented message
+  msg_op: int32;            // 0 = no message open, else TEXT or BINARY
+  utf8: RzUtf8;
+  out: RzBuf*;           // to be written to the socket
+  max_msg: int64;
+  close_sent: bool;
+  done: bool;               // no more input will be processed
+  close_code: int32;        // the code we sent or echoed (0 until then)
+  on_message: fn(rawptr, int32, string) -> int32;
+  ctx: rawptr;
+}
+
+export fn rz_ws_conn_new(max_msg: int64, on_message: fn(rawptr, int32, string) -> int32, ctx: rawptr) -> RzWsConn* {
+  var c: RzWsConn* = (RzWsConn*)calloc(1, sizeof(RzWsConn));
+  if (c == 0) { return 0; }
+  c->inbuf = rz_buf_new_cap(4096);
+  c->msg = rz_buf_new_cap(256);
+  c->out = rz_buf_new_cap(256);
+  c->max_msg = max_msg;
+  if (c->max_msg <= 0) { c->max_msg = RZ_WS_DEFAULT_MAX_MSG; }
+  c->on_message = on_message;
+  c->ctx = ctx;
+  rz_utf8_reset(&c->utf8);
+  return c;
+}
+
+export fn rz_ws_conn_free(c: RzWsConn*) {
+  if (c == 0) { return; }
+  rz_buf_free(c->inbuf);
+  rz_buf_free(c->msg);
+  rz_buf_free(c->out);
+  free(c);
+}
+
+export fn rz_ws_conn_done(c: RzWsConn*) -> bool {
+  return c == 0 || c->done;
+}
+
+// Queues a close with `code` and stops processing input. Used for failures.
+fn rz_ws_conn_fail(c: RzWsConn*, code: int32) {
+  if (!c->close_sent) {
+    rz_ws_close_append(c->out, code, "");
+    c->close_sent = true;
+    c->close_code = code;
+  }
+  c->done = true;
+}
+
+// Server-initiated close: queue the close frame, then wait for the peer's.
+export fn rz_ws_conn_close(c: RzWsConn*, code: int32, reason: string) {
+  if (c == 0 || c->close_sent) { return; }
+  rz_ws_close_append(c->out, code, reason);
+  c->close_sent = true;
+  c->close_code = code;
+}
+
+export fn rz_ws_conn_send(c: RzWsConn*, opcode: int32, payload: string) -> int32 {
+  if (c == 0 || c->close_sent || c->done) { return -1; }
+  if (rz_ws_frame_append(c->out, opcode, payload) < 0) { return -1; }
+  return 0;
+}
+
+export fn rz_ws_conn_send_text(c: RzWsConn*, s: string) -> int32 {
+  return rz_ws_conn_send(c, RZ_WS_OP_TEXT, s);
+}
+
+fn rz_ws_conn_control(c: RzWsConn*, op: int32, p: uint8*, n: int64) {
+  if (op == RZ_WS_OP_PING) {
+    if (!c->close_sent) { rz_ws_frame_append(c->out, RZ_WS_OP_PONG, rz_str_view(p, n)); }
+    return;
+  }
+  if (op == RZ_WS_OP_PONG) { return; }
+  // CLOSE
+  var code: int32 = rz_ws_close_code(p, n);
+  if (code < 0) { rz_ws_conn_fail(c, RZ_WS_CLOSE_PROTOCOL); return; }
+  if (n > 2 && !rz_utf8_valid(p + 2, n - 2)) { rz_ws_conn_fail(c, RZ_WS_CLOSE_BAD_DATA); return; }
+  if (!c->close_sent) {
+    var echo: int32 = code;
+    if (echo == RZ_WS_CLOSE_NONE) { echo = RZ_WS_CLOSE_NORMAL; }
+    rz_ws_close_append(c->out, echo, "");
+    c->close_sent = true;
+    c->close_code = echo;
+  }
+  c->done = true;
+}
+
+// Handles one data frame's (unmasked) payload. Returns false when the
+// connection failed.
+fn rz_ws_conn_data(c: RzWsConn*, f: RzWsFrame*, p: uint8*) -> bool {
+  var op: int32 = f->opcode;
+  var n: int64 = f->payload_len;
+  if (op == RZ_WS_OP_CONT) {
+    if (c->msg_op == 0) { rz_ws_conn_fail(c, RZ_WS_CLOSE_PROTOCOL); return false; }
+  } else {
+    if (c->msg_op != 0) { rz_ws_conn_fail(c, RZ_WS_CLOSE_PROTOCOL); return false; }
+    c->msg_op = op;
+    c->msg->len = 0;
+    rz_utf8_reset(&c->utf8);
+  }
+  if (c->msg->len + n > c->max_msg) { rz_ws_conn_fail(c, RZ_WS_CLOSE_TOO_BIG); return false; }
+  if (c->msg_op == RZ_WS_OP_TEXT && !rz_utf8_feed(&c->utf8, p, n)) {
+    rz_ws_conn_fail(c, RZ_WS_CLOSE_BAD_DATA);
+    return false;
+  }
+  if (c->close_sent) {
+    // Closing: the message is read for framing only and never delivered.
+    if (f->fin) { c->msg_op = 0; }
+    return true;
+  }
+  var whole: bool = f->fin && op != RZ_WS_OP_CONT;
+  if (!whole) { rz_buf_add_bytes(c->msg, p, n); }
+  if (!f->fin) { return true; }
+  var mop: int32 = c->msg_op;
+  c->msg_op = 0;
+  if (mop == RZ_WS_OP_TEXT && !rz_utf8_finish(&c->utf8)) {
+    rz_ws_conn_fail(c, RZ_WS_CLOSE_BAD_DATA);
+    return false;
+  }
+  var payload: string = rz_str_view(p, n);
+  if (!whole) { payload = rz_buf_str(c->msg); }
+  if (c->on_message != 0) {
+    if (c->on_message(c->ctx, mop, payload) != 0) {
+      rz_ws_conn_fail(c, RZ_WS_CLOSE_ERROR);
+      return false;
+    }
+  }
+  c->msg->len = 0;
+  return true;
+}
+
+// Feeds bytes read from the socket. Returns 0 while the connection is open,
+// 1 once it is done (flush c->out, then close the socket).
+export fn rz_ws_conn_feed(c: RzWsConn*, p: uint8*, n: int64) -> int32 {
+  if (c == 0) { return 1; }
+  if (c->done) { return 1; }
+  rz_buf_add_bytes(c->inbuf, p, n);
+  var off: int64 = 0;
+  while (!c->done) {
+    var f: RzWsFrame;
+    var rc: int32 = rz_ws_frame_parse(c->inbuf->data + off, c->inbuf->len - off, c->max_msg, true, &f);
+    if (rc == RZ_WS_NEED_MORE) { break; }
+    if (rc == RZ_WS_E_PROTOCOL) { rz_ws_conn_fail(c, RZ_WS_CLOSE_PROTOCOL); break; }
+    if (rc == RZ_WS_E_TOO_BIG) { rz_ws_conn_fail(c, RZ_WS_CLOSE_TOO_BIG); break; }
+    var payload: uint8* = c->inbuf->data + off + f.head_len;
+    rz_ws_unmask(payload, f.payload_len, &f.mask[0], 0);
+    if (rz_ws_opcode_is_control(f.opcode)) {
+      rz_ws_conn_control(c, f.opcode, payload, f.payload_len);
+    } else {
+      rz_ws_conn_data(c, &f, payload);
+    }
+    off = off + f.frame_len;
+  }
+  // Keep only the unconsumed tail.
+  var rest: int64 = c->inbuf->len - off;
+  if (off > 0 && rest > 0) { memmove((rawptr)c->inbuf->data, (rawptr)(c->inbuf->data + off), rest); }
+  c->inbuf->len = rest;
+  if (c->done) { return 1; }
+  return 0;
+}
+
+// Marks `n` bytes of c->out as written to the socket.
+export fn rz_ws_conn_wrote(c: RzWsConn*, n: int64) {
+  if (c == 0 || n <= 0) { return; }
+  if (n >= c->out->len) { c->out->len = 0; return; }
+  memmove((rawptr)c->out->data, (rawptr)(c->out->data + n), c->out->len - n);
+  c->out->len = c->out->len - n;
+}

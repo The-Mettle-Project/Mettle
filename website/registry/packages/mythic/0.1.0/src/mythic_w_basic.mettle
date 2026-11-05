@@ -1,0 +1,386 @@
+// mythic_w_basic: label, heading, button, separator, card/panel, progress
+// (DESIGN-SYSTEM §7.2, §7.3, §7.9, §7.12, §7.13).
+import "std/io";
+import "mythic_base";
+import "mythic_types";
+import "mythic_ctx";
+import "mythic_anim";
+import "mythic_paint";
+import "mythic_layout";
+import "mythic_icons";
+import "mythic_dl";
+import "mythic_text";
+
+// type-scale roles (DESIGN-SYSTEM §3.3); 0 = body
+export const MYTHIC_TYPE_BODY: int32 = 0;
+export const MYTHIC_TYPE_CAPTION: int32 = 1;
+export const MYTHIC_TYPE_CAPTION_STRONG: int32 = 2;
+export const MYTHIC_TYPE_BODY_STRONG: int32 = 3;
+export const MYTHIC_TYPE_LABEL: int32 = 4;
+export const MYTHIC_TYPE_LABEL_SM: int32 = 5;
+export const MYTHIC_TYPE_TITLE: int32 = 6;
+export const MYTHIC_TYPE_HEADING: int32 = 7;
+export const MYTHIC_TYPE_DISPLAY: int32 = 8;
+export const MYTHIC_TYPE_MONO: int32 = 9;
+// text tones; 0 = text.primary
+export const MYTHIC_TONE_PRIMARY: int32 = 0;
+export const MYTHIC_TONE_SECONDARY: int32 = 1;
+export const MYTHIC_TONE_TERTIARY: int32 = 2;
+export const MYTHIC_TONE_ACCENT: int32 = 3;
+export const MYTHIC_TONE_SUCCESS: int32 = 4;
+export const MYTHIC_TONE_WARNING: int32 = 5;
+export const MYTHIC_TONE_DANGER: int32 = 6;
+// button variants; 0 = secondary
+export const MYTHIC_BTN_SECONDARY: int32 = 0;
+export const MYTHIC_BTN_PRIMARY: int32 = 1;
+export const MYTHIC_BTN_GHOST: int32 = 2;
+export const MYTHIC_BTN_DANGER: int32 = 3;
+// control sizes; 0 = md
+export const MYTHIC_CTRL_MD: int32 = 0;
+export const MYTHIC_CTRL_SM: int32 = 1;
+export const MYTHIC_CTRL_LG: int32 = 2;
+// card/panel padding density; 0 = 16
+export const MYTHIC_DENSITY_NORMAL: int32 = 0;
+export const MYTHIC_DENSITY_DENSE: int32 = 1;
+export const MYTHIC_DENSITY_ROOMY: int32 = 2;
+
+export struct MythicLabelOpts {
+  role: int32;          // MYTHIC_TYPE_*
+  tone: int32;          // MYTHIC_TONE_*
+  color: uint32;        // 0 = use tone
+  wrap: bool;           // wrap at word boundaries when width-constrained
+  no_ellipsis: bool;    // single-line labels ellipsize unless set
+  width: MythicSize;
+}
+export struct MythicButtonOpts {
+  variant: int32;       // MYTHIC_BTN_*
+  size: int32;          // MYTHIC_CTRL_*
+  icon: int32;          // MYTHIC_ICON_*; 0 = none
+  icon_only: bool;      // square button, label used only for the ID / tooltip
+  loading: bool;
+  width: MythicSize;      // FIT by default; min width = height
+}
+export struct MythicProgressOpts { size: int32; color: uint32; width: MythicSize; }   // color 0 = accent
+export struct MythicCardOpts { elevation: int32; density: int32; }   // elevation 0..4 (e0..e4)
+
+fn role_style(t: MythicTheme*, role: int32) -> MythicTextStyle {
+  if (role == MYTHIC_TYPE_CAPTION) { return t->type.caption; }
+  if (role == MYTHIC_TYPE_CAPTION_STRONG) { return t->type.caption_strong; }
+  if (role == MYTHIC_TYPE_BODY_STRONG) { return t->type.body_strong; }
+  if (role == MYTHIC_TYPE_LABEL) { return t->type.label; }
+  if (role == MYTHIC_TYPE_LABEL_SM) { return t->type.label_sm; }
+  if (role == MYTHIC_TYPE_TITLE) { return t->type.title; }
+  if (role == MYTHIC_TYPE_HEADING) { return t->type.heading; }
+  if (role == MYTHIC_TYPE_DISPLAY) { return t->type.display; }
+  if (role == MYTHIC_TYPE_MONO) { return t->type.mono; }
+  return t->type.body;
+}
+
+fn tone_color(t: MythicTheme*, tone: int32) -> uint32 {
+  if (tone == MYTHIC_TONE_SECONDARY) { return t->colors.text_secondary; }
+  if (tone == MYTHIC_TONE_TERTIARY) { return t->colors.text_tertiary; }
+  if (tone == MYTHIC_TONE_ACCENT) { return t->colors.accent_text; }
+  if (tone == MYTHIC_TONE_SUCCESS) { return t->colors.success; }
+  if (tone == MYTHIC_TONE_WARNING) { return t->colors.warning; }
+  if (tone == MYTHIC_TONE_DANGER) { return t->colors.danger_text; }
+  return t->colors.text_primary;
+}
+
+/// Body text in text.primary (copies `s`).
+export fn mythic_label(ui: MythicUi*, s: string) { var o: MythicLabelOpts; mythic_label_ex(ui, s, o); }
+
+/// Text with a type-scale role and tone (DESIGN-SYSTEM §7.2). Wraps at word boundaries when
+/// `o.wrap` and width-constrained; otherwise single line, ellipsized when constrained.
+/// Inside a disabled scope the text uses text.disabled (no extra alpha).
+export fn mythic_label_ex(ui: MythicUi*, s: string, o: MythicLabelOpts) {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: uint32 = o.color;
+  if (c == 0) { c = tone_color(t, o.tone); }
+  var st: MythicTextStyle = role_style(t, o.role);
+  if (o.wrap) { st.flags = st.flags | MYTHIC_TEXT_WRAP; }
+  else if (!o.no_ellipsis) { st.flags = st.flags | MYTHIC_TEXT_ELLIPSIS; }
+  var dis: bool = ui->disabled_depth > 0;
+  if (dis) { c = t->colors.text_disabled; }
+  mythic_text(ui, s, st, c);
+  if (dis) { ui->last_node->opacity = ui->opacity_base; }
+  if (o.width.mode != MYTHIC_FIT || o.width.value != 0.0) { ui->last_node->box.width = o.width; }
+}
+
+/// "62%" for a 0..1 fraction (frame-arena string; no heap allocation).
+export fn mythic_fmt_pct(ui: MythicUi*, frac: float32) -> string {
+  var v: int32 = mythic_iround(mythic_clampf(frac, 0.0, 1.0) * 100.0);
+  var p: uint8* = (uint8*)mythic_arena_alloc(ui->arena, 8);
+  var n: int32 = 0;
+  if (v >= 100) { p[n] = (uint8)49; n = n + 1; }
+  if (v >= 10) { p[n] = (uint8)(48 + (v / 10) % 10); n = n + 1; }
+  p[n] = (uint8)(48 + v % 10); n = n + 1;
+  p[n] = (uint8)37; n = n + 1;
+  p[n] = (uint8)0;
+  var s: string;
+  s.chars = (cstring)p;
+  s.length = (uint64)n;
+  return s;
+}
+
+/// Header row above a slider / progress bar: `label` (body) left, `value` (body, secondary,
+/// tabular digits) right. Width grows to the parent.
+export fn mythic_value_header(ui: MythicUi*, label: string, value: string) {
+  var t: MythicTheme* = mythic_theme(ui);
+  mythic_row_begin(ui, { width: mythic_grow(), gap: 8 });
+  var ls: MythicTextStyle = t->type.body;
+  ls.flags = MYTHIC_TEXT_ELLIPSIS;
+  mythic_text(ui, label, ls, t->colors.text_primary);
+  mythic_spacer(ui);
+  if (value.length > (uint64)0) {
+    var vs: MythicTextStyle = t->type.body;
+    vs.flags = MYTHIC_TEXT_TABULAR;
+    mythic_text(ui, value, vs, t->colors.text_secondary);
+  }
+  mythic_end(ui);
+}
+
+/// A `heading` (20/28 SemiBold) label.
+export fn mythic_heading(ui: MythicUi*, s: string) {
+  var o: MythicLabelOpts = { role: MYTHIC_TYPE_HEADING };
+  mythic_label_ex(ui, s, o);
+}
+
+export fn mythic_button(ui: MythicUi*, label: string) -> bool { var o: MythicButtonOpts; return mythic_button_ex(ui, label, o); }
+
+// resolved per-frame visuals of one button, handed to its paint callback (arena)
+struct BtnPaint {
+  text: string; style: MythicTextStyle; text_w: float32; icon: int32; icon_size: float32; icon_gap: float32;
+  bg: uint32; border: uint32; fg: uint32; highlight: uint32;
+  radius: float32; shadow: bool; alpha: float32; focus: float32; focus_color: uint32;
+}
+
+fn btn_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: BtnPaint* = (BtnPaint*)data;
+  var t: MythicTheme* = mythic_theme(ui);
+  var saved: float32 = p->opacity;
+  p->opacity = saved * d->alpha;
+  var rad: MythicCorners = mythic_radius(d->radius);
+  if (d->shadow) {
+    var e: MythicElevLevel = t->elevation.e1;
+    for i: int32 in 0..e.count { mythic_paint_shadow(p, r, rad, e.s[i]); }
+  }
+  if (d->highlight != 0 && (d->bg >> 24) == (uint32)255) {
+    // top highlight (DESIGN-SYSTEM §5): highlight-tinted shape, then the base fill inset by one
+    // hairline on the top edge only
+    mythic_paint_fill(p, r, rad, mythic_color_over(d->bg, d->highlight));
+    var hair: float32 = mythic_paint_line_w(p, 1.0) / p->scale;
+    var ir: MythicRect = { x: r.x, y: r.y + hair, w: r.w, h: r.h - hair };
+    mythic_paint_fill(p, ir, rad, d->bg);
+  } else {
+    mythic_paint_fill(p, r, rad, d->bg);
+  }
+  if (d->border != 0) { mythic_paint_stroke(p, r, rad, 1.0, d->border); }
+  var cw: float32 = d->text_w;
+  if (d->icon != 0) { cw = cw + d->icon_size + d->icon_gap; }
+  var x: float32 = r.x + (r.w - cw) / 2.0;
+  if (d->icon != 0) {
+    // icons center on the box, not on the text (DESIGN-SYSTEM §7.3); whole device px
+    var ix: float32 = mythic_roundf(x * p->scale) / p->scale;
+    var iy: float32 = mythic_roundf((r.y + (r.h - d->icon_size) / 2.0) * p->scale) / p->scale;
+    var ir2: MythicRect = { x: ix, y: iy, w: d->icon_size, h: d->icon_size };
+    mythic_paint_icon(p, d->icon, ir2, d->fg, 1.0);
+    x = x + d->icon_size + d->icon_gap;
+  }
+  if (d->text.length > (uint64)0) {
+    var base: float32 = mythic_paint_control_baseline(p, d->style, r.y, r.h);
+    mythic_paint_text_baseline(p, d->text, d->style, x, base, d->fg);
+  }
+  mythic_paint_focus_ring(p, r, d->radius, d->focus_color, d->focus);
+  p->opacity = saved;
+}
+
+/// Push button (DESIGN-SYSTEM §7.3) with animated hover and press. Returns true when clicked.
+/// The whole label is the ID; text after "##" is not shown.
+export fn mythic_button_ex(ui: MythicUi*, label: string, o: MythicButtonOpts) -> bool {
+  var t: MythicTheme* = mythic_theme(ui);
+  var cs: MythicControlSize = t->ctrl.md;
+  if (o.size == MYTHIC_CTRL_SM) { cs = t->ctrl.sm; } else if (o.size == MYTHIC_CTRL_LG) { cs = t->ctrl.lg; }
+  var id: uint64 = mythic_id(ui, label);
+  var d: BtnPaint* = (BtnPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(BtnPaint));
+  d->text = mythic_arena_strn(ui->arena, label, mythic_label_len(label));
+  d->style = cs.text;
+  d->radius = cs.radius;
+  var sc: float32 = ui->scale;
+  if (sc <= 0.0) { sc = 1.0; }
+  if (o.icon_only) { d->text = mythic_arena_str(ui->arena, ""); }
+  if (ui->fonts != 0 && d->text.length > (uint64)0) {
+    d->text_w = mythic_text_width(ui->fonts, mythic_paint_text_spec(sc, cs.text), d->text) / sc;
+  }
+  var cw: float32 = d->text_w;
+  if (o.icon != 0) {
+    d->icon = o.icon;
+    d->icon_size = cs.icon;
+    if (d->text.length > (uint64)0) {
+      d->icon_gap = 6.0;
+      if (o.size == MYTHIC_CTRL_SM) { d->icon_gap = 4.0; }
+    }
+    cw = cw + d->icon_size + d->icon_gap;
+  }
+  var b: MythicBox;
+  b.id = id;
+  b.dir = MYTHIC_DIR_ROW;
+  b.width = o.width;
+  b.width.min = mythic_maxf(o.width.min, cs.height);
+  b.height = mythic_fixed(cs.height);
+  b.pad = mythic_pad_xy(cs.pad_x_button, 0.0);
+  if (o.icon_only) { b.width = mythic_fixed(cs.height); b.pad = mythic_pad(0.0); }
+  mythic_box_begin(ui, b);
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_FOCUS_ACTIVATE_SPACE | MYTHIC_FOCUS_ACTIVATE_ENTER | MYTHIC_SENSE_CLICK);
+  mythic_focusable(ui, id, MYTHIC_FOCUS_ACTIVATE_SPACE | MYTHIC_FOCUS_ACTIVATE_ENTER);
+  var content: MythicNode* = mythic_ctx_node_add(ui, MYTHIC_NODE_SPACER);
+  content->box.width = mythic_fixed(cw);
+  var sa: MythicStateAnim = mythic_anim_states(ui, id, r);
+  var h: float32 = sa.hover;
+  var pr: float32 = sa.press;
+  d->focus = sa.focus;
+  d->focus_color = t->colors.focus_ring;
+  var c: MythicColors* = &t->colors;
+  d->alpha = 1.0;
+  d->shadow = true;
+  if (o.variant == MYTHIC_BTN_PRIMARY) {
+    d->bg = mythic_color_lerp(mythic_color_lerp(c->accent, c->accent_hover, h), c->accent_pressed, pr);
+    d->fg = c->text_on_accent;
+    d->highlight = c->highlight_accent;
+  } else if (o.variant == MYTHIC_BTN_DANGER) {
+    d->bg = mythic_color_lerp(mythic_color_lerp(c->danger, c->danger_hover, h), c->danger_pressed, pr);
+    d->fg = c->text_on_accent;
+    d->highlight = c->highlight_accent;
+  } else if (o.variant == MYTHIC_BTN_GHOST) {
+    var clear: uint32 = c->bg_hover & (uint32)0x00FFFFFF;
+    d->bg = mythic_color_lerp(mythic_color_lerp(clear, c->bg_hover, h), c->bg_pressed, pr);
+    d->fg = mythic_color_lerp(c->text_secondary, c->text_primary, mythic_maxf(h, pr));
+    d->shadow = false;
+  } else {
+    d->bg = mythic_color_lerp(mythic_color_lerp(c->btn_secondary_bg, c->btn_secondary_bg_hover, h), c->btn_secondary_bg_pressed, pr);
+    d->border = mythic_color_lerp(mythic_color_lerp(c->btn_secondary_border, c->btn_secondary_border_hover, h), c->btn_secondary_border_pressed, pr);
+    d->fg = c->text_primary;
+    d->highlight = c->highlight_secondary;
+  }
+  if (ui->disabled_depth > 0) { d->shadow = false; }
+  mythic_end(ui);
+  mythic_node_paint(ui, &btn_paint, (rawptr)d);
+  if (r.clicked && ui->trace) { println("trace: click id={id} label=\"{d->text}\""); }
+  return r.clicked;
+}
+
+/// Hairline separator (DESIGN-SYSTEM §7.13): border.subtle, spanning the parent's content size;
+/// vertical inside a row. Spacing comes from the parent's gap.
+export fn mythic_separator(ui: MythicUi*) {
+  var n: MythicNode* = mythic_ctx_node_add(ui, MYTHIC_NODE_BOX);
+  if (ui->cur->box.dir == MYTHIC_DIR_ROW) {
+    n->box.width = mythic_fixed(1.0); n->box.height = mythic_grow();
+  } else {
+    n->box.height = mythic_fixed(1.0); n->box.width = mythic_grow();
+  }
+  n->box.bg = mythic_theme(ui)->colors.border_subtle;
+}
+
+/// Card container (DESIGN-SYSTEM §7.12): zero fields of `b` take the card defaults (bg.surface,
+/// 1px border.subtle, radius 12, padding 16 / 12 dense / 24 roomy, column). Close with mythic_end.
+export fn mythic_card_begin_ex(ui: MythicUi*, b: MythicBox, o: MythicCardOpts) {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: MythicBox = b;
+  if (c.pad.l == 0.0 && c.pad.t == 0.0 && c.pad.r == 0.0 && c.pad.b == 0.0) {
+    var pd: float32 = 16.0;
+    if (o.density == MYTHIC_DENSITY_DENSE) { pd = 12.0; } else if (o.density == MYTHIC_DENSITY_ROOMY) { pd = 24.0; }
+    c.pad = mythic_pad(pd);
+  }
+  if (c.bg == 0) { c.bg = t->colors.bg_surface; }
+  if (c.border_width == 0.0) { c.border_width = 1.0; }
+  if (c.border_color == 0) {
+    c.border_color = t->colors.border_subtle;
+    if (o.elevation >= 2 && t->colors.elevated_border != 0) { c.border_color = t->colors.elevated_border; }
+  }
+  if (c.radius.tl == 0.0 && c.radius.tr == 0.0 && c.radius.br == 0.0 && c.radius.bl == 0.0) { c.radius = mythic_radius(t->radius.xl); }
+  var e: MythicElevLevel = t->elevation.e0;
+  if (o.elevation == 1) { e = t->elevation.e1; }
+  else if (o.elevation == 2) { e = t->elevation.e2; }
+  else if (o.elevation == 3) { e = t->elevation.e3; }
+  else if (o.elevation >= 4) { e = t->elevation.e4; }
+  if (e.count > 0 && c.shadow.color == 0) { c.shadow = e.s[0]; }
+  if (e.count > 1 && c.shadow2.color == 0) { c.shadow2 = e.s[1]; }
+  mythic_box_begin(ui, c);
+}
+
+/// Flat card (e0). Close with mythic_end.
+export fn mythic_card_begin(ui: MythicUi*, b: MythicBox) { var o: MythicCardOpts; mythic_card_begin_ex(ui, b, o); }
+
+/// Elevated panel: a card with e2 shadows (+ 1px border.default in dark). Close with mythic_end.
+export fn mythic_panel_begin(ui: MythicUi*, b: MythicBox) { var o: MythicCardOpts = { elevation: 2 }; mythic_card_begin_ex(ui, b, o); }
+
+struct ProgPaint { value: float32; indet: bool; phase: float32; reduced: bool; track: uint32; fill: uint32; }
+
+fn prog_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: ProgPaint* = (ProgPaint*)data;
+  var rad: MythicCorners = mythic_radius(r.h / 2.0);
+  mythic_paint_fill(p, r, rad, d->track);
+  var dr: MythicRect = mythic_paint_dev_rect(p, r);
+  var lr: MythicRect = { x: dr.x / p->scale, y: dr.y / p->scale, w: dr.w / p->scale, h: dr.h / p->scale };
+  if (d->indet) {
+    if (d->reduced) {
+      // reduced motion: full-width fill pulsing accent alpha 25%..60% (sine, 2 s)
+      var a: float32 = 0.25 + 0.35 * (0.5 - 0.5 * mythic_cosf(d->phase * 6.2831853));
+      var fa: float32 = (float32)(d->fill >> 24) * a;
+      mythic_paint_fill(p, r, rad, ((uint32)mythic_iround(fa) << 24) | (d->fill & (uint32)0x00FFFFFF));
+      return;
+    }
+    var x: float32 = lr.x + lr.w * (-0.35 + 1.35 * mythic_ease(MYTHIC_CURVE_IN_OUT, d->phase));
+    var seg: MythicRect = { x: x, y: lr.y, w: lr.w * 0.35, h: lr.h };
+    mythic_dl_push_clip(p->dl, dr, dr.h / 2.0);
+    mythic_paint_fill_exact(p, seg, rad, d->fill);
+    mythic_dl_pop_clip(p->dl);
+    return;
+  }
+  if (d->value <= 0.0) { return; }
+  var w: float32 = mythic_maxf(lr.h, lr.w * mythic_minf(d->value, 1.0));
+  var fr: MythicRect = { x: lr.x, y: lr.y, w: w, h: lr.h };
+  mythic_paint_fill_exact(p, fr, rad, d->fill);
+}
+
+/// Progress bar (DESIGN-SYSTEM §7.9). value in [0,1]; value < 0 = indeterminate. With a non-empty
+/// label a header row (label left, percentage right) sits 6 px above the bar.
+export fn mythic_progress_ex(ui: MythicUi*, label: string, value: float32, o: MythicProgressOpts) {
+  var t: MythicTheme* = mythic_theme(ui);
+  var shown: string = mythic_arena_strn(ui->arena, label, mythic_label_len(label));
+  var col: bool = shown.length > (uint64)0;
+  if (col) {
+    var cb: MythicBox = { width: mythic_grow(), gap: 6 };
+    if (o.width.mode != MYTHIC_FIT || o.width.value != 0.0) { cb.width = o.width; }
+    mythic_column_begin(ui, cb);
+    var vt: string = "";
+    if (value >= 0.0) { vt = mythic_fmt_pct(ui, value); }
+    mythic_value_header(ui, shown, vt);
+  }
+  var n: MythicNode* = mythic_ctx_node_add(ui, MYTHIC_NODE_SPACER);
+  var h: float32 = 6.0;
+  if (o.size == MYTHIC_CTRL_SM) { h = 4.0; }
+  n->box.height = mythic_fixed(h);
+  n->box.width = mythic_grow();
+  if (!col && (o.width.mode != MYTHIC_FIT || o.width.value != 0.0)) { n->box.width = o.width; }
+  var d: ProgPaint* = (ProgPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(ProgPaint));
+  d->track = t->colors.control_track;
+  d->fill = o.color;
+  if (d->fill == 0) { d->fill = t->colors.accent; }
+  d->reduced = mythic_reduced_motion(ui);
+  var id: uint64 = n->nid;
+  if (value < 0.0) {
+    d->indet = true;
+    if (d->reduced) { d->phase = mythic_anim_loop(ui, 2000.0); }
+    else { d->phase = mythic_anim_loop(ui, t->motion.progress_loop_ms); }
+  } else {
+    d->value = mythic_anim_timed(ui, id, 0 | MYTHIC_ANIM_MOVE, mythic_clampf(value, 0.0, 1.0), t->motion.progress_ms, MYTHIC_CURVE_OUT);
+  }
+  mythic_node_paint(ui, &prog_paint, (rawptr)d);
+  if (col) { mythic_end(ui); }
+}
+
+/// Progress bar without a header; value < 0 => indeterminate.
+export fn mythic_progress(ui: MythicUi*, value: float32) {
+  var o: MythicProgressOpts;
+  mythic_progress_ex(ui, "", value, o);
+}

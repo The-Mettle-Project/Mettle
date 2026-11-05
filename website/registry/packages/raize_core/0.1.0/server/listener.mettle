@@ -1,0 +1,116 @@
+// raize/server/listener — the listening socket, and the two socket options the
+// framework depends on.
+//
+// Nothing here knows about HTTP. It exists so the accept path has exactly one
+// place where a fd is created, the address is built and freed, and the
+// timeouts are installed — the three things an error path leaks.
+//
+// `std/net` builds a sockaddr_in as a caller-owned 16-byte malloc blob and
+// hard-codes addrlen 16 (notes/04-net-web.md §3). That blob is freed on every
+// path below, including the bind failure path, because a server that leaks
+// 16 bytes per restart attempt is a server that quietly runs out of memory
+// after a supervisor has restarted it a million times.
+
+import "std/mem";
+import "std/net";
+
+// Linux socket options (values from asm-generic/socket.h). They are not in
+// std/net, which only carries the ones its own wrappers use.
+export const RZ_SOL_SOCKET: int32 = 1;
+export const RZ_SO_RCVTIMEO: int32 = 20;
+export const RZ_SO_SNDTIMEO: int32 = 21;
+
+struct RzTimeval {
+  sec: int64;
+  usec: int64;
+}
+
+fn rz_timeval_fill(tv: RzTimeval*, ms: int32) {
+  var v: int32 = ms;
+  if (v <= 0) { v = 1; }
+  tv->sec = (int64)(v / 1000);
+  tv->usec = (int64)(v % 1000) * 1000;
+}
+
+// SO_RCVTIMEO on an accepted socket is what stops one slow client from pinning
+// a worker forever: recv() returns -1/errno 11 after the timeout and the
+// connection loop closes the socket. SO_SNDTIMEO is the same guard for a client
+// that stops reading. Verified locally: 800 ms -> recv = -1, errno 11 at 816 ms
+// (notes/04-net-web.md, t/rtimeo.mettle).
+export fn rz_set_socket_timeout(fd: int64, opt: int32, ms: int32) -> int32 {
+  var tv: RzTimeval;
+  rz_timeval_fill(&tv, ms);
+  return setsockopt(fd, RZ_SOL_SOCKET, opt, (cstring)&tv, 16);
+}
+
+export fn rz_set_recv_timeout(fd: int64, ms: int32) -> int32 {
+  return rz_set_socket_timeout(fd, RZ_SO_RCVTIMEO, ms);
+}
+
+export fn rz_set_send_timeout(fd: int64, ms: int32) -> int32 {
+  return rz_set_socket_timeout(fd, RZ_SO_SNDTIMEO, ms);
+}
+
+// Creates, binds and listens. Returns the fd, or -1 with *out_err set to the
+// errno of the failing call (0 when the failure was net_init/socket_tcp, which
+// carry their own code).
+//
+// There is no hostname: Mettle has no DNS (`inet_addr` is literal-only), so the
+// address is INADDR_ANY and the port is the whole configuration.
+export fn rz_listen(port: int32, backlog: int32, out_err: int32*) -> int64 {
+  if (out_err != 0) { *out_err = 0; }
+  match (net_init()) {
+    case Ok(ready): { }
+    case Err(code): {
+      if (out_err != 0) { *out_err = code; }
+      return -1;
+    }
+  }
+  var server: int64 = 0;
+  match (socket_tcp()) {
+    case Ok(s): { server = s; }
+    case Err(code): {
+      if (out_err != 0) { *out_err = code; }
+      net_cleanup();
+      return -1;
+    }
+  }
+  // SO_REUSEADDR: a restart must not wait out TIME_WAIT.
+  set_reuseaddr(server, 1);
+  var addr: cstring = 0;
+  match (sockaddr_in_any(port)) {
+    case Ok(a): { addr = a; }
+    case Err(code): {
+      if (out_err != 0) { *out_err = code; }
+      closesocket(server);
+      net_cleanup();
+      return -1;
+    }
+  }
+  var rc: int32 = bind(server, addr, 16);
+  // The address blob is ours whether or not bind worked.
+  free((rawptr)addr);
+  if (rc != 0) {
+    if (out_err != 0) { *out_err = net_last_error(); }
+    closesocket(server);
+    net_cleanup();
+    return -1;
+  }
+  if (listen(server, backlog) != 0) {
+    if (out_err != 0) { *out_err = net_last_error(); }
+    closesocket(server);
+    net_cleanup();
+    return -1;
+  }
+  return server;
+}
+
+// Closes the listener. Workers blocked in accept() on a *shared* fd see this
+// as accept() = -1, which is how shutdown is signalled to them: there is no
+// other way to wake a blocking accept in Mettle (no poll, no self-pipe).
+export fn rz_listener_close(fd: int64) {
+  if (fd < 0) { return; }
+  shutdown(fd, SD_RECEIVE());
+  closesocket(fd);
+  net_cleanup();
+}

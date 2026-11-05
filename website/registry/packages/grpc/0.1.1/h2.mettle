@@ -1,0 +1,239 @@
+// The HTTP/2 transport: GrpcTransport over std/h2conn and a NetStream
+// (a TCP socket, or a TLS stream from mtls). Blocking: poll waits on the
+// socket; sends queue in h2conn and are written out right away.
+import "std/mem";
+import "std/core";
+import "std/hpack";
+import "std/http2";
+import "std/socket";
+import "std/h2conn";
+import "grpc/transport";
+
+export struct GrpcH2 {
+  c: H2c*;
+  ns: NetStream;
+  is_server: bool;
+  closed: bool;
+  max_stream: int32;      // highest stream the peer opened (server GOAWAY)
+  ping_n: uint64;
+  // For a TLS stream: true when it holds decrypted bytes the socket can no
+  // longer signal (grpc/tls sets it).
+  buffered: fn(rawptr) -> bool;
+}
+
+fn h(u: rawptr) -> GrpcH2* { return (GrpcH2*)u; }
+
+fn flush(t: GrpcH2*) {
+  if (t->closed) { return; }
+  if (h2c_flush(t->c, &t->ns) < 0) { h2c_eof(t->c); }
+}
+
+fn t_open(u: rawptr, hs: HpackHeader*, n: int64, end: bool) -> int64 {
+  var t: GrpcH2* = h(u);
+  if (t->closed) { return GRPC_T_CLOSED; }
+  var id: int32 = h2c_open_stream(t->c, hs, n, end);
+  if (id == H2C_ERR_NO_SLOT) { return GRPC_T_NO_SLOT; }
+  if (id <= 0) { return GRPC_T_CLOSED; }
+  flush(t);
+  return (int64)id;
+}
+
+fn t_send_headers(u: rawptr, id: int64, hs: HpackHeader*, n: int64, end: bool) -> int32 {
+  var t: GrpcH2* = h(u);
+  var r: int32 = h2c_send_headers(t->c, (int32)id, hs, n, end);
+  if (r == H2C_ERR_WOULD_BLOCK) {
+    flush(t);
+    r = h2c_send_headers(t->c, (int32)id, hs, n, end);
+  }
+  flush(t);
+  if (r < 0) { return r; }
+  return 0;
+}
+
+fn t_send_data(u: rawptr, id: int64, p: uint8*, n: int64, end: bool) -> int64 {
+  var t: GrpcH2* = h(u);
+  var r: int64 = h2c_send_data(t->c, (int32)id, p, n, end);
+  if (r == (int64)H2C_ERR_WOULD_BLOCK) {
+    flush(t);
+    r = h2c_send_data(t->c, (int32)id, p, n, end);
+    if (r == (int64)H2C_ERR_WOULD_BLOCK) { r = 0; }
+  }
+  flush(t);
+  return r;
+}
+
+fn t_reset(u: rawptr, id: int64, code: int64) {
+  var t: GrpcH2* = h(u);
+  h2c_reset_stream(t->c, (int32)id, code);
+  flush(t);
+}
+
+fn t_consumed(u: rawptr, id: int64, n: int64) {
+  h2c_consumed(h(u)->c, (int32)id, n);
+}
+
+fn t_ping(u: rawptr) -> int32 {
+  var t: GrpcH2* = h(u);
+  t->ping_n = t->ping_n + 1;
+  var d: uint8[8];
+  for i in 0..8 { d[i] = (uint8)((t->ping_n >> (uint64)(i * 8)) & 255); }
+  var r: int32 = h2c_ping(t->c, &d[0]);
+  flush(t);
+  if (r < 0) { return r; }
+  return 0;
+}
+
+fn t_goaway(u: rawptr, code: int64, debug: string) {
+  var t: GrpcH2* = h(u);
+  h2c_goaway(t->c, t->max_stream, code, debug);
+  flush(t);
+}
+
+fn t_close(u: rawptr) {
+  var t: GrpcH2* = h(u);
+  if (t->closed) { return; }
+  flush(t);
+  t->closed = true;
+  net_stream_close(&t->ns);
+}
+
+// Copies an h2conn event into a transport event. False to skip it.
+fn convert(t: GrpcH2*, e: H2cEvent*, ev: GrpcTEvent*) -> bool {
+  var blank: GrpcTEvent;
+  *ev = blank;
+  ev->stream = (int64)e->stream_id;
+  ev->end_stream = e->end_stream;
+  switch (e->kind) {
+    case H2C_EV_HEADERS: {
+      ev->kind = GRPC_TEV_HEADERS;
+      ev->headers = e->headers;
+      ev->nheaders = e->header_count;
+      if (e->new_stream && e->stream_id > t->max_stream) { t->max_stream = e->stream_id; }
+    }
+    case H2C_EV_TRAILERS: {
+      ev->kind = GRPC_TEV_HEADERS;
+      ev->headers = e->headers;
+      ev->nheaders = e->header_count;
+      ev->end_stream = true;
+    }
+    case H2C_EV_DATA: {
+      ev->kind = GRPC_TEV_DATA;
+      ev->data = e->data;
+      ev->len = e->length;
+    }
+    case H2C_EV_RESET: {
+      if (!e->by_peer && !e->unprocessed) { return false; }
+      ev->kind = GRPC_TEV_RESET;
+      ev->code = e->error_code;
+      // A stream past the peer's GOAWAY was never seen: retry it freely.
+      if (e->unprocessed) { ev->code = GRPC_H2_REFUSED_STREAM; }
+    }
+    case H2C_EV_GOAWAY: {
+      ev->kind = GRPC_TEV_GOAWAY;
+      ev->code = e->error_code;
+      ev->last_stream = (int64)e->last_stream_id;
+    }
+    case H2C_EV_PING: { ev->kind = GRPC_TEV_PING; }
+    case H2C_EV_PING_ACK: {
+      ev->kind = GRPC_TEV_PING_ACK;
+      ev->rtt_ns = e->rtt_ms * 1000000;
+    }
+    case H2C_EV_WRITABLE: { ev->kind = GRPC_TEV_WRITABLE; }
+    case H2C_EV_SLOT_FREE: { ev->kind = GRPC_TEV_SLOT; }
+    case H2C_EV_CLOSED: {
+      ev->kind = GRPC_TEV_CLOSED;
+      ev->code = e->error_code;
+    }
+    default: { return false; }
+  }
+  return true;
+}
+
+fn t_poll(u: rawptr, ev: GrpcTEvent*, timeout_ns: int64) -> int32 {
+  var t: GrpcH2* = h(u);
+  var ms: int64 = -1;
+  if (timeout_ns >= 0) { ms = (timeout_ns + 999999) / 1000000; }
+  var waited: bool = false;
+  while (true) {
+    var e: H2cEvent;
+    var k: int32 = h2c_next_event(t->c, &e);
+    if (k != 0) {
+      flush(t);
+      if (convert(t, &e, ev)) { return 1; }
+      continue;
+    }
+    flush(t);
+    if (t->closed || h2c_is_dead(t->c)) { return -1; }
+    if (waited && ms >= 0) { return 0; }
+    if (t->buffered != 0 && t->buffered(t->ns.ctx)) {
+      // Read what the TLS layer already holds without waiting on the socket.
+      var p: uint8* = (uint8*)0;
+      var space: int64 = h2c_input_space(t->c, &p);
+      if (space > 0) {
+        var got: int64 = net_stream_read(&t->ns, p, space);
+        if (got > 0) {
+          h2c_input_commit(t->c, got);
+          continue;
+        }
+      }
+    }
+    var r: int64 = h2c_pump(t->c, &t->ns, ms);
+    waited = true;
+    if (r == H2C_PUMP_EOF) { continue; }
+    if (r < 0) {
+      h2c_eof(t->c);
+      continue;
+    }
+    if (r == 0 && ms >= 0) {
+      // Timed out; one more look for events the pump's flush made.
+      if (h2c_next_event(t->c, &e) != 0 && convert(t, &e, ev)) { return 1; }
+      return 0;
+    }
+  }
+  return 0;
+}
+
+// Sets up a transport on a connected stream. cfg may be 0 for defaults.
+export fn grpc_h2_init(t: GrpcH2*, ns: NetStream, is_server: bool, cfg: H2cConfig*) {
+  var d: H2cConfig;
+  h2c_config_default(&d);
+  if (cfg != 0) { d = *cfg; }
+  t->c = h2c_new(is_server, &d);
+  t->ns = ns;
+  t->is_server = is_server;
+  t->closed = false;
+  flush(t);   // the client preface and our SETTINGS
+}
+
+export fn grpc_h2_transport(t: GrpcH2*) -> GrpcTransport {
+  var tr: GrpcTransport;
+  tr.user = (rawptr)t;
+  tr.open_stream = &t_open;
+  tr.send_headers = &t_send_headers;
+  tr.send_data = &t_send_data;
+  tr.reset = &t_reset;
+  tr.consumed = &t_consumed;
+  tr.ping = &t_ping;
+  tr.goaway = &t_goaway;
+  tr.poll = &t_poll;
+  tr.close = &t_close;
+  return tr;
+}
+
+// Connects to host:port over TCP (h2c, prior knowledge). 0 or below zero.
+export fn grpc_h2_dial(t: GrpcH2*, host: string, port: int32, timeout_ms: int64) -> int32 {
+  var fd: int64 = -1;
+  match (tcp_connect(host, port, timeout_ms)) {
+    case Ok(v): { fd = v; }
+    case Err(e): { return -1; }
+  }
+  grpc_h2_init(t, net_stream_socket(fd), false, (H2cConfig*)0);
+  return 0;
+}
+
+// Closes the connection if open and frees it.
+export fn grpc_h2_free(t: GrpcH2*) {
+  t_close((rawptr)t);
+  if (t->c != 0) { h2c_free(t->c); }
+  t->c = (H2c*)0;
+}

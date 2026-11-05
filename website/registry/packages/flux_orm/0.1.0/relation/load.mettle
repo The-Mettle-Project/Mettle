@@ -1,0 +1,589 @@
+// flux_orm/relation/load.mettle — the batch loader: one statement per relation.
+//
+// N owners cost one statement, not N. The loader collects the distinct owner
+// keys, binds them into one `WHERE fk IN (?, ?, ...)`, runs it once, then
+// groups the returned rows in memory by the foreign key.
+//
+//   HAS_MANY           1 exec   SELECT ... FROM "posts" WHERE "user_id" IN (?,...)
+//   BELONGS_TO         1 exec   SELECT ... FROM "users" WHERE "id" IN (?,...)
+//   HAS_MANY_THROUGH   2 execs  SELECT ... FROM "user_posts" WHERE "user_id" IN (?,...)
+//                               SELECT ... FROM "posts" WHERE "id" IN (?,...)
+//
+// Why THROUGH is two statements and not a JOIN: the mapping table returns
+// *keys*, not target rows. One statement would need a JOIN whose grouping and
+// column-name collision handling (both tables have an "id"?) is a different
+// feature with a different result shape. Two statements is still O(1) in the
+// owner count — the two statements do not grow with N, only their IN lists do —
+// which is exactly the N+1 property this module must have. The mapping rows are
+// also the only honest representation of a share: a target row may legitimately
+// belong to two owners, and the second statement's IN list is the deduped set of
+// target keys, while the grouping pass walks the mapping rows, so the same
+// target row index can appear in two groups.
+//
+// No session, no cache, no lazy load. A load is an explicit call with explicit
+// keys; the result owns its rows and the caller frees it. A lazily-triggered
+// load is how a cursor escapes into user code and how N+1 comes back, so there
+// is deliberately no getter on a model that runs SQL.
+//
+// Statements come out of src/query (`rc_query_select` + `rc_query_where_in` +
+// `rc_query_exec`) for every relation kind, including the through one: this
+// file never spells SQL itself and never touches core/buf.
+//
+// Reading a result: owner key -> group -> rows.
+//
+//   g = rc_relation_group(&out, user.id);        // -1: key not loaded
+//   n = rc_relation_count(&out, g);              // rows in that group
+//   for i in 0..n: rc_relation_hydrate(&out, g, i, &post, &nulls);
+//
+// Lifetime: `out->res` (and `out->through`) are owned results. `idx` holds row
+// *indices* into `res`, so a hydrated model's string fields are borrowed views
+// into `res`; the borrow ends at `rc_relation_free`.
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/persist";
+import "../adapter/adapter";
+import "../query/builder";
+import "relation";
+
+// The result of one rc_relation_load. Read it through rc_relation_group /
+// count / hydrate; free it with rc_relation_free.
+export struct RcRelationResult {
+  kind: int32;         // RC_REL_* of the relation that was loaded
+  keys: int64*;        // deduped owner keys, first-seen order
+  n_keys: int32;       // entries in keys; also the number of groups
+  res: RcResult;       // ALL target rows, one statement
+  idx: int32*;         // row indices into res, grouped
+  off: int32*;         // n_keys + 1 prefix offsets; group g = idx[off[g]..off[g+1])
+  n_execs: int32;      // 1 for HAS_MANY/BELONGS_TO, 2 for THROUGH, 0 for empty keys
+  through: RcResult;   // THROUGH only: the mapping rows
+  // Target metadata, carried so `rc_relation_hydrate` can write a model
+  // without a meta argument.
+  meta: RcMeta;        // the target_meta passed to rc_relation_load
+}
+
+fn rc_relation_result_init(out: RcRelationResult*) {
+  out->kind = 0;
+  out->keys = 0;
+  out->n_keys = 0;
+  rc_result_init(&out->res);
+  out->idx = 0;
+  out->off = 0;
+  out->n_execs = 0;
+  rc_result_init(&out->through);
+  out->meta.table = "";
+  out->meta.name = "";
+  out->meta.size = 0;
+  out->meta.fields = 0;
+  out->meta.n_fields = 0;
+  out->meta.pk = -1;
+}
+
+// Frees the parts of a failed load but keeps n_keys / keys / n_execs, so the
+// caller can tell "three keys, no statement ran" from "three keys, one statement
+// ran, grouping failed". No half-filled groups survive this: idx and off are
+// gone, so every group reads as empty or unreadable rather than as a prefix.
+fn rc_relation_drop(out: RcRelationResult*) {
+  rc_result_free(&out->res);
+  rc_result_free(&out->through);
+  if (out->idx != 0) {
+    free(out->idx);
+    out->idx = 0;
+  }
+  if (out->off != 0) {
+    free(out->off);
+    out->off = 0;
+  }
+}
+
+// Frees everything a load allocated (rows, groups, keys) and resets the
+// counts. Call it once per rc_relation_load, on success or failure.
+//   out  the result; 0 is a no-op. Safe to call twice.
+// Models hydrated from it hold views into its rows: stop using them first.
+export fn rc_relation_free(out: RcRelationResult*) {
+  if (out == 0) { return; }
+  rc_relation_drop(out);
+  if (out->keys != 0) {
+    free(out->keys);
+    out->keys = 0;
+  }
+  out->n_keys = 0;
+  out->n_execs = 0;
+  out->kind = 0;
+}
+
+// --- grouping helpers --------------------------------------------------------
+
+fn rc_relation_group_of_key(out: RcRelationResult*, key: int64) -> int32 {
+  var i: int32 = 0;
+  while (i < out->n_keys) {
+    if (out->keys[i] == key) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// off[0..n_keys] from counts. `counts` is left untouched (the caller reuses it
+// as a write cursor).
+fn rc_relation_prefix(out: RcRelationResult*, counts: int32*) -> int32 {
+  var n_keys: int32 = out->n_keys;
+  out->off = malloc((int64)(n_keys + 1) * (int64)sizeof(int32));
+  if (out->off == 0) {
+    out->off = 0;
+    return RC_ERR_NOMEM;
+  }
+  out->off[0] = 0;
+  var i: int32 = 0;
+  while (i < n_keys) {
+    out->off[i + 1] = out->off[i] + counts[i];
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+// Every group exists but holds nothing. Used when the mapping statement came
+// back empty: there is no key to put in the second IN list, and `IN ()` is
+// refused by the builder (correctly — it is a syntax error everywhere), so the
+// second statement is skipped and n_execs stays 1.
+fn rc_relation_empty_groups(out: RcRelationResult*) -> int32 {
+  out->off = malloc((int64)(out->n_keys + 1) * (int64)sizeof(int32));
+  if (out->off == 0) {
+    out->off = 0;
+    return RC_ERR_NOMEM;
+  }
+  var i: int32 = 0;
+  while (i <= out->n_keys) {
+    out->off[i] = 0;
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+// Two passes over the returned rows: count per group, then fill. A row belongs
+// to at most one group in the direct shapes, so idx is at most n_rows long.
+// Group membership is a linear scan over the (small, distinct) owner keys; the
+// cost is O(rows * keys) and allocates nothing per row.
+fn rc_relation_group_direct(out: RcRelationResult*, field: int32) -> int32 {
+  if (out->res.n_rows > 0 && out->res.n_cols != out->meta.n_fields) {
+    return RC_ERR_ADAPTER;
+  }
+  var n_keys: int32 = out->n_keys;
+  var n_rows: int32 = out->res.n_rows;
+  var counts: int32* = malloc((int64)n_keys * (int64)sizeof(int32));
+  if (counts == 0) { return RC_ERR_NOMEM; }
+  defer free(counts);
+  var i: int32 = 0;
+  while (i < n_keys) {
+    counts[i] = 0;
+    i = i + 1;
+  }
+
+  var r: int32 = 0;
+  while (r < n_rows) {
+    var k: int64 = 0;
+    var v: RcValue = rc_result_borrow(&out->res, r, field);
+    var rc: int32 = rc_value_as_i64(v, &k);
+    if (rc != RC_OK) { return RC_ERR_ADAPTER; }
+    var g: int32 = rc_relation_group_of_key(out, k);
+    if (g >= 0) { counts[g] = counts[g] + 1; }
+    r = r + 1;
+  }
+
+  var rc2: int32 = rc_relation_prefix(out, counts);
+  if (rc2 != RC_OK) { return rc2; }
+
+  var total: int32 = out->off[n_keys];
+  if (total > 0) {
+    out->idx = malloc((int64)total * (int64)sizeof(int32));
+    if (out->idx == 0) {
+      out->idx = 0;
+      return RC_ERR_NOMEM;
+    }
+  }
+
+  i = 0;
+  while (i < n_keys) {
+    counts[i] = out->off[i];
+    i = i + 1;
+  }
+  r = 0;
+  while (r < n_rows) {
+    var k: int64 = 0;
+    var v: RcValue = rc_result_borrow(&out->res, r, field);
+    var rc: int32 = rc_value_as_i64(v, &k);
+    if (rc != RC_OK) { return RC_ERR_ADAPTER; }
+    var g: int32 = rc_relation_group_of_key(out, k);
+    if (g >= 0) {
+      out->idx[counts[g]] = r;
+      counts[g] = counts[g] + 1;
+    }
+    r = r + 1;
+  }
+  return RC_OK;
+}
+
+// THROUGH grouping walks the *mapping* rows, not the target rows: each mapping
+// row says (owner key -> target key). The owner column picks the group, the
+// target column picks a row of `res` by primary key. Two mapping rows with the
+// same target key under different owners produce the same res row index in two
+// groups, which is a share and is allowed.
+fn rc_relation_group_through(out: RcRelationResult*, pk_field: int32) -> int32 {
+  if (out->through.n_cols != 2) { return RC_ERR_ADAPTER; }
+  if (out->res.n_rows > 0 && out->res.n_cols != out->meta.n_fields) {
+    return RC_ERR_ADAPTER;
+  }
+  var n_keys: int32 = out->n_keys;
+  var n_map: int32 = out->through.n_rows;
+  var counts: int32* = malloc((int64)n_keys * (int64)sizeof(int32));
+  if (counts == 0) { return RC_ERR_NOMEM; }
+  defer free(counts);
+  var i: int32 = 0;
+  while (i < n_keys) {
+    counts[i] = 0;
+    i = i + 1;
+  }
+
+  var m: int32 = 0;
+  while (m < n_map) {
+    var owner: int64 = 0;
+    var rc: int32 = rc_value_as_i64(rc_result_borrow(&out->through, m, 0), &owner);
+    if (rc != RC_OK) { return RC_ERR_ADAPTER; }
+    var target: int64 = 0;
+    rc = rc_value_as_i64(rc_result_borrow(&out->through, m, 1), &target);
+    if (rc != RC_OK) { return RC_ERR_ADAPTER; }
+    var g: int32 = rc_relation_group_of_key(out, owner);
+    if (g >= 0) {
+      var r: int32 = rc_relation_row_of_pk(out, pk_field, target);
+      if (r >= 0) { counts[g] = counts[g] + 1; }
+    }
+    m = m + 1;
+  }
+
+  var rc2: int32 = rc_relation_prefix(out, counts);
+  if (rc2 != RC_OK) { return rc2; }
+
+  var total: int32 = out->off[n_keys];
+  if (total > 0) {
+    out->idx = malloc((int64)total * (int64)sizeof(int32));
+    if (out->idx == 0) {
+      out->idx = 0;
+      return RC_ERR_NOMEM;
+    }
+  }
+  i = 0;
+  while (i < n_keys) {
+    counts[i] = out->off[i];
+    i = i + 1;
+  }
+  m = 0;
+  while (m < n_map) {
+    var owner: int64 = 0;
+    var rc: int32 = rc_value_as_i64(rc_result_borrow(&out->through, m, 0), &owner);
+    if (rc != RC_OK) { return RC_ERR_ADAPTER; }
+    var target: int64 = 0;
+    rc = rc_value_as_i64(rc_result_borrow(&out->through, m, 1), &target);
+    if (rc != RC_OK) { return RC_ERR_ADAPTER; }
+    var g: int32 = rc_relation_group_of_key(out, owner);
+    if (g >= 0) {
+      var r: int32 = rc_relation_row_of_pk(out, pk_field, target);
+      if (r >= 0) {
+        out->idx[counts[g]] = r;
+        counts[g] = counts[g] + 1;
+      }
+    }
+    m = m + 1;
+  }
+  return RC_OK;
+}
+
+fn rc_relation_row_of_pk(out: RcRelationResult*, field: int32, pk: int64) -> int32 {
+  var r: int32 = 0;
+  while (r < out->res.n_rows) {
+    var k: int64 = 0;
+    var rc: int32 = rc_value_as_i64(rc_result_borrow(&out->res, r, field), &k);
+    if (rc != RC_OK) { return -1; }
+    if (k == pk) { return r; }
+    r = r + 1;
+  }
+  return -1;
+}
+
+// --- the two statement shapes ------------------------------------------------
+
+// HAS_MANY and BELONGS_TO are the same statement: one IN list against the
+// target's key column, then group by that column. HAS_MANY groups by the target
+// foreign key, BELONGS_TO by the target primary key (which is what the owner's
+// foreign key pointed at).
+fn rc_relation_load_one(a: RcAdapter*, rel: RcRelation*, target_meta: RcMeta,
+                        vals: RcValue*, n_vals: int32,
+                        out: RcRelationResult*) -> int32 {
+  var q: RcQuery = rc_query_select(target_meta);
+  defer rc_query_free(&q);
+  if (q.err != RC_OK) { return q.err; }
+  var rc: int32 = rc_query_where_in_field(&q, rel->foreign_field, vals, n_vals);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_query_exec(&q, a, &out->res);
+  if (rc != RC_OK) { return rc; }
+  out->n_execs = 1;
+  return rc_relation_group_direct(out, rel->foreign_field);
+}
+
+// THROUGH: one statement on the mapping table, then one on the target table
+// keyed by the deduped target keys the mapping returned. See the header for why
+// this is two statements and not a JOIN.
+fn rc_relation_load_through(a: RcAdapter*, rel: RcRelation*, target_meta: RcMeta,
+                            through_meta: RcMeta*, vals: RcValue*, n_vals: int32,
+                            out: RcRelationResult*) -> int32 {
+  var tm: RcMeta = *through_meta;
+  var qm: RcQuery = rc_query_select(tm);
+  defer rc_query_free(&qm);
+  if (qm.err != RC_OK) { return qm.err; }
+  // Field 0 of the through meta is the owner column, by contract (checked in
+  // rc_relation_check), so the projection order and this index cannot disagree.
+  var rc: int32 = rc_query_where_in_field(&qm, 0, vals, n_vals);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_query_exec(&qm, a, &out->through);
+  if (rc != RC_OK) { return rc; }
+  out->n_execs = 1;
+
+  var n_map: int32 = out->through.n_rows;
+  if (n_map == 0) {
+    // Nothing mapped: no target key to bind, so the second statement is not
+    // run at all. `IN ()` would be refused by the builder, which is right.
+    return rc_relation_empty_groups(out);
+  }
+
+  // Deduped target keys, in mapping-row order. The second statement's argument
+  // count is the number of distinct targets, not the number of mapping rows.
+  var tkeys: int64* = malloc((int64)n_map * (int64)sizeof(int64));
+  if (tkeys == 0) { return RC_ERR_NOMEM; }
+  defer free(tkeys);
+  var n_t: int32 = 0;
+  var m: int32 = 0;
+  while (m < n_map) {
+    var pk: int64 = 0;
+    rc = rc_value_as_i64(rc_result_borrow(&out->through, m, 1), &pk);
+    if (rc != RC_OK) { return RC_ERR_ADAPTER; }
+    var dup: bool = false;
+    var j: int32 = 0;
+    while (j < n_t) {
+      if (tkeys[j] == pk) {
+        dup = true;
+        j = n_t;
+      } else {
+        j = j + 1;
+      }
+    }
+    if (!dup) {
+      tkeys[n_t] = pk;
+      n_t = n_t + 1;
+    }
+    m = m + 1;
+  }
+  if (n_t == 0) { return rc_relation_empty_groups(out); }
+
+  var tvals: RcValue* = malloc((int64)n_t * (int64)sizeof(RcValue));
+  if (tvals == 0) { return RC_ERR_NOMEM; }
+  defer free(tvals);
+  var i: int32 = 0;
+  while (i < n_t) {
+    tvals[i] = RcInt(tkeys[i]);
+    i = i + 1;
+  }
+
+  var q: RcQuery = rc_query_select(target_meta);
+  defer rc_query_free(&q);
+  if (q.err != RC_OK) { return q.err; }
+  rc = rc_query_where_in_field(&q, rel->foreign_field, tvals, n_t);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_query_exec(&q, a, &out->res);
+  if (rc != RC_OK) { return rc; }
+  out->n_execs = 2;
+  return rc_relation_group_through(out, rel->foreign_field);
+}
+
+// --- public loader -----------------------------------------------------------
+
+// Loads the targets of `rel` for a batch of owners: one statement for
+// HAS_MANY / BELONGS_TO, two for THROUGH, however many owners there are.
+//   a             the adapter; borrowed
+//   rel           the relation; borrowed. Checked with rc_relation_check first
+//   owner_meta    the owner model's meta
+//   target_meta   the target model's meta; copied into out->meta
+//   through_meta  the join table's meta for THROUGH, else may be 0
+//   keys          owner key values (the owner's local_field), n_keys of them;
+//                 borrowed, may be 0 when n_keys is 0. NULL keys are skipped,
+//                 duplicates collapse (first-seen order kept)
+//   n_keys        number of keys, >= 0
+//   out           the result; overwritten (not freed) on entry
+// Returns RC_OK, or:
+//   RC_ERR_USAGE    rel or out is 0 (out untouched), a is 0, n_keys < 0, or
+//                   keys is 0 with n_keys > 0; or any rc_relation_check code
+//                   (RC_ERR_USAGE / RC_ERR_UNSUPPORTED / RC_ERR_CAST)
+//   RC_ERR_CAST     a non-NULL key is not RC_T_I64; checked before any
+//                   statement runs
+//   RC_ERR_NOMEM    an allocation failed
+//   RC_ERR_ADAPTER  the store returned rows of the wrong shape (column count,
+//                   or a key cell that is not an integer)
+//   any code from the adapter or the query builder for a failed statement
+// An empty key set (or only NULLs) runs no statement and returns RC_OK with
+// zero groups. out->n_execs counts statements that succeeded. On failure no
+// group is readable, but keys / n_keys / n_execs are kept so you can see what
+// ran. Always call rc_relation_free(out) afterwards, success or not.
+export fn rc_relation_load(a: RcAdapter*, rel: RcRelation*, owner_meta: RcMeta,
+                          target_meta: RcMeta, through_meta: RcMeta*,
+                          keys: RcValue*, n_keys: int32,
+                          out: RcRelationResult*) -> int32 {
+  if (rel == 0 || out == 0) { return RC_ERR_USAGE; }
+  rc_relation_result_init(out);
+  out->kind = rel->kind;
+  out->meta = target_meta;
+  if (a == 0) { return RC_ERR_USAGE; }
+  if (n_keys < 0) { return RC_ERR_USAGE; }
+  if (n_keys > 0 && keys == 0) { return RC_ERR_USAGE; }
+
+  // A loader that runs against unchecked metadata is the bug this phase exists
+  // to prevent, so the loader checks instead of trusting its caller. On failure
+  // no statement runs and no allocation is made.
+  var rc: int32 = rc_relation_check(rel, owner_meta, target_meta, through_meta);
+  if (rc != RC_OK) { return rc; }
+
+  if (n_keys > 0) {
+    out->keys = malloc((int64)n_keys * (int64)sizeof(int64));
+    if (out->keys == 0) { return RC_ERR_NOMEM; }
+  }
+
+  // Pass 1: type-check, skip NULL, dedupe. Nothing is executed until every key
+  // has been accepted, so a bad key cannot leave a half-loaded relation behind.
+  var count: int32 = 0;
+  var i: int32 = 0;
+  while (i < n_keys) {
+    var k: RcValue = keys[i];
+    if (!rc_value_is_null(k)) {
+      if (rc_value_type(k) != RC_T_I64) {
+        rc_relation_drop(out);
+        free(out->keys);
+        out->keys = 0;
+        return RC_ERR_CAST;
+      }
+      var v: int64 = 0;
+      var cast: int32 = rc_value_as_i64(k, &v);
+      if (cast != RC_OK) {
+        rc_relation_drop(out);
+        free(out->keys);
+        out->keys = 0;
+        return cast;
+      }
+      // Duplicates are found with rc_value_same, the value layer's identity
+      // predicate, not with a second comparison rule invented here. The key
+      // array stores int64 (the relation's key type), so the already-accepted
+      // key is rebuilt as RcInt for the comparison; for RC_T_I64 that is
+      // exactly identity and it keeps one definition of "same key".
+      var dup: bool = false;
+      var j: int32 = 0;
+      while (j < count) {
+        if (rc_value_same(RcInt(out->keys[j]), k)) {
+          dup = true;
+          j = count;
+        } else {
+          j = j + 1;
+        }
+      }
+      if (!dup) {
+        out->keys[count] = v;
+        count = count + 1;
+      }
+    }
+    i = i + 1;
+  }
+  out->n_keys = count;
+
+  if (count == 0) {
+    // No owners, no statement: the adapter's call count does not move.
+    if (out->keys != 0) {
+      free(out->keys);
+      out->keys = 0;
+    }
+    return RC_OK;
+  }
+
+  var vals: RcValue* = malloc((int64)count * (int64)sizeof(RcValue));
+  if (vals == 0) {
+    rc_relation_drop(out);
+    return RC_ERR_NOMEM;
+  }
+  defer free(vals);
+  i = 0;
+  while (i < count) {
+    vals[i] = RcInt(out->keys[i]);
+    i = i + 1;
+  }
+
+  if (rel->kind == RC_REL_HAS_MANY_THROUGH) {
+    rc = rc_relation_load_through(a, rel, target_meta, through_meta, vals, count,
+                                  out);
+  } else {
+    rc = rc_relation_load_one(a, rel, target_meta, vals, count, out);
+  }
+  if (rc != RC_OK) {
+    // Keep n_execs/n_keys (what ran, which owners) but drop any partial rows
+    // and groups: a failed load has no readable group, not a truncated one.
+    rc_relation_drop(out);
+    return rc;
+  }
+  return RC_OK;
+}
+
+// --- reading a result --------------------------------------------------------
+
+// Finds the group for one owner key.
+//   out  a loaded result; may be 0
+//   key  an owner key value, as passed to rc_relation_load
+// Returns the group index (0 .. n_keys-1, in first-seen key order), or -1
+// when out is 0 or the key was not in the loaded key set.
+export fn rc_relation_group(out: RcRelationResult*, key: int64) -> int32 {
+  if (out == 0) { return -1; }
+  return rc_relation_group_of_key(out, key);
+}
+
+// Counts the target rows in a group.
+//   out    a loaded result; may be 0
+//   group  a group index from rc_relation_group
+// Returns the row count (0 for an owner with no targets, at most 1 for
+// BELONGS_TO), or -1 when out is 0, the load failed or loaded no keys, or
+// group is out of range.
+export fn rc_relation_count(out: RcRelationResult*, group: int32) -> int32 {
+  if (out == 0) { return -1; }
+  if (out->off == 0) { return -1; }
+  if (group < 0 || group >= out->n_keys) { return -1; }
+  return out->off[group + 1] - out->off[group];
+}
+
+// Fills a target model from row `i` of group `group`.
+//   out    a loaded result; borrowed, must outlive the model
+//   group  a group index from rc_relation_group
+//   i      0 .. rc_relation_count(out, group) - 1
+//   model  pointer to a target model struct (target_meta's layout)
+//   nulls  receives the model's null bitmap; zeroed first
+// Returns RC_OK, or:
+//   RC_ERR_USAGE    a pointer is 0, the load failed or the group is empty,
+//                   or group / i is out of range
+//   RC_ERR_ADAPTER  the row's column count does not match the target meta
+//   RC_ERR_RANGE / RC_ERR_CAST / RC_ERR_CONSTRAINT  a value does not fit its
+//                   field (from rc_meta_set; fields before it are written)
+// Nothing is copied: string and blob fields borrow from `out->res` and are
+// valid until rc_relation_free(out). No copy per field because the owner list
+// a copy would need is the session arena, which this phase does not have.
+export fn rc_relation_hydrate(out: RcRelationResult*, group: int32, i: int32,
+                             model: rawptr, nulls: uint64*) -> int32 {
+  if (out == 0 || model == 0 || nulls == 0) { return RC_ERR_USAGE; }
+  if (out->off == 0 || out->idx == 0) { return RC_ERR_USAGE; }
+  if (group < 0 || group >= out->n_keys) { return RC_ERR_USAGE; }
+  var base: int32 = out->off[group];
+  var n: int32 = out->off[group + 1] - base;
+  if (i < 0 || i >= n) { return RC_ERR_USAGE; }
+  return rc_persist_hydrate(out->meta, &out->res, out->idx[base + i], model, nulls);
+}

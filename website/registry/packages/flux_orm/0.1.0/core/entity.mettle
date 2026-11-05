@@ -1,0 +1,144 @@
+// flux_orm/core/entity.mettle — a model row's persistence state.
+//
+// The model struct is what the application holds. RcEntity is what the ORM
+// knows about it: which metadata describes it, which fields are NULL, and
+// whether it is in the store. Keeping this beside the struct (not inside it)
+// is what lets a plain Mettle struct with no nullable scalars be a model.
+
+import "status";
+import "value";
+import "meta";
+
+// Entity states, in RcEntity.state.
+export const RC_ST_NEW: int32 = 0;     // not in the store
+export const RC_ST_CLEAN: int32 = 1;   // matches the store
+export const RC_ST_DIRTY: int32 = 2;   // loaded, changed in memory
+export const RC_ST_DELETED: int32 = 3; // removed from the store
+
+// The ORM's view of one model row. Does not own the model.
+export struct RcEntity {
+  // describes the model's fields
+  meta: RcMeta;
+  // the application's model struct; borrowed, must outlive the entity
+  model: rawptr;
+  // bit i set means field i is NULL (see rc_nulls_*)
+  nulls: uint64;
+  // RC_ST_*
+  state: int32;
+}
+
+// Short lowercase name of an entity state, for logs and test output.
+//   s   an RC_ST_* value
+// Returns a static string ("new", "clean", "dirty", "deleted") or "unknown".
+// Do not free it.
+export fn rc_entity_state_name(s: int32) -> string {
+  if (s == RC_ST_NEW) { return "new"; }
+  if (s == RC_ST_CLEAN) { return "clean"; }
+  if (s == RC_ST_DIRTY) { return "dirty"; }
+  if (s == RC_ST_DELETED) { return "deleted"; }
+  return "unknown";
+}
+
+// Wraps a model that is not in the store yet, for rc_persist_insert.
+//   m       the model's metadata (from its *_meta() function)
+//   model   pointer to the model struct; borrowed, must outlive the entity
+// Returns an RC_ST_NEW entity with no NULL fields, except an auto primary key,
+// which starts NULL until the store assigns it. Never fails; allocates nothing.
+export fn rc_entity_new(m: RcMeta, model: rawptr) -> RcEntity {
+  var e: RcEntity;
+  e.meta = m;
+  e.model = model;
+  e.nulls = 0;
+  e.state = RC_ST_NEW;
+  // An auto key is absent until the store assigns it, and "absent" is a null.
+  var pk: int32 = rc_meta_pk(m);
+  if (pk >= 0) {
+    if ((m.fields[pk].flags & RC_F_AUTO) != 0) {
+      e.nulls = rc_nulls_set(e.nulls, pk);
+    }
+  }
+  return e;
+}
+
+// Wraps a model just filled from the store (rc_persist_load or
+// rc_persist_hydrate). The entity is CLEAN, so a changeset can save it.
+//   m       the model's metadata
+//   model   pointer to the filled model; borrowed, must outlive the entity
+//   nulls   the null bitmap the loader wrote
+// Returns the entity. Never fails; allocates nothing.
+export fn rc_entity_loaded(m: RcMeta, model: rawptr, nulls: uint64) -> RcEntity {
+  var e: RcEntity;
+  e.meta = m;
+  e.model = model;
+  e.nulls = nulls;
+  e.state = RC_ST_CLEAN;
+  return e;
+}
+
+// rc_entity_get by field index (0-based, RcMeta order), for generated code.
+// Same results as rc_entity_get; an out-of-range index is RC_ERR_USAGE.
+export fn rc_entity_get_field(e: RcEntity*, i: int32, out: RcValue*) -> int32 {
+  if (e == 0) { return RC_ERR_USAGE; }
+  return rc_meta_get(e.meta, e.model, e.nulls, i, out);
+}
+
+// rc_entity_set by field index (0-based, RcMeta order), for generated code.
+// Same results as rc_entity_set; an out-of-range index is RC_ERR_USAGE.
+export fn rc_entity_set_field(e: RcEntity*, i: int32, v: RcValue) -> int32 {
+  if (e == 0) { return RC_ERR_USAGE; }
+  if (e.state == RC_ST_DELETED) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meta_set(e.meta, e.model, &e.nulls, i, v);
+  if (rc != RC_OK) { return rc; }
+  if (e.state == RC_ST_CLEAN) { e.state = RC_ST_DIRTY; }
+  return RC_OK;
+}
+
+// The entity's primary key value.
+//   e   the entity; 0 gives RcNull
+// Returns the key, or RcNull when the table has no key, the key is NULL (an
+// auto key before insert), or it cannot be read. A text key borrows the
+// model's string.
+export fn rc_entity_pk(e: RcEntity*) -> RcValue {
+  if (e == 0) { return RcNull; }
+  var pk: int32 = rc_meta_pk(e->meta);
+  if (pk < 0) { return RcNull; }
+  var v: RcValue = RcNull;
+  if (rc_meta_get(e->meta, e->model, e->nulls, pk, &v) != RC_OK) { return RcNull; }
+  return v;
+}
+
+// True when rc_entity_pk would return a non-NULL key; false otherwise,
+// including for `e` of 0.
+export fn rc_entity_has_pk(e: RcEntity*) -> bool {
+  var v: RcValue = rc_entity_pk(e);
+  if (rc_value_is_null(v)) { return false; }
+  return true;
+}
+
+// Reads one field of the model.
+//   e      the entity
+//   name   Mettle field name, or column name if no field has that name
+//   out    receives the value: RcNull when the field is NULL, otherwise the
+//          arm for the field's kind (RcTime for an int64 TIMESTAMP field).
+//          Text borrows the model's string; do not release it.
+// Returns RC_OK; RC_ERR_USAGE when `e`, `out` or the model is 0, or the name
+// is unknown; RC_ERR_UNSUPPORTED when the field's kind cannot be read.
+export fn rc_entity_get(e: RcEntity*, name: string, out: RcValue*) -> int32 {
+  if (e == 0) { return RC_ERR_USAGE; }
+  return rc_entity_get_field(e, rc_meta_find(e->meta, name), out);
+}
+
+// Writes one field of the model and marks a CLEAN entity DIRTY.
+//   e      the entity; must not be DELETED
+//   name   Mettle field name, or column name if no field has that name
+//   v      the new value; RcNull sets the field NULL. Text is stored as a
+//          view, so its bytes must outlive the model.
+// Returns RC_OK; RC_ERR_USAGE when `e` or the model is 0, the entity is
+// DELETED, or the name is unknown; RC_ERR_CONSTRAINT for RcNull on a NOT NULL
+// field; RC_ERR_CAST when `v`'s arm does not fit the field; RC_ERR_RANGE when
+// the number does not fit the field's width; RC_ERR_UNSUPPORTED when the
+// field's kind cannot be written. On error the model and state are unchanged.
+export fn rc_entity_set(e: RcEntity*, name: string, v: RcValue) -> int32 {
+  if (e == 0) { return RC_ERR_USAGE; }
+  return rc_entity_set_field(e, rc_meta_find(e->meta, name), v);
+}

@@ -1,0 +1,1058 @@
+// flux_orm/adapter/meodb.mettle — the MeoDB adapter, over the network.
+//
+// flux_orm does not compile MeoDB in; it talks to the `meodb` server with
+// wire protocol v1 (meodb/docs/PROTOCOL.md, coded in wire.mettle). This file
+// is not in the import root, so only apps that use MeoDB pull in std/net:
+//
+//   import "flux_orm/adapter/meodb";
+//   var a: RcAdapter* = rc_meodb_adapter("token");   // "" for none
+//   rc_adapter_open(a, "127.0.0.1:5490");             // IPv4 literal; no DNS
+//
+// Statements go through the `query` slot as RcStmt; there is no SQL text, so
+// `exec` is empty (rc_adapter_exec answers RC_ERR_UNSUPPORTED): give
+// migrations an `up` callback. Results come back whole. Joins, and COUNT on a
+// server without RC_WIRE_CAP_COUNT, are RC_ERR_UNSUPPORTED without sending; so
+// is a request larger than the server's max_frame.
+//
+// rc_adapter_open(a, dsn) takes "host" or "host:port" (default port 5490); a
+// bad port or a host that is not an IPv4 literal is RC_ERR_USAGE, a refused
+// connect is RC_ERR_CLOSED, a rejected HELLO (e.g. a wrong token) maps the
+// server's ERROR with rc_wire_status. rc_adapter_close sends BYE and closes;
+// the adapter can be opened again.
+//
+// Connection loss (EOF, a socket error, or a reply with the wrong kind or
+// rid): the socket is closed at once and no request is ever sent twice.
+//   - inside a transaction: that call and every later one but rollback answer
+//     RC_ERR_TX; rollback answers RC_OK (the server already rolled back);
+//   - outside one: that call answers RC_ERR_CLOSED (it may or may not have
+//     run), and the next call reconnects once before sending.
+// A fatal ERROR from the server, or CORRUPT / NOT_A_DB / VERSION, drops the
+// connection the same way. With rc_meodb_timeout set, a reply that takes
+// longer than that is a connection loss too; without it, only the server's own
+// timeouts (idle, tx_idle) end a stuck session.
+//
+// HELLO asks for protocol minor 1. With it come rc_meodb_scan (points
+// streamed from one snapshot) and subscriptions to row changes on their own
+// connection (rc_meodb_subscribe, at the end of this file).
+
+import "std/mem";
+import "std/net";
+
+import "../core/status";
+import "../core/value";
+import "adapter";
+import "stmt";
+import "wire";
+import "../repo/pool";
+
+export const RC_MEODB_PORT: int32 = 5490;  // used when the dsn has no port
+const RC_MEODB_MAX_FRAME: int64 = 16777216;  // largest reply we accept
+
+// The adapter's state behind RcAdapter.ud. Treat it as private.
+export struct RcMeodb {
+  sock: int64;       // -1 when not connected
+  host: string;      // owned copies
+  port: int32;
+  token: string;
+  rid: uint32;       // last request id on this connection
+  in_tx: bool;       // the server holds a transaction for us
+  lost_tx: bool;     // the connection dropped inside one
+  caps: int32;       // RC_WIRE_CAP_* from HELLO_OK
+  minor: int32;      // negotiated protocol minor
+  max_frame: int64;  // largest request the server accepts
+  out: RcWire;       // request bytes
+  buf: uint8*;       // reply payload
+  cap: int64;        // bytes allocated at buf
+  timeout_ms: int32; // send and receive timeout; 0 = wait forever
+  pts: RcPoint*;     // SCAN points of one frame
+  pts_cap: int32;
+}
+
+// Sets every field; nothing is connected. False when out of memory.
+fn rc_meodb_init(m: RcMeodb*, token: string) -> bool {
+  m->sock = -1;
+  m->host = "";
+  m->port = RC_MEODB_PORT;
+  m->token = rc_text_dup(token);
+  m->rid = 0;
+  m->in_tx = false;
+  m->lost_tx = false;
+  m->caps = 0;
+  m->minor = 0;
+  m->max_frame = 65536;
+  m->out = rc_wire_new();
+  m->buf = 0;
+  m->cap = 0;
+  m->timeout_ms = 0;
+  m->pts = 0;
+  m->pts_cap = 0;
+  return token.length == (uint64)0 || m->token.chars != 0;
+}
+
+// Sets SO_RCVTIMEO and SO_SNDTIMEO (Linux numbers 20 and 21) on the socket.
+fn rc_meodb_apply_timeout(m: RcMeodb*) {
+  if (m->sock < 0) { return; }
+  var tv: int64[2];                                // struct timeval
+  tv[0] = (int64)(m->timeout_ms / 1000);
+  tv[1] = (int64)(m->timeout_ms % 1000) * 1000;
+  setsockopt(m->sock, SOL_SOCKET(), 20, (cstring)&tv[0], 16);
+  setsockopt(m->sock, SOL_SOCKET(), 21, (cstring)&tv[0], 16);
+}
+
+fn rc_meodb_of(ud: rawptr) -> RcMeodb* { return (RcMeodb*)ud; }
+
+fn rc_meodb_drop(m: RcMeodb*) {
+  if (m->sock >= 0) { closesocket(m->sock); }
+  m->sock = -1;
+  m->rid = 0;
+  m->caps = 0;
+  m->minor = 0;
+}
+
+// Closes the socket without BYE and frees what m owns. Safe twice.
+fn rc_meodb_fini(m: RcMeodb*) {
+  rc_meodb_drop(m);
+  rc_text_free(m->host);
+  rc_text_free(m->token);
+  m->host = "";
+  m->token = "";
+  rc_wire_free(&m->out);
+  if (m->buf != 0) { free((rawptr)m->buf); }
+  if (m->pts != 0) { free((rawptr)m->pts); }
+  m->buf = 0;
+  m->cap = 0;
+  m->pts = 0;
+  m->pts_cap = 0;
+}
+
+// The connection is gone: what the call that saw it answers.
+fn rc_meodb_lost(m: RcMeodb*) -> int32 {
+  rc_meodb_drop(m);
+  if (m->in_tx) {
+    m->lost_tx = true;
+    return RC_ERR_TX;
+  }
+  return RC_ERR_CLOSED;
+}
+
+fn rc_meodb_cstr(s: string) -> cstring {
+  var p: uint8* = malloc((int64)s.length + 1);
+  if (p == 0) { return (cstring)0; }
+  if (s.length > (uint64)0) { memcpy((rawptr)p, (rawptr)s.chars, (int64)s.length); }
+  p[s.length] = (uint8)0;
+  return (cstring)p;
+}
+
+fn rc_meodb_send(m: RcMeodb*) -> bool {
+  var r: Result<int32, int32> = send_all(m->sock, (cstring)m->out.data,
+                                         (int32)m->out.len);
+  match (r) {
+    case Ok(_n): { return true; }
+    case Err(_e): { return false; }
+  }
+  return false;
+}
+
+fn rc_meodb_recv(m: RcMeodb*, p: uint8*, n: int64) -> bool {
+  var got: int64 = 0;
+  while (got < n) {
+    var r: int32 = recv(m->sock, (cstring)(p + got), (int32)(n - got), 0);
+    if (r <= 0) { return false; }
+    got = got + (int64)r;
+  }
+  return true;
+}
+
+// Reads one frame into m->buf. False when the connection is out of step:
+// EOF, a socket error or timeout, a bad header, or no memory for the payload.
+fn rc_meodb_read(m: RcMeodb*, kind: int32*, len: int64*, rid: uint32*) -> bool {
+  var head: uint8[12];
+  if (!rc_meodb_recv(m, &head[0], (int64)RC_WIRE_HEADER)) { return false; }
+  if (rc_wire_header(&head[0], len, kind, rid) != RC_OK) { return false; }
+  if (*len > RC_MEODB_MAX_FRAME) { return false; }
+  if (*len > m->cap) {
+    var p: rawptr = realloc((rawptr)m->buf, *len);
+    if (p == 0) { return false; }
+    m->buf = (uint8*)p;
+    m->cap = *len;
+  }
+  return *len == 0 || rc_meodb_recv(m, m->buf, *len);
+}
+
+// Sends the frame in m->out and reads the reply into m->buf. On success *kind
+// and *len describe it. Any failure has already dropped the connection and
+// returns the code the call should answer.
+fn rc_meodb_roundtrip(m: RcMeodb*, rid: uint32, kind: int32*, len: int64*) -> int32 {
+  if (m->out.err != RC_OK) { return m->out.err; }
+  if (m->out.len - (int64)RC_WIRE_HEADER > m->max_frame) { return RC_ERR_UNSUPPORTED; }
+  if (!rc_meodb_send(m)) { return rc_meodb_lost(m); }
+  return rc_meodb_reply(m, rid, kind, len);
+}
+
+// Reads the next frame of the reply to request rid, as rc_meodb_roundtrip.
+fn rc_meodb_reply(m: RcMeodb*, rid: uint32, kind: int32*, len: int64*) -> int32 {
+  var got: uint32 = 0;
+  if (!rc_meodb_read(m, kind, len, &got)) { return rc_meodb_lost(m); }
+  // rid 0 is the server's last word (an ERROR, then it closes), never a reply.
+  if (got == (uint32)0 && *kind == RC_WIRE_ERROR) {
+    var code: int32 = rc_meodb_error(m, *len);
+    rc_meodb_drop(m);
+    if (m->in_tx) {
+      m->lost_tx = true;
+      return RC_ERR_TX;
+    }
+    return code;
+  }
+  if (got != rid) { return rc_meodb_lost(m); }
+  return RC_OK;
+}
+
+// Reads an ERROR reply: updates the transaction state from it, drops the
+// connection when it is fatal or the store is unusable, and maps the code.
+fn rc_meodb_error(m: RcMeodb*, len: int64) -> int32 {
+  var e: RcWireError;
+  if (rc_wire_error(m->buf, len, &e) != RC_OK) { return rc_meodb_lost(m); }
+  m->in_tx = e.tx != 0;
+  var rc: int32 = rc_wire_status(e.code);
+  if (e.fatal || e.code == 4 || e.code == 5 || e.code == 6) {
+    rc_meodb_drop(m);
+    if (m->in_tx) {
+      m->lost_tx = true;
+      return RC_ERR_TX;
+    }
+  }
+  return rc;
+}
+
+// connect + HELLO. On failure the connection is closed.
+fn rc_meodb_connect(m: RcMeodb*) -> int32 {
+  rc_meodb_drop(m);
+  var ok: Result<int32, int32> = net_init();
+  match (ok) {
+    case Ok(_v): {}
+    case Err(_e): { return RC_ERR_CLOSED; }
+  }
+  var sock: int64 = -1;
+  var sr: Result<int64, int32> = socket_tcp();
+  match (sr) {
+    case Ok(s): { sock = s; }
+    case Err(_e): { return RC_ERR_CLOSED; }
+  }
+  var host: cstring = rc_meodb_cstr(m->host);
+  if (host == (cstring)0) {
+    closesocket(sock);
+    return RC_ERR_NOMEM;
+  }
+  var addr: cstring = (cstring)0;
+  var ar: Result<cstring, int32> = sockaddr_in(host, m->port);
+  free((rawptr)host);
+  match (ar) {
+    case Ok(a): { addr = a; }
+    case Err(_e): {
+      closesocket(sock);
+      return RC_ERR_USAGE;
+    }
+  }
+  var c: int32 = connect(sock, addr, 16);
+  free((rawptr)addr);
+  if (c != 0) {
+    closesocket(sock);
+    return RC_ERR_CLOSED;
+  }
+  var one: int32 = 1;
+  setsockopt(sock, IPPROTO_TCP(), 1, (cstring)&one, 4);   // TCP_NODELAY
+  m->sock = sock;
+  rc_meodb_apply_timeout(m);
+  m->rid = 1;
+  m->max_frame = 65536;
+
+  rc_wire_clear(&m->out);
+  var rc: int32 = rc_wire_hello(&m->out, m->rid, (uint32)RC_MEODB_MAX_FRAME,
+                                m->token, "flux_orm");
+  if (rc != RC_OK) {
+    rc_meodb_drop(m);
+    return rc;
+  }
+  var kind: int32 = 0;
+  var len: int64 = 0;
+  rc = rc_meodb_roundtrip(m, m->rid, &kind, &len);
+  if (rc != RC_OK) { return RC_ERR_CLOSED; }
+  if (kind == RC_WIRE_ERROR) {
+    rc = rc_meodb_error(m, len);
+    rc_meodb_drop(m);
+    return rc;
+  }
+  var h: RcWireHello;
+  if (kind != RC_WIRE_HELLO_OK || rc_wire_hello_ok(m->buf, len, &h) != RC_OK) {
+    rc_meodb_drop(m);
+    return RC_ERR_ADAPTER;
+  }
+  m->caps = h.caps;
+  m->minor = h.minor;
+  m->max_frame = h.max_frame;
+  return RC_OK;
+}
+
+// Before a request: the lost-transaction rule, then reconnect once if needed.
+fn rc_meodb_ready(m: RcMeodb*) -> int32 {
+  if (m->lost_tx) { return RC_ERR_TX; }
+  if (m->sock >= 0) { return RC_OK; }
+  if (m->host.length == (uint64)0) { return RC_ERR_CLOSED; }
+  return rc_meodb_connect(m);
+}
+
+fn rc_meodb_next_rid(m: RcMeodb*) -> uint32 {
+  m->rid = m->rid + (uint32)1;
+  if (m->rid == (uint32)0) { m->rid = 1; }
+  return m->rid;
+}
+
+// A request whose success reply is OK: PING, BEGIN, COMMIT, ROLLBACK, BYE.
+fn rc_meodb_simple(m: RcMeodb*, kind: int32, mode: int32) -> int32 {
+  var rc: int32 = rc_meodb_ready(m);
+  if (rc != RC_OK) { return rc; }
+  var rid: uint32 = rc_meodb_next_rid(m);
+  rc_wire_clear(&m->out);
+  if (kind == RC_WIRE_BEGIN) {
+    rc = rc_wire_begin(&m->out, rid, mode);
+  } else {
+    rc = rc_wire_empty(&m->out, kind, rid);
+  }
+  if (rc != RC_OK) { return rc; }
+  var got: int32 = 0;
+  var len: int64 = 0;
+  rc = rc_meodb_roundtrip(m, rid, &got, &len);
+  if (rc != RC_OK) { return rc; }
+  if (got == RC_WIRE_ERROR) { return rc_meodb_error(m, len); }
+  if (got != RC_WIRE_OK || len != 0) { return rc_meodb_lost(m); }
+  return RC_OK;
+}
+
+// --- the adapter slots -------------------------------------------------------
+
+// Sets m->host and m->port from "host" or "host:port", the host an IPv4
+// literal.
+fn rc_meodb_parse(m: RcMeodb*, dsn: string) -> int32 {
+  if (dsn.length == (uint64)0) { return RC_ERR_USAGE; }
+  var colon: int64 = -1;
+  var i: uint64 = 0;
+  while (i < dsn.length) {
+    if (dsn.chars[i] == (uint8)58) { colon = (int64)i; }   // ':'
+    i = i + 1;
+  }
+  var port: int32 = RC_MEODB_PORT;
+  var host_len: int64 = (int64)dsn.length;
+  if (colon >= 0) {
+    host_len = colon;
+    port = 0;
+    var k: int64 = colon + 1;
+    if (k >= (int64)dsn.length) { return RC_ERR_USAGE; }
+    while (k < (int64)dsn.length) {
+      var d: uint8 = dsn.chars[k];
+      if (d < (uint8)48 || d > (uint8)57 || port > 65535) { return RC_ERR_USAGE; }
+      port = port * 10 + (int32)(d - (uint8)48);
+      k = k + 1;
+    }
+    if (port <= 0 || port > 65535) { return RC_ERR_USAGE; }
+  }
+  if (host_len == 0) { return RC_ERR_USAGE; }
+  rc_text_free(m->host);
+  m->host = rc_text_dup(str_from_bytes((cstring)dsn.chars, host_len));
+  if (m->host.chars == 0) { return RC_ERR_NOMEM; }
+  m->port = port;
+  return RC_OK;
+}
+
+fn rc_meodb_open(ud: rawptr, dsn: string) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meodb_parse(m, dsn);
+  if (rc != RC_OK) { return rc; }
+  m->in_tx = false;
+  m->lost_tx = false;
+  return rc_meodb_connect(m);
+}
+
+fn rc_meodb_close(ud: rawptr) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (m->sock >= 0) { rc_meodb_simple(m, RC_WIRE_BYE, 0); }
+  rc_meodb_drop(m);
+  m->in_tx = false;
+  m->lost_tx = false;
+  rc_text_free(m->host);
+  m->host = "";
+  return RC_OK;
+}
+
+fn rc_meodb_begin(ud: rawptr, mode: int32) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meodb_simple(m, RC_WIRE_BEGIN, mode);
+  if (rc == RC_OK) { m->in_tx = true; }
+  return rc;
+}
+
+fn rc_meodb_commit(ud: rawptr) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meodb_simple(m, RC_WIRE_COMMIT, 0);
+  if (rc == RC_OK) { m->in_tx = false; }
+  return rc;
+}
+
+fn rc_meodb_rollback(ud: rawptr) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (m->lost_tx) {
+    // The server rolled back when the connection went.
+    m->lost_tx = false;
+    m->in_tx = false;
+    return RC_OK;
+  }
+  var rc: int32 = rc_meodb_simple(m, RC_WIRE_ROLLBACK, 0);
+  if (rc == RC_OK) { m->in_tx = false; }
+  return rc;
+}
+
+fn rc_meodb_ping(ud: rawptr) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  return rc_meodb_simple(m, RC_WIRE_PING, 0);
+}
+
+fn rc_meodb_query(ud: rawptr, st: RcStmt*, out: RcResult*) -> int32 {
+  var m: RcMeodb* = rc_meodb_of(ud);
+  if (m == 0 || st == 0 || out == 0) { return RC_ERR_USAGE; }
+  rc_result_init(out);
+  if (st->n_joins > 0) { return RC_ERR_UNSUPPORTED; }
+  var rc: int32 = rc_meodb_ready(m);
+  if (rc != RC_OK) { return rc; }
+  if (st->op == RC_OP_COUNT && (m->caps & RC_WIRE_CAP_COUNT) == 0) {
+    return RC_ERR_UNSUPPORTED;
+  }
+  var rid: uint32 = rc_meodb_next_rid(m);
+  rc_wire_clear(&m->out);
+  rc = rc_wire_query(&m->out, rid, st);
+  if (rc != RC_OK) { return rc; }
+  var got: int32 = 0;
+  var len: int64 = 0;
+  rc = rc_meodb_roundtrip(m, rid, &got, &len);
+  if (rc != RC_OK) { return rc; }
+  if (got == RC_WIRE_ERROR) { return rc_meodb_error(m, len); }
+  if (got != RC_WIRE_RESULT) { return rc_meodb_lost(m); }
+  rc = rc_wire_result(m->buf, len, out);
+  if (rc == RC_ERR_ADAPTER) { return rc_meodb_lost(m); }
+  return rc;
+}
+
+// --- construction ------------------------------------------------------------
+
+// Makes a MeoDB adapter that will authenticate with `token`. It does not
+// connect; call rc_adapter_open(a, "host:port") next.
+//   token  the server's auth token, "" for none; copied
+// Returns the adapter, or 0 when out of memory. Free it with
+// rc_meodb_adapter_free (after rc_adapter_close for a clean BYE).
+export fn rc_meodb_adapter(token: string) -> RcAdapter* {
+  var m: RcMeodb* = malloc(sizeof(RcMeodb));
+  if (m == 0) { return 0; }
+  if (!rc_meodb_init(m, token)) {
+    free((rawptr)m);
+    return 0;
+  }
+  var a: RcAdapter* = malloc(sizeof(RcAdapter));
+  if (a == 0) {
+    rc_meodb_fini(m);
+    free((rawptr)m);
+    return 0;
+  }
+  *a = rc_adapter_empty();
+  a.name = "meodb";
+  a.ud = (rawptr)m;
+  a.open = &rc_meodb_open;
+  a.close = &rc_meodb_close;
+  a.begin = &rc_meodb_begin;
+  a.commit = &rc_meodb_commit;
+  a.rollback = &rc_meodb_rollback;
+  a.ping = &rc_meodb_ping;
+  a.query = &rc_meodb_query;
+  return a;
+}
+
+// Returns the server's capability bits (RC_WIRE_CAP_*) from the last
+// HELLO_OK, or 0 before the first connection or when a is 0.
+//   a  an adapter from rc_meodb_adapter
+export fn rc_meodb_caps(a: RcAdapter*) -> int32 {
+  if (a == 0 || a.ud == 0) { return 0; }
+  return rc_meodb_of(a.ud)->caps;
+}
+
+// Limits how long one send or reply may take. A call that runs past it gets
+// the connection-loss codes (RC_ERR_CLOSED, or RC_ERR_TX in a transaction) and
+// the socket is closed, since its reply may still arrive. Applies now and to
+// every later connection.
+//   a   an adapter from rc_meodb_adapter
+//   ms  milliseconds; 0 waits forever (the default)
+// Returns RC_OK; RC_ERR_USAGE when a is 0 or ms < 0.
+export fn rc_meodb_timeout(a: RcAdapter*, ms: int32) -> int32 {
+  if (a == 0 || a.ud == 0 || ms < 0) { return RC_ERR_USAGE; }
+  var m: RcMeodb* = rc_meodb_of(a.ud);
+  m->timeout_ms = ms;
+  rc_meodb_apply_timeout(m);
+  return RC_OK;
+}
+
+// Streams the points (x, y, and a group) of every row with lo <= x <= hi to
+// `each`, one call per SCAN_ROWS frame. Works on any open connection, in or
+// out of a transaction (it then sees the transaction's own writes); for a
+// pooled session pass rc_session_adapter(s). y is NaN for a NULL or
+// non-numeric value, rows with a non-numeric x are skipped, and points come
+// in x order when x is the rowid or indexed. Once `each` returns false it is
+// not called again, but the rest of the reply is still read so the
+// connection stays usable.
+//   a           an adapter from rc_meodb_adapter
+//   table       the table; borrowed
+//   x, y        the point columns; borrowed
+//   group       an integer column to group by, "" for none (group 0)
+//   lo, hi      the inclusive x window
+//   chunk       most points per call, 1..1048576
+//   each        each(ctx, points, n) with n >= 1; the points are borrowed for
+//               the call. Returns false to stop
+//   ctx         passed to each; may be 0
+//   commit_seq  receives the snapshot's commit (give it to rc_meodb_subscribe
+//               as from_commit to follow later changes); may be 0
+// Returns RC_OK, RC_ERR_USAGE (a or each is 0, an empty name, chunk out of
+// range, or the server's SCHEMA for an unknown table or column),
+// RC_ERR_UNSUPPORTED (the server lacks RC_WIRE_CAP_SCAN; nothing sent), the
+// connection-loss codes (RC_ERR_CLOSED, or RC_ERR_TX in a transaction),
+// another server error mapped by rc_wire_status, or RC_ERR_NOMEM.
+export fn rc_meodb_scan(a: RcAdapter*, table: string, x: string, y: string, group: string,
+                        lo: float64, hi: float64, chunk: int32,
+                        each: fn(rawptr, RcPoint*, int32) -> bool with alloc, syscall,
+                        ctx: rawptr, commit_seq: uint64*) -> int32 {
+  if (a == 0 || a.ud == 0 || each == 0 || chunk < 1 || chunk > 1048576) { return RC_ERR_USAGE; }
+  if (table.length == (uint64)0 || x.length == (uint64)0 || y.length == (uint64)0) {
+    return RC_ERR_USAGE;
+  }
+  if (commit_seq != 0) { *commit_seq = 0; }
+  var m: RcMeodb* = rc_meodb_of(a.ud);
+  var rc: int32 = rc_meodb_ready(m);
+  if (rc != RC_OK) { return rc; }
+  if ((m->caps & RC_WIRE_CAP_SCAN) == 0) { return RC_ERR_UNSUPPORTED; }
+  var rid: uint32 = rc_meodb_next_rid(m);
+  rc_wire_clear(&m->out);
+  rc = rc_wire_scan(&m->out, rid, table, x, y, group, lo, hi, (uint32)chunk);
+  if (rc != RC_OK) { return rc; }
+  var kind: int32 = 0;
+  var len: int64 = 0;
+  rc = rc_meodb_roundtrip(m, rid, &kind, &len);
+  var going: bool = true;
+  var seen: bool = false;
+  var seq: uint64 = 0;
+  while (rc == RC_OK) {
+    if (kind == RC_WIRE_ERROR) { return rc_meodb_error(m, len); }
+    var h: RcWireScanRows;
+    if (kind != RC_WIRE_SCAN_ROWS || rc_wire_scan_rows(m->buf, len, &h) != RC_OK) {
+      return rc_meodb_lost(m);
+    }
+    // Every frame of one reply has the same shape and snapshot.
+    if (h.grouped != (group.length > (uint64)0) || (seen && h.commit_seq != seq)) {
+      return rc_meodb_lost(m);
+    }
+    seen = true;
+    seq = h.commit_seq;
+    if (commit_seq != 0) { *commit_seq = seq; }
+    if (going && h.n > 0) {
+      if (h.n > m->pts_cap) {
+        var p: rawptr = realloc((rawptr)m->pts, (int64)h.n * (int64)sizeof(RcPoint));
+        // The rest of the reply is still on the wire: out of step.
+        if (p == 0) { return rc_meodb_lost(m); }
+        m->pts = (RcPoint*)p;
+        m->pts_cap = h.n;
+      }
+      var i: int32 = 0;
+      while (i < h.n) {
+        rc_wire_scan_point(&h, i, &m->pts[i]);
+        i = i + 1;
+      }
+      going = each(ctx, m->pts, h.n);
+    }
+    if (h.last) { return RC_OK; }
+    rc = rc_meodb_reply(m, rid, &kind, &len);
+  }
+  return rc;
+}
+
+// Closes the socket without BYE and frees the adapter and its state.
+//   a  an adapter from rc_meodb_adapter, or 0 (no-op); invalid afterwards
+export fn rc_meodb_adapter_free(a: RcAdapter*) {
+  if (a == 0) { return; }
+  var m: RcMeodb* = rc_meodb_of(a.ud);
+  if (m != 0) {
+    rc_meodb_fini(m);
+    free((rawptr)m);
+  }
+  free(a);
+}
+
+fn rc_meodb_pool_make(ctx: rawptr) -> RcAdapter* {
+  return rc_meodb_adapter(*(string*)ctx);
+}
+
+// Opens a pool of n MeoDB connections, e.g. one per worker thread:
+// rc_meodb_pool(&pool, 8, "token", "127.0.0.1:5490").
+//   p      receives the pool; free it with rc_pool_free
+//   n      connections, at least 1
+//   token  passed to rc_meodb_adapter; borrowed
+//   dsn    passed to rc_adapter_open; borrowed
+// Returns the codes of rc_pool_new.
+export fn rc_meodb_pool(p: RcPool*, n: int32, token: string, dsn: string) -> int32 {
+  var t: string = token;
+  return rc_pool_new(p, n, &rc_meodb_pool_make, (rawptr)&t, dsn, &rc_meodb_adapter_free);
+}
+
+// --- subscriptions -----------------------------------------------------------
+//
+// A subscription takes over its own connection (it cannot run queries), so
+// it is not an adapter and never sits in a pool:
+//
+//   var sub: RcSub;
+//   var only: string[1] = ["posts"];
+//   rc_meodb_subscribe(&sub, "token", "127.0.0.1:5490", &only[0], 1, 0, seq, 256);
+//   var ev: RcEvent;
+//   while (true) {
+//     var rc: int32 = rc_sub_next(&sub, &ev);
+//     if (rc == RC_OK) { ...; rc_sub_ack(&sub, ev.seq); }
+//     else if (rc == RC_ERR_CLOSED) { Sleep(1000); rc_sub_reopen(&sub); }
+//   }
+//   rc_sub_close(&sub);
+//
+// The read timeout is twice the server's heartbeat, so a dead server shows
+// up as RC_ERR_CLOSED. rc_sub_reopen resumes after the last event returned.
+
+// One subscribed table: its name and columns, all owned.
+struct RcSubTable {
+  id: int32;
+  name: string;
+  n_cols: int32;
+  cols: string*;
+}
+
+// A subscription. Make it with rc_meodb_subscribe and free it with
+// rc_sub_close; treat the fields as private.
+export struct RcSub {
+  conn: RcMeodb;          // the dedicated connection
+  tables: string*;        // the SUBSCRIBE arguments, owned, for rc_sub_reopen
+  n_tables: int32;
+  from_seq: uint64;
+  from_commit: uint64;
+  window: int32;
+  map: RcSubTable*;       // table_id -> name and columns, owned
+  n_map: int32;
+  start_seq: uint64;      // from the last SUB_OK
+  commit_seq: uint64;
+  heartbeat_ms: int64;
+  last_seq: uint64;       // the last event returned
+  got_any: bool;          // an event has been returned
+  ev: RcWireEvents;       // the EVENTS frame being handed out
+  ev_at: int32;           // next event of it
+}
+
+fn rc_sub_table_free(t: RcSubTable*) {
+  rc_text_free(t->name);
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    rc_text_free(t->cols[i]);
+    i = i + 1;
+  }
+  if (t->cols != 0) { free((rawptr)t->cols); }
+  t->name = "";
+  t->cols = 0;
+  t->n_cols = 0;
+}
+
+fn rc_sub_map_clear(sub: RcSub*) {
+  var i: int32 = 0;
+  while (i < sub->n_map) {
+    rc_sub_table_free(&sub->map[i]);
+    i = i + 1;
+  }
+  if (sub->map != 0) { free((rawptr)sub->map); }
+  sub->map = 0;
+  sub->n_map = 0;
+}
+
+fn rc_sub_find(sub: RcSub*, id: int32) -> RcSubTable* {
+  var i: int32 = 0;
+  while (i < sub->n_map) {
+    if (sub->map[i].id == id) { return &sub->map[i]; }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Copies a table's name and columns into t, replacing what it held.
+fn rc_sub_table_set(t: RcSubTable*, name: string, n: int32, cols: RcWireCol*) -> int32 {
+  var nm: string = rc_text_dup(name);
+  if (name.length > (uint64)0 && nm.chars == 0) { return RC_ERR_NOMEM; }
+  var cs: string* = 0;
+  if (n > 0) {
+    cs = (string*)malloc((int64)n * (int64)sizeof(string));
+    if (cs == 0) {
+      rc_text_free(nm);
+      return RC_ERR_NOMEM;
+    }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    cs[i] = rc_text_dup(cols[i].name);
+    if (cols[i].name.length > (uint64)0 && cs[i].chars == 0) {
+      var k: int32 = 0;
+      while (k < i) {
+        rc_text_free(cs[k]);
+        k = k + 1;
+      }
+      free((rawptr)cs);
+      rc_text_free(nm);
+      return RC_ERR_NOMEM;
+    }
+    i = i + 1;
+  }
+  rc_sub_table_free(t);
+  t->name = nm;
+  t->n_cols = n;
+  t->cols = cs;
+  return RC_OK;
+}
+
+// Applies a SCHEMA event: replaces the table's entry, or adds one.
+fn rc_sub_apply_schema(sub: RcSub*, e: RcWireEvent*) -> int32 {
+  var t: RcSubTable* = rc_sub_find(sub, e->ev.table_id);
+  if (t == 0) {
+    var p: rawptr = realloc((rawptr)sub->map, (int64)(sub->n_map + 1) * (int64)sizeof(RcSubTable));
+    if (p == 0) { return RC_ERR_NOMEM; }
+    sub->map = (RcSubTable*)p;
+    t = &sub->map[sub->n_map];
+    t->id = e->ev.table_id;
+    t->name = "";
+    t->n_cols = 0;
+    t->cols = 0;
+    sub->n_map = sub->n_map + 1;
+  }
+  return rc_sub_table_set(t, e->ev.table, e->n_cols, e->cols);
+}
+
+// Replaces the table map with SUB_OK's tables.
+fn rc_sub_load_map(sub: RcSub*, ok: RcWireSubOk*) -> int32 {
+  rc_sub_map_clear(sub);
+  if (ok->n_tables == 0) { return RC_OK; }
+  sub->map = (RcSubTable*)malloc((int64)ok->n_tables * (int64)sizeof(RcSubTable));
+  if (sub->map == 0) { return RC_ERR_NOMEM; }
+  var i: int32 = 0;
+  while (i < ok->n_tables) {
+    var t: RcSubTable* = &sub->map[i];
+    t->id = ok->tables[i].id;
+    t->name = "";
+    t->n_cols = 0;
+    t->cols = 0;
+    sub->n_map = i + 1;
+    var rc: int32 = rc_sub_table_set(t, ok->tables[i].name, ok->tables[i].n_cols,
+                                     ok->tables[i].cols);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+// Connects, checks the capability, and sends SUBSCRIBE. On failure the
+// socket is closed and the cursor kept.
+fn rc_sub_open(sub: RcSub*, from_seq: uint64, from_commit: uint64) -> int32 {
+  var m: RcMeodb* = &sub->conn;
+  rc_wire_events_free(&sub->ev);
+  sub->ev_at = 0;
+  // Until SUB_OK says the heartbeat, wait twice the spec's 15 s.
+  m->timeout_ms = 30000;
+  var rc: int32 = rc_meodb_connect(m);
+  if (rc != RC_OK) { return rc; }
+  if ((m->caps & RC_WIRE_CAP_SUBSCRIBE) == 0) {
+    rc_meodb_drop(m);
+    return RC_ERR_UNSUPPORTED;
+  }
+  var rid: uint32 = rc_meodb_next_rid(m);
+  rc_wire_clear(&m->out);
+  rc = rc_wire_subscribe(&m->out, rid, sub->tables, sub->n_tables, from_seq, from_commit,
+                         (uint32)sub->window);
+  if (rc != RC_OK) {
+    rc_meodb_drop(m);
+    return rc;
+  }
+  var kind: int32 = 0;
+  var len: int64 = 0;
+  rc = rc_meodb_roundtrip(m, rid, &kind, &len);
+  if (rc != RC_OK) { return rc; }
+  if (kind == RC_WIRE_ERROR) {
+    rc = rc_meodb_error(m, len);
+    rc_meodb_drop(m);
+    return rc;
+  }
+  var ok: RcWireSubOk;
+  if (kind != RC_WIRE_SUB_OK) { return rc_meodb_lost(m); }
+  rc = rc_wire_sub_ok(m->buf, len, &ok);
+  if (rc == RC_OK) {
+    rc = rc_sub_load_map(sub, &ok);
+    sub->start_seq = ok.start_seq;
+    sub->commit_seq = ok.commit_seq;
+    sub->heartbeat_ms = ok.heartbeat_ms;
+    rc_wire_sub_ok_free(&ok);
+  }
+  if (rc != RC_OK) {
+    rc_meodb_drop(m);
+    return rc;
+  }
+  var t: int64 = sub->heartbeat_ms * 2;
+  if (t > (int64)2147483647) { t = (int64)2147483647; }
+  m->timeout_ms = (int32)t;
+  rc_meodb_apply_timeout(m);
+  return RC_OK;
+}
+
+// Opens a dedicated connection and subscribes to row changes, like Postgres
+// logical replication. To follow a table from a known state, rc_meodb_scan it
+// and pass the scan's commit_seq as from_commit: every later commit then
+// arrives once, with no gap and no duplicate.
+//   sub          receives the subscription; free it with rc_sub_close
+//   token        the server's auth token, "" for none; copied
+//   dsn          "host" or "host:port" as for rc_adapter_open; copied
+//   tables       n_tables table names; copied. n_tables 0 = every table
+//   n_tables     0..65535
+//   from_seq     0 = start after the newest event; else resume at that seq
+//   from_commit  0 = unused; else the events of every commit after it (wins
+//                over from_seq)
+//   window       most events in flight before an ACK, 1..65536
+// Returns RC_OK; RC_ERR_USAGE (sub is 0, a bad argument or dsn, or the
+// server's SCHEMA for an unknown table); RC_ERR_UNSUPPORTED (the server lacks
+// RC_WIRE_CAP_SUBSCRIBE); RC_ERR_CLOSED (no connection); RC_ERR_NOMEM;
+// another server error mapped by rc_wire_status. On an error everything is
+// freed already, and rc_sub_close is a safe no-op.
+export fn rc_meodb_subscribe(sub: RcSub*, token: string, dsn: string, tables: string*,
+                             n_tables: int32, from_seq: uint64, from_commit: uint64,
+                             window: int32) -> int32 {
+  if (sub == 0) { return RC_ERR_USAGE; }
+  sub->tables = 0;
+  sub->n_tables = 0;
+  sub->from_seq = from_seq;
+  sub->from_commit = from_commit;
+  sub->window = window;
+  sub->map = 0;
+  sub->n_map = 0;
+  sub->start_seq = 0;
+  sub->commit_seq = 0;
+  sub->heartbeat_ms = 0;
+  sub->last_seq = 0;
+  sub->got_any = false;
+  sub->ev.n = 0;
+  sub->ev.ev = 0;
+  sub->ev.vals = 0;
+  sub->ev.cols = 0;
+  sub->ev_at = 0;
+  var ok: bool = rc_meodb_init(&sub->conn, token);
+  var rc: int32 = RC_ERR_NOMEM;
+  if (ok) { rc = RC_ERR_USAGE; }
+  if (ok && n_tables >= 0 && n_tables <= 65535 && (n_tables == 0 || tables != 0)
+      && window >= 1 && window <= 65536) {
+    rc = rc_meodb_parse(&sub->conn, dsn);
+  }
+  if (rc == RC_OK && n_tables > 0) {
+    sub->tables = (string*)malloc((int64)n_tables * (int64)sizeof(string));
+    if (sub->tables == 0) { rc = RC_ERR_NOMEM; }
+    var i: int32 = 0;
+    while (rc == RC_OK && i < n_tables) {
+      sub->tables[i] = rc_text_dup(tables[i]);
+      sub->n_tables = i + 1;
+      if (tables[i].length > (uint64)0 && sub->tables[i].chars == 0) { rc = RC_ERR_NOMEM; }
+      i = i + 1;
+    }
+  }
+  if (rc == RC_OK) { rc = rc_sub_open(sub, from_seq, from_commit); }
+  if (rc != RC_OK) { rc_sub_close(sub); }
+  return rc;
+}
+
+// Returns the next row change, reading from the server as needed (heartbeats
+// are skipped). A SCHEMA event updates rc_sub_table / rc_sub_column before it
+// is returned.
+//   sub  the subscription
+//   out  receives the event; its values and strings are borrowed until the
+//        next rc_sub_next or rc_sub_close
+// Returns RC_OK; RC_ERR_USAGE (sub or out is 0); RC_ERR_CLOSED when the
+// connection is gone or silent for twice the heartbeat (the socket is closed;
+// call rc_sub_reopen); RC_ERR_NOMEM; or a non-fatal server error mapped by
+// rc_wire_status (e.g. RC_ERR_USAGE for an ACK past what was sent), after
+// which the stream goes on.
+export fn rc_sub_next(sub: RcSub*, out: RcEvent*) -> int32 {
+  if (sub == 0 || out == 0) { return RC_ERR_USAGE; }
+  var m: RcMeodb* = &sub->conn;
+  while (sub->ev_at >= sub->ev.n) {
+    if (m->sock < 0) { return RC_ERR_CLOSED; }
+    var kind: int32 = 0;
+    var len: int64 = 0;
+    var rid: uint32 = 0;
+    if (!rc_meodb_read(m, &kind, &len, &rid)) {
+      rc_meodb_drop(m);
+      return RC_ERR_CLOSED;
+    }
+    if (kind == RC_WIRE_ERROR) {
+      var rc: int32 = rc_meodb_error(m, len);
+      if (m->sock < 0) { return RC_ERR_CLOSED; }
+      return rc;
+    }
+    // The events' views point into m->buf, which the next read reuses.
+    rc_wire_events_free(&sub->ev);
+    sub->ev_at = 0;
+    if (kind != RC_WIRE_EVENTS || rid != (uint32)0) {
+      rc_meodb_drop(m);
+      return RC_ERR_CLOSED;
+    }
+    var drc: int32 = rc_wire_events(m->buf, len, &sub->ev);
+    if (drc != RC_OK) {
+      // Unread events come again after rc_sub_reopen.
+      rc_meodb_drop(m);
+      if (drc == RC_ERR_NOMEM) { return drc; }
+      return RC_ERR_CLOSED;
+    }
+  }
+  var e: RcWireEvent* = &sub->ev.ev[sub->ev_at];
+  if (e->ev.kind == RC_EV_SCHEMA) {
+    var rc2: int32 = rc_sub_apply_schema(sub, e);
+    if (rc2 != RC_OK) { return rc2; }
+  }
+  sub->ev_at = sub->ev_at + 1;
+  *out = e->ev;
+  out->table = rc_sub_table(sub, e->ev.table_id);
+  sub->last_seq = e->ev.seq;
+  sub->got_any = true;
+  return RC_OK;
+}
+
+// Tells the server the events up to seq are processed, which lets it send
+// more (at most `window` go unacknowledged). There is no reply.
+//   sub  the subscription
+//   seq  an RcEvent.seq already returned by rc_sub_next
+// Returns RC_OK; RC_ERR_USAGE (sub is 0, or seq is past the last event
+// returned; nothing sent); RC_ERR_CLOSED (no connection, or the send failed:
+// the socket is closed); RC_ERR_NOMEM.
+export fn rc_sub_ack(sub: RcSub*, seq: uint64) -> int32 {
+  if (sub == 0) { return RC_ERR_USAGE; }
+  if (!sub->got_any || seq > sub->last_seq) { return RC_ERR_USAGE; }
+  var m: RcMeodb* = &sub->conn;
+  if (m->sock < 0) { return RC_ERR_CLOSED; }
+  var rid: uint32 = rc_meodb_next_rid(m);
+  rc_wire_clear(&m->out);
+  var rc: int32 = rc_wire_ack(&m->out, rid, seq);
+  if (rc != RC_OK) { return rc; }
+  if (!rc_meodb_send(m)) {
+    rc_meodb_drop(m);
+    return RC_ERR_CLOSED;
+  }
+  return RC_OK;
+}
+
+// Reconnects and subscribes again after RC_ERR_CLOSED (an open connection is
+// closed first). The stream resumes at the event after the last one
+// rc_sub_next returned, or where the first SUBSCRIBE started; events handed
+// out before are not sent again, unacknowledged or not. If the server's ring
+// has moved past that point, the first event is a GAP.
+//   sub  a subscription from rc_meodb_subscribe that rc_sub_close has not
+//        freed
+// Returns the codes of rc_meodb_subscribe; on an error the subscription
+// stays closed and can be reopened again.
+export fn rc_sub_reopen(sub: RcSub*) -> int32 {
+  if (sub == 0 || sub->conn.host.length == (uint64)0) { return RC_ERR_USAGE; }
+  rc_meodb_drop(&sub->conn);
+  var from_seq: uint64 = sub->from_seq;
+  var from_commit: uint64 = sub->from_commit;
+  if (sub->got_any) {
+    from_seq = sub->last_seq + (uint64)1;
+    from_commit = 0;
+  } else if (sub->start_seq != (uint64)0) {
+    from_seq = sub->start_seq;
+    from_commit = 0;
+  }
+  return rc_sub_open(sub, from_seq, from_commit);
+}
+
+// Returns the name of a subscribed table, "" when the id is unknown or sub
+// is 0. Borrowed until the next rc_sub_next or rc_sub_close.
+//   sub       the subscription
+//   table_id  an RcEvent.table_id
+export fn rc_sub_table(sub: RcSub*, table_id: int32) -> string {
+  if (sub == 0) { return ""; }
+  var t: RcSubTable* = rc_sub_find(sub, table_id);
+  if (t == 0) { return ""; }
+  return t->name;
+}
+
+// Returns how many columns a subscribed table has (the length of an
+// INSERT's vals), or 0 when the id is unknown or sub is 0.
+//   sub       the subscription
+//   table_id  an RcEvent.table_id
+export fn rc_sub_n_columns(sub: RcSub*, table_id: int32) -> int32 {
+  if (sub == 0) { return 0; }
+  var t: RcSubTable* = rc_sub_find(sub, table_id);
+  if (t == 0) { return 0; }
+  return t->n_cols;
+}
+
+// Returns the name of column i of a subscribed table: the column of vals[i]
+// and old[i]. "" when the id or i is unknown, or sub is 0. Borrowed until the
+// next rc_sub_next or rc_sub_close.
+//   sub       the subscription
+//   table_id  an RcEvent.table_id
+//   i         0-based column index
+export fn rc_sub_column(sub: RcSub*, table_id: int32, i: int32) -> string {
+  if (sub == 0) { return ""; }
+  var t: RcSubTable* = rc_sub_find(sub, table_id);
+  if (t == 0 || i < 0 || i >= t->n_cols) { return ""; }
+  return t->cols[i];
+}
+
+// Returns the seq of the first event the last SUB_OK promised, or 0.
+//   sub  the subscription
+export fn rc_sub_start_seq(sub: RcSub*) -> uint64 {
+  if (sub == 0) { return 0; }
+  return sub->start_seq;
+}
+
+// Returns the newest durable commit when the last SUB_OK was sent, or 0.
+//   sub  the subscription
+export fn rc_sub_commit_seq(sub: RcSub*) -> uint64 {
+  if (sub == 0) { return 0; }
+  return sub->commit_seq;
+}
+
+// Sends BYE, closes the connection and frees everything the subscription
+// owns. Safe to call twice, and after a failed rc_meodb_subscribe.
+//   sub  the subscription, or 0 (no-op)
+export fn rc_sub_close(sub: RcSub*) {
+  if (sub == 0) { return; }
+  var m: RcMeodb* = &sub->conn;
+  if (m->sock >= 0) {
+    // No reply is awaited: pushed events may come before the OK.
+    rc_wire_clear(&m->out);
+    if (rc_wire_empty(&m->out, RC_WIRE_BYE, rc_meodb_next_rid(m)) == RC_OK) {
+      rc_meodb_send(m);
+    }
+  }
+  rc_meodb_fini(m);
+  rc_wire_events_free(&sub->ev);
+  sub->ev_at = 0;
+  rc_sub_map_clear(sub);
+  var i: int32 = 0;
+  while (i < sub->n_tables) {
+    rc_text_free(sub->tables[i]);
+    i = i + 1;
+  }
+  if (sub->tables != 0) { free((rawptr)sub->tables); }
+  sub->tables = 0;
+  sub->n_tables = 0;
+}

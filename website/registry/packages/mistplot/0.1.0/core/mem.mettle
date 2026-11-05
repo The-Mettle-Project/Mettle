@@ -1,0 +1,91 @@
+//! Counted heap allocation. Every MistPlot allocation goes through these functions so
+//! tests can assert mp_alloc_live() == 0 after freeing and the bench can assert that
+//! steady frames allocate nothing. Wraps std/mem; the counters are plain globals (no
+//! atomics in core), so they are exact only while one thread allocates at a time.
+
+import "std/mem";
+
+var mpmem_count: int64 = 0;
+var mpmem_live: int64 = 0;
+
+/// Allocates n uninitialised bytes.
+///
+/// @param n Size. Units: bytes. Valid: 1 .. MP_MAX_COUNT * 8; n <= 0 returns 0 without
+///   allocating.
+/// @return The block, or 0 when n <= 0 or the allocation failed.
+/// @mem The caller owns the block and releases it with mp_free (or mp_realloc).
+/// @thread Safe from any thread; the counters are exact only without concurrent calls.
+/// @cost One malloc.
+export fn mp_alloc(n: int64) -> rawptr {
+  if (n <= 0) { return 0; }
+  var p: rawptr = malloc(n);
+  if (p == 0) { return 0; }
+  mpmem_count = mpmem_count + 1;
+  mpmem_live = mpmem_live + 1;
+  return p;
+}
+
+/// Allocates n bytes set to zero.
+///
+/// @param n Size. Units: bytes. Valid: 1 .. MP_MAX_COUNT * 8; n <= 0 returns 0 without
+///   allocating.
+/// @return The zeroed block, or 0 when n <= 0 or the allocation failed.
+/// @mem The caller owns the block and releases it with mp_free (or mp_realloc).
+/// @thread Safe from any thread; the counters are exact only without concurrent calls.
+/// @cost One calloc; O(n) to clear.
+export fn mp_alloc_zero(n: int64) -> rawptr {
+  if (n <= 0) { return 0; }
+  var p: rawptr = calloc(n, 1);
+  if (p == 0) { return 0; }
+  mpmem_count = mpmem_count + 1;
+  mpmem_live = mpmem_live + 1;
+  return p;
+}
+
+/// Resizes a block, keeping its first min(old, n) bytes.
+///
+/// @param p The block, from mp_alloc, mp_alloc_zero or mp_realloc. Valid: such a block,
+///   or 0 (then this behaves as mp_alloc).
+/// @param n New size. Units: bytes. Valid: 1 .. MP_MAX_COUNT * 8; n <= 0 returns 0 and
+///   leaves p allocated and unchanged.
+/// @return The resized block (possibly moved), or 0 on failure or n <= 0.
+/// @mem On success p is no longer valid and the caller owns the result; on failure p
+///   stays valid and owned by the caller. A successful call counts as one allocation.
+/// @thread Safe from any thread; the counters are exact only without concurrent calls.
+/// @cost One realloc; O(n) when the block moves.
+export fn mp_realloc(p: rawptr, n: int64) -> rawptr {
+  if (n <= 0) { return 0; }
+  var q: rawptr = realloc(p, n);
+  if (q == 0) { return 0; }
+  mpmem_count = mpmem_count + 1;
+  if (p == 0) { mpmem_live = mpmem_live + 1; }
+  return q;
+}
+
+/// Releases a block.
+///
+/// @param p The block, from mp_alloc, mp_alloc_zero or mp_realloc. Valid: such a block,
+///   or 0 (ignored).
+/// @mem p is invalid afterwards.
+/// @thread Safe from any thread; the counters are exact only without concurrent calls.
+export fn mp_free(p: rawptr) {
+  if (p == 0) { return; }
+  free(p);
+  mpmem_live = mpmem_live - 1;
+}
+
+/// Number of successful allocations (including resizes) since the program started.
+///
+/// @return The count; it never decreases.
+/// @thread Safe from any thread; exact only without concurrent allocation.
+export fn mp_alloc_count() -> int64 {
+  return mpmem_count;
+}
+
+/// Number of blocks allocated and not yet freed.
+///
+/// @return Allocations minus frees; 0 when everything MistPlot allocated was released.
+/// @thread Safe from any thread; exact only without concurrent allocation.
+export fn mp_alloc_live() -> int64 {
+  return mpmem_live;
+}

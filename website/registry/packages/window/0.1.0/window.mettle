@@ -1,0 +1,336 @@
+// window: windows and input for Mettle.
+//
+//   import "window/window";
+//   var cfg: WindowConfig; window_config_default(&cfg);
+//   cfg.title = "Hello"; cfg.w = 800; cfg.h = 600;
+//   var win: Window* = window_create(&cfg);
+//   var ev: WindowEvent;
+//   while (!window_should_close(win)) {
+//     while (window_poll(&ev)) { ... }        // games: poll, then draw
+//     // apps: window_wait(&ev, -1) blocks until something happens
+//   }
+//   window_destroy(win);
+//
+// The backend is picked at the first call: Wayland or X11 on Linux, Win32 on
+// Windows, or headless (WINDOW_BACKEND=headless, or window_init_backend).
+import "std/mem";
+import "core/keys.mettle";
+import "core/types.mettle";
+import "gamepad/gamepad.mettle";
+import "plat_linux.mettle" if linux;
+import "plat_windows.mettle" if windows;
+
+/// Fills cfg with the defaults: 800x600, centred, resizable, decorated, visible.
+export fn window_config_default(cfg: WindowConfig*) {
+  var c: WindowConfig;
+  c.title = "Mettle";
+  c.w = 800; c.h = 600;
+  c.x = WINDOW_POS_CENTER; c.y = WINDOW_POS_CENTER;
+  c.resizable = true; c.decorated = true; c.visible = true; c.focused = true;
+  c.hidpi = true;
+  c.app_id = "mettle";
+  *cfg = c;
+}
+
+/// Starts the library with a chosen backend (WINDOW_BACKEND_*). window_create
+/// calls this for you with WINDOW_BACKEND_AUTO. Returns false (see window_error)
+/// when no backend can start.
+export fn window_init_backend(backend: int32) -> bool {
+  if (g_window.ready) { return true; }
+  g_window.double_click_us = 400000;
+  g_window.wake_fd = -1;
+  if (!window_plat_init(backend)) { return false; }
+  g_window.ready = true;
+  window_plat_refresh_monitors();
+  window_gamepad_init();
+  return true;
+}
+
+/// Names the display to connect to before the first window_create: an X11
+/// display (":1") or a Wayland socket ("wayland-1"). Without it the DISPLAY and
+/// WAYLAND_DISPLAY environment variables are used.
+export fn window_set_display(name: string) {
+  var n: int64 = (int64)name.length;
+  if (n > 127) { n = 127; }
+  for i: int64 in 0..n { g_window.display_name[i] = name.chars[i]; }
+  g_window.display_name[n] = (uint8)0;
+  g_window.display_len = n;
+}
+
+export fn window_init() -> bool { return window_init_backend(WINDOW_BACKEND_AUTO); }
+
+/// Which backend is running (WINDOW_BACKEND_*), or AUTO before window_init.
+export fn window_backend() -> int32 { return g_window.backend; }
+
+/// Closes every window and the display connection.
+export fn window_shutdown() {
+  if (!g_window.ready) { return; }
+  while (g_window.windows != 0) { window_destroy(g_window.windows); }
+  window_gamepad_shutdown();
+  window_plat_shutdown();
+  if (g_window.q != 0) { free(g_window.q); g_window.q = (WindowEvent*)0; }
+  g_window.q_cap = 0; g_window.q_head = 0; g_window.q_tail = 0;
+  if (g_window.drop_data != 0) { free(g_window.drop_data); g_window.drop_data = (uint8*)0; }
+  window_set_monitors((WindowMonitor*)0, 0);
+  g_window.ready = false;
+  g_window.backend = WINDOW_BACKEND_AUTO;
+}
+
+/// Opens a window. Returns 0 on failure (window_error says why).
+export fn window_create(cfg: WindowConfig*) -> Window* {
+  if (!window_init()) { return (Window*)0; }
+  var c: WindowConfig;
+  if (cfg == 0) { window_config_default(&c); } else { c = *cfg; }
+  if (c.w <= 0) { c.w = 800; }
+  if (c.h <= 0) { c.h = 600; }
+  if (c.w > 32767) { c.w = 32767; }
+  if (c.h > 32767) { c.h = 32767; }
+  var w: Window* = new Window;
+  w->scale = 1.0;
+  w->cursor_mode = WINDOW_CURSOR_NORMAL;
+  w->fullscreen = WINDOW_WINDOWED;
+  window_link(w);
+  if (!window_plat_create(w, &c)) {
+    window_unlink(w);
+    free(w);
+    return (Window*)0;
+  }
+  return w;
+}
+
+/// Closes a window and frees it. Events for it still in the queue are dropped.
+export fn window_destroy(w: Window*) {
+  if (w == 0) { return; }
+  window_plat_destroy(w);
+  window_queue_forget(w);
+  window_unlink(w);
+  free(w);
+}
+
+// ---------- the event loop ----------
+fn take(ev: WindowEvent*) -> bool {
+  while (window_queue_pop(ev)) {
+    if (ev->kind != WINDOW_EV_NONE) { return true; }
+  }
+  return false;
+}
+
+fn flush_redraws() {
+  var w: Window* = g_window.windows;
+  while (w != 0) {
+    if (w->redraw) {
+      w->redraw = false;
+      var ev: WindowEvent;
+      ev.kind = WINDOW_EV_REDRAW; ev.win = w;
+      window_push_event(&ev);
+    }
+    w = w->next;
+  }
+}
+
+fn free_drop() {
+  if (g_window.drop_data != 0) { free(g_window.drop_data); g_window.drop_data = (uint8*)0; }
+}
+
+/// Takes the next event without waiting. Returns false when there is none.
+/// Call it in a loop each frame (games) or use window_wait (apps).
+export fn window_poll(ev: WindowEvent*) -> bool {
+  if (!g_window.ready) { return false; }
+  if (take(ev)) { return true; }
+  free_drop();
+  window_plat_pump(0);
+  window_gamepad_pump();
+  flush_redraws();
+  return take(ev);
+}
+
+/// Waits up to timeout_ms (-1 = forever) for an event. Returns false on timeout.
+export fn window_wait(ev: WindowEvent*, timeout_ms: int32) -> bool {
+  if (!g_window.ready) { return false; }
+  if (take(ev)) { return true; }
+  free_drop();
+  var deadline: int64 = 0;
+  if (timeout_ms >= 0) { deadline = window_now_us() + (int64)timeout_ms * 1000; }
+  while (true) {
+    window_plat_pump(0);
+    window_gamepad_pump();
+    flush_redraws();
+    if (take(ev)) { return true; }
+    var left: int32 = -1;
+    if (timeout_ms >= 0) {
+      var now: int64 = window_now_us();
+      if (now >= deadline) { return false; }
+      left = (int32)((deadline - now + 999) / 1000);
+    }
+    // Gamepads have no file the display wait can see on every backend, so cap
+    // the wait at 16 ms while any pad is connected.
+    if (window_gamepad_count() > 0 && (left < 0 || left > 16)) { left = 16; }
+    window_plat_pump(left);
+    window_gamepad_pump();
+    flush_redraws();
+    if (take(ev)) { return true; }
+  }
+  return false;
+}
+
+/// Wakes a window_wait in progress (safe to call from any thread). The waiting
+/// loop gets a WINDOW_EV_WAKE event.
+export fn window_wake() { window_plat_wake(); }
+
+/// Asks for a WINDOW_EV_REDRAW on the next loop turn (several calls give one event).
+export fn window_request_redraw(w: Window*) { if (w != 0) { w->redraw = true; } }
+
+/// Puts an event in the queue as if the platform had sent it (tests, replays, own events).
+export fn window_inject(ev: WindowEvent*) { var e: WindowEvent = *ev; window_push_event(&e); }
+
+// ---------- window state ----------
+export fn window_should_close(w: Window*) -> bool { return w == 0 || w->should_close; }
+export fn window_set_should_close(w: Window*, v: bool) { if (w != 0) { w->should_close = v; } }
+export fn window_size(w: Window*, out_w: int32*, out_h: int32*) { *out_w = w->w; *out_h = w->h; }
+/// Size in pixels: what to pass to glViewport.
+export fn window_framebuffer_size(w: Window*, out_w: int32*, out_h: int32*) { *out_w = w->fb_w; *out_h = w->fb_h; }
+export fn window_position(w: Window*, out_x: int32*, out_y: int32*) { *out_x = w->x; *out_y = w->y; }
+/// Content scale: 1.0 at 96 DPI, 2.0 on a typical HiDPI screen.
+export fn window_scale(w: Window*) -> float32 { return w->scale; }
+export fn window_focused(w: Window*) -> bool { return w->focused; }
+export fn window_visible(w: Window*) -> bool { return w->visible; }
+export fn window_minimized(w: Window*) -> bool { return w->minimized; }
+export fn window_maximized(w: Window*) -> bool { return w->maximized; }
+export fn window_hovered(w: Window*) -> bool { return w->hovered; }
+export fn window_is_fullscreen(w: Window*) -> bool { return w->fullscreen != WINDOW_WINDOWED; }
+export fn window_set_user(w: Window*, p: rawptr) { w->user = p; }
+export fn window_user(w: Window*) -> rawptr { return w->user; }
+
+export fn window_set_title(w: Window*, title: string) { window_plat_set_title(w, title); }
+export fn window_set_size(w: Window*, width: int32, height: int32) {
+  if (width <= 0 || height <= 0 || width > 32767 || height > 32767) { return; }
+  window_plat_set_size(w, width, height);
+}
+export fn window_set_position(w: Window*, x: int32, y: int32) { window_plat_set_position(w, x, y); }
+/// Limits the size the user can drag the window to (0 = no limit).
+export fn window_set_size_limits(w: Window*, min_w: int32, min_h: int32, max_w: int32, max_h: int32) {
+  window_plat_set_size_limits(w, min_w, min_h, max_w, max_h);
+}
+export fn window_show(w: Window*) { window_plat_set_visible(w, true); }
+export fn window_hide(w: Window*) { window_plat_set_visible(w, false); }
+export fn window_minimize(w: Window*) { window_plat_minimize(w); }
+export fn window_maximize(w: Window*) { window_plat_maximize(w); }
+export fn window_restore(w: Window*) { window_plat_restore(w); }
+export fn window_focus(w: Window*) { window_plat_focus(w); }
+/// Flashes the taskbar entry / sets the urgency hint until the window gets focus.
+export fn window_request_attention(w: Window*) { window_plat_attention(w); }
+/// WINDOW_FULLSCREEN covers monitor `monitor` (-1 = the one the window is on);
+/// WINDOW_WINDOWED goes back to the previous size and place.
+export fn window_set_fullscreen(w: Window*, mode: int32, monitor: int32) {
+  if (mode == w->fullscreen) { return; }
+  window_plat_set_fullscreen(w, mode, monitor);
+}
+/// Sets the window icon from RGBA pixels (w*h*4 bytes, top row first).
+export fn window_set_icon(w: Window*, rgba: uint8*, width: int32, height: int32) {
+  if (rgba == 0 || width <= 0 || height <= 0 || width > 1024 || height > 1024) { return; }
+  window_plat_set_icon(w, rgba, width, height);
+}
+/// Copies RGBA pixels (top row first, stride bytes per row) to the window: for
+/// software drawing without a GPU context.
+export fn window_blit(w: Window*, rgba: uint8*, width: int32, height: int32, stride: int32) -> bool {
+  if (rgba == 0 || width <= 0 || height <= 0 || stride < width * 4) { return false; }
+  return window_plat_blit(w, rgba, width, height, stride);
+}
+/// Native handles for making a GL or Vulkan context on the window.
+export fn window_native(w: Window*, out: WindowNative*) -> bool {
+  var n: WindowNative;
+  *out = n;
+  out->backend = g_window.backend;
+  return window_plat_native(w, out);
+}
+
+// ---------- keyboard ----------
+/// True while the physical key `scancode` (WINDOW_KEY_*) is held.
+export fn window_key_down(w: Window*, scancode: int32) -> bool {
+  if (w == 0 || scancode <= 0 || scancode >= 256) { return false; }
+  return w->keys[scancode];
+}
+/// True while a key the layout calls `key` is held.
+export fn window_key_down_layout(w: Window*, key: int32) -> bool {
+  if (w == 0 || key <= 0 || key >= 256) { return false; }
+  return w->key_layout[key];
+}
+export fn window_mods(w: Window*) -> int32 { return w->mods; }
+/// Turns text input on or off. With it on, TEXT and PREEDIT events arrive and
+/// the input method (IME) is active. It is on by default.
+export fn window_text_input(w: Window*, on: bool) {
+  w->text_input = on;
+  w->dead_key = 0;
+  window_plat_text_input(w, on);
+}
+/// Tells the input method where the text cursor is, so its window sits beside it.
+export fn window_text_input_rect(w: Window*, x: int32, y: int32, width: int32, height: int32) {
+  window_plat_text_rect(w, x, y, width, height);
+}
+
+// ---------- mouse ----------
+export fn window_mouse_position(w: Window*, x: float64*, y: float64*) { *x = w->mouse_x; *y = w->mouse_y; }
+export fn window_mouse_down(w: Window*, button: int32) -> bool {
+  if (button <= 0 || button >= 31) { return false; }
+  return (w->buttons & (1 << button)) != 0;
+}
+/// Moves the pointer to (x, y) in the window (logical pixels).
+export fn window_warp_mouse(w: Window*, x: float64, y: float64) { window_plat_warp(w, x, y); }
+/// WINDOW_CURSOR_ARROW, _TEXT, _HAND, ...
+export fn window_set_cursor(w: Window*, shape: int32) {
+  if (shape < 0 || shape >= WINDOW_CURSOR_COUNT) { return; }
+  w->cursor_shape = shape;
+  window_plat_set_cursor(w, shape);
+}
+/// Uses RGBA pixels (top row first) as the cursor, with its hot spot at (hx, hy).
+export fn window_set_cursor_image(w: Window*, rgba: uint8*, width: int32, height: int32, hx: int32, hy: int32) -> bool {
+  if (rgba == 0 || width <= 0 || height <= 0 || width > 256 || height > 256) { return false; }
+  return window_plat_set_cursor_image(w, rgba, width, height, hx, hy);
+}
+/// WINDOW_CURSOR_NORMAL, _HIDDEN, _LOCKED (mouse-look) or _CONFINED.
+export fn window_set_cursor_mode(w: Window*, mode: int32) {
+  if (mode < 0 || mode > 3 || mode == w->cursor_mode) { return; }
+  var old: int32 = w->cursor_mode;
+  w->cursor_mode = mode;
+  window_plat_set_cursor_mode(w, mode, old);
+}
+export fn window_cursor_mode(w: Window*) -> int32 { return w->cursor_mode; }
+/// Sets the time (microseconds) within which a second click counts as a double click.
+export fn window_set_double_click_time(us: int64) { g_window.double_click_us = us; }
+
+// ---------- clipboard ----------
+/// Puts UTF-8 text on the clipboard. `w` is the window that owns it.
+export fn window_clipboard_set(w: Window*, text: string) { window_plat_clipboard_set(w, text.chars, (int64)text.length); }
+/// Reads the clipboard as UTF-8. The caller frees the result with free(s.chars).
+/// Returns "" (length 0) when it is empty or not text.
+export fn window_clipboard_get(w: Window*) -> string { return window_plat_clipboard_get(w); }
+
+// ---------- monitors ----------
+export fn window_monitor_count() -> int32 {
+  if (!window_init()) { return 0; }
+  return g_window.monitor_count;
+}
+/// Copies monitor i into out; false when i is out of range.
+export fn window_monitor(i: int32, out: WindowMonitor*) -> bool {
+  if (i < 0 || i >= g_window.monitor_count) { return false; }
+  *out = g_window.monitors[i];
+  return true;
+}
+/// The index of the monitor holding most of the window (0 when unknown).
+export fn window_monitor_of(w: Window*) -> int32 {
+  var best: int32 = 0;
+  var best_area: int64 = -1;
+  for i in 0..g_window.monitor_count {
+    var m: WindowMonitor* = &g_window.monitors[i];
+    var x0: int64 = (int64)w->x; var y0: int64 = (int64)w->y;
+    var x1: int64 = x0 + (int64)w->fb_w; var y1: int64 = y0 + (int64)w->fb_h;
+    if (x0 < (int64)m->x) { x0 = (int64)m->x; }
+    if (y0 < (int64)m->y) { y0 = (int64)m->y; }
+    if (x1 > (int64)(m->x + m->w)) { x1 = (int64)(m->x + m->w); }
+    if (y1 > (int64)(m->y + m->h)) { y1 = (int64)(m->y + m->h); }
+    var area: int64 = 0;
+    if (x1 > x0 && y1 > y0) { area = (x1 - x0) * (y1 - y0); }
+    if (area > best_area) { best_area = area; best = (int32)i; }
+  }
+  return best;
+}

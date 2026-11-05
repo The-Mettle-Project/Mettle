@@ -1,0 +1,106 @@
+// raize/router/group — registration handles for a shared path prefix.
+//
+// rz_router_group(prefix) writes a prefix once and hands back a handle;
+// rz_group_add(g, verb, path, h) joins the two so a group of routes never
+// repeats the prefix. The join can never produce "//": "/api/" + "/users",
+// "/api" + "users" and "" + "/root" all become one path, and the joined
+// pattern is what duplicate detection in trie.mettle sees.
+//
+// RZ_MAX_GROUPS handles per router, handed out once and never reused: a stale
+// RzGroup* must stay inert, and a recycled slot would make it
+// indistinguishable from the new handle. rz_group_end retires a handle for
+// good (its slot is not returned). Registration is startup-only.
+
+import "std/mem";
+import "../str/str";
+import "trie";
+
+// ---------------------------------------------------------------------------
+// Groups
+// ---------------------------------------------------------------------------
+
+// Joins a group prefix and a route path without ever producing "//".
+fn rz_path_join(prefix: string, path: string) -> string {
+  var pn: int64 = (int64)prefix.length;
+  var sn: int64 = (int64)path.length;
+  if (pn == 0) { return rz_str_dup(path); }
+  if (sn == 0) { return rz_str_dup(prefix); }
+  var p_end: bool = prefix.chars[pn - 1] == 47;
+  var s_start: bool = path.chars[0] == 47;
+  var skip: int64 = 0;
+  var sep: bool = false;
+  if (p_end && s_start) {
+    skip = 1;
+  } else if (!p_end && !s_start) {
+    sep = true;
+  }
+  var extra: int64 = 0;
+  if (sep) { extra = 1; }
+  var out: uint8* = (uint8*)malloc(pn + sn - skip + extra + 1);
+  if (out == 0) { return rz_str_empty(); }
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < pn) {
+    out[o] = prefix.chars[i];
+    o = o + 1;
+    i = i + 1;
+  }
+  if (sep) {
+    out[o] = 47;
+    o = o + 1;
+  }
+  i = skip;
+  while (i < sn) {
+    out[o] = path.chars[i];
+    o = o + 1;
+    i = i + 1;
+  }
+  out[o] = 0;
+  return rz_str_view(out, o);
+}
+
+// A registration handle for a prefix. Capacity RZ_MAX_GROUPS; 0 means the
+// prefix was malformed or the router is out of group slots.
+export fn rz_router_group(rt: RzRouter*, prefix: string) -> RzGroup* {
+  if (rt == 0) { return 0; }
+  var pn: int64 = (int64)prefix.length;
+  if (pn > 0 && prefix.chars[0] != 47) {
+    rt->last_error = RZ_ROUTER_E_PATTERN;
+    return 0;
+  }
+  // Slots are handed out once and never reused: a stale RzGroup* must stay
+  // inert, and a reused slot would make it indistinguishable from the new
+  // handle. The routing table is static, so a group per process is enough.
+  var slot: int32 = rt->group_used;
+  if (slot >= RZ_MAX_GROUPS) {
+    rt->last_error = RZ_ROUTER_E_CAPACITY;
+    return 0;
+  }
+  rt->group_used = slot + 1;
+  var owned: string = rz_str_empty();
+  if (!rz_arena_dup(rt, prefix, &owned)) {
+    rt->last_error = RZ_ROUTER_E_CAPACITY;
+    return 0;
+  }
+  var g: RzGroup* = &rt->groups[slot];
+  g->rt = rt;
+  g->prefix = owned;
+  g->slot = slot;
+  g->live = true;
+  return g;
+}
+
+export fn rz_group_end(g: RzGroup*) {
+  if (g == 0 || !g->live) { return; }
+  g->live = false;
+  g->prefix = rz_str_empty();
+  g->rt = 0;
+}
+
+export fn rz_group_add(g: RzGroup*, verb: string, path: string, h: fn(RzContext*) -> int32) -> int32 {
+  if (g == 0 || g->rt == 0 || !g->live) { return RZ_E_USAGE; }
+  var joined: string = rz_path_join(g->prefix, path);
+  if ((int64)joined.length == 0 && (int64)path.length > 0) { return RZ_E_FULL; }
+  defer rz_str_free(joined);
+  return rz_router_add(g->rt, verb, joined, h);
+}

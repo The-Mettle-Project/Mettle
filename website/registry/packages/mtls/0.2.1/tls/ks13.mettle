@@ -1,0 +1,119 @@
+// The TLS 1.3 key schedule (RFC 8446 7.1), shared by client and server.
+
+import "std/mem";
+import "cryptex/core/util";
+import "mtls/core/err";
+import "mtls/crypto/hash";
+import "mtls/tls/conn";
+
+fn mtls13_derived(c: MtlsConn*, out: uint8*) -> int32 {
+  var e: uint8[64];
+  mtls_hash(c->suite.hash, (uint8*)0, 0, &e[0]);
+  return mtls_derive_secret(c->suite.hash, &c->secret[0], "derived", &e[0], out);
+}
+
+/// mtls13_early: Early Secret from a PSK (psk = 0 for none).
+export fn mtls13_early(c: MtlsConn*, psk: uint8*, plen: int64) {
+  var z: uint8[48];
+  memset(&z[0], 0, 48);
+  var hl: int64 = mtls_hlen(c);
+  if (psk == 0) {
+    mtls_hkdf_extract(c->suite.hash, (uint8*)0, 0, &z[0], hl, &c->secret[0]);
+  } else {
+    mtls_hkdf_extract(c->suite.hash, (uint8*)0, 0, psk, plen, &c->secret[0]);
+  }
+}
+
+/// mtls13_binder_key: the "res binder" key from the current Early Secret.
+export fn mtls13_binder_key(c: MtlsConn*, out: uint8*) -> int32 {
+  var e: uint8[64];
+  mtls_hash(c->suite.hash, (uint8*)0, 0, &e[0]);
+  return mtls_derive_secret(c->suite.hash, &c->secret[0], "res binder", &e[0], out);
+}
+
+/// mtls13_handshake: Handshake Secret and both handshake traffic secrets,
+/// over the transcript through ServerHello.
+export fn mtls13_handshake(c: MtlsConn*, shared: uint8*, slen: int64) -> int32 {
+  var d: uint8[48];
+  var rc: int32 = mtls13_derived(c, &d[0]);
+  if (rc != MTLS_OK) { return rc; }
+  mtls_hkdf_extract(c->suite.hash, &d[0], mtls_hlen(c), shared, slen, &c->secret[0]);
+  var th: uint8[64];
+  mtls_th_hash(c, &th[0]);
+  rc = mtls_derive_secret(c->suite.hash, &c->secret[0], "c hs traffic", &th[0], &c->c_hs[0]);
+  if (rc != MTLS_OK) { return rc; }
+  return mtls_derive_secret(c->suite.hash, &c->secret[0], "s hs traffic", &th[0], &c->s_hs[0]);
+}
+
+/// mtls13_master: Master Secret and the application traffic and exporter
+/// secrets, over the transcript through the server Finished.
+export fn mtls13_master(c: MtlsConn*) -> int32 {
+  var d: uint8[48];
+  var rc: int32 = mtls13_derived(c, &d[0]);
+  if (rc != MTLS_OK) { return rc; }
+  var z: uint8[48];
+  memset(&z[0], 0, 48);
+  mtls_hkdf_extract(c->suite.hash, &d[0], mtls_hlen(c), &z[0], mtls_hlen(c), &c->secret[0]);
+  var th: uint8[64];
+  mtls_th_hash(c, &th[0]);
+  rc = mtls_derive_secret(c->suite.hash, &c->secret[0], "c ap traffic", &th[0], &c->c_ap[0]);
+  if (rc != MTLS_OK) { return rc; }
+  rc = mtls_derive_secret(c->suite.hash, &c->secret[0], "s ap traffic", &th[0], &c->s_ap[0]);
+  if (rc != MTLS_OK) { return rc; }
+  return mtls_derive_secret(c->suite.hash, &c->secret[0], "exp master", &th[0], &c->exporter[0]);
+}
+
+/// mtls13_resumption: the resumption master secret, over the transcript
+/// through the client Finished. Wipes the master secret after.
+export fn mtls13_resumption(c: MtlsConn*) -> int32 {
+  var th: uint8[64];
+  mtls_th_hash(c, &th[0]);
+  var rc: int32 = mtls_derive_secret(c->suite.hash, &c->secret[0], "res master", &th[0], &c->res_master[0]);
+  cr_wipe(&c->secret[0], 48);
+  return rc;
+}
+
+/// mtls13_ticket_psk: the PSK for a ticket with the given nonce.
+export fn mtls13_ticket_psk(c: MtlsConn*, nonce: uint8*, nlen: int64, out: uint8*) -> int32 {
+  return mtls_expand_label(c->suite.hash, &c->res_master[0], "resumption", nonce, nlen, out, mtls_hlen(c));
+}
+
+/// mtls13_next_secret: the next traffic secret after a KeyUpdate.
+export fn mtls13_next_secret(c: MtlsConn*, secret: uint8*) -> int32 {
+  var t: uint8[48];
+  var rc: int32 = mtls_expand_label(c->suite.hash, secret, "traffic upd", (uint8*)0, 0, &t[0], mtls_hlen(c));
+  memcpy(secret, &t[0], 48);
+  cr_wipe(&t[0], 48);
+  return rc;
+}
+
+/// mtls13_export: RFC 8446 7.5 keying material exporter.
+export fn mtls13_export(c: MtlsConn*, label: string, ctx: uint8*, clen: int64, out: uint8*, olen: int64) -> int32 {
+  var e: uint8[64];
+  mtls_hash(c->suite.hash, (uint8*)0, 0, &e[0]);
+  var s: uint8[48];
+  var rc: int32 = mtls_derive_secret(c->suite.hash, &c->exporter[0], label, &e[0], &s[0]);
+  if (rc != MTLS_OK) { return rc; }
+  var h: uint8[64];
+  mtls_hash(c->suite.hash, ctx, clen, &h[0]);
+  rc = mtls_expand_label(c->suite.hash, &s[0], "exporter", &h[0], mtls_hlen(c), out, olen);
+  cr_wipe(&s[0], 48);
+  return rc;
+}
+
+/// mtls13_hrr_reset: after a HelloRetryRequest the transcript restarts
+/// with message_hash(ClientHello1) (RFC 8446 4.4.1). ch1/n is ClientHello1.
+export fn mtls13_hrr_reset(c: MtlsConn*, ch1: uint8*, n: int64) {
+  var h1: uint8[64];
+  mtls_hash(c->suite.hash, ch1, n, &h1[0]);
+  var hl: int64 = mtls_hlen(c);
+  var mh: uint8[68];
+  mh[0] = (uint8)254;
+  mh[1] = 0;
+  mh[2] = 0;
+  mh[3] = (uint8)hl;
+  memcpy(&mh[4], &h1[0], hl);
+  mtls_hash_init(&c->th, c->suite.hash);
+  c->th_on = true;
+  mtls_hash_update(&c->th, &mh[0], 4 + hl);
+}

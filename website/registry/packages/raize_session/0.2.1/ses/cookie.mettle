@@ -1,0 +1,337 @@
+// Cookie strings (RFC 6265), no HTTP types: format a Set-Cookie header
+// value, format the matching clear value, and find one cookie in a Cookie
+// header. The application or framework passes these strings to its own
+// HTTP layer. Plain Mettle, no crypto.
+//
+// Strictness: names must be RFC 7230 tokens and values cookie-octets
+// (no space, DQUOTE, comma, semicolon or backslash) or one DQUOTE-wrapped
+// run of them. A Cookie header must be `pair *( "; " pair )` with optional
+// leading and trailing spaces/tabs; anything else is SES_E_PARSE. A name
+// sent twice is SES_E_DUPLICATE (an attacker on a sibling domain or path
+// can add a second cookie with the same name; refuse to guess).
+
+import "std/conv";
+import "status";
+
+/// SES_SAMESITE_LAX: SameSite=Lax (the default): sent on top-level
+/// navigations from other sites, not on cross-site subrequests or POSTs.
+/// in: -
+/// returns: 1
+/// owns: nothing
+/// thread: constant
+/// example: o.same_site = SES_SAMESITE_LAX;
+export const SES_SAMESITE_LAX: int32 = 1;
+/// SES_SAMESITE_STRICT: SameSite=Strict: never sent from other sites.
+/// in: -
+/// returns: 2
+/// owns: nothing
+/// thread: constant
+/// example: o.same_site = SES_SAMESITE_STRICT;
+export const SES_SAMESITE_STRICT: int32 = 2;
+/// SES_SAMESITE_NONE: SameSite=None: always sent; requires Secure.
+/// in: -
+/// returns: 3
+/// owns: nothing
+/// thread: constant
+/// example: o.same_site = SES_SAMESITE_NONE; o.secure = true;
+export const SES_SAMESITE_NONE: int32 = 3;
+
+/// SesCookieOpts: Set-Cookie attributes.
+/// Fields: path ("" omits; else starts with '/'), domain ("" omits: host-only,
+///   the safest), max_age (seconds; < 0 omits it: a browser-session
+///   cookie), secure, http_only, same_site (SES_SAMESITE_*)
+/// in: - (start from ses_cookie_defaults)
+/// returns: -
+/// owns: path and domain are views the caller keeps alive while formatting
+/// thread: plain value
+/// example: var o: SesCookieOpts; ses_cookie_defaults(&o); o.max_age = ses_max_age(&m, &s, now);
+export struct SesCookieOpts {
+  path: string;
+  domain: string;
+  max_age: int64;
+  secure: bool;
+  http_only: bool;
+  same_site: int32;
+}
+
+/// Fills cookie options with safe defaults: Path=/, host-only, no Max-Age,
+/// HttpOnly, Secure, SameSite=Lax. Turn secure off only for plain-HTTP
+/// local development.
+/// in: o, the options to fill
+/// returns: SES_OK; SES_E_ARG for a null o
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: var o: SesCookieOpts; ses_cookie_defaults(&o);
+export fn ses_cookie_defaults(o: SesCookieOpts*) -> int32 {
+  if (o == 0) { return SES_E_ARG; }
+  o->path = "/";
+  o->domain = "";
+  o->max_age = -1;
+  o->secure = true;
+  o->http_only = true;
+  o->same_site = SES_SAMESITE_LAX;
+  return SES_OK;
+}
+
+fn ses_ck_tchar(c: uint8) -> bool {
+  if (c >= 48 && c <= 57) { return true; }
+  if (c >= 65 && c <= 90) { return true; }
+  if (c >= 97 && c <= 122) { return true; }
+  // ! # $ % & ' * + - . ^ _ ` | ~
+  if (c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39) { return true; }
+  if (c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95) { return true; }
+  if (c == 96 || c == 124 || c == 126) { return true; }
+  return false;
+}
+
+// cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+fn ses_ck_octet(c: uint8) -> bool {
+  if (c == 33) { return true; }
+  if (c >= 35 && c <= 43) { return true; }
+  if (c >= 45 && c <= 58) { return true; }
+  if (c >= 60 && c <= 91) { return true; }
+  if (c >= 93 && c <= 126) { return true; }
+  return false;
+}
+
+/// Reports whether a string is a valid cookie name (an RFC 7230 token).
+/// in: name
+/// returns: true for 1+ token characters
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: ses_cookie_name_ok("sid") == true
+export fn ses_cookie_name_ok(name: string) -> bool {
+  if (name.length == 0) { return false; }
+  for i in 0..name.length {
+    if (!ses_ck_tchar(name.chars[i])) { return false; }
+  }
+  return true;
+}
+
+/// Reports whether a string is a valid unquoted cookie value (0 or more
+/// cookie-octets). Session tokens and signed base64url values always are.
+/// in: value
+/// returns: true when every byte is a cookie-octet
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: ses_cookie_value_ok("a b") == false
+export fn ses_cookie_value_ok(value: string) -> bool {
+  for i in 0..value.length {
+    if (!ses_ck_octet(value.chars[i])) { return false; }
+  }
+  return true;
+}
+
+// An attribute value: printable ASCII without ';'.
+fn ses_ck_attr_ok(v: string) -> bool {
+  for i in 0..v.length {
+    var c: uint8 = v.chars[i];
+    if (c < 32 || c > 126 || c == 59) { return false; }
+  }
+  return true;
+}
+
+struct SesCkW {
+  out: uint8*;
+  cap: int64;
+  pos: int64;
+  ok: bool;
+}
+
+fn ses_ckw_str(w: SesCkW*, s: string) {
+  var n: int64 = (int64)s.length;
+  if (!w->ok || w->pos + n > w->cap) {
+    w->ok = false;
+    return;
+  }
+  for i in 0..n {
+    w->out[w->pos + i] = s.chars[i];
+  }
+  w->pos = w->pos + n;
+}
+
+fn ses_ckw_int(w: SesCkW*, v: int64) {
+  var digits: uint8[24];
+  var n: int32 = 0;
+  var x: int64 = v;
+  if (x == 0) {
+    digits[0] = (uint8)'0';
+    n = 1;
+  }
+  while (x > 0) {
+    digits[n] = (uint8)(48 + (int32)(x % 10));
+    x = x / 10;
+    n = n + 1;
+  }
+  if (!w->ok || w->pos + (int64)n > w->cap) {
+    w->ok = false;
+    return;
+  }
+  var k: int32 = n - 1;
+  while (k >= 0) {
+    w->out[w->pos] = digits[k];
+    w->pos = w->pos + 1;
+    k = k - 1;
+  }
+}
+
+fn ses_ck_opts_ok(o: SesCookieOpts*) -> bool {
+  if (!ses_ck_attr_ok(o->path) || !ses_ck_attr_ok(o->domain)) { return false; }
+  if (o->path.length > 0 && o->path.chars[0] != (uint8)'/') { return false; }
+  for i in 0..o->domain.length {
+    if (o->domain.chars[i] == (uint8)' ') { return false; }
+  }
+  if (o->same_site != SES_SAMESITE_LAX && o->same_site != SES_SAMESITE_STRICT && o->same_site != SES_SAMESITE_NONE) { return false; }
+  if (o->same_site == SES_SAMESITE_NONE && !o->secure) { return false; }
+  return true;
+}
+
+fn ses_ck_emit(w: SesCkW*, name: string, value: string, o: SesCookieOpts*, max_age: int64) {
+  var eq: string = "=";
+  var sep: string = "; ";
+  ses_ckw_str(w, name);
+  ses_ckw_str(w, eq);
+  ses_ckw_str(w, value);
+  if (o->path.length > 0) {
+    ses_ckw_str(w, "; Path=");
+    ses_ckw_str(w, o->path);
+  }
+  if (o->domain.length > 0) {
+    ses_ckw_str(w, "; Domain=");
+    ses_ckw_str(w, o->domain);
+  }
+  if (max_age >= 0) {
+    ses_ckw_str(w, "; Max-Age=");
+    ses_ckw_int(w, max_age);
+  }
+  if (o->http_only) { ses_ckw_str(w, "; HttpOnly"); }
+  if (o->secure) { ses_ckw_str(w, "; Secure"); }
+  ses_ckw_str(w, sep);
+  if (o->same_site == SES_SAMESITE_STRICT) {
+    ses_ckw_str(w, "SameSite=Strict");
+  } else if (o->same_site == SES_SAMESITE_NONE) {
+    ses_ckw_str(w, "SameSite=None");
+  } else {
+    ses_ckw_str(w, "SameSite=Lax");
+  }
+}
+
+/// Formats a Set-Cookie header value (without the "Set-Cookie: " prefix):
+/// name=value; Path=..; Domain=..; Max-Age=N; HttpOnly; Secure; SameSite=..
+/// (each attribute only when set).
+/// in: out/cap, the output buffer; out_len, receives the length; name, a
+///   cookie name; value, cookie-octets (a session token, a signed value);
+///   o, options from ses_cookie_defaults
+/// returns: SES_OK; SES_E_SPACE (*out_len is 0); SES_E_ARG (null pointer,
+///   bad name, value, path or domain, SameSite=None without Secure)
+/// owns: out is the caller's; nothing is allocated
+/// thread: any thread (pure)
+/// example: ses_cookie_format(&b[0], 512, &n, "sid", ses_token_str(&t), &o);
+export fn ses_cookie_format(out: uint8*, cap: int64, out_len: int64*, name: string, value: string, o: SesCookieOpts*) -> int32 {
+  if (out == 0 || out_len == 0 || o == 0) { return SES_E_ARG; }
+  *out_len = 0;
+  if (!ses_cookie_name_ok(name) || !ses_cookie_value_ok(value) || !ses_ck_opts_ok(o)) { return SES_E_ARG; }
+  var w: SesCkW;
+  w.out = out;
+  w.cap = cap;
+  w.pos = 0;
+  w.ok = true;
+  ses_ck_emit(&w, name, value, o, o->max_age);
+  if (!w.ok) { return SES_E_SPACE; }
+  *out_len = w.pos;
+  return SES_OK;
+}
+
+/// Formats the Set-Cookie value that deletes a cookie: an empty value with
+/// Max-Age=0 and the same Path, Domain and flags (a browser only replaces a
+/// cookie whose name, path and domain match).
+/// in: as ses_cookie_format, without value (o->max_age is ignored)
+/// returns: as ses_cookie_format
+/// owns: out is the caller's
+/// thread: any thread (pure)
+/// example: ses_cookie_clear(&b[0], 512, &n, "sid", &o);  // on logout
+export fn ses_cookie_clear(out: uint8*, cap: int64, out_len: int64*, name: string, o: SesCookieOpts*) -> int32 {
+  if (out == 0 || out_len == 0 || o == 0) { return SES_E_ARG; }
+  *out_len = 0;
+  if (!ses_cookie_name_ok(name) || !ses_ck_opts_ok(o)) { return SES_E_ARG; }
+  var w: SesCkW;
+  w.out = out;
+  w.cap = cap;
+  w.pos = 0;
+  w.ok = true;
+  var empty: string = "";
+  ses_ck_emit(&w, name, empty, o, 0);
+  if (!w.ok) { return SES_E_SPACE; }
+  *out_len = w.pos;
+  return SES_OK;
+}
+
+fn ses_ck_ows(c: uint8) -> bool {
+  return c == 32 || c == 9;
+}
+
+/// Finds one cookie in a Cookie request header value (without "Cookie: ").
+/// The whole header is validated strictly (see the top of cookie.mettle);
+/// a value in double quotes is returned without them.
+/// in: header, the Cookie header value; name, the cookie to find;
+///   out, receives its value
+/// returns: SES_OK; SES_E_NOT_FOUND (absent, or an empty header);
+///   SES_E_PARSE (malformed header, even if the name occurs);
+///   SES_E_DUPLICATE (name occurs more than once); SES_E_ARG (null out,
+///   invalid name). *out is "" unless SES_OK
+/// owns: *out is a view into header; copy it to keep it
+/// thread: any thread (pure)
+/// example: var tok: string; if (ses_cookie_find(hdr, "sid", &tok) == SES_OK) { ses_lookup(&m, tok, now, &s); }
+export fn ses_cookie_find(header: string, name: string, out: string*) -> int32 {
+  if (out == 0) { return SES_E_ARG; }
+  *out = "";
+  if (!ses_cookie_name_ok(name)) { return SES_E_ARG; }
+  var p: uint8* = header.chars;
+  var lo: int64 = 0;
+  var hi: int64 = (int64)header.length;
+  while (lo < hi && ses_ck_ows(p[lo])) { lo = lo + 1; }
+  while (hi > lo && ses_ck_ows(p[hi - 1])) { hi = hi - 1; }
+  if (lo == hi) { return SES_E_NOT_FOUND; }
+  var found: int32 = 0;
+  var vstart: int64 = 0;
+  var vlen: int64 = 0;
+  var i: int64 = lo;
+  while (true) {
+    var ns: int64 = i;
+    while (i < hi && ses_ck_tchar(p[i])) { i = i + 1; }
+    var nl: int64 = i - ns;
+    if (nl == 0 || i >= hi || p[i] != (uint8)'=') { return SES_E_PARSE; }
+    i = i + 1;
+    var vs: int64 = i;
+    var vl: int64 = 0;
+    if (i < hi && p[i] == (uint8)'"') {
+      i = i + 1;
+      vs = i;
+      while (i < hi && ses_ck_octet(p[i])) { i = i + 1; }
+      if (i >= hi || p[i] != (uint8)'"') { return SES_E_PARSE; }
+      vl = i - vs;
+      i = i + 1;
+    } else {
+      while (i < hi && ses_ck_octet(p[i])) { i = i + 1; }
+      vl = i - vs;
+    }
+    if (nl == (int64)name.length) {
+      var same: bool = true;
+      for k in 0..nl {
+        if (p[ns + k] != name.chars[k]) { same = false; }
+      }
+      if (same) {
+        found = found + 1;
+        vstart = vs;
+        vlen = vl;
+      }
+    }
+    if (i == hi) { break; }
+    if (i + 2 > hi || p[i] != (uint8)';' || p[i + 1] != (uint8)' ') { return SES_E_PARSE; }
+    i = i + 2;
+  }
+  if (found == 0) { return SES_E_NOT_FOUND; }
+  if (found > 1) { return SES_E_DUPLICATE; }
+  *out = str_from_bytes((cstring)&p[vstart], vlen);
+  return SES_OK;
+}

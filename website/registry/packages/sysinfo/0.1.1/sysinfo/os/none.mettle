@@ -1,0 +1,19 @@
+// The backend for platforms not implemented yet (Windows, macOS). Every
+// call reports SYSINFO_E_UNSUPPORTED. A real backend goes in os/<platform>/
+// and exports these same four functions.
+import "../types.mettle";
+
+export fn sysinfo_os_open(s: Sysinfo*, what: uint32, root: string) -> int32 {
+  return SYSINFO_E_UNSUPPORTED;
+}
+
+export fn sysinfo_os_refresh(s: Sysinfo*, what: uint32) -> int32 {
+  return SYSINFO_E_UNSUPPORTED;
+}
+
+export fn sysinfo_os_close(s: Sysinfo*) {
+}
+
+export fn sysinfo_os_signal(pid: int64, sig: int32) -> int32 {
+  return SYSINFO_E_UNSUPPORTED;
+}

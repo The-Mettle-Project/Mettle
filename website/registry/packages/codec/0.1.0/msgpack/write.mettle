@@ -1,0 +1,211 @@
+// MessagePack writer: each call appends one value (or one array or map
+// header) to a CodecBuf, in the smallest form the spec allows.
+// Spec: https://github.com/msgpack/msgpack/blob/master/spec.md
+import "codec/core/status";
+import "codec/core/varint";
+import "codec/core/buf";
+
+// The extension type the spec reserves for timestamps.
+export const CODEC_MP_EXT_TIMESTAMP = -1;
+
+export fn codec_mp_nil(b: CodecBuf*) {
+  codec_buf_byte(b, (uint8)0xc0);
+}
+
+export fn codec_mp_bool(b: CodecBuf*, v: bool) {
+  if (v) { codec_buf_byte(b, (uint8)0xc3); } else { codec_buf_byte(b, (uint8)0xc2); }
+}
+
+// Writes a non-negative integer.
+export fn codec_mp_uint(b: CodecBuf*, v: uint64) {
+  var p: uint8* = codec_buf_reserve(b, 9);
+  if (p == 0) { return; }
+  if (v < 128) {
+    p[0] = (uint8)v;
+    b->len = b->len + 1;
+  } else if (v < 256) {
+    p[0] = (uint8)0xcc;
+    p[1] = (uint8)v;
+    b->len = b->len + 2;
+  } else if (v < 65536) {
+    p[0] = (uint8)0xcd;
+    codec_put_be16(p + 1, (uint16)v);
+    b->len = b->len + 3;
+  } else if (v < 4294967296) {
+    p[0] = (uint8)0xce;
+    codec_put_be32(p + 1, (uint32)v);
+    b->len = b->len + 5;
+  } else {
+    p[0] = (uint8)0xcf;
+    codec_put_be64(p + 1, v);
+    b->len = b->len + 9;
+  }
+}
+
+// Writes a signed integer. Non-negative values use the unsigned forms, as
+// msgpack-c does, so 200 is 0xcc 0xc8 either way.
+export fn codec_mp_int(b: CodecBuf*, v: int64) {
+  if (v >= 0) {
+    codec_mp_uint(b, (uint64)v);
+    return;
+  }
+  var p: uint8* = codec_buf_reserve(b, 9);
+  if (p == 0) { return; }
+  if (v >= -32) {
+    p[0] = (uint8)v;
+    b->len = b->len + 1;
+  } else if (v >= -128) {
+    p[0] = (uint8)0xd0;
+    p[1] = (uint8)v;
+    b->len = b->len + 2;
+  } else if (v >= -32768) {
+    p[0] = (uint8)0xd1;
+    codec_put_be16(p + 1, (uint16)v);
+    b->len = b->len + 3;
+  } else if (v >= -2147483648) {
+    p[0] = (uint8)0xd2;
+    codec_put_be32(p + 1, (uint32)v);
+    b->len = b->len + 5;
+  } else {
+    p[0] = (uint8)0xd3;
+    codec_put_be64(p + 1, (uint64)v);
+    b->len = b->len + 9;
+  }
+}
+
+export fn codec_mp_float32(b: CodecBuf*, v: float32) {
+  var p: uint8* = codec_buf_reserve(b, 5);
+  if (p == 0) { return; }
+  p[0] = (uint8)0xca;
+  codec_put_be32(p + 1, codec_f32_bits(v));
+  b->len = b->len + 5;
+}
+
+export fn codec_mp_float64(b: CodecBuf*, v: float64) {
+  var p: uint8* = codec_buf_reserve(b, 9);
+  if (p == 0) { return; }
+  p[0] = (uint8)0xcb;
+  codec_put_be64(p + 1, codec_f64_bits(v));
+  b->len = b->len + 9;
+}
+
+// One header byte for small sizes, else a marker and a 1, 2 or 4 byte size.
+// small_max is the largest size the fix form holds; m8 is 0 if there is no
+// 8-bit form (arrays and maps).
+fn codec_mp_head(b: CodecBuf*, n: int64, fix: int32, small_max: int64, m8: int32, m16: int32, m32: int32) {
+  if (n < 0 || n > 4294967295) {
+    if (b->err == CODEC_OK) { b->err = CODEC_ERR_LIMIT; }
+    return;
+  }
+  var p: uint8* = codec_buf_reserve(b, 5);
+  if (p == 0) { return; }
+  if (n <= small_max) {
+    p[0] = (uint8)(fix | (int32)n);
+    b->len = b->len + 1;
+  } else if (m8 != 0 && n < 256) {
+    p[0] = (uint8)m8;
+    p[1] = (uint8)n;
+    b->len = b->len + 2;
+  } else if (n < 65536) {
+    p[0] = (uint8)m16;
+    codec_put_be16(p + 1, (uint16)n);
+    b->len = b->len + 3;
+  } else {
+    p[0] = (uint8)m32;
+    codec_put_be32(p + 1, (uint32)n);
+    b->len = b->len + 5;
+  }
+}
+
+// A string header for n bytes of UTF-8 that the caller writes next.
+export fn codec_mp_str_head(b: CodecBuf*, n: int64) {
+  codec_mp_head(b, n, 0xa0, 31, 0xd9, 0xda, 0xdb);
+}
+
+export fn codec_mp_str(b: CodecBuf*, s: string) {
+  codec_mp_str_head(b, (int64)s.length);
+  codec_buf_bytes(b, s.chars, (int64)s.length);
+}
+
+export fn codec_mp_bin_head(b: CodecBuf*, n: int64) {
+  codec_mp_head(b, n, 0, -1, 0xc4, 0xc5, 0xc6);
+}
+
+export fn codec_mp_bin(b: CodecBuf*, data: uint8*, n: int64) {
+  codec_mp_bin_head(b, n);
+  codec_buf_bytes(b, data, n);
+}
+
+// An array of n values; write the n values next.
+export fn codec_mp_array(b: CodecBuf*, n: int64) {
+  codec_mp_head(b, n, 0x90, 15, 0, 0xdc, 0xdd);
+}
+
+// A map of n pairs; write n keys and values next, key first.
+export fn codec_mp_map(b: CodecBuf*, n: int64) {
+  codec_mp_head(b, n, 0x80, 15, 0, 0xde, 0xdf);
+}
+
+// An extension header: type (-128..127) and n data bytes the caller writes next.
+export fn codec_mp_ext_head(b: CodecBuf*, ext_type: int32, n: int64) {
+  if (n < 0 || n > 4294967295 || ext_type < -128 || ext_type > 127) {
+    if (b->err == CODEC_OK) { b->err = CODEC_ERR_LIMIT; }
+    return;
+  }
+  var p: uint8* = codec_buf_reserve(b, 6);
+  if (p == 0) { return; }
+  var t: uint8 = (uint8)ext_type;
+  if (n == 1 || n == 2 || n == 4 || n == 8 || n == 16) {
+    var code: int32 = 0xd4;
+    if (n == 2) { code = 0xd5; }
+    if (n == 4) { code = 0xd6; }
+    if (n == 8) { code = 0xd7; }
+    if (n == 16) { code = 0xd8; }
+    p[0] = (uint8)code;
+    p[1] = t;
+    b->len = b->len + 2;
+  } else if (n < 256) {
+    p[0] = (uint8)0xc7;
+    p[1] = (uint8)n;
+    p[2] = t;
+    b->len = b->len + 3;
+  } else if (n < 65536) {
+    p[0] = (uint8)0xc8;
+    codec_put_be16(p + 1, (uint16)n);
+    p[3] = t;
+    b->len = b->len + 4;
+  } else {
+    p[0] = (uint8)0xc9;
+    codec_put_be32(p + 1, (uint32)n);
+    p[5] = t;
+    b->len = b->len + 6;
+  }
+}
+
+export fn codec_mp_ext(b: CodecBuf*, ext_type: int32, data: uint8*, n: int64) {
+  codec_mp_ext_head(b, ext_type, n);
+  codec_buf_bytes(b, data, n);
+}
+
+// A timestamp: seconds since the Unix epoch and nanoseconds (0..999999999).
+// Uses the 4, 8 or 12 byte form, whichever is smallest for the value.
+export fn codec_mp_timestamp(b: CodecBuf*, sec: int64, nsec: int64) {
+  if (nsec < 0 || nsec > 999999999) {
+    if (b->err == CODEC_OK) { b->err = CODEC_ERR_INVALID; }
+    return;
+  }
+  var tmp: uint8[12];
+  if (sec >= 0 && sec < ((int64)1 << 34)) {
+    if (nsec == 0 && sec < 4294967296) {
+      codec_put_be32(&tmp[0], (uint32)sec);
+      codec_mp_ext(b, CODEC_MP_EXT_TIMESTAMP, &tmp[0], 4);
+      return;
+    }
+    codec_put_be64(&tmp[0], ((uint64)nsec << 34) | (uint64)sec);
+    codec_mp_ext(b, CODEC_MP_EXT_TIMESTAMP, &tmp[0], 8);
+    return;
+  }
+  codec_put_be32(&tmp[0], (uint32)nsec);
+  codec_put_be64(&tmp[4], (uint64)sec);
+  codec_mp_ext(b, CODEC_MP_EXT_TIMESTAMP, &tmp[0], 12);
+}

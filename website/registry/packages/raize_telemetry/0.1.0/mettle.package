@@ -1,0 +1,7 @@
+name = raize_telemetry
+version = 0.1.0
+description = Named events with measurements and metadata, attachable handlers, spans; lock-free execute
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeTelemetry
+compiler = 0.18.0
+platforms = linux windows

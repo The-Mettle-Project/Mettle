@@ -1,0 +1,390 @@
+// GPUs: every /sys/class/drm/card<N> with its PCI device.
+//   AMD (amdgpu, Documentation/gpu/amdgpu): gpu_busy_percent,
+//     mem_info_vram_used and _total, and hwmon temp1, power1, freq1, freq2.
+//   Intel (i915, xe): the current GPU clock from gt_cur_freq_mhz or the xe
+//     tile's act_freq, and hwmon temperature and energy (power is the change
+//     in energy). Intel has no busy figure in sysfs.
+//   NVIDIA: the model from /proc/driver/nvidia/gpus/<slot>/information; the
+//     rest only from nvidia-smi, run when SYSINFO_GPU_NVSMI is asked for.
+// Names come from the pci.ids database when it is installed.
+import "std/mem";
+import "std/fs";
+import "std/time";
+import "std/arena";
+import "std/strbuf";
+import "std/process";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+
+struct SysinfoLxGpuFiles {
+  busy: int64;
+  vram_used: int64;
+  temp: int64;
+  power: int64;
+  energy: int64;            // microjoules, for Intel
+  sclk: int64;              // Hz (hwmon freq1) or MHz (Intel files)
+  sclk_mhz: bool;
+  mclk: int64;
+  prev_energy: int64;
+  prev_ns: int64;
+}
+
+export struct SysinfoLxGpu {
+  perm: SysinfoLxPool;
+  pools: SysinfoLxPools;    // nvidia-smi names, renewed each refresh
+  files: SysinfoLxGpuFiles*;
+  cap: int32;
+  nvsmi: bool;
+}
+
+// The vendor and device names for a PCI id from pci.ids text. Either view
+// may come back empty.
+export fn sysinfo_lx_pci_names(text: string, vendor: int32, device: int32, vname: string*, dname: string*) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  var in_vendor: bool = false;
+  *vname = sysinfo_lx_view(s.p, 0);
+  *dname = sysinfo_lx_view(s.p, 0);
+  while (!sysinfo_lx_end(&s)) {
+    var c0: uint8 = s.p[s.i];
+    if (c0 == (uint8)35 || c0 == (uint8)10) { sysinfo_lx_next_line(&s); continue; }
+    if (c0 != (uint8)9) {
+      if (in_vendor) { return; }   // the next vendor: the device is not listed
+      if (sysinfo_lx_at(&s, "C ")) { return; }   // device classes follow the vendors
+      var a: int64 = s.i;
+      var id: uint64 = sysinfo_lx_hex(&s);
+      if (s.i - a == 4 && (int32)id == vendor) {
+        in_vendor = true;
+        *vname = sysinfo_lx_trim(sysinfo_lx_line(&s));
+        continue;
+      }
+    } else if (in_vendor && s.i + 1 < s.n && s.p[s.i + 1] != (uint8)9) {
+      s.i = s.i + 1;
+      var a: int64 = s.i;
+      var id: uint64 = sysinfo_lx_hex(&s);
+      if (s.i - a == 4 && (int32)id == device) {
+        *dname = sysinfo_lx_trim(sysinfo_lx_line(&s));
+        return;
+      }
+    }
+    sysinfo_lx_next_line(&s);
+  }
+}
+
+fn sysinfo_lx_gpu_add(st: SysinfoLxGpu*, out: SysinfoGpus*) -> SysinfoGpu* {
+  if (out->n >= st->cap || out->list == 0) {
+    var c: int32 = st->cap;
+    out->list = (SysinfoGpu*)sysinfo_lx_grow((uint8*)out->list, &c, out->n + 1, sizeof(SysinfoGpu));
+    c = st->cap;
+    st->files = (SysinfoLxGpuFiles*)sysinfo_lx_grow((uint8*)st->files, &c, out->n + 1, sizeof(SysinfoLxGpuFiles));
+    st->cap = c;
+  }
+  var g: SysinfoGpu* = &out->list[out->n];
+  var f: SysinfoLxGpuFiles* = &st->files[out->n];
+  f->busy = -1; f->vram_used = -1; f->temp = -1; f->power = -1; f->energy = -1;
+  f->sclk = -1; f->mclk = -1; f->prev_energy = -1;
+  g->vendor = SYSINFO_GPU_OTHER;
+  g->util_pct = -1.0; g->mem_used = -1; g->mem_total = -1; g->temp_c = SYSINFO_NA_TEMP;
+  g->power_w = -1.0; g->power_cap_w = -1.0; g->clock_core_mhz = -1.0; g->clock_mem_mhz = -1.0;
+  out->n = out->n + 1;
+  return g;
+}
+
+fn sysinfo_lx_open_at(p: SysinfoLxPath*, base: int64, file: string) -> int64 {
+  p->n = base;
+  sysinfo_lx_path_add(p, file);
+  return sysinfo_lx_open(sysinfo_lx_path_str(p));
+}
+
+fn sysinfo_lx_i64_at(p: SysinfoLxPath*, base: int64, file: string) -> int64 {
+  p->n = base;
+  sysinfo_lx_path_add(p, file);
+  return sysinfo_lx_read_i64(sysinfo_lx_path_str(p), -1);
+}
+
+// The first hwmon folder of a device, appended to p. False when none.
+fn sysinfo_lx_dev_hwmon(p: SysinfoLxPath*, devbase: int64) -> bool {
+  p->n = devbase;
+  sysinfo_lx_path_add(p, "/hwmon");
+  var l: SysinfoLxNames;
+  var n: int32 = sysinfo_lx_names(sysinfo_lx_path_str(p), "hwmon", &l);
+  if (n <= 0) { sysinfo_lx_names_free(&l); return false; }
+  sysinfo_lx_path_add(p, "/");
+  sysinfo_lx_path_add(p, sysinfo_lx_names_at(&l, 0));
+  sysinfo_lx_names_free(&l);
+  return true;
+}
+
+fn sysinfo_lx_link_base(p: SysinfoLxPath*, pool: SysinfoLxPool*) -> string {
+  var buf: uint8[1024];
+  var n: int64 = fs_readlink(sysinfo_lx_path_str(p), &buf[0], 1024);
+  if (n <= 0) { return sysinfo_lx_view((uint8*)0, 0); }
+  return sysinfo_lx_pool_add(pool, sysinfo_lx_base(sysinfo_lx_view(&buf[0], n)));
+}
+
+// The model line of /proc/driver/nvidia/gpus/<slot>/information.
+fn sysinfo_lx_nv_model(c: SysinfoLxCtx*, pool: SysinfoLxPool*, slot: string) -> string {
+  var p: SysinfoLxPath;
+  sysinfo_lx_path_at(&p, c->root, "/proc/driver/nvidia/gpus/");
+  sysinfo_lx_path_add(&p, slot);
+  sysinfo_lx_path_add(&p, "/information");
+  var n: int64 = sysinfo_lx_slurp(sysinfo_lx_path_str(&p), &c->buf2);
+  var s: SysinfoLxScan = sysinfo_lx_scan(c->buf2.p, n);
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, "Model:")) {
+      sysinfo_lx_after_colon(&s);
+      return sysinfo_lx_pool_add(pool, sysinfo_lx_trim(sysinfo_lx_line(&s)));
+    }
+    sysinfo_lx_next_line(&s);
+  }
+  return sysinfo_lx_view((uint8*)0, 0);
+}
+
+fn sysinfo_lx_same_slot(a: string, b: string) -> bool {
+  // "00000000:01:00.0" from nvidia-smi against "0000:01:00.0" from sysfs
+  var na: int64 = (int64)a.length;
+  var nb: int64 = (int64)b.length;
+  if (na < 7 || nb < 7) { return false; }
+  for k in 1..8 {
+    var x: int32 = (int32)a[na - k];
+    var y: int32 = (int32)b[nb - k];
+    if (x >= 65 && x <= 90) { x = x + 32; }
+    if (y >= 65 && y <= 90) { y = y + 32; }
+    if (x != y) { return false; }
+  }
+  return true;
+}
+
+fn sysinfo_lx_csv_num(t: string) -> float64 {
+  var v: string = sysinfo_lx_trim(t);
+  if (v.length == (uint64)0 || v[0] == '[') { return -1.0; }   // [N/A], [Not Supported]
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(v);
+  return sysinfo_lx_f64(&s);
+}
+
+// Applies nvidia-smi CSV output (the query in sysinfo_lx_nvsmi) to the
+// list, adding GPUs not seen in sysfs.
+export fn sysinfo_lx_gpu_parse_nvsmi(st: SysinfoLxGpu*, out: SysinfoGpus*, pool: SysinfoLxPool*, text: string) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  while (!sysinfo_lx_end(&s)) {
+    var line: string = sysinfo_lx_line(&s);
+    var f: string[10];
+    var nf: int32 = 0;
+    var a: int64 = 0;
+    var len: int64 = (int64)line.length;
+    for k in 0..(len + 1) {
+      if ((k == len || line[k] == ',') && nf < 10) {
+        f[nf] = sysinfo_lx_trim(sysinfo_lx_view(line.chars + a, k - a));
+        nf = nf + 1;
+        a = k + 1;
+      }
+    }
+    if (nf < 10) { continue; }
+    var g: SysinfoGpu* = (SysinfoGpu*)0;
+    for i in 0..out->n {
+      if (out->list[i].vendor == SYSINFO_GPU_NVIDIA && sysinfo_lx_same_slot(f[0], out->list[i].pci_slot)) { g = &out->list[i]; }
+    }
+    if (g == 0) {
+      g = sysinfo_lx_gpu_add(st, out);
+      g->vendor = SYSINFO_GPU_NVIDIA;
+      g->vendor_name = "NVIDIA Corporation";
+      g->driver = "nvidia";
+      g->pci_slot = sysinfo_lx_pool_add(&st->perm, f[0]);   // added once
+    }
+    if (f[1].length > (uint64)0) { g->name = sysinfo_lx_pool_add(pool, f[1]); }
+    g->util_pct = sysinfo_lx_csv_num(f[2]);
+    var mu: float64 = sysinfo_lx_csv_num(f[3]);
+    var mt: float64 = sysinfo_lx_csv_num(f[4]);
+    if (mu >= 0.0) { g->mem_used = (int64)(mu * 1048576.0); }
+    if (mt >= 0.0) { g->mem_total = (int64)(mt * 1048576.0); }
+    var t: float64 = sysinfo_lx_csv_num(f[5]);
+    if (t != -1.0) { g->temp_c = t; }
+    g->power_w = sysinfo_lx_csv_num(f[6]);
+    g->power_cap_w = sysinfo_lx_csv_num(f[7]);
+    g->clock_core_mhz = sysinfo_lx_csv_num(f[8]);
+    g->clock_mem_mhz = sysinfo_lx_csv_num(f[9]);
+  }
+}
+
+fn sysinfo_lx_nvsmi(st: SysinfoLxGpu*, out: SysinfoGpus*, pool: SysinfoLxPool*) {
+  var argv: string[3];
+  argv[0] = "nvidia-smi";
+  argv[1] = "--query-gpu=pci.bus_id,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks.gr,clocks.mem";
+  argv[2] = "--format=csv,noheader,nounits";
+  var arena: Arena* = arena_init(16384);
+  if (arena == 0) { return; }
+  var sb: StrBuf* = strbuf_new(arena, 4096);
+  var ps: ProcStatus;
+  var r: int64 = proc_run(argv, "", sb, (StrBuf*)0, 3000, &ps);
+  if (r == 0 && ps.signaled == 0 && ps.code == 0 && sb->len > 0) {
+    sysinfo_lx_gpu_parse_nvsmi(st, out, pool, sysinfo_lx_view((uint8*)sb->data, sb->len));
+  }
+  arena_free(arena);
+}
+
+export fn sysinfo_lx_gpu_init(st: SysinfoLxGpu*, c: SysinfoLxCtx*, out: SysinfoGpus*, what: uint32) -> int32 {
+  st->nvsmi = c->live && (what & (uint32)SYSINFO_GPU_NVSMI) != (uint32)0;
+  var pool: SysinfoLxPool* = &st->perm;
+  var dir: SysinfoLxPath;
+  sysinfo_lx_path_at(&dir, c->root, "/sys/class/drm");
+  var cards: SysinfoLxNames;
+  var count: int32 = sysinfo_lx_names(sysinfo_lx_path_str(&dir), "card", &cards);
+  // pci.ids, read only when some GPU is found
+  var ids: SysinfoLxBuf;
+  var have_ids: int32 = 0;
+  for i in 0..count {
+    var cname: string = sysinfo_lx_names_at(&cards, i);
+    if (!sysinfo_lx_all_digits(sysinfo_lx_view(cname.chars + 4, (int64)cname.length - 4))) { continue; }
+    var p: SysinfoLxPath = dir;
+    sysinfo_lx_path_add(&p, "/");
+    sysinfo_lx_path_add(&p, cname);
+    var cardbase: int64 = p.n;
+    sysinfo_lx_path_add(&p, "/device");
+    var devbase: int64 = p.n;
+    var vendor: int64 = -1;
+    var device: int64 = -1;
+    var tmp: uint8[64];
+    sysinfo_lx_path_add(&p, "/vendor");
+    var n: int64 = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &tmp[0], 64);
+    if (n > 0) { var s: SysinfoLxScan = sysinfo_lx_scan(&tmp[0], n); vendor = (int64)sysinfo_lx_hex(&s); }
+    p.n = devbase;
+    sysinfo_lx_path_add(&p, "/device");
+    n = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &tmp[0], 64);
+    if (n > 0) { var s: SysinfoLxScan = sysinfo_lx_scan(&tmp[0], n); device = (int64)sysinfo_lx_hex(&s); }
+    if (vendor < 0) { continue; }
+    var g: SysinfoGpu* = sysinfo_lx_gpu_add(st, out);
+    var f: SysinfoLxGpuFiles* = &st->files[out->n - 1];
+    if (vendor == 4098) { g->vendor = SYSINFO_GPU_AMD; }          // 0x1002
+    if (vendor == 32902) { g->vendor = SYSINFO_GPU_INTEL; }       // 0x8086
+    if (vendor == 4318) { g->vendor = SYSINFO_GPU_NVIDIA; }       // 0x10de
+    p.n = devbase;
+    g->pci_slot = sysinfo_lx_link_base(&p, pool);
+    sysinfo_lx_path_add(&p, "/driver");
+    g->driver = sysinfo_lx_link_base(&p, pool);
+    if (have_ids == 0) {
+      have_ids = -1;
+      var ip: SysinfoLxPath;
+      if (sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &ip, "/usr/share/hwdata/pci.ids"), &ids) > 0
+          || sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &ip, "/usr/share/misc/pci.ids"), &ids) > 0) { have_ids = 1; }
+    }
+    var vname: string = sysinfo_lx_view((uint8*)0, 0);
+    var dname: string = vname;
+    if (have_ids == 1 && device >= 0) {
+      sysinfo_lx_pci_names(sysinfo_lx_view(ids.p, ids.n), (int32)vendor, (int32)device, &vname, &dname);
+    }
+    if (vname.length == (uint64)0) {
+      if (g->vendor == SYSINFO_GPU_AMD) { vname = "AMD"; }
+      if (g->vendor == SYSINFO_GPU_INTEL) { vname = "Intel"; }
+      if (g->vendor == SYSINFO_GPU_NVIDIA) { vname = "NVIDIA"; }
+    }
+    g->vendor_name = sysinfo_lx_pool_add(pool, vname);
+    g->name = sysinfo_lx_pool_add(pool, dname);
+    if (g->vendor == SYSINFO_GPU_AMD) {
+      f->busy = sysinfo_lx_open_at(&p, devbase, "/gpu_busy_percent");
+      f->vram_used = sysinfo_lx_open_at(&p, devbase, "/mem_info_vram_used");
+      g->mem_total = sysinfo_lx_i64_at(&p, devbase, "/mem_info_vram_total");
+    }
+    if (g->vendor == SYSINFO_GPU_INTEL) {
+      var q: SysinfoLxPath = p;   // the card folder is a prefix of p
+      f->sclk = sysinfo_lx_open_at(&q, cardbase, "/gt_cur_freq_mhz");
+      if (f->sclk < 0) { f->sclk = sysinfo_lx_open_at(&p, devbase, "/tile0/gt0/freq0/act_freq"); }
+      f->sclk_mhz = true;
+    }
+    if (g->vendor == SYSINFO_GPU_NVIDIA) {
+      var m: string = sysinfo_lx_nv_model(c, pool, g->pci_slot);
+      if (m.length > (uint64)0) { g->name = m; }
+    }
+    if (sysinfo_lx_dev_hwmon(&p, devbase)) {
+      var hb: int64 = p.n;
+      f->temp = sysinfo_lx_open_at(&p, hb, "/temp1_input");
+      f->power = sysinfo_lx_open_at(&p, hb, "/power1_average");
+      if (f->power < 0) { f->power = sysinfo_lx_open_at(&p, hb, "/power1_input"); }
+      if (f->power < 0) { f->energy = sysinfo_lx_open_at(&p, hb, "/energy1_input"); }
+      var capuw: int64 = sysinfo_lx_i64_at(&p, hb, "/power1_cap");
+      if (capuw > 0) { g->power_cap_w = (float64)capuw / 1000000.0; }
+      if (f->sclk < 0) { f->sclk = sysinfo_lx_open_at(&p, hb, "/freq1_input"); f->sclk_mhz = false; }
+      f->mclk = sysinfo_lx_open_at(&p, hb, "/freq2_input");
+    }
+  }
+  sysinfo_lx_names_free(&cards);
+  if (have_ids == 1) { sysinfo_lx_buf_free(&ids); }
+  // NVIDIA cards the proprietary driver lists but DRM does not
+  var nv: SysinfoLxPath;
+  sysinfo_lx_path_at(&nv, c->root, "/proc/driver/nvidia/gpus");
+  var slots: SysinfoLxNames;
+  count = sysinfo_lx_names(sysinfo_lx_path_str(&nv), "", &slots);
+  for i in 0..count {
+    var slot: string = sysinfo_lx_names_at(&slots, i);
+    var seen: bool = false;
+    for k in 0..out->n { if (sysinfo_lx_same_slot(slot, out->list[k].pci_slot)) { seen = true; } }
+    if (seen) { continue; }
+    var g: SysinfoGpu* = sysinfo_lx_gpu_add(st, out);
+    g->vendor = SYSINFO_GPU_NVIDIA;
+    g->vendor_name = "NVIDIA Corporation";
+    g->driver = "nvidia";
+    g->pci_slot = sysinfo_lx_pool_add(pool, slot);
+    g->name = sysinfo_lx_nv_model(c, pool, g->pci_slot);
+  }
+  sysinfo_lx_names_free(&slots);
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_gpu_refresh(st: SysinfoLxGpu*, c: SysinfoLxCtx*, out: SysinfoGpus*) -> int32 {
+  var t: int64 = time_mono_ns();
+  for i in 0..out->n {
+    var g: SysinfoGpu* = &out->list[i];
+    var f: SysinfoLxGpuFiles* = &st->files[i];
+    if (f->busy >= 0) {
+      var v: int64 = sysinfo_lx_fd_i64(f->busy, -1);
+      g->util_pct = -1.0;
+      if (v >= 0) { g->util_pct = (float64)v; }
+    }
+    if (f->vram_used >= 0) { g->mem_used = sysinfo_lx_fd_i64(f->vram_used, -1); }
+    if (f->temp >= 0) {
+      var v: int64 = sysinfo_lx_fd_i64(f->temp, -1000000000);
+      g->temp_c = SYSINFO_NA_TEMP;
+      if (v != -1000000000) { g->temp_c = (float64)v / 1000.0; }
+    }
+    if (f->power >= 0) {
+      var v: int64 = sysinfo_lx_fd_i64(f->power, -1);
+      g->power_w = -1.0;
+      if (v >= 0) { g->power_w = (float64)v / 1000000.0; }
+    } else if (f->energy >= 0) {
+      var e: int64 = sysinfo_lx_fd_i64(f->energy, -1);
+      g->power_w = -1.0;
+      if (e >= 0 && f->prev_energy >= 0 && t > f->prev_ns) {
+        g->power_w = sysinfo_lx_rate(e, f->prev_energy, (float64)(t - f->prev_ns) / 1000000000.0) / 1000000.0;
+      }
+      f->prev_energy = e;
+      f->prev_ns = t;
+    }
+    if (f->sclk >= 0) {
+      var v: int64 = sysinfo_lx_fd_i64(f->sclk, -1);
+      g->clock_core_mhz = -1.0;
+      if (v >= 0 && f->sclk_mhz) { g->clock_core_mhz = (float64)v; }
+      if (v >= 0 && !f->sclk_mhz) { g->clock_core_mhz = (float64)v / 1000000.0; }
+    }
+    if (f->mclk >= 0) {
+      var v: int64 = sysinfo_lx_fd_i64(f->mclk, -1);
+      g->clock_mem_mhz = -1.0;
+      if (v >= 0) { g->clock_mem_mhz = (float64)v / 1000000.0; }
+    }
+  }
+  if (st->nvsmi) { sysinfo_lx_nvsmi(st, out, sysinfo_lx_pools_next(&st->pools)); }
+  out->status = SYSINFO_OK;
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_gpu_free(st: SysinfoLxGpu*, out: SysinfoGpus*) {
+  for i in 0..out->n {
+    var f: SysinfoLxGpuFiles* = &st->files[i];
+    sysinfo_lx_close(f->busy); sysinfo_lx_close(f->vram_used); sysinfo_lx_close(f->temp);
+    sysinfo_lx_close(f->power); sysinfo_lx_close(f->energy); sysinfo_lx_close(f->sclk); sysinfo_lx_close(f->mclk);
+  }
+  if (st->files != 0) { free(st->files); }
+  if (out->list != 0) { free(out->list); }
+  out->list = (SysinfoGpu*)0;
+  out->n = 0;
+  sysinfo_lx_pool_free(&st->perm);
+  sysinfo_lx_pools_free(&st->pools);
+}

@@ -1,0 +1,527 @@
+// alph/io/reactor: an event loop for one thread, with no actors and no
+// threads of its own. Usable alone: a terminal UI, a monitor, a client or a
+// small server can run on just this, and alph's schedulers build on it.
+//
+// A reactor watches file descriptors (sockets, pipes, terminals, anything
+// epoll takes), keeps timers with nanosecond deadlines, and can be woken
+// from any thread. alph_rx_wait sleeps until something happens and fills an
+// array of events; nothing spins, so an idle reactor costs no CPU.
+//
+//   var r: AlphReactor;
+//   alph_rx_init(&r);
+//   alph_rx_add(&r, sock, ALPH_RX_READ, ALPH_RX_ONESHOT, 7);
+//   var t: int64 = alph_rx_timer(&r, 250 * 1000000, 1);  // 250 ms
+//   var ev: AlphRxEvent[64];
+//   while (true) {
+//     var n: int64 = alph_rx_wait(&r, &ev[0], 64, -1);
+//     for i: int64 in 0..n {
+//       if (ev[i].kind == ALPH_RX_FD && ev[i].data == 7) { ... read; alph_rx_modify(...) to re-arm }
+//       if (ev[i].kind == ALPH_RX_TIMER) { ... ev[i].data == 1 }
+//     }
+//   }
+//
+// Only alph_rx_wake may be called from another thread; everything else
+// belongs to the thread that runs the reactor. For many threads, run one
+// reactor per thread.
+
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/sys/linux";
+import "alph/sys/fd";
+
+// Readiness bits, for alph_rx_add and AlphRxEvent.events.
+export const ALPH_RX_READ: int64 = 1;           // data to read, or a peer to accept
+export const ALPH_RX_WRITE: int64 = 4;          // room to write, or a connect finished
+export const ALPH_RX_ERROR: int64 = 8;          // an error is pending (always reported)
+export const ALPH_RX_HANGUP: int64 = 16;        // hung up (always reported)
+export const ALPH_RX_PEER_CLOSED: int64 = 8192; // the peer closed its writing side
+
+// Arming modes, for alph_rx_add and alph_rx_modify.
+//
+//   ALPH_RX_LEVEL    reported on every wait while ready (simplest)
+//   ALPH_RX_ONESHOT  reported once, then quiet until alph_rx_modify arms it
+//                    again: one owner handles each readiness exactly once
+//   ALPH_RX_EDGE     reported when it becomes ready; read or write until
+//                    ALPH_IO_AGAIN before waiting again
+export const ALPH_RX_LEVEL: int64 = 0;
+export const ALPH_RX_ONESHOT: int64 = 1;
+export const ALPH_RX_EDGE: int64 = 2;
+
+// Event kinds, in AlphRxEvent.kind.
+export const ALPH_RX_FD: int64 = 1;      // data = the fd's data; events = what is ready
+export const ALPH_RX_TIMER: int64 = 2;   // data = the timer's data; events = its id
+export const ALPH_RX_WAKE: int64 = 3;    // alph_rx_wake was called, once or more
+export const ALPH_RX_SIGNAL: int64 = 4;  // data = the signal number
+
+// One event from alph_rx_wait.
+export struct AlphRxEvent {
+  kind: int64;
+  data: int64;
+  events: int64;
+}
+
+const ALPH_RX_TAG_WAKE: int64 = -1;
+const ALPH_RX_TAG_TIMER: int64 = -2;
+const ALPH_RX_TAG_SIGNAL: int64 = -3;
+const ALPH_RX_BATCH: int64 = 256;
+const ALPH_SYS_TIMERFD_CREATE: int64 = 283;
+const ALPH_SYS_TIMERFD_SETTIME: int64 = 286;
+
+// A pending timer. Slots are reused; a timer id is its slot plus a
+// generation, so cancelling a timer that already fired does nothing.
+struct AlphRxTimer {
+  deadline: int64;  // CLOCK_MONOTONIC, ns
+  data: int64;
+  gen: int64;
+  pos: int64;       // its place in the heap, or -1 when free
+}
+
+// A reactor. Declare one, start it with alph_rx_init, and keep it in place;
+// its fields are its own.
+export struct AlphReactor {
+  epfd: int64;
+  wakefd: int64;
+  timerfd: int64;
+  sigfd: int64;
+  woken: int64;      // a wake is pending in wakefd
+  buf: int64;        // epoll_event[ALPH_RX_BATCH]
+  slots: int64;      // AlphRxTimer array
+  slot_cap: int64;
+  free_top: int64;   // free slot indexes, a stack in free_list
+  free_list: int64;
+  heap: int64;       // slot indexes, ordered by deadline
+  heap_len: int64;
+  armed: int64;      // the deadline timerfd is set to, or 0 when disarmed
+  pwait2: int64;     // epoll_pwait2: 0 not tried yet, 1 works, -1 missing (the timerfd is used)
+}
+
+fn alph_rx_slot(r: AlphReactor*, i: int64) -> AlphRxTimer* {
+  return (AlphRxTimer*)(r->slots + i * (int64)sizeof(AlphRxTimer));
+}
+
+fn alph_rx_heap_at(r: AlphReactor*, i: int64) -> int64 {
+  return *(int64*)(r->heap + i * 8);
+}
+
+fn alph_rx_heap_put(r: AlphReactor*, i: int64, slot: int64) {
+  *(int64*)(r->heap + i * 8) = slot;
+  alph_rx_slot(r, slot)->pos = i;
+}
+
+fn alph_rx_less(r: AlphReactor*, a: int64, b: int64) -> bool {
+  return alph_rx_slot(r, alph_rx_heap_at(r, a))->deadline < alph_rx_slot(r, alph_rx_heap_at(r, b))->deadline;
+}
+
+fn alph_rx_swap(r: AlphReactor*, a: int64, b: int64) {
+  var sa: int64 = alph_rx_heap_at(r, a);
+  var sb: int64 = alph_rx_heap_at(r, b);
+  alph_rx_heap_put(r, a, sb);
+  alph_rx_heap_put(r, b, sa);
+}
+
+fn alph_rx_up(r: AlphReactor*, i: int64) {
+  var k: int64 = i;
+  while (k > 0 && alph_rx_less(r, k, (k - 1) / 2)) {
+    alph_rx_swap(r, k, (k - 1) / 2);
+    k = (k - 1) / 2;
+  }
+}
+
+fn alph_rx_down(r: AlphReactor*, i: int64) {
+  var k: int64 = i;
+  while (true) {
+    var l: int64 = 2 * k + 1;
+    var m: int64 = k;
+    if (l < r->heap_len && alph_rx_less(r, l, m)) {
+      m = l;
+    }
+    if (l + 1 < r->heap_len && alph_rx_less(r, l + 1, m)) {
+      m = l + 1;
+    }
+    if (m == k) {
+      return;
+    }
+    alph_rx_swap(r, k, m);
+    k = m;
+  }
+}
+
+// Takes slot i out of the heap and frees it.
+fn alph_rx_drop(r: AlphReactor*, slot: int64) {
+  var t: AlphRxTimer* = alph_rx_slot(r, slot);
+  var i: int64 = t->pos;
+  r->heap_len = r->heap_len - 1;
+  if (i != r->heap_len) {
+    var moved: int64 = alph_rx_heap_at(r, r->heap_len);
+    alph_rx_heap_put(r, i, moved);
+    alph_rx_up(r, i);
+    alph_rx_down(r, alph_rx_slot(r, moved)->pos);
+  }
+  t->pos = -1;
+  t->gen = t->gen + 1;
+  *(int64*)(r->free_list + r->free_top * 8) = slot;
+  r->free_top = r->free_top + 1;
+}
+
+// Doubles the timer table. Returns false when out of memory.
+fn alph_rx_grow(r: AlphReactor*) -> bool {
+  var cap: int64 = r->slot_cap * 2;
+  if (cap < 16) {
+    cap = 16;
+  }
+  var slots: int64 = (int64)realloc((rawptr)r->slots, cap * (int64)sizeof(AlphRxTimer));
+  if (slots == 0) {
+    return false;
+  }
+  r->slots = slots;
+  var heap: int64 = (int64)realloc((rawptr)r->heap, cap * 8);
+  if (heap == 0) {
+    return false;
+  }
+  r->heap = heap;
+  var fl: int64 = (int64)realloc((rawptr)r->free_list, cap * 8);
+  if (fl == 0) {
+    return false;
+  }
+  r->free_list = fl;
+  for i: int64 in r->slot_cap..cap {
+    var t: AlphRxTimer* = alph_rx_slot(r, i);
+    t->pos = -1;
+    t->gen = 1;
+    *(int64*)(r->free_list + r->free_top * 8) = cap - 1 - (i - r->slot_cap);
+    r->free_top = r->free_top + 1;
+  }
+  r->slot_cap = cap;
+  return true;
+}
+
+// Sets timerfd to fire at deadline (CLOCK_MONOTONIC ns), or disarms it for 0.
+fn alph_rx_arm_timerfd(r: AlphReactor*, deadline: int64) {
+  if (deadline == r->armed) {
+    return;
+  }
+  var spec: int64[4];
+  spec[0] = 0;
+  spec[1] = 0;
+  spec[2] = deadline / 1000000000;
+  spec[3] = deadline % 1000000000;
+  if (deadline == 0) {
+    spec[2] = 0;
+    spec[3] = 0;
+  }
+  syscall(ALPH_SYS_TIMERFD_SETTIME, r->timerfd, 1, (int64)&spec[0], 0);
+  r->armed = deadline;
+}
+
+// Starts a reactor. Returns false when the kernel refuses an epoll set, an
+// eventfd or a timerfd, or memory runs out. Thread: any, before use.
+export fn alph_rx_init(r: AlphReactor*) -> bool {
+  memset((rawptr)r, 0, (int64)sizeof(AlphReactor));
+  r->sigfd = -1;
+  r->epfd = alph_sys_epoll();
+  r->wakefd = alph_sys_eventfd();
+  r->timerfd = syscall(ALPH_SYS_TIMERFD_CREATE, ALPH_CLOCK_MONOTONIC, ALPH_O_NONBLOCK | ALPH_O_CLOEXEC);
+  r->buf = (int64)malloc(ALPH_RX_BATCH * 12);
+  if (r->epfd < 0 || r->wakefd < 0 || r->timerfd < 0 || r->buf == 0 || !alph_rx_grow(r)) {
+    alph_rx_free(r);
+    return false;
+  }
+  if (alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_ADD, r->wakefd, ALPH_EPOLLIN, ALPH_RX_TAG_WAKE) != 0 ||
+      alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_ADD, r->timerfd, ALPH_EPOLLIN, ALPH_RX_TAG_TIMER) != 0) {
+    alph_rx_free(r);
+    return false;
+  }
+  return true;
+}
+
+// Closes the reactor's own descriptors and frees its memory. The
+// descriptors it watched stay open; close them yourself. Thread: its owner.
+export fn alph_rx_free(r: AlphReactor*) {
+  if (r->epfd > 0) {
+    alph_sys_close(r->epfd);
+  }
+  if (r->wakefd > 0) {
+    alph_sys_close(r->wakefd);
+  }
+  if (r->timerfd > 0) {
+    alph_sys_close(r->timerfd);
+  }
+  if (r->sigfd > 0) {
+    alph_sys_close(r->sigfd);
+  }
+  free((rawptr)r->buf);
+  free((rawptr)r->slots);
+  free((rawptr)r->heap);
+  free((rawptr)r->free_list);
+  memset((rawptr)r, 0, (int64)sizeof(AlphReactor));
+  r->epfd = -1;
+  r->wakefd = -1;
+  r->timerfd = -1;
+  r->sigfd = -1;
+}
+
+fn alph_rx_bits(events: int64, mode: int64) -> int64 {
+  var bits: int64 = events & (ALPH_RX_READ | ALPH_RX_WRITE | ALPH_RX_PEER_CLOSED);
+  if (mode == ALPH_RX_ONESHOT) {
+    bits = bits | ALPH_EPOLLONESHOT;
+  } else if (mode == ALPH_RX_EDGE) {
+    bits = bits | ((int64)1 << 31);  // EPOLLET
+  }
+  return bits;
+}
+
+// Starts watching fd for events (ALPH_RX_READ, ALPH_RX_WRITE,
+// ALPH_RX_PEER_CLOSED; errors and hang-ups always come), armed by mode.
+// data comes back in each of its events and must not be negative. The fd
+// should be non-blocking (alph_sys_nonblock).
+//
+// Returns 0, or a negative errno: -17 when fd is already watched, -1 (EPERM)
+// for a regular file, which epoll cannot watch. Thread: its owner.
+export fn alph_rx_add(r: AlphReactor*, fd: int64, events: int64, mode: int64, data: int64) -> int64 {
+  return alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_ADD, fd, alph_rx_bits(events, mode), data);
+}
+
+// Changes what fd is watched for, its mode or its data; for a one-shot fd
+// this arms it again. Returns 0 or a negative errno. Thread: its owner.
+export fn alph_rx_modify(r: AlphReactor*, fd: int64, events: int64, mode: int64, data: int64) -> int64 {
+  return alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_MOD, fd, alph_rx_bits(events, mode), data);
+}
+
+// Stops watching fd; call it before closing fd. Returns 0 or a negative
+// errno. Thread: its owner.
+export fn alph_rx_remove(r: AlphReactor*, fd: int64) -> int64 {
+  return alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_DEL, fd, 0, 0);
+}
+
+// Starts a timer that fires once at deadline_ns (alph_now_ns time), with
+// data. Returns its id (above 0), to cancel it, or 0 when out of memory.
+// Thread: its owner.
+export fn alph_rx_timer_at(r: AlphReactor*, deadline_ns: int64, data: int64) -> int64 {
+  if (r->free_top == 0 && !alph_rx_grow(r)) {
+    return 0;
+  }
+  r->free_top = r->free_top - 1;
+  var slot: int64 = *(int64*)(r->free_list + r->free_top * 8);
+  var t: AlphRxTimer* = alph_rx_slot(r, slot);
+  t->deadline = deadline_ns;
+  t->data = data;
+  alph_rx_heap_put(r, r->heap_len, slot);
+  r->heap_len = r->heap_len + 1;
+  alph_rx_up(r, t->pos);
+  return (t->gen << 32) | (slot + 1);
+}
+
+// Starts a timer that fires once after after_ns nanoseconds. Otherwise as
+// alph_rx_timer_at. Thread: its owner.
+export fn alph_rx_timer(r: AlphReactor*, after_ns: int64, data: int64) -> int64 {
+  return alph_rx_timer_at(r, alph_now_ns() + after_ns, data);
+}
+
+// Cancels timer id. Returns false when it already fired or was cancelled.
+// Thread: its owner.
+export fn alph_rx_cancel(r: AlphReactor*, id: int64) -> bool {
+  var slot: int64 = (id & (((int64)1 << 32) - 1)) - 1;
+  if (slot < 0 || slot >= r->slot_cap) {
+    return false;
+  }
+  var t: AlphRxTimer* = alph_rx_slot(r, slot);
+  if (t->pos < 0 || t->gen != (id >> 32)) {
+    return false;
+  }
+  alph_rx_drop(r, slot);
+  return true;
+}
+
+// Cancels timer id as alph_rx_cancel, and stores its data in *data, so a
+// caller that keeps an allocation in the data can free it. Returns false,
+// leaving *data alone, when it already fired or was cancelled.
+// Thread: its owner.
+export fn alph_rx_cancel_data(r: AlphReactor*, id: int64, data: int64*) -> bool {
+  var slot: int64 = (id & (((int64)1 << 32) - 1)) - 1;
+  if (slot < 0 || slot >= r->slot_cap) {
+    return false;
+  }
+  var t: AlphRxTimer* = alph_rx_slot(r, slot);
+  if (t->pos < 0 || t->gen != (id >> 32)) {
+    return false;
+  }
+  *data = t->data;
+  alph_rx_drop(r, slot);
+  return true;
+}
+
+// Timers pending. Thread: its owner.
+export fn alph_rx_timers(r: AlphReactor*) -> int64 {
+  return r->heap_len;
+}
+
+// Wakes the reactor: its current or next alph_rx_wait returns an
+// ALPH_RX_WAKE event. Many wakes before a wait make one event.
+// Thread: any; this is the one call another thread may make.
+export fn alph_rx_wake(r: AlphReactor*) {
+  if (alph_atomic_cas(&r->woken, 0, 1) == 0) {
+    var one: int64 = 1;
+    alph_sys_write(r->wakefd, (rawptr)&one, 8);
+  }
+}
+
+// Delivers signals (a mask: bit n for signal n, such as (1 << 28) for
+// SIGWINCH) as ALPH_RX_SIGNAL events instead of handlers: they are blocked
+// for the calling thread, so call this before starting other threads, which
+// inherit the block. Returns false when the kernel refuses. Thread: its
+// owner.
+export fn alph_rx_signals(r: AlphReactor*, mask: int64) -> bool {
+  // The kernel's sigset numbers signal n as bit n - 1.
+  var set: int64 = mask >> 1;
+  if (syscall(ALPH_SYS_RT_SIGPROCMASK, 0, (int64)&set, 0, 8) != 0) {
+    return false;
+  }
+  var fd: int64 = syscall(ALPH_SYS_SIGNALFD4, r->sigfd, (int64)&set, 8, ALPH_O_NONBLOCK | ALPH_O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  if (r->sigfd < 0) {
+    r->sigfd = fd;
+    return alph_sys_epoll_ctl(r->epfd, ALPH_EPOLL_CTL_ADD, fd, ALPH_EPOLLIN, ALPH_RX_TAG_SIGNAL) == 0;
+  }
+  return true;
+}
+
+// Moves timers due by now into out, from index n, up to cap. Returns the
+// new count.
+fn alph_rx_fire(r: AlphReactor*, out: AlphRxEvent*, n: int64, cap: int64) -> int64 {
+  var k: int64 = n;
+  var now: int64 = alph_now_ns();
+  while (k < cap && r->heap_len > 0) {
+    var slot: int64 = alph_rx_heap_at(r, 0);
+    var t: AlphRxTimer* = alph_rx_slot(r, slot);
+    if (t->deadline > now) {
+      break;
+    }
+    out[k].kind = ALPH_RX_TIMER;
+    out[k].data = t->data;
+    out[k].events = (t->gen << 32) | (slot + 1);
+    k = k + 1;
+    alph_rx_drop(r, slot);
+  }
+  return k;
+}
+
+// Waits until something happens or timeout_ns passes (-1: no limit; 0:
+// just look), then fills out with up to cap events: ready fds, timers that
+// came due, a wake, signals. Timers fire with nanosecond precision, not
+// epoll's milliseconds: the wait itself takes the deadline (epoll_pwait2,
+// with the calling thread's timer slack set to 1 ns on its first wait), or
+// on kernels before 5.11 the timerfd is armed for it. Returns how many events, 0 on a
+// timeout, or a negative errno (-4 when a signal handler interrupted the
+// wait and there was nothing to report). Thread: its owner.
+export fn alph_rx_wait(r: AlphReactor*, out: AlphRxEvent*, cap: int64, timeout_ns: int64) -> int64 {
+  if (cap <= 0) {
+    return 0;
+  }
+  var n: int64 = alph_rx_fire(r, out, 0, cap);
+  var timeout: int64 = timeout_ns;
+  if (n > 0) {
+    timeout = 0;  // something to report already: only look
+  }
+  // The timerfd covers the earliest timer, and a sub-millisecond timeout.
+  var deadline: int64 = 0;
+  if (r->heap_len > 0) {
+    deadline = alph_rx_slot(r, alph_rx_heap_at(r, 0))->deadline;
+  }
+  var room: int64 = cap - n;
+  if (room == 0) {
+    return n;  // out is full of due timers; epoll_wait refuses a room of 0
+  }
+  if (room > ALPH_RX_BATCH) {
+    room = ALPH_RX_BATCH;
+  }
+  if (r->pwait2 == 0) {
+    // A sleeping hrtimer is late by the thread's timer slack, 50 us by
+    // default; the timerfd never was.
+    syscall(ALPH_SYS_PRCTL, ALPH_PR_SET_TIMERSLACK, 1, 0, 0, 0);
+    r->pwait2 = 1;
+  }
+  var got: int64 = -38;
+  if (r->pwait2 > 0) {
+    // The deadline goes into the wait: no timerfd to set and reset.
+    var wait_ns: int64 = -1;
+    if (timeout == 0) {
+      wait_ns = 0;
+    } else if (timeout > 0 || deadline != 0) {
+      var now: int64 = alph_now_ns();
+      if (timeout > 0 && (deadline == 0 || now + timeout < deadline)) {
+        deadline = now + timeout;
+      }
+      wait_ns = deadline - now;
+      if (wait_ns < 0) {
+        wait_ns = 0;
+      }
+    }
+    if (r->armed != 0) {
+      alph_rx_arm_timerfd(r, 0);
+    }
+    got = alph_sys_epoll_wait_ns(r->epfd, (rawptr)r->buf, room, wait_ns);
+    if (got == -38) {
+      r->pwait2 = -1;
+    }
+  }
+  if (got == -38 && r->pwait2 < 0) {
+    var wait_ms: int64 = -1;
+    if (timeout == 0) {
+      wait_ms = 0;
+    } else if (timeout > 0) {
+      var until: int64 = alph_now_ns() + timeout;
+      if (deadline == 0 || until < deadline) {
+        deadline = until;
+      }
+    }
+    alph_rx_arm_timerfd(r, deadline);
+    got = alph_sys_epoll_wait(r->epfd, (rawptr)r->buf, room, wait_ms);
+  }
+  if (got < 0) {
+    // Timers already taken from the heap are in out: report them rather
+    // than lose them to an interrupted wait.
+    if (n > 0) {
+      return n;
+    }
+    return got;
+  }
+  var signals: bool = false;
+  for i: int64 in 0..got {
+    var data: int64 = alph_sys_event_data((rawptr)r->buf, i);
+    if (data == ALPH_RX_TAG_WAKE) {
+      var drained: int64 = 0;
+      alph_sys_read(r->wakefd, (rawptr)&drained, 8);
+      alph_atomic_store(&r->woken, 0);
+      out[n].kind = ALPH_RX_WAKE;
+      out[n].data = 0;
+      out[n].events = 0;
+      n = n + 1;
+    } else if (data == ALPH_RX_TAG_TIMER) {
+      var ticks: int64 = 0;
+      alph_sys_read(r->timerfd, (rawptr)&ticks, 8);
+      r->armed = 0;  // it fired, so it is disarmed
+    } else if (data == ALPH_RX_TAG_SIGNAL) {
+      signals = true;
+    } else {
+      out[n].kind = ALPH_RX_FD;
+      out[n].data = data;
+      out[n].events = alph_sys_event_mask((rawptr)r->buf, i);
+      n = n + 1;
+    }
+  }
+  // Each signalfd_siginfo is 128 bytes; the number is its first 4.
+  while (signals && n < cap) {
+    var info: uint8[128];
+    if (alph_sys_read(r->sigfd, (rawptr)&info[0], 128) != 128) {
+      break;
+    }
+    out[n].kind = ALPH_RX_SIGNAL;
+    out[n].data = (int64)*(uint32*)&info[0];
+    out[n].events = 0;
+    n = n + 1;
+  }
+  return alph_rx_fire(r, out, n, cap);
+}

@@ -1,0 +1,288 @@
+// raize/signal/inst — Signal definitions, live instances, and pushes.
+//
+// An instance is one connected page: its state, its last rendered tree, and
+// the socket it lives on. Everything here runs on the hub thread except
+// rz_signal_publish, which copies its arguments and hands them to the hub.
+//
+// Pushes are ordinary messages. A Signal's message enum carries the events
+// from the page *and* the events from the server (`Tick(int32)`), and both go
+// through the same update():
+//
+//   fn todos_mount(s: Todos*) {
+//     rz_signal_subscribe("todos:nudges");          // this page, this topic
+//   }
+//   TodosMsg__publish("todos:nudges", Nudged(1));   // any thread
+//
+// Every instance is also subscribed to its Signal's name, so
+// `TodosMsg__publish("todos", Tick(n))` reaches every open todos page.
+// Delivery decodes the message, runs update and view, and pushes the diff as
+// a "diff" event: [join_ref, null, "signal:<name>", "diff", {"diff": ...}].
+// A message an instance cannot decode (another Signal's enum on a shared
+// topic) is ignored.
+//
+// Subscriptions belong to the running instance (rz_signal_subscribe works in
+// mount and update), the way a process subscribes itself in Phoenix. The
+// first-GET render has no instance, so subscribing there does nothing.
+
+import "std/mem";
+import "std/thread";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_realtime/hub/hub";
+import "raize_realtime/channel/channel";
+import "html";
+import "render";
+
+export const RZ_SIGNAL_MAX: int32 = 32;
+export const RZ_SIGNAL_MAX_SUBS: int64 = 16;
+
+// State pointers are erased to rawptr here; NameMsg__signal checked the real
+// types when the app registered the Signal.
+export struct RzSignalDef {
+  name: string;
+  size: int64;
+  mount: fn(rawptr) -> void;                     // 1-arg form (rz_signal_define_raw); or 0
+  mount_conn: fn(rawptr, RzConn*) -> int32;      // 2-arg form (rz__signal_define); or 0
+  path: string;    // the page path its sockets must be opened for; "" = any (borrowed)
+  handle: fn(rawptr, string, string) -> int32;   // decode + update
+  view: fn(rawptr) -> RzHtml*;
+  leave: fn(rawptr) -> void;
+}
+
+export struct RzSignalInst {
+  def: RzSignalDef*;
+  state: rawptr;
+  last: RzHtml*;
+  sock: int64;
+  topic: string;          // owned: "signal:<name>"
+  join_ref: string;       // owned raw JSON
+  subs: RzStrList*;    // owned topic names
+}
+
+// Written while the app starts (before the server runs), read-only after.
+var g_rz_signals: RzSignalDef* = 0;
+var g_rz_signal_count: int32 = 0;
+var g_rz_signal_hub: RzHub* = 0;
+// Hub thread only.
+var g_rz_signal_insts: RzSignalInst** = 0;
+var g_rz_signal_ninst: int32 = 0;
+var g_rz_signal_cap: int32 = 0;
+var g_rz_signal_current: RzSignalInst* = 0;
+var g_rz_signal_current_tid: uint32 = 0;     // the thread that set it
+var g_rz_signal_arena: RzArena* = 0;
+
+// True once any Signal is defined.
+export fn rz_signal_find_any() -> bool {
+  return g_rz_signal_count > 0;
+}
+
+export fn rz_signal_find(name: string) -> RzSignalDef* {
+  var i: int32 = 0;
+  while (i < g_rz_signal_count) {
+    if (rz_str_eq(g_rz_signals[i].name, name)) { return &g_rz_signals[i]; }
+    i = i + 1;
+  }
+  return 0;
+}
+
+// Adds a definition; the caller defines the channel on the first one.
+export fn rz_signal_add_def(hub: RzHub*, name: string, size: int64, mount: fn(rawptr) -> void, handle: fn(rawptr, string, string) -> int32, view: fn(rawptr) -> RzHtml*, leave: fn(rawptr) -> void) -> int32 {
+  if (g_rz_signals == 0) {
+    g_rz_signals = (RzSignalDef*)calloc((int64)RZ_SIGNAL_MAX, sizeof(RzSignalDef));
+    if (g_rz_signals == 0) { return -1; }
+  }
+  if (g_rz_signal_count >= RZ_SIGNAL_MAX) { return -1; }
+  g_rz_signal_hub = hub;
+  var d: RzSignalDef* = &g_rz_signals[g_rz_signal_count];
+  d->name = name;
+  d->size = size;
+  d->mount = mount;
+  d->handle = handle;
+  d->view = view;
+  d->leave = leave;
+  g_rz_signal_count = g_rz_signal_count + 1;
+  return 0;
+}
+
+export fn rz_signal_arena() -> RzArena* {
+  if (g_rz_signal_arena == 0) { g_rz_signal_arena = rz_arena_new(); }
+  return g_rz_signal_arena;
+}
+
+// ---- instances ------------------------------------------------------------
+
+export fn rz_signal_inst_new(def: RzSignalDef*, ctx: RzChanCtx*) -> RzSignalInst* {
+  var inst: RzSignalInst* = (RzSignalInst*)calloc(1, sizeof(RzSignalInst));
+  if (inst == 0) { return 0; }
+  inst->state = calloc(1, def->size);
+  if (inst->state == 0) {
+    free((rawptr)inst);
+    return 0;
+  }
+  if (g_rz_signal_ninst == g_rz_signal_cap) {
+    var nc: int32 = g_rz_signal_cap * 2;
+    if (nc < 16) { nc = 16; }
+    var grown: RzSignalInst** = (RzSignalInst**)realloc((rawptr)g_rz_signal_insts, (int64)nc * 8);
+    if (grown == 0) {
+      free(inst->state);
+      free((rawptr)inst);
+      return 0;
+    }
+    g_rz_signal_insts = grown;
+    g_rz_signal_cap = nc;
+  }
+  g_rz_signal_insts[g_rz_signal_ninst] = inst;
+  g_rz_signal_ninst = g_rz_signal_ninst + 1;
+  inst->def = def;
+  inst->sock = ctx->sock;
+  inst->topic = rz_str_dup(ctx->topic);
+  inst->join_ref = rz_str_dup(ctx->join_ref);
+  inst->subs = rz_strlist_new();
+  return inst;
+}
+
+export fn rz_signal_inst_free(inst: RzSignalInst*) {
+  if (inst == 0) { return; }
+  var i: int32 = 0;
+  while (i < g_rz_signal_ninst) {
+    if (g_rz_signal_insts[i] == inst) {
+      g_rz_signal_insts[i] = g_rz_signal_insts[g_rz_signal_ninst - 1];
+      g_rz_signal_ninst = g_rz_signal_ninst - 1;
+      break;
+    }
+    i = i + 1;
+  }
+  if (g_rz_signal_current == inst) { g_rz_signal_current = 0; }
+  inst->def->leave(inst->state);
+  rz_html_free(inst->last);
+  free(inst->state);
+  var k: int64 = 0;
+  while (k < inst->subs->len) {
+    rz_str_free(inst->subs->items[k]);
+    k = k + 1;
+  }
+  rz_strlist_free(inst->subs);
+  rz_str_free(inst->topic);
+  rz_str_free(inst->join_ref);
+  free((rawptr)inst);
+}
+
+// The instance whose mount/update is running (0 outside one).
+export fn rz_signal_set_current(inst: RzSignalInst*) {
+  g_rz_signal_current = inst;
+  g_rz_signal_current_tid = GetCurrentThreadId();
+}
+
+// The running instance, but only on the thread running it: the first-GET
+// render runs mount on an HTTP worker, which must not see (or subscribe) the
+// instance the hub thread happens to be updating at that moment.
+fn rz_signal_running() -> RzSignalInst* {
+  var inst: RzSignalInst* = g_rz_signal_current;
+  if (inst == 0 || g_rz_signal_current_tid != GetCurrentThreadId()) { return 0; }
+  return inst;
+}
+
+// Number of connected Signal pages (hub thread).
+export fn rz_signal_live_count() -> int32 {
+  return g_rz_signal_ninst;
+}
+
+// Subscribes the running instance to `topic`. Call from mount or update.
+export fn rz_signal_subscribe(topic: string) {
+  var inst: RzSignalInst* = rz_signal_running();
+  if (inst == 0 || topic.length == 0) { return; }
+  var k: int64 = 0;
+  while (k < inst->subs->len) {
+    if (rz_str_eq(inst->subs->items[k], topic)) { return; }
+    k = k + 1;
+  }
+  if (inst->subs->len >= RZ_SIGNAL_MAX_SUBS) { return; }
+  rz_strlist_push(inst->subs, rz_str_dup(topic));
+}
+
+fn rz_signal_listens(inst: RzSignalInst*, topic: string) -> bool {
+  if (rz_str_eq(inst->def->name, topic)) { return true; }
+  var k: int64 = 0;
+  while (k < inst->subs->len) {
+    if (rz_str_eq(inst->subs->items[k], topic)) { return true; }
+    k = k + 1;
+  }
+  return false;
+}
+
+// Applies one message, ["Variant", value?], to an instance: decode, update,
+// view, and append {"diff": ...} to `out`. Returns 0, 1 for a malformed
+// message, 2 for one this Signal's enum does not have. `changed` is set when
+// the diff is not empty.
+export fn rz_signal_apply(inst: RzSignalInst*, msg: string, out: RzBuf*, changed: bool*) -> int32 {
+  rz_arena_reset(rz_signal_arena());
+  var name_raw: string = rz_str_empty();
+  var value: string = rz_str_empty();
+  var name: string = rz_str_empty();
+  if (!rz_json_array_at(msg, 0, &name_raw)) { return 1; }
+  if (name_raw.length < 2 || name_raw.chars[0] != 34) { return 1; }
+  name = rz_json_unescape(rz_str_sub(name_raw, 1, (int64)name_raw.length - 1), rz_signal_arena());
+  rz_json_array_at(msg, 1, &value);
+  rz_signal_set_current(inst);
+  var rc: int32 = inst->def->handle(inst->state, name, value);
+  rz_signal_set_current(0);
+  if (rc != 0) { return 2; }
+  var next: RzHtml* = inst->def->view(inst->state);
+  rz_buf_add(out, "{{\"diff\":");
+  *changed = rz_html_diff(inst->last, next, out);
+  if (!*changed) { rz_buf_add(out, "{{}"); }
+  rz_buf_add_byte(out, 125);
+  rz_html_free(inst->last);
+  inst->last = next;
+  return 0;
+}
+
+// ---- publish / deliver ----------------------------------------------------
+
+struct RzSignalPub {
+  topic: string;
+  msg: string;
+}
+
+fn rz_signal_deliver(hub: RzHub*, arg: rawptr) {
+  var p: RzSignalPub* = (RzSignalPub*)arg;
+  if (hub != 0) {
+    var payload: RzBuf* = rz_buf_new();
+    var frame: RzBuf* = rz_buf_new();
+    var i: int32 = 0;
+    while (i < g_rz_signal_ninst) {
+      var inst: RzSignalInst* = g_rz_signal_insts[i];
+      if (rz_signal_listens(inst, p->topic)) {
+        payload->len = 0;
+        var changed: bool = false;
+        if (rz_signal_apply(inst, p->msg, payload, &changed) == 0 && changed) {
+          frame->len = 0;
+          rz_chan_encode(frame, inst->join_ref, "", inst->topic, "diff", rz_buf_str(payload));
+          rz_hub_send(hub, inst->sock, rz_buf_str(frame));
+        }
+      }
+      i = i + 1;
+    }
+    rz_buf_free(payload);
+    rz_buf_free(frame);
+  }
+  rz_str_free(p->topic);
+  rz_str_free(p->msg);
+  free((rawptr)p);
+}
+
+// Sends an encoded message (["Variant", value]) to every instance listening
+// on `topic`. Any thread. Use the generated NameMsg__publish instead of
+// calling this directly. Returns false when the hub's mailbox is full.
+export fn rz_signal_publish(topic: string, msg: string) -> bool {
+  if (g_rz_signal_hub == 0) { return false; }
+  var p: RzSignalPub* = (RzSignalPub*)calloc(1, sizeof(RzSignalPub));
+  if (p == 0) { return false; }
+  p->topic = rz_str_dup(topic);
+  p->msg = rz_str_dup(msg);
+  if (!rz_hub_post_call(g_rz_signal_hub, &rz_signal_deliver, (rawptr)p)) {
+    rz_signal_deliver(0, (rawptr)p);
+    return false;
+  }
+  return true;
+}

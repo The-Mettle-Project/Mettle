@@ -1,0 +1,281 @@
+// Bounds-checked reading and writing of wire formats.
+//
+// A reader or writer that runs past its end becomes "bad" and stays bad:
+// later reads return zero and later writes do nothing. Check `bad` once
+// after a whole message instead of after every field. A sub-reader that
+// fails is empty and bad, and marks its parent bad too, so a parser can
+// never index outside the bytes it was given.
+
+import "std/mem";
+
+export struct MtlsRd {
+  p: uint8*;
+  n: int64;
+  pos: int64;
+  bad: bool;
+}
+
+export struct MtlsWr {
+  p: uint8*;
+  cap: int64;
+  len: int64;
+  bad: bool;
+}
+
+var g_mtls_zero: uint8[8];
+
+/// mtls_rd: a reader over n bytes at p.
+export fn mtls_rd(p: uint8*, n: int64) -> MtlsRd {
+  var r: MtlsRd;
+  r.p = p;
+  r.n = n;
+  r.pos = 0;
+  r.bad = false;
+  if (p == 0 || n < 0) {
+    r.p = &g_mtls_zero[0];
+    r.n = 0;
+    r.bad = n != 0;
+  }
+  return r;
+}
+
+/// mtls_rd_left: bytes not read yet (0 once bad).
+export fn mtls_rd_left(r: MtlsRd*) -> int64 {
+  if (r->bad) { return 0; }
+  return r->n - r->pos;
+}
+
+/// mtls_rd_ok_end: true when every byte was read and nothing went wrong.
+export fn mtls_rd_ok_end(r: MtlsRd*) -> bool {
+  return !r->bad && r->pos == r->n;
+}
+
+/// mtls_rd_cur: pointer to the next unread byte (always valid to form).
+export fn mtls_rd_cur(r: MtlsRd*) -> uint8* {
+  return r->p + r->pos;
+}
+
+fn mtls_rd_need(r: MtlsRd*, k: int64) -> bool {
+  if (r->bad) { return false; }
+  if (k < 0 || r->n - r->pos < k) {
+    r->bad = true;
+    return false;
+  }
+  return true;
+}
+
+export fn mtls_rd_u8(r: MtlsRd*) -> int32 {
+  if (!mtls_rd_need(r, 1)) { return 0; }
+  var v: int32 = (int32)r->p[r->pos];
+  r->pos = r->pos + 1;
+  return v;
+}
+
+export fn mtls_rd_u16(r: MtlsRd*) -> int32 {
+  if (!mtls_rd_need(r, 2)) { return 0; }
+  var v: int32 = ((int32)r->p[r->pos] << 8) | (int32)r->p[r->pos + 1];
+  r->pos = r->pos + 2;
+  return v;
+}
+
+export fn mtls_rd_u24(r: MtlsRd*) -> int32 {
+  if (!mtls_rd_need(r, 3)) { return 0; }
+  var v: int32 = ((int32)r->p[r->pos] << 16) | ((int32)r->p[r->pos + 1] << 8) | (int32)r->p[r->pos + 2];
+  r->pos = r->pos + 3;
+  return v;
+}
+
+export fn mtls_rd_u32(r: MtlsRd*) -> int64 {
+  if (!mtls_rd_need(r, 4)) { return 0; }
+  var v: int64 = ((int64)r->p[r->pos] << 24) | ((int64)r->p[r->pos + 1] << 16) | ((int64)r->p[r->pos + 2] << 8) | (int64)r->p[r->pos + 3];
+  r->pos = r->pos + 4;
+  return v;
+}
+
+export fn mtls_rd_u64(r: MtlsRd*) -> uint64 {
+  var hi: int64 = mtls_rd_u32(r);
+  var lo: int64 = mtls_rd_u32(r);
+  return ((uint64)hi << 32) | (uint64)lo;
+}
+
+/// mtls_rd_sub: the next k bytes as their own reader.
+export fn mtls_rd_sub(r: MtlsRd*, k: int64) -> MtlsRd {
+  var s: MtlsRd;
+  s.p = &g_mtls_zero[0];
+  s.n = 0;
+  s.pos = 0;
+  s.bad = true;
+  if (!mtls_rd_need(r, k)) { return s; }
+  s.p = r->p + r->pos;
+  s.n = k;
+  s.bad = false;
+  r->pos = r->pos + k;
+  return s;
+}
+
+export fn mtls_rd_skip(r: MtlsRd*, k: int64) {
+  if (mtls_rd_need(r, k)) { r->pos = r->pos + k; }
+}
+
+/// mtls_rd_copy: copies k bytes to dst, or zero-fills dst if they are not there.
+export fn mtls_rd_copy(r: MtlsRd*, dst: uint8*, k: int64) {
+  if (!mtls_rd_need(r, k)) {
+    if (k > 0) { memset(dst, 0, k); }
+    return;
+  }
+  if (k > 0) { memcpy(dst, r->p + r->pos, k); }
+  r->pos = r->pos + k;
+}
+
+/// mtls_rd_vec8 / 16 / 24: a vector with a 1, 2 or 3 byte length prefix.
+export fn mtls_rd_vec8(r: MtlsRd*) -> MtlsRd {
+  var k: int32 = mtls_rd_u8(r);
+  return mtls_rd_sub(r, (int64)k);
+}
+
+export fn mtls_rd_vec16(r: MtlsRd*) -> MtlsRd {
+  var k: int32 = mtls_rd_u16(r);
+  return mtls_rd_sub(r, (int64)k);
+}
+
+export fn mtls_rd_vec24(r: MtlsRd*) -> MtlsRd {
+  var k: int32 = mtls_rd_u24(r);
+  return mtls_rd_sub(r, (int64)k);
+}
+
+/// mtls_wr: a writer into cap bytes at p.
+export fn mtls_wr(p: uint8*, cap: int64) -> MtlsWr {
+  var w: MtlsWr;
+  w.p = p;
+  w.cap = cap;
+  w.len = 0;
+  w.bad = p == 0 || cap < 0;
+  if (w.bad) { w.cap = 0; }
+  return w;
+}
+
+fn mtls_wr_need(w: MtlsWr*, k: int64) -> bool {
+  if (w->bad) { return false; }
+  if (k < 0 || w->cap - w->len < k) {
+    w->bad = true;
+    return false;
+  }
+  return true;
+}
+
+export fn mtls_wr_u8(w: MtlsWr*, v: int64) {
+  if (!mtls_wr_need(w, 1)) { return; }
+  w->p[w->len] = (uint8)(v & 255);
+  w->len = w->len + 1;
+}
+
+export fn mtls_wr_u16(w: MtlsWr*, v: int64) {
+  if (!mtls_wr_need(w, 2)) { return; }
+  w->p[w->len] = (uint8)((v >> 8) & 255);
+  w->p[w->len + 1] = (uint8)(v & 255);
+  w->len = w->len + 2;
+}
+
+export fn mtls_wr_u24(w: MtlsWr*, v: int64) {
+  if (!mtls_wr_need(w, 3)) { return; }
+  w->p[w->len] = (uint8)((v >> 16) & 255);
+  w->p[w->len + 1] = (uint8)((v >> 8) & 255);
+  w->p[w->len + 2] = (uint8)(v & 255);
+  w->len = w->len + 3;
+}
+
+export fn mtls_wr_u32(w: MtlsWr*, v: int64) {
+  mtls_wr_u16(w, (v >> 16) & 65535);
+  mtls_wr_u16(w, v & 65535);
+}
+
+export fn mtls_wr_u64(w: MtlsWr*, v: uint64) {
+  mtls_wr_u32(w, (int64)(v >> 32));
+  mtls_wr_u32(w, (int64)(v & (uint64)0xffffffff));
+}
+
+export fn mtls_wr_bytes(w: MtlsWr*, src: uint8*, k: int64) {
+  if (!mtls_wr_need(w, k)) { return; }
+  if (k > 0) { memcpy(w->p + w->len, src, k); }
+  w->len = w->len + k;
+}
+
+export fn mtls_wr_str(w: MtlsWr*, s: string) {
+  mtls_wr_bytes(w, s.chars, (int64)s.length);
+}
+
+export fn mtls_wr_zeros(w: MtlsWr*, k: int64) {
+  if (!mtls_wr_need(w, k)) { return; }
+  if (k > 0) { memset(w->p + w->len, 0, k); }
+  w->len = w->len + k;
+}
+
+/// mtls_wr_open8 / 16 / 24: reserve a length prefix; returns a mark for
+/// the matching close, which fills in the length of what came between.
+export fn mtls_wr_open8(w: MtlsWr*) -> int64 {
+  var m: int64 = w->len;
+  mtls_wr_u8(w, 0);
+  return m;
+}
+
+export fn mtls_wr_open16(w: MtlsWr*) -> int64 {
+  var m: int64 = w->len;
+  mtls_wr_u16(w, 0);
+  return m;
+}
+
+export fn mtls_wr_open24(w: MtlsWr*) -> int64 {
+  var m: int64 = w->len;
+  mtls_wr_u24(w, 0);
+  return m;
+}
+
+export fn mtls_wr_close8(w: MtlsWr*, m: int64) {
+  if (w->bad) { return; }
+  var k: int64 = w->len - m - 1;
+  if (k > 255) { w->bad = true; return; }
+  w->p[m] = (uint8)k;
+}
+
+export fn mtls_wr_close16(w: MtlsWr*, m: int64) {
+  if (w->bad) { return; }
+  var k: int64 = w->len - m - 2;
+  if (k > 65535) { w->bad = true; return; }
+  w->p[m] = (uint8)(k >> 8);
+  w->p[m + 1] = (uint8)(k & 255);
+}
+
+export fn mtls_wr_close24(w: MtlsWr*, m: int64) {
+  if (w->bad) { return; }
+  var k: int64 = w->len - m - 3;
+  if (k > 16777215) { w->bad = true; return; }
+  w->p[m] = (uint8)(k >> 16);
+  w->p[m + 1] = (uint8)((k >> 8) & 255);
+  w->p[m + 2] = (uint8)(k & 255);
+}
+
+/// mtls_load16 / 24 / store16: big-endian helpers for fixed buffers.
+export fn mtls_load16(p: uint8*) -> int32 {
+  return ((int32)p[0] << 8) | (int32)p[1];
+}
+
+export fn mtls_load24(p: uint8*) -> int32 {
+  return ((int32)p[0] << 16) | ((int32)p[1] << 8) | (int32)p[2];
+}
+
+export fn mtls_store16(p: uint8*, v: int64) {
+  p[0] = (uint8)((v >> 8) & 255);
+  p[1] = (uint8)(v & 255);
+}
+
+/// mtls_bytes_eq: plain (not constant-time) byte comparison for public data.
+export fn mtls_bytes_eq(a: uint8*, an: int64, b: uint8*, bn: int64) -> bool {
+  if (an != bn) { return false; }
+  if (an == 0) { return true; }
+  return memcmp(a, b, an) == 0;
+}
+
+/// mtls_str_eq_bytes: compares a string with a byte range.
+export fn mtls_str_eq_bytes(s: string, p: uint8*, n: int64) -> bool {
+  return mtls_bytes_eq(s.chars, (int64)s.length, p, n);
+}

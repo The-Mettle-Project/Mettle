@@ -1,0 +1,379 @@
+// Custom metadata: the key-value pairs a call sends and receives as
+// HTTP/2 headers and trailers (doc/PROTOCOL-HTTP2.md, "Custom-Metadata").
+//
+// Keys are lowercase [0-9a-z_.-]. A key ending in "-bin" holds any bytes,
+// which travel base64-encoded; the API here always holds the raw bytes.
+// Other values are printable ASCII (0x20..0x7E). Every string added is
+// copied into the arena the list was made with.
+import "std/mem";
+import "grpc/arena";
+import "std/hpack";
+
+export const GRPC_MD_OK = 0;
+export const GRPC_MD_E_KEY = -1;       // empty key or a byte outside [0-9a-z_.-]
+export const GRPC_MD_E_VALUE = -2;     // a non-binary value with a byte outside 0x20..0x7E
+export const GRPC_MD_E_RESERVED = -3;  // a key the library owns (grpc-*, pseudo-headers...)
+export const GRPC_MD_E_BASE64 = -4;    // a -bin value that is not base64
+
+export struct GrpcMdEntry {
+  key: string;
+  value: string;
+}
+
+export struct GrpcMetadata {
+  items: GrpcMdEntry*;
+  count: int64;
+  cap: int64;
+  arena: GrpcArena*;
+}
+
+export fn grpc_md_init(md: GrpcMetadata*, arena: GrpcArena*) {
+  md->items = (GrpcMdEntry*)0;
+  md->count = 0;
+  md->cap = 0;
+  md->arena = arena;
+}
+
+export fn grpc_md_clear(md: GrpcMetadata*) {
+  md->count = 0;
+}
+
+fn lower(c: uint8) -> uint8 {
+  if (c >= 65 && c <= 90) { return c + 32; }
+  return c;
+}
+
+fn key_byte_ok(c: uint8) -> bool {
+  return (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || c == 95 || c == 46 || c == 45;
+}
+
+// True if key (any case) is a valid metadata key.
+export fn grpc_md_key_valid(key: string) -> bool {
+  if (key.length == 0) { return false; }
+  for i in 0..(int64)key.length {
+    if (!key_byte_ok(lower(key.chars[i]))) { return false; }
+  }
+  return true;
+}
+
+// True if v may be sent as a non-binary value.
+export fn grpc_md_value_valid(v: string) -> bool {
+  for i in 0..(int64)v.length {
+    var c: uint8 = v.chars[i];
+    if (c < 32 || c > 126) { return false; }
+  }
+  return true;
+}
+
+fn ends_with(s: string, tail: string) -> bool {
+  if (s.length < tail.length) { return false; }
+  var off: int64 = (int64)s.length - (int64)tail.length;
+  for i in 0..(int64)tail.length {
+    if (lower(s.chars[off + i]) != tail.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn starts_with(s: string, head: string) -> bool {
+  if (s.length < head.length) { return false; }
+  for i in 0..(int64)head.length {
+    if (lower(s.chars[i]) != head.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn eq_nocase(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  for i in 0..(int64)a.length {
+    if (lower(a.chars[i]) != lower(b.chars[i])) { return false; }
+  }
+  return true;
+}
+
+export fn grpc_md_is_bin(key: string) -> bool {
+  return ends_with(key, "-bin");
+}
+
+// Keys the library writes itself and an application may not set: all
+// grpc-* keys, pseudo-headers, and the HTTP/2 headers gRPC defines.
+export fn grpc_md_is_reserved(key: string) -> bool {
+  if (key.length > 0 && key.chars[0] == 58) { return true; }
+  if (starts_with(key, "grpc-")) { return true; }
+  return eq_nocase(key, "content-type") || eq_nocase(key, "te") ||
+    eq_nocase(key, "connection") || eq_nocase(key, "keep-alive") ||
+    eq_nocase(key, "proxy-connection") || eq_nocase(key, "transfer-encoding") ||
+    eq_nocase(key, "upgrade") || eq_nocase(key, "host");
+}
+
+fn copy_in(a: GrpcArena*, s: string, lowercase: bool) -> string {
+  var r: string;
+  if (s.length == 0) { return r; }
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)s.length);
+  for i in 0..(int64)s.length {
+    if (lowercase) { p[i] = lower(s.chars[i]); } else { p[i] = s.chars[i]; }
+  }
+  r.chars = p;
+  r.length = s.length;
+  return r;
+}
+
+fn push(md: GrpcMetadata*, key: string, value: string) {
+  if (md->count == md->cap) {
+    var ncap: int64 = md->cap * 2;
+    if (ncap < 8) { ncap = 8; }
+    var n: GrpcMdEntry* = (GrpcMdEntry*)grpc_arena_alloc(md->arena, ncap * sizeof(GrpcMdEntry));
+    for i in 0..md->count { n[i] = md->items[i]; }
+    md->items = n;
+    md->cap = ncap;
+  }
+  var e: GrpcMdEntry;
+  e.key = key;
+  e.value = value;
+  md->items[md->count] = e;
+  md->count = md->count + 1;
+}
+
+// Adds a pair without the reserved-key check; the library uses it for the
+// headers it reads off the wire.
+fn add_any(md: GrpcMetadata*, key: string, value: string) -> int32 {
+  if (!grpc_md_key_valid(key)) { return GRPC_MD_E_KEY; }
+  if (!grpc_md_is_bin(key) && !grpc_md_value_valid(value)) { return GRPC_MD_E_VALUE; }
+  push(md, copy_in(md->arena, key, true), copy_in(md->arena, value, false));
+  return GRPC_MD_OK;
+}
+
+// Adds a pair. For a -bin key, value is the raw bytes. Keys may repeat.
+export fn grpc_md_add(md: GrpcMetadata*, key: string, value: string) -> int32 {
+  if (grpc_md_is_reserved(key)) { return GRPC_MD_E_RESERVED; }
+  return add_any(md, key, value);
+}
+
+// The first value for key, or false.
+export fn grpc_md_get(md: GrpcMetadata*, key: string, out: string*) -> bool {
+  for i in 0..md->count {
+    if (eq_nocase(md->items[i].key, key)) {
+      *out = md->items[i].value;
+      return true;
+    }
+  }
+  return false;
+}
+
+// How many values key has.
+export fn grpc_md_count(md: GrpcMetadata*, key: string) -> int64 {
+  var n: int64 = 0;
+  for i in 0..md->count {
+    if (eq_nocase(md->items[i].key, key)) { n = n + 1; }
+  }
+  return n;
+}
+
+// The k-th value (0-based) for key, or false.
+export fn grpc_md_get_nth(md: GrpcMetadata*, key: string, k: int64, out: string*) -> bool {
+  var n: int64 = 0;
+  for i in 0..md->count {
+    if (eq_nocase(md->items[i].key, key)) {
+      if (n == k) {
+        *out = md->items[i].value;
+        return true;
+      }
+      n = n + 1;
+    }
+  }
+  return false;
+}
+
+// Removes every value for key; returns how many went.
+export fn grpc_md_remove(md: GrpcMetadata*, key: string) -> int64 {
+  var w: int64 = 0;
+  for i in 0..md->count {
+    if (!eq_nocase(md->items[i].key, key)) {
+      md->items[w] = md->items[i];
+      w = w + 1;
+    }
+  }
+  var gone: int64 = md->count - w;
+  md->count = w;
+  return gone;
+}
+
+// Replaces every value for key with one value.
+export fn grpc_md_set(md: GrpcMetadata*, key: string, value: string) -> int32 {
+  if (grpc_md_is_reserved(key)) { return GRPC_MD_E_RESERVED; }
+  grpc_md_remove(md, key);
+  return add_any(md, key, value);
+}
+
+// Copies every pair of src onto the end of dst.
+export fn grpc_md_append(dst: GrpcMetadata*, src: GrpcMetadata*) {
+  for i in 0..src->count {
+    push(dst, copy_in(dst->arena, src->items[i].key, false), copy_in(dst->arena, src->items[i].value, false));
+  }
+}
+
+// ---- base64 (RFC 4648), padded or not ---------------------------------------
+
+const B64: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Length of the unpadded base64 form of n bytes.
+export fn grpc_b64_len(n: int64) -> int64 {
+  return (n / 3) * 4 + (n % 3 * 4 + 2) / 3;
+}
+
+// Writes unpadded base64 of src (as gRPC senders should); returns bytes written.
+export fn grpc_b64_encode(src: uint8*, n: int64, out: uint8*) -> int64 {
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i + 3 <= n) {
+    var v: uint32 = ((uint32)src[i] << 16) | ((uint32)src[i + 1] << 8) | (uint32)src[i + 2];
+    out[o] = B64.chars[(v >> 18) & 63];
+    out[o + 1] = B64.chars[(v >> 12) & 63];
+    out[o + 2] = B64.chars[(v >> 6) & 63];
+    out[o + 3] = B64.chars[v & 63];
+    o = o + 4;
+    i = i + 3;
+  }
+  var rest: int64 = n - i;
+  if (rest == 1) {
+    var v1: uint32 = (uint32)src[i] << 16;
+    out[o] = B64.chars[(v1 >> 18) & 63];
+    out[o + 1] = B64.chars[(v1 >> 12) & 63];
+    o = o + 2;
+  } else if (rest == 2) {
+    var v2: uint32 = ((uint32)src[i] << 16) | ((uint32)src[i + 1] << 8);
+    out[o] = B64.chars[(v2 >> 18) & 63];
+    out[o + 1] = B64.chars[(v2 >> 12) & 63];
+    out[o + 2] = B64.chars[(v2 >> 6) & 63];
+    o = o + 3;
+  }
+  return o;
+}
+
+fn b64val(c: uint8) -> int32 {
+  if (c >= 65 && c <= 90) { return (int32)(c - 65); }
+  if (c >= 97 && c <= 122) { return (int32)(c - 71); }
+  if (c >= 48 && c <= 57) { return (int32)(c + 4); }
+  if (c == 43) { return 62; }
+  if (c == 47) { return 63; }
+  return -1;
+}
+
+// Decodes base64, padded or not, into out (at most n * 3 / 4 + 2 bytes).
+// Returns the bytes written, or -1 if it is not base64.
+export fn grpc_b64_decode(src: uint8*, n: int64, out: uint8*) -> int64 {
+  // Drop up to two '=' of padding; the length must then be a valid unpadded one.
+  var len: int64 = n;
+  var pad: int64 = 0;
+  while (len > 0 && src[len - 1] == 61 && pad < 2) { len = len - 1; pad = pad + 1; }
+  if (pad > 0 && n % 4 != 0) { return -1; }
+  if (len % 4 == 1) { return -1; }
+  var o: int64 = 0;
+  var acc: uint32 = 0;
+  var bits: int32 = 0;
+  for i in 0..len {
+    var v: int32 = b64val(src[i]);
+    if (v < 0) { return -1; }
+    acc = (acc << 6) | (uint32)v;
+    bits = bits + 6;
+    if (bits >= 8) {
+      bits = bits - 8;
+      out[o] = (uint8)((acc >> (uint32)bits) & 255);
+      o = o + 1;
+    }
+  }
+  return o;
+}
+
+// ---- wire form ----------------------------------------------------------------
+
+// A growing list of header fields in an arena, ready for hpack_encode_block.
+export struct GrpcHeaderList {
+  items: HpackHeader*;
+  count: int64;
+  cap: int64;
+  arena: GrpcArena*;
+}
+
+export fn grpc_hl_init(h: GrpcHeaderList*, arena: GrpcArena*) {
+  h->items = (HpackHeader*)0;
+  h->count = 0;
+  h->cap = 0;
+  h->arena = arena;
+}
+
+// Adds a field; name and value are used as given (not copied).
+export fn grpc_hl_add(h: GrpcHeaderList*, name: string, value: string) {
+  if (h->count == h->cap) {
+    var ncap: int64 = h->cap * 2;
+    if (ncap < 16) { ncap = 16; }
+    var n: HpackHeader* = (HpackHeader*)grpc_arena_alloc(h->arena, ncap * sizeof(HpackHeader));
+    for i in 0..h->count { n[i] = h->items[i]; }
+    h->items = n;
+    h->cap = ncap;
+  }
+  var f: HpackHeader;
+  f.name = name;
+  f.value = value;
+  f.never_index = false;
+  h->items[h->count] = f;
+  h->count = h->count + 1;
+}
+
+// Appends md to a header list, base64-encoding -bin values.
+export fn grpc_md_to_headers(md: GrpcMetadata*, h: GrpcHeaderList*) {
+  for i in 0..md->count {
+    var e: GrpcMdEntry = md->items[i];
+    if (grpc_md_is_bin(e.key)) {
+      var n: int64 = grpc_b64_len((int64)e.value.length);
+      var v: string;
+      if (n > 0) {
+        var p: uint8* = (uint8*)grpc_arena_alloc(h->arena, n);
+        grpc_b64_encode(e.value.chars, (int64)e.value.length, p);
+        v.chars = p;
+        v.length = (uint64)n;
+      }
+      grpc_hl_add(h, e.key, v);
+    } else {
+      grpc_hl_add(h, e.key, e.value);
+    }
+  }
+}
+
+// Adds a header field read off the wire. Reserved and pseudo-headers are
+// skipped (the call layer reads those itself) and 0 is returned. A -bin
+// value may hold several base64 values joined by commas; each becomes its
+// own entry.
+export fn grpc_md_add_wire(md: GrpcMetadata*, name: string, value: string) -> int32 {
+  if (grpc_md_is_reserved(name)) { return GRPC_MD_OK; }
+  if (!grpc_md_key_valid(name)) { return GRPC_MD_E_KEY; }
+  if (!grpc_md_is_bin(name)) {
+    if (!grpc_md_value_valid(value)) { return GRPC_MD_E_VALUE; }
+    push(md, copy_in(md->arena, name, true), copy_in(md->arena, value, false));
+    return GRPC_MD_OK;
+  }
+  var key: string = copy_in(md->arena, name, true);
+  var start: int64 = 0;
+  var n: int64 = (int64)value.length;
+  var i: int64 = 0;
+  while (i <= n) {
+    if (i == n || value.chars[i] == 44) {
+      // Trim spaces around each part.
+      var a: int64 = start;
+      var b: int64 = i;
+      while (a < b && value.chars[a] == 32) { a = a + 1; }
+      while (b > a && value.chars[b - 1] == 32) { b = b - 1; }
+      var raw: string;
+      if (b > a) {
+        var p: uint8* = (uint8*)grpc_arena_alloc(md->arena, (b - a) / 4 * 3 + 3);
+        var got: int64 = grpc_b64_decode(value.chars + a, b - a, p);
+        if (got < 0) { return GRPC_MD_E_BASE64; }
+        raw.chars = p;
+        raw.length = (uint64)got;
+      }
+      push(md, key, raw);
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return GRPC_MD_OK;
+}

@@ -1,0 +1,284 @@
+// GSUB: glyph substitution. Lookup types 1 (single), 2 (multiple),
+// 3 (alternate, first choice), 4 (ligature), 5 (context), 6 (chained
+// context), 7 (extension) and 8 (reverse chained single).
+// Spec: OpenType "GSUB - Glyph Substitution Table".
+
+import "font/core/vec";
+import "font/sfnt/face";
+import "buffer";
+import "otl";
+
+fn set_glyph(c: OtlCtx*, i: int64, g: int32) {
+  var x: FontGlyph* = &c->buf->g.data[i];
+  x->id = g;
+  var cls: int32 = otl_glyph_class(c->f, g);
+  if (cls != 0 || c->f->gdef != 0) { x->cls = (uint8)cls; }
+  x->mcls = (uint8)otl_mark_class(c->f, g);
+}
+
+fn sub_single(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var g: int32 = c->buf->g.data[i].id;
+  var fmt: uint32 = font_u16(f, st);
+  var cov: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (cov < 0) { return -1; }
+  if (fmt == 1) {
+    set_glyph(c, i, (int32)(((uint32)g + font_u16(f, st + 4)) & 0xFFFF));
+    return i + 1;
+  }
+  if (fmt == 2) {
+    if ((int64)cov >= (int64)font_u16(f, st + 4)) { return -1; }
+    set_glyph(c, i, (int32)font_u16(f, st + 6 + (int64)cov * 2));
+    return i + 1;
+  }
+  return -1;
+}
+
+fn sub_multiple(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var g: int32 = c->buf->g.data[i].id;
+  var cov: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (cov < 0 || (int64)cov >= (int64)font_u16(f, st + 4)) { return -1; }
+  var seq: int64 = otl_off16(f, st, st + 6 + (int64)cov * 2);
+  if (seq == 0) { return -1; }
+  var n: int64 = (int64)font_u16(f, seq);
+  if (n == 0) {
+    // Deleting a glyph is allowed.
+    c->buf->g.data[i].uflags = c->buf->g.data[i].uflags | FONT_UF_DELETED;
+    c->deleted = c->deleted + 1;
+    return i + 1;
+  }
+  if (c->buf->g.len + n - 1 > c->limit) { return -1; }
+  if (!font_buffer_insert(c->buf, i, n - 1)) { return -1; }
+  for k: int64 in 0..n { set_glyph(c, i + k, (int32)font_u16(f, seq + 2 + k * 2)); }
+  return i + n;
+}
+
+fn sub_alternate(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var g: int32 = c->buf->g.data[i].id;
+  var cov: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (cov < 0 || (int64)cov >= (int64)font_u16(f, st + 4)) { return -1; }
+  var alt: int64 = otl_off16(f, st, st + 6 + (int64)cov * 2);
+  if (alt == 0 || font_u16(f, alt) == 0) { return -1; }
+  set_glyph(c, i, (int32)font_u16(f, alt + 2));
+  return i + 1;
+}
+
+fn sub_ligature(c: OtlCtx*, st: int64, i: int64) -> int64 {
+  var f: FontFace* = c->f;
+  var g: int32 = c->buf->g.data[i].id;
+  var cov: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (cov < 0 || (int64)cov >= (int64)font_u16(f, st + 4)) { return -1; }
+  var ls: int64 = otl_off16(f, st, st + 6 + (int64)cov * 2);
+  if (ls == 0) { return -1; }
+  var nl: int64 = (int64)font_u16(f, ls);
+  for k: int64 in 0..nl {
+    var lig: int64 = otl_off16(f, ls, ls + 2 + k * 2);
+    if (lig == 0) { continue; }
+    var nc: int64 = (int64)font_u16(f, lig + 2);
+    if (nc == 0) { continue; }
+    var e: int64 = otl_match_input(c, i, nc - 1, lig + 4, OTL_BY_GLYPH, 0, 0);
+    if (e < 0) { continue; }
+    // Form the ligature: the first glyph becomes it, the other
+    // components go away, and marks skipped in between stay.
+    var lid: int32 = c->buf->next_lig + 1;
+    if (lid > 255) { lid = 1; }
+    c->buf->next_lig = lid;
+    var npos: int64 = c->pos.len;
+    var cluster: int32 = c->buf->g.data[i].cluster;
+    for q: int64 in 1..npos {
+      var cl: int32 = c->buf->g.data[c->pos.data[q]].cluster;
+      if (cl < cluster) { cluster = cl; }
+    }
+    // Marks between components remember which component they follow.
+    var comp: int32 = 1;
+    var q: int64 = 1;
+    var j: int64 = i + 1;
+    while (j <= e) {
+      if (q < npos && j == c->pos.data[q]) { comp = comp + 1; q = q + 1; }
+      else {
+        c->buf->g.data[j].lig_id = (uint8)lid;
+        c->buf->g.data[j].lig_comp = (uint8)comp;
+      }
+      j = j + 1;
+    }
+    // Like HarfBuzz's merge_clusters, glyphs that shared a cluster with the
+    // components (marks, ZWJ) join the ligature's cluster too.
+    var lastcl: int32 = c->buf->g.data[c->pos.data[npos - 1]].cluster;
+    var firstcl: int32 = c->buf->g.data[i].cluster;
+    var hi: int32 = lastcl;
+    if (firstcl > hi) { hi = firstcl; }
+    var jj: int64 = c->pos.data[npos - 1] + 1;
+    while (jj < c->buf->g.len && c->buf->g.data[jj].cluster <= hi && c->buf->g.data[jj].cluster >= cluster) {
+      c->buf->g.data[jj].cluster = cluster;
+      jj = jj + 1;
+    }
+    jj = i - 1;
+    while (jj >= 0 && c->buf->g.data[jj].cluster == firstcl) { c->buf->g.data[jj].cluster = cluster; jj = jj - 1; }
+    set_glyph(c, i, (int32)font_u16(f, lig));
+    c->buf->g.data[i].cluster = cluster;
+    c->buf->g.data[i].lig_id = (uint8)lid;
+    c->buf->g.data[i].lig_comp = (uint8)0;
+    if (c->buf->g.data[i].cls == (uint8)0) { c->buf->g.data[i].cls = (uint8)2; }
+    // The other components are marked and dropped at the end of the pass.
+    for qq: int64 in 1..npos {
+      var d: FontGlyph* = &c->buf->g.data[c->pos.data[qq]];
+      d->uflags = d->uflags | FONT_UF_DELETED;
+    }
+    c->deleted = c->deleted + npos - 1;
+    return i + 1;
+  }
+  return -1;
+}
+
+// Applies one sub-table at glyph i. Returns the next position to look at,
+// or -1 when the sub-table did not apply.
+fn apply_sub(c: OtlCtx*, typ: uint32, st: int64, i: int64) -> int64 {
+  if (typ == 1) { return sub_single(c, st, i); }
+  if (typ == 2) { return sub_multiple(c, st, i); }
+  if (typ == 3) { return sub_alternate(c, st, i); }
+  if (typ == 4) { return sub_ligature(c, st, i); }
+  if (typ == 5) { return apply_context(c, st, false, i); }
+  if (typ == 6) { return apply_context(c, st, true, i); }
+  if (typ == 7) {
+    var t2: uint32 = font_u16(c->f, st + 2);
+    var off: int64 = st + (int64)font_u32(c->f, st + 4);
+    if (t2 == 7 || off == st) { return -1; }
+    return apply_sub(c, t2, off, i);
+  }
+  return -1;
+}
+
+fn apply_context(c: OtlCtx*, st: int64, chain: bool, i: int64) -> int64 {
+  var r: OtlRule;
+  if (!otl_context(c, st, chain, i, &r)) { return -1; }
+  // Copy the matched positions: nested lookups reuse c->pos.
+  var pos: FontVec<int64>;
+  for k: int64 in 0..c->pos.len { font_vec_push<int64>(&pos, c->pos.data[k]); }
+  var last: int64 = r.last;
+  for k: int64 in 0..r.nrec {
+    var seq: int64 = (int64)font_u16(c->f, r.recs + k * 4);
+    var li: int32 = (int32)font_u16(c->f, r.recs + k * 4 + 2);
+    if (seq >= pos.len) { continue; }
+    var at: int64 = pos.data[seq];
+    var before: int64 = c->buf->g.len;
+    apply_nested(c, li, at);
+    var delta: int64 = c->buf->g.len - before;
+    if (delta != 0) {
+      for q: int64 in 0..pos.len { if (pos.data[q] > at) { pos.data[q] = pos.data[q] + delta; } }
+      last = last + delta;
+    }
+  }
+  font_vec_free<int64>(&pos);
+  if (last < i) { last = i; }
+  return last + 1;
+}
+
+// Applies lookup li once at position i (used from context rules).
+fn apply_nested(c: OtlCtx*, li: int32, i: int64) {
+  if (c->depth >= 8 || i < 0 || i >= c->buf->g.len) { return; }
+  if ((c->buf->g.data[i].uflags & FONT_UF_DELETED) != (uint8)0) { return; }
+  var lk: int64 = otl_lookup(c->f, c->table, li);
+  if (lk == 0) { return; }
+  var saved_flag: uint32 = c->flag;
+  var saved_set: int32 = c->markset;
+  c->depth = c->depth + 1;
+  set_flag(c, lk);
+  var typ: uint32 = font_u16(c->f, lk);
+  var n: int64 = (int64)font_u16(c->f, lk + 4);
+  if (!otl_skip(c->f, &c->buf->g.data[i], c->flag, c->markset)) {
+    for s: int64 in 0..n {
+      var st: int64 = otl_off16(c->f, lk, lk + 6 + s * 2);
+      if (st != 0 && apply_sub(c, typ, st, i) >= 0) { break; }
+    }
+  }
+  c->depth = c->depth - 1;
+  c->flag = saved_flag;
+  c->markset = saved_set;
+}
+
+fn set_flag(c: OtlCtx*, lk: int64) {
+  c->flag = font_u16(c->f, lk + 2);
+  c->markset = 0;
+  if ((c->flag & OTL_MARK_SET) != 0) {
+    var n: int64 = (int64)font_u16(c->f, lk + 4);
+    c->markset = (int32)font_u16(c->f, lk + 6 + n * 2);
+  }
+}
+
+// Reverse chained single substitution (type 8), applied from the end.
+fn reverse_sub(c: OtlCtx*, st: int64, i: int64) -> bool {
+  var f: FontFace* = c->f;
+  var g: int32 = c->buf->g.data[i].id;
+  var cov: int32 = otl_coverage(f, otl_off16(f, st, st + 2), g);
+  if (cov < 0) { return false; }
+  var nb: int64 = (int64)font_u16(f, st + 4);
+  var pl: int64 = st + 6 + nb * 2;
+  var nl: int64 = (int64)font_u16(f, pl);
+  var ps: int64 = pl + 2 + nl * 2;
+  if (!otl_match_back(c, i, nb, st + 6, OTL_BY_COVER, 0, st)) { return false; }
+  if (!otl_match_ahead(c, i, nl, pl + 2, OTL_BY_COVER, 0, st)) { return false; }
+  if ((int64)cov >= (int64)font_u16(f, ps)) { return false; }
+  set_glyph(c, i, (int32)font_u16(f, ps + 2 + (int64)cov * 2));
+  return true;
+}
+
+/// Applies the given GSUB lookups (in order) to the whole buffer.
+export fn font_gsub_apply(f: FontFace*, buf: FontBuffer*, lookups: FontVec<int32>*) {
+  if (f->gsub == 0) { return; }
+  var c: OtlCtx;
+  c.f = f;
+  c.buf = buf;
+  c.table = f->gsub;
+  c.gsub = true;
+  c.work = 200000 + buf->g.len * 64;
+  c.limit = buf->g.len * 8 + 256;
+  for li: int64 in 0..lookups->len {
+    var lk: int64 = otl_lookup(f, f->gsub, lookups->data[li]);
+    if (lk == 0) { continue; }
+    var typ: uint32 = font_u16(f, lk);
+    var n: int64 = (int64)font_u16(f, lk + 4);
+    set_flag(&c, lk);
+    var real: uint32 = typ;
+    if (typ == 7 && n > 0) {
+      var st0: int64 = otl_off16(f, lk, lk + 6);
+      real = font_u16(f, st0 + 2);
+    }
+    if (real == 8) {
+      var i: int64 = buf->g.len - 1;
+      while (i >= 0) {
+        if (!otl_skip(f, &buf->g.data[i], c.flag, c.markset)) {
+          for s: int64 in 0..n {
+            var st: int64 = otl_off16(f, lk, lk + 6 + s * 2);
+            if (typ == 7) { st = st + (int64)font_u32(f, st + 4); }
+            if (st != 0 && reverse_sub(&c, st, i)) { break; }
+          }
+        }
+        i = i - 1;
+      }
+      continue;
+    }
+    var dg: OtlDigest;
+    otl_lookup_digest(f, lk, false, &dg);
+    var i: int64 = 0;
+    while (i < buf->g.len) {
+      c.work = c.work - 1;
+      if (c.work < 0) { font_buffer_compact(buf); font_vec_free<int64>(&c.pos); return; }
+      var next: int64 = -1;
+      if ((buf->g.data[i].uflags & FONT_UF_DELETED) == (uint8)0 && otl_digest_may(&dg, buf->g.data[i].id) && !otl_skip(f, &buf->g.data[i], c.flag, c.markset)) {
+        for s: int64 in 0..n {
+          var st: int64 = otl_off16(f, lk, lk + 6 + s * 2);
+          if (st == 0) { continue; }
+          c.depth = 0;
+          next = apply_sub(&c, typ, st, i);
+          set_flag(&c, lk);
+          if (next >= 0) { break; }
+        }
+      }
+      if (next < 0) { i = i + 1; } else { i = next; }
+    }
+    if (c.deleted > 0) { font_buffer_compact(buf); c.deleted = 0; }
+  }
+  font_vec_free<int64>(&c.pos);
+}
