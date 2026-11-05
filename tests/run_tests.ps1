@@ -3285,7 +3285,9 @@ if ($IsLinux) {
     @{ Name = "std_fs_release"; Path = "tests/test_std_fs.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_dl"; Path = "tests/test_std_dl.mettle"; ShouldSucceed = $true; Args = @("-l:libc.so.6") },
     @{ Name = "std_dl_release"; Path = "tests/test_std_dl.mettle"; ShouldSucceed = $true; Args = @("--release", "-l:libc.so.6") },
-    @{ Name = "thread_id_cached"; Path = "tests/test_thread_id_cached.mettle"; ShouldSucceed = $true }
+    @{ Name = "thread_id_cached"; Path = "tests/test_thread_id_cached.mettle"; ShouldSucceed = $true },
+    @{ Name = "malloc_threads"; Path = "tests/test_malloc_threads.mettle"; ShouldSucceed = $true },
+    @{ Name = "malloc_threads_release"; Path = "tests/test_malloc_threads.mettle"; ShouldSucceed = $true; Args = @("--release") }
   )
 }
 
