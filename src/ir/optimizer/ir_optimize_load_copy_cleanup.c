@@ -606,7 +606,7 @@ static const char *ir_devirtualize_global_behind(const IRFunction *function,
     const IRInstruction *ins = &function->instructions[j];
     if (ins->op == IR_OP_LABEL || ins->op == IR_OP_JUMP ||
         ins->op == IR_OP_BRANCH_ZERO || ins->op == IR_OP_BRANCH_EQ ||
-        ins->op == IR_OP_CALL || ins->op == IR_OP_CALL_INDIRECT) {
+        (ins->op != IR_OP_STORE && ir_instruction_has_side_effect(ins))) {
       return NULL;
     }
     if (ins->op == IR_OP_STORE) {
@@ -2792,9 +2792,8 @@ for (size_t header = 0; header < function->instruction_count; header++) {
     const IRInstruction *ins = &function->instructions[k];
     const char *b = NULL;
     long long w = 0;
-    if (ins->op == IR_OP_STORE || ins->op == IR_OP_CALL ||
-        ins->op == IR_OP_CALL_INDIRECT || ins->op == IR_OP_INLINE_ASM ||
-        ins->op == IR_OP_ADDRESS_OF || ins->op == IR_OP_NEW) {
+    if (ins->op == IR_OP_ADDRESS_OF || ins->op == IR_OP_NEW ||
+        ir_instruction_has_side_effect(ins)) {
       ok = 0;
       break;
     }
