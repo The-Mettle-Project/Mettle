@@ -110,6 +110,7 @@ static ASTNode *ast_clone_var_declaration(ASTNode *clone, const ASTNode *node) {
   dst->is_const = src->is_const;
   dst->structural_type = src->structural_type;
   dst->type_is_inferred = src->type_is_inferred;
+  dst->capture_type = src->capture_type;
   dst->address_space = src->address_space;
   dst->link_name = ast_copy_string(src->link_name);
   dst->initializer =
@@ -2030,6 +2031,7 @@ ASTNode *ast_create_var_declaration(const char *name, const char *type_name,
   var_decl->is_exported = 0;
   var_decl->is_const = 0;
   var_decl->structural_type = 0;
+  var_decl->capture_type = NULL;
   var_decl->address_space = AST_ADDRESS_SPACE_DEFAULT;
   var_decl->link_name = NULL;
   var_decl->composed_name = NULL;

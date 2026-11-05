@@ -954,7 +954,7 @@ static int ir_cp_record_temp_write(IRCopyPropState *state,
     return 1;
   }
   ir_temp_value_map_remove(&state->map, instruction->dest.name);
-  if (instruction->op != IR_OP_ASSIGN ||
+  if (instruction->op != IR_OP_ASSIGN || instruction->is_volatile ||
       !ir_operand_is_propagatable_value(&instruction->lhs)) {
     return 1;
   }
@@ -975,7 +975,7 @@ static int ir_cp_record_symbol_write(IRCopyPropState *state,
   ir_temp_value_map_remove_symbol_values(&state->map, instruction->dest.name);
   ir_symbol_value_map_invalidate_name(&state->symbol_map,
                                       instruction->dest.name);
-  if (instruction->op != IR_OP_ASSIGN ||
+  if (instruction->op != IR_OP_ASSIGN || instruction->is_volatile ||
       !ir_operand_is_propagatable_value(&instruction->lhs) ||
       instruction->dest.kind != IR_OPERAND_SYMBOL ||
       ir_temp_value_map_lookup(&state->storage_syms, instruction->dest.name)) {

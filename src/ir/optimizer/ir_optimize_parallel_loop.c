@@ -1900,11 +1900,40 @@ static int ir_par_run_one(IRProgram *program, IRFunction *function,
   return ok;
 }
 
+static void ir_par_leave_on_one_thread(IRProgram *program, const char *why) {
+  int marked = 0;
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    if (!function) {
+      continue;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      IRInstruction *in = &function->instructions[i];
+      if (in->op == IR_OP_NOP && in->text &&
+          strncmp(in->text, IR_PARALLEL_MARKER_PREFIX,
+                  strlen(IR_PARALLEL_MARKER_PREFIX)) == 0) {
+        in->text = NULL;
+        marked++;
+      }
+    }
+  }
+  if (marked > 0) {
+    fprintf(stderr, "note: %d `@parallel` loop%s left running on one thread; %s\n",
+            marked, marked == 1 ? "" : "s", why);
+  }
+}
+
 int ir_parallelize_marked_loops_pass(IRProgram *program, int *changed) {
   size_t id = 0;
   size_t original;
   if (!program) {
     return 0;
+  }
+  if (ir_program_lookup_symbol(program, "mettle_safety_call_enter")) {
+    ir_par_leave_on_one_thread(program,
+                               "--safe checks every access on the thread that "
+                               "makes it");
+    return 1;
   }
   original = program->function_count;
   for (size_t f = 0; f < original; f++) {
@@ -1931,29 +1960,9 @@ int ir_parallelize_marked_loops_pass(IRProgram *program, int *changed) {
 }
 
 void ir_note_parallel_loops_unverified(IRProgram *program) {
-  int marked = 0;
   if (!program) {
     return;
   }
-  for (size_t f = 0; f < program->function_count; f++) {
-    IRFunction *function = program->functions[f];
-    if (!function) {
-      continue;
-    }
-    for (size_t i = 0; i < function->instruction_count; i++) {
-      IRInstruction *in = &function->instructions[i];
-      if (in->op == IR_OP_NOP && in->text &&
-          strncmp(in->text, IR_PARALLEL_MARKER_PREFIX,
-                  strlen(IR_PARALLEL_MARKER_PREFIX)) == 0) {
-        in->text = NULL;
-        marked++;
-      }
-    }
-  }
-  if (marked > 0) {
-    fprintf(stderr,
-            "note: %d `@parallel` loop%s left running on one thread; the "
-            "outliner only runs with -O/--release\n",
-            marked, marked == 1 ? "" : "s");
-  }
+  ir_par_leave_on_one_thread(program,
+                             "the outliner only runs with -O/--release");
 }

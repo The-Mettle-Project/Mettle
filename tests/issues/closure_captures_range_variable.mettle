@@ -1,0 +1,24 @@
+import "std/io";
+fn run() {
+  var fs: Fn(int32) -> int32[3];
+  var n: int32 = 0;
+  for k in 0..3 {
+    var c: Fn(int32) -> int32 = fn(a: int32) -> int32 { return a + k; };
+    n = n + c(10);
+  }
+  println("{n}");
+  for b in (uint8)250..(uint8)253 {
+    var c: Fn(int32) -> int32 = fn(a: int32) -> int32 { return a + (int32)b; };
+    println("{c(1)}");
+  }
+  for ch in "hi" {
+    var c: Fn(int32) -> int32 = fn(a: int32) -> int32 { return a + (int32)ch; };
+    println("{c(1)}");
+  }
+  var lo: int64 = 3;
+  for w in lo..lo + 2 {
+    var c: Fn(int64) -> int64 = fn(a: int64) -> int64 { return a + w; };
+    println("{c(1)}");
+  }
+}
+fn main() -> int32 { run(); return 0; }

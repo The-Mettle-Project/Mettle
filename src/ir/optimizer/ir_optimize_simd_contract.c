@@ -2606,7 +2606,13 @@ int ir_verify_simd_contracts(IRFunction *function) {
     }
 
     const char *reason = ir_simd_bail_reason(function, begin_index, i);
-    if (loop_mode == SIMD_ATTR_CONTRACT) {
+    if (loop_mode == SIMD_ATTR_CONTRACT &&
+        ir_program_lookup_symbol(ir_optimize_get_program(),
+                                 "mettle_safety_call_enter")) {
+      fprintf(stderr,
+              "%s:%zu:%zu: warning: @simd! loop stays scalar under --safe: %s\n",
+              file, loc.line, loc.column, reason);
+    } else if (loop_mode == SIMD_ATTR_CONTRACT) {
       fprintf(stderr, "%s:%zu:%zu: error: @simd! loop was not vectorized: %s\n",
               file, loc.line, loc.column, reason);
       g_simd_contract_user_error = 1;

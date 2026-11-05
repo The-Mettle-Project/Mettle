@@ -6633,6 +6633,18 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         if (!token) {
           token = ii_global_storage(machine, insn->lhs.name);
         }
+        for (size_t d = 0; !token && d < fn->instruction_count; d++) {
+          const IRInstruction *declared = &fn->instructions[d];
+          if (declared->op != IR_OP_DECLARE_LOCAL || !declared->dest.name ||
+              strcmp(declared->dest.name, insn->lhs.name) != 0) {
+            continue;
+          }
+          if (!ii_op_declare_local(machine, &frame, fn, declared)) {
+            goto done;
+          }
+          var = ii_env_find(&frame.env, insn->lhs.name);
+          token = var ? (unsigned long long)var->value.i : 0;
+        }
         if (!token) {
           if (machine->status == IR_INTERP_OK) {
             char detail[160];

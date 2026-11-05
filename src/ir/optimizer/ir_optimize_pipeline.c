@@ -914,6 +914,9 @@ static int ir_safety_analysis_function(IRFunction *function) {
       {"safety_branches", ir_constant_and_branch_simplify_pass, {0, 0}},
       {"safety_dead_temps", ir_eliminate_dead_temp_writes_pass, {0, 0}},
   };
+  if (function->is_rule) {
+    return 1;
+  }
   return ir_run_named_stage_fixpoint(function, passes, IR_ARRAY_COUNT(passes),
       IR_OPT_FIXPOINT_MAX_ITERATIONS, "safety scalar analysis",
       "Safety scalar analysis failed", 0);

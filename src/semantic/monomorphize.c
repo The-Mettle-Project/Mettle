@@ -3413,13 +3413,17 @@ done:
 static void mono_state_binding_type(MonoContext *ctx, VarDeclaration *decl,
                                     MonoVarEnv *env) {
   char *stated;
-  if (decl->type_name || decl->structural_type || !decl->initializer) {
+  if (decl->type_name || !decl->initializer) {
     return;
   }
   stated = mono_static_type_of(ctx, decl->initializer, env);
   if (stated) {
-    decl->type_name = (char *)string_intern(stated);
-    decl->type_is_inferred = 1;
+    if (decl->structural_type) {
+      decl->capture_type = (char *)string_intern(stated);
+    } else {
+      decl->type_name = (char *)string_intern(stated);
+      decl->type_is_inferred = 1;
+    }
     free(stated);
   }
 }
@@ -3459,7 +3463,9 @@ static int mono_infer_type_args_in_node(MonoContext *ctx, ASTNode *node,
     }
     if (decl && decl->name) {
       mono_state_binding_type(ctx, decl, env);
-      if (!mono_env_add(env, decl->name, decl->type_name)) {
+      if (!mono_env_add(env, decl->name,
+                        decl->type_name ? decl->type_name
+                                        : decl->capture_type)) {
         return 0;
       }
     }
@@ -4047,7 +4053,8 @@ static void cc_collect_vars(ASTNode *node, CCEnv *env) {
   if (node->type == AST_VAR_DECLARATION) {
     VarDeclaration *vd = (VarDeclaration *)node->data;
     if (vd)
-      cc_env_add(env, vd->name, vd->type_name);
+      cc_env_add(env, vd->name,
+                 vd->type_name ? vd->type_name : vd->capture_type);
   }
   for (size_t i = 0; i < node->child_count; i++)
     cc_collect_vars(node->children[i], env);
@@ -4440,7 +4447,8 @@ static void cc_walk(ASTNode *node, CCEnv *enclosing, ASTNode *program,
   }
   if (node->type == AST_VAR_DECLARATION && node->data) {
     VarDeclaration *vd = (VarDeclaration *)node->data;
-    cc_env_push(enclosing, vd->name, vd->type_name);
+    cc_env_push(enclosing, vd->name,
+                vd->type_name ? vd->type_name : vd->capture_type);
   }
   if (node->type == AST_MATCH_STATEMENT && node->data) {
     MatchStatement *match = (MatchStatement *)node->data;

@@ -3508,9 +3508,62 @@ int ir_safety_retire_dangling_notes(IRProgram *program) {
 
 #include "ir_safety_provenance.inc"
 
+static void safety_rename_operand(IROperand *operand, const char *from,
+                                  const char *to) {
+  if (operand->kind != IR_OPERAND_SYMBOL || !operand->name ||
+      strcmp(operand->name, from) != 0) {
+    return;
+  }
+  ir_operand_destroy(operand);
+  *operand = ir_operand_symbol(to);
+}
+
+static int safety_unshadow_own_name(IRFunction *function) {
+  char renamed[256];
+  if (!function->name ||
+      (!ir_function_symbol_is_parameter(function, function->name) &&
+       !ir_function_local_declared_type(function, function->name))) {
+    return 1;
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (function->instructions[i].op == IR_OP_INLINE_ASM) {
+      return 1;
+    }
+  }
+  snprintf(renamed, sizeof(renamed), "%s.own", function->name);
+  for (size_t p = 0; p < function->parameter_count; p++) {
+    if (function->parameter_names[p] &&
+        strcmp(function->parameter_names[p], function->name) == 0) {
+      char *copy = mettle_strdup(renamed);
+      if (!copy) {
+        return 0;
+      }
+      mettle_free_string(function->parameter_names[p]);
+      function->parameter_names[p] = copy;
+    }
+  }
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *in = &function->instructions[i];
+    safety_rename_operand(&in->dest, function->name, renamed);
+    safety_rename_operand(&in->lhs, function->name, renamed);
+    safety_rename_operand(&in->rhs, function->name, renamed);
+    for (size_t a = 0; a < in->argument_count; a++) {
+      safety_rename_operand(&in->arguments[a], function->name, renamed);
+    }
+  }
+  ir_function_touch_structure(function);
+  return 1;
+}
+
 int ir_safety_register_allocations(IRProgram *program) {
   if (!program) {
     return 1;
+  }
+  for (size_t i = 0; i < program->function_count; i++) {
+    if (program->functions[i] && !program->functions[i]->is_rule &&
+        !safety_unshadow_own_name(program->functions[i])) {
+      return 0;
+    }
   }
   g_safety_next_id = 0;
   if (!safety_declare_runtime(program)) return 0;
