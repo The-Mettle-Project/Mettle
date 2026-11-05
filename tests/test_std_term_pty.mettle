@@ -1,0 +1,124 @@
+// std/term on a real pseudo-terminal: raw mode on and off, the window size,
+// and signals as a descriptor. Linux only.
+import "std/term"
+import "std/linux"
+
+const TCGETS = 0x5401;
+const TIOCSWINSZ = 0x5414;
+const TIOCSPTLCK = 0x40045431;
+
+fn cpath(s: string, buf: uint8*) -> uint8* {
+  for i in 0..s.length { buf[i] = (uint8)s[i]; }
+  buf[(int64)s.length] = (uint8)0;
+  return buf;
+}
+
+// Reads exactly n bytes, or returns what read gave on an error.
+fn read_all(fd: int64, buf: uint8*, n: int64) -> int64 {
+  var got: int64 = 0;
+  while (got < n) {
+    var r: int64 = linux_read(fd, &buf[got], n - got);
+    if (r <= 0) { return r; }
+    got = got + r;
+  }
+  return got;
+}
+
+// Opens a pty pair: the master in *m, and returns the slave or -errno.
+fn open_pty(m: int64*) -> int64 {
+  var path: uint8[32];
+  *m = linux_openat(LINUX_AT_FDCWD, cpath("/dev/ptmx", &path[0]), LINUX_O_RDWR | 0x100 | LINUX_O_CLOEXEC, 0);
+  if (*m < 0) { return *m; }
+  var zero: int32 = 0;
+  var r: int64 = linux_ioctl(*m, TIOCSPTLCK, &zero);
+  if (r < 0) { return r; }
+  var n: int32 = 0;
+  r = linux_ioctl(*m, (int64)0x40045430 + (int64)0x40000000, &n);   // TIOCGPTN
+  if (r < 0) { return r; }
+  return linux_openat(LINUX_AT_FDCWD, cpath("/dev/pts/{n}", &path[0]), LINUX_O_RDWR | 0x100 | LINUX_O_CLOEXEC, 0);
+}
+
+fn check_raw(m: int64, s: int64) -> int32 {
+  var before: uint32[16];
+  var after: uint32[16];
+  var t: uint32[16];
+  if (linux_ioctl(s, TCGETS, &before[0]) != 0) { return 20; }
+  if (term_raw_begin(s) != 0) { return 21; }
+  if (linux_ioctl(s, TCGETS, &t[0]) != 0) { return 22; }
+  if ((t[0] & (uint32)0x100) != (uint32)0) { return 23; }       // ICRNL
+  if ((t[1] & (uint32)1) != (uint32)0) { return 24; }           // OPOST
+  if ((t[2] & (uint32)0x30) != (uint32)0x30) { return 25; }     // CS8
+  if ((t[3] & (uint32)(1 | 2 | 8)) != (uint32)0) { return 26; } // ISIG, ICANON, ECHO
+  var cc: uint8* = (uint8*)&t[0];
+  if (cc[17 + 6] != (uint8)1 || cc[17 + 5] != (uint8)0) { return 27; }   // VMIN, VTIME
+
+  // Ctrl-C and CR arrive as plain bytes, one read at a time.
+  var in: uint8[4] = [(uint8)3, (uint8)13, (uint8)97, (uint8)0];
+  if (linux_write(m, &in[0], 3) != 3) { return 28; }
+  var got: uint8[4];
+  if (read_all(s, &got[0], 3) != 3) { return 29; }
+  if (got[0] != (uint8)3 || got[1] != (uint8)13 || got[2] != (uint8)97) { return 30; }
+  // Output is not translated: a newline stays one byte.
+  var out: uint8[2] = [(uint8)120, (uint8)10];
+  if (linux_write(s, &out[0], 2) != 2) { return 31; }
+  if (read_all(m, &got[0], 2) != 2) { return 32; }
+  if (got[0] != (uint8)120 || got[1] != (uint8)10) { return 33; }
+
+  if (term_raw_end(s) != 0) { return 34; }
+  if (linux_ioctl(s, TCGETS, &after[0]) != 0) { return 35; }
+  var a: uint8* = (uint8*)&before[0];
+  var b: uint8* = (uint8*)&after[0];
+  for i in 0..36 { if (a[i] != b[i]) { return 36; } }   // sizeof(struct termios)
+  if (term_raw_end(s) != 0) { return 37; }
+  return 0;
+}
+
+fn check_size(m: int64, s: int64) -> int32 {
+  var ws: uint16[4] = [(uint16)37, (uint16)101, (uint16)0, (uint16)0];
+  if (linux_ioctl(m, TIOCSWINSZ, &ws[0]) != 0) { return 40; }
+  var cols: int32 = 0;
+  var rows: int32 = 0;
+  if (term_size(s, &cols, &rows) != 0) { return 41; }
+  if (cols != 101 || rows != 37) { return 42; }
+  return 0;
+}
+
+fn check_signals() -> int32 {
+  var fd: int64 = term_signal_fd(TERM_SIGWINCH, TERM_SIGINT, TERM_SIGTERM);
+  if (fd < 0) { return 50; }
+  var pid: int64 = linux_getpid();
+  if (linux_kill(pid, (int64)TERM_SIGWINCH) != 0) { return 51; }
+  if (term_signal_next(fd) != TERM_SIGWINCH) { return 52; }
+  if (linux_kill(pid, (int64)TERM_SIGTERM) != 0) { return 53; }
+  if (term_signal_next(fd) != TERM_SIGTERM) { return 54; }
+  if (linux_kill(pid, (int64)TERM_SIGINT) != 0) { return 55; }
+  if (term_signal_next(fd) != TERM_SIGINT) { return 56; }
+  term_signal_end(fd, TERM_SIGWINCH, TERM_SIGINT, TERM_SIGTERM);
+  return 0;
+}
+
+fn main() -> int32 {
+  var m: int64 = 0;
+  var s: int64 = open_pty(&m);
+  if (s < 0) { return 1; }
+  if (!term_is_tty(s)) { return 2; }
+  var r: int32 = check_raw(m, s);
+  if (r != 0) { return r; }
+  r = check_size(m, s);
+  if (r != 0) { return r; }
+
+  // Not a terminal: every call says ENOTTY.
+  var path: uint8[16];
+  var null_fd: int64 = linux_openat(LINUX_AT_FDCWD, cpath("/dev/null", &path[0]), LINUX_O_RDWR, 0);
+  var cols: int32 = 0;
+  var rows: int32 = 0;
+  if (term_raw_begin(null_fd) != -25) { return 3; }
+  if (term_size(null_fd, &cols, &rows) != -25) { return 4; }
+
+  r = check_signals();
+  if (r != 0) { return r; }
+  linux_close(null_fd);
+  linux_close(s);
+  linux_close(m);
+  return 0;
+}

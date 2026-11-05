@@ -33,6 +33,12 @@ export const LINUX_POLLERR = 8;
 export const LINUX_POLLHUP = 16;
 export const LINUX_POLLNVAL = 32;
 
+export const LINUX_SIG_BLOCK = 0;
+export const LINUX_SIG_UNBLOCK = 1;
+export const LINUX_SIG_SETMASK = 2;
+export const LINUX_SFD_NONBLOCK = 2048;
+export const LINUX_SFD_CLOEXEC = 524288;
+
 export const LINUX_EINTR = 4;
 export const LINUX_EAGAIN = 11;
 export const LINUX_ETIMEDOUT = 110;
@@ -77,6 +83,23 @@ export fn linux_gettid() -> int64 {
 
 export fn linux_kill(pid: int64, sig: int64) -> int64 {
   return syscall(LINUX_SYS_KILL, pid, sig);
+}
+
+export fn linux_ioctl(fd: int64, req: int64, arg: rawptr) -> int64 {
+  return syscall(LINUX_SYS_IOCTL, fd, req, arg);
+}
+
+// how is LINUX_SIG_BLOCK, LINUX_SIG_UNBLOCK or LINUX_SIG_SETMASK. Signal n
+// is bit n-1 of the mask. set and old may be 0.
+export fn linux_rt_sigprocmask(how: int64, set: uint64*, old: uint64*) -> int64 {
+  return syscall(LINUX_SYS_RT_SIGPROCMASK, how, set, old, 8);
+}
+
+// fd is -1 for a new descriptor. flags takes LINUX_SFD_NONBLOCK and
+// LINUX_SFD_CLOEXEC. Each read gives 128-byte records; the signal number is
+// the first 32-bit word.
+export fn linux_signalfd(fd: int64, mask: uint64*, flags: int64) -> int64 {
+  return syscall(LINUX_SYS_SIGNALFD4, fd, mask, 8, flags);
 }
 
 export fn linux_sched_yield() -> int64 {

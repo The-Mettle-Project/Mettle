@@ -8,6 +8,8 @@ extern fn term_c_read(fd: int32, buf: uint8*, n: uint64) -> int64 = "read";
 extern fn term_c_write(fd: int32, buf: uint8*, n: uint64) -> int64 = "write";
 extern fn term_c_errno() -> int32* = "__error";
 extern fn term_c_raise(sig: int32) -> int32 = "raise";
+// ioctl is variadic: the argument goes 3rd for x86-64 and 9th for arm64.
+extern fn term_c_ioctl_v(fd: int32, req: uint64, a3: rawptr, a4: int64, a5: int64, a6: int64, a7: int64, a8: int64, a9: rawptr) -> int32 = "ioctl";
 
 const ECHO = 8;
 const ISIG = 0x80;
@@ -67,6 +69,44 @@ export fn term_os_secret_end(fd: int64) {
 
 export fn term_os_raise(sig: int32) {
   term_c_raise(sig);
+}
+
+// Raw mode: the flags cfmakeraw clears, with 8-bit chars, VMIN 1, VTIME 0.
+var g_term_raw: uint64[16];
+var g_term_raw_on: bool = false;
+
+export fn term_raw_begin(fd: int64) -> int64 {
+  var t: uint64[16];
+  if (term_c_tcgetattr((int32)fd, &t[0]) != 0) { return -(int64)*term_c_errno(); }
+  if (!g_term_raw_on) {
+    for i in 0..16 { g_term_raw[i] = t[i]; }
+  }
+  t[0] = t[0] & ~(uint64)(1 | 2 | 8 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200);
+  t[1] = t[1] & ~(uint64)1;
+  t[2] = (t[2] & ~(uint64)(0x300 | 0x1000)) | (uint64)0x300;
+  t[3] = t[3] & ~(uint64)(8 | 0x10 | 0x80 | 0x100 | 0x400);
+  var cc: uint8* = (uint8*)&t[0];
+  cc[32 + 16] = (uint8)1;
+  cc[32 + 17] = (uint8)0;
+  if (term_c_tcsetattr((int32)fd, 0, &t[0]) != 0) { return -(int64)*term_c_errno(); }
+  g_term_raw_on = true;
+  return 0;
+}
+
+export fn term_raw_end(fd: int64) -> int64 {
+  if (!g_term_raw_on) { return 0; }
+  if (term_c_tcsetattr((int32)fd, 0, &g_term_raw[0]) != 0) { return -(int64)*term_c_errno(); }
+  g_term_raw_on = false;
+  return 0;
+}
+
+export fn term_size(fd: int64, cols: int32*, rows: int32*) -> int64 {
+  var ws: uint16[4];
+  var p: rawptr = &ws[0];
+  if (term_c_ioctl_v((int32)fd, (uint64)0x40087468, p, 0, 0, 0, 0, 0, p) != 0) { return -(int64)*term_c_errno(); }   // TIOCGWINSZ
+  *rows = (int32)ws[0];
+  *cols = (int32)ws[1];
+  return 0;
 }
 
 export const TERM_SIGINT = 2;
