@@ -5558,7 +5558,10 @@ static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
     }
     if (handled < 0 || machine->status != IR_INTERP_OK) {
       if (machine->status == IR_INTERP_OK) {
-        ii_fail(machine, IR_INTERP_TRAP, "extern call trap");
+        char detail[160];
+        snprintf(detail, sizeof(detail), "the call to '%s' could not run",
+                 insn->text);
+        ii_fail(machine, IR_INTERP_TRAP, detail);
       }
       return 0;
     }
