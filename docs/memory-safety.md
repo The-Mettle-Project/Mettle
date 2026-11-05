@@ -204,7 +204,7 @@ These checks do not yet establish complete memory safety for every program.
 |------|---------------|
 | Concurrent access and free | Locks protect the registry and byte metadata. They do not hold the allocation live between the check and the machine access. The program must synchronize its accesses and lifetimes. |
 | Concurrent value and metadata writes | The machine store and its metadata update are separate operations. Data races can make them disagree. |
-| Foreign code, assembly and callbacks | Their accesses and lifetime changes need a trusted contract. A callback entered from unchecked code has no argument identities unless it establishes valid regions. |
+| Foreign code, assembly and callbacks | Their accesses and lifetime changes need a trusted contract. A function entered from unchecked code, a thread entry point for one, resolves each pointer argument by address: one inside a live tracked allocation gets that allocation's identity, and any other has none. |
 | Foreign pointer reconstruction | C can transform or copy a pointer without supplying its origin. A later checked dereference rejects the unknown result. |
 | Allocation size arithmetic | Arithmetic still follows the core language. A size expression can wrap before it reaches the allocator. Checks use the resulting allocation extent. |
 | Other targets | The regression matrix covers native Windows and Linux on x64. It does not establish equivalent coverage for other backends. |

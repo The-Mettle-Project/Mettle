@@ -1670,36 +1670,6 @@ static int ii_binary(IRInterpMachine *machine, const IRInstruction *insn,
     return ii_sym_binary(machine, insn, a, b, out);
   }
 
-  if (insn->value_type && insn->value_type->kind == MTLC_TYPE_STRING &&
-      strcmp(op, "+") == 0) {
-    const unsigned char *left_bytes = NULL, *right_bytes = NULL;
-    size_t left_length = 0, right_length = 0;
-    if (!ii_read_string(machine, (unsigned long long)ii_as_int(a),
-                        &left_bytes, &left_length) ||
-        !ii_read_string(machine, (unsigned long long)ii_as_int(b),
-                        &right_bytes, &right_length) ||
-        left_length > (size_t)II_MAX_BUFFER_SIZE - right_length) {
-      ii_fail(machine, IR_INTERP_TRAP, "string concat operand");
-      return 0;
-    }
-    char *joined = malloc(left_length + right_length + 1);
-    if (!joined) {
-      ii_fail(machine, IR_INTERP_TRAP, "out of memory");
-      return 0;
-    }
-    memcpy(joined, left_bytes, left_length);
-    memcpy(joined + left_length, right_bytes, right_length);
-    unsigned long long record =
-        ii_make_string(machine, joined, left_length + right_length);
-    free(joined);
-    if (!record) {
-      ii_fail(machine, IR_INTERP_TRAP, "string concat storage");
-      return 0;
-    }
-    *out = ii_int_value((long long)record);
-    return 1;
-  }
-
   if (insn->is_float) {
     double x = ii_as_float(a);
     double y = ii_as_float(b);
@@ -3348,6 +3318,34 @@ static int ii_extern_runtime_check(IRInterpMachine *machine, const char *name,
 static int ii_extern_string_runtime(IRInterpMachine *machine, const char *name,
                         const IRInterpValue *args, size_t arg_count,
                         IRInterpValue *result) {
+  if (strcmp(name, "mettle_string_concat") == 0 && arg_count == 2) {
+    const unsigned char *left_bytes = NULL, *right_bytes = NULL;
+    size_t left_length = 0, right_length = 0;
+    if (!ii_read_string(machine, (unsigned long long)ii_as_int(&args[0]),
+                        &left_bytes, &left_length) ||
+        !ii_read_string(machine, (unsigned long long)ii_as_int(&args[1]),
+                        &right_bytes, &right_length) ||
+        left_length > (size_t)II_MAX_BUFFER_SIZE - right_length) {
+      ii_fail(machine, IR_INTERP_TRAP, "string concat operand");
+      return -1;
+    }
+    char *joined = malloc(left_length + right_length + 1);
+    if (!joined) {
+      ii_fail(machine, IR_INTERP_TRAP, "out of memory");
+      return -1;
+    }
+    memcpy(joined, left_bytes, left_length);
+    memcpy(joined + left_length, right_bytes, right_length);
+    unsigned long long record =
+        ii_make_string(machine, joined, left_length + right_length);
+    free(joined);
+    if (!record) {
+      ii_fail(machine, IR_INTERP_TRAP, "string concat storage");
+      return -1;
+    }
+    *result = ii_int_value((long long)record);
+    return 1;
+  }
   if (strcmp(name, "mettle_string_eq") == 0 && arg_count == 2) {
     const unsigned char *left_bytes = NULL, *right_bytes = NULL;
     size_t left_length = 0, right_length = 0;
@@ -6637,7 +6635,10 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
         }
         if (!token) {
           if (machine->status == IR_INTERP_OK) {
-            ii_fail(machine, IR_INTERP_UNSUPPORTED, "address-of global");
+            char detail[160];
+            snprintf(detail, sizeof(detail), "address-of global '%s'",
+                     insn->lhs.name);
+            ii_fail(machine, IR_INTERP_UNSUPPORTED, detail);
           }
           goto done;
         }

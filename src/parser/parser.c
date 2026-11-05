@@ -4999,6 +4999,13 @@ ASTNode *parser_parse_cast_expression(Parser *parser) {
       parser->current_token.type == TOKEN_COMMA ||
       parser->current_token.type == TOKEN_SEMICOLON ||
       parser->current_token.type == TOKEN_EOF ||
+      parser->current_token.type == TOKEN_RBRACE ||
+      parser->current_token.type == TOKEN_RBRACKET ||
+      parser->current_token.type == TOKEN_COLON ||
+      parser->current_token.type == TOKEN_ARROW ||
+      parser->current_token.type == TOKEN_DOT ||
+      (parser->current_token.type == TOKEN_LBRACKET && !looks_like_type) ||
+      (parser->current_token.type == TOKEN_NEWLINE && !looks_like_type) ||
       (is_binary && !is_unary) ||
       (is_binary && is_unary && !looks_like_type)) {
     free(type_name);

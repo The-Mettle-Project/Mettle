@@ -111,6 +111,7 @@ int ir_effects_name_is_known_clean(const char *name) {
       strncmp(name, "mettle_effects_", 15) == 0 ||
       strncmp(name, "mettle_refine_", 14) == 0 ||
       strncmp(name, "mettle_safety_", 14) == 0 ||
+      strncmp(name, "mettle_string_", 14) == 0 ||
       strncmp(name, "mettle_trace_", 13) == 0) {
     return 1;
   }

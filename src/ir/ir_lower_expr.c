@@ -2171,16 +2171,24 @@ static int ir_lower_string_concat(IRLoweringContext *context,
         return 0;
       }
 
+      MtlcType *string_type = mtlc_type_from_frontend(
+          type_checker_infer_type(context->type_checker, expression));
+      IROperand call_args[2];
+      MtlcType *call_types[2];
+      call_args[0] = left;
+      call_args[1] = right;
+      call_types[0] = string_type;
+      call_types[1] = string_type;
       IRInstruction instruction = {0};
-      instruction.op = IR_OP_BINARY;
+      instruction.op = IR_OP_CALL;
       instruction.location = expression->location;
       instruction.dest = destination;
-      instruction.lhs = left;
-      instruction.rhs = right;
-      instruction.text = binary->operator;
+      instruction.text = "mettle_string_concat";
+      instruction.arguments = call_args;
+      instruction.argument_types = call_types;
+      instruction.argument_count = 2;
       instruction.ast_ref = expression;
-      instruction.value_type = mtlc_type_from_frontend(
-          type_checker_infer_type(context->type_checker, expression));
+      instruction.value_type = string_type;
       instruction.allocates = 1;
       ir_declare_string_concat_helper(context);
       if (!ir_emit(context, function, &instruction)) {

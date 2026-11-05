@@ -59,6 +59,8 @@ void mettle_safety_string_contents(void *record, uint64_t chars);
 void mettle_safety_string_fresh(void *record);
 void mettle_safety_string_release(const void *record);
 uint64_t mettle_safety_c_string_identity(const void *text);
+uint64_t mettle_safety_call_param_value(void *call, uint64_t index, uint64_t value);
+uint64_t mettle_safety_mapping_identity(void *pointer, int64_t size);
 void mettle_safety_buffer_check(void *pointer, int64_t size, uint32_t kind,
                                 uint32_t line, uint64_t identity);
 void *mettle_safety_call_push(void *callee, uint64_t count);

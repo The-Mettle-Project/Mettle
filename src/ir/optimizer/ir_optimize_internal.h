@@ -831,6 +831,7 @@ int ir_simd_fill_pass(IRFunction *function, int *changed);
 #define IR_SAFETY_TEMP_PREFIX ".safe"
 
 int ir_instruction_is_safety_scaffolding(const IRInstruction *instruction);
+int ir_instruction_is_ptr_count_guard(const IRInstruction *instruction);
 
 int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
                          const char *iv);

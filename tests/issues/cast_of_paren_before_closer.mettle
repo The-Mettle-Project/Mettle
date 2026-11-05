@@ -1,0 +1,23 @@
+import "std/io";
+
+struct P { x: int32; }
+
+fn id(a: int32) -> int32 { return a; }
+
+fn main() -> int32 {
+  var a: int32 = 5;
+  var arr: int32[8];
+  arr[(a)] = 3;
+  var p: P;
+  var q: P* = &p;
+  (q)->x = 1;
+  (p).x = 2;
+  var b: int32 = if (a > 1) { (int32)(a) } else { 2 };
+  var c: int32 = { (int32)(uint16)(a) };
+  var d: int32 = arr[(int32)(a)];
+  var h: int32 = if ((a) > (2)) { id((a)) } else { (a) };
+  var k: int32 = { 1 + (int32)(a) };
+  var m: int32 = (arr)[(a)];
+  println("{b} {c} {d} {h} {k} {m} {p.x}");
+  return 0;
+}

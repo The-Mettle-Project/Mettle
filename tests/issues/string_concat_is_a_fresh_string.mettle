@@ -1,0 +1,48 @@
+import "std/io";
+
+var g_count: int64 = 0;
+
+@noinline fn repeated(s: string) -> int32 {
+  var hits: int32 = 0;
+  for i in 0..4 {
+    if (s == ((s + s) + (s + s))) { hits += 1; }
+  }
+  return hits;
+}
+
+@noinline fn loop_tail(s: string, n: int32) -> int64 {
+  var total: int64 = 0;
+  for i in 0..n {
+    var t: string = s + "x";
+    total += (int64)t.length;
+    g_count += (int64)(t + t).length;
+  }
+  return total;
+}
+
+@noinline fn order(a: string, b: string) -> int64 {
+  var x: string = a + b;
+  var y: string = b + a;
+  var same: int64 = 0;
+  if (x == y) { same = 1; }
+  return same;
+}
+
+fn doubled(s: string) -> string {
+  return s + s;
+}
+
+@noinline fn call_twice(s: string) -> int64 {
+  var a: string = doubled(s);
+  var b: string = doubled(s);
+  return (int64)a.length + (int64)b.length;
+}
+
+fn main() -> int32 {
+  println("{repeated("")}");
+  println("{repeated("ab")}");
+  println("{loop_tail("abc", 5)} {g_count}");
+  println("{order("ab", "cd")} {order("aa", "aa")}");
+  println("{call_twice("xyz")}");
+  return 0;
+}

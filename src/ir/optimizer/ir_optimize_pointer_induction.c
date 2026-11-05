@@ -603,11 +603,16 @@ static int ir_ptr_must_keep_counter(const IRFunction *function,
   return 0;
 }
 
+static int ir_ptr_emit_count_guard(IRFunction *function, size_t header_index,
+                                   const char *bound_symbol,
+                                   const char *exit_label,
+                                   IRInstructionVector *vector);
+
 static int ir_ptr_emit_prologue(IRFunction *function,
                                 size_t header_index,
                                 const IRPtrBaseBinding *bindings,
                                 size_t binding_count, const char *bound_symbol,
-                                const char *end_ptr,
+                                const char *end_ptr, const char *exit_label,
                                 IRInstructionVector *vector) {
   IRInstruction end_decl = {0};
   IRInstruction end_init = {0};
@@ -664,6 +669,13 @@ static int ir_ptr_emit_prologue(IRFunction *function,
   end_scale.dest = ir_operand_temp(end_scale_temp);
   end_scale.lhs = ir_operand_symbol(bound_symbol);
   end_scale.rhs = ir_operand_int(2);
+  if (!ir_ptr_emit_count_guard(function, header_index, bound_symbol, exit_label,
+                               vector)) {
+    ir_instruction_destroy_storage(&end_decl);
+    ir_instruction_destroy_storage(&end_init);
+    ir_instruction_destroy_storage(&end_scale);
+    return 0;
+  }
   end_add.op = IR_OP_BINARY;
   end_add.text = mettle_strdup("+");
   end_add.dest = ir_operand_symbol(end_ptr);
@@ -678,6 +690,43 @@ static int ir_ptr_emit_prologue(IRFunction *function,
   ir_instruction_destroy_storage(&end_init);
   ir_instruction_destroy_storage(&end_scale);
   ir_instruction_destroy_storage(&end_add);
+  return ok;
+}
+
+static int ir_ptr_emit_count_guard(IRFunction *function, size_t header_index,
+                                   const char *bound_symbol,
+                                   const char *exit_label,
+                                   IRInstructionVector *vector) {
+  const char *type = ir_function_local_declared_type(function, bound_symbol);
+  int bits = 0;
+  int is_unsigned = 0;
+  char positive[64];
+  IRInstruction compare = {0};
+  IRInstruction branch = {0};
+  int ok;
+  for (size_t p = 0; !type && p < function->parameter_count; p++) {
+    if (function->parameter_names[p] &&
+        strcmp(function->parameter_names[p], bound_symbol) == 0) {
+      type = function->parameter_types[p];
+    }
+  }
+  if (!type || !ir_int_type_name_info(type, &bits, &is_unsigned) || is_unsigned) {
+    return 1;
+  }
+  snprintf(positive, sizeof(positive), "__ptr_t%zu_any", header_index);
+  compare.op = IR_OP_BINARY;
+  compare.text = mettle_strdup(">");
+  compare.dest = ir_operand_temp(positive);
+  compare.lhs = ir_operand_symbol(bound_symbol);
+  compare.rhs = ir_operand_int(0);
+  branch.op = IR_OP_BRANCH_ZERO;
+  branch.text = mettle_strdup(exit_label);
+  branch.lhs = ir_operand_temp(positive);
+  ok = compare.text && compare.dest.name && branch.text && branch.lhs.name &&
+       ir_instruction_vector_append_move(vector, &compare) &&
+       ir_instruction_vector_append_move(vector, &branch);
+  ir_instruction_destroy_storage(&compare);
+  ir_instruction_destroy_storage(&branch);
   return ok;
 }
 
@@ -843,7 +892,9 @@ static int ir_try_pointer_induction_at(IRFunction *function, size_t header_index
   }
 
   if (!ir_ptr_emit_prologue(function, header_index, bindings, binding_count,
-                            bound_symbol, end_ptr, &vector) ||
+                            bound_symbol, end_ptr,
+                            function->instructions[bounds.branch_index].text,
+                            &vector) ||
       !ir_ptr_emit_loop(function, header_index, increment_index,
                         bounds.jump_index, body_start, body_end, bindings,
                         binding_count, iv_symbol, bound_symbol, end_ptr,

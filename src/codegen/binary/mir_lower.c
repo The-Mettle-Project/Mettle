@@ -1737,42 +1737,6 @@ static int mir_call_is_supported(CodeGenerator *g,
   return 1;
 }
 
-int mir_rewrite_string_concat_calls(IRFunction *ir_function) {
-  if (!ir_function) {
-    return 1;
-  }
-  for (size_t i = 0; i < ir_function->instruction_count; i++) {
-    IRInstruction *in = &ir_function->instructions[i];
-    if (in->op != IR_OP_BINARY || !in->text || strcmp(in->text, "+") != 0 ||
-        !in->value_type || in->value_type->kind != MTLC_TYPE_STRING ||
-        in->arguments) {
-      continue;
-    }
-    IROperand *args = calloc(2, sizeof(*args));
-    MtlcType **types = calloc(2, sizeof(*types));
-    char *name = mettle_strdup("mettle_string_concat");
-    if (!args || !types || !name) {
-      free(args);
-      free(types);
-      mettle_free_string(name);
-      return 0;
-    }
-    args[0] = in->lhs;
-    args[1] = in->rhs;
-    types[0] = in->value_type;
-    types[1] = in->value_type;
-    in->lhs = ir_operand_none();
-    in->rhs = ir_operand_none();
-    mettle_free_string(in->text);
-    in->text = name;
-    in->arguments = args;
-    in->argument_types = types;
-    in->argument_count = 2;
-    in->op = IR_OP_CALL;
-  }
-  return 1;
-}
-
 int mir_route_global_call_results(CodeGenerator *generator,
                                   IRFunction *ir_function) {
   static unsigned counter;

@@ -37,8 +37,8 @@ int code_generator_binary_emit_simd_sum_i32(
   }
 
   loop_top = b->size;
-  if (!wcs_cmp_reg_reg32(b, BINARY_GP_RDX, BINARY_GP_R8)) return 0;
-  if (!wcs_jcc(b, 0x83 , &j_done)) return 0;
+  if (!wcs_cmp_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R8)) return 0;
+  if (!wcs_jcc(b, 0x8D , &j_done)) return 0;
 
   if (!wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
       !wcs_sub_reg_reg32(b, BINARY_GP_R9, BINARY_GP_RDX) ||
@@ -291,8 +291,8 @@ int code_generator_binary_emit_simd_sum_u8(
   }
 
   loop_top = b->size;
-  if (!wcs_cmp_reg_reg32(b, BINARY_GP_RDX, BINARY_GP_R8)) return 0;
-  if (!wcs_jcc(b, 0x83 , &j_done)) return 0;
+  if (!wcs_cmp_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R8)) return 0;
+  if (!wcs_jcc(b, 0x8D , &j_done)) return 0;
 
   if (!wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
       !wcs_sub_reg_reg32(b, BINARY_GP_R9, BINARY_GP_RDX) ||
@@ -450,14 +450,14 @@ int code_generator_binary_emit_simd_fill_loop_mode0(BinaryCodeBuffer *b,
   long long per_vec = 16 / size;
   size_t j_done_neg = 0, j_done = 0, j_vec = 0, j_scalar = 0;
   size_t loop_top = 0;
-  if (!wcs_test_reg_reg32(b, BINARY_GP_R8) ||
+  if (!binary_emit_test_reg_reg(b, BINARY_GP_R8) ||
       !wcs_jcc(b, 0x8E , &j_done_neg) ||
       !wcs_xor_self32(b, BINARY_GP_RDX)) {
     return 0;
   }
   loop_top = b->size;
-  if (!wcs_cmp_reg_reg32(b, BINARY_GP_RDX, BINARY_GP_R8) ||
-      !wcs_jcc(b, 0x83 , &j_done)) {
+  if (!wcs_cmp_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R8) ||
+      !wcs_jcc(b, 0x8D , &j_done)) {
     return 0;
   }
   if (!wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
@@ -607,8 +607,8 @@ int code_generator_binary_emit_simd_byte_map(
   }
 
   loop_top = b->size;
-  if (!wcs_cmp_reg_reg32(b, BINARY_GP_RDX, BINARY_GP_R8) ||
-      !wcs_jcc(b, 0x83 , &j_done)) {
+  if (!wcs_cmp_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R8) ||
+      !wcs_jcc(b, 0x8D , &j_done)) {
     return 0;
   }
   if (!wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
@@ -701,7 +701,7 @@ int code_generator_binary_emit_simd_insertion_sort_i32(
   }
 
   outer_loop = b->size;
-  if (!wcs_cmp_reg_reg32(b, BINARY_GP_RDX, BINARY_GP_R8) ||
+  if (!wcs_cmp_reg_reg64(b, BINARY_GP_RDX, BINARY_GP_R8) ||
       !wcs_jcc(b, 0x8D , &j_done)) {
     return 0;
   }
@@ -967,7 +967,7 @@ static int copy_emit_ymm_loop(BinaryCodeBuffer *b, size_t *j_tail) {
 static int copy_emit_byte_tail(BinaryCodeBuffer *b, size_t *j_tail_done) {
   size_t top = b->size;
 
-  return wcs_cmp_reg_imm32(b, BINARY_GP_R9, 0) &&
+  return binary_emit_test_reg_reg(b, BINARY_GP_R9) &&
          wcs_jcc(b, 0x8E, j_tail_done) &&
          binary_emit_movzx_reg_mem8(b, BINARY_GP_RAX, BINARY_GP_RDX, 0) &&
          binary_emit_mov_mem_reg8(b, BINARY_GP_RCX, 0, BINARY_GP_RAX) &&
@@ -978,7 +978,7 @@ static int copy_emit_element_loop(BinaryCodeBuffer *b, long long size,
                                   size_t *j_scalar_done) {
   size_t top = b->size;
 
-  return wcs_cmp_reg_imm32(b, BINARY_GP_R8, 0) &&
+  return binary_emit_test_reg_reg(b, BINARY_GP_R8) &&
          wcs_jcc(b, 0x8E, j_scalar_done) && copy_move_element(b, size) &&
          copy_advance(b, BINARY_GP_R8, (unsigned char)size, 1) &&
          copy_loop_back_to(b, top);
@@ -995,13 +995,12 @@ static int copy_emit_wide_path(BinaryCodeBuffer *b, size_t *j_vec_join) {
 
 static int copy_emit_length_guard(BinaryCodeBuffer *b, unsigned char shift,
                                   size_t *j_empty) {
-  if (!binary_emit_movsxd_reg_reg32(b, BINARY_GP_R8, BINARY_GP_R8) ||
-      !wcs_cmp_reg_imm32(b, BINARY_GP_R8, 0) ||
+  if (!binary_emit_test_reg_reg(b, BINARY_GP_R8) ||
       !wcs_jcc(b, 0x8E, j_empty) ||
       !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8)) {
     return 0;
   }
-  return !shift || wcs_shift_reg_imm(b, BINARY_GP_R9, 0, shift);
+  return !shift || binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, shift);
 }
 
 static int copy_emit_overlap_guard(BinaryCodeBuffer *b, size_t *j_scalar) {

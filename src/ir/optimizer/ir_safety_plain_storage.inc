@@ -315,6 +315,7 @@ static int safety_plain_allowed_use(SafetyPlainStorage *state,
     return position != 3 ||
         safety_plain_metadata_pairs(state, fn, array, "mettle_safety_value_clear", 2);
   }
+  if (!strcmp(in->text, "mettle_safety_call_param_value")) return 1;
   if (position != 3) return 0;
   return !strcmp(in->text, "mettle_safety_identity") ||
          !strcmp(in->text, "mettle_safety_value_load") ||

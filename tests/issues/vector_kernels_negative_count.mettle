@@ -1,0 +1,54 @@
+import "std/io";
+@noinline fn sum32(d: int32*, n: int64) -> int64 { var s: int64 = 0; var i: int64 = 0; while (i < n) { s = s + (int64)d[i]; i = i + 1; } return s; }
+@noinline fn sum32a(d: int32*, n: int32) -> int32 { var s: int32 = 0; for i in 0..n { s = s + d[i]; } return s; }
+@noinline fn sumf(d: float64*, n: int64) -> float64 { var s: float64 = 0.0; var i: int64 = 0; while (i < n) { s = s + d[i]; i = i + 1; } return s; }
+@noinline fn sumf32(d: float32*, n: int64) -> float32 { var s: float32 = (float32)0.0; var i: int64 = 0; while (i < n) { s = s + d[i]; i = i + 1; } return s; }
+@noinline fn dotf(a: float64*, b: float64*, n: int64) -> float64 { var s: float64 = 0.0; var i: int64 = 0; while (i < n) { s = s + a[i] * b[i]; i = i + 1; } return s; }
+@noinline fn dotf32(a: float32*, b: float32*, n: int64) -> float32 { var s: float32 = (float32)0.0; var i: int64 = 0; while (i < n) { s = s + a[i] * b[i]; i = i + 1; } return s; }
+@noinline fn fill32(d: int32*, n: int64, v: int32) { var i: int64 = 0; while (i < n) { d[i] = v; i = i + 1; } }
+@noinline fn fill64(d: int64*, n: int64, v: int64) { var i: int64 = 0; while (i < n) { d[i] = v; i = i + 1; } }
+@noinline fn fill8(d: uint8*, n: int64, v: uint8) { var i: int64 = 0; while (i < n) { d[i] = v; i = i + 1; } }
+@noinline fn fillf(d: float64*, n: int64, v: float64) { var i: int64 = 0; while (i < n) { d[i] = v; i = i + 1; } }
+@noinline fn copy8(d: uint8*, s: uint8*, n: int64) { var i: int64 = 0; while (i < n) { d[i] = s[i]; i = i + 1; } }
+@noinline fn copy32(d: int32*, s: int32*, n: int64) { var i: int64 = 0; while (i < n) { d[i] = s[i]; i = i + 1; } }
+@noinline fn copy64(d: int64*, s: int64*, n: int64) { var i: int64 = 0; while (i < n) { d[i] = s[i]; i = i + 1; } }
+@noinline fn mapf(d: float64*, s: float64*, n: int64, k: float64) { var i: int64 = 0; while (i < n) { d[i] = s[i] * k + 1.0; i = i + 1; } }
+@noinline fn map32(d: int32*, s: int32*, n: int64, k: int32) { var i: int64 = 0; while (i < n) { d[i] = s[i] * k + 1; i = i + 1; } }
+@noinline fn addin(d: int32*, s: int32*, n: int64) { var i: int64 = 0; while (i < n) { d[i] = d[i] + s[i]; i = i + 1; } }
+@noinline fn sum8(d: uint8*, n: int64) -> int64 { var s: int64 = 0; var i: int64 = 0; while (i < n) { s = s + (int64)d[i]; i = i + 1; } return s; }
+@noinline fn count8(d: uint8*, n: int64, c: uint8) -> int64 { var s: int64 = 0; var i: int64 = 0; while (i < n) { if (d[i] == c) { s = s + 1; } i = i + 1; } return s; }
+@noinline fn find8(d: uint8*, n: int64, c: uint8) -> int64 { var i: int64 = 0; while (i < n) { if (d[i] == c) { return i; } i = i + 1; } return -1; }
+@noinline fn find32(d: int32*, n: int64, c: int32) -> int64 { var i: int64 = 0; while (i < n) { if (d[i] == c) { return i; } i = i + 1; } return -1; }
+@noinline fn max32(d: int32*, n: int64) -> int32 { var m: int32 = -2147483647; var i: int64 = 0; while (i < n) { if (d[i] > m) { m = d[i]; } i = i + 1; } return m; }
+@noinline fn min32(d: int32*, n: int64) -> int32 { var m: int32 = 2147483647; var i: int64 = 0; while (i < n) { if (d[i] < m) { m = d[i]; } i = i + 1; } return m; }
+@noinline fn strlen8(d: uint8*, n: int64) -> int64 { var i: int64 = 0; while (i < n && d[i] != (uint8)0) { i = i + 1; } return i; }
+@noinline fn popc(d: uint64*, n: int64) -> int64 { var s: int64 = 0; var i: int64 = 0; while (i < n) { var v: uint64 = d[i]; while (v != 0) { v = v & (v - 1); s = s + 1; } i = i + 1; } return s; }
+@noinline fn xors(d: uint64*, n: int64) -> uint64 { var s: uint64 = 0; var i: int64 = 0; while (i < n) { s = s ^ d[i]; i = i + 1; } return s; }
+@noinline fn sumr(d: int32*, lo: int64, hi: int64) -> int64 { var s: int64 = 0; var i: int64 = lo; while (i < hi) { s = s + (int64)d[i]; i = i + 1; } return s; }
+
+fn run(n: int64) {
+  var nul: int32* = (int32*)0;
+  var nulf: float64* = (float64*)0;
+  var nulg: float32* = (float32*)0;
+  var nulb: uint8* = (uint8*)0;
+  var nulq: int64* = (int64*)0;
+  var nulu: uint64* = (uint64*)0;
+  println("{sum32(nul, n)} {sum32a(nul, -3)} {sumf(nulf, n)} {sumf32(nulg, n)} {dotf(nulf, nulf, n)} {dotf32(nulg, nulg, n)}");
+  fill32(nul, n, 1); fill64(nulq, n, 1); fill8(nulb, n, (uint8)1); fillf(nulf, n, 1.0);
+  copy8(nulb, nulb, n); copy32(nul, nul, n); copy64(nulq, nulq, n);
+  mapf(nulf, nulf, n, 2.0); map32(nul, nul, n, 2); addin(nul, nul, n);
+  println("{sum8(nulb, n)} {count8(nulb, n, (uint8)1)} {find8(nulb, n, (uint8)1)} {find32(nul, n, 1)} {max32(nul, n)} {min32(nul, n)} {strlen8(nulb, n)} {popc(nulu, n)} {xors(nulu, n)} {sumr(nul, 5, n)}");
+}
+
+fn main() -> int32 {
+  run(0);
+  run(-1);
+  run(-5);
+  run(-2147483648);
+  run(-4294967296);
+  run(-9223372036854775807);
+  var big: int32[8];
+  for i in 0..8 { big[i] = i + 1; }
+  println("{sum32(&big[0], 8)} {sum32(&big[0], 3)} {sumr(&big[0], 2, 6)}");
+  return 0;
+}

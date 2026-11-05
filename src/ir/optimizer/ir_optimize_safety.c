@@ -2483,6 +2483,7 @@ static int safety_declare_runtime(IRProgram *program) {
       {"mettle_safety_call_enter", pointer, span_params, 1},
       {"mettle_safety_call_arg", nothing, call_arg_params, 3},
       {"mettle_safety_call_param", u64, pointer_u64, 2},
+      {"mettle_safety_call_param_value", u64, call_arg_params, 3},
       {"mettle_safety_call_return", nothing, pointer_u64, 2},
       {"mettle_safety_call_pop", u64, span_params, 1},
       {"mettle_safety_call_arg_copy", nothing, arg_copy_params, 4},
@@ -2502,6 +2503,7 @@ static int safety_declare_runtime(IRProgram *program) {
       {"mettle_safety_string_fresh", nothing, span_params, 1},
       {"mettle_safety_string_release", nothing, span_params, 1},
       {"mettle_safety_c_string_identity", u64, span_params, 1},
+      {"mettle_safety_mapping_identity", u64, pointer_u64, 2},
       {"mettle_safety_global_pointer", nothing, call_arg_params, 3},
   };
 
@@ -2720,9 +2722,49 @@ typedef enum {
   SAFETY_ALLOC_FREE
 } SafetyAllocKind;
 
+static const IRProgram *g_safety_alloc_program = NULL;
+static const char *g_safety_alloc_source = NULL;
+
+static int safety_name_is_std_alloc(const char *name) {
+  const IRProgram *program = g_safety_alloc_program;
+  if (!program || !g_safety_alloc_source) {
+    return 0;
+  }
+  for (size_t f = 0; f < program->function_count; f++) {
+    const IRFunction *function = program->functions[f];
+    if (function && function->name && !strcmp(function->name, name)) {
+      return function->location.filename &&
+             !strcmp(function->location.filename, g_safety_alloc_source);
+    }
+  }
+  return 0;
+}
+
+static int safety_callee_takes_heap(const IRInstruction *instruction) {
+  const char *callee = instruction->text;
+  return callee && strncmp(callee, "mem_", 4) == 0 &&
+         (!strcmp(callee, "mem_alloc") || !strcmp(callee, "mem_calloc") ||
+          !strcmp(callee, "mem_realloc") || !strcmp(callee, "mem_free")) &&
+         safety_name_is_std_alloc(callee);
+}
+
+static int safety_callee_is_direct_allocator(const IRInstruction *instruction) {
+  const char *callee = instruction->text;
+  return callee && strncmp(callee, "mx_", 3) == 0 &&
+         (!strcmp(callee, "mx_alloc") || !strcmp(callee, "mx_calloc") ||
+          !strcmp(callee, "mx_realloc") || !strcmp(callee, "mx_free")) &&
+         safety_name_is_std_alloc(callee);
+}
+
+static size_t safety_alloc_lead(const IRInstruction *instruction) {
+  return safety_callee_takes_heap(instruction) ? 1 : 0;
+}
+
 static int safety_callee_is_mettle_allocator(const IRInstruction *instruction) {
   return instruction->op == IR_OP_CALL && instruction->text &&
-         strncmp(instruction->text, "mettle_heap_", 12) == 0;
+         (strncmp(instruction->text, "mettle_heap_", 12) == 0 ||
+          safety_callee_takes_heap(instruction) ||
+          safety_callee_is_direct_allocator(instruction));
 }
 
 static SafetyAllocKind safety_classify_call(const IRInstruction *instruction) {
@@ -2731,6 +2773,21 @@ static SafetyAllocKind safety_classify_call(const IRInstruction *instruction) {
   }
   const char *callee = instruction->text;
   size_t arguments = instruction->argument_count;
+
+  if (safety_callee_takes_heap(instruction)) {
+    if (arguments == 2 && !strcmp(callee, "mem_alloc")) return SAFETY_ALLOC_SIZE;
+    if (arguments == 3 && !strcmp(callee, "mem_calloc")) return SAFETY_ALLOC_PRODUCT;
+    if (arguments == 3 && !strcmp(callee, "mem_realloc")) return SAFETY_ALLOC_REALLOC;
+    if (arguments == 2 && !strcmp(callee, "mem_free")) return SAFETY_ALLOC_FREE;
+    return SAFETY_ALLOC_NONE;
+  }
+  if (safety_callee_is_direct_allocator(instruction)) {
+    if (arguments == 1 && !strcmp(callee, "mx_alloc")) return SAFETY_ALLOC_SIZE;
+    if (arguments == 2 && !strcmp(callee, "mx_calloc")) return SAFETY_ALLOC_PRODUCT;
+    if (arguments == 2 && !strcmp(callee, "mx_realloc")) return SAFETY_ALLOC_REALLOC;
+    if (arguments == 1 && !strcmp(callee, "mx_free")) return SAFETY_ALLOC_FREE;
+    return SAFETY_ALLOC_NONE;
+  }
 
   if (arguments == 1 &&
       (strcmp(callee, "malloc") == 0 ||
@@ -2855,10 +2912,12 @@ static int safety_register_function(IRFunction *function) {
       continue;
     }
 
+    size_t lead = is_new ? 0 : safety_alloc_lead(instruction);
+
     if (kind == SAFETY_ALLOC_FREE) {
       if (!safety_emit_one_pointer_call(&out, location,
                                         "mettle_safety_unregister",
-                                        &instruction->arguments[0])) {
+                                        &instruction->arguments[lead])) {
         ir_instruction_vector_destroy(&out);
         return 0;
       }
@@ -2869,9 +2928,9 @@ static int safety_register_function(IRFunction *function) {
     if (is_new) {
       size = safety_new_size(instruction);
     } else if (kind == SAFETY_ALLOC_SIZE) {
-      size = instruction->arguments[0];
+      size = instruction->arguments[lead];
     } else if (kind == SAFETY_ALLOC_REALLOC) {
-      size = instruction->arguments[1];
+      size = instruction->arguments[lead + 1];
     } else if (kind == SAFETY_ALLOC_PRODUCT) {
       char product[64];
       snprintf(product, sizeof(product), SAFETY_TEMP_PREFIX "n%u",
@@ -2879,8 +2938,8 @@ static int safety_register_function(IRFunction *function) {
       product_operand = ir_operand_temp(product);
       if (!product_operand.name ||
           !safety_emit_binary(&out, location, "*", product,
-                              &instruction->arguments[0],
-                              &instruction->arguments[1], 1)) {
+                              &instruction->arguments[lead],
+                              &instruction->arguments[lead + 1], 1)) {
         ir_operand_destroy(&product_operand);
         ir_instruction_vector_destroy(&out);
         return 0;
@@ -2890,7 +2949,7 @@ static int safety_register_function(IRFunction *function) {
 
     IROperand result = instruction->dest;
     IROperand old_pointer = kind == SAFETY_ALLOC_REALLOC
-                                ? instruction->arguments[0]
+                                ? instruction->arguments[lead]
                                 : ir_operand_none();
     int bracket = safety_callee_is_mettle_allocator(instruction);
 
@@ -3459,6 +3518,8 @@ int ir_safety_register_allocations(IRProgram *program) {
       !safety_normalize_external_calls(program)) return 0;
   const char *allocator_source = safety_allocator_source(program);
   IRFunction *entry = NULL;
+  g_safety_alloc_program = program;
+  g_safety_alloc_source = allocator_source;
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *function = program->functions[i];
     if (!function) {
@@ -3467,7 +3528,8 @@ int ir_safety_register_allocations(IRProgram *program) {
     if (function->name && strcmp(function->name, "main") == 0) {
       entry = function;
     }
-    if (safety_function_is_allocator(function, allocator_source)) {
+    if (function->is_rule ||
+        safety_function_is_allocator(function, allocator_source)) {
       continue;
     }
     if (!safety_register_function(function) ||

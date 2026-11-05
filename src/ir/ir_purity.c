@@ -49,6 +49,7 @@ static int purity_instruction_is_readonly(IRProgram *program,
   case IR_OP_ROTATE_ADD:
   case IR_OP_CAST:
   case IR_OP_RETURN:
+  case IR_OP_SAFETY_CHECK:
     return 1;
   case IR_OP_CALL: {
     IRFunction *callee;
@@ -150,6 +151,7 @@ static int purity_body_is_speculatable(IRProgram *program,
       }
       break;
     case IR_OP_LOAD:
+    case IR_OP_SAFETY_CHECK:
       result = 0;
       break;
     case IR_OP_BINARY:
@@ -266,7 +268,8 @@ static const IRInstruction *purity_first_impurity(IRProgram *program,
       *what = "calls through a pointer";
       return inst;
     case IR_OP_CALL:
-      *what = "calls a function that is not read-only";
+      *what = inst->allocates ? "allocates"
+                              : "calls a function that is not read-only";
       return inst;
     default:
       *what = "writes observable state";

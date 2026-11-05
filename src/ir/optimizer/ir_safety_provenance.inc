@@ -242,10 +242,6 @@ static int origin_runtime_check(SafetyOrigins *origins, IRInstruction *in) {
 
 static int origin_makes_runtime_string(SafetyOrigins *origins,
                                        const IRInstruction *in) {
-  if (in->op == IR_OP_BINARY) {
-    return in->allocates && in->text && !strcmp(in->text, "+") && in->value_type &&
-           in->value_type->kind == MTLC_TYPE_STRING;
-  }
   if (in->op != IR_OP_CALL || !in->text || in->dest.kind == IR_OPERAND_NONE ||
       strncmp(in->text, "mettle_string_", 14) != 0) {
     return 0;
@@ -369,9 +365,10 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
   if (!origin_get(origins, location, &lhs, &left) ||
       !origin_get(origins, location, &rhs, &right)) goto done;
   if (call && safety_classify_call(in) == SAFETY_ALLOC_REALLOC) {
+    size_t lead = safety_alloc_lead(in);
     IROperand identity = ir_operand_none();
-    if (!origin_get(origins, location, &in->arguments[0], &identity)) goto done;
-    IROperand args[2] = {in->arguments[0], identity};
+    if (!origin_get(origins, location, &in->arguments[lead], &identity)) goto done;
+    IROperand args[2] = {in->arguments[lead], identity};
     int checked = origin_call(origins, location, "mettle_safety_free_identity", args, 2, NULL);
     ir_operand_destroy(&identity);
     if (!checked) goto done;
@@ -488,6 +485,21 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
   int is_float = in->is_float;
   int fresh_string = origin_makes_runtime_string(origins, in);
   int c_string_result = origin_returns_c_string(origins, in);
+  int os_mapping = call && in->text && in->argument_count == 1 &&
+                   strstr(in->text, "os_mem_map") != NULL;
+  IROperand mapping_size = ir_operand_none();
+  if (os_mapping && !ir_operand_clone(&in->arguments[0], &mapping_size)) {
+    ir_operand_destroy(&memory_result);
+    goto done;
+  }
+  if (call && in->text && in->argument_count == 2 &&
+      strstr(in->text, "os_mem_unmap") != NULL &&
+      !origin_call(origins, location, "mettle_safety_region_end", &in->arguments[0], 1,
+                   NULL)) {
+    ir_operand_destroy(&memory_result);
+    ir_operand_destroy(&mapping_size);
+    goto done;
+  }
   if (call && in->text && !strcmp(in->text, "mettle_string_free") &&
       in->argument_count == 1) {
     IROperand record = ir_operand_none();
@@ -553,6 +565,11 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
     if (!ok) goto done;
   } else if (output && op == IR_OP_ADDRESS_OF) {
     if (!origin_capture(origins, location, &dest)) goto done;
+  } else if (output && op == IR_OP_ASSIGN && lhs.kind == IR_OPERAND_STRING &&
+             !origin_value_is_string(origins, &dest)) {
+    IROperand args[2] = {dest, ir_operand_int((long long)ir_operand_string_length(&lhs) + 1)};
+    if (!origin_call(origins, location, "mettle_safety_literal_identity", args, 2,
+                     &output->identity)) goto done;
   } else if (output && (op == IR_OP_ASSIGN || op == IR_OP_CAST || op == IR_OP_UNARY)) {
     if (!origin_assign(origins, location, &output->identity, &left)) goto done;
   } else if (output && arithmetic && !is_float) {
@@ -618,6 +635,15 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
       ir_operand_destroy(&destination);
       if (!copied) goto done;
     }
+  }
+  if (os_mapping) {
+    IROperand args[2] = {dest, mapping_size};
+    IROperand unused = origin_fresh();
+    int described = origin_call(origins, location, "mettle_safety_mapping_identity",
+                                args, 2, output ? &output->identity : &unused);
+    ir_operand_destroy(&unused);
+    ir_operand_destroy(&mapping_size);
+    if (!described) goto done;
   }
   if (output && op != IR_OP_STORE && op != IR_OP_DECLARE_LOCAL &&
       !origin_save(origins, location, &dest)) goto done;
@@ -857,8 +883,16 @@ static int safety_origins_function(IRProgram *program, IRFunction *function) {
       if (!passed) goto done;
       continue;
     }
-    int passed = !origin || !origin->active || (origin_call(&origins, function->location,
-        "mettle_safety_call_param", args, 2, &origin->identity) &&
+    int pointer_shaped = origin && origin->type &&
+        (origin->type->kind == MTLC_TYPE_POINTER ||
+         (origin->type->name && (!strcmp(origin->type->name, "cstring") ||
+                                 !strcmp(origin->type->name, "rawptr"))));
+    IROperand value_args[3] = {entry, args[1], parameter};
+    int passed = !origin || !origin->active || ((pointer_shaped
+        ? origin_call(&origins, function->location, "mettle_safety_call_param_value",
+                      value_args, 3, &origin->identity)
+        : origin_call(&origins, function->location, "mettle_safety_call_param", args, 2,
+                      &origin->identity)) &&
         origin_save(&origins, function->location, &parameter));
     ir_operand_destroy(&parameter);
     if (!passed) goto done;

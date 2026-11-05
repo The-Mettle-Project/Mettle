@@ -384,6 +384,7 @@ static void NTAPI safety_calls_destroy(void *value) {
   safety_unmap(calls, sizeof(*calls));
 }
 static SafetyCalls *safety_calls(void) {
+  DWORD last_error = GetLastError();
   DWORD slot = __atomic_load_n(&g_safety_calls_slot, __ATOMIC_ACQUIRE);
   if (slot == FLS_OUT_OF_INDEXES) {
     safety_lock();
@@ -402,6 +403,7 @@ static SafetyCalls *safety_calls(void) {
     if (!calls || !FlsSetValue(slot, calls))
       safety_internal_failure("Fatal error: unable to allocate pointer safety thread state");
   }
+  SetLastError(last_error);
   return calls;
 }
 #else
@@ -452,6 +454,12 @@ void mettle_safety_call_arg(void *call, uint64_t index, uint64_t identity) {
 uint64_t mettle_safety_call_param(void *call, uint64_t index) {
   SafetyCall *frame = (SafetyCall *)call;
   return frame && index < frame->count ? frame->arguments[index] : 0;
+}
+
+uint64_t mettle_safety_call_param_value(void *call, uint64_t index, uint64_t value) {
+  SafetyCall *frame = (SafetyCall *)call;
+  if (frame) return index < frame->count ? frame->arguments[index] : 0;
+  return mettle_safety_identity((const void *)(uintptr_t)value);
 }
 
 void mettle_safety_call_return(void *call, uint64_t identity) {
@@ -505,6 +513,12 @@ void mettle_safety_string_release(const void *record) {
       known.start == (uintptr_t)data) {
     mettle_safety_unregister((void *)data);
   }
+}
+
+uint64_t mettle_safety_mapping_identity(void *pointer, int64_t size) {
+  if (!pointer || size <= 0) return 0;
+  mettle_safety_region_begin(pointer, size);
+  return mettle_safety_identity(pointer);
 }
 
 uint64_t mettle_safety_c_string_identity(const void *text) {

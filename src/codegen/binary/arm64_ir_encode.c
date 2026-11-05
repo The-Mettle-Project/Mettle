@@ -1645,8 +1645,8 @@ static const char CONCAT_B_SLOT[] = "..concat.b";
 static const char CONCAT_DST_SLOT[] = "..concat.dst";
 
 static int binary_is_string_concat(const IRInstruction *in) {
-  return in->op == IR_OP_BINARY && in->text && strcmp(in->text, "+") == 0 &&
-         in->value_type && in->value_type->kind == MTLC_TYPE_STRING;
+  return in->op == IR_OP_CALL && in->text && in->argument_count == 2 &&
+         strcmp(in->text, "mettle_string_concat") == 0;
 }
 
 static void emit_concat_operand(Arm64Emit *e, SlotMap *slots, AggMap *ag,
@@ -1698,8 +1698,8 @@ static void emit_string_concat(Arm64Emit *e, SlotMap *slots, AggMap *ag,
   int off_a = slot_off(slots, CONCAT_A_SLOT);
   int off_b = slot_off(slots, CONCAT_B_SLOT);
   int off_dst = slot_off(slots, CONCAT_DST_SLOT);
-  emit_concat_operand(e, slots, ag, &in->lhs, off_a);
-  emit_concat_operand(e, slots, ag, &in->rhs, off_b);
+  emit_concat_operand(e, slots, ag, &in->arguments[0], off_a);
+  emit_concat_operand(e, slots, ag, &in->arguments[1], off_b);
   emit_concat_lengths(e, off_a, off_b, ARM64_X0);
   emit_concat_header_offset(e, ARM64_X0, ARM64_X0);
   arm64_emit_word(e, arm64_add_imm(1, ARM64_X0, ARM64_X0, 16, 0));
@@ -2279,16 +2279,6 @@ static int encode_arithmetic_instruction(const Arm64Scope *scope,
   (void)sret_size;
   switch (in->op) {
   case IR_OP_BINARY:
-    if (binary_is_string_concat(in)) {
-      if (!object && !fns) {
-        arm64_fail(e, "string concatenation in '%s' needs the runtime "
-                      "kernel, which this path does not provide",
-                   fn->name);
-        break;
-      }
-      emit_string_concat(e, slots, ag, object, prog, fns, in);
-      break;
-    }
     lower_binary(e, slots, fs, us, in);
     break;
   case IR_OP_UNARY:
@@ -2337,6 +2327,16 @@ static int encode_call_instruction(const Arm64Scope *scope,
   (void)sret_size;
   switch (in->op) {
   case IR_OP_CALL: {
+    if (binary_is_string_concat(in)) {
+      if (!object && !fns) {
+        arm64_fail(e, "string concatenation in '%s' needs the runtime "
+                      "kernel, which this path does not provide",
+                   fn->name);
+        break;
+      }
+      emit_string_concat(e, slots, ag, object, prog, fns, in);
+      break;
+    }
     if (!fns || !in->text) {
       arm64_fail(e, in->text
                         ? "'%s' calls '%s', but this path lowers one function"

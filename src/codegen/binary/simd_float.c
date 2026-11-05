@@ -6,6 +6,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int simd_clamped_count(BinaryCodeBuffer *b) {
+  return binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8) &&
+         binary_emit_shift_reg_imm8(b, 7, BINARY_GP_R9, 63) &&
+         binary_code_buffer_append_u8(b, 0x49) &&
+         binary_code_buffer_append_u8(b, 0xF7) &&
+         binary_code_buffer_append_u8(b, 0xD1) &&
+         binary_code_buffer_append_u8(b, 0x4D) &&
+         binary_code_buffer_append_u8(b, 0x21) &&
+         binary_code_buffer_append_u8(b, 0xC1);
+}
+
 int code_generator_binary_emit_simd_sum_f64(
     CodeGenerator *generator, BinaryFunctionContext *context,
     const IRInstruction *instruction) {
@@ -31,8 +42,8 @@ int code_generator_binary_emit_simd_sum_f64(
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->rhs,
                                                BINARY_GP_R8) ||
-      !wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
-      !wcs_shift_reg_imm(b, BINARY_GP_R9, 0, 3) ||
+      !simd_clamped_count(b) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 3) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX) ||
       !wcs_avx_vpxor_ymm(b, 2, 2, 2) ||
       !wcs_avx_vpxor_ymm(b, 4, 4, 4)) {
@@ -128,8 +139,8 @@ int code_generator_binary_emit_simd_sum_f32(
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->rhs,
                                                BINARY_GP_R8) ||
-      !wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
-      !wcs_shift_reg_imm(b, BINARY_GP_R9, 0, 2) ||
+      !simd_clamped_count(b) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX) ||
       !wcs_avx_vpxor_ymm(b, 2, 2, 2) ||
       !wcs_avx_vpxor_ymm(b, 4, 4, 4)) {
@@ -230,8 +241,8 @@ int code_generator_binary_emit_simd_dot_f64(
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[0],
                                                BINARY_GP_R8) ||
-      !wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
-      !wcs_shift_reg_imm(b, BINARY_GP_R9, 0, 3) ||
+      !simd_clamped_count(b) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 3) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX) ||
       !wcs_avx_vpxor_ymm(b, 2, 2, 2) ||
       !wcs_avx_vpxor_ymm(b, 4, 4, 4)) {
@@ -498,8 +509,8 @@ int code_generator_binary_emit_simd_affine_map_f64_inline(
       !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, (long long)c_bits) ||
       !binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
       !wcs_avx_vbroadcastsd_ymm_xmm(b, 3, 3) ||
-      !wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
-      !wcs_shift_reg_imm(b, BINARY_GP_R9, 0, 3) ||
+      !simd_clamped_count(b) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 3) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX)) {
     return 0;
   }
@@ -551,8 +562,8 @@ int code_generator_binary_emit_simd_affine_map_f64(
                                                BINARY_GP_RAX) ||
       !binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
       !wcs_avx_vbroadcastsd_ymm_xmm(b, 3, 3) ||
-      !wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
-      !wcs_shift_reg_imm(b, BINARY_GP_R9, 0, 3) ||
+      !simd_clamped_count(b) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 3) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX)) {
     return 0;
   }
@@ -678,8 +689,8 @@ int code_generator_binary_emit_simd_affine_map_f32_inline(
       !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, c_bits) ||
       !wcs_movd_xmm_reg(b, 3, BINARY_GP_RAX) ||
       !wcs_avx_vpbroadcastd_ymm(b, 3, 3) ||
-      !wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
-      !wcs_shift_reg_imm(b, BINARY_GP_R9, 0, 2) ||
+      !simd_clamped_count(b) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX)) {
     return 0;
   }
@@ -731,8 +742,8 @@ int code_generator_binary_emit_simd_affine_map_f32(
                                                BINARY_GP_RAX) ||
       !wcs_movd_xmm_reg(b, 3, BINARY_GP_RAX) ||
       !wcs_avx_vpbroadcastd_ymm(b, 3, 3) ||
-      !wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
-      !wcs_shift_reg_imm(b, BINARY_GP_R9, 0, 2) ||
+      !simd_clamped_count(b) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX)) {
     return 0;
   }
@@ -1601,7 +1612,7 @@ int code_generator_binary_emit_simd_vloop_f64(
 
   vec_top = b->size;
   if (!wcs_cmp_reg_imm8(b, BINARY_GP_R10, k.lanes) ||
-      !wcs_jcc(b, 0x82, &j_tail) || !vloop_emit_vector_body(&k) ||
+      !wcs_jcc(b, 0x8C, &j_tail) || !vloop_emit_vector_body(&k) ||
       !vloop_emit_advance(&k, k.vec_stride, k.lanes) ||
       !wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, vec_top) ||
       !wcs_patch_here(b, j_tail)) {
@@ -1615,7 +1626,7 @@ int code_generator_binary_emit_simd_vloop_f64(
 
   tail_top = b->size;
   j_back = 0;
-  if (!wcs_cmp_reg_imm8(b, BINARY_GP_R10, 0) || !wcs_jcc(b, 0x84, &j_done) ||
+  if (!wcs_cmp_reg_imm8(b, BINARY_GP_R10, 0) || !wcs_jcc(b, 0x8E, &j_done) ||
       !vloop_emit_tail_body(&k) || !vloop_emit_advance(&k, k.elem_bytes, 1) ||
       !wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, tail_top) ||
       !wcs_patch_here(b, j_done)) {
@@ -2170,8 +2181,8 @@ int code_generator_binary_emit_simd_dot_f32(
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[0],
                                                BINARY_GP_R8) ||
-      !wcs_mov_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R8) ||
-      !wcs_shift_reg_imm(b, BINARY_GP_R9, 0, 2) ||
+      !simd_clamped_count(b) ||
+      !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX) ||
       !wcs_avx_vpxor_ymm(b, 2, 2, 2) ||
       !wcs_avx_vpxor_ymm(b, 4, 4, 4)) {
@@ -2362,7 +2373,7 @@ int code_generator_binary_emit_simd_exp_f32(CodeGenerator *generator,
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[0],
                                                BINARY_GP_R8) ||
-      !binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8) ||
+      !simd_clamped_count(b) ||
       !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX)) {
     return 0;
@@ -2473,7 +2484,7 @@ int code_generator_binary_emit_simd_silu_f32_inline(BinaryCodeBuffer *b,
                                                     int has_mul) {
   size_t loop_top = 0, done_main = 0, small = 0, fin = 0, noclamp = 0;
   size_t tail = 0;
-  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8) ||
+  if (!simd_clamped_count(b) ||
       !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
       !wcs_add_reg_reg64(b, BINARY_GP_R9, BINARY_GP_RCX)) {
     return 0;

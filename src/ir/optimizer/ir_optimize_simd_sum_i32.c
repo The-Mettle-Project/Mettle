@@ -460,12 +460,20 @@ int ir_instruction_is_safety_scaffolding(const IRInstruction *instruction) {
                  sizeof(IR_SAFETY_TEMP_PREFIX) - 1) == 0;
 }
 
+int ir_instruction_is_ptr_count_guard(const IRInstruction *instruction) {
+  return instruction && instruction->op == IR_OP_BRANCH_ZERO &&
+         ir_operand_is_temp(&instruction->lhs) &&
+         strncmp(instruction->lhs.name, "__ptr_t", 7) == 0 &&
+         strstr(instruction->lhs.name, "_any") != NULL;
+}
+
 int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
                          const char *iv) {
   for (size_t i = header_index; i-- > 0;) {
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL ||
-        ir_instruction_is_safety_scaffolding(ins)) {
+        ir_instruction_is_safety_scaffolding(ins) ||
+        ir_instruction_is_ptr_count_guard(ins)) {
       continue;
     }
     if (ins->op == IR_OP_LABEL || ins->op == IR_OP_JUMP ||
