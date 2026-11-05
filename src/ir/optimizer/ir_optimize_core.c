@@ -2048,7 +2048,11 @@ int ir_common_subexpression_elimination_pass(IRFunction *function,
       }
     }
 
-    if (instruction->op == IR_OP_STORE) {
+    if (instruction->op == IR_OP_STORE ||
+        (instruction->op != IR_OP_RETURN && instruction->op != IR_OP_CALL &&
+         instruction->op != IR_OP_CALL_INDIRECT &&
+         instruction->op != IR_OP_INLINE_ASM &&
+         ir_instruction_has_side_effect(instruction))) {
       ir_expression_map_invalidate_after_store(&map, &addr_taken);
     }
 

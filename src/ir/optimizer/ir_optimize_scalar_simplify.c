@@ -1018,6 +1018,11 @@ static void ir_cp_invalidate_for(IRCopyPropState *state,
              instruction->op == IR_OP_INLINE_ASM) {
     ir_temp_value_map_remove_symbol_values(&state->map, NULL);
     ir_temp_value_map_clear(&state->symbol_map);
+  } else if (instruction->op != IR_OP_RETURN &&
+             ir_instruction_has_side_effect(instruction)) {
+    ir_temp_value_map_invalidate_after_store(&state->map, &state->addr_taken);
+    ir_temp_value_map_invalidate_after_store(&state->symbol_map,
+                                             &state->addr_taken);
   }
 }
 

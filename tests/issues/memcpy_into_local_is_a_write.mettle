@@ -1,0 +1,26 @@
+import "std/io";
+import "std/mem";
+
+@noinline fn reread(x: int64, y: int64) -> int64 {
+  var w: int64 = x;
+  var src: int64 = y;
+  var a: int64 = w * 3;
+  memcpy((void*)&w, (void*)&src, 8);
+  var b: int64 = w * 3;
+  return a * 1000 + b;
+}
+
+fn main() -> int32 {
+  var h1: float64 = 1234.5678;
+  var bits: int64 = 0;
+  memcpy((void*)&bits, (void*)&h1, 8);
+  var f: float32 = (float32)3.25;
+  var b32: int32 = 0;
+  memcpy((void*)&b32, (void*)&f, 4);
+  var w: int64 = 5;
+  var src: int64 = 77;
+  memcpy((void*)&w, (void*)&src, 8);
+  var sum: int64 = w + 1;
+  println("{bits} {b32} {w} {sum} {reread(5, 7)}");
+  return 0;
+}
