@@ -187,7 +187,7 @@ fn hash_map_prepare_insert<K, V>(map: HashMap<K, V>*) -> int32 {
   var new_capacity: int64 = map->capacity;
   if (new_capacity == (int64)0) {
     new_capacity = (int64)16;
-  } else {
+  } else if ((map->length + (int64)1) * (int64)20 >= map->capacity * (int64)7) {
     if (new_capacity > (int64)4611686018427387903) {
       return 2;
     }

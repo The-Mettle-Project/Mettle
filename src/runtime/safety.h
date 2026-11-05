@@ -30,6 +30,8 @@ void mettle_safety_unregister(void *pointer);
 void mettle_safety_enter_allocator(void);
 void mettle_safety_leave_allocator(void);
 
+void mettle_safety_reregister_held(void *old_pointer, void *new_pointer,
+                                   uint64_t size, uint64_t old_identity);
 void mettle_safety_reregister(void *old_pointer, void *new_pointer,
                               uint64_t size);
 

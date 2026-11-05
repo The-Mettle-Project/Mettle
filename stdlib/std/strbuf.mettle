@@ -19,11 +19,13 @@ fn strbuf_bytes() -> int64 {
 
 fn strbuf_grow(b: StrBuf*, needed: int64) -> int32 {
   if (b == 0 || b->arena == 0) { return 0; }
+  if (needed < (int64)0) { return 0; }
   if (needed <= b->cap) { return 1; }
 
   var new_cap: int64 = b->cap;
   if (new_cap <= (int64)0) { new_cap = strbuf_default_cap(); }
   while (new_cap < needed) {
+    if (new_cap > (int64)2305843009213693951) { return 0; }
     new_cap = new_cap * (int64)2;
   }
 

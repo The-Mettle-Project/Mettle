@@ -1,0 +1,19 @@
+import "std/io";
+import "std/random";
+
+fn main() -> int32 {
+  var lo: int64 = -9223372036854775807 - 1;
+  var hi: int64 = 9223372036854775807;
+  var bad: int32 = 0;
+  for i: int32 in 0..2000 {
+    var a: int64 = random_range(lo, 0);
+    if (a > 0) { bad = bad + 1; }
+    var b: int64 = random_range(-1, hi);
+    if (b < -1) { bad = bad + 1; }
+    var c: int64 = random_range(-5, 5);
+    if (c < -5 || c > 5) { bad = bad + 1; }
+    random_range(lo, hi);
+  }
+  println("bad {bad}");
+  return 0;
+}

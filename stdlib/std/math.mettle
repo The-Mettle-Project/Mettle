@@ -772,8 +772,8 @@ export fn ipow(base: int64, exponent: int32) -> int64 {
   var e: int32 = exponent;
   while (e > 0) {
     if ((e & 1) != 0) { result = result * b; }
-    b = b * b;
     e = e >> 1;
+    if (e > 0) { b = b * b; }
   }
   return result;
 }

@@ -2088,6 +2088,12 @@ static int ii_extern_math(const char *name, const IRInterpValue *args,
   return 0;
 }
 
+int ir_interp_value_is_address(const IRInterpMachine *machine,
+                               unsigned long long value) {
+  return machine && value >= II_ADDR_BASE &&
+         (value - II_ADDR_BASE) / II_ADDR_STRIDE < machine->buffer_count;
+}
+
 long long ir_interp_pointee_window(IRInterpMachine *machine,
                                    unsigned long long value,
                                    unsigned char *out, size_t capacity) {
@@ -2115,7 +2121,8 @@ long long ir_interp_pointee_window(IRInterpMachine *machine,
       continue;
     }
     memcpy(&word, out + w, 8);
-    if (word < II_ADDR_BASE || !ii_addr_to_buffer(machine, word, 0, &unused)) {
+    (void)unused;
+    if (!ir_interp_value_is_address(machine, word)) {
       continue;
     }
     word = II_ADDR_BASE;

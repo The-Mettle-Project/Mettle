@@ -364,23 +364,65 @@ void mettle_safety_unregister(void *pointer) {
   safety_unlock();
 }
 
-void mettle_safety_reregister(void *old_pointer, void *new_pointer,
-                              uint64_t size) {
+static void safety_retire_identity(uint64_t identity) {
+  if (!identity) {
+    return;
+  }
+  safety_lock();
+  uint32_t id = (uint32_t)(identity & 0xffffffu);
+  SafetyRegion *region = safety_region(id);
+  if (region && region->identity == identity &&
+      __atomic_load_n(&region->state, __ATOMIC_RELAXED) ==
+          (uint32_t)SAFETY_STATE_LIVE) {
+    __atomic_store_n(&region->state, (uint32_t)SAFETY_STATE_DEAD,
+                     __ATOMIC_RELEASE);
+    safety_values_clear_locked(region->start, region->size);
+    __atomic_sub_fetch(&g_safety_live_regions, 1, __ATOMIC_RELAXED);
+    if (region->granules == 0) safety_region_recycle(id, region);
+  }
+  safety_unlock();
+}
+
+static uint64_t safety_identity_span(const void *pointer, uint64_t identity) {
+  uint64_t span = 0;
+  safety_lock();
+  const SafetyRegion *region = safety_region((uint32_t)(identity & 0xffffffu));
+  if (region && region->identity == identity &&
+      __atomic_load_n(&region->state, __ATOMIC_RELAXED) ==
+          (uint32_t)SAFETY_STATE_LIVE &&
+      (uintptr_t)pointer >= region->start &&
+      (uintptr_t)pointer - region->start < region->size) {
+    span = region->size - ((uintptr_t)pointer - region->start);
+  }
+  safety_unlock();
+  return span;
+}
+
+/* A realloc that moves has already handed the old block back, so another thread
+   may own that address by now. Only the identity read before the call may be
+   retired. */
+void mettle_safety_reregister_held(void *old_pointer, void *new_pointer,
+                                   uint64_t size, uint64_t old_identity) {
   if (!new_pointer && size != 0) {
     return;
   }
-  uint64_t old_identity = mettle_safety_identity(old_pointer);
-  int64_t old_size = old_identity ? mettle_safety_span_identity(old_pointer, old_identity) : 0;
+  uint64_t old_size = old_identity ? safety_identity_span(old_pointer, old_identity) : 0;
   mettle_safety_register(new_pointer, size);
   if (old_pointer == new_pointer && new_pointer) {
     safety_values_reown(new_pointer, size, old_identity);
   } else if (old_pointer && new_pointer && old_size > 0) {
-    uint64_t copy_size = (uint64_t)old_size < size ? (uint64_t)old_size : size;
+    uint64_t copy_size = old_size < size ? old_size : size;
     mettle_safety_value_copy(new_pointer, old_pointer, copy_size);
   }
   if (old_pointer && old_pointer != new_pointer) {
-    mettle_safety_unregister(old_pointer);
+    safety_retire_identity(old_identity);
   }
+}
+
+void mettle_safety_reregister(void *old_pointer, void *new_pointer,
+                              uint64_t size) {
+  mettle_safety_reregister_held(old_pointer, new_pointer, size,
+                                mettle_safety_identity(old_pointer));
 }
 
 #if defined(_WIN32)
@@ -540,6 +582,9 @@ SAFETY_COLD static void safety_check_failed(const void *base, int64_t offset,
   failure.extent = 0;
   failure.have_extent = 0;
   failure.about_free = 0;
+  if (base && region && region->start) {
+    failure.offset = (int64_t)((uintptr_t)base + (uintptr_t)offset - region->start);
+  }
 
   if (!base) {
     failure.headline = "null pointer dereference";

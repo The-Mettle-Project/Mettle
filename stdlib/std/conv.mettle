@@ -88,7 +88,7 @@ export fn str_slice(s: string, start: int64, len: int64) -> string {
   if (from < 0) { from = 0; }
   if (from > n) { from = n; }
   if (take < 0) { take = 0; }
-  if (from + take > n) { take = n - from; }
+  if (take > n - from) { take = n - from; }
 
   out.chars = s.chars + from;
   out.length = (uint64)take;
@@ -100,7 +100,7 @@ export fn str_eq_at(s: string, offset: int64, needle: string) -> int32 {
   var m: int64 = (int64)needle.length;
 
   if (offset < 0) { return 0; }
-  if (offset + m > n) { return 0; }
+  if (offset > n - m) { return 0; }
 
   var i: int64 = 0;
   while (i < m) {
@@ -398,7 +398,7 @@ export fn cstr_ncmp(buf: uint8*, offset: int32, needle: string, buf_len: int32) 
   while ((uint64)i < needle.length) {
     if (offset + i >= buf_len) { return -1; }
     if (buf[offset + i] != needle.chars[i]) {
-      return buf[offset + i] - needle.chars[i];
+      return (int32)buf[offset + i] - (int32)needle.chars[i];
     }
     i = i + 1;
   }

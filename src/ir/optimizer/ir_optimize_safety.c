@@ -36,6 +36,7 @@ IRSafetyIntrinsic ir_safety_intrinsic(const IRInstruction *in) {
       {"mettle_safety_register_static", 2, IR_SAFETY_INTRINSIC_LIFETIME},
       {"mettle_safety_unregister", 1, IR_SAFETY_INTRINSIC_LIFETIME},
       {"mettle_safety_reregister", 3, IR_SAFETY_INTRINSIC_LIFETIME},
+      {"mettle_safety_reregister_held", 4, IR_SAFETY_INTRINSIC_LIFETIME},
       {"mettle_safety_free_identity", 2, IR_SAFETY_INTRINSIC_LIFETIME},
       {"mettle_safety_region_begin", 2, IR_SAFETY_INTRINSIC_LIFETIME},
       {"mettle_safety_region_end", 1, IR_SAFETY_INTRINSIC_LIFETIME},
@@ -2445,6 +2446,7 @@ static int safety_declare_runtime(IRProgram *program) {
   const MtlcType *register_params[2] = {pointer, u64};
   const MtlcType *unregister_params[1] = {pointer};
   const MtlcType *reregister_params[3] = {pointer, pointer, u64};
+  const MtlcType *reregister_held_params[4] = {pointer, pointer, u64, u64};
   const MtlcType *identity_check_params[6] = {pointer, i64, i64, u32, u32, u64};
   const MtlcType *affine_check_params[8] = {pointer, i64, i64, u32, u32, u64, i64, i64};
   const MtlcType *pointer_u64[2] = {pointer, u64};
@@ -2468,6 +2470,7 @@ static int safety_declare_runtime(IRProgram *program) {
       {"mettle_safety_register_static", nothing, register_params, 2},
       {"mettle_safety_unregister", nothing, unregister_params, 1},
       {"mettle_safety_reregister", nothing, reregister_params, 3},
+      {"mettle_safety_reregister_held", nothing, reregister_held_params, 4},
       {"mettle_safety_enter_allocator", nothing, NULL, 0},
       {"mettle_safety_leave_allocator", nothing, NULL, 0},
       {"mettle_safety_identity", u64, span_params, 1},
@@ -2842,12 +2845,36 @@ static int safety_emit_one_pointer_call(IRInstructionVector *out,
   return ok;
 }
 
+static int safety_emit_hold_identity(IRInstructionVector *out,
+                                     SourceLocation location,
+                                     const IROperand *pointer,
+                                     const char *held) {
+  IRInstruction insn = {0};
+  insn.op = IR_OP_CALL;
+  insn.location = location;
+  insn.text = mettle_strdup("mettle_safety_identity");
+  insn.arguments = calloc(1, sizeof(IROperand));
+  insn.dest = ir_operand_temp(held);
+  if (!insn.text || !insn.arguments || !insn.dest.name ||
+      !ir_operand_clone(pointer, &insn.arguments[0])) {
+    ir_instruction_destroy_storage(&insn);
+    return 0;
+  }
+  insn.argument_count = 1;
+  if (!ir_instruction_vector_append_move(out, &insn)) {
+    ir_instruction_destroy_storage(&insn);
+    return 0;
+  }
+  return 1;
+}
+
 static int safety_emit_reregister(IRInstructionVector *out,
                                   SourceLocation location,
                                   const IROperand *old_pointer,
                                   const IROperand *new_pointer,
-                                  const IROperand *size) {
-  IROperand arguments[3];
+                                  const IROperand *size,
+                                  const IROperand *held) {
+  IROperand arguments[4];
   size_t built = 0;
   int ok = 0;
 
@@ -2863,8 +2890,12 @@ static int safety_emit_reregister(IRInstructionVector *out,
     goto done;
   }
   built = 3;
-  ok = safety_emit_call(out, location, "mettle_safety_reregister", arguments,
-                        3);
+  if (!ir_operand_clone(held, &arguments[3])) {
+    goto done;
+  }
+  built = 4;
+  ok = safety_emit_call(out, location, "mettle_safety_reregister_held", arguments,
+                        4);
 
 done:
   for (size_t i = 0; i < built; i++) {
@@ -2953,6 +2984,20 @@ static int safety_register_function(IRFunction *function) {
                                 : ir_operand_none();
     int bracket = safety_callee_is_mettle_allocator(instruction);
 
+    IROperand held = ir_operand_none();
+    if (kind == SAFETY_ALLOC_REALLOC) {
+      char held_name[64];
+      snprintf(held_name, sizeof(held_name), SAFETY_TEMP_PREFIX "h%u",
+               g_safety_next_id++);
+      held = ir_operand_temp(held_name);
+      if (!held.name || !safety_emit_hold_identity(&out, location, &old_pointer, held_name)) {
+        ir_operand_destroy(&held);
+        ir_operand_destroy(&product_operand);
+        ir_instruction_vector_destroy(&out);
+        return 0;
+      }
+    }
+
     if (bracket && !safety_emit_call(&out, location,
                                      "mettle_safety_enter_allocator", NULL,
                                      0)) {
@@ -2979,9 +3024,10 @@ static int safety_register_function(IRFunction *function) {
     if (result.kind != IR_OPERAND_NONE && kind != SAFETY_ALLOC_FREE) {
       ok = kind == SAFETY_ALLOC_REALLOC
                ? safety_emit_reregister(&out, location, &old_pointer, &result,
-                                        &size)
+                                        &size, &held)
                : safety_emit_register(&out, location, &result, &size);
     }
+    ir_operand_destroy(&held);
     ir_operand_destroy(&product_operand);
     if (!ok) {
       ir_instruction_vector_destroy(&out);

@@ -986,7 +986,7 @@ fn t_errors() -> int32 {
   pair_up(&cc, &sc);
   id = h2c_open_stream(g_c.c, &rq[0], nrq, false);
   settle();
-  var big: uint8* = (uint8*)calloc(1, 16400);
+  var big: uint8* = (uint8*)calloc(1, 16500);
   for i in 0..4 {
     w = h2_build_data(big + 0, 16400, id, big + 100, 16384, false, -1);
     h2c_feed(g_s.c, big, w);

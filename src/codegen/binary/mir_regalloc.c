@@ -1575,6 +1575,24 @@ static int mir_vreg_is_param_in_reg(const MirFunction *fn, MirVregId v,
   return 0;
 }
 
+static uint32_t mir_ra_stress_mask(uint32_t m) {
+  static int limit = -2;
+  if (limit == -2) {
+    const char *env = getenv("METTLE_RA_STRESS");
+    limit = env ? atoi(env) : -1;
+  }
+  if (limit < 0) {
+    return m;
+  }
+  uint32_t kept = 0;
+  for (int i = 0; i < limit && m; i++) {
+    uint32_t low = m & (0u - m);
+    kept |= low;
+    m ^= low;
+  }
+  return kept;
+}
+
 static uint32_t mir_color_reg_mask(const MirFunction *fn, MirVregId v,
                                    const BinaryGpRegister *gp_leaf_pool,
                                    size_t gp_leaf_n,
@@ -1636,7 +1654,7 @@ static uint32_t mir_color_reg_mask(const MirFunction *fn, MirVregId v,
       }
     }
   }
-  return m;
+  return mir_ra_stress_mask(m);
 }
 
 static int mir_color_interferes(const MirVreg *a, const MirVreg *b) {

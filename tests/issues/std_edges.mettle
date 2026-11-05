@@ -1,0 +1,34 @@
+import "std/io";
+import "std/conv";
+import "std/math";
+import "std/mem";
+import "std/core";
+import "std/hash";
+import "std/collections";
+
+fn main() -> int32 {
+  println("{str_eq_at("abc", 9223372036854775807, "a")} {str_eq_at("abc", 1, "bc")}");
+  println("{str_slice("abc", 1, 9223372036854775807).length} {str_slice("abc", 9223372036854775807, 1).length}");
+  var b: uint8[4];
+  b[0] = 97;
+  println("{cstr_ncmp(&b[0], 0, "b", 1) < 0} {cstr_ncmp(&b[0], 0, "A", 1) > 0}");
+  println("{ipow(2, 62)} {ipow(3, 39)} {ipow(-2, 63)}");
+
+  var m: HashMap<int64, int64> = hash_map_init<int64, int64>(&hash_int64_ptr, &int64_equal_ptr);
+  for i: int64 in 0..200000 {
+    hash_map_put<int64, int64>(&m, i, i);
+    hash_map_remove<int64, int64>(&m, i);
+  }
+  println("{m.length} {m.capacity <= 64}");
+  for i: int64 in 0..1000 { hash_map_put<int64, int64>(&m, i, i * 2); }
+  var total: int64 = 0;
+  for i: int64 in 0..1000 {
+    match (hash_map_get<int64, int64>(&m, i)) {
+      case Some(v): { total = total + v; }
+      case None: { total = -1000000; }
+    }
+  }
+  println("{m.length} {total}");
+  hash_map_free<int64, int64>(&m);
+  return 0;
+}

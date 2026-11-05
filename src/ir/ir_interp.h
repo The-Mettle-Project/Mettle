@@ -88,6 +88,8 @@ const char *ir_interp_global_name(const IRInterpMachine *machine, size_t index);
 IRInterpValue ir_interp_global_value(const IRInterpMachine *machine,
                                      size_t index);
 
+int ir_interp_value_is_address(const IRInterpMachine *machine,
+                               unsigned long long value);
 long long ir_interp_pointee_window(IRInterpMachine *machine,
                                    unsigned long long value,
                                    unsigned char *out, size_t capacity);

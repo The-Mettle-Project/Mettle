@@ -21714,7 +21714,17 @@ $issueRegressions = @(
   @{ Name = "arena_accounting_release"; Entry = "tests/issues/arena_accounting.mettle"; Args = @("--release"); Expect = @("0 0 true", "true 32", "7 9 11 3 true") },
   @{ Name = "arena_accounting_safe"; Entry = "tests/issues/arena_accounting.mettle"; Args = @("--safe"); Expect = @("0 0 true", "true 32", "7 9 11 3 true") },
   @{ Name = "spilled_bit_test_count"; Entry = "tests/issues/spilled_bit_test.mettle"; Args = @("--release"); Expect = @("7525625126660281377") },
-  @{ Name = "spilled_bit_test_count_safe"; Entry = "tests/issues/spilled_bit_test.mettle"; Args = @("--safe", "--release"); Expect = @("7525625126660281377") }
+  @{ Name = "spilled_bit_test_count_safe"; Entry = "tests/issues/spilled_bit_test.mettle"; Args = @("--safe", "--release"); Expect = @("7525625126660281377") },
+  @{ Name = "std_edges"; Entry = "tests/issues/std_edges.mettle"; Args = @(); Expect = @("0 1", "2 0", "true true", "4611686018427387904 4052555153018976267", "0 true", "1000 999000") },
+  @{ Name = "std_edges_release"; Entry = "tests/issues/std_edges.mettle"; Args = @("--release"); Expect = @("0 1", "2 0", "true true", "4611686018427387904 4052555153018976267", "0 true", "1000 999000") },
+  @{ Name = "std_edges_check_overflow"; Entry = "tests/issues/std_edges.mettle"; Args = @("--check-overflow"); Refuse = @("Fatal error"); Expect = @("1000 999000") },
+  @{ Name = "issue_calls_keep_their_arguments"; Entry = "tests/issues/issue_158.mettle"; Args = @(); Expect = @("1 3 7", "34 35 34 3", "34 35", "203 202 302") },
+  @{ Name = "issue_calls_keep_their_arguments_release"; Entry = "tests/issues/issue_158.mettle"; Args = @("--release"); Expect = @("1 3 7", "34 35 34 3", "34 35", "203 202 302") },
+  @{ Name = "safe_threads_realloc_keeps_other_blocks"; Entry = "tests/test_malloc_threads.mettle"; Args = @("--safe"); Refuse = @("Fatal error"); Expect = @("malloc_threads: ok") },
+  @{ Name = "safe_threads_realloc_keeps_other_blocks_release"; Entry = "tests/test_malloc_threads.mettle"; Args = @("--safe", "--release"); Refuse = @("Fatal error"); Expect = @("malloc_threads: ok") },
+  @{ Name = "safe_h2conn_reads_in_bounds"; Entry = "tests/test_std_h2conn.mettle"; Args = @("--safe"); Refuse = @("Fatal error"); Expect = @("all ok") },
+  @{ Name = "random_range_extremes"; Entry = "tests/issues/random_range_extremes.mettle"; Args = @("--check-overflow"); Refuse = @("Fatal error"); Expect = @("bad 0") },
+  @{ Name = "verify_follows_pointers"; Command = @("--verify", "--build", "tests/test_malloc_threads.mettle", "-o", ".tmp/issue_verify.exe"); Refuse = @("MISCOMPILE"); Expect = @("Built executable") }
 )
 foreach ($case in $issueRegressions) {
   $total++

@@ -353,7 +353,8 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
                    strcmp(in->text, "mettle_safety_register_static") == 0 ||
                    strcmp(in->text, "mettle_safety_entry_arguments") == 0 ||
                    strcmp(in->text, "mettle_safety_region_begin") == 0) ? 0 :
-                  strcmp(in->text, "mettle_safety_reregister") == 0 ? 1 : -1;
+                  strcmp(in->text, "mettle_safety_reregister") == 0 ? 1 :
+                  strcmp(in->text, "mettle_safety_reregister_held") == 0 ? 1 : -1;
     IROperand result = ir_operand_none();
     if (capture >= 0 && !ir_operand_clone(&in->arguments[capture], &result)) goto done;
     ok = ir_instruction_vector_append_move(&origins->out, in);

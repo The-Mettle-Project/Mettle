@@ -562,7 +562,7 @@
         {
           "args": [],
           "exit": 1,
-          "fatal": "Fatal error: memory access outside its allocation: 8 bytes at offset 0 of a 32 byte allocation (line 3)"
+          "fatal": "Fatal error: memory access outside its allocation: 8 bytes at offset 4096 of a 32 byte allocation (line 3)"
         }
       ]
     },

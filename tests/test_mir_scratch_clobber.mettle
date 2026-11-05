@@ -60,7 +60,7 @@ fn kern(src: uint8*, dst: float32*, nblocks: int64) {
 
 fn main() -> int32 {
   var nb: int64 = 2;
-  var src: uint8* = malloc(nb * 110);
+  var src: uint8* = malloc(nb * 110 + 16);
   var dst: float32* = malloc(nb * 256 * 4);
   var k: int64 = 0;
   while (k < nb * 110) {

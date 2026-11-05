@@ -43,9 +43,9 @@ export fn random_below(n: uint64) -> uint64 {
 // A uniform value in lo..hi, both included.
 export fn random_range(lo: int64, hi: int64) -> int64 {
   if (hi <= lo) { return lo; }
-  var span: uint64 = (uint64)(hi - lo) + (uint64)1;
+  var span: uint64 = (uint64)hi - (uint64)lo + (uint64)1;
   if (span == (uint64)0) { return (int64)random_u64(); }   // the whole int64 range
-  return lo + (int64)random_below(span);
+  return (int64)((uint64)lo + random_below(span));
 }
 
 // A uniform float64 in [0, 1), from 53 random bits.

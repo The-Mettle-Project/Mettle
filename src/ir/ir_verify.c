@@ -847,27 +847,79 @@ static void irv_format_value(const IRInterpValue *value, char *buffer,
   }
 }
 
+#define IRV_POINTER_DEPTH 2
+
+static int irv_address_pointees_agree(IRInterpMachine *before,
+                                      IRInterpMachine *after,
+                                      unsigned long long address_a,
+                                      unsigned long long address_b, int depth);
+
+/* Two runs lay their allocations out in a different order when a pass adds or
+   removes one, so a word holding an interpreter address differs in its bits
+   and still means the same thing. Such a word agrees when both words point at
+   memory that agrees. Returns the offset of the first byte that does not, or
+   -1. */
+static long long irv_first_difference(IRInterpMachine *before,
+                                      IRInterpMachine *after,
+                                      const unsigned char *a,
+                                      const unsigned char *b, long long size,
+                                      int depth) {
+  long long at = 0;
+  while (at < size) {
+    if (a[at] == b[at]) {
+      at++;
+      continue;
+    }
+    long long word = at & ~(long long)7;
+    if (depth <= 0 || word + 8 > size) {
+      return at;
+    }
+    unsigned long long pa = 0;
+    unsigned long long pb = 0;
+    memcpy(&pa, a + word, sizeof(pa));
+    memcpy(&pb, b + word, sizeof(pb));
+    if (irv_address_pointees_agree(before, after, pa, pb, depth - 1) != 1) {
+      return at;
+    }
+    at = word + 8;
+  }
+  return -1;
+}
+
+static int irv_address_pointees_agree(IRInterpMachine *before,
+                                      IRInterpMachine *after,
+                                      unsigned long long address_a,
+                                      unsigned long long address_b, int depth) {
+  unsigned char *wa = malloc(IR_INTERP_EXTERN_MEM_CAP);
+  unsigned char *wb = malloc(IR_INTERP_EXTERN_MEM_CAP);
+  int result = 0;
+  if (wa && wb) {
+    long long na = ir_interp_pointee_window(before, address_a, wa,
+                                            IR_INTERP_EXTERN_MEM_CAP);
+    long long nb = ir_interp_pointee_window(after, address_b, wb,
+                                            IR_INTERP_EXTERN_MEM_CAP);
+    if (na < 0 && nb < 0) {
+      result = ir_interp_value_is_address(before, address_a) &&
+                       ir_interp_value_is_address(after, address_b)
+                   ? 1
+                   : -1;
+    } else if (na >= 0 && na == nb) {
+      result = irv_first_difference(before, after, wa, wb, na, depth) < 0;
+    }
+  }
+  free(wa);
+  free(wb);
+  return result;
+}
+
 static int irv_pointees_agree(IRInterpMachine *before, IRInterpMachine *after,
                               const IRInterpValue *va,
                               const IRInterpValue *vb) {
-  unsigned char wa[IR_INTERP_EXTERN_MEM_CAP];
-  unsigned char wb[IR_INTERP_EXTERN_MEM_CAP];
-  long long na = 0;
-  long long nb = 0;
   if (va->is_float || vb->is_float) {
     return -1;
   }
-  na = ir_interp_pointee_window(before, (unsigned long long)va->i, wa,
-                                sizeof(wa));
-  nb = ir_interp_pointee_window(after, (unsigned long long)vb->i, wb,
-                                sizeof(wb));
-  if (na < 0 && nb < 0) {
-    return -1;
-  }
-  if (na < 0 || nb < 0 || na != nb) {
-    return 0;
-  }
-  return memcmp(wa, wb, (size_t)na) == 0;
+  return irv_address_pointees_agree(before, after, (unsigned long long)va->i,
+                                    (unsigned long long)vb->i, IRV_POINTER_DEPTH);
 }
 
 static int irv_input_buffers_agree(IRInterpMachine *before,
@@ -908,9 +960,9 @@ static int irv_input_buffers_agree(IRInterpMachine *before,
                  at / 4, (double)x, (double)y);
         return 0;
       }
-      at = 0;
-      while (at < size_a && a[at] == b[at]) {
-        at++;
+      at = irv_first_difference(before, after, a, b, size_a, IRV_POINTER_DEPTH);
+      if (at < 0) {
+        continue;
       }
       snprintf(why, why_capacity,
                "buffer arg %zu differs at byte %lld (0x%02X -> 0x%02X)", i, at,
