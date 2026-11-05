@@ -21695,6 +21695,7 @@ $issueRegressions = @(
   @{ Name = "safe_release_simd_contract_stays_scalar"; Entry = "tests/test_vloop_general.mettle"; Args = @("--safe", "--release"); Expect = @() },
   @{ Name = "safe_release_parallel_runs_on_one_thread"; Entry = "tests/test_parallel_loop.mettle"; Args = @("--safe", "--release"); Expect = @() },
   @{ Name = "safe_neighbour_region_keeps_slot_identity"; Entry = "tests/issues/safe_neighbour_region_keeps_slot_identity.mettle"; Args = @("--safe"); Expect = @("ok") },
+  @{ Name = "jump_ends_at_closing_brace"; Entry = "tests/issues/jump_ends_at_brace.mettle"; Args = @(); Expect = @("8 2 4") },
   @{ Name = "main_returns_an_exit_status"; Command = @("--build", "tests/issues/err_main_returns_string.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("'main' returns the exit status") },
   @{ Name = "address_of_constant_is_a_diagnostic"; Command = @("--build", "tests/issues/err_address_of_constant.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("is a constant and has no address") },
   @{ Name = "extern_array_result_is_a_diagnostic"; Command = @("--build", "tests/issues/err_extern_returns_array.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("the C ABI has no array") },

@@ -1,0 +1,25 @@
+import "std/io"
+
+fn main() -> int32 {
+  var total = 0
+  for i in 0..10 {
+    if i == 2 { continue }
+    if i == 5 { break }
+    total += i
+  }
+  var seen = 0
+  outer: for i in 0..3 {
+    for j in 0..3 {
+      if j == 1 { continue outer }
+      if i == 2 { break outer }
+      seen += 1
+    }
+  }
+  var found = for i in 0..9 {
+    if i * i == 16 { break i }
+  } else {
+    -1
+  }
+  println("{total} {seen} {found}")
+  return 0
+}

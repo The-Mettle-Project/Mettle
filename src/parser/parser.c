@@ -8171,7 +8171,7 @@ static ASTNode *parser_parse_break_or_continue(Parser *parser,
     parser_advance(parser);
   }
 
-  if (!parser->bare_value_arm) {
+  if (!parser->bare_value_arm && !parser_match(parser, TOKEN_RBRACE)) {
     parser_expect_statement_end(parser);
   }
   ASTNode *node = (token_type == TOKEN_BREAK)
