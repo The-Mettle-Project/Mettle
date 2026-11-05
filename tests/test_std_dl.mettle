@@ -1,0 +1,29 @@
+// std/dl: load libm and libc at run time and call through the addresses.
+// Linux needs a libc for dlopen, so this test is built with -l:libc.so.6.
+import "std/dl";
+import "std/io";
+import "process_test_os/linux" if linux;
+import "process_test_os/other" if macos;
+import "process_test_os/other" if windows;
+
+fn main() -> int32 {
+  // libm.so.6 is a Linux name; elsewhere this only checks the build.
+  if (PROC_TEST_RUNS == 0) { return 0; }
+  var m: rawptr = dl_open("libm.so.6");
+  if (m == 0) {
+    println("test_std_dl: {dl_error()}");
+    return 1;
+  }
+  var cos_fn: fn(float64) -> float64 = (fn(float64) -> float64)dl_sym(m, "cos");
+  if (cos_fn == 0) { return 2; }
+  var c: float64 = cos_fn(0.0);
+  if (c != 1.0) { return 3; }
+  var pow_fn: fn(float64, float64) -> float64 = (fn(float64, float64) -> float64)dl_sym(m, "pow");
+  if (pow_fn == 0 || pow_fn(2.0, 10.0) != 1024.0) { return 4; }
+  if (dl_sym(m, "no_such_symbol_here") != 0) { return 5; }
+  if (dl_error().length == (uint64)0) { return 6; }
+  if (dl_close(m) != 0) { return 7; }
+  if (dl_open("libno-such-library-here.so") != 0) { return 8; }
+  if (dl_error().length == (uint64)0) { return 9; }
+  return 0;
+}

@@ -1,0 +1,5 @@
+import "std/mem";
+
+export fn region_register(p: uint8*, n: int64) { memory_region(p, n); }
+
+export fn region_release(p: uint8*) { memory_region_end(p); }

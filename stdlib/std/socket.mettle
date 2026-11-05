@@ -198,3 +198,64 @@ export fn udp_bind(a: NetAddr*) -> Result<int64, NetError> {
   }
   return Ok(fd);
 }
+
+// ---- Streams ------------------------------------------------------------------
+
+// A byte stream: a socket, or anything that wraps one, such as a TLS
+// session. read and write return a count, 0 at end of stream (read only), or
+// a negative error. fd is the socket to poll for readiness, or -1.
+export struct NetStream {
+  ctx: rawptr;
+  read: fn(rawptr, uint8*, int64) -> int64;
+  write: fn(rawptr, uint8*, int64) -> int64;
+  close: fn(rawptr) -> int64;
+  fd: int64;
+}
+
+fn net_sock_read(ctx: rawptr, p: uint8*, n: int64) -> int64 { return sock_recv((int64)ctx, p, n); }
+fn net_sock_write(ctx: rawptr, p: uint8*, n: int64) -> int64 { return sock_send((int64)ctx, p, n); }
+fn net_sock_close(ctx: rawptr) -> int64 { return sock_close((int64)ctx); }
+
+// A stream over a connected socket. Closing the stream closes the socket.
+export fn net_stream_socket(fd: int64) -> NetStream {
+  var s: NetStream;
+  s.ctx = (rawptr)fd;
+  s.read = &net_sock_read;
+  s.write = &net_sock_write;
+  s.close = &net_sock_close;
+  s.fd = fd;
+  return s;
+}
+
+export fn net_stream_read(s: NetStream*, p: uint8*, n: int64) -> int64 {
+  var f: fn(rawptr, uint8*, int64) -> int64 = s->read;
+  while (true) {
+    var r: int64 = f(s->ctx, p, n);
+    if (r != -NET_EINTR) { return r; }
+  }
+  return 0;
+}
+
+// Writes all n bytes. Returns n or a negative error.
+export fn net_stream_write_all(s: NetStream*, p: uint8*, n: int64) -> int64 {
+  var f: fn(rawptr, uint8*, int64) -> int64 = s->write;
+  var done: int64 = 0;
+  while (done < n) {
+    var r: int64 = f(s->ctx, p + done, n - done);
+    if (r == -NET_EINTR) { continue; }
+    if (r == -NET_EAGAIN && s->fd >= 0) {
+      var w: int64 = sock_wait(s->fd, NET_POLL_OUT, -1);
+      if (w < 0) { return w; }
+      continue;
+    }
+    if (r < 0) { return r; }
+    if (r == 0) { return -NET_EPIPE; }
+    done = done + r;
+  }
+  return n;
+}
+
+export fn net_stream_close(s: NetStream*) -> int64 {
+  var f: fn(rawptr) -> int64 = s->close;
+  return f(s->ctx);
+}

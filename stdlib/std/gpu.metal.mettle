@@ -228,6 +228,20 @@ export fn gpu_event_record(event: int64, stream: int64) -> int32 {
 @inline export fn gpu_event_sync(event: int64) -> int32 {
   return __mtlc_metal_sync();
 }
+
+// The same contract as on CUDA: 1 done, 0 running, negative an error. An
+// event here is complete once recorded, since recording waits for the GPU.
+// The Metal provider cannot ask a command buffer without waiting yet, so
+// gpu_stream_done waits for the GPU and then answers 1.
+export fn gpu_event_done(event: int64) -> int32 {
+  if (event < 1 || event > (int64)g_metal_event_count) { return -1; }
+  return 1;
+}
+
+export fn gpu_stream_done(stream: int64) -> int32 {
+  if (__mtlc_metal_sync() != 0) { return -1; }
+  return 1;
+}
 @inline export fn gpu_stream_wait_event(stream: int64, event: int64) -> int32 {
   return 0;
 }

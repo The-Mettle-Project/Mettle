@@ -78,3 +78,9 @@ export const LINUX_STAT_CTIME_AT = 104;
 
 export const LINUX_SYS_MPROTECT = 10;
 export const LINUX_SYS_IOCTL = 16;
+
+// Sleeping, scheduling and file offsets.
+export const LINUX_SYS_NANOSLEEP = 35;
+export const LINUX_SYS_GETTID = 186;
+export const LINUX_SYS_SCHED_YIELD = 24;
+export const LINUX_SYS_LSEEK = 8;

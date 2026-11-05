@@ -1,0 +1,65 @@
+// Linux shared libraries for std/dl, through libc's dlopen. A Linux build
+// links no libc by default, so build with -l:libc.so.6 to use this.
+
+extern fn dl_c_open(path: uint8*, flags: int32) -> rawptr = "dlopen";
+extern fn dl_c_sym(handle: rawptr, name: uint8*) -> rawptr = "dlsym";
+extern fn dl_c_close(handle: rawptr) -> int32 = "dlclose";
+extern fn dl_c_error() -> uint8* = "dlerror";
+
+const RTLD_NOW = 2;
+
+var g_dl_error: uint8* = (uint8*)0;
+
+fn dl_cstr(s: string, buf: uint8*) -> bool {
+  if (s.length >= (uint64)4096) { return false; }
+  for i in 0..s.length {
+    if ((int32)s[i] == 0) { return false; }
+    buf[i] = (uint8)s[i];
+  }
+  buf[(int64)s.length] = (uint8)0;
+  return true;
+}
+
+// Loads a shared library and resolves all its symbols now. A name with no
+// slash is searched for the usual way (LD_LIBRARY_PATH, the cache, /lib...).
+// Returns a handle, or 0; dl_error says why.
+export fn dl_open(path: string) -> rawptr {
+  var cp: uint8[4096];
+  if (!dl_cstr(path, &cp[0])) { return (rawptr)0; }
+  var h: rawptr = dl_c_open(&cp[0], RTLD_NOW);
+  if (h == 0) { g_dl_error = dl_c_error(); }
+  return h;
+}
+
+// The address of a function or variable in the library, or 0. Cast a
+// function's address to its fn type to call it:
+//   var f: fn(float64) -> float64 = (fn(float64) -> float64)dl_sym(h, "cos");
+export fn dl_sym(handle: rawptr, name: string) -> rawptr {
+  var cn: uint8[4096];
+  if (handle == 0 || !dl_cstr(name, &cn[0])) { return (rawptr)0; }
+  dl_c_error();   // clear any old message
+  var p: rawptr = dl_c_sym(handle, &cn[0]);
+  if (p == 0) { g_dl_error = dl_c_error(); }
+  return p;
+}
+
+// Unloads the library once nothing else holds it. Returns 0 or -1.
+export fn dl_close(handle: rawptr) -> int32 {
+  if (handle == 0) { return -1; }
+  if (dl_c_close(handle) != 0) {
+    g_dl_error = dl_c_error();
+    return -1;
+  }
+  return 0;
+}
+
+// What the last failed dl_open, dl_sym or dl_close said, or "".
+export fn dl_error() -> string {
+  var s: string;
+  if (g_dl_error == 0) { return s; }
+  var n: int64 = 0;
+  while (g_dl_error[n] != (uint8)0) { n = n + 1; }
+  s.chars = g_dl_error;
+  s.length = (uint64)n;
+  return s;
+}

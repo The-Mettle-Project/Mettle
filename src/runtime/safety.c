@@ -133,6 +133,7 @@ static uint32_t safety_region_acquire(uintptr_t start, uint64_t size) {
     reused->next_free = 0;
     reused->identity = (generation << 24) | id;
     reused->heap = 1;
+    reused->foreign = 0;
     __atomic_store_n(&reused->state, (uint32_t)SAFETY_STATE_LIVE,
                      __ATOMIC_RELEASE);
     return id;
@@ -160,6 +161,7 @@ static uint32_t safety_region_acquire(uintptr_t start, uint64_t size) {
   fresh->next_free = 0;
   fresh->identity = (generation << 24) | id;
   fresh->heap = 1;
+  fresh->foreign = 0;
   __atomic_store_n(&fresh->state, (uint32_t)SAFETY_STATE_LIVE,
                    __ATOMIC_RELEASE);
   return id;
@@ -620,7 +622,7 @@ int64_t mettle_safety_span(const void *base) {
 void mettle_safety_check_affine(const void *base, int64_t offset, int64_t length,
     uint32_t kind, uint32_t line, uint64_t identity, int64_t width, int64_t step) {
   if (length <= 0) return;
-  if (identity == SAFETY_IDENTITY_MIXED) identity = mettle_safety_identity(base);
+  identity = safety_resolve_identity(base, identity);
   if (!identity || width <= 0 || step <= 0) {
     mettle_safety_check_identity(base, offset, width, kind, line, identity);
     return;

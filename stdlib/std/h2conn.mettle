@@ -1,0 +1,1734 @@
+// HTTP/2 client and server connections over std/http2 and std/hpack.
+// The core never blocks: feed it bytes (h2c_feed), take events (h2c_next_event),
+// and send what h2c_pending_output holds. h2c_pump, h2c_call and h2c_serve are
+// blocking helpers over a NetStream. Event strings live until the next call.
+
+import "std/http2";
+import "std/hpack";
+import "std/socket";
+import "std/arena";
+
+export const H2C_OK = 0;
+export const H2C_ERR_CLOSED = -1;        // the connection failed or ended
+export const H2C_ERR_NO_STREAM = -2;     // unknown or finished stream
+export const H2C_ERR_STATE = -3;         // not allowed in the stream's state
+export const H2C_ERR_NO_SLOT = -4;       // at the concurrent stream limit; wait for H2C_EV_SLOT_FREE
+export const H2C_ERR_GOAWAY = -5;        // no new streams after GOAWAY
+export const H2C_ERR_BAD_HEADER = -6;    // header list breaks the HTTP/2 rules
+export const H2C_ERR_TOO_LARGE = -7;     // header list over a limit
+export const H2C_ERR_WOULD_BLOCK = -8;   // output queue full: drain it and retry
+export const H2C_ERR_NOMEM = -9;
+export const H2C_ERR_RESET = -10;        // h2c_call: the stream was reset
+export const H2C_ERR_TIMEOUT = -11;
+export const H2C_ERR_IO = -12;           // transport error or end of stream
+export const H2C_ERR_PROTOCOL = -13;     // the connection failed
+
+// h2c_pump returns this at end of stream.
+export const H2C_PUMP_EOF = -1;
+
+export const H2C_EV_NONE = 0;
+export const H2C_EV_SETTINGS = 1;       // the peer's SETTINGS are applied
+export const H2C_EV_SETTINGS_ACK = 2;   // the peer accepted ours
+export const H2C_EV_HEADERS = 3;        // a stream's first header block
+export const H2C_EV_DATA = 4;
+export const H2C_EV_TRAILERS = 5;       // the closing header block of a stream
+export const H2C_EV_RESET = 6;          // the stream is dead; see H2cEvent.by_peer
+export const H2C_EV_GOAWAY = 7;
+export const H2C_EV_PING = 8;           // the peer pinged (already answered)
+export const H2C_EV_PING_ACK = 9;       // our ping came back
+export const H2C_EV_WRITABLE = 10;      // a blocked stream can send again
+export const H2C_EV_SLOT_FREE = 11;     // streams finished: a slot may be free
+export const H2C_EV_CLOSED = 12;        // the connection is done; error_code says why
+
+// What h2c_next_event fills. Only the fields named for the event's kind are set.
+export struct H2cEvent {
+  kind: int32;
+  stream_id: int32;
+  end_stream: bool;          // HEADERS, DATA, TRAILERS: the peer is done sending
+  new_stream: bool;          // HEADERS: this opened the stream (server)
+  headers: HpackHeader*;     // HEADERS, TRAILERS
+  header_count: int64;
+  data: uint8*;              // DATA
+  length: int64;
+  error_code: int64;         // RESET, GOAWAY, CLOSED: an H2_* code
+  by_peer: bool;             // RESET: the peer sent it; false when this side reset the stream
+  unprocessed: bool;         // RESET after GOAWAY: the peer never saw the stream, safe to retry
+  user: rawptr;              // RESET: the stream's user pointer
+  last_stream_id: int32;     // GOAWAY
+  debug: string;             // GOAWAY, CLOSED: debug text
+  ping: uint8[8];            // PING, PING_ACK
+  rtt_ms: int64;             // PING_ACK
+  window: int64;             // WRITABLE: bytes that can be sent now
+  count: int64;              // SLOT_FREE: streams finished since the last event
+}
+
+export struct H2cConfig {
+  max_concurrent_streams: int64;   // streams the peer may have open on us
+  max_streams: int64;              // hard cap on open streams per side
+  initial_window: int64;           // per-stream receive window
+  conn_window: int64;              // connection receive window
+  max_frame_size: int64;           // largest frame we accept
+  max_header_list_size: int64;     // largest header list we accept
+  header_table_size: int64;        // HPACK table size
+  max_output: int64;               // cap on queued output bytes
+  manual_flow: bool;               // false: windows refill as DATA arrives; true: only h2c_consumed refills
+}
+
+export fn h2c_config_default(cfg: H2cConfig*) {
+  cfg->max_concurrent_streams = 100;
+  cfg->max_streams = 256;
+  cfg->initial_window = 65535;
+  cfg->conn_window = 65535;
+  cfg->max_frame_size = 16384;
+  cfg->max_header_list_size = 65536;
+  cfg->header_table_size = 4096;
+  cfg->max_output = 1048576;
+  cfg->manual_flow = false;
+}
+
+export struct H2cStream {
+  id: int32;
+  sent_headers: bool;
+  got_headers: bool;
+  local_closed: bool;      // we sent END_STREAM
+  remote_closed: bool;     // the peer sent END_STREAM
+  blocked: bool;           // send_data was cut short; wants a WRITABLE event
+  send_win: H2Window;
+  recv_win: H2Window;
+  unacked: int64;          // consumed bytes not yet announced
+  user: rawptr;
+  next: H2cStream*;        // hash chain or free list
+}
+
+export struct H2cNote {
+  kind: int32;
+  stream_id: int32;
+  user: rawptr;
+}
+
+export struct H2cPing {
+  used: bool;
+  data: uint8[8];
+  sent_ms: int64;
+}
+
+export struct H2c {
+  arena: Arena*;
+  harena: Arena*;          // decoded headers; reset on every h2c_next_event
+  is_server: bool;
+  cfg: H2cConfig;
+  mine: H2Settings;        // our settings, as the peer has acknowledged them
+  mine_new: H2Settings;    // what we advertised
+  settings_unacked: int32;
+  peer: H2Settings;
+  peer_seen: bool;
+  reader: H2Reader;
+  dec: HpackDecoder;
+  enc: HpackEncoder;
+  in_buf: uint8*;
+  in_cap: int64;
+  in_start: int64;
+  in_end: int64;
+  in_drop: int64;
+  out_buf: uint8*;
+  out_cap: int64;
+  out_soft: int64;
+  out_head: int64;
+  out_tail: int64;
+  hbuf: uint8*;
+  hbuf_cap: int64;
+  acc: uint8*;             // header block being joined from CONTINUATION frames
+  acc_cap: int64;
+  acc_len: int64;
+  acc_stream: int32;
+  acc_end_stream: bool;
+  send_win: H2Window;
+  recv_win: H2Window;
+  unacked: int64;
+  buckets: H2cStream**;
+  nbuckets: int64;
+  free_streams: H2cStream*;
+  n_local: int64;
+  n_peer: int64;
+  next_id: int32;
+  seen_peer_id: int32;     // highest stream id the peer has used
+  last_peer_id: int32;     // highest peer stream id we accepted; what GOAWAY reports
+  goaway_sent: bool;
+  goaway_sent_last: int32;
+  goaway_recv: bool;
+  goaway_recv_last: int32;
+  dead: bool;
+  fail_pending: bool;
+  fail_code: int64;
+  fail_text: string;
+  notes: H2cNote*;
+  note_cap: int64;
+  note_head: int64;
+  note_len: int64;
+  slots_freed: int64;
+  slot_last: int32;
+  n_blocked: int64;
+  pings: H2cPing[8];
+  recent: int32[16];       // streams reset lately; late frames on them are dropped
+  recent_at: int32;
+}
+
+const H2C_NOTE_WRITABLE = 1;
+const H2C_NOTE_UNPROCESSED = 2;
+
+fn h2c_min(a: int64, b: int64) -> int64 {
+  if (a < b) { return a; }
+  return b;
+}
+
+fn h2c_max(a: int64, b: int64) -> int64 {
+  if (a > b) { return a; }
+  return b;
+}
+
+fn h2c_pow2(n: int64) -> int64 {
+  var p: int64 = 16;
+  while (p < n && p < 65536) { p = p * 2; }
+  return p;
+}
+
+fn h2c_is_local_id(c: H2c*, id: int32) -> bool {
+  if (c->is_server) { return (id & 1) == 0; }
+  return (id & 1) == 1;
+}
+
+// A stream id that was never used: a frame on it is a protocol error.
+fn h2c_is_idle(c: H2c*, id: int32) -> bool {
+  if (h2c_is_local_id(c, id)) { return id >= c->next_id; }
+  return id > c->seen_peer_id;
+}
+
+fn h2c_recent_has(c: H2c*, id: int32) -> bool {
+  for i in 0..16 {
+    if (c->recent[i] == id) { return true; }
+  }
+  return false;
+}
+
+fn h2c_recent_add(c: H2c*, id: int32) {
+  c->recent[c->recent_at] = id;
+  c->recent_at = (c->recent_at + 1) & 15;
+}
+
+fn h2c_view(p: uint8*, n: int64) -> string {
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+// Room for n more bytes at the tail, compacting first if needed. Null if the
+// queue cannot hold them.
+fn h2c_reserve(c: H2c*, n: int64) -> uint8* {
+  if (c->out_cap - c->out_tail < n) {
+    if (c->out_head > 0) {
+      var used: int64 = c->out_tail - c->out_head;
+      if (used > 0) { memmove(c->out_buf, c->out_buf + c->out_head, used); }
+      c->out_head = 0;
+      c->out_tail = used;
+    }
+    if (c->out_cap - c->out_tail < n) { return (uint8*)0; }
+  }
+  return c->out_buf + c->out_tail;
+}
+
+fn h2c_out_used(c: H2c*) -> int64 {
+  return c->out_tail - c->out_head;
+}
+
+// A connection error: queue GOAWAY if there is room, and report H2C_EV_CLOSED.
+fn h2c_fail(c: H2c*, code: int64, text: string) {
+  if (c->dead) { return; }
+  c->dead = true;
+  c->fail_pending = true;
+  c->fail_code = code;
+  c->fail_text = text;
+  var p: uint8* = h2c_reserve(c, 17);
+  if (p != (uint8*)0) {
+    var w: int64 = h2_build_goaway(p, 17, c->last_peer_id, code, (uint8*)0, 0);
+    if (w > 0) { c->out_tail = c->out_tail + w; }
+  }
+}
+
+// Room for a control frame of n bytes, or a connection error.
+fn h2c_ctl(c: H2c*, n: int64) -> uint8* {
+  if (c->dead) { return (uint8*)0; }
+  var p: uint8* = h2c_reserve(c, n);
+  if (p == (uint8*)0) { h2c_fail(c, H2_ENHANCE_YOUR_CALM, "output queue full"); }
+  return p;
+}
+
+fn h2c_queue_rst(c: H2c*, id: int32, code: int64) {
+  var p: uint8* = h2c_ctl(c, 13);
+  if (p == (uint8*)0) { return; }
+  c->out_tail = c->out_tail + h2_build_rst_stream(p, 13, id, code);
+}
+
+fn h2c_queue_wu(c: H2c*, id: int32, n: int64) {
+  var p: uint8* = h2c_ctl(c, 13);
+  if (p == (uint8*)0) { return; }
+  c->out_tail = c->out_tail + h2_build_window_update(p, 13, id, n);
+}
+
+fn h2c_queue_ping(c: H2c*, data: uint8*, ack: bool) {
+  var p: uint8* = h2c_ctl(c, 17);
+  if (p == (uint8*)0) { return; }
+  c->out_tail = c->out_tail + h2_build_ping(p, 17, data, ack);
+}
+
+fn h2c_queue_settings_ack(c: H2c*) {
+  var p: uint8* = h2c_ctl(c, 9);
+  if (p == (uint8*)0) { return; }
+  c->out_tail = c->out_tail + h2_build_settings_ack(p, 9);
+}
+
+fn h2c_bucket(c: H2c*, id: int32) -> int64 {
+  return ((int64)id >> 1) & (c->nbuckets - 1);
+}
+
+fn h2c_find(c: H2c*, id: int32) -> H2cStream* {
+  if (id <= 0) { return (H2cStream*)0; }
+  var s: H2cStream* = c->buckets[h2c_bucket(c, id)];
+  while (s != (H2cStream*)0) {
+    if (s->id == id) { return s; }
+    s = s->next;
+  }
+  return (H2cStream*)0;
+}
+
+fn h2c_new_stream(c: H2c*, id: int32) -> H2cStream* {
+  var s: H2cStream* = c->free_streams;
+  if (s != (H2cStream*)0) {
+    c->free_streams = s->next;
+  } else {
+    s = (H2cStream*)arena_alloc(c->arena, (int64)sizeof(H2cStream));
+    if (s == (H2cStream*)0) { return s; }
+  }
+  var blank: H2cStream;
+  *s = blank;
+  s->id = id;
+  h2_window_init(&s->send_win, c->peer.initial_window_size);
+  h2_window_init(&s->recv_win, c->mine.initial_window_size);
+  var b: int64 = h2c_bucket(c, id);
+  s->next = c->buckets[b];
+  c->buckets[b] = s;
+  if (h2c_is_local_id(c, id)) {
+    c->n_local = c->n_local + 1;
+  } else {
+    c->n_peer = c->n_peer + 1;
+  }
+  return s;
+}
+
+// Takes the stream out of the table without telling anyone.
+fn h2c_unlink(c: H2c*, s: H2cStream*) {
+  var b: int64 = h2c_bucket(c, s->id);
+  var cur: H2cStream* = c->buckets[b];
+  if (cur == s) {
+    c->buckets[b] = s->next;
+  } else {
+    while (cur != (H2cStream*)0 && cur->next != s) { cur = cur->next; }
+    if (cur != (H2cStream*)0) { cur->next = s->next; }
+  }
+  if (h2c_is_local_id(c, s->id)) {
+    c->n_local = c->n_local - 1;
+  } else {
+    c->n_peer = c->n_peer - 1;
+  }
+  if (s->blocked) { c->n_blocked = c->n_blocked - 1; }
+  s->next = c->free_streams;
+  c->free_streams = s;
+}
+
+// A finished stream leaves the table and a slot frees up.
+fn h2c_remove(c: H2c*, s: H2cStream*) {
+  c->slots_freed = c->slots_freed + 1;
+  c->slot_last = s->id;
+  h2c_unlink(c, s);
+}
+
+fn h2c_remove_if_done(c: H2c*, s: H2cStream*) {
+  if (s->local_closed && s->remote_closed) { h2c_remove(c, s); }
+}
+
+fn h2c_note_push(c: H2c*, kind: int32, id: int32, user: rawptr) -> bool {
+  if (c->note_len >= c->note_cap) { return false; }
+  var at: int64 = (c->note_head + c->note_len) % c->note_cap;
+  c->notes[at].kind = kind;
+  c->notes[at].stream_id = id;
+  c->notes[at].user = user;
+  c->note_len = c->note_len + 1;
+  return true;
+}
+
+// Bytes a stream may send right now: both windows and the room in the queue.
+fn h2c_writable(c: H2c*, s: H2cStream*) -> int64 {
+  var w: int64 = h2c_min(h2_window_available(&s->send_win), h2_window_available(&c->send_win));
+  var room: int64 = c->out_soft - h2c_out_used(c) - 9;
+  if (room < 0) { room = 0; }
+  return h2c_min(w, room);
+}
+
+fn h2c_wake_stream(c: H2c*, s: H2cStream*) {
+  if (!s->blocked || s->local_closed) { return; }
+  if (h2c_writable(c, s) <= 0) { return; }
+  s->blocked = false;
+  c->n_blocked = c->n_blocked - 1;
+  if (!h2c_note_push(c, H2C_NOTE_WRITABLE, s->id, (rawptr)0)) {
+    s->blocked = true;
+    c->n_blocked = c->n_blocked + 1;
+  }
+}
+
+fn h2c_wake_all(c: H2c*) {
+  if (c->n_blocked == 0) { return; }
+  for b in 0..c->nbuckets {
+    var s: H2cStream* = c->buckets[b];
+    while (s != (H2cStream*)0) {
+      var nx: H2cStream* = s->next;
+      h2c_wake_stream(c, s);
+      s = nx;
+    }
+  }
+}
+
+// The application is done with n DATA bytes: announce them once enough add up.
+fn h2c_credit(c: H2c*, s: H2cStream*, n: int64) {
+  if (n <= 0) { return; }
+  c->unacked = c->unacked + n;
+  if (c->unacked >= h2c_max(1, c->cfg.conn_window / 2)) {
+    h2c_queue_wu(c, 0, c->unacked);
+    h2_window_credit(&c->recv_win, c->unacked);
+    c->unacked = 0;
+  }
+  if (s != (H2cStream*)0 && !s->remote_closed) {
+    s->unacked = s->unacked + n;
+    if (s->unacked >= h2c_max(1, c->mine.initial_window_size / 2)) {
+      h2c_queue_wu(c, s->id, s->unacked);
+      h2_window_credit(&s->recv_win, s->unacked);
+      s->unacked = 0;
+    }
+  }
+}
+
+const H2C_KIND_REQUEST = 0;
+const H2C_KIND_RESPONSE = 1;
+const H2C_KIND_TRAILERS = 2;
+
+fn h2c_plain(s: string) -> bool {
+  for i in 0..(int64)s.length {
+    var ch: int32 = (int32)s[i];
+    if (ch == 0 || ch == 10 || ch == 13) { return false; }
+  }
+  return true;
+}
+
+// Checks a header list against RFC 9113 section 8.
+fn h2c_headers_ok(list: HpackHeader*, n: int64, kind: int32) -> bool {
+  var verb: string = "";
+  var have_method: bool = false;
+  var have_scheme: bool = false;
+  var have_path: bool = false;
+  var have_status: bool = false;
+  var regular: bool = false;
+  for i in 0..n {
+    var name: string = list[i].name;
+    var value: string = list[i].value;
+    if (name.length == 0 || !h2c_plain(name) || !h2c_plain(value)) { return false; }
+    for j in 0..(int64)name.length {
+      var ch: int32 = (int32)name[j];
+      if (ch >= 65 && ch <= 90) { return false; }
+    }
+    if ((int32)name[0] == 58) {
+      if (regular || kind == H2C_KIND_TRAILERS) { return false; }
+      if (kind == H2C_KIND_REQUEST) {
+        if (name == ":method") {
+          if (have_method) { return false; }
+          have_method = true;
+          verb = value;
+        } else if (name == ":scheme") {
+          if (have_scheme) { return false; }
+          have_scheme = true;
+        } else if (name == ":path") {
+          if (have_path || value.length == 0) { return false; }
+          have_path = true;
+        } else if (name != ":authority") {
+          return false;
+        }
+      } else {
+        if (name != ":status" || have_status) { return false; }
+        have_status = true;
+      }
+      continue;
+    }
+    regular = true;
+    if (name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade") { return false; }
+    if (name == "te" && value != "trailers") { return false; }
+  }
+  if (kind == H2C_KIND_REQUEST) {
+    if (!have_method) { return false; }
+    if (verb != "CONNECT" && (!have_scheme || !have_path)) { return false; }
+  }
+  if (kind == H2C_KIND_RESPONSE && !have_status) { return false; }
+  return true;
+}
+
+// Finds a header by name. Returns false if it is not there.
+export fn h2c_find_header(list: HpackHeader*, n: int64, name: string, out: string*) -> bool {
+  for i in 0..n {
+    if (list[i].name == name) {
+      *out = list[i].value;
+      return true;
+    }
+  }
+  return false;
+}
+
+fn h2c_settings_differ(c: H2c*, list: H2Setting*) -> int64 {
+  var d: H2Settings;
+  h2_settings_defaults(&d);
+  var m: H2Settings = c->mine_new;
+  var n: int64 = 0;
+  if (m.header_table_size != d.header_table_size) { list[n].id = H2_SETTINGS_HEADER_TABLE_SIZE; list[n].value = m.header_table_size; n = n + 1; }
+  if (m.enable_push != d.enable_push) { list[n].id = H2_SETTINGS_ENABLE_PUSH; list[n].value = m.enable_push; n = n + 1; }
+  if (m.max_concurrent_streams != d.max_concurrent_streams) { list[n].id = H2_SETTINGS_MAX_CONCURRENT_STREAMS; list[n].value = m.max_concurrent_streams; n = n + 1; }
+  if (m.initial_window_size != d.initial_window_size) { list[n].id = H2_SETTINGS_INITIAL_WINDOW_SIZE; list[n].value = m.initial_window_size; n = n + 1; }
+  if (m.max_frame_size != d.max_frame_size) { list[n].id = H2_SETTINGS_MAX_FRAME_SIZE; list[n].value = m.max_frame_size; n = n + 1; }
+  if (m.max_header_list_size != d.max_header_list_size) { list[n].id = H2_SETTINGS_MAX_HEADER_LIST_SIZE; list[n].value = m.max_header_list_size; n = n + 1; }
+  return n;
+}
+
+// Makes a connection. Returns null if memory runs out.
+export fn h2c_new(is_server: bool, cfg: H2cConfig*) -> H2c* {
+  var arena: Arena* = arena_init(0);
+  if (arena == (Arena*)0) { return (H2c*)0; }
+  var c: H2c* = (H2c*)arena_alloc_zeroed(arena, (int64)sizeof(H2c));
+  if (c == (H2c*)0) {
+    arena_free(arena);
+    return c;
+  }
+  c->arena = arena;
+  c->harena = arena_init(0);
+  c->is_server = is_server;
+  memcpy((uint8*)&c->cfg, (uint8*)cfg, sizeof(H2cConfig));   // a struct copy here trips a debug codegen bug
+  var k: H2cConfig* = &c->cfg;
+  k->max_streams = h2c_min(h2c_max(k->max_streams, 1), 100000);
+  k->max_concurrent_streams = h2c_min(h2c_max(k->max_concurrent_streams, 1), k->max_streams);
+  k->max_frame_size = h2c_min(h2c_max(k->max_frame_size, 16384), (int64)H2_MAX_FRAME_SIZE_LIMIT);
+  k->initial_window = h2c_min(h2c_max(k->initial_window, 0), (int64)H2_MAX_WINDOW);
+  k->conn_window = h2c_min(h2c_max(k->conn_window, 65535), (int64)H2_MAX_WINDOW);
+  k->max_header_list_size = h2c_min(h2c_max(k->max_header_list_size, 1024), 268435456);
+  k->header_table_size = h2c_min(h2c_max(k->header_table_size, 0), 1048576);
+  k->max_output = h2c_max(k->max_output, 65536);
+
+  h2_settings_defaults(&c->peer);
+  h2_settings_defaults(&c->mine);
+  c->mine_new = c->mine;
+  c->mine_new.header_table_size = k->header_table_size;
+  c->mine_new.enable_push = 0;
+  c->mine_new.max_concurrent_streams = k->max_concurrent_streams;
+  c->mine_new.initial_window_size = k->initial_window;
+  c->mine_new.max_frame_size = k->max_frame_size;
+  c->mine_new.max_header_list_size = k->max_header_list_size;
+
+  c->in_cap = h2c_max(65536, 2 * (9 + k->max_frame_size));
+  c->in_buf = (uint8*)arena_alloc(arena, c->in_cap);
+  c->out_cap = k->max_output;
+  c->out_soft = k->max_output / 4 * 3;
+  c->out_buf = (uint8*)arena_alloc(arena, c->out_cap);
+  c->hbuf_cap = h2c_max(65536, 2 * k->max_header_list_size);
+  c->hbuf = (uint8*)arena_alloc(arena, c->hbuf_cap);
+  c->acc_cap = k->max_header_list_size;
+  c->acc = (uint8*)arena_alloc(arena, c->acc_cap);
+  c->nbuckets = h2c_pow2(2 * k->max_streams);
+  c->buckets = (H2cStream**)arena_alloc_zeroed(arena, c->nbuckets * 8);
+  c->note_cap = 2 * k->max_streams + 32;
+  c->notes = (H2cNote*)arena_alloc(arena, c->note_cap * (int64)sizeof(H2cNote));
+  if (c->harena == (Arena*)0 || c->in_buf == (uint8*)0 || c->out_buf == (uint8*)0 || c->hbuf == (uint8*)0 || c->acc == (uint8*)0 || c->buckets == (H2cStream**)0 || c->notes == (H2cNote*)0) {
+    h2c_free(c);
+    return (H2c*)0;
+  }
+  if (!hpack_decoder_init(&c->dec, arena, k->header_table_size, k->max_header_list_size) || !hpack_encoder_init(&c->enc, arena, k->header_table_size, true)) {
+    h2c_free(c);
+    return (H2c*)0;
+  }
+  h2_reader_init(&c->reader, k->max_frame_size, is_server);
+  h2_window_init(&c->send_win, 65535);
+  h2_window_init(&c->recv_win, k->conn_window);
+  c->next_id = 1;
+  if (is_server) { c->next_id = 2; }
+
+  if (!is_server) {
+    var pre: uint8* = h2c_reserve(c, 24);
+    for i in 0..24 { pre[i] = (uint8)H2_PREFACE[i]; }
+    c->out_tail = c->out_tail + 24;
+  }
+  var list: H2Setting[6];
+  var n: int64 = h2c_settings_differ(c, &list[0]);
+  var p: uint8* = h2c_reserve(c, 9 + 6 * n);
+  c->out_tail = c->out_tail + h2_build_settings(p, 9 + 6 * n, &list[0], n);
+  c->settings_unacked = 1;
+  if (k->conn_window > 65535) { h2c_queue_wu(c, 0, k->conn_window - 65535); }
+  return c;
+}
+
+export fn h2c_free(c: H2c*) {
+  if (c == (H2c*)0) { return; }
+  if (c->harena != (Arena*)0) { arena_free(c->harena); }
+  arena_free(c->arena);
+}
+
+// Bytes waiting for the transport. Sets *p to the first one.
+export fn h2c_pending_output(c: H2c*, p: uint8**) -> int64 {
+  *p = c->out_buf + c->out_head;
+  return h2c_out_used(c);
+}
+
+// The transport took n bytes of what h2c_pending_output showed.
+export fn h2c_output_consumed(c: H2c*, n: int64) {
+  c->out_head = c->out_head + n;
+  if (c->out_head >= c->out_tail) {
+    c->out_head = 0;
+    c->out_tail = 0;
+  }
+  if (c->n_blocked > 0 && h2c_out_used(c) * 2 <= c->out_soft) { h2c_wake_all(c); }
+}
+
+export fn h2c_wants_write(c: H2c*) -> bool {
+  return h2c_out_used(c) > 0;
+}
+
+fn h2c_apply_drop(c: H2c*) {
+  c->in_start = c->in_start + c->in_drop;
+  c->in_drop = 0;
+  if (c->in_start >= c->in_end) {
+    c->in_start = 0;
+    c->in_end = 0;
+  }
+}
+
+// Free space at the end of the input buffer, for reading straight into it.
+// Returns 0 when the buffer is full.
+export fn h2c_input_space(c: H2c*, p: uint8**) -> int64 {
+  h2c_apply_drop(c);
+  if (c->in_start > 0) {
+    memmove(c->in_buf, c->in_buf + c->in_start, c->in_end - c->in_start);
+    c->in_end = c->in_end - c->in_start;
+    c->in_start = 0;
+  }
+  *p = c->in_buf + c->in_end;
+  return c->in_cap - c->in_end;
+}
+
+export fn h2c_input_commit(c: H2c*, n: int64) {
+  c->in_end = c->in_end + n;
+}
+
+// Gives the connection bytes read from the transport. Returns how many it
+// took.
+export fn h2c_feed(c: H2c*, bytes: uint8*, n: int64) -> int64 {
+  if (c->dead) { return H2C_ERR_CLOSED; }
+  var p: uint8* = (uint8*)0;
+  var space: int64 = h2c_input_space(c, &p);
+  var take: int64 = h2c_min(space, n);
+  if (take > 0) { memcpy(p, bytes, take); }
+  h2c_input_commit(c, take);
+  return take;
+}
+
+// The transport ended. Reports H2C_EV_CLOSED.
+export fn h2c_eof(c: H2c*) {
+  if (c->dead) { return; }
+  c->dead = true;
+  c->fail_pending = true;
+  c->fail_code = H2_NO_ERROR;
+  c->fail_text = "";
+}
+
+// Streams we can open right now.
+export fn h2c_stream_slots(c: H2c*) -> int64 {
+  if (c->is_server || c->dead || c->goaway_sent || c->goaway_recv) { return 0; }
+  var limit: int64 = h2c_min(c->peer.max_concurrent_streams, c->cfg.max_streams);
+  var n: int64 = limit - c->n_local;
+  if (n < 0) { return 0; }
+  return n;
+}
+
+// Bytes h2c_send_data would take now on this stream, or a negative error.
+export fn h2c_stream_writable(c: H2c*, id: int32) -> int64 {
+  if (c->dead) { return H2C_ERR_CLOSED; }
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) { return H2C_ERR_NO_STREAM; }
+  if (!s->sent_headers || s->local_closed) { return H2C_ERR_STATE; }
+  return h2c_writable(c, s);
+}
+
+// Encodes the list and queues HEADERS and as many CONTINUATIONs as the peer's
+// frame size needs.
+fn h2c_send_block(c: H2c*, id: int32, list: HpackHeader*, n: int64, end_stream: bool) -> int32 {
+  var bound: int64 = 64;
+  var total: int64 = 0;
+  for i in 0..n {
+    bound = bound + (int64)list[i].name.length + (int64)list[i].value.length + 24;
+    total = total + (int64)list[i].name.length + (int64)list[i].value.length + 32;
+  }
+  if (c->peer.max_header_list_size != H2_UNLIMITED && total > c->peer.max_header_list_size) { return H2C_ERR_TOO_LARGE; }
+  if (bound > c->hbuf_cap) { return H2C_ERR_TOO_LARGE; }
+  var maxf: int64 = c->peer.max_frame_size;
+  var need: int64 = bound + 9 * (bound / maxf + 1);
+  var p: uint8* = h2c_reserve(c, need);
+  if (p == (uint8*)0) {
+    if (need > c->out_cap) { return H2C_ERR_TOO_LARGE; }
+    return H2C_ERR_WOULD_BLOCK;
+  }
+  var o: HpackOut;
+  hpack_out_init(&o, c->hbuf, c->hbuf_cap);
+  if (hpack_encode_block(&c->enc, &o, list, n) != HPACK_OK) {
+    h2c_fail(c, H2_INTERNAL_ERROR, "header encode failed");
+    return H2C_ERR_CLOSED;
+  }
+  var at: int64 = 0;
+  var first: bool = true;
+  var written: int64 = 0;
+  while (first || at < o.len) {
+    var chunk: int64 = h2c_min(o.len - at, maxf);
+    var last: bool = at + chunk >= o.len;
+    var w: int64 = 0;
+    if (first) {
+      w = h2_build_headers(p + written, need - written, id, o.data + at, chunk, end_stream, last, -1, (H2Priority*)0);
+    } else {
+      w = h2_build_continuation(p + written, need - written, id, o.data + at, chunk, last);
+    }
+    if (w < 0) {
+      h2c_fail(c, H2_INTERNAL_ERROR, "frame build failed");
+      return H2C_ERR_CLOSED;
+    }
+    written = written + w;
+    at = at + chunk;
+    first = false;
+  }
+  c->out_tail = c->out_tail + written;
+  return H2C_OK;
+}
+
+// Opens a client stream and sends its request headers. Returns the stream id,
+// or a negative error (H2C_ERR_NO_SLOT at the stream limit).
+export fn h2c_open_stream(c: H2c*, list: HpackHeader*, n: int64, end_stream: bool) -> int32 {
+  if (c->dead) { return H2C_ERR_CLOSED; }
+  if (c->is_server) { return H2C_ERR_STATE; }
+  if (c->goaway_sent || c->goaway_recv) { return H2C_ERR_GOAWAY; }
+  if (c->next_id > H2_MAX_STREAM_ID - 2) { return H2C_ERR_CLOSED; }
+  if (h2c_stream_slots(c) <= 0) { return H2C_ERR_NO_SLOT; }
+  if (!h2c_headers_ok(list, n, H2C_KIND_REQUEST)) { return H2C_ERR_BAD_HEADER; }
+  var id: int32 = c->next_id;
+  var s: H2cStream* = h2c_new_stream(c, id);
+  if (s == (H2cStream*)0) { return H2C_ERR_NOMEM; }
+  var r: int32 = h2c_send_block(c, id, list, n, end_stream);
+  if (r != 0) {
+    h2c_unlink(c, s);
+    return r;
+  }
+  c->next_id = c->next_id + 2;
+  s->sent_headers = true;
+  if (end_stream) { s->local_closed = true; }
+  return id;
+}
+
+// Sends a stream's header block.
+export fn h2c_send_headers(c: H2c*, id: int32, list: HpackHeader*, n: int64, end_stream: bool) -> int32 {
+  if (c->dead) { return H2C_ERR_CLOSED; }
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) { return H2C_ERR_NO_STREAM; }
+  if (s->local_closed) { return H2C_ERR_STATE; }
+  var kind: int32 = H2C_KIND_TRAILERS;
+  var ends: bool = true;
+  if (!s->sent_headers) {
+    if (!c->is_server) { return H2C_ERR_STATE; }
+    kind = H2C_KIND_RESPONSE;
+    ends = end_stream;
+  }
+  if (!h2c_headers_ok(list, n, kind)) { return H2C_ERR_BAD_HEADER; }
+  var r: int32 = h2c_send_block(c, id, list, n, ends);
+  if (r != 0) { return r; }
+  s->sent_headers = true;
+  if (ends) {
+    s->local_closed = true;
+    h2c_remove_if_done(c, s);
+  }
+  return H2C_OK;
+}
+
+// Queues up to n bytes of DATA, as much as both flow-control windows and the
+// output queue allow. Negative on error.
+export fn h2c_send_data(c: H2c*, id: int32, data: uint8*, n: int64, end_stream: bool) -> int64 {
+  if (c->dead) { return H2C_ERR_CLOSED; }
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) { return H2C_ERR_NO_STREAM; }
+  if (!s->sent_headers || s->local_closed) { return H2C_ERR_STATE; }
+  var sent: int64 = 0;
+  if (n == 0) {
+    if (end_stream) {
+      var p0: uint8* = h2c_reserve(c, 9);
+      if (p0 == (uint8*)0) { return H2C_ERR_WOULD_BLOCK; }
+      c->out_tail = c->out_tail + h2_build_data(p0, 9, id, data, 0, true, -1);
+      s->local_closed = true;
+      h2c_remove_if_done(c, s);
+    }
+    return 0;
+  }
+  var maxf: int64 = c->peer.max_frame_size;
+  while (sent < n) {
+    var w: int64 = h2c_writable(c, s);
+    if (w <= 0) { break; }
+    var chunk: int64 = h2c_min(h2c_min(n - sent, w), maxf);
+    var last: bool = end_stream && sent + chunk == n;
+    var p: uint8* = h2c_reserve(c, 9 + chunk);
+    if (p == (uint8*)0) { break; }
+    c->out_tail = c->out_tail + h2_build_data(p, 9 + chunk, id, data + sent, chunk, last, -1);
+    h2_window_debit(&s->send_win, chunk);
+    h2_window_debit(&c->send_win, chunk);
+    sent = sent + chunk;
+    if (last) { s->local_closed = true; }
+  }
+  if (sent < n) {
+    if (!s->blocked) {
+      s->blocked = true;
+      c->n_blocked = c->n_blocked + 1;
+    }
+  } else if (s->blocked) {
+    s->blocked = false;
+    c->n_blocked = c->n_blocked - 1;
+  }
+  h2c_remove_if_done(c, s);
+  return sent;
+}
+
+// Ends the stream with RST_STREAM. The stream is gone at once.
+export fn h2c_reset_stream(c: H2c*, id: int32, error_code: int64) -> int32 {
+  if (c->dead) { return H2C_ERR_CLOSED; }
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) { return H2C_ERR_NO_STREAM; }
+  h2c_queue_rst(c, id, error_code);
+  h2c_recent_add(c, id);
+  h2c_remove(c, s);
+  return H2C_OK;
+}
+
+// The application used n DATA bytes of this stream (manual_flow only).
+export fn h2c_consumed(c: H2c*, id: int32, n: int64) {
+  if (!c->cfg.manual_flow || c->dead) { return; }
+  h2c_credit(c, h2c_find(c, id), n);
+}
+
+// Sends a PING with 8 bytes of data.
+export fn h2c_ping(c: H2c*, data: uint8*) -> int32 {
+  if (c->dead) { return H2C_ERR_CLOSED; }
+  var slot: int32 = -1;
+  for i in 0..8 {
+    if (!c->pings[i].used) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) { return H2C_ERR_NO_SLOT; }
+  c->pings[slot].used = true;
+  for i in 0..8 { c->pings[slot].data[i] = data[i]; }
+  c->pings[slot].sent_ms = net_now_ms();
+  h2c_queue_ping(c, data, false);
+  return H2C_OK;
+}
+
+// Sends GOAWAY.
+export fn h2c_goaway(c: H2c*, last_stream_id: int32, error_code: int64, debug: string) -> int32 {
+  if (c->dead) { return H2C_ERR_CLOSED; }
+  var last: int32 = last_stream_id;
+  if (last < 0) { last = c->last_peer_id; }
+  if (c->goaway_sent && last > c->goaway_sent_last) { return H2C_ERR_STATE; }
+  var n: int64 = 17 + (int64)debug.length;
+  var p: uint8* = h2c_reserve(c, n);
+  if (p == (uint8*)0) { return H2C_ERR_WOULD_BLOCK; }
+  var w: int64 = h2_build_goaway(p, n, last, error_code, debug.chars, (int64)debug.length);
+  if (w < 0) { return H2C_ERR_TOO_LARGE; }
+  c->out_tail = c->out_tail + w;
+  c->goaway_sent = true;
+  c->goaway_sent_last = last;
+  return H2C_OK;
+}
+
+export fn h2c_peer_settings(c: H2c*) -> H2Settings* {
+  return &c->peer;
+}
+
+export fn h2c_stream_set_user(c: H2c*, id: int32, user: rawptr) -> bool {
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) { return false; }
+  s->user = user;
+  return true;
+}
+
+export fn h2c_stream_user(c: H2c*, id: int32) -> rawptr {
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) { return (rawptr)0; }
+  return s->user;
+}
+
+export fn h2c_open_count(c: H2c*) -> int64 {
+  return c->n_local + c->n_peer;
+}
+
+// The error code the connection failed with; 0 while it is healthy.
+export fn h2c_error(c: H2c*) -> int64 {
+  if (c->dead) { return c->fail_code; }
+  return 0;
+}
+
+export fn h2c_is_dead(c: H2c*) -> bool {
+  return c->dead;
+}
+
+// True when a GOAWAY went either way, no streams are left, and the output is
+// flushed.
+export fn h2c_is_done(c: H2c*) -> bool {
+  if (c->dead) { return h2c_out_used(c) == 0; }
+  return (c->goaway_sent || c->goaway_recv) && c->n_local + c->n_peer == 0 && h2c_out_used(c) == 0;
+}
+
+export fn h2c_goaway_received(c: H2c*, last_stream_id: int32*) -> bool {
+  *last_stream_id = c->goaway_recv_last;
+  return c->goaway_recv;
+}
+
+// Resets a stream because of a fault on the stream.
+fn h2c_stream_error(c: H2c*, id: int32, code: int64, ev: H2cEvent*) -> int32 {
+  h2c_queue_rst(c, id, code);
+  h2c_recent_add(c, id);
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) { return 0; }
+  ev->user = s->user;
+  h2c_remove(c, s);
+  ev->kind = H2C_EV_RESET;
+  ev->stream_id = id;
+  ev->error_code = code;
+  ev->by_peer = false;
+  return H2C_EV_RESET;
+}
+
+// A frame for a stream that is closed.
+fn h2c_closed_stream_frame(c: H2c*, id: int32) {
+  if (c->goaway_sent && id > c->goaway_sent_last && !h2c_is_local_id(c, id)) { return; }
+  if (h2c_recent_has(c, id)) { return; }
+  h2c_queue_rst(c, id, H2_STREAM_CLOSED);
+  h2c_recent_add(c, id);
+}
+
+fn h2c_on_data(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var h: H2FrameHeader = fr->header;
+  var d: H2Data;
+  var e: int32 = h2_parse_data(h, fr->payload, &d);
+  if (e != 0) {
+    h2c_fail(c, (int64)e, "bad DATA frame");
+    return 0;
+  }
+  if (h2_window_debit(&c->recv_win, h.length) != 0) {
+    h2c_fail(c, H2_FLOW_CONTROL_ERROR, "connection window exceeded");
+    return 0;
+  }
+  var s: H2cStream* = h2c_find(c, h.stream_id);
+  if (s == (H2cStream*)0) {
+    if (h2c_is_idle(c, h.stream_id)) {
+      h2c_fail(c, H2_PROTOCOL_ERROR, "DATA on an idle stream");
+      return 0;
+    }
+    h2c_credit(c, s, h.length);
+    h2c_closed_stream_frame(c, h.stream_id);
+    return 0;
+  }
+  if (s->remote_closed) {
+    h2c_credit(c, s, h.length);
+    return h2c_stream_error(c, h.stream_id, H2_STREAM_CLOSED, ev);
+  }
+  if (h2_window_debit(&s->recv_win, h.length) != 0) {
+    h2c_credit(c, s, h.length);
+    return h2c_stream_error(c, h.stream_id, H2_FLOW_CONTROL_ERROR, ev);
+  }
+  // Padding is refilled at once; the payload waits for h2c_consumed in manual mode.
+  if (c->cfg.manual_flow) {
+    h2c_credit(c, s, (int64)d.pad_length);
+  } else {
+    h2c_credit(c, s, h.length);
+  }
+  if (d.end_stream) { s->remote_closed = true; }
+  var kind: int32 = 0;
+  if (d.length > 0 || d.end_stream) {
+    ev->kind = H2C_EV_DATA;
+    ev->stream_id = h.stream_id;
+    ev->data = d.data;
+    ev->length = d.length;
+    ev->end_stream = d.end_stream;
+    kind = H2C_EV_DATA;
+  }
+  if (d.end_stream) { h2c_remove_if_done(c, s); }
+  return kind;
+}
+
+// A whole header block is in hand: decode it and route it.
+fn h2c_headers_done(c: H2c*, id: int32, end_stream: bool, block: uint8*, n: int64, ev: H2cEvent*) -> int32 {
+  var hs: HpackHeaders;
+  hpack_headers_init(&hs, c->harena);
+  var r: int32 = hpack_decode(&c->dec, block, n, &hs);
+  if (r != HPACK_OK) {
+    if (r == HPACK_ERR_TOO_LARGE) {
+      h2c_fail(c, H2_ENHANCE_YOUR_CALM, "header list too large");
+    } else {
+      h2c_fail(c, H2_COMPRESSION_ERROR, "bad header block");
+    }
+    return 0;
+  }
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) {
+    if (h2c_is_local_id(c, id)) {
+      if (h2c_is_idle(c, id)) {
+        h2c_fail(c, H2_PROTOCOL_ERROR, "HEADERS on an idle stream");
+      } else {
+        h2c_closed_stream_frame(c, id);
+      }
+      return 0;
+    }
+    if (!c->is_server || (id & 1) == 0) {
+      h2c_fail(c, H2_PROTOCOL_ERROR, "unexpected stream");
+      return 0;
+    }
+    if (id <= c->seen_peer_id) {
+      h2c_closed_stream_frame(c, id);
+      return 0;
+    }
+    c->seen_peer_id = id;
+    if (c->goaway_sent && id > c->goaway_sent_last) { return 0; }
+    if (c->n_peer >= h2c_min(c->mine.max_concurrent_streams, c->cfg.max_streams)) {
+      h2c_queue_rst(c, id, H2_REFUSED_STREAM);
+      return 0;
+    }
+    if (!h2c_headers_ok(hs.items, hs.count, H2C_KIND_REQUEST)) {
+      h2c_queue_rst(c, id, H2_PROTOCOL_ERROR);
+      return 0;
+    }
+    s = h2c_new_stream(c, id);
+    if (s == (H2cStream*)0) {
+      h2c_queue_rst(c, id, H2_REFUSED_STREAM);
+      return 0;
+    }
+    c->last_peer_id = id;
+    s->got_headers = true;
+    ev->new_stream = true;
+    ev->kind = H2C_EV_HEADERS;
+  } else {
+    if (s->remote_closed) { return h2c_stream_error(c, id, H2_STREAM_CLOSED, ev); }
+    if (!s->got_headers) {
+      if (!h2c_headers_ok(hs.items, hs.count, H2C_KIND_RESPONSE)) { return h2c_stream_error(c, id, H2_PROTOCOL_ERROR, ev); }
+      s->got_headers = true;
+      ev->kind = H2C_EV_HEADERS;
+    } else {
+      if (!end_stream || !h2c_headers_ok(hs.items, hs.count, H2C_KIND_TRAILERS)) { return h2c_stream_error(c, id, H2_PROTOCOL_ERROR, ev); }
+      ev->kind = H2C_EV_TRAILERS;
+    }
+  }
+  ev->stream_id = id;
+  ev->headers = hs.items;
+  ev->header_count = hs.count;
+  ev->end_stream = end_stream;
+  if (end_stream) {
+    s->remote_closed = true;
+    h2c_remove_if_done(c, s);
+  }
+  return ev->kind;
+}
+
+fn h2c_acc_add(c: H2c*, p: uint8*, n: int64) -> bool {
+  if (c->acc_len + n > c->acc_cap) {
+    h2c_fail(c, H2_ENHANCE_YOUR_CALM, "header block too large");
+    return false;
+  }
+  if (n > 0) { memcpy(c->acc + c->acc_len, p, n); }
+  c->acc_len = c->acc_len + n;
+  return true;
+}
+
+fn h2c_on_headers(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var hh: H2Headers;
+  var e: int32 = h2_parse_headers(fr->header, fr->payload, &hh);
+  if (e != 0) {
+    h2c_fail(c, (int64)e, "bad HEADERS frame");
+    return 0;
+  }
+  if (hh.has_priority && hh.priority.dependency == fr->header.stream_id) {
+    h2c_fail(c, H2_PROTOCOL_ERROR, "stream depends on itself");
+    return 0;
+  }
+  if (hh.end_headers) { return h2c_headers_done(c, fr->header.stream_id, hh.end_stream, hh.block, hh.block_len, ev); }
+  c->acc_len = 0;
+  c->acc_stream = fr->header.stream_id;
+  c->acc_end_stream = hh.end_stream;
+  h2c_acc_add(c, hh.block, hh.block_len);
+  return 0;
+}
+
+fn h2c_on_continuation(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var cc: H2Continuation;
+  var e: int32 = h2_parse_continuation(fr->header, fr->payload, &cc);
+  if (e != 0) {
+    h2c_fail(c, (int64)e, "bad CONTINUATION frame");
+    return 0;
+  }
+  if (!h2c_acc_add(c, cc.block, cc.block_len)) { return 0; }
+  if (!cc.end_headers) { return 0; }
+  return h2c_headers_done(c, c->acc_stream, c->acc_end_stream, c->acc, c->acc_len, ev);
+}
+
+fn h2c_on_rst(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var code: int64 = 0;
+  var e: int32 = h2_parse_rst_stream(fr->header, fr->payload, &code);
+  if (e != 0) {
+    h2c_fail(c, (int64)e, "bad RST_STREAM frame");
+    return 0;
+  }
+  var id: int32 = fr->header.stream_id;
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) {
+    if (h2c_is_idle(c, id)) { h2c_fail(c, H2_PROTOCOL_ERROR, "RST_STREAM on an idle stream"); }
+    return 0;
+  }
+  h2c_recent_add(c, id);
+  ev->user = s->user;
+  h2c_remove(c, s);
+  ev->kind = H2C_EV_RESET;
+  ev->stream_id = id;
+  ev->error_code = code;
+  ev->by_peer = true;
+  return H2C_EV_RESET;
+}
+
+fn h2c_on_settings(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var h: H2FrameHeader = fr->header;
+  var next: H2Settings = c->peer;
+  var e: int32 = h2_settings_apply_frame(&next, h, fr->payload);
+  if (e != 0) {
+    h2c_fail(c, (int64)e, "bad SETTINGS frame");
+    return 0;
+  }
+  if ((h.flags & H2_FLAG_ACK) != 0) {
+    if (c->settings_unacked == 0) { return 0; }
+    c->settings_unacked = c->settings_unacked - 1;
+    var delta: int64 = c->mine_new.initial_window_size - c->mine.initial_window_size;
+    c->mine = c->mine_new;
+    if (delta != 0) {
+      for b in 0..c->nbuckets {
+        var s: H2cStream* = c->buckets[b];
+        while (s != (H2cStream*)0) {
+          h2_window_adjust(&s->recv_win, delta);
+          s = s->next;
+        }
+      }
+    }
+    ev->kind = H2C_EV_SETTINGS_ACK;
+    return H2C_EV_SETTINGS_ACK;
+  }
+  c->peer_seen = true;
+  var old_window: int64 = c->peer.initial_window_size;
+  var old_streams: int64 = c->peer.max_concurrent_streams;
+  c->peer = next;
+  var delta2: int64 = c->peer.initial_window_size - old_window;
+  if (delta2 != 0) {
+    for b in 0..c->nbuckets {
+      var s2: H2cStream* = c->buckets[b];
+      while (s2 != (H2cStream*)0) {
+        if (h2_window_adjust(&s2->send_win, delta2) != 0) {
+          h2c_fail(c, H2_FLOW_CONTROL_ERROR, "window overflow from SETTINGS");
+          return 0;
+        }
+        s2 = s2->next;
+      }
+    }
+  }
+  hpack_encoder_set_table_size(&c->enc, c->peer.header_table_size);
+  h2c_queue_settings_ack(c);
+  if (delta2 > 0) { h2c_wake_all(c); }
+  if (c->peer.max_concurrent_streams > old_streams && h2c_stream_slots(c) > 0) {
+    c->slots_freed = c->slots_freed + 1;
+    c->slot_last = 0;
+  }
+  ev->kind = H2C_EV_SETTINGS;
+  return H2C_EV_SETTINGS;
+}
+
+fn h2c_on_ping(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var data: uint8[8];
+  var e: int32 = h2_parse_ping(fr->header, fr->payload, &data[0]);
+  if (e != 0) {
+    h2c_fail(c, (int64)e, "bad PING frame");
+    return 0;
+  }
+  for i in 0..8 { ev->ping[i] = data[i]; }
+  if ((fr->header.flags & H2_FLAG_ACK) == 0) {
+    h2c_queue_ping(c, &data[0], true);
+    ev->kind = H2C_EV_PING;
+    return H2C_EV_PING;
+  }
+  for k in 0..8 {
+    if (!c->pings[k].used) { continue; }
+    var same: bool = true;
+    for i in 0..8 {
+      if (c->pings[k].data[i] != data[i]) { same = false; }
+    }
+    if (same) {
+      c->pings[k].used = false;
+      ev->kind = H2C_EV_PING_ACK;
+      ev->rtt_ms = net_now_ms() - c->pings[k].sent_ms;
+      return H2C_EV_PING_ACK;
+    }
+  }
+  return 0;
+}
+
+fn h2c_on_goaway(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var g: H2Goaway;
+  var e: int32 = h2_parse_goaway(fr->header, fr->payload, &g);
+  if (e != 0) {
+    h2c_fail(c, (int64)e, "bad GOAWAY frame");
+    return 0;
+  }
+  c->goaway_recv = true;
+  c->goaway_recv_last = g.last_stream_id;
+  // Streams we opened above last_stream_id were never processed.
+  for b in 0..c->nbuckets {
+    var s: H2cStream* = c->buckets[b];
+    while (s != (H2cStream*)0) {
+      var nx: H2cStream* = s->next;
+      if (h2c_is_local_id(c, s->id) && s->id > g.last_stream_id) {
+        var id: int32 = s->id;
+        var u: rawptr = s->user;
+        h2c_remove(c, s);
+        h2c_note_push(c, H2C_NOTE_UNPROCESSED, id, u);
+      }
+      s = nx;
+    }
+  }
+  ev->kind = H2C_EV_GOAWAY;
+  ev->last_stream_id = g.last_stream_id;
+  ev->error_code = g.error_code;
+  ev->debug = h2c_view(g.debug, g.debug_len);
+  return H2C_EV_GOAWAY;
+}
+
+fn h2c_on_window_update(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var inc: int64 = 0;
+  var e: int32 = h2_parse_window_update(fr->header, fr->payload, &inc);
+  var id: int32 = fr->header.stream_id;
+  if (e == H2_FRAME_SIZE_ERROR) {
+    h2c_fail(c, (int64)e, "bad WINDOW_UPDATE frame");
+    return 0;
+  }
+  if (id == 0) {
+    if (e != 0) {
+      h2c_fail(c, (int64)e, "zero WINDOW_UPDATE");
+      return 0;
+    }
+    if (h2_window_credit(&c->send_win, inc) != 0) {
+      h2c_fail(c, H2_FLOW_CONTROL_ERROR, "connection window overflow");
+      return 0;
+    }
+    h2c_wake_all(c);
+    return 0;
+  }
+  var s: H2cStream* = h2c_find(c, id);
+  if (s == (H2cStream*)0) {
+    if (h2c_is_idle(c, id)) { h2c_fail(c, H2_PROTOCOL_ERROR, "WINDOW_UPDATE on an idle stream"); }
+    return 0;
+  }
+  if (e != 0) { return h2c_stream_error(c, id, H2_PROTOCOL_ERROR, ev); }
+  if (h2_window_credit(&s->send_win, inc) != 0) { return h2c_stream_error(c, id, H2_FLOW_CONTROL_ERROR, ev); }
+  h2c_wake_stream(c, s);
+  return 0;
+}
+
+fn h2c_dispatch(c: H2c*, fr: H2Frame*, ev: H2cEvent*) -> int32 {
+  var t: int32 = fr->header.type;
+  if (!c->peer_seen && t != H2_FRAME_SETTINGS) {
+    h2c_fail(c, H2_PROTOCOL_ERROR, "the first frame must be SETTINGS");
+    return 0;
+  }
+  switch (t) {
+    case 0: { return h2c_on_data(c, fr, ev); }
+    case 1: { return h2c_on_headers(c, fr, ev); }
+    case 2: {
+      var pr: H2Priority;
+      var e: int32 = h2_parse_priority(fr->header, fr->payload, &pr);
+      if (e != 0) {
+        if (h2_is_stream_error(fr->header, e)) {
+          h2c_queue_rst(c, fr->header.stream_id, (int64)e);
+        } else {
+          h2c_fail(c, (int64)e, "bad PRIORITY frame");
+        }
+      }
+      return 0;
+    }
+    case 3: { return h2c_on_rst(c, fr, ev); }
+    case 4: { return h2c_on_settings(c, fr, ev); }
+    case 5: {
+      h2c_fail(c, H2_PROTOCOL_ERROR, "PUSH_PROMISE is not accepted");
+      return 0;
+    }
+    case 6: { return h2c_on_ping(c, fr, ev); }
+    case 7: { return h2c_on_goaway(c, fr, ev); }
+    case 8: { return h2c_on_window_update(c, fr, ev); }
+    case 9: { return h2c_on_continuation(c, fr, ev); }
+    default: { return 0; }
+  }
+}
+
+// Queued notices first: Returns an event kind or 0.
+fn h2c_next_note(c: H2c*, ev: H2cEvent*) -> int32 {
+  while (c->note_len > 0) {
+    var n: H2cNote = c->notes[c->note_head];
+    c->note_head = (c->note_head + 1) % c->note_cap;
+    c->note_len = c->note_len - 1;
+    if (n.kind == H2C_NOTE_UNPROCESSED) {
+      ev->kind = H2C_EV_RESET;
+      ev->stream_id = n.stream_id;
+      ev->error_code = H2_REFUSED_STREAM;
+      ev->by_peer = true;
+      ev->unprocessed = true;
+      ev->user = n.user;
+      return H2C_EV_RESET;
+    }
+    var s: H2cStream* = h2c_find(c, n.stream_id);
+    if (s == (H2cStream*)0 || s->local_closed) { continue; }
+    var w: int64 = h2c_writable(c, s);
+    if (w <= 0) {
+      s->blocked = true;
+      c->n_blocked = c->n_blocked + 1;
+      continue;
+    }
+    ev->kind = H2C_EV_WRITABLE;
+    ev->stream_id = n.stream_id;
+    ev->window = w;
+    return H2C_EV_WRITABLE;
+  }
+  return 0;
+}
+
+// The next event, or 0 when there is none and more input is needed. Returns
+// the event's kind (H2C_EV_*) and fills *ev.
+export fn h2c_next_event(c: H2c*, ev: H2cEvent*) -> int32 {
+  var blank: H2cEvent;
+  *ev = blank;
+  h2c_apply_drop(c);
+  arena_reset(c->harena);
+  while (true) {
+    if (c->fail_pending) {
+      c->fail_pending = false;
+      ev->kind = H2C_EV_CLOSED;
+      ev->error_code = c->fail_code;
+      ev->debug = c->fail_text;
+      return H2C_EV_CLOSED;
+    }
+    if (c->dead) { return 0; }
+    var k: int32 = h2c_next_note(c, ev);
+    if (k != 0) { return k; }
+    if (c->slots_freed > 0) {
+      ev->kind = H2C_EV_SLOT_FREE;
+      ev->stream_id = c->slot_last;
+      ev->count = c->slots_freed;
+      c->slots_freed = 0;
+      return H2C_EV_SLOT_FREE;
+    }
+    var fr: H2Frame;
+    var r: int32 = h2_reader_next(&c->reader, c->in_buf + c->in_start, c->in_end - c->in_start, &fr);
+    if (r == H2_READ_MORE) { return 0; }
+    if (r == H2_READ_ERROR) {
+      h2c_fail(c, (int64)fr.error, "bad frame or preface");
+      continue;
+    }
+    if (r == H2_READ_PREFACE) {
+      c->in_start = c->in_start + fr.consumed;
+      continue;
+    }
+    c->in_drop = fr.consumed;
+    var k2: int32 = h2c_dispatch(c, &fr, ev);
+    if (k2 != 0) { return k2; }
+    h2c_apply_drop(c);
+  }
+  return 0;
+}
+
+// Writes all queued output to the stream. Returns 0 or a negative error.
+export fn h2c_flush(c: H2c*, ns: NetStream*) -> int64 {
+  while (h2c_wants_write(c)) {
+    var p: uint8* = (uint8*)0;
+    var n: int64 = h2c_pending_output(c, &p);
+    var w: int64 = net_stream_write_all(ns, p, n);
+    if (w < 0) { return w; }
+    h2c_output_consumed(c, n);
+  }
+  return 0;
+}
+
+// Sends what is queued, then waits up to timeout_ms (-1 forever) for the
+// transport to have bytes and feeds them in.
+export fn h2c_pump(c: H2c*, ns: NetStream*, timeout_ms: int64) -> int64 {
+  var f: int64 = h2c_flush(c, ns);
+  if (f < 0) { return f; }
+  var p: uint8* = (uint8*)0;
+  var space: int64 = h2c_input_space(c, &p);
+  if (space <= 0) { return 0; }
+  if (ns->fd >= 0) {
+    var w: int64 = sock_wait(ns->fd, NET_POLL_IN, timeout_ms);
+    if (w <= 0) { return w; }
+  }
+  var r: int64 = net_stream_read(ns, p, space);
+  if (r == -NET_EAGAIN) { return 0; }
+  if (r < 0) { return r; }
+  if (r == 0) {
+    h2c_eof(c);
+    return H2C_PUMP_EOF;
+  }
+  h2c_input_commit(c, r);
+  return r;
+}
+
+// A finished response. Everything lives in the arena given to h2c_call.
+export struct H2cResponse {
+  headers: HpackHeader*;
+  header_count: int64;
+  trailers: HpackHeader*;
+  trailer_count: int64;
+  body: uint8*;
+  body_len: int64;
+  reset_code: int64;      // when h2c_call returned H2C_ERR_RESET
+}
+
+fn h2c_copy_str(arena: Arena*, s: string) -> string {
+  var out: string;
+  var q: uint8* = (uint8*)arena_alloc(arena, (int64)s.length + 1);
+  if (q == (uint8*)0) { return out; }
+  if (s.length > 0) { memcpy(q, s.chars, (int64)s.length); }
+  q[s.length] = (uint8)0;
+  out.chars = q;
+  out.length = s.length;
+  return out;
+}
+
+fn h2c_copy_list(arena: Arena*, src: HpackHeader*, n: int64) -> HpackHeader* {
+  var out: HpackHeader* = (HpackHeader*)arena_alloc(arena, (n + 1) * (int64)sizeof(HpackHeader));
+  if (out == (HpackHeader*)0) { return out; }
+  for i in 0..n {
+    out[i].name = h2c_copy_str(arena, src[i].name);
+    out[i].value = h2c_copy_str(arena, src[i].value);
+    out[i].never_index = src[i].never_index;
+  }
+  return out;
+}
+
+fn h2c_left(deadline: int64, timeout_ms: int64) -> int64 {
+  if (timeout_ms < 0) { return -1; }
+  var left: int64 = deadline - net_now_ms();
+  if (left < 0) { return 0; }
+  return left;
+}
+
+// Waits for the next event, pumping the transport as needed. Returns the
+// kind, or a negative H2C_ERR_*.
+fn h2c_wait_event(c: H2c*, ns: NetStream*, ev: H2cEvent*, deadline: int64, timeout_ms: int64) -> int32 {
+  while (true) {
+    var k: int32 = h2c_next_event(c, ev);
+    if (k != 0) { return k; }
+    if (timeout_ms >= 0 && net_now_ms() >= deadline) { return H2C_ERR_TIMEOUT; }
+    var r: int64 = h2c_pump(c, ns, h2c_left(deadline, timeout_ms));
+    if (r < 0) {
+      // Whatever the peer sent before closing may still hold events.
+      var k2: int32 = h2c_next_event(c, ev);
+      if (k2 != 0) { return k2; }
+      return H2C_ERR_IO;
+    }
+  }
+  return H2C_ERR_IO;
+}
+
+// One request and its whole response, on a connection nothing else uses.
+export fn h2c_call(c: H2c*, ns: NetStream*, arena: Arena*, list: HpackHeader*, n: int64, body: uint8*, body_len: int64, max_body: int64, timeout_ms: int64, out: H2cResponse*) -> int32 {
+  var blank: H2cResponse;
+  *out = blank;
+  var deadline: int64 = net_now_ms() + timeout_ms;
+  var ev: H2cEvent;
+  var id: int32 = h2c_open_stream(c, list, n, body_len == 0);
+  while (id == H2C_ERR_NO_SLOT) {
+    var k: int32 = h2c_wait_event(c, ns, &ev, deadline, timeout_ms);
+    if (k < 0) { return k; }
+    if (k == H2C_EV_CLOSED) { return H2C_ERR_PROTOCOL; }
+    id = h2c_open_stream(c, list, n, body_len == 0);
+  }
+  if (id < 0) { return id; }
+  var sent: int64 = 0;
+  var cap: int64 = 0;
+  while (true) {
+    if (sent < body_len) {
+      var w: int64 = h2c_send_data(c, id, body + sent, body_len - sent, true);
+      if (w < 0 && w != H2C_ERR_WOULD_BLOCK) { return (int32)w; }
+      if (w > 0) { sent = sent + w; }
+    }
+    var kind: int32 = 0;
+    if (sent < body_len) {
+      // Blocked on the peer's window: flush and look at what comes back.
+      kind = h2c_next_event(c, &ev);
+      if (kind == 0) {
+        var r: int64 = h2c_pump(c, ns, h2c_left(deadline, timeout_ms));
+        if (r < 0) { return H2C_ERR_IO; }
+        if (r == 0 && timeout_ms >= 0 && net_now_ms() >= deadline) { return H2C_ERR_TIMEOUT; }
+        continue;
+      }
+    } else {
+      kind = h2c_wait_event(c, ns, &ev, deadline, timeout_ms);
+      if (kind < 0) { return kind; }
+    }
+    switch (kind) {
+      case 3: {
+        if (ev.stream_id == id) {
+          out->headers = h2c_copy_list(arena, ev.headers, ev.header_count);
+          out->header_count = ev.header_count;
+          if (ev.end_stream) { return 0; }
+        }
+      }
+      case 4: {
+        if (ev.stream_id == id) {
+          if (out->body_len + ev.length > max_body) {
+            h2c_reset_stream(c, id, H2_CANCEL);
+            return H2C_ERR_TOO_LARGE;
+          }
+          if (out->body_len + ev.length > cap) {
+            var ncap: int64 = h2c_max(cap * 2, h2c_max(out->body_len + ev.length, 4096));
+            var nb: uint8* = (uint8*)arena_alloc(arena, ncap);
+            if (nb == (uint8*)0) { return H2C_ERR_NOMEM; }
+            if (out->body_len > 0) { memcpy(nb, out->body, out->body_len); }
+            out->body = nb;
+            cap = ncap;
+          }
+          if (ev.length > 0) { memcpy(out->body + out->body_len, ev.data, ev.length); }
+          out->body_len = out->body_len + ev.length;
+          if (ev.end_stream) { return 0; }
+        }
+      }
+      case 5: {
+        if (ev.stream_id == id) {
+          out->trailers = h2c_copy_list(arena, ev.headers, ev.header_count);
+          out->trailer_count = ev.header_count;
+          return 0;
+        }
+      }
+      case 6: {
+        if (ev.stream_id == id) {
+          out->reset_code = ev.error_code;
+          if (ev.unprocessed) { return H2C_ERR_GOAWAY; }
+          return H2C_ERR_RESET;
+        }
+      }
+      case 12: { return H2C_ERR_PROTOCOL; }
+      default: { }
+    }
+  }
+  return H2C_ERR_IO;
+}
+
+export struct H2cRequest {
+  stream_id: int32;
+  headers: HpackHeader*;
+  header_count: int64;
+  body: uint8*;
+  body_len: int64;
+  trailers: HpackHeader*;
+  trailer_count: int64;
+}
+
+// What a handler fills in.
+export struct H2cReply {
+  headers: HpackHeader*;
+  header_count: int64;
+  body: uint8*;
+  body_len: int64;
+  trailers: HpackHeader*;
+  trailer_count: int64;
+}
+
+struct H2cServeCall {
+  id: int32;
+  arena: Arena*;
+  req: H2cRequest;
+  body_cap: int64;
+  reply: H2cReply;
+  replying: bool;
+  headers_sent: bool;
+  sent: int64;
+}
+
+fn h2c_call_free(c: H2c*, id: int32, call: H2cServeCall*) {
+  h2c_stream_set_user(c, id, (rawptr)0);
+  arena_free(call->arena);
+}
+
+// Sends as much of the reply as the windows allow; frees the call when done.
+fn h2c_serve_push(c: H2c*, call: H2cServeCall*) {
+  var r: H2cReply = call->reply;
+  var id: int32 = call->id;
+  var has_trailers: bool = r.trailer_count > 0;
+  if (!call->headers_sent) {
+    var only: bool = r.body_len == 0 && !has_trailers;
+    if (h2c_send_headers(c, id, r.headers, r.header_count, only) != 0) {
+      h2c_reset_stream(c, id, H2_INTERNAL_ERROR);
+      h2c_call_free(c, id, call);
+      return;
+    }
+    call->headers_sent = true;
+    if (only) {
+      h2c_call_free(c, id, call);
+      return;
+    }
+  }
+  while (call->sent < r.body_len) {
+    var w: int64 = h2c_send_data(c, id, r.body + call->sent, r.body_len - call->sent, !has_trailers);
+    if (w < 0) {
+      h2c_reset_stream(c, id, H2_INTERNAL_ERROR);
+      h2c_call_free(c, id, call);
+      return;
+    }
+    call->sent = call->sent + w;
+    if (w == 0) { return; }
+  }
+  if (has_trailers) {
+    if (h2c_send_headers(c, id, r.trailers, r.trailer_count, true) != 0) {
+      h2c_reset_stream(c, id, H2_INTERNAL_ERROR);
+    }
+  }
+  h2c_call_free(c, id, call);
+}
+
+fn h2c_serve_dispatch(c: H2c*, call: H2cServeCall*, handler: fn(rawptr, H2cRequest*, H2cReply*, Arena*) -> int32, user: rawptr) {
+  call->req.stream_id = call->id;
+  var f: fn(rawptr, H2cRequest*, H2cReply*, Arena*) -> int32 = handler;
+  var rc: int32 = f(user, &call->req, &call->reply, call->arena);
+  if (rc != 0) {
+    h2c_reset_stream(c, call->id, H2_INTERNAL_ERROR);
+    h2c_call_free(c, call->id, call);
+    return;
+  }
+  call->replying = true;
+  h2c_serve_push(c, call);
+}
+
+fn h2c_serve_cleanup(c: H2c*) {
+  for b in 0..c->nbuckets {
+    var s: H2cStream* = c->buckets[b];
+    while (s != (H2cStream*)0) {
+      var nx: H2cStream* = s->next;
+      if (s->user != (rawptr)0) {
+        var call: H2cServeCall* = (H2cServeCall*)s->user;
+        s->user = (rawptr)0;
+        arena_free(call->arena);
+      }
+      s = nx;
+    }
+  }
+}
+
+// Serves a server connection until the peer closes it (returns 0), the
+// connection fails (H2C_ERR_PROTOCOL), or nothing arrives for timeout_ms
+// (H2C_ERR_TIMEOUT).
+export fn h2c_serve(c: H2c*, ns: NetStream*, handler: fn(rawptr, H2cRequest*, H2cReply*, Arena*) -> int32, user: rawptr, max_body: int64, timeout_ms: int64) -> int32 {
+  var ev: H2cEvent;
+  var result: int32 = 0;
+  while (true) {
+    var k: int32 = h2c_next_event(c, &ev);
+    if (k == 0) {
+      var r: int64 = h2c_pump(c, ns, timeout_ms);
+      if (r == 0) {
+        result = H2C_ERR_TIMEOUT;
+        break;
+      }
+      if (r < 0) {
+        // Events queued before the close still count.
+        var tail: int32 = h2c_next_event(c, &ev);
+        if (tail == 0 || tail == H2C_EV_CLOSED) {
+          if (r != H2C_PUMP_EOF) { result = H2C_ERR_IO; }
+          break;
+        }
+        k = tail;
+      } else {
+        continue;
+      }
+    }
+    var id: int32 = ev.stream_id;
+    var call: H2cServeCall* = (H2cServeCall*)h2c_stream_user(c, id);
+    switch (k) {
+      case 3: {
+        if (ev.new_stream) {
+          var a: Arena* = arena_init(0);
+          if (a == (Arena*)0) {
+            h2c_reset_stream(c, id, H2_INTERNAL_ERROR);
+          } else {
+            call = (H2cServeCall*)arena_alloc_zeroed(a, (int64)sizeof(H2cServeCall));
+            call->id = id;
+            call->arena = a;
+            call->req.headers = h2c_copy_list(a, ev.headers, ev.header_count);
+            call->req.header_count = ev.header_count;
+            h2c_stream_set_user(c, id, (rawptr)call);
+            if (ev.end_stream) { h2c_serve_dispatch(c, call, handler, user); }
+          }
+        }
+      }
+      case 4: {
+        if (call != (H2cServeCall*)0) {
+          if (call->req.body_len + ev.length > max_body) {
+            h2c_reset_stream(c, id, H2_ENHANCE_YOUR_CALM);
+            h2c_call_free(c, id, call);
+          } else {
+            if (call->req.body_len + ev.length > call->body_cap) {
+              var ncap: int64 = h2c_max(call->body_cap * 2, h2c_max(call->req.body_len + ev.length, 4096));
+              var nb: uint8* = (uint8*)arena_alloc(call->arena, ncap);
+              if (call->req.body_len > 0) { memcpy(nb, call->req.body, call->req.body_len); }
+              call->req.body = nb;
+              call->body_cap = ncap;
+            }
+            if (ev.length > 0) { memcpy(call->req.body + call->req.body_len, ev.data, ev.length); }
+            call->req.body_len = call->req.body_len + ev.length;
+            if (ev.end_stream) { h2c_serve_dispatch(c, call, handler, user); }
+          }
+        }
+      }
+      case 5: {
+        if (call != (H2cServeCall*)0) {
+          call->req.trailers = h2c_copy_list(call->arena, ev.headers, ev.header_count);
+          call->req.trailer_count = ev.header_count;
+          h2c_serve_dispatch(c, call, handler, user);
+        }
+      }
+      case 6: {
+        if (ev.user != (rawptr)0) { arena_free(((H2cServeCall*)ev.user)->arena); }
+      }
+      case 10: {
+        if (call != (H2cServeCall*)0 && call->replying) { h2c_serve_push(c, call); }
+      }
+      case 12: {
+        result = H2C_ERR_PROTOCOL;
+        if (ev.error_code == H2_NO_ERROR) { result = 0; }
+      }
+      default: { }
+    }
+    if (k == H2C_EV_CLOSED) { break; }
+    if (h2c_is_done(c)) { break; }
+  }
+  h2c_serve_cleanup(c);
+  h2c_flush(c, ns);
+  return result;
+}

@@ -7,8 +7,13 @@ extern fn term_w_set_mode(h: int64, mode: uint32) -> int32 = "SetConsoleMode";
 extern fn term_w_read(h: int64, buf: uint8*, n: uint32, got: uint32*, ov: uint8*) -> int32 = "ReadFile";
 extern fn term_w_write(h: int64, buf: uint8*, n: uint32, put: uint32*, ov: uint8*) -> int32 = "WriteFile";
 extern fn term_w_error() -> uint32 = "GetLastError";
+extern fn term_w_ctrl_event(event: uint32, group: uint32) -> int32 = "GenerateConsoleCtrlEvent";
+extern fn term_w_buffer_info(h: int64, info: uint8*) -> int32 = "GetConsoleScreenBufferInfo";
 
 const ENABLE_ECHO_INPUT = 4;
+const ENABLE_PROCESSED_INPUT = 1;
+const ENABLE_LINE_INPUT = 2;
+const ENABLE_VIRTUAL_TERMINAL_INPUT = 0x200;
 
 fn term_handle(fd: int64) -> int64 {
   // STD_INPUT_HANDLE is -10, STD_OUTPUT_HANDLE -11, STD_ERROR_HANDLE -12.
@@ -49,3 +54,63 @@ export fn term_os_write(fd: int64, buf: uint8*, n: int64) -> int64 {
   if (term_w_write(term_handle(fd), buf, (uint32)n, &put, (uint8*)0) == 0) { return -(int64)term_w_error(); }
   return (int64)put;
 }
+
+// Echo, line editing and signal keys off; returns 0 or a negative code.
+var g_term_saved: uint32 = 0;
+
+export fn term_os_secret_begin(fd: int64) -> int64 {
+  var h: int64 = term_handle(fd);
+  if (term_w_get_mode(h, &g_term_saved) == 0) { return -(int64)term_w_error(); }
+  var quiet: uint32 = g_term_saved & ~((uint32)ENABLE_ECHO_INPUT | (uint32)ENABLE_PROCESSED_INPUT | (uint32)ENABLE_LINE_INPUT);
+  if (term_w_set_mode(h, quiet) == 0) { return -(int64)term_w_error(); }
+  return 0;
+}
+
+export fn term_os_secret_end(fd: int64) {
+  term_w_set_mode(term_handle(fd), g_term_saved);
+}
+
+export fn term_os_raise(sig: int32) {
+  if (sig == TERM_SIGINT) {
+    term_w_ctrl_event((uint32)0, (uint32)0);   // CTRL_C_EVENT
+  } else {
+    term_w_ctrl_event((uint32)1, (uint32)0);   // CTRL_BREAK_EVENT
+  }
+}
+
+// Raw mode: no echo, line editing or Ctrl-C handling; keys come as VT bytes.
+var g_term_raw: uint32 = 0;
+var g_term_raw_on: bool = false;
+
+export fn term_raw_begin(fd: int64) -> int64 {
+  var h: int64 = term_handle(fd);
+  var mode: uint32 = 0;
+  if (term_w_get_mode(h, &mode) == 0) { return -(int64)term_w_error(); }
+  if (!g_term_raw_on) { g_term_raw = mode; }
+  mode = mode & ~((uint32)ENABLE_ECHO_INPUT | (uint32)ENABLE_PROCESSED_INPUT | (uint32)ENABLE_LINE_INPUT);
+  if (term_w_set_mode(h, mode | (uint32)ENABLE_VIRTUAL_TERMINAL_INPUT) == 0) { return -(int64)term_w_error(); }
+  g_term_raw_on = true;
+  return 0;
+}
+
+export fn term_raw_end(fd: int64) -> int64 {
+  if (!g_term_raw_on) { return 0; }
+  if (term_w_set_mode(term_handle(fd), g_term_raw) == 0) { return -(int64)term_w_error(); }
+  g_term_raw_on = false;
+  return 0;
+}
+
+// The size comes from an output handle, so fd 0 asks standard output.
+export fn term_size(fd: int64, cols: int32*, rows: int32*) -> int64 {
+  var out: int64 = fd;
+  if (out == 0) { out = 1; }
+  var info: uint8[24];
+  if (term_w_buffer_info(term_handle(out), &info[0]) == 0) { return -(int64)term_w_error(); }
+  var win: int16* = (int16*)&info[10];   // srWindow: left, top, right, bottom
+  *cols = (int32)win[2] - (int32)win[0] + 1;
+  *rows = (int32)win[3] - (int32)win[1] + 1;
+  return 0;
+}
+
+export const TERM_SIGINT = 2;
+export const TERM_SIGQUIT = 3;

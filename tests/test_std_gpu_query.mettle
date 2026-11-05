@@ -1,0 +1,35 @@
+// std/gpu links on Linux with no stub, and gpu_stream_done and
+// gpu_event_done answer without waiting. With no GPU or driver it only
+// checks the build.
+import "std/gpu";
+import "std/io";
+import "std/mem";
+
+fn main() -> int32 {
+  if (gpu_device_count() <= 0) { return 0; }
+  if (gpu_init() == 0) { return 0; }
+  var s: int64 = gpu_stream_create();
+  if (s == 0) { return 1; }
+  if (gpu_stream_done(s) != 1) { return 2; }   // an idle stream is done
+  var n: int64 = 64 * 1024 * 1024;
+  var host: uint8* = (uint8*)malloc(n);
+  var dev: int64 = gpu_malloc(n);
+  if (host == 0 || dev == 0) { return 3; }
+  var e: int64 = gpu_event_create();
+  // Queue a large copy, then ask straight away: the answer may be 0 or 1,
+  // but it must come back without an error.
+  gpu_to_device_async(dev, host, n, s);
+  gpu_event_record(e, s);
+  var early: int32 = gpu_stream_done(s);
+  if (early != 0 && early != 1) { return 4; }
+  var early_e: int32 = gpu_event_done(e);
+  if (early_e != 0 && early_e != 1) { return 5; }
+  if (gpu_stream_sync(s) != 0) { return 6; }
+  if (gpu_stream_done(s) != 1 || gpu_event_done(e) != 1) { return 7; }
+  println("gpu query: early stream={early} event={early_e}");
+  gpu_event_destroy(e);
+  gpu_free(dev);
+  free(host);
+  gpu_stream_destroy(s);
+  return 0;
+}

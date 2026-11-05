@@ -2,6 +2,7 @@ import "std/core";
 
 export extern fn atoi(s: cstring) -> int32 = "atoi";
 export extern fn atol(s: cstring) -> int64 = "atol";
+extern fn conv_c_malloc(n: uint64) -> uint8* = "malloc";
 
 export fn digit_to_char(d: int32) -> char {
   return (char)(d + 48);
@@ -46,6 +47,8 @@ export fn to_upper(c: char) -> char {
   return c;
 }
 
+// A view of n bytes at p, not a copy: it dangles once p is gone. Use
+// str_dup to keep the bytes.
 export fn str_from_bytes(p: cstring, n: int64) -> string {
   var out: string;
   out.chars = p;
@@ -53,6 +56,19 @@ export fn str_from_bytes(p: cstring, n: int64) -> string {
   if (p == 0 || n < 0) {
     out.length = (uint64)0;
   }
+  return out;
+}
+
+// A heap copy of s, with a NUL after it. Free it with free(copy.chars).
+// Returns an empty string if memory runs out.
+export fn str_dup(s: string) -> string {
+  var out: string;
+  var p: uint8* = conv_c_malloc(s.length + (uint64)1);
+  if (p == 0) { return out; }
+  for i in 0..s.length { p[i] = s.chars[i]; }
+  p[(int64)s.length] = (uint8)0;
+  out.chars = p;
+  out.length = s.length;
   return out;
 }
 

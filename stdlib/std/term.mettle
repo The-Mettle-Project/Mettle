@@ -1,7 +1,42 @@
-// Terminal basics: is a descriptor a terminal, and turning echo off for a
-// password prompt. fd 0 is standard input, 1 output, 2 error.
+// Terminals: is a descriptor a terminal, echo off for a password prompt, raw
+// mode, the window size, and terminal signals as a descriptor. fd 0 is
+// standard input, 1 output, 2 error.
+//
+// term_raw_begin(fd) saves the terminal's settings and turns on raw mode:
+// bytes arrive one at a time, with no echo, line editing, Ctrl-C signal or
+// output translation. term_raw_end(fd) puts the saved settings back. Both
+// return 0 or a negative error code. On Windows raw mode also turns on VT
+// input, so keys arrive as the same escape sequences as on a POSIX terminal.
+//
+// term_size(fd, &cols, &rows) reads the window size in character cells, and
+// returns 0 or a negative error code.
 
 import "std/term_os";
+import "std/process";
+
+export const TERM_SIGHUP = 1;
+export const TERM_SIGTERM = 15;
+export const TERM_SIGWINCH = 28;
+
+// Blocks the given signals (for example TERM_SIGWINCH, TERM_SIGINT and
+// TERM_SIGTERM) and returns a descriptor that becomes readable when one
+// arrives; poll it with the terminal input. Call it before starting threads.
+// Returns the descriptor or a negative error code; Windows has no signals
+// and returns -ENOSYS.
+export fn term_signal_fd(signals: int32[..]) -> int64 {
+  return proc_signal_fd(signals);
+}
+
+// Returns the next signal number from the descriptor, waiting for one, or a
+// negative error code.
+export fn term_signal_next(fd: int64) -> int32 {
+  return proc_signal_read(fd);
+}
+
+// Closes the descriptor and unblocks the same signals.
+export fn term_signal_end(fd: int64, signals: int32[..]) {
+  proc_signal_release(fd, signals);
+}
 
 // Writes prompt to standard error, reads one line from standard input with
 // echo off, and turns echo back on. The line goes into buf without its line
@@ -9,9 +44,11 @@ import "std/term_os";
 // is not a terminal (a pipe, a file), it reads the line as it is.
 export fn term_read_secret(prompt: string, buf: uint8*, cap: int64) -> int64 {
   if (prompt.length > (uint64)0) { term_os_write(2, prompt.chars, (int64)prompt.length); }
-  var was: int64 = term_set_echo(0, false);
+  // Ctrl-C arrives as a byte, so the terminal is restored before the signal.
+  var saved: int64 = term_os_secret_begin(0);
   var n: int64 = 0;
   var err: int64 = 0;
+  var sig: int32 = 0;
   var c: uint8[4];
   while (true) {
     var r: int64 = term_os_read(0, &c[0], 1);
@@ -21,17 +58,36 @@ export fn term_read_secret(prompt: string, buf: uint8*, cap: int64) -> int64 {
       break;
     }
     if (r == 0 || c[0] == (uint8)10) { break; }
-    if (c[0] == (uint8)13) { continue; }
+    if (c[0] == (uint8)13) {
+      if (saved >= 0) { break; }
+      continue;
+    }
+    if (saved >= 0 && c[0] == (uint8)3) {
+      sig = TERM_SIGINT;
+      break;
+    }
+    if (saved >= 0 && c[0] == (uint8)28) {
+      sig = TERM_SIGQUIT;
+      break;
+    }
+    if (saved >= 0 && (c[0] == (uint8)127 || c[0] == (uint8)8)) {
+      if (n > 0) { n = n - 1; }
+      continue;
+    }
     if (n < cap) {
       buf[n] = c[0];
       n = n + 1;
     }
   }
-  if (was == 1) {
-    term_set_echo(0, true);
+  if (saved >= 0) {
+    term_os_secret_end(0);
     // The Enter the user typed was not echoed either.
     var nl: string = "\n";
     term_os_write(2, nl.chars, 1);
+  }
+  if (sig != 0) {
+    term_os_raise(sig);
+    return -4;
   }
   if (err < 0) { return err; }
   return n;

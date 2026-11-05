@@ -1,0 +1,17 @@
+import "std/io";
+import "std/osmem";
+import "import_fixtures/safe_region_register";
+
+// A region registered in another module still covers the pointer here.
+fn main() -> int32 {
+  var raw: uint8* = (uint8*)os_mem_map(4096);
+  region_register(raw, 4096);
+  var mem: uint64* = (uint64*)raw;
+  mem[3] = 7;
+  mem[511] = 5;
+  var total: int32 = (int32)mem[3] + (int32)mem[511];
+  region_release(raw);
+  os_mem_unmap((cstring)raw, 4096);
+  println("region wrong={total - 12}");
+  return total - 12;
+}
