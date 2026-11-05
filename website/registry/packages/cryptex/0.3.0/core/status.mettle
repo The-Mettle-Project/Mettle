@@ -1,0 +1,88 @@
+// Status codes shared by every crypto module.
+
+/// CR_OK: the operation succeeded.
+/// in: -
+/// returns: 0
+/// owns: nothing
+/// thread: constant
+/// example: if (cr_sha256(&d, p, n) != CR_OK) { ... }
+export const CR_OK: int32 = 0;
+/// CR_E_INIT: never returned; kept so existing code that names it still compiles.
+/// in: -
+/// returns: -1
+/// owns: nothing
+/// thread: constant
+/// example: if (cr_init() == CR_E_INIT) { abort(); }  // never true
+export const CR_E_INIT: int32 = -1;
+/// CR_E_ARG: an argument is invalid (null pointer with a non-zero length,
+/// negative length, length outside the primitive's allowed range).
+/// in: -
+/// returns: -2
+/// owns: nothing
+/// thread: constant
+/// example: cr_random_bytes(0, 4) == CR_E_ARG
+export const CR_E_ARG: int32 = -2;
+/// CR_E_SPACE: the caller's output buffer is too small. Nothing is written.
+/// in: -
+/// returns: -3
+/// owns: nothing
+/// thread: constant
+/// example: cr_hex_encode(&buf[0], 2, &n, p, 8) == CR_E_SPACE
+export const CR_E_SPACE: int32 = -3;
+/// CR_E_VERIFY: authentication failed (AEAD tag mismatch). The output is wiped.
+/// in: -
+/// returns: -4
+/// owns: nothing
+/// thread: constant
+/// example: if (cr_aead_decrypt(...) == CR_E_VERIFY) { reject(); }
+export const CR_E_VERIFY: int32 = -4;
+/// CR_E_DECODE: hex or base64url input is malformed or non-canonical.
+/// in: -
+/// returns: -5
+/// owns: nothing
+/// thread: constant
+/// example: cr_hex_decode(&b[0], 4, &n, "zz", 2) == CR_E_DECODE
+export const CR_E_DECODE: int32 = -5;
+/// CR_E_INTERNAL: an internal failure that is not the caller's fault (the
+/// kernel random source failed, or memory for Argon2id could not be mapped).
+/// in: -
+/// returns: -6
+/// owns: nothing
+/// thread: constant
+/// example: if (rc == CR_E_INTERNAL) { retry_later(); }
+export const CR_E_INTERNAL: int32 = -6;
+/// CR_E_KEY: a public key is unusable (X25519 result is all zero, i.e. the
+/// peer sent a low-order point). Outputs are wiped.
+/// in: -
+/// returns: -7
+/// owns: nothing
+/// thread: constant
+/// example: if (cr_x25519_shared(&s, &sk, &peer) == CR_E_KEY) { reject(); }
+export const CR_E_KEY: int32 = -7;
+/// CR_E_EXPIRED: a signed value is authentic but its expiry time has passed
+/// (cr_signed_verify_until). The value is not released.
+/// in: -
+/// returns: -8
+/// owns: nothing
+/// thread: constant
+/// example: if (rc == CR_E_EXPIRED) { show("link expired"); }
+export const CR_E_EXPIRED: int32 = -8;
+
+/// Names a status code for logs.
+/// in: code, a CR_* status
+/// returns: a static string such as "CR_E_ARG" ("CR_E_UNKNOWN" otherwise)
+/// owns: nothing; the result points at a string literal, never free it
+/// thread: any thread (pure)
+/// example: println(cr_status_name(rc));
+export fn cr_status_name(code: int32) -> string {
+  if (code == CR_OK) { return "CR_OK"; }
+  if (code == CR_E_INIT) { return "CR_E_INIT"; }
+  if (code == CR_E_ARG) { return "CR_E_ARG"; }
+  if (code == CR_E_SPACE) { return "CR_E_SPACE"; }
+  if (code == CR_E_VERIFY) { return "CR_E_VERIFY"; }
+  if (code == CR_E_DECODE) { return "CR_E_DECODE"; }
+  if (code == CR_E_INTERNAL) { return "CR_E_INTERNAL"; }
+  if (code == CR_E_KEY) { return "CR_E_KEY"; }
+  if (code == CR_E_EXPIRED) { return "CR_E_EXPIRED"; }
+  return "CR_E_UNKNOWN";
+}

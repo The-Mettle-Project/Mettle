@@ -1,0 +1,266 @@
+// raize/context/request — the request value the parser fills and the router
+// reads.
+//
+// Ownership is the whole story here. Every string in RzRequest is a *borrowed
+// view*:
+//
+//   verb / target / header names and values / body   -> views into the
+//       connection receive buffer (body may also be a per-request malloc when
+//       Content-Length is larger than that buffer);
+//   path (decoded + normalized) and router params   -> views into the request
+//       arena, which is reset between requests.
+//
+// A view therefore dies when the request ends. Anything that must outlive the
+// request (a session, a log line) is copied with rz_str_dup or into the
+// arena. This is stated once, in the file header, and nowhere else pretends
+// otherwise.
+//
+// The header and parameter arrays are allocated from the request arena
+// (RzHeader* / RzParam* + count) rather than embedded: a Mettle struct field's
+// array extent must be a literal, and a pointer keeps RzRequest small enough
+// to live on one worker's stack.
+
+import "std/mem";
+import "../str/str";
+import "arena";
+import "header";
+// Imported for their *public names*, not for use in this file: Mettle imports
+// are transitive, so a consumer of framework/context/context gets the query
+// and JSON accessors without the aggregator having to list every module.
+import "query";
+import "json";
+
+// Path parameters (router) and the query string both use this shape. A
+// request can hold RZ_MAX_PARAMS path params and finds query fields on demand
+// from `query` (no second array, no per-request cost for apps that never read
+// the query string).
+export const RZ_MAX_PARAMS: int32 = 16;
+
+// Hard ceiling for a request body. The connection loop reads a body larger
+// than its receive buffer into one per-request allocation, and that
+// allocation cannot exceed this: 1 MiB. A bigger Content-Length is a 413
+// before any of it is read.
+export const RZ_MAX_BODY: int64 = 1048576;
+
+export struct RzParam {
+  name: string;
+  value: string;
+}
+
+export struct RzRequest {
+  verb: string;            // "GET", "POST", ... a view into the buffer
+  target: string;          // raw request-target, a view
+  path: string;            // decoded + normalized, arena-owned
+  query: string;           // raw query string (after '?'), a view
+  version_major: int32;    // always 1 in v1
+  version_minor: int32;    // 0 or 1
+  headers: RzHeader*;      // arena, RZ_MAX_HEADERS items
+  header_count: int32;
+  header_bytes: int64;     // bytes of field lines seen (bounded, see header.mettle)
+  body: string;            // view (buffer or per-request allocation)
+  body_len: int64;         // parsed Content-Length (0 when absent)
+  head_len: int64;         // bytes of request-line + headers + CRLFCRLF
+  params: RzParam*;        // arena, RZ_MAX_PARAMS items
+  param_count: int32;
+  keepalive: bool;         // final decision, after Connection processing
+}
+
+// Zeroes the request and carves its header/parameter arrays out of the arena.
+// The arena must have been reset for this request first. Returns false when
+// the arena is exhausted, which the connection loop reports as 431.
+export fn rz_request_init(req: RzRequest*, arena: RzArena*) -> bool {
+  if (req == 0 || arena == 0) { return false; }
+  memset((rawptr)req, 0, sizeof(RzRequest));
+  req->headers = (RzHeader*)rz_arena_alloc(arena, (int64)RZ_MAX_HEADERS * sizeof(RzHeader));
+  req->params = (RzParam*)rz_arena_alloc(arena, (int64)RZ_MAX_PARAMS * sizeof(RzParam));
+  if (req->headers == 0 || req->params == 0) { return false; }
+  req->version_major = 1;
+  req->version_minor = 1;
+  req->keepalive = true;
+  return true;
+}
+
+// Clears the parsed state but keeps the (arena-owned) arrays in place. Used
+// when a request has to be re-parsed after more bytes arrive.
+export fn rz_request_reset(req: RzRequest*) {
+  if (req == 0) { return; }
+  var headers: RzHeader* = req->headers;
+  var params: RzParam* = req->params;
+  memset((rawptr)req, 0, sizeof(RzRequest));
+  req->headers = headers;
+  req->params = params;
+  req->version_major = 1;
+  req->version_minor = 1;
+  req->keepalive = true;
+}
+
+// ---------------------------------------------------------------------------
+// Header accessors
+// ---------------------------------------------------------------------------
+
+export fn rz_req_header(req: RzRequest*, name: string) -> string {
+  if (req == 0) { return rz_str_empty(); }
+  return rz_header_get(req->headers, req->header_count, name);
+}
+
+export fn rz_req_has_header(req: RzRequest*, name: string) -> bool {
+  if (req == 0) { return false; }
+  return rz_header_has(req->headers, req->header_count, name);
+}
+
+export fn rz_req_header_count(req: RzRequest*, name: string) -> int32 {
+  if (req == 0) { return 0; }
+  return rz_header_count_named(req->headers, req->header_count, name);
+}
+
+export fn rz_req_header_at(req: RzRequest*, i: int32) -> RzHeader {
+  var empty: RzHeader;
+  empty.name = rz_str_empty();
+  empty.value = rz_str_empty();
+  if (req == 0) { return empty; }
+  if (i < 0) { return empty; }
+  if (i >= req->header_count) { return empty; }
+  return req->headers[i];
+}
+
+// ---------------------------------------------------------------------------
+// Verb / media type
+// ---------------------------------------------------------------------------
+
+export fn rz_req_verb_is(req: RzRequest*, verb: string) -> bool {
+  if (req == 0) { return false; }
+  return rz_str_eq(req->verb, verb);
+}
+
+export fn rz_req_is_get(req: RzRequest*) -> bool { return rz_req_verb_is(req, "GET"); }
+export fn rz_req_is_post(req: RzRequest*) -> bool { return rz_req_verb_is(req, "POST"); }
+export fn rz_req_is_head(req: RzRequest*) -> bool { return rz_req_verb_is(req, "HEAD"); }
+
+// The media type of the body, lowercased prefix before ';' with OWS trimmed
+// ("application/json; charset=utf-8" -> "application/json"). View, not owned.
+export fn rz_req_media_type(req: RzRequest*) -> string {
+  var ct: string = rz_req_header(req, "content-type");
+  var semi: int64 = rz_str_find_byte(ct, 59);
+  if (semi >= 0) {
+    ct = rz_str_sub(ct, 0, semi);
+  }
+  return rz_header_trim(ct);
+}
+
+export fn rz_req_is_json(req: RzRequest*) -> bool {
+  var mt: string = rz_req_media_type(req);
+  if (rz_str_eq_ci(mt, "application/json")) { return true; }
+  var n: int64 = (int64)mt.length;
+  if (n < 5) { return false; }
+  // "+json" structured suffix (application/geo+json and friends)
+  return rz_str_eq_ci(rz_str_sub(mt, n - 5, n), "+json");
+}
+
+// ---------------------------------------------------------------------------
+// Path params (the router writes these)
+// ---------------------------------------------------------------------------
+
+export fn rz_req_param_set(req: RzRequest*, name: string, value: string) -> bool {
+  if (req == 0) { return false; }
+  if (req->param_count >= RZ_MAX_PARAMS) { return false; }
+  var i: int32 = req->param_count;
+  req->params[i].name = name;
+  req->params[i].value = value;
+  req->param_count = i + 1;
+  return true;
+}
+
+export fn rz_req_param(req: RzRequest*, name: string) -> string {
+  if (req == 0) { return rz_str_empty(); }
+  var i: int32 = 0;
+  while (i < req->param_count) {
+    if (rz_str_eq(req->params[i].name, name)) {
+      return req->params[i].value;
+    }
+    i = i + 1;
+  }
+  return rz_str_empty();
+}
+
+export fn rz_req_param_at(req: RzRequest*, i: int32) -> RzParam {
+  var empty: RzParam;
+  empty.name = rz_str_empty();
+  empty.value = rz_str_empty();
+  if (req == 0) { return empty; }
+  if (i < 0) { return empty; }
+  if (i >= req->param_count) { return empty; }
+  return req->params[i];
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+@test fn t_rz_request_init_and_headers() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { rz_arena_free(arena); return 2; }
+  if (req.headers == 0) { rz_arena_free(arena); return 3; }
+  if (req.params == 0) { rz_arena_free(arena); return 4; }
+  if (!req.keepalive) { rz_arena_free(arena); return 5; }
+  if (req.version_minor != 1) { rz_arena_free(arena); return 6; }
+
+  var items: RzHeader* = req.headers;
+  items[0].name = "Host";
+  items[0].value = "example";
+  items[1].name = "Content-Type";
+  items[1].value = "application/json; charset=utf-8";
+  items[2].name = "Content-Length";
+  items[2].value = "12";
+  req.header_count = 3;
+
+  if (!rz_str_eq(rz_req_header(&req, "host"), "example")) { rz_arena_free(arena); return 7; }
+  if (!rz_req_has_header(&req, "HOST")) { rz_arena_free(arena); return 8; }
+  if (rz_req_header_count(&req, "content-length") != 1) { rz_arena_free(arena); return 9; }
+  if (!rz_str_eq(rz_req_header_at(&req, 1).name, "Content-Type")) { rz_arena_free(arena); return 10; }
+  if (rz_req_header_at(&req, 99).name.length != 0) { rz_arena_free(arena); return 11; }
+  if (!rz_req_is_json(&req)) { rz_arena_free(arena); return 12; }
+  if (!rz_str_eq(rz_req_media_type(&req), "application/json")) { rz_arena_free(arena); return 13; }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_request_params() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { rz_arena_free(arena); return 2; }
+  if (!rz_req_param_set(&req, "id", "42")) { rz_arena_free(arena); return 3; }
+  if (!rz_req_param_set(&req, "slug", "hello-world")) { rz_arena_free(arena); return 4; }
+  if (!rz_str_eq(rz_req_param(&req, "id"), "42")) { rz_arena_free(arena); return 5; }
+  if (!rz_str_eq(rz_req_param_at(&req, 1).value, "hello-world")) { rz_arena_free(arena); return 6; }
+  if (rz_req_param(&req, "nope").length != 0) { rz_arena_free(arena); return 7; }
+  // The array is bounded: the 17th param is refused, not grown.
+  var i: int32 = 2;
+  while (i < RZ_MAX_PARAMS) {
+    if (!rz_req_param_set(&req, "p", "v")) { rz_arena_free(arena); return 8; }
+    i = i + 1;
+  }
+  if (rz_req_param_set(&req, "overflow", "v")) { rz_arena_free(arena); return 9; }
+  if (req.param_count != RZ_MAX_PARAMS) { rz_arena_free(arena); return 10; }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_request_verb() -> int32 {
+  var req: RzRequest;
+  if (!rz_request_reset_sanity(&req)) { return 1; }
+  req.verb = "GET";
+  if (!rz_req_is_get(&req)) { return 2; }
+  if (rz_req_is_post(&req)) { return 3; }
+  req.verb = "HEAD";
+  if (!rz_req_is_head(&req)) { return 4; }
+  return 0;
+}
+
+// Small helper so the verb test needs no arena.
+fn rz_request_reset_sanity(req: RzRequest*) -> bool {
+  memset((rawptr)req, 0, sizeof(RzRequest));
+  return true;
+}

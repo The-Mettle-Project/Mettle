@@ -1,0 +1,39 @@
+// font: fonts and text for Mettle, in pure Mettle.
+//
+//   import "font/font";
+//
+// This file re-exports every module. Exported names start with font_,
+// Font or FONT_.
+//
+//   core/     UTF-8 and small helpers
+//   sfnt/     opening fonts, tables, cmap, metrics, names
+//   outline/  glyph outlines (TrueType glyf, CFF)
+//   raster/   anti-aliased bitmaps, SDF and MSDF
+//   atlas/    glyph atlas for GPU text
+//   layout/   OpenType layout: GSUB, GPOS, kern
+//   text/     Unicode data, normalisation, line breaking, shaping, layout
+
+import "font/core/vec";
+import "font/core/utf8";
+import "font/sfnt/face";
+import "font/sfnt/init";
+import "font/sfnt/cmap";
+import "font/sfnt/metrics";
+import "font/outline/path";
+import "font/outline/glyf";
+import "font/outline/cff";
+import "font/outline/outline";
+import "font/raster/raster";
+import "font/layout/buffer";
+import "font/layout/otl";
+import "font/layout/gsub";
+import "font/layout/gpos";
+import "font/layout/kern";
+import "font/text/shape";
+import "font/raster/sdf";
+import "font/atlas/atlas";
+import "font/text/unicode_data";
+import "font/text/normalize";
+import "font/text/linebreak_data";
+import "font/text/breaks";
+import "font/text/layout";

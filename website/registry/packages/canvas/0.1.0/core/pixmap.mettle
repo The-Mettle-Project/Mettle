@@ -1,0 +1,119 @@
+// CanvasPixmap: a buffer of premultiplied 8-bit RGBA (or BGRA) pixels.
+// Rows run top to bottom; pixel (x, y) is at data + y * stride + x * 4.
+//
+//   var pm: CanvasPixmap;
+//   canvas_pixmap_new(&pm, 640, 480);     // transparent black
+//   ...
+//   canvas_pixmap_free(&pm);
+
+import "std/mem";
+import "base";
+import "color";
+
+export const CANVAS_RGBA: int32 = 0;   // bytes R, G, B, A
+export const CANVAS_BGRA: int32 = 1;   // bytes B, G, R, A (X11, Win32)
+
+export struct CanvasPixmap {
+  width: int32;
+  height: int32;
+  stride: int64;     // bytes from one row to the next
+  data: uint8*;
+  order: int32;      // CANVAS_RGBA or CANVAS_BGRA
+  owned: bool;       // true when canvas_pixmap_free frees data
+}
+
+/// A new pixmap of transparent pixels.
+export fn canvas_pixmap_new(pm: CanvasPixmap*, w: int32, h: int32) -> int32 {
+  if (pm == 0) { return CANVAS_E_ARG; }
+  memset(pm, 0, sizeof(CanvasPixmap));
+  if (w <= 0 || h <= 0) { return CANVAS_E_ARG; }
+  if (w > CANVAS_MAX_SIZE || h > CANVAS_MAX_SIZE) { return CANVAS_E_LIMIT; }
+  var n: int64 = (int64)w * (int64)h * 4;
+  var p: uint8* = (uint8*)calloc(n, 1);
+  if (p == 0) { return CANVAS_E_MEM; }
+  pm->width = w;
+  pm->height = h;
+  pm->stride = (int64)w * 4;
+  pm->data = p;
+  pm->order = CANVAS_RGBA;
+  pm->owned = true;
+  return CANVAS_OK;
+}
+
+/// Wraps memory you own (premultiplied pixels). stride 0 means w * 4.
+export fn canvas_pixmap_wrap(pm: CanvasPixmap*, data: uint8*, w: int32, h: int32, stride: int64, order: int32) -> int32 {
+  if (pm == 0) { return CANVAS_E_ARG; }
+  memset(pm, 0, sizeof(CanvasPixmap));
+  if (data == 0 || w <= 0 || h <= 0) { return CANVAS_E_ARG; }
+  if (w > CANVAS_MAX_SIZE || h > CANVAS_MAX_SIZE) { return CANVAS_E_LIMIT; }
+  var st: int64 = stride;
+  if (st == 0) { st = (int64)w * 4; }
+  if (st < (int64)w * 4) { return CANVAS_E_ARG; }
+  if (order != CANVAS_RGBA && order != CANVAS_BGRA) { return CANVAS_E_ARG; }
+  pm->width = w;
+  pm->height = h;
+  pm->stride = st;
+  pm->data = data;
+  pm->order = order;
+  pm->owned = false;
+  return CANVAS_OK;
+}
+
+/// Frees the pixels if owned and empties the pixmap.
+export fn canvas_pixmap_free(pm: CanvasPixmap*) {
+  if (pm == 0) { return; }
+  if (pm->owned && pm->data != 0) { free(pm->data); }
+  memset(pm, 0, sizeof(CanvasPixmap));
+}
+
+/// The address of row y.
+@inline export fn canvas_pixmap_row(pm: CanvasPixmap*, y: int32) -> uint32* {
+  return (uint32*)(pm->data + (int64)y * pm->stride);
+}
+
+/// The premultiplied pixel at (x, y) with red in the low byte, whatever
+/// the storage order. 0 outside the pixmap.
+export fn canvas_pixmap_get(pm: CanvasPixmap*, x: int32, y: int32) -> uint32 {
+  if (pm == 0 || pm->data == 0) { return 0; }
+  if (x < 0 || y < 0 || x >= pm->width || y >= pm->height) { return 0; }
+  var p: uint32 = canvas_pixmap_row(pm, y)[x];
+  if (pm->order == CANVAS_BGRA) { p = canvas_swap_rb(p); }
+  return p;
+}
+
+/// Sets a premultiplied pixel (red in the low byte).
+export fn canvas_pixmap_set(pm: CanvasPixmap*, x: int32, y: int32, p: uint32) {
+  if (pm == 0 || pm->data == 0) { return; }
+  if (x < 0 || y < 0 || x >= pm->width || y >= pm->height) { return; }
+  var v: uint32 = p;
+  if (pm->order == CANVAS_BGRA) { v = canvas_swap_rb(v); }
+  canvas_pixmap_row(pm, y)[x] = v;
+}
+
+/// The straight color of the pixel at (x, y).
+export fn canvas_pixmap_color(pm: CanvasPixmap*, x: int32, y: int32) -> CanvasColor {
+  return canvas_color_unpack(canvas_pixmap_get(pm, x, y));
+}
+
+/// Fills every pixel with one color.
+export fn canvas_pixmap_fill(pm: CanvasPixmap*, c: CanvasColor) {
+  if (pm == 0 || pm->data == 0) { return; }
+  var p: uint32 = canvas_color_pack(c, 1.0);
+  if (pm->order == CANVAS_BGRA) { p = canvas_swap_rb(p); }
+  for y in 0..pm->height {
+    var row: uint32* = canvas_pixmap_row(pm, y);
+    for x in 0..pm->width { row[x] = p; }
+  }
+}
+
+/// An owned, packed copy of src.
+export fn canvas_pixmap_copy(src: CanvasPixmap*, dst: CanvasPixmap*) -> int32 {
+  if (src == 0 || dst == 0 || src->data == 0) { return CANVAS_E_ARG; }
+  var rc: int32 = canvas_pixmap_new(dst, src->width, src->height);
+  if (rc != CANVAS_OK) { return rc; }
+  dst->order = src->order;
+  for y in 0..src->height {
+    memcpy(dst->data + (int64)y * dst->stride, src->data + (int64)y * src->stride, (int64)src->width * 4);
+  }
+  return CANVAS_OK;
+}

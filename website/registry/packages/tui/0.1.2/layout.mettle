@@ -1,0 +1,109 @@
+// Layout: splitting a rectangle into rows or columns by fixed sizes,
+// percentages and weighted fills (a small version of ratatui's Layout).
+
+import "types";
+
+export const TUI_LEN_FIXED = 1;
+export const TUI_LEN_PERCENT = 2;
+export const TUI_LEN_FILL = 3;
+
+export const TUI_ROWS = 0;   // split top to bottom
+export const TUI_COLS = 1;   // split left to right
+
+export struct TuiLen {
+  kind: int32;
+  v: int32;
+}
+
+export fn tui_fixed(n: int32) -> TuiLen {
+  var l: TuiLen = { kind: TUI_LEN_FIXED, v: n };
+  return l;
+}
+
+export fn tui_percent(p: int32) -> TuiLen {
+  var l: TuiLen = { kind: TUI_LEN_PERCENT, v: p };
+  return l;
+}
+
+// Takes what is left, shared with other fills by weight.
+export fn tui_fill_len(weight: int32) -> TuiLen {
+  var l: TuiLen = { kind: TUI_LEN_FILL, v: weight };
+  return l;
+}
+
+// Splits r into lens.length parts written to out, with gap cells between
+// them. Fixed and percent parts are given first, in order, as long as room
+// lasts; fills share the rest. Returns the number of parts.
+export fn tui_split(r: TuiRect, dir: int32, lens: TuiLen[], gap: int32, out: TuiRect*) -> int32 {
+  var n: int32 = (int32)lens.length;
+  if (n == 0) { return 0; }
+  var total: int32 = r.h;
+  if (dir == TUI_COLS) { total = r.w; }
+  if (gap < 0) { gap = 0; }
+  var avail: int32 = total - gap * (n - 1);
+  if (avail < 0) { avail = 0; }
+  var sizes: int32[64];
+  if (n > 64) { n = 64; }
+  var left: int32 = avail;
+  var weights: int32 = 0;
+  for i in 0..n {
+    var want: int32 = 0;
+    var l: TuiLen = lens[i];
+    if (l.kind == TUI_LEN_FIXED) { want = l.v; }
+    if (l.kind == TUI_LEN_PERCENT) { want = (int32)((int64)avail * (int64)l.v / 100); }
+    if (l.kind == TUI_LEN_FILL) {
+      var wt: int32 = l.v;
+      if (wt < 1) { wt = 1; }
+      weights = weights + wt;
+    }
+    if (want < 0) { want = 0; }
+    if (want > left) { want = left; }
+    sizes[i] = want;
+    left = left - want;
+  }
+  if (weights > 0) {
+    var share: int32 = left;
+    var last_fill: int32 = -1;
+    for i in 0..n {
+      if (lens[i].kind == TUI_LEN_FILL) {
+        var wt: int32 = lens[i].v;
+        if (wt < 1) { wt = 1; }
+        sizes[i] = (int32)((int64)share * (int64)wt / (int64)weights);
+        left = left - sizes[i];
+        last_fill = i;
+      }
+    }
+    if (last_fill >= 0) { sizes[last_fill] = sizes[last_fill] + left; }
+  }
+  var pos: int32 = r.y;
+  if (dir == TUI_COLS) { pos = r.x; }
+  for i in 0..n {
+    if (dir == TUI_COLS) {
+      out[i] = tui_rect(pos, r.y, sizes[i], r.h);
+    } else {
+      out[i] = tui_rect(r.x, pos, r.w, sizes[i]);
+    }
+    pos = pos + sizes[i] + gap;
+  }
+  return n;
+}
+
+// r shrunk by n cells on every side.
+export fn tui_inset(r: TuiRect, n: int32) -> TuiRect {
+  return tui_rect(r.x + n, r.y + n, r.w - 2 * n, r.h - 2 * n);
+}
+
+export fn tui_inset_xy(r: TuiRect, dx: int32, dy: int32) -> TuiRect {
+  return tui_rect(r.x + dx, r.y + dy, r.w - 2 * dx, r.h - 2 * dy);
+}
+
+// A w by h rectangle centred in r (clipped to r).
+export fn tui_center(r: TuiRect, w: int32, h: int32) -> TuiRect {
+  if (w > r.w) { w = r.w; }
+  if (h > r.h) { h = r.h; }
+  return tui_rect(r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h);
+}
+
+export fn tui_contains_point(r: TuiRect, x: int32, y: int32) -> bool {
+  return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h;
+}

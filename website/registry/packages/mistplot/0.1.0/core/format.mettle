@@ -1,0 +1,511 @@
+//! The only module that turns numbers into text. Every function writes into a caller
+//! buffer of at least 32 bytes and returns a view of those bytes; a shorter or null buffer
+//! gives "" and nothing is written. Nothing allocates. Uses std/conv and std/math only, so
+//! it sits at the bottom of the graph next to color and geom. Interpolation (`%g`) is never
+//! used for emitted numbers; these functions are.
+
+import "std/conv";
+import "std/math";
+
+const MP_FMT_MINCAP: int64 = 32;
+
+// 10^e for positive and negative e. Exact for |e| <= 22, good enough beyond.
+fn fmt_p10(e: int32) -> float64 {
+  var r: float64 = 1.0;
+  var i: int32 = 0;
+  if (e >= 0) {
+    while (i < e) {
+      r = r * 10.0;
+      i = i + 1;
+    }
+    return r;
+  }
+  while (i > e) {
+    r = r / 10.0;
+    i = i - 1;
+  }
+  return r;
+}
+
+fn fmt_copy(out: uint8*, cap: int64, lit: string) -> string {
+  var n: int64 = (int64)lit.length;
+  if (n >= cap) { return ""; }
+  var i: int64 = 0;
+  while (i < n) {
+    out[i] = lit.chars[i];
+    i = i + 1;
+  }
+  return str_from_bytes((cstring)out, n);
+}
+
+// Writes a decimal int64 (with its sign) at `off`; returns the new offset.
+// Digits are peeled with truncating division and a negated remainder, so
+// INT64_MIN does not have to be negated (which would overflow). Callers
+// guarantee room (<= 24 bytes).
+fn fmt_i64_at(out: uint8*, off: int64, v: int64) -> int64 {
+  var tmp: uint8[24];
+  var i: int64 = 0;
+  var pos: int64 = off;
+  var u: int64 = v;
+  if (u < 0) {
+    out[pos] = 45;
+    pos = pos + 1;
+  }
+  if (u == 0) {
+    tmp[0] = 48;
+    i = 1;
+  }
+  while (u != 0) {
+    var d: int64 = u % 10;
+    if (d < 0) { d = 0 - d; }
+    tmp[i] = (uint8)(48 + d);
+    i = i + 1;
+    u = u / 10;
+  }
+  var k: int64 = 0;
+  while (k < i) {
+    out[pos + k] = tmp[i - 1 - k];
+    k = k + 1;
+  }
+  return pos + i;
+}
+
+// Drops a trailing fraction's zeros, then a trailing dot. `n` is a length that
+// may sit on a NUL byte, so this only ever shrinks.
+fn fmt_trim(out: uint8*, n: int64) -> int64 {
+  if (n <= 0) { return 0; }
+  var dot: int64 = -1;
+  var i: int64 = 0;
+  while (i < n) {
+    if (out[i] == 46) { dot = i; }
+    i = i + 1;
+  }
+  if (dot < 0) { return n; }
+  var m: int64 = n;
+  while (m > dot + 1 && out[m - 1] == 48) { m = m - 1; }
+  if (m == dot + 1) { m = dot; }
+  return m;
+}
+
+// Splits a positive finite value into a mantissa in [1,10) and a base-10
+// exponent, scaling in 1e100 chunks and then by single decades. Doing it from
+// the value (instead of dividing by `fmt_p10(e)`, which is a repeated multiply
+// that underflows to 0 for the smallest denormals and drifts a few ulps near
+// the top) keeps the mantissa well formed for every finite input; the divide
+// printed 1e-323 as "infe-324" and 1e-320 as "10.0198e-321". Neither the
+// mantissa nor a chunk factor can overflow on the way. Not called for 0
+// (mp_fmt_auto returns early).
+fn fmt_sci_split(a: float64, mp: float64*, ep: int32*) {
+  var m: float64 = a;
+  var e: int32 = 0;
+  while (m >= 1e100) {
+    m = m / 1e100;
+    e = e + 100;
+  }
+  while (m < 1e-100) {
+    m = m * 1e100;
+    e = e - 100;
+  }
+  while (m >= 10.0) {
+    m = m / 10.0;
+    e = e + 1;
+  }
+  while (m < 1.0) {
+    m = m * 10.0;
+    e = e - 1;
+  }
+  *mp = m;
+  *ep = e;
+}
+
+fn fmt_sci(v: float64, out: uint8*, cap: int64) -> string {
+  var a: float64 = fabs(v);
+  var e: int32 = 0;
+  var m: float64 = 0.0;
+  fmt_sci_split(a, &m, &e);
+  var tmp: uint8[40];
+  var ms: string = mp_fmt_fixed(m, 5, &tmp[0], 40);
+  var mn: int64 = fmt_trim(&tmp[0], (int64)ms.length);
+  // 9.999999 rounds to "10"; carry it back into one significant digit.
+  if (mn == 2 && tmp[0] == 49 && tmp[1] == 48) {
+    mn = 1;
+    e = e + 1;
+  }
+  var pos: int64 = 0;
+  if (v < 0.0) {
+    out[pos] = 45;
+    pos = pos + 1;
+  }
+  var i: int64 = 0;
+  while (i < mn) {
+    out[pos] = tmp[i];
+    pos = pos + 1;
+    i = i + 1;
+  }
+  out[pos] = 101;
+  pos = pos + 1;
+  var ae: int32 = e;
+  if (ae < 0) {
+    out[pos] = 45;
+    pos = pos + 1;
+    ae = 0 - ae;
+  } else {
+    out[pos] = 43;
+    pos = pos + 1;
+  }
+  if (ae < 10) {
+    out[pos] = 48;
+    pos = pos + 1;
+  }
+  pos = fmt_i64_at(out, pos, (int64)ae);
+  if (pos >= cap) { return ""; }
+  return str_from_bytes((cstring)out, pos);
+}
+
+fn fmt_unit(e: int32) -> string {
+  switch (e) {
+    case 3: { return "k"; }
+    case 6: { return "M"; }
+    case 9: { return "G"; }
+    case 12: { return "T"; }
+    case -3: { return "m"; }
+    case -6: { return "µ"; }
+    case -9: { return "n"; }
+    default: { return ""; }
+  }
+}
+
+/// Decimal text of an integer, with a leading '-' when negative.
+///
+/// @param v The value. Valid: any int64 (INT64_MIN included).
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The digits, or "" when out is 0 or cap < 32.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+///   Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_fmt_int(v: int64, out: uint8*, cap: int64) -> string {
+  if (out == 0 || cap < MP_FMT_MINCAP) { return ""; }
+  var pos: int64 = fmt_i64_at(out, 0, v);
+  return str_from_bytes((cstring)out, pos);
+}
+
+/// A number with exactly `decimals` digits after the point, rounded half away from zero.
+/// Never prints "-0"; NaN and infinities print "NaN", "inf" and "-inf". |v| >= 1e15, and
+/// 0 < |v| < 1e-4 with no decimals, fall back to mp_fmt_auto.
+///
+/// @param v The value. Valid: any.
+/// @param decimals Digits after the point. Valid: 0 .. 9; values outside are clamped.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The text, or "" when out is 0 or cap is too small.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+///   Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_fmt_fixed(v: float64, decimals: int32,
+                       out: uint8*, cap: int64) -> string {
+  if (out == 0 || cap < MP_FMT_MINCAP) { return ""; }
+  var d: int32 = decimals;
+  if (d < 0) { d = 0; }
+  if (d > 9) { d = 9; }
+  if (is_nan(v) != 0) { return fmt_copy(out, cap, "NaN"); }
+  if (is_inf(v) != 0) {
+    if (v < 0.0) { return fmt_copy(out, cap, "-inf"); }
+    return fmt_copy(out, cap, "inf");
+  }
+  var a: float64 = fabs(v);
+  if (a >= 1e15) { return mp_fmt_auto(v, out, cap); }
+  if (d == 0 && a > 0.0 && a < 1e-4) { return mp_fmt_auto(v, out, cap); }
+  var ip: int64 = (int64)a;
+  var scale: int64 = (int64)fmt_p10(d);
+  var scaled: int64 = (int64)((a - (float64)ip) * (float64)scale + 0.5);
+  if (scaled >= scale) {
+    ip = ip + 1;
+    scaled = 0;
+  }
+  var pos: int64 = 0;
+  if (v < 0.0 && (ip != 0 || scaled != 0)) {
+    out[0] = 45;
+    pos = 1;
+  }
+  pos = fmt_i64_at(out, pos, ip);
+  if (d > 0) {
+    out[pos] = 46;
+    pos = pos + 1;
+    var tmp: uint8[12];
+    var i: int64 = 0;
+    var val: int64 = scaled;
+    while (i < (int64)d) {
+      tmp[i] = (uint8)(48 + (val % 10));
+      val = val / 10;
+      i = i + 1;
+    }
+    var k: int32 = d;
+    while (k > 0) {
+      out[pos] = tmp[(int64)k - 1];
+      pos = pos + 1;
+      k = k - 1;
+    }
+  }
+  if (pos >= cap) { return ""; }
+  return str_from_bytes((cstring)out, pos);
+}
+
+/// A number with up to six significant digits and trailing zeros trimmed (like %g).
+/// Scientific notation ("1e+07", "1.5e-05") below 1e-4 and from 1e7; "0" for zero.
+///
+/// @param v The value. Valid: any; NaN and infinities print "NaN", "inf", "-inf".
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The text, or "" when out is 0 or cap is too small.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+///   Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_fmt_auto(v: float64, out: uint8*, cap: int64) -> string {
+  if (out == 0 || cap < MP_FMT_MINCAP) { return ""; }
+  if (is_nan(v) != 0) { return fmt_copy(out, cap, "NaN"); }
+  if (is_inf(v) != 0) {
+    if (v < 0.0) { return fmt_copy(out, cap, "-inf"); }
+    return fmt_copy(out, cap, "inf");
+  }
+  if (v == 0.0) { return fmt_copy(out, cap, "0"); }
+  var a: float64 = fabs(v);
+  var e: int32 = (int32)floor(log10(a));
+  if (e < -4 || e >= 7) { return fmt_sci(v, out, cap); }
+  var d: int32 = 5 - e;
+  if (d < 0) { d = 0; }
+  if (d > 6) { d = 6; }
+  // d is never 0 together with a < 1e-4 here (that case is scientific), so the
+  // fixed call cannot recurse back into auto.
+  var tmp: uint8[40];
+  var s: string = mp_fmt_fixed(v, d, &tmp[0], 40);
+  var n: int64 = fmt_trim(&tmp[0], (int64)s.length);
+  var i: int64 = 0;
+  while (i < n) {
+    out[i] = tmp[i];
+    i = i + 1;
+  }
+  return str_from_bytes((cstring)out, n);
+}
+
+/// A number with three significant digits and an SI suffix (n, µ, m, k, M, G, T).
+/// "1.23k", "-45M", "0"; magnitudes beyond the suffixes keep the outermost one.
+///
+/// @param v The value. Valid: any; NaN and infinities print "NaN", "inf", "-inf".
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The text, or "" when out is 0 or cap is too small.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+///   Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_fmt_si(v: float64, out: uint8*, cap: int64) -> string {
+  if (out == 0 || cap < MP_FMT_MINCAP) { return ""; }
+  if (is_nan(v) != 0) { return fmt_copy(out, cap, "NaN"); }
+  if (is_inf(v) != 0) {
+    if (v < 0.0) { return fmt_copy(out, cap, "-inf"); }
+    return fmt_copy(out, cap, "inf");
+  }
+  if (v == 0.0) { return fmt_copy(out, cap, "0"); }
+  var a: float64 = fabs(v);
+  var e: int32 = 0;
+  var sc: float64 = a;
+  while (sc >= 1000.0 && e < 12) {
+    sc = sc / 1000.0;
+    e = e + 3;
+  }
+  while (sc < 1.0 && e > -9) {
+    sc = sc * 1000.0;
+    e = e - 3;
+  }
+  // 3 significant digits: 999.7 must not print "1000" next to a small unit.
+  if (sc >= 999.5 && e < 12) {
+    sc = sc / 1000.0;
+    e = e + 3;
+  }
+  var d: int32 = 2 - (int32)floor(log10(sc));
+  if (d < 0) { d = 0; }
+  if (d > 9) { d = 9; }
+  var tmp: uint8[40];
+  var s: string = mp_fmt_fixed(sc, d, &tmp[0], 40);
+  var n: int64 = fmt_trim(&tmp[0], (int64)s.length);
+  var pos: int64 = 0;
+  if (v < 0.0) {
+    out[0] = 45;
+    pos = 1;
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    out[pos] = tmp[i];
+    pos = pos + 1;
+    i = i + 1;
+  }
+  var unit: string = fmt_unit(e);
+  var j: int64 = 0;
+  while (j < (int64)unit.length) {
+    out[pos] = unit.chars[j];
+    pos = pos + 1;
+    j = j + 1;
+  }
+  if (pos >= cap) { return ""; }
+  return str_from_bytes((cstring)out, pos);
+}
+
+// Writes `v` (0..99) as exactly two digits at `off`; returns the new offset.
+fn fmt_two_at(out: uint8*, off: int64, v: int64) -> int64 {
+  out[off] = (uint8)(48 + v / 10);
+  out[off + 1] = (uint8)(48 + v % 10);
+  return off + 2;
+}
+
+/// Seconds as a clock label: "mm:ss" below one hour, "h:mm:ss" from one hour.
+/// Fractions are truncated toward zero and the sign is written only when the truncated
+/// value is non-zero (-0.5 prints "00:00"). Hours are unpadded and unbounded.
+///
+/// @param seconds The value. Units: seconds. Valid: any; non-finite values and
+///   |v| >= 1e15 fall back to mp_fmt_auto.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The text, or "" when out is 0 or cap < 32.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+///   Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_fmt_clock(seconds: float64, out: uint8*, cap: int64) -> string {
+  if (out == 0 || cap < MP_FMT_MINCAP) { return ""; }
+  if (is_finite(seconds) == 0 || fabs(seconds) >= 1e15) {
+    return mp_fmt_auto(seconds, out, cap);
+  }
+  var t: int64 = (int64)seconds;
+  var pos: int64 = 0;
+  if (t < 0) {
+    out[0] = 45;
+    pos = 1;
+    t = 0 - t;
+  }
+  var h: int64 = t / 3600;
+  var m: int64 = (t % 3600) / 60;
+  var s: int64 = t % 60;
+  if (h > 0) {
+    pos = fmt_i64_at(out, pos, h);
+    out[pos] = 58;
+    pos = pos + 1;
+  }
+  pos = fmt_two_at(out, pos, m);
+  out[pos] = 58;
+  pos = pos + 1;
+  pos = fmt_two_at(out, pos, s);
+  return str_from_bytes((cstring)out, pos);
+}
+
+/// Seconds as a clock label with tenths: "mm:ss.t" below one hour, "h:mm:ss.t" from one.
+/// The value is rounded to the nearest tenth (half away from zero), so ticks that are
+/// multiples of 0.1 s print as themselves; the sign is written only when the rounded value
+/// is non-zero.
+///
+/// @param seconds The value. Units: seconds. Valid: any; non-finite values and
+///   |v| >= 1e14 fall back to mp_fmt_auto.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The text, or "" when out is 0 or cap < 32.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+///   Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_fmt_clock_tenths(seconds: float64, out: uint8*,
+                              cap: int64) -> string {
+  if (out == 0 || cap < MP_FMT_MINCAP) { return ""; }
+  if (is_finite(seconds) == 0 || fabs(seconds) >= 1e14) {
+    return mp_fmt_auto(seconds, out, cap);
+  }
+  var d: int64 = (int64)round(seconds * 10.0);
+  var pos: int64 = 0;
+  if (d < 0) {
+    out[0] = 45;
+    pos = 1;
+    d = 0 - d;
+  }
+  var t: int64 = d / 10;
+  var h: int64 = t / 3600;
+  var m: int64 = (t % 3600) / 60;
+  var s: int64 = t % 60;
+  if (h > 0) {
+    pos = fmt_i64_at(out, pos, h);
+    out[pos] = 58;
+    pos = pos + 1;
+  }
+  pos = fmt_two_at(out, pos, m);
+  out[pos] = 58;
+  pos = pos + 1;
+  pos = fmt_two_at(out, pos, s);
+  out[pos] = 46;
+  pos = pos + 1;
+  out[pos] = (uint8)(48 + d % 10);
+  pos = pos + 1;
+  return str_from_bytes((cstring)out, pos);
+}
+
+/// Decimal text of an unsigned 64-bit integer.
+///
+/// @param v The value. Valid: any uint64, up to 18446744073709551615.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The digits, or "" when out is 0 or cap < 32.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+///   Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_fmt_u64(v: uint64, out: uint8*, cap: int64) -> string {
+  if (out == 0 || cap < MP_FMT_MINCAP) { return ""; }
+  var tmp: uint8[24];
+  var n: int64 = 0;
+  var u: uint64 = v;
+  if (u == (uint64)0) {
+    tmp[0] = 48;
+    n = 1;
+  }
+  while (u != (uint64)0) {
+    tmp[n] = (uint8)((uint64)48 + u % (uint64)10);
+    n = n + 1;
+    u = u / (uint64)10;
+  }
+  var k: int64 = 0;
+  while (k < n) {
+    out[k] = tmp[n - 1 - k];
+    k = k + 1;
+  }
+  return str_from_bytes((cstring)out, n);
+}
+
+/// Label format: shortest of fixed and scientific (mp_fmt_auto).
+export const MP_FMT_AUTO: int32 = 0;
+/// Label format: SI suffixes, 1.5k, 2M (mp_fmt_si).
+export const MP_FMT_SI: int32 = 1;
+/// Label format: integer, rounded half away from zero.
+export const MP_FMT_INT: int32 = 2;
+/// Label format: seconds as a clock, mm:ss or h:mm:ss; a sub-second tick step shows tenths.
+export const MP_FMT_TIME: int32 = 3;
+/// Label format: seconds as a clock with tenths, mm:ss.t.
+export const MP_FMT_TIME_TENTHS: int32 = 4;
+
+/// One axis or readout label in a chart number format.
+/// Integers round half away from zero; a non-finite or out-of-range value is never cast but
+/// printed by mp_fmt_auto. Time formats read v as seconds.
+///
+/// @param v The value. Units: data units (seconds for the time formats). Valid: any.
+/// @param fmt Format: 0 auto, 1 SI, 2 integer, 3 clock, 4 clock with tenths (the MP_FMT_*
+///   codes). Valid: 0 .. 4; any other value formats as auto (MP_FMT_AUTO).
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The text, or "" when out is 0 or cap < 32.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+///   Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_fmt_value(v: float64, fmt: int32, out: uint8*, cap: int64) -> string {
+  if (fmt == MP_FMT_INT) {
+    if (is_finite(v) != 0 && fabs(v) < 1e18) {
+      return mp_fmt_int((int64)round(v), out, cap);
+    }
+    return mp_fmt_auto(v, out, cap);
+  }
+  if (fmt == MP_FMT_SI) { return mp_fmt_si(v, out, cap); }
+  if (fmt == MP_FMT_TIME) { return mp_fmt_clock(v, out, cap); }
+  if (fmt == MP_FMT_TIME_TENTHS) { return mp_fmt_clock_tenths(v, out, cap); }
+  return mp_fmt_auto(v, out, cap);
+}

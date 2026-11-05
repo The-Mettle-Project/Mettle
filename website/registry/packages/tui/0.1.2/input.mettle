@@ -1,0 +1,420 @@
+// Input: bytes from the terminal to key, mouse and paste events.
+//
+// Handles plain UTF-8 text, C0 control keys (Ctrl+letter), Alt as an ESC
+// prefix, CSI and SS3 keys with xterm modifier parameters ("CSI 1;5A" is
+// Ctrl+Up), the "CSI n ~" keys (Insert, Delete, Page Up/Down, F5-F12),
+// kitty's "CSI code;mods u", SGR mouse reports ("CSI < b;x;y M/m", xterm
+// mode 1006), focus reports and bracketed paste (mode 2004). The parser is a
+// pure function of the bytes, so it can be tested and fuzzed without a
+// terminal. Bad or unknown sequences are dropped, never a crash.
+
+import "std/mem";
+import "std/conv";
+import "render";
+import "width";
+
+// Event kinds.
+export const TUI_EV_NONE = 0;
+export const TUI_EV_KEY = 1;
+export const TUI_EV_MOUSE = 2;
+export const TUI_EV_PASTE = 3;
+export const TUI_EV_RESIZE = 4;
+export const TUI_EV_TIMER = 5;
+export const TUI_EV_FOCUS = 6;
+export const TUI_EV_QUIT = 7;   // Ctrl-C, SIGINT, SIGTERM or SIGHUP
+
+// Keys. TUI_KEY_CHAR carries the character in ch.
+export const TUI_KEY_CHAR = 1;
+export const TUI_KEY_ENTER = 2;
+export const TUI_KEY_TAB = 3;
+export const TUI_KEY_BACKSPACE = 4;
+export const TUI_KEY_ESC = 5;
+export const TUI_KEY_UP = 6;
+export const TUI_KEY_DOWN = 7;
+export const TUI_KEY_LEFT = 8;
+export const TUI_KEY_RIGHT = 9;
+export const TUI_KEY_HOME = 10;
+export const TUI_KEY_END = 11;
+export const TUI_KEY_PGUP = 12;
+export const TUI_KEY_PGDN = 13;
+export const TUI_KEY_INSERT = 14;
+export const TUI_KEY_DELETE = 15;
+export const TUI_KEY_F1 = 21;   // F1 to F12 are TUI_KEY_F1 + 0 .. 11
+
+// Modifier bits (xterm's parameter minus one).
+export const TUI_MOD_SHIFT = 1;
+export const TUI_MOD_ALT = 2;
+export const TUI_MOD_CTRL = 4;
+export const TUI_MOD_META = 8;
+
+// Mouse buttons and actions.
+export const TUI_BTN_LEFT = 0;
+export const TUI_BTN_MIDDLE = 1;
+export const TUI_BTN_RIGHT = 2;
+export const TUI_BTN_NONE = 3;
+export const TUI_BTN_WHEEL_UP = 4;
+export const TUI_BTN_WHEEL_DOWN = 5;
+export const TUI_BTN_WHEEL_LEFT = 6;
+export const TUI_BTN_WHEEL_RIGHT = 7;
+
+export const TUI_MOUSE_PRESS = 1;
+export const TUI_MOUSE_RELEASE = 2;
+export const TUI_MOUSE_DRAG = 3;   // moved with a button held
+export const TUI_MOUSE_MOVE = 4;   // moved with no button
+
+export struct TuiEvent {
+  kind: int32;
+  key: int32;
+  ch: int32;       // code point for TUI_KEY_CHAR
+  mods: int32;
+  x: int32;        // mouse cell, from 0
+  y: int32;
+  button: int32;
+  action: int32;
+  w: int32;        // new size for TUI_EV_RESIZE
+  h: int32;
+  timer: int32;    // timer id for TUI_EV_TIMER
+  focus: bool;     // gained (true) or lost focus
+  text: string;    // pasted text; valid until the next event is read
+}
+
+const TUI_IN_CAP = 8192;
+
+export struct TuiInput {
+  buf: uint8*;
+  len: int64;
+  in_paste: bool;
+  paste: TuiOut*;
+  paste_ready: bool;
+}
+
+export fn tui_input_new() -> TuiInput* {
+  var in: TuiInput* = new TuiInput;
+  in->buf = (uint8*)malloc(TUI_IN_CAP);
+  in->paste = tui_out_new();
+  return in;
+}
+
+export fn tui_input_free(in: TuiInput*) {
+  if (in == 0) { return; }
+  free(in->buf);
+  tui_out_free(in->paste);
+  free(in);
+}
+
+// How many bytes the input buffer can still take.
+export fn tui_input_room(in: TuiInput*) -> int64 {
+  return TUI_IN_CAP - in->len;
+}
+
+// Adds bytes read from the terminal. Bytes past the free room are dropped.
+export fn tui_input_feed(in: TuiInput*, p: uint8*, n: int64) {
+  var room: int64 = TUI_IN_CAP - in->len;
+  if (n > room) { n = room; }
+  if (n <= 0) { return; }
+  memcpy(in->buf + in->len, p, n);
+  in->len = in->len + n;
+}
+
+export fn tui_input_feed_str(in: TuiInput*, s: string) {
+  tui_input_feed(in, s.chars, (int64)s.length);
+}
+
+export fn tui_input_pending(in: TuiInput*) -> bool {
+  return in->len > 0;
+}
+
+fn tui_ev_clear(ev: TuiEvent*) {
+  var e: TuiEvent;
+  *ev = e;
+}
+
+fn tui_ev_key(ev: TuiEvent*, key: int32, ch: int32, mods: int32) {
+  tui_ev_clear(ev);
+  ev->kind = TUI_EV_KEY;
+  ev->key = key;
+  ev->ch = ch;
+  ev->mods = mods;
+}
+
+// Bytes in the UTF-8 sequence that starts with b (1 for a bad lead byte).
+fn tui_utf8_need(b: int32) -> int64 {
+  if (b >= 0xC2 && b <= 0xDF) { return 2; }
+  if (b >= 0xE0 && b <= 0xEF) { return 3; }
+  if (b >= 0xF0 && b <= 0xF4) { return 4; }
+  return 1;
+}
+
+// One key that is not an escape sequence. Returns bytes used, 0 if more
+// bytes are needed.
+fn tui_parse_plain(p: uint8*, n: int64, ev: TuiEvent*, force: bool) -> int64 {
+  var b: int32 = (int32)p[0];
+  if (b == 13 || b == 10) { tui_ev_key(ev, TUI_KEY_ENTER, 0, 0); return 1; }
+  if (b == 9) { tui_ev_key(ev, TUI_KEY_TAB, 0, 0); return 1; }
+  if (b == 127 || b == 8) { tui_ev_key(ev, TUI_KEY_BACKSPACE, 0, 0); return 1; }
+  if (b == 0) { tui_ev_key(ev, TUI_KEY_CHAR, 32, TUI_MOD_CTRL); return 1; }
+  if (b >= 1 && b <= 26) { tui_ev_key(ev, TUI_KEY_CHAR, 96 + b, TUI_MOD_CTRL); return 1; }
+  if (b >= 28 && b <= 31) { tui_ev_key(ev, TUI_KEY_CHAR, 64 + b, TUI_MOD_CTRL); return 1; }
+  if (b < 128) { tui_ev_key(ev, TUI_KEY_CHAR, b, 0); return 1; }
+  var need: int64 = tui_utf8_need(b);
+  if (n < need && !force) {
+    // Wait for the rest only if the bytes so far are valid continuations.
+    var ok: bool = true;
+    for k: int64 in 1..n {
+      if (((int32)p[k] & 0xC0) != 0x80) { ok = false; }
+    }
+    if (ok) { return 0; }
+  }
+  var cp: int32 = 0;
+  var used: int64 = tui_utf8_next(p, n, 0, &cp);
+  tui_ev_key(ev, TUI_KEY_CHAR, cp, 0);
+  return used;
+}
+
+fn tui_mods_from(param: int32) -> int32 {
+  if (param <= 1) { return 0; }
+  return (param - 1) & 15;
+}
+
+// A key from a CSI or SS3 final byte, or 0.
+fn tui_final_key(f: int32) -> int32 {
+  if (f == 65) { return TUI_KEY_UP; }
+  if (f == 66) { return TUI_KEY_DOWN; }
+  if (f == 67) { return TUI_KEY_RIGHT; }
+  if (f == 68) { return TUI_KEY_LEFT; }
+  if (f == 72) { return TUI_KEY_HOME; }
+  if (f == 70) { return TUI_KEY_END; }
+  if (f >= 80 && f <= 83) { return TUI_KEY_F1 + f - 80; }   // P Q R S
+  return 0;
+}
+
+// The key for "CSI n ~", or 0.
+fn tui_tilde_key(n: int32) -> int32 {
+  switch (n) {
+    case 1: { return TUI_KEY_HOME; }
+    case 7: { return TUI_KEY_HOME; }
+    case 2: { return TUI_KEY_INSERT; }
+    case 3: { return TUI_KEY_DELETE; }
+    case 4: { return TUI_KEY_END; }
+    case 8: { return TUI_KEY_END; }
+    case 5: { return TUI_KEY_PGUP; }
+    case 6: { return TUI_KEY_PGDN; }
+    case 11: { return TUI_KEY_F1; }
+    case 12: { return TUI_KEY_F1 + 1; }
+    case 13: { return TUI_KEY_F1 + 2; }
+    case 14: { return TUI_KEY_F1 + 3; }
+    case 15: { return TUI_KEY_F1 + 4; }
+    case 17: { return TUI_KEY_F1 + 5; }
+    case 18: { return TUI_KEY_F1 + 6; }
+    case 19: { return TUI_KEY_F1 + 7; }
+    case 20: { return TUI_KEY_F1 + 8; }
+    case 21: { return TUI_KEY_F1 + 9; }
+    case 23: { return TUI_KEY_F1 + 10; }
+    case 24: { return TUI_KEY_F1 + 11; }
+    default: { return 0; }
+  }
+}
+
+const TUI_MAX_PARAMS = 8;
+const TUI_MAX_SEQ = 64;
+
+// A CSI sequence starting at p[0] = ESC, p[1] = '['.
+fn tui_parse_csi(in: TuiInput*, p: uint8*, n: int64, ev: TuiEvent*) -> int64 {
+  var params: int32[8];
+  var np: int32 = 0;
+  var cur: int32 = 0;
+  var have: bool = false;
+  var priv: int32 = 0;
+  var i: int64 = 2;
+  if (i < n && (p[i] == (uint8)60 || p[i] == (uint8)61 || p[i] == (uint8)62 || p[i] == (uint8)63)) {
+    priv = (int32)p[i];
+    i = i + 1;
+  }
+  var sub: bool = false;   // inside a ':' sub-parameter, which is skipped
+  while (i < n) {
+    var b: int32 = (int32)p[i];
+    if (b >= 48 && b <= 57) {
+      if (!sub && cur < 100000) { cur = cur * 10 + (b - 48); have = true; }
+    } else if (b == 59) {
+      if (np < TUI_MAX_PARAMS) { params[np] = cur; np = np + 1; }
+      cur = 0; have = false; sub = false;
+    } else if (b == 58) {
+      sub = true;
+    } else if (b >= 0x20 && b <= 0x3F) {
+      // other parameter or intermediate bytes: ignored
+    } else if (b >= 0x40 && b <= 0x7E) {
+      if ((have || np > 0) && np < TUI_MAX_PARAMS) { params[np] = cur; np = np + 1; }
+      var used: int64 = i + 1;
+      tui_ev_clear(ev);
+      var p0: int32 = 0;
+      var p1: int32 = 0;
+      var p2: int32 = 0;
+      if (np > 0) { p0 = params[0]; }
+      if (np > 1) { p1 = params[1]; }
+      if (np > 2) { p2 = params[2]; }
+      if (priv == 60) {
+        if ((b == 77 || b == 109) && np >= 3) {
+          tui_parse_sgr_mouse(ev, p0, p1, p2, b == 109);
+        }
+        return used;
+      }
+      if (priv != 0) { return used; }
+      if (b == 126) {
+        if (p0 == 200) { in->in_paste = true; tui_out_reset(in->paste); return used; }
+        if (p0 == 201) { return used; }
+        var k: int32 = tui_tilde_key(p0);
+        if (k != 0) { tui_ev_key(ev, k, 0, tui_mods_from(p1)); }
+        return used;
+      }
+      if (b == 117) {   // kitty: CSI code ; mods u
+        var mods: int32 = tui_mods_from(p1);
+        if (p0 == 13) { tui_ev_key(ev, TUI_KEY_ENTER, 0, mods); }
+        else if (p0 == 9) { tui_ev_key(ev, TUI_KEY_TAB, 0, mods); }
+        else if (p0 == 127) { tui_ev_key(ev, TUI_KEY_BACKSPACE, 0, mods); }
+        else if (p0 == 27) { tui_ev_key(ev, TUI_KEY_ESC, 0, mods); }
+        else if (p0 >= 32 && p0 <= 0x10FFFF && !(p0 >= 0xD800 && p0 <= 0xDFFF)) { tui_ev_key(ev, TUI_KEY_CHAR, p0, mods); }
+        return used;
+      }
+      if (b == 90) { tui_ev_key(ev, TUI_KEY_TAB, 0, TUI_MOD_SHIFT); return used; }   // CSI Z
+      if (b == 73 || b == 79) {   // focus in / out
+        if (np == 0) {
+          ev->kind = TUI_EV_FOCUS;
+          ev->focus = b == 73;
+        }
+        return used;
+      }
+      var fk: int32 = tui_final_key(b);
+      if (fk != 0) { tui_ev_key(ev, fk, 0, tui_mods_from(p1)); }
+      return used;
+    } else {
+      // A control byte inside the sequence: drop what came before it.
+      tui_ev_clear(ev);
+      return i;
+    }
+    i = i + 1;
+    if (i >= TUI_MAX_SEQ) { tui_ev_clear(ev); return i; }
+  }
+  return 0;
+}
+
+fn tui_parse_sgr_mouse(ev: TuiEvent*, cb: int32, cx: int32, cy: int32, release: bool) {
+  ev->kind = TUI_EV_MOUSE;
+  ev->x = cx - 1;
+  ev->y = cy - 1;
+  var m: int32 = 0;
+  if ((cb & 4) != 0) { m = m | TUI_MOD_SHIFT; }
+  if ((cb & 8) != 0) { m = m | TUI_MOD_ALT; }
+  if ((cb & 16) != 0) { m = m | TUI_MOD_CTRL; }
+  ev->mods = m;
+  var low: int32 = cb & 3;
+  if ((cb & 64) != 0) {
+    ev->button = TUI_BTN_WHEEL_UP + low;
+    ev->action = TUI_MOUSE_PRESS;
+    return;
+  }
+  ev->button = low;
+  if ((cb & 32) != 0) {
+    if (low == 3) { ev->action = TUI_MOUSE_MOVE; } else { ev->action = TUI_MOUSE_DRAG; }
+    return;
+  }
+  if (release) { ev->action = TUI_MOUSE_RELEASE; } else { ev->action = TUI_MOUSE_PRESS; }
+}
+
+// One event from the bytes at p. Returns bytes used (the event may be
+// TUI_EV_NONE for a dropped sequence), or 0 when more bytes are needed.
+fn tui_parse_one(in: TuiInput*, p: uint8*, n: int64, ev: TuiEvent*, force: bool) -> int64 {
+  tui_ev_clear(ev);
+  if (n <= 0) { return 0; }
+  if (p[0] != (uint8)27) { return tui_parse_plain(p, n, ev, force); }
+  if (n == 1) {
+    if (!force) { return 0; }
+    tui_ev_key(ev, TUI_KEY_ESC, 0, 0);
+    return 1;
+  }
+  var b1: int32 = (int32)p[1];
+  if (b1 == 91) {
+    var r: int64 = tui_parse_csi(in, p, n, ev);
+    if (r == 0 && force) {
+      // "ESC [" with nothing after it: Alt+[.
+      if (n == 2) { tui_ev_key(ev, TUI_KEY_CHAR, 91, TUI_MOD_ALT); return 2; }
+      tui_ev_clear(ev);
+      return n;
+    }
+    return r;
+  }
+  if (b1 == 79) {   // SS3
+    if (n < 3) {
+      if (!force) { return 0; }
+      tui_ev_key(ev, TUI_KEY_CHAR, 79, TUI_MOD_ALT);
+      return 2;
+    }
+    var k: int32 = tui_final_key((int32)p[2]);
+    if (k != 0) { tui_ev_key(ev, k, 0, 0); return 3; }
+    tui_ev_key(ev, TUI_KEY_CHAR, 79, TUI_MOD_ALT);
+    return 2;
+  }
+  if (b1 == 27) {
+    tui_ev_key(ev, TUI_KEY_ESC, 0, 0);
+    return 1;
+  }
+  // ESC then a key: that key with Alt.
+  var used: int64 = tui_parse_plain(p + 1, n - 1, ev, force);
+  if (used == 0) { return 0; }
+  ev->mods = ev->mods | TUI_MOD_ALT;
+  return used + 1;
+}
+
+fn tui_input_drop(in: TuiInput*, k: int64) {
+  if (k >= in->len) { in->len = 0; return; }
+  memmove(in->buf, in->buf + k, in->len - k);
+  in->len = in->len - k;
+}
+
+// Finds ESC [ 2 0 1 ~ in the buffer; -1 if absent.
+fn tui_find_paste_end(p: uint8*, n: int64) -> int64 {
+  var i: int64 = 0;
+  while (i + 6 <= n) {
+    if (p[i] == (uint8)27 && p[i + 1] == (uint8)91 && p[i + 2] == (uint8)50 && p[i + 3] == (uint8)48 && p[i + 4] == (uint8)49 && p[i + 5] == (uint8)126) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// Takes the next event from the buffer. Returns false when there is none
+// yet. With force, a lone ESC or a cut-off sequence is taken as it is
+// (call it that way once no more bytes have arrived for a short while).
+export fn tui_input_next(in: TuiInput*, ev: TuiEvent*, force: bool) -> bool {
+  tui_ev_clear(ev);
+  while (in->len > 0 || in->in_paste) {
+    if (in->in_paste) {
+      var end: int64 = tui_find_paste_end(in->buf, in->len);
+      if (end < 0) {
+        // Keep the last 5 bytes in case the end marker is split.
+        var keep: int64 = 5;
+        if (force) { keep = 0; }
+        var take: int64 = in->len - keep;
+        if (take > 0) {
+          tui_out_bytes(in->paste, in->buf, take);
+          tui_input_drop(in, take);
+        }
+        if (!force) { return false; }
+        // Forced with no end marker: hand over what there is.
+        in->in_paste = false;
+      } else {
+        tui_out_bytes(in->paste, in->buf, end);
+        tui_input_drop(in, end + 6);
+        in->in_paste = false;
+      }
+      ev->kind = TUI_EV_PASTE;
+      ev->text = tui_out_text(in->paste);
+      return true;
+    }
+    var used: int64 = tui_parse_one(in, in->buf, in->len, ev, force);
+    if (used == 0) { return false; }
+    tui_input_drop(in, used);
+    if (ev->kind != TUI_EV_NONE) { return true; }
+  }
+  return false;
+}

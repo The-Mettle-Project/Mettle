@@ -1,0 +1,24 @@
+// erasure: erasure coding for Mettle, written in pure Mettle.
+//
+//   import "erasure/erasure";
+//
+// This file has no exports of its own, so it re-exports every module below.
+// All exported names start with erasure_, Erasure or ERASURE_.
+//
+//   core/   status codes
+//   gf8/    GF(2^8) field, matrices, vector kernels and multiply plans
+//   rs/     Reed-Solomon codec over GF(2^8), with streaming
+//   gf16/   GF(2^16) field and the wide-stripe Reed-Solomon codec
+//   xor/    single XOR parity
+
+import "erasure/core/status";
+import "erasure/gf8/field";
+import "erasure/gf8/matrix";
+import "erasure/gf8/cpu";
+import "erasure/gf8/kernels";
+import "erasure/gf8/plan";
+import "erasure/rs/codec";
+import "erasure/xor/parity";
+import "erasure/rs/stream";
+import "erasure/gf16/field";
+import "erasure/gf16/codec";

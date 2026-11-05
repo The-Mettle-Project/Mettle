@@ -1,0 +1,470 @@
+// The inverse MDCT used by Vorbis, ported from stb_vorbis (public domain),
+// which follows "The use of multirate filter banks for coding of high
+// quality digital audio" (Sporer, Brandenburg, Edler): a merged pre-twiddle,
+// log2(n) - 3 butterfly passes with the last three folded together, bit
+// reversal and a post-twiddle that writes all four quarters of the output.
+// Works in place on n/2 spectral values, giving n time samples.
+
+import "std/mem";
+import "../core/amath";
+import "vorbis_setup";
+
+const VM_PI: float64 = 3.14159265358979323846;
+
+export struct AudioVorbisMdct {
+  n: int32;
+  ld: int32;
+  a: float32*;     // n/2 twiddles
+  b: float32*;     // n/2
+  c: float32*;     // n/4
+  rev: int32*;     // n/8
+  tmp: float32*;   // n/2 scratch
+  slow: float32*;  // n * n/2 direct cosine table for n below 256
+}
+
+export fn audio_vorbis_mdct_free(m: AudioVorbisMdct*) {
+  if (m->a != 0) { free(m->a); }
+  if (m->b != 0) { free(m->b); }
+  if (m->c != 0) { free(m->c); }
+  if (m->rev != 0) { free(m->rev); }
+  if (m->tmp != 0) { free(m->tmp); }
+  if (m->slow != 0) { free(m->slow); }
+  memset(m, 0, sizeof(AudioVorbisMdct));
+}
+
+/// Builds the tables for block size n (a power of two, 64 to 8192).
+export fn audio_vorbis_mdct_init(m: AudioVorbisMdct*, n: int32) -> bool {
+  memset(m, 0, sizeof(AudioVorbisMdct));
+  var n2: int32 = n >> 1;
+  var n4: int32 = n >> 2;
+  var n8: int32 = n >> 3;
+  m->n = n;
+  m->ld = audio_vorbis_ilog((int64)n) - 1;
+  m->a = (float32*)calloc((int64)n2, 4);
+  m->b = (float32*)calloc((int64)n2, 4);
+  m->c = (float32*)calloc((int64)n4, 4);
+  m->rev = (int32*)calloc((int64)n8, 4);
+  m->tmp = (float32*)calloc((int64)n2, 4);
+  if (m->a == 0 || m->b == 0 || m->c == 0 || m->rev == 0 || m->tmp == 0) { return false; }
+  var fn_: float64 = (float64)n;
+  for k in 0..n4 {
+    var k2: int32 = k * 2;
+    m->a[k2] = (float32)audio_cos(4.0 * (float64)k * VM_PI / fn_);
+    m->a[k2 + 1] = (float32)(-audio_sin(4.0 * (float64)k * VM_PI / fn_));
+    m->b[k2] = (float32)(audio_cos((float64)(k2 + 1) * VM_PI / fn_ / 2.0) * 0.5);
+    m->b[k2 + 1] = (float32)(audio_sin((float64)(k2 + 1) * VM_PI / fn_ / 2.0) * 0.5);
+  }
+  for k in 0..n8 {
+    var k2: int32 = k * 2;
+    m->c[k2] = (float32)audio_cos(2.0 * (float64)(k2 + 1) * VM_PI / fn_);
+    m->c[k2 + 1] = (float32)(-audio_sin(2.0 * (float64)(k2 + 1) * VM_PI / fn_));
+  }
+  if (n < 256) {
+    // the fast passes need n >= 256: smaller blocks use the direct sum
+    m->slow = (float32*)calloc((int64)n * (int64)n2, 4);
+    if (m->slow == 0) { return false; }
+    for i in 0..n {
+      for j in 0..n2 {
+        m->slow[i * n2 + j] = (float32)audio_cos(VM_PI / 2.0 / fn_ * (2.0 * (float64)i + 1.0 + fn_ / 2.0) * (2.0 * (float64)j + 1.0));
+      }
+    }
+  }
+  for i in 0..n8 {
+    m->rev[i] = (int32)((audio_vorbis_rev32((uint32)i) >> (32 - m->ld + 3)) << 2);
+  }
+  return true;
+}
+
+fn vm_iter0(n: int32, e: float32*, i_off: int32, k_off: int32, a: float32*) {
+  var e0: int32 = i_off;
+  var e2: int32 = i_off + k_off;
+  var ta: int32 = 0;
+  var i: int32 = n >> 2;
+  while (i > 0) {
+    var k00: float32 = e[e0] - e[e2];
+    var k01: float32 = e[e0 - 1] - e[e2 - 1];
+    e[e0] = e[e0] + e[e2];
+    e[e0 - 1] = e[e0 - 1] + e[e2 - 1];
+    e[e2] = k00 * a[ta] - k01 * a[ta + 1];
+    e[e2 - 1] = k01 * a[ta] + k00 * a[ta + 1];
+    ta = ta + 8;
+
+    k00 = e[e0 - 2] - e[e2 - 2];
+    k01 = e[e0 - 3] - e[e2 - 3];
+    e[e0 - 2] = e[e0 - 2] + e[e2 - 2];
+    e[e0 - 3] = e[e0 - 3] + e[e2 - 3];
+    e[e2 - 2] = k00 * a[ta] - k01 * a[ta + 1];
+    e[e2 - 3] = k01 * a[ta] + k00 * a[ta + 1];
+    ta = ta + 8;
+
+    k00 = e[e0 - 4] - e[e2 - 4];
+    k01 = e[e0 - 5] - e[e2 - 5];
+    e[e0 - 4] = e[e0 - 4] + e[e2 - 4];
+    e[e0 - 5] = e[e0 - 5] + e[e2 - 5];
+    e[e2 - 4] = k00 * a[ta] - k01 * a[ta + 1];
+    e[e2 - 5] = k01 * a[ta] + k00 * a[ta + 1];
+    ta = ta + 8;
+
+    k00 = e[e0 - 6] - e[e2 - 6];
+    k01 = e[e0 - 7] - e[e2 - 7];
+    e[e0 - 6] = e[e0 - 6] + e[e2 - 6];
+    e[e0 - 7] = e[e0 - 7] + e[e2 - 7];
+    e[e2 - 6] = k00 * a[ta] - k01 * a[ta + 1];
+    e[e2 - 7] = k01 * a[ta] + k00 * a[ta + 1];
+    ta = ta + 8;
+    e0 = e0 - 8;
+    e2 = e2 - 8;
+    i = i - 1;
+  }
+}
+
+fn vm_inner_r(lim: int32, e: float32*, d0: int32, k_off: int32, a: float32*, k1: int32) {
+  var e0: int32 = d0;
+  var e2: int32 = d0 + k_off;
+  var ta: int32 = 0;
+  var i: int32 = lim >> 2;
+  while (i > 0) {
+    var k00: float32 = e[e0] - e[e2];
+    var k01: float32 = e[e0 - 1] - e[e2 - 1];
+    e[e0] = e[e0] + e[e2];
+    e[e0 - 1] = e[e0 - 1] + e[e2 - 1];
+    e[e2] = k00 * a[ta] - k01 * a[ta + 1];
+    e[e2 - 1] = k01 * a[ta] + k00 * a[ta + 1];
+    ta = ta + k1;
+
+    k00 = e[e0 - 2] - e[e2 - 2];
+    k01 = e[e0 - 3] - e[e2 - 3];
+    e[e0 - 2] = e[e0 - 2] + e[e2 - 2];
+    e[e0 - 3] = e[e0 - 3] + e[e2 - 3];
+    e[e2 - 2] = k00 * a[ta] - k01 * a[ta + 1];
+    e[e2 - 3] = k01 * a[ta] + k00 * a[ta + 1];
+    ta = ta + k1;
+
+    k00 = e[e0 - 4] - e[e2 - 4];
+    k01 = e[e0 - 5] - e[e2 - 5];
+    e[e0 - 4] = e[e0 - 4] + e[e2 - 4];
+    e[e0 - 5] = e[e0 - 5] + e[e2 - 5];
+    e[e2 - 4] = k00 * a[ta] - k01 * a[ta + 1];
+    e[e2 - 5] = k01 * a[ta] + k00 * a[ta + 1];
+    ta = ta + k1;
+
+    k00 = e[e0 - 6] - e[e2 - 6];
+    k01 = e[e0 - 7] - e[e2 - 7];
+    e[e0 - 6] = e[e0 - 6] + e[e2 - 6];
+    e[e0 - 7] = e[e0 - 7] + e[e2 - 7];
+    e[e2 - 6] = k00 * a[ta] - k01 * a[ta + 1];
+    e[e2 - 7] = k01 * a[ta] + k00 * a[ta + 1];
+    e0 = e0 - 8;
+    e2 = e2 - 8;
+    ta = ta + k1;
+    i = i - 1;
+  }
+}
+
+fn vm_inner_s(n: int32, e: float32*, i_off: int32, k_off: int32, a: float32*, a0: int32, a_off: int32, k0: int32) {
+  var A0: float32 = a[a0];
+  var A1: float32 = a[a0 + 1];
+  var A2: float32 = a[a0 + a_off];
+  var A3: float32 = a[a0 + a_off + 1];
+  var A4: float32 = a[a0 + a_off * 2];
+  var A5: float32 = a[a0 + a_off * 2 + 1];
+  var A6: float32 = a[a0 + a_off * 3];
+  var A7: float32 = a[a0 + a_off * 3 + 1];
+  var e0: int32 = i_off;
+  var e2: int32 = i_off + k_off;
+  var i: int32 = n;
+  while (i > 0) {
+    var k00: float32 = e[e0] - e[e2];
+    var k11: float32 = e[e0 - 1] - e[e2 - 1];
+    e[e0] = e[e0] + e[e2];
+    e[e0 - 1] = e[e0 - 1] + e[e2 - 1];
+    e[e2] = k00 * A0 - k11 * A1;
+    e[e2 - 1] = k11 * A0 + k00 * A1;
+
+    k00 = e[e0 - 2] - e[e2 - 2];
+    k11 = e[e0 - 3] - e[e2 - 3];
+    e[e0 - 2] = e[e0 - 2] + e[e2 - 2];
+    e[e0 - 3] = e[e0 - 3] + e[e2 - 3];
+    e[e2 - 2] = k00 * A2 - k11 * A3;
+    e[e2 - 3] = k11 * A2 + k00 * A3;
+
+    k00 = e[e0 - 4] - e[e2 - 4];
+    k11 = e[e0 - 5] - e[e2 - 5];
+    e[e0 - 4] = e[e0 - 4] + e[e2 - 4];
+    e[e0 - 5] = e[e0 - 5] + e[e2 - 5];
+    e[e2 - 4] = k00 * A4 - k11 * A5;
+    e[e2 - 5] = k11 * A4 + k00 * A5;
+
+    k00 = e[e0 - 6] - e[e2 - 6];
+    k11 = e[e0 - 7] - e[e2 - 7];
+    e[e0 - 6] = e[e0 - 6] + e[e2 - 6];
+    e[e0 - 7] = e[e0 - 7] + e[e2 - 7];
+    e[e2 - 6] = k00 * A6 - k11 * A7;
+    e[e2 - 7] = k11 * A6 + k00 * A7;
+
+    e0 = e0 - k0;
+    e2 = e2 - k0;
+    i = i - 1;
+  }
+}
+
+@inline fn vm_iter54(e: float32*, z: int32) {
+  var k00: float32 = e[z] - e[z - 4];
+  var y0: float32 = e[z] + e[z - 4];
+  var y2: float32 = e[z - 2] + e[z - 6];
+  var k22: float32 = e[z - 2] - e[z - 6];
+  e[z] = y0 + y2;
+  e[z - 2] = y0 - y2;
+  var k33: float32 = e[z - 3] - e[z - 7];
+  e[z - 4] = k00 + k33;
+  e[z - 6] = k00 - k33;
+  var k11: float32 = e[z - 1] - e[z - 5];
+  var y1: float32 = e[z - 1] + e[z - 5];
+  var y3: float32 = e[z - 3] + e[z - 7];
+  e[z - 1] = y1 + y3;
+  e[z - 3] = y1 - y3;
+  e[z - 5] = k11 - k22;
+  e[z - 7] = k11 + k22;
+}
+
+fn vm_ld654(n: int32, e: float32*, i_off: int32, a: float32*, base_n: int32) {
+  var A2: float32 = a[base_n >> 3];
+  var z: int32 = i_off;
+  var base: int32 = z - 16 * n;
+  while (z > base) {
+    var k00: float32 = e[z] - e[z - 8];
+    var k11: float32 = e[z - 1] - e[z - 9];
+    var l00: float32 = e[z - 2] - e[z - 10];
+    var l11: float32 = e[z - 3] - e[z - 11];
+    e[z] = e[z] + e[z - 8];
+    e[z - 1] = e[z - 1] + e[z - 9];
+    e[z - 2] = e[z - 2] + e[z - 10];
+    e[z - 3] = e[z - 3] + e[z - 11];
+    e[z - 8] = k00;
+    e[z - 9] = k11;
+    e[z - 10] = (l00 + l11) * A2;
+    e[z - 11] = (l11 - l00) * A2;
+
+    k00 = e[z - 4] - e[z - 12];
+    k11 = e[z - 5] - e[z - 13];
+    l00 = e[z - 6] - e[z - 14];
+    l11 = e[z - 7] - e[z - 15];
+    e[z - 4] = e[z - 4] + e[z - 12];
+    e[z - 5] = e[z - 5] + e[z - 13];
+    e[z - 6] = e[z - 6] + e[z - 14];
+    e[z - 7] = e[z - 7] + e[z - 15];
+    e[z - 12] = k11;
+    e[z - 13] = -k00;
+    e[z - 14] = (l11 - l00) * A2;
+    e[z - 15] = (l00 + l11) * -A2;
+
+    vm_iter54(e, z);
+    vm_iter54(e, z - 8);
+    z = z - 16;
+  }
+}
+
+/// In place: buf[0 .. n/2) spectral values in, buf[0 .. n) samples out.
+export fn audio_vorbis_imdct(m: AudioVorbisMdct*, buf: float32*) {
+  var n: int32 = m->n;
+  var n2: int32 = n >> 1;
+  var n4: int32 = n >> 2;
+  var n8: int32 = n >> 3;
+  var A: float32* = m->a;
+  var u: float32* = buf;
+  var v: float32* = m->tmp;
+  if (m->slow != 0) {
+    for j in 0..n2 { v[j] = u[j]; }
+    for i in 0..n {
+      var row: float32* = m->slow + (int64)i * (int64)n2;
+      var acc: float32 = 0.0;
+      for j in 0..n2 { acc = acc + v[j] * row[j]; }
+      u[i] = acc;
+    }
+    return;
+  }
+
+  // copy, reflect and pre-twiddle (stb_vorbis's merged step 0/1)
+  var d: int32 = n2 - 2;
+  var aa: int32 = 0;
+  var e: int32 = 0;
+  while (e != n2) {
+    v[d + 1] = u[e] * A[aa] - u[e + 2] * A[aa + 1];
+    v[d] = u[e] * A[aa + 1] + u[e + 2] * A[aa];
+    d = d - 2;
+    aa = aa + 2;
+    e = e + 4;
+  }
+  e = n2 - 3;
+  while (d >= 0) {
+    v[d + 1] = -u[e + 2] * A[aa] + u[e] * A[aa + 1];
+    v[d] = -u[e + 2] * A[aa + 1] - u[e] * A[aa];
+    d = d - 2;
+    aa = aa + 2;
+    e = e - 4;
+  }
+
+  // step 2
+  var ab: int32 = n2 - 8;
+  var e0: int32 = n4;
+  var e1: int32 = 0;
+  var d0: int32 = n4;
+  var d1: int32 = 0;
+  while (ab >= 0) {
+    var v41: float32 = v[e0 + 1] - v[e1 + 1];
+    var v40: float32 = v[e0] - v[e1];
+    u[d0 + 1] = v[e0 + 1] + v[e1 + 1];
+    u[d0] = v[e0] + v[e1];
+    u[d1 + 1] = v41 * A[ab + 4] - v40 * A[ab + 5];
+    u[d1] = v40 * A[ab + 4] + v41 * A[ab + 5];
+
+    v41 = v[e0 + 3] - v[e1 + 3];
+    v40 = v[e0 + 2] - v[e1 + 2];
+    u[d0 + 3] = v[e0 + 3] + v[e1 + 3];
+    u[d0 + 2] = v[e0 + 2] + v[e1 + 2];
+    u[d1 + 3] = v41 * A[ab] - v40 * A[ab + 1];
+    u[d1 + 2] = v40 * A[ab] + v41 * A[ab + 1];
+
+    ab = ab - 8;
+    d0 = d0 + 4;
+    d1 = d1 + 4;
+    e0 = e0 + 4;
+    e1 = e1 + 4;
+  }
+
+  // step 3
+  var ld: int32 = m->ld;
+  vm_iter0(n >> 4, u, n2 - 1, -(n >> 3), A);
+  vm_iter0(n >> 4, u, n2 - 1 - n4, -(n >> 3), A);
+  vm_inner_r(n >> 5, u, n2 - 1, -(n >> 4), A, 16);
+  vm_inner_r(n >> 5, u, n2 - 1 - n8, -(n >> 4), A, 16);
+  vm_inner_r(n >> 5, u, n2 - 1 - n8 * 2, -(n >> 4), A, 16);
+  vm_inner_r(n >> 5, u, n2 - 1 - n8 * 3, -(n >> 4), A, 16);
+  var l: int32 = 2;
+  while (l < ((ld - 3) >> 1)) {
+    var k0: int32 = n >> (l + 2);
+    var k0_2: int32 = k0 >> 1;
+    var lim: int32 = 1 << (l + 1);
+    for i in 0..lim {
+      vm_inner_r(n >> (l + 4), u, n2 - 1 - k0 * i, -k0_2, A, 1 << (l + 3));
+    }
+    l = l + 1;
+  }
+  while (l < ld - 6) {
+    var k0: int32 = n >> (l + 2);
+    var k1: int32 = 1 << (l + 3);
+    var k0_2: int32 = k0 >> 1;
+    var rlim: int32 = n >> (l + 6);
+    var lim: int32 = 1 << (l + 1);
+    var i_off: int32 = n2 - 1;
+    var a0: int32 = 0;
+    var r: int32 = rlim;
+    while (r > 0) {
+      vm_inner_s(lim, u, i_off, -k0_2, A, a0, k1, k0);
+      a0 = a0 + k1 * 4;
+      i_off = i_off - 8;
+      r = r - 1;
+    }
+    l = l + 1;
+  }
+  vm_ld654(n >> 5, u, n2 - 1, A, n);
+
+  // steps 4, 5 and 6: bit reversal into v
+  var rv: int32* = m->rev;
+  var br: int32 = 0;
+  d0 = n4 - 4;
+  d1 = n2 - 4;
+  while (d0 >= 0) {
+    var k4: int32 = rv[br];
+    v[d1 + 3] = u[k4];
+    v[d1 + 2] = u[k4 + 1];
+    v[d0 + 3] = u[k4 + 2];
+    v[d0 + 2] = u[k4 + 3];
+    k4 = rv[br + 1];
+    v[d1 + 1] = u[k4];
+    v[d1] = u[k4 + 1];
+    v[d0 + 1] = u[k4 + 2];
+    v[d0] = u[k4 + 3];
+    d0 = d0 - 4;
+    d1 = d1 - 4;
+    br = br + 2;
+  }
+
+  // step 7
+  var C: float32* = m->c;
+  var ci: int32 = 0;
+  d = 0;
+  e = n2 - 4;
+  while (d < e) {
+    var a02: float32 = v[d] - v[e + 2];
+    var a11: float32 = v[d + 1] + v[e + 3];
+    var b0: float32 = C[ci + 1] * a02 + C[ci] * a11;
+    var b1: float32 = C[ci + 1] * a11 - C[ci] * a02;
+    var b2: float32 = v[d] + v[e + 2];
+    var b3: float32 = v[d + 1] - v[e + 3];
+    v[d] = b2 + b0;
+    v[d + 1] = b3 + b1;
+    v[e + 2] = b2 - b0;
+    v[e + 3] = b1 - b3;
+
+    a02 = v[d + 2] - v[e];
+    a11 = v[d + 3] + v[e + 1];
+    b0 = C[ci + 3] * a02 + C[ci + 2] * a11;
+    b1 = C[ci + 3] * a11 - C[ci + 2] * a02;
+    b2 = v[d + 2] + v[e];
+    b3 = v[d + 3] - v[e + 1];
+    v[d + 2] = b2 + b0;
+    v[d + 3] = b3 + b1;
+    v[e] = b2 - b0;
+    v[e + 1] = b1 - b3;
+
+    ci = ci + 4;
+    d = d + 4;
+    e = e - 4;
+  }
+
+  // step 8 and the output quarters
+  var B: float32* = m->b;
+  var bi: int32 = n2 - 8;
+  e = n2 - 8;
+  d0 = 0;
+  d1 = n2 - 4;
+  var d2: int32 = n2;
+  var d3: int32 = n - 4;
+  while (e >= 0) {
+    var p3: float32 = v[e + 6] * B[bi + 7] - v[e + 7] * B[bi + 6];
+    var p2: float32 = -v[e + 6] * B[bi + 6] - v[e + 7] * B[bi + 7];
+    buf[d0] = p3;
+    buf[d1 + 3] = -p3;
+    buf[d2] = p2;
+    buf[d3 + 3] = p2;
+
+    var p1: float32 = v[e + 4] * B[bi + 5] - v[e + 5] * B[bi + 4];
+    var p0: float32 = -v[e + 4] * B[bi + 4] - v[e + 5] * B[bi + 5];
+    buf[d0 + 1] = p1;
+    buf[d1 + 2] = -p1;
+    buf[d2 + 1] = p0;
+    buf[d3 + 2] = p0;
+
+    p3 = v[e + 2] * B[bi + 3] - v[e + 3] * B[bi + 2];
+    p2 = -v[e + 2] * B[bi + 2] - v[e + 3] * B[bi + 3];
+    buf[d0 + 2] = p3;
+    buf[d1 + 1] = -p3;
+    buf[d2 + 2] = p2;
+    buf[d3 + 1] = p2;
+
+    p1 = v[e] * B[bi + 1] - v[e + 1] * B[bi];
+    p0 = -v[e] * B[bi] - v[e + 1] * B[bi + 1];
+    buf[d0 + 3] = p1;
+    buf[d1] = -p1;
+    buf[d2 + 3] = p0;
+    buf[d3] = p0;
+
+    bi = bi - 8;
+    e = e - 8;
+    d0 = d0 + 4;
+    d2 = d2 + 4;
+    d1 = d1 - 4;
+    d3 = d3 - 4;
+  }
+}

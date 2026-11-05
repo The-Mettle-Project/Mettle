@@ -1,0 +1,88 @@
+// raize/server/signals — SIGTERM and SIGINT stop the server cleanly (exit 0).
+// internal
+// thread: rz__signals_block on the main thread before any other thread exists; the
+// watcher is its own thread; rz__signals_watch_end on the thread that started it.
+//
+// Mechanism (A4), chosen because Mettle links no libc and a handler would need an
+// rt_sigreturn trampoline: both signals are *blocked* in the main thread before any
+// thread starts, so every thread inherits the mask and the kernel never runs a
+// handler. One watcher thread takes them synchronously with rt_sigtimedwait (100 ms
+// timeout, so it also notices when rz_run ends for another reason) and calls
+// rz_server_stop, which is an ordinary call on an ordinary thread. Workers then see
+// accept() fail, finish the request in hand and are joined; rz_run returns 0.
+
+import "std/thread";
+import "types";
+import "server";
+
+const RZ__SYS_RT_SIGPROCMASK: int64 = 14;
+const RZ__SYS_RT_SIGTIMEDWAIT: int64 = 128;
+const RZ__SIG_BLOCK: int64 = 0;
+const RZ__SIGSET_BYTES: int64 = 8;
+
+struct Rz_Timespec {
+  sec: int64;
+  nsec: int64;
+}
+
+/// internal: server/signals. The watcher's shared state.
+export struct Rz_SigWatch {
+  srv: RzServer*;   // stopped on SIGTERM/SIGINT; borrowed
+  done: int32;      // 1 = the watcher should return (atomic)
+  got: int32;       // the signal number received, 0 none (atomic)
+}
+
+// SIGINT (2) and SIGTERM (15): bit (signo - 1) of the kernel's 64-bit set.
+fn rz__sigset_stop() -> uint64 {
+  return ((uint64)1 << 1) | ((uint64)1 << 14);
+}
+
+/// internal: app/run. Blocks SIGTERM and SIGINT on the calling thread; threads
+/// created afterwards inherit the mask. Call first thing in rz_run.
+/// in:      nothing
+/// returns: true when the mask was installed
+/// owns:    nothing
+export fn rz__signals_block() -> bool {
+  var set: uint64 = rz__sigset_stop();
+  return syscall(RZ__SYS_RT_SIGPROCMASK, RZ__SIG_BLOCK, (int64)&set, 0, RZ__SIGSET_BYTES) == 0;
+}
+
+fn rz__signals_main(arg: cstring) -> uint32 {
+  var w: Rz_SigWatch* = (Rz_SigWatch*)arg;
+  var set: uint64 = rz__sigset_stop();
+  var ts: Rz_Timespec;
+  ts.sec = 0;
+  ts.nsec = 100000000;
+  var info: uint8[128];
+  while (w->done == 0) {
+    var sig: int64 = syscall(RZ__SYS_RT_SIGTIMEDWAIT, (int64)&set, (int64)&info[0], (int64)&ts, RZ__SIGSET_BYTES);
+    if (sig > 0) {
+      atomic_exchange_i32(&w->got, (int32)sig);
+      rz_server_stop(w->srv);
+      return 0;
+    }
+  }
+  return 0;
+}
+
+/// internal: app/run. Starts the watcher that stops `w->srv` on SIGTERM/SIGINT.
+/// in:      w zeroed state with srv set; must outlive rz__signals_watch_end
+/// returns: the thread handle, or 0 when no thread could be created
+/// owns:    the caller ends it with rz__signals_watch_end
+export fn rz__signals_watch(w: Rz_SigWatch*) -> int64 {
+  var h: int64 = CreateThread(0, 0, &rz__signals_main, (cstring)w, 0, 0);
+  if (h <= 0) { return 0; }
+  return h;
+}
+
+/// internal: app/run. Ends and joins the watcher (it returns within 100 ms).
+/// in:      w the state given to rz__signals_watch; h its handle (0 is ignored)
+/// returns: the signal that stopped the server, or 0
+/// owns:    closes `h`
+export fn rz__signals_watch_end(w: Rz_SigWatch*, h: int64) -> int32 {
+  if (h == 0) { return 0; }
+  atomic_exchange_i32(&w->done, 1);
+  thread_join_infinite(h);
+  thread_close(h);
+  return w->got;
+}

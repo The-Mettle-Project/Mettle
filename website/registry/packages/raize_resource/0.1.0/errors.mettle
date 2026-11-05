@@ -1,0 +1,104 @@
+// raize/resource/errors — validation errors, per field, with their messages inline.
+// reference: resources
+// thread: an RzErrors belongs to its caller; never shared between threads.
+//
+// RzErrors owns nothing (messages are copied into fixed buffers), so it can live on
+// the stack, in a handler, or inside Signal state, and is reset by every action.
+
+import "raize_core/str/str";
+import "raize_core/core/status";
+
+/// Most field errors one RzErrors holds; later ones are dropped.
+export const RZ_ERRORS_MAX: int32 = 8;
+/// Longest message kept per field, in bytes (longer ones are cut).
+export const RZ_ERROR_TEXT_MAX: int32 = 63;
+
+/// One field's validation message.
+export struct RzFieldError {
+  field: string;       // the field name; static (from the resource definition)
+  text: uint8[64];     // the message bytes ("can't be blank"); owned, inline
+  len: int32;          // bytes used in text
+}
+
+/// The outcome of one resource action: a status and the messages per field.
+export struct RzErrors {
+  code: int32;                 // RZ_OK or the action's RZ_E_* status
+  count: int32;                // field errors recorded
+  items: RzFieldError[8];      // RZ_ERRORS_MAX
+}
+
+/// Resets `e` to "no errors" (RZ_OK, count 0). Every action does this on entry.
+///
+/// in:      e  the errors to reset; 0 is ignored
+/// returns: nothing
+/// owns:    nothing
+/// thread:  the caller's
+/// example:
+///   var errs: RzErrors;
+///   rz_errors_clear(&errs);
+export fn rz_errors_clear(e: RzErrors*) {
+  if (e == 0) { return; }
+  e->code = RZ_OK;
+  e->count = 0;
+}
+
+/// Number of field errors recorded in `e`.
+///
+/// in:      e  the errors; 0 counts as none
+/// returns: 0..RZ_ERRORS_MAX
+/// owns:    nothing
+/// thread:  the caller's
+/// example: -
+export fn rz_errors_count(e: RzErrors*) -> int32 {
+  if (e == 0) { return 0; }
+  return e->count;
+}
+
+/// The message recorded for `field`, or "" when that field is fine.
+///
+/// in:      e      the errors from the last action; 0 gives ""
+///          field  the field name ("title")
+/// returns: a view into `e`, valid until `e` is cleared or reused
+/// owns:    nothing; copy the result to keep it
+/// thread:  the caller's
+/// example:
+///   <p class="error">{rz_error_text(&s->errors, "title")}</p>
+export fn rz_error_text(e: RzErrors*, field: string) -> string {
+  if (e == 0) { return rz_str_empty(); }
+  for i in 0..e->count {
+    if (rz_str_eq(e->items[i].field, field)) {
+      return rz_str_view(&e->items[i].text[0], (int64)e->items[i].len);
+    }
+  }
+  return rz_str_empty();
+}
+
+/// internal: resource/action. Records `text` for `field` and sets the code to
+/// RZ_E_INVALID. A full list or a second message for the same field is dropped.
+/// in:      e      the errors; 0 is ignored
+///          field  static field name
+///          text   the message; copied (cut at RZ_ERROR_TEXT_MAX bytes)
+/// returns: nothing
+/// owns:    keeps `field` (static); copies `text`
+export fn rz__errors_add(e: RzErrors*, field: string, text: string) {
+  if (e == 0) { return; }
+  e->code = RZ_E_INVALID;
+  if (e->count >= RZ_ERRORS_MAX || rz_error_text(e, field).length > 0) { return; }
+  var it: RzFieldError* = &e->items[e->count];
+  it->field = field;
+  var n: int64 = (int64)text.length;
+  if (n > (int64)RZ_ERROR_TEXT_MAX) { n = (int64)RZ_ERROR_TEXT_MAX; }
+  for k in 0..n { it->text[k] = text.chars[k]; }
+  it->len = (int32)n;
+  e->count = e->count + 1;
+}
+
+/// internal: resource/action. Sets the status of the action without a field message.
+/// in:      e     the errors; 0 is ignored
+///          code  RZ_OK or RZ_E_*
+/// returns: `code`, so callers can `return rz__errors_code(errs, rc);`
+/// owns:    nothing
+export fn rz__errors_code(e: RzErrors*, code: int32) -> int32 {
+  if (e != 0 && (e->count == 0 || code != RZ_OK)) { e->code = code; }
+  return code;
+}

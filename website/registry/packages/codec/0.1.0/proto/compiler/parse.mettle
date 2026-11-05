@@ -1,0 +1,654 @@
+// The .proto parser: proto2 and proto3 files into a CodecPbcSet.
+// Covers syntax, package, import, option, message (fields, nested messages
+// and enums, oneof, map, group, reserved, extensions), enum and service.
+// Options are read and skipped, except packed and default on fields.
+// `extend` blocks are parsed and ignored; editions files are refused.
+import "std/mem";
+import "codec/core/list";
+import "codec/proto/compiler/desc";
+import "codec/proto/compiler/lex";
+
+struct CodecPbcP {
+  set: CodecPbcSet*;
+  x: CodecPbcLex;
+  file: int32;
+  syntax: int32;
+  package: string;
+}
+
+fn codec_pbc_where(p: CodecPbcP*) -> string {
+  var path: string = p->set->files.data[p->file].disk;
+  return "{path}:{p->x.tline}:{p->x.tcol}";
+}
+
+fn codec_pbc_err(p: CodecPbcP*, msg: string) -> bool {
+  codec_pbc_fail(p->set, codec_pbc_where(p), msg);
+  return false;
+}
+
+fn codec_pbc_expect(p: CodecPbcP*, s: string) -> bool {
+  if (!codec_pbc_is(&p->x, s)) {
+    var got: string = p->x.text;
+    if (p->x.kind == CODEC_PBC_EOF) { got = "end of file"; }
+    return codec_pbc_err(p, "expected '{s}', found '{got}'");
+  }
+  codec_pbc_next(&p->x);
+  return true;
+}
+
+fn codec_pbc_ident(p: CodecPbcP*, what: string) -> string {
+  var t: string = p->x.text;
+  if (p->x.kind != CODEC_PBC_IDENT) {
+    codec_pbc_err(p, "expected {what}, found '{t}'");
+    var empty: string;
+    return empty;
+  }
+  codec_pbc_next(&p->x);
+  return t;
+}
+
+// A field or enum number: an integer, maybe negative (enums only), or `max`.
+fn codec_pbc_number(p: CodecPbcP*, allow_neg: bool, out: int64*) -> bool {
+  var neg: bool = false;
+  if (codec_pbc_is(&p->x, "-")) {
+    if (!allow_neg) { return codec_pbc_err(p, "negative number not allowed here"); }
+    neg = true;
+    codec_pbc_next(&p->x);
+  }
+  if (p->x.kind == CODEC_PBC_IDENT && p->x.text == "max") {
+    *out = 536870911;
+    codec_pbc_next(&p->x);
+    return true;
+  }
+  var v: uint64 = 0;
+  if (p->x.kind != CODEC_PBC_INT || !codec_pbc_int(p->x.text, &v) || v > 4294967295) {
+    var t: string = p->x.text;
+    return codec_pbc_err(p, "expected a number, found '{t}'");
+  }
+  codec_pbc_next(&p->x);
+  *out = (int64)v;
+  if (neg) { *out = -(int64)v; }
+  if (*out < -2147483648 || *out > 2147483647) { return codec_pbc_err(p, "number out of range"); }
+  return true;
+}
+
+// Skips a constant value: identifier, number, string(s), or { aggregate }.
+fn codec_pbc_skip_value(p: CodecPbcP*) -> bool {
+  if (codec_pbc_is(&p->x, "{{")) {
+    var depth: int32 = 0;
+    while (p->x.kind != CODEC_PBC_EOF) {
+      if (codec_pbc_is(&p->x, "{{")) { depth = depth + 1; }
+      if (codec_pbc_is(&p->x, "}")) {
+        depth = depth - 1;
+        if (depth == 0) {
+          codec_pbc_next(&p->x);
+          return true;
+        }
+      }
+      codec_pbc_next(&p->x);
+    }
+    return codec_pbc_err(p, "unterminated option value");
+  }
+  if (codec_pbc_is(&p->x, "-") || codec_pbc_is(&p->x, "+")) { codec_pbc_next(&p->x); }
+  if (p->x.kind == CODEC_PBC_STRING) {
+    while (p->x.kind == CODEC_PBC_STRING) { codec_pbc_next(&p->x); }
+    return true;
+  }
+  if (p->x.kind == CODEC_PBC_IDENT || p->x.kind == CODEC_PBC_INT || p->x.kind == CODEC_PBC_FLOAT) {
+    codec_pbc_next(&p->x);
+    return true;
+  }
+  var t: string = p->x.text;
+  return codec_pbc_err(p, "expected a constant, found '{t}'");
+}
+
+// An option name: foo, foo.bar, (custom.ext).field
+fn codec_pbc_option_name(p: CodecPbcP*) -> string {
+  var name: string = "";
+  while (true) {
+    if (codec_pbc_is(&p->x, "(")) {
+      codec_pbc_next(&p->x);
+      var inner: string = codec_pbc_ident(p, "an option name");
+      if (p->set->failed || !codec_pbc_expect(p, ")")) { return name; }
+      name = name + "(" + inner + ")";
+    } else {
+      name = name + codec_pbc_ident(p, "an option name");
+      if (p->set->failed) { return name; }
+    }
+    // `(a).b` lexes the `.b` as part of the next identifier only after a
+    // name character, so a lone dot shows up as a symbol here.
+    if (codec_pbc_is(&p->x, ".")) {
+      codec_pbc_next(&p->x);
+      name = name + ".";
+      continue;
+    }
+    break;
+  }
+  return name;
+}
+
+// `option name = value;` at file, message, enum, service or method level.
+fn codec_pbc_option_stmt(p: CodecPbcP*) -> bool {
+  codec_pbc_next(&p->x);
+  codec_pbc_option_name(p);
+  if (p->set->failed || !codec_pbc_expect(p, "=")) { return false; }
+  if (!codec_pbc_skip_value(p)) { return false; }
+  return codec_pbc_expect(p, ";");
+}
+
+// [a = 1, packed = true, default = "x"]: fills packed and default.
+fn codec_pbc_field_options(p: CodecPbcP*, f: CodecPbcField*) -> bool {
+  if (!codec_pbc_is(&p->x, "[")) { return true; }
+  codec_pbc_next(&p->x);
+  while (true) {
+    var name: string = codec_pbc_option_name(p);
+    if (p->set->failed || !codec_pbc_expect(p, "=")) { return false; }
+    if (name == "packed") {
+      var v: string = codec_pbc_ident(p, "true or false");
+      if (p->set->failed) { return false; }
+      f->packed = 0;
+      if (v == "true") { f->packed = 1; }
+    } else if (name == "default") {
+      var neg: string = "";
+      if (codec_pbc_is(&p->x, "-")) {
+        neg = "-";
+        codec_pbc_next(&p->x);
+      }
+      if (p->x.kind == CODEC_PBC_STRING) {
+        var s: string = "";
+        while (p->x.kind == CODEC_PBC_STRING) {
+          s = s + codec_pbc_unquote(p->x.text);
+          codec_pbc_next(&p->x);
+        }
+        f->default_text = s;
+      } else {
+        f->default_text = neg + p->x.text;
+        if (!codec_pbc_skip_value(p)) { return false; }
+      }
+      f->has_default = true;
+    } else {
+      if (!codec_pbc_skip_value(p)) { return false; }
+    }
+    if (codec_pbc_is(&p->x, ",")) {
+      codec_pbc_next(&p->x);
+      continue;
+    }
+    return codec_pbc_expect(p, "]");
+  }
+  return false;
+}
+
+// A type name, maybe fully qualified with a leading dot: .pkg.Msg
+fn codec_pbc_type_name(p: CodecPbcP*, what: string) -> string {
+  if (codec_pbc_is(&p->x, ".")) {
+    codec_pbc_next(&p->x);
+    return "." + codec_pbc_ident(p, what);
+  }
+  return codec_pbc_ident(p, what);
+}
+
+fn codec_pbc_scalar(t: string) -> int32 {
+  if (t == "double") { return CODEC_PBT_DOUBLE; }
+  if (t == "float") { return CODEC_PBT_FLOAT; }
+  if (t == "int64") { return CODEC_PBT_INT64; }
+  if (t == "uint64") { return CODEC_PBT_UINT64; }
+  if (t == "int32") { return CODEC_PBT_INT32; }
+  if (t == "fixed64") { return CODEC_PBT_FIXED64; }
+  if (t == "fixed32") { return CODEC_PBT_FIXED32; }
+  if (t == "bool") { return CODEC_PBT_BOOL; }
+  if (t == "string") { return CODEC_PBT_STRING; }
+  if (t == "bytes") { return CODEC_PBT_BYTES; }
+  if (t == "uint32") { return CODEC_PBT_UINT32; }
+  if (t == "sfixed32") { return CODEC_PBT_SFIXED32; }
+  if (t == "sfixed64") { return CODEC_PBT_SFIXED64; }
+  if (t == "sint32") { return CODEC_PBT_SINT32; }
+  if (t == "sint64") { return CODEC_PBT_SINT64; }
+  return 0;
+}
+
+// "foo_bar" -> "FooBar", as protoc names map entry types.
+fn codec_pbc_camel(s: string) -> string {
+  var out: string = "";
+  var up: bool = true;
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 95) {
+      up = true;
+      continue;
+    }
+    if (up && c >= 97 && c <= 122) { c = c - 32; }
+    up = false;
+    var ch: char = (char)c;
+    out = out + "{ch}";
+  }
+  return out;
+}
+
+fn codec_pbc_lower(s: string) -> string {
+  var out: string = "";
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c >= 65 && c <= 90) { c = c + 32; }
+    var ch: char = (char)c;
+    out = out + "{ch}";
+  }
+  return out;
+}
+
+fn codec_pbc_new_field() -> CodecPbcField {
+  var f: CodecPbcField;
+  f.ref = -1;
+  f.oneof = -1;
+  f.packed = -1;
+  return f;
+}
+
+fn codec_pbc_new_message(p: CodecPbcP*, name: string, parent: int32) -> int32 {
+  var m: CodecPbcMessage;
+  m.name = name;
+  m.file = p->file;
+  m.parent = parent;
+  m.syntax = p->syntax;
+  if (parent >= 0) {
+    var pm: CodecPbcMessage* = codec_pbc_msg(p->set, parent);
+    m.full = pm->full + "." + name;
+    m.mettle = pm->mettle + "_" + name;
+  } else {
+    m.full = name;
+    if (p->package.length > 0) { m.full = p->package + "." + name; }
+    m.mettle = p->set->prefix + name;
+  }
+  codec_list_push(&p->set->messages, m);
+  return (int32)(p->set->messages.len - 1);
+}
+
+fn codec_pbc_add_field(p: CodecPbcP*, msg: int32, f: CodecPbcField) -> bool {
+  var m: CodecPbcMessage* = codec_pbc_msg(p->set, msg);
+  if (f.number < 1 || f.number > 536870911) {
+    return codec_pbc_err(p, "field number {f.number} is out of range 1 to 536870911");
+  }
+  if (f.number >= 19000 && f.number <= 19999) {
+    return codec_pbc_err(p, "field numbers 19000 to 19999 are reserved");
+  }
+  for i in 0..m->fields.len {
+    if (m->fields.data[i].number == f.number) {
+      return codec_pbc_err(p, "field number {f.number} is used twice in {m->name}");
+    }
+    if (m->fields.data[i].name == f.name) {
+      return codec_pbc_err(p, "field '{f.name}' is defined twice in {m->name}");
+    }
+  }
+  codec_list_push(&m->fields, f);
+  return true;
+}
+
+
+// reserved 2, 15, 9 to 11; / reserved "foo", "bar"; / extensions 100 to max;
+fn codec_pbc_ranges(p: CodecPbcP*) -> bool {
+  codec_pbc_next(&p->x);
+  while (true) {
+    if (p->x.kind == CODEC_PBC_STRING || p->x.kind == CODEC_PBC_IDENT) {
+      codec_pbc_next(&p->x);
+    } else {
+      var a: int64 = 0;
+      if (!codec_pbc_number(p, true, &a)) { return false; }
+      if (codec_pbc_is(&p->x, "to")) {
+        codec_pbc_next(&p->x);
+        if (!codec_pbc_number(p, true, &a)) { return false; }
+      }
+    }
+    if (codec_pbc_is(&p->x, ",")) {
+      codec_pbc_next(&p->x);
+      continue;
+    }
+    break;
+  }
+  if (codec_pbc_is(&p->x, "[")) {
+    var dummy: CodecPbcField = codec_pbc_new_field();
+    if (!codec_pbc_field_options(p, &dummy)) { return false; }
+  }
+  return codec_pbc_expect(p, ";");
+}
+
+// One field (after its label, if any). `oneof` is the oneof index or -1.
+fn codec_pbc_field(p: CodecPbcP*, msg: int32, label: int32, oneof: int32) -> bool {
+  var f: CodecPbcField = codec_pbc_new_field();
+  f.label = label;
+  f.oneof = oneof;
+  f.line = p->x.tline;
+  f.col = p->x.tcol;
+  if (codec_pbc_is(&p->x, "map") ) {
+    codec_pbc_next(&p->x);
+    if (codec_pbc_is(&p->x, "<")) {
+      if (label != CODEC_PBL_NONE || oneof >= 0) { return codec_pbc_err(p, "a map field cannot have a label or be in a oneof"); }
+      codec_pbc_next(&p->x);
+      var kt: string = codec_pbc_ident(p, "a key type");
+      if (p->set->failed || !codec_pbc_expect(p, ",")) { return false; }
+      var vt: string = codec_pbc_type_name(p, "a value type");
+      if (p->set->failed || !codec_pbc_expect(p, ">")) { return false; }
+      f.name = codec_pbc_ident(p, "a field name");
+      if (p->set->failed || !codec_pbc_expect(p, "=")) { return false; }
+      var num: int64 = 0;
+      if (!codec_pbc_number(p, false, &num)) { return false; }
+      f.number = (int32)num;
+      if (!codec_pbc_field_options(p, &f) || !codec_pbc_expect(p, ";")) { return false; }
+      var kk: int32 = codec_pbc_scalar(kt);
+      if (kk == 0 || kk == CODEC_PBT_DOUBLE || kk == CODEC_PBT_FLOAT || kk == CODEC_PBT_BYTES) {
+        return codec_pbc_err(p, "map key type must be an integer, bool or string type");
+      }
+      var entry: int32 = codec_pbc_new_message(p, codec_pbc_camel(f.name) + "Entry", msg);
+      var em: CodecPbcMessage* = codec_pbc_msg(p->set, entry);
+      em->map_entry = true;
+      var key: CodecPbcField = codec_pbc_new_field();
+      key.name = "key";
+      key.number = 1;
+      key.kind = kk;
+      var val: CodecPbcField = codec_pbc_new_field();
+      val.name = "value";
+      val.number = 2;
+      val.kind = codec_pbc_scalar(vt);
+      if (val.kind == 0) { val.type_name = vt; }
+      codec_list_push(&em->fields, key);
+      codec_list_push(&em->fields, val);
+      f.label = CODEC_PBL_REPEATED;
+      f.kind = CODEC_PBT_MESSAGE;
+      f.type_name = em->name;
+      f.ref = entry;
+      return codec_pbc_add_field(p, msg, f);
+    }
+    f.type_name = "map";   // a message type that happens to be named map
+  } else if (codec_pbc_is(&p->x, "group")) {
+    codec_pbc_next(&p->x);
+    var gname: string = codec_pbc_ident(p, "a group name");
+    if (p->set->failed || !codec_pbc_expect(p, "=")) { return false; }
+    var gnum: int64 = 0;
+    if (!codec_pbc_number(p, false, &gnum)) { return false; }
+    if (!codec_pbc_field_options(p, &f) || !codec_pbc_expect(p, "{{")) { return false; }
+    if (p->syntax == 3) { return codec_pbc_err(p, "groups are not allowed in proto3"); }
+    var g: int32 = codec_pbc_new_message(p, gname, msg);
+    if (!codec_pbc_message_body(p, g)) { return false; }
+    f.name = codec_pbc_lower(gname);
+    f.number = (int32)gnum;
+    f.kind = CODEC_PBT_GROUP;
+    f.type_name = gname;
+    f.ref = g;
+    if (label == CODEC_PBL_OPTIONAL || label == CODEC_PBL_REQUIRED) { f.presence = true; }
+    return codec_pbc_add_field(p, msg, f);
+  } else {
+    f.type_name = codec_pbc_type_name(p, "a field type");
+    if (p->set->failed) { return false; }
+  }
+  f.kind = codec_pbc_scalar(f.type_name);
+  f.name = codec_pbc_ident(p, "a field name");
+  if (p->set->failed || !codec_pbc_expect(p, "=")) { return false; }
+  var n: int64 = 0;
+  if (!codec_pbc_number(p, false, &n)) { return false; }
+  f.number = (int32)n;
+  if (!codec_pbc_field_options(p, &f) || !codec_pbc_expect(p, ";")) { return false; }
+  if (p->syntax == 3) {
+    if (label == CODEC_PBL_REQUIRED) { return codec_pbc_err(p, "required fields are not allowed in proto3"); }
+    if (f.has_default) { return codec_pbc_err(p, "default values are not allowed in proto3"); }
+  }
+  if (label == CODEC_PBL_OPTIONAL || label == CODEC_PBL_REQUIRED) { f.presence = true; }
+  if (p->syntax == 3 && label == CODEC_PBL_OPTIONAL) {
+    // proto3 optional: a oneof of its own, as protoc does it.
+    var m: CodecPbcMessage* = codec_pbc_msg(p->set, msg);
+    var o: CodecPbcOneof;
+    o.name = "_" + f.name;
+    o.synthetic = true;
+    codec_list_push(&m->oneofs, o);
+    f.oneof = (int32)(m->oneofs.len - 1);
+  }
+  return codec_pbc_add_field(p, msg, f);
+}
+
+fn codec_pbc_oneof(p: CodecPbcP*, msg: int32) -> bool {
+  codec_pbc_next(&p->x);
+  var o: CodecPbcOneof;
+  o.name = codec_pbc_ident(p, "a oneof name");
+  if (p->set->failed || !codec_pbc_expect(p, "{{")) { return false; }
+  var m: CodecPbcMessage* = codec_pbc_msg(p->set, msg);
+  codec_list_push(&m->oneofs, o);
+  var idx: int32 = (int32)(m->oneofs.len - 1);
+  while (!codec_pbc_is(&p->x, "}")) {
+    if (p->x.kind == CODEC_PBC_EOF) { return codec_pbc_err(p, "unterminated oneof"); }
+    if (codec_pbc_is(&p->x, "option")) {
+      if (!codec_pbc_option_stmt(p)) { return false; }
+    } else if (codec_pbc_is(&p->x, ";")) {
+      codec_pbc_next(&p->x);
+    } else {
+      if (!codec_pbc_field(p, msg, CODEC_PBL_NONE, idx)) { return false; }
+    }
+  }
+  codec_pbc_next(&p->x);
+  return true;
+}
+
+// `extend Foo { ... }`: parsed for errors, then dropped.
+fn codec_pbc_extend(p: CodecPbcP*) -> bool {
+  codec_pbc_next(&p->x);
+  codec_pbc_ident(p, "a message name");
+  if (p->set->failed || !codec_pbc_expect(p, "{{")) { return false; }
+  var depth: int32 = 1;
+  while (depth > 0) {
+    if (p->x.kind == CODEC_PBC_EOF) { return codec_pbc_err(p, "unterminated extend"); }
+    if (codec_pbc_is(&p->x, "{{")) { depth = depth + 1; }
+    if (codec_pbc_is(&p->x, "}")) { depth = depth - 1; }
+    codec_pbc_next(&p->x);
+  }
+  return true;
+}
+
+fn codec_pbc_message_decl(p: CodecPbcP*, parent: int32) -> bool {
+  codec_pbc_next(&p->x);
+  var name: string = codec_pbc_ident(p, "a message name");
+  if (p->set->failed || !codec_pbc_expect(p, "{{")) { return false; }
+  var idx: int32 = codec_pbc_new_message(p, name, parent);
+  return codec_pbc_message_body(p, idx);
+}
+
+// The inside of a message, after `{`, through `}`.
+fn codec_pbc_message_body(p: CodecPbcP*, msg: int32) -> bool {
+  while (true) {
+    if (p->set->failed) { return false; }
+    if (codec_pbc_is(&p->x, "}")) {
+      codec_pbc_next(&p->x);
+      return true;
+    }
+    if (p->x.kind == CODEC_PBC_EOF) { return codec_pbc_err(p, "unterminated message"); }
+    if (codec_pbc_is(&p->x, ";")) {
+      codec_pbc_next(&p->x);
+    } else if (codec_pbc_is(&p->x, "message")) {
+      if (!codec_pbc_message_decl(p, msg)) { return false; }
+    } else if (codec_pbc_is(&p->x, "enum")) {
+      if (!codec_pbc_enum_decl(p, msg)) { return false; }
+    } else if (codec_pbc_is(&p->x, "option")) {
+      if (!codec_pbc_option_stmt(p)) { return false; }
+    } else if (codec_pbc_is(&p->x, "oneof")) {
+      if (!codec_pbc_oneof(p, msg)) { return false; }
+    } else if (codec_pbc_is(&p->x, "reserved") || codec_pbc_is(&p->x, "extensions")) {
+      if (!codec_pbc_ranges(p)) { return false; }
+    } else if (codec_pbc_is(&p->x, "extend")) {
+      if (!codec_pbc_extend(p)) { return false; }
+    } else if (codec_pbc_is(&p->x, "optional")) {
+      codec_pbc_next(&p->x);
+      if (!codec_pbc_field(p, msg, CODEC_PBL_OPTIONAL, -1)) { return false; }
+    } else if (codec_pbc_is(&p->x, "required")) {
+      codec_pbc_next(&p->x);
+      if (!codec_pbc_field(p, msg, CODEC_PBL_REQUIRED, -1)) { return false; }
+    } else if (codec_pbc_is(&p->x, "repeated")) {
+      codec_pbc_next(&p->x);
+      if (!codec_pbc_field(p, msg, CODEC_PBL_REPEATED, -1)) { return false; }
+    } else {
+      if (p->syntax == 2 && !codec_pbc_is(&p->x, "map")) {
+        return codec_pbc_err(p, "proto2 fields need a label: optional, required or repeated");
+      }
+      if (!codec_pbc_field(p, msg, CODEC_PBL_NONE, -1)) { return false; }
+    }
+  }
+  return false;
+}
+
+fn codec_pbc_enum_decl(p: CodecPbcP*, parent: int32) -> bool {
+  codec_pbc_next(&p->x);
+  var e: CodecPbcEnum;
+  e.name = codec_pbc_ident(p, "an enum name");
+  if (p->set->failed || !codec_pbc_expect(p, "{{")) { return false; }
+  e.file = p->file;
+  e.closed = p->syntax == 2;
+  if (parent >= 0) {
+    var pm: CodecPbcMessage* = codec_pbc_msg(p->set, parent);
+    e.full = pm->full + "." + e.name;
+    e.mettle = pm->mettle + "_" + e.name;
+  } else {
+    e.full = e.name;
+    if (p->package.length > 0) { e.full = p->package + "." + e.name; }
+    e.mettle = p->set->prefix + e.name;
+  }
+  while (!codec_pbc_is(&p->x, "}")) {
+    if (p->set->failed) { return false; }
+    if (p->x.kind == CODEC_PBC_EOF) { return codec_pbc_err(p, "unterminated enum"); }
+    if (codec_pbc_is(&p->x, ";")) {
+      codec_pbc_next(&p->x);
+    } else if (codec_pbc_is(&p->x, "option")) {
+      if (!codec_pbc_option_stmt(p)) { return false; }
+    } else if (codec_pbc_is(&p->x, "reserved")) {
+      if (!codec_pbc_ranges(p)) { return false; }
+    } else {
+      var v: CodecPbcEnumValue;
+      v.name = codec_pbc_ident(p, "an enum value name");
+      if (p->set->failed || !codec_pbc_expect(p, "=")) { return false; }
+      var n: int64 = 0;
+      if (!codec_pbc_number(p, true, &n)) { return false; }
+      v.number = (int32)n;
+      var dummy: CodecPbcField = codec_pbc_new_field();
+      if (!codec_pbc_field_options(p, &dummy) || !codec_pbc_expect(p, ";")) { return false; }
+      if (p->syntax == 3 && e.values.len == 0 && v.number != 0) {
+        return codec_pbc_err(p, "the first value of a proto3 enum must be 0");
+      }
+      codec_list_push(&e.values, v);
+    }
+  }
+  codec_pbc_next(&p->x);
+  if (e.values.len == 0) { return codec_pbc_err(p, "enum {e.name} has no values"); }
+  codec_list_push(&p->set->enums, e);
+  return true;
+}
+
+fn codec_pbc_service(p: CodecPbcP*) -> bool {
+  codec_pbc_next(&p->x);
+  var s: CodecPbcService;
+  s.name = codec_pbc_ident(p, "a service name");
+  if (p->set->failed || !codec_pbc_expect(p, "{{")) { return false; }
+  s.file = p->file;
+  s.full = s.name;
+  if (p->package.length > 0) { s.full = p->package + "." + s.name; }
+  s.mettle = p->set->prefix + s.name;
+  while (!codec_pbc_is(&p->x, "}")) {
+    if (p->set->failed) { return false; }
+    if (p->x.kind == CODEC_PBC_EOF) { return codec_pbc_err(p, "unterminated service"); }
+    if (codec_pbc_is(&p->x, ";")) {
+      codec_pbc_next(&p->x);
+    } else if (codec_pbc_is(&p->x, "option")) {
+      if (!codec_pbc_option_stmt(p)) { return false; }
+    } else if (codec_pbc_is(&p->x, "rpc")) {
+      codec_pbc_next(&p->x);
+      var m: CodecPbcMethod;
+      m.in_ref = -1;
+      m.out_ref = -1;
+      m.name = codec_pbc_ident(p, "a method name");
+      if (p->set->failed || !codec_pbc_expect(p, "(")) { return false; }
+      if (codec_pbc_is(&p->x, "stream")) {
+        m.client_stream = true;
+        codec_pbc_next(&p->x);
+      }
+      m.input = codec_pbc_type_name(p, "a request type");
+      if (p->set->failed || !codec_pbc_expect(p, ")") || !codec_pbc_expect(p, "returns") || !codec_pbc_expect(p, "(")) { return false; }
+      if (codec_pbc_is(&p->x, "stream")) {
+        m.server_stream = true;
+        codec_pbc_next(&p->x);
+      }
+      m.output = codec_pbc_type_name(p, "a response type");
+      if (p->set->failed || !codec_pbc_expect(p, ")")) { return false; }
+      if (codec_pbc_is(&p->x, "{{")) {
+        codec_pbc_next(&p->x);
+        while (!codec_pbc_is(&p->x, "}")) {
+          if (p->x.kind == CODEC_PBC_EOF) { return codec_pbc_err(p, "unterminated rpc"); }
+          if (codec_pbc_is(&p->x, ";")) {
+            codec_pbc_next(&p->x);
+          } else if (!codec_pbc_option_stmt(p)) {
+            return false;
+          }
+        }
+        codec_pbc_next(&p->x);
+      } else if (!codec_pbc_expect(p, ";")) {
+        return false;
+      }
+      codec_list_push(&s.methods, m);
+    } else {
+      var t: string = p->x.text;
+      return codec_pbc_err(p, "unexpected '{t}' in service");
+    }
+  }
+  codec_pbc_next(&p->x);
+  codec_list_push(&p->set->services, s);
+  return true;
+}
+
+// Parses file number `file` (its text is already loaded). Imports are
+// recorded in the file's `imports`; the caller loads them.
+export fn codec_pbc_parse(set: CodecPbcSet*, file: int32) -> bool {
+  var p: CodecPbcP;
+  p.set = set;
+  p.file = file;
+  p.syntax = 2;
+  codec_pbc_lex_init(&p.x, set->files.data[file].text);
+  if (codec_pbc_is(&p.x, "syntax") || codec_pbc_is(&p.x, "edition")) {
+    if (codec_pbc_is(&p.x, "edition")) { return codec_pbc_err(&p, "editions are not supported; use proto2 or proto3"); }
+    codec_pbc_next(&p.x);
+    if (!codec_pbc_expect(&p, "=")) { return false; }
+    if (p.x.kind != CODEC_PBC_STRING) { return codec_pbc_err(&p, "expected \"proto2\" or \"proto3\""); }
+    var v: string = codec_pbc_unquote(p.x.text);
+    if (v == "proto3") {
+      p.syntax = 3;
+    } else if (v != "proto2") {
+      return codec_pbc_err(&p, "unknown syntax '{v}'");
+    }
+    codec_pbc_next(&p.x);
+    if (!codec_pbc_expect(&p, ";")) { return false; }
+  }
+  set->files.data[file].syntax = p.syntax;
+  while (p.x.kind != CODEC_PBC_EOF) {
+    if (set->failed) { return false; }
+    if (codec_pbc_is(&p.x, ";")) {
+      codec_pbc_next(&p.x);
+    } else if (codec_pbc_is(&p.x, "package")) {
+      codec_pbc_next(&p.x);
+      p.package = codec_pbc_ident(&p, "a package name");
+      set->files.data[file].package = p.package;
+      if (set->failed || !codec_pbc_expect(&p, ";")) { return false; }
+    } else if (codec_pbc_is(&p.x, "import")) {
+      codec_pbc_next(&p.x);
+      if (codec_pbc_is(&p.x, "public") || codec_pbc_is(&p.x, "weak")) { codec_pbc_next(&p.x); }
+      if (p.x.kind != CODEC_PBC_STRING) { return codec_pbc_err(&p, "expected an import path in quotes"); }
+      var path: string = codec_pbc_unquote(p.x.text);
+      codec_list_push(&set->files.data[file].imports, path);
+      codec_pbc_next(&p.x);
+      if (!codec_pbc_expect(&p, ";")) { return false; }
+    } else if (codec_pbc_is(&p.x, "option")) {
+      if (!codec_pbc_option_stmt(&p)) { return false; }
+    } else if (codec_pbc_is(&p.x, "message")) {
+      if (!codec_pbc_message_decl(&p, -1)) { return false; }
+    } else if (codec_pbc_is(&p.x, "enum")) {
+      if (!codec_pbc_enum_decl(&p, -1)) { return false; }
+    } else if (codec_pbc_is(&p.x, "service")) {
+      if (!codec_pbc_service(&p)) { return false; }
+    } else if (codec_pbc_is(&p.x, "extend")) {
+      if (!codec_pbc_extend(&p)) { return false; }
+    } else {
+      var t: string = p.x.text;
+      return codec_pbc_err(&p, "unexpected '{t}'");
+    }
+  }
+  return !set->failed;
+}

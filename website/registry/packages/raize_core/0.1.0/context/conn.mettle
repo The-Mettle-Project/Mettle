@@ -1,0 +1,141 @@
+// raize/context/conn — RzConn: what a long-lived connection (a Signal or channel
+// socket) keeps from the HTTP request that opened it.
+// reference: views-signals, channels
+// thread: rz__conn_from_ctx runs on the worker that serves the upgrade request; the
+// accessors are any-thread (the copy is immutable); rz__conn_free once, by the owner.
+//
+// A socket outlives its upgrade request, and the request's views die with the
+// request arena, so the hand-off is a deep copy: the Cookie header(s), the peer
+// address text and the user pointer a guard set (A9). P3-C attaches it to Signal
+// and channel members; mount/join callbacks read it through the accessors below.
+
+import "std/mem";
+import "../str/str";
+import "arena";
+import "request";
+import "context";
+import "cookie";
+import "peer";
+
+/// internal: context/conn. The copied fields behind an RzConn.
+export struct Rz_Conn {
+  cookie: string;   // every Cookie header, joined with "; "; owned
+  peer: string;     // rz_ctx_peer at upgrade time, "a.b.c.d"; owned
+  user: rawptr;     // rz_ctx_user at upgrade time; borrowed from the app
+  path: string;     // the page path a Signal socket was opened for (F5); owned, "" if none
+}
+
+/// The request that opened a socket, as a Signal mount or a channel join sees it.
+/// Opaque: read it with rz_conn_cookie, rz_conn_user and rz_conn_peer.
+export struct RzConn {
+  state: Rz_Conn*;  // owned (`impl` is a Mettle keyword)
+}
+
+/// internal: framework/signal, framework/channel (P3-C), on the worker before the
+/// upgrade hand-off. Deep-copies what a socket keeps from its upgrade request.
+/// in:      ctx the upgrade request (after guards ran, so ctx->user is set)
+/// returns: the connection, or 0 when out of memory
+/// owns:    the caller frees it with rz__conn_free
+export fn rz__conn_from_ctx(ctx: RzContext*) -> RzConn* {
+  if (ctx == 0) { return 0; }
+  var c: RzConn* = (RzConn*)calloc(1, sizeof(RzConn));
+  if (c == 0) { return 0; }
+  var d: Rz_Conn* = (Rz_Conn*)calloc(1, sizeof(Rz_Conn));
+  if (d == 0) { free((rawptr)c); return 0; }
+  c->state = d;
+  var b: RzBuf* = rz_buf_new();
+  if (ctx->req != 0) {
+    for i in 0..ctx->req->header_count {
+      if (rz_str_eq_ci(ctx->req->headers[i].name, "cookie")) {
+        if (b->len > 0) { rz_buf_add(b, "; "); }
+        rz_buf_add(b, ctx->req->headers[i].value);
+      }
+    }
+  }
+  d->cookie = rz_str_dup(rz_buf_str(b));
+  rz_buf_free(b);
+  d->peer = rz_str_dup(rz_ctx_peer(ctx));
+  d->user = ctx->user;
+  d->path = rz_str_empty();
+  return c;
+}
+
+/// internal: framework/signal (the Signal socket upgrade and the first-GET render).
+/// Records the page path this connection was opened for (DECISIONS F5).
+/// in:      c the connection; path the page path (already normalized)
+/// returns: nothing
+/// owns:    copies `path`; replaces (and frees) any earlier one
+export fn rz__conn_set_path(c: RzConn*, path: string) {
+  if (c == 0 || c->state == 0) { return; }
+  rz_str_free(c->state->path);
+  c->state->path = rz_str_dup(path);
+}
+
+/// internal: framework/signal, framework/channel (P3-C). Frees a connection copy.
+/// in:      c the connection; 0 is ignored
+/// returns: nothing
+/// owns:    takes `c`; the user pointer is the app's and is not freed
+export fn rz__conn_free(c: RzConn*) {
+  if (c == 0) { return; }
+  if (c->state != 0) {
+    rz_str_free(c->state->cookie);
+    rz_str_free(c->state->peer);
+    rz_str_free(c->state->path);
+    free((rawptr)c->state);
+  }
+  free((rawptr)c);
+}
+
+/// A cookie the browser sent with the request that opened this socket.
+///
+/// in:      c     the connection (passed to a Signal mount or channel join)
+///          name  the cookie name
+/// returns: the value, or "" when absent
+/// owns:    a view into `c`; valid while the socket is open (copy to keep longer)
+/// thread:  any
+/// example:
+///   var sid: string = rz_conn_cookie(c, "sid");
+export fn rz_conn_cookie(c: RzConn*, name: string) -> string {
+  if (c == 0 || c->state == 0) { return rz_str_empty(); }
+  var v: string = rz_str_empty();
+  rz__cookie_find(c->state->cookie, name, &v);
+  return v;
+}
+
+/// The user a guard attached (rz_ctx_set_user) to the request that opened this socket.
+///
+/// in:      c the connection
+/// returns: the pointer, or 0 when no guard set one
+/// owns:    nothing; the app keeps the user alive while the socket is open
+/// thread:  any
+/// example: -
+export fn rz_conn_user(c: RzConn*) -> rawptr {
+  if (c == 0 || c->state == 0) { return 0; }
+  return c->state->user;
+}
+
+/// The client address of the request that opened this socket (rz_ctx_peer rules).
+///
+/// in:      c the connection
+/// returns: "a.b.c.d", or "" when unknown
+/// owns:    a view into `c`; valid while the socket is open
+/// thread:  any
+/// example: -
+export fn rz_conn_peer(c: RzConn*) -> string {
+  if (c == 0 || c->state == 0) { return rz_str_empty(); }
+  return c->state->peer;
+}
+
+/// The page path a Signal socket was opened for (`?path=` on /signal/websocket), or
+/// the request path on a Signal's first-GET render.
+///
+/// in:      c the connection
+/// returns: the path ("/admin"), or "" for a channel socket
+/// owns:    a view into `c`; valid while the socket is open
+/// thread:  any
+/// example:
+///   if (rz_str_eq(rz_conn_path(c), "/admin")) { ... }
+export fn rz_conn_path(c: RzConn*) -> string {
+  if (c == 0 || c->state == 0) { return rz_str_empty(); }
+  return c->state->path;
+}

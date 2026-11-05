@@ -1,0 +1,140 @@
+// Status codes and small math helpers used by every canvas module.
+
+import "std/math" as m;
+
+export const CANVAS_OK: int32 = 0;
+export const CANVAS_E_ARG: int32 = -1;     // a bad argument (null pointer, bad size)
+export const CANVAS_E_MEM: int32 = -2;     // out of memory
+export const CANVAS_E_PARSE: int32 = -3;   // text that does not follow its grammar
+export const CANVAS_E_IO: int32 = -4;      // a file could not be read or written
+export const CANVAS_E_LIMIT: int32 = -5;   // bigger than the limits allow
+export const CANVAS_E_FONT: int32 = -6;    // the font could not be used
+
+/// The largest width or height of a pixmap.
+export const CANVAS_MAX_SIZE: int32 = 32767;
+
+/// A short message for a status code.
+export fn canvas_error_text(rc: int32) -> string {
+  if (rc == CANVAS_OK) { return "ok"; }
+  if (rc == CANVAS_E_ARG) { return "bad argument"; }
+  if (rc == CANVAS_E_MEM) { return "out of memory"; }
+  if (rc == CANVAS_E_PARSE) { return "parse error"; }
+  if (rc == CANVAS_E_IO) { return "file error"; }
+  if (rc == CANVAS_E_LIMIT) { return "too big"; }
+  if (rc == CANVAS_E_FONT) { return "font error"; }
+  return "unknown error";
+}
+
+export const CANVAS_PI: float32 = 3.14159265358979;
+export const CANVAS_TAU: float32 = 6.28318530717959;
+
+@inline export fn canvas_floor_i(x: float32) -> int32 {
+  var i: int32 = (int32)x;
+  if ((float32)i > x) { i = i - 1; }
+  return i;
+}
+
+@inline export fn canvas_ceil_i(x: float32) -> int32 {
+  var i: int32 = (int32)x;
+  if ((float32)i < x) { i = i + 1; }
+  return i;
+}
+
+@inline export fn canvas_absf(x: float32) -> float32 {
+  if (x < 0.0) { return -x; }
+  return x;
+}
+
+@inline export fn canvas_minf(a: float32, b: float32) -> float32 {
+  if (a < b) { return a; }
+  return b;
+}
+
+@inline export fn canvas_maxf(a: float32, b: float32) -> float32 {
+  if (a > b) { return a; }
+  return b;
+}
+
+@inline export fn canvas_clampf(x: float32, lo: float32, hi: float32) -> float32 {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+
+@inline export fn canvas_mini(a: int32, b: int32) -> int32 {
+  if (a < b) { return a; }
+  return b;
+}
+
+@inline export fn canvas_maxi(a: int32, b: int32) -> int32 {
+  if (a > b) { return a; }
+  return b;
+}
+
+/// True for a number that is not NaN or infinite.
+@inline export fn canvas_finite(x: float32) -> bool {
+  var d: float32 = x - x;
+  return d == 0.0;
+}
+
+/// x / 255 rounded, exact for 0 <= x <= 255 * 255.
+@inline export fn canvas_div255(x: uint32) -> uint32 {
+  return ((x + 128) * 257) >> 16;
+}
+
+/// Fast square root for per-pixel work: a bit trick and two Newton steps
+/// (relative error under 1e-6). Returns 0 for x <= 0.
+@inline export fn canvas_fsqrt(x: float32) -> float32 {
+  if (x <= 0.0) { return 0.0; }
+  var v: float32 = x;
+  var bits: uint32 = *(uint32*)&v;
+  bits = (uint32)0x5f3759df - (bits >> 1);
+  var y: float32 = *(float32*)&bits;
+  var half: float32 = x * 0.5;
+  y = y * (1.5 - half * y * y);
+  y = y * (1.5 - half * y * y);
+  return x * y;
+}
+
+/// Exact square root for geometry (not per pixel).
+export fn canvas_sqrt(x: float32) -> float32 {
+  if (x <= 0.0) { return 0.0; }
+  return (float32)m.sqrt((float64)x);
+}
+
+export fn canvas_sin(x: float32) -> float32 { return (float32)m.sin((float64)x); }
+export fn canvas_cos(x: float32) -> float32 { return (float32)m.cos((float64)x); }
+export fn canvas_tan(x: float32) -> float32 { return (float32)m.tan((float64)x); }
+
+export fn canvas_acos(x: float32) -> float32 {
+  var v: float64 = (float64)x;
+  if (v > 1.0) { v = 1.0; }
+  if (v < -1.0) { v = -1.0; }
+  return (float32)m.acos(v);
+}
+
+export fn canvas_atan2(y: float32, x: float32) -> float32 {
+  if (x == 0.0 && y == 0.0) { return 0.0; }
+  return (float32)m.atan2((float64)y, (float64)x);
+}
+
+/// Fast atan2 for per-pixel work, as a fraction of a turn in [0, 1).
+/// The 7th-order polynomial from Skia's raster pipeline (xy_to_unit_angle).
+export fn canvas_turns(y: float32, x: float32) -> float32 {
+  var ax: float32 = canvas_absf(x);
+  var ay: float32 = canvas_absf(y);
+  var mx: float32 = canvas_maxf(ax, ay);
+  if (mx == 0.0) { return 0.0; }
+  var r: float32 = canvas_minf(ax, ay) / mx;
+  var s: float32 = r * r;
+  // atan(r) / (2 pi) on [0, 1]
+  var t: float32 = r * (0.15912117063999176 + s * (-0.05185396969318390 + s * (0.02476101927459240 + s * -0.0070547382347285748)));
+  if (ay > ax) { t = 0.25 - t; }
+  if (x < 0.0) { t = 0.5 - t; }
+  if (y < 0.0) { t = 1.0 - t; }
+  if (t >= 1.0) { t = 0.0; }
+  return t;
+}
+
+export fn canvas_floorf(x: float32) -> float32 { return (float32)m.floor((float64)x); }
+export fn canvas_ceilf(x: float32) -> float32 { return (float32)m.ceil((float64)x); }

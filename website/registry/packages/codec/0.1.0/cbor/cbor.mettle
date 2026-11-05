@@ -1,0 +1,485 @@
+// CBOR (RFC 8949): a writer that uses the preferred serialization (shortest
+// heads, shortest float that keeps the value), and a pull reader like the
+// MessagePack one. WebAuthn and COSE data is CBOR.
+//
+// Reading: each codec_cbor_read gives one data item head. Arrays and maps
+// give a count (-1 for indefinite length, closed by a BREAK item), tags give
+// their number and the tagged item follows. Byte and text strings come back
+// as views into the input; an indefinite-length string arrives as a head
+// with n = -1, its chunks, then BREAK.
+import "codec/core/status";
+import "codec/core/varint";
+import "codec/core/utf8";
+import "codec/core/buf";
+import "codec/core/reader";
+
+export const CODEC_CBOR_UINT = 1;     // `u`
+export const CODEC_CBOR_NINT = 2;     // the value is -1 - `u`; `i` when it fits in int64
+export const CODEC_CBOR_BYTES = 3;    // `data`, or n = -1 for chunks that follow
+export const CODEC_CBOR_TEXT = 4;     // `data` (UTF-8 checked), or n = -1
+export const CODEC_CBOR_ARRAY = 5;    // `n` items, or -1
+export const CODEC_CBOR_MAP = 6;      // `n` pairs, or -1
+export const CODEC_CBOR_TAG = 7;      // tag number in `u`; the tagged item comes next
+export const CODEC_CBOR_SIMPLE = 8;   // simple value in `u` (not false/true/null/undefined)
+export const CODEC_CBOR_FALSE = 9;
+export const CODEC_CBOR_TRUE = 10;
+export const CODEC_CBOR_NULL = 11;
+export const CODEC_CBOR_UNDEFINED = 12;
+export const CODEC_CBOR_FLOAT = 13;   // `f`; `width` is 2, 4 or 8 bytes
+export const CODEC_CBOR_BREAK = 14;   // ends an indefinite-length item
+
+export const CODEC_CBOR_DEPTH = 512;
+
+export struct CodecCborValue {
+  kind: int32;
+  u: uint64;
+  i: int64;
+  f: float64;
+  width: int32;
+  n: int64;
+  data: string;
+}
+
+// ---- Writing --------------------------------------------------------------------
+
+// A head: major type (0..7) and argument, in the shortest form.
+export fn codec_cbor_head(b: CodecBuf*, major: int32, v: uint64) {
+  var p: uint8* = codec_buf_reserve(b, 9);
+  if (p == 0) { return; }
+  var m: int32 = major << 5;
+  if (v < 24) {
+    p[0] = (uint8)(m | (int32)v);
+    b->len = b->len + 1;
+  } else if (v < 256) {
+    p[0] = (uint8)(m | 24);
+    p[1] = (uint8)v;
+    b->len = b->len + 2;
+  } else if (v < 65536) {
+    p[0] = (uint8)(m | 25);
+    codec_put_be16(p + 1, (uint16)v);
+    b->len = b->len + 3;
+  } else if (v < 4294967296) {
+    p[0] = (uint8)(m | 26);
+    codec_put_be32(p + 1, (uint32)v);
+    b->len = b->len + 5;
+  } else {
+    p[0] = (uint8)(m | 27);
+    codec_put_be64(p + 1, v);
+    b->len = b->len + 9;
+  }
+}
+
+export fn codec_cbor_uint(b: CodecBuf*, v: uint64) { codec_cbor_head(b, 0, v); }
+
+export fn codec_cbor_int(b: CodecBuf*, v: int64) {
+  if (v >= 0) {
+    codec_cbor_head(b, 0, (uint64)v);
+  } else {
+    codec_cbor_head(b, 1, (uint64)(-1 - v));
+  }
+}
+
+// A negative integer -1 - m, for values below the int64 range.
+export fn codec_cbor_nint(b: CodecBuf*, m: uint64) { codec_cbor_head(b, 1, m); }
+
+export fn codec_cbor_bytes(b: CodecBuf*, p: uint8*, n: int64) {
+  codec_cbor_head(b, 2, (uint64)n);
+  codec_buf_bytes(b, p, n);
+}
+
+export fn codec_cbor_text(b: CodecBuf*, s: string) {
+  codec_cbor_head(b, 3, (uint64)s.length);
+  codec_buf_string(b, s);
+}
+
+export fn codec_cbor_array(b: CodecBuf*, n: int64) { codec_cbor_head(b, 4, (uint64)n); }
+export fn codec_cbor_map(b: CodecBuf*, n: int64) { codec_cbor_head(b, 5, (uint64)n); }
+export fn codec_cbor_tag(b: CodecBuf*, tag: uint64) { codec_cbor_head(b, 6, tag); }
+
+// Indefinite-length starts (major 2..5); close with codec_cbor_break.
+export fn codec_cbor_begin(b: CodecBuf*, major: int32) { codec_buf_byte(b, (uint8)((major << 5) | 31)); }
+export fn codec_cbor_break(b: CodecBuf*) { codec_buf_byte(b, (uint8)0xff); }
+
+export fn codec_cbor_bool(b: CodecBuf*, v: bool) {
+  if (v) { codec_buf_byte(b, (uint8)0xf5); } else { codec_buf_byte(b, (uint8)0xf4); }
+}
+export fn codec_cbor_null(b: CodecBuf*) { codec_buf_byte(b, (uint8)0xf6); }
+export fn codec_cbor_undefined(b: CodecBuf*) { codec_buf_byte(b, (uint8)0xf7); }
+
+// Simple values 0..19 and 32..255 (20..23 are false/true/null/undefined).
+export fn codec_cbor_simple(b: CodecBuf*, v: int32) {
+  if (v < 0 || v > 255 || (v >= 20 && v < 32)) {
+    if (b->err == CODEC_OK) { b->err = CODEC_ERR_INVALID; }
+    return;
+  }
+  if (v < 24) {
+    codec_buf_byte(b, (uint8)(0xe0 | v));
+  } else {
+    codec_buf_byte(b, (uint8)0xf8);
+    codec_buf_byte(b, (uint8)v);
+  }
+}
+
+// Half-precision bits for f if it is exactly representable, else -1.
+fn codec_cbor_to_half(f: float64) -> int32 {
+  var bits: uint64 = codec_f64_bits(f);
+  var sign: int32 = (int32)(bits >> 48) & 0x8000;
+  var exp: int32 = (int32)((bits >> 52) & 0x7ff);
+  var mant: uint64 = bits & 0xfffffffffffff;
+  if (exp == 0x7ff) {
+    if (mant == 0) { return sign | 0x7c00; }
+    // NaN: keep it only if the payload fits in 10 bits.
+    if ((mant & 0x3ffffffffff) != 0) { return -1; }
+    return sign | 0x7c00 | (int32)(mant >> 42);
+  }
+  if (exp == 0 && mant == 0) { return sign; }
+  if (exp == 0) { return -1; }     // float64 subnormals are far below half range
+  var e: int32 = exp - 1023;
+  if (e > 15 || e < -24) { return -1; }
+  if (e >= -14) {
+    if ((mant & 0x3ffffffffff) != 0) { return -1; }   // low 42 bits must be zero
+    return sign | ((e + 15) << 10) | (int32)(mant >> 42);
+  }
+  // Half subnormal: value = m * 2^-24 with m < 1024.
+  var full: uint64 = mant | ((uint64)1 << 52);
+  var shift: int32 = 42 + (-14 - e);
+  if ((full & (((uint64)1 << (uint64)shift) - 1)) != 0) { return -1; }
+  return sign | (int32)(full >> (uint64)shift);
+}
+
+// A float in the shortest of half, single or double that keeps its value.
+// Every NaN without a payload is written as the canonical 0xf97e00.
+export fn codec_cbor_float(b: CodecBuf*, f: float64) {
+  var p: uint8* = codec_buf_reserve(b, 9);
+  if (p == 0) { return; }
+  if (f != f) {
+    var nb: uint64 = codec_f64_bits(f);
+    if ((nb & 0x7ffffffffffff) == 0) {
+      p[0] = (uint8)0xf9;
+      p[1] = (uint8)0x7e;
+      p[2] = (uint8)0;
+      b->len = b->len + 3;
+      return;
+    }
+  }
+  var h: int32 = codec_cbor_to_half(f);
+  if (h >= 0) {
+    p[0] = (uint8)0xf9;
+    codec_put_be16(p + 1, (uint16)h);
+    b->len = b->len + 3;
+    return;
+  }
+  var s: float32 = (float32)f;
+  if ((float64)s == f) {
+    p[0] = (uint8)0xfa;
+    codec_put_be32(p + 1, codec_f32_bits(s));
+    b->len = b->len + 5;
+    return;
+  }
+  p[0] = (uint8)0xfb;
+  codec_put_be64(p + 1, codec_f64_bits(f));
+  b->len = b->len + 9;
+}
+
+// Floats at a fixed width, when the receiver needs one.
+export fn codec_cbor_float32(b: CodecBuf*, f: float32) {
+  codec_buf_byte(b, (uint8)0xfa);
+  var p: uint8* = codec_buf_reserve(b, 4);
+  if (p == 0) { return; }
+  codec_put_be32(p, codec_f32_bits(f));
+  b->len = b->len + 4;
+}
+export fn codec_cbor_float64(b: CodecBuf*, f: float64) {
+  codec_buf_byte(b, (uint8)0xfb);
+  var p: uint8* = codec_buf_reserve(b, 8);
+  if (p == 0) { return; }
+  codec_put_be64(p, codec_f64_bits(f));
+  b->len = b->len + 8;
+}
+
+// ---- Reading --------------------------------------------------------------------
+
+export fn codec_cbor_half(h: uint16) -> float64 {
+  var x: int32 = (int32)h;
+  var sign: float64 = 1.0;
+  if ((x & 0x8000) != 0) { sign = -1.0; }
+  var e: int32 = (x >> 10) & 31;
+  var m: int32 = x & 1023;
+  if (e == 31) {
+    var bits: uint64 = 0x7ff0000000000000 | ((uint64)m << 42);
+    if ((x & 0x8000) != 0) { bits = bits | 0x8000000000000000; }
+    return codec_bits_f64(bits);
+  }
+  var v: float64 = 0.0;
+  if (e == 0) {
+    v = (float64)m * 0.000000059604644775390625;   // 2^-24
+  } else {
+    v = (float64)(m + 1024);
+    var k: int32 = e - 25;
+    while (k > 0) { v = v * 2.0; k = k - 1; }
+    while (k < 0) { v = v * 0.5; k = k + 1; }
+  }
+  return sign * v;
+}
+
+// Reads the next item head into v. Returns false at the end of input or on an
+// error (r->err says which; CODEC_OK at a clean end).
+export fn codec_cbor_read(r: CodecReader*, v: CodecCborValue*) -> bool {
+  if (r->pos >= r->len) {
+    v->kind = 0;
+    return false;
+  }
+  var ib: int32 = (int32)r->data[r->pos];
+  r->pos = r->pos + 1;
+  var major: int32 = ib >> 5;
+  var ai: int32 = ib & 31;
+  var arg: uint64 = (uint64)ai;
+  var indefinite: bool = false;
+  if (ai == 24) {
+    arg = (uint64)codec_rd_u8(r);
+  } else if (ai == 25) {
+    arg = (uint64)codec_rd_be16(r);
+  } else if (ai == 26) {
+    arg = (uint64)codec_rd_be32(r);
+  } else if (ai == 27) {
+    arg = codec_rd_be64(r);
+  } else if (ai >= 28 && ai <= 30) {
+    codec_rd_fail(r, CODEC_ERR_INVALID);
+    return false;
+  } else if (ai == 31) {
+    indefinite = true;
+  }
+  if (r->err != CODEC_OK) { return false; }
+  v->u = arg;
+  v->n = 0;
+  if (major == 7) {
+    if (ai < 20 || (ai == 24 && arg >= 32)) {
+      if (ai == 24 && arg < 32) {
+        codec_rd_fail(r, CODEC_ERR_INVALID);
+        return false;
+      }
+      v->kind = CODEC_CBOR_SIMPLE;
+      return true;
+    }
+    if (ai == 24) {
+      codec_rd_fail(r, CODEC_ERR_INVALID);   // simple values below 32 must use one byte
+      return false;
+    }
+    switch (ai) {
+      case 20: { v->kind = CODEC_CBOR_FALSE; }
+      case 21: { v->kind = CODEC_CBOR_TRUE; }
+      case 22: { v->kind = CODEC_CBOR_NULL; }
+      case 23: { v->kind = CODEC_CBOR_UNDEFINED; }
+      case 25: { v->kind = CODEC_CBOR_FLOAT; v->width = 2; v->f = codec_cbor_half((uint16)arg); }
+      case 26: { v->kind = CODEC_CBOR_FLOAT; v->width = 4; v->f = (float64)codec_bits_f32((uint32)arg); }
+      case 27: { v->kind = CODEC_CBOR_FLOAT; v->width = 8; v->f = codec_bits_f64(arg); }
+      default: { v->kind = CODEC_CBOR_BREAK; }
+    }
+    return true;
+  }
+  if (indefinite && (major == 0 || major == 1 || major == 6)) {
+    codec_rd_fail(r, CODEC_ERR_INVALID);
+    return false;
+  }
+  switch (major) {
+    case 0: {
+      v->kind = CODEC_CBOR_UINT;
+      v->i = (int64)arg;
+    }
+    case 1: {
+      v->kind = CODEC_CBOR_NINT;
+      v->i = -1 - (int64)arg;   // meaningful only when arg < 2^63
+    }
+    case 6: { v->kind = CODEC_CBOR_TAG; }
+    default: {
+      // 2, 3: strings; 4, 5: arrays and maps.
+      v->kind = CODEC_CBOR_BYTES;
+      if (major == 3) { v->kind = CODEC_CBOR_TEXT; }
+      if (major == 4) { v->kind = CODEC_CBOR_ARRAY; }
+      if (major == 5) { v->kind = CODEC_CBOR_MAP; }
+      if (indefinite) {
+        v->n = -1;
+        return true;
+      }
+      if (arg > (uint64)(r->len - r->pos)) {
+        // Strings need that many bytes; arrays and maps at least one per item.
+        if (major <= 3) {
+          codec_rd_fail(r, CODEC_ERR_TRUNCATED);
+        } else {
+          codec_rd_fail(r, CODEC_ERR_LIMIT);
+        }
+        return false;
+      }
+      v->n = (int64)arg;
+      if (major == 5 && v->n * 2 > r->len - r->pos) {
+        codec_rd_fail(r, CODEC_ERR_LIMIT);
+        return false;
+      }
+      if (major <= 3) {
+        v->data = codec_rd_string(r, v->n);
+        if (major == 3 && !codec_utf8_valid_string(v->data)) {
+          codec_rd_fail(r, CODEC_ERR_UTF8);
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+// Skips one whole data item (nested items, tags and chunks included) and
+// checks it is well-formed: chunks of an indefinite string must be definite
+// strings of the same type, and BREAK may only end an indefinite item.
+export fn codec_cbor_skip(r: CodecReader*, max_depth: int32) -> bool {
+  // Per open level: items left (-1 for indefinite), and the string type for
+  // an indefinite string (0 otherwise).
+  var left: int64[512];
+  var chunk: int32[512];
+  var depth: int32 = 0;
+  var pending: int64 = 1;
+  var want_chunk: int32 = 0;
+  var v: CodecCborValue;
+  while (true) {
+    if (pending == 0) {
+      if (depth == 0) { return true; }
+      depth = depth - 1;
+      pending = left[depth];
+      want_chunk = chunk[depth];
+      continue;
+    }
+    if (!codec_cbor_read(r, &v)) {
+      if (r->err == CODEC_OK) { codec_rd_fail(r, CODEC_ERR_TRUNCATED); }
+      return false;
+    }
+    if (v.kind == CODEC_CBOR_BREAK) {
+      if (pending != -1) {
+        codec_rd_fail(r, CODEC_ERR_INVALID);
+        return false;
+      }
+      pending = 0;
+      continue;
+    }
+    if (want_chunk != 0 && (v.kind != want_chunk || v.n < 0)) {
+      codec_rd_fail(r, CODEC_ERR_INVALID);
+      return false;
+    }
+    if (pending > 0) { pending = pending - 1; }
+    var items: int64 = 0;
+    var open: bool = false;
+    var sub_chunk: int32 = 0;
+    if (v.kind == CODEC_CBOR_ARRAY || v.kind == CODEC_CBOR_MAP) {
+      open = true;
+      items = v.n;
+      if (v.kind == CODEC_CBOR_MAP && v.n > 0) { items = v.n * 2; }
+    } else if ((v.kind == CODEC_CBOR_BYTES || v.kind == CODEC_CBOR_TEXT) && v.n < 0) {
+      open = true;
+      items = -1;
+      sub_chunk = v.kind;
+    } else if (v.kind == CODEC_CBOR_TAG) {
+      open = true;
+      items = 1;
+    }
+    if (open && items != 0) {
+      if (depth >= max_depth || depth >= 512) {
+        codec_rd_fail(r, CODEC_ERR_DEPTH);
+        return false;
+      }
+      left[depth] = pending;
+      chunk[depth] = want_chunk;
+      depth = depth + 1;
+      pending = items;
+      want_chunk = sub_chunk;
+    }
+  }
+  return false;
+}
+
+// Checks that data is exactly one well-formed CBOR item. CODEC_OK or the error.
+export fn codec_cbor_check(data: uint8*, n: int64, max_depth: int32) -> int32 {
+  var r: CodecReader;
+  codec_rd_init(&r, data, n);
+  if (!codec_cbor_skip(&r, max_depth)) { return r.err; }
+  if (!codec_rd_done(&r)) { return CODEC_ERR_INVALID; }
+  return CODEC_OK;
+}
+
+// Typed reads: one item each; another kind fails with CODEC_ERR_TYPE.
+
+fn codec_cbor_want(r: CodecReader*, v: CodecCborValue*) -> bool {
+  if (!codec_cbor_read(r, v)) {
+    if (r->err == CODEC_OK) { codec_rd_fail(r, CODEC_ERR_TRUNCATED); }
+    return false;
+  }
+  return true;
+}
+
+export fn codec_cbor_read_int(r: CodecReader*) -> int64 {
+  var v: CodecCborValue;
+  if (!codec_cbor_want(r, &v)) { return 0; }
+  if ((v.kind == CODEC_CBOR_UINT || v.kind == CODEC_CBOR_NINT) && v.u <= 0x7fffffffffffffff) { return v.i; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return 0;
+}
+
+export fn codec_cbor_read_uint(r: CodecReader*) -> uint64 {
+  var v: CodecCborValue;
+  if (!codec_cbor_want(r, &v)) { return (uint64)0; }
+  if (v.kind == CODEC_CBOR_UINT) { return v.u; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return (uint64)0;
+}
+
+// A definite-length byte string, as a view.
+export fn codec_cbor_read_bytes(r: CodecReader*) -> string {
+  var v: CodecCborValue;
+  var empty: string;
+  if (!codec_cbor_want(r, &v)) { return empty; }
+  if (v.kind == CODEC_CBOR_BYTES && v.n >= 0) { return v.data; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return empty;
+}
+
+// A definite-length text string, as a view (UTF-8 already checked).
+export fn codec_cbor_read_text(r: CodecReader*) -> string {
+  var v: CodecCborValue;
+  var empty: string;
+  if (!codec_cbor_want(r, &v)) { return empty; }
+  if (v.kind == CODEC_CBOR_TEXT && v.n >= 0) { return v.data; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return empty;
+}
+
+// A definite-length array or map header: its count.
+export fn codec_cbor_read_array(r: CodecReader*) -> int64 {
+  var v: CodecCborValue;
+  if (!codec_cbor_want(r, &v)) { return 0; }
+  if (v.kind == CODEC_CBOR_ARRAY && v.n >= 0) { return v.n; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return 0;
+}
+
+export fn codec_cbor_read_map(r: CodecReader*) -> int64 {
+  var v: CodecCborValue;
+  if (!codec_cbor_want(r, &v)) { return 0; }
+  if (v.kind == CODEC_CBOR_MAP && v.n >= 0) { return v.n; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return 0;
+}
+
+export fn codec_cbor_read_bool(r: CodecReader*) -> bool {
+  var v: CodecCborValue;
+  if (!codec_cbor_want(r, &v)) { return false; }
+  if (v.kind == CODEC_CBOR_TRUE) { return true; }
+  if (v.kind != CODEC_CBOR_FALSE) { codec_rd_fail(r, CODEC_ERR_TYPE); }
+  return false;
+}
+
+export fn codec_cbor_read_float(r: CodecReader*) -> float64 {
+  var v: CodecCborValue;
+  if (!codec_cbor_want(r, &v)) { return 0.0; }
+  if (v.kind == CODEC_CBOR_FLOAT) { return v.f; }
+  if (v.kind == CODEC_CBOR_UINT) { return (float64)v.u; }
+  if (v.kind == CODEC_CBOR_NINT && v.u <= 0x7fffffffffffffff) { return (float64)v.i; }
+  codec_rd_fail(r, CODEC_ERR_TYPE);
+  return 0.0;
+}

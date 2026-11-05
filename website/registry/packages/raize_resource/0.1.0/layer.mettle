@@ -1,0 +1,221 @@
+// raize/resource/layer — the data-layer interface and typed access to record fields.
+// reference: data-layers
+// thread: every RzDataLayer operation may be called from any thread; field helpers are
+// pure.
+//
+// Records cross the interface as `rawptr` to a struct the layer's RzResourceDef
+// describes. Only pointers and int64 cross the vtable (indirect calls with string
+// literals or enums by value miscompile today). Inputs are borrowed for the call; the
+// layer copies what it keeps; get/scan copy into the caller's arena and never hand out
+// views into the layer's storage.
+
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/arena";
+import "def";
+
+/// Records returned by a scan: `count` structs back to back, in the caller's arena.
+export struct RzRecords {
+  items: rawptr;   // count records of def->size bytes; arena-owned
+  count: int32;    // number of records
+}
+
+/// A data layer: where one resource's records live. Built by a constructor
+/// (rz_mem_layer_new) with every slot set; freed with rz_data_layer_free.
+export struct RzDataLayer {
+  name: string;                                         // "memory"; static
+  ud: rawptr;                                           // the layer's own state; owned by the layer
+  def: RzResourceDef*;                                  // the one resource stored; static
+  insert: fn(rawptr, rawptr, int64*) -> int32;          // (ud, rec, out id): copies rec, assigns id
+  get: fn(rawptr, int64, rawptr, RzArena*) -> int32;    // (ud, id, out rec, arena)
+  modify: fn(rawptr, int64, fn(rawptr, rawptr) -> int32, rawptr, RzArena*) -> int32; // atomic read-apply-write
+  remove: fn(rawptr, int64) -> int32;                   // (ud, id)
+  scan: fn(rawptr, RzRecords*, RzArena*) -> int32;      // (ud, out, arena): all, id order
+  count: fn(rawptr) -> int32;                           // (ud)
+  close: fn(rawptr) -> void;                            // (ud): frees ud and every kept copy
+}
+
+/// Closes a data layer and frees it, with every record it kept.
+///
+/// in:      dl  a layer from rz_mem_layer_new; 0 is ignored
+/// returns: nothing
+/// owns:    takes `dl`; it is invalid afterwards
+/// thread:  any, once no other thread uses `dl`
+/// example:
+///   rz_data_layer_free(s->todos);
+export fn rz_data_layer_free(dl: RzDataLayer*) {
+  if (dl == 0) { return; }
+  dl->close(dl->ud);
+  free((rawptr)dl);
+}
+
+fn rz__field_at(rec: rawptr, f: RzField*) -> uint8* {
+  return (uint8*)rec + (int64)f->offset;
+}
+
+/// Reads a string field.
+///
+/// in:      rec  a record of the field's resource
+///          f    a field of kind RZ_KIND_STRING
+/// returns: the stored view ("" for another kind)
+/// owns:    nothing; the view borrows the record's string
+/// thread:  any
+/// example: -
+export fn rz_field_get_str(rec: rawptr, f: RzField*) -> string {
+  if (f->kind != RZ_KIND_STRING) { return rz_str_empty(); }
+  var p: string* = (string*)rz__field_at(rec, f);
+  return *p;
+}
+
+/// Writes a string field (the view itself; nothing is copied or freed).
+///
+/// in:      rec  a record
+///          f    a field of kind RZ_KIND_STRING
+///          s    the new value
+/// returns: nothing (ignored for another kind)
+/// owns:    the record keeps the view `s`; the caller decides who owns its bytes
+/// thread:  any
+/// example: -
+export fn rz_field_set_str(rec: rawptr, f: RzField*, s: string) {
+  if (f->kind != RZ_KIND_STRING) { return; }
+  var p: string* = (string*)rz__field_at(rec, f);
+  *p = s;
+}
+
+/// Reads an int32 or int64 field, widened to int64.
+///
+/// in:      rec  a record
+///          f    a field of kind RZ_KIND_INT32 or RZ_KIND_INT64
+/// returns: the value (0 for another kind)
+/// owns:    nothing
+/// thread:  any
+/// example: -
+export fn rz_field_get_int(rec: rawptr, f: RzField*) -> int64 {
+  if (f->kind == RZ_KIND_INT64) { var p: int64* = (int64*)rz__field_at(rec, f); return *p; }
+  if (f->kind == RZ_KIND_INT32) { var q: int32* = (int32*)rz__field_at(rec, f); return (int64)*q; }
+  return 0;
+}
+
+/// Writes an int32 or int64 field (int32 truncates).
+///
+/// in:      rec  a record
+///          f    an integer field
+///          v    the value
+/// returns: nothing (ignored for another kind)
+/// owns:    nothing
+/// thread:  any
+/// example: -
+export fn rz_field_set_int(rec: rawptr, f: RzField*, v: int64) {
+  if (f->kind == RZ_KIND_INT64) { var p: int64* = (int64*)rz__field_at(rec, f); *p = v; }
+  if (f->kind == RZ_KIND_INT32) { var q: int32* = (int32*)rz__field_at(rec, f); *q = (int32)v; }
+}
+
+/// Reads a bool field.
+///
+/// in:      rec  a record
+///          f    a field of kind RZ_KIND_BOOL
+/// returns: the value (false for another kind)
+/// owns:    nothing
+/// thread:  any
+/// example: -
+export fn rz_field_get_bool(rec: rawptr, f: RzField*) -> bool {
+  if (f->kind != RZ_KIND_BOOL) { return false; }
+  var p: uint8* = rz__field_at(rec, f);
+  return *p != 0;
+}
+
+/// Writes a bool field.
+///
+/// in:      rec  a record
+///          f    a field of kind RZ_KIND_BOOL
+///          v    the value
+/// returns: nothing (ignored for another kind)
+/// owns:    nothing
+/// thread:  any
+/// example: -
+export fn rz_field_set_bool(rec: rawptr, f: RzField*, v: bool) {
+  if (f->kind != RZ_KIND_BOOL) { return; }
+  var p: uint8* = rz__field_at(rec, f);
+  if (v) { *p = 1; } else { *p = 0; }
+}
+
+/// Copies record `src` into `dst`, with every string copied into `arena`, so `dst`
+/// stays valid after the source changes or is freed.
+///
+/// in:      def    the records' resource
+///          dst    def->size writable bytes
+///          src    the record to copy; borrowed
+///          arena  receives the string bytes
+/// returns: RZ_OK; RZ_E_USAGE for a 0 argument; RZ_E_NOMEM when the arena is full
+///          (then every string of `dst` is "" or an arena copy, never a view of `src`)
+/// owns:    `dst`'s strings are owned by `arena`
+/// thread:  any (the arena must be the caller's)
+/// example:
+///   rz_record_copy_into(def, out, stored, ctx_arena);
+export fn rz_record_copy_into(def: RzResourceDef*, dst: rawptr, src: rawptr, arena: RzArena*) -> int32 {
+  if (def == 0 || dst == 0 || src == 0 || arena == 0) { return RZ_E_USAGE; }
+  memcpy(dst, src, def->size);
+  rz__record_blank_strings(def, dst);
+  for i in 0..def->nfields {
+    var f: RzField* = &def->fields[i];
+    if (f->kind == RZ_KIND_STRING) {
+      var s: string = rz_field_get_str(src, f);
+      var c: string = rz_str_empty();
+      if (s.length > 0) {
+        c = rz_arena_str(arena, s);
+        if (c.length != s.length) { return RZ_E_NOMEM; }
+      }
+      rz_field_set_str(dst, f, c);
+    }
+  }
+  return RZ_OK;
+}
+
+// Sets every string field of `rec` to "" (the views are dropped, nothing is freed),
+// so a copy that fails half-way never leaves `rec` viewing the source.
+fn rz__record_blank_strings(def: RzResourceDef*, rec: rawptr) {
+  for i in 0..def->nfields {
+    var f: RzField* = &def->fields[i];
+    if (f->kind == RZ_KIND_STRING) { rz_field_set_str(rec, f, rz_str_empty()); }
+  }
+}
+
+/// internal: resource/mem. Copies `src` into `dst` with every string duplicated on
+/// the heap (the layer's own copy).
+/// in:      def  the records' resource
+///          dst  def->size writable bytes
+///          src  the record to copy; borrowed
+/// returns: RZ_OK, or RZ_E_NOMEM (dst then owns the strings copied so far and holds ""
+///          for the rest; it never views `src`)
+/// owns:    `dst`'s strings are heap copies; free them with rz__record_free_strings
+export fn rz__record_own(def: RzResourceDef*, dst: rawptr, src: rawptr) -> int32 {
+  memcpy(dst, src, def->size);
+  rz__record_blank_strings(def, dst);
+  for i in 0..def->nfields {
+    var f: RzField* = &def->fields[i];
+    if (f->kind == RZ_KIND_STRING) {
+      var s: string = rz_field_get_str(src, f);
+      var c: string = rz_str_dup(s);
+      if (c.length != s.length) { rz_str_free(c); return RZ_E_NOMEM; }
+      rz_field_set_str(dst, f, c);
+    }
+  }
+  return RZ_OK;
+}
+
+/// internal: resource/mem. Frees the heap strings of a record made by rz__record_own.
+/// in:      def  the resource
+///          rec  the record
+/// returns: nothing; the string fields are left empty
+/// owns:    frees the record's strings
+export fn rz__record_free_strings(def: RzResourceDef*, rec: rawptr) {
+  for i in 0..def->nfields {
+    var f: RzField* = &def->fields[i];
+    if (f->kind == RZ_KIND_STRING) {
+      var s: string = rz_field_get_str(rec, f);
+      rz_str_free(s);
+      rz_field_set_str(rec, f, rz_str_empty());
+    }
+  }
+}

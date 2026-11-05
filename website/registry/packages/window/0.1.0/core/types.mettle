@@ -1,0 +1,586 @@
+// types: the public data types and the shared state every backend fills in.
+//
+// Backends turn platform events into WindowEvents and hand them to
+// window_push_event, which also keeps each window's input state (keys held,
+// mouse position, size) up to date. So window_key_down() and friends behave
+// the same on every platform.
+import "std/mem";
+import "keys.mettle";
+
+// ---------- event kinds ----------
+export const WINDOW_EV_NONE = 0;
+export const WINDOW_EV_CLOSE = 1;            // the user asked to close the window
+export const WINDOW_EV_RESIZE = 2;           // w, h: new logical size; fb_w, fb_h: pixels
+export const WINDOW_EV_MOVE = 3;             // x, y: new position on the desktop
+export const WINDOW_EV_FOCUS_IN = 4;
+export const WINDOW_EV_FOCUS_OUT = 5;
+export const WINDOW_EV_REDRAW = 6;           // draw now (exposed, or window_request_redraw)
+export const WINDOW_EV_SCALE = 7;            // scale: new content scale (DPI / 96)
+export const WINDOW_EV_MINIMIZE = 8;
+export const WINDOW_EV_MAXIMIZE = 9;
+export const WINDOW_EV_RESTORE = 10;
+export const WINDOW_EV_SHOWN = 11;
+export const WINDOW_EV_HIDDEN = 12;
+export const WINDOW_EV_KEY_DOWN = 20;        // key, scancode, mods, repeat
+export const WINDOW_EV_KEY_UP = 21;
+export const WINDOW_EV_TEXT = 22;            // text/text_len: UTF-8 typed text
+export const WINDOW_EV_PREEDIT = 23;         // text: IME text being composed; cursor: byte offset
+export const WINDOW_EV_MOUSE_MOVE = 30;      // x, y in logical pixels; dx, dy since last move
+export const WINDOW_EV_MOUSE_DOWN = 31;      // button, clicks (1, 2 or 3)
+export const WINDOW_EV_MOUSE_UP = 32;
+export const WINDOW_EV_SCROLL = 33;          // dx, dy: wheel steps (positive dy = away from user)
+export const WINDOW_EV_MOUSE_ENTER = 34;
+export const WINDOW_EV_MOUSE_LEAVE = 35;
+export const WINDOW_EV_RAW_MOTION = 36;      // dx, dy: unaccelerated device motion (relative mode)
+export const WINDOW_EV_DROP_ENTER = 40;      // a drag entered the window; x, y
+export const WINDOW_EV_DROP_MOVE = 41;
+export const WINDOW_EV_DROP_LEAVE = 42;
+export const WINDOW_EV_DROP_FILES = 43;      // data: file paths, one per line (UTF-8)
+export const WINDOW_EV_DROP_TEXT = 44;       // data: dropped text (UTF-8)
+export const WINDOW_EV_CLIPBOARD = 45;       // the clipboard changed owner
+export const WINDOW_EV_GAMEPAD_ADDED = 50;   // pad: gamepad index
+export const WINDOW_EV_GAMEPAD_REMOVED = 51;
+export const WINDOW_EV_GAMEPAD_DOWN = 52;    // pad, button (WINDOW_PAD_*)
+export const WINDOW_EV_GAMEPAD_UP = 53;
+export const WINDOW_EV_GAMEPAD_AXIS = 54;    // pad, axis (WINDOW_AXIS_*), value -1..1 (triggers 0..1)
+export const WINDOW_EV_MONITORS = 60;        // monitors were added, removed or changed
+export const WINDOW_EV_WAKE = 61;            // window_wake() was called
+export const WINDOW_EV_QUIT = 62;            // the display connection was lost
+
+// ---------- mouse buttons ----------
+export const WINDOW_BUTTON_LEFT = 1;
+export const WINDOW_BUTTON_MIDDLE = 2;
+export const WINDOW_BUTTON_RIGHT = 3;
+export const WINDOW_BUTTON_X1 = 4;
+export const WINDOW_BUTTON_X2 = 5;
+
+// ---------- cursors ----------
+export const WINDOW_CURSOR_ARROW = 0;
+export const WINDOW_CURSOR_TEXT = 1;
+export const WINDOW_CURSOR_HAND = 2;
+export const WINDOW_CURSOR_CROSSHAIR = 3;
+export const WINDOW_CURSOR_WAIT = 4;
+export const WINDOW_CURSOR_RESIZE_EW = 5;
+export const WINDOW_CURSOR_RESIZE_NS = 6;
+export const WINDOW_CURSOR_RESIZE_NWSE = 7;
+export const WINDOW_CURSOR_RESIZE_NESW = 8;
+export const WINDOW_CURSOR_MOVE = 9;
+export const WINDOW_CURSOR_NOT_ALLOWED = 10;
+export const WINDOW_CURSOR_COUNT = 11;
+
+// Cursor modes: NORMAL; HIDDEN over the window; LOCKED = hidden, held in the
+// window, and raw relative motion reported (for mouse-look); CONFINED = visible
+// but cannot leave the window.
+export const WINDOW_CURSOR_NORMAL = 0;
+export const WINDOW_CURSOR_HIDDEN = 1;
+export const WINDOW_CURSOR_LOCKED = 2;
+export const WINDOW_CURSOR_CONFINED = 3;
+
+// ---------- backends ----------
+export const WINDOW_BACKEND_AUTO = 0;
+export const WINDOW_BACKEND_X11 = 1;
+export const WINDOW_BACKEND_WAYLAND = 2;
+export const WINDOW_BACKEND_WIN32 = 3;
+export const WINDOW_BACKEND_HEADLESS = 4;
+
+// ---------- fullscreen ----------
+export const WINDOW_WINDOWED = 0;
+export const WINDOW_FULLSCREEN = 1;          // borderless, covers one monitor
+
+const WINDOW_TEXT_MAX = 64;
+
+/// One event. Which fields mean something depends on `kind` (see WINDOW_EV_*).
+export struct WindowEvent {
+  kind: int32;
+  win: Window*;
+  time_us: int64;          // monotonic microseconds
+  key: int32;              // WINDOW_KEY_*: the key the layout says it is
+  scancode: int32;         // WINDOW_KEY_*: the physical key
+  mods: int32;             // WINDOW_MOD_*
+  repeat: bool;
+  button: int32;
+  clicks: int32;
+  x: float64;
+  y: float64;
+  dx: float64;
+  dy: float64;
+  w: int32;
+  h: int32;
+  fb_w: int32;
+  fb_h: int32;
+  scale: float32;
+  text: uint8[64];         // UTF-8, nul-terminated
+  text_len: int32;
+  cursor: int32;
+  pad: int32;
+  axis: int32;
+  value: float32;
+  data: uint8*;            // drop data; valid until the next poll
+  data_len: int64;
+}
+
+/// Settings for window_create. Fill with window_config_default first.
+export struct WindowConfig {
+  title: string;
+  w: int32;                // logical size (scaled by the monitor's scale when hidpi is on)
+  h: int32;
+  x: int32;                // position; WINDOW_POS_CENTER or WINDOW_POS_ANY
+  y: int32;
+  resizable: bool;
+  decorated: bool;
+  visible: bool;
+  focused: bool;
+  floating: bool;          // keep above other windows
+  transparent: bool;       // ask for a visual / surface with alpha
+  maximized: bool;
+  fullscreen: int32;       // WINDOW_WINDOWED or WINDOW_FULLSCREEN
+  monitor: int32;          // monitor index for fullscreen and centering
+  hidpi: bool;             // scale the requested size by the monitor scale
+  min_w: int32; min_h: int32;
+  max_w: int32; max_h: int32;
+  gl_visual: int64;        // X11 only: visual id to create the window with (0 = default)
+  gl_depth: int32;         // X11 only: depth that goes with gl_visual
+  app_id: string;          // X11 WM_CLASS / Wayland app_id
+}
+
+export const WINDOW_POS_ANY = -2147483647;
+export const WINDOW_POS_CENTER = -2147483646;
+
+/// A monitor. Positions and sizes are in desktop pixels.
+export struct WindowMonitor {
+  x: int32; y: int32; w: int32; h: int32;
+  work_x: int32; work_y: int32; work_w: int32; work_h: int32;
+  mm_w: int32; mm_h: int32;     // physical size in millimetres (0 when unknown)
+  refresh_mhz: int32;           // refresh rate in millihertz (60000 = 60 Hz)
+  scale: float32;
+  primary: bool;
+  name: uint8[64];
+  name_len: int32;
+  id: int64;                    // backend id (RandR output, wl_output name, HMONITOR)
+}
+
+/// Native handles for graphics APIs (see docs/glint.md).
+export struct WindowNative {
+  backend: int32;               // WINDOW_BACKEND_*
+  x11_window: int64;            // X11 window id
+  x11_visual: int64;
+  x11_screen: int32;
+  display_name: uint8[64];      // X11 DISPLAY string, nul-terminated
+  wl_display: rawptr;           // Wayland: 0 (the pure-Mettle client has no libwayland object)
+  wl_surface_id: int64;         // Wayland: object id of the wl_surface
+  hwnd: int64;                  // Win32
+  hinstance: int64;
+}
+
+/// A window. Read fields through the window_* functions.
+export struct Window {
+  id: int64;
+  plat: rawptr;                 // backend data
+  user: rawptr;                 // yours
+  x: int32; y: int32;
+  w: int32; h: int32;           // logical size
+  fb_w: int32; fb_h: int32;     // pixel size
+  scale: float32;
+  focused: bool;
+  visible: bool;
+  minimized: bool;
+  maximized: bool;
+  hovered: bool;
+  fullscreen: int32;
+  should_close: bool;
+  closed: bool;
+  cursor_mode: int32;
+  cursor_shape: int32;
+  text_input: bool;
+  redraw: bool;
+  mouse_x: float64; mouse_y: float64;
+  buttons: int32;               // bit (1 << button) per held button
+  mods: int32;
+  keys: bool[256];              // by scancode
+  key_layout: bool[256];        // by layout key
+  last_click_us: int64;
+  last_click_button: int32;
+  last_click_x: float64; last_click_y: float64;
+  clicks: int32;
+  dead_key: int64;              // pending dead keysym (0 = none)
+  next: Window*;
+}
+
+export struct WindowSys {
+  backend: int32;
+  ready: bool;
+  windows: Window*;
+  next_id: int64;
+  q: WindowEvent*;
+  q_head: int64;
+  q_tail: int64;
+  q_cap: int64;
+  drop_data: uint8*;            // freed on the next poll
+  error: uint8[256];
+  error_len: int64;
+  wake_fd: int64;
+  double_click_us: int64;
+  monitors: WindowMonitor*;
+  monitor_count: int32;
+  display_name: uint8[128];     // set by window_set_display; empty = from the environment
+  display_len: int64;
+}
+
+export var g_window: WindowSys;
+
+// ---------- errors ----------
+/// Records why the last call failed. window_error() returns it.
+export fn window_set_error(msg: string) {
+  var n: int64 = (int64)msg.length;
+  if (n > 255) { n = 255; }
+  for i: int64 in 0..n { g_window.error[i] = msg.chars[i]; }
+  g_window.error[n] = (uint8)0;
+  g_window.error_len = n;
+}
+
+/// Why the last call that can fail failed ("" when none did).
+export fn window_error() -> string {
+  var s: string; s.chars = &g_window.error[0]; s.length = (uint64)g_window.error_len;
+  return s;
+}
+
+// ---------- UTF-8 ----------
+/// Writes code point cp as UTF-8 at out; returns the byte count (0 for an invalid point).
+export fn window_utf8_encode(cp: uint32, out: uint8*) -> int32 {
+  var c: int64 = (int64)cp;
+  if (c < 0x80) { out[0] = (uint8)c; return 1; }
+  if (c < 0x800) { out[0] = (uint8)(0xC0 | (c >> 6)); out[1] = (uint8)(0x80 | (c & 63)); return 2; }
+  if (c >= 0xD800 && c <= 0xDFFF) { return 0; }
+  if (c < 0x10000) {
+    out[0] = (uint8)(0xE0 | (c >> 12)); out[1] = (uint8)(0x80 | ((c >> 6) & 63)); out[2] = (uint8)(0x80 | (c & 63));
+    return 3;
+  }
+  if (c < 0x110000) {
+    out[0] = (uint8)(0xF0 | (c >> 18)); out[1] = (uint8)(0x80 | ((c >> 12) & 63));
+    out[2] = (uint8)(0x80 | ((c >> 6) & 63)); out[3] = (uint8)(0x80 | (c & 63));
+    return 4;
+  }
+  return 0;
+}
+
+/// Length of the longest prefix of s[0..n) that is whole, valid UTF-8.
+export fn window_utf8_valid_prefix(s: uint8*, n: int64) -> int64 {
+  var i: int64 = 0;
+  while (i < n) {
+    var b: int64 = (int64)s[i];
+    var need: int64 = 0;
+    var lo: int64 = 0;
+    var cp: int64 = 0;
+    if (b < 0x80) { i = i + 1; continue; }
+    if (b >= 0xC2 && b <= 0xDF) { need = 1; cp = b & 31; lo = 0x80; }
+    else if (b >= 0xE0 && b <= 0xEF) { need = 2; cp = b & 15; lo = 0x800; }
+    else if (b >= 0xF0 && b <= 0xF4) { need = 3; cp = b & 7; lo = 0x10000; }
+    else { return i; }
+    for k: int64 in 1..need + 1 {
+      if (i + k >= n) { return i; }
+      var c: int64 = (int64)s[i + k];
+      if ((c & 0xC0) != 0x80) { return i; }
+      cp = (cp << 6) | (c & 63);
+    }
+    if (cp < lo || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { return i; }
+    i = i + need + 1;
+  }
+  return n;
+}
+
+// ---------- event queue ----------
+fn q_grow() {
+  var cap: int64 = g_window.q_cap * 2;
+  if (cap < 256) { cap = 256; }
+  var nq: WindowEvent* = (WindowEvent*)malloc(cap * (int64)sizeof(WindowEvent));
+  var n: int64 = g_window.q_tail - g_window.q_head;
+  for i: int64 in 0..n { nq[i] = g_window.q[(g_window.q_head + i) % g_window.q_cap]; }
+  if (g_window.q != 0) { free(g_window.q); }
+  g_window.q = nq;
+  g_window.q_head = 0;
+  g_window.q_tail = n;
+  g_window.q_cap = cap;
+}
+
+fn q_put(ev: WindowEvent*) {
+  if (g_window.q_cap == 0 || g_window.q_tail - g_window.q_head >= g_window.q_cap) {
+    if (g_window.q_cap >= 65536) { return; }          // a stalled app: drop rather than grow forever
+    q_grow();
+  }
+  g_window.q[g_window.q_tail % g_window.q_cap] = *ev;
+  g_window.q_tail = g_window.q_tail + 1;
+}
+
+/// Takes the oldest queued event; false when the queue is empty.
+export fn window_queue_pop(ev: WindowEvent*) -> bool {
+  if (g_window.q_head == g_window.q_tail) { return false; }
+  *ev = g_window.q[g_window.q_head % g_window.q_cap];
+  g_window.q_head = g_window.q_head + 1;
+  return true;
+}
+
+export fn window_queue_len() -> int64 { return g_window.q_tail - g_window.q_head; }
+
+/// Sets an event's text to the UTF-8 bytes s[0..n) (cut at a whole character).
+export fn window_event_set_text(ev: WindowEvent*, s: uint8*, n: int64) {
+  var m: int64 = n;
+  if (m > WINDOW_TEXT_MAX - 1) { m = WINDOW_TEXT_MAX - 1; }
+  m = window_utf8_valid_prefix(s, m);
+  for i: int64 in 0..m { ev->text[i] = s[i]; }
+  ev->text[m] = (uint8)0;
+  ev->text_len = (int32)m;
+}
+
+fn mods_from_keys(w: Window*) -> int32 {
+  var m: int32 = w->mods & (WINDOW_MOD_CAPS_LOCK | WINDOW_MOD_NUM_LOCK | WINDOW_MOD_ALTGR);
+  if (w->keys[WINDOW_KEY_LEFT_SHIFT] || w->keys[WINDOW_KEY_RIGHT_SHIFT]) { m = m | WINDOW_MOD_SHIFT; }
+  if (w->keys[WINDOW_KEY_LEFT_CTRL] || w->keys[WINDOW_KEY_RIGHT_CTRL]) { m = m | WINDOW_MOD_CTRL; }
+  if (w->keys[WINDOW_KEY_LEFT_ALT] || w->keys[WINDOW_KEY_RIGHT_ALT]) { m = m | WINDOW_MOD_ALT; }
+  if (w->keys[WINDOW_KEY_LEFT_SUPER] || w->keys[WINDOW_KEY_RIGHT_SUPER]) { m = m | WINDOW_MOD_SUPER; }
+  return m;
+}
+
+/// Queues an event and updates the window's state from it. Backends call this.
+export fn window_push_event(ev: WindowEvent*) {
+  if (ev->time_us == 0) { ev->time_us = window_now_us(); }
+  var w: Window* = ev->win;
+  if (w != 0) {
+    switch (ev->kind) {
+      case WINDOW_EV_CLOSE: { w->should_close = true; }
+      case WINDOW_EV_RESIZE: {
+        if (ev->w == w->w && ev->h == w->h && ev->fb_w == w->fb_w && ev->fb_h == w->fb_h) { return; }
+        w->w = ev->w; w->h = ev->h; w->fb_w = ev->fb_w; w->fb_h = ev->fb_h;
+      }
+      case WINDOW_EV_MOVE: {
+        if ((int32)ev->x == w->x && (int32)ev->y == w->y) { return; }
+        w->x = (int32)ev->x; w->y = (int32)ev->y;
+      }
+      case WINDOW_EV_FOCUS_IN: {
+        if (w->focused) { return; }
+        w->focused = true;
+      }
+      case WINDOW_EV_FOCUS_OUT: {
+        if (!w->focused) { return; }
+        w->focused = false;
+        // Release everything held, so no key stays stuck while another window has focus.
+        for k in 0..256 {
+          if (w->keys[k]) {
+            var up: WindowEvent;
+            up.kind = WINDOW_EV_KEY_UP; up.win = w; up.scancode = (int32)k; up.key = (int32)k;
+            up.time_us = ev->time_us;
+            w->keys[k] = false;
+            q_put(&up);
+          }
+          w->key_layout[k] = false;
+        }
+        w->mods = mods_from_keys(w);
+        w->buttons = 0;
+        w->dead_key = 0;
+      }
+      case WINDOW_EV_SCALE: {
+        if (ev->scale == w->scale) { return; }
+        w->scale = ev->scale;
+      }
+      case WINDOW_EV_MINIMIZE: { w->minimized = true; }
+      case WINDOW_EV_MAXIMIZE: { w->maximized = true; w->minimized = false; }
+      case WINDOW_EV_RESTORE: { w->maximized = false; w->minimized = false; }
+      case WINDOW_EV_SHOWN: { w->visible = true; }
+      case WINDOW_EV_HIDDEN: { w->visible = false; }
+      case WINDOW_EV_KEY_DOWN: {
+        if (ev->scancode > 0 && ev->scancode < 256) {
+          if (w->keys[ev->scancode] && !ev->repeat) { ev->repeat = true; }
+          w->keys[ev->scancode] = true;
+        }
+        if (ev->key > 0 && ev->key < 256) { w->key_layout[ev->key] = true; }
+        w->mods = mods_from_keys(w) | (ev->mods & (WINDOW_MOD_CAPS_LOCK | WINDOW_MOD_NUM_LOCK | WINDOW_MOD_ALTGR));
+        ev->mods = w->mods;
+      }
+      case WINDOW_EV_KEY_UP: {
+        if (ev->scancode > 0 && ev->scancode < 256) {
+          if (!w->keys[ev->scancode]) { return; }       // never report an up without a down
+          w->keys[ev->scancode] = false;
+        }
+        if (ev->key > 0 && ev->key < 256) { w->key_layout[ev->key] = false; }
+        w->mods = mods_from_keys(w) | (ev->mods & (WINDOW_MOD_CAPS_LOCK | WINDOW_MOD_NUM_LOCK | WINDOW_MOD_ALTGR));
+        ev->mods = w->mods;
+      }
+      case WINDOW_EV_MOUSE_MOVE: {
+        ev->dx = ev->x - w->mouse_x;
+        ev->dy = ev->y - w->mouse_y;
+        w->mouse_x = ev->x; w->mouse_y = ev->y;
+        // Coalesce: a move right after a move replaces it (keeps the queue short on fast mice).
+        if (g_window.q_tail > g_window.q_head) {
+          var last: WindowEvent* = &g_window.q[(g_window.q_tail - 1) % g_window.q_cap];
+          if (last->kind == WINDOW_EV_MOUSE_MOVE && last->win == w) {
+            ev->dx = ev->dx + last->dx; ev->dy = ev->dy + last->dy;
+            *last = *ev;
+            return;
+          }
+        }
+      }
+      case WINDOW_EV_MOUSE_DOWN: {
+        if (ev->button > 0 && ev->button < 31) { w->buttons = w->buttons | (1 << ev->button); }
+        var near: bool = ev->x - w->last_click_x < 4.0 && w->last_click_x - ev->x < 4.0 && ev->y - w->last_click_y < 4.0 && w->last_click_y - ev->y < 4.0;
+        if (ev->button == w->last_click_button && ev->time_us - w->last_click_us < g_window.double_click_us && near) {
+          w->clicks = w->clicks + 1;
+          if (w->clicks > 3) { w->clicks = 1; }
+        } else {
+          w->clicks = 1;
+        }
+        w->last_click_us = ev->time_us; w->last_click_button = ev->button;
+        w->last_click_x = ev->x; w->last_click_y = ev->y;
+        ev->clicks = w->clicks;
+        w->mouse_x = ev->x; w->mouse_y = ev->y;
+      }
+      case WINDOW_EV_MOUSE_UP: {
+        if (ev->button > 0 && ev->button < 31) { w->buttons = w->buttons & ~(1 << ev->button); }
+        ev->clicks = w->clicks;
+      }
+      case WINDOW_EV_MOUSE_ENTER: { w->hovered = true; w->mouse_x = ev->x; w->mouse_y = ev->y; }
+      case WINDOW_EV_MOUSE_LEAVE: { w->hovered = false; }
+      case WINDOW_EV_REDRAW: {
+        // One pending redraw per window is enough.
+        for i: int64 in g_window.q_head..g_window.q_tail {
+          var e: WindowEvent* = &g_window.q[i % g_window.q_cap];
+          if (e->kind == WINDOW_EV_REDRAW && e->win == w) { return; }
+        }
+        w->redraw = false;
+      }
+      default: { }
+    }
+    if (ev->mods == 0) { ev->mods = w->mods; }
+  }
+  q_put(ev);
+}
+
+/// Pushes a TEXT event with code point cp, handling a pending dead key.
+export fn window_push_codepoint(w: Window*, cp: uint32, ks: int64, mods: int32) {
+  if (window_keysym_is_dead(ks)) {
+    if (w->dead_key != 0) {
+      // Two dead keys: type the first one's own character.
+      var sp: uint32 = window_dead_spacing(w->dead_key);
+      w->dead_key = 0;
+      if (sp != (uint32)0) { window_push_codepoint(w, sp, 0, mods); }
+    }
+    w->dead_key = ks;
+    return;
+  }
+  var out: uint32 = cp;
+  if (w->dead_key != 0) {
+    var d: int64 = w->dead_key;
+    w->dead_key = 0;
+    var c: uint32 = window_dead_compose(d, cp);
+    if (c != (uint32)0) { out = c; }
+    else {
+      var sp: uint32 = window_dead_spacing(d);
+      if (sp != (uint32)0 && cp != (uint32)32) { window_push_codepoint(w, sp, 0, mods); }
+      if (cp == (uint32)32 && sp != (uint32)0) { out = sp; }
+    }
+  }
+  if (out < (uint32)32 || out == (uint32)127) { return; }
+  var ev: WindowEvent;
+  ev.kind = WINDOW_EV_TEXT; ev.win = w; ev.mods = mods;
+  var b: uint8[4];
+  var n: int32 = window_utf8_encode(out, &b[0]);
+  if (n == 0) { return; }
+  window_event_set_text(&ev, &b[0], (int64)n);
+  window_push_event(&ev);
+}
+
+// ---------- window list ----------
+export fn window_link(w: Window*) {
+  g_window.next_id = g_window.next_id + 1;
+  w->id = g_window.next_id;
+  w->next = g_window.windows;
+  g_window.windows = w;
+}
+
+export fn window_unlink(w: Window*) {
+  var pp: Window** = &g_window.windows;
+  while (*pp != 0) {
+    if (*pp == w) { *pp = w->next; return; }
+    var cur: Window* = *pp;
+    pp = &cur->next;
+  }
+}
+
+/// Drops queued events for a window that is going away.
+export fn window_queue_forget(w: Window*) {
+  for i: int64 in g_window.q_head..g_window.q_tail {
+    var e: WindowEvent* = &g_window.q[i % g_window.q_cap];
+    if (e->win == w) { e->kind = WINDOW_EV_NONE; e->win = (Window*)0; }
+  }
+}
+
+// ---------- monitors ----------
+/// Replaces the monitor list (backends call this). Takes ownership of `list`.
+export fn window_set_monitors(list: WindowMonitor*, n: int32) {
+  if (g_window.monitors != 0) { free(g_window.monitors); }
+  g_window.monitors = list;
+  g_window.monitor_count = n;
+}
+
+/// A malloc'd byte buffer.
+export struct WindowBytes { data: uint8*; len: int64; }
+
+// ---------- text/uri-list ----------
+fn hexval(c: int64) -> int64 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return -1;
+}
+
+/// Turns a text/uri-list (RFC 2483) into local paths, one per line; non-file
+/// URIs are kept as they are. Returns the output length (out has room for n + 1).
+export fn window_uri_list_to_paths(s: uint8*, n: int64, out: uint8*) -> int64 {
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var j: int64 = i;
+    while (j < n && s[j] != (uint8)10 && s[j] != (uint8)13) { j = j + 1; }
+    var a: int64 = i;
+    var b: int64 = j;
+    i = j;
+    while (i < n && (s[i] == (uint8)10 || s[i] == (uint8)13)) { i = i + 1; }
+    if (b <= a || s[a] == (uint8)35) { continue; }      // empty or a # comment
+    var file: bool = b - a >= 7 && s[a] == (uint8)102 && s[a + 1] == (uint8)105 && s[a + 2] == (uint8)108 && s[a + 3] == (uint8)101 && s[a + 4] == (uint8)58;
+    if (file) {
+      a = a + 5;                                         // "file:"
+      if (b - a >= 2 && s[a] == (uint8)47 && s[a + 1] == (uint8)47) {
+        a = a + 2;                                       // "//host"
+        while (a < b && s[a] != (uint8)47) { a = a + 1; }
+      }
+    }
+    if (o > 0) { out[o] = (uint8)10; o = o + 1; }
+    var k: int64 = a;
+    while (k < b) {
+      var c: int64 = (int64)s[k];
+      if (file && c == 37 && k + 2 < b && hexval((int64)s[k + 1]) >= 0 && hexval((int64)s[k + 2]) >= 0) {
+        out[o] = (uint8)(hexval((int64)s[k + 1]) * 16 + hexval((int64)s[k + 2]));
+        k = k + 3;
+      } else {
+        out[o] = (uint8)c;
+        k = k + 1;
+      }
+      o = o + 1;
+    }
+  }
+  out[o] = (uint8)0;
+  return o;
+}
+
+// ---------- small byte helpers shared by the backends (little-endian) ----------
+export fn window_rd16(b: uint8*, o: int64) -> int64 { return (int64)b[o] | ((int64)b[o + 1] << 8); }
+export fn window_rd32(b: uint8*, o: int64) -> int64 {
+  return (int64)b[o] | ((int64)b[o + 1] << 8) | ((int64)b[o + 2] << 16) | ((int64)b[o + 3] << 24);
+}
+export fn window_rds16(b: uint8*, o: int64) -> int64 { var v: int64 = window_rd16(b, o); if (v >= 32768) { v = v - 65536; } return v; }
+export fn window_rds32(b: uint8*, o: int64) -> int64 { var v: int64 = window_rd32(b, o); if (v >= 2147483648) { v = v - 4294967296; } return v; }
+export fn window_wr16(b: uint8*, o: int64, v: int64) { b[o] = (uint8)(v & 255); b[o + 1] = (uint8)((v >> 8) & 255); }
+export fn window_wr32(b: uint8*, o: int64, v: int64) {
+  b[o] = (uint8)(v & 255); b[o + 1] = (uint8)((v >> 8) & 255);
+  b[o + 2] = (uint8)((v >> 16) & 255); b[o + 3] = (uint8)((v >> 24) & 255);
+}
+export fn window_pad4(n: int64) -> int64 { return (n + 3) & ~3; }
+export fn window_zero(b: uint8*, n: int64) { for i: int64 in 0..n { b[i] = (uint8)0; } }

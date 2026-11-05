@@ -1,0 +1,338 @@
+// x11/ext: the X extensions window uses, each optional.
+//   XKEYBOARD 1.0 ("The X Keyboard Extension: Protocol Specification"): detectable auto-repeat.
+//   RANDR 1.5 ("The X Resize, Rotate and Reflect Extension"): monitors and their changes.
+//   XInputExtension 2.0 ("The X Input Extension, Version 2"): raw mouse motion for pointer lock.
+//   RENDER 0.11 ("The X Rendering Extension"): full-colour cursors.
+import "std/mem";
+import "../core/types.mettle";
+import "wire.mettle";
+
+export fn window_x11_ext_init() {
+  var ev: int64 = 0;
+  // XKB: UseExtension, then PerClientFlags(DetectableAutoRepeat) so a held key
+  // sends only presses.
+  g_x11.xkb_major = window_x11_query_extension("XKEYBOARD", &ev);
+  g_x11.xkb_event = ev;
+  if (g_x11.xkb_major != 0) {
+    var r: uint8[8];
+    window_x11_req(&r[0], g_x11.xkb_major, 0, 8);
+    window_wr16(&r[0], 4, 1); window_wr16(&r[0], 6, 0);
+    var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 8));
+    if (p != 0 && p[1] != (uint8)0) {
+      free(p);
+      var f: uint8[28];
+      window_x11_req(&f[0], g_x11.xkb_major, 21, 28);
+      window_wr16(&f[0], 4, 0x100);                    // XkbUseCoreKbd
+      window_wr32(&f[0], 8, 1); window_wr32(&f[0], 12, 1);
+      var q: uint8* = window_x11_wait_reply(window_x11_send(&f[0], 28));
+      if (q != 0) {
+        g_x11.xkb_ok = (window_rd32(q, 12) & 1) != 0;
+        free(q);
+      }
+    } else if (p != 0) { free(p); }
+  }
+  // RandR 1.2 or newer.
+  g_x11.randr_major = window_x11_query_extension("RANDR", &ev);
+  g_x11.randr_event = ev;
+  if (g_x11.randr_major != 0) {
+    var r2: uint8[12];
+    window_x11_req(&r2[0], g_x11.randr_major, 0, 12);
+    window_wr32(&r2[0], 4, 1); window_wr32(&r2[0], 8, 5);
+    var p2: uint8* = window_x11_wait_reply(window_x11_send(&r2[0], 12));
+    if (p2 != 0) {
+      var maj: int64 = window_rd32(p2, 8);
+      var mnr: int64 = window_rd32(p2, 12);
+      free(p2);
+      g_x11.randr_ok = maj > 1 || (maj == 1 && mnr >= 2);
+    }
+    if (g_x11.randr_ok) {
+      var s: uint8[12];
+      window_x11_req(&s[0], g_x11.randr_major, 4, 12);   // RRSelectInput
+      window_wr32(&s[0], 4, g_x11.root); window_wr16(&s[0], 8, 1 | 2 | 4);
+      window_x11_send(&s[0], 12);
+    }
+  }
+  // XInput 2.0.
+  g_x11.xi_opcode = window_x11_query_extension("XInputExtension", &ev);
+  if (g_x11.xi_opcode != 0) {
+    var r3: uint8[8];
+    window_x11_req(&r3[0], g_x11.xi_opcode, 47, 8);
+    window_wr16(&r3[0], 4, 2); window_wr16(&r3[0], 6, 0);
+    var p3: uint8* = window_x11_wait_reply(window_x11_send(&r3[0], 8));
+    if (p3 != 0) { g_x11.xi_ok = window_rd16(p3, 8) >= 2; free(p3); }
+  }
+  // RENDER: find the ARGB32 picture format for cursors.
+  g_x11.render_major = window_x11_query_extension("RENDER", &ev);
+  if (g_x11.render_major != 0) {
+    var r4: uint8[12];
+    window_x11_req(&r4[0], g_x11.render_major, 0, 12);
+    window_wr32(&r4[0], 4, 0); window_wr32(&r4[0], 8, 11);
+    var p4: uint8* = window_x11_wait_reply(window_x11_send(&r4[0], 12));
+    if (p4 != 0) { free(p4); }
+    var r5: uint8[4];
+    window_x11_req(&r5[0], g_x11.render_major, 1, 4);
+    var p5: uint8* = window_x11_wait_reply(window_x11_send(&r5[0], 4));
+    if (p5 != 0) {
+      var plen: int64 = window_x11_reply_len(p5);
+      var nf: int64 = window_rd32(p5, 8);
+      for i: int64 in 0..nf {
+        var o: int64 = 32 + i * 28;
+        if (o + 28 > plen) { break; }
+        var direct: bool = p5[o + 4] == (uint8)1 && p5[o + 5] == (uint8)32;
+        var argb: bool = window_rd16(p5, o + 8) == 16 && window_rd16(p5, o + 10) == 255 && window_rd16(p5, o + 12) == 8 && window_rd16(p5, o + 14) == 255 && window_rd16(p5, o + 16) == 0 && window_rd16(p5, o + 18) == 255 && window_rd16(p5, o + 20) == 24 && window_rd16(p5, o + 22) == 255;
+        if (direct && argb) { g_x11.argb_format = window_rd32(p5, o); break; }
+      }
+      free(p5);
+    }
+    g_x11.render_ok = g_x11.argb_format != 0;
+  }
+}
+
+// ---------- monitors (RandR) ----------
+fn work_area(out: int64*) -> bool {
+  if (g_x11.a_workarea == 0) { return false; }
+  var b: WindowBytes; var ty: int64 = 0; var fmt: int64 = 0;
+  if (!window_x11_get_property(g_x11.root, g_x11.a_workarea, false, &b, &ty, &fmt)) { return false; }
+  var ok: bool = fmt == 32 && b.len >= 16;
+  if (ok) { for i: int64 in 0..4 { out[i] = window_rds32(b.data, i * 4); } }
+  free(b.data);
+  return ok;
+}
+
+fn fill_work(m: WindowMonitor*, wa: int64*, have: bool) {
+  m->work_x = m->x; m->work_y = m->y; m->work_w = m->w; m->work_h = m->h;
+  if (!have) { return; }
+  var x0: int64 = (int64)m->x; var y0: int64 = (int64)m->y;
+  var x1: int64 = x0 + (int64)m->w; var y1: int64 = y0 + (int64)m->h;
+  if (wa[0] > x0) { x0 = wa[0]; }
+  if (wa[1] > y0) { y0 = wa[1]; }
+  if (wa[0] + wa[2] < x1) { x1 = wa[0] + wa[2]; }
+  if (wa[1] + wa[3] < y1) { y1 = wa[1] + wa[3]; }
+  if (x1 <= x0 || y1 <= y0) { return; }
+  m->work_x = (int32)x0; m->work_y = (int32)y0; m->work_w = (int32)(x1 - x0); m->work_h = (int32)(y1 - y0);
+}
+
+fn whole_screen() {
+  var m: WindowMonitor* = (WindowMonitor*)malloc((int64)sizeof(WindowMonitor));
+  var z: WindowMonitor;
+  *m = z;
+  m->w = (int32)g_x11.screen_w; m->h = (int32)g_x11.screen_h;
+  m->mm_w = (int32)g_x11.screen_mm_w; m->mm_h = (int32)g_x11.screen_mm_h;
+  m->scale = g_x11.scale; m->primary = true; m->refresh_mhz = 60000;
+  var name: string = "screen";
+  for i in 0..6 { m->name[i] = name.chars[i]; }
+  m->name_len = 6;
+  var wa: int64[4];
+  fill_work(m, &wa[0], work_area(&wa[0]));
+  window_set_monitors(m, 1);
+}
+
+export fn window_x11_refresh_monitors() {
+  if (!g_x11.randr_ok) { whole_screen(); return; }
+  var r: uint8[8];
+  window_x11_req(&r[0], g_x11.randr_major, 25, 8);       // GetScreenResourcesCurrent
+  window_wr32(&r[0], 4, g_x11.root);
+  var res: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 8));
+  if (res == 0) { whole_screen(); return; }
+  var rlen: int64 = window_x11_reply_len(res);
+  var cfg_ts: int64 = window_rd32(res, 12);
+  var ncrtc: int64 = window_rd16(res, 16);
+  var nout: int64 = window_rd16(res, 18);
+  var nmode: int64 = window_rd16(res, 20);
+  var outs_o: int64 = 32 + ncrtc * 4;
+  var modes_o: int64 = outs_o + nout * 4;
+  if (modes_o + nmode * 32 > rlen || nout > 64) { free(res); whole_screen(); return; }
+  var primary: int64 = 0;
+  var pr: uint8[8];
+  window_x11_req(&pr[0], g_x11.randr_major, 31, 8);      // GetOutputPrimary
+  window_wr32(&pr[0], 4, g_x11.root);
+  var pp: uint8* = window_x11_wait_reply(window_x11_send(&pr[0], 8));
+  if (pp != 0) { primary = window_rd32(pp, 8); free(pp); }
+  var wa: int64[4];
+  var have_wa: bool = work_area(&wa[0]);
+  var list: WindowMonitor* = (WindowMonitor*)malloc(((int64)sizeof(WindowMonitor)) * (nout + 1));
+  var n: int32 = 0;
+  for i: int64 in 0..nout {
+    var out_id: int64 = window_rd32(res, outs_o + i * 4);
+    var oi: uint8[12];
+    window_x11_req(&oi[0], g_x11.randr_major, 9, 12);    // GetOutputInfo
+    window_wr32(&oi[0], 4, out_id); window_wr32(&oi[0], 8, cfg_ts);
+    var o: uint8* = window_x11_wait_reply(window_x11_send(&oi[0], 12));
+    if (o == 0) { continue; }
+    var olen: int64 = window_x11_reply_len(o);
+    var crtc: int64 = window_rd32(o, 12);
+    var connected: bool = o[24] == (uint8)0;
+    if (!connected || crtc == 0) { free(o); continue; }
+    var ci: uint8[12];
+    window_x11_req(&ci[0], g_x11.randr_major, 20, 12);   // GetCrtcInfo
+    window_wr32(&ci[0], 4, crtc); window_wr32(&ci[0], 8, cfg_ts);
+    var c: uint8* = window_x11_wait_reply(window_x11_send(&ci[0], 12));
+    if (c == 0) { free(o); continue; }
+    var m: WindowMonitor;
+    var z: WindowMonitor;
+    m = z;
+    m.x = (int32)window_rds16(c, 12); m.y = (int32)window_rds16(c, 14);
+    m.w = (int32)window_rd16(c, 16); m.h = (int32)window_rd16(c, 18);
+    var mode: int64 = window_rd32(c, 20);
+    var rot: int64 = window_rd16(c, 24);
+    free(c);
+    if (m.w == 0 || m.h == 0) { free(o); continue; }
+    m.mm_w = (int32)window_rd32(o, 16); m.mm_h = (int32)window_rd32(o, 20);
+    if ((rot & 10) != 0) { var t: int32 = m.mm_w; m.mm_w = m.mm_h; m.mm_h = t; }
+    var name_len: int64 = window_rd16(o, 34);
+    var name_o: int64 = 36 + (window_rd16(o, 26) + window_rd16(o, 28) + window_rd16(o, 32)) * 4;
+    if (name_len > 63) { name_len = 63; }
+    if (name_o + name_len <= olen) {
+      for k: int64 in 0..name_len { m.name[k] = o[name_o + k]; }
+      m.name_len = (int32)name_len;
+    }
+    free(o);
+    for k: int64 in 0..nmode {
+      var mo: int64 = modes_o + k * 32;
+      if (window_rd32(res, mo) == mode) {
+        var clock: int64 = window_rd32(res, mo + 8);
+        var ht: int64 = window_rd16(res, mo + 16);
+        var vt: int64 = window_rd16(res, mo + 24);
+        var flags: int64 = window_rd32(res, mo + 28);
+        if ((flags & 32) != 0) { vt = vt * 2; }        // DoubleScan
+        if ((flags & 16) != 0) { vt = vt / 2; }        // Interlace
+        if (ht > 0 && vt > 0) { m.refresh_mhz = (int32)(clock * 1000 / (ht * vt)); }
+      }
+    }
+    m.scale = g_x11.scale;
+    m.primary = out_id == primary;
+    m.id = out_id;
+    fill_work(&m, &wa[0], have_wa);
+    list[n] = m;
+    n = n + 1;
+  }
+  free(res);
+  if (n == 0) { free(list); whole_screen(); return; }
+  var any_primary: bool = false;
+  for i in 0..n { if (list[i].primary) { any_primary = true; } }
+  if (!any_primary) { list[0].primary = true; }
+  window_set_monitors(list, n);
+}
+
+// ---------- raw motion (XInput 2) ----------
+/// Turns XI_RawMotion delivery on or off. False when XInput 2 is missing.
+export fn window_x11_raw_motion(on: bool) -> bool {
+  if (!g_x11.xi_ok) { return false; }
+  var r: uint8[20];
+  window_x11_req(&r[0], g_x11.xi_opcode, 46, 20);        // XISelectEvents
+  window_wr32(&r[0], 4, g_x11.root);
+  window_wr16(&r[0], 8, 1);
+  window_wr16(&r[0], 12, 1);                             // XIAllMasterDevices
+  window_wr16(&r[0], 14, 1);
+  if (on) { window_wr32(&r[0], 16, (int64)1 << 17); }    // XI_RawMotion
+  window_x11_send(&r[0], 20);
+  return true;
+}
+
+/// Handles a GenericEvent (code 35); only XI_RawMotion is used.
+export fn window_x11_generic_event(e: uint8*) {
+  if (!g_x11.xi_ok || (int64)e[1] != g_x11.xi_opcode) { return; }
+  if (window_rd16(e, 8) != 17) { return; }
+  // Layout: 32-byte header, valuator mask (valuators_len words), then the
+  // accelerated values and the raw values (FP3232 each) for every set bit.
+  var mlen: int64 = window_rd16(e, 22);
+  if (mlen < 1 || 32 + mlen * 4 > WINDOW_X11_EV_SIZE) { return; }
+  var mask: int64 = window_rd32(e, 32);
+  var bits: int64 = 0;
+  for i: int64 in 0..32 { if ((mask & ((int64)1 << i)) != 0) { bits = bits + 1; } }
+  var o: int64 = 32 + mlen * 4 + bits * 8;               // start of raw values
+  var dx: float64 = 0.0;
+  var dy: float64 = 0.0;
+  var k: int64 = 0;
+  for i: int64 in 0..2 {
+    if ((mask & ((int64)1 << i)) == 0) { continue; }
+    var at: int64 = o + k * 8;
+    k = k + 1;
+    if (at + 8 > WINDOW_X11_EV_SIZE) { return; }
+    var v: float64 = (float64)window_rds32(e, at) + (float64)window_rd32(e, at + 4) / 4294967296.0;
+    if (i == 0) { dx = v; } else { dy = v; }
+  }
+  if (dx != 0.0 || dy != 0.0) { window_x11_raw_delta(dx, dy); }
+}
+
+
+/// Sends RGBA rows to a drawable with PutImage (ZPixmap, BGRA in memory).
+export fn window_x11_put_image(drawable: int64, gc: int64, depth: int64, rgba: uint8*, iw: int32, ih: int32, stride: int32, premultiply: bool) {
+  var row_bytes: int64 = (int64)iw * 4;
+  var max_rows: int64 = (g_x11.max_req * 4 - 24) / row_bytes;
+  if (max_rows < 1) { return; }
+  var y: int64 = 0;
+  while (y < (int64)ih && !g_x11.dead) {
+    var rows: int64 = (int64)ih - y;
+    if (rows > max_rows) { rows = max_rows; }
+    var len: int64 = 24 + rows * row_bytes;
+    var r: uint8* = (uint8*)malloc(len);
+    window_x11_req(r, 72, 2, len);
+    window_wr32(r, 4, drawable); window_wr32(r, 8, gc);
+    window_wr16(r, 12, (int64)iw); window_wr16(r, 14, rows);
+    window_wr16(r, 16, 0); window_wr16(r, 18, y);
+    r[20] = (uint8)0; r[21] = (uint8)depth;
+    for j: int64 in 0..rows {
+      var src: uint8* = &rgba[(y + j) * (int64)stride];
+      var dst: uint8* = &r[24 + j * row_bytes];
+      for i: int64 in 0..(int64)iw {
+        var a: int64 = (int64)src[i * 4 + 3];
+        var rr: int64 = (int64)src[i * 4];
+        var gg: int64 = (int64)src[i * 4 + 1];
+        var bb: int64 = (int64)src[i * 4 + 2];
+        if (premultiply) { rr = rr * a / 255; gg = gg * a / 255; bb = bb * a / 255; }
+        dst[i * 4] = (uint8)bb; dst[i * 4 + 1] = (uint8)gg; dst[i * 4 + 2] = (uint8)rr; dst[i * 4 + 3] = (uint8)a;
+      }
+    }
+    window_x11_send(r, len);
+    free(r);
+    y = y + rows;
+  }
+}
+
+export fn window_x11_create_gc(drawable: int64) -> int64 {
+  var gc: int64 = window_x11_new_id();
+  var r: uint8[20];
+  window_x11_req(&r[0], 55, 0, 20);
+  window_wr32(&r[0], 4, gc); window_wr32(&r[0], 8, drawable);
+  window_wr32(&r[0], 12, 0x10000);                     // GCGraphicsExposures
+  window_wr32(&r[0], 16, 0);
+  window_x11_send(&r[0], 20);
+  return gc;
+}
+
+// ---------- RGBA cursors (RENDER) ----------
+/// Builds a cursor from RGBA pixels; 0 when RENDER is missing.
+export fn window_x11_render_cursor(rgba: uint8*, cw: int32, ch: int32, hx: int32, hy: int32) -> int64 {
+  if (!g_x11.render_ok) { return 0; }
+  var pm: int64 = window_x11_new_id();
+  var r: uint8[16];
+  window_x11_req(&r[0], 53, 32, 16);
+  window_wr32(&r[0], 4, pm); window_wr32(&r[0], 8, g_x11.root);
+  window_wr16(&r[0], 12, (int64)cw); window_wr16(&r[0], 14, (int64)ch);
+  window_x11_send(&r[0], 16);
+  var gc: int64 = window_x11_create_gc(pm);
+  window_x11_put_image(pm, gc, 32, rgba, cw, ch, cw * 4, true);
+  var pic: int64 = window_x11_new_id();
+  var cp: uint8[20];
+  window_x11_req(&cp[0], g_x11.render_major, 4, 20);     // CreatePicture
+  window_wr32(&cp[0], 4, pic); window_wr32(&cp[0], 8, pm); window_wr32(&cp[0], 12, g_x11.argb_format); window_wr32(&cp[0], 16, 0);
+  window_x11_send(&cp[0], 20);
+  var cur: int64 = window_x11_new_id();
+  var cc: uint8[16];
+  var x: int64 = (int64)hx; var y: int64 = (int64)hy;
+  if (x < 0) { x = 0; }
+  if (y < 0) { y = 0; }
+  if (x >= (int64)cw) { x = (int64)cw - 1; }
+  if (y >= (int64)ch) { y = (int64)ch - 1; }
+  window_x11_req(&cc[0], g_x11.render_major, 27, 16);    // CreateCursor
+  window_wr32(&cc[0], 4, cur); window_wr32(&cc[0], 8, pic); window_wr16(&cc[0], 12, x); window_wr16(&cc[0], 14, y);
+  var seq: int64 = window_x11_send(&cc[0], 16);
+  var f: uint8[8];
+  window_x11_req(&f[0], g_x11.render_major, 7, 8); window_wr32(&f[0], 4, pic); window_x11_send(&f[0], 8);
+  window_x11_req(&f[0], 60, 0, 8); window_wr32(&f[0], 4, gc); window_x11_send(&f[0], 8);
+  window_x11_req(&f[0], 54, 0, 8); window_wr32(&f[0], 4, pm); window_x11_send(&f[0], 8);
+  window_x11_sync();
+  if (g_x11.err_seq == seq && g_x11.err_code != 0) { g_x11.err_code = 0; return 0; }
+  return cur;
+}

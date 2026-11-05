@@ -1,0 +1,21 @@
+// log: structured logging for Mettle, in pure Mettle.
+//
+//   import "log/log";
+//
+// This file re-exports every module below. All exported names start with
+// log_, Log or LOG_ (internal ones with log__).
+//
+//   log/level   levels (OpenTelemetry severity numbers), names, parsing
+//   log/field   key-value fields and the LogRecord
+//   log/filter  RUST_LOG-style per-target filters
+//   log/format  text, logfmt, JSON lines, syslog and journald output
+//   log/sink    stderr, files with rotation, memory, syslog, journald,
+//               callbacks, and async queues
+//   log/logger  loggers, setup from the environment, the log_* calls
+
+import "log/level";
+import "log/field";
+import "log/filter";
+import "log/format";
+import "log/sink";
+import "log/logger";

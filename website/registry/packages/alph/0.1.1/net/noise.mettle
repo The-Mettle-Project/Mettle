@@ -1,0 +1,415 @@
+// alph/net/noise: the Noise_XXpsk3_25519_ChaChaPoly_SHA256 handshake and
+// transport ciphers (noiseprotocol.org, revision 34), on the cryptex package.
+//
+//   -> e
+//   <- e, ee, s, es
+//   -> s, se, psk
+//
+// Both sides prove knowledge of a pre-shared key (alph uses the SHA-256 of
+// the cluster cookie) without sending it, and each learns the other's static
+// public key. Handshake payloads are empty. After the third message,
+// alph_noise_split gives each side a sending and a receiving cipher. The
+// initiator only knows the responder holds the key once a transport message
+// from it decrypts.
+//
+// Plain data, no actors: alph/net/dist drives it. Thread: whoever owns the
+// state.
+
+import "std/mem";
+import "cryptex/cryptex";
+
+// The longest Noise message, and the most plaintext one transport message
+// can carry.
+export const ALPH_NOISE_MAX: int64 = 65535;
+export const ALPH_NOISE_PLAIN_MAX: int64 = 65519;
+
+const ALPH_NOISE_NAME: string = "Noise_XXpsk3_25519_ChaChaPoly_SHA256";
+
+// One direction of an established session.
+export struct AlphNoiseCipher {
+  k: CrKey32;
+  n: int64;
+}
+
+// A handshake in progress. Fill it with alph_noise_init; its fields are
+// this module's own.
+export struct AlphNoise {
+  initiator: int64;
+  step: int64;         // handshake messages written or read so far
+  h: uint8[32];
+  ck: uint8[32];
+  c: AlphNoiseCipher;
+  has_key: int64;
+  s_sk: CrX25519Secret;
+  s_pk: CrX25519Public;
+  e_sk: CrX25519Secret;
+  e_pk: CrX25519Public;
+  fixed_e: int64;      // alph_noise_set_ephemeral was called
+  re: CrX25519Public;
+  rs: CrX25519Public;
+  psk: uint8[32];
+}
+
+// h = SHA-256(h || data).
+fn alph_noise_mix_hash(n: AlphNoise*, data: uint8*, len: int64) -> bool {
+  var buf: uint8* = (uint8*)malloc(32 + len);
+  if (buf == 0) {
+    return false;
+  }
+  memcpy((rawptr)buf, (rawptr)&n->h[0], 32);
+  if (len > 0) {
+    memcpy((rawptr)((int64)buf + 32), (rawptr)data, len);
+  }
+  var out: CrSha256;
+  var ok: bool = cr_sha256(&out, buf, 32 + len) == CR_OK;
+  free((rawptr)buf);
+  memcpy((rawptr)&n->h[0], (rawptr)&out.b[0], 32);
+  return ok;
+}
+
+// Noise's HKDF with HMAC-SHA-256: out1 and out2 (and out3 when not 0) from
+// chaining key ck and input ikm.
+fn alph_noise_hkdf(ck: uint8*, ikm: uint8*, ikm_len: int64, out1: uint8*, out2: uint8*,
+                   out3: uint8*) -> bool {
+  var temp: CrHmacSha256;
+  if (cr_hmac_sha256(&temp, ck, 32, ikm, ikm_len) != CR_OK) {
+    return false;
+  }
+  var one: uint8[33];
+  var o: CrHmacSha256;
+  one[0] = (uint8)1;
+  if (cr_hmac_sha256(&o, &temp.b[0], 32, &one[0], 1) != CR_OK) {
+    return false;
+  }
+  memcpy((rawptr)out1, (rawptr)&o.b[0], 32);
+  memcpy((rawptr)&one[0], (rawptr)&o.b[0], 32);
+  one[32] = (uint8)2;
+  if (cr_hmac_sha256(&o, &temp.b[0], 32, &one[0], 33) != CR_OK) {
+    return false;
+  }
+  memcpy((rawptr)out2, (rawptr)&o.b[0], 32);
+  if (out3 != 0) {
+    memcpy((rawptr)&one[0], (rawptr)&o.b[0], 32);
+    one[32] = (uint8)3;
+    if (cr_hmac_sha256(&o, &temp.b[0], 32, &one[0], 33) != CR_OK) {
+      return false;
+    }
+    memcpy((rawptr)out3, (rawptr)&o.b[0], 32);
+  }
+  memset((rawptr)&temp.b[0], 0, 32);
+  memset((rawptr)&o.b[0], 0, 32);
+  return true;
+}
+
+fn alph_noise_mix_key(n: AlphNoise*, ikm: uint8*, len: int64) -> bool {
+  var ck: uint8[32];
+  if (!alph_noise_hkdf(&n->ck[0], ikm, len, &ck[0], &n->c.k.b[0], (uint8*)0)) {
+    return false;
+  }
+  memcpy((rawptr)&n->ck[0], (rawptr)&ck[0], 32);
+  n->c.n = 0;
+  n->has_key = 1;
+  return true;
+}
+
+fn alph_noise_mix_key_and_hash(n: AlphNoise*, ikm: uint8*) -> bool {
+  var ck: uint8[32];
+  var th: uint8[32];
+  if (!alph_noise_hkdf(&n->ck[0], ikm, 32, &ck[0], &th[0], &n->c.k.b[0])) {
+    return false;
+  }
+  memcpy((rawptr)&n->ck[0], (rawptr)&ck[0], 32);
+  n->c.n = 0;
+  n->has_key = 1;
+  return alph_noise_mix_hash(n, &th[0], 32);
+}
+
+fn alph_noise_nonce(c: AlphNoiseCipher*, out: CrNonce12*) {
+  for i: int64 in 0..4 {
+    out->b[i] = (uint8)0;
+  }
+  var v: int64 = c->n;
+  for i: int64 in 0..8 {
+    out->b[4 + i] = (uint8)(v & 255);
+    v = v >> 8;
+  }
+}
+
+// Encrypts len bytes at pt to out (len + 16 bytes) with associated data ad,
+// and moves the nonce on. False on failure or an exhausted nonce.
+fn alph_noise_encrypt(c: AlphNoiseCipher*, out: uint8*, pt: uint8*, len: int64, ad: uint8*,
+                      ad_len: int64) -> bool {
+  if (c->n < 0) {
+    return false;
+  }
+  var nonce: CrNonce12;
+  alph_noise_nonce(c, &nonce);
+  var out_len: int64 = 0;
+  if (cr_chacha20poly1305_encrypt(out, len + 16, &out_len, pt, len, ad, ad_len, &nonce, &c->k) != CR_OK) {
+    return false;
+  }
+  c->n = c->n + 1;
+  return true;
+}
+
+fn alph_noise_decrypt(c: AlphNoiseCipher*, out: uint8*, ct: uint8*, len: int64, ad: uint8*,
+                      ad_len: int64) -> bool {
+  if (c->n < 0 || len < 16) {
+    return false;
+  }
+  var nonce: CrNonce12;
+  alph_noise_nonce(c, &nonce);
+  var out_len: int64 = 0;
+  if (cr_chacha20poly1305_decrypt(out, len - 16, &out_len, ct, len, ad, ad_len, &nonce, &c->k) != CR_OK) {
+    return false;
+  }
+  c->n = c->n + 1;
+  return true;
+}
+
+// EncryptAndHash of len bytes at pt into out; returns the bytes written, or -1.
+fn alph_noise_encrypt_hash(n: AlphNoise*, out: uint8*, pt: uint8*, len: int64) -> int64 {
+  var size: int64 = len;
+  if (n->has_key != 0) {
+    if (!alph_noise_encrypt(&n->c, out, pt, len, &n->h[0], 32)) {
+      return -1;
+    }
+    size = len + 16;
+  } else if (len > 0) {
+    memcpy((rawptr)out, (rawptr)pt, len);
+  }
+  if (!alph_noise_mix_hash(n, out, size)) {
+    return -1;
+  }
+  return size;
+}
+
+// DecryptAndHash of len bytes at ct into out; returns the plaintext length,
+// or -1 when it does not authenticate.
+fn alph_noise_decrypt_hash(n: AlphNoise*, out: uint8*, ct: uint8*, len: int64) -> int64 {
+  var size: int64 = len;
+  if (n->has_key != 0) {
+    if (!alph_noise_decrypt(&n->c, out, ct, len, &n->h[0], 32)) {
+      return -1;
+    }
+    size = len - 16;
+  } else if (len > 0) {
+    memcpy((rawptr)out, (rawptr)ct, len);
+  }
+  if (!alph_noise_mix_hash(n, ct, len)) {
+    return -1;
+  }
+  return size;
+}
+
+fn alph_noise_dh(n: AlphNoise*, sk: CrX25519Secret*, pk: CrX25519Public*) -> bool {
+  var shared: CrX25519Shared;
+  if (cr_x25519_shared(&shared, sk, pk) != CR_OK) {
+    return false;
+  }
+  var ok: bool = alph_noise_mix_key(n, &shared.b[0], 32);
+  memset((rawptr)&shared.b[0], 0, 32);
+  return ok;
+}
+
+// The e token when writing: a new ephemeral key, its public half sent.
+fn alph_noise_write_e(n: AlphNoise*, out: uint8*) -> bool {
+  if (n->fixed_e == 0 && cr_x25519_keypair(&n->e_pk, &n->e_sk) != CR_OK) {
+    return false;
+  }
+  memcpy((rawptr)out, (rawptr)&n->e_pk.b[0], 32);
+  // In a psk handshake, e is mixed into the key as well as the hash.
+  return alph_noise_mix_hash(n, &n->e_pk.b[0], 32) && alph_noise_mix_key(n, &n->e_pk.b[0], 32);
+}
+
+fn alph_noise_read_e(n: AlphNoise*, msg: uint8*) -> bool {
+  memcpy((rawptr)&n->re.b[0], (rawptr)msg, 32);
+  return alph_noise_mix_hash(n, &n->re.b[0], 32) && alph_noise_mix_key(n, &n->re.b[0], 32);
+}
+
+// Starts a handshake.
+//
+//   n          the state to fill
+//   initiator  true on the side that connects
+//   s_sk       this node's static secret key
+//   psk        32 bytes both sides share
+//
+// Returns false when the cryptex package fails. Thread: any.
+export fn alph_noise_init(n: AlphNoise*, initiator: bool, s_sk: CrX25519Secret*, psk: uint8*) -> bool {
+  memset((rawptr)n, 0, (int64)sizeof(AlphNoise));
+  if (initiator) {
+    n->initiator = 1;
+  }
+  memcpy((rawptr)&n->s_sk.b[0], (rawptr)&s_sk->b[0], 32);
+  memcpy((rawptr)&n->psk[0], (rawptr)psk, 32);
+  if (cr_x25519_public_from_secret(&n->s_pk, &n->s_sk) != CR_OK) {
+    return false;
+  }
+  // The protocol name is longer than 32 bytes, so h starts as its hash.
+  var name_hash: CrSha256;
+  if (cr_sha256(&name_hash, ALPH_NOISE_NAME.chars, (int64)ALPH_NOISE_NAME.length) != CR_OK) {
+    return false;
+  }
+  memcpy((rawptr)&n->h[0], (rawptr)&name_hash.b[0], 32);
+  memcpy((rawptr)&n->ck[0], (rawptr)&name_hash.b[0], 32);
+  return alph_noise_mix_hash(n, (uint8*)0, 0);  // the empty prologue
+}
+
+// Uses e_sk as the next ephemeral key instead of a random one. For tests
+// against fixed vectors only; a real handshake must never reuse one.
+export fn alph_noise_set_ephemeral(n: AlphNoise*, e_sk: CrX25519Secret*) -> bool {
+  memcpy((rawptr)&n->e_sk.b[0], (rawptr)&e_sk->b[0], 32);
+  n->fixed_e = 1;
+  return cr_x25519_public_from_secret(&n->e_pk, &n->e_sk) == CR_OK;
+}
+
+// Writes this side's next handshake message to out (cap at least 96
+// bytes) and its length to *out_len. Returns false when it is not this
+// side's turn or the cryptex package fails. Thread: the state's owner.
+export fn alph_noise_write(n: AlphNoise*, out: uint8*, cap: int64, out_len: int64*) -> bool {
+  if (cap < 96) {
+    return false;
+  }
+  var at: int64 = 0;
+  var none: uint8[1];
+  if (n->step == 0 && n->initiator != 0) {
+    if (!alph_noise_write_e(n, out)) {
+      return false;
+    }
+    at = 32;
+  } else if (n->step == 1 && n->initiator == 0) {
+    if (!alph_noise_write_e(n, out) || !alph_noise_dh(n, &n->e_sk, &n->re)) {
+      return false;
+    }
+    at = 32;
+    var w: int64 = alph_noise_encrypt_hash(n, (uint8*)((int64)out + at), &n->s_pk.b[0], 32);
+    if (w < 0 || !alph_noise_dh(n, &n->s_sk, &n->re)) {
+      return false;
+    }
+    at = at + w;
+  } else if (n->step == 2 && n->initiator != 0) {
+    var w: int64 = alph_noise_encrypt_hash(n, out, &n->s_pk.b[0], 32);
+    if (w < 0 || !alph_noise_dh(n, &n->s_sk, &n->re) ||
+        !alph_noise_mix_key_and_hash(n, &n->psk[0])) {
+      return false;
+    }
+    at = w;
+  } else {
+    return false;
+  }
+  var p: int64 = alph_noise_encrypt_hash(n, (uint8*)((int64)out + at), &none[0], 0);
+  if (p < 0) {
+    return false;
+  }
+  *out_len = at + p;
+  n->step = n->step + 1;
+  return true;
+}
+
+// Reads the other side's next handshake message. Returns false when it is
+// not the other side's turn, the message has the wrong length, or it does
+// not authenticate (a wrong pre-shared key shows up here, on the
+// responder's side of the third message). Thread: the state's owner.
+export fn alph_noise_read(n: AlphNoise*, msg: uint8*, len: int64) -> bool {
+  var plain: uint8[48];
+  var at: int64 = 0;
+  if (n->step == 0 && n->initiator == 0) {
+    if (len != 48 || !alph_noise_read_e(n, msg)) {
+      return false;
+    }
+    at = 32;
+  } else if (n->step == 1 && n->initiator != 0) {
+    if (len != 96 || !alph_noise_read_e(n, msg) || !alph_noise_dh(n, &n->e_sk, &n->re)) {
+      return false;
+    }
+    if (alph_noise_decrypt_hash(n, &plain[0], (uint8*)((int64)msg + 32), 48) != 32) {
+      return false;
+    }
+    memcpy((rawptr)&n->rs.b[0], (rawptr)&plain[0], 32);
+    if (!alph_noise_dh(n, &n->e_sk, &n->rs)) {
+      return false;
+    }
+    at = 80;
+  } else if (n->step == 2 && n->initiator == 0) {
+    if (len != 64 || alph_noise_decrypt_hash(n, &plain[0], msg, 48) != 32) {
+      return false;
+    }
+    memcpy((rawptr)&n->rs.b[0], (rawptr)&plain[0], 32);
+    if (!alph_noise_dh(n, &n->e_sk, &n->rs) || !alph_noise_mix_key_and_hash(n, &n->psk[0])) {
+      return false;
+    }
+    at = 48;
+  } else {
+    return false;
+  }
+  if (alph_noise_decrypt_hash(n, &plain[0], (uint8*)((int64)msg + at), len - at) != 0) {
+    return false;
+  }
+  n->step = n->step + 1;
+  return true;
+}
+
+// True once all three handshake messages are done. Thread: the owner.
+export fn alph_noise_done(n: AlphNoise*) -> bool {
+  return n->step == 3;
+}
+
+// The other side's static public key, valid once the handshake is done.
+// Thread: the state's owner.
+export fn alph_noise_peer(n: AlphNoise*, out: CrX25519Public*) {
+  memcpy((rawptr)&out->b[0], (rawptr)&n->rs.b[0], 32);
+}
+
+// Ends a finished handshake: fills the sending and receiving ciphers and
+// wipes the handshake's secrets. Returns false when the handshake is not
+// done. Thread: the state's owner.
+export fn alph_noise_split(n: AlphNoise*, send: AlphNoiseCipher*, recv: AlphNoiseCipher*) -> bool {
+  if (n->step != 3) {
+    return false;
+  }
+  var none: uint8[1];
+  var k1: uint8[32];
+  var k2: uint8[32];
+  if (!alph_noise_hkdf(&n->ck[0], &none[0], 0, &k1[0], &k2[0], (uint8*)0)) {
+    return false;
+  }
+  if (n->initiator != 0) {
+    memcpy((rawptr)&send->k.b[0], (rawptr)&k1[0], 32);
+    memcpy((rawptr)&recv->k.b[0], (rawptr)&k2[0], 32);
+  } else {
+    memcpy((rawptr)&send->k.b[0], (rawptr)&k2[0], 32);
+    memcpy((rawptr)&recv->k.b[0], (rawptr)&k1[0], 32);
+  }
+  send->n = 0;
+  recv->n = 0;
+  memset((rawptr)&k1[0], 0, 32);
+  memset((rawptr)&k2[0], 0, 32);
+  var rs: CrX25519Public;
+  memcpy((rawptr)&rs.b[0], (rawptr)&n->rs.b[0], 32);
+  memset((rawptr)n, 0, (int64)sizeof(AlphNoise));
+  memcpy((rawptr)&n->rs.b[0], (rawptr)&rs.b[0], 32);  // kept for alph_noise_peer
+  n->step = 3;
+  return true;
+}
+
+// Encrypts len bytes at pt (at most ALPH_NOISE_PLAIN_MAX) to out, which
+// gets len + 16 bytes. Returns false when len is too long or the nonce is
+// exhausted. Thread: the cipher's owner.
+export fn alph_noise_seal(c: AlphNoiseCipher*, out: uint8*, pt: uint8*, len: int64) -> bool {
+  if (len < 0 || len > ALPH_NOISE_PLAIN_MAX) {
+    return false;
+  }
+  var none: uint8[1];
+  return alph_noise_encrypt(c, out, pt, len, &none[0], 0);
+}
+
+// Decrypts a transport message of len bytes at ct to out, which gets
+// len - 16 bytes. Returns false when it does not authenticate.
+// Thread: the cipher's owner.
+export fn alph_noise_open(c: AlphNoiseCipher*, out: uint8*, ct: uint8*, len: int64) -> bool {
+  if (len < 16 || len > ALPH_NOISE_MAX) {
+    return false;
+  }
+  var none: uint8[1];
+  return alph_noise_decrypt(c, out, ct, len, &none[0], 0);
+}

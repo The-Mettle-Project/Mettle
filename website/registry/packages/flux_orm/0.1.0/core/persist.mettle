@@ -1,0 +1,340 @@
+// flux_orm/core/persist.mettle — insert, load by key, delete by key.
+//
+// Builds the three single-row statements straight from RcMeta and binds
+// RcValue arguments: no user data in the statement text. Queries live in
+// query/, updates in changeset/.
+
+import "std/mem";
+
+import "status";
+import "value";
+import "meta";
+import "entity";
+import "buf";
+import "clock";
+import "../adapter/adapter";
+import "../adapter/stmt";
+
+fn rc_persist_put_columns(b: RcBuf*, m: RcMeta) -> int32 {
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (i > 0) {
+      var sep: int32 = rc_buf_put(b, ", ");
+      if (sep != RC_OK) { return sep; }
+    }
+    var rc: int32 = rc_buf_ident(b, m.fields[i].column);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+fn rc_persist_put_table(b: RcBuf*, m: RcMeta) -> int32 {
+  var rc: int32 = rc_buf_put(b, " FROM ");
+  if (rc != RC_OK) { return rc; }
+  return rc_buf_ident(b, m.table);
+}
+
+// Inserts one entity's row.
+//   a   the adapter
+//   e   an RC_ST_NEW entity. An auto primary key whose null bit is set is
+//       left out and filled from the store's assigned id; other NULL fields
+//       bind as RcNull. Before the statement runs, a version field is set to
+//       1 and CREATED/UPDATED fields to the clock's time, in the model.
+// Returns RC_OK and makes the entity CLEAN. Errors:
+//   RC_ERR_USAGE   `a` or `e` is 0, the entity is not NEW, every field would
+//                  be left out, or a timestamp is needed and no clock is set
+//   any rc_meta_check error (RC_ERR_USAGE, RC_ERR_UNSUPPORTED)
+//   RC_ERR_NOMEM   building the statement failed
+//   any adapter code: RC_ERR_CONFLICT for a unique violation,
+//                  RC_ERR_CONSTRAINT, RC_ERR_CLOSED, RC_ERR_ADAPTER, ...
+//   RC_ERR_ADAPTER the store assigned no id for an auto key (the row may be
+//                  stored anyway)
+// On error the entity stays NEW, but the version and timestamps may already
+// be written into the model.
+export fn rc_persist_insert(a: RcAdapter*, e: RcEntity*) -> int32 {
+  if (a == 0 || e == 0) { return RC_ERR_USAGE; }
+  if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
+  var m: RcMeta = e->meta;
+  var bad: int32 = -1;
+  var rc: int32 = rc_meta_check(m, &bad);
+  if (rc != RC_OK) { return rc; }
+  if (rc_meta_any(m, RC_F_CREATED | RC_F_UPDATED)) {
+    var now: int64 = 0;
+    rc = rc_clock_now(&now);
+    if (rc != RC_OK) { return rc; }
+    var t: int32 = 0;
+    while (t < m.n_fields) {
+      if ((m.fields[t].flags & (RC_F_CREATED | RC_F_UPDATED)) != 0) {
+        rc = rc_meta_set(m, e->model, &e->nulls, t, RcTime(now));
+        if (rc != RC_OK) { return rc; }
+      }
+      t = t + 1;
+    }
+  }
+  var vf: int32 = rc_meta_version(m);
+  if (vf >= 0) {
+    rc = rc_meta_set(m, e->model, &e->nulls, vf, RcInt(1));
+    if (rc != RC_OK) { return rc; }
+  }
+
+  var buf: RcBuf = rc_buf_new(128);
+  if (buf.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&buf);
+
+  rc = rc_buf_put(&buf, "INSERT INTO ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_ident(&buf, m.table);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " (");
+  if (rc != RC_OK) { return rc; }
+
+  var st: RcStmt = rc_stmt_new(RC_OP_INSERT, m.table);
+  defer rc_stmt_free(&st);
+  st.n_rows = 1;
+  var first: bool = true;
+  var n_args: int32 = 0;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var skip: bool = false;
+    if ((m.fields[i].flags & RC_F_AUTO) != 0 && rc_nulls_has(e->nulls, i)) {
+      skip = true;
+    }
+    if (!skip) {
+      if (!first) {
+        rc = rc_buf_put(&buf, ", ");
+        if (rc != RC_OK) { return rc; }
+      }
+      rc = rc_buf_ident(&buf, m.fields[i].column);
+      if (rc == RC_OK) { rc = rc_stmt_field(&st, m.fields[i]); }
+      if (rc != RC_OK) { return rc; }
+      first = false;
+      n_args = n_args + 1;
+    }
+    i = i + 1;
+  }
+  if (n_args == 0) { return RC_ERR_USAGE; }
+  rc = rc_buf_put(&buf, ") VALUES (");
+  if (rc != RC_OK) { return rc; }
+  i = 0;
+  while (i < n_args) {
+    if (i > 0) {
+      rc = rc_buf_put(&buf, ", ");
+      if (rc != RC_OK) { return rc; }
+    }
+    rc = rc_buf_put(&buf, "?");
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  rc = rc_buf_put(&buf, ")");
+  if (rc != RC_OK) { return rc; }
+
+  var args: RcValue* = malloc((int64)n_args * (int64)sizeof(RcValue));
+  if (args == 0) { return RC_ERR_NOMEM; }
+  defer free(args);
+  var k: int32 = 0;
+  i = 0;
+  while (i < m.n_fields) {
+    var skip: bool = false;
+    if ((m.fields[i].flags & RC_F_AUTO) != 0 && rc_nulls_has(e->nulls, i)) {
+      skip = true;
+    }
+    if (!skip) {
+      var v: RcValue = RcNull;
+      rc = rc_meta_get(m, e->model, e->nulls, i, &v);
+      if (rc != RC_OK) { return rc; }
+      args[k] = v;
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+
+  var want_auto: bool = false;
+  if (rc_meta_is_auto(m)) {
+    if (rc_nulls_has(e->nulls, m.pk)) { want_auto = true; }
+  }
+
+  var res: RcResult;
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &st, args, n_args, &res);
+  if (rc != RC_OK) { return rc; }
+  defer rc_result_free(&res);
+
+  if (want_auto) {
+    if (res.last_id == 0) { return RC_ERR_ADAPTER; }
+    var pkv: RcValue = RcInt(res.last_id);
+    rc = rc_meta_set(m, e->model, &e->nulls, m.pk, pkv);
+    if (rc != RC_OK) { return rc; }
+  }
+  e->state = RC_ST_CLEAN;
+  return RC_OK;
+}
+
+// Fills `model` from row `row` of a result whose columns are in RcMeta order,
+// which is what rc_query_select produces.
+//   m       the model's metadata
+//   res     the result; borrowed. Text fields point into it, so it must
+//           outlive the model (keep it with rc_session_keep).
+//   row     row index, 0-based
+//   model   the model struct to fill; every field is written
+//   nulls   receives the model's null bitmap
+// Returns RC_OK; RC_ERR_USAGE when a pointer is 0 or `row` is out of range;
+// RC_ERR_ADAPTER when the result's column count is not the model's field
+// count; any rc_meta_set error for a cell that does not fit its field
+// (RC_ERR_CAST, RC_ERR_RANGE, RC_ERR_CONSTRAINT for NULL in a NOT NULL
+// field, RC_ERR_UNSUPPORTED). On error the model is partly filled. Wrap the
+// filled model with rc_entity_loaded.
+export fn rc_persist_hydrate(m: RcMeta, res: RcResult*, row: int32, model: rawptr,
+                             nulls: uint64*) -> int32 {
+  if (res == 0 || model == 0 || nulls == 0) { return RC_ERR_USAGE; }
+  if (row < 0 || row >= res->n_rows) { return RC_ERR_USAGE; }
+  if (res->n_cols != m.n_fields) { return RC_ERR_ADAPTER; }
+  *nulls = 0;
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    var v: RcValue = rc_result_borrow(res, row, i);
+    var rc: int32 = rc_meta_set(m, model, nulls, i, v);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  return RC_OK;
+}
+
+// Loads one row by primary key into `model`.
+//
+// Lifetime, and it is the one thing to get right here: a model's string fields
+// are 16-byte *views*. The loader therefore adopts cells out of the result
+// instead of copying them, and hands the result back through `owner`.
+//   a       the adapter
+//   m       the model's metadata; the table must have a primary key
+//   pk      the key value; borrowed for the call
+//   model   the model struct to fill
+//   nulls   receives the model's null bitmap
+//   owner   receives the result the model points into. On RC_OK it must
+//           outlive every use of the model, then be freed with
+//           rc_result_free (or moved into a session with rc_session_keep).
+//           On error it is empty and needs no free.
+// Returns RC_OK; RC_ERR_USAGE when a pointer is 0 or the table has no primary
+// key; any rc_meta_check error; RC_ERR_NOMEM; any code the adapter returns;
+// RC_ERR_NOT_FOUND when no row has that key; any rc_persist_hydrate error.
+// Wrap the filled model with rc_entity_loaded.
+export fn rc_persist_load(a: RcAdapter*, m: RcMeta, pk: RcValue, model: rawptr,
+                          nulls: uint64*, owner: RcResult*) -> int32 {
+  if (a == 0 || model == 0 || nulls == 0 || owner == 0) { return RC_ERR_USAGE; }
+  if (m.pk < 0) { return RC_ERR_USAGE; }
+  rc_result_init(owner);
+  var bad: int32 = -1;
+  var rc: int32 = rc_meta_check(m, &bad);
+  if (rc != RC_OK) { return rc; }
+
+  var buf: RcBuf = rc_buf_new(128);
+  if (buf.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&buf);
+
+  rc = rc_buf_put(&buf, "SELECT ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_persist_put_columns(&buf, m);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_persist_put_table(&buf, m);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " WHERE ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_ident(&buf, m.fields[m.pk].column);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " = ? LIMIT 1");
+  if (rc != RC_OK) { return rc; }
+
+  var st: RcStmt = rc_stmt_new(RC_OP_SELECT, m.table);
+  defer rc_stmt_free(&st);
+  var c: int32 = 0;
+  while (c < m.n_fields) {
+    rc = rc_stmt_field(&st, m.fields[c]);
+    if (rc != RC_OK) { return rc; }
+    c = c + 1;
+  }
+  rc = rc_stmt_term(&st, m.fields[m.pk].column, RC_W_EQ, 0, 1);
+  if (rc != RC_OK) { return rc; }
+  st.limit = 1;
+
+  var args: RcValue[1];
+  args[0] = pk;
+  var res: RcResult;
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &st, &args[0], 1, &res);
+  if (rc != RC_OK) { return rc; }
+  if (res.n_rows == 0) {
+    rc_result_free(&res);
+    return RC_ERR_NOT_FOUND;
+  }
+  rc = rc_persist_hydrate(m, &res, 0, model, nulls);
+  if (rc != RC_OK) {
+    rc_result_free(&res);
+    return rc;
+  }
+  *owner = res;
+  return RC_OK;
+}
+
+// Deletes an entity's row by primary key. A versioned row is deleted only
+// while it still holds the version the model has.
+//   a   the adapter
+//   e   the entity; must not be DELETED and must have a non-NULL key
+// Returns RC_OK and makes the entity DELETED. Errors: RC_ERR_USAGE when `a`
+// or `e` is 0, the entity is already DELETED, or the table or entity has no
+// key; RC_ERR_NOMEM; any code the adapter returns; RC_ERR_NOT_FOUND when no
+// row matched on an unversioned table; RC_ERR_CONFLICT when no row matched
+// on a versioned one (someone changed or deleted it first). On error the
+// state is unchanged.
+export fn rc_persist_delete(a: RcAdapter*, e: RcEntity*) -> int32 {
+  if (a == 0 || e == 0) { return RC_ERR_USAGE; }
+  if (e->state == RC_ST_DELETED) { return RC_ERR_USAGE; }
+  var m: RcMeta = e->meta;
+  if (m.pk < 0) { return RC_ERR_USAGE; }
+  if (!rc_entity_has_pk(e)) { return RC_ERR_USAGE; }
+
+  var buf: RcBuf = rc_buf_new(64);
+  if (buf.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&buf);
+
+  var rc: int32 = rc_buf_put(&buf, "DELETE");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_persist_put_table(&buf, m);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " WHERE ");
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_ident(&buf, m.fields[m.pk].column);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_buf_put(&buf, " = ?");
+  if (rc != RC_OK) { return rc; }
+
+  // A versioned row is only deleted while it still holds the version this
+  // model read; otherwise someone changed it first and it is kept.
+  var st: RcStmt = rc_stmt_new(RC_OP_DELETE, m.table);
+  defer rc_stmt_free(&st);
+  rc = rc_stmt_term(&st, m.fields[m.pk].column, RC_W_EQ, 0, 1);
+  if (rc != RC_OK) { return rc; }
+  var args: RcValue[2];
+  args[0] = rc_entity_pk(e);
+  var n_args: int32 = 1;
+  var vf: int32 = rc_meta_version(m);
+  if (vf >= 0) {
+    rc = rc_buf_put(&buf, " AND ");
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_ident(&buf, m.fields[vf].column);
+    if (rc != RC_OK) { return rc; }
+    rc = rc_buf_put(&buf, " = ?");
+    if (rc != RC_OK) { return rc; }
+    rc = rc_entity_get_field(e, vf, &args[1]);
+    if (rc == RC_OK) { rc = rc_stmt_term(&st, m.fields[vf].column, RC_W_EQ, 1, 1); }
+    if (rc != RC_OK) { return rc; }
+    n_args = 2;
+  }
+  var res: RcResult;
+  rc = rc_adapter_run(a, rc_buf_text(&buf), &st, &args[0], n_args, &res);
+  if (rc != RC_OK) { return rc; }
+  defer rc_result_free(&res);
+  if (res.affected == 0) {
+    if (vf >= 0) { return RC_ERR_CONFLICT; }   // changed or deleted since read
+    return RC_ERR_NOT_FOUND;
+  }
+  e->state = RC_ST_DELETED;
+  return RC_OK;
+}

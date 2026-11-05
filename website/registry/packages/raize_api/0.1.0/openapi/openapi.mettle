@@ -1,0 +1,447 @@
+// raize_api/openapi: the OpenAPI 3.1 document of an API, and a docs page.
+//
+// Schemas are JSON Schema 2020-12 (OpenAPI 3.1's dialect). Named object types go
+// to components/schemas and are used through $ref. Every operation also documents
+// its error responses as RFC 9457 problem details (application/problem+json).
+//
+// Served at <base>/openapi.json and <base>/docs unless moved or turned off with
+// rapi_docs_at. The docs page loads Swagger UI from a CDN (rapi_docs_cdn changes it).
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "codec/core/buf";
+import "codec/core/status";
+import "codec/json/write";
+import "../types/type";
+import "../problem/problem";
+import "../route/api";
+
+export const RAPI_DOCS_CDN: string = "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14";
+
+struct RapiDoc {
+  w: CodecJson;
+  named: (RapiType*)[128];
+  nnamed: int32;
+}
+
+fn rapi__remember_named(d: RapiDoc*, t: RapiType*) {
+  for i in 0..d->nnamed {
+    if (d->named[i] == t) { return; }
+  }
+  if (d->nnamed < 128) {
+    d->named[d->nnamed] = t;
+    d->nnamed = d->nnamed + 1;
+  }
+}
+
+fn rapi__type_word(k: int32) -> string {
+  if (k == RAPI_T_STRING) { return "string"; }
+  if (k == RAPI_T_INT) { return "integer"; }
+  if (k == RAPI_T_NUMBER) { return "number"; }
+  if (k == RAPI_T_BOOL) { return "boolean"; }
+  if (k == RAPI_T_OBJECT) { return "object"; }
+  if (k == RAPI_T_ARRAY) { return "array"; }
+  return "";
+}
+
+// Writes the schema members of t (inside an open object).
+fn rapi__schema_members(d: RapiDoc*, t: RapiType*) {
+  var w: CodecJson* = &d->w;
+  var word: string = rapi__type_word(t->kind);
+  if (word.length > 0) {
+    if (t->nullable) {
+      codec_json_key(w, "type");
+      codec_json_array(w);
+      codec_json_string(w, word);
+      codec_json_string(w, "null");
+      codec_json_end(w);
+    } else {
+      codec_json_field_string(w, "type", word);
+    }
+  }
+  if (t->format.length > 0) { codec_json_field_string(w, "format", t->format); }
+  if (t->desc.length > 0) { codec_json_field_string(w, "description", t->desc); }
+  if (t->kind == RAPI_T_STRING) {
+    if (t->min_len != RAPI_UNSET) { codec_json_field_int(w, "minLength", t->min_len); }
+    if (t->max_len != RAPI_UNSET) { codec_json_field_int(w, "maxLength", t->max_len); }
+    if (t->nenum > 0) {
+      codec_json_key(w, "enum");
+      codec_json_array(w);
+      for i in 0..t->nenum { codec_json_string(w, t->enum_vals[i]); }
+      if (t->nullable) { codec_json_null(w); }
+      codec_json_end(w);
+    }
+  }
+  if (t->kind == RAPI_T_INT) {
+    var is32: bool = t->size == 4;
+    if (t->minimum != RAPI_UNSET && !(is32 && t->minimum == -2147483648)) { codec_json_field_int(w, "minimum", t->minimum); }
+    if (t->maximum != RAPI_UNSET && !(is32 && t->maximum == 2147483647)) { codec_json_field_int(w, "maximum", t->maximum); }
+  }
+  if (t->kind == RAPI_T_ARRAY) {
+    codec_json_key(w, "items");
+    rapi__schema(d, t->items);
+    if (t->min_items != RAPI_UNSET) { codec_json_field_int(w, "minItems", t->min_items); }
+    if (t->max_items != RAPI_UNSET) { codec_json_field_int(w, "maxItems", t->max_items); }
+  }
+  if (t->kind == RAPI_T_OBJECT) {
+    codec_json_key(w, "properties");
+    codec_json_object(w);
+    for i in 0..t->nfields {
+      var f: RapiField* = &t->fields[i];
+      codec_json_key(w, f->name);
+      if (f->read_only || f->desc.length > 0) {
+        codec_json_object(w);
+        if (f->type->name.length > 0) {
+          rapi__remember_named(d, f->type);
+          codec_json_field_string(w, "$ref", "#/components/schemas/" + f->type->name);
+        } else {
+          rapi__schema_members(d, f->type);
+        }
+        if (f->read_only) { codec_json_field_bool(w, "readOnly", true); }
+        if (f->desc.length > 0) { codec_json_field_string(w, "description", f->desc); }
+        codec_json_end(w);
+      } else {
+        rapi__schema(d, f->type);
+      }
+    }
+    codec_json_end(w);
+    var nreq: int32 = 0;
+    for i in 0..t->nfields {
+      if (t->fields[i].required) { nreq = nreq + 1; }
+    }
+    if (nreq > 0) {
+      codec_json_key(w, "required");
+      codec_json_array(w);
+      for i in 0..t->nfields {
+        if (t->fields[i].required) { codec_json_string(w, t->fields[i].name); }
+      }
+      codec_json_end(w);
+    }
+    if (t->closed) { codec_json_field_bool(w, "additionalProperties", false); }
+  }
+  if (t->example.length > 0) {
+    codec_json_key(w, "examples");
+    codec_json_array(w);
+    codec_json_raw(w, t->example);
+    codec_json_end(w);
+  }
+}
+
+// Writes a schema for t: a $ref for named objects, else inline.
+fn rapi__schema(d: RapiDoc*, t: RapiType*) {
+  var w: CodecJson* = &d->w;
+  codec_json_object(w);
+  if (t->kind == RAPI_T_OBJECT && t->name.length > 0) {
+    rapi__remember_named(d, t);
+    codec_json_field_string(w, "$ref", "#/components/schemas/" + t->name);
+  } else {
+    rapi__schema_members(d, t);
+  }
+  codec_json_end(w);
+}
+
+fn rapi__schema_of(d: RapiDoc*, t: RapiType*, list: bool) {
+  if (!list) { rapi__schema(d, t); return; }
+  var w: CodecJson* = &d->w;
+  codec_json_object(w);
+  codec_json_field_string(w, "type", "array");
+  codec_json_key(w, "items");
+  rapi__schema(d, t);
+  codec_json_end(w);
+}
+
+/// The operation's path in OpenAPI form ("/tasks/{id}").
+export fn rapi_openapi_path(op: RapiOp*) -> string {
+  if (op->nsegs == 0) { return "/"; }
+  var b: RzBuf* = rz_buf_new();
+  for i in 0..op->nsegs {
+    rz_buf_add_byte(b, 47);
+    if (op->is_param[i]) { rz_buf_add_byte(b, 123); }
+    rz_buf_add(b, op->segs[i]);
+    if (op->is_param[i]) { rz_buf_add_byte(b, 125); }
+  }
+  var out: string = rz_str_dup(rz_buf_str(b));
+  rz_buf_free(b);
+  return out;
+}
+
+fn rapi__in_name(in: int32) -> string {
+  if (in == RAPI_IN_PATH) { return "path"; }
+  if (in == RAPI_IN_QUERY) { return "query"; }
+  return "header";
+}
+
+fn rapi__problem_ref(w: CodecJson*, desc: string) {
+  codec_json_object(w);
+  codec_json_field_string(w, "description", desc);
+  codec_json_key(w, "content");
+  codec_json_object(w);
+  codec_json_key(w, RAPI_CT_PROBLEM);
+  codec_json_object(w);
+  codec_json_key(w, "schema");
+  codec_json_object(w);
+  codec_json_field_string(w, "$ref", "#/components/schemas/Problem");
+  codec_json_end(w);
+  codec_json_end(w);
+  codec_json_end(w);
+  codec_json_end(w);
+}
+
+fn rapi__scopes_array(w: CodecJson*, scopes: string) {
+  codec_json_array(w);
+  var start: int64 = 0;
+  var n: int64 = (int64)scopes.length;
+  for i in 0..(n + 1) {
+    if (i == n || scopes.chars[i] == 32) {
+      if ((int64)i > start) { codec_json_string(w, rz_str_sub(scopes, start, (int64)i)); }
+      start = (int64)i + 1;
+    }
+  }
+  codec_json_end(w);
+}
+
+fn rapi__operation(d: RapiDoc*, api: RapiApi*, op: RapiOp*) {
+  var w: CodecJson* = &d->w;
+  codec_json_key(w, rz_str_lower(op->verb));
+  codec_json_object(w);
+  codec_json_field_string(w, "operationId", op->id);
+  if (op->summary.length > 0) { codec_json_field_string(w, "summary", op->summary); }
+  if (op->desc.length > 0) { codec_json_field_string(w, "description", op->desc); }
+  if (op->ntags > 0) {
+    codec_json_key(w, "tags");
+    codec_json_array(w);
+    for i in 0..op->ntags { codec_json_string(w, op->tags[i]); }
+    codec_json_end(w);
+  }
+  if (op->deprecated) { codec_json_field_bool(w, "deprecated", true); }
+  if (op->nparams > 0) {
+    codec_json_key(w, "parameters");
+    codec_json_array(w);
+    for i in 0..op->nparams {
+      var p: RapiParam* = &op->params[i];
+      codec_json_object(w);
+      codec_json_field_string(w, "name", p->name);
+      codec_json_field_string(w, "in", rapi__in_name(p->in));
+      if (p->required) { codec_json_field_bool(w, "required", true); }
+      if (p->desc.length > 0) { codec_json_field_string(w, "description", p->desc); }
+      if (p->in == RAPI_IN_QUERY && p->type->kind == RAPI_T_ARRAY) {
+        codec_json_field_string(w, "style", "form");
+        codec_json_field_bool(w, "explode", true);
+      }
+      if (p->in == RAPI_IN_QUERY && p->type->kind == RAPI_T_OBJECT) {
+        codec_json_field_string(w, "style", "deepObject");
+        codec_json_field_bool(w, "explode", true);
+      }
+      codec_json_key(w, "schema");
+      codec_json_object(w);
+      rapi__schema_members(d, p->type);
+      if (p->def.length > 0) {
+        codec_json_key(w, "default");
+        if (p->type->kind == RAPI_T_STRING) { codec_json_string(w, p->def); } else { codec_json_raw(w, p->def); }
+      }
+      codec_json_end(w);
+      codec_json_end(w);
+    }
+    codec_json_end(w);
+  }
+  if (op->body != 0) {
+    codec_json_key(w, "requestBody");
+    codec_json_object(w);
+    if (op->body_required) { codec_json_field_bool(w, "required", true); }
+    codec_json_key(w, "content");
+    codec_json_object(w);
+    var media: string = op->body_media;
+    if (media.length == 0) { media = "application/json"; }
+    codec_json_key(w, media);
+    codec_json_object(w);
+    codec_json_key(w, "schema");
+    rapi__schema_of(d, op->body, op->body_list);
+    codec_json_end(w);
+    codec_json_end(w);
+    codec_json_end(w);
+  }
+  codec_json_key(w, "responses");
+  codec_json_object(w);
+  if (op->nresps == 0) {
+    codec_json_key(w, "200");
+    codec_json_object(w);
+    codec_json_field_string(w, "description", "OK");
+    codec_json_end(w);
+  }
+  for i in 0..op->nresps {
+    var rs: RapiResp* = &op->resps[i];
+    var code: string = rz_int_str((int64)rs->status);
+    codec_json_key(w, code);
+    codec_json_object(w);
+    var desc: string = rs->desc;
+    if (desc.length == 0) { desc = rz_status_reason(rs->status); }
+    codec_json_field_string(w, "description", desc);
+    if (rs->type != 0) {
+      codec_json_key(w, "content");
+      codec_json_object(w);
+      var rm: string = rs->media;
+      if (rm.length == 0) { rm = "application/json"; }
+      codec_json_key(w, rm);
+      codec_json_object(w);
+      codec_json_key(w, "schema");
+      rapi__schema_of(d, rs->type, rs->list);
+      codec_json_end(w);
+      codec_json_end(w);
+    }
+    codec_json_end(w);
+  }
+  codec_json_key(w, "default");
+  rapi__problem_ref(w, "An error, as RFC 9457 problem details");
+  codec_json_end(w);
+  if (op->security && api->security_name.length > 0) {
+    codec_json_key(w, "security");
+    codec_json_array(w);
+    codec_json_object(w);
+    codec_json_key(w, api->security_name);
+    rapi__scopes_array(w, op->scopes);
+    codec_json_end(w);
+    codec_json_end(w);
+  }
+  codec_json_end(w);
+}
+
+fn rapi__problem_schema(w: CodecJson*) {
+  codec_json_raw(w, "{{\"type\":\"object\",\"description\":\"RFC 9457 problem details\",\"properties\":{{"
+    + "\"type\":{{\"type\":\"string\",\"format\":\"uri-reference\",\"default\":\"about:blank\"},"
+    + "\"title\":{{\"type\":\"string\"},\"status\":{{\"type\":\"integer\"},\"detail\":{{\"type\":\"string\"},"
+    + "\"instance\":{{\"type\":\"string\",\"format\":\"uri-reference\"},"
+    + "\"errors\":{{\"type\":\"array\",\"items\":{{\"type\":\"object\",\"properties\":{{"
+    + "\"detail\":{{\"type\":\"string\"},\"pointer\":{{\"type\":\"string\",\"description\":\"JSON Pointer (RFC 6901) into the body\"},"
+    + "\"parameter\":{{\"type\":\"string\"},\"in\":{{\"type\":\"string\",\"enum\":[\"path\",\"query\",\"header\",\"body\"]}},"
+    + "\"required\":[\"detail\"]}}}}");
+}
+
+/// Writes the OpenAPI 3.1 document of `api` into `b` (cleared first), pretty when
+/// `indent` > 0. Returns CODEC_OK or the writer's error.
+export fn rapi_openapi_write(api: RapiApi*, b: CodecBuf*, indent: int32) -> int32 {
+  codec_buf_clear(b);
+  var d: RapiDoc* = (RapiDoc*)calloc(1, sizeof(RapiDoc));
+  var w: CodecJson* = &d->w;
+  codec_json_init_flags(w, b, CODEC_JSON_LOSSY_UTF8);
+  if (indent > 0) { codec_json_pretty(w, indent); }
+  codec_json_object(w);
+  codec_json_field_string(w, "openapi", "3.1.0");
+  codec_json_field_string(w, "jsonSchemaDialect", "https://spec.openapis.org/oas/3.1/dialect/base");
+  codec_json_key(w, "info");
+  codec_json_object(w);
+  codec_json_field_string(w, "title", api->title);
+  codec_json_field_string(w, "version", api->version);
+  if (api->desc.length > 0) { codec_json_field_string(w, "description", api->desc); }
+  codec_json_end(w);
+  if (api->nservers > 0 || api->base.length > 0) {
+    codec_json_key(w, "servers");
+    codec_json_array(w);
+    if (api->nservers == 0) {
+      codec_json_object(w);
+      codec_json_field_string(w, "url", api->base);
+      codec_json_end(w);
+    }
+    for i in 0..api->nservers {
+      codec_json_object(w);
+      codec_json_field_string(w, "url", api->servers[i] + api->base);
+      codec_json_end(w);
+    }
+    codec_json_end(w);
+  }
+  codec_json_key(w, "paths");
+  codec_json_object(w);
+  for i in 0..api->nops {
+    var op: RapiOp* = api->ops[i];
+    var first: bool = true;
+    for k in 0..i {
+      if (rz_str_eq(api->ops[k]->path, op->path)) { first = false; }
+    }
+    if (!first) { continue; }
+    codec_json_key(w, rapi_openapi_path(op));
+    codec_json_object(w);
+    for k in i..api->nops {
+      if (rz_str_eq(api->ops[k]->path, op->path)) { rapi__operation(d, api, api->ops[k]); }
+    }
+    codec_json_end(w);
+  }
+  codec_json_end(w);
+  codec_json_key(w, "components");
+  codec_json_object(w);
+  codec_json_key(w, "schemas");
+  codec_json_object(w);
+  codec_json_key(w, "Problem");
+  rapi__problem_schema(w);
+  // Named types can pull in more named types while being written.
+  var done: int32 = 0;
+  while (done < d->nnamed) {
+    var t: RapiType* = d->named[done];
+    codec_json_key(w, t->name);
+    codec_json_object(w);
+    rapi__schema_members(d, t);
+    codec_json_end(w);
+    done = done + 1;
+  }
+  codec_json_end(w);
+  if (api->security_name.length > 0) {
+    codec_json_key(w, "securitySchemes");
+    codec_json_object(w);
+    codec_json_key(w, api->security_name);
+    codec_json_raw(w, api->security_json);
+    codec_json_end(w);
+  }
+  codec_json_end(w);
+  codec_json_end(w);
+  var rc: int32 = codec_json_finish(w);
+  free((rawptr)d);
+  return rc;
+}
+
+/// internal: route/dispatch. Sends the document.
+export fn rapi_openapi_send(api: RapiApi*, ctx: RzContext*) -> int32 {
+  var b: CodecBuf;
+  codec_buf_init(&b, 4096);
+  if (rapi_openapi_write(api, &b, 0) != CODEC_OK) {
+    codec_buf_free(&b);
+    return rapi_problem(ctx, 500, "");
+  }
+  var body: string = rz_arena_str(ctx->arena, codec_buf_view(&b));
+  codec_buf_free(&b);
+  return rz_ctx_bytes(ctx, 200, "application/vnd.oai.openapi+json;version=3.1", body);
+}
+
+fn rapi__html_escape(b: RzBuf*, s: string) {
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 60) { rz_buf_add(b, "&lt;"); }
+    else if (c == 62) { rz_buf_add(b, "&gt;"); }
+    else if (c == 38) { rz_buf_add(b, "&amp;"); }
+    else if (c == 34) { rz_buf_add(b, "&quot;"); }
+    else if (c == 39) { rz_buf_add(b, "&#39;"); }
+    else { rz_buf_add_byte(b, c); }
+  }
+}
+
+/// Points the docs page at another copy of swagger-ui-dist (a URL without the
+/// trailing slash, such as one you serve yourself).
+export fn rapi_docs_cdn(api: RapiApi*, url: string) { api->docs_script = rz_str_dup(url); }
+
+/// internal: route/dispatch. Sends the docs page.
+export fn rapi_docs_send(api: RapiApi*, ctx: RzContext*) -> int32 {
+  var cdn: string = api->docs_script;
+  if (cdn.length == 0) { cdn = RAPI_DOCS_CDN; }
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+  rz_buf_add(b, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>");
+  rapi__html_escape(b, api->title);
+  rz_buf_add(b, "</title>\n<link rel=\"stylesheet\" href=\"");
+  rapi__html_escape(b, cdn);
+  rz_buf_add(b, "/swagger-ui.css\">\n</head>\n<body>\n<div id=\"docs\"></div>\n<script src=\"");
+  rapi__html_escape(b, cdn);
+  rz_buf_add(b, "/swagger-ui-bundle.js\"></script>\n<script>\nSwaggerUIBundle({{ url: \"");
+  rapi__html_escape(b, api->base + api->openapi_path);
+  rz_buf_add(b, "\", dom_id: \"#docs\" });\n</script>\n</body>\n</html>\n");
+  var body: string = rz_arena_str(ctx->arena, rz_buf_str(b));
+  rz_buf_free(b);
+  return rz_ctx_html(ctx, 200, body);
+}

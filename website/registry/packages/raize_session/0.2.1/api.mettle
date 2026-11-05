@@ -1,0 +1,218 @@
+// raize_session/api — what handlers and guards call: session values, rotation,
+// logout, the CSRF token and flash messages.
+// reference: sessions
+// thread: every function runs on the worker serving the request, inside the session
+// middleware (rz_use_session); outside it they do nothing and return ""/false/
+// RZ_E_USAGE. The calls that write (put, rotate, drop, flash, a first token) reach
+// the app's SesStore, which must be thread-safe.
+//
+// A request without a session gets one the first time a handler writes to it (put,
+// rz_flash_put, rz_csrf_token, rz_session_rotate); the middleware then sets the
+// cookie. Values are saved after the handler returns.
+
+import "ses/session";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/arena";
+import "raize_core/context/context";
+import "state";
+
+/// A value stored in the request's session.
+///
+/// in:      ctx the request; key the name (1..64 bytes)
+/// returns: the value, or "" when there is no session or no such key
+/// owns:    a copy in the request arena; valid until the handler returns
+/// thread:  the worker serving the request
+/// example:
+///   var user: string = rz_session_get(ctx, "user");
+///   if (user.length == 0) { return rz_ctx_redirect(ctx, 303, "/login"); }
+export fn rz_session_get(ctx: RzContext*, key: string) -> string {
+  var r: Rz_SesReq* = rz__ses_req(ctx);
+  if (r == 0 || !ses_is_live(&r->s)) { return rz_str_empty(); }
+  var v: string = rz_str_empty();
+  if (ses_data_get(&r->s, key, &v) != SES_OK) { return rz_str_empty(); }
+  return rz_arena_str(ctx->arena, v);
+}
+
+/// Stores a value in the session, creating the session if the request has none.
+/// Saved when the handler returns.
+///
+/// in:      ctx the request; key 1..64 bytes; value 0..1024 bytes (32 keys, 4096
+///          bytes in all)
+/// returns: RZ_OK; RZ_E_INVALID (key or value too long, session full);
+///          RZ_E_USAGE (no rz_use_session) ; RZ_E_IO (the store refused a new
+///          session)
+/// owns:    copies key and value
+/// thread:  the worker serving the request
+/// example:
+///   rz_session_put(ctx, "user", name);
+///   rz_session_rotate(ctx);   // after a login
+export fn rz_session_put(ctx: RzContext*, key: string, value: string) -> int32 {
+  if (rz__ses_req(ctx) == 0) { return RZ_E_USAGE; }
+  var r: Rz_SesReq* = rz__ses_ensure(ctx);
+  if (r == 0) { return RZ_E_IO; }
+  return rz__ses_status(ses_data_set(&r->s, key, value));
+}
+
+/// Removes a value from the session (nothing happens when absent).
+///
+/// in:      ctx the request; key the name
+/// returns: nothing
+/// owns:    nothing
+/// thread:  the worker serving the request
+/// example:
+///   rz_session_delete(ctx, "cart");
+export fn rz_session_delete(ctx: RzContext*, key: string) {
+  var r: Rz_SesReq* = rz__ses_req(ctx);
+  if (r == 0 || !ses_is_live(&r->s)) { return; }
+  ses_data_del(&r->s, key);
+}
+
+/// Gives the session a new id (cookie) and a new CSRF token, keeping its values. Call
+/// it on login and on every privilege change: the old id stops working at once
+/// (session fixation). Creates a session when the request has none.
+///
+/// in:      ctx the request
+/// returns: RZ_OK; RZ_E_USAGE (no rz_use_session); RZ_E_IO (the store refused; the
+///          old id still works)
+/// owns:    nothing
+/// thread:  the worker serving the request
+/// example:
+///   rz_session_put(ctx, "user", name);
+///   rz_session_rotate(ctx);
+///   return rz_ctx_redirect(ctx, 303, "/");
+export fn rz_session_rotate(ctx: RzContext*) -> int32 {
+  var r: Rz_SesReq* = rz__ses_req(ctx);
+  if (r == 0) { return RZ_E_USAGE; }
+  if (!ses_is_live(&r->s)) {
+    if (rz__ses_ensure(ctx) == 0) { return RZ_E_IO; }
+    return RZ_OK;
+  }
+  var rc: int32 = ses_rotate(&rz__ses_global()->m, &r->s, r->now, &r->tok);
+  if (rc != SES_OK) { return rz__ses_status(rc); }
+  r->set_cookie = true;
+  return RZ_OK;
+}
+
+/// Signs the session in as a user: sets its subject (the owner id the session library
+/// indexes, so ses_revoke_subject can end one user's sessions) and rotates the id and
+/// CSRF token, keeping the values. Call it on login instead of rz_session_rotate; keep
+/// the user's name in the data as well if handlers read it. Creates a session when the
+/// request has none.
+///
+/// in:      ctx the request; subject 1..256 bytes (the user id)
+/// returns: RZ_OK; RZ_E_USAGE (no rz_use_session); RZ_E_INVALID (empty or oversized
+///          subject); RZ_E_IO (the store refused; the old id still works)
+/// owns:    copies subject
+/// thread:  the worker serving the request
+/// example:
+///   rz_session_put(ctx, "user", name);
+///   rz_session_login(ctx, name);
+///   return rz_ctx_redirect(ctx, 303, "/");
+export fn rz_session_login(ctx: RzContext*, subject: string) -> int32 {
+  if (rz__ses_req(ctx) == 0) { return RZ_E_USAGE; }
+  var r: Rz_SesReq* = rz__ses_ensure(ctx);
+  if (r == 0) { return RZ_E_IO; }
+  var rc: int32 = ses_set_subject(&rz__ses_global()->m, &r->s, subject);
+  if (rc != SES_OK) { return rz__ses_status(rc); }
+  return rz_session_rotate(ctx);
+}
+
+/// Ends the session (logout): it is revoked in the store and the cookie is cleared.
+/// A later write in the same request starts a fresh session.
+///
+/// in:      ctx the request
+/// returns: nothing
+/// owns:    nothing
+/// thread:  the worker serving the request
+/// example:
+///   rz_session_drop(ctx);
+///   return rz_ctx_redirect(ctx, 303, "/");
+export fn rz_session_drop(ctx: RzContext*) {
+  var r: Rz_SesReq* = rz__ses_req(ctx);
+  if (r == 0) { return; }
+  if (ses_is_live(&r->s)) { ses_revoke(&rz__ses_global()->m, &r->s); }
+  r->s.live = false;
+  ses_token_wipe(&r->tok);
+  r->set_cookie = false;
+  r->clear = true;
+}
+
+/// Whether the request carries a live session (from its cookie, or created by this
+/// handler).
+///
+/// in:      ctx the request
+/// returns: true when there is one
+/// owns:    nothing
+/// thread:  the worker serving the request
+/// example:
+///   if (!rz_session_id_present(ctx)) { return rz_ctx_redirect(ctx, 303, "/login"); }
+export fn rz_session_id_present(ctx: RzContext*) -> bool {
+  var r: Rz_SesReq* = rz__ses_req(ctx);
+  if (r == 0) { return false; }
+  return ses_is_live(&r->s);
+}
+
+/// The session's CSRF token, for a hidden `_csrf` form field or an X-CSRF-Token
+/// header (a `<meta>` tag for scripts). Creates a session when the request has none,
+/// so a login form is protected too. It changes on rz_session_rotate.
+///
+/// in:      ctx the request
+/// returns: the token (43 characters), or "" outside the middleware or when the
+///          store refused a new session
+/// owns:    a copy in the request arena; valid until the handler returns
+/// thread:  the worker serving the request
+/// example:
+///   var t: string = rz_csrf_token(ctx);
+///   html"""<input type="hidden" name="_csrf" value="{t}">"""
+export fn rz_csrf_token(ctx: RzContext*) -> string {
+  var r: Rz_SesReq* = rz__ses_ensure(ctx);
+  if (r == 0) { return rz_str_empty(); }
+  var t: SesToken;
+  if (ses_csrf_token(&r->s, &t) != SES_OK) { return rz_str_empty(); }
+  return rz_arena_str(ctx->arena, ses_token_str(&t));
+}
+
+/// Queues a message for the next request of this session (after a redirect), which
+/// reads it once with rz_flash_take. Creates a session when the request has none.
+///
+/// in:      ctx the request; kind 1..32 bytes ("notice", "error"); msg 0..512 bytes
+/// returns: RZ_OK; RZ_E_INVALID (too long, or more than 8 queued); RZ_E_USAGE (no
+///          rz_use_session); RZ_E_IO (the store refused a new session)
+/// owns:    copies kind and msg
+/// thread:  the worker serving the request
+/// example:
+///   rz_flash_put(ctx, "notice", "Saved.");
+///   return rz_ctx_redirect(ctx, 303, "/notes");
+export fn rz_flash_put(ctx: RzContext*, kind: string, msg: string) -> int32 {
+  if (rz__ses_req(ctx) == 0) { return RZ_E_USAGE; }
+  var r: Rz_SesReq* = rz__ses_ensure(ctx);
+  if (r == 0) { return RZ_E_IO; }
+  return rz__ses_status(ses_flash_add(&r->s, kind, msg));
+}
+
+/// Takes the first message of `kind` this request received (queued by the previous
+/// request); a second take of the same kind gives the next one, then "". Messages
+/// arrive once: the next request no longer sees them.
+///
+/// in:      ctx the request; kind the kind given to rz_flash_put
+/// returns: the message, or "" when there is none (left)
+/// owns:    a copy in the request arena; valid until the handler returns
+/// thread:  the worker serving the request
+/// example:
+///   var note: string = rz_flash_take(ctx, "notice");
+export fn rz_flash_take(ctx: RzContext*, kind: string) -> string {
+  var r: Rz_SesReq* = rz__ses_req(ctx);
+  if (r == 0 || !ses_is_live(&r->s)) { return rz_str_empty(); }
+  var n: int32 = ses_flash_count(&r->s);
+  for i in 0..n {
+    var k: string = rz_str_empty();
+    var t: string = rz_str_empty();
+    var bit: int32 = 1 << i;
+    if ((r->taken & bit) == 0 && ses_flash_at(&r->s, i, &k, &t) == SES_OK && rz_str_eq(k, kind)) {
+      r->taken = r->taken | bit;
+      return rz_arena_str(ctx->arena, t);
+    }
+  }
+  return rz_str_empty();
+}

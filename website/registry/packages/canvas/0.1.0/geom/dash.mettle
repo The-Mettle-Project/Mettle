@@ -1,0 +1,219 @@
+// Dashing: cuts polylines into dashes by length, as SVG's
+// stroke-dasharray and stroke-dashoffset say. An odd list is repeated to
+// make it even; a list with a negative value or a zero total is ignored.
+// The pattern starts over on each contour. On a closed contour, a dash
+// running over the start joins the first dash (as Skia does).
+
+import "../core/base";
+import "flatten";
+import "transform";
+
+fn piece_begin(out: CanvasPoly*, x: float32, y: float32) {
+  canvas_poly_begin(out);
+  canvas_poly_add(out, x, y, 0);
+}
+
+// Where the dash pattern stands.
+struct DS {
+  di: int32; on: bool; left: float32; pieces: int64;
+  d: float32*; nd: int32; n: int32; k: float32; total: float32;
+}
+
+@inline fn ds_next(st: DS*) {
+  st->di = (st->di + 1) % st->n;
+  st->on = !st->on;
+  st->left = st->d[st->di % st->nd] * st->k;
+}
+
+// Moves the pattern along len without making dashes; the stretch ends at
+// (bx, by), where a dash that is on goes on.
+fn ds_skip(st: DS*, out: CanvasPoly*, len: float32, bx: float32, by: float32) {
+  var rem: float32 = len;
+  var switched: bool = false;
+  if (rem >= st->left) {
+    rem = rem - st->left;
+    ds_next(st);
+    switched = true;
+    // whole patterns change nothing
+    var r64: float64 = (float64)rem;
+    r64 = r64 - (float64)st->total * (float64)canvas_floorf((float32)(r64 / (float64)st->total));
+    rem = (float32)r64;
+    if (!(rem >= 0.0) || !(rem < st->total)) { rem = 0.0; }
+    var g: int32 = 0;
+    while (rem >= st->left && g < 2 * st->n) {
+      rem = rem - st->left;
+      ds_next(st);
+      g = g + 1;
+    }
+  }
+  st->left = st->left - rem;
+  if (st->on) {
+    if (switched) {
+      piece_begin(out, bx, by);
+      st->pieces = st->pieces + 1;
+    } else {
+      canvas_poly_add(out, bx, by, 0);
+    }
+  }
+}
+
+// Dashes the line (ax, ay)-(bx, by); f is the flag of the end point.
+fn ds_walk(st: DS*, out: CanvasPoly*, ax: float32, ay: float32, bx: float32, by: float32, f: uint8) -> bool {
+  var dx: float32 = bx - ax; var dy: float32 = by - ay;
+  var len: float32 = canvas_sqrt(dx * dx + dy * dy);
+  var pos: float32 = 0.0;
+  while (len - pos >= st->left) {
+    pos = pos + st->left;
+    var t: float32 = pos / len;
+    var x: float32 = ax + dx * t;
+    var y: float32 = ay + dy * t;
+    if (st->on) { canvas_poly_add(out, x, y, 0); }
+    ds_next(st);
+    if (st->on) {
+      piece_begin(out, x, y);
+      st->pieces = st->pieces + 1;
+      if (st->pieces > 1000000) { return false; }
+    }
+    if (out->failed) { return false; }
+  }
+  st->left = st->left - (len - pos);
+  if (st->on) { canvas_poly_add(out, bx, by, f); }
+  return true;
+}
+
+// The part [t0, t1] of a + t (dx, dy) inside r (Liang-Barsky); t1 <= t0
+// when none is.
+fn clip_seg(ax: float32, ay: float32, dx: float32, dy: float32, r: CanvasRect*, t0: float32*, t1: float32*) {
+  var p: float32[4] = [-dx, dx, -dy, dy];
+  var q: float32[4] = [ax - r->x0, r->x1 - ax, ay - r->y0, r->y1 - ay];
+  var lo: float32 = 0.0;
+  var hi: float32 = 1.0;
+  for i in 0..4 {
+    if (p[i] == 0.0) {
+      if (q[i] < 0.0) { lo = 1.0; hi = 0.0; }
+    } else {
+      var v: float32 = q[i] / p[i];
+      if (p[i] < 0.0) { if (v > lo) { lo = v; } }
+      else { if (v < hi) { hi = v; } }
+    }
+  }
+  if (!(lo == lo) || !(hi == hi)) { lo = 0.0; hi = 1.0; }
+  *t0 = lo;
+  *t1 = hi;
+}
+
+/// True when the dash list should be used.
+export fn canvas_dash_ok(d: float32*, n: int32) -> bool {
+  if (d == 0 || n <= 0) { return false; }
+  var total: float32 = 0.0;
+  for i in 0..n {
+    if (!(d[i] >= 0.0) || !canvas_finite(d[i])) { return false; }
+    total = total + d[i];
+  }
+  return total > 0.0 && canvas_finite(total);
+}
+
+/// Dashes every contour of q into out (cleared first), with lengths scaled
+/// by k (to dash in a space other than the one the lengths are in). When
+/// cull is not 0, only the parts of segments inside it get dashes; the rest
+/// only moves the pattern on (Skia culls dashes the same way), so a long
+/// line mostly off the pixmap costs almost nothing.
+export fn canvas_dash_poly(q: CanvasPoly*, d: float32*, nd: int32, offset: float32, k: float32, cull: CanvasRect*, out: CanvasPoly*) -> bool {
+  canvas_poly_reset(out);
+  var n: int32 = nd;
+  if (n % 2 == 1) { n = n * 2; }
+  var total: float32 = 0.0;
+  for i in 0..n { total = total + d[i % nd] * k; }
+  if (!(total > 0.0)) { return false; }
+  // a pattern with tiny dashes on a long path could make millions of
+  // pieces; refuse more than this many per contour
+  var max_pieces: int64 = 1000000;
+  // starting place in the pattern
+  var o64: float64 = (float64)offset * (float64)k;
+  if (!canvas_finite(offset)) { o64 = 0.0; }
+  var t64: float64 = (float64)total;
+  o64 = o64 - t64 * (float64)canvas_floorf((float32)(o64 / t64));
+  if (!(o64 >= 0.0 && o64 < t64)) { o64 = 0.0; }   // too big to place exactly
+  var off: float32 = (float32)o64;
+  var start_i: int32 = 0;
+  var guard: int32 = 0;
+  while (off >= d[start_i % nd] * k && off > 0.0 && guard < n) {
+    off = off - d[start_i % nd] * k;
+    start_i = (start_i + 1) % n;
+    guard = guard + 1;
+  }
+  var st: DS;
+  st.d = d; st.nd = nd; st.n = n; st.k = k; st.total = total;
+  for c in 0..q->nconts {
+    var ct: CanvasContour* = q->conts + c;
+    if (ct->count < 1) { continue; }
+    var p: float32* = q->xy + ct->start * 2;
+    var fl: uint8* = q->flags + ct->start;
+    var di: int32 = start_i;
+    var left: float32 = d[di % nd] * k - off;   // length left in this dash or gap
+    var on: bool = di % 2 == 0;
+    var first_piece: int64 = out->nconts;
+    var started_on: bool = on;
+    var pieces: int64 = 0;
+    if (on) { piece_begin(out, p[0], p[1]); pieces = 1; }
+    var segs: int64 = ct->count - 1;
+    if (ct->closed) { segs = ct->count; }
+    // refuse up front when the visible length would make too many dashes
+    var vis: float64 = 0.0;
+    for s2 in 0..segs {
+      var j2: int64 = s2 + 1;
+      if (j2 == ct->count) { j2 = 0; }
+      var ex: float32 = p[j2 * 2] - p[s2 * 2];
+      var ey: float32 = p[j2 * 2 + 1] - p[s2 * 2 + 1];
+      var u0: float32 = 0.0;
+      var u1: float32 = 1.0;
+      if (cull != 0) { clip_seg(p[s2 * 2], p[s2 * 2 + 1], ex, ey, cull, &u0, &u1); }
+      if (u1 > u0) { vis = vis + (float64)canvas_sqrt(ex * ex + ey * ey) * (float64)(u1 - u0); }
+    }
+    if (vis / (float64)total * (float64)(n / 2) > (float64)max_pieces) { return false; }
+    var ended_on: bool = on;
+    for s in 0..segs {
+      var j: int64 = s + 1;
+      if (j == ct->count) { j = 0; }
+      var ax: float32 = p[s * 2]; var ay: float32 = p[s * 2 + 1];
+      var bx: float32 = p[j * 2]; var by: float32 = p[j * 2 + 1];
+      var dx: float32 = bx - ax; var dy: float32 = by - ay;
+      var len: float32 = canvas_sqrt(dx * dx + dy * dy);
+      var f: uint8 = 0;
+      if (j != 0) { f = fl[j]; }
+      st.di = di; st.on = on; st.left = left; st.pieces = pieces;
+      var t0: float32 = 0.0;
+      var t1: float32 = 1.0;
+      if (cull != 0) { clip_seg(ax, ay, dx, dy, cull, &t0, &t1); }
+      if (t1 <= t0) {
+        ds_skip(&st, out, len, bx, by);
+      } else {
+        var px0: float32 = ax + dx * t0; var py0: float32 = ay + dy * t0;
+        var px1: float32 = ax + dx * t1; var py1: float32 = ay + dy * t1;
+        if (t0 > 0.0) { ds_skip(&st, out, len * t0, px0, py0); }
+        var fe: uint8 = 0;
+        if (t1 >= 1.0) { fe = f; }
+        if (!ds_walk(&st, out, px0, py0, px1, py1, fe)) { return false; }
+        if (t1 < 1.0) { ds_skip(&st, out, len * (1.0 - t1), bx, by); }
+      }
+      di = st.di; on = st.on; left = st.left; pieces = st.pieces;
+      if (pieces > max_pieces || out->failed) { return false; }
+    }
+    ended_on = on;
+    // join the last dash of a closed contour onto the first
+    if (ct->closed && started_on && ended_on && out->nconts - first_piece >= 2) {
+      var firstc: CanvasContour = out->conts[first_piece];
+      // append the first piece's points (skipping its first) to the last piece
+      for i in 1..firstc.count {
+        var xi: float32 = out->xy[(firstc.start + i) * 2];
+        var yi: float32 = out->xy[(firstc.start + i) * 2 + 1];
+        canvas_poly_add(out, xi, yi, out->flags[firstc.start + i]);
+      }
+      out->conts[first_piece].count = 0;
+    } else if (ct->closed && started_on && ended_on && out->nconts - first_piece == 1 && pieces == 1) {
+      // the whole contour is one dash: keep it closed
+      canvas_poly_close(out);
+    }
+  }
+  return !out->failed;
+}

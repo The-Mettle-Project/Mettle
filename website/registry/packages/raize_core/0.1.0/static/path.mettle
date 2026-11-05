@@ -1,0 +1,105 @@
+// raize/static/path — turning a URL path into a file path, safely.
+//
+// The input here is a *relative* path already split off by the mount prefix
+// (static.mettle). It is a decoded view; the server's parser percent-decoded
+// and normalized req->path before the router saw it, so this layer must assume
+// the bytes are final and check them again anyway. Defence in depth is the
+// point: the router's 400 is not a reason for the file server to trust `..`.
+//
+// Refused, with no filesystem call:
+//   * an empty path, or one longer than RZ_STATIC_MAX_REL;
+//   * a leading '/' (absolute path) — the path is relative by construction;
+//   * any NUL byte, any backslash, any control byte;
+//   * any empty segment (a//b), "." or ".." segment.
+//
+// Allowed: ordinary bytes, spaces, UTF-8, and a trailing extension. There is
+// no dotfile rule beyond "..": ".well-known" is a legal file name, and a
+// directory is refused later (it is never listed).
+//
+// Containment is checked twice. rz_static_rel_ok is lexical; after realpath()
+// the resolved path must still be inside the canonical root, which also
+// catches symlinks that point out of the tree.
+
+import "../str/str";
+
+export const RZ_STATIC_MAX_REL: int64 = 1024;
+export const RZ_STATIC_MAX_PATH: int64 = 4096;
+
+fn rz_static_seg_is_dots(rel: string, start: int64, end: int64) -> bool {
+  var n: int64 = end - start;
+  if (n == 1 && rel.chars[start] == 46) { return true; }
+  if (n == 2 && rel.chars[start] == 46 && rel.chars[start + 1] == 46) { return true; }
+  return false;
+}
+
+// One pass, no allocation. Segment boundaries are tracked so "." and ".." are
+// rejected as whole segments; "x..y" and ".hidden" are ordinary names.
+export fn rz_static_rel_ok(rel: string) -> bool {
+  var n: int64 = (int64)rel.length;
+  if (n <= 0) { return false; }
+  if (n > RZ_STATIC_MAX_REL) { return false; }
+  if (rel.chars[0] == 47) { return false; }
+  var seg_start: int64 = 0;
+  var i: int64 = 0;
+  while (i <= n) {
+    var at_end: bool = i == n;
+    var c: int32 = 0;
+    if (!at_end) { c = (int32)rel.chars[i]; }
+    if (at_end || c == 47) {
+      if (i == seg_start) { return false; }             // empty segment
+      if (rz_static_seg_is_dots(rel, seg_start, i)) { return false; }
+      seg_start = i + 1;
+    } else {
+      if (c == 0) { return false; }                     // NUL truncates a C path
+      if (c == 92) { return false; }                    // backslash is not a separator here
+      if (c < 32 || c == 127) { return false; }         // control bytes
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// root [+ '/'] + rel + NUL, into caller storage. Returns the byte length, or
+// -1 when it would not fit. root is canonical (rz_static_new) so the one
+// special case is the filesystem root: "/" must not become "//x".
+export fn rz_static_join(root: string, rel: string, buf: uint8*, cap: int64) -> int64 {
+  if (buf == 0 || cap <= 0) { return -1; }
+  var rn: int64 = (int64)root.length;
+  var ln: int64 = (int64)rel.length;
+  var need: int64 = rn + ln + 2;
+  if (need > cap) { return -1; }
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < rn) {
+    buf[o] = root.chars[i];
+    o = o + 1;
+    i = i + 1;
+  }
+  var root_is_slash: bool = rn == 1 && root.chars[0] == 47;
+  if (!root_is_slash) {
+    buf[o] = 47;
+    o = o + 1;
+  }
+  i = 0;
+  while (i < ln) {
+    buf[o] = rel.chars[i];
+    o = o + 1;
+    i = i + 1;
+  }
+  buf[o] = 0;
+  return o;
+}
+
+// True when `resolved` is strictly below `root`. A directory equal to the
+// root is not servable, so strict containment is the right test, not `<=`.
+export fn rz_static_within(root: string, resolved: string) -> bool {
+  var rn: int64 = (int64)root.length;
+  var n: int64 = (int64)resolved.length;
+  if (rn <= 0) { return false; }
+  if (rn == 1 && root.chars[0] == 47) {
+    return n > 1 && resolved.chars[0] == 47;
+  }
+  if (n <= rn) { return false; }
+  if (!rz_str_eq(rz_str_sub(resolved, 0, rn), root)) { return false; }
+  return resolved.chars[rn] == 47;
+}

@@ -1,0 +1,328 @@
+// raize/context/query — percent-decoding, request-target splitting, path
+// normalization, and query-string lookup.
+//
+// Decisions, documented once (the architecture review asks for each of these
+// to be explicit rather than accidental):
+//
+//   * `+` means space in the *query string* only, never in a path.
+//   * An invalid percent escape (a '%' not followed by two hex digits) is kept
+//     literally. It is not a 400: a literal '%' in a query value is common and
+//     clients send it unescaped. A path is different — see the next rule.
+//   * A path is percent-decoded *first*, then normalized (`//` collapsed,
+//     `.` dropped, `..` popped), and only then matched. Decoding after
+//     matching is the classic `%2e%2e` traversal bug, so the order here is
+//     the security boundary.
+//   * A `..` that would pop above the root, or a NUL byte in a decoded path,
+//     makes normalization fail (empty string); the parser turns that into 400.
+//   * The query string is never decoded wholesale. It stays a raw view and a
+//     field is decoded on demand, which keeps `RzRequest` free of a second
+//     params array and makes an unused query string cost nothing.
+//
+// Nothing here allocates outside the caller's arena.
+
+import "../str/str";
+import "arena";
+import "header";
+
+fn rz_hex_value(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return -1;
+}
+
+// Decoded copy in the arena. Returns the input view unchanged when there is
+// nothing to decode (no allocation, no copy).
+export fn rz_pct_decode(s: string, plus_as_space: bool, arena: RzArena*) -> string {
+  var n: int64 = (int64)s.length;
+  if (n <= 0) { return rz_str_empty(); }
+  var needs: bool = false;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 37) { needs = true; }
+    if (c == 43 && plus_as_space) { needs = true; }
+    i = i + 1;
+  }
+  if (!needs) { return s; }
+  var out: uint8* = rz_arena_alloc(arena, n);
+  if (out == 0) { return rz_str_empty(); }
+  var o: int64 = 0;
+  i = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 37 && i + 2 < n) {
+      var hi: int32 = rz_hex_value((int32)s.chars[i + 1]);
+      var lo: int32 = rz_hex_value((int32)s.chars[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out[o] = (uint8)(hi * 16 + lo);
+        o = o + 1;
+        i = i + 3;
+      } else {
+        out[o] = (uint8)c;
+        o = o + 1;
+        i = i + 1;
+      }
+    } else if (c == 43 && plus_as_space) {
+      out[o] = (uint8)32;
+      o = o + 1;
+      i = i + 1;
+    } else {
+      out[o] = (uint8)c;
+      o = o + 1;
+      i = i + 1;
+    }
+  }
+  return rz_str_view(out, o);
+}
+
+// How many `&`-separated non-empty fields the raw query holds. Used to bound
+// iteration; it never allocates.
+export fn rz_query_count(q: string) -> int32 {
+  var n: int64 = (int64)q.length;
+  if (n <= 0) { return 0; }
+  var count: int32 = 0;
+  var start: int64 = 0;
+  var i: int64 = 0;
+  while (i <= n) {
+    var at_end: bool = i == n;
+    var c: int32 = 0;
+    if (!at_end) { c = (int32)q.chars[i]; }
+    if (at_end || c == 38) {
+      if (i > start) { count = count + 1; }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return count;
+}
+
+// The i-th `<name>[=<value>]` pair, decoded into the arena. Returns false when
+// i is past the end (or the arena is exhausted).
+export fn rz_query_at(q: string, i: int32, arena: RzArena*, out_name: string*, out_value: string*) -> bool {
+  if (i < 0) { return false; }
+  var n: int64 = (int64)q.length;
+  var seen: int32 = 0;
+  var start: int64 = 0;
+  var k: int64 = 0;
+  while (k <= n) {
+    var at_end: bool = k == n;
+    var c: int32 = 0;
+    if (!at_end) { c = (int32)q.chars[k]; }
+    if (at_end || c == 38) {
+      if (k > start) {
+        if (seen == i) {
+          var pair: string = rz_str_sub(q, start, k);
+          var eq: int64 = rz_str_find_byte(pair, 61);
+          var raw_name: string = pair;
+          var raw_value: string = rz_str_empty();
+          if (eq >= 0) {
+            raw_name = rz_str_sub(pair, 0, eq);
+            raw_value = rz_str_from(pair, eq + 1);
+          }
+          *out_name = rz_pct_decode(raw_name, true, arena);
+          *out_value = rz_pct_decode(raw_value, true, arena);
+          return true;
+        }
+        seen = seen + 1;
+      }
+      start = k + 1;
+    }
+    k = k + 1;
+  }
+  return false;
+}
+
+// Find a field by name. The raw segment is compared without allocating when
+// it has no escape; Percent-decoded names also match.
+export fn rz_query_find(q: string, name: string, arena: RzArena*, out_value: string*) -> bool {
+  if (out_value != 0) { *out_value = rz_str_empty(); }
+  var n: int64 = (int64)q.length;
+  if (n <= 0) { return false; }
+  var start: int64 = 0;
+  var k: int64 = 0;
+  while (k <= n) {
+    var at_end: bool = k == n;
+    var c: int32 = 0;
+    if (!at_end) { c = (int32)q.chars[k]; }
+    if (at_end || c == 38) {
+      if (k > start) {
+        var pair: string = rz_str_sub(q, start, k);
+        var eq: int64 = rz_str_find_byte(pair, 61);
+        var raw_name: string = pair;
+        var raw_value: string = rz_str_empty();
+        if (eq >= 0) {
+          raw_name = rz_str_sub(pair, 0, eq);
+          raw_value = rz_str_from(pair, eq + 1);
+        }
+        var hit: bool = false;
+        if (rz_str_find_byte(raw_name, 37) < 0 && rz_str_find_byte(raw_name, 43) < 0) {
+          hit = rz_str_eq(raw_name, name);
+        } else {
+          hit = rz_str_eq(rz_pct_decode(raw_name, true, arena), name);
+        }
+        if (hit) {
+          if (out_value != 0) {
+            *out_value = rz_pct_decode(raw_value, true, arena);
+          }
+          return true;
+        }
+      }
+      start = k + 1;
+    }
+    k = k + 1;
+  }
+  return false;
+}
+
+export fn rz_query_get(q: string, name: string, arena: RzArena*) -> string {
+  var v: string = rz_str_empty();
+  if (!rz_query_find(q, name, arena, &v)) { return rz_str_empty(); }
+  return v;
+}
+
+// ---------------------------------------------------------------------------
+// Path normalization
+// ---------------------------------------------------------------------------
+
+// Percent-decode then textually normalize. Returns the empty string when the
+// path is not absolute, contains a NUL, or a `..` escapes the root.
+export fn rz_path_normalize(raw: string, arena: RzArena*) -> string {
+  var n: int64 = (int64)raw.length;
+  if (n <= 0) { return rz_str_empty(); }
+  if ((int32)raw.chars[0] != 47) { return rz_str_empty(); }
+  var decoded: string = rz_pct_decode(raw, false, arena);
+  var dn: int64 = (int64)decoded.length;
+  if (dn <= 0) { return rz_str_empty(); }
+  // A NUL would truncate any C string built from this path.
+  var j: int64 = 0;
+  while (j < dn) {
+    if (decoded.chars[j] == 0) { return rz_str_empty(); }
+    j = j + 1;
+  }
+  var out: uint8* = rz_arena_alloc(arena, dn + 2);
+  if (out == 0) { return rz_str_empty(); }
+  var olen: int64 = 0;
+  var i: int64 = 0;
+  while (i < dn) {
+    var c: int32 = (int32)decoded.chars[i];
+    if (c == 47) { i = i + 1; continue; }
+    var end: int64 = i;
+    while (end < dn && decoded.chars[end] != 47) { end = end + 1; }
+    var seg: string = rz_str_sub(decoded, i, end);
+    var seglen: int64 = (int64)seg.length;
+    var dot1: bool = seglen == 1 && seg.chars[0] == 46;
+    var dot2: bool = seglen == 2 && seg.chars[0] == 46 && seg.chars[1] == 46;
+    if (dot1) {
+      // "." is dropped
+    } else if (dot2) {
+      if (olen == 0) { return rz_str_empty(); }  // would escape the root
+      while (olen > 0 && out[olen - 1] != 47) { olen = olen - 1; }
+      if (olen > 0) { olen = olen - 1; }
+    } else {
+      out[olen] = 47;
+      olen = olen + 1;
+      var q: int64 = 0;
+      while (q < seglen) {
+        out[olen] = seg.chars[q];
+        olen = olen + 1;
+        q = q + 1;
+      }
+    }
+    i = end;
+  }
+  if (olen == 0) {
+    out[0] = 47;
+    olen = 1;
+  }
+  return rz_str_view(out, olen);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+@test fn t_rz_pct_decode() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  if (!rz_str_eq(rz_pct_decode("a%20b", false, arena), "a b")) { rz_arena_free(arena); return 2; }
+  if (!rz_str_eq(rz_pct_decode("a+b", true, arena), "a b")) { rz_arena_free(arena); return 3; }
+  if (!rz_str_eq(rz_pct_decode("a+b", false, arena), "a+b")) { rz_arena_free(arena); return 4; }
+  if (!rz_str_eq(rz_pct_decode("%41%42", false, arena), "AB")) { rz_arena_free(arena); return 5; }
+  // invalid escapes stay literal
+  if (!rz_str_eq(rz_pct_decode("100%", false, arena), "100%")) { rz_arena_free(arena); return 6; }
+  if (!rz_str_eq(rz_pct_decode("%zz", false, arena), "%zz")) { rz_arena_free(arena); return 7; }
+  if (!rz_str_eq(rz_pct_decode("%4", false, arena), "%4")) { rz_arena_free(arena); return 8; }
+  // no-op fast path returns the same view
+  var s: string = "plain";
+  if (rz_pct_decode(s, true, arena).chars != s.chars) { rz_arena_free(arena); return 9; }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_query_lookup() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  var q: string = "a=1&b=hello+world&c=%41&flag&d=a%26b";
+  if (rz_query_count(q) != 5) { rz_arena_free(arena); return 2; }
+  if (!rz_str_eq(rz_query_get(q, "a", arena), "1")) { rz_arena_free(arena); return 3; }
+  if (!rz_str_eq(rz_query_get(q, "b", arena), "hello world")) { rz_arena_free(arena); return 4; }
+  if (!rz_str_eq(rz_query_get(q, "c", arena), "A")) { rz_arena_free(arena); return 5; }
+  if (!rz_str_eq(rz_query_get(q, "d", arena), "a&b")) { rz_arena_free(arena); return 6; }
+  var flag: string = "unset";
+  if (!rz_query_find(q, "flag", arena, &flag)) { rz_arena_free(arena); return 7; }
+  if (flag.length != 0) { rz_arena_free(arena); return 8; }
+  if (rz_query_find(q, "nope", arena, &flag)) { rz_arena_free(arena); return 9; }
+  // first occurrence wins, deterministically
+  if (!rz_str_eq(rz_query_get("x=1&x=2", "x", arena), "1")) { rz_arena_free(arena); return 10; }
+  // encoded field name
+  if (!rz_str_eq(rz_query_get("na%6De=7", "name", arena), "7")) { rz_arena_free(arena); return 11; }
+  var n1: string = rz_str_empty();
+  var v1: string = rz_str_empty();
+  if (!rz_query_at(q, 3, arena, &n1, &v1)) { rz_arena_free(arena); return 12; }
+  if (!rz_str_eq(n1, "flag")) { rz_arena_free(arena); return 13; }
+  if (rz_query_at(q, 9, arena, &n1, &v1)) { rz_arena_free(arena); return 14; }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_query_semicolon() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  // ';' is not a separator: one field `a` whose value is "1;b=2"
+  if (rz_query_count("a=1;b=2") != 1) { rz_arena_free(arena); return 2; }
+  if (!rz_str_eq(rz_query_get("a=1;b=2", "a", arena), "1;b=2")) { rz_arena_free(arena); return 3; }
+  var v: string = rz_str_empty();
+  if (rz_query_find("a=1;b=2", "b", arena, &v)) { rz_arena_free(arena); return 4; }
+  var n1: string = rz_str_empty();
+  var v1: string = rz_str_empty();
+  if (!rz_query_at("a=1;b=2", 0, arena, &n1, &v1)) { rz_arena_free(arena); return 5; }
+  if (!rz_str_eq(n1, "a") || !rz_str_eq(v1, "1;b=2")) { rz_arena_free(arena); return 6; }
+  if (rz_query_at("a=1;b=2", 1, arena, &n1, &v1)) { rz_arena_free(arena); return 7; }
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_path_normalize() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  if (!rz_str_eq(rz_path_normalize("/", arena), "/")) { rz_arena_free(arena); return 2; }
+  if (!rz_str_eq(rz_path_normalize("/a/b", arena), "/a/b")) { rz_arena_free(arena); return 3; }
+  if (!rz_str_eq(rz_path_normalize("/a//b/", arena), "/a/b")) { rz_arena_free(arena); return 4; }
+  if (!rz_str_eq(rz_path_normalize("/a/./b", arena), "/a/b")) { rz_arena_free(arena); return 5; }
+  if (!rz_str_eq(rz_path_normalize("/a/../b", arena), "/b")) { rz_arena_free(arena); return 6; }
+  if (!rz_str_eq(rz_path_normalize("/a/b/..", arena), "/a")) { rz_arena_free(arena); return 7; }
+  if (!rz_str_eq(rz_path_normalize("/a/%2e%2e/b", arena), "/b")) { rz_arena_free(arena); return 8; }
+  if (!rz_str_eq(rz_path_normalize("/a/b%2Fc", arena), "/a/b/c")) { rz_arena_free(arena); return 9; }
+  if (!rz_str_eq(rz_path_normalize("/hello%20world", arena), "/hello world")) { rz_arena_free(arena); return 10; }
+  // escapes above the root are refused
+  if (rz_path_normalize("/../etc/passwd", arena).length != 0) { rz_arena_free(arena); return 11; }
+  if (rz_path_normalize("/..", arena).length != 0) { rz_arena_free(arena); return 12; }
+  if (rz_path_normalize("/a/%2e%2e%2f%2e%2e/x", arena).length != 0) { rz_arena_free(arena); return 13; }
+  // not absolute, NUL, empty
+  if (rz_path_normalize("a/b", arena).length != 0) { rz_arena_free(arena); return 14; }
+  if (rz_path_normalize("/a%00b", arena).length != 0) { rz_arena_free(arena); return 15; }
+  if (rz_path_normalize("", arena).length != 0) { rz_arena_free(arena); return 16; }
+  rz_arena_free(arena);
+  return 0;
+}

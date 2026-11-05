@@ -1,0 +1,621 @@
+// An HTTP/1.1 client on top of std/http: it keeps idle connections for
+// reuse, follows redirects, keeps cookies and decodes gzip and deflate.
+//
+// One FetchClient serves one thread at a time. Everything a request returns
+// is allocated in the arena you pass.
+
+import "std/core";
+import "std/arena";
+import "std/strbuf";
+import "std/socket";
+import "std/mem";
+import "std/http";
+import "press/press";
+import "fetch/stream";
+import "fetch/pool";
+import "fetch/cookie";
+import "fetch/redirect";
+import "fetch/tls";
+import "fetch/error";
+
+// What a request returns. Everything in it lives in the arena.
+export struct FetchReply {
+  status: int32;
+  nheaders: int32;
+  reason: string;
+  headers: HttpHeader*;
+  body: string;       // followed by a zero byte that is not counted in the length
+  url: string;        // the URL that answered, after redirects
+  redirects: int32;   // how many were followed
+  reused: int32;      // 1 when a kept connection carried the final request
+}
+
+export struct FetchClient {
+  timeout_ms: int64;        // for one request with its redirects; 0 for no limit
+  max_body: int64;          // the most body bytes taken, before and after decoding
+  max_redirects: int32;     // 0 follows none
+  allow_downgrade: int32;   // 1 lets a redirect go from https to http
+  decompress: int32;        // 1 asks for gzip and deflate and decodes them
+  keep_alive: int32;        // 1 keeps connections for reuse
+  jar: FetchCookieJar*;      // cookies are stored and sent when this is set
+  pool: FetchPool;
+  tls: FetchTlsConfig;
+  dials: int64;             // connections opened
+  reuses: int64;            // requests sent on a kept connection
+  retries: int64;           // requests sent again after a kept connection had closed
+  detail: string;           // extra text for the last connection error
+}
+
+export fn fetch_client_init(c: FetchClient*) {
+  memset(c, 0, (int64)sizeof(FetchClient));
+  c->timeout_ms = 30000;
+  c->max_body = HTTP_CLIENT_MAX_BODY;
+  c->max_redirects = 10;
+  c->decompress = 1;
+  c->keep_alive = 1;
+  fetch_pool_init(&c->pool);
+  fetch_tls_init(&c->tls);
+}
+
+// Closes the kept connections. The cookie jar is yours to free.
+export fn fetch_client_free(c: FetchClient*) {
+  fetch_pool_close_all(&c->pool);
+  fetch_tls_free(&c->tls);
+}
+
+// Closes the kept connections that have been idle for too long.
+export fn fetch_client_prune(c: FetchClient*) {
+  fetch_pool_prune(&c->pool);
+}
+
+fn hc_lower(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) { return c + 32; }
+  return c;
+}
+
+fn hc_ieq(a: string, b: string) -> bool {
+  if (a.length != b.length) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)a.length) {
+    if (hc_lower((int32)a.chars[i]) != hc_lower((int32)b.chars[i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn hc_view(p: uint8*, from: int64, len: int64) -> string {
+  var s: string;
+  s.chars = p + from;
+  s.length = (uint64)len;
+  return s;
+}
+
+fn hc_copy(arena: Arena*, s: string) -> string {
+  var out: string;
+  var n: int64 = (int64)s.length;
+  var p: uint8* = (uint8*)arena_alloc(arena, n + 1);
+  if (p == 0) { return out; }
+  if (n > 0) { memcpy(p, s.chars, n); }
+  p[n] = (uint8)0;
+  out.chars = p;
+  out.length = s.length;
+  return out;
+}
+
+fn hc_deadline(timeout_ms: int64) -> int64 {
+  if (timeout_ms <= 0) { return -1; }
+  return net_now_ms() + timeout_ms;
+}
+
+// Milliseconds left until deadline: -1 for no limit, 0 when it has passed.
+fn hc_left(deadline: int64) -> int64 {
+  if (deadline < 0) { return -1; }
+  var left: int64 = deadline - net_now_ms();
+  if (left < 0) { return 0; }
+  return left;
+}
+
+// Reads once, waiting until the deadline. Returns the bytes read, 0 at the
+// end of the stream, HTTP_ERR_TIMEOUT or HTTP_ERR_IO.
+fn hc_recv(s: FetchStream*, p: uint8*, n: int64, deadline: int64) -> int64 {
+  while (true) {
+    var left: int64 = hc_left(deadline);
+    if (deadline >= 0 && left == 0) { return HTTP_ERR_TIMEOUT; }
+    if (s->fd >= 0) {
+      var w: int64 = sock_wait(s->fd, NET_POLL_IN, left);
+      if (w == 0) { return HTTP_ERR_TIMEOUT; }
+      if (w < 0) { return HTTP_ERR_IO; }
+    }
+    var r: int64 = fetch_stream_read(s, p, n);
+    if (r == -NET_EINTR || r == -NET_EAGAIN) { continue; }
+    if (r < 0) { return HTTP_ERR_IO; }
+    return r;
+  }
+  return 0;
+}
+
+fn hc_send(s: FetchStream*, p: uint8*, n: int64) -> int64 {
+  var r: int64 = fetch_stream_write(s, p, n);
+  if (r == -NET_EAGAIN || r == -NET_ETIMEDOUT) { return HTTP_ERR_TIMEOUT; }
+  if (r < 0) { return HTTP_ERR_IO; }
+  return 0;
+}
+
+// Reading state of one exchange. The buffers belong to the caller.
+struct HcIo {
+  rbuf: uint8*;
+  rcap: int64;
+  rlen: int64;
+  cbuf: uint8*;         // chunk input after the first read, so the head in rbuf survives
+  body: uint8*;
+  bcap: int64;
+  blen: int64;
+  got_bytes: int32;     // 1 once any byte of the response arrived
+}
+
+fn hc_body_reserve(io: HcIo*, need: int64) -> bool {
+  if (need <= io->bcap) { return true; }
+  var cap: int64 = io->bcap * 2;
+  if (cap < 4096) { cap = 4096; }
+  if (cap < need) { cap = need; }
+  var p: uint8* = (uint8*)realloc(io->body, cap);
+  if (p == 0) { return false; }
+  io->body = p;
+  io->bcap = cap;
+  return true;
+}
+
+fn hc_fill(s: FetchStream*, io: HcIo*, p: uint8*, n: int64, deadline: int64) -> int64 {
+  var r: int64 = hc_recv(s, p, n, deadline);
+  if (r > 0) { io->got_bytes = 1; }
+  return r;
+}
+
+// Reads the response into io. res points into io->rbuf. *reusable says
+// the connection can carry another request.
+fn hc_read_response(c: FetchClient*, s: FetchStream*, io: HcIo*, is_head: bool, deadline: int64, res: HttpResponse*, reusable: bool*) -> int64 {
+  io->rcap = 16384;
+  io->rbuf = (uint8*)malloc(io->rcap);
+  if (io->rbuf == 0) { return HTTP_ERR_NOMEM; }
+  io->rlen = 0;
+
+  var head_len: int64 = 0;
+  while (head_len == 0) {
+    var r: int64 = http_parse_response(hc_view(io->rbuf, 0, io->rlen), res);
+    if (r < 0) { return r; }
+    if (r > 0) {
+      if (res->status >= 100 && res->status < 200 && res->status != 101) {
+        memmove(io->rbuf, io->rbuf + r, io->rlen - r);
+        io->rlen = io->rlen - r;
+      } else {
+        head_len = r;
+      }
+    } else {
+      if (io->rlen == io->rcap) {
+        var bigger: uint8* = (uint8*)realloc(io->rbuf, io->rcap * 2);
+        if (bigger == 0) { return HTTP_ERR_NOMEM; }
+        io->rbuf = bigger;
+        io->rcap = io->rcap * 2;
+      }
+      var n: int64 = hc_fill(s, io, io->rbuf + io->rlen, io->rcap - io->rlen, deadline);
+      if (n < 0) { return n; }
+      if (n == 0) { return HTTP_ERR_CLOSED; }
+      io->rlen = io->rlen + n;
+    }
+  }
+
+  var kind: HttpBody = http_response_body_kind(res, is_head);
+  if (kind.kind == HTTP_BODY_INVALID) { return kind.length; }
+  *reusable = kind.kind != HTTP_BODY_CLOSE && http_keep_alive(res->minor, &res->headers[0], res->nheaders);
+
+  var left: int64 = io->rlen - head_len;
+  io->blen = 0;
+  var extra: int64 = 0;
+  if (kind.kind == HTTP_BODY_NONE) {
+    extra = left;
+  } else if (kind.kind == HTTP_BODY_LENGTH) {
+    if (kind.length > c->max_body) { return HTTP_ERR_BODY_TOO_LARGE; }
+    if (!hc_body_reserve(io, kind.length)) { return HTTP_ERR_NOMEM; }
+    var take: int64 = left;
+    if (take > kind.length) { take = kind.length; }
+    memcpy(io->body, io->rbuf + head_len, take);
+    io->blen = take;
+    extra = left - take;
+    while (io->blen < kind.length) {
+      var n2: int64 = hc_fill(s, io, io->body + io->blen, kind.length - io->blen, deadline);
+      if (n2 < 0) { return n2; }
+      if (n2 == 0) { return HTTP_ERR_CLOSED; }
+      io->blen = io->blen + n2;
+    }
+  } else if (kind.kind == HTTP_BODY_CHUNKED) {
+    var d: HttpChunkDecoder;
+    var feed: HttpChunkFeed;
+    http_chunk_init(&d, c->max_body);
+    var avail: int64 = left;
+    var src: uint8* = io->rbuf + head_len;
+    var done: bool = false;
+    while (!done) {
+      if (avail > 0) {
+        if (!hc_body_reserve(io, io->blen + avail)) { return HTTP_ERR_NOMEM; }
+        var st: int64 = http_chunk_feed(&d, src, avail, io->body + io->blen, io->bcap - io->blen, &feed);
+        if (st < 0) { return st; }
+        io->blen = io->blen + feed.produced;
+        if (st == HTTP_CHUNK_DONE) {
+          done = true;
+          extra = avail - feed.consumed;
+        }
+      }
+      if (!done) {
+        if (io->cbuf == 0) {
+          io->cbuf = (uint8*)malloc(16384);
+          if (io->cbuf == 0) { return HTTP_ERR_NOMEM; }
+        }
+        src = io->cbuf;
+        var n3: int64 = hc_fill(s, io, io->cbuf, 16384, deadline);
+        if (n3 < 0) { return n3; }
+        if (n3 == 0) { return HTTP_ERR_CLOSED; }
+        avail = n3;
+      }
+    }
+  } else {
+    if (left > c->max_body) { return HTTP_ERR_BODY_TOO_LARGE; }
+    if (!hc_body_reserve(io, left + 4096)) { return HTTP_ERR_NOMEM; }
+    memcpy(io->body, io->rbuf + head_len, left);
+    io->blen = left;
+    var open: bool = true;
+    while (open) {
+      if (!hc_body_reserve(io, io->blen + 4096)) { return HTTP_ERR_NOMEM; }
+      var n4: int64 = hc_fill(s, io, io->body + io->blen, io->bcap - io->blen, deadline);
+      if (n4 < 0) { return n4; }
+      if (n4 == 0) {
+        open = false;
+      } else {
+        io->blen = io->blen + n4;
+        if (io->blen > c->max_body) { return HTTP_ERR_BODY_TOO_LARGE; }
+      }
+    }
+  }
+  if (extra > 0) { *reusable = false; }
+  return 0;
+}
+
+// HTTP's "deflate" is zlib data, but some servers send it raw: try both.
+fn hc_decode(gzip: bool, src: uint8*, n: int64, max_out: int64, out: PressBuf*) -> int64 {
+  press_buf_limit(out, max_out);
+  var rc: int32 = PRESS_E_DATA;
+  if (gzip) {
+    rc = press_gzip_decompress(src, n, out);
+  } else {
+    rc = press_zlib_decompress(src, n, out);
+    if (rc == PRESS_E_DATA) {
+      press_buf_clear(out);
+      rc = press_deflate_decompress(src, n, out);
+    }
+  }
+  if (rc == PRESS_OK) { return 0; }
+  if (rc == PRESS_E_LIMIT) { return HTTP_ERR_BODY_TOO_LARGE; }
+  if (rc == PRESS_E_MEM) { return HTTP_ERR_NOMEM; }
+  return FETCH_CLIENT_ERR_ENCODING;
+}
+
+// Copies the response into the arena, decoding the body when asked.
+fn hc_finish(c: FetchClient*, arena: Arena*, res: HttpResponse*, io: HcIo*, decode: bool, out: FetchReply*) -> int64 {
+  out->status = res->status;
+  out->reason = hc_copy(arena, res->reason);
+  out->headers = (HttpHeader*)arena_alloc(arena, (int64)(res->nheaders + 1) * (int64)sizeof(HttpHeader));
+  if (out->headers == 0 || (out->reason.chars == 0 && res->reason.length > 0)) { return HTTP_ERR_NOMEM; }
+
+  var coding: int32 = 0;      // 1 gzip, 2 deflate
+  if (decode && io->blen > 0) {
+    match (http_header(&res->headers[0], res->nheaders, "content-encoding")) {
+      case Some(v): {
+        if (hc_ieq(v, "gzip") || hc_ieq(v, "x-gzip")) { coding = 1; }
+        if (hc_ieq(v, "deflate")) { coding = 2; }
+      }
+      case None: { }
+    }
+  }
+
+  var n: int32 = 0;
+  for i in 0..res->nheaders {
+    var drop: bool = coding != 0 && (hc_ieq(res->headers[i].name, "content-encoding") || hc_ieq(res->headers[i].name, "content-length"));
+    if (!drop) {
+      out->headers[n].name = hc_copy(arena, res->headers[i].name);
+      out->headers[n].value = hc_copy(arena, res->headers[i].value);
+      n = n + 1;
+    }
+  }
+  out->nheaders = n;
+
+  var src: uint8* = io->body;
+  var len: int64 = io->blen;
+  var plain: PressBuf;
+  if (coding != 0) {
+    var rc: int64 = hc_decode(coding == 1, io->body, io->blen, c->max_body, &plain);
+    if (rc != 0) {
+      press_buf_free(&plain);
+      return rc;
+    }
+    src = plain.data;
+    len = plain.len;
+  }
+  var tail: uint8* = (uint8*)arena_alloc(arena, len + 1);
+  if (tail == 0) {
+    if (coding != 0) { press_buf_free(&plain); }
+    return HTTP_ERR_NOMEM;
+  }
+  if (len > 0) { memcpy(tail, src, len); }
+  tail[len] = (uint8)0;
+  out->body = hc_view(tail, 0, len);
+  if (coding != 0) { press_buf_free(&plain); }
+  return 0;
+}
+
+fn hc_idempotent(verb: string) -> bool {
+  return verb == "GET" || verb == "HEAD" || verb == "PUT" || verb == "DELETE" || verb == "OPTIONS" || verb == "TRACE";
+}
+
+// scheme://host:port in lower case: what a kept connection is filed under.
+fn hc_key(arena: Arena*, u: HttpUrl*) -> string {
+  var sb: StrBuf* = strbuf_new(arena, 64);
+  if (sb == 0) { return ""; }
+  if (u->tls != 0) {
+    strbuf_append_string(sb, "https://");
+  } else {
+    strbuf_append_string(sb, "http://");
+  }
+  var i: int64 = 0;
+  while (i < (int64)u->host.length) {
+    strbuf_append_byte(sb, (uint8)hc_lower((int32)u->host.chars[i]));
+    i = i + 1;
+  }
+  strbuf_append_byte(sb, (uint8)58);
+  strbuf_append_int(sb, (int64)u->port);
+  return strbuf_finish_string(sb);
+}
+
+fn hc_text(arena: Arena*, a: string, b: string) -> string {
+  var sb: StrBuf* = strbuf_new(arena, 64);
+  if (sb == 0) { return a; }
+  strbuf_append_string(sb, a);
+  strbuf_append_string(sb, b);
+  return strbuf_finish_string(sb);
+}
+
+// Opens a connection for u, plain or TLS.
+fn hc_dial(c: FetchClient*, arena: Arena*, u: HttpUrl*, key: string, deadline: int64, out: FetchConn**) -> int64 {
+  var left: int64 = hc_left(deadline);
+  if (deadline >= 0 && left == 0) { return HTTP_ERR_TIMEOUT; }
+  if (u->tls != 0) { return fetch_tls_dial(&c->tls, arena, u->host, u->port, left, key, out, &c->detail); }
+  var fd: int64 = 0;
+  match (tcp_connect(u->host, u->port, left)) {
+    case Ok(s): { fd = s; }
+    case Err(e): {
+      c->detail = hc_copy(arena, e.message);
+      return HTTP_ERR_CONNECT;
+    }
+  }
+  var conn: FetchConn* = fetch_conn_new(fetch_stream_plain(fd), key);
+  if (conn == 0) {
+    sock_close(fd);
+    return HTTP_ERR_NOMEM;
+  }
+  *out = conn;
+  return 0;
+}
+
+// One request and its response. Cookies go in and come out here.
+fn hc_hop(c: FetchClient*, arena: Arena*, verb: string, u: HttpUrl*, headers: HttpHeader*, nheaders: int32, body: string, deadline: int64, out: FetchReply*) -> int64 {
+  var has_host: bool = false;
+  var has_cookie: bool = false;
+  var has_enc: bool = false;
+  for i in 0..nheaders {
+    if (hc_ieq(headers[i].name, "host")) { has_host = true; }
+    if (hc_ieq(headers[i].name, "cookie")) { has_cookie = true; }
+    if (hc_ieq(headers[i].name, "accept-encoding")) { has_enc = true; }
+  }
+
+  var tb: StrBuf* = strbuf_new(arena, 128);
+  if (tb == 0) { return HTTP_ERR_NOMEM; }
+  strbuf_append_string(tb, u->path);
+  if (u->query.length > 0) {
+    strbuf_append_byte(tb, (uint8)63);
+    strbuf_append_string(tb, u->query);
+  }
+
+  var all: HttpHeader* = (HttpHeader*)arena_alloc(arena, (int64)(nheaders + 5) * (int64)sizeof(HttpHeader));
+  if (all == 0) { return HTTP_ERR_NOMEM; }
+  var count: int32 = 0;
+  for i in 0..nheaders {
+    all[count] = headers[i];
+    count = count + 1;
+  }
+  if (!has_host) {
+    var hb: StrBuf* = strbuf_new(arena, 64);
+    if (hb == 0) { return HTTP_ERR_NOMEM; }
+    if (u->ipv6 != 0) { strbuf_append_byte(hb, (uint8)91); }
+    strbuf_append_string(hb, u->host);
+    if (u->ipv6 != 0) { strbuf_append_byte(hb, (uint8)93); }
+    var def: int32 = 80;
+    if (u->tls != 0) { def = 443; }
+    if (u->port != def) {
+      strbuf_append_byte(hb, (uint8)58);
+      strbuf_append_int(hb, (int64)u->port);
+    }
+    all[count].name = "Host";
+    all[count].value = strbuf_finish_string(hb);
+    count = count + 1;
+  }
+  var decode: bool = c->decompress != 0 && !has_enc;
+  if (decode) {
+    all[count].name = "Accept-Encoding";
+    all[count].value = "gzip, deflate";
+    count = count + 1;
+  }
+  if (c->jar != 0 && !has_cookie) {
+    var jv: string = fetch_cookie_jar_header(c->jar, arena, u->host, u->path, u->tls != 0);
+    if (jv.length > 0) {
+      all[count].name = "Cookie";
+      all[count].value = jv;
+      count = count + 1;
+    }
+  }
+  if (body.length > 0 || verb == "POST" || verb == "PUT" || verb == "PATCH") {
+    var lb: StrBuf* = strbuf_new(arena, 24);
+    if (lb == 0) { return HTTP_ERR_NOMEM; }
+    strbuf_append_uint(lb, body.length);
+    all[count].name = "Content-Length";
+    all[count].value = strbuf_finish_string(lb);
+    count = count + 1;
+  }
+  if (c->keep_alive == 0) {
+    all[count].name = "Connection";
+    all[count].value = "close";
+    count = count + 1;
+  }
+
+  var hd: StrBuf* = strbuf_new(arena, 512);
+  if (hd == 0) { return HTTP_ERR_NOMEM; }
+  var wrote: int64 = http_write_request_head(hd, verb, strbuf_finish_string(tb), all, count);
+  if (wrote < 0) { return wrote; }
+  var head: string = strbuf_finish_string(hd);
+  var key: string = hc_key(arena, u);
+  var is_head: bool = verb == "HEAD";
+
+  var attempt: int32 = 0;
+  while (true) {
+    var conn: FetchConn* = (FetchConn*)0;
+    var reused: bool = false;
+    if (c->keep_alive != 0 && attempt == 0) {
+      conn = fetch_pool_take(&c->pool, key);
+      if (conn != 0) { reused = true; }
+    }
+    if (conn == 0) {
+      var dc: int64 = hc_dial(c, arena, u, key, deadline, &conn);
+      if (dc != 0) { return dc; }
+      c->dials = c->dials + 1;
+    } else {
+      c->reuses = c->reuses + 1;
+    }
+
+    var io: HcIo;
+    memset(&io, 0, (int64)sizeof(HcIo));
+    var res: HttpResponse;
+    var reusable: bool = false;
+    var s: FetchStream* = &conn->stream;
+    if (conn->probe_fd >= 0) {
+      var left: int64 = hc_left(deadline);
+      if (left < 0) {
+        sock_set_timeout(conn->probe_fd, 0, 0);
+      } else {
+        sock_set_timeout(conn->probe_fd, left + 1, left + 1);
+      }
+    }
+    var code: int64 = hc_send(s, head.chars, (int64)head.length);
+    if (code == 0 && body.length > 0) { code = hc_send(s, body.chars, (int64)body.length); }
+    if (code == 0) { code = hc_read_response(c, s, &io, is_head, deadline, &res, &reusable); }
+    if (code == 0) { code = hc_finish(c, arena, &res, &io, decode, out); }
+    if (code == 0 && c->jar != 0) {
+      for i in 0..res.nheaders {
+        if (hc_ieq(res.headers[i].name, "set-cookie")) {
+          fetch_cookie_jar_set(c->jar, res.headers[i].value, u->host, u->path, u->tls != 0);
+        }
+      }
+    }
+    if (io.rbuf != 0) { free(io.rbuf); }
+    if (io.cbuf != 0) { free(io.cbuf); }
+    if (io.body != 0) { free(io.body); }
+    if (code == 0) {
+      out->reused = 0;
+      if (reused) { out->reused = 1; }
+      conn->uses = conn->uses + 1;
+      if (reusable && c->keep_alive != 0) {
+        fetch_pool_put(&c->pool, conn);
+      } else {
+        fetch_conn_close(conn);
+      }
+      return 0;
+    }
+    fetch_conn_close(conn);
+    var stale: bool = (code == HTTP_ERR_CLOSED || code == HTTP_ERR_IO) && io.got_bytes == 0;
+    if (reused && stale && hc_idempotent(verb)) {
+      attempt = 1;
+      c->retries = c->retries + 1;
+    } else {
+      return code;
+    }
+  }
+  return 0;
+}
+
+fn hc_err(c: FetchClient*, arena: Arena*, code: int64) -> string {
+  if ((code == HTTP_ERR_CONNECT || code == FETCH_CLIENT_ERR_HANDSHAKE || code == FETCH_CLIENT_ERR_CERT) && c->detail.length > 0) {
+    return hc_text(arena, hc_text(arena, fetch_client_error_text(code), ": "), c->detail);
+  }
+  return fetch_client_error_text(code);
+}
+
+// A blocking request with redirects, cookies and decoding; see docs/client.md.
+// The reply is allocated in arena.
+export fn fetch_client_request(c: FetchClient*, arena: Arena*, verb: string, url: string, headers: HttpHeader*, nheaders: int32, body: string) -> Result<FetchReply*, string> {
+  c->detail = "";
+  for i in 0..nheaders {
+    if (hc_ieq(headers[i].name, "content-length") || hc_ieq(headers[i].name, "transfer-encoding") || hc_ieq(headers[i].name, "connection")) {
+      return Err("Content-Length, Transfer-Encoding and Connection are set by the client");
+    }
+  }
+  var u: HttpUrl;
+  if (http_url_parse(url, &u) != 0) { return Err("bad URL"); }
+  if (!hc_ieq(u.scheme, "http") && !hc_ieq(u.scheme, "https")) { return Err(fetch_client_error_text(FETCH_CLIENT_ERR_SCHEME)); }
+
+  var deadline: int64 = hc_deadline(c->timeout_ms);
+  var cur: string = url;
+  var cverb: string = verb;
+  var cbody: string = body;
+  var hdrs: HttpHeader* = (HttpHeader*)arena_alloc(arena, (int64)(nheaders + 1) * (int64)sizeof(HttpHeader));
+  if (hdrs == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+  var nh: int32 = nheaders;
+  for i in 0..nheaders { hdrs[i] = headers[i]; }
+
+  var redirects: int32 = 0;
+  while (true) {
+    var reply: FetchReply* = (FetchReply*)arena_alloc_zeroed(arena, (int64)sizeof(FetchReply));
+    if (reply == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+    var code: int64 = hc_hop(c, arena, cverb, &u, hdrs, nh, cbody, deadline, reply);
+    if (code != 0) { return Err(hc_err(c, arena, code)); }
+    reply->url = hc_copy(arena, cur);
+    reply->redirects = redirects;
+    if (c->max_redirects <= 0 || !fetch_redirect_follows(reply->status)) { return Ok(reply); }
+    var loc: string = "";
+    match (http_header(reply->headers, reply->nheaders, "location")) {
+      case Some(v): { loc = v; }
+      case None: { return Ok(reply); }
+    }
+    if (redirects >= c->max_redirects) { return Err(fetch_client_error_text(FETCH_CLIENT_ERR_REDIRECTS)); }
+
+    var sb: StrBuf* = strbuf_new(arena, 128);
+    if (sb == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+    if (fetch_url_resolve(arena, &u, loc, sb) != 0) { return Err(fetch_client_error_text(FETCH_CLIENT_ERR_LOCATION)); }
+    var next: string = strbuf_finish_string(sb);
+    var nu: HttpUrl;
+    if (http_url_parse(next, &nu) != 0) { return Err(fetch_client_error_text(FETCH_CLIENT_ERR_LOCATION)); }
+    if (u.tls != 0 && nu.tls == 0 && c->allow_downgrade == 0) { return Err(fetch_client_error_text(FETCH_CLIENT_ERR_DOWNGRADE)); }
+
+    var keep_body: bool = fetch_redirect_keeps_body(reply->status, cverb);
+    var fresh: HttpHeader* = (HttpHeader*)arena_alloc(arena, (int64)(nh + 1) * (int64)sizeof(HttpHeader));
+    if (fresh == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+    nh = fetch_redirect_headers(hdrs, nh, fresh, !fetch_url_same_host(&u, &nu), !keep_body);
+    hdrs = fresh;
+    cverb = fetch_redirect_method(reply->status, cverb);
+    if (!keep_body) { cbody = ""; }
+    cur = next;
+    u = nu;
+    redirects = redirects + 1;
+  }
+  return Err("unreachable");
+}
+
+// GET url.
+export fn fetch_client_get(c: FetchClient*, arena: Arena*, url: string) -> Result<FetchReply*, string> {
+  return fetch_client_request(c, arena, "GET", url, (HttpHeader*)0, 0, "");
+}

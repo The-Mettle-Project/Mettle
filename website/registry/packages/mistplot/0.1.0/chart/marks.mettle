@@ -1,0 +1,289 @@
+//! Series marks of one frame, drawn from each series' view: polylines (or monotone cubic
+//! paths when smoothing applies), gradient area fills, bars and markers. Non-finite points
+//! split a line into separate runs. Bar edges are snapped to device pixels (at least one
+//! device pixel for a non-zero value); lines, paths and markers are not snapped. Pixel
+//! coordinates live in the chart's scratch, so steady frames allocate nothing. Uses
+//! chart/layout, data/smooth, scene and core.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
+import "mistplot/data/smooth";
+import "mistplot/scene/scene";
+import "mistplot/scene/snap";
+import "mistplot/chart/chart";
+import "mistplot/chart/layout";
+
+const MARKS_FILL_TOP: uint8 = 71;   // 0.28 * 255
+const MARKS_FILL_BOT: uint8 = 5;    // 0.02 * 255
+const MARKS_DOT_ALPHA: float64 = 0.8;
+
+// Pixel points of one series: px, py and slopes, each n floats in the chart scratch.
+struct MarkPts {
+  px: float64*;
+  py: float64*;
+  sl: float64*;
+  n: int64;
+}
+
+fn marks_none() -> MpColor {
+  return mp_rgba(0, 0, 0, 0);
+}
+
+fn marks_ok(v: float64) -> bool {
+  return v - v == 0.0;
+}
+
+fn marks_points(l: MpLayout*, d: MpSeriesData*, p: MarkPts*) -> int32 {
+  var n: int64 = d->vn;
+  var buf: float64* = (float64*)mp_chart_scratch(l->c, n * 24);
+  if (buf == 0) { return MP_ERR_ALLOC; }
+  p->px = buf;
+  p->py = buf + n;
+  p->sl = buf + n * 2;
+  p->n = n;
+  var clamp: bool = l->c->x_fixed || l->c->y_fixed;
+  var r: MpRect = l->plot;
+  var zero: float64 = 0.0;
+  var i: int64 = 0;
+  while (i < n) {
+    var x: float64 = mp_scale_map(l->xs, d->vx[i]);
+    var y: float64 = mp_scale_map(l->ys, d->vy[i]);
+    if (!marks_ok(d->vx[i]) || !marks_ok(d->vy[i]) || !marks_ok(x) || !marks_ok(y)) {
+      x = zero / zero;
+      y = x;
+    } else if (clamp) {
+      x = mp_clamp(x, r.x, r.x + r.w);
+      y = mp_clamp(y, r.y, r.y + r.h);
+    }
+    p->px[i] = x;
+    p->py[i] = y;
+    i = i + 1;
+  }
+  return MP_OK;
+}
+
+// End of the finite run starting at a (first non-finite index at or after a).
+fn marks_run_end(p: MarkPts*, a: int64) -> int64 {
+  var b: int64 = a;
+  while (b < p->n && marks_ok(p->px[b])) { b = b + 1; }
+  return b;
+}
+
+fn marks_next_run(p: MarkPts*, a: int64) -> int64 {
+  var i: int64 = a;
+  while (i < p->n && !marks_ok(p->px[i])) { i = i + 1; }
+  return i;
+}
+
+// Path segments from point a (the pen is on it) to b-1: cubics over strictly increasing x,
+// a straight line wherever x does not increase.
+fn marks_curve(s: MpScene*, p: MarkPts*, a: int64, b: int64, smooth: bool) -> int32 {
+  var rc: int32 = MP_OK;
+  var i: int64 = a;
+  while (i + 1 < b && rc == MP_OK) {
+    var q: int64 = i + 1;
+    while (smooth && q < b && p->px[q] > p->px[q - 1]) { q = q + 1; }
+    if (!smooth || q - i < 2) {
+      rc = mp_scene_path_line(s, p->px[i + 1], p->py[i + 1]);
+      i = i + 1;
+    } else {
+      rc = mp_smooth_slopes(p->px + i, p->py + i, q - i, p->sl + i);
+      var k: int64 = i;
+      while (k + 1 < q && rc == MP_OK) {
+        var h: float64 = (p->px[k + 1] - p->px[k]) / 3.0;
+        rc = mp_scene_path_cubic(s, p->px[k] + h, p->py[k] + p->sl[k] * h,
+                                 p->px[k + 1] - h, p->py[k + 1] - p->sl[k + 1] * h,
+                                 p->px[k + 1], p->py[k + 1]);
+        k = k + 1;
+      }
+      i = q - 1;
+    }
+  }
+  return rc;
+}
+
+fn marks_fill(l: MpLayout*, i: int32, p: MarkPts*, smooth: bool) -> int32 {
+  var col: MpColor = mp_layout_color(l, i);
+  var r: MpRect = l->plot;
+  var base: float64 = r.y + r.h;
+  if (!l->ylog) { base = mp_clamp(mp_scale_map(l->ys, 0.0), r.y, r.y + r.h); }
+  var s: MpScene* = l->s;
+  var top: MpColor = mp_color_alpha(col, (uint8)((int32)MARKS_FILL_TOP * (int32)col.a / 255));
+  var bot: MpColor = mp_color_alpha(col, (uint8)((int32)MARKS_FILL_BOT * (int32)col.a / 255));
+  var rc: int32 = mp_scene_path_begin(s, p->n * 3 + 8, p->n + 8, top, bot, marks_none(), 0.0,
+                                      MP_DASH_SOLID, MP_NF_GRADIENT, MP_CLS_SERIES + i);
+  var a: int64 = marks_next_run(p, 0);
+  while (a < p->n && rc == MP_OK) {
+    var b: int64 = marks_run_end(p, a);
+    if (b - a >= 2) {
+      rc = mp_scene_path_move(s, p->px[a], base);
+      if (rc == MP_OK) { rc = mp_scene_path_line(s, p->px[a], p->py[a]); }
+      if (rc == MP_OK) { rc = marks_curve(s, p, a, b, smooth); }
+      if (rc == MP_OK) { rc = mp_scene_path_line(s, p->px[b - 1], base); }
+      if (rc == MP_OK) { rc = mp_scene_path_close(s); }
+    }
+    a = marks_next_run(p, b);
+  }
+  if (rc == MP_OK) { rc = mp_scene_path_end(s); }
+  return rc;
+}
+
+fn marks_stroke_path(l: MpLayout*, i: int32, p: MarkPts*) -> int32 {
+  var d: MpSeriesData* = &l->c->series[(int64)i];
+  var s: MpScene* = l->s;
+  var rc: int32 = mp_scene_path_begin(s, p->n * 3 + 4, p->n + 4, marks_none(), marks_none(),
+                                      mp_layout_color(l, i), d->width, d->dash, MP_NF_ROUND,
+                                      MP_CLS_SERIES + i);
+  var a: int64 = marks_next_run(p, 0);
+  while (a < p->n && rc == MP_OK) {
+    var b: int64 = marks_run_end(p, a);
+    if (b - a >= 2) {
+      rc = mp_scene_path_move(s, p->px[a], p->py[a]);
+      if (rc == MP_OK) { rc = marks_curve(s, p, a, b, true); }
+    }
+    a = marks_next_run(p, b);
+  }
+  if (rc == MP_OK) { rc = mp_scene_path_end(s); }
+  return rc;
+}
+
+fn marks_stroke_polys(l: MpLayout*, i: int32, p: MarkPts*) -> int32 {
+  var d: MpSeriesData* = &l->c->series[(int64)i];
+  var col: MpColor = mp_layout_color(l, i);
+  var rc: int32 = MP_OK;
+  var a: int64 = marks_next_run(p, 0);
+  while (a < p->n && rc == MP_OK) {
+    var b: int64 = marks_run_end(p, a);
+    if (b - a >= 2) {
+      rc = mp_scene_poly_begin(l->s, b - a, col, d->width, d->dash, MP_NF_ROUND,
+                               MP_CLS_SERIES + i);
+      var k: int64 = a;
+      while (k < b && rc == MP_OK) {
+        rc = mp_scene_poly_add(l->s, p->px[k], p->py[k]);
+        k = k + 1;
+      }
+      if (rc == MP_OK) { rc = mp_scene_poly_end(l->s); }
+    }
+    a = marks_next_run(p, b);
+  }
+  return rc;
+}
+
+fn marks_dots(l: MpLayout*, i: int32, p: MarkPts*, shape: int32) -> int32 {
+  var d: MpSeriesData* = &l->c->series[(int64)i];
+  var col: MpColor = mp_layout_color(l, i);
+  var fill: MpColor = mp_color_alpha(col, (uint8)(int32)((float64)col.a * MARKS_DOT_ALPHA));
+  var r: MpRect = l->plot;
+  var rc: int32 = MP_OK;
+  var k: int64 = 0;
+  while (k < p->n && rc == MP_OK) {
+    var x: float64 = p->px[k];
+    var y: float64 = p->py[k];
+    if (marks_ok(x) && mp_rect_contains(r, x, y)) {
+      rc = mp_scene_marker(l->s, x, y, d->marker_r, shape, fill, l->c->theme.bg, 1.0,
+                           MP_CLS_SERIES + i);
+    }
+    k = k + 1;
+  }
+  return rc;
+}
+
+fn marks_line(l: MpLayout*, i: int32) -> int32 {
+  var d: MpSeriesData* = &l->c->series[(int64)i];
+  if (d->vn == 0) { return MP_OK; }
+  var p: MarkPts;
+  var rc: int32 = marks_points(l, d, &p);
+  if (rc != MP_OK) { return rc; }
+  var sparse: bool = (float64)d->vn * 3.0 <= l->plot.w;
+  var smooth: bool = d->smooth && sparse;
+  if (d->fill) { rc = marks_fill(l, i, &p, smooth); }
+  if (rc == MP_OK && smooth) { rc = marks_stroke_path(l, i, &p); }
+  if (rc == MP_OK && !smooth) { rc = marks_stroke_polys(l, i, &p); }
+  if (rc == MP_OK && sparse && d->marker != MP_MARK_NONE) {
+    rc = marks_dots(l, i, &p, d->marker);
+  }
+  return rc;
+}
+
+fn marks_scatter(l: MpLayout*, i: int32) -> int32 {
+  var d: MpSeriesData* = &l->c->series[(int64)i];
+  if (d->vn == 0) { return MP_OK; }
+  var p: MarkPts;
+  var rc: int32 = marks_points(l, d, &p);
+  if (rc != MP_OK) { return rc; }
+  var shape: int32 = d->marker;
+  if (shape == MP_MARK_NONE) { shape = MP_MARK_CIRCLE; }
+  return marks_dots(l, i, &p, shape);
+}
+
+fn marks_bar(l: MpLayout*, i: int32, y: float64, x0: float64, x1: float64) -> int32 {
+  var r: MpRect = l->plot;
+  var s: float64 = l->scale;
+  var dev: float64 = 1.0;
+  if (s > 0.0 && s < 1e6) { dev = 1.0 / s; }
+  var ya: float64 = mp_clamp(mp_scale_map(l->ys, fmax(y, 0.0)), r.y, r.y + r.h);
+  var yb: float64 = mp_clamp(mp_scale_map(l->ys, fmin(y, 0.0)), r.y, r.y + r.h);
+  if (!(yb > ya) && (y > l->y1 || y < l->y0)) { return MP_OK; }
+  var X0: float64 = mp_snap_edge(x0, s);
+  var X1: float64 = mp_snap_edge(x1, s);
+  var Y0: float64 = mp_snap_edge(ya, s);
+  var Y1: float64 = mp_snap_edge(yb, s);
+  if (X1 - X0 < dev) { X1 = X0 + dev; }
+  if (y != 0.0 && Y1 - Y0 < dev) {
+    if (y > 0.0) { Y0 = Y1 - dev; } else { Y1 = Y0 + dev; }
+  }
+  if (!(Y1 > Y0)) { return MP_OK; }
+  return mp_scene_rect(l->s, mp_rect(X0, Y0, X1 - X0, Y1 - Y0), mp_layout_color(l, i),
+                       marks_none(), 0.0, MP_CLS_SERIES + i);
+}
+
+fn marks_bars(l: MpLayout*) -> int32 {
+  var c: MpChart* = l->c;
+  var k: int32 = c->n_series;
+  var sub: float64 = mp_scale_band_width(l->xs) / (float64)k;
+  var rc: int32 = MP_OK;
+  var i: int32 = 0;
+  while (i < k && rc == MP_OK) {
+    var d: MpSeriesData* = &c->series[(int64)i];
+    var j: int64 = 0;
+    while (j < d->vn && rc == MP_OK) {
+      var y: float64 = d->vy[j];
+      if (marks_ok(y)) {
+        var x0: float64 = mp_scale_band_start(l->xs, (int32)j) + (float64)i * sub;
+        rc = marks_bar(l, i, y, x0, x0 + sub);
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return rc;
+}
+
+/// Draws every series' marks for the chart's kind, series in index order.
+///
+/// @param l The layout. Valid: non-zero, laid out with scales built and views filled.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ALLOC the scratch or the scene could not grow; the marks are partial.
+/// @error MP_ERR_LIMIT the scene reached its size limit; the marks are partial.
+/// @mem Writes into l->s and the chart's scratch.
+/// @thread Call with the chart entered.
+/// @cost O(view points + nodes).
+export fn mp_marks_draw(l: MpLayout*) -> int32 {
+  var c: MpChart* = l->c;
+  if (c->kind == MP_BAR) { return marks_bars(l); }
+  var rc: int32 = MP_OK;
+  var i: int32 = 0;
+  while (i < c->n_series && rc == MP_OK) {
+    if (c->kind == MP_SCATTER) {
+      rc = marks_scatter(l, i);
+    } else {
+      rc = marks_line(l, i);
+    }
+    i = i + 1;
+  }
+  return rc;
+}

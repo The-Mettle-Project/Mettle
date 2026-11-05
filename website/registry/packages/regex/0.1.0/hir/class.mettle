@@ -1,0 +1,233 @@
+// Character classes as sorted, non-overlapping ranges of code points (or of
+// bytes for classes built with Unicode mode off), with the set operations
+// the parser needs: union, intersection, difference, symmetric difference,
+// negation and simple case folding.
+
+import "std/mem";
+import "regex/core/vec";
+import "regex/unicode/ucd";
+
+export struct RxRange {
+  lo: uint32;
+  hi: uint32;
+}
+
+export struct RxClass {
+  r: RxVec<RxRange>;
+}
+
+export const RX_MAX_CP = 0x10FFFF;
+
+/// Adds the range lo..hi (inclusive). Call rx_cls_canon before reading.
+export fn rx_cls_add(c: RxClass*, lo: uint32, hi: uint32) {
+  var x: RxRange = { lo: lo, hi: hi };
+  if (lo > hi) { x.lo = hi; x.hi = lo; }
+  rx_vpush(&c->r, x);
+}
+
+export fn rx_cls_free(c: RxClass*) {
+  rx_vfree(&c->r);
+}
+
+export fn rx_cls_copy(dst: RxClass*, src: RxClass*) {
+  dst->r.len = 0;
+  rx_vreserve(&dst->r, src->r.len);
+  for i in 0..src->r.len { dst->r.data[i] = src->r.data[i]; }
+  dst->r.len = src->r.len;
+}
+
+// Bottom-up merge sort by low end.
+fn sort_ranges(a: RxRange*, n: int64) {
+  if (n < 2) { return; }
+  var ordered: bool = true;
+  for i in 1..n {
+    if (a[i - 1].lo > a[i].lo) { ordered = false; break; }
+  }
+  if (ordered) { return; }
+  var tmp: RxRange* = (RxRange*)malloc(sizeof(RxRange) * n);
+  var src: RxRange* = a;
+  var dst: RxRange* = tmp;
+  var width: int64 = 1;
+  while (width < n) {
+    var i: int64 = 0;
+    while (i < n) {
+      var mid: int64 = i + width;
+      if (mid > n) { mid = n; }
+      var hi: int64 = i + 2 * width;
+      if (hi > n) { hi = n; }
+      var l: int64 = i;
+      var r: int64 = mid;
+      var k: int64 = i;
+      while (k < hi) {
+        if (l < mid && (r >= hi || src[l].lo <= src[r].lo)) {
+          dst[k] = src[l];
+          l = l + 1;
+        } else {
+          dst[k] = src[r];
+          r = r + 1;
+        }
+        k = k + 1;
+      }
+      i = hi;
+    }
+    var t: RxRange* = src;
+    src = dst;
+    dst = t;
+    width = width * 2;
+  }
+  if (src != a) {
+    for i in 0..n { a[i] = src[i]; }
+  }
+  free(tmp);
+}
+
+/// Sorts the ranges and merges ones that overlap or touch.
+export fn rx_cls_canon(c: RxClass*) {
+  var n: int64 = c->r.len;
+  if (n == 0) { return; }
+  var a: RxRange* = c->r.data;
+  sort_ranges(a, n);
+  var w: int64 = 0;
+  for i in 1..n {
+    var cur: RxRange = a[i];
+    if ((uint64)cur.lo <= (uint64)a[w].hi + 1) {
+      if (cur.hi > a[w].hi) { a[w].hi = cur.hi; }
+    } else {
+      w = w + 1;
+      a[w] = cur;
+    }
+  }
+  c->r.len = w + 1;
+}
+
+/// Replaces the class with everything in 0..max that it does not hold.
+/// The class must be canonical.
+export fn rx_cls_negate(c: RxClass*, max: uint32) {
+  var out: RxClass;
+  var next: uint64 = 0;
+  for i in 0..c->r.len {
+    var x: RxRange = c->r.data[i];
+    if ((uint64)x.lo > next) { rx_cls_add(&out, (uint32)next, x.lo - 1); }
+    next = (uint64)x.hi + 1;
+  }
+  if (next <= (uint64)max) { rx_cls_add(&out, (uint32)next, max); }
+  rx_vfree(&c->r);
+  c->r = out.r;
+}
+
+/// Adds every range of src to dst, then makes dst canonical.
+export fn rx_cls_union(dst: RxClass*, src: RxClass*) {
+  rx_vreserve(&dst->r, dst->r.len + src->r.len);
+  for i in 0..src->r.len { rx_vpush(&dst->r, src->r.data[i]); }
+  rx_cls_canon(dst);
+}
+
+/// Keeps in a only what is also in b. Both must be canonical.
+export fn rx_cls_intersect(a: RxClass*, b: RxClass*) {
+  var out: RxClass;
+  var i: int64 = 0;
+  var j: int64 = 0;
+  while (i < a->r.len && j < b->r.len) {
+    var x: RxRange = a->r.data[i];
+    var y: RxRange = b->r.data[j];
+    var lo: uint32 = x.lo;
+    if (y.lo > lo) { lo = y.lo; }
+    var hi: uint32 = x.hi;
+    if (y.hi < hi) { hi = y.hi; }
+    if (lo <= hi) { rx_cls_add(&out, lo, hi); }
+    if (x.hi < y.hi) { i = i + 1; } else { j = j + 1; }
+  }
+  rx_vfree(&a->r);
+  a->r = out.r;
+}
+
+/// Removes from a everything in b. Both must be canonical.
+export fn rx_cls_diff(a: RxClass*, b: RxClass*) {
+  var nb: RxClass;
+  rx_cls_copy(&nb, b);
+  rx_cls_negate(&nb, 0xFFFFFFFF);
+  rx_cls_intersect(a, &nb);
+  rx_cls_free(&nb);
+}
+
+/// Keeps what is in exactly one of a and b. Both must be canonical.
+export fn rx_cls_symdiff(a: RxClass*, b: RxClass*) {
+  var both: RxClass;
+  rx_cls_copy(&both, a);
+  rx_cls_intersect(&both, b);
+  rx_cls_union(a, b);
+  rx_cls_diff(a, &both);
+  rx_cls_free(&both);
+}
+
+/// True when cp is in the (canonical) class.
+export fn rx_cls_has(c: RxClass*, cp: uint32) -> bool {
+  var lo: int64 = 0;
+  var hi: int64 = c->r.len;
+  while (lo < hi) {
+    var mid: int64 = (lo + hi) / 2;
+    var x: RxRange = c->r.data[mid];
+    if (x.hi < cp) { lo = mid + 1; }
+    else if (x.lo > cp) { hi = mid; }
+    else { return true; }
+  }
+  return false;
+}
+
+/// Adds the simple case folding of every code point (Unicode).
+export fn rx_cls_fold(c: RxClass*) {
+  var n: int64 = c->r.len;
+  var nf: int64 = rx_fold_count();
+  for i in 0..n {
+    var x: RxRange = c->r.data[i];
+    var k: int64 = rx_fold_lower_bound(x.lo);
+    while (k < nf && rx_fold_cp(k) <= x.hi) {
+      var start: uint32 = rx_fold_cp(k);
+      var cp: uint32 = rx_fold_next_at(k);
+      var guard: int32 = 0;
+      while (cp != start && guard < 8) {
+        rx_cls_add(c, cp, cp);
+        cp = rx_fold_next(cp);
+        guard = guard + 1;
+      }
+      k = k + 1;
+    }
+  }
+  rx_cls_canon(c);
+}
+
+/// Adds the ASCII case variants of letters in the class.
+export fn rx_cls_fold_ascii(c: RxClass*) {
+  var n: int64 = c->r.len;
+  for i in 0..n {
+    var x: RxRange = c->r.data[i];
+    var lo: uint32 = x.lo;
+    var hi: uint32 = x.hi;
+    if (lo < 65) { lo = 65; }
+    if (hi > 90) { hi = 90; }
+    if (lo <= hi) { rx_cls_add(c, lo + 32, hi + 32); }
+    lo = x.lo;
+    hi = x.hi;
+    if (lo < 97) { lo = 97; }
+    if (hi > 122) { hi = 122; }
+    if (lo <= hi) { rx_cls_add(c, lo - 32, hi - 32); }
+  }
+  rx_cls_canon(c);
+}
+
+/// Adds every range of Unicode set `idx` (from rx_ucd_find).
+export fn rx_cls_add_ucd(c: RxClass*, idx: int32) {
+  var n: int64 = rx_ucd_count(idx);
+  rx_vreserve(&c->r, c->r.len + n);
+  for i in 0..n { rx_cls_add(c, rx_ucd_lo(idx, i), rx_ucd_hi(idx, i)); }
+}
+
+/// Total number of code points (or bytes) in the class.
+export fn rx_cls_size(c: RxClass*) -> int64 {
+  var t: int64 = 0;
+  for i in 0..c->r.len {
+    var x: RxRange = c->r.data[i];
+    t = t + (int64)(x.hi - x.lo) + 1;
+  }
+  return t;
+}

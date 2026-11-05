@@ -1,0 +1,396 @@
+// The chart object: lifecycle, series, pushes, categories, rings, the sticky error, seq
+// rules (equal values never move it), string copies and the lock hooks. Every check ends
+// with mp_alloc_live() back at its starting value.
+
+import "std/conv";
+import "std/math";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/data/col";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/scene/scene";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/chart/series";
+import "mistplot/render/svg";
+
+fn check_lifecycle() {
+  var base: int64 = mp_alloc_live();
+  mp_expect("bad kind", mp_chart_new(7) == 0);
+  mp_expect("negative kind", mp_chart_new(-1) == 0);
+  var c: MpChart* = mp_chart_new(MP_AREA);
+  mp_expect("new", c != 0);
+  mp_expect_i64("kind", (int64)mp_chart_kind(c), (int64)MP_AREA);
+  mp_expect_i64("seq starts at 0", mp_chart_seq(c), 0);
+  mp_expect_i64("no error", (int64)mp_chart_error(c), (int64)MP_OK);
+  mp_expect_i64("series 0", (int64)mp_chart_series(c, "a"), 0);
+  mp_expect_i64("series 1", (int64)mp_chart_series(c, ""), 1);
+  mp_expect_i64("count", (int64)mp_chart_series_count(c), 2);
+  mp_expect("area fills by default", c->series[0].fill);
+  mp_chart_free(c);
+  mp_chart_free(0);
+  mp_expect_i64("null kind", (int64)mp_chart_kind(0), -1);
+  mp_expect_i64("null series", (int64)mp_chart_series(0, "x"), -1);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_series_limits() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var i: int32 = 0;
+  while (i < MP_MAX_SERIES) {
+    mp_chart_series(c, "s");
+    i = i + 1;
+  }
+  mp_expect_i64("33rd series", (int64)mp_chart_series(c, "x"), -1);
+  mp_expect_i64("limit recorded", (int64)mp_chart_error(c), (int64)MP_ERR_LIMIT);
+  mp_expect_i64("bad push", (int64)mp_chart_push(c, 40, 1.0, 1.0), (int64)MP_ERR_ARG);
+  mp_expect_i64("first error sticks", (int64)mp_chart_error(c), (int64)MP_ERR_LIMIT);
+  mp_chart_error_clear(c);
+  mp_expect_i64("cleared", (int64)mp_chart_error(c), (int64)MP_OK);
+  mp_expect_i64("bad push again", (int64)mp_chart_push(c, -1, 1.0, 1.0), (int64)MP_ERR_ARG);
+  mp_expect_i64("now arg", (int64)mp_chart_error(c), (int64)MP_ERR_ARG);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_push() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  var xs: float64[4] = [1.0, 2.0, 3.0, 4.0];
+  var ys: float64[4] = [5.0, 6.0, 7.0, 8.0];
+  var q0: int64 = mp_chart_seq(c);
+  mp_expect_i64("push_n", (int64)mp_chart_push_n(c, s, &xs[0], &ys[0], 4), (int64)MP_OK);
+  mp_expect("push_n moves seq once", mp_chart_seq(c) == q0 + 1);
+  mp_expect_i64("push_n 0 arrays", (int64)mp_chart_push_n(c, s, 0, 0, 0), (int64)MP_OK);
+  mp_expect("empty push_n keeps seq", mp_chart_seq(c) == q0 + 1);
+  mp_expect_i64("push_n null", (int64)mp_chart_push_n(c, s, 0, 0, 2), (int64)MP_ERR_ARG);
+  mp_chart_push(c, s, 9.0, 1.0);
+  mp_expect_i64("len", mp_chart_len(c, s), 5);
+  mp_expect_i64("len bad series", mp_chart_len(c, 3), 0);
+  mp_expect_i64("keep", (int64)mp_chart_keep(c, 3), (int64)MP_OK);
+  mp_expect_i64("ring len", mp_chart_len(c, s), 3);
+  mp_chart_push(c, s, 10.0, 1.0);
+  mp_expect_i64("ring stays", mp_chart_len(c, s), 3);
+  var s2: int32 = mp_chart_series(c, "b");
+  mp_expect_i64("new series gets keep", c->series[(int64)s2].col.keep, 3);
+  var zero: float64 = 0.0;
+  mp_expect_i64("keep negative", (int64)mp_chart_keep(c, -1), (int64)MP_ERR_ARG);
+  mp_expect_i64("window NaN", (int64)mp_chart_window(c, zero / zero), (int64)MP_ERR_ARG);
+  mp_expect_i64("clear series", (int64)mp_chart_clear_series(c, s), (int64)MP_OK);
+  mp_expect_i64("cleared len", mp_chart_len(c, s), 0);
+  mp_chart_push(c, s2, 1.0, 1.0);
+  mp_chart_clear(c);
+  mp_expect_i64("clear all", mp_chart_len(c, s2), 0);
+  mp_expect("clear forgets latest", !c->has_latest);
+  var st: MpChartStats;
+  mp_expect_i64("stats", (int64)mp_chart_stats(c, &st), (int64)MP_OK);
+  mp_expect_i64("pushes", st.pushes, 7);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_categories() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_BAR);
+  var a: int32 = mp_chart_series(c, "a");
+  var b: int32 = mp_chart_series(c, "b");
+  mp_chart_set_value(c, a, "north", 3.0);
+  mp_chart_set_value(c, b, "south", 4.0);
+  mp_chart_set_value(c, a, "south", 5.0);
+  mp_expect_i64("categories", (int64)c->n_cats, 2);
+  mp_expect_str("first seen", c->cats[0], "north");
+  mp_expect_i64("b padded", mp_chart_len(c, b), 2);
+  mp_expect("b north NaN", c->series[(int64)b].col.ys[0] != c->series[(int64)b].col.ys[0]);
+  mp_expect("a south", c->series[(int64)a].col.ys[1] == 5.0);
+  var q: int64 = mp_chart_seq(c);
+  mp_chart_set_value(c, a, "south", 5.0);
+  mp_expect_i64("equal value keeps seq", mp_chart_seq(c), q);
+  mp_chart_set_value(c, a, "south", 6.0);
+  mp_expect("new value moves seq", mp_chart_seq(c) > q);
+  mp_expect_i64("bad series", (int64)mp_chart_set_value(c, 9, "x", 1.0), (int64)MP_ERR_ARG);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_seq_equal() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_set_title(c, "T");
+  mp_chart_set_theme(c, mp_theme_dark());
+  mp_chart_set_legend(c, MP_LEGEND_RIGHT);
+  mp_chart_window(c, 10.0);
+  mp_chart_keep(c, 50);
+  mp_chart_set_y_range(c, 0.0, 1.0);
+  mp_chart_set_margins(c, mp_insets(1.0, 2.0, 3.0, 4.0));
+  mp_series_set_color(c, s, mp_hex(0x112233));
+  mp_series_set_width(c, s, 3.0);
+  mp_series_set_dash(c, s, MP_DASH_DOTTED);
+  mp_series_set_marker(c, s, MP_MARK_SQUARE, 4.0);
+  mp_series_set_smooth(c, s, true);
+  mp_series_set_name(c, s, "b");
+  var q: int64 = mp_chart_seq(c);
+  mp_chart_set_title(c, "T");
+  mp_chart_set_subtitle(c, "");
+  mp_chart_set_theme(c, mp_theme_dark());
+  mp_chart_set_legend(c, MP_LEGEND_RIGHT);
+  mp_chart_set_grid(c, MP_GRID_Y);
+  mp_chart_set_x_format(c, MP_FMT_AUTO);
+  mp_chart_set_y_zero(c, true);
+  mp_chart_set_x_log(c, false);
+  mp_chart_window(c, 10.0);
+  mp_chart_keep(c, 50);
+  mp_chart_set_y_range(c, 0.0, 1.0);
+  mp_chart_set_x_auto(c);
+  mp_chart_set_bar_gap(c, 0.2);
+  mp_chart_set_margins(c, mp_insets(1.0, 2.0, 3.0, 4.0));
+  mp_series_set_color(c, s, mp_hex(0x112233));
+  mp_series_set_width(c, s, 3.0);
+  mp_series_set_dash(c, s, MP_DASH_DOTTED);
+  mp_series_set_marker(c, s, MP_MARK_SQUARE, 4.0);
+  mp_series_set_smooth(c, s, true);
+  mp_series_set_fill(c, s, false);
+  mp_series_set_name(c, s, "b");
+  mp_chart_set_generation(c, 99);
+  mp_expect_i64("equal setters keep seq", mp_chart_seq(c), q);
+  mp_expect_i64("no error", (int64)mp_chart_error(c), (int64)MP_OK);
+  mp_expect_i64("generation", mp_chart_generation(c), 99);
+  mp_chart_set_legend(c, MP_LEGEND_TOP);
+  mp_expect_i64("change moves seq by one", mp_chart_seq(c), q + 1);
+  mp_expect_i64("bad legend", (int64)mp_chart_set_legend(c, 9), (int64)MP_ERR_ARG);
+  mp_expect_i64("bad range", (int64)mp_chart_set_x_range(c, 2.0, 1.0), (int64)MP_ERR_ARG);
+  mp_expect_i64("bad gap", (int64)mp_chart_set_bar_gap(c, 0.95), (int64)MP_ERR_ARG);
+  mp_expect_i64("bad width", (int64)mp_series_set_width(c, s, 0.0), (int64)MP_ERR_ARG);
+  mp_expect_i64("bad dash", (int64)mp_series_set_dash(c, s, 5), (int64)MP_ERR_ARG);
+  mp_expect_i64("rejected keep seq", mp_chart_seq(c), q + 1);
+  mp_expect("explicit colour", mp_color_eq(mp_series_color(c, s), mp_hex(0x112233)));
+  mp_series_set_color(c, s, mp_rgba(0, 0, 0, 0));
+  mp_expect("palette colour", mp_color_eq(mp_series_color(c, s), mp_hex(0x4269D0)));
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_host_theme() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_host_theme(c, mp_theme_dark());
+  mp_expect("host theme applies", mp_color_eq(c->theme.bg, mp_hex(0x111827)));
+  mp_expect("not explicit", !c->theme_explicit);
+  mp_chart_set_theme(c, mp_theme_light());
+  mp_chart_set_host_theme(c, mp_theme_dark());
+  mp_expect("explicit wins", mp_color_eq(c->theme.bg, mp_hex(0xFFFFFF)));
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+// The title comes from a heap buffer that is scribbled over and freed before rendering.
+fn check_string_copies() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var p: uint8* = (uint8*)mp_alloc(5);
+  var src: string = "Quota";
+  var i: int64 = 0;
+  while (i < 5) {
+    p[i] = src.chars[i];
+    i = i + 1;
+  }
+  var tmp: string = str_from_bytes((cstring)p, 5);
+  mp_chart_set_title(c, tmp);
+  var s: int32 = mp_chart_series(c, tmp);
+  mp_chart_set_value(c, s, tmp, 1.0);
+  i = 0;
+  while (i < 5) {
+    p[i] = 88;
+    i = i + 1;
+  }
+  mp_free((rawptr)p);
+  mp_chart_push(c, s, 1.0, 2.0);
+  var out: MpBuf* = mp_buf_new(256);
+  mp_expect_i64("render", (int64)mp_chart_svg(c, 200.0, 120.0, out), (int64)MP_OK);
+  var doc: string = mp_buf_str(out);
+  mp_expect("title survives", str_contains(doc, ">Quota</text>") != 0);
+  mp_expect("no scribble", str_contains(doc, "XXXXX") == 0);
+  mp_expect_str("name copy", c->series[0].name, "Quota");
+  mp_expect_str("category copy", c->cats[0], "Quota");
+  mp_buf_free(out);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+struct HookCount {
+  locks: int32;
+  unlocks: int32;
+  batches: int32;
+  depth: int32;
+  worst: int32;
+}
+
+fn hook_lock(ctx: rawptr, batch: int32) {
+  var h: HookCount* = (HookCount*)ctx;
+  h->locks = h->locks + 1;
+  if (batch != 0) { h->batches = h->batches + 1; }
+  h->depth = h->depth + 1;
+  if (h->depth > h->worst) { h->worst = h->depth; }
+}
+
+fn hook_unlock(ctx: rawptr, batch: int32) {
+  var h: HookCount* = (HookCount*)ctx;
+  h->unlocks = h->unlocks + 1;
+  h->depth = h->depth - 1;
+}
+
+fn check_lock_hooks() {
+  var base: int64 = mp_alloc_live();
+  var h: HookCount* = (HookCount*)mp_alloc_zero((int64)sizeof(HookCount));
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_expect_i64("install", (int64)mp_chart_set_lock_hooks(c, &hook_lock, &hook_unlock,
+                                                          (rawptr)h), (int64)MP_OK);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_push(c, s, 1.0, 1.0);
+  mp_chart_set_title(c, "t");
+  mp_chart_lock(c);
+  mp_chart_push(c, s, 2.0, 2.0);
+  mp_chart_unlock(c);
+  var out: MpBuf* = mp_buf_new(256);
+  mp_chart_svg(c, 100.0, 80.0, out);
+  mp_expect("hooks ran", h->locks >= 6);
+  mp_expect_i64("balanced", (int64)h->locks, (int64)h->unlocks);
+  mp_expect_i64("one batch", (int64)h->batches, 1);
+  mp_expect_i64("nesting only inside the batch", (int64)h->worst, 2);
+  mp_buf_free(out);
+  mp_chart_free(c);
+  mp_free((rawptr)h);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_getters() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_expect_i64("keep default", mp_chart_keep_count(c), 0);
+  mp_expect_near("window default", mp_chart_window_span(c), 0.0, 0.0);
+  mp_expect("static is not live", !mp_chart_is_live(c));
+  mp_chart_keep(c, 50);
+  mp_expect_i64("keep", mp_chart_keep_count(c), 50);
+  mp_expect("keep makes it live", mp_chart_is_live(c));
+  mp_chart_keep(c, 0);
+  mp_expect("static again", !mp_chart_is_live(c));
+  mp_chart_window(c, 2.5);
+  mp_expect_near("window", mp_chart_window_span(c), 2.5, 0.0);
+  mp_expect("window makes it live", mp_chart_is_live(c));
+  mp_expect_i64("null keep", mp_chart_keep_count(0), 0);
+  mp_expect_near("null window", mp_chart_window_span(0), 0.0, 0.0);
+  mp_expect("null live", !mp_chart_is_live(0));
+
+  var s: int32 = mp_chart_series(c, "alpha é");
+  var t: int32 = mp_chart_series(c, "");
+  var buf: uint8[16];
+  mp_expect_str("name", mp_series_name(c, s, &buf[0], 16), "alpha é");
+  mp_expect_str("empty name", mp_series_name(c, t, &buf[0], 16), "");
+  mp_expect_str("name cut", mp_series_name(c, s, &buf[0], 3), "alp");
+  mp_expect_str("name cut at a code point", mp_series_name(c, s, &buf[0], 7), "alpha ");
+  mp_expect_str("name bad index", mp_series_name(c, 9, &buf[0], 16), "");
+  mp_expect_str("name negative index", mp_series_name(c, -1, &buf[0], 16), "");
+  mp_expect_str("name null buffer", mp_series_name(c, s, 0, 16), "");
+  mp_expect_str("name zero cap", mp_series_name(c, s, &buf[0], 0), "");
+  mp_expect_str("name null chart", mp_series_name(0, s, &buf[0], 16), "");
+
+  mp_expect("last_x empty", mp_chart_last_x(c, s) != mp_chart_last_x(c, s));
+  mp_expect("last_x bad index", mp_chart_last_x(c, 5) != mp_chart_last_x(c, 5));
+  mp_expect("last_x null", mp_chart_last_x(0, 0) != mp_chart_last_x(0, 0));
+  mp_chart_clear(c);
+  mp_chart_push(c, s, 1.0, 10.0);
+  mp_chart_push(c, s, 2.0, 20.0);
+  mp_chart_push(c, s, 3.0, 30.0);
+  mp_chart_push(c, s, NAN(), 40.0);
+  mp_expect_near("last_x skips non-finite", mp_chart_last_x(c, s), 3.0, 0.0);
+  mp_expect("other series still empty", mp_chart_last_x(c, t) != mp_chart_last_x(c, t));
+  mp_chart_clear(c);
+  mp_expect("last_x after clear", mp_chart_last_x(c, s) != mp_chart_last_x(c, s));
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_set_at_x() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  var i: int32 = 0;
+  while (i < 5) {
+    mp_chart_push(c, s, (float64)i, (float64)(i * 10));
+    i = i + 1;
+  }
+  var seq: int64 = mp_chart_seq(c);
+  mp_expect_i64("overwrite", (int64)mp_chart_set_at_x(c, s, 3.0, 99.0), (int64)MP_OK);
+  mp_expect("seq bumped", mp_chart_seq(c) > seq);
+  mp_expect_near("y replaced", mp_col_y(&c->series[0].col, 3), 99.0, 0.0);
+  mp_expect_near("x kept", mp_col_x(&c->series[0].col, 3), 3.0, 0.0);
+  mp_expect_i64("len unchanged", mp_chart_len(c, s), 5);
+  mp_expect_near("last_x unchanged", mp_chart_last_x(c, s), 4.0, 0.0);
+  mp_expect_i64("last sample", (int64)mp_chart_set_at_x(c, s, 4.0, 1.0), (int64)MP_OK);
+  mp_expect_near("first sample ok", mp_col_y(&c->series[0].col, 4), 1.0, 0.0);
+  mp_expect_i64("first", (int64)mp_chart_set_at_x(c, s, 0.0, 7.0), (int64)MP_OK);
+
+  seq = mp_chart_seq(c);
+  mp_expect_i64("miss between", (int64)mp_chart_set_at_x(c, s, 2.5, 1.0), (int64)MP_ERR_STATE);
+  mp_expect_i64("miss above", (int64)mp_chart_set_at_x(c, s, 9.0, 1.0), (int64)MP_ERR_STATE);
+  mp_expect_i64("miss below", (int64)mp_chart_set_at_x(c, s, -1.0, 1.0), (int64)MP_ERR_STATE);
+  mp_expect_i64("seq unchanged by a miss", mp_chart_seq(c), seq);
+  mp_expect_i64("a miss is not a setup error", (int64)mp_chart_error(c), (int64)MP_OK);
+
+  mp_expect_i64("bad series", (int64)mp_chart_set_at_x(c, 4, 1.0, 1.0), (int64)MP_ERR_ARG);
+  mp_expect_i64("bad series recorded", (int64)mp_chart_error(c), (int64)MP_ERR_ARG);
+  mp_expect_i64("null chart", (int64)mp_chart_set_at_x(0, 0, 1.0, 1.0), (int64)MP_ERR_ARG);
+  mp_chart_error_clear(c);
+
+  var u: int32 = mp_chart_series(c, "unsorted");
+  mp_chart_push(c, u, 2.0, 1.0);
+  mp_chart_push(c, u, 1.0, 2.0);
+  mp_expect_i64("unsorted", (int64)mp_chart_set_at_x(c, u, 1.0, 5.0), (int64)MP_ERR_STATE);
+  mp_expect_near("unsorted untouched", mp_col_y(&c->series[1].col, 1), 2.0, 0.0);
+  mp_expect_i64("empty series", (int64)mp_chart_set_at_x(c, mp_chart_series(c, "e"), 1.0, 5.0),
+                (int64)MP_ERR_STATE);
+
+  // A ring that dropped its oldest samples still finds the ones it holds.
+  var r: int32 = mp_chart_series(c, "ring");
+  mp_chart_keep(c, 3);
+  i = 0;
+  while (i < 6) {
+    mp_chart_push(c, r, (float64)i, (float64)i);
+    i = i + 1;
+  }
+  mp_expect_i64("ring hit", (int64)mp_chart_set_at_x(c, r, 4.0, 44.0), (int64)MP_OK);
+  mp_expect_near("ring y", mp_col_y(&c->series[3].col, 1), 44.0, 0.0);
+  mp_expect_i64("ring dropped", (int64)mp_chart_set_at_x(c, r, 1.0, 0.0), (int64)MP_ERR_STATE);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn run_all() {
+  check_lifecycle();
+  check_series_limits();
+  check_push();
+  check_categories();
+  check_seq_equal();
+  check_host_theme();
+  check_string_copies();
+  check_lock_hooks();
+  check_getters();
+  check_set_at_x();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_chart_object() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

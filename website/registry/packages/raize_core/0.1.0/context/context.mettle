@@ -1,0 +1,320 @@
+// raize/context — the aggregator and the per-request context.
+//
+// This is the only file the rest of the framework imports:
+//
+//     import "framework/context/context";
+//
+// It pulls in arena, header, request and response (Mettle imports are
+// transitive, so query/json/date come with them) and defines RzContext, the
+// per-request object a handler receives.
+//
+// Division of labour, so `context` does not become a god module:
+//   RzRequest   wire data: verb, target, path, query, headers, body
+//   RzResponse  wire data: status, headers, body builder
+//   RzContext   per-request services: the two pointers above, the arena,
+//               a store handle, a user handle, and the status/byte counters
+//               the logging middleware reads after the handler returns.
+//
+// `context` imports nothing above it. It never knows what a router, a
+// middleware chain, a store or a template is; those are `rawptr` here and are
+// typed by their owning module.
+
+import "arena";
+import "header";
+import "request";
+import "response";
+import "../core/status";
+
+// A request a handler has accepted for a protocol upgrade (WebSocket). The
+// handler fills ctx->upgrade; after it returns, the connection loop calls
+// `adopt` on the worker thread with the socket and any bytes already read
+// past the request. When adopt returns 0 the socket belongs to the adopter:
+// the loop writes nothing more and does not close it. Non-zero means the
+// upgrade failed before anything was written, and the loop answers 500.
+// `owner` and `arg` are typed by the module that made the upgrade
+// (framework/hub). The struct itself lives in the request arena.
+export struct RzUpgrade {
+  adopt: fn(RzUpgrade*, int64, uint8*, int64) -> int32;
+  owner: rawptr;
+  arg: rawptr;
+  key: string;            // e.g. Sec-WebSocket-Key, a view into the request
+}
+
+export struct RzContext {
+  req: RzRequest*;
+  resp: RzResponse*;
+  arena: RzArena*;
+  store: rawptr;          // framework/orm's RzStore*, typed there
+  user: rawptr;           // auth middleware's principal, typed there
+  status: int32;          // set by the handler, read by the log frame
+  bytes_written: int64;   // set by the server after the write
+  aborted: bool;          // a middleware refused: do not call the handler
+  upgrade: RzUpgrade*;    // set by an upgrading handler, else 0
+  peer: uint32;           // the socket's IPv4 address, bytes a.b.c.d in memory order; 0 unknown
+  session: rawptr;        // raize_session's per-request state while its middleware runs, else 0
+}
+
+// Binds a context to a request/response pair. `resp->arena` is set here, once,
+// so every header a handler sets is copied and cannot alias a stack buffer.
+export fn rz_ctx_init(ctx: RzContext*, req: RzRequest*, resp: RzResponse*, arena: RzArena*) {
+  if (ctx == 0) { return; }
+  ctx->req = req;
+  ctx->resp = resp;
+  ctx->arena = arena;
+  ctx->store = 0;
+  ctx->user = 0;
+  ctx->status = 0;
+  ctx->bytes_written = 0;
+  ctx->aborted = false;
+  ctx->upgrade = 0;
+  ctx->peer = 0;
+  ctx->session = 0;
+  if (resp != 0) {
+    resp->arena = arena;
+  }
+}
+
+// The status is tracked twice on purpose: `resp->status` is what goes on the
+// wire, `ctx->status` is what the outer logging frame reads even when a
+// handler forged the response itself.
+fn rz_ctx_mark(ctx: RzContext*, status: int32) {
+  if (ctx == 0) { return; }
+  ctx->status = status;
+}
+
+// Every response helper returns the HTTP status it set, so a handler can end
+// with `return rz_ctx_text(ctx, 404, "...");`. With no context or response
+// there is nothing to set and the helpers return 500. A response that cannot
+// be built (rz_ctx_redirect with the header table full) becomes an empty 500.
+fn rz_ctx_done(ctx: RzContext*, status: int32, rc: int32) -> int32 {
+  if (rc == 0) { return status; }
+  rz_ctx_mark(ctx, 500);
+  rz_resp_empty(ctx->resp, 500);
+  return 500;
+}
+
+export fn rz_ctx_text(ctx: RzContext*, status: int32, body: string) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return 500; }
+  rz_ctx_mark(ctx, status);
+  return rz_ctx_done(ctx, status, rz_resp_text(ctx->resp, status, body));
+}
+
+export fn rz_ctx_html(ctx: RzContext*, status: int32, body: string) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return 500; }
+  rz_ctx_mark(ctx, status);
+  return rz_ctx_done(ctx, status, rz_resp_html(ctx->resp, status, body));
+}
+
+export fn rz_ctx_json(ctx: RzContext*, status: int32, body: string) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return 500; }
+  rz_ctx_mark(ctx, status);
+  return rz_ctx_done(ctx, status, rz_resp_json(ctx->resp, status, body));
+}
+
+export fn rz_ctx_bytes(ctx: RzContext*, status: int32, ct: string, body: string) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return 500; }
+  rz_ctx_mark(ctx, status);
+  return rz_ctx_done(ctx, status, rz_resp_bytes(ctx->resp, status, ct, body));
+}
+
+export fn rz_ctx_empty(ctx: RzContext*, status: int32) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return 500; }
+  rz_ctx_mark(ctx, status);
+  return rz_ctx_done(ctx, status, rz_resp_empty(ctx->resp, status));
+}
+
+export fn rz_ctx_redirect(ctx: RzContext*, status: int32, location: string) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return 500; }
+  rz_ctx_mark(ctx, status);
+  return rz_ctx_done(ctx, status, rz_resp_redirect(ctx->resp, status, location));
+}
+
+export fn rz_ctx_not_found(ctx: RzContext*) -> int32 {
+  return rz_ctx_text(ctx, 404, "not found\n");
+}
+
+// A middleware refuses by aborting: the server sees `aborted` and skips the
+// handler, but still writes whatever response was built. Returns `status`
+// (500 with no context).
+export fn rz_ctx_abort(ctx: RzContext*, status: int32) -> int32 {
+  if (ctx == 0) { return 500; }
+  ctx->aborted = true;
+  rz_ctx_mark(ctx, status);
+  if (ctx->resp != 0) { ctx->resp->status = status; }
+  return status;
+}
+
+export fn rz_ctx_is_json(ctx: RzContext*) -> bool {
+  if (ctx == 0) { return false; }
+  return rz_req_is_json(ctx->req);
+}
+
+// Convenience over the query accessors; the arena is the context's.
+export fn rz_ctx_query(ctx: RzContext*, name: string) -> string {
+  if (ctx == 0 || ctx->req == 0) { return rz_str_empty(); }
+  return rz_query_get(ctx->req->query, name, ctx->arena);
+}
+
+/// Reads a query parameter as an int64 with strict parsing (rz_str_parse_int):
+/// a missing, empty, malformed or out-of-range value is a false return, never a
+/// sentinel number.
+///
+/// in:      ctx   the request
+///          name  the parameter name
+///          out   written only on success; must be non-null
+/// returns: true and `*out` set on success; false otherwise
+/// owns:    nothing (decoding uses the request arena)
+/// thread:  the worker serving the request
+/// example:
+///   var page: int64 = 1;
+///   if (!rz_ctx_query_int(ctx, "page", &page)) { page = 1; }
+export fn rz_ctx_query_int(ctx: RzContext*, name: string, out: int64*) -> bool {
+  if (ctx == 0 || ctx->req == 0) { return false; }
+  var v: string = rz_query_get(ctx->req->query, name, ctx->arena);
+  if (v.length == 0) { return false; }
+  return rz_str_parse_int(v, out);
+}
+
+/// Attaches the signed-in user (or any per-request principal) to the request.
+/// A guard or middleware sets it; later steps and the handler read it with
+/// rz_ctx_user, and a WebSocket upgrade copies it into the connection's RzConn.
+///
+/// in:      ctx   the request
+///          user  the app's own value (e.g. a User* found from a session cookie); 0 clears
+/// returns: nothing
+/// owns:    nothing; the app keeps `user` alive at least until the request ends (and
+///          for as long as a socket that captured it is open)
+/// thread:  the worker serving the request
+/// example:
+///   rz_ctx_set_user(ctx, (rawptr)u);
+export fn rz_ctx_set_user(ctx: RzContext*, user: rawptr) {
+  if (ctx == 0) { return; }
+  ctx->user = user;
+}
+
+/// The value a guard or middleware attached with rz_ctx_set_user, or 0.
+///
+/// in:      ctx the request
+/// returns: the user pointer, or 0 when none was set
+/// owns:    nothing; borrowed from whoever set it
+/// thread:  the worker serving the request
+/// example: -
+export fn rz_ctx_user(ctx: RzContext*) -> rawptr {
+  if (ctx == 0) { return 0; }
+  return ctx->user;
+}
+
+/// A request header, case-insensitively; the first one when repeated.
+///
+/// in:      ctx   the request
+///          name  the header name ("Authorization", "x-request-id")
+/// returns: the value with surrounding whitespace removed, or "" when absent
+/// owns:    a view into the request; valid until the handler returns (copy to keep)
+/// thread:  the worker serving the request
+/// example:
+///   var id: string = rz_ctx_header(ctx, "X-Request-Id");
+export fn rz_ctx_header(ctx: RzContext*, name: string) -> string {
+  if (ctx == 0 || ctx->req == 0) { return rz_str_empty(); }
+  return rz_req_header(ctx->req, name);
+}
+
+/// Sets (or replaces) a response header. Use rz_ctx_set_cookie for Set-Cookie.
+///
+/// in:      ctx    the request
+///          name   a header token ("Cache-Control")
+///          value  no CR, LF or NUL; copied into the request arena
+/// returns: RZ_OK; RZ_E_INVALID for a bad name or value (nothing stored);
+///          RZ_E_FULL when the response already has 16 headers
+/// owns:    nothing kept from the caller
+/// thread:  the worker serving the request
+/// example:
+///   rz_ctx_set_header(ctx, "Cache-Control", "no-store");
+export fn rz_ctx_set_header(ctx: RzContext*, name: string, value: string) -> int32 {
+  if (ctx == 0 || ctx->resp == 0) { return RZ_E_USAGE; }
+  var rc: int32 = rz_resp_header_set(ctx->resp, name, value);
+  if (rc == -2) { return RZ_E_FULL; }
+  if (rc != 0) { return RZ_E_INVALID; }
+  return RZ_OK;
+}
+
+/// One field of an `application/x-www-form-urlencoded` request body (an HTML
+/// form POST), decoded: `+` is a space and `%XX` a byte.
+///
+/// in:      ctx   the request
+///          name  the field name, matched exactly after decoding
+///          out   receives the value ("" when absent); may not be 0
+/// returns: true when the body is a urlencoded form and holds the field
+/// owns:    *out is a view into the request or the request arena; valid until the
+///          handler returns (copy to keep)
+/// thread:  the worker serving the request
+/// example:
+///   var email: string = rz_str_empty();
+///   if (!rz_ctx_form(ctx, "email", &email)) { return rz_ctx_text(ctx, 400, "email?\n"); }
+export fn rz_ctx_form(ctx: RzContext*, name: string, out: string*) -> bool {
+  if (out == 0) { return false; }
+  *out = rz_str_empty();
+  if (ctx == 0 || ctx->req == 0) { return false; }
+  if (!rz_str_eq_ci(rz_req_media_type(ctx->req), "application/x-www-form-urlencoded")) { return false; }
+  return rz_query_find(ctx->req->body, name, ctx->arena, out);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+@test fn t_rz_ctx_lifecycle() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { rz_arena_free(arena); return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { rz_arena_free(arena); return 3; }
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  if (ctx.req != &req) { rz_response_free(resp); rz_arena_free(arena); return 4; }
+  if (resp->arena != arena) { rz_response_free(resp); rz_arena_free(arena); return 5; }
+  if (ctx.status != 0) { rz_response_free(resp); rz_arena_free(arena); return 6; }
+
+  if (rz_ctx_text(&ctx, 201, "made") != 201) { rz_response_free(resp); rz_arena_free(arena); return 7; }
+  if (resp->status != 201) { rz_response_free(resp); rz_arena_free(arena); return 8; }
+  if (ctx.status != 201) { rz_response_free(resp); rz_arena_free(arena); return 9; }
+  if (rz_resp_body_len(resp) != 4) { rz_response_free(resp); rz_arena_free(arena); return 10; }
+  if (!rz_str_eq(rz_resp_header_get(resp, "content-type"), RZ_CT_TEXT)) { rz_response_free(resp); rz_arena_free(arena); return 11; }
+
+  if (rz_ctx_json(&ctx, 200, "[]") != 200) { rz_response_free(resp); rz_arena_free(arena); return 12; }
+  if (!rz_str_eq(rz_resp_header_get(resp, "content-type"), RZ_CT_JSON)) { rz_response_free(resp); rz_arena_free(arena); return 13; }
+
+  if (rz_ctx_not_found(&ctx) != 404) { rz_response_free(resp); rz_arena_free(arena); return 14; }
+  if (resp->status != 404) { rz_response_free(resp); rz_arena_free(arena); return 15; }
+
+  if (rz_ctx_abort(&ctx, 403) != 403) { rz_response_free(resp); rz_arena_free(arena); return 16; }
+  if (!ctx.aborted) { rz_response_free(resp); rz_arena_free(arena); return 17; }
+  if (resp->status != 403) { rz_response_free(resp); rz_arena_free(arena); return 18; }
+
+  // query convenience reads the raw query string through the arena
+  req.query = "limit=25&q=hi+there";
+  var limit: int64 = 0;
+  if (!rz_ctx_query_int(&ctx, "limit", &limit)) { rz_response_free(resp); rz_arena_free(arena); return 19; }
+  if (limit != 25) { rz_response_free(resp); rz_arena_free(arena); return 20; }
+  if (!rz_str_eq(rz_ctx_query(&ctx, "q"), "hi there")) { rz_response_free(resp); rz_arena_free(arena); return 21; }
+
+  rz_response_free(resp);
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_ctx_response_reset_reuse() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { rz_arena_free(arena); return 2; }
+  rz_resp_text(resp, 200, "one");
+  rz_response_reset(resp);
+  if (resp->status != 200) { rz_response_free(resp); rz_arena_free(arena); return 3; }
+  if (rz_resp_body_len(resp) != 0) { rz_response_free(resp); rz_arena_free(arena); return 4; }
+  rz_resp_text(resp, 500, "two");
+  if (!rz_str_starts(rz_buf_str(resp->body), "two")) { rz_response_free(resp); rz_arena_free(arena); return 5; }
+  rz_response_free(resp);
+  rz_arena_free(arena);
+  return 0;
+}

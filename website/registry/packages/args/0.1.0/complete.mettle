@@ -1,0 +1,364 @@
+// Shell completion scripts for bash, zsh and fish, built from the spec.
+//
+// Each script walks the words typed so far to find the current command
+// (words that start with '-' are skipped), then offers that command's
+// subcommands and options. After an option with a fixed set of values it
+// offers those values; after any other option that takes a value it
+// leaves completion to the shell (file names).
+//
+// bash: programmable completion (complete -F, compgen, COMPREPLY), as in
+//       the bash manual, "Programmable Completion".
+// zsh:  compsys functions (_describe, compadd, _files), loaded with
+//       `source` or from a file named _PROG on $fpath.
+// fish: `complete` commands with -n conditions.
+
+import "types";
+import "out";
+import "error";
+import "parse";
+
+export const ARGS_BASH = 1;
+export const ARGS_ZSH = 2;
+export const ARGS_FISH = 3;
+
+// "bash", "zsh" or "fish" to ARGS_BASH ...; 0 when unknown.
+export fn args_shell_id(name: string) -> int32 {
+  if (name == "bash") { return ARGS_BASH; }
+  if (name == "zsh") { return ARGS_ZSH; }
+  if (name == "fish") { return ARGS_FISH; }
+  return 0;
+}
+
+fn takes_value(kind: int32) -> bool {
+  return kind == ARGS_INT || kind == ARGS_UINT || kind == ARGS_FLOAT || kind == ARGS_STR
+      || kind == ARGS_CHOICE || kind == ARGS_LIST || kind == ARGS_CUSTOM;
+}
+
+// The program name as a shell function name: anything but [A-Za-z0-9_] is _.
+fn ident(w: ArgsOut*, s: string) {
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    var ok: bool = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95;
+    if (ok) { args_out_byte(w, c); } else { args_out_byte(w, 95); }
+  }
+}
+
+// Inside "double quotes" for bash and zsh.
+fn dq(w: ArgsOut*, s: string) {
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 34 || c == 36 || c == 96 || c == 92) { args_out_byte(w, 92); }
+    args_out_byte(w, c);
+  }
+}
+
+// Inside 'single quotes' for bash and zsh: ' becomes '\''.
+fn sq(w: ArgsOut*, s: string) {
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 39) { args_out_str(w, "'\\''"); }
+    else if (c == 10) { args_out_byte(w, 32); }
+    else { args_out_byte(w, c); }
+  }
+}
+
+// Inside 'single quotes' for fish: \ and ' get a backslash.
+fn fq(w: ArgsOut*, s: string) {
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 39 || c == 92) { args_out_byte(w, 92); }
+    if (c == 10) { args_out_byte(w, 32); } else { args_out_byte(w, c); }
+  }
+}
+
+// zsh _describe item "name:help", with ':' in the name escaped.
+fn zitem(w: ArgsOut*, name_prefix: string, name: string, help: string) {
+  args_out_byte(w, 39);
+  sq(w, name_prefix);
+  for i in 0..name.length {
+    var c: int32 = (int32)name.chars[i];
+    if (c == 58) { args_out_byte(w, 92); }
+    if (c == 39) { args_out_str(w, "'\\''"); } else { args_out_byte(w, c); }
+  }
+  args_out_byte(w, 58);
+  sq(w, help);
+  args_out_byte(w, 39);
+}
+
+// The command path of c without the program name: "build sub".
+fn path(a: Args*, c: int32, w: ArgsOut*) {
+  var chain: int32[64];
+  var n: int32 = 0;
+  var k: int32 = c;
+  while (k > 0 && n < 64) { chain[n] = k; n = n + 1; k = a->cmds[k].parent; }
+  var i: int32 = n - 1;
+  while (i >= 0) {
+    args_out_str(w, a->cmds[chain[i]].name);
+    if (i > 0) { args_out_byte(w, 32); }
+    i = i - 1;
+  }
+}
+
+// Every name of command c (name, then aliases) as `"P:name"|"P:alias"`.
+fn bash_cmd_patterns(a: Args*, c: int32, w: ArgsOut*) {
+  var parent: int32 = a->cmds[c].parent;
+  args_out_byte(w, 34); path(a, parent, w); args_out_byte(w, 58); dq(w, a->cmds[c].name); args_out_byte(w, 34);
+  var al: string = a->cmds[c].aliases;
+  var start: int64 = 0;
+  var n: int64 = (int64)al.length;
+  var i: int64 = 0;
+  while (i <= n) {
+    if (i == n || (int32)al.chars[i] == 32) {
+      if (i > start) {
+        var one: string;
+        one.chars = al.chars + start;
+        one.length = (uint64)(i - start);
+        args_out_str(w, "|\"");
+        path(a, parent, w); args_out_byte(w, 58); dq(w, one);
+        args_out_byte(w, 34);
+      }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+}
+
+// The case arms that track which command the user is in.
+fn walk_arms(a: Args*, w: ArgsOut*, var_name: string, fish: bool) {
+  for c in 1..a->ncmds {
+    if (a->cmds[c].hidden) { continue; }
+    if (fish) {
+      args_out_str(w, "      case ");
+      // fish: case 'P:name' 'P:alias'
+      args_out_byte(w, 39); path(a, a->cmds[c].parent, w); args_out_byte(w, 58); fq(w, a->cmds[c].name); args_out_byte(w, 39);
+      var al: string = a->cmds[c].aliases;
+      var start: int64 = 0;
+      var n: int64 = (int64)al.length;
+      var i: int64 = 0;
+      while (i <= n) {
+        if (i == n || (int32)al.chars[i] == 32) {
+          if (i > start) {
+            var one: string;
+            one.chars = al.chars + start;
+            one.length = (uint64)(i - start);
+            args_out_str(w, " '");
+            path(a, a->cmds[c].parent, w); args_out_byte(w, 58); fq(w, one);
+            args_out_byte(w, 39);
+          }
+          start = i + 1;
+        }
+        i = i + 1;
+      }
+      args_out_str(w, "\n        set ");
+      args_out_str(w, var_name);
+      args_out_str(w, " '");
+      path(a, c, w);
+      args_out_str(w, "'\n");
+    } else {
+      args_out_str(w, "      ");
+      bash_cmd_patterns(a, c, w);
+      args_out_str(w, ") ");
+      args_out_str(w, var_name);
+      args_out_str(w, "=\"");
+      path(a, c, w);
+      args_out_str(w, "\" ;;\n");
+    }
+  }
+}
+
+fn opt_pattern_bash(o: ArgsOpt*, a: Args*, c: int32, w: ArgsOut*) {
+  var first: bool = true;
+  if (o->long_name.length > (uint64)0) {
+    args_out_byte(w, 34); path(a, c, w); args_out_str(w, ":--"); dq(w, o->long_name); args_out_byte(w, 34);
+    first = false;
+  }
+  if (o->short_name != (uint8)0) {
+    if (!first) { args_out_byte(w, 124); }
+    args_out_byte(w, 34); path(a, c, w); args_out_str(w, ":-"); args_out_byte(w, (int32)o->short_name); args_out_byte(w, 34);
+  }
+}
+
+fn write_bash(a: Args*, w: ArgsOut*) {
+  args_out_str(w, "# bash completion for "); args_out_str(w, a->name);
+  args_out_str(w, "\n# Load it with: source <(");
+  args_out_str(w, a->name);
+  args_out_str(w, " completion bash)\n_");
+  ident(w, a->name);
+  args_out_str(w, "_complete() {{\n  local cur=\"${{COMP_WORDS[COMP_CWORD]}\" prev=\"\" p=\"\" w i\n");
+  args_out_str(w, "  if [ \"$COMP_CWORD\" -gt 0 ]; then prev=\"${{COMP_WORDS[COMP_CWORD-1]}\"; fi\n");
+  args_out_str(w, "  for ((i = 1; i < COMP_CWORD; i++)); do\n    w=\"${{COMP_WORDS[i]}\"\n    case \"$p:$w\" in\n");
+  walk_arms(a, w, "p", false);
+  args_out_str(w, "    esac\n  done\n  case \"$p:$prev\" in\n");
+  for c in 0..a->ncmds {
+    if (a->cmds[c].hidden) { continue; }
+    for i in 0..a->nopts {
+      var o: ArgsOpt* = &a->opts[i];
+      if (o->hidden || !takes_value(o->kind) || !args_opt_in_scope(a, i, c)) { continue; }
+      args_out_str(w, "    ");
+      opt_pattern_bash(o, a, c, w);
+      if (o->kind == ARGS_CHOICE) {
+        args_out_str(w, ") COMPREPLY=($(compgen -W \"");
+        for k in 0..o->nchoices { if (k > 0) { args_out_byte(w, 32); } dq(w, o->choices[k]); }
+        args_out_str(w, "\" -- \"$cur\")); return ;;\n");
+      } else {
+        args_out_str(w, ") return ;;\n");
+      }
+    }
+  }
+  args_out_str(w, "  esac\n  local words=\"\"\n  case \"$p\" in\n");
+  for c in 0..a->ncmds {
+    if (a->cmds[c].hidden) { continue; }
+    args_out_str(w, "    \"");
+    path(a, c, w);
+    args_out_str(w, "\") words=\"");
+    var first: bool = true;
+    for s in 1..a->ncmds {
+      if (a->cmds[s].parent != c || a->cmds[s].hidden) { continue; }
+      if (!first) { args_out_byte(w, 32); }
+      dq(w, a->cmds[s].name);
+      first = false;
+    }
+    for i in 0..a->nopts {
+      var o: ArgsOpt* = &a->opts[i];
+      if (o->hidden || !args_opt_in_scope(a, i, c)) { continue; }
+      if (o->long_name.length > (uint64)0) {
+        if (!first) { args_out_byte(w, 32); }
+        args_out_str(w, "--"); dq(w, o->long_name);
+        first = false;
+      }
+      if (o->short_name != (uint8)0) {
+        if (!first) { args_out_byte(w, 32); }
+        args_out_byte(w, 45); args_out_byte(w, (int32)o->short_name);
+        first = false;
+      }
+    }
+    args_out_str(w, "\" ;;\n");
+  }
+  args_out_str(w, "  esac\n  COMPREPLY=($(compgen -W \"$words\" -- \"$cur\"))\n}\ncomplete -o default -F _");
+  ident(w, a->name);
+  args_out_str(w, "_complete ");
+  args_out_str(w, a->name);
+  args_out_byte(w, 10);
+}
+
+fn zsh_opt_case(a: Args*, w: ArgsOut*) {
+  for c in 0..a->ncmds {
+    if (a->cmds[c].hidden) { continue; }
+    for i in 0..a->nopts {
+      var o: ArgsOpt* = &a->opts[i];
+      if (o->hidden || !takes_value(o->kind) || !args_opt_in_scope(a, i, c)) { continue; }
+      args_out_str(w, "    ");
+      opt_pattern_bash(o, a, c, w);
+      if (o->kind == ARGS_CHOICE) {
+        args_out_str(w, ") compadd --");
+        for k in 0..o->nchoices { args_out_str(w, " '"); sq(w, o->choices[k]); args_out_byte(w, 39); }
+        args_out_str(w, "; return ;;\n");
+      } else {
+        args_out_str(w, ") _files; return ;;\n");
+      }
+    }
+  }
+}
+
+fn write_zsh(a: Args*, w: ArgsOut*) {
+  args_out_str(w, "#compdef "); args_out_str(w, a->name);
+  args_out_str(w, "\n# zsh completion for "); args_out_str(w, a->name);
+  args_out_str(w, "\n# Load it with: source <("); args_out_str(w, a->name);
+  args_out_str(w, " completion zsh), or save it as _"); args_out_str(w, a->name);
+  args_out_str(w, " on $fpath\n_"); ident(w, a->name);
+  args_out_str(w, "() {{\n  local p=\"\" w i prev=\"${{words[CURRENT-1]}\"\n");
+  args_out_str(w, "  for ((i = 2; i < CURRENT; i++)); do\n    w=\"${{words[i]}\"\n    case \"$p:$w\" in\n");
+  walk_arms(a, w, "p", false);
+  args_out_str(w, "    esac\n  done\n  case \"$p:$prev\" in\n");
+  zsh_opt_case(a, w);
+  args_out_str(w, "  esac\n  local -a cmds opts\n  case \"$p\" in\n");
+  for c in 0..a->ncmds {
+    if (a->cmds[c].hidden) { continue; }
+    args_out_str(w, "    \"");
+    path(a, c, w);
+    args_out_str(w, "\")\n      cmds=(");
+    for s in 1..a->ncmds {
+      if (a->cmds[s].parent != c || a->cmds[s].hidden) { continue; }
+      args_out_byte(w, 32);
+      zitem(w, "", a->cmds[s].name, a->cmds[s].help);
+    }
+    args_out_str(w, " )\n      opts=(");
+    for i in 0..a->nopts {
+      var o: ArgsOpt* = &a->opts[i];
+      if (o->hidden || !args_opt_in_scope(a, i, c)) { continue; }
+      if (o->long_name.length > (uint64)0) { args_out_byte(w, 32); zitem(w, "--", o->long_name, o->help); }
+      if (o->short_name != (uint8)0) {
+        var one: uint8[1];
+        one[0] = o->short_name;
+        var sn: string;
+        sn.chars = &one[0];
+        sn.length = 1;
+        args_out_byte(w, 32);
+        zitem(w, "-", sn, o->help);
+      }
+    }
+    args_out_str(w, " ) ;;\n");
+  }
+  args_out_str(w, "  esac\n  if [[ \"${{words[CURRENT]}\" == -* ]]; then\n    _describe 'option' opts\n");
+  args_out_str(w, "  else\n    (( ${{#cmds} )) && _describe 'command' cmds\n    _files\n  fi\n}\n");
+  args_out_str(w, "if [ \"$funcstack[1]\" = \"_"); ident(w, a->name);
+  args_out_str(w, "\" ]; then\n  _"); ident(w, a->name);
+  args_out_str(w, " \"$@\"\nelse\n  compdef _"); ident(w, a->name);
+  args_out_byte(w, 32); args_out_str(w, a->name); args_out_str(w, "\nfi\n");
+}
+
+fn write_fish(a: Args*, w: ArgsOut*) {
+  args_out_str(w, "# fish completion for "); args_out_str(w, a->name);
+  args_out_str(w, "\n# Load it with: "); args_out_str(w, a->name);
+  args_out_str(w, " completion fish | source\nfunction __"); ident(w, a->name);
+  args_out_str(w, "_at\n  set -l toks (commandline -opc)\n  set -e toks[1]\n  set -l p ''\n");
+  args_out_str(w, "  for t in $toks\n    switch \"$p:$t\"\n");
+  walk_arms(a, w, "p", true);
+  args_out_str(w, "    end\n  end\n  test \"$p\" = \"$argv[1]\"\nend\n");
+  for c in 0..a->ncmds {
+    if (a->cmds[c].hidden) { continue; }
+    for s in 1..a->ncmds {
+      if (a->cmds[s].parent != c || a->cmds[s].hidden) { continue; }
+      args_out_str(w, "complete -c "); args_out_str(w, a->name);
+      args_out_str(w, " -n '__"); ident(w, a->name); args_out_str(w, "_at \"");
+      path(a, c, w);
+      args_out_str(w, "\"' -f -a '"); fq(w, a->cmds[s].name);
+      args_out_str(w, "' -d '"); fq(w, a->cmds[s].help); args_out_str(w, "'\n");
+    }
+    for i in 0..a->nopts {
+      var o: ArgsOpt* = &a->opts[i];
+      if (o->hidden || !args_opt_in_scope(a, i, c)) { continue; }
+      args_out_str(w, "complete -c "); args_out_str(w, a->name);
+      args_out_str(w, " -n '__"); ident(w, a->name); args_out_str(w, "_at \"");
+      path(a, c, w);
+      args_out_str(w, "\"'");
+      if (o->short_name != (uint8)0) { args_out_str(w, " -s "); args_out_byte(w, (int32)o->short_name); }
+      if (o->long_name.length > (uint64)0) { args_out_str(w, " -l '"); fq(w, o->long_name); args_out_byte(w, 39); }
+      if (o->kind == ARGS_CHOICE) {
+        args_out_str(w, " -x -a '");
+        for k in 0..o->nchoices { if (k > 0) { args_out_byte(w, 32); } fq(w, o->choices[k]); }
+        args_out_byte(w, 39);
+      } else if (takes_value(o->kind)) {
+        args_out_str(w, " -r");
+      }
+      args_out_str(w, " -d '"); fq(w, o->help); args_out_str(w, "'\n");
+    }
+  }
+}
+
+// Writes the completion script for shell (ARGS_BASH, ARGS_ZSH, ARGS_FISH).
+// Returns false for an unknown shell.
+export fn args_write_completion(a: Args*, shell: int32, w: ArgsOut*) -> bool {
+  if (shell == ARGS_BASH) { write_bash(a, w); return true; }
+  if (shell == ARGS_ZSH) { write_zsh(a, w); return true; }
+  if (shell == ARGS_FISH) { write_fish(a, w); return true; }
+  return false;
+}
+
+// The script into buf; returns the length it needs, or -1 for an unknown shell.
+export fn args_completion(a: Args*, shell: int32, buf: uint8*, cap: int64) -> int64 {
+  var w: ArgsOut;
+  args_out_buf(&w, buf, cap);
+  if (!args_write_completion(a, shell, &w)) { return -1; }
+  return w.len;
+}

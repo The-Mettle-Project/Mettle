@@ -1,0 +1,182 @@
+// Unicode data: named code point sets and simple case folding.
+//
+// The tables live in ucd.bin, built by tools/gen_unicode.py from the Unicode
+// Character Database. The layout is described in that script. The file is
+// parsed into an index the first time a lookup needs it.
+
+import "std/mem";
+
+const RX_UCD: string = import_str "ucd.bin";
+
+var g_ready: bool = false;
+var g_nsets: int64 = 0;
+var g_set_name: int64* = (int64*)0;   // offset of each set's name (length byte)
+var g_set_first: int64* = (int64*)0;
+var g_set_count: int64* = (int64*)0;
+var g_nalias: int64 = 0;
+var g_alias_name: int64* = (int64*)0;
+var g_alias_set: int64* = (int64*)0;
+var g_ranges: int64 = 0;              // offset of the range pairs
+var g_nfold: int64 = 0;
+var g_fold: int64 = 0;                // offset of the fold pairs
+var g_word: int32 = -1;               // set index of perlword
+var g_version: int64 = 0;
+
+fn u32_at(off: int64) -> int64 {
+  var p: uint8* = RX_UCD.chars + off;
+  return (int64)p[0] | ((int64)p[1] << 8) | ((int64)p[2] << 16) | ((int64)p[3] << 24);
+}
+
+fn ucd_init() {
+  if (g_ready) { return; }
+  var off: int64 = 4;
+  g_version = off;
+  off = off + 1 + (int64)RX_UCD.chars[off];
+  g_nsets = u32_at(off);
+  off = off + 4;
+  g_set_name = (int64*)malloc(8 * g_nsets);
+  g_set_first = (int64*)malloc(8 * g_nsets);
+  g_set_count = (int64*)malloc(8 * g_nsets);
+  for i in 0..g_nsets {
+    g_set_name[i] = off;
+    off = off + 1 + (int64)RX_UCD.chars[off];
+    g_set_first[i] = u32_at(off);
+    g_set_count[i] = u32_at(off + 4);
+    off = off + 8;
+  }
+  g_nalias = u32_at(off);
+  off = off + 4;
+  g_alias_name = (int64*)malloc(8 * g_nalias + 8);
+  g_alias_set = (int64*)malloc(8 * g_nalias + 8);
+  for i in 0..g_nalias {
+    g_alias_name[i] = off;
+    off = off + 1 + (int64)RX_UCD.chars[off];
+    g_alias_set[i] = u32_at(off);
+    off = off + 4;
+  }
+  var nr: int64 = u32_at(off);
+  g_ranges = off + 4;
+  off = g_ranges + nr * 8;
+  g_nfold = u32_at(off);
+  g_fold = off + 4;
+  g_ready = true;
+  g_word = rx_ucd_find("perlword");
+}
+
+// Compares the stored name at `off` with name. Returns <0, 0 or >0.
+fn name_cmp(off: int64, name: string) -> int32 {
+  var n: int64 = (int64)RX_UCD.chars[off];
+  var p: uint8* = RX_UCD.chars + off + 1;
+  var m: int64 = (int64)name.length;
+  var k: int64 = n;
+  if (m < k) { k = m; }
+  for i in 0..k {
+    var a: int32 = (int32)p[i];
+    var b: int32 = (int32)name.chars[i];
+    if (a != b) { return a - b; }
+  }
+  if (n < m) { return -1; }
+  if (n > m) { return 1; }
+  return 0;
+}
+
+/// Finds a set by its loose-matched name ("gc=lu", "sc=greek", "alphabetic").
+/// Returns the set index, or -1.
+export fn rx_ucd_find(name: string) -> int32 {
+  ucd_init();
+  // Set names are sorted: binary search.
+  var lo: int64 = 0;
+  var hi: int64 = g_nsets;
+  while (lo < hi) {
+    var mid: int64 = (lo + hi) / 2;
+    var c: int32 = name_cmp(g_set_name[mid], name);
+    if (c == 0) { return (int32)mid; }
+    if (c < 0) { lo = mid + 1; } else { hi = mid; }
+  }
+  lo = 0;
+  hi = g_nalias;
+  while (lo < hi) {
+    var mid: int64 = (lo + hi) / 2;
+    var c: int32 = name_cmp(g_alias_name[mid], name);
+    if (c == 0) { return (int32)g_alias_set[mid]; }
+    if (c < 0) { lo = mid + 1; } else { hi = mid; }
+  }
+  return -1;
+}
+
+/// Number of ranges in set `idx`.
+export fn rx_ucd_count(idx: int32) -> int64 {
+  ucd_init();
+  return g_set_count[idx];
+}
+
+/// Range `i` of set `idx`: low end.
+export fn rx_ucd_lo(idx: int32, i: int64) -> uint32 {
+  return (uint32)u32_at(g_ranges + (g_set_first[idx] + i) * 8);
+}
+
+/// Range `i` of set `idx`: high end.
+export fn rx_ucd_hi(idx: int32, i: int64) -> uint32 {
+  return (uint32)u32_at(g_ranges + (g_set_first[idx] + i) * 8 + 4);
+}
+
+/// The Unicode version of the tables, like "15.1.0".
+export fn rx_ucd_version() -> string {
+  ucd_init();
+  var v: string;
+  v.chars = RX_UCD.chars + g_version + 1;
+  v.length = (uint64)RX_UCD.chars[g_version];
+  return v;
+}
+
+/// Number of entries in the case folding table.
+export fn rx_fold_count() -> int64 {
+  ucd_init();
+  return g_nfold;
+}
+
+/// Index of the first fold entry whose code point is >= cp.
+export fn rx_fold_lower_bound(cp: uint32) -> int64 {
+  ucd_init();
+  var lo: int64 = 0;
+  var hi: int64 = g_nfold;
+  while (lo < hi) {
+    var mid: int64 = (lo + hi) / 2;
+    if ((uint32)u32_at(g_fold + mid * 8) < cp) { lo = mid + 1; } else { hi = mid; }
+  }
+  return lo;
+}
+
+/// Code point of fold entry i.
+export fn rx_fold_cp(i: int64) -> uint32 {
+  return (uint32)u32_at(g_fold + i * 8);
+}
+
+/// The next code point in the case orbit of fold entry i.
+export fn rx_fold_next_at(i: int64) -> uint32 {
+  return (uint32)u32_at(g_fold + i * 8 + 4);
+}
+
+/// The next code point in cp's case orbit, or cp itself when it has none.
+export fn rx_fold_next(cp: uint32) -> uint32 {
+  var i: int64 = rx_fold_lower_bound(cp);
+  if (i < g_nfold && rx_fold_cp(i) == cp) { return rx_fold_next_at(i); }
+  return cp;
+}
+
+/// True when cp is a Unicode word character (\w).
+export fn rx_is_word_cp(cp: uint32) -> bool {
+  if (cp < 128) {
+    return (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || cp == 95;
+  }
+  ucd_init();
+  var lo: int64 = 0;
+  var hi: int64 = g_set_count[g_word];
+  while (lo < hi) {
+    var mid: int64 = (lo + hi) / 2;
+    if (rx_ucd_hi(g_word, mid) < cp) { lo = mid + 1; }
+    else if (rx_ucd_lo(g_word, mid) > cp) { hi = mid; }
+    else { return true; }
+  }
+  return false;
+}

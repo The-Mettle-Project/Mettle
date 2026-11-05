@@ -1,0 +1,290 @@
+// Code shared by every platform: errors, the event queue, version and extension
+// queries, the headless framebuffer, pixel readback and shader helpers.
+import "std/io";
+import "std/mem";
+import "glint_types";
+import "glint_gl";
+import "glint_ext";
+
+var g_err: uint8[4096];
+var g_err_len: int64 = 0;
+
+// Why the last Glint call failed, as a NUL-terminated string ("" if none).
+export fn glint_error() -> cstring {
+  g_err[g_err_len] = 0;
+  return (cstring)&g_err[0];
+}
+
+// Set the error text (used by the platform files). The text is copied.
+export fn glint_internal_fail(msg: string) {
+  var n: int64 = (int64)msg.length;
+  if (n > 4095) { n = 4095; }
+  for i in 0..n { g_err[i] = (uint8)msg[i]; }
+  g_err_len = n;
+  g_err[n] = 0;
+}
+
+// Add a C string to the end of the error text.
+export fn glint_internal_fail_more(c: cstring) {
+  if (c == 0) { return; }
+  var i: int64 = 0;
+  while (c[i] != 0 && g_err_len < 4095) { g_err[g_err_len] = c[i]; g_err_len += 1; i += 1; }
+  g_err[g_err_len] = 0;
+}
+
+// ---- events ----
+
+export fn glint_internal_push(ctx: GlintContext*, e: GlintEvent) {
+  if (ctx->ev_count >= 64) {          // full: drop the oldest
+    ctx->ev_head = (ctx->ev_head + 1) % 64;
+    ctx->ev_count -= 1;
+  }
+  var at: int32 = (ctx->ev_head + ctx->ev_count) % 64;
+  ctx->ev[at] = e;
+  ctx->ev_count += 1;
+  if (e.kind == GLINT_EV_CLOSE) { ctx->should_close = true; }
+  if (e.kind == GLINT_EV_KEY_DOWN && e.key > 0 && e.key < 512) { ctx->keys[e.key] = 1; }
+  if (e.kind == GLINT_EV_KEY_UP && e.key > 0 && e.key < 512) { ctx->keys[e.key] = 0; }
+  if (e.kind == GLINT_EV_MOUSE_DOWN && e.button > 0 && e.button < 8) { ctx->buttons[e.button] = 1; }
+  if (e.kind == GLINT_EV_MOUSE_UP && e.button > 0 && e.button < 8) { ctx->buttons[e.button] = 0; }
+  if (e.kind == GLINT_EV_MOUSE_MOVE) { ctx->mouse_x = e.x; ctx->mouse_y = e.y; }
+  if (e.kind == GLINT_EV_RESIZE) { ctx->width = e.w; ctx->height = e.h; }
+}
+
+export fn glint_internal_pop(ctx: GlintContext*, out: GlintEvent*) -> bool {
+  if (ctx->ev_count == 0) { return false; }
+  *out = ctx->ev[ctx->ev_head];
+  ctx->ev_head = (ctx->ev_head + 1) % 64;
+  ctx->ev_count -= 1;
+  return true;
+}
+
+// Is this key held down right now? (own window only)
+export fn glint_key_down(ctx: GlintContext*, key: int32) -> bool {
+  if (key <= 0 || key >= 512) { return false; }
+  return ctx->keys[key] != 0;
+}
+
+export fn glint_mouse_down(ctx: GlintContext*, button: int32) -> bool {
+  if (button <= 0 || button >= 8) { return false; }
+  return ctx->buttons[button] != 0;
+}
+
+export fn glint_should_close(ctx: GlintContext*) -> bool { return ctx->should_close; }
+export fn glint_set_should_close(ctx: GlintContext*, v: bool) { ctx->should_close = v; }
+
+// Step the GL version down: 4.6 -> 4.5 ... -> 4.0 -> 3.3 -> 3.2. False when below min.
+export fn glint_internal_next_version(maj: int32*, min: int32*, cfg: GlintConfig*) -> bool {
+  if (*min > 0 && !(*maj == 3 && *min <= 2)) { *min = *min - 1; }
+  else if (*maj == 4) { *maj = 3; *min = 3; }
+  else { return false; }
+  return *maj * 10 + *min >= cfg->major * 10 + cfg->minor;
+}
+
+// ---- after a context is current ----
+
+// Load GL, read the version, and for headless contexts make the framebuffer.
+// Returns false (with glint_error set) when the driver is too old.
+export fn glint_internal_setup(ctx: GlintContext*, cfg: GlintConfig*, glint_getproc_cb: fn(cstring) -> int64) -> bool {
+  glint_load_gl(glint_getproc_cb);
+  glint_load_ext(glint_getproc_cb);
+  if (glGetIntegerv == 0 || glGetString == 0) { glint_internal_fail("GL functions did not load"); return false; }
+  var maj: int32 = 0;
+  var min: int32 = 0;
+  glGetIntegerv(GL_MAJOR_VERSION, &maj);
+  glGetIntegerv(GL_MINOR_VERSION, &min);
+  ctx->gl_major = maj;
+  ctx->gl_minor = min;
+  if (maj * 10 + min < cfg->major * 10 + cfg->minor) {
+    glint_internal_fail("the driver gave GL {maj}.{min}, lower than the {cfg->major}.{cfg->minor} asked for");
+    return false;
+  }
+  if (ctx->kind == GLINT_KIND_HEADLESS) {
+    if (!glint_internal_make_fbo(ctx, ctx->width, ctx->height, cfg->samples)) { return false; }
+  }
+  glViewport(0, 0, ctx->width, ctx->height);
+  return true;
+}
+
+// Make (or remake at a new size) the headless framebuffer and bind it.
+export fn glint_internal_make_fbo(ctx: GlintContext*, w: int32, h: int32, samples: int32) -> bool {
+  if (ctx->fbo != 0) {
+    glDeleteFramebuffers(1, &ctx->fbo);
+    if (ctx->fbo_tex) { glDeleteTextures(1, &ctx->fbo_color); } else { glDeleteRenderbuffers(1, &ctx->fbo_color); }
+    glDeleteRenderbuffers(1, &ctx->fbo_depth);
+  }
+  glGenFramebuffers(1, &ctx->fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, ctx->fbo);
+  if (ctx->fbo_tex) {
+    // A texture, so a context that shares objects with this one can draw it.
+    glGenTextures(1, &ctx->fbo_color);
+    glBindTexture(GL_TEXTURE_2D, ctx->fbo_color);
+    glTexImage2D(GL_TEXTURE_2D, 0, (int32)GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, (rawptr)0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (int32)GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (int32)GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, (int32)GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, (int32)GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ctx->fbo_color, 0);
+  } else {
+    glGenRenderbuffers(1, &ctx->fbo_color);
+    glBindRenderbuffer(GL_RENDERBUFFER, ctx->fbo_color);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, w, h);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, ctx->fbo_color);
+  }
+  glGenRenderbuffers(1, &ctx->fbo_depth);
+  glBindRenderbuffer(GL_RENDERBUFFER, ctx->fbo_depth);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, ctx->fbo_depth);
+  glBindRenderbuffer(GL_RENDERBUFFER, 0);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    glint_internal_fail("headless framebuffer is not complete");
+    return false;
+  }
+  ctx->width = w;
+  ctx->height = h;
+  return true;
+}
+
+// The framebuffer to bind when you mean "the screen": 0 for windows, the
+// off-screen one for headless contexts.
+export fn glint_framebuffer(ctx: GlintContext*) -> uint32 { return ctx->fbo; }
+
+// The colour texture of a context made with glint_open_shared (0 otherwise).
+// The parent context can bind it like any texture. Rows are bottom-up, as in GL.
+export fn glint_color_texture(ctx: GlintContext*) -> uint32 {
+  if (!ctx->fbo_tex) { return 0; }
+  return ctx->fbo_color;
+}
+
+export fn glint_width(ctx: GlintContext*) -> int32 { return ctx->width; }
+export fn glint_height(ctx: GlintContext*) -> int32 { return ctx->height; }
+
+// GL version as major * 10 + minor, e.g. 46.
+export fn glint_gl_version(ctx: GlintContext*) -> int32 { return ctx->gl_major * 10 + ctx->gl_minor; }
+
+export fn glint_backend_name(ctx: GlintContext*) -> string {
+  if (ctx->backend == GLINT_BACKEND_EGL) { return "EGL"; }
+  if (ctx->backend == GLINT_BACKEND_GLX) { return "GLX"; }
+  if (ctx->backend == GLINT_BACKEND_WGL) { return "WGL"; }
+  return "none";
+}
+
+// Does the current context have this extension? name is like "GL_ARB_bindless_texture".
+export fn glint_has_ext(name: string) -> bool {
+  var n: int32 = 0;
+  glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+  for i in 0..n {
+    var e: cstring = glGetStringi(GL_EXTENSIONS, (uint32)i);
+    if (e != 0 && glint_internal_cstr_is(e, name)) { return true; }
+  }
+  return false;
+}
+
+// Is `word` one of the space-separated names in `list`?
+export fn glint_internal_has_word(list: cstring, word: string) -> bool {
+  if (list == 0) { return false; }
+  var n: int64 = (int64)word.length;
+  var i: int64 = 0;
+  while (list[i] != 0) {
+    var j: int64 = 0;
+    while (j < n && list[i + j] == (uint8)word[j]) { j += 1; }
+    if (j == n && (list[i + n] == 0 || list[i + n] == 32)) { return true; }
+    while (list[i] != 0 && list[i] != 32) { i += 1; }
+    while (list[i] == 32) { i += 1; }
+  }
+  return false;
+}
+
+export fn glint_internal_cstr_is(c: cstring, s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  for i in 0..n {
+    if (c[i] != (uint8)s[i]) { return false; }   // also stops at c's NUL
+  }
+  return c[n] == 0;
+}
+
+// ---- pixels ----
+
+// Read a rectangle of the drawable, top row first. (x, y) is its top-left
+// corner, from the top-left of the drawable. format is GLINT_FORMAT_RGBA or
+// GLINT_FORMAT_BGRA. stride is the bytes from one row of `out` to the next
+// (0 means w * 4; it must be a multiple of 4), so you can read straight into a
+// tile of a bigger image.
+export fn glint_read_rect(ctx: GlintContext*, x: int32, y: int32, w: int32, h: int32, format: int32, out: uint8*, stride: int32) {
+  var st: int32 = stride;
+  if (st == 0) { st = w * 4; }
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->fbo);
+  glPixelStorei(GL_PACK_ALIGNMENT, 4);
+  glPixelStorei(GL_PACK_ROW_LENGTH, st / 4);
+  if (format == GLINT_FORMAT_BGRA) {
+    glReadPixels(x, ctx->height - y - h, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, (rawptr)out);
+  } else {
+    glReadPixels(x, ctx->height - y - h, w, h, GL_RGBA, GL_UNSIGNED_BYTE, (rawptr)out);
+  }
+  glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+  // GL rows are bottom-up: flip the rectangle in place.
+  var row: int64 = (int64)w * 4;
+  var tmp: uint8* = (uint8*)malloc(row);
+  for r in 0..(h / 2) {
+    var a: uint8* = out + (int64)r * (int64)st;
+    var b: uint8* = out + (int64)(h - 1 - r) * (int64)st;
+    memcpy((rawptr)tmp, (rawptr)a, row);
+    memcpy((rawptr)a, (rawptr)b, row);
+    memcpy((rawptr)b, (rawptr)tmp, row);
+  }
+  free((rawptr)tmp);
+}
+
+// Read the whole drawable as RGBA8, top row first. out must hold width*height*4 bytes.
+export fn glint_read_rgba(ctx: GlintContext*, out: uint8*) {
+  glint_read_rect(ctx, 0, 0, ctx->width, ctx->height, GLINT_FORMAT_RGBA, out, 0);
+}
+
+// One pixel as 0xAARRGGBB; (x, y) counted from the top-left.
+export fn glint_read_pixel(ctx: GlintContext*, x: int32, y: int32) -> uint32 {
+  var px: uint8[4];
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->fbo);
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glReadPixels(x, ctx->height - 1 - y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, (rawptr)&px[0]);
+  return ((uint32)px[3] << 24) | ((uint32)px[0] << 16) | ((uint32)px[1] << 8) | (uint32)px[2];
+}
+
+// Save RGBA8 pixels (top row first) as a binary PPM file. Returns true on success.
+export fn glint_write_ppm(path: cstring, w: int32, h: int32, rgba: uint8*) -> bool {
+  var f: cstring = fopen(path, "wb");
+  if (f == 0) { return false; }
+  var head: string = "P6\n{w} {h}\n255\n";
+  fwrite((cstring)head.chars, 1, (int64)head.length, f);
+  free(head.chars);
+  var n: int64 = (int64)w * (int64)h;
+  var rgb: uint8* = (uint8*)malloc(n * 3);
+  for i in 0..n {
+    rgb[i * 3] = rgba[i * 4];
+    rgb[i * 3 + 1] = rgba[i * 4 + 1];
+    rgb[i * 3 + 2] = rgba[i * 4 + 2];
+  }
+  fwrite((cstring)rgb, 1, n * 3, f);
+  free((rawptr)rgb);
+  fclose(f);
+  return true;
+}
+
+// Print GL debug messages to stderr. Use with a debug context:
+// glint_enable_debug_output() after the context is made.
+fn glint_debug_print(source: uint32, kind: uint32, id: uint32, severity: uint32, len: int32, msg: cstring, user: rawptr) {
+  if (severity == GL_DEBUG_SEVERITY_NOTIFICATION) { return; }
+  var n: int64 = 0;
+  while (msg[n] != 0) { n += 1; }
+  print_err("GL debug: ");
+  fwrite(msg, 1, n, get_stderr());
+  print_err("\n");
+}
+
+export fn glint_enable_debug_output() -> bool {
+  if (glDebugMessageCallback == 0) { return false; }
+  glEnable(GL_DEBUG_OUTPUT);
+  glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+  glDebugMessageCallback(&glint_debug_print, (rawptr)0);
+  return true;
+}

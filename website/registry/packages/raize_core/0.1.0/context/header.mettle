@@ -1,0 +1,240 @@
+// raize/context/header — HTTP field rules, bounded header lookup, and the
+// hard caps the rest of the framework measures itself against.
+//
+// This module is pure: no sockets, no globals, no allocation. It is the layer
+// the parser and every response writer share so that "is this a legal header
+// name" has exactly one answer in the codebase.
+//
+// Bounds (all of them are the contract):
+//
+//   RZ_MAX_HEADERS        64 headers in a request      -> 431
+//   RZ_MAX_HEADER_BYTES   8192 bytes of header block   -> 431
+//   RZ_MAX_REQUEST_LINE   4096 bytes incl. CRLF        -> 414
+//   RZ_MAX_TARGET         2048 bytes of request-target -> 414
+//   RZ_MAX_METHOD         16 bytes of verb             -> 400
+//   RZ_MAX_RESP_HEADERS    16 headers in a response     -> -2 from header_set
+//
+// A *request* header array is allocated from the request arena (RzHeader* +
+// count) because a Mettle struct field's array extent must be a literal and
+// RzRequest must stay small; a *response* header array is an embedded
+// RzHeader[16] literal inside RzResponse.
+
+import "../str/str";
+
+export const RZ_MAX_HEADERS: int32 = 64;
+export const RZ_MAX_HEADER_BYTES: int64 = 8192;
+export const RZ_MAX_REQUEST_LINE: int64 = 4096;
+export const RZ_MAX_TARGET: int64 = 2048;
+export const RZ_MAX_METHOD: int32 = 16;
+export const RZ_MAX_RESP_HEADERS: int32 = 16;
+
+// tchar from RFC 9110 §5.6.2: the characters legal in a field name / method.
+export fn rz_char_is_tchar(c: int32) -> bool {
+  if (c >= 48 && c <= 57) { return true; }                 // 0-9
+  if (c >= 65 && c <= 90) { return true; }                 // A-Z
+  if (c >= 97 && c <= 122) { return true; }                // a-z
+  if (c == 33) { return true; }                            // !
+  if (c == 35) { return true; }                            // #
+  if (c == 36) { return true; }                            // $
+  if (c == 37) { return true; }                            // %
+  if (c == 38) { return true; }                            // &
+  if (c == 39) { return true; }                            // '
+  if (c == 42) { return true; }                            // *
+  if (c == 43) { return true; }                            // +
+  if (c == 45) { return true; }                            // -
+  if (c == 46) { return true; }                            // .
+  if (c == 94) { return true; }                            // ^
+  if (c == 95) { return true; }                            // _
+  if (c == 96) { return true; }                            // `
+  if (c == 124) { return true; }                           // |
+  if (c == 126) { return true; }                           // ~
+  return false;
+}
+
+// A field name must be 1..N tchars, with no space before the colon.
+export fn rz_header_name_ok(name: string) -> bool {
+  var n: int64 = (int64)name.length;
+  if (n <= 0) { return false; }
+  if (n > 255) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)name.chars[i];
+    if (!rz_char_is_tchar(c)) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// A field value may not contain CR, LF or NUL: that is the response-splitting
+// guard, enforced at set time in every path (parser and handler alike).
+export fn rz_header_value_ok(value: string) -> bool {
+  var n: int64 = (int64)value.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)value.chars[i];
+    if (c == 13 || c == 10 || c == 0) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// Trim leading/trailing OWS (SP / HTAB) only. No other whitespace is legal in
+// a field value's edges.
+export fn rz_header_trim(value: string) -> string {
+  var n: int64 = (int64)value.length;
+  var start: int64 = 0;
+  var end: int64 = n;
+  while (start < end) {
+    var c: int32 = (int32)value.chars[start];
+    if (c == 32 || c == 9) { start = start + 1; } else { break; }
+  }
+  while (end > start) {
+    var c: int32 = (int32)value.chars[end - 1];
+    if (c == 32 || c == 9) { end = end - 1; } else { break; }
+  }
+  if (end <= start) { return rz_str_empty(); }
+  return rz_str_sub(value, start, end);
+}
+
+// ---------------------------------------------------------------------------
+// Lookup over a (RzHeader*, count) pair
+// ---------------------------------------------------------------------------
+
+export struct RzHeader {
+  name: string;
+  value: string;
+}
+
+export fn rz_header_get(items: RzHeader*, count: int32, name: string) -> string {
+  if (items == 0) { return rz_str_empty(); }
+  var i: int32 = 0;
+  while (i < count) {
+    if (rz_str_eq_ci(items[i].name, name)) {
+      return items[i].value;
+    }
+    i = i + 1;
+  }
+  return rz_str_empty();
+}
+
+export fn rz_header_has(items: RzHeader*, count: int32, name: string) -> bool {
+  if (items == 0) { return false; }
+  var i: int32 = 0;
+  while (i < count) {
+    if (rz_str_eq_ci(items[i].name, name)) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+export fn rz_header_count_named(items: RzHeader*, count: int32, name: string) -> int32 {
+  if (items == 0) { return 0; }
+  var seen: int32 = 0;
+  var i: int32 = 0;
+  while (i < count) {
+    if (rz_str_eq_ci(items[i].name, name)) { seen = seen + 1; }
+    i = i + 1;
+  }
+  return seen;
+}
+
+// True when a comma-separated field value contains `token` (case-insensitive,
+// OWS trimmed). This is the only correct way to read `Connection`,
+// `Transfer-Encoding` and `Expect`.
+export fn rz_header_has_token(value: string, token: string) -> bool {
+  var n: int64 = (int64)value.length;
+  var start: int64 = 0;
+  var i: int64 = 0;
+  while (i <= n) {
+    var at_end: bool = i == n;
+    var c: int32 = 0;
+    if (!at_end) { c = (int32)value.chars[i]; }
+    if (at_end || c == 44) {
+      var piece: string = rz_str_sub(value, start, i);
+      piece = rz_header_trim(piece);
+      if (rz_str_eq_ci(piece, token)) { return true; }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Validation of a whole header block (used by the parser and by tests)
+// ---------------------------------------------------------------------------
+
+export fn rz_header_pair_ok(name: string, value: string) -> bool {
+  if (!rz_header_name_ok(name)) { return false; }
+  if (!rz_header_value_ok(value)) { return false; }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+@test fn t_rz_header_name_rules() -> int32 {
+  if (!rz_header_name_ok("Host")) { return 1; }
+  if (!rz_header_name_ok("X-Custom_1")) { return 2; }
+  if (rz_header_name_ok("")) { return 3; }
+  if (rz_header_name_ok("Host ")) { return 4; }
+  if (rz_header_name_ok("Ho st")) { return 5; }
+  if (rz_header_name_ok("Host\t")) { return 6; }
+  // name:value with a space before the colon is the classic request-smuggling
+  // vector; the parser splits on ':' so a trailing space lands in the name and
+  // must be refused here.
+  if (rz_header_pair_ok("Host ", "t")) { return 7; }
+  if (!rz_header_pair_ok("Host", "t")) { return 8; }
+  return 0;
+}
+
+@test fn t_rz_header_value_rules() -> int32 {
+  if (!rz_header_value_ok("text/plain; charset=utf-8")) { return 1; }
+  if (rz_header_value_ok("a\r\nInjected: 1")) { return 2; }
+  if (rz_header_value_ok("a\nb")) { return 3; }
+  if (rz_header_value_ok("a\rb")) { return 4; }
+  if (!rz_header_value_ok("  spaced  ")) { return 5; }
+  var t: string = rz_header_trim("  x y\t ");
+  if (!rz_str_eq(t, "x y")) { return 6; }
+  if (rz_header_trim(" \t ").length != 0) { return 7; }
+  return 0;
+}
+
+@test fn t_rz_header_lookup() -> int32 {
+  var items: RzHeader[4];
+  items[0].name = "Host";
+  items[0].value = "example";
+  items[1].name = "Content-Type";
+  items[1].value = "application/json";
+  items[2].name = "connection";
+  items[2].value = "keep-alive, Upgrade";
+  if (!rz_str_eq(rz_header_get(&items[0], 3, "host"), "example")) { return 1; }
+  if (!rz_str_eq(rz_header_get(&items[0], 3, "CONTENT-TYPE"), "application/json")) { return 2; }
+  if (rz_header_get(&items[0], 3, "missing").length != 0) { return 3; }
+  if (!rz_header_has(&items[0], 3, "HOST")) { return 4; }
+  if (rz_header_has(&items[0], 3, "Date")) { return 5; }
+  if (rz_header_count_named(&items[0], 3, "host") != 1) { return 6; }
+  if (!rz_header_has_token(items[2].value, "upgrade")) { return 7; }
+  if (!rz_header_has_token(items[2].value, "KEEP-ALIVE")) { return 8; }
+  if (rz_header_has_token(items[2].value, "close")) { return 9; }
+  if (!rz_header_has_token("close", "close")) { return 10; }
+  if (rz_header_has_token("", "close")) { return 11; }
+  return 0;
+}
+
+@test fn t_rz_header_capacity() -> int32 {
+  if (RZ_MAX_RESP_HEADERS > RZ_MAX_HEADERS) { return 1; }
+  if (RZ_MAX_HEADER_BYTES < 1024) { return 2; }
+  if (RZ_MAX_REQUEST_LINE < RZ_MAX_TARGET) { return 3; }
+  var items: RzHeader[2];
+  items[0].name = "A";
+  items[0].value = "1";
+  items[1].name = "a";
+  items[1].value = "2";
+  if (rz_header_count_named(&items[0], 2, "A") != 2) { return 4; }
+  // First match wins: a duplicate Content-Length is rejected by the parser
+  // before lookup matters, but lookup must still be deterministic.
+  if (!rz_str_eq(rz_header_get(&items[0], 2, "a"), "1")) { return 5; }
+  return 0;
+}

@@ -1,0 +1,614 @@
+// npm: ranges in the syntax npm uses, with the same meaning node-semver
+// gives them (https://github.com/npm/node-semver#ranges).
+//
+//   1.2.3  =1.2.3  >1.2.3  >=1.2.3  <1.2.3  <=1.2.3
+//   1.2.x  1.x  *  ""           x-ranges (x, X and * are the same)
+//   ~1.2.3  ~>1.2.3  ^1.2.3     tilde and caret ranges, partials allowed
+//   1.2.3 - 2.3.4               hyphen ranges
+//   a b                         both a and b
+//   a || b                      a or b
+//
+// Every range is turned into plain comparators exactly as node-semver does,
+// including its "-0" bounds, so semver_range_format gives node's range.range.
+// Versions inside a range are strict (no leading zeros); build metadata is
+// ignored. Like node-semver, numbers in a range may not pass 2^53 - 1.
+
+import "std/core";
+import "std/conv";
+import "std/collections";
+import "version";
+import "compare";
+import "range";
+
+const SVN_MAX: uint64 = 18446744073709551615;
+const SVN_SAFE: uint64 = 9007199254740991; // JavaScript's Number.MAX_SAFE_INTEGER
+
+// One x-range as written: an operator and up to three parts, any of which
+// may be a wildcard. A part that is missing counts as a wildcard.
+struct SvnX {
+  op: int32;   // 0 when none was written
+  xm0: bool;   // major is a wildcard
+  xm1: bool;   // minor is a wildcard
+  xm2: bool;   // patch is a wildcard
+  major: uint64;
+  minor: uint64;
+  patch: uint64;
+  pre: string;
+  bad_order: bool; // a number after a wildcard, like "x.1" or "1.x.3"
+  prefix_ok: bool; // what came before the number was "" or "v"
+}
+
+fn svn_xpart(s: string, i: int64*, val: uint64*, wild: bool*) -> string {
+  var n: int64 = (int64)s.length;
+  if (*i < n && (s[*i] == 'x' || s[*i] == 'X' || s[*i] == '*')) {
+    *i = *i + 1;
+    *wild = true;
+    *val = 0;
+    return "";
+  }
+  *wild = false;
+  return semver_read_num(s, i, true, val);
+}
+
+// Reads an operator at *i: < <= > >= = ~ ~> ^. Returns 0 when there is none.
+fn svn_read_op(s: string, i: int64*) -> int32 {
+  var n: int64 = (int64)s.length;
+  var k: int64 = *i;
+  if (k >= n) { return 0; }
+  var c: char = s[k];
+  var eq: bool = k + 1 < n && s[k + 1] == '=';
+  if (c == '~') {
+    *i = k + 1;
+    if (k + 1 < n && s[k + 1] == '>') { *i = k + 2; }
+    return SEMVER_TILDE;
+  }
+  if (c == '^') { *i = k + 1; return SEMVER_CARET; }
+  if (c == '=') { *i = k + 1; return SEMVER_EQ; }
+  if (c == '<' || c == '>') {
+    *i = k + 1;
+    if (eq) { *i = k + 2; }
+    if (c == '<') {
+      if (eq) { return SEMVER_LE; }
+      return SEMVER_LT;
+    }
+    if (eq) { return SEMVER_GE; }
+    return SEMVER_GT;
+  }
+  return 0;
+}
+
+// Parses an x-range from s, which holds no spaces. allow_op is false for
+// the two ends of a hyphen range and for a version after an operator word.
+fn svn_parse_x(s: string, allow_op: bool, out: SvnX*) -> string {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  out->op = 0;
+  out->xm0 = true;
+  out->xm1 = true;
+  out->xm2 = true;
+  out->major = 0;
+  out->minor = 0;
+  out->patch = 0;
+  out->pre = "";
+  if (allow_op) { out->op = svn_read_op(s, &i); }
+  var ps: int64 = i;
+  while (i < n && (s[i] == 'v' || s[i] == '=')) { i = i + 1; }
+  out->prefix_ok = i == ps || (i == ps + 1 && s[ps] == 'v');
+  var why: string = svn_xpart(s, &i, &out->major, &out->xm0);
+  if (why.length > 0) { return why; }
+  if (i < n && s[i] == '.') {
+    i = i + 1;
+    why = svn_xpart(s, &i, &out->minor, &out->xm1);
+    if (why.length > 0) { return why; }
+    if (i < n && s[i] == '.') {
+      i = i + 1;
+      why = svn_xpart(s, &i, &out->patch, &out->xm2);
+      if (why.length > 0) { return why; }
+      if (i < n && s[i] == '-') {
+        i = i + 1;
+        var pst: int64 = i;
+        why = semver_read_idents(s, &i, true);
+        if (why.length > 0) { return why; }
+        out->pre = str_slice(s, pst, i - pst);
+      }
+    }
+  }
+  if (i < n && s[i] == '+') {
+    i = i + 1;
+    why = semver_read_idents(s, &i, false);
+    if (why.length > 0) { return why; }
+  }
+  if (i != n) { return "invalid comparator"; }
+  // A wildcard counts for every part after it.
+  out->bad_order = (out->xm0 && !out->xm1) || (out->xm1 && !out->xm2);
+  if (out->xm0) { out->xm1 = true; }
+  if (out->xm1) { out->xm2 = true; }
+  return "";
+}
+
+fn svn_add(set: List<SemverComparator>*, op: int32, major: uint64, minor: uint64, patch: uint64, pre: string) {
+  list_push<SemverComparator>(set, semver_cmp_new(op, 3, major, minor, patch, pre));
+}
+
+fn svn_any(set: List<SemverComparator>*) {
+  list_push<SemverComparator>(set, semver_cmp_new(SEMVER_ANY, 0, 0, 0, 0, ""));
+}
+
+fn svn_inc(x: uint64, bad: bool*) -> uint64 {
+  if (x == SVN_MAX) { *bad = true; return x; }
+  return x + 1;
+}
+
+// Pre-release text for the lower bound when prereleases are included.
+fn svn_z(inc: bool) -> string {
+  if (inc) { return "0"; }
+  return "";
+}
+
+fn svn_tilde(x: SvnX*, inc: bool, set: List<SemverComparator>*) -> bool {
+  var bad: bool = false;
+  if (x->xm0) {
+    svn_any(set);
+  } else if (x->xm1) {
+    svn_add(set, SEMVER_GE, x->major, 0, 0, svn_z(inc));
+    svn_add(set, SEMVER_LT, svn_inc(x->major, &bad), 0, 0, "0");
+  } else if (x->xm2) {
+    svn_add(set, SEMVER_GE, x->major, x->minor, 0, svn_z(inc));
+    svn_add(set, SEMVER_LT, x->major, svn_inc(x->minor, &bad), 0, "0");
+  } else {
+    svn_add(set, SEMVER_GE, x->major, x->minor, x->patch, x->pre);
+    svn_add(set, SEMVER_LT, x->major, svn_inc(x->minor, &bad), 0, "0");
+  }
+  return !bad;
+}
+
+fn svn_caret(x: SvnX*, inc: bool, set: List<SemverComparator>*) -> bool {
+  var bad: bool = false;
+  if (x->xm0) {
+    svn_any(set);
+  } else if (x->xm1) {
+    svn_add(set, SEMVER_GE, x->major, 0, 0, svn_z(inc));
+    svn_add(set, SEMVER_LT, svn_inc(x->major, &bad), 0, 0, "0");
+  } else if (x->xm2) {
+    svn_add(set, SEMVER_GE, x->major, x->minor, 0, svn_z(inc));
+    if (x->major == 0) {
+      svn_add(set, SEMVER_LT, 0, svn_inc(x->minor, &bad), 0, "0");
+    } else {
+      svn_add(set, SEMVER_LT, svn_inc(x->major, &bad), 0, 0, "0");
+    }
+  } else {
+    svn_add(set, SEMVER_GE, x->major, x->minor, x->patch, x->pre);
+    if (x->major == 0 && x->minor == 0) {
+      svn_add(set, SEMVER_LT, 0, 0, svn_inc(x->patch, &bad), "0");
+    } else if (x->major == 0) {
+      svn_add(set, SEMVER_LT, 0, svn_inc(x->minor, &bad), 0, "0");
+    } else {
+      svn_add(set, SEMVER_LT, svn_inc(x->major, &bad), 0, 0, "0");
+    }
+  }
+  return !bad;
+}
+
+fn svn_xrange(x: SvnX*, inc: bool, set: List<SemverComparator>*) -> bool {
+  var bad: bool = false;
+  var op: int32 = x->op;
+  var any_x: bool = x->xm2;
+  if (op == SEMVER_EQ && any_x) { op = 0; }
+  var pr: string = svn_z(inc);
+  if (x->xm0) {
+    if (op == SEMVER_GT || op == SEMVER_LT) {
+      svn_add(set, SEMVER_LT, 0, 0, 0, "0");
+    } else {
+      svn_any(set);
+    }
+  } else if (op != 0 && any_x) {
+    var ma: uint64 = x->major;
+    var mi: uint64 = x->minor;
+    var pa: uint64 = 0;
+    if (x->xm1) { mi = 0; }
+    if (op == SEMVER_GT) {
+      op = SEMVER_GE;
+      if (x->xm1) {
+        ma = svn_inc(ma, &bad);
+        mi = 0;
+      } else {
+        mi = svn_inc(mi, &bad);
+      }
+    } else if (op == SEMVER_LE) {
+      op = SEMVER_LT;
+      if (x->xm1) {
+        ma = svn_inc(ma, &bad);
+      } else {
+        mi = svn_inc(mi, &bad);
+      }
+    }
+    if (op == SEMVER_LT) { pr = "0"; }
+    svn_add(set, op, ma, mi, pa, pr);
+  } else if (x->xm1) {
+    svn_add(set, SEMVER_GE, x->major, 0, 0, pr);
+    svn_add(set, SEMVER_LT, svn_inc(x->major, &bad), 0, 0, "0");
+  } else if (x->xm2) {
+    svn_add(set, SEMVER_GE, x->major, x->minor, 0, pr);
+    svn_add(set, SEMVER_LT, x->major, svn_inc(x->minor, &bad), 0, "0");
+  } else {
+    // node-semver re-reads a full version as written, which allows only an
+    // operator and one "v" before it.
+    if (!x->prefix_ok) { return false; }
+    if (op == 0) { op = SEMVER_EQ; }
+    svn_add(set, op, x->major, x->minor, x->patch, x->pre);
+  }
+  return !bad;
+}
+
+fn svn_hyphen(a: SvnX*, b: SvnX*, inc: bool, set: List<SemverComparator>*) -> bool {
+  var bad: bool = false;
+  if (!a->xm2 && !a->prefix_ok) { return false; }
+  if (!b->xm2 && b->pre.length == 0 && !inc && !b->prefix_ok) { return false; }
+  if (a->xm0) {
+    // no lower bound
+  } else if (a->xm1) {
+    svn_add(set, SEMVER_GE, a->major, 0, 0, svn_z(inc));
+  } else if (a->xm2) {
+    svn_add(set, SEMVER_GE, a->major, a->minor, 0, svn_z(inc));
+  } else if (a->pre.length > 0) {
+    svn_add(set, SEMVER_GE, a->major, a->minor, a->patch, a->pre);
+  } else {
+    svn_add(set, SEMVER_GE, a->major, a->minor, a->patch, svn_z(inc));
+  }
+  if (b->xm0) {
+    // no upper bound
+  } else if (b->xm1) {
+    svn_add(set, SEMVER_LT, svn_inc(b->major, &bad), 0, 0, "0");
+  } else if (b->xm2) {
+    svn_add(set, SEMVER_LT, b->major, svn_inc(b->minor, &bad), 0, "0");
+  } else if (b->pre.length > 0) {
+    svn_add(set, SEMVER_LE, b->major, b->minor, b->patch, b->pre);
+  } else if (inc) {
+    svn_add(set, SEMVER_LT, b->major, b->minor, svn_inc(b->patch, &bad), "0");
+  } else {
+    svn_add(set, SEMVER_LE, b->major, b->minor, b->patch, "");
+  }
+  if (set->length == 0) { svn_any(set); }
+  return !bad;
+}
+
+fn svn_same(a: SemverComparator*, b: SemverComparator*) -> bool {
+  if (a->op != b->op) { return false; }
+  if (a->op == SEMVER_ANY) { return true; }
+  if (a->major != b->major || a->minor != b->minor || a->patch != b->patch) { return false; }
+  if (a->pre.length != b->pre.length) { return false; }
+  for i in 0..(int64)a->pre.length {
+    if (a->pre[i] != b->pre[i]) { return false; }
+  }
+  return true;
+}
+
+fn svn_is_null(c: SemverComparator*) -> bool {
+  return c->op == SEMVER_LT && c->major == 0 && c->minor == 0 && c->patch == 0 &&
+    c->pre.length == 1 && c->pre[0] == '0';
+}
+
+// Splits s[st..en) into words at whitespace. Returns how many were found,
+// at most max; starts and lengths go into the two arrays.
+fn svn_words(s: string, st: int64, en: int64, ws: int64*, wl: int64*, max: int64) -> int64 {
+  var count: int64 = 0;
+  var i: int64 = st;
+  while (i < en) {
+    while (i < en && semver_is_space(s[i])) { i = i + 1; }
+    if (i >= en) { break; }
+    var b: int64 = i;
+    while (i < en && !semver_is_space(s[i])) { i = i + 1; }
+    if (count < max) {
+      ws[count] = b;
+      wl[count] = i - b;
+    }
+    count = count + 1;
+  }
+  return count;
+}
+
+fn svn_check_safe(set: List<SemverComparator>*, at: int64) -> Result<int32, SemverError> {
+  for k in 0..set->length {
+    var c: SemverComparator* = &set->data[k];
+    if (c->major > SVN_SAFE || c->minor > SVN_SAFE || c->patch > SVN_SAFE) {
+      return semver_err<int32>(at, "number too large");
+    }
+  }
+  return Ok(0);
+}
+
+// Parses one set (the text between "||") into comparators added to set.
+fn svn_parse_set(s: string, st: int64, en: int64, inc: bool, set: List<SemverComparator>*) -> Result<int32, SemverError> {
+  var ws: int64[3];
+  var wl: int64[3];
+  var nw: int64 = svn_words(s, st, en, &ws[0], &wl[0], 3);
+  if (nw == 3 && wl[1] == 1 && s[ws[1]] == '-') {
+    var a: SvnX;
+    var b: SvnX;
+    if (svn_parse_x(str_slice(s, ws[0], wl[0]), false, &a).length == 0 &&
+        svn_parse_x(str_slice(s, ws[2], wl[2]), false, &b).length == 0) {
+      if (!svn_hyphen(&a, &b, inc, set)) { return semver_err<int32>(ws[0], "invalid comparator"); }
+      return svn_check_safe(set, st);
+    }
+  }
+  var i: int64 = st;
+  while (i < en) {
+    while (i < en && semver_is_space(s[i])) { i = i + 1; }
+    if (i >= en) { break; }
+    var b0: int64 = i;
+    while (i < en && !semver_is_space(s[i])) { i = i + 1; }
+    var word: string = str_slice(s, b0, i - b0);
+    var x: SvnX;
+    var why: string = "";
+    var k: int64 = 0;
+    var lone: int32 = svn_read_op(word, &k);
+    var j: int64 = i;
+    while (j < en && s[j] == ' ') { j = j + 1; }
+    // An operator on its own joins the next word, so ">= 1.2.3" means
+    // ">=1.2.3". node-semver does this for "~" and "^" across any spaces,
+    // but for < > <= >= only across one space, and for "=" only with one
+    // space on each side (more spaces appear only where build metadata
+    // was dropped).
+    var join: bool = lone != 0 && k == (int64)word.length && j < en;
+    if (join && lone != SEMVER_TILDE && lone != SEMVER_CARET) {
+      var before: int64 = 0;
+      var q: int64 = b0 - 1;
+      while (q >= st && s[q] == ' ') { before = before + 1; q = q - 1; }
+      join = j - i == 1 && (lone != SEMVER_EQ || before <= 1);
+    }
+    if (join) {
+      var b1: int64 = j;
+      while (j < en && s[j] != ' ') { j = j + 1; }
+      why = svn_parse_x(str_slice(s, b1, j - b1), false, &x);
+      x.op = lone;
+      i = j;
+    } else {
+      why = svn_parse_x(word, true, &x);
+    }
+    if (why.length > 0) { return semver_err<int32>(b0, why); }
+    var ok: bool = true;
+    if (x.op == SEMVER_TILDE) {
+      ok = svn_tilde(&x, inc, set);
+    } else if (x.op == SEMVER_CARET) {
+      ok = svn_caret(&x, inc, set);
+    } else {
+      if (x.bad_order) {
+        return semver_err<int32>(b0, "invalid comparator");
+      }
+      ok = svn_xrange(&x, inc, set);
+    }
+    if (!ok) { return semver_err<int32>(b0, "invalid comparator"); }
+  }
+  if (set->length == 0) { svn_any(set); }
+  return svn_check_safe(set, st);
+}
+
+// svn_parse_set as a plain error value: at is -1 when the set parsed.
+fn svn_set_status(s: string, st: int64, en: int64, inc: bool, set: List<SemverComparator>*) -> SemverError {
+  var out: SemverError = { at: -1, why: "" };
+  match (svn_parse_set(s, st, en, inc, set)) {
+    case Ok(z): { }
+    case Err(e): { out = e; }
+  }
+  return out;
+}
+
+// node-semver treats ">=0.0.0" (or ">=0.0.0-0" with prereleases included)
+// as "*".
+fn svn_gte0(c: SemverComparator*, inc: bool) -> bool {
+  if (c->op != SEMVER_GE || c->major != 0 || c->minor != 0 || c->patch != 0) { return false; }
+  if (inc) { return c->pre.length == 1 && c->pre[0] == '0'; }
+  return c->pre.length == 0;
+}
+
+// Cleans up one set the way node-semver's parseRange does, then appends it.
+fn svn_finish_set(r: SemverRange*, set: List<SemverComparator>*) {
+  for i in 0..set->length {
+    if (svn_gte0(&set->data[i], r->include_pre)) {
+      set->data[i] = semver_cmp_new(SEMVER_ANY, 0, 0, 0, 0, "");
+    }
+  }
+  for i in 0..set->length {
+    if (svn_is_null(&set->data[i])) {
+      list_push<SemverComparator>(&r->cmps, set->data[i]);
+      list_push<int64>(&r->ends, r->cmps.length);
+      return;
+    }
+  }
+  var start: int64 = r->cmps.length;
+  var has_any: bool = false;
+  var others: int64 = 0;
+  for i in 0..set->length {
+    var dup: bool = false;
+    for j in start..r->cmps.length {
+      if (svn_same(&r->cmps.data[j], &set->data[i])) { dup = true; }
+    }
+    if (!dup) {
+      list_push<SemverComparator>(&r->cmps, set->data[i]);
+      if (set->data[i].op == SEMVER_ANY) { has_any = true; } else { others = others + 1; }
+    }
+  }
+  if (has_any && others > 0) {
+    // Drop the "*" when the set has other comparators.
+    var w: int64 = start;
+    for j in start..r->cmps.length {
+      if (r->cmps.data[j].op != SEMVER_ANY) {
+        r->cmps.data[w] = r->cmps.data[j];
+        w = w + 1;
+      }
+    }
+    r->cmps.length = w;
+  }
+  list_push<int64>(&r->ends, r->cmps.length);
+}
+
+fn svn_set_is(r: SemverRange*, k: int64, null_set: bool) -> bool {
+  var st: int64 = semver_range_set_start(r, k);
+  var en: int64 = semver_range_set_end(r, k);
+  if (null_set) { return en > st && svn_is_null(&r->cmps.data[st]); }
+  return en - st == 1 && r->cmps.data[st].op == SEMVER_ANY;
+}
+
+// Keeps only set k (with its comparators) in the range.
+fn svn_keep_sets(r: SemverRange*, keep: bool*) {
+  var w: int64 = 0;
+  var nsets: int64 = 0;
+  for k in 0..r->ends.length {
+    var st: int64 = semver_range_set_start(r, k);
+    var en: int64 = semver_range_set_end(r, k);
+    if (keep[k]) {
+      for i in st..en {
+        r->cmps.data[w] = r->cmps.data[i];
+        w = w + 1;
+      }
+      r->ends.data[nsets] = w;
+      nsets = nsets + 1;
+    }
+  }
+  r->cmps.length = w;
+  r->ends.length = nsets;
+}
+
+fn svn_cleanup(r: SemverRange*) {
+  var n: int64 = r->ends.length;
+  if (n <= 1) { return; }
+  var keep: bool* = (bool*)malloc(n);
+  defer free(keep);
+  var left: int64 = 0;
+  for k in 0..n {
+    keep[k] = !svn_set_is(r, k, true);
+    if (keep[k]) { left = left + 1; }
+  }
+  if (left == 0) {
+    keep[0] = true;
+    for k in 1..n { keep[k] = false; }
+  }
+  svn_keep_sets(r, keep);
+  n = r->ends.length;
+  if (n <= 1) { return; }
+  for k in 0..n {
+    if (svn_set_is(r, k, false)) {
+      for j in 0..n { keep[j] = j == k; }
+      svn_keep_sets(r, keep);
+      return;
+    }
+  }
+}
+
+// How many bytes of whitespace start at s[i]: what JavaScript's \s
+// matches, in UTF-8. 0 when there is none.
+export fn semver_space_len(s: string, i: int64) -> int64 {
+  var n: int64 = (int64)s.length;
+  var c: int32 = (int32)(uint8)s[i];
+  if (c == 32 || (c >= 9 && c <= 13)) { return 1; }
+  if (c < 0xC2 || i + 1 >= n) { return 0; }
+  var c1: int32 = (int32)(uint8)s[i + 1];
+  if (c == 0xC2) {
+    if (c1 == 0xA0) { return 2; }
+    return 0;
+  }
+  if (i + 2 >= n) { return 0; }
+  var c2: int32 = (int32)(uint8)s[i + 2];
+  if (c == 0xE1 && c1 == 0x9A && c2 == 0x80) { return 3; }
+  if (c == 0xE2 && c1 == 0x80 && (c2 <= 0x8A || c2 == 0xA8 || c2 == 0xA9 || c2 == 0xAF)) { return 3; }
+  if (c == 0xE2 && c1 == 0x81 && c2 == 0x9F) { return 3; }
+  if (c == 0xE3 && c1 == 0x80 && c2 == 0x80) { return 3; }
+  if (c == 0xEF && c1 == 0xBB && c2 == 0xBF) { return 3; }
+  return 0;
+}
+
+// Parses an npm range. include_pre is node-semver's includePrerelease
+// option: pre-release versions may then match any set. The range keeps
+// its own tidied copy of the text; free it with semver_range_free.
+export fn semver_npm_parse(text: string, include_pre: bool) -> Result<SemverRange, SemverError> {
+  var r: SemverRange = semver_range_new(SEMVER_STYLE_NPM, include_pre);
+  var n: int64 = (int64)text.length;
+  var buf: uint8* = (uint8*)malloc(n + 1);
+  var map: int64* = (int64*)malloc((n + 1) * 8);
+  r.owned = buf;
+  // Like node-semver: trim, turn each run of whitespace into one space,
+  // then drop build metadata ("+" and identifiers) wherever it appears.
+  var m: int64 = 0;
+  var i: int64 = 0;
+  var gap: bool = false;
+  while (i < n) {
+    var k: int64 = semver_space_len(text, i);
+    if (k > 0) {
+      if (m > 0) { gap = true; }
+      i = i + k;
+      continue;
+    }
+    if (gap) {
+      buf[m] = (uint8)32;
+      map[m] = i;
+      m = m + 1;
+      gap = false;
+    }
+    buf[m] = (uint8)text[i];
+    map[m] = i;
+    m = m + 1;
+    i = i + 1;
+  }
+  var w: int64 = 0;
+  var j: int64 = 0;
+  while (j < m) {
+    if (buf[j] == (uint8)43 && j + 1 < m && semver_is_ident_char((char)buf[j + 1])) {
+      j = j + 1;
+      while (j < m && semver_is_ident_char((char)buf[j])) { j = j + 1; }
+      while (j + 1 < m && buf[j] == (uint8)46 && semver_is_ident_char((char)buf[j + 1])) {
+        j = j + 1;
+        while (j < m && semver_is_ident_char((char)buf[j])) { j = j + 1; }
+      }
+      continue;
+    }
+    buf[w] = buf[j];
+    map[w] = map[j];
+    w = w + 1;
+    j = j + 1;
+  }
+  map[w] = n;
+  var s: string = str_from_bytes((cstring)buf, w);
+  var set: List<SemverComparator> = list_init<SemverComparator>();
+  var st: int64 = 0;
+  while (true) {
+    var en: int64 = st;
+    while (en < w && !(s[en] == '|' && en + 1 < w && s[en + 1] == '|')) { en = en + 1; }
+    list_clear<SemverComparator>(&set);
+    var bad: SemverError = svn_set_status(s, st, en, include_pre, &set);
+    if (bad.at >= 0) {
+      list_free<SemverComparator>(&set);
+      semver_range_free(&r);
+      var at: int64 = bad.at;
+      if (at > w) { at = w; }
+      var orig: int64 = map[at];
+      free(map);
+      return semver_err<SemverRange>(orig, bad.why);
+    }
+    svn_finish_set(&r, &set);
+    if (en >= w) { break; }
+    st = en + 2;
+  }
+  list_free<SemverComparator>(&set);
+  free(map);
+  svn_cleanup(&r);
+  return Ok(r);
+}
+
+// True when the version text is in the npm range text. Text that does not
+// parse is never in a range.
+export fn semver_npm_satisfies(version: string, range: string) -> bool {
+  match (semver_parse(version)) {
+    case Ok(v): {
+      match (semver_npm_parse(range, false)) {
+        case Ok(r): {
+          var ok: bool = semver_satisfies(&r, v);
+          semver_range_free(&r);
+          return ok;
+        }
+        case Err(e): { return false; }
+      }
+    }
+    case Err(e2): { return false; }
+  }
+  return false;
+}

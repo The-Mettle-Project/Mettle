@@ -1,0 +1,196 @@
+// Sensors: every hwmon chip in /sys/class/hwmon, following the kernel's
+// sysfs-interface for hwmon (Documentation/hwmon/sysfs-interface.rst):
+// temp*_input (millidegree C), fan*_input (RPM), in*_input (millivolt),
+// power*_input or power*_average (microwatt), curr*_input (milliampere),
+// with *_label, *_min, *_max and *_crit beside them. The set of inputs is
+// found once; each refresh reads the kept-open input files.
+//
+// Some inputs ask the hardware on every read (NVMe drives answer an admin
+// command, SPD hubs sit on a slow bus), which can take tens of
+// milliseconds and wake a sleeping drive. An input whose read took longer
+// than 5 ms is read again at most every 5 seconds; in between it keeps its
+// last value.
+import "std/mem";
+import "std/time";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+
+export struct SysinfoLxSensors {
+  perm: SysinfoLxPool;
+  fds: int64*;
+  scale: float64*;
+  last_ns: int64*;          // when each input was last read
+  slow: bool*;
+  cap: int32;
+}
+
+// The kind, scale and index of a hwmon file name such as "temp3_input".
+// Returns false for anything else.
+export fn sysinfo_lx_hwmon_input(name: string, kind: int32*, scale: float64*, index: int32*, prefix_len: int32*) -> bool {
+  var n: int64 = (int64)name.length;
+  var k: int32 = 0;
+  var pre: int32 = 0;
+  var sc: float64 = 1.0;
+  if (sysinfo_lx_starts(name, "temp")) { k = SYSINFO_SENSOR_TEMP; pre = 4; sc = 0.001; }
+  else if (sysinfo_lx_starts(name, "fan")) { k = SYSINFO_SENSOR_FAN; pre = 3; sc = 1.0; }
+  else if (sysinfo_lx_starts(name, "in")) { k = SYSINFO_SENSOR_VOLT; pre = 2; sc = 0.001; }
+  else if (sysinfo_lx_starts(name, "power")) { k = SYSINFO_SENSOR_POWER; pre = 5; sc = 0.000001; }
+  else if (sysinfo_lx_starts(name, "curr")) { k = SYSINFO_SENSOR_CURRENT; pre = 4; sc = 0.001; }
+  else { return false; }
+  var i: int64 = (int64)pre;
+  var idx: int64 = 0;
+  var digits: int32 = 0;
+  while (i < n && name[i] >= '0' && name[i] <= '9') { idx = idx * 10 + (int64)((int32)name[i] - 48); i = i + 1; digits = digits + 1; }
+  if (digits == 0) { return false; }
+  var rest: string = sysinfo_lx_view(name.chars + i, n - i);
+  if (!sysinfo_lx_eq(rest, "_input") && !(k == SYSINFO_SENSOR_POWER && sysinfo_lx_eq(rest, "_average"))) { return false; }
+  *kind = k;
+  *scale = sc;
+  *index = (int32)idx;
+  *prefix_len = pre;
+  return true;
+}
+
+fn sysinfo_lx_sensor_limit(path: SysinfoLxPath*, base: int64, suffix: string, scale: float64) -> float64 {
+  path->n = base;
+  sysinfo_lx_path_add(path, suffix);
+  var v: int64 = sysinfo_lx_read_i64(sysinfo_lx_path_str(path), -2000000000);
+  if (v == -2000000000) { return -1.0; }
+  return (float64)v * scale;
+}
+
+fn sysinfo_lx_sensor_add(st: SysinfoLxSensors*, out: SysinfoSensors*) -> SysinfoSensor* {
+  if (out->n >= st->cap || out->list == 0) {
+    var c: int32 = st->cap;
+    out->list = (SysinfoSensor*)sysinfo_lx_grow((uint8*)out->list, &c, out->n + 1, sizeof(SysinfoSensor));
+    c = st->cap;
+    st->fds = (int64*)sysinfo_lx_grow((uint8*)st->fds, &c, out->n + 1, 8);
+    c = st->cap;
+    st->scale = (float64*)sysinfo_lx_grow((uint8*)st->scale, &c, out->n + 1, 8);
+    c = st->cap;
+    st->last_ns = (int64*)sysinfo_lx_grow((uint8*)st->last_ns, &c, out->n + 1, 8);
+    c = st->cap;
+    st->slow = (bool*)sysinfo_lx_grow((uint8*)st->slow, &c, out->n + 1, 1);
+    st->cap = c;
+  }
+  var s: SysinfoSensor* = &out->list[out->n];
+  out->n = out->n + 1;
+  return s;
+}
+
+fn sysinfo_lx_sensors_chip(st: SysinfoLxSensors*, out: SysinfoSensors*, chipdir: string) {
+  var p: SysinfoLxPath;
+  sysinfo_lx_path_reset(&p);
+  sysinfo_lx_path_add(&p, chipdir);
+  var cbase: int64 = p.n;
+  sysinfo_lx_path_add(&p, "/name");
+  var tmp: uint8[128];
+  var n: int64 = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &tmp[0], 128);
+  var chip: string = sysinfo_lx_pool_add_bytes(&st->perm, &tmp[0], n);
+  p.n = cbase;
+  var files: SysinfoLxNames;
+  var count: int32 = sysinfo_lx_names(sysinfo_lx_path_str(&p), "", &files);
+  // in kind order: temperatures, fans, voltages, power, current
+  for kind in 1..6 {
+    for i in 0..count {
+      var name: string = sysinfo_lx_names_at(&files, i);
+      var k: int32 = 0;
+      var scale: float64 = 1.0;
+      var idx: int32 = 0;
+      var pre: int32 = 0;
+      if (!sysinfo_lx_hwmon_input(name, &k, &scale, &idx, &pre) || k != kind) { continue; }
+      // power1_average is used only when power1_input is missing
+      if (k == SYSINFO_SENSOR_POWER && sysinfo_lx_ends(name, "_average")) {
+        var twin: bool = false;
+        for j in 0..count {
+          var o: string = sysinfo_lx_names_at(&files, j);
+          var k2: int32 = 0; var s2: float64 = 1.0; var i2: int32 = 0; var p2: int32 = 0;
+          if (sysinfo_lx_hwmon_input(o, &k2, &s2, &i2, &p2) && k2 == k && i2 == idx && sysinfo_lx_ends(o, "_input")) { twin = true; }
+        }
+        if (twin) { continue; }
+      }
+      p.n = cbase;
+      sysinfo_lx_path_add(&p, "/");
+      var stem: int64 = p.n;
+      sysinfo_lx_path_add(&p, name);
+      var fd: int64 = sysinfo_lx_open(sysinfo_lx_path_str(&p));
+      if (fd < 0) { continue; }
+      var s: SysinfoSensor* = sysinfo_lx_sensor_add(st, out);
+      var slot: int32 = out->n - 1;
+      st->fds[slot] = fd;
+      st->scale[slot] = scale;
+      s->chip = chip;
+      s->kind = k;
+      // the stem, such as "temp3"
+      var sn: int64 = (int64)pre;
+      var x: int32 = idx;
+      var digits: int64 = 1;
+      while (x >= 10) { digits = digits + 1; x = x / 10; }
+      sn = sn + digits;
+      var stemv: string = sysinfo_lx_view(name.chars, sn);
+      p.n = stem;
+      sysinfo_lx_path_add(&p, stemv);
+      var base: int64 = p.n;
+      sysinfo_lx_path_add(&p, "_label");
+      n = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &tmp[0], 128);
+      if (n > 0) { s->label = sysinfo_lx_pool_add_bytes(&st->perm, &tmp[0], n); }
+      else { s->label = sysinfo_lx_pool_add(&st->perm, stemv); }
+      s->min = sysinfo_lx_sensor_limit(&p, base, "_min", scale);
+      s->max = sysinfo_lx_sensor_limit(&p, base, "_max", scale);
+      s->crit = sysinfo_lx_sensor_limit(&p, base, "_crit", scale);
+      if (k == SYSINFO_SENSOR_POWER && s->max < 0.0) { s->max = sysinfo_lx_sensor_limit(&p, base, "_cap", scale); }
+      if (k == SYSINFO_SENSOR_TEMP) {
+        if (s->min == -1.0) { s->min = SYSINFO_NA_TEMP; }
+        if (s->max == -1.0) { s->max = SYSINFO_NA_TEMP; }
+        if (s->crit == -1.0) { s->crit = SYSINFO_NA_TEMP; }
+      }
+    }
+  }
+  sysinfo_lx_names_free(&files);
+}
+
+export fn sysinfo_lx_sensors_init(st: SysinfoLxSensors*, c: SysinfoLxCtx*, out: SysinfoSensors*) -> int32 {
+  var dir: SysinfoLxPath;
+  sysinfo_lx_path_at(&dir, c->root, "/sys/class/hwmon");
+  var chips: SysinfoLxNames;
+  var count: int32 = sysinfo_lx_names(sysinfo_lx_path_str(&dir), "", &chips);
+  out->n = 0;
+  for i in 0..count {
+    var p: SysinfoLxPath = dir;
+    sysinfo_lx_path_add(&p, "/");
+    sysinfo_lx_path_add(&p, sysinfo_lx_names_at(&chips, i));
+    sysinfo_lx_sensors_chip(st, out, sysinfo_lx_path_str(&p));
+  }
+  sysinfo_lx_names_free(&chips);
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_sensors_refresh(st: SysinfoLxSensors*, c: SysinfoLxCtx*, out: SysinfoSensors*) -> int32 {
+  for i in 0..out->n {
+    var s: SysinfoSensor* = &out->list[i];
+    var t0: int64 = time_mono_ns();
+    if (st->slow[i] && t0 - st->last_ns[i] < 5000000000) { continue; }
+    var v: int64 = sysinfo_lx_fd_i64(st->fds[i], -2000000000);
+    var t1: int64 = time_mono_ns();
+    st->last_ns[i] = t1;
+    st->slow[i] = t1 - t0 > 5000000;
+    if (v == -2000000000) {
+      s->value = -1.0;
+      if (s->kind == SYSINFO_SENSOR_TEMP) { s->value = SYSINFO_NA_TEMP; }
+    } else {
+      s->value = (float64)v * st->scale[i];
+    }
+  }
+  out->status = SYSINFO_OK;
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_sensors_free(st: SysinfoLxSensors*, out: SysinfoSensors*) {
+  for i in 0..out->n { sysinfo_lx_close(st->fds[i]); }
+  if (st->fds != 0) { free(st->fds); free(st->scale); free(st->last_ns); free(st->slow); }
+  if (out->list != 0) { free(out->list); }
+  out->list = (SysinfoSensor*)0;
+  out->n = 0;
+  sysinfo_lx_pool_free(&st->perm);
+}

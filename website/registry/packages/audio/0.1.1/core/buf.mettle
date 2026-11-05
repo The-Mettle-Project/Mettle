@@ -1,0 +1,103 @@
+// AudioBuf: a growable byte buffer that encoders write into.
+//
+//   var out: AudioBuf;                 // zeroed: empty, no limit
+//   audio_wav_encode(&pcm, &out);
+//   ... out.data[0 .. out.len] ...
+//   audio_buf_free(&out);
+
+import "std/mem";
+import "status";
+
+export struct AudioBuf {
+  data: uint8*;
+  len: int64;     // bytes in use
+  cap: int64;     // bytes allocated
+  limit: int64;   // most bytes len may reach; 0 means no limit
+}
+
+/// Frees the buffer's memory and leaves it empty. The limit stays.
+export fn audio_buf_free(b: AudioBuf*) {
+  if (b->data != 0) { free(b->data); }
+  b->data = (uint8*)0;
+  b->len = 0;
+  b->cap = 0;
+}
+
+/// Makes room for at least `extra` more bytes.
+export fn audio_buf_reserve(b: AudioBuf*, extra: int64) -> int32 {
+  if (extra < 0) { return AUDIO_E_ARG; }
+  var need: int64 = b->len + extra;
+  if (need <= b->cap) { return AUDIO_OK; }
+  if (b->limit > 0 && need > b->limit) { return AUDIO_E_LIMIT; }
+  var ncap: int64 = b->cap * 2;
+  if (ncap < 256) { ncap = 256; }
+  if (ncap < need) { ncap = need; }
+  if (b->limit > 0 && ncap > b->limit) { ncap = b->limit; }
+  var nd: uint8* = (uint8*)malloc(ncap);
+  if (nd == 0) { return AUDIO_E_MEM; }
+  if (b->data != 0) {
+    if (b->len > 0) { memcpy(nd, b->data, b->len); }
+    free(b->data);
+  }
+  b->data = nd;
+  b->cap = ncap;
+  return AUDIO_OK;
+}
+
+/// Appends n bytes.
+export fn audio_buf_append(b: AudioBuf*, p: uint8*, n: int64) -> int32 {
+  if (n <= 0) { return AUDIO_OK; }
+  var rc: int32 = audio_buf_reserve(b, n);
+  if (rc != AUDIO_OK) { return rc; }
+  memcpy(b->data + b->len, p, n);
+  b->len = b->len + n;
+  return AUDIO_OK;
+}
+
+/// Appends one byte.
+export fn audio_buf_push(b: AudioBuf*, v: int64) -> int32 {
+  if (b->len >= b->cap) {
+    var rc: int32 = audio_buf_reserve(b, 1);
+    if (rc != AUDIO_OK) { return rc; }
+  }
+  b->data[b->len] = (uint8)(v & 255);
+  b->len = b->len + 1;
+  return AUDIO_OK;
+}
+
+export fn audio_buf_u16le(b: AudioBuf*, v: int64) -> int32 {
+  audio_buf_push(b, v);
+  return audio_buf_push(b, v >> 8);
+}
+
+export fn audio_buf_u32le(b: AudioBuf*, v: int64) -> int32 {
+  audio_buf_u16le(b, v);
+  return audio_buf_u16le(b, v >> 16);
+}
+
+export fn audio_buf_u64le(b: AudioBuf*, v: int64) -> int32 {
+  audio_buf_u32le(b, v);
+  return audio_buf_u32le(b, v >> 32);
+}
+
+export fn audio_buf_u16be(b: AudioBuf*, v: int64) -> int32 {
+  audio_buf_push(b, v >> 8);
+  return audio_buf_push(b, v);
+}
+
+export fn audio_buf_u24be(b: AudioBuf*, v: int64) -> int32 {
+  audio_buf_push(b, v >> 16);
+  return audio_buf_u16be(b, v);
+}
+
+export fn audio_buf_u32be(b: AudioBuf*, v: int64) -> int32 {
+  audio_buf_u16be(b, v >> 16);
+  return audio_buf_u16be(b, v);
+}
+
+/// Appends the bytes of a string.
+export fn audio_buf_str(b: AudioBuf*, s: string) -> int32 {
+  var rc: int32 = AUDIO_OK;
+  for i in 0..(int64)s.length { rc = audio_buf_push(b, (int64)(uint8)s[i]); }
+  return rc;
+}

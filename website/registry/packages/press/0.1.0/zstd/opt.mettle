@@ -1,0 +1,343 @@
+// Optimal parser for the highest levels. For each stretch of input it
+// finds every useful match (repeat offsets plus the hash chain), then runs
+// a shortest-path search where the cost of literals, lengths and offsets
+// comes from the symbol statistics of the previous block.
+
+import "std/mem";
+import "../core/buf";
+import "common";
+import "fse";
+import "ectx";
+import "match";
+
+const OPT_NUM: int64 = 4096;
+const NODES: int64 = 5200;     // OPT_NUM plus the longest early-exit match
+const MAXM: int64 = 64;
+const INF: int64 = 1125899906842624;   // 1 << 50
+
+struct Node {
+  price: int64;
+  off: uint32;     // match distance ending here, 0 when reached by a literal
+  mlen: uint32;
+  litlen: uint32;
+  rep: uint32[3];
+}
+
+struct Cand {
+  off: uint32;
+  len: uint32;
+}
+
+struct OptState {
+  valid: bool;
+  lit: uint32[256];
+  ll: uint32[36];
+  ml: uint32[53];
+  of: uint32[32];
+  litP: int64[256];
+  llP: int64[36];
+  mlP: int64[53];
+  ofP: int64[32];
+  nodes: Node[5200];
+  cands: Cand[64];
+  path: uint32[8192];
+}
+
+fn prices(st: OptState*) {
+  var t: uint64 = 0;
+  for i in 0..256 { t = t + (uint64)st->lit[i]; }
+  var lt: int64 = pzs_log2_256(t);
+  for i in 0..256 { st->litP[i] = lt - pzs_log2_256((uint64)st->lit[i]); }
+  t = 0;
+  for i in 0..36 { t = t + (uint64)st->ll[i]; }
+  lt = pzs_log2_256(t);
+  for i in 0..36 { st->llP[i] = lt - pzs_log2_256((uint64)st->ll[i]) + (int64)PZS_LL_BITS[i] * 256; }
+  t = 0;
+  for i in 0..53 { t = t + (uint64)st->ml[i]; }
+  lt = pzs_log2_256(t);
+  for i in 0..53 { st->mlP[i] = lt - pzs_log2_256((uint64)st->ml[i]) + (int64)PZS_ML_BITS[i] * 256; }
+  t = 0;
+  for i in 0..32 { t = t + (uint64)st->of[i]; }
+  lt = pzs_log2_256(t);
+  for i in 0..32 { st->ofP[i] = lt - pzs_log2_256((uint64)st->of[i]) + (int64)i * 256; }
+}
+
+@inline fn llcode(e: PzsEnc*, ll: int64) -> int32 {
+  if (ll < 64) { return (int32)e->llc_t[ll]; }
+  return pzs_hb32((uint32)ll) + 19;
+}
+
+@inline fn mlcode(e: PzsEnc*, ml: int64) -> int32 {
+  var mb: int64 = ml - 3;
+  if (mb < 128) { return (int32)e->mlc_t[mb]; }
+  return pzs_hb32((uint32)mb) + 36;
+}
+
+@inline fn ll_price(e: PzsEnc*, st: OptState*, ll: int64) -> int64 {
+  return st->llP[llcode(e, ll)];
+}
+
+// First-block guesses: literal counts from the bytes, flat-ish codes.
+fn seed_stats(e: PzsEnc*, st: OptState*, s: int64, end: int64) {
+  for i in 0..256 { st->lit[i] = 1; }
+  for i in s..end { st->lit[e->b[i]] = st->lit[e->b[i]] + (uint32)1; }
+  for i in 0..36 { st->ll[i] = 1; }
+  for i in 0..16 { st->ll[i] = 4; }
+  st->ll[0] = 16;
+  for i in 0..53 { st->ml[i] = 1; }
+  for i in 0..16 { st->ml[i] = 6; }
+  for i in 0..32 { st->of[i] = 1; }
+  for i in 0..3 { st->of[i] = 6; }
+  for i in 10..24 { st->of[i] = 4; }
+}
+
+// Counts from the sequences just stored, plus a little of the old stats.
+fn learn_stats(e: PzsEnc*, st: OptState*) {
+  for i in 0..256 { st->lit[i] = (uint32)1 + (st->lit[i] >> 3); }
+  for i in 0..36 { st->ll[i] = (uint32)1 + (st->ll[i] >> 3); }
+  for i in 0..53 { st->ml[i] = (uint32)1 + (st->ml[i] >> 3); }
+  for i in 0..32 { st->of[i] = (uint32)1 + (st->of[i] >> 3); }
+  for i in 0..e->nlit { st->lit[e->lit[i]] = st->lit[e->lit[i]] + (uint32)2; }
+  for k in 0..e->nseq {
+    var a: int32 = llcode(e, (int64)e->sll[k]);
+    var m: int32 = mlcode(e, (int64)e->sml[k]);
+    var o: int32 = pzs_hb32(e->sob[k]);
+    st->ll[a] = st->ll[a] + (uint32)2;
+    st->ml[m] = st->ml[m] + (uint32)2;
+    st->of[o] = st->of[o] + (uint32)2;
+  }
+}
+
+// Collects matches at ip with strictly growing lengths. rep is the repeat
+// state there and ll the literal run before ip. Returns the count.
+fn find_matches(e: PzsEnc*, st: OptState*, ip: int64, end: int64, low: int64, rep: uint32*, ll: int64) -> int64 {
+  var b: uint8* = e->b;
+  var n: int64 = 0;
+  var best: int64 = 3;
+  var limit: int64 = end - ip;
+  for k in 0..3 {
+    var o: int64 = (int64)rep[k];
+    if (ll == 0) {
+      if (k == 0) { o = (int64)rep[1]; } else if (k == 1) { o = (int64)rep[2]; } else { o = (int64)rep[0] - 1; }
+    }
+    if (o > 0 && ip - o >= low && press_rd32(b + ip) == press_rd32(b + ip - o)) {
+      var len: int64 = pzs_count(b, ip + 4, ip + 4 - o, end) + 4;
+      if (len > best) {
+        st->cands[n].off = (uint32)o;
+        st->cands[n].len = (uint32)len;
+        n = n + 1;
+        best = len;
+      }
+    }
+  }
+  pzs_chain_insert(e, ip + 1);
+  var cm: int64 = e->csize - 1;
+  var minChain: int64 = ip - e->csize;
+  if (minChain < low) { minChain = low; }
+  var cand: int64 = (int64)e->ct[ip & cm];
+  var tries: int32 = 1 << e->slog;
+  var w: uint32 = press_rd32(b + ip);
+  while (cand >= minChain && cand < ip && tries > 0 && best < limit && n < MAXM) {
+    tries = tries - 1;
+    if (b[cand + best] == b[ip + best] && press_rd32(b + cand) == w) {
+      var len2: int64 = pzs_count(b, ip + 4, cand + 4, end) + 4;
+      if (len2 > best) {
+        st->cands[n].off = (uint32)(ip - cand);
+        st->cands[n].len = (uint32)len2;
+        n = n + 1;
+        best = len2;
+      }
+    }
+    cand = (int64)e->ct[cand & cm];
+  }
+  return n;
+}
+
+// Price of a match of length ml at distance off after ll literals, with
+// repeat state rep. Also gives the repeat state after it in nrep.
+@inline fn match_price(e: PzsEnc*, st: OptState*, rep: uint32*, off: uint32, ml: int64, ll: int64, nrep: uint32*) -> int64 {
+  nrep[0] = rep[0];
+  nrep[1] = rep[1];
+  nrep[2] = rep[2];
+  var ob: uint32 = pzs_rep_update(nrep, off, ll);
+  return st->ofP[pzs_hb32(ob)] + st->mlP[mlcode(e, ml)];
+}
+
+// Relaxes the nodes reached from node cur by the n candidates. Returns
+// the new last position.
+fn relax(e: PzsEnc*, st: OptState*, cur: int64, n: int64, last0: int64) -> int64 {
+  var last: int64 = last0;
+  var from: Node* = &st->nodes[cur];
+  var base: int64 = from->price + ll_price(e, st, 0);
+  var nrep: uint32[3];
+  var minLen: int64 = 4;
+  for j in 0..n {
+    var off: uint32 = st->cands[j].off;
+    var top: int64 = (int64)st->cands[j].len;
+    var l: int64 = minLen;
+    while (l <= top) {
+      var pos: int64 = cur + l;
+      while (last < pos) { last = last + 1; st->nodes[last].price = INF; }
+      var pr: int64 = base + match_price(e, st, &from->rep[0], off, l, (int64)from->litlen, &nrep[0]);
+      if (pr < st->nodes[pos].price) {
+        var nd: Node* = &st->nodes[pos];
+        nd->price = pr;
+        nd->off = off;
+        nd->mlen = (uint32)l;
+        nd->litlen = 0;
+        nd->rep[0] = nrep[0];
+        nd->rep[1] = nrep[1];
+        nd->rep[2] = nrep[2];
+      }
+      l = l + 1;
+    }
+    minLen = top + 1;
+  }
+  return last;
+}
+
+// Walks back from node last, then stores the matches in order. ip is the
+// segment start; returns the new anchor.
+fn emit(e: PzsEnc*, st: OptState*, ip: int64, last: int64, anchor0: int64) -> int64 {
+  var np: int64 = 0;
+  var pos: int64 = last;
+  while (pos > 0) {
+    var nd: Node* = &st->nodes[pos];
+    if (nd->mlen > 0) {
+      st->path[np] = (uint32)pos;
+      np = np + 1;
+      pos = pos - (int64)nd->mlen;
+    } else {
+      pos = pos - 1;
+    }
+  }
+  var anchor: int64 = anchor0;
+  var k: int64 = np;
+  while (k > 0) {
+    k = k - 1;
+    var endp: int64 = (int64)st->path[k];
+    var nd2: Node* = &st->nodes[endp];
+    var ml: int64 = (int64)nd2->mlen;
+    var start: int64 = ip + endp - ml;
+    pzs_store(e, anchor, start - anchor, (int64)nd2->off, ml);
+    anchor = start + ml;
+  }
+  return anchor;
+}
+
+// One shortest-path search starting at ip, where the first matches are
+// already in st->cands. Returns how far it got (the segment length).
+fn segment(e: PzsEnc*, st: OptState*, ip: int64, n0: int64, end: int64, low: int64, ll0: int64, anchor: int64, newAnchor: int64*) -> int64 {
+  var ilimit: int64 = end - 8;
+  var suff: int64 = (int64)e->tlen;
+  var nd0: Node* = &st->nodes[0];
+  nd0->price = ll_price(e, st, ll0);
+  nd0->off = 0;
+  nd0->mlen = 0;
+  nd0->litlen = (uint32)ll0;
+  nd0->rep[0] = e->srep[0];
+  nd0->rep[1] = e->srep[1];
+  nd0->rep[2] = e->srep[2];
+  var last: int64 = relax(e, st, 0, n0, 0);
+  var cur: int64 = 1;
+  var done: bool = false;
+  var lateOff: uint32 = 0;
+  var lateLen: int64 = 0;
+  while (cur <= last && !done) {
+    // Reach cur with one more literal.
+    var pv: Node* = &st->nodes[cur - 1];
+    var nl: int64 = (int64)pv->litlen + 1;
+    var lp: int64 = pv->price + st->litP[e->b[ip + cur - 1]] + ll_price(e, st, nl) - ll_price(e, st, nl - 1);
+    var nc: Node* = &st->nodes[cur];
+    if (lp < nc->price) {
+      nc->price = lp;
+      nc->off = 0;
+      nc->mlen = 0;
+      nc->litlen = (uint32)nl;
+      nc->rep[0] = pv->rep[0];
+      nc->rep[1] = pv->rep[1];
+      nc->rep[2] = pv->rep[2];
+    }
+    if (cur < last && ip + cur < ilimit) {
+      var n: int64 = find_matches(e, st, ip + cur, end, low, &nc->rep[0], (int64)nc->litlen);
+      if (n > 0) {
+        var longest: int64 = (int64)st->cands[n - 1].len;
+        if (longest > suff || cur + longest >= OPT_NUM) {
+          // Take the long match right away: the path ends at cur.
+          lateOff = st->cands[n - 1].off;
+          lateLen = longest;
+          last = cur;
+          done = true;
+        } else {
+          last = relax(e, st, cur, n, last);
+        }
+      }
+    }
+    cur = cur + 1;
+  }
+  var a: int64 = emit(e, st, ip, last, anchor);
+  if (lateLen > 0) {
+    pzs_store(e, a, ip + last - a, (int64)lateOff, lateLen);
+    a = ip + last + lateLen;
+    last = last + lateLen;
+  }
+  *newAnchor = a;
+  return last;
+}
+
+/// Parses b[s .. end] with the optimal parser.
+export fn pzs_opt(e: PzsEnc*, s: int64, end: int64) {
+  if (e->opt == 0) {
+    e->opt = (uint8*)calloc(1, sizeof(OptState));
+    if (e->opt == 0) { pzs_lazy(e, s, end, 2); return; }
+  }
+  var st: OptState* = (OptState*)e->opt;
+  if (!st->valid) {
+    // First block: parse once to learn the statistics, then start over.
+    seed_stats(e, st, s, end);
+    prices(st);
+    opt_run(e, st, s, end);
+    learn_stats(e, st);
+    memset(e->ht, 0, e->hsize * 4);
+    memset(e->ct, 0, e->csize * 4);
+    e->next_up = 0;
+    e->nlit = 0;
+    e->nseq = 0;
+    e->srep[0] = e->rep[0];
+    e->srep[1] = e->rep[1];
+    e->srep[2] = e->rep[2];
+    st->valid = true;
+  }
+  prices(st);
+  opt_run(e, st, s, end);
+  learn_stats(e, st);
+}
+
+fn opt_run(e: PzsEnc*, st: OptState*, s: int64, end: int64) {
+  var low: int64 = end - e->window;
+  if (low < 0) { low = 0; }
+  var ip: int64 = s;
+  var anchor: int64 = s;
+  if (ip == 0) { ip = 1; }
+  var ilimit: int64 = end - 8;
+  if (e->next_up < low) { e->next_up = low; }
+  while (ip < ilimit) {
+    var n: int64 = find_matches(e, st, ip, end, low, &e->srep[0], ip - anchor);
+    if (n == 0) {
+      ip = ip + 1;
+    } else {
+      var longest: int64 = (int64)st->cands[n - 1].len;
+      if (longest > (int64)e->tlen) {
+        pzs_store(e, anchor, ip - anchor, (int64)st->cands[n - 1].off, longest);
+        ip = ip + longest;
+        anchor = ip;
+      } else {
+        var na: int64 = anchor;
+        var len: int64 = segment(e, st, ip, n, end, low, ip - anchor, anchor, &na);
+        ip = ip + len;
+        anchor = na;
+      }
+    }
+  }
+  pzs_store_last(e, anchor, end);
+}

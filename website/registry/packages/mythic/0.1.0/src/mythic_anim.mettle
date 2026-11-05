@@ -1,0 +1,142 @@
+// mythic_anim: smoothed and timed tweens keyed by hash(id, slot) (DECISIONS §4, DESIGN-SYSTEM §6).
+// MythicTween lives in mythic_ctx (MythicUi owns the tween map).
+import "mythic_base";
+import "mythic_types";
+import "mythic_ctx";
+
+// curves for mythic_anim_timed (DESIGN-SYSTEM §6.1)
+export const MYTHIC_CURVE_OUT: int32 = 0;
+export const MYTHIC_CURVE_OUT_STRONG: int32 = 1;
+export const MYTHIC_CURVE_IN_OUT: int32 = 2;
+export const MYTHIC_CURVE_LINEAR: int32 = 3;
+// reduced-motion class, OR'd into `slot` (Appendix C signatures have no flag parameter):
+// MOVE tweens go to 0 ms and COLOR tweens cap at 80 ms when theme.reduced_motion is set.
+export const MYTHIC_ANIM_MOVE: int32 = 65536;
+export const MYTHIC_ANIM_COLOR: int32 = 131072;
+
+fn pow_n(x: float32, n: int32) -> float32 { var r: float32 = 1.0; for i: int32 in 0..n { r = r * x; } return r; }
+
+/// Easing curves of DESIGN-SYSTEM §6.1; t is clamped to [0,1].
+export fn mythic_ease(curve: int32, t: float32) -> float32 {
+  var u: float32 = mythic_clampf(t, 0.0, 1.0);
+  if (curve == MYTHIC_CURVE_OUT) { return 1.0 - pow_n(1.0 - u, 3); }
+  if (curve == MYTHIC_CURVE_OUT_STRONG) { return 1.0 - pow_n(1.0 - u, 5); }
+  if (curve == MYTHIC_CURVE_IN_OUT) {
+    if (u < 0.5) { return 4.0 * u * u * u; }
+    return 1.0 - pow_n(-2.0 * u + 2.0, 3) / 2.0;
+  }
+  return u;
+}
+
+fn tween_get(ui: MythicUi*, id: uint64, slot: int32, target: float32, smooth: bool, snap: bool*) -> MythicTween* {
+  var tw: MythicTween* = mythic_map_get<MythicTween>(&ui->tweens, mythic_hash_u64(id, (uint64)slot), true);
+  // not touched in the previous frame (or new): snap, so appearing widgets never animate in
+  if (tw->last_frame == 0 || tw->last_frame < ui->frame - 1) {
+    tw->value = target; tw->from = target; tw->target = target; tw->t0_us = ui->time_us; tw->duration_ms = 0.0;
+    tw->last_frame = ui->frame;
+    *snap = true;
+    return tw;
+  }
+  if (tw->last_frame != ui->frame) {
+    if (smooth) { tw->from = tw->value; }
+    tw->last_frame = ui->frame;
+  }
+  *snap = false;
+  return tw;
+}
+
+fn keep_going(ui: MythicUi*) {
+  ui->anim_active = true;
+  mythic_request_frame_in(ui, 16);
+}
+
+/// Exponential approach (frame-rate independent, DESIGN-SYSTEM §6.1): tau_in_ms while the value
+/// rises, tau_out_ms while it falls; snaps when within 0.002. Requests frames until settled.
+/// Re-running a pass in the same frame recomputes from the frame's start value (no double step).
+export fn mythic_anim_smooth(ui: MythicUi*, id: uint64, slot: int32, target: float32, tau_in_ms: float32, tau_out_ms: float32) -> float32 {
+  var snap: bool = false;
+  var tw: MythicTween* = tween_get(ui, id, slot, target, true, &snap);
+  if (snap) { return target; }
+  var v: float32 = tw->from;
+  var tau: float32 = tau_out_ms;
+  if (target > v) { tau = tau_in_ms; }
+  var th: MythicTheme* = mythic_theme(ui);
+  if (mythic_reduced_motion(ui)) {
+    if ((slot & MYTHIC_ANIM_MOVE) != 0) { tau = 0.0; }
+    if ((slot & MYTHIC_ANIM_COLOR) != 0) { tau = mythic_minf(tau, th->motion.reduced_color_cap_ms / 3.0); }
+  }
+  if (tau <= 0.0) { v = target; }
+  else { v = v + (target - v) * (1.0 - mythic_expf(-(ui->dt * 1000.0) / tau)); }
+  if (mythic_absf(target - v) < 0.002) { v = target; } else { keep_going(ui); }
+  tw->value = v;
+  tw->target = target;
+  return v;
+}
+
+/// Timed transition with `curve`; a re-target mid-flight starts from the current value with
+/// duration D·|Δ| (DESIGN-SYSTEM §6.1).
+export fn mythic_anim_timed(ui: MythicUi*, id: uint64, slot: int32, target: float32, duration_ms: float32, curve: int32) -> float32 {
+  var snap: bool = false;
+  var tw: MythicTween* = tween_get(ui, id, slot, target, false, &snap);
+  if (snap) { return target; }
+  if (tw->target != target) {
+    var cur: float32 = tw->value;
+    var d: float32 = duration_ms;
+    var th: MythicTheme* = mythic_theme(ui);
+    if (mythic_reduced_motion(ui)) {
+      if ((slot & MYTHIC_ANIM_MOVE) != 0) { d = 0.0; }
+      if ((slot & MYTHIC_ANIM_COLOR) != 0) { d = mythic_minf(d, th->motion.reduced_color_cap_ms); }
+    }
+    d = d * mythic_minf(mythic_absf(target - cur), 1.0);
+    tw->from = cur;
+    tw->t0_us = ui->time_us;
+    tw->duration_ms = d;
+    tw->target = target;
+  }
+  var v: float32 = target;
+  if (tw->duration_ms > 0.0) {
+    var t: float32 = (float32)(ui->time_us - tw->t0_us) / (tw->duration_ms * 1000.0);
+    if (t < 1.0) {
+      v = tw->from + (target - tw->from) * mythic_ease(curve, t);
+      keep_going(ui);
+    }
+  }
+  tw->value = v;
+  return v;
+}
+
+/// 0..1 phase of a loop with `period_ms`; keeps frames coming while called.
+export fn mythic_anim_loop(ui: MythicUi*, period_ms: float32) -> float32 {
+  keep_going(ui);
+  if (period_ms <= 0.0) { return 0.0; }
+  var ms: float64 = (float64)ui->time_us / 1000.0;
+  var p: float64 = (float64)period_ms;
+  var ph: float64 = ms - p * (float64)(int64)(ms / p);
+  return (float32)(ph / p);
+}
+
+/// Sets a tween to `value` immediately (no animation), e.g. a slider thumb that follows a drag.
+export fn mythic_anim_set(ui: MythicUi*, id: uint64, slot: int32, value: float32) {
+  var tw: MythicTween* = mythic_map_get<MythicTween>(&ui->tweens, mythic_hash_u64(id, (uint64)slot), true);
+  tw->value = value; tw->from = value; tw->target = value; tw->t0_us = ui->time_us; tw->duration_ms = 0.0;
+  tw->last_frame = ui->frame;
+}
+
+// hover / press / keyboard-focus progress of one interactive widget (DESIGN-SYSTEM §6.2)
+export struct MythicStateAnim { hover: float32; press: float32; focus: float32; }
+
+/// Smoothed hover (slot 0), press (slot 1) and focus-ring (slot 2) values for the response `r`.
+export fn mythic_anim_states(ui: MythicUi*, id: uint64, r: MythicResp) -> MythicStateAnim {
+  var m: MythicMotion* = &mythic_theme(ui)->motion;
+  var ht: float32 = 0.0;
+  if (r.hovered || (r.pressed && ui->active_id == id)) { ht = 1.0; }
+  var pt: float32 = 0.0;
+  if (r.pressed && r.hovered) { pt = 1.0; }
+  var ft: float32 = 0.0;
+  if (mythic_focus_ring_on(ui, id)) { ft = 1.0; }
+  var o: MythicStateAnim;
+  o.hover = mythic_anim_smooth(ui, id, 0 | MYTHIC_ANIM_COLOR, ht, m->hover_in_tau, m->hover_out_tau);
+  o.press = mythic_anim_smooth(ui, id, 1 | MYTHIC_ANIM_COLOR, pt, m->press_in_tau, m->press_out_tau);
+  o.focus = mythic_anim_smooth(ui, id, 2 | MYTHIC_ANIM_COLOR, ft, m->focus_tau, m->focus_tau);
+  return o;
+}

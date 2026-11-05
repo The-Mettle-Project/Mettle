@@ -1,0 +1,162 @@
+// Gradients: linear, radial (two-point conical, as the HTML canvas
+// createRadialGradient defines) and sweep (conic). Colors between stops
+// are mixed in premultiplied form, as CSS Images 4 says, and looked up in
+// a 1024-entry table built once per gradient (the Blend2D approach).
+
+import "std/mem";
+import "../core/base";
+import "../core/color";
+import "../geom/transform";
+
+export const CANVAS_LINEAR: int32 = 1;
+export const CANVAS_RADIAL: int32 = 2;
+export const CANVAS_SWEEP: int32 = 3;
+
+/// How a gradient or pattern goes on past its ends.
+export const CANVAS_PAD: int32 = 0;       // the end colors carry on
+export const CANVAS_REPEAT: int32 = 1;    // it starts over
+export const CANVAS_REFLECT: int32 = 2;   // it runs back and forth
+export const CANVAS_DECAL: int32 = 3;     // patterns only: transparent outside
+
+export const CANVAS_LUT_SIZE: int32 = 1024;
+
+export struct CanvasStop { offset: float32; color: CanvasColor; }
+
+export struct CanvasGradient {
+  kind: int32;
+  x0: float32; y0: float32; r0: float32;   // start point / circle; sweep center
+  x1: float32; y1: float32; r1: float32;   // end point / circle
+  angle: float32;                          // sweep: start angle in radians
+  stops: CanvasStop*;
+  nstops: int32;
+  cap_stops: int32;
+  spread: int32;
+  m: CanvasTransform;                      // gradient space to user space
+  lut: uint32*;
+  lut_opacity: float32;
+  lut_ok: bool;
+}
+
+fn init(g: CanvasGradient*, kind: int32) {
+  memset(g, 0, sizeof(CanvasGradient));
+  g->kind = kind;
+  g->m = canvas_identity();
+  g->spread = CANVAS_PAD;
+}
+
+/// A linear gradient from (x0, y0) to (x1, y1).
+export fn canvas_linear_gradient(g: CanvasGradient*, x0: float32, y0: float32, x1: float32, y1: float32) {
+  init(g, CANVAS_LINEAR);
+  g->x0 = x0; g->y0 = y0; g->x1 = x1; g->y1 = y1;
+}
+
+/// A radial gradient between circle (x0, y0, r0) and circle (x1, y1, r1).
+export fn canvas_radial_gradient(g: CanvasGradient*, x0: float32, y0: float32, r0: float32, x1: float32, y1: float32, r1: float32) {
+  init(g, CANVAS_RADIAL);
+  g->x0 = x0; g->y0 = y0; g->r0 = canvas_maxf(r0, 0.0);
+  g->x1 = x1; g->y1 = y1; g->r1 = canvas_maxf(r1, 0.0);
+}
+
+/// A sweep (conic) gradient around (cx, cy), starting at angle radians
+/// and turning clockwise on screen, like the HTML canvas createConicGradient.
+export fn canvas_sweep_gradient(g: CanvasGradient*, cx: float32, cy: float32, angle: float32) {
+  init(g, CANVAS_SWEEP);
+  g->x0 = cx; g->y0 = cy; g->angle = angle;
+}
+
+/// Adds a color stop. Offsets are clamped to [0, 1] and never go below
+/// the previous stop's offset.
+export fn canvas_gradient_add_stop(g: CanvasGradient*, offset: float32, c: CanvasColor) -> int32 {
+  if (g->nstops >= g->cap_stops) {
+    var nc: int32 = g->cap_stops * 2;
+    if (nc < 4) { nc = 4; }
+    var p: CanvasStop* = (CanvasStop*)realloc(g->stops, (int64)nc * sizeof(CanvasStop));
+    if (p == 0) { return CANVAS_E_MEM; }
+    g->stops = p;
+    g->cap_stops = nc;
+  }
+  var o: float32 = canvas_clampf(offset, 0.0, 1.0);
+  if (!canvas_finite(offset)) { o = 0.0; }
+  if (g->nstops > 0 && o < g->stops[g->nstops - 1].offset) { o = g->stops[g->nstops - 1].offset; }
+  g->stops[g->nstops].offset = o;
+  g->stops[g->nstops].color = c;
+  g->nstops = g->nstops + 1;
+  g->lut_ok = false;
+  return CANVAS_OK;
+}
+
+/// Sets the spread mode (CANVAS_PAD, CANVAS_REPEAT or CANVAS_REFLECT).
+export fn canvas_gradient_spread(g: CanvasGradient*, spread: int32) {
+  g->spread = spread;
+}
+
+/// Sets the gradient's own transform (gradient space to user space).
+export fn canvas_gradient_transform(g: CanvasGradient*, m: CanvasTransform) {
+  g->m = m;
+}
+
+export fn canvas_gradient_free(g: CanvasGradient*) {
+  if (g->stops != 0) { free(g->stops); }
+  if (g->lut != 0) { free(g->lut); }
+  g->stops = (CanvasStop*)0;
+  g->lut = (uint32*)0;
+  g->nstops = 0;
+  g->cap_stops = 0;
+  g->lut_ok = false;
+}
+
+/// The color table for opacity, built when needed. 0 when out of memory.
+export fn canvas_gradient_lut(g: CanvasGradient*, opacity: float32) -> uint32* {
+  if (g->lut_ok && g->lut_opacity == opacity && g->lut != 0) { return g->lut; }
+  if (g->lut == 0) {
+    g->lut = (uint32*)malloc((int64)CANVAS_LUT_SIZE * 4);
+    if (g->lut == 0) { return (uint32*)0; }
+  }
+  var n: int32 = g->nstops;
+  var k: int32 = 0;
+  for i in 0..CANVAS_LUT_SIZE {
+    var t: float32 = (float32)i / (float32)(CANVAS_LUT_SIZE - 1);
+    var r: float32 = 0.0; var gg: float32 = 0.0; var b: float32 = 0.0; var a: float32 = 0.0;
+    if (n == 1 || (n > 1 && t <= g->stops[0].offset)) {
+      var c: CanvasColor = g->stops[0].color;
+      a = c.a * opacity; r = c.r * a; gg = c.g * a; b = c.b * a;
+    } else if (n > 1 && t >= g->stops[n - 1].offset) {
+      var c2: CanvasColor = g->stops[n - 1].color;
+      a = c2.a * opacity; r = c2.r * a; gg = c2.g * a; b = c2.b * a;
+    } else if (n > 1) {
+      while (k < n - 2 && t > g->stops[k + 1].offset) { k = k + 1; }
+      var s0: CanvasStop = g->stops[k];
+      var s1: CanvasStop = g->stops[k + 1];
+      var span: float32 = s1.offset - s0.offset;
+      var f: float32 = 0.0;
+      if (span > 0.0) { f = (t - s0.offset) / span; }
+      var a0: float32 = s0.color.a * opacity;
+      var a1: float32 = s1.color.a * opacity;
+      a = a0 + (a1 - a0) * f;
+      r = s0.color.r * a0 + (s1.color.r * a1 - s0.color.r * a0) * f;
+      gg = s0.color.g * a0 + (s1.color.g * a1 - s0.color.g * a0) * f;
+      b = s0.color.b * a0 + (s1.color.b * a1 - s0.color.b * a0) * f;
+    }
+    g->lut[i] = canvas_pm_pack(r, gg, b, a);
+  }
+  g->lut_opacity = opacity;
+  g->lut_ok = true;
+  return g->lut;
+}
+
+/// Maps a gradient position t through a spread mode into [0, 1].
+@inline export fn canvas_spread_t(t: float32, spread: int32) -> float32 {
+  if (spread == CANVAS_REPEAT) {
+    var f: float32 = t - (float32)canvas_floor_i(t);
+    return f;
+  }
+  if (spread == CANVAS_REFLECT) {
+    var u: float32 = t * 0.5;
+    var f2: float32 = (u - (float32)canvas_floor_i(u)) * 2.0;
+    if (f2 > 1.0) { f2 = 2.0 - f2; }
+    return f2;
+  }
+  if (t < 0.0) { return 0.0; }
+  if (t > 1.0) { return 1.0; }
+  return t;
+}

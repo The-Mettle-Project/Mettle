@@ -1,0 +1,93 @@
+// Errors carry where they happened: byte offset, line and column (both
+// counted from 1, columns in bytes), the record number and the field.
+
+import "std/conv";
+
+export const CSV_OK = 0;
+export const CSV_ERR_QUOTE = 1;          // quote inside an unquoted field (strict)
+export const CSV_ERR_AFTER_QUOTE = 2;    // data after a closing quote (strict)
+export const CSV_ERR_UNCLOSED = 3;       // quoted field not closed at end of input (strict)
+export const CSV_ERR_ESCAPE = 4;         // escape byte at end of input (strict)
+export const CSV_ERR_FIELD_COUNT = 5;    // record has a different number of fields
+export const CSV_ERR_UTF8 = 6;           // field is not valid UTF-8 (check_utf8)
+export const CSV_ERR_TOO_LARGE = 7;      // record longer than max_record
+export const CSV_ERR_IO = 8;             // read or write failed, or out of memory
+export const CSV_ERR_PARSE = 9;          // a field does not hold a value of the wanted type
+export const CSV_ERR_MISSING = 10;       // no such column, or the record is too short
+export const CSV_ERR_NO_HEADER = 11;     // mapping by name needs a header row
+
+export struct CsvError {
+  kind: int32;        // CSV_ERR_*, or CSV_OK
+  byte: int64;        // offset from the start of the input
+  line: int64;        // from 1
+  column: int64;      // from 1, in bytes
+  record: int64;      // record number from 1; a header is record 1
+  field: int32;       // field number from 1, 0 when not about one field
+  expected: int32;    // CSV_ERR_FIELD_COUNT: fields expected
+  got: int32;         // CSV_ERR_FIELD_COUNT: fields found
+}
+
+// A short description of an error kind.
+export fn csv_error_text(kind: int32) -> string {
+  switch (kind) {
+    case 0: { return "no error"; }
+    case 1: { return "quote inside an unquoted field"; }
+    case 2: { return "unexpected data after a closing quote"; }
+    case 3: { return "quoted field is not closed"; }
+    case 4: { return "escape character at end of input"; }
+    case 5: { return "wrong number of fields"; }
+    case 6: { return "field is not valid UTF-8"; }
+    case 7: { return "record is too large"; }
+    case 8: { return "input or output failed"; }
+    case 9: { return "field does not hold a value of the wanted type"; }
+    case 10: { return "missing field"; }
+    case 11: { return "no header row"; }
+    default: { return "unknown error"; }
+  }
+}
+
+fn put_str(buf: uint8*, cap: int64, at: int64, s: string) -> int64 {
+  for i in 0..(int64)s.length {
+    if (at < cap) { buf[at] = s.chars[i]; }
+    at = at + 1;
+  }
+  return at;
+}
+
+fn put_int(buf: uint8*, cap: int64, at: int64, v: int64) -> int64 {
+  var tmp: uint8[24];
+  var s: string = i64_to_str(v, &tmp[0], 24);
+  return put_str(buf, cap, at, s);
+}
+
+// Writes a one-line description into buf, for example
+// "line 3, column 7 (record 3, field 2): quote inside an unquoted field".
+// Returns a view of the text, cut short if buf is too small.
+export fn csv_error_format(e: CsvError, buf: uint8*, cap: int64) -> string {
+  var at: int64 = 0;
+  if (e.line > 0) {
+    at = put_str(buf, cap, at, "line ");
+    at = put_int(buf, cap, at, e.line);
+    at = put_str(buf, cap, at, ", column ");
+    at = put_int(buf, cap, at, e.column);
+    if (e.record > 0) {
+      at = put_str(buf, cap, at, " (record ");
+      at = put_int(buf, cap, at, e.record);
+      if (e.field > 0) {
+        at = put_str(buf, cap, at, ", field ");
+        at = put_int(buf, cap, at, (int64)e.field);
+      }
+      at = put_str(buf, cap, at, ")");
+    }
+    at = put_str(buf, cap, at, ": ");
+  }
+  at = put_str(buf, cap, at, csv_error_text(e.kind));
+  if (e.kind == CSV_ERR_FIELD_COUNT) {
+    at = put_str(buf, cap, at, ", expected ");
+    at = put_int(buf, cap, at, (int64)e.expected);
+    at = put_str(buf, cap, at, ", got ");
+    at = put_int(buf, cap, at, (int64)e.got);
+  }
+  if (at > cap) { at = cap; }
+  return str_from_bytes((cstring)buf, at);
+}

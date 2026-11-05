@@ -1,0 +1,791 @@
+// PNG and APNG. Decodes every color type and bit depth (1 to 16), palettes,
+// tRNS transparency and Adam7 interlacing, and APNG animations (composed
+// into whole frames). Encodes gray, gray+alpha, RGB and RGBA at 8 or 16 bits
+// with per-row filter choice. DEFLATE comes from Press.
+//
+// Output formats: gray and RGB stay gray and RGB; tRNS adds alpha; palette
+// images become RGB8 or RGBA8; bit depths below 8 are scaled to 8 bits; 16-bit
+// files give 16-bit formats in machine byte order.
+
+import "std/mem";
+import "press/core/status";
+import "press/core/buf";
+import "press/check/crc32";
+import "press/deflate/wrap";
+import "../core/status";
+import "../core/image";
+import "../core/buf";
+import "../core/anim";
+import "../ops/convert";
+import "common";
+
+/// True when the bytes start with the PNG signature.
+export fn etch_png_is(p: uint8*, n: int64) -> bool {
+  return n >= 8 && p[0] == 137 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G' &&
+    p[4] == 13 && p[5] == 10 && p[6] == 26 && p[7] == 10;
+}
+
+/// What the header and metadata chunks say.
+export struct EtchPngInfo {
+  width: int32;
+  height: int32;
+  depth: int32;        // bits per sample: 1, 2, 4, 8 or 16
+  color_type: int32;   // 0 gray, 2 RGB, 3 palette, 4 gray+alpha, 6 RGBA
+  interlaced: bool;
+  format: int32;       // the ETCH_* format etch_png_decode gives
+  gamma: int32;        // gAMA times 100000, or 0 when absent
+  srgb: bool;          // an sRGB chunk is present
+  frames: int32;       // APNG frame count from acTL, or 1
+  loops: int32;        // APNG play count (0 = forever)
+}
+
+struct PngFrame {
+  w: int64;
+  h: int64;
+  x: int64;
+  y: int64;
+  delay_ms: int32;
+  dispose: int32;
+  blend: int32;
+  data: EtchBuf;       // the frame's compressed data, joined
+}
+
+struct Png {
+  w: int64;
+  h: int64;
+  depth: int32;
+  ctype: int32;
+  interlace: int32;
+  pal: uint8[1024];    // RGBA
+  npal: int32;
+  has_trns: bool;
+  key: int32[3];       // tRNS color key, in sample units
+  gamma: int32;
+  srgb: bool;
+  idat: EtchBuf;
+  // APNG
+  anim: bool;
+  nframes: int64;
+  loops: int32;
+  default_is_frame: bool;
+  frames: PngFrame*;
+  count: int32;
+  fcap: int32;
+}
+
+fn png_free(s: Png*) {
+  etch_buf_free(&s->idat);
+  for i in 0..s->count { etch_buf_free(&s->frames[i].data); }
+  if (s->frames != 0) { free(s->frames); }
+  s->frames = (PngFrame*)0;
+  s->count = 0;
+}
+
+fn sample_channels(ctype: int32) -> int32 {
+  switch (ctype) {
+    case 0: { return 1; }
+    case 2: { return 3; }
+    case 3: { return 1; }
+    case 4: { return 2; }
+    case 6: { return 4; }
+    default: { }
+  }
+  return 0;
+}
+
+fn out_format(s: Png*) -> int32 {
+  var c: int32 = 0;
+  if (s->ctype == 3) {
+    if (s->has_trns) { return ETCH_RGBA8; }
+    return ETCH_RGB8;
+  }
+  c = sample_channels(s->ctype);
+  if (s->has_trns && (s->ctype == 0 || s->ctype == 2)) { c = c + 1; }
+  if (s->depth == 16) { return etch_format_make(c, ETCH_U16); }
+  return etch_format_make(c, ETCH_U8);
+}
+
+fn new_frame(s: Png*) -> PngFrame* {
+  if (s->count >= s->fcap) {
+    var nc: int32 = s->fcap * 2;
+    if (nc < 8) { nc = 8; }
+    var nf: PngFrame* = (PngFrame*)calloc((int64)nc, sizeof(PngFrame));
+    if (nf == 0) { return nf; }
+    if (s->frames != 0) {
+      memcpy(nf, s->frames, (int64)s->count * sizeof(PngFrame));
+      free(s->frames);
+    }
+    s->frames = nf;
+    s->fcap = nc;
+  }
+  var f: PngFrame* = s->frames + (int64)s->count;
+  memset(f, 0, sizeof(PngFrame));
+  s->count = s->count + 1;
+  return f;
+}
+
+fn is_letter(c: uint8) -> bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+fn chunk_is(t: uint8*, name: string) -> bool {
+  return t[0] == name.chars[0] && t[1] == name.chars[1] && t[2] == name.chars[2] && t[3] == name.chars[3];
+}
+
+// Reads every chunk. `want_anim` keeps APNG frame data.
+fn png_parse(p: uint8*, n: int64, s: Png*, want_anim: bool) -> int32 {
+  memset(s, 0, sizeof(Png));
+  if (p == 0 || n < 0) { return ETCH_E_ARG; }
+  if (n < 8) { return ETCH_E_TRUNC; }
+  if (!etch_png_is(p, n)) { return ETCH_E_DATA; }
+  for i in 0..256 { s->pal[i * 4 + 3] = 255; }
+  var pos: int64 = 8;
+  var seen_ihdr: bool = false;
+  var seen_plte: bool = false;
+  var seen_idat: bool = false;
+  var idat_done: bool = false;     // a non-IDAT chunk came after IDAT
+  var seen_iend: bool = false;
+  var cur: PngFrame* = (PngFrame*)0;
+  var next_seq: int64 = 0;
+  while (pos + 12 <= n) {
+    var len: int64 = (int64)etch_get_u32be(p + pos);
+    var t: uint8* = p + pos + 4;
+    if (len > 2147483647) { return ETCH_E_DATA; }
+    if (!is_letter(t[0]) || !is_letter(t[1]) || !is_letter(t[2]) || !is_letter(t[3])) { return ETCH_E_DATA; }
+    if (pos + 12 + len > n) { return ETCH_E_TRUNC; }
+    var d: uint8* = p + pos + 8;
+    var critical: bool = (t[0] & 32) == 0;
+    var crc: uint32 = press_crc32(0, t, len + 4);
+    pos = pos + 12 + len;
+    if (crc != etch_get_u32be(d + len)) {
+      if (critical) { return ETCH_E_CHECK; }
+      continue;       // a damaged extra chunk is dropped
+    }
+    if (!seen_ihdr) {
+      if (!chunk_is(t, "IHDR") || len != 13) { return ETCH_E_DATA; }
+      seen_ihdr = true;
+      s->w = (int64)etch_get_u32be(d);
+      s->h = (int64)etch_get_u32be(d + 4);
+      s->depth = (int32)d[8];
+      s->ctype = (int32)d[9];
+      s->interlace = (int32)d[12];
+      if (s->w == 0 || s->h == 0 || s->w > 2147483647 || s->h > 2147483647) { return ETCH_E_DATA; }
+      if (d[10] != 0 || d[11] != 0 || s->interlace > 1) { return ETCH_E_DATA; }
+      var dp: int32 = s->depth;
+      var ok: bool = false;
+      switch (s->ctype) {
+        case 0: { ok = dp == 1 || dp == 2 || dp == 4 || dp == 8 || dp == 16; }
+        case 3: { ok = dp == 1 || dp == 2 || dp == 4 || dp == 8; }
+        case 2: { ok = dp == 8 || dp == 16; }
+        case 4: { ok = dp == 8 || dp == 16; }
+        case 6: { ok = dp == 8 || dp == 16; }
+        default: { }
+      }
+      if (!ok) { return ETCH_E_DATA; }
+      continue;
+    }
+    var is_idat: bool = chunk_is(t, "IDAT");
+    if (seen_idat && !is_idat) { idat_done = true; }
+    if (is_idat) {
+      if (idat_done) { return ETCH_E_DATA; }
+      if (s->ctype == 3 && !seen_plte) { return ETCH_E_DATA; }
+      seen_idat = true;
+      var rc: int32 = etch_buf_append(&s->idat, d, len);
+      if (rc != ETCH_OK) { return rc; }
+    } else if (chunk_is(t, "IEND")) {
+      seen_iend = true;
+      break;
+    } else if (chunk_is(t, "PLTE")) {
+      if (seen_plte || seen_idat || len % 3 != 0 || len == 0 || len > 768) { return ETCH_E_DATA; }
+      seen_plte = true;
+      s->npal = (int32)(len / 3);
+      for i in 0..(int64)s->npal {
+        s->pal[i * 4] = d[i * 3];
+        s->pal[i * 4 + 1] = d[i * 3 + 1];
+        s->pal[i * 4 + 2] = d[i * 3 + 2];
+      }
+    } else if (chunk_is(t, "tRNS")) {
+      if (seen_idat) { continue; }
+      if (s->ctype == 3) {
+        if (len > 256) { continue; }
+        for i in 0..len { s->pal[i * 4 + 3] = d[i]; }
+        s->has_trns = true;
+      } else if (s->ctype == 0 && len == 2) {
+        s->key[0] = ((int32)d[0] << 8) | (int32)d[1];
+        s->has_trns = true;
+      } else if (s->ctype == 2 && len == 6) {
+        for k in 0..3 { s->key[k] = ((int32)d[k * 2] << 8) | (int32)d[k * 2 + 1]; }
+        s->has_trns = true;
+      }
+    } else if (chunk_is(t, "gAMA")) {
+      if (len == 4) { s->gamma = (int32)etch_get_u32be(d); }
+    } else if (chunk_is(t, "sRGB")) {
+      s->srgb = true;
+    } else if (chunk_is(t, "acTL")) {
+      if (len == 8 && !seen_idat) {
+        s->anim = true;
+        s->nframes = (int64)etch_get_u32be(d);
+        s->loops = (int32)etch_get_u32be(d + 4);
+        if (s->nframes == 0) { s->anim = false; }
+      }
+    } else if (chunk_is(t, "fcTL")) {
+      if (!s->anim || len != 26) { continue; }
+      if ((int64)etch_get_u32be(d) != next_seq) { s->anim = false; continue; }
+      next_seq = next_seq + 1;
+      if (!want_anim) { continue; }
+      if ((int64)s->count >= s->nframes) { continue; }
+      cur = new_frame(s);
+      if (cur == 0) { return ETCH_E_MEM; }
+      cur->w = (int64)etch_get_u32be(d + 4);
+      cur->h = (int64)etch_get_u32be(d + 8);
+      cur->x = (int64)etch_get_u32be(d + 12);
+      cur->y = (int64)etch_get_u32be(d + 16);
+      var num: int64 = ((int64)d[20] << 8) | (int64)d[21];
+      var den: int64 = ((int64)d[22] << 8) | (int64)d[23];
+      if (den == 0) { den = 100; }
+      cur->delay_ms = (int32)(num * 1000 / den);
+      cur->dispose = (int32)d[24];
+      cur->blend = (int32)d[25];
+      if (!seen_idat) { s->default_is_frame = true; }
+      if (cur->w == 0 || cur->h == 0 || cur->x + cur->w > s->w || cur->y + cur->h > s->h ||
+          cur->dispose > 2 || cur->blend > 1) {
+        s->anim = false;    // a broken animation: show the still image
+      }
+    } else if (chunk_is(t, "fdAT")) {
+      if (!s->anim || len < 4) { continue; }
+      if ((int64)etch_get_u32be(d) != next_seq) { s->anim = false; continue; }
+      next_seq = next_seq + 1;
+      if (!want_anim || cur == 0) { continue; }
+      var rc2: int32 = etch_buf_append(&cur->data, d + 4, len - 4);
+      if (rc2 != ETCH_OK) { return rc2; }
+    } else if (critical) {
+      return ETCH_E_UNSUPPORTED;
+    }
+  }
+  if (!seen_ihdr) { return ETCH_E_TRUNC; }
+  if (!seen_idat) {
+    if (seen_iend) { return ETCH_E_DATA; }
+    return ETCH_E_TRUNC;
+  }
+  return ETCH_OK;
+}
+
+// The Paeth predictor without branches: masks pick a, b or c, so mixed
+// image content does not cost branch misses.
+@inline fn paeth_pred(a: int32, b: int32, c: int32) -> int32 {
+  var p: int32 = b - c;
+  var q: int32 = a - c;
+  var r: int32 = p + q;
+  var sp: int32 = p >> 31;
+  var sq: int32 = q >> 31;
+  var sr: int32 = r >> 31;
+  var pa: int32 = (p ^ sp) - sp;
+  var pb: int32 = (q ^ sq) - sq;
+  var pc: int32 = (r ^ sr) - sr;
+  var use_c: int32 = (pc - pb) >> 31;                 // all ones when pb > pc
+  var bc: int32 = b ^ ((b ^ c) & use_c);
+  var not_a: int32 = ((pb - pa) | (pc - pa)) >> 31;   // all ones when pa > pb or pa > pc
+  return a ^ ((a ^ bc) & not_a);
+}
+
+// Undoes one row's filter in place. prev is the row above (zeros at the top).
+fn unfilter(f: int32, cur: uint8*, prev: uint8*, n: int64, bpp: int64) -> bool {
+  if (f == 0) { return true; }
+  if (f == 1) {
+    for i in bpp..n { cur[i] = (uint8)((int32)cur[i] + (int32)cur[i - bpp]); }
+    return true;
+  }
+  if (f == 2) {
+    for i in 0..n { cur[i] = (uint8)((int32)cur[i] + (int32)prev[i]); }
+    return true;
+  }
+  if (f == 3) {
+    var k: int64 = bpp;
+    if (k > n) { k = n; }
+    for i in 0..k { cur[i] = (uint8)((int32)cur[i] + ((int32)prev[i] >> 1)); }
+    for i in bpp..n { cur[i] = (uint8)((int32)cur[i] + (((int32)cur[i - bpp] + (int32)prev[i]) >> 1)); }
+    return true;
+  }
+  if (f == 4) {
+    var k: int64 = bpp;
+    if (k > n) { k = n; }
+    for i in 0..k { cur[i] = (uint8)((int32)cur[i] + (int32)prev[i]); }
+    for i in bpp..n {
+      var pred: int32 = paeth_pred((int32)cur[i - bpp], (int32)prev[i], (int32)prev[i - bpp]);
+      cur[i] = (uint8)((int32)cur[i] + pred);
+    }
+    return true;
+  }
+  return false;
+}
+
+// Turns one unfiltered row of w samples into w pixels of fmt at dst.
+fn expand_row(s: Png*, r: uint8*, w: int64, fmt: int32, dst: uint8*) {
+  var ch: int64 = (int64)sample_channels(s->ctype);
+  var oc: int64 = (int64)(fmt & 7);
+  var dp: int32 = s->depth;
+  if (dp == 16) {
+    var d16: uint16* = (uint16*)dst;
+    for x in 0..w {
+      var q: uint8* = r + x * ch * 2;
+      var o: uint16* = d16 + x * oc;
+      for k in 0..ch { o[k] = (uint16)(((int32)q[k * 2] << 8) | (int32)q[k * 2 + 1]); }
+      if (oc > ch) {
+        var clear: bool = false;
+        if (ch == 1) { clear = (int32)o[0] == s->key[0]; }
+        else { clear = (int32)o[0] == s->key[0] && (int32)o[1] == s->key[1] && (int32)o[2] == s->key[2]; }
+        if (clear) { o[ch] = 0; } else { o[ch] = 65535; }
+      }
+    }
+    return;
+  }
+  if (s->ctype == 3) {
+    var mask: int32 = (1 << dp) - 1;
+    for x in 0..w {
+      var idx: int64 = 0;
+      if (dp == 8) { idx = (int64)r[x]; }
+      else {
+        var bit: int64 = x * (int64)dp;
+        idx = (int64)(((int32)r[bit >> 3] >> (8 - dp - (int32)(bit & 7))) & mask);
+      }
+      var pe: uint8* = &s->pal[0] + idx * 4;
+      var o: uint8* = dst + x * oc;
+      o[0] = pe[0]; o[1] = pe[1]; o[2] = pe[2];
+      if (oc == 4) { o[3] = pe[3]; }
+    }
+    return;
+  }
+  if (dp < 8) {
+    var mask: int32 = (1 << dp) - 1;
+    var scale: int32 = 255 / mask;
+    for x in 0..w {
+      var bit: int64 = x * (int64)dp;
+      var v: int32 = ((int32)r[bit >> 3] >> (8 - dp - (int32)(bit & 7))) & mask;
+      var o: uint8* = dst + x * oc;
+      o[0] = (uint8)(v * scale);
+      if (oc == 2) {
+        if (v == s->key[0]) { o[1] = 0; } else { o[1] = 255; }
+      }
+    }
+    return;
+  }
+  if (oc == ch) { memcpy(dst, r, w * ch); return; }
+  for x in 0..w {
+    var q: uint8* = r + x * ch;
+    var o: uint8* = dst + x * oc;
+    var clear: bool = false;
+    if (ch == 1) {
+      o[0] = q[0];
+      clear = (int32)q[0] == s->key[0];
+    } else {
+      o[0] = q[0]; o[1] = q[1]; o[2] = q[2];
+      clear = (int32)q[0] == s->key[0] && (int32)q[1] == s->key[1] && (int32)q[2] == s->key[2];
+    }
+    if (clear) { o[ch] = 0; } else { o[ch] = 255; }
+  }
+}
+
+fn map_press(rc: int32) -> int32 {
+  if (rc == PRESS_E_TRUNC) { return ETCH_E_TRUNC; }
+  if (rc == PRESS_E_CHECK) { return ETCH_E_CHECK; }
+  if (rc == PRESS_E_MEM) { return ETCH_E_MEM; }
+  if (rc == PRESS_E_LIMIT) { return ETCH_E_DATA; }
+  if (rc == PRESS_E_UNSUPPORTED) { return ETCH_E_UNSUPPORTED; }
+  return ETCH_E_DATA;
+}
+
+// Adam7 pass layout: x0, y0, dx, dy for each of the 7 passes.
+const ADAM7: int32[28] = [0, 0, 8, 8, 4, 0, 8, 8, 0, 4, 4, 8, 2, 0, 4, 4, 0, 2, 2, 4, 1, 0, 2, 2, 0, 1, 1, 2];
+
+// Decodes compressed image data for a w x h picture into img (allocated
+// here, in fmt).
+fn png_pixels(s: Png*, z: uint8*, zn: int64, w: int64, h: int64, fmt: int32, o: EtchOpts*, img: EtchImage*) -> int32 {
+  var rc: int32 = etch_alloc_checked(img, w, h, fmt, o);
+  if (rc != ETCH_OK) { return rc; }
+  var ch: int64 = (int64)sample_channels(s->ctype);
+  var bits: int64 = ch * (int64)s->depth;
+  var fbpp: int64 = (bits + 7) / 8;
+  var passes: int32 = 1;
+  if (s->interlace == 1) { passes = 7; }
+  // Size of the raw data for all passes.
+  var total: int64 = 0;
+  for pi in 0..passes {
+    var x0: int64 = 0;
+    var y0: int64 = 0;
+    var dx: int64 = 1;
+    var dy: int64 = 1;
+    if (passes == 7) {
+      x0 = (int64)ADAM7[pi * 4]; y0 = (int64)ADAM7[pi * 4 + 1];
+      dx = (int64)ADAM7[pi * 4 + 2]; dy = (int64)ADAM7[pi * 4 + 3];
+    }
+    var pw: int64 = (w - x0 + dx - 1) / dx;
+    var ph: int64 = (h - y0 + dy - 1) / dy;
+    if (pw > 0 && ph > 0) { total = total + ph * (1 + (pw * bits + 7) / 8); }
+  }
+  var raw: PressBuf;
+  memset(&raw, 0, sizeof(PressBuf));
+  raw.limit = total;
+  // the exact size is known, so allocate once instead of growing
+  var prc: int32 = press_buf_reserve(&raw, total);
+  if (prc == PRESS_OK) { prc = press_zlib_decompress(z, zn, &raw); }
+  if (prc != PRESS_OK && !(prc == PRESS_E_LIMIT && raw.len == total)) {
+    press_buf_free(&raw);
+    etch_image_free(img);
+    return map_press(prc);
+  }
+  if (raw.len < total) {
+    press_buf_free(&raw);
+    etch_image_free(img);
+    return ETCH_E_TRUNC;
+  }
+  var obpp: int64 = (int64)etch_format_bpp(fmt);
+  var maxrow: int64 = (w * bits + 7) / 8;
+  var zero: uint8* = (uint8*)calloc(maxrow + 8, 1);
+  var tmp: uint8* = (uint8*)malloc(w * obpp + 8);
+  if (zero == 0 || tmp == 0) {
+    if (zero != 0) { free(zero); }
+    if (tmp != 0) { free(tmp); }
+    press_buf_free(&raw);
+    etch_image_free(img);
+    return ETCH_E_MEM;
+  }
+  var pos: int64 = 0;
+  rc = ETCH_OK;
+  for pi in 0..passes {
+    var x0: int64 = 0;
+    var y0: int64 = 0;
+    var dx: int64 = 1;
+    var dy: int64 = 1;
+    if (passes == 7) {
+      x0 = (int64)ADAM7[pi * 4]; y0 = (int64)ADAM7[pi * 4 + 1];
+      dx = (int64)ADAM7[pi * 4 + 2]; dy = (int64)ADAM7[pi * 4 + 3];
+    }
+    var pw: int64 = (w - x0 + dx - 1) / dx;
+    var ph: int64 = (h - y0 + dy - 1) / dy;
+    if (pw <= 0 || ph <= 0) { continue; }
+    var rb: int64 = (pw * bits + 7) / 8;
+    var prev: uint8* = zero;
+    for ry in 0..ph {
+      var f: int32 = (int32)raw.data[pos];
+      var cur: uint8* = raw.data + pos + 1;
+      if (!unfilter(f, cur, prev, rb, fbpp)) { rc = ETCH_E_DATA; break; }
+      var y: int64 = y0 + ry * dy;
+      var drow: uint8* = img->data + y * img->stride;
+      if (dx == 1) {
+        expand_row(s, cur, pw, fmt, drow);
+      } else {
+        expand_row(s, cur, pw, fmt, tmp);
+        for k in 0..pw { memcpy(drow + (x0 + k * dx) * obpp, tmp + k * obpp, obpp); }
+      }
+      prev = cur;
+      pos = pos + 1 + rb;
+    }
+    if (rc != ETCH_OK) { break; }
+  }
+  free(zero);
+  free(tmp);
+  press_buf_free(&raw);
+  if (rc != ETCH_OK) { etch_image_free(img); }
+  return rc;
+}
+
+/// Reads the header and metadata without decoding pixels.
+export fn etch_png_info(p: uint8*, n: int64, info: EtchPngInfo*) -> int32 {
+  if (info == 0) { return ETCH_E_ARG; }
+  var s: Png;
+  var rc: int32 = png_parse(p, n, &s, false);
+  if (rc == ETCH_OK) {
+    info->width = (int32)s.w;
+    info->height = (int32)s.h;
+    info->depth = s.depth;
+    info->color_type = s.ctype;
+    info->interlaced = s.interlace == 1;
+    info->format = out_format(&s);
+    info->gamma = s.gamma;
+    info->srgb = s.srgb;
+    info->frames = 1;
+    info->loops = 0;
+    if (s.anim) { info->frames = (int32)s.nframes; info->loops = s.loops; }
+  }
+  png_free(&s);
+  return rc;
+}
+
+/// Decodes a PNG file (for an APNG, its still image).
+export fn etch_png_decode(p: uint8*, n: int64, out: EtchImage*, o: EtchOpts*) -> int32 {
+  if (out == 0) { return ETCH_E_ARG; }
+  var s: Png;
+  var rc: int32 = png_parse(p, n, &s, false);
+  if (rc == ETCH_OK) {
+    rc = etch_check_size(s.w, s.h, out_format(&s), etch_opts_limits(o));
+  }
+  if (rc == ETCH_OK) {
+    rc = png_pixels(&s, s.idat.data, s.idat.len, s.w, s.h, out_format(&s), o, out);
+  }
+  png_free(&s);
+  if (rc != ETCH_OK) { return rc; }
+  return etch_finish(out, o);
+}
+
+// Draws frame pixels f (canvas format) onto canvas at x, y.
+fn compose(canvas: EtchImage*, f: EtchImage*, x: int64, y: int64, over: bool) {
+  var wide: bool = canvas->format == ETCH_RGBA16;
+  var w: int64 = (int64)f->width;
+  for r in 0..(int64)f->height {
+    var s: uint8* = f->data + r * f->stride;
+    var d: uint8* = canvas->data + (y + r) * canvas->stride;
+    if (!over) {
+      memcpy(d + x * (int64)etch_format_bpp(canvas->format), s, f->stride);
+      continue;
+    }
+    if (!wide) {
+      var dd: uint8* = d + x * 4;
+      for i in 0..w {
+        var sa: int32 = (int32)s[i * 4 + 3];
+        if (sa == 255) {
+          dd[i * 4] = s[i * 4]; dd[i * 4 + 1] = s[i * 4 + 1]; dd[i * 4 + 2] = s[i * 4 + 2]; dd[i * 4 + 3] = 255;
+        } else if (sa != 0) {
+          var da: int32 = (int32)dd[i * 4 + 3];
+          var ia: int32 = (da * (255 - sa) + 127) / 255;   // what shows through
+          var oa: int32 = sa + ia;
+          for k in 0..3 {
+            var v: int32 = ((int32)s[i * 4 + k] * sa + (int32)dd[i * 4 + k] * ia + oa / 2) / oa;
+            dd[i * 4 + k] = (uint8)v;
+          }
+          dd[i * 4 + 3] = (uint8)oa;
+        }
+      }
+    } else {
+      var s16: uint16* = (uint16*)s;
+      var d16: uint16* = (uint16*)d + x * 4;
+      for i in 0..w {
+        var sa: int64 = (int64)s16[i * 4 + 3];
+        if (sa == 65535) {
+          for k in 0..4 { d16[i * 4 + k] = s16[i * 4 + k]; }
+        } else if (sa != 0) {
+          var da: int64 = (int64)d16[i * 4 + 3];
+          var ia: int64 = (da * (65535 - sa) + 32767) / 65535;
+          var oa: int64 = sa + ia;
+          for k in 0..3 {
+            d16[i * 4 + k] = (uint16)(((int64)s16[i * 4 + k] * sa + (int64)d16[i * 4 + k] * ia + oa / 2) / oa);
+          }
+          d16[i * 4 + 3] = (uint16)oa;
+        }
+      }
+    }
+  }
+}
+
+fn clear_rect(img: EtchImage*, x: int64, y: int64, w: int64, h: int64) {
+  var bpp: int64 = (int64)etch_format_bpp(img->format);
+  for r in 0..h { memset(img->data + (y + r) * img->stride + x * bpp, 0, w * bpp); }
+}
+
+/// Decodes every frame of an APNG, composed onto the canvas, as RGBA8 (or
+/// RGBA16 for 16-bit files; opts->want converts each frame). A plain PNG
+/// gives one frame.
+export fn etch_png_decode_anim(p: uint8*, n: int64, a: EtchAnim*, o: EtchOpts*) -> int32 {
+  if (a == 0) { return ETCH_E_ARG; }
+  memset(a, 0, sizeof(EtchAnim));
+  var s: Png;
+  var rc: int32 = png_parse(p, n, &s, true);
+  if (rc != ETCH_OK) { png_free(&s); return rc; }
+  var nat: int32 = out_format(&s);
+  rc = etch_check_size(s.w, s.h, ETCH_RGBA16, etch_opts_limits(o));
+  if (rc != ETCH_OK) { png_free(&s); return rc; }
+  a->width = (int32)s.w;
+  a->height = (int32)s.h;
+  a->loops = s.loops;
+  if (!s.anim || s.count == 0) {
+    var still: EtchImage;
+    rc = png_pixels(&s, s.idat.data, s.idat.len, s.w, s.h, nat, o, &still);
+    png_free(&s);
+    if (rc == ETCH_OK) { rc = etch_finish(&still, o); }
+    if (rc == ETCH_OK) { rc = etch_anim_push(a, &still, 0); }
+    if (rc != ETCH_OK) { etch_image_free(&still); }
+    return rc;
+  }
+  var cfmt: int32 = ETCH_RGBA8;
+  if (s.depth == 16) { cfmt = ETCH_RGBA16; }
+  var canvas: EtchImage;
+  rc = etch_image_new(&canvas, (int32)s.w, (int32)s.h, cfmt);
+  var saved: EtchImage;
+  var have_saved: bool = false;
+  for fi in 0..s.count {
+    if (rc != ETCH_OK) { break; }
+    var f: PngFrame* = s.frames + (int64)fi;
+    var z: uint8* = f->data.data;
+    var zn: int64 = f->data.len;
+    if (fi == 0 && s.default_is_frame) { z = s.idat.data; zn = s.idat.len; }
+    if (fi == 0 && s.default_is_frame && (f->w != s.w || f->h != s.h || f->x != 0 || f->y != 0)) {
+      rc = ETCH_E_DATA;
+      break;
+    }
+    var px: EtchImage;
+    rc = png_pixels(&s, z, zn, f->w, f->h, nat, o, &px);
+    if (rc != ETCH_OK) { break; }
+    rc = etch_convert_self(&px, cfmt);
+    if (rc != ETCH_OK) { etch_image_free(&px); break; }
+    var dispose: int32 = f->dispose;
+    if (fi == 0 && dispose == 2) { dispose = 1; }
+    if (dispose == 2) {
+      if (have_saved) { etch_image_free(&saved); have_saved = false; }
+      var region: EtchImage;
+      etch_image_view(&canvas, (int32)f->x, (int32)f->y, (int32)f->w, (int32)f->h, &region);
+      rc = etch_image_copy(&region, &saved);
+      if (rc != ETCH_OK) { etch_image_free(&px); break; }
+      have_saved = true;
+    }
+    if (fi == 0) { clear_rect(&canvas, 0, 0, s.w, s.h); }
+    compose(&canvas, &px, f->x, f->y, f->blend == 1);
+    etch_image_free(&px);
+    var shot: EtchImage;
+    rc = etch_image_copy(&canvas, &shot);
+    if (rc == ETCH_OK && o != 0 && o->want != 0) { rc = etch_finish(&shot, o); }
+    if (rc == ETCH_OK) { rc = etch_anim_push(a, &shot, f->delay_ms); }
+    if (rc != ETCH_OK) { break; }
+    if (dispose == 1) {
+      clear_rect(&canvas, f->x, f->y, f->w, f->h);
+    } else if (dispose == 2 && have_saved) {
+      compose(&canvas, &saved, f->x, f->y, false);
+    }
+  }
+  if (have_saved) { etch_image_free(&saved); }
+  etch_image_free(&canvas);
+  png_free(&s);
+  if (rc != ETCH_OK) { etch_anim_free(a); }
+  return rc;
+}
+
+// ---- encoder ----
+
+fn put_chunk(out: EtchBuf*, name: string, d: uint8*, len: int64) -> int32 {
+  var rc: int32 = etch_buf_reserve(out, len + 12);
+  if (rc != ETCH_OK) { return rc; }
+  etch_buf_u32be(out, len);
+  var t: int64 = out->len;
+  etch_buf_append(out, name.chars, 4);
+  etch_buf_append(out, d, len);
+  var crc: uint32 = press_crc32(0, out->data + t, len + 4);
+  return etch_buf_u32be(out, (int64)crc);
+}
+
+fn filter_row(f: int32, cur: uint8*, prev: uint8*, n: int64, bpp: int64, o: uint8*) {
+  o[0] = (uint8)f;
+  var d: uint8* = o + 1;
+  for i in 0..n {
+    var a: int32 = 0;
+    var c: int32 = 0;
+    if (i >= bpp) { a = (int32)cur[i - bpp]; c = (int32)prev[i - bpp]; }
+    var b: int32 = (int32)prev[i];
+    var pred: int32 = 0;
+    if (f == 1) { pred = a; }
+    else if (f == 2) { pred = b; }
+    else if (f == 3) { pred = (a + b) >> 1; }
+    else if (f == 4) { pred = paeth_pred(a, b, c); }
+    d[i] = (uint8)((int32)cur[i] - pred);
+  }
+}
+
+fn row_cost(d: uint8*, n: int64) -> int64 {
+  var s: int64 = 0;
+  for i in 0..n {
+    var v: int64 = (int64)d[i];
+    if (v >= 128) { v = 256 - v; }
+    s = s + v;
+  }
+  return s;
+}
+
+/// Encodes an image as PNG. Integer formats keep their channels and depth;
+/// float formats become 16-bit. level is the DEFLATE level, 0 (store) to 9
+/// (smallest), or -1 for the default (6).
+export fn etch_png_encode(src: EtchImage*, out: EtchBuf*, level: int32) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0 || !etch_format_ok(src->format)) { return ETCH_E_ARG; }
+  if (level < -1 || level > 9) { return ETCH_E_ARG; }
+  var img: EtchImage = *src;
+  var conv: bool = false;
+  var rc: int32 = ETCH_OK;
+  if ((src->format >> 4) == ETCH_F32) {
+    rc = etch_convert(src, etch_format_make(src->format & 7, ETCH_U16), &img);
+    if (rc != ETCH_OK) { return rc; }
+    conv = true;
+  }
+  var ch: int64 = (int64)(img.format & 7);
+  var depth: int64 = 8;
+  if ((img.format >> 4) == ETCH_U16) { depth = 16; }
+  var ctype: int32 = 0;
+  if (ch == 2) { ctype = 4; } else if (ch == 3) { ctype = 2; } else if (ch == 4) { ctype = 6; }
+  var w: int64 = (int64)img.width;
+  var h: int64 = (int64)img.height;
+  var bpp: int64 = ch * depth / 8;
+  var rb: int64 = w * bpp;
+  var raw: uint8* = (uint8*)malloc((rb + 1) * h);
+  var rowbuf: uint8* = (uint8*)malloc(rb * 2 + 16);
+  var trial: uint8* = (uint8*)malloc((rb + 1) * 2);
+  var zero: uint8* = (uint8*)calloc(rb + 1, 1);
+  if (raw == 0 || rowbuf == 0 || trial == 0 || zero == 0) {
+    if (raw != 0) { free(raw); }
+    if (rowbuf != 0) { free(rowbuf); }
+    if (trial != 0) { free(trial); }
+    if (zero != 0) { free(zero); }
+    if (conv) { etch_image_free(&img); }
+    return ETCH_E_MEM;
+  }
+  var bufa: uint8* = rowbuf;
+  var bufb: uint8* = rowbuf + rb + 8;
+  var cur: uint8* = bufa;
+  var prev: uint8* = zero;
+  for y in 0..h {
+    var s: uint8* = img.data + y * img.stride;
+    if (depth == 16) {
+      var s16: uint16* = (uint16*)s;
+      for i in 0..(w * ch) { cur[i * 2] = (uint8)(s16[i] >> 8); cur[i * 2 + 1] = (uint8)s16[i]; }
+    } else {
+      memcpy(cur, s, rb);
+    }
+    var dst: uint8* = raw + y * (rb + 1);
+    if (level == 0) {
+      filter_row(0, cur, prev, rb, bpp, dst);
+    } else {
+      // Pick the filter with the smallest sum of absolute values.
+      var best: int64 = -1;
+      for f in 0..5 {
+        var t: uint8* = trial + (int64)(f & 1) * (rb + 1);
+        filter_row(f, cur, prev, rb, bpp, t);
+        var cost: int64 = row_cost(t + 1, rb);
+        if (best < 0 || cost < best) { best = cost; memcpy(dst, t, rb + 1); }
+      }
+    }
+    prev = cur;
+    if (cur == bufa) { cur = bufb; } else { cur = bufa; }
+  }
+  free(rowbuf);
+  free(trial);
+  free(zero);
+  if (conv) { etch_image_free(&img); }
+  var z: PressBuf;
+  memset(&z, 0, sizeof(PressBuf));
+  var prc: int32 = press_zlib_compress(raw, (rb + 1) * h, level, &z);
+  free(raw);
+  if (prc != PRESS_OK) { press_buf_free(&z); return ETCH_E_MEM; }
+  var sig: uint8[8] = [137, 80, 78, 71, 13, 10, 26, 10];
+  rc = etch_buf_append(out, &sig[0], 8);
+  var hdr: uint8[13];
+  etch_put_u32be(&hdr[0], (uint32)w);
+  etch_put_u32be(&hdr[4], (uint32)h);
+  hdr[8] = (uint8)depth;
+  hdr[9] = (uint8)ctype;
+  hdr[10] = 0; hdr[11] = 0; hdr[12] = 0;
+  if (rc == ETCH_OK) { rc = put_chunk(out, "IHDR", &hdr[0], 13); }
+  var zp: int64 = 0;
+  while (rc == ETCH_OK && zp < z.len) {
+    var part: int64 = z.len - zp;
+    if (part > 1048576) { part = 1048576; }
+    rc = put_chunk(out, "IDAT", z.data + zp, part);
+    zp = zp + part;
+  }
+  press_buf_free(&z);
+  if (rc == ETCH_OK) { rc = put_chunk(out, "IEND", (uint8*)0, 0); }
+  return rc;
+}

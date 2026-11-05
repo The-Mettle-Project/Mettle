@@ -1,0 +1,607 @@
+// AudioMixer: plays many sounds at once into one float output, for games.
+//
+//   var m: AudioMixer;
+//   audio_mixer_init(&m, 48000, 2, 64);
+//   var v: int64 = audio_mixer_play(&m, &shot, 1.0, 0.0, false);   // game thread
+//   audio_mixer_set_pitch(&m, v, 1.2);
+//   ...
+//   audio_mixer_mix(&m, out, frames);                               // audio thread
+//
+// The game thread and the audio thread never wait on each other: calls
+// from the game go through a lock-free queue of commands that the audio
+// thread applies at the start of each mix, and voices that finish come back
+// through a second queue. Gain, pan and fades are ramped per sample, so
+// changes never click. Sounds are AudioPcm blocks in AUDIO_F32 with 1 or 2
+// channels at any rate (pitch and rate are handled by linear interpolation;
+// convert other channel counts with audio_pcm_channels). Music and other
+// long sounds play from a fill function (see audio_stream_fill), which the
+// audio thread calls for samples at the mixer's rate.
+//
+// Handles are int64 numbers that stay unique: a handle of a voice that has
+// ended does nothing.
+
+import "std/mem";
+import "std/thread" as th;
+import "../core/status";
+import "../core/pcm";
+import "../core/amath";
+
+export const AUDIO_GROUPS: int32 = 16;
+const MX_BLOCK = 512;
+const MX_QUEUE = 1024;
+
+const OP_PLAY = 1;
+const OP_STREAM = 2;
+const OP_STOP = 3;
+const OP_PAUSE = 4;
+const OP_RESUME = 5;
+const OP_GAIN = 6;
+const OP_PAN = 7;
+const OP_PITCH = 8;
+const OP_GROUP = 9;
+const OP_MASTER = 10;
+const OP_SEEK = 11;
+const OP_LOOP = 12;
+
+struct MixCmd {
+  op: int32;
+  slot: int32;
+  gen: int32;
+  group: int32;
+  a: float32;
+  b: float32;
+  c: float32;
+  n: int32;         // ramp frames
+  flag: int32;
+  i: int64;
+  p: rawptr;        // AudioPcm*
+  fill: fn(rawptr, float32*, int32, int32) -> int32;
+  q: rawptr;        // stream user data
+}
+
+// One gain that moves to a target over a number of frames.
+struct MixRamp {
+  v: float32;
+  target: float32;
+  step: float32;
+  left: int32;
+}
+
+struct MixVoice {
+  state: int32;     // 0 free, 1 playing, 2 paused
+  gen: int32;
+  group: int32;
+  pcm: AudioPcm*;
+  fill: fn(rawptr, float32*, int32, int32) -> int32;   // stream: user, out, frames, channels -> frames
+  user: rawptr;
+  sch: int32;       // source channels
+  pos: int64;       // 32.32 fixed point frame position
+  step: int64;      // 32.32 frames per output frame
+  pitch: float32;
+  looping: bool;
+  stop_after: bool; // free when the gain ramp ends
+  gain: MixRamp;
+  pan: MixRamp;
+}
+
+export struct AudioMixer {
+  rate: int32;
+  ch: int32;
+  nvoice: int32;
+  voices: MixVoice*;      // audio thread
+  busy: bool*;            // game thread: slot in use
+  gens: int32*;           // game thread: current generation per slot
+  cmds: MixCmd*;
+  cw: int32;              // commands written (game)
+  cr: int32;              // commands read (audio)
+  done: int32*;
+  dw: int32;              // finished slots written (audio)
+  dr: int32;              // finished slots read (game)
+  group: MixRamp[16];
+  master: MixRamp;
+  tmp: float32*;          // stream samples for one block
+  lim: bool;              // soft limit instead of hard clip
+}
+
+fn mx_load(p: int32*) -> int32 { return th.InterlockedCompareExchange(p, 0, 0); }
+
+fn ramp_to(r: MixRamp*, target: float32, frames: int32) {
+  if (frames <= 0) {
+    r->v = target;
+    r->target = target;
+    r->step = 0.0;
+    r->left = 0;
+    return;
+  }
+  r->target = target;
+  r->left = frames;
+  r->step = (target - r->v) / (float32)frames;
+}
+
+/// Sets up a mixer for `channels` output channels (1 to 8) at `rate`, with
+/// room for `voices` sounds at once.
+export fn audio_mixer_init(m: AudioMixer*, rate: int32, channels: int32, voices: int32) -> int32 {
+  memset(m, 0, sizeof(AudioMixer));
+  if (rate < 1 || channels < 1 || channels > AUDIO_MAX_CHANNELS || voices < 1 || voices > 4096) { return AUDIO_E_ARG; }
+  m->rate = rate;
+  m->ch = channels;
+  m->nvoice = voices;
+  m->voices = (MixVoice*)calloc((int64)voices, sizeof(MixVoice));
+  m->busy = (bool*)calloc((int64)voices, 1);
+  m->gens = (int32*)calloc((int64)voices, 4);
+  m->cmds = (MixCmd*)calloc(MX_QUEUE, sizeof(MixCmd));
+  m->done = (int32*)calloc(MX_QUEUE, 4);
+  m->tmp = (float32*)calloc(MX_BLOCK * 8, 4);
+  if (m->voices == 0 || m->busy == 0 || m->gens == 0 || m->cmds == 0 || m->done == 0 || m->tmp == 0) {
+    audio_mixer_free(m);
+    return AUDIO_E_MEM;
+  }
+  for g in 0..16 { ramp_to(&m->group[g], 1.0, 0); }
+  ramp_to(&m->master, 1.0, 0);
+  return AUDIO_OK;
+}
+
+export fn audio_mixer_free(m: AudioMixer*) {
+  if (m->voices != 0) { free(m->voices); }
+  if (m->busy != 0) { free(m->busy); }
+  if (m->gens != 0) { free(m->gens); }
+  if (m->cmds != 0) { free(m->cmds); }
+  if (m->done != 0) { free(m->done); }
+  if (m->tmp != 0) { free(m->tmp); }
+  m->voices = (MixVoice*)0;
+  m->busy = (bool*)0;
+  m->gens = (int32*)0;
+  m->cmds = (MixCmd*)0;
+  m->done = (int32*)0;
+  m->tmp = (float32*)0;
+}
+
+// ---- game thread ----
+
+// Takes back the slots of voices that ended.
+fn mx_reap(m: AudioMixer*) {
+  var w: int32 = mx_load(&m->dw);
+  while (m->dr != w) {
+    var s: int32 = m->done[m->dr & (MX_QUEUE - 1)];
+    // a slot replayed since it ended has a newer generation; the done
+    // entry carries the generation it ended with
+    var g: int32 = m->done[(m->dr + 1) & (MX_QUEUE - 1)];
+    if (s >= 0 && s < m->nvoice && m->gens[s] == g) { m->busy[s] = false; }
+    m->dr = m->dr + 2;
+  }
+  th.InterlockedExchange(&m->dr, m->dr);
+}
+
+fn mx_send(m: AudioMixer*, c: MixCmd*) -> bool {
+  var r: int32 = mx_load(&m->cr);
+  if (m->cw - r >= MX_QUEUE) { return false; }
+  memcpy(&m->cmds[m->cw & (MX_QUEUE - 1)], c, sizeof(MixCmd));
+  th.InterlockedExchange(&m->cw, m->cw + 1);
+  return true;
+}
+
+fn mx_ms(m: AudioMixer*, ms: float32) -> int32 {
+  if (ms <= 0.0) { return 0; }
+  return (int32)((float64)ms * (float64)m->rate / 1000.0);
+}
+
+fn mx_handle(slot: int32, gen: int32) -> int64 { return ((int64)gen << 32) | (int64)slot; }
+
+// The slot of a live handle, or -1.
+fn mx_slot(m: AudioMixer*, v: int64) -> int32 {
+  if (v < 0) { return -1; }
+  var s: int32 = (int32)(v & 0xFFFFFFFF);
+  var g: int32 = (int32)(v >> 32);
+  if (s >= m->nvoice || !m->busy[s] || m->gens[s] != g) { return -1; }
+  return s;
+}
+
+fn mx_new(m: AudioMixer*) -> int32 {
+  mx_reap(m);
+  for s in 0..m->nvoice {
+    if (!m->busy[s]) {
+      m->busy[s] = true;
+      m->gens[s] = (m->gens[s] + 1) & 0x7FFFFFFF;
+      return (int32)s;
+    }
+  }
+  return -1;
+}
+
+/// Plays a sound (AUDIO_F32, 1 or 2 channels; it must stay alive while it
+/// plays). gain 1.0 is as recorded; pan -1 left .. 1 right. Returns a
+/// handle, or -1 when every voice is busy.
+export fn audio_mixer_play(m: AudioMixer*, pcm: AudioPcm*, gain: float32, pan: float32, looping: bool) -> int64 {
+  return audio_mixer_play_ex(m, pcm, gain, pan, 1.0, looping, 0, 0.0);
+}
+
+/// audio_mixer_play with a pitch (1.0 = as recorded), a group (0..15) and a
+/// fade-in time in milliseconds.
+export fn audio_mixer_play_ex(m: AudioMixer*, pcm: AudioPcm*, gain: float32, pan: float32, pitch: float32,
+    looping: bool, group: int32, fade_ms: float32) -> int64 {
+  if (pcm == 0 || pcm->fmt != AUDIO_F32 || pcm->channels < 1 || pcm->channels > 2 || pcm->rate < 1 || pcm->data == 0) { return -1; }
+  if (group < 0 || group >= AUDIO_GROUPS) { return -1; }
+  var s: int32 = mx_new(m);
+  if (s < 0) { return -1; }
+  var c: MixCmd;
+  memset(&c, 0, sizeof(MixCmd));
+  c.op = OP_PLAY;
+  c.slot = s;
+  c.gen = m->gens[s];
+  c.group = group;
+  c.a = gain;
+  c.b = pan;
+  c.c = pitch;
+  c.n = mx_ms(m, fade_ms);
+  if (looping) { c.flag = 1; }
+  c.p = (rawptr)pcm;
+  if (!mx_send(m, &c)) { m->busy[s] = false; return -1; }
+  return mx_handle(s, c.gen);
+}
+
+/// Plays from a fill function, called on the audio thread as
+/// fill(user, out, frames, channels): it writes up to `frames` interleaved
+/// frames of `channels` (the mixer's own count) at the mixer's rate and
+/// returns how many it wrote; fewer than asked means the end.
+export fn audio_mixer_play_stream(m: AudioMixer*, fill: fn(rawptr, float32*, int32, int32) -> int32, user: rawptr,
+    gain: float32, group: int32, fade_ms: float32) -> int64 {
+  if (fill == 0 || group < 0 || group >= AUDIO_GROUPS) { return -1; }
+  var s: int32 = mx_new(m);
+  if (s < 0) { return -1; }
+  var c: MixCmd;
+  memset(&c, 0, sizeof(MixCmd));
+  c.op = OP_STREAM;
+  c.slot = s;
+  c.gen = m->gens[s];
+  c.group = group;
+  c.a = gain;
+  c.n = mx_ms(m, fade_ms);
+  c.fill = fill;
+  c.q = user;
+  if (!mx_send(m, &c)) { m->busy[s] = false; return -1; }
+  return mx_handle(s, c.gen);
+}
+
+fn mx_simple(m: AudioMixer*, v: int64, op: int32, a: float32, ms: float32) -> bool {
+  var s: int32 = mx_slot(m, v);
+  if (s < 0) { return false; }
+  var c: MixCmd;
+  memset(&c, 0, sizeof(MixCmd));
+  c.op = op;
+  c.slot = s;
+  c.gen = m->gens[s];
+  c.a = a;
+  c.n = mx_ms(m, ms);
+  return mx_send(m, &c);
+}
+
+/// Stops a voice, fading out over fade_ms (0 stops at once).
+export fn audio_mixer_stop(m: AudioMixer*, v: int64, fade_ms: float32) -> bool { return mx_simple(m, v, OP_STOP, 0.0, fade_ms); }
+export fn audio_mixer_pause(m: AudioMixer*, v: int64) -> bool { return mx_simple(m, v, OP_PAUSE, 0.0, 0.0); }
+export fn audio_mixer_resume(m: AudioMixer*, v: int64) -> bool { return mx_simple(m, v, OP_RESUME, 0.0, 0.0); }
+/// Moves a voice's gain to `gain` over ms milliseconds.
+export fn audio_mixer_set_gain(m: AudioMixer*, v: int64, gain: float32, ms: float32) -> bool { return mx_simple(m, v, OP_GAIN, gain, ms); }
+/// Moves a voice's pan (-1 .. 1) over ms milliseconds.
+export fn audio_mixer_set_pan(m: AudioMixer*, v: int64, pan: float32, ms: float32) -> bool { return mx_simple(m, v, OP_PAN, pan, ms); }
+/// Sets the pitch: 2.0 is an octave up and twice as fast.
+export fn audio_mixer_set_pitch(m: AudioMixer*, v: int64, pitch: float32) -> bool { return mx_simple(m, v, OP_PITCH, pitch, 0.0); }
+/// Turns looping on or off.
+export fn audio_mixer_set_loop(m: AudioMixer*, v: int64, looping: bool) -> bool {
+  var a: float32 = 0.0;
+  if (looping) { a = 1.0; }
+  return mx_simple(m, v, OP_LOOP, a, 0.0);
+}
+
+/// Moves a voice to a frame of its sound.
+export fn audio_mixer_seek(m: AudioMixer*, v: int64, frame: int64) -> bool {
+  var s: int32 = mx_slot(m, v);
+  if (s < 0) { return false; }
+  var c: MixCmd;
+  memset(&c, 0, sizeof(MixCmd));
+  c.op = OP_SEEK;
+  c.slot = s;
+  c.gen = m->gens[s];
+  c.i = frame;
+  return mx_send(m, &c);
+}
+
+/// Sets the gain of a group (music, effects, voices ...) over ms.
+export fn audio_mixer_set_group_gain(m: AudioMixer*, group: int32, gain: float32, ms: float32) -> bool {
+  if (group < 0 || group >= AUDIO_GROUPS) { return false; }
+  var c: MixCmd;
+  memset(&c, 0, sizeof(MixCmd));
+  c.op = OP_GROUP;
+  c.group = group;
+  c.a = gain;
+  c.n = mx_ms(m, ms);
+  return mx_send(m, &c);
+}
+
+/// Sets the gain of everything over ms.
+export fn audio_mixer_set_master(m: AudioMixer*, gain: float32, ms: float32) -> bool {
+  var c: MixCmd;
+  memset(&c, 0, sizeof(MixCmd));
+  c.op = OP_MASTER;
+  c.a = gain;
+  c.n = mx_ms(m, ms);
+  return mx_send(m, &c);
+}
+
+/// Soft limiting (true) or hard clipping (false, the default) at full scale.
+export fn audio_mixer_set_limiter(m: AudioMixer*, on: bool) { m->lim = on; }
+
+/// True while the voice plays or is paused.
+export fn audio_mixer_playing(m: AudioMixer*, v: int64) -> bool {
+  mx_reap(m);
+  return mx_slot(m, v) >= 0;
+}
+
+/// Voices in use.
+export fn audio_mixer_active(m: AudioMixer*) -> int32 {
+  mx_reap(m);
+  var k: int32 = 0;
+  for s in 0..m->nvoice { if (m->busy[s]) { k = k + 1; } }
+  return k;
+}
+
+// ---- audio thread ----
+
+fn mx_finish(m: AudioMixer*, s: int32) {
+  var v: MixVoice* = &m->voices[s];
+  v->state = 0;
+  var w: int32 = m->dw;
+  if (w - mx_load(&m->dr) >= MX_QUEUE - 2) { return; }   // full: the slot stays busy until a later end
+  m->done[w & (MX_QUEUE - 1)] = s;
+  m->done[(w + 1) & (MX_QUEUE - 1)] = v->gen;
+  th.InterlockedExchange(&m->dw, w + 2);
+}
+
+fn mx_step(m: AudioMixer*, v: MixVoice*) {
+  var rate: float64 = 1.0;
+  if (v->pcm != 0) { rate = (float64)v->pcm->rate / (float64)m->rate; }
+  var p: float64 = (float64)v->pitch;
+  if (!(p > 0.0)) { p = 1.0; }
+  if (p > 16.0) { p = 16.0; }
+  v->step = (int64)(rate * p * 4294967296.0);
+  if (v->step < 1) { v->step = 1; }
+}
+
+fn mx_apply(m: AudioMixer*, c: MixCmd*) {
+  if (c->op == OP_GROUP) { ramp_to(&m->group[c->group], c->a, c->n); return; }
+  if (c->op == OP_MASTER) { ramp_to(&m->master, c->a, c->n); return; }
+  if (c->slot < 0 || c->slot >= m->nvoice) { return; }
+  var v: MixVoice* = &m->voices[c->slot];
+  if (c->op == OP_PLAY || c->op == OP_STREAM) {
+    memset(v, 0, sizeof(MixVoice));
+    v->state = 1;
+    v->gen = c->gen;
+    v->group = c->group;
+    v->pitch = c->c;
+    v->gain.v = c->a;
+    if (c->n > 0) { v->gain.v = 0.0; }
+    ramp_to(&v->gain, c->a, c->n);
+    ramp_to(&v->pan, c->b, 0);
+    if (c->op == OP_PLAY) {
+      v->pcm = (AudioPcm*)c->p;
+      v->sch = v->pcm->channels;
+      v->looping = c->flag != 0;
+      mx_step(m, v);
+    } else {
+      v->fill = c->fill;
+      v->user = c->q;
+      v->sch = m->ch;
+    }
+    return;
+  }
+  if (v->state == 0 || v->gen != c->gen) { return; }
+  switch (c->op) {
+    case 3: {
+      if (c->n <= 0) { mx_finish(m, c->slot); return; }
+      ramp_to(&v->gain, 0.0, c->n);
+      v->stop_after = true;
+    }
+    case 4: { v->state = 2; }
+    case 5: { v->state = 1; }
+    case 6: { ramp_to(&v->gain, c->a, c->n); v->stop_after = false; }
+    case 7: { ramp_to(&v->pan, c->a, c->n); }
+    case 8: { v->pitch = c->a; mx_step(m, v); }
+    case 11: {
+      if (v->pcm != 0 && c->i >= 0 && c->i < v->pcm->frames) { v->pos = c->i << 32; }
+    }
+    case 12: { v->looping = c->a != 0.0; }
+    default: { }
+  }
+}
+
+// Speaker gains for the left and right of a voice at pan p.
+fn pan_gains(p: float32, sch: int32, gl: float32*, gr: float32*) {
+  var x: float32 = p;
+  if (x < -1.0) { x = -1.0; }
+  if (x > 1.0) { x = 1.0; }
+  if (sch == 1) {
+    // constant power
+    var a: float64 = ((float64)x + 1.0) * 0.7853981633974483;
+    *gl = (float32)audio_cos(a);
+    *gr = (float32)audio_sin(a);
+  } else {
+    // balance
+    *gl = 1.0;
+    *gr = 1.0;
+    if (x > 0.0) { *gl = 1.0 - x; }
+    if (x < 0.0) { *gr = 1.0 + x; }
+  }
+}
+
+// Adds n frames of voice v to acc (m->ch channels).
+fn mx_voice(m: AudioMixer*, s: int32, acc: float32*, n: int32) {
+  var v: MixVoice* = &m->voices[s];
+  var och: int32 = m->ch;
+  var g0: float32 = v->gain.v;
+  // the ramp over this block
+  var g1: float32 = g0;
+  var ended_ramp: bool = false;
+  if (v->gain.left > 0) {
+    var k: int32 = n;
+    if (k > v->gain.left) { k = v->gain.left; }
+    g1 = g0 + v->gain.step * (float32)k;
+    v->gain.left = v->gain.left - k;
+    if (v->gain.left == 0) { g1 = v->gain.target; ended_ramp = true; }
+  }
+  var p0: float32 = v->pan.v;
+  var p1: float32 = p0;
+  if (v->pan.left > 0) {
+    var k: int32 = n;
+    if (k > v->pan.left) { k = v->pan.left; }
+    p1 = p0 + v->pan.step * (float32)k;
+    v->pan.left = v->pan.left - k;
+    if (v->pan.left == 0) { p1 = v->pan.target; }
+  }
+  v->gain.v = g1;
+  v->pan.v = p1;
+  var grp: MixRamp* = &m->group[v->group];
+  var gg: float32 = grp->v;
+  var la: float32 = 0.0; var ra: float32 = 0.0; var lb: float32 = 0.0; var rb: float32 = 0.0;
+  pan_gains(p0, v->sch, &la, &ra);
+  pan_gains(p1, v->sch, &lb, &rb);
+  la = la * g0 * gg; ra = ra * g0 * gg;
+  lb = lb * g1 * gg; rb = rb * g1 * gg;
+  var inv: float32 = 1.0 / (float32)n;
+  var dl: float32 = (lb - la) * inv;
+  var dr: float32 = (rb - ra) * inv;
+  var gl: float32 = la;
+  var gr: float32 = ra;
+  var frames_done: int32 = n;
+  if (v->fill != 0) {
+    // stream: pull samples at the mixer's rate and layout
+    var got: int32 = v->fill(v->user, m->tmp, n, och);
+    if (got < 0) { got = 0; }
+    if (got > n) { got = n; }
+    var t: float32* = m->tmp;
+    if (och == 1) {
+      for i in 0..got { acc[i] = acc[i] + t[i] * gl; gl = gl + dl; }
+    } else {
+      for i in 0..got {
+        var b: int64 = (int64)i * (int64)och;
+        acc[b] = acc[b] + t[b] * gl;
+        acc[b + 1] = acc[b + 1] + t[b + 1] * gr;
+        for c in 2..och { acc[b + (int64)c] = acc[b + (int64)c] + t[b + (int64)c] * gl; }
+        gl = gl + dl;
+        gr = gr + dr;
+      }
+    }
+    if (got < n) { mx_finish(m, s); return; }
+  } else {
+    var pcm: AudioPcm* = v->pcm;
+    var x: float32* = (float32*)pcm->data;
+    var len: int64 = pcm->frames;
+    var sch: int64 = (int64)v->sch;
+    var pos: int64 = v->pos;
+    var step: int64 = v->step;
+    var i: int32 = 0;
+    while (i < n) {
+      var idx: int64 = pos >> 32;
+      if (idx >= len) {
+        if (v->looping && len > 0) { pos = pos - (len << 32); continue; }
+        frames_done = i;
+        break;
+      }
+      var fr: float32 = (float32)(pos & 0xFFFFFFFF) * 0.00000000023283064365386963;
+      var nx: int64 = idx + 1;
+      if (nx >= len) {
+        if (v->looping) { nx = 0; } else { nx = idx; }
+      }
+      var l: float32 = 0.0;
+      var r: float32 = 0.0;
+      if (sch == 1) {
+        var a: float32 = x[idx];
+        l = a + (x[nx] - a) * fr;
+        r = l;
+      } else {
+        var a0: float32 = x[idx * 2];
+        var a1: float32 = x[idx * 2 + 1];
+        l = a0 + (x[nx * 2] - a0) * fr;
+        r = a1 + (x[nx * 2 + 1] - a1) * fr;
+      }
+      if (och == 1) {
+        acc[i] = acc[i] + (l * gl + r * gr) * 0.5;
+      } else {
+        var b: int64 = (int64)i * (int64)och;
+        acc[b] = acc[b] + l * gl;
+        acc[b + 1] = acc[b + 1] + r * gr;
+      }
+      gl = gl + dl;
+      gr = gr + dr;
+      pos = pos + step;
+      i = i + 1;
+    }
+    v->pos = pos;
+    if (frames_done < n) { mx_finish(m, s); return; }
+  }
+  if (ended_ramp && v->stop_after) { mx_finish(m, s); }
+}
+
+/// Fills out with `frames` interleaved float frames. Call from the audio
+/// thread (the device callback) only.
+export fn audio_mixer_mix(m: AudioMixer*, out: float32*, frames: int32) {
+  // apply what the game sent
+  var w: int32 = mx_load(&m->cw);
+  while (m->cr != w) {
+    mx_apply(m, &m->cmds[m->cr & (MX_QUEUE - 1)]);
+    m->cr = m->cr + 1;
+  }
+  th.InterlockedExchange(&m->cr, m->cr);
+  var och: int64 = (int64)m->ch;
+  var at: int32 = 0;
+  while (at < frames) {
+    var n: int32 = frames - at;
+    if (n > MX_BLOCK) { n = MX_BLOCK; }
+    var acc: float32* = out + (int64)at * och;
+    memset(acc, 0, (int64)n * och * 4);
+    for s in 0..m->nvoice {
+      if (m->voices[s].state == 1) { mx_voice(m, (int32)s, acc, n); }
+    }
+    // group ramps move once per block
+    for g in 0..16 {
+      var r: MixRamp* = &m->group[g];
+      if (r->left > 0) {
+        var k: int32 = n;
+        if (k > r->left) { k = r->left; }
+        r->v = r->v + r->step * (float32)k;
+        r->left = r->left - k;
+        if (r->left == 0) { r->v = r->target; }
+      }
+    }
+    // master gain (ramped per sample) and the output limit
+    var mg: float32 = m->master.v;
+    var md: float32 = 0.0;
+    if (m->master.left > 0) {
+      var k: int32 = n;
+      if (k > m->master.left) { k = m->master.left; }
+      md = m->master.step * (float32)k / (float32)n;
+      m->master.left = m->master.left - k;
+    }
+    for f in 0..(int64)n {
+      for c in 0..och {
+        var y: float32 = acc[f * och + c] * mg;
+        if (m->lim) {
+          // smooth above 0.5: y / (1 + |y|) scaled to meet full scale
+          var ay: float32 = y;
+          if (ay < 0.0) { ay = -ay; }
+          if (ay > 0.5) {
+            var e: float32 = ay - 0.5;
+            var z: float32 = 0.5 + e / (1.0 + 2.0 * e);
+            if (y < 0.0) { y = -z; } else { y = z; }
+          }
+        } else {
+          if (y > 1.0) { y = 1.0; }
+          if (y < -1.0) { y = -1.0; }
+        }
+        acc[f * och + c] = y;
+      }
+      mg = mg + md;
+    }
+    m->master.v = mg;
+    if (m->master.left == 0 && m->master.step != 0.0) { m->master.v = m->master.target; m->master.step = 0.0; }
+    at = at + n;
+  }
+}

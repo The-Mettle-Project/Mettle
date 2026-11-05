@@ -1,0 +1,134 @@
+// Poly1305 core on x86-64 in base 2^64: h is three 64-bit words (h2 holds a
+// few bits), r is two words, and each block is two full 64x64 -> 128 multiply
+// steps with mul and adc. Mettle has no 128-bit integers and no high-half
+// multiply, so this part is assembly. Ported from OpenSSL's
+// poly1305-x86_64 scalar code (__poly1305_block and poly1305_emit, Andy
+// Polyakov, Apache-2.0): since r1 is a multiple of 4, h1 * r1 * 2^128 is
+// folded in as h1 * s1 with s1 = r1 + (r1 >> 2) = 5 * r1 / 4.
+//
+// mul, imul, adc and cmov take the same time for every value on x86-64, and
+// there is no branch or address that depends on the key or data, so this
+// path is constant time. Internal: used by poly1305.mettle.
+
+/// internal: 1: this target has the base 2^64 Poly1305 core.
+export fn crx_poly1305_x64() -> uint32 {
+  return 1;
+}
+
+/// internal: absorbs nblocks 16-byte blocks. st is h0, h1, h2, r0, r1 (r
+/// clamped); h is updated in place. padbit is 1 for full blocks, 0 for the
+/// final padded block.
+/// in: st 5 words; m readable for nblocks * 16 bytes; nblocks >= 0
+@naked export fn crx_poly1305_x64_blocks(st: uint64*, m: uint8*, nblocks: int64, padbit: uint64) {
+  asm {
+    test rdx, rdx
+    jz done
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r14, rdx
+    mov r15, rcx
+    mov r8, [rdi]
+    mov r9, [rdi+8]
+    mov r10, [rdi+16]
+    mov r11, [rdi+24]
+    mov r12, [rdi+32]
+    mov r13, r12
+    shr r13, 2
+    add r13, r12
+  next:
+    add r8, [rsi]
+    adc r9, [rsi+8]
+    adc r10, r15
+    mov rax, r12
+    mul r8
+    mov rbx, rax
+    mov rcx, rdx
+    mov rax, r11
+    mul r8
+    mov r8, rax
+    mov rbp, rdx
+    mov rax, r11
+    mul r9
+    add rbx, rax
+    adc rcx, rdx
+    mov rax, r13
+    mul r9
+    mov r9, r10
+    add r8, rax
+    adc rbp, rdx
+    imul r9, r13
+    add rbx, r9
+    adc rcx, 0
+    mov r9, rbp
+    imul r10, r11
+    add r9, rbx
+    mov rax, -4
+    adc rcx, r10
+    and rax, rcx
+    mov r10, rcx
+    shr rcx, 2
+    and r10, 3
+    add rax, rcx
+    add r8, rax
+    adc r9, 0
+    adc r10, 0
+    add rsi, 16
+    dec r14
+    jnz next
+    mov [rdi], r8
+    mov [rdi+8], r9
+    mov [rdi+16], r10
+    xor eax, eax
+    xor edx, edx
+    xor ecx, ecx
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor ebx, ebx
+    xor ebp, ebp
+    xor r12d, r12d
+    xor r13d, r13d
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+  done:
+    ret
+  }
+}
+
+/// internal: writes the 16-byte tag: (h mod p) + s mod 2^128. h must come
+/// from crx_poly1305_x64_blocks (h < 2p).
+/// in: st 5 words (h0, h1, h2 used); s 16 bytes; tag writable for 16 bytes
+@naked export fn crx_poly1305_x64_emit(st: uint64*, s: uint8*, tag: uint8*) {
+  asm {
+    mov r8, [rdi]
+    mov r9, [rdi+8]
+    mov r10, [rdi+16]
+    mov rax, r8
+    add r8, 5
+    mov rcx, r9
+    adc r9, 0
+    adc r10, 0
+    shr r10, 2
+    cmovz r8, rax
+    cmovz r9, rcx
+    add r8, [rsi]
+    adc r9, [rsi+8]
+    mov [rdx], r8
+    mov [rdx+8], r9
+    xor eax, eax
+    xor ecx, ecx
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    ret
+  }
+}

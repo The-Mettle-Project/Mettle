@@ -1,0 +1,651 @@
+// Vector kernels for x86-64: AVX2 split-table multiply (the PSHUFB method
+// from Intel ISA-L), and AVX2 + GFNI and AVX-512 + GFNI affine multiply
+// (as in klauspost's reedsolomon). Each kernel computes up to 4 outputs in
+// one pass over the sources, so each source byte is loaded once per group
+// of outputs.
+//
+// Table layout for a group of g outputs and k sources: for source j and
+// output o, entry (j * g + o). AVX2 entries are 64 bytes: the low-nibble
+// table twice, then the high-nibble table twice. GFNI entries are 32 bytes:
+// the 8x8 bit matrix for the coefficient, four times. AVX-512 entries are
+// that matrix once (8 bytes), broadcast into a register. The AVX-512
+// kernels do 128 bytes per step (two registers per output).
+//
+// Do not edit by hand: the byte strings were produced with the GNU
+// assembler from the mnemonics shown in the comments.
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 32. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_avx2_1(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+    mov rdx, {mask}
+    db 0xc5, 0x7e, 0x6f, 0x3a  // vmovdqu ymm15, [rdx]
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0xc4, 0x41, 0x3d, 0xef, 0xc0  // vpxor ymm8, ymm8, ymm8
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0xc5, 0xfe, 0x6f, 0x04, 0x07  // vmovdqu ymm0, [rdi + rax]
+    db 0xc5, 0xf5, 0x71, 0xd0, 0x04  // vpsrlw ymm1, ymm0, 4
+    db 0xc4, 0xc1, 0x7d, 0xdb, 0xc7  // vpand ymm0, ymm0, ymm15
+    db 0xc4, 0xc1, 0x75, 0xdb, 0xcf  // vpand ymm1, ymm1, ymm15
+    db 0xc5, 0xfe, 0x6f, 0x16  // vmovdqu ymm2, [rsi + 0]
+    db 0xc5, 0xfe, 0x6f, 0x5e, 0x20  // vmovdqu ymm3, [rsi + 32]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x3d, 0xef, 0xc2  // vpxor ymm8, ymm8, ymm2
+    db 0xc5, 0x3d, 0xef, 0xc3  // vpxor ymm8, ymm8, ymm3
+    add rsi, 64
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0xc5, 0x7e, 0x7f, 0x04, 0x07  // vmovdqu [rdi + rax], ymm8
+    add rax, 32
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 32. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_avx2_2(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+    mov rdx, {mask}
+    db 0xc5, 0x7e, 0x6f, 0x3a  // vmovdqu ymm15, [rdx]
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0xc4, 0x41, 0x3d, 0xef, 0xc0  // vpxor ymm8, ymm8, ymm8
+    db 0xc4, 0x41, 0x35, 0xef, 0xc9  // vpxor ymm9, ymm9, ymm9
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0xc5, 0xfe, 0x6f, 0x04, 0x07  // vmovdqu ymm0, [rdi + rax]
+    db 0xc5, 0xf5, 0x71, 0xd0, 0x04  // vpsrlw ymm1, ymm0, 4
+    db 0xc4, 0xc1, 0x7d, 0xdb, 0xc7  // vpand ymm0, ymm0, ymm15
+    db 0xc4, 0xc1, 0x75, 0xdb, 0xcf  // vpand ymm1, ymm1, ymm15
+    db 0xc5, 0xfe, 0x6f, 0x16  // vmovdqu ymm2, [rsi + 0]
+    db 0xc5, 0xfe, 0x6f, 0x5e, 0x20  // vmovdqu ymm3, [rsi + 32]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x3d, 0xef, 0xc2  // vpxor ymm8, ymm8, ymm2
+    db 0xc5, 0x3d, 0xef, 0xc3  // vpxor ymm8, ymm8, ymm3
+    db 0xc5, 0xfe, 0x6f, 0x56, 0x40  // vmovdqu ymm2, [rsi + 64]
+    db 0xc5, 0xfe, 0x6f, 0x5e, 0x60  // vmovdqu ymm3, [rsi + 96]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x35, 0xef, 0xca  // vpxor ymm9, ymm9, ymm2
+    db 0xc5, 0x35, 0xef, 0xcb  // vpxor ymm9, ymm9, ymm3
+    add rsi, 128
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0xc5, 0x7e, 0x7f, 0x04, 0x07  // vmovdqu [rdi + rax], ymm8
+    mov rdi, [r11 + 8]
+    db 0xc5, 0x7e, 0x7f, 0x0c, 0x07  // vmovdqu [rdi + rax], ymm9
+    add rax, 32
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 32. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_avx2_3(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+    mov rdx, {mask}
+    db 0xc5, 0x7e, 0x6f, 0x3a  // vmovdqu ymm15, [rdx]
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0xc4, 0x41, 0x3d, 0xef, 0xc0  // vpxor ymm8, ymm8, ymm8
+    db 0xc4, 0x41, 0x35, 0xef, 0xc9  // vpxor ymm9, ymm9, ymm9
+    db 0xc4, 0x41, 0x2d, 0xef, 0xd2  // vpxor ymm10, ymm10, ymm10
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0xc5, 0xfe, 0x6f, 0x04, 0x07  // vmovdqu ymm0, [rdi + rax]
+    db 0xc5, 0xf5, 0x71, 0xd0, 0x04  // vpsrlw ymm1, ymm0, 4
+    db 0xc4, 0xc1, 0x7d, 0xdb, 0xc7  // vpand ymm0, ymm0, ymm15
+    db 0xc4, 0xc1, 0x75, 0xdb, 0xcf  // vpand ymm1, ymm1, ymm15
+    db 0xc5, 0xfe, 0x6f, 0x16  // vmovdqu ymm2, [rsi + 0]
+    db 0xc5, 0xfe, 0x6f, 0x5e, 0x20  // vmovdqu ymm3, [rsi + 32]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x3d, 0xef, 0xc2  // vpxor ymm8, ymm8, ymm2
+    db 0xc5, 0x3d, 0xef, 0xc3  // vpxor ymm8, ymm8, ymm3
+    db 0xc5, 0xfe, 0x6f, 0x56, 0x40  // vmovdqu ymm2, [rsi + 64]
+    db 0xc5, 0xfe, 0x6f, 0x5e, 0x60  // vmovdqu ymm3, [rsi + 96]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x35, 0xef, 0xca  // vpxor ymm9, ymm9, ymm2
+    db 0xc5, 0x35, 0xef, 0xcb  // vpxor ymm9, ymm9, ymm3
+    db 0xc5, 0xfe, 0x6f, 0x96, 0x80, 0x00, 0x00, 0x00  // vmovdqu ymm2, [rsi + 128]
+    db 0xc5, 0xfe, 0x6f, 0x9e, 0xa0, 0x00, 0x00, 0x00  // vmovdqu ymm3, [rsi + 160]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x2d, 0xef, 0xd2  // vpxor ymm10, ymm10, ymm2
+    db 0xc5, 0x2d, 0xef, 0xd3  // vpxor ymm10, ymm10, ymm3
+    add rsi, 192
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0xc5, 0x7e, 0x7f, 0x04, 0x07  // vmovdqu [rdi + rax], ymm8
+    mov rdi, [r11 + 8]
+    db 0xc5, 0x7e, 0x7f, 0x0c, 0x07  // vmovdqu [rdi + rax], ymm9
+    mov rdi, [r11 + 16]
+    db 0xc5, 0x7e, 0x7f, 0x14, 0x07  // vmovdqu [rdi + rax], ymm10
+    add rax, 32
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 32. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_avx2_4(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+    mov rdx, {mask}
+    db 0xc5, 0x7e, 0x6f, 0x3a  // vmovdqu ymm15, [rdx]
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0xc4, 0x41, 0x3d, 0xef, 0xc0  // vpxor ymm8, ymm8, ymm8
+    db 0xc4, 0x41, 0x35, 0xef, 0xc9  // vpxor ymm9, ymm9, ymm9
+    db 0xc4, 0x41, 0x2d, 0xef, 0xd2  // vpxor ymm10, ymm10, ymm10
+    db 0xc4, 0x41, 0x25, 0xef, 0xdb  // vpxor ymm11, ymm11, ymm11
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0xc5, 0xfe, 0x6f, 0x04, 0x07  // vmovdqu ymm0, [rdi + rax]
+    db 0xc5, 0xf5, 0x71, 0xd0, 0x04  // vpsrlw ymm1, ymm0, 4
+    db 0xc4, 0xc1, 0x7d, 0xdb, 0xc7  // vpand ymm0, ymm0, ymm15
+    db 0xc4, 0xc1, 0x75, 0xdb, 0xcf  // vpand ymm1, ymm1, ymm15
+    db 0xc5, 0xfe, 0x6f, 0x16  // vmovdqu ymm2, [rsi + 0]
+    db 0xc5, 0xfe, 0x6f, 0x5e, 0x20  // vmovdqu ymm3, [rsi + 32]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x3d, 0xef, 0xc2  // vpxor ymm8, ymm8, ymm2
+    db 0xc5, 0x3d, 0xef, 0xc3  // vpxor ymm8, ymm8, ymm3
+    db 0xc5, 0xfe, 0x6f, 0x56, 0x40  // vmovdqu ymm2, [rsi + 64]
+    db 0xc5, 0xfe, 0x6f, 0x5e, 0x60  // vmovdqu ymm3, [rsi + 96]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x35, 0xef, 0xca  // vpxor ymm9, ymm9, ymm2
+    db 0xc5, 0x35, 0xef, 0xcb  // vpxor ymm9, ymm9, ymm3
+    db 0xc5, 0xfe, 0x6f, 0x96, 0x80, 0x00, 0x00, 0x00  // vmovdqu ymm2, [rsi + 128]
+    db 0xc5, 0xfe, 0x6f, 0x9e, 0xa0, 0x00, 0x00, 0x00  // vmovdqu ymm3, [rsi + 160]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x2d, 0xef, 0xd2  // vpxor ymm10, ymm10, ymm2
+    db 0xc5, 0x2d, 0xef, 0xd3  // vpxor ymm10, ymm10, ymm3
+    db 0xc5, 0xfe, 0x6f, 0x96, 0xc0, 0x00, 0x00, 0x00  // vmovdqu ymm2, [rsi + 192]
+    db 0xc5, 0xfe, 0x6f, 0x9e, 0xe0, 0x00, 0x00, 0x00  // vmovdqu ymm3, [rsi + 224]
+    db 0xc4, 0xe2, 0x6d, 0x00, 0xd0  // vpshufb ymm2, ymm2, ymm0
+    db 0xc4, 0xe2, 0x65, 0x00, 0xd9  // vpshufb ymm3, ymm3, ymm1
+    db 0xc5, 0x25, 0xef, 0xda  // vpxor ymm11, ymm11, ymm2
+    db 0xc5, 0x25, 0xef, 0xdb  // vpxor ymm11, ymm11, ymm3
+    add rsi, 256
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0xc5, 0x7e, 0x7f, 0x04, 0x07  // vmovdqu [rdi + rax], ymm8
+    mov rdi, [r11 + 8]
+    db 0xc5, 0x7e, 0x7f, 0x0c, 0x07  // vmovdqu [rdi + rax], ymm9
+    mov rdi, [r11 + 16]
+    db 0xc5, 0x7e, 0x7f, 0x14, 0x07  // vmovdqu [rdi + rax], ymm10
+    mov rdi, [r11 + 24]
+    db 0xc5, 0x7e, 0x7f, 0x1c, 0x07  // vmovdqu [rdi + rax], ymm11
+    add rax, 32
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 32. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_gfni_1(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0xc4, 0x41, 0x3d, 0xef, 0xc0  // vpxor ymm8, ymm8, ymm8
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0xc5, 0xfe, 0x6f, 0x04, 0x07  // vmovdqu ymm0, [rdi + rax]
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x16, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 0], 0
+    db 0xc5, 0x3d, 0xef, 0xc2  // vpxor ymm8, ymm8, ymm2
+    add rsi, 32
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0xc5, 0x7e, 0x7f, 0x04, 0x07  // vmovdqu [rdi + rax], ymm8
+    add rax, 32
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 32. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_gfni_2(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0xc4, 0x41, 0x3d, 0xef, 0xc0  // vpxor ymm8, ymm8, ymm8
+    db 0xc4, 0x41, 0x35, 0xef, 0xc9  // vpxor ymm9, ymm9, ymm9
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0xc5, 0xfe, 0x6f, 0x04, 0x07  // vmovdqu ymm0, [rdi + rax]
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x16, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 0], 0
+    db 0xc5, 0x3d, 0xef, 0xc2  // vpxor ymm8, ymm8, ymm2
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x56, 0x20, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 32], 0
+    db 0xc5, 0x35, 0xef, 0xca  // vpxor ymm9, ymm9, ymm2
+    add rsi, 64
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0xc5, 0x7e, 0x7f, 0x04, 0x07  // vmovdqu [rdi + rax], ymm8
+    mov rdi, [r11 + 8]
+    db 0xc5, 0x7e, 0x7f, 0x0c, 0x07  // vmovdqu [rdi + rax], ymm9
+    add rax, 32
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 32. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_gfni_3(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0xc4, 0x41, 0x3d, 0xef, 0xc0  // vpxor ymm8, ymm8, ymm8
+    db 0xc4, 0x41, 0x35, 0xef, 0xc9  // vpxor ymm9, ymm9, ymm9
+    db 0xc4, 0x41, 0x2d, 0xef, 0xd2  // vpxor ymm10, ymm10, ymm10
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0xc5, 0xfe, 0x6f, 0x04, 0x07  // vmovdqu ymm0, [rdi + rax]
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x16, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 0], 0
+    db 0xc5, 0x3d, 0xef, 0xc2  // vpxor ymm8, ymm8, ymm2
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x56, 0x20, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 32], 0
+    db 0xc5, 0x35, 0xef, 0xca  // vpxor ymm9, ymm9, ymm2
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x56, 0x40, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 64], 0
+    db 0xc5, 0x2d, 0xef, 0xd2  // vpxor ymm10, ymm10, ymm2
+    add rsi, 96
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0xc5, 0x7e, 0x7f, 0x04, 0x07  // vmovdqu [rdi + rax], ymm8
+    mov rdi, [r11 + 8]
+    db 0xc5, 0x7e, 0x7f, 0x0c, 0x07  // vmovdqu [rdi + rax], ymm9
+    mov rdi, [r11 + 16]
+    db 0xc5, 0x7e, 0x7f, 0x14, 0x07  // vmovdqu [rdi + rax], ymm10
+    add rax, 32
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 32. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_gfni_4(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0xc4, 0x41, 0x3d, 0xef, 0xc0  // vpxor ymm8, ymm8, ymm8
+    db 0xc4, 0x41, 0x35, 0xef, 0xc9  // vpxor ymm9, ymm9, ymm9
+    db 0xc4, 0x41, 0x2d, 0xef, 0xd2  // vpxor ymm10, ymm10, ymm10
+    db 0xc4, 0x41, 0x25, 0xef, 0xdb  // vpxor ymm11, ymm11, ymm11
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0xc5, 0xfe, 0x6f, 0x04, 0x07  // vmovdqu ymm0, [rdi + rax]
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x16, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 0], 0
+    db 0xc5, 0x3d, 0xef, 0xc2  // vpxor ymm8, ymm8, ymm2
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x56, 0x20, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 32], 0
+    db 0xc5, 0x35, 0xef, 0xca  // vpxor ymm9, ymm9, ymm2
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x56, 0x40, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 64], 0
+    db 0xc5, 0x2d, 0xef, 0xd2  // vpxor ymm10, ymm10, ymm2
+    db 0xc4, 0xe3, 0xfd, 0xce, 0x56, 0x60, 0x00  // vgf2p8affineqb ymm2, ymm0, [rsi + 96], 0
+    db 0xc5, 0x25, 0xef, 0xda  // vpxor ymm11, ymm11, ymm2
+    add rsi, 128
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0xc5, 0x7e, 0x7f, 0x04, 0x07  // vmovdqu [rdi + rax], ymm8
+    mov rdi, [r11 + 8]
+    db 0xc5, 0x7e, 0x7f, 0x0c, 0x07  // vmovdqu [rdi + rax], ymm9
+    mov rdi, [r11 + 16]
+    db 0xc5, 0x7e, 0x7f, 0x14, 0x07  // vmovdqu [rdi + rax], ymm10
+    mov rdi, [r11 + 24]
+    db 0xc5, 0x7e, 0x7f, 0x1c, 0x07  // vmovdqu [rdi + rax], ymm11
+    add rax, 32
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 128. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_gfni512_1(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0x62, 0x51, 0xbd, 0x48, 0xef, 0xc0  // vpxorq zmm8, zmm8, zmm8
+    db 0x62, 0x51, 0x9d, 0x48, 0xef, 0xe4  // vpxorq zmm12, zmm12, zmm12
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x04, 0x07  // vmovdqu64 zmm0, [rdi + rax]
+    db 0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x4c, 0x07, 0x01  // vmovdqu64 zmm1, [rdi + rax + 64]
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x26  // vbroadcastsd zmm4, qword ptr [rsi + 0]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xbd, 0x48, 0xef, 0xc2  // vpxorq zmm8, zmm8, zmm2
+    db 0x62, 0x71, 0x9d, 0x48, 0xef, 0xe3  // vpxorq zmm12, zmm12, zmm3
+    add rsi, 8
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x04, 0x07  // vmovdqu64 [rdi + rax], zmm8
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x64, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm12
+    add rax, 128
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 128. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_gfni512_2(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0x62, 0x51, 0xbd, 0x48, 0xef, 0xc0  // vpxorq zmm8, zmm8, zmm8
+    db 0x62, 0x51, 0x9d, 0x48, 0xef, 0xe4  // vpxorq zmm12, zmm12, zmm12
+    db 0x62, 0x51, 0xb5, 0x48, 0xef, 0xc9  // vpxorq zmm9, zmm9, zmm9
+    db 0x62, 0x51, 0x95, 0x48, 0xef, 0xed  // vpxorq zmm13, zmm13, zmm13
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x04, 0x07  // vmovdqu64 zmm0, [rdi + rax]
+    db 0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x4c, 0x07, 0x01  // vmovdqu64 zmm1, [rdi + rax + 64]
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x26  // vbroadcastsd zmm4, qword ptr [rsi + 0]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xbd, 0x48, 0xef, 0xc2  // vpxorq zmm8, zmm8, zmm2
+    db 0x62, 0x71, 0x9d, 0x48, 0xef, 0xe3  // vpxorq zmm12, zmm12, zmm3
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x66, 0x01  // vbroadcastsd zmm4, qword ptr [rsi + 8]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xb5, 0x48, 0xef, 0xca  // vpxorq zmm9, zmm9, zmm2
+    db 0x62, 0x71, 0x95, 0x48, 0xef, 0xeb  // vpxorq zmm13, zmm13, zmm3
+    add rsi, 16
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x04, 0x07  // vmovdqu64 [rdi + rax], zmm8
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x64, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm12
+    mov rdi, [r11 + 8]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x0c, 0x07  // vmovdqu64 [rdi + rax], zmm9
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x6c, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm13
+    add rax, 128
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 128. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_gfni512_3(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0x62, 0x51, 0xbd, 0x48, 0xef, 0xc0  // vpxorq zmm8, zmm8, zmm8
+    db 0x62, 0x51, 0x9d, 0x48, 0xef, 0xe4  // vpxorq zmm12, zmm12, zmm12
+    db 0x62, 0x51, 0xb5, 0x48, 0xef, 0xc9  // vpxorq zmm9, zmm9, zmm9
+    db 0x62, 0x51, 0x95, 0x48, 0xef, 0xed  // vpxorq zmm13, zmm13, zmm13
+    db 0x62, 0x51, 0xad, 0x48, 0xef, 0xd2  // vpxorq zmm10, zmm10, zmm10
+    db 0x62, 0x51, 0x8d, 0x48, 0xef, 0xf6  // vpxorq zmm14, zmm14, zmm14
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x04, 0x07  // vmovdqu64 zmm0, [rdi + rax]
+    db 0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x4c, 0x07, 0x01  // vmovdqu64 zmm1, [rdi + rax + 64]
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x26  // vbroadcastsd zmm4, qword ptr [rsi + 0]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xbd, 0x48, 0xef, 0xc2  // vpxorq zmm8, zmm8, zmm2
+    db 0x62, 0x71, 0x9d, 0x48, 0xef, 0xe3  // vpxorq zmm12, zmm12, zmm3
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x66, 0x01  // vbroadcastsd zmm4, qword ptr [rsi + 8]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xb5, 0x48, 0xef, 0xca  // vpxorq zmm9, zmm9, zmm2
+    db 0x62, 0x71, 0x95, 0x48, 0xef, 0xeb  // vpxorq zmm13, zmm13, zmm3
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x66, 0x02  // vbroadcastsd zmm4, qword ptr [rsi + 16]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xad, 0x48, 0xef, 0xd2  // vpxorq zmm10, zmm10, zmm2
+    db 0x62, 0x71, 0x8d, 0x48, 0xef, 0xf3  // vpxorq zmm14, zmm14, zmm3
+    add rsi, 24
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x04, 0x07  // vmovdqu64 [rdi + rax], zmm8
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x64, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm12
+    mov rdi, [r11 + 8]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x0c, 0x07  // vmovdqu64 [rdi + rax], zmm9
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x6c, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm13
+    mov rdi, [r11 + 16]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x14, 0x07  // vmovdqu64 [rdi + rax], zmm10
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x74, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm14
+    add rax, 128
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}
+
+// dst[o][i] = sum over j of c[j][o] * src[j][i], for i in off..off+n.
+// n is a multiple of 128. Every vector instruction is written as bytes
+// with its mnemonic beside it, because the Mettle assembler lacks it.
+export fn erasure_k_gfni512_4(tbls: uint8*, srcs: uint8**, k: int64, dsts: uint8**, off: int64, n: int64, mask: uint8*) {
+  asm {
+    mov r8, {tbls}
+    mov r9, {srcs}
+    mov r10, {k}
+    mov r11, {dsts}
+    mov rax, {off}
+    mov rcx, {n}
+    add rcx, rax
+  outer:
+    cmp rax, rcx
+    jge done
+    db 0x62, 0x51, 0xbd, 0x48, 0xef, 0xc0  // vpxorq zmm8, zmm8, zmm8
+    db 0x62, 0x51, 0x9d, 0x48, 0xef, 0xe4  // vpxorq zmm12, zmm12, zmm12
+    db 0x62, 0x51, 0xb5, 0x48, 0xef, 0xc9  // vpxorq zmm9, zmm9, zmm9
+    db 0x62, 0x51, 0x95, 0x48, 0xef, 0xed  // vpxorq zmm13, zmm13, zmm13
+    db 0x62, 0x51, 0xad, 0x48, 0xef, 0xd2  // vpxorq zmm10, zmm10, zmm10
+    db 0x62, 0x51, 0x8d, 0x48, 0xef, 0xf6  // vpxorq zmm14, zmm14, zmm14
+    db 0x62, 0x51, 0xa5, 0x48, 0xef, 0xdb  // vpxorq zmm11, zmm11, zmm11
+    db 0x62, 0x51, 0x85, 0x48, 0xef, 0xff  // vpxorq zmm15, zmm15, zmm15
+    mov rsi, r8
+    xor rdx, rdx
+  inner:
+    mov rdi, [r9 + rdx*8]
+    db 0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x04, 0x07  // vmovdqu64 zmm0, [rdi + rax]
+    db 0x62, 0xf1, 0xfe, 0x48, 0x6f, 0x4c, 0x07, 0x01  // vmovdqu64 zmm1, [rdi + rax + 64]
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x26  // vbroadcastsd zmm4, qword ptr [rsi + 0]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xbd, 0x48, 0xef, 0xc2  // vpxorq zmm8, zmm8, zmm2
+    db 0x62, 0x71, 0x9d, 0x48, 0xef, 0xe3  // vpxorq zmm12, zmm12, zmm3
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x66, 0x01  // vbroadcastsd zmm4, qword ptr [rsi + 8]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xb5, 0x48, 0xef, 0xca  // vpxorq zmm9, zmm9, zmm2
+    db 0x62, 0x71, 0x95, 0x48, 0xef, 0xeb  // vpxorq zmm13, zmm13, zmm3
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x66, 0x02  // vbroadcastsd zmm4, qword ptr [rsi + 16]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xad, 0x48, 0xef, 0xd2  // vpxorq zmm10, zmm10, zmm2
+    db 0x62, 0x71, 0x8d, 0x48, 0xef, 0xf3  // vpxorq zmm14, zmm14, zmm3
+    db 0x62, 0xf2, 0xfd, 0x48, 0x19, 0x66, 0x03  // vbroadcastsd zmm4, qword ptr [rsi + 24]
+    db 0x62, 0xf3, 0xfd, 0x48, 0xce, 0xd4, 0x00  // vgf2p8affineqb zmm2, zmm0, zmm4, 0
+    db 0x62, 0xf3, 0xf5, 0x48, 0xce, 0xdc, 0x00  // vgf2p8affineqb zmm3, zmm1, zmm4, 0
+    db 0x62, 0x71, 0xa5, 0x48, 0xef, 0xda  // vpxorq zmm11, zmm11, zmm2
+    db 0x62, 0x71, 0x85, 0x48, 0xef, 0xfb  // vpxorq zmm15, zmm15, zmm3
+    add rsi, 32
+    inc rdx
+    cmp rdx, r10
+    jl inner
+    mov rdi, [r11 + 0]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x04, 0x07  // vmovdqu64 [rdi + rax], zmm8
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x64, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm12
+    mov rdi, [r11 + 8]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x0c, 0x07  // vmovdqu64 [rdi + rax], zmm9
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x6c, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm13
+    mov rdi, [r11 + 16]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x14, 0x07  // vmovdqu64 [rdi + rax], zmm10
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x74, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm14
+    mov rdi, [r11 + 24]
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x1c, 0x07  // vmovdqu64 [rdi + rax], zmm11
+    db 0x62, 0x71, 0xfe, 0x48, 0x7f, 0x7c, 0x07, 0x01  // vmovdqu64 [rdi + rax + 64], zmm15
+    add rax, 128
+    jmp outer
+  done:
+    db 0xc5, 0xf8, 0x77  // vzeroupper
+  }
+}

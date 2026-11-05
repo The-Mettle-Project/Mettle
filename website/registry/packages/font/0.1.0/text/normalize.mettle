@@ -1,0 +1,140 @@
+// Unicode normalization forms NFD and NFC, following Unicode Standard
+// Annex #15: full canonical decomposition, canonical ordering by combining
+// class, and canonical composition.
+//
+// Input is a sequence of code points. Values that are not Unicode scalar
+// values (surrogates, past U+10FFFF) have no properties, so they pass through
+// unchanged.
+
+import "font/core/vec";
+import "unicode_data";
+import "std/mem";
+
+// Runs of combining marks up to this length are ordered by insertion sort;
+// longer runs use a counting sort so that hostile input stays fast.
+const SMALL_RUN: int64 = 24;
+
+// Appends the full canonical decomposition of cp. Uses a small stack instead
+// of recursion. Returns false when memory runs out.
+fn push_decomposed(cp: uint32, out: FontVec<uint32>*) -> bool {
+  var stack: uint32[48];
+  var sp: int64 = 0;
+  stack[0] = cp;
+  sp = 1;
+  while (sp > 0) {
+    sp = sp - 1;
+    var c: uint32 = stack[sp];
+    var a: uint32 = 0;
+    var b: uint32 = 0;
+    // The longest canonical decomposition is far shorter than the stack, but
+    // stop splitting if it ever filled up.
+    if (sp < 44 && font_ucd_decompose(c, &a, &b)) {
+      if (b != 0) { stack[sp] = b; sp = sp + 1; }
+      stack[sp] = a;
+      sp = sp + 1;
+    } else {
+      if (!font_vec_push<uint32>(out, c)) { return false; }
+    }
+  }
+  return true;
+}
+
+// Stable sort of v[lo..hi] by combining class, for a run of non-starters.
+fn sort_run(v: uint32*, lo: int64, hi: int64) {
+  var len: int64 = hi - lo;
+  if (len <= SMALL_RUN) {
+    for i: int64 in lo + 1..hi {
+      var x: uint32 = v[i];
+      var cx: uint8 = font_ucd_ccc(x);
+      var j: int64 = i;
+      while (j > lo && font_ucd_ccc(v[j - 1]) > cx) {
+        v[j] = v[j - 1];
+        j = j - 1;
+      }
+      v[j] = x;
+    }
+    return;
+  }
+  // Counting sort on the class (1..255), stable.
+  var tmp: uint32* = (uint32*)malloc(len * 4);
+  var count: int64[257];
+  if (tmp == 0) {
+    // Out of memory: fall back to a slow but correct insertion sort.
+    for i: int64 in lo + 1..hi {
+      var x: uint32 = v[i];
+      var cx: uint8 = font_ucd_ccc(x);
+      var j: int64 = i;
+      while (j > lo && font_ucd_ccc(v[j - 1]) > cx) {
+        v[j] = v[j - 1];
+        j = j - 1;
+      }
+      v[j] = x;
+    }
+    return;
+  }
+  for i: int64 in lo..hi { var k: int64 = (int64)font_ucd_ccc(v[i]); count[k + 1] = count[k + 1] + 1; }
+  for k in 1..257 { count[k] = count[k] + count[k - 1]; }
+  for i: int64 in lo..hi {
+    var k: int64 = (int64)font_ucd_ccc(v[i]);
+    tmp[count[k]] = v[i];
+    count[k] = count[k] + 1;
+  }
+  for i: int64 in 0..len { v[lo + i] = tmp[i]; }
+  free((rawptr)tmp);
+}
+
+// Canonical ordering of v[from..to]: every run of non-starters is sorted by
+// combining class.
+fn order_marks(v: uint32*, from: int64, to: int64) {
+  var i: int64 = from;
+  while (i < to) {
+    if (font_ucd_ccc(v[i]) == 0) { i = i + 1; continue; }
+    var j: int64 = i + 1;
+    while (j < to && font_ucd_ccc(v[j]) != 0) { j = j + 1; }
+    if (j - i > 1) { sort_run(v, i, j); }
+    i = j;
+  }
+}
+
+/// Appends the canonical decomposition (NFD) of cps[0..n] to out. Returns false
+/// when memory runs out.
+export fn font_ucd_nfd(cps: uint32*, n: int64, out: FontVec<uint32>*) -> bool {
+  var start: int64 = out->len;
+  for i: int64 in 0..n {
+    if (!push_decomposed(cps[i], out)) { return false; }
+  }
+  order_marks(out->data, start, out->len);
+  return true;
+}
+
+/// Appends the canonical composition (NFC) of cps[0..n] to out. Returns false
+/// when memory runs out.
+export fn font_ucd_nfc(cps: uint32*, n: int64, out: FontVec<uint32>*) -> bool {
+  var start: int64 = out->len;
+  if (!font_ucd_nfd(cps, n, out)) { return false; }
+  var v: uint32* = out->data;
+  var end: int64 = out->len;
+  var w: int64 = start;       // next write position
+  var starter: int64 = -1;    // position of the last starter that was kept
+  var last: int64 = 0;        // combining class of the last mark kept after it
+  for r: int64 in start..end {
+    var c: uint32 = v[r];
+    var cc: int64 = (int64)font_ucd_ccc(c);
+    if (starter >= 0) {
+      // c is not blocked when nothing sits between the starter and c, or when
+      // the mark just before it has a lower class.
+      if (w - 1 == starter || last < cc) {
+        var comp: uint32 = font_ucd_compose(v[starter], c);
+        if (comp != 0) {
+          v[starter] = comp;
+          continue;
+        }
+      }
+    }
+    if (cc == 0) { starter = w; last = 0; } else { last = cc; }
+    v[w] = c;
+    w = w + 1;
+  }
+  out->len = w;
+  return true;
+}

@@ -1,0 +1,376 @@
+// raize_api/cache: ETags and conditional requests.
+//
+//   rapi_use_etags(api);                      // GET/HEAD: ETag, and 304 on If-None-Match
+//   rapi_require_if_match(put_op);            // PUT/PATCH/DELETE: 428 without If-Match
+//   fn put_task(r: RapiReq*) -> int32 {
+//     var rc: int32 = rapi_if_match(r, current_etag_of_task(r));
+//     if (rc != RAPI_NEXT) { return rc; }      // 412, already sent
+//     ...
+//   }
+//
+// Follows:
+//   RFC 9110 8.8.3     ETag: entity-tag = [ "W/" ] DQUOTE *etagc DQUOTE
+//   RFC 9110 8.8.3.2   strong comparison (If-Match) and weak comparison (If-None-Match)
+//   RFC 9110 13.1.1    If-Match, 13.1.2 If-None-Match ("*" matches any current representation)
+//   RFC 9110 13.2.2    order of evaluation: If-Match first, then If-None-Match
+//   RFC 9110 15.4.5    304 Not Modified (keeps ETag, Cache-Control, Vary, Content-Location,
+//                      Expires; has no body and no Content-Type or Content-Length)
+//   RFC 9110 15.5.13   412 Precondition Failed
+//   RFC 6585 3         428 Precondition Required
+//   RFC 9111           Cache-Control stays on a 304 so caches can refresh the stored response
+//
+// Header values come from the client. A list that is not well formed matches nothing,
+// so If-Match then answers 412 and If-None-Match lets the full response through.
+//
+// Hook order: the ETag is made from the bytes the handler wrote, so register
+// rapi_use_etags before any hook that changes the body (compression).
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/header";
+import "../types/type";
+import "../route/api";
+import "../problem/problem";
+
+// ---------------------------------------------------------------------------
+// The hash: xxHash64 (seed 0). It is a proven non-cryptographic hash with good
+// bit mixing and is fast on large bodies; FNV-1a is simpler but mixes the last
+// bytes poorly. An ETag only has to change when the bytes change, so a hash
+// is enough. It is not a security feature: do not use it to prove integrity.
+// ---------------------------------------------------------------------------
+
+const RAPI__XP1: uint64 = 0x9E3779B185EBCA87;
+const RAPI__XP2: uint64 = 0xC2B2AE3D27D4EB4F;
+const RAPI__XP3: uint64 = 0x165667B19E3779F9;
+const RAPI__XP4: uint64 = 0x85EBCA77C2B2AE63;
+const RAPI__XP5: uint64 = 0x27D4EB2F165667C5;
+
+fn rapi__rotl(x: uint64, r: int32) -> uint64 {
+  return (x << (uint64)r) | (x >> (uint64)(64 - r));
+}
+
+fn rapi__rd64(p: uint8*) -> uint64 {
+  var v: uint64 = 0;
+  var i: int32 = 7;
+  while (i >= 0) {
+    v = (v << (uint64)8) | (uint64)p[i];
+    i = i - 1;
+  }
+  return v;
+}
+
+fn rapi__rd32(p: uint8*) -> uint64 {
+  var v: uint64 = 0;
+  var i: int32 = 3;
+  while (i >= 0) {
+    v = (v << (uint64)8) | (uint64)p[i];
+    i = i - 1;
+  }
+  return v;
+}
+
+fn rapi__xx_round(acc: uint64, input: uint64) -> uint64 {
+  var a: uint64 = acc + input * RAPI__XP2;
+  return rapi__rotl(a, 31) * RAPI__XP1;
+}
+
+fn rapi__xx_merge(h: uint64, v: uint64) -> uint64 {
+  var x: uint64 = h ^ rapi__xx_round(0, v);
+  return x * RAPI__XP1 + RAPI__XP4;
+}
+
+/// internal: xxHash64 of `len` bytes at `p`, seed 0.
+export fn rapi__xxh64(p: uint8*, len: int64) -> uint64 {
+  var h: uint64 = 0;
+  var i: int64 = 0;
+  if (len >= 32) {
+    var v1: uint64 = RAPI__XP1 + RAPI__XP2;
+    var v2: uint64 = RAPI__XP2;
+    var v3: uint64 = 0;
+    var v4: uint64 = (uint64)0 - RAPI__XP1;
+    while (i + 32 <= len) {
+      v1 = rapi__xx_round(v1, rapi__rd64(&p[i]));
+      v2 = rapi__xx_round(v2, rapi__rd64(&p[i + 8]));
+      v3 = rapi__xx_round(v3, rapi__rd64(&p[i + 16]));
+      v4 = rapi__xx_round(v4, rapi__rd64(&p[i + 24]));
+      i = i + 32;
+    }
+    h = rapi__rotl(v1, 1) + rapi__rotl(v2, 7) + rapi__rotl(v3, 12) + rapi__rotl(v4, 18);
+    h = rapi__xx_merge(h, v1);
+    h = rapi__xx_merge(h, v2);
+    h = rapi__xx_merge(h, v3);
+    h = rapi__xx_merge(h, v4);
+  } else {
+    h = RAPI__XP5;
+  }
+  h = h + (uint64)len;
+  while (i + 8 <= len) {
+    var k1: uint64 = rapi__xx_round(0, rapi__rd64(&p[i]));
+    h = h ^ k1;
+    h = rapi__rotl(h, 27) * RAPI__XP1 + RAPI__XP4;
+    i = i + 8;
+  }
+  if (i + 4 <= len) {
+    h = h ^ (rapi__rd32(&p[i]) * RAPI__XP1);
+    h = rapi__rotl(h, 23) * RAPI__XP2 + RAPI__XP3;
+    i = i + 4;
+  }
+  while (i < len) {
+    h = h ^ ((uint64)p[i] * RAPI__XP5);
+    h = rapi__rotl(h, 11) * RAPI__XP1;
+    i = i + 1;
+  }
+  h = h ^ (h >> (uint64)33);
+  h = h * RAPI__XP2;
+  h = h ^ (h >> (uint64)29);
+  h = h * RAPI__XP3;
+  h = h ^ (h >> (uint64)32);
+  return h;
+}
+
+/// A strong ETag for `body`: DQUOTE, 16 lower-case hex digits of its xxHash64, DQUOTE.
+/// It is a hash of the bytes, not a cryptographic digest.
+/// body: the response bytes. arena: where the text goes.
+/// returns: the ETag value (18 bytes), or "" when the arena is exhausted.
+export fn rapi_etag_of(body: string, arena: RzArena*) -> string {
+  var h: uint64 = rapi__xxh64(body.chars, (int64)body.length);
+  var out: uint8* = rz_arena_alloc(arena, 18);
+  if (out == 0) { return ""; }
+  out[0] = 34;
+  for k in 0..16 {
+    var nib: int32 = (int32)((h >> (uint64)((15 - k) * 4)) & (uint64)15);
+    if (nib < 10) { out[1 + k] = (uint8)(48 + nib); } else { out[1 + k] = (uint8)(87 + nib); }
+  }
+  out[17] = 34;
+  return rz_str_view(out, 18);
+}
+
+// ---------------------------------------------------------------------------
+// Reading entity-tags (RFC 9110 8.8.3). Nothing here allocates; spans index
+// into the header text.
+// ---------------------------------------------------------------------------
+
+// Reads one entity-tag at `i`. Returns the index after it, or -1 when it is not
+// well formed. `os`..`oe` is the opaque-tag with its quotes.
+fn rapi__etag_parse(s: string, i: int64, weak: bool*, os: int64*, oe: int64*) -> int64 {
+  var n: int64 = (int64)s.length;
+  var k: int64 = i;
+  *weak = false;
+  if (k + 1 < n && s.chars[k] == 87 && s.chars[k + 1] == 47) {
+    *weak = true;
+    k = k + 2;
+  }
+  if (k >= n || s.chars[k] != 34) { return -1; }
+  *os = k;
+  k = k + 1;
+  while (k < n) {
+    var c: int32 = (int32)s.chars[k];
+    if (c == 34) {
+      *oe = k + 1;
+      return k + 1;
+    }
+    var ok: bool = c == 33 || (c >= 35 && c <= 126) || c >= 128;
+    if (!ok) { return -1; }
+    k = k + 1;
+  }
+  return -1;
+}
+
+fn rapi__ows(s: string, i: int64) -> int64 {
+  var k: int64 = i;
+  var n: int64 = (int64)s.length;
+  while (k < n && (s.chars[k] == 32 || s.chars[k] == 9)) { k = k + 1; }
+  return k;
+}
+
+// True when the list `value` (1#entity-tag) holds a tag that matches `cur_opaque`.
+// Strong comparison needs both tags strong; weak comparison ignores W/.
+// A list with any malformed part matches nothing.
+fn rapi__list_has(value: string, cur_weak: bool, cur_opaque: string, strong: bool) -> bool {
+  var n: int64 = (int64)value.length;
+  var i: int64 = 0;
+  var found: bool = false;
+  var count: int32 = 0;
+  while (true) {
+    while (i < n && (value.chars[i] == 32 || value.chars[i] == 9 || value.chars[i] == 44)) { i = i + 1; }
+    if (i >= n) { break; }
+    var weak: bool = false;
+    var os: int64 = 0;
+    var oe: int64 = 0;
+    var j: int64 = rapi__etag_parse(value, i, &weak, &os, &oe);
+    if (j < 0) { return false; }
+    var k: int64 = rapi__ows(value, j);
+    if (k < n && value.chars[k] != 44) { return false; }
+    count = count + 1;
+    var same: bool = rz_str_eq(rz_str_sub(value, os, oe), cur_opaque);
+    if (same && strong && (weak || cur_weak)) { same = false; }
+    if (same) { found = true; }
+    i = k;
+  }
+  return found && count > 0;
+}
+
+const RAPI__PRE_ABSENT: int32 = 0;
+const RAPI__PRE_MATCH: int32 = 1;
+const RAPI__PRE_FAIL: int32 = 2;
+
+// Evaluates every `name` field line of the request against `current` ("" for no
+// current representation). Absent, or the best result of the lines present.
+fn rapi__precondition(req: RzRequest*, name: string, current: string, strong: bool) -> int32 {
+  var present: bool = false;
+  var matched: bool = false;
+  var cur_weak: bool = false;
+  var cos: int64 = 0;
+  var coe: int64 = 0;
+  var cur_ok: bool = false;
+  if (current.length > 0) {
+    var end: int64 = rapi__etag_parse(current, 0, &cur_weak, &cos, &coe);
+    cur_ok = end == (int64)current.length;
+  }
+  var cur_opaque: string = rz_str_sub(current, cos, coe);
+  for i in 0..req->header_count {
+    if (!rz_str_eq_ci(req->headers[i].name, name)) { continue; }
+    present = true;
+    var v: string = rz_header_trim(req->headers[i].value);
+    if (v == "*") {
+      if (current.length > 0) { matched = true; }
+    } else if (cur_ok && rapi__list_has(v, cur_weak, cur_opaque, strong)) {
+      matched = true;
+    }
+  }
+  if (!present) { return RAPI__PRE_ABSENT; }
+  if (matched) { return RAPI__PRE_MATCH; }
+  return RAPI__PRE_FAIL;
+}
+
+// ---------------------------------------------------------------------------
+// Operations that must carry If-Match. The table is written at startup only
+// (rapi_require_if_match) and read by workers, so it needs no lock.
+// ---------------------------------------------------------------------------
+
+var g_cache_ops: (RapiOp*)[256];
+var g_cache_nops: int32 = 0;
+var g_cache_apis: (RapiApi*)[8];
+var g_cache_napis: int32 = 0;
+
+fn rapi__needs_if_match(op: RapiOp*) -> bool {
+  for i in 0..g_cache_nops {
+    if (g_cache_ops[i] == op) { return true; }
+  }
+  return false;
+}
+
+fn rapi__no_if_match(ctx: RzContext*) -> int32 {
+  return rapi_problem(ctx, 428, "send an If-Match header with the ETag of the version you are changing");
+}
+
+fn rapi__header_present(req: RzRequest*, name: string) -> bool {
+  return rz_header_has(req->headers, req->header_count, name);
+}
+
+// Before hook: refuses a marked operation early, before the body is read.
+fn rapi__require_hook(r: RapiReq*) -> int32 {
+  if (g_cache_nops == 0 || !rapi__needs_if_match(r->op)) { return RAPI_NEXT; }
+  if (rapi__header_present(r->ctx->req, "If-Match")) { return RAPI_NEXT; }
+  return rapi__no_if_match(r->ctx);
+}
+
+/// Makes the operation answer 428 (RFC 6585 section 3) when the request has no If-Match
+/// header, and lists the header in its OpenAPI parameters. Call it at startup, for
+/// PUT, PATCH or DELETE operations, once the operation exists. It adds a before hook to
+/// the operation's API the first time, so register auth hooks first if a caller who is
+/// not signed in should see 401 before 428. At most 256 operations.
+export fn rapi_require_if_match(op: RapiOp*) {
+  if (op == 0) { return; }
+  if (rapi__needs_if_match(op)) { return; }
+  var n: int32 = 0;
+  var apis: RapiApi** = rapi__apis(&n);
+  var owner: RapiApi* = (RapiApi*)0;
+  for a in 0..n {
+    for i in 0..apis[a]->nops {
+      if (apis[a]->ops[i] == op) { owner = apis[a]; }
+    }
+  }
+  if (g_cache_nops >= 256) {
+    if (owner != 0) { rapi__set_error(owner, "more than 256 operations need If-Match"); }
+    return;
+  }
+  g_cache_ops[g_cache_nops] = op;
+  g_cache_nops = g_cache_nops + 1;
+  if (owner == 0) { return; }
+  var hooked: bool = false;
+  for a in 0..g_cache_napis {
+    if (g_cache_apis[a] == owner) { hooked = true; }
+  }
+  if (!hooked && g_cache_napis < 8) {
+    g_cache_apis[g_cache_napis] = owner;
+    g_cache_napis = g_cache_napis + 1;
+    rapi_before(owner, &rapi__require_hook);
+  }
+  rapi_header_param(op, "If-Match", rapi_string_t(), true, "The ETag of the version being changed");
+}
+
+/// Checks the If-Match header (RFC 9110 13.1.1, strong comparison) against the
+/// resource's current ETag. Call it first in the handler of a PUT, PATCH or DELETE.
+/// current: the current strong ETag with its quotes, or "" when the resource does not
+/// exist. "*" in If-Match matches when current is not "".
+/// returns: RAPI_NEXT to go on (no If-Match header, or it matches), 428 after sending a
+/// problem when the operation needs If-Match and it is missing (rapi_require_if_match),
+/// or 412 after sending a problem when it does not match.
+export fn rapi_if_match(r: RapiReq*, current: string) -> int32 {
+  var st: int32 = rapi__precondition(r->ctx->req, "If-Match", current, true);
+  if (st == RAPI__PRE_ABSENT) {
+    if (rapi__needs_if_match(r->op)) { return rapi__no_if_match(r->ctx); }
+    return RAPI_NEXT;
+  }
+  if (st == RAPI__PRE_MATCH) { return RAPI_NEXT; }
+  return rapi_problem(r->ctx, 412, "the resource has changed since you read it; fetch it again and retry");
+}
+
+// ---------------------------------------------------------------------------
+// The after hook for GET and HEAD
+// ---------------------------------------------------------------------------
+
+// A 304 has no body and no representation headers (RFC 9110 15.4.5). The other
+// headers (ETag, Cache-Control, Vary, Content-Location, Expires) stay.
+fn rapi__not_modified(ctx: RzContext*) -> int32 {
+  rz_resp_header_del(ctx->resp, "Content-Type");
+  rz_resp_header_del(ctx->resp, "Content-Length");
+  rz_resp_header_del(ctx->resp, "Content-Encoding");
+  rz_resp_header_del(ctx->resp, "Content-Language");
+  ctx->resp->status = 304;
+  ctx->resp->body->len = 0;
+  return 304;
+}
+
+fn rapi__etag_after(r: RapiReq*, status: int32) -> int32 {
+  var ctx: RzContext* = r->ctx;
+  var resp: RzResponse* = ctx->resp;
+  var verb: string = ctx->req->verb;
+  if (status != 200 || (verb != "GET" && verb != "HEAD")) { return status; }
+  if (resp->body == 0 || resp->body->len == 0) { return status; }
+  var tag: string = rz_resp_header_get(resp, "ETag");
+  if (tag.length == 0) {
+    tag = rapi_etag_of(rz_buf_str(resp->body), ctx->arena);
+    if (tag.length == 0 || rz_ctx_set_header(ctx, "ETag", tag) != 0) { return status; }
+  }
+  // 13.2.2: If-Match first, then If-None-Match.
+  var im: int32 = rapi__precondition(ctx->req, "If-Match", tag, true);
+  if (im == RAPI__PRE_FAIL) {
+    resp->body->len = 0;
+    return rapi_problem(ctx, 412, "the resource does not match the If-Match header");
+  }
+  var inm: int32 = rapi__precondition(ctx->req, "If-None-Match", tag, false);
+  if (inm == RAPI__PRE_MATCH) { return rapi__not_modified(ctx); }
+  return status;
+}
+
+/// Adds ETags to the API's GET and HEAD responses. A 200 response with a body and
+/// no ETag of its own gets a strong ETag made from the body (rapi_etag_of). Then
+/// If-None-Match is checked with weak comparison, and a match turns the response into
+/// 304 Not Modified. If-Match on a GET is checked too and answers 412 when it fails.
+/// A handler that sets its own ETag header (for example a version number) keeps it.
+export fn rapi_use_etags(api: RapiApi*) {
+  rapi_after(api, &rapi__etag_after);
+}

@@ -1,0 +1,346 @@
+// JPEG encoder: baseline, Huffman coded, 4:2:0 or 4:4:4 color or gray.
+// Uses the standard quantization tables scaled by quality (as libjpeg's
+// -quality) and the standard Huffman tables. The forward DCT is the float
+// AAN method.
+
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "../core/buf";
+import "../ops/convert";
+
+const STD_Q0: int32[64] = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99];
+const STD_Q1: int32[64] = [17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99];
+const DC0_BITS: int32[16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+const DC0_VALS: int32[12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const AC0_BITS: int32[16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125];
+const AC0_VALS: int32[162] = [1, 2, 3, 0, 4, 17, 5, 18, 33, 49, 65, 6, 19, 81, 97, 7, 34, 113, 20, 50, 129, 145, 161, 8, 35, 66, 177, 193, 21, 82, 209, 240, 36, 51, 98, 114, 130, 9, 10, 22, 23, 24, 25, 26, 37, 38, 39, 40, 41, 42, 52, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250];
+const DC1_BITS: int32[16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+const DC1_VALS: int32[12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const AC1_BITS: int32[16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119];
+const AC1_VALS: int32[162] = [0, 1, 2, 3, 17, 4, 5, 33, 49, 6, 18, 65, 81, 7, 97, 113, 19, 34, 50, 129, 8, 20, 66, 145, 161, 177, 193, 9, 35, 51, 82, 240, 21, 98, 114, 209, 10, 22, 36, 52, 225, 37, 241, 23, 24, 25, 26, 38, 39, 40, 41, 42, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 130, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 226, 227, 228, 229, 230, 231, 232, 233, 234, 242, 243, 244, 245, 246, 247, 248, 249, 250];
+
+const ZIG: int32[64] = [
+  0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+  12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+  35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+  58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63];
+
+const AASF: float64[8] = [1.0, 1.387039845, 1.306562965, 1.175875602, 1.0, 0.785694958, 0.541196100, 0.275899379];
+
+struct HCode {
+  co: uint16[256];
+  si: uint8[256];
+}
+
+struct JEnc {
+  out: EtchBuf*;
+  bits: uint32;
+  nbits: int32;
+  err: int32;
+  dc: HCode[2];
+  ac: HCode[2];
+  q: int32[128];         // natural order, luma then chroma
+  fd: float32[128];      // 1 / divisor, natural order
+  pred: int32[3];
+}
+
+fn make_codes(h: HCode*, bits: int32*, vals: int32*) {
+  var code: int32 = 0;
+  var k: int32 = 0;
+  for len in 1..17 {
+    for i in 0..bits[len - 1] {
+      h->co[vals[k]] = (uint16)code;
+      h->si[vals[k]] = (uint8)len;
+      code = code + 1;
+      k = k + 1;
+    }
+    code = code << 1;
+  }
+}
+
+fn emit(e: JEnc*, code: int32, len: int32) {
+  if (len == 0) { return; }
+  e->bits = e->bits | (((uint32)code & (((uint32)1 << (uint32)len) - 1)) << (uint32)(32 - e->nbits - len));
+  e->nbits = e->nbits + len;
+  while (e->nbits >= 8) {
+    var b: int32 = (int32)(e->bits >> 24);
+    if (etch_buf_push(e->out, b) != ETCH_OK) { e->err = ETCH_E_MEM; }
+    if (b == 255) { etch_buf_push(e->out, 0); }
+    e->bits = e->bits << 8;
+    e->nbits = e->nbits - 8;
+  }
+}
+
+fn flush_bits(e: JEnc*) {
+  if (e->nbits > 0) { emit(e, 127, 8 - (e->nbits & 7)); }
+}
+
+fn nbits_of(v0: int32) -> int32 {
+  var v: int32 = v0;
+  if (v < 0) { v = -v; }
+  var n: int32 = 0;
+  while (v > 0) { v = v >> 1; n = n + 1; }
+  return n;
+}
+
+fn fdct8(d: float32*, step: int64) {
+  var d0: float32 = d[0];
+  var d1: float32 = d[step];
+  var d2: float32 = d[step * 2];
+  var d3: float32 = d[step * 3];
+  var d4: float32 = d[step * 4];
+  var d5: float32 = d[step * 5];
+  var d6: float32 = d[step * 6];
+  var d7: float32 = d[step * 7];
+  var tmp0: float32 = d0 + d7;
+  var tmp7: float32 = d0 - d7;
+  var tmp1: float32 = d1 + d6;
+  var tmp6: float32 = d1 - d6;
+  var tmp2: float32 = d2 + d5;
+  var tmp5: float32 = d2 - d5;
+  var tmp3: float32 = d3 + d4;
+  var tmp4: float32 = d3 - d4;
+  var tmp10: float32 = tmp0 + tmp3;
+  var tmp13: float32 = tmp0 - tmp3;
+  var tmp11: float32 = tmp1 + tmp2;
+  var tmp12: float32 = tmp1 - tmp2;
+  d[0] = tmp10 + tmp11;
+  d[step * 4] = tmp10 - tmp11;
+  var z1: float32 = (tmp12 + tmp13) * 0.707106781;
+  d[step * 2] = tmp13 + z1;
+  d[step * 6] = tmp13 - z1;
+  tmp10 = tmp4 + tmp5;
+  tmp11 = tmp5 + tmp6;
+  tmp12 = tmp6 + tmp7;
+  var z5: float32 = (tmp10 - tmp12) * 0.382683433;
+  var z2: float32 = tmp10 * 0.541196100 + z5;
+  var z4: float32 = tmp12 * 1.306562965 + z5;
+  var z3: float32 = tmp11 * 0.707106781;
+  var z11: float32 = tmp7 + z3;
+  var z13: float32 = tmp7 - z3;
+  d[step * 5] = z13 + z2;
+  d[step * 3] = z13 - z2;
+  d[step] = z11 + z4;
+  d[step * 7] = z11 - z4;
+}
+
+// Codes one 8x8 block of samples (already minus 128). t is 0 for luma.
+fn code_block(e: JEnc*, blk: float32*, t: int32, ci: int32) {
+  for r in 0..8 { fdct8(blk + r * 8, 1); }
+  for c in 0..8 { fdct8(blk + c, 8); }
+  var zz: int32[64];
+  var fd: float32* = &e->fd[0] + (int64)t * 64;
+  for k in 0..64 {
+    var nat: int32 = ZIG[k];
+    var v: float32 = blk[nat] * fd[nat];
+    var iv: int32 = 0;
+    if (v < 0.0) { iv = -(int32)(0.5 - v); } else { iv = (int32)(v + 0.5); }
+    zz[k] = iv;
+  }
+  var dch: HCode* = &e->dc[t];
+  var ach: HCode* = &e->ac[t];
+  var diff: int32 = zz[0] - e->pred[ci];
+  e->pred[ci] = zz[0];
+  var s: int32 = nbits_of(diff);
+  emit(e, (int32)dch->co[s], (int32)dch->si[s]);
+  if (s > 0) {
+    var v: int32 = diff;
+    if (v < 0) { v = v - 1; }
+    emit(e, v, s);
+  }
+  var run: int32 = 0;
+  for k in 1..64 {
+    var v: int32 = zz[k];
+    if (v == 0) { run = run + 1; continue; }
+    while (run > 15) { emit(e, (int32)ach->co[240], (int32)ach->si[240]); run = run - 16; }
+    var sz: int32 = nbits_of(v);
+    var sym: int32 = (run << 4) | sz;
+    emit(e, (int32)ach->co[sym], (int32)ach->si[sym]);
+    if (v < 0) { v = v - 1; }
+    emit(e, v, sz);
+    run = 0;
+  }
+  if (run > 0) { emit(e, (int32)ach->co[0], (int32)ach->si[0]); }
+}
+
+fn marker(out: EtchBuf*, m: int32, len: int64) {
+  etch_buf_push(out, 255);
+  etch_buf_push(out, m);
+  etch_buf_u16be(out, len);
+}
+
+fn put_dht(out: EtchBuf*, cls: int32, id: int32, bits: int32*, vals: int32*, n: int32) {
+  etch_buf_push(out, (cls << 4) | id);
+  for i in 0..16 { etch_buf_push(out, bits[i]); }
+  for i in 0..n { etch_buf_push(out, vals[i]); }
+}
+
+/// Encodes an image as a baseline JPEG. quality is 1 to 100 (as libjpeg).
+/// With `subsample`, color is stored at half size each way (4:2:0), the
+/// usual choice; without it, 4:4:4. Gray images stay gray. Alpha is
+/// dropped; other formats are converted to 8-bit first.
+export fn etch_jpeg_encode(src: EtchImage*, out: EtchBuf*, quality: int32, subsample: bool) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0 || !etch_format_ok(src->format)) { return ETCH_E_ARG; }
+  if (src->width > 65535 || src->height > 65535) { return ETCH_E_ARG; }
+  var q: int32 = quality;
+  if (q < 1) { q = 1; }
+  if (q > 100) { q = 100; }
+  var gray: bool = (src->format & 7) <= 2;
+  var img: EtchImage;
+  var want: int32 = ETCH_RGB8;
+  if (gray) { want = ETCH_GRAY8; }
+  var conv: bool = src->format != want;
+  var rc: int32 = ETCH_OK;
+  if (conv) { rc = etch_convert(src, want, &img); } else { img = *src; }
+  if (rc != ETCH_OK) { return rc; }
+  var e: JEnc* = new JEnc;
+  if (e == 0) { if (conv) { etch_image_free(&img); } return ETCH_E_MEM; }
+  e->out = out;
+  make_codes(&e->dc[0], &DC0_BITS[0], &DC0_VALS[0]);
+  make_codes(&e->ac[0], &AC0_BITS[0], &AC0_VALS[0]);
+  make_codes(&e->dc[1], &DC1_BITS[0], &DC1_VALS[0]);
+  make_codes(&e->ac[1], &AC1_BITS[0], &AC1_VALS[0]);
+  var scale: int32 = 200 - q * 2;
+  if (q < 50) { scale = 5000 / q; }
+  for k in 0..64 {
+    var a: int32 = (STD_Q0[k] * scale + 50) / 100;
+    var b: int32 = (STD_Q1[k] * scale + 50) / 100;
+    if (a < 1) { a = 1; }
+    if (a > 255) { a = 255; }
+    if (b < 1) { b = 1; }
+    if (b > 255) { b = 255; }
+    e->q[k] = a;
+    e->q[64 + k] = b;
+    var r: int64 = (int64)(k / 8);
+    var c: int64 = (int64)(k % 8);
+    var f: float64 = AASF[r] * AASF[c] * 8.0;
+    e->fd[k] = (float32)(1.0 / ((float64)a * f));
+    e->fd[64 + k] = (float32)(1.0 / ((float64)b * f));
+  }
+  var w: int64 = (int64)img.width;
+  var h: int64 = (int64)img.height;
+  // headers
+  etch_buf_push(out, 255);
+  etch_buf_push(out, 216);
+  marker(out, 224, 16);
+  var jfif: string = "JFIF";
+  etch_buf_append(out, jfif.chars, 4);
+  etch_buf_push(out, 0);
+  etch_buf_push(out, 1); etch_buf_push(out, 1);    // version 1.1
+  etch_buf_push(out, 0);                           // no units
+  etch_buf_u16be(out, 1); etch_buf_u16be(out, 1);
+  etch_buf_push(out, 0); etch_buf_push(out, 0);
+  var ntab: int32 = 2;
+  if (gray) { ntab = 1; }
+  marker(out, 219, (int64)(2 + 65 * ntab));
+  for t in 0..ntab {
+    etch_buf_push(out, t);
+    for k in 0..64 { etch_buf_push(out, e->q[t * 64 + ZIG[k]]); }
+  }
+  var nc: int32 = 3;
+  if (gray) { nc = 1; }
+  marker(out, 192, (int64)(8 + 3 * nc));
+  etch_buf_push(out, 8);
+  etch_buf_u16be(out, h);
+  etch_buf_u16be(out, w);
+  etch_buf_push(out, nc);
+  var samp: int32 = 17;
+  if (subsample && !gray) { samp = 34; }
+  etch_buf_push(out, 1); etch_buf_push(out, samp); etch_buf_push(out, 0);
+  if (!gray) {
+    etch_buf_push(out, 2); etch_buf_push(out, 17); etch_buf_push(out, 1);
+    etch_buf_push(out, 3); etch_buf_push(out, 17); etch_buf_push(out, 1);
+  }
+  var dhtlen: int64 = 2 + 17 + 12 + 17 + 162;
+  if (!gray) { dhtlen = dhtlen + 17 + 12 + 17 + 162; }
+  marker(out, 196, dhtlen);
+  put_dht(out, 0, 0, &DC0_BITS[0], &DC0_VALS[0], 12);
+  put_dht(out, 1, 0, &AC0_BITS[0], &AC0_VALS[0], 162);
+  if (!gray) {
+    put_dht(out, 0, 1, &DC1_BITS[0], &DC1_VALS[0], 12);
+    put_dht(out, 1, 1, &AC1_BITS[0], &AC1_VALS[0], 162);
+  }
+  marker(out, 218, (int64)(6 + 2 * nc));
+  etch_buf_push(out, nc);
+  etch_buf_push(out, 1); etch_buf_push(out, 0);
+  if (!gray) {
+    etch_buf_push(out, 2); etch_buf_push(out, 17);
+    etch_buf_push(out, 3); etch_buf_push(out, 17);
+  }
+  etch_buf_push(out, 0); etch_buf_push(out, 63); etch_buf_push(out, 0);
+  // data
+  var blk: float32[64];
+  var mcu: int64 = 8;
+  if (subsample && !gray) { mcu = 16; }
+  // Y, Cb, Cr for one MCU, full resolution.
+  var ys: float32[256];
+  var cbs: float32[256];
+  var crs: float32[256];
+  var my: int64 = 0;
+  while (my < h) {
+    var mx: int64 = 0;
+    while (mx < w) {
+      for yy in 0..mcu {
+        var sy: int64 = my + yy;
+        if (sy >= h) { sy = h - 1; }
+        var row: uint8* = img.data + sy * img.stride;
+        for xx in 0..mcu {
+          var sx: int64 = mx + xx;
+          if (sx >= w) { sx = w - 1; }
+          var i: int64 = yy * mcu + xx;
+          if (gray) {
+            ys[i] = (float32)row[sx] - 128.0;
+          } else {
+            var r: float32 = (float32)row[sx * 3];
+            var g: float32 = (float32)row[sx * 3 + 1];
+            var b: float32 = (float32)row[sx * 3 + 2];
+            ys[i] = 0.299 * r + 0.587 * g + 0.114 * b - 128.0;
+            cbs[i] = -0.168735892 * r - 0.331264108 * g + 0.5 * b;
+            crs[i] = 0.5 * r - 0.418687589 * g - 0.081312411 * b;
+          }
+        }
+      }
+      if (mcu == 8) {
+        for i in 0..64 { blk[i] = ys[i]; }
+        code_block(e, &blk[0], 0, 0);
+        if (!gray) {
+          for i in 0..64 { blk[i] = cbs[i]; }
+          code_block(e, &blk[0], 1, 1);
+          for i in 0..64 { blk[i] = crs[i]; }
+          code_block(e, &blk[0], 1, 2);
+        }
+      } else {
+        for by in 0..2 {
+          for bx in 0..2 {
+            for r in 0..8 { for c in 0..8 { blk[r * 8 + c] = ys[(by * 8 + r) * 16 + bx * 8 + c]; } }
+            code_block(e, &blk[0], 0, 0);
+          }
+        }
+        for r in 0..8 {
+          for c in 0..8 {
+            var i: int64 = r * 32 + c * 2;
+            blk[r * 8 + c] = (cbs[i] + cbs[i + 1] + cbs[i + 16] + cbs[i + 17]) * 0.25;
+          }
+        }
+        code_block(e, &blk[0], 1, 1);
+        for r in 0..8 {
+          for c in 0..8 {
+            var i: int64 = r * 32 + c * 2;
+            blk[r * 8 + c] = (crs[i] + crs[i + 1] + crs[i + 16] + crs[i + 17]) * 0.25;
+          }
+        }
+        code_block(e, &blk[0], 1, 2);
+      }
+      mx = mx + mcu;
+    }
+    my = my + mcu;
+  }
+  flush_bits(e);
+  etch_buf_push(out, 255);
+  rc = etch_buf_push(out, 217);
+  if (e->err != ETCH_OK) { rc = e->err; }
+  free(e);
+  if (conv) { etch_image_free(&img); }
+  return rc;
+}

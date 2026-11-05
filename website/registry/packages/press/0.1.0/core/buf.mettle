@@ -1,0 +1,125 @@
+// PressBuf: the growable byte buffer every Press function writes into.
+//
+//   var out: PressBuf;                 // zeroed: empty, no limit
+//   press_buf_limit(&out, 64 << 20);   // optional: refuse to grow past 64 MiB
+//   press_gzip_decompress(p, n, &out);
+//   ... use out.data[0 .. out.len] ...
+//   press_buf_free(&out);
+//
+// Functions append to the buffer, so you can reuse one for many calls. Set
+// a limit when you decompress data you do not trust: a small input can
+// expand to a huge output, and the limit turns that into PRESS_E_LIMIT.
+
+import "std/mem";
+import "status";
+
+export struct PressBuf {
+  data: uint8*;
+  len: int64;     // bytes in use
+  cap: int64;     // bytes allocated
+  limit: int64;   // most bytes len may reach; 0 means no limit
+}
+
+/// Sets the most bytes the buffer may hold (0 for no limit).
+export fn press_buf_limit(b: PressBuf*, limit: int64) {
+  b->limit = limit;
+}
+
+/// Frees the buffer's memory and leaves it empty. The limit stays.
+export fn press_buf_free(b: PressBuf*) {
+  if (b->data != 0) { free(b->data); }
+  b->data = (uint8*)0;
+  b->len = 0;
+  b->cap = 0;
+}
+
+/// Empties the buffer but keeps its memory for reuse.
+export fn press_buf_clear(b: PressBuf*) {
+  b->len = 0;
+}
+
+/// Makes room for at least `extra` more bytes. Returns PRESS_E_LIMIT when
+/// that passes the limit and PRESS_E_MEM when memory runs out.
+export fn press_buf_reserve(b: PressBuf*, extra: int64) -> int32 {
+  if (extra < 0) { return PRESS_E_ARG; }
+  var need: int64 = b->len + extra;
+  if (b->limit > 0 && need > b->limit) { return PRESS_E_LIMIT; }
+  if (need <= b->cap) { return PRESS_OK; }
+  var ncap: int64 = b->cap * 2;
+  if (ncap < 256) { ncap = 256; }
+  if (ncap < need) { ncap = need; }
+  if (b->limit > 0 && ncap > b->limit) { ncap = b->limit; }
+  var nd: uint8* = (uint8*)realloc(b->data, ncap);
+  if (nd == 0) { return PRESS_E_MEM; }
+  b->data = nd;
+  b->cap = ncap;
+  return PRESS_OK;
+}
+
+/// Like press_buf_reserve, but asks for `want` bytes and settles for `need`
+/// when the limit is in the way. Decoders use it to grow in large steps.
+export fn press_buf_reserve_soft(b: PressBuf*, need: int64, want: int64) -> int32 {
+  if (b->len + want <= b->cap) { return PRESS_OK; }
+  if (b->limit > 0 && b->len + want > b->limit) {
+    return press_buf_reserve(b, need);
+  }
+  return press_buf_reserve(b, want);
+}
+
+/// Appends n bytes.
+export fn press_buf_append(b: PressBuf*, p: uint8*, n: int64) -> int32 {
+  if (n <= 0) { return PRESS_OK; }
+  var rc: int32 = press_buf_reserve(b, n);
+  if (rc != PRESS_OK) { return rc; }
+  memcpy(b->data + b->len, p, n);
+  b->len = b->len + n;
+  return PRESS_OK;
+}
+
+/// Appends one byte.
+export fn press_buf_push(b: PressBuf*, v: uint8) -> int32 {
+  if (b->len >= b->cap) {
+    var rc: int32 = press_buf_reserve(b, 1);
+    if (rc != PRESS_OK) { return rc; }
+  }
+  b->data[b->len] = v;
+  b->len = b->len + 1;
+  return PRESS_OK;
+}
+
+// Little-endian loads and stores. x86-64 and ARM64 both allow unaligned
+// access, so these are single instructions.
+@inline export fn press_rd16(p: uint8*) -> uint32 { return (uint32)*(uint16*)p; }
+@inline export fn press_rd32(p: uint8*) -> uint32 { return *(uint32*)p; }
+@inline export fn press_rd64(p: uint8*) -> uint64 { return *(uint64*)p; }
+@inline export fn press_wr16(p: uint8*, v: uint32) { *(uint16*)p = (uint16)v; }
+@inline export fn press_wr32(p: uint8*, v: uint32) { *(uint32*)p = v; }
+@inline export fn press_wr64(p: uint8*, v: uint64) { *(uint64*)p = v; }
+
+/// Appends a little-endian 32-bit value.
+export fn press_buf_put32(b: PressBuf*, v: uint32) -> int32 {
+  var rc: int32 = press_buf_reserve(b, 4);
+  if (rc != PRESS_OK) { return rc; }
+  press_wr32(b->data + b->len, v);
+  b->len = b->len + 4;
+  return PRESS_OK;
+}
+
+// Count of trailing zero bits in a nonzero 64-bit value, by de Bruijn
+// multiply (Mettle has no ctz intrinsic yet). Used to find where two
+// 8-byte words first differ.
+fn press_ctz_make() -> uint8[64] {
+  var t: uint8[64];
+  var db: uint64 = 0x03F79D71B4CB0A89;
+  for i in 0..64 {
+    t[(int64)(((db << (uint64)i)) >> 58)] = (uint8)i;
+  }
+  return t;
+}
+
+const PRESS_CTZ_T: uint8[64] = press_ctz_make();
+
+@inline export fn press_ctz64(x: uint64) -> int64 {
+  var low: uint64 = x & (0 - x);
+  return (int64)PRESS_CTZ_T[(int64)((low * 0x03F79D71B4CB0A89) >> 58)];
+}

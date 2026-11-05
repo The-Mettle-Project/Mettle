@@ -1,0 +1,290 @@
+// Authenticated encryption, in pure Mettle: XChaCha20-Poly1305-IETF
+// (draft-irtf-cfrg-xchacha-03 on top of RFC 8439) and the plain IETF
+// ChaCha20-Poly1305 of RFC 8439 section 2.8 with a 12-byte nonce.
+//
+// 24-byte nonces are large enough to pick at random for every message
+// (cr_aead_nonce), so nonce reuse needs no counter bookkeeping. Never encrypt
+// two messages with the same key and nonce. Decryption fails closed: on any
+// failure no plaintext is released. Both families share one RFC 8439 2.8
+// seal and one open (cr_aead12_seal, cr_aead12_open).
+
+import "cryptex/core/status";
+import "cryptex/core/types";
+import "cryptex/core/util";
+import "cryptex/cipher/chacha";
+import "cryptex/cipher/poly1305";
+
+/// Bytes the authentication tag adds to every ciphertext.
+/// in: -
+/// returns: 16
+/// owns: nothing
+/// thread: constant
+/// example: var cap: int64 = mlen + CR_AEAD_TAG_BYTES;
+export const CR_AEAD_TAG_BYTES: int64 = 16;
+
+var g_cr_aead_empty: uint8[1];
+
+fn cr_aead_ptr(p: uint8*, n: int64) -> uint8* {
+  if (p == 0 || n == 0) { return &g_cr_aead_empty[0]; }
+  return p;
+}
+
+// XChaCha20 key schedule: the ChaCha20 subkey (HChaCha20 of key and
+// nonce[0..16]) and the 12-byte ChaCha20 nonce (4 zero bytes || nonce[16..24]).
+// The caller wipes sub.
+fn cr_aead_derive(key: uint8*, nonce: uint8*, sub: uint8*, n12: uint8*) {
+  crx_hchacha20(sub, key, nonce);
+  var i: int32 = 0;
+  while (i < 4) {
+    n12[i] = 0;
+    i = i + 1;
+  }
+  while (i < 12) {
+    n12[i] = nonce[12 + i];
+    i = i + 1;
+  }
+}
+
+// The Poly1305 one-time key: first 32 bytes of ChaCha20 block 0 (RFC 8439
+// 2.6). The caller wipes otk.
+fn cr_aead12_otk(otk: uint8*, key: uint8*, n12: uint8*) {
+  var blk: uint8[64];
+  crx_chacha20_block(key, 0, n12, &blk[0]);
+  var i: int32 = 0;
+  while (i < 32) {
+    otk[i] = blk[i];
+    i = i + 1;
+  }
+  cr_wipe(&blk[0], 64);
+}
+
+// Poly1305 over ad || pad16 || ct || pad16 || le64(adlen) || le64(clen)
+// (RFC 8439 2.8). All lengths are public.
+fn cr_aead_mac(tag: uint8*, otk: uint8*, ad: uint8*, adlen: int64, ct: uint8*, clen: int64) {
+  var st: CrxPoly1305;
+  var zero: uint8[16];
+  var lens: uint8[16];
+  var i: int32 = 0;
+  while (i < 16) {
+    zero[i] = 0;
+    lens[i] = 0;
+    i = i + 1;
+  }
+  crx_poly1305_init(&st, otk);
+  crx_poly1305_update(&st, ad, adlen);
+  crx_poly1305_update(&st, &zero[0], (16 - adlen % 16) % 16);
+  crx_poly1305_update(&st, ct, clen);
+  crx_poly1305_update(&st, &zero[0], (16 - clen % 16) % 16);
+  var a: uint64 = (uint64)adlen;
+  var c: uint64 = (uint64)clen;
+  i = 0;
+  while (i < 8) {
+    lens[i] = (uint8)((a >> (i * 8)) & (uint64)0xff);
+    lens[8 + i] = (uint8)((c >> (i * 8)) & (uint64)0xff);
+    i = i + 1;
+  }
+  crx_poly1305_update(&st, &lens[0], 16);
+  crx_poly1305_final(&st, tag);
+}
+
+// RFC 8439 2.8 seal with a 32-byte key and 12-byte nonce: ct[0..mlen) is the
+// ciphertext and ct[mlen..mlen+16) the tag. ct may equal msg. Arguments are
+// already validated by the caller.
+fn cr_aead12_seal(ct: uint8*, msg: uint8*, mlen: int64, ad: uint8*, adlen: int64, key: uint8*, n12: uint8*) {
+  var otk: uint8[32];
+  cr_aead12_otk(&otk[0], key, n12);
+  crx_chacha20_xor(ct, cr_aead_ptr(msg, mlen), mlen, key, n12, 1);
+  cr_aead_mac(&ct[mlen], &otk[0], cr_aead_ptr(ad, adlen), adlen, ct, mlen);
+  cr_wipe(&otk[0], 32);
+}
+
+// RFC 8439 2.8 open: ct holds mlen ciphertext bytes then the 16-byte tag. On
+// success writes mlen plaintext bytes to pt (pt may equal ct) and returns
+// CR_OK. On a tag mismatch wipes the first pt_cap bytes of pt and returns
+// CR_E_VERIFY. Arguments are already validated by the caller.
+fn cr_aead12_open(pt: uint8*, pt_cap: int64, ct: uint8*, mlen: int64, ad: uint8*, adlen: int64, key: uint8*, n12: uint8*) -> int32 {
+  var otk: uint8[32];
+  var tag: uint8[16];
+  cr_aead12_otk(&otk[0], key, n12);
+  cr_aead_mac(&tag[0], &otk[0], cr_aead_ptr(ad, adlen), adlen, ct, mlen);
+  var ok: bool = cr_equal(&tag[0], &ct[mlen], 16);
+  cr_wipe(&tag[0], 16);
+  cr_wipe(&otk[0], 32);
+  if (!ok) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_VERIFY;
+  }
+  crx_chacha20_xor(pt, ct, mlen, key, n12, 1);
+  return CR_OK;
+}
+
+/// Generates a random XChaCha20-Poly1305 key.
+/// in: k
+/// returns: CR_OK; CR_E_ARG (null k); CR_E_INTERNAL if the kernel random
+///   source fails
+/// owns: k is secret caller memory: cr_wipe(&k.b[0], 32) when done
+/// thread: any thread (no shared state)
+/// example: var k: CrKey32; cr_aead_keygen(&k); defer cr_wipe(&k.b[0], 32);
+export fn cr_aead_keygen(k: CrKey32*) -> int32 {
+  if (k == 0) { return CR_E_ARG; }
+  return cr_random_bytes(&k->b[0], 32);
+}
+
+/// Generates a random 24-byte nonce. Call it once per message.
+/// in: n
+/// returns: CR_OK; CR_E_ARG (null n); CR_E_INTERNAL if the kernel random
+///   source fails
+/// owns: nothing; the nonce is public and travels with the ciphertext
+/// thread: any thread (no shared state)
+/// example: var nonce: CrNonce24; cr_aead_nonce(&nonce);
+export fn cr_aead_nonce(n: CrNonce24*) -> int32 {
+  if (n == 0) { return CR_E_ARG; }
+  return cr_random_bytes(&n->b[0], 24);
+}
+
+/// Encrypts and authenticates msg, and authenticates (does not encrypt) ad.
+/// Output is ciphertext || 16-byte tag.
+/// in: ct writable for ct_cap bytes, ct_cap >= mlen + CR_AEAD_TAG_BYTES
+///   (ct may equal msg for in-place encryption; no other overlap);
+///   ct_len, where the ciphertext length goes; msg/mlen the plaintext;
+///   ad/adlen associated data (0, 0 for none); nonce, unique per key
+///   (cr_aead_nonce); key
+/// returns: CR_OK and *ct_len = mlen + 16; CR_E_ARG (null pointer with a
+///   non-zero length, negative length, null nonce/key/ct_len); CR_E_SPACE
+///   if ct_cap is too small (nothing written, *ct_len = 0)
+/// owns: nothing; the caller owns every buffer and must wipe key and
+///   plaintext when done
+/// thread: any thread (no shared state)
+/// example: cr_aead_encrypt(&ct[0], 64, &clen, m.chars, (int64)m.length, 0, 0, &nonce, &k);
+export fn cr_aead_encrypt(ct: uint8*, ct_cap: int64, ct_len: int64*, msg: uint8*, mlen: int64, ad: uint8*, adlen: int64, nonce: CrNonce24*, key: CrKey32*) -> int32 {
+  if (ct_len == 0) { return CR_E_ARG; }
+  *ct_len = 0;
+  if (ct == 0 || nonce == 0 || key == 0) { return CR_E_ARG; }
+  if (mlen < 0 || adlen < 0 || ct_cap < 0) { return CR_E_ARG; }
+  if ((msg == 0 && mlen > 0) || (ad == 0 && adlen > 0)) { return CR_E_ARG; }
+  if (ct_cap - CR_AEAD_TAG_BYTES < mlen) { return CR_E_SPACE; }
+  var sub: uint8[32];
+  var n12: uint8[12];
+  cr_aead_derive(&key->b[0], &nonce->b[0], &sub[0], &n12[0]);
+  cr_aead12_seal(ct, msg, mlen, ad, adlen, &sub[0], &n12[0]);
+  cr_wipe(&sub[0], 32);
+  *ct_len = mlen + CR_AEAD_TAG_BYTES;
+  return CR_OK;
+}
+
+/// Verifies and decrypts ct (ciphertext || tag) produced by cr_aead_encrypt
+/// with the same key, nonce and ad. Fails closed.
+/// in: pt writable for pt_cap bytes, pt_cap >= clen - CR_AEAD_TAG_BYTES
+///   (pt may equal ct for in-place decryption); pt_len; ct/clen; ad/adlen;
+///   nonce; key
+/// returns: CR_OK and *pt_len = clen - 16; CR_E_VERIFY if the tag does not
+///   match (wrong key, nonce or ad, tampered or truncated ciphertext,
+///   clen < 16); CR_E_ARG; CR_E_SPACE. On every failure
+///   *pt_len = 0 and the first pt_cap bytes of pt are wiped (cr_wipe),
+///   so no unauthenticated plaintext ever reaches the caller (when
+///   decrypting in place, pt == ct, that also wipes the ciphertext)
+/// owns: nothing; the caller owns every buffer and must wipe the plaintext
+///   when done
+/// thread: any thread (no shared state)
+/// example: if (cr_aead_decrypt(&pt[0], 64, &plen, &ct[0], clen, 0, 0, &nonce, &k) != CR_OK) { reject(); }
+export fn cr_aead_decrypt(pt: uint8*, pt_cap: int64, pt_len: int64*, ct: uint8*, clen: int64, ad: uint8*, adlen: int64, nonce: CrNonce24*, key: CrKey32*) -> int32 {
+  if (pt_len == 0) { return CR_E_ARG; }
+  *pt_len = 0;
+  if (pt == 0 || pt_cap < 0) { return CR_E_ARG; }
+  if (ct == 0 || nonce == 0 || key == 0 || clen < 0 || adlen < 0 || (ad == 0 && adlen > 0)) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_ARG;
+  }
+  if (clen < CR_AEAD_TAG_BYTES) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_VERIFY;
+  }
+  if (pt_cap < clen - CR_AEAD_TAG_BYTES) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_SPACE;
+  }
+  var mlen: int64 = clen - CR_AEAD_TAG_BYTES;
+  var sub: uint8[32];
+  var n12: uint8[12];
+  cr_aead_derive(&key->b[0], &nonce->b[0], &sub[0], &n12[0]);
+  var rc: int32 = cr_aead12_open(pt, pt_cap, ct, mlen, ad, adlen, &sub[0], &n12[0]);
+  cr_wipe(&sub[0], 32);
+  if (rc != CR_OK) { return rc; }
+  *pt_len = mlen;
+  return CR_OK;
+}
+
+/// Encrypts and authenticates msg, and authenticates (does not encrypt) ad,
+/// with the IETF ChaCha20-Poly1305 of RFC 8439 section 2.8 (12-byte nonce).
+/// Output is ciphertext || 16-byte tag. For protocols with counter nonces
+/// such as Noise. The caller must never use the same key with the same nonce
+/// twice; with random nonces use cr_aead_encrypt (24-byte nonces) instead.
+/// in: ct writable for ct_cap bytes, ct_cap >= mlen + CR_AEAD_TAG_BYTES
+///   (ct may equal msg for in-place encryption; no other overlap);
+///   ct_len, where the ciphertext length goes; msg/mlen the plaintext
+///   (mlen <= 274877906816, RFC 8439: 2^38 - 64); ad/adlen associated data
+///   (0, 0 for none); nonce, unique per key; key
+/// returns: CR_OK and *ct_len = mlen + 16; CR_E_ARG (null pointer with a
+///   non-zero length, negative length, mlen above 274877906816, null
+///   nonce/key/ct_len); CR_E_SPACE if ct_cap is too small (nothing written,
+///   *ct_len = 0)
+/// owns: nothing; the caller owns every buffer and must wipe key and
+///   plaintext when done
+/// thread: any thread (no shared state)
+/// example: cr_chacha20poly1305_encrypt(&ct[0], 64, &clen, m.chars, (int64)m.length, 0, 0, &nonce, &k);
+export fn cr_chacha20poly1305_encrypt(ct: uint8*, ct_cap: int64, ct_len: int64*, msg: uint8*, mlen: int64, ad: uint8*, adlen: int64, nonce: CrNonce12*, key: CrKey32*) -> int32 {
+  if (ct_len == 0) { return CR_E_ARG; }
+  *ct_len = 0;
+  if (ct == 0 || nonce == 0 || key == 0) { return CR_E_ARG; }
+  if (mlen < 0 || adlen < 0 || ct_cap < 0) { return CR_E_ARG; }
+  if (mlen > 274877906816) { return CR_E_ARG; }
+  if ((msg == 0 && mlen > 0) || (ad == 0 && adlen > 0)) { return CR_E_ARG; }
+  if (ct_cap - CR_AEAD_TAG_BYTES < mlen) { return CR_E_SPACE; }
+  cr_aead12_seal(ct, msg, mlen, ad, adlen, &key->b[0], &nonce->b[0]);
+  *ct_len = mlen + CR_AEAD_TAG_BYTES;
+  return CR_OK;
+}
+
+/// Verifies and decrypts ct (ciphertext || tag) produced by
+/// cr_chacha20poly1305_encrypt with the same key, nonce and ad (RFC 8439
+/// section 2.8). Fails closed.
+/// in: pt writable for pt_cap bytes, pt_cap >= clen - CR_AEAD_TAG_BYTES
+///   (pt may equal ct for in-place decryption); pt_len; ct/clen (clen - 16
+///   <= 274877906816); ad/adlen; nonce; key
+/// returns: CR_OK and *pt_len = clen - 16; CR_E_VERIFY if the tag does not
+///   match (wrong key, nonce or ad, tampered or truncated ciphertext,
+///   clen < 16); CR_E_ARG (including a message above 274877906816 bytes);
+///   CR_E_SPACE. On every failure *pt_len = 0 and the first pt_cap bytes of
+///   pt are wiped (cr_wipe), so no unauthenticated plaintext ever reaches
+///   the caller (when decrypting in place, pt == ct, that also wipes the
+///   ciphertext)
+/// owns: nothing; the caller owns every buffer and must wipe the plaintext
+///   when done
+/// thread: any thread (no shared state)
+/// example: if (cr_chacha20poly1305_decrypt(&pt[0], 64, &plen, &ct[0], clen, 0, 0, &nonce, &k) != CR_OK) { reject(); }
+export fn cr_chacha20poly1305_decrypt(pt: uint8*, pt_cap: int64, pt_len: int64*, ct: uint8*, clen: int64, ad: uint8*, adlen: int64, nonce: CrNonce12*, key: CrKey32*) -> int32 {
+  if (pt_len == 0) { return CR_E_ARG; }
+  *pt_len = 0;
+  if (pt == 0 || pt_cap < 0) { return CR_E_ARG; }
+  if (ct == 0 || nonce == 0 || key == 0 || clen < 0 || adlen < 0 || (ad == 0 && adlen > 0)) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_ARG;
+  }
+  if (clen < CR_AEAD_TAG_BYTES) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_VERIFY;
+  }
+  if (clen - CR_AEAD_TAG_BYTES > 274877906816) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_ARG;
+  }
+  if (pt_cap < clen - CR_AEAD_TAG_BYTES) {
+    cr_wipe(pt, pt_cap);
+    return CR_E_SPACE;
+  }
+  var mlen: int64 = clen - CR_AEAD_TAG_BYTES;
+  var rc: int32 = cr_aead12_open(pt, pt_cap, ct, mlen, ad, adlen, &key->b[0], &nonce->b[0]);
+  if (rc != CR_OK) { return rc; }
+  *pt_len = mlen;
+  return CR_OK;
+}

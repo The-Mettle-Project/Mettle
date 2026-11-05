@@ -1,0 +1,112 @@
+// raize/ws/utf8 — strict UTF-8 validation for text messages (RFC 6455 §8.1).
+//
+// A text message that is not valid UTF-8 closes the connection with 1007.
+// "Valid" is RFC 3629: no overlong forms, no surrogates (U+D800-DFFF), nothing
+// above U+10FFFF. Fragments may split a code point, so the validator is
+// incremental: RzUtf8 carries the bytes still expected between calls, and
+// rz_utf8_finish says whether the message ended on a boundary.
+
+export struct RzUtf8 {
+  need: int32;       // continuation bytes still expected
+  lo: int32;         // allowed range of the next continuation byte
+  hi: int32;
+}
+
+export fn rz_utf8_reset(v: RzUtf8*) {
+  v->need = 0;
+  v->lo = 0x80;
+  v->hi = 0xBF;
+}
+
+// Feeds n bytes. Returns false at the first invalid byte; the state is then
+// meaningless until reset.
+export fn rz_utf8_feed(v: RzUtf8*, p: uint8*, n: int64) -> bool {
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)p[i];
+    if (v->need > 0) {
+      if (c < v->lo || c > v->hi) { return false; }
+      v->need = v->need - 1;
+      v->lo = 0x80;
+      v->hi = 0xBF;
+    } else if (c < 0x80) {
+      // ASCII
+    } else if (c >= 0xC2 && c <= 0xDF) {
+      v->need = 1;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+      v->need = 2;
+      if (c == 0xE0) { v->lo = 0xA0; }   // no overlong 3-byte forms
+      if (c == 0xED) { v->hi = 0x9F; }   // no surrogates
+    } else if (c >= 0xF0 && c <= 0xF4) {
+      v->need = 3;
+      if (c == 0xF0) { v->lo = 0x90; }   // no overlong 4-byte forms
+      if (c == 0xF4) { v->hi = 0x8F; }   // nothing past U+10FFFF
+    } else {
+      return false;                      // 0x80-0xC1, 0xF5-0xFF
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// True when the input so far ended on a code point boundary.
+export fn rz_utf8_finish(v: RzUtf8*) -> bool {
+  return v->need == 0;
+}
+
+// One-shot check of a whole buffer.
+export fn rz_utf8_valid(p: uint8*, n: int64) -> bool {
+  var v: RzUtf8;
+  rz_utf8_reset(&v);
+  if (!rz_utf8_feed(&v, p, n)) { return false; }
+  return rz_utf8_finish(&v);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+fn rz_utf8_bytes_ok(a: int32, b: int32, c: int32, d: int32, n: int64) -> bool {
+  var buf: uint8[4];
+  buf[0] = (uint8)a;
+  buf[1] = (uint8)b;
+  buf[2] = (uint8)c;
+  buf[3] = (uint8)d;
+  return rz_utf8_valid(&buf[0], n);
+}
+
+@test fn t_rz_utf8_accepts() -> int32 {
+  var s: string = "hello, κόσμε";
+  if (!rz_utf8_valid(s.chars, (int64)s.length)) { return 1; }
+  if (!rz_utf8_bytes_ok(0xE2, 0x82, 0xAC, 0, 3)) { return 2; }      // U+20AC
+  if (!rz_utf8_bytes_ok(0xF0, 0x9F, 0x98, 0x80, 4)) { return 3; }   // U+1F600
+  if (!rz_utf8_bytes_ok(0xF4, 0x8F, 0xBF, 0xBF, 4)) { return 4; }   // U+10FFFF
+  if (!rz_utf8_bytes_ok(0xED, 0x9F, 0xBF, 0, 3)) { return 5; }      // U+D7FF
+  if (!rz_utf8_valid(0, 0)) { return 6; }
+  return 0;
+}
+
+@test fn t_rz_utf8_rejects() -> int32 {
+  if (rz_utf8_bytes_ok(0xC0, 0xAF, 0, 0, 2)) { return 1; }          // overlong '/'
+  if (rz_utf8_bytes_ok(0xE0, 0x80, 0xAF, 0, 3)) { return 2; }       // overlong 3-byte
+  if (rz_utf8_bytes_ok(0xED, 0xA0, 0x80, 0, 3)) { return 3; }       // U+D800
+  if (rz_utf8_bytes_ok(0xF4, 0x90, 0x80, 0x80, 4)) { return 4; }    // > U+10FFFF
+  if (rz_utf8_bytes_ok(0xFF, 0, 0, 0, 1)) { return 5; }
+  if (rz_utf8_bytes_ok(0x80, 0, 0, 0, 1)) { return 6; }             // lone continuation
+  if (rz_utf8_bytes_ok(0xE2, 0x82, 0, 0, 2)) { return 7; }          // truncated
+  return 0;
+}
+
+@test fn t_rz_utf8_split_across_fragments() -> int32 {
+  var euro: uint8[3];
+  euro[0] = (uint8)0xE2;
+  euro[1] = (uint8)0x82;
+  euro[2] = (uint8)0xAC;
+  var v: RzUtf8;
+  rz_utf8_reset(&v);
+  if (!rz_utf8_feed(&v, &euro[0], 1)) { return 1; }
+  if (rz_utf8_finish(&v)) { return 2; }
+  if (!rz_utf8_feed(&v, &euro[1], 2)) { return 3; }
+  if (!rz_utf8_finish(&v)) { return 4; }
+  return 0;
+}

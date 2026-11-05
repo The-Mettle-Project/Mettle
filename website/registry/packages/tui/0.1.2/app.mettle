@@ -1,0 +1,458 @@
+// The terminal session and the event loop: setup and restore, frames,
+// events and timers. A headless session does the same work with no
+// terminal: output collects in memory, input comes from tui_feed, and time
+// only moves when tui_poll waits, so tests are exact and repeatable.
+
+import "std/mem";
+import "std/time";
+import "std/linux";
+import "types";
+import "buf";
+import "color";
+import "render";
+import "input";
+import "term";
+
+// Options for tui_init_with.
+export const TUI_OPT_MOUSE = 1;        // clicks, wheel and drags (xterm 1000, 1002, 1006)
+export const TUI_OPT_MOUSE_MOVE = 2;   // every mouse move too (1003)
+export const TUI_OPT_PASTE = 4;        // bracketed paste (2004)
+export const TUI_OPT_FOCUS = 8;        // focus in and out (1004)
+export const TUI_OPT_NO_ALT = 16;      // stay on the main screen
+export const TUI_OPT_DEFAULT = 5;      // mouse and paste
+
+const TUI_MAX_TIMERS = 32;
+const TUI_ESC_WAIT_MS = 25;            // how long a lone ESC waits for more bytes
+
+struct TuiTimer {
+  id: int32;
+  period: int64;   // 0 for a one-shot timer
+  due: int64;
+  live: bool;
+}
+
+export struct Tui {
+  term: TuiTerm;
+  headless: bool;
+  opts: int32;
+  w: int32;
+  h: int32;
+  depth: int32;
+  front: TuiBuf*;
+  back: TuiBuf*;
+  out: TuiOut*;
+  pen: TuiPen;
+  input: TuiInput*;
+  timers: TuiTimer[32];
+  next_timer_id: int32;
+  clock: int64;          // headless time in ms
+  redraw: bool;
+  pending_resize: bool;
+  ended: bool;
+  ctrl_c_quits: bool;
+  sync: bool;            // wrap frames in synchronized output (mode 2026)
+  cursor_on: bool;
+  cursor_x: int32;
+  cursor_y: int32;
+  last_cells: int32;     // cells written by the last tui_show
+  last_bytes: int64;     // bytes written by the last tui_show
+  shown_cursor: bool;    // cursor state the terminal has now
+  shown_x: int32;
+  shown_y: int32;
+}
+
+fn tui_new_common(w: int32, h: int32) -> Tui* {
+  var t: Tui* = new Tui;
+  t->w = w;
+  t->h = h;
+  t->front = tui_buf_new(w, h);
+  t->back = tui_buf_new(w, h);
+  t->out = tui_out_new();
+  t->input = tui_input_new();
+  t->redraw = true;
+  t->ctrl_c_quits = true;
+  t->sync = true;
+  t->next_timer_id = 1;
+  t->depth = TUI_DEPTH_TRUE;
+  tui_pen_reset(&t->pen, t->depth);
+  return t;
+}
+
+// A session with no terminal, w by h cells, true colour.
+export fn tui_headless(w: int32, h: int32) -> Tui* {
+  var t: Tui* = tui_new_common(w, h);
+  t->headless = true;
+  return t;
+}
+
+fn tui_dec(o: TuiOut*, mode: int32, on: bool) {
+  tui_csi(o);
+  tui_out_byte(o, 63);   // '?'
+  tui_out_int(o, mode);
+  if (on) { tui_out_byte(o, 104); } else { tui_out_byte(o, 108); }   // h / l
+}
+
+fn tui_modes(t: Tui*, on: bool) {
+  var o: TuiOut* = t->out;
+  if (on) {
+    if ((t->opts & TUI_OPT_NO_ALT) == 0) { tui_dec(o, 1049, true); }
+    tui_dec(o, 25, false);   // hide the cursor
+    tui_dec(o, 7, false);    // no auto-wrap, so the last cell never scrolls
+    if ((t->opts & TUI_OPT_MOUSE) != 0) {
+      tui_dec(o, 1000, true);
+      tui_dec(o, 1002, true);
+      if ((t->opts & TUI_OPT_MOUSE_MOVE) != 0) { tui_dec(o, 1003, true); }
+      tui_dec(o, 1006, true);
+    }
+    if ((t->opts & TUI_OPT_PASTE) != 0) { tui_dec(o, 2004, true); }
+    if ((t->opts & TUI_OPT_FOCUS) != 0) { tui_dec(o, 1004, true); }
+  } else {
+    if ((t->opts & TUI_OPT_FOCUS) != 0) { tui_dec(o, 1004, false); }
+    if ((t->opts & TUI_OPT_PASTE) != 0) { tui_dec(o, 2004, false); }
+    if ((t->opts & TUI_OPT_MOUSE) != 0) {
+      tui_dec(o, 1006, false);
+      if ((t->opts & TUI_OPT_MOUSE_MOVE) != 0) { tui_dec(o, 1003, false); }
+      tui_dec(o, 1002, false);
+      tui_dec(o, 1000, false);
+    }
+    tui_csi(o);
+    tui_out_byte(o, 109);    // SGR reset
+    tui_dec(o, 7, true);
+    tui_dec(o, 25, true);
+    if ((t->opts & TUI_OPT_NO_ALT) == 0) { tui_dec(o, 1049, false); }
+  }
+}
+
+fn tui_flush(t: Tui*) {
+  if (t->headless) { return; }
+  tui_term_write(&t->term, t->out->data, t->out->len);
+  tui_out_reset(t->out);
+}
+
+// Starts a full-screen session on the controlling terminal with the given
+// TUI_OPT_ flags. Returns 0 when there is no terminal.
+export fn tui_init_with(opts: int32) -> Tui* {
+  var term: TuiTerm;
+  if (tui_term_open(&term) < 0) {
+    tui_term_close(&term);
+    return (Tui*)0;
+  }
+  var w: int32 = 0;
+  var h: int32 = 0;
+  tui_term_size(&term, &w, &h);
+  if (w <= 0) { w = 80; }
+  if (h <= 0) { h = 24; }
+  var t: Tui* = tui_new_common(w, h);
+  t->term = term;
+  t->opts = opts;
+  t->depth = tui_detect_depth();
+  tui_pen_reset(&t->pen, t->depth);
+  if (tui_term_raw(&t->term) < 0 || tui_term_signals(&t->term) < 0) {
+    tui_term_close(&t->term);
+    return (Tui*)0;
+  }
+  tui_modes(t, true);
+  tui_flush(t);
+  return t;
+}
+
+export fn tui_init() -> Tui* {
+  return tui_init_with(TUI_OPT_DEFAULT);
+}
+
+// Restores the terminal (modes, main screen, cooked mode, signals) and frees
+// the session. Safe to call twice; the second call does nothing.
+export fn tui_end(t: Tui*) {
+  if (t == 0 || t->ended) { return; }
+  t->ended = true;
+  if (!t->headless) {
+    tui_out_reset(t->out);
+    tui_modes(t, false);
+    tui_flush(t);
+    tui_term_close(&t->term);
+  }
+  tui_buf_free(t->front);
+  tui_buf_free(t->back);
+  tui_out_free(t->out);
+  tui_input_free(t->input);
+  free(t);
+}
+
+// Leaves the terminal as it was and ends the process with code.
+export fn tui_exit(t: Tui*, code: int32) {
+  tui_end(t);
+  linux_exit_group((int64)code);
+}
+
+export fn tui_size(t: Tui*) -> TuiRect {
+  return tui_rect(0, 0, t->w, t->h);
+}
+
+// Overrides the colour depth (TUI_DEPTH_16, _256 or _TRUE).
+export fn tui_set_depth(t: Tui*, depth: int32) {
+  t->depth = depth;
+  t->pen.depth = depth;
+  t->redraw = true;
+}
+
+// When on (the default), Ctrl-C arrives as TUI_EV_QUIT instead of a key.
+export fn tui_set_ctrl_c_quits(t: Tui*, on: bool) { t->ctrl_c_quits = on; }
+
+// Shows the text cursor at (x, y) after each frame, or hides it.
+export fn tui_cursor(t: Tui*, show: bool, x: int32, y: int32) {
+  t->cursor_on = show;
+  t->cursor_x = x;
+  t->cursor_y = y;
+}
+
+// Draw everything again on the next frame (after the screen was disturbed).
+export fn tui_redraw(t: Tui*) { t->redraw = true; }
+
+fn tui_apply_size(t: Tui*, w: int32, h: int32) {
+  if (w <= 0 || h <= 0) { return; }
+  t->w = w;
+  t->h = h;
+  tui_buf_resize(t->front, w, h);
+  tui_buf_resize(t->back, w, h);
+  t->redraw = true;
+}
+
+// The buffer to draw the next frame into, cleared.
+export fn tui_frame(t: Tui*) -> TuiBuf* {
+  tui_buf_clear(t->back);
+  return t->back;
+}
+
+// Sends the frame: only cells that changed since the last one.
+export fn tui_show(t: Tui*) {
+  var o: TuiOut* = t->out;
+  if (t->headless) { tui_out_reset(o); }
+  var start: int64 = o->len;
+  var full: bool = t->redraw;
+  if (t->sync) { tui_dec(o, 2026, true); }
+  if (t->redraw) {
+    tui_csi(o); tui_out_byte(o, 109);              // SGR 0
+    tui_csi(o); tui_out_byte(o, 50); tui_out_byte(o, 74);   // ED 2: clear
+    tui_buf_clear(t->front);
+    tui_pen_reset(&t->pen, t->depth);
+    t->pen.known = true;
+    t->redraw = false;
+  }
+  t->last_cells = tui_render_diff(o, &t->pen, t->front, t->back);
+  var same_cursor: bool = t->cursor_on == t->shown_cursor;
+  if (t->cursor_on && (t->cursor_x != t->shown_x || t->cursor_y != t->shown_y)) { same_cursor = false; }
+  if (!full && t->last_cells == 0 && same_cursor) {
+    // Nothing changed: write nothing at all.
+    o->len = start;
+    t->last_bytes = 0;
+    return;
+  }
+  t->shown_cursor = t->cursor_on;
+  t->shown_x = t->cursor_x;
+  t->shown_y = t->cursor_y;
+  if (t->cursor_on) {
+    tui_move(o, &t->pen, t->cursor_x, t->cursor_y);
+    tui_dec(o, 25, true);
+  } else {
+    tui_dec(o, 25, false);
+  }
+  if (t->sync) { tui_dec(o, 2026, false); }
+  t->last_bytes = o->len - start;
+  tui_flush(t);
+}
+
+// The bytes the last tui_show wrote (headless sessions only).
+export fn tui_output(t: Tui*) -> string {
+  return tui_out_text(t->out);
+}
+
+// The screen as text, as the terminal now shows it. Caller frees chars.
+export fn tui_screen(t: Tui*) -> string {
+  return tui_buf_text(t->front);
+}
+
+// The screen as the terminal shows it, cell by cell.
+export fn tui_screen_buf(t: Tui*) -> TuiBuf* {
+  return t->front;
+}
+
+// Headless: pretend bytes arrived from the keyboard.
+export fn tui_feed(t: Tui*, s: string) {
+  tui_input_feed_str(t->input, s);
+}
+
+// Headless: pretend the window changed size. The next tui_poll reports it.
+export fn tui_resize(t: Tui*, w: int32, h: int32) {
+  tui_apply_size(t, w, h);
+  t->pending_resize = true;
+}
+
+// Time in milliseconds on the session's clock (monotonic; headless time
+// starts at 0 and moves only in tui_poll).
+export fn tui_now(t: Tui*) -> int64 {
+  if (t->headless) { return t->clock; }
+  return time_mono_ms();
+}
+
+fn tui_timer_add(t: Tui*, ms: int64, period: int64) -> int32 {
+  if (ms < 1) { ms = 1; }
+  for i in 0..TUI_MAX_TIMERS {
+    if (!t->timers[i].live) {
+      t->timers[i].live = true;
+      t->timers[i].id = t->next_timer_id;
+      t->timers[i].period = period;
+      t->timers[i].due = tui_now(t) + ms;
+      t->next_timer_id = t->next_timer_id + 1;
+      return t->timers[i].id;
+    }
+  }
+  return 0;
+}
+
+// A timer that fires every ms milliseconds. Returns its id (0 if all 32
+// timers are in use). It arrives as TUI_EV_TIMER with ev.timer set.
+export fn tui_timer_every(t: Tui*, ms: int64) -> int32 {
+  if (ms < 1) { ms = 1; }
+  return tui_timer_add(t, ms, ms);
+}
+
+export fn tui_timer_once(t: Tui*, ms: int64) -> int32 {
+  return tui_timer_add(t, ms, 0);
+}
+
+export fn tui_timer_stop(t: Tui*, id: int32) {
+  for i in 0..TUI_MAX_TIMERS {
+    if (t->timers[i].live && t->timers[i].id == id) { t->timers[i].live = false; }
+  }
+}
+
+// Index of the timer due soonest, or -1.
+fn tui_timer_first(t: Tui*) -> int32 {
+  var best: int32 = -1;
+  for i in 0..TUI_MAX_TIMERS {
+    if (t->timers[i].live) {
+      if (best < 0 || t->timers[i].due < t->timers[best].due) { best = i; }
+    }
+  }
+  return best;
+}
+
+fn tui_timer_fire(t: Tui*, i: int32, ev: TuiEvent*) {
+  var e: TuiEvent;
+  *ev = e;
+  ev->kind = TUI_EV_TIMER;
+  ev->timer = t->timers[i].id;
+  var now: int64 = tui_now(t);
+  if (t->timers[i].period > 0) {
+    var next: int64 = t->timers[i].due + t->timers[i].period;
+    // A late timer does not fire again and again to catch up.
+    if (next <= now) { next = now + t->timers[i].period; }
+    t->timers[i].due = next;
+  } else {
+    t->timers[i].live = false;
+  }
+}
+
+// An event from bytes already read, with Ctrl-C turned into QUIT.
+fn tui_take_input(t: Tui*, ev: TuiEvent*, force: bool) -> bool {
+  if (!tui_input_next(t->input, ev, force)) { return false; }
+  if (t->ctrl_c_quits && ev->kind == TUI_EV_KEY && ev->key == TUI_KEY_CHAR && ev->ch == 99 && ev->mods == TUI_MOD_CTRL) {
+    ev->kind = TUI_EV_QUIT;
+  }
+  return true;
+}
+
+fn tui_resize_event(t: Tui*, ev: TuiEvent*) {
+  var e: TuiEvent;
+  *ev = e;
+  ev->kind = TUI_EV_RESIZE;
+  ev->w = t->w;
+  ev->h = t->h;
+}
+
+// Waits up to timeout_ms (-1: no limit) for the next event: a key, mouse,
+// paste, resize, timer or quit. Returns false if the time ran out first.
+export fn tui_poll(t: Tui*, timeout_ms: int64, ev: TuiEvent*) -> bool {
+  var e: TuiEvent;
+  *ev = e;
+  if (t->pending_resize) {
+    t->pending_resize = false;
+    tui_resize_event(t, ev);
+    return true;
+  }
+  if (tui_take_input(t, ev, false)) { return true; }
+  var start: int64 = tui_now(t);
+  var limit: int64 = -1;
+  if (timeout_ms >= 0) { limit = start + timeout_ms; }
+  if (t->headless) {
+    if (tui_take_input(t, ev, true)) { return true; }
+    var ti: int32 = tui_timer_first(t);
+    if (ti >= 0 && (limit < 0 || t->timers[ti].due <= limit)) {
+      if (t->timers[ti].due > t->clock) { t->clock = t->timers[ti].due; }
+      tui_timer_fire(t, ti, ev);
+      return true;
+    }
+    if (limit >= 0) { t->clock = limit; }
+    return false;
+  }
+  var buf: uint8[1024];
+  while (true) {
+    var now: int64 = tui_now(t);
+    var ti: int32 = tui_timer_first(t);
+    if (ti >= 0 && t->timers[ti].due <= now) {
+      tui_timer_fire(t, ti, ev);
+      return true;
+    }
+    if (limit >= 0 && now >= limit) { return false; }
+    var wait: int64 = -1;
+    if (limit >= 0) { wait = limit - now; }
+    if (ti >= 0) {
+      var tw: int64 = t->timers[ti].due - now;
+      if (wait < 0 || tw < wait) { wait = tw; }
+    }
+    var partial: bool = tui_input_pending(t->input);
+    if (partial && (wait < 0 || wait > TUI_ESC_WAIT_MS)) { wait = TUI_ESC_WAIT_MS; }
+    var got_in: bool = false;
+    var got_sig: bool = false;
+    var r: int64 = tui_term_wait(&t->term, wait, &got_in, &got_sig);
+    if (r < 0) { return false; }
+    if (got_sig) {
+      var quit: bool = false;
+      var resized: bool = false;
+      // One signal per wakeup: the read blocks, and ppoll reports the rest.
+      var sig: int32 = tui_term_next_signal(&t->term);
+      if (sig == TERM_SIGWINCH) { resized = true; } else if (sig != 0) { quit = true; }
+      if (quit) {
+        ev->kind = TUI_EV_QUIT;
+        return true;
+      }
+      if (resized) {
+        var w: int32 = 0;
+        var h: int32 = 0;
+        tui_term_size(&t->term, &w, &h);
+        if (w != t->w || h != t->h) {
+          tui_apply_size(t, w, h);
+          tui_resize_event(t, ev);
+          return true;
+        }
+      }
+    }
+    if (got_in) {
+      var room: int64 = tui_input_room(t->input);
+      if (room > 1024) { room = 1024; }
+      var n: int64 = tui_term_read(&t->term, &buf[0], room);
+      if (n > 0) {
+        tui_input_feed(t->input, &buf[0], n);
+      } else if (n == 0) {
+        // The terminal went away: treat it as a hang-up.
+        ev->kind = TUI_EV_QUIT;
+        return true;
+      }
+      if (tui_take_input(t, ev, false)) { return true; }
+    } else if (r == 0 && partial) {
+      // Nothing more came after a lone ESC or a cut-off sequence.
+      if (tui_take_input(t, ev, true)) { return true; }
+    }
+  }
+  return false;
+}

@@ -1,0 +1,154 @@
+// Sample format conversion.
+//
+// Integers move through a full-scale 32-bit form: 16-bit v is v << 16,
+// 24-bit v is v << 8, 8-bit v is (v - 128) << 24. Going to fewer bits
+// rounds to nearest and clips. Integer to float divides by 2^(bits-1);
+// float to integer multiplies by 2^(bits-1) - 1, rounds and clips. These
+// are the rules miniaudio and dr_libs use, so files round-trip the same.
+
+import "std/mem";
+import "../core/status";
+import "../core/pcm";
+
+/// Reads sample i of a block in format fmt as full-scale int32.
+@inline fn load_i32(p: uint8*, fmt: int32, i: int64) -> int32 {
+  if (fmt == AUDIO_S16) {
+    var q: uint8* = p + i * 2;
+    return (int32)(((uint32)q[0] << 16) | ((uint32)q[1] << 24));
+  }
+  if (fmt == AUDIO_S24) {
+    var q: uint8* = p + i * 3;
+    return (int32)(((uint32)q[0] << 8) | ((uint32)q[1] << 16) | ((uint32)q[2] << 24));
+  }
+  if (fmt == AUDIO_S32) {
+    return ((int32*)p)[i];
+  }
+  if (fmt == AUDIO_U8) {
+    return ((int32)p[i] - 128) << 24;
+  }
+  var f: float64 = 0.0;
+  if (fmt == AUDIO_F32) { f = (float64)((float32*)p)[i]; } else { f = ((float64*)p)[i]; }
+  return f64_to_s32(f);
+}
+
+@inline fn f64_to_s32(f: float64) -> int32 {
+  var x: float64 = f * 2147483648.0;
+  if (x >= 2147483647.0) { return 2147483647; }
+  if (x <= -2147483648.0) { return -2147483647 - 1; }
+  if (x >= 0.0) { return (int32)(x + 0.5); }
+  return (int32)(x - 0.5);
+}
+
+/// Rounds a full-scale int32 down to `bits` bits (8, 16 or 24), clipping.
+@inline fn round_to(v: int32, bits: int32) -> int32 {
+  var sh: int32 = 32 - bits;
+  var x: int64 = ((int64)v + ((int64)1 << (sh - 1))) >> sh;
+  var hi: int64 = ((int64)1 << (bits - 1)) - 1;
+  if (x > hi) { x = hi; }
+  return (int32)x;
+}
+
+/// Converts n samples from (src, sfmt) to (dst, dfmt). The blocks must not
+/// overlap unless they are the same block and the formats are the same size.
+export fn audio_convert_samples(src: uint8*, sfmt: int32, dst: uint8*, dfmt: int32, n: int64) {
+  if (n <= 0) { return; }
+  if (sfmt == dfmt) {
+    memmove(dst, src, n * (int64)audio_fmt_size(sfmt));
+    return;
+  }
+  if (dfmt == AUDIO_F32) {
+    var o: float32* = (float32*)dst;
+    if (sfmt == AUDIO_S16) {
+      for i in 0..n {
+        var q: uint8* = src + i * 2;
+        var s: int32 = (int32)(int16)((uint16)q[0] | ((uint16)q[1] << 8));
+        o[i] = (float32)s * 0.000030517578125;
+      }
+      return;
+    }
+    if (sfmt == AUDIO_F64) {
+      for i in 0..n { o[i] = (float32)((float64*)src)[i]; }
+      return;
+    }
+    for i in 0..n { o[i] = (float32)((float64)load_i32(src, sfmt, i) * 0.0000000004656612873077392578125); }
+    return;
+  }
+  if (dfmt == AUDIO_F64) {
+    var o: float64* = (float64*)dst;
+    if (sfmt == AUDIO_F32) {
+      for i in 0..n { o[i] = (float64)((float32*)src)[i]; }
+      return;
+    }
+    for i in 0..n { o[i] = (float64)load_i32(src, sfmt, i) * 0.0000000004656612873077392578125; }
+    return;
+  }
+  if (dfmt == AUDIO_S16 && sfmt == AUDIO_F32) {
+    var fs: float32* = (float32*)src;
+    for i in 0..n {
+      var x: float32 = fs[i] * 32768.0;
+      var v: int32 = 0;
+      if (x >= 32767.0) { v = 32767; } else if (x <= -32768.0) { v = -32768; }
+      else if (x >= 0.0) { v = (int32)(x + 0.5); } else { v = (int32)(x - 0.5); }
+      dst[i * 2] = (uint8)(v & 255);
+      dst[i * 2 + 1] = (uint8)((v >> 8) & 255);
+    }
+    return;
+  }
+  // integer targets through full-scale int32
+  for i in 0..n {
+    var v: int32 = 0;
+    if (sfmt == AUDIO_F32 || sfmt == AUDIO_F64) {
+      var f: float64 = 0.0;
+      if (sfmt == AUDIO_F32) { f = (float64)((float32*)src)[i]; } else { f = ((float64*)src)[i]; }
+      if (dfmt == AUDIO_S32) { v = f64_to_s32(f); }
+      else {
+        var bits: int32 = 8;
+        if (dfmt == AUDIO_S16) { bits = 16; } else if (dfmt == AUDIO_S24) { bits = 24; }
+        var scale: float64 = (float64)((int64)1 << (bits - 1));
+        var x: float64 = f * scale;
+        var r: int64 = 0;
+        if (x >= 0.0) { r = (int64)(x + 0.5); } else { r = (int64)(x - 0.5); }
+        if (r > (int64)scale - 1) { r = (int64)scale - 1; }
+        if (r < -(int64)scale) { r = -(int64)scale; }
+        v = (int32)(r << (32 - bits));
+      }
+    } else {
+      v = load_i32(src, sfmt, i);
+    }
+    if (dfmt == AUDIO_S32) { ((int32*)dst)[i] = v; }
+    else if (dfmt == AUDIO_S16) {
+      var s: int32 = round_to(v, 16);
+      dst[i * 2] = (uint8)(s & 255);
+      dst[i * 2 + 1] = (uint8)((s >> 8) & 255);
+    } else if (dfmt == AUDIO_S24) {
+      var s: int32 = round_to(v, 24);
+      dst[i * 3] = (uint8)(s & 255);
+      dst[i * 3 + 1] = (uint8)((s >> 8) & 255);
+      dst[i * 3 + 2] = (uint8)((s >> 16) & 255);
+    } else if (dfmt == AUDIO_U8) {
+      dst[i] = (uint8)(round_to(v, 8) + 128);
+    }
+  }
+}
+
+/// Converts full-scale int32 samples to a format.
+export fn audio_convert_from_i32(src: int32*, dst: uint8*, dfmt: int32, n: int64) {
+  audio_convert_samples((uint8*)src, AUDIO_S32, dst, dfmt, n);
+}
+
+/// Converts float samples to a format.
+export fn audio_convert_from_f32(src: float32*, dst: uint8*, dfmt: int32, n: int64) {
+  audio_convert_samples((uint8*)src, AUDIO_F32, dst, dfmt, n);
+}
+
+/// Makes `dst` a copy of `src` in another sample format.
+export fn audio_pcm_convert(src: AudioPcm*, fmt: int32, dst: AudioPcm*) -> int32 {
+  if (src == dst) { return AUDIO_E_ARG; }
+  if (audio_fmt_size(fmt) == 0 || src->data == 0) { return AUDIO_E_ARG; }
+  var rc: int32 = audio_pcm_alloc(dst, src->frames, src->channels, src->rate, fmt);
+  if (rc != AUDIO_OK) { return rc; }
+  audio_convert_samples(src->data, src->fmt, dst->data, fmt, src->frames * (int64)src->channels);
+  dst->mask = src->mask;
+  if (fmt != AUDIO_F32 && fmt != AUDIO_F64 && src->bits > 0 && src->bits < dst->bits) { dst->bits = src->bits; }
+  return AUDIO_OK;
+}

@@ -1,0 +1,1019 @@
+// mythic_ctx: the per-window UI context: frame lifecycle, ID stack, ID store, input,
+// interaction against previous-frame rects, focus, theme stack (DECISIONS §2, §3, §4, §9).
+import "std/mem";
+import "mythic_base";
+import "mythic_types";
+import "mythic_theme";
+import "mythic_fonts";
+import "mythic_image";
+import "mythic_text";
+import "mythic_dl";
+import "mythic_paint";
+
+// mythic_interact / mythic_focusable flags
+export const MYTHIC_FOCUS_ACTIVATE_SPACE: int32 = 1;
+export const MYTHIC_FOCUS_ACTIVATE_ENTER: int32 = 2;
+export const MYTHIC_FOCUS_WANTS_TEXT: int32 = 4;
+export const MYTHIC_FOCUS_WANTS_ARROWS: int32 = 8;
+export const MYTHIC_SENSE_HOVER: int32 = 256;
+export const MYTHIC_SENSE_CLICK: int32 = 512;
+export const MYTHIC_SENSE_DRAG: int32 = 1024;
+
+// one entry of a frame's focus order (Tab order = declaration order, §4). `group` != 0 joins a
+// radio-style group that is a single Tab stop at its selected member; `value` is the member's value.
+export struct MythicFocusEnt { id: uint64; flags: int32; group: uint64; value: int64; selected: bool; }
+
+// generic per-widget scratch in the ID store (CONTRACT §4)
+export struct MythicWState { last_frame: int64; flags: int32; i: int64[2]; f: float32[4]; }
+
+// user-owned text buffer; zero value is valid; MythicUI grows it with malloc (§4)
+export struct MythicTextBuf { data: uint8*; len: int64; cap: int64; max_len: int64; }
+
+// one undo snapshot of an edited buffer (malloc'd copy, 0 when empty)
+export struct MythicEditSnap { data: uint8*; len: int64; cursor: int64; anchor: int64; }
+
+// the single active text edit (§4). Undo ring: logical entries [0, undo_count) start at slot
+// undo_first; entries before undo_pos are undo states, the rest redo states.
+export struct MythicEditState { id: uint64; cursor: int64; anchor: int64; scroll_x: float32;
+                              blink_t0: int64; last_input_us: int64;
+                              undo: MythicEditSnap[32]; undo_first: int32; undo_count: int32; undo_pos: int32;
+                              run_kind: int32; run_us: int64; drag_mode: int32; word_a: int64; word_b: int64; }
+
+export struct MythicKeyEvent { key: int32; mods: int32; repeat: bool; }
+
+export struct MythicInput {
+  mouse: MythicVec2;                 // logical px
+  mouse_down: bool[4];             // index = MythicEvent.button
+  mouse_pressed: bool[4];
+  mouse_released: bool[4];
+  wheel: MythicVec2;                 // notches, +y = up (Shift+wheel arrives as x)
+  wheel_px: MythicVec2;              // precise deltas (logical px, same signs), applied unsmoothed
+  mods: int32;
+  keys: MythicVec<MythicKeyEvent>;
+  text: MythicVec<uint32>;
+  mouse_inside: bool;
+  key_downs: int32;                // key presses fed this frame, including ones a widget consumed
+  moved: bool;                     // pointer motion fed this frame (trickle, §4)
+}
+
+export struct MythicResp { id: uint64; rect: MythicRect; hovered: bool; pressed: bool; clicked: bool;
+                         right_clicked: bool; click_count: int32; focused: bool; changed: bool;
+                         submitted: bool; drag: MythicVec2; }
+
+// node kinds
+export const MYTHIC_NODE_BOX: int32 = 0;
+export const MYTHIC_NODE_TEXT: int32 = 1;
+export const MYTHIC_NODE_SPACER: int32 = 2;
+export const MYTHIC_NODE_IMAGE: int32 = 3;
+
+// one layout node per box/leaf, allocated in the frame arena (§3)
+export struct MythicNode {
+  box: MythicBox;
+  kind: int32;
+  parent: MythicNode*; first: MythicNode*; last: MythicNode*; next: MythicNode*;
+  child_count: int32;
+  rect: MythicRect;                  // resolved, logical px
+  clip: MythicRect;
+  content: MythicVec2;               // content size (scroll)
+  nid: uint64;                     // box.id, or hash(parent nid, child index) for anonymous nodes
+  hit_id: uint64;                  // set by mythic_interact: node takes part in hit testing
+  fit: MythicVec2;                   // pass 1/4 result: fit (content + padding) size
+  minc: MythicVec2;                  // pass 1/4 result: min size it can shrink to (wrap / ellipsis)
+  opacity: float32;                // opacity stack value at declaration (disabled alpha, fades)
+  text: string;                    // TEXT: arena copy (§5)
+  style: MythicTextStyle;            // TEXT
+  color: uint32;                   // TEXT
+  image: int32;                    // IMAGE
+  paint: fn(MythicUi*, MythicPainter*, MythicRect, rawptr) -> void;   // custom paint (mythic_node_paint)
+  paint_data: rawptr;
+  frozen: bool;                    // layout scratch (grow distribution)
+  scroll: MythicVec2;                // scroll offset of the children (whole device px)
+  over: MythicNode*;                 // overlay children (scrollbars): sized against this node's rect,
+                                   // outside the flow, drawn and hit-tested above it
+  end_cb: fn(MythicUi*, MythicNode*) -> void;   // run by mythic_end (scroll view, list)
+  ext: rawptr;                     // widget data of an open container (frame arena)
+  hidden: bool;                    // floating root whose target was not declared, or inside such a root:
+                                   // not laid out, drawn or in the Tab order
+  float_shift: float32;            // floating root: extra dy applied after the flip decision
+}
+
+export struct MythicHit { id: uint64; rect: MythicRect; }
+
+// one scroll view or list (mythic_w_scroll). content / view / rect / vis / laid come from the
+// latest completed layout. A settle pass steps the smoothing from `base` again, so it never
+// moves twice in one frame.
+export struct MythicScrollState {
+  last_frame: int64;                 // first field: GC stamp (see gc_keep)
+  off: MythicVec2; target: MythicVec2; base: MythicVec2; base_frame: int64;
+  content: MythicVec2; view: MythicVec2; rect: MythicRect; vis: MythicRect; laid: MythicVec2;
+  shown_us: int64;                   // last scroll, bar hover or drag: auto-hide counts from here
+  drag: int32; grab: float32;        // thumb being dragged (1 = x, 2 = y), pointer offset into it
+  into_view: uint64; into_wait: uint64;    // focus scrolled into view / waiting for its rect
+  active: int64; count: int64; row_h: float32; sel: int64; sel_next: int64;   // list
+}
+
+// per-ID tween (mythic_anim); lives here because MythicUi owns the map
+export struct MythicTween { last_frame: int64; value: float32; from: float32; target: float32;
+                          t0_us: int64; duration_ms: float32; }
+
+export struct MythicUi {
+  frame: int64;
+  arenas: MythicArena[2];            // alternate per frame (§5)
+  arena: MythicArena*;               // this frame's arena
+  plat: MythicPlatform*;
+  fonts: MythicFonts*;
+  images: MythicImages*;
+  dl: MythicDrawList*;
+  theme: MythicTheme;                // base theme (mythic_set_theme)
+  theme_stack: MythicVec<MythicTheme*>;
+  scale: float32;
+  size: MythicVec2;                  // window size, logical px
+  dev_w: int32; dev_h: int32;      // window size, device px
+  time_us: int64;
+  last_time_us: int64;
+  dt: float32;                     // seconds
+  renderer: int32;                 // MYTHIC_RENDERER_GL or _CPU, set by the app each frame
+  frame_ms: float32;               // how long the last drawn frame took, set by the app
+  next_frame_us: int64;            // 0 = none requested
+  quit: bool;
+  close_requested: bool;
+  close_cancelled: bool;
+  close_forced: bool;              // CLOSE with repeat = true: the platform is dead (Amendment 14)
+  repass: bool;
+  pass: int32;                     // 0 = first UI pass of this frame
+  cursor: int32;
+  in: MythicInput;
+  id_stack: MythicVec<uint64>;
+  states: MythicMap<MythicWState>;
+  scrolls: MythicMap<MythicScrollState>;
+  scroll_ids: MythicVec<uint64>;     // scroll views of the latest layout, outermost first
+  wheel_id: uint64;                // scroll view that takes this frame's wheel
+  scroll_hover_id: uint64;         // topmost scroll view under the pointer
+  tweens: MythicMap<MythicTween>;
+  anim_active: bool;               // a tween was unsettled during this frame
+  anim_prev: bool;                 // ... during the previous frame
+  hits_a: MythicVec<MythicHit>;
+  hits_b: MythicVec<MythicHit>;
+  hits_cur: MythicVec<MythicHit>*;     // built after layout of each pass
+  hits_prev: MythicVec<MythicHit>*;    // previous frame's (hit test at frame begin)
+  hovered_id: uint64;
+  active_id: uint64;
+  active_seen: bool;
+  focus_id: uint64;
+  focus_seen: bool;
+  focus_claimed: bool;
+  pass_focus: uint64;              // focus_id when this pass began
+  activate_id: uint64;
+  focus_visible: bool;
+  focus_rect: MythicRect;            // unclipped rect of the focused node in the latest layout
+  focus_rect_id: uint64;
+  focus_a: MythicVec<MythicFocusEnt>;
+  focus_b: MythicVec<MythicFocusEnt>;
+  focus_cur: MythicVec<MythicFocusEnt>*;   // this frame's order (rebuilt every pass)
+  focus_prev: MythicVec<MythicFocusEnt>*;  // previous frame's order (Tab handling at frame begin)
+  op_stack: float32[32];           // mythic_opacity_push values
+  op_n: int32;
+  opacity_base: float32;           // product of the opacity stack
+  opacity: float32;                // opacity_base x disabled alpha inside a disabled scope
+  dis_alpha: float32;              // theme disabled alpha captured by the outermost disabled_begin
+  disabled_depth: int32;
+  dis_levels: bool[32];
+  dis_n: int32;
+  last: MythicResp;
+  last_node: MythicNode*;
+  edit: MythicEditState;
+  root: MythicNode*;
+  cur: MythicNode*;
+  last_click_us: int64;
+  last_click_pos: MythicVec2;
+  click_count: int32;
+  trace: bool;                     // MYTHIC_TRACE=1
+  reduced_motion: bool;            // app-level reduced motion (ORed with theme.reduced_motion)
+  debug: bool;                     // MYTHIC_DEBUG=1
+  floats: MythicVec<MythicNode*>;    // floating roots of this pass, declaration order (§3)
+  float_order: MythicNode**;       // the same, sorted by (z, declaration order) after layout
+  deactivated: bool;               // window lost focus (FOCUS_OUT until FOCUS_IN)
+  tip_open: uint64;                // tooltip shown in frame tip_open_frame (warm mode)
+  tip_open_frame: int64;
+  tip_closed_us: int64;            // when the last shown tooltip closed
+}
+
+// ---------------------------------------------------------------- lifecycle (internal, used by mythic_app)
+
+/// Creates a UI context. `plat`, `fonts`, `images`, `dl` are owned by the caller.
+export fn mythic_ctx_create(plat: MythicPlatform*, fonts: MythicFonts*, images: MythicImages*, dl: MythicDrawList*) -> MythicUi* {
+  var ui: MythicUi* = new MythicUi;
+  ui->plat = plat;
+  ui->fonts = fonts;
+  ui->images = images;
+  ui->dl = dl;
+  ui->theme = mythic_theme_light();
+  ui->scale = 1.0;
+  ui->hits_cur = &ui->hits_a;
+  ui->hits_prev = &ui->hits_b;
+  ui->focus_cur = &ui->focus_a;
+  ui->focus_prev = &ui->focus_b;
+  ui->opacity = 1.0;
+  ui->opacity_base = 1.0;
+  ui->arena = &ui->arenas[0];
+  return ui;
+}
+
+export fn mythic_ctx_destroy(ui: MythicUi*) {
+  mythic_arena_free(&ui->arenas[0]);
+  mythic_arena_free(&ui->arenas[1]);
+  mythic_vec_free<MythicTheme*>(&ui->theme_stack);
+  mythic_vec_free<uint64>(&ui->id_stack);
+  mythic_vec_free<MythicHit>(&ui->hits_a);
+  mythic_vec_free<MythicHit>(&ui->hits_b);
+  mythic_vec_free<MythicFocusEnt>(&ui->focus_a);
+  mythic_vec_free<MythicFocusEnt>(&ui->focus_b);
+  mythic_vec_free<MythicKeyEvent>(&ui->in.keys);
+  mythic_vec_free<uint32>(&ui->in.text);
+  mythic_map_free<MythicWState>(&ui->states);
+  mythic_map_free<MythicTween>(&ui->tweens);
+  mythic_map_free<MythicScrollState>(&ui->scrolls);
+  mythic_vec_free<uint64>(&ui->scroll_ids);
+  mythic_vec_free<MythicNode*>(&ui->floats);
+  mythic_edit_clear(ui);
+  free((rawptr)ui);
+}
+
+/// Clears per-frame input transitions before the events of a new frame are fed.
+export fn mythic_ctx_input_begin(ui: MythicUi*) {
+  for i: int32 in 0..4 { ui->in.mouse_pressed[i] = false; ui->in.mouse_released[i] = false; }
+  ui->in.wheel.x = 0.0; ui->in.wheel.y = 0.0;
+  ui->in.wheel_px.x = 0.0; ui->in.wheel_px.y = 0.0;
+  mythic_vec_clear<MythicKeyEvent>(&ui->in.keys);
+  mythic_vec_clear<uint32>(&ui->in.text);
+  ui->in.key_downs = 0;
+  ui->in.moved = false;
+}
+
+// a mouse-button transition was fed this frame
+fn button_changed(ui: MythicUi*) -> bool {
+  for i: int32 in 0..4 { if (ui->in.mouse_pressed[i] || ui->in.mouse_released[i]) { return true; } }
+  return false;
+}
+
+fn any_button_down(ui: MythicUi*) -> bool {
+  for i: int32 in 0..4 { if (ui->in.mouse_down[i]) { return true; } }
+  return false;
+}
+
+/// Feeds one platform event. Returns false when the event must wait for the next frame; the
+/// caller keeps it. Mouse-button trickle (§4, Amendment 26): at most one transition per button per
+/// frame; pointer motion is coalesced only between transitions, so motion after a transition
+/// waits (a press hit-tests where it happened, a release is never followed by motion it did not
+/// see), and while a button is down a transition after motion waits (a drag sees the motion that
+/// came before its release with the button still down). Keys and text that would otherwise apply
+/// out of order wait too. Returns true when consumed.
+export fn mythic_ctx_feed(ui: MythicUi*, ev: MythicEvent*) -> bool {
+  var k: int32 = ev->kind;
+  var s: float32 = ui->scale;
+  if (s <= 0.0) { s = 1.0; }
+  if (k == MYTHIC_EV_MOUSE_MOVE) {
+    if (button_changed(ui)) { return false; }
+    ui->in.mouse.x = ev->x / s; ui->in.mouse.y = ev->y / s;
+    ui->in.mouse_inside = true;
+    ui->in.moved = true;
+  } else if (k == MYTHIC_EV_MOUSE_DOWN || k == MYTHIC_EV_MOUSE_UP) {
+    var b: int32 = ev->button;
+    if (b < 1 || b > 3) { return true; }
+    if (ui->in.mouse_pressed[b] || ui->in.mouse_released[b]) { return false; }
+    if (ui->in.moved && any_button_down(ui)) { return false; }
+    ui->in.mouse.x = ev->x / s; ui->in.mouse.y = ev->y / s;
+    ui->in.mouse_inside = true;
+    ui->in.mods = ev->mods;
+    if (k == MYTHIC_EV_MOUSE_DOWN) {
+      if (ui->in.mouse_down[b]) { return true; }
+      ui->in.mouse_down[b] = true;
+      ui->in.mouse_pressed[b] = true;
+      if (b == 1) {
+        var t: int64 = ev->time_us;
+        if (t == 0) { t = ui->time_us; }
+        var dx: float32 = ui->in.mouse.x - ui->last_click_pos.x;
+        var dy: float32 = ui->in.mouse.y - ui->last_click_pos.y;
+        if (ui->click_count > 0 && t - ui->last_click_us < 400000 && dx * dx + dy * dy <= 16.0) {
+          ui->click_count = ui->click_count + 1;
+        } else {
+          ui->click_count = 1;
+        }
+        ui->last_click_us = t;
+        ui->last_click_pos = ui->in.mouse;
+      }
+    } else {
+      if (!ui->in.mouse_down[b]) { return true; }
+      ui->in.mouse_down[b] = false;
+      ui->in.mouse_released[b] = true;
+    }
+  } else if (k == MYTHIC_EV_WHEEL) {
+    var wx: float32 = ev->wheel_x;
+    var wy: float32 = ev->wheel_y;
+    if ((ev->mods & MYTHIC_MOD_SHIFT) != 0 && wx == 0.0) { wx = -wy; wy = 0.0; }
+    if (ev->precise) {
+      ui->in.wheel_px.x = ui->in.wheel_px.x + wx / s; ui->in.wheel_px.y = ui->in.wheel_px.y + wy / s;
+    } else {
+      ui->in.wheel.x = ui->in.wheel.x + wx; ui->in.wheel.y = ui->in.wheel.y + wy;
+    }
+  } else if (k == MYTHIC_EV_KEY_DOWN) {
+    // Tab moves focus at frame begin, before anything else this frame is applied
+    if (ev->key == MYTHIC_KEY_TAB && (ui->in.keys.len > 0 || ui->in.text.len > 0)) { return false; }
+    ui->in.mods = ev->mods;
+    var ke: MythicKeyEvent = { key: ev->key, mods: ev->mods, repeat: ev->repeat };
+    mythic_vec_push<MythicKeyEvent>(&ui->in.keys, ke);
+    ui->in.key_downs = ui->in.key_downs + 1;
+  } else if (k == MYTHIC_EV_KEY_UP) {
+    ui->in.mods = ev->mods;
+  } else if (k == MYTHIC_EV_TEXT) {
+    // a text input applies all text before all keys, so text typed after an editing key waits
+    for i: int64 in 0..ui->in.keys.len {
+      var ke: MythicKeyEvent = ui->in.keys.data[i];
+      if (ke.key >= 256 || (ke.mods & (MYTHIC_MOD_CTRL | MYTHIC_MOD_ALT | MYTHIC_MOD_SUPER)) != 0) { return false; }
+    }
+    mythic_vec_push<uint32>(&ui->in.text, ev->codepoint);
+  } else if (k == MYTHIC_EV_RESIZE) {
+    ui->dev_w = ev->width; ui->dev_h = ev->height;
+    ui->size.x = (float32)ev->width / s; ui->size.y = (float32)ev->height / s;
+  } else if (k == MYTHIC_EV_SCALE) {
+    if (ev->scale > 0.0) {
+      ui->in.mouse.x = ui->in.mouse.x * s / ev->scale;
+      ui->in.mouse.y = ui->in.mouse.y * s / ev->scale;
+      ui->scale = ev->scale;
+      ui->size.x = (float32)ui->dev_w / ev->scale; ui->size.y = (float32)ui->dev_h / ev->scale;
+    }
+  } else if (k == MYTHIC_EV_MOUSE_LEAVE) {
+    if (button_changed(ui)) { return false; }   // a click just before leaving still lands
+    ui->in.mouse_inside = false;
+  } else if (k == MYTHIC_EV_FOCUS_OUT) {
+    ui->in.mouse_inside = false;
+    ui->deactivated = true;
+    for i: int32 in 0..4 { ui->in.mouse_down[i] = false; }
+  } else if (k == MYTHIC_EV_FOCUS_IN) {
+    ui->deactivated = false;
+  } else if (k == MYTHIC_EV_CLOSE) {
+    ui->close_requested = true;
+    if (ev->repeat) { ui->close_forced = true; }
+  }
+  return true;
+}
+
+fn hit_test(ui: MythicUi*, hits: MythicVec<MythicHit>*) -> uint64 {
+  if (!ui->in.mouse_inside) { return 0; }
+  var mx: float32 = ui->in.mouse.x;
+  var my: float32 = ui->in.mouse.y;
+  var i: int64 = hits->len - 1;
+  var found: uint64 = 0;
+  while (i >= 0) {
+    var r: MythicRect = hits->data[i].rect;
+    if (mx >= r.x && my >= r.y && mx < r.x + r.w && my < r.y + r.h) { found = hits->data[i].id; break; }
+    i = i - 1;
+  }
+  // while a widget holds the mouse (pressed, dragging), only it can be hovered
+  if (ui->active_id != 0 && ui->in.mouse_down[1] && found != ui->active_id) { return 0; }
+  return found;
+}
+
+var g_gc_cut: int64 = 0;
+fn gc_keep(p: rawptr) -> bool { var lf: int64* = (int64*)p; return *lf >= g_gc_cut; }
+
+/// Starts a frame at time `now_us`: swaps the arenas and hit lists, computes dt, and hit-tests
+/// the mouse against the previous frame's hit list (§3).
+export fn mythic_ctx_frame_begin(ui: MythicUi*, now_us: int64) {
+  ui->frame = ui->frame + 1;
+  ui->arena = &ui->arenas[ui->frame & 1];
+  var t: MythicVec<MythicHit>* = ui->hits_prev;
+  ui->hits_prev = ui->hits_cur;
+  ui->hits_cur = t;
+  ui->time_us = now_us;
+  var dt_us: int64 = now_us - ui->last_time_us;
+  // after an idle period the first animation step is one nominal frame, not the idle gap
+  if (!ui->anim_prev || ui->last_time_us == 0 || dt_us <= 0) { dt_us = 16667; }
+  if (dt_us > 50000) { dt_us = 50000; }
+  ui->dt = (float32)dt_us / 1000000.0;
+  ui->last_time_us = now_us;
+  ui->anim_prev = false;
+  ui->anim_active = false;
+  ui->next_frame_us = 0;
+  ui->cursor = MYTHIC_CURSOR_ARROW;
+  ui->pass = 0;
+  ui->active_seen = false;
+  ui->focus_seen = false;
+  ui->focus_claimed = false;
+  ui->hovered_id = hit_test(ui, ui->hits_prev);
+  scroll_route(ui);
+  var ft: MythicVec<MythicFocusEnt>* = ui->focus_prev;
+  ui->focus_prev = ui->focus_cur;
+  ui->focus_cur = ft;
+  focus_keys(ui);
+  if (ui->frame % 60 == 0 && ui->frame > 600) {
+    g_gc_cut = ui->frame - 600;
+    mythic_map_sweep<MythicWState>(&ui->states, &gc_keep);
+    mythic_map_sweep<MythicTween>(&ui->tweens, &gc_keep);
+    mythic_map_sweep<MythicScrollState>(&ui->scrolls, &gc_keep);
+  }
+}
+
+/// Starts one UI pass: fresh tree root (the window), ID stack and theme stack.
+export fn mythic_ctx_pass_begin(ui: MythicUi*) {
+  mythic_arena_reset(ui->arena);
+  mythic_vec_clear<uint64>(&ui->id_stack);
+  mythic_vec_push<uint64>(&ui->id_stack, (uint64)0);
+  mythic_vec_clear<MythicTheme*>(&ui->theme_stack);
+  ui->repass = false;
+  ui->pass_focus = ui->focus_id;
+  ui->disabled_depth = 0;
+  ui->dis_n = 0;
+  ui->op_n = 0;
+  ui->opacity = 1.0;
+  ui->opacity_base = 1.0;
+  mythic_vec_clear<MythicFocusEnt>(ui->focus_cur);
+  mythic_vec_clear<MythicNode*>(&ui->floats);
+  ui->float_order = (MythicNode**)0;
+  var r: MythicNode* = (MythicNode*)mythic_arena_alloc_zero(ui->arena, sizeof(MythicNode));
+  r->box.width.mode = MYTHIC_FIXED; r->box.width.value = ui->size.x;
+  r->box.height.mode = MYTHIC_FIXED; r->box.height.value = ui->size.y;
+  r->nid = (uint64)1;
+  r->opacity = 1.0;
+  ui->root = r;
+  ui->cur = r;
+  ui->last_node = 0;
+  var z: MythicResp;
+  ui->last = z;
+}
+
+fn clip_rect(r: MythicRect, c: MythicRect) -> MythicRect {
+  var x0: float32 = mythic_maxf(r.x, c.x); var y0: float32 = mythic_maxf(r.y, c.y);
+  var x1: float32 = mythic_minf(r.x + r.w, c.x + c.w); var y1: float32 = mythic_minf(r.y + r.h, c.y + c.h);
+  var o: MythicRect = { x: x0, y: y0, w: mythic_maxf(0.0, x1 - x0), h: mythic_maxf(0.0, y1 - y0) };
+  return o;
+}
+
+fn in_rect(r: MythicRect, p: MythicVec2) -> bool { return p.x >= r.x && p.y >= r.y && p.x < r.x + r.w && p.y < r.y + r.h; }
+
+// a laid-out scroll view: keep its sizes for the next pass and frame (wheel routing, clamping)
+fn scroll_laid(ui: MythicUi*, n: MythicNode*) {
+  var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, n->box.id, false);
+  if (st == 0) { return; }
+  mythic_vec_push<uint64>(&ui->scroll_ids, n->box.id);
+  var mx: float32 = mythic_maxf(0.0, n->content.x - n->rect.w);
+  var my: float32 = mythic_maxf(0.0, n->content.y - n->rect.h);
+  // a new or resized view (a list builds rows for it) or an offset past the new end: lay out again
+  if (st->view.x != n->rect.w || st->view.y != n->rect.h || st->off.x > mx + 0.01 || st->off.y > my + 0.01) { ui->repass = true; }
+  st->content = n->content;
+  st->view.x = n->rect.w; st->view.y = n->rect.h;
+  st->rect = n->rect;
+  st->vis = clip_rect(n->rect, n->clip);
+  st->laid = n->scroll;
+}
+
+fn collect_hits(ui: MythicUi*, n: MythicNode*, hits: bool) {
+  if (hits && n->hit_id != 0) {
+    var c: MythicRect = clip_rect(n->rect, n->clip);
+    if (c.w > 0.0 && c.h > 0.0) {
+      var h: MythicHit = { id: n->hit_id, rect: c };
+      mythic_vec_push<MythicHit>(ui->hits_cur, h);
+    }
+  }
+  if (ui->focus_id != 0 && (n->nid == ui->focus_id || n->hit_id == ui->focus_id)) {
+    ui->focus_rect = n->rect;
+    ui->focus_rect_id = ui->focus_id;
+  }
+  if (n->box.id != 0 && (n->box.scroll_x || n->box.scroll_y)) { scroll_laid(ui, n); }
+  var ch: MythicNode* = n->first;
+  while (ch != 0) { collect_hits(ui, ch, hits); ch = ch->next; }
+  ch = n->over;
+  while (ch != 0) { collect_hits(ui, ch, hits); ch = ch->next; }
+}
+
+// floating roots go on top of the main tree in paint order. A passthrough root adds no hits; any
+// other root blocks what is beneath it even where nothing inside is interactive.
+fn collect_float_hits(ui: MythicUi*) {
+  if (ui->float_order == 0) { return; }
+  for i: int64 in 0..ui->floats.len {
+    var n: MythicNode* = ui->float_order[i];
+    if (n->hidden) { continue; }
+    var hits: bool = !n->box.floating.passthrough;
+    if (hits && n->hit_id == 0) {
+      var c: MythicRect = clip_rect(n->rect, n->clip);
+      if (c.w > 0.0 && c.h > 0.0) {
+        var h: MythicHit = { id: n->nid, rect: c };
+        mythic_vec_push<MythicHit>(ui->hits_cur, h);
+      }
+    }
+    collect_hits(ui, n, hits);
+  }
+}
+
+fn drop_focus(ui: MythicUi*, id: uint64) {
+  if (id == 0) { return; }
+  var o: MythicVec<MythicFocusEnt>* = ui->focus_cur;
+  var k: int64 = 0;
+  for i: int64 in 0..o->len {
+    if (o->data[i].id != id) { o->data[k] = o->data[i]; k = k + 1; }
+  }
+  o->len = k;
+  if (ui->focus_id == id) { ui->focus_id = 0; }
+}
+
+fn drop_focus_tree(ui: MythicUi*, n: MythicNode*) {
+  drop_focus(ui, n->hit_id);
+  if (n->box.id != n->hit_id) { drop_focus(ui, n->box.id); }
+  var ch: MythicNode* = n->first;
+  while (ch != 0) { drop_focus_tree(ui, ch); ch = ch->next; }
+  ch = n->over;
+  while (ch != 0) { drop_focus_tree(ui, ch); ch = ch->next; }
+}
+
+// widgets inside a hidden floating root are not shown: they leave the Tab order and lose focus
+fn drop_hidden_focus(ui: MythicUi*) {
+  for i: int64 in 0..ui->floats.len {
+    if (ui->floats.data[i]->hidden) { drop_focus_tree(ui, ui->floats.data[i]); }
+  }
+}
+
+// the wheel goes to the topmost scroll view under the pointer that can still move that way (§3)
+fn scroll_route(ui: MythicUi*) {
+  ui->wheel_id = 0;
+  ui->scroll_hover_id = 0;
+  if (!ui->in.mouse_inside) { return; }
+  // direction of the offset change: +x = right, +y = down
+  var dx: float32 = ui->in.wheel.x + ui->in.wheel_px.x;
+  var dy: float32 = -(ui->in.wheel.y + ui->in.wheel_px.y);
+  var i: int64 = ui->scroll_ids.len - 1;
+  while (i >= 0) {
+    var id: uint64 = ui->scroll_ids.data[i];
+    var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, id, false);
+    if (st != 0 && in_rect(st->vis, ui->in.mouse)) {
+      if (ui->scroll_hover_id == 0) { ui->scroll_hover_id = id; }
+      if (dx == 0.0 && dy == 0.0) { return; }
+      var mx: float32 = st->content.x - st->view.x;
+      var my: float32 = st->content.y - st->view.y;
+      if ((dy < 0.0 && st->target.y > 0.0) || (dy > 0.0 && st->target.y < my) ||
+          (dx < 0.0 && st->target.x > 0.0) || (dx > 0.0 && st->target.x < mx)) {
+        ui->wheel_id = id;
+        return;
+      }
+    }
+    i = i - 1;
+  }
+}
+
+/// Ends a UI pass (after layout): rebuilds this frame's hit list, re-hit-tests, and returns
+/// true when the frame callback must run again before presenting (settle pass, §3; max 2).
+export fn mythic_ctx_pass_end(ui: MythicUi*) -> bool {
+  mythic_vec_clear<MythicHit>(ui->hits_cur);
+  mythic_vec_clear<uint64>(&ui->scroll_ids);
+  ui->focus_rect_id = 0;
+  collect_hits(ui, ui->root, true);
+  collect_float_hits(ui);
+  drop_hidden_focus(ui);
+  var nh: uint64 = hit_test(ui, ui->hits_cur);
+  if (ui->pass == 0) {
+    // input transitions are consumed by the first pass only: clicks never double-fire
+    if (ui->in.mouse_pressed[1] && !ui->focus_claimed) { ui->focus_id = 0; }
+    if (ui->in.mouse_released[1] || !ui->in.mouse_down[1]) { ui->active_id = 0; }
+    // Escape that no widget consumed clears focus (Amendment 17)
+    if (mythic_key_pressed(ui, MYTHIC_KEY_ESCAPE, -1)) { ui->focus_id = 0; }
+    // widgets declared before a focus change drew the old focus: settle so none is left showing it
+    if (ui->focus_id != ui->pass_focus) { ui->repass = true; }
+    for i: int32 in 0..4 { ui->in.mouse_pressed[i] = false; ui->in.mouse_released[i] = false; }
+    mythic_vec_clear<MythicKeyEvent>(&ui->in.keys);
+    mythic_vec_clear<uint32>(&ui->in.text);
+    ui->in.wheel.x = 0.0; ui->in.wheel.y = 0.0;
+    ui->in.wheel_px.x = 0.0; ui->in.wheel_px.y = 0.0;
+    ui->activate_id = 0;
+  }
+  var again: bool = nh != ui->hovered_id || ui->repass || (ui->frame == 1 && ui->pass == 0);
+  if (ui->pass >= 2) { again = false; }
+  ui->hovered_id = nh;
+  ui->pass = ui->pass + 1;
+  return again;
+}
+
+/// Ends the frame: drops focus / active IDs whose widgets were not declared.
+export fn mythic_ctx_frame_end(ui: MythicUi*) {
+  if (ui->active_id != 0 && !ui->active_seen) { ui->active_id = 0; }
+  if (ui->focus_id != 0 && !ui->focus_seen) { ui->focus_id = 0; }
+  ui->anim_prev = ui->anim_active;
+  ui->close_requested = false;
+  ui->close_cancelled = false;
+}
+
+/// Appends a node of `kind` as the last child of the open container.
+export fn mythic_ctx_node_add(ui: MythicUi*, kind: int32) -> MythicNode* {
+  var n: MythicNode* = (MythicNode*)mythic_arena_alloc_zero(ui->arena, sizeof(MythicNode));
+  n->kind = kind;
+  n->opacity = ui->opacity;
+  var p: MythicNode* = ui->cur;
+  n->parent = p;
+  if (p->last == 0) { p->first = n; } else { p->last->next = n; }
+  p->last = n;
+  n->nid = mythic_hash_u64(p->nid, (uint64)p->child_count);
+  p->child_count = p->child_count + 1;
+  ui->last_node = n;
+  return n;
+}
+
+/// Opens a floating root (MythicBox.floating, §3) under the open container: it takes part in the
+/// ID scope and opacity of where it is declared but not in its parent's layout.
+export fn mythic_ctx_float_add(ui: MythicUi*) -> MythicNode* {
+  var n: MythicNode* = (MythicNode*)mythic_arena_alloc_zero(ui->arena, sizeof(MythicNode));
+  n->opacity = ui->opacity;
+  var p: MythicNode* = ui->cur;
+  n->parent = p;
+  // no child index: a tooltip coming and going must not shift its siblings' anonymous IDs. An
+  // anonymous root counts only the anonymous roots of the same parent (a root with box.id gets
+  // that as its nid in mythic_box_begin)
+  var k: int64 = 0;
+  for i: int64 in 0..ui->floats.len {
+    if (ui->floats.data[i]->parent == p && ui->floats.data[i]->box.id == 0) { k = k + 1; }
+  }
+  n->nid = mythic_hash_u64(p->nid ^ (uint64)0x666C6F6174, (uint64)k);
+  mythic_vec_push<MythicNode*>(&ui->floats, n);
+  ui->last_node = n;
+  return n;
+}
+
+/// Appends an overlay child to the open container (see MythicNode.over).
+export fn mythic_ctx_overlay_add(ui: MythicUi*) -> MythicNode* {
+  var n: MythicNode* = (MythicNode*)mythic_arena_alloc_zero(ui->arena, sizeof(MythicNode));
+  n->opacity = ui->opacity;
+  var p: MythicNode* = ui->cur;
+  n->parent = p;
+  n->nid = mythic_hash_u64(p->nid, (uint64)p->child_count);
+  p->child_count = p->child_count + 1;
+  if (p->over == 0) { p->over = n; } else {
+    var o: MythicNode* = p->over;
+    while (o->next != 0) { o = o->next; }
+    o->next = n;
+  }
+  ui->last_node = n;
+  return n;
+}
+
+// ---- frame-level
+/// Asks the loop to exit after this frame.
+export fn mythic_quit(ui: MythicUi*) { ui->quit = true; }
+/// True during the frame that follows a window-close request.
+export fn mythic_close_requested(ui: MythicUi*) -> bool { return ui->close_requested; }
+/// Keeps the window open after a close request (call during the close frame).
+export fn mythic_cancel_close(ui: MythicUi*) { ui->close_cancelled = true; }
+export fn mythic_set_title(ui: MythicUi*, title: string) {
+  if (ui->plat != 0) { ui->plat->set_title(ui->plat->self, (uint8*)title.chars, (int64)title.length); }
+}
+/// Seconds since the previous frame (one nominal frame after idle).
+export fn mythic_dt(ui: MythicUi*) -> float32 { return ui->dt; }
+/// The renderer drawing this window: MYTHIC_RENDERER_GL or MYTHIC_RENDERER_CPU (0 before the first frame).
+export fn mythic_renderer(ui: MythicUi*) -> int32 { return ui->renderer; }
+/// Milliseconds the last frame that drew something took, from input to present.
+export fn mythic_frame_ms(ui: MythicUi*) -> float32 { return ui->frame_ms; }
+export fn mythic_time_us(ui: MythicUi*) -> int64 { return ui->time_us; }
+export fn mythic_scale(ui: MythicUi*) -> float32 { return ui->scale; }
+/// Window size in logical px.
+export fn mythic_window_size(ui: MythicUi*) -> MythicVec2 { return ui->size; }
+/// Schedules a frame `ms` from now (the loop wakes at the earliest request).
+export fn mythic_request_frame_in(ui: MythicUi*, ms: int32) {
+  var t: int64 = ui->time_us + (int64)ms * 1000;
+  if (ui->next_frame_us == 0 || t < ui->next_frame_us) { ui->next_frame_us = t; }
+}
+/// Runs the frame callback once more before presenting (max 2 extra passes).
+export fn mythic_request_repass(ui: MythicUi*) { ui->repass = true; }
+export fn mythic_set_cursor(ui: MythicUi*, cursor: int32) { ui->cursor = cursor; }
+export fn mythic_clipboard_set(ui: MythicUi*, s: string) {
+  if (ui->plat != 0) { ui->plat->clipboard_set(ui->plat->self, (uint8*)s.chars, (int64)s.length); }
+}
+/// Clipboard text copied into the frame arena; "" when unavailable.
+export fn mythic_clipboard_get(ui: MythicUi*) -> string {
+  var b: MythicBytes;
+  var out: string = "";
+  if (ui->plat != 0 && ui->plat->clipboard_get(ui->plat->self, &b)) {
+    var v: string;
+    v.chars = (cstring)b.data;
+    v.length = (uint64)b.len;
+    out = mythic_arena_str(ui->arena, v);
+    if (b.data != 0) { free((rawptr)b.data); }
+  }
+  return out;
+}
+
+// ---- ids
+fn id_top(ui: MythicUi*) -> uint64 {
+  if (ui->id_stack.len == 0) { return 0; }
+  return ui->id_stack.data[ui->id_stack.len - 1];
+}
+/// ID of `label` under the current ID scope (the whole label is hashed, including "##...").
+export fn mythic_id(ui: MythicUi*, label: string) -> uint64 { return mythic_hash_str(id_top(ui), label); }
+export fn mythic_push_id_str(ui: MythicUi*, s: string) {
+  mythic_vec_push<uint64>(&ui->id_stack, mythic_hash_str(id_top(ui), s));
+}
+export fn mythic_push_id_int(ui: MythicUi*, i: int64) {
+  mythic_vec_push<uint64>(&ui->id_stack, mythic_hash_u64(id_top(ui), (uint64)i));
+}
+export fn mythic_pop_id(ui: MythicUi*) {
+  if (ui->id_stack.len > 1) { ui->id_stack.len = ui->id_stack.len - 1; }
+}
+/// Length in bytes of the displayed part of a label: everything before "##". Returns a length,
+/// not a view: returning a view of a string parameter leaks the caller's interpolated temporary
+/// (Amendment 20). Copy the shown part with `mythic_arena_strn(arena, s, mythic_label_len(s))`.
+export fn mythic_label_len(s: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i + 1 < n) {
+    if (s.chars[i] == (uint8)35 && s.chars[i + 1] == (uint8)35) { return i; }
+    i = i + 1;
+  }
+  return n;
+}
+
+// ---- theme accessors (§9)
+/// Switches the base theme (instant, DESIGN-SYSTEM §6.2). A light/dark change mid-frame re-runs
+/// the frame callback so the whole frame uses one theme.
+export fn mythic_set_theme(ui: MythicUi*, t: MythicTheme) {
+  if (t.dark != ui->theme.dark || t.reduced_motion != ui->theme.reduced_motion) { ui->repass = true; }
+  ui->theme = t;
+}
+export fn mythic_theme(ui: MythicUi*) -> MythicTheme* {
+  if (ui->theme_stack.len > 0) { return ui->theme_stack.data[ui->theme_stack.len - 1]; }
+  return &ui->theme;
+}
+export fn mythic_theme_push(ui: MythicUi*, t: MythicTheme) {
+  var c: MythicTheme* = (MythicTheme*)mythic_arena_alloc(ui->arena, sizeof(MythicTheme));
+  *c = t;
+  mythic_vec_push<MythicTheme*>(&ui->theme_stack, c);
+}
+export fn mythic_theme_pop(ui: MythicUi*) {
+  if (ui->theme_stack.len > 0) { ui->theme_stack.len = ui->theme_stack.len - 1; }
+}
+/// True when movement should snap (theme.reduced_motion or the app flag, DESIGN-SYSTEM §6.3).
+export fn mythic_reduced_motion(ui: MythicUi*) -> bool { return ui->reduced_motion || mythic_theme(ui)->reduced_motion; }
+/// Spacing step n of the 4 px grid (mythic_sp(ui, 3) = 12).
+export fn mythic_sp(ui: MythicUi*, n: float32) -> float32 { return n * mythic_theme(ui)->space; }
+
+// ---- interaction, focus, state
+// rect of `id` from the latest completed layout: the previous pass of this frame on a settle
+// pass, else the previous frame
+fn prev_rect(ui: MythicUi*, id: uint64) -> MythicRect {
+  var hs: MythicVec<MythicHit>* = ui->hits_prev;
+  if (ui->pass > 0) { hs = ui->hits_cur; }
+  var r: MythicRect;
+  for i: int64 in 0..hs->len {
+    if (hs->data[i].id == id) { return hs->data[i].rect; }
+  }
+  return r;
+}
+
+/// Makes the node with box.id == id (the last declared node, or the open container) interactive
+/// and returns its response, computed against the previous frame's rects (§3).
+export fn mythic_interact(ui: MythicUi*, id: uint64, flags: int32) -> MythicResp {
+  var r: MythicResp;
+  r.id = id;
+  var n: MythicNode* = ui->last_node;
+  if (n == 0 || n->box.id != id) {
+    if (ui->cur != 0 && ui->cur->box.id == id) { n = ui->cur; }
+  }
+  if (n != 0 && ui->disabled_depth == 0) { n->hit_id = id; }
+  r.rect = prev_rect(ui, id);
+  if (id == ui->active_id) { ui->active_seen = true; }
+  if (ui->disabled_depth > 0 || id == 0) { ui->last = r; return r; }
+  if (id == ui->focus_id) { ui->focus_seen = true; r.focused = true; }
+  r.hovered = ui->hovered_id == id;
+  if (r.hovered && ui->in.mouse_pressed[1]) {
+    ui->active_id = id;
+    ui->active_seen = true;
+  }
+  if (r.hovered && ui->in.mouse_pressed[3]) { r.right_clicked = true; }
+  if (ui->active_id == id) {
+    r.pressed = ui->in.mouse_down[1];
+    if (ui->in.mouse_released[1]) {
+      r.clicked = r.hovered;
+      if (r.clicked) { r.click_count = ui->click_count; }
+    }
+  }
+  if (ui->activate_id == id) { r.clicked = true; r.click_count = 1; }
+  ui->last = r;
+  return r;
+}
+
+/// Declares `id` focusable this frame: appends it to the Tab order (declaration order) and
+/// focuses it on a mouse press (focus ring hidden until the keyboard is used, §4).
+export fn mythic_focusable(ui: MythicUi*, id: uint64, flags: int32) { mythic_focusable_group(ui, id, flags, 0, 0, false); }
+
+/// mythic_focusable for a member of a group that is one Tab stop (radio group): `group` identifies
+/// the group, `value` the member, `selected` whether it is the group's current value.
+export fn mythic_focusable_group(ui: MythicUi*, id: uint64, flags: int32, group: uint64, value: int64, selected: bool) {
+  if (ui->disabled_depth > 0 || id == 0) { return; }
+  var e: MythicFocusEnt = { id: id, flags: flags, group: group, value: value, selected: selected };
+  mythic_vec_push<MythicFocusEnt>(ui->focus_cur, e);
+  if (ui->hovered_id == id && ui->in.mouse_pressed[1] && ui->pass == 0) {
+    ui->focus_id = id;
+    ui->focus_visible = false;
+    ui->focus_claimed = true;
+  }
+  if (ui->focus_id == id) { ui->focus_seen = true; }
+}
+
+/// Moves keyboard focus to `id` and shows the focus ring (arrow-key navigation inside groups).
+export fn mythic_focus_set(ui: MythicUi*, id: uint64) {
+  ui->focus_id = id;
+  ui->focus_visible = true;
+  ui->focus_seen = true;
+}
+
+/// True while `id` has keyboard-visible focus (the focus ring target).
+export fn mythic_focus_ring_on(ui: MythicUi*, id: uint64) -> bool {
+  return id != 0 && ui->focus_id == id && ui->focus_visible && ui->disabled_depth == 0;
+}
+
+/// Previous frame's focus entry of `id` (null when it was not focusable).
+export fn mythic_focus_prev_ent(ui: MythicUi*, id: uint64) -> MythicFocusEnt* {
+  var o: MythicVec<MythicFocusEnt>* = ui->focus_prev;
+  for i: int64 in 0..o->len {
+    if (o->data[i].id == id) { return &o->data[i]; }
+  }
+  return (MythicFocusEnt*)0;
+}
+
+/// The member of `group` next to `id` in the previous frame's order (dir +1 / -1, wrapping).
+export fn mythic_focus_group_step(ui: MythicUi*, group: uint64, id: uint64, dir: int32) -> MythicFocusEnt* {
+  var o: MythicVec<MythicFocusEnt>* = ui->focus_prev;
+  var n: int64 = o->len;
+  var at: int64 = -1;
+  for i: int64 in 0..n {
+    if (o->data[i].id == id) { at = i; }
+  }
+  if (at < 0 || group == 0) { return (MythicFocusEnt*)0; }
+  var j: int64 = at;
+  for k: int64 in 0..n {
+    j = (j + (int64)dir + n) % n;
+    if (o->data[j].group == group) {
+      if (j == at) { return (MythicFocusEnt*)0; }
+      return &o->data[j];
+    }
+  }
+  return (MythicFocusEnt*)0;
+}
+
+// the Tab stop for entry j: groups are entered at their selected member (else the first)
+fn group_stop(o: MythicVec<MythicFocusEnt>*, j: int64) -> int64 {
+  var g: uint64 = o->data[j].group;
+  if (g == 0) { return j; }
+  var first: int64 = -1;
+  for i: int64 in 0..o->len {
+    if (o->data[i].group == g) {
+      if (first < 0) { first = i; }
+      if (o->data[i].selected) { return i; }
+    }
+  }
+  return first;
+}
+
+fn tab_move(ui: MythicUi*, back: bool) {
+  var o: MythicVec<MythicFocusEnt>* = ui->focus_prev;
+  var n: int64 = o->len;
+  ui->focus_visible = true;
+  if (n == 0) { ui->focus_id = 0; return; }
+  var at: int64 = -1;
+  for i: int64 in 0..n {
+    if (o->data[i].id == ui->focus_id) { at = i; }
+  }
+  var cg: uint64 = 0;
+  if (at >= 0) { cg = o->data[at].group; }
+  var step: int64 = 1;
+  if (back) { step = n - 1; }
+  var j: int64 = at;
+  if (at < 0) { if (back) { j = 0; } else { j = n - 1; } }
+  for k: int64 in 0..n {
+    j = (j + step) % n;
+    var g: uint64 = o->data[j].group;
+    if (g != 0 && g == cg) { continue; }
+    ui->focus_id = o->data[group_stop(o, j)].id;
+    return;
+  }
+}
+
+// keyboard focus handling at frame begin against the previous frame's order (§4)
+fn focus_keys(ui: MythicUi*) {
+  ui->activate_id = 0;
+  for i: int64 in 0..ui->in.keys.len {
+    var k: MythicKeyEvent = ui->in.keys.data[i];
+    var plain: bool = (k.mods & (MYTHIC_MOD_CTRL | MYTHIC_MOD_ALT | MYTHIC_MOD_SUPER)) == 0;
+    if (k.key == MYTHIC_KEY_TAB && plain) {
+      tab_move(ui, (k.mods & MYTHIC_MOD_SHIFT) != 0);
+    } else if ((k.key == MYTHIC_KEY_SPACE || k.key == MYTHIC_KEY_ENTER) && plain && ui->focus_id != 0) {
+      var e: MythicFocusEnt* = mythic_focus_prev_ent(ui, ui->focus_id);
+      if (e != 0) {
+        var need: int32 = MYTHIC_FOCUS_ACTIVATE_ENTER;
+        if (k.key == MYTHIC_KEY_SPACE) { need = MYTHIC_FOCUS_ACTIVATE_SPACE; }
+        if ((e->flags & need) != 0 && !k.repeat) { ui->activate_id = ui->focus_id; }
+      }
+    }
+  }
+}
+
+/// Per-ID scratch state; created zeroed on first use; touching keeps it alive (GC, §4).
+export fn mythic_state(ui: MythicUi*, id: uint64) -> MythicWState* {
+  var w: MythicWState* = mythic_map_get<MythicWState>(&ui->states, id, true);
+  if (w != 0) { w->last_frame = ui->frame; }
+  return w;
+}
+export fn mythic_last(ui: MythicUi*) -> MythicResp { return ui->last; }
+/// True when `key` was pressed this frame with exactly `mods` (mods < 0 = any).
+export fn mythic_key_pressed(ui: MythicUi*, key: int32, mods: int32) -> bool {
+  for i: int64 in 0..ui->in.keys.len {
+    var k: MythicKeyEvent = ui->in.keys.data[i];
+    if (k.key == key && (mods < 0 || k.mods == mods)) { return true; }
+  }
+  return false;
+}
+/// Like mythic_key_pressed, but removes the matching key event so later widgets do not see it.
+export fn mythic_key_consume(ui: MythicUi*, key: int32, mods: int32) -> bool {
+  var n: int64 = ui->in.keys.len;
+  for i: int64 in 0..n {
+    var k: MythicKeyEvent = ui->in.keys.data[i];
+    if (k.key == key && (mods < 0 || k.mods == mods)) {
+      var j: int64 = i;
+      while (j + 1 < n) { ui->in.keys.data[j] = ui->in.keys.data[j + 1]; j = j + 1; }
+      ui->in.keys.len = n - 1;
+      return true;
+    }
+  }
+  return false;
+}
+/// Drops the active text edit and frees its undo history.
+export fn mythic_edit_clear(ui: MythicUi*) {
+  for i: int32 in 0..32 {
+    if (ui->edit.undo[i].data != 0) { free((rawptr)ui->edit.undo[i].data); }
+  }
+  var z: MythicEditState;
+  ui->edit = z;
+}
+/// This frame's typed text as UTF-8 (arena copy); consumes it.
+export fn mythic_take_text(ui: MythicUi*) -> string {
+  var n: int64 = ui->in.text.len;
+  var p: uint8* = (uint8*)mythic_arena_alloc(ui->arena, n * 4 + 1);
+  var o: int64 = 0;
+  for i: int64 in 0..n {
+    var c: uint32 = ui->in.text.data[i];
+    if (c < (uint32)0x80) { p[o] = (uint8)c; o = o + 1; }
+    else if (c < (uint32)0x800) {
+      p[o] = (uint8)((uint32)0xC0 | (c >> 6)); p[o + 1] = (uint8)((uint32)0x80 | (c & (uint32)0x3F)); o = o + 2;
+    } else if (c < (uint32)0x10000) {
+      p[o] = (uint8)((uint32)0xE0 | (c >> 12)); p[o + 1] = (uint8)((uint32)0x80 | ((c >> 6) & (uint32)0x3F));
+      p[o + 2] = (uint8)((uint32)0x80 | (c & (uint32)0x3F)); o = o + 3;
+    } else {
+      p[o] = (uint8)((uint32)0xF0 | (c >> 18)); p[o + 1] = (uint8)((uint32)0x80 | ((c >> 12) & (uint32)0x3F));
+      p[o + 2] = (uint8)((uint32)0x80 | ((c >> 6) & (uint32)0x3F)); p[o + 3] = (uint8)((uint32)0x80 | (c & (uint32)0x3F)); o = o + 4;
+    }
+  }
+  p[o] = (uint8)0;
+  mythic_vec_clear<uint32>(&ui->in.text);
+  var s: string;
+  s.chars = (cstring)p;
+  s.length = (uint64)o;
+  return s;
+}
+fn opacity_update(ui: MythicUi*) {
+  var b: float32 = 1.0;
+  var n: int32 = mythic_mini(ui->op_n, 32);
+  for i: int32 in 0..n { b = b * ui->op_stack[i]; }
+  ui->opacity_base = b;
+  if (ui->disabled_depth > 0) { b = b * ui->dis_alpha; }
+  ui->opacity = b;
+}
+/// Starts a disabled scope when `disabled` (always pair with mythic_disabled_end): widgets inside
+/// are not interactive or focusable and paint at the theme's disabled alpha (§2, §6).
+export fn mythic_disabled_begin(ui: MythicUi*, disabled: bool) {
+  if (ui->dis_n < 32) { ui->dis_levels[ui->dis_n] = disabled; }
+  ui->dis_n = ui->dis_n + 1;
+  if (disabled) {
+    if (ui->disabled_depth == 0) { ui->dis_alpha = mythic_theme(ui)->disabled_alpha; }
+    ui->disabled_depth = ui->disabled_depth + 1;
+  }
+  opacity_update(ui);
+}
+export fn mythic_disabled_end(ui: MythicUi*) {
+  if (ui->dis_n == 0) { return; }
+  ui->dis_n = ui->dis_n - 1;
+  var was: bool = true;
+  if (ui->dis_n < 32) { was = ui->dis_levels[ui->dis_n]; }
+  if (was && ui->disabled_depth > 0) { ui->disabled_depth = ui->disabled_depth - 1; }
+  opacity_update(ui);
+}
+/// True inside a disabled scope.
+export fn mythic_is_disabled(ui: MythicUi*) -> bool { return ui->disabled_depth > 0; }
+/// Multiplies the opacity of everything declared until the matching mythic_opacity_pop by `a`.
+export fn mythic_opacity_push(ui: MythicUi*, a: float32) {
+  if (ui->op_n < 32) { ui->op_stack[ui->op_n] = mythic_clampf(a, 0.0, 1.0); }
+  ui->op_n = ui->op_n + 1;
+  opacity_update(ui);
+}
+export fn mythic_opacity_pop(ui: MythicUi*) {
+  if (ui->op_n > 0) { ui->op_n = ui->op_n - 1; }
+  opacity_update(ui);
+}
+
+// ---- resources
+export fn mythic_font_add(ui: MythicUi*, data: uint8*, len: int64) -> int32 { return mythic_fonts_add(ui->fonts, data, len); }
+export fn mythic_image_create(ui: MythicUi*, w: int32, h: int32, rgba: uint8*) -> int32 { return mythic_images_add(ui->images, w, h, rgba); }
+export fn mythic_image_update(ui: MythicUi*, image: int32, rgba: uint8*) { mythic_images_update(ui->images, image, rgba); }

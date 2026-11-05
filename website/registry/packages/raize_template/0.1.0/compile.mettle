@@ -1,0 +1,97 @@
+// raize/template/compile — the compile entry point.
+//
+// Syntax (the complete language — there is no expression language):
+//
+//   {{name}}               escaped substitution
+//   {{{name}}}             raw substitution (explicitly dangerous)
+//   {# ... #}              comment, removed at compile time
+//   {{#name}}body{{/name}} one-level section; the body renders once when the
+//                          named value is non-empty; no nesting, no else
+//
+// A name is a literal key: first byte A-Z/a-z/_, then A-Z/a-z/0-9/_/./-.
+// Spaces and tabs around a name are allowed. Anything else (`+`, `^`, a second
+// `#`) is refused as an unknown directive. A template engine that grows a
+// condition language grows an injection surface, so this one does not.
+//
+// The scanner is in scan.mettle; the compiled type is in types.mettle.
+
+import "std/mem";
+import "raize_core/str/str";
+import "vars";
+import "types";
+import "scan";
+
+// Zeroes a fresh template. rz_template_new() does this for the heap case; a
+// caller-owned stack value must call it before the first compile, or compile
+// would free uninitialised pointers.
+export fn rz_template_init(t: RzTemplate*) {
+  if (t == 0) { return; }
+  memset((rawptr)t, 0, sizeof(RzTemplate));
+}
+
+// ---------------------------------------------------------------------------
+// Compile entry point
+// ---------------------------------------------------------------------------
+
+// Compiles `src` into `t`, replacing anything previously compiled. `decls`
+// is the startup default map; every referenced name missing from it is
+// remembered in t->undef and reported once by rz_template_report_undeclared.
+// A null `decls` means "no defaults declared", so every referenced name is
+// reported. On refusal, t->error != 0 and rz_template_ok(t) is false.
+export fn rz_template_compile(t: RzTemplate*, src: string, decls: RzVarMap*) -> int32 {
+  if (t == 0) { return RZ_TPL_E_ARG; }
+  rz_template_reset(t);
+  var n: int64 = (int64)src.length;
+  if (n > RZ_TEMPLATE_MAX_BYTES) {
+    t->error = RZ_TPL_E_SIZE;
+    return t->error;
+  }
+  if (n > 0) {
+    t->src = (uint8*)malloc(n + 1);
+    if (t->src == 0) {
+      t->error = RZ_TPL_E_NOMEM;
+      return t->error;
+    }
+    var i: int64 = 0;
+    while (i < n) {
+      t->src[i] = src.chars[i];
+      i = i + 1;
+    }
+    t->src[n] = 0;
+    t->src_len = n;
+  }
+  t->ops = (RzTemplateOp*)calloc(RZ_TEMPLATE_MAX_OPS, sizeof(RzTemplateOp));
+  if (t->ops == 0) {
+    rz_template_release(t);
+    t->error = RZ_TPL_E_NOMEM;
+    return t->error;
+  }
+
+  var refs: RzTemplateRef[32];
+  var ref_count: int32 = 0;
+  var st: RzScan;
+  st.src = rz_str_view(t->src, n);
+  st.pos = 0;
+  st.in_section = false;
+  st.open_off = 0;
+  st.open_len = 0;
+  var rc: int32 = rz_scan_body(t, &st, &refs[0], &ref_count);
+  if (rc != RZ_TPL_OK) {
+    rz_template_release(t);
+    return rc;
+  }
+
+  var u: int32 = 0;
+  var i2: int32 = 0;
+  while (i2 < ref_count) {
+    var rn: string = rz_str_view(&t->src[refs[i2].off], refs[i2].len);
+    if (!rz_vars_has(decls, rn)) {
+      t->undef[u].off = refs[i2].off;
+      t->undef[u].len = refs[i2].len;
+      u = u + 1;
+    }
+    i2 = i2 + 1;
+  }
+  t->undef_count = u;
+  return RZ_TPL_OK;
+}

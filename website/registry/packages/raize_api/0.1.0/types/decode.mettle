@@ -1,0 +1,354 @@
+// raize_api/types/decode: a JSON document into a struct, checked against its type.
+//
+// The reader is the registry `json` pull reader (RFC 8259, no allocation). Values
+// are written at each field's offset. Strings are copied into the request arena
+// (escapes decoded) and checked as UTF-8. Every problem is collected with a JSON
+// Pointer (RFC 6901) to where it is, so one response lists them all.
+//
+// Rules:
+//   - a member of the wrong JSON type, out of range or failing a constraint is an error
+//   - unknown members are skipped, or an error when the type is closed
+//   - a member given twice is an error (no last-one-wins surprises)
+//   - a missing required member is an error; a missing optional one is left as it was
+//   - a read-only member in a request is an error
+//   - null is accepted only by nullable types, and stores the zero value
+import "std/mem";
+import "json";
+import "raize_core/str/str";
+import "raize_core/context/arena";
+import "../problem/problem";
+import "type";
+import "format";
+
+export const RAPI_DECODE_OK: int32 = 0;
+export const RAPI_DECODE_SYNTAX: int32 = 1;    // not JSON: answer 400
+export const RAPI_DECODE_INVALID: int32 = 2;   // JSON, but errors were collected: answer 422
+
+/// State of one decode.
+export struct RapiDecoder {
+  r: JsonReader;
+  arena: RzArena*;
+  errs: RapiErrors*;
+  syntax: bool;          // the reader failed
+  syntax_at: int64;      // byte offset of the failure
+  present: int64;        // top-level fields seen, bit i = field i
+}
+
+// Appends one escaped JSON Pointer token (RFC 6901: ~ is ~0, / is ~1).
+fn rapi__ptr_join(d: RapiDecoder*, base: string, token: string) -> string {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, base);
+  rz_buf_add_byte(b, 47);
+  for i in 0..token.length {
+    var c: int32 = (int32)token.chars[i];
+    if (c == 126) { rz_buf_add(b, "~0"); }
+    else if (c == 47) { rz_buf_add(b, "~1"); }
+    else { rz_buf_add_byte(b, c); }
+  }
+  var out: string = rz_arena_str(d->arena, rz_buf_str(b));
+  rz_buf_free(b);
+  return out;
+}
+
+fn rapi__ptr_index(d: RapiDecoder*, base: string, i: int64) -> string {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, base);
+  rz_buf_add_byte(b, 47);
+  rz_buf_add_int(b, i);
+  var out: string = rz_arena_str(d->arena, rz_buf_str(b));
+  rz_buf_free(b);
+  return out;
+}
+
+fn rapi__err(d: RapiDecoder*, ptr: string, text: string) {
+  rapi_errors_body(d->errs, ptr, rz_arena_str(d->arena, text));
+}
+
+fn rapi__kind_word(k: int32) -> string {
+  if (k == RAPI_T_STRING) { return "a string"; }
+  if (k == RAPI_T_INT) { return "an integer"; }
+  if (k == RAPI_T_NUMBER) { return "a number"; }
+  if (k == RAPI_T_BOOL) { return "a boolean"; }
+  if (k == RAPI_T_OBJECT) { return "an object"; }
+  if (k == RAPI_T_ARRAY) { return "an array"; }
+  return "a value";
+}
+
+// Skips the value whose first event is `ev`. False when the reader failed.
+fn rapi__skip(d: RapiDecoder*, ev: int32) -> bool {
+  if (ev == JSON_OBJECT_START || ev == JSON_ARRAY_START) {
+    if (json_skip(&d->r) == JSON_ERROR) { return rapi__fail(d); }
+    return true;
+  }
+  if (ev == JSON_ERROR || ev == JSON_END) { return rapi__fail(d); }
+  return true;
+}
+
+fn rapi__fail(d: RapiDecoder*) -> bool {
+  if (!d->syntax) {
+    d->syntax = true;
+    d->syntax_at = json_error_offset(&d->r);
+  }
+  return false;
+}
+
+// The string token the reader stands on, copied into the arena.
+fn rapi__take_string(d: RapiDecoder*) -> string {
+  var n: int64 = json_string_length(&d->r);
+  if (n <= 0) { return ""; }
+  var p: uint8* = rz_arena_alloc(d->arena, n);
+  if (p == 0) { return ""; }
+  var got: int64 = json_string_copy(&d->r, p, n);
+  return rz_str_view(p, got);
+}
+
+/// What is wrong with string `s` as a value of `t`, or "" when it is fine.
+/// The text lives in `arena`.
+export fn rapi_string_issue(t: RapiType*, s: string, arena: RzArena*) -> string {
+  var cps: int64 = rapi_utf8_count(s);
+  if (cps < 0) { return "must be valid UTF-8"; }
+  if (t->min_len != RAPI_UNSET && cps < t->min_len) {
+    return rz_arena_str(arena, "must be at least {t->min_len} characters");
+  }
+  if (t->max_len != RAPI_UNSET && cps > t->max_len) {
+    return rz_arena_str(arena, "must be at most {t->max_len} characters");
+  }
+  if (t->nenum > 0) {
+    var hit: bool = false;
+    for i in 0..t->nenum {
+      if (rz_str_eq(t->enum_vals[i], s)) { hit = true; }
+    }
+    if (!hit) {
+      var b: RzBuf* = rz_buf_new();
+      rz_buf_add(b, "must be one of: ");
+      for i in 0..t->nenum {
+        if (i > 0) { rz_buf_add(b, ", "); }
+        rz_buf_add(b, t->enum_vals[i]);
+      }
+      var out: string = rz_arena_str(arena, rz_buf_str(b));
+      rz_buf_free(b);
+      return out;
+    }
+  }
+  if (t->format.length > 0 && !rapi_format_ok(t->format, s)) {
+    return rz_arena_str(arena, "must be a valid {t->format}");
+  }
+  return "";
+}
+
+/// What is wrong with integer `v` as a value of `t`, or "" when it is fine.
+export fn rapi_int_issue(t: RapiType*, v: int64, arena: RzArena*) -> string {
+  if (t->minimum != RAPI_UNSET && v < t->minimum) {
+    return rz_arena_str(arena, "must be at least {t->minimum}");
+  }
+  if (t->maximum != RAPI_UNSET && v > t->maximum) {
+    return rz_arena_str(arena, "must be at most {t->maximum}");
+  }
+  if (t->size == 4 && (v < -2147483648 || v > 2147483647)) { return "is out of range"; }
+  return "";
+}
+
+fn rapi__store_int(dst: rawptr, size: int64, v: int64) {
+  if (size == 4) { *(int32*)dst = (int32)v; } else { *(int64*)dst = v; }
+}
+
+// Decodes the value whose first event is `ev` into dst. False only on a syntax
+// failure; constraint failures go to d->errs and decoding goes on.
+fn rapi__value(d: RapiDecoder*, t: RapiType*, dst: rawptr, ev: int32, ptr: string) -> bool {
+  if (ev == JSON_ERROR || ev == JSON_END) { return rapi__fail(d); }
+  if (ev == JSON_NULL) {
+    if (!t->nullable) { rapi__err(d, ptr, "must not be null"); }
+    return true;
+  }
+  var k: int32 = t->kind;
+  if (k == RAPI_T_ANY) {
+    // Keep the raw text of the value.
+    var start: int64 = d->r.start;
+    var end: int64 = d->r.stop;
+    if (ev == JSON_OBJECT_START || ev == JSON_ARRAY_START) {
+      start = d->r.at - 1;
+      if (!rapi__skip(d, ev)) { return false; }
+      end = d->r.at;
+    } else if (ev == JSON_STRING) {
+      start = start - 1;
+      end = end + 1;
+    }
+    var raw: string = rz_str_view(d->r.text + start, end - start);
+    *(string*)dst = rz_arena_str(d->arena, raw);
+    return true;
+  }
+  if (k == RAPI_T_STRING) {
+    if (ev != JSON_STRING) {
+      rapi__err(d, ptr, "must be a string");
+      return rapi__skip(d, ev);
+    }
+    var s: string = rapi__take_string(d);
+    var issue: string = rapi_string_issue(t, s, d->arena);
+    if (issue.length > 0) { rapi_errors_body(d->errs, ptr, issue); }
+    *(string*)dst = s;
+    return true;
+  }
+  if (k == RAPI_T_INT) {
+    if (ev != JSON_NUMBER) {
+      rapi__err(d, ptr, "must be an integer");
+      return rapi__skip(d, ev);
+    }
+    var v: int64 = 0;
+    if (!json_read_int64(&d->r, &v)) {
+      rapi__err(d, ptr, "must be an integer");
+      return true;
+    }
+    var issue: string = rapi_int_issue(t, v, d->arena);
+    if (issue.length > 0) { rapi_errors_body(d->errs, ptr, issue); }
+    else { rapi__store_int(dst, t->size, v); }
+    return true;
+  }
+  if (k == RAPI_T_NUMBER) {
+    if (ev != JSON_NUMBER) {
+      rapi__err(d, ptr, "must be a number");
+      return rapi__skip(d, ev);
+    }
+    *(float64*)dst = json_read_float64(&d->r);
+    return true;
+  }
+  if (k == RAPI_T_BOOL) {
+    if (ev != JSON_TRUE && ev != JSON_FALSE) {
+      rapi__err(d, ptr, "must be a boolean");
+      return rapi__skip(d, ev);
+    }
+    *(bool*)dst = ev == JSON_TRUE;
+    return true;
+  }
+  if (k == RAPI_T_ARRAY) {
+    if (ev != JSON_ARRAY_START) {
+      rapi__err(d, ptr, "must be an array");
+      return rapi__skip(d, ev);
+    }
+    return rapi__array(d, t, dst, ptr);
+  }
+  if (k == RAPI_T_OBJECT) {
+    if (ev != JSON_OBJECT_START) {
+      rapi__err(d, ptr, "must be an object");
+      return rapi__skip(d, ev);
+    }
+    return rapi__object(d, t, dst, ptr, false);
+  }
+  return rapi__skip(d, ev);
+}
+
+// Array: elements go into an arena block that doubles as it fills; dst gets the
+// CodecList<T> layout (data, len, cap).
+fn rapi__array(d: RapiDecoder*, t: RapiType*, dst: rawptr, ptr: string) -> bool {
+  var et: RapiType* = t->items;
+  var esz: int64 = et->size;
+  var cap: int64 = 0;
+  var n: int64 = 0;
+  var data: uint8* = (uint8*)0;
+  var ev: int32 = json_next(&d->r);
+  while (ev != JSON_ARRAY_END) {
+    if (ev == JSON_ERROR || ev == JSON_END) { return rapi__fail(d); }
+    if (n == cap) {
+      var ncap: int64 = 8;
+      if (cap > 0) { ncap = cap * 2; }
+      var nd: uint8* = rz_arena_alloc_zeroed(d->arena, ncap * esz);
+      if (nd == 0) { rapi__err(d, ptr, "is too large"); return rapi__fail(d); }
+      if (n > 0) { memcpy((rawptr)nd, (rawptr)data, n * esz); }
+      data = nd;
+      cap = ncap;
+    }
+    var eptr: string = rapi__ptr_index(d, ptr, n);
+    if (!rapi__value(d, et, (rawptr)(data + n * esz), ev, eptr)) { return false; }
+    n = n + 1;
+    ev = json_next(&d->r);
+  }
+  if (t->min_items != RAPI_UNSET && n < t->min_items) {
+    rapi__err(d, ptr, "must have at least {t->min_items} items");
+  }
+  if (t->max_items != RAPI_UNSET && n > t->max_items) {
+    rapi__err(d, ptr, "must have at most {t->max_items} items");
+  }
+  *(rawptr*)dst = (rawptr)data;
+  *(int64*)((uint8*)dst + 8) = n;
+  *(int64*)((uint8*)dst + 16) = cap;
+  return true;
+}
+
+// Object: the reader stands just inside '{'.
+fn rapi__object(d: RapiDecoder*, t: RapiType*, dst: rawptr, ptr: string, top: bool) -> bool {
+  var seen: int64 = 0;
+  var ev: int32 = json_next(&d->r);
+  while (ev != JSON_OBJECT_END) {
+    if (ev != JSON_KEY) { return rapi__fail(d); }
+    var fi: int32 = -1;
+    for i in 0..t->nfields {
+      if (json_text_is(&d->r, t->fields[i].name)) { fi = (int32)i; break; }
+    }
+    var key: string = "";
+    if (fi < 0) { key = rapi__take_string(d); }
+    else { key = t->fields[fi].name; }
+    var mptr: string = rapi__ptr_join(d, ptr, key);
+    var vev: int32 = json_next(&d->r);
+    if (fi < 0) {
+      if (t->closed) { rapi__err(d, mptr, "is not allowed"); }
+      if (!rapi__skip(d, vev)) { return false; }
+    } else {
+      var bit: int64 = (int64)1 << (int64)fi;
+      var f: RapiField* = &t->fields[fi];
+      if ((seen & bit) != 0) {
+        rapi__err(d, mptr, "is given more than once");
+        if (!rapi__skip(d, vev)) { return false; }
+      } else if (f->read_only) {
+        seen = seen | bit;
+        rapi__err(d, mptr, "is read-only");
+        if (!rapi__skip(d, vev)) { return false; }
+      } else {
+        seen = seen | bit;
+        if (!rapi__value(d, f->type, (rawptr)((uint8*)dst + f->offset), vev, mptr)) { return false; }
+      }
+    }
+    ev = json_next(&d->r);
+  }
+  for i in 0..t->nfields {
+    var bit: int64 = (int64)1 << (int64)i;
+    if (t->fields[i].required && (seen & bit) == 0) {
+      rapi__err(d, rapi__ptr_join(d, ptr, t->fields[i].name), "is required");
+    }
+  }
+  if (top) { d->present = seen; }
+  return true;
+}
+
+/// Decodes `doc` into `out` (t->size bytes, zeroed or holding defaults) as type `t`.
+///
+/// in:      t      the type (any kind; objects are the usual case)
+///          doc    the JSON text
+///          out    where to write
+///          arena  the request arena (strings and arrays go here)
+///          errs   collects the errors; cleared first
+///          present  when not 0, gets the top-level fields seen (bit i = field i)
+/// returns: RAPI_DECODE_OK, RAPI_DECODE_SYNTAX (not JSON, errs holds one error
+///          with the byte offset) or RAPI_DECODE_INVALID (errs says why)
+export fn rapi_decode(t: RapiType*, doc: string, out: rawptr, arena: RzArena*, errs: RapiErrors*, present: int64*) -> int32 {
+  rapi_errors_clear(errs);
+  var d: RapiDecoder;
+  memset((rawptr)&d, 0, sizeof(RapiDecoder));
+  d.arena = arena;
+  d.errs = errs;
+  json_begin(&d.r, doc);
+  var ev: int32 = json_next(&d.r);
+  var ok: bool = true;
+  if (t->kind == RAPI_T_OBJECT && ev == JSON_OBJECT_START) {
+    ok = rapi__object(&d, t, out, "#", true);
+  } else {
+    ok = rapi__value(&d, t, out, ev, "#");
+  }
+  if (ok && json_next(&d.r) != JSON_END) { ok = rapi__fail(&d); }
+  if (!ok || d.syntax) {
+    rapi_errors_clear(errs);
+    rapi_errors_body(errs, "", rz_arena_str(arena, "the body is not valid JSON (at byte {d.syntax_at})"));
+    return RAPI_DECODE_SYNTAX;
+  }
+  if (present != 0) { *present = d.present; }
+  if (rapi_errors_count(errs) > 0) { return RAPI_DECODE_INVALID; }
+  return RAPI_DECODE_OK;
+}

@@ -1,0 +1,231 @@
+//! Walks line, polyline and path nodes as a flat run of move/line points, flattening
+//! cubic segments adaptively, and turns a dash style into a dash pattern. Depends on
+//! scene/scene and std/math. The iterator borrows the scene's arrays: do not add to the
+//! scene while iterating. Allocates nothing.
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/scene/scene";
+
+const PATH_MAX_SEGS: int32 = 32;
+
+/// Iterator state for mp_path_next. Initialise it with mp_path_iter; fields are private.
+///
+/// @mem Borrows the scene's point and command arrays; holds no ownership.
+export struct MpPathIter {
+  pts: float64*;   /// the node's points
+  npts: int32;     /// floats in pts
+  pi: int32;       /// next float to read
+  cmds: uint8*;    /// the node's commands (0 for a line or polyline)
+  ncmds: int32;    /// commands in cmds
+  ci: int32;       /// next command to read
+  tol: float64;    /// flattening tolerance, px
+  cx: float64;     /// current point x
+  cy: float64;     /// current point y
+  sx: float64;     /// current subpath start x
+  sy: float64;     /// current subpath start y
+  seg: int32;      /// next segment of the cubic being flattened (0 = none)
+  nseg: int32;     /// segments of that cubic
+  bx0: float64;    /// cubic start x
+  by0: float64;    /// cubic start y
+  bx1: float64;    /// cubic first control x
+  by1: float64;    /// cubic first control y
+  bx2: float64;    /// cubic second control x
+  by2: float64;    /// cubic second control y
+  bx3: float64;    /// cubic end x
+  by3: float64;    /// cubic end y
+}
+
+/// Starts iterating the points of a line, polyline or path node.
+/// Lines and polylines yield one MP_PATH_MOVE then MP_PATH_LINE per further point. Paths
+/// yield their moves and lines; a close yields a line back to the subpath start (when
+/// not already there); a cubic yields clamp(ceil(L / tol_px), 1, 32) lines, where L is
+/// the length of its control polygon (an upper bound on the curve length).
+///
+/// @param s The scene that holds the node. Valid: non-zero.
+/// @param nd The node. Valid: a LINE, POLY or PATH node of s.
+/// @param it The iterator to initialise. Valid: non-zero.
+/// @param tol_px Flattening tolerance. Units: px. Valid: > 0; anything else uses 0.5.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s, nd or it is 0, or nd is another kind; it then yields nothing.
+/// @mem it borrows the scene's arrays until the next add, clear or free of s.
+/// @thread One thread at a time per scene.
+/// @cost O(1).
+export fn mp_path_iter(s: MpScene*, nd: MpNode*, it: MpPathIter*, tol_px: float64) -> int32 {
+  if (it == 0) { return MP_ERR_ARG; }
+  it->pts = 0;
+  it->npts = 0;
+  it->pi = 0;
+  it->cmds = 0;
+  it->ncmds = 0;
+  it->ci = 0;
+  it->seg = 0;
+  it->nseg = 0;
+  it->tol = tol_px;
+  if (!(tol_px > 0.0) || tol_px > 1e9) { it->tol = 0.5; }
+  if (s == 0 || nd == 0) { return MP_ERR_ARG; }
+  if (nd->kind != MP_NODE_LINE && nd->kind != MP_NODE_POLY && nd->kind != MP_NODE_PATH) {
+    return MP_ERR_ARG;
+  }
+  var p: float64* = mp_scene_node_pts(s, nd);
+  if (p == 0) { return MP_OK; }
+  it->pts = p;
+  it->npts = nd->pts_len;
+  if (nd->kind == MP_NODE_PATH) {
+    it->cmds = mp_scene_node_cmds(s, nd);
+    if (it->cmds == 0) {
+      it->npts = 0;
+      return MP_OK;
+    }
+    it->ncmds = nd->cmd_len;
+  }
+  return MP_OK;
+}
+
+fn path_take(it: MpPathIter*, x: float64*, y: float64*) -> bool {
+  if (it->pi + 1 >= it->npts) { return false; }
+  *x = it->pts[it->pi];
+  *y = it->pts[it->pi + 1];
+  it->pi = it->pi + 2;
+  return true;
+}
+
+fn path_dist(x0: float64, y0: float64, x1: float64, y1: float64) -> float64 {
+  var dx: float64 = x1 - x0;
+  var dy: float64 = y1 - y0;
+  return sqrt(dx * dx + dy * dy);
+}
+
+fn path_cubic_start(it: MpPathIter*) -> bool {
+  it->bx0 = it->cx;
+  it->by0 = it->cy;
+  if (!path_take(it, &it->bx1, &it->by1)) { return false; }
+  if (!path_take(it, &it->bx2, &it->by2)) { return false; }
+  if (!path_take(it, &it->bx3, &it->by3)) { return false; }
+  var len: float64 = path_dist(it->bx0, it->by0, it->bx1, it->by1) +
+    path_dist(it->bx1, it->by1, it->bx2, it->by2) +
+    path_dist(it->bx2, it->by2, it->bx3, it->by3);
+  var n: int32 = PATH_MAX_SEGS;
+  if (len == len && len / it->tol < (float64)PATH_MAX_SEGS) {
+    n = (int32)ceil(len / it->tol);
+  }
+  if (n < 1) { n = 1; }
+  it->nseg = n;
+  it->seg = 1;
+  return true;
+}
+
+// Point of the cubic at segment `it->seg` of `it->nseg`; the last one is exact.
+fn path_cubic_step(it: MpPathIter*, x: float64*, y: float64*) {
+  if (it->seg >= it->nseg) {
+    *x = it->bx3;
+    *y = it->by3;
+    it->seg = 0;
+    return;
+  }
+  var t: float64 = (float64)it->seg / (float64)it->nseg;
+  var u: float64 = 1.0 - t;
+  var a: float64 = u * u * u;
+  var b: float64 = 3.0 * u * u * t;
+  var c: float64 = 3.0 * u * t * t;
+  var d: float64 = t * t * t;
+  *x = a * it->bx0 + b * it->bx1 + c * it->bx2 + d * it->bx3;
+  *y = a * it->by0 + b * it->by1 + c * it->by2 + d * it->by3;
+  it->seg = it->seg + 1;
+}
+
+fn path_emit(it: MpPathIter*, x: float64*, y: float64*, px: float64, py: float64) {
+  *x = px;
+  *y = py;
+  it->cx = px;
+  it->cy = py;
+}
+
+// One path command; returns the MP_PATH_* yielded, or -1 to read the next command.
+fn path_cmd(it: MpPathIter*, x: float64*, y: float64*) -> int32 {
+  var cmd: int32 = (int32)it->cmds[it->ci];
+  it->ci = it->ci + 1;
+  var px: float64 = 0.0;
+  var py: float64 = 0.0;
+  if (cmd == MP_PATH_MOVE || cmd == MP_PATH_LINE) {
+    if (!path_take(it, &px, &py)) { return 0; }
+    path_emit(it, x, y, px, py);
+    if (cmd == MP_PATH_MOVE) {
+      it->sx = px;
+      it->sy = py;
+    }
+    return cmd;
+  }
+  if (cmd == MP_PATH_CUBIC) {
+    if (!path_cubic_start(it)) { return 0; }
+    path_cubic_step(it, &px, &py);
+    path_emit(it, x, y, px, py);
+    return MP_PATH_LINE;
+  }
+  if (cmd == MP_PATH_CLOSE && (it->cx != it->sx || it->cy != it->sy)) {
+    path_emit(it, x, y, it->sx, it->sy);
+    return MP_PATH_LINE;
+  }
+  return -1;
+}
+
+/// Yields the next point of the node.
+///
+/// @param it The iterator from mp_path_iter. Valid: non-zero.
+/// @param x Receives the point x. Units: px. Valid: non-zero.
+/// @param y Receives the point y. Units: px. Valid: non-zero.
+/// @return MP_PATH_MOVE (start a new run here), MP_PATH_LINE (draw to here), or 0 at the
+///   end (also for a zero argument or a truncated node).
+/// @mem Writes only through x and y; borrows the scene's arrays.
+/// @thread One thread at a time per iterator.
+/// @cost O(1) per point.
+export fn mp_path_next(it: MpPathIter*, x: float64*, y: float64*) -> int32 {
+  if (it == 0 || x == 0 || y == 0) { return 0; }
+  if (it->seg > 0) {
+    var px: float64 = 0.0;
+    var py: float64 = 0.0;
+    path_cubic_step(it, &px, &py);
+    path_emit(it, x, y, px, py);
+    return MP_PATH_LINE;
+  }
+  if (it->cmds == 0) {
+    var first: bool = it->pi == 0;
+    var qx: float64 = 0.0;
+    var qy: float64 = 0.0;
+    if (!path_take(it, &qx, &qy)) { return 0; }
+    path_emit(it, x, y, qx, qy);
+    if (first) { return MP_PATH_MOVE; }
+    return MP_PATH_LINE;
+  }
+  while (it->ci < it->ncmds) {
+    var r: int32 = path_cmd(it, x, y);
+    if (r >= 0) { return r; }
+  }
+  return 0;
+}
+
+/// Dash pattern for a stroke: dash and gap lengths, repeated along the line.
+/// Dashed is 4w on, 3w off; dotted is 0.01 on, 2w off and is meant for round caps.
+///
+/// @param dash MP_DASH_*. Valid: any; solid or an unknown value gives 0 entries.
+/// @param width Stroke width. Units: px. Valid: > 0; anything else counts as 1.
+/// @param out Receives the pattern. Units: px. Valid: room for 2 floats.
+/// @return Number of entries written: 0 (solid) or 2.
+/// @mem Writes at most out[0] and out[1].
+/// @thread Safe from any thread.
+export fn mp_dash_pattern(dash: int32, width: float64, out: float64*) -> int32 {
+  if (out == 0) { return 0; }
+  var w: float64 = width;
+  if (!(w > 0.0) || w > 1e9) { w = 1.0; }
+  if (dash == MP_DASH_DASHED) {
+    out[0] = 4.0 * w;
+    out[1] = 3.0 * w;
+    return 2;
+  }
+  if (dash == MP_DASH_DOTTED) {
+    out[0] = 0.01;
+    out[1] = 2.0 * w;
+    return 2;
+  }
+  return 0;
+}

@@ -1,0 +1,234 @@
+// Reed-Solomon over GF(2^16) for wide stripes: k data plus m parity
+// shards with k + m up to 65536. The code is systematic Cauchy Reed-Solomon
+// (Blomer et al., as in Jerasure): parity p, data j has coefficient
+// 1 / ((k + p) xor j). Every square sub-matrix of a Cauchy matrix is
+// invertible, so any k shards rebuild the rest.
+//
+// Rebuild does not invert a k x k matrix. For e lost data shards it takes e
+// surviving parity shards, removes the known data from them, and inverts
+// only the e x e Cauchy block, so the cost grows with the losses, not k^3.
+//
+// Shards hold 16-bit little-endian symbols, so the shard size must be even.
+
+import "std/mem";
+import "erasure/core/status";
+import "erasure/gf16/field";
+
+export const ERASURE_RS16_MAX_SHARDS: int32 = 65536;
+
+// Symbols per step, so the working set stays in cache.
+const ERASURE16_CHUNK: int64 = 8192;
+
+export struct ErasureRS16 {
+  k: int32;
+  m: int32;
+  n: int32;
+  tab: uint16*;      // 512 words of scratch for the multiply tables
+}
+
+/// Sets up a GF(2^16) codec. k >= 1, m >= 0, k + m <= 65536.
+export fn erasure_rs16_new(c: ErasureRS16*, k: int32, m: int32) -> int32 {
+  if (c == 0) { return ERASURE_E_ARG; }
+  c->tab = 0;
+  if (k < 1 || m < 0 || k > ERASURE_RS16_MAX_SHARDS - m) { return ERASURE_E_ARG; }
+  erasure_gf16_init();
+  c->k = k;
+  c->m = m;
+  c->n = k + m;
+  c->tab = (uint16*)malloc(1024);
+  if (c->tab == 0) { return ERASURE_E_MEM; }
+  return ERASURE_OK;
+}
+
+export fn erasure_rs16_free(c: ErasureRS16*) {
+  if (c == 0) { return; }
+  if (c->tab != 0) { free(c->tab); }
+  c->tab = 0;
+}
+
+/// Coefficient of data shard j in parity shard p (0-based parity index).
+export fn erasure_rs16_coef(c: ErasureRS16*, p: int32, j: int32) -> uint16 {
+  return erasure_gf16_inv((uint16)((c->k + p) ^ j));
+}
+
+fn erasure16_check(c: ErasureRS16*, shards: uint8**, size: int64) -> int32 {
+  if (c == 0 || shards == 0 || size < 0 || (size & 1) != 0) { return ERASURE_E_ARG; }
+  for i in 0..c->n { if (shards[i] == 0) { return ERASURE_E_ARG; } }
+  return ERASURE_OK;
+}
+
+// out = parity row p over symbols off..off+n of the data shards.
+fn erasure16_parity(c: ErasureRS16*, shards: uint8**, p: int32, out: uint16*, off: int64, n: int64) {
+  for j in 0..c->k {
+    var src: uint16* = (uint16*)shards[j] + off;
+    erasure_gf16_mul_add(out, src, n, erasure_rs16_coef(c, p, j), c->tab, j == 0);
+  }
+}
+
+/// Computes the m parity shards from the k data shards. size is in bytes
+/// and must be even.
+export fn erasure_rs16_encode(c: ErasureRS16*, shards: uint8**, size: int64) -> int32 {
+  var rc: int32 = erasure16_check(c, shards, size);
+  if (rc != ERASURE_OK) { return rc; }
+  var total: int64 = size / 2;
+  var off: int64 = 0;
+  while (off < total) {
+    var n: int64 = total - off;
+    if (n > ERASURE16_CHUNK) { n = ERASURE16_CHUNK; }
+    for p in 0..c->m {
+      erasure16_parity(c, shards, p, (uint16*)shards[c->k + p] + off, off, n);
+    }
+    off = off + n;
+  }
+  return ERASURE_OK;
+}
+
+/// ERASURE_OK when the parity matches the data, else ERASURE_E_VERIFY.
+export fn erasure_rs16_verify(c: ErasureRS16*, shards: uint8**, size: int64) -> int32 {
+  var rc: int32 = erasure16_check(c, shards, size);
+  if (rc != ERASURE_OK) { return rc; }
+  var tmp: uint16* = (uint16*)malloc(ERASURE16_CHUNK * 2);
+  if (tmp == 0) { return ERASURE_E_MEM; }
+  var total: int64 = size / 2;
+  var off: int64 = 0;
+  while (off < total && rc == ERASURE_OK) {
+    var n: int64 = total - off;
+    if (n > ERASURE16_CHUNK) { n = ERASURE16_CHUNK; }
+    for p in 0..c->m {
+      erasure16_parity(c, shards, p, tmp, off, n);
+      var have: uint16* = (uint16*)shards[c->k + p] + off;
+      for i in 0..n { if (have[i] != tmp[i]) { rc = ERASURE_E_VERIFY; break; } }
+      if (rc != ERASURE_OK) { break; }
+    }
+    off = off + n;
+  }
+  free(tmp);
+  return rc;
+}
+
+// Inverts the e x e matrix a in place. Returns ERASURE_OK or ERASURE_E_ARG.
+fn erasure16_invert(a: uint16*, e: int32) -> int32 {
+  var w: int64 = (int64)e * 2;
+  var t: uint16* = (uint16*)malloc((int64)e * w * 2);
+  if (t == 0) { return ERASURE_E_MEM; }
+  for i in 0..e {
+    for j in 0..e {
+      t[i * w + j] = a[(int64)i * e + j];
+      var one: uint16 = 0;
+      if (i == j) { one = 1; }
+      t[i * w + e + j] = one;
+    }
+  }
+  for col in 0..e {
+    var piv: int32 = -1;
+    for r in col..e { if (t[(int64)r * w + col] != 0) { piv = r; break; } }
+    if (piv < 0) { free(t); return ERASURE_E_ARG; }
+    if (piv != col) {
+      for j in 0..w {
+        var x: uint16 = t[(int64)piv * w + j];
+        t[(int64)piv * w + j] = t[(int64)col * w + j];
+        t[(int64)col * w + j] = x;
+      }
+    }
+    var d: uint16 = erasure_gf16_inv(t[(int64)col * w + col]);
+    for j in 0..w { t[(int64)col * w + j] = erasure_gf16_mul(t[(int64)col * w + j], d); }
+    for r in 0..e {
+      if (r == col) { continue; }
+      var f: uint16 = t[(int64)r * w + col];
+      if (f == 0) { continue; }
+      for j in 0..w {
+        t[(int64)r * w + j] = t[(int64)r * w + j] ^ erasure_gf16_mul(f, t[(int64)col * w + j]);
+      }
+    }
+  }
+  for i in 0..e {
+    for j in 0..e { a[(int64)i * e + j] = t[(int64)i * w + e + j]; }
+  }
+  free(t);
+  return ERASURE_OK;
+}
+
+fn erasure16_rebuild(c: ErasureRS16*, shards: uint8**, present: bool*, size: int64, data_only: bool) -> int32 {
+  var rc: int32 = erasure16_check(c, shards, size);
+  if (rc != ERASURE_OK) { return rc; }
+  if (present == 0) { return ERASURE_E_ARG; }
+  var have: int32 = 0;
+  for i in 0..c->n { if (present[i]) { have = have + 1; } }
+  var lost: int32* = (int32*)malloc((int64)c->k * 4 + 4);
+  var use: int32* = (int32*)malloc((int64)c->m * 4 + 4);
+  if (lost == 0 || use == 0) { free(lost); free(use); return ERASURE_E_MEM; }
+  var e: int32 = 0;
+  for j in 0..c->k { if (!present[j]) { lost[e] = j; e = e + 1; } }
+  var need_parity: bool = false;
+  if (!data_only) {
+    for p in 0..c->m { if (!present[c->k + p]) { need_parity = true; } }
+  }
+  if (e == 0 && !need_parity) { free(lost); free(use); return ERASURE_OK; }
+  if (have < c->k) { free(lost); free(use); return ERASURE_E_SHARDS; }
+  if (e > 0) {
+    var nu: int32 = 0;
+    for p in 0..c->m {
+      if (present[c->k + p] && nu < e) { use[nu] = p; nu = nu + 1; }
+    }
+    // The e x e Cauchy block: chosen parity rows, lost data columns.
+    var inv: uint16* = (uint16*)malloc((int64)e * e * 2);
+    var tmp: uint16* = (uint16*)malloc((int64)e * ERASURE16_CHUNK * 2);
+    if (inv == 0 || tmp == 0) { free(inv); free(tmp); free(lost); free(use); return ERASURE_E_MEM; }
+    for r in 0..e {
+      for q in 0..e { inv[(int64)r * e + q] = erasure_rs16_coef(c, use[r], lost[q]); }
+    }
+    rc = erasure16_invert(inv, e);
+    var total: int64 = size / 2;
+    var off: int64 = 0;
+    while (rc == ERASURE_OK && off < total) {
+      var n: int64 = total - off;
+      if (n > ERASURE16_CHUNK) { n = ERASURE16_CHUNK; }
+      // s[r] = parity use[r] minus the part from the data we still have.
+      for r in 0..e {
+        var s: uint16* = tmp + (int64)r * ERASURE16_CHUNK;
+        var par: uint16* = (uint16*)shards[c->k + use[r]] + off;
+        for i in 0..n { s[i] = par[i]; }
+        for j in 0..c->k {
+          if (!present[j]) { continue; }
+          erasure_gf16_mul_add(s, (uint16*)shards[j] + off, n, erasure_rs16_coef(c, use[r], j), c->tab, false);
+        }
+      }
+      // lost data q = sum over r of inv[q][r] * s[r].
+      for q in 0..e {
+        var d: uint16* = (uint16*)shards[lost[q]] + off;
+        for r in 0..e {
+          erasure_gf16_mul_add(d, tmp + (int64)r * ERASURE16_CHUNK, n, inv[(int64)q * e + r], c->tab, r == 0);
+        }
+      }
+      off = off + n;
+    }
+    free(inv);
+    free(tmp);
+  }
+  if (rc == ERASURE_OK && need_parity) {
+    var total2: int64 = size / 2;
+    var off2: int64 = 0;
+    while (off2 < total2) {
+      var n2: int64 = total2 - off2;
+      if (n2 > ERASURE16_CHUNK) { n2 = ERASURE16_CHUNK; }
+      for p in 0..c->m {
+        if (present[c->k + p]) { continue; }
+        erasure16_parity(c, shards, p, (uint16*)shards[c->k + p] + off2, off2, n2);
+      }
+      off2 = off2 + n2;
+    }
+  }
+  free(lost);
+  free(use);
+  return rc;
+}
+
+/// Rebuilds every missing shard (present[i] false). Needs k present shards.
+export fn erasure_rs16_reconstruct(c: ErasureRS16*, shards: uint8**, present: bool*, size: int64) -> int32 {
+  return erasure16_rebuild(c, shards, present, size, false);
+}
+
+/// Rebuilds only the missing data shards.
+export fn erasure_rs16_reconstruct_data(c: ErasureRS16*, shards: uint8**, present: bool*, size: int64) -> int32 {
+  return erasure16_rebuild(c, shards, present, size, true);
+}

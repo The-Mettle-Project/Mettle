@@ -1,0 +1,1463 @@
+// wayland/backend: windows and input on Wayland, written from the protocol XML:
+//   wayland.xml (core: wl_compositor, wl_surface, wl_shm, wl_seat, wl_pointer,
+//     wl_keyboard, wl_output, wl_data_device), xdg-shell (xdg_wm_base,
+//     xdg_surface, xdg_toplevel), xdg-decoration-unstable-v1, cursor-shape-v1,
+//   fractional-scale-v1, viewporter, relative-pointer-unstable-v1,
+//   pointer-constraints-unstable-v1, text-input-unstable-v3, xdg-activation-v1.
+// Optional protocols are used when the compositor offers them.
+//
+// Drawing is through wl_shm buffers (window_blit). GL needs libwayland's
+// wl_display, which this pure-Mettle client does not have (see docs/glint.md).
+import "std/mem";
+import "../core/keys.mettle";
+import "../core/types.mettle";
+import "wire.mettle";
+import "xkb.mettle";
+
+const MAX_OUTPUTS: int64 = 16;
+
+struct WlOutput {
+  id: int64;
+  gname: int64;              // registry name
+  x: int32; y: int32;
+  w: int32; h: int32;        // current mode in pixels
+  mm_w: int32; mm_h: int32;
+  refresh: int32;
+  scale: int32;
+  transform: int32;
+  name: uint8[64];
+  name_len: int32;
+}
+
+struct WlOffer {
+  id: int64;
+  uri: bool;
+  utf8: bool;                // text/plain;charset=utf-8
+  utf8_string: bool;         // UTF8_STRING
+  plain: bool;               // text/plain
+}
+
+struct ShmBuf {
+  id: int64;
+  ptr: int64;
+  size: int64;
+}
+
+export struct WindowWlWin {
+  surface: int64;
+  xdg_surface: int64;
+  toplevel: int64;
+  decoration: int64;
+  fractional: int64;
+  viewport: int64;
+  locked: int64;
+  confined: int64;
+  configured: bool;
+  mapped: bool;
+  has_content: bool;
+  transparent: bool;
+  pend_w: int32; pend_h: int32;
+  pend_max: bool; pend_full: bool; pend_act: bool;
+  scale120: int32;           // fractional scale * 120 (0 = not told)
+  pref_scale: int32;         // wl_surface.preferred_buffer_scale (0 = not told)
+  outputs: int64;            // bit per entered output slot
+  buf_w: int32; buf_h: int32;
+  min_w: int32; min_h: int32; max_w: int32; max_h: int32;
+  cursor_surface: int64;
+  cursor_hx: int32; cursor_hy: int32;
+  cursor_img: bool;
+}
+
+struct WlState {
+  registry: int64;
+  compositor: int64; compositor_v: int64;
+  shm: int64;
+  wm_base: int64;
+  seat: int64; seat_v: int64;
+  ddm: int64; ddm_v: int64;
+  deco: int64;
+  cshape: int64;
+  fracman: int64;
+  viewporter: int64;
+  relman: int64;
+  constraints: int64;
+  timan: int64;
+  activation: int64;
+  pointer: int64;
+  keyboard: int64;
+  data_device: int64;
+  cshape_dev: int64;
+  relative: int64;
+  text_input: int64;
+  ti_serial: int64;
+  outputs: WlOutput[16];
+  noutputs: int32;
+  sync_done: bool;
+  ptr_serial: int64;
+  ptr_win: Window*;
+  kbd_win: Window*;
+  ti_win: Window*;
+  serial: int64;             // newest input serial (for clipboard and activation)
+  xkb: WindowXkbMap*;
+  mods: int32;
+  group: int32;
+  rep_rate: int32;
+  rep_delay: int32;
+  rep_key: int64;
+  rep_next: int64;
+  scroll_dx: float64; scroll_dy: float64; scroll_any: bool;
+  scroll_steps: bool;
+  clip: uint8*; clip_len: int64; clip_source: int64; own_clip: bool;
+  sel_offer: int64;
+  offers: WlOffer[8];
+  dnd_offer: int64;
+  dnd_win: Window*;
+  dnd_x: float64; dnd_y: float64;
+  ti_preedit: uint8*; ti_preedit_len: int64; ti_cursor: int32;
+  ti_commit: uint8*; ti_commit_len: int64;
+  ti_have_preedit: bool;
+  arrow_surface: int64;
+}
+
+var g_s: WlState;
+
+fn ww(w: Window*) -> WindowWlWin* { return (WindowWlWin*)w->plat; }
+
+// ---------- small request helpers ----------
+fn req(obj: int64, op: int64) { window_wl_begin(obj, op); window_wl_send(); }
+fn req1(obj: int64, op: int64, a: int64) { window_wl_begin(obj, op); window_wl_u32(a); window_wl_send(); }
+fn req2(obj: int64, op: int64, a: int64, b: int64) { window_wl_begin(obj, op); window_wl_u32(a); window_wl_u32(b); window_wl_send(); }
+
+fn destroy(obj: int64, op: int64) {
+  if (obj == 0) { return; }
+  req(obj, op);
+  window_wl_forget(obj);
+}
+
+fn bind(gname: int64, iface: string, version: int64, kind: int32) -> int64 {
+  var id: int64 = window_wl_new_id(kind, (rawptr)0);
+  window_wl_begin(g_s.registry, 0);
+  window_wl_u32(gname);
+  window_wl_string(iface);
+  window_wl_u32(version);
+  window_wl_u32(id);
+  window_wl_send();
+  return id;
+}
+
+fn minv(a: int64, b: int64) -> int64 { if (a < b) { return a; } return b; }
+
+fn str_is(p: uint8*, n: int64, lit: string) -> bool {
+  if (n != (int64)lit.length) { return false; }
+  for i: int64 in 0..n { if (p[i] != lit.chars[i]) { return false; } }
+  return true;
+}
+
+fn win_of_surface(id: int64) -> Window* {
+  if (window_wl_kind(id) != WL_SURFACE) { return (Window*)0; }
+  var w: Window* = (Window*)window_wl_data(id);
+  // Cursor surfaces carry no window.
+  if (w == 0 || w->plat == 0 || ww(w)->surface != id) { return (Window*)0; }
+  return w;
+}
+
+// ---------- shm buffers ----------
+fn shm_buffer(width: int32, height: int32, format: int64, out_ptr: int64*) -> int64 {
+  var stride: int64 = (int64)width * 4;
+  var size: int64 = stride * (int64)height;
+  if (size <= 0 || size > 268435456) { return 0; }
+  var name: string = "mettle-window";
+  var cname: uint8[16];
+  for i: int64 in 0..13 { cname[i] = name.chars[i]; }
+  cname[13] = (uint8)0;
+  var fd: int64 = syscall(319, &cname[0], 1);                       // memfd_create(MFD_CLOEXEC)
+  if (fd < 0) { return 0; }
+  if (syscall(77, fd, size) < 0) { syscall(3, fd); return 0; }    // ftruncate
+  var ptr: int64 = syscall(9, 0, size, 3, 1, fd, 0);                // mmap shared rw
+  if (ptr < 0 && ptr > -4096) { syscall(3, fd); return 0; }
+  var pool: int64 = window_wl_new_id(WL_SHM_POOL, (rawptr)0);
+  window_wl_begin(g_s.shm, 0);
+  window_wl_u32(pool); window_wl_fd(fd); window_wl_u32(size);
+  window_wl_send();
+  var sb: ShmBuf* = new ShmBuf;
+  var buf: int64 = window_wl_new_id(WL_BUFFER, (rawptr)sb);
+  sb->id = buf; sb->ptr = ptr; sb->size = size;
+  window_wl_begin(pool, 0);
+  window_wl_u32(buf); window_wl_u32(0); window_wl_u32((int64)width); window_wl_u32((int64)height);
+  window_wl_u32(stride); window_wl_u32(format);
+  window_wl_send();
+  destroy(pool, 1);
+  syscall(3, fd);
+  *out_ptr = ptr;
+  return buf;
+}
+
+fn buffer_release(id: int64) {
+  var sb: ShmBuf* = (ShmBuf*)window_wl_data(id);
+  destroy(id, 0);
+  if (sb != 0) {
+    syscall(11, sb->ptr, sb->size);
+    free(sb);
+  }
+}
+
+// ---------- scale ----------
+fn win_scale(w: Window*) -> float32 {
+  var x: WindowWlWin* = ww(w);
+  if (x->scale120 > 0 && x->viewport != 0) { return (float32)x->scale120 / 120.0; }
+  if (x->pref_scale > 0) { return (float32)x->pref_scale; }
+  var s: int32 = 1;
+  for i in 0..g_s.noutputs {
+    if ((x->outputs & ((int64)1 << i)) != 0 && g_s.outputs[i].scale > s) { s = g_s.outputs[i].scale; }
+  }
+  return (float32)s;
+}
+
+fn int_scale(w: Window*) -> int32 {
+  var x: WindowWlWin* = ww(w);
+  if (x->scale120 > 0 && x->viewport != 0) { return 1; }
+  return (int32)win_scale(w);
+}
+
+fn px(v: int32, s: float32) -> int32 {
+  var r: int32 = (int32)((float32)v * s + 0.5);
+  if (r < 1) { r = 1; }
+  return r;
+}
+
+// Emits SCALE and RESIZE when the scale or size changed.
+fn update_size(w: Window*, lw: int32, lh: int32) {
+  var s: float32 = win_scale(w);
+  if (s != w->scale) {
+    var se: WindowEvent; se.kind = WINDOW_EV_SCALE; se.win = w; se.scale = s;
+    window_push_event(&se);
+  }
+  var ev: WindowEvent;
+  ev.kind = WINDOW_EV_RESIZE; ev.win = w;
+  ev.w = lw; ev.h = lh;
+  ev.fb_w = px(lw, s); ev.fb_h = px(lh, s);
+  window_push_event(&ev);
+}
+
+// Attaches pixels (BGRA, premultiplied when transparent) to the surface and commits.
+fn present(w: Window*, rgba: uint8*, iw: int32, ih: int32, stride: int32) -> bool {
+  var x: WindowWlWin* = ww(w);
+  var format: int64 = 1;                                            // XRGB8888
+  if (x->transparent) { format = 0; }                               // ARGB8888
+  var ptr: int64 = 0;
+  var buf: int64 = shm_buffer(iw, ih, format, &ptr);
+  if (buf == 0) { window_set_error("cannot make a shared-memory buffer"); return false; }
+  var dst: uint8* = (uint8*)ptr;
+  for y: int64 in 0..(int64)ih {
+    var srow: int64 = y * (int64)stride;
+    var drow: int64 = y * (int64)iw * 4;
+    for i: int64 in 0..(int64)iw {
+      if (rgba == 0) {
+        dst[drow + i * 4] = (uint8)0; dst[drow + i * 4 + 1] = (uint8)0; dst[drow + i * 4 + 2] = (uint8)0; dst[drow + i * 4 + 3] = (uint8)255;
+        continue;
+      }
+      var a: int64 = (int64)rgba[srow + i * 4 + 3];
+      var r: int64 = (int64)rgba[srow + i * 4];
+      var g: int64 = (int64)rgba[srow + i * 4 + 1];
+      var b: int64 = (int64)rgba[srow + i * 4 + 2];
+      if (x->transparent) { r = r * a / 255; g = g * a / 255; b = b * a / 255; } else { a = 255; }
+      dst[drow + i * 4] = (uint8)b; dst[drow + i * 4 + 1] = (uint8)g; dst[drow + i * 4 + 2] = (uint8)r; dst[drow + i * 4 + 3] = (uint8)a;
+    }
+  }
+  var is: int32 = int_scale(w);
+  if (g_s.compositor_v >= 3) { req1(x->surface, 8, (int64)is); }           // set_buffer_scale
+  if (x->viewport != 0) {
+    window_wl_begin(x->viewport, 2); window_wl_u32((int64)w->w); window_wl_u32((int64)w->h); window_wl_send();
+  }
+  window_wl_begin(x->surface, 1); window_wl_u32(buf); window_wl_u32(0); window_wl_u32(0); window_wl_send();
+  if (g_s.compositor_v >= 4) {
+    window_wl_begin(x->surface, 9); window_wl_u32(0); window_wl_u32(0); window_wl_u32(0x7FFFFFFF); window_wl_u32(0x7FFFFFFF); window_wl_send();
+  } else {
+    window_wl_begin(x->surface, 2); window_wl_u32(0); window_wl_u32(0); window_wl_u32(0x7FFFFFFF); window_wl_u32(0x7FFFFFFF); window_wl_send();
+  }
+  req(x->surface, 6);                                               // commit
+  x->buf_w = iw; x->buf_h = ih;
+  x->has_content = true;
+  x->mapped = true;
+  return true;
+}
+
+// ---------- registry ----------
+fn add_output(gname: int64, version: int64) {
+  if (g_s.noutputs >= (int32)MAX_OUTPUTS) { return; }
+  var o: WlOutput* = &g_s.outputs[g_s.noutputs];
+  var z: WlOutput;
+  *o = z;
+  o->gname = gname;
+  o->scale = 1;
+  o->refresh = 60000;
+  o->id = bind(gname, "wl_output", minv(version, 4), WL_OUTPUT);
+  g_s.noutputs = g_s.noutputs + 1;
+}
+
+fn output_slot(id: int64) -> int32 {
+  for i in 0..g_s.noutputs { if (g_s.outputs[i].id == id) { return (int32)i; } }
+  return -1;
+}
+
+fn publish_monitors() {
+  var n: int32 = g_s.noutputs;
+  if (n == 0) { window_set_monitors((WindowMonitor*)0, 0); return; }
+  var list: WindowMonitor* = (WindowMonitor*)malloc((int64)n * (int64)sizeof(WindowMonitor));
+  for i in 0..n {
+    var o: WlOutput* = &g_s.outputs[i];
+    var m: WindowMonitor;
+    var z: WindowMonitor;
+    m = z;
+    var s: int32 = o->scale;
+    if (s < 1) { s = 1; }
+    m.x = o->x; m.y = o->y;
+    m.w = o->w / s; m.h = o->h / s;                                 // logical size (integer scale)
+    if ((o->transform & 1) != 0) { var t: int32 = m.w; m.w = m.h; m.h = t; }
+    m.work_x = m.x; m.work_y = m.y; m.work_w = m.w; m.work_h = m.h;
+    m.mm_w = o->mm_w; m.mm_h = o->mm_h; m.refresh_mhz = o->refresh;
+    m.scale = (float32)s;
+    m.primary = i == 0;
+    m.id = o->gname;
+    for k in 0..o->name_len { m.name[k] = o->name[k]; }
+    m.name_len = o->name_len;
+    list[i] = m;
+  }
+  window_set_monitors(list, n);
+}
+
+fn registry_global(a: WindowWlArgs*) {
+  var gname: int64 = window_wl_arg_u32(a);
+  var ip: uint8* = (uint8*)0; var il: int64 = 0;
+  window_wl_arg_str(a, &ip, &il);
+  var ver: int64 = window_wl_arg_u32(a);
+  if (a->bad || ver < 1) { return; }
+  if (str_is(ip, il, "wl_compositor")) { g_s.compositor_v = minv(ver, 6); g_s.compositor = bind(gname, "wl_compositor", g_s.compositor_v, WL_COMPOSITOR); }
+  else if (str_is(ip, il, "wl_shm")) { g_s.shm = bind(gname, "wl_shm", 1, WL_SHM); }
+  else if (str_is(ip, il, "xdg_wm_base")) { g_s.wm_base = bind(gname, "xdg_wm_base", minv(ver, 5), WL_XDG_WM_BASE); }
+  else if (str_is(ip, il, "wl_seat") && g_s.seat == 0) { g_s.seat_v = minv(ver, 8); g_s.seat = bind(gname, "wl_seat", g_s.seat_v, WL_SEAT); }
+  else if (str_is(ip, il, "wl_output")) { add_output(gname, ver); }
+  else if (str_is(ip, il, "wl_data_device_manager")) { g_s.ddm_v = minv(ver, 3); g_s.ddm = bind(gname, "wl_data_device_manager", g_s.ddm_v, WL_DATA_DEVICE_MANAGER); }
+  else if (str_is(ip, il, "zxdg_decoration_manager_v1")) { g_s.deco = bind(gname, "zxdg_decoration_manager_v1", 1, WL_DECO_MANAGER); }
+  else if (str_is(ip, il, "wp_cursor_shape_manager_v1")) { g_s.cshape = bind(gname, "wp_cursor_shape_manager_v1", 1, WL_CURSOR_SHAPE_MANAGER); }
+  else if (str_is(ip, il, "wp_fractional_scale_manager_v1")) { g_s.fracman = bind(gname, "wp_fractional_scale_manager_v1", 1, WL_FRACTIONAL_MANAGER); }
+  else if (str_is(ip, il, "wp_viewporter")) { g_s.viewporter = bind(gname, "wp_viewporter", 1, WL_VIEWPORTER); }
+  else if (str_is(ip, il, "zwp_relative_pointer_manager_v1")) { g_s.relman = bind(gname, "zwp_relative_pointer_manager_v1", 1, WL_RELATIVE_MANAGER); }
+  else if (str_is(ip, il, "zwp_pointer_constraints_v1")) { g_s.constraints = bind(gname, "zwp_pointer_constraints_v1", 1, WL_CONSTRAINTS); }
+  else if (str_is(ip, il, "zwp_text_input_manager_v3")) { g_s.timan = bind(gname, "zwp_text_input_manager_v3", 1, WL_TEXT_INPUT_MANAGER); }
+  else if (str_is(ip, il, "xdg_activation_v1")) { g_s.activation = bind(gname, "xdg_activation_v1", 1, WL_ACTIVATION); }
+}
+
+fn registry_remove(a: WindowWlArgs*) {
+  var gname: int64 = window_wl_arg_u32(a);
+  for i in 0..g_s.noutputs {
+    if (g_s.outputs[i].gname == gname) {
+      if (g_s.outputs[i].id != 0) { destroy(g_s.outputs[i].id, 0); }
+      for k: int64 in (int64)i..(int64)g_s.noutputs - 1 { g_s.outputs[k] = g_s.outputs[k + 1]; }
+      g_s.noutputs = g_s.noutputs - 1;
+      publish_monitors();
+      var ev: WindowEvent; ev.kind = WINDOW_EV_MONITORS; window_push_event(&ev);
+      return;
+    }
+  }
+}
+
+// ---------- seat ----------
+fn seat_caps(caps: int64) {
+  if ((caps & 1) != 0 && g_s.pointer == 0) {
+    g_s.pointer = window_wl_new_id(WL_POINTER, (rawptr)0);
+    req1(g_s.seat, 0, g_s.pointer);
+    if (g_s.cshape != 0) {
+      g_s.cshape_dev = window_wl_new_id(WL_CURSOR_SHAPE_DEVICE, (rawptr)0);
+      req2(g_s.cshape, 1, g_s.cshape_dev, g_s.pointer);
+    }
+    if (g_s.relman != 0) {
+      g_s.relative = window_wl_new_id(WL_RELATIVE_POINTER, (rawptr)0);
+      req2(g_s.relman, 1, g_s.relative, g_s.pointer);
+    }
+  }
+  if ((caps & 2) != 0 && g_s.keyboard == 0) {
+    g_s.keyboard = window_wl_new_id(WL_KEYBOARD, (rawptr)0);
+    req1(g_s.seat, 1, g_s.keyboard);
+  }
+  if (g_s.ddm != 0 && g_s.data_device == 0) {
+    g_s.data_device = window_wl_new_id(WL_DATA_DEVICE, (rawptr)0);
+    req2(g_s.ddm, 1, g_s.data_device, g_s.seat);
+  }
+  if (g_s.timan != 0 && g_s.text_input == 0) {
+    g_s.text_input = window_wl_new_id(WL_TEXT_INPUT, (rawptr)0);
+    req2(g_s.timan, 1, g_s.text_input, g_s.seat);
+  }
+}
+
+// cursor-shape-v1 shape numbers for WINDOW_CURSOR_*.
+fn shape_code(shape: int32) -> int64 {
+  switch (shape) {
+    case 1: { return 9; }     // text
+    case 2: { return 4; }     // pointer (hand)
+    case 3: { return 8; }     // crosshair
+    case 4: { return 6; }     // wait
+    case 5: { return 26; }    // ew-resize
+    case 6: { return 27; }    // ns-resize
+    case 7: { return 29; }    // nwse-resize
+    case 8: { return 28; }    // nesw-resize
+    case 9: { return 13; }    // move
+    case 10: { return 15; }   // not-allowed
+    default: { return 1; }    // default
+  }
+  return 1;
+}
+
+// A small built-in arrow for compositors without cursor-shape-v1.
+const ARROW: string = "X...........XX..........X.X.........X..X........X...X.......X....X......X.....X.....X......X....X.......X...X........X..X......XXXXX.....X..X...........X.X........XX..X.......X....X..............X..............";
+
+fn arrow_surface() -> int64 {
+  if (g_s.arrow_surface != 0) { return g_s.arrow_surface; }
+  var px: uint8[1024];
+  for i in 0..256 {
+    var c: uint8 = (uint8)46;
+    if (i < (int64)ARROW.length) { c = ARROW.chars[i]; }
+    var on: bool = c == (uint8)88;
+    var v: uint8 = (uint8)0;
+    if (on) { v = (uint8)255; }
+    // White arrow with a black outline look: filled pixels white, others clear.
+    px[i * 4] = v; px[i * 4 + 1] = v; px[i * 4 + 2] = v; px[i * 4 + 3] = v;
+  }
+  var s: int64 = window_wl_new_id(WL_SURFACE, (rawptr)0);
+  req1(g_s.compositor, 0, s);
+  var ptr: int64 = 0;
+  var buf: int64 = shm_buffer(16, 16, 0, &ptr);
+  if (buf == 0) { return s; }
+  var dst: uint8* = (uint8*)ptr;
+  for i in 0..1024 { dst[i] = px[i]; }
+  window_wl_begin(s, 1); window_wl_u32(buf); window_wl_u32(0); window_wl_u32(0); window_wl_send();
+  window_wl_begin(s, 2); window_wl_u32(0); window_wl_u32(0); window_wl_u32(16); window_wl_u32(16); window_wl_send();
+  req(s, 6);
+  g_s.arrow_surface = s;
+  return s;
+}
+
+fn apply_cursor(w: Window*) {
+  if (g_s.pointer == 0 || w == 0 || g_s.ptr_win != w) { return; }
+  var x: WindowWlWin* = ww(w);
+  if (w->cursor_mode == WINDOW_CURSOR_HIDDEN || w->cursor_mode == WINDOW_CURSOR_LOCKED) {
+    window_wl_begin(g_s.pointer, 0); window_wl_u32(g_s.ptr_serial); window_wl_null(); window_wl_u32(0); window_wl_u32(0); window_wl_send();
+    return;
+  }
+  if (x->cursor_img && x->cursor_surface != 0) {
+    window_wl_begin(g_s.pointer, 0); window_wl_u32(g_s.ptr_serial); window_wl_u32(x->cursor_surface);
+    window_wl_u32((int64)x->cursor_hx); window_wl_u32((int64)x->cursor_hy); window_wl_send();
+    return;
+  }
+  if (g_s.cshape_dev != 0) {
+    req2(g_s.cshape_dev, 1, g_s.ptr_serial, shape_code(w->cursor_shape));
+    return;
+  }
+  var s: int64 = arrow_surface();
+  window_wl_begin(g_s.pointer, 0); window_wl_u32(g_s.ptr_serial); window_wl_u32(s); window_wl_u32(0); window_wl_u32(0); window_wl_send();
+}
+
+fn pointer_event(op: int64, a: WindowWlArgs*) {
+  var w: Window* = g_s.ptr_win;
+  switch (op) {
+    case 0: {                                                        // enter
+      var serial: int64 = window_wl_arg_u32(a);
+      var surf: int64 = window_wl_arg_u32(a);
+      var fx: float64 = window_wl_arg_fixed(a);
+      var fy: float64 = window_wl_arg_fixed(a);
+      var nw: Window* = win_of_surface(surf);
+      g_s.ptr_serial = serial;
+      g_s.ptr_win = nw;
+      if (nw == 0) { return; }
+      var ev: WindowEvent; ev.kind = WINDOW_EV_MOUSE_ENTER; ev.win = nw; ev.x = fx; ev.y = fy;
+      window_push_event(&ev);
+      apply_cursor(nw);
+    }
+    case 1: {                                                        // leave
+      if (w != 0) { var ev2: WindowEvent; ev2.kind = WINDOW_EV_MOUSE_LEAVE; ev2.win = w; window_push_event(&ev2); }
+      g_s.ptr_win = (Window*)0;
+    }
+    case 2: {                                                        // motion
+      window_wl_arg_u32(a);
+      var mx: float64 = window_wl_arg_fixed(a);
+      var my: float64 = window_wl_arg_fixed(a);
+      if (w == 0) { return; }
+      var mv: WindowEvent; mv.kind = WINDOW_EV_MOUSE_MOVE; mv.win = w; mv.x = mx; mv.y = my;
+      window_push_event(&mv);
+    }
+    case 3: {                                                        // button
+      var serial2: int64 = window_wl_arg_u32(a);
+      window_wl_arg_u32(a);
+      var code: int64 = window_wl_arg_u32(a);
+      var state: int64 = window_wl_arg_u32(a);
+      g_s.serial = serial2;
+      if (w == 0) { return; }
+      var be: WindowEvent; be.win = w; be.x = w->mouse_x; be.y = w->mouse_y;
+      be.kind = WINDOW_EV_MOUSE_UP;
+      if (state == 1) { be.kind = WINDOW_EV_MOUSE_DOWN; }
+      switch (code) {
+        case 0x110: { be.button = WINDOW_BUTTON_LEFT; }
+        case 0x111: { be.button = WINDOW_BUTTON_RIGHT; }
+        case 0x112: { be.button = WINDOW_BUTTON_MIDDLE; }
+        case 0x113: { be.button = WINDOW_BUTTON_X1; }
+        case 0x114: { be.button = WINDOW_BUTTON_X2; }
+        default: { be.button = (int32)(code - 0x110 + 1); }
+      }
+      window_push_event(&be);
+    }
+    case 4: {                                                        // axis (smooth value)
+      window_wl_arg_u32(a);
+      var axis: int64 = window_wl_arg_u32(a);
+      var v: float64 = window_wl_arg_fixed(a);
+      if (!g_s.scroll_steps) {
+        if (axis == 0) { g_s.scroll_dy = g_s.scroll_dy - v / 10.0; } else { g_s.scroll_dx = g_s.scroll_dx + v / 10.0; }
+      }
+      g_s.scroll_any = true;
+      if (g_s.seat_v < 5) { flush_scroll(); }
+    }
+    case 5: { flush_scroll(); }                                      // frame
+    case 8: {                                                        // axis_discrete (v5-v7)
+      var axis2: int64 = window_wl_arg_u32(a);
+      var d: int64 = window_wl_arg_i32(a);
+      if (g_s.seat_v >= 8) { return; }
+      if (!g_s.scroll_steps) { g_s.scroll_dx = 0.0; g_s.scroll_dy = 0.0; }
+      g_s.scroll_steps = true;
+      if (axis2 == 0) { g_s.scroll_dy = g_s.scroll_dy - (float64)d; } else { g_s.scroll_dx = g_s.scroll_dx + (float64)d; }
+      g_s.scroll_any = true;
+    }
+    case 9: {                                                        // axis_value120 (v8)
+      var axis3: int64 = window_wl_arg_u32(a);
+      var d3: int64 = window_wl_arg_i32(a);
+      if (!g_s.scroll_steps) { g_s.scroll_dx = 0.0; g_s.scroll_dy = 0.0; }
+      g_s.scroll_steps = true;
+      if (axis3 == 0) { g_s.scroll_dy = g_s.scroll_dy - (float64)d3 / 120.0; } else { g_s.scroll_dx = g_s.scroll_dx + (float64)d3 / 120.0; }
+      g_s.scroll_any = true;
+    }
+    default: { }
+  }
+}
+
+fn flush_scroll() {
+  if (g_s.scroll_any && g_s.ptr_win != 0 && (g_s.scroll_dx != 0.0 || g_s.scroll_dy != 0.0)) {
+    var ev: WindowEvent;
+    ev.kind = WINDOW_EV_SCROLL; ev.win = g_s.ptr_win; ev.dx = g_s.scroll_dx; ev.dy = g_s.scroll_dy;
+    ev.x = g_s.ptr_win->mouse_x; ev.y = g_s.ptr_win->mouse_y;
+    window_push_event(&ev);
+  }
+  g_s.scroll_dx = 0.0; g_s.scroll_dy = 0.0; g_s.scroll_any = false; g_s.scroll_steps = false;
+}
+
+fn is_modifier_key(code: int64) -> bool {
+  var k: int32 = window_evdev_to_key(code);
+  return (k >= WINDOW_KEY_LEFT_CTRL && k <= WINDOW_KEY_RIGHT_SUPER) || k == WINDOW_KEY_CAPS_LOCK || k == WINDOW_KEY_NUM_LOCK || k == WINDOW_KEY_SCROLL_LOCK;
+}
+
+fn key_event(w: Window*, code: int64, down: bool, repeat: bool) {
+  var ev: WindowEvent;
+  ev.win = w;
+  ev.kind = WINDOW_EV_KEY_UP;
+  if (down) { ev.kind = WINDOW_EV_KEY_DOWN; }
+  ev.repeat = repeat;
+  ev.scancode = window_evdev_to_key(code);
+  var mods: int32 = 0;
+  var ks: int64 = 0;
+  var base: int64 = 0;
+  if (g_s.xkb != 0) {
+    mods = window_xkb_mods(g_s.xkb, g_s.mods);
+    ks = window_xkb_keysym(g_s.xkb, code + 8, g_s.mods, g_s.group);
+    base = window_xkb_base(g_s.xkb, code + 8, g_s.group);
+  }
+  ev.key = window_keysym_to_key(base);
+  if (ev.key == 0) { ev.key = ev.scancode; }
+  if (ev.scancode == 0) { ev.scancode = ev.key; }
+  ev.mods = mods;
+  window_push_event(&ev);
+  if (!down || !w->text_input) { return; }
+  var altgr: bool = (mods & WINDOW_MOD_ALTGR) != 0;
+  if ((mods & (WINDOW_MOD_CTRL | WINDOW_MOD_ALT)) != 0 && !altgr) { return; }
+  if (window_keysym_is_dead(ks)) { window_push_codepoint(w, (uint32)0, ks, mods); return; }
+  var cp: uint32 = window_keysym_to_ucs(ks);
+  if (cp != (uint32)0) { window_push_codepoint(w, cp, ks, mods); }
+}
+
+fn keyboard_event(op: int64, a: WindowWlArgs*) {
+  switch (op) {
+    case 0: {                                                        // keymap
+      var format: int64 = window_wl_arg_u32(a);
+      var size: int64 = window_wl_arg_u32(a);
+      var fd: int64 = window_wl_take_fd();
+      if (fd < 0) { return; }
+      if (format == 1 && size > 0 && size < 16777216) {
+        var p: int64 = syscall(9, 0, size, 1, 2, fd, 0);           // mmap private read-only
+        if (p > 0 || p < -4096) {
+          if (g_s.xkb == 0) { g_s.xkb = new WindowXkbMap; }
+          var n: int64 = size;
+          var text: uint8* = (uint8*)p;
+          while (n > 0 && text[n - 1] == (uint8)0) { n = n - 1; }
+          window_xkb_parse(text, n, g_s.xkb);
+          syscall(11, p, size);
+        }
+      }
+      syscall(3, fd);
+    }
+    case 1: {                                                        // enter
+      var serial: int64 = window_wl_arg_u32(a);
+      var surf: int64 = window_wl_arg_u32(a);
+      g_s.serial = serial;
+      var w: Window* = win_of_surface(surf);
+      g_s.kbd_win = w;
+      if (w != 0) { var ev: WindowEvent; ev.kind = WINDOW_EV_FOCUS_IN; ev.win = w; window_push_event(&ev); }
+    }
+    case 2: {                                                        // leave
+      var w2: Window* = g_s.kbd_win;
+      g_s.kbd_win = (Window*)0;
+      g_s.rep_key = 0;
+      if (w2 != 0) { var ev2: WindowEvent; ev2.kind = WINDOW_EV_FOCUS_OUT; ev2.win = w2; window_push_event(&ev2); }
+    }
+    case 3: {                                                        // key
+      var serial3: int64 = window_wl_arg_u32(a);
+      window_wl_arg_u32(a);
+      var code: int64 = window_wl_arg_u32(a);
+      var state: int64 = window_wl_arg_u32(a);
+      g_s.serial = serial3;
+      var w3: Window* = g_s.kbd_win;
+      if (w3 == 0 || code > 767) { return; }
+      var down: bool = state == 1;
+      key_event(w3, code, down, false);
+      if (down && !is_modifier_key(code) && g_s.rep_rate > 0) {
+        g_s.rep_key = code;
+        g_s.rep_next = window_now_us() + (int64)g_s.rep_delay * 1000;
+      } else if (!down && code == g_s.rep_key) {
+        g_s.rep_key = 0;
+      }
+    }
+    case 4: {                                                        // modifiers
+      window_wl_arg_u32(a);
+      var dep: int64 = window_wl_arg_u32(a);
+      var lat: int64 = window_wl_arg_u32(a);
+      var loc: int64 = window_wl_arg_u32(a);
+      var grp: int64 = window_wl_arg_u32(a);
+      g_s.mods = (int32)((dep | lat | loc) & 0xFFFF);
+      g_s.group = (int32)(grp & 3);
+    }
+    case 5: {                                                        // repeat_info
+      var rate: int64 = window_wl_arg_i32(a);
+      var delay: int64 = window_wl_arg_i32(a);
+      if (rate < 0) { rate = 0; }
+      if (rate > 1000) { rate = 1000; }
+      if (delay < 0) { delay = 0; }
+      if (delay > 10000) { delay = 10000; }
+      g_s.rep_rate = (int32)rate;
+      g_s.rep_delay = (int32)delay;
+    }
+    default: { }
+  }
+}
+
+fn do_repeat() {
+  if (g_s.rep_key == 0 || g_s.kbd_win == 0 || g_s.rep_rate <= 0) { return; }
+  var now: int64 = window_now_us();
+  var step: int64 = 1000000 / (int64)g_s.rep_rate;
+  var n: int32 = 0;
+  while (now >= g_s.rep_next && n < 8) {
+    key_event(g_s.kbd_win, g_s.rep_key, true, true);
+    g_s.rep_next = g_s.rep_next + step;
+    n = n + 1;
+  }
+  if (now >= g_s.rep_next) { g_s.rep_next = now + step; }
+}
+
+// ---------- outputs ----------
+fn output_event(id: int64, op: int64, a: WindowWlArgs*) {
+  var i: int32 = output_slot(id);
+  if (i < 0) { return; }
+  var o: WlOutput* = &g_s.outputs[i];
+  switch (op) {
+    case 0: {                                                        // geometry
+      o->x = (int32)window_wl_arg_i32(a); o->y = (int32)window_wl_arg_i32(a);
+      o->mm_w = (int32)window_wl_arg_i32(a); o->mm_h = (int32)window_wl_arg_i32(a);
+      window_wl_arg_i32(a);
+      var p: uint8* = (uint8*)0; var n: int64 = 0;
+      window_wl_arg_str(a, &p, &n);
+      window_wl_arg_str(a, &p, &n);
+      o->transform = (int32)window_wl_arg_i32(a);
+    }
+    case 1: {                                                        // mode
+      var flags: int64 = window_wl_arg_u32(a);
+      var mw: int64 = window_wl_arg_i32(a);
+      var mh: int64 = window_wl_arg_i32(a);
+      var rf: int64 = window_wl_arg_i32(a);
+      if ((flags & 1) != 0 && mw > 0 && mh > 0 && mw < 65536 && mh < 65536) {
+        o->w = (int32)mw; o->h = (int32)mh;
+        if (rf > 0 && rf < 2000000) { o->refresh = (int32)rf; }
+      }
+    }
+    case 2: {                                                        // done
+      publish_monitors();
+      var ev: WindowEvent; ev.kind = WINDOW_EV_MONITORS; window_push_event(&ev);
+      // A scale change of an output a window is on changes that window's scale.
+      var w: Window* = g_window.windows;
+      while (w != 0) {
+        if (w->plat != 0 && ww(w)->configured && win_scale(w) != w->scale) { update_size(w, w->w, w->h); w->redraw = true; }
+        w = w->next;
+      }
+    }
+    case 3: {                                                        // scale
+      var s: int64 = window_wl_arg_i32(a);
+      if (s >= 1 && s <= 16) { o->scale = (int32)s; }
+    }
+    case 4: {                                                        // name
+      var p2: uint8* = (uint8*)0; var n2: int64 = 0;
+      window_wl_arg_str(a, &p2, &n2);
+      if (n2 > 63) { n2 = 63; }
+      for k: int64 in 0..n2 { o->name[k] = p2[k]; }
+      o->name_len = (int32)n2;
+    }
+    default: { }
+  }
+}
+
+// ---------- xdg-shell ----------
+fn xdg_surface_configure(w: Window*, serial: int64) {
+  var x: WindowWlWin* = ww(w);
+  req1(x->xdg_surface, 4, serial);                                   // ack_configure
+  var lw: int32 = x->pend_w;
+  var lh: int32 = x->pend_h;
+  if (lw <= 0) { lw = w->w; }
+  if (lh <= 0) { lh = w->h; }
+  if (x->max_w > 0 && lw > x->max_w) { lw = x->max_w; }
+  if (x->max_h > 0 && lh > x->max_h) { lh = x->max_h; }
+  if (lw < 1) { lw = 1; }
+  if (lh < 1) { lh = 1; }
+  var first: bool = !x->configured;
+  x->configured = true;
+  var ev: WindowEvent;
+  ev.win = w;
+  if (x->pend_max && !w->maximized) { ev.kind = WINDOW_EV_MAXIMIZE; window_push_event(&ev); }
+  if (!x->pend_max && w->maximized) { ev.kind = WINDOW_EV_RESTORE; window_push_event(&ev); }
+  if (x->pend_full) { w->fullscreen = WINDOW_FULLSCREEN; } else { w->fullscreen = WINDOW_WINDOWED; }
+  var size_changed: bool = lw != w->w || lh != w->h || win_scale(w) != w->scale;
+  if (first || size_changed) { update_size(w, lw, lh); }
+  if (first) { var se: WindowEvent; se.kind = WINDOW_EV_SHOWN; se.win = w; window_push_event(&se); }
+  if (first || size_changed || !x->has_content) {
+    // Map (or refit) at once with a black frame; the app's next blit replaces it.
+    var s: float32 = win_scale(w);
+    present(w, (uint8*)0, px(lw, s), px(lh, s), px(lw, s) * 4);
+    x->has_content = false;
+  }
+  w->redraw = true;
+}
+
+fn toplevel_configure(w: Window*, a: WindowWlArgs*) {
+  var x: WindowWlWin* = ww(w);
+  var cw: int64 = window_wl_arg_i32(a);
+  var ch: int64 = window_wl_arg_i32(a);
+  var sp: uint8* = (uint8*)0; var sn: int64 = 0;
+  window_wl_arg_array(a, &sp, &sn);
+  if (cw < 0 || cw > 32767) { cw = 0; }
+  if (ch < 0 || ch > 32767) { ch = 0; }
+  x->pend_w = (int32)cw; x->pend_h = (int32)ch;
+  x->pend_max = false; x->pend_full = false; x->pend_act = false;
+  var n: int64 = sn / 4;
+  for i: int64 in 0..n {
+    var st: int64 = window_rd32(sp, i * 4);
+    if (st == 1) { x->pend_max = true; }
+    if (st == 2) { x->pend_full = true; }
+    if (st == 4) { x->pend_act = true; }
+  }
+}
+
+// ---------- clipboard and drag and drop ----------
+fn offer_slot(id: int64) -> WlOffer* {
+  for i in 0..8 { if (g_s.offers[i].id == id) { return &g_s.offers[i]; } }
+  return (WlOffer*)0;
+}
+
+fn new_offer(id: int64) {
+  var slot: int64 = -1;
+  for i: int64 in 0..8 { if (slot < 0 && g_s.offers[i].id == 0) { slot = i; } }
+  if (slot < 0) { slot = 0; destroy_offer(g_s.offers[0].id); }
+  var z: WlOffer;
+  g_s.offers[slot] = z;
+  g_s.offers[slot].id = id;
+  window_wl_server_obj(id, WL_DATA_OFFER, (rawptr)0);
+}
+
+fn destroy_offer(id: int64) {
+  if (id == 0) { return; }
+  var o: WlOffer* = offer_slot(id);
+  if (o != 0) { o->id = 0; }
+  if (window_wl_kind(id) == WL_DATA_OFFER) { req(id, 2); }
+  window_wl_forget(id);
+  if (g_s.sel_offer == id) { g_s.sel_offer = 0; }
+  if (g_s.dnd_offer == id) { g_s.dnd_offer = 0; }
+}
+
+fn offer_mime(o: WlOffer*, uri: bool) -> string {
+  if (uri && o->uri) { return "text/uri-list"; }
+  if (o->utf8) { return "text/plain;charset=utf-8"; }
+  if (o->utf8_string) { return "UTF8_STRING"; }
+  if (o->plain) { return "text/plain"; }
+  return "";
+}
+
+// Asks the offer for `mime` through a pipe and reads it all (up to 1 s, 64 MB).
+fn receive(offer: int64, mime: string, out: WindowBytes*) -> bool {
+  var fds: int32[2];
+  if (syscall(293, &fds[0], 0x80000) != 0) { return false; }      // pipe2(O_CLOEXEC)
+  window_wl_begin(offer, 1); window_wl_string(mime); window_wl_fd((int64)fds[1]); window_wl_send();
+  syscall(3, (int64)fds[1]);
+  var cap: int64 = 4096;
+  var len: int64 = 0;
+  var buf: uint8* = (uint8*)malloc(cap + 1);
+  var deadline: int64 = window_now_us() + 1000000;
+  var ok: bool = true;
+  while (true) {
+    var left: int64 = (deadline - window_now_us()) / 1000;
+    if (left <= 0) { ok = false; break; }
+    var pfd: uint8[8];
+    window_wr32(&pfd[0], 0, (int64)fds[0]); window_wr16(&pfd[0], 4, 1); window_wr16(&pfd[0], 6, 0);
+    if (syscall(7, &pfd[0], 1, left) <= 0) { continue; }
+    if (len == cap) {
+      if (cap >= 67108864) { ok = false; break; }
+      var nb: uint8* = (uint8*)malloc(cap * 2 + 1);
+      for i: int64 in 0..len { nb[i] = buf[i]; }
+      free(buf);
+      buf = nb;
+      cap = cap * 2;
+    }
+    var r: int64 = syscall(0, (int64)fds[0], &buf[len], cap - len);
+    if (r == -4 || r == -11) { continue; }
+    if (r <= 0) { break; }
+    len = len + r;
+  }
+  syscall(3, (int64)fds[0]);
+  buf[len] = (uint8)0;
+  out->data = buf;
+  out->len = len;
+  return ok;
+}
+
+fn data_device_event(op: int64, a: WindowWlArgs*) {
+  switch (op) {
+    case 0: { new_offer(window_wl_arg_u32(a)); }                     // data_offer
+    case 1: {                                                        // enter
+      var serial: int64 = window_wl_arg_u32(a);
+      var surf: int64 = window_wl_arg_u32(a);
+      var fx: float64 = window_wl_arg_fixed(a);
+      var fy: float64 = window_wl_arg_fixed(a);
+      var offer: int64 = window_wl_arg_u32(a);
+      var w: Window* = win_of_surface(surf);
+      if (g_s.dnd_offer != 0 && g_s.dnd_offer != offer) { destroy_offer(g_s.dnd_offer); }
+      g_s.dnd_offer = offer;
+      g_s.dnd_win = w;
+      g_s.dnd_x = fx; g_s.dnd_y = fy;
+      var o: WlOffer* = offer_slot(offer);
+      if (o != 0) {
+        var mime: string = offer_mime(o, true);
+        window_wl_begin(offer, 0); window_wl_u32(serial);
+        if (mime.length > 0) { window_wl_string(mime); } else { window_wl_null(); }
+        window_wl_send();
+        if (g_s.ddm_v >= 3) { req2(offer, 4, 1, 1); }               // set_actions(copy, copy)
+      }
+      if (w != 0) { var ev: WindowEvent; ev.kind = WINDOW_EV_DROP_ENTER; ev.win = w; ev.x = fx; ev.y = fy; window_push_event(&ev); }
+    }
+    case 2: {                                                        // leave
+      if (g_s.dnd_win != 0) { var lv: WindowEvent; lv.kind = WINDOW_EV_DROP_LEAVE; lv.win = g_s.dnd_win; window_push_event(&lv); }
+      destroy_offer(g_s.dnd_offer);
+      g_s.dnd_win = (Window*)0;
+    }
+    case 3: {                                                        // motion
+      window_wl_arg_u32(a);
+      g_s.dnd_x = window_wl_arg_fixed(a);
+      g_s.dnd_y = window_wl_arg_fixed(a);
+      if (g_s.dnd_win != 0) { var mv: WindowEvent; mv.kind = WINDOW_EV_DROP_MOVE; mv.win = g_s.dnd_win; mv.x = g_s.dnd_x; mv.y = g_s.dnd_y; window_push_event(&mv); }
+    }
+    case 4: {                                                        // drop
+      var o2: WlOffer* = offer_slot(g_s.dnd_offer);
+      var w2: Window* = g_s.dnd_win;
+      if (o2 == 0 || w2 == 0) { return; }
+      var mime2: string = offer_mime(o2, true);
+      var ev2: WindowEvent;
+      ev2.win = w2; ev2.x = g_s.dnd_x; ev2.y = g_s.dnd_y;
+      var b: WindowBytes;
+      if (mime2.length > 0 && receive(g_s.dnd_offer, mime2, &b)) {
+        if (o2->uri) {
+          var paths: uint8* = (uint8*)malloc(b.len + 1);
+          ev2.data_len = window_uri_list_to_paths(b.data, b.len, paths);
+          ev2.data = paths;
+          free(b.data);
+          ev2.kind = WINDOW_EV_DROP_FILES;
+        } else {
+          ev2.data = b.data;
+          ev2.data_len = window_utf8_valid_prefix(b.data, b.len);
+          ev2.kind = WINDOW_EV_DROP_TEXT;
+        }
+        if (g_window.drop_data != 0) { free(g_window.drop_data); }
+        g_window.drop_data = ev2.data;
+        window_push_event(&ev2);
+        if (g_s.ddm_v >= 3) { req(g_s.dnd_offer, 3); }              // finish
+      } else {
+        ev2.kind = WINDOW_EV_DROP_LEAVE;
+        window_push_event(&ev2);
+      }
+      destroy_offer(g_s.dnd_offer);
+      g_s.dnd_win = (Window*)0;
+    }
+    case 5: {                                                        // selection
+      var so: int64 = window_wl_arg_u32(a);
+      if (g_s.sel_offer != 0 && g_s.sel_offer != so) { destroy_offer(g_s.sel_offer); }
+      g_s.sel_offer = so;
+      if (!g_s.own_clip) { var ce: WindowEvent; ce.kind = WINDOW_EV_CLIPBOARD; window_push_event(&ce); }
+    }
+    default: { }
+  }
+}
+
+fn offer_event(id: int64, op: int64, a: WindowWlArgs*) {
+  if (op != 0) { return; }
+  var o: WlOffer* = offer_slot(id);
+  if (o == 0) { return; }
+  var p: uint8* = (uint8*)0; var n: int64 = 0;
+  window_wl_arg_str(a, &p, &n);
+  if (str_is(p, n, "text/uri-list")) { o->uri = true; }
+  if (str_is(p, n, "text/plain;charset=utf-8")) { o->utf8 = true; }
+  if (str_is(p, n, "UTF8_STRING")) { o->utf8_string = true; }
+  if (str_is(p, n, "text/plain") || str_is(p, n, "TEXT") || str_is(p, n, "STRING")) { o->plain = true; }
+}
+
+fn source_event(id: int64, op: int64, a: WindowWlArgs*) {
+  if (op == 1) {                                                     // send(mime, fd)
+    var p: uint8* = (uint8*)0; var n: int64 = 0;
+    window_wl_arg_str(a, &p, &n);
+    var fd: int64 = window_wl_take_fd();
+    if (fd < 0) { return; }
+    if (id == g_s.clip_source) {
+      var done: int64 = 0;
+      var guard: int32 = 0;
+      while (done < g_s.clip_len && guard < 10000) {
+        guard = guard + 1;
+        var r: int64 = syscall(1, fd, &g_s.clip[done], g_s.clip_len - done);
+        if (r == -4 || r == -11) { continue; }
+        if (r <= 0) { break; }
+        done = done + r;
+      }
+    }
+    syscall(3, fd);
+    return;
+  }
+  if (op == 2) {                                                     // cancelled
+    if (id == g_s.clip_source) {
+      g_s.clip_source = 0;
+      g_s.own_clip = false;
+      var ce: WindowEvent; ce.kind = WINDOW_EV_CLIPBOARD; window_push_event(&ce);
+    }
+    destroy(id, 1);
+  }
+}
+
+// ---------- text input (IME) ----------
+fn ti_update(w: Window*, enable: bool) {
+  if (g_s.text_input == 0) { return; }
+  if (enable) {
+    req(g_s.text_input, 1);                                          // enable
+    req2(g_s.text_input, 5, 0, 0);                                   // content type: normal
+  } else {
+    req(g_s.text_input, 2);                                          // disable
+  }
+  req(g_s.text_input, 7);                                            // commit
+  g_s.ti_serial = g_s.ti_serial + 1;
+}
+
+fn copy_text(p: uint8*, n: int64, out: uint8**, out_len: int64*) {
+  if (*out != 0) { free(*out); }
+  *out = (uint8*)malloc(n + 1);
+  for i: int64 in 0..n { (*out)[i] = p[i]; }
+  (*out)[n] = (uint8)0;
+  *out_len = n;
+}
+
+fn text_input_event(op: int64, a: WindowWlArgs*) {
+  switch (op) {
+    case 0: {                                                        // enter
+      var w: Window* = win_of_surface(window_wl_arg_u32(a));
+      g_s.ti_win = w;
+      if (w != 0 && w->text_input) { ti_update(w, true); }
+    }
+    case 1: {                                                        // leave
+      if (g_s.ti_win != 0) { ti_update(g_s.ti_win, false); }
+      g_s.ti_win = (Window*)0;
+    }
+    case 2: {                                                        // preedit_string
+      var p: uint8* = (uint8*)0; var n: int64 = 0;
+      window_wl_arg_str(a, &p, &n);
+      var cb: int64 = window_wl_arg_i32(a);
+      window_wl_arg_i32(a);
+      copy_text(p, n, &g_s.ti_preedit, &g_s.ti_preedit_len);
+      g_s.ti_cursor = (int32)cb;
+      g_s.ti_have_preedit = true;
+    }
+    case 3: {                                                        // commit_string
+      var p2: uint8* = (uint8*)0; var n2: int64 = 0;
+      window_wl_arg_str(a, &p2, &n2);
+      copy_text(p2, n2, &g_s.ti_commit, &g_s.ti_commit_len);
+    }
+    case 5: {                                                        // done
+      var w2: Window* = g_s.ti_win;
+      if (w2 == 0) { return; }
+      if (g_s.ti_commit != 0 && g_s.ti_commit_len > 0) {
+        // Split long commits into whole-character pieces that fit an event.
+        var at: int64 = 0;
+        while (at < g_s.ti_commit_len) {
+          var take: int64 = g_s.ti_commit_len - at;
+          if (take > 60) { take = window_utf8_valid_prefix(&g_s.ti_commit[at], 60); }
+          if (take <= 0) { break; }
+          var ev: WindowEvent; ev.kind = WINDOW_EV_TEXT; ev.win = w2;
+          window_event_set_text(&ev, &g_s.ti_commit[at], take);
+          window_push_event(&ev);
+          at = at + take;
+        }
+        g_s.ti_commit_len = 0;
+      }
+      var pe: WindowEvent; pe.kind = WINDOW_EV_PREEDIT; pe.win = w2;
+      if (g_s.ti_preedit != 0 && g_s.ti_have_preedit) { window_event_set_text(&pe, g_s.ti_preedit, g_s.ti_preedit_len); }
+      pe.cursor = g_s.ti_cursor;
+      window_push_event(&pe);
+      g_s.ti_have_preedit = false;
+      g_s.ti_preedit_len = 0;
+    }
+    default: { }
+  }
+}
+
+// ---------- dispatch ----------
+fn dispatch_one(obj: int64, op: int64, body: uint8*, size: int64) {
+  var a: WindowWlArgs = window_wl_args(body, size);
+  var kind: int32 = window_wl_kind(obj);
+  switch (kind) {
+    case WL_DISPLAY: {
+      if (op == 0) {
+        window_wl_arg_u32(&a);
+        g_wl.error_code = window_wl_arg_u32(&a);
+        window_set_error("the Wayland compositor reported a protocol error");
+        g_wl.dead = true;
+      } else if (op == 1) {
+        window_wl_release_id(window_wl_arg_u32(&a));
+      }
+    }
+    case WL_REGISTRY: {
+      if (op == 0) { registry_global(&a); }
+      if (op == 1) { registry_remove(&a); }
+    }
+    case WL_CALLBACK: {
+      if (op == 0) { g_s.sync_done = true; window_wl_forget(obj); }
+    }
+    case WL_XDG_WM_BASE: { if (op == 0) { req1(g_s.wm_base, 3, window_wl_arg_u32(&a)); } }
+    case WL_XDG_SURFACE: {
+      var w: Window* = (Window*)window_wl_data(obj);
+      if (op == 0 && w != 0) { xdg_surface_configure(w, window_wl_arg_u32(&a)); }
+    }
+    case WL_XDG_TOPLEVEL: {
+      var w2: Window* = (Window*)window_wl_data(obj);
+      if (w2 == 0) { return; }
+      if (op == 0) { toplevel_configure(w2, &a); }
+      if (op == 1) { var ev: WindowEvent; ev.kind = WINDOW_EV_CLOSE; ev.win = w2; window_push_event(&ev); }
+    }
+    case WL_SURFACE: {
+      var w3: Window* = win_of_surface(obj);
+      if (w3 == 0) { return; }
+      var x: WindowWlWin* = ww(w3);
+      if (op == 0 || op == 1) {
+        var slot: int32 = output_slot(window_wl_arg_u32(&a));
+        if (slot >= 0) {
+          if (op == 0) { x->outputs = x->outputs | ((int64)1 << slot); } else { x->outputs = x->outputs & ~((int64)1 << slot); }
+        }
+      }
+      if (op == 2) {
+        var ps: int64 = window_wl_arg_i32(&a);
+        if (ps >= 1 && ps <= 16) { x->pref_scale = (int32)ps; }
+      }
+      if (x->configured && win_scale(w3) != w3->scale) { update_size(w3, w3->w, w3->h); w3->redraw = true; }
+    }
+    case WL_FRACTIONAL: {
+      var w4: Window* = (Window*)window_wl_data(obj);
+      if (op == 0 && w4 != 0) {
+        var s120: int64 = window_wl_arg_u32(&a);
+        if (s120 >= 60 && s120 <= 1920) { ww(w4)->scale120 = (int32)s120; }
+        if (ww(w4)->configured && win_scale(w4) != w4->scale) { update_size(w4, w4->w, w4->h); w4->redraw = true; }
+      }
+    }
+    case WL_BUFFER: { if (op == 0) { buffer_release(obj); } }
+    case WL_SEAT: { if (op == 0) { seat_caps(window_wl_arg_u32(&a)); } }
+    case WL_POINTER: { pointer_event(op, &a); }
+    case WL_KEYBOARD: { keyboard_event(op, &a); }
+    case WL_OUTPUT: { output_event(obj, op, &a); }
+    case WL_DATA_DEVICE: { data_device_event(op, &a); }
+    case WL_DATA_OFFER: { offer_event(obj, op, &a); }
+    case WL_DATA_SOURCE: { source_event(obj, op, &a); }
+    case WL_RELATIVE_POINTER: {
+      if (op == 0) {
+        window_wl_arg_u32(&a); window_wl_arg_u32(&a);
+        window_wl_arg_fixed(&a); window_wl_arg_fixed(&a);
+        var ux: float64 = window_wl_arg_fixed(&a);
+        var uy: float64 = window_wl_arg_fixed(&a);
+        var w5: Window* = g_s.ptr_win;
+        if (w5 != 0 && w5->cursor_mode == WINDOW_CURSOR_LOCKED) {
+          var rv: WindowEvent; rv.kind = WINDOW_EV_RAW_MOTION; rv.win = w5; rv.dx = ux; rv.dy = uy;
+          window_push_event(&rv);
+        }
+      }
+    }
+    case WL_TEXT_INPUT: { text_input_event(op, &a); }
+    case WL_ACTIVATION_TOKEN: {
+      if (op == 0) {
+        var p: uint8* = (uint8*)0; var n: int64 = 0;
+        window_wl_arg_str(&a, &p, &n);
+        var w6: Window* = (Window*)window_wl_data(obj);
+        if (w6 != 0 && w6->plat != 0 && g_s.activation != 0 && n > 0) {
+          window_wl_begin(g_s.activation, 2); window_wl_str(p, n); window_wl_u32(ww(w6)->surface); window_wl_send();
+        }
+        destroy(obj, 4);
+      }
+    }
+    default: { }
+  }
+}
+
+/// Handles every whole message in the read buffer.
+export fn window_wl_dispatch() {
+  var obj: int64 = 0; var op: int64 = 0; var body: uint8* = (uint8*)0; var size: int64 = 0;
+  var guard: int32 = 0;
+  while (!g_wl.dead && guard < 100000 && window_wl_next_message(&obj, &op, &body, &size)) {
+    guard = guard + 1;
+    dispatch_one(obj, op, body, size);
+  }
+}
+
+fn roundtrip() -> bool {
+  var cb: int64 = window_wl_new_id(WL_CALLBACK, (rawptr)0);
+  g_s.sync_done = false;
+  req1(1, 0, cb);
+  var deadline: int64 = window_now_us() + 2000000;
+  while (!g_s.sync_done && !g_wl.dead) {
+    var left: int64 = (deadline - window_now_us()) / 1000;
+    if (left <= 0) { return false; }
+    window_wl_read(left);
+    window_wl_dispatch();
+  }
+  return g_s.sync_done;
+}
+
+// ---------- init / shutdown ----------
+export fn window_wl_init(path: string) -> bool {
+  var z: WlState;
+  g_s = z;
+  g_s.rep_rate = 25;
+  g_s.rep_delay = 600;
+  if (!window_wl_connect(path)) { return false; }
+  g_s.registry = window_wl_new_id(WL_REGISTRY, (rawptr)0);
+  req1(1, 1, g_s.registry);
+  if (!roundtrip()) { window_set_error("the Wayland compositor did not answer"); window_wl_disconnect(); return false; }
+  if (g_s.compositor == 0 || g_s.shm == 0 || g_s.wm_base == 0) {
+    window_set_error("the Wayland compositor lacks wl_compositor, wl_shm or xdg_wm_base");
+    window_wl_disconnect();
+    return false;
+  }
+  roundtrip();                                                       // seat capabilities, outputs, keymap
+  roundtrip();
+  publish_monitors();
+  return !g_wl.dead;
+}
+
+export fn window_wl_shutdown() {
+  if (!g_wl.dead) { roundtrip(); }
+  if (g_s.xkb != 0) { free(g_s.xkb); g_s.xkb = (WindowXkbMap*)0; }
+  if (g_s.clip != 0) { free(g_s.clip); g_s.clip = (uint8*)0; }
+  if (g_s.ti_preedit != 0) { free(g_s.ti_preedit); g_s.ti_preedit = (uint8*)0; }
+  if (g_s.ti_commit != 0) { free(g_s.ti_commit); g_s.ti_commit = (uint8*)0; }
+  window_wl_disconnect();
+}
+
+export fn window_wl_refresh_monitors() { publish_monitors(); }
+
+// ---------- windows ----------
+export fn window_wl_create(w: Window*, cfg: WindowConfig*) -> bool {
+  if (g_wl.dead) { window_set_error("the Wayland connection is gone"); return false; }
+  var x: WindowWlWin* = new WindowWlWin;
+  w->plat = (rawptr)x;
+  w->text_input = true;
+  w->scale = 1.0;
+  w->w = cfg->w; w->h = cfg->h;
+  w->fb_w = cfg->w; w->fb_h = cfg->h;
+  x->transparent = cfg->transparent;
+  x->min_w = cfg->min_w; x->min_h = cfg->min_h; x->max_w = cfg->max_w; x->max_h = cfg->max_h;
+  if (!cfg->resizable) { x->min_w = cfg->w; x->min_h = cfg->h; x->max_w = cfg->w; x->max_h = cfg->h; }
+  x->surface = window_wl_new_id(WL_SURFACE, (rawptr)w);
+  req1(g_s.compositor, 0, x->surface);
+  if (g_s.fracman != 0 && g_s.viewporter != 0) {
+    x->fractional = window_wl_new_id(WL_FRACTIONAL, (rawptr)w);
+    req2(g_s.fracman, 1, x->fractional, x->surface);
+    x->viewport = window_wl_new_id(WL_VIEWPORT, (rawptr)w);
+    req2(g_s.viewporter, 1, x->viewport, x->surface);
+  }
+  x->xdg_surface = window_wl_new_id(WL_XDG_SURFACE, (rawptr)w);
+  req2(g_s.wm_base, 2, x->xdg_surface, x->surface);
+  x->toplevel = window_wl_new_id(WL_XDG_TOPLEVEL, (rawptr)w);
+  req1(x->xdg_surface, 1, x->toplevel);
+  window_wl_begin(x->toplevel, 2); window_wl_string(cfg->title); window_wl_send();
+  window_wl_begin(x->toplevel, 3); window_wl_string(cfg->app_id); window_wl_send();
+  send_limits(w);
+  if (g_s.deco != 0) {
+    x->decoration = window_wl_new_id(WL_DECORATION, (rawptr)w);
+    req2(g_s.deco, 1, x->decoration, x->toplevel);
+    var mode: int64 = 2;
+    if (!cfg->decorated) { mode = 1; }
+    req1(x->decoration, 1, mode);
+  }
+  if (cfg->maximized) { req(x->toplevel, 9); }
+  if (cfg->fullscreen != WINDOW_WINDOWED) { set_fs(w, true, cfg->monitor); }
+  if (cfg->visible) {
+    req(x->surface, 6);                                               // initial commit, no buffer
+    var deadline: int64 = window_now_us() + 2000000;
+    while (!x->configured && !g_wl.dead && window_now_us() < deadline) {
+      window_wl_read(50);
+      window_wl_dispatch();
+    }
+    if (!x->configured) { window_set_error("the Wayland compositor did not configure the window"); }
+  }
+  return !g_wl.dead;
+}
+
+fn send_limits(w: Window*) {
+  var x: WindowWlWin* = ww(w);
+  window_wl_begin(x->toplevel, 7); window_wl_u32((int64)x->max_w); window_wl_u32((int64)x->max_h); window_wl_send();
+  window_wl_begin(x->toplevel, 8); window_wl_u32((int64)x->min_w); window_wl_u32((int64)x->min_h); window_wl_send();
+}
+
+fn set_fs(w: Window*, on: bool, monitor: int32) {
+  var x: WindowWlWin* = ww(w);
+  if (!on) { req(x->toplevel, 12); return; }
+  window_wl_begin(x->toplevel, 11);
+  if (monitor >= 0 && monitor < g_s.noutputs) { window_wl_u32(g_s.outputs[monitor].id); } else { window_wl_null(); }
+  window_wl_send();
+}
+
+export fn window_wl_destroy(w: Window*) {
+  var x: WindowWlWin* = ww(w);
+  if (x == 0) { return; }
+  if (g_s.ptr_win == w) { g_s.ptr_win = (Window*)0; }
+  if (g_s.kbd_win == w) { g_s.kbd_win = (Window*)0; g_s.rep_key = 0; }
+  if (g_s.ti_win == w) { g_s.ti_win = (Window*)0; }
+  if (g_s.dnd_win == w) { g_s.dnd_win = (Window*)0; }
+  if (!g_wl.dead) {
+    destroy(x->locked, 0);
+    destroy(x->confined, 0);
+    destroy(x->decoration, 0);
+    destroy(x->toplevel, 0);
+    destroy(x->xdg_surface, 0);
+    destroy(x->viewport, 0);
+    destroy(x->fractional, 0);
+    destroy(x->cursor_surface, 0);
+    destroy(x->surface, 0);
+    roundtrip();
+  }
+  free(x);
+  w->plat = (rawptr)0;
+}
+
+export fn window_wl_pump(timeout_ms: int32, wake_fd: int64) {
+  if (g_wl.dead) { return; }
+  window_wl_read(0);
+  window_wl_dispatch();
+  do_repeat();
+  if (timeout_ms != 0 && g_window.q_tail == g_window.q_head) {
+    var t: int64 = (int64)timeout_ms;
+    if (g_s.rep_key != 0 && g_s.kbd_win != 0) {
+      var until: int64 = (g_s.rep_next - window_now_us() + 999) / 1000;
+      if (until < 0) { until = 0; }
+      if (t < 0 || until < t) { t = until; }
+    }
+    var pfd: uint8[16];
+    window_wr32(&pfd[0], 0, g_wl.fd); window_wr16(&pfd[0], 4, 1); window_wr16(&pfd[0], 6, 0);
+    var n: int64 = 1;
+    if (wake_fd >= 0) { window_wr32(&pfd[0], 8, wake_fd); window_wr16(&pfd[0], 12, 1); window_wr16(&pfd[0], 14, 0); n = 2; }
+    syscall(7, &pfd[0], n, t);
+    window_wl_read(0);
+    window_wl_dispatch();
+    do_repeat();
+  }
+  if (g_wl.dead) {
+    var q: WindowEvent; q.kind = WINDOW_EV_QUIT; window_push_event(&q);
+    var w: Window* = g_window.windows;
+    while (w != 0) { var c: WindowEvent; c.kind = WINDOW_EV_CLOSE; c.win = w; window_push_event(&c); w = w->next; }
+  }
+}
+
+export fn window_wl_set_title(w: Window*, s: string) {
+  window_wl_begin(ww(w)->toplevel, 2); window_wl_string(s); window_wl_send();
+}
+
+export fn window_wl_set_size(w: Window*, width: int32, height: int32) {
+  // Wayland clients pick their own size: resize the content and tell the compositor.
+  var x: WindowWlWin* = ww(w);
+  if (x->min_w == x->max_w && x->min_w > 0) { x->min_w = width; x->max_w = width; x->min_h = height; x->max_h = height; send_limits(w); }
+  update_size(w, width, height);
+  if (x->mapped) {
+    var s: float32 = win_scale(w);
+    present(w, (uint8*)0, px(width, s), px(height, s), px(width, s) * 4);
+    x->has_content = false;
+  }
+  w->redraw = true;
+}
+
+export fn window_wl_set_size_limits(w: Window*, a: int32, b: int32, c: int32, d: int32) {
+  var x: WindowWlWin* = ww(w);
+  x->min_w = a; x->min_h = b; x->max_w = c; x->max_h = d;
+  send_limits(w);
+  req(x->surface, 6);
+}
+
+export fn window_wl_set_visible(w: Window*, on: bool) {
+  var x: WindowWlWin* = ww(w);
+  if (on == x->mapped) { return; }
+  if (!on) {
+    window_wl_begin(x->surface, 1); window_wl_null(); window_wl_u32(0); window_wl_u32(0); window_wl_send();
+    req(x->surface, 6);
+    x->mapped = false;
+    x->configured = false;
+    var ev: WindowEvent; ev.kind = WINDOW_EV_HIDDEN; ev.win = w; window_push_event(&ev);
+    return;
+  }
+  req(x->surface, 6);
+  var deadline: int64 = window_now_us() + 2000000;
+  while (!x->configured && !g_wl.dead && window_now_us() < deadline) { window_wl_read(50); window_wl_dispatch(); }
+}
+
+export fn window_wl_minimize(w: Window*) { req(ww(w)->toplevel, 13); }
+export fn window_wl_maximize(w: Window*) { req(ww(w)->toplevel, 9); }
+export fn window_wl_restore(w: Window*) { if (w->maximized) { req(ww(w)->toplevel, 10); } }
+
+fn activate(w: Window*, with_serial: bool) {
+  if (g_s.activation == 0) { return; }
+  var tok: int64 = window_wl_new_id(WL_ACTIVATION_TOKEN, (rawptr)w);
+  req1(g_s.activation, 1, tok);
+  if (with_serial && g_s.serial != 0 && g_s.seat != 0) { req2(tok, 0, g_s.serial, g_s.seat); }
+  req1(tok, 2, ww(w)->surface);
+  req(tok, 3);
+}
+
+export fn window_wl_focus(w: Window*) { activate(w, true); }
+export fn window_wl_attention(w: Window*) { activate(w, false); }
+
+export fn window_wl_set_fullscreen(w: Window*, mode: int32, monitor: int32) {
+  set_fs(w, mode != WINDOW_WINDOWED, monitor);
+  req(ww(w)->surface, 6);
+}
+
+export fn window_wl_blit(w: Window*, rgba: uint8*, iw: int32, ih: int32, stride: int32) -> bool {
+  var x: WindowWlWin* = ww(w);
+  if (!x->configured) { window_set_error("the window is not shown yet"); return false; }
+  return present(w, rgba, iw, ih, stride);
+}
+
+export fn window_wl_native(w: Window*, out: WindowNative*) -> bool {
+  out->wl_surface_id = ww(w)->surface;
+  return true;
+}
+
+export fn window_wl_text_input(w: Window*, on: bool) {
+  if (g_s.ti_win == w) { ti_update(w, on); }
+}
+
+export fn window_wl_text_rect(w: Window*, x: int32, y: int32, width: int32, height: int32) {
+  if (g_s.text_input == 0 || g_s.ti_win != w || !w->text_input) { return; }
+  window_wl_begin(g_s.text_input, 6);
+  window_wl_u32((int64)x & 0xFFFFFFFF); window_wl_u32((int64)y & 0xFFFFFFFF); window_wl_u32((int64)width); window_wl_u32((int64)height);
+  window_wl_send();
+  req(g_s.text_input, 7);
+  g_s.ti_serial = g_s.ti_serial + 1;
+}
+
+export fn window_wl_set_cursor(w: Window*, shape: int32) {
+  ww(w)->cursor_img = false;
+  apply_cursor(w);
+}
+
+export fn window_wl_set_cursor_image(w: Window*, rgba: uint8*, cw: int32, ch: int32, hx: int32, hy: int32) -> bool {
+  var x: WindowWlWin* = ww(w);
+  if (x->cursor_surface == 0) {
+    x->cursor_surface = window_wl_new_id(WL_SURFACE, (rawptr)0);
+    req1(g_s.compositor, 0, x->cursor_surface);
+  }
+  var ptr: int64 = 0;
+  var buf: int64 = shm_buffer(cw, ch, 0, &ptr);
+  if (buf == 0) { return false; }
+  var dst: uint8* = (uint8*)ptr;
+  for i: int64 in 0..(int64)cw * (int64)ch {
+    var a: int64 = (int64)rgba[i * 4 + 3];
+    dst[i * 4] = (uint8)((int64)rgba[i * 4 + 2] * a / 255);
+    dst[i * 4 + 1] = (uint8)((int64)rgba[i * 4 + 1] * a / 255);
+    dst[i * 4 + 2] = (uint8)((int64)rgba[i * 4] * a / 255);
+    dst[i * 4 + 3] = (uint8)a;
+  }
+  window_wl_begin(x->cursor_surface, 1); window_wl_u32(buf); window_wl_u32(0); window_wl_u32(0); window_wl_send();
+  window_wl_begin(x->cursor_surface, 2); window_wl_u32(0); window_wl_u32(0); window_wl_u32((int64)cw); window_wl_u32((int64)ch); window_wl_send();
+  req(x->cursor_surface, 6);
+  x->cursor_hx = hx; x->cursor_hy = hy;
+  x->cursor_img = true;
+  apply_cursor(w);
+  return true;
+}
+
+export fn window_wl_set_cursor_mode(w: Window*, mode: int32, old: int32) {
+  var x: WindowWlWin* = ww(w);
+  destroy(x->locked, 0); x->locked = 0;
+  destroy(x->confined, 0); x->confined = 0;
+  if (g_s.constraints != 0 && g_s.pointer != 0) {
+    if (mode == WINDOW_CURSOR_LOCKED) {
+      x->locked = window_wl_new_id(WL_LOCKED_POINTER, (rawptr)w);
+      window_wl_begin(g_s.constraints, 1); window_wl_u32(x->locked); window_wl_u32(x->surface); window_wl_u32(g_s.pointer); window_wl_null(); window_wl_u32(2); window_wl_send();
+    }
+    if (mode == WINDOW_CURSOR_CONFINED) {
+      x->confined = window_wl_new_id(WL_CONFINED_POINTER, (rawptr)w);
+      window_wl_begin(g_s.constraints, 2); window_wl_u32(x->confined); window_wl_u32(x->surface); window_wl_u32(g_s.pointer); window_wl_null(); window_wl_u32(2); window_wl_send();
+    }
+  }
+  apply_cursor(w);
+}
+
+export fn window_wl_clipboard_set(s: uint8*, n: int64) {
+  if (g_s.ddm == 0 || g_s.data_device == 0) { return; }
+  if (g_s.clip != 0) { free(g_s.clip); }
+  var m: int64 = window_utf8_valid_prefix(s, n);
+  g_s.clip = (uint8*)malloc(m + 1);
+  for i: int64 in 0..m { g_s.clip[i] = s[i]; }
+  g_s.clip[m] = (uint8)0;
+  g_s.clip_len = m;
+  if (g_s.clip_source != 0) { destroy(g_s.clip_source, 1); }
+  g_s.clip_source = window_wl_new_id(WL_DATA_SOURCE, (rawptr)0);
+  req1(g_s.ddm, 0, g_s.clip_source);
+  window_wl_begin(g_s.clip_source, 0); window_wl_string("text/plain;charset=utf-8"); window_wl_send();
+  window_wl_begin(g_s.clip_source, 0); window_wl_string("UTF8_STRING"); window_wl_send();
+  window_wl_begin(g_s.clip_source, 0); window_wl_string("text/plain"); window_wl_send();
+  req2(g_s.data_device, 1, g_s.clip_source, g_s.serial);
+  g_s.own_clip = true;
+}
+
+export fn window_wl_clipboard_get() -> string {
+  var empty: string = "";
+  if (g_s.own_clip) {
+    var d: uint8* = (uint8*)malloc(g_s.clip_len + 1);
+    for i: int64 in 0..g_s.clip_len + 1 { d[i] = g_s.clip[i]; }
+    var s: string; s.chars = d; s.length = (uint64)g_s.clip_len;
+    return s;
+  }
+  var o: WlOffer* = offer_slot(g_s.sel_offer);
+  if (o == 0) { return empty; }
+  var mime: string = offer_mime(o, false);
+  if (mime.length == 0) { return empty; }
+  var b: WindowBytes;
+  if (!receive(g_s.sel_offer, mime, &b)) { return empty; }
+  var s2: string; s2.chars = b.data; s2.length = (uint64)window_utf8_valid_prefix(b.data, b.len);
+  return s2;
+}

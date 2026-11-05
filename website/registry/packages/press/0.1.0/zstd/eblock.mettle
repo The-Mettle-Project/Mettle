@@ -1,0 +1,259 @@
+// Block entropy coding: turns the sequence store into a compressed block
+// body (literals section, then sequences section).
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "common";
+import "fse";
+import "huf";
+import "ectx";
+
+// Writes a raw literals section. Returns its size.
+fn lits_raw(dst: uint8*, src: uint8*, n: int64) -> int64 {
+  var hs: int64 = 1;
+  if (n < 32) { dst[0] = (uint8)(n << 3); }
+  else if (n < 4096) { press_wr16(dst, (uint32)((n << 4) | 4)); hs = 2; }
+  else { press_wr32(dst, (uint32)((n << 4) | 12)); hs = 3; }
+  memcpy(dst + hs, src, n);
+  return hs + n;
+}
+
+// Writes the literals section for e->lit. Returns its size.
+fn enc_lits(e: PzsEnc*, dst: uint8*) -> int64 {
+  var src: uint8* = e->lit;
+  var n: int64 = e->nlit;
+  e->huf_used_new = false;
+  if (n == 0) { dst[0] = 0; return 1; }
+  var count: uint32[256];
+  for i in 0..256 { count[i] = 0; }
+  for i in 0..n { count[src[i]] = count[src[i]] + 1; }
+  if ((int64)count[src[0]] == n && n > 2) {
+    var rs: int64 = 1;
+    if (n < 32) { dst[0] = (uint8)((n << 3) | 1); }
+    else if (n < 4096) { press_wr16(dst, (uint32)((n << 4) | 5)); rs = 2; }
+    else { press_wr32(dst, (uint32)((n << 4) | 13)); rs = 3; }
+    dst[rs] = src[0];
+    return rs + 1;
+  }
+  var minLits: int64 = 63;
+  if (e->huf_prev_ok) { minLits = 6; }
+  if (n <= minLits) { return lits_raw(dst, src, n); }
+  var four: bool = n >= 256;
+  var hs: int64 = 3;
+  if (n >= 1024) { hs = 4; }
+  if (n >= 16384) { hs = 5; }
+  // New table versus the previous one.
+  var tsz: int64 = -1;
+  var newBits: int64 = -1;
+  if (pzs_huf_build(&e->huf_new, &count[0], PZS_HUF_LOG)) {
+    tsz = pzs_huf_write_table(&e->huf_new, dst + hs);
+    if (tsz > 0) { newBits = pzs_huf_cost(&e->huf_new, &count[0]) + tsz * 8; }
+  }
+  var repBits: int64 = -1;
+  if (e->huf_prev_ok) { repBits = pzs_huf_cost(&e->huf_prev, &count[0]); }
+  var useRep: bool = repBits >= 0 && (newBits < 0 || repBits <= newBits);
+  if (!useRep && newBits < 0) { return lits_raw(dst, src, n); }
+  var hc: PzsHufC* = &e->huf_new;
+  var at: int64 = hs + tsz;
+  var typ: int64 = 2;
+  if (useRep) { hc = &e->huf_prev; at = hs; typ = 3; }
+  var cs: int64 = pzs_huf_encode(hc, src, n, dst + at, n, four);
+  var minGain: int64 = (n >> 6) + 2;
+  if (cs < 0 || (at - hs) + cs >= n - minGain) { return lits_raw(dst, src, n); }
+  var comp: int64 = (at - hs) + cs;
+  if (hs == 3) {
+    var sf: int64 = 0;
+    if (four) { sf = 1; }
+    var v: int64 = typ | (sf << 2) | (n << 4) | (comp << 14);
+    dst[0] = (uint8)v;
+    dst[1] = (uint8)(v >> 8);
+    dst[2] = (uint8)(v >> 16);
+  } else if (hs == 4) {
+    press_wr32(dst, (uint32)(typ | 8 | (n << 4) | (comp << 18)));
+  } else {
+    press_wr32(dst, (uint32)(typ | 12 | (n << 4) | (comp << 22)));
+    dst[4] = (uint8)(comp >> 10);
+  }
+  e->huf_used_new = !useRep;
+  return hs + comp;
+}
+
+@inline fn ll_code(e: PzsEnc*, ll: uint32) -> uint8 {
+  if (ll < 64) { return e->llc_t[ll]; }
+  return (uint8)(pzs_hb32(ll) + 19);
+}
+
+@inline fn ml_code(e: PzsEnc*, mb: uint32) -> uint8 {
+  if (mb < 128) { return e->mlc_t[mb]; }
+  return (uint8)(pzs_hb32(mb) + 36);
+}
+
+// Picks the table mode for one code type and writes its description.
+// Returns the bytes written; sets e->fse_mode[t].
+fn pick_table(e: PzsEnc*, t: int32, count: uint32*, nsym: int32, maxLog: int32, nseq: int64, dst: uint8*) -> int64 {
+  var maxs: int32 = 0;
+  var distinct: int32 = 0;
+  for s in 0..nsym {
+    if (count[s] > 0) { maxs = s; distinct = distinct + 1; }
+  }
+  if (distinct == 1 && nseq > 2) {
+    e->fse_mode[t] = 1;
+    dst[0] = (uint8)maxs;
+    return 1;
+  }
+  var def: PzsFseC* = &e->fse_def[t];
+  var best: int64 = pzs_fse_cost(count, maxs + 1, &def->norm[0], def->nsym, def->log);
+  var mode: int32 = 0;
+  if (e->fse_prev_ok[t]) {
+    var pv: PzsFseC* = &e->fse_prev[t];
+    var rc: int64 = pzs_fse_cost(count, maxs + 1, &pv->norm[0], pv->nsym, pv->log);
+    if (rc >= 0 && (best < 0 || rc < best)) { best = rc; mode = 3; }
+  }
+  var hsz: int64 = 0;
+  if (distinct >= 2) {
+    var log: int32 = pzs_fse_pick_log(maxLog, nseq, maxs + 1);
+    var norm: int16[64];
+    pzs_fse_normalize(&norm[0], count, maxs + 1, nseq, log);
+    hsz = pzs_fse_write_ncount(dst, &norm[0], maxs + 1, log);
+    var nc: int64 = pzs_fse_cost(count, maxs + 1, &norm[0], maxs + 1, log) + hsz * 8 * 256;
+    if (best < 0 || nc < best) {
+      best = nc;
+      mode = 2;
+      pzs_fse_build_ct(&e->fse_new[t], &norm[0], maxs + 1, log);
+    }
+  }
+  if (best < 0) {
+    // Only reachable with one symbol and nseq <= 2 outside the defaults.
+    e->fse_mode[t] = 1;
+    dst[0] = (uint8)maxs;
+    return 1;
+  }
+  e->fse_mode[t] = mode;
+  if (mode == 2) { return hsz; }
+  return 0;
+}
+
+@inline fn table_for(e: PzsEnc*, t: int32) -> PzsFseC* {
+  var m: int32 = e->fse_mode[t];
+  if (m == 0) { return &e->fse_def[t]; }
+  if (m == 3) { return &e->fse_prev[t]; }
+  return &e->fse_new[t];
+}
+
+// Writes the sequence bit stream. Returns its size or -1.
+fn enc_seq_bits(e: PzsEnc*, dst: uint8*, cap: int64) -> int64 {
+  var n: int64 = e->nseq;
+  var llc: uint8* = e->codes;
+  var ofc: uint8* = e->codes + PZS_SEQ_CAP;
+  var mlc: uint8* = e->codes + PZS_SEQ_CAP * 2;
+  var tl: PzsFseC* = table_for(e, 0);
+  var to: PzsFseC* = table_for(e, 1);
+  var tm: PzsFseC* = table_for(e, 2);
+  var rl: bool = e->fse_mode[0] == 1;
+  var ro: bool = e->fse_mode[1] == 1;
+  var rm: bool = e->fse_mode[2] == 1;
+  var bw: PzsBitW;
+  pzs_bw_init(&bw, dst, cap);
+  var k: int64 = n - 1;
+  var sl: uint32 = 0;
+  var so: uint32 = 0;
+  var sm: uint32 = 0;
+  if (!rm) { sm = pzs_fse_init_state(tm, (int32)mlc[k]); }
+  if (!ro) { so = pzs_fse_init_state(to, (int32)ofc[k]); }
+  if (!rl) { sl = pzs_fse_init_state(tl, (int32)llc[k]); }
+  pzs_bw_add(&bw, (uint64)e->sll[k], (int64)PZS_LL_BITS[llc[k]]);
+  pzs_bw_add(&bw, (uint64)(e->sml[k] - 3), (int64)PZS_ML_BITS[mlc[k]]);
+  pzs_bw_flush(&bw);
+  pzs_bw_add(&bw, (uint64)e->sob[k], (int64)ofc[k]);
+  pzs_bw_flush(&bw);
+  while (k > 0) {
+    k = k - 1;
+    var lc: int32 = (int32)llc[k];
+    var oc: int32 = (int32)ofc[k];
+    var mc: int32 = (int32)mlc[k];
+    if (!ro) { pzs_fse_encode(&bw, to, &so, oc); }
+    if (!rm) { pzs_fse_encode(&bw, tm, &sm, mc); }
+    if (!rl) { pzs_fse_encode(&bw, tl, &sl, lc); }
+    pzs_bw_flush(&bw);
+    pzs_bw_add(&bw, (uint64)e->sll[k], (int64)PZS_LL_BITS[lc]);
+    pzs_bw_add(&bw, (uint64)(e->sml[k] - 3), (int64)PZS_ML_BITS[mc]);
+    pzs_bw_flush(&bw);
+    pzs_bw_add(&bw, (uint64)e->sob[k], (int64)oc);
+    pzs_bw_flush(&bw);
+    if (bw.bad) { return -1; }
+  }
+  if (!rm) { pzs_bw_add(&bw, (uint64)sm, (int64)tm->log); }
+  if (!ro) { pzs_bw_add(&bw, (uint64)so, (int64)to->log); }
+  pzs_bw_flush(&bw);
+  if (!rl) { pzs_bw_add(&bw, (uint64)sl, (int64)tl->log); }
+  return pzs_bw_close(&bw);
+}
+
+/// Encodes the sequence store as a compressed block body into dst. Returns
+/// the size, or -1 when it would not fit in cap bytes.
+export fn pzs_enc_body(e: PzsEnc*, dst: uint8*, cap: int64) -> int64 {
+  if (cap < e->nlit + 600) { return -1; }
+  var at: int64 = enc_lits(e, dst);
+  var n: int64 = e->nseq;
+  if (n < 128) { dst[at] = (uint8)n; at = at + 1; }
+  else if (n < 0x7F00) { dst[at] = (uint8)((n >> 8) + 128); dst[at + 1] = (uint8)n; at = at + 2; }
+  else { dst[at] = 255; press_wr16(dst + at + 1, (uint32)(n - 0x7F00)); at = at + 3; }
+  e->fse_mode[0] = -1;
+  e->fse_mode[1] = -1;
+  e->fse_mode[2] = -1;
+  if (n == 0) { return at; }
+  var cl: uint32[36];
+  var co: uint32[32];
+  var cm: uint32[53];
+  for i in 0..36 { cl[i] = 0; }
+  for i in 0..32 { co[i] = 0; }
+  for i in 0..53 { cm[i] = 0; }
+  var llc: uint8* = e->codes;
+  var ofc: uint8* = e->codes + PZS_SEQ_CAP;
+  var mlc: uint8* = e->codes + PZS_SEQ_CAP * 2;
+  for k in 0..n {
+    var a: uint8 = ll_code(e, e->sll[k]);
+    var o: uint8 = (uint8)pzs_hb32(e->sob[k]);
+    var c: uint8 = ml_code(e, e->sml[k] - 3);
+    llc[k] = a;
+    ofc[k] = o;
+    mlc[k] = c;
+    cl[a] = cl[a] + 1;
+    co[o] = co[o] + 1;
+    cm[c] = cm[c] + 1;
+  }
+  var mpos: int64 = at;
+  at = at + 1;
+  at = at + pick_table(e, 0, &cl[0], 36, PZS_LL_LOG, n, dst + at);
+  at = at + pick_table(e, 1, &co[0], 32, PZS_OF_LOG, n, dst + at);
+  at = at + pick_table(e, 2, &cm[0], 53, PZS_ML_LOG, n, dst + at);
+  dst[mpos] = (uint8)((e->fse_mode[0] << 6) | (e->fse_mode[1] << 4) | (e->fse_mode[2] << 2));
+  var bs: int64 = enc_seq_bits(e, dst + at, cap - at);
+  if (bs < 0) { return -1; }
+  return at + bs;
+}
+
+/// Makes the entropy choices of the last pzs_enc_body call the state the
+/// decoder will see (call it only when that block is written compressed).
+export fn pzs_enc_commit(e: PzsEnc*) {
+  if (e->huf_used_new) {
+    memcpy(&e->huf_prev, &e->huf_new, sizeof(PzsHufC));
+    e->huf_prev_ok = true;
+  }
+  for t in 0..3 {
+    var m: int32 = e->fse_mode[t];
+    if (m == 0) {
+      memcpy(&e->fse_prev[t], &e->fse_def[t], sizeof(PzsFseC));
+      e->fse_prev_ok[t] = true;
+    } else if (m == 1) {
+      e->fse_prev_ok[t] = false;
+    } else if (m == 2) {
+      memcpy(&e->fse_prev[t], &e->fse_new[t], sizeof(PzsFseC));
+      e->fse_prev_ok[t] = true;
+    }
+  }
+  e->rep[0] = e->srep[0];
+  e->rep[1] = e->srep[1];
+  e->rep[2] = e->srep[2];
+}

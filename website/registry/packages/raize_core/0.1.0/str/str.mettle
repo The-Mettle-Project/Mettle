@@ -1,0 +1,814 @@
+// raize/str — string views, byte buffers, and the small helpers the rest of
+// the framework needs.
+//
+// Mettle strings are 16-byte views (pointer + length), never owned. This
+// module therefore separates two lifetimes:
+//
+//   * a *view* (rz_str_sub and friends) borrows bytes that somebody else
+//     keeps alive;
+//   * an *owned* string (rz_str_dup, rz_buf_take) is heap memory the
+//     caller frees with rz_str_free / rz_buf_free.
+//
+// Every public name carries the rz_ prefix: Mettle has one flat global
+// namespace shared by every import in the program.
+
+import "std/mem";
+
+// ---------------------------------------------------------------------------
+// Views
+// ---------------------------------------------------------------------------
+
+export fn rz_str_view(p: uint8*, n: int64) -> string {
+  var s: string;
+  s.chars = p;
+  s.length = (uint64)n;
+  return s;
+}
+
+export fn rz_str_empty() -> string {
+  return rz_str_view((uint8*)"".chars, 0);
+}
+
+export fn rz_str_len(s: string) -> int64 {
+  return (int64)s.length;
+}
+
+export fn rz_str_sub(s: string, start: int64, end: int64) -> string {
+  var n: int64 = (int64)s.length;
+  if (start < 0) { start = 0; }
+  if (end > n) { end = n; }
+  if (end <= start) {
+    return rz_str_empty();
+  }
+  return rz_str_view(&s.chars[start], end - start);
+}
+
+export fn rz_str_from(s: string, start: int64) -> string {
+  return rz_str_sub(s, start, (int64)s.length);
+}
+
+export fn rz_str_byte(s: string, i: int64) -> int32 {
+  return (int32)s.chars[i];
+}
+
+// ---------------------------------------------------------------------------
+// Owning copies
+// ---------------------------------------------------------------------------
+
+/// Returns a NUL-terminated heap copy of `s`; an empty `s` gives rz_str_empty()
+/// without allocating.
+///
+/// in:      s  the bytes to copy; borrowed
+/// returns: the copy (same length as `s`), or rz_str_empty() when `s` is empty or
+///          memory runs out (check `.length` against `s.length`)
+/// owns:    the caller owns the copy and frees it with rz_str_free (a no-op on
+///          the empty result)
+/// thread:  any
+/// example:
+///   var d: string = rz_str_dup(rz_str_trim(raw));
+///   rz_str_free(d);
+export fn rz_str_dup(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  if (n == 0) {
+    return rz_str_empty();
+  }
+  var p: uint8* = (uint8*)malloc(n + 1);
+  if (p == 0) {
+    return rz_str_empty();
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    p[i] = s.chars[i];
+    i = i + 1;
+  }
+  p[n] = 0;
+  return rz_str_view(p, n);
+}
+
+/// Frees a string made by rz_str_dup / rz_str_from_c / rz_buf_take. A string of
+/// length 0 is never freed, so rz_str_free(rz_str_empty()) and freeing an empty
+/// rz_str_dup result are safe no-ops.
+///
+/// in:      s  an owned string, or any empty string
+/// returns: nothing
+/// owns:    takes `s`; a non-empty `s` that was not allocated by raize is the
+///          caller's bug and is not detected
+/// thread:  any
+/// example:
+///   var d: string = rz_str_dup("x");
+///   rz_str_free(d);
+export fn rz_str_free(s: string) {
+  if (s.length == 0) {
+    return;
+  }
+  if (s.chars != 0) {
+    free(s.chars);
+  }
+}
+
+export fn rz_str_c(s: string) -> cstring {
+  var d: string = rz_str_dup(s);
+  return (cstring)d.chars;
+}
+
+extern fn rz_c_strlen(s: cstring) -> int64 = "strlen";
+
+export fn rz_str_from_c(c: cstring) -> string {
+  if (c == 0) {
+    return rz_str_empty();
+  }
+  return rz_str_dup(rz_str_view((uint8*)c, rz_c_strlen(c)));
+}
+
+// ---------------------------------------------------------------------------
+// Comparison and search
+// ---------------------------------------------------------------------------
+
+export fn rz_str_eq(a: string, b: string) -> bool {
+  var n: int64 = (int64)a.length;
+  if (n != (int64)b.length) {
+    return false;
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    if (a.chars[i] != b.chars[i]) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// ASCII case-insensitive equality. Used for request headers, where the field
+// name is case-insensitive by RFC 9110.
+export fn rz_str_eq_ci(a: string, b: string) -> bool {
+  var n: int64 = (int64)a.length;
+  if (n != (int64)b.length) {
+    return false;
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    var x: int32 = (int32)a.chars[i];
+    var y: int32 = (int32)b.chars[i];
+    if (x != y) {
+      if (rz_char_lower(x) != rz_char_lower(y)) {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+export fn rz_str_cmp(a: string, b: string) -> int32 {
+  var na: int64 = (int64)a.length;
+  var nb: int64 = (int64)b.length;
+  var i: int64 = 0;
+  while (i < na && i < nb) {
+    var x: int32 = (int32)a.chars[i];
+    var y: int32 = (int32)b.chars[i];
+    if (x != y) {
+      return x - y;
+    }
+    i = i + 1;
+  }
+  if (na < nb) { return -1; }
+  if (na > nb) { return 1; }
+  return 0;
+}
+
+export fn rz_str_starts(s: string, prefix: string) -> bool {
+  if ((int64)prefix.length > (int64)s.length) {
+    return false;
+  }
+  return rz_str_eq(rz_str_sub(s, 0, (int64)prefix.length), prefix);
+}
+
+export fn rz_str_ends(s: string, suffix: string) -> bool {
+  if ((int64)suffix.length > (int64)s.length) {
+    return false;
+  }
+  return rz_str_eq(rz_str_from(s, (int64)s.length - (int64)suffix.length), suffix);
+}
+
+export fn rz_str_find_from(s: string, needle: string, from: int64) -> int64 {
+  var n: int64 = (int64)s.length;
+  var m: int64 = (int64)needle.length;
+  if (m == 0) {
+    if (from < 0) { return 0; }
+    if (from > n) { return n; }
+    return from;
+  }
+  var i: int64 = from;
+  if (i < 0) { i = 0; }
+  while (i + m <= n) {
+    var j: int64 = 0;
+    while (j < m && s.chars[i + j] == needle.chars[j]) {
+      j = j + 1;
+    }
+    if (j == m) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+export fn rz_str_find(s: string, needle: string) -> int64 {
+  return rz_str_find_from(s, needle, 0);
+}
+
+export fn rz_str_contains(s: string, needle: string) -> bool {
+  return rz_str_find(s, needle) >= 0;
+}
+
+export fn rz_str_find_byte(s: string, c: int32) -> int64 {
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    if ((int32)s.chars[i] == c) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+export fn rz_str_find_byte_from(s: string, c: int32, from: int64) -> int64 {
+  var i: int64 = from;
+  if (i < 0) { i = 0; }
+  while (i < (int64)s.length) {
+    if ((int32)s.chars[i] == c) {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+export fn rz_str_rfind_byte(s: string, c: int32) -> int64 {
+  var i: int64 = (int64)s.length - 1;
+  while (i >= 0) {
+    if ((int32)s.chars[i] == c) {
+      return i;
+    }
+    i = i - 1;
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Character classes (ASCII only; raize/url and raize/http are byte protocols)
+// ---------------------------------------------------------------------------
+
+export fn rz_char_lower(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) {
+    return c + 32;
+  }
+  return c;
+}
+
+export fn rz_char_upper(c: int32) -> int32 {
+  if (c >= 97 && c <= 122) {
+    return c - 32;
+  }
+  return c;
+}
+
+export fn rz_char_is_space(c: int32) -> bool {
+  return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+}
+
+export fn rz_char_is_digit(c: int32) -> bool {
+  return c >= 48 && c <= 57;
+}
+
+export fn rz_char_is_alpha(c: int32) -> bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+export fn rz_char_is_hex(c: int32) -> bool {
+  return rz_char_is_digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+export fn rz_char_hex_value(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Trimming and case conversion (owning)
+// ---------------------------------------------------------------------------
+
+export fn rz_str_trim(s: string) -> string {
+  var a: int64 = 0;
+  var b: int64 = (int64)s.length;
+  while (a < b && rz_char_is_space(rz_str_byte(s, a))) { a = a + 1; }
+  while (b > a && rz_char_is_space(rz_str_byte(s, b - 1))) { b = b - 1; }
+  return rz_str_sub(s, a, b);
+}
+
+export fn rz_str_lower(s: string) -> string {
+  var d: string = rz_str_dup(s);
+  var i: int64 = 0;
+  while (i < (int64)d.length) {
+    d.chars[i] = (uint8)rz_char_lower((int32)d.chars[i]);
+    i = i + 1;
+  }
+  return d;
+}
+
+export fn rz_str_upper(s: string) -> string {
+  var d: string = rz_str_dup(s);
+  var i: int64 = 0;
+  while (i < (int64)d.length) {
+    d.chars[i] = (uint8)rz_char_upper((int32)d.chars[i]);
+    i = i + 1;
+  }
+  return d;
+}
+
+// ---------------------------------------------------------------------------
+// Numbers
+// ---------------------------------------------------------------------------
+
+/// Strict decimal parser for untrusted text: an optional '+' or '-', then one
+/// or more ASCII digits and nothing else. Overflow is checked against the int64
+/// range, so "-9223372036854775808" (INT64_MIN) parses and
+/// "9223372036854775808" does not. On failure `*out` is left untouched.
+///
+/// in:      s    the text; borrowed, not NUL-terminated
+///          out  where the value is written on success; must be non-null
+/// returns: true and `*out` set when `s` is a whole in-range integer; false for
+///          "", "+", "-", any non-digit byte (including spaces) or overflow
+/// owns:    nothing
+/// thread:  any
+/// example:
+///   var id: int64 = 0;
+///   if (!rz_str_parse_int(raw, &id)) { return rz_ctx_text(ctx, 400, "bad id\n"); }
+export fn rz_str_parse_int(s: string, out: int64*) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n == 0) { return false; }
+  var i: int64 = 0;
+  var neg: bool = false;
+  if (s.chars[0] == 45) {
+    neg = true;
+    i = 1;
+  } else if (s.chars[0] == 43) {
+    i = 1;
+  }
+  if (i >= n) { return false; }
+  // Accumulate the magnitude unsigned; INT64_MAX + 1 is the limit for a
+  // negative number and exactly INT64_MIN's magnitude.
+  var limit: uint64 = (uint64)9223372036854775807;
+  if (neg) { limit = limit + (uint64)1; }
+  var mag: uint64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (!rz_char_is_digit(c)) { return false; }
+    var d: uint64 = (uint64)(c - 48);
+    if (mag > (limit - d) / (uint64)10) { return false; }
+    mag = mag * (uint64)10 + d;
+    i = i + 1;
+  }
+  if (neg) {
+    // mag <= 2^63; 0 - mag in uint64 then reinterpret is INT64_MIN-safe.
+    *out = (int64)(0 - mag);
+  } else {
+    *out = (int64)mag;
+  }
+  return true;
+}
+
+/// Lenient wrapper over rz_str_parse_int for trusted input (argv, constants):
+/// the same grammar, but any failure (malformed or out of range) returns -1,
+/// which is indistinguishable from a real -1. Use rz_str_parse_int on anything
+/// a client sent.
+///
+/// in:      s  the text; borrowed
+/// returns: the value, or -1 on any error
+/// owns:    nothing
+/// thread:  any
+/// example:
+///   var port: int32 = (int32)rz_str_to_int(rz_str_from_c(argv[1]));
+export fn rz_str_to_int(s: string) -> int64 {
+  var v: int64 = 0;
+  if (!rz_str_parse_int(s, &v)) { return -1; }
+  return v;
+}
+
+// Reads a decimal number that starts at `from`, stopping at the first
+// non-digit. Returns the count of digits consumed and writes the value
+// through out.
+export fn rz_str_scan_int(s: string, from: int64, out: int64*) -> int64 {
+  var i: int64 = from;
+  var v: int64 = 0;
+  while (i < (int64)s.length) {
+    var c: int32 = (int32)s.chars[i];
+    if (!rz_char_is_digit(c)) { break; }
+    v = v * 10 + (int64)(c - 48);
+    i = i + 1;
+  }
+  out[0] = v;
+  return i - from;
+}
+
+// Formats into caller storage. Returns a view of buf[0..n).
+export fn rz_int_buf(n: int64, buf: uint8*, cap: int64) -> string {
+  if (cap < 21) { return rz_str_empty(); }
+  var tmp: uint8[21];
+  var neg: bool = n < 0;
+  var mag: uint64 = (uint64)n;
+  if (neg) {
+    mag = (uint64)(0 - n);
+  }
+  var i: int32 = 20;
+  tmp[i] = 0;
+  i = i - 1;
+  if (mag == 0) {
+    tmp[i] = 48;
+    i = i - 1;
+  } else {
+    while (mag > 0) {
+      tmp[i] = (uint8)(48 + (int32)(mag % (uint64)10));
+      mag = mag / (uint64)10;
+      i = i - 1;
+    }
+  }
+  if (neg) {
+    tmp[i] = 45;
+    i = i - 1;
+  }
+  var start: int32 = i + 1;
+  var n2: int64 = (int64)(20 - start);
+  var j: int64 = 0;
+  while (j < n2) {
+    buf[j] = tmp[start + (int32)j];
+    j = j + 1;
+  }
+  buf[n2] = 0;
+  return rz_str_view(buf, n2);
+}
+
+// A heap decimal string. Free with rz_str_free.
+export fn rz_int_str(n: int64) -> string {
+  var p: uint8* = (uint8*)malloc(24);
+  if (p == 0) { return rz_str_empty(); }
+  return rz_int_buf(n, p, 24);
+}
+
+// Lowercase hex, no prefix. Writes into caller storage.
+export fn rz_hex_buf(v: uint64, buf: uint8*, cap: int64) -> string {
+  var tmp: uint8[17];
+  var i: int32 = 16;
+  tmp[16] = 0;
+  i = 15;
+  if (v == 0) {
+    buf[0] = 48;
+    buf[1] = 0;
+    return rz_str_view(buf, 1);
+  }
+  while (v > 0 && i >= 0) {
+    var d: int32 = (int32)(v & (uint64)15);
+    if (d < 10) {
+      tmp[i] = (uint8)(48 + d);
+    } else {
+      tmp[i] = (uint8)(87 + d);
+    }
+    v = v >> (uint64)4;
+    i = i - 1;
+  }
+  var start: int32 = i + 1;
+  var len: int64 = (int64)(16 - start);
+  if (len > cap - 1) { len = cap - 1; }
+  var j: int64 = 0;
+  while (j < len) {
+    buf[j] = tmp[start + (int32)j];
+    j = j + 1;
+  }
+  buf[len] = 0;
+  return rz_str_view(buf, len);
+}
+
+// ---------------------------------------------------------------------------
+// Splitting
+// ---------------------------------------------------------------------------
+
+export struct RzStrList {
+  items: string*;
+  len: int64;
+  cap: int64;
+}
+
+export fn rz_strlist_new() -> RzStrList* {
+  var l: RzStrList* = new RzStrList;
+  l->cap = 4;
+  l->len = 0;
+  l->items = (string*)malloc(l->cap * 16);
+  return l;
+}
+
+export fn rz_strlist_push(l: RzStrList*, s: string) {
+  if (l->len + 1 > l->cap) {
+    var nc: int64 = l->cap * 2;
+    l->items = (string*)realloc(l->items, nc * 16);
+    l->cap = nc;
+  }
+  l->items[l->len] = s;
+  l->len = l->len + 1;
+}
+
+export fn rz_strlist_get(l: RzStrList*, i: int64) -> string {
+  if (i < 0 || i >= l->len) {
+    return rz_str_empty();
+  }
+  return l->items[i];
+}
+
+export fn rz_strlist_free(l: RzStrList*) {
+  if (l == 0) { return; }
+  if (l->items != 0) {
+    free(l->items);
+  }
+  free(l);
+}
+
+// Split on one byte. Empty pieces are kept: "a,,b" has three pieces.
+export fn rz_str_split(s: string, sep: int32) -> RzStrList* {
+  var out: RzStrList* = rz_strlist_new();
+  var start: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    if (rz_str_byte(s, i) == sep) {
+      rz_strlist_push(out, rz_str_sub(s, start, i));
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  rz_strlist_push(out, rz_str_sub(s, start, (int64)s.length));
+  return out;
+}
+
+// Split on a substring.
+export fn rz_str_split_str(s: string, sep: string) -> RzStrList* {
+  var out: RzStrList* = rz_strlist_new();
+  if ((int64)sep.length == 0) {
+    rz_strlist_push(out, s);
+    return out;
+  }
+  var start: int64 = 0;
+  var i: int64 = 0;
+  while (i <= (int64)s.length) {
+    var at: int64 = rz_str_find_from(s, sep, i);
+    if (at < 0) {
+      rz_strlist_push(out, rz_str_from(s, start));
+      break;
+    }
+    rz_strlist_push(out, rz_str_sub(s, start, at));
+    i = at + (int64)sep.length;
+    start = i;
+  }
+  return out;
+}
+
+// Split on any run of spaces and tabs, dropping empty pieces.
+export fn rz_str_fields(s: string) -> RzStrList* {
+  var out: RzStrList* = rz_strlist_new();
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    while (i < n && rz_char_is_space(rz_str_byte(s, i))) { i = i + 1; }
+    var start: int64 = i;
+    while (i < n && !rz_char_is_space(rz_str_byte(s, i))) { i = i + 1; }
+    if (i > start) {
+      rz_strlist_push(out, rz_str_sub(s, start, i));
+    }
+  }
+  return out;
+}
+
+// Lines without terminators. A trailing newline does not add an empty line.
+export fn rz_str_lines(s: string) -> RzStrList* {
+  var out: RzStrList* = rz_strlist_new();
+  var start: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    if (s.chars[i] == 10) {
+      var end: int64 = i;
+      if (end > start && s.chars[end - 1] == 13) {
+        end = end - 1;
+      }
+      rz_strlist_push(out, rz_str_sub(s, start, end));
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  if (start < (int64)s.length) {
+    var tail: string = rz_str_from(s, start);
+    if (rz_str_ends(tail, "\r")) {
+      tail = rz_str_sub(tail, 0, (int64)tail.length - 1);
+    }
+    rz_strlist_push(out, tail);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Growable byte buffer
+// ---------------------------------------------------------------------------
+
+export struct RzBuf {
+  data: uint8*;
+  len: int64;
+  cap: int64;
+}
+
+export fn rz_buf_new() -> RzBuf* {
+  var b: RzBuf* = new RzBuf;
+  b->cap = 256;
+  b->len = 0;
+  b->data = (uint8*)malloc(b->cap);
+  if (b->data == 0) { b->cap = 0; }
+  return b;
+}
+
+export fn rz_buf_new_cap(cap: int64) -> RzBuf* {
+  var b: RzBuf* = new RzBuf;
+  if (cap < 16) { cap = 16; }
+  b->cap = cap;
+  b->len = 0;
+  b->data = (uint8*)malloc(b->cap);
+  if (b->data == 0) { b->cap = 0; }
+  return b;
+}
+
+export fn rz_buf_reserve(b: RzBuf*, extra: int64) {
+  if (b->len + extra + 1 <= b->cap) {
+    return;
+  }
+  var nc: int64 = b->cap * 2;
+  if (nc < 64) { nc = 64; }
+  while (nc < b->len + extra + 1) {
+    nc = nc * 2;
+  }
+  b->data = (uint8*)realloc(b->data, nc);
+  b->cap = nc;
+}
+
+export fn rz_buf_add(b: RzBuf*, s: string) {
+  rz_buf_add_bytes(b, s.chars, (int64)s.length);
+}
+
+export fn rz_buf_add_bytes(b: RzBuf*, p: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  rz_buf_reserve(b, n);
+  var i: int64 = 0;
+  while (i < n) {
+    b->data[b->len + i] = p[i];
+    i = i + 1;
+  }
+  b->len = b->len + n;
+}
+
+export fn rz_buf_add_byte(b: RzBuf*, c: int32) {
+  rz_buf_reserve(b, 1);
+  b->data[b->len] = (uint8)c;
+  b->len = b->len + 1;
+}
+
+export fn rz_buf_add_int(b: RzBuf*, n: int64) {
+  var tmp: uint8[24];
+  var s: string = rz_int_buf(n, &tmp[0], 24);
+  rz_buf_add(b, s);
+}
+
+export fn rz_buf_add_repeat(b: RzBuf*, c: int32, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    rz_buf_add_byte(b, c);
+    i = i + 1;
+  }
+}
+
+// A view of everything written so far. The bytes live until the buffer is
+// freed or grown again.
+export fn rz_buf_str(b: RzBuf*) -> string {
+  return rz_str_view(b->data, b->len);
+}
+
+// NUL-terminates the contents and returns a view; safe to pass to C.
+export fn rz_buf_cstr(b: RzBuf*) -> cstring {
+  rz_buf_reserve(b, 1);
+  b->data[b->len] = 0;
+  return (cstring)b->data;
+}
+
+// Hands the bytes to the caller, who owns them. The buffer is gone.
+export fn rz_buf_take(b: RzBuf*) -> string {
+  // An empty result is the static empty string: rz_str_free skips length-0
+  // strings, so returning a length-0 view of the buffer would leak it.
+  if (b->data == 0 || b->len == 0) {
+    if (b->data != 0) { free(b->data); }
+    free(b);
+    return rz_str_empty();
+  }
+  var s: string = rz_str_view(b->data, b->len);
+  free(b);
+  return s;
+}
+
+export fn rz_buf_free(b: RzBuf*) {
+  if (b == 0) { return; }
+  if (b->data != 0) {
+    free(b->data);
+  }
+  free(b);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+@test fn t_raize_str_views() -> int32 {
+  var s: string = "hello world";
+  if (!rz_str_eq(rz_str_sub(s, 0, 5), "hello")) { return 1; }
+  if (!rz_str_starts(s, "hell")) { return 2; }
+  if (!rz_str_ends(s, "world")) { return 3; }
+  if (rz_str_find(s, "o w") != 4) { return 4; }
+  if (rz_str_find(s, "zz") != -1) { return 5; }
+  if (!rz_str_eq(rz_str_trim("  x\t"), "x")) { return 6; }
+  if (!rz_str_eq_ci("Content-Length", "content-length")) { return 7; }
+  return 0;
+}
+
+@test fn t_raize_str_split() -> int32 {
+  var l: RzStrList* = rz_str_split("a,,b", 44);
+  if (l->len != 3) { return 1; }
+  if (!rz_str_eq(rz_strlist_get(l, 0), "a")) { return 2; }
+  if (rz_strlist_get(l, 1).length != 0) { return 3; }
+  if (!rz_str_eq(rz_strlist_get(l, 2), "b")) { return 4; }
+  rz_strlist_free(l);
+  var f: RzStrList* = rz_str_fields("  one  two ");
+  if (f->len != 2) { return 5; }
+  if (!rz_str_eq(rz_strlist_get(f, 1), "two")) { return 6; }
+  rz_strlist_free(f);
+  return 0;
+}
+
+@test fn t_raize_str_numbers() -> int32 {
+  if (rz_str_to_int("1234") != 1234) { return 1; }
+  if (rz_str_to_int("-42") != -42) { return 2; }
+  if (rz_str_to_int("12x") != -1) { return 3; }
+  var v: int64 = 7;
+  if (rz_str_parse_int("", &v) || v != 7) { return 10; }
+  if (rz_str_parse_int("-", &v)) { return 11; }
+  if (rz_str_parse_int("+", &v)) { return 12; }
+  if (rz_str_parse_int("abc", &v)) { return 13; }
+  if (rz_str_parse_int("1x", &v)) { return 14; }
+  if (rz_str_parse_int(" 1", &v)) { return 15; }
+  if (!rz_str_parse_int("+5", &v) || v != 5) { return 16; }
+  if (!rz_str_parse_int("9223372036854775807", &v) || v != 9223372036854775807) { return 17; }
+  if (rz_str_parse_int("9223372036854775808", &v)) { return 18; }
+  if (!rz_str_parse_int("-9223372036854775808", &v) || v != (0 - 9223372036854775807 - 1)) { return 19; }
+  if (rz_str_parse_int("-9223372036854775809", &v)) { return 20; }
+  if (rz_str_parse_int("123456789012345678901234", &v)) { return 21; }
+  if (rz_str_parse_int("18446744073709551617", &v)) { return 22; }
+  if (!rz_str_parse_int("-0", &v) || v != 0) { return 23; }
+  if (!rz_str_parse_int("0007", &v) || v != 7) { return 24; }
+  if (rz_str_to_int("9223372036854775808") != -1) { return 25; }
+  var p: uint8* = (uint8*)malloc(24);
+  var s: string = rz_int_buf(-900, p, 24);
+  if (!rz_str_eq(s, "-900")) { free(p); return 4; }
+  var h: uint8* = (uint8*)malloc(24);
+  if (!rz_str_eq(rz_hex_buf((uint64)48879, h, 24), "beef")) { free(p); free(h); return 5; }
+  free(p);
+  free(h);
+  return 0;
+}
+
+@test fn t_raize_buf() -> int32 {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, "id=");
+  rz_buf_add_int(b, 77);
+  rz_buf_add_byte(b, 38);
+  rz_buf_add(b, "ok");
+  var s: string = rz_buf_take(b);
+  if (!rz_str_eq(s, "id=77&ok")) { rz_str_free(s); return 1; }
+  rz_str_free(s);
+  return 0;
+}
+
+@test fn t_raize_str_dup_free_empty() -> int32 {
+  rz_str_free(rz_str_empty());
+  rz_str_free("");
+  var e: string = rz_str_dup("");
+  if (e.length != 0) { return 1; }
+  rz_str_free(e);
+  var x: string = rz_str_dup("x");
+  if (x.length != 1) { return 2; }
+  if (!rz_str_eq(x, "x")) { rz_str_free(x); return 3; }
+  if (x.chars[1] != 0) { rz_str_free(x); return 4; }
+  rz_str_free(x);
+  return 0;
+}

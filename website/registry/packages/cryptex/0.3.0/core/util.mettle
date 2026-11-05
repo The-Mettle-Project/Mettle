@@ -1,0 +1,167 @@
+// Initialization (a no-op), randomness, constant-time comparison and wiping.
+// Pure Mettle: randomness comes from the Linux getrandom(2) system call
+// through the syscall built-in (Linux x86-64 and AArch64); there is no foreign code and no shared state,
+// so every function in this library may be called from any thread.
+
+import "cryptex/core/status";
+import "cryptex/core/sys_x86_64" if x86_64;
+import "cryptex/core/sys_aarch64" if aarch64;
+
+// Largest request getrandom(2) is asked for in one call (the kernel returns
+// at most 33554431 bytes per call anyway).
+const CR_RANDOM_CHUNK: int64 = 33554431;
+
+/// Kept for compatibility: there is nothing to initialize. Safe to call any
+/// number of times, from any thread.
+/// in: -
+/// returns: CR_OK, always
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (cr_init() != CR_OK) { return 1; }
+export fn cr_init() -> int32 {
+  return CR_OK;
+}
+
+/// Fills buf with n cryptographically secure random bytes (the kernel's
+/// getrandom(2)).
+/// in: buf, writable for n bytes (may be 0 only when n == 0); n >= 0
+/// returns: CR_OK; CR_E_ARG for a null buf with n > 0 or n < 0;
+///   CR_E_INTERNAL if the kernel random source fails
+/// owns: nothing; the caller owns buf
+/// thread: any thread (no shared state)
+/// example: var salt: uint8[16]; cr_random_bytes(&salt[0], 16);
+export fn cr_random_bytes(buf: uint8*, n: int64) -> int32 {
+  if (n < 0) { return CR_E_ARG; }
+  if (n == 0) { return CR_OK; }
+  if (buf == 0) { return CR_E_ARG; }
+  var done: int64 = 0;
+  while (done < n) {
+    var want: int64 = n - done;
+    if (want > CR_RANDOM_CHUNK) { want = CR_RANDOM_CHUNK; }
+    // getrandom(buf, count, flags = 0)
+    var got: int64 = syscall(CRX_SYS_GETRANDOM, &buf[done], want, 0);
+    if (got == -4) { continue; }  // EINTR: try again
+    if (got <= 0) { return CR_E_INTERNAL; }
+    done = done + got;
+  }
+  return CR_OK;
+}
+
+/// Picks a uniformly distributed random integer in [0, n) without modulo
+/// bias (rejection sampling).
+/// in: n >= 1, the exclusive upper bound; out, where the value goes
+/// returns: CR_OK; CR_E_ARG if n == 0 or out is null (out untouched);
+///   CR_E_INTERNAL if the kernel random source fails
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: var die: uint32; cr_random_u32_below(6, &die);  // 0..5
+export fn cr_random_u32_below(n: uint32, out: uint32*) -> int32 {
+  if (out == 0 || n == 0) { return CR_E_ARG; }
+  // Values below min would make the result favour small residues; skip them.
+  // n is public, so % is fine here.
+  var min: uint32 = ((uint32)0 - n) % n;
+  var r: uint8[4];
+  while (true) {
+    var rc: int32 = cr_random_bytes(&r[0], 4);
+    if (rc != CR_OK) { return rc; }
+    var v: uint32 = (uint32)r[0] | ((uint32)r[1] << 8) | ((uint32)r[2] << 16) | ((uint32)r[3] << 24);
+    if (v >= min) {
+      *out = v % n;
+      return CR_OK;
+    }
+  }
+  return CR_OK;
+}
+
+/// Compares two byte ranges in constant time: the time depends on n only,
+/// never on the contents. Use it for every comparison of secrets, tags and
+/// tokens; never use == or mem_equal for those.
+/// in: a, b readable for n bytes; n >= 0
+/// returns: true only if all n bytes are equal; false otherwise, and false
+///   for invalid arguments (null pointer with n > 0, n < 0)
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (cr_equal(&got.b[0], &want.b[0], 32)) { accept(); }
+export fn cr_equal(a: uint8*, b: uint8*, n: int64) -> bool {
+  if (n < 0) { return false; }
+  if (n == 0) { return true; }
+  if (a == 0 || b == 0) { return false; }
+  // volatile: every access stays, so the loop cannot stop at the first
+  // difference.
+  var d: volatile uint8 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    d = d | (a[i] ^ b[i]);
+    i = i + 1;
+  }
+  return d == 0;
+}
+
+/// Overwrites n bytes with zeros in a way the optimizer cannot remove
+/// (volatile stores). Call it on every secret (keys, seeds, passwords,
+/// plaintexts, HMAC states) as soon as you are done with it, including on
+/// error paths: `defer cr_wipe(&k.b[0], 32);`.
+/// in: buf writable for n bytes; n >= 0
+/// returns: CR_OK; CR_E_ARG for a null buf with n > 0 or n < 0
+/// owns: nothing; the caller still owns (and frees) buf
+/// thread: any thread (no shared state)
+/// example: var k: CrKey32; cr_aead_keygen(&k); defer cr_wipe(&k.b[0], 32);
+export fn cr_wipe(buf: uint8*, n: int64) -> int32 {
+  if (n < 0) { return CR_E_ARG; }
+  if (n == 0) { return CR_OK; }
+  if (buf == 0) { return CR_E_ARG; }
+  // Every loop counts from 0 over its own base pointer (the optimizer's
+  // fill-loop pass mishandles volatile loops that start at a variable index).
+  var p: volatile uint8* = (volatile uint8*)buf;
+  // Bytes up to the next 8-byte boundary (at most n of them).
+  var head: int64 = ((int64)0 - (int64)((uint64)buf & (uint64)7)) & 7;
+  if (head > n) { head = n; }
+  var i: int64 = 0;
+  while (i < head) {
+    p[i] = 0;
+    i = i + 1;
+  }
+  // Whole words.
+  var words: int64 = (n - head) / 8;
+  if (words == 0 && head == n) { return CR_OK; }
+  var w: volatile uint64* = (volatile uint64*)&buf[head];
+  var j: int64 = 0;
+  while (j < words) {
+    w[j] = 0;
+    j = j + 1;
+  }
+  // Tail bytes.
+  var tail: int64 = n - head - words * 8;
+  if (tail == 0) { return CR_OK; }
+  var t: volatile uint8* = (volatile uint8*)&buf[head + words * 8];
+  var k: int64 = 0;
+  while (k < tail) {
+    t[k] = 0;
+    k = k + 1;
+  }
+  return CR_OK;
+}
+
+/// Checks in constant time whether all n bytes are zero: the time depends on
+/// n only, never on the contents. Use it on secrets (for example to reject
+/// an all-zero shared secret) instead of a loop with an early exit.
+/// in: buf readable for n bytes; n >= 0
+/// returns: true only if all n bytes are zero (also for n == 0); false
+///   otherwise, and false for invalid arguments (null buf with n > 0, n < 0)
+/// owns: nothing
+/// thread: any thread (no shared state)
+/// example: if (cr_is_zero(&shared.b[0], 32)) { reject(); }
+export fn cr_is_zero(buf: uint8*, n: int64) -> bool {
+  if (n < 0) { return false; }
+  if (n == 0) { return true; }
+  if (buf == 0) { return false; }
+  // volatile: every byte is read, so the loop cannot stop at the first
+  // non-zero byte.
+  var acc: volatile uint8 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    acc = acc | buf[i];
+    i = i + 1;
+  }
+  return acc == 0;
+}

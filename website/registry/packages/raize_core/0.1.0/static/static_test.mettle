@@ -1,0 +1,113 @@
+// raize/static/static_test — unit tests for the pure half of the file server.
+//
+//   ./mettle-build/bin/mettle test framework/static/static_test.mettle
+//
+// These run in the compile-time interpreter. They deliberately do not open a
+// file or a socket: mime mapping, path validation, containment, cache
+// metadata and If-None-Match parsing are pure functions, so they are provable
+// without a process. The file-reading half is proven over HTTP with curl (see
+// the run log in the final report).
+
+import "std/mem";
+import "../str/str";
+import "static";
+
+@test fn t_rz_static_mime() -> int32 {
+  if (!rz_str_eq(rz_static_mime("index.html"), RZ_STATIC_CT_HTML)) { return 1; }
+  if (!rz_str_eq(rz_static_mime("a/b.htm"), RZ_STATIC_CT_HTML)) { return 2; }
+  if (!rz_str_eq(rz_static_mime("site.css"), RZ_STATIC_CT_CSS)) { return 3; }
+  if (!rz_str_eq(rz_static_mime("app.js"), RZ_STATIC_CT_JS)) { return 4; }
+  if (!rz_str_eq(rz_static_mime("mod.mjs"), RZ_STATIC_CT_JS)) { return 5; }
+  if (!rz_str_eq(rz_static_mime("data.json"), RZ_STATIC_CT_JSON)) { return 6; }
+  if (!rz_str_eq(rz_static_mime("logo.svg"), RZ_STATIC_CT_SVG)) { return 7; }
+  if (!rz_str_eq(rz_static_mime("notes.txt"), RZ_STATIC_CT_TXT)) { return 8; }
+  if (!rz_str_eq(rz_static_mime("pic.png"), RZ_STATIC_CT_PNG)) { return 9; }
+  if (!rz_str_eq(rz_static_mime("photo.JPG"), RZ_STATIC_CT_JPG)) { return 10; }
+  if (!rz_str_eq(rz_static_mime("font.woff2"), RZ_STATIC_CT_WOFF2)) { return 11; }
+  if (!rz_str_eq(rz_static_mime("mod.wasm"), RZ_STATIC_CT_WASM)) { return 12; }
+  // unknown and missing extensions are octet-stream, never sniffed
+  if (!rz_str_eq(rz_static_mime("blob.bin"), RZ_STATIC_CT_OCTET)) { return 13; }
+  if (!rz_str_eq(rz_static_mime("noext"), RZ_STATIC_CT_OCTET)) { return 14; }
+  if (!rz_str_eq(rz_static_mime("archive.tar.gz"), RZ_STATIC_CT_OCTET)) { return 15; }
+  if (!rz_str_eq(rz_static_mime("trailing."), RZ_STATIC_CT_OCTET)) { return 16; }
+  // a dot in a directory name is not an extension
+  if (!rz_str_eq(rz_static_mime("v1.2/file"), RZ_STATIC_CT_OCTET)) { return 17; }
+  return 0;
+}
+
+@test fn t_rz_static_rel_ok() -> int32 {
+  if (!rz_static_rel_ok("a.txt")) { return 1; }
+  if (!rz_static_rel_ok("a/b/c.txt")) { return 2; }
+  if (!rz_static_rel_ok(".well-known/x")) { return 3; }
+  if (!rz_static_rel_ok("x..y")) { return 4; }        // only a whole segment counts
+  if (!rz_static_rel_ok("a b.txt")) { return 5; }
+  if (!rz_static_rel_ok("café.txt")) { return 6; }
+  if (rz_static_rel_ok("")) { return 7; }
+  if (rz_static_rel_ok("/abs")) { return 8; }
+  if (rz_static_rel_ok("../secret")) { return 9; }
+  if (rz_static_rel_ok("a/../b")) { return 10; }
+  if (rz_static_rel_ok("a/./b")) { return 11; }
+  if (rz_static_rel_ok("a//b")) { return 12; }
+  if (rz_static_rel_ok(".")) { return 13; }
+  if (rz_static_rel_ok("..")) { return 14; }
+  if (rz_static_rel_ok("a\\b")) { return 15; }
+  // NUL truncates a C path, so it is refused before the filesystem sees it
+  var nb: uint8[4];
+  nb[0] = 97;   // a
+  nb[1] = 0;
+  nb[2] = 98;   // b
+  if (rz_static_rel_ok(rz_str_view(&nb[0], 3))) { return 16; }
+  // length cap, not a growing buffer
+  var long: uint8[1025];
+  var i: int64 = 0;
+  while (i < 1025) { long[i] = 97; i = i + 1; }
+  if (rz_static_rel_ok(rz_str_view(&long[0], 1025))) { return 17; }
+  return 0;
+}
+
+@test fn t_rz_static_join_and_within() -> int32 {
+  var b: uint8[64];
+  var n: int64 = rz_static_join("/srv/www", "a/b.txt", &b[0], 64);
+  if (n != 16) { return 1; }
+  if (!rz_str_eq(rz_str_view(&b[0], n), "/srv/www/a/b.txt")) { return 2; }
+  n = rz_static_join("/", "x.txt", &b[0], 64);
+  if (!rz_str_eq(rz_str_view(&b[0], n), "/x.txt")) { return 3; }
+  if (rz_static_join("/srv/www", "a/b.txt", &b[0], 8) != -1) { return 4; }
+
+  if (!rz_static_within("/srv/www", "/srv/www/a.txt")) { return 5; }
+  if (!rz_static_within("/srv/www", "/srv/www/sub/a.txt")) { return 6; }
+  if (rz_static_within("/srv/www", "/srv/www")) { return 7; }          // directory
+  if (rz_static_within("/srv/www", "/srv/wwwx/a")) { return 8; }       // prefix, not child
+  if (rz_static_within("/srv/www", "/etc/passwd")) { return 9; }
+  if (rz_static_within("/srv/www", "/srv")) { return 10; }
+  if (!rz_static_within("/", "/etc/passwd")) { return 11; }
+  if (rz_static_within("/", "/")) { return 12; }
+  return 0;
+}
+
+@test fn t_rz_static_etag_and_match() -> int32 {
+  var b: uint8[96];
+  var e: string = rz_static_etag(5, (uint64)48879, &b[0], 96);
+  if (!rz_str_eq(e, "\"5-beef\"")) { return 1; }
+  if (!rz_static_etag_match(e, e)) { return 2; }
+  if (!rz_static_etag_match("W/\"5-beef\"", e)) { return 3; }
+  if (!rz_static_etag_match("\"other\", \"5-beef\"", e)) { return 4; }
+  if (!rz_static_etag_match(" * ", e)) { return 5; }
+  if (rz_static_etag_match("\"other\"", e)) { return 6; }
+  if (rz_static_etag_match("", e)) { return 7; }
+  if (rz_static_etag_match("W/", e)) { return 8; }
+  // 304 only when the tag really matches: a partial tag is not a match
+  if (rz_static_etag_match("\"5-bee\"", e)) { return 9; }
+  // size and hash both participate, so a same-size edit changes the tag
+  var b2: uint8[96];
+  if (rz_str_eq(rz_static_etag(5, (uint64)48880, &b2[0], 96), e)) { return 10; }
+  return 0;
+}
+
+@test fn t_rz_static_cache_control() -> int32 {
+  var b: uint8[64];
+  if (!rz_str_eq(rz_static_cache_control(60, &b[0], 64), "public, max-age=60")) { return 1; }
+  if (!rz_str_eq(rz_static_cache_control(0, &b[0], 64), "public, max-age=0")) { return 2; }
+  if (rz_static_cache_control(60, &b[0], 8).length != 0) { return 3; }
+  return 0;
+}

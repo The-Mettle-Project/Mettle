@@ -1,0 +1,268 @@
+// EtchImage: a block of pixels with a width, a height, a row stride and a
+// pixel format. Rows run top to bottom. 16-bit channels are uint16 in the
+// machine's byte order and float channels are float32.
+//
+//   var img: EtchImage;
+//   etch_image_new(&img, 640, 480, ETCH_RGBA8);
+//   uint8* row = img.data + y * img.stride
+//   etch_image_free(&img);
+//
+// An image made with etch_image_new owns its memory. One made with
+// etch_image_view points into another and must not outlive it.
+
+import "std/mem";
+import "status";
+
+// Pixel formats. The low three bits are the channel count (1 gray,
+// 2 gray+alpha, 3 RGB, 4 RGBA). The next bits say the channel type.
+export const ETCH_GRAY8: int32 = 1;
+export const ETCH_GA8: int32 = 2;
+export const ETCH_RGB8: int32 = 3;
+export const ETCH_RGBA8: int32 = 4;
+export const ETCH_GRAY16: int32 = 17;
+export const ETCH_GA16: int32 = 18;
+export const ETCH_RGB16: int32 = 19;
+export const ETCH_RGBA16: int32 = 20;
+export const ETCH_GRAYF: int32 = 33;
+export const ETCH_GAF: int32 = 34;
+export const ETCH_RGBF: int32 = 35;
+export const ETCH_RGBAF: int32 = 36;
+
+// Channel types, from etch_format_kind.
+export const ETCH_U8: int32 = 0;
+export const ETCH_U16: int32 = 1;
+export const ETCH_F32: int32 = 2;
+
+export struct EtchImage {
+  width: int32;
+  height: int32;
+  format: int32;
+  stride: int64;    // bytes from one row to the next
+  data: uint8*;
+  owned: bool;      // true when etch_image_free should free data
+}
+
+/// Size and memory limits for decoders. A zero field means "no limit".
+export struct EtchLimits {
+  max_width: int32;
+  max_height: int32;
+  max_pixels: int64;   // width * height
+  max_bytes: int64;    // memory for one decoded image or frame
+}
+
+/// Options for decoders. Pass 0 for the defaults.
+export struct EtchOpts {
+  limits: EtchLimits;
+  want: int32;         // convert to this format; 0 keeps the file's own
+}
+
+/// True when fmt is one of the ETCH_* pixel formats.
+export fn etch_format_ok(fmt: int32) -> bool {
+  var c: int32 = fmt & 7;
+  var k: int32 = fmt >> 4;
+  return c >= 1 && c <= 4 && k >= 0 && k <= 2 && (fmt & 8) == 0;
+}
+
+/// Channels per pixel: 1 to 4.
+export fn etch_format_channels(fmt: int32) -> int32 { return fmt & 7; }
+
+/// The channel type: ETCH_U8, ETCH_U16 or ETCH_F32.
+export fn etch_format_kind(fmt: int32) -> int32 { return fmt >> 4; }
+
+/// Bytes per channel: 1, 2 or 4.
+export fn etch_format_depth(fmt: int32) -> int32 {
+  var k: int32 = fmt >> 4;
+  if (k == 0) { return 1; }
+  if (k == 1) { return 2; }
+  return 4;
+}
+
+/// Bytes per pixel.
+export fn etch_format_bpp(fmt: int32) -> int32 {
+  return etch_format_channels(fmt) * etch_format_depth(fmt);
+}
+
+/// True when the format has an alpha channel.
+export fn etch_format_has_alpha(fmt: int32) -> bool {
+  var c: int32 = fmt & 7;
+  return c == 2 || c == 4;
+}
+
+/// The format with the given channel count and channel type.
+export fn etch_format_make(channels: int32, kind: int32) -> int32 {
+  return (kind << 4) | channels;
+}
+
+/// A short name such as "rgba8".
+export fn etch_format_name(fmt: int32) -> string {
+  switch (fmt) {
+    case 1: { return "gray8"; }
+    case 2: { return "ga8"; }
+    case 3: { return "rgb8"; }
+    case 4: { return "rgba8"; }
+    case 17: { return "gray16"; }
+    case 18: { return "ga16"; }
+    case 19: { return "rgb16"; }
+    case 20: { return "rgba16"; }
+    case 33: { return "grayf"; }
+    case 34: { return "gaf"; }
+    case 35: { return "rgbf"; }
+    case 36: { return "rgbaf"; }
+    default: { }
+  }
+  return "invalid";
+}
+
+var g_etch_limits: EtchLimits = { max_width: 65535, max_height: 65535, max_pixels: 268435456, max_bytes: 1073741824 };
+
+/// The limits decoders use when they get no options: 65535 pixels a side,
+/// 2^28 pixels and 1 GiB per image.
+export fn etch_default_limits() -> EtchLimits { return g_etch_limits; }
+
+/// Changes the default limits for every later call that passes no options.
+export fn etch_set_default_limits(l: EtchLimits) { g_etch_limits = l; }
+
+/// Fills opts with the defaults.
+export fn etch_opts_init(o: EtchOpts*) {
+  o->limits = g_etch_limits;
+  o->want = 0;
+}
+
+/// Checks a size against limits. Returns ETCH_OK, ETCH_E_DATA for a zero or
+/// negative size, or ETCH_E_LIMIT.
+export fn etch_check_size(w: int64, h: int64, fmt: int32, l: EtchLimits*) -> int32 {
+  if (w <= 0 || h <= 0) { return ETCH_E_DATA; }
+  if (w > 1073741823 || h > 1073741823) { return ETCH_E_LIMIT; }
+  if (l != 0) {
+    if (l->max_width > 0 && w > (int64)l->max_width) { return ETCH_E_LIMIT; }
+    if (l->max_height > 0 && h > (int64)l->max_height) { return ETCH_E_LIMIT; }
+    if (l->max_pixels > 0 && w * h > l->max_pixels) { return ETCH_E_LIMIT; }
+    var bytes: int64 = w * h * (int64)etch_format_bpp(fmt);
+    if (l->max_bytes > 0 && bytes > l->max_bytes) { return ETCH_E_LIMIT; }
+  }
+  return ETCH_OK;
+}
+
+/// The limits in opts, or the defaults when opts is 0.
+export fn etch_opts_limits(o: EtchOpts*) -> EtchLimits* {
+  if (o == 0) { return &g_etch_limits; }
+  return &o->limits;
+}
+
+/// Makes a new image with zeroed pixels and tightly packed rows.
+export fn etch_image_new(img: EtchImage*, w: int32, h: int32, fmt: int32) -> int32 {
+  if (img == 0 || !etch_format_ok(fmt) || w <= 0 || h <= 0) { return ETCH_E_ARG; }
+  img->data = (uint8*)0;
+  img->owned = false;
+  var stride: int64 = (int64)w * (int64)etch_format_bpp(fmt);
+  var bytes: int64 = stride * (int64)h;
+  var p: uint8* = (uint8*)calloc(bytes, 1);
+  if (p == 0) { return ETCH_E_MEM; }
+  img->width = w;
+  img->height = h;
+  img->format = fmt;
+  img->stride = stride;
+  img->data = p;
+  img->owned = true;
+  return ETCH_OK;
+}
+
+/// Like etch_image_new, but leaves the pixels unset (faster for decoders
+/// that write every byte).
+export fn etch_image_alloc(img: EtchImage*, w: int32, h: int32, fmt: int32) -> int32 {
+  if (img == 0 || !etch_format_ok(fmt) || w <= 0 || h <= 0) { return ETCH_E_ARG; }
+  img->data = (uint8*)0;
+  img->owned = false;
+  var stride: int64 = (int64)w * (int64)etch_format_bpp(fmt);
+  var p: uint8* = (uint8*)malloc(stride * (int64)h);
+  if (p == 0) { return ETCH_E_MEM; }
+  img->width = w;
+  img->height = h;
+  img->format = fmt;
+  img->stride = stride;
+  img->data = p;
+  img->owned = true;
+  return ETCH_OK;
+}
+
+/// Wraps memory you own as an image. Etch never frees it.
+export fn etch_image_wrap(img: EtchImage*, data: uint8*, w: int32, h: int32, fmt: int32, stride: int64) -> int32 {
+  if (img == 0 || data == 0 || !etch_format_ok(fmt) || w <= 0 || h <= 0) { return ETCH_E_ARG; }
+  var minstride: int64 = (int64)w * (int64)etch_format_bpp(fmt);
+  if (stride == 0) { stride = minstride; }
+  if (stride < minstride) { return ETCH_E_ARG; }
+  img->width = w;
+  img->height = h;
+  img->format = fmt;
+  img->stride = stride;
+  img->data = data;
+  img->owned = false;
+  return ETCH_OK;
+}
+
+/// Frees an image's memory if it owns it, and empties it.
+export fn etch_image_free(img: EtchImage*) {
+  if (img == 0) { return; }
+  if (img->owned && img->data != 0) { free(img->data); }
+  img->data = (uint8*)0;
+  img->owned = false;
+  img->width = 0;
+  img->height = 0;
+  img->stride = 0;
+}
+
+/// Makes `out` a view of the rectangle x, y, w, h inside `src`, sharing its
+/// memory (a crop with no copy). The rectangle is clipped to the image.
+export fn etch_image_view(src: EtchImage*, x: int32, y: int32, w: int32, h: int32, out: EtchImage*) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0) { return ETCH_E_ARG; }
+  var x0: int32 = x;
+  var y0: int32 = y;
+  var x1: int32 = x + w;
+  var y1: int32 = y + h;
+  if (x0 < 0) { x0 = 0; }
+  if (y0 < 0) { y0 = 0; }
+  if (x1 > src->width) { x1 = src->width; }
+  if (y1 > src->height) { y1 = src->height; }
+  if (x1 <= x0 || y1 <= y0) { return ETCH_E_ARG; }
+  var bpp: int64 = (int64)etch_format_bpp(src->format);
+  out->width = x1 - x0;
+  out->height = y1 - y0;
+  out->format = src->format;
+  out->stride = src->stride;
+  out->data = src->data + (int64)y0 * src->stride + (int64)x0 * bpp;
+  out->owned = false;
+  return ETCH_OK;
+}
+
+/// Makes an owned, tightly packed copy of an image (or of a view).
+export fn etch_image_copy(src: EtchImage*, out: EtchImage*) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0) { return ETCH_E_ARG; }
+  var tmp: EtchImage;
+  var rc: int32 = etch_image_alloc(&tmp, src->width, src->height, src->format);
+  if (rc != ETCH_OK) { return rc; }
+  for y in 0..src->height {
+    memcpy(tmp.data + (int64)y * tmp.stride, src->data + (int64)y * src->stride, tmp.stride);
+  }
+  *out = tmp;
+  return ETCH_OK;
+}
+
+/// Address of pixel x, y. No bounds check.
+export fn etch_pixel(img: EtchImage*, x: int32, y: int32) -> uint8* {
+  return img->data + (int64)y * img->stride + (int64)x * (int64)etch_format_bpp(img->format);
+}
+
+/// Bytes in one tightly packed row.
+export fn etch_image_row_bytes(img: EtchImage*) -> int64 {
+  return (int64)img->width * (int64)etch_format_bpp(img->format);
+}
+
+/// True when two images have the same size, format and pixel bytes.
+export fn etch_image_equal(a: EtchImage*, b: EtchImage*) -> bool {
+  if (a->width != b->width || a->height != b->height || a->format != b->format) { return false; }
+  var rb: int64 = etch_image_row_bytes(a);
+  for y in 0..a->height {
+    if (memcmp(a->data + (int64)y * a->stride, b->data + (int64)y * b->stride, rb) != 0) { return false; }
+  }
+  return true;
+}

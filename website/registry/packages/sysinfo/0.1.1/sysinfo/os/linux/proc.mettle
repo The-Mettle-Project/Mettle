@@ -1,0 +1,470 @@
+// Processes: one pass over /proc/<pid>/ per refresh (proc(5)).
+//   stat:    name, state, ppid, times, priority, nice, threads, start, sizes
+//   statm:   shared pages (only with SYSINFO_PROC_SHARED)
+//   status:  real uid and gid (read once per process)
+//   cmdline, exe: read once per process, as btop and Rust's sysinfo do
+//   io, fd/: only with SYSINFO_PROC_IO and SYSINFO_PROC_FILES
+// A process is the same one between refreshes when both its pid and its
+// start time match, so a reused pid is never mixed up with the old one.
+// User and group names come from /etc/passwd and /etc/group.
+import "std/mem";
+import "std/fs";
+import "std/time";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+
+struct SysinfoLxIdName { id: int32; name: string; }
+
+// What is kept per process for rates.
+struct SysinfoLxProcPrev { ticks: int64; io_r: int64; io_w: int64; }
+
+export struct SysinfoLxProc {
+  pools: SysinfoLxPools;
+  perm: SysinfoLxPool;
+  a: SysinfoProc*;           // the two lists, used in turn
+  b: SysinfoProc*;
+  a_cap: int32;
+  b_cap: int32;
+  pa: SysinfoLxProcPrev*;    // rate data, parallel to a and b
+  pb: SysinfoLxProcPrev*;
+  pa_cap: int32;
+  pb_cap: int32;
+  flip: int32;
+  prev: SysinfoProc*;
+  prev_rate: SysinfoLxProcPrev*;
+  n_prev: int32;
+  prev_ns: int64;
+  users: SysinfoLxIdName*;
+  n_users: int32;
+  groups: SysinfoLxIdName*;
+  n_groups: int32;
+  want_io: bool;
+  want_files: bool;
+  want_shared: bool;
+}
+
+// ---- users and groups ------------------------------------------------------
+
+// Parses passwd or group text (name:x:id:...) into a table sorted by id.
+fn sysinfo_lx_load_ids(pool: SysinfoLxPool*, text: string, n_out: int32*) -> SysinfoLxIdName* {
+  var cap: int32 = 0;
+  var list: SysinfoLxIdName* = (SysinfoLxIdName*)0;
+  var n: int32 = 0;
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  while (!sysinfo_lx_end(&s)) {
+    var line: string = sysinfo_lx_line(&s);
+    var f0: int64 = -1;
+    var f1: int64 = -1;
+    var f2: int64 = -1;
+    for k in 0..line.length {
+      if (line[k] == ':') {
+        if (f0 < 0) { f0 = (int64)k; } else if (f1 < 0) { f1 = (int64)k; } else if (f2 < 0) { f2 = (int64)k; }
+      }
+    }
+    if (f2 < 0 || f0 <= 0 || line[0] == '#') { continue; }
+    var ok: bool = false;
+    var id: int64 = sysinfo_lx_parse_i64(line.chars + f1 + 1, f2 - f1 - 1, &ok);
+    if (!ok || id < 0) { continue; }
+    list = (SysinfoLxIdName*)sysinfo_lx_grow((uint8*)list, &cap, n + 1, sizeof(SysinfoLxIdName));
+    // insertion keeps the table sorted; the first entry for an id wins
+    var at: int32 = n;
+    while (at > 0 && list[at - 1].id > (int32)id) { at = at - 1; }
+    if (at > 0 && list[at - 1].id == (int32)id) { continue; }
+    var j: int32 = n;
+    while (j > at) { list[j] = list[j - 1]; j = j - 1; }
+    list[at].id = (int32)id;
+    list[at].name = sysinfo_lx_pool_add_bytes(pool, line.chars, f0);
+    n = n + 1;
+  }
+  *n_out = n;
+  return list;
+}
+
+fn sysinfo_lx_id_name(list: SysinfoLxIdName*, n: int32, id: int32) -> string {
+  var lo: int32 = 0;
+  var hi: int32 = n - 1;
+  while (lo <= hi) {
+    var mid: int32 = (lo + hi) / 2;
+    if (list[mid].id == id) { return list[mid].name; }
+    if (list[mid].id < id) { lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return sysinfo_lx_view((uint8*)0, 0);
+}
+
+fn sysinfo_lx_name_or_num(pool: SysinfoLxPool*, list: SysinfoLxIdName*, n: int32, id: int32) -> string {
+  var name: string = sysinfo_lx_id_name(list, n, id);
+  if (name.length > (uint64)0) { return sysinfo_lx_pool_add(pool, name); }
+  var tmp: uint8[24];
+  var k: int64 = sysinfo_lx_fmt_i64(&tmp[0], (int64)id);
+  return sysinfo_lx_pool_add_bytes(pool, &tmp[0], k);
+}
+
+// ---- parsing ---------------------------------------------------------------
+
+// Parses /proc/<pid>/stat text. The name sits in parentheses and may hold
+// spaces or ')' itself, so the fields start after the last ')'.
+// Returns false when the text is not a stat line.
+export fn sysinfo_lx_parse_pid_stat(text: string, p: SysinfoProc*, name: string*, ticks: int64*, page: int64) -> bool {
+  var n: int64 = (int64)text.length;
+  var open: int64 = -1;
+  var close: int64 = -1;
+  for k in 0..n {
+    if (open < 0 && text[k] == '(') { open = (int64)k; }
+    if (text[k] == ')') { close = (int64)k; }
+  }
+  if (open < 0 || close < open) { return false; }
+  *name = sysinfo_lx_view(text.chars + open + 1, close - open - 1);
+  var s: SysinfoLxScan = sysinfo_lx_scan(text.chars + close + 1, n - close - 1);
+  sysinfo_lx_skip(&s);
+  if (sysinfo_lx_end(&s)) { return false; }
+  p->state = s.p[s.i];
+  s.i = s.i + 1;
+  p->ppid = (int32)sysinfo_lx_i64(&s);   // 4
+  for k in 0..9 { sysinfo_lx_i64(&s); }   // 5..13: pgrp .. cmajflt
+  var ut: int64 = sysinfo_lx_i64(&s);     // 14
+  var stt: int64 = sysinfo_lx_i64(&s);    // 15
+  sysinfo_lx_i64(&s);                     // 16 cutime
+  sysinfo_lx_i64(&s);                     // 17 cstime
+  p->priority = (int32)sysinfo_lx_i64(&s);  // 18
+  p->nice = (int32)sysinfo_lx_i64(&s);      // 19
+  p->threads = (int32)sysinfo_lx_i64(&s);   // 20
+  sysinfo_lx_i64(&s);                       // 21 itrealvalue
+  p->start_ticks = sysinfo_lx_i64(&s);      // 22
+  p->vms = sysinfo_lx_i64(&s);              // 23 bytes
+  p->rss = sysinfo_lx_i64(&s) * page;       // 24 pages
+  *ticks = ut + stt;
+  p->utime_s = (float64)ut;
+  p->stime_s = (float64)stt;
+  return true;
+}
+
+// Real uid and gid from /proc/<pid>/status text.
+export fn sysinfo_lx_parse_pid_status(text: string, uid: int32*, gid: int32*) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, "Uid:")) { s.i = s.i + 4; *uid = (int32)sysinfo_lx_i64(&s); }
+    else if (sysinfo_lx_at(&s, "Gid:")) { s.i = s.i + 4; *gid = (int32)sysinfo_lx_i64(&s); return; }
+    sysinfo_lx_next_line(&s);
+  }
+}
+
+// Storage bytes from /proc/<pid>/io text.
+export fn sysinfo_lx_parse_pid_io(text: string, r: int64*, w: int64*) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, "read_bytes:")) { s.i = s.i + 11; *r = sysinfo_lx_i64(&s); }
+    else if (sysinfo_lx_at(&s, "write_bytes:")) { s.i = s.i + 12; *w = sysinfo_lx_i64(&s); }
+    sysinfo_lx_next_line(&s);
+  }
+}
+
+// Turns cmdline's NUL separators into spaces and drops the trailing ones.
+export fn sysinfo_lx_cmdline(p: uint8*, n: int64) -> int64 {
+  var len: int64 = n;
+  while (len > 0 && p[len - 1] == (uint8)0) { len = len - 1; }
+  for k in 0..len { if (p[k] == (uint8)0) { p[k] = (uint8)32; } }
+  return len;
+}
+
+// The kernel cuts names at 15 bytes. When the first argument's base name
+// starts with the cut name, that longer name is the real one (psutil's rule).
+fn sysinfo_lx_long_name(name: string, cmd: string) -> string {
+  if (name.length < (uint64)15) { return name; }
+  var end: int64 = 0;
+  var n: int64 = (int64)cmd.length;
+  while (end < n && cmd[end] != ' ') { end = end + 1; }
+  var arg0: string = sysinfo_lx_base(sysinfo_lx_view(cmd.chars, end));
+  if (arg0.length > name.length && sysinfo_lx_starts(arg0, name)) { return arg0; }
+  return name;
+}
+
+// ---- the list --------------------------------------------------------------
+
+fn sysinfo_lx_proc_find(list: SysinfoProc*, n: int32, pid: int32) -> int32 {
+  var lo: int32 = 0;
+  var hi: int32 = n - 1;
+  while (lo <= hi) {
+    var mid: int32 = (lo + hi) / 2;
+    if (list[mid].pid == pid) { return mid; }
+    if (list[mid].pid < pid) { lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return -1;
+}
+
+fn sysinfo_lx_proc_lists(st: SysinfoLxProc*, need: int32) {
+  if (st->flip == 0) {
+    var c: int32 = st->a_cap;
+    st->a = (SysinfoProc*)sysinfo_lx_grow((uint8*)st->a, &c, need, sizeof(SysinfoProc));
+    st->a_cap = c;
+    c = st->pa_cap;
+    st->pa = (SysinfoLxProcPrev*)sysinfo_lx_grow((uint8*)st->pa, &c, need, sizeof(SysinfoLxProcPrev));
+    st->pa_cap = c;
+  } else {
+    var c: int32 = st->b_cap;
+    st->b = (SysinfoProc*)sysinfo_lx_grow((uint8*)st->b, &c, need, sizeof(SysinfoProc));
+    st->b_cap = c;
+    c = st->pb_cap;
+    st->pb = (SysinfoLxProcPrev*)sysinfo_lx_grow((uint8*)st->pb, &c, need, sizeof(SysinfoLxProcPrev));
+    st->pb_cap = c;
+  }
+}
+
+fn sysinfo_lx_proc_cur(st: SysinfoLxProc*) -> SysinfoProc* {
+  if (st->flip == 0) { return st->a; }
+  return st->b;
+}
+
+fn sysinfo_lx_proc_cur_rate(st: SysinfoLxProc*) -> SysinfoLxProcPrev* {
+  if (st->flip == 0) { return st->pa; }
+  return st->pb;
+}
+
+// Sorts the new list by pid. /proc lists in pid order, so this is
+// usually a single pass.
+fn sysinfo_lx_proc_sort(list: SysinfoProc*, rate: SysinfoLxProcPrev*, n: int32) {
+  for i in 1..n {
+    if (list[i - 1].pid <= list[i].pid) { continue; }
+    var tp: SysinfoProc = list[i];
+    var tr: SysinfoLxProcPrev = rate[i];
+    var j: int32 = i;
+    while (j > 0 && list[j - 1].pid > tp.pid) {
+      list[j] = list[j - 1];
+      rate[j] = rate[j - 1];
+      j = j - 1;
+    }
+    list[j] = tp;
+    rate[j] = tr;
+  }
+}
+
+// Reads one process. Returns false when it is gone or unreadable.
+fn sysinfo_lx_proc_read(st: SysinfoLxProc*, c: SysinfoLxCtx*, pool: SysinfoLxPool*, pid: int32,
+                        p: SysinfoProc*, rate: SysinfoLxProcPrev*, secs: float64) -> bool {
+  var path: SysinfoLxPath;
+  sysinfo_lx_path_at(&path, c->root, "/proc/");
+  sysinfo_lx_path_num(&path, (int64)pid);
+  var base: int64 = path.n;
+  sysinfo_lx_path_add(&path, "/stat");
+  var n: int64 = sysinfo_lx_slurp(sysinfo_lx_path_str(&path), &c->buf);
+  if (n <= 0) { return false; }
+  var blank: SysinfoProc;
+  *p = blank;
+  p->pid = pid;
+  var name: string;
+  var ticks: int64 = 0;
+  if (!sysinfo_lx_parse_pid_stat(sysinfo_lx_view(c->buf.p, n), p, &name, &ticks, c->page_size)) { return false; }
+  var tck: float64 = (float64)c->clk_tck;
+  p->utime_s = p->utime_s / tck;
+  p->stime_s = p->stime_s / tck;
+  p->start_time = c->boot_time + p->start_ticks / c->clk_tck;
+  rate->ticks = ticks;
+  rate->io_r = -1;
+  rate->io_w = -1;
+  p->io_read_bytes = -1;
+  p->io_write_bytes = -1;
+  p->io_read_bps = -1.0;
+  p->io_write_bps = -1.0;
+  p->open_files = -1;
+  p->parent = -1;
+  p->first_child = -1;
+  p->next_sibling = -1;
+  // the same process as last time?
+  var old: SysinfoProc* = (SysinfoProc*)0;
+  var old_rate: SysinfoLxProcPrev* = (SysinfoLxProcPrev*)0;
+  var k: int32 = sysinfo_lx_proc_find(st->prev, st->n_prev, pid);
+  if (k >= 0 && st->prev[k].start_ticks == p->start_ticks) {
+    old = &st->prev[k];
+    old_rate = &st->prev_rate[k];
+  }
+  if (old != 0) {
+    p->cmdline = sysinfo_lx_pool_add(pool, old->cmdline);
+    p->exe = sysinfo_lx_pool_add(pool, old->exe);
+    p->uid = old->uid;
+    p->gid = old->gid;
+    p->user = sysinfo_lx_pool_add(pool, old->user);
+    p->group = sysinfo_lx_pool_add(pool, old->group);
+    if (secs > 0.0 && ticks >= old_rate->ticks) {
+      p->cpu_pct = (float64)(ticks - old_rate->ticks) / tck / secs * 100.0;
+    }
+  } else {
+    p->uid = -1;
+    p->gid = -1;
+    path.n = base;
+    sysinfo_lx_path_add(&path, "/status");
+    var m: int64 = sysinfo_lx_slurp(sysinfo_lx_path_str(&path), &c->buf2);
+    if (m > 0) { sysinfo_lx_parse_pid_status(sysinfo_lx_view(c->buf2.p, m), &p->uid, &p->gid); }
+    if (p->uid >= 0) { p->user = sysinfo_lx_name_or_num(pool, st->users, st->n_users, p->uid); }
+    if (p->gid >= 0) { p->group = sysinfo_lx_name_or_num(pool, st->groups, st->n_groups, p->gid); }
+    path.n = base;
+    sysinfo_lx_path_add(&path, "/cmdline");
+    m = sysinfo_lx_slurp(sysinfo_lx_path_str(&path), &c->buf2);
+    if (m > 0) {
+      m = sysinfo_lx_cmdline(c->buf2.p, m);
+      p->cmdline = sysinfo_lx_pool_add_bytes(pool, c->buf2.p, m);
+    }
+    path.n = base;
+    sysinfo_lx_path_add(&path, "/exe");
+    var link: uint8[4096];
+    m = fs_readlink(sysinfo_lx_path_str(&path), &link[0], 4096);
+    if (m > 0) { p->exe = sysinfo_lx_pool_add_bytes(pool, &link[0], m); }
+  }
+  p->name = sysinfo_lx_pool_add(pool, sysinfo_lx_long_name(name, p->cmdline));
+  if (c->ncpu > 0) { p->cpu_total_pct = p->cpu_pct / (float64)c->ncpu; }
+  if (c->mem_total > 0) { p->mem_pct = (float64)p->rss * 100.0 / (float64)c->mem_total; }
+  // shared pages, only when asked for: statm is one more file per process
+  p->shared = -1;
+  var m2: int64 = 0;
+  var tmp: uint8[128];
+  if (st->want_shared) {
+    path.n = base;
+    sysinfo_lx_path_add(&path, "/statm");
+    m2 = sysinfo_lx_read_small(sysinfo_lx_path_str(&path), &tmp[0], 128);
+  }
+  if (m2 > 0) {
+    var s: SysinfoLxScan = sysinfo_lx_scan(&tmp[0], m2);
+    sysinfo_lx_u64(&s);
+    sysinfo_lx_u64(&s);
+    p->shared = (int64)sysinfo_lx_u64(&s) * c->page_size;
+  }
+  if (st->want_io) {
+    path.n = base;
+    sysinfo_lx_path_add(&path, "/io");
+    var m: int64 = sysinfo_lx_slurp(sysinfo_lx_path_str(&path), &c->buf2);
+    if (m > 0) {
+      sysinfo_lx_parse_pid_io(sysinfo_lx_view(c->buf2.p, m), &p->io_read_bytes, &p->io_write_bytes);
+      rate->io_r = p->io_read_bytes;
+      rate->io_w = p->io_write_bytes;
+      if (old != 0 && old_rate->io_r >= 0) {
+        p->io_read_bps = sysinfo_lx_rate(p->io_read_bytes, old_rate->io_r, secs);
+        p->io_write_bps = sysinfo_lx_rate(p->io_write_bytes, old_rate->io_w, secs);
+      } else {
+        p->io_read_bps = 0.0;
+        p->io_write_bps = 0.0;
+      }
+    }
+  }
+  if (st->want_files) {
+    path.n = base;
+    sysinfo_lx_path_add(&path, "/fd");
+    var d: FsDir;
+    var e: FsDirEntry;
+    if (fs_dir_open(sysinfo_lx_path_str(&path), &d) == 0) {
+      var count: int32 = 0;
+      while (fs_dir_next(&d, &e) == 1) { count = count + 1; }
+      fs_dir_close(&d);
+      p->open_files = count;
+    }
+  }
+  return true;
+}
+
+// Links each process to its parent, first child and next sibling.
+export fn sysinfo_lx_proc_tree(list: SysinfoProc*, n: int32) {
+  for i in 0..n {
+    list[i].parent = -1;
+    list[i].first_child = -1;
+    list[i].next_sibling = -1;
+  }
+  var i: int32 = n - 1;
+  while (i >= 0) {
+    var q: SysinfoProc* = &list[i];
+    if (q->ppid > 0 && q->ppid != q->pid) {
+      var at: int32 = sysinfo_lx_proc_find(list, n, q->ppid);
+      if (at >= 0) {
+        q->parent = at;
+        q->next_sibling = list[at].first_child;
+        list[at].first_child = i;
+      }
+    }
+    i = i - 1;
+  }
+}
+
+export fn sysinfo_lx_proc_init(st: SysinfoLxProc*, c: SysinfoLxCtx*, out: SysinfoProcs*, what: uint32) -> int32 {
+  var p: SysinfoLxPath;
+  var n: int64 = sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/etc/passwd"), &c->buf);
+  if (n > 0) { st->users = sysinfo_lx_load_ids(&st->perm, sysinfo_lx_view(c->buf.p, n), &st->n_users); }
+  n = sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/etc/group"), &c->buf);
+  if (n > 0) { st->groups = sysinfo_lx_load_ids(&st->perm, sysinfo_lx_view(c->buf.p, n), &st->n_groups); }
+  st->want_io = (what & (uint32)SYSINFO_PROC_IO) != (uint32)0;
+  st->want_files = (what & (uint32)SYSINFO_PROC_FILES) != (uint32)0;
+  st->want_shared = (what & (uint32)SYSINFO_PROC_SHARED) != (uint32)0;
+  return SYSINFO_OK;
+}
+
+// Turns the extras on or off.
+export fn sysinfo_lx_proc_extras(st: SysinfoLxProc*, what: uint32) {
+  if ((what & (uint32)SYSINFO_PROC_IO) != (uint32)0) { st->want_io = true; }
+  if ((what & (uint32)SYSINFO_PROC_FILES) != (uint32)0) { st->want_files = true; }
+  if ((what & (uint32)SYSINFO_PROC_SHARED) != (uint32)0) { st->want_shared = true; }
+}
+
+export fn sysinfo_lx_proc_refresh(st: SysinfoLxProc*, c: SysinfoLxCtx*, out: SysinfoProcs*) -> int32 {
+  var dir: SysinfoLxPath;
+  sysinfo_lx_path_at(&dir, c->root, "/proc");
+  var d: FsDir;
+  var e: FsDirEntry;
+  if (fs_dir_open(sysinfo_lx_path_str(&dir), &d) != 0) {
+    out->status = SYSINFO_E_IO;
+    return SYSINFO_E_IO;
+  }
+  var t: int64 = time_mono_ns();
+  var secs: float64 = 0.0;
+  if (st->prev_ns > 0) { secs = (float64)(t - st->prev_ns) / 1000000000.0; }
+  st->prev_ns = t;
+  var pool: SysinfoLxPool* = sysinfo_lx_pools_next(&st->pools);
+  st->flip = 1 - st->flip;
+  var n: int32 = 0;
+  while (fs_dir_next(&d, &e) == 1) {
+    if (e.kind != FS_DIR || !sysinfo_lx_all_digits(e.name)) { continue; }
+    var ok: bool = false;
+    var pid: int64 = sysinfo_lx_parse_i64(e.name.chars, (int64)e.name.length, &ok);
+    if (!ok || pid <= 0 || pid > 2147483647) { continue; }
+    sysinfo_lx_proc_lists(st, n + 1);
+    var list: SysinfoProc* = sysinfo_lx_proc_cur(st);
+    var rate: SysinfoLxProcPrev* = sysinfo_lx_proc_cur_rate(st);
+    if (sysinfo_lx_proc_read(st, c, pool, (int32)pid, &list[n], &rate[n], secs)) { n = n + 1; }
+  }
+  fs_dir_close(&d);
+  sysinfo_lx_proc_lists(st, n + 1);
+  var list: SysinfoProc* = sysinfo_lx_proc_cur(st);
+  var rate: SysinfoLxProcPrev* = sysinfo_lx_proc_cur_rate(st);
+  sysinfo_lx_proc_sort(list, rate, n);
+  sysinfo_lx_proc_tree(list, n);
+  var threads: int32 = 0;
+  var running: int32 = 0;
+  var sleeping: int32 = 0;
+  var zombies: int32 = 0;
+  for i in 0..n {
+    threads = threads + list[i].threads;
+    var sc: uint8 = list[i].state;
+    if (sc == (uint8)82) { running = running + 1; }
+    else if (sc == (uint8)83 || sc == (uint8)68 || sc == (uint8)73) { sleeping = sleeping + 1; }
+    else if (sc == (uint8)90) { zombies = zombies + 1; }
+  }
+  out->list = list;
+  out->n = n;
+  out->threads = threads;
+  out->running = running;
+  out->sleeping = sleeping;
+  out->zombies = zombies;
+  st->prev = list;
+  st->prev_rate = rate;
+  st->n_prev = n;
+  out->status = SYSINFO_OK;
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_proc_free(st: SysinfoLxProc*, out: SysinfoProcs*) {
+  sysinfo_lx_pools_free(&st->pools);
+  sysinfo_lx_pool_free(&st->perm);
+  if (st->a != 0) { free(st->a); }
+  if (st->b != 0) { free(st->b); }
+  if (st->pa != 0) { free(st->pa); }
+  if (st->pb != 0) { free(st->pb); }
+  if (st->users != 0) { free(st->users); }
+  if (st->groups != 0) { free(st->groups); }
+  out->list = (SysinfoProc*)0;
+  out->n = 0;
+}

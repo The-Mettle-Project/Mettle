@@ -1,0 +1,172 @@
+// raize/signal/render — a rendered tree as HTML, as JSON, and as a diff.
+//
+//   rz_html_render  flatten to HTML (the first, plain-HTTP response)
+//   rz_html_json    Phoenix's "rendered" JSON: {"s": [statics], "0": ..., }
+//                   a comprehension is {"s": [body statics], "d": [[...], ...]}
+//   rz_html_diff    only what changed between two renders of the same view:
+//                   changed text slots, nested diffs for children whose
+//                   statics are unchanged, whole values where the statics
+//                   differ (a different if branch, a different component),
+//                   and the whole "d" of a comprehension that changed
+//
+// The client merges a diff into its copy of the tree: an object with "s"
+// replaces, an object without "s" merges, a string replaces.
+
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/json";
+import "html";
+
+export fn rz_html_render(h: RzHtml*, out: RzBuf*) {
+  if (h == 0 || out == 0) { return; }
+  var i: int32 = 0;
+  while (i < h->nstatics) {
+    rz_buf_add(out, h->statics[i]);
+    if (i < h->nstatics - 1) {
+      var s: RzHtmlSlot* = &h->slots[i];
+      if (s->kind == RZ_SLOT_TEXT) { rz_buf_add(out, s->text); }
+      if (s->kind == RZ_SLOT_NODE) { rz_html_render(s->node, out); }
+      if (s->kind == RZ_SLOT_LIST) {
+        var k: int32 = 0;
+        while (k < s->list->count) {
+          rz_html_render(s->list->items[k], out);
+          k = k + 1;
+        }
+      }
+    }
+    i = i + 1;
+  }
+}
+
+fn rz_html_json_str(out: RzBuf*, s: string) {
+  rz_buf_add_byte(out, 34);
+  rz_json_escape_into(out, s);
+  rz_buf_add_byte(out, 34);
+}
+
+fn rz_html_json_statics(out: RzBuf*, statics: string*, n: int32) {
+  rz_buf_add(out, "\"s\":[");
+  var i: int32 = 0;
+  while (i < n) {
+    if (i > 0) { rz_buf_add_byte(out, 44); }
+    rz_html_json_str(out, statics[i]);
+    i = i + 1;
+  }
+  rz_buf_add_byte(out, 93);
+}
+
+fn rz_html_json_items(out: RzBuf*, l: RzHtmlList*) {
+  rz_buf_add(out, "\"d\":[");
+  var k: int32 = 0;
+  while (k < l->count) {
+    if (k > 0) { rz_buf_add_byte(out, 44); }
+    rz_buf_add_byte(out, 91);
+    var e: RzHtml* = l->items[k];
+    var i: int32 = 0;
+    while (i < rz_html_slot_count(e)) {
+      if (i > 0) { rz_buf_add_byte(out, 44); }
+      rz_html_json_slot(out, &e->slots[i]);
+      i = i + 1;
+    }
+    rz_buf_add_byte(out, 93);
+    k = k + 1;
+  }
+  rz_buf_add_byte(out, 93);
+}
+
+fn rz_html_json_list(out: RzBuf*, l: RzHtmlList*, with_statics: bool) {
+  rz_buf_add_byte(out, 123);
+  if (with_statics) {
+    rz_html_json_statics(out, l->statics, l->nstatics);
+    rz_buf_add_byte(out, 44);
+  }
+  rz_html_json_items(out, l);
+  rz_buf_add_byte(out, 125);
+}
+
+fn rz_html_json_slot(out: RzBuf*, s: RzHtmlSlot*) {
+  if (s->kind == RZ_SLOT_TEXT) { rz_html_json_str(out, s->text); return; }
+  if (s->kind == RZ_SLOT_NODE) { rz_html_json(s->node, out); return; }
+  if (s->kind == RZ_SLOT_LIST) { rz_html_json_list(out, s->list, true); return; }
+  rz_buf_add(out, "\"\"");
+}
+
+export fn rz_html_json(h: RzHtml*, out: RzBuf*) {
+  if (h == 0) { rz_buf_add(out, "\"\""); return; }
+  rz_buf_add_byte(out, 123);
+  rz_html_json_statics(out, h->statics, h->nstatics);
+  var i: int32 = 0;
+  while (i < rz_html_slot_count(h)) {
+    rz_buf_add(out, ",\"");
+    rz_buf_add_int(out, (int64)i);
+    rz_buf_add(out, "\":");
+    rz_html_json_slot(out, &h->slots[i]);
+    i = i + 1;
+  }
+  rz_buf_add_byte(out, 125);
+}
+
+// Deep equality of two renders (statics by fingerprint, slots by value).
+export fn rz_html_equal(a: RzHtml*, b: RzHtml*) -> bool {
+  if (a == 0 || b == 0) { return a == b; }
+  if (a->fp != b->fp || a->nstatics != b->nstatics) { return false; }
+  var i: int32 = 0;
+  while (i < rz_html_slot_count(a)) {
+    if (!rz_html_slot_equal(&a->slots[i], &b->slots[i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn rz_html_slot_equal(x: RzHtmlSlot*, y: RzHtmlSlot*) -> bool {
+  if (x->kind != y->kind) { return false; }
+  if (x->kind == RZ_SLOT_TEXT) { return rz_str_eq(x->text, y->text); }
+  if (x->kind == RZ_SLOT_NODE) { return rz_html_equal(x->node, y->node); }
+  if (x->kind == RZ_SLOT_LIST) {
+    if (x->list->fp != y->list->fp || x->list->count != y->list->count) { return false; }
+    var k: int32 = 0;
+    while (k < x->list->count) {
+      if (!rz_html_equal(x->list->items[k], y->list->items[k])) { return false; }
+      k = k + 1;
+    }
+  }
+  return true;
+}
+
+// Appends the diff from `prev` to `next` as one JSON object. Returns false (and
+// appends nothing) when nothing changed.
+export fn rz_html_diff(prev: RzHtml*, next: RzHtml*, out: RzBuf*) -> bool {
+  if (next == 0) { return false; }
+  if (prev == 0 || prev->fp != next->fp || prev->nstatics != next->nstatics) {
+    rz_html_json(next, out);
+    return true;
+  }
+  var start: int64 = out->len;
+  var wrote: bool = false;
+  var i: int32 = 0;
+  while (i < rz_html_slot_count(next)) {
+    var a: RzHtmlSlot* = &prev->slots[i];
+    var b: RzHtmlSlot* = &next->slots[i];
+    if (!rz_html_slot_equal(a, b)) {
+      if (!wrote) { rz_buf_add_byte(out, 123); } else { rz_buf_add_byte(out, 44); }
+      wrote = true;
+      rz_buf_add_byte(out, 34);
+      rz_buf_add_int(out, (int64)i);
+      rz_buf_add(out, "\":");
+      if (a->kind == RZ_SLOT_NODE && b->kind == RZ_SLOT_NODE) {
+        rz_html_diff(a->node, b->node, out);
+      } else if (a->kind == RZ_SLOT_LIST && b->kind == RZ_SLOT_LIST) {
+        rz_html_json_list(out, b->list, a->list->fp != b->list->fp);
+      } else {
+        rz_html_json_slot(out, b);
+      }
+    }
+    i = i + 1;
+  }
+  if (!wrote) {
+    out->len = start;
+    return false;
+  }
+  rz_buf_add_byte(out, 125);
+  return true;
+}

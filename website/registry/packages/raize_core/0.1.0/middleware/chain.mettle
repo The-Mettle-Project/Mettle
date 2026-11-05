@@ -1,0 +1,562 @@
+// raize/middleware/chain — the fixed request pipeline.
+//
+// ## Shape
+//
+// A chain is a fixed array of steps plus one terminal function:
+//
+//   step      fn(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32
+//   terminal  fn(ctx: RzContext*) -> int32
+//
+// A step does its work, calls next(ctx) to continue, and returns whatever the
+// continuation returned. Calling next is optional: a step that answers the
+// request itself (a CORS preflight, an auth denial) returns without calling
+// next and the chain ends there. The terminal is what the server used to take
+// as its handler; in production it is a three-line adapter over the router:
+//
+//   fn terminal(ctx: RzContext*) -> int32 {
+//     return rz_router_handle(g_router, ctx);
+//   }
+//
+// Mounting, the whole of it:
+//
+//   var chain: RzChain* = rz_chain_new();
+//   rz_chain_add(chain, "logging", &rz_mw_logging);
+//   rz_chain_add(chain, "recovery", &rz_mw_recover);
+//   rz_chain_add(chain, "cors", &rz_mw_cors);
+//   rz_chain_add(chain, "auth", &rz_mw_auth);
+//   rz_chain_set_terminal(chain, &terminal);
+//   rz_server_set_handler(srv, rz_chain_handler(chain));   // mounts + adapts
+//
+// ## Why not index-based
+//
+// The other shape is `fn(ctx, chain, i) -> int32`, with each handler calling
+// `chain->steps[i + 1](...)` itself. Two things go wrong with it:
+//
+//   1. The *handler* chooses the position. It can call step i+2, re-enter step
+//      i, or jump back to 0. "Every step runs exactly once, in order" stops
+//      being a property of this file and becomes the discipline of every
+//      handler — and a recovery scope that is entered twice for one request
+//      frees the same arena twice.
+//   2. It needs somewhere to keep the position. RzContext is fixed by
+//      raize.server (it is not the middleware's struct to extend), so the
+//      index would have to be threaded through every signature anyway, i.e.
+//      it becomes the (ctx, next, i) convention this file already rejects.
+//
+// With (ctx, next) the continuation is a function pointer *the chain* picks,
+// so the position is not reachable from the handler: the only continuation it
+// can call is the next step. The position lives in code — one static
+// continuation function per slot (RZ_MW_MAX_STEPS = 8 of them) — not in shared
+// mutable state, which is also why the chain needs no lock and no atomics on
+// the request path.
+//
+// The cost, stated plainly: a Mettle function value is a bare code pointer
+// (there are no closures), so a continuation cannot carry the chain it belongs
+// to. Each continuation therefore reads the one pointer rz_chain_mount()
+// installs, which is why exactly **one chain per process** is mounted. That is
+// not a limitation this file invents: the server's own handler slot is one
+// `fn(RzContext*) -> int32` (RzServer.handler), so one chain per process is the
+// contract above this module. rz_chain_serve refuses (500 + a counter) a chain
+// that is not the mounted one rather than continuing into the wrong chain.
+//
+// Mounting is safe to do before the workers start and never after: the pointer
+// is written once, no worker writes it, and it is only read on the request
+// path. Nothing on the request path allocates.
+
+import "std/mem";
+import "std/thread";
+import "../context/context";
+import "../str/str";
+
+// Literal because a Mettle struct field's array extent must be a literal.
+export const RZ_MW_MAX_STEPS: int32 = 8;
+
+// 32-bit counters only: Mettle's atomics are int32 and sequentially
+// consistent. Wrapping after 2^31 requests is not this module's problem.
+export struct RzChainStats {
+  runs: int32;        // chain entries (requests served through the chain)
+  steps_run: int32;   // step invocations, all requests
+  aborted: int32;     // requests a step answered without calling next
+  refused: int32;     // rz_chain_serve refused: chain was not the mounted one
+}
+
+export struct RzChain {
+  steps: (fn(RzContext*, fn(RzContext*) -> int32) -> int32)[8];  // RZ_MW_MAX_STEPS
+  names: string[8];   // diagnostics only; borrowed, must outlive the chain
+  count: int32;
+  terminal: fn(RzContext*) -> int32;
+  stats: RzChainStats;
+}
+
+// The single published chain. Written by rz_chain_mount before the worker
+// threads exist, read (never written) on the request path.
+var g_rz_chain: RzChain* = 0;
+
+export fn rz_chain_new() -> RzChain* {
+  var c: RzChain* = (RzChain*)calloc(1, sizeof(RzChain));
+  return c;
+}
+
+// Unpublishes (so a test can mount the next chain) and frees.
+export fn rz_chain_free(c: RzChain*) {
+  if (c == 0) { return; }
+  if (g_rz_chain == c) { g_rz_chain = 0; }
+  free((rawptr)c);
+}
+
+// 0 added, -1 no chain / no step, -2 full.
+export fn rz_chain_add(c: RzChain*, name: string, h: fn(RzContext*, fn(RzContext*) -> int32) -> int32) -> int32 {
+  if (c == 0 || h == 0) { return -1; }
+  if (c->count < 0) { return -1; }
+  if (c->count >= RZ_MW_MAX_STEPS) { return -2; }
+  var at: int32 = c->count;
+  c->steps[at] = h;
+  c->names[at] = name;
+  c->count = at + 1;
+  return 0;
+}
+
+// 0 set, -1 null. A chain without a terminal cannot serve: the last step's
+// continuation has nowhere to go.
+export fn rz_chain_set_terminal(c: RzChain*, t: fn(RzContext*) -> int32) -> int32 {
+  if (c == 0 || t == 0) { return -1; }
+  c->terminal = t;
+  return 0;
+}
+
+// Publishes `c` as the process chain. 0 ok, -1 null, -2 no terminal.
+//
+// A chain with *zero* steps is a valid chain: it is the terminal alone, i.e.
+// "no middleware installed yet". That is a real configuration (the router is
+// the handler; logging is added later), and refusing it would force every such
+// app to add a no-op step just to satisfy the mount. The steps array is fixed
+// and the continuations are one-per-slot, so an empty chain costs nothing.
+export fn rz_chain_mount(c: RzChain*) -> int32 {
+  if (c == 0) { return -1; }
+  if (c->terminal == 0) { return -2; }
+  if (c->count < 0) { return -2; }
+  g_rz_chain = c;
+  return 0;
+}
+
+export fn rz_chain_mounted() -> RzChain* {
+  return g_rz_chain;
+}
+
+export fn rz_chain_count(c: RzChain*) -> int32 {
+  if (c == 0) { return 0; }
+  return c->count;
+}
+
+export fn rz_chain_name(c: RzChain*, i: int32) -> string {
+  if (c == 0 || i < 0 || i >= c->count) { return rz_str_empty(); }
+  return c->names[i];
+}
+
+export fn rz_chain_stats(c: RzChain*) -> RzChainStats {
+  var s: RzChainStats;
+  if (c == 0) { return s; }
+  s = c->stats;
+  return s;
+}
+
+// "logging,recovery,cors,auth" into `out`; returns the number of bytes
+// written (0 when the buffer is too small, in which case nothing is written).
+// Startup diagnostics, not a request-path function.
+export fn rz_chain_describe(c: RzChain*, out: uint8*, cap: int64) -> int64 {
+  if (c == 0 || out == 0 || cap <= 0) { return 0; }
+  var n: int64 = 0;
+  var i: int32 = 0;
+  while (i < c->count) {
+    var s: string = c->names[i];
+    var k: int64 = 0;
+    if (i > 0) {
+      if (n + 1 >= cap) { return 0; }
+      out[n] = 44;   // ','
+      n = n + 1;
+    }
+    while (k < (int64)s.length) {
+      if (n + 1 >= cap) { return 0; }
+      out[n] = s.chars[k];
+      n = n + 1;
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  out[n] = 0;
+  return n;
+}
+
+// The status a step should report and log for `st` returned by its
+// continuation. Three cases, in order:
+//
+//   * st is a status (100..599)  -> st
+//   * st is anything else        -> ctx->status, else resp->status, else 500
+//
+// A handler is allowed to return 0 ("the response is built", the server's own
+// convention), so 0 is never a status; and a value outside 100..599 is a
+// programming error. Both cases are resolved the same way — to the status the
+// response actually carries, because that is what goes on the wire — and only
+// when the response has no valid status either do we report 500.
+export fn rz_chain_status(ctx: RzContext*, st: int32) -> int32 {
+  var s: int32 = st;
+  if (s >= 100 && s <= 599) { return s; }
+  if (ctx == 0) { return 500; }
+  s = ctx->status;
+  if (s < 100 || s > 599) {
+    s = 0;
+    if (ctx->resp != 0) { s = ctx->resp->status; }
+  }
+  if (s < 100 || s > 599) { return 500; }
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// Continuations
+//
+// One per slot, because a function value cannot carry the chain. Index k means
+// "continue at step k"; a k at or past count reaches the terminal.
+// ---------------------------------------------------------------------------
+
+fn rz_mw_cont_1(ctx: RzContext*) -> int32 { return rz_chain_step(g_rz_chain, 1, ctx); }
+fn rz_mw_cont_2(ctx: RzContext*) -> int32 { return rz_chain_step(g_rz_chain, 2, ctx); }
+fn rz_mw_cont_3(ctx: RzContext*) -> int32 { return rz_chain_step(g_rz_chain, 3, ctx); }
+fn rz_mw_cont_4(ctx: RzContext*) -> int32 { return rz_chain_step(g_rz_chain, 4, ctx); }
+fn rz_mw_cont_5(ctx: RzContext*) -> int32 { return rz_chain_step(g_rz_chain, 5, ctx); }
+fn rz_mw_cont_6(ctx: RzContext*) -> int32 { return rz_chain_step(g_rz_chain, 6, ctx); }
+fn rz_mw_cont_7(ctx: RzContext*) -> int32 { return rz_chain_step(g_rz_chain, 7, ctx); }
+fn rz_mw_cont_8(ctx: RzContext*) -> int32 { return rz_chain_step(g_rz_chain, 8, ctx); }
+
+fn rz_chain_next(i: int32) -> fn(RzContext*) -> int32 {
+  if (i <= 0) { return &rz_mw_cont_1; }
+  if (i == 1) { return &rz_mw_cont_2; }
+  if (i == 2) { return &rz_mw_cont_3; }
+  if (i == 3) { return &rz_mw_cont_4; }
+  if (i == 4) { return &rz_mw_cont_5; }
+  if (i == 5) { return &rz_mw_cont_6; }
+  if (i == 6) { return &rz_mw_cont_7; }
+  return &rz_mw_cont_8;
+}
+
+fn rz_chain_step(c: RzChain*, i: int32, ctx: RzContext*) -> int32 {
+  if (c == 0 || ctx == 0) { return 500; }
+  if (i < 0 || i >= c->count) {
+    if (c->terminal == 0) { return 500; }
+    return c->terminal(ctx);
+  }
+  var h: fn(RzContext*, fn(RzContext*) -> int32) -> int32 = c->steps[i];
+  if (h == 0) { return 500; }
+  atomic_inc_i32(&c->stats.steps_run);
+  return h(ctx, rz_chain_next(i));
+}
+
+// Runs the chain from step 0. `c` must be the mounted chain (see the header):
+// if it is not, the continuations would address a different chain, so this
+// refuses with 500 instead of silently running the wrong pipeline.
+//
+// Returns what the server expects from a handler: a status, or 0 when a step
+// aborted (the response is already built and ctx->status says what it is).
+export fn rz_chain_serve(c: RzChain*, ctx: RzContext*) -> int32 {
+  if (c == 0 || ctx == 0) { return 500; }
+  if (c != g_rz_chain || c->terminal == 0) {
+    atomic_inc_i32(&c->stats.refused);
+    if (ctx->resp != 0) { ctx->resp->status = 500; }
+    ctx->status = 500;
+    return 500;
+  }
+  atomic_inc_i32(&c->stats.runs);
+  var st: int32 = rz_chain_step(c, 0, ctx);
+  if (ctx->aborted) {
+    atomic_inc_i32(&c->stats.aborted);
+    return 0;
+  }
+  st = rz_chain_status(ctx, st);
+  ctx->status = st;
+  return st;
+}
+
+// The adapter the server's handler slot takes. The mount is what makes this
+// function pointer able to find its chain; see rz_chain_handler.
+fn rz_mw_serve(ctx: RzContext*) -> int32 {
+  var c: RzChain* = g_rz_chain;
+  if (c == 0) {
+    if (ctx != 0) {
+      ctx->status = 500;
+      if (ctx->resp != 0) { ctx->resp->status = 500; }
+    }
+    return 500;
+  }
+  return rz_chain_serve(c, ctx);
+}
+
+// Mounts `c` and returns the `fn(RzContext*) -> int32` the server's handler
+// slot wants (rz_server_set_handler). Returns 0 when the chain cannot serve,
+// which rz_server_set_handler refuses rather than installing a handler that
+// answers nothing.
+export fn rz_chain_handler(c: RzChain*) -> fn(RzContext*) -> int32 {
+  if (rz_chain_mount(c) != 0) { return (fn(RzContext*) -> int32)0; }
+  return &rz_mw_serve;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// Run: ./mettle-build/bin/mettle test framework/middleware/chain.mettle
+//
+// The steps and terminals below are ordinary functions, not closures — that is
+// the whole design — so a test mounts them exactly as an app does.
+// ---------------------------------------------------------------------------
+
+fn t_chain_step_a(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  if (ctx->resp != 0) { rz_resp_write(ctx->resp, "A"); }
+  return next(ctx);
+}
+
+fn t_chain_step_b(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  if (ctx->resp != 0) { rz_resp_write(ctx->resp, "B"); }
+  return next(ctx);
+}
+
+fn t_chain_step_c(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  if (ctx->resp != 0) { rz_resp_write(ctx->resp, "C"); }
+  return next(ctx);
+}
+
+// A step that answers the request itself: next is never called.
+fn t_chain_step_stop(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  if (ctx->resp != 0) { rz_resp_write(ctx->resp, "S"); }
+  rz_ctx_abort(ctx, 204);
+  return 0;
+}
+
+// A step that reads its continuation's answer: "T<status>" lands in the body.
+fn t_chain_step_after(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  var st: int32 = next(ctx);
+  var seen: int32 = rz_chain_status(ctx, st);
+  if (ctx->resp != 0 && ctx->resp->body != 0) { rz_buf_add_int(ctx->resp->body, (int64)seen); }
+  return st;
+}
+
+fn t_chain_term_ok(ctx: RzContext*) -> int32 {
+  // Status only: rz_ctx_text would *replace* the body the steps built, which
+  // would hide the order the steps ran in.
+  if (ctx->resp != 0) {
+    rz_resp_write(ctx->resp, "T");
+    ctx->resp->status = 200;
+  }
+  ctx->status = 200;
+  return 200;
+}
+
+fn t_chain_term_boom(ctx: RzContext*) -> int32 {
+  return 500;
+}
+
+@test fn t_rz_chain_order_and_termination() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+
+  var c: RzChain* = rz_chain_new();
+  if (c == 0) { return 4; }
+  defer rz_chain_free(c);
+  if (rz_chain_add(c, "a", &t_chain_step_a) != 0) { return 5; }
+  if (rz_chain_add(c, "b", &t_chain_step_b) != 0) { return 6; }
+  if (rz_chain_add(c, "c", &t_chain_step_c) != 0) { return 7; }
+  if (rz_chain_set_terminal(c, &t_chain_term_ok) != 0) { return 8; }
+  if (rz_chain_count(c) != 3) { return 9; }
+  if (rz_chain_mount(c) != 0) { return 10; }
+  if (rz_chain_serve(c, &ctx) != 200) { return 11; }
+  // every step ran exactly once, in order, then the terminal
+  if (!rz_str_eq(rz_buf_str(resp->body), "ABCT")) { return 12; }
+  if (!rz_str_eq(rz_chain_name(c, 0), "a")) { return 13; }
+  var st: RzChainStats = rz_chain_stats(c);
+  if (st.runs != 1) { return 14; }
+  if (st.steps_run != 3) { return 15; }
+  if (st.aborted != 0) { return 16; }
+  return 0;
+}
+
+@test fn t_rz_chain_short_circuit() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+
+  var c: RzChain* = rz_chain_new();
+  if (c == 0) { return 4; }
+  defer rz_chain_free(c);
+  if (rz_chain_add(c, "a", &t_chain_step_a) != 0) { return 5; }
+  if (rz_chain_add(c, "stop", &t_chain_step_stop) != 0) { return 6; }
+  if (rz_chain_add(c, "b", &t_chain_step_b) != 0) { return 7; }
+  if (rz_chain_set_terminal(c, &t_chain_term_ok) != 0) { return 8; }
+  if (rz_chain_mount(c) != 0) { return 9; }
+  // an abort is reported to the server as 0 ("the response is built")
+  if (rz_chain_serve(c, &ctx) != 0) { return 10; }
+  if (!rz_str_eq(rz_buf_str(resp->body), "AS")) { return 11; }
+  if (!ctx.aborted) { return 12; }
+  if (resp->status != 204) { return 13; }
+  var st: RzChainStats = rz_chain_stats(c);
+  if (st.aborted != 1) { return 14; }
+  if (st.steps_run != 2) { return 15; }
+  return 0;
+}
+
+@test fn t_rz_chain_after_next_status() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+
+  var c: RzChain* = rz_chain_new();
+  if (c == 0) { return 4; }
+  defer rz_chain_free(c);
+  if (rz_chain_add(c, "after", &t_chain_step_after) != 0) { return 5; }
+  if (rz_chain_set_terminal(c, &t_chain_term_boom) != 0) { return 6; }
+  if (rz_chain_mount(c) != 0) { return 7; }
+  // the terminal returned a status that is not "0 = built": 500 reaches the step
+  if (rz_chain_serve(c, &ctx) != 500) { return 8; }
+  if (!rz_str_eq(rz_buf_str(resp->body), "500")) { return 9; }
+  return 0;
+}
+
+@test fn t_rz_chain_capacity() -> int32 {
+  var c: RzChain* = rz_chain_new();
+  if (c == 0) { return 1; }
+  defer rz_chain_free(c);
+  var i: int32 = 0;
+  while (i < RZ_MW_MAX_STEPS) {
+    if (rz_chain_add(c, "a", &t_chain_step_a) != 0) { return 2; }
+    i = i + 1;
+  }
+  if (rz_chain_count(c) != RZ_MW_MAX_STEPS) { return 3; }
+  // the step array is literal-length: the ninth add is refused, never truncated
+  if (rz_chain_add(c, "over", &t_chain_step_a) != -2) { return 4; }
+  if (rz_chain_count(c) != RZ_MW_MAX_STEPS) { return 5; }
+  var none: fn(RzContext*, fn(RzContext*) -> int32) -> int32 = (fn(RzContext*, fn(RzContext*) -> int32) -> int32)0;
+  if (rz_chain_add(c, "null", none) != -1) { return 6; }
+  if (rz_chain_add(0, "none", &t_chain_step_a) != -1) { return 7; }
+  return 0;
+}
+
+@test fn t_rz_chain_empty_chain_is_the_terminal() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var c: RzChain* = rz_chain_new();
+  if (c == 0) { return 4; }
+  defer rz_chain_free(c);
+  // no steps: the router is the handler and no middleware is installed yet
+  if (rz_chain_mount(c) != -2) { return 5; }
+  if (rz_chain_set_terminal(c, &t_chain_term_ok) != 0) { return 6; }
+  if (rz_chain_mount(c) != 0) { return 7; }
+  if (rz_chain_serve(c, &ctx) != 200) { return 8; }
+  if (!rz_str_eq(rz_buf_str(resp->body), "T")) { return 9; }
+  return 0;
+}
+
+@test fn t_rz_chain_refuses_unmounted() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  // mounted chain
+  var a: RzChain* = rz_chain_new();
+  if (a == 0) { return 4; }
+  defer rz_chain_free(a);
+  if (rz_chain_set_terminal(a, &t_chain_term_ok) != 0) { return 5; }
+  if (rz_chain_mount(a) != 0) { return 6; }
+  // a second chain: its continuations are not the installed ones, so serving it
+  // must refuse rather than run a different pipeline
+  var b: RzChain* = rz_chain_new();
+  if (b == 0) { return 7; }
+  defer rz_chain_free(b);
+  if (rz_chain_add(b, "a", &t_chain_step_a) != 0) { return 8; }
+  if (rz_chain_set_terminal(b, &t_chain_term_ok) != 0) { return 9; }
+  if (rz_chain_serve(b, &ctx) != 500) { return 10; }
+  if (resp->status != 500) { return 11; }
+  var sb: RzChainStats = rz_chain_stats(b);
+  if (sb.refused != 1) { return 12; }
+  // and the mounted chain still works
+  if (rz_chain_serve(a, &ctx) != 200) { return 13; }
+  return 0;
+}
+
+@test fn t_rz_chain_status_resolution() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  // a real status is authoritative
+  if (rz_chain_status(&ctx, 404) != 404) { return 4; }
+  // 0 means "I built the response": ctx->status, then resp->status
+  ctx.status = 418;
+  if (rz_chain_status(&ctx, 0) != 418) { return 5; }
+  ctx.status = 0;
+  resp->status = 204;
+  if (rz_chain_status(&ctx, 0) != 204) { return 6; }
+  // nothing at all is a programming error, and is reported as 500
+  resp->status = 0;
+  if (rz_chain_status(&ctx, 0) != 500) { return 7; }
+  if (rz_chain_status(0, 200) != 200) { return 8; }
+  // a handler cannot return a bogus status through the chain
+  if (rz_chain_status(&ctx, 99) != 500) { return 9; }
+  return 0;
+}
+
+@test fn t_rz_chain_describe_and_handler() -> int32 {
+  var c: RzChain* = rz_chain_new();
+  if (c == 0) { return 1; }
+  defer rz_chain_free(c);
+  if (rz_chain_add(c, "logging", &t_chain_step_a) != 0) { return 2; }
+  if (rz_chain_add(c, "cors", &t_chain_step_b) != 0) { return 3; }
+  var buf: uint8[64];
+  var n: int64 = rz_chain_describe(c, &buf[0], 64);
+  if (!rz_str_eq(rz_str_view(&buf[0], n), "logging,cors")) { return 4; }
+  // too small a buffer: nothing is written (never a truncated description)
+  if (rz_chain_describe(c, &buf[0], 4) != 0) { return 5; }
+  // a chain without a terminal cannot be mounted, so the server never gets a
+  // handler that answers nothing
+  if (rz_chain_handler(c) != (fn(RzContext*) -> int32)0) { return 6; }
+  if (rz_chain_set_terminal(c, &t_chain_term_ok) != 0) { return 7; }
+  if (rz_chain_handler(c) == (fn(RzContext*) -> int32)0) { return 8; }
+  if (rz_chain_mounted() != c) { return 9; }
+  return 0;
+}

@@ -1,0 +1,51 @@
+// A byte stream the client reads and writes. Plain TCP is one; a TLS stream
+// has the same shape. read and write give a count, 0 at the end of the
+// stream, or a negative error. fd is the socket to poll before a read, or -1
+// when the stream waits for itself.
+
+import "std/socket";
+
+export struct FetchStream {
+  ctx: rawptr;
+  read: fn(rawptr, uint8*, int64) -> int64;
+  write: fn(rawptr, uint8*, int64) -> int64;
+  close: fn(rawptr) -> int64;
+  fd: int64;
+}
+
+fn hs_plain_read(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  return sock_recv((int64)ctx, p, n);
+}
+
+fn hs_plain_write(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  return sock_send_all((int64)ctx, p, n);
+}
+
+fn hs_plain_close(ctx: rawptr) -> int64 {
+  sock_close((int64)ctx);
+  return 0;
+}
+
+// Wraps a connected socket. close closes the socket.
+export fn fetch_stream_plain(fd: int64) -> FetchStream {
+  var s: FetchStream;
+  s.ctx = (rawptr)fd;
+  s.read = &hs_plain_read;
+  s.write = &hs_plain_write;
+  s.close = &hs_plain_close;
+  s.fd = fd;
+  return s;
+}
+
+export fn fetch_stream_read(s: FetchStream*, p: uint8*, n: int64) -> int64 {
+  return s->read(s->ctx, p, n);
+}
+
+export fn fetch_stream_write(s: FetchStream*, p: uint8*, n: int64) -> int64 {
+  return s->write(s->ctx, p, n);
+}
+
+export fn fetch_stream_close(s: FetchStream*) {
+  s->close(s->ctx);
+  s->fd = -1;
+}

@@ -1,0 +1,10 @@
+name = raize_app
+version = 0.1.0
+description = Raize app layer: rz_run, declarations (routes, Signals, resources, channels, guards), rz_use, rz_every
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeApp
+compiler = 0.18.0
+require = raize_core 0.1.0
+require = raize_realtime 0.1.0
+require = raize_signal 0.1.0
+require = raize_resource 0.1.0

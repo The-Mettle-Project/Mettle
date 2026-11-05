@@ -1,0 +1,7 @@
+name = sandbox
+version = 0.1.0
+description = Process sandboxing in pure Mettle: namespaces, seccomp, Landlock, cgroups v2, rlimits, capabilities
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Sandbox
+compiler = 0.18.0
+platforms = linux

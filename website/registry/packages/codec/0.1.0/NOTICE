@@ -1,0 +1,6 @@
+Codec
+Copyright 2026 Lex Dellimere
+
+This product includes the msgpack-test-suite test data by Yusuke Kawasaki
+(https://github.com/kawanet/msgpack-test-suite), under the MIT license, in
+tests/data/msgpack-test-suite/ with its license file.

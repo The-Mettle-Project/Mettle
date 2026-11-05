@@ -1,0 +1,490 @@
+// raize_api/ratelimit: rate limiting with the Generic Cell Rate Algorithm (GCRA).
+//
+//   rapi_use_rate_limit(api, 100, 60);        // 100 requests per 60 seconds per caller
+//   rapi_op_rate(search_op, 10, 60);          // this operation has its own, tighter limit
+//   rapi_rate_key(api, &key_by_api_key);      // optional: choose who is counted
+//
+// Follows:
+//   GCRA             the algorithm used by redis-cell (CL.THROTTLE) and by the Go library
+//                    throttled. It keeps one number per caller, the "theoretical arrival
+//                    time" (TAT): the time at which the caller's bucket is empty. A request
+//                    is allowed when TAT + T - limit*T is not in the future, where
+//                    T = window / limit. Then TAT moves forward by T. A caller can burst
+//                    `limit` requests, then gets one more every T. No timers, no refills.
+//   draft-ietf-httpapi-ratelimit-headers-11 (RateLimit header fields for HTTP)
+//                    section 3 RateLimit-Policy:  "default";q=100;w=60
+//                    section 4 RateLimit:         "default";r=42;t=10
+//                    section 5.1 the quota-exceeded problem type, with the
+//                    violated-policies member, used as the 429 body
+//   RFC 9110 10.2.3  Retry-After, as whole seconds (rounded up)
+//   RFC 6585 4       429 Too Many Requests
+//   RFC 9457         problem details
+//
+// Who is counted: r->subject when the auth hook set one, else the client IPv4 address
+// (rz_ctx_peer: the socket peer, or the X-Forwarded-For client behind a trusted proxy).
+// Register auth hooks before the limiter so the subject is known. rapi_rate_key
+// replaces both.
+//
+// The store is a fixed table (4096 entries, rapi_rate_table_size) behind one mutex.
+// A key is looked up in a window of 16 slots at the hash position. When none of them
+// holds the key, the slot with the oldest TAT is reused, so entries of callers who
+// stopped long ago go first and a full table never refuses anyone. The cost of
+// eviction is that an evicted caller starts again with a full bucket. Keys are
+// hashed whole but only the first 47 bytes are kept to compare. The hash is seeded
+// per process so callers cannot choose keys that land in one window.
+//
+// Time is kept in microseconds inside, from milliseconds of the monotonic clock.
+// A rate above one request per microsecond is treated as one per microsecond.
+import "std/mem";
+import "std/thread";
+import "std/time";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/peer";
+import "../route/api";
+import "../problem/problem";
+
+const RAPI__RATE_DEFAULT_SLOTS: int32 = 4096;
+const RAPI__RATE_MIN_SLOTS: int32 = 16;
+const RAPI__RATE_MAX_SLOTS: int32 = 4194304;
+const RAPI__RATE_PROBE: int32 = 16;
+const RAPI__RATE_KEY: int32 = 48;        // bytes kept per key: 1 kind byte + 47 of the key
+const RAPI__US: int64 = 1000000;
+const RAPI__RATE_MAX_LIMIT: int64 = 1000000000;
+const RAPI__RATE_MAX_WINDOW: int64 = 315360000;   // ten years in seconds
+
+const RAPI__KEY_SUBJECT: int32 = 117;    // 'u'
+const RAPI__KEY_IP: int32 = 105;         // 'i'
+const RAPI__KEY_CUSTOM: int32 = 107;     // 'k'
+
+// One caller's bucket.
+struct RapiRateEntry {
+  hash: uint64;
+  tat: int64;          // theoretical arrival time, microseconds; 0 when the slot is empty
+  opid: int64;         // 0 for the API-wide policy, else the operation's address
+  klen: int32;         // bytes used in key
+  used: bool;
+  key: uint8[48];
+}
+
+// An API's limiter, in api->limiter.
+struct RapiLimiter {
+  mu: int64;                          // guards tab
+  tab: RapiRateEntry*;
+  n: int32;
+  seed: uint64;
+  limit: int64;                       // API-wide policy; 0 for none
+  window: int64;                      // seconds
+  key_fn: fn(RapiReq*) -> string;     // 0 for the default key
+}
+
+// An operation's own policy. Written at startup only.
+struct RapiOpRate {
+  op: RapiOp*;
+  limit: int64;      // 0 or less: the operation is not limited at all
+  window: int64;
+}
+
+var g_rate_ops: RapiOpRate[256];
+var g_rate_nops: int32 = 0;
+var g_rate_clock: fn() -> int64;
+
+fn rapi__rate_real_clock() -> int64 { return time_mono_ms(); }
+
+/// internal: replaces the clock (milliseconds, any origin, never going back). Tests
+/// give it a fake. rapi__rate_real_clock restores the real one.
+export fn rapi__rate_clock(f: fn() -> int64) { g_rate_clock = f; }
+
+/// internal: puts the real clock back.
+export fn rapi__rate_clock_real() { g_rate_clock = &rapi__rate_real_clock; }
+
+fn rapi__now_us() -> int64 {
+  var ms: int64 = 0;
+  if (g_rate_clock != 0) { ms = g_rate_clock(); } else { ms = time_mono_ms(); }
+  return ms * 1000;
+}
+
+// ---------------------------------------------------------------------------
+// Hashing: FNV-1a over the whole key and the operation, then a splitmix64 finish
+// so the low bits (used to pick the slot) are well mixed.
+// ---------------------------------------------------------------------------
+
+const RAPI__FNV_BASIS: uint64 = 0xCBF29CE484222325;
+const RAPI__FNV_PRIME: uint64 = 0x00000100000001B3;
+const RAPI__MIX1: uint64 = 0xBF58476D1CE4E5B9;
+const RAPI__MIX2: uint64 = 0x94D049BB133111EB;
+const RAPI__GOLDEN: uint64 = 0x9E3779B97F4A7C15;
+
+fn rapi__hash(seed: uint64, kind: int32, key: string, opid: int64) -> uint64 {
+  var h: uint64 = RAPI__FNV_BASIS ^ seed;
+  h = (h ^ (uint64)kind) * RAPI__FNV_PRIME;
+  var o: uint64 = (uint64)opid;
+  for k in 0..8 {
+    h = (h ^ ((o >> (uint64)(k * 8)) & (uint64)255)) * RAPI__FNV_PRIME;
+  }
+  for i in 0..key.length {
+    h = (h ^ (uint64)key.chars[i]) * RAPI__FNV_PRIME;
+  }
+  h = h ^ (h >> (uint64)30);
+  h = h * RAPI__MIX1;
+  h = h ^ (h >> (uint64)27);
+  h = h * RAPI__MIX2;
+  h = h ^ (h >> (uint64)31);
+  return h;
+}
+
+// ---------------------------------------------------------------------------
+// GCRA on the table
+// ---------------------------------------------------------------------------
+
+// What one request found out.
+struct RapiRateOut {
+  allowed: bool;
+  remaining: int64;    // requests still possible right now
+  reset_us: int64;     // until the bucket is empty again
+  retry_us: int64;     // when refused: until the next request would pass
+}
+
+fn rapi__key_same(e: RapiRateEntry*, kind: int32, key: string, klen: int32) -> bool {
+  if (e->klen != klen || (int32)e->key[0] != kind) { return false; }
+  for i in 1..klen {
+    if (e->key[i] != key.chars[i - 1]) { return false; }
+  }
+  return true;
+}
+
+// Takes one request's worth from the bucket of (kind, key, opid) under `limit` per
+// `window` seconds. Thread safe.
+fn rapi__take(lim: RapiLimiter*, kind: int32, key: string, opid: int64, limit: int64, window: int64, out: RapiRateOut*) {
+  var hash: uint64 = rapi__hash(lim->seed, kind, key, opid);
+  var klen: int32 = 1;
+  var keep: int64 = (int64)key.length;
+  if (keep > (int64)(RAPI__RATE_KEY - 1)) { keep = (int64)(RAPI__RATE_KEY - 1); }
+  klen = 1 + (int32)keep;
+
+  var window_us: int64 = window * RAPI__US;
+  var t: int64 = window_us / limit;
+  if (t < 1) { t = 1; }
+  var dvt: int64 = t * limit;
+
+  mutex_lock_infinite(lim->mu);
+  var now: int64 = rapi__now_us();
+  var span: int32 = RAPI__RATE_PROBE;
+  if (lim->n < span) { span = lim->n; }
+  var start: int32 = (int32)(hash % (uint64)lim->n);
+  var slot: RapiRateEntry* = (RapiRateEntry*)0;
+  var victim: RapiRateEntry* = (RapiRateEntry*)0;
+  for k in 0..span {
+    var e: RapiRateEntry* = &lim->tab[(start + k) % lim->n];
+    if (e->used && e->hash == hash && e->opid == opid && rapi__key_same(e, kind, key, klen)) {
+      slot = e;
+      break;
+    }
+    if (victim == 0 || e->tat < victim->tat) { victim = e; }
+  }
+  var tat: int64 = now;
+  if (slot != 0 && slot->tat > now) { tat = slot->tat; }
+  var new_tat: int64 = tat + t;
+  var diff: int64 = now - (new_tat - dvt);
+  if (diff < 0) {
+    out->allowed = false;
+    out->remaining = 0;
+    out->retry_us = 0 - diff;
+    out->reset_us = tat - now;
+  } else {
+    if (slot == 0) {
+      slot = victim;
+      slot->used = true;
+      slot->hash = hash;
+      slot->opid = opid;
+      slot->klen = klen;
+      slot->key[0] = (uint8)kind;
+      for i in 1..klen { slot->key[i] = key.chars[i - 1]; }
+    }
+    slot->tat = new_tat;
+    out->allowed = true;
+    out->remaining = diff / t;
+    if (out->remaining > limit) { out->remaining = limit; }
+    out->reset_us = new_tat - now;
+    out->retry_us = 0;
+  }
+  mutex_unlock(lim->mu);
+}
+
+// ---------------------------------------------------------------------------
+// Headers
+// ---------------------------------------------------------------------------
+
+// A small writer into arena memory.
+struct RapiW {
+  p: uint8*;
+  n: int64;
+  cap: int64;
+}
+
+fn rapi__w_open(w: RapiW*, arena: RzArena*, cap: int64) {
+  w->p = rz_arena_alloc(arena, cap);
+  w->n = 0;
+  w->cap = cap;
+}
+
+fn rapi__w_byte(w: RapiW*, c: int32) {
+  if (w->p == 0 || w->n >= w->cap) { return; }
+  w->p[w->n] = (uint8)c;
+  w->n = w->n + 1;
+}
+
+fn rapi__w_str(w: RapiW*, s: string) {
+  for i in 0..s.length { rapi__w_byte(w, (int32)s.chars[i]); }
+}
+
+fn rapi__w_int(w: RapiW*, v: int64) {
+  var digits: uint8[20];
+  var n: int32 = 0;
+  var x: int64 = v;
+  if (x < 0) { x = 0; }
+  if (x == 0) { digits[0] = 48; n = 1; }
+  while (x > 0) {
+    digits[n] = (uint8)(48 + (int32)(x % 10));
+    x = x / 10;
+    n = n + 1;
+  }
+  while (n > 0) {
+    n = n - 1;
+    rapi__w_byte(w, (int32)digits[n]);
+  }
+}
+
+// A policy name is a quoted string: keep letters, digits and . _ - only.
+fn rapi__w_name(w: RapiW*, name: string) {
+  rapi__w_byte(w, 34);
+  var n: int64 = (int64)name.length;
+  if (n > 64) { n = 64; }
+  for i in 0..n {
+    var c: int32 = (int32)name.chars[i];
+    var ok: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 45;
+    if (ok) { rapi__w_byte(w, c); } else { rapi__w_byte(w, 95); }
+  }
+  rapi__w_byte(w, 34);
+}
+
+fn rapi__w_view(w: RapiW*) -> string {
+  if (w->p == 0) { return ""; }
+  return rz_str_view(w->p, w->n);
+}
+
+fn rapi__secs_up(us: int64) -> int64 {
+  var s: int64 = (us + RAPI__US - 1) / RAPI__US;
+  if (s < 1) { s = 1; }
+  return s;
+}
+
+fn rapi__set_rate_headers(ctx: RzContext*, name: string, limit: int64, window: int64, remaining: int64, t_secs: int64) {
+  var w: RapiW;
+  rapi__w_open(&w, ctx->arena, 128);
+  rapi__w_name(&w, name);
+  rapi__w_str(&w, ";q=");
+  rapi__w_int(&w, limit);
+  rapi__w_str(&w, ";w=");
+  rapi__w_int(&w, window);
+  rz_ctx_set_header(ctx, "RateLimit-Policy", rapi__w_view(&w));
+  rapi__w_open(&w, ctx->arena, 128);
+  rapi__w_name(&w, name);
+  rapi__w_str(&w, ";r=");
+  rapi__w_int(&w, remaining);
+  rapi__w_str(&w, ";t=");
+  rapi__w_int(&w, t_secs);
+  rz_ctx_set_header(ctx, "RateLimit", rapi__w_view(&w));
+}
+
+// 429 with Retry-After and the quota-exceeded problem (draft section 5.1).
+fn rapi__too_many(ctx: RzContext*, name: string, retry_secs: int64) -> int32 {
+  var w: RapiW;
+  rapi__w_open(&w, ctx->arena, 24);
+  rapi__w_int(&w, retry_secs);
+  rz_ctx_set_header(ctx, "Retry-After", rapi__w_view(&w));
+  var d: RapiW;
+  rapi__w_open(&d, ctx->arena, 96);
+  rapi__w_str(&d, "too many requests; try again in ");
+  rapi__w_int(&d, retry_secs);
+  rapi__w_str(&d, " seconds");
+  var x: RapiW;
+  rapi__w_open(&x, ctx->arena, 128);
+  rapi__w_str(&x, "\"violated-policies\":[");
+  rapi__w_name(&x, name);
+  rapi__w_str(&x, "]");
+  var p: RapiProblem;
+  memset((rawptr)&p, 0, sizeof(RapiProblem));
+  p.status = 429;
+  p.type_uri = "https://iana.org/assignments/http-problem-types#quota-exceeded";
+  p.title = "Request cannot be satisfied as assigned quota has been exceeded";
+  p.detail = rapi__w_view(&d);
+  p.extra_json = rapi__w_view(&x);
+  return rapi_problem_send(ctx, &p);
+}
+
+// ---------------------------------------------------------------------------
+// The hook
+// ---------------------------------------------------------------------------
+
+fn rapi__op_rate_index(op: RapiOp*) -> int32 {
+  for i in 0..g_rate_nops {
+    if (g_rate_ops[i].op == op) { return i; }
+  }
+  return -1;
+}
+
+fn rapi__rate_hook(r: RapiReq*) -> int32 {
+  var lim: RapiLimiter* = (RapiLimiter*)r->api->limiter;
+  if (lim == 0) { return RAPI_NEXT; }
+  var ctx: RzContext* = r->ctx;
+  var limit: int64 = lim->limit;
+  var window: int64 = lim->window;
+  var opid: int64 = 0;
+  var name: string = "default";
+  var oi: int32 = -1;
+  if (g_rate_nops > 0) { oi = rapi__op_rate_index(r->op); }
+  if (oi >= 0) {
+    limit = g_rate_ops[oi].limit;
+    window = g_rate_ops[oi].window;
+    opid = (int64)r->op;
+    name = r->op->id;
+  }
+  if (limit <= 0 || window <= 0) { return RAPI_NEXT; }
+
+  var kind: int32 = RAPI__KEY_CUSTOM;
+  var key: string = "";
+  if (lim->key_fn != 0) { key = lim->key_fn(r); }
+  if (key.length == 0) {
+    if (r->subject.length > 0) {
+      kind = RAPI__KEY_SUBJECT;
+      key = r->subject;
+    } else {
+      kind = RAPI__KEY_IP;
+      key = rz_ctx_peer(ctx);
+      if (key.length == 0) { key = "-"; }
+    }
+  }
+
+  var out: RapiRateOut;
+  rapi__take(lim, kind, key, opid, limit, window, &out);
+  if (!out.allowed) {
+    var retry: int64 = rapi__secs_up(out.retry_us);
+    rapi__set_rate_headers(ctx, name, limit, window, 0, retry);
+    return rapi__too_many(ctx, name, retry);
+  }
+  rapi__set_rate_headers(ctx, name, limit, window, out.remaining, rapi__secs_up(out.reset_us));
+  return RAPI_NEXT;
+}
+
+// ---------------------------------------------------------------------------
+// Setup (startup only, one thread)
+// ---------------------------------------------------------------------------
+
+fn rapi__new_table(n: int32) -> RapiRateEntry* {
+  return (RapiRateEntry*)calloc((int64)n, sizeof(RapiRateEntry));
+}
+
+// The API's limiter, made with the hook on first use. 0 after recording a mistake.
+fn rapi__limiter_of(api: RapiApi*) -> RapiLimiter* {
+  if (api->limiter != 0) { return (RapiLimiter*)api->limiter; }
+  var lim: RapiLimiter* = (RapiLimiter*)calloc(1, sizeof(RapiLimiter));
+  if (lim == 0) { rapi__set_error(api, "rate limit: out of memory"); return (RapiLimiter*)0; }
+  lim->tab = rapi__new_table(RAPI__RATE_DEFAULT_SLOTS);
+  if (lim->tab == 0) {
+    free((rawptr)lim);
+    rapi__set_error(api, "rate limit: out of memory");
+    return (RapiLimiter*)0;
+  }
+  lim->n = RAPI__RATE_DEFAULT_SLOTS;
+  lim->mu = mutex_create();
+  lim->seed = ((uint64)time_unix_ms() * RAPI__GOLDEN) ^ (uint64)(int64)lim;
+  api->limiter = (rawptr)lim;
+  rapi_before(api, &rapi__rate_hook);
+  return lim;
+}
+
+fn rapi__clamp(v: int64, hi: int64) -> int64 {
+  if (v < 0) { return 0; }
+  if (v > hi) { return hi; }
+  return v;
+}
+
+/// Limits every operation of the API: `limit` requests per `window_secs` seconds for
+/// each caller (see the top of this file for who that is). Callers may burst `limit`
+/// requests at once; after that they get one more every window_secs/limit seconds.
+/// Responses carry RateLimit-Policy and RateLimit; a refused request is a 429 problem
+/// with Retry-After. A limit or window of 0 or less means no API-wide limit (use
+/// rapi_op_rate for single operations). Call it once at startup, after the auth hooks.
+export fn rapi_use_rate_limit(api: RapiApi*, limit: int64, window_secs: int64) {
+  var lim: RapiLimiter* = rapi__limiter_of(api);
+  if (lim == 0) { return; }
+  lim->limit = rapi__clamp(limit, RAPI__RATE_MAX_LIMIT);
+  lim->window = rapi__clamp(window_secs, RAPI__RATE_MAX_WINDOW);
+}
+
+/// Chooses who is counted: `key_fn` returns the key for the request (an API key, a
+/// tenant id). The text only has to live until the function returns. When it returns
+/// "" the default key (subject, else client address) is used.
+export fn rapi_rate_key(api: RapiApi*, key_fn: fn(RapiReq*) -> string) {
+  var lim: RapiLimiter* = rapi__limiter_of(api);
+  if (lim == 0) { return; }
+  lim->key_fn = key_fn;
+}
+
+/// Gives one operation its own limit instead of the API-wide one, with its own buckets:
+/// `limit` requests per `window_secs` seconds. A limit of 0 or less leaves the operation
+/// unlimited. The operation's headers name the policy after its operationId. Call it
+/// at startup; at most 256 operations. It turns the limiter on for the operation's API
+/// (with no API-wide limit unless rapi_use_rate_limit sets one).
+export fn rapi_op_rate(op: RapiOp*, limit: int64, window_secs: int64) {
+  if (op == 0) { return; }
+  var n: int32 = 0;
+  var apis: RapiApi** = rapi__apis(&n);
+  var owner: RapiApi* = (RapiApi*)0;
+  for a in 0..n {
+    for i in 0..apis[a]->nops {
+      if (apis[a]->ops[i] == op) { owner = apis[a]; }
+    }
+  }
+  var at: int32 = rapi__op_rate_index(op);
+  if (at < 0) {
+    if (g_rate_nops >= 256) {
+      if (owner != 0) { rapi__set_error(owner, "more than 256 operations have their own rate limit"); }
+      return;
+    }
+    at = g_rate_nops;
+    g_rate_nops = g_rate_nops + 1;
+  }
+  g_rate_ops[at].op = op;
+  g_rate_ops[at].limit = rapi__clamp(limit, RAPI__RATE_MAX_LIMIT);
+  g_rate_ops[at].window = rapi__clamp(window_secs, RAPI__RATE_MAX_WINDOW);
+  if (owner != 0) { rapi__limiter_of(owner); }
+}
+
+/// Sets how many callers the API's limiter can remember (default 4096, at least 16).
+/// Each takes 80 bytes. Call it at startup, before serving: it forgets everyone.
+export fn rapi_rate_table_size(api: RapiApi*, entries: int32) {
+  var lim: RapiLimiter* = rapi__limiter_of(api);
+  if (lim == 0) { return; }
+  var n: int32 = entries;
+  if (n < RAPI__RATE_MIN_SLOTS) { n = RAPI__RATE_MIN_SLOTS; }
+  if (n > RAPI__RATE_MAX_SLOTS) { n = RAPI__RATE_MAX_SLOTS; }
+  var t: RapiRateEntry* = rapi__new_table(n);
+  if (t == 0) { rapi__set_error(api, "rate limit: out of memory"); return; }
+  mutex_lock_infinite(lim->mu);
+  free((rawptr)lim->tab);
+  lim->tab = t;
+  lim->n = n;
+  mutex_unlock(lim->mu);
+}
+
+/// internal: forgets every caller of the API (tests use it after changing the clock).
+export fn rapi__rate_reset(api: RapiApi*) {
+  var lim: RapiLimiter* = (RapiLimiter*)api->limiter;
+  if (lim == 0) { return; }
+  mutex_lock_infinite(lim->mu);
+  memset((rawptr)lim->tab, 0, (int64)lim->n * sizeof(RapiRateEntry));
+  mutex_unlock(lim->mu);
+}

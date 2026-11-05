@@ -1,0 +1,159 @@
+// raize/channel/members — who is joined to what, and sending to them.
+//
+// The member table is a flat array scanned linearly: broadcast cost is
+// O(max_members). That is the honest first version; a topic index is the
+// change to make when a profile asks for it, and nothing outside this file
+// would notice.
+//
+// Hub thread only, except rz_chan_post_broadcast, which copies its arguments
+// and runs the broadcast on the hub thread through rz_hub_post_call.
+
+import "std/mem";
+import "raize_core/str/str";
+import "../hub/hub";
+import "wire";
+import "types";
+
+export fn rz_chan_find(r: RzChanRouter*, sock: int64, topic: string) -> int32 {
+  var i: int32 = 0;
+  while (i < r->max_members) {
+    var m: RzChanMember* = &r->members[i];
+    if (m->used && m->sock == sock && rz_str_eq(m->topic, topic)) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+export fn rz_chan_free_slot(r: RzChanRouter*) -> int32 {
+  var i: int32 = 0;
+  while (i < r->max_members) {
+    if (!r->members[i].used) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// A context for member `i` (or for a not-yet-joined slot when `i` < 0).
+export fn rz_chan_ctx(r: RzChanRouter*, sock: int64, topic: string, join_ref: string, state: rawptr) -> RzChanCtx {
+  var c: RzChanCtx;
+  c.router = r;
+  c.hub = r->hub;
+  c.sock = sock;
+  c.topic = topic;
+  c.join_ref = join_ref;
+  c.state = state;
+  c.reply = 0;
+  c.conn = 0;
+  return c;
+}
+
+// Calls leave and frees the member's strings.
+export fn rz_chan_remove(r: RzChanRouter*, i: int32) {
+  var m: RzChanMember* = &r->members[i];
+  if (!m->used) { return; }
+  var def: RzChannelDef* = &r->defs[m->def];
+  if (def->leave != 0) {
+    var c: RzChanCtx = rz_chan_ctx(r, m->sock, m->topic, m->join_ref, m->state);
+    c.conn = m->conn;
+    def->leave(&c);
+  }
+  rz_str_free(m->topic);
+  rz_str_free(m->join_ref);
+  memset((rawptr)m, 0, sizeof(RzChanMember));
+}
+
+/// The request that opened this member's socket: cookies, peer address and the user
+/// a guard set, copied on the worker at upgrade time.
+///
+/// in:      ctx a channel callback's context (join, handle_in or leave)
+/// returns: the connection (read it with rz_conn_cookie, rz_conn_user, rz_conn_peer),
+///          or 0 when the socket was not opened through rz_chan_upgrade
+/// owns:    nothing; the socket owns it and frees it when it closes (valid during
+///          the callback; do not keep it past leave)
+/// thread:  the hub thread (channel callbacks)
+/// example:
+///   if (!rz_str_eq(rz_conn_cookie(rz_chan_conn(ctx), "sid"), "s3cret")) { return 1; }
+export fn rz_chan_conn(ctx: RzChanCtx*) -> RzConn* {
+  if (ctx == 0) { return 0; }
+  return ctx->conn;
+}
+
+// Sets the JSON body of the reply to the event being handled (join or
+// handle_in). Must be a complete JSON value.
+export fn rz_chan_reply_json(ctx: RzChanCtx*, json: string) {
+  if (ctx == 0 || ctx->reply == 0) { return; }
+  ctx->reply->len = 0;
+  rz_buf_add(ctx->reply, json);
+}
+
+// Pushes an event to this member only.
+export fn rz_chan_push(ctx: RzChanCtx*, event: string, payload: string) -> int32 {
+  if (ctx == 0) { return -1; }
+  var b: RzBuf* = rz_buf_new();
+  rz_chan_encode(b, ctx->join_ref, "", ctx->topic, event, payload);
+  var rc: int32 = rz_hub_send(ctx->hub, ctx->sock, rz_buf_str(b));
+  rz_buf_free(b);
+  return rc;
+}
+
+fn rz_chan_fanout(r: RzChanRouter*, topic: string, event: string, payload: string, skip: int64) -> int32 {
+  var b: RzBuf* = rz_buf_new();
+  rz_chan_encode(b, "", "", topic, event, payload);
+  var text: string = rz_buf_str(b);
+  var reached: int32 = 0;
+  var i: int32 = 0;
+  while (i < r->max_members) {
+    var m: RzChanMember* = &r->members[i];
+    if (m->used && m->sock != skip && rz_str_eq(m->topic, topic)) {
+      if (rz_hub_send(r->hub, m->sock, text) == 0) { reached = reached + 1; }
+    }
+    i = i + 1;
+  }
+  rz_buf_free(b);
+  return reached;
+}
+
+// Broadcasts to every member of `topic` (hub thread). Returns members reached.
+export fn rz_chan_broadcast(r: RzChanRouter*, topic: string, event: string, payload: string) -> int32 {
+  if (r == 0) { return 0; }
+  return rz_chan_fanout(r, topic, event, payload, -1);
+}
+
+// Broadcasts to every member of the context's topic except the sender.
+export fn rz_chan_broadcast_from(ctx: RzChanCtx*, event: string, payload: string) -> int32 {
+  if (ctx == 0) { return 0; }
+  return rz_chan_fanout(ctx->router, ctx->topic, event, payload, ctx->sock);
+}
+
+struct RzChanBcast {
+  router: RzChanRouter*;
+  topic: string;
+  event: string;
+  payload: string;
+}
+
+fn rz_chan_bcast_run(hub: RzHub*, arg: rawptr) {
+  var b: RzChanBcast* = (RzChanBcast*)arg;
+  if (hub != 0) { rz_chan_broadcast(b->router, b->topic, b->event, b->payload); }
+  rz_str_free(b->topic);
+  rz_str_free(b->event);
+  rz_str_free(b->payload);
+  free((rawptr)b);
+}
+
+// Broadcast from any thread: copies the strings and runs on the hub thread.
+// Returns false when the hub's mailbox is full (nothing was queued).
+export fn rz_chan_post_broadcast(r: RzChanRouter*, topic: string, event: string, payload: string) -> bool {
+  if (r == 0) { return false; }
+  var b: RzChanBcast* = (RzChanBcast*)calloc(1, sizeof(RzChanBcast));
+  if (b == 0) { return false; }
+  b->router = r;
+  b->topic = rz_str_dup(topic);
+  b->event = rz_str_dup(event);
+  b->payload = rz_str_dup(payload);
+  if (!rz_hub_post_call(r->hub, &rz_chan_bcast_run, (rawptr)b)) {
+    rz_chan_bcast_run(0, (rawptr)b);
+    return false;
+  }
+  return true;
+}

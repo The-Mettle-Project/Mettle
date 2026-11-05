@@ -1,0 +1,1021 @@
+// mythic_render_gl: OpenGL 3.3 core renderer for the display list, on Glint (DECISIONS Amendment 25).
+// The CPU renderer's tile hashing decides what changed; when nothing did, nothing is drawn or
+// swapped. Otherwise every command overlapping the damage (widened by the buffer age) becomes one
+// instanced quad, drawn under one scissor. The shaders (assets/shaders/mythic_ui.*) repeat the
+// CPU coverage maths, so output matches the CPU goldens within a small tolerance. Glyphs come
+// from the shared atlas (R8 array texture), images are textures, paths are rasterized on the CPU
+// into an R32F sprite atlas cached by geometry (whole path, so scrolling under a clip reuses it);
+// paths too big for a sprite are rasterized per frame over their visible part only, in bands
+// streamed through a small texture. Rounded clips are a coverage product in the shader.
+import "std/mem";
+import "std/io";
+import "glint/glint";
+import "mythic_types";
+import "mythic_dl";
+import "mythic_ttf";
+import "mythic_fonts";
+import "mythic_glyph";
+import "mythic_image";
+import "mythic_raster_path";
+import "mythic_raster";
+
+var g_mythic_gl_vs: string = import_str "../assets/shaders/mythic_ui.vert";
+var g_mythic_gl_fs: string = import_str "../assets/shaders/mythic_ui.frag";
+var g_mythic_gl_why: cstring = "";
+var g_mythic_gl_cur: GlintContext* = 0;     // the context made current last (several apps, tests)
+
+const GL_PATH_ATLAS = 1024;
+const GL_PATH_SPRITE_AREA = 262144; // largest cached sprite (w * h): a quarter of the atlas
+const GL_BIG_BAND = 128;            // rows per band of an oversized path
+const GL_BIG_SLOTS = 4;             // bands the band texture holds (uploads rotate through them)
+const GL_BIG_MAX_W = 4096;          // widest band piece (also cut to GL_MAX_TEXTURE_SIZE)
+const GL_CLIP_ROW = 1024;           // texels per row of the clip shape texture
+const GL_INST_BYTES = 112;
+
+// One quad. Slots a..d depend on the kind (table in mythic_ui.frag).
+struct GlInst {
+  bx0: int32; by0: int32; bx1: int32; by1: int32;
+  cx0: int32; cy0: int32; cx1: int32; cy1: int32;
+  a0: float32; a1: float32; a2: float32; a3: float32;
+  b0: float32; b1: float32; b2: float32; b3: float32;
+  c0: float32; c1: float32; c2: float32; c3: float32;
+  d0: float32; d1: float32; d2: float32; d3: float32;
+  kind: uint32; color: uint32; color2: uint32; clip: uint32;
+}
+struct GlBatch { first: int32; count: int32; tex: uint32; big: int32; }   // big: band job + 1
+// One band piece of an oversized path: command ci over device rect x0 y0 x1 y1, uploaded to
+// rows slot_y.. of the band texture right before its batch draws.
+struct GlBig { ci: int32; x0: int32; y0: int32; x1: int32; y1: int32; slot_y: int32; }
+struct GlImg { tex: uint32; gen: int32; }
+struct GlPathEnt { x: int32; y: int32; }
+struct GlShape { x0: float32; y0: float32; x1: float32; y1: float32; tl: float32; tr: float32; br: float32; bl: float32; }
+
+// Opaque outside this module.
+export struct MythicGLRenderer {
+  ctx: GlintContext*;
+  fonts: MythicFonts*; images: MythicImages*;
+  dmg: MythicRenderer*;               // tile damage and command boxes (CPU code, draws nothing)
+  readback: bool;                     // headless: copy dirty rects into a CPU framebuffer
+  prog: uint32; vao: uint32; vbo: uint32; vbo_cap: int64;
+  u_size: int32;
+  w: int32; h: int32;
+  frames: int64;
+  hist: int32[16];                    // dirty bounding boxes of the last 4 frames (x0 y0 x1 y1)
+  hist_n: int32;
+  insts: MythicVec<GlInst>;
+  batches: MythicVec<GlBatch>;
+  clip_first: MythicVec<int32>;       // per clip index: first shape + 1 (0 = not built this frame)
+  shapes: MythicVec<float32>;         // 8 floats per rounded clip shape
+  tex_clips: uint32;
+  // glyph atlas mirror
+  tex_glyphs: uint32; glyph_layers: int32;
+  glyph_gen: int32; glyph_count: int64; glyph_all: bool;
+  glyph_dirty: MythicVec<int32>;      // per page: first row, end row (end 0 = clean)
+  // path sprites
+  tex_paths: uint32;
+  path_map: MythicMap<GlPathEnt>;
+  path_shelves: MythicVec<MythicAtlasShelf>;
+  path_next_y: int32;
+  path_full: bool;
+  path_buf: float32*; path_cap: int64;
+  acc: MythicAccum; acc_base: float32*;   // acc.acc = acc_base + 4 (see path_cov)
+  imgs: MythicVec<GlImg>;
+  path_uploads: int64;                // path coverage uploads so far (tests)
+  // oversized paths: bands streamed through tex_big (big_w x GL_BIG_BAND * GL_BIG_SLOTS)
+  tex_big: uint32; big_w: int32;
+  bigs: MythicVec<GlBig>;
+  big_slot: int32;
+  max_tex: int32;                     // GL_MAX_TEXTURE_SIZE
+  prog_state: int32;                  // 1 linked and set up, 0 still compiling, -1 failed
+  lost: bool;                         // a frame found the context lost (or the test hook said so)
+  test_wait: int32;                   // test hook: polls that still say "compiling"
+  test_lost: int32;                   // test hook: the frame (counted from now) that reports a loss
+  test_fail: bool;                    // test hook: the program fails to build
+  warm: bool;                         // mythic_gl_warm: draw, don't show
+}
+
+fn use_ctx(g: MythicGLRenderer*) {
+  if (g_mythic_gl_cur != g->ctx) { glint_make_current(g->ctx); g_mythic_gl_cur = g->ctx; }
+}
+
+/// Why the last mythic_gl_create (or the offscreen helper) failed.
+export fn mythic_gl_error() -> cstring { return g_mythic_gl_why; }
+
+// ------------------------------------------------------------------ CPU-side geometry
+
+fn ifloor(x: float32) -> int32 {
+  var i: int32 = (int32)x;
+  if ((float32)i > x) { i = i - 1; }
+  return i;
+}
+fn iceil(x: float32) -> int32 {
+  var i: int32 = (int32)x;
+  if ((float32)i < x) { i = i + 1; }
+  return i;
+}
+fn clamp01(x: float32) -> float32 {
+  if (x < 0.0) { return 0.0; }
+  if (x > 1.0) { return 1.0; }
+  return x;
+}
+
+// make_shape in mythic_raster: radii scaled down so opposite corners never overlap
+fn shape_of(x: float32, y: float32, w: float32, h: float32, rc: MythicCorners) -> GlShape {
+  var s: GlShape = { x0: x, y0: y, x1: x + w, y1: y + h,
+                     tl: mythic_maxf(rc.tl, 0.0), tr: mythic_maxf(rc.tr, 0.0), br: mythic_maxf(rc.br, 0.0), bl: mythic_maxf(rc.bl, 0.0) };
+  var f: float32 = 1.0;
+  if (s.tl + s.tr > w) { f = mythic_minf(f, w / (s.tl + s.tr)); }
+  if (s.bl + s.br > w) { f = mythic_minf(f, w / (s.bl + s.br)); }
+  if (s.tl + s.bl > h) { f = mythic_minf(f, h / (s.tl + s.bl)); }
+  if (s.tr + s.br > h) { f = mythic_minf(f, h / (s.tr + s.br)); }
+  if (f < 1.0) { s.tl = s.tl * f; s.tr = s.tr * f; s.br = s.br * f; s.bl = s.bl * f; }
+  return s;
+}
+
+fn premul(c: uint32) -> uint32 {
+  var a: uint32 = c >> (uint32)24;
+  var m: uint32 = (uint32)0x00FF00FF;
+  var rb: uint32 = (c & m) * a + (uint32)0x00800080;
+  rb = ((rb + ((rb >> (uint32)8) & m)) >> (uint32)8) & m;
+  var g: uint32 = ((c >> (uint32)8) & (uint32)255) * a + (uint32)128;
+  g = (g + (g >> (uint32)8)) >> (uint32)8;
+  return (a << (uint32)24) | rb | (g << (uint32)8);
+}
+
+fn q4(v: float32) -> float32 { return mythic_roundf(v * 4.0) * 0.25; }
+
+fn set_shape(q: GlInst*, s: GlShape) {
+  q->a0 = s.x0; q->a1 = s.y0; q->a2 = s.x1; q->a3 = s.y1;
+  q->b0 = s.tl; q->b1 = s.tr; q->b2 = s.br; q->b3 = s.bl;
+}
+
+fn fbits(f: float32) -> uint64 {
+  var v: float32 = f;
+  return (uint64)*(uint32*)&v;
+}
+
+// ------------------------------------------------------------------ GL objects
+
+fn tex_new(target: uint32) -> uint32 {
+  var t: uint32 = 0;
+  glGenTextures(1, &t);
+  glBindTexture(target, t);
+  glTexParameteri(target, GL_TEXTURE_MIN_FILTER, (int32)GL_NEAREST);
+  glTexParameteri(target, GL_TEXTURE_MAG_FILTER, (int32)GL_NEAREST);
+  glTexParameteri(target, GL_TEXTURE_WRAP_S, (int32)GL_CLAMP_TO_EDGE);
+  glTexParameteri(target, GL_TEXTURE_WRAP_T, (int32)GL_CLAMP_TO_EDGE);
+  glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, 0);
+  return t;
+}
+
+fn set_attribs(off: int64) {
+  var st: int32 = GL_INST_BYTES;
+  glVertexAttribIPointer(0, 4, GL_INT, st, (rawptr)off);
+  glVertexAttribIPointer(1, 4, GL_INT, st, (rawptr)(off + 16));
+  glVertexAttribPointer(2, 4, GL_FLOAT, (uint8)0, st, (rawptr)(off + 32));
+  glVertexAttribPointer(3, 4, GL_FLOAT, (uint8)0, st, (rawptr)(off + 48));
+  glVertexAttribPointer(4, 4, GL_FLOAT, (uint8)0, st, (rawptr)(off + 64));
+  glVertexAttribPointer(5, 4, GL_FLOAT, (uint8)0, st, (rawptr)(off + 80));
+  glVertexAttribIPointer(6, 4, GL_UNSIGNED_INT, st, (rawptr)(off + 96));
+}
+
+fn uniform_i(prog: uint32, name: cstring, v: int32) {
+  var loc: int32 = glGetUniformLocation(prog, name);
+  if (loc >= 0) { glUniform1i(loc, v); }
+}
+
+/// Makes a renderer on the current context of `ctx` (GL 3.3 core or newer) and waits for its
+/// shaders. `readback` = the context is headless and mythic_gl_read copies results into a CPU
+/// framebuffer. Returns 0 when the shaders do not build (mythic_gl_error says why).
+export fn mythic_gl_create(ctx: GlintContext*, f: MythicFonts*, im: MythicImages*, readback: bool) -> MythicGLRenderer* {
+  var g: MythicGLRenderer* = mythic_gl_create_async(ctx, f, im, readback);
+  if (g == 0) { return g; }
+  if (mythic_gl_poll(g, true) != 1) { mythic_gl_destroy(g); return (MythicGLRenderer*)0; }
+  return g;
+}
+
+/// Like mythic_gl_create, but returns while the driver still compiles the shaders (on its own
+/// threads with GL_KHR_parallel_shader_compile). Call mythic_gl_poll until it says 1 before
+/// mythic_gl_render; draw some other way meanwhile.
+export fn mythic_gl_create_async(ctx: GlintContext*, f: MythicFonts*, im: MythicImages*, readback: bool) -> MythicGLRenderer* {
+  if (glint_gl_version(ctx) < 33) { g_mythic_gl_why = "GL 3.3 not available"; return (MythicGLRenderer*)0; }
+  var vs: string = g_mythic_gl_vs;
+  var fs: string = g_mythic_gl_fs;
+  var prog: uint32 = glint_program_start(vs, fs);
+  if (prog == (uint32)0) { g_mythic_gl_why = glint_error(); return (MythicGLRenderer*)0; }
+  var g: MythicGLRenderer* = new MythicGLRenderer;
+  g->ctx = ctx;
+  g_mythic_gl_cur = ctx;
+  g->fonts = f;
+  g->images = im;
+  g->readback = readback;
+  g->dmg = mythic_renderer_create(f, im);
+  g->prog = prog;
+  glGenVertexArrays(1, &g->vao);
+  glBindVertexArray(g->vao);
+  glGenBuffers(1, &g->vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
+  for i: int32 in 0..7 {
+    glEnableVertexAttribArray((uint32)i);
+    glVertexAttribDivisor((uint32)i, (uint32)1);
+  }
+  g->tex_clips = tex_new(GL_TEXTURE_2D);
+  g->tex_paths = tex_new(GL_TEXTURE_2D);
+  glTexImage2D(GL_TEXTURE_2D, 0, (int32)GL_R32F, GL_PATH_ATLAS, GL_PATH_ATLAS, 0, GL_RED, GL_FLOAT, (rawptr)0);
+  g->glyph_gen = -1;
+  var mt: int32 = 0;
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &mt);
+  g->max_tex = mythic_maxi(mt, GL_PATH_ATLAS);      // GL 3.3 guarantees 1024
+  if (glGetError() != GL_NO_ERROR) {
+    g_mythic_gl_why = "GL error while setting up the renderer";
+    mythic_gl_destroy(g);
+    return (MythicGLRenderer*)0;
+  }
+  return g;
+}
+
+// the program linked: look its uniforms up and set the constant ones
+fn prog_setup(g: MythicGLRenderer*) -> bool {
+  var prog: uint32 = g->prog;
+  glUseProgram(prog);
+  g->u_size = glGetUniformLocation(prog, "u_size");
+  uniform_i(prog, "u_glyphs", 0);
+  uniform_i(prog, "u_paths", 1);
+  uniform_i(prog, "u_image", 2);
+  uniform_i(prog, "u_clips", 3);
+  var lut: float32[256];
+  for i: int32 in 0..256 {
+    var v: float32 = mythic_powf((float32)i / 255.0, 1.0 / 1.25);
+    lut[i] = (float32)mythic_clampi(mythic_iround(v * 255.0), 0, 255);
+  }
+  var lg: int32 = glGetUniformLocation(prog, "u_gamma");
+  if (lg >= 0) { glUniform4fv(lg, 64, &lut[0]); }
+  return glGetError() == GL_NO_ERROR;
+}
+
+/// Where the shader build stands: 1 ready (mythic_gl_render may be called), 0 still compiling,
+/// -1 failed (mythic_gl_error says why; destroy the renderer). `block` waits for the driver
+/// instead of answering 0. Cheap once it has said 1 or -1.
+export fn mythic_gl_poll(g: MythicGLRenderer*, block: bool) -> int32 {
+  if (g == 0) { return -1; }
+  if (g->prog_state != 0) { return g->prog_state; }
+  if (g->test_wait > 0) { g->test_wait = g->test_wait - 1; return 0; }
+  use_ctx(g);
+  if (g->test_fail) {
+    glDeleteProgram(g->prog);
+    g->prog = (uint32)0;
+    g_mythic_gl_why = "the shader program failed to build (test hook)";
+    g->prog_state = -1;
+    return -1;
+  }
+  if (block) {
+    var ok: int32 = 0;
+    glGetProgramiv(g->prog, GL_LINK_STATUS, &ok);     // the driver waits for its compile threads here
+  }
+  var st: int32 = glint_program_poll(g->prog);
+  if (st == 0) { return 0; }
+  if (st < 0) {
+    g->prog = (uint32)0;                              // Glint deleted it
+    g_mythic_gl_why = glint_error();
+    g->prog_state = -1;
+    return -1;
+  }
+  if (!prog_setup(g)) {
+    g_mythic_gl_why = "GL error while setting up the shader program";
+    g->prog_state = -1;
+    return -1;
+  }
+  g->prog_state = 1;
+  return 1;
+}
+
+/// Draws all of `dl` into the back buffer without showing it, and waits for it. The driver
+/// compiles its code for the shaders' state on the first draw (llvmpipe: about 150 ms cold), so do
+/// this once, after a frame from another renderer is on screen, then switch with a full frame.
+/// False if GL failed (mythic_gl_error says why).
+export fn mythic_gl_warm(g: MythicGLRenderer*, dl: MythicDrawList*, w: int32, h: int32) -> bool {
+  g->warm = true;
+  var n: int32 = mythic_gl_render(g, dl, w, h, true);
+  g->warm = false;
+  return n >= 0;
+}
+
+/// Test hook: the next `polls` polls say "still compiling"; the `lost_after`-th frame from now
+/// reports a lost context (0 = never); `fail` makes the shader build fail.
+export fn mythic_gl_test_hook(g: MythicGLRenderer*, polls: int32, lost_after: int32, fail: bool) {
+  if (g == 0) { return; }
+  g->test_wait = polls;
+  g->test_lost = lost_after;
+  g->test_fail = fail;
+}
+
+// ------------------------------------------------------------------ glyph atlas mirror
+
+fn glyph_sync_begin(g: MythicGLRenderer*) {
+  var c: MythicGlyphCache* = &g->fonts->glyphs;
+  if (c->gen != g->glyph_gen) {
+    // the cache was cleared: every glyph from here on is a miss we see
+    g->glyph_gen = c->gen;
+    g->glyph_count = c->map.count;
+    if (g->glyph_count != 0) { g->glyph_all = true; }
+  } else if (c->map.count != g->glyph_count) {
+    g->glyph_all = true;           // glyphs rasterized by someone else (a CPU render)
+  }
+}
+
+fn glyph_mark(g: MythicGLRenderer*, e: MythicGlyphEntry) {
+  while (g->glyph_dirty.len < (int64)(e.page + 1) * 2) { mythic_vec_push<int32>(&g->glyph_dirty, 0); }
+  var d: int32* = &g->glyph_dirty.data[(int64)e.page * 2];
+  if (d[1] == 0) { d[0] = e.y; d[1] = e.y + e.h; return; }
+  d[0] = mythic_mini(d[0], e.y);
+  d[1] = mythic_maxi(d[1], e.y + e.h);
+}
+
+fn glyph_sync_end(g: MythicGLRenderer*) {
+  var c: MythicGlyphCache* = &g->fonts->glyphs;
+  var W: int32 = MYTHIC_ATLAS_SIZE;
+  var pages: int32 = c->live_pages;
+  if (g->tex_glyphs == (uint32)0 || pages > g->glyph_layers) {
+    if (g->tex_glyphs != (uint32)0) { glDeleteTextures(1, &g->tex_glyphs); }
+    g->glyph_layers = mythic_maxi(pages + 2, MYTHIC_ATLAS_MAX_PAGES + 2);
+    glActiveTexture(GL_TEXTURE0);
+    g->tex_glyphs = tex_new(GL_TEXTURE_2D_ARRAY);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, (int32)GL_R8, W, W, g->glyph_layers, 0, GL_RED, GL_UNSIGNED_BYTE, (rawptr)0);
+    g->glyph_all = true;
+  }
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, g->tex_glyphs);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  for p: int32 in 0..pages {
+    var y0: int32 = 0;
+    var y1: int32 = 0;
+    if (g->glyph_all) { y1 = W; }
+    else if (g->glyph_dirty.len >= (int64)(p + 1) * 2) {
+      y0 = g->glyph_dirty.data[(int64)p * 2];
+      y1 = g->glyph_dirty.data[(int64)p * 2 + 1];
+    }
+    if (y1 > y0) {
+      var src: uint8* = c->pages.data[p].px + (int64)y0 * (int64)W;
+      glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, y0, p, W, y1 - y0, 1, GL_RED, GL_UNSIGNED_BYTE, (rawptr)src);
+    }
+  }
+  for i: int64 in 0..g->glyph_dirty.len { g->glyph_dirty.data[i] = 0; }
+  g->glyph_all = false;
+  g->glyph_count = c->map.count;
+}
+
+// ------------------------------------------------------------------ path sprites
+
+fn path_alloc(g: MythicGLRenderer*, w: int32, h: int32, ox: int32*, oy: int32*) -> bool {
+  var W: int32 = GL_PATH_ATLAS;
+  if (w > W || h > W) { return false; }
+  var best: int64 = -1;
+  var best_h: int32 = 100000;
+  for s: int64 in 0..g->path_shelves.len {
+    var sh: MythicAtlasShelf* = &g->path_shelves.data[s];
+    if (sh->h >= h && sh->h <= h + h / 4 + 2 && sh->x + w <= W && sh->h < best_h) { best = s; best_h = sh->h; }
+  }
+  if (best < 0 && g->path_next_y + h <= W) {
+    var ns: MythicAtlasShelf = { y: g->path_next_y, h: h, x: 0 };
+    mythic_vec_push<MythicAtlasShelf>(&g->path_shelves, ns);
+    g->path_next_y = g->path_next_y + h;
+    best = g->path_shelves.len - 1;
+  }
+  if (best < 0) { return false; }
+  var sh2: MythicAtlasShelf* = &g->path_shelves.data[best];
+  *ox = sh2->x; *oy = sh2->y;
+  sh2->x = sh2->x + w;
+  return true;
+}
+
+fn path_reset(g: MythicGLRenderer*) {
+  mythic_map_clear<GlPathEnt>(&g->path_map);
+  mythic_vec_clear<MythicAtlasShelf>(&g->path_shelves);
+  g->path_next_y = 0;
+}
+
+// capsule coverage of one stroke segment, union by max (seg_cov in mythic_raster)
+fn seg_cov(buf: float32*, bw: int32, bh: int32, ax: float32, ay: float32, bx: float32, by: float32, hw: float32) {
+  var x0: int32 = mythic_maxi(ifloor(mythic_minf(ax, bx) - hw - 1.0), 0);
+  var x1: int32 = mythic_mini(iceil(mythic_maxf(ax, bx) + hw + 1.0), bw);
+  var y0: int32 = mythic_maxi(ifloor(mythic_minf(ay, by) - hw - 1.0), 0);
+  var y1: int32 = mythic_mini(iceil(mythic_maxf(ay, by) + hw + 1.0), bh);
+  var dx: float32 = bx - ax;
+  var dy: float32 = by - ay;
+  var l2: float32 = dx * dx + dy * dy;
+  var il2: float32 = 0.0;
+  if (l2 > 0.0) { il2 = 1.0 / l2; }
+  for y: int32 in y0..y1 {
+    var py: float32 = (float32)y + 0.5 - ay;
+    var brow: float32* = buf + (int64)y * (int64)bw;
+    for x: int32 in x0..x1 {
+      var px: float32 = (float32)x + 0.5 - ax;
+      var t: float32 = clamp01((px * dx + py * dy) * il2);
+      var ex: float32 = px - t * dx;
+      var ey: float32 = py - t * dy;
+      var cv: float32 = hw + 0.5 - mythic_sqrtf(ex * ex + ey * ey);
+      if (cv > brow[x]) { brow[x] = mythic_minf(cv, 1.0); }
+    }
+  }
+}
+
+// Coverage of path command c over the device rect at x0, y0 (w x h), with the accumulation and
+// capsule code of mythic_raster; geometry outside the rect is cut exactly. Returns rows of float
+// coverage *stride floats apart, valid until the next call.
+fn path_cov(g: MythicGLRenderer*, dl: MythicDrawList*, c: MythicCmd*, x0: int32, y0: int32, w: int32, h: int32, stride: int32*) -> float32* {
+  var fx: float32 = (float32)x0;
+  var fy: float32 = (float32)y0;
+  var pts: MythicVec2* = &dl->points.data[(int64)c->first];
+  var n: int32 = c->count;
+  if (c->kind == MYTHIC_CMD_PATH_FILL) {
+    var a: MythicAccum* = &g->acc;
+    // our own buffer with 4 floats in front: acc_piece can step x to -1e-7 on a line clipped
+    // at x = 0 and write acc[-1] (reports/issues/21); sized here so the reset never reallocates
+    var need: int64 = (int64)(w + 2) * (int64)(h + 1);
+    if (need > a->cap) {
+      if (g->acc_base != 0) { free((rawptr)g->acc_base); }
+      a->cap = need * 2;
+      if (a->cap < 4096) { a->cap = 4096; }
+      g->acc_base = (float32*)malloc((a->cap + 4) * 4);
+      a->acc = g->acc_base + (int64)4;
+    }
+    mythic_r_acc_reset(a, w, h);
+    for i: int32 in 0..n {
+      var p: MythicVec2 = pts[i];
+      var q: MythicVec2 = pts[(i + 1) % n];
+      mythic_r_acc_line(a, p.x - fx, p.y - fy, q.x - fx, q.y - fy);
+    }
+    for y: int32 in 0..h {           // prefix sums in place
+      var s: float32 = 0.0;
+      var arow: float32* = a->acc + (int64)y * (int64)a->stride;
+      for x: int32 in 0..w {
+        s = s + arow[x];
+        var v: float32 = s;
+        if (v < 0.0) { v = -v; }
+        if (v > 1.0) { v = 1.0; }
+        arow[x] = v;
+      }
+    }
+    *stride = a->stride;
+    return a->acc;
+  }
+  var need: int64 = (int64)w * (int64)h;
+  if (need > g->path_cap) {
+    if (g->path_buf != 0) { free((rawptr)g->path_buf); }
+    g->path_cap = need * 2;
+    g->path_buf = (float32*)malloc(g->path_cap * 4);
+  }
+  var buf: float32* = g->path_buf;
+  memset((rawptr)buf, 0, need * 4);
+  var hw: float32 = c->a * 0.5;
+  var left: float32 = c->b;           // draw-on length (0 = whole path)
+  var limited: bool = left > 0.0;
+  var nseg: int32 = n - 1;
+  if (c->res == 1) { nseg = n; }
+  for i: int32 in 0..nseg {
+    var p: MythicVec2 = pts[i];
+    var q: MythicVec2 = pts[(i + 1) % n];
+    if (limited) {
+      var dx: float32 = q.x - p.x;
+      var dy: float32 = q.y - p.y;
+      var l: float32 = mythic_sqrtf(dx * dx + dy * dy);
+      if (l > left) {
+        var f: float32 = 0.0;
+        if (l > 0.0) { f = left / l; }
+        q.x = p.x + dx * f; q.y = p.y + dy * f;
+        seg_cov(buf, w, h, p.x - fx, p.y - fy, q.x - fx, q.y - fy, hw);
+        break;
+      }
+      left = left - l;
+    }
+    seg_cov(buf, w, h, p.x - fx, p.y - fy, q.x - fx, q.y - fy, hw);
+  }
+  *stride = w;
+  return buf;
+}
+
+// into the texture bound on the active unit
+fn path_upload(g: MythicGLRenderer*, x: int32, y: int32, w: int32, h: int32, data: float32*, stride: int32) {
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, stride);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RED, GL_FLOAT, (rawptr)data);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+  g->path_uploads = g->path_uploads + 1;
+}
+
+// 1/4096 px steps: a whole-pixel move in float can change the last bit of a coordinate
+fn qbits(v: float32) -> uint64 { return (uint64)(uint32)(int32)mythic_roundf(v * 4096.0); }
+
+// Coverage of a whole path over its unclipped box u (x0 y0 x1 y1), cached in the sprite atlas by
+// its geometry relative to u: a path that moves by whole pixels, under a clip edge too, keeps
+// its sprite. False when the atlas has no room (path_full is set).
+fn path_sprite(g: MythicGLRenderer*, dl: MythicDrawList*, c: MythicCmd*, u: MythicRectI, ox: int32*, oy: int32*) -> bool {
+  var w: int32 = u.w - u.x;
+  var h: int32 = u.h - u.y;
+  var fx: float32 = (float32)u.x;
+  var fy: float32 = (float32)u.y;
+  var pts: MythicVec2* = &dl->points.data[(int64)c->first];
+  var n: int32 = c->count;
+  var key: uint64 = mythic_hash_u64((uint64)c->kind, ((uint64)(uint32)w << (uint64)32) | (uint64)(uint32)h);
+  key = mythic_hash_u64(key, (fbits(c->a) << (uint64)32) | fbits(c->b));
+  key = mythic_hash_u64(key, ((uint64)(uint32)c->res << (uint64)32) | (uint64)(uint32)n);
+  for i: int32 in 0..n { key = mythic_hash_u64(key, (qbits(pts[i].x - fx) << (uint64)32) | qbits(pts[i].y - fy)); }
+  key = key | (uint64)1;
+  var hit: GlPathEnt* = mythic_map_get<GlPathEnt>(&g->path_map, key, false);
+  if (hit != 0) { *ox = hit->x; *oy = hit->y; return true; }
+  var ax: int32 = 0;
+  var ay: int32 = 0;
+  if (!path_alloc(g, w, h, &ax, &ay)) { g->path_full = true; return false; }
+  var stride: int32 = 0;
+  var data: float32* = path_cov(g, dl, c, u.x, u.y, w, h, &stride);
+  glActiveTexture(GL_TEXTURE0 + (uint32)1);
+  glBindTexture(GL_TEXTURE_2D, g->tex_paths);
+  path_upload(g, ax, ay, w, h, data, stride);
+  var slot: GlPathEnt* = mythic_map_get<GlPathEnt>(&g->path_map, key, true);
+  slot->x = ax; slot->y = ay;
+  *ox = ax; *oy = ay;
+  return true;
+}
+
+// ------------------------------------------------------------------ images
+
+fn image_tex(g: MythicGLRenderer*, id: int32, img: MythicImage*) -> uint32 {
+  var e: GlImg;
+  while (g->imgs.len <= (int64)id) { mythic_vec_push<GlImg>(&g->imgs, e); }
+  var s: GlImg* = &g->imgs.data[(int64)id];
+  if (s->tex != (uint32)0 && s->gen == img->gen) { return s->tex; }
+  glActiveTexture(GL_TEXTURE0 + (uint32)2);
+  if (s->tex == (uint32)0) { s->tex = tex_new(GL_TEXTURE_2D); } else { glBindTexture(GL_TEXTURE_2D, s->tex); }
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glTexImage2D(GL_TEXTURE_2D, 0, (int32)GL_RGBA8, img->w, img->h, 0, GL_BGRA, GL_UNSIGNED_BYTE, (rawptr)img->px);
+  s->gen = img->gen;
+  return s->tex;
+}
+
+// ------------------------------------------------------------------ instances
+
+fn clip_info(g: MythicGLRenderer*, dl: MythicDrawList*, ci: int32) -> uint32 {
+  var ns: int32 = mythic_dl_clip_shape_count(dl, ci);
+  if (ns == 0) { return (uint32)0; }
+  var cf: int32* = &g->clip_first.data[(int64)ci];
+  if (*cf == 0) {
+    *cf = (int32)(g->shapes.len / 8) + 1;
+    for i: int32 in 0..ns {
+      var cl: MythicClip = mythic_dl_clip_shape(dl, ci, i);
+      var rc: MythicCorners = { tl: cl.radius, tr: cl.radius, br: cl.radius, bl: cl.radius };
+      var s: GlShape = shape_of(cl.x, cl.y, cl.w, cl.h, rc);
+      mythic_vec_push<float32>(&g->shapes, s.x0); mythic_vec_push<float32>(&g->shapes, s.y0);
+      mythic_vec_push<float32>(&g->shapes, s.x1); mythic_vec_push<float32>(&g->shapes, s.y1);
+      mythic_vec_push<float32>(&g->shapes, s.tl); mythic_vec_push<float32>(&g->shapes, 0.0);
+      mythic_vec_push<float32>(&g->shapes, 0.0); mythic_vec_push<float32>(&g->shapes, 0.0);
+    }
+  }
+  return ((uint32)(*cf - 1) << (uint32)8) | (uint32)mythic_mini(ns, 255);
+}
+
+fn push_inst(g: MythicGLRenderer*, b: MythicRectI, cb: MythicRectI, kind: int32, color: uint32, clip: uint32, tex: uint32) -> GlInst* {
+  var q: GlInst;
+  q.bx0 = b.x; q.by0 = b.y; q.bx1 = b.w; q.by1 = b.h;
+  q.cx0 = cb.x; q.cy0 = cb.y; q.cx1 = cb.w; q.cy1 = cb.h;
+  q.kind = (uint32)kind; q.color = color; q.clip = clip;
+  var n: int32 = (int32)g->insts.len;
+  var last: GlBatch* = (GlBatch*)0;
+  if (g->batches.len > 0) { last = &g->batches.data[g->batches.len - 1]; }
+  if (last == 0 || last->big != 0 || (tex != (uint32)0 && last->tex != (uint32)0 && last->tex != tex)) {
+    var nb: GlBatch = { first: n, count: 0, tex: tex, big: 0 };
+    last = mythic_vec_push<GlBatch>(&g->batches, nb);
+  }
+  if (tex != (uint32)0) { last->tex = tex; }
+  last->count = last->count + 1;
+  return mythic_vec_push<GlInst>(&g->insts, q);
+}
+
+// One band piece of an oversized path: a batch of its own, so its coverage can be uploaded to the
+// band texture right before it draws.
+fn push_big(g: MythicGLRenderer*, j: GlBig, cb: MythicRectI, color: uint32, clip: uint32) {
+  var jb: GlBig* = mythic_vec_push<GlBig>(&g->bigs, j);
+  var nb: GlBatch = { first: (int32)g->insts.len, count: 1, tex: (uint32)0, big: (int32)g->bigs.len };
+  mythic_vec_push<GlBatch>(&g->batches, nb);
+  var q: GlInst;
+  q.bx0 = jb->x0; q.by0 = jb->y0; q.bx1 = jb->x1; q.by1 = jb->y1;
+  q.cx0 = cb.x; q.cy0 = cb.y; q.cx1 = cb.w; q.cy1 = cb.h;
+  q.kind = (uint32)8; q.color = color; q.clip = clip;
+  q.a0 = (float32)(0 - jb->x0); q.a1 = (float32)(jb->slot_y - jb->y0);
+  mythic_vec_push<GlInst>(&g->insts, q);
+}
+
+fn overlaps(b: MythicRectI, r: MythicRectI) -> bool {
+  return b.x < r.w && b.w > r.x && b.y < r.h && b.h > r.y;
+}
+
+fn emit_glyphs(g: MythicGLRenderer*, dl: MythicDrawList*, c: MythicCmd*, b: MythicRectI, reg: MythicRectI, clip: uint32) {
+  var f: MythicFonts* = g->fonts;
+  if (f == 0 || f->count == 0) { return; }
+  var font: int32 = c->res;
+  if (font < 0 || font >= f->count) { font = 0; }
+  var t: MythicTtf* = mythic_fonts_ttf(f, font);
+  var sc: float32 = c->a / (float32)t->upem;
+  var size_q: int32 = mythic_iround(c->a * 4.0);
+  var gxmin: float32 = (float32)t->x_min * sc - 1.0;
+  var gxmax: float32 = (float32)t->x_max * sc + 1.0;
+  var gymax: float32 = (float32)t->y_max * sc + 1.0;
+  var gymin: float32 = (float32)t->y_min * sc - 1.0;
+  var darken: float32 = 0.0;
+  if (c->b != 0.0) { darken = 1.0; }
+  var cache: MythicGlyphCache* = &f->glyphs;
+  var fbx0: float32 = (float32)b.x; var fbx1: float32 = (float32)b.w;
+  var fby0: float32 = (float32)b.y; var fby1: float32 = (float32)b.h;
+  for k: int32 in 0..c->count {
+    var gp: MythicGlyphPos = dl->glyphs.data[(int64)(c->first + k)];
+    if (gp.x + gxmax < fbx0 || gp.x + gxmin > fbx1) { continue; }
+    if (gp.y - gymax > fby1 || gp.y - gymin < fby0) { continue; }
+    var fx: int32 = ifloor(gp.x);
+    var bin: int32 = (int32)((gp.x - (float32)fx) * 4.0 + 0.5);
+    if (bin >= 4) { bin = 0; fx = fx + 1; }
+    var before: int64 = cache->map.count;
+    var e: MythicGlyphEntry = *mythic_glyph_get(cache, t, font, gp.glyph, size_q, bin);
+    if (cache->map.count != before && e.w > 0) { glyph_mark(g, e); }
+    if (e.w == 0) { continue; }
+    var by: int32 = ifloor(gp.y + 0.5);
+    var gx0: int32 = fx + e.left;
+    var gy0: int32 = by + e.top;
+    var q: MythicRectI = { x: mythic_maxi(gx0, b.x), y: mythic_maxi(gy0, b.y),
+                           w: mythic_mini(gx0 + e.w, b.w), h: mythic_mini(gy0 + e.h, b.h) };
+    if (q.x >= q.w || q.y >= q.h || !overlaps(q, reg)) { continue; }
+    var p: GlInst* = push_inst(g, q, b, 5, c->color, clip, (uint32)0);
+    p->a0 = (float32)(e.x - gx0); p->a1 = (float32)(e.y - gy0); p->a2 = (float32)e.page; p->a3 = darken;
+  }
+}
+
+fn emit_shadow(g: MythicGLRenderer*, c: MythicCmd*, b: MythicRectI, clip: uint32) {
+  var spread: float32 = c->d;
+  var sx0: float32 = q4(c->x + c->a - spread);
+  var sy0: float32 = q4(c->y + c->b - spread);
+  var sx1: float32 = q4(c->x + c->a + c->w + spread);
+  var sy1: float32 = q4(c->y + c->b + c->h + spread);
+  if (sx1 <= sx0 || sy1 <= sy0) { return; }
+  var rc: MythicCorners = c->radii;
+  if (rc.tl > 0.0) { rc.tl = mythic_maxf(rc.tl + spread, 0.0); }
+  if (rc.tr > 0.0) { rc.tr = mythic_maxf(rc.tr + spread, 0.0); }
+  if (rc.br > 0.0) { rc.br = mythic_maxf(rc.br + spread, 0.0); }
+  if (rc.bl > 0.0) { rc.bl = mythic_maxf(rc.bl + spread, 0.0); }
+  var o: GlShape = shape_of(sx0, sy0, sx1 - sx0, sy1 - sy0, rc);
+  var sigma: float32 = c->c * 0.5;
+  if (sigma < 0.25) {
+    set_shape(push_inst(g, b, b, 1, c->color, clip, (uint32)0), o);
+    return;
+  }
+  var p: GlInst* = push_inst(g, b, b, 3, c->color, clip, (uint32)0);
+  set_shape(p, o);
+  p->c0 = (float32)mythic_iround(sigma * 8.0) * 0.125;
+}
+
+// A path: from the sprite atlas when the whole path is small enough, else (or when the atlas is
+// full even after a reset) its visible part (box b cut to the redraw region), rasterized this
+// frame in bands of GL_BIG_BAND rows.
+fn emit_path(g: MythicGLRenderer*, dl: MythicDrawList*, ci: int32, c: MythicCmd*, b: MythicRectI, reg: MythicRectI, clip: uint32) {
+  var A: float32 = (float32)GL_PATH_ATLAS;
+  if (c->w + 4.0 <= A && c->h + 4.0 <= A) {
+    // the command box of mythic_raster (cmd_box) before the clip and window cut it
+    var u: MythicRectI = { x: ifloor(c->x - 1.0), y: ifloor(c->y - 1.0), w: iceil(c->x + c->w + 1.0), h: iceil(c->y + c->h + 1.0) };
+    var uw: int32 = u.w - u.x;
+    var uh: int32 = u.h - u.y;
+    if (uw <= GL_PATH_ATLAS && uh <= GL_PATH_ATLAS && uw * uh <= GL_PATH_SPRITE_AREA) {
+      var ox: int32 = 0;
+      var oy: int32 = 0;
+      if (path_sprite(g, dl, c, u, &ox, &oy)) {
+        var p: GlInst* = push_inst(g, b, b, 7, c->color, clip, (uint32)0);
+        p->a0 = (float32)(ox - u.x); p->a1 = (float32)(oy - u.y);
+        return;
+      }
+    }
+  }
+  var r: MythicRectI = { x: mythic_maxi(b.x, reg.x), y: mythic_maxi(b.y, reg.y), w: mythic_mini(b.w, reg.w), h: mythic_mini(b.h, reg.h) };
+  if (r.x >= r.w || r.y >= r.h) { return; }
+  var cw: int32 = mythic_mini(g->max_tex, GL_BIG_MAX_W);
+  var y: int32 = r.y;
+  while (y < r.h) {
+    var x: int32 = r.x;
+    while (x < r.w) {
+      var j: GlBig = { ci: ci, x0: x, y0: y, x1: mythic_mini(x + cw, r.w), y1: mythic_mini(y + GL_BIG_BAND, r.h),
+                       slot_y: (g->big_slot % GL_BIG_SLOTS) * GL_BIG_BAND };
+      g->big_slot = (g->big_slot + 1) % GL_BIG_SLOTS;
+      push_big(g, j, b, c->color, clip);
+      x = x + cw;
+    }
+    y = y + GL_BIG_BAND;
+  }
+}
+
+fn emit_cmd(g: MythicGLRenderer*, dl: MythicDrawList*, ci: int32, reg: MythicRectI) {
+  var c: MythicCmd* = &dl->cmds.data[(int64)ci];
+  var b: MythicRectI = mythic_renderer_box(g->dmg, ci);
+  if (b.x >= b.w || b.y >= b.h || !overlaps(b, reg)) { return; }
+  var clip: uint32 = clip_info(g, dl, c->clip);
+  var k: int32 = c->kind;
+  if (k == MYTHIC_CMD_FILL) {
+    set_shape(push_inst(g, b, b, 1, c->color, clip, (uint32)0), shape_of(c->x, c->y, c->w, c->h, c->radii));
+  } else if (k == MYTHIC_CMD_STROKE) {
+    var o: GlShape = shape_of(c->x, c->y, c->w, c->h, c->radii);
+    var sw: float32 = c->a;
+    var iw: float32 = c->w - 2.0 * sw;
+    var ih: float32 = c->h - 2.0 * sw;
+    if (iw <= 0.0 || ih <= 0.0) {
+      set_shape(push_inst(g, b, b, 1, c->color, clip, (uint32)0), o);
+      return;
+    }
+    var rc: MythicCorners = { tl: mythic_maxf(o.tl - sw, 0.0), tr: mythic_maxf(o.tr - sw, 0.0),
+                              br: mythic_maxf(o.br - sw, 0.0), bl: mythic_maxf(o.bl - sw, 0.0) };
+    var in: GlShape = shape_of(c->x + sw, c->y + sw, iw, ih, rc);
+    var p: GlInst* = push_inst(g, b, b, 2, c->color, clip, (uint32)0);
+    set_shape(p, o);
+    p->c0 = in.x0; p->c1 = in.y0; p->c2 = in.x1; p->c3 = in.y1;
+    p->d0 = in.tl; p->d1 = in.tr; p->d2 = in.br; p->d3 = in.bl;
+  } else if (k == MYTHIC_CMD_SHADOW) {
+    emit_shadow(g, c, b, clip);
+  } else if (k == MYTHIC_CMD_GRADIENT) {
+    var p: GlInst* = push_inst(g, b, b, 4, premul(c->color), clip, (uint32)0);
+    set_shape(p, shape_of(c->x, c->y, c->w, c->h, c->radii));
+    p->color2 = premul(c->color2);
+    var dx: float32 = c->c - c->a;
+    var dy: float32 = c->d - c->b;
+    var l2: float32 = dx * dx + dy * dy;
+    p->c0 = c->a; p->c1 = c->b;
+    if (l2 > 0.0) { p->c2 = dx / l2; p->c3 = dy / l2; }
+  } else if (k == MYTHIC_CMD_GLYPHS) {
+    emit_glyphs(g, dl, c, b, reg, clip);
+  } else if (k == MYTHIC_CMD_IMAGE) {
+    var im: MythicImage* = mythic_images_get(g->images, c->res);
+    if (im == 0 || im->px == 0 || c->w <= 0.0 || c->h <= 0.0) { return; }
+    var tex: uint32 = image_tex(g, c->res, im);
+    var p: GlInst* = push_inst(g, b, b, 6, c->color, clip, tex);
+    set_shape(p, shape_of(c->x, c->y, c->w, c->h, c->radii));
+    var isx: float32 = (c->d - c->b) * (float32)im->w / c->w;
+    var isy: float32 = (c->e - c->c) * (float32)im->h / c->h;
+    p->c0 = c->b * (float32)im->w - c->x * isx;
+    p->c1 = c->c * (float32)im->h - c->y * isy;
+    p->c2 = isx; p->c3 = isy;
+    p->d0 = clamp01(c->a) * (float32)(c->color >> (uint32)24) / 255.0;
+  } else if (k == MYTHIC_CMD_PATH_FILL || k == MYTHIC_CMD_PATH_STROKE) {
+    if ((k == MYTHIC_CMD_PATH_FILL && c->count < 3) || c->count < 2) { return; }
+    emit_path(g, dl, ci, c, b, reg, clip);
+  }
+}
+
+fn build(g: MythicGLRenderer*, dl: MythicDrawList*, reg: MythicRectI) {
+  mythic_vec_clear<GlInst>(&g->insts);
+  mythic_vec_clear<GlBatch>(&g->batches);
+  mythic_vec_clear<float32>(&g->shapes);
+  mythic_vec_clear<int32>(&g->clip_first);
+  mythic_vec_clear<GlBig>(&g->bigs);
+  for i: int64 in 0..dl->clips.len { mythic_vec_push<int32>(&g->clip_first, 0); }
+  g->path_full = false;
+  var ncmd: int32 = (int32)dl->cmds.len;
+  for ci: int32 in 0..ncmd { emit_cmd(g, dl, ci, reg); }
+}
+
+// ------------------------------------------------------------------ frame
+
+// the band texture wide enough for this frame's band pieces (grown in steps of 256 px, kept)
+fn big_tex_fit(g: MythicGLRenderer*) {
+  if (g->bigs.len == 0) { return; }
+  var need: int32 = 0;
+  for i: int64 in 0..g->bigs.len { need = mythic_maxi(need, g->bigs.data[i].x1 - g->bigs.data[i].x0); }
+  if (g->tex_big != (uint32)0 && g->big_w >= need) { return; }
+  var w: int32 = mythic_mini((need + 255) / 256 * 256, mythic_mini(g->max_tex, GL_BIG_MAX_W));
+  w = mythic_maxi(w, need);
+  glActiveTexture(GL_TEXTURE0 + (uint32)2);
+  if (g->tex_big != (uint32)0) { glDeleteTextures(1, &g->tex_big); }
+  g->tex_big = tex_new(GL_TEXTURE_2D);
+  glTexImage2D(GL_TEXTURE_2D, 0, (int32)GL_R32F, w, GL_BIG_BAND * GL_BIG_SLOTS, 0, GL_RED, GL_FLOAT, (rawptr)0);
+  g->big_w = w;
+}
+
+fn hist_push(g: MythicGLRenderer*, r: MythicRectI) {
+  var i: int32 = 3;
+  while (i > 0) {
+    for k: int32 in 0..4 { g->hist[i * 4 + k] = g->hist[(i - 1) * 4 + k]; }
+    i = i - 1;
+  }
+  g->hist[0] = r.x; g->hist[1] = r.y; g->hist[2] = r.w; g->hist[3] = r.h;
+  g->hist_n = mythic_mini(g->hist_n + 1, 4);
+}
+
+/// Draws the parts of `dl` that changed into the context's w x h drawable and shows them
+/// (swap with damage; nothing for a headless context, see mythic_gl_read). Returns the number of
+/// dirty rects (mythic_gl_dirty; 0 = nothing changed, nothing drawn), or -1 if GL reported an error
+/// or the context is lost (mythic_gl_error says which; the caller drops GL and draws the frame
+/// another way).
+export fn mythic_gl_render(g: MythicGLRenderer*, dl: MythicDrawList*, w: int32, h: int32, force_full: bool) -> int32 {
+  if (g->prog_state != 1) { g_mythic_gl_why = "the shader program is not ready"; return -1; }
+  if (g->lost || g->ctx->lost) { g->lost = true; g_mythic_gl_why = "the GL context was lost"; return -1; }
+  use_ctx(g);
+  if (glint_context_lost(g->ctx)) { g->lost = true; g_mythic_gl_why = "the GL context was lost"; return -1; }
+  var force: bool = force_full;
+  if (w != g->w || h != g->h) {
+    glint_resize(g->ctx, w, h);
+    g->w = w; g->h = h;
+    g->hist_n = 0;
+    path_reset(g);
+    force = true;
+  }
+  var n: int32 = mythic_renderer_damage(g->dmg, dl, w, h, force);
+  if (n == 0) { return 0; }
+  var rects: MythicRectI* = mythic_renderer_dirty(g->dmg);
+  var cur: MythicRectI = { x: w, y: h, w: 0, h: 0 };      // x0 y0 x1 y1
+  for i: int32 in 0..n {
+    cur.x = mythic_mini(cur.x, rects[i].x); cur.y = mythic_mini(cur.y, rects[i].y);
+    cur.w = mythic_maxi(cur.w, rects[i].x + rects[i].w); cur.h = mythic_maxi(cur.h, rects[i].y + rects[i].h);
+  }
+  // the back buffer holds the frame from `age` swaps ago: redraw what changed since then
+  var reg: MythicRectI = { x: 0, y: 0, w: w, h: h };
+  var age: int32 = glint_buffer_age(g->ctx);
+  if (!force && age >= 1 && age <= g->hist_n + 1) {
+    reg = cur;
+    for i: int32 in 0..age - 1 {
+      reg.x = mythic_mini(reg.x, g->hist[i * 4]); reg.y = mythic_mini(reg.y, g->hist[i * 4 + 1]);
+      reg.w = mythic_maxi(reg.w, g->hist[i * 4 + 2]); reg.h = mythic_maxi(reg.h, g->hist[i * 4 + 3]);
+    }
+  }
+  hist_push(g, cur);
+
+  glyph_sync_begin(g);
+  build(g, dl, reg);
+  if (g->path_full) { path_reset(g); build(g, dl, reg); }
+  glyph_sync_end(g);
+
+  glBindFramebuffer(GL_FRAMEBUFFER, glint_framebuffer(g->ctx));
+  glViewport(0, 0, w, h);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_CULL_FACE);
+  glDisable(GL_FRAMEBUFFER_SRGB);
+  glEnable(GL_SCISSOR_TEST);
+  glScissor(reg.x, h - reg.h, reg.w - reg.x, reg.h - reg.y);
+  glClearColor((float32)0.0, (float32)0.0, (float32)0.0, (float32)1.0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  glUseProgram(g->prog);
+  glUniform2f(g->u_size, (float32)w, (float32)h);
+  // clip shapes
+  var nsh: int64 = g->shapes.len / 4;            // texels
+  var rows: int32 = (int32)((nsh + (int64)GL_CLIP_ROW - 1) / (int64)GL_CLIP_ROW);
+  if (rows < 1) { rows = 1; }
+  while (g->shapes.len < (int64)rows * (int64)GL_CLIP_ROW * 4) { mythic_vec_push<float32>(&g->shapes, 0.0); }
+  glActiveTexture(GL_TEXTURE0 + (uint32)3);
+  glBindTexture(GL_TEXTURE_2D, g->tex_clips);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glTexImage2D(GL_TEXTURE_2D, 0, (int32)GL_RGBA32F, GL_CLIP_ROW, rows, 0, GL_RGBA, GL_FLOAT, (rawptr)g->shapes.data);
+  glActiveTexture(GL_TEXTURE0 + (uint32)1);
+  glBindTexture(GL_TEXTURE_2D, g->tex_paths);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, g->tex_glyphs);
+  glBindVertexArray(g->vao);
+  glBindBuffer(GL_ARRAY_BUFFER, g->vbo);
+  big_tex_fit(g);
+  var bytes: int64 = g->insts.len * (int64)GL_INST_BYTES;
+  if (bytes > 0) {
+    glBufferData(GL_ARRAY_BUFFER, bytes, (rawptr)g->insts.data, GL_STREAM_DRAW);
+    glActiveTexture(GL_TEXTURE0 + (uint32)2);
+    for bi: int64 in 0..g->batches.len {
+      var bt: GlBatch = g->batches.data[bi];
+      if (bt.count == 0) { continue; }
+      if (bt.big != 0) {
+        // an oversized path's band: rasterize it now, into the band texture, then draw it
+        var j: GlBig = g->bigs.data[(int64)(bt.big - 1)];
+        var stride: int32 = 0;
+        var data: float32* = path_cov(g, dl, &dl->cmds.data[(int64)j.ci], j.x0, j.y0, j.x1 - j.x0, j.y1 - j.y0, &stride);
+        glBindTexture(GL_TEXTURE_2D, g->tex_big);
+        path_upload(g, 0, j.slot_y, j.x1 - j.x0, j.y1 - j.y0, data, stride);
+      } else {
+        glBindTexture(GL_TEXTURE_2D, bt.tex);
+      }
+      set_attribs((int64)bt.first * (int64)GL_INST_BYTES);
+      glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, bt.count);
+    }
+  }
+  glDisable(GL_SCISSOR_TEST);
+  var err: bool = false;
+  var tries: int32 = 0;
+  while (tries < 16 && glGetError() != GL_NO_ERROR) { err = true; tries = tries + 1; }   // bounded: a lost context may not clear
+  g->frames = g->frames + 1;
+  if (err) { g_mythic_gl_why = "GL error in a frame"; return -1; }   // a plain context shows a loss as errors
+  if (g->warm) { glFinish(); return n; }
+  if (!g->readback) { glint_swap_damage(g->ctx, (int32*)rects, n); }   // false only means no damage extension
+  if (g->test_lost > 0) {
+    g->test_lost = g->test_lost - 1;
+    if (g->test_lost == 0) { g->lost = true; }
+  }
+  // a failed swap, a GPU reset (robust context) or a dead X server: the frame did not reach the screen
+  if (g->lost || glint_context_lost(g->ctx)) { g->lost = true; g_mythic_gl_why = "the GL context was lost"; return -1; }
+  return n;
+}
+
+/// Dirty rects of the last mythic_gl_render.
+export fn mythic_gl_dirty(g: MythicGLRenderer*) -> MythicRectI* { return mythic_renderer_dirty(g->dmg); }
+
+/// Copies rects of the drawable into `fb` (n = 0: all of it), for headless contexts.
+export fn mythic_gl_read(g: MythicGLRenderer*, fb: MythicFramebuffer, rects: MythicRectI*, n: int32) {
+  if (fb.px == 0) { return; }
+  use_ctx(g);
+  var full: MythicRectI = { x: 0, y: 0, w: mythic_mini(fb.w, g->w), h: mythic_mini(fb.h, g->h) };
+  var list: MythicRectI* = rects;
+  var cnt: int32 = n;
+  if (cnt <= 0 || list == 0) { list = &full; cnt = 1; }
+  for i: int32 in 0..cnt {
+    var r: MythicRectI = list[i];
+    if (r.w <= 0 || r.h <= 0) { continue; }
+    var out: uint8* = (uint8*)(fb.px + (int64)r.y * (int64)fb.stride + (int64)r.x);
+    glint_read_rect(g->ctx, r.x, r.y, r.w, r.h, GLINT_FORMAT_BGRA, out, fb.stride * 4);
+  }
+}
+
+/// Draws all of `dl` and copies it into `fb` before showing it (screenshots of a GL window).
+export fn mythic_gl_snapshot(g: MythicGLRenderer*, dl: MythicDrawList*, fb: MythicFramebuffer) {
+  var rb: bool = g->readback;
+  g->readback = true;
+  mythic_gl_render(g, dl, fb.w, fb.h, true);
+  mythic_gl_read(g, fb, (MythicRectI*)0, 0);
+  g->readback = rb;
+  if (!rb) { glint_swap(g->ctx); }
+}
+
+/// Path coverage uploads (sprites and oversized paths) since the renderer was made, for tests.
+export fn mythic_gl_path_uploads(g: MythicGLRenderer*) -> int64 { return g->path_uploads; }
+
+/// Frees the renderer's GL objects (the context stays) and its CPU-side state.
+export fn mythic_gl_destroy(g: MythicGLRenderer*) {
+  if (g == 0) { return; }
+  // on a really lost context the GL objects go with it (and with a dead X server even making it
+  // current could fail): only the CPU side is freed then
+  if (!g->ctx->lost) { gl_free(g); }
+  mythic_renderer_destroy(g->dmg);
+  mythic_vec_free<GlInst>(&g->insts);
+  mythic_vec_free<GlBatch>(&g->batches);
+  mythic_vec_free<int32>(&g->clip_first);
+  mythic_vec_free<float32>(&g->shapes);
+  mythic_vec_free<int32>(&g->glyph_dirty);
+  mythic_vec_free<MythicAtlasShelf>(&g->path_shelves);
+  mythic_map_free<GlPathEnt>(&g->path_map);
+  mythic_vec_free<GlImg>(&g->imgs);
+  mythic_vec_free<GlBig>(&g->bigs);
+  if (g->path_buf != 0) { free((rawptr)g->path_buf); }
+  if (g->acc_base != 0) { free((rawptr)g->acc_base); }
+  free((rawptr)g);
+  g_mythic_gl_cur = (GlintContext*)0;
+}
+
+fn gl_free(g: MythicGLRenderer*) {
+  use_ctx(g);
+  if (g->prog != (uint32)0) { glDeleteProgram(g->prog); }
+  if (g->vbo != (uint32)0) { glDeleteBuffers(1, &g->vbo); }
+  if (g->vao != (uint32)0) { glDeleteVertexArrays(1, &g->vao); }
+  if (g->tex_glyphs != (uint32)0) { glDeleteTextures(1, &g->tex_glyphs); }
+  if (g->tex_paths != (uint32)0) { glDeleteTextures(1, &g->tex_paths); }
+  if (g->tex_clips != (uint32)0) { glDeleteTextures(1, &g->tex_clips); }
+  if (g->tex_big != (uint32)0) { glDeleteTextures(1, &g->tex_big); }
+  for i: int64 in 0..g->imgs.len {
+    if (g->imgs.data[i].tex != (uint32)0) { glDeleteTextures(1, &g->imgs.data[i].tex); }
+  }
+}
+
+// ------------------------------------------------------------------ offscreen
+
+var g_mythic_gl_off_ctx: GlintContext* = 0;
+var g_mythic_gl_off: MythicGLRenderer* = 0;
+var g_mythic_gl_off_failed: bool = false;
+
+/// The renderer mythic_gl_render_offscreen uses (0 before its first frame), for tests.
+export fn mythic_gl_offscreen_renderer() -> MythicGLRenderer* { return g_mythic_gl_off; }
+
+/// GL config MythicUI asks Glint for: GL 3.3 core, no depth or stencil, vsync on, robust.
+export fn mythic_gl_config() -> GlintConfig {
+  var cfg: GlintConfig = glint_config();
+  cfg.major = 3; cfg.minor = 3;
+  cfg.want_major = 3; cfg.want_minor = 3;
+  cfg.depth_bits = 0; cfg.stencil_bits = 0;
+  cfg.robust = true;                  // a GPU reset loses the context instead of hanging; plain if the driver can't
+  return cfg;
+}
+
+/// Renders all of `dl` with GL on a headless context (made on first use and kept) and reads
+/// the result into `fb`. For tests that call the renderer directly. False when GL is unavailable.
+export fn mythic_gl_render_offscreen(f: MythicFonts*, im: MythicImages*, dl: MythicDrawList*, fb: MythicFramebuffer) -> bool {
+  if (g_mythic_gl_off_failed) { return false; }
+  if (g_mythic_gl_off_ctx == 0) {
+    var cfg: GlintConfig = mythic_gl_config();
+    g_mythic_gl_off_ctx = glint_open_headless(fb.w, fb.h, &cfg);
+    if (g_mythic_gl_off_ctx == 0) { g_mythic_gl_why = glint_error(); g_mythic_gl_off_failed = true; return false; }
+  }
+  var g: MythicGLRenderer* = g_mythic_gl_off;
+  if (g == 0 || g->fonts != f || g->images != im) {
+    if (g != 0) { mythic_gl_destroy(g); }
+    glint_make_current(g_mythic_gl_off_ctx);
+    g = mythic_gl_create(g_mythic_gl_off_ctx, f, im, true);
+    g_mythic_gl_off = g;
+    if (g == 0) { g_mythic_gl_off_failed = true; return false; }
+  }
+  if (mythic_gl_render(g, dl, fb.w, fb.h, true) < 0) { return false; }
+  mythic_gl_read(g, fb, (MythicRectI*)0, 0);
+  return true;
+}

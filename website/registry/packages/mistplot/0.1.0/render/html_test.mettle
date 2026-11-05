@@ -1,0 +1,79 @@
+// HTML output: the figure fragment around a chart's SVG and the two live embeds, with
+// escaping and argument errors.
+
+import "std/conv";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/render/svg";
+import "mistplot/render/html";
+
+fn has(s: string, needle: string) -> bool {
+  return str_contains(s, needle) != 0;
+}
+
+fn check_figure() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_title(c, "<script>alert(1)</script>");
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_push(c, s, 0.0, 1.0);
+  mp_chart_push(c, s, 1.0, 2.0);
+  var out: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("html", (int64)mp_chart_html(c, 300.0, 200.0, out), (int64)MP_OK);
+  var doc: string = mp_buf_str(out);
+  mp_expect("figure open", str_starts_with(doc, "<figure class=\"mp-figure\">\n  <svg ") != 0);
+  mp_expect("figure close", str_ends_with(doc, "  </svg>\n</figure>\n") != 0);
+  mp_expect("no figcaption", !has(doc, "figcaption"));
+  mp_expect("no script", !has(doc, "<script"));
+  mp_expect("title escaped", has(doc, "&lt;script&gt;"));
+  mp_expect_i64("bad size", (int64)mp_chart_html(c, 0.0, 200.0, out), (int64)MP_ERR_ARG);
+  mp_expect_i64("cleared", mp_buf_len(out), 0);
+  mp_buf_free(out);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_live() {
+  var out: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("poll", (int64)mp_html_live("/c.svg?a=1&b=\"", 1000, "", "", "<svg/>", out),
+                (int64)MP_OK);
+  var doc: string = mp_buf_str(out);
+  mp_expect("div", str_starts_with(doc, "<div class=\"mp-live\" data-src=\"/c.svg?a=1&amp;") != 0);
+  mp_expect("attrs", has(doc, "b=&quot;\" data-interval=\"1000\"><svg/></div>\n<script>\n"));
+  mp_expect("poll script", has(doc, "setTimeout(tick, wait)") && !has(doc, "WebSocket"));
+  mp_expect("script end", str_ends_with(doc, "})();\n</script>\n") != 0);
+  mp_expect_i64("ws", (int64)mp_html_live("/c.svg", 500, "/socket/websocket", "chart:a", "", out),
+                (int64)MP_OK);
+  doc = mp_buf_str(out);
+  mp_expect("ws attrs", has(doc, " data-ws=\"/socket/websocket\" data-topic=\"chart:a\"></div>"));
+  mp_expect("ws script", has(doc, "new WebSocket(wsu.href)"));
+  mp_expect_i64("empty url", (int64)mp_html_live("", 1000, "", "", "", out), (int64)MP_ERR_ARG);
+  mp_expect_i64("interval", (int64)mp_html_live("/x", 0, "", "", "", out), (int64)MP_ERR_ARG);
+  mp_expect_i64("too slow", (int64)mp_html_live("/x", MP_LIVE_MAX_INTERVAL_MS + 1, "", "", "", out),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("ws without topic", (int64)mp_html_live("/x", 10, "/ws", "", "", out),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("error clears", mp_buf_len(out), 0);
+  mp_buf_free(out);
+}
+
+fn run_all() {
+  check_figure();
+  check_live();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_html() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

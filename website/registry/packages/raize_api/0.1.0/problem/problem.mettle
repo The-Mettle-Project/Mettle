@@ -1,0 +1,172 @@
+// raize_api/problem: errors as RFC 9457 problem details.
+//
+//   {"type":"about:blank","title":"Not Found","status":404,"detail":"no task 7"}
+//
+// Validation failures add an "errors" member, as in RFC 9457 section 3:
+//
+//   "errors":[{"detail":"must be at least 1 characters","pointer":"#/title"}]
+//
+// `pointer` is a JSON Pointer (RFC 6901) into the body, written as a URI fragment.
+// Problems in parameters use "parameter" and "in" instead (the name and where it was).
+// Content type: application/problem+json. A problem with type "about:blank" uses the
+// status's reason phrase as its title (RFC 9457 section 4.2.1).
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "codec/core/buf";
+import "codec/core/status";
+import "codec/json/write";
+
+export const RAPI_CT_PROBLEM: string = "application/problem+json";
+export const RAPI_ERRORS_MAX: int32 = 32;
+
+/// One error inside a problem: what is wrong and where.
+export struct RapiError {
+  detail: string;     // "must be at least 1 characters"
+  pointer: string;    // "#/title" for a body member, "" otherwise
+  param: string;      // the parameter name, "" for a body member
+  loc: string;        // "path", "query", "header", "body"
+}
+
+/// The errors one request collected. Strings live in the request arena.
+export struct RapiErrors {
+  items: RapiError[32];   // RAPI_ERRORS_MAX
+  count: int32;
+  dropped: int32;         // errors past the limit, counted but not kept
+}
+
+/// Empties `e`.
+export fn rapi_errors_clear(e: RapiErrors*) {
+  if (e == 0) { return; }
+  e->count = 0;
+  e->dropped = 0;
+}
+
+/// Number of errors in `e` (0 when e is 0).
+export fn rapi_errors_count(e: RapiErrors*) -> int32 {
+  if (e == 0) { return 0; }
+  return e->count + e->dropped;
+}
+
+/// Adds a body error at JSON Pointer `pointer` ("#/items/0/name").
+export fn rapi_errors_body(e: RapiErrors*, pointer: string, detail: string) {
+  if (e == 0) { return; }
+  if (e->count >= RAPI_ERRORS_MAX) { e->dropped = e->dropped + 1; return; }
+  var it: RapiError* = &e->items[e->count];
+  it->detail = detail;
+  it->pointer = pointer;
+  it->param = "";
+  it->loc = "body";
+  e->count = e->count + 1;
+}
+
+/// Adds an error for parameter `name` found in `loc` ("path", "query", "header").
+export fn rapi_errors_param(e: RapiErrors*, loc: string, name: string, detail: string) {
+  if (e == 0) { return; }
+  if (e->count >= RAPI_ERRORS_MAX) { e->dropped = e->dropped + 1; return; }
+  var it: RapiError* = &e->items[e->count];
+  it->detail = detail;
+  it->pointer = "";
+  it->param = name;
+  it->loc = loc;
+  e->count = e->count + 1;
+}
+
+/// A problem to send. Zero it, set what you need, then rapi_problem_send.
+export struct RapiProblem {
+  status: int32;        // HTTP status
+  type_uri: string;     // "" means "about:blank"
+  title: string;        // "" means the status's reason phrase
+  detail: string;       // human text for this occurrence, "" to leave out
+  instance: string;     // URI of this occurrence, "" to leave out
+  errors: RapiErrors*;  // 0 for none
+  extra_json: string;   // more members, already JSON without braces ("\"balance\":30"), or ""
+}
+
+/// Writes the problem as JSON into `b`.
+export fn rapi_problem_write(p: RapiProblem*, b: CodecBuf*) -> int32 {
+  var w: CodecJson;
+  codec_json_init_flags(&w, b, CODEC_JSON_LOSSY_UTF8);
+  codec_json_object(&w);
+  var t: string = p->type_uri;
+  if (t.length == 0) { t = "about:blank"; }
+  codec_json_field_string(&w, "type", t);
+  var title: string = p->title;
+  if (title.length == 0) { title = rz_status_reason(p->status); }
+  codec_json_field_string(&w, "title", title);
+  codec_json_field_int(&w, "status", (int64)p->status);
+  if (p->detail.length > 0) { codec_json_field_string(&w, "detail", p->detail); }
+  if (p->instance.length > 0) { codec_json_field_string(&w, "instance", p->instance); }
+  if (p->errors != 0 && p->errors->count > 0) {
+    codec_json_key(&w, "errors");
+    codec_json_array(&w);
+    for i in 0..p->errors->count {
+      var it: RapiError* = &p->errors->items[i];
+      codec_json_object(&w);
+      codec_json_field_string(&w, "detail", it->detail);
+      if (it->pointer.length > 0) { codec_json_field_string(&w, "pointer", it->pointer); }
+      if (it->param.length > 0) {
+        codec_json_field_string(&w, "parameter", it->param);
+        codec_json_field_string(&w, "in", it->loc);
+      }
+      codec_json_end(&w);
+    }
+    codec_json_end(&w);
+  }
+  codec_json_end(&w);
+  var rc: int32 = codec_json_finish(&w);
+  if (rc == CODEC_OK && p->extra_json.length > 0) {
+    // Splice the extra members in before the closing brace.
+    b->len = b->len - 1;
+    codec_buf_string(b, ",");
+    codec_buf_string(b, p->extra_json);
+    codec_buf_string(b, "}");
+  }
+  return rc;
+}
+
+/// Sends `p` as the response. Returns its status.
+export fn rapi_problem_send(ctx: RzContext*, p: RapiProblem*) -> int32 {
+  var b: CodecBuf;
+  codec_buf_init(&b, 256);
+  if (rapi_problem_write(p, &b) != CODEC_OK) {
+    codec_buf_clear(&b);
+    codec_buf_string(&b, "{{\"type\":\"about:blank\",\"title\":\"Internal Server Error\",\"status\":500}");
+    p->status = 500;
+  }
+  var st: int32 = rz_ctx_bytes(ctx, p->status, RAPI_CT_PROBLEM, rz_arena_str(ctx->arena, codec_buf_view(&b)));
+  codec_buf_free(&b);
+  return st;
+}
+
+/// Sends a plain problem: status, and a detail ("" to leave out).
+export fn rapi_problem(ctx: RzContext*, status: int32, detail: string) -> int32 {
+  var p: RapiProblem;
+  memset((rawptr)&p, 0, sizeof(RapiProblem));
+  p.status = status;
+  p.detail = detail;
+  return rapi_problem_send(ctx, &p);
+}
+
+/// Sends a problem with a type URI and title of your own.
+export fn rapi_problem_typed(ctx: RzContext*, status: int32, type_uri: string, title: string, detail: string) -> int32 {
+  var p: RapiProblem;
+  memset((rawptr)&p, 0, sizeof(RapiProblem));
+  p.status = status;
+  p.type_uri = type_uri;
+  p.title = title;
+  p.detail = detail;
+  return rapi_problem_send(ctx, &p);
+}
+
+/// Sends the collected errors: 422 for a body that parsed but failed checks, 400 for
+/// bad parameters or a body that is not valid JSON (`status` picks which).
+export fn rapi_problem_errors(ctx: RzContext*, status: int32, detail: string, e: RapiErrors*) -> int32 {
+  var p: RapiProblem;
+  memset((rawptr)&p, 0, sizeof(RapiProblem));
+  p.status = status;
+  p.detail = detail;
+  p.errors = e;
+  return rapi_problem_send(ctx, &p);
+}

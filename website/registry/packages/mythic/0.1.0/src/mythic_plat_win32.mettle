@@ -1,0 +1,819 @@
+// mythic_plat_win32: user32/gdi32/kernel32 backend (DECISIONS §8, Appendix B).
+// Compiled only on windows (guarded import in mythic_plat). Externs are never exported and use aliases.
+import "std/mem";
+import "std/io";
+import "mythic_types";
+import "mythic_utf8";
+
+struct W32Point { x: int32; y: int32; }
+struct W32Rect { left: int32; top: int32; right: int32; bottom: int32; }
+struct W32Msg { hwnd: int64; message: uint32; wparam: int64; lparam: int64; time: uint32; pt: W32Point; l_private: uint32; }
+struct W32Paint { hdc: int64; erase: int32; rc_paint: W32Rect; restore: int32; inc_update: int32; reserved: uint8[32]; }
+struct W32WndClassExW {
+  cb_size: uint32; style: uint32; wnd_proc: fn(int64, uint32, int64, int64) -> int64;
+  cls_extra: int32; wnd_extra: int32; instance: int64; icon: int64; cursor: int64; background: int64;
+  menu_name: uint16*; class_name: uint16*; icon_sm: int64;
+}
+struct W32Bmi {
+  size: uint32; width: int32; height: int32; planes: uint16; bit_count: uint16; compression: uint32;
+  size_image: uint32; x_ppm: int32; y_ppm: int32; clr_used: uint32; clr_important: uint32;
+}
+struct W32TrackMouse { cb_size: uint32; flags: uint32; hwnd: int64; hover_time: uint32; }
+
+extern fn mythic_w32_GetModuleHandleW(name: uint16*) -> int64 = "GetModuleHandleW";
+extern fn mythic_w32_QueryPerformanceCounter(out: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn mythic_w32_QueryPerformanceFrequency(out: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn mythic_w32_LoadLibraryA(name: cstring) -> int64 = "LoadLibraryA";
+extern fn mythic_w32_GetProcAddress(module: int64, name: cstring) -> int64 = "GetProcAddress";
+extern fn mythic_w32_IsIconic(hwnd: int64) -> int32 = "IsIconic";
+extern fn mythic_w32_GetEnvironmentVariableA(name: cstring, buf: uint8*, size: uint32) -> uint32 = "GetEnvironmentVariableA";
+extern fn mythic_w32_RegisterClassExW(wc: W32WndClassExW*) -> uint16 = "RegisterClassExW";
+extern fn mythic_w32_CreateWindowExW(ex_style: uint32, class_name: uint16*, title: uint16*, style: uint32, x: int32, y: int32, w: int32, h: int32, parent: int64, menu: int64, instance: int64, param: int64) -> int64 = "CreateWindowExW";
+extern fn mythic_w32_DefWindowProcW(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 = "DefWindowProcW";
+extern fn mythic_w32_ShowWindow(hwnd: int64, cmd: int32) -> int32 = "ShowWindow";
+extern fn mythic_w32_UpdateWindow(hwnd: int64) -> int32 = "UpdateWindow";
+extern fn mythic_w32_DestroyWindow(hwnd: int64) -> int32 = "DestroyWindow";
+extern fn mythic_w32_PeekMessageW(msg: W32Msg*, hwnd: int64, lo: uint32, hi: uint32, remove: uint32) -> int32 = "PeekMessageW";
+extern fn mythic_w32_TranslateMessage(msg: W32Msg*) -> int32 = "TranslateMessage";
+extern fn mythic_w32_DispatchMessageW(msg: W32Msg*) -> int64 = "DispatchMessageW";
+extern fn mythic_w32_MsgWaitForMultipleObjectsEx(count: uint32, handles: int64*, ms: uint32, wake_mask: uint32, flags: uint32) -> uint32 = "MsgWaitForMultipleObjectsEx";
+extern fn mythic_w32_BeginPaint(hwnd: int64, ps: W32Paint*) -> int64 = "BeginPaint";
+extern fn mythic_w32_EndPaint(hwnd: int64, ps: W32Paint*) -> int32 = "EndPaint";
+extern fn mythic_w32_GetDC(hwnd: int64) -> int64 = "GetDC";
+extern fn mythic_w32_ReleaseDC(hwnd: int64, hdc: int64) -> int32 = "ReleaseDC";
+extern fn mythic_w32_GetClientRect(hwnd: int64, r: W32Rect*) -> int32 = "GetClientRect";
+extern fn mythic_w32_AdjustWindowRectEx(r: W32Rect*, style: uint32, menu: int32, ex_style: uint32) -> int32 = "AdjustWindowRectEx";
+extern fn mythic_w32_SetWindowPos(hwnd: int64, after: int64, x: int32, y: int32, w: int32, h: int32, flags: uint32) -> int32 = "SetWindowPos";
+extern fn mythic_w32_SetWindowTextW(hwnd: int64, s: uint16*) -> int32 = "SetWindowTextW";
+extern fn mythic_w32_LoadCursorW(instance: int64, id: int64) -> int64 = "LoadCursorW";
+extern fn mythic_w32_SetCursor(cursor: int64) -> int64 = "SetCursor";
+extern fn mythic_w32_SetCapture(hwnd: int64) -> int64 = "SetCapture";
+extern fn mythic_w32_ReleaseCapture() -> int32 = "ReleaseCapture";
+extern fn mythic_w32_ScreenToClient(hwnd: int64, p: W32Point*) -> int32 = "ScreenToClient";
+extern fn mythic_w32_TrackMouseEvent(t: W32TrackMouse*) -> int32 = "TrackMouseEvent";
+extern fn mythic_w32_GetKeyState(vk: int32) -> int32 = "GetKeyState";
+extern fn mythic_w32_SetForegroundWindow(hwnd: int64) -> int32 = "SetForegroundWindow";
+extern fn mythic_w32_SetFocus(hwnd: int64) -> int64 = "SetFocus";
+extern fn mythic_w32_GetFocus() -> int64 = "GetFocus";
+extern fn mythic_w32_SetDIBitsToDevice(hdc: int64, x: int32, y: int32, w: uint32, h: uint32, sx: int32, sy: int32, start_scan: uint32, lines: uint32, bits: rawptr, bmi: W32Bmi*, usage: uint32) -> int32 = "SetDIBitsToDevice";
+extern fn mythic_w32_GetDeviceCaps(hdc: int64, index: int32) -> int32 = "GetDeviceCaps";
+extern fn mythic_w32_OpenClipboard(hwnd: int64) -> int32 = "OpenClipboard";
+extern fn mythic_w32_CloseClipboard() -> int32 = "CloseClipboard";
+extern fn mythic_w32_EmptyClipboard() -> int32 = "EmptyClipboard";
+extern fn mythic_w32_SetClipboardData(format: uint32, mem: int64) -> int64 = "SetClipboardData";
+extern fn mythic_w32_GetClipboardData(format: uint32) -> int64 = "GetClipboardData";
+extern fn mythic_w32_GlobalAlloc(flags: uint32, size: int64) -> int64 = "GlobalAlloc";
+extern fn mythic_w32_GlobalLock(mem: int64) -> rawptr = "GlobalLock";
+extern fn mythic_w32_GlobalUnlock(mem: int64) -> int32 = "GlobalUnlock";
+extern fn mythic_w32_GlobalSize(mem: int64) -> int64 = "GlobalSize";
+extern fn mythic_w32_GlobalFree(mem: int64) -> int64 = "GlobalFree";
+extern fn mythic_w32_Sleep(ms: uint32) = "Sleep";
+
+const W32_EQCAP = 4096;
+const W32_STYLE = 0x00CF0000;            // WS_OVERLAPPEDWINDOW
+
+export struct MythicW32 {
+  plat: MythicPlatform;
+  hwnd: int64;
+  instance: int64;
+  opened: bool;
+  creating: bool;
+  eq: MythicEvent*; eq_head: int64; eq_tail: int64;
+  px: uint32*; fb_w: int32; fb_h: int32; fb_valid: bool;
+  win_w: int32; win_h: int32;
+  scale: float32; dpi: int32;
+  qpc_freq: int64;
+  hi_surrogate: uint32;
+  in_sizemove: bool;
+  tracking: bool;
+  buttons: int32;
+  cursor_shape: int32;
+  cursors: int64[8];
+  style: uint32;
+  min_w: int32; min_h: int32;
+  p_get_dpi_for_window: int64;
+  scale_forced: bool;
+  min_lw: int32; min_lh: int32;      // logical min size, re-scaled on WM_DPICHANGED
+  gl: bool;                          // a GL context will own the window (mythic_plat_gl_prepare)
+  gl_active: bool;                   // a GL context draws it now: WM_PAINT must not put the CPU DIB
+}
+
+var g_mythic_w32: MythicW32* = 0;
+
+fn lo16(v: int64) -> int32 { return (int32)(v & 0xFFFF); }
+fn hi16(v: int64) -> int32 { return (int32)((v >> 16) & 0xFFFF); }
+fn slo16(v: int64) -> int32 { var x: int32 = lo16(v); if (x >= 32768) { x = x - 65536; } return x; }
+fn shi16(v: int64) -> int32 { var x: int32 = hi16(v); if (x >= 32768) { x = x - 65536; } return x; }
+
+fn qpc_us(w: MythicW32*) -> int64 {
+  var c: int64 = 0;
+  mythic_w32_QueryPerformanceCounter(&c);
+  var f: int64 = w->qpc_freq;
+  if (f <= 0) { f = 1; }
+  return (c / f) * 1000000 + ((c % f) * 1000000) / f;
+}
+
+// UTF-8 (n bytes) -> malloc'd nul-terminated UTF-16.
+fn utf8_to_w(s: uint8*, n: int64) -> uint16* {
+  var dst: uint16* = (uint16*)malloc((n + 1) * 2 + 4);
+  var i: int64 = 0;
+  var o: int64 = 0;
+  while (i < n) {
+    var c: uint32 = (uint32)s[i];
+    var cp: uint32 = 0xFFFD;
+    var len: int64 = 1;
+    if (c < 0x80) { cp = c; }
+    else if (c >= 0xC0 && c < 0xE0 && i + 1 < n) { cp = ((c & 0x1F) << 6) | ((uint32)s[i + 1] & 0x3F); len = 2; }
+    else if (c >= 0xE0 && c < 0xF0 && i + 2 < n) { cp = ((c & 0x0F) << 12) | (((uint32)s[i + 1] & 0x3F) << 6) | ((uint32)s[i + 2] & 0x3F); len = 3; }
+    else if (c >= 0xF0 && i + 3 < n) { cp = ((c & 0x07) << 18) | (((uint32)s[i + 1] & 0x3F) << 12) | (((uint32)s[i + 2] & 0x3F) << 6) | ((uint32)s[i + 3] & 0x3F); len = 4; }
+    if (cp >= 0x10000) {
+      cp = cp - 0x10000;
+      dst[o] = (uint16)(0xD800 + (cp >> 10));
+      dst[o + 1] = (uint16)(0xDC00 + (cp & 0x3FF));
+      o = o + 2;
+    } else {
+      dst[o] = (uint16)cp;
+      o = o + 1;
+    }
+    i = i + len;
+  }
+  dst[o] = (uint16)0;
+  return dst;
+}
+
+fn push_ev(w: MythicW32*, ev: MythicEvent) {
+  if (!w->opened || w->creating) { return; }
+  var e: MythicEvent = ev;
+  e.time_us = qpc_us(w);
+  if (e.kind == MYTHIC_EV_MOUSE_MOVE && w->eq_tail > w->eq_head) {
+    var last: MythicEvent* = &w->eq[(w->eq_tail - 1) % W32_EQCAP];
+    if (last->kind == MYTHIC_EV_MOUSE_MOVE) { *last = e; return; }
+  }
+  if (w->eq_tail - w->eq_head >= W32_EQCAP) { return; }
+  w->eq[w->eq_tail % W32_EQCAP] = e;
+  w->eq_tail = w->eq_tail + 1;
+}
+
+fn key_down(vk: int32) -> bool { return (mythic_w32_GetKeyState(vk) & 0x8000) != 0; }
+
+fn cur_mods() -> int32 {
+  var m: int32 = 0;
+  if (key_down(16)) { m = m | MYTHIC_MOD_SHIFT; }
+  if (key_down(17)) { m = m | MYTHIC_MOD_CTRL; }
+  if (key_down(18)) { m = m | MYTHIC_MOD_ALT; }
+  if (key_down(91) || key_down(92)) { m = m | MYTHIC_MOD_SUPER; }
+  return m;
+}
+
+fn vk_to_key(vk: int64) -> int32 {
+  if ((vk >= 65 && vk <= 90) || (vk >= 48 && vk <= 57)) { return (int32)vk; }
+  if (vk >= 112 && vk <= 123) { return MYTHIC_KEY_F1 + (int32)(vk - 112); }
+  if (vk >= 96 && vk <= 105) { return (int32)(48 + vk - 96); }
+  switch (vk) {
+    case 9: { return MYTHIC_KEY_TAB; }
+    case 13: { return MYTHIC_KEY_ENTER; }
+    case 27: { return MYTHIC_KEY_ESCAPE; }
+    case 8: { return MYTHIC_KEY_BACKSPACE; }
+    case 46: { return MYTHIC_KEY_DELETE; }
+    case 37: { return MYTHIC_KEY_LEFT; }
+    case 38: { return MYTHIC_KEY_UP; }
+    case 39: { return MYTHIC_KEY_RIGHT; }
+    case 40: { return MYTHIC_KEY_DOWN; }
+    case 36: { return MYTHIC_KEY_HOME; }
+    case 35: { return MYTHIC_KEY_END; }
+    case 33: { return MYTHIC_KEY_PAGE_UP; }
+    case 34: { return MYTHIC_KEY_PAGE_DOWN; }
+    case 45: { return MYTHIC_KEY_INSERT; }
+    case 32: { return MYTHIC_KEY_SPACE; }
+    case 186: { return 59; }    // ;
+    case 187: { return 61; }    // =
+    case 188: { return 44; }    // ,
+    case 189: { return 45; }    // -
+    case 190: { return 46; }    // .
+    case 191: { return 47; }    // /
+    case 192: { return 96; }    // `
+    case 219: { return 91; }    // [
+    case 220: { return 92; }    // backslash
+    case 221: { return 93; }    // ]
+    case 222: { return 39; }    // '
+    default: { return 0; }
+  }
+  return 0;
+}
+
+fn mouse_ev(w: MythicW32*, kind: int32, button: int32, lparam: int64) {
+  var ev: MythicEvent;
+  ev.kind = kind; ev.button = button; ev.mods = cur_mods();
+  ev.x = (float32)slo16(lparam); ev.y = (float32)shi16(lparam);
+  push_ev(w, ev);
+}
+
+fn button_down(w: MythicW32*, hwnd: int64, button: int32, lparam: int64) {
+  if (w->buttons == 0) { mythic_w32_SetCapture(hwnd); }
+  w->buttons = w->buttons | (1 << button);
+  mouse_ev(w, MYTHIC_EV_MOUSE_DOWN, button, lparam);
+}
+
+fn button_up(w: MythicW32*, button: int32, lparam: int64) {
+  w->buttons = w->buttons & ~(1 << button);
+  if (w->buttons == 0) { mythic_w32_ReleaseCapture(); }
+  mouse_ev(w, MYTHIC_EV_MOUSE_UP, button, lparam);
+}
+
+fn blit(w: MythicW32*, hdc: int64, rx: int32, ry: int32, rw: int32, rh: int32) {
+  // One DIB per rect whose rows start at row ry: avoids the top-down ySrc ambiguity.
+  var bmi: W32Bmi;
+  bmi.size = 40;
+  bmi.width = w->fb_w;
+  bmi.height = 0 - rh;
+  bmi.planes = (uint16)1;
+  bmi.bit_count = (uint16)32;
+  var rows: uint32* = w->px + (int64)ry * (int64)w->fb_w;
+  mythic_w32_SetDIBitsToDevice(hdc, rx, ry, (uint32)rw, (uint32)rh, rx, 0, 0, (uint32)rh, (rawptr)rows, &bmi, 0);
+}
+
+fn present_rects(w: MythicW32*, hdc_in: int64, rects: MythicRectI*, n: int32) {
+  if (w->px == 0 || w->hwnd == 0) { return; }
+  var hdc: int64 = hdc_in;
+  if (hdc == 0) { hdc = mythic_w32_GetDC(w->hwnd); }
+  var full: MythicRectI = { x: 0, y: 0, w: w->fb_w, h: w->fb_h };
+  var list: MythicRectI* = rects;
+  var cnt: int32 = n;
+  if (cnt <= 0 || list == 0) { list = &full; cnt = 1; }
+  for i: int32 in 0..cnt {
+    var r: MythicRectI = list[i];
+    if (r.x < 0) { r.w = r.w + r.x; r.x = 0; }
+    if (r.y < 0) { r.h = r.h + r.y; r.y = 0; }
+    if (r.x + r.w > w->fb_w) { r.w = w->fb_w - r.x; }
+    if (r.y + r.h > w->fb_h) { r.h = w->fb_h - r.y; }
+    if (r.w > 0 && r.h > 0) { blit(w, hdc, r.x, r.y, r.w, r.h); }
+  }
+  if (hdc_in == 0) { mythic_w32_ReleaseDC(w->hwnd, hdc); }
+  w->fb_valid = true;
+}
+
+fn outer_size(w: MythicW32*, cw: int32, ch: int32, ow: int32*, oh: int32*) {
+  var r: W32Rect = { left: 0, top: 0, right: cw, bottom: ch };
+  mythic_w32_AdjustWindowRectEx(&r, w->style, 0, 0);
+  *ow = r.right - r.left;
+  *oh = r.bottom - r.top;
+}
+
+fn w32_wnd_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  var w: MythicW32* = g_mythic_w32;
+  if (w == 0) { return mythic_w32_DefWindowProcW(hwnd, msg, wparam, lparam); }
+  switch ((int32)msg) {
+    case 5: {    // WM_SIZE
+      if (wparam != 1) {
+        var nw: int32 = lo16(lparam);
+        var nh: int32 = hi16(lparam);
+        if (nw > 0 && nh > 0 && (nw != w->win_w || nh != w->win_h)) {
+          w->win_w = nw;
+          w->win_h = nh;
+          w->fb_valid = false;
+          var ev: MythicEvent;
+          ev.kind = MYTHIC_EV_RESIZE; ev.width = nw; ev.height = nh;
+          push_ev(w, ev);
+          if (w->in_sizemove && w->plat.refresh != 0) {
+            var rf: fn(rawptr) -> void = w->plat.refresh;
+            rf(w->plat.refresh_ud);
+          }
+        }
+      }
+      return 0;
+    }
+    case 15: {   // WM_PAINT
+      var ps: W32Paint;
+      var hdc: int64 = mythic_w32_BeginPaint(hwnd, &ps);
+      if (w->in_sizemove && w->plat.refresh != 0) {
+        var rf: fn(rawptr) -> void = w->plat.refresh;
+        rf(w->plat.refresh_ud);
+      }
+      if (!w->gl_active && w->fb_valid && w->fb_w == w->win_w && w->fb_h == w->win_h) { present_rects(w, hdc, (MythicRectI*)0, 0); }
+      mythic_w32_EndPaint(hwnd, &ps);
+      var ev: MythicEvent;
+      ev.kind = MYTHIC_EV_EXPOSE;
+      push_ev(w, ev);
+      return 0;
+    }
+    case 20: { return 1; }   // WM_ERASEBKGND
+    case 16: {   // WM_CLOSE
+      var ev: MythicEvent;
+      ev.kind = MYTHIC_EV_CLOSE;
+      push_ev(w, ev);
+      return 0;
+    }
+    case 2: { return 0; }    // WM_DESTROY
+    case 7: { var ev: MythicEvent; ev.kind = MYTHIC_EV_FOCUS_IN; push_ev(w, ev); return 0; }
+    case 8: { var ev: MythicEvent; ev.kind = MYTHIC_EV_FOCUS_OUT; push_ev(w, ev); return 0; }
+    case 512: {  // WM_MOUSEMOVE
+      if (!w->tracking) {
+        var t: W32TrackMouse = { cb_size: 24, flags: 2, hwnd: hwnd, hover_time: 0 };
+        mythic_w32_TrackMouseEvent(&t);
+        w->tracking = true;
+      }
+      mouse_ev(w, MYTHIC_EV_MOUSE_MOVE, 0, lparam);
+      return 0;
+    }
+    case 675: {  // WM_MOUSELEAVE
+      w->tracking = false;
+      var ev: MythicEvent;
+      ev.kind = MYTHIC_EV_MOUSE_LEAVE;
+      push_ev(w, ev);
+      return 0;
+    }
+    case 513: { button_down(w, hwnd, 1, lparam); return 0; }
+    case 514: { button_up(w, 1, lparam); return 0; }
+    case 516: { button_down(w, hwnd, 3, lparam); return 0; }
+    case 517: { button_up(w, 3, lparam); return 0; }
+    case 519: { button_down(w, hwnd, 2, lparam); return 0; }
+    case 520: { button_up(w, 2, lparam); return 0; }
+    case 522:
+    case 526: {  // WM_MOUSEWHEEL / WM_MOUSEHWHEEL (lparam in screen coordinates)
+      var pt: W32Point;
+      pt.x = slo16(lparam);
+      pt.y = shi16(lparam);
+      mythic_w32_ScreenToClient(hwnd, &pt);
+      var ev: MythicEvent;
+      ev.kind = MYTHIC_EV_WHEEL; ev.mods = cur_mods();
+      ev.x = (float32)pt.x; ev.y = (float32)pt.y;
+      var notches: float32 = (float32)shi16(wparam) / 120.0;
+      if (msg == (uint32)522) { ev.wheel_y = notches; } else { ev.wheel_x = notches; }
+      push_ev(w, ev);
+      return 0;
+    }
+    case 256:
+    case 260: {  // WM_KEYDOWN / WM_SYSKEYDOWN
+      var key: int32 = vk_to_key(wparam);
+      if (key != 0) {
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_KEY_DOWN; ev.key = key; ev.mods = cur_mods();
+        ev.repeat = ((lparam >> 30) & 1) != 0;
+        push_ev(w, ev);
+      }
+      if (msg == (uint32)260) { return mythic_w32_DefWindowProcW(hwnd, msg, wparam, lparam); }
+      return 0;
+    }
+    case 257:
+    case 261: {  // WM_KEYUP / WM_SYSKEYUP
+      var key: int32 = vk_to_key(wparam);
+      if (key != 0) {
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_KEY_UP; ev.key = key; ev.mods = cur_mods();
+        push_ev(w, ev);
+      }
+      if (msg == (uint32)261) { return mythic_w32_DefWindowProcW(hwnd, msg, wparam, lparam); }
+      return 0;
+    }
+    case 258: {  // WM_CHAR: one UTF-16 unit; pair surrogates
+      var u: uint32 = (uint32)(wparam & 0xFFFF);
+      if (u >= (uint32)0xD800 && u < (uint32)0xDC00) { w->hi_surrogate = u; return 0; }
+      var cp: uint32 = u;
+      if (u >= (uint32)0xDC00 && u < (uint32)0xE000) {
+        if (w->hi_surrogate == (uint32)0) { return 0; }
+        cp = (uint32)0x10000 + ((w->hi_surrogate - (uint32)0xD800) << 10) + (u - (uint32)0xDC00);
+      }
+      w->hi_surrogate = (uint32)0;
+      if (cp < (uint32)32 || cp == (uint32)127) { return 0; }
+      var mods: int32 = cur_mods();
+      // Ctrl combos are shortcuts, never text (Ctrl+Space yields ' '); Ctrl+Alt is AltGr.
+      if ((mods & MYTHIC_MOD_CTRL) != 0 && (mods & MYTHIC_MOD_ALT) == 0) { return 0; }
+      var ev: MythicEvent;
+      ev.kind = MYTHIC_EV_TEXT; ev.codepoint = cp; ev.mods = mods;
+      ev.repeat = ((lparam >> 30) & 1) != 0;
+      push_ev(w, ev);
+      return 0;
+    }
+    case 32: {   // WM_SETCURSOR
+      if ((lparam & 0xFFFF) == 1) {
+        mythic_w32_SetCursor(w->cursors[w->cursor_shape]);
+        return 1;
+      }
+      return mythic_w32_DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    case 36: {   // WM_GETMINMAXINFO: ptMinTrackSize at byte 24
+      if (w->min_w > 0 || w->min_h > 0) {
+        var ow: int32 = 0;
+        var oh: int32 = 0;
+        outer_size(w, w->min_w, w->min_h, &ow, &oh);
+        var mm: int32* = (int32*)lparam;
+        mm[6] = ow;
+        mm[7] = oh;
+      }
+      return 0;
+    }
+    case 736: {  // WM_DPICHANGED: report the new scale first, then apply the suggested rect
+      var ndpi: int32 = lo16(wparam);
+      if (w->scale_forced || ndpi <= 0) { return 0; }   // MYTHIC_SCALE pins the scale and size
+      w->dpi = ndpi;
+      w->scale = (float32)ndpi / 96.0;
+      w->min_w = (int32)((float32)w->min_lw * w->scale + 0.5);
+      w->min_h = (int32)((float32)w->min_lh * w->scale + 0.5);
+      if (!w->creating) {
+        var ev: MythicEvent;
+        ev.kind = MYTHIC_EV_SCALE; ev.scale = w->scale;
+        push_ev(w, ev);
+      }
+      var r: W32Rect* = (W32Rect*)lparam;
+      mythic_w32_SetWindowPos(hwnd, 0, r->left, r->top, r->right - r->left, r->bottom - r->top, 0x14);
+      return 0;
+    }
+    case 561: { w->in_sizemove = true; return 0; }    // WM_ENTERSIZEMOVE
+    case 562: { w->in_sizemove = false; return 0; }   // WM_EXITSIZEMOVE
+    default: { }
+  }
+  return mythic_w32_DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+fn system_dpi() -> int32 {
+  var user32: int64 = mythic_w32_LoadLibraryA("user32.dll");
+  var p: int64 = mythic_w32_GetProcAddress(user32, "GetDpiForSystem");
+  if (p != 0) {
+    var f: fn() -> uint32 = (fn() -> uint32)p;
+    var d: int32 = (int32)f();
+    if (d > 0) { return d; }
+  }
+  var hdc: int64 = mythic_w32_GetDC(0);
+  var d2: int32 = mythic_w32_GetDeviceCaps(hdc, 88);   // LOGPIXELSX
+  mythic_w32_ReleaseDC(0, hdc);
+  if (d2 <= 0) { d2 = 96; }
+  return d2;
+}
+
+fn env_scale(out: float32*) -> bool {
+  var buf: uint8[32];
+  var n: uint32 = mythic_w32_GetEnvironmentVariableA("MYTHIC_SCALE", &buf[0], (uint32)32);
+  if (n == (uint32)0 || n >= (uint32)32) { return false; }
+  var v: float32 = 0.0;
+  var k: int32 = 0;
+  var nn: int32 = (int32)n;
+  while (k < nn && buf[k] >= (uint8)48 && buf[k] <= (uint8)57) { v = v * 10.0 + (float32)((int32)buf[k] - 48); k = k + 1; }
+  if (k < nn && buf[k] == (uint8)46) {
+    k = k + 1;
+    var f: float32 = 0.1;
+    while (k < nn && buf[k] >= (uint8)48 && buf[k] <= (uint8)57) { v = v + f * (float32)((int32)buf[k] - 48); f = f * 0.1; k = k + 1; }
+  }
+  if (v <= 0.0) { return false; }
+  *out = v;
+  return true;
+}
+
+fn w32_open(self: rawptr, desc: MythicWindowDesc*) -> int32 {
+  var w: MythicW32* = (MythicW32*)self;
+  g_mythic_w32 = w;
+  mythic_w32_QueryPerformanceFrequency(&w->qpc_freq);
+  w->eq = (MythicEvent*)malloc(sizeof(MythicEvent) * W32_EQCAP);
+  var user32: int64 = mythic_w32_LoadLibraryA("user32.dll");
+  var p_ctx: int64 = mythic_w32_GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+  var aware: bool = false;
+  if (p_ctx != 0) {
+    var set_ctx: fn(int64) -> int32 = (fn(int64) -> int32)p_ctx;
+    aware = set_ctx(-4) != 0;     // PER_MONITOR_AWARE_V2
+  }
+  if (!aware) {
+    var p_old: int64 = mythic_w32_GetProcAddress(user32, "SetProcessDPIAware");
+    if (p_old != 0) { var f: fn() -> int32 = (fn() -> int32)p_old; f(); }
+  }
+  w->p_get_dpi_for_window = mythic_w32_GetProcAddress(user32, "GetDpiForWindow");
+  w->instance = mythic_w32_GetModuleHandleW((uint16*)0);
+  w->cursors[0] = mythic_w32_LoadCursorW(0, 32512);   // IDC_ARROW
+  w->cursors[1] = mythic_w32_LoadCursorW(0, 32513);   // IDC_IBEAM
+  w->cursors[2] = mythic_w32_LoadCursorW(0, 32649);   // IDC_HAND
+  w->cursors[3] = mythic_w32_LoadCursorW(0, 32644);   // IDC_SIZEWE
+  w->cursors[4] = mythic_w32_LoadCursorW(0, 32645);   // IDC_SIZENS
+  w->cursors[5] = mythic_w32_LoadCursorW(0, 32646);   // IDC_SIZEALL
+  w->cursors[6] = mythic_w32_LoadCursorW(0, 32648);   // IDC_NO
+  w->cursors[7] = mythic_w32_LoadCursorW(0, 32514);   // IDC_WAIT
+
+  w->dpi = system_dpi();
+  w->scale = (float32)w->dpi / 96.0;
+  var forced: float32 = 0.0;
+  var have_forced: bool = env_scale(&forced);
+  if (have_forced) { w->scale = forced; }
+  w->scale_forced = have_forced;
+  w->min_lw = desc->min_width;
+  w->min_lh = desc->min_height;
+
+  var cname: string = "MythicWindow";
+  var cls: uint16* = utf8_to_w(cname.chars, (int64)cname.length);
+  var wc: W32WndClassExW;
+  wc.cb_size = 80;
+  wc.style = 3;                  // CS_HREDRAW | CS_VREDRAW
+  if (w->gl) { wc.style = wc.style | (uint32)32; }   // CS_OWNDC: GL keeps one DC for the window's life
+  wc.wnd_proc = &w32_wnd_proc;
+  wc.instance = w->instance;
+  wc.class_name = cls;
+  if (mythic_w32_RegisterClassExW(&wc) == (uint16)0) {
+    print_err("MythicUI: RegisterClassExW failed\n");
+    return 1;
+  }
+  w->style = (uint32)W32_STYLE;
+  if (!desc->resizable) { w->style = w->style & ~(uint32)0x50000; }   // no THICKFRAME / MAXIMIZEBOX
+  if (w->gl) { w->style = w->style | (uint32)0x06000000; }            // CLIPCHILDREN | CLIPSIBLINGS
+  var cw: int32 = (int32)((float32)desc->width * w->scale + 0.5);
+  var ch: int32 = (int32)((float32)desc->height * w->scale + 0.5);
+  w->min_w = (int32)((float32)desc->min_width * w->scale + 0.5);
+  w->min_h = (int32)((float32)desc->min_height * w->scale + 0.5);
+  var ow: int32 = 0;
+  var oh: int32 = 0;
+  outer_size(w, cw, ch, &ow, &oh);
+  var title: uint16* = utf8_to_w(desc->title, desc->title_len);
+  w->creating = true;
+  w->opened = true;
+  w->hwnd = mythic_w32_CreateWindowExW(0, cls, title, w->style, (int32)0x80000000, (int32)0x80000000, ow, oh, 0, 0, w->instance, 0);
+  free(title);
+  if (w->hwnd == 0) {
+    w->opened = false;
+    print_err("MythicUI: CreateWindowExW failed\n");
+    return 1;
+  }
+  if (w->p_get_dpi_for_window != 0 && !have_forced) {
+    var gd: fn(int64) -> uint32 = (fn(int64) -> uint32)w->p_get_dpi_for_window;
+    var wd: int32 = (int32)gd(w->hwnd);
+    if (wd > 0 && wd != w->dpi) {
+      w->dpi = wd;
+      w->scale = (float32)wd / 96.0;
+      cw = (int32)((float32)desc->width * w->scale + 0.5);
+      ch = (int32)((float32)desc->height * w->scale + 0.5);
+      w->min_w = (int32)((float32)desc->min_width * w->scale + 0.5);
+      w->min_h = (int32)((float32)desc->min_height * w->scale + 0.5);
+      outer_size(w, cw, ch, &ow, &oh);
+      mythic_w32_SetWindowPos(w->hwnd, 0, 0, 0, ow, oh, 0x16);   // NOMOVE|NOZORDER|NOACTIVATE
+    }
+  }
+  mythic_w32_ShowWindow(w->hwnd, 5);
+  mythic_w32_UpdateWindow(w->hwnd);
+  mythic_w32_SetForegroundWindow(w->hwnd);
+  mythic_w32_SetFocus(w->hwnd);
+  var rc: W32Rect;
+  mythic_w32_GetClientRect(w->hwnd, &rc);
+  w->win_w = rc.right - rc.left;
+  w->win_h = rc.bottom - rc.top;
+  if (w->win_w < 1) { w->win_w = 1; }
+  if (w->win_h < 1) { w->win_h = 1; }
+  w->creating = false;
+  w->eq_head = 0;
+  w->eq_tail = 0;
+  var se: MythicEvent;
+  se.kind = MYTHIC_EV_SCALE; se.scale = w->scale;
+  push_ev(w, se);
+  var re: MythicEvent;
+  re.kind = MYTHIC_EV_RESIZE; re.width = w->win_w; re.height = w->win_h;
+  push_ev(w, re);
+  if (mythic_w32_GetFocus() == w->hwnd) {
+    var fe: MythicEvent;
+    fe.kind = MYTHIC_EV_FOCUS_IN;
+    push_ev(w, fe);
+  }
+  return 0;
+}
+
+fn w32_close(self: rawptr) {
+  var w: MythicW32* = (MythicW32*)self;
+  if (w->hwnd != 0) {
+    w->opened = false;
+    mythic_w32_DestroyWindow(w->hwnd);
+    w->hwnd = 0;
+    var msg: W32Msg;
+    while (mythic_w32_PeekMessageW(&msg, 0, 0, 0, 1) != 0) { mythic_w32_DispatchMessageW(&msg); }
+  }
+  if (w->px != 0) { free(w->px); w->px = (uint32*)0; }
+  if (g_mythic_w32 == w) { g_mythic_w32 = (MythicW32*)0; }
+}
+
+fn pump(w: MythicW32*) {
+  var msg: W32Msg;
+  while (mythic_w32_PeekMessageW(&msg, 0, 0, 0, 1) != 0) {
+    mythic_w32_TranslateMessage(&msg);
+    mythic_w32_DispatchMessageW(&msg);
+  }
+}
+
+fn w32_wait(self: rawptr, timeout_ms: int32) {
+  var w: MythicW32* = (MythicW32*)self;
+  var deadline: int64 = qpc_us(w) + (int64)timeout_ms * 1000;
+  while (true) {
+    pump(w);
+    if (w->eq_tail > w->eq_head || w->hwnd == 0) { return; }
+    var ms: uint32 = (uint32)0xFFFFFFFF;
+    if (timeout_ms >= 0) {
+      var rem: int64 = (deadline - qpc_us(w) + 999) / 1000;
+      if (rem <= 0) { return; }
+      ms = (uint32)rem;
+    }
+    mythic_w32_MsgWaitForMultipleObjectsEx(0, (int64*)0, ms, (uint32)0x04FF, (uint32)4);   // QS_ALLINPUT, MWMO_INPUTAVAILABLE
+  }
+}
+
+fn w32_next_event(self: rawptr, ev: MythicEvent*) -> bool {
+  var w: MythicW32* = (MythicW32*)self;
+  if (w->eq_head == w->eq_tail) { return false; }
+  *ev = w->eq[w->eq_head % W32_EQCAP];
+  w->eq_head = w->eq_head + 1;
+  return true;
+}
+
+fn w32_framebuffer(self: rawptr) -> MythicFramebuffer {
+  var w: MythicW32* = (MythicW32*)self;
+  var fw: int32 = w->win_w;
+  var fh: int32 = w->win_h;
+  if (fw < 1) { fw = 1; }
+  if (fh < 1) { fh = 1; }
+  if (w->px == 0 || w->fb_w != fw || w->fb_h != fh) {
+    if (w->px != 0) { free(w->px); }
+    w->px = (uint32*)malloc((int64)fw * (int64)fh * 4);
+    w->fb_w = fw;
+    w->fb_h = fh;
+    w->fb_valid = false;
+  }
+  var fb: MythicFramebuffer;
+  fb.px = w->px;
+  fb.w = w->fb_w;
+  fb.h = w->fb_h;
+  fb.stride = w->fb_w;
+  return fb;
+}
+
+fn w32_present(self: rawptr, rects: MythicRectI*, n: int32) {
+  var w: MythicW32* = (MythicW32*)self;
+  present_rects(w, 0, rects, n);
+}
+
+fn w32_now_us(self: rawptr) -> int64 {
+  var w: MythicW32* = (MythicW32*)self;
+  if (w->qpc_freq == 0) { mythic_w32_QueryPerformanceFrequency(&w->qpc_freq); }
+  return qpc_us(w);
+}
+
+fn w32_set_title(self: rawptr, s: uint8*, n: int64) {
+  var w: MythicW32* = (MythicW32*)self;
+  if (w->hwnd == 0) { return; }
+  var t: uint16* = utf8_to_w(s, n);
+  mythic_w32_SetWindowTextW(w->hwnd, t);
+  free(t);
+}
+
+fn w32_set_cursor(self: rawptr, cursor: int32) {
+  var w: MythicW32* = (MythicW32*)self;
+  if (cursor < 0 || cursor > 7 || cursor == w->cursor_shape) { return; }
+  w->cursor_shape = cursor;
+  mythic_w32_SetCursor(w->cursors[cursor]);
+}
+
+// Another process may hold the clipboard open for a moment, so retry for about 100 ms.
+fn open_clipboard(w: MythicW32*) -> bool {
+  for i in 0..20 {
+    if (mythic_w32_OpenClipboard(w->hwnd) != 0) { return true; }
+    mythic_w32_Sleep((uint32)5);
+  }
+  return false;
+}
+
+// CF_UNICODETEXT is CRLF text: LF becomes CRLF on copy and CRLF becomes LF on paste.
+fn w32_clipboard_set(self: rawptr, s: uint8*, n: int64) {
+  var w: MythicW32* = (MythicW32*)self;
+  if (w->hwnd == 0) { return; }
+  var units: int64 = 1;
+  var i: int64 = 0;
+  var cp: uint32 = 0;
+  while (i < n) {
+    i = mythic_utf8_decode(s, n, i, &cp);
+    units = units + 1;
+    if (cp >= (uint32)0x10000 || cp == (uint32)10) { units = units + 1; }
+  }
+  var mem: int64 = mythic_w32_GlobalAlloc((uint32)2, units * 2);   // GMEM_MOVEABLE
+  if (mem == 0) { return; }
+  var d: uint16* = (uint16*)mythic_w32_GlobalLock(mem);
+  if (d == 0) { mythic_w32_GlobalFree(mem); return; }
+  var o: int64 = 0;
+  i = 0;
+  while (i < n) {
+    i = mythic_utf8_decode(s, n, i, &cp);
+    if (cp == (uint32)10 && (o == 0 || d[o - 1] != (uint16)13)) { d[o] = (uint16)13; o = o + 1; }
+    if (cp >= (uint32)0x10000) {
+      cp = cp - (uint32)0x10000;
+      d[o] = (uint16)((uint32)0xD800 + (cp >> (uint32)10));
+      d[o + 1] = (uint16)((uint32)0xDC00 + (cp & (uint32)0x3FF));
+      o = o + 2;
+    } else {
+      d[o] = (uint16)cp;
+      o = o + 1;
+    }
+  }
+  d[o] = (uint16)0;
+  mythic_w32_GlobalUnlock(mem);
+  if (!open_clipboard(w)) { mythic_w32_GlobalFree(mem); return; }
+  mythic_w32_EmptyClipboard();
+  if (mythic_w32_SetClipboardData((uint32)13, mem) == 0) { mythic_w32_GlobalFree(mem); }   // CF_UNICODETEXT
+  mythic_w32_CloseClipboard();
+}
+
+fn w32_clipboard_get(self: rawptr, out: MythicBytes*) -> bool {
+  var w: MythicW32* = (MythicW32*)self;
+  out->data = (uint8*)0;
+  out->len = 0;
+  if (w->hwnd == 0 || !open_clipboard(w)) { return false; }
+  var mem: int64 = mythic_w32_GetClipboardData((uint32)13);
+  var src: uint16* = (uint16*)0;
+  if (mem != 0) { src = (uint16*)mythic_w32_GlobalLock(mem); }
+  if (src == 0) { mythic_w32_CloseClipboard(); return false; }
+  var units: int64 = mythic_w32_GlobalSize(mem) / 2;
+  var n: int64 = 0;
+  while (n < units && src[n] != (uint16)0) { n = n + 1; }
+  var d: uint8* = (uint8*)malloc(n * 3 + 1);
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var cp: uint32 = (uint32)src[i];
+    i = i + 1;
+    if (cp >= (uint32)0xD800 && cp < (uint32)0xDC00 && i < n && src[i] >= (uint16)0xDC00 && src[i] < (uint16)0xE000) {
+      cp = (uint32)0x10000 + ((cp - (uint32)0xD800) << (uint32)10) + ((uint32)src[i] - (uint32)0xDC00);
+      i = i + 1;
+    }
+    if (cp == (uint32)13 && i < n && src[i] == (uint16)10) { continue; }
+    o = o + (int64)mythic_utf8_encode(cp, &d[o]);    // a lone surrogate encodes as U+FFFD
+  }
+  d[o] = (uint8)0;
+  mythic_w32_GlobalUnlock(mem);
+  mythic_w32_CloseClipboard();
+  if (o == 0) { free(d); return false; }
+  out->data = d;
+  out->len = o;
+  return true;
+}
+
+fn w32_getenv(self: rawptr, name: uint8*, n: int64, out: MythicBytes*) -> bool {
+  var cname: uint8* = (uint8*)malloc(n + 1);
+  for i: int64 in 0..n { cname[i] = name[i]; }
+  cname[n] = (uint8)0;
+  var need: uint32 = mythic_w32_GetEnvironmentVariableA((cstring)cname, (uint8*)0, (uint32)0);
+  if (need == (uint32)0) { free(cname); return false; }
+  var buf: uint8* = (uint8*)malloc((int64)need + 1);
+  var got: uint32 = mythic_w32_GetEnvironmentVariableA((cstring)cname, buf, need);
+  free(cname);
+  if (got >= need) { free(buf); return false; }
+  buf[got] = (uint8)0;
+  out->data = buf;
+  out->len = (int64)got;
+  return true;
+}
+
+export fn mythic_plat_native_create() -> MythicPlatform* {
+  var w: MythicW32* = new MythicW32;
+  var p: MythicPlatform* = &w->plat;
+  p->self = (rawptr)w;
+  p->open = &w32_open;
+  p->close = &w32_close;
+  p->wait = &w32_wait;
+  p->next_event = &w32_next_event;
+  p->framebuffer = &w32_framebuffer;
+  p->present = &w32_present;
+  p->now_us = &w32_now_us;
+  p->set_title = &w32_set_title;
+  p->set_cursor = &w32_set_cursor;
+  p->clipboard_set = &w32_clipboard_set;
+  p->clipboard_get = &w32_clipboard_get;
+  p->getenv = &w32_getenv;
+  return p;
+}
+
+/// GL (mythic_app): nothing to do before open on Win32 (X11 connects early here).
+export fn mythic_plat_gl_connect(p: MythicPlatform*) -> bool { return p != 0 && p->open == &w32_open; }
+
+/// GL (mythic_app): give the window class CS_OWNDC. Call before open. False when `p` is not
+/// this platform. The visual arguments are for X11 and ignored here.
+export fn mythic_plat_gl_prepare(p: MythicPlatform*, visual: int64, depth: int32) -> bool {
+  if (p == 0 || p->open != &w32_open) { return false; }
+  var w: MythicW32* = (MythicW32*)p->self;
+  w->gl = true;
+  return true;
+}
+
+/// The HWND a GL context draws into (0 when `p` is not this platform or not open).
+export fn mythic_plat_gl_handle(p: MythicPlatform*) -> int64 {
+  if (p == 0 || p->open != &w32_open) { return 0; }
+  var w: MythicW32* = (MythicW32*)p->self;
+  if (!w->opened) { return 0; }
+  return w->hwnd;
+}
+
+/// True while the window is minimized (mythic_app skips drawing and slows timer frames then).
+/// False when `p` is not this platform.
+export fn mythic_plat_hidden(p: MythicPlatform*) -> bool {
+  if (p == 0 || p->open != &w32_open) { return false; }
+  var w: MythicW32* = (MythicW32*)p->self;
+  return w->opened && mythic_w32_IsIconic(w->hwnd) != 0;
+}
+
+/// GL (mythic_app): a GL context now draws the window (on), or the CPU renderer again (off).
+/// While on, WM_PAINT leaves the window to GL instead of putting the CPU framebuffer, which
+/// holds a frame from before GL started.
+export fn mythic_plat_gl_active(p: MythicPlatform*, on: bool) {
+  if (p == 0 || p->open != &w32_open) { return; }
+  var w: MythicW32* = (MythicW32*)p->self;
+  w->gl_active = on;
+  if (on) { w->fb_valid = false; }
+}
+
+/// The process environment, whatever the platform object (malloc'd, nul-terminated value).
+export fn mythic_plat_env(name: uint8*, n: int64, out: MythicBytes*) -> bool { return w32_getenv((rawptr)0, name, n, out); }

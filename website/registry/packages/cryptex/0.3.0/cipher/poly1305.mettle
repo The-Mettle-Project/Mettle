@@ -1,0 +1,213 @@
+// Poly1305 (RFC 8439 section 2.5) in pure Mettle, 32-bit "donna" layout:
+// five 26-bit limbs, uint64 products. On x86-64 the blocks and the final
+// step go through poly1305_x86_64.mettle instead (base 2^64 with mul and
+// adc, about twice as fast); the tag is the same. Internal: used by
+// cr_aead_*.
+//
+// Constant time: no branch, index or loop bound depends on r, h, the key or
+// the message bytes; only on public lengths. The final reduction picks h or
+// h - p with a mask.
+
+import "cryptex/core/util";
+import "cryptex/cipher/chacha";
+import "cryptex/cipher/poly1305_x86_64" if x86_64;
+import "cryptex/cipher/poly1305_aarch64" if aarch64;
+
+/// internal: Poly1305 state (clamped r, accumulator h in 26-bit limbs, the
+/// same in base 2^64 for x86-64 as h0, h1, h2, r0, r1, the s pad, and a
+/// 16-byte partial-block buffer).
+export struct CrxPoly1305 {
+  x: uint64[5];
+  r: uint32[5];
+  h: uint32[5];
+  pad: uint32[4];
+  buf: uint8[16];
+  buflen: int64;
+  generic: uint32;
+}
+
+/// internal: starts a MAC with a 32-byte one-time key (r clamped per RFC
+/// 8439 2.5, then s).
+export fn crx_poly1305_init(s: CrxPoly1305*, key: uint8*) {
+  s->r[0] = crx_ld32(&key[0]) & (uint32)0x3ffffff;
+  s->r[1] = (crx_ld32(&key[3]) >> 2) & (uint32)0x3ffff03;
+  s->r[2] = (crx_ld32(&key[6]) >> 4) & (uint32)0x3ffc0ff;
+  s->r[3] = (crx_ld32(&key[9]) >> 6) & (uint32)0x3f03fff;
+  s->r[4] = (crx_ld32(&key[12]) >> 8) & (uint32)0x00fffff;
+  var i: int32 = 0;
+  while (i < 5) {
+    s->h[i] = 0;
+    i = i + 1;
+  }
+  s->generic = 0;
+  s->x[0] = 0;
+  s->x[1] = 0;
+  s->x[2] = 0;
+  s->x[3] = (uint64)(crx_ld32(&key[0]) & (uint32)0x0fffffff) | ((uint64)(crx_ld32(&key[4]) & (uint32)0x0ffffffc) << 32);
+  s->x[4] = (uint64)(crx_ld32(&key[8]) & (uint32)0x0ffffffc) | ((uint64)(crx_ld32(&key[12]) & (uint32)0x0ffffffc) << 32);
+  i = 0;
+  while (i < 4) {
+    s->pad[i] = crx_ld32(&key[16 + i * 4]);
+    i = i + 1;
+  }
+  i = 0;
+  while (i < 16) {
+    s->buf[i] = 0;
+    i = i + 1;
+  }
+  s->buflen = 0;
+}
+
+// Absorbs whole 16-byte blocks. hibit is 1 << 24 for a full block and 0 for
+// the final padded block (whose 0x01 byte is already in the data).
+fn crx_poly1305_blocks(s: CrxPoly1305*, m: uint8*, n: int64, hibit: uint32) {
+  if (crx_poly1305_x64() != (uint32)0 && s->generic == (uint32)0) {
+    crx_poly1305_x64_blocks(&s->x[0], m, n >> 4, (uint64)(hibit >> 24));
+    return;
+  }
+  var m26: uint64 = (uint64)0x3ffffff;
+  var r0: uint64 = (uint64)s->r[0];
+  var r1: uint64 = (uint64)s->r[1];
+  var r2: uint64 = (uint64)s->r[2];
+  var r3: uint64 = (uint64)s->r[3];
+  var r4: uint64 = (uint64)s->r[4];
+  var s1: uint64 = r1 * (uint64)5;
+  var s2: uint64 = r2 * (uint64)5;
+  var s3: uint64 = r3 * (uint64)5;
+  var s4: uint64 = r4 * (uint64)5;
+  var h0: uint64 = (uint64)s->h[0];
+  var h1: uint64 = (uint64)s->h[1];
+  var h2: uint64 = (uint64)s->h[2];
+  var h3: uint64 = (uint64)s->h[3];
+  var h4: uint64 = (uint64)s->h[4];
+  var pos: int64 = 0;
+  while (pos + 16 <= n) {
+    var p: uint8* = &m[pos];
+    h0 = h0 + ((uint64)crx_ld32(&p[0]) & m26);
+    h1 = h1 + (((uint64)crx_ld32(&p[3]) >> 2) & m26);
+    h2 = h2 + (((uint64)crx_ld32(&p[6]) >> 4) & m26);
+    h3 = h3 + (((uint64)crx_ld32(&p[9]) >> 6) & m26);
+    h4 = h4 + (((uint64)crx_ld32(&p[12]) >> 8) | (uint64)hibit);
+
+    var d0: uint64 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+    var d1: uint64 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+    var d2: uint64 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+    var d3: uint64 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+    var d4: uint64 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+
+    var c: uint64 = d0 >> 26; h0 = d0 & m26;
+    d1 = d1 + c; c = d1 >> 26; h1 = d1 & m26;
+    d2 = d2 + c; c = d2 >> 26; h2 = d2 & m26;
+    d3 = d3 + c; c = d3 >> 26; h3 = d3 & m26;
+    d4 = d4 + c; c = d4 >> 26; h4 = d4 & m26;
+    h0 = h0 + c * (uint64)5;
+    c = h0 >> 26; h0 = h0 & m26;
+    h1 = h1 + c;
+    pos = pos + 16;
+  }
+  s->h[0] = (uint32)h0;
+  s->h[1] = (uint32)h1;
+  s->h[2] = (uint32)h2;
+  s->h[3] = (uint32)h3;
+  s->h[4] = (uint32)h4;
+}
+
+/// internal: makes s use the portable 26-bit limb code even where the
+/// base 2^64 core exists (the tests compare the two). Call right after
+/// crx_poly1305_init.
+export fn crx_poly1305_use_generic(s: CrxPoly1305*) {
+  s->generic = 1;
+}
+
+/// internal: absorbs n message bytes.
+export fn crx_poly1305_update(s: CrxPoly1305*, p: uint8*, n: int64) {
+  var pos: int64 = 0;
+  if (s->buflen > 0) {
+    while (pos < n && s->buflen < 16) {
+      s->buf[s->buflen] = p[pos];
+      s->buflen = s->buflen + 1;
+      pos = pos + 1;
+    }
+    if (s->buflen < 16) { return; }
+    crx_poly1305_blocks(s, &s->buf[0], 16, (uint32)0x1000000);
+    s->buflen = 0;
+  }
+  var whole: int64 = ((n - pos) / 16) * 16;
+  if (whole > 0) {
+    crx_poly1305_blocks(s, &p[pos], whole, (uint32)0x1000000);
+    pos = pos + whole;
+  }
+  while (pos < n) {
+    s->buf[s->buflen] = p[pos];
+    s->buflen = s->buflen + 1;
+    pos = pos + 1;
+  }
+}
+
+/// internal: finishes the MAC, writes the 16-byte tag, then wipes s.
+export fn crx_poly1305_final(s: CrxPoly1305*, tag: uint8*) {
+  if (s->buflen > 0) {
+    s->buf[s->buflen] = 1;
+    var i: int64 = s->buflen + 1;
+    while (i < 16) {
+      s->buf[i] = 0;
+      i = i + 1;
+    }
+    crx_poly1305_blocks(s, &s->buf[0], 16, 0);
+  }
+  if (crx_poly1305_x64() != (uint32)0 && s->generic == (uint32)0) {
+    crx_poly1305_x64_emit(&s->x[0], (uint8*)&s->pad[0], tag);
+    cr_wipe((uint8*)&s->x[0], 40);
+    cr_wipe((uint8*)&s->r[0], 20);
+    cr_wipe((uint8*)&s->pad[0], 16);
+    cr_wipe(&s->buf[0], 16);
+    s->buflen = 0;
+    return;
+  }
+  var m26: uint32 = (uint32)0x3ffffff;
+  var h0: uint32 = s->h[0];
+  var h1: uint32 = s->h[1];
+  var h2: uint32 = s->h[2];
+  var h3: uint32 = s->h[3];
+  var h4: uint32 = s->h[4];
+  // Full carry.
+  var c: uint32 = h1 >> 26; h1 = h1 & m26;
+  h2 = h2 + c; c = h2 >> 26; h2 = h2 & m26;
+  h3 = h3 + c; c = h3 >> 26; h3 = h3 & m26;
+  h4 = h4 + c; c = h4 >> 26; h4 = h4 & m26;
+  h0 = h0 + c * (uint32)5; c = h0 >> 26; h0 = h0 & m26;
+  h1 = h1 + c;
+  // g = h + 5 - 2^130; select g if h >= p, else h, with a mask.
+  var g0: uint32 = h0 + (uint32)5; c = g0 >> 26; g0 = g0 & m26;
+  var g1: uint32 = h1 + c; c = g1 >> 26; g1 = g1 & m26;
+  var g2: uint32 = h2 + c; c = g2 >> 26; g2 = g2 & m26;
+  var g3: uint32 = h3 + c; c = g3 >> 26; g3 = g3 & m26;
+  var g4: uint32 = h4 + c - ((uint32)1 << 26);
+  var mask: uint32 = (g4 >> 31) - (uint32)1;
+  var nmask: uint32 = ~mask;
+  h0 = (h0 & nmask) | (g0 & mask);
+  h1 = (h1 & nmask) | (g1 & mask);
+  h2 = (h2 & nmask) | (g2 & mask);
+  h3 = (h3 & nmask) | (g3 & mask);
+  h4 = (h4 & nmask) | (g4 & mask);
+  // h mod 2^128, then + s.
+  var w0: uint32 = h0 | (h1 << 26);
+  var w1: uint32 = (h1 >> 6) | (h2 << 20);
+  var w2: uint32 = (h2 >> 12) | (h3 << 14);
+  var w3: uint32 = (h3 >> 18) | (h4 << 8);
+  var f: uint64 = (uint64)w0 + (uint64)s->pad[0];
+  crx_st32(&tag[0], (uint32)f);
+  f = (uint64)w1 + (uint64)s->pad[1] + (f >> 32);
+  crx_st32(&tag[4], (uint32)f);
+  f = (uint64)w2 + (uint64)s->pad[2] + (f >> 32);
+  crx_st32(&tag[8], (uint32)f);
+  f = (uint64)w3 + (uint64)s->pad[3] + (f >> 32);
+  crx_st32(&tag[12], (uint32)f);
+  // Wipe the state.
+  cr_wipe((uint8*)&s->x[0], 40);
+  cr_wipe((uint8*)&s->r[0], 20);
+  cr_wipe((uint8*)&s->h[0], 20);
+  cr_wipe((uint8*)&s->pad[0], 16);
+  cr_wipe(&s->buf[0], 16);
+  s->buflen = 0;
+}

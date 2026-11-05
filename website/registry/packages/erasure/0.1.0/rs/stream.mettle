@@ -1,0 +1,190 @@
+// Streaming encode, verify and rebuild over shards too big to hold in
+// memory, in fixed-size chunks (like klauspost's StreamEncoder).
+//
+// The caller gives two closures:
+//   read(shard, buf, max)  -> bytes read, 0 at the end, < 0 on error
+//   write(shard, buf, n)   -> 0 on success, nonzero on error
+// A read may return fewer bytes than asked; it is called again until the
+// chunk is full or the shard ends. All shards must have the same length.
+
+import "std/mem";
+import "erasure/core/status";
+import "erasure/rs/codec";
+
+/// Default chunk size: 1 MiB per shard.
+export const ERASURE_STREAM_CHUNK: int64 = 1048576;
+
+// Reads until n bytes or the end. Returns the count, or < 0 on error.
+fn erasure_read_full(read: Fn(int32, uint8*, int64) -> int64, shard: int32, buf: uint8*, n: int64) -> int64 {
+  var got: int64 = 0;
+  while (got < n) {
+    var r: int64 = read(shard, buf + got, n - got);
+    if (r < 0) { return -1; }
+    if (r == 0) { break; }
+    if (r > n - got) { return -1; }
+    got = got + r;
+  }
+  return got;
+}
+
+fn erasure_stream_buffers(c: ErasureRS*, chunk: int64, block: uint8**) -> uint8** {
+  var b: uint8* = (uint8*)malloc((int64)c->n * chunk);
+  var sh: uint8** = (uint8**)malloc((int64)c->n * 8);
+  if (b == 0 || sh == 0) { free(b); free(sh); return (uint8**)0; }
+  for i in 0..c->n { sh[i] = b + (int64)i * chunk; }
+  *block = b;
+  return sh;
+}
+
+// Reads one chunk from every shard that `want` marks (all when want is 0).
+// Returns the common length, or a negative status.
+fn erasure_stream_fill(c: ErasureRS*, read: Fn(int32, uint8*, int64) -> int64, sh: uint8**, want: bool*, upto: int32, chunk: int64) -> int64 {
+  var len: int64 = -1;
+  for i in 0..upto {
+    if (want != 0 && !want[i]) { continue; }
+    var got: int64 = erasure_read_full(read, i, sh[i], chunk);
+    if (got < 0) { return (int64)ERASURE_E_IO; }
+    if (len < 0) { len = got; }
+    if (got != len) { return (int64)ERASURE_E_SIZE; }
+  }
+  if (len < 0) { len = 0; }
+  return len;
+}
+
+fn erasure_stream_chunk(chunk: int64) -> int64 {
+  if (chunk <= 0) { return ERASURE_STREAM_CHUNK; }
+  return chunk;
+}
+
+/// Reads the k data shards and writes the m parity shards (shard numbers
+/// k..k+m). chunk is the bytes per shard per step (0 for the default).
+export fn erasure_rs_stream_encode(c: ErasureRS*, read: Fn(int32, uint8*, int64) -> int64, write: Fn(int32, uint8*, int64) -> int32, chunk: int64) -> int32 {
+  if (c == 0) { return ERASURE_E_ARG; }
+  var ch: int64 = erasure_stream_chunk(chunk);
+  var block: uint8* = 0;
+  var sh: uint8** = erasure_stream_buffers(c, ch, &block);
+  if (sh == 0) { return ERASURE_E_MEM; }
+  var rc: int32 = ERASURE_OK;
+  while (true) {
+    var len: int64 = erasure_stream_fill(c, read, sh, (bool*)0, c->k, ch);
+    if (len < 0) { rc = (int32)len; break; }
+    if (len == 0) { break; }
+    erasure_rs_encode(c, sh, len);
+    for p in c->k..c->n {
+      if (write(p, sh[p], len) != 0) { rc = ERASURE_E_IO; break; }
+    }
+    if (rc != ERASURE_OK || len < ch) { break; }
+  }
+  free(sh);
+  free(block);
+  return rc;
+}
+
+/// Reads all k + m shards and checks the parity. Returns ERASURE_OK or
+/// ERASURE_E_VERIFY (or a read error).
+export fn erasure_rs_stream_verify(c: ErasureRS*, read: Fn(int32, uint8*, int64) -> int64, chunk: int64) -> int32 {
+  if (c == 0) { return ERASURE_E_ARG; }
+  var ch: int64 = erasure_stream_chunk(chunk);
+  var block: uint8* = 0;
+  var sh: uint8** = erasure_stream_buffers(c, ch, &block);
+  if (sh == 0) { return ERASURE_E_MEM; }
+  var rc: int32 = ERASURE_OK;
+  while (true) {
+    var len: int64 = erasure_stream_fill(c, read, sh, (bool*)0, c->n, ch);
+    if (len < 0) { rc = (int32)len; break; }
+    if (len == 0) { break; }
+    rc = erasure_rs_verify(c, sh, len);
+    if (rc != ERASURE_OK || len < ch) { break; }
+  }
+  free(sh);
+  free(block);
+  return rc;
+}
+
+/// Reads the shards marked present and writes the missing ones (only the
+/// missing data shards when data_only is true). Needs k present shards.
+export fn erasure_rs_stream_reconstruct(c: ErasureRS*, present: bool*, read: Fn(int32, uint8*, int64) -> int64, write: Fn(int32, uint8*, int64) -> int32, chunk: int64, data_only: bool) -> int32 {
+  if (c == 0 || present == 0) { return ERASURE_E_ARG; }
+  var have: int32 = 0;
+  for i in 0..c->n { if (present[i]) { have = have + 1; } }
+  if (have < c->k) { return ERASURE_E_SHARDS; }
+  var ch: int64 = erasure_stream_chunk(chunk);
+  var block: uint8* = 0;
+  var sh: uint8** = erasure_stream_buffers(c, ch, &block);
+  if (sh == 0) { return ERASURE_E_MEM; }
+  var rc: int32 = ERASURE_OK;
+  while (true) {
+    var len: int64 = erasure_stream_fill(c, read, sh, present, c->n, ch);
+    if (len < 0) { rc = (int32)len; break; }
+    if (len == 0) { break; }
+    rc = erasure_rs_reconstruct_range(c, sh, present, 0, len, data_only);
+    if (rc != ERASURE_OK) { break; }
+    for i in 0..c->n {
+      if (present[i] || (data_only && i >= c->k)) { continue; }
+      if (write(i, sh[i], len) != 0) { rc = ERASURE_E_IO; break; }
+    }
+    if (rc != ERASURE_OK || len < ch) { break; }
+  }
+  free(sh);
+  free(block);
+  return rc;
+}
+
+/// Splits one input of total bytes into the k data shards, each
+/// erasure_shard_size(total, k) bytes, the last padded with zeros. The
+/// input is read with read(-1, buf, max); shard j is written with
+/// write(j, buf, n). Run erasure_rs_stream_encode afterwards for parity.
+export fn erasure_rs_stream_split(c: ErasureRS*, total: int64, read: Fn(int32, uint8*, int64) -> int64, write: Fn(int32, uint8*, int64) -> int32, chunk: int64) -> int32 {
+  if (c == 0 || total < 0) { return ERASURE_E_ARG; }
+  var ch: int64 = erasure_stream_chunk(chunk);
+  var size: int64 = erasure_shard_size(total, c->k);
+  var buf: uint8* = (uint8*)malloc(ch);
+  if (buf == 0) { return ERASURE_E_MEM; }
+  var rc: int32 = ERASURE_OK;
+  var left: int64 = total;
+  for j in 0..c->k {
+    var done: int64 = 0;
+    while (done < size && rc == ERASURE_OK) {
+      var len: int64 = size - done;
+      if (len > ch) { len = ch; }
+      var take: int64 = len;
+      if (take > left) { take = left; }
+      if (take > 0) {
+        var got: int64 = erasure_read_full(read, -1, buf, take);
+        if (got < 0) { rc = ERASURE_E_IO; break; }
+        if (got != take) { rc = ERASURE_E_SIZE; break; }
+      }
+      for i in take..len { buf[i] = 0; }
+      if (write(j, buf, len) != 0) { rc = ERASURE_E_IO; break; }
+      left = left - take;
+      done = done + len;
+    }
+    if (rc != ERASURE_OK) { break; }
+  }
+  free(buf);
+  return rc;
+}
+
+/// Reads the k data shards in order and writes the first total bytes to
+/// write(-1, buf, n). The reverse of erasure_rs_stream_split.
+export fn erasure_rs_stream_join(c: ErasureRS*, total: int64, read: Fn(int32, uint8*, int64) -> int64, write: Fn(int32, uint8*, int64) -> int32, chunk: int64) -> int32 {
+  if (c == 0 || total < 0) { return ERASURE_E_ARG; }
+  var ch: int64 = erasure_stream_chunk(chunk);
+  var buf: uint8* = (uint8*)malloc(ch);
+  if (buf == 0) { return ERASURE_E_MEM; }
+  var rc: int32 = ERASURE_OK;
+  var left: int64 = total;
+  var j: int32 = 0;
+  while (left > 0 && j < c->k) {
+    var want: int64 = left;
+    if (want > ch) { want = ch; }
+    var got: int64 = erasure_read_full(read, j, buf, want);
+    if (got < 0) { rc = ERASURE_E_IO; break; }
+    if (got == 0) { j = j + 1; continue; }
+    if (write(-1, buf, got) != 0) { rc = ERASURE_E_IO; break; }
+    left = left - got;
+  }
+  if (rc == ERASURE_OK && left > 0) { rc = ERASURE_E_SIZE; }
+  free(buf);
+  return rc;
+}

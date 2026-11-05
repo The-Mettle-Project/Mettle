@@ -1,0 +1,76 @@
+// plat_windows: Windows. The Win32 backend, or headless when asked for.
+import "std/mem";
+import "std/thread";
+import "core/types.mettle";
+import "headless/headless.mettle";
+import "win32/api.mettle";
+import "win32/backend.mettle";
+
+fn is_w32() -> bool { return g_window.backend == WINDOW_BACKEND_WIN32; }
+
+/// Monotonic clock in microseconds.
+export fn window_now_us() -> int64 { return window_w32_now_us(); }
+
+/// Sleeps for ms milliseconds.
+export fn window_sleep_ms(ms: int32) { if (ms > 0) { thread_sleep_ms((uint32)ms); } }
+
+fn env_headless() -> bool {
+  var buf: uint8[16];
+  var n: uint32 = window_w32_GetEnvironmentVariableA("WINDOW_BACKEND", &buf[0], 16);
+  return n == (uint32)8 && buf[0] == (uint8)104 && buf[4] == (uint8)108;   // "headless"
+}
+
+export fn window_plat_init(backend: int32) -> bool {
+  var b: int32 = backend;
+  if (b == WINDOW_BACKEND_AUTO && env_headless()) { b = WINDOW_BACKEND_HEADLESS; }
+  if (b == WINDOW_BACKEND_HEADLESS) { g_window.backend = b; window_w32_wake_init(); return window_hl_init(); }
+  if (b != WINDOW_BACKEND_AUTO && b != WINDOW_BACKEND_WIN32) {
+    window_set_error("this backend is not available on Windows");
+    return false;
+  }
+  if (!window_w32_init()) { return false; }
+  g_window.backend = WINDOW_BACKEND_WIN32;
+  return true;
+}
+export fn window_plat_shutdown() { if (!is_w32()) { window_hl_shutdown(); } window_w32_shutdown(); }
+export fn window_plat_wake() { window_w32_wake(); }
+export fn window_plat_refresh_monitors() { if (is_w32()) { window_w32_refresh_monitors(); } else { window_hl_monitors(); } }
+export fn window_plat_create(w: Window*, cfg: WindowConfig*) -> bool { if (is_w32()) { return window_w32_create(w, cfg); } return window_hl_create(w, cfg); }
+export fn window_plat_destroy(w: Window*) { if (is_w32()) { window_w32_destroy(w); } }
+export fn window_plat_pump(timeout_ms: int32) {
+  window_w32_pump(timeout_ms);                   // headless too: it waits on the wake event
+}
+export fn window_plat_set_title(w: Window*, title: string) { if (is_w32()) { window_w32_set_title(w, title); } }
+export fn window_plat_set_size(w: Window*, width: int32, height: int32) { if (is_w32()) { window_w32_set_size(w, width, height); return; } window_hl_resize(w, width, height); }
+export fn window_plat_set_position(w: Window*, x: int32, y: int32) {
+  if (is_w32()) { window_w32_set_position(w, x, y); return; }
+  var ev: WindowEvent; ev.kind = WINDOW_EV_MOVE; ev.win = w; ev.x = (float64)x; ev.y = (float64)y; window_push_event(&ev);
+}
+export fn window_plat_set_size_limits(w: Window*, a: int32, b: int32, c: int32, d: int32) { if (is_w32()) { window_w32_set_size_limits(w, a, b, c, d); } }
+export fn window_plat_set_visible(w: Window*, on: bool) {
+  if (is_w32()) { window_w32_set_visible(w, on); return; }
+  var ev: WindowEvent; ev.win = w; ev.kind = WINDOW_EV_HIDDEN; if (on) { ev.kind = WINDOW_EV_SHOWN; } window_push_event(&ev);
+}
+export fn window_plat_minimize(w: Window*) { if (is_w32()) { window_w32_minimize(w); return; } var ev: WindowEvent; ev.kind = WINDOW_EV_MINIMIZE; ev.win = w; window_push_event(&ev); }
+export fn window_plat_maximize(w: Window*) { if (is_w32()) { window_w32_maximize(w); return; } var ev: WindowEvent; ev.kind = WINDOW_EV_MAXIMIZE; ev.win = w; window_push_event(&ev); }
+export fn window_plat_restore(w: Window*) { if (is_w32()) { window_w32_restore(w); return; } var ev: WindowEvent; ev.kind = WINDOW_EV_RESTORE; ev.win = w; window_push_event(&ev); }
+export fn window_plat_focus(w: Window*) { if (is_w32()) { window_w32_focus(w); return; } var ev: WindowEvent; ev.kind = WINDOW_EV_FOCUS_IN; ev.win = w; window_push_event(&ev); }
+export fn window_plat_attention(w: Window*) { if (is_w32()) { window_w32_attention(w); } }
+export fn window_plat_set_fullscreen(w: Window*, mode: int32, monitor: int32) { if (is_w32()) { window_w32_set_fullscreen(w, mode, monitor); return; } w->fullscreen = mode; }
+export fn window_plat_set_icon(w: Window*, rgba: uint8*, width: int32, height: int32) { if (is_w32()) { window_w32_set_icon(w, rgba, width, height); } }
+export fn window_plat_blit(w: Window*, rgba: uint8*, width: int32, height: int32, stride: int32) -> bool { if (is_w32()) { return window_w32_blit(w, rgba, width, height, stride); } return true; }
+export fn window_plat_native(w: Window*, out: WindowNative*) -> bool { if (is_w32()) { return window_w32_native(w, out); } return false; }
+export fn window_plat_text_input(w: Window*, on: bool) { if (is_w32()) { window_w32_text_input(w, on); } }
+export fn window_plat_text_rect(w: Window*, x: int32, y: int32, width: int32, height: int32) { if (is_w32()) { window_w32_text_rect(w, x, y, width, height); } }
+export fn window_plat_warp(w: Window*, x: float64, y: float64) {
+  if (is_w32()) { window_w32_warp(w, x, y); return; }
+  var ev: WindowEvent; ev.kind = WINDOW_EV_MOUSE_MOVE; ev.win = w; ev.x = x; ev.y = y; window_push_event(&ev);
+}
+export fn window_plat_set_cursor(w: Window*, shape: int32) { if (is_w32()) { window_w32_set_cursor(w, shape); } }
+export fn window_plat_set_cursor_image(w: Window*, rgba: uint8*, width: int32, height: int32, hx: int32, hy: int32) -> bool {
+  if (is_w32()) { return window_w32_set_cursor_image(w, rgba, width, height, hx, hy); }
+  return true;
+}
+export fn window_plat_set_cursor_mode(w: Window*, mode: int32, old: int32) { if (is_w32()) { window_w32_set_cursor_mode(w, mode, old); } }
+export fn window_plat_clipboard_set(w: Window*, s: uint8*, n: int64) { if (is_w32()) { window_w32_clipboard_set(w, s, n); return; } window_hl_clipboard_set(s, n); }
+export fn window_plat_clipboard_get(w: Window*) -> string { if (is_w32()) { return window_w32_clipboard_get(w); } return window_hl_clipboard_get(); }

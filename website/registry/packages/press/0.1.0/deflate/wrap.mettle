@@ -1,0 +1,194 @@
+// zlib (RFC 1950) and gzip (RFC 1952) wrappers around DEFLATE.
+//
+// zlib:  2-byte header, DEFLATE data, Adler-32 of the data (big-endian).
+// gzip:  10-byte header plus optional fields, DEFLATE data, CRC-32 and the
+//        size mod 2^32 (both little-endian). A gzip file may hold several
+//        members back to back; they decode to one output.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../check/crc32";
+import "../check/adler32";
+import "inflate";
+import "deflate";
+
+// Format codes for the streaming API and press_deflate_format_of.
+export const PRESS_FMT_RAW: int32 = 0;
+export const PRESS_FMT_ZLIB: int32 = 1;
+export const PRESS_FMT_GZIP: int32 = 2;
+export const PRESS_FMT_AUTO: int32 = 3;   // decoders only: zlib or gzip, from the first bytes
+
+/// Checks a zlib header. Returns its length (2), PDF_MORE if n < 2, or an
+/// error. A preset dictionary gives PRESS_E_UNSUPPORTED.
+export fn pdf_zlib_header(p: uint8*, n: int64) -> int32 {
+  if (n < 2) { return PDF_MORE; }
+  var cmf: int32 = (int32)p[0];
+  var flg: int32 = (int32)p[1];
+  if ((cmf & 15) != 8 || (cmf >> 4) > 7) { return PRESS_E_DATA; }
+  if ((cmf * 256 + flg) % 31 != 0) { return PRESS_E_DATA; }
+  if ((flg & 32) != 0) { return PRESS_E_UNSUPPORTED; }
+  return 2;
+}
+
+/// Checks a gzip member header. Returns its length, PDF_MORE if the header
+/// is not all there yet, or an error.
+export fn pdf_gzip_header(p: uint8*, n: int64) -> int32 {
+  if (n < 10) { return PDF_MORE; }
+  if (p[0] != 31 || p[1] != 139 || p[2] != 8) { return PRESS_E_DATA; }
+  var flg: int32 = (int32)p[3];
+  if ((flg & 224) != 0) { return PRESS_E_DATA; }
+  var i: int64 = 10;
+  if ((flg & 4) != 0) {
+    if (n < i + 2) { return PDF_MORE; }
+    var xlen: int64 = (int64)press_rd16(p + i);
+    i = i + 2 + xlen;
+    if (n < i) { return PDF_MORE; }
+  }
+  if ((flg & 8) != 0) {
+    while (true) {
+      if (i >= n) { return PDF_MORE; }
+      i = i + 1;
+      if (p[i - 1] == 0) { break; }
+    }
+  }
+  if ((flg & 16) != 0) {
+    while (true) {
+      if (i >= n) { return PDF_MORE; }
+      i = i + 1;
+      if (p[i - 1] == 0) { break; }
+    }
+  }
+  if ((flg & 2) != 0) {
+    if (n < i + 2) { return PDF_MORE; }
+    var want: uint32 = press_crc32(0, p, i) & 65535;
+    if (press_rd16(p + i) != want) { return PRESS_E_CHECK; }
+    i = i + 2;
+  }
+  if (i > 1048576) { return PRESS_E_DATA; }
+  return (int32)i;
+}
+
+@inline fn pdf_be32(p: uint8*) -> uint32 {
+  return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+
+/// Decompresses zlib data, appending to out.
+export fn press_zlib_decompress(src: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (out == 0 || n < 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var h: int32 = pdf_zlib_header(src, n);
+  if (h == PDF_MORE) { return PRESS_E_TRUNC; }
+  if (h < 0) { return h; }
+  var start: int64 = out->len;
+  var used: int64 = 0;
+  var rc: int32 = pdf_inflate_once(src + 2, n - 2, out, &used);
+  if (rc != PRESS_OK) { return rc; }
+  var t: int64 = 2 + used;
+  if (n - t < 4) { out->len = start; return PRESS_E_TRUNC; }
+  if (press_adler32(1, out->data + start, out->len - start) != pdf_be32(src + t)) {
+    out->len = start;
+    return PRESS_E_CHECK;
+  }
+  return PRESS_OK;
+}
+
+/// Decompresses gzip data (all members), appending to out. Zero bytes after
+/// the last member are allowed, as gzip allows them; anything else there is
+/// PRESS_E_DATA.
+export fn press_gzip_decompress(src: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (out == 0 || n < 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var start: int64 = out->len;
+  var pos: int64 = 0;
+  var members: int32 = 0;
+  while (pos < n || members == 0) {
+    if (members > 0 && src[pos] == 0) {
+      var k: int64 = pos;
+      while (k < n && src[k] == 0) { k = k + 1; }
+      if (k == n) { break; }
+    }
+    var h: int32 = pdf_gzip_header(src + pos, n - pos);
+    if (h == PDF_MORE) { out->len = start; return PRESS_E_TRUNC; }
+    if (h < 0) { out->len = start; return h; }
+    pos = pos + (int64)h;
+    var mstart: int64 = out->len;
+    var used: int64 = 0;
+    var rc: int32 = pdf_inflate_once(src + pos, n - pos, out, &used);
+    if (rc != PRESS_OK) { out->len = start; return rc; }
+    pos = pos + used;
+    if (n - pos < 8) { out->len = start; return PRESS_E_TRUNC; }
+    var crc: uint32 = press_crc32(0, out->data + mstart, out->len - mstart);
+    if (crc != press_rd32(src + pos) || (uint32)(out->len - mstart) != press_rd32(src + pos + 4)) {
+      out->len = start;
+      return PRESS_E_CHECK;
+    }
+    pos = pos + 8;
+    members = members + 1;
+  }
+  return PRESS_OK;
+}
+
+/// The zlib header for a level: CMF 0x78 (32 KiB window) and FLG with the
+/// level hint and check bits.
+export fn pdf_zlib_flg(level: int32) -> uint8 {
+  var lv: int32 = 2;
+  if (level <= 1) { lv = 0; } else if (level <= 5) { lv = 1; } else if (level >= 7) { lv = 3; }
+  var flg: int32 = lv << 6;
+  flg = flg + (31 - ((120 * 256 + flg) % 31)) % 31;
+  return (uint8)flg;
+}
+
+/// Writes a 10-byte gzip header with no name and no time stamp.
+export fn pdf_gzip_head(level: int32, out: PressBuf*) -> int32 {
+  var rc: int32 = press_buf_reserve(out, 10);
+  if (rc != PRESS_OK) { return rc; }
+  var o: uint8* = out->data + out->len;
+  memset(o, 0, 10);
+  o[0] = 31;
+  o[1] = 139;
+  o[2] = 8;
+  if (level >= 9) { o[8] = 2; } else if (level == 1) { o[8] = 4; }
+  o[9] = 3;
+  out->len = out->len + 10;
+  return PRESS_OK;
+}
+
+fn pdf_put_be32(out: PressBuf*, v: uint32) -> int32 {
+  var rc: int32 = press_buf_reserve(out, 4);
+  if (rc != PRESS_OK) { return rc; }
+  var o: uint8* = out->data + out->len;
+  o[0] = (uint8)(v >> 24);
+  o[1] = (uint8)(v >> 16);
+  o[2] = (uint8)(v >> 8);
+  o[3] = (uint8)v;
+  out->len = out->len + 4;
+  return PRESS_OK;
+}
+
+/// Compresses to zlib format, appending to out. Levels 0 to 9, -1 for 6.
+export fn press_zlib_compress(src: uint8*, n: int64, level: int32, out: PressBuf*) -> int32 {
+  if (out == 0 || n < 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var lv: int32 = level;
+  if (lv == -1) { lv = 6; }
+  var start: int64 = out->len;
+  var rc: int32 = press_buf_push(out, 120);
+  if (rc == PRESS_OK) { rc = press_buf_push(out, pdf_zlib_flg(lv)); }
+  if (rc == PRESS_OK) { rc = press_deflate_compress(src, n, lv, out); }
+  if (rc == PRESS_OK) { rc = pdf_put_be32(out, press_adler32(1, src, n)); }
+  if (rc != PRESS_OK) { out->len = start; }
+  return rc;
+}
+
+/// Compresses to gzip format (one member), appending to out. Levels 0 to 9,
+/// -1 for 6.
+export fn press_gzip_compress(src: uint8*, n: int64, level: int32, out: PressBuf*) -> int32 {
+  if (out == 0 || n < 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var lv: int32 = level;
+  if (lv == -1) { lv = 6; }
+  var start: int64 = out->len;
+  var rc: int32 = pdf_gzip_head(lv, out);
+  if (rc == PRESS_OK) { rc = press_deflate_compress(src, n, lv, out); }
+  if (rc == PRESS_OK) { rc = press_buf_put32(out, press_crc32(0, src, n)); }
+  if (rc == PRESS_OK) { rc = press_buf_put32(out, (uint32)n); }
+  if (rc != PRESS_OK) { out->len = start; }
+  return rc;
+}

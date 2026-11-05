@@ -1,0 +1,211 @@
+// Streaming Zstandard decoder. Input may arrive split at any byte. The
+// decoder gathers whole units (frame header, block header, block, checksum),
+// decodes each block into its own history buffer and appends the new bytes
+// to the caller's output.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../check/xxhash";
+import "common";
+import "dec";
+
+const ST_MAGIC: int32 = 0;
+const ST_SKIPSIZE: int32 = 1;
+const ST_SKIPPING: int32 = 2;
+const ST_DESC: int32 = 3;
+const ST_HDR: int32 = 4;
+const ST_BHDR: int32 = 5;
+const ST_BLOCK: int32 = 6;
+const ST_CHECK: int32 = 7;
+
+/// Streaming decoder state. Set up with press_zstd_dec_init. The field
+/// window_max (bytes) may be changed after init; it defaults to 128 MiB.
+export struct PressZstdDec {
+  d: PzsDec*;
+  st: int32;
+  err: int32;
+  need: int64;
+  inb: PressBuf;
+  win: PressBuf;
+  hbuf: uint8[24];
+  hdr: PzsFrameHdr;
+  bh: int64;
+  skip: int64;
+  produced: int64;
+  xx: PressXxh64;
+  window_max: int64;
+}
+
+/// Prepares a streaming decoder. Free it with press_zstd_dec_free.
+export fn press_zstd_dec_init(z: PressZstdDec*) -> int32 {
+  if (z == 0) { return PRESS_E_ARG; }
+  memset(z, 0, sizeof(PressZstdDec));
+  z->d = pzs_dec_new();
+  if (z->d == 0) { return PRESS_E_MEM; }
+  z->st = ST_MAGIC;
+  z->need = 4;
+  z->window_max = PZS_WINDOW_DEFAULT;
+  return PRESS_OK;
+}
+
+/// Frees the decoder's memory.
+export fn press_zstd_dec_free(z: PressZstdDec*) {
+  if (z == 0) { return; }
+  pzs_dec_delete(z->d);
+  z->d = (PzsDec*)0;
+  press_buf_free(&z->inb);
+  press_buf_free(&z->win);
+}
+
+// Moves the decoded bytes win[from ..] to out and trims the history.
+fn deliver(z: PressZstdDec*, from: int64, out: PressBuf*) -> int32 {
+  var nb: int64 = z->win.len - from;
+  z->produced = z->produced + nb;
+  if (z->hdr.fcs >= 0 && z->produced > z->hdr.fcs) { return PRESS_E_DATA; }
+  if (z->hdr.checksum) { press_xxh64_update(&z->xx, z->win.data + from, nb); }
+  var rc: int32 = press_buf_append(out, z->win.data + from, nb);
+  if (rc != PRESS_OK) { return rc; }
+  var w: int64 = z->hdr.window;
+  if (z->win.len > w * 2 + 262144) {
+    memmove(z->win.data, z->win.data + z->win.len - w, w);
+    z->win.len = w;
+  }
+  return PRESS_OK;
+}
+
+fn on_header(z: PressZstdDec*) -> int32 {
+  var rc: int32 = pzs_frame_hdr(&z->hbuf[0], z->need + 5, &z->hdr);
+  if (rc != PRESS_OK) { return rc; }
+  if (z->hdr.dict != 0) { return PRESS_E_UNSUPPORTED; }
+  if (z->hdr.window > z->window_max) { return PRESS_E_LIMIT; }
+  pzs_dec_reset(z->d, z->hdr.window);
+  z->win.len = 0;
+  z->produced = 0;
+  press_xxh64_init(&z->xx, 0);
+  z->st = ST_BHDR;
+  z->need = 3;
+  return PRESS_OK;
+}
+
+fn on_block(z: PressZstdDec*, u: uint8*, out: PressBuf*) -> int32 {
+  var bt: int64 = (z->bh >> 1) & 3;
+  var bs: int64 = z->bh >> 3;
+  var from: int64 = z->win.len;
+  var rc: int32 = PRESS_OK;
+  if (bt == 0) { rc = press_buf_append(&z->win, u, bs); }
+  else if (bt == 1) {
+    rc = press_buf_reserve(&z->win, bs);
+    if (rc == PRESS_OK) {
+      memset(z->win.data + z->win.len, (int32)u[0], bs);
+      z->win.len = z->win.len + bs;
+    }
+  } else {
+    rc = pzs_dec_block(z->d, u, bs, &z->win, 0);
+  }
+  if (rc != PRESS_OK) { return rc; }
+  rc = deliver(z, from, out);
+  if (rc != PRESS_OK) { return rc; }
+  if ((z->bh & 1) == 0) { z->st = ST_BHDR; z->need = 3; return PRESS_OK; }
+  if (z->hdr.fcs >= 0 && z->produced != z->hdr.fcs) { return PRESS_E_DATA; }
+  if (z->hdr.checksum) { z->st = ST_CHECK; z->need = 4; return PRESS_OK; }
+  z->st = ST_MAGIC;
+  z->need = 4;
+  return PRESS_OK;
+}
+
+// Handles one complete unit u[0 .. z->need].
+fn step(z: PressZstdDec*, u: uint8*, out: PressBuf*) -> int32 {
+  switch (z->st) {
+    case 0: {
+      var mg: uint32 = press_rd32(u);
+      if ((mg & 0xFFFFFFF0) == PZS_SKIP_MAGIC) { z->st = ST_SKIPSIZE; z->need = 4; return PRESS_OK; }
+      if (mg != PZS_MAGIC) { return PRESS_E_DATA; }
+      memcpy(&z->hbuf[0], u, 4);
+      z->st = ST_DESC;
+      z->need = 1;
+    }
+    case 1: {
+      z->skip = (int64)press_rd32(u);
+      z->st = ST_SKIPPING;
+      z->need = 0;
+    }
+    case 3: {
+      z->hbuf[4] = u[0];
+      z->st = ST_HDR;
+      z->need = pzs_frame_hdr_size(&z->hbuf[0]) - 5;
+    }
+    case 4: {
+      memcpy(&z->hbuf[5], u, z->need);
+      return on_header(z);
+    }
+    case 5: {
+      z->bh = (int64)pzs_rd24(u);
+      var bt: int64 = (z->bh >> 1) & 3;
+      var bs: int64 = z->bh >> 3;
+      if (bt == 3 || bs > z->d->block_max) { return PRESS_E_DATA; }
+      z->st = ST_BLOCK;
+      z->need = bs;
+      if (bt == 1) { z->need = 1; }
+    }
+    case 6: { return on_block(z, u, out); }
+    case 7: {
+      var want: uint32 = press_rd32(u);
+      var got: uint32 = (uint32)press_xxh64_digest(&z->xx);
+      if (want != got) { return PRESS_E_CHECK; }
+      z->st = ST_MAGIC;
+      z->need = 4;
+    }
+    default: { return PRESS_E_STATE; }
+  }
+  return PRESS_OK;
+}
+
+/// Feeds n more input bytes and appends any output to out. Errors stick:
+/// after one, every later call returns it again.
+export fn press_zstd_dec_feed(z: PressZstdDec*, p: uint8*, n: int64, out: PressBuf*) -> int32 {
+  if (z == 0 || z->d == 0) { return PRESS_E_STATE; }
+  if (n < 0 || out == 0 || (p == 0 && n > 0)) { return PRESS_E_ARG; }
+  if (z->err != PRESS_OK) { return z->err; }
+  var at: int64 = 0;
+  while (true) {
+    if (z->st == ST_SKIPPING) {
+      var take: int64 = n - at;
+      if (take > z->skip) { take = z->skip; }
+      at = at + take;
+      z->skip = z->skip - take;
+      if (z->skip > 0) { return PRESS_OK; }
+      z->st = ST_MAGIC;
+      z->need = 4;
+      continue;
+    }
+    var u: uint8* = (uint8*)0;
+    if (z->inb.len == 0 && n - at >= z->need) {
+      u = p + at;
+      at = at + z->need;
+    } else {
+      var t: int64 = z->need - z->inb.len;
+      if (t > n - at) { t = n - at; }
+      var rc0: int32 = press_buf_append(&z->inb, p + at, t);
+      if (rc0 != PRESS_OK) { z->err = rc0; return rc0; }
+      at = at + t;
+      if (z->inb.len < z->need) { return PRESS_OK; }
+      u = z->inb.data;
+    }
+    var rc: int32 = step(z, u, out);
+    z->inb.len = 0;
+    if (rc != PRESS_OK) { z->err = rc; return rc; }
+    if (at == n && z->st != ST_SKIPPING && z->need > 0) { return PRESS_OK; }
+  }
+  return PRESS_OK;
+}
+
+/// Ends the input. Returns PRESS_OK only if it ended exactly at the end of
+/// a frame, PRESS_E_TRUNC if a frame was cut short.
+export fn press_zstd_dec_finish(z: PressZstdDec*) -> int32 {
+  if (z == 0 || z->d == 0) { return PRESS_E_STATE; }
+  if (z->err != PRESS_OK) { return z->err; }
+  if (z->st == ST_SKIPPING && z->skip == 0) { return PRESS_OK; }
+  if (z->st == ST_MAGIC && z->inb.len == 0) { return PRESS_OK; }
+  return PRESS_E_TRUNC;
+}

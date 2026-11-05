@@ -1,0 +1,462 @@
+// Lazy DFA: builds DFA states from the NFA while it searches, and keeps them
+// in a bounded cache. Each byte then costs one table lookup.
+//
+// The design follows RE2's DFA and Rust's hybrid DFA:
+// - a state is an ordered list of NFA states (its "kernel", the states
+//   reached right after a byte) plus a little context about the previous
+//   byte, so assertions like ^, $ and \b can be decided at the next byte;
+// - matches are reported one byte late, so a state carries "a match ended
+//   just before the byte that led here";
+// - leftmost-first order is kept by dropping lower priority threads after a
+//   match, as RE2 does; the reverse DFA (used to find match starts) keeps
+//   them all;
+// - when the cache fills up it is cleared; if that keeps happening without
+//   progress, the search gives up and the caller falls back to the PikeVM;
+// - with Unicode \b, non-ASCII bytes make the DFA give up too (as in Rust).
+
+import "std/mem";
+import "regex/core/vec";
+import "regex/nfa/nfa";
+import "regex/nfa/look";
+import "regex/literal/prefilter";
+
+export const RX_DFA_NONE = -1;     // no match
+export const RX_DFA_GAVE_UP = -2;  // use another engine
+
+const DEAD = 1;
+const QUIT = -1;
+const GIVEUP = -3;
+
+// Context bits about the previous byte.
+const C_START = 1;
+const C_LF = 2;
+const C_CR = 4;
+const C_WORD = 8;
+const F_MATCH = 16;
+const F_START = 32;
+
+struct RxDSet {
+  dense: int32*;
+  sparse: int32*;
+  len: int64;
+}
+
+export struct RxDfa {
+  nfa: RxNfa*;
+  first: bool;
+  ctxmask: int32;
+  quit_high: bool;
+  stride: int64;
+  rep: int32*;            // representative byte for each class
+  kern: RxVec<int32>;
+  s_off: RxVec<int64>;
+  s_len: RxVec<int32>;
+  s_flags: RxVec<int32>;
+  trans: RxVec<int32>;
+  table: int32*;
+  tcap: int64;
+  tcount: int64;
+  starts: int32*;
+  limit: int64;
+  clears: int32;
+  clear_at: int64;
+  at: int64;
+  visited: RxDSet;
+  targets: RxDSet;
+  stack: RxVec<int32>;
+  newk: RxVec<int32>;
+}
+
+fn dset_init(s: RxDSet*, n: int64) {
+  s->dense = (int32*)malloc(4 * n + 4);
+  s->sparse = (int32*)malloc(4 * n + 4);
+  memset(s->sparse, 0, 4 * n + 4);
+  s->len = 0;
+}
+
+fn dset_has(s: RxDSet*, id: int32) -> bool {
+  var i: int32 = s->sparse[id];
+  return i >= 0 && (int64)i < s->len && s->dense[i] == id;
+}
+
+fn dset_add(s: RxDSet*, id: int32) {
+  s->dense[s->len] = id;
+  s->sparse[id] = (int32)s->len;
+  s->len = s->len + 1;
+}
+
+fn reset_cache(d: RxDfa*) {
+  d->kern.len = 0;
+  d->s_off.len = 0;
+  d->s_len.len = 0;
+  d->s_flags.len = 0;
+  d->trans.len = 0;
+  for i in 0..d->tcap { d->table[i] = -1; }
+  d->tcount = 0;
+  for i in 0..64 { d->starts[i] = 0; }
+  // id 0 is unused (0 means "not computed" in rows); id 1 is the dead state.
+  for k in 0..2 {
+    rx_vpush(&d->s_off, (int64)0);
+    rx_vpush(&d->s_len, 0);
+    rx_vpush(&d->s_flags, 0);
+    for j in 0..d->stride { rx_vpush(&d->trans, 0); }
+  }
+  for j in 0..d->stride { d->trans.data[d->stride + j] = DEAD; }
+}
+
+/// Prepares a lazy DFA for nfa. first = leftmost-first (forward search),
+/// otherwise every match is kept (reverse search). limit is the cache size
+/// in bytes.
+export fn rx_dfa_init(d: RxDfa*, nfa: RxNfa*, first: bool, limit: int64) {
+  d->nfa = nfa;
+  d->first = first;
+  d->limit = limit;
+  d->stride = (int64)nfa->nclass + 1;
+  var lk: uint32 = nfa->looks;
+  var m: int32 = 0;
+  if ((lk & (((uint32)1 << 1) | ((uint32)1 << 3) | ((uint32)1 << 5) | ((uint32)1 << 6) | ((uint32)1 << 2) | ((uint32)1 << 4))) != 0) { m = m | C_START; }
+  if ((lk & (((uint32)1 << 3) | ((uint32)1 << 4) | ((uint32)1 << 5) | ((uint32)1 << 6))) != 0) { m = m | C_LF | C_CR; }
+  var words: uint32 = ~(uint32)127;
+  if ((lk & words) != 0) { m = m | C_WORD; }
+  d->ctxmask = m;
+  var uw: uint32 = ((uint32)1 << 9) | ((uint32)1 << 10) | ((uint32)1 << 13) | ((uint32)1 << 14) | ((uint32)1 << 17) | ((uint32)1 << 18);
+  d->quit_high = (lk & uw) != 0;
+  d->rep = (int32*)malloc(4 * d->stride);
+  for i in 0..d->stride { d->rep[i] = -1; }
+  for b in 0..256 {
+    var c: int32 = (int32)nfa->bmap[b];
+    if (d->rep[c] < 0) { d->rep[c] = b; }
+  }
+  d->rep[d->stride - 1] = 256;
+  d->starts = (int32*)malloc(4 * 64);
+  d->tcap = 1024;
+  d->table = (int32*)malloc(4 * d->tcap);
+  var n: int64 = nfa->st.len;
+  dset_init(&d->visited, n);
+  dset_init(&d->targets, n);
+  reset_cache(d);
+  d->clears = 0;
+}
+
+export fn rx_dfa_free(d: RxDfa*) {
+  rx_vfree(&d->kern);
+  rx_vfree(&d->s_off);
+  rx_vfree(&d->s_len);
+  rx_vfree(&d->s_flags);
+  rx_vfree(&d->trans);
+  rx_vfree(&d->stack);
+  rx_vfree(&d->newk);
+  free(d->table);
+  free(d->rep);
+  free(d->starts);
+  free(d->visited.dense);
+  free(d->visited.sparse);
+  free(d->targets.dense);
+  free(d->targets.sparse);
+}
+
+fn mem_used(d: RxDfa*) -> int64 {
+  return d->trans.len * 4 + d->kern.len * 4 + d->s_off.len * 16 + d->tcap * 4;
+}
+
+fn khash(k: int32*, n: int64, flags: int32) -> uint64 {
+  var h: uint64 = 1469598103934665603 ^ (uint64)flags;
+  for i in 0..n { h = (h ^ (uint64)k[i]) * 1099511628211; }
+  return h;
+}
+
+fn same(d: RxDfa*, id: int32, k: int32*, n: int64, flags: int32) -> bool {
+  if (d->s_flags.data[id] != flags || (int64)d->s_len.data[id] != n) { return false; }
+  var off: int64 = d->s_off.data[id];
+  for i in 0..n { if (d->kern.data[off + i] != k[i]) { return false; } }
+  return true;
+}
+
+fn grow_table(d: RxDfa*) {
+  var nc: int64 = d->tcap * 2;
+  var nt: int32* = (int32*)malloc(4 * nc);
+  for i in 0..nc { nt[i] = -1; }
+  var mask: uint64 = (uint64)nc - 1;
+  for id in 2..d->s_off.len {
+    var off: int64 = d->s_off.data[id];
+    var h: uint64 = khash(d->kern.data + off, (int64)d->s_len.data[id], d->s_flags.data[id]);
+    var i: uint64 = h & mask;
+    while (nt[i] >= 0) { i = (i + 1) & mask; }
+    nt[i] = (int32)id;
+  }
+  free(d->table);
+  d->table = nt;
+  d->tcap = nc;
+}
+
+// Finds or adds the state for kernel k with flags. May clear the cache
+// (then every older id is invalid). Returns GIVEUP when clearing does
+// not help.
+fn intern(d: RxDfa*, k: int32*, n: int64, flags: int32) -> int32 {
+  if (n == 0 && (flags & F_MATCH) == 0) { return DEAD; }
+  var h: uint64 = khash(k, n, flags);
+  var mask: uint64 = (uint64)d->tcap - 1;
+  var i: uint64 = h & mask;
+  while (d->table[i] >= 0) {
+    var id: int32 = d->table[i];
+    if (same(d, id, k, n, flags)) { return id; }
+    i = (i + 1) & mask;
+  }
+  if (mem_used(d) + d->stride * 4 + n * 4 > d->limit) {
+    var states: int64 = d->s_off.len;
+    if (d->clears >= 3 && d->at - d->clear_at < 10 * states) { return GIVEUP; }
+    d->clears = d->clears + 1;
+    d->clear_at = d->at;
+    // k points into d->newk, which reset_cache leaves alone.
+    reset_cache(d);
+    mask = (uint64)d->tcap - 1;
+    i = h & mask;
+  }
+  var nid: int32 = (int32)d->s_off.len;
+  rx_vpush(&d->s_off, d->kern.len);
+  rx_vpush(&d->s_len, (int32)n);
+  rx_vpush(&d->s_flags, flags);
+  for j in 0..n { rx_vpush(&d->kern, k[j]); }
+  rx_vreserve(&d->trans, d->trans.len + d->stride);
+  for j in 0..d->stride { d->trans.data[d->trans.len + j] = 0; }
+  d->trans.len = d->trans.len + d->stride;
+  while (d->table[i] >= 0) { i = (i + 1) & mask; }
+  d->table[i] = nid;
+  d->tcount = d->tcount + 1;
+  if (d->tcount * 2 > d->tcap) { grow_table(d); }
+  return nid;
+}
+
+// Which assertions hold between the previous byte (ctx) and byte b
+// (256 = end of input).
+fn looks_now(d: RxDfa*, ctx: int32, b: int32) -> uint32 {
+  var r: uint32 = 0;
+  var start: bool = (ctx & C_START) != 0;
+  var eoi: bool = b == 256;
+  var plf: bool = (ctx & C_LF) != 0;
+  var pcr: bool = (ctx & C_CR) != 0;
+  var lf: int32 = 10;
+  var cr: int32 = 13;
+  if (d->nfa->reverse) {
+    lf = 13;
+    cr = 10;
+    var t: bool = plf;
+    plf = pcr;
+    pcr = t;
+  }
+  if (start) { r = r | ((uint32)1 << 1); }
+  if (eoi) { r = r | ((uint32)1 << 2); }
+  if (start || (ctx & C_LF) != 0) { r = r | ((uint32)1 << 3); }
+  if (eoi || b == 10) { r = r | ((uint32)1 << 4); }
+  if (start || plf || (pcr && b != lf)) { r = r | ((uint32)1 << 5); }
+  if (eoi || b == cr || (b == lf && !pcr)) { r = r | ((uint32)1 << 6); }
+  var before: bool = (ctx & C_WORD) != 0;
+  var after: bool = !eoi && rx_is_word_byte(b);
+  if (before != after) { r = r | ((uint32)1 << 7) | ((uint32)1 << 9); }
+  else { r = r | ((uint32)1 << 8) | ((uint32)1 << 10); }
+  if (!before && after) { r = r | ((uint32)1 << 11) | ((uint32)1 << 13); }
+  if (before && !after) { r = r | ((uint32)1 << 12) | ((uint32)1 << 14); }
+  if (!before) { r = r | ((uint32)1 << 15) | ((uint32)1 << 17); }
+  if (!after) { r = r | ((uint32)1 << 16) | ((uint32)1 << 18); }
+  return r;
+}
+
+fn ctx_of(d: RxDfa*, b: int32) -> int32 {
+  var c: int32 = 0;
+  if (b == 10) { c = c | C_LF; }
+  if (b == 13) { c = c | C_CR; }
+  if (rx_is_word_byte(b)) { c = c | C_WORD; }
+  return c & d->ctxmask;
+}
+
+fn add_target(d: RxDfa*, t: int32) {
+  if (!dset_has(&d->targets, t)) {
+    dset_add(&d->targets, t);
+    rx_vpush(&d->newk, t);
+  }
+}
+
+// Computes the transition of state sid on byte class cls.
+fn compute(d: RxDfa*, sid: int32, cls: int64) -> int32 {
+  var b: int32 = d->rep[cls];
+  if (d->quit_high && b >= 128 && b < 256) { return QUIT; }
+  var flags: int32 = d->s_flags.data[sid];
+  var ctx: int32 = flags & 15;
+  var lk: uint32 = looks_now(d, ctx, b);
+  var st: RxState* = d->nfa->st.data;
+  var tr: RxTrans* = d->nfa->tr.data;
+  d->visited.len = 0;
+  d->targets.len = 0;
+  d->newk.len = 0;
+  var ismatch: bool = false;
+  var off: int64 = d->s_off.data[sid];
+  var n: int64 = (int64)d->s_len.data[sid];
+  var done: bool = false;
+  for ki in 0..n {
+    if (done) { break; }
+    d->stack.len = 0;
+    rx_vpush(&d->stack, d->kern.data[off + ki]);
+    while (d->stack.len > 0 && !done) {
+      d->stack.len = d->stack.len - 1;
+      var id: int32 = d->stack.data[d->stack.len];
+      while (true) {
+        if (dset_has(&d->visited, id)) { break; }
+        dset_add(&d->visited, id);
+        var s: RxState = st[id];
+        var k: int32 = s.kind;
+        if (k == RX_S_RANGE) {
+          if (b >= s.lo && b <= s.hi) { add_target(d, s.next); }
+          break;
+        }
+        if (k == RX_S_SPARSE) {
+          if (b < 256) {
+            for t in 0..s.hi {
+              var x: RxTrans = tr[(int64)s.lo + (int64)t];
+              if (b >= x.lo && b <= x.hi) { add_target(d, x.next); }
+            }
+          }
+          break;
+        }
+        if (k == RX_S_MATCH) {
+          ismatch = true;
+          if (d->first) { done = true; }
+          break;
+        }
+        if (k == RX_S_EMPTY || k == RX_S_CAPTURE) { id = s.next; continue; }
+        if (k == RX_S_SPLIT) {
+          rx_vpush(&d->stack, s.alt);
+          id = s.next;
+          continue;
+        }
+        if (k == RX_S_LOOK) {
+          if ((lk & ((uint32)1 << (uint32)s.lo)) != 0) { id = s.next; continue; }
+          break;
+        }
+        break;
+      }
+    }
+  }
+  var nf: int32 = 0;
+  if (b < 256) { nf = ctx_of(d, b); }
+  if (ismatch) { nf = nf | F_MATCH; }
+  if (d->newk.len == 1 && d->newk.data[0] == d->nfa->ustart) { nf = nf | F_START; }
+  return intern(d, d->newk.data, d->newk.len, nf);
+}
+
+// The transition of sid on byte b (256 = end of input). May clear the
+// cache; the returned id is valid in the current cache.
+fn step(d: RxDfa*, sid: int32, b: int32) -> int32 {
+  var cls: int64 = d->stride - 1;
+  if (b < 256) { cls = (int64)d->nfa->bmap[b]; }
+  var row: int64 = (int64)sid * d->stride;
+  var t: int32 = d->trans.data[row + cls];
+  if (t != 0) { return t; }
+  var gen: int32 = d->clears;
+  t = compute(d, sid, cls);
+  if (t == QUIT || t == GIVEUP) { return t; }
+  if (d->clears == gen) { d->trans.data[row + cls] = t; }
+  return t;
+}
+
+// Written with early returns: Mettle v0.18.0 release builds miscompile
+// "var id = n->ustart; if (anchored) { id = n->start; }" (the load of n
+// is sunk into one branch only). See reports/ in the Mettle tree.
+@noinline fn start_id(n: RxNfa*, anchored: bool) -> int32 {
+  if (anchored) { return n->start; }
+  return n->ustart;
+}
+
+fn start_state(d: RxDfa*, anchored: bool, ctx: int32) -> int32 {
+  var slot: int64 = (int64)ctx;
+  if (anchored) { slot = slot + 32; }
+  var s: int32 = d->starts[slot];
+  if (s != 0) { return s; }
+  var id: int32 = start_id(d->nfa, anchored);
+  d->newk.len = 0;
+  rx_vpush(&d->newk, id);
+  var f: int32 = ctx;
+  if (!anchored) { f = f | F_START; }
+  s = intern(d, d->newk.data, 1, f);
+  if (s > 0) { d->starts[slot] = s; }
+  return s;
+}
+
+// Start context for a search whose previous byte is p (-1 = none).
+fn start_ctx(d: RxDfa*, p: int32) -> int32 {
+  if (p < 0) { return C_START & d->ctxmask; }
+  return ctx_of(d, p);
+}
+
+/// Forward search in h[start..end] (looks see all of h[0..n]). Returns the
+/// end of the leftmost-first match, RX_DFA_NONE, or RX_DFA_GAVE_UP.
+/// earliest returns as soon as any match is known.
+export fn rx_dfa_fwd(d: RxDfa*, h: uint8*, n: int64, start: int64, end: int64, anchored: bool, earliest: bool, pf: RxPrefilter*) -> int64 {
+  d->clears = 0;
+  d->clear_at = start;
+  var prev: int32 = -1;
+  if (start > 0) { prev = (int32)h[start - 1]; }
+  if (d->quit_high && prev >= 128) { return RX_DFA_GAVE_UP; }
+  var s: int32 = start_state(d, anchored, start_ctx(d, prev));
+  if (s < 0) { return RX_DFA_GAVE_UP; }
+  var usepf: bool = pf != 0 && pf->kind != RX_PF_NONE && !anchored;
+  var last: int64 = -1;
+  var at: int64 = start;
+  while (at < end) {
+    if (usepf && (d->s_flags.data[s] & F_START) != 0) {
+      var p: int64 = rx_pf_find(pf, h, at, end);
+      if (p < 0) { return last; }
+      if (p > at) {
+        at = p;
+        var pb: int32 = (int32)h[at - 1];
+        if (d->quit_high && pb >= 128) { return RX_DFA_GAVE_UP; }
+        s = start_state(d, false, ctx_of(d, pb));
+        if (s < 0) { return RX_DFA_GAVE_UP; }
+      }
+    }
+    d->at = at;
+    var nx: int32 = step(d, s, (int32)h[at]);
+    if (nx < 0) { return RX_DFA_GAVE_UP; }
+    if ((d->s_flags.data[nx] & F_MATCH) != 0) {
+      last = at;
+      if (earliest) { return at; }
+    }
+    if (nx == DEAD) { return last; }
+    s = nx;
+    at = at + 1;
+  }
+  var eb: int32 = 256;
+  if (end < n) { eb = (int32)h[end]; }
+  var fin: int32 = step(d, s, eb);
+  if (fin < 0) { return RX_DFA_GAVE_UP; }
+  if ((d->s_flags.data[fin] & F_MATCH) != 0) { last = end; }
+  return last;
+}
+
+/// Reverse search from `end` back to `start`, anchored at `end`. Returns the
+/// smallest start of a match ending at `end`, RX_DFA_NONE or RX_DFA_GAVE_UP.
+export fn rx_dfa_rev(d: RxDfa*, h: uint8*, n: int64, start: int64, end: int64) -> int64 {
+  d->clears = 0;
+  d->clear_at = end;
+  var prev: int32 = -1;
+  if (end < n) { prev = (int32)h[end]; }
+  if (d->quit_high && prev >= 128) { return RX_DFA_GAVE_UP; }
+  var s: int32 = start_state(d, true, start_ctx(d, prev));
+  if (s < 0) { return RX_DFA_GAVE_UP; }
+  var last: int64 = -1;
+  var at: int64 = end;
+  while (at > start) {
+    d->at = end - at;
+    var nx: int32 = step(d, s, (int32)h[at - 1]);
+    if (nx < 0) { return RX_DFA_GAVE_UP; }
+    if ((d->s_flags.data[nx] & F_MATCH) != 0) { last = at; }
+    if (nx == DEAD) { return last; }
+    s = nx;
+    at = at - 1;
+  }
+  var eb: int32 = 256;
+  if (start > 0) { eb = (int32)h[start - 1]; }
+  var fin: int32 = step(d, s, eb);
+  if (fin < 0) { return RX_DFA_GAVE_UP; }
+  if ((d->s_flags.data[fin] & F_MATCH) != 0) { last = start; }
+  return last;
+}

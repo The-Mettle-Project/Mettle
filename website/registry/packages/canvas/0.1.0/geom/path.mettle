@@ -1,0 +1,398 @@
+// CanvasPath: a list of contours made of lines, quadratic and cubic
+// Béziers. Arcs are turned into cubics as they are added.
+//
+//   var p: CanvasPath;                 // zeroed: empty
+//   canvas_move_to(&p, 10.0, 10.0);
+//   canvas_line_to(&p, 90.0, 10.0);
+//   canvas_quad_to(&p, 90.0, 90.0, 10.0, 90.0);
+//   canvas_close(&p);
+//   canvas_path_free(&p);
+//
+// Like the HTML canvas, a line or curve with no current point starts a
+// new contour at its first point, and anything after a close starts a new
+// contour where the closed one began.
+
+import "std/mem";
+import "../core/base";
+import "transform";
+
+export const CANVAS_MOVE: uint8 = 0;
+export const CANVAS_LINE: uint8 = 1;
+export const CANVAS_QUAD: uint8 = 2;
+export const CANVAS_CUBIC: uint8 = 3;
+export const CANVAS_CLOSE: uint8 = 4;
+
+export struct CanvasPath {
+  verbs: uint8*;
+  nverbs: int64;
+  cap_verbs: int64;
+  pts: float32*;      // x0, y0, x1, y1, ...; a move or line adds 1 point, a quad 2, a cubic 3
+  npts: int64;        // points (not floats)
+  cap_pts: int64;
+  sx: float32; sy: float32;   // start of the current contour
+  cx: float32; cy: float32;   // current point
+  has_cur: bool;      // there is a current point
+  after_close: bool;  // the last verb was a close
+  failed: bool;       // an allocation failed; the path is incomplete
+}
+
+/// Frees the path's memory and leaves it empty.
+export fn canvas_path_free(p: CanvasPath*) {
+  if (p == 0) { return; }
+  if (p->verbs != 0) { free(p->verbs); }
+  if (p->pts != 0) { free(p->pts); }
+  memset(p, 0, sizeof(CanvasPath));
+}
+
+/// Empties the path but keeps its memory.
+export fn canvas_path_reset(p: CanvasPath*) {
+  p->nverbs = 0;
+  p->npts = 0;
+  p->has_cur = false;
+  p->after_close = false;
+  p->failed = false;
+}
+
+/// The number of verbs.
+export fn canvas_path_len(p: CanvasPath*) -> int64 { return p->nverbs; }
+
+fn grow(p: CanvasPath*, nv: int64, np: int64) -> bool {
+  if (p->failed) { return false; }
+  if (p->nverbs + nv > p->cap_verbs) {
+    var c: int64 = p->cap_verbs * 2;
+    if (c < 16) { c = 16; }
+    while (c < p->nverbs + nv) { c = c * 2; }
+    var v: uint8* = (uint8*)realloc(p->verbs, c);
+    if (v == 0) { p->failed = true; return false; }
+    p->verbs = v;
+    p->cap_verbs = c;
+  }
+  if (p->npts + np > p->cap_pts) {
+    var c2: int64 = p->cap_pts * 2;
+    if (c2 < 32) { c2 = 32; }
+    while (c2 < p->npts + np) { c2 = c2 * 2; }
+    var q: float32* = (float32*)realloc(p->pts, c2 * 8);
+    if (q == 0) { p->failed = true; return false; }
+    p->pts = q;
+    p->cap_pts = c2;
+  }
+  return true;
+}
+
+fn put(p: CanvasPath*, x: float32, y: float32) {
+  p->pts[p->npts * 2] = x;
+  p->pts[p->npts * 2 + 1] = y;
+  p->npts = p->npts + 1;
+}
+
+/// Starts a new contour at (x, y).
+export fn canvas_move_to(p: CanvasPath*, x: float32, y: float32) {
+  if (p->nverbs > 0 && p->verbs[p->nverbs - 1] == CANVAS_MOVE) {
+    // two moves in a row: the second replaces the first
+    p->pts[(p->npts - 1) * 2] = x;
+    p->pts[(p->npts - 1) * 2 + 1] = y;
+  } else {
+    if (!grow(p, 1, 1)) { return; }
+    p->verbs[p->nverbs] = CANVAS_MOVE;
+    p->nverbs = p->nverbs + 1;
+    put(p, x, y);
+  }
+  p->sx = x; p->sy = y; p->cx = x; p->cy = y;
+  p->has_cur = true;
+  p->after_close = false;
+}
+
+// Makes sure a contour is open before a segment; false when the segment
+// should become a move instead.
+fn need_contour(p: CanvasPath*, x: float32, y: float32) -> bool {
+  if (!p->has_cur) { canvas_move_to(p, x, y); return false; }
+  if (p->after_close) { canvas_move_to(p, p->sx, p->sy); }
+  return true;
+}
+
+export fn canvas_line_to(p: CanvasPath*, x: float32, y: float32) {
+  if (!need_contour(p, x, y)) { return; }
+  if (!grow(p, 1, 1)) { return; }
+  p->verbs[p->nverbs] = CANVAS_LINE;
+  p->nverbs = p->nverbs + 1;
+  put(p, x, y);
+  p->cx = x; p->cy = y;
+}
+
+/// A quadratic Bézier with control point (x1, y1) ending at (x, y).
+export fn canvas_quad_to(p: CanvasPath*, x1: float32, y1: float32, x: float32, y: float32) {
+  if (!need_contour(p, x1, y1)) { }
+  if (!grow(p, 1, 2)) { return; }
+  p->verbs[p->nverbs] = CANVAS_QUAD;
+  p->nverbs = p->nverbs + 1;
+  put(p, x1, y1);
+  put(p, x, y);
+  p->cx = x; p->cy = y;
+}
+
+/// A cubic Bézier with control points (x1, y1), (x2, y2) ending at (x, y).
+export fn canvas_cubic_to(p: CanvasPath*, x1: float32, y1: float32, x2: float32, y2: float32, x: float32, y: float32) {
+  if (!need_contour(p, x1, y1)) { }
+  if (!grow(p, 1, 3)) { return; }
+  p->verbs[p->nverbs] = CANVAS_CUBIC;
+  p->nverbs = p->nverbs + 1;
+  put(p, x1, y1);
+  put(p, x2, y2);
+  put(p, x, y);
+  p->cx = x; p->cy = y;
+}
+
+/// Closes the current contour with a line back to its start.
+export fn canvas_close(p: CanvasPath*) {
+  if (!p->has_cur || p->after_close) { return; }
+  if (p->nverbs == 0) { return; }
+  if (!grow(p, 1, 0)) { return; }
+  p->verbs[p->nverbs] = CANVAS_CLOSE;
+  p->nverbs = p->nverbs + 1;
+  p->cx = p->sx; p->cy = p->sy;
+  p->after_close = true;
+}
+
+// Cubics for an elliptical arc from angle a0 turning by da radians, on the
+// ellipse centered (cx, cy) with radii rx, ry rotated by phi. The current
+// point is taken to be the arc's start. Each piece spans at most 90 degrees,
+// with handles 4/3 tan(t/4) long (the standard circle approximation).
+fn arc_cubics(p: CanvasPath*, cx: float32, cy: float32, rx: float32, ry: float32, phi: float32, a0: float32, da: float32) {
+  var n: int32 = canvas_ceil_i(canvas_absf(da) / (0.5 * CANVAS_PI) - 0.001);
+  if (n < 1) { n = 1; }
+  if (n > 64) { n = 64; }
+  var step: float32 = da / (float32)n;
+  var k: float32 = (4.0 / 3.0) * canvas_tan(step * 0.25);
+  var cp: float32 = canvas_cos(phi);
+  var sp: float32 = canvas_sin(phi);
+  var a: float32 = a0;
+  var ca: float32 = canvas_cos(a);
+  var sa: float32 = canvas_sin(a);
+  for i in 0..n {
+    var b: float32 = a0 + step * (float32)(i + 1);
+    var cb: float32 = canvas_cos(b);
+    var sb: float32 = canvas_sin(b);
+    // unit circle points
+    var x1: float32 = ca - k * sa; var y1: float32 = sa + k * ca;
+    var x2: float32 = cb + k * sb; var y2: float32 = sb - k * cb;
+    var X1: float32 = cx + rx * cp * x1 - ry * sp * y1;
+    var Y1: float32 = cy + rx * sp * x1 + ry * cp * y1;
+    var X2: float32 = cx + rx * cp * x2 - ry * sp * y2;
+    var Y2: float32 = cy + rx * sp * x2 + ry * cp * y2;
+    var X3: float32 = cx + rx * cp * cb - ry * sp * sb;
+    var Y3: float32 = cy + rx * sp * cb + ry * cp * sb;
+    canvas_cubic_to(p, X1, Y1, X2, Y2, X3, Y3);
+    ca = cb; sa = sb;
+  }
+}
+
+/// An SVG elliptical arc (the A command) from the current point to (x, y),
+/// following SVG 1.1 appendix F.6 (endpoint to center conversion).
+export fn canvas_svg_arc_to(p: CanvasPath*, rx_in: float32, ry_in: float32, xrot_deg: float32, large: bool, sweep: bool, x: float32, y: float32) {
+  if (!p->has_cur) { canvas_move_to(p, x, y); return; }
+  if (p->after_close) { canvas_move_to(p, p->sx, p->sy); }
+  var x1: float32 = p->cx;
+  var y1: float32 = p->cy;
+  if (x1 == x && y1 == y) { return; }
+  var rx: float32 = canvas_absf(rx_in);
+  var ry: float32 = canvas_absf(ry_in);
+  if (rx == 0.0 || ry == 0.0 || !canvas_finite(rx) || !canvas_finite(ry)) { canvas_line_to(p, x, y); return; }
+  var phi: float32 = xrot_deg * (CANVAS_PI / 180.0);
+  var cp: float32 = canvas_cos(phi);
+  var sp: float32 = canvas_sin(phi);
+  var hx: float32 = (x1 - x) * 0.5;
+  var hy: float32 = (y1 - y) * 0.5;
+  var x1p: float32 = cp * hx + sp * hy;
+  var y1p: float32 = -sp * hx + cp * hy;
+  var lam: float32 = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+  if (lam > 1.0) {
+    var s: float32 = canvas_sqrt(lam);
+    rx = rx * s;
+    ry = ry * s;
+  }
+  var rx2: float64 = (float64)rx * (float64)rx;
+  var ry2: float64 = (float64)ry * (float64)ry;
+  var num: float64 = rx2 * ry2 - rx2 * (float64)y1p * (float64)y1p - ry2 * (float64)x1p * (float64)x1p;
+  var den: float64 = rx2 * (float64)y1p * (float64)y1p + ry2 * (float64)x1p * (float64)x1p;
+  var coef: float32 = 0.0;
+  if (den > 0.0 && num > 0.0) { coef = canvas_sqrt((float32)(num / den)); }
+  if (large == sweep) { coef = -coef; }
+  var cxp: float32 = coef * rx * y1p / ry;
+  var cyp: float32 = -coef * ry * x1p / rx;
+  var cx: float32 = cp * cxp - sp * cyp + (x1 + x) * 0.5;
+  var cy: float32 = sp * cxp + cp * cyp + (y1 + y) * 0.5;
+  var ux: float32 = (x1p - cxp) / rx;
+  var uy: float32 = (y1p - cyp) / ry;
+  var vx: float32 = (-x1p - cxp) / rx;
+  var vy: float32 = (-y1p - cyp) / ry;
+  var a0: float32 = canvas_atan2(uy, ux);
+  var da: float32 = canvas_atan2(ux * vy - uy * vx, ux * vx + uy * vy);
+  if (!sweep && da > 0.0) { da = da - CANVAS_TAU; }
+  if (sweep && da < 0.0) { da = da + CANVAS_TAU; }
+  var last: int64 = p->npts;
+  arc_cubics(p, cx, cy, rx, ry, phi, a0, da);
+  // land exactly on the end point
+  if (p->npts > last) {
+    p->pts[(p->npts - 1) * 2] = x;
+    p->pts[(p->npts - 1) * 2 + 1] = y;
+    p->cx = x; p->cy = y;
+  }
+}
+
+/// An elliptical arc like the HTML canvas ellipse(): center (cx, cy), radii
+/// rx, ry, rotated by rot radians, from angle a0 to a1 (radians), turning
+/// counterclockwise on screen when ccw is true. A line joins the current
+/// point to the arc's start.
+export fn canvas_ellipse_arc(p: CanvasPath*, cx: float32, cy: float32, rx: float32, ry: float32, rot: float32, a0: float32, a1: float32, ccw: bool) {
+  if (rx < 0.0 || ry < 0.0) { return; }
+  if (!canvas_finite(a0) || !canvas_finite(a1) || !canvas_finite(rx) || !canvas_finite(ry)) { return; }
+  var da: float32 = a1 - a0;
+  // as the HTML canvas spec says: a full turn or more draws the whole
+  // ellipse, anything else is taken modulo one turn in the given direction
+  if (!ccw) {
+    if (da >= CANVAS_TAU) { da = CANVAS_TAU; }
+    else { da = da - CANVAS_TAU * canvas_floorf(da / CANVAS_TAU); }
+  } else {
+    if (-da >= CANVAS_TAU) { da = -CANVAS_TAU; }
+    else { da = da - CANVAS_TAU * canvas_ceilf(da / CANVAS_TAU); }
+  }
+  if (!canvas_finite(da)) { return; }
+  var cr: float32 = canvas_cos(rot);
+  var sr: float32 = canvas_sin(rot);
+  var ex: float32 = rx * canvas_cos(a0);
+  var ey: float32 = ry * canvas_sin(a0);
+  var sx: float32 = cx + cr * ex - sr * ey;
+  var sy: float32 = cy + sr * ex + cr * ey;
+  if (!p->has_cur) { canvas_move_to(p, sx, sy); }
+  else { canvas_line_to(p, sx, sy); }
+  if (da == 0.0) { return; }
+  arc_cubics(p, cx, cy, rx, ry, rot, a0, da);
+}
+
+/// A circular arc like the HTML canvas arc().
+export fn canvas_arc(p: CanvasPath*, cx: float32, cy: float32, r: float32, a0: float32, a1: float32, ccw: bool) {
+  canvas_ellipse_arc(p, cx, cy, r, r, 0.0, a0, a1, ccw);
+}
+
+/// The HTML canvas arcTo(): a line toward (x1, y1) rounded with radius r
+/// into the direction of (x2, y2).
+export fn canvas_arc_to(p: CanvasPath*, x1: float32, y1: float32, x2: float32, y2: float32, r: float32) {
+  if (r < 0.0) { return; }
+  if (!p->has_cur) { canvas_move_to(p, x1, y1); return; }
+  if (p->after_close) { canvas_move_to(p, p->sx, p->sy); }
+  var x0: float32 = p->cx;
+  var y0: float32 = p->cy;
+  var ax: float32 = x0 - x1; var ay: float32 = y0 - y1;
+  var bx: float32 = x2 - x1; var by: float32 = y2 - y1;
+  var la: float32 = canvas_sqrt(ax * ax + ay * ay);
+  var lb: float32 = canvas_sqrt(bx * bx + by * by);
+  var cross: float32 = ax * by - ay * bx;
+  if (r == 0.0 || la == 0.0 || lb == 0.0 || canvas_absf(cross) <= 1.0e-6 * la * lb) {
+    canvas_line_to(p, x1, y1);
+    return;
+  }
+  ax = ax / la; ay = ay / la; bx = bx / lb; by = by / lb;
+  var cth: float32 = ax * bx + ay * by;
+  var th: float32 = canvas_acos(cth);          // angle between the legs
+  var d: float32 = r / canvas_tan(th * 0.5);   // tangent points from the corner
+  var t1x: float32 = x1 + ax * d; var t1y: float32 = y1 + ay * d;
+  var t2x: float32 = x1 + bx * d; var t2y: float32 = y1 + by * d;
+  var mx: float32 = ax + bx; var my: float32 = ay + by;
+  var ml: float32 = canvas_sqrt(mx * mx + my * my);
+  var h: float32 = r / canvas_sin(th * 0.5);
+  var ccx: float32 = x1 + mx / ml * h;
+  var ccy: float32 = y1 + my / ml * h;
+  canvas_line_to(p, t1x, t1y);
+  var a0: float32 = canvas_atan2(t1y - ccy, t1x - ccx);
+  var a1: float32 = canvas_atan2(t2y - ccy, t2x - ccx);
+  var da: float32 = a1 - a0;
+  while (da > CANVAS_PI) { da = da - CANVAS_TAU; }
+  while (da < -CANVAS_PI) { da = da + CANVAS_TAU; }
+  arc_cubics(p, ccx, ccy, r, r, 0.0, a0, da);
+}
+
+/// A closed rectangle, drawn clockwise on screen.
+export fn canvas_rect(p: CanvasPath*, x: float32, y: float32, w: float32, h: float32) {
+  canvas_move_to(p, x, y);
+  canvas_line_to(p, x + w, y);
+  canvas_line_to(p, x + w, y + h);
+  canvas_line_to(p, x, y + h);
+  canvas_close(p);
+}
+
+/// A closed ellipse (four cubics), clockwise on screen.
+export fn canvas_oval(p: CanvasPath*, cx: float32, cy: float32, rx: float32, ry: float32) {
+  var k: float32 = 0.552284749831;
+  var kx: float32 = rx * k;
+  var ky: float32 = ry * k;
+  canvas_move_to(p, cx + rx, cy);
+  canvas_cubic_to(p, cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry);
+  canvas_cubic_to(p, cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy);
+  canvas_cubic_to(p, cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry);
+  canvas_cubic_to(p, cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
+  canvas_close(p);
+}
+
+export fn canvas_circle(p: CanvasPath*, cx: float32, cy: float32, r: float32) {
+  canvas_oval(p, cx, cy, r, r);
+}
+
+/// A closed rectangle with elliptical corners of radii rx, ry, clamped to
+/// half the size as SVG's rect does.
+export fn canvas_round_rect(p: CanvasPath*, x: float32, y: float32, w: float32, h: float32, rx_in: float32, ry_in: float32) {
+  var rx: float32 = canvas_absf(rx_in);
+  var ry: float32 = canvas_absf(ry_in);
+  if (rx > canvas_absf(w) * 0.5) { rx = canvas_absf(w) * 0.5; }
+  if (ry > canvas_absf(h) * 0.5) { ry = canvas_absf(h) * 0.5; }
+  if (rx == 0.0 || ry == 0.0) { canvas_rect(p, x, y, w, h); return; }
+  var k: float32 = 1.0 - 0.552284749831;
+  var x1: float32 = x + w;
+  var y1: float32 = y + h;
+  canvas_move_to(p, x + rx, y);
+  canvas_line_to(p, x1 - rx, y);
+  canvas_cubic_to(p, x1 - rx * k, y, x1, y + ry * k, x1, y + ry);
+  canvas_line_to(p, x1, y1 - ry);
+  canvas_cubic_to(p, x1, y1 - ry * k, x1 - rx * k, y1, x1 - rx, y1);
+  canvas_line_to(p, x + rx, y1);
+  canvas_cubic_to(p, x + rx * k, y1, x, y1 - ry * k, x, y1 - ry);
+  canvas_line_to(p, x, y + ry);
+  canvas_cubic_to(p, x, y + ry * k, x + rx * k, y, x + rx, y);
+  canvas_close(p);
+}
+
+/// Bounds of every point, control points included. False for an empty path.
+export fn canvas_path_bounds(p: CanvasPath*, out: CanvasRect*) -> bool {
+  *out = canvas_rect_empty();
+  if (p->npts == 0) { return false; }
+  for i in 0..p->npts { canvas_rect_add(out, p->pts[i * 2], p->pts[i * 2 + 1]); }
+  return true;
+}
+
+/// Maps every point by m.
+export fn canvas_path_transform(p: CanvasPath*, m: CanvasTransform) {
+  for i in 0..p->npts {
+    var q: CanvasPoint = canvas_t_point(m, p->pts[i * 2], p->pts[i * 2 + 1]);
+    p->pts[i * 2] = q.x;
+    p->pts[i * 2 + 1] = q.y;
+  }
+  var s: CanvasPoint = canvas_t_point(m, p->sx, p->sy);
+  var c: CanvasPoint = canvas_t_point(m, p->cx, p->cy);
+  p->sx = s.x; p->sy = s.y; p->cx = c.x; p->cy = c.y;
+}
+
+/// Appends every contour of src to dst.
+export fn canvas_path_append(dst: CanvasPath*, src: CanvasPath*) {
+  var k: int64 = 0;
+  for i in 0..src->nverbs {
+    var v: uint8 = src->verbs[i];
+    if (v == CANVAS_MOVE) { canvas_move_to(dst, src->pts[k * 2], src->pts[k * 2 + 1]); k = k + 1; }
+    else if (v == CANVAS_LINE) { canvas_line_to(dst, src->pts[k * 2], src->pts[k * 2 + 1]); k = k + 1; }
+    else if (v == CANVAS_QUAD) {
+      canvas_quad_to(dst, src->pts[k * 2], src->pts[k * 2 + 1], src->pts[k * 2 + 2], src->pts[k * 2 + 3]);
+      k = k + 2;
+    } else if (v == CANVAS_CUBIC) {
+      canvas_cubic_to(dst, src->pts[k * 2], src->pts[k * 2 + 1], src->pts[k * 2 + 2], src->pts[k * 2 + 3], src->pts[k * 2 + 4], src->pts[k * 2 + 5]);
+      k = k + 3;
+    } else { canvas_close(dst); }
+  }
+}

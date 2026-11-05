@@ -1,0 +1,173 @@
+// Flattening: paths to polylines. Curves are split into lines so the
+// polyline stays within a tolerance of the curve. The number of lines
+// for a curve comes from Wang's formula (as in Skia's GrWangsFormula):
+// n = sqrt(d(d-1)/8 * M / tol), with M the largest second difference of
+// the control points and d the degree.
+
+import "std/mem";
+import "../core/base";
+import "transform";
+import "path";
+
+export struct CanvasContour { start: int64; count: int64; closed: bool; }
+
+// A set of polylines. flags[i] is 1 when point i lies inside a curve
+// (a smooth point the stroker may join with a round join).
+export struct CanvasPoly {
+  xy: float32*;
+  flags: uint8*;
+  n: int64;
+  cap: int64;
+  conts: CanvasContour*;
+  nconts: int64;
+  cap_conts: int64;
+  failed: bool;
+}
+
+export fn canvas_poly_free(q: CanvasPoly*) {
+  if (q->xy != 0) { free(q->xy); }
+  if (q->flags != 0) { free(q->flags); }
+  if (q->conts != 0) { free(q->conts); }
+  memset(q, 0, sizeof(CanvasPoly));
+}
+
+export fn canvas_poly_reset(q: CanvasPoly*) {
+  q->n = 0;
+  q->nconts = 0;
+  q->failed = false;
+}
+
+/// Starts a new contour.
+export fn canvas_poly_begin(q: CanvasPoly*) {
+  if (q->failed) { return; }
+  if (q->nconts >= q->cap_conts) {
+    var c: int64 = q->cap_conts * 2;
+    if (c < 8) { c = 8; }
+    var p: CanvasContour* = (CanvasContour*)realloc(q->conts, c * sizeof(CanvasContour));
+    if (p == 0) { q->failed = true; return; }
+    q->conts = p;
+    q->cap_conts = c;
+  }
+  var ct: CanvasContour* = q->conts + q->nconts;
+  ct->start = q->n;
+  ct->count = 0;
+  ct->closed = false;
+  q->nconts = q->nconts + 1;
+}
+
+/// Adds a point to the current contour.
+export fn canvas_poly_add(q: CanvasPoly*, x: float32, y: float32, flag: uint8) {
+  if (q->failed || q->nconts == 0) { return; }
+  if (q->n >= q->cap) {
+    var c: int64 = q->cap * 2;
+    if (c < 64) { c = 64; }
+    var p: float32* = (float32*)realloc(q->xy, c * 8);
+    if (p == 0) { q->failed = true; return; }
+    q->xy = p;
+    var f: uint8* = (uint8*)realloc(q->flags, c);
+    if (f == 0) { q->failed = true; return; }
+    q->flags = f;
+    q->cap = c;
+  }
+  q->xy[q->n * 2] = x;
+  q->xy[q->n * 2 + 1] = y;
+  q->flags[q->n] = flag;
+  q->n = q->n + 1;
+  q->conts[q->nconts - 1].count = q->conts[q->nconts - 1].count + 1;
+}
+
+/// Marks the current contour closed.
+export fn canvas_poly_close(q: CanvasPoly*) {
+  if (q->failed || q->nconts == 0) { return; }
+  q->conts[q->nconts - 1].closed = true;
+}
+
+fn seg_count(m: float32, deg: float32, tol: float32) -> int32 {
+  var v: float32 = deg * (deg - 1.0) / 8.0 * m / tol;
+  if (!(v > 1.0)) { return 1; }
+  var n: float32 = canvas_ceilf(canvas_sqrt(v));
+  if (!(n < 500.0)) { return 500; }
+  return (int32)n;
+}
+
+@inline fn len2(x: float32, y: float32) -> float32 { return canvas_sqrt(x * x + y * y); }
+
+/// Flattens path p, mapped by m, into q (cleared first). tol is the most a
+/// line may stray from its curve, in output units. Returns false when a
+/// point is not a finite number or memory ran out.
+export fn canvas_flatten(p: CanvasPath*, m: CanvasTransform, tol_in: float32, q: CanvasPoly*) -> bool {
+  canvas_poly_reset(q);
+  var tol: float32 = tol_in;
+  if (!(tol > 0.001)) { tol = 0.001; }
+  var k: int64 = 0;
+  var lx: float32 = 0.0;
+  var ly: float32 = 0.0;
+  var open: bool = false;
+  for i in 0..p->nverbs {
+    var v: uint8 = p->verbs[i];
+    if (v == CANVAS_MOVE) {
+      var a: CanvasPoint = canvas_t_point(m, p->pts[k * 2], p->pts[k * 2 + 1]);
+      k = k + 1;
+      canvas_poly_begin(q);
+      canvas_poly_add(q, a.x, a.y, 0);
+      lx = a.x; ly = a.y;
+      open = true;
+      if (!canvas_finite(a.x) || !canvas_finite(a.y)) { return false; }
+    } else if (v == CANVAS_LINE) {
+      var b: CanvasPoint = canvas_t_point(m, p->pts[k * 2], p->pts[k * 2 + 1]);
+      k = k + 1;
+      if (!canvas_finite(b.x) || !canvas_finite(b.y)) { return false; }
+      canvas_poly_add(q, b.x, b.y, 0);
+      lx = b.x; ly = b.y;
+    } else if (v == CANVAS_QUAD) {
+      var c1: CanvasPoint = canvas_t_point(m, p->pts[k * 2], p->pts[k * 2 + 1]);
+      var c2: CanvasPoint = canvas_t_point(m, p->pts[k * 2 + 2], p->pts[k * 2 + 3]);
+      k = k + 2;
+      if (!canvas_finite(c1.x) || !canvas_finite(c1.y) || !canvas_finite(c2.x) || !canvas_finite(c2.y)) { return false; }
+      var dd: float32 = len2(lx - 2.0 * c1.x + c2.x, ly - 2.0 * c1.y + c2.y);
+      var n: int32 = seg_count(dd, 2.0, tol);
+      var inv: float32 = 1.0 / (float32)n;
+      for j in 1..n {
+        var t: float32 = (float32)j * inv;
+        var mt: float32 = 1.0 - t;
+        var x: float32 = mt * mt * lx + 2.0 * mt * t * c1.x + t * t * c2.x;
+        var y: float32 = mt * mt * ly + 2.0 * mt * t * c1.y + t * t * c2.y;
+        canvas_poly_add(q, x, y, 1);
+      }
+      canvas_poly_add(q, c2.x, c2.y, 0);
+      lx = c2.x; ly = c2.y;
+    } else if (v == CANVAS_CUBIC) {
+      var d1: CanvasPoint = canvas_t_point(m, p->pts[k * 2], p->pts[k * 2 + 1]);
+      var d2: CanvasPoint = canvas_t_point(m, p->pts[k * 2 + 2], p->pts[k * 2 + 3]);
+      var d3: CanvasPoint = canvas_t_point(m, p->pts[k * 2 + 4], p->pts[k * 2 + 5]);
+      k = k + 3;
+      if (!canvas_finite(d1.x) || !canvas_finite(d1.y) || !canvas_finite(d2.x) || !canvas_finite(d2.y) || !canvas_finite(d3.x) || !canvas_finite(d3.y)) { return false; }
+      var e1: float32 = len2(lx - 2.0 * d1.x + d2.x, ly - 2.0 * d1.y + d2.y);
+      var e2: float32 = len2(d1.x - 2.0 * d2.x + d3.x, d1.y - 2.0 * d2.y + d3.y);
+      var n2: int32 = seg_count(canvas_maxf(e1, e2), 3.0, tol);
+      var inv2: float32 = 1.0 / (float32)n2;
+      for j in 1..n2 {
+        var t: float32 = (float32)j * inv2;
+        var mt: float32 = 1.0 - t;
+        var w0: float32 = mt * mt * mt;
+        var w1: float32 = 3.0 * mt * mt * t;
+        var w2: float32 = 3.0 * mt * t * t;
+        var w3: float32 = t * t * t;
+        var x: float32 = w0 * lx + w1 * d1.x + w2 * d2.x + w3 * d3.x;
+        var y: float32 = w0 * ly + w1 * d1.y + w2 * d2.y + w3 * d3.y;
+        canvas_poly_add(q, x, y, 1);
+      }
+      canvas_poly_add(q, d3.x, d3.y, 0);
+      lx = d3.x; ly = d3.y;
+    } else {
+      canvas_poly_close(q);
+      if (q->nconts > 0) {
+        var ct: CanvasContour* = q->conts + (q->nconts - 1);
+        lx = q->xy[ct->start * 2];
+        ly = q->xy[ct->start * 2 + 1];
+      }
+    }
+  }
+  if (open) { }
+  return !q->failed && !p->failed;
+}

@@ -1,0 +1,728 @@
+// Numbers in CSV fields.
+//
+// Integers: exact, with overflow checks.
+// Floats, text to binary: correctly rounded (round half to even) for every
+// input. Short inputs take Clinger's exact fast path; the rest use exact big
+// integer arithmetic, as in David Gay's and Rust's correct parsers.
+// Floats, binary to text: the shortest digits that read back to the same
+// value, by the Burger and Dybvig free-format algorithm with exact big
+// integers. Layout follows Python's repr: 1.0, 0.0001, 1e-05, 1.5e+300.
+
+const LIMBS = 140;
+const M32: uint64 = 4294967295;
+const MAX_DIGITS = 768;
+
+// A big unsigned integer: little-endian 32-bit limbs.
+struct Big {
+  n: int32;
+  d: uint32[140];
+}
+
+fn big_set(b: Big*, v: uint64) {
+  b->n = 0;
+  while (v != 0) {
+    b->d[b->n] = (uint32)(v & M32);
+    b->n = b->n + 1;
+    v = v >> 32;
+  }
+}
+
+fn big_copy(dst: Big*, src: Big*) {
+  dst->n = src->n;
+  for i in 0..src->n { dst->d[i] = src->d[i]; }
+}
+
+fn big_mul_small(b: Big*, m: uint32) {
+  var carry: uint64 = 0;
+  for i in 0..b->n {
+    var t: uint64 = (uint64)b->d[i] * (uint64)m + carry;
+    b->d[i] = (uint32)(t & M32);
+    carry = t >> 32;
+  }
+  if (carry != 0 && b->n < LIMBS) {
+    b->d[b->n] = (uint32)carry;
+    b->n = b->n + 1;
+  }
+}
+
+fn big_add_small(b: Big*, a: uint32) {
+  var carry: uint64 = (uint64)a;
+  var i: int32 = 0;
+  while (carry != 0 && i < b->n) {
+    var t: uint64 = (uint64)b->d[i] + carry;
+    b->d[i] = (uint32)(t & M32);
+    carry = t >> 32;
+    i = i + 1;
+  }
+  if (carry != 0 && b->n < LIMBS) {
+    b->d[b->n] = (uint32)carry;
+    b->n = b->n + 1;
+  }
+}
+
+fn big_mul_pow10(b: Big*, e: int32) {
+  while (e >= 9) {
+    big_mul_small(b, (uint32)1000000000);
+    e = e - 9;
+  }
+  var p: uint32 = 1;
+  while (e > 0) {
+    p = p * (uint32)10;
+    e = e - 1;
+  }
+  if (p != (uint32)1) { big_mul_small(b, p); }
+}
+
+fn big_shl(b: Big*, bits: int32) {
+  if (b->n == 0 || bits <= 0) { return; }
+  var limbs: int32 = bits / 32;
+  var sh: int32 = bits % 32;
+  var n: int32 = b->n;
+  var top: int32 = n + limbs;
+  if (top >= LIMBS) { top = LIMBS - 1; }
+  b->d[top] = (uint32)0;
+  var i: int32 = n - 1;
+  while (i >= 0) {
+    var v: uint64 = (uint64)b->d[i];
+    var at: int32 = i + limbs;
+    if (at + 1 < LIMBS && sh != 0) {
+      b->d[at + 1] = b->d[at + 1] | (uint32)((v >> (uint64)(32 - sh)) & M32);
+    }
+    if (at < LIMBS) {
+      b->d[at] = (uint32)((v << (uint64)sh) & M32);
+    }
+    i = i - 1;
+  }
+  for j in 0..limbs {
+    if (j < LIMBS) { b->d[j] = (uint32)0; }
+  }
+  b->n = top + 1;
+  while (b->n > 0 && b->d[b->n - 1] == (uint32)0) { b->n = b->n - 1; }
+}
+
+fn big_shr1(b: Big*) {
+  var i: int32 = 0;
+  while (i < b->n) {
+    var v: uint32 = b->d[i] >> (uint32)1;
+    if (i + 1 < b->n) { v = v | (b->d[i + 1] << (uint32)31); }
+    b->d[i] = v;
+    i = i + 1;
+  }
+  while (b->n > 0 && b->d[b->n - 1] == (uint32)0) { b->n = b->n - 1; }
+}
+
+fn big_cmp(a: Big*, b: Big*) -> int32 {
+  if (a->n != b->n) {
+    if (a->n < b->n) { return -1; }
+    return 1;
+  }
+  var i: int32 = a->n - 1;
+  while (i >= 0) {
+    if (a->d[i] != b->d[i]) {
+      if (a->d[i] < b->d[i]) { return -1; }
+      return 1;
+    }
+    i = i - 1;
+  }
+  return 0;
+}
+
+// a = a - b. Needs a >= b.
+fn big_sub(a: Big*, b: Big*) {
+  var borrow: int64 = 0;
+  for i in 0..a->n {
+    var bv: int64 = 0;
+    if (i < b->n) { bv = (int64)b->d[i]; }
+    var t: int64 = (int64)a->d[i] - bv - borrow;
+    if (t < 0) {
+      t = t + (int64)4294967296;
+      borrow = 1;
+    } else {
+      borrow = 0;
+    }
+    a->d[i] = (uint32)t;
+  }
+  while (a->n > 0 && a->d[a->n - 1] == (uint32)0) { a->n = a->n - 1; }
+}
+
+// out = a + b.
+fn big_add(out: Big*, a: Big*, b: Big*) {
+  var n: int32 = a->n;
+  if (b->n > n) { n = b->n; }
+  var carry: uint64 = 0;
+  for i in 0..n {
+    var t: uint64 = carry;
+    if (i < a->n) { t = t + (uint64)a->d[i]; }
+    if (i < b->n) { t = t + (uint64)b->d[i]; }
+    out->d[i] = (uint32)(t & M32);
+    carry = t >> 32;
+  }
+  out->n = n;
+  if (carry != 0 && n < LIMBS) {
+    out->d[n] = (uint32)carry;
+    out->n = n + 1;
+  }
+}
+
+fn big_bitlen(b: Big*) -> int32 {
+  if (b->n == 0) { return 0; }
+  var top: uint32 = b->d[b->n - 1];
+  var bits: int32 = 0;
+  while (top != (uint32)0) {
+    bits = bits + 1;
+    top = top >> (uint32)1;
+  }
+  return (b->n - 1) * 32 + bits;
+}
+
+fn big_bit(b: Big*, i: int32) -> uint64 {
+  if (i < 0) { return 0; }
+  var limb: int32 = i / 32;
+  if (limb >= b->n) { return 0; }
+  return ((uint64)b->d[limb] >> (uint64)(i % 32)) & (uint64)1;
+}
+
+// True when any bit below position `below` is set.
+fn big_low_nonzero(b: Big*, below: int32) -> bool {
+  if (below <= 0) { return false; }
+  var full: int32 = below / 32;
+  var i: int32 = 0;
+  while (i < full && i < b->n) {
+    if (b->d[i] != (uint32)0) { return true; }
+    i = i + 1;
+  }
+  var rest: int32 = below % 32;
+  if (rest != 0 && full < b->n) {
+    var mask: uint32 = ((uint32)1 << (uint32)rest) - (uint32)1;
+    if ((b->d[full] & mask) != (uint32)0) { return true; }
+  }
+  return false;
+}
+
+// Rounds m * 2^e2 (plus a bit more when sticky) to the nearest binary float
+// with `mbits` stored mantissa bits and exponent bias `bias`. Returns the
+// bit pattern without the sign.
+fn round_float(m: uint64, e2: int32, sticky: bool, mbits: int32, bias: int32) -> uint64 {
+  if (m == 0) { return 0; }
+  while ((m >> 63) == 0) {
+    m = m << 1;
+    e2 = e2 - 1;
+  }
+  var maxexp: int32 = bias * 2 + 1;
+  var top: int32 = e2 + 63;               // exponent of the leading bit
+  var shift: int32 = 63 - mbits;          // bits dropped for a normal result
+  var biased: int32 = top + bias;
+  if (biased <= 0) {
+    shift = shift + 1 - biased;           // subnormal: drop more
+    biased = 0;
+  }
+  if (shift > 64) { return 0; }
+  var mant: uint64 = 0;
+  var rest: uint64 = 0;
+  var half: uint64 = 0;
+  if (shift == 64) {
+    rest = m;
+    half = (uint64)1 << 63;
+  } else {
+    mant = m >> (uint64)shift;
+    rest = m & (((uint64)1 << (uint64)shift) - 1);
+    half = (uint64)1 << (uint64)(shift - 1);
+  }
+  var up: bool = false;
+  if (rest > half) { up = true; }
+  if (rest == half && (sticky || (mant & 1) == 1)) { up = true; }
+  if (up) { mant = mant + 1; }
+  var hidden: uint64 = (uint64)1 << (uint64)mbits;
+  if (biased == 0) {
+    // Subnormal; rounding up may reach the smallest normal, which the
+    // hidden bit then encodes correctly.
+    if (mant >= hidden) { return ((uint64)1 << (uint64)mbits) | (mant - hidden); }
+    return mant;
+  }
+  if (mant >= hidden * 2) {
+    mant = mant >> 1;
+    biased = biased + 1;
+  }
+  if (biased >= maxexp) { return (uint64)maxexp << (uint64)mbits; }
+  return ((uint64)biased << (uint64)mbits) | (mant - hidden);
+}
+
+fn lower(c: uint8) -> uint8 {
+  if (c >= (uint8)'A' && c <= (uint8)'Z') { return c + (uint8)32; }
+  return c;
+}
+
+fn word_is(s: string, at: int64, w: string) -> bool {
+  if ((int64)s.length - at != (int64)w.length) { return false; }
+  for i in 0..(int64)w.length {
+    if (lower(s.chars[at + i]) != (uint8)w[i]) { return false; }
+  }
+  return true;
+}
+
+const POW10: float64[23] = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0,
+  100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0, 10000000000000.0,
+  100000000000000.0, 1000000000000000.0, 10000000000000000.0, 100000000000000000.0,
+  1000000000000000000.0, 10000000000000000000.0, 100000000000000000000.0,
+  1000000000000000000000.0, 10000000000000000000000.0];
+
+// Parses a decimal float into a bit pattern for the given format.
+// Returns false for text that is not a number.
+fn parse_float_bits(s: string, mbits: int32, bias: int32, out: uint64*) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var neg: bool = false;
+  if (i < n && (s.chars[i] == (uint8)'+' || s.chars[i] == (uint8)'-')) {
+    neg = s.chars[i] == (uint8)'-';
+    i = i + 1;
+  }
+  // The sign bit sits just above the exponent: bit 63 or bit 31.
+  var sign: uint64 = 0;
+  if (neg && bias == 1023) { sign = (uint64)1 << 63; }
+  if (neg && bias == 127) { sign = (uint64)1 << 31; }
+  var inf_bits: uint64 = (uint64)(bias * 2 + 1) << (uint64)mbits;
+  if (word_is(s, i, "inf") || word_is(s, i, "infinity")) {
+    *out = sign | inf_bits;
+    return true;
+  }
+  if (word_is(s, i, "nan")) {
+    *out = inf_bits | ((uint64)1 << (uint64)(mbits - 1));
+    return true;
+  }
+  var digits: uint8[770];
+  var nd: int32 = 0;
+  var dropped: bool = false;
+  var eadj: int64 = 0;
+  var any: bool = false;
+  while (i < n && s.chars[i] >= (uint8)'0' && s.chars[i] <= (uint8)'9') {
+    var d: uint8 = s.chars[i] - (uint8)'0';
+    any = true;
+    if (nd == 0 && d == (uint8)0) {
+      // leading zero
+    } else if (nd < MAX_DIGITS) {
+      digits[nd] = d;
+      nd = nd + 1;
+    } else {
+      eadj = eadj + 1;
+      if (d != (uint8)0) { dropped = true; }
+    }
+    i = i + 1;
+  }
+  if (i < n && s.chars[i] == (uint8)'.') {
+    i = i + 1;
+    while (i < n && s.chars[i] >= (uint8)'0' && s.chars[i] <= (uint8)'9') {
+      var d: uint8 = s.chars[i] - (uint8)'0';
+      any = true;
+      if (nd == 0 && d == (uint8)0) {
+        eadj = eadj - 1;
+      } else if (nd < MAX_DIGITS) {
+        digits[nd] = d;
+        nd = nd + 1;
+        eadj = eadj - 1;
+      } else if (d != (uint8)0) {
+        dropped = true;
+      }
+      i = i + 1;
+    }
+  }
+  if (!any) { return false; }
+  var exp: int64 = 0;
+  if (i < n && (s.chars[i] == (uint8)'e' || s.chars[i] == (uint8)'E')) {
+    i = i + 1;
+    var eneg: bool = false;
+    if (i < n && (s.chars[i] == (uint8)'+' || s.chars[i] == (uint8)'-')) {
+      eneg = s.chars[i] == (uint8)'-';
+      i = i + 1;
+    }
+    var edig: bool = false;
+    while (i < n && s.chars[i] >= (uint8)'0' && s.chars[i] <= (uint8)'9') {
+      if (exp < 1000000) { exp = exp * 10 + (int64)(s.chars[i] - (uint8)'0'); }
+      edig = true;
+      i = i + 1;
+    }
+    if (!edig) { return false; }
+    if (eneg) { exp = -exp; }
+  }
+  if (i != n) { return false; }
+  if (nd == 0) {
+    *out = sign;
+    return true;
+  }
+  // Trailing zeros carry no value.
+  while (nd > 1 && digits[nd - 1] == (uint8)0 && !dropped) {
+    nd = nd - 1;
+    eadj = eadj + 1;
+  }
+  if (dropped) {
+    digits[nd] = (uint8)1;
+    nd = nd + 1;
+    eadj = eadj - 1;
+  }
+  var e10: int64 = exp + eadj;
+  if ((int64)nd + e10 > 310) {
+    *out = sign | inf_bits;
+    return true;
+  }
+  if ((int64)nd + e10 < -345) {
+    *out = sign;
+    return true;
+  }
+  // Clinger's fast path: both the digits and the power of ten are exact
+  // float64 values, so one multiply or divide rounds correctly. A float32
+  // result then rounds once from that exact float64.
+  if (nd <= 15 && e10 >= -22 && e10 <= 22) {
+    var v: uint64 = 0;
+    for k in 0..nd { v = v * 10 + (uint64)digits[k]; }
+    var f: float64 = (float64)v;
+    if (e10 >= 0) {
+      f = f * POW10[e10];
+    } else {
+      f = f / POW10[-e10];
+    }
+    if (bias == 1023) {
+      *out = sign | (*(uint64*)&f);
+      return true;
+    }
+    if (bias == 127) {
+      var g: float32 = (float32)f;
+      *out = sign | (uint64)(*(uint32*)&g);
+      return true;
+    }
+  }
+  var num: Big;
+  num.n = 0;
+  for k in 0..nd {
+    big_mul_small(&num, (uint32)10);
+    if (num.n == 0) { big_set(&num, (uint64)digits[k]); } else { big_add_small(&num, (uint32)digits[k]); }
+  }
+  if (e10 >= 0) {
+    big_mul_pow10(&num, (int32)e10);
+    var len: int32 = big_bitlen(&num);
+    var m: uint64 = 0;
+    for k in 0..64 { m = (m << 1) | big_bit(&num, len - 1 - k); }
+    var sticky: bool = big_low_nonzero(&num, len - 64);
+    *out = sign | round_float(m, len - 64, sticky, mbits, bias);
+    return true;
+  }
+  var den: Big;
+  big_set(&den, 1);
+  big_mul_pow10(&den, (int32)(-e10));
+  var k: int32 = 63 + big_bitlen(&den) - big_bitlen(&num);
+  var q: uint64 = 0;
+  var rem: Big;
+  var rounds: int32 = 0;
+  while (rounds < 2) {
+    var a: Big;
+    var b: Big;
+    big_copy(&a, &num);
+    big_copy(&b, &den);
+    if (k >= 0) { big_shl(&a, k); } else { big_shl(&b, -k); }
+    big_shl(&b, 63);
+    q = 0;
+    for bit in 0..64 {
+      q = q << 1;
+      if (big_cmp(&a, &b) >= 0) {
+        big_sub(&a, &b);
+        q = q | 1;
+      }
+      big_shr1(&b);
+    }
+    // The loop above shifted b once too often; a is the true remainder.
+    big_copy(&rem, &a);
+    if ((q >> 63) == 1) { break; }
+    k = k + 1;
+    rounds = rounds + 1;
+  }
+  *out = sign | round_float(q, -k, rem.n != 0, mbits, bias);
+  return true;
+}
+
+// Parses a float64. Accepts [+-]digits[.digits][e[+-]digits], forms with
+// only a fraction (.5) or only an integer part (5.), and inf, infinity and
+// nan in any case. No spaces. Returns false for anything else.
+export fn csv_parse_f64(s: string, out: float64*) -> bool {
+  var bits: uint64 = 0;
+  if (!parse_float_bits(s, 52, 1023, &bits)) { return false; }
+  *out = *(float64*)&bits;
+  return true;
+}
+
+// Parses a float32, rounded once, correctly, from the decimal text.
+export fn csv_parse_f32(s: string, out: float32*) -> bool {
+  var bits: uint64 = 0;
+  if (!parse_float_bits(s, 23, 127, &bits)) { return false; }
+  var b32: uint32 = (uint32)bits;
+  *out = *(float32*)&b32;
+  return true;
+}
+
+// Parses a signed decimal integer with an optional + or - sign. Returns
+// false on any other byte, on empty text and on overflow.
+export fn csv_parse_i64(s: string, out: int64*) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var neg: bool = false;
+  if (n > 0 && (s.chars[0] == (uint8)'+' || s.chars[0] == (uint8)'-')) {
+    neg = s.chars[0] == (uint8)'-';
+    i = 1;
+  }
+  if (i >= n) { return false; }
+  var v: uint64 = 0;
+  var limit: uint64 = (uint64)9223372036854775807;
+  if (neg) { limit = limit + 1; }
+  while (i < n) {
+    var c: uint8 = s.chars[i];
+    if (c < (uint8)'0' || c > (uint8)'9') { return false; }
+    var d: uint64 = (uint64)(c - (uint8)'0');
+    if (v > (limit - d) / 10) { return false; }
+    v = v * 10 + d;
+    i = i + 1;
+  }
+  if (neg) {
+    *out = (int64)(0 - v);
+  } else {
+    *out = (int64)v;
+  }
+  return true;
+}
+
+// Parses an unsigned decimal integer (an optional + sign is allowed).
+export fn csv_parse_u64(s: string, out: uint64*) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  if (n > 0 && s.chars[0] == (uint8)'+') { i = 1; }
+  if (i >= n) { return false; }
+  var v: uint64 = 0;
+  var max: uint64 = 0 - (uint64)1;
+  while (i < n) {
+    var c: uint8 = s.chars[i];
+    if (c < (uint8)'0' || c > (uint8)'9') { return false; }
+    var d: uint64 = (uint64)(c - (uint8)'0');
+    if (v > (max - d) / 10) { return false; }
+    v = v * 10 + d;
+    i = i + 1;
+  }
+  *out = v;
+  return true;
+}
+
+// Parses true/false (any case) and 1/0.
+export fn csv_parse_bool(s: string, out: bool*) -> bool {
+  if (word_is(s, 0, "true") || s == "1") {
+    *out = true;
+    return true;
+  }
+  if (word_is(s, 0, "false") || s == "0") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+// Shortest digits for f * 2^e (f is the full integer mantissa), by Burger
+// and Dybvig. Writes the digits as values 0..9 and returns their count; the
+// value is 0.d1d2...dn times 10^(*k).
+fn shortest_digits(f: uint64, e: int32, p: int32, min_e: int32, digits: uint8*, k: int32*) -> int32 {
+  var r: Big;
+  var s: Big;
+  var mp: Big;
+  var mm: Big;
+  var even: bool = (f & 1) == 0;
+  var hidden: uint64 = (uint64)1 << (uint64)(p - 1);
+  if (e >= 0) {
+    if (f != hidden) {
+      big_set(&r, f);
+      big_shl(&r, e + 1);
+      big_set(&s, 2);
+      big_set(&mp, 1);
+      big_shl(&mp, e);
+      big_copy(&mm, &mp);
+    } else {
+      big_set(&r, f);
+      big_shl(&r, e + 2);
+      big_set(&s, 4);
+      big_set(&mp, 1);
+      big_shl(&mp, e + 1);
+      big_set(&mm, 1);
+      big_shl(&mm, e);
+    }
+  } else {
+    if (e == min_e || f != hidden) {
+      big_set(&r, f);
+      big_shl(&r, 1);
+      big_set(&s, 1);
+      big_shl(&s, 1 - e);
+      big_set(&mp, 1);
+      big_set(&mm, 1);
+    } else {
+      big_set(&r, f);
+      big_shl(&r, 2);
+      big_set(&s, 1);
+      big_shl(&s, 2 - e);
+      big_set(&mp, 2);
+      big_set(&mm, 1);
+    }
+  }
+  // Estimate k = ceil(log10(v)); it may be one too small, fixed below.
+  var bl: int32 = 0;
+  var t: uint64 = f;
+  while (t != 0) {
+    bl = bl + 1;
+    t = t >> 1;
+  }
+  var x: float64 = (float64)(e + bl - 1) * 0.30102999566398114;
+  var est: int32 = (int32)x;
+  if (x > 0.0 && (float64)est < x) { est = est + 1; }
+  if (est >= 0) {
+    big_mul_pow10(&s, est);
+  } else {
+    big_mul_pow10(&r, -est);
+    big_mul_pow10(&mp, -est);
+    big_mul_pow10(&mm, -est);
+  }
+  var sum: Big;
+  big_add(&sum, &r, &mp);
+  var c: int32 = big_cmp(&sum, &s);
+  if (c > 0 || (c == 0 && even)) {
+    est = est + 1;
+    big_mul_small(&s, (uint32)10);
+  }
+  *k = est;
+  var nd: int32 = 0;
+  while (nd < 40) {
+    big_mul_small(&r, (uint32)10);
+    big_mul_small(&mp, (uint32)10);
+    big_mul_small(&mm, (uint32)10);
+    var d: int32 = 0;
+    while (big_cmp(&r, &s) >= 0) {
+      big_sub(&r, &s);
+      d = d + 1;
+    }
+    var c1: int32 = big_cmp(&r, &mm);
+    var low: bool = c1 < 0 || (c1 == 0 && even);
+    big_add(&sum, &r, &mp);
+    var c2: int32 = big_cmp(&sum, &s);
+    var high: bool = c2 > 0 || (c2 == 0 && even);
+    if (!low && !high) {
+      digits[nd] = (uint8)d;
+      nd = nd + 1;
+      continue;
+    }
+    if (low && high) {
+      var twice: Big;
+      big_copy(&twice, &r);
+      big_shl(&twice, 1);
+      if (big_cmp(&twice, &s) >= 0) { d = d + 1; }
+    } else if (high) {
+      d = d + 1;
+    }
+    digits[nd] = (uint8)d;
+    nd = nd + 1;
+    break;
+  }
+  return nd;
+}
+
+fn put(out: uint8*, at: int32, c: uint8) -> int32 {
+  out[at] = c;
+  return at + 1;
+}
+
+fn layout(neg: bool, digits: uint8*, nd: int32, k: int32, out: uint8*) -> int32 {
+  var at: int32 = 0;
+  if (neg) { at = put(out, at, (uint8)'-'); }
+  var exp10: int32 = k - 1;
+  if (exp10 < -4 || exp10 >= 16) {
+    at = put(out, at, (uint8)'0' + digits[0]);
+    if (nd > 1) {
+      at = put(out, at, (uint8)'.');
+      for i in 1..nd { at = put(out, at, (uint8)'0' + digits[i]); }
+    }
+    at = put(out, at, (uint8)'e');
+    var ex: int32 = exp10;
+    if (ex < 0) {
+      at = put(out, at, (uint8)'-');
+      ex = -ex;
+    } else {
+      at = put(out, at, (uint8)'+');
+    }
+    if (ex >= 100) { at = put(out, at, (uint8)'0' + (uint8)(ex / 100)); }
+    at = put(out, at, (uint8)'0' + (uint8)((ex / 10) % 10));
+    at = put(out, at, (uint8)'0' + (uint8)(ex % 10));
+    return at;
+  }
+  if (k <= 0) {
+    at = put(out, at, (uint8)'0');
+    at = put(out, at, (uint8)'.');
+    var z: int32 = 0;
+    while (z < -k) {
+      at = put(out, at, (uint8)'0');
+      z = z + 1;
+    }
+    for i in 0..nd { at = put(out, at, (uint8)'0' + digits[i]); }
+    return at;
+  }
+  for i in 0..k {
+    var d: uint8 = (uint8)0;
+    if (i < nd) { d = digits[i]; }
+    at = put(out, at, (uint8)'0' + d);
+  }
+  at = put(out, at, (uint8)'.');
+  if (nd <= k) {
+    at = put(out, at, (uint8)'0');
+  } else {
+    for i in k..nd { at = put(out, at, (uint8)'0' + digits[i]); }
+  }
+  return at;
+}
+
+fn format_bits(bits: uint64, mbits: int32, bias: int32, neg: bool, out: uint8*) -> int32 {
+  var expmask: uint64 = (uint64)(bias * 2 + 1);
+  var be: uint64 = (bits >> (uint64)mbits) & expmask;
+  var frac: uint64 = bits & (((uint64)1 << (uint64)mbits) - 1);
+  var at: int32 = 0;
+  if (be == expmask) {
+    if (frac != 0) {
+      at = put(out, at, (uint8)'n');
+      at = put(out, at, (uint8)'a');
+      return put(out, at, (uint8)'n');
+    }
+    if (neg) { at = put(out, at, (uint8)'-'); }
+    at = put(out, at, (uint8)'i');
+    at = put(out, at, (uint8)'n');
+    return put(out, at, (uint8)'f');
+  }
+  if (be == 0 && frac == 0) {
+    if (neg) { at = put(out, at, (uint8)'-'); }
+    at = put(out, at, (uint8)'0');
+    at = put(out, at, (uint8)'.');
+    return put(out, at, (uint8)'0');
+  }
+  var f: uint64 = frac;
+  var e: int32 = 0;
+  var min_e: int32 = 1 - bias - mbits;
+  if (be == 0) {
+    e = min_e;
+  } else {
+    f = frac | ((uint64)1 << (uint64)mbits);
+    e = (int32)be - bias - mbits;
+  }
+  var digits: uint8[48];
+  var k: int32 = 0;
+  var nd: int32 = shortest_digits(f, e, mbits + 1, min_e, &digits[0], &k);
+  return layout(neg, &digits[0], nd, k, out);
+}
+
+// Writes the shortest text that reads back to v. `out` needs 32 bytes.
+// Returns the length.
+export fn csv_format_f64(v: float64, out: uint8*) -> int32 {
+  var bits: uint64 = *(uint64*)&v;
+  return format_bits(bits, 52, 1023, (bits >> 63) == 1, out);
+}
+
+// Same for float32: the shortest text that reads back to the same float32.
+export fn csv_format_f32(v: float32, out: uint8*) -> int32 {
+  var b32: uint32 = *(uint32*)&v;
+  var bits: uint64 = (uint64)b32;
+  return format_bits(bits, 23, 127, (bits >> 31) == 1, out);
+}

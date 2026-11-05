@@ -1,0 +1,520 @@
+// Basic text shaping: UTF-8 text in, positioned glyphs out.
+//
+// Steps follow HarfBuzz's default ("generic") shaper: map characters with
+// cmap (honouring variation selectors), set GDEF classes, apply the GSUB
+// features ccmp, locl, rlig, liga, clig, calt and rclt, set advances,
+// apply the GPOS features kern, mark, mkmk, curs, dist, abvm and blwm (or
+// the legacy kern table when GPOS has no kerning), then resolve mark and
+// cursive attachments. Complex-script shaping (Arabic joining, Indic
+// reordering) is not done yet.
+
+import "std/math";
+import "font/core/vec";
+import "font/core/utf8";
+import "font/sfnt/face";
+import "font/sfnt/cmap";
+import "font/sfnt/metrics";
+import "font/layout/buffer";
+import "font/layout/otl";
+import "font/layout/gsub";
+import "font/layout/gpos";
+import "font/layout/kern";
+import "font/outline/glyf";
+import "font/outline/outline";
+import "unicode_data";
+
+/// Makes a 4-byte tag from a 4-character string such as "liga".
+export fn font_tag(s: string) -> uint32 {
+  var t: uint32 = 0;
+  for i in 0..4 {
+    var c: uint32 = 32;
+    if (i < s.length) { c = (uint32)s.chars[i]; }
+    t = (t << 8) | c;
+  }
+  return t;
+}
+
+export const FONT_DIR_AUTO: int32 = 0;
+export const FONT_DIR_LTR: int32 = 1;
+export const FONT_DIR_RTL: int32 = 2;
+
+export struct FontFeature { tag: uint32; on: bool; }
+
+/// Shaping options. A zeroed value means: guess the script, default
+/// language, guess the direction, default features.
+export struct FontShapeOpts {
+  script: uint32;          // OpenType script tag, 0 = guess from the text
+  lang: uint32;            // OpenType language tag, 0 = default
+  dir: int32;              // FONT_DIR_*
+  feats: FontFeature[16];  // features to turn on or off
+  nfeat: int32;
+}
+
+/// Adds a feature switch to the options ("smcp" on, "liga" off, ...).
+export fn font_shape_feature(o: FontShapeOpts*, tag: string, on: bool) {
+  if (o->nfeat >= 16) { return; }
+  o->feats[o->nfeat].tag = font_tag(tag);
+  o->feats[o->nfeat].on = on;
+  o->nfeat = o->nfeat + 1;
+}
+
+/// Guesses the OpenType script tag of a code point (0 when neutral).
+export fn font_script_of(cp: uint32) -> uint32 {
+  if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A) || (cp >= 0xC0 && cp <= 0x24F && cp != 0xD7 && cp != 0xF7) || (cp >= 0x1E00 && cp <= 0x1EFF)) { return FONT_TAG_LATN; }
+  if (cp >= 0x370 && cp <= 0x3FF) { return 0x6772656B; }    // grek
+  if (cp >= 0x400 && cp <= 0x52F) { return 0x6379726C; }    // cyrl
+  if (cp >= 0x590 && cp <= 0x5FF) { return 0x68656272; }    // hebr
+  if ((cp >= 0x600 && cp <= 0x6FF) || (cp >= 0x750 && cp <= 0x77F) || (cp >= 0xFB50 && cp <= 0xFEFC)) { return 0x61726162; }   // arab
+  if (cp >= 0x900 && cp <= 0x97F) { return 0x64657632; }    // dev2
+  if (cp >= 0xE00 && cp <= 0xE7F) { return 0x74686169; }    // thai
+  if ((cp >= 0x1100 && cp <= 0x11FF) || (cp >= 0xAC00 && cp <= 0xD7AF)) { return 0x68616E67; }   // hang
+  if ((cp >= 0x3040 && cp <= 0x30FF)) { return 0x6B616E61; }  // kana
+  if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x20000 && cp <= 0x2FFFF)) { return 0x68616E69; }   // hani
+  return 0;
+}
+
+fn is_rtl_script(t: uint32) -> bool { return t == 0x68656272 || t == 0x61726162; }
+
+fn is_var_selector(cp: uint32) -> bool {
+  return (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xE0100 && cp <= 0xE01EF) || (cp >= 0x180B && cp <= 0x180D);
+}
+
+fn is_mark_gc(gc: uint8) -> bool {
+  return gc == FONT_GC_Mn || gc == FONT_GC_Mc || gc == FONT_GC_Me;
+}
+
+fn is_ext_pict(cp: uint32) -> bool {
+  return (cp >= 0x1F000 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) || cp == 0x2B50 || cp == 0x2B55;
+}
+
+// General category of an ASCII character without a table search.
+fn ascii_gc(cp: uint32) -> uint8 {
+  if (cp < 0x20 || cp == 0x7F) { return FONT_GC_Cc; }
+  if (cp == 0x20) { return FONT_GC_Zs; }
+  if (cp >= 0x30 && cp <= 0x39) { return FONT_GC_Nd; }
+  if (cp >= 0x41 && cp <= 0x5A) { return FONT_GC_Lu; }
+  if (cp >= 0x61 && cp <= 0x7A) { return FONT_GC_Ll; }
+  return font_ucd_gc(cp);
+}
+
+// Sets the Unicode properties HarfBuzz keeps per character
+// (hb_set_unicode_props): category, combining class, ignorable, and
+// "continuation" for marks, ZWJ (and the pictograph after it), emoji
+// modifiers and tag characters.
+fn set_props(b: FontBuffer*) {
+  var n: int64 = b->g.len;
+  var i: int64 = 0;
+  while (i < n) {
+    var x: FontGlyph* = &b->g.data[i];
+    var cp: uint32 = x->cp;
+    if (cp < 0x80) {
+      x->gc = ascii_gc(cp);
+      x->ccc = (uint8)0;
+      x->uflags = (uint8)0;
+      i = i + 1;
+      continue;
+    }
+    x->gc = font_ucd_gc(cp);
+    x->ccc = font_ucd_ccc(cp);
+    x->uflags = (uint8)0;
+    if (font_ucd_default_ignorable(cp)) { x->uflags = FONT_UF_IGNORABLE; }
+    if (is_mark_gc(x->gc) && x->uflags == (uint8)0) { x->uflags = FONT_UF_CONTINUE; }
+    if (cp >= 0x1F3FB && cp <= 0x1F3FF) { x->uflags = x->uflags | FONT_UF_CONTINUE; }
+    if (cp >= 0xE0020 && cp <= 0xE007F) { x->uflags = x->uflags | FONT_UF_CONTINUE; }
+    if (is_mark_gc(x->gc)) { x->uflags = x->uflags | FONT_UF_CONTINUE; }
+    if (cp == 0x200D) {
+      x->uflags = x->uflags | FONT_UF_CONTINUE;
+      if (i + 1 < n && is_ext_pict(b->g.data[i + 1].cp)) {
+        i = i + 1;
+        b->g.data[i].gc = font_ucd_gc(b->g.data[i].cp);
+        b->g.data[i].ccc = font_ucd_ccc(b->g.data[i].cp);
+        b->g.data[i].uflags = FONT_UF_CONTINUE;
+      }
+    }
+    i = i + 1;
+  }
+}
+
+// Gives every character of a grapheme the cluster of its first character.
+fn form_clusters(b: FontBuffer*) {
+  var start: int64 = 0;
+  for i: int64 in 1..b->g.len + 1 {
+    if (i < b->g.len && (b->g.data[i].uflags & FONT_UF_CONTINUE) != (uint8)0) { continue; }
+    var cl: int32 = b->g.data[start].cluster;
+    for k: int64 in start..i { if (b->g.data[k].cluster < cl) { cl = b->g.data[k].cluster; } }
+    for k: int64 in start..i { b->g.data[k].cluster = cl; }
+    start = i;
+  }
+}
+
+fn has_glyph(f: FontFace*, cp: uint32) -> bool { return font_glyph_index(f, cp) != 0; }
+
+// Appends cp to out with x's cluster and properties.
+fn put_char(out: FontVec<FontGlyph>*, x: FontGlyph*, cp: uint32) {
+  var y: FontGlyph = *x;
+  y.cp = cp;
+  y.id = -1;
+  y.gc = font_ucd_gc(cp);
+  y.ccc = font_ucd_ccc(cp);
+  y.uflags = x->uflags;
+  if (is_mark_gc(y.gc)) { y.uflags = y.uflags | FONT_UF_CONTINUE; }
+  font_vec_push<FontGlyph>(out, y);
+}
+
+// HarfBuzz's decompose(): writes the decomposition of ab when the font can
+// show it. Returns how many characters were written (0 = none).
+fn decompose(f: FontFace*, x: FontGlyph*, out: FontVec<FontGlyph>*, shortest: bool, ab: uint32, depth: int32) -> int32 {
+  if (depth > 8) { return 0; }
+  var a: uint32 = 0;
+  var b: uint32 = 0;
+  if (!font_ucd_decompose(ab, &a, &b)) { return 0; }
+  if (b != 0 && !has_glyph(f, b)) { return 0; }
+  var has_a: bool = has_glyph(f, a);
+  if (shortest && has_a) {
+    put_char(out, x, a);
+    if (b != 0) { put_char(out, x, b); return 2; }
+    return 1;
+  }
+  var mark: int64 = out->len;
+  var r: int32 = decompose(f, x, out, shortest, a, depth + 1);
+  if (r > 0) {
+    if (b != 0) { put_char(out, x, b); return r + 1; }
+    return r;
+  }
+  out->len = mark;
+  if (has_a) {
+    put_char(out, x, a);
+    if (b != 0) { put_char(out, x, b); return 2; }
+    return 1;
+  }
+  return 0;
+}
+
+// HarfBuzz's normalisation in "composed diacritics" mode
+// (hb-ot-shape-normalize.cc): decompose what the font cannot show
+// directly, sort runs of marks by combining class, then recompose pairs
+// the font has a glyph for.
+fn normalize(f: FontFace*, b: FontBuffer*) -> bool {
+  var out: FontVec<FontGlyph>;
+  var n: int64 = b->g.len;
+  var i: int64 = 0;
+  while (i < n) {
+    var x: FontGlyph* = &b->g.data[i];
+    // A character with marks after it is decomposed fully; a lone one
+    // only when the font lacks it.
+    var lone: bool = !(i + 1 < n && is_mark_gc(b->g.data[i + 1].gc)) && !is_mark_gc(x->gc);
+    if (lone) {
+      var gl: int32 = font_glyph_index(f, x->cp);
+      if (gl != 0) {
+        var y: FontGlyph = *x;
+        y.id = gl;
+        font_vec_push<FontGlyph>(&out, y);
+        i = i + 1;
+        continue;
+      }
+    }
+    if (decompose(f, x, &out, lone, x->cp, 0) == 0) { font_vec_push<FontGlyph>(&out, *x); }
+    i = i + 1;
+  }
+  // Sort each run of marks (combining class > 0) by class, stably.
+  var s: int64 = 0;
+  while (s < out.len) {
+    if (out.data[s].ccc == (uint8)0) { s = s + 1; continue; }
+    var e: int64 = s;
+    while (e < out.len && out.data[e].ccc != (uint8)0) { e = e + 1; }
+    if (e - s <= 32) {
+      for k: int64 in s + 1..e {
+        var j: int64 = k;
+        while (j > s && out.data[j - 1].ccc > out.data[j].ccc) {
+          var t: FontGlyph = out.data[j];
+          out.data[j] = out.data[j - 1];
+          out.data[j - 1] = t;
+          j = j - 1;
+        }
+      }
+    }
+    s = e;
+  }
+  // Recompose.
+  b->g.len = 0;
+  var starter: int64 = -1;
+  for k: int64 in 0..out.len {
+    var y: FontGlyph = out.data[k];
+    if (is_mark_gc(y.gc) && starter >= 0) {
+      var last: int64 = b->g.len - 1;
+      if (starter == last || b->g.data[last].ccc < y.ccc) {
+        var c: uint32 = font_ucd_compose(b->g.data[starter].cp, y.cp);
+        if (c != 0 && has_glyph(f, c)) {
+          var st: FontGlyph* = &b->g.data[starter];
+          st->cp = c;
+          st->id = -1;
+          st->gc = font_ucd_gc(c);
+          st->ccc = font_ucd_ccc(c);
+          if (y.cluster < st->cluster) { st->cluster = y.cluster; }
+          continue;
+        }
+      }
+    }
+    if (!font_vec_push<FontGlyph>(&b->g, y)) { font_vec_free<FontGlyph>(&out); return false; }
+    if (y.ccc == (uint8)0) { starter = b->g.len - 1; }
+  }
+  font_vec_free<FontGlyph>(&out);
+  return true;
+}
+
+fn feature_list(o: FontShapeOpts*, out: uint32*, defaults: string[..]) -> int32 {
+  var n: int32 = 0;
+  for i in 0..defaults.length {
+    var t: uint32 = font_tag(defaults[i]);
+    var off: bool = false;
+    for k in 0..o->nfeat { if (o->feats[k].tag == t && !o->feats[k].on) { off = true; } }
+    if (!off) { out[n] = t; n = n + 1; }
+  }
+  return n;
+}
+
+/// Shapes UTF-8 text with face f into buf (cleared first). Positions are in
+/// font units: multiply by font_scale_em(f, px) for pixels. opts may be
+/// null. Returns false when memory runs out.
+export fn font_shape(f: FontFace*, text: uint8*, len: int64, opts: FontShapeOpts*, buf: FontBuffer*) -> bool {
+  var zero: FontShapeOpts;
+  var o: FontShapeOpts* = opts;
+  if (o == 0) { o = &zero; }
+  font_buffer_clear(buf);
+  var script: uint32 = o->script;
+  var i: int64 = 0;
+  var used: int64 = 0;
+  while (i < len) {
+    var cp: uint32 = font_utf8_decode(text, len, i, &used);
+    if (script == 0) { script = font_script_of(cp); }
+    var x: FontGlyph;
+    x.cluster = (int32)i;
+    x.cp = cp;
+    x.id = -1;
+    x.attach = -1;
+    if (!font_vec_push<FontGlyph>(&buf->g, x)) { return false; }
+    i = i + used;
+  }
+  if (script == 0) { script = FONT_TAG_LATN; }
+  set_props(buf);
+  form_clusters(buf);
+  if (!normalize(f, buf)) { return false; }
+  // Map to glyphs. A variation selector picks the glyph of the character
+  // before it and stays behind as a hidden glyph.
+  var has_gdef: bool = f->gdef != 0;
+  for k: int64 in 0..buf->g.len {
+    var x: FontGlyph* = &buf->g.data[k];
+    if (x->id < 0) { x->id = font_glyph_index(f, x->cp); }
+    if (is_var_selector(x->cp) && k > 0) {
+      var prev: FontGlyph* = &buf->g.data[k - 1];
+      prev->id = font_glyph_index_vs(f, prev->cp, x->cp);
+    }
+  }
+  var rtl: bool = o->dir == FONT_DIR_RTL || (o->dir == FONT_DIR_AUTO && is_rtl_script(script));
+  for k: int64 in 0..buf->g.len {
+    var x: FontGlyph* = &buf->g.data[k];
+    if (has_gdef) {
+      x->cls = (uint8)otl_glyph_class(f, x->id);
+      x->mcls = (uint8)otl_mark_class(f, x->id);
+    } else if (x->gc == FONT_GC_Mn && (x->uflags & FONT_UF_IGNORABLE) == (uint8)0) {
+      x->cls = (uint8)3;
+    } else {
+      x->cls = (uint8)1;
+    }
+  }
+  if (rtl) {
+    var a: int64 = 0;
+    var b: int64 = buf->g.len - 1;
+    while (a < b) {
+      var t: FontGlyph = buf->g.data[a];
+      buf->g.data[a] = buf->g.data[b];
+      buf->g.data[b] = t;
+      a = a + 1;
+      b = b - 1;
+    }
+  }
+
+  var tags: uint32[48];
+  var lookups: FontVec<int32>;
+  var nt: int32 = feature_list(o, &tags[0], "ccmp", "locl", "rlig", "liga", "clig", "calt", "rclt");
+  for k in 0..o->nfeat { if (o->feats[k].on && nt < 48) { tags[nt] = o->feats[k].tag; nt = nt + 1; } }
+  if (f->gsub != 0) {
+    otl_collect(f, f->gsub, script, o->lang, &tags[0], nt, &lookups);
+    font_gsub_apply(f, buf, &lookups);
+  }
+
+  for k: int64 in 0..buf->g.len {
+    var x: FontGlyph* = &buf->g.data[k];
+    x->x_adv = font_advance(f, x->id);
+    x->y_adv = 0;
+    x->x_off = 0;
+    x->y_off = 0;
+    x->attach = -1;
+    x->atype = (uint8)0;
+  }
+
+  nt = feature_list(o, &tags[0], "kern", "mark", "mkmk", "curs", "dist", "abvm", "blwm");
+  var want_kern: bool = false;
+  for k in 0..nt { if (tags[k] == 0x6B65726E) { want_kern = true; } }
+  for k in 0..o->nfeat { if (o->feats[k].on && nt < 48) { tags[nt] = o->feats[k].tag; nt = nt + 1; } }
+  var gpos_kern: bool = false;
+  if (f->gpos != 0) {
+    var kt: uint32[1];
+    kt[0] = 0x6B65726E;
+    otl_collect(f, f->gpos, script, o->lang, &kt[0], 1, &lookups);
+    gpos_kern = lookups.len > 0;
+    otl_collect(f, f->gpos, script, o->lang, &tags[0], nt, &lookups);
+    font_gpos_apply(f, buf, &lookups);
+  }
+  if (want_kern && !gpos_kern && f->kern != 0) {
+    // Like HarfBuzz, half of each kern value goes on the first glyph's
+    // advance and the rest on the second glyph's advance and offset.
+    var prev: int64 = -1;
+    for k: int64 in 0..buf->g.len {
+      if (buf->g.data[k].cls == (uint8)3 || (buf->g.data[k].uflags & FONT_UF_IGNORABLE) != (uint8)0) { continue; }
+      if (prev >= 0) {
+        var v: int32 = font_kern(f, buf->g.data[prev].id, buf->g.data[k].id);
+        if (rtl) { v = font_kern(f, buf->g.data[k].id, buf->g.data[prev].id); }
+        var k1: int32 = v >> 1;
+        var k2: int32 = v - k1;
+        buf->g.data[prev].x_adv = buf->g.data[prev].x_adv + k1;
+        buf->g.data[k].x_adv = buf->g.data[k].x_adv + k2;
+        buf->g.data[k].x_off = buf->g.data[k].x_off + k2;
+      }
+      prev = k;
+    }
+  }
+  font_vec_free<int32>(&lookups);
+  if (f->gpos == 0 && !rtl) { fallback_marks(f, buf); }
+  // Marks take no space (HarfBuzz zeroes GDEF marks after GPOS), and
+  // default ignorables become invisible: the space glyph with no width,
+  // or nothing when the font has no space.
+  var space: int32 = font_glyph_index(f, 32);
+  for k: int64 in 0..buf->g.len {
+    var x: FontGlyph* = &buf->g.data[k];
+    if (x->cls == (uint8)3) { x->x_adv = 0; x->y_adv = 0; }
+    if ((x->uflags & FONT_UF_IGNORABLE) != (uint8)0) { x->x_adv = 0; x->y_adv = 0; x->x_off = 0; x->y_off = 0; }
+  }
+  font_gpos_resolve(buf);
+  var w: int64 = 0;
+  for k: int64 in 0..buf->g.len {
+    var x: FontGlyph = buf->g.data[k];
+    if ((x.uflags & FONT_UF_IGNORABLE) != (uint8)0) {
+      if (space == 0) { continue; }
+      x.id = space;
+    }
+    buf->g.data[w] = x;
+    w = w + 1;
+  }
+  buf->g.len = w;
+  return true;
+}
+
+// ---- Fallback mark positioning (hb-ot-shape-fallback.cc) ----
+// For fonts without GPOS: marks are placed on their base by glyph boxes and
+// combining class.
+
+struct Ext { xb: int32; yb: int32; w: int32; h: int32; }   // HarfBuzz glyph extents (h < 0)
+
+fn extents(f: FontFace*, g: int32, e: Ext*) -> bool {
+  e->xb = 0; e->yb = 0; e->w = 0; e->h = 0;
+  if (f->outline == FONT_OUTLINE_GLYF) {
+    var ln: int64 = 0;
+    var o: int64 = font_glyf_range(f, g, &ln);
+    if (o == 0 || ln < 10) { return true; }
+    var x0: int32 = font_i16(f, o + 2); var y0: int32 = font_i16(f, o + 4);
+    var x1: int32 = font_i16(f, o + 6); var y1: int32 = font_i16(f, o + 8);
+    e->xb = font_lsb(f, g);
+    e->yb = y1;
+    e->w = x1 - x0;
+    e->h = y0 - y1;
+    return true;
+  }
+  var x0: float32 = 0.0; var y0: float32 = 0.0; var x1: float32 = 0.0; var y1: float32 = 0.0;
+  if (!font_glyph_box(f, g, &x0, &y0, &x1, &y1)) { return true; }
+  e->xb = (int32)floor((float64)x0);
+  e->yb = (int32)ceil((float64)y1);
+  e->w = (int32)ceil((float64)x1) - e->xb;
+  e->h = (int32)floor((float64)y0) - e->yb;
+  return true;
+}
+
+fn place_mark(f: FontFace*, x: FontGlyph*, base: Ext*, cc: int32) {
+  var m: Ext;
+  extents(f, x->id, &m);
+  var gap: int32 = f->upem / 16;
+  x->x_off = 0;
+  x->y_off = 0;
+  if (cc == 200 || cc == 218 || cc == 228) { x->x_off = base->xb - m.xb; }
+  else if (cc == 204 || cc == 222 || cc == 232) { x->x_off = base->xb + base->w - m.w - m.xb; }
+  else if (cc == 233 || cc == 234) { x->x_off = base->xb + base->w - m.w / 2 - m.xb; }
+  else { x->x_off = base->xb + (base->w - m.w) / 2 - m.xb; }
+  if (cc == 233 || cc == 218 || cc == 220 || cc == 222 || cc == 200 || cc == 202) {
+    if (cc != 200 && cc != 202) { base->h = base->h - gap; }
+    x->y_off = base->yb + base->h - m.yb;
+    if ((gap > 0) == (x->y_off > 0)) { base->h = base->h - x->y_off; x->y_off = 0; }
+    base->h = base->h + m.h;
+  } else if (cc == 234 || cc == 228 || cc == 230 || cc == 232 || cc == 214 || cc == 204) {
+    if (cc != 214 && cc != 204) { base->yb = base->yb + gap; base->h = base->h - gap; }
+    x->y_off = base->yb - (m.yb + m.h);
+    if ((gap > 0) != (x->y_off > 0)) {
+      var corr: int32 = -x->y_off / 2;
+      base->yb = base->yb + corr;
+      base->h = base->h - corr;
+      x->y_off = x->y_off + corr;
+    }
+    base->yb = base->yb - m.h;
+    base->h = base->h + m.h;
+  }
+}
+
+fn fallback_cluster(f: FontFace*, b: FontBuffer*, base: int64, end: int64) {
+  var be: Ext;
+  extents(f, b->g.data[base].id, &be);
+  be.xb = 0;
+  be.w = font_advance(f, b->g.data[base].id);
+  be.yb = be.yb + b->g.data[base].y_off;
+  var xo: int32 = -b->g.data[base].x_adv;
+  var comp: Ext = be;
+  var cluster: Ext = be;
+  var last: int32 = 255;
+  for i: int64 in base + 1..end {
+    var x: FontGlyph* = &b->g.data[i];
+    if (x->ccc != (uint8)0) {
+      var cc: int32 = (int32)x->ccc;
+      if (cc != last) { last = cc; cluster = comp; }
+      place_mark(f, x, &cluster, cc);
+      x->x_adv = 0;
+      x->y_adv = 0;
+      x->x_off = x->x_off + xo;
+    } else {
+      xo = xo - x->x_adv;
+    }
+  }
+}
+
+fn fallback_marks(f: FontFace*, b: FontBuffer*) {
+  var n: int64 = b->g.len;
+  var i: int64 = 0;
+  while (i < n) {
+    if (is_mark_gc(b->g.data[i].gc)) { i = i + 1; continue; }
+    var j: int64 = i + 1;
+    while (j < n && is_mark_gc(b->g.data[j].gc)) { j = j + 1; }
+    if (j - i > 1) {
+      // Marks with advances are pulled back before zeroing, as HarfBuzz
+      // does when it positions marks itself.
+      for k: int64 in i + 1..j {
+        if (b->g.data[k].cls == (uint8)3) { b->g.data[k].x_off = b->g.data[k].x_off - b->g.data[k].x_adv; b->g.data[k].x_adv = 0; }
+      }
+      fallback_cluster(f, b, i, j);
+    }
+    i = j;
+  }
+}
+
+/// Total advance of the shaped run in font units.
+export fn font_shape_width(buf: FontBuffer*) -> int64 {
+  var w: int64 = 0;
+  for k: int64 in 0..buf->g.len { w = w + (int64)buf->g.data[k].x_adv; }
+  return w;
+}

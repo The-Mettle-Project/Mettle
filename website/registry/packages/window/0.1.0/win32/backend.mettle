@@ -1,0 +1,1093 @@
+// win32/backend: windows and input on Windows, written from the Win32 API
+// documentation (learn.microsoft.com: "Window Procedures", "Keyboard Input",
+// "Mouse Input", "Raw Input", "High DPI Desktop Application Development",
+// "Input Method Manager", "Clipboard").
+//
+// The process asks for per-monitor DPI awareness v2, so sizes from the system
+// are pixels and window reports logical sizes the same way as on Linux.
+import "std/mem";
+import "../core/keys.mettle";
+import "../core/types.mettle";
+import "api.mettle";
+
+export struct WindowW32Win {
+  hwnd: int64;
+  style: uint32;
+  ex_style: uint32;
+  dpi: int32;
+  tracking: bool;
+  hi_surrogate: uint32;
+  saved_style: uint32;
+  saved_rect: W32Rect;
+  min_w: int32; min_h: int32; max_w: int32; max_h: int32;
+  px: uint8*;              // last blitted pixels as BGRA, for WM_PAINT
+  px_w: int32; px_h: int32;
+  cursor_img: int64;
+  icon: int64;
+  composing: bool;
+  ime_rect: W32Rect;
+  skip_ctrl_time: uint32;
+}
+
+struct W32State {
+  instance: int64;
+  class_atom: uint16;
+  qpc_freq: int64;
+  wake_event: int64;
+  cursors: int64[11];
+  get_dpi_for_window: int64;
+  adjust_for_dpi: int64;
+  get_dpi_for_monitor: int64;
+  raw_registered: bool;
+}
+
+var g_w: W32State;
+var g_mon_list: WindowMonitor*;
+var g_mon_n: int32 = 0;
+
+fn ww(w: Window*) -> WindowW32Win* { return (WindowW32Win*)w->plat; }
+
+fn lo16(v: int64) -> int32 { return (int32)(v & 0xFFFF); }
+fn hi16(v: int64) -> int32 { return (int32)((v >> 16) & 0xFFFF); }
+fn slo16(v: int64) -> int32 { var x: int32 = lo16(v); if (x >= 32768) { x = x - 65536; } return x; }
+fn shi16(v: int64) -> int32 { var x: int32 = hi16(v); if (x >= 32768) { x = x - 65536; } return x; }
+
+/// Monotonic microseconds from QueryPerformanceCounter.
+export fn window_w32_now_us() -> int64 {
+  var c: int64 = 0;
+  window_w32_QueryPerformanceCounter(&c);
+  var f: int64 = g_w.qpc_freq;
+  if (f <= 0) { window_w32_QueryPerformanceFrequency(&g_w.qpc_freq); f = g_w.qpc_freq; }
+  if (f <= 0) { f = 1; }
+  return (c / f) * 1000000 + ((c % f) * 1000000) / f;
+}
+
+// UTF-8 -> malloc'd NUL-terminated UTF-16.
+export fn window_w32_wide(s: uint8*, n: int64) -> uint16* {
+  var dst: uint16* = (uint16*)malloc((n + 1) * 2 + 4);
+  var i: int64 = 0;
+  var o: int64 = 0;
+  var m: int64 = window_utf8_valid_prefix(s, n);
+  while (i < m) {
+    var c: int64 = (int64)s[i];
+    var cp: int64 = c;
+    var len: int64 = 1;
+    if (c >= 0xC0 && c < 0xE0) { cp = ((c & 0x1F) << 6) | ((int64)s[i + 1] & 0x3F); len = 2; }
+    else if (c >= 0xE0 && c < 0xF0) { cp = ((c & 0x0F) << 12) | (((int64)s[i + 1] & 0x3F) << 6) | ((int64)s[i + 2] & 0x3F); len = 3; }
+    else if (c >= 0xF0) { cp = ((c & 0x07) << 18) | (((int64)s[i + 1] & 0x3F) << 12) | (((int64)s[i + 2] & 0x3F) << 6) | ((int64)s[i + 3] & 0x3F); len = 4; }
+    if (cp >= 0x10000) {
+      cp = cp - 0x10000;
+      dst[o] = (uint16)(0xD800 + (cp >> 10));
+      dst[o + 1] = (uint16)(0xDC00 + (cp & 0x3FF));
+      o = o + 2;
+    } else {
+      dst[o] = (uint16)cp;
+      o = o + 1;
+    }
+    i = i + len;
+  }
+  dst[o] = (uint16)0;
+  return dst;
+}
+
+// UTF-16 (n units) -> UTF-8 into out (room for n * 3 + 1). Returns bytes written.
+// count_to: when >= 0, *at gets the byte offset of UTF-16 unit count_to.
+fn narrow(s: uint16*, n: int64, out: uint8*, count_to: int64, at: int64*) -> int64 {
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    if (i == count_to) { *at = o; }
+    var u: int64 = (int64)s[i];
+    var cp: int64 = u;
+    if (u >= 0xD800 && u < 0xDC00 && i + 1 < n && (int64)s[i + 1] >= 0xDC00 && (int64)s[i + 1] < 0xE000) {
+      cp = 0x10000 + ((u - 0xD800) << 10) + ((int64)s[i + 1] - 0xDC00);
+      i = i + 1;
+    } else if (u >= 0xD800 && u < 0xE000) {
+      cp = 0xFFFD;
+    }
+    o = o + (int64)window_utf8_encode((uint32)cp, &out[o]);
+    i = i + 1;
+  }
+  if (count_to >= n) { *at = o; }
+  out[o] = (uint8)0;
+  return o;
+}
+
+export fn window_w32_find(hwnd: int64) -> Window* {
+  var w: Window* = g_window.windows;
+  while (w != 0) {
+    if (w->plat != 0 && ww(w)->hwnd == hwnd) { return w; }
+    w = w->next;
+  }
+  return (Window*)0;
+}
+
+// ---------- scancodes ----------
+// Set-1 scancode (no E0 prefix) -> HID usage.
+const SC_TO_HID: uint8[128] = [
+  0, 41, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 45, 46, 42, 43,
+  20, 26, 8, 21, 23, 28, 24, 12, 18, 19, 47, 48, 40, 224, 4, 22,
+  7, 9, 10, 11, 13, 14, 15, 51, 52, 53, 225, 49, 29, 27, 6, 25,
+  5, 17, 16, 54, 55, 56, 229, 85, 226, 44, 57, 58, 59, 60, 61, 62,
+  63, 64, 65, 66, 67, 72, 71, 95, 96, 97, 86, 92, 93, 94, 87, 89,
+  90, 91, 98, 99, 0, 0, 100, 68, 69, 103, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 0,
+  136, 0, 0, 135, 0, 0, 115, 0, 0, 138, 0, 139, 0, 137, 133, 0,
+];
+
+/// Set-1 scancode (with the E0 "extended" flag) -> WINDOW_KEY_*.
+export fn window_w32_scancode_to_key(sc: int64, extended: bool) -> int32 {
+  if (!extended) {
+    if (sc >= 0 && sc < 128) { return (int32)SC_TO_HID[sc]; }
+    return 0;
+  }
+  switch (sc) {
+    case 0x1C: { return WINDOW_KEY_KP_ENTER; }
+    case 0x1D: { return WINDOW_KEY_RIGHT_CTRL; }
+    case 0x35: { return WINDOW_KEY_KP_DIVIDE; }
+    case 0x37: { return WINDOW_KEY_PRINT_SCREEN; }
+    case 0x38: { return WINDOW_KEY_RIGHT_ALT; }
+    case 0x45: { return WINDOW_KEY_NUM_LOCK; }
+    case 0x46: { return WINDOW_KEY_PAUSE; }
+    case 0x47: { return WINDOW_KEY_HOME; }
+    case 0x48: { return WINDOW_KEY_UP; }
+    case 0x49: { return WINDOW_KEY_PAGE_UP; }
+    case 0x4B: { return WINDOW_KEY_LEFT; }
+    case 0x4D: { return WINDOW_KEY_RIGHT; }
+    case 0x4F: { return WINDOW_KEY_END; }
+    case 0x50: { return WINDOW_KEY_DOWN; }
+    case 0x51: { return WINDOW_KEY_PAGE_DOWN; }
+    case 0x52: { return WINDOW_KEY_INSERT; }
+    case 0x53: { return WINDOW_KEY_DELETE; }
+    case 0x5B: { return WINDOW_KEY_LEFT_SUPER; }
+    case 0x5C: { return WINDOW_KEY_RIGHT_SUPER; }
+    case 0x5D: { return WINDOW_KEY_MENU; }
+    case 0x20: { return WINDOW_KEY_MUTE; }
+    case 0x2E: { return WINDOW_KEY_VOLUME_DOWN; }
+    case 0x30: { return WINDOW_KEY_VOLUME_UP; }
+    default: { return 0; }
+  }
+  return 0;
+}
+
+// The layout's key for a virtual-key code; 0 when it has none of its own.
+fn vk_to_key(vk: int64) -> int32 {
+  if (vk >= 0x41 && vk <= 0x5A) { return (int32)(WINDOW_KEY_A + vk - 0x41); }
+  if (vk >= 0x31 && vk <= 0x39) { return (int32)(WINDOW_KEY_1 + vk - 0x31); }
+  if (vk == 0x30) { return WINDOW_KEY_0; }
+  if (vk >= 0x70 && vk <= 0x7B) { return (int32)(WINDOW_KEY_F1 + vk - 0x70); }
+  if (vk >= 0x7C && vk <= 0x87) { return (int32)(WINDOW_KEY_F13 + vk - 0x7C); }
+  if (vk >= 0xBA && vk <= 0xE2) {
+    // OEM keys: ask the layout which character the key types.
+    var ch: int64 = (int64)window_w32_MapVirtualKeyW((uint32)vk, 2) & 0x7FFF;
+    if (ch >= 65 && ch <= 90) { ch = ch + 32; }
+    if (ch > 0 && ch < 128) { return window_keysym_to_key(ch); }
+  }
+  return 0;
+}
+
+fn key_held(vk: int32) -> bool { return ((int32)window_w32_GetKeyState(vk) & 0x8000) != 0; }
+
+fn cur_mods() -> int32 {
+  var m: int32 = 0;
+  if (key_held(16)) { m = m | WINDOW_MOD_SHIFT; }
+  if (key_held(17)) { m = m | WINDOW_MOD_CTRL; }
+  if (key_held(18)) { m = m | WINDOW_MOD_ALT; }
+  if (key_held(91) || key_held(92)) { m = m | WINDOW_MOD_SUPER; }
+  if (((int32)window_w32_GetKeyState(20) & 1) != 0) { m = m | WINDOW_MOD_CAPS_LOCK; }
+  if (((int32)window_w32_GetKeyState(144) & 1) != 0) { m = m | WINDOW_MOD_NUM_LOCK; }
+  if (key_held(17) && key_held(165)) { m = m | WINDOW_MOD_ALTGR; }
+  return m;
+}
+
+// ---------- DPI ----------
+fn window_dpi(hwnd: int64) -> int32 {
+  if (g_w.get_dpi_for_window != 0 && hwnd != 0) {
+    var f: fn(int64) -> uint32 = (fn(int64) -> uint32)g_w.get_dpi_for_window;
+    var d: int32 = (int32)f(hwnd);
+    if (d > 0) { return d; }
+  }
+  var hdc: int64 = window_w32_GetDC(0);
+  var d2: int32 = window_w32_GetDeviceCaps(hdc, 88);       // LOGPIXELSX
+  window_w32_ReleaseDC(0, hdc);
+  if (d2 <= 0) { d2 = 96; }
+  return d2;
+}
+
+fn outer_rect(x: WindowW32Win*, cw: int32, ch: int32, r: W32Rect*) {
+  r->left = 0; r->top = 0; r->right = cw; r->bottom = ch;
+  if (g_w.adjust_for_dpi != 0) {
+    var f: fn(W32Rect*, uint32, int32, uint32, uint32) -> int32 = (fn(W32Rect*, uint32, int32, uint32, uint32) -> int32)g_w.adjust_for_dpi;
+    f(r, x->style, 0, x->ex_style, (uint32)x->dpi);
+  } else {
+    window_w32_AdjustWindowRectEx(r, x->style, 0, x->ex_style);
+  }
+}
+
+fn to_px(v: int32, dpi: int32) -> int32 { return (int32)(((int64)v * (int64)dpi + 48) / 96); }
+fn to_logical(v: int32, dpi: int32) -> int32 {
+  var r: int32 = (int32)(((int64)v * 96 + (int64)dpi / 2) / (int64)dpi);
+  if (r < 1) { r = 1; }
+  return r;
+}
+
+// ---------- init ----------
+fn load_cursors() {
+  var ids: int64[11] = [32512, 32513, 32649, 32515, 32514, 32644, 32645, 32642, 32643, 32646, 32648];
+  for i in 0..11 { g_w.cursors[i] = window_w32_LoadCursorW(0, ids[i]); }
+}
+
+export fn window_w32_init() -> bool {
+  window_w32_QueryPerformanceFrequency(&g_w.qpc_freq);
+  var user32: int64 = window_w32_LoadLibraryA("user32.dll");
+  var set_ctx: int64 = window_w32_GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+  var aware: bool = false;
+  if (set_ctx != 0) {
+    var f: fn(int64) -> int32 = (fn(int64) -> int32)set_ctx;
+    aware = f(-4) != 0;                                     // PER_MONITOR_AWARE_V2
+  }
+  if (!aware) {
+    var shcore: int64 = window_w32_LoadLibraryA("shcore.dll");
+    var set_aw: int64 = 0;
+    if (shcore != 0) { set_aw = window_w32_GetProcAddress(shcore, "SetProcessDpiAwareness"); }
+    if (set_aw != 0) { var g: fn(int32) -> int32 = (fn(int32) -> int32)set_aw; g(2); }
+    else {
+      var old: int64 = window_w32_GetProcAddress(user32, "SetProcessDPIAware");
+      if (old != 0) { var h: fn() -> int32 = (fn() -> int32)old; h(); }
+    }
+  }
+  g_w.get_dpi_for_window = window_w32_GetProcAddress(user32, "GetDpiForWindow");
+  g_w.adjust_for_dpi = window_w32_GetProcAddress(user32, "AdjustWindowRectExForDpi");
+  var sh: int64 = window_w32_LoadLibraryA("shcore.dll");
+  if (sh != 0) { g_w.get_dpi_for_monitor = window_w32_GetProcAddress(sh, "GetDpiForMonitor"); }
+  g_w.instance = window_w32_GetModuleHandleW((uint16*)0);
+  load_cursors();
+  var cname: string = "MettleWindow";
+  var cls: uint16* = window_w32_wide(cname.chars, (int64)cname.length);
+  var wc: W32WndClassExW;
+  wc.cb_size = 80;
+  wc.style = 3 | 32;                                       // CS_HREDRAW | CS_VREDRAW | CS_OWNDC (for GL)
+  wc.wnd_proc = &wnd_proc;
+  wc.instance = g_w.instance;
+  wc.class_name = cls;
+  g_w.class_atom = window_w32_RegisterClassExW(&wc);
+  free(cls);
+  if (g_w.class_atom == (uint16)0) { window_set_error("RegisterClassExW failed"); return false; }
+  window_w32_wake_init();
+  return true;
+}
+
+/// Makes the event window_wake signals (the headless backend uses it too).
+export fn window_w32_wake_init() {
+  if (g_w.wake_event == 0) { g_w.wake_event = window_w32_CreateEventW((rawptr)0, 0, 0, (uint16*)0); }
+}
+
+export fn window_w32_shutdown() {
+  if (g_w.wake_event != 0) { window_w32_CloseHandle(g_w.wake_event); g_w.wake_event = 0; }
+  window_w32_ClipCursor((W32Rect*)0);
+}
+
+export fn window_w32_wake() { if (g_w.wake_event != 0) { window_w32_SetEvent(g_w.wake_event); } }
+
+// ---------- monitors ----------
+fn mon_cb(hmon: int64, hdc: int64, rect: rawptr, data: int64) -> int32 {
+  if (g_mon_n >= 32) { return 0; }
+  var info: W32MonitorInfoEx;
+  info.cb_size = 104;
+  if (window_w32_GetMonitorInfoW(hmon, &info) == 0) { return 1; }
+  var m: WindowMonitor;
+  var z: WindowMonitor;
+  m = z;
+  m.x = info.monitor.left; m.y = info.monitor.top;
+  m.w = info.monitor.right - info.monitor.left; m.h = info.monitor.bottom - info.monitor.top;
+  m.work_x = info.work.left; m.work_y = info.work.top;
+  m.work_w = info.work.right - info.work.left; m.work_h = info.work.bottom - info.work.top;
+  m.primary = (info.flags & (uint32)1) != (uint32)0;
+  m.id = hmon;
+  m.scale = 1.0;
+  if (g_w.get_dpi_for_monitor != 0) {
+    var dx: uint32 = 0;
+    var dy: uint32 = 0;
+    var f: fn(int64, int32, uint32*, uint32*) -> int32 = (fn(int64, int32, uint32*, uint32*) -> int32)g_w.get_dpi_for_monitor;
+    if (f(hmon, 0, &dx, &dy) == 0 && dx > (uint32)0) { m.scale = (float32)dx / 96.0; }
+  }
+  var dm: uint8[220];
+  window_zero(&dm[0], 220);
+  window_wr16(&dm[0], 68, 220);
+  m.refresh_mhz = 60000;
+  if (window_w32_EnumDisplaySettingsW(&info.device[0], 0xFFFFFFFF, &dm[0]) != 0) {
+    var hz: int64 = window_rd32(&dm[0], 184);
+    if (hz > 1 && hz < 1000) { m.refresh_mhz = (int32)(hz * 1000); }
+  }
+  var nb: uint8[100];
+  var at: int64 = 0;
+  var dn: int64 = 0;
+  while (dn < 32 && info.device[dn] != (uint16)0) { dn = dn + 1; }
+  var nl: int64 = narrow(&info.device[0], dn, &nb[0], -1, &at);
+  if (nl > 63) { nl = 63; }
+  for k: int64 in 0..nl { m.name[k] = nb[k]; }
+  m.name_len = (int32)nl;
+  g_mon_list[g_mon_n] = m;
+  g_mon_n = g_mon_n + 1;
+  return 1;
+}
+
+export fn window_w32_refresh_monitors() {
+  g_mon_list = (WindowMonitor*)malloc(32 * (int64)sizeof(WindowMonitor));
+  g_mon_n = 0;
+  window_w32_EnumDisplayMonitors(0, (W32Rect*)0, &mon_cb, 0);
+  if (g_mon_n == 0) {
+    var m: WindowMonitor;
+    var z: WindowMonitor;
+    m = z;
+    m.w = window_w32_GetSystemMetrics(0); m.h = window_w32_GetSystemMetrics(1);
+    m.work_w = m.w; m.work_h = m.h; m.scale = 1.0; m.primary = true; m.refresh_mhz = 60000;
+    g_mon_list[0] = m;
+    g_mon_n = 1;
+  }
+  window_set_monitors(g_mon_list, g_mon_n);
+  g_mon_list = (WindowMonitor*)0;
+}
+
+// ---------- events ----------
+fn push(w: Window*, kind: int32) { var ev: WindowEvent; ev.kind = kind; ev.win = w; window_push_event(&ev); }
+
+fn client_size_event(w: Window*, pw: int32, ph: int32) {
+  var x: WindowW32Win* = ww(w);
+  if (pw <= 0 || ph <= 0) { return; }
+  var ev: WindowEvent;
+  ev.kind = WINDOW_EV_RESIZE; ev.win = w;
+  ev.fb_w = pw; ev.fb_h = ph;
+  ev.w = to_logical(pw, x->dpi); ev.h = to_logical(ph, x->dpi);
+  window_push_event(&ev);
+}
+
+fn mouse(w: Window*, kind: int32, button: int32, lparam: int64) {
+  var x: WindowW32Win* = ww(w);
+  var ev: WindowEvent;
+  ev.kind = kind; ev.win = w; ev.button = button; ev.mods = cur_mods();
+  ev.x = (float64)slo16(lparam) * 96.0 / (float64)x->dpi;
+  ev.y = (float64)shi16(lparam) * 96.0 / (float64)x->dpi;
+  window_push_event(&ev);
+}
+
+fn button(w: Window*, hwnd: int64, b: int32, down: bool, lparam: int64) {
+  if (down) {
+    if (w->buttons == 0) { window_w32_SetCapture(hwnd); }
+    mouse(w, WINDOW_EV_MOUSE_DOWN, b, lparam);
+  } else {
+    mouse(w, WINDOW_EV_MOUSE_UP, b, lparam);
+    if (w->buttons == 0) { window_w32_ReleaseCapture(); }
+  }
+}
+
+fn key_msg(w: Window*, wparam: int64, lparam: int64, down: bool) {
+  var sc: int64 = (lparam >> 16) & 0xFF;
+  var ext: bool = ((lparam >> 24) & 1) != 0;
+  var vk: int64 = wparam;
+  // AltGr arrives as a fake Left Ctrl followed by Right Alt: drop the fake Ctrl.
+  if (vk == 17 && !ext) {
+    var next: W32Msg;
+    if (window_w32_PeekMessageW(&next, 0, 0, 0, 0) != 0) {
+      if ((next.message == (uint32)256 || next.message == (uint32)257 || next.message == (uint32)260 || next.message == (uint32)261) && next.wparam == 18 && ((next.lparam >> 24) & 1) != 0) {
+        return;
+      }
+    }
+  }
+  var ev: WindowEvent;
+  ev.win = w;
+  ev.kind = WINDOW_EV_KEY_UP;
+  if (down) { ev.kind = WINDOW_EV_KEY_DOWN; ev.repeat = ((lparam >> 30) & 1) != 0; }
+  if (sc == 0) { sc = (int64)window_w32_MapVirtualKeyW((uint32)vk, 0); }
+  ev.scancode = window_w32_scancode_to_key(sc, ext);
+  ev.key = vk_to_key(vk);
+  if (ev.key == 0) { ev.key = ev.scancode; }
+  if (ev.scancode == 0) { ev.scancode = ev.key; }
+  ev.mods = cur_mods();
+  if (!down && ev.scancode == WINDOW_KEY_PRINT_SCREEN && !w->keys[WINDOW_KEY_PRINT_SCREEN]) {
+    // Print Screen sends only a key-up: give it its key-down first.
+    var dn: WindowEvent = ev;
+    dn.kind = WINDOW_EV_KEY_DOWN;
+    window_push_event(&dn);
+  }
+  window_push_event(&ev);
+}
+
+fn character(w: Window*, wparam: int64) {
+  var x: WindowW32Win* = ww(w);
+  if (!w->text_input) { return; }
+  var u: uint32 = (uint32)(wparam & 0xFFFF);
+  if (u >= (uint32)0xD800 && u < (uint32)0xDC00) { x->hi_surrogate = u; return; }
+  var cp: uint32 = u;
+  if (u >= (uint32)0xDC00 && u < (uint32)0xE000) {
+    if (x->hi_surrogate == (uint32)0) { return; }
+    cp = (uint32)0x10000 + ((x->hi_surrogate - (uint32)0xD800) << 10) + (u - (uint32)0xDC00);
+  }
+  x->hi_surrogate = (uint32)0;
+  if (cp < (uint32)32 || cp == (uint32)127) { return; }
+  var mods: int32 = cur_mods();
+  // Ctrl shortcuts make no text; Ctrl+Alt is AltGr and does.
+  if ((mods & WINDOW_MOD_CTRL) != 0 && (mods & WINDOW_MOD_ALT) == 0) { return; }
+  window_push_codepoint(w, cp, 0, mods);
+}
+
+fn ime_string(hwnd: int64, kind: uint32, out: uint8*, cursor: int32*) -> int64 {
+  var himc: int64 = window_w32_ImmGetContext(hwnd);
+  if (himc == 0) { return 0; }
+  var bytes: int32 = window_w32_ImmGetCompositionStringW(himc, kind, (rawptr)0, 0);
+  var n: int64 = 0;
+  if (bytes > 0 && bytes < 4096) {
+    var buf: uint16* = (uint16*)malloc((int64)bytes + 2);
+    window_w32_ImmGetCompositionStringW(himc, kind, (rawptr)buf, (uint32)bytes);
+    var units: int64 = (int64)bytes / 2;
+    var cpos: int64 = -1;
+    if (cursor != 0) {
+      cpos = (int64)window_w32_ImmGetCompositionStringW(himc, 0x80, (rawptr)0, 0);   // GCS_CURSORPOS
+      if (cpos < 0 || cpos > units) { cpos = units; }
+    }
+    var at: int64 = 0;
+    if (units > 1000) { units = 1000; }
+    n = narrow(buf, units, out, cpos, &at);
+    if (cursor != 0) { *cursor = (int32)at; }
+    free(buf);
+  }
+  window_w32_ImmReleaseContext(hwnd, himc);
+  return n;
+}
+
+fn ime_place(w: Window*) {
+  var x: WindowW32Win* = ww(w);
+  var himc: int64 = window_w32_ImmGetContext(x->hwnd);
+  if (himc == 0) { return; }
+  var cf: W32CompositionForm;
+  cf.style = 2;                                              // CFS_POINT
+  cf.pos.x = x->ime_rect.left; cf.pos.y = x->ime_rect.top;
+  window_w32_ImmSetCompositionWindow(himc, &cf);
+  var cand: W32CandidateForm;
+  cand.index = 0;
+  cand.style = 0x80;                                         // CFS_EXCLUDE
+  cand.pos.x = x->ime_rect.left; cand.pos.y = x->ime_rect.bottom;
+  cand.area = x->ime_rect;
+  window_w32_ImmSetCandidateWindow(himc, &cand);
+  window_w32_ImmReleaseContext(x->hwnd, himc);
+}
+
+fn raw_input(w: Window*, lparam: int64) {
+  var buf: uint8[64];
+  var size: uint32 = 64;
+  // RAWINPUT: header (24 bytes on 64-bit), then RAWMOUSE: usFlags u16, pad,
+  // buttons u32, ulRawButtons u32, lLastX i32 @12, lLastY i32 @16.
+  if (window_w32_GetRawInputData(lparam, 0x10000003, (rawptr)&buf[0], &size, 24) == 0xFFFFFFFF) { return; }
+  if (window_rd32(&buf[0], 0) != 0) { return; }             // RIM_TYPEMOUSE
+  var flags: int64 = window_rd16(&buf[0], 24);
+  if ((flags & 1) != 0) { return; }                         // absolute (remote desktop, pens): skip
+  var dx: int64 = window_rds32(&buf[0], 36);
+  var dy: int64 = window_rds32(&buf[0], 40);
+  if (dx == 0 && dy == 0) { return; }
+  var ev: WindowEvent;
+  ev.kind = WINDOW_EV_RAW_MOTION; ev.win = w; ev.dx = (float64)dx; ev.dy = (float64)dy;
+  window_push_event(&ev);
+}
+
+fn clip_to_client(w: Window*) {
+  var x: WindowW32Win* = ww(w);
+  var r: W32Rect;
+  window_w32_GetClientRect(x->hwnd, &r);
+  var a: W32Point; a.x = r.left; a.y = r.top;
+  var b: W32Point; b.x = r.right; b.y = r.bottom;
+  window_w32_ClientToScreen(x->hwnd, &a);
+  window_w32_ClientToScreen(x->hwnd, &b);
+  var s: W32Rect; s.left = a.x; s.top = a.y; s.right = b.x; s.bottom = b.y;
+  window_w32_ClipCursor(&s);
+}
+
+fn apply_cursor_mode(w: Window*) {
+  if (w->cursor_mode == WINDOW_CURSOR_LOCKED || w->cursor_mode == WINDOW_CURSOR_CONFINED) {
+    if (w->focused) { clip_to_client(w); }
+  } else {
+    window_w32_ClipCursor((W32Rect*)0);
+  }
+}
+
+fn cursor_for(w: Window*) -> int64 {
+  if (w->cursor_mode == WINDOW_CURSOR_HIDDEN || w->cursor_mode == WINDOW_CURSOR_LOCKED) { return 0; }
+  if (ww(w)->cursor_img != 0) { return ww(w)->cursor_img; }
+  return g_w.cursors[w->cursor_shape];
+}
+
+fn paint(w: Window*, hdc: int64) {
+  var x: WindowW32Win* = ww(w);
+  if (x->px == 0) { return; }
+  var bmi: W32Bmi;
+  bmi.size = 40;
+  bmi.width = x->px_w;
+  bmi.height = 0 - x->px_h;
+  bmi.planes = (uint16)1;
+  bmi.bit_count = (uint16)32;
+  window_w32_SetDIBitsToDevice(hdc, 0, 0, (uint32)x->px_w, (uint32)x->px_h, 0, 0, 0, (uint32)x->px_h, (rawptr)x->px, &bmi, 0);
+}
+
+fn wnd_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  var w: Window* = window_w32_find(hwnd);
+  if (w == 0) { return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam); }
+  var x: WindowW32Win* = ww(w);
+  switch ((int32)msg) {
+    case 3: {    // WM_MOVE: client-area origin in screen coordinates
+      if (window_w32_IsIconic(hwnd) == 0) {
+        var ev: WindowEvent; ev.kind = WINDOW_EV_MOVE; ev.win = w; ev.x = (float64)slo16(lparam); ev.y = (float64)shi16(lparam);
+        window_push_event(&ev);
+      }
+      return 0;
+    }
+    case 5: {    // WM_SIZE
+      if (wparam == 1) { if (!w->minimized) { push(w, WINDOW_EV_MINIMIZE); } return 0; }
+      if (wparam == 2 && !w->maximized) { push(w, WINDOW_EV_MAXIMIZE); }
+      if (wparam == 0 && (w->maximized || w->minimized)) { push(w, WINDOW_EV_RESTORE); }
+      client_size_event(w, lo16(lparam), hi16(lparam));
+      if (w->cursor_mode == WINDOW_CURSOR_LOCKED || w->cursor_mode == WINDOW_CURSOR_CONFINED) { apply_cursor_mode(w); }
+      return 0;
+    }
+    case 15: {   // WM_PAINT
+      var ps: W32Paint;
+      var hdc: int64 = window_w32_BeginPaint(hwnd, &ps);
+      paint(w, hdc);
+      window_w32_EndPaint(hwnd, &ps);
+      w->redraw = true;
+      return 0;
+    }
+    case 20: { return 1; }                                   // WM_ERASEBKGND: we draw everything
+    case 16: { push(w, WINDOW_EV_CLOSE); return 0; }         // WM_CLOSE
+    case 24: {                                               // WM_SHOWWINDOW
+      if (wparam != 0) { push(w, WINDOW_EV_SHOWN); } else { push(w, WINDOW_EV_HIDDEN); }
+      return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    case 7: { push(w, WINDOW_EV_FOCUS_IN); apply_cursor_mode(w); return 0; }    // WM_SETFOCUS
+    case 8: { push(w, WINDOW_EV_FOCUS_OUT); window_w32_ClipCursor((W32Rect*)0); return 0; }   // WM_KILLFOCUS
+    case 512: {  // WM_MOUSEMOVE
+      if (!x->tracking) {
+        var t: W32TrackMouse;
+        t.cb_size = 24; t.flags = 2; t.hwnd = hwnd; t.hover_time = 0;
+        window_w32_TrackMouseEvent(&t);
+        x->tracking = true;
+        mouse(w, WINDOW_EV_MOUSE_ENTER, 0, lparam);
+      }
+      mouse(w, WINDOW_EV_MOUSE_MOVE, 0, lparam);
+      return 0;
+    }
+    case 675: { x->tracking = false; push(w, WINDOW_EV_MOUSE_LEAVE); return 0; }   // WM_MOUSELEAVE
+    case 513: { button(w, hwnd, WINDOW_BUTTON_LEFT, true, lparam); return 0; }
+    case 514: { button(w, hwnd, WINDOW_BUTTON_LEFT, false, lparam); return 0; }
+    case 516: { button(w, hwnd, WINDOW_BUTTON_RIGHT, true, lparam); return 0; }
+    case 517: { button(w, hwnd, WINDOW_BUTTON_RIGHT, false, lparam); return 0; }
+    case 519: { button(w, hwnd, WINDOW_BUTTON_MIDDLE, true, lparam); return 0; }
+    case 520: { button(w, hwnd, WINDOW_BUTTON_MIDDLE, false, lparam); return 0; }
+    case 523: {  // WM_XBUTTONDOWN
+      var xb: int32 = WINDOW_BUTTON_X1;
+      if (hi16(wparam) == 2) { xb = WINDOW_BUTTON_X2; }
+      button(w, hwnd, xb, true, lparam);
+      return 1;
+    }
+    case 524: {
+      var xb2: int32 = WINDOW_BUTTON_X1;
+      if (hi16(wparam) == 2) { xb2 = WINDOW_BUTTON_X2; }
+      button(w, hwnd, xb2, false, lparam);
+      return 1;
+    }
+    case 522:
+    case 526: {  // WM_MOUSEWHEEL / WM_MOUSEHWHEEL: lparam is in screen coordinates
+      var pt: W32Point;
+      pt.x = slo16(lparam); pt.y = shi16(lparam);
+      window_w32_ScreenToClient(hwnd, &pt);
+      var we: WindowEvent;
+      we.kind = WINDOW_EV_SCROLL; we.win = w; we.mods = cur_mods();
+      we.x = (float64)pt.x * 96.0 / (float64)x->dpi; we.y = (float64)pt.y * 96.0 / (float64)x->dpi;
+      var steps: float64 = (float64)shi16(wparam) / 120.0;
+      if (msg == (uint32)522) { we.dy = steps; } else { we.dx = steps; }
+      window_push_event(&we);
+      return 0;
+    }
+    case 255: {  // WM_INPUT
+      if (w->cursor_mode == WINDOW_CURSOR_LOCKED) { raw_input(w, lparam); }
+      return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    case 256:
+    case 260: {  // WM_KEYDOWN / WM_SYSKEYDOWN
+      key_msg(w, wparam, lparam, true);
+      if (msg == (uint32)260) { return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam); }   // Alt+F4 and the menu
+      return 0;
+    }
+    case 257:
+    case 261: {  // WM_KEYUP / WM_SYSKEYUP
+      key_msg(w, wparam, lparam, false);
+      if (msg == (uint32)261) { return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam); }
+      return 0;
+    }
+    case 258: { character(w, wparam); return 0; }   // WM_CHAR
+    case 262: { return 0; }                                  // WM_SYSCHAR: no menu beep
+    case 0x10D: { x->composing = true; ime_place(w); return 0; }   // WM_IME_STARTCOMPOSITION
+    case 0x10E: {                                            // WM_IME_ENDCOMPOSITION
+      x->composing = false;
+      push(w, WINDOW_EV_PREEDIT);
+      return 0;
+    }
+    case 0x10F: {                                            // WM_IME_COMPOSITION
+      var text: uint8[3004];
+      if ((lparam & 0x800) != 0) {                           // GCS_RESULTSTR
+        var n: int64 = ime_string(hwnd, 0x800, &text[0], (int32*)0);
+        var at: int64 = 0;
+        while (at < n) {
+          var take: int64 = n - at;
+          if (take > 60) { take = window_utf8_valid_prefix(&text[at], 60); }
+          if (take <= 0) { break; }
+          var te: WindowEvent; te.kind = WINDOW_EV_TEXT; te.win = w;
+          window_event_set_text(&te, &text[at], take);
+          window_push_event(&te);
+          at = at + take;
+        }
+      }
+      if ((lparam & 0x8) != 0) {                             // GCS_COMPSTR
+        var cur: int32 = 0;
+        var n2: int64 = ime_string(hwnd, 0x8, &text[0], &cur);
+        var pe: WindowEvent; pe.kind = WINDOW_EV_PREEDIT; pe.win = w;
+        window_event_set_text(&pe, &text[0], n2);
+        pe.cursor = cur;
+        window_push_event(&pe);
+      }
+      return 0;
+    }
+    case 0x281: {                                            // WM_IME_SETCONTEXT: we draw the pre-edit
+      return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam & ~0xC000000F);
+    }
+    case 32: {   // WM_SETCURSOR
+      if ((lparam & 0xFFFF) == 1) { window_w32_SetCursor(cursor_for(w)); return 1; }
+      return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    case 36: {   // WM_GETMINMAXINFO
+      var mm: int32* = (int32*)lparam;
+      var r: W32Rect;
+      if (x->min_w > 0 || x->min_h > 0) {
+        outer_rect(x, to_px(x->min_w, x->dpi), to_px(x->min_h, x->dpi), &r);
+        mm[6] = r.right - r.left; mm[7] = r.bottom - r.top;
+      }
+      if (x->max_w > 0 || x->max_h > 0) {
+        var mw: int32 = 32767; var mh: int32 = 32767;
+        if (x->max_w > 0) { mw = to_px(x->max_w, x->dpi); }
+        if (x->max_h > 0) { mh = to_px(x->max_h, x->dpi); }
+        outer_rect(x, mw, mh, &r);
+        mm[8] = r.right - r.left; mm[9] = r.bottom - r.top;
+      }
+      return 0;
+    }
+    case 736: {  // WM_DPICHANGED
+      var nd: int32 = lo16(wparam);
+      if (nd > 0 && nd != x->dpi) {
+        x->dpi = nd;
+        var se: WindowEvent; se.kind = WINDOW_EV_SCALE; se.win = w; se.scale = (float32)nd / 96.0;
+        window_push_event(&se);
+      }
+      var sr: W32Rect* = (W32Rect*)lparam;
+      if (w->fullscreen == WINDOW_WINDOWED) {
+        window_w32_SetWindowPos(hwnd, 0, sr->left, sr->top, sr->right - sr->left, sr->bottom - sr->top, 0x14);
+      }
+      return 0;
+    }
+    case 0x233: { drop_files(w, wparam); return 0; }        // WM_DROPFILES
+    case 0x7E: {                                             // WM_DISPLAYCHANGE
+      window_w32_refresh_monitors();
+      push((Window*)0, WINDOW_EV_MONITORS);
+      return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    default: { }
+  }
+  return window_w32_DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+// Files dropped from Explorer (DragAcceptFiles / WM_DROPFILES): one path per line.
+fn drop_files(w: Window*, hdrop: int64) {
+  var x: WindowW32Win* = ww(w);
+  var n: uint32 = window_w32_DragQueryFileW(hdrop, 0xFFFFFFFF, (uint16*)0, 0);
+  if (n > (uint32)4096) { n = 4096; }
+  var cap: int64 = 4096;
+  var out: uint8* = (uint8*)malloc(cap + 1);
+  var len: int64 = 0;
+  for i: uint32 in 0..n {
+    var units: uint32 = window_w32_DragQueryFileW(hdrop, i, (uint16*)0, 0);
+    if (units == (uint32)0 || units > (uint32)32767) { continue; }
+    var wb: uint16* = (uint16*)malloc(((int64)units + 1) * 2);
+    window_w32_DragQueryFileW(hdrop, i, wb, units + 1);
+    var need: int64 = len + (int64)units * 3 + 2;
+    if (need > cap) {
+      var nc: int64 = need * 2;
+      var nb: uint8* = (uint8*)malloc(nc + 1);
+      for k: int64 in 0..len { nb[k] = out[k]; }
+      free(out);
+      out = nb;
+      cap = nc;
+    }
+    if (len > 0) { out[len] = (uint8)10; len = len + 1; }
+    var at: int64 = 0;
+    len = len + narrow(wb, (int64)units, &out[len], -1, &at);
+    free(wb);
+  }
+  out[len] = (uint8)0;
+  var pt: W32Point;
+  window_w32_DragQueryPoint(hdrop, &pt);
+  window_w32_DragFinish(hdrop);
+  var ev: WindowEvent;
+  ev.kind = WINDOW_EV_DROP_FILES; ev.win = w;
+  ev.x = (float64)pt.x * 96.0 / (float64)x->dpi; ev.y = (float64)pt.y * 96.0 / (float64)x->dpi;
+  ev.data = out; ev.data_len = len;
+  if (g_window.drop_data != 0) { free(g_window.drop_data); }
+  g_window.drop_data = out;
+  window_push_event(&ev);
+}
+
+// ---------- create / destroy ----------
+export fn window_w32_create(w: Window*, cfg: WindowConfig*) -> bool {
+  var x: WindowW32Win* = new WindowW32Win;
+  w->plat = (rawptr)x;
+  w->text_input = true;
+  x->min_w = cfg->min_w; x->min_h = cfg->min_h; x->max_w = cfg->max_w; x->max_h = cfg->max_h;
+  x->style = 0x00CF0000;                                     // WS_OVERLAPPEDWINDOW
+  if (!cfg->decorated) { x->style = 0x80000000 | 0x00080000 | 0x00020000; }   // POPUP | SYSMENU | MINIMIZEBOX
+  if (!cfg->resizable) { x->style = x->style & ~(uint32)0x50000; }
+  x->style = x->style | (uint32)0x06000000;                  // CLIPCHILDREN | CLIPSIBLINGS (GL)
+  x->ex_style = 0x40000;                                     // WS_EX_APPWINDOW
+  if (cfg->floating) { x->ex_style = x->ex_style | (uint32)8; }   // WS_EX_TOPMOST
+  // Pick the monitor first, for its DPI and for centring.
+  var mon: WindowMonitor;
+  var have_mon: bool = g_window.monitor_count > 0;
+  if (have_mon) {
+    var mi: int32 = cfg->monitor;
+    if (mi < 0 || mi >= g_window.monitor_count) {
+      mi = 0;
+      for i in 0..g_window.monitor_count { if (g_window.monitors[i].primary) { mi = (int32)i; } }
+    }
+    mon = g_window.monitors[mi];
+  }
+  x->dpi = 96;
+  if (have_mon && cfg->hidpi) { x->dpi = (int32)(mon.scale * 96.0 + 0.5); }
+  var cw: int32 = cfg->w;
+  var ch: int32 = cfg->h;
+  if (cfg->hidpi) { cw = to_px(cw, x->dpi); ch = to_px(ch, x->dpi); }
+  var r: W32Rect;
+  outer_rect(x, cw, ch, &r);
+  var ow: int32 = r.right - r.left;
+  var oh: int32 = r.bottom - r.top;
+  var px: int32 = (int32)0x80000000;                         // CW_USEDEFAULT
+  var py: int32 = (int32)0x80000000;
+  if (cfg->x == WINDOW_POS_CENTER && have_mon) { px = mon.work_x + (mon.work_w - ow) / 2; }
+  else if (cfg->x != WINDOW_POS_ANY && cfg->x != WINDOW_POS_CENTER) { px = cfg->x + r.left; }
+  if (cfg->y == WINDOW_POS_CENTER && have_mon) { py = mon.work_y + (mon.work_h - oh) / 2; }
+  else if (cfg->y != WINDOW_POS_ANY && cfg->y != WINDOW_POS_CENTER) { py = cfg->y + r.top; }
+  var title: uint16* = window_w32_wide(cfg->title.chars, (int64)cfg->title.length);
+  x->hwnd = window_w32_CreateWindowExW(x->ex_style, (uint16*)(int64)g_w.class_atom, title, x->style, px, py, ow, oh, 0, 0, g_w.instance, 0);
+  free(title);
+  if (x->hwnd == 0) {
+    window_set_error("CreateWindowExW failed");
+    free(x);
+    w->plat = (rawptr)0;
+    return false;
+  }
+  // The window's real DPI decides the size (the monitor may differ from the guess).
+  var real: int32 = window_dpi(x->hwnd);
+  if (real != x->dpi && cfg->hidpi) {
+    x->dpi = real;
+    cw = to_px(cfg->w, real); ch = to_px(cfg->h, real);
+    outer_rect(x, cw, ch, &r);
+    window_w32_SetWindowPos(x->hwnd, 0, 0, 0, r.right - r.left, r.bottom - r.top, 0x16);
+  } else {
+    x->dpi = real;
+  }
+  if (!cfg->hidpi) { x->dpi = 96; }
+  w->scale = (float32)x->dpi / 96.0;
+  var rc: W32Rect;
+  window_w32_GetClientRect(x->hwnd, &rc);
+  w->fb_w = rc.right - rc.left; w->fb_h = rc.bottom - rc.top;
+  if (w->fb_w < 1) { w->fb_w = 1; }
+  if (w->fb_h < 1) { w->fb_h = 1; }
+  w->w = to_logical(w->fb_w, x->dpi); w->h = to_logical(w->fb_h, x->dpi);
+  var org: W32Point;
+  window_w32_ClientToScreen(x->hwnd, &org);
+  w->x = org.x; w->y = org.y;
+  window_w32_DragAcceptFiles(x->hwnd, 1);
+  if (cfg->fullscreen != WINDOW_WINDOWED) { window_w32_set_fullscreen(w, cfg->fullscreen, cfg->monitor); }
+  if (cfg->visible) {
+    var cmd: int32 = 5;                                      // SW_SHOW
+    if (cfg->maximized) { cmd = 3; }
+    if (!cfg->focused) { cmd = 8; }                          // SW_SHOWNA
+    window_w32_ShowWindow(x->hwnd, cmd);
+    window_w32_UpdateWindow(x->hwnd);
+    if (cfg->focused) { window_w32_focus(w); }
+  }
+  return true;
+}
+
+export fn window_w32_destroy(w: Window*) {
+  var x: WindowW32Win* = ww(w);
+  if (x == 0) { return; }
+  if (w->cursor_mode != WINDOW_CURSOR_NORMAL) { window_w32_ClipCursor((W32Rect*)0); }
+  window_w32_DestroyWindow(x->hwnd);
+  if (x->px != 0) { free(x->px); }
+  if (x->cursor_img != 0) { window_w32_DestroyIcon(x->cursor_img); }
+  if (x->icon != 0) { window_w32_DestroyIcon(x->icon); }
+  free(x);
+  w->plat = (rawptr)0;
+}
+
+export fn window_w32_pump(timeout_ms: int32) {
+  var msg: W32Msg;
+  var any: bool = false;
+  while (window_w32_PeekMessageW(&msg, 0, 0, 0, 1) != 0) {
+    window_w32_TranslateMessage(&msg);
+    window_w32_DispatchMessageW(&msg);
+    any = true;
+  }
+  if (any || timeout_ms == 0 || g_window.q_tail != g_window.q_head) { return; }
+  var ms: uint32 = 0xFFFFFFFF;
+  if (timeout_ms > 0) { ms = (uint32)timeout_ms; }
+  var h: int64[1];
+  h[0] = g_w.wake_event;
+  var r: uint32 = window_w32_MsgWaitForMultipleObjectsEx(1, &h[0], ms, 0x4FF, 4);   // QS_ALLINPUT, MWMO_INPUTAVAILABLE
+  if (r == (uint32)0) { push((Window*)0, WINDOW_EV_WAKE); }
+  while (window_w32_PeekMessageW(&msg, 0, 0, 0, 1) != 0) {
+    window_w32_TranslateMessage(&msg);
+    window_w32_DispatchMessageW(&msg);
+  }
+}
+
+// ---------- window operations ----------
+export fn window_w32_set_title(w: Window*, s: string) {
+  var t: uint16* = window_w32_wide(s.chars, (int64)s.length);
+  window_w32_SetWindowTextW(ww(w)->hwnd, t);
+  free(t);
+}
+
+export fn window_w32_set_size(w: Window*, width: int32, height: int32) {
+  var x: WindowW32Win* = ww(w);
+  var r: W32Rect;
+  outer_rect(x, to_px(width, x->dpi), to_px(height, x->dpi), &r);
+  window_w32_SetWindowPos(x->hwnd, 0, 0, 0, r.right - r.left, r.bottom - r.top, 0x16);   // NOMOVE|NOZORDER|NOACTIVATE
+}
+
+export fn window_w32_set_position(w: Window*, px: int32, py: int32) {
+  var x: WindowW32Win* = ww(w);
+  var r: W32Rect;
+  outer_rect(x, 1, 1, &r);
+  window_w32_SetWindowPos(x->hwnd, 0, px + r.left, py + r.top, 0, 0, 0x15);   // NOSIZE|NOZORDER|NOACTIVATE
+}
+
+export fn window_w32_set_size_limits(w: Window*, a: int32, b: int32, c: int32, d: int32) {
+  var x: WindowW32Win* = ww(w);
+  x->min_w = a; x->min_h = b; x->max_w = c; x->max_h = d;
+  var r: W32Rect;
+  window_w32_GetWindowRect(x->hwnd, &r);
+  window_w32_SetWindowPos(x->hwnd, 0, r.left, r.top, r.right - r.left, r.bottom - r.top, 0x14);
+}
+
+export fn window_w32_set_visible(w: Window*, on: bool) {
+  var cmd: int32 = 0;
+  if (on) { cmd = 5; }
+  window_w32_ShowWindow(ww(w)->hwnd, cmd);
+}
+
+export fn window_w32_minimize(w: Window*) { window_w32_ShowWindow(ww(w)->hwnd, 6); }
+export fn window_w32_maximize(w: Window*) { window_w32_ShowWindow(ww(w)->hwnd, 3); }
+export fn window_w32_restore(w: Window*) { window_w32_ShowWindow(ww(w)->hwnd, 9); }
+
+export fn window_w32_focus(w: Window*) {
+  var h: int64 = ww(w)->hwnd;
+  window_w32_BringWindowToTop(h);
+  window_w32_SetForegroundWindow(h);
+  window_w32_SetFocus(h);
+}
+
+export fn window_w32_attention(w: Window*) {
+  var f: W32FlashInfo;
+  f.cb_size = 32; f.hwnd = ww(w)->hwnd; f.flags = 3 | 12; f.count = 0; f.timeout = 0;   // FLASHW_ALL | FLASHW_TIMERNOFG
+  window_w32_FlashWindowEx(&f);
+}
+
+export fn window_w32_set_fullscreen(w: Window*, mode: int32, monitor: int32) {
+  var x: WindowW32Win* = ww(w);
+  if (mode != WINDOW_WINDOWED) {
+    if (w->fullscreen == WINDOW_WINDOWED) {
+      x->saved_style = x->style;
+      window_w32_GetWindowRect(x->hwnd, &x->saved_rect);
+    }
+    var m: WindowMonitor;
+    var mi: int32 = monitor;
+    if (mi < 0 || mi >= g_window.monitor_count) {
+      var hm: int64 = window_w32_MonitorFromWindow(x->hwnd, 2);
+      mi = 0;
+      for i in 0..g_window.monitor_count { if (g_window.monitors[i].id == hm) { mi = (int32)i; } }
+    }
+    if (g_window.monitor_count == 0) { return; }
+    m = g_window.monitors[mi];
+    x->style = (x->saved_style & ~(uint32)0x00CF0000) | (uint32)0x80000000 | (uint32)0x10000000;   // POPUP | VISIBLE
+    window_w32_SetWindowLongPtrW(x->hwnd, -16, (int64)x->style);
+    window_w32_SetWindowPos(x->hwnd, 0, m.x, m.y, m.w, m.h, 0x20 | 0x200 | 0x40);   // FRAMECHANGED | NOOWNERZORDER | SHOWWINDOW
+  } else if (w->fullscreen != WINDOW_WINDOWED) {
+    x->style = x->saved_style;
+    window_w32_SetWindowLongPtrW(x->hwnd, -16, (int64)x->style);
+    var r: W32Rect = x->saved_rect;
+    window_w32_SetWindowPos(x->hwnd, 0, r.left, r.top, r.right - r.left, r.bottom - r.top, 0x20 | 0x200 | 0x40);
+  }
+  w->fullscreen = mode;
+}
+
+// An icon or cursor from RGBA pixels (CreateIconIndirect with a 32-bit DIB).
+fn make_icon(rgba: uint8*, iw: int32, ih: int32, is_icon: bool, hx: int32, hy: int32) -> int64 {
+  var bmi: W32Bmi;
+  bmi.size = 40; bmi.width = iw; bmi.height = 0 - ih; bmi.planes = (uint16)1; bmi.bit_count = (uint16)32;
+  var bits: rawptr = (rawptr)0;
+  var color: int64 = window_w32_CreateDIBSection(0, &bmi, 0, &bits, 0, 0);
+  if (color == 0 || bits == 0) { return 0; }
+  var dst: uint8* = (uint8*)bits;
+  for i: int64 in 0..(int64)iw * (int64)ih {
+    dst[i * 4] = rgba[i * 4 + 2]; dst[i * 4 + 1] = rgba[i * 4 + 1];
+    dst[i * 4 + 2] = rgba[i * 4]; dst[i * 4 + 3] = rgba[i * 4 + 3];
+  }
+  var mask: int64 = window_w32_CreateBitmap(iw, ih, 1, 1, (rawptr)0);
+  var info: W32IconInfo;
+  info.is_icon = 0;
+  if (is_icon) { info.is_icon = 1; }
+  info.hot_x = (uint32)hx; info.hot_y = (uint32)hy;
+  info.mask = mask; info.color = color;
+  var h: int64 = window_w32_CreateIconIndirect(&info);
+  window_w32_DeleteObject(color);
+  window_w32_DeleteObject(mask);
+  return h;
+}
+
+export fn window_w32_set_icon(w: Window*, rgba: uint8*, iw: int32, ih: int32) {
+  var x: WindowW32Win* = ww(w);
+  var h: int64 = make_icon(rgba, iw, ih, true, 0, 0);
+  if (h == 0) { return; }
+  window_w32_SendMessageW(x->hwnd, 0x80, 1, h);              // WM_SETICON, ICON_BIG
+  window_w32_SendMessageW(x->hwnd, 0x80, 0, h);              // ICON_SMALL
+  if (x->icon != 0) { window_w32_DestroyIcon(x->icon); }
+  x->icon = h;
+}
+
+export fn window_w32_blit(w: Window*, rgba: uint8*, iw: int32, ih: int32, stride: int32) -> bool {
+  var x: WindowW32Win* = ww(w);
+  if (x->px == 0 || x->px_w != iw || x->px_h != ih) {
+    if (x->px != 0) { free(x->px); }
+    x->px = (uint8*)malloc((int64)iw * (int64)ih * 4);
+    x->px_w = iw; x->px_h = ih;
+  }
+  for y: int64 in 0..(int64)ih {
+    var s: uint8* = &rgba[y * (int64)stride];
+    var d: uint8* = &x->px[y * (int64)iw * 4];
+    for i: int64 in 0..(int64)iw {
+      d[i * 4] = s[i * 4 + 2]; d[i * 4 + 1] = s[i * 4 + 1]; d[i * 4 + 2] = s[i * 4]; d[i * 4 + 3] = s[i * 4 + 3];
+    }
+  }
+  var hdc: int64 = window_w32_GetDC(x->hwnd);
+  paint(w, hdc);
+  window_w32_ReleaseDC(x->hwnd, hdc);
+  return true;
+}
+
+export fn window_w32_native(w: Window*, out: WindowNative*) -> bool {
+  out->hwnd = ww(w)->hwnd;
+  out->hinstance = g_w.instance;
+  return true;
+}
+
+export fn window_w32_text_input(w: Window*, on: bool) {
+  var flags: uint32 = 0;
+  if (on) { flags = 0x10; }                                  // IACE_DEFAULT; 0 detaches the IME
+  window_w32_ImmAssociateContextEx(ww(w)->hwnd, 0, flags);
+}
+
+export fn window_w32_text_rect(w: Window*, x: int32, y: int32, width: int32, height: int32) {
+  var p: WindowW32Win* = ww(w);
+  p->ime_rect.left = to_px(x, p->dpi); p->ime_rect.top = to_px(y, p->dpi);
+  p->ime_rect.right = to_px(x + width, p->dpi); p->ime_rect.bottom = to_px(y + height, p->dpi);
+  if (p->composing) { ime_place(w); }
+}
+
+export fn window_w32_warp(w: Window*, lx: float64, ly: float64) {
+  var x: WindowW32Win* = ww(w);
+  var p: W32Point;
+  p.x = (int32)(lx * (float64)x->dpi / 96.0); p.y = (int32)(ly * (float64)x->dpi / 96.0);
+  window_w32_ClientToScreen(x->hwnd, &p);
+  window_w32_SetCursorPos(p.x, p.y);
+}
+
+export fn window_w32_set_cursor(w: Window*, shape: int32) {
+  var x: WindowW32Win* = ww(w);
+  if (x->cursor_img != 0) { window_w32_DestroyIcon(x->cursor_img); x->cursor_img = 0; }
+  if (w->hovered) { window_w32_SetCursor(cursor_for(w)); }
+}
+
+export fn window_w32_set_cursor_image(w: Window*, rgba: uint8*, cw: int32, ch: int32, hx: int32, hy: int32) -> bool {
+  var x: WindowW32Win* = ww(w);
+  var h: int64 = make_icon(rgba, cw, ch, false, hx, hy);
+  if (h == 0) { return false; }
+  if (x->cursor_img != 0) { window_w32_DestroyIcon(x->cursor_img); }
+  x->cursor_img = h;
+  if (w->hovered) { window_w32_SetCursor(cursor_for(w)); }
+  return true;
+}
+
+export fn window_w32_set_cursor_mode(w: Window*, mode: int32, old: int32) {
+  var x: WindowW32Win* = ww(w);
+  if (mode == WINDOW_CURSOR_LOCKED && !g_w.raw_registered) {
+    var dev: W32RawInputDevice;
+    dev.usage_page = (uint16)1; dev.usage = (uint16)2; dev.flags = 0; dev.target = x->hwnd;
+    g_w.raw_registered = window_w32_RegisterRawInputDevices(&dev, 1, 16) != 0;
+  }
+  apply_cursor_mode(w);
+  if (w->hovered) { window_w32_SetCursor(cursor_for(w)); }
+  if (mode == WINDOW_CURSOR_LOCKED) { window_w32_warp(w, (float64)w->w / 2.0, (float64)w->h / 2.0); }
+}
+
+export fn window_w32_clipboard_set(w: Window*, s: uint8*, n: int64) {
+  var hwnd: int64 = 0;
+  if (w != 0 && w->plat != 0) { hwnd = ww(w)->hwnd; }
+  if (window_w32_OpenClipboard(hwnd) == 0) { return; }
+  window_w32_EmptyClipboard();
+  var wide: uint16* = window_w32_wide(s, n);
+  var units: int64 = 0;
+  while (wide[units] != (uint16)0) { units = units + 1; }
+  var mem: int64 = window_w32_GlobalAlloc(2, (units + 1) * 2);      // GMEM_MOVEABLE
+  if (mem != 0) {
+    var p: uint16* = (uint16*)window_w32_GlobalLock(mem);
+    if (p != 0) {
+      for i: int64 in 0..units + 1 { p[i] = wide[i]; }
+      window_w32_GlobalUnlock(mem);
+      if (window_w32_SetClipboardData(13, mem) == 0) { window_w32_GlobalFree(mem); }   // CF_UNICODETEXT
+    } else {
+      window_w32_GlobalFree(mem);
+    }
+  }
+  free(wide);
+  window_w32_CloseClipboard();
+}
+
+export fn window_w32_clipboard_get(w: Window*) -> string {
+  var empty: string = "";
+  var hwnd: int64 = 0;
+  if (w != 0 && w->plat != 0) { hwnd = ww(w)->hwnd; }
+  if (window_w32_OpenClipboard(hwnd) == 0) { return empty; }
+  var mem: int64 = window_w32_GetClipboardData(13);
+  var out: string = empty;
+  if (mem != 0) {
+    var p: uint16* = (uint16*)window_w32_GlobalLock(mem);
+    if (p != 0) {
+      var cap: int64 = window_w32_GlobalSize(mem) / 2;
+      var n: int64 = 0;
+      while (n < cap && p[n] != (uint16)0) { n = n + 1; }
+      var buf: uint8* = (uint8*)malloc(n * 3 + 1);
+      var at: int64 = 0;
+      var len: int64 = narrow(p, n, buf, -1, &at);
+      window_w32_GlobalUnlock(mem);
+      out.chars = buf; out.length = (uint64)len;
+    }
+  }
+  window_w32_CloseClipboard();
+  return out;
+}

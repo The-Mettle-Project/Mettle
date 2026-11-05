@@ -1,0 +1,524 @@
+// The fill rasteriser: exact-area anti-aliasing by signed-area
+// accumulation, the method of FreeType's "gray" rasteriser, font-rs and
+// stb_truetype 2, as used in MythicUI. Each line adds the area it covers
+// to cells; a running sum along each row gives the winding coverage.
+// Non-zero coverage is min(1, |sum|), even-odd folds the sum into [0, 1]
+// (as Blend2D does).
+//
+// Work goes in bands of 16 rows so memory stays small for big pixmaps,
+// with edges sorted by their top so each band sees only its own.
+//
+// The running sum is exact while no part of a pixel is covered twice. Where
+// a path overlaps itself (strokes that cross, overlapping contours), a
+// pixel holding both a doubly covered part and an empty part would come out
+// too dark. A row whose sum goes past 1 has such overlap, so that row is
+// done again with 4 sub-rows, each clamped on its own (FreeType does the
+// same for overlapping glyphs, with 4x4 supersampling).
+
+import "std/mem";
+import "../core/base";
+import "../geom/flatten";
+
+export const CANVAS_NONZERO: int32 = 0;
+export const CANVAS_EVENODD: int32 = 1;
+
+const BAND: int32 = 16;
+const SUB: int32 = 4;     // sub-rows for rows with overlap
+const BIG: float32 = 4000000.0;
+
+export struct CanvasEdge { x0: float32; y0: float32; x1: float32; y1: float32; top: float32; }
+
+export struct CanvasRaster {
+  edges: CanvasEdge*;
+  nedges: int64;
+  cap_edges: int64;
+  active: int64*;
+  cap_active: int64;
+  acc: float32*;
+  cap_acc: int64;
+  rmin: int32*;
+  rmax: int32*;
+  cov: uint8*;
+  cap_cov: int64;
+  acc2: float32*;       // SUB sub-rows for one pixel row
+  fcov: float32*;       // coverage of one row while summing sub-rows
+  rmin2: int32*;
+  rmax2: int32*;
+  failed: bool;
+}
+
+export fn canvas_raster_free(r: CanvasRaster*) {
+  if (r->edges != 0) { free(r->edges); }
+  if (r->active != 0) { free(r->active); }
+  if (r->acc != 0) { free(r->acc); }
+  if (r->rmin != 0) { free(r->rmin); }
+  if (r->rmax != 0) { free(r->rmax); }
+  if (r->cov != 0) { free(r->cov); }
+  if (r->acc2 != 0) { free(r->acc2); }
+  if (r->fcov != 0) { free(r->fcov); }
+  if (r->rmin2 != 0) { free(r->rmin2); }
+  if (r->rmax2 != 0) { free(r->rmax2); }
+  memset(r, 0, sizeof(CanvasRaster));
+}
+
+@inline fn clampc(v: float32) -> float32 {
+  if (v < -BIG) { return -BIG; }
+  if (v > BIG) { return BIG; }
+  return v;
+}
+
+fn add_edge(r: CanvasRaster*, x0: float32, y0: float32, x1: float32, y1: float32) {
+  if (y0 == y1) { return; }
+  if (r->nedges >= r->cap_edges) {
+    var c: int64 = r->cap_edges * 2;
+    if (c < 64) { c = 64; }
+    var p: CanvasEdge* = (CanvasEdge*)realloc(r->edges, c * sizeof(CanvasEdge));
+    if (p == 0) { r->failed = true; return; }
+    r->edges = p;
+    r->cap_edges = c;
+  }
+  var e: CanvasEdge* = r->edges + r->nedges;
+  e->x0 = x0; e->y0 = y0; e->x1 = x1; e->y1 = y1;
+  e->top = canvas_minf(y0, y1);
+  r->nedges = r->nedges + 1;
+}
+
+/// Turns every contour of q into edges (each contour closed), dropping
+/// edges above, below or right of the box [bx0, bx1) x [by0, by1).
+export fn canvas_raster_edges(r: CanvasRaster*, q: CanvasPoly*, bx0: int32, by0: int32, bx1: int32, by1: int32) {
+  r->nedges = 0;
+  r->failed = false;
+  var fx1: float32 = (float32)bx1;
+  var fy0: float32 = (float32)by0;
+  var fy1: float32 = (float32)by1;
+  for c in 0..q->nconts {
+    var ct: CanvasContour* = q->conts + c;
+    if (ct->count < 2) { continue; }
+    var base: float32* = q->xy + ct->start * 2;
+    for i in 0..ct->count {
+      var j: int64 = i + 1;
+      if (j == ct->count) { j = 0; }
+      var ax: float32 = clampc(base[i * 2]);
+      var ay: float32 = clampc(base[i * 2 + 1]);
+      var bx: float32 = clampc(base[j * 2]);
+      var by: float32 = clampc(base[j * 2 + 1]);
+      if (ay == by) { continue; }
+      if (!canvas_finite(ax) || !canvas_finite(ay) || !canvas_finite(bx) || !canvas_finite(by)) { continue; }
+      if (ay <= fy0 && by <= fy0) { continue; }
+      if (ay >= fy1 && by >= fy1) { continue; }
+      // wholly right of the box: it cannot change any pixel in the box
+      // (rows carry their last coverage to the right side themselves)
+      if (ax >= fx1 && bx >= fx1) { continue; }
+      add_edge(r, ax, ay, bx, by);
+    }
+  }
+}
+
+// Heap sort of the edges by top.
+fn sift(e: CanvasEdge*, start: int64, n: int64) {
+  var root: int64 = start;
+  while (true) {
+    var child: int64 = root * 2 + 1;
+    if (child >= n) { return; }
+    if (child + 1 < n && e[child + 1].top > e[child].top) { child = child + 1; }
+    if (e[root].top >= e[child].top) { return; }
+    var t: CanvasEdge = e[root];
+    e[root] = e[child];
+    e[child] = t;
+    root = child;
+  }
+}
+
+fn sort_edges(e: CanvasEdge*, n: int64) {
+  if (n < 2) { return; }
+  var i: int64 = n / 2 - 1;
+  while (i >= 0) { sift(e, i, n); i = i - 1; }
+  var end: int64 = n - 1;
+  while (end > 0) {
+    var t: CanvasEdge = e[0];
+    e[0] = e[end];
+    e[end] = t;
+    sift(e, 0, end);
+    end = end - 1;
+  }
+}
+
+// The band being filled.
+struct Band { acc: float32*; stride: int32; w: int32; h: int32; rmin: int32*; rmax: int32*; }
+
+// One piece of a line that does not cross x = 0 or x = w (its ends may lie
+// outside, and are clamped onto the border). Coordinates are band-local.
+fn acc_piece(b: Band*, x0: float32, y0: float32, x1: float32, y1: float32) {
+  if (y0 == y1) { return; }
+  var dir: float32 = 1.0;
+  var ax: float32 = x0; var ay: float32 = y0; var bx: float32 = x1; var by: float32 = y1;
+  if (y0 > y1) { dir = -1.0; ax = x1; ay = y1; bx = x0; by = y0; }
+  var maxx: float32 = (float32)b->w;
+  if (ax < 0.0) { ax = 0.0; } if (bx < 0.0) { bx = 0.0; }
+  if (ax > maxx) { ax = maxx; } if (bx > maxx) { bx = maxx; }
+  var dxdy: float32 = (bx - ax) / (by - ay);
+  var x: float32 = ax;
+  var ystart: int32 = 0;
+  if (ay < 0.0) { x = x - ay * dxdy; } else { ystart = canvas_floor_i(ay); }
+  var yend: int32 = canvas_ceil_i(by);
+  if (yend > b->h) { yend = b->h; }
+  var stride: int32 = b->stride;
+  var acc: float32* = b->acc;
+  var y: int32 = ystart;
+  while (y < yend) {
+    var ls: int64 = (int64)y * (int64)stride;
+    var fy: float32 = (float32)y;
+    var top: float32 = fy; if (ay > top) { top = ay; }
+    var bot: float32 = fy + 1.0; if (by < bot) { bot = by; }
+    var dy: float32 = bot - top;
+    var xnext: float32 = x + dxdy * dy;
+    if (xnext < 0.0) { xnext = 0.0; }
+    if (xnext > maxx) { xnext = maxx; }
+    var d: float32 = dy * dir;
+    var xa: float32 = x; var xb: float32 = xnext;
+    if (xa > xb) { xa = xnext; xb = x; }
+    var xaf: float32 = (float32)canvas_floor_i(xa);
+    var xai: int32 = (int32)xaf;
+    var xbi: int32 = canvas_ceil_i(xb);
+    var xbc: float32 = (float32)xbi;
+    var hi: int32 = xbi;
+    if (xbi <= xai + 1) {
+      var xmf: float32 = 0.5 * (x + xnext) - xaf;
+      acc[ls + (int64)xai] += d - d * xmf;
+      acc[ls + (int64)xai + 1] += d * xmf;
+      hi = xai + 1;
+    } else {
+      var s: float32 = 1.0 / (xb - xa);
+      var x0f: float32 = xa - xaf;
+      var a0: float32 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+      var x1f: float32 = xb - xbc + 1.0;
+      var am: float32 = 0.5 * s * x1f * x1f;
+      acc[ls + (int64)xai] += d * a0;
+      if (xbi == xai + 2) {
+        acc[ls + (int64)xai + 1] += d * (1.0 - a0 - am);
+      } else {
+        var a1: float32 = s * (1.5 - x0f);
+        acc[ls + (int64)xai + 1] += d * (a1 - a0);
+        var xi: int32 = xai + 2;
+        var ds: float32 = d * s;
+        while (xi < xbi - 1) { acc[ls + (int64)xi] += ds; xi = xi + 1; }
+        var a2: float32 = a1 + (float32)(xbi - xai - 3) * s;
+        acc[ls + (int64)xbi - 1] += d * (1.0 - a2 - am);
+      }
+      acc[ls + (int64)xbi] += d * am;
+    }
+    if (xai < b->rmin[y]) { b->rmin[y] = xai; }
+    if (hi > b->rmax[y]) { b->rmax[y] = hi; }
+    x = xnext;
+    y = y + 1;
+  }
+}
+
+// A line in band-local coordinates. A line that leaves the band sideways is
+// split where it crosses x = 0 and x = w, so clamping each piece is exact.
+fn acc_line(b: Band*, x0: float32, y0: float32, x1: float32, y1: float32) {
+  if (y0 == y1) { return; }
+  var maxx: float32 = (float32)b->w;
+  if ((x0 >= 0.0 && x1 >= 0.0 && x0 <= maxx && x1 <= maxx) || x0 == x1) {
+    acc_piece(b, x0, y0, x1, y1);
+    return;
+  }
+  var dx: float32 = x1 - x0;
+  var ta: float32 = 2.0; var xa: float32 = 0.0;
+  var tb: float32 = 2.0; var xb: float32 = maxx;
+  if ((x0 < 0.0 && x1 > 0.0) || (x0 > 0.0 && x1 < 0.0)) { ta = (0.0 - x0) / dx; }
+  if ((x0 < maxx && x1 > maxx) || (x0 > maxx && x1 < maxx)) { tb = (maxx - x0) / dx; }
+  if (tb < ta) { var tt: float32 = ta; ta = tb; tb = tt; xa = maxx; xb = 0.0; }
+  var dy: float32 = y1 - y0;
+  var px: float32 = x0; var py: float32 = y0;
+  if (ta < 1.0) {
+    var qy: float32 = y0 + ta * dy;
+    acc_piece(b, px, py, xa, qy);
+    px = xa; py = qy;
+  }
+  if (tb < 1.0) {
+    var ry: float32 = y0 + tb * dy;
+    acc_piece(b, px, py, xb, ry);
+    px = xb; py = ry;
+  }
+  acc_piece(b, px, py, x1, y1);
+}
+
+@inline fn rule_cov(s: float32, rule: int32) -> float32 {
+  var v: float32 = s;
+  if (v < 0.0) { v = -v; }
+  if (rule == CANVAS_EVENODD) {
+    if (v > 2.0) { v = v - 2.0 * (float32)canvas_floor_i(v * 0.5); }
+    if (v > 1.0) { v = 2.0 - v; }
+  } else if (v > 1.0) { v = 1.0; }
+  return v;
+}
+
+// Redoes pixel row y (band-local row, band top y0) with SUB sub-rows.
+// Writes coverage bytes for [lo, hi] into cov and returns false when the
+// row came out empty.
+fn redo_row(r: CanvasRaster*, nact: int64, bx0: int32, y: int32, w: int32, rule: int32, aa: bool, out: uint8*, lo: int32*, hi: int32*) -> bool {
+  var b: Band;
+  b.acc = r->acc2;
+  b.stride = w + 2;
+  b.w = w;
+  b.h = SUB;
+  b.rmin = r->rmin2;
+  b.rmax = r->rmax2;
+  for i in 0..SUB { b.rmin[i] = w + 2; b.rmax[i] = -1; }
+  var fx0: float32 = (float32)bx0;
+  var fy: float32 = (float32)y;
+  var k: float32 = (float32)SUB;
+  var fy1: float32 = fy + 1.0;
+  for i in 0..nact {
+    var e: CanvasEdge* = r->edges + r->active[i];
+    if (e->top >= fy1) { continue; }
+    if (e->y0 <= fy && e->y1 <= fy) { continue; }
+    acc_line(&b, e->x0 - fx0, (e->y0 - fy) * k, e->x1 - fx0, (e->y1 - fy) * k);
+  }
+  var l: int32 = w + 2;
+  var h: int32 = -1;
+  for i in 0..SUB {
+    if (b.rmin[i] < l) { l = b.rmin[i]; }
+    if (b.rmax[i] > h) { h = b.rmax[i]; }
+  }
+  if (h < l) { return false; }
+  var end: int32 = canvas_mini(h, w - 1);
+  var fc: float32* = r->fcov;
+  var inv: float32 = 1.0 / k;
+  var full: int32 = end;
+  for i in 0..SUB {
+    var a: float32* = b.acc + (int64)i * (int64)b.stride;
+    var s: float32 = 0.0;
+    var x: int32 = l;
+    while (x <= end) {
+      s = s + a[x];
+      a[x] = 0.0;
+      fc[x] = fc[x] + rule_cov(s, rule) * inv;
+      x = x + 1;
+    }
+    x = canvas_maxi(end + 1, l);
+    while (x <= h) { a[x] = 0.0; x = x + 1; }
+    // past the last edge this sub-row's coverage stays as it is
+    var v: float32 = rule_cov(s, rule) * inv;
+    if (v > 0.0 && end < w - 1) {
+      var x3: int32 = end + 1;
+      while (x3 < w) { fc[x3] = fc[x3] + v; x3 = x3 + 1; }
+      full = w - 1;
+    }
+  }
+  end = full;
+  var first: int32 = -1;
+  var last: int32 = -1;
+  var x2: int32 = l;
+  while (x2 <= end) {
+    var v: float32 = fc[x2];
+    fc[x2] = 0.0;
+    if (v > 1.0) { v = 1.0; }
+    var c: int32 = (int32)(v * 255.0 + 0.5);
+    if (!aa) { c = 0; if (v >= 0.5) { c = 255; } }
+    out[x2] = (uint8)c;
+    if (c != 0) { if (first < 0) { first = x2; } last = x2; }
+    x2 = x2 + 1;
+  }
+  if (first < 0) { return false; }
+  *lo = first;
+  *hi = last;
+  return true;
+}
+
+fn ensure(r: CanvasRaster*, w: int32) -> bool {
+  var need: int64 = (int64)(w + 2) * (int64)BAND;
+  if (need > r->cap_acc) {
+    if (r->acc != 0) { free(r->acc); }
+    r->acc = (float32*)calloc(need, 4);
+    if (r->acc == 0) { r->cap_acc = 0; return false; }
+    r->cap_acc = need;
+  }
+  if (r->rmin == 0) {
+    r->rmin = (int32*)malloc((int64)BAND * 4);
+    r->rmax = (int32*)malloc((int64)BAND * 4);
+    if (r->rmin == 0 || r->rmax == 0) { return false; }
+  }
+  if ((int64)w + 2 > r->cap_cov) {
+    if (r->cov != 0) { free(r->cov); }
+    if (r->acc2 != 0) { free(r->acc2); }
+    if (r->fcov != 0) { free(r->fcov); }
+    r->cov = (uint8*)malloc(((int64)w + 2) * 2);
+    r->acc2 = (float32*)calloc((int64)(w + 2) * (int64)SUB, 4);
+    r->fcov = (float32*)calloc((int64)w + 2, 4);
+    if (r->cov == 0 || r->acc2 == 0 || r->fcov == 0) { r->cap_cov = 0; return false; }
+    r->cap_cov = (int64)w + 2;
+  }
+  if (r->rmin2 == 0) {
+    r->rmin2 = (int32*)malloc((int64)SUB * 4);
+    r->rmax2 = (int32*)malloc((int64)SUB * 4);
+    if (r->rmin2 == 0 || r->rmax2 == 0) { return false; }
+  }
+  if (r->nedges > r->cap_active) {
+    if (r->active != 0) { free(r->active); }
+    r->active = (int64*)malloc(r->nedges * 8);
+    if (r->active == 0) { r->cap_active = 0; return false; }
+    r->cap_active = r->nedges;
+  }
+  return true;
+}
+
+// A row waiting to be sent: it is redone first if it or a row next to it
+// turned out to overlap.
+struct Pend { y: int32; first: int32; last: int32; over: bool; need: bool; live: bool; cov: uint8*; }
+
+fn flush(r: CanvasRaster*, pd: Pend*, nact: int64, bx0: int32, w: int32, rule: int32, aa: bool,
+         sink: fn(rawptr, int32, int32, int32, uint8*) -> void, ctx: rawptr) {
+  if (!pd->live) { return; }
+  pd->live = false;
+  var first: int32 = pd->first;
+  var last: int32 = pd->last;
+  if (pd->need) {
+    if (!redo_row(r, nact, bx0, pd->y, w, rule, aa, pd->cov, &first, &last)) { first = -1; }
+  }
+  if (first >= 0) { sink(ctx, pd->y, bx0 + first, last - first + 1, pd->cov + first); }
+}
+
+/// Fills the edges inside the box [bx0, bx1) x [by0, by1) with a fill rule.
+/// For each row with coverage, calls sink(ctx, y, x, n, cov) with n coverage
+/// bytes for pixels x .. x + n - 1. aa false gives hard edges (a pixel is
+/// in when at least half of it is covered).
+export fn canvas_raster_fill(r: CanvasRaster*, bx0: int32, by0: int32, bx1: int32, by1: int32, rule: int32, aa: bool,
+                             sink: fn(rawptr, int32, int32, int32, uint8*) -> void, ctx: rawptr) -> bool {
+  if (r->failed) { return false; }
+  if (bx1 <= bx0 || by1 <= by0 || r->nedges == 0) { return true; }
+  var w: int32 = bx1 - bx0;
+  if (!ensure(r, w)) { return false; }
+  sort_edges(r->edges, r->nedges);
+  var b: Band;
+  b.acc = r->acc;
+  b.stride = w + 2;
+  b.w = w;
+  b.rmin = r->rmin;
+  b.rmax = r->rmax;
+  var fx0: float32 = (float32)bx0;
+  var next: int64 = 0;
+  var nact: int64 = 0;
+  // two row buffers: the pending row and the current one
+  var bufs: uint8* = r->cov;
+  var cur: int32 = 0;
+  var pd: Pend;
+  pd.live = false;
+  pd.y = -1;
+  var y0: int32 = by0;
+  while (y0 < by1) {
+    var y1: int32 = canvas_mini(y0 + BAND, by1);
+    var fy0: float32 = (float32)y0;
+    var fy1: float32 = (float32)y1;
+    b.h = y1 - y0;
+    while (next < r->nedges && r->edges[next].top < fy1) {
+      r->active[nact] = next;
+      nact = nact + 1;
+      next = next + 1;
+    }
+    // keep edges that reach the row above the band, which may still be
+    // redone as the pending row
+    var keep: int64 = 0;
+    for i in 0..nact {
+      var e: CanvasEdge* = r->edges + r->active[i];
+      if (e->y0 <= fy0 - 1.0 && e->y1 <= fy0 - 1.0) { continue; }
+      r->active[keep] = r->active[i];
+      keep = keep + 1;
+    }
+    nact = keep;
+    if (nact == 0) {
+      flush(r, &pd, nact, bx0, w, rule, aa, sink, ctx);
+      if (next >= r->nedges) { break; }
+      // skip empty bands up to the next edge
+      var t: int32 = canvas_floor_i(r->edges[next].top);
+      if (t > y1) {
+        var skip: int32 = by0 + ((t - by0) / BAND) * BAND;
+        if (skip > y0) { y0 = skip; continue; }
+      }
+      y0 = y1;
+      continue;
+    }
+    for i in 0..b.h { b.rmin[i] = w + 2; b.rmax[i] = -1; }
+    for i in 0..nact {
+      var e2: CanvasEdge* = r->edges + r->active[i];
+      if (e2->y0 <= fy0 && e2->y1 <= fy0) { continue; }
+      acc_line(&b, e2->x0 - fx0, e2->y0 - fy0, e2->x1 - fx0, e2->y1 - fy0);
+    }
+    for row in 0..b.h {
+      var y: int32 = y0 + row;
+      var cov: uint8* = bufs + (int64)cur * ((int64)w + 2);
+      var lo: int32 = b.rmin[row];
+      var hi: int32 = b.rmax[row];
+      var first: int32 = -1;
+      var last: int32 = -1;
+      var over: bool = false;
+      if (hi >= lo) {
+        var a: float32* = b.acc + (int64)row * (int64)b.stride;
+        var end: int32 = canvas_mini(hi, w - 1);
+        var s: float32 = 0.0;
+        var x: int32 = lo;
+        var c: int32 = 0;
+        while (x <= end) {
+          var d: float32 = a[x];
+          if (d == 0.0 && x > lo) {
+            // no edge here: the coverage carries on unchanged, so fill
+            // the whole run at once (the inside of a shape)
+            var j: int32 = x + 1;
+            while (j <= end && a[j] == 0.0) { j = j + 1; }
+            memset(cov + x, c, (int64)(j - x));
+            if (c != 0) { last = j - 1; }
+            x = j;
+            continue;
+          }
+          s = s + d;
+          a[x] = 0.0;
+          if (s > 1.001 || s < -1.001) { over = true; }
+          var v: float32 = s;
+          if (v < 0.0) { v = -v; }
+          if (rule == CANVAS_EVENODD) {
+            if (v > 2.0) { v = v - 2.0 * (float32)canvas_floor_i(v * 0.5); }
+            if (v > 1.0) { v = 2.0 - v; }
+          } else if (v > 1.0) { v = 1.0; }
+          c = (int32)(v * 255.0 + 0.5);
+          if (!aa) { c = 0; if (v >= 0.5) { c = 255; } }
+          cov[x] = (uint8)c;
+          if (c != 0) { if (first < 0) { first = x; } last = x; }
+          x = x + 1;
+        }
+        x = canvas_maxi(end + 1, lo);
+        while (x <= hi) { a[x] = 0.0; x = x + 1; }
+        // past the last edge the coverage stays as it is
+        if (end < w - 1 && c != 0) {
+          memset(cov + end + 1, c, (int64)(w - 1 - end));
+          if (first < 0) { first = end + 1; }
+          last = w - 1;
+        }
+      }
+      // the pending row is the one just above: send it now
+      if (pd.live && pd.y == y - 1) {
+        if (over) { pd.need = true; }
+        flush(r, &pd, nact, bx0, w, rule, aa, sink, ctx);
+      } else {
+        flush(r, &pd, nact, bx0, w, rule, aa, sink, ctx);
+      }
+      var prev_over: bool = pd.y == y - 1 && pd.over;
+      if (first >= 0 || over || prev_over) {
+        pd.live = true;
+        pd.y = y;
+        pd.first = first;
+        pd.last = last;
+        pd.over = over;
+        pd.need = over || prev_over;
+        pd.cov = cov;
+        cur = 1 - cur;
+      } else {
+        pd.y = y;
+        pd.over = false;
+      }
+    }
+    y0 = y1;
+  }
+  flush(r, &pd, nact, bx0, w, rule, aa, sink, ctx);
+  return true;
+}

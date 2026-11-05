@@ -1,0 +1,69 @@
+// raize_api/types/encode: a struct to JSON through Codec's writer, by its type.
+import "raize_core/str/str";
+import "codec/core/buf";
+import "codec/core/status";
+import "codec/json/write";
+import "type";
+
+fn rapi__enc(w: CodecJson*, t: RapiType*, src: rawptr, mask: int64) {
+  var k: int32 = t->kind;
+  if (k == RAPI_T_STRING) { codec_json_string(w, *(string*)src); return; }
+  if (k == RAPI_T_ANY) {
+    var raw: string = *(string*)src;
+    if (raw.length == 0) { codec_json_null(w); } else { codec_json_raw(w, raw); }
+    return;
+  }
+  if (k == RAPI_T_INT) {
+    if (t->size == 4) { codec_json_int(w, (int64)*(int32*)src); }
+    else { codec_json_int(w, *(int64*)src); }
+    return;
+  }
+  if (k == RAPI_T_NUMBER) { codec_json_float(w, *(float64*)src); return; }
+  if (k == RAPI_T_BOOL) { codec_json_bool(w, *(bool*)src); return; }
+  if (k == RAPI_T_ARRAY) {
+    var data: uint8* = *(uint8**)src;
+    var n: int64 = *(int64*)((uint8*)src + 8);
+    codec_json_array(w);
+    for i in 0..n {
+      rapi__enc(w, t->items, (rawptr)(data + i * t->items->size), -1);
+    }
+    codec_json_end(w);
+    return;
+  }
+  if (k == RAPI_T_OBJECT) {
+    codec_json_object(w);
+    for i in 0..t->nfields {
+      if ((mask & ((int64)1 << (int64)i)) == 0) { continue; }
+      var f: RapiField* = &t->fields[i];
+      codec_json_key(w, f->name);
+      rapi__enc(w, f->type, (rawptr)((uint8*)src + f->offset), -1);
+    }
+    codec_json_end(w);
+    return;
+  }
+  codec_json_null(w);
+}
+
+/// Writes `src` as JSON of type `t` into the writer.
+/// mask: for objects, the top-level fields to write (bit i = field i); -1 for all.
+export fn rapi_encode_into(w: CodecJson*, t: RapiType*, src: rawptr, mask: int64) {
+  rapi__enc(w, t, src, mask);
+}
+
+/// Writes an array of `n` values of type `t`, back to back at `items`.
+export fn rapi_encode_list_into(w: CodecJson*, t: RapiType*, items: rawptr, n: int64, mask: int64) {
+  codec_json_array(w);
+  for i in 0..n {
+    rapi__enc(w, t, (rawptr)((uint8*)items + i * t->size), mask);
+  }
+  codec_json_end(w);
+}
+
+/// `src` as JSON text in `b` (cleared first). Returns CODEC_OK or the writer's error.
+export fn rapi_encode(b: CodecBuf*, t: RapiType*, src: rawptr) -> int32 {
+  codec_buf_clear(b);
+  var w: CodecJson;
+  codec_json_init_flags(&w, b, CODEC_JSON_LOSSY_UTF8);
+  rapi__enc(&w, t, src, -1);
+  return codec_json_finish(&w);
+}

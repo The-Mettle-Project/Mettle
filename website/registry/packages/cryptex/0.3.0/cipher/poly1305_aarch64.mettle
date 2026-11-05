@@ -1,0 +1,17 @@
+// AArch64 stand-in for poly1305_x86_64.mettle: this target uses the 26-bit
+// limb code in poly1305.mettle, so crx_poly1305_x64 says 0 and the other
+// functions are never called. They exist so the same code compiles
+// everywhere.
+
+/// internal: 0: no base 2^64 Poly1305 core on this target.
+export fn crx_poly1305_x64() -> uint32 {
+  return 0;
+}
+
+/// internal: never called.
+export fn crx_poly1305_x64_blocks(st: uint64*, m: uint8*, nblocks: int64, padbit: uint64) {
+}
+
+/// internal: never called.
+export fn crx_poly1305_x64_emit(st: uint64*, s: uint8*, tag: uint8*) {
+}

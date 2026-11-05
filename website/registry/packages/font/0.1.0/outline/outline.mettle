@@ -1,0 +1,24 @@
+// Glyph outlines for any face, whatever its outline format.
+
+import "font/sfnt/face";
+import "path";
+import "glyf";
+import "cff";
+
+/// Appends the outline of glyph g (font units, y up) to path. Returns false
+/// on damaged data. A glyph with no outline (a space) returns true and adds
+/// nothing.
+export fn font_glyph_path(f: FontFace*, g: int32, path: FontPath*) -> bool {
+  if (f->outline == FONT_OUTLINE_GLYF) { return font_glyf_path(f, g, path); }
+  if (f->outline == FONT_OUTLINE_CFF) { return font_cff_path(f, g, path); }
+  return false;
+}
+
+/// Tight-ish box of glyph g in font units, from its outline points
+/// (control points included). False for an empty glyph.
+export fn font_glyph_box(f: FontFace*, g: int32, x0: float32*, y0: float32*, x1: float32*, y1: float32*) -> bool {
+  var p: FontPath;
+  var ok: bool = font_glyph_path(f, g, &p) && font_path_bounds(&p, x0, y0, x1, y1);
+  font_path_free(&p);
+  return ok;
+}

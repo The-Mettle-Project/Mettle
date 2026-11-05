@@ -1,0 +1,59 @@
+// mythic_image: image store (premultiplied), ids for IMAGE commands (Appendix D).
+// Pixels are kept as premultiplied 0xAARRGGBB. `gen` bumps on update (part of the damage hash
+// from M2, when IMAGE rendering lands).
+import "mythic_types";
+
+export struct MythicImage { w: int32; h: int32; gen: int32; px: uint32*; }
+
+// Opaque outside the renderer modules.
+export struct MythicImages { count: int32; list: MythicVec<MythicImage>; }
+
+export fn mythic_images_create() -> MythicImages* {
+  var im: MythicImages* = new MythicImages;
+  return im;
+}
+
+fn load(img: MythicImage*, rgba: uint8*) {
+  var n: int64 = (int64)img->w * (int64)img->h;
+  for i: int64 in 0..n {
+    var r: uint32 = (uint32)rgba[i * 4];
+    var g: uint32 = (uint32)rgba[i * 4 + 1];
+    var b: uint32 = (uint32)rgba[i * 4 + 2];
+    var a: uint32 = (uint32)rgba[i * 4 + 3];
+    r = (r * a + (uint32)127) / (uint32)255;
+    g = (g * a + (uint32)127) / (uint32)255;
+    b = (b * a + (uint32)127) / (uint32)255;
+    img->px[i] = (a << (uint32)24) | (r << (uint32)16) | (g << (uint32)8) | b;
+  }
+  img->gen = img->gen + 1;
+}
+
+/// Adds a w x h image from straight RGBA8 bytes (copied). Returns its id, or -1.
+export fn mythic_images_add(im: MythicImages*, w: int32, h: int32, rgba: uint8*) -> int32 {
+  if (im == 0 || w <= 0 || h <= 0) { return -1; }
+  var img: MythicImage = { w: w, h: h, gen: 0, px: (uint32*)malloc((int64)w * (int64)h * 4) };
+  var p: MythicImage* = mythic_vec_push<MythicImage>(&im->list, img);
+  if (rgba != 0) { load(p, rgba); }
+  im->count = (int32)im->list.len;
+  return im->count - 1;
+}
+
+export fn mythic_images_update(im: MythicImages*, id: int32, rgba: uint8*) {
+  if (im == 0 || id < 0 || id >= im->count || rgba == 0) { return; }
+  load(&im->list.data[(int64)id], rgba);
+}
+
+export fn mythic_images_get(im: MythicImages*, id: int32) -> MythicImage* {
+  if (im == 0 || id < 0 || id >= im->count) { return 0; }
+  return &im->list.data[(int64)id];
+}
+
+/// Frees every image and the store.
+export fn mythic_images_destroy(im: MythicImages*) {
+  if (im == 0) { return; }
+  for i: int64 in 0..im->list.len {
+    if (im->list.data[i].px != 0) { free((rawptr)im->list.data[i].px); }
+  }
+  mythic_vec_free<MythicImage>(&im->list);
+  free((rawptr)im);
+}

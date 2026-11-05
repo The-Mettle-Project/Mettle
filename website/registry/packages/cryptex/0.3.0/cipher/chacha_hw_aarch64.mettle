@@ -1,0 +1,21 @@
+// AArch64 stand-in for chacha_hw_x86_64.mettle: there is no SIMD ChaCha20
+// path on this target yet, so crx_chacha_hw_level says 0 and chacha.mettle
+// never calls the other functions. They exist so the same code compiles
+// everywhere.
+
+/// internal: 0, always: no SIMD ChaCha20 on this target yet.
+export fn crx_chacha_hw_level() -> uint32 {
+  return 0;
+}
+
+/// internal: never called.
+export fn crx_chacha_avx2x8_blocks(st: uint32*, src: uint8*, dst: uint8*, nblocks: int64) {
+}
+
+/// internal: never called.
+export fn crx_chacha_avx2_blocks(st: uint32*, src: uint8*, dst: uint8*, nblocks: int64) {
+}
+
+/// internal: never called.
+export fn crx_chacha_ssse3_blocks(st: uint32*, src: uint8*, dst: uint8*, nblocks: int64) {
+}

@@ -1,0 +1,26 @@
+// args: command-line arguments for Mettle, in pure Mettle.
+//
+//   import "args/args";
+//
+// This file has no exports of its own, so it re-exports every module
+// below. All exported names start with args_, Args or ARGS_.
+//
+//   types     Args, ArgsOpt, ArgsPos, ArgsCmd, limits, kinds, result codes
+//   spec      building a parser: options, positionals, subcommands
+//   value     text to bool, int, uint, float
+//   parse     argv to values, environment fallbacks, required checks
+//   error     error messages and suggestions
+//   help      usage and help text
+//   complete  bash, zsh and fish completion scripts
+//   run       parse the real command line and print what is needed
+//   out       the writer the text goes through
+
+import "types";
+import "out";
+import "value";
+import "spec";
+import "error";
+import "parse";
+import "help";
+import "complete";
+import "run";

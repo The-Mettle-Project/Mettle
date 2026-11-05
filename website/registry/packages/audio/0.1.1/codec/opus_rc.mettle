@@ -1,0 +1,231 @@
+// Opus range decoder (RFC 6716 section 4.1), shared by SILK and CELT.
+// Follows the reference decoder (libopus entdec.c, BSD) step by step, so
+// the decoded symbols match it exactly. Reads past the end of the data
+// give zeros, as in the reference; nothing is ever read out of bounds.
+
+export struct AudioOpusRc {
+  buf: uint8*;
+  storage: uint32;    // bytes in buf (shrinks when the end holds other data)
+  end_offs: uint32;   // bytes read from the end (raw bits)
+  end_window: uint32;
+  nend_bits: int32;
+  nbits_total: int32;
+  offs: uint32;       // bytes read from the front
+  rng: uint32;
+  val: uint32;
+  ext: uint32;
+  rem: int32;
+  error: int32;
+}
+
+/// Number of bits needed to hold x (0 for 0).
+export fn audio_opus_ilog(x: uint32) -> int32 {
+  if (x == 0) { return 0; }
+  var n: int32 = 1;
+  var v: uint32 = x;
+  if ((v >> 16) != 0) { n = n + 16; v = v >> 16; }
+  if ((v >> 8) != 0) { n = n + 8; v = v >> 8; }
+  if ((v >> 4) != 0) { n = n + 4; v = v >> 4; }
+  if ((v >> 2) != 0) { n = n + 2; v = v >> 2; }
+  if ((v >> 1) != 0) { n = n + 1; }
+  return n;
+}
+
+@inline fn rc_byte(d: AudioOpusRc*) -> int32 {
+  if (d->offs < d->storage) {
+    var b: int32 = (int32)d->buf[d->offs];
+    d->offs = d->offs + 1;
+    return b;
+  }
+  return 0;
+}
+
+@inline fn rc_byte_end(d: AudioOpusRc*) -> int32 {
+  if (d->end_offs < d->storage) {
+    d->end_offs = d->end_offs + 1;
+    return (int32)d->buf[d->storage - d->end_offs];
+  }
+  return 0;
+}
+
+fn rc_normalize(d: AudioOpusRc*) {
+  while (d->rng <= 0x800000) {
+    d->nbits_total = d->nbits_total + 8;
+    d->rng = d->rng << 8;
+    var sym: int32 = d->rem;
+    d->rem = rc_byte(d);
+    sym = ((sym << 8) | d->rem) >> 1;
+    d->val = ((d->val << 8) + (uint32)(255 & ~sym)) & 0x7FFFFFFF;
+  }
+}
+
+export fn audio_opus_rc_init(d: AudioOpusRc*, buf: uint8*, n: int32) {
+  d->buf = buf;
+  d->storage = 0;
+  if (n > 0) { d->storage = (uint32)n; }
+  d->end_offs = 0;
+  d->end_window = 0;
+  d->nend_bits = 0;
+  d->nbits_total = 9;
+  d->offs = 0;
+  d->rng = 128;
+  d->rem = rc_byte(d);
+  d->val = d->rng - 1 - (uint32)(d->rem >> 1);
+  d->error = 0;
+  d->ext = 0;
+  rc_normalize(d);
+}
+
+/// The cumulative frequency of the next symbol, for a total of ft.
+export fn audio_opus_rc_decode(d: AudioOpusRc*, ft: uint32) -> uint32 {
+  d->ext = d->rng / ft;
+  var s: uint32 = d->val / d->ext;
+  var t: uint32 = s + 1;
+  if (t > ft) { t = ft; }
+  return ft - t;
+}
+
+export fn audio_opus_rc_decode_bin(d: AudioOpusRc*, bits: int32) -> uint32 {
+  d->ext = d->rng >> bits;
+  var s: uint32 = d->val / d->ext;
+  var ft: uint32 = (uint32)1 << bits;
+  var t: uint32 = s + 1;
+  if (t > ft) { t = ft; }
+  return ft - t;
+}
+
+export fn audio_opus_rc_update(d: AudioOpusRc*, fl: uint32, fh: uint32, ft: uint32) {
+  var s: uint32 = d->ext * (ft - fh);
+  d->val = d->val - s;
+  if (fl > 0) { d->rng = d->ext * (fh - fl); } else { d->rng = d->rng - s; }
+  rc_normalize(d);
+}
+
+/// One bit with probability 1/2^logp of being 1.
+export fn audio_opus_rc_bit_logp(d: AudioOpusRc*, logp: int32) -> int32 {
+  var r: uint32 = d->rng;
+  var dv: uint32 = d->val;
+  var s: uint32 = r >> logp;
+  var ret: int32 = 0;
+  if (dv < s) {
+    ret = 1;
+    d->rng = s;
+  } else {
+    d->val = dv - s;
+    d->rng = r - s;
+  }
+  rc_normalize(d);
+  return ret;
+}
+
+/// A symbol from an "inverse" cumulative table with total 2^ftb.
+/// The table must end with 0.
+export fn audio_opus_rc_icdf(d: AudioOpusRc*, icdf: uint8*, ftb: int32) -> int32 {
+  var s: uint32 = d->rng;
+  var dv: uint32 = d->val;
+  var r: uint32 = s >> ftb;
+  var ret: int32 = -1;
+  var t: uint32 = 0;
+  while (true) {
+    t = s;
+    ret = ret + 1;
+    s = r * (uint32)icdf[ret];
+    if (dv >= s) { break; }
+  }
+  d->val = dv - s;
+  d->rng = t - s;
+  rc_normalize(d);
+  return ret;
+}
+
+/// Raw bits from the end of the frame (up to 25).
+export fn audio_opus_rc_bits(d: AudioOpusRc*, bits: int32) -> uint32 {
+  var window: uint32 = d->end_window;
+  var avail: int32 = d->nend_bits;
+  if (avail < bits) {
+    while (true) {
+      window = window | ((uint32)rc_byte_end(d) << avail);
+      avail = avail + 8;
+      if (avail > 24) { break; }
+    }
+  }
+  var ret: uint32 = window & (((uint32)1 << bits) - 1);
+  window = window >> bits;
+  avail = avail - bits;
+  d->end_window = window;
+  d->nend_bits = avail;
+  d->nbits_total = d->nbits_total + bits;
+  return ret;
+}
+
+/// A uniform number in 0 .. ft-1 (ft > 1).
+export fn audio_opus_rc_uint(d: AudioOpusRc*, fta: uint32) -> uint32 {
+  if (fta <= 1) { return 0; }
+  var ft: uint32 = fta - 1;
+  var ftb: int32 = audio_opus_ilog(ft);
+  if (ftb > 8) {
+    ftb = ftb - 8;
+    var ft1: uint32 = (ft >> ftb) + 1;
+    var s: uint32 = audio_opus_rc_decode(d, ft1);
+    audio_opus_rc_update(d, s, s + 1, ft1);
+    var t: uint32 = (s << ftb) | audio_opus_rc_bits(d, ftb);
+    if (t <= ft) { return t; }
+    d->error = 1;
+    return ft;
+  }
+  ft = ft + 1;
+  var s2: uint32 = audio_opus_rc_decode(d, ft);
+  audio_opus_rc_update(d, s2, s2 + 1, ft);
+  return s2;
+}
+
+/// Bits used so far, rounded up.
+export fn audio_opus_rc_tell(d: AudioOpusRc*) -> int32 {
+  return d->nbits_total - audio_opus_ilog(d->rng);
+}
+
+/// Bits used so far in 1/8 bit units.
+export fn audio_opus_rc_tell_frac(d: AudioOpusRc*) -> int32 {
+  var nbits: int32 = d->nbits_total << 3;
+  var l: int32 = audio_opus_ilog(d->rng);
+  var r: uint32 = d->rng >> (l - 16);
+  for i in 0..3 {
+    r = (r * r) >> 15;
+    var b: int32 = (int32)(r >> 16);
+    l = (l << 1) | b;
+    r = r >> b;
+  }
+  return nbits - l;
+}
+
+/// The Laplace-distributed energy symbol of CELT (laplace.c).
+export fn audio_opus_rc_laplace(d: AudioOpusRc*, fs0: uint32, decay: int32) -> int32 {
+  var val: int32 = 0;
+  var fs: uint32 = fs0;
+  var fm: uint32 = audio_opus_rc_decode_bin(d, 15);
+  var fl: uint32 = 0;
+  if (fm >= fs) {
+    val = val + 1;
+    fl = fs;
+    var ft: uint32 = 32768 - 32 - fs;
+    fs = (uint32)(((int64)ft * (int64)(16384 - decay)) >> 15) + 1;
+    while (fs > 1 && fm >= fl + 2 * fs) {
+      fs = fs * 2;
+      fl = fl + fs;
+      fs = (uint32)(((int64)(fs - 2) * (int64)decay) >> 15);
+      fs = fs + 1;
+      val = val + 1;
+    }
+    if (fs <= 1) {
+      var di: uint32 = (fm - fl) >> 1;
+      val = val + (int32)di;
+      fl = fl + 2 * di;
+    }
+    if (fm < fl + fs) { val = -val; } else { fl = fl + fs; }
+  }
+  var fh: uint32 = fl + fs;
+  if (fh > 32768) { fh = 32768; }
+  if (fl >= fh) { fl = fh - 1; }   // only on broken data
+  audio_opus_rc_update(d, fl, fh, 32768);
+  return val;
+}

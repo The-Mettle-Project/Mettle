@@ -1,0 +1,129 @@
+// raize/context/date — the one `Date:` formatter.
+//
+// Every response carries `Date` (RFC 9110 §6.6.1) and `Last-Modified` needs
+// the same formatting, so it is written once, here, as a pure function over an
+// epoch second. The clock is a separate one-line call so the formatter itself
+// stays testable in the interpreter (which has no clock).
+//
+// Format: IMF-fixdate, always GMT, always English:
+//     Sun, 06 Nov 1994 08:49:37 GMT
+//
+// The civil-from-days arithmetic is Howard Hinnant's (proleptic Gregorian,
+// exact for the whole int64 range we can reach), not a table.
+
+import "../str/str";
+
+struct RzTimespec {
+  sec: int64;
+  nsec: int64;
+}
+
+// CLOCK_REALTIME. The runtime's clock_gettime is a raw syscall with no libc;
+// verified through std/bench on Linux x86-64.
+extern fn clock_gettime(clk_id: int32, ts: cstring) -> int32 = "clock_gettime";
+
+export fn rz_time_epoch() -> int64 {
+  var ts: RzTimespec;
+  if (clock_gettime(0, (cstring)&ts) != 0) { return 0; }
+  return ts.sec;
+}
+
+fn rz_date_put2(buf: uint8*, at: int64, v: int64) {
+  buf[at] = (uint8)(48 + (v / 10) % 10);
+  buf[at + 1] = (uint8)(48 + v % 10);
+}
+
+fn rz_date_put4(buf: uint8*, at: int64, v: int64) {
+  buf[at] = (uint8)(48 + (v / 1000) % 10);
+  buf[at + 1] = (uint8)(48 + (v / 100) % 10);
+  buf[at + 2] = (uint8)(48 + (v / 10) % 10);
+  buf[at + 3] = (uint8)(48 + v % 10);
+}
+
+// Writes "Sun, 06 Nov 1994 08:49:37 GMT" into buf (29 bytes + NUL) and returns
+// the view. On a short buffer it returns the empty string rather than a
+// truncated date.
+export fn rz_http_date(buf: uint8*, cap: int64, now_secs: int64) -> string {
+  var epoch_secs: int64 = now_secs;
+  if (buf == 0 || cap < 30) { return rz_str_empty(); }
+  var days: int64 = epoch_secs / 86400;
+  var sod: int64 = epoch_secs - days * 86400;
+  if (sod < 0) { sod = sod + 86400; days = days - 1; }
+
+  var z: int64 = days + 719468;
+  var era: int64 = z / 146097;
+  if (z < 0 && z % 146097 != 0) { era = era - 1; }
+  var doe: int64 = z - era * 146097;
+  var yoe: int64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  var y: int64 = yoe + era * 400;
+  var doy: int64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  var mp: int64 = (5 * doy + 2) / 153;
+  var d: int64 = doy - (153 * mp + 2) / 5 + 1;
+  var m: int64 = mp + 3;
+  if (mp >= 10) { m = mp - 9; }
+  if (m <= 2) { y = y + 1; }
+
+  var wday: int64 = days + 4;
+  wday = wday % 7;
+  if (wday < 0) { wday = wday + 7; }
+
+  var names: string[7];
+  names[0] = "Sun";
+  names[1] = "Mon";
+  names[2] = "Tue";
+  names[3] = "Wed";
+  names[4] = "Thu";
+  names[5] = "Fri";
+  names[6] = "Sat";
+  var months: string[12];
+  months[0] = "Jan";
+  months[1] = "Feb";
+  months[2] = "Mar";
+  months[3] = "Apr";
+  months[4] = "May";
+  months[5] = "Jun";
+  months[6] = "Jul";
+  months[7] = "Aug";
+  months[8] = "Sep";
+  months[9] = "Oct";
+  months[10] = "Nov";
+  months[11] = "Dec";
+
+  var dn: string = names[wday];
+  buf[0] = dn.chars[0];
+  buf[1] = dn.chars[1];
+  buf[2] = dn.chars[2];
+  buf[3] = 44;   // ,
+  buf[4] = 32;   // space
+  rz_date_put2(buf, 5, d);
+  buf[7] = 32;
+  var mn: string = months[m - 1];
+  buf[8] = mn.chars[0];
+  buf[9] = mn.chars[1];
+  buf[10] = mn.chars[2];
+  buf[11] = 32;
+  rz_date_put4(buf, 12, y);
+  buf[16] = 32;
+  rz_date_put2(buf, 17, sod / 3600);
+  buf[19] = 58;
+  rz_date_put2(buf, 20, (sod % 3600) / 60);
+  buf[22] = 58;
+  rz_date_put2(buf, 23, sod % 60);
+  buf[25] = 32;
+  buf[26] = 71;  // G
+  buf[27] = 77;  // M
+  buf[28] = 84;  // T
+  buf[29] = 0;
+  return rz_str_view(buf, 29);
+}
+
+@test fn t_rz_http_date() -> int32 {
+  var buf: uint8[32];
+  if (!rz_str_eq(rz_http_date(&buf[0], 32, 0), "Thu, 01 Jan 1970 00:00:00 GMT")) { return 1; }
+  // 784111777 = Sun, 06 Nov 1994 08:49:37 GMT (the RFC's own example)
+  if (!rz_str_eq(rz_http_date(&buf[0], 32, 784111777), "Sun, 06 Nov 1994 08:49:37 GMT")) { return 2; }
+  if (!rz_str_eq(rz_http_date(&buf[0], 32, 1700000000), "Tue, 14 Nov 2023 22:13:20 GMT")) { return 3; }
+  if (!rz_str_eq(rz_http_date(&buf[0], 32, 951782400), "Tue, 29 Feb 2000 00:00:00 GMT")) { return 4; }
+  if (rz_http_date(&buf[0], 29, 0).length != 0) { return 5; }
+  return 0;
+}

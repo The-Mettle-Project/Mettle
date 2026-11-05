@@ -1,0 +1,65 @@
+// Linux system call numbers for aarch64, from the kernel's uapi headers.
+// sys.mettle picks this file or the other one by target; both export the same names.
+// SBX_SYSCALL_NAMES lists every system call as "name nr" lines for the seccomp builder.
+
+export const SBX_NR_READ = 63;
+export const SBX_NR_WRITE = 64;
+export const SBX_NR_CLOSE = 57;
+export const SBX_NR_OPENAT = 56;
+export const SBX_NR_MOUNT = 40;
+export const SBX_NR_UMOUNT2 = 39;
+export const SBX_NR_PIVOT_ROOT = 41;
+export const SBX_NR_CHROOT = 51;
+export const SBX_NR_CHDIR = 49;
+export const SBX_NR_FCHDIR = 50;
+export const SBX_NR_MKDIRAT = 34;
+export const SBX_NR_UNSHARE = 97;
+export const SBX_NR_SETNS = 268;
+export const SBX_NR_CLONE = 220;
+export const SBX_NR_CLONE3 = 435;
+export const SBX_NR_PRCTL = 167;
+export const SBX_NR_SECCOMP = 277;
+export const SBX_NR_LANDLOCK_CREATE_RULESET = 444;
+export const SBX_NR_LANDLOCK_ADD_RULE = 445;
+export const SBX_NR_LANDLOCK_RESTRICT_SELF = 446;
+export const SBX_NR_CAPGET = 90;
+export const SBX_NR_CAPSET = 91;
+export const SBX_NR_PRLIMIT64 = 261;
+export const SBX_NR_GETUID = 174;
+export const SBX_NR_GETGID = 176;
+export const SBX_NR_SETGROUPS = 159;
+export const SBX_NR_SETRESUID = 147;
+export const SBX_NR_SETRESGID = 149;
+export const SBX_NR_SETHOSTNAME = 161;
+export const SBX_NR_SETDOMAINNAME = 162;
+export const SBX_NR_EXECVE = 221;
+export const SBX_NR_EXIT_GROUP = 94;
+export const SBX_NR_WAIT4 = 260;
+export const SBX_NR_KILL = 129;
+export const SBX_NR_GETPID = 172;
+export const SBX_NR_GETPPID = 173;
+export const SBX_NR_DUP3 = 24;
+export const SBX_NR_PIPE2 = 59;
+export const SBX_NR_RT_SIGPROCMASK = 135;
+export const SBX_NR_MKNODAT = 33;
+export const SBX_NR_SYMLINKAT = 36;
+export const SBX_NR_FCNTL = 25;
+export const SBX_NR_SOCKET = 198;
+export const SBX_NR_IOCTL = 29;
+export const SBX_NR_CLOSE_RANGE = 436;
+export const SBX_NR_SETSID = 157;
+export const SBX_NR_UMASK = 166;
+export const SBX_NR_UNLINKAT = 35;
+export const SBX_NR_READLINKAT = 78;
+export const SBX_NR_MOUNT_SETATTR = 442;
+export const SBX_NR_STATFS = 43;
+
+// open flags that differ between the two CPUs.
+export const SBX_O_DIRECTORY = 0x4000;
+export const SBX_O_NOFOLLOW = 0x8000;
+
+// seccomp: the audit arch value for this CPU, and whether x32 calls must be refused.
+export const SBX_AUDIT_ARCH: uint32 = 0xc00000b7;
+export const SBX_HAS_X32 = 0;
+
+export const SBX_SYSCALL_NAMES: string = "io_setup 0\nio_destroy 1\nio_submit 2\nio_cancel 3\nio_getevents 4\nsetxattr 5\nlsetxattr 6\nfsetxattr 7\ngetxattr 8\nlgetxattr 9\nfgetxattr 10\nlistxattr 11\nllistxattr 12\nflistxattr 13\nremovexattr 14\nlremovexattr 15\nfremovexattr 16\ngetcwd 17\nlookup_dcookie 18\neventfd2 19\nepoll_create1 20\nepoll_ctl 21\nepoll_pwait 22\ndup 23\ndup3 24\nfcntl 25\ninotify_init1 26\ninotify_add_watch 27\ninotify_rm_watch 28\nioctl 29\nioprio_set 30\nioprio_get 31\nflock 32\nmknodat 33\nmkdirat 34\nunlinkat 35\nsymlinkat 36\nlinkat 37\nrenameat 38\numount2 39\nmount 40\npivot_root 41\nnfsservctl 42\nstatfs 43\nfstatfs 44\ntruncate 45\nftruncate 46\nfallocate 47\nfaccessat 48\nchdir 49\nfchdir 50\nchroot 51\nfchmod 52\nfchmodat 53\nfchownat 54\nfchown 55\nopenat 56\nclose 57\nvhangup 58\npipe2 59\nquotactl 60\ngetdents64 61\nlseek 62\nread 63\nwrite 64\nreadv 65\nwritev 66\npread64 67\npwrite64 68\npreadv 69\npwritev 70\nsendfile 71\npselect6 72\nppoll 73\nsignalfd4 74\nvmsplice 75\nsplice 76\ntee 77\nreadlinkat 78\nnewfstatat 79\nfstat 80\nsync 81\nfsync 82\nfdatasync 83\nsync_file_range 84\ntimerfd_create 85\ntimerfd_settime 86\ntimerfd_gettime 87\nutimensat 88\nacct 89\ncapget 90\ncapset 91\npersonality 92\nexit 93\nexit_group 94\nwaitid 95\nset_tid_address 96\nunshare 97\nfutex 98\nset_robust_list 99\nget_robust_list 100\nnanosleep 101\ngetitimer 102\nsetitimer 103\nkexec_load 104\ninit_module 105\ndelete_module 106\ntimer_create 107\ntimer_gettime 108\ntimer_getoverrun 109\ntimer_settime 110\ntimer_delete 111\nclock_settime 112\nclock_gettime 113\nclock_getres 114\nclock_nanosleep 115\nsyslog 116\nptrace 117\nsched_setparam 118\nsched_setscheduler 119\nsched_getscheduler 120\nsched_getparam 121\nsched_setaffinity 122\nsched_getaffinity 123\nsched_yield 124\nsched_get_priority_max 125\nsched_get_priority_min 126\nsched_rr_get_interval 127\nrestart_syscall 128\nkill 129\ntkill 130\ntgkill 131\nsigaltstack 132\nrt_sigsuspend 133\nrt_sigaction 134\nrt_sigprocmask 135\nrt_sigpending 136\nrt_sigtimedwait 137\nrt_sigqueueinfo 138\nrt_sigreturn 139\nsetpriority 140\ngetpriority 141\nreboot 142\nsetregid 143\nsetgid 144\nsetreuid 145\nsetuid 146\nsetresuid 147\ngetresuid 148\nsetresgid 149\ngetresgid 150\nsetfsuid 151\nsetfsgid 152\ntimes 153\nsetpgid 154\ngetpgid 155\ngetsid 156\nsetsid 157\ngetgroups 158\nsetgroups 159\nuname 160\nsethostname 161\nsetdomainname 162\ngetrlimit 163\nsetrlimit 164\ngetrusage 165\numask 166\nprctl 167\ngetcpu 168\ngettimeofday 169\nsettimeofday 170\nadjtimex 171\ngetpid 172\ngetppid 173\ngetuid 174\ngeteuid 175\ngetgid 176\ngetegid 177\ngettid 178\nsysinfo 179\nmq_open 180\nmq_unlink 181\nmq_timedsend 182\nmq_timedreceive 183\nmq_notify 184\nmq_getsetattr 185\nmsgget 186\nmsgctl 187\nmsgrcv 188\nmsgsnd 189\nsemget 190\nsemctl 191\nsemtimedop 192\nsemop 193\nshmget 194\nshmctl 195\nshmat 196\nshmdt 197\nsocket 198\nsocketpair 199\nbind 200\nlisten 201\naccept 202\nconnect 203\ngetsockname 204\ngetpeername 205\nsendto 206\nrecvfrom 207\nsetsockopt 208\ngetsockopt 209\nshutdown 210\nsendmsg 211\nrecvmsg 212\nreadahead 213\nbrk 214\nmunmap 215\nmremap 216\nadd_key 217\nrequest_key 218\nkeyctl 219\nclone 220\nexecve 221\nmmap 222\nfadvise64 223\nswapon 224\nswapoff 225\nmprotect 226\nmsync 227\nmlock 228\nmunlock 229\nmlockall 230\nmunlockall 231\nmincore 232\nmadvise 233\nremap_file_pages 234\nmbind 235\nget_mempolicy 236\nset_mempolicy 237\nmigrate_pages 238\nmove_pages 239\nrt_tgsigqueueinfo 240\nperf_event_open 241\naccept4 242\nrecvmmsg 243\nwait4 260\nprlimit64 261\nfanotify_init 262\nfanotify_mark 263\nname_to_handle_at 264\nopen_by_handle_at 265\nclock_adjtime 266\nsyncfs 267\nsetns 268\nsendmmsg 269\nprocess_vm_readv 270\nprocess_vm_writev 271\nkcmp 272\nfinit_module 273\nsched_setattr 274\nsched_getattr 275\nrenameat2 276\nseccomp 277\ngetrandom 278\nmemfd_create 279\nbpf 280\nexecveat 281\nuserfaultfd 282\nmembarrier 283\nmlock2 284\ncopy_file_range 285\npreadv2 286\npwritev2 287\npkey_mprotect 288\npkey_alloc 289\npkey_free 290\nstatx 291\nio_pgetevents 292\nrseq 293\nkexec_file_load 294\npidfd_send_signal 424\nio_uring_setup 425\nio_uring_enter 426\nio_uring_register 427\nopen_tree 428\nmove_mount 429\nfsopen 430\nfsconfig 431\nfsmount 432\nfspick 433\npidfd_open 434\nclone3 435\nclose_range 436\nopenat2 437\npidfd_getfd 438\nfaccessat2 439\nprocess_madvise 440\nepoll_pwait2 441\nmount_setattr 442\nquotactl_fd 443\nlandlock_create_ruleset 444\nlandlock_add_rule 445\nlandlock_restrict_self 446\nmemfd_secret 447\nprocess_mrelease 448\nfutex_waitv 449\nset_mempolicy_home_node 450\ncachestat 451\nfchmodat2 452\nmap_shadow_stack 453\nfutex_wake 454\nfutex_wait 455\nfutex_requeue 456\nstatmount 457\nlistmount 458\nlsm_get_self_attr 459\nlsm_set_self_attr 460\nlsm_list_modules 461\nmseal 462\n";

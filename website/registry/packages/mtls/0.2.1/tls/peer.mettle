@@ -1,0 +1,76 @@
+// Checks the peer's certificate chain (RFC 5280 path validation, RFC 6125
+// host names) according to the config's verify mode, and keeps the leaf's
+// public key for the CertificateVerify / ServerKeyExchange signature.
+
+import "std/mem";
+import "mtls/core/err";
+import "mtls/crypto/sig";
+import "mtls/x509/cert";
+import "mtls/x509/verify";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+
+export fn mtls_verify_peer(c: MtlsConn*) -> int32 {
+  var cfg: MtlsConfig* = c->cfg;
+  c->cert_detail = MTLS_CV_OK;
+  if (c->npchain == 0) { return MTLS_E_CERT; }
+  var leaf: MtlsDer = c->pchain[0];
+  if (cfg->verify_mode == MTLS_VERIFY_NONE) {
+    var cert: MtlsCert;
+    if (mtls_cert_parse(&cert, leaf.p, leaf.n) != MTLS_OK) {
+      c->cert_detail = MTLS_CV_MALFORMED;
+      return MTLS_E_CERT;
+    }
+    c->peer_key = cert.pub;
+    if (c->peer_key.kind == MTLS_KEY_NONE) {
+      c->cert_detail = MTLS_CV_UNSUPPORTED_SIG;
+      return MTLS_E_CERT;
+    }
+    return MTLS_OK;
+  }
+  var opts: MtlsVerifyOpts;
+  memset(&opts, 0, (int64)sizeof(MtlsVerifyOpts));
+  opts.now = mtls_now(c);
+  opts.hostname = "";
+  if (c->is_client) {
+    opts.purpose = MTLS_PURPOSE_SERVER;
+    opts.hostname.chars = &c->host[0];
+    opts.hostname.length = (uint64)c->hostlen;
+  } else {
+    opts.purpose = MTLS_PURPOSE_CLIENT;
+  }
+  var empty: MtlsRoots;
+  mtls_roots_init(&empty);
+  var roots: MtlsRoots* = cfg->roots;
+  if (cfg->verify_mode == MTLS_VERIFY_PIN) {
+    opts.pin_mode = MTLS_PIN_ONLY;
+    memcpy(&opts.pin[0], &cfg->pin[0], 32);
+    roots = &empty;
+  }
+  if (roots == 0) {
+    c->cert_detail = MTLS_CV_UNKNOWN_ISSUER;
+    return MTLS_E_CERT;
+  }
+  var inter: MtlsDerRef[10];
+  var ni: int32 = 0;
+  for i in 1..c->npchain {
+    inter[ni].p = c->pchain[i].p;
+    inter[ni].n = c->pchain[i].n;
+    ni = ni + 1;
+  }
+  var res: MtlsVerifyResult;
+  var rc: int32 = mtls_chain_verify(roots, leaf.p, leaf.n, &inter[0], ni, &opts, &res);
+  if (rc != MTLS_OK) {
+    c->cert_detail = res.detail;
+    if (c->cert_detail == MTLS_CV_OK) { c->cert_detail = MTLS_CV_MALFORMED; }
+    return MTLS_E_CERT;
+  }
+  c->peer_key = res.leaf;
+  c->peer_verified = true;
+  return MTLS_OK;
+}
+
+/// mtls_peer_alert: the alert that fits why the certificate was refused.
+export fn mtls_peer_alert(c: MtlsConn*) -> int32 {
+  return mtls_cv_alert(c->cert_detail);
+}

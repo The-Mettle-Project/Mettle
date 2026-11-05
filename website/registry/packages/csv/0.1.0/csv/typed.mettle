@@ -1,0 +1,293 @@
+// Typed rows: read records into structs and write structs as records.
+//
+// A schema lists the struct's fields. Mettle's compile-time reflection
+// builds it in three lines, in your own code:
+//
+//   var s: CsvSchema* = csv_schema_new();
+//   comptime for f in typeof(Trade).fields {
+//     csv_schema_add(s, f.name, (int32)f.type.kind, f.offset, f.type.size);
+//   }
+//
+// Columns are matched to fields by header name (csv_schema_bind), or by
+// position when there is no header. Supported field types: bool, int8 to
+// int64, uint8 to uint64, float32, float64 and string. Other fields are
+// left alone.
+
+import "std/mem";
+import "std/conv";
+import "dialect";
+import "error";
+import "num";
+import "reader";
+import "writer";
+
+// Field kinds, equal to (int32)f.type.kind for the matching Mettle types.
+export const CSV_KIND_BOOL = 1;
+export const CSV_KIND_I8 = 2;
+export const CSV_KIND_I16 = 3;
+export const CSV_KIND_I32 = 4;
+export const CSV_KIND_I64 = 5;
+export const CSV_KIND_U8 = 6;
+export const CSV_KIND_U16 = 7;
+export const CSV_KIND_U32 = 8;
+export const CSV_KIND_U64 = 9;
+export const CSV_KIND_F32 = 10;
+export const CSV_KIND_F64 = 11;
+export const CSV_KIND_STRING = 14;
+
+export struct CsvColumn {
+  name: string;       // field name, also the header name it matches
+  kind: int32;        // CSV_KIND_*
+  offset: int64;      // byte offset in the struct
+  size: int64;        // byte size
+  index: int32;       // record field it reads from; -1 when unbound
+}
+
+export struct CsvSchema {
+  cols: CsvColumn*;
+  n: int32;
+  cap: int32;
+  copy_strings: bool; // decoded strings are malloc'd copies, not views
+  empty_zero: bool;   // an empty field decodes to 0 / false instead of failing
+  bound: bool;        // csv_schema_bind has run
+}
+
+export fn csv_schema_new() -> CsvSchema* {
+  var s: CsvSchema* = new CsvSchema;
+  return s;
+}
+
+export fn csv_schema_free(s: CsvSchema*) {
+  if (s == 0) { return; }
+  if (s->cols != 0) { free(s->cols); }
+  free(s);
+}
+
+fn kind_ok(kind: int32) -> bool {
+  return (kind >= CSV_KIND_BOOL && kind <= CSV_KIND_F64) || kind == CSV_KIND_STRING;
+}
+
+// Adds a field. Fields of other kinds are recorded but never read or
+// written. The column starts bound to its position among added fields.
+export fn csv_schema_add(s: CsvSchema*, name: string, kind: int32, offset: int64, size: int64) {
+  if (s->n == s->cap) {
+    var nc: int32 = s->cap * 2;
+    if (nc == 0) { nc = 8; }
+    var nb: CsvColumn* = (CsvColumn*)realloc(s->cols, (int64)nc * sizeof(CsvColumn));
+    if (nb == 0) { return; }
+    s->cols = nb;
+    s->cap = nc;
+  }
+  var c: CsvColumn;
+  c.name = name;
+  c.kind = kind;
+  c.offset = offset;
+  c.size = size;
+  c.index = s->n;
+  if (!kind_ok(kind)) { c.index = -1; }
+  s->cols[s->n] = c;
+  s->n = s->n + 1;
+}
+
+// Makes `field` read from (and write as) the header column named `column`.
+export fn csv_schema_rename(s: CsvSchema*, field: string, column: string) {
+  for i in 0..s->n {
+    if (s->cols[i].name == field) { s->cols[i].name = column; }
+  }
+}
+
+// Binds every field to the header column of the same name. A field with no
+// column is an error (CSV_ERR_MISSING, field = the field's position from 1).
+// Pass 0 for `header` to bind by position.
+export fn csv_schema_bind(s: CsvSchema*, header: CsvRecord*) -> CsvError {
+  var e: CsvError;
+  var pos: int32 = 0;
+  s->bound = true;
+  for i in 0..s->n {
+    if (!kind_ok(s->cols[i].kind)) {
+      s->cols[i].index = -1;
+      continue;
+    }
+    if (header == 0) {
+      s->cols[i].index = pos;
+      pos = pos + 1;
+      continue;
+    }
+    var at: int32 = csv_record_find(header, s->cols[i].name);
+    s->cols[i].index = at;
+    if (at < 0 && e.kind == CSV_OK) {
+      e.kind = CSV_ERR_MISSING;
+      e.field = i + 1;
+      e.line = header->line;
+      e.record = header->index;
+      e.byte = header->byte;
+    }
+  }
+  return e;
+}
+
+fn int_fits(v: int64, size: int64) -> bool {
+  if (size == 1) { return v >= -128 && v <= 127; }
+  if (size == 2) { return v >= -32768 && v <= 32767; }
+  if (size == 4) { return v >= (int64)-2147483648 && v <= (int64)2147483647; }
+  return true;
+}
+
+fn uint_fits(v: uint64, size: int64) -> bool {
+  if (size == 1) { return v <= 255; }
+  if (size == 2) { return v <= 65535; }
+  if (size == 4) { return v <= (uint64)4294967295; }
+  return true;
+}
+
+// Decodes one field's text into the struct field at p.
+fn decode_one(c: CsvColumn*, s: string, p: uint8*, copy: bool, empty_zero: bool) -> bool {
+  var k: int32 = c->kind;
+  if (k == CSV_KIND_STRING) {
+    if (copy) {
+      var m: uint8* = (uint8*)malloc((int64)s.length + 1);
+      if (m == 0) { return false; }
+      memcpy(m, s.chars, (int64)s.length);
+      m[(int64)s.length] = (uint8)0;
+      *(string*)p = str_from_bytes((cstring)m, (int64)s.length);
+    } else {
+      *(string*)p = s;
+    }
+    return true;
+  }
+  if (s.length == 0 && empty_zero) {
+    memset(p, 0, c->size);
+    return true;
+  }
+  if (k == CSV_KIND_BOOL) { return csv_parse_bool(s, (bool*)p); }
+  if (k == CSV_KIND_F64) { return csv_parse_f64(s, (float64*)p); }
+  if (k == CSV_KIND_F32) { return csv_parse_f32(s, (float32*)p); }
+  if (k >= CSV_KIND_I8 && k <= CSV_KIND_I64) {
+    var v: int64 = 0;
+    if (!csv_parse_i64(s, &v)) { return false; }
+    if (!int_fits(v, c->size)) { return false; }
+    if (c->size == 1) { *(int8*)p = (int8)v; }
+    if (c->size == 2) { *(int16*)p = (int16)v; }
+    if (c->size == 4) { *(int32*)p = (int32)v; }
+    if (c->size == 8) { *(int64*)p = v; }
+    return true;
+  }
+  if (k >= CSV_KIND_U8 && k <= CSV_KIND_U64) {
+    var u: uint64 = 0;
+    if (!csv_parse_u64(s, &u)) { return false; }
+    if (!uint_fits(u, c->size)) { return false; }
+    if (c->size == 1) { *(uint8*)p = (uint8)u; }
+    if (c->size == 2) { *(uint16*)p = (uint16)u; }
+    if (c->size == 4) { *(uint32*)p = (uint32)u; }
+    if (c->size == 8) { *(uint64*)p = u; }
+    return true;
+  }
+  return true;
+}
+
+// Fills the struct at `out` from a record. String fields are views into
+// the record (valid until the next read) unless the schema copies them.
+// On failure the error names the field (from 1) of the record.
+export fn csv_decode(s: CsvSchema*, rec: CsvRecord*, out: rawptr) -> CsvError {
+  var e: CsvError;
+  var base: uint8* = (uint8*)out;
+  for i in 0..s->n {
+    var c: CsvColumn* = &s->cols[i];
+    if (c->index < 0) { continue; }
+    e.line = rec->line;
+    e.byte = rec->byte;
+    e.record = rec->index;
+    e.field = c->index + 1;
+    if (c->index >= rec->n) {
+      e.kind = CSV_ERR_MISSING;
+      return e;
+    }
+    if (!decode_one(c, rec->fields[c->index], base + c->offset, s->copy_strings, s->empty_zero)) {
+      e.kind = CSV_ERR_PARSE;
+      return e;
+    }
+  }
+  var ok: CsvError;
+  return ok;
+}
+
+// Frees the strings csv_decode copied into a struct (copy_strings only).
+export fn csv_decode_free(s: CsvSchema*, row: rawptr) {
+  if (!s->copy_strings) { return; }
+  var base: uint8* = (uint8*)row;
+  for i in 0..s->n {
+    if (s->cols[i].kind == CSV_KIND_STRING && s->cols[i].index >= 0) {
+      var p: string* = (string*)(base + s->cols[i].offset);
+      if (p->chars != 0) { free(p->chars); }
+      p->length = (uint64)0;
+    }
+  }
+}
+
+// Reads the next record and decodes it. Returns CSV_RECORD, CSV_END or
+// CSV_ERROR (see csv_reader_error). The schema is bound to the header on
+// first use, or by position when the dialect has no header.
+export fn csv_read_row(r: CsvReader*, s: CsvSchema*, out: rawptr) -> int32 {
+  if (!s->bound) {
+    var h: CsvRecord* = csv_reader_headers(r);
+    if (r->failed) { return CSV_ERROR; }
+    var be: CsvError = csv_schema_bind(s, h);
+    if (be.kind != CSV_OK) {
+      r->err = be;
+      return CSV_ERROR;
+    }
+  }
+  var rec: CsvRecord;
+  var st: int32 = csv_read(r, &rec);
+  if (st != CSV_RECORD) { return st; }
+  var e: CsvError = csv_decode(s, &rec, out);
+  if (e.kind != CSV_OK) {
+    r->err = e;
+    return CSV_ERROR;
+  }
+  return CSV_RECORD;
+}
+
+// Writes the field names as a header record.
+export fn csv_write_header(w: CsvWriter*, s: CsvSchema*) -> bool {
+  for i in 0..s->n {
+    if (kind_ok(s->cols[i].kind) && !csv_write_field(w, s->cols[i].name)) { return false; }
+  }
+  return csv_write_end(w);
+}
+
+// Writes a struct as one record, fields in schema order.
+export fn csv_write_struct(w: CsvWriter*, s: CsvSchema*, row: rawptr) -> bool {
+  var base: uint8* = (uint8*)row;
+  for i in 0..s->n {
+    var c: CsvColumn* = &s->cols[i];
+    var p: uint8* = base + c->offset;
+    var ok: bool = true;
+    var k: int32 = c->kind;
+    if (k == CSV_KIND_STRING) {
+      ok = csv_write_field(w, *(string*)p);
+    } else if (k == CSV_KIND_BOOL) {
+      ok = csv_write_bool(w, *(bool*)p);
+    } else if (k == CSV_KIND_F64) {
+      ok = csv_write_f64(w, *(float64*)p);
+    } else if (k == CSV_KIND_F32) {
+      ok = csv_write_f32(w, *(float32*)p);
+    } else if (k >= CSV_KIND_I8 && k <= CSV_KIND_I64) {
+      var v: int64 = 0;
+      if (c->size == 1) { v = (int64)*(int8*)p; }
+      if (c->size == 2) { v = (int64)*(int16*)p; }
+      if (c->size == 4) { v = (int64)*(int32*)p; }
+      if (c->size == 8) { v = *(int64*)p; }
+      ok = csv_write_i64(w, v);
+    } else if (k >= CSV_KIND_U8 && k <= CSV_KIND_U64) {
+      var u: uint64 = 0;
+      if (c->size == 1) { u = (uint64)*(uint8*)p; }
+      if (c->size == 2) { u = (uint64)*(uint16*)p; }
+      if (c->size == 4) { u = (uint64)*(uint32*)p; }
+      if (c->size == 8) { u = *(uint64*)p; }
+      ok = csv_write_u64(w, u);
+    }
+    if (!ok) { return false; }
+  }
+  return csv_write_end(w);
+}

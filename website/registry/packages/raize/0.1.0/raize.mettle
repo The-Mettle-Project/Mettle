@@ -1,0 +1,23 @@
+// raize — the whole app-facing API in one import:  import "raize";
+// reference: app
+// thread: see each area's reference page.
+//
+// This module exports nothing itself; importing it brings in every area below (Mettle
+// imports are transitive). It resolves from the working directory (builds run from the
+// repository root); elsewhere, build with `-I <raize_web>` and write the same line.
+
+import "std/io";
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/context";
+import "raize_signal/html";
+import "raize_signal/signal";
+import "raize_resource/resource";
+import "raize_app/app";
+import "raize_template/template";
+import "raize_realtime/realtime";
+import "raize_session/raize_session";
+import "raize_auth/auth";
+import "raize_api/raize_api";
+import "raize_telemetry/raize_telemetry";

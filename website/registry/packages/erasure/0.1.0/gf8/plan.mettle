@@ -1,0 +1,218 @@
+// A plan multiplies a set of source shards by a fixed coefficient matrix:
+//
+//   out[o][i] = sum over j of coef[o][j] * src[j][i]
+//
+// It holds the matrix plus the tables each vector kernel needs, built once.
+// Encoding uses the parity rows of the coding matrix; rebuilding uses the
+// rows of an inverted matrix.
+
+import "std/mem";
+import "erasure/core/status";
+import "erasure/gf8/field";
+import "erasure/gf8/cpu";
+import "erasure/gf8/kernels";
+
+export struct ErasureGf8Plan {
+  rows: int32;      // outputs
+  cols: int32;      // sources
+  coef: uint8*;     // rows x cols, row-major
+  nib: uint8*;      // AVX2 split tables, grouped by 4 outputs
+  aff: uint8*;      // GFNI matrices x4 (32 bytes), grouped by 4 outputs
+  aff8: uint8*;     // GFNI matrices (8 bytes) for AVX-512, grouped by 4 outputs
+}
+
+// Bytes of input handled per pass over all output groups, so the sources
+// stay in cache when there are more than 4 outputs.
+const ERASURE_CHUNK: int64 = 16384;
+
+// Above this many sources the AVX2 kernel is used even when GFNI exists.
+const ERASURE_GFNI_MAX_COLS: int32 = 16;
+
+var g_mask: uint8* = 0;
+
+fn erasure_plan_mask() -> uint8* {
+  if (g_mask == 0) {
+    var m: uint8* = (uint8*)malloc(32);
+    for i in 0..32 { m[i] = 15; }
+    g_mask = m;
+  }
+  return g_mask;
+}
+
+// The 8x8 bit matrix that multiplies a byte by c, in the layout
+// GF2P8AFFINEQB wants: byte 7 - i of the qword holds output bit i.
+fn erasure_gfni_matrix(c: uint8) -> uint64 {
+  var q: uint64 = 0;
+  for i in 0..8 {
+    var row: uint64 = 0;
+    for j in 0..8 {
+      var p: uint8 = erasure_gf8_mul(c, (uint8)(1 << j));
+      row = row | ((uint64)((p >> i) & 1) << (uint64)j);
+    }
+    q = q | (row << (uint64)((7 - i) * 8));
+  }
+  return q;
+}
+
+/// Sets up p for a rows x cols coefficient matrix (copied). Returns
+/// ERASURE_OK or ERASURE_E_MEM. Free it with erasure_gf8_plan_free.
+export fn erasure_gf8_plan_init(p: ErasureGf8Plan*, coef: uint8*, rows: int32, cols: int32) -> int32 {
+  erasure_gf8_init();
+  p->rows = rows;
+  p->cols = cols;
+  var cells: int64 = (int64)rows * cols;
+  p->coef = (uint8*)malloc(cells + 1);
+  p->nib = (uint8*)malloc(cells * 64 + 1);
+  p->aff = (uint8*)malloc(cells * 32 + 1);
+  p->aff8 = (uint8*)malloc(cells * 8 + 1);
+  if (p->coef == 0 || p->nib == 0 || p->aff == 0 || p->aff8 == 0) {
+    erasure_gf8_plan_free(p);
+    return ERASURE_E_MEM;
+  }
+  for i in 0..cells { p->coef[i] = coef[i]; }
+  var g0: int32 = 0;
+  while (g0 < rows) {
+    var gs: int32 = rows - g0;
+    if (gs > 4) { gs = 4; }
+    var nb: uint8* = p->nib + (int64)g0 * cols * 64;
+    var ab: uint8* = p->aff + (int64)g0 * cols * 32;
+    var a8: uint8* = p->aff8 + (int64)g0 * cols * 8;
+    for j in 0..cols {
+      for o in 0..gs {
+        var c: uint8 = coef[(int64)(g0 + o) * cols + j];
+        var e: uint8* = nb + ((int64)j * gs + o) * 64;
+        for x in 0..16 {
+          var lo: uint8 = erasure_gf8_mul(c, (uint8)x);
+          var hi: uint8 = erasure_gf8_mul(c, (uint8)(x << 4));
+          e[x] = lo;
+          e[16 + x] = lo;
+          e[32 + x] = hi;
+          e[48 + x] = hi;
+        }
+        var q: uint64 = erasure_gfni_matrix(c);
+        var a: uint8* = ab + ((int64)j * gs + o) * 32;
+        for r in 0..4 {
+          for b in 0..8 { a[r * 8 + b] = (uint8)((q >> (uint64)(b * 8)) & 255); }
+        }
+        var e8: uint8* = a8 + ((int64)j * gs + o) * 8;
+        for b in 0..8 { e8[b] = (uint8)((q >> (uint64)(b * 8)) & 255); }
+      }
+    }
+    g0 = g0 + gs;
+  }
+  return ERASURE_OK;
+}
+
+/// Frees the plan's tables.
+export fn erasure_gf8_plan_free(p: ErasureGf8Plan*) {
+  if (p->coef != 0) { free(p->coef); }
+  if (p->nib != 0) { free(p->nib); }
+  if (p->aff != 0) { free(p->aff); }
+  if (p->aff8 != 0) { free(p->aff8); }
+  p->coef = 0;
+  p->nib = 0;
+  p->aff = 0;
+  p->aff8 = 0;
+}
+
+// Portable path for bytes off..off+n of every output.
+fn erasure_plan_scalar(p: ErasureGf8Plan*, srcs: uint8**, dsts: uint8**, off: int64, n: int64) {
+  for o in 0..p->rows {
+    var d: uint8* = dsts[o] + off;
+    for j in 0..p->cols {
+      var c: uint8 = p->coef[(int64)o * p->cols + j];
+      var s: uint8* = srcs[j] + off;
+      if (j == 0) {
+        if (c == 0) {
+          for i in 0..n { d[i] = 0; }
+        } else if (c == 1) {
+          for i in 0..n { d[i] = s[i]; }
+        } else {
+          var row: uint8* = erasure_gf8_mul_row(c);
+          for i in 0..n { d[i] = row[s[i]]; }
+        }
+      } else if (c == 1) {
+        for i in 0..n { d[i] = d[i] ^ s[i]; }
+      } else if (c != 0) {
+        var row: uint8* = erasure_gf8_mul_row(c);
+        for i in 0..n { d[i] = d[i] ^ row[s[i]]; }
+      }
+    }
+  }
+}
+
+fn erasure_plan_kernel(level: int32, gs: int32, t: uint8*, srcs: uint8**, k: int64, d: uint8**, off: int64, n: int64, mask: uint8*) {
+  if (level == ERASURE_SIMD_AVX512) {
+    switch (gs) {
+      case 1: { erasure_k_gfni512_1(t, srcs, k, d, off, n, mask); }
+      case 2: { erasure_k_gfni512_2(t, srcs, k, d, off, n, mask); }
+      case 3: { erasure_k_gfni512_3(t, srcs, k, d, off, n, mask); }
+      default: { erasure_k_gfni512_4(t, srcs, k, d, off, n, mask); }
+    }
+    return;
+  }
+  if (level == ERASURE_SIMD_GFNI) {
+    switch (gs) {
+      case 1: { erasure_k_gfni_1(t, srcs, k, d, off, n, mask); }
+      case 2: { erasure_k_gfni_2(t, srcs, k, d, off, n, mask); }
+      case 3: { erasure_k_gfni_3(t, srcs, k, d, off, n, mask); }
+      default: { erasure_k_gfni_4(t, srcs, k, d, off, n, mask); }
+    }
+    return;
+  }
+  switch (gs) {
+    case 1: { erasure_k_avx2_1(t, srcs, k, d, off, n, mask); }
+    case 2: { erasure_k_avx2_2(t, srcs, k, d, off, n, mask); }
+    case 3: { erasure_k_avx2_3(t, srcs, k, d, off, n, mask); }
+    default: { erasure_k_avx2_4(t, srcs, k, d, off, n, mask); }
+  }
+}
+
+// Runs the kernel for one level over bytes off..off+n (n a multiple of
+// the kernel width), in blocks of ERASURE_CHUNK and groups of 4 outputs.
+fn erasure_plan_vec(p: ErasureGf8Plan*, level: int32, srcs: uint8**, dsts: uint8**, off: int64, n: int64) {
+  var mask: uint8* = erasure_plan_mask();
+  var k: int64 = (int64)p->cols;
+  var pos: int64 = 0;
+  while (pos < n) {
+    var len: int64 = n - pos;
+    if (len > ERASURE_CHUNK) { len = ERASURE_CHUNK; }
+    var g0: int32 = 0;
+    while (g0 < p->rows) {
+      var gs: int32 = p->rows - g0;
+      if (gs > 4) { gs = 4; }
+      var t: uint8* = p->nib + (int64)g0 * p->cols * 64;
+      if (level == ERASURE_SIMD_GFNI) { t = p->aff + (int64)g0 * p->cols * 32; }
+      if (level == ERASURE_SIMD_AVX512) { t = p->aff8 + (int64)g0 * p->cols * 8; }
+      erasure_plan_kernel(level, gs, t, srcs, k, dsts + g0, off + pos, len, mask);
+      g0 = g0 + gs;
+    }
+    pos = pos + len;
+  }
+}
+
+/// Computes bytes off..off+n of every output from the same bytes of every
+/// source. srcs has cols pointers and dsts has rows pointers. An output
+/// must not be one of the sources.
+export fn erasure_gf8_plan_apply(p: ErasureGf8Plan*, srcs: uint8**, dsts: uint8**, off: int64, n: int64) {
+  if (n <= 0 || p->rows == 0) { return; }
+  var level: int32 = erasure_simd_level();
+  var done: int64 = 0;
+  if (p->cols > 0 && level == ERASURE_SIMD_AVX512) {
+    // 128 bytes per step; what is left in 32-byte steps below.
+    var n512: int64 = n - (n % 128);
+    if (n512 > 0) { erasure_plan_vec(p, level, srcs, dsts, off, n512); }
+    done = n512;
+    level = ERASURE_SIMD_GFNI;
+  }
+  // GFNI wins with few sources; with many, the AVX2 kernel measured faster
+  // (see `mbuild bench K M`), so use it there.
+  if (level == ERASURE_SIMD_GFNI && p->cols > ERASURE_GFNI_MAX_COLS) { level = ERASURE_SIMD_AVX2; }
+  if (p->cols > 0 && level != ERASURE_SIMD_NONE) {
+    var left: int64 = n - done;
+    var n32: int64 = left - (left % 32);
+    if (n32 > 0) { erasure_plan_vec(p, level, srcs, dsts, off + done, n32); }
+    done = done + n32;
+  }
+  if (done < n) { erasure_plan_scalar(p, srcs, dsts, off + done, n - done); }
+}

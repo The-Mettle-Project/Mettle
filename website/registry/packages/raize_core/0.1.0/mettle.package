@@ -1,0 +1,6 @@
+name = raize_core
+version = 0.1.0
+description = Raize core: strings, status, request context, router, HTTP server, middleware, config, static files
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeCore
+compiler = 0.18.0

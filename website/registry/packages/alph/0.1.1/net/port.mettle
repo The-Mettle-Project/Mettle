@@ -1,0 +1,86 @@
+// alph/net/port: wait until a TCP port accepts connections.
+//
+// After starting a server as a child process, a caller often has to wait
+// until it listens. alph_spawn_port_wait starts an actor that tries to
+// connect every interval_ms and tells its parent once:
+//
+//   ALPH_TAG_PORT_READY  from = the waiter, arg = 1 when a connection was
+//                        accepted, 0 after tries failed attempts
+//
+// The waiter closes its test connection and exits after telling. To stop it
+// early, send it an exit signal.
+
+import "std/mem";
+import "alph/core/mailbox";
+import "alph/core/node";
+
+// The waiter's answer, described at the top of this module.
+export const ALPH_TAG_PORT_READY: int64 = 24;
+
+const ALPH_TAG_PORT_RETRY: int64 = 25;
+
+struct AlphPortWait {
+  ip4: int64;
+  port: int64;
+  interval_ms: int64;
+  tries: int64;      // attempts left
+  h: int64;          // the connection being tried, or 0
+}
+
+// One more attempt, or the answer 0 when none are left.
+fn alph_port_try(ctx: AlphCtx*, w: AlphPortWait*) -> int64 {
+  if (w->tries <= 0) {
+    alph_send(ctx, alph_parent(ctx), ALPH_TAG_PORT_READY, 0);
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  w->tries = w->tries - 1;
+  w->h = alph_tcp_connect(ctx, w->ip4, w->port);
+  if (w->h > 0) {
+    alph_io_arm(ctx, w->h, ALPH_IO_OUT);
+  } else {
+    w->h = 0;
+    alph_start_timer(ctx, w->interval_ms, ALPH_TAG_PORT_RETRY, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn alph_port_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var w: AlphPortWait* = (AlphPortWait*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT || m->tag == ALPH_TAG_PORT_RETRY) {
+    return alph_port_try(ctx, w);
+  }
+  if (m->tag == ALPH_TAG_IO && m->ref == w->h) {
+    // The connect finished: no error means the port accepted it.
+    var err: int64 = alph_io_error(ctx, w->h);
+    alph_io_close(ctx, w->h);
+    w->h = 0;
+    if (err == 0) {
+      alph_send(ctx, alph_parent(ctx), ALPH_TAG_PORT_READY, 1);
+      return alph_stop(ctx, ALPH_NORMAL);
+    }
+    alph_start_timer(ctx, w->interval_ms, ALPH_TAG_PORT_RETRY, 0);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Spawns an actor that waits for ip4:port (alph_ip4) to accept TCP
+// connections, trying every interval_ms at most tries times (each at least
+// 1), and answers the caller with ALPH_TAG_PORT_READY. It is linked to the
+// caller, so it stops if the caller exits; its own normal exit does not
+// reach the caller.
+//
+// Returns its pid, or 0 when an argument is out of range or the node is
+// full. Thread: a handler.
+export fn alph_spawn_port_wait(ctx: AlphCtx*, ip4: int64, port: int64, interval_ms: int64,
+                               tries: int64) -> int64 {
+  if (interval_ms < 1 || tries < 1 || port < 1 || port > 65535) {
+    return 0;
+  }
+  var w: AlphPortWait;
+  memset((rawptr)&w, 0, (int64)sizeof(AlphPortWait));
+  w.ip4 = ip4;
+  w.port = port;
+  w.interval_ms = interval_ms;
+  w.tries = tries;
+  return alph_spawn_value<AlphPortWait>(ctx, ALPH_LINK, &w, &alph_port_handle);
+}

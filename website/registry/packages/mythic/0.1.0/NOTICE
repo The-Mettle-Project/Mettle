@@ -1,0 +1,10 @@
+MythicUI
+Copyright 2026 Lex-Dellimere
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The fonts in assets/fonts are not covered by the Apache License. They are under
+the SIL Open Font License 1.1, and their license texts are in that folder:
+Geist Serif and Geist Sans (OFL-Geist.txt), JetBrains Mono (OFL-JetBrainsMono.txt) and
+IBM Plex Mono, shipped renamed as Mythic Mono Alt (OFL-IBMPlexMono.txt).
+Apps that embed these fonts must ship those license texts with them.

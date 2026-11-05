@@ -1,0 +1,91 @@
+// raize_auth/config: RaConfig (settings) and RaAuth, the handle every
+// raize_auth feature takes. Build one at startup with ra_auth_init.
+
+import "std/mem";
+import "cryptex/cryptex";
+import "status";
+import "password";
+import "store";
+
+/// Settings for a RaAuth. Start from ra_config_defaults.
+///
+/// in:      - (fill with ra_config_defaults, then change fields)
+/// returns: -
+/// owns:    plain value
+/// thread:  plain value
+/// example: var cfg: RaConfig; ra_config_defaults(&cfg); cfg.lock_max = 10;
+export struct RaConfig {
+  pw_preset: int32;
+  lock_max: int32;
+  lock_window: int64;
+  lock_for: int64;
+}
+
+/// The auth handle: settings, the stores, and a dummy hash for unknown logins.
+///
+/// in:      - (fill with ra_auth_init)
+/// returns: -
+/// owns:    borrows the stores; the caller keeps them alive while a is used
+/// thread:  read-only after init, so any thread may use one RaAuth if the
+///          stores are thread-safe
+/// example: var a: RaAuth; ra_auth_init(&a, &cfg, &stores);
+export struct RaAuth {
+  cfg: RaConfig;
+  stores: RaStores;
+  dummy: CrPwHash;
+}
+
+/// Fills a config with the defaults: Argon2id INTERACTIVE, lock after 5
+/// wrong passwords within 15 minutes, for 15 minutes.
+///
+/// in:      c        the config to fill
+/// returns: nothing
+/// owns:    writes *c
+/// thread:  any
+/// example:
+///   var cfg: RaConfig; ra_config_defaults(&cfg);
+export fn ra_config_defaults(c: RaConfig*) {
+  if (c == 0) { return; }
+  c->pw_preset = CR_PW_INTERACTIVE;
+  c->lock_max = 5;
+  c->lock_window = 900;
+  c->lock_for = 900;
+}
+
+/// Sets up a RaAuth over the app's stores.
+///
+/// in:      a        the handle to fill; cfg settings (copied)
+///          stores   creds and counters must be complete; tokens may be null
+///                   (no API tokens), else must be complete
+/// returns: RA_OK; RA_E_USAGE (null argument, a missing or incomplete store,
+///          lock_max < 1, lock_window or lock_for <= 0, unknown pw_preset);
+///          RA_E_CRYPTO
+/// owns:    copies *cfg and *stores (the pointers); borrows the stores
+/// thread:  any; takes about one password hash of time (makes the dummy hash)
+/// example:
+///   var a: RaAuth;
+///   if (ra_auth_init(&a, &cfg, &stores) != RA_OK) { return 1; }
+export fn ra_auth_init(a: RaAuth*, cfg: RaConfig*, stores: RaStores*) -> int32 {
+  if (a == 0 || cfg == 0 || stores == 0) { return RA_E_USAGE; }
+  if (!ra_store_cred_complete(stores->creds) || !ra_store_ctr_complete(stores->counters)) { return RA_E_USAGE; }
+  if (stores->tokens != 0 && !ra_store_tok_complete(stores->tokens)) { return RA_E_USAGE; }
+  if (cfg->lock_max < 1 || cfg->lock_window <= 0 || cfg->lock_for <= 0) { return RA_E_USAGE; }
+  var ops: uint64 = 0;
+  var mem: uint64 = 0;
+  if (cr_pwhash_preset_limits(cfg->pw_preset, &ops, &mem) != CR_OK) { return RA_E_USAGE; }
+  memset((rawptr)a, 0, sizeof(RaAuth));
+  a->cfg = *cfg;
+  a->stores = *stores;
+  // Never a real credential: unknown logins are denied whatever verify says.
+  var rc: int32 = ra_password_hash(&a->dummy, "ra.dummy.password.not.a.credential", cfg->pw_preset);
+  if (rc != RA_OK) { return RA_E_CRYPTO; }
+  return RA_OK;
+}
+
+@test fn t_ra_config_defaults() -> int32 {
+  var c: RaConfig;
+  ra_config_defaults(&c);
+  if (c.pw_preset != CR_PW_INTERACTIVE || c.lock_max != 5) { return 1; }
+  if (c.lock_window != 900 || c.lock_for != 900) { return 2; }
+  return 0;
+}

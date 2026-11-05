@@ -1,0 +1,597 @@
+// DEFLATE decoder (RFC 1951).
+//
+// The decoder keeps all of its state in a PdfInflate, so it can stop when the
+// input runs out and go on when more arrives. The one-shot functions and the
+// streaming decoder in stream.mettle both drive pdf_inflate_run.
+//
+// Speed comes from the same ideas as libdeflate: a 64-bit bit buffer that is
+// refilled 8 bytes at a time, decode tables whose entries hold everything
+// needed for a symbol (length base, extra bit count, flags), and a fast loop
+// that runs without any input or output checks while there is plenty of
+// both. Near the end of the input a careful loop takes over. It decodes one
+// symbol at a time and, if the input ran out in the middle of a symbol, puts
+// everything back as it was so the symbol can be decoded again later.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "tables";
+
+// Decode table entries (uint32):
+//   bits 0-4   codeword length in bits
+//   bit 5      literal          bit 6  end of block
+//   bit 7      subtable link    bit 14 invalid code
+//   bits 8-12  extra bits (length or distance), or subtable size in bits
+//   bits 16-31 literal byte, length or distance base, or subtable offset
+const PDF_F_LIT: uint32 = 32;
+const PDF_F_EOB: uint32 = 64;
+const PDF_F_SUB: uint32 = 128;
+const PDF_F_ERR: uint32 = 16384;
+
+// Table sizes: main tables of 11 and 8 bits, plus room for subtables. These
+// are the largest sizes any valid code can need (zlib's "enough" values).
+const PDF_LL_BITS: int64 = 11;
+const PDF_LL_SIZE: int64 = 2342;
+const PDF_DD_BITS: int64 = 8;
+const PDF_DD_SIZE: int64 = 402;
+
+export const PDF_M_HDR: int32 = 0;
+export const PDF_M_STORED: int32 = 1;
+export const PDF_M_HUFF: int32 = 2;
+export const PDF_M_DONE: int32 = 3;
+
+// pdf_inflate_run returns this when it needs more input.
+export const PDF_MORE: int32 = 1;
+const PDF_SLOW: int32 = 2;
+
+export struct PdfInflate {
+  bitbuf: uint64;
+  bitsleft: int64;
+  mode: int32;
+  last: int32;
+  stored_left: int64;
+  ll: uint32[2342];
+  dd: uint32[402];
+}
+
+// The bit reader used outside the fast loop. Reading past the end of the
+// input adds zero bytes and counts them in virt; if any of those bits get
+// used, the input ran out (see pdf_over).
+struct PdfBits {
+  p: uint8*;
+  n: int64;
+  ip: int64;
+  bb: uint64;
+  bl: int64;
+  virt: int64;
+}
+
+fn pdf_need(b: PdfBits*, k: int64) {
+  while (b->bl < k) {
+    if (b->ip < b->n) {
+      b->bb = b->bb | ((uint64)b->p[b->ip] << (uint64)b->bl);
+      b->ip = b->ip + 1;
+    } else {
+      b->virt = b->virt + 1;
+    }
+    b->bl = b->bl + 8;
+  }
+}
+
+fn pdf_get(b: PdfBits*, k: int64) -> uint32 {
+  if (k == 0) { return 0; }
+  pdf_need(b, k);
+  var v: uint32 = (uint32)(b->bb & (((uint64)1 << (uint64)k) - 1));
+  b->bb = b->bb >> (uint64)k;
+  b->bl = b->bl - k;
+  return v;
+}
+
+// True when bits past the real end of input were used.
+fn pdf_over(b: PdfBits*) -> bool {
+  return b->bl < b->virt * 8;
+}
+
+// Drops the zero bytes added past the end, once we know none were used.
+fn pdf_norm(b: PdfBits*) {
+  b->bl = b->bl - b->virt * 8;
+  b->virt = 0;
+}
+
+// Reads one codeword and returns its table entry.
+fn pdf_sym(b: PdfBits*, t: uint32*, tb: int64) -> uint32 {
+  pdf_need(b, 15);
+  var e: uint32 = t[(int64)(b->bb & (((uint64)1 << (uint64)tb) - 1))];
+  if ((e & PDF_F_SUB) != 0) {
+    var sb: uint64 = (uint64)((e >> 8) & 31);
+    e = t[(int64)(e >> 16) + (int64)((b->bb >> (uint64)tb) & (((uint64)1 << sb) - 1))];
+  }
+  var cw: int64 = (int64)(e & 31);
+  b->bb = b->bb >> (uint64)cw;
+  b->bl = b->bl - cw;
+  return e;
+}
+
+// Entry templates for each symbol (value, extra bits, flags; no length yet).
+fn pdf_make_ll_vals() -> uint32[288] {
+  var t: uint32[288];
+  for s in 0..256 { t[s] = ((uint32)s << 16) | PDF_F_LIT; }
+  t[256] = PDF_F_EOB;
+  for s in 0..29 { t[257 + s] = ((uint32)PDF_LEN_BASE[s] << 16) | ((uint32)PDF_LEN_EXTRA[s] << 8); }
+  t[286] = PDF_F_ERR;
+  t[287] = PDF_F_ERR;
+  return t;
+}
+const PDF_LL_VALS: uint32[288] = pdf_make_ll_vals();
+
+fn pdf_make_dd_vals() -> uint32[32] {
+  var t: uint32[32];
+  for s in 0..30 { t[s] = ((uint32)PDF_DIST_BASE[s] << 16) | ((uint32)PDF_DIST_EXTRA[s] << 8); }
+  t[30] = PDF_F_ERR;
+  t[31] = PDF_F_ERR;
+  return t;
+}
+const PDF_DD_VALS: uint32[32] = pdf_make_dd_vals();
+
+fn pdf_make_pc_vals() -> uint32[19] {
+  var t: uint32[19];
+  for s in 0..19 { t[s] = (uint32)s << 16; }
+  return t;
+}
+const PDF_PC_VALS: uint32[19] = pdf_make_pc_vals();
+
+// Builds a decode table from code lengths (canonical Huffman). Returns 0, or
+// -1 when the lengths do not form a valid code. An incomplete code is
+// allowed only when `loose` is set and it is a single one-bit code, like
+// zlib.
+fn pdf_build(t: uint32*, size: int64, tb: int64, lens: uint8*, nsym: int64, vals: uint32*, loose: bool) -> int32 {
+  var count: int64[16];
+  var remain: int64[16];
+  for s in 0..nsym {
+    var l: int64 = (int64)lens[s];
+    if (l > 15) { return -1; }
+    count[l] = count[l] + 1;
+  }
+  count[0] = 0;
+  var left: int64 = 1;
+  var maxlen: int64 = 0;
+  for l in 1..16 {
+    left = left * 2 - count[l];
+    if (left < 0) { return -1; }
+    if (count[l] > 0) { maxlen = l; }
+  }
+  for i in 0..size { t[i] = PDF_F_ERR; }
+  if (maxlen == 0) { return 0; }
+  if (left > 0 && !(loose && maxlen == 1)) { return -1; }
+  var offs: int64[17];
+  for l in 1..16 { offs[l + 1] = offs[l] + count[l]; remain[l] = count[l]; }
+  var sorted: int32[288];
+  for s in 0..nsym {
+    var l: int64 = (int64)lens[s];
+    if (l > 0) { sorted[offs[l]] = (int32)s; offs[l] = offs[l] + 1; }
+  }
+  var total: int64 = offs[16];
+  var tsize: int64 = (int64)1 << (uint64)tb;
+  var mask: int64 = tsize - 1;
+  var code: int64 = 0;
+  var curlen: int64 = 0;
+  var sub_key: int64 = -1;
+  var sub_start: int64 = 0;
+  var sub_bits: int64 = 0;
+  var next_free: int64 = tsize;
+  for i in 0..total {
+    var sym: int64 = (int64)sorted[i];
+    var len: int64 = (int64)lens[sym];
+    if (curlen == 0) { curlen = len; }
+    if (len > curlen) { code = code << (uint64)(len - curlen); curlen = len; }
+    var rev: int64 = 0;
+    for k in 0..len { rev = (rev << 1) | ((code >> (uint64)k) & 1); }
+    var entry: uint32 = vals[sym] | (uint32)len;
+    if (len <= tb) {
+      var step: int64 = (int64)1 << (uint64)len;
+      var k: int64 = rev;
+      while (k < tsize) { t[k] = entry; k = k + step; }
+    } else {
+      var key: int64 = rev & mask;
+      if (key != sub_key) {
+        var cur: int64 = len - tb;
+        var lft: int64 = (int64)1 << (uint64)cur;
+        while (cur + tb < maxlen) {
+          lft = lft - remain[cur + tb];
+          if (lft <= 0) { break; }
+          cur = cur + 1;
+          lft = lft * 2;
+        }
+        sub_bits = cur;
+        sub_start = next_free;
+        next_free = next_free + ((int64)1 << (uint64)cur);
+        if (next_free > size) { return -1; }
+        sub_key = key;
+        t[key] = ((uint32)sub_start << 16) | ((uint32)cur << 8) | PDF_F_SUB;
+      }
+      if (len - tb > sub_bits) { return -1; }
+      var step2: int64 = (int64)1 << (uint64)(len - tb);
+      var k2: int64 = rev >> (uint64)tb;
+      var ssize: int64 = (int64)1 << (uint64)sub_bits;
+      while (k2 < ssize) { t[sub_start + k2] = entry; k2 = k2 + step2; }
+    }
+    remain[len] = remain[len] - 1;
+    code = code + 1;
+  }
+  return 0;
+}
+
+struct PdfFixed {
+  ll: uint32[2342];
+  dd: uint32[402];
+}
+
+fn pdf_make_fixed() -> PdfFixed {
+  var f: PdfFixed;
+  var lens: uint8[320];
+  for i in 0..144 { lens[i] = 8; }
+  for i in 144..256 { lens[i] = 9; }
+  for i in 256..280 { lens[i] = 7; }
+  for i in 280..288 { lens[i] = 8; }
+  for i in 288..320 { lens[i] = 5; }
+  var vl: uint32[288] = PDF_LL_VALS;
+  var vd: uint32[32] = PDF_DD_VALS;
+  pdf_build(&f.ll[0], PDF_LL_SIZE, PDF_LL_BITS, &lens[0], 288, &vl[0], false);
+  pdf_build(&f.dd[0], PDF_DD_SIZE, PDF_DD_BITS, &lens[288], 32, &vd[0], false);
+  return f;
+}
+
+var g_pdf_fixed: PdfFixed;
+var g_pdf_fixed_ready: int32 = 0;
+
+// The fixed-code tables, built once. Two threads may both build them the
+// first time; they write the same values, so that is harmless.
+fn pdf_fixed() -> PdfFixed* {
+  if (g_pdf_fixed_ready == 0) {
+    g_pdf_fixed = pdf_make_fixed();
+    g_pdf_fixed_ready = 1;
+  }
+  return &g_pdf_fixed;
+}
+
+// Reads a dynamic block header and builds its tables.
+fn pdf_dynamic(st: PdfInflate*, b: PdfBits*) -> int32 {
+  var hlit: int64 = (int64)pdf_get(b, 5) + 257;
+  var hdist: int64 = (int64)pdf_get(b, 5) + 1;
+  var hclen: int64 = (int64)pdf_get(b, 4) + 4;
+  if (hlit > 286 || hdist > 30) { return PRESS_E_DATA; }
+  var clens: uint8[19];
+  for i in 0..hclen { clens[PDF_CL_ORDER[i]] = (uint8)pdf_get(b, 3); }
+  var pc: uint32[128];
+  var vp: uint32[19] = PDF_PC_VALS;
+  if (pdf_build(&pc[0], 128, 7, &clens[0], 19, &vp[0], false) != 0) { return PRESS_E_DATA; }
+  var lens: uint8[320];
+  var total: int64 = hlit + hdist;
+  var i: int64 = 0;
+  while (i < total) {
+    var e: uint32 = pdf_sym(b, &pc[0], 7);
+    if ((e & PDF_F_ERR) != 0) { return PRESS_E_DATA; }
+    var sym: int64 = (int64)(e >> 16);
+    if (sym < 16) {
+      lens[i] = (uint8)sym;
+      i = i + 1;
+    } else {
+      var v: uint8 = 0;
+      var r: int64 = 0;
+      if (sym == 16) {
+        if (i == 0) { return PRESS_E_DATA; }
+        v = lens[i - 1];
+        r = 3 + (int64)pdf_get(b, 2);
+      } else if (sym == 17) {
+        r = 3 + (int64)pdf_get(b, 3);
+      } else {
+        r = 11 + (int64)pdf_get(b, 7);
+      }
+      if (i + r > total) { return PRESS_E_DATA; }
+      for k in 0..r { lens[i + k] = v; }
+      i = i + r;
+    }
+  }
+  if (lens[256] == 0) { return PRESS_E_DATA; }
+  var vl: uint32[288] = PDF_LL_VALS;
+  var vd: uint32[32] = PDF_DD_VALS;
+  if (pdf_build(&st->ll[0], PDF_LL_SIZE, PDF_LL_BITS, &lens[0], hlit, &vl[0], true) != 0) { return PRESS_E_DATA; }
+  if (pdf_build(&st->dd[0], PDF_DD_SIZE, PDF_DD_BITS, &lens[hlit], hdist, &vd[0], true) != 0) { return PRESS_E_DATA; }
+  return PRESS_OK;
+}
+
+// Reads a block header. On running out of input everything is put back.
+fn pdf_block_header(st: PdfInflate*, b: PdfBits*) -> int32 {
+  var c_ip: int64 = b->ip;
+  var c_bb: uint64 = b->bb;
+  var c_bl: int64 = b->bl;
+  var hdr: int64 = (int64)pdf_get(b, 3);
+  var rc: int32 = PRESS_OK;
+  var kind: int64 = hdr >> 1;
+  if (!pdf_over(b)) {
+    if (kind == 0) {
+      var drop: int64 = b->bl & 7;
+      b->bb = b->bb >> (uint64)drop;
+      b->bl = b->bl - drop;
+      var len: int64 = (int64)pdf_get(b, 16);
+      var nlen: int64 = (int64)pdf_get(b, 16);
+      if (!pdf_over(b)) {
+        if ((len ^ nlen) != 65535) { return PRESS_E_DATA; }
+        st->stored_left = len;
+        st->mode = PDF_M_STORED;
+      }
+    } else if (kind == 1) {
+      var f: PdfFixed* = pdf_fixed();
+      memcpy(&st->ll[0], &f->ll[0], PDF_LL_SIZE * 4);
+      memcpy(&st->dd[0], &f->dd[0], PDF_DD_SIZE * 4);
+      st->mode = PDF_M_HUFF;
+    } else if (kind == 2) {
+      rc = pdf_dynamic(st, b);
+      if (rc == PRESS_OK && !pdf_over(b)) { st->mode = PDF_M_HUFF; }
+    } else {
+      return PRESS_E_DATA;
+    }
+  }
+  if (pdf_over(b)) {
+    st->mode = PDF_M_HDR;
+    b->ip = c_ip; b->bb = c_bb; b->bl = c_bl; b->virt = 0;
+    return PDF_MORE;
+  }
+  if (rc != PRESS_OK) { return rc; }
+  st->last = (int32)(hdr & 1);
+  pdf_norm(b);
+  return PRESS_OK;
+}
+
+fn pdf_stored(st: PdfInflate*, b: PdfBits*, out: PressBuf*) -> int32 {
+  var rc: int32 = PRESS_OK;
+  while (st->stored_left > 0 && b->bl >= 8) {
+    rc = press_buf_push(out, (uint8)(b->bb & 255));
+    if (rc != PRESS_OK) { return rc; }
+    b->bb = b->bb >> 8;
+    b->bl = b->bl - 8;
+    st->stored_left = st->stored_left - 1;
+  }
+  if (st->stored_left > 0) {
+    b->bb = 0;
+    var k: int64 = b->n - b->ip;
+    if (k > st->stored_left) { k = st->stored_left; }
+    rc = press_buf_append(out, b->p + b->ip, k);
+    if (rc != PRESS_OK) { return rc; }
+    b->ip = b->ip + k;
+    st->stored_left = st->stored_left - k;
+    if (st->stored_left > 0) { return PDF_MORE; }
+  }
+  if (st->last != 0) { st->mode = PDF_M_DONE; } else { st->mode = PDF_M_HDR; }
+  return PRESS_OK;
+}
+
+// Copies a match with a distance under 8. There are at least 272 bytes of
+// room, so 8-byte copies may run a little past the end.
+@noinline fn pdf_copy_short(w: uint8*, src: uint8*, dist: int64, len: int64) {
+  if (dist == 1) {
+    memset(w, (int32)*src, len);
+    return;
+  }
+  // Each 8-byte copy gets `dist` correct bytes (the rest is overwritten by
+  // the next copy), so step by dist.
+  var k: int64 = 0;
+  while (k < len) {
+    press_wr64(w + k, press_rd64(src + k));
+    k = k + dist;
+  }
+}
+
+// The fast loop: runs while there are at least 8 input bytes and room for
+// the longest match. Returns PRESS_OK at the end of the block, PDF_SLOW when
+// it is time for the careful loop, or an error.
+//
+// It is written with few live values (pointers rather than base plus index,
+// one table pointer for both tables) so they all stay in registers.
+fn pdf_huff_fast(st: PdfInflate*, b: PdfBits*, out: PressBuf*, os: int64) -> int32 {
+  if (b->virt != 0) { return PDF_SLOW; }
+  var t: uint32* = &st->ll[0];          // the distance table follows at t + 2342
+  var q: uint8* = b->p + b->ip;
+  var qend: uint8* = b->p + b->n - 8;
+  var bb: uint64 = b->bb;
+  var bl: uint64 = (uint64)b->bl;
+  var rc: int32 = PDF_SLOW;
+  var cap: int64 = out->cap;
+  if (out->limit > 0 && cap > out->limit) { cap = out->limit; }
+  var w: uint8* = out->data + out->len;
+  var wlim: uint8* = out->data + cap - 272;
+  var base: uint8* = out->data + os;
+  while (qend - q >= 0) {
+    if (wlim - w < 0) {
+      out->len = w - out->data;
+      var want: int64 = out->len;
+      if (want < 65536) { want = 65536; }
+      if (press_buf_reserve_soft(out, 272, want) != PRESS_OK) { break; }
+      cap = out->cap;
+      if (out->limit > 0 && cap > out->limit) { cap = out->limit; }
+      w = out->data + out->len;
+      wlim = out->data + cap - 272;
+      base = out->data + os;
+      if (wlim - w < 0) { break; }
+    }
+    bb = bb | (press_rd64(q) << bl);
+    q = q + (int64)((63 - bl) >> 3);
+    bl = bl | 56;
+    var e: uint32 = t[(int64)(bb & 2047)];
+    if ((e & PDF_F_SUB) != 0) {
+      e = t[(int64)(e >> 16) + (int64)((bb >> 11) & (((uint64)1 << (uint64)((e >> 8) & 31)) - 1))];
+    }
+    if ((e & PDF_F_LIT) != 0) {
+      bb = bb >> (uint64)(e & 31);
+      bl = bl - (uint64)(e & 31);
+      *w = (uint8)(e >> 16);
+      w = w + 1;
+      // A second literal fits in the bits we have.
+      e = t[(int64)(bb & 2047)];
+      if ((e & (PDF_F_LIT | PDF_F_SUB)) == PDF_F_LIT) {
+        bb = bb >> (uint64)(e & 31);
+        bl = bl - (uint64)(e & 31);
+        *w = (uint8)(e >> 16);
+        w = w + 1;
+      }
+      continue;
+    }
+    var cw: uint64 = (uint64)(e & 31);
+    if ((e & (PDF_F_EOB | PDF_F_ERR)) != 0) {
+      if ((e & PDF_F_ERR) != 0) { rc = PRESS_E_DATA; break; }
+      bb = bb >> cw;
+      bl = bl - cw;
+      if (st->last != 0) { st->mode = PDF_M_DONE; } else { st->mode = PDF_M_HDR; }
+      rc = PRESS_OK;
+      break;
+    }
+    var ex: uint64 = (uint64)((e >> 8) & 31);
+    var length: int64 = (int64)(e >> 16) + (int64)((bb >> cw) & (((uint64)1 << ex) - 1));
+    bb = bb >> (cw + ex);
+    bl = bl - (cw + ex);
+    var d: uint32 = t[2342 + (int64)(bb & 255)];
+    if ((d & PDF_F_SUB) != 0) {
+      d = t[2342 + (int64)(d >> 16) + (int64)((bb >> 8) & (((uint64)1 << (uint64)((d >> 8) & 31)) - 1))];
+    }
+    if ((d & PDF_F_ERR) != 0) { rc = PRESS_E_DATA; break; }
+    cw = (uint64)(d & 31);
+    ex = (uint64)((d >> 8) & 31);
+    var dist: int64 = (int64)(d >> 16) + (int64)((bb >> cw) & (((uint64)1 << ex) - 1));
+    bb = bb >> (cw + ex);
+    bl = bl - (cw + ex);
+    if (dist > w - base) { rc = PRESS_E_DATA; break; }
+    var src: uint8* = w - dist;
+    if (dist >= 8) {
+      var k: int64 = 0;
+      while (k < length) {
+        press_wr64(w + k, press_rd64(src + k));
+        k = k + 8;
+      }
+    } else {
+      pdf_copy_short(w, src, dist, length);
+    }
+    w = w + length;
+  }
+  b->ip = q - b->p;
+  b->bb = bb;
+  b->bl = (int64)bl;
+  out->len = w - out->data;
+  return rc;
+}
+
+// The careful loop: one symbol, with every input and output check.
+fn pdf_huff_slow(st: PdfInflate*, b: PdfBits*, out: PressBuf*, os: int64) -> int32 {
+  var c_ip: int64 = b->ip;
+  var c_bb: uint64 = b->bb;
+  var c_bl: int64 = b->bl;
+  var c_virt: int64 = b->virt;
+  var e: uint32 = pdf_sym(b, &st->ll[0], PDF_LL_BITS);
+  var length: int64 = 0;
+  var dist: int64 = 0;
+  var bad: bool = false;
+  if ((e & (PDF_F_LIT | PDF_F_EOB | PDF_F_ERR)) == 0) {
+    length = (int64)(e >> 16) + (int64)pdf_get(b, (int64)((e >> 8) & 31));
+    var d: uint32 = pdf_sym(b, &st->dd[0], PDF_DD_BITS);
+    if ((d & PDF_F_ERR) != 0) { bad = true; }
+    else { dist = (int64)(d >> 16) + (int64)pdf_get(b, (int64)((d >> 8) & 31)); }
+  }
+  if (pdf_over(b)) {
+    b->ip = c_ip; b->bb = c_bb; b->bl = c_bl; b->virt = c_virt;
+    return PDF_MORE;
+  }
+  pdf_norm(b);
+  if ((e & PDF_F_ERR) != 0 || bad) { return PRESS_E_DATA; }
+  if ((e & PDF_F_LIT) != 0) { return press_buf_push(out, (uint8)(e >> 16)); }
+  if ((e & PDF_F_EOB) != 0) {
+    if (st->last != 0) { st->mode = PDF_M_DONE; } else { st->mode = PDF_M_HDR; }
+    return PRESS_OK;
+  }
+  if (dist > out->len - os) { return PRESS_E_DATA; }
+  var rc: int32 = press_buf_reserve(out, length);
+  if (rc != PRESS_OK) { return rc; }
+  var o: uint8* = out->data;
+  var op: int64 = out->len;
+  for k in 0..length { o[op + k] = o[op - dist + k]; }
+  out->len = op + length;
+  return PRESS_OK;
+}
+
+fn pdf_huff(st: PdfInflate*, b: PdfBits*, out: PressBuf*, os: int64) -> int32 {
+  while (true) {
+    var rc: int32 = pdf_huff_fast(st, b, out, os);
+    if (rc != PDF_SLOW) { return rc; }
+    rc = pdf_huff_slow(st, b, out, os);
+    if (rc != PRESS_OK) { return rc; }
+    if (st->mode != PDF_M_HUFF) { return PRESS_OK; }
+  }
+  return PRESS_OK;
+}
+
+/// Resets a decoder to the start of a DEFLATE stream.
+export fn pdf_inflate_reset(st: PdfInflate*) {
+  st->bitbuf = 0;
+  st->bitsleft = 0;
+  st->mode = PDF_M_HDR;
+  st->last = 0;
+  st->stored_left = 0;
+}
+
+/// Decodes from inp[0..n). Output is appended to out; matches may reach back
+/// to out->data[os]. *used gets the number of input bytes consumed. Returns
+/// PRESS_OK at the end of the stream (the unused bytes of the last byte's
+/// bits are dropped and the whole unused bytes are given back), PDF_MORE when
+/// all input was used and more is needed, or an error.
+export fn pdf_inflate_run(st: PdfInflate*, inp: uint8*, n: int64, used: int64*, out: PressBuf*, os: int64) -> int32 {
+  var b: PdfBits;
+  b.p = inp;
+  b.n = n;
+  b.ip = 0;
+  b.bb = st->bitbuf;
+  b.bl = st->bitsleft;
+  b.virt = 0;
+  var rc: int32 = PRESS_OK;
+  while (st->mode != PDF_M_DONE) {
+    if (st->mode == PDF_M_HDR) { rc = pdf_block_header(st, &b); }
+    else if (st->mode == PDF_M_STORED) { rc = pdf_stored(st, &b, out); }
+    else { rc = pdf_huff(st, &b, out, os); }
+    if (rc != PRESS_OK) { break; }
+  }
+  // Give whole unused bytes back to the input, so the state never holds a
+  // byte from an earlier call. At the end of the stream the bits left in
+  // the last byte are padding and are dropped too.
+  if (rc == PRESS_OK || rc == PDF_MORE) {
+    pdf_norm(&b);
+    var give: int64 = b.bl >> 3;
+    if (give > b.ip) { give = b.ip; }
+    b.ip = b.ip - give;
+    b.bl = b.bl - give * 8;
+    if (rc == PRESS_OK) { b.bl = 0; }
+  }
+  if (b.bl < 64) { b.bb = b.bb & (((uint64)1 << (uint64)b.bl) - 1); }
+  st->bitbuf = b.bb;
+  st->bitsleft = b.bl;
+  *used = b.ip;
+  return rc;
+}
+
+/// Decodes one raw DEFLATE stream from src[0..n), appending to out. *used
+/// gets the bytes the stream took (trailers start there).
+export fn pdf_inflate_once(src: uint8*, n: int64, out: PressBuf*, used: int64*) -> int32 {
+  if (out == 0 || n < 0 || (src == 0 && n > 0)) { return PRESS_E_ARG; }
+  var st: PdfInflate* = new PdfInflate;
+  if (st == 0) { return PRESS_E_MEM; }
+  pdf_inflate_reset(st);
+  var start: int64 = out->len;
+  var rc: int32 = pdf_inflate_run(st, src, n, used, out, start);
+  free(st);
+  if (rc == PDF_MORE) { rc = PRESS_E_TRUNC; }
+  if (rc != PRESS_OK) { out->len = start; }
+  return rc;
+}
+
+/// Decompresses raw DEFLATE data (no zlib or gzip wrapper), appending the
+/// result to out. Bytes after the end of the stream are ignored.
+export fn press_deflate_decompress(src: uint8*, n: int64, out: PressBuf*) -> int32 {
+  var used: int64 = 0;
+  return pdf_inflate_once(src, n, out, &used);
+}

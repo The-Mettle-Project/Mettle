@@ -1,0 +1,35 @@
+// Small helpers shared by the format modules.
+
+import "../core/status";
+import "../core/image";
+import "../ops/convert";
+
+/// Converts a freshly decoded image to opts->want when asked. Frees the
+/// image on failure.
+export fn etch_finish(img: EtchImage*, o: EtchOpts*) -> int32 {
+  if (o == 0 || o->want == 0 || o->want == img->format) { return ETCH_OK; }
+  if (!etch_format_ok(o->want)) { etch_image_free(img); return ETCH_E_ARG; }
+  var rc: int32 = etch_convert_self(img, o->want);
+  if (rc != ETCH_OK) { etch_image_free(img); }
+  return rc;
+}
+
+/// Allocates a decoder's output image after checking it against the limits.
+export fn etch_alloc_checked(img: EtchImage*, w: int64, h: int64, fmt: int32, o: EtchOpts*) -> int32 {
+  var rc: int32 = etch_check_size(w, h, fmt, etch_opts_limits(o));
+  if (rc != ETCH_OK) { return rc; }
+  return etch_image_alloc(img, (int32)w, (int32)h, fmt);
+}
+
+/// Gives a view of img in 8-bit RGB or RGBA (whichever keeps alpha) for
+/// encoders that take only those. Sets *tmp_used when it had to convert;
+/// then free `tmp` when done.
+export fn etch_as_rgb8(img: EtchImage*, tmp: EtchImage*, tmp_used: bool*) -> int32 {
+  *tmp_used = false;
+  if (img->format == ETCH_RGB8 || img->format == ETCH_RGBA8) { *tmp = *img; return ETCH_OK; }
+  var want: int32 = ETCH_RGB8;
+  if (etch_format_has_alpha(img->format)) { want = ETCH_RGBA8; }
+  var rc: int32 = etch_convert(img, want, tmp);
+  if (rc == ETCH_OK) { *tmp_used = true; }
+  return rc;
+}

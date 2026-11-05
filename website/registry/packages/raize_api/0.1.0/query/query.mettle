@@ -1,0 +1,707 @@
+// raize_api/query: list operations with pagination, filters, sorting and sparse
+// fields.
+//
+//   var l: RapiListing* = rapi_listing(op, Task_rapi(), 20, 100);
+//   rapi_listing_sort(l, "title prio id");
+//   rapi_listing_filter(l, "title done prio");
+//   rapi_listing_fields(l);
+//
+// gives the operation these query parameters:
+//
+//   limit=20&offset=40           offset pages (Django REST framework's LimitOffset)
+//   limit=20&cursor=<opaque>     cursor pages on id, when rapi_listing_cursor is set
+//   sort=-prio,title             comma list, '-' for descending (JSON:API 1.1 sorting)
+//   filter[done]=true            equality, and filter[prio][gte]=2 with eq ne lt lte gt
+//                                gte contains in (in takes a comma list)
+//   fields=title,prio            only these members in each item (sparse fieldsets)
+//
+// In the handler, rapi_query_parse checks them (400 problem on a mistake),
+// rapi_query_apply runs them over records in memory, and rapi_json_page sends
+//
+//   {"items":[...],"total":57,"limit":20,"offset":40}        (offset pages)
+//   {"items":[...],"limit":20,"next_cursor":"MjE"}            (cursor pages; null at the end)
+//
+// with a Link header (RFC 8288) holding first, prev and next.
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/query";
+import "codec/core/buf";
+import "codec/core/status";
+import "codec/json/write";
+import "../types/type";
+import "../types/decode";
+import "../types/encode";
+import "../problem/problem";
+import "../route/api";
+import "../route/request";
+
+export const RAPI_SORTS_MAX: int32 = 4;
+export const RAPI_FILTERS_MAX: int32 = 8;
+
+export const RAPI_F_EQ: int32 = 1;
+export const RAPI_F_NE: int32 = 2;
+export const RAPI_F_LT: int32 = 3;
+export const RAPI_F_LTE: int32 = 4;
+export const RAPI_F_GT: int32 = 5;
+export const RAPI_F_GTE: int32 = 6;
+export const RAPI_F_CONTAINS: int32 = 7;
+export const RAPI_F_IN: int32 = 8;
+
+/// What a list operation allows. Made by rapi_listing, kept in op->listing.
+export struct RapiListing {
+  type: RapiType*;       // the item type (an object)
+  def_limit: int64;
+  max_limit: int64;
+  cursor: bool;          // cursor pages on the "id" field instead of offsets
+  sortable: int64;       // bit i = field i may be sorted on
+  filterable: int64;     // bit i = field i may be filtered on
+  sparse: bool;          // fields= is accepted
+  page_type: RapiType*;  // the page envelope, for the docs
+}
+
+export struct RapiSort {
+  field: int32;          // field index in the item type
+  desc: bool;
+}
+
+export struct RapiFilter {
+  field: int32;
+  op: int32;             // RAPI_F_*
+  text: string;          // the value as given
+  i: int64;              // parsed, for integers and booleans
+  f: float64;            // parsed, for numbers
+  list: string*;         // RAPI_F_IN: the items
+  n: int64;
+}
+
+/// One request's checked query.
+export struct RapiQuery {
+  listing: RapiListing*;
+  limit: int64;
+  offset: int64;
+  after: int64;          // cursor pages: items with id greater than this
+  has_after: bool;
+  sorts: RapiSort[4];
+  nsorts: int32;
+  filters: RapiFilter[8];
+  nfilters: int32;
+  mask: int64;           // fields to write, -1 for all
+  total: int64;          // set by rapi_query_apply: items after filtering
+  next_after: int64;     // cursor pages: the cursor for the next page, -1 at the end
+}
+
+fn rapi__mask_of(t: RapiType*, names: string) -> int64 {
+  var m: int64 = 0;
+  var start: int64 = 0;
+  var n: int64 = (int64)names.length;
+  for i in 0..(n + 1) {
+    if (i == n || names.chars[i] == 32 || names.chars[i] == 44) {
+      if ((int64)i > start) {
+        var fi: int32 = rapi_field_index(t, rz_str_sub(names, start, (int64)i));
+        if (fi >= 0) { m = m | ((int64)1 << (int64)fi); }
+      }
+      start = (int64)i + 1;
+    }
+  }
+  return m;
+}
+
+/// Makes `op` a list operation over items of type `t` with limit/offset pages
+/// (`def_limit` items unless the caller asks, at most `max_limit`).
+export fn rapi_listing(op: RapiOp*, t: RapiType*, def_limit: int64, max_limit: int64) -> RapiListing* {
+  var l: RapiListing* = (RapiListing*)calloc(1, sizeof(RapiListing));
+  l->type = t;
+  l->def_limit = def_limit;
+  l->max_limit = max_limit;
+  if (op == 0) { return l; }
+  op->listing = (rawptr)l;
+  rapi_query(op, "limit", rapi_range(rapi_int64_t(), 1, max_limit), false, "Items per page");
+  rapi_param_default(op, "limit", rz_int_str(def_limit));
+  rapi_query(op, "offset", rapi_range(rapi_int64_t(), 0, RAPI_UNSET), false, "Items to skip");
+  rapi_param_default(op, "offset", "0");
+  var page: RapiType* = rapi_object_t(t->name + "Page", 0);
+  rapi_field(page, "items", rapi_array_t(t), 0, true);
+  rapi_field(page, "total", rapi_int64_t(), 0, true);
+  rapi_field(page, "limit", rapi_int64_t(), 0, true);
+  rapi_field(page, "offset", rapi_int64_t(), 0, true);
+  l->page_type = page;
+  rapi_returns(op, 200, page, "One page of items");
+  return l;
+}
+
+/// Uses cursor pages on the item's "id" field (int64, ascending) instead of offsets.
+export fn rapi_listing_cursor(op: RapiOp*, l: RapiListing*) {
+  l->cursor = true;
+  if (op == 0) { return; }
+  // Replace "offset" with "cursor".
+  for i in 0..op->nparams {
+    if (rz_str_eq(op->params[i].name, "offset")) {
+      op->params[i].name = "cursor";
+      op->params[i].type = rapi_string_t();
+      op->params[i].desc = "Opaque cursor from next_cursor";
+      op->params[i].def = "";
+    }
+  }
+  var page: RapiType* = l->page_type;
+  page->nfields = 2;
+  page->fields[1].name = "limit";
+  rapi_field(page, "next_cursor", rapi_nullable(rapi_string_t()), 0, true);
+}
+
+/// Fields (space-separated names) the caller may sort on.
+export fn rapi_listing_sort(op: RapiOp*, l: RapiListing*, names: string) {
+  l->sortable = rapi__mask_of(l->type, names);
+  rapi_query(op, "sort", rapi_string_t(), false, rz_str_dup("Comma-separated fields, '-' for descending: " + names));
+}
+
+/// Fields (space-separated names) the caller may filter on.
+export fn rapi_listing_filter(op: RapiOp*, l: RapiListing*, names: string) {
+  l->filterable = rapi__mask_of(l->type, names);
+  var ft: RapiType* = rapi_object_t("", 0);
+  for i in 0..l->type->nfields {
+    if ((l->filterable & ((int64)1 << (int64)i)) != 0) {
+      rapi_field(ft, l->type->fields[i].name, rapi_string_t(), 0, false);
+    }
+  }
+  rapi_query(op, "filter", ft, false, "filter[field]=value or filter[field][op]=value; op is eq, ne, lt, lte, gt, gte, contains or in");
+}
+
+/// Lets the caller pick the members of each item with fields=a,b.
+export fn rapi_listing_fields(op: RapiOp*, l: RapiListing*) {
+  l->sparse = true;
+  rapi_query(op, "fields", rapi_string_t(), false, "Comma-separated members to include in each item");
+}
+
+// ---------------------------------------------------------------------------
+// Cursors: base64url (RFC 4648 section 5, no padding) of the decimal id.
+// Opaque to callers; not signed, so treat a cursor as a hint, not a credential.
+// ---------------------------------------------------------------------------
+
+fn rapi__b64_val(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) { return c - 65; }
+  if (c >= 97 && c <= 122) { return c - 71; }
+  if (c >= 48 && c <= 57) { return c + 4; }
+  if (c == 45) { return 62; }
+  if (c == 95) { return 63; }
+  return -1;
+}
+
+/// The cursor text for id `after`.
+export fn rapi_cursor_encode(after: int64, arena: RzArena*) -> string {
+  var digits: string = rz_int_str(after);
+  var alpha: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  var b: RzBuf* = rz_buf_new();
+  var n: int64 = (int64)digits.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var c0: int32 = (int32)digits.chars[i];
+    var c1: int32 = 0;
+    var c2: int32 = 0;
+    if (i + 1 < n) { c1 = (int32)digits.chars[i + 1]; }
+    if (i + 2 < n) { c2 = (int32)digits.chars[i + 2]; }
+    var v: int32 = (c0 << 16) | (c1 << 8) | c2;
+    rz_buf_add_byte(b, (int32)alpha.chars[(v >> 18) & 63]);
+    rz_buf_add_byte(b, (int32)alpha.chars[(v >> 12) & 63]);
+    if (i + 1 < n) { rz_buf_add_byte(b, (int32)alpha.chars[(v >> 6) & 63]); }
+    if (i + 2 < n) { rz_buf_add_byte(b, (int32)alpha.chars[v & 63]); }
+    i = i + 3;
+  }
+  var out: string = rz_arena_str(arena, rz_buf_str(b));
+  rz_buf_free(b);
+  return out;
+}
+
+/// Reads a cursor made by rapi_cursor_encode. False when it is not one.
+export fn rapi_cursor_decode(s: string, out: int64*) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n == 0 || n > 28 || n % 4 == 1) { return false; }
+  var buf: uint8[24];
+  var k: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: int32 = 0;
+    var got: int32 = 0;
+    for j in 0..4 {
+      if (i + (int64)j < n) {
+        var d: int32 = rapi__b64_val((int32)s.chars[i + (int64)j]);
+        if (d < 0) { return false; }
+        v = v | (d << (18 - 6 * (int32)j));
+        got = got + 1;
+      }
+    }
+    buf[k] = (uint8)((v >> 16) & 255);
+    k = k + 1;
+    if (got >= 3) { buf[k] = (uint8)((v >> 8) & 255); k = k + 1; }
+    if (got == 4) { buf[k] = (uint8)(v & 255); k = k + 1; }
+    i = i + 4;
+  }
+  return rapi_parse_int(rz_str_view(&buf[0], k), out) && *out >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+fn rapi__bad(r: RapiReq*, name: string, detail: string) {
+  rapi_errors_param(r->errs, "query", name, rz_arena_str(r->ctx->arena, detail));
+}
+
+fn rapi__filter_op(s: string) -> int32 {
+  if (s == "eq") { return RAPI_F_EQ; }
+  if (s == "ne") { return RAPI_F_NE; }
+  if (s == "lt") { return RAPI_F_LT; }
+  if (s == "lte") { return RAPI_F_LTE; }
+  if (s == "gt") { return RAPI_F_GT; }
+  if (s == "gte") { return RAPI_F_GTE; }
+  if (s == "contains") { return RAPI_F_CONTAINS; }
+  if (s == "in") { return RAPI_F_IN; }
+  return 0;
+}
+
+// Checks one filter value against the field type; fills i/f.
+fn rapi__filter_value(r: RapiReq*, t: RapiType*, f: RapiFilter*, text: string, name: string) -> bool {
+  var arena: RzArena* = r->ctx->arena;
+  if (t->kind == RAPI_T_INT) {
+    var v: int64 = 0;
+    if (!rapi_parse_int(text, &v)) { rapi__bad(r, name, "must be an integer"); return false; }
+    f->i = v;
+    f->f = (float64)v;
+    return true;
+  }
+  if (t->kind == RAPI_T_NUMBER) {
+    var x: float64 = 0.0;
+    if (!rapi_parse_number(text, &x)) { rapi__bad(r, name, "must be a number"); return false; }
+    f->f = x;
+    return true;
+  }
+  if (t->kind == RAPI_T_BOOL) {
+    if (text == "true") { f->i = 1; return true; }
+    if (text == "false") { f->i = 0; return true; }
+    rapi__bad(r, name, "must be true or false");
+    return false;
+  }
+  if (t->kind == RAPI_T_STRING) {
+    if (rapi_utf8_count(text) < 0) { rapi__bad(r, name, "must be valid UTF-8"); return false; }
+    return true;
+  }
+  rapi__bad(r, name, "cannot be filtered");
+  return false;
+}
+
+fn rapi__parse_filter(r: RapiReq*, q: RapiQuery*, l: RapiListing*, name: string, value: string) {
+  // name is filter[field] or filter[field][op]
+  var rest: string = rz_str_from(name, 6);
+  if (rest.length < 3 || rest.chars[0] != 91) { rapi__bad(r, name, "use filter[field]=value"); return; }
+  var close: int64 = rz_str_find_byte(rest, 93);
+  if (close < 2) { rapi__bad(r, name, "use filter[field]=value"); return; }
+  var field: string = rz_str_sub(rest, 1, close);
+  var after: string = rz_str_from(rest, close + 1);
+  var op: int32 = RAPI_F_EQ;
+  if (after.length > 0) {
+    if (after.length < 3 || after.chars[0] != 91 || after.chars[after.length - 1] != 93) { rapi__bad(r, name, "use filter[field][op]=value"); return; }
+    op = rapi__filter_op(rz_str_sub(after, 1, (int64)after.length - 1));
+    if (op == 0) { rapi__bad(r, name, "the operator must be eq, ne, lt, lte, gt, gte, contains or in"); return; }
+  }
+  var t: RapiType* = l->type;
+  var fi: int32 = rapi_field_index(t, field);
+  if (fi < 0 || (l->filterable & ((int64)1 << (int64)fi)) == 0) { rapi__bad(r, name, "is not a field you can filter on"); return; }
+  var ft: RapiType* = t->fields[fi].type;
+  if (op == RAPI_F_CONTAINS && ft->kind != RAPI_T_STRING) { rapi__bad(r, name, "contains works on text fields only"); return; }
+  var ordered: bool = op == RAPI_F_LT || op == RAPI_F_LTE || op == RAPI_F_GT || op == RAPI_F_GTE;
+  if (ordered && ft->kind == RAPI_T_BOOL) { rapi__bad(r, name, "booleans have no order"); return; }
+  if (q->nfilters >= RAPI_FILTERS_MAX) { rapi__bad(r, name, "too many filters (at most 8)"); return; }
+  var f: RapiFilter* = &q->filters[q->nfilters];
+  f->field = fi;
+  f->op = op;
+  f->text = value;
+  if (op == RAPI_F_IN) {
+    var count: int64 = 1;
+    for i in 0..value.length {
+      if (value.chars[i] == 44) { count = count + 1; }
+    }
+    if (count > 64) { rapi__bad(r, name, "in takes at most 64 values"); return; }
+    f->list = (string*)rz_arena_alloc(r->ctx->arena, count * (int64)sizeof(string));
+    var start: int64 = 0;
+    var k: int64 = 0;
+    for i in 0..(value.length + 1) {
+      if (i == value.length || value.chars[i] == 44) {
+        var item: string = rz_str_sub(value, start, (int64)i);
+        var tmp: RapiFilter;
+        if (!rapi__filter_value(r, ft, &tmp, item, name)) { return; }
+        f->list[k] = item;
+        k = k + 1;
+        start = (int64)i + 1;
+      }
+    }
+    f->n = k;
+  } else if (!rapi__filter_value(r, ft, f, value, name)) {
+    return;
+  }
+  q->nfilters = q->nfilters + 1;
+}
+
+fn rapi__parse_sort(r: RapiReq*, q: RapiQuery*, l: RapiListing*, value: string) {
+  var start: int64 = 0;
+  var n: int64 = (int64)value.length;
+  for i in 0..(n + 1) {
+    if (i == n || value.chars[i] == 44) {
+      var item: string = rz_str_sub(value, start, (int64)i);
+      start = (int64)i + 1;
+      var desc: bool = false;
+      if (item.length > 0 && item.chars[0] == 45) { desc = true; item = rz_str_from(item, 1); }
+      var fi: int32 = rapi_field_index(l->type, item);
+      if (fi < 0 || (l->sortable & ((int64)1 << (int64)fi)) == 0) {
+        rapi__bad(r, "sort", "'" + item + "' is not a field you can sort on");
+        return;
+      }
+      if (q->nsorts >= RAPI_SORTS_MAX) { rapi__bad(r, "sort", "at most 4 sort fields"); return; }
+      q->sorts[q->nsorts].field = fi;
+      q->sorts[q->nsorts].desc = desc;
+      q->nsorts = q->nsorts + 1;
+    }
+  }
+}
+
+/// Checks the list query of request `r` into `q`. Returns RAPI_NEXT, or sends a 400
+/// problem naming every mistake and returns 400.
+export fn rapi_query_parse(r: RapiReq*, q: RapiQuery*) -> int32 {
+  memset((rawptr)q, 0, sizeof(RapiQuery));
+  q->mask = -1;
+  q->next_after = -1;
+  var l: RapiListing* = (RapiListing*)r->op->listing;
+  if (l == 0) { return RAPI_NEXT; }
+  q->listing = l;
+  q->limit = l->def_limit;
+  if (rapi_has(r, "limit")) { q->limit = rapi_int(r, "limit"); }
+  if (!l->cursor) { q->offset = rapi_int(r, "offset"); }
+  if (l->cursor && rapi_str(r, "cursor").length > 0) {
+    if (!rapi_cursor_decode(rapi_str(r, "cursor"), &q->after)) {
+      rapi__bad(r, "cursor", "is not a cursor from this API");
+    } else {
+      q->has_after = true;
+    }
+  }
+  var pairs: RapiPair* = (RapiPair*)0;
+  var nq: int32 = rapi_query_pairs(r, &pairs);
+  for i in 0..nq {
+    var name: string = pairs[i].name;
+    var value: string = pairs[i].value;
+    if (rz_str_starts(name, "filter")) {
+      if (l->filterable == 0) { rapi__bad(r, name, "this list has no filters"); continue; }
+      rapi__parse_filter(r, q, l, name, value);
+    } else if (name == "sort") {
+      if (l->sortable == 0) { rapi__bad(r, "sort", "this list cannot be sorted"); continue; }
+      if (q->nsorts > 0) { rapi__bad(r, "sort", "is given more than once"); continue; }
+      rapi__parse_sort(r, q, l, value);
+    } else if (name == "fields") {
+      if (!l->sparse) { rapi__bad(r, "fields", "this list does not take fields"); continue; }
+      var m: int64 = 0;
+      var start: int64 = 0;
+      var n: int64 = (int64)value.length;
+      for k in 0..(n + 1) {
+        if (k == n || value.chars[k] == 44) {
+          var item: string = rz_str_sub(value, start, (int64)k);
+          start = (int64)k + 1;
+          var fi: int32 = rapi_field_index(l->type, item);
+          if (fi < 0) { rapi__bad(r, "fields", "'" + item + "' is not a field"); }
+          else { m = m | ((int64)1 << (int64)fi); }
+        }
+      }
+      q->mask = m;
+      r->mask_type = l->type;
+      r->mask = m;
+    }
+  }
+  if (rapi_errors_count(r->errs) > 0) {
+    return rapi_problem_errors(r->ctx, 400, "the list query is invalid", r->errs);
+  }
+  return RAPI_NEXT;
+}
+
+// ---------------------------------------------------------------------------
+// Applying a query to records in memory
+// ---------------------------------------------------------------------------
+
+fn rapi__str_at(rec: rawptr, f: RapiField*) -> string { return *(string*)((uint8*)rec + f->offset); }
+
+fn rapi__int_at(rec: rawptr, f: RapiField*) -> int64 {
+  var p: uint8* = (uint8*)rec + f->offset;
+  if (f->type->kind == RAPI_T_BOOL) {
+    if (*(bool*)p) { return 1; }
+    return 0;
+  }
+  if (f->type->size == 4) { return (int64)*(int32*)p; }
+  return *(int64*)p;
+}
+
+fn rapi__num_at(rec: rawptr, f: RapiField*) -> float64 {
+  if (f->type->kind == RAPI_T_NUMBER) { return *(float64*)((uint8*)rec + f->offset); }
+  return (float64)rapi__int_at(rec, f);
+}
+
+// -1, 0 or 1 comparing field f of a and b.
+fn rapi__cmp_field(f: RapiField*, a: rawptr, b: rawptr) -> int32 {
+  var k: int32 = f->type->kind;
+  if (k == RAPI_T_STRING) { return rz_str_cmp(rapi__str_at(a, f), rapi__str_at(b, f)); }
+  if (k == RAPI_T_NUMBER) {
+    var x: float64 = rapi__num_at(a, f);
+    var y: float64 = rapi__num_at(b, f);
+    if (x < y) { return -1; }
+    if (x > y) { return 1; }
+    return 0;
+  }
+  if (k == RAPI_T_INT || k == RAPI_T_BOOL) {
+    var i: int64 = rapi__int_at(a, f);
+    var j: int64 = rapi__int_at(b, f);
+    if (i < j) { return -1; }
+    if (i > j) { return 1; }
+    return 0;
+  }
+  return 0;
+}
+
+fn rapi__cmp_text(a: string, b: string) -> int32 { return rz_str_cmp(a, b); }
+
+fn rapi__contains(hay: string, needle: string) -> bool {
+  return rz_str_find(rz_str_lower(hay), rz_str_lower(needle)) >= 0;
+}
+
+fn rapi__one(t: RapiType*, f: RapiFilter*, rec: rawptr, text: string, i: int64, x: float64) -> int32 {
+  var fd: RapiField* = &t->fields[f->field];
+  var k: int32 = fd->type->kind;
+  if (k == RAPI_T_STRING) { return rapi__cmp_text(rapi__str_at(rec, fd), text); }
+  if (k == RAPI_T_NUMBER) {
+    var v: float64 = rapi__num_at(rec, fd);
+    if (v < x) { return -1; }
+    if (v > x) { return 1; }
+    return 0;
+  }
+  var w: int64 = rapi__int_at(rec, fd);
+  if (w < i) { return -1; }
+  if (w > i) { return 1; }
+  return 0;
+}
+
+fn rapi__keep(q: RapiQuery*, t: RapiType*, rec: rawptr) -> bool {
+  for k in 0..q->nfilters {
+    var f: RapiFilter* = &q->filters[k];
+    var op: int32 = f->op;
+    if (op == RAPI_F_CONTAINS) {
+      if (!rapi__contains(rapi__str_at(rec, &t->fields[f->field]), f->text)) { return false; }
+      continue;
+    }
+    if (op == RAPI_F_IN) {
+      var hit: bool = false;
+      for j in 0..f->n {
+        var tmp: RapiFilter;
+        tmp.field = f->field;
+        tmp.i = 0;
+        tmp.f = 0.0;
+        var ft: RapiType* = t->fields[f->field].type;
+        if (ft->kind == RAPI_T_INT) { rapi_parse_int(f->list[j], &tmp.i); }
+        if (ft->kind == RAPI_T_NUMBER) { rapi_parse_number(f->list[j], &tmp.f); }
+        if (ft->kind == RAPI_T_BOOL && f->list[j] == "true") { tmp.i = 1; }
+        if (rapi__one(t, &tmp, rec, f->list[j], tmp.i, tmp.f) == 0) { hit = true; break; }
+      }
+      if (!hit) { return false; }
+      continue;
+    }
+    var c: int32 = rapi__one(t, f, rec, f->text, f->i, f->f);
+    var ok: bool = true;
+    if (op == RAPI_F_EQ) { ok = c == 0; }
+    else if (op == RAPI_F_NE) { ok = c != 0; }
+    else if (op == RAPI_F_LT) { ok = c < 0; }
+    else if (op == RAPI_F_LTE) { ok = c <= 0; }
+    else if (op == RAPI_F_GT) { ok = c > 0; }
+    else if (op == RAPI_F_GTE) { ok = c >= 0; }
+    if (!ok) { return false; }
+  }
+  return true;
+}
+
+fn rapi__cmp_items(q: RapiQuery*, t: RapiType*, a: rawptr, b: rawptr) -> int32 {
+  for k in 0..q->nsorts {
+    var s: RapiSort* = &q->sorts[k];
+    var c: int32 = rapi__cmp_field(&t->fields[s->field], a, b);
+    if (c != 0) {
+      if (s->desc) { return 0 - c; }
+      return c;
+    }
+  }
+  return 0;
+}
+
+// Stable merge sort of idx[0..n) by the query's sort fields.
+fn rapi__sort(q: RapiQuery*, t: RapiType*, items: uint8*, idx: int32*, tmp: int32*, n: int64) {
+  var width: int64 = 1;
+  var src: int32* = idx;
+  var dst: int32* = tmp;
+  while (width < n) {
+    var lo: int64 = 0;
+    while (lo < n) {
+      var mid: int64 = lo + width;
+      if (mid > n) { mid = n; }
+      var hi: int64 = lo + 2 * width;
+      if (hi > n) { hi = n; }
+      var i: int64 = lo;
+      var j: int64 = mid;
+      var k: int64 = lo;
+      while (k < hi) {
+        var take_left: bool = false;
+        if (i < mid && j >= hi) { take_left = true; }
+        else if (i < mid) {
+          var ra: rawptr = (rawptr)(items + (int64)src[i] * t->size);
+          var rb: rawptr = (rawptr)(items + (int64)src[j] * t->size);
+          take_left = rapi__cmp_items(q, t, ra, rb) <= 0;
+        }
+        if (take_left) { dst[k] = src[i]; i = i + 1; }
+        else { dst[k] = src[j]; j = j + 1; }
+        k = k + 1;
+      }
+      lo = hi;
+    }
+    var sw: int32* = src;
+    src = dst;
+    dst = sw;
+    width = width * 2;
+  }
+  if (src != idx) { memcpy((rawptr)idx, (rawptr)src, n * 4); }
+}
+
+/// Runs q over `n` records of type `t` stored back to back at `items`: filters,
+/// sorts, then takes one page. The page is copied into the request arena.
+/// out_items / out_n receive the page; q->total the count after filtering;
+/// q->next_after the next cursor (cursor pages, -1 at the end).
+/// returns: false when the arena ran out
+export fn rapi_query_apply(q: RapiQuery*, t: RapiType*, items: rawptr, n: int64, arena: RzArena*, out_items: rawptr*, out_n: int64*) -> bool {
+  var base: uint8* = (uint8*)items;
+  var idx: int32* = (int32*)rz_arena_alloc(arena, (n + 1) * 4);
+  var tmp: int32* = (int32*)rz_arena_alloc(arena, (n + 1) * 4);
+  if (idx == 0 || tmp == 0) { return false; }
+  var idf: RapiField* = rapi_field_get(t, "id");
+  var kept: int64 = 0;
+  for i in 0..n {
+    var rec: rawptr = (rawptr)(base + i * t->size);
+    if (!rapi__keep(q, t, rec)) { continue; }
+    if (q->has_after && idf != 0 && rapi__int_at(rec, idf) <= q->after) { continue; }
+    idx[kept] = (int32)i;
+    kept = kept + 1;
+  }
+  if (q->nsorts > 0) { rapi__sort(q, t, base, idx, tmp, kept); }
+  q->total = kept;
+  var start: int64 = q->offset;
+  if (q->listing != 0 && q->listing->cursor) { start = 0; }
+  if (start > kept) { start = kept; }
+  var count: int64 = kept - start;
+  if (q->limit >= 0 && count > q->limit) { count = q->limit; }
+  var page: uint8* = rz_arena_alloc(arena, (count + 1) * t->size);
+  if (page == 0) { return false; }
+  for i in 0..count {
+    memcpy((rawptr)(page + i * t->size), (rawptr)(base + (int64)idx[start + i] * t->size), t->size);
+  }
+  q->next_after = -1;
+  if (start + count < kept && count > 0 && idf != 0) {
+    q->next_after = rapi__int_at((rawptr)(page + (count - 1) * t->size), idf);
+  }
+  *out_items = (rawptr)page;
+  *out_n = count;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Sending a page
+// ---------------------------------------------------------------------------
+
+// The request URL with limit/offset/cursor replaced.
+fn rapi__page_url(r: RapiReq*, limit: int64, offset: int64, cursor: string) -> string {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, r->ctx->req->path);
+  rz_buf_add_byte(b, 63);
+  var qs: string = r->ctx->req->query;
+  var start: int64 = 0;
+  var n: int64 = (int64)qs.length;
+  for i in 0..(n + 1) {
+    if (i == n || qs.chars[i] == 38) {
+      var pair: string = rz_str_sub(qs, start, (int64)i);
+      start = (int64)i + 1;
+      if (pair.length == 0) { continue; }
+      var eq: int64 = rz_str_find_byte(pair, 61);
+      var name: string = pair;
+      if (eq >= 0) { name = rz_str_sub(pair, 0, eq); }
+      if (name == "limit" || name == "offset" || name == "cursor") { continue; }
+      rz_buf_add(b, pair);
+      rz_buf_add_byte(b, 38);
+    }
+  }
+  rz_buf_add(b, "limit=");
+  rz_buf_add_int(b, limit);
+  if (cursor.length > 0) {
+    rz_buf_add(b, "&cursor=");
+    rz_buf_add(b, cursor);
+  } else if (offset >= 0) {
+    rz_buf_add(b, "&offset=");
+    rz_buf_add_int(b, offset);
+  }
+  var out: string = rz_arena_str(r->ctx->arena, rz_buf_str(b));
+  rz_buf_free(b);
+  return out;
+}
+
+fn rapi__link(b: RzBuf*, url: string, rel: string) {
+  if (rz_buf_str(b).length > 0) { rz_buf_add(b, ", "); }
+  rz_buf_add_byte(b, 60);
+  rz_buf_add(b, url);
+  rz_buf_add(b, ">; rel=\"");
+  rz_buf_add(b, rel);
+  rz_buf_add_byte(b, 34);
+}
+
+/// Sends one page from rapi_query_apply with status 200, the envelope and a Link header.
+export fn rapi_json_page(r: RapiReq*, q: RapiQuery*, t: RapiType*, items: rawptr, n: int64) -> int32 {
+  var arena: RzArena* = r->ctx->arena;
+  var cursor_mode: bool = q->listing != 0 && q->listing->cursor;
+  var next_cursor: string = "";
+  if (q->next_after >= 0) { next_cursor = rapi_cursor_encode(q->next_after, arena); }
+  var links: RzBuf* = rz_buf_new();
+  if (cursor_mode) {
+    rapi__link(links, rapi__page_url(r, q->limit, -1, ""), "first");
+    if (next_cursor.length > 0) { rapi__link(links, rapi__page_url(r, q->limit, -1, next_cursor), "next"); }
+  } else {
+    rapi__link(links, rapi__page_url(r, q->limit, 0, ""), "first");
+    if (q->offset > 0) {
+      var prev: int64 = q->offset - q->limit;
+      if (prev < 0) { prev = 0; }
+      rapi__link(links, rapi__page_url(r, q->limit, prev, ""), "prev");
+    }
+    if (q->offset + n < q->total) { rapi__link(links, rapi__page_url(r, q->limit, q->offset + n, ""), "next"); }
+  }
+  rz_ctx_set_header(r->ctx, "Link", rz_arena_str(arena, rz_buf_str(links)));
+  rz_buf_free(links);
+
+  var b: CodecBuf;
+  codec_buf_init(&b, 1024);
+  var w: CodecJson;
+  codec_json_init_flags(&w, &b, CODEC_JSON_LOSSY_UTF8);
+  codec_json_object(&w);
+  codec_json_key(&w, "items");
+  rapi_encode_list_into(&w, t, items, n, q->mask);
+  if (cursor_mode) {
+    codec_json_field_int(&w, "limit", q->limit);
+    if (next_cursor.length > 0) { codec_json_field_string(&w, "next_cursor", next_cursor); }
+    else { codec_json_field_null(&w, "next_cursor"); }
+  } else {
+    codec_json_field_int(&w, "total", q->total);
+    codec_json_field_int(&w, "limit", q->limit);
+    codec_json_field_int(&w, "offset", q->offset);
+  }
+  codec_json_end(&w);
+  if (codec_json_finish(&w) != CODEC_OK) {
+    codec_buf_free(&b);
+    return rapi_problem(r->ctx, 500, "");
+  }
+  var body: string = rz_arena_str(arena, codec_buf_view(&b));
+  codec_buf_free(&b);
+  return rz_ctx_bytes(r->ctx, 200, RZ_CT_JSON, body);
+}

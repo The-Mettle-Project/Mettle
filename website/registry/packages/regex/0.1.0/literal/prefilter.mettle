@@ -1,0 +1,392 @@
+// Literal prefilter: finds places where a match can start, much faster than
+// running an automaton over every byte.
+//
+// Literal extraction follows Rust's regex-syntax (sets of prefix literals,
+// each exact or not). The search routines are word-at-a-time (SWAR)
+// versions of memchr, memchr2, memchr3 and a rare-byte memmem, as in the
+// Rust memchr crate's fallback paths.
+
+import "std/mem";
+import "regex/core/vec";
+import "regex/hir/class";
+import "regex/hir/hir";
+
+const MAXLITS = 64;
+const MAXLEN = 16;
+
+export const RX_PF_NONE = 0;
+export const RX_PF_MEMCHR = 1;
+export const RX_PF_MEMCHR2 = 2;
+export const RX_PF_MEMCHR3 = 3;
+export const RX_PF_MEMMEM = 4;
+
+export struct RxPrefilter {
+  kind: int32;
+  b1: int32;
+  b2: int32;
+  b3: int32;
+  needle: uint8*;
+  nlen: int64;
+  rare_off: int64;
+  off: int64;       // memchr kinds: offset of the searched byte in the literals
+  exact: bool;      // the pattern is exactly this one literal
+}
+
+struct RxLit {
+  b: uint8[16];
+  n: int32;
+  exact: bool;
+}
+
+struct RxLits {
+  v: RxVec<RxLit>;
+  inf: bool;
+}
+
+const LO = 0x0101010101010101;
+const HI = 0x8080808080808080;
+
+fn first_set_byte(t: uint64) -> int64 {
+  for k in 0..8 {
+    if (((t >> (uint64)(k * 8)) & 0x80) != 0) { return k; }
+  }
+  return 8;
+}
+
+fn load64(p: uint8*) -> uint64 {
+  var q: uint64* = (uint64*)p;
+  return *q;
+}
+
+/// First index i in at..end with h[i] == a, or -1.
+export fn rx_memchr(a: int32, h: uint8*, at: int64, end: int64) -> int64 {
+  var i: int64 = at;
+  var ra: uint64 = (uint64)LO * (uint64)a;
+  while (i + 8 <= end) {
+    var w: uint64 = load64(h + i) ^ ra;
+    var t: uint64 = (w - (uint64)LO) & ~w & (uint64)HI;
+    if (t != 0) { return i + first_set_byte(t); }
+    i = i + 8;
+  }
+  while (i < end) {
+    if ((int32)h[i] == a) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+/// First index with h[i] == a or b, or -1.
+export fn rx_memchr2(a: int32, b: int32, h: uint8*, at: int64, end: int64) -> int64 {
+  var i: int64 = at;
+  var ra: uint64 = (uint64)LO * (uint64)a;
+  var rb: uint64 = (uint64)LO * (uint64)b;
+  while (i + 8 <= end) {
+    var x: uint64 = load64(h + i);
+    var w1: uint64 = x ^ ra;
+    var w2: uint64 = x ^ rb;
+    var t: uint64 = ((w1 - (uint64)LO) & ~w1) | ((w2 - (uint64)LO) & ~w2);
+    t = t & (uint64)HI;
+    if (t != 0) { return i + first_set_byte(t); }
+    i = i + 8;
+  }
+  while (i < end) {
+    var c: int32 = (int32)h[i];
+    if (c == a || c == b) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+/// First index with h[i] == a, b or c, or -1.
+export fn rx_memchr3(a: int32, b: int32, c: int32, h: uint8*, at: int64, end: int64) -> int64 {
+  var i: int64 = at;
+  var ra: uint64 = (uint64)LO * (uint64)a;
+  var rb: uint64 = (uint64)LO * (uint64)b;
+  var rc: uint64 = (uint64)LO * (uint64)c;
+  while (i + 8 <= end) {
+    var x: uint64 = load64(h + i);
+    var w1: uint64 = x ^ ra;
+    var w2: uint64 = x ^ rb;
+    var w3: uint64 = x ^ rc;
+    var t: uint64 = ((w1 - (uint64)LO) & ~w1) | ((w2 - (uint64)LO) & ~w2) | ((w3 - (uint64)LO) & ~w3);
+    t = t & (uint64)HI;
+    if (t != 0) { return i + first_set_byte(t); }
+    i = i + 8;
+  }
+  while (i < end) {
+    var d: int32 = (int32)h[i];
+    if (d == a || d == b || d == c) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// A rough rank of how common a byte is in text (higher = more common).
+fn byte_rank(b: int32) -> int32 {
+  if (b == 32) { return 255; }
+  if (b == 101 || b == 116 || b == 97 || b == 111 || b == 105 || b == 110) { return 240; }
+  if (b == 115 || b == 104 || b == 114 || b == 100 || b == 108 || b == 117) { return 230; }
+  if (b >= 97 && b <= 122) { return 200; }
+  if (b == 10 || b == 44 || b == 46) { return 190; }
+  if (b >= 65 && b <= 90) { return 150; }
+  if (b >= 48 && b <= 57) { return 140; }
+  if (b == 9 || b == 13 || (b >= 33 && b <= 126)) { return 100; }
+  if (b >= 128) { return 60; }
+  return 20;
+}
+
+/// Finds needle in h[at..end] (rare-byte search). Returns the start or -1.
+export fn rx_memmem(nd: uint8*, nn: int64, rare_off: int64, h: uint8*, at: int64, end: int64) -> int64 {
+  if (nn == 0) { return at; }
+  if (end - at < nn) { return -1; }
+  var rare: int32 = (int32)nd[rare_off];
+  var i: int64 = at + rare_off;
+  var last: int64 = end - nn + rare_off;
+  while (i <= last) {
+    var j: int64 = rx_memchr(rare, h, i, last + 1);
+    if (j < 0) { return -1; }
+    var s: int64 = j - rare_off;
+    if (memcmp(h + s, nd, nn) == 0) { return s; }
+    i = j + 1;
+  }
+  return -1;
+}
+
+/// Next place in h[at..end] where a match may start, or -1 for none.
+export fn rx_pf_find(pf: RxPrefilter*, h: uint8*, at: int64, end: int64) -> int64 {
+  var r: int64 = -1;
+  switch (pf->kind) {
+    case 1: { r = rx_memchr(pf->b1, h, at + pf->off, end); }
+    case 2: { r = rx_memchr2(pf->b1, pf->b2, h, at + pf->off, end); }
+    case 3: { r = rx_memchr3(pf->b1, pf->b2, pf->b3, h, at + pf->off, end); }
+    case 4: { return rx_memmem(pf->needle, pf->nlen, pf->rare_off, h, at, end); }
+    default: { return at; }
+  }
+  if (r < 0) { return -1; }
+  return r - pf->off;
+}
+
+// ---- literal extraction ----
+
+fn lits_one(l: RxLits*, b: uint8*, n: int32) {
+  var x: RxLit;
+  x.n = n;
+  x.exact = true;
+  for i in 0..n { x.b[i] = b[i]; }
+  rx_vpush(&l->v, x);
+}
+
+fn encode(cp: uint32, out: uint8*) -> int32 {
+  if (cp < 0x80) { out[0] = (uint8)cp; return 1; }
+  if (cp < 0x800) {
+    out[0] = (uint8)(0xC0 | (cp >> 6));
+    out[1] = (uint8)(0x80 | (cp & 0x3F));
+    return 2;
+  }
+  if (cp < 0x10000) {
+    out[0] = (uint8)(0xE0 | (cp >> 12));
+    out[1] = (uint8)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (uint8)(0x80 | (cp & 0x3F));
+    return 3;
+  }
+  out[0] = (uint8)(0xF0 | (cp >> 18));
+  out[1] = (uint8)(0x80 | ((cp >> 12) & 0x3F));
+  out[2] = (uint8)(0x80 | ((cp >> 6) & 0x3F));
+  out[3] = (uint8)(0x80 | (cp & 0x3F));
+  return 4;
+}
+
+
+fn concat_into(acc: RxLits*, s: RxLits*) -> bool {
+  // Returns false when the product would be too big (acc is then made inexact).
+  var total: int64 = 0;
+  for i in 0..acc->v.len {
+    if (acc->v.data[i].exact) { total = total + s->v.len; } else { total = total + 1; }
+  }
+  if (total > MAXLITS) {
+    for i in 0..acc->v.len { acc->v.data[i].exact = false; }
+    return false;
+  }
+  var nv: RxVec<RxLit>;
+  for i in 0..acc->v.len {
+    var a: RxLit = acc->v.data[i];
+    if (!a.exact) { rx_vpush(&nv, a); continue; }
+    for j in 0..s->v.len {
+      var b: RxLit = s->v.data[j];
+      var x: RxLit = a;
+      var k: int32 = 0;
+      while (k < b.n && x.n < MAXLEN) {
+        x.b[x.n] = b.b[k];
+        x.n = x.n + 1;
+        k = k + 1;
+      }
+      x.exact = b.exact && k == b.n;
+      rx_vpush(&nv, x);
+    }
+  }
+  rx_vfree(&acc->v);
+  acc->v = nv;
+  return true;
+}
+
+fn prefixes(h: RxHir*, id: int32, out: RxLits*) {
+  var nd: RxNode = h->nodes.data[id];
+  var tmp: uint8[4];
+  switch (nd.kind) {
+    case 0: { lits_one(out, &tmp[0], 0); return; }
+    case 3: { lits_one(out, &tmp[0], 0); return; }
+    case 1: {
+      var n: int32 = 1;
+      if (nd.flag != 0) { tmp[0] = (uint8)nd.x; } else { n = encode((uint32)nd.x, &tmp[0]); }
+      lits_one(out, &tmp[0], n);
+      return;
+    }
+    case 2: {
+      var c: RxClass* = &h->classes.data[nd.x];
+      if (rx_cls_size(c) > 16 || c->r.len == 0) { out->inf = true; return; }
+      for i in 0..c->r.len {
+        var r: RxRange = c->r.data[i];
+        var cp: uint32 = r.lo;
+        while (cp <= r.hi) {
+          var n2: int32 = 1;
+          if (nd.flag != 0) { tmp[0] = (uint8)cp; } else { n2 = encode(cp, &tmp[0]); }
+          lits_one(out, &tmp[0], n2);
+          cp = cp + 1;
+        }
+      }
+      return;
+    }
+    case 5: { prefixes(h, nd.sub, out); return; }
+    case 4: {
+      if (nd.x == 0) { out->inf = true; return; }
+      prefixes(h, nd.sub, out);
+      if (!(nd.x == 1 && nd.y == 1)) {
+        for i in 0..out->v.len { out->v.data[i].exact = false; }
+      }
+      return;
+    }
+    case 6: {
+      lits_one(out, &tmp[0], 0);
+      var k: int32 = nd.sub;
+      while (k >= 0) {
+        var any_exact: bool = false;
+        for i in 0..out->v.len { if (out->v.data[i].exact) { any_exact = true; } }
+        if (!any_exact) { return; }
+        var s: RxLits;
+        prefixes(h, k, &s);
+        if (s.inf) {
+          rx_vfree(&s.v);
+          for i in 0..out->v.len { out->v.data[i].exact = false; }
+          return;
+        }
+        var ok: bool = concat_into(out, &s);
+        rx_vfree(&s.v);
+        if (!ok) { return; }
+        k = h->nodes.data[k].next;
+      }
+      return;
+    }
+    case 7: {
+      var k2: int32 = nd.sub;
+      while (k2 >= 0) {
+        var s2: RxLits;
+        prefixes(h, k2, &s2);
+        if (s2.inf || out->v.len + s2.v.len > MAXLITS) {
+          rx_vfree(&s2.v);
+          out->inf = true;
+          return;
+        }
+        for i in 0..s2.v.len { rx_vpush(&out->v, s2.v.data[i]); }
+        rx_vfree(&s2.v);
+        k2 = h->nodes.data[k2].next;
+      }
+      return;
+    }
+    default: { }
+  }
+  out->inf = true;
+}
+
+/// Builds a prefilter for h. pf->kind is RX_PF_NONE when none helps.
+export fn rx_pf_build(h: RxHir*, pf: RxPrefilter*) {
+  pf->kind = RX_PF_NONE;
+  pf->exact = false;
+  var l: RxLits;
+  prefixes(h, h->root, &l);
+  if (l.inf || l.v.len == 0) { rx_vfree(&l.v); return; }
+  var firsts: bool[256];
+  for i in 0..256 { firsts[i] = false; }
+  var nfirst: int32 = 0;
+  for i in 0..l.v.len {
+    var x: RxLit = l.v.data[i];
+    if (x.n == 0) { rx_vfree(&l.v); return; }
+    if (!firsts[x.b[0]]) { firsts[x.b[0]] = true; nfirst = nfirst + 1; }
+  }
+  // All literals the same?
+  var same: bool = true;
+  var a: RxLit = l.v.data[0];
+  for i in 1..l.v.len {
+    var y: RxLit = l.v.data[i];
+    if (y.n != a.n) { same = false; break; }
+    for k in 0..a.n { if (y.b[k] != a.b[k]) { same = false; } }
+  }
+  if (same && a.n >= 2) {
+    pf->kind = RX_PF_MEMMEM;
+    pf->nlen = (int64)a.n;
+    pf->needle = (uint8*)malloc(pf->nlen);
+    var best: int64 = 0;
+    for k in 0..a.n {
+      pf->needle[k] = a.b[k];
+      if (byte_rank((int32)a.b[k]) < byte_rank((int32)a.b[best])) { best = k; }
+    }
+    pf->rare_off = best;
+    pf->exact = a.exact && h->looks == 0;
+    rx_vfree(&l.v);
+    return;
+  }
+  // Pick the byte position (within the shortest literal) whose bytes are
+  // fewest (at most 3) and rarest, like the Rust memchr crate's heuristic.
+  var minlen: int32 = 16;
+  for i in 0..l.v.len { if (l.v.data[i].n < minlen) { minlen = l.v.data[i].n; } }
+  var best_off: int32 = -1;
+  var best_score: int32 = 0x7FFFFFFF;
+  var bs: int32[3];
+  for k in 0..minlen {
+    var seen: bool[256];
+    for b in 0..256 { seen[b] = false; }
+    var cnt: int32 = 0;
+    var score: int32 = 0;
+    for i in 0..l.v.len {
+      var c: int32 = (int32)l.v.data[i].b[k];
+      if (!seen[c]) {
+        seen[c] = true;
+        cnt = cnt + 1;
+        score = score + byte_rank(c);
+      }
+    }
+    if (cnt <= 3 && score < best_score) {
+      best_score = score;
+      best_off = k;
+      var j: int32 = 0;
+      for b in 0..256 {
+        if (seen[b] && j < 3) { bs[j] = b; j = j + 1; }
+      }
+      nfirst = cnt;
+    }
+  }
+  if (best_off >= 0) {
+    pf->off = (int64)best_off;
+    pf->b1 = bs[0];
+    if (nfirst == 1) { pf->kind = RX_PF_MEMCHR; }
+    if (nfirst == 2) { pf->kind = RX_PF_MEMCHR2; pf->b2 = bs[1]; }
+    if (nfirst == 3) { pf->kind = RX_PF_MEMCHR3; pf->b2 = bs[1]; pf->b3 = bs[2]; }
+    if (nfirst == 1 && same && a.n == 1) { pf->exact = a.exact && h->looks == 0; }
+    if (pf->exact) { pf->off = 0; }
+  }
+  rx_vfree(&l.v);
+}
+
+export fn rx_pf_free(pf: RxPrefilter*) {
+  if (pf->kind == RX_PF_MEMMEM && pf->needle != 0) { free(pf->needle); }
+  pf->kind = RX_PF_NONE;
+}

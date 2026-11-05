@@ -1,0 +1,178 @@
+// flux_orm/repo/pool.mettle — a fixed set of sessions shared by threads.
+//
+// An adapter is one connection and is not thread-safe, so a server with N
+// worker threads keeps a pool and gives each request its own session:
+//
+//   import "flux_orm/repo/pool";
+//   var pool: RcPool;
+//   rc_meodb_pool(&pool, 8, "token", "127.0.0.1:5490");   // or rc_pool_new
+//   var s: RcSession* = 0;
+//   if (rc_pool_checkout(&pool, 1000, &s) == RC_OK) {
+//     rc_repo_get(s, ...);
+//     rc_pool_checkin(&pool, s);
+//   }
+//   rc_pool_free(&pool);
+//
+// This file is not in the import root, so only apps that pool pull in
+// std/thread. Checkout and checkin are safe from any thread; one session is
+// used by one thread at a time. A dropped connection needs nothing from the
+// pool: the adapter reconnects on its next call.
+
+import "std/mem";
+import "std/thread";
+
+import "../core/status";
+import "../core/session";
+import "../adapter/adapter";
+
+// A pool of open sessions. Make it with rc_pool_new and free it with
+// rc_pool_free; treat the fields as private.
+export struct RcPool {
+  sessions: RcSession*;      // n sessions, owned; each owns its adapter
+  free_: bool*;              // n flags: true when the session is checked in
+  n: int32;
+  lock: int32;               // spin lock over free_
+  release: fn(RcAdapter*) -> void with alloc, syscall;   // frees one adapter
+}
+
+// Frees the first n sessions' adapters and the pool's arrays.
+fn rc_pool_drop(p: RcPool*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    var a: RcAdapter* = rc_session_adapter(&p->sessions[i]);
+    rc_session_free(&p->sessions[i]);
+    rc_adapter_close(a);
+    p->release(a);
+    i = i + 1;
+  }
+  free((rawptr)p->sessions);
+  free((rawptr)p->free_);
+  p->sessions = 0;
+  p->free_ = 0;
+  p->n = 0;
+}
+
+// Opens n adapters made by make(ctx) on dsn and wraps each in a session.
+//   p        receives the pool
+//   n        sessions, at least 1
+//   make     called n times as make(ctx); returns a new adapter, or 0
+//   ctx      passed to make; may be 0
+//   dsn      passed to rc_adapter_open; borrowed
+//   release  frees one adapter, e.g. rc_meodb_adapter_free
+// Returns RC_OK, or:
+//   RC_ERR_USAGE  p, make or release is 0, or n < 1
+//   RC_ERR_NOMEM  an allocation failed or make returned 0
+//   the first failing rc_adapter_open code
+// On failure every adapter made so far is closed and released.
+export fn rc_pool_new(p: RcPool*, n: int32, make: fn(rawptr) -> RcAdapter* with alloc, syscall,
+                      ctx: rawptr, dsn: string,
+                      release: fn(RcAdapter*) -> void with alloc, syscall) -> int32 {
+  if (p == 0 || make == 0 || release == 0 || n < 1) { return RC_ERR_USAGE; }
+  p->n = 0;
+  p->lock = 0;
+  p->release = release;
+  p->sessions = (RcSession*)malloc((int64)n * sizeof(RcSession));
+  p->free_ = (bool*)malloc((int64)n);
+  if (p->sessions == 0 || p->free_ == 0) {
+    rc_pool_drop(p, 0);
+    return RC_ERR_NOMEM;
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    var a: RcAdapter* = make(ctx);
+    if (a == 0) {
+      rc_pool_drop(p, i);
+      return RC_ERR_NOMEM;
+    }
+    var rc: int32 = rc_adapter_open(a, dsn);
+    if (rc != RC_OK) {
+      release(a);
+      rc_pool_drop(p, i);
+      return rc;
+    }
+    p->sessions[i] = rc_session_new(a);
+    p->free_[i] = true;
+    i = i + 1;
+  }
+  p->n = n;
+  return RC_OK;
+}
+
+// Takes a free session, waiting up to wait_ms for one.
+//   p        the pool
+//   wait_ms  0 to not wait, < 0 to wait forever
+//   out      receives the session; give it back with rc_pool_checkin
+// Returns RC_OK; RC_ERR_BUSY when none was free in time; RC_ERR_USAGE when
+// p or out is 0 or the pool is empty.
+export fn rc_pool_checkout(p: RcPool*, wait_ms: int32, out: RcSession**) -> int32 {
+  if (p == 0 || out == 0 || p->n == 0) { return RC_ERR_USAGE; }
+  *out = 0;
+  var waited: int32 = 0;
+  while (true) {
+    spin_lock(&p->lock);
+    var i: int32 = 0;
+    while (i < p->n) {
+      if (p->free_[i]) {
+        p->free_[i] = false;
+        spin_unlock(&p->lock);
+        *out = &p->sessions[i];
+        return RC_OK;
+      }
+      i = i + 1;
+    }
+    spin_unlock(&p->lock);
+    if (wait_ms >= 0 && waited >= wait_ms) { return RC_ERR_BUSY; }
+    thread_sleep_ms(1);
+    waited = waited + 1;
+  }
+  return RC_ERR_BUSY;
+}
+
+// Gives a session back. An open transaction is rolled back and the
+// session's kept results are released, so its loaded models' text is no
+// longer valid.
+//   p  the pool
+//   s  a session from rc_pool_checkout on p
+// Returns RC_OK; RC_ERR_USAGE when p or s is 0, s is not from p, or it is
+// already checked in.
+export fn rc_pool_checkin(p: RcPool*, s: RcSession*) -> int32 {
+  if (p == 0 || s == 0 || p->n == 0) { return RC_ERR_USAGE; }
+  var i: int64 = ((int64)s - (int64)p->sessions) / sizeof(RcSession);
+  if ((int64)s < (int64)p->sessions || i >= (int64)p->n || &p->sessions[i] != s) {
+    return RC_ERR_USAGE;
+  }
+  if (p->free_[i]) { return RC_ERR_USAGE; }
+  var guard: int32 = 0;
+  while (rc_session_in_tx(s) && guard < 64) {
+    if (rc_session_rollback(s) != RC_OK) { break; }
+    guard = guard + 1;
+  }
+  rc_session_clear(s);
+  spin_lock(&p->lock);
+  p->free_[i] = true;
+  spin_unlock(&p->lock);
+  return RC_OK;
+}
+
+// Number of sessions checked in right now.
+//   p  the pool, or 0 (answers 0)
+export fn rc_pool_idle(p: RcPool*) -> int32 {
+  if (p == 0) { return 0; }
+  spin_lock(&p->lock);
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < p->n) {
+    if (p->free_[i]) { n = n + 1; }
+    i = i + 1;
+  }
+  spin_unlock(&p->lock);
+  return n;
+}
+
+// Closes and frees every session and adapter. Check every session in first;
+// none may be in use.
+//   p  the pool, or 0 (no-op); empty afterwards, so freeing twice is safe
+export fn rc_pool_free(p: RcPool*) {
+  if (p == 0 || p->sessions == 0) { return; }
+  rc_pool_drop(p, p->n);
+}

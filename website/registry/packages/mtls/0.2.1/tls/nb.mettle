@@ -1,0 +1,186 @@
+// MtlsNb: TLS on a non-blocking socket, driven by readiness events from
+// an event loop (alph/io/reactor, alph/sched/exec, alph actors, epoll).
+// Nothing here ever blocks: the handshake advances a little on each
+// event, and every call returns at once.
+//
+//   on start:     mtls_nb_client(&t, fd, &cfg, host) or mtls_nb_server(&t, fd, &cfg)
+//   on an event:  mtls_nb_pump(&t); then read with mtls_nb_read while it
+//                 returns data, write with mtls_nb_write
+//   then arm:     watch fd for mtls_nb_wants(&t) (MTLS_NB_READ / _WRITE)
+//   at the end:   mtls_nb_close(&t), which is safe to call twice and from
+//                 an exit hook (alph_on_exit), so a crashed owner leaks
+//                 nothing
+//
+// MTLS_NB_READ and MTLS_NB_WRITE have the values of ALPH_RX_READ /
+// ALPH_RX_WRITE, ALPH_IO_IN / ALPH_IO_OUT and EPOLLIN / EPOLLOUT, so the
+// mask can be passed to those APIs as it is.
+//
+// An MtlsNb belongs to one thread (or one actor) at a time.
+
+import "std/mem";
+import "std/socket";
+import "mtls/core/err";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+import "mtls/tls/client";
+import "mtls/tls/engine";
+
+export const MTLS_NB_READ: int64 = 1;
+export const MTLS_NB_WRITE: int64 = 4;
+
+export struct MtlsNb {
+  fd: int64;
+  c: MtlsConn*;
+  owns_fd: bool;     // mtls_nb_close also closes fd
+  eof: bool;         // the peer closed the socket
+  ioerr: int32;      // a socket error, MTLS_E_IO, once seen
+}
+
+fn mtls_nb_init(t: MtlsNb*, fd: int64, c: MtlsConn*) -> int32 {
+  memset(t, 0, (int64)sizeof(MtlsNb));
+  t->fd = fd;
+  t->c = c;
+  if (c == 0) { return MTLS_E_NOMEM; }
+  if (sock_set_nonblocking(fd, true) < 0) { return MTLS_E_IO; }
+  return MTLS_OK;
+}
+
+/// mtls_nb_client: starts a client handshake on a connected socket (made
+/// non-blocking here). Call mtls_nb_pump next, then wait for mtls_nb_wants.
+export fn mtls_nb_client(t: MtlsNb*, fd: int64, cfg: MtlsConfig*, host: string) -> int32 {
+  var rc: int32 = mtls_nb_init(t, fd, mtls_client_new(cfg));
+  if (rc != MTLS_OK) { return rc; }
+  return mtls_client_start(t->c, host);
+}
+
+/// mtls_nb_server: starts a server connection on an accepted socket.
+export fn mtls_nb_server(t: MtlsNb*, fd: int64, cfg: MtlsConfig*) -> int32 {
+  return mtls_nb_init(t, fd, mtls_server_new(cfg));
+}
+
+// Sends what is queued until the socket is full. False on a socket error.
+fn mtls_nb_send(t: MtlsNb*) -> bool {
+  var p: uint8* = (uint8*)0;
+  var n: int64 = mtls_conn_out_peek(t->c, &p);
+  while (n > 0) {
+    var r: int64 = sock_send(t->fd, p, n);
+    if (r == -NET_EINTR) { continue; }
+    if (r == -NET_EAGAIN) { return true; }
+    if (r <= 0) { return false; }
+    mtls_conn_out_done(t->c, r);
+    n = mtls_conn_out_peek(t->c, &p);
+  }
+  return true;
+}
+
+/// mtls_nb_pump: moves bytes both ways until the socket would block:
+/// sends what is queued, receives and processes what has arrived (the
+/// handshake moves forward here), and sends any answer. Returns MTLS_OK,
+/// or the connection's error, MTLS_E_IO, or MTLS_E_EOF when the peer
+/// closed the socket in the middle of the handshake.
+export fn mtls_nb_pump(t: MtlsNb*) -> int32 {
+  if (t->c == 0) { return MTLS_E_CLOSED; }
+  var rounds: int32 = 0;
+  while (rounds < 64) {
+    rounds = rounds + 1;
+    if (!mtls_nb_send(t)) {
+      t->ioerr = MTLS_E_IO;
+      return MTLS_E_IO;
+    }
+    if (t->eof || t->c->err != 0) { break; }
+    var p: uint8* = (uint8*)0;
+    var room: int64 = mtls_conn_in_space(t->c, &p);
+    // A full buffer or unread application data: let the caller read first.
+    if (room == 0 || (mtls_conn_wants(t->c) & MTLS_WANT_READ) == 0) { break; }
+    var r: int64 = sock_recv(t->fd, p, room);
+    if (r == -NET_EINTR) { continue; }
+    if (r == -NET_EAGAIN) { break; }
+    if (r < 0) {
+      t->ioerr = MTLS_E_IO;
+      return MTLS_E_IO;
+    }
+    if (r == 0) {
+      t->eof = true;
+      break;
+    }
+    mtls_conn_in_commit(t->c, r);
+  }
+  // Answers produced while processing (Finished, tickets, alerts).
+  if (!mtls_nb_send(t)) {
+    t->ioerr = MTLS_E_IO;
+    return MTLS_E_IO;
+  }
+  if (t->c->err != 0) { return t->c->err; }
+  if (t->eof && mtls_conn_handshaking(t->c)) { return MTLS_E_EOF; }
+  return MTLS_OK;
+}
+
+/// mtls_nb_wants: what to watch the socket for, as MTLS_NB_READ |
+/// MTLS_NB_WRITE. 0 means the connection is finished (failed or closed).
+export fn mtls_nb_wants(t: MtlsNb*) -> int64 {
+  if (t->c == 0 || t->ioerr != 0) { return 0; }
+  var w: int32 = mtls_conn_wants(t->c);
+  var ev: int64 = 0;
+  if ((w & MTLS_WANT_READ) != 0 && !t->eof) { ev = ev | MTLS_NB_READ; }
+  if ((w & MTLS_WANT_WRITE) != 0) { ev = ev | MTLS_NB_WRITE; }
+  return ev;
+}
+
+/// mtls_nb_handshaking: true until the handshake finished or failed.
+export fn mtls_nb_handshaking(t: MtlsNb*) -> bool {
+  return t->c != 0 && mtls_conn_handshaking(t->c) && t->ioerr == 0 && !t->eof;
+}
+
+/// mtls_nb_read: decrypted application data, without waiting. Returns the
+/// count, 0 at a clean end (close_notify), MTLS_E_WANT_IO when nothing is
+/// there yet (wait for mtls_nb_wants), MTLS_E_EOF when the peer closed
+/// the socket without close_notify, or another error.
+export fn mtls_nb_read(t: MtlsNb*, dst: uint8*, cap: int64) -> int64 {
+  if (t->c == 0) { return (int64)MTLS_E_CLOSED; }
+  var r: int64 = mtls_conn_read(t->c, dst, cap);
+  if (r == (int64)MTLS_E_WANT_IO) {
+    var rc: int32 = mtls_nb_pump(t);
+    r = mtls_conn_read(t->c, dst, cap);
+    if (r == (int64)MTLS_E_WANT_IO && rc != MTLS_OK) { return (int64)rc; }
+    if (r == (int64)MTLS_E_WANT_IO && t->eof) { return (int64)MTLS_E_EOF; }
+  }
+  return r;
+}
+
+/// mtls_nb_write: encrypts n bytes and sends as much as the socket takes
+/// now; the rest goes out on later pumps (watch for MTLS_NB_WRITE).
+/// Returns n or a negative error.
+export fn mtls_nb_write(t: MtlsNb*, src: uint8*, n: int64) -> int64 {
+  if (t->c == 0) { return (int64)MTLS_E_CLOSED; }
+  var r: int64 = mtls_conn_write(t->c, src, n);
+  if (r < 0) { return r; }
+  if (!mtls_nb_send(t)) {
+    t->ioerr = MTLS_E_IO;
+    return (int64)MTLS_E_IO;
+  }
+  return r;
+}
+
+/// mtls_nb_pending: bytes queued but not yet sent.
+export fn mtls_nb_pending(t: MtlsNb*) -> int64 {
+  if (t->c == 0) { return 0; }
+  return mtls_out_pending(t->c);
+}
+
+/// mtls_nb_close: sends close_notify (as much as fits now), frees the
+/// connection and closes the socket if owns_fd is set. Safe to call
+/// more than once, and on a connection that never finished.
+export fn mtls_nb_close(t: MtlsNb*) {
+  if (t->c != 0) {
+    if (t->ioerr == 0) {
+      mtls_conn_close(t->c);
+      mtls_nb_send(t);
+    }
+    mtls_conn_free(t->c);
+    t->c = (MtlsConn*)0;
+  }
+  if (t->owns_fd && t->fd >= 0) {
+    sock_close(t->fd);
+  }
+  t->fd = -1;
+}

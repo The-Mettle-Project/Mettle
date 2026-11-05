@@ -1,0 +1,502 @@
+//! Serializes a scene into one standalone SVG document, and renders charts through it.
+//! Depends on core (error, buf, color, target), scene/scene, scene/path and chart/frame.
+//! Output is a pure function of the scene,
+//! the target size, the font and the label: no ids except colour-derived gradient ids,
+//! no <style> block (class rules would leak between charts inlined in one page), and
+//! coordinates written with mp_buf_put_num. The font family is set once on the root;
+//! colours with alpha < 255 use fill-opacity / stroke-opacity. Unknown node kinds are
+//! skipped. Allocates nothing but the growth of out.
+
+import "mistplot/core/error";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/scene/path";
+import "mistplot/chart/chart";
+import "mistplot/chart/frame";
+
+// Gradient ids already written in this document; more distinct gradients than this are
+// written again before each use (same id, same definition, so still correct).
+const SVG_MAX_GRADS: int32 = 32;
+
+struct SvgState {
+  b: MpBuf*;
+  rc: int32;                 // first error; once set, writers do nothing
+  grads: uint64[32];         // fill<<32 | fill2 of each written gradient
+  ngrads: int32;
+}
+
+fn svg_s(st: SvgState*, s: string) {
+  if (st->rc == MP_OK) { st->rc = mp_buf_puts(st->b, s); }
+}
+
+fn svg_c(st: SvgState*, c: int32) {
+  if (st->rc == MP_OK) { st->rc = mp_buf_putc(st->b, c); }
+}
+
+fn svg_n(st: SvgState*, v: float64) {
+  if (st->rc == MP_OK) { st->rc = mp_buf_put_num(st->b, v); }
+}
+
+fn svg_esc(st: SvgState*, s: string) {
+  if (st->rc == MP_OK) { st->rc = mp_buf_put_esc(st->b, s); }
+}
+
+// ` name="v"` with a number value.
+fn svg_na(st: SvgState*, name: string, v: float64) {
+  svg_c(st, 32);
+  svg_s(st, name);
+  svg_s(st, "=\"");
+  svg_n(st, v);
+  svg_c(st, 34);
+}
+
+fn svg_hex2(st: SvgState*, v: uint8) {
+  var hi: int32 = ((int32)v >> 4) & 15;
+  var lo: int32 = (int32)v & 15;
+  if (hi < 10) { svg_c(st, 48 + hi); } else { svg_c(st, 87 + hi); }
+  if (lo < 10) { svg_c(st, 48 + lo); } else { svg_c(st, 87 + lo); }
+}
+
+fn svg_rgb(st: SvgState*, c: MpColor) {
+  svg_c(st, 35);
+  svg_hex2(st, c.r);
+  svg_hex2(st, c.g);
+  svg_hex2(st, c.b);
+}
+
+// ` name="#rrggbb"` plus ` name-opacity="a"` when the colour is not opaque.
+fn svg_paint(st: SvgState*, name: string, c: MpColor) {
+  svg_c(st, 32);
+  svg_s(st, name);
+  svg_s(st, "=\"");
+  svg_rgb(st, c);
+  svg_c(st, 34);
+  if (c.a != 255) {
+    svg_c(st, 32);
+    svg_s(st, name);
+    svg_s(st, "-opacity=\"");
+    svg_n(st, (float64)c.a / 255.0);
+    svg_c(st, 34);
+  }
+}
+
+fn svg_class(st: SvgState*, cls: int32) {
+  svg_s(st, " class=\"mp-c-");
+  if (cls >= MP_CLS_SERIES) {
+    svg_s(st, "series mp-s-");
+    if (st->rc == MP_OK) { st->rc = mp_buf_put_i64(st->b, (int64)(cls - MP_CLS_SERIES)); }
+  } else {
+    switch (cls) {
+      case MP_CLS_BG: { svg_s(st, "bg"); }
+      case MP_CLS_PLOT: { svg_s(st, "plot"); }
+      case MP_CLS_GRID: { svg_s(st, "grid"); }
+      case MP_CLS_AXIS: { svg_s(st, "axis"); }
+      case MP_CLS_TICK: { svg_s(st, "tick"); }
+      case MP_CLS_LABEL: { svg_s(st, "label"); }
+      case MP_CLS_TITLE: { svg_s(st, "title"); }
+      case MP_CLS_LEGEND: { svg_s(st, "legend"); }
+      default: {
+        if (st->rc == MP_OK) { st->rc = mp_buf_put_i64(st->b, (int64)cls); }
+      }
+    }
+  }
+  svg_c(st, 34);
+}
+
+fn svg_end(st: SvgState*, cls: int32) {
+  svg_class(st, cls);
+  svg_s(st, "/>\n");
+}
+
+// stroke, stroke-width, joins/caps and dasharray; nothing when there is no stroke.
+fn svg_stroke(st: SvgState*, nd: MpNode*) {
+  if (!(nd->stroke_w > 0.0) || nd->stroke.a == 0) { return; }
+  svg_paint(st, "stroke", nd->stroke);
+  svg_na(st, "stroke-width", nd->stroke_w);
+  var round: bool = (nd->flags & MP_NF_ROUND) != 0;
+  if (round) { svg_s(st, " stroke-linejoin=\"round\" stroke-linecap=\"round\""); }
+  var d: float64[2];
+  var ndash: int32 = mp_dash_pattern(nd->dash, nd->stroke_w, &d[0]);
+  if (ndash == 2) {
+    if (nd->dash == MP_DASH_DOTTED && !round) { svg_s(st, " stroke-linecap=\"round\""); }
+    svg_s(st, " stroke-dasharray=\"");
+    svg_n(st, d[0]);
+    svg_c(st, 32);
+    svg_n(st, d[1]);
+    svg_c(st, 34);
+  }
+}
+
+// ` fill="..."` for shapes whose SVG default fill is black.
+fn svg_fill(st: SvgState*, c: MpColor) {
+  if (c.a == 0) {
+    svg_s(st, " fill=\"none\"");
+  } else {
+    svg_paint(st, "fill", c);
+  }
+}
+
+fn svg_rect(st: SvgState*, nd: MpNode*) {
+  svg_s(st, "  <rect");
+  svg_na(st, "x", nd->x);
+  svg_na(st, "y", nd->y);
+  svg_na(st, "width", nd->w);
+  svg_na(st, "height", nd->h);
+  svg_fill(st, nd->fill);
+  svg_stroke(st, nd);
+  svg_end(st, nd->cls);
+}
+
+fn svg_line(st: SvgState*, s: MpScene*, nd: MpNode*) {
+  var p: float64* = mp_scene_node_pts(s, nd);
+  if (p == 0 || nd->pts_len < 4) { return; }
+  svg_s(st, "  <line");
+  svg_na(st, "x1", p[0]);
+  svg_na(st, "y1", p[1]);
+  svg_na(st, "x2", p[2]);
+  svg_na(st, "y2", p[3]);
+  svg_stroke(st, nd);
+  svg_end(st, nd->cls);
+}
+
+fn svg_poly(st: SvgState*, s: MpScene*, nd: MpNode*) {
+  var p: float64* = mp_scene_node_pts(s, nd);
+  if (p == 0 || nd->pts_len < 2) { return; }
+  svg_s(st, "  <polyline points=\"");
+  var i: int32 = 0;
+  while (i + 1 < nd->pts_len) {
+    if (i > 0) { svg_c(st, 32); }
+    svg_n(st, p[i]);
+    svg_c(st, 44);
+    svg_n(st, p[i + 1]);
+    i = i + 2;
+  }
+  svg_s(st, "\" fill=\"none\"");
+  svg_stroke(st, nd);
+  svg_end(st, nd->cls);
+}
+
+fn svg_pt(st: SvgState*, p: float64*, i: int32) {
+  svg_n(st, p[i]);
+  svg_c(st, 44);
+  svg_n(st, p[i + 1]);
+}
+
+// The d attribute; commands are trusted to carry their points (the scene builds them).
+fn svg_d(st: SvgState*, s: MpScene*, nd: MpNode*) {
+  var p: float64* = mp_scene_node_pts(s, nd);
+  var c: uint8* = mp_scene_node_cmds(s, nd);
+  svg_s(st, " d=\"");
+  var pi: int32 = 0;
+  var ci: int32 = 0;
+  while (c != 0 && p != 0 && ci < nd->cmd_len) {
+    var cmd: int32 = (int32)c[ci];
+    if (ci > 0) { svg_c(st, 32); }
+    if (cmd == MP_PATH_MOVE || cmd == MP_PATH_LINE) {
+      if (cmd == MP_PATH_MOVE) { svg_c(st, 77); } else { svg_c(st, 76); }
+      svg_pt(st, p, pi);
+      pi = pi + 2;
+    } else if (cmd == MP_PATH_CUBIC) {
+      svg_c(st, 67);
+      svg_pt(st, p, pi);
+      svg_c(st, 32);
+      svg_pt(st, p, pi + 2);
+      svg_c(st, 32);
+      svg_pt(st, p, pi + 4);
+      pi = pi + 6;
+    } else {
+      svg_c(st, 90);
+    }
+    ci = ci + 1;
+  }
+  svg_c(st, 34);
+}
+
+fn svg_grad_id(st: SvgState*, a: MpColor, b: MpColor) {
+  svg_s(st, "mp-g-");
+  svg_hex2(st, a.r);
+  svg_hex2(st, a.g);
+  svg_hex2(st, a.b);
+  svg_hex2(st, a.a);
+  svg_hex2(st, b.r);
+  svg_hex2(st, b.g);
+  svg_hex2(st, b.b);
+  svg_hex2(st, b.a);
+}
+
+fn svg_stop(st: SvgState*, offset: string, c: MpColor) {
+  svg_s(st, "<stop offset=\"");
+  svg_s(st, offset);
+  svg_s(st, "\" stop-color=\"");
+  svg_rgb(st, c);
+  svg_c(st, 34);
+  if (c.a != 255) { svg_na(st, "stop-opacity", (float64)c.a / 255.0); }
+  svg_s(st, "/>");
+}
+
+fn svg_key(c: MpColor) -> uint64 {
+  return ((uint64)c.r << 24) | ((uint64)c.g << 16) | ((uint64)c.b << 8) | (uint64)c.a;
+}
+
+// Writes the <defs> for a gradient unless this document already has it.
+fn svg_grad_def(st: SvgState*, a: MpColor, b: MpColor) {
+  var key: uint64 = (svg_key(a) << 32) | svg_key(b);
+  var i: int32 = 0;
+  while (i < st->ngrads) {
+    if (st->grads[i] == key) { return; }
+    i = i + 1;
+  }
+  if (st->ngrads < SVG_MAX_GRADS) {
+    st->grads[st->ngrads] = key;
+    st->ngrads = st->ngrads + 1;
+  }
+  svg_s(st, "  <defs><linearGradient id=\"");
+  svg_grad_id(st, a, b);
+  svg_s(st, "\" x2=\"0\" y2=\"1\">");
+  svg_stop(st, "0", a);
+  svg_stop(st, "1", b);
+  svg_s(st, "</linearGradient></defs>\n");
+}
+
+fn svg_path(st: SvgState*, s: MpScene*, nd: MpNode*) {
+  if (nd->cmd_len <= 0) { return; }
+  var grad: bool = (nd->flags & MP_NF_GRADIENT) != 0 && (nd->fill.a != 0 || nd->fill2.a != 0);
+  if (grad) { svg_grad_def(st, nd->fill, nd->fill2); }
+  svg_s(st, "  <path");
+  svg_d(st, s, nd);
+  if (grad) {
+    svg_s(st, " fill=\"url(#");
+    svg_grad_id(st, nd->fill, nd->fill2);
+    svg_s(st, ")\"");
+  } else {
+    svg_fill(st, nd->fill);
+  }
+  svg_stroke(st, nd);
+  svg_end(st, nd->cls);
+}
+
+fn svg_marker(st: SvgState*, nd: MpNode*) {
+  var r: float64 = nd->r;
+  if (nd->marker == MP_MARK_CIRCLE) {
+    svg_s(st, "  <circle");
+    svg_na(st, "cx", nd->x);
+    svg_na(st, "cy", nd->y);
+    svg_na(st, "r", r);
+  } else if (nd->marker == MP_MARK_SQUARE) {
+    svg_s(st, "  <rect");
+    svg_na(st, "x", nd->x - r);
+    svg_na(st, "y", nd->y - r);
+    svg_na(st, "width", r * 2.0);
+    svg_na(st, "height", r * 2.0);
+  } else if (nd->marker == MP_MARK_DIAMOND) {
+    svg_s(st, "  <path d=\"M");
+    svg_n(st, nd->x);
+    svg_c(st, 44);
+    svg_n(st, nd->y - r);
+    svg_s(st, " L");
+    svg_n(st, nd->x + r);
+    svg_c(st, 44);
+    svg_n(st, nd->y);
+    svg_s(st, " L");
+    svg_n(st, nd->x);
+    svg_c(st, 44);
+    svg_n(st, nd->y + r);
+    svg_s(st, " L");
+    svg_n(st, nd->x - r);
+    svg_c(st, 44);
+    svg_n(st, nd->y);
+    svg_s(st, " Z\"");
+  } else {
+    return;
+  }
+  svg_fill(st, nd->fill);
+  svg_stroke(st, nd);
+  svg_end(st, nd->cls);
+}
+
+fn svg_text(st: SvgState*, s: MpScene*, nd: MpNode*) {
+  svg_s(st, "  <text");
+  svg_na(st, "x", nd->x);
+  svg_na(st, "y", nd->y);
+  svg_paint(st, "fill", nd->fill);
+  svg_na(st, "font-size", nd->size);
+  if (nd->align == MP_ALIGN_CENTER) { svg_s(st, " text-anchor=\"middle\""); }
+  if (nd->align == MP_ALIGN_END) { svg_s(st, " text-anchor=\"end\""); }
+  if ((nd->flags & MP_NF_BOLD) != 0) { svg_s(st, " font-weight=\"600\""); }
+  if ((nd->flags & MP_NF_TABULAR) != 0) {
+    svg_s(st, " style=\"font-variant-numeric:tabular-nums\"");
+  }
+  svg_class(st, nd->cls);
+  svg_c(st, 62);
+  svg_esc(st, mp_scene_node_text(s, nd));
+  svg_s(st, "</text>\n");
+}
+
+fn svg_node(st: SvgState*, s: MpScene*, nd: MpNode*) {
+  switch (nd->kind) {
+    case MP_NODE_RECT: { svg_rect(st, nd); }
+    case MP_NODE_LINE: { svg_line(st, s, nd); }
+    case MP_NODE_POLY: { svg_poly(st, s, nd); }
+    case MP_NODE_PATH: { svg_path(st, s, nd); }
+    case MP_NODE_MARKER: { svg_marker(st, nd); }
+    case MP_NODE_TEXT: { svg_text(st, s, nd); }
+    default: { }
+  }
+}
+
+fn svg_root(st: SvgState*, w: float64, h: float64, font: string, label: string) {
+  svg_s(st, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 ");
+  svg_n(st, w);
+  svg_c(st, 32);
+  svg_n(st, h);
+  svg_c(st, 34);
+  svg_na(st, "width", w);
+  svg_na(st, "height", h);
+  svg_s(st, " style=\"max-width:100%;height:auto\" role=\"img\"");
+  if (label.length > 0) {
+    svg_s(st, " aria-label=\"");
+    svg_esc(st, label);
+    svg_c(st, 34);
+  }
+  svg_s(st, " font-family=\"");
+  if (font.length > 0) { svg_esc(st, font); } else { svg_esc(st, MP_FONT_STACK); }
+  svg_s(st, "\">\n");
+}
+
+/// Writes a scene as an SVG document sized to the target.
+/// The root carries viewBox, width and height (t->width x t->height), a responsive
+/// style, role="img", aria-label (omitted when label is "") and font-family once.
+/// Rect, line, polyline, path (M L C Z, gradient fills through an inline <defs> written
+/// before first use), marker (circle, rect or diamond path) and text nodes become one
+/// element per line; t->scale is not used because SVG is resolution independent.
+///
+/// @param s The scene. Valid: non-zero, with no polyline or path open.
+/// @param t The target; only width and height are read. Valid: non-zero, width and height
+///   finite and in (0, 1e9).
+/// @param font CSS font-family list for every text node. Valid: any; "" uses
+///   MP_FONT_STACK.
+/// @param label Accessible name (usually the chart title). Valid: any; "" omits it.
+/// @param out Receives the document. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s, t or out is 0, or the size is out of range; out is empty.
+/// @error MP_ERR_STATE a polyline or path is still open; out is empty.
+/// @error MP_ERR_ALLOC out could not grow; out holds a partial document.
+/// @mem out belongs to the caller; nothing is retained from the arguments.
+/// @thread One thread at a time per scene and per out.
+/// @cost O(nodes + points); allocates only for the growth of out.
+export fn mp_svg_scene(s: MpScene*, t: MpTarget*, font: string, label: string,
+                       out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (s == 0 || t == 0) { return MP_ERR_ARG; }
+  if (!(t->width > 0.0) || !(t->height > 0.0)) { return MP_ERR_ARG; }
+  if (t->width >= 1e9 || t->height >= 1e9) { return MP_ERR_ARG; }
+  if (s->open >= 0) { return MP_ERR_STATE; }
+  var st: SvgState;
+  st.b = out;
+  st.rc = MP_OK;
+  st.ngrads = 0;
+  svg_root(&st, t->width, t->height, font, label);
+  var i: int64 = 0;
+  var n: int64 = mp_scene_count(s);
+  while (i < n && st.rc == MP_OK) {
+    svg_node(&st, s, mp_scene_node(s, i));
+    i = i + 1;
+  }
+  svg_s(&st, "</svg>\n");
+  return st.rc;
+}
+
+fn svg_chart(c: MpChart*, t: MpTarget*, out: MpBuf*) -> int32 {
+  var rc: int32 = mp_frame_scene(c, t);
+  if (rc != MP_OK) { return rc; }
+  c->stats.svg_renders = c->stats.svg_renders + 1;
+  return mp_chart_fail(c, mp_svg_scene(c->scene, t, c->font, c->title, out));
+}
+
+/// Renders a chart as an SVG document of w x h px.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param w Width. Units: px. Valid: finite, in (0, 1e9).
+/// @param h Height. Units: px. Valid: finite, in (0, 1e9).
+/// @param out Receives the document. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code (also recorded as the chart's sticky error).
+/// @error MP_ERR_ARG c or out is 0, or the size is out of range; out is empty.
+/// @error MP_ERR_ALLOC the frame or out could not grow; out is empty or partial.
+/// @mem out belongs to the caller; nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost The frame (cached per seq and size) plus O(nodes + points).
+export fn mp_chart_svg(c: MpChart*, w: float64, h: float64, out: MpBuf*) -> int32 {
+  var t: MpTarget = mp_target(w, h);
+  return mp_chart_svg_target(c, &t, out);
+}
+
+/// Renders a chart as an SVG document for a target (its width and height; the device
+/// scale only moves the pixel snapping).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param t The target. Valid: non-zero, as for mp_chart_scene.
+/// @param out Receives the document. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code (also recorded as the chart's sticky error).
+/// @error MP_ERR_ARG c, t or out is 0, or the target is out of range; out is empty.
+/// @error MP_ERR_ALLOC the frame or out could not grow; out is empty or partial.
+/// @mem out belongs to the caller; nothing is retained from t.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost The frame (cached per seq and target) plus O(nodes + points).
+export fn mp_chart_svg_target(c: MpChart*, t: MpTarget*, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = svg_chart(c, t, out);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Makes the chart's SVG cache hold the document at w x h px (rebuilt when seq or the size
+/// changed), with the chart entered.
+///
+/// @param c The chart. Valid: non-zero, entered or locked.
+/// @param w Width. Units: px. Valid: finite, in (0, 1e9).
+/// @param h Height. Units: px. Valid: finite, in (0, 1e9).
+/// @return MP_OK (c->svg holds the document), or an error code (also recorded).
+/// @error MP_ERR_ARG the size is out of range.
+/// @error MP_ERR_ALLOC the frame or the cache could not grow.
+/// @mem The cache (c->svg) belongs to the chart and grows only.
+/// @thread Call with the chart entered or locked.
+/// @internal
+export fn mp_svg_cached(c: MpChart*, w: float64, h: float64) -> int32 {
+  if (c->svg_ok && c->svg_seq == c->seq && c->svg_w == w && c->svg_h == h) { return MP_OK; }
+  if (c->svg == 0) { c->svg = mp_buf_new(4096); }
+  if (c->svg == 0) { return mp_chart_fail(c, MP_ERR_ALLOC); }
+  var t: MpTarget = mp_target(w, h);
+  var rc: int32 = svg_chart(c, &t, c->svg);
+  c->svg_ok = rc == MP_OK;
+  c->svg_seq = c->seq;
+  c->svg_w = w;
+  c->svg_h = h;
+  return rc;
+}
+
+/// The chart's SVG at w x h px from a chart-owned cache keyed by (seq, w, h).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param w Width. Units: px. Valid: finite, in (0, 1e9).
+/// @param h Height. Units: px. Valid: finite, in (0, 1e9).
+/// @return The document, or "" when c is 0 or rendering failed (see mp_chart_error).
+/// @error MP_ERR_ARG the size is out of range ("" returned, error recorded).
+/// @error MP_ERR_ALLOC the frame or the cache could not grow ("" returned, error recorded).
+/// @mem Borrowed from the chart: valid while you hold mp_chart_lock and until the next
+///   render call; copy it to keep it.
+/// @thread Call between mp_chart_lock and mp_chart_unlock when other threads use c.
+/// @cost O(1) when cached; otherwise as mp_chart_svg.
+export fn mp_chart_svg_view(c: MpChart*, w: float64, h: float64) -> string {
+  if (c == 0) { return ""; }
+  mp_chart_enter(c);
+  var v: string = "";
+  if (mp_svg_cached(c, w, h) == MP_OK) { v = mp_buf_str(c->svg); }
+  mp_chart_leave(c);
+  return v;
+}

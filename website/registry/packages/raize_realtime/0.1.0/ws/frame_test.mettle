@@ -1,0 +1,141 @@
+// Tests for raize/ws/frame. Vectors from RFC 6455 §5.7 where one exists.
+
+import "std/mem";
+import "raize_core/str/str";
+import "frame";
+
+// Writes the bytes spelled by `hex` ("81 05 48", spaces ignored) into p.
+fn rz_wst_set(p: uint8*, hex: string) -> int64 {
+  var n: int64 = 0;
+  var i: int64 = 0;
+  var len: int64 = (int64)hex.length;
+  while (i + 1 < len) {
+    var hi: int32 = rz_char_hex_value((int32)hex.chars[i]);
+    if (hi < 0) {
+      i = i + 1;
+    } else {
+      p[n] = (uint8)(hi * 16 + rz_char_hex_value((int32)hex.chars[i + 1]));
+      n = n + 1;
+      i = i + 2;
+    }
+  }
+  return n;
+}
+
+@test fn t_rz_ws_parse_rfc_unmasked_hello() -> int32 {
+  var b: uint8[16];
+  var n: int64 = rz_wst_set(&b[0], "81 05 48 65 6c 6c 6f");
+  var f: RzWsFrame;
+  if (rz_ws_frame_parse(&b[0], n, 1024, false, &f) != RZ_WS_FRAME_OK) { return 1; }
+  if (!f.fin || f.opcode != RZ_WS_OP_TEXT || f.masked) { return 2; }
+  if (f.head_len != 2 || f.payload_len != 5 || f.frame_len != 7) { return 3; }
+  if (!rz_str_eq(rz_str_view(&b[2], 5), "Hello")) { return 4; }
+  // A client must mask: the same bytes from a client are a protocol error.
+  if (rz_ws_frame_parse(&b[0], n, 1024, true, &f) != RZ_WS_E_PROTOCOL) { return 5; }
+  // Every proper prefix needs more bytes.
+  var k: int64 = 0;
+  while (k < n) {
+    if (rz_ws_frame_parse(&b[0], k, 1024, false, &f) != RZ_WS_NEED_MORE) { return 6; }
+    k = k + 1;
+  }
+  return 0;
+}
+
+@test fn t_rz_ws_parse_rfc_masked_hello() -> int32 {
+  var b: uint8[16];
+  var n: int64 = rz_wst_set(&b[0], "81 85 37 fa 21 3d 7f 9f 4d 51 58");
+  var f: RzWsFrame;
+  if (rz_ws_frame_parse(&b[0], n, 1024, true, &f) != RZ_WS_FRAME_OK) { return 1; }
+  if (!f.masked || f.head_len != 6 || f.payload_len != 5) { return 2; }
+  rz_ws_unmask(&b[6], 5, &f.mask[0], 0);
+  if (!rz_str_eq(rz_str_view(&b[6], 5), "Hello")) { return 3; }
+  if (rz_ws_frame_parse(&b[0], 5, 1024, true, &f) != RZ_WS_NEED_MORE) { return 4; }
+  return 0;
+}
+
+@test fn t_rz_ws_unmask_in_pieces() -> int32 {
+  var b: uint8[8];
+  rz_wst_set(&b[0], "7f 9f 4d 51 58");
+  var m: uint8[4];
+  rz_wst_set(&m[0], "37 fa 21 3d");
+  var phase: int64 = rz_ws_unmask(&b[0], 3, &m[0], 0);
+  if (phase != 3) { return 1; }
+  rz_ws_unmask(&b[3], 2, &m[0], phase);
+  if (!rz_str_eq(rz_str_view(&b[0], 5), "Hello")) { return 2; }
+  return 0;
+}
+
+@test fn t_rz_ws_parse_fragments_and_control() -> int32 {
+  var b: uint8[16];
+  var f: RzWsFrame;
+  var n: int64 = rz_wst_set(&b[0], "01 03 48 65 6c");
+  if (rz_ws_frame_parse(&b[0], n, 1024, false, &f) != RZ_WS_FRAME_OK) { return 1; }
+  if (f.fin || f.opcode != RZ_WS_OP_TEXT) { return 2; }
+  n = rz_wst_set(&b[0], "80 02 6c 6f");
+  if (rz_ws_frame_parse(&b[0], n, 1024, false, &f) != RZ_WS_FRAME_OK) { return 3; }
+  if (!f.fin || f.opcode != RZ_WS_OP_CONT) { return 4; }
+  n = rz_wst_set(&b[0], "89 05 48 65 6c 6c 6f");
+  if (rz_ws_frame_parse(&b[0], n, 1024, false, &f) != RZ_WS_FRAME_OK) { return 5; }
+  if (f.opcode != RZ_WS_OP_PING) { return 6; }
+  // A fragmented ping, and a 126-byte ping, are protocol errors.
+  b[0] = (uint8)0x09;
+  if (rz_ws_frame_parse(&b[0], n, 1024, false, &f) != RZ_WS_E_PROTOCOL) { return 7; }
+  rz_wst_set(&b[0], "89 7e 00 7e");
+  if (rz_ws_frame_parse(&b[0], 4, 1024, false, &f) != RZ_WS_E_PROTOCOL) { return 8; }
+  return 0;
+}
+
+@test fn t_rz_ws_parse_rejects() -> int32 {
+  var b: uint8[16];
+  var f: RzWsFrame;
+  rz_wst_set(&b[0], "c1 00");                    // RSV1
+  if (rz_ws_frame_parse(&b[0], 2, 1024, false, &f) != RZ_WS_E_PROTOCOL) { return 1; }
+  rz_wst_set(&b[0], "83 00");                    // opcode 3
+  if (rz_ws_frame_parse(&b[0], 2, 1024, false, &f) != RZ_WS_E_PROTOCOL) { return 2; }
+  rz_wst_set(&b[0], "82 7e 00 05");        // 16-bit length for 5
+  if (rz_ws_frame_parse(&b[0], 4, 1024, false, &f) != RZ_WS_E_PROTOCOL) { return 3; }
+  rz_wst_set(&b[0], "82 7f 80 00 00 00 00 00 00 00");   // top bit set
+  if (rz_ws_frame_parse(&b[0], 10, 1024, false, &f) != RZ_WS_E_PROTOCOL) { return 4; }
+  rz_wst_set(&b[0], "82 7f 00 00 00 00 00 00 01 00"); // 64-bit for 256
+  if (rz_ws_frame_parse(&b[0], 10, 1024, false, &f) != RZ_WS_E_PROTOCOL) { return 5; }
+  rz_wst_set(&b[0], "82 7e 04 01");        // 1025 > max 1024
+  if (rz_ws_frame_parse(&b[0], 4, 1024, false, &f) != RZ_WS_E_TOO_BIG) { return 6; }
+  rz_wst_set(&b[0], "82 7f 00 00 01 00 00 00 00 00");    // 2^40
+  if (rz_ws_frame_parse(&b[0], 10, 1 << 30, false, &f) != RZ_WS_E_TOO_BIG) { return 7; }
+  return 0;
+}
+
+@test fn t_rz_ws_head_lengths() -> int32 {
+  var h: uint8[16];
+  var f: RzWsFrame;
+  if (rz_ws_frame_head(true, RZ_WS_OP_TEXT, 5, &h[0], 16) != 2) { return 1; }
+  if (h[0] != (uint8)0x81 || h[1] != (uint8)5) { return 2; }
+  if (rz_ws_frame_head(true, RZ_WS_OP_BINARY, 256, &h[0], 16) != 4) { return 3; }
+  if (h[1] != (uint8)0x7E || h[2] != (uint8)1 || h[3] != (uint8)0) { return 4; }
+  if (rz_ws_frame_head(true, RZ_WS_OP_BINARY, 65536, &h[0], 16) != 10) { return 5; }
+  if (h[1] != (uint8)0x7F || h[7] != (uint8)1 || h[9] != (uint8)0) { return 6; }
+  // The parser reads back what the encoder wrote (head only: n = head + len
+  // is not available, so check NEED_MORE then the declared sizes).
+  if (rz_ws_frame_parse(&h[0], 10, 1 << 20, false, &f) != RZ_WS_NEED_MORE) { return 7; }
+  if (f.payload_len != 65536 || f.head_len != 10) { return 8; }
+  if (rz_ws_frame_head(true, RZ_WS_OP_PING, 126, &h[0], 16) != -1) { return 9; }
+  if (rz_ws_frame_head(false, RZ_WS_OP_CLOSE, 2, &h[0], 16) != -1) { return 10; }
+  if (rz_ws_frame_head(true, 3, 0, &h[0], 16) != -1) { return 11; }
+  return 0;
+}
+
+@test fn t_rz_ws_close_codes() -> int32 {
+  var b: RzBuf* = rz_buf_new();
+  var fail: int32 = 0;
+  rz_ws_close_append(b, RZ_WS_CLOSE_NORMAL, "bye");
+  var f: RzWsFrame;
+  if (rz_ws_frame_parse(b->data, b->len, 0, false, &f) != RZ_WS_FRAME_OK) { fail = 1; }
+  if (fail == 0 && (f.opcode != RZ_WS_OP_CLOSE || f.payload_len != 5)) { fail = 2; }
+  if (fail == 0 && rz_ws_close_code(b->data + 2, 3) != 1000) { fail = 3; }
+  if (fail == 0 && rz_ws_close_code(b->data + 2, 0) != RZ_WS_CLOSE_NONE) { fail = 4; }
+  if (fail == 0 && rz_ws_close_code(b->data + 2, 1) != -1) { fail = 5; }
+  if (fail == 0 && (rz_ws_close_code_ok(1005) || rz_ws_close_code_ok(1015) || rz_ws_close_code_ok(999))) { fail = 6; }
+  if (fail == 0 && (!rz_ws_close_code_ok(4000) || rz_ws_close_code_ok(5000))) { fail = 7; }
+  rz_buf_free(b);
+  return fail;
+}

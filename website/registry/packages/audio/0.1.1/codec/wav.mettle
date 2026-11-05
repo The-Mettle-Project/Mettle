@@ -1,0 +1,482 @@
+// WAV: RIFF/WAVE and RF64 files (EBU Tech 3306), read and written.
+//
+// Reads PCM (8 to 32 bits, any valid-bits count), IEEE float (32 and 64
+// bits), A-law and mu-law (ITU-T G.711), IMA ADPCM and Microsoft ADPCM,
+// and WAVE_FORMAT_EXTENSIBLE around any of them. Writes PCM and float,
+// with WAVE_FORMAT_EXTENSIBLE when there are more than 2 channels or a
+// speaker mask, and RF64 when the data passes 4 GB.
+//
+// The decoder follows the stream contract in codec/stream.mettle: open,
+// then next() hands out blocks of up to 1024 frames as full-scale int32
+// (outi) for integer data or float32 (out) for float data.
+
+import "std/mem";
+import "../core/status";
+import "../core/bits";
+import "../core/buf";
+import "../core/pcm";
+import "../dsp/convert";
+
+const WAV_PCM = 1;
+const WAV_MSADPCM = 2;
+const WAV_FLOAT = 3;
+const WAV_ALAW = 6;
+const WAV_MULAW = 7;
+const WAV_IMA = 17;
+const WAV_EXT = 65534;
+const WAV_BLOCK = 1024;
+
+export struct AudioWav {
+  info: AudioInfo;
+  out: float32*;      // float data: interleaved floats of the last block
+  outi: int32*;       // integer data: interleaved full-scale int32 of the last block
+  out_frames: int32;
+  p: uint8*;
+  data: int64;        // offset of the first sample byte
+  size: int64;        // bytes of sample data
+  tag: int32;
+  align: int32;       // bytes per frame, or per ADPCM block
+  ssize: int32;       // bytes per sample (PCM and float)
+  spb: int32;         // frames per ADPCM block
+  pos: int64;         // next frame to hand out
+  coef: int32[64];    // MS ADPCM coefficient pairs
+  ncoef: int32;
+  blk: int32*;        // one decoded ADPCM block, interleaved
+  blk_no: int64;      // which block is in blk, or -1
+}
+
+// ---- G.711 ----
+
+fn wav_alaw(v: int32) -> int32 {
+  var a: int32 = v ^ 0x55;
+  var t: int32 = (a & 15) << 4;
+  var seg: int32 = (a & 0x70) >> 4;
+  if (seg == 0) { t = t + 8; } else if (seg == 1) { t = t + 0x108; } else { t = (t + 0x108) << (seg - 1); }
+  if ((a & 0x80) != 0) { return t; }
+  return -t;
+}
+
+fn wav_mulaw(v: int32) -> int32 {
+  var u: int32 = ~v & 255;
+  var t: int32 = ((u & 15) << 3) + 0x84;
+  t = t << ((u & 0x70) >> 4);
+  if ((u & 0x80) != 0) { return 0x84 - t; }
+  return t - 0x84;
+}
+
+// ---- ADPCM ----
+
+const IMA_STEP: int32[89] = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+  50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371,
+  408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+  2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+  10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
+const IMA_INDEX: int32[16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+const MS_ADAPT: int32[16] = [230, 230, 230, 230, 307, 409, 512, 614, 768, 614, 512, 409, 307, 230, 230, 230];
+const MS_COEF: int32[14] = [256, 0, 512, -256, 0, 0, 192, 64, 240, 0, 460, -208, 392, -232];
+
+fn clamp16(v: int32) -> int32 {
+  if (v > 32767) { return 32767; }
+  if (v < -32768) { return -32768; }
+  return v;
+}
+
+// Decodes ADPCM block b into d->blk (spb frames of 16-bit values).
+fn wav_adpcm_block(d: AudioWav*, b: int64) -> int32 {
+  var ch: int32 = d->info.channels;
+  var off: int64 = b * (int64)d->align;
+  var len: int64 = (int64)d->align;
+  if (off + len > d->size) { len = d->size - off; }
+  if (len <= 0) { return AUDIO_E_TRUNC; }
+  var q: uint8* = d->p + d->data + off;
+  var o: int32* = d->blk;
+  var spb: int32 = d->spb;
+  memset(o, 0, (int64)spb * (int64)ch * 4);
+  if (d->tag == WAV_IMA) {
+    if (len < 4 * (int64)ch) { return AUDIO_E_TRUNC; }
+    var pred: int32[8];
+    var idx: int32[8];
+    for c in 0..ch {
+      pred[c] = (int32)(int16)((uint16)q[c * 4] | ((uint16)q[c * 4 + 1] << 8));
+      idx[c] = (int32)q[c * 4 + 2];
+      if (idx[c] > 88) { idx[c] = 88; }
+      o[c] = pred[c];
+    }
+    // then groups of 4 bytes (8 samples) per channel, low nibble first
+    var at: int64 = 4 * (int64)ch;
+    var f: int32 = 1;
+    while (f < spb && at + 4 * (int64)ch <= len) {
+      for c in 0..ch {
+        for k in 0..8 {
+          var byte: int32 = (int32)q[at + (int64)c * 4 + (int64)(k >> 1)];
+          var nib: int32 = byte & 15;
+          if ((k & 1) == 1) { nib = byte >> 4; }
+          var step: int32 = IMA_STEP[idx[c]];
+          var diff: int32 = step >> 3;
+          if ((nib & 1) != 0) { diff = diff + (step >> 2); }
+          if ((nib & 2) != 0) { diff = diff + (step >> 1); }
+          if ((nib & 4) != 0) { diff = diff + step; }
+          if ((nib & 8) != 0) { pred[c] = clamp16(pred[c] - diff); } else { pred[c] = clamp16(pred[c] + diff); }
+          idx[c] = idx[c] + IMA_INDEX[nib];
+          if (idx[c] < 0) { idx[c] = 0; }
+          if (idx[c] > 88) { idx[c] = 88; }
+          var fr: int32 = f + (int32)k;
+          if (fr < spb) { o[fr * ch + c] = pred[c]; }
+        }
+      }
+      at = at + 4 * (int64)ch;
+      f = f + 8;
+    }
+    return AUDIO_OK;
+  }
+  // Microsoft ADPCM: per channel a predictor, delta, sample 1 and sample 2
+  if (len < 7 * (int64)ch) { return AUDIO_E_TRUNC; }
+  var c1: int32[8];
+  var c2: int32[8];
+  var delta: int32[8];
+  var s1: int32[8];
+  var s2: int32[8];
+  var at: int64 = 0;
+  for c in 0..ch {
+    var pi: int32 = (int32)q[at];
+    at = at + 1;
+    if (pi >= d->ncoef) { pi = 0; }
+    c1[c] = d->coef[pi * 2];
+    c2[c] = d->coef[pi * 2 + 1];
+  }
+  for c in 0..ch { delta[c] = (int32)(int16)((uint16)q[at] | ((uint16)q[at + 1] << 8)); at = at + 2; }
+  for c in 0..ch { s1[c] = (int32)(int16)((uint16)q[at] | ((uint16)q[at + 1] << 8)); at = at + 2; }
+  for c in 0..ch { s2[c] = (int32)(int16)((uint16)q[at] | ((uint16)q[at + 1] << 8)); at = at + 2; }
+  for c in 0..ch {
+    o[c] = s2[c];
+    if (spb > 1) { o[ch + c] = s1[c]; }
+  }
+  var n: int64 = 2 * (int64)ch;     // samples written
+  var total: int64 = (int64)spb * (int64)ch;
+  var hi: bool = true;
+  while (n < total && at < len) {
+    var c: int32 = (int32)(n % (int64)ch);
+    var nib: int32 = (int32)q[at] & 15;
+    if (hi) { nib = (int32)q[at] >> 4; }
+    if (!hi) { at = at + 1; }
+    hi = !hi;
+    var sn: int32 = nib;
+    if (sn >= 8) { sn = sn - 16; }
+    var pred: int32 = (s1[c] * c1[c] + s2[c] * c2[c]) >> 8;
+    var v: int32 = clamp16(pred + sn * delta[c]);
+    s2[c] = s1[c];
+    s1[c] = v;
+    delta[c] = (MS_ADAPT[nib] * delta[c]) >> 8;
+    if (delta[c] < 16) { delta[c] = 16; }
+    o[n] = v;
+    n = n + 1;
+  }
+  return AUDIO_OK;
+}
+
+// ---- reading ----
+
+/// Reads the headers of a WAV file in memory.
+export fn audio_wav_open(d: AudioWav*, p: uint8*, n: int64) -> int32 {
+  memset(d, 0, sizeof(AudioWav));
+  d->blk_no = -1;
+  d->p = p;
+  var r: AudioRd;
+  audio_rd_init(&r, p, n);
+  var rf64: bool = false;
+  if (audio_rd_is(&r, "RF64") || audio_rd_is(&r, "BW64")) { rf64 = true; }
+  else if (!audio_rd_is(&r, "RIFF")) { return AUDIO_E_FORMAT; }
+  audio_rd_skip(&r, 8);
+  if (!audio_rd_is(&r, "WAVE")) { return AUDIO_E_FORMAT; }
+  audio_rd_skip(&r, 4);
+  var big_data: int64 = -1;
+  var fact: int64 = -1;
+  var have_fmt: bool = false;
+  var bits: int32 = 0;
+  var valid: int32 = 0;
+  var ch: int32 = 0;
+  var rate: int64 = 0;
+  while (audio_rd_left(&r) >= 8) {
+    var id: int64 = r.pos;
+    audio_rd_skip(&r, 4);
+    var sz: int64 = audio_rd_u32le(&r);
+    var body: int64 = r.pos;
+    if (audio_bytes_is(p + id, 4, "ds64")) {
+      audio_rd_skip(&r, 8);
+      big_data = audio_rd_u64le(&r);
+      fact = audio_rd_u64le(&r);
+      if (fact == 0) { fact = -1; }
+    } else if (audio_bytes_is(p + id, 4, "fmt ")) {
+      if (sz < 16) { return AUDIO_E_DATA; }
+      d->tag = (int32)audio_rd_u16le(&r);
+      ch = (int32)audio_rd_u16le(&r);
+      rate = audio_rd_u32le(&r);
+      audio_rd_skip(&r, 4);
+      d->align = (int32)audio_rd_u16le(&r);
+      bits = (int32)audio_rd_u16le(&r);
+      valid = bits;
+      var cb: int64 = 0;
+      if (sz >= 18) { cb = audio_rd_u16le(&r); }
+      if (d->tag == WAV_EXT && sz >= 40 && cb >= 22) {
+        valid = (int32)audio_rd_u16le(&r);
+        d->info.mask = (uint32)audio_rd_u32le(&r);
+        d->tag = (int32)audio_rd_u16le(&r);   // first two bytes of the sub-format GUID
+        if (valid == 0) { valid = bits; }
+      } else if (d->tag == WAV_IMA && cb >= 2) {
+        d->spb = (int32)audio_rd_u16le(&r);
+      } else if (d->tag == WAV_MSADPCM && cb >= 4) {
+        d->spb = (int32)audio_rd_u16le(&r);
+        var nc: int32 = (int32)audio_rd_u16le(&r);
+        if (nc > 32) { nc = 32; }
+        d->ncoef = nc;
+        for i in 0..nc {
+          d->coef[i * 2] = (int32)(int16)audio_rd_u16le(&r);
+          d->coef[i * 2 + 1] = (int32)(int16)audio_rd_u16le(&r);
+        }
+      }
+      have_fmt = true;
+    } else if (audio_bytes_is(p + id, 4, "fact")) {
+      if (sz >= 4 && fact < 0) { fact = audio_rd_u32le(&r); }
+    } else if (audio_bytes_is(p + id, 4, "data")) {
+      if (!have_fmt) { return AUDIO_E_DATA; }
+      d->data = body;
+      d->size = sz;
+      if (rf64 && sz == 0xFFFFFFFF && big_data >= 0) { d->size = big_data; }
+      if (d->size > n - body) { d->size = n - body; }   // cut short: use what is there
+      break;
+    }
+    if (sz > n) { return AUDIO_E_DATA; }
+    r.pos = body;
+    audio_rd_skip(&r, sz + (sz & 1));
+    if (r.bad) { return AUDIO_E_TRUNC; }
+  }
+  if (!have_fmt || d->data == 0) { return AUDIO_E_DATA; }
+  if (ch < 1 || ch > AUDIO_MAX_CHANNELS || rate < 1 || rate > 1000000 || d->align < 1) { return AUDIO_E_UNSUPPORTED; }
+  d->info.channels = ch;
+  d->info.rate = (int32)rate;
+  d->info.bits = valid;
+  var t: int32 = d->tag;
+  if (t == WAV_PCM) {
+    if (bits < 8 || bits > 32 || (bits & 7) != 0) { return AUDIO_E_UNSUPPORTED; }
+    d->ssize = bits / 8;
+    d->info.fmt = AUDIO_S32;
+    if (bits == 8) { d->info.fmt = AUDIO_U8; } else if (bits == 16) { d->info.fmt = AUDIO_S16; } else if (bits == 24) { d->info.fmt = AUDIO_S24; }
+    if (valid < 1 || valid > bits) { d->info.bits = bits; }
+  } else if (t == WAV_FLOAT) {
+    if (bits != 32 && bits != 64) { return AUDIO_E_UNSUPPORTED; }
+    d->ssize = bits / 8;
+    d->info.fmt = AUDIO_F32;
+    if (bits == 64) { d->info.fmt = AUDIO_F64; }
+    d->info.bits = 0;
+  } else if (t == WAV_ALAW || t == WAV_MULAW) {
+    if (bits != 8) { return AUDIO_E_UNSUPPORTED; }
+    d->ssize = 1;
+    d->info.fmt = AUDIO_S16;
+    d->info.bits = 16;
+  } else if (t == WAV_IMA || t == WAV_MSADPCM) {
+    if (bits != 4) { return AUDIO_E_UNSUPPORTED; }
+    d->info.fmt = AUDIO_S16;
+    d->info.bits = 16;
+    if (t == WAV_IMA) {
+      var want: int32 = (d->align - 4 * ch) * 8 / (4 * ch) + 1;
+      if (d->spb <= 0) { d->spb = want; }
+      if (d->align < 4 * ch || d->spb > want) { return AUDIO_E_DATA; }
+    } else {
+      if (d->ncoef == 0) {
+        d->ncoef = 7;
+        for i in 0..14 { d->coef[i] = MS_COEF[i]; }
+      }
+      var want: int32 = (d->align - 7 * ch) * 2 / ch + 2;
+      if (d->spb <= 0) { d->spb = want; }
+      if (d->align < 7 * ch || d->spb > want || d->spb < 2) { return AUDIO_E_DATA; }
+    }
+    d->blk = (int32*)malloc((int64)d->spb * (int64)ch * 4);
+    if (d->blk == 0) { return AUDIO_E_MEM; }
+  } else {
+    return AUDIO_E_UNSUPPORTED;
+  }
+  if (t == WAV_IMA || t == WAV_MSADPCM) {
+    var blocks: int64 = (d->size + (int64)d->align - 1) / (int64)d->align;
+    d->info.frames = blocks * (int64)d->spb;
+    if (fact >= 0 && fact < d->info.frames) { d->info.frames = fact; }
+  } else {
+    if (d->align != d->ssize * ch) { d->align = d->ssize * ch; }
+    d->info.frames = d->size / (int64)d->align;
+  }
+  var fb: int64 = (int64)WAV_BLOCK * (int64)ch * 4;
+  if (d->info.fmt == AUDIO_F32 || d->info.fmt == AUDIO_F64) { d->out = (float32*)malloc(fb); }
+  else { d->outi = (int32*)malloc(fb); }
+  if (d->out == 0 && d->outi == 0) { audio_wav_close(d); return AUDIO_E_MEM; }
+  return AUDIO_OK;
+}
+
+/// Decodes the next block of up to 1024 frames.
+export fn audio_wav_next(d: AudioWav*) -> int32 {
+  d->out_frames = 0;
+  if (d->pos >= d->info.frames) { return AUDIO_END; }
+  var ch: int32 = d->info.channels;
+  var k: int64 = d->info.frames - d->pos;
+  if (k > (int64)WAV_BLOCK) { k = (int64)WAV_BLOCK; }
+  var t: int32 = d->tag;
+  if (t == WAV_IMA || t == WAV_MSADPCM) {
+    var got: int64 = 0;
+    while (got < k) {
+      var b: int64 = (d->pos + got) / (int64)d->spb;
+      var in_b: int64 = (d->pos + got) % (int64)d->spb;
+      if (b != d->blk_no) {
+        var rc: int32 = wav_adpcm_block(d, b);
+        if (rc != AUDIO_OK) { break; }
+        d->blk_no = b;
+      }
+      var take: int64 = (int64)d->spb - in_b;
+      if (take > k - got) { take = k - got; }
+      for i in 0..take * (int64)ch {
+        d->outi[got * (int64)ch + i] = d->blk[in_b * (int64)ch + i] << 16;
+      }
+      got = got + take;
+    }
+    k = got;
+    if (k == 0) { return AUDIO_END; }
+  } else {
+    var src: uint8* = d->p + d->data + d->pos * (int64)d->align;
+    var ns: int64 = k * (int64)ch;
+    if (t == WAV_ALAW) {
+      for i in 0..ns { d->outi[i] = wav_alaw((int32)src[i]) << 16; }
+    } else if (t == WAV_MULAW) {
+      for i in 0..ns { d->outi[i] = wav_mulaw((int32)src[i]) << 16; }
+    } else if (d->info.fmt == AUDIO_F32) {
+      memcpy(d->out, src, ns * 4);
+    } else if (d->info.fmt == AUDIO_F64) {
+      for i in 0..ns {
+        var b: uint64 = 0;
+        for j in 0..8 { b = b | ((uint64)src[i * 8 + j] << (8 * (int32)j)); }
+        var dv: float64 = *(float64*)&b;
+        d->out[i] = (float32)dv;
+      }
+    } else {
+      audio_convert_samples(src, d->info.fmt, (uint8*)d->outi, AUDIO_S32, ns);
+    }
+  }
+  d->pos = d->pos + k;
+  d->out_frames = (int32)k;
+  return AUDIO_OK;
+}
+
+/// Moves to a frame.
+export fn audio_wav_seek(d: AudioWav*, frame: int64) -> int32 {
+  if (frame < 0) { return AUDIO_E_ARG; }
+  d->pos = frame;
+  if (d->pos > d->info.frames) { d->pos = d->info.frames; }
+  return AUDIO_OK;
+}
+
+export fn audio_wav_close(d: AudioWav*) {
+  if (d->out != 0) { free(d->out); }
+  if (d->outi != 0) { free(d->outi); }
+  if (d->blk != 0) { free(d->blk); }
+  d->out = (float32*)0;
+  d->outi = (int32*)0;
+  d->blk = (int32*)0;
+}
+
+/// Decodes a whole WAV file into pcm in the file's own sample format
+/// (A-law, mu-law and ADPCM become AUDIO_S16).
+export fn audio_wav_decode(p: uint8*, n: int64, pcm: AudioPcm*) -> int32 {
+  var d: AudioWav;
+  var rc: int32 = audio_wav_open(&d, p, n);
+  if (rc != AUDIO_OK) { audio_wav_close(&d); return rc; }
+  defer audio_wav_close(&d);
+  rc = audio_pcm_alloc(pcm, d.info.frames, d.info.channels, d.info.rate, d.info.fmt);
+  if (rc != AUDIO_OK) { return rc; }
+  pcm->bits = d.info.bits;
+  pcm->mask = d.info.mask;
+  var t: int32 = d.tag;
+  if (t == WAV_PCM || t == WAV_FLOAT) {
+    memcpy(pcm->data, p + d.data, d.info.frames * (int64)d.align);
+    return AUDIO_OK;
+  }
+  var fs: int64 = audio_pcm_frame_size(pcm);
+  var at: int64 = 0;
+  while (true) {
+    rc = audio_wav_next(&d);
+    if (rc != AUDIO_OK) { break; }
+    audio_convert_samples((uint8*)d.outi, AUDIO_S32, pcm->data + at * fs, pcm->fmt, (int64)d.out_frames * (int64)d.info.channels);
+    at = at + (int64)d.out_frames;
+  }
+  pcm->frames = at;
+  return AUDIO_OK;
+}
+
+// ---- writing ----
+
+/// Writes pcm as a WAV file. U8, S16, S24 and S32 become PCM; F32 and F64
+/// become IEEE float.
+export fn audio_wav_encode(pcm: AudioPcm*, out: AudioBuf*) -> int32 {
+  var ss: int64 = (int64)audio_fmt_size(pcm->fmt);
+  if (ss == 0 || pcm->channels < 1 || pcm->channels > AUDIO_MAX_CHANNELS || pcm->rate < 1) { return AUDIO_E_ARG; }
+  if (pcm->data == 0 && pcm->frames > 0) { return AUDIO_E_ARG; }
+  var ch: int64 = (int64)pcm->channels;
+  var bytes: int64 = pcm->frames * ss * ch;
+  var isf: bool = pcm->fmt == AUDIO_F32 || pcm->fmt == AUDIO_F64;
+  var valid: int64 = ss * 8;
+  if (!isf && pcm->bits > 0 && (int64)pcm->bits < valid) { valid = (int64)pcm->bits; }
+  var ext: bool = ch > 2 || pcm->mask != 0 || valid != ss * 8;
+  var big: bool = bytes + 80 > 0xFFFFFFFF;
+  var fmt_len: int64 = 16;
+  if (ext) { fmt_len = 40; }
+  var rc: int32 = audio_buf_reserve(out, bytes + 120);
+  if (rc != AUDIO_OK) { return rc; }
+  var start: int64 = out->len;
+  if (big) { audio_buf_str(out, "RF64"); audio_buf_u32le(out, 0xFFFFFFFF); }
+  else { audio_buf_str(out, "RIFF"); audio_buf_u32le(out, 0); }
+  audio_buf_str(out, "WAVE");
+  if (big) {
+    audio_buf_str(out, "ds64");
+    audio_buf_u32le(out, 28);
+    audio_buf_u64le(out, 0);          // riff size, set below
+    audio_buf_u64le(out, bytes);
+    audio_buf_u64le(out, pcm->frames);
+    audio_buf_u32le(out, 0);
+  }
+  audio_buf_str(out, "fmt ");
+  audio_buf_u32le(out, fmt_len);
+  var tag: int64 = 1;
+  if (isf) { tag = 3; }
+  if (ext) { audio_buf_u16le(out, WAV_EXT); } else { audio_buf_u16le(out, tag); }
+  audio_buf_u16le(out, ch);
+  audio_buf_u32le(out, (int64)pcm->rate);
+  audio_buf_u32le(out, (int64)pcm->rate * ss * ch);
+  audio_buf_u16le(out, ss * ch);
+  audio_buf_u16le(out, ss * 8);
+  if (ext) {
+    audio_buf_u16le(out, 22);
+    audio_buf_u16le(out, valid);
+    var mask: int64 = (int64)pcm->mask;
+    if (mask == 0) { mask = (int64)audio_default_mask(pcm->channels); }
+    audio_buf_u32le(out, mask);
+    // KSDATAFORMAT_SUBTYPE_PCM / IEEE_FLOAT: tag then 00000000-0010-8000-00AA00389B71
+    audio_buf_u16le(out, tag);
+    var g: uint8[14] = [0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71];
+    audio_buf_append(out, &g[0], 14);
+  }
+  if (isf) {
+    audio_buf_str(out, "fact");
+    audio_buf_u32le(out, 4);
+    var fr: int64 = pcm->frames;
+    if (fr > 0xFFFFFFFF) { fr = 0xFFFFFFFF; }
+    audio_buf_u32le(out, fr);
+  }
+  audio_buf_str(out, "data");
+  if (big) { audio_buf_u32le(out, 0xFFFFFFFF); } else { audio_buf_u32le(out, bytes); }
+  rc = audio_buf_append(out, pcm->data, bytes);
+  if (rc != AUDIO_OK) { return rc; }
+  if ((bytes & 1) != 0) { audio_buf_push(out, 0); }
+  var total: int64 = out->len - start - 8;
+  var q: uint8* = out->data + start;
+  if (big) {
+    for i in 0..8 { q[20 + i] = (uint8)((total >> (8 * (int32)i)) & 255); }
+  } else {
+    for i in 0..4 { q[4 + i] = (uint8)((total >> (8 * (int32)i)) & 255); }
+  }
+  return AUDIO_OK;
+}

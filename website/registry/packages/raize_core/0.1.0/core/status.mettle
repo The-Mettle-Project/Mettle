@@ -1,0 +1,115 @@
+// raize/core/status — the one status vocabulary every fallible raize call returns.
+// reference: status
+// thread: pure functions and constants; safe on any thread.
+//
+// RZ_OK is 0 and every error is negative, so a status can never be mistaken
+// for an HTTP status (a handler's return). Module-specific detail codes (the
+// router's, config's, template's) map onto these at their public boundary.
+
+/// Success: the call did what it says.
+export const RZ_OK: int32 = 0;
+/// Misuse (a null handle, a call in the wrong phase); nothing changed.
+export const RZ_E_USAGE: int32 = -1;
+/// The input is malformed or fails validation.
+export const RZ_E_INVALID: int32 = -2;
+/// The thing asked for does not exist.
+export const RZ_E_NOT_FOUND: int32 = -3;
+/// The request clashes with existing state (a duplicate, a name conflict).
+export const RZ_E_CONFLICT: int32 = -4;
+/// A fixed capacity is exhausted; raize never grows past its limits.
+export const RZ_E_FULL: int32 = -5;
+/// An allocation failed.
+export const RZ_E_NOMEM: int32 = -6;
+/// The operation is not supported by this implementation (e.g. a data layer).
+export const RZ_E_UNSUPPORTED: int32 = -7;
+/// The data layer failed for its own reasons.
+export const RZ_E_DATA_LAYER: int32 = -8;
+/// A file or socket operation failed.
+export const RZ_E_IO: int32 = -9;
+
+/// Names a status in a few words, for logs and error messages.
+///
+/// in:      code     RZ_OK or any RZ_E_* value
+/// returns: a short lowercase phrase; "unknown status" for any other value
+/// owns:    the result is a static string; never free it
+/// thread:  any
+/// example:
+///   println("add route: {rz_status_text(rc)}");
+export fn rz_status_text(code: int32) -> string {
+  if (code == RZ_OK) { return "ok"; }
+  if (code == RZ_E_USAGE) { return "misuse"; }
+  if (code == RZ_E_INVALID) { return "invalid input"; }
+  if (code == RZ_E_NOT_FOUND) { return "not found"; }
+  if (code == RZ_E_CONFLICT) { return "conflict"; }
+  if (code == RZ_E_FULL) { return "capacity exhausted"; }
+  if (code == RZ_E_NOMEM) { return "out of memory"; }
+  if (code == RZ_E_UNSUPPORTED) { return "unsupported"; }
+  if (code == RZ_E_DATA_LAYER) { return "data layer error"; }
+  if (code == RZ_E_IO) { return "i/o error"; }
+  return "unknown status";
+}
+
+/// Maps a status to the HTTP status a handler should answer with.
+///
+/// in:      code     RZ_OK or any RZ_E_* value
+/// returns: 200 for RZ_OK, 400 INVALID, 404 NOT_FOUND, 409 CONFLICT and FULL;
+///          500 for USAGE, NOMEM, UNSUPPORTED, DATA_LAYER, IO and unknown codes
+/// thread:  any
+/// example:
+///   return rz_ctx_json(ctx, rz_status_http(rc), body);
+export fn rz_status_http(code: int32) -> int32 {
+  if (code == RZ_OK) { return 200; }
+  if (code == RZ_E_INVALID) { return 400; }
+  if (code == RZ_E_NOT_FOUND) { return 404; }
+  if (code == RZ_E_CONFLICT) { return 409; }
+  if (code == RZ_E_FULL) { return 409; }
+  return 500;
+}
+
+fn t_text_is(code: int32, want: string) -> bool {
+  var got: string = rz_status_text(code);
+  if (got.length != want.length) { return false; }
+  for i in 0..(int64)got.length {
+    if (got.chars[i] != want.chars[i]) { return false; }
+  }
+  return true;
+}
+
+@test fn t_rz_status_codes() -> int32 {
+  if (RZ_OK != 0) { return 1; }
+  if (RZ_E_USAGE != -1 || RZ_E_INVALID != -2 || RZ_E_NOT_FOUND != -3) { return 2; }
+  if (RZ_E_CONFLICT != -4 || RZ_E_FULL != -5 || RZ_E_NOMEM != -6) { return 3; }
+  if (RZ_E_UNSUPPORTED != -7 || RZ_E_DATA_LAYER != -8 || RZ_E_IO != -9) { return 4; }
+  return 0;
+}
+
+@test fn t_rz_status_text() -> int32 {
+  if (!t_text_is(RZ_OK, "ok")) { return 1; }
+  if (!t_text_is(RZ_E_USAGE, "misuse")) { return 2; }
+  if (!t_text_is(RZ_E_INVALID, "invalid input")) { return 3; }
+  if (!t_text_is(RZ_E_NOT_FOUND, "not found")) { return 4; }
+  if (!t_text_is(RZ_E_CONFLICT, "conflict")) { return 5; }
+  if (!t_text_is(RZ_E_FULL, "capacity exhausted")) { return 6; }
+  if (!t_text_is(RZ_E_NOMEM, "out of memory")) { return 7; }
+  if (!t_text_is(RZ_E_UNSUPPORTED, "unsupported")) { return 8; }
+  if (!t_text_is(RZ_E_DATA_LAYER, "data layer error")) { return 9; }
+  if (!t_text_is(RZ_E_IO, "i/o error")) { return 10; }
+  if (!t_text_is(-100, "unknown status")) { return 11; }
+  if (!t_text_is(7, "unknown status")) { return 12; }
+  return 0;
+}
+
+@test fn t_rz_status_http() -> int32 {
+  if (rz_status_http(RZ_OK) != 200) { return 1; }
+  if (rz_status_http(RZ_E_USAGE) != 500) { return 2; }
+  if (rz_status_http(RZ_E_INVALID) != 400) { return 3; }
+  if (rz_status_http(RZ_E_NOT_FOUND) != 404) { return 4; }
+  if (rz_status_http(RZ_E_CONFLICT) != 409) { return 5; }
+  if (rz_status_http(RZ_E_FULL) != 409) { return 6; }
+  if (rz_status_http(RZ_E_NOMEM) != 500) { return 7; }
+  if (rz_status_http(RZ_E_UNSUPPORTED) != 500) { return 8; }
+  if (rz_status_http(RZ_E_DATA_LAYER) != 500) { return 9; }
+  if (rz_status_http(RZ_E_IO) != 500) { return 10; }
+  if (rz_status_http(-100) != 500) { return 11; }
+  return 0;
+}

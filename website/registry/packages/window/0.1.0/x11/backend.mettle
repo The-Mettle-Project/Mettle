@@ -1,0 +1,1131 @@
+// x11/backend: windows and input on X11.
+//
+// Window manager hints follow ICCCM 2.0 (WM_PROTOCOLS, WM_NORMAL_HINTS,
+// WM_HINTS, WM_CLASS, WM_STATE) and the freedesktop.org Extended Window
+// Manager Hints 1.5 (_NET_WM_STATE, _NET_WM_PING, _NET_ACTIVE_WINDOW,
+// _NET_WM_ICON, _NET_WM_FULLSCREEN_MONITORS, _NET_WM_BYPASS_COMPOSITOR).
+// Without a window manager (a bare Xvfb, say) the same calls fall back to
+// moving and resizing the window directly.
+import "std/mem";
+import "../core/keys.mettle";
+import "../core/types.mettle";
+import "wire.mettle";
+import "select.mettle";
+import "ext.mettle";
+
+export struct WindowX11Win {
+  xid: int64;
+  colormap: int64;
+  visual: int64;
+  depth: int64;
+  gc: int64;
+  mapped: bool;
+  resizable: bool;
+  decorated: bool;
+  floating: bool;
+  min_w: int32; min_h: int32; max_w: int32; max_h: int32;
+  saved_x: int32; saved_y: int32; saved_w: int32; saved_h: int32;
+  cursor_img: int64;
+  grabbed: bool;
+  warp_x: int64; warp_y: int64;   // last warp target in pixels (to skip its own motion event)
+  have_raw: bool;
+  px_w: int64; px_h: int64;       // pixel size the server last told us
+  dnd_source: int64;
+  dnd_version: int64;
+  dnd_type: int64;
+  dnd_x: float64; dnd_y: float64;
+}
+
+fn xw(w: Window*) -> WindowX11Win* { return (WindowX11Win*)w->plat; }
+
+/// The Window for an X window id (0 when it is not one of ours).
+export fn window_x11_find(xid: int64) -> Window* {
+  var w: Window* = g_window.windows;
+  while (w != 0) {
+    if (w->plat != 0 && xw(w)->xid == xid) { return w; }
+    w = w->next;
+  }
+  return (Window*)0;
+}
+
+fn scale() -> float32 { return g_x11.scale; }
+fn to_logical(px: int64) -> int32 {
+  var v: int32 = (int32)((float32)px / scale() + 0.5);
+  if (v < 1) { v = 1; }
+  return v;
+}
+
+// ---------- init ----------
+export fn window_x11_init(display: string, xauth: string, home: string) -> bool {
+  if (!window_x11_connect(display, xauth, home)) { return false; }
+  var names: string[60] = [
+    "WM_PROTOCOLS", "WM_DELETE_WINDOW", "_NET_WM_PING", "_NET_WM_NAME", "_NET_WM_ICON_NAME",
+    "UTF8_STRING", "WM_STATE", "WM_CHANGE_STATE", "_NET_WM_STATE", "_NET_WM_STATE_FULLSCREEN",
+    "_NET_WM_STATE_MAXIMIZED_VERT", "_NET_WM_STATE_MAXIMIZED_HORZ", "_NET_WM_STATE_HIDDEN", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_DEMANDS_ATTENTION",
+    "_NET_ACTIVE_WINDOW", "_NET_WM_PID", "_NET_WM_ICON", "_MOTIF_WM_HINTS", "_NET_WM_BYPASS_COMPOSITOR",
+    "_NET_SUPPORTING_WM_CHECK", "_NET_WM_FULLSCREEN_MONITORS", "_NET_WORKAREA", "_NET_SUPPORTED", "CLIPBOARD",
+    "TARGETS", "TEXT", "INCR", "METTLE_WINDOW_SELECTION", "XdndAware",
+    "XdndEnter", "XdndPosition", "XdndStatus", "XdndLeave", "XdndDrop",
+    "XdndFinished", "XdndSelection", "XdndActionCopy", "XdndTypeList", "text/uri-list",
+    "text/plain;charset=utf-8", "text/plain", "METTLE_WINDOW_DND", "RESOURCE_MANAGER", "_NET_WM_WINDOW_TYPE",
+    "_NET_WM_WINDOW_TYPE_NORMAL", "_NET_FRAME_EXTENTS", "CLIPBOARD_MANAGER", "SAVE_TARGETS", "_NET_WM_USER_TIME",
+    "", "", "", "", "", "", "", "", "", ""
+  ];
+  var a: int64[60];
+  var used: string[] = { data: &names[0], length: 50 };
+  window_x11_intern_many(used, &a[0]);
+  g_x11.a_protocols = a[0]; g_x11.a_delete = a[1]; g_x11.a_ping = a[2]; g_x11.a_net_wm_name = a[3]; g_x11.a_net_icon_name = a[4];
+  g_x11.a_utf8 = a[5]; g_x11.a_wm_state = a[6]; g_x11.a_change_state = a[7]; g_x11.a_state = a[8]; g_x11.a_fullscreen = a[9];
+  g_x11.a_max_v = a[10]; g_x11.a_max_h = a[11]; g_x11.a_hidden = a[12]; g_x11.a_above = a[13]; g_x11.a_attention = a[14];
+  g_x11.a_active = a[15]; g_x11.a_pid = a[16]; g_x11.a_icon = a[17]; g_x11.a_motif = a[18]; g_x11.a_bypass = a[19];
+  g_x11.a_wm_check = a[20]; g_x11.a_fs_monitors = a[21]; g_x11.a_workarea = a[22]; g_x11.a_supported = a[23]; g_x11.a_clipboard = a[24];
+  g_x11.a_targets = a[25]; g_x11.a_text = a[26]; g_x11.a_incr = a[27]; g_x11.a_sel = a[28]; g_x11.a_xdnd_aware = a[29];
+  g_x11.a_xdnd_enter = a[30]; g_x11.a_xdnd_position = a[31]; g_x11.a_xdnd_status = a[32]; g_x11.a_xdnd_leave = a[33]; g_x11.a_xdnd_drop = a[34];
+  g_x11.a_xdnd_finished = a[35]; g_x11.a_xdnd_selection = a[36]; g_x11.a_xdnd_copy = a[37]; g_x11.a_xdnd_typelist = a[38]; g_x11.a_uri_list = a[39];
+  g_x11.a_text_plain_utf8 = a[40]; g_x11.a_text_plain = a[41]; g_x11.a_dnd_prop = a[42]; g_x11.a_resource_manager = a[43]; g_x11.a_net_wm_type = a[44];
+  g_x11.a_type_normal = a[45]; g_x11.a_frame_extents = a[46]; g_x11.a_clipboard_manager = a[47]; g_x11.a_save_targets = a[48];
+  if (g_x11.dead) { window_set_error("lost the X server during setup"); return false; }
+  window_x11_load_keymap();
+  window_x11_ext_init();
+  var dpi: float32 = window_x11_xft_dpi();
+  if (dpi >= 48.0 && dpi <= 960.0) { g_x11.scale = dpi / 96.0; }
+  g_x11.have_wm = detect_wm();
+  // A hidden helper window owns the clipboard, so it outlives any one window.
+  g_x11.helper = window_x11_new_id();
+  var r: uint8[36];
+  window_x11_req(&r[0], 1, 0, 36);
+  window_wr32(&r[0], 4, g_x11.helper); window_wr32(&r[0], 8, g_x11.root);
+  window_wr16(&r[0], 12, 0); window_wr16(&r[0], 14, 0); window_wr16(&r[0], 16, 1); window_wr16(&r[0], 18, 1);
+  window_wr16(&r[0], 22, 2);                         // InputOnly
+  window_wr32(&r[0], 28, 0x800);                     // event-mask
+  window_wr32(&r[0], 32, 0x400000);                  // PropertyChange (INCR transfers)
+  window_x11_send(&r[0], 36);
+  window_x11_select_init();
+  // Root PropertyChange: Xft.dpi and work-area updates.
+  var c2: uint8[16];
+  window_x11_req(&c2[0], 2, 0, 16);
+  window_wr32(&c2[0], 4, g_x11.root); window_wr32(&c2[0], 8, 0x800); window_wr32(&c2[0], 12, 0x400000);
+  window_x11_send(&c2[0], 16);
+  window_x11_sync();
+  if (g_x11.dead) { window_set_error("lost the X server during setup"); return false; }
+  return true;
+}
+
+fn detect_wm() -> bool {
+  if (g_x11.a_wm_check == 0) { return false; }
+  var b: WindowBytes; var ty: int64 = 0; var fmt: int64 = 0;
+  if (!window_x11_get_property(g_x11.root, g_x11.a_wm_check, false, &b, &ty, &fmt)) { return false; }
+  var ok: bool = b.len >= 4 && fmt == 32;
+  var child: int64 = 0;
+  if (ok) { child = window_rd32(b.data, 0); }
+  free(b.data);
+  if (!ok || child == 0) { return false; }
+  // The check window must point at itself, or the property is stale.
+  var b2: WindowBytes;
+  g_x11.quiet_from = g_x11.seq + 1;
+  if (!window_x11_get_property(child, g_x11.a_wm_check, false, &b2, &ty, &fmt)) { return false; }
+  var self_ok: bool = b2.len >= 4 && window_rd32(b2.data, 0) == child;
+  free(b2.data);
+  return self_ok;
+}
+
+export fn window_x11_shutdown() {
+  window_x11_select_shutdown();
+  if (!g_x11.dead) {
+    var r: uint8[8];
+    window_x11_req(&r[0], 4, 0, 8);
+    window_wr32(&r[0], 4, g_x11.helper);
+    window_x11_send(&r[0], 8);
+    window_x11_sync();
+  }
+  window_x11_disconnect();
+}
+
+export fn window_x11_scale() -> float32 { return g_x11.scale; }
+
+// ---------- hints ----------
+fn set_size_hints(w: Window*) {
+  var x: WindowX11Win* = xw(w);
+  var h: uint8[72];
+  window_zero(&h[0], 72);
+  var flags: int64 = 0;
+  var min_w: int64 = (int64)((float32)x->min_w * scale());
+  var min_h: int64 = (int64)((float32)x->min_h * scale());
+  var max_w: int64 = (int64)((float32)x->max_w * scale());
+  var max_h: int64 = (int64)((float32)x->max_h * scale());
+  if (!x->resizable && w->fullscreen == WINDOW_WINDOWED) {
+    min_w = x->px_w; min_h = x->px_h; max_w = x->px_w; max_h = x->px_h;
+  }
+  if (min_w > 0 || min_h > 0) { flags = flags | 16; window_wr32(&h[0], 20, min_w); window_wr32(&h[0], 24, min_h); }
+  if (max_w > 0 || max_h > 0) {
+    if (max_w <= 0) { max_w = 32767; }
+    if (max_h <= 0) { max_h = 32767; }
+    flags = flags | 32; window_wr32(&h[0], 28, max_w); window_wr32(&h[0], 32, max_h);
+  }
+  flags = flags | 512;                                 // PWinGravity
+  window_wr32(&h[0], 68, 10);                          // StaticGravity: positions are of the client area
+  window_wr32(&h[0], 0, flags);
+  window_x11_change_property(x->xid, 40, 41, 32, &h[0], 72, 0);   // WM_NORMAL_HINTS, WM_SIZE_HINTS
+}
+
+fn set_wm_hints(xid: int64, urgent: bool) {
+  var h: uint8[36];
+  window_zero(&h[0], 36);
+  var flags: int64 = 1 | 2;                            // InputHint | StateHint
+  if (urgent) { flags = flags | 256; }
+  window_wr32(&h[0], 0, flags); window_wr32(&h[0], 4, 1); window_wr32(&h[0], 8, 1);
+  window_x11_change_property(xid, 35, 35, 32, &h[0], 36, 0);      // WM_HINTS
+}
+
+fn set_motif(xid: int64, decorated: bool) {
+  var m: uint8[20];
+  window_zero(&m[0], 20);
+  window_wr32(&m[0], 0, 2);                           // MWM_HINTS_DECORATIONS
+  if (decorated) { window_wr32(&m[0], 8, 1); }
+  window_x11_change_property(xid, g_x11.a_motif, g_x11.a_motif, 32, &m[0], 20, 0);
+}
+
+fn set_title_props(xid: int64, s: string) {
+  var n: int64 = (int64)s.length;
+  if (n > 4096) { n = 4096; }
+  n = window_utf8_valid_prefix(s.chars, n);
+  window_x11_change_property(xid, g_x11.a_net_wm_name, g_x11.a_utf8, 8, s.chars, n, 0);
+  window_x11_change_property(xid, g_x11.a_net_icon_name, g_x11.a_utf8, 8, s.chars, n, 0);
+  // WM_NAME as Latin-1 STRING for old window managers.
+  var l1: uint8* = (uint8*)malloc(n + 1);
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var b: int64 = (int64)s.chars[i];
+    var cp: int64 = b;
+    var adv: int64 = 1;
+    if (b >= 0xC0 && b < 0xE0 && i + 1 < n) { cp = ((b & 31) << 6) | ((int64)s.chars[i + 1] & 63); adv = 2; }
+    else if (b >= 0xE0 && b < 0xF0) { cp = 63; adv = 3; }
+    else if (b >= 0xF0) { cp = 63; adv = 4; }
+    if (cp > 255) { cp = 63; }
+    l1[o] = (uint8)cp; o = o + 1;
+    i = i + adv;
+  }
+  window_x11_change_property(xid, 39, 31, 8, l1, o, 0);           // WM_NAME, STRING
+  free(l1);
+}
+
+fn net_state(w: Window*, action: int64, a1: int64, a2: int64) {
+  window_x11_client_message(g_x11.root, xw(w)->xid, g_x11.a_state, action, a1, a2, 1, 0, 0x180000);
+}
+
+fn configure(xid: int64, mask: int64, v: int64*, nv: int64) {
+  var r: uint8[40];
+  var len: int64 = 12 + nv * 4;
+  window_x11_req(&r[0], 12, 0, len);
+  window_wr32(&r[0], 4, xid); window_wr16(&r[0], 8, mask);
+  for i: int64 in 0..nv { window_wr32(&r[0], 12 + i * 4, v[i]); }
+  window_x11_send(&r[0], len);
+}
+
+fn map(xid: int64, on: bool) {
+  var r: uint8[8];
+  var op: int64 = 10;
+  if (on) { op = 8; }
+  window_x11_req(&r[0], op, 0, 8);
+  window_wr32(&r[0], 4, xid);
+  window_x11_send(&r[0], 8);
+}
+
+// Waits (up to timeout_ms) for MapNotify on xid, parking every other event.
+fn wait_mapped(xid: int64, timeout_ms: int64) {
+  var deadline: int64 = window_now_us() + timeout_ms * 1000;
+  while (!g_x11.dead) {
+    // Look through what is already parked.
+    var n: int64 = g_x11.rq_tail - g_x11.rq_head;
+    for i: int64 in 0..n {
+      var slot: uint8* = &g_x11.rq[((g_x11.rq_head + i) % 2048) * WINDOW_X11_EV_SIZE];
+      if (((int64)slot[0] & 127) == 19 && window_rd32(slot, 8) == xid) { return; }
+    }
+    var left: int64 = (deadline - window_now_us()) / 1000;
+    if (left <= 0) { return; }
+    if (window_x11_readable(left)) { window_x11_read_pending(); }
+  }
+}
+
+fn geometry(xid: int64, px_w: int64*, px_h: int64*) -> bool {
+  var r: uint8[8];
+  window_x11_req(&r[0], 14, 0, 8);
+  window_wr32(&r[0], 4, xid);
+  var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 8));
+  if (p == 0) { return false; }
+  *px_w = window_rd16(p, 16); *px_h = window_rd16(p, 18);
+  free(p);
+  return true;
+}
+
+fn root_position(xid: int64, ox: int64*, oy: int64*) -> bool {
+  var r: uint8[16];
+  window_x11_req(&r[0], 40, 0, 16);
+  window_wr32(&r[0], 4, xid); window_wr32(&r[0], 8, g_x11.root);
+  var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 16));
+  if (p == 0) { return false; }
+  *ox = window_rds16(p, 12); *oy = window_rds16(p, 14);
+  free(p);
+  return true;
+}
+
+// ---------- create / destroy ----------
+export fn window_x11_create(w: Window*, cfg: WindowConfig*) -> bool {
+  if (g_x11.dead) { window_set_error("the X server connection is gone"); return false; }
+  var x: WindowX11Win* = new WindowX11Win;
+  w->plat = (rawptr)x;
+  x->resizable = cfg->resizable;
+  x->decorated = cfg->decorated;
+  x->floating = cfg->floating;
+  x->min_w = cfg->min_w; x->min_h = cfg->min_h; x->max_w = cfg->max_w; x->max_h = cfg->max_h;
+  w->scale = scale();
+  w->text_input = true;
+  var depth: int64 = 0;
+  var visual: int64 = 0;
+  if (cfg->gl_visual != 0) { visual = cfg->gl_visual; depth = (int64)cfg->gl_depth; }
+  else if (cfg->transparent && g_x11.argb_visual != 0) { visual = g_x11.argb_visual; depth = 32; }
+  var mask: int64 = 0x8 | 0x800;
+  if (visual != 0 && visual != g_x11.root_visual) {
+    x->colormap = window_x11_new_id();
+    var cm: uint8[16];
+    window_x11_req(&cm[0], 78, 0, 16);
+    window_wr32(&cm[0], 4, x->colormap); window_wr32(&cm[0], 8, g_x11.root); window_wr32(&cm[0], 12, visual);
+    window_x11_send(&cm[0], 16);
+    mask = mask | 0x2000;
+  } else {
+    visual = g_x11.root_visual;
+    depth = g_x11.root_depth;
+  }
+  x->visual = visual;
+  x->depth = depth;
+  var pw: int64 = (int64)cfg->w;
+  var ph: int64 = (int64)cfg->h;
+  if (cfg->hidpi) { pw = (int64)((float32)pw * scale() + 0.5); ph = (int64)((float32)ph * scale() + 0.5); }
+  if (pw > 32767) { pw = 32767; }
+  if (ph > 32767) { ph = 32767; }
+  var px: int64 = 0;
+  var py: int64 = 0;
+  var mon: WindowMonitor;
+  var have_mon: bool = false;
+  if (g_window.monitor_count > 0) {
+    var mi: int32 = cfg->monitor;
+    if (mi < 0 || mi >= g_window.monitor_count) {
+      mi = 0;
+      for i in 0..g_window.monitor_count { if (g_window.monitors[i].primary) { mi = (int32)i; } }
+    }
+    mon = g_window.monitors[mi];
+    have_mon = true;
+  }
+  if (cfg->x == WINDOW_POS_CENTER || cfg->x == WINDOW_POS_ANY) {
+    if (have_mon) { px = (int64)mon.x + ((int64)mon.w - pw) / 2; }
+  } else { px = (int64)cfg->x; }
+  if (cfg->y == WINDOW_POS_CENTER || cfg->y == WINDOW_POS_ANY) {
+    if (have_mon) { py = (int64)mon.y + ((int64)mon.h - ph) / 2; }
+  } else { py = (int64)cfg->y; }
+  if (px < -32768) { px = -32768; }
+  if (py < -32768) { py = -32768; }
+  if (px > 32767) { px = 32767; }
+  if (py > 32767) { py = 32767; }
+  x->xid = window_x11_new_id();
+  var nvals: int64 = 2;
+  if ((mask & 0x2000) != 0) { nvals = 3; }
+  var len: int64 = 32 + nvals * 4;
+  var r: uint8[48];
+  window_x11_req(&r[0], 1, depth, len);
+  window_wr32(&r[0], 4, x->xid); window_wr32(&r[0], 8, g_x11.root);
+  window_wr16(&r[0], 12, px); window_wr16(&r[0], 14, py);
+  window_wr16(&r[0], 16, pw); window_wr16(&r[0], 18, ph);
+  window_wr16(&r[0], 20, 0); window_wr16(&r[0], 22, 1);
+  window_wr32(&r[0], 24, visual); window_wr32(&r[0], 28, mask);
+  window_wr32(&r[0], 32, 0);                         // border pixel
+  window_wr32(&r[0], 36, 6455423);                   // event mask
+  if (nvals == 3) { window_wr32(&r[0], 40, x->colormap); }
+  var seq: int64 = window_x11_send(&r[0], len);
+  x->px_w = pw; x->px_h = ph;
+  // Properties every window manager reads before mapping.
+  var protos: int64[2];
+  protos[0] = g_x11.a_delete; protos[1] = g_x11.a_ping;
+  window_x11_set_atoms(x->xid, g_x11.a_protocols, &protos[0], 2);
+  var pid: uint8[4];
+  window_wr32(&pid[0], 0, syscall(39));
+  window_x11_change_property(x->xid, g_x11.a_pid, 6, 32, &pid[0], 4, 0);
+  var cls: uint8[200];
+  var an: int64 = (int64)cfg->app_id.length;
+  if (an > 98) { an = 98; }
+  for i: int64 in 0..an { cls[i] = cfg->app_id.chars[i]; cls[an + 1 + i] = cfg->app_id.chars[i]; }
+  cls[an] = (uint8)0; cls[an * 2 + 1] = (uint8)0;
+  window_x11_change_property(x->xid, 67, 31, 8, &cls[0], an * 2 + 2, 0);   // WM_CLASS
+  set_title_props(x->xid, cfg->title);
+  set_wm_hints(x->xid, false);
+  set_size_hints(w);
+  if (!cfg->decorated) { set_motif(x->xid, false); }
+  var wt: int64[1];
+  wt[0] = g_x11.a_type_normal;
+  window_x11_set_atoms(x->xid, g_x11.a_net_wm_type, &wt[0], 1);
+  var ver: uint8[4];
+  window_wr32(&ver[0], 0, 5);
+  window_x11_change_property(x->xid, g_x11.a_xdnd_aware, 4, 32, &ver[0], 4, 0);
+  // Initial EWMH state goes in the property before mapping (EWMH "_NET_WM_STATE").
+  var st: int64[4];
+  var ns: int64 = 0;
+  if (cfg->floating) { st[ns] = g_x11.a_above; ns = ns + 1; }
+  if (cfg->maximized) { st[ns] = g_x11.a_max_v; st[ns + 1] = g_x11.a_max_h; ns = ns + 2; }
+  if (cfg->fullscreen != WINDOW_WINDOWED && g_x11.have_wm) { st[ns] = g_x11.a_fullscreen; ns = ns + 1; }
+  if (ns > 0) { window_x11_set_atoms(x->xid, g_x11.a_state, &st[0], ns); }
+  window_x11_sync();
+  if (g_x11.err_seq == seq && g_x11.err_code != 0) {
+    window_set_error("the X server refused to create the window (bad visual or size?)");
+    g_x11.err_code = 0;
+    free(x);
+    w->plat = (rawptr)0;
+    return false;
+  }
+  w->x = (int32)px; w->y = (int32)py;
+  w->fb_w = (int32)pw; w->fb_h = (int32)ph;
+  w->w = to_logical(pw); w->h = to_logical(ph);
+  if (cfg->fullscreen != WINDOW_WINDOWED) { window_x11_set_fullscreen(w, cfg->fullscreen, cfg->monitor); }
+  if (cfg->visible) {
+    map(x->xid, true);
+    x->mapped = true;
+    wait_mapped(x->xid, 1000);
+    if (cfg->focused) { window_x11_focus(w); }
+  }
+  return true;
+}
+
+export fn window_x11_destroy(w: Window*) {
+  var x: WindowX11Win* = xw(w);
+  if (x == 0) { return; }
+  if (!g_x11.dead) {
+    if (x->grabbed) { ungrab(); }
+    var r: uint8[8];
+    window_x11_req(&r[0], 4, 0, 8);
+    window_wr32(&r[0], 4, x->xid);
+    window_x11_send(&r[0], 8);
+    if (x->colormap != 0) { window_x11_req(&r[0], 79, 0, 8); window_wr32(&r[0], 4, x->colormap); window_x11_send(&r[0], 8); }
+    if (x->gc != 0) { window_x11_req(&r[0], 60, 0, 8); window_wr32(&r[0], 4, x->gc); window_x11_send(&r[0], 8); }
+    if (x->cursor_img != 0) { window_x11_req(&r[0], 95, 0, 8); window_wr32(&r[0], 4, x->cursor_img); window_x11_send(&r[0], 8); }
+    window_x11_sync();
+  }
+  free(x);
+  w->plat = (rawptr)0;
+}
+
+// ---------- event translation ----------
+fn mods_of(state: int64) -> int32 {
+  var m: int32 = 0;
+  if ((state & 1) != 0) { m = m | WINDOW_MOD_SHIFT; }
+  if ((state & 2) != 0) { m = m | WINDOW_MOD_CAPS_LOCK; }
+  if ((state & 4) != 0) { m = m | WINDOW_MOD_CTRL; }
+  if ((state & 8) != 0) { m = m | WINDOW_MOD_ALT; }
+  if ((state & 64) != 0) { m = m | WINDOW_MOD_SUPER; }
+  if ((state & g_x11.numlock_mask) != 0) { m = m | WINDOW_MOD_NUM_LOCK; }
+  if (g_x11.level3_mask != 0 && (state & g_x11.level3_mask) != 0) { m = m | WINDOW_MOD_ALTGR; }
+  if (g_x11.modeswitch_mask != 0 && (state & g_x11.modeswitch_mask) != 0) { m = m | WINDOW_MOD_ALTGR; }
+  return m;
+}
+
+fn key_event(w: Window*, e: uint8*, down: bool) {
+  var kc: int64 = (int64)e[1];
+  var state: int64 = window_rd16(e, 28);
+  var mods: int32 = mods_of(state);
+  var ev: WindowEvent;
+  ev.win = w;
+  ev.kind = WINDOW_EV_KEY_UP;
+  if (down) { ev.kind = WINDOW_EV_KEY_DOWN; }
+  ev.scancode = window_evdev_to_key(kc - 8);
+  // The layout's key: the keysym in the current group with no modifiers.
+  var plain: int64 = window_x11_keysym(kc, state & 0x6000);
+  ev.key = window_keysym_to_key(plain);
+  if (ev.key == 0) { ev.key = ev.scancode; }
+  if (ev.scancode == 0) { ev.scancode = ev.key; }
+  ev.mods = mods;
+  ev.x = (float64)window_rds16(e, 24) / (float64)scale();
+  ev.y = (float64)window_rds16(e, 26) / (float64)scale();
+  window_push_event(&ev);
+  if (!down || !w->text_input) { return; }
+  var altgr: bool = (mods & WINDOW_MOD_ALTGR) != 0;
+  if ((mods & WINDOW_MOD_CTRL) != 0 && !altgr) { return; }
+  if ((mods & WINDOW_MOD_ALT) != 0 && !altgr) { return; }
+  var ks: int64 = window_x11_keysym(kc, state);
+  if (window_keysym_is_dead(ks)) { window_push_codepoint(w, (uint32)0, ks, mods); return; }
+  var cp: uint32 = window_keysym_to_ucs(ks);
+  if (cp != (uint32)0) { window_push_codepoint(w, cp, ks, mods); }
+}
+
+fn button_event(w: Window*, e: uint8*, down: bool) {
+  var b: int64 = (int64)e[1];
+  var ev: WindowEvent;
+  ev.win = w;
+  ev.x = (float64)window_rds16(e, 24) / (float64)scale();
+  ev.y = (float64)window_rds16(e, 26) / (float64)scale();
+  ev.mods = mods_of(window_rd16(e, 28));
+  if (b >= 4 && b <= 7) {
+    if (!down) { return; }
+    ev.kind = WINDOW_EV_SCROLL;
+    if (b == 4) { ev.dy = 1.0; }
+    if (b == 5) { ev.dy = -1.0; }
+    if (b == 6) { ev.dx = -1.0; }
+    if (b == 7) { ev.dx = 1.0; }
+    window_push_event(&ev);
+    return;
+  }
+  ev.kind = WINDOW_EV_MOUSE_UP;
+  if (down) { ev.kind = WINDOW_EV_MOUSE_DOWN; }
+  switch (b) {
+    case 1: { ev.button = WINDOW_BUTTON_LEFT; }
+    case 2: { ev.button = WINDOW_BUTTON_MIDDLE; }
+    case 3: { ev.button = WINDOW_BUTTON_RIGHT; }
+    case 8: { ev.button = WINDOW_BUTTON_X1; }
+    case 9: { ev.button = WINDOW_BUTTON_X2; }
+    default: { ev.button = (int32)b; }
+  }
+  window_push_event(&ev);
+}
+
+fn motion_event(w: Window*, e: uint8*) {
+  var x: WindowX11Win* = xw(w);
+  var ex: int64 = window_rds16(e, 24);
+  var ey: int64 = window_rds16(e, 26);
+  if (w->cursor_mode == WINDOW_CURSOR_LOCKED && !x->have_raw) {
+    // No XInput2: keep the pointer in the middle and report how far it moved.
+    var cx: int64 = x->px_w / 2;
+    var cy: int64 = x->px_h / 2;
+    if (ex == cx && ey == cy) { return; }
+    var rv: WindowEvent;
+    rv.kind = WINDOW_EV_RAW_MOTION; rv.win = w;
+    rv.dx = (float64)(ex - cx); rv.dy = (float64)(ey - cy);
+    window_push_event(&rv);
+    window_x11_warp(w, (float64)cx / (float64)scale(), (float64)cy / (float64)scale());
+    return;
+  }
+  var ev: WindowEvent;
+  ev.kind = WINDOW_EV_MOUSE_MOVE; ev.win = w;
+  ev.x = (float64)ex / (float64)scale();
+  ev.y = (float64)ey / (float64)scale();
+  ev.mods = mods_of(window_rd16(e, 28));
+  window_push_event(&ev);
+}
+
+fn read_wm_state(w: Window*) {
+  var b: WindowBytes; var ty: int64 = 0; var fmt: int64 = 0;
+  if (!window_x11_get_property(xw(w)->xid, g_x11.a_state, false, &b, &ty, &fmt)) {
+    if (w->maximized) { var ev: WindowEvent; ev.kind = WINDOW_EV_RESTORE; ev.win = w; window_push_event(&ev); }
+    return;
+  }
+  var mv: bool = false; var mh: bool = false; var hidden: bool = false; var fs: bool = false;
+  if (fmt == 32) {
+    var n: int64 = b.len / 4;
+    for i: int64 in 0..n {
+      var a: int64 = window_rd32(b.data, i * 4);
+      if (a == g_x11.a_max_v) { mv = true; }
+      if (a == g_x11.a_max_h) { mh = true; }
+      if (a == g_x11.a_hidden) { hidden = true; }
+      if (a == g_x11.a_fullscreen) { fs = true; }
+    }
+  }
+  free(b.data);
+  var ev: WindowEvent;
+  ev.win = w;
+  if (hidden && !w->minimized) { ev.kind = WINDOW_EV_MINIMIZE; window_push_event(&ev); }
+  else if (mv && mh && !w->maximized) { ev.kind = WINDOW_EV_MAXIMIZE; window_push_event(&ev); }
+  else if (!hidden && !(mv && mh) && (w->maximized || w->minimized)) { ev.kind = WINDOW_EV_RESTORE; window_push_event(&ev); }
+  if (g_x11.have_wm) {
+    if (fs) { w->fullscreen = WINDOW_FULLSCREEN; } else { w->fullscreen = WINDOW_WINDOWED; }
+  }
+}
+
+fn client_message(w: Window*, e: uint8*) {
+  var mtype: int64 = window_rd32(e, 8);
+  if (mtype == g_x11.a_protocols) {
+    var p: int64 = window_rd32(e, 12);
+    if (p == g_x11.a_delete) {
+      var ev: WindowEvent; ev.kind = WINDOW_EV_CLOSE; ev.win = w; window_push_event(&ev);
+    } else if (p == g_x11.a_ping) {
+      var reply: uint8[32];
+      for i in 0..32 { reply[i] = e[i]; }
+      reply[0] = (uint8)33;
+      window_wr32(&reply[0], 4, g_x11.root);
+      window_x11_send_event(g_x11.root, 0x180000, &reply[0]);
+    }
+    return;
+  }
+  window_x11_dnd_message(w, e);
+}
+
+fn configure_event(w: Window*, e: uint8*) {
+  var x: WindowX11Win* = xw(w);
+  var pw: int64 = window_rd16(e, 20);
+  var ph: int64 = window_rd16(e, 22);
+  if (pw != x->px_w || ph != x->px_h) {
+    x->px_w = pw; x->px_h = ph;
+    var ev: WindowEvent;
+    ev.kind = WINDOW_EV_RESIZE; ev.win = w;
+    ev.fb_w = (int32)pw; ev.fb_h = (int32)ph;
+    ev.w = to_logical(pw); ev.h = to_logical(ph);
+    window_push_event(&ev);
+    if (!x->resizable) { set_size_hints(w); }
+  }
+  var ox: int64 = window_rds16(e, 16);
+  var oy: int64 = window_rds16(e, 18);
+  if (((int64)e[0] & 128) == 0) {
+    // A real (not synthetic) event has the position relative to the parent,
+    // which is the frame when a window manager reparented us.
+    if (!root_position(x->xid, &ox, &oy)) { return; }
+  }
+  var mv: WindowEvent;
+  mv.kind = WINDOW_EV_MOVE; mv.win = w; mv.x = (float64)ox; mv.y = (float64)oy;
+  window_push_event(&mv);
+}
+
+fn focus_event(w: Window*, e: uint8*, in: bool) {
+  var detail: int64 = (int64)e[1];
+  var mode: int64 = (int64)e[8];
+  if (mode == 1 || mode == 2) { return; }      // NotifyGrab / NotifyUngrab: a WM move, not real focus
+  if (detail == 5 || detail == 6 || detail == 7) { return; }   // Pointer / PointerRoot / None
+  var ev: WindowEvent;
+  ev.win = w;
+  if (in) {
+    ev.kind = WINDOW_EV_FOCUS_IN;
+    window_push_event(&ev);
+    if (w->cursor_mode == WINDOW_CURSOR_LOCKED || w->cursor_mode == WINDOW_CURSOR_CONFINED) { grab(w); }
+  } else {
+    ev.kind = WINDOW_EV_FOCUS_OUT;
+    window_push_event(&ev);
+    if (xw(w)->grabbed) { ungrab(); xw(w)->grabbed = false; }
+  }
+}
+
+/// Turns one X event packet into WindowEvents.
+export fn window_x11_translate(e: uint8*) {
+  var code: int64 = (int64)e[0] & 127;
+  if (code >= 2 && code <= 8) { g_x11.last_time = window_rd32(e, 4); }
+  if (code == 35) { window_x11_generic_event(e); return; }
+  if (g_x11.randr_ok && (code == g_x11.randr_event || code == g_x11.randr_event + 1)) {
+    window_x11_refresh_monitors();
+    var me: WindowEvent; me.kind = WINDOW_EV_MONITORS; window_push_event(&me);
+    return;
+  }
+  if (code == 34) {
+    window_x11_load_keymap();
+    return;
+  }
+  if (code == 29 || code == 30 || code == 31) { window_x11_selection_event(e); return; }
+  var wid: int64 = 0;
+  switch (code) {
+    case 2: { wid = window_rd32(e, 12); }
+    case 3: { wid = window_rd32(e, 12); }
+    case 4: { wid = window_rd32(e, 12); }
+    case 5: { wid = window_rd32(e, 12); }
+    case 6: { wid = window_rd32(e, 12); }
+    case 7: { wid = window_rd32(e, 12); }
+    case 8: { wid = window_rd32(e, 12); }
+    case 9: { wid = window_rd32(e, 4); }
+    case 10: { wid = window_rd32(e, 4); }
+    case 12: { wid = window_rd32(e, 4); }
+    case 18: { wid = window_rd32(e, 8); }
+    case 19: { wid = window_rd32(e, 8); }
+    case 22: { wid = window_rd32(e, 8); }
+    case 28: { wid = window_rd32(e, 4); }
+    case 33: { wid = window_rd32(e, 4); }
+    default: { return; }
+  }
+  if (code == 28 && wid == g_x11.root) {
+    var atom: int64 = window_rd32(e, 8);
+    if (atom == g_x11.a_resource_manager) { rescale(); }
+    if (atom == g_x11.a_workarea) { window_x11_refresh_monitors(); }
+    return;
+  }
+  var w: Window* = window_x11_find(wid);
+  if (w == 0) { return; }
+  var ev: WindowEvent;
+  ev.win = w;
+  switch (code) {
+    case 2: { key_event(w, e, true); }
+    case 3: {
+      // Without XKB detectable auto-repeat, a repeat is a release followed at
+      // once by a press of the same key with the same time: drop the release.
+      if (!g_x11.xkb_ok) {
+        window_x11_read_pending();
+        var nx: uint8* = window_x11_rq_peek();
+        if (nx != 0 && ((int64)nx[0] & 127) == 2 && nx[1] == e[1] && window_rd32(nx, 4) == window_rd32(e, 4)) { return; }
+      }
+      key_event(w, e, false);
+    }
+    case 4: { button_event(w, e, true); }
+    case 5: { button_event(w, e, false); }
+    case 6: { motion_event(w, e); }
+    case 7: {
+      if ((int64)e[30] != 0) { return; }       // grab / ungrab crossings
+      ev.kind = WINDOW_EV_MOUSE_ENTER;
+      ev.x = (float64)window_rds16(e, 24) / (float64)scale(); ev.y = (float64)window_rds16(e, 26) / (float64)scale();
+      window_push_event(&ev);
+      if (w->cursor_shape != WINDOW_CURSOR_ARROW && w->cursor_mode == WINDOW_CURSOR_NORMAL) { window_x11_set_cursor(w, w->cursor_shape); }
+    }
+    case 8: {
+      if ((int64)e[30] != 0) { return; }
+      ev.kind = WINDOW_EV_MOUSE_LEAVE;
+      window_push_event(&ev);
+    }
+    case 9: { focus_event(w, e, true); }
+    case 10: { focus_event(w, e, false); }
+    case 12: {
+      if (window_rd16(e, 16) == 0) { w->redraw = true; }
+    }
+    case 18: {
+      xw(w)->mapped = false;
+      ev.kind = WINDOW_EV_HIDDEN; window_push_event(&ev);
+    }
+    case 19: {
+      xw(w)->mapped = true;
+      ev.kind = WINDOW_EV_SHOWN; window_push_event(&ev);
+      w->redraw = true;
+      if (w->cursor_mode == WINDOW_CURSOR_LOCKED || w->cursor_mode == WINDOW_CURSOR_CONFINED) { grab(w); }
+    }
+    case 22: { configure_event(w, e); }
+    case 28: {
+      var atom2: int64 = window_rd32(e, 8);
+      if (atom2 == g_x11.a_state) { read_wm_state(w); }
+      if (atom2 == g_x11.a_wm_state) {
+        var b: WindowBytes; var ty: int64 = 0; var fmt: int64 = 0;
+        if (window_x11_get_property(xw(w)->xid, g_x11.a_wm_state, false, &b, &ty, &fmt)) {
+          if (b.len >= 4) {
+            var s: int64 = window_rd32(b.data, 0);
+            if (s == 3 && !w->minimized) { ev.kind = WINDOW_EV_MINIMIZE; window_push_event(&ev); }
+            if (s == 1 && w->minimized) { ev.kind = WINDOW_EV_RESTORE; window_push_event(&ev); }
+          }
+          free(b.data);
+        }
+      }
+    }
+    case 33: { client_message(w, e); }
+    default: { }
+  }
+}
+
+fn rescale() {
+  var dpi: float32 = window_x11_xft_dpi();
+  var s: float32 = 1.0;
+  if (dpi >= 48.0 && dpi <= 960.0) { s = dpi / 96.0; }
+  if (s == g_x11.scale) { return; }
+  g_x11.scale = s;
+  var w: Window* = g_window.windows;
+  while (w != 0) {
+    var ev: WindowEvent;
+    ev.kind = WINDOW_EV_SCALE; ev.win = w; ev.scale = s;
+    window_push_event(&ev);
+    var rv: WindowEvent;
+    rv.kind = WINDOW_EV_RESIZE; rv.win = w; rv.fb_w = w->fb_w; rv.fb_h = w->fb_h;
+    rv.w = to_logical((int64)w->fb_w); rv.h = to_logical((int64)w->fb_h);
+    window_push_event(&rv);
+    w = w->next;
+  }
+  window_x11_refresh_monitors();
+}
+
+/// Reads and translates events. Waits up to timeout_ms (-1 = forever) when none are ready.
+export fn window_x11_pump(timeout_ms: int32, wake_fd: int64) {
+  if (g_x11.dead) { return; }
+  var e: uint8[128];
+  window_x11_read_pending();
+  var did: bool = false;
+  while (window_x11_rq_pop(&e[0])) { window_x11_translate(&e[0]); did = true; }
+  if (!did && timeout_ms != 0 && g_window.q_tail == g_window.q_head) {
+    var fds: int64[2];
+    fds[0] = g_x11.fd; fds[1] = wake_fd;
+    var n: int32 = 1;
+    if (wake_fd >= 0) { n = 2; }
+    var pfd: uint8[16];
+    for i in 0..n {
+      window_wr32(&pfd[0], (int64)i * 8, fds[i]); window_wr16(&pfd[0], (int64)i * 8 + 4, 1); window_wr16(&pfd[0], (int64)i * 8 + 6, 0);
+    }
+    syscall(7, &pfd[0], (int64)n, (int64)timeout_ms);
+    window_x11_read_pending();
+    while (window_x11_rq_pop(&e[0])) { window_x11_translate(&e[0]); }
+  }
+  if (g_x11.dead) {
+    var q: WindowEvent;
+    q.kind = WINDOW_EV_QUIT;
+    window_push_event(&q);
+    var w: Window* = g_window.windows;
+    while (w != 0) { var c: WindowEvent; c.kind = WINDOW_EV_CLOSE; c.win = w; window_push_event(&c); w = w->next; }
+  }
+}
+
+// ---------- window operations ----------
+export fn window_x11_set_title(w: Window*, s: string) { set_title_props(xw(w)->xid, s); }
+
+export fn window_x11_set_size(w: Window*, width: int32, height: int32) {
+  var x: WindowX11Win* = xw(w);
+  var v: int64[2];
+  v[0] = (int64)((float32)width * scale() + 0.5); v[1] = (int64)((float32)height * scale() + 0.5);
+  if (!x->resizable) { x->px_w = v[0]; x->px_h = v[1]; set_size_hints(w); }
+  configure(x->xid, 4 | 8, &v[0], 2);
+  if (!g_x11.have_wm || !x->mapped) {
+    // No WM to send a ConfigureNotify after its own decision: the server sends one, but
+    // report the size now so a caller that reads it straight away sees the new value.
+    window_x11_sync();
+  }
+}
+
+export fn window_x11_set_position(w: Window*, px: int32, py: int32) {
+  var v: int64[2];
+  v[0] = (int64)px; v[1] = (int64)py;
+  configure(xw(w)->xid, 1 | 2, &v[0], 2);
+}
+
+export fn window_x11_set_size_limits(w: Window*, a: int32, b: int32, c: int32, d: int32) {
+  var x: WindowX11Win* = xw(w);
+  x->min_w = a; x->min_h = b; x->max_w = c; x->max_h = d;
+  set_size_hints(w);
+}
+
+export fn window_x11_set_visible(w: Window*, on: bool) {
+  var x: WindowX11Win* = xw(w);
+  if (on == x->mapped) { return; }
+  map(x->xid, on);
+  if (on) { wait_mapped(x->xid, 1000); }
+  x->mapped = on;
+}
+
+export fn window_x11_minimize(w: Window*) {
+  var x: WindowX11Win* = xw(w);
+  if (g_x11.have_wm) {
+    window_x11_client_message(g_x11.root, x->xid, g_x11.a_change_state, 3, 0, 0, 0, 0, 0x180000);
+  } else {
+    map(x->xid, false);
+    var ev: WindowEvent; ev.kind = WINDOW_EV_MINIMIZE; ev.win = w; window_push_event(&ev);
+  }
+}
+
+export fn window_x11_maximize(w: Window*) {
+  if (g_x11.have_wm) { net_state(w, 1, g_x11.a_max_v, g_x11.a_max_h); return; }
+  if (g_window.monitor_count == 0) { return; }
+  var m: WindowMonitor* = &g_window.monitors[window_x11_monitor_index(w)];
+  save_geometry(w);
+  var v: int64[4];
+  v[0] = (int64)m->work_x; v[1] = (int64)m->work_y; v[2] = (int64)m->work_w; v[3] = (int64)m->work_h;
+  configure(xw(w)->xid, 1 | 2 | 4 | 8, &v[0], 4);
+  var ev: WindowEvent; ev.kind = WINDOW_EV_MAXIMIZE; ev.win = w; window_push_event(&ev);
+}
+
+export fn window_x11_restore(w: Window*) {
+  var x: WindowX11Win* = xw(w);
+  if (w->minimized || !x->mapped) {
+    map(x->xid, true);
+    x->mapped = true;
+    if (!g_x11.have_wm) { var ev: WindowEvent; ev.kind = WINDOW_EV_RESTORE; ev.win = w; window_push_event(&ev); }
+    return;
+  }
+  if (w->maximized) {
+    if (g_x11.have_wm) { net_state(w, 0, g_x11.a_max_v, g_x11.a_max_h); return; }
+    restore_geometry(w);
+    var ev2: WindowEvent; ev2.kind = WINDOW_EV_RESTORE; ev2.win = w; window_push_event(&ev2);
+  }
+}
+
+export fn window_x11_focus(w: Window*) {
+  var x: WindowX11Win* = xw(w);
+  if (g_x11.have_wm) {
+    window_x11_client_message(g_x11.root, x->xid, g_x11.a_active, 1, g_x11.last_time, 0, 0, 0, 0x180000);
+    return;
+  }
+  var v: int64[1];
+  v[0] = 0;                                            // Above
+  configure(x->xid, 64, &v[0], 1);
+  var r: uint8[12];
+  window_x11_req(&r[0], 42, 1, 12);                    // SetInputFocus, revert-to PointerRoot
+  window_wr32(&r[0], 4, x->xid); window_wr32(&r[0], 8, 0);
+  g_x11.quiet_from = g_x11.seq + 1;
+  window_x11_send(&r[0], 12);
+}
+
+export fn window_x11_attention(w: Window*) {
+  set_wm_hints(xw(w)->xid, true);
+  if (g_x11.have_wm) { net_state(w, 1, g_x11.a_attention, 0); }
+}
+
+fn save_geometry(w: Window*) {
+  var x: WindowX11Win* = xw(w);
+  x->saved_x = w->x; x->saved_y = w->y;
+  x->saved_w = (int32)x->px_w; x->saved_h = (int32)x->px_h;
+}
+
+fn restore_geometry(w: Window*) {
+  var x: WindowX11Win* = xw(w);
+  if (x->saved_w <= 0) { return; }
+  var v: int64[4];
+  v[0] = (int64)x->saved_x; v[1] = (int64)x->saved_y; v[2] = (int64)x->saved_w; v[3] = (int64)x->saved_h;
+  configure(x->xid, 1 | 2 | 4 | 8, &v[0], 4);
+}
+
+export fn window_x11_monitor_index(w: Window*) -> int32 {
+  var best: int32 = 0;
+  var best_area: int64 = -1;
+  for i in 0..g_window.monitor_count {
+    var m: WindowMonitor* = &g_window.monitors[i];
+    var x0: int64 = (int64)w->x; var y0: int64 = (int64)w->y;
+    var x1: int64 = x0 + (int64)w->fb_w; var y1: int64 = y0 + (int64)w->fb_h;
+    if (x0 < (int64)m->x) { x0 = (int64)m->x; }
+    if (y0 < (int64)m->y) { y0 = (int64)m->y; }
+    if (x1 > (int64)(m->x + m->w)) { x1 = (int64)(m->x + m->w); }
+    if (y1 > (int64)(m->y + m->h)) { y1 = (int64)(m->y + m->h); }
+    var area: int64 = 0;
+    if (x1 > x0 && y1 > y0) { area = (x1 - x0) * (y1 - y0); }
+    if (area > best_area) { best_area = area; best = (int32)i; }
+  }
+  return best;
+}
+
+export fn window_x11_set_fullscreen(w: Window*, mode: int32, monitor: int32) {
+  var x: WindowX11Win* = xw(w);
+  var mi: int32 = monitor;
+  if (mi < 0 || mi >= g_window.monitor_count) { mi = window_x11_monitor_index(w); }
+  var on: bool = mode != WINDOW_WINDOWED;
+  var bypass: uint8[4];
+  if (on) { window_wr32(&bypass[0], 0, 1); } else { window_wr32(&bypass[0], 0, 0); }
+  window_x11_change_property(x->xid, g_x11.a_bypass, 6, 32, &bypass[0], 4, 0);
+  if (g_x11.have_wm) {
+    if (on && g_window.monitor_count > 0 && g_x11.randr_ok) {
+      // _NET_WM_FULLSCREEN_MONITORS takes Xinerama indexes: with RandR monitors in
+      // the same order this is the monitor index.
+      window_x11_client_message(g_x11.root, x->xid, g_x11.a_fs_monitors, (int64)mi, (int64)mi, (int64)mi, (int64)mi, 1, 0x180000);
+    }
+    if (x->mapped) {
+      var action: int64 = 0;
+      if (on) { action = 1; }
+      net_state(w, action, g_x11.a_fullscreen, 0);
+    } else if (on) {
+      var st: int64[1];
+      st[0] = g_x11.a_fullscreen;
+      window_x11_set_atoms(x->xid, g_x11.a_state, &st[0], 1);
+    } else {
+      window_x11_delete_property(x->xid, g_x11.a_state);
+    }
+    w->fullscreen = mode;
+    return;
+  }
+  // No window manager: cover the monitor ourselves.
+  if (on) {
+    save_geometry(w);
+    if (g_window.monitor_count == 0) { w->fullscreen = mode; return; }
+    var m: WindowMonitor* = &g_window.monitors[mi];
+    var v: int64[5];
+    v[0] = (int64)m->x; v[1] = (int64)m->y; v[2] = (int64)m->w; v[3] = (int64)m->h; v[4] = 0;
+    configure(x->xid, 1 | 2 | 4 | 8 | 64, &v[0], 5);
+  } else {
+    restore_geometry(w);
+  }
+  w->fullscreen = mode;
+  window_x11_sync();
+}
+
+export fn window_x11_set_icon(w: Window*, rgba: uint8*, iw: int32, ih: int32) {
+  var n: int64 = (int64)iw * (int64)ih;
+  var bytes: int64 = 8 + n * 4;
+  if (bytes / 4 + 6 > g_x11.max_req) { return; }
+  var b: uint8* = (uint8*)malloc(bytes);
+  window_wr32(b, 0, (int64)iw); window_wr32(b, 4, (int64)ih);
+  for i: int64 in 0..n {
+    b[8 + i * 4] = rgba[i * 4 + 2];
+    b[8 + i * 4 + 1] = rgba[i * 4 + 1];
+    b[8 + i * 4 + 2] = rgba[i * 4];
+    b[8 + i * 4 + 3] = rgba[i * 4 + 3];
+  }
+  window_x11_change_property(xw(w)->xid, g_x11.a_icon, 6, 32, b, bytes, 0);
+  free(b);
+}
+
+export fn window_x11_blit(w: Window*, rgba: uint8*, iw: int32, ih: int32, stride: int32) -> bool {
+  var x: WindowX11Win* = xw(w);
+  if (!g_x11.blit_ok && x->depth != 32) { window_set_error("the X server's pixel format is not 32-bit BGRX"); return false; }
+  if (x->gc == 0) { x->gc = window_x11_create_gc(x->xid); }
+  window_x11_put_image(x->xid, x->gc, x->depth, rgba, iw, ih, stride, x->depth == 32);
+  return !g_x11.dead;
+}
+
+export fn window_x11_native(w: Window*, out: WindowNative*) -> bool {
+  var x: WindowX11Win* = xw(w);
+  out->x11_window = x->xid;
+  out->x11_visual = x->visual;
+  out->x11_screen = 0;
+  for i in 0..64 { out->display_name[i] = g_x11.display_name[i]; }
+  return true;
+}
+
+export fn window_x11_warp(w: Window*, lx: float64, ly: float64) {
+  var r: uint8[24];
+  window_x11_req(&r[0], 41, 0, 24);
+  window_wr32(&r[0], 4, 0); window_wr32(&r[0], 8, xw(w)->xid);
+  window_wr16(&r[0], 20, (int64)(lx * (float64)scale())); window_wr16(&r[0], 22, (int64)(ly * (float64)scale()));
+  window_x11_send(&r[0], 24);
+}
+
+// ---------- cursors ----------
+fn cursor_glyph(shape: int32) -> int64 {
+  switch (shape) {
+    case 1: { return 152; }   // xterm
+    case 2: { return 60; }    // hand2
+    case 3: { return 34; }    // crosshair
+    case 4: { return 150; }   // watch
+    case 5: { return 108; }   // sb_h_double_arrow
+    case 6: { return 116; }   // sb_v_double_arrow
+    case 7: { return 14; }    // bottom_right_corner
+    case 8: { return 12; }    // bottom_left_corner
+    case 9: { return 52; }    // fleur
+    case 10: { return 0; }    // X_cursor
+    default: { return 68; }   // left_ptr
+  }
+  return 68;
+}
+
+fn font_cursor(shape: int32) -> int64 {
+  if (g_x11.font_cursors[shape] != 0) { return g_x11.font_cursors[shape]; }
+  var font: int64 = window_x11_new_id();
+  var name: string = "cursor";
+  var r: uint8[20];
+  window_x11_req(&r[0], 45, 0, 20);
+  window_wr32(&r[0], 4, font); window_wr16(&r[0], 8, 6);
+  for i: int64 in 0..6 { r[12 + i] = name.chars[i]; }
+  window_x11_send(&r[0], 20);
+  var id: int64 = window_x11_new_id();
+  var glyph: int64 = cursor_glyph(shape);
+  var c: uint8[32];
+  window_x11_req(&c[0], 94, 0, 32);
+  window_wr32(&c[0], 4, id); window_wr32(&c[0], 8, font); window_wr32(&c[0], 12, font);
+  window_wr16(&c[0], 16, glyph); window_wr16(&c[0], 18, glyph + 1);
+  window_wr16(&c[0], 26, 65535); window_wr16(&c[0], 28, 65535); window_wr16(&c[0], 30, 65535);
+  window_x11_send(&c[0], 32);
+  var f: uint8[8];
+  window_x11_req(&f[0], 46, 0, 8);
+  window_wr32(&f[0], 4, font);
+  window_x11_send(&f[0], 8);
+  g_x11.font_cursors[shape] = id;
+  return id;
+}
+
+fn blank_cursor() -> int64 {
+  if (g_x11.blank_cursor != 0) { return g_x11.blank_cursor; }
+  var pm: int64 = window_x11_new_id();
+  var r: uint8[16];
+  window_x11_req(&r[0], 53, 1, 16);                    // CreatePixmap depth 1
+  window_wr32(&r[0], 4, pm); window_wr32(&r[0], 8, g_x11.root);
+  window_wr16(&r[0], 12, 1); window_wr16(&r[0], 14, 1);
+  window_x11_send(&r[0], 16);
+  var id: int64 = window_x11_new_id();
+  var c: uint8[32];
+  window_x11_req(&c[0], 93, 0, 32);                    // CreateCursor
+  window_wr32(&c[0], 4, id); window_wr32(&c[0], 8, pm); window_wr32(&c[0], 12, pm);
+  window_x11_send(&c[0], 32);
+  var f: uint8[8];
+  window_x11_req(&f[0], 54, 0, 8);
+  window_wr32(&f[0], 4, pm);
+  window_x11_send(&f[0], 8);
+  g_x11.blank_cursor = id;
+  return id;
+}
+
+fn define_cursor(xid: int64, cursor: int64) {
+  var r: uint8[16];
+  window_x11_req(&r[0], 2, 0, 16);
+  window_wr32(&r[0], 4, xid); window_wr32(&r[0], 8, 0x4000); window_wr32(&r[0], 12, cursor);
+  window_x11_send(&r[0], 16);
+}
+
+export fn window_x11_set_cursor(w: Window*, shape: int32) {
+  var x: WindowX11Win* = xw(w);
+  if (x->cursor_img != 0) {
+    var f: uint8[8];
+    window_x11_req(&f[0], 95, 0, 8);
+    window_wr32(&f[0], 4, x->cursor_img);
+    window_x11_send(&f[0], 8);
+    x->cursor_img = 0;
+  }
+  if (w->cursor_mode == WINDOW_CURSOR_HIDDEN || w->cursor_mode == WINDOW_CURSOR_LOCKED) { return; }
+  var c: int64 = 0;
+  if (shape != WINDOW_CURSOR_ARROW) { c = font_cursor(shape); }
+  define_cursor(x->xid, c);
+}
+
+export fn window_x11_set_cursor_image(w: Window*, rgba: uint8*, cw: int32, ch: int32, hx: int32, hy: int32) -> bool {
+  var x: WindowX11Win* = xw(w);
+  var c: int64 = window_x11_render_cursor(rgba, cw, ch, hx, hy);
+  if (c == 0) { return false; }
+  if (x->cursor_img != 0) {
+    var f: uint8[8];
+    window_x11_req(&f[0], 95, 0, 8);
+    window_wr32(&f[0], 4, x->cursor_img);
+    window_x11_send(&f[0], 8);
+  }
+  x->cursor_img = c;
+  if (w->cursor_mode == WINDOW_CURSOR_NORMAL || w->cursor_mode == WINDOW_CURSOR_CONFINED) { define_cursor(x->xid, c); }
+  return true;
+}
+
+fn grab(w: Window*) -> bool {
+  var x: WindowX11Win* = xw(w);
+  if (!x->mapped) { return false; }
+  var cursor: int64 = 0;
+  if (w->cursor_mode == WINDOW_CURSOR_LOCKED) { cursor = blank_cursor(); }
+  var r: uint8[24];
+  window_x11_req(&r[0], 26, 1, 24);                    // GrabPointer, owner-events
+  window_wr32(&r[0], 4, x->xid);
+  window_wr16(&r[0], 8, 4 | 8 | 64);
+  r[10] = (uint8)1; r[11] = (uint8)1;                   // async pointer, async keyboard
+  window_wr32(&r[0], 12, x->xid); window_wr32(&r[0], 16, cursor); window_wr32(&r[0], 20, 0);
+  var p: uint8* = window_x11_wait_reply(window_x11_send(&r[0], 24));
+  if (p == 0) { return false; }
+  var ok: bool = p[1] == (uint8)0;
+  free(p);
+  x->grabbed = ok;
+  return ok;
+}
+
+fn ungrab() {
+  var r: uint8[8];
+  window_x11_req(&r[0], 27, 0, 8);
+  window_x11_send(&r[0], 8);
+}
+
+export fn window_x11_set_cursor_mode(w: Window*, mode: int32, old: int32) {
+  var x: WindowX11Win* = xw(w);
+  if (x->grabbed) { ungrab(); x->grabbed = false; }
+  if (old == WINDOW_CURSOR_LOCKED) {
+    window_x11_raw_motion(false);
+    x->have_raw = false;
+  }
+  switch (mode) {
+    case WINDOW_CURSOR_NORMAL: {
+      if (x->cursor_img != 0) { define_cursor(x->xid, x->cursor_img); }
+      else { window_x11_set_cursor(w, w->cursor_shape); }
+    }
+    case WINDOW_CURSOR_HIDDEN: { define_cursor(x->xid, blank_cursor()); }
+    case WINDOW_CURSOR_LOCKED: {
+      define_cursor(x->xid, blank_cursor());
+      x->have_raw = window_x11_raw_motion(true);
+      grab(w);
+      window_x11_warp(w, (float64)w->w / 2.0, (float64)w->h / 2.0);
+    }
+    case WINDOW_CURSOR_CONFINED: {
+      if (x->cursor_img != 0) { define_cursor(x->xid, x->cursor_img); }
+      else { window_x11_set_cursor(w, w->cursor_shape); }
+      grab(w);
+    }
+    default: { }
+  }
+}
+
+/// Delivers raw (unaccelerated) motion to the window that has the pointer locked.
+export fn window_x11_raw_delta(dx: float64, dy: float64) {
+  var w: Window* = g_window.windows;
+  while (w != 0) {
+    if (w->cursor_mode == WINDOW_CURSOR_LOCKED && w->focused) {
+      var ev: WindowEvent;
+      ev.kind = WINDOW_EV_RAW_MOTION; ev.win = w; ev.dx = dx; ev.dy = dy;
+      window_push_event(&ev);
+      return;
+    }
+    w = w->next;
+  }
+}

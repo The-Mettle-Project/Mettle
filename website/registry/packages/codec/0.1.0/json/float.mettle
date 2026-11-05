@@ -1,0 +1,282 @@
+// Float to text: Grisu2 (Florian Loitsch, 2010), as RapidJSON does it. The
+// digits always parse back to the same float; they are the shortest such
+// digits for nearly every value, and at most one digit longer otherwise.
+// Both float64 and float32 are supported: only the rounding interval differs.
+//
+// Output follows JavaScript's Number formatting: 1, 0.5, 1.5e+300, 1e-7.
+import "codec/core/varint";
+import "codec/json/pow10";
+
+// A float as f * 2^e with a 64-bit f.
+struct CodecDiyFp {
+  f: uint64;
+  e: int32;
+}
+
+@inline fn codec_diy(f: uint64, e: int32) -> CodecDiyFp {
+  var d: CodecDiyFp;
+  d.f = f;
+  d.e = e;
+  return d;
+}
+
+@inline fn codec_clz64(x: uint64) -> int32 {
+  var n: int32 = 0;
+  if ((x >> 32) == 0) { n = n + 32; x = x << 32; }
+  if ((x >> 48) == 0) { n = n + 16; x = x << 16; }
+  if ((x >> 56) == 0) { n = n + 8; x = x << 8; }
+  if ((x >> 60) == 0) { n = n + 4; x = x << 4; }
+  if ((x >> 62) == 0) { n = n + 2; x = x << 2; }
+  if ((x >> 63) == 0) { n = n + 1; }
+  return n;
+}
+
+@inline fn codec_diy_norm(d: CodecDiyFp) -> CodecDiyFp {
+  var s: int32 = codec_clz64(d.f);
+  return codec_diy(d.f << (uint64)s, d.e - s);
+}
+
+// The upper 64 bits of the 128-bit product, rounded.
+@inline fn codec_diy_mul(x: CodecDiyFp, y: CodecDiyFp) -> CodecDiyFp {
+  var m32: uint64 = 0xffffffff;
+  var a: uint64 = x.f >> 32;
+  var b: uint64 = x.f & m32;
+  var c: uint64 = y.f >> 32;
+  var d: uint64 = y.f & m32;
+  var ac: uint64 = a * c;
+  var bc: uint64 = b * c;
+  var ad: uint64 = a * d;
+  var bd: uint64 = b * d;
+  var tmp: uint64 = (bd >> 32) + (ad & m32) + (bc & m32);
+  tmp = tmp + ((uint64)1 << 31);
+  return codec_diy(ac + (ad >> 32) + (bc >> 32) + (tmp >> 32), x.e + y.e + 64);
+}
+
+const CODEC_POW10_U64: uint64[20] = [
+  1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000,
+  10000000000, 100000000000, 1000000000000, 10000000000000, 100000000000000,
+  1000000000000000, 10000000000000000, 100000000000000000, 1000000000000000000,
+  10000000000000000000
+];
+
+fn codec_count_digits32(n: uint32) -> int32 {
+  if (n < 10) { return 1; }
+  if (n < 100) { return 2; }
+  if (n < 1000) { return 3; }
+  if (n < 10000) { return 4; }
+  if (n < 100000) { return 5; }
+  if (n < 1000000) { return 6; }
+  if (n < 10000000) { return 7; }
+  if (n < 100000000) { return 8; }
+  return 9;
+}
+
+fn codec_grisu_round(buf: uint8*, len: int32, delta: uint64, rest: uint64, ten_kappa: uint64, wp_w: uint64) {
+  while (rest < wp_w && delta - rest >= ten_kappa &&
+         (rest + ten_kappa < wp_w || wp_w - rest > rest + ten_kappa - wp_w)) {
+    buf[len - 1] = buf[len - 1] - 1;
+    rest = rest + ten_kappa;
+  }
+}
+
+// Writes the digits of W (between Mp - delta and Mp) to buf. Returns the
+// digit count; *k gets the decimal exponent adjustment.
+fn codec_digit_gen(w: CodecDiyFp, mp: CodecDiyFp, delta: uint64, buf: uint8*, k: int32*) -> int32 {
+  var shift: uint64 = (uint64)(-mp.e);
+  var one_f: uint64 = (uint64)1 << shift;
+  var wp_w: uint64 = mp.f - w.f;
+  var p1: uint32 = (uint32)(mp.f >> shift);
+  var p2: uint64 = mp.f & (one_f - 1);
+  var kappa: int32 = codec_count_digits32(p1);
+  var len: int32 = 0;
+  while (kappa > 0) {
+    var div: uint32 = (uint32)CODEC_POW10_U64[kappa - 1];
+    var d: uint32 = p1 / div;
+    p1 = p1 % div;
+    if (d != 0 || len != 0) {
+      buf[len] = (uint8)(48 + d);
+      len = len + 1;
+    }
+    kappa = kappa - 1;
+    var tmp: uint64 = ((uint64)p1 << shift) + p2;
+    if (tmp <= delta) {
+      *k = *k + kappa;
+      codec_grisu_round(buf, len, delta, tmp, CODEC_POW10_U64[kappa] << shift, wp_w);
+      return len;
+    }
+  }
+  while (true) {
+    p2 = p2 * 10;
+    delta = delta * 10;
+    var d2: uint32 = (uint32)(p2 >> shift);
+    if (d2 != 0 || len != 0) {
+      buf[len] = (uint8)(48 + d2);
+      len = len + 1;
+    }
+    p2 = p2 & (one_f - 1);
+    kappa = kappa - 1;
+    if (p2 < delta) {
+      *k = *k + kappa;
+      var idx: int32 = -kappa;
+      var scale: uint64 = 0;
+      if (idx < 20) { scale = CODEC_POW10_U64[idx]; }
+      codec_grisu_round(buf, len, delta, p2, one_f, wp_w * scale);
+      return len;
+    }
+  }
+  return len;
+}
+
+// Grisu2 core for a positive finite value f * 2^e whose significand has
+// `hidden` as its implicit top bit. Writes digits to buf (at least 18 bytes);
+// the value is digits * 10^(*k). Returns the digit count.
+fn codec_grisu2(f: uint64, e: int32, hidden: uint64, buf: uint8*, k: int32*) -> int32 {
+  var v: CodecDiyFp = codec_diy(f, e);
+  // Boundaries halfway to the neighbouring floats.
+  var pl: CodecDiyFp = codec_diy_norm(codec_diy((f << 1) + 1, e - 1));
+  var mi: CodecDiyFp = codec_diy((f << 1) - 1, e - 1);
+  if (f == hidden) { mi = codec_diy((f << 2) - 1, e - 2); }
+  mi.f = mi.f << (uint64)(mi.e - pl.e);
+  mi.e = pl.e;
+  // A cached power c = 10^-K that brings pl's exponent into [-60, -32].
+  var dk: float64 = (float64)(-61 - pl.e) * 0.30102999566398114 + 347.0;
+  var kk: int32 = (int32)dk;
+  if (dk - (float64)kk > 0.0) { kk = kk + 1; }
+  var index: int32 = (kk >> 3) + 1;
+  *k = -(-348 + index * 8);
+  var c: CodecDiyFp = codec_diy(CODEC_POW10_F[index], CODEC_POW10_E[index]);
+  var w: CodecDiyFp = codec_diy_mul(codec_diy_norm(v), c);
+  var wp: CodecDiyFp = codec_diy_mul(pl, c);
+  var wm: CodecDiyFp = codec_diy_mul(mi, c);
+  wm.f = wm.f + 1;
+  wp.f = wp.f - 1;
+  return codec_digit_gen(w, wp, wp.f - wm.f, buf, k);
+}
+
+fn codec_put_exp(out: uint8*, pos: int32, exp: int32) -> int32 {
+  out[pos] = (uint8)101;  // 'e'
+  pos = pos + 1;
+  if (exp < 0) {
+    out[pos] = (uint8)45;  // '-'
+    exp = -exp;
+  } else {
+    out[pos] = (uint8)43;  // '+'
+  }
+  pos = pos + 1;
+  if (exp >= 100) {
+    out[pos] = (uint8)(48 + exp / 100);
+    pos = pos + 1;
+    exp = exp % 100;
+    out[pos] = (uint8)(48 + exp / 10);
+    out[pos + 1] = (uint8)(48 + exp % 10);
+    return pos + 2;
+  }
+  if (exp >= 10) {
+    out[pos] = (uint8)(48 + exp / 10);
+    out[pos + 1] = (uint8)(48 + exp % 10);
+    return pos + 2;
+  }
+  out[pos] = (uint8)(48 + exp);
+  return pos + 1;
+}
+
+// Lays out `len` digits times 10^k the way JavaScript prints numbers.
+fn codec_prettify(digits: uint8*, len: int32, k: int32, out: uint8*) -> int32 {
+  var kk: int32 = len + k;   // 10^(kk-1) <= v < 10^kk
+  var pos: int32 = 0;
+  if (k >= 0 && kk <= 21) {
+    // 1234e7 -> 12340000000
+    for i in 0..len { out[i] = digits[i]; }
+    for j in len..kk { out[j] = (uint8)48; }
+    return kk;
+  }
+  if (kk > 0 && kk <= 21) {
+    // 1234e-2 -> 12.34
+    for i in 0..kk { out[i] = digits[i]; }
+    out[kk] = (uint8)46;
+    for j in kk..len { out[j + 1] = digits[j]; }
+    return len + 1;
+  }
+  if (kk > -6 && kk <= 0) {
+    // 1234e-6 -> 0.001234
+    out[0] = (uint8)48;
+    out[1] = (uint8)46;
+    pos = 2;
+    for i in 0..(-kk) {
+      out[pos] = (uint8)48;
+      pos = pos + 1;
+    }
+    for j in 0..len {
+      out[pos] = digits[j];
+      pos = pos + 1;
+    }
+    return pos;
+  }
+  // 1e30, 1.234e-33
+  out[0] = digits[0];
+  pos = 1;
+  if (len > 1) {
+    out[1] = (uint8)46;
+    pos = 2;
+    for i in 1..len {
+      out[pos] = digits[i];
+      pos = pos + 1;
+    }
+  }
+  return codec_put_exp(out, pos, kk - 1);
+}
+
+// Formats a finite float64 into out (at least 32 bytes). Returns the length,
+// or 0 for NaN and the infinities, which JSON cannot hold.
+export fn codec_format_f64(v: float64, out: uint8*) -> int32 {
+  var bits: uint64 = codec_f64_bits(v);
+  var exp: int32 = (int32)((bits >> 52) & 0x7ff);
+  var frac: uint64 = bits & 0xfffffffffffff;
+  if (exp == 0x7ff) { return 0; }
+  var pos: int32 = 0;
+  if ((bits >> 63) != 0) {
+    out[0] = (uint8)45;
+    pos = 1;
+  }
+  if (exp == 0 && frac == 0) {
+    out[pos] = (uint8)48;
+    return pos + 1;
+  }
+  var f: uint64 = frac;
+  var e: int32 = -1074;
+  if (exp != 0) {
+    f = frac | ((uint64)1 << 52);
+    e = exp - 1075;
+  }
+  var digits: uint8[24];
+  var k: int32 = 0;
+  var len: int32 = codec_grisu2(f, e, (uint64)1 << 52, &digits[0], &k);
+  return pos + codec_prettify(&digits[0], len, k, out + pos);
+}
+
+// The same for float32: the shortest digits that parse back to this float32.
+export fn codec_format_f32(v: float32, out: uint8*) -> int32 {
+  var bits: uint32 = codec_f32_bits(v);
+  var exp: int32 = (int32)((bits >> 23) & 0xff);
+  var frac: uint64 = (uint64)(bits & 0x7fffff);
+  if (exp == 0xff) { return 0; }
+  var pos: int32 = 0;
+  if ((bits >> 31) != 0) {
+    out[0] = (uint8)45;
+    pos = 1;
+  }
+  if (exp == 0 && frac == 0) {
+    out[pos] = (uint8)48;
+    return pos + 1;
+  }
+  var f: uint64 = frac;
+  var e: int32 = -149;
+  if (exp != 0) {
+    f = frac | ((uint64)1 << 23);
+    e = exp - 150;
+  }
+  var digits: uint8[24];
+  var k: int32 = 0;
+  var len: int32 = codec_grisu2(f, e, (uint64)1 << 23, &digits[0], &k);
+  return pos + codec_prettify(&digits[0], len, k, out + pos);
+}

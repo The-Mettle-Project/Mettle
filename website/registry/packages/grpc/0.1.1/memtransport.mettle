@@ -1,0 +1,239 @@
+// An in-memory transport pair: a client end and a server end joined
+// without sockets or framing. Used by the tests and handy for running a
+// client and server in one thread. Flow control is unlimited.
+//
+// Both ends run in one thread, so each end has an `idle` hook: when its
+// poll finds nothing queued it calls the hook once, which should let the
+// other side make progress (for a server end, grpc_server_conn_step).
+import "std/mem";
+import "grpc/arena";
+import "std/hpack";
+import "std/time";
+import "grpc/transport";
+
+export struct GrpcMemEnd {
+  pipe: GrpcMemPipe*;
+  is_server: bool;
+  q: GrpcTEvent*;
+  qlen: int64;
+  qhead: int64;
+  qcap: int64;
+  arena: GrpcArena*;          // event payloads; reset when the queue drains
+  idle: fn(rawptr) -> void;
+  idle_user: rawptr;
+  in_idle: bool;
+  pings_sent: int64;
+  last_goaway_code: int64;
+}
+
+export struct GrpcMemPipe {
+  client: GrpcMemEnd;
+  server: GrpcMemEnd;
+  next_stream: int64;
+  closed: bool;
+  max_streams: int64;     // 0: no limit
+  open_streams: int64;
+  goaway_last: int64;     // -1 until the server sends GOAWAY
+}
+
+fn peer(e: GrpcMemEnd*) -> GrpcMemEnd* {
+  if (e->is_server) { return &e->pipe->client; }
+  return &e->pipe->server;
+}
+
+fn push(e: GrpcMemEnd*, ev: GrpcTEvent*) {
+  if (e->qlen == e->qcap) {
+    var ncap: int64 = e->qcap * 2;
+    if (ncap < 16) { ncap = 16; }
+    var n: GrpcTEvent* = (GrpcTEvent*)malloc(ncap * sizeof(GrpcTEvent));
+    for i in 0..e->qlen { n[i] = e->q[i]; }
+    if (e->q != 0) { free(e->q); }
+    e->q = n;
+    e->qcap = ncap;
+  }
+  e->q[e->qlen] = *ev;
+  e->qlen = e->qlen + 1;
+}
+
+fn copy_headers(e: GrpcMemEnd*, hs: HpackHeader*, n: int64) -> HpackHeader* {
+  if (n <= 0) { return (HpackHeader*)0; }
+  var out: HpackHeader* = (HpackHeader*)grpc_arena_alloc(e->arena, n * sizeof(HpackHeader));
+  for i in 0..n {
+    var h: HpackHeader;
+    h.name = copy_bytes(e, hs[i].name);
+    h.value = copy_bytes(e, hs[i].value);
+    out[i] = h;
+  }
+  return out;
+}
+
+fn copy_bytes(e: GrpcMemEnd*, s: string) -> string {
+  var r: string;
+  if (s.length == 0) { return r; }
+  var p: uint8* = (uint8*)grpc_arena_alloc(e->arena, (int64)s.length);
+  memcpy(p, s.chars, (int64)s.length);
+  r.chars = p;
+  r.length = s.length;
+  return r;
+}
+
+fn send_hdrs(e: GrpcMemEnd*, stream: int64, hs: HpackHeader*, n: int64, end: bool) {
+  var to: GrpcMemEnd* = peer(e);
+  var ev: GrpcTEvent;
+  ev.kind = GRPC_TEV_HEADERS;
+  ev.stream = stream;
+  ev.headers = copy_headers(to, hs, n);
+  ev.nheaders = n;
+  ev.end_stream = end;
+  push(to, &ev);
+}
+
+fn m_open(u: rawptr, hs: HpackHeader*, n: int64, end: bool) -> int64 {
+  var e: GrpcMemEnd* = (GrpcMemEnd*)u;
+  var p: GrpcMemPipe* = e->pipe;
+  if (p->closed || p->goaway_last >= 0) { return GRPC_T_CLOSED; }
+  if (p->max_streams > 0 && p->open_streams >= p->max_streams) { return GRPC_T_NO_SLOT; }
+  var id: int64 = p->next_stream;
+  p->next_stream = id + 2;
+  p->open_streams = p->open_streams + 1;
+  send_hdrs(e, id, hs, n, end);
+  return id;
+}
+
+fn m_send_headers(u: rawptr, stream: int64, hs: HpackHeader*, n: int64, end: bool) -> int32 {
+  var e: GrpcMemEnd* = (GrpcMemEnd*)u;
+  if (e->pipe->closed) { return -1; }
+  send_hdrs(e, stream, hs, n, end);
+  if (end && e->is_server && e->pipe->open_streams > 0) {
+    e->pipe->open_streams = e->pipe->open_streams - 1;
+  }
+  return 0;
+}
+
+fn m_send_data(u: rawptr, stream: int64, p: uint8*, n: int64, end: bool) -> int64 {
+  var e: GrpcMemEnd* = (GrpcMemEnd*)u;
+  if (e->pipe->closed) { return -1; }
+  var to: GrpcMemEnd* = peer(e);
+  var ev: GrpcTEvent;
+  ev.kind = GRPC_TEV_DATA;
+  ev.stream = stream;
+  ev.end_stream = end;
+  if (n > 0) {
+    var d: uint8* = (uint8*)grpc_arena_alloc(to->arena, n);
+    memcpy(d, p, n);
+    ev.data = d;
+  }
+  ev.len = n;
+  push(to, &ev);
+  return n;
+}
+
+fn m_reset(u: rawptr, stream: int64, code: int64) {
+  var e: GrpcMemEnd* = (GrpcMemEnd*)u;
+  var ev: GrpcTEvent;
+  ev.kind = GRPC_TEV_RESET;
+  ev.stream = stream;
+  ev.code = code;
+  push(peer(e), &ev);
+  if (e->pipe->open_streams > 0) { e->pipe->open_streams = e->pipe->open_streams - 1; }
+}
+
+fn m_consumed(u: rawptr, stream: int64, n: int64) { }
+
+fn m_ping(u: rawptr) -> int32 {
+  var e: GrpcMemEnd* = (GrpcMemEnd*)u;
+  if (e->pipe->closed) { return -1; }
+  e->pings_sent = e->pings_sent + 1;
+  var ev: GrpcTEvent;
+  ev.kind = GRPC_TEV_PING;
+  push(peer(e), &ev);
+  var ack: GrpcTEvent;
+  ack.kind = GRPC_TEV_PING_ACK;
+  ack.rtt_ns = 1000;
+  push(e, &ack);
+  return 0;
+}
+
+fn m_goaway(u: rawptr, code: int64, debug: string) {
+  var e: GrpcMemEnd* = (GrpcMemEnd*)u;
+  e->last_goaway_code = code;
+  var last: int64 = e->pipe->next_stream - 2;
+  if (e->is_server) { e->pipe->goaway_last = last; }
+  var ev: GrpcTEvent;
+  ev.kind = GRPC_TEV_GOAWAY;
+  ev.code = code;
+  ev.last_stream = last;
+  push(peer(e), &ev);
+}
+
+fn m_close(u: rawptr) {
+  var e: GrpcMemEnd* = (GrpcMemEnd*)u;
+  if (e->pipe->closed) { return; }
+  e->pipe->closed = true;
+  var ev: GrpcTEvent;
+  ev.kind = GRPC_TEV_CLOSED;
+  push(peer(e), &ev);
+  var ev2: GrpcTEvent;
+  ev2.kind = GRPC_TEV_CLOSED;
+  push(e, &ev2);
+}
+
+fn m_poll(u: rawptr, ev: GrpcTEvent*, timeout_ns: int64) -> int32 {
+  var e: GrpcMemEnd* = (GrpcMemEnd*)u;
+  if (e->qhead == e->qlen) {
+    e->qhead = 0;
+    e->qlen = 0;
+    grpc_arena_reset(e->arena);
+    if (e->idle != 0 && !e->in_idle) {
+      e->in_idle = true;
+      e->idle(e->idle_user);
+      e->in_idle = false;
+    }
+  }
+  if (e->qhead == e->qlen) {
+    if (e->pipe->closed) { return -1; }
+    // Nothing will arrive in a single thread; let a little time pass so
+    // deadline loops do not spin hard.
+    if (timeout_ns != 0) { time_sleep_us(200); }
+    return 0;
+  }
+  *ev = e->q[e->qhead];
+  e->qhead = e->qhead + 1;
+  return 1;
+}
+
+fn end_init(e: GrpcMemEnd*, p: GrpcMemPipe*, is_server: bool) {
+  e->pipe = p;
+  e->is_server = is_server;
+  e->arena = grpc_arena_new();
+}
+
+export fn grpc_mem_pipe_init(p: GrpcMemPipe*) {
+  p->next_stream = 1;
+  p->goaway_last = -1;
+  end_init(&p->client, p, false);
+  end_init(&p->server, p, true);
+}
+
+export fn grpc_mem_pipe_free(p: GrpcMemPipe*) {
+  grpc_arena_free(p->client.arena);
+  grpc_arena_free(p->server.arena);
+  if (p->client.q != 0) { free(p->client.q); }
+  if (p->server.q != 0) { free(p->server.q); }
+}
+
+// The transport table for one end.
+export fn grpc_mem_transport(e: GrpcMemEnd*) -> GrpcTransport {
+  var t: GrpcTransport;
+  t.user = (rawptr)e;
+  t.open_stream = &m_open;
+  t.send_headers = &m_send_headers;
+  t.send_data = &m_send_data;
+  t.reset = &m_reset;
+  t.consumed = &m_consumed;
+  t.ping = &m_ping;
+  t.goaway = &m_goaway;
+  t.poll = &m_poll;
+  t.close = &m_close;
+  return t;
+}

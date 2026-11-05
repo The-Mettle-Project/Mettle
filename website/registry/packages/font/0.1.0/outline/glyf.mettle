@@ -1,0 +1,264 @@
+// TrueType outlines from the loca and glyf tables, simple and composite.
+// Spec: OpenType "glyf - Glyph data" and "loca - Index to location".
+
+import "std/mem";
+import "font/core/vec";
+import "font/sfnt/face";
+import "path";
+
+struct GPt { x: float32; y: float32; on: bool; }
+struct GOut { pts: FontVec<GPt>; ends: FontVec<int64>; }
+
+const MAX_POINTS: int64 = 1 << 20;   // stops composite bombs
+
+/// Byte range of glyph g inside glyf. Returns 0 for empty or bad glyphs.
+export fn font_glyf_range(f: FontFace*, g: int32, out_len: int64*) -> int64 {
+  *out_len = 0;
+  if (f->glyf == 0 || g < 0 || g >= f->num_glyphs) { return 0; }
+  var a: int64 = 0;
+  var b: int64 = 0;
+  if (f->loc_format == 0) {
+    if ((int64)g * 2 + 4 > f->loca_len) { return 0; }
+    a = (int64)font_u16(f, f->loca + (int64)g * 2) * 2;
+    b = (int64)font_u16(f, f->loca + (int64)g * 2 + 2) * 2;
+  } else {
+    if ((int64)g * 4 + 8 > f->loca_len) { return 0; }
+    a = (int64)font_u32(f, f->loca + (int64)g * 4);
+    b = (int64)font_u32(f, f->loca + (int64)g * 4 + 4);
+  }
+  if (b <= a || b > f->glyf_len) { return 0; }
+  *out_len = b - a;
+  return f->glyf + a;
+}
+
+// hmtx left side bearing (metrics.mettle has the public one; this module
+// sits below it).
+fn glyf_lsb(f: FontFace*, g: int32, xmin: int32) -> int32 {
+  if (g < f->num_hmetrics) { return font_i16(f, f->hmtx + (int64)g * 4 + 2); }
+  var o: int64 = (int64)f->num_hmetrics * 4 + (int64)(g - f->num_hmetrics) * 2;
+  if (o + 2 > f->hmtx_len) { return xmin; }
+  return font_i16(f, f->hmtx + o);
+}
+
+fn simple(f: FontFace*, o: int64, ln: int64, out: GOut*) -> bool {
+  var nc: int64 = (int64)font_i16(f, o);
+  var endp: int64 = o + 10;
+  var lim: int64 = o + ln;
+  if (endp + nc * 2 + 2 > lim) { return false; }
+  var npts: int64 = (int64)font_u16(f, endp + (nc - 1) * 2) + 1;
+  // End points must go up.
+  var prev: int64 = -1;
+  for c: int64 in 0..nc {
+    var e: int64 = (int64)font_u16(f, endp + c * 2);
+    if (e <= prev) { return false; }
+    prev = e;
+  }
+  if (out->pts.len + npts > MAX_POINTS) { return false; }
+  var ilen: int64 = (int64)font_u16(f, endp + nc * 2);
+  var fp: int64 = endp + nc * 2 + 2 + ilen;
+  var base: int64 = out->pts.len;
+  if (!font_vec_reserve<GPt>(&out->pts, base + npts)) { return false; }
+  var flags: uint8* = (uint8*)malloc(npts);
+  if (flags == 0) { return false; }
+  var i: int64 = 0;
+  while (i < npts) {
+    if (fp >= lim) { free(flags); return false; }
+    var fl: uint32 = font_u8(f, fp); fp = fp + 1;
+    var rep: int64 = 0;
+    if ((fl & 8) != 0) {
+      if (fp >= lim) { free(flags); return false; }
+      rep = (int64)font_u8(f, fp); fp = fp + 1;
+    }
+    rep = rep + 1;
+    while (rep > 0 && i < npts) {
+      flags[i] = (uint8)fl;
+      out->pts.data[base + i].on = (fl & 1) != 0;
+      i = i + 1;
+      rep = rep - 1;
+    }
+  }
+  var v: int32 = 0;
+  for k: int64 in 0..npts {
+    var fl: uint8 = flags[k];
+    if ((fl & (uint8)2) != (uint8)0) {
+      var d: int32 = (int32)font_u8(f, fp); fp = fp + 1;
+      if ((fl & (uint8)16) != (uint8)0) { v = v + d; } else { v = v - d; }
+    } else if ((fl & (uint8)16) == (uint8)0) {
+      v = v + font_i16(f, fp); fp = fp + 2;
+    }
+    out->pts.data[base + k].x = (float32)v;
+  }
+  v = 0;
+  for k: int64 in 0..npts {
+    var fl: uint8 = flags[k];
+    if ((fl & (uint8)4) != (uint8)0) {
+      var d: int32 = (int32)font_u8(f, fp); fp = fp + 1;
+      if ((fl & (uint8)32) != (uint8)0) { v = v + d; } else { v = v - d; }
+    } else if ((fl & (uint8)32) == (uint8)0) {
+      v = v + font_i16(f, fp); fp = fp + 2;
+    }
+    out->pts.data[base + k].y = (float32)v;
+  }
+  free(flags);
+  if (fp > lim) { return false; }
+  out->pts.len = base + npts;
+  for c: int64 in 0..nc {
+    font_vec_push<int64>(&out->ends, base + (int64)font_u16(f, endp + c * 2));
+  }
+  return true;
+}
+
+fn load(f: FontFace*, g: int32, out: GOut*, depth: int32) -> bool {
+  if (depth > 8) { return false; }
+  var ln: int64 = 0;
+  var o: int64 = font_glyf_range(f, g, &ln);
+  if (o == 0) { return true; }      // empty glyph, such as a space
+  if (ln < 10) { return false; }
+  var nc: int32 = font_i16(f, o);
+  if (nc >= 0) {
+    if (nc == 0) { return true; }
+    return simple(f, o, ln, out);
+  }
+  var p: int64 = o + 10;
+  var lim: int64 = o + ln;
+  var gstart: int64 = out->pts.len;   // point numbers below count from here
+  var more: bool = true;
+  while (more) {
+    if (p + 4 > lim) { return false; }
+    var flags: uint32 = font_u16(f, p);
+    var cg: int32 = (int32)font_u16(f, p + 2);
+    p = p + 4;
+    var a1: int32 = 0;
+    var a2: int32 = 0;
+    var xy: bool = (flags & 2) != 0;
+    if ((flags & 1) != 0) {
+      if (xy) { a1 = font_i16(f, p); a2 = font_i16(f, p + 2); }
+      else { a1 = (int32)font_u16(f, p); a2 = (int32)font_u16(f, p + 2); }
+      p = p + 4;
+    } else {
+      a1 = (int32)font_u8(f, p); a2 = (int32)font_u8(f, p + 1);
+      if (xy) {
+        if (a1 >= 128) { a1 = a1 - 256; }
+        if (a2 >= 128) { a2 = a2 - 256; }
+      }
+      p = p + 2;
+    }
+    var a: float32 = 1.0; var b: float32 = 0.0; var c: float32 = 0.0; var d: float32 = 1.0;
+    if ((flags & 8) != 0) {
+      a = font_f2dot14(f, p); d = a; p = p + 2;
+    } else if ((flags & 0x40) != 0) {
+      a = font_f2dot14(f, p); d = font_f2dot14(f, p + 2); p = p + 4;
+    } else if ((flags & 0x80) != 0) {
+      a = font_f2dot14(f, p); b = font_f2dot14(f, p + 2);
+      c = font_f2dot14(f, p + 4); d = font_f2dot14(f, p + 6); p = p + 8;
+    }
+    if (p > lim) { return false; }
+    var first: int64 = out->pts.len;
+    if (!load(f, cg, out, depth + 1)) { return false; }
+    // Transform the component's points.
+    var k: int64 = first;
+    while (k < out->pts.len) {
+      var q: GPt* = &out->pts.data[k];
+      var x: float32 = q->x;
+      var y: float32 = q->y;
+      q->x = a * x + c * y;
+      q->y = b * x + d * y;
+      k = k + 1;
+    }
+    var dx: float32 = 0.0;
+    var dy: float32 = 0.0;
+    if (xy) {
+      dx = (float32)a1;
+      dy = (float32)a2;
+      if ((flags & 0x800) != 0 && (flags & 0x1000) == 0) {
+        // SCALED_COMPONENT_OFFSET: the offset goes through the matrix too.
+        var tx: float32 = a * dx + c * dy;
+        var ty: float32 = b * dx + d * dy;
+        dx = tx; dy = ty;
+      }
+    } else {
+      // Point matching: parent point a1 meets child point a2.
+      var pi: int64 = gstart + (int64)a1;
+      var ci: int64 = first + (int64)a2;
+      if (pi < first && ci < out->pts.len) {
+        dx = out->pts.data[pi].x - out->pts.data[ci].x;
+        dy = out->pts.data[pi].y - out->pts.data[ci].y;
+      }
+    }
+    k = first;
+    while (k < out->pts.len) {
+      out->pts.data[k].x = out->pts.data[k].x + dx;
+      out->pts.data[k].y = out->pts.data[k].y + dy;
+      k = k + 1;
+    }
+    more = (flags & 0x20) != 0;
+  }
+  return true;
+}
+
+fn emit(out: GOut*, path: FontPath*) {
+  var s: int64 = 0;
+  for c: int64 in 0..out->ends.len {
+    var e: int64 = out->ends.data[c];
+    if (e < s || e >= out->pts.len) { break; }
+    var n: int64 = e - s + 1;
+    var pts: GPt* = out->pts.data + s;
+    if (n < 2) { s = e + 1; continue; }
+    // Start at the first on-curve point (as fontTools does), or at the
+    // midpoint of the last and first points when every point is off-curve.
+    var fo: int64 = -1;
+    for k: int64 in 0..n { if (pts[k].on) { fo = k; break; } }
+    var sx: float32 = 0.0;
+    var sy: float32 = 0.0;
+    if (fo >= 0) { sx = pts[fo].x; sy = pts[fo].y; }
+    else { sx = (pts[0].x + pts[n - 1].x) * 0.5; sy = (pts[0].y + pts[n - 1].y) * 0.5; fo = n - 1; }
+    font_path_move(path, sx, sy);
+    var have: bool = false;
+    var qx: float32 = 0.0;
+    var qy: float32 = 0.0;
+    for step: int64 in 1..n + 1 {
+      var pt: GPt = pts[(fo + step) % n];
+      if (step == n && pt.on) { break; }   // back at the start point
+      if (pt.on) {
+        if (have) { font_path_quad(path, qx, qy, pt.x, pt.y); } else { font_path_line(path, pt.x, pt.y); }
+        have = false;
+      } else {
+        if (have) {
+          var mx: float32 = (qx + pt.x) * 0.5;
+          var my: float32 = (qy + pt.y) * 0.5;
+          font_path_quad(path, qx, qy, mx, my);
+        }
+        qx = pt.x; qy = pt.y; have = true;
+      }
+    }
+    if (have) { font_path_quad(path, qx, qy, sx, sy); }
+    font_path_close(path);
+    s = e + 1;
+  }
+}
+
+/// Appends the TrueType outline of glyph g to path. False on damaged data
+/// (the path then holds nothing new).
+export fn font_glyf_path(f: FontFace*, g: int32, path: FontPath*) -> bool {
+  var out: GOut;
+  var ok: bool = load(f, g, &out, 0);
+  // The origin sits at phantom point 1, xMin - lsb (spec "glyf", phantom
+  // points), so shift a simple glyph when hmtx's side bearing disagrees
+  // with xMin. Composites are left alone, as fontTools does.
+  var ln: int64 = 0;
+  var o: int64 = font_glyf_range(f, g, &ln);
+  if (ok && o != 0 && ln >= 10 && font_i16(f, o) >= 0) {
+    var xmin: int32 = font_i16(f, o + 2);
+    var shift: float32 = (float32)(glyf_lsb(f, g, xmin) - xmin);
+    if (shift != 0.0) {
+      for k: int64 in 0..out.pts.len { out.pts.data[k].x = out.pts.data[k].x + shift; }
+    }
+  }
+  var c0: int64 = path->cmds.len;
+  var p0: int64 = path->pts.len;
+  if (ok) { emit(&out, path); }
+  if (!ok) { path->cmds.len = c0; path->pts.len = p0; }
+  font_vec_free<GPt>(&out.pts);
+  font_vec_free<int64>(&out.ends);
+  return ok;
+}

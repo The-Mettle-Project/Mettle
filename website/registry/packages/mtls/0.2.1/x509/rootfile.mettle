@@ -1,0 +1,65 @@
+// Reading a PEM file of certificates into a trust store. Works on every
+// platform (it only needs fopen).
+
+import "std/io";
+import "std/mem";
+import "mtls/core/err";
+import "mtls/x509/verify";
+
+const MTLS_X_MAX_FILE: int64 = 33554432;   // a PEM bundle of 32 MB is not a trust store
+
+/// mtls_file_read: the whole file at path in a new malloc block (free it with
+/// free). Returns MTLS_OK, MTLS_E_IO (cannot open or read) or MTLS_E_SPACE
+/// (over 32 MB).
+export fn mtls_file_read(path: string, out: uint8**, len: int64*) -> int32 {
+  *out = 0;
+  *len = 0;
+  var cpath: cstring = cstr(path, &malloc);
+  if (cpath == 0) { return MTLS_E_NOMEM; }
+  var fp: cstring = fopen(cpath, "rb");
+  free(cpath);
+  if (fp == 0) { return MTLS_E_IO; }
+  var cap: int64 = 65536;
+  var buf: uint8* = malloc(cap);
+  if (buf == 0) {
+    fclose(fp);
+    return MTLS_E_NOMEM;
+  }
+  var n: int64 = 0;
+  while (true) {
+    if (n == cap) {
+      if (cap >= MTLS_X_MAX_FILE) {
+        free(buf);
+        fclose(fp);
+        return MTLS_E_SPACE;
+      }
+      var bigger: uint8* = realloc(buf, cap * 2);
+      if (bigger == 0) {
+        free(buf);
+        fclose(fp);
+        return MTLS_E_NOMEM;
+      }
+      buf = bigger;
+      cap = cap * 2;
+    }
+    var got: int64 = fread(buf + n, 1, cap - n, fp);
+    if (got <= 0) { break; }
+    n = n + got;
+  }
+  fclose(fp);
+  *out = buf;
+  *len = n;
+  return MTLS_OK;
+}
+
+/// mtls_roots_add_file: adds every certificate in a PEM file. Returns the
+/// number added, or a negative MTLS_E_* if the file cannot be read.
+export fn mtls_roots_add_file(r: MtlsRoots*, path: string) -> int32 {
+  var buf: uint8* = 0;
+  var n: int64 = 0;
+  var rc: int32 = mtls_file_read(path, &buf, &n);
+  if (rc != MTLS_OK) { return rc; }
+  var added: int32 = mtls_roots_add_pem(r, buf, n);
+  free(buf);
+  return added;
+}

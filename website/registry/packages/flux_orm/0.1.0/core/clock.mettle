@@ -1,0 +1,32 @@
+// flux_orm/core/clock.mettle — where the ORM gets the time.
+//
+// Mettle's stdlib has no wall clock, so the application installs one, usually
+// rc_clock_realtime_us from clock_linux.mettle. Without a clock, a write that
+// needs a timestamp is refused rather than storing 0. Tests install a fixed
+// clock and assert its value.
+
+import "status";
+
+var RC_CLOCK: fn() -> int64 with alloc, syscall = 0;
+
+// Installs the process-wide clock that timestamp writes read.
+//   now   function answering Unix microseconds; replaces any earlier clock.
+//         Passing 0 is the same as rc_clock_clear.
+export fn rc_clock_set(now: fn() -> int64 with alloc, syscall) { RC_CLOCK = now; }
+
+// Removes the installed clock. Writes that need a timestamp then fail with
+// RC_ERR_USAGE until a clock is set again.
+export fn rc_clock_clear() { RC_CLOCK = 0; }
+
+// Reads the installed clock.
+//   out   receives Unix microseconds; untouched on failure
+// Returns RC_OK; RC_ERR_USAGE when `out` is 0, no clock is installed, or the
+// clock answers 0 or less.
+export fn rc_clock_now(out: int64*) -> int32 {
+  if (out == 0) { return RC_ERR_USAGE; }
+  if (RC_CLOCK == 0) { return RC_ERR_USAGE; }
+  var us: int64 = RC_CLOCK();
+  if (us <= 0) { return RC_ERR_USAGE; }
+  *out = us;
+  return RC_OK;
+}

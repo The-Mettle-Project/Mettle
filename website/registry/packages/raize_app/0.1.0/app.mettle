@@ -1,0 +1,20 @@
+// raize/app — an app declares what it is; rz_run derives the wiring and serves.
+// reference: app
+// thread: declarations on the main thread inside rz_run; handlers on workers.
+//
+//   fn slice_app(app: RzApp*) {
+//     rz_default(app, "port", "8075");
+//     note_json_api(app, "/api/notes", rz_mem_layer(app, note_resource(), 8));
+//     counter_signal(app, "/counter", "");
+//   }
+//   fn main() -> int32 { return rz_run("slice", &slice_app); }
+
+import "types";
+import "declare";
+import "web";
+import "use";
+import "timer";
+import "run";
+import "raize_core/context/cookie";
+import "raize_core/context/peer";
+import "raize_core/context/conn";

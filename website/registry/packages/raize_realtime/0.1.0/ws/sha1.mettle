@@ -1,0 +1,158 @@
+// raize/ws/sha1 — SHA-1 (RFC 3174), for the WebSocket handshake only.
+//
+// RFC 6455 §4.2.2 derives Sec-WebSocket-Accept from SHA-1 of the client key
+// plus a fixed GUID. That is the only use: SHA-1 is broken for collision
+// resistance and must not be used for anything that needs a secure hash.
+//
+// One call hashes one contiguous input; there is no streaming state because
+// the handshake input is at most a few dozen bytes. No allocation: the
+// padded tail is built in a 128-byte stack block.
+
+import "std/mem";
+
+export const RZ_SHA1_LEN: int64 = 20;
+
+fn rz_sha1_rol(x: uint32, n: uint32) -> uint32 {
+  return (x << n) | (x >> (32 - n));
+}
+
+fn rz_sha1_be32(p: uint8*) -> uint32 {
+  return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+
+// Processes one 64-byte block into h[0..5].
+fn rz_sha1_block(h: uint32*, block: uint8*) {
+  var w: uint32[80];
+  var t: int32 = 0;
+  while (t < 16) {
+    w[t] = rz_sha1_be32(block + (int64)(t * 4));
+    t = t + 1;
+  }
+  while (t < 80) {
+    w[t] = rz_sha1_rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+    t = t + 1;
+  }
+  var a: uint32 = h[0];
+  var b: uint32 = h[1];
+  var c: uint32 = h[2];
+  var d: uint32 = h[3];
+  var e: uint32 = h[4];
+  t = 0;
+  while (t < 80) {
+    var f: uint32 = 0;
+    var k: uint32 = 0;
+    if (t < 20) {
+      f = (b & c) | ((~b) & d);
+      k = (uint32)0x5A827999;
+    } else if (t < 40) {
+      f = b ^ c ^ d;
+      k = (uint32)0x6ED9EBA1;
+    } else if (t < 60) {
+      f = (b & c) | (b & d) | (c & d);
+      k = (uint32)0x8F1BBCDC;
+    } else {
+      f = b ^ c ^ d;
+      k = (uint32)0xCA62C1D6;
+    }
+    var tmp: uint32 = rz_sha1_rol(a, 5) + f + e + k + w[t];
+    e = d;
+    d = c;
+    c = rz_sha1_rol(b, 30);
+    b = a;
+    a = tmp;
+    t = t + 1;
+  }
+  h[0] = h[0] + a;
+  h[1] = h[1] + b;
+  h[2] = h[2] + c;
+  h[3] = h[3] + d;
+  h[4] = h[4] + e;
+}
+
+// Hashes n bytes at p into out[0..20]. Returns 0, or -1 on a bad argument.
+export fn rz_sha1(p: uint8*, n: int64, out: uint8*) -> int32 {
+  if (out == 0 || n < 0 || (p == 0 && n > 0)) { return -1; }
+  var h: uint32[5];
+  h[0] = (uint32)0x67452301;
+  h[1] = (uint32)0xEFCDAB89;
+  h[2] = (uint32)0x98BADCFE;
+  h[3] = (uint32)0x10325476;
+  h[4] = (uint32)0xC3D2E1F0;
+
+  var off: int64 = 0;
+  while (n - off >= 64) {
+    rz_sha1_block(&h[0], p + off);
+    off = off + 64;
+  }
+
+  // Tail: the remaining bytes, 0x80, zeros, then the bit length (big-endian
+  // 64-bit) in the last 8 bytes of one or two blocks.
+  var tail: uint8[128];
+  memset((rawptr)&tail[0], 0, 128);
+  var rest: int64 = n - off;
+  if (rest > 0) { memcpy((rawptr)&tail[0], (rawptr)(p + off), rest); }
+  tail[rest] = (uint8)0x80;
+  var blocks: int64 = 1;
+  if (rest >= 56) { blocks = 2; }
+  var bits: uint64 = (uint64)n * 8;
+  var end: int64 = blocks * 64;
+  var i: int64 = 0;
+  while (i < 8) {
+    tail[end - 1 - i] = (uint8)((bits >> (uint64)(i * 8)) & 255);
+    i = i + 1;
+  }
+  rz_sha1_block(&h[0], &tail[0]);
+  if (blocks == 2) { rz_sha1_block(&h[0], &tail[64]); }
+
+  var j: int32 = 0;
+  while (j < 5) {
+    out[j * 4] = (uint8)((h[j] >> 24) & 255);
+    out[j * 4 + 1] = (uint8)((h[j] >> 16) & 255);
+    out[j * 4 + 2] = (uint8)((h[j] >> 8) & 255);
+    out[j * 4 + 3] = (uint8)(h[j] & 255);
+    j = j + 1;
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tests: RFC 3174 §7.3 vectors, plus the one- and two-block padding edges.
+// ---------------------------------------------------------------------------
+
+fn rz_sha1_hex_eq(d: uint8*, want: string) -> bool {
+  var digits: string = "0123456789abcdef";
+  var i: int64 = 0;
+  while (i < 20) {
+    if (digits.chars[(int64)(d[i] >> 4)] != want.chars[i * 2]) { return false; }
+    if (digits.chars[(int64)(d[i] & 15)] != want.chars[i * 2 + 1]) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+@test fn t_rz_sha1_vectors() -> int32 {
+  var d: uint8[20];
+  var abc: string = "abc";
+  rz_sha1(abc.chars, 3, &d[0]);
+  if (!rz_sha1_hex_eq(&d[0], "a9993e364706816aba3e25717850c26c9cd0d89d")) { return 1; }
+  var two: string = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+  rz_sha1(two.chars, 56, &d[0]);
+  if (!rz_sha1_hex_eq(&d[0], "84983e441c3bd26ebaae4aa1f95129e5e54670f1")) { return 2; }
+  rz_sha1(0, 0, &d[0]);
+  if (!rz_sha1_hex_eq(&d[0], "da39a3ee5e6b4b0d3255bfef95601890afd80709")) { return 3; }
+  return 0;
+}
+
+@test fn t_rz_sha1_block_edges() -> int32 {
+  // 64 'a's: one full block, then a padding-only block.
+  var buf: uint8[64];
+  memset((rawptr)&buf[0], 97, 64);
+  var d: uint8[20];
+  rz_sha1(&buf[0], 64, &d[0]);
+  if (!rz_sha1_hex_eq(&d[0], "0098ba824b5c16427bd7a1122a5a442a25ec644d")) { return 1; }
+  // 55 'a's: the length still fits the first block.
+  rz_sha1(&buf[0], 55, &d[0]);
+  if (!rz_sha1_hex_eq(&d[0], "c1c8bbdc22796e28c0e15163d20899b65621d65a")) { return 2; }
+  if (rz_sha1(0, 3, &d[0]) != -1) { return 3; }
+  return 0;
+}

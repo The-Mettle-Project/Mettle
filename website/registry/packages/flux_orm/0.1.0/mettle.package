@@ -1,0 +1,7 @@
+name = flux_orm
+version = 0.1.0
+description = An ORM for the MeoDB database, written in Mettle
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/FluxORM
+compiler = 0.18.0
+platforms = linux

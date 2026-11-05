@@ -1,0 +1,503 @@
+// mythic_w_scroll: scroll view with overlay scrollbars, and the virtualized list (DESIGN-SYSTEM §7.10, §7.11).
+import "mythic_base";
+import "mythic_types";
+import "mythic_ctx";
+import "mythic_anim";
+import "mythic_paint";
+import "mythic_layout";
+
+// an open scroll view or list, hung on its node until mythic_end (frame arena)
+struct ScrollRun {
+  id: uint64;
+  focus_len: int64;              // focus order length at begin: entries after it are inside
+  list: bool;
+  first: int64; next: int64;     // list: first row built, index of the next list_item
+  row_h: float32;
+  count: int64; last: int64; ranged: bool;   // set by mythic_list_visible_range
+}
+
+// one overlay scrollbar, painted from the laid-out scroll node of this frame
+struct BarPaint {
+  view: MythicNode*; ax: int32;
+  alpha: float32; wide: float32; hover: float32; press: float32;
+  thumb: uint32; thumb_hover: uint32; thumb_active: uint32; track: uint32;
+}
+
+fn vget(v: MythicVec2, ax: int32) -> float32 { if (ax == 0) { return v.x; } return v.y; }
+fn vset(v: MythicVec2*, ax: int32, f: float32) { if (ax == 0) { v->x = f; } else { v->y = f; } }
+
+fn scroll_max(st: MythicScrollState*, n: MythicNode*, ax: int32) -> float32 {
+  if (ax == 0 && !n->box.scroll_x) { return 0.0; }
+  if (ax == 1 && !n->box.scroll_y) { return 0.0; }
+  return mythic_maxf(0.0, vget(st->content, ax) - vget(st->view, ax));
+}
+
+// track and thumb of the bar for axis `ax` along the edge of view rect `r`: inset 2 from the edge
+// and the track ends, 12 short of the corner when both bars show, thumb at least 24 long
+struct BarGeo { start: float32; len: float32; tpos: float32; tlen: float32; }
+
+fn bar_geo(r: MythicRect, ax: int32, both: bool, view: float32, content: float32, off: float32) -> BarGeo {
+  var g: BarGeo;
+  var end: float32 = 2.0;
+  if (both) { end = 12.0; }
+  g.start = r.y + 2.0;
+  g.len = mythic_maxf(0.0, r.h - 2.0 - end);
+  if (ax == 0) { g.start = r.x + 2.0; g.len = mythic_maxf(0.0, r.w - 2.0 - end); }
+  g.tlen = g.len;
+  if (content > 0.0) { g.tlen = mythic_clampf(g.len * view / content, mythic_minf(24.0, g.len), g.len); }
+  var mx: float32 = content - view;
+  g.tpos = g.start;
+  if (mx > 0.0) { g.tpos = g.start + (g.len - g.tlen) * mythic_clampf(off / mx, 0.0, 1.0); }
+  return g;
+}
+
+fn bar_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: BarPaint* = (BarPaint*)data;
+  var n: MythicNode* = d->view;
+  var mx: float32 = n->content.x - n->rect.w;
+  var my: float32 = n->content.y - n->rect.h;
+  var both: bool = n->box.scroll_x && n->box.scroll_y && mx > 0.5 && my > 0.5;
+  var w: float32 = 6.0 + 4.0 * d->wide;
+  var rv: MythicRect = n->rect;
+  if (d->ax == 0) {
+    var g: BarGeo = bar_geo(rv, 0, both, rv.w, n->content.x, n->scroll.x);
+    var y: float32 = rv.y + rv.h - 2.0 - w;
+    var tr: MythicRect = { x: g.start, y: y, w: g.len, h: w };
+    var th: MythicRect = { x: g.tpos, y: y, w: g.tlen, h: w };
+    bar_draw(p, d, tr, th, w);
+  } else {
+    var g2: BarGeo = bar_geo(rv, 1, both, rv.h, n->content.y, n->scroll.y);
+    var x: float32 = rv.x + rv.w - 2.0 - w;
+    var tr2: MythicRect = { x: x, y: g2.start, w: w, h: g2.len };
+    var th2: MythicRect = { x: x, y: g2.tpos, w: w, h: g2.tlen };
+    bar_draw(p, d, tr2, th2, w);
+  }
+}
+
+fn bar_draw(p: MythicPainter*, d: BarPaint*, track: MythicRect, thumb: MythicRect, w: float32) {
+  var saved: float32 = p->opacity;
+  p->opacity = saved * d->alpha;
+  var rad: MythicCorners = mythic_radius(w / 2.0);
+  // the track only shows while the bar is expanded
+  if (d->wide > 0.0) {
+    var a: float32 = (float32)(d->track >> 24) * d->wide;
+    mythic_paint_fill(p, track, rad, ((uint32)mythic_iround(a) << 24) | (d->track & (uint32)0x00FFFFFF));
+  }
+  var c: uint32 = mythic_color_lerp(mythic_color_lerp(d->thumb, d->thumb_hover, d->hover), d->thumb_active, d->press);
+  mythic_paint_fill(p, thumb, rad, c);
+  p->opacity = saved;
+}
+
+// input and visuals of the bar for axis `ax` (0 = horizontal bar, 1 = vertical)
+fn bar_update(ui: MythicUi*, n: MythicNode*, ov: MythicNode*, ax: int32, input: bool) {
+  var t: MythicTheme* = mythic_theme(ui);
+  var m: MythicMotion* = &t->motion;
+  var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, n->box.id, false);
+  var mx: float32 = scroll_max(st, n, ax);
+  if (mx <= 0.5) { return; }
+  var both: bool = scroll_max(st, n, 1 - ax) > 0.5;
+  var bid: uint64 = ov->box.id;
+  // the hit zone is 12 wide along the edge; the bar takes the pointer only while it shows
+  if (ax == 0) { ov->box.width = mythic_grow(); ov->box.height = mythic_fixed(12.0); ov->box.align_y = MYTHIC_ALIGN_END; }
+  else { ov->box.width = mythic_fixed(12.0); ov->box.height = mythic_grow(); ov->box.align_x = MYTHIC_ALIGN_END; }
+  // both overlays exist before either is updated: point interact at this one
+  ui->last_node = ov;
+  var r: MythicResp = mythic_interact(ui, bid, MYTHIC_SENSE_DRAG | MYTHIC_SENSE_CLICK);
+  var mp: MythicVec2 = ui->in.mouse;
+  var zone: MythicRect = st->rect;
+  if (ax == 0) { zone.y = zone.y + zone.h - 12.0; zone.h = 12.0; } else { zone.x = zone.x + zone.w - 12.0; zone.w = 12.0; }
+  var in_zone: bool = r.hovered;
+  if (!in_zone && ui->scroll_hover_id == n->box.id && ui->active_id == 0) {
+    in_zone = mp.x >= zone.x && mp.y >= zone.y && mp.x < zone.x + zone.w && mp.y < zone.y + zone.h &&
+              mp.x >= st->vis.x && mp.y >= st->vis.y && mp.x < st->vis.x + st->vis.w && mp.y < st->vis.y + st->vis.h;
+  }
+  var view: float32 = vget(st->view, ax);
+  var g: BarGeo = bar_geo(st->rect, ax, both, view, vget(st->content, ax), vget(st->base, ax));
+  var along: float32 = vget(mp, ax);
+  if (input && r.hovered && ui->in.mouse_pressed[1]) {
+    // press on the thumb grabs it; on the track pages toward the pointer
+    if (along < g.tpos) { vset(&st->target, ax, vget(st->target, ax) - view); }
+    else if (along >= g.tpos + g.tlen) { vset(&st->target, ax, vget(st->target, ax) + view); }
+    else { st->drag = ax + 1; st->grab = along - g.tpos; }
+    st->shown_us = ui->time_us;
+  }
+  var dragging: bool = st->drag == ax + 1 && ui->active_id == bid && ui->in.mouse_down[1];
+  if (st->drag == ax + 1 && !dragging) { st->drag = 0; }
+  if (dragging) {
+    // the thumb follows the pointer exactly: no smoothing
+    var f: float32 = 0.0;
+    if (g.len > g.tlen) { f = mythic_clampf((along - st->grab - g.start) / (g.len - g.tlen), 0.0, 1.0); }
+    vset(&st->target, ax, f * mx);
+    vset(&st->base, ax, f * mx);
+  }
+  if (in_zone || dragging) { st->shown_us = ui->time_us; }
+  var on_thumb: bool = r.hovered && along >= g.tpos && along < g.tpos + g.tlen;
+  // shown on scroll, hover and drag; hides 800 ms after the last of these
+  var hide_us: int64 = (int64)(m->scrollbar_hide_delay_ms * 1000.0);
+  var idle: int64 = ui->time_us - st->shown_us;
+  var shown: bool = st->shown_us != 0 && idle < hide_us;
+  var vis: float32 = 0.0;
+  var dur: float32 = m->scrollbar_fade_ms;
+  if (shown) { vis = 1.0; dur = m->scrollbar_show_ms; }
+  var d: BarPaint* = (BarPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(BarPaint));
+  d->view = n;
+  d->ax = ax;
+  d->alpha = mythic_anim_timed(ui, bid, 0 | MYTHIC_ANIM_COLOR, vis, dur, MYTHIC_CURVE_LINEAR);
+  var wt: float32 = 0.0;
+  if (in_zone || dragging) { wt = 1.0; }
+  d->wide = mythic_anim_smooth(ui, bid, 1 | MYTHIC_ANIM_MOVE, wt, m->scrollbar_width_tau, m->scrollbar_width_tau);
+  var ht: float32 = 0.0;
+  if (on_thumb || dragging) { ht = 1.0; }
+  d->hover = mythic_anim_smooth(ui, bid, 2 | MYTHIC_ANIM_COLOR, ht, m->hover_in_tau, m->hover_out_tau);
+  var pt: float32 = 0.0;
+  if (dragging) { pt = 1.0; }
+  d->press = mythic_anim_smooth(ui, bid, 3 | MYTHIC_ANIM_COLOR, pt, m->press_in_tau, m->press_out_tau);
+  var c: MythicColors* = &t->colors;
+  d->thumb = c->scrollbar_thumb;
+  d->thumb_hover = c->scrollbar_thumb_hover;
+  d->thumb_active = c->scrollbar_thumb_active;
+  d->track = c->scrollbar_track;
+  if (shown && !in_zone && !dragging) { mythic_request_frame_in(ui, (int32)((hide_us - idle + 999) / 1000)); }
+  if (d->alpha <= 0.0 && !shown) { ov->hit_id = 0; }
+  ov->paint = &bar_paint;
+  ov->paint_data = (rawptr)d;
+}
+
+// clamps the offset to the content and takes one smoothing step from the frame's start value
+fn scroll_step(ui: MythicUi*, n: MythicNode*) {
+  var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, n->box.id, false);
+  var mx: float32 = scroll_max(st, n, 0);
+  var my: float32 = scroll_max(st, n, 1);
+  st->target.x = mythic_clampf(st->target.x, 0.0, mx); st->target.y = mythic_clampf(st->target.y, 0.0, my);
+  st->base.x = mythic_clampf(st->base.x, 0.0, mx); st->base.y = mythic_clampf(st->base.y, 0.0, my);
+  var k: float32 = 1.0;
+  var tau: float32 = mythic_theme(ui)->motion.scroll_tau;
+  if (!mythic_reduced_motion(ui) && tau > 0.0) { k = 1.0 - mythic_expf(-(ui->dt * 1000.0) / tau); }
+  var sc: float32 = ui->scale;
+  if (sc <= 0.0) { sc = 1.0; }
+  var o: MythicVec2 = { x: st->base.x + (st->target.x - st->base.x) * k, y: st->base.y + (st->target.y - st->base.y) * k };
+  // within half a device pixel nothing visible is left to animate
+  if (mythic_absf(st->target.x - o.x) * sc < 0.5) { o.x = st->target.x; }
+  if (mythic_absf(st->target.y - o.y) * sc < 0.5) { o.y = st->target.y; }
+  // far down a long list a float32 step can round to nothing: snap rather than animate forever
+  if (o.x == st->base.x) { o.x = st->target.x; }
+  if (o.y == st->base.y) { o.y = st->target.y; }
+  if (o.x != st->base.x || o.y != st->base.y) { st->shown_us = ui->time_us; }
+  if (o.x != st->target.x || o.y != st->target.y) {
+    ui->anim_active = true;
+    mythic_request_frame_in(ui, 16);
+  }
+  st->off = o;
+  // children move by whole device px (Amendment 19)
+  n->scroll.x = mythic_roundf(o.x * sc) / sc;
+  n->scroll.y = mythic_roundf(o.y * sc) / sc;
+}
+
+// opens the scroll node, its two bar overlays, and applies the wheel and bar input
+fn scroll_open(ui: MythicUi*, id: uint64, b: MythicBox, list: bool) -> ScrollRun* {
+  var c: MythicBox = b;
+  c.id = id;
+  c.clip = true;
+  if (!c.scroll_x && !c.scroll_y) { c.scroll_y = true; }
+  var run: ScrollRun* = (ScrollRun*)mythic_arena_alloc_zero(ui->arena, sizeof(ScrollRun));
+  run->id = id;
+  run->list = list;
+  run->focus_len = ui->focus_cur->len;
+  mythic_box_begin(ui, c);
+  var n: MythicNode* = ui->cur;
+  n->ext = (rawptr)run;
+  n->end_cb = &scroll_close;
+  var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, id, true);
+  if (st->last_frame == 0) { st->active = -1; st->sel = -1; st->sel_next = -1; }
+  st->last_frame = ui->frame;
+  if (st->base_frame != ui->frame) { st->base = st->off; st->base_frame = ui->frame; }
+  var input: bool = ui->pass == 0 && ui->disabled_depth == 0;
+  if (input && ui->wheel_id == id) {
+    st->target.x = st->target.x + ui->in.wheel.x * 48.0;
+    st->target.y = st->target.y - ui->in.wheel.y * 48.0;
+    // precise (touchpad) deltas skip the smoothing
+    st->target.x = st->target.x + ui->in.wheel_px.x; st->base.x = st->base.x + ui->in.wheel_px.x;
+    st->target.y = st->target.y - ui->in.wheel_px.y; st->base.y = st->base.y - ui->in.wheel_px.y;
+  }
+  var hx: MythicNode* = mythic_ctx_overlay_add(ui);
+  hx->box.id = mythic_hash_u64(id, (uint64)1);
+  var vy: MythicNode* = mythic_ctx_overlay_add(ui);
+  vy->box.id = mythic_hash_u64(id, (uint64)2);
+  bar_update(ui, n, hx, 0, input);
+  bar_update(ui, n, vy, 1, input);
+  ui->last_node = n;
+  return run;
+}
+
+// moves the target so `r` (latest layout, plus a margin) is inside the view
+fn reveal(st: MythicScrollState*, r: MythicRect) {
+  var top: float32 = r.y - st->rect.y + st->laid.y - 8.0;
+  var bot: float32 = top + r.h + 16.0;
+  if (bot - top > st->view.y || top < st->target.y) { st->target.y = top; }
+  else if (bot > st->target.y + st->view.y) { st->target.y = bot - st->view.y; }
+  var left: float32 = r.x - st->rect.x + st->laid.x - 8.0;
+  var right: float32 = left + r.w + 16.0;
+  if (right - left > st->view.x || left < st->target.x) { st->target.x = left; }
+  else if (right > st->target.x + st->view.x) { st->target.x = right - st->view.x; }
+}
+
+fn scroll_close(ui: MythicUi*, n: MythicNode*) {
+  var run: ScrollRun* = (ScrollRun*)n->ext;
+  if (run->list) { list_close(ui, n, run); }
+  var fid: uint64 = ui->focus_id;
+  var inside: bool = false;
+  if (fid != 0 && fid != run->id) {
+    var o: MythicVec<MythicFocusEnt>* = ui->focus_cur;
+    for i: int64 in run->focus_len..o->len {
+      if (o->data[i].id == fid) { inside = true; }
+    }
+  }
+  var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, run->id, false);
+  if (!inside) {
+    // a focused list keeps its own mark (its active row was shown, mythic_list_begin)
+    if (fid != run->id) { st->into_view = 0; }
+    st->into_wait = 0;
+    return;
+  }
+  if (st->into_view == fid) { return; }
+  // keyboard focus moved to a child: scroll it into view once (§4); a click does not scroll
+  if (!ui->focus_visible) { st->into_view = fid; return; }
+  if (ui->focus_rect_id == fid) {
+    reveal(st, ui->focus_rect);
+    st->into_view = fid;
+    scroll_step(ui, n);
+    // an outer view closes next: show it where the child will land, not where it was laid out
+    ui->focus_rect.x = ui->focus_rect.x - (st->target.x - st->laid.x);
+    ui->focus_rect.y = ui->focus_rect.y - (st->target.y - st->laid.y);
+  } else if (st->into_wait != fid) {
+    // its rect is known after this pass's layout
+    st->into_wait = fid;
+    mythic_request_repass(ui);
+  } else {
+    st->into_view = fid;
+  }
+}
+
+/// Opens a scroll view (DESIGN-SYSTEM §7.10). `id_label` names it; zero fields of `b` keep the box
+/// defaults, and with neither b.scroll_x nor b.scroll_y it scrolls vertically. Children are laid
+/// out unconstrained on the scroll axis and clipped to the view (with b.radius). Overlay scrollbars,
+/// smoothed wheel (Shift+wheel scrolls sideways), and a child focused with the keyboard is
+/// scrolled into view. Give it a size (fixed or grow). Close with mythic_end.
+export fn mythic_scroll_begin(ui: MythicUi*, id_label: string, b: MythicBox) {
+  var id: uint64 = mythic_id(ui, id_label);
+  scroll_open(ui, id, b, false);
+  scroll_step(ui, ui->cur);
+}
+
+/// Same as mythic_end.
+export fn mythic_scroll_end(ui: MythicUi*) { mythic_end(ui); }
+
+// ---------------------------------------------------------------- list
+
+// the innermost open list
+fn list_run(ui: MythicUi*) -> MythicNode* {
+  var n: MythicNode* = ui->cur;
+  while (n != 0) {
+    if (n->ext != 0 && ((ScrollRun*)n->ext)->list) { return n; }
+    n = n->parent;
+  }
+  return n;
+}
+
+fn row_height(st: MythicScrollState*) -> float32 {
+  if (st->row_h > 0.0) { return st->row_h; }
+  return 32.0;
+}
+
+// keeps row `a` inside the view (list padding included)
+fn reveal_row(st: MythicScrollState*, n: MythicNode*, a: int64) {
+  var rh: float32 = row_height(st);
+  var top: float32 = (float32)a * rh;
+  var bot: float32 = top + rh + n->box.pad.t + n->box.pad.b;
+  if (top < st->target.y) { st->target.y = top; }
+  else if (bot > st->target.y + st->view.y) { st->target.y = bot - st->view.y; }
+}
+
+/// Opens a list (DESIGN-SYSTEM §7.11): a vertical scroll view with list padding 4 (when b.pad is
+/// zero) whose rows are mythic_list_item calls. The list is one Tab stop: Up, Down, Home, End,
+/// PageUp and PageDown move the active row, Enter and Space activate it. For long lists call
+/// mythic_list_visible_range first and declare only the rows it returns. Close with mythic_end.
+export fn mythic_list_begin(ui: MythicUi*, id_label: string, b: MythicBox) {
+  var id: uint64 = mythic_id(ui, id_label);
+  var c: MythicBox = b;
+  if (c.pad.l == 0.0 && c.pad.t == 0.0 && c.pad.r == 0.0 && c.pad.b == 0.0) { c.pad = mythic_pad(4.0); }
+  c.dir = MYTHIC_DIR_COLUMN;
+  c.gap = 0.0;
+  scroll_open(ui, id, c, true);
+  var n: MythicNode* = ui->cur;
+  var fl: int32 = MYTHIC_FOCUS_ACTIVATE_ENTER | MYTHIC_FOCUS_ACTIVATE_SPACE | MYTHIC_FOCUS_WANTS_ARROWS;
+  mythic_interact(ui, id, MYTHIC_SENSE_CLICK);
+  mythic_focusable(ui, id, fl);
+  var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, id, false);
+  if (ui->focus_id == id && ui->disabled_depth == 0 && st->count > 0) {
+    var a: int64 = st->active;
+    var rh: float32 = row_height(st);
+    if (a < 0 || a >= st->count) {
+      // entering the list: start at the selected row, else the first one in view
+      a = st->sel;
+      if (a < 0) { a = (int64)mythic_floorf(st->off.y / rh); }
+    }
+    var page: int64 = mythic_maxi(1, (int32)((st->view.y - n->box.pad.t - n->box.pad.b) / rh));
+    var moved: bool = false;
+    if (ui->pass == 0) {
+      while (mythic_key_consume(ui, MYTHIC_KEY_UP, -1)) { a = a - 1; moved = true; }
+      while (mythic_key_consume(ui, MYTHIC_KEY_DOWN, -1)) { a = a + 1; moved = true; }
+      while (mythic_key_consume(ui, MYTHIC_KEY_PAGE_UP, -1)) { a = a - page; moved = true; }
+      while (mythic_key_consume(ui, MYTHIC_KEY_PAGE_DOWN, -1)) { a = a + page; moved = true; }
+      if (mythic_key_consume(ui, MYTHIC_KEY_HOME, -1)) { a = 0; moved = true; }
+      if (mythic_key_consume(ui, MYTHIC_KEY_END, -1)) { a = st->count - 1; moved = true; }
+    }
+    if (a < 0) { a = 0; }
+    if (a >= st->count) { a = st->count - 1; }
+    st->active = a;
+    if (moved) { ui->focus_visible = true; }
+    // keyboard focus arriving (Tab) shows the active row once
+    if (moved || ui->activate_id == id || (ui->focus_visible && st->into_view != id)) {
+      // keyboard moves jump, so the active row is built this frame and Enter can reach it
+      reveal_row(st, n, a);
+      st->base.y = st->target.y;
+      st->into_view = id;
+    }
+  }
+  scroll_step(ui, n);
+}
+
+/// Same as mythic_end.
+export fn mythic_list_end(ui: MythicUi*) { mythic_end(ui); }
+
+fn list_close(ui: MythicUi*, n: MythicNode*, run: ScrollRun*) {
+  var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, run->id, false);
+  if (run->ranged) {
+    // the rows below the view, as one spacer: the scrollbar reflects the whole count
+    if (run->count > run->last) {
+      var sp: MythicNode* = mythic_ctx_node_add(ui, MYTHIC_NODE_SPACER);
+      sp->box.height = mythic_fixed((float32)(run->count - run->last) * run->row_h);
+    }
+    st->count = run->count;
+  } else {
+    st->count = run->next;
+  }
+  if (run->row_h > 0.0) { st->row_h = run->row_h; }
+  if (st->active >= st->count) { st->active = st->count - 1; }
+  // the selection as last seen: a selected row that is not built keeps it
+  if (st->sel_next >= 0 || (st->sel >= run->first && st->sel < run->next) || st->sel >= st->count) { st->sel = st->sel_next; }
+  st->sel_next = -1;
+}
+
+/// Rows [*first, *last) of a list of `count` rows of height `row_h` that are in view. Call it
+/// right after mythic_list_begin and declare exactly those rows: the rows above and below become
+/// spacers, so only visible rows are built and the scrollbar still reflects `count`. Offsets are
+/// float32: rows stay pixel-exact up to about 16M px of content (500k rows of 32).
+export fn mythic_list_visible_range(ui: MythicUi*, row_h: float32, count: int64, first: int64*, last: int64*) {
+  var n: MythicNode* = list_run(ui);
+  *first = 0;
+  *last = count;
+  if (n == 0 || count <= 0 || row_h <= 0.0) { if (count < 0) { *last = 0; } return; }
+  var run: ScrollRun* = (ScrollRun*)n->ext;
+  var st: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, run->id, false);
+  var top: float32 = n->scroll.y - n->box.pad.t;
+  var f: int64 = (int64)mythic_floorf(top / row_h);
+  var l: int64 = (int64)mythic_ceilf((top + st->view.y) / row_h);
+  if (f < 0) { f = 0; }
+  if (f > count) { f = count; }
+  if (l < f) { l = f; }
+  if (l > count) { l = count; }
+  if (f > 0) {
+    var sp: MythicNode* = mythic_ctx_node_add(ui, MYTHIC_NODE_SPACER);
+    sp->box.height = mythic_fixed((float32)f * row_h);
+  }
+  run->first = f;
+  run->next = f;
+  run->last = l;
+  run->count = count;
+  run->row_h = row_h;
+  run->ranged = true;
+  *first = f;
+  *last = l;
+}
+
+struct RowPaint { bg: uint32; ring: uint32; focus: float32; radius: float32; }
+
+fn row_paint(ui: MythicUi*, p: MythicPainter*, r: MythicRect, data: rawptr) {
+  var d: RowPaint* = (RowPaint*)data;
+  var rad: MythicCorners = mythic_radius(d->radius);
+  mythic_paint_fill(p, r, rad, d->bg);
+  // the active row of a keyboard-focused list: a 2 px ring inside the row
+  if (d->focus > 0.0) {
+    var a: float32 = (float32)(d->ring >> 24) * mythic_clampf(d->focus, 0.0, 1.0);
+    mythic_paint_stroke(p, r, rad, 2.0, ((uint32)mythic_iround(a) << 24) | (d->ring & (uint32)0x00FFFFFF));
+  }
+}
+
+/// One list row (DESIGN-SYSTEM §7.11): `label` (text after "##" is not shown) on accent.subtle when
+/// `selected`. Returns true when the row was clicked, or activated with Enter / Space while it is
+/// the list's active row. Declare it inside mythic_list_begin; push an ID per row when labels repeat.
+export fn mythic_list_item(ui: MythicUi*, label: string, selected: bool) -> bool {
+  var t: MythicTheme* = mythic_theme(ui);
+  var c: MythicColors* = &t->colors;
+  var id: uint64 = mythic_id(ui, label);
+  var ln: MythicNode* = list_run(ui);
+  var run: ScrollRun* = (ScrollRun*)0;
+  var idx: int64 = -1;
+  var rh: float32 = 32.0;
+  if (ln != 0) {
+    run = (ScrollRun*)ln->ext;
+    idx = run->next;
+    run->next = run->next + 1;
+    if (run->row_h > 0.0) { rh = run->row_h; }
+  }
+  var b: MythicBox;
+  b.id = id;
+  b.dir = MYTHIC_DIR_ROW;
+  b.width = mythic_grow();
+  b.height = mythic_fixed(rh);
+  b.pad = mythic_pad_xy(8.0, 0.0);
+  b.align_y = MYTHIC_ALIGN_CENTER;
+  mythic_box_begin(ui, b);
+  var r: MythicResp = mythic_interact(ui, id, MYTHIC_SENSE_CLICK);
+  var dis: bool = ui->disabled_depth > 0;
+  var st: MythicTextStyle = t->type.body;
+  st.flags = MYTHIC_TEXT_ELLIPSIS;
+  var tc: uint32 = c->text_primary;
+  if (dis) { tc = t->colors.text_disabled; }
+  mythic_text(ui, mythic_arena_strn(ui->arena, label, mythic_label_len(label)), st, tc);
+  if (dis) { ui->last_node->opacity = ui->opacity_base; }
+  mythic_end(ui);
+  var clicked: bool = r.clicked;
+  var ring: float32 = 0.0;
+  if (run != 0) {
+    var ls: MythicScrollState* = mythic_map_get<MythicScrollState>(&ui->scrolls, run->id, false);
+    if (selected) { ls->sel_next = idx; }
+    if (!dis && r.hovered && ui->in.mouse_pressed[1] && ui->pass == 0) {
+      // a press on a row focuses the list (no ring) and makes the row active
+      ui->focus_id = run->id;
+      ui->focus_visible = false;
+      ui->focus_claimed = true;
+      ls->active = idx;
+    }
+    if (!dis && ls->active == idx) {
+      if (ui->activate_id == run->id) { clicked = true; }
+      if (mythic_focus_ring_on(ui, run->id)) { ring = 1.0; }
+    }
+  }
+  var sa: MythicStateAnim = mythic_anim_states(ui, id, r);
+  var d: RowPaint* = (RowPaint*)mythic_arena_alloc_zero(ui->arena, sizeof(RowPaint));
+  d->radius = t->radius.md;
+  d->ring = c->focus_ring;
+  d->focus = mythic_anim_smooth(ui, id, 3 | MYTHIC_ANIM_COLOR, ring, t->motion.focus_tau, t->motion.focus_tau);
+  if (selected) {
+    d->bg = mythic_color_lerp(c->accent_subtle, c->accent_subtle_hover, mythic_maxf(sa.hover, sa.press));
+  } else {
+    var clear: uint32 = c->bg_hover & (uint32)0x00FFFFFF;
+    d->bg = mythic_color_lerp(mythic_color_lerp(clear, c->bg_hover, sa.hover), c->bg_pressed, sa.press);
+  }
+  mythic_node_paint(ui, &row_paint, (rawptr)d);
+  // the caller changes its selection after this returns: run the pass again so it is drawn
+  if (clicked) { mythic_request_repass(ui); }
+  return clicked;
+}

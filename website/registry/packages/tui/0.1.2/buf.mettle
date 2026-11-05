@@ -1,0 +1,233 @@
+// The cell buffer: create, clear, write text with correct widths, and turn
+// it into plain text for tests.
+
+import "std/mem";
+import "std/conv";
+import "types";
+import "width";
+
+export fn tui_buf_new(w: int32, h: int32) -> TuiBuf* {
+  var b: TuiBuf* = new TuiBuf;
+  if (w < 0) { w = 0; }
+  if (h < 0) { h = 0; }
+  b->w = w;
+  b->h = h;
+  var n: int64 = (int64)w * (int64)h;
+  if (n < 1) { n = 1; }
+  b->cells = (TuiCell*)calloc(n, sizeof(TuiCell));
+  tui_buf_clear(b);
+  return b;
+}
+
+export fn tui_buf_free(b: TuiBuf*) {
+  if (b == 0) { return; }
+  free(b->cells);
+  free(b);
+}
+
+fn tui_cell_blank(c: TuiCell*, st: TuiStyle) {
+  c->text[0] = (uint8)32;
+  c->len = (uint8)1;
+  c->width = (uint8)1;
+  c->style = st;
+}
+
+export fn tui_buf_clear(b: TuiBuf*) {
+  var st: TuiStyle;
+  var n: int64 = (int64)b->w * (int64)b->h;
+  for i: int64 in 0..n { tui_cell_blank(&b->cells[i], st); }
+}
+
+// Resizes and clears.
+export fn tui_buf_resize(b: TuiBuf*, w: int32, h: int32) {
+  if (w < 0) { w = 0; }
+  if (h < 0) { h = 0; }
+  var n: int64 = (int64)w * (int64)h;
+  if (n < 1) { n = 1; }
+  free(b->cells);
+  b->cells = (TuiCell*)calloc(n, sizeof(TuiCell));
+  b->w = w;
+  b->h = h;
+  tui_buf_clear(b);
+}
+
+export fn tui_buf_area(b: TuiBuf*) -> TuiRect {
+  return tui_rect(0, 0, b->w, b->h);
+}
+
+// The cell at (x, y), or 0 when it is off the buffer.
+export fn tui_buf_cell(b: TuiBuf*, x: int32, y: int32) -> TuiCell* {
+  if (x < 0 || y < 0 || x >= b->w || y >= b->h) { return (TuiCell*)0; }
+  return &b->cells[(int64)y * (int64)b->w + (int64)x];
+}
+
+// Blanks the half of a wide character that is left when the other half is
+// overwritten, so a cell never holds half a character.
+fn tui_buf_unsplit(b: TuiBuf*, x: int32, y: int32) {
+  var c: TuiCell* = tui_buf_cell(b, x, y);
+  if (c == 0) { return; }
+  if (c->width == (uint8)0) {
+    var l: TuiCell* = tui_buf_cell(b, x - 1, y);
+    if (l != 0 && l->width == (uint8)2) { tui_cell_blank(l, l->style); }
+  } else if (c->width == (uint8)2) {
+    var r: TuiCell* = tui_buf_cell(b, x + 1, y);
+    if (r != 0 && r->width == (uint8)0) { tui_cell_blank(r, r->style); }
+  }
+}
+
+// Puts one grapheme (bytes p[0..n]) of the given width at (x, y).
+export fn tui_buf_set(b: TuiBuf*, x: int32, y: int32, p: uint8*, n: int32, width: int32, st: TuiStyle) {
+  var c: TuiCell* = tui_buf_cell(b, x, y);
+  if (c == 0) { return; }
+  if (width == 2 && x + 1 >= b->w) {
+    // No room for the right half: draw a space instead, as terminals do.
+    tui_buf_unsplit(b, x, y);
+    tui_cell_blank(c, st);
+    return;
+  }
+  tui_buf_unsplit(b, x, y);
+  if (width == 2) { tui_buf_unsplit(b, x + 1, y); }
+  if (n > TUI_CELL_BYTES) { n = TUI_CELL_BYTES; }
+  for i in 0..n { c->text[i] = p[i]; }
+  c->len = (uint8)n;
+  c->width = (uint8)width;
+  c->style = st;
+  if (width == 2) {
+    var r: TuiCell* = tui_buf_cell(b, x + 1, y);
+    r->len = (uint8)0;
+    r->width = (uint8)0;
+    r->style = st;
+  }
+}
+
+// Puts one code point.
+export fn tui_buf_set_cp(b: TuiBuf*, x: int32, y: int32, cp: int32, st: TuiStyle) {
+  var tmp: uint8[4];
+  var n: int32 = tui_utf8_put(&tmp[0], cp);
+  var w: int32 = tui_cp_width(cp);
+  if (w < 1) { w = 1; }
+  tui_buf_set(b, x, y, &tmp[0], n, w, st);
+}
+
+// Puts one code point; the same as tui_buf_set_cp with a uint32.
+export fn tui_put_cp(b: TuiBuf*, x: int32, y: int32, cp: uint32, st: TuiStyle) {
+  tui_buf_set_cp(b, x, y, (int32)cp, st);
+}
+
+// Changes only the style of a cell, keeping its text.
+export fn tui_buf_set_style(b: TuiBuf*, x: int32, y: int32, st: TuiStyle) {
+  var c: TuiCell* = tui_buf_cell(b, x, y);
+  if (c != 0) { c->style = st; }
+}
+
+// Fills a rectangle with one character.
+export fn tui_fill(b: TuiBuf*, r: TuiRect, cp: int32, st: TuiStyle) {
+  for y in r.y..r.y + r.h {
+    for x in r.x..r.x + r.w { tui_buf_set_cp(b, x, y, cp, st); }
+  }
+}
+
+// Writes text at (x, y), clipped to max_w columns (and the buffer).
+// Combining marks join the character before them, emoji joined by U+200D
+// share one cell, and a pair of regional indicators makes one flag.
+// Control characters are skipped. Returns the columns used.
+export fn tui_put_clip(b: TuiBuf*, x: int32, y: int32, s: string, max_w: int32, st: TuiStyle) -> int32 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var col: int32 = 0;
+  var last_x: int32 = -1;   // cell of the last grapheme, for joining
+  var join_next: bool = false;
+  var ri_open: bool = false;
+  while (i < n) {
+    var cp: int32 = 0;
+    var start: int64 = i;
+    var len: int64 = tui_utf8_next(s.chars, n, i, &cp);
+    i = i + len;
+    var w: int32 = tui_cp_width(cp);
+    if (w < 0) { join_next = false; ri_open = false; continue; }
+    var joins: bool = w == 0 || join_next;
+    if (tui_is_regional(cp) && ri_open) { joins = true; }
+    if (joins && last_x >= 0) {
+      var c: TuiCell* = tui_buf_cell(b, last_x, y);
+      if (c != 0 && (int64)c->len + len <= (int64)TUI_CELL_BYTES) {
+        for k: int64 in 0..len { c->text[(int64)c->len + k] = s.chars[start + k]; }
+        c->len = (uint8)((int64)c->len + len);
+        if (tui_is_regional(cp) && ri_open && c->width == (uint8)1 && col < max_w) {
+          // The flag takes two columns.
+          var r: TuiCell* = tui_buf_cell(b, last_x + 1, y);
+          if (r != 0) {
+            tui_buf_unsplit(b, last_x + 1, y);
+            c->width = (uint8)2;
+            r->len = (uint8)0;
+            r->width = (uint8)0;
+            r->style = st;
+            col = col + 1;
+          }
+        }
+      }
+      join_next = cp == 0x200D;
+      if (tui_is_regional(cp)) { ri_open = false; }
+      continue;
+    }
+    join_next = false;
+    if (w == 0) { continue; }   // a mark with nothing to join
+    if (col + w > max_w) { break; }
+    tui_buf_set(b, x + col, y, s.chars + start, (int32)len, w, st);
+    last_x = x + col;
+    col = col + w;
+    ri_open = tui_is_regional(cp);
+  }
+  return col;
+}
+
+export fn tui_put(b: TuiBuf*, x: int32, y: int32, s: string, st: TuiStyle) -> int32 {
+  return tui_put_clip(b, x, y, s, b->w - x, st);
+}
+
+// Copies src into dst with its top-left corner at (x, y).
+export fn tui_buf_blit(dst: TuiBuf*, src: TuiBuf*, x: int32, y: int32) {
+  for sy in 0..src->h {
+    for sx in 0..src->w {
+      var d: TuiCell* = tui_buf_cell(dst, x + sx, y + sy);
+      if (d != 0) { *d = src->cells[(int64)sy * (int64)src->w + (int64)sx]; }
+    }
+  }
+}
+
+// The text of the buffer, one line per row, each ending in "\n". Trailing
+// spaces stay, so tests can compare exact screens. The caller frees
+// the result's chars.
+export fn tui_buf_text(b: TuiBuf*) -> string {
+  var cap: int64 = (int64)b->w * (int64)b->h * (int64)4 + (int64)b->h + 1;
+  var out: uint8* = (uint8*)malloc(cap);
+  var o: int64 = 0;
+  for y in 0..b->h {
+    for x in 0..b->w {
+      var c: TuiCell* = &b->cells[(int64)y * (int64)b->w + (int64)x];
+      if (c->width == (uint8)0) { continue; }
+      if (o + (int64)c->len + 2 > cap) {
+        cap = cap * 2 + (int64)c->len;
+        out = (uint8*)realloc(out, cap);
+      }
+      for k in 0..(int32)c->len { out[o] = c->text[k]; o = o + 1; }
+    }
+    out[o] = (uint8)10;
+    o = o + 1;
+  }
+  return str_from_bytes((cstring)out, o);
+}
+
+// One row of the buffer as text, without the line end. Caller frees.
+export fn tui_buf_row(b: TuiBuf*, y: int32) -> string {
+  var cap: int64 = (int64)b->w * (int64)TUI_CELL_BYTES + 1;
+  var out: uint8* = (uint8*)malloc(cap);
+  var o: int64 = 0;
+  if (y >= 0 && y < b->h) {
+    for x in 0..b->w {
+      var c: TuiCell* = &b->cells[(int64)y * (int64)b->w + (int64)x];
+      if (c->width == (uint8)0) { continue; }
+      for k in 0..(int32)c->len { out[o] = c->text[k]; o = o + 1; }
+    }
+  }
+  return str_from_bytes((cstring)out, o);
+}

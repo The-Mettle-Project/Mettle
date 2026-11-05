@@ -1,0 +1,291 @@
+// FontAtlas: packs rasterised glyphs into one texture for GPU text.
+//
+// Packing is the skyline bottom-left method of stb_rect_pack (also used by
+// fontstash): the atlas keeps the height of its top edge as a list of
+// segments, and each glyph goes where it ends lowest. Glyphs are cached by
+// (face, glyph, size, sub-pixel step, kind). When the atlas is full it
+// doubles in height up to max_h; past that font_atlas_glyph returns null
+// and the caller can font_atlas_clear() and start over.
+
+import "std/mem";
+import "std/math";
+import "font/core/vec";
+import "font/sfnt/face";
+import "font/outline/path";
+import "font/outline/outline";
+import "font/raster/raster";
+import "font/raster/sdf";
+
+export const FONT_ATLAS_COVERAGE: int32 = 0;   // anti-aliased coverage, 1 byte
+export const FONT_ATLAS_SDF: int32 = 1;        // signed distance, 1 byte
+export const FONT_ATLAS_MSDF: int32 = 2;       // multi-channel distance, 3 bytes
+
+/// Where a glyph sits in the atlas. Draw the w x h rectangle at
+/// (pen_x + bx, baseline_y + by), sampling texture rect (u0, v0)-(u1, v1).
+export struct FontAtlasGlyph {
+  x: int32; y: int32; w: int32; h: int32;   // atlas pixels
+  bx: int32; by: int32;                     // offset from the pen, y down
+  u0: float32; v0: float32; u1: float32; v1: float32;
+}
+
+struct Node { x: int32; y: int32; w: int32; }
+struct Slot { key: uint64; used: bool; g: FontAtlasGlyph; f: FontFace*; glyph: int32; size: int32; sub: int32; kind: int32; }
+
+export struct FontAtlas {
+  w: int32; h: int32; max_h: int32;
+  ch: int32;                 // bytes per pixel: 1, or 3 for MSDF atlases
+  pixels: uint8*;
+  nodes: FontVec<Node>;
+  slots: FontVec<Slot>;      // open-addressed cache, size a power of two
+  count: int64;
+  spread: float32;           // SDF/MSDF range in pixels
+  // Area changed since font_atlas_clean, to upload to the GPU.
+  dirty_x0: int32; dirty_y0: int32; dirty_x1: int32; dirty_y1: int32;
+  resized: bool;             // the texture grew; upload all of it
+}
+
+fn reset_nodes(a: FontAtlas*) {
+  a->nodes.len = 0;
+  var n: Node;
+  n.x = 0; n.y = 0; n.w = a->w;
+  font_vec_push<Node>(&a->nodes, n);
+}
+
+/// Sets up an empty atlas w x h pixels that may grow to max_h rows.
+/// `ch` is 1 for coverage and SDF atlases, 3 for MSDF. Returns false when
+/// out of memory.
+export fn font_atlas_init(a: FontAtlas*, w: int32, h: int32, max_h: int32, ch: int32) -> bool {
+  var zero: FontAtlas;
+  *a = zero;
+  if (w <= 0 || h <= 0 || (ch != 1 && ch != 3)) { return false; }
+  a->w = w; a->h = h; a->max_h = max_h;
+  if (a->max_h < h) { a->max_h = h; }
+  a->ch = ch;
+  a->spread = 4.0;
+  a->pixels = (uint8*)alloc_zeroed((int64)w * (int64)h * (int64)ch);
+  if (a->pixels == 0) { return false; }
+  reset_nodes(a);
+  a->slots.data = (Slot*)alloc_zeroed(256 * sizeof(Slot));
+  if (a->slots.data == 0) { return false; }
+  a->slots.len = 256;
+  a->slots.cap = 256;
+  a->dirty_x0 = w; a->dirty_y0 = h; a->dirty_x1 = 0; a->dirty_y1 = 0;
+  return true;
+}
+
+/// Frees the atlas.
+export fn font_atlas_free(a: FontAtlas*) {
+  if (a->pixels != 0) { free(a->pixels); }
+  a->pixels = (uint8*)0;
+  font_vec_free<Node>(&a->nodes);
+  font_vec_free<Slot>(&a->slots);
+}
+
+/// Forgets every glyph and clears the pixels (the size stays).
+export fn font_atlas_clear(a: FontAtlas*) {
+  mem_zero(a->pixels, (int64)a->w * (int64)a->h * (int64)a->ch);
+  reset_nodes(a);
+  for i: int64 in 0..a->slots.len { a->slots.data[i].used = false; }
+  a->count = 0;
+  a->dirty_x0 = 0; a->dirty_y0 = 0; a->dirty_x1 = a->w; a->dirty_y1 = a->h;
+}
+
+/// Marks the dirty area as uploaded.
+export fn font_atlas_clean(a: FontAtlas*) {
+  a->dirty_x0 = a->w; a->dirty_y0 = a->h; a->dirty_x1 = 0; a->dirty_y1 = 0;
+  a->resized = false;
+}
+
+// Lowest y at which a rectangle of width w fits starting at node i, or -1.
+fn fit(a: FontAtlas*, i: int64, w: int32) -> int32 {
+  var x: int32 = a->nodes.data[i].x;
+  if (x + w > a->w) { return -1; }
+  var left: int32 = w;
+  var y: int32 = 0;
+  var k: int64 = i;
+  while (left > 0) {
+    if (k >= a->nodes.len) { return -1; }
+    if (a->nodes.data[k].y > y) { y = a->nodes.data[k].y; }
+    left = left - a->nodes.data[k].w;
+    k = k + 1;
+  }
+  return y;
+}
+
+// Finds room for w x h; writes the position. False when it does not fit.
+fn pack(a: FontAtlas*, w: int32, h: int32, ox: int32*, oy: int32*) -> bool {
+  var best: int64 = -1;
+  var by: int32 = 0;
+  var bw: int32 = 0;
+  for i: int64 in 0..a->nodes.len {
+    var y: int32 = fit(a, i, w);
+    if (y < 0 || y + h > a->h) { continue; }
+    if (best < 0 || y < by || (y == by && a->nodes.data[i].w < bw)) {
+      best = i; by = y; bw = a->nodes.data[i].w;
+    }
+  }
+  if (best < 0) { return false; }
+  var x: int32 = a->nodes.data[best].x;
+  // Insert the new top edge and trim the nodes it covers.
+  var n: Node;
+  n.x = x; n.y = by + h; n.w = w;
+  if (!font_vec_push<Node>(&a->nodes, n)) { return false; }
+  var i: int64 = a->nodes.len - 1;
+  while (i > best) { a->nodes.data[i] = a->nodes.data[i - 1]; i = i - 1; }
+  a->nodes.data[best] = n;
+  i = best + 1;
+  while (i < a->nodes.len) {
+    var cur: Node* = &a->nodes.data[i];
+    var prev: Node* = &a->nodes.data[i - 1];
+    if (cur->x >= prev->x + prev->w) { break; }
+    var shrink: int32 = prev->x + prev->w - cur->x;
+    cur->x = cur->x + shrink;
+    cur->w = cur->w - shrink;
+    if (cur->w > 0) { break; }
+    for k: int64 in i..a->nodes.len - 1 { a->nodes.data[k] = a->nodes.data[k + 1]; }
+    a->nodes.len = a->nodes.len - 1;
+  }
+  // Merge neighbours of the same height.
+  i = 0;
+  while (i + 1 < a->nodes.len) {
+    if (a->nodes.data[i].y == a->nodes.data[i + 1].y) {
+      a->nodes.data[i].w = a->nodes.data[i].w + a->nodes.data[i + 1].w;
+      for k: int64 in i + 1..a->nodes.len - 1 { a->nodes.data[k] = a->nodes.data[k + 1]; }
+      a->nodes.len = a->nodes.len - 1;
+    } else {
+      i = i + 1;
+    }
+  }
+  *ox = x;
+  *oy = by;
+  return true;
+}
+
+fn grow(a: FontAtlas*) -> bool {
+  if (a->h >= a->max_h) { return false; }
+  var nh: int32 = a->h * 2;
+  if (nh > a->max_h) { nh = a->max_h; }
+  var old: int64 = (int64)a->w * (int64)a->h * (int64)a->ch;
+  var np: uint8* = (uint8*)realloc(a->pixels, (int64)a->w * (int64)nh * (int64)a->ch);
+  if (np == 0) { return false; }
+  mem_zero(np + old, (int64)a->w * (int64)(nh - a->h) * (int64)a->ch);
+  a->pixels = np;
+  a->h = nh;
+  a->resized = true;
+  // Texture coordinates of cached glyphs change with the height.
+  for i: int64 in 0..a->slots.len {
+    var s: Slot* = &a->slots.data[i];
+    if (s->used) {
+      s->g.v0 = (float32)s->g.y / (float32)nh;
+      s->g.v1 = (float32)(s->g.y + s->g.h) / (float32)nh;
+    }
+  }
+  return true;
+}
+
+fn hash_key(f: FontFace*, g: int32, size: int32, sub: int32, kind: int32) -> uint64 {
+  var h: uint64 = 1469598103934665603;
+  h = (h ^ (uint64)(uint32)f->upem) * 1099511628211;
+  h = (h ^ (uint64)(uint32)f->num_glyphs) * 1099511628211;
+  h = (h ^ (uint64)(uint32)g) * 1099511628211;
+  h = (h ^ (uint64)(uint32)size) * 1099511628211;
+  h = (h ^ (uint64)(uint32)sub) * 1099511628211;
+  h = (h ^ (uint64)(uint32)kind) * 1099511628211;
+  return h ^ (h >> 29);
+}
+
+fn find(a: FontAtlas*, key: uint64, f: FontFace*, g: int32, size: int32, sub: int32, kind: int32) -> int64 {
+  var mask: int64 = a->slots.len - 1;
+  var i: int64 = (int64)(key & (uint64)mask);
+  while (a->slots.data[i].used) {
+    var s: Slot* = &a->slots.data[i];
+    if (s->key == key && s->f == f && s->glyph == g && s->size == size && s->sub == sub && s->kind == kind) { return i; }
+    i = (i + 1) & mask;
+  }
+  return -1 - i;   // free slot, encoded
+}
+
+fn rehash(a: FontAtlas*) -> bool {
+  var old: Slot* = a->slots.data;
+  var oldn: int64 = a->slots.len;
+  var fresh: Slot* = (Slot*)alloc_zeroed(oldn * 2 * sizeof(Slot));
+  if (fresh == 0) { return false; }
+  a->slots.data = fresh;
+  a->slots.len = oldn * 2;
+  a->slots.cap = oldn * 2;
+  for i: int64 in 0..oldn {
+    if (!old[i].used) { continue; }
+    var r: int64 = find(a, old[i].key, old[i].f, old[i].glyph, old[i].size, old[i].sub, old[i].kind);
+    var at: int64 = -1 - r;
+    a->slots.data[at] = old[i];
+  }
+  free((rawptr)old);
+  return true;
+}
+
+/// Returns glyph g of face f at `px` pixels per em in the atlas, drawing
+/// and packing it on first use. `sub` (0..3) shifts the glyph right by
+/// sub/4 pixel for sub-pixel positioning (coverage atlases). `kind` is
+/// FONT_ATLAS_*. Returns null when the atlas is full or on bad input. The
+/// face must stay at the same address while its glyphs are cached. The
+/// returned pointer stays valid until the next call (copy the entry to keep
+/// it).
+export fn font_atlas_glyph(a: FontAtlas*, f: FontFace*, g: int32, px: float32, sub: int32, kind: int32) -> FontAtlasGlyph* {
+  if (a->pixels == 0 || px <= 0.0 || px > 2048.0) { return (FontAtlasGlyph*)0; }
+  if ((kind == FONT_ATLAS_MSDF) != (a->ch == 3)) { return (FontAtlasGlyph*)0; }
+  var size: int32 = (int32)(px * 64.0 + 0.5);   // 1/64 pixel steps
+  var sb: int32 = sub & 3;
+  var key: uint64 = hash_key(f, g, size, sb, kind);
+  var r: int64 = find(a, key, f, g, size, sb, kind);
+  if (r >= 0) { return &a->slots.data[r].g; }
+  // Draw it.
+  var b: FontBitmap;
+  var p: FontPath;
+  var s: float32 = px / (float32)f->upem;
+  var ok: bool = font_glyph_path(f, g, &p);
+  b.w = 0; b.h = 0; b.x = 0; b.y = 0; b.data = (uint8*)0;
+  if (ok && p.cmds.len > 0) {
+    if (kind == FONT_ATLAS_SDF) { ok = font_path_sdf(&p, s, s, (float32)sb * 0.25, 0.0, a->spread, &b); }
+    else if (kind == FONT_ATLAS_MSDF) { ok = font_path_msdf(&p, s, s, (float32)sb * 0.25, 0.0, a->spread, &b); }
+    else { ok = font_path_bitmap(&p, s, s, (float32)sb * 0.25, 0.0, &b); }
+  }
+  font_path_free(&p);
+  if (!ok) { font_bitmap_free(&b); return (FontAtlasGlyph*)0; }
+  var e: FontAtlasGlyph;
+  e.bx = b.x; e.by = b.y; e.w = b.w; e.h = b.h;
+  if (b.w > 0 && b.h > 0) {
+    // One pixel of gap so bilinear filtering never reads a neighbour.
+    var x: int32 = 0;
+    var y: int32 = 0;
+    while (!pack(a, b.w + 1, b.h + 1, &x, &y)) {
+      if (!grow(a)) { font_bitmap_free(&b); return (FontAtlasGlyph*)0; }
+    }
+    e.x = x; e.y = y;
+    var ch: int64 = (int64)a->ch;
+    for row in 0..b.h {
+      var dst: uint8* = a->pixels + ((int64)(y + row) * (int64)a->w + (int64)x) * ch;
+      var src: uint8* = b.data + (int64)row * (int64)b.w * ch;
+      mem_copy(dst, src, (int64)b.w * ch);
+    }
+    if (x < a->dirty_x0) { a->dirty_x0 = x; }
+    if (y < a->dirty_y0) { a->dirty_y0 = y; }
+    if (x + b.w > a->dirty_x1) { a->dirty_x1 = x + b.w; }
+    if (y + b.h > a->dirty_y1) { a->dirty_y1 = y + b.h; }
+  }
+  font_bitmap_free(&b);
+  e.u0 = (float32)e.x / (float32)a->w;
+  e.v0 = (float32)e.y / (float32)a->h;
+  e.u1 = (float32)(e.x + e.w) / (float32)a->w;
+  e.v1 = (float32)(e.y + e.h) / (float32)a->h;
+  if ((a->count + 1) * 2 > a->slots.len) {
+    if (!rehash(a)) { return (FontAtlasGlyph*)0; }
+  }
+  r = find(a, key, f, g, size, sb, kind);
+  var at: int64 = -1 - r;
+  var slot: Slot* = a->slots.data + at;
+  slot->used = true;
+  slot->key = key; slot->f = f; slot->glyph = g; slot->size = size; slot->sub = sb; slot->kind = kind;
+  slot->g = e;
+  a->count = a->count + 1;
+  return &slot->g;
+}

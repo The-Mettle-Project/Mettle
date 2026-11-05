@@ -1,0 +1,1149 @@
+// Curve25519 and Ed25519 in pure Mettle: the arithmetic behind X25519
+// (RFC 7748) and Ed25519 (RFC 8032 section 5.1). Internal: used by kx.mettle
+// and sign.mettle.
+//
+// Ported from Monocypher 4.0.3 (src/monocypher.c, curve and scalar code),
+// Copyright (c) Loup Vaillant and contributors, BSD-2-Clause / CC0; see
+// NOTICE. The field code is the ref10 design Monocypher uses: a field element
+// is ten limbs of 25.5 bits (int32[10], radix 2^25.5) with int64 products and
+// signed carries; points are in extended coordinates (a group element is
+// int32[40]: X, Y, Z, T); the X25519 ladder is the Montgomery ladder; the
+// fixed base multiplication is Monocypher's twin signed 4-bit combs over two
+// precomputed tables; verification uses sliding windows (width 3 for the
+// public key, width 5 over a precomputed table for the base point); scalars
+// mod L use Monocypher's 32-bit word arithmetic and Barrett reduction.
+//
+// Not ported: Monocypher hashes EdDSA with BLAKE2b. This is Ed25519 as RFC
+// 8032 says, with SHA-512, so the hashing and the message flow of sign and
+// verify are cryptex's own; only the group and scalar arithmetic is
+// Monocypher's.
+//
+// Constant time: everything that touches a scalar or a key (the X25519
+// ladder, the base multiplication, the scalar arithmetic in signing, key
+// generation) is a fixed sequence of operations with masked swaps and table
+// reads; no branch, loop bound or index depends on secret data. Signature
+// verification works on public data only and is variable time (the sliding
+// windows, the point decoding and the small-order tests).
+
+import "cryptex/core/status";
+import "cryptex/core/util";
+import "cryptex/hash/sha2";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// sqrt(-1) mod p.
+var g_crx_c25_sqrtm1: int32[10] = [
+  -32595792, -7943725, 9377950, 3500415, 12389472,
+  -272473, -25146209, -2005654, 326686, 11406482
+];
+// d = -121665 / 121666.
+var g_crx_c25_d: int32[10] = [
+  -10913610, 13857413, -15372611, 6949391, 114729,
+  -8787816, -6275908, -3247719, -18696448, -12055116
+];
+// D2 = 2 * d.
+var g_crx_c25_d2: int32[10] = [
+  -21827239, -5839606, -30745221, 13898782, 229458,
+  15978800, -12551817, -6495438, 29715968, 9444199
+];
+
+// The group order L, little-endian 32-bit words.
+var g_crx_c25_l: uint32[8] = [
+  (uint32)0x5cf5d3ed, (uint32)0x5812631a, (uint32)0xa2f79cd6, (uint32)0x14def9de,
+  0, 0, 0, (uint32)0x10000000
+];
+
+// Barrett constant for the reduction mod L.
+var g_crx_c25_barrett: uint32[9] = [
+  (uint32)0x0a2c131b, (uint32)0xed9ce5a3, (uint32)0x086329a7, (uint32)0x2106215d,
+  (uint32)0xffffffeb, (uint32)0xffffffff, (uint32)0xffffffff, (uint32)0xffffffff, 0xf
+];
+
+// 1 / 2 modulo L, little-endian bytes.
+var g_crx_c25_half_mod_l: uint8[32] = [
+  247, 233, 122, 46, 141, 49, 9, 44, 107, 206, 123, 81, 239, 124, 111, 10,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8
+];
+// (2^256 - 1) / 2 modulo L, little-endian bytes.
+var g_crx_c25_half_ones: uint8[32] = [
+  142, 74, 204, 70, 186, 24, 118, 107, 184, 231, 190, 57, 250, 173, 119, 99,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 7
+];
+
+// Encodings of the points of order dividing 8 (y coordinate, sign bit
+// ignored): 0, 1, the two order-8 y values, p-1, p and p+1 (the last two are
+// the non-canonical encodings of 0 and 1).
+var g_crx_c25_small: uint8[224] = [
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
+  0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+  0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+  0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+  0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f
+];
+
+// Point layouts (ten int32 limbs per field element):
+//   ge         (int32[40]): X at 0, Y at 10, Z at 20, T at 30
+//   ge_cached  (int32[40]): Yp = Y+X at 0, Ym = Y-X at 10, Z at 20, T2 at 30
+//   ge_precomp (int32[30]): Yp at 0, Ym at 10, T2 at 20 (Z = 1)
+// The three tables below hold eight ge_precomp entries each (240 limbs).
+
+// 5-bit signed window, 8 entries of Yp, Ym, T2 (10 limbs each) (Monocypher b_window).
+var g_crx_c25_bwin: int32[240] = [
+  25967493, -14356035, 29566456, 3660896, -12694345, 4014787, 27544626, -11754271, -6079156, 2047605,
+  -12545711, 934262, -2722910, 3049990, -727428, 9406986, 12720692, 5043384, 19500929, -15469378,
+  -8738181, 4489570, 9688441, -14785194, 10184609, -12363380, 29287919, 11864899, -24514362, -4438546,
+  15636291, -9688557, 24204773, -7912398, 616977, -16685262, 27787600, -14772189, 28944400, -1550024,
+  16568933, 4717097, -11556148, -1102322, 15682896, -11807043, 16354577, -11775962, 7689662, 11199574,
+  30464156, -5976125, -11779434, -15670865, 23220365, 15915852, 7512774, 10017326, -17749093, -9920357,
+  10861363, 11473154, 27284546, 1981175, -30064349, 12577861, 32867885, 14515107, -15438304, 10819380,
+  4708026, 6336745, 20377586, 9066809, -11272109, 6594696, -25653668, 12483688, -12668491, 5581306,
+  19563160, 16186464, -29386857, 4097519, 10237984, -4348115, 28542350, 13850243, -23678021, -15815942,
+  5153746, 9909285, 1723747, -2777874, 30523605, 5516873, 19480852, 5230134, -23952439, -15175766,
+  -30269007, -3463509, 7665486, 10083793, 28475525, 1649722, 20654025, 16520125, 30598449, 7715701,
+  28881845, 14381568, 9657904, 3680757, -20181635, 7843316, -31400660, 1370708, 29794553, -1409300,
+  -22518993, -6692182, 14201702, -8745502, -23510406, 8844726, 18474211, -1361450, -13062696, 13821877,
+  -6455177, -7839871, 3374702, -4740862, -27098617, -10571707, 31655028, -7212327, 18853322, -14220951,
+  4566830, -12963868, -28974889, -12240689, -7602672, -2830569, -8514358, -10431137, 2207753, -3209784,
+  -25154831, -4185821, 29681144, 7868801, -6854661, -9423865, -12437364, -663000, -31111463, -16132436,
+  25576264, -2703214, 7349804, -11814844, 16472782, 9300885, 3844789, 15725684, 171356, 6466918,
+  23103977, 13316479, 9739013, -16149481, 817875, -15038942, 8965339, -14088058, -30714912, 16193877,
+  -33521811, 3180713, -2394130, 14003687, -16903474, -16270840, 17238398, 4729455, -18074513, 9256800,
+  -25182317, -4174131, 32336398, 5036987, -21236817, 11360617, 22616405, 9761698, -19827198, 630305,
+  -13720693, 2639453, -24237460, -7406481, 9494427, -5774029, -6554551, -15960994, -2449256, -14291300,
+  -3151181, -5046075, 9282714, 6866145, -31907062, -863023, -18940575, 15033784, 25105118, -7894876,
+  -24326370, 15950226, -31801215, -14592823, -11662737, -5090925, 1573892, -2625887, 2198790, -15804619,
+  -3099351, 10324967, -2241613, 7453183, -5446979, -2735503, -13812022, -16236442, -32461234, -12290683
+];
+
+// 5-bit signed comb, low half (Monocypher b_comb_low).
+var g_crx_c25_comb_low: int32[240] = [
+  -6816601, -2324159, -22559413, 124364, 18015490, 8373481, 19993724, 1979872, -18549925, 9085059,
+  10306321, 403248, 14839893, 9633706, 8463310, -8354981, -14305673, 14668847, 26301366, 2818560,
+  -22701500, -3210264, -13831292, -2927732, -16326337, -14016360, 12940910, 177905, 12165515, -2397893,
+  -12282262, -7022066, 9920413, -3064358, -32147467, 2927790, 22392436, -14852487, 2719975, 16402117,
+  -7236961, -4729776, 2685954, -6525055, -24242706, -15940211, -6238521, 14082855, 10047669, 12228189,
+  -30495588, -12893761, -11161261, 3539405, -11502464, 16491580, -27286798, -15030530, -7272871, -15934455,
+  17650926, 582297, -860412, -187745, -12072900, -10683391, -20352381, 15557840, -31072141, -5019061,
+  -6283632, -2259834, -4674247, -4598977, -4089240, 12435688, -31278303, 1060251, 6256175, 10480726,
+  -13871026, 2026300, -21928428, -2741605, -2406664, -8034988, 7355518, 15733500, -23379862, 7489131,
+  6883359, 695140, 23196907, 9644202, -33430614, 11354760, -20134606, 6388313, -8263585, -8491918,
+  -7716174, -13605463, -13646110, 14757414, -19430591, -14967316, 10359532, -11059670, -21935259, 12082603,
+  -11253345, -15943946, 10046784, 5414629, 24840771, 8086951, -6694742, 9868723, 15842692, -16224787,
+  9639399, 11810955, -24007778, -9320054, 3912937, -9856959, 996125, -8727907, -8919186, -14097242,
+  7248867, 14468564, 25228636, -8795035, 14346339, 8224790, 6388427, -7181107, 6468218, -8720783,
+  15513115, 15439095, 7342322, -10157390, 18005294, -7265713, 2186239, 4884640, 10826567, 7135781,
+  -14204238, 5297536, -5862318, -6004934, 28095835, 4236101, -14203318, 1958636, -16816875, 3837147,
+  -5511166, -13176782, -29588215, 12339465, 15325758, -15945770, -8813185, 11075932, -19608050, -3776283,
+  11728032, 9603156, -4637821, -5304487, -7827751, 2724948, 31236191, -16760175, -7268616, 14799772,
+  -28842672, 4840636, -12047946, -9101456, -1445464, 381905, -30977094, -16523389, 1290540, 12798615,
+  27246947, -10320914, 14792098, -14518944, 5302070, -8746152, -3403974, -4149637, -27061213, 10749585,
+  25572375, -6270368, -15353037, 16037944, 1146292, 32198, 23487090, 9585613, 24714571, -1418265,
+  19844825, 282124, -17583147, 11004019, -32004269, -2716035, 6105106, -1711007, -21010044, 14338445,
+  8027505, 8191102, -18504907, -12335737, 25173494, -5923905, 15446145, 7483684, -30440441, 10009108,
+  -14134701, -4174411, 10246585, -14677495, 33553567, -14012935, 23366126, 15080531, -7969992, 7663473
+];
+
+// 5-bit signed comb, high half (Monocypher b_comb_high).
+var g_crx_c25_comb_high: int32[240] = [
+  33055887, -4431773, -521787, 6654165, 951411, -6266464, -5158124, 6995613, -5397442, -6985227,
+  4014062, 6967095, -11977872, 3960002, 8001989, 5130302, -2154812, -1899602, -31954493, -16173976,
+  16271757, -9212948, 23792794, 731486, -25808309, -3546396, 6964344, -4767590, 10976593, 10050757,
+  2533007, -4288439, -24467768, -12387405, -13450051, 14542280, 12876301, 13893535, 15067764, 8594792,
+  20073501, -11623621, 3165391, -13119866, 13188608, -11540496, -10751437, -13482671, 29588810, 2197295,
+  -1084082, 11831693, 6031797, 14062724, 14748428, -8159962, -20721760, 11742548, 31368706, 13161200,
+  2050412, -6457589, 15321215, 5273360, 25484180, 124590, -18187548, -7097255, -6691621, -14604792,
+  9938196, 2162889, -6158074, -1711248, 4278932, -2598531, -22865792, -7168500, -24323168, 11746309,
+  -22691768, -14268164, 5965485, 9383325, 20443693, 5854192, 28250679, -1381811, -10837134, 13717818,
+  -8495530, 16382250, 9548884, -4971523, -4491811, -3902147, 6182256, -12832479, 26628081, 10395408,
+  27329048, -15853735, 7715764, 8717446, -9215518, -14633480, 28982250, -5668414, 4227628, 242148,
+  -13279943, -7986904, -7100016, 8764468, -27276630, 3096719, 29678419, -9141299, 3906709, 11265498,
+  11918285, 15686328, -17757323, -11217300, -27548967, 4853165, -27168827, 6807359, 6871949, -1075745,
+  -29002610, 13984323, -27111812, -2713442, 28107359, -13266203, 6155126, 15104658, 3538727, -7513788,
+  14103158, 11233913, -33165269, 9279850, 31014152, 4335090, -1827936, 4590951, 13960841, 12787712,
+  1469134, -16738009, 33411928, 13942824, 8092558, -8778224, -11165065, 1437842, 22521552, -2792954,
+  31352705, -4807352, -25327300, 3962447, 12541566, -9399651, -27425693, 7964818, -23829869, 5541287,
+  -25732021, -6864887, 23848984, 3039395, -9147354, 6022816, -27421653, 10590137, 25309915, -1584678,
+  -22951376, 5048948, 31139401, -190316, -19542447, -626310, -17486305, -16511925, -18851313, -12985140,
+  -9684890, 14681754, 30487568, 7717771, -10829709, 9630497, 30290549, -10531496, -27798994, -13812825,
+  5827835, 16097107, -24501327, 12094619, 7413972, 11447087, 28057551, -1793987, -14056981, 4359312,
+  26323183, 2342588, -21887793, -1623758, -6062284, 2107090, -28724907, 9036464, -19618351, -13055189,
+  -29697200, 14829398, -4596333, 14220089, -30022969, 2955645, 12094100, -13693652, -5941445, 7047569,
+  -3201977, 14413268, -12058324, -16417589, -9035655, -7224648, 9258160, 1399236, 30397584, -5684634
+];
+
+// ---------------------------------------------------------------------------
+// Byte helpers
+// ---------------------------------------------------------------------------
+
+@inline fn crx_c25_ld24(s: uint8*) -> uint32 {
+  return (uint32)s[0] | ((uint32)s[1] << 8) | ((uint32)s[2] << 16);
+}
+
+@inline fn crx_c25_ld32(s: uint8*) -> uint32 {
+  return (uint32)s[0] | ((uint32)s[1] << 8) | ((uint32)s[2] << 16) | ((uint32)s[3] << 24);
+}
+
+@inline fn crx_c25_st32(s: uint8*, v: uint32) {
+  s[0] = (uint8)(v & 255);
+  s[1] = (uint8)((v >> 8) & 255);
+  s[2] = (uint8)((v >> 16) & 255);
+  s[3] = (uint8)((v >> 24) & 255);
+}
+
+// 0 if the 32 bytes are equal, -1 if not; constant time.
+fn crx_c25_verify32(a: uint8*, b: uint8*) -> int32 {
+  var diff: uint32 = 0;
+  for i in 0..32 { diff = diff | (uint32)(a[i] ^ b[i]); }
+  return (int32)(((diff - 1) >> 8) & 1) - 1;
+}
+
+// Bit i of a little-endian scalar; 0 for i < 0 (the sliding windows ask for -1).
+@inline fn crx_c25_scalar_bit(s: uint8*, i: int32) -> int32 {
+  if (i < 0) { return 0; }
+  return ((int32)s[i >> 3] >> (i & 7)) & 1;
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic modulo 2^255 - 19
+// ---------------------------------------------------------------------------
+
+fn crx_c25_fe_0(h: int32*) {
+  for i in 0..10 { h[i] = 0; }
+}
+
+fn crx_c25_fe_1(h: int32*) {
+  h[0] = 1;
+  for i in 1..10 { h[i] = 0; }
+}
+
+fn crx_c25_fe_copy(h: int32*, f: int32*) {
+  for i in 0..10 { h[i] = f[i]; }
+}
+
+fn crx_c25_fe_neg(h: int32*, f: int32*) {
+  for i in 0..10 { h[i] = 0 - f[i]; }
+}
+
+fn crx_c25_fe_add(h: int32*, f: int32*, g: int32*) {
+  for i in 0..10 { h[i] = f[i] + g[i]; }
+}
+
+fn crx_c25_fe_sub(h: int32*, f: int32*, g: int32*) {
+  for i in 0..10 { h[i] = f[i] - g[i]; }
+}
+
+// Swaps f and g when b == 1, leaves them when b == 0 (b is 0 or 1, secret).
+// The copy loop is unrolled as in Monocypher.
+fn crx_c25_fe_cswap(f: int32*, g: int32*, b: int32) {
+  var mask: int32 = (int32)0 - b;
+  var x0: int32 = (f[0] ^ g[0]) & mask;  f[0] = f[0] ^ x0;  g[0] = g[0] ^ x0;
+  var x1: int32 = (f[1] ^ g[1]) & mask;  f[1] = f[1] ^ x1;  g[1] = g[1] ^ x1;
+  var x2: int32 = (f[2] ^ g[2]) & mask;  f[2] = f[2] ^ x2;  g[2] = g[2] ^ x2;
+  var x3: int32 = (f[3] ^ g[3]) & mask;  f[3] = f[3] ^ x3;  g[3] = g[3] ^ x3;
+  var x4: int32 = (f[4] ^ g[4]) & mask;  f[4] = f[4] ^ x4;  g[4] = g[4] ^ x4;
+  var x5: int32 = (f[5] ^ g[5]) & mask;  f[5] = f[5] ^ x5;  g[5] = g[5] ^ x5;
+  var x6: int32 = (f[6] ^ g[6]) & mask;  f[6] = f[6] ^ x6;  g[6] = g[6] ^ x6;
+  var x7: int32 = (f[7] ^ g[7]) & mask;  f[7] = f[7] ^ x7;  g[7] = g[7] ^ x7;
+  var x8: int32 = (f[8] ^ g[8]) & mask;  f[8] = f[8] ^ x8;  g[8] = g[8] ^ x8;
+  var x9: int32 = (f[9] ^ g[9]) & mask;  f[9] = f[9] ^ x9;  g[9] = g[9] ^ x9;
+}
+
+// f = g when b == 1, unchanged when b == 0 (b is 0 or 1, secret).
+fn crx_c25_fe_ccopy(f: int32*, g: int32*, b: int32) {
+  var mask: int32 = (int32)0 - b;
+  var x0: int32 = (f[0] ^ g[0]) & mask;  f[0] = f[0] ^ x0;
+  var x1: int32 = (f[1] ^ g[1]) & mask;  f[1] = f[1] ^ x1;
+  var x2: int32 = (f[2] ^ g[2]) & mask;  f[2] = f[2] ^ x2;
+  var x3: int32 = (f[3] ^ g[3]) & mask;  f[3] = f[3] ^ x3;
+  var x4: int32 = (f[4] ^ g[4]) & mask;  f[4] = f[4] ^ x4;
+  var x5: int32 = (f[5] ^ g[5]) & mask;  f[5] = f[5] ^ x5;
+  var x6: int32 = (f[6] ^ g[6]) & mask;  f[6] = f[6] ^ x6;
+  var x7: int32 = (f[7] ^ g[7]) & mask;  f[7] = f[7] ^ x7;
+  var x8: int32 = (f[8] ^ g[8]) & mask;  f[8] = f[8] ^ x8;
+  var x9: int32 = (f[9] ^ g[9]) & mask;  f[9] = f[9] ^ x9;
+}
+
+// Signed carry propagation: writes the ten tN, which must satisfy
+// |t0| < 2^63 and |t1|..|t9| < 2^62, as limbs with |t0|, |t2|, |t4|, |t6|,
+// |t8| < 1.1 * 2^25 and |t1|, |t3|, |t5|, |t7|, |t9| < 1.1 * 2^24.
+@inline fn crx_c25_carry(h: int32*, t0: int64, t1: int64, t2: int64, t3: int64, t4: int64, t5: int64, t6: int64, t7: int64, t8: int64, t9: int64) {
+  var c: int64;
+  c = (t0 + ((int64)1 << 25)) >> 26;  t0 = t0 - c * ((int64)1 << 26);  t1 = t1 + c;
+  c = (t4 + ((int64)1 << 25)) >> 26;  t4 = t4 - c * ((int64)1 << 26);  t5 = t5 + c;
+  c = (t1 + ((int64)1 << 24)) >> 25;  t1 = t1 - c * ((int64)1 << 25);  t2 = t2 + c;
+  c = (t5 + ((int64)1 << 24)) >> 25;  t5 = t5 - c * ((int64)1 << 25);  t6 = t6 + c;
+  c = (t2 + ((int64)1 << 25)) >> 26;  t2 = t2 - c * ((int64)1 << 26);  t3 = t3 + c;
+  c = (t6 + ((int64)1 << 25)) >> 26;  t6 = t6 - c * ((int64)1 << 26);  t7 = t7 + c;
+  c = (t3 + ((int64)1 << 24)) >> 25;  t3 = t3 - c * ((int64)1 << 25);  t4 = t4 + c;
+  c = (t7 + ((int64)1 << 24)) >> 25;  t7 = t7 - c * ((int64)1 << 25);  t8 = t8 + c;
+  c = (t4 + ((int64)1 << 25)) >> 26;  t4 = t4 - c * ((int64)1 << 26);  t5 = t5 + c;
+  c = (t8 + ((int64)1 << 25)) >> 26;  t8 = t8 - c * ((int64)1 << 26);  t9 = t9 + c;
+  c = (t9 + ((int64)1 << 24)) >> 25;  t9 = t9 - c * ((int64)1 << 25);  t0 = t0 + c * 19;
+  c = (t0 + ((int64)1 << 25)) >> 26;  t0 = t0 - c * ((int64)1 << 26);  t1 = t1 + c;
+  h[0] = (int32)t0;  h[1] = (int32)t1;  h[2] = (int32)t2;  h[3] = (int32)t3;  h[4] = (int32)t4;
+  h[5] = (int32)t5;  h[6] = (int32)t6;  h[7] = (int32)t7;  h[8] = (int32)t8;  h[9] = (int32)t9;
+}
+
+// Decodes a field element from 32 little-endian bytes, ignoring the top bit
+// (EdDSA uses it as the sign of x).
+fn crx_c25_fe_frombytes(h: int32*, s: uint8*) {
+  var t0: int64 = (int64)crx_c25_ld32(s);
+  var t1: int64 = (int64)crx_c25_ld24(&s[4]) << 6;
+  var t2: int64 = (int64)crx_c25_ld24(&s[7]) << 5;
+  var t3: int64 = (int64)crx_c25_ld24(&s[10]) << 3;
+  var t4: int64 = (int64)crx_c25_ld24(&s[13]) << 2;
+  var t5: int64 = (int64)crx_c25_ld32(&s[16]);
+  var t6: int64 = (int64)crx_c25_ld24(&s[20]) << 7;
+  var t7: int64 = (int64)crx_c25_ld24(&s[23]) << 5;
+  var t8: int64 = (int64)crx_c25_ld24(&s[26]) << 4;
+  var t9: int64 = (int64)(crx_c25_ld24(&s[29]) & (uint32)0x7fffff) << 2;
+  crx_c25_carry(h, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9);
+}
+
+// Writes the fully reduced value of h as 32 little-endian bytes. Precondition:
+// |h0|, |h2|, |h4|, |h6|, |h8| < 1.1 * 2^25 and |h1|, |h3|, |h5|, |h7|, |h9| <
+// 1.1 * 2^24.
+fn crx_c25_fe_tobytes(s: uint8*, h: int32*) {
+  var t: int32[10];
+  for i in 0..10 { t[i] = h[i]; }
+  var q: int32 = (19 * t[9] + ((int32)1 << 24)) >> 25;
+  for i in 0..5 {
+    q = q + t[2 * i];  q = q >> 26;
+    q = q + t[2 * i + 1];  q = q >> 25;
+  }
+  q = q * 19;
+  for i in 0..5 {
+    t[i * 2] = t[i * 2] + q;  q = t[i * 2] >> 26;  t[i * 2] = t[i * 2] - q * ((int32)1 << 26);
+    t[i * 2 + 1] = t[i * 2 + 1] + q;  q = t[i * 2 + 1] >> 25;  t[i * 2 + 1] = t[i * 2 + 1] - q * ((int32)1 << 25);
+  }
+  crx_c25_st32(&s[0], (uint32)t[0] | ((uint32)t[1] << 26));
+  crx_c25_st32(&s[4], ((uint32)t[1] >> 6) | ((uint32)t[2] << 19));
+  crx_c25_st32(&s[8], ((uint32)t[2] >> 13) | ((uint32)t[3] << 13));
+  crx_c25_st32(&s[12], ((uint32)t[3] >> 19) | ((uint32)t[4] << 6));
+  crx_c25_st32(&s[16], (uint32)t[5] | ((uint32)t[6] << 25));
+  crx_c25_st32(&s[20], ((uint32)t[6] >> 7) | ((uint32)t[7] << 19));
+  crx_c25_st32(&s[24], ((uint32)t[7] >> 13) | ((uint32)t[8] << 12));
+  crx_c25_st32(&s[28], ((uint32)t[8] >> 20) | ((uint32)t[9] << 6));
+  cr_wipe((uint8*)&t[0], 40);
+}
+
+// h = f * g for a small constant g (|g| < 2^31).
+fn crx_c25_fe_mul_small(h: int32*, f: int32*, g: int32) {
+  var t0: int64 = (int64)f[0] * (int64)g;  var t1: int64 = (int64)f[1] * (int64)g;
+  var t2: int64 = (int64)f[2] * (int64)g;  var t3: int64 = (int64)f[3] * (int64)g;
+  var t4: int64 = (int64)f[4] * (int64)g;  var t5: int64 = (int64)f[5] * (int64)g;
+  var t6: int64 = (int64)f[6] * (int64)g;  var t7: int64 = (int64)f[7] * (int64)g;
+  var t8: int64 = (int64)f[8] * (int64)g;  var t9: int64 = (int64)f[9] * (int64)g;
+  crx_c25_carry(h, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9);
+}
+
+// h = f * g. Precondition: |f0|, |f2|, |f4|, |f6|, |f8| < 1.65 * 2^26 and
+// |f1|, |f3|, |f5|, |f7|, |f9| < 1.65 * 2^25, the same for g. h may alias f
+// or g. Everything is unrolled into temporaries, as in Monocypher.
+fn crx_c25_fe_mul(h: int32*, f: int32*, g: int32*) {
+  var f0: int32 = f[0];  var f1: int32 = f[1];  var f2: int32 = f[2];  var f3: int32 = f[3];  var f4: int32 = f[4];
+  var f5: int32 = f[5];  var f6: int32 = f[6];  var f7: int32 = f[7];  var f8: int32 = f[8];  var f9: int32 = f[9];
+  var g0: int32 = g[0];  var g1: int32 = g[1];  var g2: int32 = g[2];  var g3: int32 = g[3];  var g4: int32 = g[4];
+  var g5: int32 = g[5];  var g6: int32 = g[6];  var g7: int32 = g[7];  var g8: int32 = g[8];  var g9: int32 = g[9];
+  var F1: int32 = f1 * 2;  var F3: int32 = f3 * 2;  var F5: int32 = f5 * 2;  var F7: int32 = f7 * 2;  var F9: int32 = f9 * 2;
+  var G1: int32 = g1 * 19;  var G2: int32 = g2 * 19;  var G3: int32 = g3 * 19;
+  var G4: int32 = g4 * 19;  var G5: int32 = g5 * 19;  var G6: int32 = g6 * 19;
+  var G7: int32 = g7 * 19;  var G8: int32 = g8 * 19;  var G9: int32 = g9 * 19;
+  var t0: int64 = (int64)f0 * (int64)g0 + (int64)F1 * (int64)G9 + (int64)f2 * (int64)G8
+      + (int64)F3 * (int64)G7 + (int64)f4 * (int64)G6 + (int64)F5 * (int64)G5
+      + (int64)f6 * (int64)G4 + (int64)F7 * (int64)G3 + (int64)f8 * (int64)G2
+      + (int64)F9 * (int64)G1;
+  var t1: int64 = (int64)f0 * (int64)g1 + (int64)f1 * (int64)g0 + (int64)f2 * (int64)G9
+      + (int64)f3 * (int64)G8 + (int64)f4 * (int64)G7 + (int64)f5 * (int64)G6
+      + (int64)f6 * (int64)G5 + (int64)f7 * (int64)G4 + (int64)f8 * (int64)G3
+      + (int64)f9 * (int64)G2;
+  var t2: int64 = (int64)f0 * (int64)g2 + (int64)F1 * (int64)g1 + (int64)f2 * (int64)g0
+      + (int64)F3 * (int64)G9 + (int64)f4 * (int64)G8 + (int64)F5 * (int64)G7
+      + (int64)f6 * (int64)G6 + (int64)F7 * (int64)G5 + (int64)f8 * (int64)G4
+      + (int64)F9 * (int64)G3;
+  var t3: int64 = (int64)f0 * (int64)g3 + (int64)f1 * (int64)g2 + (int64)f2 * (int64)g1
+      + (int64)f3 * (int64)g0 + (int64)f4 * (int64)G9 + (int64)f5 * (int64)G8
+      + (int64)f6 * (int64)G7 + (int64)f7 * (int64)G6 + (int64)f8 * (int64)G5
+      + (int64)f9 * (int64)G4;
+  var t4: int64 = (int64)f0 * (int64)g4 + (int64)F1 * (int64)g3 + (int64)f2 * (int64)g2
+      + (int64)F3 * (int64)g1 + (int64)f4 * (int64)g0 + (int64)F5 * (int64)G9
+      + (int64)f6 * (int64)G8 + (int64)F7 * (int64)G7 + (int64)f8 * (int64)G6
+      + (int64)F9 * (int64)G5;
+  var t5: int64 = (int64)f0 * (int64)g5 + (int64)f1 * (int64)g4 + (int64)f2 * (int64)g3
+      + (int64)f3 * (int64)g2 + (int64)f4 * (int64)g1 + (int64)f5 * (int64)g0
+      + (int64)f6 * (int64)G9 + (int64)f7 * (int64)G8 + (int64)f8 * (int64)G7
+      + (int64)f9 * (int64)G6;
+  var t6: int64 = (int64)f0 * (int64)g6 + (int64)F1 * (int64)g5 + (int64)f2 * (int64)g4
+      + (int64)F3 * (int64)g3 + (int64)f4 * (int64)g2 + (int64)F5 * (int64)g1
+      + (int64)f6 * (int64)g0 + (int64)F7 * (int64)G9 + (int64)f8 * (int64)G8
+      + (int64)F9 * (int64)G7;
+  var t7: int64 = (int64)f0 * (int64)g7 + (int64)f1 * (int64)g6 + (int64)f2 * (int64)g5
+      + (int64)f3 * (int64)g4 + (int64)f4 * (int64)g3 + (int64)f5 * (int64)g2
+      + (int64)f6 * (int64)g1 + (int64)f7 * (int64)g0 + (int64)f8 * (int64)G9
+      + (int64)f9 * (int64)G8;
+  var t8: int64 = (int64)f0 * (int64)g8 + (int64)F1 * (int64)g7 + (int64)f2 * (int64)g6
+      + (int64)F3 * (int64)g5 + (int64)f4 * (int64)g4 + (int64)F5 * (int64)g3
+      + (int64)f6 * (int64)g2 + (int64)F7 * (int64)g1 + (int64)f8 * (int64)g0
+      + (int64)F9 * (int64)G9;
+  var t9: int64 = (int64)f0 * (int64)g9 + (int64)f1 * (int64)g8 + (int64)f2 * (int64)g7
+      + (int64)f3 * (int64)g6 + (int64)f4 * (int64)g5 + (int64)f5 * (int64)g4
+      + (int64)f6 * (int64)g3 + (int64)f7 * (int64)g2 + (int64)f8 * (int64)g1
+      + (int64)f9 * (int64)g0;
+  crx_c25_carry(h, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9);
+}
+
+// h = f * f, faster than fe_mul. Same precondition on f; h may alias f.
+fn crx_c25_fe_sq(h: int32*, f: int32*) {
+  var f0: int32 = f[0];  var f1: int32 = f[1];  var f2: int32 = f[2];  var f3: int32 = f[3];  var f4: int32 = f[4];
+  var f5: int32 = f[5];  var f6: int32 = f[6];  var f7: int32 = f[7];  var f8: int32 = f[8];  var f9: int32 = f[9];
+  var f0_2: int32 = f0 * 2;  var f1_2: int32 = f1 * 2;  var f2_2: int32 = f2 * 2;  var f3_2: int32 = f3 * 2;
+  var f4_2: int32 = f4 * 2;  var f5_2: int32 = f5 * 2;  var f6_2: int32 = f6 * 2;  var f7_2: int32 = f7 * 2;
+  var f5_38: int32 = f5 * 38;  var f6_19: int32 = f6 * 19;  var f7_38: int32 = f7 * 38;
+  var f8_19: int32 = f8 * 19;  var f9_38: int32 = f9 * 38;
+  var t0: int64 = (int64)f0 * (int64)f0 + (int64)f1_2 * (int64)f9_38 + (int64)f2_2 * (int64)f8_19
+      + (int64)f3_2 * (int64)f7_38 + (int64)f4_2 * (int64)f6_19 + (int64)f5 * (int64)f5_38;
+  var t1: int64 = (int64)f0_2 * (int64)f1 + (int64)f2 * (int64)f9_38 + (int64)f3_2 * (int64)f8_19
+      + (int64)f4 * (int64)f7_38 + (int64)f5_2 * (int64)f6_19;
+  var t2: int64 = (int64)f0_2 * (int64)f2 + (int64)f1_2 * (int64)f1 + (int64)f3_2 * (int64)f9_38
+      + (int64)f4_2 * (int64)f8_19 + (int64)f5_2 * (int64)f7_38 + (int64)f6 * (int64)f6_19;
+  var t3: int64 = (int64)f0_2 * (int64)f3 + (int64)f1_2 * (int64)f2 + (int64)f4 * (int64)f9_38
+      + (int64)f5_2 * (int64)f8_19 + (int64)f6 * (int64)f7_38;
+  var t4: int64 = (int64)f0_2 * (int64)f4 + (int64)f1_2 * (int64)f3_2 + (int64)f2 * (int64)f2
+      + (int64)f5_2 * (int64)f9_38 + (int64)f6_2 * (int64)f8_19 + (int64)f7 * (int64)f7_38;
+  var t5: int64 = (int64)f0_2 * (int64)f5 + (int64)f1_2 * (int64)f4 + (int64)f2_2 * (int64)f3
+      + (int64)f6 * (int64)f9_38 + (int64)f7_2 * (int64)f8_19;
+  var t6: int64 = (int64)f0_2 * (int64)f6 + (int64)f1_2 * (int64)f5_2 + (int64)f2_2 * (int64)f4
+      + (int64)f3_2 * (int64)f3 + (int64)f7_2 * (int64)f9_38 + (int64)f8 * (int64)f8_19;
+  var t7: int64 = (int64)f0_2 * (int64)f7 + (int64)f1_2 * (int64)f6 + (int64)f2_2 * (int64)f5
+      + (int64)f3_2 * (int64)f4 + (int64)f8 * (int64)f9_38;
+  var t8: int64 = (int64)f0_2 * (int64)f8 + (int64)f1_2 * (int64)f7_2 + (int64)f2_2 * (int64)f6
+      + (int64)f3_2 * (int64)f5_2 + (int64)f4 * (int64)f4 + (int64)f9 * (int64)f9_38;
+  var t9: int64 = (int64)f0_2 * (int64)f9 + (int64)f1_2 * (int64)f8 + (int64)f2_2 * (int64)f7
+      + (int64)f3_2 * (int64)f6 + (int64)f4 * (int64)f5_2;
+  crx_c25_carry(h, t0, t1, t2, t3, t4, t5, t6, t7, t8, t9);
+}
+
+// 1 if the fully reduced value of f is odd, 0 if even.
+fn crx_c25_fe_isodd(f: int32*) -> int32 {
+  var s: uint8[32];
+  crx_c25_fe_tobytes(&s[0], f);
+  var isodd: int32 = (int32)(s[0] & 1);
+  cr_wipe(&s[0], 32);
+  return isodd;
+}
+
+// 1 if f == g, 0 if not; constant time.
+fn crx_c25_fe_isequal(f: int32*, g: int32*) -> int32 {
+  var fs: uint8[32];
+  var gs: uint8[32];
+  crx_c25_fe_tobytes(&fs[0], f);
+  crx_c25_fe_tobytes(&gs[0], g);
+  var isdifferent: int32 = crx_c25_verify32(&fs[0], &gs[0]);
+  cr_wipe(&fs[0], 32);
+  cr_wipe(&gs[0], 32);
+  return 1 + isdifferent;
+}
+
+// Inverse square root. Returns 1 if x is a square (or zero), 0 otherwise.
+// After the call:
+//   isr = sqrt(1/x)        if x is a non-zero square,
+//   isr = sqrt(sqrt(-1)/x) if x is not a square,
+//   isr = 0                if x is zero.
+// The sign of the root is not defined. Constant time. isr may alias x.
+fn crx_c25_invsqrt(isr: int32*, x: int32*) -> int32 {
+  var t0: int32[10];
+  var t1: int32[10];
+  var t2: int32[10];
+
+  // t0 = x^((p-5)/8)
+  crx_c25_fe_sq(&t0[0], x);
+  crx_c25_fe_sq(&t1[0], &t0[0]);  crx_c25_fe_sq(&t1[0], &t1[0]);  crx_c25_fe_mul(&t1[0], x, &t1[0]);
+  crx_c25_fe_mul(&t0[0], &t0[0], &t1[0]);
+  crx_c25_fe_sq(&t0[0], &t0[0]);  crx_c25_fe_mul(&t0[0], &t1[0], &t0[0]);
+  crx_c25_fe_sq(&t1[0], &t0[0]);  for i in 1..5 { crx_c25_fe_sq(&t1[0], &t1[0]); }  crx_c25_fe_mul(&t0[0], &t1[0], &t0[0]);
+  crx_c25_fe_sq(&t1[0], &t0[0]);  for i in 1..10 { crx_c25_fe_sq(&t1[0], &t1[0]); }  crx_c25_fe_mul(&t1[0], &t1[0], &t0[0]);
+  crx_c25_fe_sq(&t2[0], &t1[0]);  for i in 1..20 { crx_c25_fe_sq(&t2[0], &t2[0]); }  crx_c25_fe_mul(&t1[0], &t2[0], &t1[0]);
+  crx_c25_fe_sq(&t1[0], &t1[0]);  for i in 1..10 { crx_c25_fe_sq(&t1[0], &t1[0]); }  crx_c25_fe_mul(&t0[0], &t1[0], &t0[0]);
+  crx_c25_fe_sq(&t1[0], &t0[0]);  for i in 1..50 { crx_c25_fe_sq(&t1[0], &t1[0]); }  crx_c25_fe_mul(&t1[0], &t1[0], &t0[0]);
+  crx_c25_fe_sq(&t2[0], &t1[0]);  for i in 1..100 { crx_c25_fe_sq(&t2[0], &t2[0]); }  crx_c25_fe_mul(&t1[0], &t2[0], &t1[0]);
+  crx_c25_fe_sq(&t1[0], &t1[0]);  for i in 1..50 { crx_c25_fe_sq(&t1[0], &t1[0]); }  crx_c25_fe_mul(&t0[0], &t1[0], &t0[0]);
+  crx_c25_fe_sq(&t0[0], &t0[0]);  for i in 1..2 { crx_c25_fe_sq(&t0[0], &t0[0]); }  crx_c25_fe_mul(&t0[0], &t0[0], x);
+
+  // quartic = x^((p-1)/4)
+  var quartic: int32* = &t1[0];
+  crx_c25_fe_sq(quartic, &t0[0]);
+  crx_c25_fe_mul(quartic, quartic, x);
+
+  var check: int32* = &t2[0];
+  crx_c25_fe_0(check);  var z0: int32 = crx_c25_fe_isequal(x, check);
+  crx_c25_fe_1(check);  var p1: int32 = crx_c25_fe_isequal(quartic, check);
+  crx_c25_fe_neg(check, check);  var m1: int32 = crx_c25_fe_isequal(quartic, check);
+  crx_c25_fe_neg(check, &g_crx_c25_sqrtm1[0]);  var ms: int32 = crx_c25_fe_isequal(quartic, check);
+
+  // if quartic == -1 or sqrt(-1)
+  // then  isr = x^((p-1)/4) * sqrt(-1)
+  // else  isr = x^((p-1)/4)
+  crx_c25_fe_mul(isr, &t0[0], &g_crx_c25_sqrtm1[0]);
+  crx_c25_fe_ccopy(isr, &t0[0], 1 - (m1 | ms));
+
+  cr_wipe((uint8*)&t0[0], 40);
+  cr_wipe((uint8*)&t1[0], 40);
+  cr_wipe((uint8*)&t2[0], 40);
+  return p1 | m1 | z0;
+}
+
+// out = 1/x (0 for 0), in terms of the inverse square root: 1/x = x *
+// (invsqrt(x^2))^2. Constant time. out may alias x.
+fn crx_c25_fe_invert(out: int32*, x: int32*) {
+  var tmp: int32[10];
+  crx_c25_fe_sq(&tmp[0], x);
+  crx_c25_invsqrt(&tmp[0], &tmp[0]);
+  crx_c25_fe_sq(&tmp[0], &tmp[0]);
+  crx_c25_fe_mul(out, &tmp[0], x);
+  cr_wipe((uint8*)&tmp[0], 40);
+}
+
+// ---------------------------------------------------------------------------
+// X25519 (RFC 7748 section 5)
+// ---------------------------------------------------------------------------
+
+// Clamps a scalar for multiplication.
+fn crx_c25_trim_scalar(out: uint8*, in: uint8*) {
+  for i in 0..32 { out[i] = in[i]; }
+  out[0] = out[0] & 248;
+  out[31] = out[31] & 127;
+  out[31] = out[31] | 64;
+}
+
+// q = scalar * p on the Montgomery curve (x coordinates only), by the
+// Montgomery ladder over nb_bits bits. Constant time in scalar and p.
+fn crx_c25_scalarmult(q: uint8*, scalar: uint8*, p: uint8*, nb_bits: int32) {
+  var x1: int32[10];
+  crx_c25_fe_frombytes(&x1[0], p);
+
+  var x2: int32[10];
+  var z2: int32[10];
+  var x3: int32[10];
+  var z3: int32[10];
+  var t0: int32[10];
+  var t1: int32[10];
+  // In projective coordinates, to avoid divisions: x = X / Z.
+  crx_c25_fe_1(&x2[0]);  crx_c25_fe_0(&z2[0]);
+  crx_c25_fe_copy(&x3[0], &x1[0]);  crx_c25_fe_1(&z3[0]);
+  var swap: int32 = 0;
+  var pos: int32 = nb_bits - 1;
+  while (pos >= 0) {
+    // constant time conditional swap before the ladder step
+    var b: int32 = crx_c25_scalar_bit(scalar, pos);
+    swap = swap ^ b;
+    crx_c25_fe_cswap(&x2[0], &x3[0], swap);
+    crx_c25_fe_cswap(&z2[0], &z3[0], swap);
+    swap = b;
+
+    // Montgomery ladder step: replaces (P2, P3) by (P2*2, P2+P3) with
+    // differential addition
+    crx_c25_fe_sub(&t0[0], &x3[0], &z3[0]);
+    crx_c25_fe_sub(&t1[0], &x2[0], &z2[0]);
+    crx_c25_fe_add(&x2[0], &x2[0], &z2[0]);
+    crx_c25_fe_add(&z2[0], &x3[0], &z3[0]);
+    crx_c25_fe_mul(&z3[0], &t0[0], &x2[0]);
+    crx_c25_fe_mul(&z2[0], &z2[0], &t1[0]);
+    crx_c25_fe_sq(&t0[0], &t1[0]);
+    crx_c25_fe_sq(&t1[0], &x2[0]);
+    crx_c25_fe_add(&x3[0], &z3[0], &z2[0]);
+    crx_c25_fe_sub(&z2[0], &z3[0], &z2[0]);
+    crx_c25_fe_mul(&x2[0], &t1[0], &t0[0]);
+    crx_c25_fe_sub(&t1[0], &t1[0], &t0[0]);
+    crx_c25_fe_sq(&z2[0], &z2[0]);
+    crx_c25_fe_mul_small(&z3[0], &t1[0], 121666);
+    crx_c25_fe_sq(&x3[0], &x3[0]);
+    crx_c25_fe_add(&t0[0], &t0[0], &z3[0]);
+    crx_c25_fe_mul(&z3[0], &x1[0], &z2[0]);
+    crx_c25_fe_mul(&z2[0], &t1[0], &t0[0]);
+    pos = pos - 1;
+  }
+  // last swap is necessary to compensate for the xor trick
+  crx_c25_fe_cswap(&x2[0], &x3[0], swap);
+  crx_c25_fe_cswap(&z2[0], &z3[0], swap);
+
+  // normalises the coordinates: x == X / Z
+  crx_c25_fe_invert(&z2[0], &z2[0]);
+  crx_c25_fe_mul(&x2[0], &x2[0], &z2[0]);
+  crx_c25_fe_tobytes(q, &x2[0]);
+
+  cr_wipe((uint8*)&x1[0], 40);
+  cr_wipe((uint8*)&x2[0], 40);  cr_wipe((uint8*)&z2[0], 40);  cr_wipe((uint8*)&t0[0], 40);
+  cr_wipe((uint8*)&x3[0], 40);  cr_wipe((uint8*)&z3[0], 40);  cr_wipe((uint8*)&t1[0], 40);
+}
+
+/// internal: X25519(scalar, point): the scalar is clamped as RFC 7748
+/// says; the u-coordinate is read ignoring its top bit. 32 bytes each; out
+/// may alias neither input. Constant time in scalar and point. The result is
+/// all zero for a low-order point (the caller decides what to do).
+export fn crx_x25519(out: uint8*, scalar: uint8*, point: uint8*) {
+  var e: uint8[32];
+  crx_c25_trim_scalar(&e[0], scalar);
+  crx_c25_scalarmult(out, &e[0], point, 255);
+  cr_wipe(&e[0], 32);
+}
+
+/// internal: X25519(scalar, 9): the public key of a secret scalar. out must
+/// not alias scalar.
+export fn crx_x25519_base(out: uint8*, scalar: uint8*) {
+  var nine: uint8[32];
+  nine[0] = 9;
+  crx_x25519(out, scalar, &nine[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic modulo L
+// ---------------------------------------------------------------------------
+
+// p = a * b + p (p has 16 words, a and b 8).
+fn crx_c25_multiply(p: uint32*, a: uint32*, b: uint32*) {
+  for i in 0..8 {
+    var carry: uint64 = 0;
+    for j in 0..8 {
+      carry = carry + (uint64)p[i + j] + (uint64)a[i] * (uint64)b[j];
+      p[i + j] = (uint32)carry;
+      carry = carry >> 32;
+    }
+    p[i + 8] = (uint32)carry;
+  }
+}
+
+// 1 if x >= L, 0 if x < L.
+fn crx_c25_is_above_l(x: uint32*) -> int32 {
+  // We work with L directly, in a 2's complement encoding (-L == ~L + 1).
+  var carry: uint64 = 1;
+  for i in 0..8 {
+    var nl: uint32 = ~g_crx_c25_l[i];
+    carry = carry + (uint64)x[i] + (uint64)nl;
+    carry = carry >> 32;
+  }
+  return (int32)carry;
+}
+
+// Final reduction modulo L, by conditionally removing L:
+// if x < L, then r = x; if L <= x < 2*L, then r = x - L; otherwise the result
+// is wrong. Constant time.
+fn crx_c25_remove_l(r: uint32*, x: uint32*) {
+  var carry: uint64 = (uint64)crx_c25_is_above_l(x);
+  var mask: uint32 = (uint32)0 - (uint32)carry;
+  for i in 0..8 {
+    var nl: uint32 = ~g_crx_c25_l[i];
+    carry = carry + (uint64)x[i] + (uint64)(nl & mask);
+    r[i] = (uint32)carry;
+    carry = carry >> 32;
+  }
+}
+
+// Full reduction modulo L (Barrett reduction) of 16 words to 32 bytes.
+fn crx_c25_mod_l(reduced: uint8*, x: uint32*) {
+  // xr = x * r
+  var xr: uint32[25];
+  for i in 0..9 {
+    var carry: uint64 = 0;
+    for j in 0..16 {
+      carry = carry + (uint64)xr[i + j] + (uint64)g_crx_c25_barrett[i] * (uint64)x[j];
+      xr[i + j] = (uint32)carry;
+      carry = carry >> 32;
+    }
+    xr[i + 16] = (uint32)carry;
+  }
+  // xr = floor(xr / 2^512) * L
+  // Since the result is guaranteed to be below 2*L, it is enough to only
+  // compute the first 256 bits. The division is performed by saying
+  // xr[i+16]. (16 * 32 = 512)
+  for i in 0..8 { xr[i] = 0; }
+  for i in 0..8 {
+    var carry: uint64 = 0;
+    for j in 0..(8 - i) {
+      carry = carry + (uint64)xr[i + j] + (uint64)xr[i + 16] * (uint64)g_crx_c25_l[j];
+      xr[i + j] = (uint32)carry;
+      carry = carry >> 32;
+    }
+  }
+  // xr = x - xr
+  var carry2: uint64 = 1;
+  for i in 0..8 {
+    var nx: uint32 = ~xr[i];
+    carry2 = carry2 + (uint64)x[i] + (uint64)nx;
+    xr[i] = (uint32)carry2;
+    carry2 = carry2 >> 32;
+  }
+  // Final reduction modulo L (conditional subtraction)
+  crx_c25_remove_l(&xr[0], &xr[0]);
+  for i in 0..8 { crx_c25_st32(&reduced[4 * i], xr[i]); }
+
+  cr_wipe((uint8*)&xr[0], 100);
+}
+
+// reduced = expanded (64 little-endian bytes) mod L. reduced may alias
+// expanded.
+fn crx_c25_eddsa_reduce(reduced: uint8*, expanded: uint8*) {
+  var x: uint32[16];
+  for i in 0..16 { x[i] = crx_c25_ld32(&expanded[4 * i]); }
+  crx_c25_mod_l(reduced, &x[0]);
+  cr_wipe((uint8*)&x[0], 64);
+}
+
+// r = (a * b) + c mod L, all 32-byte little-endian. Constant time.
+fn crx_c25_eddsa_mul_add(r: uint8*, a: uint8*, b: uint8*, c: uint8*) {
+  var wa: uint32[8];
+  var wb: uint32[8];
+  var p: uint32[16];
+  for i in 0..8 {
+    wa[i] = crx_c25_ld32(&a[4 * i]);
+    wb[i] = crx_c25_ld32(&b[4 * i]);
+    p[i] = crx_c25_ld32(&c[4 * i]);
+  }
+  for i in 8..16 { p[i] = 0; }
+  crx_c25_multiply(&p[0], &wa[0], &wb[0]);
+  crx_c25_mod_l(r, &p[0]);
+  cr_wipe((uint8*)&p[0], 64);
+  cr_wipe((uint8*)&wa[0], 32);
+  cr_wipe((uint8*)&wb[0], 32);
+}
+
+/// internal: reduces a 64-byte little-endian integer (a SHA-512 output)
+/// modulo the group order L, in place: the 32-byte result is in h[0..32] and
+/// h[32..64] is zeroed.
+export fn crx_ed25519_reduce(h: uint8*) {
+  crx_c25_eddsa_reduce(h, h);
+  for i in 32..64 { h[i] = 0; }
+}
+
+// ---------------------------------------------------------------------------
+// Edwards group (extended coordinates, a = -1)
+// ---------------------------------------------------------------------------
+
+fn crx_c25_ge_zero(p: int32*) {
+  crx_c25_fe_0(&p[0]);
+  crx_c25_fe_1(&p[10]);
+  crx_c25_fe_1(&p[20]);
+  crx_c25_fe_0(&p[30]);
+}
+
+// s = the 32-byte encoding of h: y with the low bit of x in bit 255.
+fn crx_c25_ge_tobytes(s: uint8*, h: int32*) {
+  var recip: int32[10];
+  var x: int32[10];
+  var y: int32[10];
+  crx_c25_fe_invert(&recip[0], &h[20]);
+  crx_c25_fe_mul(&x[0], &h[0], &recip[0]);
+  crx_c25_fe_mul(&y[0], &h[10], &recip[0]);
+  crx_c25_fe_tobytes(s, &y[0]);
+  s[31] = s[31] ^ (uint8)(crx_c25_fe_isodd(&x[0]) << 7);
+
+  cr_wipe((uint8*)&recip[0], 40);
+  cr_wipe((uint8*)&x[0], 40);
+  cr_wipe((uint8*)&y[0], 40);
+}
+
+// h = -s, where s is a point encoded in 32 bytes. 0 on success, -1 if s is
+// not on the curve.
+//
+// Variable time! Inputs must not be secret: use only to check signatures.
+//
+// The encoding of s contains y and the sign of x, with
+//   x = sqrt((y^2 - 1) / (d*y^2 + 1)).
+// In extended coordinates: X = x, Y = y, Z = 1, T = x*y. With
+//   num = y^2 - 1, den = d*y^2 + 1,
+//   isr = invsqrt(num * den)  (not a square: not on the curve),
+//   x   = num * isr,
+// and x is negated if its sign is not the one asked for.
+fn crx_c25_ge_frombytes_neg_vartime(h: int32*, s: uint8*) -> int32 {
+  crx_c25_fe_frombytes(&h[10], s);
+  crx_c25_fe_1(&h[20]);
+  crx_c25_fe_sq(&h[30], &h[10]);
+  crx_c25_fe_mul(&h[0], &h[30], &g_crx_c25_d[0]);
+  crx_c25_fe_sub(&h[30], &h[30], &h[20]);
+  crx_c25_fe_add(&h[0], &h[0], &h[20]);
+  crx_c25_fe_mul(&h[0], &h[30], &h[0]);
+  var is_square: int32 = crx_c25_invsqrt(&h[0], &h[0]);
+  if (is_square == 0) {
+    return -1;
+  }
+  crx_c25_fe_mul(&h[0], &h[30], &h[0]);
+  if (crx_c25_fe_isodd(&h[0]) == (int32)(s[31] >> 7)) {
+    crx_c25_fe_neg(&h[0], &h[0]);
+  }
+  crx_c25_fe_mul(&h[30], &h[0], &h[10]);
+  return 0;
+}
+
+// c = p in cached form.
+fn crx_c25_ge_cache(c: int32*, p: int32*) {
+  crx_c25_fe_add(&c[0], &p[10], &p[0]);
+  crx_c25_fe_sub(&c[10], &p[10], &p[0]);
+  crx_c25_fe_copy(&c[20], &p[20]);
+  crx_c25_fe_mul(&c[30], &p[30], &g_crx_c25_d2[0]);
+}
+
+// s = p + q for a cached q. s may alias p.
+fn crx_c25_ge_add(s: int32*, p: int32*, q: int32*) {
+  var a: int32[10];
+  var b: int32[10];
+  crx_c25_fe_add(&a[0], &p[10], &p[0]);
+  crx_c25_fe_sub(&b[0], &p[10], &p[0]);
+  crx_c25_fe_mul(&a[0], &a[0], &q[0]);
+  crx_c25_fe_mul(&b[0], &b[0], &q[10]);
+  crx_c25_fe_add(&s[10], &a[0], &b[0]);
+  crx_c25_fe_sub(&s[0], &a[0], &b[0]);
+
+  crx_c25_fe_add(&s[20], &p[20], &p[20]);
+  crx_c25_fe_mul(&s[20], &s[20], &q[20]);
+  crx_c25_fe_mul(&s[30], &p[30], &q[30]);
+  crx_c25_fe_add(&a[0], &s[20], &s[30]);
+  crx_c25_fe_sub(&b[0], &s[20], &s[30]);
+
+  crx_c25_fe_mul(&s[30], &s[0], &s[10]);
+  crx_c25_fe_mul(&s[0], &s[0], &b[0]);
+  crx_c25_fe_mul(&s[10], &s[10], &a[0]);
+  crx_c25_fe_mul(&s[20], &a[0], &b[0]);
+}
+
+// s = p - q for a cached q. Internal buffers are not wiped: inputs must not
+// be secret.
+fn crx_c25_ge_sub(s: int32*, p: int32*, q: int32*) {
+  var neg: int32[40];
+  crx_c25_fe_copy(&neg[10], &q[0]);
+  crx_c25_fe_copy(&neg[0], &q[10]);
+  crx_c25_fe_copy(&neg[20], &q[20]);
+  crx_c25_fe_neg(&neg[30], &q[30]);
+  crx_c25_ge_add(s, p, &neg[0]);
+}
+
+// s = p + q for a precomputed q (Z = 1). a and b are scratch. s may alias p.
+fn crx_c25_ge_madd(s: int32*, p: int32*, q: int32*, a: int32*, b: int32*) {
+  crx_c25_fe_add(a, &p[10], &p[0]);
+  crx_c25_fe_sub(b, &p[10], &p[0]);
+  crx_c25_fe_mul(a, a, &q[0]);
+  crx_c25_fe_mul(b, b, &q[10]);
+  crx_c25_fe_add(&s[10], a, b);
+  crx_c25_fe_sub(&s[0], a, b);
+
+  crx_c25_fe_add(&s[20], &p[20], &p[20]);
+  crx_c25_fe_mul(&s[30], &p[30], &q[20]);
+  crx_c25_fe_add(a, &s[20], &s[30]);
+  crx_c25_fe_sub(b, &s[20], &s[30]);
+
+  crx_c25_fe_mul(&s[30], &s[0], &s[10]);
+  crx_c25_fe_mul(&s[0], &s[0], b);
+  crx_c25_fe_mul(&s[10], &s[10], a);
+  crx_c25_fe_mul(&s[20], a, b);
+}
+
+// s = p - q for a precomputed q. Internal buffers are not wiped: inputs must
+// not be secret.
+fn crx_c25_ge_msub(s: int32*, p: int32*, q: int32*, a: int32*, b: int32*) {
+  var neg: int32[30];
+  crx_c25_fe_copy(&neg[10], &q[0]);
+  crx_c25_fe_copy(&neg[0], &q[10]);
+  crx_c25_fe_neg(&neg[20], &q[20]);
+  crx_c25_ge_madd(s, p, &neg[0], a, b);
+}
+
+// s = 2 * p, q is scratch (a point). s may alias p.
+fn crx_c25_ge_double(s: int32*, p: int32*, q: int32*) {
+  crx_c25_fe_sq(&q[0], &p[0]);
+  crx_c25_fe_sq(&q[10], &p[10]);
+  crx_c25_fe_sq(&q[20], &p[20]);
+  crx_c25_fe_mul_small(&q[20], &q[20], 2);
+  crx_c25_fe_add(&q[30], &p[0], &p[10]);
+  crx_c25_fe_sq(&s[30], &q[30]);
+  crx_c25_fe_add(&q[30], &q[10], &q[0]);
+  crx_c25_fe_sub(&q[10], &q[10], &q[0]);
+  crx_c25_fe_sub(&q[0], &s[30], &q[30]);
+  crx_c25_fe_sub(&q[20], &q[20], &q[10]);
+
+  crx_c25_fe_mul(&s[0], &q[0], &q[20]);
+  crx_c25_fe_mul(&s[10], &q[30], &q[10]);
+  crx_c25_fe_mul(&s[20], &q[10], &q[20]);
+  crx_c25_fe_mul(&s[30], &q[0], &q[30]);
+}
+
+// ---------------------------------------------------------------------------
+// Fixed base multiplication (constant time)
+// ---------------------------------------------------------------------------
+
+// p += one entry of a comb table, picked by four bits of the scalar (bits i,
+// i+32, i+64 and i+96): the table is read in full and the entry kept with
+// masks. tmp_c is a precomp (int32[30]) that holds Yp = 1, Ym = 1, T2 = 0 on
+// the first call; tmp_a and tmp_b are field element scratch.
+fn crx_c25_lookup_add(p: int32*, tmp_c: int32*, tmp_a: int32*, tmp_b: int32*, comb: int32*, scalar: uint8*, i: int32) {
+  var teeth: int32 = crx_c25_scalar_bit(scalar, i) + (crx_c25_scalar_bit(scalar, i + 32) << 1) + (crx_c25_scalar_bit(scalar, i + 64) << 2) + (crx_c25_scalar_bit(scalar, i + 96) << 3);
+  var high: int32 = teeth >> 3;
+  var index: int32 = (teeth ^ (high - 1)) & 7;
+  for j in 0..8 {
+    var select: int32 = 1 & (((j ^ index) - 1) >> 8);
+    crx_c25_fe_ccopy(&tmp_c[0], &comb[j * 30], select);
+    crx_c25_fe_ccopy(&tmp_c[10], &comb[j * 30 + 10], select);
+    crx_c25_fe_ccopy(&tmp_c[20], &comb[j * 30 + 20], select);
+  }
+  crx_c25_fe_neg(tmp_a, &tmp_c[20]);
+  crx_c25_fe_cswap(&tmp_c[20], tmp_a, high ^ 1);
+  crx_c25_fe_cswap(&tmp_c[0], &tmp_c[10], high ^ 1);
+  crx_c25_ge_madd(p, p, tmp_c, tmp_a, tmp_b);
+}
+
+// p = [scalar]B, where B is the base point. Constant time in scalar.
+fn crx_c25_ge_scalarmult_base(p: int32*, scalar: uint8*) {
+  // twin 4-bit signed combs, from Mike Hamburg's Fast and compact
+  // elliptic-curve cryptography (2012)
+
+  // All bits set form: 1 means 1, 0 means -1
+  var s_scalar: uint8[32];
+  crx_c25_eddsa_mul_add(&s_scalar[0], scalar, &g_crx_c25_half_mod_l[0], &g_crx_c25_half_ones[0]);
+
+  // Double and add ladder
+  var tmp_a: int32[10];
+  var tmp_b: int32[10];
+  var tmp_c: int32[30];
+  var tmp_d: int32[40];
+  crx_c25_fe_1(&tmp_c[0]);
+  crx_c25_fe_1(&tmp_c[10]);
+  crx_c25_fe_0(&tmp_c[20]);
+
+  // Save a double on the first iteration
+  crx_c25_ge_zero(p);
+  crx_c25_lookup_add(p, &tmp_c[0], &tmp_a[0], &tmp_b[0], &g_crx_c25_comb_low[0], &s_scalar[0], 31);
+  crx_c25_lookup_add(p, &tmp_c[0], &tmp_a[0], &tmp_b[0], &g_crx_c25_comb_high[0], &s_scalar[0], 31 + 128);
+  // Regular double & add for the rest
+  var i: int32 = 30;
+  while (i >= 0) {
+    crx_c25_ge_double(p, p, &tmp_d[0]);
+    crx_c25_lookup_add(p, &tmp_c[0], &tmp_a[0], &tmp_b[0], &g_crx_c25_comb_low[0], &s_scalar[0], i);
+    crx_c25_lookup_add(p, &tmp_c[0], &tmp_a[0], &tmp_b[0], &g_crx_c25_comb_high[0], &s_scalar[0], i + 128);
+    i = i - 1;
+  }
+  // One addition could be saved at the end for a scalar below 2^252, but a
+  // non-random, non-hashed scalar can overflow 252 bits, so it is not.
+
+  cr_wipe((uint8*)&tmp_a[0], 40);
+  cr_wipe((uint8*)&tmp_d[0], 160);
+  cr_wipe((uint8*)&tmp_b[0], 40);
+  cr_wipe((uint8*)&tmp_c[0], 120);
+  cr_wipe(&s_scalar[0], 32);
+}
+
+// point = the 32-byte encoding of [scalar]B. Constant time in scalar.
+fn crx_c25_eddsa_scalarbase(point: uint8*, scalar: uint8*) {
+  var pp: int32[40];
+  crx_c25_ge_scalarmult_base(&pp[0], scalar);
+  crx_c25_ge_tobytes(point, &pp[0]);
+  cr_wipe((uint8*)&pp[0], 160);
+}
+
+// ---------------------------------------------------------------------------
+// Verification: public data, variable time allowed
+// ---------------------------------------------------------------------------
+
+// Incremental sliding windows (left to right), based on Roberto Maria Avanzi
+// [2005].
+struct CrxC25Slide {
+  next_index: int32;
+  next_digit: int32;
+  next_check: int32;
+}
+
+fn crx_c25_slide_init(ctx: CrxC25Slide*, scalar: uint8*) {
+  // scalar is guaranteed to be below L, either because it was checked (s) or
+  // because it was reduced modulo L (h). L is under 2^253, so bits 253 to 255
+  // are zero. L is very close to 2^252, so bit 252 is almost always zero, but
+  // it is still checked.
+  var i: int32 = 252;
+  while (i > 0 && crx_c25_scalar_bit(scalar, i) == 0) {
+    i = i - 1;
+  }
+  ctx->next_check = i + 1;
+  ctx->next_index = -1;
+  ctx->next_digit = -1;
+}
+
+fn crx_c25_slide_step(ctx: CrxC25Slide*, width: int32, i: int32, scalar: uint8*) -> int32 {
+  if (i == ctx->next_check) {
+    if (crx_c25_scalar_bit(scalar, i) == crx_c25_scalar_bit(scalar, i - 1)) {
+      ctx->next_check = ctx->next_check - 1;
+    } else {
+      // compute digit of next window
+      var w: int32 = width;
+      if (i + 1 < w) { w = i + 1; }
+      var v: int32 = 0 - (crx_c25_scalar_bit(scalar, i) << (w - 1));
+      for j in 0..(w - 1) {
+        v = v + (crx_c25_scalar_bit(scalar, i - (w - 1) + j) << j);
+      }
+      v = v + crx_c25_scalar_bit(scalar, i - w);
+      var lsb: int32 = v & (~v + 1);
+      var s: int32 = 0;
+      if ((lsb & 0xAA) != 0) { s = s | 1; }
+      if ((lsb & 0xCC) != 0) { s = s | 2; }
+      if ((lsb & 0xF0) != 0) { s = s | 4; }
+      ctx->next_index = i - (w - 1) + s;
+      ctx->next_digit = v >> s;
+      ctx->next_check = ctx->next_check - w;
+    }
+  }
+  if (i == ctx->next_index) { return ctx->next_digit; }
+  return 0;
+}
+
+// Checks the Ed25519 equation: returns 0 if the encoding of [s]B - [h]A is
+// equal to signature[0..32], where s = signature[32..64] and A = public_key,
+// and -1 if not. Returns -1 too when S >= L (this prevents malleability) or
+// when A does not decode to a point. h is the hash H(R || A || M) reduced
+// modulo L. Variable time.
+fn crx_c25_check_equation(sig: uint8*, public_key: uint8*, h: uint8*) -> int32 {
+  var minus_a: int32[40];
+  var s: uint8* = &sig[32];
+
+  // Check that 0 <= S < L, and that A is on the curve.
+  var s32: uint32[8];
+  for i in 0..8 { s32[i] = crx_c25_ld32(&s[4 * i]); }
+  if (crx_c25_is_above_l(&s32[0]) != 0) { return -1; }
+  if (crx_c25_ge_frombytes_neg_vartime(&minus_a[0], public_key) != 0) { return -1; }
+
+  // look-up table for minus_a: -A and -3A (two cached points)
+  var lut_a: int32[80];
+  var tmp: int32[40];
+  {
+    var minus_a2: int32[40];
+    crx_c25_ge_double(&minus_a2[0], &minus_a[0], &tmp[0]);
+    crx_c25_ge_cache(&lut_a[0], &minus_a[0]);
+    crx_c25_ge_add(&tmp[0], &minus_a2[0], &lut_a[0]);
+    crx_c25_ge_cache(&lut_a[40], &tmp[0]);
+  }
+
+  // sum = [s]B - [h]A
+  // Merged double and add ladder, fused with sliding windows
+  var h_slide: CrxC25Slide;
+  var s_slide: CrxC25Slide;
+  crx_c25_slide_init(&h_slide, h);
+  crx_c25_slide_init(&s_slide, s);
+  var i: int32 = h_slide.next_check;
+  if (s_slide.next_check > i) { i = s_slide.next_check; }
+  var sum: int32* = &minus_a[0];
+  crx_c25_ge_zero(sum);
+  var t1: int32[10];
+  var t2: int32[10];
+  while (i >= 0) {
+    crx_c25_ge_double(sum, sum, &tmp[0]);
+    var h_digit: int32 = crx_c25_slide_step(&h_slide, 3, i, h);
+    var s_digit: int32 = crx_c25_slide_step(&s_slide, 5, i, s);
+    if (h_digit > 0) { crx_c25_ge_add(sum, sum, &lut_a[(h_digit / 2) * 40]); }
+    if (h_digit < 0) { crx_c25_ge_sub(sum, sum, &lut_a[((0 - h_digit) / 2) * 40]); }
+    if (s_digit > 0) { crx_c25_ge_madd(sum, sum, &g_crx_c25_bwin[(s_digit / 2) * 30], &t1[0], &t2[0]); }
+    if (s_digit < 0) { crx_c25_ge_msub(sum, sum, &g_crx_c25_bwin[((0 - s_digit) / 2) * 30], &t1[0], &t2[0]); }
+    i = i - 1;
+  }
+
+  var check: uint8[32];
+  crx_c25_ge_tobytes(&check[0], sum);
+  return crx_c25_verify32(&check[0], sig);
+}
+
+// True if the 32-byte encoding s (sign bit ignored) is one of the small-order
+// points' y coordinates.
+fn crx_c25_small_order(s: uint8*) -> bool {
+  for e in 0..7 {
+    var same: bool = true;
+    for j in 0..31 {
+      if (s[j] != g_crx_c25_small[e * 32 + j]) { same = false; }
+    }
+    if ((s[31] & 127) != g_crx_c25_small[e * 32 + 31]) { same = false; }
+    if (same) { return true; }
+  }
+  return false;
+}
+
+// True if y (sign bit ignored) is below p.
+fn crx_c25_y_canonical(s: uint8*) -> bool {
+  if ((s[31] & 127) != 127) { return true; }
+  for j in 1..31 {
+    if (s[j] != 255) { return true; }
+  }
+  return s[0] < 237;
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 (RFC 8032 section 5.1)
+// ---------------------------------------------------------------------------
+
+// SHA-512 of seed -> h; a = clamp(h[0..32]) in place.
+fn crx_c25_expand(h: uint8*, seed: uint8*) {
+  var st: CrxSha512;
+  crx_sha512_init(&st);
+  crx_sha512_update(&st, seed, 32);
+  crx_sha512_final(&st, h);
+  crx_c25_trim_scalar(h, h);
+}
+
+/// internal: Ed25519 key pair of a 32-byte seed: pk is the 32-byte public
+/// key, sk the 64 bytes seed || pk.
+export fn crx_ed25519_seed_keypair(pk: uint8*, sk: uint8*, seed: uint8*) {
+  var h: uint8[64];
+  var pkb: uint8[32];
+  crx_c25_expand(&h[0], seed);
+  crx_c25_eddsa_scalarbase(&pkb[0], &h[0]);
+  for i in 0..32 {
+    sk[i] = seed[i];
+    sk[32 + i] = pkb[i];
+    pk[i] = pkb[i];
+  }
+  cr_wipe(&h[0], 64);
+}
+
+/// internal: detached Ed25519 signature of msg (n >= 0 bytes; msg may be any
+/// valid pointer when n == 0) under the 64-byte secret key seed || pk.
+/// Writes 64 bytes to sig. Constant time in the key.
+export fn crx_ed25519_sign(sig: uint8*, msg: uint8*, n: int64, sk: uint8*) {
+  var h: uint8[64];
+  var r: uint8[64];
+  var k: uint8[64];
+  var st: CrxSha512;
+  crx_c25_expand(&h[0], sk);
+  // r = H(h[32..64] || M) mod L
+  crx_sha512_init(&st);
+  crx_sha512_update(&st, &h[32], 32);
+  crx_sha512_update(&st, msg, n);
+  crx_sha512_final(&st, &r[0]);
+  crx_ed25519_reduce(&r[0]);
+  // R = rB
+  crx_c25_eddsa_scalarbase(&sig[0], &r[0]);
+  // k = H(R || A || M) mod L
+  crx_sha512_init(&st);
+  crx_sha512_update(&st, &sig[0], 32);
+  crx_sha512_update(&st, &sk[32], 32);
+  crx_sha512_update(&st, msg, n);
+  crx_sha512_final(&st, &k[0]);
+  crx_ed25519_reduce(&k[0]);
+  // S = (k a + r) mod L
+  crx_c25_eddsa_mul_add(&sig[32], &k[0], &h[0], &r[0]);
+  cr_wipe(&h[0], 64);
+  cr_wipe(&r[0], 64);
+  cr_wipe(&k[0], 64);
+}
+
+/// internal: verifies a detached Ed25519 signature. False when S >= L, when
+/// pk does not decode, is not canonical or has small order, when R has small
+/// order, or when [S]B != R + [k]A (encodings compared). Variable time:
+/// everything it reads is public.
+export fn crx_ed25519_verify(sig: uint8*, msg: uint8*, n: int64, pk: uint8*) -> bool {
+  if (crx_c25_small_order(&sig[0])) { return false; }
+  if (!crx_c25_y_canonical(pk)) { return false; }
+  if (crx_c25_small_order(pk)) { return false; }
+  var k: uint8[64];
+  var st: CrxSha512;
+  crx_sha512_init(&st);
+  crx_sha512_update(&st, sig, 32);
+  crx_sha512_update(&st, pk, 32);
+  crx_sha512_update(&st, msg, n);
+  crx_sha512_final(&st, &k[0]);
+  crx_ed25519_reduce(&k[0]);
+  return crx_c25_check_equation(sig, pk, &k[0]) == 0;
+}

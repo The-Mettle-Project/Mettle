@@ -1,0 +1,372 @@
+// raize/middleware/recover — what "recovery" means in Mettle, and what it
+// does not mean.
+//
+// ## Read this before trusting the word "recovery"
+//
+// Mettle has no exceptions and no try/catch. A *hardware* fault — SIGSEGV, a
+// stack overflow, an illegal instruction — is fatal: the process dies, and no
+// handler of ours runs. That is not a gap in this module, it is the language's
+// contract (notes/09-gaps.md "Stack overflow is not recoverable"). The last
+// entry in this file's own list is therefore: a supervisor restarts the
+// process. If you want "survive a crash", the supervisor is the mechanism and
+// this middleware is not.
+//
+// What this middleware does handle, in the three pieces the brief asked for:
+//
+//   (a) the request arena. It is the server's to free — rz_conn_serve()
+//       allocates one per request and `defer rz_arena_free(arena)` runs on
+//       every exit path, including "handler returned an error", "client hung
+//       up", "parser refused the request". This middleware does not free it
+//       (that would be a double free) but it *observes* it: if the arena ran
+//       out of memory during the handler (rz_arena_ok() is false) the failure
+//       line says so, because "the 500 was caused by the arena" is the one
+//       piece of diagnosis the server cannot supply.
+//
+//   (b) an error return. A handler's non-zero return, or a 5xx status it put
+//       on the response itself, becomes a 500 with a **generic** body. The
+//       original body (the handler's detail) never reaches the wire: it goes to
+//       stderr as one escaped log line. This is deliberate — an error body is
+//       where stack traces and query text leak.
+//
+//   (c) a process death. See above: fatal, and the supervisor's job. Nothing
+//       in this file claims otherwise.
+//
+// ## Order matters
+//
+// Recovery must sit *outside* every step whose failure it is meant to catch,
+// and inside the log frame so the log line shows the 500. Recommended order,
+// which the aggregator does not impose (composition is the app's):
+//
+//   logging -> recovery -> cors -> auth -> limits -> router(terminal)
+//
+// CORS and auth are *not* failures: auth denies with 401/403 and returns
+// without calling next, which is an abort (ctx->aborted), not an error. So
+// recovery must not turn a 403 into a 500 — that is why the abort check comes
+// first below.
+//
+// ## Bounded, no allocation
+//
+// The detail copied out of the failed body is capped at RZ_RECOVER_DETAIL_MAX
+// bytes on the stack. The replacement body is a literal. Nothing here mallocs
+// on the failure path, so a 500 caused by memory pressure does not try to
+// allocate its way out of it.
+
+import "std/mem";
+import "std/thread";
+import "../str/str";
+import "../context/context";
+import "chain";
+import "logging";
+
+export const RZ_RECOVER_GENERIC_BODY: string = "internal server error\n";
+export const RZ_RECOVER_DETAIL_MAX: int64 = 192;
+export const RZ_RECOVER_GENERIC_CT: string = "text/plain; charset=utf-8";
+
+export struct RzRecoverStats {
+  entered: int32;       // requests that entered the recovery scope
+  handled: int32;       // failures turned into a generic 500
+  arena_failed: int32;  // failures whose arena was exhausted
+  no_arena: int32;      // requests with no arena at all (ctx->arena == 0)
+}
+
+export struct RzRecover {
+  stats: RzRecoverStats;
+}
+
+var g_rz_recover: RzRecover* = 0;
+var g_rz_recover_default: RzRecover;
+
+export fn rz_recover_new() -> RzRecover* {
+  var r: RzRecover* = (RzRecover*)calloc(1, sizeof(RzRecover));
+  return r;
+}
+
+export fn rz_recover_free(r: RzRecover*) {
+  if (r == 0) { return; }
+  if (g_rz_recover == r) { g_rz_recover = 0; }
+  free((rawptr)r);
+}
+
+export fn rz_recover_use(r: RzRecover*) -> int32 {
+  if (r == 0) { return -1; }
+  g_rz_recover = r;
+  return 0;
+}
+
+export fn rz_recover_stats(r: RzRecover*) -> RzRecoverStats {
+  var s: RzRecoverStats;
+  if (r == 0) { return s; }
+  s = r->stats;
+  return s;
+}
+
+fn rz_recover_cfg() -> RzRecover* {
+  if (g_rz_recover != 0) { return g_rz_recover; }
+  return &g_rz_recover_default;
+}
+
+// Replaces whatever the failed handler built with the generic 500: status,
+// Content-Type and body. Headers the handler set are *kept* — an X-Request-Id
+// on the error response is the one thing that makes a 500 traceable — except
+// Content-Type, which the generic text body overrides.
+//
+// The old body is copied out first (bounded) so the detail can be logged after
+// the body has been replaced; the copy is a stack buffer, not an arena
+// allocation, so a 500 caused by memory pressure does not allocate.
+//
+// Returns 500 always: this is the status the caller must report.
+export fn rz_recover_fail(ctx: RzContext*, status: int32) -> int32 {
+  var cfg: RzRecover* = rz_recover_cfg();
+  var detail: uint8[RZ_RECOVER_DETAIL_MAX];
+  var dn: int64 = 0;
+  var resp: RzResponse* = 0;
+  if (ctx != 0) { resp = ctx->resp; }
+  if (resp != 0 && resp->body != 0) {
+    dn = resp->body->len;
+    if (dn > RZ_RECOVER_DETAIL_MAX) { dn = RZ_RECOVER_DETAIL_MAX; }
+    var k: int64 = 0;
+    while (k < dn) {
+      detail[k] = resp->body->data[k];
+      k = k + 1;
+    }
+  }
+  var arena_note: string = "no detail";
+  if (dn > 0) {
+    arena_note = rz_str_view(&detail[0], dn);
+  } else if (ctx != 0) {
+    if (ctx->arena == 0) {
+      atomic_inc_i32(&cfg->stats.no_arena);
+      arena_note = "no request arena";
+    } else if (!rz_arena_ok(ctx->arena)) {
+      atomic_inc_i32(&cfg->stats.arena_failed);
+      arena_note = "request arena exhausted";
+    }
+  }
+  atomic_inc_i32(&cfg->stats.handled);
+  // Replace the body first, then log: the log line can then carry the byte
+  // count of what the client will actually receive, which is the only copy of
+  // the size that is true when recovery sits outside the logging frame. The
+  // detail itself is already in the stack copy above, so nothing is lost by
+  // replacing the body before writing the line.
+  if (resp != 0) {
+    rz_resp_text(resp, 500, RZ_RECOVER_GENERIC_BODY);
+    rz_resp_set_content_type(resp, RZ_RECOVER_GENERIC_CT);
+  }
+  var final_bytes: int64 = 0;
+  if (resp != 0) { final_bytes = rz_resp_body_len(resp); }
+  rz_log_recovery(ctx, 500, final_bytes, arena_note);
+  if (ctx != 0) {
+    ctx->status = 500;
+    if (ctx->resp != 0) { ctx->resp->status = 500; }
+  }
+  return 500;
+}
+
+// The middleware. Passes 1xx/2xx/3xx/4xx and aborts straight through; a 5xx
+// (or a return that is not a status) is logged in full and answered with the
+// generic 500.
+export fn rz_mw_recover(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  var cfg: RzRecover* = rz_recover_cfg();
+  atomic_inc_i32(&cfg->stats.entered);
+  var st: int32 = next(ctx);
+  if (ctx != 0 && ctx->aborted) {
+    // An abort is a decision, not a failure: 401/403/404 keep their bodies.
+    return st;
+  }
+  var status: int32 = rz_chain_status(ctx, st);
+  if (status < 500) { return st; }
+  return rz_recover_fail(ctx, status);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// Run: ./mettle-build/bin/mettle test framework/middleware/recover.mettle
+//
+// Recovery is a *return-value* contract here. A SIGSEGV is not testable this
+// way and is not claimed: see the header, and the native fault probe
+// (tests/fixtures/middleware/fault.mettle) which shows the process dying with
+// exit 139 while this middleware is mounted.
+// ---------------------------------------------------------------------------
+
+fn t_rec_term_secret(ctx: RzContext*) -> int32 {
+  if (ctx->resp == 0) { return 500; }
+  rz_resp_write(ctx->resp, "db password=hunter2 at handlers/x.mettle:42\n");
+  rz_resp_header_set(ctx->resp, "X-Request-Id", "abc123");
+  ctx->resp->status = 500;
+  ctx->status = 500;
+  return 500;
+}
+
+fn t_rec_term_404(ctx: RzContext*) -> int32 {
+  return rz_ctx_text(ctx, 404, "no such page\n");
+}
+
+fn t_rec_term_abort(ctx: RzContext*) -> int32 {
+  rz_ctx_text(ctx, 401, "unauthorized\n");
+  rz_ctx_abort(ctx, 401);
+  return 0;
+}
+
+fn t_rec_term_bogus(ctx: RzContext*) -> int32 {
+  return 99;   // not a status and not 0: a handler bug
+}
+
+fn t_rec_term_empty_500(ctx: RzContext*) -> int32 {
+  ctx->status = 500;
+  if (ctx->resp != 0) { ctx->resp->status = 500; }
+  return 500;
+}
+
+@test fn t_rz_recover_500_gets_generic_body() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var r: RzRecover* = rz_recover_new();
+  if (r == 0) { return 4; }
+  defer rz_recover_free(r);
+  if (rz_recover_use(r) != 0) { return 5; }
+  if (rz_mw_recover(&ctx, &t_rec_term_secret) != 500) { return 6; }
+  // the handler's detail is replaced, never forwarded
+  if (!rz_str_eq(rz_buf_str(resp->body), RZ_RECOVER_GENERIC_BODY)) { return 7; }
+  if (rz_str_contains(rz_buf_str(resp->body), "hunter2")) { return 8; }
+  if (resp->status != 500) { return 9; }
+  if (ctx.status != 500) { return 10; }
+  if (!rz_str_eq(rz_resp_header_get(resp, "Content-Type"), RZ_RECOVER_GENERIC_CT)) { return 11; }
+  // a traceable header the handler set is kept (an X-Request-Id on a 500 is the
+  // one thing that makes the failure findable)
+  if (!rz_str_eq(rz_resp_header_get(resp, "X-Request-Id"), "abc123")) { return 12; }
+  var st: RzRecoverStats = rz_recover_stats(r);
+  if (st.entered != 1) { return 13; }
+  if (st.handled != 1) { return 14; }
+  return 0;
+}
+
+@test fn t_rz_recover_leaves_4xx_alone() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var r: RzRecover* = rz_recover_new();
+  if (r == 0) { return 4; }
+  defer rz_recover_free(r);
+  if (rz_recover_use(r) != 0) { return 5; }
+  // rz_ctx_text returns the status it set (404): recovery passes a 4xx
+  // through untouched, and the status stays on the response.
+  if (rz_mw_recover(&ctx, &t_rec_term_404) != 404) { return 6; }
+  if (resp->status != 404) { return 7; }
+  if (!rz_str_eq(rz_buf_str(resp->body), "no such page\n")) { return 8; }
+  // an abort is a decision (401/403/404 keep their body), not a failure
+  if (rz_mw_recover(&ctx, &t_rec_term_abort) != 0) { return 9; }
+  if (resp->status != 401) { return 10; }
+  if (!rz_str_eq(rz_buf_str(resp->body), "unauthorized\n")) { return 11; }
+  var st: RzRecoverStats = rz_recover_stats(r);
+  if (st.handled != 0) { return 12; }
+  return 0;
+}
+
+@test fn t_rz_recover_non_status_return() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var r: RzRecover* = rz_recover_new();
+  if (r == 0) { return 4; }
+  defer rz_recover_free(r);
+  if (rz_recover_use(r) != 0) { return 5; }
+  // A return that is neither a status nor 0 makes rz_chain_status fall back to
+  // the status on the response; with no valid status there either, it is 500
+  // and recovery answers it. (Note: "0 with nothing built" is *not* this case —
+  // that is a legal empty 200 and the server turns it into a 500 in
+  // rz_conn_serve, which owns the "handler answered nothing" rule.)
+  resp->status = 0;
+  ctx.status = 0;
+  if (rz_mw_recover(&ctx, &t_rec_term_bogus) != 500) { return 6; }
+  if (!rz_str_eq(rz_buf_str(resp->body), RZ_RECOVER_GENERIC_BODY)) { return 7; }
+  if (resp->status != 500) { return 8; }
+  var st: RzRecoverStats = rz_recover_stats(r);
+  if (st.handled != 1) { return 9; }
+  return 0;
+}
+
+@test fn t_rz_recover_body_is_bounded() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var r: RzRecover* = rz_recover_new();
+  if (r == 0) { return 4; }
+  defer rz_recover_free(r);
+  if (rz_recover_use(r) != 0) { return 5; }
+  // a handler that wrote a lot: the replacement is the fixed generic body, and
+  // the copy taken for the log line is capped on the stack (no allocation)
+  var i: int32 = 0;
+  while (i < 64) {
+    rz_resp_write(resp, "0123456789abcdef");
+    i = i + 1;
+  }
+  ctx.status = 500;
+  resp->status = 500;
+  if (rz_mw_recover(&ctx, &t_rec_term_empty_500) != 500) { return 6; }
+  if (rz_resp_body_len(resp) != (int64)RZ_RECOVER_GENERIC_BODY.length) { return 7; }
+  if (RZ_RECOVER_DETAIL_MAX > 1024) { return 8; }
+  return 0;
+}
+
+@test fn t_rz_recover_arena_notes() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var r: RzRecover* = rz_recover_new();
+  if (r == 0) { return 4; }
+  defer rz_recover_free(r);
+  if (rz_recover_use(r) != 0) { return 5; }
+  // exhaust the request arena, then fail with no body: the log line must say
+  // *why* (arena exhausted), which is the one diagnosis the server cannot supply
+  var p: uint8* = rz_arena_alloc(arena, RZ_ARENA_MAX_BYTES);
+  if (p != 0) { return 6; }
+  if (rz_arena_ok(arena)) { return 7; }
+  if (rz_mw_recover(&ctx, &t_rec_term_empty_500) != 500) { return 8; }
+  var st: RzRecoverStats = rz_recover_stats(r);
+  if (st.arena_failed != 1) { return 9; }
+  // and a context with no arena at all is counted separately, not crashed on
+  ctx.arena = 0;
+  resp->body->len = 0;
+  ctx.aborted = false;
+  if (rz_mw_recover(&ctx, &t_rec_term_empty_500) != 500) { return 10; }
+  st = rz_recover_stats(r);
+  if (st.no_arena != 1) { return 11; }
+  return 0;
+}

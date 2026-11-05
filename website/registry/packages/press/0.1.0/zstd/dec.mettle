@@ -1,0 +1,558 @@
+// Zstandard decoder: frame headers, blocks, literals, sequences.
+// pzs_dec_block decodes one compressed block; the one-shot and streaming
+// front ends both drive it.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../check/xxhash";
+import "common";
+import "fse";
+import "huf";
+
+const SEQ_MAX: int64 = 43700;   // a block of 128 KiB holds at most 43691 sequences
+
+/// Decoder state kept across the blocks of a frame.
+export struct PzsDec {
+  own: PzsSeqD[1280];     // tables built from the stream: LL at 0, OF at 512, ML at 768
+  def: PzsSeqD[160];      // predefined tables: LL at 0, OF at 64, ML at 96
+  tab: PzsSeqD*[3];       // table in use for LL, OF, ML
+  tlog: int32[3];
+  tok: bool[3];
+  huf: PzsHufD;
+  huf_ok: bool;
+  rep: int64[3];
+  lit: uint8*;            // literal scratch, PZS_BLOCK_MAX + PZS_SLACK bytes
+  lp: uint8*;             // literals of the current block
+  ln: int64;
+  lsafe: int64;           // bytes readable from lp
+  s_ll: uint32*;
+  s_ml: uint32*;
+  s_of: uint32*;
+  window: int64;
+  block_max: int64;
+}
+
+/// Parsed frame header.
+export struct PzsFrameHdr {
+  hsize: int64;    // header bytes, magic included
+  fcs: int64;      // content size, or -1 when unknown
+  window: int64;
+  checksum: bool;
+  dict: uint32;
+}
+
+/// Allocates a decoder context. Returns 0 when memory runs out.
+export fn pzs_dec_new() -> PzsDec* {
+  var d: PzsDec* = new PzsDec;
+  if (d == 0) { return (PzsDec*)0; }
+  d->lit = (uint8*)malloc(PZS_BLOCK_MAX + PZS_SLACK);
+  d->s_ll = (uint32*)malloc(SEQ_MAX * 4);
+  d->s_ml = (uint32*)malloc(SEQ_MAX * 4);
+  d->s_of = (uint32*)malloc(SEQ_MAX * 4);
+  if (d->lit == 0 || d->s_ll == 0 || d->s_ml == 0 || d->s_of == 0) {
+    pzs_dec_delete(d);
+    return (PzsDec*)0;
+  }
+  var ll: int16[36] = PZS_LL_DEF;
+  var of: int16[29] = PZS_OF_DEF;
+  var ml: int16[53] = PZS_ML_DEF;
+  pzs_fse_build_dt(&d->def[0], &ll[0], 36, 6, PZS_K_LL);
+  pzs_fse_build_dt(&d->def[64], &of[0], 29, 5, PZS_K_OF);
+  pzs_fse_build_dt(&d->def[96], &ml[0], 53, 6, PZS_K_ML);
+  return d;
+}
+
+/// Frees a decoder context.
+export fn pzs_dec_delete(d: PzsDec*) {
+  if (d == 0) { return; }
+  if (d->lit != 0) { free(d->lit); }
+  if (d->s_ll != 0) { free(d->s_ll); }
+  if (d->s_ml != 0) { free(d->s_ml); }
+  if (d->s_of != 0) { free(d->s_of); }
+  free(d);
+}
+
+/// Resets the per-frame state for a frame with the given window size.
+export fn pzs_dec_reset(d: PzsDec*, window: int64) {
+  d->rep[0] = 1;
+  d->rep[1] = 4;
+  d->rep[2] = 8;
+  d->tok[0] = false;
+  d->tok[1] = false;
+  d->tok[2] = false;
+  d->huf_ok = false;
+  d->window = window;
+  d->block_max = window;
+  if (d->block_max > PZS_BLOCK_MAX) { d->block_max = PZS_BLOCK_MAX; }
+}
+
+/// Bytes the frame header takes, from its first 5 bytes (p needs 5).
+export fn pzs_frame_hdr_size(p: uint8*) -> int64 {
+  var fd: int32 = (int32)p[4];
+  var single: bool = (fd & 32) != 0;
+  var sz: int64 = 5;
+  if (!single) { sz = sz + 1; }
+  var df: int32 = fd & 3;
+  if (df == 1) { sz = sz + 1; } else if (df == 2) { sz = sz + 2; } else if (df == 3) { sz = sz + 4; }
+  var ff: int32 = fd >> 6;
+  if (ff == 0) { if (single) { sz = sz + 1; } }
+  else if (ff == 1) { sz = sz + 2; }
+  else if (ff == 2) { sz = sz + 4; }
+  else { sz = sz + 8; }
+  return sz;
+}
+
+/// Parses a frame header at p[0 .. n] (magic included).
+export fn pzs_frame_hdr(p: uint8*, n: int64, h: PzsFrameHdr*) -> int32 {
+  if (n < 5) { return PRESS_E_TRUNC; }
+  if (press_rd32(p) != PZS_MAGIC) { return PRESS_E_DATA; }
+  var fd: int32 = (int32)p[4];
+  if ((fd & 8) != 0) { return PRESS_E_DATA; }
+  var hs: int64 = pzs_frame_hdr_size(p);
+  if (n < hs) { return PRESS_E_TRUNC; }
+  var single: bool = (fd & 32) != 0;
+  var at: int64 = 5;
+  var window: int64 = 0;
+  if (!single) {
+    var wd: int32 = (int32)p[5];
+    var wlog: int64 = (int64)(10 + (wd >> 3));
+    var base: int64 = (int64)1 << wlog;
+    window = base + (base >> 3) * (int64)(wd & 7);
+    at = 6;
+  }
+  var dict: uint32 = 0;
+  var df: int32 = fd & 3;
+  if (df == 1) { dict = (uint32)p[at]; at = at + 1; }
+  else if (df == 2) { dict = press_rd16(p + at); at = at + 2; }
+  else if (df == 3) { dict = press_rd32(p + at); at = at + 4; }
+  var fcs: int64 = -1;
+  var ff: int32 = fd >> 6;
+  if (ff == 0) { if (single) { fcs = (int64)p[at]; } }
+  else if (ff == 1) { fcs = (int64)press_rd16(p + at) + 256; }
+  else if (ff == 2) { fcs = (int64)press_rd32(p + at); }
+  else {
+    var v: uint64 = press_rd64(p + at);
+    if ((v >> 62) != 0) { return PRESS_E_LIMIT; }
+    fcs = (int64)v;
+  }
+  if (single) { window = fcs; }
+  h->hsize = hs;
+  h->fcs = fcs;
+  h->window = window;
+  h->checksum = (fd & 4) != 0;
+  h->dict = dict;
+  return PRESS_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Literals section.
+
+fn dec_lits(d: PzsDec*, p: uint8*, n: int64, used: int64*) -> int32 {
+  if (n < 1) { return PRESS_E_DATA; }
+  var b0: int64 = (int64)p[0];
+  var t: int64 = b0 & 3;
+  var sf: int64 = (b0 >> 2) & 3;
+  if (t <= 1) {
+    var size: int64 = 0;
+    var hs: int64 = 1;
+    if (sf == 0 || sf == 2) { size = b0 >> 3; }
+    else if (sf == 1) {
+      if (n < 2) { return PRESS_E_DATA; }
+      size = (b0 >> 4) + ((int64)p[1] << 4);
+      hs = 2;
+    } else {
+      if (n < 3) { return PRESS_E_DATA; }
+      size = (b0 >> 4) + ((int64)p[1] << 4) + ((int64)p[2] << 12);
+      hs = 3;
+    }
+    if (size > d->block_max) { return PRESS_E_DATA; }
+    if (t == 0) {
+      if (hs + size > n) { return PRESS_E_DATA; }
+      d->lp = p + hs;
+      d->ln = size;
+      d->lsafe = n - hs;
+      *used = hs + size;
+    } else {
+      if (hs + 1 > n) { return PRESS_E_DATA; }
+      memset(d->lit, (int32)p[hs], size);
+      d->lp = d->lit;
+      d->ln = size;
+      d->lsafe = PZS_BLOCK_MAX + PZS_SLACK;
+      *used = hs + 1;
+    }
+    return PRESS_OK;
+  }
+  var hs2: int64 = 3;
+  if (sf == 2) { hs2 = 4; } else if (sf == 3) { hs2 = 5; }
+  if (n < hs2) { return PRESS_E_DATA; }
+  var regen: int64 = 0;
+  var comp: int64 = 0;
+  if (sf <= 1) {
+    var v: int64 = (int64)pzs_rd24(p);
+    regen = (v >> 4) & 0x3FF;
+    comp = (v >> 14) & 0x3FF;
+  } else if (sf == 2) {
+    var v2: int64 = (int64)press_rd32(p);
+    regen = (v2 >> 4) & 0x3FFF;
+    comp = v2 >> 18;
+  } else {
+    var v3: int64 = (int64)press_rd32(p);
+    regen = (v3 >> 4) & 0x3FFFF;
+    comp = (v3 >> 22) + ((int64)p[4] << 10);
+  }
+  if (regen > d->block_max) { return PRESS_E_DATA; }
+  if (hs2 + comp > n) { return PRESS_E_DATA; }
+  var q: uint8* = p + hs2;
+  var qn: int64 = comp;
+  if (t == 2) {
+    var tu: int64 = pzs_huf_read_table(&d->huf, q, qn);
+    if (tu < 0) { return PRESS_E_DATA; }
+    q = q + tu;
+    qn = qn - tu;
+    d->huf_ok = true;
+  } else if (!d->huf_ok) {
+    return PRESS_E_DATA;
+  }
+  var rc: int32 = PRESS_OK;
+  if (sf == 0) { rc = pzs_huf_dec1(&d->huf, q, qn, d->lit, regen); }
+  else { rc = pzs_huf_dec4(&d->huf, q, qn, d->lit, regen); }
+  if (rc != PRESS_OK) { return PRESS_E_DATA; }
+  d->lp = d->lit;
+  d->ln = regen;
+  d->lsafe = PZS_BLOCK_MAX + PZS_SLACK;
+  *used = hs2 + comp;
+  return PRESS_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Sequences section.
+
+// Sets up the table for LL (which 0), OF (1) or ML (2). Returns bytes used.
+fn seq_table(d: PzsDec*, which: int32, mode: int32, p: uint8*, n: int64) -> int64 {
+  var kind: int32 = PZS_K_LL;
+  var maxSym: int32 = PZS_LL_MAX;
+  var maxLog: int32 = PZS_LL_LOG;
+  var own: int32 = 0;
+  var def: int32 = 0;
+  var defLog: int32 = 6;
+  if (which == 1) { kind = PZS_K_OF; maxSym = PZS_OF_MAX; maxLog = PZS_OF_LOG; own = 512; def = 64; defLog = 5; }
+  if (which == 2) { kind = PZS_K_ML; maxSym = PZS_ML_MAX; maxLog = PZS_ML_LOG; own = 768; def = 96; }
+  if (mode == 0) {
+    d->tab[which] = &d->def[def];
+    d->tlog[which] = defLog;
+    d->tok[which] = true;
+    return 0;
+  }
+  if (mode == 1) {
+    if (n < 1) { return (int64)PRESS_E_DATA; }
+    var s: int32 = (int32)p[0];
+    if (s > maxSym) { return (int64)PRESS_E_DATA; }
+    pzs_fse_rle_dt(&d->own[own], s, kind);
+    d->tab[which] = &d->own[own];
+    d->tlog[which] = 0;
+    d->tok[which] = true;
+    return 1;
+  }
+  if (mode == 2) {
+    var norm: int16[64];
+    var log: int32 = 0;
+    var used: int64 = pzs_fse_read_ncount(p, n, &norm[0], maxSym, maxLog, &log);
+    if (used < 0) { return used; }
+    if (pzs_fse_build_dt(&d->own[own], &norm[0], maxSym + 1, log, kind) != PRESS_OK) { return (int64)PRESS_E_DATA; }
+    d->tab[which] = &d->own[own];
+    d->tlog[which] = log;
+    d->tok[which] = true;
+    return used;
+  }
+  if (!d->tok[which]) { return (int64)PRESS_E_DATA; }
+  return 0;
+}
+
+// Reads the sequences section header and tables. Sets *nseq and returns
+// the bytes used, or a negative status.
+fn seq_header(d: PzsDec*, p: uint8*, n: int64, nseq: int64*) -> int64 {
+  if (n < 1) { return (int64)PRESS_E_DATA; }
+  var b0: int64 = (int64)p[0];
+  var at: int64 = 1;
+  if (b0 == 0) {
+    if (n != 1) { return (int64)PRESS_E_DATA; }
+    *nseq = 0;
+    return 1;
+  }
+  var ns: int64 = b0;
+  if (b0 >= 128 && b0 < 255) {
+    if (n < 2) { return (int64)PRESS_E_DATA; }
+    ns = ((b0 - 128) << 8) + (int64)p[1];
+    at = 2;
+  } else if (b0 == 255) {
+    if (n < 3) { return (int64)PRESS_E_DATA; }
+    ns = (int64)p[1] + ((int64)p[2] << 8) + 0x7F00;
+    at = 3;
+  }
+  // Zero sequences (in any of the three forms) ends the block: nothing may follow.
+  if (ns == 0) {
+    if (at != n) { return (int64)PRESS_E_DATA; }
+    *nseq = 0;
+    return at;
+  }
+  if (at >= n) { return (int64)PRESS_E_DATA; }
+  var modes: int32 = (int32)p[at];
+  at = at + 1;
+  if ((modes & 3) != 0) { return (int64)PRESS_E_DATA; }
+  var u: int64 = seq_table(d, 0, (modes >> 6) & 3, p + at, n - at);
+  if (u < 0) { return u; }
+  at = at + u;
+  u = seq_table(d, 1, (modes >> 4) & 3, p + at, n - at);
+  if (u < 0) { return u; }
+  at = at + u;
+  u = seq_table(d, 2, (modes >> 2) & 3, p + at, n - at);
+  if (u < 0) { return u; }
+  at = at + u;
+  if (ns > SEQ_MAX) { return (int64)PRESS_E_DATA; }
+  *nseq = ns;
+  return at;
+}
+
+// Decodes nseq sequences from the bit stream p[0 .. n] into d->s_*.
+// Sets *mlsum to the total match length.
+fn seq_decode(d: PzsDec*, p: uint8*, n: int64, nseq: int64, mlsum: int64*) -> int32 {
+  var r: PzsBitR;
+  if (pzs_br_init(&r, p, n) != PRESS_OK) { return PRESS_E_DATA; }
+  var tl: PzsSeqD* = d->tab[0];
+  var to: PzsSeqD* = d->tab[1];
+  var tm: PzsSeqD* = d->tab[2];
+  var sl: int64 = (int64)pzs_br_read(&r, (int64)d->tlog[0]);
+  var so: int64 = (int64)pzs_br_read(&r, (int64)d->tlog[1]);
+  var sm: int64 = (int64)pzs_br_read(&r, (int64)d->tlog[2]);
+  pzs_br_reload(&r);
+  var r0: int64 = d->rep[0];
+  var r1: int64 = d->rep[1];
+  var r2: int64 = d->rep[2];
+  var litsum: int64 = 0;
+  var msum: int64 = 0;
+  var lim: int64 = d->block_max - d->ln;
+  var oll: uint32* = d->s_ll;
+  var oml: uint32* = d->s_ml;
+  var oof: uint32* = d->s_of;
+  for k in 0..nseq {
+    var eL: PzsSeqD* = &tl[sl];
+    var eO: PzsSeqD* = &to[so];
+    var eM: PzsSeqD* = &tm[sm];
+    var ob: int64 = (int64)eO->extra;
+    var ov: int64 = (int64)eO->base + (int64)pzs_br_read(&r, ob);
+    if (r.n > 32) { pzs_br_reload(&r); }
+    var mv: int64 = (int64)eM->base + (int64)pzs_br_read(&r, (int64)eM->extra);
+    var lv: int64 = (int64)eL->base + (int64)pzs_br_read(&r, (int64)eL->extra);
+    var off: int64 = 0;
+    if (ob > 1) {
+      off = ov - 3;
+      r2 = r1;
+      r1 = r0;
+      r0 = off;
+    } else {
+      var idx: int64 = ov - 1;
+      if (lv == 0) { idx = idx + 1; }
+      if (idx == 0) { off = r0; }
+      else if (idx == 1) { off = r1; r1 = r0; r0 = off; }
+      else {
+        if (idx == 2) { off = r2; } else { off = r0 - 1; }
+        r2 = r1;
+        r1 = r0;
+        r0 = off;
+      }
+    }
+    litsum = litsum + lv;
+    msum = msum + mv;
+    if (litsum > d->ln || msum > lim) { return PRESS_E_DATA; }
+    oll[k] = (uint32)lv;
+    oml[k] = (uint32)mv;
+    if (off < 0 || off > 0xFFFFFFFF) { off = 0; }
+    oof[k] = (uint32)off;
+    if (k + 1 < nseq) {
+      if (r.n > 38) { pzs_br_reload(&r); }
+      sl = (int64)eL->next + (int64)pzs_br_read(&r, (int64)eL->nbits);
+      sm = (int64)eM->next + (int64)pzs_br_read(&r, (int64)eM->nbits);
+      so = (int64)eO->next + (int64)pzs_br_read(&r, (int64)eO->nbits);
+      pzs_br_reload(&r);
+    }
+  }
+  pzs_br_reload(&r);
+  if (!pzs_br_done(&r)) { return PRESS_E_DATA; }
+  d->rep[0] = r0;
+  d->rep[1] = r1;
+  d->rep[2] = r2;
+  *mlsum = msum;
+  return PRESS_OK;
+}
+
+const SMALL_OFF: int64[8] = [0, 8, 8, 9, 8, 10, 12, 14];
+
+// Copies a match of ml bytes from off back. The caller checked the
+// offset and that o has ml + 8 bytes of room past op when `wide`.
+@inline fn copy_match(o: uint8*, op: int64, off: int64, ml: int64, wide: bool) {
+  var m: int64 = op - off;
+  if (!wide) {
+    for j in 0..ml { o[op + j] = o[m + j]; }
+    return;
+  }
+  if (off >= 8) {
+    var j: int64 = 0;
+    while (j < ml) {
+      press_wr64(o + op + j, press_rd64(o + m + j));
+      j = j + 8;
+    }
+    return;
+  }
+  for j2 in 0..8 { o[op + j2] = o[m + j2]; }
+  if (ml > 8) {
+    var o2: int64 = SMALL_OFF[off];
+    var k: int64 = 8;
+    while (k < ml) {
+      press_wr64(o + op + k, press_rd64(o + op + k - o2));
+      k = k + 8;
+    }
+  }
+}
+
+// Runs the decoded sequences, appending the block output to out.
+fn exec_seqs(d: PzsDec*, nseq: int64, total: int64, out: PressBuf*, hist: int64) -> int32 {
+  var rc: int32 = press_buf_reserve_soft(out, total, total + PZS_SLACK);
+  if (rc != PRESS_OK) { return rc; }
+  var o: uint8* = out->data;
+  var op: int64 = out->len;
+  var cap: int64 = out->cap;
+  var lp: uint8* = d->lp;
+  var li: int64 = 0;
+  var lsafe: int64 = d->lsafe;
+  var win: int64 = d->window;
+  for k in 0..nseq {
+    var ll: int64 = (int64)d->s_ll[k];
+    var ml: int64 = (int64)d->s_ml[k];
+    var off: int64 = (int64)d->s_of[k];
+    if (li + ll + 16 <= lsafe && op + ll + 16 <= cap) {
+      var j: int64 = 0;
+      while (j < ll) {
+        press_wr64(o + op + j, press_rd64(lp + li + j));
+        press_wr64(o + op + j + 8, press_rd64(lp + li + j + 8));
+        j = j + 16;
+      }
+    } else if (ll > 0) {
+      memcpy(o + op, lp + li, ll);
+    }
+    op = op + ll;
+    li = li + ll;
+    if (off == 0 || off > op - hist || off > win) { return PRESS_E_DATA; }
+    copy_match(o, op, off, ml, op + ml + 8 <= cap);
+    op = op + ml;
+  }
+  if (d->ln > li) { memcpy(o + op, lp + li, d->ln - li); }
+  op = op + (d->ln - li);
+  out->len = op;
+  return PRESS_OK;
+}
+
+/// Decodes one compressed block of n bytes and appends its output to out.
+/// Offsets may reach back to out->data[hist].
+export fn pzs_dec_block(d: PzsDec*, p: uint8*, n: int64, out: PressBuf*, hist: int64) -> int32 {
+  var used: int64 = 0;
+  var rc: int32 = dec_lits(d, p, n, &used);
+  if (rc != PRESS_OK) { return rc; }
+  var nseq: int64 = 0;
+  var hu: int64 = seq_header(d, p + used, n - used, &nseq);
+  if (hu < 0) { return (int32)hu; }
+  var mlsum: int64 = 0;
+  if (nseq > 0) {
+    rc = seq_decode(d, p + used + hu, n - used - hu, nseq, &mlsum);
+    if (rc != PRESS_OK) { return rc; }
+  }
+  return exec_seqs(d, nseq, d->ln + mlsum, out, hist);
+}
+
+// ---------------------------------------------------------------------------
+// One-shot frame decoding.
+
+// Decodes the frame at p[0 .. n]. Sets *used to its size.
+fn dec_frame(d: PzsDec*, p: uint8*, n: int64, out: PressBuf*, wmax: int64, used: int64*) -> int32 {
+  var h: PzsFrameHdr;
+  var rc: int32 = pzs_frame_hdr(p, n, &h);
+  if (rc != PRESS_OK) { return rc; }
+  if (h.dict != 0) { return PRESS_E_UNSUPPORTED; }
+  if (h.window > wmax) { return PRESS_E_LIMIT; }
+  pzs_dec_reset(d, h.window);
+  var start: int64 = out->len;
+  if (h.fcs > 0 && h.fcs <= n * 64 + 1048576) {
+    rc = press_buf_reserve_soft(out, 0, h.fcs + PZS_SLACK);
+    if (rc != PRESS_OK) { return rc; }
+  }
+  var at: int64 = h.hsize;
+  while (true) {
+    if (at + 3 > n) { return PRESS_E_TRUNC; }
+    var bh: int64 = (int64)pzs_rd24(p + at);
+    at = at + 3;
+    var bt: int64 = (bh >> 1) & 3;
+    var bs: int64 = bh >> 3;
+    if (bt == 3) { return PRESS_E_DATA; }
+    if (bt == 1) {
+      if (bs > d->block_max) { return PRESS_E_DATA; }
+      if (at + 1 > n) { return PRESS_E_TRUNC; }
+      rc = press_buf_reserve(out, bs);
+      if (rc != PRESS_OK) { return rc; }
+      memset(out->data + out->len, (int32)p[at], bs);
+      out->len = out->len + bs;
+      at = at + 1;
+    } else {
+      if (bs > d->block_max) { return PRESS_E_DATA; }
+      if (at + bs > n) { return PRESS_E_TRUNC; }
+      if (bt == 0) { rc = press_buf_append(out, p + at, bs); }
+      else { rc = pzs_dec_block(d, p + at, bs, out, start); }
+      if (rc != PRESS_OK) { return rc; }
+      at = at + bs;
+    }
+    if (h.fcs >= 0 && out->len - start > h.fcs) { return PRESS_E_DATA; }
+    if ((bh & 1) != 0) { break; }
+  }
+  if (h.fcs >= 0 && out->len - start != h.fcs) { return PRESS_E_DATA; }
+  if (h.checksum) {
+    if (at + 4 > n) { return PRESS_E_TRUNC; }
+    var want: uint32 = press_rd32(p + at);
+    var got: uint32 = (uint32)press_xxh64(out->data + start, out->len - start, 0);
+    if (want != got) { return PRESS_E_CHECK; }
+    at = at + 4;
+  }
+  *used = at;
+  return PRESS_OK;
+}
+
+/// Decodes every frame in p[0 .. n] (skippable frames are skipped) and
+/// appends the output to out. On error out keeps its old length.
+export fn pzs_decompress(p: uint8*, n: int64, out: PressBuf*, wmax: int64) -> int32 {
+  if (n < 0 || out == 0 || (p == 0 && n > 0)) { return PRESS_E_ARG; }
+  var d: PzsDec* = (PzsDec*)0;
+  var keep: int64 = out->len;
+  var at: int64 = 0;
+  var rc: int32 = PRESS_OK;
+  while (at < n) {
+    if (n - at < 4) { rc = PRESS_E_TRUNC; break; }
+    var mg: uint32 = press_rd32(p + at);
+    if ((mg & 0xFFFFFFF0) == PZS_SKIP_MAGIC) {
+      if (n - at < 8) { rc = PRESS_E_TRUNC; break; }
+      var sk: int64 = (int64)press_rd32(p + at + 4);
+      if (n - at - 8 < sk) { rc = PRESS_E_TRUNC; break; }
+      at = at + 8 + sk;
+      continue;
+    }
+    if (mg != PZS_MAGIC) { rc = PRESS_E_DATA; break; }
+    if (d == 0) {
+      d = pzs_dec_new();
+      if (d == 0) { rc = PRESS_E_MEM; break; }
+    }
+    var used: int64 = 0;
+    rc = dec_frame(d, p + at, n - at, out, wmax, &used);
+    if (rc != PRESS_OK) { break; }
+    at = at + used;
+  }
+  pzs_dec_delete(d);
+  if (rc != PRESS_OK) { out->len = keep; }
+  return rc;
+}

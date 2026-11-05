@@ -36,6 +36,7 @@ API_LINES = 4
 NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\Z")
 COMPONENT = re.compile(r"[A-Za-z0-9_+.-]+\Z")
+PLATFORMS = ("linux", "macos", "windows")
 RESERVED_NAMES = {"std", "mettle", "con", "prn", "aux", "nul", "v1"}
 RESERVED_STEMS = {"con", "prn", "aux", "nul"}
 BINARY = {".exe", ".dll", ".so", ".dylib", ".o", ".obj", ".a", ".lib", ".pdb", ".tar", ".zip", ".gz"}
@@ -95,7 +96,7 @@ def parse_manifest(path):
             if len(parts) != 2 or not name_is_valid(parts[0]) or not VERSION.match(parts[1]):
                 raise RegistryError(f"{path}:{number}: a require line is `require = <name> <version>`")
             fields["require"][parts[0]] = parts[1]
-        elif key in ("name", "version", "description", "license", "source", "compiler"):
+        elif key in ("name", "version", "description", "license", "source", "compiler", "platforms"):
             fields[key] = value
         else:
             raise RegistryError(f"{path}:{number}: unknown key `{key}`")
@@ -112,6 +113,10 @@ def check_manifest(fields, where):
         raise RegistryError(f"{where}: `{fields['version']}` is not a version")
     if fields.get("compiler") and not VERSION.match(fields["compiler"]):
         raise RegistryError(f"{where}: `{fields['compiler']}` is not a version")
+    if "platforms" in fields:
+        named = fields["platforms"].split()
+        if not named or any(p not in PLATFORMS for p in named) or len(set(named)) != len(named):
+            raise RegistryError(f"{where}: platforms is a list of {', '.join(PLATFORMS)}")
     if "\t" in fields["description"]:
         raise RegistryError(f"{where}: a description holds no tabs")
 
@@ -603,6 +608,8 @@ def rail_facts(registry, name, latest):
         ("Size", format_size(len(latest["archive"]))),
         ("Published", latest["date"]),
     ]
+    if manifest.get("platforms"):
+        rows.append(("Platforms", text_escape(", ".join(manifest["platforms"].split()))))
     if manifest.get("compiler"):
         rows.append(("Compiler", f"{text_escape(manifest['compiler'])} or newer"))
     if manifest["require"]:
@@ -777,7 +784,17 @@ def check_with_compiler(registry, compiler):
             server.server_close()
 
 
+def host_platform():
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return "macos" if sys.platform == "darwin" else "windows"
+
+
 def check_latest(name, package, compiler, scratch, environment):
+    platforms = package["manifest"].get("platforms")
+    if platforms and host_platform() not in platforms.split():
+        print(f"{name} {package['version']}: not built here, it is for {platforms}")
+        return
     project = scratch / f"use-{name}"
     project.mkdir()
     run_tool([compiler, "pkg", "add", f"{name}@{package['version']}"], project, environment)

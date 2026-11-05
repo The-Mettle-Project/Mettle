@@ -1,0 +1,47 @@
+// Image patterns: a pixmap used as paint, mapped by a transform, with a
+// spread mode on each axis and nearest or bilinear sampling.
+
+import "../core/base";
+import "../core/pixmap";
+import "../geom/transform";
+import "gradient";
+
+export const CANVAS_NEAREST: int32 = 0;
+export const CANVAS_BILINEAR: int32 = 1;
+
+export struct CanvasPattern {
+  pm: CanvasPixmap*;      // borrowed; must outlive drawing with it
+  m: CanvasTransform;     // pattern space (pixels of pm) to user space
+  spread_x: int32;
+  spread_y: int32;
+  filter: int32;
+}
+
+/// A pattern of pm repeated in both directions, sampled bilinearly.
+export fn canvas_pattern(p: CanvasPattern*, pm: CanvasPixmap*) {
+  p->pm = pm;
+  p->m = canvas_identity();
+  p->spread_x = CANVAS_REPEAT;
+  p->spread_y = CANVAS_REPEAT;
+  p->filter = CANVAS_BILINEAR;
+}
+
+// An index in [0, n) for i under a spread mode, or -1 (DECAL outside).
+@inline export fn canvas_wrap_index(i: int32, n: int32, spread: int32) -> int32 {
+  if (i >= 0 && i < n) { return i; }
+  if (spread == CANVAS_REPEAT) {
+    var r: int32 = i % n;
+    if (r < 0) { r = r + n; }
+    return r;
+  }
+  if (spread == CANVAS_REFLECT) {
+    var p: int32 = 2 * n;
+    var r2: int32 = i % p;
+    if (r2 < 0) { r2 = r2 + p; }
+    if (r2 >= n) { r2 = p - 1 - r2; }
+    return r2;
+  }
+  if (spread == CANVAS_DECAL) { return -1; }
+  if (i < 0) { return 0; }
+  return n - 1;
+}

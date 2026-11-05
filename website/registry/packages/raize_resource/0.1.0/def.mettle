@@ -1,0 +1,246 @@
+// raize/resource/def — what a resource is: its fields (from the compiler) and its actions.
+// reference: data-layers
+// thread: a definition is built once, on the main thread during declaration, and is
+// read-only afterwards (any thread may read it).
+//
+// rzpp generates one `<snake>_resource()` per `@resource` struct that fills an
+// RzResourceDef through the rz__resource_* / rz__attr_* / rz__action_* calls below.
+// Field names, offsets and sizes come from `comptime for f in typeof(T).fields`, so
+// raize never assumes a layout (flux_orm's RcField idiom).
+
+import "raize_core/str/str";
+import "raize_core/core/status";
+
+/// Field kind: a 32-bit signed integer.
+export const RZ_KIND_INT32: int32 = 1;
+/// Field kind: a 64-bit signed integer (the primary key is one).
+export const RZ_KIND_INT64: int32 = 2;
+/// Field kind: a bool.
+export const RZ_KIND_BOOL: int32 = 3;
+/// Field kind: a string the data layer copies and owns.
+export const RZ_KIND_STRING: int32 = 4;
+
+/// Field flag: the primary key (field 0, `id: int64`, assigned by the data layer).
+export const RZ_FIELD_PK: int32 = 1;
+/// Field flag: `@required`, a string that must be non-empty after trimming.
+export const RZ_FIELD_REQUIRED: int32 = 2;
+
+/// Most fields a resource may have.
+export const RZ_RESOURCE_MAX_FIELDS: int32 = 16;
+/// Most actions a resource may have.
+export const RZ_RESOURCE_MAX_ACTIONS: int32 = 8;
+
+/// internal: resource/action, resource/api. Action kinds.
+export const RZ__ACTION_CREATE: int32 = 1;
+/// internal: resource/action, resource/api. Read: list, get by id, count.
+export const RZ__ACTION_READ: int32 = 2;
+/// internal: resource/action, resource/api. Destroy by id.
+export const RZ__ACTION_DESTROY: int32 = 3;
+/// internal: resource/action, resource/api. A custom update through a change fn.
+export const RZ__ACTION_CUSTOM: int32 = 4;
+/// internal: resource/action, resource/api. Update by id, setting the accepted fields.
+export const RZ__ACTION_UPDATE: int32 = 5;
+
+/// One field of a resource record, as the compiler laid it out.
+export struct RzField {
+  name: string;     // the field name; static (a compile-time name)
+  kind: int32;      // RZ_KIND_*, 0 for a type resources do not support
+  offset: int32;    // bytes from the start of the record
+  size: int32;      // bytes
+  flags: int32;     // RZ_FIELD_* bits
+  min_len: int32;   // @min_length in bytes after trimming, -1 when unset
+  max_len: int32;   // @max_length in bytes after trimming, -1 when unset
+}
+
+/// One declared action of a resource.
+export struct RzAction {
+  name: string;                 // "create", "read", "destroy" or the custom name; static
+  kind: int32;                  // RZ__ACTION_*
+  accept: int64;                // bit i set = field i is accepted (create, update)
+  change: fn(rawptr) -> void;   // custom actions: the generated typed wrapper, else 0
+}
+
+/// A resource: record layout, validations and actions. One static instance per
+/// `@resource` struct, returned by the generated `<snake>_resource()`.
+export struct RzResourceDef {
+  name: string;                    // snake name ("note"); static
+  type_name: string;               // struct name ("Note"); static
+  size: int64;                     // sizeof the record struct
+  fields: RzField[16];             // RZ_RESOURCE_MAX_FIELDS
+  nfields: int32;                  // fields reported by the compiler
+  actions: RzAction[8];            // RZ_RESOURCE_MAX_ACTIONS
+  nactions: int32;                 // actions declared
+  ready: bool;                     // true once rz__resource_end ran
+  status: int32;                   // RZ_OK, or the first definition error
+}
+
+/// internal: generated <snake>_resource(). True once the definition is built.
+/// in:      def  the resource's static definition
+/// returns: true when rz__resource_end has run
+/// owns:    nothing
+export fn rz__resource_ready(def: RzResourceDef*) -> bool {
+  return def != 0 && def->ready;
+}
+
+/// internal: generated <snake>_resource(). Starts filling a definition.
+/// in:      def        the resource's zeroed static definition
+///          name       snake name; static
+///          type_name  struct name; static
+///          size       sizeof the record struct
+/// returns: nothing
+/// owns:    keeps `name` and `type_name` (static literals)
+export fn rz__resource_begin(def: RzResourceDef*, name: string, type_name: string, size: int64) {
+  def->name = name;
+  def->type_name = type_name;
+  def->size = size;
+  def->nfields = 0;
+  def->nactions = 0;
+  def->status = RZ_OK;
+}
+
+fn rz__kind_of(k: Kind) -> int32 {
+  if (k == Kind.Int32) { return RZ_KIND_INT32; }
+  if (k == Kind.Int64) { return RZ_KIND_INT64; }
+  if (k == Kind.Bool) { return RZ_KIND_BOOL; }
+  if (k == Kind.String) { return RZ_KIND_STRING; }
+  return 0;
+}
+
+/// internal: generated <Type>__init_fields (its comptime for). Records one field.
+/// in:      def     the definition being built
+///          name    f.name; static
+///          kind    f.type.kind
+///          offset  f.offset in bytes
+///          size    f.type.size in bytes
+/// returns: nothing; an unsupported kind or a 17th field sets def->status
+/// owns:    keeps `name` (a compile-time name)
+export fn rz__resource_field(def: RzResourceDef*, name: string, kind: Kind, offset: int64, size: int64) {
+  var i: int32 = def->nfields;
+  if (i >= RZ_RESOURCE_MAX_FIELDS) { def->status = RZ_E_FULL; return; }
+  def->fields[i].name = name;
+  def->fields[i].kind = rz__kind_of(kind);
+  def->fields[i].offset = (int32)offset;
+  def->fields[i].size = (int32)size;
+  def->fields[i].flags = 0;
+  def->fields[i].min_len = -1;
+  def->fields[i].max_len = -1;
+  if (i == 0) { def->fields[i].flags = RZ_FIELD_PK; }
+  if (def->fields[i].kind == 0) { def->status = RZ_E_UNSUPPORTED; }
+  def->nfields = i + 1;
+}
+
+/// internal: generated <snake>_resource(). Marks field `i` @required.
+/// in:      def  the definition being built
+///          i    field index (rzpp checked it is a string field)
+/// returns: nothing
+/// owns:    nothing
+export fn rz__attr_required(def: RzResourceDef*, i: int32) {
+  if (i < 0 || i >= def->nfields) { def->status = RZ_E_USAGE; return; }
+  def->fields[i].flags = def->fields[i].flags | RZ_FIELD_REQUIRED;
+}
+
+/// internal: generated <snake>_resource(). Sets field `i`'s @max_length.
+/// in:      def  the definition being built
+///          i    field index (a string field)
+///          n    most bytes after trimming, >= 0
+/// returns: nothing
+/// owns:    nothing
+export fn rz__attr_max_length(def: RzResourceDef*, i: int32, n: int32) {
+  if (i < 0 || i >= def->nfields || n < 0) { def->status = RZ_E_USAGE; return; }
+  def->fields[i].max_len = n;
+}
+
+/// internal: generated <snake>_resource(). Sets field `i`'s @min_length.
+/// in:      def  the definition being built
+///          i    field index (a string field)
+///          n    fewest bytes after trimming, >= 0 (an empty value is left to @required)
+/// returns: nothing
+/// owns:    nothing
+export fn rz__attr_min_length(def: RzResourceDef*, i: int32, n: int32) {
+  if (i < 0 || i >= def->nfields || n < 0) { def->status = RZ_E_USAGE; return; }
+  def->fields[i].min_len = n;
+}
+
+fn rz__action_add(def: RzResourceDef*, name: string, kind: int32, accept: int64, change: fn(rawptr) -> void) {
+  var i: int32 = def->nactions;
+  if (i >= RZ_RESOURCE_MAX_ACTIONS) { def->status = RZ_E_FULL; return; }
+  def->actions[i].name = name;
+  def->actions[i].kind = kind;
+  def->actions[i].accept = accept;
+  def->actions[i].change = change;
+  def->nactions = i + 1;
+}
+
+fn rz__no_change(rec: rawptr) { }
+
+/// internal: generated <snake>_resource(). Declares @create(fields...).
+/// in:      def     the definition being built
+///          accept  bit i set = field i is accepted
+/// returns: nothing
+/// owns:    nothing
+export fn rz__action_create(def: RzResourceDef*, accept: int64) {
+  rz__action_add(def, "create", RZ__ACTION_CREATE, accept, &rz__no_change);
+}
+
+/// internal: generated <snake>_resource(). Declares @update(fields...).
+/// in:      def     the definition being built
+///          accept  bit i set = field i is accepted (never bit 0, the id)
+/// returns: nothing
+/// owns:    nothing
+export fn rz__action_update(def: RzResourceDef*, accept: int64) {
+  rz__action_add(def, "update", RZ__ACTION_UPDATE, accept, &rz__no_change);
+}
+
+/// internal: generated <snake>_resource(). Declares @read (list, get, count).
+/// in:      def  the definition being built
+/// returns: nothing
+/// owns:    nothing
+export fn rz__action_read(def: RzResourceDef*) {
+  rz__action_add(def, "read", RZ__ACTION_READ, 0, &rz__no_change);
+}
+
+/// internal: generated <snake>_resource(). Declares @destroy.
+/// in:      def  the definition being built
+/// returns: nothing
+/// owns:    nothing
+export fn rz__action_destroy(def: RzResourceDef*) {
+  rz__action_add(def, "destroy", RZ__ACTION_DESTROY, 0, &rz__no_change);
+}
+
+/// internal: generated <snake>_resource(). Declares @action(name, change_fn).
+/// in:      def     the definition being built
+///          name    the action name; static
+///          change  the generated typed wrapper `<Type>__change_<name>(rec: rawptr)`
+/// returns: nothing
+/// owns:    keeps `name` (a static literal)
+export fn rz__action_custom(def: RzResourceDef*, name: string, change: fn(rawptr) -> void) {
+  rz__action_add(def, name, RZ__ACTION_CUSTOM, 0, change);
+}
+
+/// internal: generated <snake>_resource(). Seals the definition.
+/// in:      def  the definition being built
+/// returns: nothing; a resource without actions or without `id: int64` first gets
+///          def->status = RZ_E_INVALID
+/// owns:    nothing
+export fn rz__resource_end(def: RzResourceDef*) {
+  if (def->nactions == 0) { def->status = RZ_E_INVALID; }
+  if (def->nfields == 0 || def->fields[0].kind != RZ_KIND_INT64) { def->status = RZ_E_INVALID; }
+  def->ready = true;
+}
+
+/// internal: resource/action, resource/api. Index of the action named `name` of
+/// kind `kind`, or -1.
+/// in:      def   a built definition
+///          kind  RZ__ACTION_*
+///          name  the action name (ignored unless kind is RZ__ACTION_CUSTOM)
+/// returns: the index, or -1
+/// owns:    nothing
+export fn rz__resource_action(def: RzResourceDef*, kind: int32, name: string) -> int32 {
+  if (def == 0) { return -1; }
+  for i in 0..def->nactions {
+    if (def->actions[i].kind == kind) {
+      if (kind != RZ__ACTION_CUSTOM || rz_str_eq(def->actions[i].name, name)) { return (int32)i; }
+    }
+  }
+  return -1;
+}

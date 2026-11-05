@@ -1,0 +1,430 @@
+// flux_orm/adapter/mem.mettle — the recording adapter.
+//
+// This is not a database. It is the seam's executable specification: it
+// records the statement text and the bound arguments, and replays a scripted
+// result. That is enough to pin down argument order, type preservation, NULL
+// round-tripping, ownership, transaction states and error propagation without
+// a single byte of MeoDB existing yet — which matters, because MeoDB's SQL
+// surface is a later phase than this ORM's core.
+//
+// It is also the adapter the whole test suite runs against, so every ORM
+// behaviour is verified twice: once against the seam, once against real MeoDB
+// once that lands.
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "adapter";
+
+struct RcMemStep {
+  values: RcValue*; // flat, row-major, owned
+  n_rows: int32;
+  n_cols: int32;
+  affected: int32;
+  last_id: int64;
+}
+
+struct RcMem {
+  opened: bool;
+  calls: int32;
+  sql: string;      // owned copy of the last statement
+  args: RcValue*;   // owned clones of the last bound arguments
+  n_args: int32;
+  steps: RcMemStep*;
+  n_steps: int32;
+  head: int32;
+  tx_depth: int32;
+  commits: int32;
+  rollbacks: int32;
+  fail_code: int32;
+  fail_armed: bool;
+}
+
+fn rc_mem_of(ud: rawptr) -> RcMem* { return (RcMem*)ud; }
+
+fn rc_mem_of_checked(a: RcAdapter*) -> RcMem* {
+  if (a == 0) { return 0; }
+  if (a.name != "mem") { return 0; }
+  return rc_mem_of(a.ud);
+}
+
+fn rc_mem_args_free(m: RcMem*) {
+  if (m == 0) { return; }
+  if (m.args != 0) {
+    var i: int32 = 0;
+    while (i < m.n_args) {
+      rc_value_release(m.args[i]);
+      i = i + 1;
+    }
+    free(m.args);
+  }
+  m.args = 0;
+  m.n_args = 0;
+}
+
+fn rc_mem_open(ud: rawptr, dsn: string) -> int32 {
+  var m: RcMem* = rc_mem_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (m.opened) { return RC_ERR_USAGE; }
+  if (dsn.length == (uint64)0) { return RC_ERR_USAGE; }
+  m.opened = true;
+  return RC_OK;
+}
+
+fn rc_mem_close(ud: rawptr) -> int32 {
+  var m: RcMem* = rc_mem_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (!m.opened) { return RC_OK; }
+  if (m.tx_depth > 0) { return RC_ERR_TX; }
+  m.opened = false;
+  return RC_OK;
+}
+
+fn rc_mem_exec(ud: rawptr, sql: string, args: RcValue*, n_args: int32,
+               out: RcResult*) -> int32 {
+  var m: RcMem* = rc_mem_of(ud);
+  if (m == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (!m.opened) { return RC_ERR_CLOSED; }
+  if (n_args < 0) { return RC_ERR_USAGE; }
+  if (n_args > 0 && args == 0) { return RC_ERR_USAGE; }
+
+  // Injected failure happens before anything is recorded, so a test can prove
+  // a failed call left the seam untouched.
+  if (m.fail_armed) {
+    m.fail_armed = false;
+    var code: int32 = m.fail_code;
+    m.fail_code = 0;
+    return code;
+  }
+
+  var text: string = rc_text_dup(sql);
+  if (text.chars == 0 && sql.length > (uint64)0) { return RC_ERR_NOMEM; }
+  rc_text_free(m.sql);
+  m.sql = text;
+  rc_mem_args_free(m);
+  if (n_args > 0) {
+    var copy: RcValue* = malloc((int64)n_args * (int64)sizeof(RcValue));
+    if (copy == 0) { return RC_ERR_NOMEM; }
+    var i: int32 = 0;
+    while (i < n_args) {
+      var v: RcValue = RcNull;
+      var rc: int32 = rc_value_clone(args[i], &v);
+      if (rc != RC_OK) {
+        var k: int32 = 0;
+        while (k < i) { rc_value_release(copy[k]); k = k + 1; }
+        free(copy);
+        return rc;
+      }
+      copy[i] = v;
+      i = i + 1;
+    }
+    m.args = copy;
+    m.n_args = n_args;
+  }
+  m.calls = m.calls + 1;
+
+  if (m.head < m.n_steps) {
+    var step: RcMemStep = m.steps[m.head];
+    m.head = m.head + 1;
+    var rc: int32 = rc_result_copy(out, step.values, step.n_rows, step.n_cols,
+                                  step.affected, step.last_id);
+    var i: int32 = 0;
+    while (i < step.n_rows * step.n_cols) {
+      rc_value_release(step.values[i]);
+      i = i + 1;
+    }
+    free(step.values);
+    return rc;
+  }
+  return RC_OK;
+}
+
+fn rc_mem_begin(ud: rawptr, mode: int32) -> int32 {
+  var m: RcMem* = rc_mem_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (!m.opened) { return RC_ERR_CLOSED; }
+  if (mode != RC_TX_DEFAULT && mode != RC_TX_DEFERRED && mode != RC_TX_IMMEDIATE) {
+    return RC_ERR_USAGE;
+  }
+  // No nesting, like MeoDB: silent nesting hides a boundary bug in the caller.
+  // core/session flattens nesting above this.
+  if (m.tx_depth != 0) { return RC_ERR_TX; }
+  m.tx_depth = 1;
+  return RC_OK;
+}
+
+fn rc_mem_commit(ud: rawptr) -> int32 {
+  var m: RcMem* = rc_mem_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (!m.opened) { return RC_ERR_CLOSED; }
+  if (m.tx_depth != 1) { return RC_ERR_TX; }
+  m.tx_depth = 0;
+  m.commits = m.commits + 1;
+  return RC_OK;
+}
+
+fn rc_mem_rollback(ud: rawptr) -> int32 {
+  var m: RcMem* = rc_mem_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (!m.opened) { return RC_ERR_CLOSED; }
+  if (m.tx_depth != 1) { return RC_ERR_TX; }
+  m.tx_depth = 0;
+  m.rollbacks = m.rollbacks + 1;
+  return RC_OK;
+}
+
+fn rc_mem_ping(ud: rawptr) -> int32 {
+  var m: RcMem* = rc_mem_of(ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (!m.opened) { return RC_ERR_CLOSED; }
+  return RC_OK;
+}
+
+// Makes a new recording adapter, closed, with an empty script. Its slots:
+//   open      RC_ERR_USAGE for an empty dsn or when already open
+//   close     RC_OK when not open; RC_ERR_TX while a transaction is open
+//   exec      RC_ERR_CLOSED before open; RC_ERR_USAGE for n_args < 0 or a 0
+//             args with n_args > 0; then an armed rc_mem_fail_next code;
+//             otherwise records a copy of sql and clones of args, and returns
+//             the next scripted result (or RC_OK with no rows once the script
+//             is used up)
+//   begin     RC_ERR_CLOSED; RC_ERR_USAGE for a bad RC_TX_* mode; RC_ERR_TX
+//             when a transaction is already open (no nesting)
+//   commit, rollback  RC_ERR_CLOSED; RC_ERR_TX when none is open
+//   ping      RC_ERR_CLOSED before open, else RC_OK
+//   query     0, so rc_query_exec sends it SQL text
+// Returns the adapter, owned by the caller (free with rc_mem_free), or 0 when
+// allocation fails.
+export fn rc_mem_adapter() -> RcAdapter* {
+  var m: RcMem* = malloc(sizeof(RcMem));
+  if (m == 0) { return 0; }
+  m.opened = false;
+  m.calls = 0;
+  m.sql = str_from_bytes((cstring)0, 0);
+  m.args = 0;
+  m.n_args = 0;
+  m.steps = 0;
+  m.n_steps = 0;
+  m.head = 0;
+  m.tx_depth = 0;
+  m.commits = 0;
+  m.rollbacks = 0;
+  m.fail_code = 0;
+  m.fail_armed = false;
+
+  var a: RcAdapter* = malloc(sizeof(RcAdapter));
+  if (a == 0) {
+    free(m);
+    return 0;
+  }
+  a.name = "mem";
+  a.ud = (rawptr)m;
+  a.open = &rc_mem_open;
+  a.close = &rc_mem_close;
+  a.exec = &rc_mem_exec;
+  a.begin = &rc_mem_begin;
+  a.commit = &rc_mem_commit;
+  a.rollback = &rc_mem_rollback;
+  a.ping = &rc_mem_ping;
+  a.query = 0;  // records SQL text; the RcStmt path is tested with fakes
+  return a;
+}
+
+// Frees an adapter from rc_mem_adapter: the recorded sql and args, every
+// unused scripted result, its state and the adapter itself.
+//   a   the adapter; may be 0. Only pass one from rc_mem_adapter: the name is
+//       not checked and `a` itself is freed. Views from rc_mem_last_sql and
+//       rc_mem_last_args are invalid after.
+export fn rc_mem_free(a: RcAdapter*) {
+  if (a == 0 || a.name != "mem") { return; }
+  var m: RcMem* = rc_mem_of(a.ud);
+  if (m != 0) {
+    rc_text_free(m.sql);
+    rc_mem_args_free(m);
+    if (m.steps != 0) {
+      var i: int32 = m.head;
+      while (i < m.n_steps) {
+        var step: RcMemStep = m.steps[i];
+        var k: int32 = 0;
+        while (k < step.n_rows * step.n_cols) {
+          rc_value_release(step.values[k]);
+          k = k + 1;
+        }
+        free(step.values);
+        i = i + 1;
+      }
+      free(m.steps);
+    }
+    free(m);
+  }
+  free(a);
+}
+
+// Clones values into a new scripted result at the end of the queue.
+fn rc_mem_push_step(a: RcAdapter*, values: RcValue*, n_rows: int32,
+                    n_cols: int32, affected: int32, last_id: int64) -> int32 {
+  if (a == 0 || a.name != "mem") { return RC_ERR_USAGE; }
+  var m: RcMem* = rc_mem_of(a.ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (n_rows < 0 || n_cols < 0) { return RC_ERR_USAGE; }
+  var owned: RcValue* = 0;
+  var total: int32 = n_rows * n_cols;
+  if (total > 0) {
+    if (values == 0) { return RC_ERR_USAGE; }
+    owned = malloc((int64)total * (int64)sizeof(RcValue));
+    if (owned == 0) { return RC_ERR_NOMEM; }
+    var i: int32 = 0;
+    while (i < total) {
+      var v: RcValue = RcNull;
+      var rc: int32 = rc_value_clone(values[i], &v);
+      if (rc != RC_OK) {
+        var k: int32 = 0;
+        while (k < i) { rc_value_release(owned[k]); k = k + 1; }
+        free(owned);
+        return rc;
+      }
+      owned[i] = v;
+      i = i + 1;
+    }
+  }
+  var next: RcMemStep* = realloc((rawptr)m.steps,
+                                 (int64)(m.n_steps + 1) * (int64)sizeof(RcMemStep));
+  if (next == 0) {
+    if (owned != 0) {
+      var i: int32 = 0;
+      while (i < total) { rc_value_release(owned[i]); i = i + 1; }
+      free(owned);
+    }
+    return RC_ERR_NOMEM;
+  }
+  m.steps = next;
+  m.steps[m.n_steps].values = owned;
+  m.steps[m.n_steps].n_rows = n_rows;
+  m.steps[m.n_steps].n_cols = n_cols;
+  m.steps[m.n_steps].affected = affected;
+  m.steps[m.n_steps].last_id = last_id;
+  m.n_steps = m.n_steps + 1;
+  return RC_OK;
+}
+
+// Queues a result with no rows, e.g. for an INSERT, for the next exec that
+// gets past its checks.
+//   a         an adapter from rc_mem_adapter
+//   affected  the result's affected count
+//   last_id   the result's last_id
+// Returns RC_OK. RC_ERR_USAGE when a or its state is 0. RC_ERR_NOMEM when the
+// script cannot grow.
+export fn rc_mem_push_ok(a: RcAdapter*, affected: int32, last_id: int64) -> int32 {
+  return rc_mem_push_step(a, 0, 0, 0, affected, last_id);
+}
+
+// Queues a result with rows for the next exec that gets past its checks;
+// affected and last_id are 0.
+//   a       an adapter from rc_mem_adapter
+//   values  n_rows * n_cols cells, flat and row-major; borrowed, every cell is
+//           cloned, so the caller keeps ownership; may be 0 when there are none
+//   n_rows  rows, 0 or more
+//   n_cols  cells per row, 0 or more
+// Returns RC_OK. RC_ERR_USAGE when a or its state is 0, n_rows or n_cols < 0,
+// or values is 0 with cells to copy. RC_ERR_NOMEM when a clone or the script
+// cannot grow, RC_ERR_CAST for a cell with an unknown arm; nothing is queued.
+export fn rc_mem_push_rows(a: RcAdapter*, values: RcValue*, n_rows: int32,
+                           n_cols: int32) -> int32 {
+  return rc_mem_push_step(a, values, n_rows, n_cols, 0, 0);
+}
+
+// Makes the next exec return `code` without recording anything or using a
+// scripted result. It fires on the first exec that passes the open and
+// argument checks, then disarms.
+//   a      an adapter from rc_mem_adapter
+//   code   returned as is (any value, RC_OK included)
+// Returns RC_OK. RC_ERR_USAGE when a or its state is 0.
+export fn rc_mem_fail_next(a: RcAdapter*, code: int32) -> int32 {
+  if (a == 0 || a.name != "mem") { return RC_ERR_USAGE; }
+  if (code == RC_OK) { return RC_ERR_USAGE; }
+  var m: RcMem* = rc_mem_of(a.ud);
+  if (m == 0) { return RC_ERR_USAGE; }
+  m.fail_code = code;
+  m.fail_armed = true;
+  return RC_OK;
+}
+
+// The SQL text of the last recorded exec.
+//   a   the adapter; may be 0
+// Returns a borrowed view of the adapter's own copy, valid until the next
+// recorded exec or rc_mem_free; "" when none was recorded or a is 0 or not a
+// mem adapter.
+export fn rc_mem_last_sql(a: RcAdapter*) -> string {
+  var m: RcMem* = rc_mem_of_checked(a);
+  if (m == 0) { return ""; }
+  return m.sql;
+}
+
+// The arguments of the last recorded exec; rc_mem_arg_count gives the count.
+//   a   the adapter; may be 0
+// Returns the adapter's own clones, borrowed, valid until the next recorded
+// exec or rc_mem_free (do not release them); 0 when there were none, or a is
+// 0 or not a mem adapter.
+export fn rc_mem_last_args(a: RcAdapter*) -> RcValue* {
+  var m: RcMem* = rc_mem_of_checked(a);
+  if (m == 0) { return 0; }
+  return m.args;
+}
+
+// The number of arguments of the last recorded exec.
+//   a   the adapter; may be 0
+// Returns the count, or -1 when a is 0 or not a mem adapter.
+export fn rc_mem_arg_count(a: RcAdapter*) -> int32 {
+  var m: RcMem* = rc_mem_of_checked(a);
+  if (m == 0) { return -1; }
+  return m.n_args;
+}
+
+// The number of execs recorded so far. Execs refused by a check or by
+// rc_mem_fail_next are not counted.
+//   a   the adapter; may be 0
+// Returns the count, or -1 when a is 0 or not a mem adapter.
+export fn rc_mem_call_count(a: RcAdapter*) -> int32 {
+  var m: RcMem* = rc_mem_of_checked(a);
+  if (m == 0) { return -1; }
+  return m.calls;
+}
+
+// Whether a transaction is open.
+//   a   the adapter; may be 0
+// Returns 1 inside a transaction, 0 outside, or -1 when a is 0 or not a mem
+// adapter.
+export fn rc_mem_tx_depth(a: RcAdapter*) -> int32 {
+  var m: RcMem* = rc_mem_of_checked(a);
+  if (m == 0) { return -1; }
+  return m.tx_depth;
+}
+
+// The number of successful commits.
+//   a   the adapter; may be 0
+// Returns the count, or -1 when a is 0 or not a mem adapter.
+export fn rc_mem_commits(a: RcAdapter*) -> int32 {
+  var m: RcMem* = rc_mem_of_checked(a);
+  if (m == 0) { return -1; }
+  return m.commits;
+}
+
+// The number of successful rollbacks.
+//   a   the adapter; may be 0
+// Returns the count, or -1 when a is 0 or not a mem adapter.
+export fn rc_mem_rollbacks(a: RcAdapter*) -> int32 {
+  var m: RcMem* = rc_mem_of_checked(a);
+  if (m == 0) { return -1; }
+  return m.rollbacks;
+}
+
+// Whether the adapter is open.
+//   a   the adapter; may be 0
+// Returns true after a successful open and before close; false otherwise, or
+// when a is 0 or not a mem adapter.
+export fn rc_mem_is_open(a: RcAdapter*) -> bool {
+  var m: RcMem* = rc_mem_of_checked(a);
+  if (m == 0) { return false; }
+  return m.opened;
+}

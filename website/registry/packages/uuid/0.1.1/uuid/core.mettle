@@ -1,0 +1,203 @@
+// core: the Uuid type, its fields, comparison, hashing and byte order.
+//
+// A Uuid is 16 bytes in network order (big-endian), as RFC 9562 section 4
+// lays them out. Byte 6 holds the version in its high 4 bits and byte 8
+// holds the variant in its high bits.
+
+import "std/core";
+
+export struct Uuid {
+  b: uint8[16];
+}
+
+// Variants (RFC 9562 section 4.1), read from the high bits of byte 8.
+export const UUID_VARIANT_NCS: int32 = 0;       // 0xxx: old Apollo NCS
+export const UUID_VARIANT_RFC: int32 = 1;       // 10xx: RFC 9562 (and 4122)
+export const UUID_VARIANT_MICROSOFT: int32 = 2; // 110x: old Microsoft GUIDs
+export const UUID_VARIANT_FUTURE: int32 = 3;    // 111x: reserved
+
+// The nil UUID: all bits zero (RFC 9562 section 5.9).
+export fn uuid_nil() -> Uuid {
+  var u: Uuid;
+  for i in 0..16 { u.b[i] = 0; }
+  return u;
+}
+
+// The max UUID: all bits one (RFC 9562 section 5.10).
+export fn uuid_max() -> Uuid {
+  var u: Uuid;
+  for i in 0..16 { u.b[i] = 255; }
+  return u;
+}
+
+// A Uuid from 16 bytes in network order. The bytes are taken as they are.
+export fn uuid_from_bytes(p: uint8*) -> Uuid {
+  var u: Uuid;
+  for i in 0..16 { u.b[i] = p[i]; }
+  return u;
+}
+
+// Copies the 16 bytes, network order, to out.
+export fn uuid_to_bytes(u: Uuid, out: uint8*) {
+  for i in 0..16 { out[i] = u.b[i]; }
+}
+
+// A Uuid from its high and low 64 bits, as Java's UUID(msb, lsb).
+export fn uuid_from_u64(hi: uint64, lo: uint64) -> Uuid {
+  var u: Uuid;
+  for i in 0..8 {
+    u.b[i] = (uint8)(hi >> (uint64)(56 - 8 * i));
+    u.b[i + 8] = (uint8)(lo >> (uint64)(56 - 8 * i));
+  }
+  return u;
+}
+
+// The high 64 bits (Java's getMostSignificantBits).
+export fn uuid_hi(u: Uuid) -> uint64 {
+  var v: uint64 = 0;
+  for i in 0..8 { v = (v << (uint64)8) | (uint64)u.b[i]; }
+  return v;
+}
+
+// The low 64 bits (Java's getLeastSignificantBits).
+export fn uuid_lo(u: Uuid) -> uint64 {
+  var v: uint64 = 0;
+  for i in 0..8 { v = (v << (uint64)8) | (uint64)u.b[i + 8]; }
+  return v;
+}
+
+// A Uuid from the classic fields: a 32-bit, two 16-bit and 8 more bytes.
+// This is the layout of a Windows GUID struct, given as numbers.
+export fn uuid_from_fields(d1: uint32, d2: uint16, d3: uint16, d4: uint8*) -> Uuid {
+  var u: Uuid;
+  u.b[0] = (uint8)(d1 >> (uint32)24);
+  u.b[1] = (uint8)(d1 >> (uint32)16);
+  u.b[2] = (uint8)(d1 >> (uint32)8);
+  u.b[3] = (uint8)d1;
+  u.b[4] = (uint8)(d2 >> (uint16)8);
+  u.b[5] = (uint8)d2;
+  u.b[6] = (uint8)(d3 >> (uint16)8);
+  u.b[7] = (uint8)d3;
+  for i in 0..8 { u.b[i + 8] = d4[i]; }
+  return u;
+}
+
+// The classic fields back out of a Uuid. d4 receives 8 bytes.
+export fn uuid_to_fields(u: Uuid, d1: uint32*, d2: uint16*, d3: uint16*, d4: uint8*) {
+  *d1 = ((uint32)u.b[0] << (uint32)24) | ((uint32)u.b[1] << (uint32)16) | ((uint32)u.b[2] << (uint32)8) | (uint32)u.b[3];
+  *d2 = (uint16)(((uint32)u.b[4] << (uint32)8) | (uint32)u.b[5]);
+  *d3 = (uint16)(((uint32)u.b[6] << (uint32)8) | (uint32)u.b[7]);
+  for i in 0..8 { d4[i] = u.b[i + 8]; }
+}
+
+// Microsoft's in-memory GUID order: the first three fields little-endian,
+// the last 8 bytes as they are. Use these when reading or writing GUIDs
+// from Windows APIs, COM, SMBIOS or .NET's Guid.ToByteArray.
+export fn uuid_from_bytes_le(p: uint8*) -> Uuid {
+  var u: Uuid;
+  u.b[0] = p[3];
+  u.b[1] = p[2];
+  u.b[2] = p[1];
+  u.b[3] = p[0];
+  u.b[4] = p[5];
+  u.b[5] = p[4];
+  u.b[6] = p[7];
+  u.b[7] = p[6];
+  for i in 8..16 { u.b[i] = p[i]; }
+  return u;
+}
+
+export fn uuid_to_bytes_le(u: Uuid, out: uint8*) {
+  out[0] = u.b[3];
+  out[1] = u.b[2];
+  out[2] = u.b[1];
+  out[3] = u.b[0];
+  out[4] = u.b[5];
+  out[5] = u.b[4];
+  out[6] = u.b[7];
+  out[7] = u.b[6];
+  for i in 8..16 { out[i] = u.b[i]; }
+}
+
+// The version number, 0 to 15, from the high 4 bits of byte 6. It only
+// means something when the variant is UUID_VARIANT_RFC.
+export fn uuid_version(u: Uuid) -> int32 {
+  return (int32)(u.b[6] >> (uint8)4);
+}
+
+export fn uuid_variant(u: Uuid) -> int32 {
+  var x: uint8 = u.b[8];
+  if ((x & (uint8)0x80) == (uint8)0) { return UUID_VARIANT_NCS; }
+  if ((x & (uint8)0x40) == (uint8)0) { return UUID_VARIANT_RFC; }
+  if ((x & (uint8)0x20) == (uint8)0) { return UUID_VARIANT_MICROSOFT; }
+  return UUID_VARIANT_FUTURE;
+}
+
+// Sets the version (high 4 bits of byte 6) and the RFC variant (10 in the
+// top bits of byte 8), keeping every other bit.
+export fn uuid_set_version(u: Uuid*, version: int32) {
+  u->b[6] = (u->b[6] & (uint8)0x0F) | (uint8)((version & 15) << 4);
+  u->b[8] = (u->b[8] & (uint8)0x3F) | (uint8)0x80;
+}
+
+export fn uuid_is_nil(u: Uuid) -> bool {
+  var acc: uint8 = 0;
+  for i in 0..16 { acc = acc | u.b[i]; }
+  return acc == (uint8)0;
+}
+
+export fn uuid_is_max(u: Uuid) -> bool {
+  var acc: uint8 = 255;
+  for i in 0..16 { acc = acc & u.b[i]; }
+  return acc == (uint8)255;
+}
+
+// Compares as unsigned 128-bit numbers, which is the same as comparing the
+// bytes in order (RFC 9562 section 6.11). -1, 0 or 1. Unlike Java, there is
+// no signed comparison: v6 and v7 values sort by time.
+export fn uuid_cmp(a: Uuid, b: Uuid) -> int32 {
+  var x: uint64 = uuid_hi(a);
+  var y: uint64 = uuid_hi(b);
+  if (x == y) {
+    x = uuid_lo(a);
+    y = uuid_lo(b);
+  }
+  if (x < y) { return -1; }
+  if (x > y) { return 1; }
+  return 0;
+}
+
+export fn uuid_eq(a: Uuid, b: Uuid) -> bool {
+  return uuid_hi(a) == uuid_hi(b) && uuid_lo(a) == uuid_lo(b);
+}
+
+export fn uuid_lt(a: Uuid, b: Uuid) -> bool {
+  return uuid_cmp(a, b) < 0;
+}
+
+fn uuid_mix64(x: uint64) -> uint64 {
+  // The finalizer of MurmurHash3 (fmix64): every input bit reaches every
+  // output bit.
+  var k: uint64 = x;
+  k = k ^ (k >> (uint64)33);
+  k = k * (uint64)0xff51afd7ed558ccd;
+  k = k ^ (k >> (uint64)33);
+  k = k * (uint64)0xc4ceb9fe1a85ec53;
+  k = k ^ (k >> (uint64)33);
+  return k;
+}
+
+// A 64-bit hash for tables. It is fast and well mixed but not keyed, so do
+// not use it where an attacker picks the UUIDs and can flood one bucket.
+export fn uuid_hash(u: Uuid) -> uint64 {
+  return uuid_mix64(uuid_hi(u) ^ uuid_mix64(uuid_lo(u) + (uint64)0x9e3779b97f4a7c15));
+}
+
+// Pointer forms for std/collections maps, like std/hash's helpers.
+export fn uuid_hash_ptr(p: rawptr) -> uint64 {
+  return uuid_hash(*(Uuid*)p);
+}
+
+export fn uuid_equal_ptr(a: rawptr, b: rawptr) -> bool {
+  return uuid_eq(*(Uuid*)a, *(Uuid*)b);
+}

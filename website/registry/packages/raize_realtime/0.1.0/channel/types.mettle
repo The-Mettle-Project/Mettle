@@ -1,0 +1,81 @@
+// raize/channel/types — channels: definitions, members, the callback context.
+//
+// A channel is Phoenix's unit of realtime: a client joins a topic
+// ("room:lobby") over one socket, sends events to it and receives pushes and
+// broadcasts. The app declares channel definitions by topic pattern:
+//
+//   join(ctx, payload) -> int32         0 accepts the join; anything else
+//                                       refuses it. Set ctx->state for
+//                                       per-member state, and write a reply
+//                                       body with rz_chan_reply_json.
+//   handle_in(ctx, event, payload) -> int32
+//                                       an event from the client. Reply only
+//                                       if the handler wrote one (Phoenix's
+//                                       {:reply, ...} vs {:noreply, ...});
+//                                       non-zero sends an error reply.
+//   leave(ctx)                          the member is gone (phx_leave, a
+//                                       rejoin, or the socket closed). Free
+//                                       ctx->state here.
+//
+// Every callback runs on the hub thread, one at a time, and must not block
+// (docs/design/realtime.md §5): the same shape a process will have once the
+// Mettle runtime lands.
+//
+// Files: types (this), members (table + push/broadcast), channel (router,
+// dispatch, public setup).
+
+import "raize_core/str/str";
+import "raize_core/context/arena";
+import "raize_core/context/conn";
+import "../hub/hub";
+
+export const RZ_CHAN_MAX_DEFS: int32 = 16;
+export const RZ_CHAN_DEFAULT_MEMBERS: int32 = 8192;
+
+export struct RzChanCtx {
+  router: RzChanRouter*;
+  hub: RzHub*;
+  sock: int64;
+  topic: string;         // owned by the member; valid during the callback
+  join_ref: string;      // raw JSON
+  state: rawptr;         // the member's state; join sets it
+  reply: RzBuf*;      // JSON response body for this event's reply
+  conn: RzConn*;         // the socket's upgrade request (rz_chan_conn); borrowed
+}
+
+export struct RzChannelDef {
+  pattern: string;       // "room:*" (prefix + non-empty rest) or an exact topic
+  join: fn(RzChanCtx*, string) -> int32;
+  handle_in: fn(RzChanCtx*, string, string) -> int32;
+  leave: fn(RzChanCtx*) -> void;
+}
+
+export struct RzChanMember {
+  used: bool;
+  sock: int64;
+  topic: string;         // owned
+  join_ref: string;      // owned raw JSON
+  def: int32;
+  state: rawptr;
+  conn: RzConn*;         // the socket's RzConn; borrowed from its Rz_ChanSock
+}
+
+// internal: channel. Per-socket state: the router and what the socket kept from
+// its upgrade request. Made on the worker in rz_chan_upgrade, freed in on_close.
+export struct Rz_ChanSock {
+  router: RzChanRouter*;
+  conn: RzConn*;         // owned
+}
+
+// `handler` must stay the first field: the hub passes the handler pointer to
+// on_open, and the router finds itself by casting it back.
+export struct RzChanRouter {
+  handler: RzHubHandler;
+  hub: RzHub*;
+  defs: RzChannelDef[16];      // literal is RZ_CHAN_MAX_DEFS
+  ndefs: int32;
+  members: RzChanMember*;
+  max_members: int32;
+  scratch: RzArena*;           // per-message decode space (hub thread)
+  out: RzBuf*;              // per-message encode space (hub thread)
+}

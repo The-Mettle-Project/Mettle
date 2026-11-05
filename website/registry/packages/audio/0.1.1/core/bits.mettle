@@ -1,0 +1,373 @@
+// Readers over a block of memory. None of them ever reads past the end:
+// a read past it gives zeros and sets a flag, so a decoder can read a whole
+// header and check once.
+//
+//   AudioRd    bytes, little or big endian (RIFF, Ogg, ID3 headers)
+//   AudioBits  bits, most significant first (FLAC, MP3, Opus headers)
+//   AudioBitsL bits, least significant first (Vorbis)
+//
+// Also the checksums the formats use: CRC-8 and CRC-16 (FLAC) and the
+// Ogg CRC-32.
+
+// ---- bytes ----
+
+export struct AudioRd {
+  p: uint8*;
+  n: int64;
+  pos: int64;
+  bad: bool;      // set once a read went past the end
+}
+
+export fn audio_rd_init(r: AudioRd*, p: uint8*, n: int64) {
+  r->p = p;
+  r->n = n;
+  r->pos = 0;
+  r->bad = false;
+  if (n < 0) { r->n = 0; }
+}
+
+export fn audio_rd_left(r: AudioRd*) -> int64 { return r->n - r->pos; }
+
+export fn audio_rd_skip(r: AudioRd*, k: int64) {
+  if (k < 0 || k > r->n - r->pos) { r->pos = r->n; r->bad = true; return; }
+  r->pos = r->pos + k;
+}
+
+export fn audio_rd_u8(r: AudioRd*) -> int64 {
+  if (r->pos >= r->n) { r->bad = true; return 0; }
+  var v: int64 = (int64)r->p[r->pos];
+  r->pos = r->pos + 1;
+  return v;
+}
+
+export fn audio_rd_u16le(r: AudioRd*) -> int64 {
+  if (r->n - r->pos < 2) { r->pos = r->n; r->bad = true; return 0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + 2;
+  return (int64)q[0] | ((int64)q[1] << 8);
+}
+
+export fn audio_rd_u32le(r: AudioRd*) -> int64 {
+  if (r->n - r->pos < 4) { r->pos = r->n; r->bad = true; return 0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + 4;
+  return (int64)q[0] | ((int64)q[1] << 8) | ((int64)q[2] << 16) | ((int64)q[3] << 24);
+}
+
+export fn audio_rd_u64le(r: AudioRd*) -> int64 {
+  var lo: int64 = audio_rd_u32le(r);
+  var hi: int64 = audio_rd_u32le(r);
+  return lo | (hi << 32);
+}
+
+export fn audio_rd_u16be(r: AudioRd*) -> int64 {
+  if (r->n - r->pos < 2) { r->pos = r->n; r->bad = true; return 0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + 2;
+  return ((int64)q[0] << 8) | (int64)q[1];
+}
+
+export fn audio_rd_u24be(r: AudioRd*) -> int64 {
+  if (r->n - r->pos < 3) { r->pos = r->n; r->bad = true; return 0; }
+  var q: uint8* = r->p + r->pos;
+  r->pos = r->pos + 3;
+  return ((int64)q[0] << 16) | ((int64)q[1] << 8) | (int64)q[2];
+}
+
+export fn audio_rd_u32be(r: AudioRd*) -> int64 {
+  var hi: int64 = audio_rd_u16be(r);
+  var lo: int64 = audio_rd_u16be(r);
+  return (hi << 16) | lo;
+}
+
+/// True when the next 4 bytes are the tag (does not move).
+export fn audio_rd_is(r: AudioRd*, tag: string) -> bool {
+  var k: int64 = (int64)tag.length;
+  if (r->n - r->pos < k) { return false; }
+  for i in 0..k {
+    if (r->p[r->pos + i] != (uint8)tag[i]) { return false; }
+  }
+  return true;
+}
+
+/// True when p[0..len(tag)] equals the tag. p must hold at least n bytes.
+export fn audio_bytes_is(p: uint8*, n: int64, tag: string) -> bool {
+  var k: int64 = (int64)tag.length;
+  if (n < k) { return false; }
+  for i in 0..k {
+    if (p[i] != (uint8)tag[i]) { return false; }
+  }
+  return true;
+}
+
+// ---- bits, most significant first ----
+
+// `cache` holds the next `cnt` bits at its top. Bits past the end of the
+// data read as zero and count in `over`.
+export struct AudioBits {
+  p: uint8*;
+  n: int64;
+  pos: int64;     // next byte to load into the cache
+  cache: uint64;
+  cnt: int32;
+  over: int64;    // bits read past the end
+}
+
+export fn audio_bits_init(b: AudioBits*, p: uint8*, n: int64) {
+  b->p = p;
+  b->n = n;
+  if (n < 0) { b->n = 0; }
+  b->pos = 0;
+  b->cache = 0;
+  b->cnt = 0;
+  b->over = 0;
+}
+
+@inline fn bits_refill(b: AudioBits*) {
+  if (b->n - b->pos >= 8) {
+    var take: int32 = (64 - b->cnt) >> 3;   // whole bytes that fit
+    if (take == 0) { return; }
+    var q: uint8* = b->p + b->pos;
+    var w: uint64 = ((uint64)q[0] << 56) | ((uint64)q[1] << 48) | ((uint64)q[2] << 40) | ((uint64)q[3] << 32) |
+      ((uint64)q[4] << 24) | ((uint64)q[5] << 16) | ((uint64)q[6] << 8) | (uint64)q[7];
+    b->cache = b->cache | (w >> b->cnt);
+    b->cnt = b->cnt + take * 8;
+    b->pos = b->pos + (int64)take;
+    // bits below the count stay zero
+    if (b->cnt < 64) { b->cache = b->cache & ~(~(uint64)0 >> b->cnt); }
+    return;
+  }
+  while (b->cnt <= 56 && b->pos < b->n) {
+    b->cache = b->cache | ((uint64)b->p[b->pos] << (56 - b->cnt));
+    b->pos = b->pos + 1;
+    b->cnt = b->cnt + 8;
+  }
+}
+
+/// Fills the bit cache as far as it goes (for decoders that read the
+/// cache directly in their inner loops).
+export fn audio_bits_fill(b: AudioBits*) { bits_refill(b); }
+
+/// Reads k bits (0..32) as an unsigned number.
+export fn audio_bits_get(b: AudioBits*, k: int32) -> uint32 {
+  if (k <= 0) { return 0; }
+  if (b->cnt < k) {
+    bits_refill(b);
+    if (b->cnt < k) {
+      b->over = b->over + (int64)(k - b->cnt);
+      b->cnt = k;
+    }
+  }
+  var v: uint32 = (uint32)(b->cache >> (64 - k));
+  if (k == 64) { b->cache = 0; } else { b->cache = b->cache << k; }
+  b->cnt = b->cnt - k;
+  return v;
+}
+
+/// Reads k bits (1..32) as a two's complement signed number.
+export fn audio_bits_sget(b: AudioBits*, k: int32) -> int32 {
+  if (k <= 0) { return 0; }
+  var v: uint32 = audio_bits_get(b, k);
+  if (k == 32) { return (int32)v; }
+  var sh: int32 = 32 - k;
+  return ((int32)(v << sh)) >> sh;
+}
+
+/// Reads one bit.
+export fn audio_bits_bit(b: AudioBits*) -> int32 {
+  return (int32)audio_bits_get(b, 1);
+}
+
+/// Looks at the next k bits (1..32) without moving.
+export fn audio_bits_peek(b: AudioBits*, k: int32) -> uint32 {
+  if (b->cnt < k) { bits_refill(b); }
+  return (uint32)(b->cache >> (64 - k));
+}
+
+/// Moves past k bits (any count).
+export fn audio_bits_skip(b: AudioBits*, k: int64) {
+  var left: int64 = k;
+  while (left > 0) {
+    var s: int32 = 32;
+    if (left < 32) { s = (int32)left; }
+    audio_bits_get(b, s);
+    left = left - (int64)s;
+  }
+}
+
+/// Counts zero bits up to and past the next 1 bit (the unary code of
+/// FLAC's Rice codes). Stops at `max`, returning max.
+export fn audio_bits_unary(b: AudioBits*, max: int32) -> int32 {
+  var z: int32 = 0;
+  while (true) {
+    if (b->cnt == 0) {
+      bits_refill(b);
+      if (b->cnt == 0) { b->over = b->over + 1; return max; }
+    }
+    if (b->cache == 0) {
+      z = z + b->cnt;
+      b->cnt = 0;
+      if (z >= max) { return max; }
+      continue;
+    }
+    // leading zeros of the cache, at most cnt
+    var c: uint64 = b->cache;
+    var lz: int32 = 0;
+    if ((c >> 32) == 0) { lz = lz + 32; c = c << 32; }
+    if ((c >> 48) == 0) { lz = lz + 16; c = c << 16; }
+    if ((c >> 56) == 0) { lz = lz + 8; c = c << 8; }
+    if ((c >> 60) == 0) { lz = lz + 4; c = c << 4; }
+    if ((c >> 62) == 0) { lz = lz + 2; c = c << 2; }
+    if ((c >> 63) == 0) { lz = lz + 1; }
+    if (lz >= b->cnt) {
+      z = z + b->cnt;
+      b->cnt = 0;
+      b->cache = 0;
+      if (z >= max) { return max; }
+      continue;
+    }
+    z = z + lz;
+    // drop the zeros and the 1
+    b->cache = b->cache << lz;
+    b->cache = b->cache << 1;
+    b->cnt = b->cnt - lz - 1;
+    if (z > max) { return max; }
+    return z;
+  }
+  return max;
+}
+
+/// Bits read so far.
+export fn audio_bits_tell(b: AudioBits*) -> int64 {
+  return b->pos * 8 - (int64)b->cnt;
+}
+
+/// Skips to the next byte boundary.
+export fn audio_bits_align(b: AudioBits*) {
+  var r: int32 = b->cnt & 7;
+  if (r != 0) { audio_bits_get(b, r); }
+}
+
+/// The byte offset of the reader (after audio_bits_align).
+export fn audio_bits_byte(b: AudioBits*) -> int64 {
+  return b->pos - (int64)(b->cnt >> 3);
+}
+
+/// True if any read went past the end.
+export fn audio_bits_bad(b: AudioBits*) -> bool { return b->over > 0; }
+
+// ---- bits, least significant first ----
+
+export struct AudioBitsL {
+  p: uint8*;
+  n: int64;
+  pos: int64;
+  cache: uint64;  // next cnt bits at the bottom
+  cnt: int32;
+  over: int64;
+}
+
+export fn audio_bitsl_init(b: AudioBitsL*, p: uint8*, n: int64) {
+  b->p = p;
+  b->n = n;
+  if (n < 0) { b->n = 0; }
+  b->pos = 0;
+  b->cache = 0;
+  b->cnt = 0;
+  b->over = 0;
+}
+
+@inline fn bitsl_refill(b: AudioBitsL*) {
+  while (b->cnt <= 56 && b->pos < b->n) {
+    b->cache = b->cache | ((uint64)b->p[b->pos] << b->cnt);
+    b->pos = b->pos + 1;
+    b->cnt = b->cnt + 8;
+  }
+}
+
+/// Reads k bits (0..32).
+export fn audio_bitsl_get(b: AudioBitsL*, k: int32) -> uint32 {
+  if (k <= 0) { return 0; }
+  if (b->cnt < k) {
+    bitsl_refill(b);
+    if (b->cnt < k) {
+      b->over = b->over + (int64)(k - b->cnt);
+      b->cnt = k;
+    }
+  }
+  var v: uint32 = (uint32)(b->cache & (((uint64)1 << k) - 1));
+  b->cache = b->cache >> k;
+  b->cnt = b->cnt - k;
+  return v;
+}
+
+/// Looks at the next k bits (1..32) without moving. Bits past the end are 0.
+export fn audio_bitsl_peek(b: AudioBitsL*, k: int32) -> uint32 {
+  if (b->cnt < k) { bitsl_refill(b); }
+  return (uint32)(b->cache & (((uint64)1 << k) - 1));
+}
+
+/// Drops k bits after a peek.
+export fn audio_bitsl_drop(b: AudioBitsL*, k: int32) {
+  if (k > b->cnt) {
+    b->over = b->over + (int64)(k - b->cnt);
+    b->cache = 0;
+    b->cnt = 0;
+    return;
+  }
+  b->cache = b->cache >> k;
+  b->cnt = b->cnt - k;
+}
+
+/// Bits still to read (0 when past the end).
+export fn audio_bitsl_left(b: AudioBitsL*) -> int64 {
+  return (b->n - b->pos) * 8 + (int64)b->cnt;
+}
+
+// ---- checksums ----
+
+var g_crc_ready: bool = false;
+var g_crc8: uint8[256];
+var g_crc16: uint16[256];
+var g_crc32: uint32[256];
+
+fn crc_tables() {
+  for i in 0..256 {
+    var c8: uint32 = (uint32)i;
+    var c16: uint32 = (uint32)i << 8;
+    var c32: uint32 = (uint32)i << 24;
+    for k in 0..8 {
+      if ((c8 & 0x80) != 0) { c8 = ((c8 << 1) ^ 0x07) & 0xFF; } else { c8 = (c8 << 1) & 0xFF; }
+      if ((c16 & 0x8000) != 0) { c16 = ((c16 << 1) ^ 0x8005) & 0xFFFF; } else { c16 = (c16 << 1) & 0xFFFF; }
+      if ((c32 & 0x80000000) != 0) { c32 = (c32 << 1) ^ 0x04C11DB7; } else { c32 = c32 << 1; }
+    }
+    g_crc8[i] = (uint8)c8;
+    g_crc16[i] = (uint16)c16;
+    g_crc32[i] = c32;
+  }
+  g_crc_ready = true;
+}
+
+/// FLAC CRC-8 (polynomial x^8 + x^2 + x + 1, start 0).
+export fn audio_crc8(crc: uint32, p: uint8*, n: int64) -> uint32 {
+  if (!g_crc_ready) { crc_tables(); }
+  var c: uint32 = crc & 0xFF;
+  for i in 0..n { c = (uint32)g_crc8[(c ^ (uint32)p[i]) & 0xFF]; }
+  return c;
+}
+
+/// FLAC CRC-16 (polynomial x^16 + x^15 + x^2 + 1, start 0).
+export fn audio_crc16(crc: uint32, p: uint8*, n: int64) -> uint32 {
+  if (!g_crc_ready) { crc_tables(); }
+  var c: uint32 = crc & 0xFFFF;
+  for i in 0..n { c = ((c << 8) ^ (uint32)g_crc16[((c >> 8) ^ (uint32)p[i]) & 0xFF]) & 0xFFFF; }
+  return c;
+}
+
+/// Ogg CRC-32 (polynomial 0x04C11DB7, not reflected, start 0).
+export fn audio_crc32_ogg(crc: uint32, p: uint8*, n: int64) -> uint32 {
+  if (!g_crc_ready) { crc_tables(); }
+  var c: uint32 = crc;
+  for i in 0..n { c = (c << 8) ^ g_crc32[((c >> 24) ^ (uint32)p[i]) & 0xFF]; }
+  return c;
+}

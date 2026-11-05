@@ -1,0 +1,110 @@
+// raize_api/types/model: @rapi_model writes a struct's RapiType at compile time.
+//
+//   import "raize_api/types/model";
+//   @rapi_model struct NewTask {
+//     title: string;
+//     done: bool;
+//   }
+//
+// gives `fn NewTask_rapi() -> RapiType*`, built once, with one field per struct
+// field, all required. Refine it after the first call:
+//
+//   var t: RapiType* = NewTask_rapi();
+//   rapi_len(rapi_field_type(t, "title"), 1, 120);
+//   rapi_require(t, "done", false);
+//
+// Field types: string, int32, int64, float64, bool, another @rapi_model struct
+// (inline), and CodecList<T> of any of these (a JSON array).
+import "std/meta";
+
+fn rm_sub(s: string, from: int64, to: int64) -> string {
+  var out: string;
+  out.chars = s.chars + from;
+  out.length = (uint64)(to - from);
+  return out;
+}
+
+// "codec/core/list.CodecList__Tag" -> "CodecList__Tag"
+fn rm_norm(t: string) -> string {
+  var i: int64 = (int64)t.length - 1;
+  while (i >= 0 && t.chars[i] != 46) { i = i - 1; }
+  if (i < 0) { return t; }
+  return rm_sub(t, i + 1, (int64)t.length);
+}
+
+fn rm_starts(s: string, p: string) -> bool {
+  if (s.length < p.length) { return false; }
+  for i in 0..p.length {
+    if (s.chars[i] != p.chars[i]) { return false; }
+  }
+  return true;
+}
+
+fn rm_is_struct_name(t: string) -> bool {
+  if (t.length == 0) { return false; }
+  var c: int32 = (int32)t.chars[0];
+  if (c < 65 || c > 90) { return false; }
+  for i in 0..t.length {
+    var d: int32 = (int32)t.chars[i];
+    var ok: bool = (d >= 65 && d <= 90) || (d >= 97 && d <= 122) || (d >= 48 && d <= 57) || d == 95;
+    if (!ok) { return false; }
+  }
+  return true;
+}
+
+// The constructor call for a field type, or "" when unsupported.
+fn rm_ctor(t: string) -> string {
+  if (t == "string") { return "rapi_string_t()"; }
+  if (t == "int64") { return "rapi_int64_t()"; }
+  if (t == "int32") { return "rapi_int32_t()"; }
+  if (t == "float64") { return "rapi_number_t()"; }
+  if (t == "bool") { return "rapi_bool_t()"; }
+  if (rm_starts(t, "CodecList__")) {
+    var inner: string = rm_ctor(rm_sub(t, 11, (int64)t.length));
+    if (inner.length == 0) { return ""; }
+    return "rapi_array_t(" + inner + ")";
+  }
+  if (rm_starts(t, "CodecList")) { return ""; }
+  if (rm_is_struct_name(t)) { return t + "_rapi()"; }
+  return "";
+}
+
+@generate export fn rapi_model(t: TypeInfo) -> Generated {
+  var name: string = t.name;
+  for f in t.fields {
+    if (rm_ctor(rm_norm(f.type_name)).length == 0) {
+      return refuse("@rapi_model: field '{f.name}' of {name} has type {f.type_name}; use string, int32, int64, float64, bool, a @rapi_model struct or CodecList of one");
+    }
+  }
+  var out: Text;
+  text_add(&out, "var {name}__rapi_t: RapiType* = 0;\n\n");
+  text_add(&out, "// The API type of {name}, built on the first call.\n");
+  text_add(&out, "export fn {name}_rapi() -> RapiType* {{\n");
+  text_add(&out, "  if ({name}__rapi_t != 0) {{ return {name}__rapi_t; }\n");
+  text_add(&out, "  var v: {name};\n");
+  text_add(&out, "  var base: uint8* = (uint8*)&v;\n");
+  text_add(&out, "  var t: RapiType* = rapi_object_t(\"{name}\", (int64)sizeof({name}));\n");
+  for f in t.fields {
+    var ctor: string = rm_ctor(rm_norm(f.type_name));
+    text_add(&out, "  rapi_field(t, \"{f.name}\", {ctor}, (int64)((uint8*)&v.{f.name} - base), true);\n");
+  }
+  text_add(&out, "  {name}__rapi_t = t;\n");
+  text_add(&out, "  rapi__type_cached(&{name}__rapi_t);\n");
+  text_add(&out, "  return t;\n");
+  text_add(&out, "}\n\n");
+  var nf: int64 = 0;
+  for f in t.fields { nf = nf + 1; }
+  // Checked while compiling: every field is described and sits inside the struct.
+  text_add(&out, "@rule fn {name}__rapi_layout(p: Program) -> Verdict {{\n");
+  text_add(&out, "  rapi__track_begin();\n");
+  text_add(&out, "  var t: RapiType* = {name}_rapi();\n");
+  text_add(&out, "  var bad: bool = t->nfields != {nf} || t->size != (int64)sizeof({name});\n");
+  text_add(&out, "  for i in 0..t->nfields {{\n");
+  text_add(&out, "    if (t->fields[i].offset < 0 || t->fields[i].offset + t->fields[i].type->size > t->size) {{ bad = true; }\n");
+  text_add(&out, "  }\n");
+  text_add(&out, "  rapi__track_end();\n");
+  text_add(&out, "  if (bad) {{ return verdict_fail(function_site(p, \"{name}_rapi\"), \"@rapi_model: {name}'s fields do not match its layout\"); }\n");
+  text_add(&out, "  return verdict_pass();\n");
+  text_add(&out, "}\n");
+  return generated(text_done(&out));
+}

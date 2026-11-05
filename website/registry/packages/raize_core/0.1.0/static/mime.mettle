@@ -1,0 +1,55 @@
+// raize/static/mime — extension to media type.
+//
+// A fixed table, matched on the last '.', case-insensitively. There is no
+// content sniffing (a static server that guesses is a server that can be made
+// to serve a text file as HTML), no registry lookup, and no allocation: every
+// answer is a string literal.
+//
+// charset=utf-8 is attached to the text-shaped types only. Binary types
+// (png/jpeg/woff2/wasm) must not carry a charset; application/json gets one
+// because every JSON body raize emits is UTF-8 and browsers accept it.
+//
+// Default is application/octet-stream, which browsers download rather than
+// render. That is the safe default for an unknown extension.
+
+import "../str/str";
+
+export const RZ_STATIC_CT_HTML: string = "text/html; charset=utf-8";
+export const RZ_STATIC_CT_CSS: string = "text/css; charset=utf-8";
+export const RZ_STATIC_CT_JS: string = "text/javascript; charset=utf-8";
+export const RZ_STATIC_CT_JSON: string = "application/json; charset=utf-8";
+export const RZ_STATIC_CT_SVG: string = "image/svg+xml; charset=utf-8";
+export const RZ_STATIC_CT_TXT: string = "text/plain; charset=utf-8";
+export const RZ_STATIC_CT_PNG: string = "image/png";
+export const RZ_STATIC_CT_JPG: string = "image/jpeg";
+export const RZ_STATIC_CT_WOFF2: string = "font/woff2";
+export const RZ_STATIC_CT_WASM: string = "application/wasm";
+export const RZ_STATIC_CT_OCTET: string = "application/octet-stream";
+
+// The extension of `path`: bytes after the last '.' that follows the last '/'.
+// An empty view means "no extension".
+export fn rz_static_ext(path: string) -> string {
+  var n: int64 = (int64)path.length;
+  if (n == 0) { return rz_str_empty(); }
+  var slash: int64 = rz_str_rfind_byte(path, 47);
+  var dot: int64 = rz_str_rfind_byte(path, 46);
+  if (dot < 0 || dot <= slash) { return rz_str_empty(); }
+  if (dot + 1 >= n) { return rz_str_empty(); }
+  return rz_str_from(path, dot + 1);
+}
+
+export fn rz_static_mime(path: string) -> string {
+  var ext: string = rz_static_ext(path);
+  if (ext.length == 0) { return RZ_STATIC_CT_OCTET; }
+  if (rz_str_eq_ci(ext, "html") || rz_str_eq_ci(ext, "htm")) { return RZ_STATIC_CT_HTML; }
+  if (rz_str_eq_ci(ext, "css")) { return RZ_STATIC_CT_CSS; }
+  if (rz_str_eq_ci(ext, "js") || rz_str_eq_ci(ext, "mjs")) { return RZ_STATIC_CT_JS; }
+  if (rz_str_eq_ci(ext, "json")) { return RZ_STATIC_CT_JSON; }
+  if (rz_str_eq_ci(ext, "svg")) { return RZ_STATIC_CT_SVG; }
+  if (rz_str_eq_ci(ext, "txt")) { return RZ_STATIC_CT_TXT; }
+  if (rz_str_eq_ci(ext, "png")) { return RZ_STATIC_CT_PNG; }
+  if (rz_str_eq_ci(ext, "jpg") || rz_str_eq_ci(ext, "jpeg")) { return RZ_STATIC_CT_JPG; }
+  if (rz_str_eq_ci(ext, "woff2")) { return RZ_STATIC_CT_WOFF2; }
+  if (rz_str_eq_ci(ext, "wasm")) { return RZ_STATIC_CT_WASM; }
+  return RZ_STATIC_CT_OCTET;
+}

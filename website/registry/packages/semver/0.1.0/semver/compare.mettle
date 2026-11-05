@@ -1,0 +1,165 @@
+// compare: precedence (SemVer 2.0.0 section 11), formatting and bumps.
+
+import "std/core";
+import "std/conv";
+import "version";
+
+fn svc_sign64(a: uint64, b: uint64) -> int32 {
+  if (a < b) { return -1; }
+  if (a > b) { return 1; }
+  return 0;
+}
+
+fn svc_all_digits(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  for c in s {
+    if (!semver_is_digit(c)) { return false; }
+  }
+  return true;
+}
+
+// Compares two identifiers. Numeric ones compare by value and sort before
+// alphanumeric ones, which compare byte by byte in ASCII order.
+export fn semver_cmp_ident(a: string, b: string) -> int32 {
+  var an: bool = svc_all_digits(a);
+  var bn: bool = svc_all_digits(b);
+  if (an && bn) {
+    // Skip leading zeros (loose input may have them), then the longer
+    // number is larger, and equal lengths compare digit by digit.
+    var i: int64 = 0;
+    while (i + 1 < (int64)a.length && a[i] == '0') { i = i + 1; }
+    var j: int64 = 0;
+    while (j + 1 < (int64)b.length && b[j] == '0') { j = j + 1; }
+    var la: int64 = (int64)a.length - i;
+    var lb: int64 = (int64)b.length - j;
+    if (la != lb) {
+      if (la < lb) { return -1; }
+      return 1;
+    }
+    for k in 0..la {
+      if (a[i + k] != b[j + k]) {
+        if (a[i + k] < b[j + k]) { return -1; }
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (an) { return -1; }
+  if (bn) { return 1; }
+  var m: int64 = (int64)a.length;
+  if ((int64)b.length < m) { m = (int64)b.length; }
+  for k in 0..m {
+    if (a[k] != b[k]) {
+      if ((uint8)a[k] < (uint8)b[k]) { return -1; }
+      return 1;
+    }
+  }
+  if (a.length < b.length) { return -1; }
+  if (a.length > b.length) { return 1; }
+  return 0;
+}
+
+// The next identifier of a dot-separated list, starting at *pos.
+fn svc_next(s: string, pos: int64*) -> string {
+  var st: int64 = *pos;
+  var i: int64 = st;
+  while (i < (int64)s.length && s[i] != '.') { i = i + 1; }
+  *pos = i + 1;
+  return str_slice(s, st, i - st);
+}
+
+// Compares two dot-separated identifier lists field by field; when one is a
+// prefix of the other, the shorter list is smaller.
+export fn semver_cmp_idents(a: string, b: string) -> int32 {
+  var i: int64 = 0;
+  var j: int64 = 0;
+  var na: int64 = (int64)a.length;
+  var nb: int64 = (int64)b.length;
+  while (true) {
+    var ea: bool = i > na || na == 0;
+    var eb: bool = j > nb || nb == 0;
+    if (ea && eb) { return 0; }
+    if (ea) { return -1; }
+    if (eb) { return 1; }
+    var x: string = svc_next(a, &i);
+    var y: string = svc_next(b, &j);
+    var c: int32 = semver_cmp_ident(x, y);
+    if (c != 0) { return c; }
+  }
+  return 0;
+}
+
+// Compares two pre-release strings. No pre-release ranks above any.
+export fn semver_cmp_pre(a: string, b: string) -> int32 {
+  if (a.length == 0 && b.length == 0) { return 0; }
+  if (a.length == 0) { return 1; }
+  if (b.length == 0) { return -1; }
+  return semver_cmp_idents(a, b);
+}
+
+// Precedence of a and b: -1, 0 or 1. Build metadata is ignored, so
+// 1.0.0+a and 1.0.0+b compare equal.
+export fn semver_cmp(a: SemverVersion, b: SemverVersion) -> int32 {
+  var c: int32 = svc_sign64(a.major, b.major);
+  if (c != 0) { return c; }
+  c = svc_sign64(a.minor, b.minor);
+  if (c != 0) { return c; }
+  c = svc_sign64(a.patch, b.patch);
+  if (c != 0) { return c; }
+  return semver_cmp_pre(a.pre, b.pre);
+}
+
+// Like semver_cmp, then breaks ties on build metadata (no build first), so
+// that sorting is total and stable across runs. This is node-semver's
+// compareBuild.
+export fn semver_cmp_build(a: SemverVersion, b: SemverVersion) -> int32 {
+  var c: int32 = semver_cmp(a, b);
+  if (c != 0) { return c; }
+  return semver_cmp_idents(a.build, b.build);
+}
+
+export fn semver_eq(a: SemverVersion, b: SemverVersion) -> bool { return semver_cmp(a, b) == 0; }
+export fn semver_lt(a: SemverVersion, b: SemverVersion) -> bool { return semver_cmp(a, b) < 0; }
+export fn semver_gt(a: SemverVersion, b: SemverVersion) -> bool { return semver_cmp(a, b) > 0; }
+export fn semver_le(a: SemverVersion, b: SemverVersion) -> bool { return semver_cmp(a, b) <= 0; }
+export fn semver_ge(a: SemverVersion, b: SemverVersion) -> bool { return semver_cmp(a, b) >= 0; }
+
+// True when the version has a pre-release part.
+export fn semver_is_pre(v: SemverVersion) -> bool { return v.pre.length > 0; }
+
+// MAJOR.MINOR.PATCH[-PRE][+BUILD]. The new string belongs to the caller.
+export fn semver_format(v: SemverVersion) -> string {
+  var s: string = "{v.major}.{v.minor}.{v.patch}";
+  if (v.pre.length > 0) { s = s + "-" + v.pre; }
+  if (v.build.length > 0) { s = s + "+" + v.build; }
+  return s;
+}
+
+// MAJOR.MINOR.PATCH[-PRE], without build metadata.
+export fn semver_format_nobuild(v: SemverVersion) -> string {
+  var s: string = "{v.major}.{v.minor}.{v.patch}";
+  if (v.pre.length > 0) { s = s + "-" + v.pre; }
+  return s;
+}
+
+// The next major version: 1.2.3 -> 2.0.0. A pre-release of a major release
+// becomes that release: 2.0.0-rc.1 -> 2.0.0. Same rules as node-semver.
+export fn semver_bump_major(v: SemverVersion) -> SemverVersion {
+  var r: SemverVersion = semver_new(v.major, 0, 0);
+  if (v.minor != 0 || v.patch != 0 || v.pre.length == 0) { r.major = v.major + 1; }
+  return r;
+}
+
+// The next minor version: 1.2.3 -> 1.3.0, and 1.3.0-rc.1 -> 1.3.0.
+export fn semver_bump_minor(v: SemverVersion) -> SemverVersion {
+  var r: SemverVersion = semver_new(v.major, v.minor, 0);
+  if (v.patch != 0 || v.pre.length == 0) { r.minor = v.minor + 1; }
+  return r;
+}
+
+// The next patch version: 1.2.3 -> 1.2.4, and 1.2.4-rc.1 -> 1.2.4.
+export fn semver_bump_patch(v: SemverVersion) -> SemverVersion {
+  var r: SemverVersion = semver_new(v.major, v.minor, v.patch);
+  if (v.pre.length == 0) { r.patch = v.patch + 1; }
+  return r;
+}

@@ -1,0 +1,708 @@
+// A ready-made output window for seeing work as you make it. Shaders and other
+// files you register are watched and reloaded when they change. A shader that
+// fails to compile keeps the old one running, and the error is shown in the
+// window. A frame that fails shows the last good frame. Under `mbuild live`,
+// code patches and build errors show up too. There is an optional orbit camera
+// for 3D.
+//
+//   var pv: GlintPreview* = glint_preview_open("my shader", 0, 0, GLINT_DOCK_RIGHT);
+//   glint_preview_program(pv, prog);              // a GlintProgram built from files
+//   glint_preview_run(pv, &draw_frame, (rawptr)0); // draw_frame(pv, user) -> bool
+//
+// Import "glint/glint_preview" (it also brings in glint and glint_math).
+import "std/io";
+import "std/mem";
+import "glint";
+import "glint_math";
+
+extern fn glint_pv_getenv(name: cstring) -> cstring = "getenv";
+
+export const GLINT_DOCK_NONE: int32 = 0;     // a normal window, placed by the system
+export const GLINT_DOCK_RIGHT: int32 = 1;    // full height on the right of the screen
+export const GLINT_DOCK_LEFT: int32 = 2;
+export const GLINT_DOCK_TOP: int32 = 3;      // full width along the top
+export const GLINT_DOCK_BOTTOM: int32 = 4;
+
+struct GlintPvWatch { cb: fn(rawptr, cstring) -> void; }
+
+export struct GlintPreview {
+  ctx: GlintContext*;
+  // what the user draws into, and a copy of the last good frame
+  scene_fbo: uint32;
+  scene_tex: uint32;
+  scene_depth: uint32;
+  good_fbo: uint32;
+  good_tex: uint32;
+  fw: int32;
+  fh: int32;
+  has_good: bool;
+  last_ok: bool;
+  // watched programs and files
+  progs: rawptr[32];
+  prog_bad: bool[32];
+  nprogs: int32;
+  watch_path: cstring[32];
+  watch_mtime: int64[32];
+  watch_cb: GlintPvWatch[32];
+  watch_user: rawptr[32];
+  nwatch: int32;
+  // messages shown in the window
+  shader_err: uint8[4096];
+  shader_err_len: int64;
+  live_err: uint8[2048];
+  live_err_len: int64;
+  user_err: uint8[2048];
+  user_err_len: int64;
+  status: uint8[256];
+  status_len: int64;
+  status_until: float64;
+  paused: bool;
+  // mbuild live events (MBUILD_LIVE_EVENTS)
+  ev_fd: int64;              // -1 until the file opens
+  ev_off: int64;
+  ev_path: cstring;
+  has_ev: bool;
+  ev_retry: float64;
+  ev_line: uint8[2048];
+  ev_line_len: int64;
+  patches: int32;            // how many `patched` events came in
+  // this frame's window events, after the preview took what it needs
+  events: GlintEvent[64];
+  nevents: int32;
+  // orbit camera
+  orbit: bool;
+  target: GlintVec3;
+  yaw: float32;
+  pitch: float32;
+  dist: float32;
+  home_dist: float32;
+  dragging: bool;
+  drag_x: int32;
+  drag_y: int32;
+  fov: float32;
+  // text
+  text_prog: uint32;
+  text_vao: uint32;
+  text_vbo: uint32;
+  font_tex: uint32;
+  verts: float32*;
+  nverts: int32;
+  // time
+  t0: float64;
+  time: float32;             // seconds since the preview opened
+  frame: int64;
+}
+
+var g_font: string = import_str "assets/glint_font.bin";
+
+// ---- small text helpers ----
+
+fn set_text(dst: uint8*, cap: int64, len: int64*, src: uint8*, n: int64) {
+  var m: int64 = n;
+  if (m > cap - 1) { m = cap - 1; }
+  for i in 0..m { dst[i] = src[i]; }
+  dst[m] = 0;
+  *len = m;
+}
+
+fn set_text_s(dst: uint8*, cap: int64, len: int64*, s: string) { set_text(dst, cap, len, s.chars, (int64)s.length); }
+
+fn cstr_len(c: cstring) -> int64 {
+  var n: int64 = 0;
+  while (c[n] != 0) { n += 1; }
+  return n;
+}
+
+fn starts(p: uint8*, n: int64, word: string) -> bool {
+  var w: int64 = (int64)word.length;
+  if (n < w) { return false; }
+  for i in 0..w { if (p[i] != (uint8)word[i]) { return false; } }
+  return true;
+}
+
+// Show a short line at the bottom of the window for two seconds.
+export fn glint_preview_status(pv: GlintPreview*, msg: string) {
+  set_text_s(&pv->status[0], 256, &pv->status_len, msg);
+  pv->status_until = glint_time() + 2.0;
+}
+
+fn status_c(pv: GlintPreview*, a: string, b: cstring) {
+  set_text_s(&pv->status[0], 256, &pv->status_len, a);
+  var n: int64 = cstr_len(b);
+  var at: int64 = pv->status_len;
+  for i in 0..n { if (at < 255) { pv->status[at] = b[i]; at += 1; } }
+  pv->status[at] = 0;
+  pv->status_len = at;
+  pv->status_until = glint_time() + 2.0;
+}
+
+// Show your own error in the window (for example, a model file that did not
+// load). "" clears it.
+export fn glint_preview_error(pv: GlintPreview*, msg: string) {
+  set_text_s(&pv->user_err[0], 2048, &pv->user_err_len, msg);
+}
+
+// ---- framebuffers ----
+
+fn make_color(w: int32, h: int32) -> uint32 {
+  var t: uint32 = 0;
+  glGenTextures(1, &t);
+  glBindTexture(GL_TEXTURE_2D, t);
+  glTexImage2D(GL_TEXTURE_2D, 0, (int32)GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, (rawptr)0);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (int32)GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (int32)GL_NEAREST);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  return t;
+}
+
+fn make_targets(pv: GlintPreview*, w: int32, h: int32) {
+  if (pv->scene_fbo != 0) {
+    glDeleteFramebuffers(1, &pv->scene_fbo);
+    glDeleteFramebuffers(1, &pv->good_fbo);
+    glDeleteTextures(1, &pv->scene_tex);
+    glDeleteTextures(1, &pv->good_tex);
+    glDeleteRenderbuffers(1, &pv->scene_depth);
+  }
+  pv->scene_tex = make_color(w, h);
+  glGenRenderbuffers(1, &pv->scene_depth);
+  glBindRenderbuffer(GL_RENDERBUFFER, pv->scene_depth);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+  glBindRenderbuffer(GL_RENDERBUFFER, 0);
+  glGenFramebuffers(1, &pv->scene_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, pv->scene_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, pv->scene_tex, 0);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, pv->scene_depth);
+  pv->good_tex = make_color(w, h);
+  glGenFramebuffers(1, &pv->good_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, pv->good_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, pv->good_tex, 0);
+  pv->fw = w;
+  pv->fh = h;
+  pv->has_good = false;
+}
+
+// ---- text ----
+
+fn setup_text(pv: GlintPreview*) -> bool {
+  // atlas: 16 x 6 cells of 8 x 16; cell 95 is solid, for boxes
+  var px: uint8* = (uint8*)malloc(128 * 96);
+  memset((rawptr)px, 0, 128 * 96);
+  for g in 0..96 {
+    var cx: int32 = (g % 16) * 8;
+    var cy: int32 = (g / 16) * 16;
+    for row in 0..16 {
+      var bits: int32 = 255;
+      if (g < 95) { bits = (int32)(uint8)g_font[(int64)(g * 16 + row)]; }
+      for x in 0..8 {
+        if ((bits & (128 >> x)) != 0) { px[(int64)((cy + row) * 128 + cx + x)] = (uint8)255; }
+      }
+    }
+  }
+  glGenTextures(1, &pv->font_tex);
+  glBindTexture(GL_TEXTURE_2D, pv->font_tex);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(GL_TEXTURE_2D, 0, (int32)GL_R8, 128, 96, 0, GL_RED, GL_UNSIGNED_BYTE, (rawptr)px);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (int32)GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (int32)GL_NEAREST);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  free((rawptr)px);
+  pv->text_prog = glint_program(
+    "#version 330 core\nlayout (location = 0) in vec2 aPos;\nlayout (location = 1) in vec2 aUV;\nlayout (location = 2) in vec4 aCol;\nuniform vec2 screen;\nout vec2 uv;\nout vec4 col;\nvoid main() {{ uv = aUV; col = aCol; gl_Position = vec4(aPos.x / screen.x * 2.0 - 1.0, 1.0 - aPos.y / screen.y * 2.0, 0.0, 1.0); }\n",
+    "#version 330 core\nin vec2 uv;\nin vec4 col;\nuniform sampler2D font;\nout vec4 o;\nvoid main() {{ o = vec4(col.rgb, col.a * texture(font, uv).r); }\n");
+  if (pv->text_prog == 0) { return false; }
+  glGenVertexArrays(1, &pv->text_vao);
+  glBindVertexArray(pv->text_vao);
+  glGenBuffers(1, &pv->text_vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, pv->text_vbo);
+  glVertexAttribPointer(0, 2, GL_FLOAT, (uint8)0, 32, (rawptr)0);
+  glVertexAttribPointer(1, 2, GL_FLOAT, (uint8)0, 32, (rawptr)8);
+  glVertexAttribPointer(2, 4, GL_FLOAT, (uint8)0, 32, (rawptr)16);
+  glEnableVertexAttribArray(0);
+  glEnableVertexAttribArray(1);
+  glEnableVertexAttribArray(2);
+  glBindVertexArray(0);
+  pv->verts = (float32*)malloc(6 * 8 * 4 * 8192);
+  return true;
+}
+
+fn quad(pv: GlintPreview*, x: float32, y: float32, w: float32, h: float32, glyph: int32, r: float32, g: float32, b: float32, a: float32) {
+  if (pv->nverts + 6 > 6 * 8192) { return; }
+  var u0: float32 = (float32)((glyph % 16) * 8) / 128.0;
+  var v0: float32 = (float32)((glyph / 16) * 16) / 96.0;
+  var u1: float32 = u0 + 8.0 / 128.0;
+  var v1: float32 = v0 + 16.0 / 96.0;
+  var xs: float32[6] = [x, x + w, x + w, x, x + w, x];
+  var ys: float32[6] = [y, y, y + h, y, y + h, y + h];
+  var us: float32[6] = [u0, u1, u1, u0, u1, u0];
+  var vs: float32[6] = [v0, v0, v1, v0, v1, v1];
+  for i in 0..6 {
+    var o: int64 = (int64)(pv->nverts + i) * 8;
+    pv->verts[o] = xs[i]; pv->verts[o + 1] = ys[i];
+    pv->verts[o + 2] = us[i]; pv->verts[o + 3] = vs[i];
+    pv->verts[o + 4] = r; pv->verts[o + 5] = g; pv->verts[o + 6] = b; pv->verts[o + 7] = a;
+  }
+  pv->nverts += 6;
+}
+
+fn box(pv: GlintPreview*, x: float32, y: float32, w: float32, h: float32, r: float32, g: float32, b: float32, a: float32) {
+  quad(pv, x, y, w, h, 95, r, g, b, a);
+}
+
+fn scale_of(pv: GlintPreview*) -> int32 {
+  if (pv->fw >= 1400) { return 2; }
+  return 1;
+}
+
+// Lay out text from (x, y), wrapped to the width; returns the number of lines.
+fn text(pv: GlintPreview*, x: float32, y: float32, maxw: float32, maxlines: int32, s: uint8*, n: int64, r: float32, g: float32, b: float32, draw: bool) -> int32 {
+  var sc: float32 = (float32)scale_of(pv);
+  var cw: float32 = 8.0 * sc;
+  var ch: float32 = 16.0 * sc;
+  var cols: int32 = (int32)(maxw / cw);
+  if (cols < 1) { cols = 1; }
+  var line: int32 = 0;
+  var col: int32 = 0;
+  for i in 0..n {
+    var c: int32 = (int32)s[i];
+    if (c == 10) { line += 1; col = 0; }
+    else if (c != 13) {
+      if (col >= cols) { line += 1; col = 0; }
+      if (line >= maxlines) { return maxlines; }
+      if (c == 9) { c = 32; }
+      if (c < 32 || c > 126) { c = 63; }
+      if (draw && c != 32) { quad(pv, x + (float32)col * cw, y + (float32)line * ch, cw, ch, c - 32, r, g, b, 1.0); }
+      col += 1;
+    }
+  }
+  if (col > 0) { line += 1; }
+  if (line > maxlines) { return maxlines; }
+  return line;
+}
+
+// A coloured box with text in it at the top (top = true) or bottom of the window.
+fn banner(pv: GlintPreview*, s: uint8*, n: int64, top: bool, br: float32, bg: float32, bb: float32, at: float32) -> float32 {
+  if (n <= 0) { return at; }
+  var sc: float32 = (float32)scale_of(pv);
+  var pad: float32 = 6.0 * sc;
+  var w: float32 = (float32)pv->fw;
+  var maxl: int32 = (int32)(((float32)pv->fh * 0.6) / (16.0 * sc));
+  if (maxl < 1) { maxl = 1; }
+  var lines: int32 = text(pv, 0.0, 0.0, w - 2.0 * pad, maxl, s, n, 0.0, 0.0, 0.0, false);
+  var h: float32 = (float32)lines * 16.0 * sc + 2.0 * pad;
+  var y: float32 = at;
+  if (!top) { y = at - h; }
+  box(pv, 0.0, y, w, h, br, bg, bb, 0.88);
+  text(pv, pad, y + pad, w - 2.0 * pad, maxl, s, n, 1.0, 1.0, 1.0, true);
+  if (top) { return at + h; }
+  return y;
+}
+
+fn draw_overlay(pv: GlintPreview*, frame_ok: bool) {
+  pv->nverts = 0;
+  var y: float32 = 0.0;
+  y = banner(pv, &pv->shader_err[0], pv->shader_err_len, true, 0.55, 0.08, 0.08, y);
+  y = banner(pv, &pv->live_err[0], pv->live_err_len, true, 0.55, 0.08, 0.08, y);
+  y = banner(pv, &pv->user_err[0], pv->user_err_len, true, 0.55, 0.08, 0.08, y);
+  if (!frame_ok) {
+    var m: string = "the frame failed: showing the last good frame";
+    if (!pv->has_good) { m = "the frame failed, and there is no good frame yet"; }
+    y = banner(pv, m.chars, (int64)m.length, true, 0.45, 0.30, 0.05, y);
+  }
+  if (pv->paused) {
+    var m: string = "paused (waiting for a fix)";
+    y = banner(pv, m.chars, (int64)m.length, true, 0.45, 0.30, 0.05, y);
+  }
+  if (pv->status_len > 0 && glint_time() < pv->status_until) {
+    banner(pv, &pv->status[0], pv->status_len, false, 0.10, 0.25, 0.15, (float32)pv->fh);
+  }
+  if (pv->nverts == 0) { return; }
+  // save the state we touch
+  var depth: uint8 = glIsEnabled(GL_DEPTH_TEST);
+  var blend: uint8 = glIsEnabled(GL_BLEND);
+  var cull: uint8 = glIsEnabled(GL_CULL_FACE);
+  var scissor: uint8 = glIsEnabled(GL_SCISSOR_TEST);
+  var prog: int32 = 0;
+  var vao: int32 = 0;
+  var tex: int32 = 0;
+  var unit: int32 = 0;
+  var abuf: int32 = 0;
+  glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+  glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &unit);
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
+  glActiveTexture(GL_TEXTURE0);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_CULL_FACE);
+  glDisable(GL_SCISSOR_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glUseProgram(pv->text_prog);
+  glUniform2f(glGetUniformLocation(pv->text_prog, "screen"), (float32)pv->fw, (float32)pv->fh);
+  glUniform1i(glGetUniformLocation(pv->text_prog, "font"), 0);
+  glBindTexture(GL_TEXTURE_2D, pv->font_tex);
+  glBindVertexArray(pv->text_vao);
+  glBindBuffer(GL_ARRAY_BUFFER, pv->text_vbo);
+  glBufferData(GL_ARRAY_BUFFER, (int64)pv->nverts * 32, (rawptr)pv->verts, GL_STREAM_DRAW);
+  glDrawArrays(GL_TRIANGLES, 0, pv->nverts);
+  // put it back
+  glBindTexture(GL_TEXTURE_2D, (uint32)tex);
+  glActiveTexture((uint32)unit);
+  glBindBuffer(GL_ARRAY_BUFFER, (uint32)abuf);
+  glBindVertexArray((uint32)vao);
+  glUseProgram((uint32)prog);
+  if (depth != 0) { glEnable(GL_DEPTH_TEST); }
+  if (blend == 0) { glDisable(GL_BLEND); }
+  if (cull != 0) { glEnable(GL_CULL_FACE); }
+  if (scissor != 0) { glEnable(GL_SCISSOR_TEST); }
+}
+
+// ---- opening ----
+
+fn env_is(v: cstring, s: string) -> bool { return v != 0 && glint_internal_cstr_is(v, s); }
+
+fn live_path(pv: GlintPreview*, c: cstring) {
+  if (pv->ev_fd >= 0) { glint_internal_fclose(pv->ev_fd); }
+  if (pv->has_ev) { free((rawptr)pv->ev_path); }
+  var n: int64 = cstr_len(c);
+  var cp: uint8* = (uint8*)malloc(n + 1);
+  for i in 0..(n + 1) { cp[i] = c[i]; }
+  pv->ev_path = (cstring)cp;
+  pv->has_ev = true;
+  pv->ev_fd = -1;
+  pv->ev_off = 0;
+  pv->ev_retry = 0.0;
+  pv->ev_line_len = 0;
+}
+
+// Read live events (patches, build errors) from this file. The preview does
+// this on its own when MBUILD_LIVE_EVENTS is set, as `mbuild live` does.
+export fn glint_preview_live_events(pv: GlintPreview*, path: cstring) { live_path(pv, path); }
+
+// Use any context as a preview (an existing window, a headless context...).
+export fn glint_preview_wrap(ctx: GlintContext*) -> GlintPreview* {
+  if (ctx == 0) { return (GlintPreview*)0; }
+  var pv: GlintPreview* = new GlintPreview;
+  pv->ctx = ctx;
+  pv->last_ok = true;
+  pv->fov = glint_radians(45.0);
+  pv->t0 = glint_time();
+  pv->ev_fd = -1;
+  if (!setup_text(pv)) { free((rawptr)pv); return (GlintPreview*)0; }
+  make_targets(pv, ctx->width, ctx->height);
+  var ev: cstring = glint_pv_getenv("MBUILD_LIVE_EVENTS");
+  if (ev != 0 && ev[0] != 0) { live_path(pv, ev); }
+  glBindFramebuffer(GL_FRAMEBUFFER, pv->scene_fbo);
+  return pv;
+}
+
+// Open a preview window. w or h of 0 picks a size for the dock (two fifths of
+// the screen). dock is GLINT_DOCK_*; MBUILD_PREVIEW=right|left|top|bottom|off
+// in the environment (set by `mbuild live`) wins over it. Returns 0 on failure
+// (glint_error() says why).
+export fn glint_preview_open(title: string, w: int32, h: int32, dock: int32) -> GlintPreview* {
+  var d: int32 = dock;
+  var e: cstring = glint_pv_getenv("MBUILD_PREVIEW");
+  if (env_is(e, "right")) { d = GLINT_DOCK_RIGHT; }
+  if (env_is(e, "left")) { d = GLINT_DOCK_LEFT; }
+  if (env_is(e, "top")) { d = GLINT_DOCK_TOP; }
+  if (env_is(e, "bottom")) { d = GLINT_DOCK_BOTTOM; }
+  if (env_is(e, "off")) { d = GLINT_DOCK_NONE; }
+  var cfg: GlintConfig = glint_config();
+  var ww: int32 = w;
+  var wh: int32 = h;
+  var sw: int32 = 0;
+  var sh: int32 = 0;
+  if (d != GLINT_DOCK_NONE && glint_screen_size(&sw, &sh)) {
+    cfg.place = true;
+    if (d == GLINT_DOCK_RIGHT || d == GLINT_DOCK_LEFT) {
+      if (ww <= 0) { ww = sw * 2 / 5; }
+      wh = sh;
+      cfg.y = 0;
+      cfg.x = 0;
+      if (d == GLINT_DOCK_RIGHT) { cfg.x = sw - ww; }
+    } else {
+      if (wh <= 0) { wh = sh * 2 / 5; }
+      ww = sw;
+      cfg.x = 0;
+      cfg.y = 0;
+      if (d == GLINT_DOCK_BOTTOM) { cfg.y = sh - wh; }
+    }
+  }
+  if (ww <= 0) { ww = 800; }
+  if (wh <= 0) { wh = 600; }
+  return glint_preview_wrap(glint_open_window(title, ww, wh, &cfg));
+}
+
+// A preview with no window, for tests and CI: read the result with glint_read_rgba(pv->ctx, ...).
+export fn glint_preview_headless(w: int32, h: int32) -> GlintPreview* {
+  return glint_preview_wrap(glint_open_headless(w, h, (GlintConfig*)0));
+}
+
+// Watch a program built from files: it is rebuilt when they change, and its
+// compile errors are shown in the window until it builds again. Call it right
+// after glint_program_build: if that failed, its error shows at once and the
+// program is rebuilt when you save a fix.
+export fn glint_preview_program(pv: GlintPreview*, p: GlintProgram*) {
+  if (pv->nprogs >= 32) { return; }
+  var i: int32 = pv->nprogs;
+  pv->progs[i] = (rawptr)p;
+  pv->nprogs += 1;
+  if (p->id == 0) {
+    pv->prog_bad[i] = true;
+    var e: cstring = glint_error();
+    set_text((uint8*)&pv->shader_err[0], 4096, &pv->shader_err_len, (uint8*)e, cstr_len(e));
+  }
+}
+
+// Watch any file (a texture, a mesh, a level). glint_watch_cb(user, path) is
+// called at the start of the frame after the file changes.
+export fn glint_preview_watch(pv: GlintPreview*, path: string, glint_watch_cb: fn(rawptr, cstring) -> void, user: rawptr) {
+  if (pv->nwatch >= 32) { return; }
+  var n: int64 = (int64)path.length;
+  var p: uint8* = (uint8*)malloc(n + 1);
+  for i in 0..n { p[i] = (uint8)path[i]; }
+  p[n] = 0;
+  var i: int32 = pv->nwatch;
+  pv->watch_path[i] = (cstring)p;
+  pv->watch_mtime[i] = glint_internal_mtime((cstring)p);
+  pv->watch_cb[i].cb = glint_watch_cb;
+  pv->watch_user[i] = user;
+  pv->nwatch += 1;
+}
+
+// ---- camera ----
+
+// Turn on the orbit camera: it looks at target from dist away. Drag with the
+// left mouse button to turn, scroll to zoom, R to reset.
+export fn glint_preview_orbit(pv: GlintPreview*, target: GlintVec3, dist: float32) {
+  pv->orbit = true;
+  pv->target = target;
+  pv->dist = dist;
+  pv->home_dist = dist;
+  pv->yaw = 0.6;
+  pv->pitch = 0.35;
+}
+
+export fn glint_preview_eye(pv: GlintPreview*) -> GlintVec3 {
+  var cp: float32 = glint_cos(pv->pitch);
+  return glint_vec3_add(pv->target, glint_vec3(pv->dist * cp * glint_sin(pv->yaw), pv->dist * glint_sin(pv->pitch), pv->dist * cp * glint_cos(pv->yaw)));
+}
+
+export fn glint_preview_view(pv: GlintPreview*) -> GlintMat4 {
+  return glint_mat4_look_at(glint_preview_eye(pv), pv->target, glint_vec3(0.0, 1.0, 0.0));
+}
+
+export fn glint_preview_projection(pv: GlintPreview*) -> GlintMat4 {
+  var aspect: float32 = (float32)pv->fw / (float32)pv->fh;
+  var far: float32 = 100.0;
+  if (pv->dist * 10.0 > far) { far = pv->dist * 10.0; }
+  return glint_mat4_perspective(pv->fov, aspect, 0.05, far);
+}
+
+fn camera_event(pv: GlintPreview*, e: GlintEvent*) {
+  if (!pv->orbit) { return; }
+  if (e->kind == GLINT_EV_MOUSE_DOWN && e->button == GLINT_MOUSE_LEFT) { pv->dragging = true; pv->drag_x = e->x; pv->drag_y = e->y; }
+  if (e->kind == GLINT_EV_MOUSE_UP && e->button == GLINT_MOUSE_LEFT) { pv->dragging = false; }
+  if (e->kind == GLINT_EV_MOUSE_MOVE && pv->dragging) {
+    pv->yaw = pv->yaw - (float32)(e->x - pv->drag_x) * 0.01;
+    pv->pitch = pv->pitch + (float32)(e->y - pv->drag_y) * 0.01;
+    if (pv->pitch > 1.5) { pv->pitch = 1.5; }
+    if (pv->pitch < -1.5) { pv->pitch = -1.5; }
+    pv->drag_x = e->x;
+    pv->drag_y = e->y;
+  }
+  if (e->kind == GLINT_EV_SCROLL) {
+    if (e->dy > 0) { pv->dist = pv->dist * 0.9; } else { pv->dist = pv->dist * 1.1; }
+  }
+  if (e->kind == GLINT_EV_KEY_DOWN && e->key == 82) {          // R
+    pv->yaw = 0.6; pv->pitch = 0.35; pv->dist = pv->home_dist;
+  }
+}
+
+// ---- mbuild live events ----
+
+fn live_line(pv: GlintPreview*, p: uint8*, n: int64) {
+  if (starts(p, n, "patched ")) {
+    pv->patches += 1;
+    pv->live_err_len = 0;
+    pv->paused = false;
+    set_text_s(&pv->status[0], 256, &pv->status_len, "patched ");
+    var at: int64 = pv->status_len;
+    for i in 8..n { if (at < 255) { pv->status[at] = p[i]; at += 1; } }
+    pv->status_len = at;
+    pv->status_until = glint_time() + 2.0;
+  } else if (starts(p, n, "patch-error ")) {
+    set_text(&pv->live_err[0], 2048, &pv->live_err_len, p + 12, n - 12);
+  } else if (starts(p, n, "build-error ")) {
+    set_text(&pv->live_err[0], 2048, &pv->live_err_len, p + 12, n - 12);
+  } else if (starts(p, n, "built")) {
+    pv->live_err_len = 0;
+    glint_preview_status(pv, "built");
+  } else if (starts(p, n, "paused")) {
+    pv->paused = true;
+  } else if (starts(p, n, "resumed")) {
+    pv->paused = false;
+  } else if (starts(p, n, "changed ") || starts(p, n, "removed ")) {
+    // file watching below notices it on its own; this just tells the user
+    var m: uint8[256];
+    var ml: int64 = 0;
+    set_text(&m[0], 256, &ml, p, n);
+    set_text(&pv->status[0], 256, &pv->status_len, &m[0], ml);
+    pv->status_until = glint_time() + 2.0;
+  }
+  // other kinds (exited, ...) are ignored
+}
+
+// New complete lines since the last frame. Reads by offset, so a
+// file that grows is seen at once.
+fn read_live(pv: GlintPreview*) {
+  if (!pv->has_ev) { return; }
+  if (pv->ev_fd < 0) {
+    if (glint_time() < pv->ev_retry) { return; }
+    pv->ev_retry = glint_time() + 1.0;
+    var fd: int64 = glint_internal_fopen_read(pv->ev_path);
+    if (fd < 0) { return; }
+    pv->ev_fd = fd;
+  }
+  var buf: uint8[1024];
+  while (true) {
+    var n: int64 = glint_internal_fread_at(pv->ev_fd, &buf[0], 1024, pv->ev_off);
+    if (n <= 0) { break; }
+    pv->ev_off = pv->ev_off + n;
+    for i in 0..n {
+      var c: uint8 = buf[i];
+      if (c == (uint8)10) {
+        live_line(pv, &pv->ev_line[0], pv->ev_line_len);
+        pv->ev_line_len = 0;
+      } else if (pv->ev_line_len < 2047) {
+        pv->ev_line[pv->ev_line_len] = c;
+        pv->ev_line_len += 1;
+      }
+    }
+  }
+}
+
+// ---- the frame ----
+
+fn reload_all(pv: GlintPreview*) {
+  for i in 0..pv->nprogs {
+    var p: GlintProgram* = (GlintProgram*)pv->progs[i];
+    var r: int32 = glint_program_reload(p);
+    if (r == 1) {
+      if (pv->prog_bad[i]) { pv->shader_err_len = 0; }
+      pv->prog_bad[i] = false;
+      if (p->nfiles > 0) { status_c(pv, "reloaded ", p->files[p->nfiles - 1]); }
+    }
+    if (r == -1) {
+      pv->prog_bad[i] = true;
+      var e: cstring = glint_error();
+      set_text((uint8*)&pv->shader_err[0], 4096, &pv->shader_err_len, (uint8*)e, cstr_len(e));
+    }
+  }
+  var any_bad: bool = false;
+  for i in 0..pv->nprogs { if (pv->prog_bad[i]) { any_bad = true; } }
+  if (!any_bad) { pv->shader_err_len = 0; }
+  for i in 0..pv->nwatch {
+    var m: int64 = glint_internal_mtime(pv->watch_path[i]);
+    if (m != pv->watch_mtime[i]) {
+      pv->watch_mtime[i] = m;
+      status_c(pv, "changed ", pv->watch_path[i]);
+      pv->watch_cb[i].cb(pv->watch_user[i], pv->watch_path[i]);
+    }
+  }
+}
+
+// Start a frame: handle window events, reload what changed, read mbuild's
+// events, and bind the framebuffer to draw into (it is not 0: draw with
+// whatever is bound, or bind glint_preview_target(pv)). False when the window
+// was closed. This frame's window events are in pv->events[0 .. pv->nevents].
+export fn glint_preview_begin(pv: GlintPreview*) -> bool {
+  var ctx: GlintContext* = pv->ctx;
+  pv->nevents = 0;
+  var e: GlintEvent;
+  while (glint_poll(ctx, &e)) {
+    camera_event(pv, &e);
+    if (pv->nevents < 64) { pv->events[pv->nevents] = e; pv->nevents += 1; }
+  }
+  if (glint_should_close(ctx)) { return false; }
+  read_live(pv);
+  reload_all(pv);
+  if (ctx->width != pv->fw || ctx->height != pv->fh) {
+    if (ctx->width > 0 && ctx->height > 0) { make_targets(pv, ctx->width, ctx->height); }
+  }
+  pv->time = (float32)(glint_time() - pv->t0);
+  glBindFramebuffer(GL_FRAMEBUFFER, pv->scene_fbo);
+  glViewport(0, 0, pv->fw, pv->fh);
+  return true;
+}
+
+// The framebuffer a preview frame draws into.
+export fn glint_preview_target(pv: GlintPreview*) -> uint32 { return pv->scene_fbo; }
+
+fn copy_fbo(from: uint32, to: uint32, w: int32, h: int32, tw: int32, th: int32) {
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, from);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to);
+  glBlitFramebuffer(0, 0, w, h, 0, 0, tw, th, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
+
+// End a frame. ok = false means the frame went wrong: the last good frame is
+// shown instead. Then the messages are drawn on top and the frame is shown.
+// Under `mbuild live`, code patches are applied here (quiesce).
+export fn glint_preview_end(pv: GlintPreview*, ok: bool) {
+  var ctx: GlintContext* = pv->ctx;
+  var src: uint32 = pv->scene_fbo;
+  if (ok) {
+    copy_fbo(pv->scene_fbo, pv->good_fbo, pv->fw, pv->fh, pv->fw, pv->fh);
+    pv->has_good = true;
+  } else if (pv->has_good) {
+    src = pv->good_fbo;
+  }
+  pv->last_ok = ok;
+  copy_fbo(src, glint_framebuffer(ctx), pv->fw, pv->fh, ctx->width, ctx->height);
+  glBindFramebuffer(GL_FRAMEBUFFER, glint_framebuffer(ctx));
+  glViewport(0, 0, ctx->width, ctx->height);
+  draw_overlay(pv, ok);
+  glint_swap(ctx);
+  pv->frame += 1;
+  quiesce;
+}
+
+// Run the preview until its window is closed (or Escape is pressed). Each
+// frame calls glint_frame_cb(pv, user); return false from it when the frame
+// went wrong. Returns 0.
+export fn glint_preview_run(pv: GlintPreview*, glint_frame_cb: fn(GlintPreview*, rawptr) -> bool, user: rawptr) -> int32 {
+  while (glint_preview_begin(pv)) {
+    for i in 0..pv->nevents {
+      if (pv->events[i].kind == GLINT_EV_KEY_DOWN && pv->events[i].key == GLINT_KEY_ESCAPE) { glint_set_should_close(pv->ctx, true); }
+    }
+    var ok: bool = glint_frame_cb(pv, user);
+    glint_preview_end(pv, ok);
+  }
+  return 0;
+}
+
+// Is any error showing (shader, mbuild or yours)?
+export fn glint_preview_has_error(pv: GlintPreview*) -> bool {
+  return pv->shader_err_len > 0 || pv->live_err_len > 0 || pv->user_err_len > 0;
+}
+
+// The error text showing at the top of the window ("" if none), shader errors first.
+export fn glint_preview_error_text(pv: GlintPreview*) -> cstring {
+  if (pv->shader_err_len > 0) { return (cstring)&pv->shader_err[0]; }
+  if (pv->live_err_len > 0) { return (cstring)&pv->live_err[0]; }
+  if (pv->user_err_len > 0) { return (cstring)&pv->user_err[0]; }
+  return "";
+}
+
+// Close the preview and its window (programs you registered are yours to free).
+export fn glint_preview_close(pv: GlintPreview*) {
+  if (pv == 0) { return; }
+  if (pv->ev_fd >= 0) { glint_internal_fclose(pv->ev_fd); }
+  if (pv->has_ev) { free((rawptr)pv->ev_path); }
+  for i in 0..pv->nwatch { free((rawptr)pv->watch_path[i]); }
+  free((rawptr)pv->verts);
+  glint_close(pv->ctx);
+  free((rawptr)pv);
+}

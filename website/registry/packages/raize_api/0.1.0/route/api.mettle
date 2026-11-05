@@ -1,0 +1,587 @@
+// raize_api/route/api: an API, its operations and how they are declared.
+//
+//   fn tasks_app(app: RzApp*) {
+//     var api: RapiApi* = rapi_new(app, "/api", "Tasks", "1.0.0");
+//     rapi_group(api, "/v1");
+//     var op: RapiOp* = rapi_get(api, "/tasks/:id", &get_task);
+//     rapi_summary(op, "Get a task");
+//     rapi_path_param(op, "id", rapi_range(rapi_int64_t(), 1, RAPI_UNSET), "The task id");
+//     rapi_returns(op, 200, Task_rapi(), "The task");
+//     rapi_group_end(api);
+//   }
+//
+// Paths use raize's form ("/tasks/:id"): a segment is literal text or one whole
+// :name. Each :name is a string path parameter until rapi_path_param gives it a
+// type. The OpenAPI document shows them as {name}. Everything is declared once at
+// startup.
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_app/types";
+import "../types/type";
+import "../problem/problem";
+
+export const RAPI_IN_PATH: int32 = 1;
+export const RAPI_IN_QUERY: int32 = 2;
+export const RAPI_IN_HEADER: int32 = 3;
+
+export const RAPI_PARAMS_MAX: int32 = 16;
+export const RAPI_RESPS_MAX: int32 = 8;
+export const RAPI_SEGS_MAX: int32 = 16;
+export const RAPI_OPS_MAX: int32 = 256;
+export const RAPI_HOOKS_MAX: int32 = 16;
+
+/// Returned by a hook to let the request go on.
+export const RAPI_NEXT: int32 = 0;
+
+/// A declared parameter.
+export struct RapiParam {
+  name: string;
+  in: int32;            // RAPI_IN_*
+  type: RapiType*;      // a scalar type, or an array of one (query: repeated keys)
+  required: bool;
+  desc: string;
+  def: string;          // default used when absent ("" for none)
+}
+
+/// A declared response.
+export struct RapiResp {
+  status: int32;
+  type: RapiType*;      // 0 for no body
+  list: bool;           // the body is an array of `type`
+  desc: string;
+  media: string;        // "" means application/json
+}
+
+/// One operation: a verb on a path template and the handler that serves it.
+export struct RapiOp {
+  verb: string;
+  path: string;                    // full template relative to the API base ("/v1/tasks/:id")
+  segs: string[16];                // path segments; a parameter segment holds its name
+  is_param: bool[16];
+  nsegs: int32;
+  handler: fn(RapiReq*) -> int32;
+  id: string;                      // operationId
+  summary: string;
+  desc: string;
+  tags: string[4];
+  ntags: int32;
+  params: RapiParam[16];
+  nparams: int32;
+  body: RapiType*;                 // request body type, 0 for none
+  body_list: bool;                 // the body is an array of `body`
+  body_required: bool;
+  body_media: string;              // "" means application/json
+  resps: RapiResp[8];
+  nresps: int32;
+  security: bool;                  // needs an authenticated caller
+  scopes: string;                  // space-separated scopes the caller must hold
+  deprecated: bool;
+  deprecated_at: int64;            // unix seconds for the Deprecation header, 0 for none
+  sunset_at: int64;                // unix seconds for the Sunset header, 0 for none
+  cache_control: string;           // Cache-Control for success responses, "" for none
+  idem: int32;                     // Idempotency-Key: 0 off, 1 optional, 2 required
+  max_body: int64;                 // bytes, 0 means the API's limit
+  ud: rawptr;                      // for the app: any pointer the handler wants (rapi_op_data)
+  ud2: rawptr;                     // for raize_api's own generated operations
+  listing: rawptr;                 // query/: the RapiListing of a list operation, or 0
+}
+
+/// A parsed parameter value.
+export struct RapiValue {
+  set: bool;          // present (or defaulted)
+  s: string;          // the text
+  i: int64;           // integers and booleans (1/0)
+  f: float64;         // numbers
+  list: string*;      // arrays: the items' text, in the request arena
+  n: int64;           // arrays: item count
+}
+
+/// One request being served by an operation.
+export struct RapiReq {
+  ctx: RzContext*;
+  api: RapiApi*;
+  op: RapiOp*;
+  vals: RapiValue[16];   // parallel to op->params
+  body: rawptr;          // the decoded body (op->body->size bytes), or 0
+  present: int64;        // top-level body fields that were present (bit i = field i)
+  errs: RapiErrors*;     // scratch for errors, in the arena
+  principal: rawptr;     // the authenticated caller, set by the auth hook
+  subject: string;       // the caller's id as text, "" when anonymous
+  scopes: string;        // the caller's granted scopes, space-separated
+  ud: rawptr;            // per-request data for hooks and the handler
+  idem_slot: int32;      // idempotency: the reserved store slot, -1 for none
+  mask_type: RapiType*;  // sparse fields: the type the mask applies to, 0 for none
+  mask: int64;           // sparse fields: top-level fields to write (bit i = field i)
+}
+
+/// An API mounted under a base path.
+export struct RapiApi {
+  app: RzApp*;
+  base: string;                       // "/api", or "" for the root
+  title: string;
+  version: string;
+  desc: string;
+  ops: (RapiOp*)[256];
+  nops: int32;
+  prefix: string;                     // the open group's prefix
+  group_tag: string;                  // the open group's default tag
+  group_deprecated: bool;
+  group_deprecated_at: int64;
+  group_sunset_at: int64;
+  group_security: bool;
+  group_scopes: string;
+  max_body: int64;                    // default body limit in bytes
+  openapi_path: string;               // "/openapi.json" under base, "" to turn off
+  docs_path: string;                  // "/docs" under base, "" to turn off
+  docs_script: string;                // the docs page's script URL
+  servers: string[4];
+  nservers: int32;
+  befores: (fn(RapiReq*) -> int32)[16];
+  nbefores: int32;
+  afters: (fn(RapiReq*, int32) -> int32)[16];
+  nafters: int32;
+  edges: (fn(RapiApi*, RzContext*) -> int32)[4];   // run first for every request under base
+  nedges: int32;
+  security_name: string;              // the security scheme's name in OpenAPI ("" for none)
+  security_json: string;              // its Security Scheme Object, JSON
+  cors: rawptr;                       // cors/ state
+  limiter: rawptr;                    // ratelimit/ state
+  idem: rawptr;                       // idempotency/ state
+  auth: rawptr;                       // auth/ state
+  compress: rawptr;                   // negotiate/ compression state
+  errors: int32;                      // declaration mistakes found
+  first_error: string;
+}
+
+/// internal: records a declaration mistake.
+export fn rapi__set_error(api: RapiApi*, text: string) {
+  if (api->errors == 0) { api->first_error = rz_str_dup(text); }
+  api->errors = api->errors + 1;
+}
+
+/// The first declaration mistake, or "" when there was none.
+export fn rapi_error(api: RapiApi*) -> string {
+  if (api == 0 || api->errors == 0) { return ""; }
+  return api->first_error;
+}
+
+// Every API made by rapi_new, for the shared entry handler.
+var g_rapi_apis: (RapiApi*)[8];
+var g_rapi_napis: int32 = 0;
+
+/// internal: route/dispatch. The APIs made so far.
+export fn rapi__apis(n: int32*) -> RapiApi** {
+  *n = g_rapi_napis;
+  return &g_rapi_apis[0];
+}
+
+/// internal: route/dispatch (rapi_new). Makes and records an API without mounting it.
+export fn rapi__api_alloc(app: RzApp*, base: string, title: string, version: string) -> RapiApi* {
+  var api: RapiApi* = (RapiApi*)calloc(1, sizeof(RapiApi));
+  var b: string = base;
+  if (b == "/") { b = ""; }
+  api->app = app;
+  api->base = rz_str_dup(b);
+  api->title = rz_str_dup(title);
+  api->version = rz_str_dup(version);
+  api->desc = "";
+  api->prefix = "";
+  api->group_tag = "";
+  api->group_scopes = "";
+  api->max_body = 1048576;
+  api->openapi_path = "/openapi.json";
+  api->docs_path = "/docs";
+  api->docs_script = "";
+  api->security_name = "";
+  api->security_json = "";
+  api->first_error = "";
+  if (g_rapi_napis < 8) {
+    g_rapi_apis[g_rapi_napis] = api;
+    g_rapi_napis = g_rapi_napis + 1;
+  } else {
+    rapi__set_error(api, "more than 8 APIs");
+  }
+  return api;
+}
+
+/// Sets the API's description (Markdown, shown in the docs).
+export fn rapi_describe_api(api: RapiApi*, desc: string) { api->desc = rz_str_dup(desc); }
+
+/// Adds a server URL to the OpenAPI document ("https://api.example.com").
+export fn rapi_server(api: RapiApi*, url: string) {
+  if (api->nservers < 4) {
+    api->servers[api->nservers] = rz_str_dup(url);
+    api->nservers = api->nservers + 1;
+  }
+}
+
+/// Default request body limit in bytes (1 MiB to start with).
+export fn rapi_max_body(api: RapiApi*, bytes: int64) { api->max_body = bytes; }
+
+/// Moves or turns off ("") the OpenAPI document and the docs page.
+export fn rapi_docs_at(api: RapiApi*, openapi_path: string, docs_path: string) {
+  api->openapi_path = rz_str_dup(openapi_path);
+  api->docs_path = rz_str_dup(docs_path);
+}
+
+/// Adds a hook that runs before every operation's handler, in the order added.
+/// It returns RAPI_NEXT to go on, or the status of a response it already sent.
+export fn rapi_before(api: RapiApi*, hook: fn(RapiReq*) -> int32) {
+  if (api->nbefores >= RAPI_HOOKS_MAX) { rapi__set_error(api, "more than 16 before hooks"); return; }
+  api->befores[api->nbefores] = hook;
+  api->nbefores = api->nbefores + 1;
+}
+
+/// Adds a hook that runs after every handler with the status it returned, and returns
+/// the status to keep (it may rewrite the response).
+export fn rapi_after(api: RapiApi*, hook: fn(RapiReq*, int32) -> int32) {
+  if (api->nafters >= RAPI_HOOKS_MAX) { rapi__set_error(api, "more than 16 after hooks"); return; }
+  api->afters[api->nafters] = hook;
+  api->nafters = api->nafters + 1;
+}
+
+/// Adds a hook that runs first for every request under the API's base, matched or
+/// not (CORS uses it so error responses carry its headers too).
+export fn rapi_edge(api: RapiApi*, hook: fn(RapiApi*, RzContext*) -> int32) {
+  if (api->nedges >= 4) { rapi__set_error(api, "more than 4 edge hooks"); return; }
+  api->edges[api->nedges] = hook;
+  api->nedges = api->nedges + 1;
+}
+
+// ---------------------------------------------------------------------------
+// Groups: a path prefix and defaults for the operations declared inside.
+// Versioned APIs put each version in a group ("/v1", "/v2").
+// ---------------------------------------------------------------------------
+
+/// Opens a group: operations declared until rapi_group_end get `prefix` in front.
+export fn rapi_group(api: RapiApi*, prefix: string) {
+  api->prefix = rz_str_dup(prefix);
+  api->group_tag = "";
+  api->group_deprecated = false;
+  api->group_deprecated_at = 0;
+  api->group_sunset_at = 0;
+  api->group_security = false;
+  api->group_scopes = "";
+}
+
+/// Gives the open group's operations a default tag.
+export fn rapi_group_tag(api: RapiApi*, tag: string) { api->group_tag = rz_str_dup(tag); }
+
+/// Marks the open group deprecated (RFC 9745 Deprecation header from `since`, unix
+/// seconds, 0 to leave it out) with an optional end date (RFC 8594 Sunset, 0 for none).
+export fn rapi_group_deprecate(api: RapiApi*, since: int64, sunset: int64) {
+  api->group_deprecated = true;
+  api->group_deprecated_at = since;
+  api->group_sunset_at = sunset;
+}
+
+/// The open group's operations need an authenticated caller with these scopes
+/// (space-separated, "" for any caller).
+export fn rapi_group_secure(api: RapiApi*, scopes: string) {
+  api->group_security = true;
+  api->group_scopes = rz_str_dup(scopes);
+}
+
+/// Closes the open group.
+export fn rapi_group_end(api: RapiApi*) { rapi_group(api, ""); }
+
+// ---------------------------------------------------------------------------
+// Operations
+// ---------------------------------------------------------------------------
+
+fn rapi__camel_id(verb: string, path: string) -> string {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, rz_str_lower(verb));
+  var up: bool = true;
+  for i in 0..path.length {
+    var c: int32 = (int32)path.chars[i];
+    var word: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57);
+    if (!word) { up = true; continue; }
+    if (up) { rz_buf_add_byte(b, rz_char_upper(c)); up = false; }
+    else { rz_buf_add_byte(b, c); }
+  }
+  var out: string = rz_str_dup(rz_buf_str(b));
+  rz_buf_free(b);
+  return out;
+}
+
+fn rapi__name_ok(s: string) -> bool {
+  if (s.length == 0) { return false; }
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    var ok: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 45 || c == 46;
+    if (!ok) { return false; }
+  }
+  return true;
+}
+
+// Splits the template into segments. False when it is malformed.
+fn rapi__split(api: RapiApi*, op: RapiOp*) -> bool {
+  var p: string = op->path;
+  if (p.length == 0 || p.chars[0] != 47) { return false; }
+  var i: int64 = 1;
+  var n: int64 = (int64)p.length;
+  if (n == 1) { return true; }
+  while (i <= n) {
+    var j: int64 = i;
+    while (j < n && p.chars[j] != 47) { j = j + 1; }
+    if (j == i) { return false; }
+    if (op->nsegs >= RAPI_SEGS_MAX) { return false; }
+    var seg: string = rz_str_sub(p, i, j);
+    var k: int32 = op->nsegs;
+    if (seg.chars[0] == 58) {
+      var name: string = rz_str_from(seg, 1);
+      if (!rapi__name_ok(name)) { return false; }
+      op->segs[k] = rz_str_dup(name);
+      op->is_param[k] = true;
+      rapi__param(api, op, name, RAPI_IN_PATH, rapi_string_t(), true, "", true);
+    } else {
+      for q in 0..seg.length {
+        var c: int32 = (int32)seg.chars[q];
+        if (c == 123 || c == 125 || c == 42 || c == 58) { return false; }
+      }
+      op->segs[k] = rz_str_dup(seg);
+      op->is_param[k] = false;
+    }
+    op->nsegs = op->nsegs + 1;
+    i = j + 1;
+  }
+  return true;
+}
+
+fn rapi__add_param(api: RapiApi*, op: RapiOp*, name: string, in: int32, t: RapiType*, required: bool, desc: string) -> RapiParam* {
+  return rapi__param(api, op, name, in, t, required, desc, false);
+}
+
+fn rapi__param(api: RapiApi*, op: RapiOp*, name: string, in: int32, t: RapiType*, required: bool, desc: string, create: bool) -> RapiParam* {
+  for i in 0..op->nparams {
+    var have: RapiParam* = &op->params[i];
+    var same: bool = have->in == in && rz_str_eq(have->name, name);
+    if (in == RAPI_IN_HEADER) { same = have->in == in && rz_str_eq_ci(have->name, name); }
+    if (same) {
+      have->type = t;
+      have->required = required || in == RAPI_IN_PATH;
+      have->desc = rz_str_dup(desc);
+      return have;
+    }
+  }
+  if (in == RAPI_IN_PATH && !create) {
+    rapi__set_error(api, "{op->verb} {op->path}: no path segment :{name}");
+    return (RapiParam*)0;
+  }
+  if (op->nparams >= RAPI_PARAMS_MAX) {
+    rapi__set_error(api, "{op->verb} {op->path}: more than 16 parameters");
+    return (RapiParam*)0;
+  }
+  var p: RapiParam* = &op->params[op->nparams];
+  p->name = rz_str_dup(name);
+  p->in = in;
+  p->type = t;
+  p->required = required;
+  p->desc = rz_str_dup(desc);
+  p->def = "";
+  op->nparams = op->nparams + 1;
+  return p;
+}
+
+/// Declares an operation. `verb` is GET, POST, PUT, PATCH or DELETE; `path` is a
+/// template under the API base and the open group. Returns the operation to describe
+/// further, or 0 after recording a mistake (rapi_error).
+export fn rapi_op(api: RapiApi*, verb: string, path: string, handler: fn(RapiReq*) -> int32) -> RapiOp* {
+  var v: string = rz_str_upper(verb);
+  var ok: bool = v == "GET" || v == "POST" || v == "PUT" || v == "PATCH" || v == "DELETE";
+  if (!ok) { rapi__set_error(api, "{verb} {path}: unknown verb"); return (RapiOp*)0; }
+  if (api->nops >= RAPI_OPS_MAX) { rapi__set_error(api, "{verb} {path}: more than 256 operations"); return (RapiOp*)0; }
+  var op: RapiOp* = (RapiOp*)calloc(1, sizeof(RapiOp));
+  op->verb = rz_str_dup(v);
+  var full: string = api->prefix + path;
+  if (full == "") { full = "/"; }
+  op->path = rz_str_dup(full);
+  op->handler = handler;
+  op->summary = "";
+  op->desc = "";
+  op->scopes = api->group_scopes;
+  op->security = api->group_security;
+  op->deprecated = api->group_deprecated;
+  op->deprecated_at = api->group_deprecated_at;
+  op->sunset_at = api->group_sunset_at;
+  op->cache_control = "";
+  op->body_media = "";
+  if (api->group_tag.length > 0) {
+    op->tags[0] = api->group_tag;
+    op->ntags = 1;
+  }
+  if (!rapi__split(api, op)) {
+    rapi__set_error(api, "{verb} {full}: bad path template; use segments like /tasks/:id");
+    free((rawptr)op);
+    return (RapiOp*)0;
+  }
+  op->id = rapi__camel_id(v, full);
+  for i in 0..api->nops {
+    var o: RapiOp* = api->ops[i];
+    if (o->verb == op->verb && rapi__same_shape(o, op)) {
+      rapi__set_error(api, "{v} {full}: declared twice (same as {o->path})");
+      free((rawptr)op);
+      return (RapiOp*)0;
+    }
+  }
+  api->ops[api->nops] = op;
+  api->nops = api->nops + 1;
+  return op;
+}
+
+// Two templates that match exactly the same paths.
+fn rapi__same_shape(a: RapiOp*, b: RapiOp*) -> bool {
+  if (a->nsegs != b->nsegs) { return false; }
+  for i in 0..a->nsegs {
+    if (a->is_param[i] != b->is_param[i]) { return false; }
+    if (!a->is_param[i] && !rz_str_eq(a->segs[i], b->segs[i])) { return false; }
+  }
+  return true;
+}
+
+/// GET `path` (see rapi_op).
+export fn rapi_get(api: RapiApi*, path: string, h: fn(RapiReq*) -> int32) -> RapiOp* { return rapi_op(api, "GET", path, h); }
+/// POST `path`.
+export fn rapi_post(api: RapiApi*, path: string, h: fn(RapiReq*) -> int32) -> RapiOp* { return rapi_op(api, "POST", path, h); }
+/// PUT `path`.
+export fn rapi_put(api: RapiApi*, path: string, h: fn(RapiReq*) -> int32) -> RapiOp* { return rapi_op(api, "PUT", path, h); }
+/// PATCH `path`.
+export fn rapi_patch(api: RapiApi*, path: string, h: fn(RapiReq*) -> int32) -> RapiOp* { return rapi_op(api, "PATCH", path, h); }
+/// DELETE `path`.
+export fn rapi_delete(api: RapiApi*, path: string, h: fn(RapiReq*) -> int32) -> RapiOp* { return rapi_op(api, "DELETE", path, h); }
+
+// Describing an operation. Each accepts 0 (from a failed rapi_op) and does nothing.
+
+/// Sets the operationId (default: verb and path in camel case, "getV1TasksId").
+export fn rapi_op_id(op: RapiOp*, id: string) { if (op != 0) { op->id = rz_str_dup(id); } }
+/// Sets the one-line summary.
+export fn rapi_summary(op: RapiOp*, text: string) { if (op != 0) { op->summary = rz_str_dup(text); } }
+/// Sets the longer description (Markdown).
+export fn rapi_describe(op: RapiOp*, text: string) { if (op != 0) { op->desc = rz_str_dup(text); } }
+
+/// Adds a tag (at most 4).
+export fn rapi_tag(op: RapiOp*, tag: string) {
+  if (op == 0 || op->ntags >= 4) { return; }
+  op->tags[op->ntags] = rz_str_dup(tag);
+  op->ntags = op->ntags + 1;
+}
+
+/// Gives path parameter :name a type and description.
+export fn rapi_path_param(op: RapiOp*, name: string, t: RapiType*, desc: string) {
+  if (op == 0) { return; }
+  rapi__add_param_op(op, name, RAPI_IN_PATH, t, true, desc);
+}
+
+/// Declares a query parameter. An array type takes repeated keys (?tag=a&tag=b).
+export fn rapi_query(op: RapiOp*, name: string, t: RapiType*, required: bool, desc: string) {
+  if (op == 0) { return; }
+  rapi__add_param_op(op, name, RAPI_IN_QUERY, t, required, desc);
+}
+
+/// Declares a request header parameter.
+export fn rapi_header_param(op: RapiOp*, name: string, t: RapiType*, required: bool, desc: string) {
+  if (op == 0) { return; }
+  rapi__add_param_op(op, name, RAPI_IN_HEADER, t, required, desc);
+}
+
+/// Sets the value an absent optional parameter takes (the text form: "20", "true").
+export fn rapi_param_default(op: RapiOp*, name: string, value: string) {
+  if (op == 0) { return; }
+  for i in 0..op->nparams {
+    if (rz_str_eq(op->params[i].name, name)) { op->params[i].def = rz_str_dup(value); }
+  }
+}
+
+fn rapi__add_param_op(op: RapiOp*, name: string, in: int32, t: RapiType*, required: bool, desc: string) {
+  var api: RapiApi* = rapi__api_of(op);
+  if (api == 0) { return; }
+  rapi__add_param(api, op, name, in, t, required, desc);
+}
+
+fn rapi__api_of(op: RapiOp*) -> RapiApi* {
+  for a in 0..g_rapi_napis {
+    var api: RapiApi* = g_rapi_apis[a];
+    for i in 0..api->nops {
+      if (api->ops[i] == op) { return api; }
+    }
+  }
+  return (RapiApi*)0;
+}
+
+/// The request body is a JSON value of type `t` (required).
+export fn rapi_body(op: RapiOp*, t: RapiType*) {
+  if (op == 0) { return; }
+  op->body = t;
+  op->body_list = false;
+  op->body_required = true;
+}
+
+/// The request body is a JSON array of `t`.
+export fn rapi_body_list(op: RapiOp*, t: RapiType*) {
+  if (op == 0) { return; }
+  op->body = t;
+  op->body_list = true;
+  op->body_required = true;
+  op->ud2 = (rawptr)rapi_array_t(t);
+}
+
+/// The request body may be left out.
+export fn rapi_body_optional(op: RapiOp*) { if (op != 0) { op->body_required = false; } }
+
+/// Documents a response: `status` with a body of type `t` (0 for none).
+export fn rapi_returns(op: RapiOp*, status: int32, t: RapiType*, desc: string) {
+  rapi__resp(op, status, t, false, desc);
+}
+
+/// Documents a response whose body is a JSON array of `t`.
+export fn rapi_returns_list(op: RapiOp*, status: int32, t: RapiType*, desc: string) {
+  rapi__resp(op, status, t, true, desc);
+}
+
+fn rapi__resp(op: RapiOp*, status: int32, t: RapiType*, list: bool, desc: string) {
+  if (op == 0 || op->nresps >= RAPI_RESPS_MAX) { return; }
+  var r: RapiResp* = &op->resps[op->nresps];
+  r->status = status;
+  r->type = t;
+  r->list = list;
+  r->desc = rz_str_dup(desc);
+  r->media = "";
+  op->nresps = op->nresps + 1;
+}
+
+/// The operation needs an authenticated caller holding `scopes` (space-separated;
+/// "" for any authenticated caller).
+export fn rapi_secure(op: RapiOp*, scopes: string) {
+  if (op == 0) { return; }
+  op->security = true;
+  op->scopes = rz_str_dup(scopes);
+}
+
+/// The operation is open to anonymous callers even inside a secured group.
+export fn rapi_public(op: RapiOp*) {
+  if (op == 0) { return; }
+  op->security = false;
+  op->scopes = "";
+}
+
+/// Marks the operation deprecated (see rapi_group_deprecate for the dates).
+export fn rapi_deprecate(op: RapiOp*, since: int64, sunset: int64) {
+  if (op == 0) { return; }
+  op->deprecated = true;
+  op->deprecated_at = since;
+  op->sunset_at = sunset;
+}
+
+/// Cache-Control for the operation's successful responses ("max-age=60", "no-store").
+export fn rapi_cache(op: RapiOp*, value: string) { if (op != 0) { op->cache_control = rz_str_dup(value); } }
+
+/// Body limit for this operation in bytes.
+export fn rapi_op_max_body(op: RapiOp*, bytes: int64) { if (op != 0) { op->max_body = bytes; } }
+
+/// Any pointer the handler wants to find again with rapi_op_data.
+export fn rapi_op_set_data(op: RapiOp*, ud: rawptr) { if (op != 0) { op->ud = ud; } }
+
+/// The pointer given to rapi_op_set_data for the operation serving `r`.
+export fn rapi_op_data(r: RapiReq*) -> rawptr { return r->op->ud; }

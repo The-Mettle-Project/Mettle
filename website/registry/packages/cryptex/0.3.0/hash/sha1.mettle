@@ -1,0 +1,199 @@
+// SHA-1 (FIPS 180-4) and HMAC-SHA1 (RFC 2104) in pure Mettle. Internal
+// module (crx_ prefix), and deliberately not part of the public API: SHA-1
+// is broken for collision resistance and exists here only because
+// authenticator apps (RFC 4226 HOTP, RFC 6238 TOTP) are defined over
+// HMAC-SHA1. Callers have already validated their arguments, these functions
+// do not. Words are loaded and stored big-endian with explicit shifts, all
+// arithmetic is on unsigned types and no index or branch depends on the
+// data, so the code is constant time for secret input.
+
+import "cryptex/core/status";
+import "cryptex/core/util";
+
+/// internal: SHA-1 running state (chaining value, partial block, byte count).
+export struct CrxSha1 {
+  h: uint32[5];
+  buf: uint8[64];
+  buflen: int64;
+  total: uint64;
+}
+
+fn crx_sha1_rotl(x: uint32, n: int32) -> uint32 {
+  return (x << n) | (x >> (32 - n));
+}
+
+fn crx_sha1_load32be(p: uint8*) -> uint32 {
+  return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+
+fn crx_sha1_store32be(p: uint8*, v: uint32) {
+  p[0] = (uint8)(v >> 24);
+  p[1] = (uint8)(v >> 16);
+  p[2] = (uint8)(v >> 8);
+  p[3] = (uint8)v;
+}
+
+fn crx_sha1_store64be(p: uint8*, v: uint64) {
+  crx_sha1_store32be(p, (uint32)(v >> 32));
+  crx_sha1_store32be(&p[4], (uint32)v);
+}
+
+// One 64-byte block.
+fn crx_sha1_block(s: CrxSha1*, blk: uint8*) {
+  var w: uint32[80];
+  for i in 0..16 {
+    w[i] = crx_sha1_load32be(&blk[i * 4]);
+  }
+  for i in 16..80 {
+    w[i] = crx_sha1_rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+  }
+  var a: uint32 = s->h[0];
+  var b: uint32 = s->h[1];
+  var c: uint32 = s->h[2];
+  var d: uint32 = s->h[3];
+  var e: uint32 = s->h[4];
+  var t: uint32 = 0;
+  // Rounds 0..19: Ch, K = 5a827999.
+  for i in 0..20 {
+    t = crx_sha1_rotl(a, 5) + ((b & c) | (~b & d)) + e + (uint32)0x5a827999 + w[i];
+    e = d;
+    d = c;
+    c = crx_sha1_rotl(b, 30);
+    b = a;
+    a = t;
+  }
+  // Rounds 20..39: Parity, K = 6ed9eba1.
+  for i in 20..40 {
+    t = crx_sha1_rotl(a, 5) + (b ^ c ^ d) + e + (uint32)0x6ed9eba1 + w[i];
+    e = d;
+    d = c;
+    c = crx_sha1_rotl(b, 30);
+    b = a;
+    a = t;
+  }
+  // Rounds 40..59: Maj, K = 8f1bbcdc.
+  for i in 40..60 {
+    t = crx_sha1_rotl(a, 5) + ((b & c) | (b & d) | (c & d)) + e + (uint32)0x8f1bbcdc + w[i];
+    e = d;
+    d = c;
+    c = crx_sha1_rotl(b, 30);
+    b = a;
+    a = t;
+  }
+  // Rounds 60..79: Parity, K = ca62c1d6.
+  for i in 60..80 {
+    t = crx_sha1_rotl(a, 5) + (b ^ c ^ d) + e + (uint32)0xca62c1d6 + w[i];
+    e = d;
+    d = c;
+    c = crx_sha1_rotl(b, 30);
+    b = a;
+    a = t;
+  }
+  s->h[0] = s->h[0] + a;
+  s->h[1] = s->h[1] + b;
+  s->h[2] = s->h[2] + c;
+  s->h[3] = s->h[3] + d;
+  s->h[4] = s->h[4] + e;
+  cr_wipe((uint8*)&w[0], 320);
+}
+
+/// internal: starts a SHA-1 computation.
+export fn crx_sha1_init(s: CrxSha1*) {
+  s->h[0] = (uint32)0x67452301;
+  s->h[1] = (uint32)0xefcdab89;
+  s->h[2] = (uint32)0x98badcfe;
+  s->h[3] = (uint32)0x10325476;
+  s->h[4] = (uint32)0xc3d2e1f0;
+  for i in 0..64 {
+    s->buf[i] = 0;
+  }
+  s->buflen = 0;
+  s->total = 0;
+}
+
+/// internal: feeds n bytes into a SHA-1 computation.
+export fn crx_sha1_update(s: CrxSha1*, p: uint8*, n: int64) {
+  s->total = s->total + (uint64)n;
+  var pos: int64 = 0;
+  if (s->buflen > 0) {
+    while (pos < n && s->buflen < 64) {
+      s->buf[s->buflen] = p[pos];
+      s->buflen = s->buflen + 1;
+      pos = pos + 1;
+    }
+    if (s->buflen < 64) { return; }
+    crx_sha1_block(s, &s->buf[0]);
+    s->buflen = 0;
+  }
+  while (n - pos >= 64) {
+    crx_sha1_block(s, &p[pos]);
+    pos = pos + 64;
+  }
+  while (pos < n) {
+    s->buf[s->buflen] = p[pos];
+    s->buflen = s->buflen + 1;
+    pos = pos + 1;
+  }
+}
+
+/// internal: finishes SHA-1: writes 20 bytes to out, then wipes s.
+export fn crx_sha1_final(s: CrxSha1*, out: uint8*) {
+  var bits: uint64 = s->total << 3;
+  var i: int64 = s->buflen;
+  s->buf[i] = 128;
+  i = i + 1;
+  if (i > 56) {
+    while (i < 64) { s->buf[i] = 0; i = i + 1; }
+    crx_sha1_block(s, &s->buf[0]);
+    i = 0;
+  }
+  while (i < 56) { s->buf[i] = 0; i = i + 1; }
+  crx_sha1_store64be(&s->buf[56], bits);
+  crx_sha1_block(s, &s->buf[0]);
+  for j in 0..5 {
+    crx_sha1_store32be(&out[j * 4], s->h[j]);
+  }
+  cr_wipe((uint8*)s, 104);
+}
+
+/// internal: HMAC-SHA1 (RFC 2104) of msg under a key of any length (keys
+/// over 64 bytes are hashed first). Writes 20 bytes to out20; wipes its pads
+/// and hash states.
+export fn crx_hmac_sha1(out20: uint8*, key: uint8*, keylen: int64, msg: uint8*, n: int64) {
+  var kb: uint8[64];
+  for i in 0..64 {
+    kb[i] = 0;
+  }
+  var h: CrxSha1;
+  if (keylen > 64) {
+    crx_sha1_init(&h);
+    crx_sha1_update(&h, key, keylen);
+    crx_sha1_final(&h, &kb[0]);
+  } else {
+    var i: int64 = 0;
+    while (i < keylen) {
+      kb[i] = key[i];
+      i = i + 1;
+    }
+  }
+  var pad: uint8[64];
+  var ih: uint8[20];
+  for i in 0..64 {
+    pad[i] = kb[i] ^ 54;
+  }
+  crx_sha1_init(&h);
+  crx_sha1_update(&h, &pad[0], 64);
+  crx_sha1_update(&h, msg, n);
+  crx_sha1_final(&h, &ih[0]);
+  for i in 0..64 {
+    pad[i] = kb[i] ^ 92;
+  }
+  crx_sha1_init(&h);
+  crx_sha1_update(&h, &pad[0], 64);
+  crx_sha1_update(&h, &ih[0], 20);
+  crx_sha1_final(&h, out20);
+  cr_wipe(&kb[0], 64);
+  cr_wipe(&pad[0], 64);
+  cr_wipe(&ih[0], 20);
+  cr_wipe((uint8*)&h, 104);
+}

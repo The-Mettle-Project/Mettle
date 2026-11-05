@@ -1,0 +1,220 @@
+// Scene building, path iteration and dash patterns on small hand-built scenes. Every
+// check frees what it built and asserts mp_alloc_live() returns to its starting value.
+
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/scene/scene";
+import "mistplot/scene/path";
+
+fn red() -> MpColor { return mp_rgba(255, 0, 0, 255); }
+fn none() -> MpColor { return mp_rgba(0, 0, 0, 0); }
+
+fn check_basic() {
+  var live0: int64 = mp_alloc_live();
+  var s: MpScene* = mp_scene_new();
+  mp_expect("scene allocates", s != 0);
+  if (s == 0) { return; }
+  mp_expect_i64("new scene is empty", mp_scene_count(s), 0);
+  mp_expect_i64("rect", (int64)mp_scene_rect(s, mp_rect(1.0, 2.0, 3.0, 4.0), red(), none(),
+                                                0.0, MP_CLS_BG), (int64)MP_OK);
+  mp_expect_i64("line", (int64)mp_scene_line(s, 10.0, 5.0, 2.0, 9.0, red(), 1.0,
+                                                MP_CLS_GRID), (int64)MP_OK);
+  mp_expect_i64("text", (int64)mp_scene_text(s, 4.0, 20.0, "héllo", 12.0, red(),
+                                                MP_ALIGN_END, MP_NF_BOLD, MP_CLS_TITLE,
+                                                31.5), (int64)MP_OK);
+  mp_expect_i64("marker", (int64)mp_scene_marker(s, 5.0, 6.0, 3.0, MP_MARK_DIAMOND, red(),
+                                                    none(), 0.0, MP_CLS_SERIES + 1),
+                (int64)MP_OK);
+  mp_expect_i64("marker none adds nothing",
+                (int64)mp_scene_marker(s, 5.0, 6.0, 3.0, MP_MARK_NONE, red(), none(), 0.0,
+                                       MP_CLS_SERIES), (int64)MP_OK);
+  mp_expect_i64("bad marker", (int64)mp_scene_marker(s, 0.0, 0.0, 1.0, 9, red(), none(),
+                                                        0.0, 0), (int64)MP_ERR_ARG);
+  mp_expect_i64("bad align", (int64)mp_scene_text(s, 0.0, 0.0, "x", 12.0, red(), 7, 0, 0,
+                                                     1.0), (int64)MP_ERR_ARG);
+  mp_expect_i64("four nodes", mp_scene_count(s), 4);
+  var r: MpNode* = mp_scene_node(s, 0);
+  mp_expect("rect kind", r->kind == MP_NODE_RECT && r->w == 3.0 && r->h == 4.0);
+  var l: MpNode* = mp_scene_node(s, 1);
+  mp_expect("line bbox", l->x == 2.0 && l->y == 5.0 && l->w == 8.0 && l->h == 4.0);
+  var lp: float64* = mp_scene_node_pts(s, l);
+  mp_expect("line points", lp != 0 && lp[0] == 10.0 && lp[3] == 9.0 && l->pts_len == 4);
+  var t: MpNode* = mp_scene_node(s, 2);
+  mp_expect_str("text copied", mp_scene_node_text(s, t), "héllo");
+  mp_expect("text fields", t->y == 20.0 && t->w == 31.5 && t->size == 12.0 &&
+            t->align == MP_ALIGN_END && t->flags == MP_NF_BOLD);
+  var m: MpNode* = mp_scene_node(s, 3);
+  mp_expect("marker fields", m->kind == MP_NODE_MARKER && m->marker == MP_MARK_DIAMOND &&
+            m->r == 3.0 && m->cls == MP_CLS_SERIES + 1);
+  mp_expect("node out of range", mp_scene_node(s, 4) == 0 && mp_scene_node(s, -1) == 0);
+  mp_expect_str("text of a rect", mp_scene_node_text(s, r), "");
+  mp_scene_clear(s);
+  mp_expect_i64("clear", mp_scene_count(s), 0);
+  mp_scene_free(s);
+  mp_expect_i64("basic leaks", mp_alloc_live(), live0);
+}
+
+fn check_poly() {
+  var live0: int64 = mp_alloc_live();
+  var s: MpScene* = mp_scene_new();
+  if (s == 0) { return; }
+  mp_expect_i64("add before begin", (int64)mp_scene_poly_add(s, 1.0, 1.0),
+                (int64)MP_ERR_STATE);
+  mp_expect_i64("begin", (int64)mp_scene_poly_begin(s, 2, red(), 2.0, MP_DASH_DASHED,
+                                                       MP_NF_ROUND, MP_CLS_SERIES),
+                (int64)MP_OK);
+  mp_expect_i64("rect while open", (int64)mp_scene_rect(s, mp_rect(0.0, 0.0, 1.0, 1.0),
+                                                           red(), none(), 0.0, 0),
+                (int64)MP_ERR_STATE);
+  mp_expect_i64("path end on a poly", (int64)mp_scene_path_end(s), (int64)MP_ERR_STATE);
+  var i: int32 = 0;
+  var ok: bool = true;
+  while (i < 100) {
+    if (mp_scene_poly_add(s, (float64)i, (float64)(i % 7)) != MP_OK) { ok = false; }
+    i = i + 1;
+  }
+  mp_expect("100 adds past the reserve", ok);
+  mp_expect_i64("end", (int64)mp_scene_poly_end(s), (int64)MP_OK);
+  mp_expect_i64("end twice", (int64)mp_scene_poly_end(s), (int64)MP_ERR_STATE);
+  var nd: MpNode* = mp_scene_node(s, 0);
+  mp_expect_i64("poly floats", (int64)nd->pts_len, 200);
+  mp_expect("poly bbox", nd->x == 0.0 && nd->w == 99.0 && nd->y == 0.0 && nd->h == 6.0);
+  mp_expect("poly style", nd->dash == MP_DASH_DASHED && nd->flags == MP_NF_ROUND);
+  var p: float64* = mp_scene_node_pts(s, nd);
+  mp_expect("poly in place", p != 0 && p[198] == 99.0 && p[199] == 1.0);
+  mp_scene_free(s);
+  mp_expect_i64("poly leaks", mp_alloc_live(), live0);
+}
+
+fn check_path() {
+  var live0: int64 = mp_alloc_live();
+  var s: MpScene* = mp_scene_new();
+  if (s == 0) { return; }
+  mp_expect_i64("path begin", (int64)mp_scene_path_begin(s, 4, 4, red(), none(), red(), 1.0,
+                                                            MP_DASH_SOLID, MP_NF_GRADIENT,
+                                                            MP_CLS_SERIES), (int64)MP_OK);
+  mp_expect_i64("line before move", (int64)mp_scene_path_line(s, 1.0, 1.0),
+                (int64)MP_ERR_STATE);
+  mp_expect_i64("move", (int64)mp_scene_path_move(s, 0.0, 10.0), (int64)MP_OK);
+  mp_expect_i64("cubic", (int64)mp_scene_path_cubic(s, 0.0, 0.0, 10.0, 0.0, 10.0, 10.0),
+                (int64)MP_OK);
+  mp_expect_i64("line", (int64)mp_scene_path_line(s, 20.0, 10.0), (int64)MP_OK);
+  mp_expect_i64("close", (int64)mp_scene_path_close(s), (int64)MP_OK);
+  mp_expect_i64("poly add on a path", (int64)mp_scene_poly_add(s, 1.0, 1.0),
+                (int64)MP_ERR_STATE);
+  mp_expect_i64("path end", (int64)mp_scene_path_end(s), (int64)MP_OK);
+  var nd: MpNode* = mp_scene_node(s, 0);
+  mp_expect_i64("path cmds", (int64)nd->cmd_len, 4);
+  mp_expect_i64("path floats", (int64)nd->pts_len, 10);
+  var c: uint8* = mp_scene_node_cmds(s, nd);
+  mp_expect("cmd bytes", c != 0 && c[0] == 1 && c[1] == 3 && c[2] == 2 && c[3] == 4);
+  mp_expect("path bbox", nd->x == 0.0 && nd->y == 0.0 && nd->w == 20.0 && nd->h == 10.0);
+  mp_expect("path flags", nd->flags == MP_NF_GRADIENT && nd->kind == MP_NODE_PATH);
+  mp_scene_free(s);
+  mp_expect_i64("path leaks", mp_alloc_live(), live0);
+}
+
+// Collects up to 64 iterator points into xs/ys/kinds; returns the count.
+fn walk(s: MpScene*, nd: MpNode*, tol: float64, xs: float64*, ys: float64*,
+        kinds: int32*) -> int32 {
+  var it: MpPathIter;
+  if (mp_path_iter(s, nd, &it, tol) != MP_OK) { return -1; }
+  var n: int32 = 0;
+  var x: float64 = 0.0;
+  var y: float64 = 0.0;
+  var k: int32 = mp_path_next(&it, &x, &y);
+  while (k != 0 && n < 64) {
+    xs[n] = x;
+    ys[n] = y;
+    kinds[n] = k;
+    n = n + 1;
+    k = mp_path_next(&it, &x, &y);
+  }
+  return n;
+}
+
+fn check_iter() {
+  var live0: int64 = mp_alloc_live();
+  var s: MpScene* = mp_scene_new();
+  if (s == 0) { return; }
+  var xs: float64[64];
+  var ys: float64[64];
+  var ks: int32[64];
+  mp_scene_line(s, 1.0, 2.0, 3.0, 4.0, red(), 1.0, 0);
+  var n: int32 = walk(s, mp_scene_node(s, 0), 0.5, &xs[0], &ys[0], &ks[0]);
+  mp_expect_i64("line yields 2", (int64)n, 2);
+  mp_expect("line move then line", ks[0] == MP_PATH_MOVE && ks[1] == MP_PATH_LINE &&
+            xs[1] == 3.0 && ys[1] == 4.0);
+  mp_scene_poly_begin(s, 3, red(), 1.0, 0, 0, 0);
+  mp_scene_poly_add(s, 0.0, 0.0);
+  mp_scene_poly_add(s, 5.0, 0.0);
+  mp_scene_poly_add(s, 5.0, 5.0);
+  mp_scene_poly_end(s);
+  n = walk(s, mp_scene_node(s, 1), 0.5, &xs[0], &ys[0], &ks[0]);
+  mp_expect_i64("poly yields 3", (int64)n, 3);
+  mp_expect("poly kinds", ks[0] == MP_PATH_MOVE && ks[2] == MP_PATH_LINE && xs[2] == 5.0);
+  // Control polygon length 30 at tolerance 10 -> 3 segments.
+  mp_scene_path_begin(s, 0, 0, none(), none(), red(), 1.0, 0, 0, 0);
+  mp_scene_path_move(s, 0.0, 10.0);
+  mp_scene_path_cubic(s, 0.0, 0.0, 10.0, 0.0, 10.0, 10.0);
+  mp_scene_path_close(s);
+  mp_scene_path_move(s, 50.0, 50.0);
+  mp_scene_path_close(s);
+  mp_scene_path_end(s);
+  n = walk(s, mp_scene_node(s, 2), 10.0, &xs[0], &ys[0], &ks[0]);
+  mp_expect_i64("cubic + close + empty subpath", (int64)n, 6);
+  mp_expect("cubic midpoint", xs[1] > 0.0 && xs[1] < 5.0 && ys[1] < 10.0);
+  mp_expect("cubic end exact", xs[3] == 10.0 && ys[3] == 10.0 && ks[3] == MP_PATH_LINE);
+  mp_expect("close returns to start", xs[4] == 0.0 && ys[4] == 10.0);
+  mp_expect("second move", ks[5] == MP_PATH_MOVE && xs[5] == 50.0);
+  n = walk(s, mp_scene_node(s, 2), 0.01, &xs[0], &ys[0], &ks[0]);
+  mp_expect_i64("cubic capped at 32 segments", (int64)n, 1 + 32 + 1 + 1);
+  mp_expect_i64("iter on a rect", (int64)walk(s, mp_scene_node(s, 3), 0.5, &xs[0],
+                                               &ys[0], &ks[0]), -1);
+  mp_scene_free(s);
+  mp_expect_i64("iter leaks", mp_alloc_live(), live0);
+}
+
+fn check_dash() {
+  var d: float64[2];
+  mp_expect_i64("solid", (int64)mp_dash_pattern(MP_DASH_SOLID, 2.0, &d[0]), 0);
+  mp_expect_i64("dashed", (int64)mp_dash_pattern(MP_DASH_DASHED, 2.0, &d[0]), 2);
+  mp_expect("dashed 4w 3w", d[0] == 8.0 && d[1] == 6.0);
+  mp_expect_i64("dotted", (int64)mp_dash_pattern(MP_DASH_DOTTED, 1.5, &d[0]), 2);
+  mp_expect("dotted 0.01 2w", d[0] == 0.01 && d[1] == 3.0);
+  mp_dash_pattern(MP_DASH_DASHED, 0.0, &d[0]);
+  mp_expect("zero width counts as 1", d[0] == 4.0 && d[1] == 3.0);
+  mp_expect_i64("unknown", (int64)mp_dash_pattern(9, 1.0, &d[0]), 0);
+}
+
+fn check_args() {
+  mp_expect_i64("rect on 0", (int64)mp_scene_rect(0, mp_rect(0.0, 0.0, 1.0, 1.0), red(),
+                                                     none(), 0.0, 0), (int64)MP_ERR_ARG);
+  mp_expect_i64("poly end on 0", (int64)mp_scene_poly_end(0), (int64)MP_ERR_ARG);
+  mp_expect_i64("count of 0", mp_scene_count(0), 0);
+  mp_scene_free(0);
+  mp_scene_clear(0);
+}
+
+fn run_all() {
+  check_basic();
+  check_poly();
+  check_path();
+  check_iter();
+  check_dash();
+  check_args();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_scene() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

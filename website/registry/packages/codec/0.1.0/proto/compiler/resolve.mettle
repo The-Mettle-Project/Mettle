@@ -1,0 +1,161 @@
+// Loading imports and resolving type names, after parsing.
+import "std/mem";
+import "std/file";
+import "codec/core/list";
+import "codec/proto/compiler/desc";
+import "codec/proto/compiler/parse";
+
+fn codec_pbc_read(path: string, out: string*) -> bool {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return false; }
+  var n: int64 = file_size(fd);
+  var p: uint8* = (uint8*)malloc(n + 1);
+  var got: int64 = 0;
+  while (got < n) {
+    var k: int64 = file_read_at(fd, p + got, n - got, got);
+    if (k <= 0) { break; }
+    got = got + k;
+  }
+  file_close(fd);
+  p[got] = (uint8)0;
+  out->chars = p;
+  out->length = (uint64)got;
+  return got == n;
+}
+
+// Loads a file by import name (searching the include directories), parses it
+// and, in turn, everything it imports. Returns the file's index, or -1.
+export fn codec_pbc_load(set: CodecPbcSet*, name: string) -> int32 {
+  for i in 0..set->files.len {
+    if (set->files.data[i].path == name) { return (int32)i; }
+  }
+  var f: CodecPbcFile;
+  f.path = name;
+  var found: bool = false;
+  for d in 0..set->include.len {
+    var dir: string = set->include.data[d];
+    var disk: string = name;
+    if (dir.length > 0) { disk = dir + "/" + name; }
+    if (codec_pbc_read(disk, &f.text)) {
+      f.disk = disk;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    codec_pbc_fail(set, name, "file not found in the include directories");
+    return -1;
+  }
+  codec_list_push(&set->files, f);
+  var idx: int32 = (int32)(set->files.len - 1);
+  if (!codec_pbc_parse(set, idx)) { return -1; }
+  var n: int64 = set->files.data[idx].imports.len;
+  for k in 0..n {
+    var imp: string = set->files.data[idx].imports.data[k];
+    if (codec_pbc_load(set, imp) < 0) { return -1; }
+  }
+  return idx;
+}
+
+// Finds a message (*is_enum false) or enum by full name, without a leading dot.
+fn codec_pbc_lookup(set: CodecPbcSet*, full: string, is_enum: bool*) -> int32 {
+  for i in 0..set->messages.len {
+    if (set->messages.data[i].full == full) {
+      *is_enum = false;
+      return (int32)i;
+    }
+  }
+  for j in 0..set->enums.len {
+    if (set->enums.data[j].full == full) {
+      *is_enum = true;
+      return (int32)j;
+    }
+  }
+  return -1;
+}
+
+fn codec_pbc_parent_scope(s: string) -> string {
+  var i: int64 = (int64)s.length - 1;
+  while (i >= 0 && s.chars[i] != 46) { i = i - 1; }
+  var out: string;
+  out.chars = s.chars;
+  out.length = (uint64)0;
+  if (i > 0) { out.length = (uint64)i; }
+  return out;
+}
+
+// Resolves `name` as written inside `scope` (a package or message full name),
+// searching from the innermost scope outward, as protoc does.
+fn codec_pbc_resolve_name(set: CodecPbcSet*, scope: string, name: string, is_enum: bool*) -> int32 {
+  if (name.length > 0 && name.chars[0] == 46) {
+    var abs: string;
+    abs.chars = name.chars + 1;
+    abs.length = name.length - 1;
+    return codec_pbc_lookup(set, abs, is_enum);
+  }
+  var s: string = scope;
+  while (true) {
+    var cand: string = name;
+    if (s.length > 0) { cand = s + "." + name; }
+    var r: int32 = codec_pbc_lookup(set, cand, is_enum);
+    if (r >= 0) { return r; }
+    if (s.length == 0) { break; }
+    s = codec_pbc_parent_scope(s);
+  }
+  return -1;
+}
+
+fn codec_pbc_field_where(set: CodecPbcSet*, m: CodecPbcMessage*, f: CodecPbcField*) -> string {
+  var path: string = set->files.data[m->file].disk;
+  return "{path}:{f->line}:{f->col}";
+}
+
+// Resolves every named type. Returns false (with set->error) on the first
+// name that does not resolve.
+export fn codec_pbc_resolve(set: CodecPbcSet*) -> bool {
+  if (set->failed) { return false; }
+  for i in 0..set->messages.len {
+    var nf: int64 = set->messages.data[i].fields.len;
+    for k in 0..nf {
+      var m: CodecPbcMessage* = &set->messages.data[i];
+      var f: CodecPbcField* = &m->fields.data[k];
+      if (f->kind != 0) { continue; }
+      var is_enum: bool = false;
+      var r: int32 = codec_pbc_resolve_name(set, m->full, f->type_name, &is_enum);
+      if (r < 0) {
+        codec_pbc_fail(set, codec_pbc_field_where(set, m, f), "unknown type '{f->type_name}'");
+        return false;
+      }
+      f->ref = r;
+      f->kind = CODEC_PBT_MESSAGE;
+      if (is_enum) {
+        f->kind = CODEC_PBT_ENUM;
+        if (m->syntax == 3 && set->enums.data[r].closed) {
+          codec_pbc_fail(set, codec_pbc_field_where(set, m, f), "a proto3 message cannot use the proto2 enum '{f->type_name}'");
+          return false;
+        }
+      }
+      if (f->packed == 1 && (f->label != CODEC_PBL_REPEATED || f->kind == CODEC_PBT_MESSAGE)) {
+        codec_pbc_fail(set, codec_pbc_field_where(set, m, f), "only repeated number, bool and enum fields can be packed");
+        return false;
+      }
+    }
+  }
+  for s in 0..set->services.len {
+    var svc: CodecPbcService* = &set->services.data[s];
+    var scope: string = set->files.data[svc->file].package;
+    for k in 0..svc->methods.len {
+      var md: CodecPbcMethod* = &svc->methods.data[k];
+      var e1: bool = false;
+      var e2: bool = false;
+      md->in_ref = codec_pbc_resolve_name(set, scope, md->input, &e1);
+      md->out_ref = codec_pbc_resolve_name(set, scope, md->output, &e2);
+      if (md->in_ref < 0 || md->out_ref < 0 || e1 || e2) {
+        var path: string = set->files.data[svc->file].disk;
+        codec_pbc_fail(set, path, "method {svc->name}.{md->name}: request and response must be known message types");
+        return false;
+      }
+    }
+  }
+  return true;
+}

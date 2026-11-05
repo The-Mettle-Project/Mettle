@@ -1,0 +1,397 @@
+// raize/router/trie — the static trie: nodes, lifecycle and registration.
+//
+// The data half of the router: one RzRouter owns two startup allocations (the
+// node table and the pattern/name arena) and nothing else, so matching never
+// allocates. The split is trie (this file: constants, RzNode/RzLink/RzSlot/
+// RzRouter/RzGroup, method bits, new/free/add, the registration errors),
+// match (decode + match + dispatch), group (prefix handles) and router (the
+// facade the framework imports).
+//
+// Construction is startup-only and single-threaded; nothing here runs per
+// request. Every pattern segment and param name is copied into the router's
+// arena, so the caller's buffer may die at once. A nonzero rz_router_add
+// return is a startup failure: the trie may be partly built, so refuse to
+// serve rather than keep registering.
+//
+// Capacities (exceeding any is the listed startup error, never growth):
+//   RZ_MAX_ROUTES 256 registrations, RZ_MAX_NODES 1024, RZ_MAX_LINKS 64
+//   children per node, RZ_MAX_SEGS 32 segments (trie depth),
+//   RZ_MAX_PATTERN_BYTES 16384 of owned copies, RZ_MAX_GROUPS 32 handles.
+
+import "std/mem";
+import "../str/str";
+import "../context/context";
+import "../core/status";
+
+// ---------------------------------------------------------------------------
+// Capacities
+// ---------------------------------------------------------------------------
+
+export const RZ_MAX_ROUTES: int32 = 256;
+export const RZ_MAX_NODES: int32 = 1024;
+export const RZ_MAX_LINKS: int32 = 64;
+export const RZ_MAX_SEGS: int32 = 32;
+export const RZ_MAX_GROUPS: int32 = 32;
+export const RZ_MAX_PATTERN_BYTES: int64 = 16384;
+export const RZ_MAX_PATH: int64 = 2048;
+
+// Registration detail codes, kept in RzRouter.last_error (rz_router_error,
+// rz_router_strerror). RZ_OK (0) means no error. The public results of
+// rz_router_add / rz_group_add are the shared status vocabulary
+// (framework/core/status); rz_router_status maps a detail onto it.
+export const RZ_ROUTER_E_CAPACITY: int32 = 1;       // -> RZ_E_FULL
+export const RZ_ROUTER_E_DUPLICATE: int32 = 2;      // -> RZ_E_CONFLICT
+export const RZ_ROUTER_E_NAME_CONFLICT: int32 = 3;  // -> RZ_E_CONFLICT (param/wildcard name)
+export const RZ_ROUTER_E_PATTERN: int32 = 4;        // -> RZ_E_INVALID
+export const RZ_ROUTER_E_METHOD: int32 = 5;         // -> RZ_E_INVALID
+
+// Node kinds. The numeric order *is* the match priority.
+export const RZ_KIND_ROOT: int32 = 0;
+export const RZ_KIND_EXACT: int32 = 1;
+export const RZ_KIND_PARAM: int32 = 2;
+export const RZ_KIND_WILDCARD: int32 = 3;
+
+// Method bits. Slot index in RzNode.slots is the bit position.
+export const RZ_METHOD_SLOTS: int32 = 9;
+export const RZ_BIT_GET: int32 = 1;
+export const RZ_BIT_HEAD: int32 = 2;
+export const RZ_BIT_POST: int32 = 4;
+export const RZ_BIT_PUT: int32 = 8;
+export const RZ_BIT_PATCH: int32 = 16;
+export const RZ_BIT_DELETE: int32 = 32;
+export const RZ_BIT_OPTIONS: int32 = 64;
+export const RZ_BIT_CONNECT: int32 = 128;
+export const RZ_BIT_TRACE: int32 = 256;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export struct RzLink {
+  node: int32;
+  kind: int32;
+}
+
+export struct RzSlot {
+  h: fn(RzContext*) -> int32;
+}
+
+// One trie node. `seg` holds the exact segment text, `name` the param or
+// wildcard name; both are views into the router's pattern arena.
+export struct RzNode {
+  seg: string;
+  name: string;
+  kind: int32;
+  methods: int32;
+  slots: RzSlot[9];
+  child_count: int32;
+  children: RzLink[64];
+}
+
+export struct RzGroup {
+  rt: RzRouter*;
+  prefix: string;
+  slot: int32;
+  live: bool;
+}
+
+export struct RzRouter {
+  nodes: RzNode*;
+  node_count: int32;
+  route_count: int32;
+  pat_bytes: uint8*;
+  pat_used: int64;
+  groups: RzGroup*;
+  group_used: int32;
+  path_decoded: bool;
+  last_error: int32;
+}
+
+// ---------------------------------------------------------------------------
+// Methods
+// ---------------------------------------------------------------------------
+
+export fn rz_method_bit(m: string) -> int32 {
+  if (rz_str_eq(m, "GET")) { return RZ_BIT_GET; }
+  if (rz_str_eq(m, "HEAD")) { return RZ_BIT_HEAD; }
+  if (rz_str_eq(m, "POST")) { return RZ_BIT_POST; }
+  if (rz_str_eq(m, "PUT")) { return RZ_BIT_PUT; }
+  if (rz_str_eq(m, "PATCH")) { return RZ_BIT_PATCH; }
+  if (rz_str_eq(m, "DELETE")) { return RZ_BIT_DELETE; }
+  if (rz_str_eq(m, "OPTIONS")) { return RZ_BIT_OPTIONS; }
+  if (rz_str_eq(m, "CONNECT")) { return RZ_BIT_CONNECT; }
+  if (rz_str_eq(m, "TRACE")) { return RZ_BIT_TRACE; }
+  return 0;
+}
+
+export fn rz_method_name(bit: int32) -> string {
+  if (bit == RZ_BIT_GET) { return "GET"; }
+  if (bit == RZ_BIT_HEAD) { return "HEAD"; }
+  if (bit == RZ_BIT_POST) { return "POST"; }
+  if (bit == RZ_BIT_PUT) { return "PUT"; }
+  if (bit == RZ_BIT_PATCH) { return "PATCH"; }
+  if (bit == RZ_BIT_DELETE) { return "DELETE"; }
+  if (bit == RZ_BIT_OPTIONS) { return "OPTIONS"; }
+  if (bit == RZ_BIT_CONNECT) { return "CONNECT"; }
+  if (bit == RZ_BIT_TRACE) { return "TRACE"; }
+  return rz_str_empty();
+}
+
+export fn rz_slot_of(bit: int32) -> int32 {
+  var i: int32 = 0;
+  var b: int32 = 1;
+  while (i < RZ_METHOD_SLOTS) {
+    if (bit == b) { return i; }
+    b = b * 2;
+    i = i + 1;
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+export fn rz_router_new() -> RzRouter* {
+  var rt: RzRouter* = new RzRouter;
+  if (rt == 0) { return 0; }
+  rt->nodes = (RzNode*)calloc((int64)RZ_MAX_NODES, (int64)sizeof(RzNode));
+  if (rt->nodes == 0) {
+    free(rt);
+    return 0;
+  }
+  rt->pat_bytes = (uint8*)malloc(RZ_MAX_PATTERN_BYTES);
+  if (rt->pat_bytes == 0) {
+    free(rt->nodes);
+    free(rt);
+    return 0;
+  }
+  rt->groups = (RzGroup*)calloc((int64)RZ_MAX_GROUPS, (int64)sizeof(RzGroup));
+  if (rt->groups == 0) {
+    free(rt->pat_bytes);
+    free(rt->nodes);
+    free(rt);
+    return 0;
+  }
+  rt->nodes[0].kind = RZ_KIND_ROOT;
+  rt->node_count = 1;
+  rt->route_count = 0;
+  rt->pat_used = 0;
+  rt->group_used = 0;
+  rt->path_decoded = false;
+  rt->last_error = RZ_OK;
+  return rt;
+}
+
+export fn rz_router_free(rt: RzRouter*) {
+  if (rt == 0) { return; }
+  if (rt->nodes != 0) { free(rt->nodes); }
+  if (rt->pat_bytes != 0) { free(rt->pat_bytes); }
+  if (rt->groups != 0) { free(rt->groups); }
+  free(rt);
+}
+
+// Tells the router the paths it will see are already decoded and normalized
+// by the server's parser, so it must not decode them again.
+export fn rz_router_set_path_decoded(rt: RzRouter*, decoded: bool) {
+  if (rt == 0) { return; }
+  rt->path_decoded = decoded;
+}
+
+export fn rz_router_count(rt: RzRouter*) -> int32 {
+  if (rt == 0) { return 0; }
+  return rt->route_count;
+}
+
+export fn rz_router_nodes(rt: RzRouter*) -> int32 {
+  if (rt == 0) { return 0; }
+  return rt->node_count;
+}
+
+export fn rz_router_error(rt: RzRouter*) -> int32 {
+  if (rt == 0) { return RZ_ROUTER_E_CAPACITY; }
+  return rt->last_error;
+}
+
+// Maps a registration detail code onto the shared status vocabulary.
+export fn rz_router_status(detail: int32) -> int32 {
+  if (detail == RZ_OK) { return RZ_OK; }
+  if (detail == RZ_ROUTER_E_CAPACITY) { return RZ_E_FULL; }
+  if (detail == RZ_ROUTER_E_DUPLICATE) { return RZ_E_CONFLICT; }
+  if (detail == RZ_ROUTER_E_NAME_CONFLICT) { return RZ_E_CONFLICT; }
+  if (detail == RZ_ROUTER_E_PATTERN) { return RZ_E_INVALID; }
+  if (detail == RZ_ROUTER_E_METHOD) { return RZ_E_INVALID; }
+  return RZ_E_USAGE;
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+// A view into the node arena. Failure (arena full) returns false.
+export fn rz_arena_dup(rt: RzRouter*, s: string, out: string*) -> bool {
+  var n: int64 = (int64)s.length;
+  if (rt->pat_used + n + 1 > RZ_MAX_PATTERN_BYTES) { return false; }
+  var base: uint8* = &rt->pat_bytes[rt->pat_used];
+  var i: int64 = 0;
+  while (i < n) {
+    base[i] = s.chars[i];
+    i = i + 1;
+  }
+  base[n] = 0;
+  rt->pat_used = rt->pat_used + n + 1;
+  out[0] = rz_str_view(base, n);
+  return true;
+}
+
+fn rz_add_fail(rt: RzRouter*, detail: int32) -> int32 {
+  rt->last_error = detail;
+  return rz_router_status(detail);
+}
+
+// Inserts a link keeping the children sorted by kind, which is the match
+// priority (exact < param < wildcard). Stable inside a kind: creation order.
+fn rz_child_insert(rt: RzRouter*, node: int32, child: int32, kind: int32) {
+  var count: int32 = rt->nodes[node].child_count;
+  var at: int32 = count;
+  var i: int32 = 0;
+  while (i < count) {
+    if (rt->nodes[node].children[i].kind > kind) {
+      at = i;
+      break;
+    }
+    i = i + 1;
+  }
+  var j: int32 = count;
+  while (j > at) {
+    rt->nodes[node].children[j] = rt->nodes[node].children[j - 1];
+    j = j - 1;
+  }
+  rt->nodes[node].children[at].node = child;
+  rt->nodes[node].children[at].kind = kind;
+  rt->nodes[node].child_count = count + 1;
+}
+
+// Registers one method+pattern pair. The pattern string is copied segment by
+// segment into router-owned memory, so `pattern` may be freed on return.
+export fn rz_router_add(rt: RzRouter*, verb: string, pattern: string, h: fn(RzContext*) -> int32) -> int32 {
+  if (rt == 0) { return RZ_E_USAGE; }
+  var bit: int32 = rz_method_bit(verb);
+  if (bit == 0) { return rz_add_fail(rt, RZ_ROUTER_E_METHOD); }
+  var n: int64 = (int64)pattern.length;
+  if (n == 0 || pattern.chars[0] != 47) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+  if (rz_str_find_byte(pattern, 63) >= 0) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+  if (rz_str_find_byte(pattern, 35) >= 0) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+
+  // Split and classify, refusing everything the matcher could only guess at.
+  var segs: string[RZ_MAX_SEGS];
+  var kinds: int32[RZ_MAX_SEGS];
+  var nsegs: int32 = 0;
+  if (n > 1) {
+    var i: int64 = 1;
+    while (true) {
+      var start: int64 = i;
+      while (i < n && pattern.chars[i] != 47) { i = i + 1; }
+      var seg: string = rz_str_sub(pattern, start, i);
+      var kind: int32 = RZ_KIND_EXACT;
+      if ((int64)seg.length > 0 && seg.chars[0] == 58) {
+        kind = RZ_KIND_PARAM;
+        seg = rz_str_from(seg, 1);
+      } else if ((int64)seg.length > 0 && seg.chars[0] == 42) {
+        kind = RZ_KIND_WILDCARD;
+        seg = rz_str_from(seg, 1);
+      }
+      if (kind == RZ_KIND_PARAM || kind == RZ_KIND_WILDCARD) {
+        if ((int64)seg.length == 0) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+        if (rz_str_find_byte(seg, 58) >= 0) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+        if (rz_str_find_byte(seg, 42) >= 0) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+      } else {
+        // An empty exact segment is either "//" (ambiguous) or the trailing
+        // slash marker this loop never reaches; "." and ".." are refused
+        // because the matcher refuses them in paths.
+        if ((int64)seg.length == 0) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+        if (rz_str_eq(seg, ".")) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+        if (rz_str_eq(seg, "..")) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+      }
+      if (nsegs >= RZ_MAX_SEGS) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+      segs[nsegs] = seg;
+      kinds[nsegs] = kind;
+      nsegs = nsegs + 1;
+      if (i >= n) { break; }
+      i = i + 1;
+      if (i >= n) {
+        // Trailing slash: a final empty exact segment, distinct from "/a".
+        if (nsegs >= RZ_MAX_SEGS) { return rz_add_fail(rt, RZ_ROUTER_E_PATTERN); }
+        segs[nsegs] = rz_str_empty();
+        kinds[nsegs] = RZ_KIND_EXACT;
+        nsegs = nsegs + 1;
+        break;
+      }
+    }
+  }
+  var k: int32 = 0;
+  while (k < nsegs) {
+    if (kinds[k] == RZ_KIND_WILDCARD && k != nsegs - 1) {
+      return rz_add_fail(rt, RZ_ROUTER_E_PATTERN);
+    }
+    k = k + 1;
+  }
+
+  // Walk or create.
+  var node: int32 = 0;
+  k = 0;
+  while (k < nsegs) {
+    var kind: int32 = kinds[k];
+    var want: string = segs[k];
+    var found: int32 = -1;
+    var c: int32 = 0;
+    while (c < rt->nodes[node].child_count) {
+      var link: RzLink = rt->nodes[node].children[c];
+      if (link.kind == kind) {
+        if (kind == RZ_KIND_EXACT) {
+          if (rz_str_eq(rt->nodes[link.node].seg, want)) {
+            found = link.node;
+            break;
+          }
+        } else {
+          if (!rz_str_eq(rt->nodes[link.node].name, want)) {
+            return rz_add_fail(rt, RZ_ROUTER_E_NAME_CONFLICT);
+          }
+          found = link.node;
+          break;
+        }
+      }
+      c = c + 1;
+    }
+    if (found < 0) {
+      if (rt->node_count >= RZ_MAX_NODES) { return rz_add_fail(rt, RZ_ROUTER_E_CAPACITY); }
+      if (rt->nodes[node].child_count >= RZ_MAX_LINKS) { return rz_add_fail(rt, RZ_ROUTER_E_CAPACITY); }
+      var owned: string = rz_str_empty();
+      if (!rz_arena_dup(rt, want, &owned)) { return rz_add_fail(rt, RZ_ROUTER_E_CAPACITY); }
+      var nn: int32 = rt->node_count;
+      rt->node_count = nn + 1;
+      rt->nodes[nn].kind = kind;
+      if (kind == RZ_KIND_EXACT) {
+        rt->nodes[nn].seg = owned;
+      } else {
+        rt->nodes[nn].name = owned;
+      }
+      rz_child_insert(rt, node, nn, kind);
+      found = nn;
+    }
+    node = found;
+    k = k + 1;
+  }
+
+  if ((rt->nodes[node].methods & bit) != 0) {
+    return rz_add_fail(rt, RZ_ROUTER_E_DUPLICATE);
+  }
+  if (rt->route_count >= RZ_MAX_ROUTES) { return rz_add_fail(rt, RZ_ROUTER_E_CAPACITY); }
+  var slot: int32 = rz_slot_of(bit);
+  if (slot < 0) { return rz_add_fail(rt, RZ_ROUTER_E_METHOD); }
+  rt->nodes[node].methods = rt->nodes[node].methods | bit;
+  rt->nodes[node].slots[slot].h = h;
+  rt->route_count = rt->route_count + 1;
+  rt->last_error = RZ_OK;
+  return RZ_OK;
+}

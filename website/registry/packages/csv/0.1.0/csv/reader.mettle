@@ -1,0 +1,1211 @@
+// The streaming reader.
+//
+// One state machine covers every dialect. Its states and its repair rules
+// for malformed input follow Python's _csv.c and Rust's csv-core, so files
+// read the way those libraries read them. Special bytes are found with a
+// bitmap built 64 bytes at a time with SWAR (SIMD within a register), the
+// structural index simdcsv and zsv build with vector registers, and plain
+// bytes in between are never looked at one by one. docs/design.md has the
+// details.
+//
+// Fields are zero-copy where possible: an unquoted field, or a quoted field
+// with no doubled quotes or escapes, is a view into the input buffer. Only
+// fields that need rewriting are copied, into a scratch buffer. Views stay
+// valid until the next read from the same reader.
+
+import "std/mem";
+import "std/file";
+import "std/conv";
+import "dialect";
+import "error";
+
+export const CSV_RECORD = 1;     // csv_read returned a record
+export const CSV_END = 0;        // no more records
+export const CSV_ERROR = -1;     // see csv_reader_error
+
+const SRC_BYTES = 0;
+const SRC_FD = 1;
+const SRC_FN = 2;
+
+const NEED = 2;
+const FAIL = -1;
+
+const CR: uint8 = 13;
+const LF: uint8 = 10;
+
+const LO: uint64 = 0x0101010101010101;
+const HI: uint64 = 0x8080808080808080;
+const LT14: uint64 = 0x0E0E0E0E0E0E0E0E;     // 14 in every byte
+const GATHER: uint64 = 0x0002040810204081;   // collects the 8 high bits
+
+// A record: field views plus where it came from.
+export struct CsvRecord {
+  fields: string*;   // views; owned by the reader unless cloned
+  n: int32;          // number of fields
+  line: int64;       // line where the record starts, from 1
+  byte: int64;       // byte offset where the record starts
+  index: int64;      // record number from 1 (a header is record 1)
+  owned: uint8*;     // set by csv_record_clone: one block holding everything
+}
+
+export struct CsvReader {
+  d: CsvDialect;
+  src: int32;
+  fd: int64;
+  fd_off: int64;
+  own_fd: bool;
+  read_fn: Fn(uint8*, int64) -> int64;
+  buf: uint8*;
+  cap: int64;
+  len: int64;
+  pos: int64;
+  own_buf: bool;
+  eof: bool;
+  base: int64;        // input offset of buf[0]
+  line: int64;        // line at pos
+  line_start: int64;  // input offset where that line starts
+  last_cr: bool;      // the byte before pos was CR
+  started: bool;      // BOM check done
+  records: int64;     // records parsed so far
+  scratch: uint8*;
+  scap: int64;
+  slen: int64;
+  nf: int32;
+  views: string*;     // field views; scratch fields hold an offset until finish
+  vcap: int32;
+  sidx: int32*;       // indexes of the fields that live in scratch
+  nsc: int32;
+  cblk: int64;        // bitmap block kept between records (fast path)
+  cbend: int64;
+  cmask: uint64;
+  expect: int32;      // field count every record must have; -1 before the first
+  header: CsvRecord;
+  header_done: bool;
+  has_header: bool;
+  failed: bool;
+  err: CsvError;
+}
+
+@inline fn bcast(c: uint8) -> uint64 {
+  return (uint64)c * LO;
+}
+
+// Count of trailing zero bits, by de Bruijn multiplication.
+const DEBRUIJN: uint64 = 0x03f79d71b4cb0a89;
+
+fn make_ctz_table() -> int32[64] {
+  var t: int32[64];
+  var i: int32 = 0;
+  while (i < 64) {
+    t[(((uint64)1 << (uint64)i) * DEBRUIJN) >> 58] = i;
+    i = i + 1;
+  }
+  return t;
+}
+
+const CTZ_TABLE: int32[64] = make_ctz_table();
+
+@inline fn ctz64(m: uint64) -> int64 {
+  return (int64)CTZ_TABLE[((m & (0 - m)) * DEBRUIJN) >> 58];
+}
+
+// Keys broadcast to every byte. Unused keys repeat the delimiter.
+struct Keys {
+  d: uint64;
+  q: uint64;
+  e: uint64;
+  t: uint64;
+  bd: uint8;
+  bq: uint8;
+  be: uint8;
+  bt: uint8;
+  few: bool;          // only the delimiter and quote are keys
+}
+
+// One bit per byte of buf[at..at+n) (n <= 64): set where the byte may be
+// special, that is the delimiter, quote, escape, terminator, or any byte
+// below 14 (CR and LF among them). The parser checks each set bit, so
+// extra bits only cost time. This is the structural bitmap of simdcsv and
+// zsv, built eight bytes at a time in a 64-bit register.
+//
+// (t - 0x01..01) & ~t has the high bit set in the first zero byte of t,
+// and may set it in later bytes after a borrow; such extra bits are
+// harmless here because each one is checked.
+@noinline fn block_mask(buf: uint8*, at: int64, n: int64, k: Keys*) -> uint64 {
+  var mask: uint64 = 0;
+  var w: int64 = 0;
+  var kd: uint64 = k->d;
+  var kq: uint64 = k->q;
+  if (k->few) {
+    while (w + 8 <= n) {
+      var x: uint64 = *(uint64*)(buf + at + w);
+      var td: uint64 = x ^ kd;
+      var tq: uint64 = x ^ kq;
+      var hm: uint64 = (((td - LO) & ~td) | ((tq - LO) & ~tq) | ((x - LT14) & ~x)) & HI;
+      mask = mask | (((hm * GATHER) >> 56) << (uint64)w);
+      w = w + 8;
+    }
+  } else {
+    var ke: uint64 = k->e;
+    var kt: uint64 = k->t;
+    while (w + 8 <= n) {
+      var x2: uint64 = *(uint64*)(buf + at + w);
+      var t1: uint64 = x2 ^ kd;
+      var t2: uint64 = x2 ^ kq;
+      var t3: uint64 = x2 ^ ke;
+      var t4: uint64 = x2 ^ kt;
+      var hm2: uint64 = (((t1 - LO) & ~t1) | ((t2 - LO) & ~t2) | ((t3 - LO) & ~t3) | ((t4 - LO) & ~t4) |
+        ((x2 - LT14) & ~x2)) & HI;
+      mask = mask | (((hm2 * GATHER) >> 56) << (uint64)w);
+      w = w + 8;
+    }
+  }
+  while (w < n) {
+    var c: uint8 = buf[at + w];
+    if (c < (uint8)14 || c == k->bd || c == k->bq || c == k->be || c == k->bt) {
+      mask = mask | ((uint64)1 << (uint64)w);
+    }
+    w = w + 1;
+  }
+  return mask;
+}
+
+// The block being walked.
+struct Scan {
+  blk: int64;
+  bend: int64;
+  mask: uint64;
+}
+
+// The first position at or after p that may be special, or end.
+@inline fn next_special(buf: uint8*, p: int64, end: int64, s: Scan*, k: Keys*) -> int64 {
+  while (true) {
+    if (p >= s->bend) {
+      if (p >= end) { return end; }
+      var e: int64 = p + 64;
+      if (e > end) { e = end; }
+      s->blk = p;
+      s->bend = e;
+      s->mask = block_mask(buf, p, e - p, k);
+    }
+    var m: uint64 = s->mask & ((0 - (uint64)1) << (uint64)(p - s->blk));
+    if (m != 0) { return s->blk + ctz64(m); }
+    p = s->bend;
+  }
+  return end;
+}
+
+fn reader_new(d: CsvDialect) -> CsvReader* {
+  var r: CsvReader* = new CsvReader;
+  if (r == 0) { return r; }
+  r->d = d;
+  r->line = 1;
+  r->expect = -1;
+  r->has_header = d.has_header;
+  r->vcap = 16;
+  r->views = (string*)malloc(16 * 16);
+  r->sidx = (int32*)malloc(4 * 16);
+  r->scap = 256;
+  r->scratch = (uint8*)malloc(256);
+  return r;
+}
+
+// A reader over bytes already in memory. Nothing is copied: field views
+// point into `data`, which must outlive the reader.
+export fn csv_reader_from_string(data: string, d: CsvDialect) -> CsvReader* {
+  var r: CsvReader* = reader_new(d);
+  if (r == 0) { return r; }
+  r->src = SRC_BYTES;
+  r->buf = data.chars;
+  r->len = (int64)data.length;
+  r->cap = r->len;
+  r->eof = true;
+  return r;
+}
+
+fn stream_init(r: CsvReader*) {
+  r->cap = 65536;
+  r->buf = (uint8*)malloc(r->cap);
+  r->own_buf = true;
+  if (r->buf == 0) {
+    r->failed = true;
+    r->err.kind = CSV_ERR_IO;
+  }
+}
+
+// A reader over an open file descriptor, read from offset 0 onward. The
+// descriptor stays yours.
+export fn csv_reader_from_fd(fd: int64, d: CsvDialect) -> CsvReader* {
+  var r: CsvReader* = reader_new(d);
+  if (r == 0) { return r; }
+  r->src = SRC_FD;
+  r->fd = fd;
+  stream_init(r);
+  return r;
+}
+
+// Opens a file and reads it as a stream. Returns 0 if it cannot be opened.
+export fn csv_reader_open(path: string, d: CsvDialect) -> CsvReader* {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return (CsvReader*)0; }
+  var r: CsvReader* = csv_reader_from_fd(fd, d);
+  if (r == 0) {
+    file_close(fd);
+    return r;
+  }
+  r->own_fd = true;
+  return r;
+}
+
+// A reader that pulls bytes from a function: read(buf, max) fills up to max
+// bytes and returns how many, 0 at end of input, or a negative number on
+// failure.
+export fn csv_reader_from_fn(read: Fn(uint8*, int64) -> int64, d: CsvDialect) -> CsvReader* {
+  var r: CsvReader* = reader_new(d);
+  if (r == 0) { return r; }
+  r->src = SRC_FN;
+  r->read_fn = read;
+  stream_init(r);
+  return r;
+}
+
+// Sets the starting size of a streaming reader's buffer (64 KiB by
+// default). It still grows to hold the longest record. Call before the
+// first read; it does nothing for a reader over a string.
+export fn csv_reader_set_buffer(r: CsvReader*, size: int64) {
+  if (!r->own_buf || r->len > 0 || size < 1) { return; }
+  var nb: uint8* = (uint8*)realloc(r->buf, size);
+  if (nb == 0) { return; }
+  r->buf = nb;
+  r->cap = size;
+}
+
+export fn csv_reader_free(r: CsvReader*) {
+  if (r == 0) { return; }
+  if (r->own_buf && r->buf != 0) { free(r->buf); }
+  if (r->own_fd) { file_close(r->fd); }
+  free(r->scratch);
+  free(r->views);
+  free(r->sidx);
+  if (r->header.owned != 0) { free(r->header.owned); }
+  free(r);
+}
+
+fn set_error(r: CsvReader*, kind: int32, at: int64, line: int64, ls: int64, field: int32) {
+  r->err.kind = kind;
+  r->err.byte = r->base + at;
+  r->err.line = line;
+  r->err.column = r->base + at - ls + 1;
+  r->err.record = r->records + 1;
+  r->err.field = field;
+  r->err.expected = 0;
+  r->err.got = 0;
+}
+
+// Pulls more input, keeping the bytes from pos onward. Returns false when
+// nothing more can be had.
+fn refill(r: CsvReader*) -> bool {
+  if (r->src == SRC_BYTES || r->eof) { return false; }
+  r->cbend = 0;
+  r->cblk = 0;
+  if (r->pos > 0) {
+    memmove(r->buf, r->buf + r->pos, r->len - r->pos);
+    r->base = r->base + r->pos;
+    r->len = r->len - r->pos;
+    r->pos = 0;
+  }
+  if (r->len == r->cap) {
+    var ncap: int64 = r->cap * 2;
+    if (r->d.max_record > 0 && r->cap > r->d.max_record + 4) {
+      r->failed = true;
+      set_error(r, CSV_ERR_TOO_LARGE, 0, r->line, r->line_start, 0);
+      return false;
+    }
+    var nb: uint8* = (uint8*)realloc(r->buf, ncap);
+    if (nb == 0) {
+      r->failed = true;
+      set_error(r, CSV_ERR_IO, 0, r->line, r->line_start, 0);
+      return false;
+    }
+    r->buf = nb;
+    r->cap = ncap;
+  }
+  var got_any: bool = false;
+  while (r->len < r->cap && !r->eof) {
+    var k: int64 = 0;
+    if (r->src == SRC_FD) {
+      k = file_read_at(r->fd, r->buf + r->len, r->cap - r->len, r->fd_off);
+      if (k > 0) { r->fd_off = r->fd_off + k; }
+    } else {
+      var f: Fn(uint8*, int64) -> int64 = r->read_fn;
+      k = f(r->buf + r->len, r->cap - r->len);
+    }
+    if (k < 0) {
+      r->eof = true;
+      r->failed = true;
+      set_error(r, CSV_ERR_IO, r->len, r->line, r->line_start, 0);
+      return false;
+    }
+    if (k == 0) {
+      r->eof = true;
+    } else {
+      if (k > r->cap - r->len) { k = r->cap - r->len; }
+      r->len = r->len + k;
+      got_any = true;
+    }
+  }
+  return got_any || r->eof;
+}
+
+fn scratch_put(r: CsvReader*, src: uint8*, n: int64) -> bool {
+  if (n <= 0) { return true; }
+  if (r->slen + n > r->scap) {
+    var nc: int64 = r->scap * 2;
+    while (nc < r->slen + n) { nc = nc * 2; }
+    var nb: uint8* = (uint8*)realloc(r->scratch, nc);
+    if (nb == 0) { return false; }
+    r->scratch = nb;
+    r->scap = nc;
+  }
+  memcpy(r->scratch + r->slen, src, n);
+  r->slen = r->slen + n;
+  return true;
+}
+
+fn scratch_byte(r: CsvReader*, c: uint8) -> bool {
+  if (r->slen + 1 > r->scap) {
+    var b: uint8[1];
+    b[0] = c;
+    return scratch_put(r, &b[0], 1);
+  }
+  r->scratch[r->slen] = c;
+  r->slen = r->slen + 1;
+  return true;
+}
+
+fn grow_views(r: CsvReader*) -> bool {
+  var nc: int32 = r->vcap * 2;
+  var nv: string* = (string*)realloc(r->views, 16 * (int64)nc);
+  if (nv == 0) { return false; }
+  r->views = nv;
+  var ns: int32* = (int32*)realloc(r->sidx, 4 * (int64)nc);
+  if (ns == 0) { return false; }
+  r->sidx = ns;
+  r->vcap = nc;
+  return true;
+}
+
+@inline fn push_view(r: CsvReader*, chars: uint8*, len: int64) -> bool {
+  if (r->nf == r->vcap && !grow_views(r)) { return false; }
+  var v: string* = &r->views[r->nf];
+  v->chars = chars;
+  v->length = (uint64)len;
+  r->nf = r->nf + 1;
+  return true;
+}
+
+// A field in scratch: its offset is stored for now, since scratch may move.
+fn push_scratch(r: CsvReader*, off: int64, len: int64) -> bool {
+  if (!push_view(r, (uint8*)off, len)) { return false; }
+  r->sidx[r->nsc] = r->nf - 1;
+  r->nsc = r->nsc + 1;
+  return true;
+}
+
+const FAST_DONE = 3;
+const FAST_SLOW = 4;
+
+// The fast path for the common dialect (a quote byte, no escape, CR/LF
+// record ends, no initial-space skipping). It walks the bitmap and handles
+// unquoted fields, and quoted fields without line breaks: zero-copy views,
+// or a scratch copy when the field has doubled quotes. Anything else returns FAST_SLOW, and the record
+// is parsed again by the full state machine. On FAST_DONE, *out is the
+// position of the terminator (or the end of input).
+fn fast_fields(r: CsvReader*, buf: uint8*, p: int64, end: int64, eof: bool, k: Keys*, out: int64*) -> int32 {
+  var delim: uint8 = k->bd;
+  var quote: uint8 = k->bq;
+  var fb: int64 = p;
+  var all: uint64 = 0 - (uint64)1;
+  // The block left by the previous record, if p is inside it. Bits below p
+  // are cleared so the walk can take the lowest bit each time.
+  var blk: int64 = r->cblk;
+  var bend: int64 = r->cbend;
+  var mask: uint64 = 0;
+  if (p >= blk && p < bend) {
+    mask = r->cmask & (all << (uint64)(p - blk));
+  } else {
+    bend = p;
+  }
+  while (true) {
+    if (mask == 0) {
+      if (p < bend) { p = bend; }
+      if (p >= end) {
+        if (!eof) { return NEED; }
+        if (!push_view(r, buf + fb, p - fb)) { return FAIL; }
+        *out = p;
+        return FAST_DONE;
+      }
+      blk = p;
+      bend = p + 64;
+      if (bend > end) { bend = end; }
+      mask = block_mask(buf, p, bend - p, k);
+      continue;
+    }
+    p = blk + ctz64(mask);
+    mask = mask & (mask - 1);
+    var c: uint8 = buf[p];
+    if (c == delim) {
+      if (!push_view(r, buf + fb, p - fb)) { return FAIL; }
+      p = p + 1;
+      fb = p;
+      continue;
+    }
+    if (c == CR || c == LF) {
+      if (!push_view(r, buf + fb, p - fb)) { return FAIL; }
+      *out = p;
+      r->cblk = blk;
+      r->cbend = bend;
+      r->cmask = mask;
+      return FAST_DONE;
+    }
+    if (c != quote) {
+      p = p + 1;
+      continue;
+    }
+    if (p != fb) { return FAST_SLOW; }
+    // A quoted field: find the closing quote.
+    p = p + 1;
+    var mq: uint64 = mask;
+    var run: int64 = p;
+    var cp: bool = false;
+    var sb: int64 = 0;
+    var closed: bool = false;
+    while (!closed) {
+      if (mq == 0) {
+        if (p < bend) { p = bend; }
+        if (p >= end) {
+          if (!eof) { return NEED; }
+          return FAST_SLOW;
+        }
+        blk = p;
+        bend = p + 64;
+        if (bend > end) { bend = end; }
+        mq = block_mask(buf, p, bend - p, k);
+        continue;
+      }
+      p = blk + ctz64(mq);
+      mq = mq & (mq - 1);
+      var cq: uint8 = buf[p];
+      if (cq == CR || cq == LF) { return FAST_SLOW; }
+      if (cq != quote) {
+        p = p + 1;
+        continue;
+      }
+      if (p + 1 >= end && !eof) { return NEED; }
+      if (p + 1 < end && buf[p + 1] == quote) {
+        // A doubled quote: build the field in scratch from here on.
+        if (!cp) {
+          cp = true;
+          sb = r->slen;
+        }
+        if (!scratch_put(r, buf + run, p + 1 - run)) { return FAIL; }
+        p = p + 2;
+        run = p;
+        if (p < bend) { mq = mq & (all << (uint64)(p - blk)); } else { mq = 0; }
+        continue;
+      }
+      closed = true;
+    }
+    mask = mq;
+    var fstart: int64 = fb + 1;
+    if (cp) {
+      if (!scratch_put(r, buf + run, p - run)) { return FAIL; }
+    }
+    // p is at the closing quote.
+    var n: uint8 = (uint8)0;
+    if (p + 1 < end) { n = buf[p + 1]; }
+    var last: bool = p + 1 >= end || n == CR || n == LF;
+    if (!last && n != delim) { return FAST_SLOW; }
+    var ok: bool = false;
+    if (cp) {
+      ok = push_scratch(r, sb, r->slen - sb);
+    } else {
+      ok = push_view(r, buf + fstart, p - fstart);
+    }
+    if (!ok) { return FAIL; }
+    if (last) {
+      *out = p + 1;
+      r->cblk = blk;
+      r->cbend = bend;
+      r->cmask = mask;
+      return FAST_DONE;
+    }
+    p = p + 2;
+    fb = p;
+    if (p < bend) { mask = mask & (all << (uint64)(p - blk)); } else { mask = 0; }
+  }
+  return FAST_SLOW;
+}
+
+fn oom(r: CsvReader*) -> int32 {
+  r->failed = true;
+  r->err.kind = CSV_ERR_IO;
+  return FAIL;
+}
+
+// Parses one record starting at r->pos. Returns CSV_RECORD, CSV_END, NEED
+// (the buffer ended inside the record and more input may come) or FAIL.
+// Nothing in r changes on NEED, so the caller refills and calls again.
+fn parse_record(r: CsvReader*, rec: CsvRecord*) -> int32 {
+  var buf: uint8* = r->buf;
+  var end: int64 = r->len;
+  var eof: bool = r->eof;
+  var p: int64 = r->pos;
+  var line: int64 = r->line;
+  var ls: int64 = r->line_start;     // input offset of the line start
+  var base: int64 = r->base;
+  var rs: int64 = p;                 // first byte this call looks at
+  var delim: uint8 = r->d.delimiter;
+  var quote: uint8 = r->d.quote;
+  var esc: uint8 = r->d.escape;
+  var term: uint8 = r->d.terminator;
+  var any_term: bool = term == (uint8)CSV_TERM_ANY;
+  var strict: bool = r->d.strict;
+  var dq: bool = r->d.double_quote;
+  // Scan keys. Unused keys repeat the delimiter so they never add a match.
+  var kq: uint8 = quote;
+  if (quote == (uint8)0) { kq = delim; }
+  var ke: uint8 = esc;
+  if (esc == (uint8)0) { ke = delim; }
+  var kt: uint8 = term;
+  if (any_term) { kt = delim; }
+  var keys: Keys;
+  keys.bd = delim;
+  keys.bq = kq;
+  keys.be = ke;
+  keys.bt = kt;
+  keys.d = bcast(delim);
+  keys.q = bcast(kq);
+  keys.e = bcast(ke);
+  keys.t = bcast(kt);
+  keys.few = ke == delim && kt == delim;
+  var fast: bool = quote != (uint8)0 && quote != delim && dq && esc == (uint8)0 && any_term && !r->d.skip_initial_space;
+  var sc: Scan;
+  sc.blk = 0;
+  sc.bend = 0;
+  sc.mask = 0;
+  r->nf = 0;
+  r->nsc = 0;
+  r->slen = 0;
+
+  // Blank lines and comment lines before the record.
+  while (true) {
+    if (p >= end) {
+      if (!eof) { return NEED; }
+      r->pos = p;
+      r->line = line;
+      r->line_start = ls;
+      return CSV_END;
+    }
+    var c0: uint8 = buf[p];
+    var blank: bool = false;
+    if (any_term) {
+      blank = c0 == CR || c0 == LF;
+    } else {
+      blank = c0 == term;
+    }
+    if (blank) {
+      if (c0 == CR) {
+        if (p + 1 >= end && !eof) { return NEED; }
+        line = line + 1;
+        if (any_term && p + 1 < end && buf[p + 1] == LF) {
+          p = p + 2;
+        } else {
+          p = p + 1;
+        }
+        ls = base + p;
+      } else if (c0 == LF) {
+        var after_cr: bool = r->last_cr;
+        if (p > rs) { after_cr = buf[p - 1] == CR; }
+        if (!after_cr) { line = line + 1; }
+        p = p + 1;
+        ls = base + p;
+      } else {
+        p = p + 1;
+      }
+      if (r->d.blank_lines == CSV_BLANK_EMPTY) {
+        r->pos = p;
+        r->line = line;
+        r->line_start = ls;
+        r->last_cr = buf[p - 1] == CR;
+        rec->line = line - 1;
+        rec->byte = base + p - 1;
+        return CSV_RECORD;
+      }
+      continue;
+    }
+    if (r->d.comment != (uint8)0 && c0 == r->d.comment) {
+      // Skip to the end of the line, terminator included.
+      var q: int64 = p + 1;
+      var done: bool = false;
+      while (q < end) {
+        var cq: uint8 = buf[q];
+        var is_t: bool = false;
+        if (any_term) { is_t = cq == CR || cq == LF; } else { is_t = cq == term; }
+        if (cq == CR || cq == LF) {
+          if (cq == CR) {
+            if (q + 1 >= end && !eof) { return NEED; }
+            line = line + 1;
+            if (any_term && q + 1 < end && buf[q + 1] == LF) { q = q + 1; }
+          } else if (buf[q - 1] != CR) {
+            line = line + 1;
+          }
+          ls = base + q + 1;
+        }
+        q = q + 1;
+        if (is_t) {
+          done = true;
+          break;
+        }
+      }
+      if (!done && !eof) { return NEED; }
+      p = q;
+      continue;
+    }
+    break;
+  }
+
+  var rec_line: int64 = line;
+  var rec_byte: int64 = base + p;
+  var field_no: int32 = 0;
+
+  var fast_done: bool = false;
+  if (fast) {
+    var fp: int64 = 0;
+    var fr: int32 = fast_fields(r, buf, p, end, eof, &keys, &fp);
+    if (fr == NEED) { return NEED; }
+    if (fr == FAIL) { return oom(r); }
+    if (fr == FAST_DONE) {
+      fast_done = true;
+      p = fp;
+    } else {
+      r->nf = 0;
+      r->nsc = 0;
+      r->slen = 0;
+    }
+  }
+
+  // One pass of this loop reads one field.
+  while (!fast_done) {
+    field_no = field_no + 1;
+    if (r->d.skip_initial_space) {
+      while (p < end && buf[p] == (uint8)' ') { p = p + 1; }
+    }
+    if (p >= end) {
+      if (!eof) { return NEED; }
+      if (!push_view(r, buf + p, 0)) { return oom(r); }
+      break;
+    }
+    var quoted: bool = quote != (uint8)0 && buf[p] == quote;
+    var qpos: int64 = p;             // where the opening quote is
+    var qline: int64 = line;
+    var qls: int64 = ls;
+    if (quoted) { p = p + 1; }
+    var fb: int64 = p;               // field start in buf
+    var run: int64 = p;              // start of bytes not yet copied
+    var cp: bool = false;            // field is being built in scratch
+    var sb: int64 = r->slen;         // field start in scratch
+    var ends_record: bool = false;
+    var done_field: bool = false;
+    var fe: int64 = p;               // field end in buf when not copying
+
+    while (!done_field) {
+      if (quoted) {
+        p = next_special(buf, p, end, &sc, &keys);
+        if (p >= end) {
+          if (!eof) { return NEED; }
+          if (strict) {
+            r->failed = true;
+            set_error(r, CSV_ERR_UNCLOSED, qpos, qline, qls, field_no);
+            return FAIL;
+          }
+          fe = p;
+          ends_record = true;
+          done_field = true;
+          break;
+        }
+        var c: uint8 = buf[p];
+        if (c == quote) {
+          if (p + 1 >= end && !eof) { return NEED; }
+          if (dq && p + 1 < end && buf[p + 1] == quote) {
+            if (!cp) {
+              cp = true;
+              sb = r->slen;
+            }
+            if (!scratch_put(r, buf + run, p + 1 - run)) { return oom(r); }
+            p = p + 2;
+            run = p;
+            continue;
+          }
+          // Closing quote.
+          fe = p;
+          p = p + 1;
+          if (p >= end) {
+            ends_record = true;
+            done_field = true;
+            break;
+          }
+          var c2: uint8 = buf[p];
+          if (c2 == delim) {
+            p = p + 1;
+            done_field = true;
+            break;
+          }
+          var t2: bool = false;
+          if (any_term) { t2 = c2 == CR || c2 == LF; } else { t2 = c2 == term; }
+          if (t2) {
+            ends_record = true;
+            done_field = true;
+            break;
+          }
+          if (strict) {
+            r->failed = true;
+            set_error(r, CSV_ERR_AFTER_QUOTE, p, line, ls, field_no);
+            return FAIL;
+          }
+          // Repair as Python and csv-core do: keep the text, and go on as
+          // an unquoted field.
+          if (!cp) {
+            cp = true;
+            sb = r->slen;
+          }
+          if (!scratch_put(r, buf + run, fe - run)) { return oom(r); }
+          run = p;
+          quoted = false;
+          // With doubled quotes on, the byte after the closing quote is
+          // kept as it is, even an escape byte (Python's rule).
+          if (dq && c2 != CR && c2 != LF) { p = p + 1; }
+          continue;
+        }
+        if (c == CR || c == LF) {
+          var after_cr: bool = r->last_cr;
+          if (p > rs) { after_cr = buf[p - 1] == CR; }
+          if (c == CR || !after_cr) { line = line + 1; }
+          if (c == CR && p + 1 < end && buf[p + 1] == LF) {
+            ls = base + p + 2;
+            p = p + 2;
+          } else {
+            ls = base + p + 1;
+            p = p + 1;
+          }
+          continue;
+        }
+        if (esc == (uint8)0 || c != esc) {
+          // The delimiter or another byte the bitmap flags: plain data here.
+          p = p + 1;
+          continue;
+        }
+        // Escape inside quotes: the next byte is taken as it is.
+        if (!cp) {
+          cp = true;
+          sb = r->slen;
+        }
+        if (!scratch_put(r, buf + run, p - run)) { return oom(r); }
+        if (p + 1 >= end) {
+          if (!eof) { return NEED; }
+          if (strict) {
+            r->failed = true;
+            set_error(r, CSV_ERR_ESCAPE, p, line, ls, field_no);
+            return FAIL;
+          }
+          p = p + 1;
+          run = p;
+          fe = p;
+          ends_record = true;
+          done_field = true;
+          break;
+        }
+        var ce: uint8 = buf[p + 1];
+        if (ce == CR || ce == LF) {
+          if (ce == CR || buf[p] != CR) { line = line + 1; }
+          ls = base + p + 2;
+        }
+        if (!scratch_byte(r, ce)) { return oom(r); }
+        p = p + 2;
+        run = p;
+        continue;
+      }
+
+      // Unquoted.
+      p = next_special(buf, p, end, &sc, &keys);
+      if (p >= end) {
+        if (!eof) { return NEED; }
+        fe = p;
+        ends_record = true;
+        done_field = true;
+        break;
+      }
+      var u: uint8 = buf[p];
+      if (u == delim) {
+        fe = p;
+        p = p + 1;
+        done_field = true;
+        break;
+      }
+      var tu: bool = false;
+      if (any_term) { tu = u == CR || u == LF; } else { tu = u == term; }
+      if (tu) {
+        fe = p;
+        ends_record = true;
+        done_field = true;
+        break;
+      }
+      if (u == CR || u == LF) {
+        // Line break inside a field when a custom terminator is used.
+        var after_cr2: bool = r->last_cr;
+        if (p > rs) { after_cr2 = buf[p - 1] == CR; }
+        if (u == CR || !after_cr2) { line = line + 1; }
+        ls = base + p + 1;
+        p = p + 1;
+        continue;
+      }
+      if (esc != (uint8)0 && u == esc) {
+        if (!cp) {
+          cp = true;
+          sb = r->slen;
+        }
+        if (!scratch_put(r, buf + run, p - run)) { return oom(r); }
+        if (p + 1 >= end) {
+          if (!eof) { return NEED; }
+          if (strict) {
+            r->failed = true;
+            set_error(r, CSV_ERR_ESCAPE, p, line, ls, field_no);
+            return FAIL;
+          }
+          p = p + 1;
+          run = p;
+          fe = p;
+          ends_record = true;
+          done_field = true;
+          break;
+        }
+        var ue: uint8 = buf[p + 1];
+        if (ue == CR || ue == LF) {
+          if (ue == CR || buf[p] != CR) { line = line + 1; }
+          ls = base + p + 2;
+        }
+        if (!scratch_byte(r, ue)) { return oom(r); }
+        p = p + 2;
+        run = p;
+        continue;
+      }
+      if (quote == (uint8)0 || u != quote) {
+        p = p + 1;
+        continue;
+      }
+      // A quote inside an unquoted field.
+      if (strict) {
+        r->failed = true;
+        set_error(r, CSV_ERR_QUOTE, p, line, ls, field_no);
+        return FAIL;
+      }
+      p = p + 1;
+    }
+
+    if (cp) {
+      if (!scratch_put(r, buf + run, fe - run)) { return oom(r); }
+      if (!push_scratch(r, sb, r->slen - sb)) { return oom(r); }
+    } else {
+      if (!push_view(r, buf + fb, fe - fb)) { return oom(r); }
+    }
+    if (ends_record) { break; }
+  }
+
+  // Consume the terminator, if any.
+  if (p < end) {
+    var tc: uint8 = buf[p];
+    if (tc == CR) {
+      if (p + 1 >= end && !eof && any_term) { return NEED; }
+      line = line + 1;
+      if (any_term && p + 1 < end && buf[p + 1] == LF) {
+        p = p + 2;
+      } else {
+        p = p + 1;
+      }
+      ls = base + p;
+    } else if (tc == LF) {
+      var after_cr3: bool = r->last_cr;
+      if (p > rs) { after_cr3 = buf[p - 1] == CR; }
+      if (!after_cr3) { line = line + 1; }
+      p = p + 1;
+      ls = base + p;
+    } else {
+      p = p + 1;
+    }
+  }
+  if (r->d.max_record > 0 && base + p - rec_byte > r->d.max_record) {
+    r->failed = true;
+    set_error(r, CSV_ERR_TOO_LARGE, rec_byte - base, rec_line, rec_byte, 0);
+    return FAIL;
+  }
+  r->pos = p;
+  r->line = line;
+  r->line_start = ls;
+  if (p > 0) { r->last_cr = buf[p - 1] == CR; }
+  rec->line = rec_line;
+  rec->byte = rec_byte;
+  return CSV_RECORD;
+}
+
+@inline fn is_ws(c: uint8) -> bool {
+  return c == (uint8)' ' || c == (uint8)'\t' || c == CR || c == LF || c == (uint8)12;
+}
+
+fn utf8_bad_at(s: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: uint8 = s.chars[i];
+    if (c < (uint8)0x80) {
+      i = i + 1;
+      continue;
+    }
+    var need: int64 = 0;
+    var lo: uint8 = (uint8)0x80;
+    var hi: uint8 = (uint8)0xBF;
+    if (c >= (uint8)0xC2 && c <= (uint8)0xDF) {
+      need = 1;
+    } else if (c == (uint8)0xE0) {
+      need = 2;
+      lo = (uint8)0xA0;
+    } else if (c >= (uint8)0xE1 && c <= (uint8)0xEC) {
+      need = 2;
+    } else if (c == (uint8)0xED) {
+      need = 2;
+      hi = (uint8)0x9F;
+    } else if (c >= (uint8)0xEE && c <= (uint8)0xEF) {
+      need = 2;
+    } else if (c == (uint8)0xF0) {
+      need = 3;
+      lo = (uint8)0x90;
+    } else if (c >= (uint8)0xF1 && c <= (uint8)0xF3) {
+      need = 3;
+    } else if (c == (uint8)0xF4) {
+      need = 3;
+      hi = (uint8)0x8F;
+    } else {
+      return i;
+    }
+    if (i + need >= n) { return i; }
+    var b1: uint8 = s.chars[i + 1];
+    if (b1 < lo || b1 > hi) { return i; }
+    for k in 2..need + 1 {
+      var bk: uint8 = s.chars[i + k];
+      if (bk < (uint8)0x80 || bk > (uint8)0xBF) { return i; }
+    }
+    i = i + need + 1;
+  }
+  return -1;
+}
+
+// Points scratch fields at the scratch buffer, trims, and checks the record.
+fn finish(r: CsvReader*, rec: CsvRecord*, is_header: bool) -> int32 {
+  for j in 0..r->nsc {
+    var v: string* = &r->views[r->sidx[j]];
+    v->chars = r->scratch + (int64)v->chars;
+  }
+  var trim: bool = r->d.trim == CSV_TRIM_ALL || (is_header && r->d.trim == CSV_TRIM_HEADERS) ||
+    (!is_header && r->d.trim == CSV_TRIM_FIELDS);
+  if (trim) {
+    for i in 0..r->nf {
+      var t: string* = &r->views[i];
+      var p: uint8* = t->chars;
+      var n: int64 = (int64)t->length;
+      while (n > 0 && is_ws(p[0])) {
+        p = p + 1;
+        n = n - 1;
+      }
+      while (n > 0 && is_ws(p[n - 1])) { n = n - 1; }
+      t->chars = p;
+      t->length = (uint64)n;
+    }
+  }
+  r->records = r->records + 1;
+  rec->fields = r->views;
+  rec->n = r->nf;
+  rec->index = r->records;
+  rec->owned = (uint8*)0;
+  if (r->d.check_utf8) {
+    for i in 0..r->nf {
+      var bad: int64 = utf8_bad_at(r->views[i]);
+      if (bad >= 0) {
+        r->err.kind = CSV_ERR_UTF8;
+        r->err.record = r->records;
+        r->err.field = i + 1;
+        r->err.line = rec->line;
+        r->err.byte = rec->byte;
+        r->err.column = 0;
+        var at: int64 = (int64)r->views[i].chars - (int64)r->buf;
+        if (at >= 0 && at < r->len) {
+          // A view into the input: report the exact byte.
+          r->err.byte = r->base + at + bad;
+        }
+        return CSV_ERROR;
+      }
+    }
+  }
+  if (!r->d.flexible && r->nf > 0) {
+    if (r->expect < 0) {
+      r->expect = r->nf;
+    } else if (r->nf != r->expect) {
+      r->err.kind = CSV_ERR_FIELD_COUNT;
+      r->err.record = r->records;
+      r->err.field = 0;
+      r->err.line = rec->line;
+      r->err.byte = rec->byte;
+      r->err.column = 1;
+      r->err.expected = r->expect;
+      r->err.got = r->nf;
+      return CSV_ERROR;
+    }
+  }
+  return CSV_RECORD;
+}
+
+fn read_raw(r: CsvReader*, rec: CsvRecord*, is_header: bool) -> int32 {
+  if (r->failed) { return CSV_ERROR; }
+  if (!r->started) {
+    if (!r->d.keep_bom) {
+      while (r->len - r->pos < 3 && !r->eof) {
+        if (!refill(r)) { break; }
+      }
+      if (r->failed) { return CSV_ERROR; }
+      if (r->len - r->pos >= 3 && r->buf[r->pos] == (uint8)0xEF && r->buf[r->pos + 1] == (uint8)0xBB &&
+          r->buf[r->pos + 2] == (uint8)0xBF) {
+        r->pos = r->pos + 3;
+        r->line_start = r->base + r->pos;
+      }
+    }
+    r->started = true;
+  }
+  while (true) {
+    var st: int32 = parse_record(r, rec);
+    if (st == NEED) {
+      if (!refill(r)) {
+        if (r->failed) { return CSV_ERROR; }
+        r->eof = true;
+      }
+      continue;
+    }
+    if (st == FAIL) { return CSV_ERROR; }
+    if (st == CSV_END) {
+      rec->n = 0;
+      return CSV_END;
+    }
+    r->err.kind = CSV_OK;
+    return finish(r, rec, is_header);
+  }
+  return CSV_END;
+}
+
+// Copies a record into one owned block. Free it with csv_record_free.
+export fn csv_record_clone(rec: CsvRecord*) -> CsvRecord {
+  var out: CsvRecord;
+  out.n = rec->n;
+  out.line = rec->line;
+  out.byte = rec->byte;
+  out.index = rec->index;
+  var total: int64 = 16 * (int64)rec->n + 1;
+  for i in 0..rec->n { total = total + (int64)rec->fields[i].length; }
+  var blk: uint8* = (uint8*)malloc(total);
+  out.owned = blk;
+  if (blk == 0) {
+    out.n = 0;
+    out.fields = (string*)0;
+    return out;
+  }
+  out.fields = (string*)blk;
+  var at: int64 = 16 * (int64)rec->n;
+  for i in 0..rec->n {
+    var f: string = rec->fields[i];
+    memcpy(blk + at, f.chars, (int64)f.length);
+    out.fields[i] = str_from_bytes((cstring)(blk + at), (int64)f.length);
+    at = at + (int64)f.length;
+  }
+  return out;
+}
+
+export fn csv_record_free(rec: CsvRecord*) {
+  if (rec->owned != 0) { free(rec->owned); }
+  rec->owned = (uint8*)0;
+  rec->fields = (string*)0;
+  rec->n = 0;
+}
+
+// Field i (from 0), or "" when there is no such field.
+export fn csv_record_get(rec: CsvRecord*, i: int32) -> string {
+  if (i < 0 || i >= rec->n) { return ""; }
+  return rec->fields[i];
+}
+
+// Index of the first field equal to name, or -1.
+export fn csv_record_find(rec: CsvRecord*, name: string) -> int32 {
+  for i in 0..rec->n {
+    if (rec->fields[i] == name) { return i; }
+  }
+  return -1;
+}
+
+fn read_header(r: CsvReader*) -> int32 {
+  if (r->header_done) { return CSV_RECORD; }
+  r->header_done = true;
+  if (!r->has_header) { return CSV_RECORD; }
+  var h: CsvRecord;
+  var st: int32 = read_raw(r, &h, true);
+  if (st == CSV_RECORD || (st == CSV_ERROR && !r->failed)) {
+    r->header = csv_record_clone(&h);
+    if (r->header.owned == 0) { return oom(r); }
+  }
+  if (st == CSV_END) {
+    r->header.n = 0;
+    return CSV_RECORD;
+  }
+  return st;
+}
+
+// The header row, or 0 when the dialect has none. Reads it if needed.
+export fn csv_reader_headers(r: CsvReader*) -> CsvRecord* {
+  if (read_header(r) == CSV_ERROR && r->failed) { return (CsvRecord*)0; }
+  if (!r->has_header) { return (CsvRecord*)0; }
+  return &r->header;
+}
+
+// Reads the next record into rec. Returns CSV_RECORD, CSV_END or CSV_ERROR.
+// After CSV_ERR_FIELD_COUNT or CSV_ERR_UTF8 the record is still filled in
+// and reading can go on; any other error stops the reader.
+export fn csv_read(r: CsvReader*, rec: CsvRecord*) -> int32 {
+  if (!r->header_done) {
+    var h: int32 = read_header(r);
+    if (h == CSV_ERROR) { return CSV_ERROR; }
+  }
+  return read_raw(r, rec, false);
+}
+
+// The last error. kind is CSV_OK when there was none.
+export fn csv_reader_error(r: CsvReader*) -> CsvError {
+  return r->err;
+}
+
+// Line (from 1) and input byte offset where the next record starts.
+export fn csv_reader_line(r: CsvReader*) -> int64 {
+  return r->line;
+}
+
+export fn csv_reader_offset(r: CsvReader*) -> int64 {
+  return r->base + r->pos;
+}
+
+// Records read so far, header included.
+export fn csv_reader_count(r: CsvReader*) -> int64 {
+  return r->records;
+}

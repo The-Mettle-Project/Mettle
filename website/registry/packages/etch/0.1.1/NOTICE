@@ -1,0 +1,9 @@
+Etch
+Copyright 2026 Lex Dellimere. Licensed under the Apache License 2.0 (see LICENSE).
+
+tests/data/pngsuite holds the PngSuite test images by Willem van Schaik,
+http://www.schaik.com/pngsuite/ . Their license (tests/data/pngsuite/LICENSE)
+allows use, copying, changing and sharing for any purpose without fee.
+
+The other files in tests/data were made for these tests with ImageMagick,
+libjpeg-turbo, Pillow and ffmpeg (tools/make_testdata.sh).

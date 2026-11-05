@@ -1,0 +1,934 @@
+// The client: a channel over one transport, and calls on it.
+//
+// The API blocks: a call waits by pumping the channel's transport, and
+// events for other calls on the same channel are kept for them, so many
+// calls can be open at once from one thread. A channel belongs to one
+// thread.
+//
+// Retries and hedging follow gRFC A6 (doc/service_config.md): a call is
+// replayed from its send log until it commits, which happens when the
+// server's response headers arrive or the log passes retry_buffer bytes.
+// Keepalive follows gRFC A8; reconnect backoff doc/connection-backoff.md.
+import "std/mem";
+import "grpc/arena";
+import "std/hpack";
+import "std/random";
+import "std/time";
+import "press/core/buf";
+import "press/core/status";
+import "grpc/status";
+import "grpc/metadata";
+import "grpc/deadline";
+import "grpc/message";
+import "grpc/transport";
+import "grpc/wire";
+import "grpc/svcconfig";
+import "grpc/call";
+
+export struct GrpcChannelOptions {
+  authority: string;
+  scheme: string;              // "http" (default) or "https"
+  user_agent: string;
+  max_send: int64;             // 0: no limit (2 GiB)
+  max_recv: int64;             // 0: 4 MiB
+  send_enc: int32;             // compress requests with this (GRPC_ENC_*)
+  retry_buffer: int64;         // 0: 256 KiB per call
+  keepalive_time_ns: int64;    // 0: off
+  keepalive_timeout_ns: int64; // 0: 20 s
+  keepalive_without_calls: bool;
+  service_config: GrpcServiceConfig*;
+  interceptors: GrpcInterceptor*;
+  ninterceptors: int64;
+  // Opens a new transport after the old one closed; 0 to not reconnect.
+  connect: fn(rawptr, GrpcTransport*) -> int32;
+  connect_user: rawptr;
+}
+
+export struct GrpcChannel {
+  opts: GrpcChannelOptions;
+  t: GrpcTransport;
+  connected: bool;
+  draining: bool;               // GOAWAY seen: no new streams on this transport
+  calls: GrpcCall**;
+  ncalls: int64;
+  cap: int64;
+  has_throttle: bool;
+  throttle: GrpcRetryThrottle;
+  last_activity: int64;
+  ping_out: bool;
+  ping_sent: int64;
+  backoff_ns: int64;            // next reconnect backoff
+  retry_at: int64;              // no reconnect before this
+}
+
+export struct GrpcCallOptions {
+  timeout_ns: int64;            // 0: none (or the service config's)
+  deadline: int64;              // absolute; used if set and earlier
+  parent: GrpcContext*;         // propagate deadline and cancellation
+  wait_for_ready: int32;        // -1: from config (default false), 0, 1
+  compress: bool;               // compress with the channel's send_enc
+  md: GrpcMetadata*;            // request metadata to send (copied), or 0
+}
+
+const DEFAULT_RETRY_BUFFER: int64 = 262144;
+const INITIAL_BACKOFF: int64 = 1000000000;
+const MAX_BACKOFF: int64 = 120000000000;
+
+export fn grpc_channel_init(ch: GrpcChannel*, t: GrpcTransport, opts: GrpcChannelOptions*) {
+  ch->opts = *opts;
+  if (ch->opts.scheme.length == 0) { ch->opts.scheme = "http"; }
+  if (ch->opts.authority.length == 0) { ch->opts.authority = "localhost"; }
+  if (ch->opts.max_send <= 0) { ch->opts.max_send = 2147483647; }
+  if (ch->opts.max_recv <= 0) { ch->opts.max_recv = GRPC_DEFAULT_MAX_RECV; }
+  if (ch->opts.retry_buffer <= 0) { ch->opts.retry_buffer = DEFAULT_RETRY_BUFFER; }
+  if (ch->opts.keepalive_timeout_ns <= 0) { ch->opts.keepalive_timeout_ns = 20000000000; }
+  if (ch->opts.keepalive_time_ns > 0 && ch->opts.keepalive_time_ns < 10000000000) {
+    ch->opts.keepalive_time_ns = 10000000000;   // gRFC A8: at least 10 s
+  }
+  ch->t = t;
+  ch->connected = true;
+  ch->last_activity = grpc_now_ns();
+  ch->backoff_ns = INITIAL_BACKOFF;
+  var sc: GrpcServiceConfig* = ch->opts.service_config;
+  if (sc != 0 && sc->has_throttle) {
+    ch->has_throttle = true;
+    grpc_throttle_init(&ch->throttle, sc->max_tokens, sc->token_ratio);
+  }
+}
+
+// Cancels every open call and closes the transport.
+export fn grpc_channel_close(ch: GrpcChannel*) {
+  while (ch->ncalls > 0) {
+    var c: GrpcCall* = ch->calls[0];
+    finish_call(ch, c, GRPC_UNAVAILABLE, "channel closed", "");
+  }
+  if (ch->connected) {
+    ch->t.close(ch->t.user);
+    ch->connected = false;
+  }
+  if (ch->calls != 0) { free(ch->calls); }
+  ch->calls = (GrpcCall**)0;
+  ch->cap = 0;
+}
+
+fn add_call(ch: GrpcChannel*, c: GrpcCall*) {
+  if (ch->ncalls == ch->cap) {
+    var ncap: int64 = ch->cap * 2;
+    if (ncap < 8) { ncap = 8; }
+    var n: GrpcCall** = (GrpcCall**)malloc(ncap * 8);
+    for i in 0..ch->ncalls { n[i] = ch->calls[i]; }
+    if (ch->calls != 0) { free(ch->calls); }
+    ch->calls = n;
+    ch->cap = ncap;
+  }
+  ch->calls[ch->ncalls] = c;
+  ch->ncalls = ch->ncalls + 1;
+}
+
+fn remove_call(ch: GrpcChannel*, c: GrpcCall*) {
+  var w: int64 = 0;
+  for i in 0..ch->ncalls {
+    if (ch->calls[i] != c) {
+      ch->calls[w] = ch->calls[i];
+      w = w + 1;
+    }
+  }
+  ch->ncalls = w;
+}
+
+fn chan(c: GrpcCall*) -> GrpcChannel* {
+  return (GrpcChannel*)c->owner;
+}
+
+// ---- finishing --------------------------------------------------------------------
+
+fn stop_attempt(ch: GrpcChannel*, a: GrpcAttempt*) {
+  if (a->live && a->stream > 0 && ch->connected) {
+    ch->t.reset(ch->t.user, a->stream, GRPC_H2_CANCEL);
+  }
+  a->live = false;
+  a->stream = 0;
+}
+
+fn finish_call(ch: GrpcChannel*, c: GrpcCall*, code: int32, msg: string, details: string) {
+  if (c->done) { return; }
+  for i in 0..c->nattempts { stop_attempt(ch, &c->attempts[i]); }
+  c->status.code = code;
+  c->status.message = grpc_call_keep(c, msg);
+  c->status.details = grpc_call_keep(c, details);
+  c->done = true;
+  c->next_at = 0;
+  remove_call(ch, c);
+  if (ch->has_throttle) {
+    if (code == GRPC_OK) { grpc_throttle_success(&ch->throttle); }
+  }
+  grpc_ic_close(c, &c->status);
+}
+
+// ---- sending ----------------------------------------------------------------------
+
+// Writes as much of the send log as the transport takes to one attempt.
+fn flush_attempt(ch: GrpcChannel*, c: GrpcCall*, a: GrpcAttempt*) {
+  if (!a->live || a->stream <= 0 || a->end_sent) { return; }
+  var total: int64 = c->log_base + c->sendlog.len;
+  while (a->wpos < total) {
+    var off: int64 = a->wpos - c->log_base;
+    var n: int64 = total - a->wpos;
+    var took: int64 = ch->t.send_data(ch->t.user, a->stream, c->sendlog.data + off, n, c->half_closed);
+    if (took < 0) {
+      a->live = false;
+      return;
+    }
+    a->wpos = a->wpos + took;
+    ch->last_activity = grpc_now_ns();
+    if (took == n && c->half_closed) { a->end_sent = true; }
+    if (took < n) { return; }   // the transport says GRPC_TEV_WRITABLE when it can take more
+  }
+  if (c->half_closed && !a->end_sent) {
+    // Nothing left to write: END_STREAM goes on an empty DATA frame.
+    if (ch->t.send_data(ch->t.user, a->stream, c->sendlog.data, 0, true) >= 0) { a->end_sent = true; }
+  }
+}
+
+fn flush_call(ch: GrpcChannel*, c: GrpcCall*) {
+  for i in 0..c->nattempts { flush_attempt(ch, c, &c->attempts[i]); }
+  // Once committed, bytes every live attempt has sent can go.
+  if (c->committed >= 0) {
+    var a: GrpcAttempt* = &c->attempts[c->committed];
+    var drop: int64 = a->wpos - c->log_base;
+    if (drop > 0 && drop == c->sendlog.len) {
+      c->log_base = a->wpos;
+      c->sendlog.len = 0;
+    }
+  }
+}
+
+// ---- attempts ----------------------------------------------------------------------
+
+fn retry_policy(c: GrpcCall*) -> GrpcRetryPolicy* {
+  if (c->mc != 0 && c->mc->has_retry) { return &c->mc->retry; }
+  return (GrpcRetryPolicy*)0;
+}
+
+fn hedging_policy(c: GrpcCall*) -> GrpcHedgingPolicy* {
+  if (c->mc != 0 && c->mc->has_hedging) { return &c->mc->hedging; }
+  return (GrpcHedgingPolicy*)0;
+}
+
+fn max_attempts(c: GrpcCall*) -> int32 {
+  var r: GrpcRetryPolicy* = retry_policy(c);
+  if (r != 0) { return r->max_attempts; }
+  var h: GrpcHedgingPolicy* = hedging_policy(c);
+  if (h != 0) { return h->max_attempts; }
+  return 1;
+}
+
+fn live_attempts(c: GrpcCall*) -> int32 {
+  var n: int32 = 0;
+  for i in 0..c->nattempts {
+    if (c->attempts[i].live) { n = n + 1; }
+  }
+  return n;
+}
+
+// Opens a stream for a new attempt. Returns 1 started, 0 must wait (no
+// slot, or reconnecting), -1 the call was finished.
+fn start_attempt(ch: GrpcChannel*, c: GrpcCall*, counted: bool) -> int32 {
+  if (c->nattempts >= GRPC_MAX_ATTEMPTS) {
+    finish_call(ch, c, GRPC_UNAVAILABLE, "too many attempts", "");
+    return -1;
+  }
+  if (!ch->connected || ch->draining) {
+    var r: int32 = reconnect(ch, c);
+    if (r <= 0) { return r; }
+  }
+  var a: GrpcArena* = grpc_arena_new();
+  var hl: GrpcHeaderList;
+  grpc_hl_init(&hl, a);
+  var head: GrpcRequestHead;
+  head.path = c->path;
+  head.authority = c->authority;
+  head.scheme = ch->opts.scheme;
+  head.deadline = c->ctx.deadline;
+  head.send_enc = GRPC_ENC_IDENTITY;
+  if (c->compress) { head.send_enc = c->send_enc; }
+  head.user_agent = ch->opts.user_agent;
+  var md: GrpcMetadata = c->send_md;
+  if (c->nattempts > 0 && c->committed < 0) {
+    // gRFC A6: tell the server how many attempts came before.
+    var prev: GrpcMetadata;
+    grpc_md_init(&prev, a);
+    grpc_md_append(&prev, &c->send_md);
+    var nb: uint8[12];
+    var k: int64 = 0;
+    var v: int32 = c->counted;
+    if (v >= 10) { nb[0] = (uint8)(48 + v / 10); k = 1; }
+    nb[k] = (uint8)(48 + v % 10);
+    var vs: string;
+    vs.chars = &nb[0];
+    vs.length = (uint64)(k + 1);
+    grpc_request_headers(&head, &prev, &hl);
+    grpc_hl_add(&hl, "grpc-previous-rpc-attempts", vs + "");
+  } else {
+    grpc_request_headers(&head, &md, &hl);
+  }
+  var id: int64 = ch->t.open_stream(ch->t.user, hl.items, hl.count, false);
+  grpc_arena_free(a);
+  if (id == GRPC_T_NO_SLOT) {
+    // Try again on GRPC_TEV_SLOT, or after a short wait.
+    c->wait_slot = true;
+    c->next_at = grpc_now_ns() + 10000000;
+    return 0;
+  }
+  if (id <= 0) {
+    ch->draining = true;
+    var r2: int32 = reconnect(ch, c);
+    if (r2 <= 0) { return r2; }
+    return start_attempt(ch, c, counted);
+  }
+  c->wait_slot = false;
+  var at: GrpcAttempt* = &c->attempts[c->nattempts];
+  at->stream = id;
+  at->live = true;
+  at->pushback_ns = -2;
+  at->wpos = c->log_base;
+  grpc_deframer_init(&at->deframer, c->max_recv, GRPC_ENC_IDENTITY);
+  c->nattempts = c->nattempts + 1;
+  if (counted) { c->counted = c->counted + 1; }
+  ch->last_activity = grpc_now_ns();
+  flush_attempt(ch, c, at);
+  // Hedging: plan the next attempt.
+  var h: GrpcHedgingPolicy* = hedging_policy(c);
+  if (h != 0 && c->committed < 0 && c->counted < h->max_attempts) {
+    c->next_at = grpc_now_ns() + h->delay_ns;
+  }
+  return 1;
+}
+
+// Gets a connected transport. 1 ready, 0 wait (wait_for_ready), -1 failed
+// (the call is finished).
+fn reconnect(ch: GrpcChannel*, c: GrpcCall*) -> int32 {
+  // Streams still running on a draining transport keep it alive.
+  if (ch->connected && ch->draining) {
+    for i in 0..ch->ncalls {
+      var o: GrpcCall* = ch->calls[i];
+      for k in 0..o->nattempts {
+        if (o->attempts[k].live) { return wait_or_fail(ch, c, "connection draining"); }
+      }
+    }
+    ch->t.close(ch->t.user);
+    ch->connected = false;
+  }
+  if (!ch->connected) {
+    if (ch->opts.connect == 0) { return wait_or_fail(ch, c, "not connected"); }
+    var now: int64 = grpc_now_ns();
+    if (now < ch->retry_at) { return wait_or_fail(ch, c, "reconnect backoff"); }
+    var t: GrpcTransport;
+    if (ch->opts.connect(ch->opts.connect_user, &t) != 0) {
+      // doc/connection-backoff.md: multiplier 1.6, jitter 0.2.
+      var jitter: float64 = 1.0 + 0.2 * (random_float64() * 2.0 - 1.0);
+      ch->retry_at = now + (int64)((float64)ch->backoff_ns * jitter);
+      ch->backoff_ns = (int64)((float64)ch->backoff_ns * 1.6);
+      if (ch->backoff_ns > MAX_BACKOFF) { ch->backoff_ns = MAX_BACKOFF; }
+      return wait_or_fail(ch, c, "connect failed");
+    }
+    ch->t = t;
+    ch->connected = true;
+    ch->draining = false;
+    ch->backoff_ns = INITIAL_BACKOFF;
+    ch->last_activity = now;
+    ch->ping_out = false;
+  }
+  return 1;
+}
+
+fn wait_for_ready(c: GrpcCall*) -> bool {
+  return c->mc != 0 && c->mc->wait_for_ready == 1;
+}
+
+fn wait_or_fail(ch: GrpcChannel*, c: GrpcCall*, why: string) -> int32 {
+  if (wait_for_ready(c) || (ch->connected && ch->draining)) {
+    if (c->next_at == 0) { c->next_at = grpc_now_ns() + 10000000; }
+    return 0;
+  }
+  finish_call(ch, c, GRPC_UNAVAILABLE, why, "");
+  return -1;
+}
+
+fn commit(ch: GrpcChannel*, c: GrpcCall*, idx: int32) {
+  if (c->committed >= 0) { return; }
+  c->committed = idx;
+  c->next_at = 0;
+  for i in 0..c->nattempts {
+    if ((int32)i != idx) { stop_attempt(ch, &c->attempts[i]); }
+  }
+}
+
+// An attempt ended before or without committing; decide what next.
+fn attempt_failed(ch: GrpcChannel*, c: GrpcCall*, idx: int32) {
+  var a: GrpcAttempt* = &c->attempts[idx];
+  a->live = false;
+  a->stream = 0;
+  if (c->done) { return; }
+  if (c->committed == idx) {
+    finish_call(ch, c, a->code, a->message, a->details);
+    return;
+  }
+  var now: int64 = grpc_now_ns();
+  if (grpc_deadline_passed(c->ctx.deadline)) {
+    finish_call(ch, c, GRPC_DEADLINE_EXCEEDED, "deadline exceeded", "");
+    return;
+  }
+  // gRFC A6 transparent retry: the server never saw it.
+  if (a->refused && c->nattempts < GRPC_MAX_ATTEMPTS && c->committed < 0) {
+    if (start_attempt(ch, c, false) != 0 || c->done) { return; }
+    c->next_at = now;
+    return;
+  }
+  var h: GrpcHedgingPolicy* = hedging_policy(c);
+  var r: GrpcRetryPolicy* = retry_policy(c);
+  var can_more: bool = c->counted < max_attempts(c) && c->log_base == 0;
+  if (h != 0) {
+    if (grpc_code_in(h->non_fatal, a->code)) {
+      if (ch->has_throttle) { grpc_throttle_failure(&ch->throttle); }
+      var throttled: bool = ch->has_throttle && !grpc_throttle_allows(&ch->throttle);
+      if (a->pushback_ns == -1 || throttled) { c->next_at = 0; can_more = false; }
+      if (can_more) {
+        if (a->pushback_ns >= 0) {
+          c->next_at = now + a->pushback_ns;
+        } else if (c->next_at == 0) {
+          c->next_at = now;
+        }
+      }
+      if (live_attempts(c) > 0 || (can_more && c->next_at != 0)) { return; }
+    }
+    finish_call(ch, c, a->code, a->message, a->details);
+    return;
+  }
+  if (r != 0 && grpc_code_in(r->codes, a->code)) {
+    if (ch->has_throttle) { grpc_throttle_failure(&ch->throttle); }
+    var allowed: bool = can_more && a->pushback_ns != -1;
+    if (ch->has_throttle && !grpc_throttle_allows(&ch->throttle)) { allowed = false; }
+    if (allowed) {
+      var delay: int64 = a->pushback_ns;
+      if (delay < 0) { delay = grpc_retry_backoff_ns(r, c->counted, random_float64()); }
+      c->next_at = now + delay;
+      return;
+    }
+  }
+  finish_call(ch, c, a->code, a->message, a->details);
+}
+
+// ---- events ------------------------------------------------------------------------
+
+fn find_attempt(ch: GrpcChannel*, stream: int64, out_idx: int32*) -> GrpcCall* {
+  for i in 0..ch->ncalls {
+    var c: GrpcCall* = ch->calls[i];
+    for k in 0..c->nattempts {
+      if (c->attempts[k].live && c->attempts[k].stream == stream) {
+        *out_idx = (int32)k;
+        return c;
+      }
+    }
+  }
+  return (GrpcCall*)0;
+}
+
+fn on_headers(ch: GrpcChannel*, c: GrpcCall*, idx: int32, ev: GrpcTEvent*) {
+  var a: GrpcAttempt* = &c->attempts[idx];
+  var info: GrpcResponseInfo;
+  info.recv_enc = GRPC_ENC_IDENTITY;
+  var trailers: bool = a->got_headers || ev->end_stream;
+  var md: GrpcMetadata* = &c->headers;
+  if (trailers) { md = &c->trailers; }
+  if (c->committed != idx) {
+    // Metadata of an attempt that may still lose goes to a scratch list.
+    grpc_md_clear(md);
+  }
+  grpc_response_parse(c->arena, ev->headers, ev->nheaders, md, &info);
+  if (!a->got_headers) {
+    // First HEADERS: response headers, or the whole response (trailers-only).
+    if (info.http_status != 200) {
+      a->code = grpc_code_from_http(info.http_status);
+      a->message = "unexpected HTTP status";
+      if (info.has_status) { a->code = info.code; a->message = info.message; }
+      if (!ev->end_stream && ch->connected) { ch->t.reset(ch->t.user, ev->stream, GRPC_H2_CANCEL); }
+      attempt_failed(ch, c, idx);
+      return;
+    }
+    if (!info.is_grpc && !info.has_status) {
+      a->code = GRPC_UNKNOWN;
+      a->message = "response is not gRPC (content-type)";
+      if (!ev->end_stream && ch->connected) { ch->t.reset(ch->t.user, ev->stream, GRPC_H2_CANCEL); }
+      attempt_failed(ch, c, idx);
+      return;
+    }
+    if (ev->end_stream) {
+      // Trailers-only: does not commit (gRFC A6).
+      read_status(c, a, &info, md);
+      attempt_failed(ch, c, idx);
+      return;
+    }
+    a->got_headers = true;
+    if (info.recv_enc < 0) {
+      a->code = GRPC_INTERNAL;
+      a->message = "unsupported grpc-encoding in response";
+      ch->t.reset(ch->t.user, ev->stream, GRPC_H2_CANCEL);
+      commit(ch, c, idx);
+      attempt_failed(ch, c, idx);
+      return;
+    }
+    a->deframer.enc = info.recv_enc;
+    c->recv_enc = info.recv_enc;
+    c->peer_accept = grpc_call_keep(c, info.accept);
+    commit(ch, c, idx);
+    c->headers_seen = true;
+    grpc_ic_headers(c);
+    return;
+  }
+  // Trailers.
+  read_status(c, a, &info, md);
+  if (a->code == GRPC_OK && grpc_deframer_finish(&a->deframer) != GRPC_OK) {
+    a->code = a->deframer.code;
+    a->message = a->deframer.message;
+  }
+  if (!ev->end_stream) {
+    a->code = GRPC_INTERNAL;
+    a->message = "trailers without END_STREAM";
+    ch->t.reset(ch->t.user, ev->stream, GRPC_H2_PROTOCOL_ERROR);
+  }
+  attempt_failed(ch, c, idx);
+}
+
+fn read_status(c: GrpcCall*, a: GrpcAttempt*, info: GrpcResponseInfo*, md: GrpcMetadata*) {
+  if (!info->has_status) {
+    a->code = GRPC_INTERNAL;
+    a->message = "missing grpc-status";
+    return;
+  }
+  a->code = info->code;
+  a->message = info->message;
+  a->details = info->details;
+  var pb: string;
+  if (grpc_md_get(md, "grpc-retry-pushback-ms", &pb)) {
+    a->pushback_ns = grpc_pushback_parse(pb);
+  }
+}
+
+fn on_data(ch: GrpcChannel*, c: GrpcCall*, idx: int32, ev: GrpcTEvent*) {
+  var a: GrpcAttempt* = &c->attempts[idx];
+  if (ch->connected && ev->len > 0) { ch->t.consumed(ch->t.user, ev->stream, ev->len); }
+  if (!a->got_headers) {
+    a->code = GRPC_INTERNAL;
+    a->message = "DATA before response headers";
+    ch->t.reset(ch->t.user, ev->stream, GRPC_H2_PROTOCOL_ERROR);
+    attempt_failed(ch, c, idx);
+    return;
+  }
+  if (grpc_deframer_feed(&a->deframer, ev->data, ev->len) != GRPC_OK) {
+    fail_committed(ch, c, a, a->deframer.code, a->deframer.message);
+    return;
+  }
+  var m: GrpcMsg;
+  while (true) {
+    var r: int32 = grpc_deframer_next(&a->deframer, &m);
+    if (r == GRPC_DF_MORE) { break; }
+    if (r == GRPC_DF_ERROR) {
+      fail_committed(ch, c, a, a->deframer.code, a->deframer.message);
+      return;
+    }
+    if (!grpc_inbox_put(c, m.data, m.len)) {
+      fail_committed(ch, c, a, GRPC_RESOURCE_EXHAUSTED, "out of memory");
+      return;
+    }
+  }
+  if (ev->end_stream) {
+    a->code = GRPC_INTERNAL;
+    a->message = "stream ended without trailers";
+    attempt_failed(ch, c, idx);
+  }
+}
+
+fn fail_committed(ch: GrpcChannel*, c: GrpcCall*, a: GrpcAttempt*, code: int32, msg: string) {
+  if (a->stream > 0 && ch->connected) { ch->t.reset(ch->t.user, a->stream, GRPC_H2_CANCEL); }
+  finish_call(ch, c, code, msg, "");
+}
+
+// The transport closed: every stream on it is gone.
+fn lost_connection(ch: GrpcChannel*, why: string) {
+  ch->connected = false;
+  ch->draining = false;
+  ch->ping_out = false;
+  var i: int64 = 0;
+  while (i < ch->ncalls) {
+    var c: GrpcCall* = ch->calls[i];
+    var n: int64 = ch->ncalls;
+    for k in 0..c->nattempts {
+      var a: GrpcAttempt* = &c->attempts[k];
+      if (a->live) {
+        a->stream = 0;
+        a->code = GRPC_UNAVAILABLE;
+        a->message = why;
+        a->refused = !a->got_headers && a->wpos == 0;
+        attempt_failed(ch, c, (int32)k);
+        if (c->done) { break; }
+      }
+    }
+    if (ch->ncalls == n) { i = i + 1; }
+  }
+}
+
+fn handle_event(ch: GrpcChannel*, ev: GrpcTEvent*) {
+  ch->last_activity = grpc_now_ns();
+  var idx: int32 = 0;
+  switch (ev->kind) {
+    case GRPC_TEV_HEADERS: {
+      var c: GrpcCall* = find_attempt(ch, ev->stream, &idx);
+      if (c != 0) { on_headers(ch, c, idx, ev); }
+    }
+    case GRPC_TEV_DATA: {
+      var c2: GrpcCall* = find_attempt(ch, ev->stream, &idx);
+      if (c2 != 0) { on_data(ch, c2, idx, ev); }
+    }
+    case GRPC_TEV_RESET: {
+      var c3: GrpcCall* = find_attempt(ch, ev->stream, &idx);
+      if (c3 != 0) {
+        var a: GrpcAttempt* = &c3->attempts[idx];
+        // doc/PROTOCOL-HTTP2.md "Errors": RST_STREAM codes to statuses.
+        a->code = GRPC_INTERNAL;
+        if (ev->code == GRPC_H2_REFUSED_STREAM) { a->code = GRPC_UNAVAILABLE; a->refused = !a->got_headers; }
+        if (ev->code == GRPC_H2_CANCEL) { a->code = GRPC_CANCELLED; }
+        if (ev->code == GRPC_H2_ENHANCE_YOUR_CALM) { a->code = GRPC_RESOURCE_EXHAUSTED; }
+        if (ev->code == GRPC_H2_INADEQUATE_SECURITY) { a->code = GRPC_PERMISSION_DENIED; }
+        a->message = "stream reset by server";
+        a->stream = 0;
+        attempt_failed(ch, c3, idx);
+      }
+    }
+    case GRPC_TEV_GOAWAY: {
+      ch->draining = true;
+      if (ev->code == GRPC_H2_ENHANCE_YOUR_CALM && ch->opts.keepalive_time_ns > 0) {
+        // gRFC A8: the server wants fewer pings.
+        ch->opts.keepalive_time_ns = ch->opts.keepalive_time_ns * 2;
+      }
+      // Streams above last_stream were never processed: retry them.
+      var i: int64 = 0;
+      while (i < ch->ncalls) {
+        var c4: GrpcCall* = ch->calls[i];
+        var n: int64 = ch->ncalls;
+        for k in 0..c4->nattempts {
+          var a2: GrpcAttempt* = &c4->attempts[k];
+          if (a2->live && a2->stream > ev->last_stream) {
+            a2->stream = 0;
+            a2->code = GRPC_UNAVAILABLE;
+            a2->message = "server going away";
+            a2->refused = true;
+            attempt_failed(ch, c4, (int32)k);
+            if (c4->done) { break; }
+          }
+        }
+        if (ch->ncalls == n) { i = i + 1; }
+      }
+    }
+    case GRPC_TEV_PING_ACK: { ch->ping_out = false; }
+    case GRPC_TEV_WRITABLE: {
+      for i2 in 0..ch->ncalls { flush_call(ch, ch->calls[i2]); }
+    }
+    case GRPC_TEV_SLOT: {
+      for i3 in 0..ch->ncalls {
+        var c5: GrpcCall* = ch->calls[i3];
+        if (c5->wait_slot) { c5->next_at = grpc_now_ns(); }
+      }
+    }
+    case GRPC_TEV_CLOSED: { lost_connection(ch, "connection closed"); }
+    default: { }
+  }
+}
+
+// Timers: deadlines, attempts due, keepalive. Returns the next time
+// something is due (0 if nothing).
+fn tick(ch: GrpcChannel*) -> int64 {
+  var now: int64 = grpc_now_ns();
+  var next: int64 = 0;
+  var i: int64 = 0;
+  while (i < ch->ncalls) {
+    var c: GrpcCall* = ch->calls[i];
+    var n: int64 = ch->ncalls;
+    var err: int32 = grpc_ctx_err(&c->ctx);
+    if (err != GRPC_OK) {
+      var why: string = "cancelled";
+      if (err == GRPC_DEADLINE_EXCEEDED) { why = "deadline exceeded"; }
+      finish_call(ch, c, err, why, "");
+    } else if (c->next_at != 0 && now >= c->next_at && c->committed < 0) {
+      c->next_at = 0;
+      if (c->counted < max_attempts(c) || c->nattempts == 0) {
+        start_attempt(ch, c, true);
+      }
+      if (!c->done && c->next_at == 0 && live_attempts(c) == 0 && !c->wait_slot && c->nattempts > 0) {
+        var a: GrpcAttempt* = &c->attempts[c->nattempts - 1];
+        finish_call(ch, c, a->code, a->message, a->details);
+      }
+    }
+    if (!c->done) {
+      next = grpc_deadline_min(next, c->ctx.deadline);
+      next = grpc_deadline_min(next, c->next_at);
+    }
+    if (ch->ncalls == n) { i = i + 1; }
+  }
+  // Keepalive (gRFC A8).
+  var kt: int64 = ch->opts.keepalive_time_ns;
+  if (kt > 0 && ch->connected && (ch->ncalls > 0 || ch->opts.keepalive_without_calls)) {
+    if (ch->ping_out) {
+      if (now - ch->ping_sent >= ch->opts.keepalive_timeout_ns) {
+        ch->t.close(ch->t.user);
+        lost_connection(ch, "keepalive timeout");
+        return now;
+      }
+      next = grpc_deadline_min(next, ch->ping_sent + ch->opts.keepalive_timeout_ns);
+    } else if (now - ch->last_activity >= kt) {
+      if (ch->t.ping(ch->t.user) == 0) {
+        ch->ping_out = true;
+        ch->ping_sent = now;
+        next = grpc_deadline_min(next, now + ch->opts.keepalive_timeout_ns);
+      }
+    } else {
+      next = grpc_deadline_min(next, ch->last_activity + kt);
+    }
+  }
+  return next;
+}
+
+// Handles events until one arrives or `until` passes. Returns false when
+// there is nothing to wait for.
+fn pump(ch: GrpcChannel*) {
+  var next: int64 = tick(ch);
+  var wait: int64 = -1;
+  if (next != 0) {
+    wait = next - grpc_now_ns();
+    if (wait < 0) { wait = 0; }
+  }
+  if (!ch->connected) {
+    if (wait < 0) { wait = 10000000; }
+    time_sleep_ns(wait);
+    return;
+  }
+  var ev: GrpcTEvent;
+  var r: int32 = ch->t.poll(ch->t.user, &ev, wait);
+  if (r < 0) {
+    lost_connection(ch, "connection closed");
+    return;
+  }
+  if (r > 0) { handle_event(ch, &ev); }
+}
+
+// Handles whatever is ready without waiting; for event loops that drive a
+// channel themselves.
+export fn grpc_channel_poll(ch: GrpcChannel*) {
+  tick(ch);
+  if (!ch->connected) { return; }
+  var ev: GrpcTEvent;
+  while (ch->t.poll(ch->t.user, &ev, 0) > 0) { handle_event(ch, &ev); }
+}
+
+// ---- the call API ------------------------------------------------------------------
+
+export fn grpc_call_options() -> GrpcCallOptions {
+  var o: GrpcCallOptions;
+  o.wait_for_ready = -1;
+  return o;
+}
+
+// Starts a call to path ("/pkg.Service/Method"). Always returns a call;
+// if it could not start, it is already done and grpc_call_finish says why.
+// Free it with grpc_call_free.
+export fn grpc_call_start(ch: GrpcChannel*, path: string, kind: int32, o: GrpcCallOptions*) -> GrpcCall* {
+  var c: GrpcCall* = grpc_call_alloc(false);
+  c->owner = (rawptr)ch;
+  c->kind = kind;
+  c->path = grpc_call_keep(c, path);
+  c->authority = ch->opts.authority;
+  c->max_send = ch->opts.max_send;
+  c->max_recv = ch->opts.max_recv;
+  c->send_enc = ch->opts.send_enc;
+  c->compress = o->compress && ch->opts.send_enc != GRPC_ENC_IDENTITY;
+  c->interceptors = ch->opts.interceptors;
+  c->ninterceptors = ch->opts.ninterceptors;
+  if (ch->opts.service_config != 0) {
+    c->mc = grpc_svc_config_find(ch->opts.service_config, path);
+  }
+  var deadline: int64 = GRPC_NO_DEADLINE;
+  if (o->timeout_ns > 0) { deadline = grpc_deadline_after(o->timeout_ns); }
+  if (o->deadline != 0) { deadline = grpc_deadline_min(deadline, o->deadline); }
+  if (c->mc != 0) {
+    if (c->mc->timeout_ns > 0) { deadline = grpc_deadline_min(deadline, grpc_deadline_after(c->mc->timeout_ns)); }
+    if (c->mc->max_request_bytes > 0 && c->mc->max_request_bytes < c->max_send) { c->max_send = c->mc->max_request_bytes; }
+    if (c->mc->max_response_bytes > 0 && c->mc->max_response_bytes < c->max_recv) { c->max_recv = c->mc->max_response_bytes; }
+  }
+  if (o->parent != 0) {
+    grpc_ctx_child(&c->ctx, o->parent, deadline);
+  } else {
+    c->ctx.deadline = deadline;
+  }
+  if (o->wait_for_ready >= 0) {
+    // A call option beats the service config; keep it in a copy.
+    var mc: GrpcMethodConfig* = (GrpcMethodConfig*)grpc_arena_alloc_zeroed(c->arena, sizeof(GrpcMethodConfig));
+    if (c->mc != 0) { *mc = *c->mc; } else { mc->wait_for_ready = -1; }
+    mc->wait_for_ready = o->wait_for_ready;
+    c->mc = mc;
+  }
+  if (o->md != 0) { grpc_md_append(&c->send_md, o->md); }
+  add_call(ch, c);
+  return c;
+}
+
+// Sends the request headers. Optional: the first send does it. Lets
+// interceptors and the metadata in grpc_call_md(c) go out now.
+export fn grpc_call_begin(c: GrpcCall*) -> bool {
+  var ch: GrpcChannel* = chan(c);
+  if (c->done) { return false; }
+  if (c->begun) { return true; }
+  c->begun = true;
+  var st: GrpcStatus;
+  st.code = GRPC_OK;
+  if (!grpc_ic_start(c, &st)) {
+    finish_call(ch, c, st.code, st.message, st.details);
+    return false;
+  }
+  if (grpc_ctx_err(&c->ctx) != GRPC_OK) {
+    tick(ch);
+    return false;
+  }
+  // If it cannot open a stream yet, it waits (next_at) and the pump
+  // starts it later; messages sent meanwhile wait in the send log.
+  start_attempt(ch, c, true);
+  return !c->done;
+}
+
+// Sends one message. Returns GRPC_OK, or the code the call failed with.
+export fn grpc_call_send(c: GrpcCall*, msg: GrpcBytes) -> int32 {
+  var ch: GrpcChannel* = chan(c);
+  if (!grpc_call_begin(c)) { return c->status.code; }
+  if (c->half_closed) { return GRPC_INTERNAL; }
+  var m: GrpcBytes = msg;
+  var st: GrpcStatus;
+  st.code = GRPC_OK;
+  if (!grpc_ic_send(c, &m, &st)) {
+    finish_call(ch, c, st.code, st.message, st.details);
+    return c->status.code;
+  }
+  if (m.len > c->max_send) {
+    finish_call(ch, c, GRPC_RESOURCE_EXHAUSTED, "request larger than max send size", "");
+    return c->status.code;
+  }
+  var rc: int32 = grpc_frame(m.data, m.len, c->send_enc, c->compress, &c->sendlog);
+  if (rc != GRPC_OK) {
+    finish_call(ch, c, rc, "cannot frame request", "");
+    return rc;
+  }
+  // Past the retry buffer: commit to the attempt that has sent the most.
+  if (c->committed < 0 && c->sendlog.len > ch->opts.retry_buffer) {
+    var best: int32 = -1;
+    for i in 0..c->nattempts {
+      if (c->attempts[i].live && (best < 0 || c->attempts[i].wpos > c->attempts[best].wpos)) { best = (int32)i; }
+    }
+    if (best >= 0) { commit(ch, c, best); }
+  }
+  flush_call(ch, c);
+  while (!c->done && c->committed >= 0 && c->attempts[c->committed].live &&
+         c->attempts[c->committed].wpos < c->log_base + c->sendlog.len) {
+    // Flow control: wait until the transport takes it.
+    pump(ch);
+    flush_call(ch, c);
+  }
+  if (c->done) { return c->status.code; }
+  return GRPC_OK;
+}
+
+// No more requests (half-close).
+export fn grpc_call_close_send(c: GrpcCall*) -> int32 {
+  if (!grpc_call_begin(c)) { return c->status.code; }
+  c->half_closed = true;
+  flush_call(chan(c), c);
+  return GRPC_OK;
+}
+
+// Waits for the response headers. False if the call ended without them.
+export fn grpc_call_wait_headers(c: GrpcCall*) -> bool {
+  var ch: GrpcChannel* = chan(c);
+  if (!grpc_call_begin(c)) { return false; }
+  while (!c->headers_seen && !c->done) { pump(ch); }
+  return c->headers_seen;
+}
+
+// Waits for the next response message. False at the end of the stream
+// (then grpc_call_finish gives the status). The bytes stay valid until
+// the next recv.
+export fn grpc_call_recv(c: GrpcCall*, out: GrpcBytes*) -> bool {
+  var ch: GrpcChannel* = chan(c);
+  if (!grpc_call_begin(c) && c->inbox_count == 0) { return false; }
+  while (c->inbox_count == 0 && !c->done) { pump(ch); }
+  if (!grpc_inbox_take(c, out)) { return false; }
+  var st: GrpcStatus;
+  st.code = GRPC_OK;
+  if (!grpc_ic_recv(c, out, &st)) {
+    finish_call(ch, c, st.code, st.message, st.details);
+    return false;
+  }
+  return true;
+}
+
+// Waits for the end of the call and returns its status. Messages not yet
+// read are dropped.
+export fn grpc_call_finish(c: GrpcCall*) -> GrpcStatus {
+  var ch: GrpcChannel* = chan(c);
+  grpc_call_begin(c);
+  if (!c->half_closed && !c->done) { grpc_call_close_send(c); }
+  while (!c->done) { pump(ch); }
+  return c->status;
+}
+
+// Cancels the call (RST_STREAM CANCEL); its status becomes CANCELLED.
+export fn grpc_call_cancel(c: GrpcCall*) {
+  finish_call(chan(c), c, GRPC_CANCELLED, "cancelled by client", "");
+}
+
+export fn grpc_call_free(c: GrpcCall*) {
+  if (!c->done) { grpc_call_cancel(c); }
+  grpc_call_release(c);
+}
+
+// One request, one response. resp is copied into out (malloc'd; free
+// out->data). Returns the status.
+export fn grpc_unary(ch: GrpcChannel*, path: string, req: GrpcBytes, out: GrpcBytes*, o: GrpcCallOptions*) -> GrpcStatus {
+  var c: GrpcCall* = grpc_call_start(ch, path, GRPC_UNARY, o);
+  out->data = (uint8*)0;
+  out->len = 0;
+  grpc_call_send(c, req);
+  grpc_call_close_send(c);
+  var m: GrpcBytes;
+  var got: int32 = 0;
+  while (grpc_call_recv(c, &m)) {
+    got = got + 1;
+    if (got == 1) {
+      out->data = (uint8*)malloc(m.len + 1);
+      if (m.len > 0) { memcpy(out->data, m.data, m.len); }
+      out->len = m.len;
+    }
+  }
+  var st: GrpcStatus = grpc_call_finish(c);
+  var res: GrpcStatus;
+  res.code = st.code;
+  res.message = st.message + "";
+  res.details = st.details + "";
+  if (res.code == GRPC_OK && got != 1) {
+    res.code = GRPC_INTERNAL;
+    if (got == 0) { res.message = "no response message"; } else { res.message = "too many response messages"; }
+  }
+  if (res.code != GRPC_OK && out->data != 0) {
+    free(out->data);
+    out->data = (uint8*)0;
+    out->len = 0;
+  }
+  grpc_call_free(c);
+  return res;
+}

@@ -1,0 +1,663 @@
+// The server: a method table, and connections that run calls on it.
+//
+// Handlers are callbacks, so one thread can serve many streams: a method
+// gets on_start, on_message for each request, on_half_close when the
+// client is done sending, and on_cancel if the call ends early (client
+// cancel, deadline, lost connection). A handler answers with grpc_srv_send
+// and ends the call with grpc_srv_finish, at any time and from any of its
+// callbacks. Sends never block: what the transport cannot take yet is
+// queued and written as flow control allows.
+//
+// Every call a handler has seen must be finished with grpc_srv_finish
+// exactly once, also after on_cancel; until then the call stays allocated.
+//
+// Unary and server-streaming methods get their one request at half-close:
+// on_message then on_half_close. Zero or two requests end the call with
+// INTERNAL, as grpc-java does.
+import "std/mem";
+import "grpc/arena";
+import "std/hpack";
+import "std/random";
+import "press/core/buf";
+import "grpc/status";
+import "grpc/metadata";
+import "grpc/deadline";
+import "grpc/message";
+import "grpc/transport";
+import "grpc/wire";
+import "grpc/call";
+
+export struct GrpcMethodDesc {
+  path: string;                 // "/pkg.Service/Method"
+  kind: int32;                  // GRPC_UNARY ... GRPC_BIDI_STREAMING
+  user: rawptr;
+  on_start: fn(rawptr, GrpcCall*) -> void;
+  on_message: fn(rawptr, GrpcCall*, GrpcBytes*) -> void;
+  on_half_close: fn(rawptr, GrpcCall*) -> void;
+  on_cancel: fn(rawptr, GrpcCall*) -> void;
+}
+
+export struct GrpcServerOptions {
+  max_recv: int64;              // 0: 4 MiB
+  max_send: int64;              // 0: no limit (2 GiB)
+  send_enc: int32;              // compress responses with this when the client accepts it
+  interceptors: GrpcInterceptor*;
+  ninterceptors: int64;
+  keepalive_time_ns: int64;     // server pings after this much quiet; 0 off
+  keepalive_timeout_ns: int64;  // 0: 20 s
+  min_ping_interval_ns: int64;  // pings closer than this are strikes; 0: 5 min
+  permit_without_calls: bool;   // allow client pings with no calls open
+  max_conn_idle_ns: int64;      // GOAWAY after this long with no calls; 0 off
+  max_conn_age_ns: int64;       // GOAWAY after this long, +-10% jitter; 0 off
+  max_conn_age_grace_ns: int64; // then close after this long; 0: wait for the calls
+}
+
+export struct GrpcServer {
+  opts: GrpcServerOptions;
+  methods: GrpcMethodDesc*;
+  nmethods: int64;
+  cap: int64;
+}
+
+export struct GrpcServerConn {
+  srv: GrpcServer*;
+  t: GrpcTransport;
+  calls: GrpcCall**;
+  ncalls: int64;
+  cap: int64;
+  closed: bool;
+  going_away: bool;
+  created: int64;
+  idle_since: int64;
+  age_limit: int64;
+  goaway_at: int64;
+  last_ping_recv: int64;
+  strikes: int32;
+  ping_out: bool;
+  ping_sent: int64;
+  last_activity: int64;
+  dead: GrpcCall**;             // finished calls, freed at the next step
+  ndead: int64;
+  dcap: int64;
+}
+
+export fn grpc_server_init(s: GrpcServer*, opts: GrpcServerOptions*) {
+  s->opts = *opts;
+  if (s->opts.max_recv <= 0) { s->opts.max_recv = GRPC_DEFAULT_MAX_RECV; }
+  if (s->opts.max_send <= 0) { s->opts.max_send = 2147483647; }
+  if (s->opts.keepalive_timeout_ns <= 0) { s->opts.keepalive_timeout_ns = 20000000000; }
+  if (s->opts.min_ping_interval_ns <= 0) { s->opts.min_ping_interval_ns = 300000000000; }
+}
+
+// Adds a method (copied). A second method with the same path replaces the first.
+export fn grpc_server_add(s: GrpcServer*, d: GrpcMethodDesc*) {
+  for i in 0..s->nmethods {
+    if (s->methods[i].path == d->path) {
+      s->methods[i] = *d;
+      return;
+    }
+  }
+  if (s->nmethods == s->cap) {
+    var ncap: int64 = s->cap * 2;
+    if (ncap < 16) { ncap = 16; }
+    var n: GrpcMethodDesc* = (GrpcMethodDesc*)malloc(ncap * sizeof(GrpcMethodDesc));
+    for i in 0..s->nmethods { n[i] = s->methods[i]; }
+    if (s->methods != 0) { free(s->methods); }
+    s->methods = n;
+    s->cap = ncap;
+  }
+  s->methods[s->nmethods] = *d;
+  s->nmethods = s->nmethods + 1;
+}
+
+export fn grpc_server_find(s: GrpcServer*, path: string) -> GrpcMethodDesc* {
+  for i in 0..s->nmethods {
+    if (s->methods[i].path == path) { return &s->methods[i]; }
+  }
+  return (GrpcMethodDesc*)0;
+}
+
+export fn grpc_server_free(s: GrpcServer*) {
+  if (s->methods != 0) { free(s->methods); }
+  s->methods = (GrpcMethodDesc*)0;
+  s->nmethods = 0;
+  s->cap = 0;
+}
+
+export fn grpc_server_conn_init(sc: GrpcServerConn*, s: GrpcServer*, t: GrpcTransport) {
+  sc->srv = s;
+  sc->t = t;
+  var now: int64 = grpc_now_ns();
+  sc->created = now;
+  sc->idle_since = now;
+  sc->last_activity = now;
+  sc->last_ping_recv = 0;
+  if (s->opts.max_conn_age_ns > 0) {
+    // gRFC A9: +-10% jitter so connections made together do not all go at once.
+    var j: float64 = 0.9 + 0.2 * random_float64();
+    sc->age_limit = now + (int64)((float64)s->opts.max_conn_age_ns * j);
+  }
+}
+
+fn conn(c: GrpcCall*) -> GrpcServerConn* { return (GrpcServerConn*)c->conn; }
+fn desc(c: GrpcCall*) -> GrpcMethodDesc* { return (GrpcMethodDesc*)c->mdesc; }
+
+fn add_call(sc: GrpcServerConn*, c: GrpcCall*) {
+  if (sc->ncalls == sc->cap) {
+    var ncap: int64 = sc->cap * 2;
+    if (ncap < 16) { ncap = 16; }
+    var n: GrpcCall** = (GrpcCall**)malloc(ncap * 8);
+    for i in 0..sc->ncalls { n[i] = sc->calls[i]; }
+    if (sc->calls != 0) { free(sc->calls); }
+    sc->calls = n;
+    sc->cap = ncap;
+  }
+  sc->calls[sc->ncalls] = c;
+  sc->ncalls = sc->ncalls + 1;
+}
+
+fn find_call(sc: GrpcServerConn*, stream: int64) -> GrpcCall* {
+  for i in 0..sc->ncalls {
+    if (sc->calls[i]->stream == stream) { return sc->calls[i]; }
+  }
+  return (GrpcCall*)0;
+}
+
+// Queues a call to be freed once nothing on the stack can still use it.
+fn bury(sc: GrpcServerConn*, c: GrpcCall*) {
+  if (sc->ndead == sc->dcap) {
+    var ncap: int64 = sc->dcap * 2;
+    if (ncap < 16) { ncap = 16; }
+    var n: GrpcCall** = (GrpcCall**)malloc(ncap * 8);
+    for i in 0..sc->ndead { n[i] = sc->dead[i]; }
+    if (sc->dead != 0) { free(sc->dead); }
+    sc->dead = n;
+    sc->dcap = ncap;
+  }
+  sc->dead[sc->ndead] = c;
+  sc->ndead = sc->ndead + 1;
+}
+
+fn reap(sc: GrpcServerConn*) {
+  for i in 0..sc->ndead { grpc_call_release(sc->dead[i]); }
+  sc->ndead = 0;
+}
+
+// Drops the call from the stream table; frees it unless a handler still holds it.
+fn retire(sc: GrpcServerConn*, c: GrpcCall*) {
+  var w: int64 = 0;
+  for i in 0..sc->ncalls {
+    if (sc->calls[i] != c) {
+      sc->calls[w] = sc->calls[i];
+      w = w + 1;
+    }
+  }
+  sc->ncalls = w;
+  if (sc->ncalls == 0) { sc->idle_since = grpc_now_ns(); }
+  c->stream = 0;
+  c->done = true;
+  // c->user_held: a handler saw the call and has not finished it.
+  if (!c->begun || c->ending) { bury(sc, c); }
+}
+
+fn send_list(sc: GrpcServerConn*, stream: int64, hl: GrpcHeaderList*, end: bool) -> int32 {
+  sc->strikes = 0;
+  sc->last_activity = grpc_now_ns();
+  return sc->t.send_headers(sc->t.user, stream, hl->items, hl->count, end);
+}
+
+fn send_headers_now(sc: GrpcServerConn*, c: GrpcCall*) {
+  if (c->sent_headers) { return; }
+  c->sent_headers = true;
+  c->send_enc = GRPC_ENC_IDENTITY;
+  c->compress = false;
+  if (sc->srv->opts.send_enc != GRPC_ENC_IDENTITY && grpc_accept_has(c->peer_accept, sc->srv->opts.send_enc)) {
+    c->send_enc = sc->srv->opts.send_enc;
+    c->compress = c->compress_pref != 0;
+  }
+  var a: GrpcArena* = grpc_arena_new();
+  var hl: GrpcHeaderList;
+  grpc_hl_init(&hl, a);
+  grpc_response_headers(c->send_enc, &c->send_md, &hl);
+  send_list(sc, c->stream, &hl, false);
+  grpc_arena_free(a);
+}
+
+// Writes queued bytes, then the trailers once everything is out.
+fn flush(sc: GrpcServerConn*, c: GrpcCall*) {
+  if (c->stream == 0 || c->done) { return; }
+  while (c->out_off < c->out.len) {
+    var n: int64 = c->out.len - c->out_off;
+    var took: int64 = sc->t.send_data(sc->t.user, c->stream, c->out.data + c->out_off, n, false);
+    if (took < 0) { return; }
+    c->out_off = c->out_off + took;
+    if (took > 0) {
+      sc->strikes = 0;
+      sc->last_activity = grpc_now_ns();
+    }
+    if (took < n) { return; }
+  }
+  c->out.len = 0;
+  c->out_off = 0;
+  if (c->ending) {
+    var a: GrpcArena* = grpc_arena_new();
+    var hl: GrpcHeaderList;
+    grpc_hl_init(&hl, a);
+    grpc_trailers(&c->end_status, &c->trailer_md, !c->sent_headers, &hl);
+    send_list(sc, c->stream, &hl, true);
+    grpc_arena_free(a);
+    retire(sc, c);
+  }
+}
+
+// ---- the handler API ----------------------------------------------------------------
+
+// Sends the response headers (with grpc_call_md(c)) now, before any message.
+export fn grpc_srv_send_headers(c: GrpcCall*) -> int32 {
+  if (c->done || c->ending || c->cancelled) { return GRPC_CANCELLED; }
+  send_headers_now(conn(c), c);
+  return GRPC_OK;
+}
+
+// Queues one response message. Returns GRPC_OK, or CANCELLED if the call
+// is over (stop sending), or the code the call was ended with.
+export fn grpc_srv_send(c: GrpcCall*, msg: GrpcBytes) -> int32 {
+  if (c->done || c->ending || c->cancelled) { return GRPC_CANCELLED; }
+  var sc: GrpcServerConn* = conn(c);
+  var m: GrpcBytes = msg;
+  var st: GrpcStatus;
+  st.code = GRPC_OK;
+  if (!grpc_ic_send(c, &m, &st)) {
+    grpc_srv_finish(c, st);
+    return st.code;
+  }
+  if (m.len > c->max_send) {
+    grpc_srv_finish(c, grpc_status(GRPC_RESOURCE_EXHAUSTED, "response larger than max send size"));
+    return GRPC_RESOURCE_EXHAUSTED;
+  }
+  send_headers_now(sc, c);
+  var rc: int32 = grpc_frame(m.data, m.len, c->send_enc, c->compress, &c->out);
+  if (rc != GRPC_OK) {
+    grpc_srv_finish(c, grpc_status(rc, "cannot frame response"));
+    return rc;
+  }
+  flush(sc, c);
+  return GRPC_OK;
+}
+
+// Turns compression of the next responses on or off. It takes effect only
+// when the server has a send_enc the client accepts; the default is on.
+export fn grpc_srv_compress(c: GrpcCall*, on: bool) {
+  if (on) { c->compress_pref = 1; } else { c->compress_pref = 0; }
+  if (c->sent_headers) { c->compress = on && c->send_enc != GRPC_ENC_IDENTITY; }
+}
+
+// Bytes queued but not yet taken by the transport; a handler streaming a
+// lot can wait for this to fall before sending more.
+export fn grpc_srv_pending(c: GrpcCall*) -> int64 {
+  return c->out.len - c->out_off;
+}
+
+// Ends the call with st. Interceptors' on_close may change st first.
+// The call must not be used after this.
+export fn grpc_srv_finish(c: GrpcCall*, st: GrpcStatus) {
+  if (c->ending) { return; }
+  c->ending = true;
+  if (c->done || c->stream == 0) {
+    // Already gone (cancelled); the handler is done with it now.
+    bury(conn(c), c);
+    return;
+  }
+  var s: GrpcStatus = st;
+  grpc_ic_close(c, &s);
+  c->end_status.code = s.code;
+  c->end_status.message = grpc_call_keep(c, s.message);
+  c->end_status.details = grpc_call_keep(c, s.details);
+  flush(conn(c), c);
+}
+
+// ---- events -----------------------------------------------------------------------
+
+// The call ended without the handler finishing it.
+fn cancel_call(sc: GrpcServerConn*, c: GrpcCall*, code: int32, msg: string) {
+  if (c->cancelled) { return; }
+  c->cancelled = true;
+  var st: GrpcStatus = grpc_status(code, msg);
+  grpc_cancel(&c->ctx.cancel, code);
+  grpc_ic_close(c, &st);
+  var d: GrpcMethodDesc* = desc(c);
+  var held: bool = c->begun && !c->ending;
+  retire(sc, c);
+  if (held && d != 0 && d->on_cancel != 0) { d->on_cancel(d->user, c); }
+}
+
+// Ends a call before a handler saw it.
+fn reject(sc: GrpcServerConn*, c: GrpcCall*, code: int32, msg: string) {
+  c->begun = false;
+  c->ending = false;
+  grpc_srv_finish(c, grpc_status(code, msg));
+}
+
+fn on_new_stream(sc: GrpcServerConn*, ev: GrpcTEvent*) {
+  var s: GrpcServer* = sc->srv;
+  if (sc->going_away) {
+    sc->t.reset(sc->t.user, ev->stream, GRPC_H2_REFUSED_STREAM);
+    return;
+  }
+  var c: GrpcCall* = grpc_call_alloc(true);
+  c->stream = ev->stream;
+  c->conn = (rawptr)sc;
+  c->max_recv = s->opts.max_recv;
+  c->max_send = s->opts.max_send;
+  c->compress_pref = -1;
+  c->interceptors = s->opts.interceptors;
+  c->ninterceptors = s->opts.ninterceptors;
+  var info: GrpcRequestInfo;
+  grpc_request_parse(ev->headers, ev->nheaders, &c->headers, &info);
+  add_call(sc, c);
+  if (info.http_status != 0) {
+    var a: GrpcArena* = grpc_arena_new();
+    var hl: GrpcHeaderList;
+    grpc_hl_init(&hl, a);
+    grpc_http_error_headers(info.http_status, &hl);
+    send_list(sc, c->stream, &hl, true);
+    grpc_arena_free(a);
+    retire(sc, c);
+    return;
+  }
+  c->path = grpc_call_keep(c, info.path);
+  c->ctx.deadline = info.deadline;
+  c->peer_accept = grpc_call_keep(c, info.accept);
+  c->prev_attempts = info.prev_attempts;
+  c->recv_enc = info.recv_enc;
+  if (c->recv_enc < 0) { c->recv_enc = GRPC_ENC_IDENTITY; }
+  grpc_deframer_init(&c->attempts[0].deframer, c->max_recv, c->recv_enc);
+  c->nattempts = 1;
+  if (info.code != GRPC_OK) {
+    reject(sc, c, info.code, info.message);
+    return;
+  }
+  var d: GrpcMethodDesc* = grpc_server_find(s, c->path);
+  if (d == 0) {
+    reject(sc, c, GRPC_UNIMPLEMENTED, "unknown method " + c->path);
+    return;
+  }
+  c->mdesc = (rawptr)d;
+  c->kind = d->kind;
+  var st: GrpcStatus;
+  st.code = GRPC_OK;
+  if (!grpc_ic_start(c, &st)) {
+    reject(sc, c, st.code, st.message);
+    return;
+  }
+  if (grpc_deadline_passed(c->ctx.deadline)) {
+    reject(sc, c, GRPC_DEADLINE_EXCEEDED, "deadline exceeded");
+    return;
+  }
+  c->begun = true;
+  if (d->on_start != 0) { d->on_start(d->user, c); }
+  if (ev->end_stream && find_call(sc, ev->stream) == c) { half_close(sc, c); }
+}
+
+fn deliver(sc: GrpcServerConn*, c: GrpcCall*, m: GrpcBytes*) {
+  var st: GrpcStatus;
+  st.code = GRPC_OK;
+  if (!grpc_ic_recv(c, m, &st)) {
+    grpc_srv_finish(c, st);
+    return;
+  }
+  var d: GrpcMethodDesc* = desc(c);
+  if (d->on_message != 0) { d->on_message(d->user, c, m); }
+}
+
+fn single_request(c: GrpcCall*) -> bool {
+  return c->kind == GRPC_UNARY || c->kind == GRPC_SERVER_STREAMING;
+}
+
+fn half_close(sc: GrpcServerConn*, c: GrpcCall*) {
+  if (c->got_half_close || c->ending || c->stream == 0) { return; }
+  c->got_half_close = true;
+  if (grpc_deframer_finish(&c->attempts[0].deframer) != GRPC_OK) {
+    grpc_srv_finish(c, grpc_status(c->attempts[0].deframer.code, c->attempts[0].deframer.message));
+    return;
+  }
+  if (single_request(c)) {
+    if (c->nrecv == 0) {
+      grpc_srv_finish(c, grpc_status(GRPC_INTERNAL, "half-closed without a request"));
+      return;
+    }
+    var m: GrpcBytes;
+    grpc_inbox_take(c, &m);
+    deliver(sc, c, &m);
+    if (c->ending || c->stream == 0) { return; }
+  }
+  var d: GrpcMethodDesc* = desc(c);
+  if (d->on_half_close != 0) { d->on_half_close(d->user, c); }
+}
+
+fn on_data(sc: GrpcServerConn*, c: GrpcCall*, ev: GrpcTEvent*) {
+  if (ev->len > 0) { sc->t.consumed(sc->t.user, ev->stream, ev->len); }
+  if (c->ending || c->got_half_close) { return; }
+  var df: GrpcDeframer* = &c->attempts[0].deframer;
+  if (grpc_deframer_feed(df, ev->data, ev->len) != GRPC_OK) {
+    grpc_srv_finish(c, grpc_status(df->code, df->message));
+    return;
+  }
+  var m: GrpcMsg;
+  while (true) {
+    var r: int32 = grpc_deframer_next(df, &m);
+    if (r == GRPC_DF_MORE) { break; }
+    if (r == GRPC_DF_ERROR) {
+      grpc_srv_finish(c, grpc_status(df->code, df->message));
+      return;
+    }
+    c->nrecv = c->nrecv + 1;
+    if (single_request(c)) {
+      if (c->nrecv > 1) {
+        grpc_srv_finish(c, grpc_status(GRPC_INTERNAL, "too many requests"));
+        return;
+      }
+      grpc_inbox_put(c, m.data, m.len);
+      c->recv_compressed = m.was_compressed;
+    } else {
+      c->recv_compressed = m.was_compressed;
+      var b: GrpcBytes;
+      b.data = m.data;
+      b.len = m.len;
+      deliver(sc, c, &b);
+      if (c->ending || c->stream == 0) { return; }
+    }
+  }
+  if (ev->end_stream) { half_close(sc, c); }
+}
+
+fn handle_event(sc: GrpcServerConn*, ev: GrpcTEvent*) {
+  sc->last_activity = grpc_now_ns();
+  switch (ev->kind) {
+    case GRPC_TEV_HEADERS: {
+      var c: GrpcCall* = find_call(sc, ev->stream);
+      if (c == 0) {
+        on_new_stream(sc, ev);
+      } else if (ev->end_stream) {
+        half_close(sc, c);
+      }
+    }
+    case GRPC_TEV_DATA: {
+      var c2: GrpcCall* = find_call(sc, ev->stream);
+      if (c2 != 0) { on_data(sc, c2, ev); }
+    }
+    case GRPC_TEV_RESET: {
+      var c3: GrpcCall* = find_call(sc, ev->stream);
+      if (c3 != 0) { cancel_call(sc, c3, GRPC_CANCELLED, "cancelled by client"); }
+    }
+    case GRPC_TEV_PING: { on_ping(sc); }
+    case GRPC_TEV_PING_ACK: { sc->ping_out = false; }
+    case GRPC_TEV_WRITABLE: {
+      var i: int64 = 0;
+      while (i < sc->ncalls) {
+        var n: int64 = sc->ncalls;
+        flush(sc, sc->calls[i]);
+        if (sc->ncalls == n) { i = i + 1; }
+      }
+    }
+    case GRPC_TEV_CLOSED: { lost(sc); }
+    default: { }
+  }
+}
+
+// gRFC A8 server enforcement: pings closer together than the minimum
+// interval (or any ping with no calls, unless permitted) are strikes; past
+// two strikes the server says GOAWAY ENHANCE_YOUR_CALM "too_many_pings".
+fn on_ping(sc: GrpcServerConn*) {
+  var now: int64 = grpc_now_ns();
+  var o: GrpcServerOptions* = &sc->srv->opts;
+  var bad: bool = false;
+  if (sc->last_ping_recv != 0) {
+    var limit: int64 = o->min_ping_interval_ns;
+    if (sc->ncalls == 0 && !o->permit_without_calls) { limit = 7200000000000; }
+    if (now - sc->last_ping_recv < limit) { bad = true; }
+  }
+  sc->last_ping_recv = now;
+  if (bad) {
+    sc->strikes = sc->strikes + 1;
+    if (sc->strikes > 2) {
+      sc->t.goaway(sc->t.user, GRPC_H2_ENHANCE_YOUR_CALM, "too_many_pings");
+      sc->t.close(sc->t.user);
+      lost(sc);
+    }
+  }
+}
+
+fn lost(sc: GrpcServerConn*) {
+  if (sc->closed) { return; }
+  sc->closed = true;
+  while (sc->ncalls > 0) {
+    cancel_call(sc, sc->calls[0], GRPC_UNAVAILABLE, "connection closed");
+  }
+}
+
+fn tick(sc: GrpcServerConn*) -> int64 {
+  var now: int64 = grpc_now_ns();
+  var next: int64 = 0;
+  var o: GrpcServerOptions* = &sc->srv->opts;
+  var i: int64 = 0;
+  while (i < sc->ncalls) {
+    var c: GrpcCall* = sc->calls[i];
+    var n: int64 = sc->ncalls;
+    if (grpc_deadline_passed(c->ctx.deadline) && !c->ending) {
+      // Tell the client, then let the handler know.
+      var a: GrpcArena* = grpc_arena_new();
+      var hl: GrpcHeaderList;
+      grpc_hl_init(&hl, a);
+      var st: GrpcStatus = grpc_status(GRPC_DEADLINE_EXCEEDED, "deadline exceeded");
+      grpc_trailers(&st, &c->trailer_md, !c->sent_headers, &hl);
+      send_list(sc, c->stream, &hl, true);
+      grpc_arena_free(a);
+      cancel_call(sc, c, GRPC_DEADLINE_EXCEEDED, "deadline exceeded");
+    } else if (!c->ending) {
+      next = grpc_deadline_min(next, c->ctx.deadline);
+    }
+    if (sc->ncalls == n) { i = i + 1; }
+  }
+  if (sc->closed) { return next; }
+  // Connection idle and age (gRFC A9).
+  if (!sc->going_away) {
+    if (o->max_conn_idle_ns > 0 && sc->ncalls == 0) {
+      if (now - sc->idle_since >= o->max_conn_idle_ns) {
+        grpc_server_conn_shutdown(sc);
+      } else {
+        next = grpc_deadline_min(next, sc->idle_since + o->max_conn_idle_ns);
+      }
+    }
+    if (sc->age_limit != 0 && !sc->going_away) {
+      if (now >= sc->age_limit) {
+        grpc_server_conn_shutdown(sc);
+      } else {
+        next = grpc_deadline_min(next, sc->age_limit);
+      }
+    }
+  }
+  if (sc->going_away && !sc->closed) {
+    var grace: int64 = o->max_conn_age_grace_ns;
+    if (sc->ncalls == 0 || (grace > 0 && now - sc->goaway_at >= grace)) {
+      sc->t.close(sc->t.user);
+      lost(sc);
+      return next;
+    }
+    if (grace > 0) { next = grpc_deadline_min(next, sc->goaway_at + grace); }
+  }
+  // Server keepalive pings.
+  if (o->keepalive_time_ns > 0 && !sc->closed) {
+    if (sc->ping_out) {
+      if (now - sc->ping_sent >= o->keepalive_timeout_ns) {
+        sc->t.close(sc->t.user);
+        lost(sc);
+        return next;
+      }
+      next = grpc_deadline_min(next, sc->ping_sent + o->keepalive_timeout_ns);
+    } else if (now - sc->last_activity >= o->keepalive_time_ns) {
+      if (sc->t.ping(sc->t.user) == 0) {
+        sc->ping_out = true;
+        sc->ping_sent = now;
+      }
+    } else {
+      next = grpc_deadline_min(next, sc->last_activity + o->keepalive_time_ns);
+    }
+  }
+  return next;
+}
+
+// Handles one event, waiting up to timeout_ns (0: no wait, below 0: until
+// something happens). Returns 1 if it handled one, 0 if not, -1 once the
+// connection is closed.
+export fn grpc_server_conn_step(sc: GrpcServerConn*, timeout_ns: int64) -> int32 {
+  reap(sc);
+  if (sc->closed) { return -1; }
+  var next: int64 = tick(sc);
+  if (sc->closed) { return -1; }
+  var wait: int64 = timeout_ns;
+  if (next != 0) {
+    var left: int64 = next - grpc_now_ns();
+    if (left < 0) { left = 0; }
+    if (wait < 0 || left < wait) { wait = left; }
+  }
+  var ev: GrpcTEvent;
+  var r: int32 = sc->t.poll(sc->t.user, &ev, wait);
+  if (r < 0) {
+    lost(sc);
+    return -1;
+  }
+  if (r == 0) { return 0; }
+  handle_event(sc, &ev);
+  return 1;
+}
+
+// Handles everything that is ready without waiting.
+export fn grpc_server_conn_poll(sc: GrpcServerConn*) {
+  while (grpc_server_conn_step(sc, 0) > 0) { }
+}
+
+// Serves until the connection closes.
+export fn grpc_server_conn_serve(sc: GrpcServerConn*) {
+  while (grpc_server_conn_step(sc, -1) >= 0) { }
+}
+
+// Graceful shutdown: GOAWAY, finish the calls already running, then close.
+export fn grpc_server_conn_shutdown(sc: GrpcServerConn*) {
+  if (sc->going_away || sc->closed) { return; }
+  sc->going_away = true;
+  sc->goaway_at = grpc_now_ns();
+  sc->t.goaway(sc->t.user, GRPC_H2_NO_ERROR, "");
+}
+
+export fn grpc_server_conn_free(sc: GrpcServerConn*) {
+  if (!sc->closed) {
+    sc->t.close(sc->t.user);
+    lost(sc);
+  }
+  reap(sc);
+  if (sc->calls != 0) { free(sc->calls); }
+  if (sc->dead != 0) { free(sc->dead); }
+  sc->calls = (GrpcCall**)0;
+  sc->dead = (GrpcCall**)0;
+}

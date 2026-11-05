@@ -1,0 +1,289 @@
+// flux_orm/relation/relation.mettle — association metadata, checked at startup.
+//
+// A relation is *metadata*, not a column and not a method on a model. The
+// models stay exactly what they are (`User`, `Post`: an int64 field is the
+// foreign key) and the association is declared beside them, by column name:
+//
+//   posts = rc_relation_has_many("posts", user_meta(), "id",
+//                                post_meta(), "user_id")
+//   user  = rc_relation_belongs_to("user", post_meta(), "user_id",
+//                                  user_meta(), "id")
+//   tags  = rc_relation_has_many_through("tags", post_meta(), "id",
+//                                        tag_meta(), "id", post_tag_meta())
+//
+// rc_relation and rc_relation_through are the same thing by 0-based field
+// index; the name-based forms call them.
+//
+// Everything a relation can get wrong is wrong *at startup* and is refused by
+// `rc_relation_check` here: a field index that does not exist, a key that is
+// not RC_T_I64, a foreign table that is not the target model's table, a
+// through table whose two columns are not the ones the loader projects. A
+// loader that runs against unchecked metadata is the bug class this file
+// exists to prevent, which is why `rc_relation_load` calls this check itself
+// rather than trusting its caller.
+//
+// Nothing here touches a store. `src/relation/load.mettle` is the only place
+// that emits a statement.
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+
+// Relation kinds. Unique to this phase, so RC_REL_* cannot collide with a
+// status code or a flag.
+export const RC_REL_HAS_MANY: int32 = 0;          // owner key -> many targets
+export const RC_REL_BELONGS_TO: int32 = 1;        // owner FK -> one target
+export const RC_REL_HAS_MANY_THROUGH: int32 = 2;  // via a two-column join table
+
+export struct RcRelation {
+  name: string;            // "posts" / "user" / "tags"
+  kind: int32;             // RC_REL_*
+  local_field: int32;      // owner-side field index
+  foreign_table: string;   // target table name, must equal target_meta.table
+  foreign_field: int32;    // target-side field index
+  through_table: string;   // RC_REL_HAS_MANY_THROUGH only, else ""
+  through_local: string;   // through column holding the owner key
+  through_foreign: string; // through column holding the target key
+  target: RcMeta;          // the target model; set by the name-based forms
+  through: RcMeta;         // the join table model (THROUGH, name-based form)
+}
+
+// A meta with no fields: what rc_relation leaves in `target` / `through`.
+fn rc_relation_no_meta() -> RcMeta {
+  var m: RcMeta;
+  m.table = "";
+  m.name = "";
+  m.size = 0;
+  m.fields = 0;
+  m.n_fields = 0;
+  m.pk = -1;
+  return m;
+}
+
+// Builds a HAS_MANY or BELONGS_TO relation from 0-based field indexes. This is
+// the low-level form; apps usually call rc_relation_has_many / belongs_to.
+//   name           relation name, e.g. "posts"; borrowed, must be non-empty
+//   kind           RC_REL_HAS_MANY or RC_REL_BELONGS_TO
+//   local_field    owner-side key field index (an RC_T_I64 field)
+//   foreign_table  target table name; borrowed, must equal target_meta.table
+//   foreign_field  target-side key field index (an RC_T_I64 field)
+// Returns the relation by value. Nothing is checked or allocated here; bad
+// indexes or names are refused later by rc_relation_check. `foreign_table` is
+// stored, not derived, so a typo is caught by that check's string compare
+// instead of silently selecting from the target's own table.
+export fn rc_relation(name: string, kind: int32, local_field: int32,
+                      foreign_table: string, foreign_field: int32) -> RcRelation {
+  var r: RcRelation;
+  r.name = name;
+  r.kind = kind;
+  r.local_field = local_field;
+  r.foreign_table = foreign_table;
+  r.foreign_field = foreign_field;
+  r.through_table = "";
+  r.through_local = "";
+  r.through_foreign = "";
+  r.target = rc_relation_no_meta();
+  r.through = rc_relation_no_meta();
+  return r;
+}
+
+// Builds a HAS_MANY_THROUGH relation from 0-based field indexes (low-level form
+// of rc_relation_has_many_through).
+//   name             relation name; borrowed, must be non-empty
+//   local_field      owner-side key field index (RC_T_I64)
+//   foreign_table    target table name; must equal target_meta.table
+//   foreign_field    target field index; must be the target's primary key
+//   through_table    join table name; must equal through_meta.table
+//   through_local    join column holding the owner key (through field 0)
+//   through_foreign  join column holding the target key (through field 1)
+// All strings are borrowed. Returns the relation by value; nothing is checked
+// or allocated until rc_relation_check.
+export fn rc_relation_through(name: string, local_field: int32,
+                              foreign_table: string, foreign_field: int32,
+                              through_table: string, through_local: string,
+                              through_foreign: string) -> RcRelation {
+  var r: RcRelation;
+  r.name = name;
+  r.kind = RC_REL_HAS_MANY_THROUGH;
+  r.local_field = local_field;
+  r.foreign_table = foreign_table;
+  r.foreign_field = foreign_field;
+  r.through_table = through_table;
+  r.through_local = through_local;
+  r.through_foreign = through_foreign;
+  r.target = rc_relation_no_meta();
+  r.through = rc_relation_no_meta();
+  return r;
+}
+
+fn rc_relation_kind_known(kind: int32) -> bool {
+  if (kind == RC_REL_HAS_MANY) { return true; }
+  if (kind == RC_REL_BELONGS_TO) { return true; }
+  if (kind == RC_REL_HAS_MANY_THROUGH) { return true; }
+  return false;
+}
+
+// The ways an app declares a relation, after Ecto's has_many / belongs_to.
+// Columns are field or column names, resolved against the two models; an
+// unknown one leaves the field at -1, which rc_relation_check reports as
+// RC_ERR_USAGE.
+
+// Declares that each owner has many target rows whose `target_col` holds the
+// owner's `owner_col`, e.g.
+//   rc_relation_has_many("posts", user_meta(), "id", post_meta(), "user_id")
+//   name        relation name; borrowed, must be non-empty
+//   owner       the owner model's meta (read here, not kept)
+//   owner_col   owner key column; RC_T_I64 and NOT NULL
+//   target      the target model's meta; its table name is kept (borrowed)
+//   target_col  target column holding the owner key; RC_T_I64
+// Returns the relation by value. Nothing is allocated; errors surface from
+// rc_relation_check / rc_relation_load.
+export fn rc_relation_has_many(name: string, owner: RcMeta, owner_col: string,
+                               target: RcMeta, target_col: string) -> RcRelation {
+  var r: RcRelation = rc_relation(name, RC_REL_HAS_MANY, rc_meta_find(owner, owner_col),
+                                  target.table, rc_meta_find(target, target_col));
+  r.target = target;
+  return r;
+}
+
+// Declares that each owner points at one target row: the owner's `owner_col`
+// holds the target's primary key `target_col`, e.g.
+//   rc_relation_belongs_to("user", post_meta(), "user_id", user_meta(), "id")
+//   name        relation name; borrowed, must be non-empty
+//   owner       the owner model's meta (read here, not kept)
+//   owner_col   owner foreign key column; RC_T_I64, may be nullable (a NULL
+//               key means "no target")
+//   target      the target model's meta; its table name is kept (borrowed)
+//   target_col  the target's primary key column; RC_T_I64
+// Returns the relation by value. Nothing is allocated; errors surface from
+// rc_relation_check / rc_relation_load.
+export fn rc_relation_belongs_to(name: string, owner: RcMeta, owner_col: string,
+                                 target: RcMeta, target_col: string) -> RcRelation {
+  var r: RcRelation = rc_relation(name, RC_REL_BELONGS_TO, rc_meta_find(owner, owner_col),
+                                  target.table, rc_meta_find(target, target_col));
+  r.target = target;
+  return r;
+}
+
+// Declares a many-to-many relation through a join table whose field 0 holds
+// the owner key and field 1 the target key, e.g. posts -> post_tags -> tags.
+//   name        relation name; borrowed, must be non-empty
+//   owner       the owner model's meta (read here, not kept)
+//   owner_col   owner key column; RC_T_I64
+//   target      the target model's meta; its table name is kept (borrowed)
+//   target_col  the target's primary key column; RC_T_I64
+//   through     the join table's meta; must have exactly 2 RC_T_I64 fields,
+//               owner column first. Its names are kept (borrowed)
+// Returns the relation by value. A `through` without exactly 2 fields leaves
+// the join columns empty, which rc_relation_check refuses as RC_ERR_USAGE.
+export fn rc_relation_has_many_through(name: string, owner: RcMeta, owner_col: string,
+                                       target: RcMeta, target_col: string,
+                                       through: RcMeta) -> RcRelation {
+  var tl: string = "";
+  var tf: string = "";
+  if (through.n_fields == 2) {
+    tl = through.fields[0].name;
+    tf = through.fields[1].name;
+  }
+  var r: RcRelation = rc_relation_through(name, rc_meta_find(owner, owner_col),
+                                          target.table, rc_meta_find(target, target_col),
+                                          through.table, tl, tf);
+  r.target = target;
+  r.through = through;
+  return r;
+}
+
+// Checks a relation against its models. rc_relation_load calls it on every
+// load; call it yourself at startup to fail early.
+//   rel           the relation; borrowed, may not be 0
+//   owner_meta    the owner model's meta
+//   target_meta   the target model's meta
+//   through_meta  the join table's meta for HAS_MANY_THROUGH, else may be 0
+// Returns RC_OK, or:
+//   RC_ERR_USAGE        rel is 0; empty name; a key field index is out of
+//                       range; foreign_table is not target_meta.table; a
+//                       HAS_MANY owner key is nullable; a BELONGS_TO / THROUGH
+//                       target field is not the target's NOT NULL primary key;
+//                       a two-table relation has through_* names; a THROUGH
+//                       relation has no through_meta, or one that is not 2
+//                       RC_T_I64 fields named through_local, through_foreign
+//                       on table through_table
+//   RC_ERR_UNSUPPORTED  kind is not an RC_REL_* value
+//   RC_ERR_CAST         an owner or target key field is not RC_T_I64
+// No statement is run and nothing is allocated.
+//
+// Two rules make a batch loader possible:
+//
+//   * the key fields on both sides are RC_T_I64 — an int64 field the model
+//     already has, never a new column;
+//   * for BELONGS_TO / THROUGH the target side is the target's primary key,
+//     so "find the target" is a primary-key lookup and never a scan by a
+//     non-unique column.
+//
+// A HAS_MANY groups by the *owner's* local field, so that field must be
+// NOT NULL (a NULL grouping key is not a key). BELONGS_TO and
+// THROUGH allow a nullable local field on purpose: a NULL foreign key means "no
+// relation", and the loader skips NULL owner keys before it builds the IN list.
+//
+// The through metadata contract is positional, not name-searched: field 0 is
+// the owner column and field 1 is the target column. That is what lets the
+// loader project `SELECT "user_id", "post_id"` without a column list of its
+// own, and what makes a swapped through table a startup refusal instead of a
+// silently inverted mapping.
+export fn rc_relation_check(rel: RcRelation*, owner_meta: RcMeta,
+                            target_meta: RcMeta, through_meta: RcMeta*) -> int32 {
+  if (rel == 0) { return RC_ERR_USAGE; }
+  if (!rc_relation_kind_known(rel->kind)) { return RC_ERR_UNSUPPORTED; }
+  if (rel->name.length == (uint64)0) { return RC_ERR_USAGE; }
+
+  if (owner_meta.fields == 0 || owner_meta.n_fields <= 0) { return RC_ERR_USAGE; }
+  if (rel->local_field < 0) { return RC_ERR_USAGE; }
+  if (rel->local_field >= owner_meta.n_fields) { return RC_ERR_USAGE; }
+  if (owner_meta.fields[rel->local_field].ty != RC_T_I64) { return RC_ERR_CAST; }
+
+  if (rel->foreign_table != target_meta.table) { return RC_ERR_USAGE; }
+  if (target_meta.fields == 0 || target_meta.n_fields <= 0) { return RC_ERR_USAGE; }
+  if (rel->foreign_field < 0) { return RC_ERR_USAGE; }
+  if (rel->foreign_field >= target_meta.n_fields) { return RC_ERR_USAGE; }
+  if (target_meta.fields[rel->foreign_field].ty != RC_T_I64) { return RC_ERR_CAST; }
+
+  if (rel->kind == RC_REL_HAS_MANY) {
+    // The owner's grouping key must exist as a value; NULL keys are skipped by
+    // the loader, so a nullable local field would silently drop owners.
+    if ((owner_meta.fields[rel->local_field].flags & RC_F_NOT_NULL) == 0) {
+      return RC_ERR_USAGE;
+    }
+  } else {
+    // BELONGS_TO / THROUGH: the target side is the primary key.
+    if (target_meta.pk < 0) { return RC_ERR_USAGE; }
+    if (rel->foreign_field != target_meta.pk) { return RC_ERR_USAGE; }
+    // rc_meta_check already guarantees this for a finalized meta; assert it
+    // here too so a hand-built table cannot slip a nullable key past us.
+    if ((target_meta.fields[target_meta.pk].flags & RC_F_NOT_NULL) == 0) {
+      return RC_ERR_USAGE;
+    }
+  }
+
+  if (rel->kind != RC_REL_HAS_MANY_THROUGH) {
+    // A through_* name on a two-table relation is a declaration bug: the loader
+    // would silently ignore it and the author would believe the mapping table
+    // is involved.
+    if (rel->through_table.length != (uint64)0) { return RC_ERR_USAGE; }
+    if (rel->through_local.length != (uint64)0) { return RC_ERR_USAGE; }
+    if (rel->through_foreign.length != (uint64)0) { return RC_ERR_USAGE; }
+    return RC_OK;
+  }
+
+  if (through_meta == 0) { return RC_ERR_USAGE; }
+  var tm: RcMeta = *through_meta;
+  if (tm.fields == 0 || tm.n_fields != 2) { return RC_ERR_USAGE; }
+  if (rel->through_table.length == (uint64)0) { return RC_ERR_USAGE; }
+  if (rel->through_local.length == (uint64)0) { return RC_ERR_USAGE; }
+  if (rel->through_foreign.length == (uint64)0) { return RC_ERR_USAGE; }
+  if (tm.table != rel->through_table) { return RC_ERR_USAGE; }
+  if (tm.fields[0].name != rel->through_local) { return RC_ERR_USAGE; }
+  if (tm.fields[1].name != rel->through_foreign) { return RC_ERR_USAGE; }
+  if (tm.fields[0].ty != RC_T_I64) { return RC_ERR_CAST; }
+  if (tm.fields[1].ty != RC_T_I64) { return RC_ERR_CAST; }
+  return RC_OK;
+}

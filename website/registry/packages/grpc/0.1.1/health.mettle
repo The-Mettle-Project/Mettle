@@ -1,0 +1,173 @@
+// The standard health service, grpc.health.v1.Health
+// (doc/health-checking.md): Check, Watch and List.
+//
+// The empty service name "" stands for the whole server and starts as
+// SERVING. Watch streams the current status at once and then every change
+// until the client cancels; a service not (yet) known reads as
+// SERVICE_UNKNOWN there, and as NOT_FOUND in Check.
+import "std/mem";
+import "codec/core/list";
+import "grpc/status";
+import "grpc/call";
+import "grpc/server";
+import "grpc/gen/grpc/health/v1/health_pb";
+import "grpc/gen/grpc/health/v1/health_grpc";
+
+export const GRPC_HEALTH_UNKNOWN = 0;
+export const GRPC_HEALTH_SERVING = 1;
+export const GRPC_HEALTH_NOT_SERVING = 2;
+export const GRPC_HEALTH_SERVICE_UNKNOWN = 3;
+
+struct Watcher {
+  call: GrpcCall*;
+  service: string;
+}
+
+export struct GrpcHealth {
+  handlers: GrpcPbHealth_Handlers;
+  names: CodecList<string>;
+  statuses: CodecList<int32>;
+  watchers: CodecList<Watcher>;
+  shut: bool;
+}
+
+fn copy(s: string) -> string {
+  var r: string;
+  if (s.length == 0) { return r; }
+  var p: uint8* = (uint8*)malloc((int64)s.length);
+  memcpy(p, s.chars, (int64)s.length);
+  r.chars = p;
+  r.length = s.length;
+  return r;
+}
+
+fn find(h: GrpcHealth*, service: string) -> int64 {
+  for i in 0..h->names.len {
+    if (h->names.data[i] == service) { return i; }
+  }
+  return -1;
+}
+
+fn status_of(h: GrpcHealth*, service: string) -> int32 {
+  var i: int64 = find(h, service);
+  if (i < 0) { return GRPC_HEALTH_SERVICE_UNKNOWN; }
+  return h->statuses.data[i];
+}
+
+fn send(c: GrpcCall*, status: int32) -> int32 {
+  var r: GrpcPbHealthCheckResponse;
+  GrpcPbHealthCheckResponse_init(&r);
+  r.status = status;
+  return GrpcPbHealth_Watch_reply(c, &r);
+}
+
+fn check(u: rawptr, c: GrpcCall*, req: GrpcPbHealthCheckRequest*, resp: GrpcPbHealthCheckResponse*) -> GrpcStatus {
+  var h: GrpcHealth* = (GrpcHealth*)u;
+  var i: int64 = find(h, req->service);
+  if (i < 0) { return grpc_status(GRPC_NOT_FOUND, "unknown service"); }
+  resp->status = h->statuses.data[i];
+  return grpc_status(GRPC_OK, "");
+}
+
+fn list(u: rawptr, c: GrpcCall*, req: GrpcPbHealthListRequest*, resp: GrpcPbHealthListResponse*) -> GrpcStatus {
+  var h: GrpcHealth* = (GrpcHealth*)u;
+  for i in 0..h->names.len {
+    var e: GrpcPbHealthListResponse_StatusesEntry;
+    GrpcPbHealthListResponse_StatusesEntry_init(&e);
+    e.key = h->names.data[i];
+    e.value = new GrpcPbHealthCheckResponse;
+    GrpcPbHealthCheckResponse_init(e.value);
+    e.value->status = h->statuses.data[i];
+    codec_list_push(&resp->statuses, e);
+  }
+  return grpc_status(GRPC_OK, "");
+}
+
+fn watch(u: rawptr, c: GrpcCall*, req: GrpcPbHealthCheckRequest*) -> GrpcStatus {
+  var h: GrpcHealth* = (GrpcHealth*)u;
+  send(c, status_of(h, req->service));
+  var w: Watcher;
+  w.call = c;
+  w.service = copy(req->service);
+  codec_list_push(&h->watchers, w);
+  return grpc_status(GRPC_PENDING, "");
+}
+
+fn drop_watcher(h: GrpcHealth*, c: GrpcCall*) {
+  var k: int64 = 0;
+  for i in 0..h->watchers.len {
+    var w: Watcher = h->watchers.data[i];
+    if (w.call == c) {
+      if (w.service.length > 0) { free(w.service.chars); }
+    } else {
+      h->watchers.data[k] = w;
+      k = k + 1;
+    }
+  }
+  h->watchers.len = k;
+}
+
+fn cancelled(u: rawptr, c: GrpcCall*) {
+  var h: GrpcHealth* = (GrpcHealth*)u;
+  drop_watcher(h, c);
+  grpc_srv_finish(c, grpc_status(GRPC_CANCELLED, ""));
+}
+
+export fn grpc_health_init(h: GrpcHealth*) {
+  h->handlers.user = (rawptr)h;
+  h->handlers.Check = &check;
+  h->handlers.List = &list;
+  h->handlers.Watch = &watch;
+  h->handlers.on_cancel = &cancelled;
+  grpc_health_set(h, "", GRPC_HEALTH_SERVING);
+}
+
+// Sets a service's status and tells its watchers. After grpc_health_shutdown
+// it does nothing.
+export fn grpc_health_set(h: GrpcHealth*, service: string, status: int32) {
+  if (h->shut) { return; }
+  var i: int64 = find(h, service);
+  if (i < 0) {
+    codec_list_push(&h->names, copy(service));
+    codec_list_push(&h->statuses, status);
+  } else {
+    if (h->statuses.data[i] == status) { return; }
+    h->statuses.data[i] = status;
+  }
+  var k: int64 = 0;
+  while (k < h->watchers.len) {
+    var w: Watcher = h->watchers.data[k];
+    if (w.service == service && send(w.call, status) != GRPC_OK) {
+      drop_watcher(h, w.call);
+      continue;
+    }
+    k = k + 1;
+  }
+}
+
+// Marks every service NOT_SERVING and ignores later updates, for a server
+// that is about to stop.
+export fn grpc_health_shutdown(h: GrpcHealth*) {
+  for i in 0..h->names.len { grpc_health_set(h, h->names.data[i], GRPC_HEALTH_NOT_SERVING); }
+  h->shut = true;
+}
+
+// Adds the service to a server. h must outlive the server.
+export fn grpc_health_register(h: GrpcHealth*, s: GrpcServer*) {
+  GrpcPbHealth_register(s, &h->handlers);
+}
+
+// Ends the open Watch calls and frees the table.
+export fn grpc_health_free(h: GrpcHealth*) {
+  while (h->watchers.len > 0) {
+    var c: GrpcCall* = h->watchers.data[0].call;
+    drop_watcher(h, c);
+    grpc_srv_finish(c, grpc_status(GRPC_UNAVAILABLE, "health service stopped"));
+  }
+  for i in 0..h->names.len {
+    if (h->names.data[i].length > 0) { free(h->names.data[i].chars); }
+  }
+  codec_list_free(&h->names);
+  codec_list_free(&h->statuses);
+  codec_list_free(&h->watchers);
+}

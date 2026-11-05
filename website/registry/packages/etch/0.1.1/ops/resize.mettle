@@ -1,0 +1,254 @@
+// Resizing with a choice of filter.
+//
+//   var small: EtchImage;
+//   etch_resize(&img, 320, 240, ETCH_FILTER_LANCZOS, &small);
+//
+// Separable: each row is filtered across, then each column down. When
+// shrinking, the filter widens by the scale factor, so every source pixel
+// counts (no aliasing). Work is done in float. Images with alpha are
+// premultiplied while filtering, so transparent pixels do not bleed their
+// color into the edges. Resizing happens in the stored values: convert to
+// linear light first (ops/color) for the most correct result on sRGB.
+
+import "std/math" as math;
+import "std/mem";
+import "../core/status";
+import "../core/image";
+import "convert";
+
+export const ETCH_FILTER_NEAREST: int32 = 0;
+export const ETCH_FILTER_BOX: int32 = 1;       // area average when shrinking
+export const ETCH_FILTER_BILINEAR: int32 = 2;  // triangle
+export const ETCH_FILTER_CUBIC: int32 = 3;     // Catmull-Rom
+export const ETCH_FILTER_MITCHELL: int32 = 4;  // Mitchell-Netravali, B = C = 1/3
+export const ETCH_FILTER_LANCZOS: int32 = 5;   // Lanczos, 3 lobes
+
+fn support(f: int32) -> float64 {
+  switch (f) {
+    case 1: { return 0.5; }
+    case 2: { return 1.0; }
+    case 3: { return 2.0; }
+    case 4: { return 2.0; }
+    case 5: { return 3.0; }
+    default: { }
+  }
+  return 0.5;
+}
+
+fn sinc(x: float64) -> float64 {
+  if (x == 0.0) { return 1.0; }
+  var px: float64 = x * 3.14159265358979323846;
+  return math.sin(px) / px;
+}
+
+fn filter_weight(f: int32, x0: float64) -> float64 {
+  var x: float64 = x0;
+  if (x < 0.0) { x = -x; }
+  if (f == 1) {
+    if (x <= 0.5) { return 1.0; }
+    return 0.0;
+  }
+  if (f == 2) {
+    if (x < 1.0) { return 1.0 - x; }
+    return 0.0;
+  }
+  if (f == 3 || f == 4) {
+    var b: float64 = 0.0;
+    var c: float64 = 0.5;
+    if (f == 4) { b = 1.0 / 3.0; c = 1.0 / 3.0; }
+    if (x < 1.0) {
+      return ((12.0 - 9.0 * b - 6.0 * c) * x * x * x + (-18.0 + 12.0 * b + 6.0 * c) * x * x + (6.0 - 2.0 * b)) / 6.0;
+    }
+    if (x < 2.0) {
+      return ((-b - 6.0 * c) * x * x * x + (6.0 * b + 30.0 * c) * x * x + (-12.0 * b - 48.0 * c) * x + (8.0 * b + 24.0 * c)) / 6.0;
+    }
+    return 0.0;
+  }
+  if (f == 5) {
+    if (x < 3.0) { return sinc(x) * sinc(x / 3.0); }
+    return 0.0;
+  }
+  return 0.0;
+}
+
+// For each output position: the first source index and `taps` weights.
+struct Taps {
+  first: int32*;    // [out]
+  count: int32*;    // [out] weights in use, never past the source's end
+  w: float32*;      // [out * taps]
+  taps: int32;
+}
+
+fn taps_free(t: Taps*) {
+  if (t->first != 0) { free(t->first); }
+  if (t->count != 0) { free(t->count); }
+  if (t->w != 0) { free(t->w); }
+}
+
+fn taps_make(t: Taps*, f: int32, in_n: int32, out_n: int32) -> int32 {
+  var scale: float64 = (float64)out_n / (float64)in_n;
+  var fs: float64 = 1.0;               // filter stretch
+  if (scale < 1.0) { fs = 1.0 / scale; }
+  var sup: float64 = support(f) * fs;
+  var taps: int32 = (int32)(sup * 2.0) + 3;
+  t->taps = taps;
+  t->first = (int32*)malloc((int64)out_n * 4);
+  t->count = (int32*)malloc((int64)out_n * 4);
+  t->w = (float32*)malloc((int64)out_n * (int64)taps * 4);
+  if (t->first == 0 || t->count == 0 || t->w == 0) { return ETCH_E_MEM; }
+  for o in 0..out_n {
+    var center: float64 = ((float64)o + 0.5) / scale;
+    var lo: int32 = (int32)(center - sup + 0.5);
+    if (center - sup + 0.5 < 0.0) { lo = (int32)(center - sup + 0.5) - 1; }
+    if (lo < 0) { lo = 0; }
+    var hi: int32 = (int32)(center + sup + 0.5);
+    if (hi > in_n) { hi = in_n; }
+    if (hi - lo > taps) { hi = lo + taps; }
+    var wp: float32* = t->w + (int64)o * (int64)taps;
+    var total: float64 = 0.0;
+    var n: int32 = hi - lo;
+    for k in 0..taps { wp[k] = 0.0; }
+    for k in 0..n {
+      var v: float64 = filter_weight(f, ((float64)(lo + k) + 0.5 - center) / fs);
+      wp[k] = (float32)v;
+      total = total + v;
+    }
+    if (n <= 0) {
+      // No source pixel in range: take the nearest one.
+      lo = (int32)center;
+      if (lo >= in_n) { lo = in_n - 1; }
+      wp[0] = 1.0;
+      n = 1;
+    } else if (total != 0.0) {
+      for k in 0..n { wp[k] = (float32)((float64)wp[k] / total); }
+    } else {
+      wp[0] = 1.0;
+    }
+    t->count[o] = n;
+    t->first[o] = lo;
+  }
+  return ETCH_OK;
+}
+
+fn resize_nearest(src: EtchImage*, out: EtchImage*) {
+  var bpp: int64 = (int64)etch_format_bpp(src->format);
+  var ow: int32 = out->width;
+  var xs: int64* = (int64*)malloc((int64)ow * 8);
+  for x in 0..ow {
+    var sx: int64 = ((int64)x * (int64)src->width * 2 + (int64)src->width) / ((int64)ow * 2);
+    xs[x] = sx * bpp;
+  }
+  for y in 0..out->height {
+    var sy: int64 = ((int64)y * (int64)src->height * 2 + (int64)src->height) / ((int64)out->height * 2);
+    var s: uint8* = src->data + sy * src->stride;
+    var d: uint8* = out->data + (int64)y * out->stride;
+    for x in 0..ow { memcpy(d + (int64)x * bpp, s + xs[x], bpp); }
+  }
+  free(xs);
+}
+
+/// Makes a new image of w by h pixels from src, using one of the
+/// ETCH_FILTER_* filters. The result has src's format.
+export fn etch_resize(src: EtchImage*, w: int32, h: int32, filter: int32, out: EtchImage*) -> int32 {
+  if (src == 0 || out == 0 || src->data == 0 || w <= 0 || h <= 0) { return ETCH_E_ARG; }
+  if (filter < 0 || filter > 5) { return ETCH_E_ARG; }
+  var tmp: EtchImage;
+  var rc: int32 = etch_image_alloc(&tmp, w, h, src->format);
+  if (rc != ETCH_OK) { return rc; }
+  if (filter == ETCH_FILTER_NEAREST) {
+    resize_nearest(src, &tmp);
+    *out = tmp;
+    return ETCH_OK;
+  }
+  var tx: Taps;
+  var ty: Taps;
+  rc = taps_make(&tx, filter, src->width, w);
+  if (rc == ETCH_OK) { rc = taps_make(&ty, filter, src->height, h); }
+  var sw: int64 = (int64)src->width;
+  var sh: int64 = (int64)src->height;
+  var ow: int64 = (int64)w;
+  // Horizontal pass result: sh rows of ow RGBA floats.
+  var mid: float32* = (float32*)0;
+  var row: float32* = (float32*)0;
+  var orow: float32* = (float32*)0;
+  if (rc == ETCH_OK) {
+    mid = (float32*)malloc(sh * ow * 16);
+    row = (float32*)malloc(sw * 16);
+    orow = (float32*)malloc(ow * 16);
+    if (mid == 0 || row == 0 || orow == 0) { rc = ETCH_E_MEM; }
+  }
+  if (rc != ETCH_OK) {
+    taps_free(&tx); taps_free(&ty);
+    if (mid != 0) { free(mid); }
+    if (row != 0) { free(row); }
+    if (orow != 0) { free(orow); }
+    etch_image_free(&tmp);
+    return rc;
+  }
+  var alpha: bool = etch_format_has_alpha(src->format);
+  var ntx: int64 = (int64)tx.taps;
+  for y in 0..sh {
+    etch_row_to_f32(src->data + y * src->stride, src->format, sw, row);
+    if (alpha) {
+      for x in 0..sw {
+        var a: float32 = row[x * 4 + 3];
+        row[x * 4] = row[x * 4] * a;
+        row[x * 4 + 1] = row[x * 4 + 1] * a;
+        row[x * 4 + 2] = row[x * 4 + 2] * a;
+      }
+    }
+    var m: float32* = mid + y * ow * 4;
+    for x in 0..ow {
+      var wp: float32* = tx.w + x * ntx;
+      var sp: float32* = row + (int64)tx.first[x] * 4;
+      var r: float32 = 0.0;
+      var g: float32 = 0.0;
+      var b: float32 = 0.0;
+      var a: float32 = 0.0;
+      for k in 0..(int64)tx.count[x] {
+        var kw: float32 = wp[k];
+        r = r + sp[k * 4] * kw;
+        g = g + sp[k * 4 + 1] * kw;
+        b = b + sp[k * 4 + 2] * kw;
+        a = a + sp[k * 4 + 3] * kw;
+      }
+      m[x * 4] = r;
+      m[x * 4 + 1] = g;
+      m[x * 4 + 2] = b;
+      m[x * 4 + 3] = a;
+    }
+  }
+  var nty: int64 = (int64)ty.taps;
+  var ow4: int64 = ow * 4;
+  for y in 0..(int64)h {
+    var wp: float32* = ty.w + y * nty;
+    var base: float32* = mid + (int64)ty.first[y] * ow4;
+    for i in 0..ow4 { orow[i] = 0.0; }
+    for k in 0..(int64)ty.count[y] {
+      var kw: float32 = wp[k];
+      if (kw == 0.0) { continue; }
+      var sp: float32* = base + k * ow4;
+      for i in 0..ow4 { orow[i] = orow[i] + sp[i] * kw; }
+    }
+    if (alpha) {
+      for x in 0..ow {
+        var a: float32 = orow[x * 4 + 3];
+        if (a > 0.0) {
+          var inv: float32 = 1.0 / a;
+          orow[x * 4] = orow[x * 4] * inv;
+          orow[x * 4 + 1] = orow[x * 4 + 1] * inv;
+          orow[x * 4 + 2] = orow[x * 4 + 2] * inv;
+        } else {
+          orow[x * 4] = 0.0;
+          orow[x * 4 + 1] = 0.0;
+          orow[x * 4 + 2] = 0.0;
+        }
+      }
+    }
+    etch_row_from_f32(orow, src->format, ow, tmp.data + y * tmp.stride);
+  }
+  free(mid); free(row); free(orow);
+  taps_free(&tx); taps_free(&ty);
+  *out = tmp;
+  return ETCH_OK;
+}

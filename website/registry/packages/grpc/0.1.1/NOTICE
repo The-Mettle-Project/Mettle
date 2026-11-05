@@ -1,0 +1,10 @@
+grpc for Mettle
+Copyright 2026 Lex Dellimere
+
+This product includes .proto files from:
+- grpc/grpc-proto (grpc/health/v1, grpc/reflection/v1), Apache License 2.0,
+  Copyright The gRPC Authors
+- googleapis/googleapis (google/rpc), Apache License 2.0, Copyright Google LLC
+- protocolbuffers/protobuf (google/protobuf), BSD 3-Clause License,
+  Copyright Google Inc.; see proto/google/protobuf/LICENSE
+Code generated from them is in src/gen.

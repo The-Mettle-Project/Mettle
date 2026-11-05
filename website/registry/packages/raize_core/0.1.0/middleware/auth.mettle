@@ -1,0 +1,591 @@
+// raize/middleware/auth — a hook, not a user database.
+//
+// This file does not know what a user is. It knows three things:
+//
+//   1. how to *find* a credential on a request (the default is a bearer token
+//      in Authorization: Bearer <token>, and that extractor is replaceable);
+//   2. how to ask *your* verifier whether that credential is good, through one
+//      function pointer;
+//   3. how to refuse: 401 with a WWW-Authenticate challenge, or 403 for "known
+//      but not allowed", both answered without calling the rest of the chain.
+//
+// The verifier is the pluggable part:
+//
+//   verdict  fn(ctx: RzContext*, token: string*, principal: rawptr*) -> int32
+//
+// ## Why the token is a pointer and not a string (an ABI constraint)
+//
+// Both hooks are called through a function pointer installed in a *different
+// module*, and Mettle v0.17.0 mis-handles an aggregate in that position: a
+// string *by value* argument is a codegen error (`call_indirect_unsupported`),
+// and a string *return* from another module compiles and then jumps to
+// address 0. So a hook taking `token: string` would be a SIGSEGV in the first
+// app that installed a verifier; every pluggable hook here uses pointers,
+// int64/int32 and bool only. Probes (and the fuller note): auth_token.mettle
+// header, tests/fixtures/middleware/probe_abi_*.mettle.
+//
+// It returns an HTTP status, because that is what it is deciding:
+//
+//   0 or 200  allowed. Set *principal to whatever the app wants (a session
+//             struct, a user id, a rawptr to a row) — it is stored in
+//             ctx->user, which RzContext deliberately types as rawptr so the
+//             auth layer can hand a value to the app without the context
+//             module knowing its type.
+//   401       unauthorized: no token, or the token is not valid.
+//   403       forbidden: the credential is valid, the request is not allowed.
+//   anything  a verifier bug. Answered as 500 (with a detail body that an
+//   else      outer recovery middleware replaces and logs) and counted; do not
+//             return arbitrary numbers from a security check.
+//
+// A verifier that returns 500 is *not* turned into a 401 here: an auth
+// misconfiguration must not look like "the client sent the wrong token", and
+// the recovery middleware is the layer that owns generic 500s.
+//
+// A published config with no verifier installed **fails closed** (401 for
+// every request): a process that mounted auth but forgot the verifier must not
+// silently become open. An *unpublished* config means "auth is not installed",
+// and the middleware calls next — an app without auth is a valid app (a static
+// site), an app with a broken auth is not.
+//
+// ## The challenge
+//
+// RFC 6750 §3.1: a 401 carries a Bearer challenge; a 403 caused by an
+// insufficient scope carries `error="insufficient_scope"`. So:
+//
+//   401, no token      WWW-Authenticate: Bearer realm="<realm>"
+//   401, bad token     WWW-Authenticate: Bearer realm="<realm>", error="invalid_token"
+//   403                WWW-Authenticate: Bearer realm="<realm>", error="insufficient_scope"
+//
+// The realm is app-supplied, so it is validated at set time: no quote, no
+// backslash, no CR/LF, at most 64 bytes. A realm that could not be quoted is
+// refused at startup, not escaped at request time — an auth header built by
+// escaping is an auth header nobody reviewed.
+//
+// The denial body is generic ("unauthorized\n" / "forbidden\n"): the reason
+// belongs in the challenge and in the log line, not in a body a client reads.
+// The verifier-bug body is never written by the middleware (the outer recovery
+// owns it); when recovery is not mounted the client sees the generic text the
+// recovery constant would have produced.
+
+import "std/mem";
+import "std/thread";
+import "../str/str";
+import "../context/context";
+import "headers";
+// The credential parser (Authorization / Bearer / token trimming) lives in the
+// sibling auth_token.mettle after the 400-line split. Mettle imports are
+// transitive, so a consumer of this file still sees rz_auth_bearer_token and
+// RZ_AUTH_SCHEME_BEARER.
+import "auth_token";
+
+export const RZ_AUTH_REALM_MAX: int64 = 64;
+export const RZ_AUTH_BODY_UNAUTHORIZED: string = "unauthorized\n";
+export const RZ_AUTH_BODY_FORBIDDEN: string = "forbidden\n";
+// What a verifier bug puts in the response *before* recovery replaces it; the
+// recovery middleware logs it as the detail and substitutes its own body.
+export const RZ_AUTH_BODY_VERIFIER: string = "auth verifier error\n";
+
+// Verifier verdicts, named. Any other value is treated as 500.
+export const RZ_AUTH_ALLOW: int32 = 200;
+export const RZ_AUTH_DENY: int32 = 401;
+export const RZ_AUTH_FORBIDDEN: int32 = 403;
+
+export struct RzAuthStats {
+  entered: int32;          // requests through the hook
+  allowed: int32;          // verdict 0/200
+  unauthorized: int32;     // verdict 401 or no token with a verifier installed
+  forbidden: int32;        // verdict 403
+  verifier_missing: int32; // published config with no verifier (fail closed)
+  verifier_bug: int32;     // a verdict that is not 0/200/401/403 (-> 500)
+  duplicate_credentials: int32;  // more than one Authorization header
+  header_rejected: int32;  // the challenge could not be stored
+}
+
+// The credential extractor: fills *out with a borrowed view of the credential
+// and returns 1, or returns 0 for "this request carries none". A replacement
+// lets an app use a cookie or an X-Api-Key header instead.
+export struct RzAuth {
+  verify: fn(RzContext*, string*, rawptr*) -> int32;
+  extract: fn(RzRequest*, string*) -> int32;
+  realm: string;
+  scheme: string;      // "Bearer"; the challenge's scheme token
+  challenge: bool;     // emit WWW-Authenticate on 401/403 (default true)
+  stats: RzAuthStats;
+}
+
+var g_rz_auth: RzAuth* = 0;
+
+// The default verifier. It allows nothing: there is no "default credential" in
+// this framework and guessing one would be a vulnerability. An app installs its
+// own with rz_auth_set_verifier.
+export fn rz_auth_deny_all(ctx: RzContext*, token: string*, principal: rawptr*) -> int32 {
+  return RZ_AUTH_DENY;
+}
+
+export fn rz_auth_new() -> RzAuth* {
+  var a: RzAuth* = (RzAuth*)calloc(1, sizeof(RzAuth));
+  if (a == 0) { return 0; }
+  a->verify = &rz_auth_deny_all;
+  a->extract = &rz_auth_bearer_token;
+  a->realm = "raize";
+  a->scheme = RZ_AUTH_SCHEME_BEARER;
+  a->challenge = true;
+  return a;
+}
+
+export fn rz_auth_free(a: RzAuth*) {
+  if (a == 0) { return; }
+  if (g_rz_auth == a) { g_rz_auth = 0; }
+  free((rawptr)a);
+}
+
+export fn rz_auth_stats(a: RzAuth*) -> RzAuthStats {
+  var s: RzAuthStats;
+  if (a == 0) { return s; }
+  s = a->stats;
+  return s;
+}
+
+// 0 installed. A null verifier is refused: "no verifier" must be an explicit
+// rz_auth_deny_all, not a null pointer nobody checks.
+export fn rz_auth_set_verifier(a: RzAuth*, v: fn(RzContext*, string*, rawptr*) -> int32) -> int32 {
+  if (a == 0 || v == 0) { return -1; }
+  a->verify = v;
+  return 0;
+}
+
+export fn rz_auth_set_extractor(a: RzAuth*, e: fn(RzRequest*, string*) -> int32) -> int32 {
+  if (a == 0 || e == 0) { return -1; }
+  a->extract = e;
+  return 0;
+}
+
+// The realm goes inside a quoted-string, so it may not contain the quote, the
+// backslash, or a control byte. Refused here, never escaped later.
+export fn rz_auth_set_realm(a: RzAuth*, realm: string) -> int32 {
+  if (a == 0 || realm.length == 0) { return -1; }
+  if ((int64)realm.length > RZ_AUTH_REALM_MAX) { return -2; }
+  if (!rz_hdr_crlf_ok(realm)) { return -1; }
+  var i: int64 = 0;
+  while (i < (int64)realm.length) {
+    var c: int32 = (int32)realm.chars[i];
+    if (c == 34 || c == 92) { return -1; }
+    i = i + 1;
+  }
+  a->realm = realm;
+  return 0;
+}
+
+export fn rz_auth_set_scheme(a: RzAuth*, scheme: string) -> int32 {
+  if (a == 0 || scheme.length == 0) { return -1; }
+  if (!rz_header_name_ok(scheme)) { return -1; }   // scheme is a token
+  a->scheme = scheme;
+  return 0;
+}
+
+export fn rz_auth_set_challenge(a: RzAuth*, on: bool) -> int32 {
+  if (a == 0) { return -1; }
+  a->challenge = on;
+  return 0;
+}
+
+// 0 valid. Validates the realm and scheme through their setters' rules without
+// mutating anything.
+export fn rz_auth_validate(a: RzAuth*) -> int32 {
+  if (a == 0) { return -1; }
+  if (a->verify == 0) { return -2; }
+  if (a->extract == 0) { return -3; }
+  if (a->realm.length == 0) { return -4; }
+  if (!rz_hdr_crlf_ok(a->realm)) { return -4; }
+  var i: int64 = 0;
+  while (i < (int64)a->realm.length) {
+    var c: int32 = (int32)a->realm.chars[i];
+    if (c == 34 || c == 92) { return -4; }
+    i = i + 1;
+  }
+  if (!rz_header_name_ok(a->scheme)) { return -5; }
+  return 0;
+}
+
+export fn rz_auth_use(a: RzAuth*) -> int32 {
+  var rc: int32 = rz_auth_validate(a);
+  if (rc != 0) { return rc; }
+  g_rz_auth = a;
+  return 0;
+}
+
+fn rz_auth_cfg() -> RzAuth* {
+  return g_rz_auth;
+}
+
+// The verifier's answer as an HTTP status. 0 and 200 both mean allowed; only
+// 401 and 403 are denials; anything else is a bug in the verifier and becomes
+// 500 rather than leaking through as a status line.
+export fn rz_auth_status(verdict: int32) -> int32 {
+  if (verdict == 0 || verdict == 200) { return 200; }
+  if (verdict == 401) { return 401; }
+  if (verdict == 403) { return 403; }
+  return 500;
+}
+
+// Bounded append into a stack buffer; returns the new length or -1 when it
+// does not fit (never a partial write).
+fn rz_auth_put(out: uint8*, cap: int64, at: int64, s: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  if (at < 0) { return -1; }
+  if (at + n + 1 > cap) { return -1; }
+  var i: int64 = 0;
+  while (i < n) {
+    out[at + i] = s.chars[i];
+    i = i + 1;
+  }
+  return at + n;
+}
+
+// Builds the WWW-Authenticate value into `out` and returns its length (0 when
+// it does not fit — the buffer is 128 and the realm is capped at 64, so it
+// always fits; 0 is a bug signal, not a normal outcome).
+//
+// `has_token` distinguishes "no credentials" from "wrong credentials";
+// `forbidden` is the 403 case. See the header comment for the exact strings.
+export fn rz_auth_challenge(a: RzAuth*, has_token: bool, forbidden: bool, out: uint8*, cap: int64) -> int64 {
+  if (a == 0 || out == 0 || cap <= 0) { return 0; }
+  var at: int64 = 0;
+  at = rz_auth_put(out, cap, at, a->scheme);
+  at = rz_auth_put(out, cap, at, " realm=\"");
+  at = rz_auth_put(out, cap, at, a->realm);
+  at = rz_auth_put(out, cap, at, "\"");
+  if (forbidden) {
+    at = rz_auth_put(out, cap, at, ", error=\"insufficient_scope\"");
+  } else if (has_token) {
+    at = rz_auth_put(out, cap, at, ", error=\"invalid_token\"");
+  }
+  if (at < 0) { return 0; }
+  return at;
+}
+
+// Answers the request with a denial: status, generic body and (when enabled)
+// the challenge header. Marks the context aborted so the server does not call
+// the handler, and returns 0 — the chain's "answered, do not continue".
+fn rz_auth_deny(ctx: RzContext*, a: RzAuth*, status: int32, has_token: bool) -> int32 {
+  var forbidden: bool = status == 403;
+  if (ctx->resp != 0 && a->challenge) {
+    var ch: uint8[128];
+    var cn: int64 = rz_auth_challenge(a, has_token, forbidden, &ch[0], 128);
+    if (cn > 0) {
+      var v: string = rz_str_view(&ch[0], cn);
+      var rc: int32 = rz_hdr_set(ctx->resp, "WWW-Authenticate", v);
+      if (rc != RZ_HDR_OK) { atomic_inc_i32(&a->stats.header_rejected); }
+    } else {
+      atomic_inc_i32(&a->stats.header_rejected);
+    }
+  }
+  if (forbidden) {
+    rz_ctx_text(ctx, 403, RZ_AUTH_BODY_FORBIDDEN);
+  } else {
+    rz_ctx_text(ctx, 401, RZ_AUTH_BODY_UNAUTHORIZED);
+  }
+  ctx->aborted = true;
+  return 0;
+}
+
+// The middleware. Allows pass through with ctx->user set; denials are answered
+// here and the rest of the chain does not run. A verifier bug (status 500)
+// returns 500 *without* aborting, so an outer recovery owns the response.
+export fn rz_mw_auth(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  var a: RzAuth* = rz_auth_cfg();
+  if (a == 0) { return next(ctx); }   // auth not installed: not this layer's policy
+  if (ctx == 0 || ctx->req == 0) { return next(ctx); }
+  atomic_inc_i32(&a->stats.entered);
+  var req: RzRequest* = ctx->req;
+  if (rz_hdr_in_count(req, "Authorization") > 1) {
+    // RFC 7235: more than one Authorization header is malformed. Refusing is
+    // safer than picking one and hoping the proxy agrees.
+    atomic_inc_i32(&a->stats.duplicate_credentials);
+    return rz_auth_deny(ctx, a, 401, false);
+  }
+  var token: string = rz_str_empty();
+  if (a->extract != 0) {
+    var found: int32 = a->extract(req, &token);
+    if (found != 1) { token = rz_str_empty(); }
+  }
+  var principal: rawptr = 0;
+  var verdict: int32 = RZ_AUTH_DENY;
+  if (a->verify != 0) {
+    verdict = a->verify(ctx, &token, &principal);
+  } else {
+    atomic_inc_i32(&a->stats.verifier_missing);
+  }
+  var status: int32 = rz_auth_status(verdict);
+  if (status == 200) {
+    ctx->user = principal;
+    atomic_inc_i32(&a->stats.allowed);
+    return next(ctx);
+  }
+  if (status == 500) {
+    // Not a denial: a verifier bug or a bad verdict. Leave the answer to the
+    // recovery middleware (which logs the detail and substitutes its generic
+    // body) and do *not* mark the context aborted — an abort means "a step
+    // decided", and this is a fault. Without recovery mounted the client sees
+    // RZ_AUTH_BODY_VERIFIER, which carries no request data.
+    atomic_inc_i32(&a->stats.verifier_bug);
+    if (ctx->resp != 0) { rz_resp_text(ctx->resp, 500, RZ_AUTH_BODY_VERIFIER); }
+    ctx->status = 500;
+    return 500;
+  }
+  if (status == 403) {
+    atomic_inc_i32(&a->stats.forbidden);
+  } else {
+    atomic_inc_i32(&a->stats.unauthorized);
+  }
+  return rz_auth_deny(ctx, a, status, token.length > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// Run: ./mettle-build/bin/mettle test framework/middleware/auth.mettle
+//
+// The hooks below are *called through a function pointer* here too, because
+// that is the path an app uses — and it is the path the ABI note above is
+// about.
+// ---------------------------------------------------------------------------
+
+fn t_auth_add_header(req: RzRequest*, name: string, value: string) {
+  var at: int32 = req->header_count;
+  req->headers[at].name = name;
+  req->headers[at].value = value;
+  req->header_count = at + 1;
+}
+
+fn t_auth_term(ctx: RzContext*) -> int32 {
+  if (ctx->resp != 0) {
+    rz_resp_write(ctx->resp, "T");
+    ctx->resp->status = 200;
+  }
+  ctx->status = 200;
+  return 200;
+}
+
+fn t_auth_ok_verify(ctx: RzContext*, token: string*, principal: rawptr*) -> int32 {
+  if (token == 0) { return 401; }
+  if (!rz_str_eq(*token, "good")) { return 401; }
+  if (principal != 0) { *principal = (rawptr)ctx; }
+  return 200;
+}
+
+fn t_auth_403_verify(ctx: RzContext*, token: string*, principal: rawptr*) -> int32 {
+  return 403;
+}
+
+fn t_auth_bug_verify(ctx: RzContext*, token: string*, principal: rawptr*) -> int32 {
+  return 999;
+}
+
+// An app that reads X-Api-Key instead of Authorization.
+fn t_auth_key_extract(req: RzRequest*, out: string*) -> int32 {
+  var v: string = rz_hdr_in_get(req, "X-Api-Key");
+  out->chars = v.chars;
+  out->length = v.length;
+  if (v.length == 0) { return 0; }
+  return 1;
+}
+
+@test fn t_rz_auth_challenge_strings() -> int32 {
+  var a: RzAuth* = rz_auth_new();
+  if (a == 0) { return 1; }
+  defer rz_auth_free(a);
+  var out: uint8[128];
+  var n: int64 = rz_auth_challenge(a, false, false, &out[0], 128);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "Bearer realm=\"raize\"")) { return 2; }
+  n = rz_auth_challenge(a, true, false, &out[0], 128);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "Bearer realm=\"raize\", error=\"invalid_token\"")) { return 3; }
+  n = rz_auth_challenge(a, true, true, &out[0], 128);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "Bearer realm=\"raize\", error=\"insufficient_scope\"")) { return 4; }
+  // a buffer that cannot hold the value produces nothing, never a partial one
+  if (rz_auth_challenge(a, false, false, &out[0], 8) != 0) { return 5; }
+  return 0;
+}
+
+@test fn t_rz_auth_realm_is_not_escapable() -> int32 {
+  var a: RzAuth* = rz_auth_new();
+  if (a == 0) { return 1; }
+  defer rz_auth_free(a);
+  if (rz_auth_set_realm(a, "api") != 0) { return 2; }
+  if (rz_auth_set_realm(a, "") != -1) { return 3; }
+  if (rz_auth_set_realm(a, "a\"b") != -1) { return 4; }
+  if (rz_auth_set_realm(a, "a\\b") != -1) { return 5; }
+  if (rz_auth_set_realm(a, "a\r\nb") != -1) { return 6; }
+  var long: uint8[80];
+  var i: int64 = 0;
+  while (i < 80) { long[i] = 65; i = i + 1; }
+  if (rz_auth_set_realm(a, rz_str_view(&long[0], 80)) != -2) { return 7; }
+  if (rz_auth_validate(a) != 0) { return 8; }
+  if (rz_auth_set_scheme(a, "Bearer 2") != -1) { return 9; }   // not a token
+  return 0;
+}
+
+@test fn t_rz_auth_status_mapping() -> int32 {
+  if (rz_auth_status(0) != 200) { return 1; }
+  if (rz_auth_status(200) != 200) { return 2; }
+  if (rz_auth_status(401) != 401) { return 3; }
+  if (rz_auth_status(403) != 403) { return 4; }
+  if (rz_auth_status(1) != 500) { return 5; }
+  if (rz_auth_status(304) != 500) { return 6; }
+  return 0;
+}
+
+@test fn t_rz_auth_denies_without_token() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var a: RzAuth* = rz_auth_new();
+  if (a == 0) { return 4; }
+  defer rz_auth_free(a);
+  if (rz_auth_use(a) != 0) { return 5; }
+  // the default verifier allows nothing: published-but-unconfigured fails closed
+  if (rz_mw_auth(&ctx, &t_auth_term) != 0) { return 6; }
+  if (!ctx.aborted) { return 7; }
+  if (resp->status != 401) { return 8; }
+  if (!rz_str_eq(rz_buf_str(resp->body), RZ_AUTH_BODY_UNAUTHORIZED)) { return 9; }
+  if (!rz_str_eq(rz_hdr_get(resp, "WWW-Authenticate"), "Bearer realm=\"raize\"")) { return 10; }
+  var st: RzAuthStats = rz_auth_stats(a);
+  if (st.entered != 1) { return 11; }
+  if (st.unauthorized != 1) { return 12; }
+  return 0;
+}
+
+@test fn t_rz_auth_allows_with_verifier() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var a: RzAuth* = rz_auth_new();
+  if (a == 0) { return 4; }
+  defer rz_auth_free(a);
+  if (rz_auth_set_verifier(a, &t_auth_ok_verify) != 0) { return 5; }
+  if (rz_auth_use(a) != 0) { return 6; }
+  t_auth_add_header(&req, "Authorization", "Bearer good");
+  if (rz_mw_auth(&ctx, &t_auth_term) != 200) { return 7; }
+  if (ctx.aborted) { return 8; }
+  if (!rz_str_eq(rz_buf_str(resp->body), "T")) { return 9; }
+  if (ctx.user != (rawptr)&ctx) { return 10; }        // principal handed to the app
+  if (rz_hdr_get(resp, "WWW-Authenticate").length != 0) { return 11; }
+  var st: RzAuthStats = rz_auth_stats(a);
+  if (st.allowed != 1) { return 12; }
+  // and the same request with a wrong token is a 401 with invalid_token
+  resp->header_count = 0;
+  req.headers[0].value = "Bearer bad";
+  if (rz_mw_auth(&ctx, &t_auth_term) != 0) { return 13; }
+  if (resp->status != 401) { return 14; }
+  if (!rz_str_eq(rz_hdr_get(resp, "WWW-Authenticate"), "Bearer realm=\"raize\", error=\"invalid_token\"")) { return 15; }
+  return 0;
+}
+
+@test fn t_rz_auth_403_and_duplicates() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var a: RzAuth* = rz_auth_new();
+  if (a == 0) { return 4; }
+  defer rz_auth_free(a);
+  if (rz_auth_set_verifier(a, &t_auth_403_verify) != 0) { return 5; }
+  if (rz_auth_use(a) != 0) { return 6; }
+  t_auth_add_header(&req, "Authorization", "Bearer good");
+  if (rz_mw_auth(&ctx, &t_auth_term) != 0) { return 7; }
+  if (resp->status != 403) { return 8; }
+  if (!rz_str_eq(rz_hdr_get(resp, "WWW-Authenticate"), "Bearer realm=\"raize\", error=\"insufficient_scope\"")) { return 9; }
+  if (!rz_str_eq(rz_buf_str(resp->body), RZ_AUTH_BODY_FORBIDDEN)) { return 10; }
+  // two Authorization headers is malformed (RFC 7235): refuse, do not pick one
+  resp->header_count = 0;
+  ctx.aborted = false;
+  t_auth_add_header(&req, "Authorization", "Bearer other");
+  if (rz_mw_auth(&ctx, &t_auth_term) != 0) { return 11; }
+  if (resp->status != 401) { return 12; }
+  var st: RzAuthStats = rz_auth_stats(a);
+  if (st.duplicate_credentials != 1) { return 13; }
+  return 0;
+}
+
+@test fn t_rz_auth_verifier_bug_is_500() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var a: RzAuth* = rz_auth_new();
+  if (a == 0) { return 4; }
+  defer rz_auth_free(a);
+  if (rz_auth_set_verifier(a, &t_auth_bug_verify) != 0) { return 5; }
+  if (rz_auth_use(a) != 0) { return 6; }
+  t_auth_add_header(&req, "Authorization", "Bearer good");
+  if (rz_mw_auth(&ctx, &t_auth_term) != 500) { return 7; }
+  // not a denial: recovery owns the generic 500, so the context is not aborted
+  if (ctx.aborted) { return 8; }
+  if (resp->status != 500) { return 9; }
+  if (rz_hdr_get(resp, "WWW-Authenticate").length != 0) { return 10; }
+  if (!rz_str_eq(rz_buf_str(resp->body), RZ_AUTH_BODY_VERIFIER)) { return 11; }
+  var st: RzAuthStats = rz_auth_stats(a);
+  if (st.verifier_bug != 1) { return 12; }
+  return 0;
+}
+
+@test fn t_rz_auth_custom_extractor_and_unpublished() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  var a: RzAuth* = rz_auth_new();
+  if (a == 0) { return 4; }
+  defer rz_auth_free(a);
+  if (rz_auth_set_extractor(a, &t_auth_key_extract) != 0) { return 5; }
+  if (rz_auth_set_verifier(a, &t_auth_ok_verify) != 0) { return 6; }
+  if (rz_auth_use(a) != 0) { return 7; }
+  t_auth_add_header(&req, "X-Api-Key", "good");
+  if (rz_mw_auth(&ctx, &t_auth_term) != 200) { return 8; }
+  // a null verifier/extractor is refused at set time, never at request time
+  if (rz_auth_set_extractor(a, (fn(RzRequest*, string*) -> int32)0) != -1) { return 9; }
+  if (rz_auth_set_verifier(a, (fn(RzContext*, string*, rawptr*) -> int32)0) != -1) { return 10; }
+  // unpublishing means "auth is not installed": the chain continues. (A second
+  // config is published and freed so the first one is not double-freed.)
+  var b: RzAuth* = rz_auth_new();
+  if (b == 0) { return 11; }
+  if (rz_auth_use(b) != 0) { return 12; }
+  rz_auth_free(b);
+  resp->header_count = 0;
+  ctx.aborted = false;
+  if (rz_mw_auth(&ctx, &t_auth_term) != 200) { return 13; }
+  if (ctx.aborted) { return 14; }
+  return 0;
+}

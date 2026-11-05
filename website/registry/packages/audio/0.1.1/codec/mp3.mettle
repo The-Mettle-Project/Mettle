@@ -1,0 +1,451 @@
+// MP3 (and MP2, MP1) streams: finds the frames, reads the tags, trims the
+// encoder delay and padding, and seeks to any sample. The frames
+// themselves are decoded by mp3_dec.
+//
+//   var m: AudioMp3;
+//   if (audio_mp3_open(&m, data, size) == AUDIO_OK) {
+//     while (audio_mp3_next(&m) == AUDIO_OK) { ... m.out[0 .. m.out_frames * channels] ... }
+//   }
+//   audio_mp3_close(&m);
+//
+// Channels are mono or stereo (L R), the same order as WAV.
+//
+// Tags: ID3v2 at the start is skipped using the size in its header, and
+// ID3v1 and APEv2 at the end are cut off. A Xing/Info or VBRI frame at the
+// start is not sound and is skipped. With a LAME (or Lavf/Lavc) extension
+// in the Xing/Info frame, the first 529 + encoder delay samples and the
+// encoder padding at the end are dropped, as ffmpeg does, so the length
+// is the length of the original sound. Without it nothing is dropped.
+//
+// Syncing needs a run of frames with the same layout (version, layer,
+// sample rate), as minimp3 does, so stray 0xFF bytes in garbage are not
+// taken for frames. Garbage between frames is skipped. A frame that fails
+// to decode gives silence, so every frame is worth the same number of
+// samples and seeking stays exact.
+
+import "std/mem";
+import "../core/status";
+import "../core/pcm";
+import "mp3_dec";
+
+const MP3_SYNC_MATCHES: int32 = 10;   // frames that must follow a new sync point
+const MP3_IDX_STEP: int64 = 16;       // the seek index keeps every 16th frame
+const MP3_SEEK_BACK: int64 = 64;      // most frames decoded before a seek point
+
+export struct AudioMp3 {
+  info: AudioInfo;      // channels, rate, frames, fmt = AUDIO_F32, bits = 0
+  out: float32*;        // interleaved samples of the last block
+  out_frames: int32;
+  // stream
+  p: uint8*;
+  n: int64;             // end of the frame data (tags at the end cut off)
+  first: int64;         // offset of the first sound frame
+  ref: uint8[4];        // header of the first frame: the layout all frames share
+  ffb: int32;           // frame size of a free-format stream, else 0
+  spf: int32;           // samples per frame
+  nch: int32;
+  nframes: int64;       // sound frames in the stream
+  idx: int64*;          // offset of frame k * MP3_IDX_STEP
+  nidx: int64;
+  // trimming, in samples counted from the first sound frame
+  start: int64;
+  end: int64;
+  skip_to: int64;       // after a seek, samples before this are dropped
+  // decoding
+  dec: AudioMp3Dec*;
+  pcm: float32*;
+  tmp: float32*;
+  pos: int64;           // where to look for the next frame
+  fidx: int64;          // index of the next frame
+}
+
+// ---- frame walking ----
+
+// Size (with padding) of a frame of this stream at `at`, or 0.
+fn mp3_frame_len(m: AudioMp3*, at: int64) -> int32 {
+  if (at < 0 || m->n - at < 4) { return 0; }
+  var h: uint8* = m->p + at;
+  if (h[0] != 0xFF) { return 0; }
+  if (!audio_mp3_hdr_compare(&m->ref[0], h)) { return 0; }
+  var fb: int32 = audio_mp3_hdr_frame_bytes(h, m->ffb);
+  if (fb <= 0) { return 0; }
+  return fb + audio_mp3_hdr_padding(h);
+}
+
+// True when frames of the same layout follow the frame at `at`, up to
+// MP3_SYNC_MATCHES of them or the end of the data (at least one).
+fn mp3_match(m: AudioMp3*, at: int64, size: int32) -> bool {
+  var i: int64 = at;
+  var fs: int32 = size;
+  for k in 0..MP3_SYNC_MATCHES {
+    i = i + (int64)fs;
+    if (i + 4 > m->n) { return k > 0; }
+    fs = mp3_frame_len(m, i);
+    if (fs <= 0) { return false; }
+  }
+  return true;
+}
+
+// Looks for a sync point from `from` on. With no layout yet (at open),
+// the first frame that a run of frames follows sets m->ref (and the
+// free-format size).
+fn mp3_find(m: AudioMp3*, from: int64, have_ref: bool, off: int64*, size: int32*) -> bool {
+  var i: int64 = from;
+  if (i < 0) { i = 0; }
+  while (i + 4 <= m->n) {
+    var h: uint8* = m->p + i;
+    if (h[0] != 0xFF || !audio_mp3_hdr_valid(h)) { i = i + 1; continue; }
+    if (have_ref) {
+      if (!audio_mp3_hdr_compare(&m->ref[0], h)) { i = i + 1; continue; }
+    } else {
+      for k in 0..4 { m->ref[k] = h[k]; }
+      m->ffb = 0;
+    }
+    var pad: int32 = audio_mp3_hdr_padding(h);
+    var fb: int32 = audio_mp3_hdr_frame_bytes(h, m->ffb);
+    var fp: int32 = fb + pad;
+    if (fb == 0 && !have_ref) {
+      // free format: find the next header of the same layout
+      var k: int64 = 4;
+      while (k < (int64)AUDIO_MP3_MAX_FREE_FRAME && i + 2 * k < m->n - 4) {
+        if (audio_mp3_hdr_compare(h, h + k)) {
+          var fb2: int32 = (int32)k - pad;
+          var nextfb: int64 = (int64)fb2 + (int64)audio_mp3_hdr_padding(h + k);
+          if (i + k + nextfb + 4 <= m->n && audio_mp3_hdr_compare(h, h + k + nextfb)) {
+            fp = (int32)k;
+            fb = fb2;
+            m->ffb = fb2;
+            break;
+          }
+        }
+        k = k + 1;
+      }
+    }
+    if (fb > 0) {
+      if (i + (int64)fp <= m->n && mp3_match(m, i, fp)) {
+        *off = i;
+        *size = fp;
+        return true;
+      }
+      if (i == from && i + (int64)fp == m->n) {
+        *off = i;
+        *size = fp;
+        return true;
+      }
+    }
+    if (!have_ref) { m->ffb = 0; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// The frame that follows when the last one ended at `at`.
+fn mp3_walk(m: AudioMp3*, at: int64, off: int64*, size: int32*) -> bool {
+  var fs: int32 = mp3_frame_len(m, at);
+  if (fs > 0 && at + (int64)fs <= m->n) {
+    *off = at;
+    *size = fs;
+    return true;
+  }
+  return mp3_find(m, at, true, off, size);
+}
+
+// ---- tags ----
+
+fn mp3_be32(p: uint8*) -> int64 {
+  return ((int64)p[0] << 24) | ((int64)p[1] << 16) | ((int64)p[2] << 8) | (int64)p[3];
+}
+
+fn mp3_le32(p: uint8*) -> int64 {
+  return ((int64)p[3] << 24) | ((int64)p[2] << 16) | ((int64)p[1] << 8) | (int64)p[0];
+}
+
+fn mp3_is(p: uint8*, a: int32, b: int32, c: int32, d: int32) -> bool {
+  return (int32)p[0] == a && (int32)p[1] == b && (int32)p[2] == c && (int32)p[3] == d;
+}
+
+struct Mp3Tag {
+  found: bool;      // a Xing/Info/VBRI frame: not sound
+  frames: int64;    // frame count from the tag, or -1
+  lame: bool;       // delay and padding below are valid
+  delay: int64;
+  padding: int64;
+}
+
+fn mp3_read_tag(m: AudioMp3*, off: int64, size: int32, t: Mp3Tag*) {
+  t->found = false;
+  t->frames = -1;
+  t->lame = false;
+  t->delay = 0;
+  t->padding = 0;
+  var h: uint8* = m->p + off;
+  if (audio_mp3_hdr_layer(h) != 3) { return; }
+  var fend: int64 = off + (int64)size;
+  var x: int64 = off + 4 + (int64)audio_mp3_hdr_side_bytes(h);
+  if (x + 8 <= fend && (mp3_is(m->p + x, 'X', 'i', 'n', 'g') || mp3_is(m->p + x, 'I', 'n', 'f', 'o'))) {
+    t->found = true;
+    var flags: int64 = mp3_be32(m->p + x + 4);
+    var q: int64 = x + 8;
+    if ((flags & 1) != 0) {
+      if (q + 4 > fend) { return; }
+      t->frames = mp3_be32(m->p + q);
+      q = q + 4;
+    }
+    if ((flags & 2) != 0) { q = q + 4; }
+    if ((flags & 4) != 0) { q = q + 100; }
+    if ((flags & 8) != 0) { q = q + 4; }
+    // LAME extension: 9 bytes of encoder name, ..., 12 bits delay, 12 bits padding at +21
+    if (q + 24 <= fend) {
+      var e: uint8* = m->p + q;
+      if (mp3_is(e, 'L', 'A', 'M', 'E') || mp3_is(e, 'L', 'a', 'v', 'f') || mp3_is(e, 'L', 'a', 'v', 'c')) {
+        var v: int64 = ((int64)e[21] << 16) | ((int64)e[22] << 8) | (int64)e[23];
+        t->lame = true;
+        t->delay = v >> 12;
+        t->padding = v & 0xFFF;
+      }
+    }
+    return;
+  }
+  var vb: int64 = off + 36;
+  if (vb + 18 <= fend && mp3_is(m->p + vb, 'V', 'B', 'R', 'I')) {
+    t->found = true;
+    t->frames = mp3_be32(m->p + vb + 14);
+  }
+}
+
+// ---- open, next, seek, close ----
+
+export fn audio_mp3_close(m: AudioMp3*) {
+  if (m->dec != 0) { free(m->dec); }
+  if (m->pcm != 0) { free(m->pcm); }
+  if (m->tmp != 0) { free(m->tmp); }
+  if (m->idx != 0) { free(m->idx); }
+  m->dec = (AudioMp3Dec*)0;
+  m->pcm = (float32*)0;
+  m->tmp = (float32*)0;
+  m->idx = (int64*)0;
+  m->out = (float32*)0;
+  m->out_frames = 0;
+}
+
+export fn audio_mp3_open(m: AudioMp3*, p: uint8*, n: int64) -> int32 {
+  memset(m, 0, sizeof(AudioMp3));
+  if (p == 0 || n <= 0) { return AUDIO_E_ARG; }
+  var s: int64 = 0;
+  var e: int64 = n;
+  // ID3v2 tags (there may be more than one)
+  for t in 0..16 {
+    if (e - s < 10) { break; }
+    var q: uint8* = p + s;
+    if (!(q[0] == 'I' && q[1] == 'D' && q[2] == '3')) { break; }
+    if (((int32)q[5] & 15) != 0 || ((int32)q[6] & 0x80) != 0 || ((int32)q[7] & 0x80) != 0 ||
+        ((int32)q[8] & 0x80) != 0 || ((int32)q[9] & 0x80) != 0) { break; }
+    var sz: int64 = (((int64)q[6] & 0x7F) << 21) | (((int64)q[7] & 0x7F) << 14) | (((int64)q[8] & 0x7F) << 7) | ((int64)q[9] & 0x7F);
+    sz = sz + 10;
+    if (((int32)q[5] & 16) != 0) { sz = sz + 10; }   // footer
+    if (sz > e - s) { sz = e - s; }
+    s = s + sz;
+  }
+  // ID3v1 (and the extended TAG+ block before it)
+  if (e - s >= 128 && p[e - 128] == 'T' && p[e - 127] == 'A' && p[e - 126] == 'G') {
+    e = e - 128;
+    if (e - s >= 227 && mp3_is(p + e - 227, 'T', 'A', 'G', '+')) { e = e - 227; }
+  }
+  // APEv2: a 32-byte footer whose size counts the items and the footer
+  if (e - s >= 32 && mp3_is(p + e - 32, 'A', 'P', 'E', 'T') && mp3_is(p + e - 28, 'A', 'G', 'E', 'X')) {
+    var tsize: int64 = mp3_le32(p + e - 32 + 12);
+    var tflags: int64 = mp3_le32(p + e - 32 + 20);
+    if (tsize >= 32 && tsize <= e - s) {
+      e = e - tsize;
+      if ((tflags & 0x80000000) != 0 && e - s >= 32) { e = e - 32; }   // header too
+    }
+  }
+  m->p = p;
+  m->n = e;
+
+  var off0: int64 = 0;
+  var size0: int32 = 0;
+  if (!mp3_find(m, s, false, &off0, &size0)) { return AUDIO_E_FORMAT; }
+  var h: uint8* = &m->ref[0];
+  m->spf = audio_mp3_hdr_samples(h);
+  m->nch = audio_mp3_hdr_channels(p + off0);
+  var rate: int32 = audio_mp3_hdr_rate(h);
+
+  var tag: Mp3Tag;
+  mp3_read_tag(m, off0, size0, &tag);
+  m->first = off0;
+  if (tag.found) { m->first = off0 + (int64)size0; }
+
+  // count the frames and keep every 16th offset for seeking
+  var cnt: int64 = 0;
+  var at: int64 = m->first;
+  var off: int64 = 0;
+  var size: int32 = 0;
+  while (mp3_walk(m, at, &off, &size)) {
+    cnt = cnt + 1;
+    at = off + (int64)size;
+  }
+  m->nframes = cnt;
+  m->nidx = cnt / MP3_IDX_STEP + 1;
+  m->idx = (int64*)calloc(m->nidx, 8);
+  m->dec = (AudioMp3Dec*)calloc(1, sizeof(AudioMp3Dec));
+  m->pcm = (float32*)calloc((int64)AUDIO_MP3_MAX_SAMPLES, 4);
+  m->tmp = (float32*)calloc((int64)AUDIO_MP3_MAX_SAMPLES, 4);
+  if (m->idx == 0 || m->dec == 0 || m->pcm == 0 || m->tmp == 0) {
+    audio_mp3_close(m);
+    return AUDIO_E_MEM;
+  }
+  m->idx[0] = m->first;
+  var k: int64 = 0;
+  at = m->first;
+  while (k < cnt && mp3_walk(m, at, &off, &size)) {
+    if (k % MP3_IDX_STEP == 0) { m->idx[k / MP3_IDX_STEP] = off; }
+    k = k + 1;
+    at = off + (int64)size;
+  }
+
+  // trimming
+  var spf: int64 = (int64)m->spf;
+  var total: int64 = cnt * spf;
+  m->start = 0;
+  m->end = total;
+  if (tag.lame) {
+    m->start = tag.delay + 529;
+    if (tag.frames > 0) {
+      var tend: int64 = tag.frames * spf - tag.padding + 529;
+      if (tend < m->end) { m->end = tend; }
+    }
+  }
+  if (m->start > m->end) { m->start = m->end; }
+
+  m->info.channels = m->nch;
+  m->info.rate = rate;
+  m->info.frames = m->end - m->start;
+  m->info.fmt = AUDIO_F32;
+  m->info.bits = 0;
+  m->info.mask = 0;
+  m->pos = m->first;
+  m->fidx = 0;
+  m->skip_to = 0;
+  m->out = m->pcm;
+  m->out_frames = 0;
+  return AUDIO_OK;
+}
+
+export fn audio_mp3_next(m: AudioMp3*) -> int32 {
+  if (m->dec == 0) { return AUDIO_E_ARG; }
+  var spf: int64 = (int64)m->spf;
+  var nch: int32 = m->nch;
+  m->out_frames = 0;
+  while (true) {
+    var fstart: int64 = m->fidx * spf;
+    if (fstart >= m->end || m->fidx >= m->nframes) { return AUDIO_END; }
+    var off: int64 = 0;
+    var size: int32 = 0;
+    if (!mp3_walk(m, m->pos, &off, &size)) {
+      m->nframes = m->fidx;
+      return AUDIO_END;
+    }
+    m->pos = off + (int64)size;
+    m->fidx = m->fidx + 1;
+    var fr: uint8* = m->p + off;
+    var ch: int32 = audio_mp3_hdr_channels(fr);
+    var got: int32 = 0;
+    if (ch == nch) {
+      got = audio_mp3_dec_frame(m->dec, fr, size, m->pcm);
+    } else {
+      got = audio_mp3_dec_frame(m->dec, fr, size, m->tmp);
+      if ((int64)got == spf) {
+        // the channel mode changed inside the stream
+        var t: float32* = m->tmp;
+        var o: float32* = m->pcm;
+        if (nch == 2) {
+          for i in 0..spf {
+            o[2 * i] = t[i];
+            o[2 * i + 1] = t[i];
+          }
+        } else {
+          var half: float32 = 0.5;
+          for i in 0..spf { o[i] = (t[2 * i] + t[2 * i + 1]) * half; }
+        }
+      }
+    }
+    if ((int64)got != spf) { memset(m->pcm, 0, spf * (int64)nch * 4); }
+    var lo: int64 = m->start;
+    if (m->skip_to > lo) { lo = m->skip_to; }
+    var a: int64 = fstart;
+    if (lo > a) { a = lo; }
+    var b: int64 = fstart + spf;
+    if (m->end < b) { b = m->end; }
+    if (b <= a) { continue; }
+    m->out = m->pcm + (a - fstart) * (int64)nch;
+    m->out_frames = (int32)(b - a);
+    return AUDIO_OK;
+  }
+  return AUDIO_END;
+}
+
+// Bytes of main data a Layer III frame adds to the bit reservoir.
+fn mp3_payload(m: AudioMp3*, off: int64, size: int32) -> int64 {
+  var h: uint8* = m->p + off;
+  var v: int64 = (int64)size - 4 - (int64)audio_mp3_hdr_side_bytes(h);
+  if (v < 0) { v = 0; }
+  return v;
+}
+
+export fn audio_mp3_seek(m: AudioMp3*, frame: int64) -> int32 {
+  if (m->dec == 0 || frame < 0) { return AUDIO_E_ARG; }
+  m->out_frames = 0;
+  if (frame >= m->info.frames) {
+    m->fidx = m->nframes;
+    m->pos = m->n;
+    m->skip_to = 0;
+    return AUDIO_OK;
+  }
+  var spf: int64 = (int64)m->spf;
+  var target: int64 = m->start + frame;
+  var fi: int64 = target / spf;
+  // walk to frame fi, remembering the frames just before it
+  var lo: int64 = fi - MP3_SEEK_BACK - 2;
+  if (lo < 0) { lo = 0; }
+  var offs: int64[128];
+  var sizes: int32[128];
+  var f: int64 = (lo / MP3_IDX_STEP) * MP3_IDX_STEP;
+  var at: int64 = m->idx[lo / MP3_IDX_STEP];
+  var off: int64 = 0;
+  var size: int32 = 0;
+  while (f <= fi && mp3_walk(m, at, &off, &size)) {
+    offs[f & 127] = off;
+    sizes[f & 127] = size;
+    at = off + (int64)size;
+    f = f + 1;
+  }
+  if (f <= fi) { fi = f - 1; }
+  if (fi < 0) { fi = 0; }
+  // Start early enough that the frames just before fi have their bit
+  // reservoir (Layer III), and that the IMDCT overlap and the synthesis
+  // filter are full when fi starts: then the samples are the same as
+  // when decoding from the start.
+  var need: int64 = 0;
+  if (audio_mp3_hdr_layer(&m->ref[0]) == 3) {
+    need = 511;
+    if (((int32)m->ref[1] & 0x08) == 0) { need = 255; }
+  }
+  var st: int64 = fi - 2;
+  if (st < lo) { st = lo; }
+  var acc: int64 = 0;
+  while (acc < need && st > lo) {
+    st = st - 1;
+    acc = acc + mp3_payload(m, offs[st & 127], sizes[st & 127]);
+  }
+  audio_mp3_dec_reset(m->dec);
+  if (st >= f) {
+    m->fidx = m->nframes;
+    m->pos = m->n;
+    return AUDIO_OK;
+  }
+  m->fidx = st;
+  m->pos = offs[st & 127];
+  m->skip_to = target;
+  return AUDIO_OK;
+}

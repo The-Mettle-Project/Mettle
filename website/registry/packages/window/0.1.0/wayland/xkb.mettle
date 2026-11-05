@@ -1,0 +1,712 @@
+// wayland/xkb: reads the XKB keymap text a Wayland compositor sends
+// (wl_keyboard.keymap, format xkb_v1) and turns key + modifier state into
+// keysyms. It follows "The X Keyboard Extension: Protocol Specification"
+// (key types, levels, groups) and the keymap text format as libxkbcommon
+// writes it, including the automatic key types for keys with no type.
+//
+// The parser is defensive: any malformed input gives an empty or partial
+// keymap, never a crash.
+import "std/mem";
+import "../core/types.mettle";
+import "../core/keys.mettle";
+
+const KEYSYMS_TXT: string = import_str "keysyms.txt";
+
+// Extended modifier bits: 0..7 are the real modifiers (Shift, Lock, Control,
+// Mod1..Mod5); the virtual ones are kept apart and resolved through the
+// keymap's modifier_map at lookup time.
+const VM_NUMLOCK: int32 = 256;
+const VM_LEVEL3: int32 = 512;
+const VM_ALT: int32 = 1024;
+const VM_SUPER: int32 = 2048;
+const VM_LEVEL5: int32 = 4096;
+
+export struct WindowXkbType {
+  name: uint8[32];
+  name_len: int32;
+  mask: int32;                 // extended modifier bits this type looks at
+  levels: int32;
+  n: int32;
+  emods: int32[16];
+  elevel: int8[16];
+}
+
+export struct WindowXkbKey {
+  syms: int32[8];              // [group * 4 + level]
+  types: int8[2];              // type index per group, -1 = automatic
+  width: int8[2];
+  ngroups: int8;
+}
+
+export struct WindowXkbMap {
+  valid: bool;
+  keys: WindowXkbKey[256];     // by XKB keycode (evdev + 8)
+  types: WindowXkbType[48];
+  ntypes: int32;
+  numlock: int32;              // real modifier bits of the virtual modifiers
+  level3: int32;
+  alt: int32;
+  super: int32;
+  level5: int32;
+}
+
+// ---------- keysym names ----------
+var g_ks_names: int64*;        // offset << 20 | length
+var g_ks_values: int32*;
+var g_ks_count: int64 = 0;
+
+fn ks_load() {
+  if (g_ks_count != 0) { return; }
+  var s: uint8* = KEYSYMS_TXT.chars;
+  var n: int64 = (int64)KEYSYMS_TXT.length;
+  var lines: int64 = 0;
+  for i: int64 in 0..n { if (s[i] == (uint8)10) { lines = lines + 1; } }
+  g_ks_names = (int64*)malloc((lines + 1) * 8);
+  g_ks_values = (int32*)malloc((lines + 1) * 4);
+  var i: int64 = 0;
+  var k: int64 = 0;
+  while (i < n && k < lines) {
+    var a: int64 = i;
+    while (i < n && s[i] != (uint8)32) { i = i + 1; }
+    var nl: int64 = i - a;
+    i = i + 1;
+    var v: int64 = 0;
+    while (i < n && s[i] != (uint8)10) {
+      var c: int64 = (int64)s[i];
+      var d: int64 = 0;
+      if (c >= 48 && c <= 57) { d = c - 48; } else { d = c - 87; }
+      v = v * 16 + d;
+      i = i + 1;
+    }
+    i = i + 1;
+    g_ks_names[k] = (a << 20) | nl;
+    g_ks_values[k] = (int32)v;
+    k = k + 1;
+  }
+  g_ks_count = k;
+}
+
+fn cmp_name(a: uint8*, an: int64, b: uint8*, bn: int64) -> int32 {
+  var m: int64 = an;
+  if (bn < m) { m = bn; }
+  for i: int64 in 0..m {
+    if (a[i] != b[i]) { if (a[i] < b[i]) { return -1; } return 1; }
+  }
+  if (an == bn) { return 0; }
+  if (an < bn) { return -1; }
+  return 1;
+}
+
+/// Keysym for a name ("a", "Return", "U20AC", "0xff0d"); 0 when unknown.
+export fn window_keysym_from_name(s: uint8*, n: int64) -> int64 {
+  if (n <= 0 || n > 64) { return 0; }
+  if (n >= 3 && s[0] == (uint8)48 && (s[1] == (uint8)120 || s[1] == (uint8)88)) {
+    var v: int64 = 0;
+    for i: int64 in 2..n {
+      var c: int64 = (int64)s[i];
+      var d: int64 = -1;
+      if (c >= 48 && c <= 57) { d = c - 48; }
+      if (c >= 97 && c <= 102) { d = c - 87; }
+      if (c >= 65 && c <= 70) { d = c - 55; }
+      if (d < 0 || v > 0x1FFFFFFF) { return 0; }
+      v = v * 16 + d;
+    }
+    return v;
+  }
+  if (n >= 2 && n <= 7 && s[0] == (uint8)85) {
+    var u: int64 = 0;
+    var ok: bool = true;
+    for i: int64 in 1..n {
+      var c2: int64 = (int64)s[i];
+      var d2: int64 = -1;
+      if (c2 >= 48 && c2 <= 57) { d2 = c2 - 48; }
+      if (c2 >= 97 && c2 <= 102) { d2 = c2 - 87; }
+      if (c2 >= 65 && c2 <= 70) { d2 = c2 - 55; }
+      if (d2 < 0) { ok = false; }
+      u = u * 16 + d2;
+    }
+    if (ok && u <= 0x10FFFF) {
+      if ((u >= 0x20 && u <= 0x7E) || (u >= 0xA0 && u <= 0xFF)) { return u; }
+      return 0x01000000 | u;
+    }
+  }
+  if (n == 8 && s[0] == (uint8)78 && s[1] == (uint8)111 && s[2] == (uint8)83) { return 0; }   // NoSymbol
+  ks_load();
+  var lo: int64 = 0;
+  var hi: int64 = g_ks_count - 1;
+  while (lo <= hi) {
+    var mid: int64 = (lo + hi) / 2;
+    var e: int64 = g_ks_names[mid];
+    var c3: int32 = cmp_name(&KEYSYMS_TXT.chars[e >> 20], e & 0xFFFFF, s, n);
+    if (c3 == 0) { return (int64)g_ks_values[mid]; }
+    if (c3 < 0) { lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return 0;
+}
+
+// ---------- tokenizer ----------
+const T_END: int32 = 0;
+const T_IDENT: int32 = 1;      // names, numbers, keysyms
+const T_STRING: int32 = 2;
+const T_KEYNAME: int32 = 3;    // <AE01>
+const T_PUNCT: int32 = 4;
+
+struct Lexer {
+  s: uint8*;
+  n: int64;
+  i: int64;
+  kind: int32;
+  a: int64;                    // token start
+  len: int64;
+  ch: uint8;                   // punctuation character
+}
+
+fn is_ident(c: uint8) -> bool {
+  return (c >= (uint8)48 && c <= (uint8)57) || (c >= (uint8)65 && c <= (uint8)90) || (c >= (uint8)97 && c <= (uint8)122) || c == (uint8)95;
+}
+
+fn next(l: Lexer*) {
+  while (l->i < l->n) {
+    var c: uint8 = l->s[l->i];
+    if (c == (uint8)32 || c == (uint8)9 || c == (uint8)10 || c == (uint8)13) { l->i = l->i + 1; continue; }
+    if (c == (uint8)47 && l->i + 1 < l->n && l->s[l->i + 1] == (uint8)47) {
+      while (l->i < l->n && l->s[l->i] != (uint8)10) { l->i = l->i + 1; }
+      continue;
+    }
+    if (c == (uint8)35) {
+      while (l->i < l->n && l->s[l->i] != (uint8)10) { l->i = l->i + 1; }
+      continue;
+    }
+    break;
+  }
+  if (l->i >= l->n) { l->kind = T_END; l->len = 0; return; }
+  var c2: uint8 = l->s[l->i];
+  if (c2 == (uint8)34) {
+    l->i = l->i + 1;
+    l->a = l->i;
+    while (l->i < l->n && l->s[l->i] != (uint8)34) {
+      if (l->s[l->i] == (uint8)92) { l->i = l->i + 1; }
+      l->i = l->i + 1;
+    }
+    l->len = l->i - l->a;
+    if (l->len < 0) { l->len = 0; }
+    l->i = l->i + 1;
+    l->kind = T_STRING;
+    return;
+  }
+  if (c2 == (uint8)60) {
+    l->i = l->i + 1;
+    l->a = l->i;
+    while (l->i < l->n && l->s[l->i] != (uint8)62 && l->i - l->a < 32) { l->i = l->i + 1; }
+    l->len = l->i - l->a;
+    l->i = l->i + 1;
+    l->kind = T_KEYNAME;
+    return;
+  }
+  if (is_ident(c2)) {
+    l->a = l->i;
+    while (l->i < l->n && is_ident(l->s[l->i])) { l->i = l->i + 1; }
+    l->len = l->i - l->a;
+    l->kind = T_IDENT;
+    return;
+  }
+  l->kind = T_PUNCT;
+  l->ch = c2;
+  l->a = l->i;
+  l->len = 1;
+  l->i = l->i + 1;
+}
+
+fn is_p(l: Lexer*, c: int32) -> bool { return l->kind == T_PUNCT && l->ch == (uint8)c; }
+
+fn word(l: Lexer*, w: string) -> bool {
+  if (l->kind != T_IDENT || l->len != (int64)w.length) { return false; }
+  for i: int64 in 0..l->len {
+    var a: uint8 = l->s[l->a + i];
+    var b: uint8 = w.chars[i];
+    if (a >= (uint8)65 && a <= (uint8)90) { a = a + (uint8)32; }
+    if (b >= (uint8)65 && b <= (uint8)90) { b = b + (uint8)32; }
+    if (a != b) { return false; }
+  }
+  return true;
+}
+
+// Skips to the end of the current statement (';' at this nesting depth).
+fn skip_stmt(l: Lexer*) {
+  var depth: int32 = 0;
+  while (l->kind != T_END) {
+    if (is_p(l, 123) || is_p(l, 91) || is_p(l, 40)) { depth = depth + 1; }
+    if (is_p(l, 125)) {
+      if (depth == 0) { return; }            // the caller's closing brace
+      depth = depth - 1;
+    }
+    if ((is_p(l, 93) || is_p(l, 41)) && depth > 0) { depth = depth - 1; }
+    if (is_p(l, 59) && depth == 0) { next(l); return; }
+    next(l);
+  }
+}
+
+// ---------- key names ----------
+struct KeyNames {
+  names: uint8[4096];          // 16 bytes per keycode 0..255
+  alias_from: uint8[2048];     // up to 128 aliases, 16 bytes each
+  alias_to: uint8[2048];
+  nalias: int32;
+}
+
+fn store_name(dst: uint8*, s: uint8*, n: int64) {
+  var m: int64 = n;
+  if (m > 15) { m = 15; }
+  for i: int64 in 0..m { dst[i] = s[i]; }
+  for i: int64 in m..16 { dst[i] = (uint8)0; }
+}
+
+fn same16(a: uint8*, s: uint8*, n: int64) -> bool {
+  if (n > 15) { return false; }
+  for i: int64 in 0..n { if (a[i] != s[i]) { return false; } }
+  return a[n] == (uint8)0;
+}
+
+fn keycode_of(k: KeyNames*, s: uint8*, n: int64, depth: int32) -> int32 {
+  for c in 0..256 { if (k->names[c * 16] != (uint8)0 && same16(&k->names[c * 16], s, n)) { return (int32)c; } }
+  if (depth > 4) { return -1; }
+  for i in 0..k->nalias {
+    if (same16(&k->alias_from[i * 16], s, n)) {
+      var t: uint8* = &k->alias_to[i * 16];
+      var tl: int64 = 0;
+      while (tl < 15 && t[tl] != (uint8)0) { tl = tl + 1; }
+      return keycode_of(k, t, tl, depth + 1);
+    }
+  }
+  return -1;
+}
+
+fn parse_int(l: Lexer*) -> int64 {
+  if (l->kind != T_IDENT) { return -1; }
+  var v: int64 = 0;
+  for i: int64 in 0..l->len {
+    var c: uint8 = l->s[l->a + i];
+    if (c < (uint8)48 || c > (uint8)57 || v > 100000) { return -1; }
+    v = v * 10 + ((int64)c - 48);
+  }
+  return v;
+}
+
+fn parse_keycodes(l: Lexer*, k: KeyNames*) {
+  // at '{'
+  next(l);
+  while (l->kind != T_END && !is_p(l, 125)) {
+    if (l->kind == T_KEYNAME) {
+      var a: int64 = l->a;
+      var n: int64 = l->len;
+      next(l);
+      if (is_p(l, 61)) {
+        next(l);
+        var code: int64 = parse_int(l);
+        if (code >= 0 && code < 256) { store_name(&k->names[code * 16], &l->s[a], n); }
+      }
+      skip_stmt(l);
+      continue;
+    }
+    if (word(l, "alias")) {
+      next(l);
+      if (l->kind == T_KEYNAME && k->nalias < 128) {
+        var fa: int64 = l->a;
+        var fn_: int64 = l->len;
+        next(l);
+        if (is_p(l, 61)) {
+          next(l);
+          if (l->kind == T_KEYNAME) {
+            store_name(&k->alias_from[k->nalias * 16], &l->s[fa], fn_);
+            store_name(&k->alias_to[k->nalias * 16], &l->s[l->a], l->len);
+            k->nalias = k->nalias + 1;
+          }
+        }
+      }
+      skip_stmt(l);
+      continue;
+    }
+    skip_stmt(l);
+  }
+  next(l);
+}
+
+// ---------- types ----------
+fn mod_bit(l: Lexer*) -> int32 {
+  if (word(l, "Shift")) { return 1; }
+  if (word(l, "Lock")) { return 2; }
+  if (word(l, "Control")) { return 4; }
+  if (word(l, "Mod1")) { return 8; }
+  if (word(l, "Mod2")) { return 16; }
+  if (word(l, "Mod3")) { return 32; }
+  if (word(l, "Mod4")) { return 64; }
+  if (word(l, "Mod5")) { return 128; }
+  if (word(l, "NumLock")) { return VM_NUMLOCK; }
+  if (word(l, "LevelThree")) { return VM_LEVEL3; }
+  if (word(l, "Alt") || word(l, "Meta")) { return VM_ALT; }
+  if (word(l, "Super") || word(l, "Hyper")) { return VM_SUPER; }
+  if (word(l, "LevelFive")) { return VM_LEVEL5; }
+  return 0;
+}
+
+// Reads Shift+Lock+... (or "none") up to a terminator; leaves l on it.
+fn parse_mods(l: Lexer*) -> int32 {
+  var m: int32 = 0;
+  while (l->kind == T_IDENT || is_p(l, 43)) {
+    if (l->kind == T_IDENT) { m = m | mod_bit(l); }
+    next(l);
+  }
+  return m;
+}
+
+fn parse_level(l: Lexer*) -> int32 {
+  if (l->kind != T_IDENT) { return 1; }
+  var s: uint8* = &l->s[l->a];
+  var n: int64 = l->len;
+  var start: int64 = 0;
+  if (n > 5 && (s[0] == (uint8)76 || s[0] == (uint8)108)) { start = 5; }   // "Level"
+  var v: int32 = 0;
+  for i: int64 in start..n {
+    if (s[i] < (uint8)48 || s[i] > (uint8)57) { return 1; }
+    v = v * 10 + ((int32)s[i] - 48);
+  }
+  if (v < 1 || v > 8) { return 1; }
+  return v;
+}
+
+fn parse_type(l: Lexer*, map: WindowXkbMap*) {
+  // at the type's name string
+  if (l->kind != T_STRING || map->ntypes >= 48) { skip_stmt(l); return; }
+  var t: WindowXkbType* = &map->types[map->ntypes];
+  var z: WindowXkbType;
+  *t = z;
+  var n: int64 = l->len;
+  if (n > 31) { n = 31; }
+  for i: int64 in 0..n { t->name[i] = l->s[l->a + i]; }
+  t->name_len = (int32)n;
+  t->levels = 1;
+  next(l);
+  if (!is_p(l, 123)) { skip_stmt(l); return; }
+  next(l);
+  while (l->kind != T_END && !is_p(l, 125)) {
+    if (word(l, "modifiers")) {
+      next(l);
+      if (is_p(l, 61)) { next(l); t->mask = parse_mods(l); }
+      skip_stmt(l);
+      continue;
+    }
+    if (word(l, "map")) {
+      next(l);
+      if (is_p(l, 91)) {
+        next(l);
+        var m: int32 = parse_mods(l);
+        if (is_p(l, 93)) { next(l); }
+        if (is_p(l, 61)) {
+          next(l);
+          var lv: int32 = parse_level(l);
+          if (t->n < 16) {
+            t->emods[t->n] = m;
+            t->elevel[t->n] = (int8)lv;
+            t->n = t->n + 1;
+          }
+          if (lv > t->levels) { t->levels = lv; }
+        }
+      }
+      skip_stmt(l);
+      continue;
+    }
+    skip_stmt(l);
+  }
+  next(l);
+  if (is_p(l, 59)) { next(l); }
+  map->ntypes = map->ntypes + 1;
+}
+
+fn parse_types(l: Lexer*, map: WindowXkbMap*) {
+  next(l);
+  while (l->kind != T_END && !is_p(l, 125)) {
+    if (word(l, "type")) { next(l); parse_type(l, map); continue; }
+    skip_stmt(l);
+  }
+  next(l);
+}
+
+fn find_type(map: WindowXkbMap*, s: uint8*, n: int64) -> int32 {
+  for i in 0..map->ntypes {
+    var t: WindowXkbType* = &map->types[i];
+    if ((int64)t->name_len != n) { continue; }
+    var same: bool = true;
+    for k: int64 in 0..n { if (t->name[k] != s[k]) { same = false; } }
+    if (same) { return (int32)i; }
+  }
+  return -1;
+}
+
+fn find_type_str(map: WindowXkbMap*, name: string) -> int32 { return find_type(map, name.chars, (int64)name.length); }
+
+// ---------- symbols ----------
+fn group_index(l: Lexer*) -> int32 {
+  // [Group1] or [1]
+  if (l->kind != T_IDENT) { return 0; }
+  var s: uint8* = &l->s[l->a];
+  var c: uint8 = s[l->len - 1];
+  if (c >= (uint8)49 && c <= (uint8)50) { return (int32)c - 49; }
+  return 2;
+}
+
+fn parse_sym_list(l: Lexer*, key: WindowXkbKey*, g: int32) {
+  // at '['
+  next(l);
+  var lv: int32 = 0;
+  while (l->kind != T_END && !is_p(l, 93)) {
+    if (l->kind == T_IDENT) {
+      if (g < 2 && lv < 4) { key->syms[g * 4 + lv] = (int32)window_keysym_from_name(&l->s[l->a], l->len); }
+      lv = lv + 1;
+    } else if (is_p(l, 123)) {
+      // { a, b } multi-keysym levels: keep the first
+      next(l);
+      if (l->kind == T_IDENT && g < 2 && lv < 4) { key->syms[g * 4 + lv] = (int32)window_keysym_from_name(&l->s[l->a], l->len); }
+      while (l->kind != T_END && !is_p(l, 125)) { next(l); }
+      lv = lv + 1;
+    }
+    next(l);
+  }
+  if (g < 2) {
+    var w: int32 = lv;
+    if (w > 4) { w = 4; }
+    key->width[g] = (int8)w;
+    if (g + 1 > (int32)key->ngroups) { key->ngroups = (int8)(g + 1); }
+  }
+  next(l);
+}
+
+fn parse_key(l: Lexer*, map: WindowXkbMap*, names: KeyNames*) {
+  // at <NAME>
+  var code: int32 = -1;
+  if (l->kind == T_KEYNAME) { code = keycode_of(names, &l->s[l->a], l->len, 0); }
+  next(l);
+  if (!is_p(l, 123) || code < 0) { skip_stmt(l); return; }
+  var key: WindowXkbKey* = &map->keys[code];
+  var z: WindowXkbKey;
+  *key = z;
+  key->types[0] = (int8)-1; key->types[1] = (int8)-1;
+  next(l);
+  var g: int32 = 0;
+  while (l->kind != T_END && !is_p(l, 125)) {
+    if (is_p(l, 91)) { parse_sym_list(l, key, g); g = g + 1; continue; }
+    if (word(l, "type")) {
+      next(l);
+      var tg: int32 = -1;
+      if (is_p(l, 91)) { next(l); tg = group_index(l); while (l->kind != T_END && !is_p(l, 93)) { next(l); } next(l); }
+      if (is_p(l, 61)) {
+        next(l);
+        if (l->kind == T_STRING) {
+          var ti: int32 = find_type(map, &l->s[l->a], l->len);
+          if (tg < 0) { key->types[0] = (int8)ti; key->types[1] = (int8)ti; }
+          else if (tg < 2) { key->types[tg] = (int8)ti; }
+          next(l);
+        }
+      }
+      if (is_p(l, 44)) { next(l); }
+      continue;
+    }
+    if (word(l, "symbols")) {
+      next(l);
+      var sg: int32 = 0;
+      if (is_p(l, 91)) { next(l); sg = group_index(l); while (l->kind != T_END && !is_p(l, 93)) { next(l); } next(l); }
+      if (is_p(l, 61)) { next(l); if (is_p(l, 91)) { parse_sym_list(l, key, sg); } }
+      if (is_p(l, 44)) { next(l); }
+      continue;
+    }
+    // actions[..] = [ ... ], repeat=, vmods=, overlay..: skip to the next ',' or '}'
+    var depth: int32 = 0;
+    while (l->kind != T_END) {
+      if (is_p(l, 91) || is_p(l, 40) || is_p(l, 123)) { depth = depth + 1; }
+      if (is_p(l, 93) || is_p(l, 41)) { depth = depth - 1; }
+      if (is_p(l, 125)) { if (depth == 0) { break; } depth = depth - 1; }
+      if (is_p(l, 44) && depth == 0) { next(l); break; }
+      next(l);
+    }
+  }
+  next(l);
+  if (is_p(l, 59)) { next(l); }
+}
+
+fn real_mod(l: Lexer*) -> int32 {
+  var b: int32 = mod_bit(l);
+  if (b > 128) { return 0; }
+  return b;
+}
+
+fn parse_modmap(l: Lexer*, map: WindowXkbMap*, names: KeyNames*) {
+  // modifier_map Mod2 { <NMLK>, Num_Lock };
+  var bitv: int32 = real_mod(l);
+  next(l);
+  if (!is_p(l, 123)) { skip_stmt(l); return; }
+  next(l);
+  while (l->kind != T_END && !is_p(l, 125)) {
+    var ks: int64 = 0;
+    if (l->kind == T_KEYNAME) {
+      var code: int32 = keycode_of(names, &l->s[l->a], l->len, 0);
+      if (code >= 0) { ks = (int64)map->keys[code].syms[0]; }
+    } else if (l->kind == T_IDENT) {
+      ks = window_keysym_from_name(&l->s[l->a], l->len);
+    }
+    if (ks == 0xFF7F) { map->numlock = bitv; }
+    if (ks == 0xFE03) { map->level3 = bitv; }
+    if (ks == 0xFE11) { map->level5 = bitv; }
+    if (ks == 0xFFE9 || ks == 0xFFEA) { map->alt = bitv; }
+    if (ks == 0xFFEB || ks == 0xFFEC) { map->super = bitv; }
+    next(l);
+  }
+  skip_stmt(l);
+}
+
+fn parse_symbols(l: Lexer*, map: WindowXkbMap*, names: KeyNames*) {
+  next(l);
+  while (l->kind != T_END && !is_p(l, 125)) {
+    if (word(l, "key")) { next(l); parse_key(l, map, names); continue; }
+    if (word(l, "modifier_map")) { next(l); parse_modmap(l, map, names); continue; }
+    skip_stmt(l);
+  }
+  next(l);
+}
+
+/// Parses keymap text into map. Returns false when it holds no keys.
+export fn window_xkb_parse(text: uint8*, n: int64, map: WindowXkbMap*) -> bool {
+  var z: WindowXkbMap;
+  *map = z;
+  map->numlock = 16; map->level3 = 128; map->alt = 8; map->super = 64; map->level5 = 32;
+  var names: KeyNames* = new KeyNames;
+  var l: Lexer;
+  l.s = text; l.n = n; l.i = 0;
+  next(&l);
+  var guard: int64 = 0;
+  while (l.kind != T_END && guard < 1000000) {
+    guard = guard + 1;
+    if (word(&l, "xkb_keycodes") || word(&l, "xkb_types") || word(&l, "xkb_symbols") || word(&l, "xkb_compatibility") || word(&l, "xkb_compat") || word(&l, "xkb_geometry")) {
+      var which: int32 = 0;
+      if (word(&l, "xkb_keycodes")) { which = 1; }
+      if (word(&l, "xkb_types")) { which = 2; }
+      if (word(&l, "xkb_symbols")) { which = 3; }
+      next(&l);
+      if (l.kind == T_STRING) { next(&l); }
+      if (!is_p(&l, 123)) { continue; }
+      if (which == 1) { parse_keycodes(&l, names); }
+      else if (which == 2) { parse_types(&l, map); }
+      else if (which == 3) { parse_symbols(&l, map, names); }
+      else { skip_stmt(&l); continue; }
+      if (is_p(&l, 59)) { next(&l); }
+      continue;
+    }
+    next(&l);
+  }
+  free(names);
+  var any: bool = false;
+  for c in 0..256 { if (map->keys[c].ngroups > (int8)0) { any = true; } }
+  map->valid = any;
+  return any;
+}
+
+// ---------- lookup ----------
+fn is_lower(ks: int64) -> bool { return (ks >= 97 && ks <= 122) || (ks >= 224 && ks <= 254 && ks != 247); }
+fn is_upper(ks: int64) -> bool { return (ks >= 65 && ks <= 90) || (ks >= 192 && ks <= 222 && ks != 215); }
+fn to_upper(ks: int64) -> int64 {
+  if (is_lower(ks)) { return ks - 32; }
+  if (ks >= 0x01000430 && ks <= 0x0100044F) { return ks - 32; }            // Cyrillic as Unicode keysyms
+  if (ks >= 0x6C0 && ks <= 0x6DF) { return ks + 32; }                      // legacy Cyrillic small -> capital
+  return ks;
+}
+fn is_keypad(ks: int64) -> bool { return ks >= 0xFF80 && ks <= 0xFFBD; }
+fn alpha_pair(a: int64, b: int64) -> bool { return a != 0 && b != 0 && to_upper(a) == b && a != b; }
+
+// The automatic type for a key with no type (xkbcommon's rules).
+fn auto_type(map: WindowXkbMap*, key: WindowXkbKey*, g: int32) -> int32 {
+  var w: int32 = (int32)key->width[g];
+  var s0: int64 = (int64)key->syms[g * 4];
+  var s1: int64 = (int64)key->syms[g * 4 + 1];
+  var s2: int64 = (int64)key->syms[g * 4 + 2];
+  var s3: int64 = (int64)key->syms[g * 4 + 3];
+  if (w <= 1) { return find_type_str(map, "ONE_LEVEL"); }
+  if (w == 2) {
+    if (alpha_pair(s0, s1)) { return find_type_str(map, "ALPHABETIC"); }
+    if (is_keypad(s0) || is_keypad(s1)) { return find_type_str(map, "KEYPAD"); }
+    return find_type_str(map, "TWO_LEVEL");
+  }
+  if (alpha_pair(s0, s1)) {
+    if (alpha_pair(s2, s3)) { return find_type_str(map, "FOUR_LEVEL_ALPHABETIC"); }
+    return find_type_str(map, "FOUR_LEVEL_SEMIALPHABETIC");
+  }
+  if (is_keypad(s0) || is_keypad(s1)) { return find_type_str(map, "FOUR_LEVEL_KEYPAD"); }
+  return find_type_str(map, "FOUR_LEVEL");
+}
+
+// Real modifier state -> extended bits (real bits plus the virtual ones they carry).
+fn extend(map: WindowXkbMap*, mods: int32) -> int32 {
+  var e: int32 = mods & 255;
+  if ((mods & map->numlock) != 0) { e = e | VM_NUMLOCK; }
+  if ((mods & map->level3) != 0) { e = e | VM_LEVEL3; }
+  if ((mods & map->alt) != 0) { e = e | VM_ALT; }
+  if ((mods & map->super) != 0) { e = e | VM_SUPER; }
+  if ((mods & map->level5) != 0) { e = e | VM_LEVEL5; }
+  return e;
+}
+
+// A type's mask in extended bits: a virtual bit also covers its real bit.
+fn type_level(map: WindowXkbMap*, ti: int32, ext: int32, fallback_width: int32) -> int32 {
+  if (ti < 0 || ti >= map->ntypes) {
+    // No such type in the keymap: Shift picks level 2, AltGr levels 3 and 4.
+    var lv: int32 = 1;
+    if ((ext & 1) != 0 && fallback_width >= 2) { lv = 2; }
+    if ((ext & VM_LEVEL3) != 0 && fallback_width >= 3) { lv = lv + 2; }
+    return lv;
+  }
+  var t: WindowXkbType* = &map->types[ti];
+  var masked: int32 = ext & t->mask;
+  for i in 0..t->n {
+    if (t->emods[i] == masked) { return (int32)t->elevel[i]; }
+  }
+  return 1;
+}
+
+/// The keysym of XKB keycode kc with real modifier state mods and group.
+export fn window_xkb_keysym(map: WindowXkbMap*, kc: int64, mods: int32, group: int32) -> int64 {
+  if (!map->valid || kc < 0 || kc > 255) { return 0; }
+  var key: WindowXkbKey* = &map->keys[kc];
+  if (key->ngroups <= (int8)0) { return 0; }
+  var g: int32 = group;
+  if (g < 0 || g >= (int32)key->ngroups || g > 1) { g = 0; }
+  var ti: int32 = (int32)key->types[g];
+  if (ti < 0) { ti = auto_type(map, key, g); }
+  var ext: int32 = extend(map, mods);
+  var lv: int32 = type_level(map, ti, ext, (int32)key->width[g]);
+  if (lv < 1 || lv > 4) { lv = 1; }
+  var ks: int64 = (int64)key->syms[g * 4 + lv - 1];
+  if (ks == 0 && lv > 1) { ks = (int64)key->syms[g * 4]; }
+  // Caps Lock capitalizes when the key's type did not use Lock.
+  var lock_used: bool = ti >= 0 && ti < map->ntypes && (map->types[ti].mask & 2) != 0;
+  if ((mods & 2) != 0 && !lock_used) { ks = to_upper(ks); }
+  return ks;
+}
+
+/// The keysym with no modifiers in the given group (the key's "base" name).
+export fn window_xkb_base(map: WindowXkbMap*, kc: int64, group: int32) -> int64 {
+  if (!map->valid || kc < 0 || kc > 255) { return 0; }
+  var key: WindowXkbKey* = &map->keys[kc];
+  var g: int32 = group;
+  if (g < 0 || g >= (int32)key->ngroups || g > 1) { g = 0; }
+  return (int64)key->syms[g * 4];
+}
+
+/// WINDOW_MOD_* bits from real modifier state.
+export fn window_xkb_mods(map: WindowXkbMap*, mods: int32) -> int32 {
+  var m: int32 = 0;
+  if ((mods & 1) != 0) { m = m | WINDOW_MOD_SHIFT; }
+  if ((mods & 2) != 0) { m = m | WINDOW_MOD_CAPS_LOCK; }
+  if ((mods & 4) != 0) { m = m | WINDOW_MOD_CTRL; }
+  if ((mods & map->alt) != 0) { m = m | WINDOW_MOD_ALT; }
+  if ((mods & map->super) != 0) { m = m | WINDOW_MOD_SUPER; }
+  if ((mods & map->numlock) != 0) { m = m | WINDOW_MOD_NUM_LOCK; }
+  if ((mods & map->level3) != 0) { m = m | WINDOW_MOD_ALTGR; }
+  return m;
+}

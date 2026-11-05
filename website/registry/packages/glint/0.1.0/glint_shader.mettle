@@ -1,0 +1,738 @@
+// Shaders: compile from strings or files with #include, clear errors with file
+// and line, programs that rebuild when their files change, cached uniform
+// locations and setters, listing active uniforms and attributes, SPIR-V
+// shaders, separable programs and program pipelines.
+import "std/io";
+import "std/mem";
+import "glint_types";
+import "glint_gl";
+import "glint_common";
+
+// ---- a growing byte buffer ----
+
+struct ShBuf { p: uint8*; n: int64; cap: int64; }
+
+fn buf_put(b: ShBuf*, src: uint8*, n: int64) {
+  if (b->n + n + 1 > b->cap) {
+    var c: int64 = b->cap * 2;
+    if (c < 256) { c = 256; }
+    while (c < b->n + n + 1) { c = c * 2; }
+    // malloc + copy, not realloc: the v0.17.0 Windows runtime's realloc gave 0 here
+    var q: uint8* = (uint8*)malloc(c);
+    for i in 0..b->n { q[i] = b->p[i]; }
+    if (b->p != 0) { free((rawptr)b->p); }
+    b->p = q;
+    b->cap = c;
+  }
+  for i in 0..n { b->p[b->n + i] = src[i]; }
+  b->n = b->n + n;
+  b->p[b->n] = 0;
+}
+
+fn buf_str(b: ShBuf*, s: string) { buf_put(b, s.chars, (int64)s.length); }
+
+fn buf_cstr(b: ShBuf*, c: cstring) {
+  var n: int64 = 0;
+  while (c[n] != 0) { n += 1; }
+  buf_put(b, (uint8*)c, n);
+}
+
+fn buf_int(b: ShBuf*, v: int64) {
+  var tmp: uint8[24];
+  var n: int32 = 0;
+  var x: int64 = v;
+  if (x == 0) { tmp[0] = (uint8)48; n = 1; }
+  while (x > 0) { tmp[n] = (uint8)(48 + (int32)(x % 10)); x = x / 10; n += 1; }
+  var out: uint8[24];
+  for i in 0..n { out[i] = tmp[n - 1 - i]; }
+  buf_put(b, &out[0], (int64)n);
+}
+
+fn buf_free(b: ShBuf*) {
+  if (b->p != 0) { free((rawptr)b->p); }
+  b->p = 0; b->n = 0; b->cap = 0;
+}
+
+fn cstr_dup(c: cstring) -> cstring {
+  var n: int64 = 0;
+  while (c[n] != 0) { n += 1; }
+  var o: uint8* = (uint8*)malloc(n + 1);
+  for i in 0..(n + 1) { o[i] = c[i]; }
+  return (cstring)o;
+}
+
+fn str_dup(s: string) -> cstring {
+  var n: int64 = (int64)s.length;
+  var o: uint8* = (uint8*)malloc(n + 1);
+  for i in 0..n { o[i] = (uint8)s[i]; }
+  o[n] = 0;
+  return (cstring)o;
+}
+
+fn cstr_eq(a: cstring, b: cstring) -> bool {
+  var i: int64 = 0;
+  while (a[i] != 0 && a[i] == b[i]) { i += 1; }
+  return a[i] == b[i];
+}
+
+// Read a whole file. Returns 0 if it can't be read.
+export fn glint_read_file(path: cstring, out_len: int64*) -> uint8* {
+  var f: cstring = fopen(path, "rb");
+  if (f == 0) { return (uint8*)0; }
+  var cap: int64 = 4096;
+  var len: int64 = 0;
+  var buf: uint8* = (uint8*)malloc(cap + 1);
+  while (true) {
+    if (len == cap) {
+      var bigger: uint8* = (uint8*)malloc(cap * 2 + 1);
+      memcpy((rawptr)bigger, (rawptr)buf, len);
+      free((rawptr)buf);
+      buf = bigger;
+      cap = cap * 2;
+    }
+    var n: int64 = fread((cstring)(buf + len), 1, cap - len, f);
+    if (n <= 0) { break; }
+    len = len + n;
+  }
+  fclose(f);
+  buf[len] = 0;
+  *out_len = len;
+  return buf;
+}
+
+// ---- #include ----
+
+// The files one shader was made from; the index is the GLSL source-string
+// number used in #line, so error lines can name the file.
+struct ShFiles { names: cstring[32]; count: int32; }
+
+fn files_add(f: ShFiles*, name: cstring) -> int32 {
+  if (f->count >= 32) { return 31; }
+  f->names[f->count] = cstr_dup(name);
+  f->count += 1;
+  return f->count - 1;
+}
+
+fn files_free(f: ShFiles*) {
+  for i in 0..f->count { free((rawptr)f->names[i]); }
+  f->count = 0;
+}
+
+// `name` relative to the folder of `from` (or as it is when absolute or from is 0).
+fn join_path(from: cstring, name: uint8*, n: int64) -> cstring {
+  var b: ShBuf = { p: (uint8*)0, n: 0, cap: 0 };
+  var absolute: bool = n > 0 && (name[0] == (uint8)47 || name[0] == (uint8)92 || (n > 1 && name[1] == (uint8)58));
+  if (from != 0 && !absolute) {
+    var cut: int64 = -1;
+    var i: int64 = 0;
+    while (from[i] != 0) {
+      if (from[i] == (uint8)47 || from[i] == (uint8)92) { cut = i; }
+      i += 1;
+    }
+    if (cut >= 0) { buf_put(&b, (uint8*)from, cut + 1); }
+  }
+  buf_put(&b, name, n);
+  return (cstring)b.p;
+}
+
+fn is_space(c: uint8) -> bool { return c == (uint8)32 || c == (uint8)9; }
+
+// Copy text into b, replacing each `#include "file"` line with that file.
+fn expand(b: ShBuf*, files: ShFiles*, text: uint8*, len: int64, idx: int32, path: cstring, depth: int32) -> bool {
+  var i: int64 = 0;
+  var line: int64 = 1;
+  while (i < len) {
+    var e: int64 = i;
+    while (e < len && text[e] != (uint8)10) { e += 1; }
+    var k: int64 = i;
+    while (k < e && is_space(text[k])) { k += 1; }
+    var inc: bool = e - k > 8 && text[k] == (uint8)35;     // '#'
+    var word: string = "include";
+    if (inc) {
+      var m: int64 = k + 1;
+      while (m < e && is_space(text[m])) { m += 1; }
+      for w in 0..7 { if (m + w >= e || text[m + w] != (uint8)word[w]) { inc = false; } }
+      k = m + 7;
+    }
+    if (inc) {
+      while (k < e && is_space(text[k])) { k += 1; }
+      var q: uint8 = text[k];
+      var close: uint8 = (uint8)34;                           // '"'
+      if (q == (uint8)60) { close = (uint8)62; }              // <file>
+      var s: int64 = k + 1;
+      var t: int64 = s;
+      while (t < e && text[t] != close) { t += 1; }
+      if ((q != (uint8)34 && q != (uint8)60) || t >= e) {
+        glint_internal_fail("bad #include in ");
+        glint_internal_fail_more(files->names[idx]);
+        return false;
+      }
+      if (depth >= 16) { glint_internal_fail("#include nested more than 16 deep at "); glint_internal_fail_more(files->names[idx]); return false; }
+      var full: cstring = join_path(path, text + s, t - s);
+      var n: int64 = 0;
+      var data: uint8* = glint_read_file(full, &n);
+      if (data == 0) {
+        glint_internal_fail("cannot read ");
+        glint_internal_fail_more(full);
+        glint_internal_fail_more(", included from ");
+        glint_internal_fail_more(files->names[idx]);
+        free((rawptr)full);
+        return false;
+      }
+      var sub: int32 = files_add(files, full);
+      buf_str(b, "#line 1 "); buf_int(b, (int64)sub); buf_str(b, "\n");
+      var ok: bool = expand(b, files, data, n, sub, full, depth + 1);
+      free((rawptr)data);
+      free((rawptr)full);
+      if (!ok) { return false; }
+      buf_str(b, "\n#line "); buf_int(b, line + 1); buf_str(b, " "); buf_int(b, (int64)idx); buf_str(b, "\n");
+    } else {
+      buf_put(b, text + i, e - i);
+      buf_str(b, "\n");
+    }
+    i = e + 1;
+    line += 1;
+  }
+  return true;
+}
+
+// Rewrite driver log lines "0:12(5): error" (Mesa), "0(12) : error" (NVIDIA)
+// and "ERROR: 0:12: ..." into "file:12: error".
+fn fix_log(log: cstring, files: ShFiles*) {
+  var b: ShBuf = { p: (uint8*)0, n: 0, cap: 0 };
+  var i: int64 = 0;
+  while (log[i] != 0) {
+    var e: int64 = i;
+    while (log[e] != 0 && log[e] != (uint8)10) { e += 1; }
+    var k: int64 = i;
+    var pre: int64 = k;
+    if (log[k] == (uint8)69 || log[k] == (uint8)87) {          // "ERROR: " / "WARNING: "
+      while (k < e && log[k] != (uint8)32) { k += 1; }
+      k += 1;
+    }
+    var src: int64 = 0;
+    var d: int64 = k;
+    while (d < e && log[d] >= (uint8)48 && log[d] <= (uint8)57) { src = src * 10 + (int64)(log[d] - (uint8)48); d += 1; }
+    var done: bool = false;
+    if (d > k && d < e && (log[d] == (uint8)58 || log[d] == (uint8)40)) {
+      var ln: int64 = 0;
+      var m: int64 = d + 1;
+      while (m < e && log[m] >= (uint8)48 && log[m] <= (uint8)57) { ln = ln * 10 + (int64)(log[m] - (uint8)48); m += 1; }
+      if (m > d + 1 && src < (int64)files->count) {
+        // skip what follows the line number: "(5): ", ") : ", ": "
+        while (m < e && (log[m] == (uint8)41 || log[m] == (uint8)40 || (log[m] >= (uint8)48 && log[m] <= (uint8)57))) { m += 1; }
+        while (m < e && (log[m] == (uint8)58 || log[m] == (uint8)32)) { m += 1; }
+        buf_cstr(&b, files->names[src]);
+        buf_str(&b, ":"); buf_int(&b, ln); buf_str(&b, ": ");
+        if (k > pre) { buf_put(&b, (uint8*)log + pre, k - pre); }
+        buf_put(&b, (uint8*)log + m, e - m);
+        done = true;
+      }
+    }
+    if (!done) { buf_put(&b, (uint8*)log + i, e - i); }
+    if (log[e] == (uint8)10) { buf_str(&b, "\n"); e += 1; }
+    i = e;
+  }
+  if (b.p != 0) { glint_internal_fail_more((cstring)b.p); }
+  buf_free(&b);
+}
+
+fn stage_name(kind: uint32) -> string {
+  if (kind == GL_VERTEX_SHADER) { return "vertex"; }
+  if (kind == GL_FRAGMENT_SHADER) { return "fragment"; }
+  if (kind == GL_GEOMETRY_SHADER) { return "geometry"; }
+  if (kind == GL_TESS_CONTROL_SHADER) { return "tessellation control"; }
+  if (kind == GL_TESS_EVALUATION_SHADER) { return "tessellation evaluation"; }
+  if (kind == GL_COMPUTE_SHADER) { return "compute"; }
+  return "unknown";
+}
+
+// Expand includes, compile, and on failure put a readable log in glint_error().
+// `files` keeps every file read (for hot reload).
+fn compile_text(kind: uint32, text: uint8*, len: int64, name: cstring, path: cstring, files: ShFiles*) -> uint32 {
+  var b: ShBuf = { p: (uint8*)0, n: 0, cap: 0 };
+  var idx: int32 = files_add(files, name);
+  if (!expand(&b, files, text, len, idx, path, 0)) { buf_free(&b); return 0; }
+  var s: uint32 = glCreateShader(kind);
+  var srcs: cstring[1];
+  var lens: int32[1];
+  srcs[0] = (cstring)b.p;
+  lens[0] = (int32)b.n;
+  glShaderSource(s, 1, &srcs[0], &lens[0]);
+  glCompileShader(s);
+  buf_free(&b);
+  var ok: int32 = 0;
+  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+  if (ok == 0) {
+    var n: int32 = 0;
+    glGetShaderiv(s, GL_INFO_LOG_LENGTH, &n);
+    var log: uint8* = (uint8*)malloc((int64)n + 1);
+    var got: int32 = 0;
+    glGetShaderInfoLog(s, n, &got, log);
+    log[got] = 0;
+    glint_internal_fail("");
+    glint_internal_fail_more((cstring)str_dup(stage_name(kind)));
+    glint_internal_fail_more(" shader did not compile:\n");
+    fix_log((cstring)log, files);
+    free((rawptr)log);
+    glDeleteShader(s);
+    return 0;
+  }
+  return s;
+}
+
+// Compile one shader from a string. `src` may #include files (relative to the
+// current folder). Returns 0 on failure; glint_error() has the log with file
+// names and lines.
+export fn glint_shader(kind: uint32, src: string) -> uint32 {
+  var files: ShFiles;
+  files.count = 0;
+  var s: uint32 = compile_text(kind, src.chars, (int64)src.length, "<string>", (cstring)0, &files);
+  files_free(&files);
+  return s;
+}
+
+// Compile one shader from a file. #include paths are relative to that file.
+export fn glint_shader_file(kind: uint32, path: string) -> uint32 {
+  var files: ShFiles;
+  files.count = 0;
+  var p: cstring = str_dup(path);
+  var n: int64 = 0;
+  var data: uint8* = glint_read_file(p, &n);
+  var s: uint32 = 0;
+  if (data == 0) { glint_internal_fail("cannot read "); glint_internal_fail_more(p); }
+  else { s = compile_text(kind, data, n, p, p, &files); free((rawptr)data); }
+  free((rawptr)p);
+  files_free(&files);
+  return s;
+}
+
+// A shader from SPIR-V (GL 4.6 or GL_ARB_gl_spirv): glShaderBinary, then
+// glSpecializeShader with `entry` (usually "main"). Returns 0 on failure.
+export fn glint_shader_spirv(kind: uint32, data: uint8*, len: int64, entry: cstring) -> uint32 {
+  var bin: fn(int32, uint32*, uint32, rawptr, int32) -> void = glShaderBinary;
+  var spec: fn(uint32, cstring, uint32, uint32*, uint32*) -> void = glSpecializeShader;
+  if (spec == 0) { spec = (fn(uint32, cstring, uint32, uint32*, uint32*) -> void)glint_getproc("glSpecializeShaderARB"); }
+  var maj: int32 = 0;
+  var min: int32 = 0;
+  glGetIntegerv(GL_MAJOR_VERSION, &maj);
+  glGetIntegerv(GL_MINOR_VERSION, &min);
+  if (bin == 0 || spec == 0 || (maj * 10 + min < 46 && !glint_has_ext("GL_ARB_gl_spirv"))) {
+    glint_internal_fail("SPIR-V shaders need GL 4.6 or GL_ARB_gl_spirv");
+    return 0;
+  }
+  var s: uint32 = glCreateShader(kind);
+  bin(1, &s, GL_SHADER_BINARY_FORMAT_SPIR_V, (rawptr)data, (int32)len);
+  spec(s, entry, 0, (uint32*)0, (uint32*)0);
+  var ok: int32 = 0;
+  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+  if (ok == 0) {
+    var log: uint8[2048];
+    var n: int32 = 0;
+    glGetShaderInfoLog(s, 2047, &n, &log[0]);
+    log[n] = 0;
+    glint_internal_fail("SPIR-V shader did not specialize: ");
+    glint_internal_fail_more((cstring)&log[0]);
+    glDeleteShader(s);
+    return 0;
+  }
+  return s;
+}
+
+export fn glint_shader_spirv_file(kind: uint32, path: string, entry: cstring) -> uint32 {
+  var p: cstring = str_dup(path);
+  var n: int64 = 0;
+  var data: uint8* = glint_read_file(p, &n);
+  var s: uint32 = 0;
+  if (data == 0) { glint_internal_fail("cannot read "); glint_internal_fail_more(p); }
+  else { s = glint_shader_spirv(kind, data, n, entry); free((rawptr)data); }
+  free((rawptr)p);
+  return s;
+}
+
+// Link compiled shaders into a program. separable: for program pipelines.
+// The shaders are deleted. Returns 0 on failure (log in glint_error()).
+export fn glint_link(shaders: uint32*, n: int32, separable: bool) -> uint32 {
+  var p: uint32 = glCreateProgram();
+  if (separable) { glProgramParameteri(p, GL_PROGRAM_SEPARABLE, 1); }
+  for i in 0..n { glAttachShader(p, shaders[i]); }
+  glLinkProgram(p);
+  for i in 0..n { glDetachShader(p, shaders[i]); glDeleteShader(shaders[i]); }
+  var ok: int32 = 0;
+  glGetProgramiv(p, GL_LINK_STATUS, &ok);
+  if (ok == 0) {
+    var len: int32 = 0;
+    glGetProgramiv(p, GL_INFO_LOG_LENGTH, &len);
+    var log: uint8* = (uint8*)malloc((int64)len + 1);
+    var got: int32 = 0;
+    glGetProgramInfoLog(p, len, &got, log);
+    log[got] = 0;
+    glint_internal_fail("program did not link:\n");
+    glint_internal_fail_more((cstring)log);
+    free((rawptr)log);
+    glDeleteProgram(p);
+    return 0;
+  }
+  return p;
+}
+
+// Compile and link a vertex + fragment program from strings. 0 on failure.
+export fn glint_program(vs_src: string, fs_src: string) -> uint32 {
+  var sh: uint32[2];
+  sh[0] = glint_shader(GL_VERTEX_SHADER, vs_src);
+  if (sh[0] == 0) { return 0; }
+  sh[1] = glint_shader(GL_FRAGMENT_SHADER, fs_src);
+  if (sh[1] == 0) { glDeleteShader(sh[0]); return 0; }
+  return glint_link(&sh[0], 2, false);
+}
+
+// The same from two files.
+export fn glint_program_files(vs_path: string, fs_path: string) -> uint32 {
+  var sh: uint32[2];
+  sh[0] = glint_shader_file(GL_VERTEX_SHADER, vs_path);
+  if (sh[0] == 0) { return 0; }
+  sh[1] = glint_shader_file(GL_FRAGMENT_SHADER, fs_path);
+  if (sh[1] == 0) { glDeleteShader(sh[0]); return 0; }
+  return glint_link(&sh[0], 2, false);
+}
+
+// ---- programs that know their sources ----
+
+// A program built from stages you add. It remembers where each stage came
+// from, so glint_program_reload can rebuild it when a file changes, and it
+// caches uniform locations. Make one with glint_program_new.
+export struct GlintProgram {
+  id: uint32;               // the GL program; 0 until a build works
+  version: int32;           // goes up by one on every successful build
+  separable: bool;          // set before building, for program pipelines
+  nstages: int32;
+  kinds: uint32[6];
+  spirv: bool[6];
+  paths: cstring[6];        // file stages (0 for string stages)
+  texts: cstring[6];        // string stages (a copy)
+  entries: cstring[6];      // SPIR-V entry points
+  files: cstring[64];       // every file the last build read, with its time
+  mtimes: int64[64];
+  nfiles: int32;
+  uhash: uint64[64];        // uniform location cache
+  uloc: int32[64];
+  nu: int32;
+}
+
+export fn glint_program_new() -> GlintProgram* { return new GlintProgram; }
+
+fn add_stage(p: GlintProgram*, kind: uint32) -> int32 {
+  if (p->nstages >= 6) { return -1; }
+  var i: int32 = p->nstages;
+  p->kinds[i] = kind;
+  p->nstages += 1;
+  return i;
+}
+
+// Add a stage from a file (GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, ...).
+export fn glint_program_add_file(p: GlintProgram*, kind: uint32, path: string) {
+  var i: int32 = add_stage(p, kind);
+  if (i >= 0) { p->paths[i] = str_dup(path); }
+}
+
+// Add a stage from a string (copied).
+export fn glint_program_add_source(p: GlintProgram*, kind: uint32, src: string) {
+  var i: int32 = add_stage(p, kind);
+  if (i >= 0) { p->texts[i] = str_dup(src); }
+}
+
+// Add a stage from a SPIR-V file, with its entry point (usually "main").
+export fn glint_program_add_spirv(p: GlintProgram*, kind: uint32, path: string, entry: string) {
+  var i: int32 = add_stage(p, kind);
+  if (i >= 0) { p->paths[i] = str_dup(path); p->spirv[i] = true; p->entries[i] = str_dup(entry); }
+}
+
+fn note_file(p: GlintProgram*, name: cstring) {
+  for i in 0..p->nfiles { if (cstr_eq(p->files[i], name)) { return; } }
+  if (p->nfiles >= 64) { return; }
+  p->files[p->nfiles] = cstr_dup(name);
+  p->mtimes[p->nfiles] = glint_internal_mtime(name);
+  p->nfiles += 1;
+}
+
+fn forget_files(p: GlintProgram*) {
+  for i in 0..p->nfiles { free((rawptr)p->files[i]); }
+  p->nfiles = 0;
+}
+
+// Compile and link every stage. On success the old program (if any) is
+// replaced; on failure it is kept and glint_error() says what went wrong.
+export fn glint_program_build(p: GlintProgram*) -> bool {
+  forget_files(p);
+  var sh: uint32[6];
+  var ok: bool = p->nstages > 0;
+  if (!ok) { glint_internal_fail("the program has no stages"); }
+  var n: int32 = 0;
+  for i in 0..p->nstages {
+    if (ok) {
+      var files: ShFiles;
+  files.count = 0;
+      var s: uint32 = 0;
+      if (p->spirv[i]) {
+        note_file(p, p->paths[i]);
+        var len: int64 = 0;
+        var data: uint8* = glint_read_file(p->paths[i], &len);
+        if (data == 0) { glint_internal_fail("cannot read "); glint_internal_fail_more(p->paths[i]); }
+        else { s = glint_shader_spirv(p->kinds[i], data, len, p->entries[i]); free((rawptr)data); }
+      } else if (p->paths[i] != 0) {
+        note_file(p, p->paths[i]);
+        var len: int64 = 0;
+        var data: uint8* = glint_read_file(p->paths[i], &len);
+        if (data == 0) { glint_internal_fail("cannot read "); glint_internal_fail_more(p->paths[i]); }
+        else { s = compile_text(p->kinds[i], data, len, p->paths[i], p->paths[i], &files); free((rawptr)data); }
+      } else {
+        var t: cstring = p->texts[i];
+        var len: int64 = 0;
+        while (t[len] != 0) { len += 1; }
+        s = compile_text(p->kinds[i], (uint8*)t, len, "<string>", (cstring)0, &files);
+      }
+      for f in 1..files.count { note_file(p, files.names[f]); }   // included files
+      files_free(&files);
+      if (s == 0) { ok = false; } else { sh[n] = s; n += 1; }
+    }
+  }
+  if (!ok) {
+    for i in 0..n { glDeleteShader(sh[i]); }
+    return false;
+  }
+  var id: uint32 = glint_link(&sh[0], n, p->separable);
+  if (id == 0) { return false; }
+  if (p->id != 0) { glDeleteProgram(p->id); }
+  p->id = id;
+  p->version += 1;
+  p->nu = 0;                    // locations may have moved
+  return true;
+}
+
+// Rebuild if any file the program was made from changed (includes too).
+// Returns 1 if it rebuilt, 0 if nothing changed, -1 if the rebuild failed
+// (the old program stays in use; glint_error() has the log). Cheap enough to
+// call every frame.
+export fn glint_program_reload(p: GlintProgram*) -> int32 {
+  var changed: bool = false;
+  for i in 0..p->nfiles {
+    if (glint_internal_mtime(p->files[i]) != p->mtimes[i]) { changed = true; }
+  }
+  if (!changed) { return 0; }
+  if (glint_program_build(p)) { return 1; }
+  return -1;
+}
+
+export fn glint_program_use(p: GlintProgram*) { glUseProgram(p->id); }
+
+export fn glint_program_free(p: GlintProgram*) {
+  if (p->id != 0) { glDeleteProgram(p->id); }
+  for i in 0..p->nstages {
+    if (p->paths[i] != 0) { free((rawptr)p->paths[i]); }
+    if (p->texts[i] != 0) { free((rawptr)p->texts[i]); }
+    if (p->entries[i] != 0) { free((rawptr)p->entries[i]); }
+  }
+  forget_files(p);
+  free((rawptr)p);
+}
+
+// ---- uniforms ----
+
+// glGetUniformLocation, for plain program ids.
+export fn glint_uniform(prog: uint32, name: cstring) -> int32 { return glGetUniformLocation(prog, name); }
+
+fn name_hash(s: string) -> uint64 {
+  var h: uint64 = 14695981039346656037;
+  for i in 0..(int64)s.length {
+    h = h ^ (uint64)(uint8)s[i];
+    h = h * 1099511628211;
+  }
+  return h;
+}
+
+// A uniform's location, cached after the first look-up. -1 if the program has
+// no such active uniform (unused uniforms are removed by the compiler).
+export fn glint_loc(p: GlintProgram*, name: string) -> int32 {
+  var h: uint64 = name_hash(name);
+  for i in 0..p->nu { if (p->uhash[i] == h) { return p->uloc[i]; } }
+  var c: cstring = str_dup(name);
+  var loc: int32 = glGetUniformLocation(p->id, c);
+  free((rawptr)c);
+  var at: int32 = p->nu;
+  if (at >= 64) { at = (int32)(h % 64); } else { p->nu += 1; }
+  p->uhash[at] = h;
+  p->uloc[at] = loc;
+  return loc;
+}
+
+// The setters return false when the uniform is not there. With GL 4.1 they
+// set it without binding the program; before that they make it current.
+fn direct() -> bool { return glProgramUniform1i != 0; }
+
+export fn glint_set_int(p: GlintProgram*, name: string, v: int32) -> bool {
+  var l: int32 = glint_loc(p, name);
+  if (l < 0) { return false; }
+  if (direct()) { glProgramUniform1i(p->id, l, v); } else { glUseProgram(p->id); glUniform1i(l, v); }
+  return true;
+}
+
+// Point a sampler uniform at a texture unit (0 = GL_TEXTURE0).
+export fn glint_set_sampler(p: GlintProgram*, name: string, unit: int32) -> bool { return glint_set_int(p, name, unit); }
+
+export fn glint_set_float(p: GlintProgram*, name: string, v: float32) -> bool {
+  var l: int32 = glint_loc(p, name);
+  if (l < 0) { return false; }
+  if (direct()) { glProgramUniform1f(p->id, l, v); } else { glUseProgram(p->id); glUniform1f(l, v); }
+  return true;
+}
+
+export fn glint_set_vec2(p: GlintProgram*, name: string, x: float32, y: float32) -> bool {
+  var l: int32 = glint_loc(p, name);
+  if (l < 0) { return false; }
+  if (direct()) { glProgramUniform2f(p->id, l, x, y); } else { glUseProgram(p->id); glUniform2f(l, x, y); }
+  return true;
+}
+
+export fn glint_set_vec3(p: GlintProgram*, name: string, x: float32, y: float32, z: float32) -> bool {
+  var l: int32 = glint_loc(p, name);
+  if (l < 0) { return false; }
+  if (direct()) { glProgramUniform3f(p->id, l, x, y, z); } else { glUseProgram(p->id); glUniform3f(l, x, y, z); }
+  return true;
+}
+
+export fn glint_set_vec4(p: GlintProgram*, name: string, x: float32, y: float32, z: float32, w: float32) -> bool {
+  var l: int32 = glint_loc(p, name);
+  if (l < 0) { return false; }
+  if (direct()) { glProgramUniform4f(p->id, l, x, y, z, w); } else { glUseProgram(p->id); glUniform4f(l, x, y, z, w); }
+  return true;
+}
+
+// m is 9 floats, column by column.
+export fn glint_set_mat3(p: GlintProgram*, name: string, m: float32*) -> bool {
+  var l: int32 = glint_loc(p, name);
+  if (l < 0) { return false; }
+  if (direct()) { glProgramUniformMatrix3fv(p->id, l, 1, (uint8)0, m); } else { glUseProgram(p->id); glUniformMatrix3fv(l, 1, (uint8)0, m); }
+  return true;
+}
+
+// m is 16 floats, column by column (a GlintMat4: &m.m[0]).
+export fn glint_set_mat4(p: GlintProgram*, name: string, m: float32*) -> bool {
+  var l: int32 = glint_loc(p, name);
+  if (l < 0) { return false; }
+  if (direct()) { glProgramUniformMatrix4fv(p->id, l, 1, (uint8)0, m); } else { glUseProgram(p->id); glUniformMatrix4fv(l, 1, (uint8)0, m); }
+  return true;
+}
+
+// ---- listing what a program uses ----
+
+export fn glint_uniform_count(prog: uint32) -> int32 {
+  var n: int32 = 0;
+  glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &n);
+  return n;
+}
+
+// Active uniform i: its name (into name, cap bytes), GL type and array size.
+// Returns its location (-1 for uniforms in a block).
+export fn glint_uniform_info(prog: uint32, i: int32, name: uint8*, cap: int32, kind: uint32*, size: int32*) -> int32 {
+  var len: int32 = 0;
+  glGetActiveUniform(prog, (uint32)i, cap, &len, size, kind, name);
+  return glGetUniformLocation(prog, (cstring)name);
+}
+
+export fn glint_attrib_count(prog: uint32) -> int32 {
+  var n: int32 = 0;
+  glGetProgramiv(prog, GL_ACTIVE_ATTRIBUTES, &n);
+  return n;
+}
+
+// Active vertex attribute i, like glint_uniform_info. Returns its location.
+export fn glint_attrib_info(prog: uint32, i: int32, name: uint8*, cap: int32, kind: uint32*, size: int32*) -> int32 {
+  var len: int32 = 0;
+  glGetActiveAttrib(prog, (uint32)i, cap, &len, size, kind, name);
+  return glGetAttribLocation(prog, (cstring)name);
+}
+
+// The GLSL name of a GL type from glint_uniform_info: "vec3", "mat4", "sampler2D".
+export fn glint_glsl_type(kind: uint32) -> string {
+  switch ((int32)kind) {
+    case 5126: { return "float"; }
+    case 35664: { return "vec2"; }
+    case 35665: { return "vec3"; }
+    case 35666: { return "vec4"; }
+    case 5124: { return "int"; }
+    case 35667: { return "ivec2"; }
+    case 35668: { return "ivec3"; }
+    case 35669: { return "ivec4"; }
+    case 5125: { return "uint"; }
+    case 36294: { return "uvec2"; }
+    case 36295: { return "uvec3"; }
+    case 36296: { return "uvec4"; }
+    case 35670: { return "bool"; }
+    case 35674: { return "mat2"; }
+    case 35675: { return "mat3"; }
+    case 35676: { return "mat4"; }
+    case 5130: { return "double"; }
+    case 35678: { return "sampler2D"; }
+    case 35679: { return "sampler3D"; }
+    case 35680: { return "samplerCube"; }
+    case 35682: { return "sampler2DShadow"; }
+    case 36289: { return "sampler2DArray"; }
+    case 37128: { return "sampler2DMS"; }
+    case 36298: { return "isampler2D"; }
+    case 36306: { return "usampler2D"; }
+    case 36941: { return "image2D"; }
+    default: { return "other"; }
+  }
+  return "other";
+}
+
+// Print a program's active attributes and uniforms, one per line.
+export fn glint_program_print(prog: uint32) {
+  var name: uint8[256];
+  var kind: uint32 = 0;
+  var size: int32 = 0;
+  var na: int32 = glint_attrib_count(prog);
+  for i in 0..na {
+    var l: int32 = glint_attrib_info(prog, i, &name[0], 256, &kind, &size);
+    print("attribute {l} {glint_glsl_type(kind)} ");
+    print_cstr((cstring)&name[0]);
+    println("");
+  }
+  var nu: int32 = glint_uniform_count(prog);
+  for i in 0..nu {
+    var l: int32 = glint_uniform_info(prog, i, &name[0], 256, &kind, &size);
+    print("uniform {l} {glint_glsl_type(kind)} ");
+    print_cstr((cstring)&name[0]);
+    if (size > 1) { print("[{size}]"); }
+    println("");
+  }
+}
+
+// ---- program pipelines (GL 4.1) ----
+
+// A pipeline that takes its vertex stage from vs_prog and its fragment stage
+// from fs_prog (both built separable). Bind it with glBindProgramPipeline,
+// with no program in use (glUseProgram(0)). Returns the pipeline name.
+export fn glint_pipeline(vs_prog: uint32, fs_prog: uint32) -> uint32 {
+  var pp: uint32 = 0;
+  glGenProgramPipelines(1, &pp);
+  glUseProgramStages(pp, GL_VERTEX_SHADER_BIT, vs_prog);
+  glUseProgramStages(pp, GL_FRAGMENT_SHADER_BIT, fs_prog);
+  return pp;
+}
+
+// Check that the pipeline's stages fit together. False (log in glint_error())
+// if not. Call it with the vertex array you will draw with bound.
+export fn glint_pipeline_check(pp: uint32) -> bool {
+  glValidateProgramPipeline(pp);
+  var ok: int32 = 0;
+  glGetProgramPipelineiv(pp, GL_VALIDATE_STATUS, &ok);
+  if (ok != 0) { return true; }
+  var log: uint8[2048];
+  var n: int32 = 0;
+  glGetProgramPipelineInfoLog(pp, 2047, &n, &log[0]);
+  log[n] = 0;
+  glint_internal_fail("program pipeline is not valid: ");
+  glint_internal_fail_more((cstring)&log[0]);
+  return false;
+}

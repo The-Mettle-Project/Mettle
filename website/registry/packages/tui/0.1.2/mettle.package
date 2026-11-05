@@ -1,0 +1,7 @@
+name = tui
+version = 0.1.2
+description = Terminal user interfaces in pure Mettle: raw mode, diff rendering, input, layout, widgets, charts
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Tui
+compiler = 0.18.0
+platforms = linux

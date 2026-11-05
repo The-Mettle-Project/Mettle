@@ -1,0 +1,196 @@
+// mythic_dl: display-list builders, device px (DECISIONS §6, Appendix A/D).
+// Clip index 0 is always the whole screen (set by mythic_dl_clear).
+import "mythic_types";
+
+fn top_clip(dl: MythicDrawList*) -> int32 {
+  if (dl->clip_stack.len == 0) { return 0; }
+  return dl->clip_stack.data[dl->clip_stack.len - 1];
+}
+
+/// Appends a zeroed command of `kind` bound to the current clip and returns it.
+export fn mythic_dl_cmd(dl: MythicDrawList*, kind: int32) -> MythicCmd* {
+  var c: MythicCmd;
+  var p: MythicCmd* = mythic_vec_push<MythicCmd>(&dl->cmds, c);
+  p->kind = kind;
+  p->clip = top_clip(dl);
+  return p;
+}
+
+fn set_shape(p: MythicCmd*, r: MythicRect, radii: MythicCorners) {
+  p->x = r.x; p->y = r.y; p->w = r.w; p->h = r.h;
+  p->radii = radii;
+}
+
+export fn mythic_dl_clear(dl: MythicDrawList*, w: int32, h: int32) {
+  mythic_vec_clear<MythicCmd>(&dl->cmds);
+  mythic_vec_clear<MythicClip>(&dl->clips);
+  mythic_vec_clear<int32>(&dl->clip_stack);
+  mythic_vec_clear<MythicGlyphPos>(&dl->glyphs);
+  mythic_vec_clear<MythicVec2>(&dl->points);
+  dl->width = w;
+  dl->height = h;
+  var c: MythicClip = { x: 0.0, y: 0.0, w: (float32)w, h: (float32)h, radius: 0.0 };
+  mythic_vec_push<MythicClip>(&dl->clips, c);
+  mythic_vec_push<int32>(&dl->clip_stack, 0);
+}
+
+// Rounded clips. A clip entry with radius >= 0 is a "head": its rect is the hard clip (the
+// intersection with every ancestor) and its radius rounds that rect. Entries with radius < 0
+// directly before a head are "links" of that head: rounded rects (radius = -stored - 1) that
+// also mask everything drawn under the head (the requested rect when the intersection cut it,
+// and rounded ancestors whose corners reach into the head's rect). The renderer walks the
+// links backwards from the head (mythic_dl_clip_shape_count/mythic_dl_clip_shape).
+
+fn corner_hits(c: MythicClip, r: float32, x0: float32, y0: float32, x1: float32, y1: float32) -> bool {
+  if (r <= 0.0) { return false; }
+  var cx1: float32 = c.x + c.w; var cy1: float32 = c.y + c.h;
+  var inx: bool = x0 < c.x + r || x1 > cx1 - r;
+  var iny: bool = y0 < c.y + r || y1 > cy1 - r;
+  return inx && iny;
+}
+
+fn push_link(dl: MythicDrawList*, c: MythicClip, r: float32) {
+  var l: MythicClip = { x: c.x, y: c.y, w: c.w, h: c.h, radius: -r - 1.0 };
+  mythic_vec_push<MythicClip>(&dl->clips, l);
+}
+
+/// Intersects `r` with the current clip and makes it current. A `radius` > 0 rounds the clip:
+/// fills, strokes, text, images, paths and shadows inside are all masked by it (and by any
+/// rounded ancestor clip whose corners reach into it).
+export fn mythic_dl_push_clip(dl: MythicDrawList*, r: MythicRect, radius: float32) {
+  if (dl->clips.len == 0) { mythic_dl_clear(dl, dl->width, dl->height); }
+  var pi: int32 = top_clip(dl);
+  var cur: MythicClip = dl->clips.data[pi];
+  var x0: float32 = mythic_maxf(r.x, cur.x);
+  var y0: float32 = mythic_maxf(r.y, cur.y);
+  var x1: float32 = mythic_minf(r.x + r.w, cur.x + cur.w);
+  var y1: float32 = mythic_minf(r.y + r.h, cur.y + cur.h);
+  if (x1 < x0) { x1 = x0; }
+  if (y1 < y0) { y1 = y0; }
+  // rounded ancestors whose corners reach into the new rect
+  if (cur.radius > 0.0 && corner_hits(cur, cur.radius, x0, y0, x1, y1)) { push_link(dl, cur, cur.radius); }
+  var k: int32 = pi - 1;
+  while (k >= 1 && dl->clips.data[k].radius < 0.0) {
+    var lc: MythicClip = dl->clips.data[k];
+    var lr: float32 = -lc.radius - 1.0;
+    if (corner_hits(lc, lr, x0, y0, x1, y1)) { push_link(dl, lc, lr); }
+    k = k - 1;
+  }
+  var rad: float32 = mythic_maxf(radius, 0.0);
+  var cut: bool = x0 != r.x || y0 != r.y || x1 != r.x + r.w || y1 != r.y + r.h;
+  if (rad > 0.0 && cut) {
+    var orig: MythicClip = { x: r.x, y: r.y, w: r.w, h: r.h, radius: 0.0 };
+    if (corner_hits(orig, rad, x0, y0, x1, y1)) { push_link(dl, orig, rad); }
+    rad = 0.0;
+  }
+  var c: MythicClip = { x: x0, y: y0, w: x1 - x0, h: y1 - y0, radius: rad };
+  mythic_vec_push<MythicClip>(&dl->clips, c);
+  mythic_vec_push<int32>(&dl->clip_stack, (int32)(dl->clips.len - 1));
+}
+
+/// Number of rounded shapes masking clip `ci` (0 = a plain rectangle clip).
+export fn mythic_dl_clip_shape_count(dl: MythicDrawList*, ci: int32) -> int32 {
+  var n: int32 = 0;
+  if (dl->clips.data[ci].radius > 0.0) { n = 1; }
+  var k: int32 = ci - 1;
+  while (k >= 1 && dl->clips.data[k].radius < 0.0) { n = n + 1; k = k - 1; }
+  return n;
+}
+
+/// The i-th rounded shape masking clip `ci` (radius is the real radius, > 0).
+export fn mythic_dl_clip_shape(dl: MythicDrawList*, ci: int32, i: int32) -> MythicClip {
+  var k: int32 = ci;
+  var j: int32 = i;
+  if (dl->clips.data[ci].radius > 0.0) {
+    if (j == 0) { return dl->clips.data[ci]; }
+    j = j - 1;
+  }
+  var c: MythicClip = dl->clips.data[ci - 1 - j];
+  c.radius = -c.radius - 1.0;
+  return c;
+}
+
+export fn mythic_dl_pop_clip(dl: MythicDrawList*) {
+  if (dl->clip_stack.len > 1) { dl->clip_stack.len = dl->clip_stack.len - 1; }
+}
+
+export fn mythic_dl_fill(dl: MythicDrawList*, r: MythicRect, radii: MythicCorners, color: uint32) {
+  if ((color >> (uint32)24) == (uint32)0 || r.w <= 0.0 || r.h <= 0.0) { return; }
+  var p: MythicCmd* = mythic_dl_cmd(dl, MYTHIC_CMD_FILL);
+  set_shape(p, r, radii);
+  p->color = color;
+}
+
+/// Inside stroke of the rounded rect (the border lies within `r`).
+export fn mythic_dl_stroke(dl: MythicDrawList*, r: MythicRect, radii: MythicCorners, width: float32, color: uint32) {
+  if ((color >> (uint32)24) == (uint32)0 || r.w <= 0.0 || r.h <= 0.0 || width <= 0.0) { return; }
+  var p: MythicCmd* = mythic_dl_cmd(dl, MYTHIC_CMD_STROKE);
+  set_shape(p, r, radii);
+  p->color = color;
+  p->a = width;
+}
+
+export fn mythic_dl_shadow(dl: MythicDrawList*, r: MythicRect, radii: MythicCorners, s: MythicShadow) {
+  if ((s.color >> (uint32)24) == (uint32)0) { return; }
+  var p: MythicCmd* = mythic_dl_cmd(dl, MYTHIC_CMD_SHADOW);
+  set_shape(p, r, radii);
+  p->color = s.color;
+  p->a = s.dx; p->b = s.dy; p->c = s.blur; p->d = s.spread;
+}
+
+export fn mythic_dl_gradient(dl: MythicDrawList*, r: MythicRect, radii: MythicCorners, p0: MythicVec2, p1: MythicVec2, c0: uint32, c1: uint32) {
+  var p: MythicCmd* = mythic_dl_cmd(dl, MYTHIC_CMD_GRADIENT);
+  set_shape(p, r, radii);
+  p->color = c0; p->color2 = c1;
+  p->a = p0.x; p->b = p0.y; p->c = p1.x; p->d = p1.y;
+}
+
+export fn mythic_dl_image(dl: MythicDrawList*, r: MythicRect, radii: MythicCorners, image: int32, opacity: float32) {
+  var p: MythicCmd* = mythic_dl_cmd(dl, MYTHIC_CMD_IMAGE);
+  set_shape(p, r, radii);
+  p->color = 0xFFFFFFFF;
+  p->a = opacity; p->b = 0.0; p->c = 0.0; p->d = 1.0; p->e = 1.0;
+  p->res = image;
+}
+
+fn path_cmd(dl: MythicDrawList*, kind: int32, pts: MythicVec2*, n: int32, pad: float32) -> MythicCmd* {
+  var p: MythicCmd* = mythic_dl_cmd(dl, kind);
+  p->first = (int32)dl->points.len;
+  p->count = n;
+  var x0: float32 = 1.0e9; var y0: float32 = 1.0e9; var x1: float32 = -1.0e9; var y1: float32 = -1.0e9;
+  for i: int32 in 0..n {
+    var v: MythicVec2 = pts[i];
+    mythic_vec_push<MythicVec2>(&dl->points, v);
+    if (v.x < x0) { x0 = v.x; } if (v.x > x1) { x1 = v.x; }
+    if (v.y < y0) { y0 = v.y; } if (v.y > y1) { y1 = v.y; }
+  }
+  if (n == 0) { x0 = 0.0; y0 = 0.0; x1 = 0.0; y1 = 0.0; }
+  p->x = x0 - pad; p->y = y0 - pad; p->w = x1 - x0 + 2.0 * pad; p->h = y1 - y0 + 2.0 * pad;
+  return p;
+}
+
+export fn mythic_dl_path_fill(dl: MythicDrawList*, pts: MythicVec2*, n: int32, color: uint32) {
+  if (n < 3) { return; }
+  var p: MythicCmd* = path_cmd(dl, MYTHIC_CMD_PATH_FILL, pts, n, 0.0);
+  p->color = color;
+}
+
+export fn mythic_dl_path_stroke(dl: MythicDrawList*, pts: MythicVec2*, n: int32, width: float32, color: uint32, closed: bool, draw_len: float32) {
+  if (n < 2) { return; }
+  var p: MythicCmd* = path_cmd(dl, MYTHIC_CMD_PATH_STROKE, pts, n, width * 0.5);
+  p->color = color;
+  p->a = width;
+  p->b = draw_len;
+  if (closed) { p->res = 1; }
+}
+
+/// Writes n+1 points of the circular arc centered (cx, cy), radius r, from angle a0 to a1
+/// (radians, y down) into out[0..n]. Returns n + 1. Use with mythic_dl_path_stroke/_fill.
+export fn mythic_path_arc(out: MythicVec2*, n: int32, cx: float32, cy: float32, r: float32, a0: float32, a1: float32) -> int32 {
+  for i: int32 in 0..n + 1 {
+    var t: float32 = a0 + (a1 - a0) * (float32)i / (float32)n;
+    out[i].x = cx + r * mythic_cosf(t);
+    out[i].y = cy + r * mythic_sinf(t);
+  }
+  return n + 1;
+}

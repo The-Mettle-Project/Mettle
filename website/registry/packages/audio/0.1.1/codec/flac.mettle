@@ -1,0 +1,601 @@
+// FLAC decoder (RFC 9639).
+//
+// Reads native FLAC streams: all block sizes, 1 to 8 channels, 4 to 32
+// bits per sample (a side channel of 32-bit audio needs 33 bits, which is
+// not read), fixed and LPC subframes up to order 32, both Rice codings and
+// escaped partitions. Every frame header is checked with its CRC-8 and every
+// frame with its CRC-16; a bad frame is skipped and the decoder finds the
+// next one. Seeking is sample exact, with the seek table when the file has
+// one and a byte-position search when it does not.
+//
+// The fast paths follow dr_flac and libFLAC: Rice codes read straight from
+// a 64-bit bit cache, and the predictor loops written out for each fixed
+// order.
+
+import "std/mem";
+import "../core/status";
+import "../core/bits";
+import "../core/pcm";
+import "../core/md5";
+
+const FLAC_MAX_BLOCK = 65535;
+
+export struct AudioFlacSeekPoint {
+  sample: int64;
+  off: int64;       // from the first frame
+}
+
+export struct AudioFlac {
+  info: AudioInfo;
+  out: float32*;        // always 0: FLAC gives integers
+  outi: int32*;         // interleaved full-scale int32 of the last block
+  out_frames: int32;
+  md5: uint8[16];       // the MD5 of the decoded samples, from STREAMINFO
+  min_block: int32;
+  max_block: int32;
+  max_frame: int64;
+  p: uint8*;
+  n: int64;
+  first: int64;         // offset of the first frame
+  pos: int64;           // offset of the next frame
+  ch: int32*[8];        // per-channel samples of the last frame
+  cap: int32;           // samples each ch buffer holds
+  skip: int32;          // samples to drop from the next frame (after a seek)
+  seek: AudioFlacSeekPoint*;
+  nseek: int32;
+  bad_frames: int64;    // frames skipped for bad CRCs
+}
+
+struct FlacHdr {
+  off: int64;
+  size: int32;          // header bytes
+  block: int32;
+  rate: int32;
+  chans: int32;
+  assign: int32;        // 0-7 independent, 8 left/side, 9 side/right, 10 mid/side
+  bps: int32;
+  sample: int64;        // first sample number
+}
+
+const FLAC_RATES: int32[12] = [0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000];
+const FLAC_BPS: int32[8] = [0, 8, 12, 0, 16, 20, 24, 32];
+
+// Parses and checks the frame header at off.
+fn flac_hdr(d: AudioFlac*, off: int64, h: FlacHdr*) -> bool {
+  if (off < 0 || d->n - off < 6) { return false; }
+  var q: uint8* = d->p + off;
+  if (q[0] != 0xFF || (q[1] & 0xFE) != 0xF8) { return false; }
+  var var_block: bool = (q[1] & 1) != 0;
+  var bsc: int32 = (int32)(q[2] >> 4);
+  var rc: int32 = (int32)(q[2] & 15);
+  var ac: int32 = (int32)(q[3] >> 4);
+  var sc: int32 = (int32)((q[3] >> 1) & 7);
+  if ((q[3] & 1) != 0 || bsc == 0 || rc == 15 || ac > 10 || sc == 3) { return false; }
+  // the frame or sample number, coded like UTF-8 with up to 7 bytes
+  var at: int64 = 4;
+  var c0: int64 = (int64)q[4];
+  var num: int64 = 0;
+  var extra: int32 = 0;
+  if (c0 < 0x80) { num = c0; }
+  else if (c0 >= 0xC0 && c0 < 0xE0) { num = c0 & 0x1F; extra = 1; }
+  else if (c0 >= 0xE0 && c0 < 0xF0) { num = c0 & 0x0F; extra = 2; }
+  else if (c0 >= 0xF0 && c0 < 0xF8) { num = c0 & 0x07; extra = 3; }
+  else if (c0 >= 0xF8 && c0 < 0xFC) { num = c0 & 0x03; extra = 4; }
+  else if (c0 >= 0xFC && c0 < 0xFE) { num = c0 & 0x01; extra = 5; }
+  else if (c0 == 0xFE) { num = 0; extra = 6; }
+  else { return false; }
+  if (d->n - off < at + 1 + (int64)extra + 3) { return false; }
+  at = at + 1;
+  for i in 0..extra {
+    var c: int64 = (int64)q[at];
+    if ((c & 0xC0) != 0x80) { return false; }
+    num = (num << 6) | (c & 0x3F);
+    at = at + 1;
+  }
+  var block: int32 = 0;
+  if (bsc == 1) { block = 192; }
+  else if (bsc <= 5) { block = 576 << (bsc - 2); }
+  else if (bsc == 6) { block = (int32)q[at] + 1; at = at + 1; }
+  else if (bsc == 7) { block = (((int32)q[at] << 8) | (int32)q[at + 1]) + 1; at = at + 2; }
+  else { block = 256 << (bsc - 8); }
+  var rate: int32 = d->info.rate;
+  if (rc >= 1 && rc <= 11) { rate = FLAC_RATES[rc]; }
+  else if (rc == 12) { rate = (int32)q[at] * 1000; at = at + 1; }
+  else if (rc == 13) { rate = ((int32)q[at] << 8) | (int32)q[at + 1]; at = at + 2; }
+  else if (rc == 14) { rate = (((int32)q[at] << 8) | (int32)q[at + 1]) * 10; at = at + 2; }
+  if (d->n - off < at + 1) { return false; }
+  var crc: uint32 = audio_crc8(0, q, at);
+  if (crc != (uint32)q[at]) { return false; }
+  var bps: int32 = d->info.bits;
+  if (sc != 0) { bps = FLAC_BPS[sc]; }
+  var chans: int32 = ac + 1;
+  if (ac >= 8) { chans = 2; }
+  // a frame must match the stream
+  if (chans != d->info.channels || bps != d->info.bits) { return false; }
+  if (block > d->cap) { return false; }
+  h->off = off;
+  h->size = (int32)at + 1;
+  h->block = block;
+  h->rate = rate;
+  h->chans = chans;
+  h->assign = ac;
+  h->bps = bps;
+  if (var_block) { h->sample = num; }
+  else { h->sample = num * (int64)d->min_block; }
+  return true;
+}
+
+// Finds the next frame header at or after off. Returns its offset or -1.
+fn flac_find(d: AudioFlac*, off: int64, h: FlacHdr*) -> int64 {
+  var at: int64 = off;
+  if (at < d->first) { at = d->first; }
+  while (d->n - at >= 6) {
+    if (d->p[at] == 0xFF && (d->p[at + 1] & 0xFE) == 0xF8) {
+      if (flac_hdr(d, at, h)) { return at; }
+    }
+    at = at + 1;
+  }
+  return -1;
+}
+
+var g_lz8: uint8[256];
+var g_lz8_ready: bool = false;
+
+fn flac_lz8_init() {
+  for i in 0..256 {
+    var z: int32 = 8;
+    var v: int32 = (int32)i;
+    while (v != 0) { z = z - 1; v = v >> 1; }
+    g_lz8[i] = (uint8)z;
+  }
+  g_lz8_ready = true;
+}
+
+// Reads n Rice-coded residuals with parameter k into r. The common case
+// (a short unary part) is read straight from the bit cache.
+fn flac_rice(b: AudioBits*, r: int32*, n: int32, k: int32) {
+  var cache: uint64 = b->cache;
+  var cnt: int32 = b->cnt;
+  var i: int32 = 0;
+  while (i < n) {
+    if (cnt < 40) {
+      b->cache = cache;
+      b->cnt = cnt;
+      audio_bits_fill(b);
+      cache = b->cache;
+      cnt = b->cnt;
+    }
+    var top: int32 = (int32)(cache >> 56);
+    if (top != 0) {
+      var lz: int32 = (int32)g_lz8[top];
+      var need: int32 = lz + 1 + k;
+      if (need <= cnt) {
+        var c2: uint64 = cache << (lz + 1);
+        var v: uint32 = (uint32)lz;
+        if (k > 0) {
+          v = (v << k) | (uint32)(c2 >> (64 - k));
+          c2 = c2 << k;
+        }
+        cache = c2;
+        cnt = cnt - need;
+        r[i] = (int32)(v >> 1) ^ -(int32)(v & 1);
+        i = i + 1;
+        continue;
+      }
+    }
+    b->cache = cache;
+    b->cnt = cnt;
+    var hi: uint32 = (uint32)audio_bits_unary(b, 1 << 20);
+    var v: uint32 = (hi << k) | audio_bits_get(b, k);
+    r[i] = (int32)(v >> 1) ^ -(int32)(v & 1);
+    cache = b->cache;
+    cnt = b->cnt;
+    i = i + 1;
+  }
+  b->cache = cache;
+  b->cnt = cnt;
+}
+
+// Reads the residual of a subframe into r[order .. block].
+fn flac_residual(b: AudioBits*, r: int32*, block: int32, order: int32) -> bool {
+  var coding: int32 = (int32)audio_bits_get(b, 2);
+  if (coding > 1) { return false; }
+  var pbits: int32 = 4;
+  var esc: int32 = 15;
+  if (coding == 1) { pbits = 5; esc = 31; }
+  var porder: int32 = (int32)audio_bits_get(b, 4);
+  var parts: int32 = 1 << porder;
+  if ((block & (parts - 1)) != 0) { return false; }
+  var per: int32 = block >> porder;
+  if (per < order) { return false; }
+  var at: int32 = order;
+  for p in 0..parts {
+    var cnt: int32 = per;
+    if (p == 0) { cnt = per - order; }
+    var k: int32 = (int32)audio_bits_get(b, pbits);
+    if (k == esc) {
+      var raw: int32 = (int32)audio_bits_get(b, 5);
+      if (raw == 0) {
+        for i in 0..cnt { r[at + (int32)i] = 0; }
+      } else {
+        for i in 0..cnt { r[at + (int32)i] = audio_bits_sget(b, raw); }
+      }
+    } else {
+      flac_rice(b, r + at, cnt, k);
+    }
+    at = at + cnt;
+    if (audio_bits_bad(b)) { return false; }
+  }
+  return true;
+}
+
+fn flac_fixed(s: int32*, block: int32, order: int32) {
+  if (order == 1) {
+    for i in 1..block { s[i] = s[i] + s[i - 1]; }
+  } else if (order == 2) {
+    for i in 2..block { s[i] = s[i] + 2 * s[i - 1] - s[i - 2]; }
+  } else if (order == 3) {
+    for i in 3..block { s[i] = s[i] + 3 * s[i - 1] - 3 * s[i - 2] + s[i - 3]; }
+  } else if (order == 4) {
+    for i in 4..block { s[i] = s[i] + 4 * s[i - 1] - 6 * s[i - 2] + 4 * s[i - 3] - s[i - 4]; }
+  }
+}
+
+fn flac_lpc(s: int32*, block: int32, order: int32, c: int32*, shift: int32) {
+  if (order == 8) {
+    var c0: int64 = (int64)c[0]; var c1: int64 = (int64)c[1]; var c2: int64 = (int64)c[2]; var c3: int64 = (int64)c[3];
+    var c4: int64 = (int64)c[4]; var c5: int64 = (int64)c[5]; var c6: int64 = (int64)c[6]; var c7: int64 = (int64)c[7];
+    for i in 8..block {
+      var sum: int64 = c0 * (int64)s[i - 1] + c1 * (int64)s[i - 2] + c2 * (int64)s[i - 3] + c3 * (int64)s[i - 4] +
+        c4 * (int64)s[i - 5] + c5 * (int64)s[i - 6] + c6 * (int64)s[i - 7] + c7 * (int64)s[i - 8];
+      s[i] = s[i] + (int32)(sum >> shift);
+    }
+    return;
+  }
+  for i in order..block {
+    var sum: int64 = 0;
+    for j in 0..order { sum = sum + (int64)c[j] * (int64)s[i - 1 - (int32)j]; }
+    s[i] = s[i] + (int32)(sum >> shift);
+  }
+}
+
+// Decodes one subframe of `bps` bits into s.
+fn flac_subframe(b: AudioBits*, s: int32*, block: int32, bps0: int32) -> bool {
+  if (audio_bits_get(b, 1) != 0) { return false; }
+  var t: int32 = (int32)audio_bits_get(b, 6);
+  var wasted: int32 = 0;
+  if (audio_bits_get(b, 1) != 0) { wasted = audio_bits_unary(b, 32) + 1; }
+  var bps: int32 = bps0 - wasted;
+  if (bps < 1 || bps > 32) { return false; }
+  if (t == 0) {
+    var v: int32 = audio_bits_sget(b, bps);
+    for i in 0..block { s[i] = v; }
+  } else if (t == 1) {
+    for i in 0..block { s[i] = audio_bits_sget(b, bps); }
+  } else if (t >= 8 && t <= 12) {
+    var order: int32 = t - 8;
+    if (order > block) { return false; }
+    for i in 0..order { s[i] = audio_bits_sget(b, bps); }
+    if (!flac_residual(b, s, block, order)) { return false; }
+    flac_fixed(s, block, order);
+  } else if (t >= 32) {
+    var order: int32 = t - 31;
+    if (order > block) { return false; }
+    for i in 0..order { s[i] = audio_bits_sget(b, bps); }
+    var prec: int32 = (int32)audio_bits_get(b, 4) + 1;
+    if (prec == 16) { return false; }
+    var shift: int32 = audio_bits_sget(b, 5);
+    if (shift < 0) { return false; }
+    var c: int32[32];
+    for i in 0..order { c[i] = audio_bits_sget(b, prec); }
+    if (!flac_residual(b, s, block, order)) { return false; }
+    flac_lpc(s, block, order, &c[0], shift);
+  } else {
+    return false;
+  }
+  if (wasted > 0) {
+    for i in 0..block { s[i] = s[i] << wasted; }
+  }
+  return !audio_bits_bad(b);
+}
+
+// Decodes the frame whose header is h. Sets d->pos past it.
+fn flac_frame(d: AudioFlac*, h: FlacHdr*) -> bool {
+  var b: AudioBits;
+  audio_bits_init(&b, d->p + h->off + (int64)h->size, d->n - h->off - (int64)h->size);
+  var block: int32 = h->block;
+  for c in 0..h->chans {
+    var bps: int32 = h->bps;
+    // the side channel has one more bit
+    if ((h->assign == 8 && c == 1) || (h->assign == 9 && c == 0) || (h->assign == 10 && c == 1)) { bps = bps + 1; }
+    if (bps > 32) { return false; }
+    if (!flac_subframe(&b, d->ch[c], block, bps)) { return false; }
+  }
+  audio_bits_align(&b);
+  var end: int64 = h->off + (int64)h->size + audio_bits_byte(&b);
+  if (d->n - end < 2) { return false; }
+  var want: uint32 = ((uint32)d->p[end] << 8) | (uint32)d->p[end + 1];
+  if (audio_crc16(0, d->p + h->off, end - h->off) != want) { return false; }
+  d->pos = end + 2;
+  var l: int32* = d->ch[0];
+  var r: int32* = d->ch[1];
+  if (h->assign == 8) {
+    for i in 0..block { r[i] = l[i] - r[i]; }
+  } else if (h->assign == 9) {
+    for i in 0..block { l[i] = l[i] + r[i]; }
+  } else if (h->assign == 10) {
+    for i in 0..block {
+      var side: int32 = r[i];
+      var mid: int32 = (l[i] << 1) | (side & 1);
+      l[i] = (mid + side) >> 1;
+      r[i] = (mid - side) >> 1;
+    }
+  }
+  return true;
+}
+
+/// Reads the headers of a FLAC stream in memory.
+export fn audio_flac_open(d: AudioFlac*, p: uint8*, n: int64) -> int32 {
+  memset(d, 0, sizeof(AudioFlac));
+  if (!g_lz8_ready) { flac_lz8_init(); }
+  d->p = p;
+  d->n = n;
+  if (n < 0) { d->n = 0; }
+  var r: AudioRd;
+  audio_rd_init(&r, p, d->n);
+  // an ID3v2 tag in front is not allowed by the spec, but common
+  if (audio_rd_is(&r, "ID3") && d->n >= 10) {
+    var sz: int64 = ((int64)(p[6] & 127) << 21) | ((int64)(p[7] & 127) << 14) | ((int64)(p[8] & 127) << 7) | (int64)(p[9] & 127);
+    audio_rd_skip(&r, 10 + sz);
+  }
+  if (!audio_rd_is(&r, "fLaC")) { return AUDIO_E_FORMAT; }
+  audio_rd_skip(&r, 4);
+  var have_info: bool = false;
+  var last: bool = false;
+  while (!last) {
+    var hb: int64 = audio_rd_u8(&r);
+    last = (hb & 0x80) != 0;
+    var kind: int64 = hb & 0x7F;
+    var len: int64 = audio_rd_u24be(&r);
+    if (r.bad || len > audio_rd_left(&r)) { return AUDIO_E_TRUNC; }
+    var body: int64 = r.pos;
+    if (kind == 0) {
+      if (len < 34) { return AUDIO_E_DATA; }
+      d->min_block = (int32)audio_rd_u16be(&r);
+      d->max_block = (int32)audio_rd_u16be(&r);
+      audio_rd_skip(&r, 3);
+      d->max_frame = audio_rd_u24be(&r);
+      var a: int64 = audio_rd_u32be(&r);
+      var bb: int64 = audio_rd_u32be(&r);
+      d->info.rate = (int32)(a >> 12);
+      d->info.channels = (int32)((a >> 9) & 7) + 1;
+      d->info.bits = (int32)((a >> 4) & 31) + 1;
+      var total: int64 = ((a & 15) << 32) | bb;
+      d->info.frames = total;
+      if (total == 0) { d->info.frames = -1; }
+      for i in 0..16 { d->md5[i] = (uint8)audio_rd_u8(&r); }
+      have_info = true;
+    } else if (kind == 3) {
+      var np: int64 = len / 18;
+      if (np > 0 && d->seek == 0) {
+        d->seek = (AudioFlacSeekPoint*)malloc(np * sizeof(AudioFlacSeekPoint));
+        if (d->seek == 0) { return AUDIO_E_MEM; }
+        for i in 0..np {
+          var hi: int64 = audio_rd_u32be(&r);
+          var lo: int64 = audio_rd_u32be(&r);
+          var s: int64 = (hi << 32) | lo;
+          var ohi: int64 = audio_rd_u32be(&r);
+          var olo: int64 = audio_rd_u32be(&r);
+          audio_rd_skip(&r, 2);
+          if (hi == 0xFFFFFFFF && lo == 0xFFFFFFFF) { continue; }   // placeholder
+          if (s < 0) { continue; }
+          d->seek[d->nseek].sample = s;
+          d->seek[d->nseek].off = (ohi << 32) | olo;
+          d->nseek = d->nseek + 1;
+        }
+      }
+    }
+    r.pos = body;
+    audio_rd_skip(&r, len);
+    if (r.bad) { return AUDIO_E_TRUNC; }
+  }
+  if (!have_info) { return AUDIO_E_DATA; }
+  if (d->info.rate < 1 || d->info.bits < 4 || d->info.channels > AUDIO_MAX_CHANNELS) { return AUDIO_E_UNSUPPORTED; }
+  if (d->min_block < 16) { d->min_block = 16; }
+  if (d->max_block < d->min_block) { d->max_block = FLAC_MAX_BLOCK; }
+  d->info.fmt = AUDIO_S32;
+  if (d->info.bits <= 8) { d->info.fmt = AUDIO_U8; }
+  else if (d->info.bits <= 16) { d->info.fmt = AUDIO_S16; }
+  else if (d->info.bits <= 24) { d->info.fmt = AUDIO_S24; }
+  d->first = r.pos;
+  d->pos = r.pos;
+  d->cap = d->max_block;
+  for c in 0..d->info.channels {
+    d->ch[c] = (int32*)malloc((int64)d->cap * 4);
+    if (d->ch[c] == 0) { audio_flac_close(d); return AUDIO_E_MEM; }
+  }
+  d->outi = (int32*)malloc((int64)d->cap * (int64)d->info.channels * 4);
+  if (d->outi == 0) { audio_flac_close(d); return AUDIO_E_MEM; }
+  return AUDIO_OK;
+}
+
+/// Decodes the next frame.
+export fn audio_flac_next(d: AudioFlac*) -> int32 {
+  d->out_frames = 0;
+  while (true) {
+    var h: FlacHdr;
+    var at: int64 = flac_find(d, d->pos, &h);
+    if (at < 0) { d->pos = d->n; return AUDIO_END; }
+    if (at != d->pos) { d->bad_frames = d->bad_frames + 1; }
+    if (!flac_frame(d, &h)) {
+      d->bad_frames = d->bad_frames + 1;
+      d->pos = at + 1;
+      continue;
+    }
+    var block: int32 = h.block;
+    // the last frame of a stream with a known length may say more than is left
+    if (d->info.frames > 0 && h.sample + (int64)block > d->info.frames && h.sample < d->info.frames) {
+      block = (int32)(d->info.frames - h.sample);
+    }
+    var from: int32 = d->skip;
+    d->skip = 0;
+    if (from >= block) { continue; }
+    var ch: int32 = d->info.channels;
+    var sh: int32 = 32 - d->info.bits;
+    var o: int32* = d->outi;
+    if (ch == 2) {
+      var l: int32* = d->ch[0];
+      var r: int32* = d->ch[1];
+      var k: int64 = 0;
+      for i in from..block {
+        o[k] = l[i] << sh;
+        o[k + 1] = r[i] << sh;
+        k = k + 2;
+      }
+    } else {
+      for c in 0..ch {
+        var s: int32* = d->ch[c];
+        var k: int64 = (int64)c;
+        for i in from..block {
+          o[k] = s[i] << sh;
+          k = k + (int64)ch;
+        }
+      }
+    }
+    d->out_frames = block - from;
+    return AUDIO_OK;
+  }
+  return AUDIO_END;
+}
+
+/// Moves so the next block starts at `frame`.
+export fn audio_flac_seek(d: AudioFlac*, frame: int64) -> int32 {
+  if (frame < 0) { return AUDIO_E_ARG; }
+  d->skip = 0;
+  // the nearest known frame at or before the target
+  var lo: int64 = d->first;
+  for i in 0..d->nseek {
+    if (d->seek[i].sample <= frame && d->first + d->seek[i].off < d->n) {
+      var h: FlacHdr;
+      if (flac_hdr(d, d->first + d->seek[i].off, &h) && h.sample <= frame) { lo = h.off; }
+    }
+  }
+  // narrow by byte position
+  var hi: int64 = d->n;
+  var span: int64 = d->max_frame * 2;
+  if (span < 16384) { span = 16384; }
+  var guard: int32 = 0;
+  while (hi - lo > span && guard < 64) {
+    guard = guard + 1;
+    var mid: int64 = lo + (hi - lo) / 2;
+    var h: FlacHdr;
+    var at: int64 = flac_find(d, mid, &h);
+    if (at < 0 || at >= hi) { hi = mid; continue; }
+    if (h.sample <= frame) { lo = at; } else { hi = mid; }
+  }
+  // walk frame by frame to the one holding the target
+  d->pos = lo;
+  while (true) {
+    var h: FlacHdr;
+    var at: int64 = flac_find(d, d->pos, &h);
+    if (at < 0) { d->pos = d->n; return AUDIO_OK; }
+    if (h.sample + (int64)h.block > frame) {
+      d->pos = at;
+      d->skip = (int32)(frame - h.sample);
+      if (d->skip < 0) { d->skip = 0; }
+      return AUDIO_OK;
+    }
+    if (!flac_frame(d, &h)) { d->pos = at + 1; }
+  }
+  return AUDIO_OK;
+}
+
+export fn audio_flac_close(d: AudioFlac*) {
+  for c in 0..8 {
+    if (d->ch[c] != 0) { free(d->ch[c]); }
+    d->ch[c] = (int32*)0;
+  }
+  if (d->outi != 0) { free(d->outi); }
+  if (d->seek != 0) { free(d->seek); }
+  d->outi = (int32*)0;
+  d->seek = (AudioFlacSeekPoint*)0;
+}
+
+/// Decodes a whole FLAC stream into pcm (U8, S16, S24 or S32 by the
+/// stream's bit depth). When `check` is true the MD5 of the samples is
+/// compared with the one in the stream (if the stream has one).
+export fn audio_flac_decode(p: uint8*, n: int64, pcm: AudioPcm*, check: bool) -> int32 {
+  var d: AudioFlac;
+  var rc: int32 = audio_flac_open(&d, p, n);
+  if (rc != AUDIO_OK) { audio_flac_close(&d); return rc; }
+  defer audio_flac_close(&d);
+  var ch: int32 = d.info.channels;
+  var cap: int64 = d.info.frames;
+  if (cap < 0) { cap = 1 << 16; }
+  // never trust the header for more than the data could hold: at least
+  // a few bits per sample
+  var most: int64 = (n * 8) / (int64)ch * 4 + (int64)d.max_block;
+  if (cap > most) { cap = most; }
+  rc = audio_pcm_alloc(pcm, cap, ch, d.info.rate, d.info.fmt);
+  if (rc != AUDIO_OK) { return rc; }
+  pcm->bits = d.info.bits;
+  var fs: int64 = audio_pcm_frame_size(pcm);
+  var ss: int64 = (int64)audio_fmt_size(d.info.fmt);
+  var bytes: int64 = (int64)((d.info.bits + 7) / 8);
+  var md: AudioMd5;
+  audio_md5_init(&md);
+  var tmp: uint8[256];
+  var at: int64 = 0;
+  while (true) {
+    rc = audio_flac_next(&d);
+    if (rc != AUDIO_OK) { break; }
+    var k: int64 = (int64)d.out_frames;
+    if (at + k > pcm->frames) {
+      var ncap: int64 = pcm->frames * 2;
+      if (ncap < at + k) { ncap = at + k; }
+      var nd: uint8* = (uint8*)malloc(ncap * fs);
+      if (nd == 0) { return AUDIO_E_MEM; }
+      memcpy(nd, pcm->data, at * fs);
+      free(pcm->data);
+      pcm->data = nd;
+      pcm->frames = ncap;
+    }
+    var dst: uint8* = pcm->data + at * fs;
+    var ns: int64 = k * (int64)ch;
+    var sh: int32 = 32 - d.info.bits;
+    var src: int32* = d.outi;
+    if (ss == 2) {
+      var o16: int16* = (int16*)dst;
+      for i in 0..ns { o16[i] = (int16)(src[i] >> 16); }
+    } else if (ss == 4) {
+      memcpy(dst, src, ns * 4);
+    } else if (ss == 3) {
+      for i in 0..ns { var w: int32 = src[i] >> 8; dst[i * 3] = (uint8)w; dst[i * 3 + 1] = (uint8)(w >> 8); dst[i * 3 + 2] = (uint8)(w >> 16); }
+    } else {
+      for i in 0..ns { dst[i] = (uint8)((src[i] >> 24) + 128); }
+    }
+    if (check) {
+      // the MD5 is of the samples at their own size, little endian
+      var t: int64 = 0;
+      for i in 0..ns {
+        var v: int32 = d.outi[i] >> sh;
+        for j in 0..bytes { tmp[t] = (uint8)(v >> (8 * (int32)j)); t = t + 1; }
+        if (t > 248) { audio_md5_add(&md, &tmp[0], t); t = 0; }
+      }
+      audio_md5_add(&md, &tmp[0], t);
+    }
+    at = at + k;
+  }
+  pcm->frames = at;
+  if (rc < 0) { return rc; }
+  if (check) {
+    var zero: bool = true;
+    for i in 0..16 { if (d.md5[i] != 0) { zero = false; } }
+    if (!zero) {
+      var got: uint8[16];
+      audio_md5_end(&md, &got[0]);
+      for i in 0..16 { if (got[i] != d.md5[i]) { return AUDIO_E_CHECK; } }
+    }
+  }
+  return AUDIO_OK;
+}

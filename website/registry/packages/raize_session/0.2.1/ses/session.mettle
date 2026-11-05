@@ -1,0 +1,38 @@
+// session: framework-agnostic session handling over plain strings, bytes
+// and structs.
+//
+//   import "session/session";
+//
+// This facade has no exports of its own, so it re-exports every module
+// below (Mettle's rule for export-free modules). Each module documents its
+// functions with a /// contract (summary, in, returns, owns, thread,
+// example). No cryptography is implemented here; every random byte, hash,
+// MAC and constant-time comparison comes from the crypto library, see
+// README.md. Everything that calls crypto is main-thread only.
+//
+//   status     SES_OK, SES_E_* codes, ses_status_name
+//   types      SesToken, SesRecord, SesSession, size limits, ses_token_str
+//   store      SesStore vtable (the storage contract), ses_store_*, ses_record_*
+//   config     SesConfig, SesManager, ses_config_defaults/_check, ses_init, ses_close
+//   token      ses_token_new, ses_token_hash, ses_token_wipe
+//   lifecycle  ses_create, ses_lookup, ses_peek, ses_touch, ses_save, ses_subject,
+//              ses_set_subject, ses_max_age
+//   admin      ses_rotate, ses_needs_rotation, ses_revoke, ses_revoke_token,
+//              ses_revoke_subject, ses_prune
+//   data       ses_data_get/_set/_del/_count, ses_flash_add/_count/_at
+//   csrf       ses_csrf_token, ses_csrf_verify
+//   sign       ses_sign, ses_verify (HMAC-SHA256, key rotation)
+//   cookie     ses_cookie_defaults, ses_cookie_format, ses_cookie_clear,
+//              ses_cookie_find, ses_cookie_name_ok, ses_cookie_value_ok
+
+import "status";
+import "types";
+import "store";
+import "config";
+import "token";
+import "lifecycle";
+import "admin";
+import "data";
+import "csrf";
+import "sign";
+import "cookie";

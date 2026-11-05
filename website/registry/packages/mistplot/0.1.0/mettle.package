@@ -1,0 +1,7 @@
+name = mistplot
+version = 0.1.0
+description = Charts: line, area, bar and scatter, static or live
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/MistPlot
+compiler = 0.18.0
+platforms = linux

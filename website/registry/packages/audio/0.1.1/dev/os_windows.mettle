@@ -1,0 +1,259 @@
+// Windows sound back end: WASAPI in shared mode with event-driven
+// buffering. The device's mix format is not forced: we ask for 32-bit
+// float at our rate and channel count with AUTOCONVERTPCM, so Windows does
+// any conversion. COM calls go through the interfaces' function tables.
+
+import "std/mem";
+import "std/thread" as th;
+import "../core/status";
+import "types";
+
+// The device each thread serves. The thread gets its slot number, not a
+// pointer: a pointer passed through the thread start argument loses its
+// allocation record in bounds-checked (--safe) builds, while one read from
+// a global keeps it.
+const DEV_SLOTS = 32;
+var g_devs: AudioDevice*[32];
+var g_dev_used: int32[32];
+
+fn dev_claim(d: AudioDevice*) -> int32 {
+  for i in 0..DEV_SLOTS {
+    if (th.InterlockedCompareExchange(&g_dev_used[i], 1, 0) == 0) {
+      g_devs[i] = d;
+      return (int32)i;
+    }
+  }
+  return -1;
+}
+
+fn dev_release(slot: int32) {
+  if (slot < 0 || slot >= DEV_SLOTS) { return; }
+  g_devs[slot] = (AudioDevice*)0;
+  th.InterlockedExchange(&g_dev_used[slot], 0);
+}
+
+extern fn audio_CoInitializeEx(reserved: rawptr, flags: uint32) -> int32 = "CoInitializeEx";
+extern fn audio_CoUninitialize() = "CoUninitialize";
+extern fn audio_CoCreateInstance(clsid: uint8*, outer: rawptr, ctx: uint32, iid: uint8*, out: rawptr*) -> int32 = "CoCreateInstance";
+extern fn audio_CoTaskMemFree(p: rawptr) = "CoTaskMemFree";
+extern fn audio_CreateEventA(attr: rawptr, manual: int32, initial: int32, name: cstring) -> int64 = "CreateEventA";
+extern fn audio_WaitForSingleObject(h: int64, ms: uint32) -> uint32 = "WaitForSingleObject";
+extern fn audio_CloseHandle(h: int64) -> int32 = "CloseHandle";
+
+// {BCDE0395-E52F-467C-8E3D-C4579291692E}
+const CLSID_ENUM: uint8[16] = [0x95, 0x03, 0xDE, 0xBC, 0x2F, 0xE5, 0x7C, 0x46, 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E];
+// {A95664D2-9614-4F35-A746-DE8DB63617E6}
+const IID_ENUM: uint8[16] = [0xD2, 0x64, 0x56, 0xA9, 0x14, 0x96, 0x35, 0x4F, 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6];
+// {1CB9AD4C-DBFA-4C32-B178-C2F568A703B2}
+const IID_CLIENT: uint8[16] = [0x4C, 0xAD, 0xB9, 0x1C, 0xFA, 0xDB, 0x32, 0x4C, 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2];
+// {F294ACFC-3146-4483-A7BF-ADDCA7C260E2}
+const IID_RENDER: uint8[16] = [0xFC, 0xAC, 0x94, 0xF2, 0x46, 0x31, 0x83, 0x44, 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2];
+// {C8ADBD64-E71E-48A0-A4DE-185C395CD317}
+const IID_CAPTURE: uint8[16] = [0x64, 0xBD, 0xAD, 0xC8, 0x1E, 0xE7, 0xA0, 0x48, 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17];
+// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {00000003-0000-0010-8000-00AA00389B71}
+const SUB_FLOAT: uint8[16] = [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71];
+
+// The i-th function of a COM object's table.
+fn vt(obj: rawptr, i: int32) -> rawptr {
+  var table: rawptr* = *(rawptr**)obj;
+  return table[i];
+}
+
+fn com_release(obj: rawptr) {
+  if (obj == 0) { return; }
+  var f: fn(rawptr) -> uint32 = (fn(rawptr) -> uint32)vt(obj, 2);
+  f(obj);
+}
+
+fn put16(p: uint8*, v: int64) { p[0] = (uint8)v; p[1] = (uint8)(v >> 8); }
+fn put32(p: uint8*, v: int64) { put16(p, v); put16(p + 2, v >> 16); }
+
+fn copy16(dst: uint8*, src: uint8*) { for i in 0..16 { dst[i] = src[i]; } }
+
+fn default_mask(ch: int32) -> int64 {
+  switch (ch) {
+    case 1: { return 0x4; }
+    case 2: { return 0x3; }
+    case 3: { return 0x7; }
+    case 4: { return 0x33; }
+    case 5: { return 0x37; }
+    case 6: { return 0x3F; }
+    case 7: { return 0x13F; }
+    case 8: { return 0x63F; }
+    default: { }
+  }
+  return 0;
+}
+
+/// Opens the default render or capture endpoint.
+export fn audio_os_open(d: AudioDevice*) -> int32 {
+  audio_CoInitializeEx(0, 0);   // COINIT_MULTITHREADED; fine if already done
+  var clsid: uint8[16];
+  var iid: uint8[16];
+  copy16(&clsid[0], &CLSID_ENUM[0]);
+  copy16(&iid[0], &IID_ENUM[0]);
+  var en: rawptr = 0;
+  if (audio_CoCreateInstance(&clsid[0], 0, 0x17, &iid[0], &en) < 0 || en == 0) { return AUDIO_E_DEVICE; }
+  // IMMDeviceEnumerator::GetDefaultAudioEndpoint(flow, role, &device)
+  var flow: int32 = 0;
+  if (!d->playback) { flow = 1; }
+  var dev: rawptr = 0;
+  var get_def: fn(rawptr, int32, int32, rawptr*) -> int32 = (fn(rawptr, int32, int32, rawptr*) -> int32)vt(en, 4);
+  var hr: int32 = get_def(en, flow, 0, &dev);
+  com_release(en);
+  if (hr < 0 || dev == 0) { return AUDIO_E_DEVICE; }
+  // IMMDevice::Activate(iid, ctx, params, &client)
+  copy16(&iid[0], &IID_CLIENT[0]);
+  var client: rawptr = 0;
+  var activate: fn(rawptr, uint8*, uint32, rawptr, rawptr*) -> int32 = (fn(rawptr, uint8*, uint32, rawptr, rawptr*) -> int32)vt(dev, 3);
+  hr = activate(dev, &iid[0], 0x17, 0, &client);
+  com_release(dev);
+  if (hr < 0 || client == 0) { return AUDIO_E_DEVICE; }
+  // WAVEFORMATEXTENSIBLE, 32-bit float
+  var wf: uint8[40];
+  memset(&wf[0], 0, 40);
+  put16(&wf[0], 0xFFFE);
+  put16(&wf[2], (int64)d->ch);
+  put32(&wf[4], (int64)d->rate);
+  put32(&wf[8], (int64)d->rate * (int64)d->ch * 4);
+  put16(&wf[12], (int64)d->ch * 4);
+  put16(&wf[14], 32);
+  put16(&wf[16], 22);
+  put16(&wf[18], 32);
+  put32(&wf[20], default_mask(d->ch));
+  copy16(&wf[24], &SUB_FLOAT[0]);
+  // IAudioClient::Initialize(shared, flags, duration, period, format, session)
+  var dur: int64 = (int64)d->period * 4 * 10000000 / (int64)d->rate;   // 100 ns units
+  // event callback, auto convert, good resampling
+  var flags: uint32 = (uint32)0x00040000 | (uint32)2147483648 | (uint32)0x08000000;
+  var init: fn(rawptr, int32, uint32, int64, int64, uint8*, rawptr) -> int32 = (fn(rawptr, int32, uint32, int64, int64, uint8*, rawptr) -> int32)vt(client, 3);
+  hr = init(client, 0, flags, dur, 0, &wf[0], 0);
+  if (hr < 0) { com_release(client); return AUDIO_E_DEVICE; }
+  var ev: int64 = audio_CreateEventA(0, 0, 0, (cstring)0);
+  var set_ev: fn(rawptr, int64) -> int32 = (fn(rawptr, int64) -> int32)vt(client, 13);
+  if (ev == 0 || set_ev(client, ev) < 0) { com_release(client); return AUDIO_E_DEVICE; }
+  var frames: uint32 = 0;
+  var get_size: fn(rawptr, uint32*) -> int32 = (fn(rawptr, uint32*) -> int32)vt(client, 4);
+  get_size(client, &frames);
+  // IAudioClient::GetService(render or capture client)
+  if (d->playback) { copy16(&iid[0], &IID_RENDER[0]); } else { copy16(&iid[0], &IID_CAPTURE[0]); }
+  var svc: rawptr = 0;
+  var get_svc: fn(rawptr, uint8*, rawptr*) -> int32 = (fn(rawptr, uint8*, rawptr*) -> int32)vt(client, 14);
+  if (get_svc(client, &iid[0], &svc) < 0 || svc == 0) { audio_CloseHandle(ev); com_release(client); return AUDIO_E_DEVICE; }
+  d->h = client;
+  d->h2 = svc;
+  d->ev = ev;
+  d->bufframes = (int32)frames;
+  d->backend = AUDIO_DEV_WASAPI;
+  return AUDIO_OK;
+}
+
+// Fills (or drains) what the device has room for. False on failure.
+fn step(d: AudioDevice*) -> bool {
+  audio_WaitForSingleObject(d->ev, 200);
+  var client: rawptr = d->h;
+  var svc: rawptr = d->h2;
+  var ch: int64 = (int64)d->ch;
+  if (d->playback) {
+    var pad: uint32 = 0;
+    var get_pad: fn(rawptr, uint32*) -> int32 = (fn(rawptr, uint32*) -> int32)vt(client, 6);
+    if (get_pad(client, &pad) < 0) { return false; }
+    var room: int32 = d->bufframes - (int32)pad;
+    while (room > 0) {
+      var n: int32 = room;
+      if (n > d->period) { n = d->period; }
+      var p: uint8* = (uint8*)0;
+      var get_buf: fn(rawptr, uint32, uint8**) -> int32 = (fn(rawptr, uint32, uint8**) -> int32)vt(svc, 3);
+      if (get_buf(svc, (uint32)n, &p) < 0 || p == 0) { return false; }
+      d->cb(d->user, d->buf, n, d->ch);
+      memcpy(p, d->buf, (int64)n * ch * 4);
+      var rel: fn(rawptr, uint32, uint32) -> int32 = (fn(rawptr, uint32, uint32) -> int32)vt(svc, 4);
+      if (rel(svc, (uint32)n, 0) < 0) { return false; }
+      room = room - n;
+    }
+    return true;
+  }
+  // capture: every packet waiting
+  var next: fn(rawptr, uint32*) -> int32 = (fn(rawptr, uint32*) -> int32)vt(svc, 5);
+  var size: uint32 = 0;
+  if (next(svc, &size) < 0) { return false; }
+  while (size > 0) {
+    var p: uint8* = (uint8*)0;
+    var got: uint32 = 0;
+    var flags: uint32 = 0;
+    var get_buf: fn(rawptr, uint8**, uint32*, uint32*, uint64*, uint64*) -> int32 = (fn(rawptr, uint8**, uint32*, uint32*, uint64*, uint64*) -> int32)vt(svc, 3);
+    if (get_buf(svc, &p, &got, &flags, (uint64*)0, (uint64*)0) < 0) { return false; }
+    var at: int64 = 0;
+    while (at < (int64)got) {
+      var n: int64 = (int64)got - at;
+      if (n > (int64)d->period) { n = (int64)d->period; }
+      if ((flags & 2) != 0 || p == 0) { memset(d->buf, 0, n * ch * 4); }   // silent packet
+      else { memcpy(d->buf, p + at * ch * 4, n * ch * 4); }
+      d->cb(d->user, d->buf, (int32)n, d->ch);
+      at = at + n;
+    }
+    var rel: fn(rawptr, uint32) -> int32 = (fn(rawptr, uint32) -> int32)vt(svc, 4);
+    rel(svc, got);
+    if (next(svc, &size) < 0) { return false; }
+  }
+  return true;
+}
+
+fn dev_thread(arg: cstring) -> uint32 {
+  var slot: int64 = (int64)arg - 1;
+  if (slot < 0 || slot >= DEV_SLOTS) { return (uint32)0; }
+  var d: AudioDevice* = g_devs[slot];
+  audio_CoInitializeEx(0, 0);
+  var start: fn(rawptr) -> int32 = (fn(rawptr) -> int32)vt(d->h, 10);
+  if (d->playback) {
+    // fill the buffer once before starting, so it starts with sound
+    step(d);
+  }
+  if (start(d->h) < 0) { th.InterlockedExchange(&d->err, AUDIO_E_DEVICE); th.InterlockedExchange(&d->alive, 0); return 0; }
+  while (th.InterlockedCompareExchange(&d->running, 0, 0) != 0) {
+    if (!step(d)) {
+      th.InterlockedExchange(&d->err, AUDIO_E_DEVICE);
+      break;
+    }
+  }
+  var stop: fn(rawptr) -> int32 = (fn(rawptr) -> int32)vt(d->h, 11);
+  stop(d->h);
+  th.InterlockedExchange(&d->alive, 0);
+  return 0;
+}
+
+export fn audio_os_start(d: AudioDevice*) -> int32 {
+  var slot: int32 = dev_claim(d);
+  if (slot < 0) { return AUDIO_E_LIMIT; }
+  d->slot = slot;
+  th.InterlockedExchange(&d->running, 1);
+  th.InterlockedExchange(&d->alive, 1);
+  var h: int64 = th.CreateThread((cstring)0, 0, &dev_thread, (cstring)(int64)(slot + 1), 0, (uint32*)0);
+  if (h == 0) {
+    th.InterlockedExchange(&d->running, 0);
+    th.InterlockedExchange(&d->alive, 0);
+    dev_release(slot);
+    return AUDIO_E_DEVICE;
+  }
+  d->thread = h;
+  return AUDIO_OK;
+}
+
+export fn audio_os_stop(d: AudioDevice*) {
+  th.InterlockedExchange(&d->running, 0);
+  if (d->thread != 0) {
+    th.thread_join_infinite(d->thread);
+    th.thread_close(d->thread);
+    d->thread = 0;
+    dev_release(d->slot);
+  }
+}
+
+export fn audio_os_close(d: AudioDevice*) {
+  com_release(d->h2);
+  com_release(d->h);
+  if (d->ev != 0) { audio_CloseHandle(d->ev); }
+  d->h = 0;
+  d->h2 = 0;
+  d->ev = 0;
+}

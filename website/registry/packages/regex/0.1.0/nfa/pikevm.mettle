@@ -1,0 +1,224 @@
+// PikeVM: runs the NFA over the haystack, keeping every live thread at
+// once. It always takes time proportional to haystack size times pattern
+// size, and it reports capture groups. Threads are kept in priority order,
+// which gives leftmost-first (Perl-like) results, as in RE2 and Rust.
+
+import "std/mem";
+import "regex/core/vec";
+import "regex/nfa/nfa";
+import "regex/nfa/look";
+import "regex/literal/prefilter";
+
+struct RxSet {
+  dense: int32*;
+  sparse: int32*;
+  len: int64;
+}
+
+struct RxFrame {
+  id: int32;      // state to explore, or -1 for a slot restore
+  slot: int32;
+  val: int64;
+}
+
+export struct RxPike {
+  nfa: RxNfa*;
+  nslots: int32;        // slots tracked per thread
+  ready: bool;
+  cur: RxSet;
+  nxt: RxSet;
+  slots_cur: int64*;    // nstates * nslots
+  slots_nxt: int64*;
+  scratch: int64*;
+  stack: RxVec<RxFrame>;
+  cap_states: int64;
+  cap_slots: int32;
+}
+
+fn set_init(s: RxSet*, n: int64) {
+  s->dense = (int32*)malloc(4 * n + 4);
+  s->sparse = (int32*)malloc(4 * n + 4);
+  s->len = 0;
+}
+
+fn set_free(s: RxSet*) {
+  free(s->dense);
+  free(s->sparse);
+}
+
+fn set_has(s: RxSet*, id: int32) -> bool {
+  var i: int32 = s->sparse[id];
+  return i >= 0 && (int64)i < s->len && s->dense[i] == id;
+}
+
+fn set_add(s: RxSet*, id: int32) {
+  s->dense[s->len] = id;
+  s->sparse[id] = (int32)s->len;
+  s->len = s->len + 1;
+}
+
+/// Prepares vm to run nfa while tracking `nslots` slots (0, 2 or all).
+export fn rx_pike_setup(vm: RxPike*, nfa: RxNfa*, nslots: int32) {
+  var n: int64 = nfa->st.len;
+  var ns: int32 = nslots;
+  if (ns > nfa->nslots) { ns = nfa->nslots; }
+  if (vm->ready && vm->cap_states == n && vm->cap_slots >= ns) {
+    vm->nfa = nfa;
+    vm->nslots = ns;
+    return;
+  }
+  if (vm->ready) { rx_pike_free(vm); }
+  vm->nfa = nfa;
+  vm->nslots = ns;
+  set_init(&vm->cur, n);
+  set_init(&vm->nxt, n);
+  // sparse arrays may hold garbage: set_has checks dense too, but the
+  // index must stay in range, so start them at zero.
+  memset(vm->cur.sparse, 0, 4 * n + 4);
+  memset(vm->nxt.sparse, 0, 4 * n + 4);
+  var per: int64 = (int64)ns;
+  if (per < 1) { per = 1; }
+  vm->slots_cur = (int64*)malloc(8 * n * per + 8);
+  vm->slots_nxt = (int64*)malloc(8 * n * per + 8);
+  vm->scratch = (int64*)malloc(8 * per + 8);
+  vm->ready = true;
+  vm->cap_states = n;
+  vm->cap_slots = ns;
+}
+
+export fn rx_pike_free(vm: RxPike*) {
+  if (!vm->ready) { return; }
+  set_free(&vm->cur);
+  set_free(&vm->nxt);
+  free(vm->slots_cur);
+  free(vm->slots_nxt);
+  free(vm->scratch);
+  rx_vfree(&vm->stack);
+  vm->ready = false;
+}
+
+// Follows empty transitions from sid at position at, adding the states
+// reached to set (with a copy of the slots for each consuming state).
+fn add(vm: RxPike*, set: RxSet*, slots: int64*, sid: int32, h: uint8*, n: int64, at: int64) {
+  var st: RxState* = vm->nfa->st.data;
+  var ns: int64 = (int64)vm->nslots;
+  var fr: RxFrame = { id: sid, slot: 0, val: 0 };
+  rx_vpush(&vm->stack, fr);
+  while (vm->stack.len > 0) {
+    vm->stack.len = vm->stack.len - 1;
+    var f: RxFrame = vm->stack.data[vm->stack.len];
+    if (f.id < 0) {
+      vm->scratch[f.slot] = f.val;
+      continue;
+    }
+    var id: int32 = f.id;
+    while (true) {
+      if (set_has(set, id)) { break; }
+      set_add(set, id);
+      var s: RxState = st[id];
+      var k: int32 = s.kind;
+      if (k == RX_S_RANGE || k == RX_S_SPARSE || k == RX_S_MATCH) {
+        var dst: int64* = slots + (int64)id * ns;
+        for i in 0..ns { dst[i] = vm->scratch[i]; }
+        break;
+      }
+      if (k == RX_S_EMPTY) { id = s.next; continue; }
+      if (k == RX_S_SPLIT) {
+        var alt: RxFrame = { id: s.alt, slot: 0, val: 0 };
+        rx_vpush(&vm->stack, alt);
+        id = s.next;
+        continue;
+      }
+      if (k == RX_S_LOOK) {
+        if (rx_look_at(s.lo, h, n, at)) { id = s.next; continue; }
+        break;
+      }
+      if (k == RX_S_CAPTURE) {
+        if ((int64)s.lo < ns) {
+          var rs: RxFrame = { id: -1, slot: s.lo, val: vm->scratch[s.lo] };
+          rx_vpush(&vm->stack, rs);
+          vm->scratch[s.lo] = at;
+        }
+        id = s.next;
+        continue;
+      }
+      break;
+    }
+  }
+}
+
+fn byte_ok(vm: RxPike*, s: RxState, b: int32) -> int32 {
+  if (s.kind == RX_S_RANGE) {
+    if (b >= s.lo && b <= s.hi) { return s.next; }
+    return -1;
+  }
+  return -2;
+}
+
+/// Searches h[0..n] for a match starting at or after `start` and ending at
+/// or before `end` (anchored: only starting at `start`). Looks see the whole
+/// haystack. On a match fills slots[0..vm->nslots] and returns true.
+/// earliest stops at the first match found, whatever its end.
+export fn rx_pike_search(vm: RxPike*, h: uint8*, n: int64, start: int64, end: int64, anchored: bool, earliest: bool, pf: RxPrefilter*, slots: int64*) -> bool {
+  var nfa: RxNfa* = vm->nfa;
+  var st: RxState* = nfa->st.data;
+  var tr: RxTrans* = nfa->tr.data;
+  var ns: int64 = (int64)vm->nslots;
+  vm->cur.len = 0;
+  vm->nxt.len = 0;
+  var matched: bool = false;
+  var at: int64 = start;
+  while (true) {
+    if (!matched && (!anchored || at == start)) {
+      if (vm->cur.len == 0 && !anchored && pf != 0 && pf->kind != RX_PF_NONE) {
+        var p: int64 = rx_pf_find(pf, h, at, end);
+        if (p < 0) { break; }
+        at = p;
+      }
+      for i in 0..ns { vm->scratch[i] = -1; }
+      add(vm, &vm->cur, vm->slots_cur, nfa->start, h, n, at);
+    }
+    if (vm->cur.len == 0) { break; }
+    vm->nxt.len = 0;
+    var b: int32 = -1;
+    if (at < end) { b = (int32)h[at]; }
+    for i in 0..vm->cur.len {
+      var id: int32 = vm->cur.dense[i];
+      var s: RxState = st[id];
+      if (s.kind == RX_S_MATCH) {
+        var src: int64* = vm->slots_cur + (int64)id * ns;
+        for k in 0..ns { slots[k] = src[k]; }
+        matched = true;
+        if (earliest) { return true; }
+        break;
+      }
+      if (b < 0) { continue; }
+      if (s.kind == RX_S_RANGE) {
+        if (b >= s.lo && b <= s.hi) {
+          var src2: int64* = vm->slots_cur + (int64)id * ns;
+          for k in 0..ns { vm->scratch[k] = src2[k]; }
+          add(vm, &vm->nxt, vm->slots_nxt, s.next, h, n, at + 1);
+        }
+      } else if (s.kind == RX_S_SPARSE) {
+        for t in 0..s.hi {
+          var x: RxTrans = tr[(int64)s.lo + (int64)t];
+          if (b >= x.lo && b <= x.hi) {
+            var src3: int64* = vm->slots_cur + (int64)id * ns;
+            for k in 0..ns { vm->scratch[k] = src3[k]; }
+            add(vm, &vm->nxt, vm->slots_nxt, x.next, h, n, at + 1);
+          }
+        }
+      }
+    }
+    // Swap the thread lists.
+    var ts: RxSet = vm->cur;
+    vm->cur = vm->nxt;
+    vm->nxt = ts;
+    var tp: int64* = vm->slots_cur;
+    vm->slots_cur = vm->slots_nxt;
+    vm->slots_nxt = tp;
+    if (at >= end) { break; }
+    at = at + 1;
+  }
+  return matched;
+}

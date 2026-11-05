@@ -1,0 +1,504 @@
+// raize/middleware/logging — one access-log line per request.
+//
+// ## The line
+//
+//   req verb=GET path="/hello/world" status=200 bytes=13 ms=0.412
+//
+//   verb    the request method, escaped (the parser already restricts it to
+//           tchars; this is belt and braces)
+//   path    the decoded path, quoted and escaped: a path can contain spaces and
+//           control bytes ("/a%0Ab" decodes to a literal LF), and an unescaped
+//           one would let a client forge extra log lines
+//   status  the status this response will carry (see rz_chain_status)
+//   bytes   the body length of the response at the moment the log frame closed
+//           — i.e. the number the server's Content-Length will say, provided
+//           nothing outside the log frame rewrites the body afterwards.
+//
+//           That proviso is why logging belongs *outside* recovery (the order
+//           this directory recommends). Mounted inside it, a recovered 500 is
+//           logged with the byte count of the handler's body, because recovery
+//           replaces that body after the log line was written; the recovery
+//           line carries `bytes=` for the body that actually went out, so the
+//           true size is never lost. Measured on examples/site (recover ->
+//           logging): `bytes=58` on the access line, `bytes=22` on the
+//           recovery line, `Content-Length: 22` on the wire.
+//
+//           The server sets ctx->bytes_written only *after* it has written, so
+//           a chain that runs before the write cannot read it; if a caller ever
+//           pre-sets it (a re-log, or a wrapper that logs after writing) that
+//           value wins.
+//   ms      elapsed wall time of the chain, in milliseconds with three
+//           decimals, from a **monotonic** clock (see below). "na" when the
+//           clock could not be read.
+//
+// A log line is capped at RZ_LOG_LINE_MAX bytes. The path is escaped up to 160
+// bytes and a detail up to 192, and a cut value is marked with "..." — the cap
+// is on the *input* bytes, so the escaped line can still exceed the buffer and
+// is then cut at the buffer end. Never a malloc: the line is built in a stack
+// buffer, on the request path, with no allocation.
+//
+// ## The clock
+//
+// Timing MUST come from a monotonic source. Mettle has no portable clock API,
+// but std/bench is exactly that pair of platform shims and it is not a wall
+// clock: on Windows `bench_time_us()` is QueryPerformanceCounter, on Linux it
+// is clock_gettime(CLOCK_MONOTONIC) = 1 (stdlib/std/bench.linux.mettle). Both
+// are monotonic by contract: they cannot go backwards and they do not jump
+// when the RTC is corrected by NTP or by an operator.
+//
+// Verified on this machine (see the report): bench_time_us() reads
+// 1.55e11 us, which tracks /proc/uptime to within a second, and it does not
+// look like the epoch (1.7e15 us). That is the boot clock, not the wall clock.
+//
+// If the clock cannot be read (`bench_time_us()` returns 0, which is what the
+// Linux shim returns when clock_gettime fails) the line says `ms=na` and the
+// `clock_missing` counter is bumped. There is deliberately **no wall-clock
+// fallback**: a wall clock can step backwards or forwards, so a latency
+// measured with one is not a latency, and silently swapping in one is how a
+// p99 that never happened gets into a graph.
+//
+// The clock is a function pointer on the config (`RzLog.clock`) so a test can
+// inject a fake one: `mettle test` runs in the compile-time interpreter, which
+// cannot call clock_gettime and would *skip* every test that reaches it.
+//
+// ## Why the status is computed here and not read from ctx->status alone
+//
+// ctx->status is written by whoever built the response (the router, a
+// middleware, or an abort). A step's own return value is authoritative when it
+// is a real status, and 0 means "I built the response" (the server's
+// convention). rz_chain_status() resolves the three cases in one place so the
+// log line, the recovery line and the server all agree.
+
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "std/bench";
+import "../str/str";
+import "../context/context";
+import "chain";
+
+export const RZ_LOG_LINE_MAX: int32 = 512;
+export const RZ_LOG_PATH_MAX: int64 = 160;
+export const RZ_LOG_DETAIL_MAX: int64 = 192;
+
+export struct RzLogStats {
+  lines: int32;           // access-log lines written
+  clock_missing: int32;   // lines that could not time themselves (ms=na)
+  recovery_lines: int32;  // error lines written by rz_log_recovery
+}
+
+export struct RzLog {
+  clock: fn() -> int64;   // 0 = use rz_log_now_us (monotonic std/bench)
+  stats: RzLogStats;
+}
+
+var g_rz_log: RzLog* = 0;
+var g_rz_log_default: RzLog;
+
+export fn rz_log_new() -> RzLog* {
+  var l: RzLog* = (RzLog*)calloc(1, sizeof(RzLog));
+  if (l == 0) { return 0; }
+  l->clock = &rz_log_now_us;
+  return l;
+}
+
+export fn rz_log_free(l: RzLog*) {
+  if (l == 0) { return; }
+  if (g_rz_log == l) { g_rz_log = 0; }
+  free((rawptr)l);
+}
+
+// Publishes the config this middleware reads. One per process, published
+// before the workers start, like the chain itself.
+export fn rz_log_use(l: RzLog*) -> int32 {
+  if (l == 0) { return -1; }
+  if (l->clock == 0) { l->clock = &rz_log_now_us; }
+  g_rz_log = l;
+  return 0;
+}
+
+export fn rz_log_stats(l: RzLog*) -> RzLogStats {
+  var s: RzLogStats;
+  if (l == 0) { return s; }
+  s = l->stats;
+  return s;
+}
+
+fn rz_log_cfg() -> RzLog* {
+  if (g_rz_log != 0) { return g_rz_log; }
+  return &g_rz_log_default;
+}
+
+// Monotonic microseconds. 0 means "the clock could not be read"; nothing here
+// retries and nothing substitutes a wall clock.
+export fn rz_log_now_us() -> int64 {
+  return bench_time_us();
+}
+
+// True when the process has a monotonic clock at all. Startup can use this to
+// refuse to run with an unusable clock (the log would say ms=na for ever).
+export fn rz_log_clock_ok() -> bool {
+  return rz_log_now_us() != 0;
+}
+
+// ---------------------------------------------------------------------------
+// A bounded byte sink. Not a RzBuf on purpose: a RzBuf grows by
+// malloc'ing, and a log line must never allocate (it is on the request path
+// and its own failure mode would be a log of the log).
+// ---------------------------------------------------------------------------
+
+struct RzLogSink {
+  p: uint8*;
+  cap: int64;
+  len: int64;
+  cut: bool;
+}
+
+fn rz_sink_init(s: RzLogSink*, p: uint8*, cap: int64) {
+  s->p = p;
+  s->cap = cap;
+  s->len = 0;
+  s->cut = false;
+}
+
+// One byte, leaving room for a terminator that the final view does not need
+// but that keeps the buffer printable for a debugger.
+fn rz_sink_byte(s: RzLogSink*, c: int32) {
+  if (s->p == 0) { return; }
+  if (s->len + 1 >= s->cap) { s->cut = true; return; }
+  s->p[s->len] = (uint8)c;
+  s->len = s->len + 1;
+}
+
+fn rz_sink_str(s: RzLogSink*, v: string) {
+  if (s->p == 0) { return; }
+  var i: int64 = 0;
+  var n: int64 = (int64)v.length;
+  while (i < n) {
+    rz_sink_byte(s, (int32)v.chars[i]);
+    i = i + 1;
+  }
+}
+
+fn rz_sink_int(s: RzLogSink*, n: int64) {
+  var b: uint8[24];
+  var v: string = rz_int_buf(n, &b[0], 24);
+  rz_sink_str(s, v);
+}
+
+fn rz_sink_hex_byte(s: RzLogSink*, c: int32) {
+  var hi: int32 = (c >> 4) & 15;
+  var lo: int32 = c & 15;
+  if (hi < 10) { rz_sink_byte(s, 48 + hi); } else { rz_sink_byte(s, 87 + hi); }
+  if (lo < 10) { rz_sink_byte(s, 48 + lo); } else { rz_sink_byte(s, 87 + lo); }
+}
+
+// Escape for a quoted field: backslash, double quote, CR, LF, HTAB and any
+// other C0/DEL byte become an escape sequence, so one line of output is one
+// line of log no matter what the client sent. A value longer than `max` input
+// bytes is cut and marked with "...".
+fn rz_sink_escaped_n(s: RzLogSink*, v: string, max: int64) {
+  var i: int64 = 0;
+  var n: int64 = (int64)v.length;
+  while (i < n && i < max) {
+    var c: int32 = (int32)v.chars[i];
+    if (c == 92) { rz_sink_str(s, "\\\\"); }
+    else if (c == 34) { rz_sink_str(s, "\\\""); }
+    else if (c == 10) { rz_sink_str(s, "\\n"); }
+    else if (c == 13) { rz_sink_str(s, "\\r"); }
+    else if (c == 9) { rz_sink_str(s, "\\t"); }
+    else if (c < 32 || c == 127) { rz_sink_str(s, "\\x"); rz_sink_hex_byte(s, c); }
+    else { rz_sink_byte(s, c); }
+    i = i + 1;
+  }
+  if (n > max) { rz_sink_str(s, "..."); }
+}
+
+// Milliseconds with three decimals, built with integer arithmetic (Mettle has
+// no float formatting this file can use without a float formatter).
+fn rz_sink_ms(s: RzLogSink*, us: int64) {
+  var ms: int64 = us / 1000;
+  var frac: int64 = us % 1000;
+  rz_sink_int(s, ms);
+  rz_sink_byte(s, 46);   // '.'
+  if (frac < 100) { rz_sink_byte(s, 48); }
+  if (frac < 10) { rz_sink_byte(s, 48); }
+  rz_sink_int(s, frac);
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+// Writes one access-log line into `out` (no trailing newline) and returns its
+// length. Pure: no I/O, no allocation, no globals — that is what makes it
+// assertable from a test in the interpreter.
+//
+// start_us <= 0 or end_us < start_us means "no clock": the line says ms=na
+// rather than printing a number the caller did not measure.
+export fn rz_log_format(out: uint8*, cap: int64, ctx: RzContext*, status: int32, bytes: int64, start_us: int64, end_us: int64) -> int64 {
+  var s: RzLogSink;
+  rz_sink_init(&s, out, cap);
+  rz_sink_str(&s, "req verb=");
+  if (ctx != 0 && ctx->req != 0) {
+    rz_sink_escaped_n(&s, ctx->req->verb, 16);
+    rz_sink_str(&s, " path=\"");
+    rz_sink_escaped_n(&s, ctx->req->path, RZ_LOG_PATH_MAX);
+    rz_sink_str(&s, "\"");
+  } else {
+    rz_sink_str(&s, "- path=\"-\"");
+  }
+  rz_sink_str(&s, " status=");
+  rz_sink_int(&s, (int64)status);
+  rz_sink_str(&s, " bytes=");
+  rz_sink_int(&s, bytes);
+  rz_sink_str(&s, " ms=");
+  if (start_us <= 0 || end_us < start_us) {
+    rz_sink_str(&s, "na");
+  } else {
+    rz_sink_ms(&s, end_us - start_us);
+  }
+  if (ctx != 0 && ctx->aborted) { rz_sink_str(&s, " aborted=1"); }
+  return s.len;
+}
+
+// The error line a recovered failure produces:
+//
+//   err=recovery status=500 verb=GET path="/api/boom" bytes=22 detail="..."
+//
+// `detail` is whatever the handler left in the response body (or a description
+// of what went wrong); it is escaped and capped, and it goes to stderr because
+// it is not access log. `bytes` is the body length *after* recovery replaced
+// it, i.e. what the client will actually receive — the access line may have
+// reported the pre-replacement length when recovery sits outside logging.
+export fn rz_log_recovery(ctx: RzContext*, status: int32, bytes: int64, detail: string) -> int64 {
+  var buf: uint8[RZ_LOG_LINE_MAX];
+  var s: RzLogSink;
+  rz_sink_init(&s, &buf[0], RZ_LOG_LINE_MAX);
+  rz_sink_str(&s, "err=recovery status=");
+  rz_sink_int(&s, (int64)status);
+  rz_sink_str(&s, " verb=");
+  if (ctx != 0 && ctx->req != 0) {
+    rz_sink_escaped_n(&s, ctx->req->verb, 16);
+    rz_sink_str(&s, " path=\"");
+    rz_sink_escaped_n(&s, ctx->req->path, RZ_LOG_PATH_MAX);
+    rz_sink_str(&s, "\"");
+  } else {
+    rz_sink_str(&s, "- path=\"-\"");
+  }
+  rz_sink_str(&s, " bytes=");
+  rz_sink_int(&s, bytes);
+  rz_sink_str(&s, " detail=\"");
+  rz_sink_escaped_n(&s, detail, RZ_LOG_DETAIL_MAX);
+  rz_sink_str(&s, "\"");
+  var line: string = rz_str_view(&buf[0], s.len);
+  println_err(line);
+  atomic_inc_i32(&rz_log_cfg()->stats.recovery_lines);
+  return s.len;
+}
+
+// ---------------------------------------------------------------------------
+// The middleware
+// ---------------------------------------------------------------------------
+
+// Times the rest of the chain and writes one line. Returns exactly what the
+// continuation returned: logging never changes a response.
+export fn rz_mw_logging(ctx: RzContext*, next: fn(RzContext*) -> int32) -> int32 {
+  var cfg: RzLog* = rz_log_cfg();
+  var clock: fn() -> int64 = cfg->clock;
+  if (clock == 0) { clock = &rz_log_now_us; }
+  var t0: int64 = clock();
+  var st: int32 = next(ctx);
+  var t1: int64 = clock();
+  if (t0 <= 0 || t1 < t0) {
+    atomic_inc_i32(&cfg->stats.clock_missing);
+  }
+  var bytes: int64 = 0;
+  if (ctx != 0) {
+    if (ctx->bytes_written > 0) {
+      bytes = ctx->bytes_written;
+    } else if (ctx->resp != 0) {
+      bytes = rz_resp_body_len(ctx->resp);
+    }
+  }
+  var status: int32 = rz_chain_status(ctx, st);
+  var line: uint8[RZ_LOG_LINE_MAX];
+  var n: int64 = rz_log_format(&line[0], RZ_LOG_LINE_MAX, ctx, status, bytes, t0, t1);
+  var v: string = rz_str_view(&line[0], n);
+  println(v);
+  atomic_inc_i32(&cfg->stats.lines);
+  return st;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// Run: ./mettle-build/bin/mettle test framework/middleware/logging.mettle
+//
+// The formatter is pure, so the line is asserted byte for byte here. The clock
+// is a function pointer on the config, which is what makes the middleware
+// itself testable without a real monotonic clock (the interpreter cannot call
+// clock_gettime — a test that reached it would be skipped).
+// ---------------------------------------------------------------------------
+
+var g_t_log_ticks: int64 = 0;
+
+fn t_log_fake_clock() -> int64 {
+  g_t_log_ticks = g_t_log_ticks + 1;
+  if (g_t_log_ticks == 1) { return 1000; }   // t0
+  return 3500;                               // t1 -> 2.500 ms
+}
+
+fn t_log_zero_clock() -> int64 {
+  return 0;                                   // "the clock could not be read"
+}
+
+fn t_log_term(ctx: RzContext*) -> int32 {
+  if (ctx->resp != 0) {
+    rz_resp_write(ctx->resp, "hello");
+    ctx->resp->status = 201;
+  }
+  ctx->status = 201;
+  return 201;
+}
+
+@test fn t_rz_log_format_line() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  req.verb = "GET";
+  req.path = "/hello/world";
+  var out: uint8[RZ_LOG_LINE_MAX];
+  var n: int64 = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 200, 13, 1000, 1250);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "req verb=GET path=\"/hello/world\" status=200 bytes=13 ms=0.250")) { return 4; }
+  // millisecond padding: 0.004 must not print as 0.4 or 0.04
+  n = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 500, 22, 1000, 1004);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "req verb=GET path=\"/hello/world\" status=500 bytes=22 ms=0.004")) { return 5; }
+  n = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 418, 0, 1000, 2500);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "req verb=GET path=\"/hello/world\" status=418 bytes=0 ms=1.500")) { return 6; }
+  // an abort is visible in the line
+  ctx.aborted = true;
+  n = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 401, 12, 1000, 1001);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "req verb=GET path=\"/hello/world\" status=401 bytes=12 ms=0.001 aborted=1")) { return 7; }
+  ctx.aborted = false;
+  // no context at all still produces one well-formed line
+  n = rz_log_format(&out[0], RZ_LOG_LINE_MAX, 0, 500, 0, 0, 0);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "req verb=- path=\"-\" status=500 bytes=0 ms=na")) { return 8; }
+  return 0;
+}
+
+@test fn t_rz_log_format_escapes_the_path() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  // %0A decodes to a real LF in the path: an unescaped one would forge a line
+  req.verb = "GET";
+  req.path = "/a\ninjected=1";
+  var out: uint8[RZ_LOG_LINE_MAX];
+  var n: int64 = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 200, 0, 1000, 1000);
+  var line: string = rz_str_view(&out[0], n);
+  if (!rz_str_eq(line, "req verb=GET path=\"/a\\ninjected=1\" status=200 bytes=0 ms=0.000")) { return 4; }
+  // quote and backslash are escaped, not passed through
+  req.path = "/q\"b\\c";
+  n = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 200, 0, 1000, 1000);
+  line = rz_str_view(&out[0], n);
+  if (!rz_str_eq(line, "req verb=GET path=\"/q\\\"b\\\\c\" status=200 bytes=0 ms=0.000")) { return 5; }
+  // other C0 bytes become \xNN (no \x string escape in Mettle: build the byte)
+  var ctl: uint8[2];
+  ctl[0] = 47;    // '/'
+  ctl[1] = 1;
+  req.path = rz_str_view(&ctl[0], 2);
+  n = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 200, 0, 1000, 1000);
+  line = rz_str_view(&out[0], n);
+  if (!rz_str_eq(line, "req verb=GET path=\"/\\x01\" status=200 bytes=0 ms=0.000")) { return 6; }
+  // a path longer than RZ_LOG_PATH_MAX input bytes is cut and marked, and the
+  // line still ends where the buffer ends (never a partial escape)
+  var long: uint8[400];
+  var i: int64 = 0;
+  while (i < 400) { long[i] = 65; i = i + 1; }
+  req.path = rz_str_view(&long[0], 400);
+  n = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 200, 0, 1000, 1000);
+  line = rz_str_view(&out[0], n);
+  if (n >= (int64)RZ_LOG_LINE_MAX) { return 7; }
+  if (!rz_str_ends(line, "...\" status=200 bytes=0 ms=0.000")) { return 8; }
+  return 0;
+}
+
+@test fn t_rz_log_no_clock_means_na() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  req.verb = "GET";
+  req.path = "/";
+  var out: uint8[RZ_LOG_LINE_MAX];
+  // a clock that could not be read is reported, never replaced by a wall clock
+  var n: int64 = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 200, 0, 0, 0);
+  if (!rz_str_eq(rz_str_view(&out[0], n), "req verb=GET path=\"/\" status=200 bytes=0 ms=na")) { return 4; }
+  // an end before the start is also "no measurement", not a negative duration
+  n = rz_log_format(&out[0], RZ_LOG_LINE_MAX, &ctx, 200, 0, 2000, 1000);
+  if (!rz_str_ends(rz_str_view(&out[0], n), "ms=na")) { return 5; }
+  return 0;
+}
+
+@test fn t_rz_log_middleware_passthrough() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  defer rz_arena_free(arena);
+  var req: RzRequest;
+  if (!rz_request_init(&req, arena)) { return 2; }
+  var resp: RzResponse* = rz_response_new();
+  if (resp == 0) { return 3; }
+  defer rz_response_free(resp);
+  var ctx: RzContext;
+  rz_ctx_init(&ctx, &req, resp, arena);
+  req.verb = "POST";
+  req.path = "/api/echo";
+  var l: RzLog* = rz_log_new();
+  if (l == 0) { return 4; }
+  defer rz_log_free(l);
+  l->clock = &t_log_fake_clock;
+  if (rz_log_use(l) != 0) { return 5; }
+  g_t_log_ticks = 0;
+  // logging returns exactly what the continuation returned: it observes, never
+  // rewrites
+  if (rz_mw_logging(&ctx, &t_log_term) != 201) { return 6; }
+  if (!rz_str_eq(rz_buf_str(resp->body), "hello")) { return 7; }
+  var st: RzLogStats = rz_log_stats(l);
+  if (st.lines != 1) { return 8; }
+  if (st.clock_missing != 0) { return 9; }
+  // a clock that answers 0 is counted, and the line says ms=na
+  l->clock = &t_log_zero_clock;
+  if (rz_mw_logging(&ctx, &t_log_term) != 201) { return 10; }
+  st = rz_log_stats(l);
+  if (st.lines != 2) { return 11; }
+  if (st.clock_missing != 1) { return 12; }
+  // config plumbing
+  if (rz_log_use(0) != -1) { return 13; }
+  var fresh: RzLog* = rz_log_new();
+  if (fresh == 0) { return 14; }
+  defer rz_log_free(fresh);
+  if (fresh->clock == 0) { return 15; }
+  if (rz_log_stats(0).lines != 0) { return 16; }
+  return 0;
+}

@@ -1,0 +1,77 @@
+// Server session tickets: the session state sealed with the config's
+// ticket key, so the server keeps nothing per client (RFC 5077, RFC 8446
+// 4.6.1). Layout: nonce(12) || ChaCha20-Poly1305(state) || tag(16).
+
+import "std/mem";
+import "cryptex/core/util";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/aead";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+
+/// mtls_ticket_seal: writes the sealed ticket for s to out; returns its
+/// length, or 0 on failure.
+export fn mtls_ticket_seal(cfg: MtlsConfig*, s: MtlsSession*, out: uint8*, cap: int64) -> int64 {
+  var pt: uint8[400];
+  var w: MtlsWr = mtls_wr(&pt[0], 400);
+  mtls_wr_u8(&w, 1);  // format version
+  mtls_wr_u16(&w, (int64)s->version);
+  mtls_wr_u16(&w, (int64)s->suite);
+  mtls_wr_u64(&w, (uint64)s->issued);
+  mtls_wr_u32(&w, (int64)s->lifetime);
+  mtls_wr_u32(&w, (int64)s->age_add);
+  mtls_wr_u8(&w, (int64)s->secretlen);
+  mtls_wr_bytes(&w, &s->secret[0], (int64)s->secretlen);
+  var ems: int64 = 0;
+  if (s->ems) { ems = 1; }
+  mtls_wr_u8(&w, ems);
+  var m: int64 = mtls_wr_open8(&w);
+  mtls_wr_bytes(&w, &s->alpn[0], (int64)s->alpnlen);
+  mtls_wr_close8(&w, m);
+  if (w.bad || cap < 12 + w.len + 16) { cr_wipe(&pt[0], 400); return 0; }
+  if (cr_random_bytes(out, 12) != 0) { cr_wipe(&pt[0], 400); return 0; }
+  var k: MtlsAeadKey;
+  mtls_aead_init(&k, MTLS_AEAD_CHACHA20, &cfg->ticket_key[0]);
+  var rc: int32 = mtls_aead_seal(&k, out, (uint8*)0, 0, &pt[0], w.len, out + 12);
+  cr_wipe(&pt[0], 400);
+  if (rc != MTLS_OK) { return 0; }
+  return 12 + w.len + 16;
+}
+
+/// mtls_ticket_open: decrypts and parses a ticket into s. False for any
+/// ticket we did not make, or one that is damaged.
+export fn mtls_ticket_open(cfg: MtlsConfig*, p: uint8*, n: int64, s: MtlsSession*) -> bool {
+  memset(s, 0, (int64)sizeof(MtlsSession));
+  if (n < 12 + 16 + 20 || n > 400 + 28) { return false; }
+  var pt: uint8[400];
+  var ct: uint8[428];
+  memcpy(&ct[0], p, n);
+  var k: MtlsAeadKey;
+  mtls_aead_init(&k, MTLS_AEAD_CHACHA20, &cfg->ticket_key[0]);
+  if (mtls_aead_open(&k, &ct[0], (uint8*)0, 0, &ct[12], n - 12, &pt[0]) != MTLS_OK) {
+    return false;
+  }
+  var r: MtlsRd = mtls_rd(&pt[0], n - 28);
+  var fmt: int32 = mtls_rd_u8(&r);
+  s->version = mtls_rd_u16(&r);
+  s->suite = mtls_rd_u16(&r);
+  s->issued = (int64)mtls_rd_u64(&r);
+  s->lifetime = (int32)mtls_rd_u32(&r);
+  s->age_add = (uint32)mtls_rd_u32(&r);
+  s->secretlen = mtls_rd_u8(&r);
+  if (s->secretlen > 48) { s->secretlen = 0; r.bad = true; }
+  mtls_rd_copy(&r, &s->secret[0], (int64)s->secretlen);
+  s->ems = mtls_rd_u8(&r) == 1;
+  var alpn: MtlsRd = mtls_rd_vec8(&r);
+  mtls_rd_copy(&alpn, &s->alpn[0], alpn.n);
+  s->alpnlen = (int32)alpn.n;
+  var ok: bool = fmt == 1 && mtls_rd_ok_end(&r);
+  cr_wipe(&pt[0], 400);
+  if (!ok) {
+    cr_wipe((uint8*)s, (int64)sizeof(MtlsSession));
+    return false;
+  }
+  s->valid = true;
+  return true;
+}

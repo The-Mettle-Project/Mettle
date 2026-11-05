@@ -1,0 +1,157 @@
+// Batteries and mains power from /sys/class/power_supply, following the
+// kernel's ABI document (Documentation/ABI/testing/sysfs-class-power).
+// Energy is in microwatt-hours, charge in microampere-hours, power in
+// microwatts, current in microamperes and voltage in microvolts. When only
+// charge is given, energy is charge times the present voltage.
+import "std/mem";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+
+export struct SysinfoLxBattery {
+  pools: SysinfoLxPools;
+  names: SysinfoLxNames;
+  cap: int32;
+}
+
+fn sysinfo_lx_ps_i64(p: SysinfoLxPath*, base: int64, file: string) -> int64 {
+  p->n = base;
+  sysinfo_lx_path_add(p, file);
+  return sysinfo_lx_read_i64(sysinfo_lx_path_str(p), -1);
+}
+
+fn sysinfo_lx_ps_str(p: SysinfoLxPath*, base: int64, file: string, buf: uint8*, cap: int64) -> string {
+  p->n = base;
+  sysinfo_lx_path_add(p, file);
+  var n: int64 = sysinfo_lx_read_small(sysinfo_lx_path_str(p), buf, cap);
+  return sysinfo_lx_view(buf, n);
+}
+
+export fn sysinfo_lx_bat_status(s: string) -> int32 {
+  if (sysinfo_lx_eq(s, "Charging")) { return SYSINFO_BAT_CHARGING; }
+  if (sysinfo_lx_eq(s, "Discharging")) { return SYSINFO_BAT_DISCHARGING; }
+  if (sysinfo_lx_eq(s, "Full")) { return SYSINFO_BAT_FULL; }
+  if (sysinfo_lx_eq(s, "Not charging")) { return SYSINFO_BAT_NOT_CHARGING; }
+  return SYSINFO_BAT_UNKNOWN;
+}
+
+// Reads one battery folder into b.
+fn sysinfo_lx_bat_read(pool: SysinfoLxPool*, p: SysinfoLxPath*, b: SysinfoBattery*) {
+  var base: int64 = p->n;
+  var tmp: uint8[128];
+  var present: int64 = sysinfo_lx_ps_i64(p, base, "/present");
+  b->present = present != 0;
+  b->status = sysinfo_lx_bat_status(sysinfo_lx_ps_str(p, base, "/status", &tmp[0], 128));
+  b->technology = sysinfo_lx_pool_add(pool, sysinfo_lx_ps_str(p, base, "/technology", &tmp[0], 128));
+  b->model = sysinfo_lx_pool_add(pool, sysinfo_lx_ps_str(p, base, "/model_name", &tmp[0], 128));
+  b->manufacturer = sysinfo_lx_pool_add(pool, sysinfo_lx_ps_str(p, base, "/manufacturer", &tmp[0], 128));
+  var uv: int64 = sysinfo_lx_ps_i64(p, base, "/voltage_now");
+  var vdesign: int64 = sysinfo_lx_ps_i64(p, base, "/voltage_min_design");
+  var volts: float64 = -1.0;
+  if (uv > 0) { volts = (float64)uv / 1000000.0; }
+  b->voltage_v = volts;
+  var vcalc: float64 = volts;
+  if (vcalc <= 0.0 && vdesign > 0) { vcalc = (float64)vdesign / 1000000.0; }
+  // energy in Wh, from energy_* or charge_* times voltage
+  var now: int64 = sysinfo_lx_ps_i64(p, base, "/energy_now");
+  var full: int64 = sysinfo_lx_ps_i64(p, base, "/energy_full");
+  var design: int64 = sysinfo_lx_ps_i64(p, base, "/energy_full_design");
+  var mult: float64 = 1.0 / 1000000.0;
+  if (now < 0 && full < 0) {
+    now = sysinfo_lx_ps_i64(p, base, "/charge_now");
+    full = sysinfo_lx_ps_i64(p, base, "/charge_full");
+    design = sysinfo_lx_ps_i64(p, base, "/charge_full_design");
+    mult = -1.0;
+    if (vcalc > 0.0) { mult = vcalc / 1000000.0; }
+  }
+  b->energy_wh = -1.0;
+  b->energy_full_wh = -1.0;
+  b->energy_design_wh = -1.0;
+  if (mult > 0.0) {
+    if (now >= 0) { b->energy_wh = (float64)now * mult; }
+    if (full >= 0) { b->energy_full_wh = (float64)full * mult; }
+    if (design >= 0) { b->energy_design_wh = (float64)design * mult; }
+  }
+  // rate in W, from power_now or current times voltage; the sign of
+  // current_now differs between drivers, so it is dropped
+  var pw: int64 = sysinfo_lx_ps_i64(p, base, "/power_now");
+  b->rate_w = -1.0;
+  if (pw >= 0) {
+    b->rate_w = (float64)pw / 1000000.0;
+  } else {
+    var ua: int64 = sysinfo_lx_ps_i64(p, base, "/current_now");
+    if (ua != -1 && vcalc > 0.0) {
+      if (ua < 0) { ua = -ua; }
+      b->rate_w = (float64)ua / 1000000.0 * vcalc;
+    }
+  }
+  var cap: int64 = sysinfo_lx_ps_i64(p, base, "/capacity");
+  b->capacity_pct = -1.0;
+  if (cap >= 0) { b->capacity_pct = (float64)cap; }
+  else if (b->energy_wh >= 0.0 && b->energy_full_wh > 0.0) { b->capacity_pct = b->energy_wh * 100.0 / b->energy_full_wh; }
+  b->health_pct = -1.0;
+  if (b->energy_full_wh > 0.0 && b->energy_design_wh > 0.0) { b->health_pct = b->energy_full_wh * 100.0 / b->energy_design_wh; }
+  b->cycles = (int32)sysinfo_lx_ps_i64(p, base, "/cycle_count");
+  b->time_to_empty_s = -1.0;
+  b->time_to_full_s = -1.0;
+  if (b->rate_w > 0.0 && b->energy_wh >= 0.0) {
+    if (b->status == SYSINFO_BAT_DISCHARGING) { b->time_to_empty_s = b->energy_wh / b->rate_w * 3600.0; }
+    if (b->status == SYSINFO_BAT_CHARGING && b->energy_full_wh > b->energy_wh) {
+      b->time_to_full_s = (b->energy_full_wh - b->energy_wh) / b->rate_w * 3600.0;
+    }
+  }
+  p->n = base;
+}
+
+export fn sysinfo_lx_battery_init(st: SysinfoLxBattery*, c: SysinfoLxCtx*, out: SysinfoPower*) -> int32 {
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_battery_refresh(st: SysinfoLxBattery*, c: SysinfoLxCtx*, out: SysinfoPower*) -> int32 {
+  var pool: SysinfoLxPool* = sysinfo_lx_pools_next(&st->pools);
+  var dir: SysinfoLxPath;
+  sysinfo_lx_path_at(&dir, c->root, "/sys/class/power_supply");
+  var count: int32 = sysinfo_lx_names(sysinfo_lx_path_str(&dir), "", &st->names);
+  out->ac_online = -1;
+  out->n = 0;
+  var tmp: uint8[64];
+  for i in 0..count {
+    var name: string = sysinfo_lx_names_at(&st->names, i);
+    var p: SysinfoLxPath = dir;
+    sysinfo_lx_path_add(&p, "/");
+    sysinfo_lx_path_add(&p, name);
+    var base: int64 = p.n;
+    var typ: string = sysinfo_lx_ps_str(&p, base, "/type", &tmp[0], 64);
+    if (sysinfo_lx_eq(typ, "Mains")) {
+      var on: int64 = sysinfo_lx_ps_i64(&p, base, "/online");
+      if (on == 1) { out->ac_online = 1; }
+      else if (out->ac_online < 0 && on == 0) { out->ac_online = 0; }
+      continue;
+    }
+    if (!sysinfo_lx_eq(typ, "Battery")) { continue; }
+    // batteries of mice and headsets say scope Device; they are not ours
+    if (sysinfo_lx_eq(sysinfo_lx_ps_str(&p, base, "/scope", &tmp[0], 64), "Device")) { continue; }
+    p.n = base;
+    if (out->n >= st->cap || out->list == 0) {
+      var cc: int32 = st->cap;
+      out->list = (SysinfoBattery*)sysinfo_lx_grow((uint8*)out->list, &cc, out->n + 1, sizeof(SysinfoBattery));
+      st->cap = cc;
+    }
+    var b: SysinfoBattery* = &out->list[out->n];
+    var blank: SysinfoBattery;
+    *b = blank;
+    b->name = sysinfo_lx_pool_add(pool, name);
+    sysinfo_lx_bat_read(pool, &p, b);
+    out->n = out->n + 1;
+  }
+  out->status = SYSINFO_OK;
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_battery_free(st: SysinfoLxBattery*, out: SysinfoPower*) {
+  sysinfo_lx_pools_free(&st->pools);
+  sysinfo_lx_names_free(&st->names);
+  if (out->list != 0) { free(out->list); }
+  out->list = (SysinfoBattery*)0;
+  out->n = 0;
+}

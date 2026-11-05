@@ -1,0 +1,247 @@
+// raize/hub/loop — the hub thread.
+//
+// Everything in this file runs on the hub thread only (the mailbox is the way
+// in from elsewhere). Per epoll wakeup:
+//
+//   1. readable slots: recv until EAGAIN, feed RzWsConn, which calls the
+//      route's on_message for each complete message
+//   2. mailbox: adopt handed-over sockets, deliver cross-thread sends,
+//      broadcasts and closes
+//   3. flush: write every slot's pending output; close slots that are done
+//      and drained; ask for EPOLLOUT only while output is pending
+//
+// The flush pass walks the slot table. That is O(max_conns) per wakeup, which
+// is fine at the default 1024 and is the first thing to replace (a dirty
+// list) when a profile says so.
+
+import "std/mem";
+import "std/thread";
+import "std/bench";
+import "raize_core/str/str";
+import "../ws/frame";
+import "../ws/conn";
+import "../poll/sys";
+import "../poll/poll";
+import "types";
+
+fn rz_hub_tag(i: int32) -> int64 { return (int64)i + 1; }
+
+// Monotonic milliseconds, for idle timeouts only.
+export fn rz_hub_now_ms() -> int64 {
+  return bench_time_us() / 1000;
+}
+
+export fn rz_hub_slot_of(hub: RzHub*, sock: int64) -> RzHubSlot* {
+  if (hub == 0 || sock <= 0) { return 0; }
+  var i: int32 = rz_hub_sock_slot(sock);
+  if (i < 0 || i >= hub->opts.max_conns) { return 0; }
+  var s: RzHubSlot* = &hub->slots[i];
+  if (!s->used || s->id != sock) { return 0; }
+  return s;
+}
+
+fn rz_hub_slot_close(hub: RzHub*, s: RzHubSlot*) {
+  if (!s->used) { return; }
+  if (s->handler != 0 && s->handler->on_close != 0) {
+    s->handler->on_close(hub, s->id, s->state);
+  }
+  rz_poll_del(hub->poll, s->fd);
+  rz_sys_close(s->fd);
+  rz_ws_conn_free(s->ws);
+  s->used = false;
+  s->ws = 0;
+  s->state = 0;
+  s->handler = 0;
+  hub->open = hub->open - 1;
+  hub->stats_closed = hub->stats_closed + 1;
+}
+
+fn rz_hub_on_ws_message(ctx: rawptr, op: int32, payload: string) -> int32 {
+  var s: RzHubSlot* = (RzHubSlot*)ctx;
+  if (s->handler == 0 || s->handler->on_message == 0) { return 0; }
+  return s->handler->on_message(s->hub, s->id, s->state, op, payload);
+}
+
+fn rz_hub_flush(hub: RzHub*, s: RzHubSlot*) {
+  var out: RzBuf* = s->ws->out;
+  while (out->len > 0) {
+    var n: int64 = rz_sys_send(s->fd, out->data, out->len);
+    if (n == RZ_EINTR) { continue; }
+    if (n == RZ_EAGAIN) { break; }
+    if (n <= 0) { rz_hub_slot_close(hub, s); return; }
+    rz_ws_conn_wrote(s->ws, n);
+  }
+  var pending: bool = out->len > 0;
+  if (!pending && rz_ws_conn_done(s->ws)) {
+    rz_hub_slot_close(hub, s);
+    return;
+  }
+  if (pending != s->want_out) {
+    var ev: int32 = RZ_EPOLLIN | RZ_EPOLLRDHUP;
+    if (pending) { ev = ev | RZ_EPOLLOUT; }
+    var i: int32 = rz_hub_sock_slot(s->id);
+    rz_poll_mod(hub->poll, s->fd, ev, rz_hub_tag(i));
+    s->want_out = pending;
+  }
+}
+
+fn rz_hub_read(hub: RzHub*, s: RzHubSlot*, now_ms: int64) {
+  var buf: uint8[16384];
+  while (s->used && !rz_ws_conn_done(s->ws)) {
+    var n: int64 = rz_sys_recv(s->fd, &buf[0], 16384);
+    if (n == RZ_EINTR) { continue; }
+    if (n == RZ_EAGAIN) { break; }
+    if (n <= 0) { rz_hub_slot_close(hub, s); return; }
+    s->last_ms = now_ms;
+    rz_ws_conn_feed(s->ws, &buf[0], n);
+  }
+}
+
+fn rz_hub_adopt_now(hub: RzHub*, a: RzHubAdopt*, now_ms: int64) {
+  atomic_dec_i32(&hub->reserved);
+  var i: int32 = 0;
+  while (i < hub->opts.max_conns && hub->slots[i].used) { i = i + 1; }
+  if (i == hub->opts.max_conns) {
+    rz_sys_close(a->fd);
+    rz__hub_drop(a->drop, a->arg);
+    hub->stats_refused = hub->stats_refused + 1;
+    return;
+  }
+  var s: RzHubSlot* = &hub->slots[i];
+  hub->next_gen = hub->next_gen + 1;
+  s->gen = hub->next_gen;
+  s->id = (s->gen << 16) | (int64)i;
+  s->fd = a->fd;
+  s->hub = hub;
+  s->handler = a->handler;
+  s->want_out = false;
+  s->last_ms = now_ms;
+  s->ws = rz_ws_conn_new(hub->opts.max_message, &rz_hub_on_ws_message, (rawptr)s);
+  if (s->ws == 0 || rz_poll_add(hub->poll, s->fd, RZ_EPOLLIN | RZ_EPOLLRDHUP, rz_hub_tag(i)) < 0) {
+    if (s->ws != 0) { rz_ws_conn_free(s->ws); }
+    rz_sys_close(s->fd);
+    rz__hub_drop(a->drop, a->arg);
+    hub->stats_refused = hub->stats_refused + 1;
+    return;
+  }
+  s->used = true;
+  hub->open = hub->open + 1;
+  hub->stats_opened = hub->stats_opened + 1;
+  s->state = 0;
+  if (s->handler != 0 && s->handler->on_open != 0) {
+    s->state = s->handler->on_open(hub, s->id, a->arg);
+  }
+  if (a->early_len > 0 && s->used) { rz_ws_conn_feed(s->ws, a->early, a->early_len); }
+}
+
+fn rz_hub_bytes_free(b: RzHubBytes*) {
+  if (b == 0) { return; }
+  if (b->data != 0) { free((rawptr)b->data); }
+  free((rawptr)b);
+}
+
+// Hub-thread send. Returns 0, or -1 when the socket is gone or closing.
+export fn rz_hub_send_op(hub: RzHub*, sock: int64, opcode: int32, payload: string) -> int32 {
+  var s: RzHubSlot* = rz_hub_slot_of(hub, sock);
+  if (s == 0) { return -1; }
+  return rz_ws_conn_send(s->ws, opcode, payload);
+}
+
+// Hub-thread broadcast to every open socket. Returns the number reached.
+export fn rz_hub_broadcast_op(hub: RzHub*, opcode: int32, payload: string) -> int32 {
+  var reached: int32 = 0;
+  var i: int32 = 0;
+  while (i < hub->opts.max_conns) {
+    if (hub->slots[i].used && rz_ws_conn_send(hub->slots[i].ws, opcode, payload) == 0) {
+      reached = reached + 1;
+    }
+    i = i + 1;
+  }
+  return reached;
+}
+
+// Hub-thread close: queue a close frame, wait for the peer's reply.
+export fn rz_hub_close_sock(hub: RzHub*, sock: int64, code: int32) {
+  var s: RzHubSlot* = rz_hub_slot_of(hub, sock);
+  if (s == 0) { return; }
+  rz_ws_conn_close(s->ws, code, "");
+}
+
+// Drains the mailbox. Returns false when a STOP message arrived.
+fn rz_hub_mailbox(hub: RzHub*, now_ms: int64) -> bool {
+  var m: RzPollMsg;
+  var keep: bool = true;
+  while (rz_poll_take(hub->poll, &m)) {
+    if (m.kind == RZ_HUB_MSG_ADOPT) {
+      var a: RzHubAdopt* = (RzHubAdopt*)m.ptr;
+      rz_hub_adopt_now(hub, a, now_ms);
+      if (a->early != 0) { free((rawptr)a->early); }
+      free((rawptr)a);
+    } else if (m.kind == RZ_HUB_MSG_SEND || m.kind == RZ_HUB_MSG_BROADCAST) {
+      var b: RzHubBytes* = (RzHubBytes*)m.ptr;
+      var text: string = rz_str_view(b->data, b->len);
+      if (m.kind == RZ_HUB_MSG_SEND) {
+        rz_hub_send_op(hub, m.a, (int32)m.b, text);
+      } else {
+        rz_hub_broadcast_op(hub, (int32)m.b, text);
+      }
+      rz_hub_bytes_free(b);
+    } else if (m.kind == RZ_HUB_MSG_CLOSE) {
+      rz_hub_close_sock(hub, m.a, (int32)m.b);
+    } else if (m.kind == RZ_HUB_MSG_CALL) {
+      var call: RzHubCall* = (RzHubCall*)m.ptr;
+      call->fn_(hub, call->arg);
+      free((rawptr)call);
+    } else if (m.kind == RZ_HUB_MSG_STOP) {
+      keep = false;
+    }
+  }
+  return keep;
+}
+
+fn rz_hub_sweep(hub: RzHub*, now_ms: int64) {
+  var i: int32 = 0;
+  while (i < hub->opts.max_conns) {
+    var s: RzHubSlot* = &hub->slots[i];
+    if (s->used && hub->opts.idle_ms > 0 && now_ms - s->last_ms > (int64)hub->opts.idle_ms) {
+      rz_ws_conn_close(s->ws, RZ_WS_CLOSE_GOING_AWAY, "idle");
+      s->last_ms = now_ms;    // one close per idle period, then the peer's reply
+    }
+    if (s->used) { rz_hub_flush(hub, s); }
+    i = i + 1;
+  }
+}
+
+// CreateThread entry. `arg` is the RzHub*.
+export fn rz_hub_thread_main(arg: cstring) -> uint32 {
+  var hub: RzHub* = (RzHub*)arg;
+  var running: bool = true;
+  while (running) {
+    var n: int32 = rz_poll_wait(hub->poll, 1000);
+    var now_ms: int64 = rz_hub_now_ms();
+    var k: int32 = 0;
+    while (k < n) {
+      var e: RzPollEvent = rz_poll_event(hub->poll, k);
+      if (e.tag == RZ_POLL_WAKE) {
+        running = rz_hub_mailbox(hub, now_ms);
+      } else if (e.tag >= 1 && e.tag <= (int64)hub->opts.max_conns) {
+        var s: RzHubSlot* = &hub->slots[(int32)(e.tag - 1)];
+        if (s->used) { rz_hub_read(hub, s, now_ms); }
+      }
+      k = k + 1;
+    }
+    rz_hub_sweep(hub, now_ms);
+  }
+  // Shutdown: tell every peer, then drop the sockets.
+  var i: int32 = 0;
+  while (i < hub->opts.max_conns) {
+    var s: RzHubSlot* = &hub->slots[i];
+    if (s->used) {
+      rz_ws_conn_close(s->ws, RZ_WS_CLOSE_GOING_AWAY, "shutdown");
+      rz_sys_send(s->fd, s->ws->out->data, s->ws->out->len);
+      rz_hub_slot_close(hub, s);
+    }
+    i = i + 1;
+  }
+  return 0;
+}

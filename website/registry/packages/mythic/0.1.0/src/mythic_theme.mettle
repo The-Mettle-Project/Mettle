@@ -1,0 +1,309 @@
+// mythic_theme: theme data mirroring DESIGN-SYSTEM tokens one to one (DECISIONS §9).
+// Field rule: token name with '.' and '-' replaced by '_'. Values transcribed from DESIGN-SYSTEM.
+// The ui-taking accessors (mythic_set_theme, mythic_theme, mythic_theme_push/pop, mythic_sp) live in
+// mythic_ctx, because MythicUi embeds a MythicTheme and imports this file.
+import "mythic_types";
+
+export struct MythicColors {
+  // §2 tokens
+  bg_window: uint32; bg_surface: uint32; bg_surface_raised: uint32; bg_surface_sunken: uint32;
+  bg_input: uint32; bg_tooltip: uint32; bg_hover: uint32; bg_pressed: uint32;
+  control_track: uint32;
+  border_subtle: uint32; border_default: uint32; border_strong: uint32;
+  border_control: uint32; border_control_hover: uint32;
+  text_primary: uint32; text_secondary: uint32; text_tertiary: uint32; text_disabled: uint32;
+  text_on_accent: uint32; text_tooltip: uint32;
+  accent: uint32; accent_hover: uint32; accent_pressed: uint32; accent_subtle: uint32;
+  accent_subtle_hover: uint32; accent_text: uint32; accent_subtle_text: uint32;
+  focus_ring: uint32; focus_glow: uint32;
+  success: uint32; success_subtle: uint32;
+  warning: uint32; warning_solid: uint32; warning_subtle: uint32;
+  danger: uint32; danger_hover: uint32; danger_pressed: uint32; danger_text: uint32;
+  danger_subtle: uint32; danger_glow: uint32;
+  selection: uint32; selection_inactive: uint32;
+  scrollbar_thumb: uint32; scrollbar_thumb_hover: uint32; scrollbar_thumb_active: uint32; scrollbar_track: uint32;
+  shadow_color: uint32;
+  // §5 / §7 literals promoted to named fields (0 = not drawn)
+  highlight_accent: uint32;                 // top highlight over accent/danger fills
+  highlight_secondary: uint32;              // top highlight over secondary buttons (dark only)
+  elevated_border: uint32;                  // 1px border on e2+ surfaces (dark only)
+  btn_secondary_bg: uint32; btn_secondary_bg_hover: uint32; btn_secondary_bg_pressed: uint32;
+  btn_secondary_border: uint32; btn_secondary_border_hover: uint32; btn_secondary_border_pressed: uint32;
+  radio_dot: uint32;
+  switch_track_off_hover: uint32; switch_knob_off: uint32; switch_knob_on: uint32;
+  slider_thumb: uint32; slider_thumb_border: uint32; slider_halo_hover: uint32; slider_halo_pressed: uint32;
+  input_border_focus: uint32; caret: uint32;
+  tooltip_border: uint32; tooltip_shortcut: uint32;
+}
+
+export struct MythicTypeScale {
+  caption: MythicTextStyle; caption_strong: MythicTextStyle; body: MythicTextStyle; body_strong: MythicTextStyle;
+  label: MythicTextStyle; label_sm: MythicTextStyle; title: MythicTextStyle; heading: MythicTextStyle;
+  display: MythicTextStyle; mono: MythicTextStyle;
+}
+
+export struct MythicRadii { xs: float32; sm: float32; md: float32; lg: float32; xl: float32; }   // full = height/2
+
+export struct MythicElevLevel { count: int32; s: MythicShadow[2]; }
+export struct MythicElevation { e0: MythicElevLevel; e1: MythicElevLevel; e2: MythicElevLevel; e3: MythicElevLevel; e4: MythicElevLevel; }
+
+// τ values and durations, ms (DESIGN-SYSTEM §6.2)
+export struct MythicMotion {
+  hover_in_tau: float32; hover_out_tau: float32; press_in_tau: float32; press_out_tau: float32;
+  focus_tau: float32;
+  check_ms: float32; check_fill_ms: float32; check_draw_start_ms: float32; uncheck_ms: float32;
+  press_scale: float32;
+  radio_ms: float32; switch_ms: float32; switch_press_tau: float32;
+  slider_halo_tau: float32; slider_key_ms: float32;
+  progress_ms: float32; progress_loop_ms: float32;
+  tab_ms: float32;
+  tooltip_in_ms: float32; tooltip_out_ms: float32; tooltip_delay_ms: float32; tooltip_warm_ms: float32;
+  tooltip_shift: float32;
+  scrollbar_show_ms: float32; scrollbar_hide_delay_ms: float32; scrollbar_fade_ms: float32;
+  scrollbar_width_tau: float32; scroll_tau: float32;
+  caret_solid_ms: float32; caret_on_ms: float32; caret_fade_ms: float32; caret_idle_ms: float32;
+  reduced_color_cap_ms: float32;
+}
+
+export struct MythicControlSize { height: float32; pad_x_button: float32; pad_x_input: float32; icon: float32;
+                                radius: float32; text: MythicTextStyle; }
+export struct MythicControlSizes { sm: MythicControlSize; md: MythicControlSize; lg: MythicControlSize; }
+
+export struct MythicTheme {
+  colors: MythicColors;
+  type: MythicTypeScale;
+  radius: MythicRadii;
+  elevation: MythicElevation;
+  motion: MythicMotion;
+  ctrl: MythicControlSizes;
+  space: float32;              // spacing grid unit (4); mythic_sp(ui, n) = n * space
+  reduced_motion: bool;
+  disabled_alpha: float32;
+  dark: bool;
+}
+
+fn ts(font: int32, size: float32, lh: float32, tr: float32) -> MythicTextStyle {
+  var s: MythicTextStyle = { font: font, size: size, line_height: lh, tracking: tr };
+  return s;
+}
+fn sh(dy: float32, blur: float32, spread: float32, color: uint32) -> MythicShadow {
+  var s: MythicShadow = { dx: 0.0, dy: dy, blur: blur, spread: spread, color: color };
+  return s;
+}
+fn lvl1(a: MythicShadow) -> MythicElevLevel { var l: MythicElevLevel; l.count = 1; l.s[0] = a; return l; }
+fn lvl2(a: MythicShadow, b: MythicShadow) -> MythicElevLevel { var l: MythicElevLevel; l.count = 2; l.s[0] = a; l.s[1] = b; return l; }
+fn ctl(h: float32, pxb: float32, pxi: float32, icon: float32, r: float32, t: MythicTextStyle) -> MythicControlSize {
+  var c: MythicControlSize = { height: h, pad_x_button: pxb, pad_x_input: pxi, icon: icon, radius: r };
+  c.text = t;
+  return c;
+}
+
+fn colors_light() -> MythicColors {
+  var c: MythicColors;
+  c.bg_window = 0xFFF6F7F9;
+  c.bg_surface = 0xFFFFFFFF;
+  c.bg_surface_raised = 0xFFFFFFFF;
+  c.bg_surface_sunken = 0xFFF0F2F5;
+  c.bg_input = 0xFFFFFFFF;
+  c.bg_tooltip = 0xFF1C1E24;
+  c.bg_hover = 0x0D16181D;
+  c.bg_pressed = 0x1716181D;
+  c.control_track = 0xFFDADDE3;
+  c.border_subtle = 0xFFE8EAEE;
+  c.border_default = 0xFFDCDFE5;
+  c.border_strong = 0xFFC4C8D0;
+  c.border_control = 0xFF868C98;
+  c.border_control_hover = 0xFF6B7180;
+  c.text_primary = 0xFF16181D;
+  c.text_secondary = 0xFF5A606C;
+  c.text_tertiary = 0xFF6B7180;
+  c.text_disabled = 0xFFA9AEB8;
+  c.text_on_accent = 0xFFFFFFFF;
+  c.text_tooltip = 0xFFF3F4F6;
+  c.accent = 0xFF3A5CE9;
+  c.accent_hover = 0xFF3352DA;
+  c.accent_pressed = 0xFF2C47BF;
+  c.accent_subtle = 0xFFEBEFFD;
+  c.accent_subtle_hover = 0xFFDFE5FC;
+  c.accent_text = 0xFF3A5CE9;
+  c.accent_subtle_text = 0xFF2F4FD6;
+  c.focus_ring = 0xFF3A5CE9;
+  c.focus_glow = 0x403A5CE9;
+  c.success = 0xFF1A7F45;
+  c.success_subtle = 0xFFE8F6EE;
+  c.warning = 0xFFA35300;
+  c.warning_solid = 0xFFF0A33A;
+  c.warning_subtle = 0xFFFDF3E3;
+  c.danger = 0xFFD92D3A;
+  c.danger_hover = 0xFFC42633;
+  c.danger_pressed = 0xFFAD1F2B;
+  c.danger_text = 0xFFC42B36;
+  c.danger_subtle = 0xFFFDECEC;
+  c.danger_glow = 0x33D92D3A;
+  c.selection = 0x383A5CE9;
+  c.selection_inactive = 0x1A16181D;
+  c.scrollbar_thumb = 0x4716181D;
+  c.scrollbar_thumb_hover = 0x6616181D;
+  c.scrollbar_thumb_active = 0x8016181D;
+  c.scrollbar_track = 0x0A16181D;
+  c.shadow_color = 0xFF101828;
+  c.highlight_accent = 0x1FFFFFFF;
+  c.highlight_secondary = 0x00000000;
+  c.elevated_border = 0x00000000;
+  c.btn_secondary_bg = 0xFFFFFFFF;
+  c.btn_secondary_bg_hover = 0xFFF6F7F9;
+  c.btn_secondary_bg_pressed = 0xFFEEF0F3;
+  c.btn_secondary_border = 0xFFDCDFE5;
+  c.btn_secondary_border_hover = 0xFFC4C8D0;
+  c.btn_secondary_border_pressed = 0xFFC4C8D0;
+  c.radio_dot = 0xFFFFFFFF;
+  c.switch_track_off_hover = 0xFFC9CDD5;
+  c.switch_knob_off = 0xFFFFFFFF;
+  c.switch_knob_on = 0xFFFFFFFF;
+  c.slider_thumb = 0xFFFFFFFF;
+  c.slider_thumb_border = 0x14000000;
+  c.slider_halo_hover = 0x243A5CE9;
+  c.slider_halo_pressed = 0x383A5CE9;
+  c.input_border_focus = 0xFF3A5CE9;
+  c.caret = 0xFF3A5CE9;
+  c.tooltip_border = 0x00000000;
+  c.tooltip_shortcut = 0xFFA3A7B0;
+  return c;
+}
+
+fn colors_dark() -> MythicColors {
+  var c: MythicColors;
+  c.bg_window = 0xFF111214;
+  c.bg_surface = 0xFF18191C;
+  c.bg_surface_raised = 0xFF1F2024;
+  c.bg_surface_sunken = 0xFF0E0F11;
+  c.bg_input = 0xFF0E0F11;
+  c.bg_tooltip = 0xFF2A2C31;
+  c.bg_hover = 0x0FFFFFFF;
+  c.bg_pressed = 0x1AFFFFFF;
+  c.control_track = 0xFF33353B;
+  c.border_subtle = 0xFF24262B;
+  c.border_default = 0xFF2E3036;
+  c.border_strong = 0xFF42454D;
+  c.border_control = 0xFF6B707B;
+  c.border_control_hover = 0xFF868B96;
+  c.text_primary = 0xFFEDEEF0;
+  c.text_secondary = 0xFFA3A7B0;
+  c.text_tertiary = 0xFF868B96;
+  c.text_disabled = 0xFF50545C;
+  c.text_on_accent = 0xFFFFFFFF;
+  c.text_tooltip = 0xFFEDEEF0;
+  c.accent = 0xFF3D63F0;
+  c.accent_hover = 0xFF4568F2;
+  c.accent_pressed = 0xFF3457DB;
+  c.accent_subtle = 0xFF1E253E;
+  c.accent_subtle_hover = 0xFF252E4D;
+  c.accent_text = 0xFF7D9BFF;
+  c.accent_subtle_text = 0xFF9CB3FF;
+  c.focus_ring = 0xFF6D8CFF;
+  c.focus_glow = 0x593D63F0;
+  c.success = 0xFF4CC38A;
+  c.success_subtle = 0xFF14271D;
+  c.warning = 0xFFF0A33A;
+  c.warning_solid = 0xFFF0A33A;
+  c.warning_subtle = 0xFF2D2213;
+  c.danger = 0xFFD92D3A;
+  c.danger_hover = 0xFFC42633;
+  c.danger_pressed = 0xFFAD1F2B;
+  c.danger_text = 0xFFFF6B70;
+  c.danger_subtle = 0xFF2E1717;
+  c.danger_glow = 0x40FF6B70;
+  c.selection = 0x613D63F0;
+  c.selection_inactive = 0x24FFFFFF;
+  c.scrollbar_thumb = 0x3DEDEEF0;
+  c.scrollbar_thumb_hover = 0x5CEDEEF0;
+  c.scrollbar_thumb_active = 0x75EDEEF0;
+  c.scrollbar_track = 0x0AFFFFFF;
+  c.shadow_color = 0xFF000000;
+  c.highlight_accent = 0x1FFFFFFF;
+  c.highlight_secondary = 0x0DFFFFFF;
+  c.elevated_border = 0xFF2E3036;
+  c.btn_secondary_bg = 0xFF232428;
+  c.btn_secondary_bg_hover = 0xFF2A2C31;
+  c.btn_secondary_bg_pressed = 0xFF1F2024;
+  c.btn_secondary_border = 0xFF34363C;
+  c.btn_secondary_border_hover = 0xFF3E4148;
+  c.btn_secondary_border_pressed = 0xFF3E4148;
+  c.radio_dot = 0xFFFFFFFF;
+  c.switch_track_off_hover = 0xFF3E4148;
+  c.switch_knob_off = 0xFFE6E7EA;
+  c.switch_knob_on = 0xFFFFFFFF;
+  c.slider_thumb = 0xFFFFFFFF;
+  c.slider_thumb_border = 0x00000000;
+  c.slider_halo_hover = 0x243D63F0;
+  c.slider_halo_pressed = 0x383D63F0;
+  c.input_border_focus = 0xFF6D8CFF;
+  c.caret = 0xFF6D8CFF;
+  c.tooltip_border = 0xFF3A3D44;
+  c.tooltip_shortcut = 0xFFA3A7B0;
+  return c;
+}
+
+// DESIGN-SYSTEM §3.3 / §4 / §6.2 values shared by both themes.
+fn theme_common() -> MythicTheme {
+  var t: MythicTheme;
+  // Regular roles are Geist Serif, medium and semibold roles Geist Sans; all at tracking 0.
+  t.type.caption = ts(MYTHIC_FONT_REGULAR, 12.0, 16.0, 0.0);
+  t.type.caption_strong = ts(MYTHIC_FONT_MEDIUM, 12.0, 16.0, 0.0);
+  t.type.body = ts(MYTHIC_FONT_REGULAR, 14.0, 20.0, 0.0);
+  t.type.body_strong = ts(MYTHIC_FONT_SEMIBOLD, 14.0, 20.0, 0.0);
+  t.type.label = ts(MYTHIC_FONT_MEDIUM, 14.0, 20.0, 0.0);
+  t.type.label_sm = ts(MYTHIC_FONT_MEDIUM, 13.0, 16.0, 0.0);
+  t.type.title = ts(MYTHIC_FONT_SEMIBOLD, 16.0, 24.0, 0.0);
+  t.type.heading = ts(MYTHIC_FONT_SEMIBOLD, 20.0, 28.0, 0.0);
+  t.type.display = ts(MYTHIC_FONT_SEMIBOLD, 28.0, 36.0, 0.0);
+  t.type.mono = ts(MYTHIC_FONT_MONO, 13.0, 20.0, 0.0);      // or MYTHIC_FONT_MONO_ALT (IBM Plex Mono)
+  t.radius.xs = 2.0; t.radius.sm = 4.0; t.radius.md = 6.0; t.radius.lg = 8.0; t.radius.xl = 12.0;
+  var m: MythicMotion* = &t.motion;
+  m->hover_in_tau = 25.0; m->hover_out_tau = 50.0; m->press_in_tau = 15.0; m->press_out_tau = 40.0;
+  m->focus_tau = 30.0;
+  m->check_ms = 180.0; m->check_fill_ms = 100.0; m->check_draw_start_ms = 40.0; m->uncheck_ms = 120.0;
+  m->press_scale = 0.92;
+  m->radio_ms = 160.0; m->switch_ms = 200.0; m->switch_press_tau = 40.0;
+  m->slider_halo_tau = 40.0; m->slider_key_ms = 120.0;
+  m->progress_ms = 280.0; m->progress_loop_ms = 1500.0;
+  m->tab_ms = 240.0;
+  m->tooltip_in_ms = 120.0; m->tooltip_out_ms = 80.0; m->tooltip_delay_ms = 500.0; m->tooltip_warm_ms = 400.0;
+  m->tooltip_shift = 4.0;
+  m->scrollbar_show_ms = 100.0; m->scrollbar_hide_delay_ms = 800.0; m->scrollbar_fade_ms = 300.0;
+  m->scrollbar_width_tau = 40.0; m->scroll_tau = 50.0;
+  m->caret_solid_ms = 500.0; m->caret_on_ms = 530.0; m->caret_fade_ms = 100.0; m->caret_idle_ms = 10000.0;
+  m->reduced_color_cap_ms = 80.0;
+  t.ctrl.sm = ctl(28.0, 10.0, 8.0, 14.0, 6.0, t.type.label_sm);
+  t.ctrl.md = ctl(32.0, 12.0, 10.0, 16.0, 6.0, t.type.label);
+  t.ctrl.lg = ctl(40.0, 16.0, 12.0, 16.0, 8.0, t.type.label);
+  t.space = 4.0;
+  return t;
+}
+
+/// The built-in light theme (DESIGN-SYSTEM §2.1, §5).
+export fn mythic_theme_light() -> MythicTheme {
+  var t: MythicTheme = theme_common();
+  t.colors = colors_light();
+  var c: uint32 = 0x101828;
+  t.elevation.e1 = lvl1(sh(1.0, 2.0, 0.0, c | 0x0F000000));
+  t.elevation.e2 = lvl2(sh(1.0, 3.0, 0.0, c | 0x1A000000), sh(1.0, 2.0, -1.0, c | 0x0F000000));
+  t.elevation.e3 = lvl2(sh(4.0, 8.0, -2.0, c | 0x1A000000), sh(2.0, 4.0, -2.0, c | 0x0F000000));
+  t.elevation.e4 = lvl2(sh(12.0, 24.0, -4.0, c | 0x24000000), sh(4.0, 8.0, -2.0, c | 0x0F000000));
+  t.disabled_alpha = 0.45;
+  t.dark = false;
+  return t;
+}
+
+/// The built-in dark theme (DESIGN-SYSTEM §2.2, §5).
+export fn mythic_theme_dark() -> MythicTheme {
+  var t: MythicTheme = theme_common();
+  t.colors = colors_dark();
+  t.elevation.e1 = lvl1(sh(1.0, 2.0, 0.0, 0x4D000000));
+  t.elevation.e2 = lvl2(sh(1.0, 3.0, 0.0, 0x66000000), sh(1.0, 2.0, -1.0, 0x4D000000));
+  t.elevation.e3 = lvl2(sh(4.0, 8.0, -2.0, 0x73000000), sh(2.0, 4.0, -2.0, 0x4D000000));
+  t.elevation.e4 = lvl2(sh(12.0, 24.0, -4.0, 0x8C000000), sh(4.0, 8.0, -2.0, 0x59000000));
+  t.disabled_alpha = 0.40;
+  t.dark = true;
+  return t;
+}

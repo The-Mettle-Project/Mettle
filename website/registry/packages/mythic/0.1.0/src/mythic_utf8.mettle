@@ -1,0 +1,91 @@
+// mythic_utf8: UTF-8 decode/encode helpers.
+// Invalid input (bad lead byte, bad continuation, overlong form, surrogate, > U+10FFFF,
+// truncated sequence) decodes to U+FFFD and consumes exactly one byte.
+import "mythic_types";
+
+export const MYTHIC_UTF8_REPLACEMENT: uint32 = 0xFFFD;
+
+/// Decodes the code point starting at byte `i` of `s[0..len)`. Stores it in `*cp` and returns
+/// the index of the next code point. Returns `i` (and stores 0) when `i >= len`.
+export fn mythic_utf8_decode(s: uint8*, len: int64, i: int64, cp: uint32*) -> int64 {
+  if (i >= len) { *cp = 0; return i; }
+  var b0: uint32 = (uint32)s[i];
+  if (b0 < (uint32)0x80) { *cp = b0; return i + 1; }
+  var need: int64 = 0;
+  var c: uint32 = 0;
+  var min: uint32 = 0;
+  if (b0 >= (uint32)0xC2 && b0 <= (uint32)0xDF) { need = 1; c = b0 & (uint32)0x1F; min = 0x80; }
+  else if (b0 >= (uint32)0xE0 && b0 <= (uint32)0xEF) { need = 2; c = b0 & (uint32)0x0F; min = 0x800; }
+  else if (b0 >= (uint32)0xF0 && b0 <= (uint32)0xF4) { need = 3; c = b0 & (uint32)0x07; min = 0x10000; }
+  else { *cp = MYTHIC_UTF8_REPLACEMENT; return i + 1; }
+  if (i + need >= len) { *cp = MYTHIC_UTF8_REPLACEMENT; return i + 1; }
+  var k: int64 = 1;
+  while (k <= need) {
+    var b: uint32 = (uint32)s[i + k];
+    if ((b & (uint32)0xC0) != (uint32)0x80) { *cp = MYTHIC_UTF8_REPLACEMENT; return i + 1; }
+    c = (c << (uint32)6) | (b & (uint32)0x3F);
+    k = k + 1;
+  }
+  if (c < min || c > (uint32)0x10FFFF || (c >= (uint32)0xD800 && c <= (uint32)0xDFFF)) {
+    *cp = MYTHIC_UTF8_REPLACEMENT;
+    return i + 1;
+  }
+  *cp = c;
+  return i + 1 + need;
+}
+
+/// Encodes `cp` into `out` (at least 4 bytes). Returns the byte count (invalid -> U+FFFD).
+export fn mythic_utf8_encode(cp: uint32, out: uint8*) -> int32 {
+  var c: uint32 = cp;
+  if (c > (uint32)0x10FFFF || (c >= (uint32)0xD800 && c <= (uint32)0xDFFF)) { c = MYTHIC_UTF8_REPLACEMENT; }
+  if (c < (uint32)0x80) { out[0] = (uint8)c; return 1; }
+  if (c < (uint32)0x800) {
+    out[0] = (uint8)((uint32)0xC0 | (c >> (uint32)6));
+    out[1] = (uint8)((uint32)0x80 | (c & (uint32)0x3F));
+    return 2;
+  }
+  if (c < (uint32)0x10000) {
+    out[0] = (uint8)((uint32)0xE0 | (c >> (uint32)12));
+    out[1] = (uint8)((uint32)0x80 | ((c >> (uint32)6) & (uint32)0x3F));
+    out[2] = (uint8)((uint32)0x80 | (c & (uint32)0x3F));
+    return 3;
+  }
+  out[0] = (uint8)((uint32)0xF0 | (c >> (uint32)18));
+  out[1] = (uint8)((uint32)0x80 | ((c >> (uint32)12) & (uint32)0x3F));
+  out[2] = (uint8)((uint32)0x80 | ((c >> (uint32)6) & (uint32)0x3F));
+  out[3] = (uint8)((uint32)0x80 | (c & (uint32)0x3F));
+  return 4;
+}
+
+/// Number of code points in `s[0..len)` (each invalid byte counts as one).
+export fn mythic_utf8_count(s: uint8*, len: int64) -> int64 {
+  var i: int64 = 0;
+  var n: int64 = 0;
+  var cp: uint32 = 0;
+  while (i < len) { i = mythic_utf8_decode(s, len, i, &cp); n = n + 1; }
+  return n;
+}
+
+/// Index of the code point after the one at byte `i` (the next caret stop); `len` at the end.
+export fn mythic_utf8_next(s: uint8*, len: int64, i: int64) -> int64 {
+  if (i >= len) { return len; }
+  var cp: uint32 = 0;
+  return mythic_utf8_decode(s, len, i, &cp);
+}
+
+/// Start of the code point that ends at byte `i` (the previous caret stop); 0 at the start.
+/// Agrees with mythic_utf8_decode on invalid input, where every bad byte is its own code point.
+export fn mythic_utf8_prev(s: uint8*, len: int64, i: int64) -> int64 {
+  if (i <= 0) { return 0; }
+  var e: int64 = i;
+  if (e > len) { e = len; }
+  // the longest sequence that decodes to exactly [j, e) wins; a lead byte never sits inside one
+  var j: int64 = e - 4;
+  if (j < 0) { j = 0; }
+  var cp: uint32 = 0;
+  while (j < e - 1) {
+    if (mythic_utf8_decode(s, len, j, &cp) == e) { return j; }
+    j = j + 1;
+  }
+  return e - 1;
+}

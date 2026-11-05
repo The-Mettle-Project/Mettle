@@ -1,0 +1,36 @@
+// The system trust store on Windows: the "ROOT" certificate store, read
+// through Crypt32. The internal linker does not search crypt32.dll, so
+// link with `--link-arg crypt32.lib` (or --linker msvc).
+
+import "mtls/core/err";
+import "mtls/x509/verify";
+
+extern fn mtls_x_cert_open(prov: int64, name: cstring) -> int64 = "CertOpenSystemStoreA";
+extern fn mtls_x_cert_next(store: int64, prev: int64) -> int64 = "CertEnumCertificatesInStore";
+extern fn mtls_x_cert_close(store: int64, flags: uint32) -> int32 = "CertCloseStore";
+
+/// mtls_sysroots_native: loads the Windows root store into r. Returns how
+/// many certificates were added, or MTLS_E_IO if the store cannot be opened.
+export fn mtls_sysroots_native(r: MtlsRoots*) -> int32 {
+  var store: int64 = mtls_x_cert_open(0, "ROOT");
+  if (store == 0) { return MTLS_E_IO; }
+  var added: int32 = 0;
+  var ctx: int64 = 0;
+  while (true) {
+    // CertEnumCertificatesInStore frees the context it is given.
+    ctx = mtls_x_cert_next(store, ctx);
+    if (ctx == 0) { break; }
+    // CERT_CONTEXT: dwCertEncodingType, pbCertEncoded at 8, cbCertEncoded at 16.
+    var cp: uint8* = (uint8*)ctx;
+    var enc: uint8* = *(uint8**)(cp + 8);
+    var len: int64 = (int64)*(uint32*)(cp + 16);
+    var before: int32 = r->count;
+    if (mtls_roots_add_der(r, enc, len) != MTLS_OK) {
+      r->skipped = r->skipped + 1;
+    } else if (r->count > before) {
+      added = added + 1;
+    }
+  }
+  mtls_x_cert_close(store, 0);
+  return added;
+}

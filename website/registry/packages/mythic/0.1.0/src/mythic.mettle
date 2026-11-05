@@ -1,0 +1,30 @@
+// mythic: umbrella module. Imports every module; declares nothing itself (DECISIONS §1).
+// Apps: put `mythic=/path/to/mythic/src` in a mettle.deps file and `import "mythic/mythic";`.
+import "mythic_base";
+import "mythic_types";
+import "mythic_utf8";
+import "mythic_ttf";
+import "mythic_glyph";
+import "mythic_fonts";
+import "mythic_text";
+import "mythic_dl";
+import "mythic_image";
+import "mythic_raster_path";
+import "mythic_raster_shadow";
+import "mythic_raster";
+import "mythic_render_gl";
+import "mythic_png";
+import "mythic_plat";
+import "mythic_theme";
+import "mythic_ctx";
+import "mythic_anim";
+import "mythic_paint";
+import "mythic_layout";
+import "mythic_icons";
+import "mythic_w_basic";
+import "mythic_w_toggle";
+import "mythic_w_text_input";
+import "mythic_w_scroll";
+import "mythic_w_tabs";
+import "mythic_w_tooltip";
+import "mythic_app";

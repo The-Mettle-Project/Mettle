@@ -1,0 +1,29 @@
+// gRPC message framing on top of std/http2. A gRPC message on an HTTP/2
+// stream is a 5-byte prefix (a compressed flag and a big-endian length) and
+// the protobuf bytes. Generated service code calls these; std/http2's
+// h2_grpc_read splits incoming DATA into H2GrpcMessage values.
+import "std/http2";
+import "codec/core/status";
+import "codec/core/rev";
+
+// Puts the 5-byte prefix in front of the message written into w after `mark`
+// (a codec_rev_len taken before encoding; 0 for everything in w). Because w
+// grows toward the front, frame each message on its own before sending it.
+export fn codec_grpc_frame(w: CodecRev*, mark: int64) {
+  var n: int64 = codec_rev_len(w) - mark;
+  if (n > 4294967295) {
+    if (w->err == CODEC_OK) { w->err = CODEC_ERR_LIMIT; }
+    return;
+  }
+  var p: uint8* = codec_rev_reserve(w, 5);
+  if (p == 0) { return; }
+  h2_grpc_write_prefix(p, n, false);
+}
+
+// The protobuf bytes of a message h2_grpc_read found, as a view.
+export fn codec_grpc_payload(m: H2GrpcMessage*) -> string {
+  var s: string;
+  s.chars = m->data;
+  s.length = (uint64)m->length;
+  return s;
+}

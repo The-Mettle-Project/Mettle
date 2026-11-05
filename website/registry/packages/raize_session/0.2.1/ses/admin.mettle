@@ -1,0 +1,145 @@
+// Rotation, revocation and pruning.
+
+import "std/mem";
+import "cryptex/cryptex";
+import "status";
+import "types";
+import "store";
+import "config";
+import "token";
+import "lifecycle";
+
+/// Reports whether the rotation policy asks for a new token: rotate_interval
+/// > 0 and at least that many seconds since the last token change.
+/// in: m, an initialized manager; s, a session; now, unix seconds
+/// returns: true when s is live and due for ses_rotate
+/// owns: nothing
+/// thread: any thread (no crypto call)
+/// example: if (ses_needs_rotation(&m, &s, now)) { ses_rotate(&m, &s, now, &t); set_cookie(t); }
+export fn ses_needs_rotation(m: SesManager*, s: SesSession*, now: int64) -> bool {
+  if (m == 0 || s == 0 || !s->live) { return false; }
+  if (m->cfg.rotate_interval <= 0) { return false; }
+  return now - s->rec.rotated >= m->cfg.rotate_interval;
+}
+
+/// Gives a live session a new token, keeping its subject, data, flash and
+/// expiry. Call it on login (when a pre-login session exists), on every
+/// privilege change and when ses_needs_rotation says so: it defeats session
+/// fixation. The old token stops working at once; the CSRF token changes
+/// too. Also counts as a touch (last_seen = now).
+/// in: m, an initialized manager; s, a live session; now, unix seconds;
+///   tok, receives the new token
+/// returns: SES_OK; SES_E_INVALID (s not live); SES_E_ARG; SES_E_CRYPTO; or
+///   the store's error. On error s keeps its old token (still valid unless
+///   the store lost it) and tok is wiped. A read-only session from ses_peek
+///   gives SES_E_ARG
+/// owns: tok is the only copy of the new token: send it to the client
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0; the store must be
+///   thread-safe if shared)
+/// example: var t: SesToken; if (ses_rotate(&m, &s, now, &t) == SES_OK) { set_cookie(ses_token_str(&t)); }
+export fn ses_rotate(m: SesManager*, s: SesSession*, now: int64, tok: SesToken*) -> int32 {
+  if (m == 0 || s == 0 || tok == 0 || !m->ready) { return SES_E_ARG; }
+  if (!s->live) { return SES_E_INVALID; }
+  if (s->readonly) { return SES_E_ARG; }
+  var nh: CrSha256;
+  var rc: int32 = ses_token_new(m->cfg.token_bytes, tok, &nh);
+  if (rc != SES_OK) { return rc; }
+  var old: SesRecord = s->rec;
+  var r: SesRecord* = &s->rec;
+  memcpy(&r->hash[0], &nh.b[0], 32);
+  if (cr_random_bytes(&r->csrf[0], 32) != CR_OK) {
+    s->rec = old;
+    ses_token_wipe(tok);
+    return SES_E_CRYPTO;
+  }
+  r->rotated = now;
+  if (now > r->last_seen) { r->last_seen = now; }
+  r->expires = ses_record_deadline(m, r);
+  rc = ses_store_put(m->store, r);
+  if (rc != SES_OK) {
+    s->rec = old;
+    ses_token_wipe(tok);
+    return rc;
+  }
+  rc = ses_store_del(m->store, &old.hash[0]);
+  if (rc != SES_OK && rc != SES_E_NOT_FOUND) {
+    ses_store_del(m->store, &nh.b[0]);
+    s->rec = old;
+    ses_token_wipe(tok);
+    return rc;
+  }
+  s->dirty = false;
+  s->saved_seen = r->last_seen;
+  return SES_OK;
+}
+
+/// Revokes a live session (logout). Later lookups of its token give
+/// SES_E_REVOKED until ses_prune removes the record.
+/// in: m, an initialized manager; s, a live session
+/// returns: SES_OK; SES_E_INVALID (s not live); SES_E_ARG; or the store's
+///   error (s stays live)
+/// owns: the store copies the revoked record; s is no longer live
+/// thread: any thread (the store must be thread-safe if shared)
+/// example: ses_revoke(&m, &s); send_header(clear_cookie);
+export fn ses_revoke(m: SesManager*, s: SesSession*) -> int32 {
+  if (m == 0 || s == 0 || !m->ready) { return SES_E_ARG; }
+  if (!s->live) { return SES_E_INVALID; }
+  s->rec.revoked = 1;
+  var rc: int32 = ses_store_put(m->store, &s->rec);
+  if (rc != SES_OK) {
+    s->rec.revoked = 0;
+    return rc;
+  }
+  s->live = false;
+  s->dirty = false;
+  return SES_OK;
+}
+
+/// Revokes the session behind a token without loading it into a SesSession
+/// (logout from a handler that has only the cookie).
+/// in: m, an initialized manager; tok, the presented token text
+/// returns: SES_OK (also when it was already revoked); SES_E_NOT_FOUND
+///   (unknown or malformed); SES_E_ARG; SES_E_CRYPTO; or the store's error
+/// owns: tok is borrowed
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0; the store must be
+///   thread-safe if shared)
+/// example: ses_revoke_token(&m, cookie_value);
+export fn ses_revoke_token(m: SesManager*, tok: string) -> int32 {
+  if (m == 0 || !m->ready) { return SES_E_ARG; }
+  var h: CrSha256;
+  var rc: int32 = ses_token_hash(tok, &h);
+  if (rc != SES_OK) { return rc; }
+  var r: SesRecord;
+  rc = ses_store_get(m->store, &h.b[0], &r);
+  if (rc != SES_OK) { return rc; }
+  if (!cr_equal(&r.hash[0], &h.b[0], 32)) { return SES_E_NOT_FOUND; }
+  if (r.revoked != 0) { return SES_OK; }
+  r.revoked = 1;
+  return ses_store_put(m->store, &r);
+}
+
+/// Ends every session of a subject (password change, "log out everywhere",
+/// account lock). The records are deleted, so their tokens give
+/// SES_E_NOT_FOUND.
+/// in: m, an initialized manager; subject, 1..SES_SUBJECT_CAP bytes
+/// returns: the number of sessions ended (>= 0); SES_E_ARG; or the store's
+///   error
+/// owns: subject is borrowed
+/// thread: any thread (the store must be thread-safe if shared)
+/// example: var n: int32 = ses_revoke_subject(&m, uid);
+export fn ses_revoke_subject(m: SesManager*, subject: string) -> int32 {
+  if (m == 0 || !m->ready) { return SES_E_ARG; }
+  return ses_store_del_subject(m->store, subject);
+}
+
+/// Deletes expired and revoked sessions from the store. Run it from a
+/// periodic job; lookups already reject such sessions without it.
+/// in: m, an initialized manager; now, unix seconds
+/// returns: the number deleted (>= 0); SES_E_ARG; or the store's error
+/// owns: nothing
+/// thread: any thread (the store must be thread-safe if shared)
+/// example: ses_prune(&m, now);  // e.g. every 10 minutes
+export fn ses_prune(m: SesManager*, now: int64) -> int32 {
+  if (m == 0 || !m->ready) { return SES_E_ARG; }
+  return ses_store_prune(m->store, now);
+}

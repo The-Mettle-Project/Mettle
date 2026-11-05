@@ -1,0 +1,7 @@
+name = raize_resource
+version = 0.1.0
+description = Raize Resources: declared attributes and actions, typed code interface, JSON API, memory data layer
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeResource
+compiler = 0.18.0
+require = raize_core 0.1.0

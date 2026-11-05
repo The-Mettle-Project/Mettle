@@ -1,0 +1,129 @@
+// flux_orm/core/schema.mettle — the short way to declare a model.
+//
+// Mettle reflects on a named type only, so each model keeps one small field
+// function with a `comptime for`; everything else is here:
+//
+//   export struct Note { id: int64; text: string; version: int64; }
+//
+//   const NOTE_COLS: RcColumn[3] = [ ... keys, NOT NULL, version ... ];
+//
+//   var NOTE: RcSchema;
+//
+//   fn note_fields(s: RcSchema*) {
+//     comptime for f in typeof(Note).fields {
+//       rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+//     }
+//   }
+//
+//   export fn note_meta() -> RcMeta {
+//     return rc_schema_meta(&NOTE, &note_fields, "notes", "Note",
+//                           (int64)sizeof(Note), &NOTE_COLS[0], 3);
+//   }
+//
+// The metadata is built on the first call and kept. rc_schema_status says
+// whether it is valid.
+
+import "status";
+import "meta";
+
+// One model's metadata, built once. Declare it as a zeroed global (`var
+// NOTE: RcSchema;`) and never copy it: `meta.fields` points into it.
+export struct RcSchema {
+  fields: RcField[64];   // RC_MAX_FIELDS
+  // the built metadata; returned by rc_schema_meta
+  meta: RcMeta;
+  n_seen: int32;         // fields reported, which may exceed 64
+  // true once rc_schema_meta has run
+  ready: bool;
+  // result of the build: RC_OK or the error rc_schema_status returns
+  status: int32;
+}
+
+// Records one field, as reported by `comptime for f in typeof(T).fields`.
+// Call it only from the model's field function. Its column name is the field
+// name until an RcColumn overrides it, and its wire type comes from
+// rc_kind_type.
+//   s        the schema being built; 0 is ignored
+//   name     f.name; borrowed, must outlive the schema (a compile-time
+//            name does)
+//   kind     f.type.kind
+//   offset   f.offset, in bytes
+//   size     f.type.size, in bytes
+// Returns nothing. Fields past the 64th are counted but not stored, which
+// makes rc_schema_status answer RC_ERR_UNSUPPORTED.
+export fn rc_schema_field(s: RcSchema*, name: string, kind: Kind, offset: int64,
+                          size: int64) {
+  if (s == 0) { return; }
+  var i: int32 = s->n_seen;
+  s->n_seen = s->n_seen + 1;
+  if (i >= RC_MAX_FIELDS) { return; }
+  s->fields[i].name = name;
+  s->fields[i].column = name;
+  s->fields[i].kind = kind;
+  s->fields[i].ty = rc_kind_type(kind);
+  s->fields[i].offset = (int32)offset;
+  s->fields[i].size = (int32)size;
+  s->fields[i].flags = 0;
+}
+
+// The model's metadata. The first call builds it: it calls `fill`, then applies
+// `cols` and validates with rc_meta_finalize. Later calls return the stored
+// copy and ignore the other arguments.
+//   s        the model's schema global; must not be 0 and must outlive every
+//            RcMeta returned (they point into it)
+//   fill     the model's field function; calls rc_schema_field once per field
+//   table    table name in the store; borrowed, must outlive the schema
+//   name     model name, for diagnostics; borrowed
+//   size     sizeof(Model)
+//   cols     hand-written overrides (keys, NOT NULL, versions, ...); may be 0
+//            when `n_cols` is 0
+//   n_cols   number of entries in `cols`
+// Returns the metadata. It is returned even when invalid, so check
+// rc_schema_status once at startup: a model with more than 64 fields is
+// refused (RC_ERR_UNSUPPORTED, and its metadata has 0 fields so every use of
+// it fails) rather than truncated; any other failure is the code from
+// rc_meta_finalize. `s` = 0 returns metadata with no fields.
+export fn rc_schema_meta(s: RcSchema*, fill: fn(RcSchema*) -> void with alloc, syscall,
+                         table: string,
+                         name: string, size: int64, cols: RcColumn*,
+                         n_cols: int32) -> RcMeta {
+  if (s == 0) {
+    var none: RcMeta;
+    none.table = table;
+    none.name = name;
+    none.size = 0;
+    none.fields = 0;
+    none.n_fields = 0;
+    none.pk = -1;
+    return none;
+  }
+  if (!s->ready) {
+    s->n_seen = 0;
+    fill(s);
+    s->meta.table = table;
+    s->meta.name = name;
+    s->meta.size = (int32)size;
+    s->meta.fields = &s->fields[0];
+    s->meta.n_fields = s->n_seen;
+    s->meta.pk = -1;
+    if (s->n_seen > RC_MAX_FIELDS) {
+      // Unusable, not truncated: 0 fields makes every use refuse it.
+      s->status = RC_ERR_UNSUPPORTED;
+      s->meta.n_fields = 0;
+    } else {
+      s->status = rc_meta_finalize(&s->meta, cols, n_cols);
+    }
+    s->ready = true;
+  }
+  return s->meta;
+}
+
+// Whether the model's metadata is valid. Call after the first *_meta().
+//   s   the model's schema global
+// Returns RC_OK when valid; RC_ERR_USAGE when `s` is 0 or rc_schema_meta has
+// not run yet; otherwise the stored build error: RC_ERR_UNSUPPORTED for more
+// than 64 fields, or any code rc_meta_finalize returns.
+export fn rc_schema_status(s: RcSchema*) -> int32 {
+  if (s == 0 || !s->ready) { return RC_ERR_USAGE; }
+  return s->status;
+}

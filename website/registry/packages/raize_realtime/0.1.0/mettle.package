@@ -1,0 +1,7 @@
+name = raize_realtime
+version = 0.1.0
+description = Raize realtime: poll loop, WebSocket, hub thread, Phoenix v2 channels
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/RaizeRealtime
+compiler = 0.18.0
+require = raize_core 0.1.0

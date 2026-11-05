@@ -1,0 +1,218 @@
+// alph/sys/recover: recovery points that survive traps and faults (x86-64 Linux).
+//
+// Mettle's runtime asks a hook where to resume before it ends the process on
+// a trap (bounds, divide, null) or a fault signal (SIGSEGV, SIGFPE, ...). The
+// hook is mettle_crash_set_live_recovery, built for `mettle live`. alph
+// registers its own callbacks there, so a crash inside an actor resumes the
+// scheduler instead of killing the node.
+//
+// Use, in the frame that must survive (the scheduler loop):
+//
+//   alph_recover_arm(r);
+//   if (alph_recover_save(&r->regs[0]) != 0) {
+//     // a crash below resumed here; locals kept in registers may be stale,
+//     // so read state back from memory
+//   } else {
+//     run_the_handler();
+//   }
+//   alph_recover_disarm(r);
+//
+// Programs must be built with -s: without it the compiler emits inserted
+// traps as an inline exit that never reaches the hook. --safe is not
+// supported: the jump does not unwind its shadow call stack.
+
+import "alph/sys/atomic";
+
+extern fn mettle_crash_set_live_recovery(point: int64, wait: int64, jump: int64) with none;
+extern fn mettle_crash_set_quiet_recovery(on: int32) with none;
+
+const ALPH_RECOVER_MAX: int64 = 256;
+
+// One thread's recovery point. Register it with alph_recover_register,
+// then save into regs with alph_recover_save.
+//
+//   crashes  how many crashes resumed this point so far
+//   owner    free for the registrant: the node keeps its scheduler here
+export struct AlphRecover {
+  // rbx, rbp, (unused), (unused), r12, r13, r14, r15, rsp, rip: the layout
+  // the runtime's signal path restores (crash_handler.c).
+  regs: int64[10];
+  stack_lo: int64;
+  stack_hi: int64;
+  armed: int64;
+  crashes: int64;
+  owner: int64;
+}
+
+var g_alph_recover_table: int64[256];
+var g_alph_recover_count: int64 = 0;
+var g_alph_recover_installed: int64 = 0;
+
+// Saves the callee-saved registers, the stack pointer and the return address
+// into regs (an AlphRecover's regs). Returns 0 now, and returns 1 a second
+// time when a crash resumes here. Arm the AlphRecover first, and keep the
+// calling frame alive while the protected code runs.
+// Thread: the thread that owns regs.
+@naked export fn alph_recover_save(regs: int64*) -> int64 {
+  asm {
+    mov [rdi], rbx
+    mov [rdi + 8], rbp
+    mov [rdi + 32], r12
+    mov [rdi + 40], r13
+    mov [rdi + 48], r14
+    mov [rdi + 56], r15
+    lea r10, [rsp + 8]
+    mov [rdi + 64], r10
+    mov r10, [rsp]
+    mov [rdi + 72], r10
+    xor eax, eax
+    ret
+  }
+}
+
+// Jumps back to the point saved in regs, where alph_recover_save returns 1.
+// Called by alph_recover_hook_jump; do not call it with a frame that has
+// returned. Thread: the thread that saved regs.
+@naked export fn alph_recover_resume(regs: int64) {
+  asm {
+    mov rax, rdi
+    mov rbx, [rax]
+    mov rbp, [rax + 8]
+    mov r12, [rax + 32]
+    mov r13, [rax + 40]
+    mov r14, [rax + 48]
+    mov r15, [rax + 56]
+    mov rsp, [rax + 64]
+    mov r10, [rax + 72]
+    mov rax, 1
+    jmp r10
+  }
+}
+
+// With on true, a crash the hook recovers prints nothing: the runtime asks
+// the hook first, and skips the stack trace and report it would otherwise
+// build and write, which cost about 60 us per crash. A crash nobody
+// recovers is reported as always. Thread: any; it sets a process-wide flag.
+export fn alph_recover_quiet(on: bool) {
+  if (on) {
+    mettle_crash_set_quiet_recovery(1);
+  } else {
+    mettle_crash_set_quiet_recovery(0);
+  }
+}
+
+// Called by the Mettle runtime on a crash, not by programs. Returns the armed
+// recovery point of the thread whose stack holds `stack`, or 0 to let the
+// crash end the process. It runs inside a signal handler, so it only reads.
+export fn alph_recover_hook_point(stack: int64) -> int64 {
+  var count: int64 = alph_atomic_load(&g_alph_recover_count);
+  for i: int64 in 0..count {
+    var r: AlphRecover* = (AlphRecover*)g_alph_recover_table[i];
+    if (r != 0 && r->armed != 0 && stack >= r->stack_lo && stack < r->stack_hi) {
+      return (int64)&r->regs[0];
+    }
+  }
+  return 0;
+}
+
+// The armed recovery point of the calling thread, or 0 when the thread has
+// none armed. Thread: any.
+export fn alph_recover_current() -> AlphRecover* {
+  var here: int64 = 0;
+  var point: int64 = alph_recover_hook_point((int64)&here);
+  return (AlphRecover*)point;
+}
+
+// Called by the Mettle runtime, not by programs: decides to resume. alph
+// always resumes at once, disarming the point and counting the crash. regs
+// is the first field, so the slot is the AlphRecover itself.
+export fn alph_recover_hook_wait(slot: int64) -> int64 {
+  var r: AlphRecover* = (AlphRecover*)slot;
+  r->armed = 0;
+  r->crashes = r->crashes + 1;
+  return 1;
+}
+
+// Called by the Mettle runtime on the trap path, not by programs: jumps to
+// the recovery point. The signal path restores the registers itself.
+export fn alph_recover_hook_jump(slot: int64) {
+  alph_recover_resume(slot);
+}
+
+fn alph_recover_install() {
+  if (alph_atomic_cas(&g_alph_recover_installed, 0, 1) == 0) {
+    mettle_crash_set_live_recovery((int64)&alph_recover_hook_point,
+                                   (int64)&alph_recover_hook_wait,
+                                   (int64)&alph_recover_hook_jump);
+  }
+}
+
+// Registers r as the recovery point for the thread whose stack is [lo, hi),
+// and installs alph's crash hook on first use.
+//
+//   r       stays registered until alph_recover_unregister; keep it in place
+//   lo, hi  the stack range, lowest and one past highest address
+//
+// Returns false when 256 threads are registered at once. A slot freed by
+// alph_recover_unregister is reused, so threads may come and go for ever.
+// Thread: any.
+export fn alph_recover_register(r: AlphRecover*, lo: int64, hi: int64) -> bool {
+  alph_recover_install();
+  r->stack_lo = lo;
+  r->stack_hi = hi;
+  r->armed = 0;
+  r->crashes = 0;
+  var used: int64 = alph_atomic_load(&g_alph_recover_count);
+  for i: int64 in 0..used {
+    if (alph_atomic_load(&g_alph_recover_table[i]) == 0 &&
+        alph_atomic_cas(&g_alph_recover_table[i], 0, (int64)r) == 0) {
+      return true;
+    }
+  }
+  var at: int64 = alph_atomic_add(&g_alph_recover_count, 1);
+  if (at >= ALPH_RECOVER_MAX) {
+    alph_atomic_add(&g_alph_recover_count, -1);
+    return false;
+  }
+  alph_atomic_store(&g_alph_recover_table[at], (int64)r);
+  return true;
+}
+
+// Registers the calling thread when alph did not create it, such as the
+// main thread. The stack range is taken around the caller's frame:
+//
+//   below  bytes of stack below the caller's frame (how deep it may grow)
+//   above  bytes above it (the frames that called it)
+//
+// Returns false when the table is full. Thread: the thread being registered.
+export fn alph_recover_register_here(r: AlphRecover*, below: int64, above: int64) -> bool {
+  var here: int64 = 0;
+  var at: int64 = (int64)&here;
+  return alph_recover_register(r, at - below, at + above);
+}
+
+// Stops the crash hook from matching r and frees its table slot for the
+// next thread. Thread: any.
+export fn alph_recover_unregister(r: AlphRecover*) {
+  r->armed = 0;
+  alph_atomic_store(&r->stack_hi, 0);
+  var used: int64 = alph_atomic_load(&g_alph_recover_count);
+  for i: int64 in 0..used {
+    if (alph_atomic_load(&g_alph_recover_table[i]) == (int64)r) {
+      alph_atomic_store_sc(&g_alph_recover_table[i], 0);
+      return;
+    }
+  }
+}
+
+// Arms r: a crash on its thread now resumes at the last alph_recover_save.
+// Arm before saving. Thread: the thread that owns r.
+export fn alph_recover_arm(r: AlphRecover*) {
+  alph_atomic_store(&r->armed, 1);
+}
+
+// Disarms r: a crash on its thread ends the process again. A resumed crash
+// disarms it already. Thread: the thread that owns r.
+export fn alph_recover_disarm(r: AlphRecover*) {
+  alph_atomic_store(&r->armed, 0);
+}

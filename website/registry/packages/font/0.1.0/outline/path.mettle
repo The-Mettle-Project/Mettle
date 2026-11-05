@@ -1,0 +1,120 @@
+// FontPath: a glyph outline as drawing commands, in font units, y up.
+//
+// Each contour starts with FONT_MOVE and ends with FONT_CLOSE. Points are
+// stored as x, y pairs: MOVE and LINE use 1 point, QUAD 2 (control, end),
+// CUBIC 3 (control 1, control 2, end), CLOSE none.
+
+import "std/mem";
+import "font/core/vec";
+
+export const FONT_MOVE: uint8 = 0;
+export const FONT_LINE: uint8 = 1;
+export const FONT_QUAD: uint8 = 2;
+export const FONT_CUBIC: uint8 = 3;
+export const FONT_CLOSE: uint8 = 4;
+
+export struct FontPath {
+  cmds: FontVec<uint8>;
+  pts: FontVec<float32>;    // x0, y0, x1, y1, ...
+  open: bool;               // a contour has started and is not closed yet
+  sx: float32; sy: float32; // start of the open contour
+  cx: float32; cy: float32; // current point
+}
+
+fn put(p: FontPath*, x: float32, y: float32) {
+  font_vec_push<float32>(&p->pts, x);
+  font_vec_push<float32>(&p->pts, y);
+}
+
+/// Empties the path but keeps its memory.
+export fn font_path_clear(p: FontPath*) {
+  p->cmds.len = 0;
+  p->pts.len = 0;
+  p->open = false;
+}
+
+/// Frees the path's memory.
+export fn font_path_free(p: FontPath*) {
+  font_vec_free<uint8>(&p->cmds);
+  font_vec_free<float32>(&p->pts);
+  p->open = false;
+}
+
+/// Closes the open contour, if any, with a straight line back to its start
+/// when the current point is somewhere else.
+export fn font_path_close(p: FontPath*) {
+  if (!p->open) { return; }
+  var dx: float32 = p->cx - p->sx;
+  var dy: float32 = p->cy - p->sy;
+  if (dx > 0.001 || dx < -0.001 || dy > 0.001 || dy < -0.001) {
+    font_vec_push<uint8>(&p->cmds, FONT_LINE);
+    put(p, p->sx, p->sy);
+  }
+  font_vec_push<uint8>(&p->cmds, FONT_CLOSE);
+  p->open = false;
+  p->cx = p->sx;
+  p->cy = p->sy;
+}
+
+/// Starts a new contour at (x, y), closing the previous one.
+export fn font_path_move(p: FontPath*, x: float32, y: float32) {
+  font_path_close(p);
+  font_vec_push<uint8>(&p->cmds, FONT_MOVE);
+  put(p, x, y);
+  p->open = true;
+  p->sx = x; p->sy = y; p->cx = x; p->cy = y;
+}
+
+/// Straight line to (x, y).
+export fn font_path_line(p: FontPath*, x: float32, y: float32) {
+  if (!p->open) { font_path_move(p, p->cx, p->cy); }
+  font_vec_push<uint8>(&p->cmds, FONT_LINE);
+  put(p, x, y);
+  p->cx = x; p->cy = y;
+}
+
+/// Quadratic curve with control (cx, cy) to (x, y).
+export fn font_path_quad(p: FontPath*, cx: float32, cy: float32, x: float32, y: float32) {
+  if (!p->open) { font_path_move(p, p->cx, p->cy); }
+  font_vec_push<uint8>(&p->cmds, FONT_QUAD);
+  put(p, cx, cy);
+  put(p, x, y);
+  p->cx = x; p->cy = y;
+}
+
+/// Cubic curve with controls (c1x, c1y), (c2x, c2y) to (x, y).
+export fn font_path_cubic(p: FontPath*, c1x: float32, c1y: float32, c2x: float32, c2y: float32, x: float32, y: float32) {
+  if (!p->open) { font_path_move(p, p->cx, p->cy); }
+  font_vec_push<uint8>(&p->cmds, FONT_CUBIC);
+  put(p, c1x, c1y);
+  put(p, c2x, c2y);
+  put(p, x, y);
+  p->cx = x; p->cy = y;
+}
+
+/// Number of points a command uses.
+export fn font_path_cmd_points(c: uint8) -> int64 {
+  if (c == FONT_MOVE || c == FONT_LINE) { return 1; }
+  if (c == FONT_QUAD) { return 2; }
+  if (c == FONT_CUBIC) { return 3; }
+  return 0;
+}
+
+/// Bounds of all points (control points included). False for an empty path.
+export fn font_path_bounds(p: FontPath*, x0: float32*, y0: float32*, x1: float32*, y1: float32*) -> bool {
+  *x0 = 0.0; *y0 = 0.0; *x1 = 0.0; *y1 = 0.0;
+  var n: int64 = p->pts.len / 2;
+  if (n == 0) { return false; }
+  var ax: float32 = p->pts.data[0]; var ay: float32 = p->pts.data[1];
+  var bx: float32 = ax; var by: float32 = ay;
+  for i: int64 in 1..n {
+    var x: float32 = p->pts.data[i * 2];
+    var y: float32 = p->pts.data[i * 2 + 1];
+    if (x < ax) { ax = x; }
+    if (x > bx) { bx = x; }
+    if (y < ay) { ay = y; }
+    if (y > by) { by = y; }
+  }
+  *x0 = ax; *y0 = ay; *x1 = bx; *y1 = by;
+  return true;
+}

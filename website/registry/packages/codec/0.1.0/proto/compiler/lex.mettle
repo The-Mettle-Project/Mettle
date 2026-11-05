@@ -1,0 +1,230 @@
+// Tokens of the .proto language: identifiers (dots included), numbers,
+// quoted strings and single-character symbols. Comments are skipped.
+import "std/mem";
+import "codec/core/buf";
+
+export const CODEC_PBC_EOF = 0;
+export const CODEC_PBC_IDENT = 1;
+export const CODEC_PBC_INT = 2;
+export const CODEC_PBC_FLOAT = 3;
+export const CODEC_PBC_STRING = 4;
+export const CODEC_PBC_SYM = 5;
+export const CODEC_PBC_BAD = 6;
+
+export struct CodecPbcLex {
+  src: string;
+  pos: int64;
+  line: int32;
+  col: int32;
+  kind: int32;            // the current token
+  text: string;           // its text (for strings, with the quotes)
+  tline: int32;
+  tcol: int32;
+}
+
+fn codec_pbc_is_ident(c: int32) -> bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95;
+}
+
+fn codec_pbc_peekc(x: CodecPbcLex*, off: int64) -> int32 {
+  if (x->pos + off >= (int64)x->src.length) { return 0; }
+  return (int32)x->src.chars[x->pos + off];
+}
+
+fn codec_pbc_adv(x: CodecPbcLex*) {
+  if ((int32)x->src.chars[x->pos] == 10) {
+    x->line = x->line + 1;
+    x->col = 1;
+  } else {
+    x->col = x->col + 1;
+  }
+  x->pos = x->pos + 1;
+}
+
+// Moves to the next token.
+export fn codec_pbc_next(x: CodecPbcLex*) {
+  var n: int64 = (int64)x->src.length;
+  // Skip space and comments.
+  while (x->pos < n) {
+    var c: int32 = codec_pbc_peekc(x, 0);
+    if (c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11) {
+      codec_pbc_adv(x);
+    } else if (c == 47 && codec_pbc_peekc(x, 1) == 47) {
+      while (x->pos < n && codec_pbc_peekc(x, 0) != 10) { codec_pbc_adv(x); }
+    } else if (c == 47 && codec_pbc_peekc(x, 1) == 42) {
+      codec_pbc_adv(x);
+      codec_pbc_adv(x);
+      while (x->pos < n && !(codec_pbc_peekc(x, 0) == 42 && codec_pbc_peekc(x, 1) == 47)) { codec_pbc_adv(x); }
+      if (x->pos < n) {
+        codec_pbc_adv(x);
+        codec_pbc_adv(x);
+      }
+    } else {
+      break;
+    }
+  }
+  x->tline = x->line;
+  x->tcol = x->col;
+  var start: int64 = x->pos;
+  x->text.chars = x->src.chars + start;
+  x->text.length = (uint64)0;
+  if (x->pos >= n) {
+    x->kind = CODEC_PBC_EOF;
+    return;
+  }
+  var c0: int32 = codec_pbc_peekc(x, 0);
+  if (codec_pbc_is_ident(c0) && !(c0 >= 48 && c0 <= 57)) {
+    // Identifiers may contain dots: foo.bar.Baz.
+    while (x->pos < n && (codec_pbc_is_ident(codec_pbc_peekc(x, 0)) || (codec_pbc_peekc(x, 0) == 46 && codec_pbc_is_ident(codec_pbc_peekc(x, 1))))) {
+      codec_pbc_adv(x);
+    }
+    x->kind = CODEC_PBC_IDENT;
+  } else if ((c0 >= 48 && c0 <= 57) || (c0 == 46 && codec_pbc_peekc(x, 1) >= 48 && codec_pbc_peekc(x, 1) <= 57)) {
+    x->kind = CODEC_PBC_INT;
+    var hex: bool = c0 == 48 && (codec_pbc_peekc(x, 1) == 120 || codec_pbc_peekc(x, 1) == 88);
+    if (hex) {
+      codec_pbc_adv(x);
+      codec_pbc_adv(x);
+    }
+    while (x->pos < n) {
+      var c: int32 = codec_pbc_peekc(x, 0);
+      if (codec_pbc_is_ident(c)) {
+        if (!hex && (c == 101 || c == 69)) {
+          x->kind = CODEC_PBC_FLOAT;
+          codec_pbc_adv(x);
+          var s: int32 = codec_pbc_peekc(x, 0);
+          if (s == 43 || s == 45) { codec_pbc_adv(x); }
+          continue;
+        }
+        codec_pbc_adv(x);
+      } else if (c == 46 && !hex) {
+        x->kind = CODEC_PBC_FLOAT;
+        codec_pbc_adv(x);
+      } else {
+        break;
+      }
+    }
+  } else if (c0 == 34 || c0 == 39) {
+    codec_pbc_adv(x);
+    x->kind = CODEC_PBC_BAD;
+    while (x->pos < n) {
+      var c: int32 = codec_pbc_peekc(x, 0);
+      if (c == 10) { break; }
+      if (c == 92 && x->pos + 1 < n) {
+        codec_pbc_adv(x);
+        codec_pbc_adv(x);
+        continue;
+      }
+      codec_pbc_adv(x);
+      if (c == c0) {
+        x->kind = CODEC_PBC_STRING;
+        break;
+      }
+    }
+  } else {
+    codec_pbc_adv(x);
+    x->kind = CODEC_PBC_SYM;
+  }
+  x->text.length = (uint64)(x->pos - start);
+}
+
+export fn codec_pbc_lex_init(x: CodecPbcLex*, src: string) {
+  x->src = src;
+  x->pos = 0;
+  x->line = 1;
+  x->col = 1;
+  codec_pbc_next(x);
+}
+
+export fn codec_pbc_is(x: CodecPbcLex*, s: string) -> bool {
+  return (x->kind == CODEC_PBC_SYM || x->kind == CODEC_PBC_IDENT) && x->text == s;
+}
+
+fn codec_pbc_hexv(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return -1;
+}
+
+// The value of a string token (quotes removed, escapes decoded), as new memory.
+export fn codec_pbc_unquote(tok: string) -> string {
+  var b: CodecBuf;
+  codec_buf_init(&b, (int64)tok.length + 1);
+  var i: int64 = 1;
+  var end: int64 = (int64)tok.length - 1;
+  while (i < end) {
+    var c: int32 = (int32)tok.chars[i];
+    i = i + 1;
+    if (c != 92 || i >= end) {
+      codec_buf_byte(&b, (uint8)c);
+      continue;
+    }
+    var e: int32 = (int32)tok.chars[i];
+    i = i + 1;
+    switch (e) {
+      case 110: { codec_buf_byte(&b, (uint8)10); }
+      case 116: { codec_buf_byte(&b, (uint8)9); }
+      case 114: { codec_buf_byte(&b, (uint8)13); }
+      case 97: { codec_buf_byte(&b, (uint8)7); }
+      case 98: { codec_buf_byte(&b, (uint8)8); }
+      case 102: { codec_buf_byte(&b, (uint8)12); }
+      case 118: { codec_buf_byte(&b, (uint8)11); }
+      case 120: {
+        var v: int32 = 0;
+        var k: int32 = 0;
+        while (k < 2 && i < end && codec_pbc_hexv((int32)tok.chars[i]) >= 0) {
+          v = v * 16 + codec_pbc_hexv((int32)tok.chars[i]);
+          i = i + 1;
+          k = k + 1;
+        }
+        codec_buf_byte(&b, (uint8)v);
+      }
+      default: {
+        if (e >= 48 && e <= 55) {
+          var o: int32 = e - 48;
+          var k2: int32 = 1;
+          while (k2 < 3 && i < end && (int32)tok.chars[i] >= 48 && (int32)tok.chars[i] <= 55) {
+            o = o * 8 + (int32)tok.chars[i] - 48;
+            i = i + 1;
+            k2 = k2 + 1;
+          }
+          codec_buf_byte(&b, (uint8)o);
+        } else {
+          codec_buf_byte(&b, (uint8)e);   // \\ \' \" \?
+        }
+      }
+    }
+  }
+  return codec_buf_take(&b);
+}
+
+// Parses an integer token (decimal, 0x hex or 0 octal) into *out. False on
+// overflow past 64 bits or a bad digit.
+export fn codec_pbc_int(tok: string, out: uint64*) -> bool {
+  var v: uint64 = 0;
+  var i: int64 = 0;
+  var n: int64 = (int64)tok.length;
+  var base: uint64 = 10;
+  if (n > 2 && tok.chars[0] == 48 && (tok.chars[1] == 120 || tok.chars[1] == 88)) {
+    base = 16;
+    i = 2;
+  } else if (n > 1 && tok.chars[0] == 48) {
+    base = 8;
+    i = 1;
+  }
+  if (i >= n) {
+    *out = 0;
+    return n > 0;
+  }
+  while (i < n) {
+    var d: int32 = codec_pbc_hexv((int32)tok.chars[i]);
+    if (d < 0 || (uint64)d >= base) { return false; }
+    var nv: uint64 = v * base + (uint64)d;
+    if ((nv - (uint64)d) / base != v) { return false; }
+    v = nv;
+    i = i + 1;
+  }
+  *out = v;
+  return true;
+}

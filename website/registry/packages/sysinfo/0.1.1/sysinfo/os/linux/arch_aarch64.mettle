@@ -1,0 +1,3 @@
+// AArch64 details the Linux backend needs.
+export const SYSINFO_LX_SYS_STATFS = 43;
+export const SYSINFO_LX_ARCH: string = "aarch64";

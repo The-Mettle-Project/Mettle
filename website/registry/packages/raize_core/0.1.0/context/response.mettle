@@ -1,0 +1,518 @@
+// raize/context/response — the response value and its serializer.
+//
+// A response owns exactly one allocation: its body builder (RzBuf*). The
+// header array is a literal RzHeader[16] embedded in the struct, because a
+// response has a compile-time small header set and a router must not be able
+// to make it grow. Adding the 17th header is `-2`, never a realloc.
+//
+// Header values are copied into `res->arena` when it is set (the server points
+// it at the request arena before calling the handler). That is what makes
+// this legal:
+//
+//     var allow: uint8[64];
+//     var s: string = rz_str_view(&allow[0], n);
+//     rz_resp_header_set(res, "Allow", s);      // stored copy, not a view
+//
+// Serialization is pure: it appends bytes to an output buffer and never
+// touches a socket. `Content-Length`, `Connection`, `Date` and `Server` are
+// owned by the serializer and are never taken from a client-facing header set,
+// so a handler cannot emit a wrong Content-Length or a second one.
+//
+// Body rules (RFC 9110): 204 and 304 carry no body; HEAD carries the headers
+// of the GET but no body. `rz_resp_serialize_head` always emits
+// Content-Length, and the caller decides whether to write the body bytes.
+
+import "std/mem";
+import "../str/str";
+import "arena";
+import "header";
+import "date";
+
+export struct RzResponse {
+  status: int32;
+  headers: RzHeader[16];     // literal extent: see header.mettle
+  header_count: int32;
+  body: RzBuf*;           // owned
+  close_after: bool;
+  arena: RzArena*;           // optional, for copied header values
+}
+
+export const RZ_CT_TEXT: string = "text/plain; charset=utf-8";
+export const RZ_CT_HTML: string = "text/html; charset=utf-8";
+export const RZ_CT_JSON: string = "application/json";
+export const RZ_CT_BYTES: string = "application/octet-stream";
+
+export fn rz_response_new() -> RzResponse* {
+  var r: RzResponse* = (RzResponse*)calloc(1, sizeof(RzResponse));
+  if (r == 0) { return 0; }
+  r->status = 200;
+  r->body = rz_buf_new_cap(256);
+  if (r->body == 0) {
+    free((rawptr)r);
+    return 0;
+  }
+  return r;
+}
+
+export fn rz_response_free(r: RzResponse*) {
+  if (r == 0) { return; }
+  if (r->body != 0) {
+    rz_buf_free(r->body);
+    r->body = 0;
+  }
+  free((rawptr)r);
+}
+
+// Keeps the body allocation (so a keep-alive connection allocates nothing per
+// request) and clears everything else. The arena is cleared too: it is set
+// again by the server for the next request.
+export fn rz_response_reset(r: RzResponse*) {
+  if (r == 0) { return; }
+  r->status = 200;
+  r->header_count = 0;
+  r->close_after = false;
+  r->arena = 0;
+  if (r->body == 0) {
+    r->body = rz_buf_new_cap(256);
+  } else {
+    r->body->len = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Headers
+// ---------------------------------------------------------------------------
+
+// 0 stored, -1 rejected (bad name, or CR/LF/NUL in the value), -2 full.
+// Setting an existing name replaces it in place, keeping header order.
+export fn rz_resp_header_set(res: RzResponse*, name: string, value: string) -> int32 {
+  if (res == 0) { return -1; }
+  if (!rz_header_name_ok(name)) { return -1; }
+  if (!rz_header_value_ok(value)) { return -1; }
+  var stored_name: string = name;
+  var stored_value: string = value;
+  if (res->arena != 0) {
+    stored_name = rz_arena_str(res->arena, name);
+    stored_value = rz_arena_str(res->arena, value);
+    if (stored_name.chars == 0 || stored_value.chars == 0) { return -1; }
+  }
+  var i: int32 = 0;
+  while (i < res->header_count) {
+    if (rz_str_eq_ci(res->headers[i].name, name)) {
+      res->headers[i].value = stored_value;
+      return 0;
+    }
+    i = i + 1;
+  }
+  if (res->header_count >= RZ_MAX_RESP_HEADERS) { return -2; }
+  var at: int32 = res->header_count;
+  res->headers[at].name = stored_name;
+  res->headers[at].value = stored_value;
+  res->header_count = at + 1;
+  return 0;
+}
+
+export fn rz_resp_header_get(res: RzResponse*, name: string) -> string {
+  if (res == 0) { return rz_str_empty(); }
+  return rz_header_get(&res->headers[0], res->header_count, name);
+}
+
+export fn rz_resp_header_del(res: RzResponse*, name: string) -> bool {
+  if (res == 0) { return false; }
+  var i: int32 = 0;
+  while (i < res->header_count) {
+    if (rz_str_eq_ci(res->headers[i].name, name)) {
+      var k: int32 = i;
+      while (k + 1 < res->header_count) {
+        res->headers[k].name = res->headers[k + 1].name;
+        res->headers[k].value = res->headers[k + 1].value;
+        k = k + 1;
+      }
+      res->header_count = res->header_count - 1;
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+export fn rz_resp_set_content_type(res: RzResponse*, ct: string) -> int32 {
+  return rz_resp_header_set(res, "Content-Type", ct);
+}
+
+// ---------------------------------------------------------------------------
+// Body
+// ---------------------------------------------------------------------------
+
+export fn rz_resp_write(res: RzResponse*, s: string) {
+  if (res == 0 || res->body == 0) { return; }
+  rz_buf_add(res->body, s);
+}
+
+export fn rz_resp_write_bytes(res: RzResponse*, p: uint8*, n: int64) {
+  if (res == 0 || res->body == 0) { return; }
+  rz_buf_add_bytes(res->body, p, n);
+}
+
+export fn rz_resp_write_byte(res: RzResponse*, c: int32) {
+  if (res == 0 || res->body == 0) { return; }
+  rz_buf_add_byte(res->body, c);
+}
+
+export fn rz_resp_write_int(res: RzResponse*, n: int64) {
+  if (res == 0 || res->body == 0) { return; }
+  rz_buf_add_int(res->body, n);
+}
+
+export fn rz_resp_body_len(res: RzResponse*) -> int64 {
+  if (res == 0 || res->body == 0) { return 0; }
+  return res->body->len;
+}
+
+// Replace the body with `s` (a view; the bytes are copied).
+export fn rz_resp_set_body(res: RzResponse*, s: string) {
+  if (res == 0 || res->body == 0) { return; }
+  res->body->len = 0;
+  rz_buf_add(res->body, s);
+}
+
+// ---------------------------------------------------------------------------
+// Whole-response helpers (the shape a handler uses)
+// ---------------------------------------------------------------------------
+
+export fn rz_resp_text(res: RzResponse*, status: int32, body: string) -> int32 {
+  if (res == 0) { return -1; }
+  res->status = status;
+  rz_resp_set_content_type(res, RZ_CT_TEXT);
+  rz_resp_set_body(res, body);
+  return 0;
+}
+
+export fn rz_resp_html(res: RzResponse*, status: int32, body: string) -> int32 {
+  if (res == 0) { return -1; }
+  res->status = status;
+  rz_resp_set_content_type(res, RZ_CT_HTML);
+  rz_resp_set_body(res, body);
+  return 0;
+}
+
+export fn rz_resp_json(res: RzResponse*, status: int32, body: string) -> int32 {
+  if (res == 0) { return -1; }
+  res->status = status;
+  rz_resp_set_content_type(res, RZ_CT_JSON);
+  rz_resp_set_body(res, body);
+  return 0;
+}
+
+export fn rz_resp_bytes(res: RzResponse*, status: int32, ct: string, body: string) -> int32 {
+  if (res == 0) { return -1; }
+  res->status = status;
+  rz_resp_set_content_type(res, ct);
+  rz_resp_set_body(res, body);
+  return 0;
+}
+
+export fn rz_resp_empty(res: RzResponse*, status: int32) -> int32 {
+  if (res == 0) { return -1; }
+  res->status = status;
+  if (res->body != 0) { res->body->len = 0; }
+  return 0;
+}
+
+export fn rz_resp_redirect(res: RzResponse*, status: int32, location: string) -> int32 {
+  if (res == 0) { return -1; }
+  if (rz_resp_header_set(res, "Location", location) != 0) { return -1; }
+  return rz_resp_empty(res, status);
+}
+
+// ---------------------------------------------------------------------------
+// Reason phrases
+// ---------------------------------------------------------------------------
+
+export fn rz_status_reason(code: int32) -> string {
+  switch (code) {
+    case 100: { return "Continue"; }
+    case 101: { return "Switching Protocols"; }
+    case 200: { return "OK"; }
+    case 201: { return "Created"; }
+    case 202: { return "Accepted"; }
+    case 204: { return "No Content"; }
+    case 206: { return "Partial Content"; }
+    case 301: { return "Moved Permanently"; }
+    case 302: { return "Found"; }
+    case 303: { return "See Other"; }
+    case 304: { return "Not Modified"; }
+    case 307: { return "Temporary Redirect"; }
+    case 308: { return "Permanent Redirect"; }
+    case 400: { return "Bad Request"; }
+    case 401: { return "Unauthorized"; }
+    case 403: { return "Forbidden"; }
+    case 404: { return "Not Found"; }
+    case 405: { return "Method Not Allowed"; }
+    case 406: { return "Not Acceptable"; }
+    case 408: { return "Request Timeout"; }
+    case 409: { return "Conflict"; }
+    case 410: { return "Gone"; }
+    case 411: { return "Length Required"; }
+    case 412: { return "Precondition Failed"; }
+    case 413: { return "Content Too Large"; }
+    case 414: { return "URI Too Long"; }
+    case 415: { return "Unsupported Media Type"; }
+    case 416: { return "Range Not Satisfiable"; }
+    case 417: { return "Expectation Failed"; }
+    case 418: { return "I'm a teapot"; }
+    case 422: { return "Unprocessable Content"; }
+    case 426: { return "Upgrade Required"; }
+    case 428: { return "Precondition Required"; }
+    case 429: { return "Too Many Requests"; }
+    case 431: { return "Request Header Fields Too Large"; }
+    case 500: { return "Internal Server Error"; }
+    case 501: { return "Not Implemented"; }
+    case 502: { return "Bad Gateway"; }
+    case 503: { return "Service Unavailable"; }
+    case 504: { return "Gateway Timeout"; }
+    case 505: { return "HTTP Version Not Supported"; }
+  }
+  return "Unknown";
+}
+
+// A code outside 100..599 is a programming error; the serializer clamps it to
+// 500 so an app can never emit a status line a client cannot parse.
+export fn rz_status_valid(code: int32) -> bool {
+  if (code < 100) { return false; }
+  if (code > 599) { return false; }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+fn rz_resp_body_forbidden(status: int32) -> bool {
+  if (status == 204) { return true; }
+  if (status == 304) { return true; }
+  if (status >= 100 && status < 200) { return true; }
+  return false;
+}
+
+// Appends the status line and the whole header block (terminated by the empty
+// line) to `out`. Returns the number of bytes appended.
+//
+// `keepalive` is the connection's wish; `res->close_after` overrides it.
+// `now_secs` of 0 means "no clock" and omits Date (used by tests).
+export fn rz_resp_serialize_head(res: RzResponse*, out: RzBuf*, keepalive: bool, now_secs: int64) -> int64 {
+  if (res == 0 || out == 0) { return 0; }
+  var start: int64 = out->len;
+  var status: int32 = res->status;
+  if (!rz_status_valid(status)) { status = 500; }
+
+  rz_buf_add(out, "HTTP/1.1 ");
+  rz_buf_add_int(out, (int64)status);
+  rz_buf_add(out, " ");
+  rz_buf_add(out, rz_status_reason(status));
+  rz_buf_add(out, "\r\n");
+
+  var body_len: int64 = rz_resp_body_len(res);
+  if (rz_resp_body_forbidden(status)) { body_len = 0; }
+
+  // User headers, minus the four the serializer owns.
+  var have_ct: bool = false;
+  var i: int32 = 0;
+  while (i < res->header_count) {
+    var name: string = res->headers[i].name;
+    var value: string = res->headers[i].value;
+    var owned: bool = false;
+    if (rz_str_eq_ci(name, "content-length")) { owned = true; }
+    if (rz_str_eq_ci(name, "connection")) { owned = true; }
+    if (rz_str_eq_ci(name, "date")) { owned = true; }
+    if (rz_str_eq_ci(name, "server")) { owned = true; }
+    if (!owned) {
+      if (rz_str_eq_ci(name, "content-type")) { have_ct = true; }
+      rz_buf_add(out, name);
+      rz_buf_add(out, ": ");
+      rz_buf_add(out, value);
+      rz_buf_add(out, "\r\n");
+    }
+    i = i + 1;
+  }
+
+  if (!have_ct && body_len > 0) {
+    rz_buf_add(out, "Content-Type: ");
+    rz_buf_add(out, RZ_CT_BYTES);
+    rz_buf_add(out, "\r\n");
+  }
+
+  rz_buf_add(out, "Content-Length: ");
+  rz_buf_add_int(out, body_len);
+  rz_buf_add(out, "\r\n");
+
+  if (now_secs > 0) {
+    var dbuf: uint8[32];
+    var d: string = rz_http_date(&dbuf[0], 32, now_secs);
+    if (d.length > 0) {
+      rz_buf_add(out, "Date: ");
+      rz_buf_add(out, d);
+      rz_buf_add(out, "\r\n");
+    }
+  }
+
+  var ka: bool = keepalive;
+  if (res->close_after) { ka = false; }
+  if (ka) {
+    rz_buf_add(out, "Connection: keep-alive\r\n");
+  } else {
+    rz_buf_add(out, "Connection: close\r\n");
+  }
+  rz_buf_add(out, "Server: raize\r\n");
+  rz_buf_add(out, "\r\n");
+  return out->len - start;
+}
+
+// True when the status forbids a body (204/304/1xx).
+export fn rz_resp_status_bodyless(status: int32) -> bool {
+  return rz_resp_body_forbidden(status);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+fn rz_resp_test_has(haystack: string, needle: string) -> bool {
+  return rz_str_find(haystack, needle) >= 0;
+}
+
+@test fn t_rz_response_headers() -> int32 {
+  var arena: RzArena* = rz_arena_new();
+  if (arena == 0) { return 1; }
+  var r: RzResponse* = rz_response_new();
+  if (r == 0) { rz_arena_free(arena); return 2; }
+  r->arena = arena;
+
+  if (rz_resp_header_set(r, "Content-Type", "text/plain") != 0) { rz_response_free(r); rz_arena_free(arena); return 3; }
+  if (rz_resp_header_set(r, "X-Test", "one") != 0) { rz_response_free(r); rz_arena_free(arena); return 4; }
+  if (!rz_str_eq(rz_resp_header_get(r, "x-test"), "one")) { rz_response_free(r); rz_arena_free(arena); return 5; }
+  // set replaces
+  if (rz_resp_header_set(r, "X-Test", "two") != 0) { rz_response_free(r); rz_arena_free(arena); return 6; }
+  if (r->header_count != 2) { rz_response_free(r); rz_arena_free(arena); return 7; }
+  if (!rz_str_eq(rz_resp_header_get(r, "X-Test"), "two")) { rz_response_free(r); rz_arena_free(arena); return 8; }
+  // response splitting is refused
+  if (rz_resp_header_set(r, "X-Bad", "a\r\nInjected: 1") != -1) { rz_response_free(r); rz_arena_free(arena); return 9; }
+  if (rz_resp_header_set(r, "X Bad", "v") != -1) { rz_response_free(r); rz_arena_free(arena); return 10; }
+  // copy semantics: the stored value does not alias the caller's stack buffer
+  var scratch: uint8[8];
+  scratch[0] = 65; // A
+  var view: string = rz_str_view(&scratch[0], 1);
+  if (rz_resp_header_set(r, "X-Copy", view) != 0) { rz_response_free(r); rz_arena_free(arena); return 11; }
+  scratch[0] = 66; // B
+  if (!rz_str_eq(rz_resp_header_get(r, "X-Copy"), "A")) { rz_response_free(r); rz_arena_free(arena); return 12; }
+  // delete
+  if (!rz_resp_header_del(r, "x-test")) { rz_response_free(r); rz_arena_free(arena); return 13; }
+  if (rz_resp_header_get(r, "X-Test").length != 0) { rz_response_free(r); rz_arena_free(arena); return 14; }
+  // full: distinct names until RZ_MAX_RESP_HEADERS, then -2
+  var nb: uint8[8];
+  nb[0] = 88;   // X
+  nb[1] = 45;   // -
+  var i: int32 = 0;
+  while (i < 40) {
+    nb[2] = (uint8)(65 + (i / 10) % 26);
+    nb[3] = (uint8)(48 + i % 10);
+    var nm: string = rz_str_view(&nb[0], 4);
+    if (rz_resp_header_set(r, nm, "v") == -2) { break; }
+    i = i + 1;
+  }
+  if (r->header_count != RZ_MAX_RESP_HEADERS) { rz_response_free(r); rz_arena_free(arena); return 15; }
+  if (rz_resp_header_set(r, "X-Overflow", "v") != -2) { rz_response_free(r); rz_arena_free(arena); return 16; }
+  rz_response_free(r);
+  rz_arena_free(arena);
+  return 0;
+}
+
+@test fn t_rz_response_serialize() -> int32 {
+  var r: RzResponse* = rz_response_new();
+  if (r == 0) { return 1; }
+  var out: RzBuf* = rz_buf_new_cap(512);
+  if (out == 0) { rz_response_free(r); return 2; }
+  rz_resp_json(r, 200, "[]");
+  var n: int64 = rz_resp_serialize_head(r, out, true, 0);
+  var head: string = rz_buf_str(out);
+  if (n != (int64)head.length) { rz_response_free(r); rz_buf_free(out); return 3; }
+  if (!rz_str_starts(head, "HTTP/1.1 200 OK\r\n")) { rz_response_free(r); rz_buf_free(out); return 4; }
+  if (!rz_resp_test_has(head, "Content-Length: 2\r\n")) { rz_response_free(r); rz_buf_free(out); return 5; }
+  if (!rz_resp_test_has(head, "Content-Type: application/json\r\n")) { rz_response_free(r); rz_buf_free(out); return 6; }
+  if (!rz_resp_test_has(head, "Connection: keep-alive\r\n")) { rz_response_free(r); rz_buf_free(out); return 7; }
+  if (!rz_str_ends(head, "\r\n\r\n")) { rz_response_free(r); rz_buf_free(out); return 8; }
+  if (rz_resp_test_has(head, "Date: ")) { rz_response_free(r); rz_buf_free(out); return 9; }
+
+  // close_after wins over the connection's wish
+  r->close_after = true;
+  out->len = 0;
+  rz_resp_serialize_head(r, out, true, 0);
+  head = rz_buf_str(out);
+  if (!rz_resp_test_has(head, "Connection: close\r\n")) { rz_response_free(r); rz_buf_free(out); return 10; }
+
+  // a handler cannot smuggle its own Content-Length or duplicate it
+  r->close_after = false;
+  rz_resp_header_set(r, "Content-Length", "999");
+  out->len = 0;
+  rz_resp_serialize_head(r, out, true, 0);
+  head = rz_buf_str(out);
+  if (rz_resp_test_has(head, "999")) { rz_response_free(r); rz_buf_free(out); return 11; }
+  if (rz_header_count_named(&r->headers[0], r->header_count, "content-length") != 1) {
+    rz_response_free(r); rz_buf_free(out); return 12;
+  }
+
+  // 204 has no body and Content-Length: 0
+  rz_resp_write(r, "ignored");
+  rz_resp_empty(r, 204);
+  out->len = 0;
+  rz_resp_serialize_head(r, out, true, 0);
+  head = rz_buf_str(out);
+  if (!rz_resp_test_has(head, "Content-Length: 0\r\n")) { rz_response_free(r); rz_buf_free(out); return 13; }
+
+  // Date is emitted when the caller has a clock, and it is 29 bytes
+  out->len = 0;
+  rz_resp_serialize_head(r, out, false, 784111777);
+  head = rz_buf_str(out);
+  if (!rz_resp_test_has(head, "Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n")) {
+    rz_response_free(r); rz_buf_free(out); return 14;
+  }
+  // a bogus status is clamped, never emitted
+  r->status = 999;
+  out->len = 0;
+  rz_resp_serialize_head(r, out, false, 0);
+  head = rz_buf_str(out);
+  if (!rz_str_starts(head, "HTTP/1.1 500 ")) { rz_response_free(r); rz_buf_free(out); return 15; }
+
+  rz_response_free(r);
+  rz_buf_free(out);
+  return 0;
+}
+
+@test fn t_rz_status_reason_table() -> int32 {
+  if (!rz_str_eq(rz_status_reason(200), "OK")) { return 1; }
+  if (!rz_str_eq(rz_status_reason(404), "Not Found")) { return 2; }
+  if (!rz_str_eq(rz_status_reason(431), "Request Header Fields Too Large")) { return 3; }
+  if (!rz_str_eq(rz_status_reason(599), "Unknown")) { return 4; }
+  if (rz_status_valid(0)) { return 5; }
+  if (rz_status_valid(600)) { return 6; }
+  if (!rz_status_valid(404)) { return 7; }
+  if (!rz_resp_status_bodyless(304)) { return 8; }
+  if (rz_resp_status_bodyless(200)) { return 9; }
+  return 0;
+}
+
+@test fn t_rz_response_reset() -> int32 {
+  var r: RzResponse* = rz_response_new();
+  if (r == 0) { return 1; }
+  rz_resp_text(r, 404, "gone");
+  if (rz_resp_body_len(r) != 4) { rz_response_free(r); return 2; }
+  var body_ptr: uint8* = r->body->data;
+  rz_response_reset(r);
+  if (r->status != 200) { rz_response_free(r); return 3; }
+  if (r->header_count != 0) { rz_response_free(r); return 4; }
+  if (rz_resp_body_len(r) != 0) { rz_response_free(r); return 5; }
+  if (r->body->data != body_ptr) { rz_response_free(r); return 6; }
+  if (r->arena != 0) { rz_response_free(r); return 7; }
+  rz_response_free(r);
+  return 0;
+}

@@ -1,0 +1,262 @@
+// raize/template/scan — the one-pass syntax check and op emitter.
+//
+// This is the only place that reads template syntax. It runs at startup; a
+// refusal here means the process never serves the template. The grammar is
+// documented at the top of compile.mettle (the entry point) and in the
+// framework README entry for template/.
+//
+// Refusals carry a byte offset (RzTemplate.error_at) so a startup log can say
+// exactly where the template is broken: a missing '}}', an unclosed comment,
+// a section whose close tag names something else, a nested section (single
+// level is the whole contract), or a name that looks like an expression.
+
+import "std/mem";
+import "raize_core/str/str";
+import "vars";
+import "types";
+
+// ---------------------------------------------------------------------------
+// Scanning
+// ---------------------------------------------------------------------------
+
+struct RzName {
+  off: int64;
+  len: int64;
+}
+
+struct RzScan {
+  src: string;
+  pos: int64;
+  in_section: bool;
+  open_off: int64;
+  open_len: int64;
+}
+
+fn rz_fail(t: RzTemplate*, code: int32, at: int64) -> int32 {
+  t->error = code;
+  t->error_at = at;
+  return code;
+}
+
+// First byte of a name: A-Z, a-z or '_'. No digits: a bare number is more
+// likely a typo than an intentional key, and refusing it keeps the language
+// unambiguously non-numeric.
+fn rz_name_start(c: int32) -> bool {
+  if (c == 95) { return true; }
+  return rz_char_is_alpha(c);
+}
+
+fn rz_name_char(c: int32) -> bool {
+  if (c == 95 || c == 46 || c == 45) { return true; }
+  if (rz_char_is_digit(c)) { return true; }
+  return rz_char_is_alpha(c);
+}
+
+// Trims SP/HTAB around the byte range. Newlines are not trimmed: a tag that
+// spans lines is refused as a bad name rather than silently accepted.
+fn rz_name_of(src: string, off: int64, end: int64) -> RzName {
+  var n: RzName;
+  n.off = off;
+  n.len = end - off;
+  while (n.len > 0) {
+    var c: int32 = (int32)src.chars[n.off];
+    if (c == 32 || c == 9) {
+      n.off = n.off + 1;
+      n.len = n.len - 1;
+    } else {
+      break;
+    }
+  }
+  while (n.len > 0) {
+    var c: int32 = (int32)src.chars[n.off + n.len - 1];
+    if (c == 32 || c == 9) {
+      n.len = n.len - 1;
+    } else {
+      break;
+    }
+  }
+  return n;
+}
+
+fn rz_name_ok(src: string, n: RzName) -> bool {
+  if (n.len <= 0) { return false; }
+  if (n.len > RZ_TEMPLATE_MAX_NAME) { return false; }
+  if (!rz_name_start((int32)src.chars[n.off])) { return false; }
+  var i: int64 = 1;
+  while (i < n.len) {
+    if (!rz_name_char((int32)src.chars[n.off + i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn rz_name_eq(src: string, a_off: int64, a_len: int64, b_off: int64, b_len: int64) -> bool {
+  if (a_len != b_len) { return false; }
+  var i: int64 = 0;
+  while (i < a_len) {
+    if (src.chars[a_off + i] != src.chars[b_off + i]) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// Index of the next byte that starts a tag: '{' followed by '{' or '#'.
+fn rz_find_tag(src: string, from: int64) -> int64 {
+  var n: int64 = (int64)src.length;
+  var i: int64 = from;
+  while (i + 1 < n) {
+    if (src.chars[i] == 123) {
+      var c: uint8 = src.chars[i + 1];
+      if (c == 123 || c == 35) { return i; }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn rz_emit_op(t: RzTemplate*, kind: int32, name_off: int64, name_len: int64, a: int64, b: int64) -> int32 {
+  if (t->op_count >= RZ_TEMPLATE_MAX_OPS) { return -1; }
+  var at: int32 = t->op_count;
+  t->ops[at].kind = kind;
+  t->ops[at].name_off = name_off;
+  t->ops[at].name_len = name_len;
+  t->ops[at].a = a;
+  t->ops[at].b = b;
+  t->op_count = at + 1;
+  return at;
+}
+
+fn rz_emit_text(t: RzTemplate*, start: int64, end: int64) -> int32 {
+  if (end <= start) { return 0; }
+  if (rz_emit_op(t, RZ_OP_TEXT, 0, 0, start, end - start) < 0) { return -1; }
+  return 0;
+}
+
+fn rz_ref_lookup(t: RzTemplate*, refs: RzTemplateRef*, count: int32, n: RzName) -> int32 {
+  var i: int32 = 0;
+  while (i < count) {
+    if (refs[i].len == n.len) {
+      var same: bool = true;
+      var j: int64 = 0;
+      while (j < n.len) {
+        if (t->src[refs[i].off + j] != t->src[n.off + j]) {
+          same = false;
+          break;
+        }
+        j = j + 1;
+      }
+      if (same) { return i; }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn rz_ref_record(t: RzTemplate*, refs: RzTemplateRef*, count: int32*, n: RzName) -> int32 {
+  if (rz_ref_lookup(t, refs, count[0], n) >= 0) { return 0; }
+  if (count[0] >= RZ_TEMPLATE_MAX_VARS) { return -1; }
+  refs[count[0]].off = n.off;
+  refs[count[0]].len = n.len;
+  count[0] = count[0] + 1;
+  return 0;
+}
+
+// Scans one level. Called recursively once per section, so `depth` is 0 or 1;
+// anything deeper is refused before it gets here.
+fn rz_scan_body(t: RzTemplate*, st: RzScan*, refs: RzTemplateRef*, ref_count: int32*) -> int32 {
+  var src: string = st->src;
+  var n: int64 = (int64)src.length;
+  while (true) {
+    var at: int64 = rz_find_tag(src, st->pos);
+    if (at < 0) {
+      if (rz_emit_text(t, st->pos, n) != 0) { return rz_fail(t, RZ_TPL_E_OPS, st->pos); }
+      st->pos = n;
+      if (st->in_section) { return rz_fail(t, RZ_TPL_E_SECTION, n); }
+      return RZ_TPL_OK;
+    }
+    if (rz_emit_text(t, st->pos, at) != 0) { return rz_fail(t, RZ_TPL_E_OPS, at); }
+
+    // {# comment #}
+    if (src.chars[at + 1] == 35) {
+      var cend: int64 = rz_str_find_from(src, "#}", at + 2);
+      if (cend < 0) { return rz_fail(t, RZ_TPL_E_COMMENT, at); }
+      st->pos = cend + 2;
+      continue;
+    }
+
+    var p: int64 = at + 2;
+    // {{{ raw }}}
+    if (p < n && src.chars[p] == 123) {
+      var rend: int64 = rz_str_find_from(src, "}}}", p + 1);
+      if (rend < 0) { return rz_fail(t, RZ_TPL_E_TAG, at); }
+      var rn: RzName = rz_name_of(src, p + 1, rend);
+      if (!rz_name_ok(src, rn)) { return rz_fail(t, RZ_TPL_E_NAME, at); }
+      if (rz_emit_op(t, RZ_OP_RAW, rn.off, rn.len, 0, 0) < 0) {
+        return rz_fail(t, RZ_TPL_E_OPS, at);
+      }
+      if (rz_ref_record(t, refs, ref_count, rn) != 0) {
+        return rz_fail(t, RZ_TPL_E_NAME, at);
+      }
+      st->pos = rend + 3;
+      continue;
+    }
+
+    // {{#section}}
+    if (p < n && src.chars[p] == 35) {
+      if (st->in_section) { return rz_fail(t, RZ_TPL_E_SECTION, at); }
+      var send: int64 = rz_str_find_from(src, "}}", p + 1);
+      if (send < 0) { return rz_fail(t, RZ_TPL_E_TAG, at); }
+      var sn: RzName = rz_name_of(src, p + 1, send);
+      if (!rz_name_ok(src, sn)) { return rz_fail(t, RZ_TPL_E_NAME, at); }
+      var sid: int32 = rz_emit_op(t, RZ_OP_SECTION, sn.off, sn.len, 0, 0);
+      if (sid < 0) { return rz_fail(t, RZ_TPL_E_OPS, at); }
+      if (rz_ref_record(t, refs, ref_count, sn) != 0) {
+        return rz_fail(t, RZ_TPL_E_NAME, at);
+      }
+      var inner: RzScan;
+      inner.src = src;
+      inner.pos = send + 2;
+      inner.in_section = true;
+      inner.open_off = sn.off;
+      inner.open_len = sn.len;
+      var rc: int32 = rz_scan_body(t, &inner, refs, ref_count);
+      if (rc != RZ_TPL_OK) { return rc; }
+      t->ops[sid].a = (int64)sid + 1;
+      t->ops[sid].b = (int64)t->op_count;
+      st->pos = inner.pos;
+      continue;
+    }
+
+    // {{/section}}
+    if (p < n && src.chars[p] == 47) {
+      if (!st->in_section) { return rz_fail(t, RZ_TPL_E_SECTION, at); }
+      var cend2: int64 = rz_str_find_from(src, "}}", p + 1);
+      if (cend2 < 0) { return rz_fail(t, RZ_TPL_E_TAG, at); }
+      var cn: RzName = rz_name_of(src, p + 1, cend2);
+      if (!rz_name_ok(src, cn)) { return rz_fail(t, RZ_TPL_E_NAME, at); }
+      if (!rz_name_eq(src, cn.off, cn.len, st->open_off, st->open_len)) {
+        return rz_fail(t, RZ_TPL_E_SECTION, at);
+      }
+      st->pos = cend2 + 2;
+      return RZ_TPL_OK;
+    }
+
+    // {{name}} — the default, escaped substitution.
+    var vend: int64 = rz_str_find_from(src, "}}", p);
+    if (vend < 0) { return rz_fail(t, RZ_TPL_E_TAG, at); }
+    var vn: RzName = rz_name_of(src, p, vend);
+    if (vn.len <= 0) { return rz_fail(t, RZ_TPL_E_NAME, at); }
+    if (!rz_name_start((int32)src.chars[vn.off])) {
+      return rz_fail(t, RZ_TPL_E_DIRECTIVE, at);
+    }
+    if (!rz_name_ok(src, vn)) { return rz_fail(t, RZ_TPL_E_NAME, at); }
+    if (rz_emit_op(t, RZ_OP_VAR, vn.off, vn.len, 0, 0) < 0) {
+      return rz_fail(t, RZ_TPL_E_OPS, at);
+    }
+    if (rz_ref_record(t, refs, ref_count, vn) != 0) {
+      return rz_fail(t, RZ_TPL_E_NAME, at);
+    }
+    st->pos = vend + 2;
+  }
+  return RZ_TPL_OK;
+}

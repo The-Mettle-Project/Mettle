@@ -1,0 +1,111 @@
+// Status codes and TLS alert numbers.
+//
+// Every mtls function that can fail returns MTLS_OK (0) or a negative
+// MTLS_E_* code. A failed handshake also records the alert it sent or got,
+// so callers can tell "the peer refused" from "we refused".
+
+export const MTLS_OK: int32 = 0;
+export const MTLS_E_ARG: int32 = -1;          // bad argument from the caller
+export const MTLS_E_SPACE: int32 = -2;        // output buffer too small
+export const MTLS_E_DECODE: int32 = -3;       // malformed data from the peer
+export const MTLS_E_UNSUPPORTED: int32 = -4;  // valid but not supported here
+export const MTLS_E_CRYPTO: int32 = -5;       // a crypto primitive failed
+export const MTLS_E_VERIFY: int32 = -6;       // a signature, MAC or tag did not verify
+export const MTLS_E_CERT: int32 = -7;         // the peer's certificate was rejected
+export const MTLS_E_PROTOCOL: int32 = -8;     // the peer broke the protocol
+export const MTLS_E_ALERT: int32 = -9;        // the peer sent a fatal alert
+export const MTLS_E_CLOSED: int32 = -10;      // the connection is closed
+export const MTLS_E_IO: int32 = -11;          // the socket failed
+export const MTLS_E_TIMEOUT: int32 = -12;     // the socket timed out
+export const MTLS_E_STATE: int32 = -13;       // call not valid in this state
+export const MTLS_E_NOMEM: int32 = -14;       // out of memory
+export const MTLS_E_WANT_IO: int32 = -15;     // non-blocking: feed more input or flush output
+export const MTLS_E_EOF: int32 = -16;         // the peer closed the socket without close_notify
+
+// TLS alert descriptions (RFC 8446 section 6).
+export const MTLS_ALERT_CLOSE_NOTIFY: int32 = 0;
+export const MTLS_ALERT_UNEXPECTED_MESSAGE: int32 = 10;
+export const MTLS_ALERT_BAD_RECORD_MAC: int32 = 20;
+export const MTLS_ALERT_RECORD_OVERFLOW: int32 = 22;
+export const MTLS_ALERT_HANDSHAKE_FAILURE: int32 = 40;
+export const MTLS_ALERT_BAD_CERTIFICATE: int32 = 42;
+export const MTLS_ALERT_UNSUPPORTED_CERTIFICATE: int32 = 43;
+export const MTLS_ALERT_CERTIFICATE_REVOKED: int32 = 44;
+export const MTLS_ALERT_CERTIFICATE_EXPIRED: int32 = 45;
+export const MTLS_ALERT_CERTIFICATE_UNKNOWN: int32 = 46;
+export const MTLS_ALERT_ILLEGAL_PARAMETER: int32 = 47;
+export const MTLS_ALERT_UNKNOWN_CA: int32 = 48;
+export const MTLS_ALERT_ACCESS_DENIED: int32 = 49;
+export const MTLS_ALERT_DECODE_ERROR: int32 = 50;
+export const MTLS_ALERT_DECRYPT_ERROR: int32 = 51;
+export const MTLS_ALERT_PROTOCOL_VERSION: int32 = 70;
+export const MTLS_ALERT_INSUFFICIENT_SECURITY: int32 = 71;
+export const MTLS_ALERT_INTERNAL_ERROR: int32 = 80;
+export const MTLS_ALERT_INAPPROPRIATE_FALLBACK: int32 = 86;
+export const MTLS_ALERT_USER_CANCELED: int32 = 90;
+export const MTLS_ALERT_MISSING_EXTENSION: int32 = 109;
+export const MTLS_ALERT_UNSUPPORTED_EXTENSION: int32 = 110;
+export const MTLS_ALERT_UNRECOGNIZED_NAME: int32 = 112;
+export const MTLS_ALERT_BAD_CERTIFICATE_STATUS_RESPONSE: int32 = 113;
+export const MTLS_ALERT_UNKNOWN_PSK_IDENTITY: int32 = 115;
+export const MTLS_ALERT_CERTIFICATE_REQUIRED: int32 = 116;
+export const MTLS_ALERT_NO_APPLICATION_PROTOCOL: int32 = 120;
+
+/// mtls_err_text: a short English description of an MTLS_E_* code.
+export fn mtls_err_text(code: int32) -> string {
+  switch (code) {
+    case 0: { return "ok"; }
+    case -1: { return "bad argument"; }
+    case -2: { return "buffer too small"; }
+    case -3: { return "malformed message from peer"; }
+    case -4: { return "not supported"; }
+    case -5: { return "crypto failure"; }
+    case -6: { return "verification failed"; }
+    case -7: { return "certificate rejected"; }
+    case -8: { return "protocol violation"; }
+    case -9: { return "peer sent a fatal alert"; }
+    case -10: { return "connection closed"; }
+    case -11: { return "socket error"; }
+    case -12: { return "timed out"; }
+    case -13: { return "not valid in this state"; }
+    case -14: { return "out of memory"; }
+    case -15: { return "needs more I/O"; }
+    case -16: { return "peer closed the socket without close_notify"; }
+    default: { }
+  }
+  return "unknown error";
+}
+
+/// mtls_alert_text: the RFC name of an alert description.
+export fn mtls_alert_text(a: int32) -> string {
+  switch (a) {
+    case 0: { return "close_notify"; }
+    case 10: { return "unexpected_message"; }
+    case 20: { return "bad_record_mac"; }
+    case 22: { return "record_overflow"; }
+    case 40: { return "handshake_failure"; }
+    case 42: { return "bad_certificate"; }
+    case 43: { return "unsupported_certificate"; }
+    case 44: { return "certificate_revoked"; }
+    case 45: { return "certificate_expired"; }
+    case 46: { return "certificate_unknown"; }
+    case 47: { return "illegal_parameter"; }
+    case 48: { return "unknown_ca"; }
+    case 49: { return "access_denied"; }
+    case 50: { return "decode_error"; }
+    case 51: { return "decrypt_error"; }
+    case 70: { return "protocol_version"; }
+    case 71: { return "insufficient_security"; }
+    case 80: { return "internal_error"; }
+    case 86: { return "inappropriate_fallback"; }
+    case 90: { return "user_canceled"; }
+    case 109: { return "missing_extension"; }
+    case 110: { return "unsupported_extension"; }
+    case 112: { return "unrecognized_name"; }
+    case 115: { return "unknown_psk_identity"; }
+    case 116: { return "certificate_required"; }
+    case 120: { return "no_application_protocol"; }
+    default: { }
+  }
+  return "unknown alert";
+}

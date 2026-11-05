@@ -1,0 +1,59 @@
+// raize/template/escape — the HTML escaping table, and nothing else.
+//
+// Escaped substitution ({{name}}) is the default. Exactly six bytes are
+// rewritten; every other byte, including all of UTF-8, is copied through
+// unchanged. That is what "only where needed" means here: the table is the
+// complete set of characters that can change the meaning of an HTML or
+// attribute context, and everything else is not touched.
+//
+//   &  -> &amp;    must be first or the other entities would be re-escaped
+//   <  -> &lt;
+//   >  -> &gt;
+//   "  -> &quot;   attribute values
+//   '  -> &#x27;   single-quoted attributes
+//   /  -> &#x2F;   keeps a value from closing a tag or forming a comment
+//
+// Raw substitution ({{{name}}}) is the explicit escape hatch and is *not*
+// filtered: see compile.mettle, RZ_OP_RAW. A template that uses triple braces
+// on request-controlled data is an injection bug, by definition.
+
+import "raize_core/str/str";
+
+// The entity for one byte, or an empty view when the byte needs no escaping.
+// Exported for the escaping table test, not for hot-path use.
+export fn rz_html_entity(c: int32) -> string {
+  switch (c) {
+    case 38: { return "&amp;"; }
+    case 60: { return "&lt;"; }
+    case 62: { return "&gt;"; }
+    case 34: { return "&quot;"; }
+    case 39: { return "&#x27;"; }
+    case 47: { return "&#x2F;"; }
+  }
+  return rz_str_empty();
+}
+
+// Appends `s` to `out` with the table above applied. Bytes are processed
+// individually so a multi-byte UTF-8 sequence (none of whose bytes can be an
+// ASCII metacharacter) passes through byte-for-byte.
+export fn rz_html_escape(out: RzBuf*, s: string) {
+  if (out == 0) { return; }
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    var ent: string = rz_html_entity(c);
+    if (ent.length != 0) {
+      rz_buf_add(out, ent);
+    } else {
+      rz_buf_add_byte(out, c);
+    }
+    i = i + 1;
+  }
+}
+
+// Raw append, named so a reader sees the dangerous path at the call site.
+export fn rz_html_append_raw(out: RzBuf*, s: string) {
+  if (out == 0) { return; }
+  rz_buf_add(out, s);
+}

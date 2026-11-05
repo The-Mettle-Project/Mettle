@@ -1,0 +1,172 @@
+// Value types and size limits. Every struct here is fixed-size and holds no
+// pointers, so it can be copied by value, kept on the stack, and persisted
+// byte-for-byte by a store.
+
+import "std/conv";
+
+/// SES_SUBJECT_CAP: longest subject (user id or other opaque owner id), bytes.
+/// in: -
+/// returns: 256
+/// owns: nothing
+/// thread: constant
+/// example: if (uid.length > (uint64)SES_SUBJECT_CAP) { ... }
+export const SES_SUBJECT_CAP: int32 = 256;
+/// SES_DATA_CAP: bytes of encoded session data (each entry costs
+/// 3 + key length + value length).
+/// in: -
+/// returns: 4096
+/// owns: nothing
+/// thread: constant
+/// example: var room: int64 = (int64)SES_DATA_CAP - s.rec.data_len;
+export const SES_DATA_CAP: int32 = 4096;
+/// SES_DATA_KEY_MAX: longest data key, bytes (keys are 1..64 bytes).
+/// in: -
+/// returns: 64
+/// owns: nothing
+/// thread: constant
+/// example: ses_data_set(&s, k, v) == SES_E_LIMIT when k is 65 bytes
+export const SES_DATA_KEY_MAX: int32 = 64;
+/// SES_DATA_VALUE_MAX: longest data value, bytes (0..1024).
+/// in: -
+/// returns: 1024
+/// owns: nothing
+/// thread: constant
+/// example: ses_data_set(&s, k, big) == SES_E_LIMIT when big is 1025 bytes
+export const SES_DATA_VALUE_MAX: int32 = 1024;
+/// SES_DATA_ENTRIES_MAX: most data entries per session.
+/// in: -
+/// returns: 32
+/// owns: nothing
+/// thread: constant
+/// example: the 33rd distinct key gives SES_E_LIMIT
+export const SES_DATA_ENTRIES_MAX: int32 = 32;
+/// SES_FLASH_CAP: bytes of encoded flash messages per session (each costs
+/// 3 + kind length + text length).
+/// in: -
+/// returns: 1024
+/// owns: nothing
+/// thread: constant
+/// example: ses_flash_add(&s, "notice", text) == SES_E_LIMIT when full
+export const SES_FLASH_CAP: int32 = 1024;
+/// SES_FLASH_KIND_MAX: longest flash kind ("notice", "error"), bytes (1..32).
+/// in: -
+/// returns: 32
+/// owns: nothing
+/// thread: constant
+/// example: ses_flash_add(&s, "notice", "Saved.")
+export const SES_FLASH_KIND_MAX: int32 = 32;
+/// SES_FLASH_TEXT_MAX: longest flash text, bytes (0..512).
+/// in: -
+/// returns: 512
+/// owns: nothing
+/// thread: constant
+/// example: ses_flash_add(&s, "error", long_text) == SES_E_LIMIT past 512
+export const SES_FLASH_TEXT_MAX: int32 = 512;
+/// SES_FLASH_MAX: most flash messages per session.
+/// in: -
+/// returns: 8
+/// owns: nothing
+/// thread: constant
+/// example: the 9th ses_flash_add gives SES_E_LIMIT
+export const SES_FLASH_MAX: int32 = 8;
+/// SES_TOKEN_CAP: capacity of a SesToken's text, bytes (a 64-byte token is
+/// 86 base64url characters).
+/// in: -
+/// returns: 128
+/// owns: nothing
+/// thread: constant
+/// example: var t: SesToken;  // t.b holds up to SES_TOKEN_CAP bytes
+export const SES_TOKEN_CAP: int32 = 128;
+/// SES_RECORD_VERSION: layout version of SesRecord. A store that persists
+/// the raw sizeof(SesRecord) bytes must store this too and refuse other
+/// versions.
+/// in: -
+/// returns: 1
+/// owns: nothing
+/// thread: constant
+/// example: if (row.version != SES_RECORD_VERSION) { return SES_E_STORE; }
+export const SES_RECORD_VERSION: int32 = 1;
+
+/// SesToken: a token in text form (base64url, no padding): a session token
+/// from ses_create / ses_rotate, or a CSRF token from ses_csrf_token.
+/// in: - (zeroed when declared: `var t: SesToken;`)
+/// returns: -
+/// owns: secret: the session token is shown once and never stored by the
+///   library; give it to the client (cookie) and wipe it with
+///   ses_token_wipe(&t) when done
+/// thread: plain value; no shared state
+/// example: var t: SesToken; ses_create(&m, uid, now, &t, &s); send(ses_token_str(&t));
+export struct SesToken {
+  b: uint8[128];
+  len: int64;
+}
+
+/// SesRecord: one stored session, exactly what crosses the SesStore vtable.
+/// Fields:
+///   hash         SHA-256 of the token text; the store's primary key
+///   csrf         32 random bytes behind ses_csrf_token
+///   created      unix seconds at ses_create
+///   last_seen    unix seconds of the last persisted touch
+///   expires      min(last_seen + idle timeout, abs_expires) when written;
+///                ses_store_prune removes records with expires <= before
+///   abs_expires  created + absolute lifetime (never extended)
+///   rotated      unix seconds of the last token change (create or rotate)
+///   revoked      1 once revoked, else 0
+///   subject_len, subject   the owner id (ses_record_subject)
+///   data_len, data         the encoded key/value map (ses_record_data)
+///   flash_len, flash       pending flash messages (ses_record_flash)
+/// in: - (zeroed when declared)
+/// returns: -
+/// owns: plain value with no pointers. It never holds the token itself. A
+///   store copies it in and out; it may persist each field (SQL columns:
+///   hash BLOB(32) PRIMARY KEY, subject TEXT indexed, the int64s, data,
+///   flash and csrf BLOBs) or the raw sizeof(SesRecord) bytes plus
+///   SES_RECORD_VERSION
+/// thread: plain value; no shared state
+/// example: var r: SesRecord; if (ses_store_get(st, &h.b[0], &r) == SES_OK) { ... }
+export struct SesRecord {
+  hash: uint8[32];
+  csrf: uint8[32];
+  created: int64;
+  last_seen: int64;
+  expires: int64;
+  abs_expires: int64;
+  rotated: int64;
+  revoked: int64;
+  subject_len: int64;
+  data_len: int64;
+  flash_len: int64;
+  subject: uint8[256];
+  data: uint8[4096];
+  flash: uint8[1024];
+}
+
+/// SesSession: a live session for one request: the loaded record, the
+/// flash messages taken from it by the lookup, and write bookkeeping.
+/// in: - (filled by ses_create, ses_lookup or ses_peek; zeroed when declared)
+///   readonly is true for a ses_peek session, which ses_save refuses
+/// returns: -
+/// owns: plain value; strings read from it (ses_subject, ses_data_get,
+///   ses_flash_at) are views that borrow it, valid until it changes
+/// thread: plain value; one request at a time
+/// example: var s: SesSession; if (ses_lookup(&m, tok, now, &s) != SES_OK) { login(); }
+export struct SesSession {
+  rec: SesRecord;
+  flash_in: uint8[1024];
+  flash_in_len: int64;
+  saved_seen: int64;
+  dirty: bool;
+  live: bool;
+  readonly: bool;
+}
+
+/// Views a token's text.
+/// in: t, a token from ses_create, ses_rotate or ses_csrf_token
+/// returns: the base64url text ("" for an empty token)
+/// owns: the view borrows t; never free it; copy it before wiping t
+/// thread: any thread (pure)
+/// example: var cookie_value: string = ses_token_str(&t);
+export fn ses_token_str(t: SesToken*) -> string {
+  if (t == 0) { return ""; }
+  return str_from_bytes((cstring)&t->b[0], t->len);
+}

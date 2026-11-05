@@ -1,0 +1,121 @@
+// Evaluates zero-width assertions at a position of the haystack.
+
+import "regex/hir/hir";
+import "regex/unicode/ucd";
+
+/// True for ASCII word bytes [0-9A-Za-z_].
+export fn rx_is_word_byte(b: int32) -> bool {
+  return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95;
+}
+
+// Decodes the code point that starts at i; -1 when the bytes are not
+// valid UTF-8.
+fn cp_at(h: uint8*, n: int64, i: int64) -> int64 {
+  var b0: int64 = (int64)h[i];
+  if (b0 < 0x80) { return b0; }
+  var need: int64 = 0;
+  var cp: int64 = 0;
+  var min: int64 = 0;
+  if (b0 >= 0xC2 && b0 <= 0xDF) { need = 1; cp = b0 & 0x1F; min = 0x80; }
+  else if (b0 >= 0xE0 && b0 <= 0xEF) { need = 2; cp = b0 & 0x0F; min = 0x800; }
+  else if (b0 >= 0xF0 && b0 <= 0xF4) { need = 3; cp = b0 & 0x07; min = 0x10000; }
+  else { return -1; }
+  if (i + need >= n + 1) { return -1; }
+  for k in 1..need + 1 {
+    var b: int64 = (int64)h[i + k];
+    if ((b & 0xC0) != 0x80) { return -1; }
+    cp = (cp << 6) | (b & 0x3F);
+  }
+  if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) { return -1; }
+  return cp;
+}
+
+// Do the bytes right before `at` end with a complete, valid code point?
+fn valid_before(h: uint8*, n: int64, at: int64) -> bool {
+  var i: int64 = at - 1;
+  var k: int32 = 0;
+  while (i > 0 && k < 3 && (h[i] & 0xC0) == 0x80) { i = i - 1; k = k + 1; }
+  var cp: int64 = cp_at(h, n, i);
+  if (cp < 0) { return false; }
+  var len: int64 = 1;
+  if (cp >= 0x80) { len = 2; }
+  if (cp >= 0x800) { len = 3; }
+  if (cp >= 0x10000) { len = 4; }
+  return i + len == at;
+}
+
+// Is the code point that ends right before `at` a word character?
+fn word_before_u(h: uint8*, n: int64, at: int64) -> bool {
+  if (at <= 0) { return false; }
+  var i: int64 = at - 1;
+  var k: int32 = 0;
+  while (i > 0 && k < 3 && (h[i] & 0xC0) == 0x80) { i = i - 1; k = k + 1; }
+  var cp: int64 = cp_at(h, n, i);
+  if (cp < 0) { return false; }
+  // The code point must end exactly at `at`.
+  var len: int64 = 1;
+  if (cp >= 0x80) { len = 2; }
+  if (cp >= 0x800) { len = 3; }
+  if (cp >= 0x10000) { len = 4; }
+  if (i + len != at) { return false; }
+  return rx_is_word_cp((uint32)cp);
+}
+
+fn word_after_u(h: uint8*, n: int64, at: int64) -> bool {
+  if (at >= n) { return false; }
+  var cp: int64 = cp_at(h, n, at);
+  if (cp < 0) { return false; }
+  return rx_is_word_cp((uint32)cp);
+}
+
+/// True when assertion `kind` holds at position `at` of h[0..n].
+export fn rx_look_at(kind: int32, h: uint8*, n: int64, at: int64) -> bool {
+  switch (kind) {
+    case 1: { return at == 0; }
+    case 2: { return at == n; }
+    case 3: { return at == 0 || h[at - 1] == 10; }
+    case 4: { return at == n || h[at] == 10; }
+    case 5: {
+      if (at == 0) { return true; }
+      if (h[at - 1] == 10) { return true; }
+      return h[at - 1] == 13 && (at == n || h[at] != 10);
+    }
+    case 6: {
+      if (at == n) { return true; }
+      if (h[at] == 13) { return true; }
+      return h[at] == 10 && (at == 0 || h[at - 1] != 13);
+    }
+    default: { }
+  }
+  var before: bool = false;
+  var after: bool = false;
+  var u: bool = kind == 9 || kind == 10 || kind == 13 || kind == 14 || kind == 17 || kind == 18;
+  if (kind == 10) {
+    // Unicode \B never holds next to bytes that are not valid UTF-8 (Rust).
+    if (at > 0 && !valid_before(h, n, at)) { return false; }
+    if (at < n && cp_at(h, n, at) < 0) { return false; }
+  }
+  if (u) {
+    before = word_before_u(h, n, at);
+    after = word_after_u(h, n, at);
+  } else {
+    before = at > 0 && rx_is_word_byte((int32)h[at - 1]);
+    after = at < n && rx_is_word_byte((int32)h[at]);
+  }
+  switch (kind) {
+    case 7: { return before != after; }
+    case 9: { return before != after; }
+    case 8: { return before == after; }
+    case 10: { return before == after; }
+    case 11: { return !before && after; }
+    case 13: { return !before && after; }
+    case 12: { return before && !after; }
+    case 14: { return before && !after; }
+    case 15: { return !before; }
+    case 17: { return !before; }
+    case 16: { return !after; }
+    case 18: { return !after; }
+    default: { }
+  }
+  return false;
+}

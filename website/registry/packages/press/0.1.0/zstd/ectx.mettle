@@ -1,0 +1,269 @@
+// Encoder context shared by the match finders and the block encoder:
+// level parameters, the input window, hash tables and the sequence store.
+
+import "std/mem";
+import "../core/status";
+import "../core/buf";
+import "../check/xxhash";
+import "common";
+import "fse";
+import "huf";
+
+export const PZS_S_FAST: int32 = 1;
+export const PZS_S_DFAST: int32 = 2;
+export const PZS_S_GREEDY: int32 = 3;
+export const PZS_S_LAZY: int32 = 4;
+export const PZS_S_LAZY2: int32 = 5;
+export const PZS_S_OPT: int32 = 6;
+
+export const PZS_SEQ_CAP: int64 = 43800;
+
+// Per level: window log, chain log, hash log, search log, min match,
+// target length, strategy. Levels 20 to 22 reuse the strongest settings
+// with bigger windows.
+const LEVELS: int32[161] = [
+  19, 12, 13, 1, 6, 1, 1,      // 0 is not used
+  19, 12, 13, 1, 6, 1, 1,      // 1
+  19, 13, 14, 1, 7, 0, 1,      // 2
+  21, 16, 17, 1, 5, 0, 2,      // 3
+  21, 18, 18, 1, 5, 0, 2,      // 4
+  21, 18, 19, 2, 5, 2, 3,      // 5
+  21, 18, 19, 3, 5, 4, 4,      // 6
+  21, 19, 20, 4, 5, 8, 4,      // 7
+  21, 19, 20, 4, 5, 16, 5,     // 8
+  22, 20, 21, 4, 5, 16, 5,     // 9
+  22, 21, 22, 5, 5, 16, 5,     // 10
+  22, 21, 22, 6, 5, 16, 5,     // 11
+  22, 22, 23, 6, 5, 32, 5,     // 12
+  22, 22, 22, 3, 5, 32, 6,     // 13
+  22, 22, 23, 7, 5, 32, 5,     // 14
+  22, 23, 23, 4, 5, 48, 6,     // 15
+  22, 22, 22, 5, 5, 48, 6,     // 16
+  23, 23, 22, 5, 4, 64, 6,     // 17
+  23, 23, 22, 6, 3, 64, 6,     // 18
+  23, 24, 22, 5, 3, 128, 6,     // 19
+  25, 25, 23, 7, 3, 256, 6,    // 20
+  26, 26, 24, 7, 3, 512, 6,    // 21
+  27, 27, 25, 9, 3, 999, 6     // 22
+];
+
+/// Encoder state for one frame.
+export struct PzsEnc {
+  level: int32;
+  wlog: int32;
+  clog: int32;
+  hlog: int32;
+  slog: int32;
+  mml: int32;
+  tlen: int32;
+  strat: int32;
+  window: int64;
+  // Input: b[0 .. blen] holds history and pending input; pos is the first
+  // byte not yet compressed.
+  b: uint8*;
+  blen: int64;
+  bcap: int64;
+  own: bool;
+  pos: int64;
+  // Match finder tables (entries are indexes into b).
+  ht: uint32*;
+  ht2: uint32*;
+  ct: uint32*;
+  hsize: int64;
+  h2size: int64;
+  csize: int64;
+  next_up: int64;
+  // Sequence store for the current block.
+  lit: uint8*;
+  nlit: int64;
+  sll: uint32*;
+  sml: uint32*;
+  sob: uint32*;
+  nseq: int64;
+  rep: uint32[3];     // repeat offsets as the decoder has them
+  srep: uint32[3];    // working copy while a block is parsed
+  // Entropy state.
+  huf_prev: PzsHufC;
+  huf_prev_ok: bool;
+  huf_new: PzsHufC;
+  huf_used_new: bool;
+  fse_prev: PzsFseC[3];
+  fse_prev_ok: bool[3];
+  fse_new: PzsFseC[3];
+  fse_def: PzsFseC[3];
+  fse_mode: int32[3];
+  codes: uint8*;      // ll codes, of codes, ml codes (3 * PZS_SEQ_CAP)
+  llc_t: uint8[64];
+  mlc_t: uint8[128];
+  scratch: uint8*;    // compressed block output
+  scap: int64;
+  opt: uint8*;        // optimal parser work memory
+  // Frame.
+  fcs: int64;         // content size, or -1 when unknown
+  started: bool;
+  xx: PressXxh64;
+}
+
+/// Fills the level parameters. src_size is the input size, or -1.
+export fn pzs_enc_params(e: PzsEnc*, level: int32, src_size: int64) {
+  var lv: int32 = level;
+  if (lv <= 0) { lv = 3; if (level < 0) { lv = 1; } }
+  if (lv > 22) { lv = 22; }
+  var at: int32 = lv * 7;
+  e->level = lv;
+  e->wlog = LEVELS[at];
+  e->clog = LEVELS[at + 1];
+  e->hlog = LEVELS[at + 2];
+  e->slog = LEVELS[at + 3];
+  e->mml = LEVELS[at + 4];
+  e->tlen = LEVELS[at + 5];
+  e->strat = LEVELS[at + 6];
+  if (src_size >= 0) {
+    // A window bigger than the input buys nothing.
+    var need: int32 = 10;
+    while (need < 30 && ((int64)1 << (int64)need) < src_size) { need = need + 1; }
+    if (e->wlog > need) { e->wlog = need; }
+  }
+  if (e->hlog > e->wlog + 1) { e->hlog = e->wlog + 1; }
+  if (e->clog > e->wlog + 1) { e->clog = e->wlog + 1; }
+  if (e->mml < 4) { e->mml = 4; }
+  if (e->mml > 7) { e->mml = 7; }
+  e->window = (int64)1 << (int64)e->wlog;
+}
+
+/// Allocates the tables and buffers for the chosen parameters.
+export fn pzs_enc_alloc(e: PzsEnc*) -> int32 {
+  e->hsize = (int64)1 << (int64)e->hlog;
+  e->ht = (uint32*)calloc(e->hsize, 4);
+  if (e->strat == PZS_S_DFAST) {
+    e->h2size = (int64)1 << (int64)e->clog;
+    e->ht2 = (uint32*)calloc(e->h2size, 4);
+    if (e->ht2 == 0) { return PRESS_E_MEM; }
+  }
+  if (e->strat >= PZS_S_GREEDY) {
+    e->csize = (int64)1 << (int64)e->clog;
+    e->ct = (uint32*)calloc(e->csize, 4);
+    if (e->ct == 0) { return PRESS_E_MEM; }
+  }
+  e->lit = (uint8*)malloc(PZS_BLOCK_MAX + PZS_SLACK);
+  e->sll = (uint32*)malloc(PZS_SEQ_CAP * 4);
+  e->sml = (uint32*)malloc(PZS_SEQ_CAP * 4);
+  e->sob = (uint32*)malloc(PZS_SEQ_CAP * 4);
+  e->codes = (uint8*)malloc(PZS_SEQ_CAP * 3);
+  e->scap = PZS_BLOCK_MAX * 2 + 4096;
+  e->scratch = (uint8*)malloc(e->scap);
+  if (e->ht == 0 || e->lit == 0 || e->sll == 0 || e->sml == 0 || e->sob == 0 || e->codes == 0 || e->scratch == 0) {
+    return PRESS_E_MEM;
+  }
+  // Code lookup for small lengths.
+  for i in 0..64 {
+    var c: int32 = 0;
+    while (c < 35 && PZS_LL_BASE[c + 1] <= (uint32)i) { c = c + 1; }
+    e->llc_t[i] = (uint8)c;
+  }
+  for i in 0..128 {
+    var c: int32 = 0;
+    while (c < 52 && PZS_ML_BASE[c + 1] <= (uint32)(i + 3)) { c = c + 1; }
+    e->mlc_t[i] = (uint8)c;
+  }
+  var ll: int16[36] = PZS_LL_DEF;
+  var of: int16[29] = PZS_OF_DEF;
+  var ml: int16[53] = PZS_ML_DEF;
+  pzs_fse_build_ct(&e->fse_def[0], &ll[0], 36, 6);
+  pzs_fse_build_ct(&e->fse_def[1], &of[0], 29, 5);
+  pzs_fse_build_ct(&e->fse_def[2], &ml[0], 53, 6);
+  e->rep[0] = 1;
+  e->rep[1] = 4;
+  e->rep[2] = 8;
+  return PRESS_OK;
+}
+
+/// Frees everything the context owns, and the context.
+export fn pzs_enc_delete(e: PzsEnc*) {
+  if (e == 0) { return; }
+  if (e->own && e->b != 0) { free(e->b); }
+  if (e->ht != 0) { free(e->ht); }
+  if (e->ht2 != 0) { free(e->ht2); }
+  if (e->ct != 0) { free(e->ct); }
+  if (e->lit != 0) { free(e->lit); }
+  if (e->sll != 0) { free(e->sll); }
+  if (e->sml != 0) { free(e->sml); }
+  if (e->sob != 0) { free(e->sob); }
+  if (e->codes != 0) { free(e->codes); }
+  if (e->scratch != 0) { free(e->scratch); }
+  if (e->opt != 0) { free(e->opt); }
+  free(e);
+}
+
+/// Length of the common prefix of b[a ..] and b[m ..], stopping at lim.
+@inline export fn pzs_count(b: uint8*, a: int64, m: int64, lim: int64) -> int64 {
+  var k: int64 = 0;
+  while (a + k + 8 <= lim) {
+    var x: uint64 = press_rd64(b + a + k) ^ press_rd64(b + m + k);
+    if (x != 0) { return k + (int64)(pzs_ctz64(x) >> 3); }
+    k = k + 8;
+  }
+  while (a + k < lim && b[a + k] == b[m + k]) { k = k + 1; }
+  return k;
+}
+
+/// Hash of the first mls bytes (4 to 8) at p, hlog bits.
+@inline export fn pzs_hash(p: uint8*, mls: int32, hlog: int32) -> uint64 {
+  var v: uint64 = press_rd64(p) << (uint64)(64 - 8 * mls);
+  return (v * (uint64)0xCF1BBCDCB7A56463) >> (uint64)(64 - hlog);
+}
+
+/// Updates the repeat offsets rep[0..3] for a match at distance o after
+/// ll literals, the way the decoder does, and returns the offset code
+/// (1 to 3 for a repeat, o + 3 otherwise).
+@inline export fn pzs_rep_update(rep: uint32*, o: uint32, ll: int64) -> uint32 {
+  var r0: uint32 = rep[0];
+  var r1: uint32 = rep[1];
+  var r2: uint32 = rep[2];
+  if (ll > 0) {
+    if (o == r0) { return 1; }
+    if (o == r1) { rep[1] = r0; rep[0] = o; return 2; }
+    if (o == r2) { rep[2] = r1; rep[1] = r0; rep[0] = o; return 3; }
+  } else {
+    if (o == r1) { rep[1] = r0; rep[0] = o; return 1; }
+    if (o == r2) { rep[2] = r1; rep[1] = r0; rep[0] = o; return 2; }
+    if (o == r0 - 1) { rep[2] = r1; rep[1] = r0; rep[0] = o; return 3; }
+  }
+  rep[2] = r1;
+  rep[1] = r0;
+  rep[0] = o;
+  return o + 3;
+}
+
+/// Appends a sequence: ll literals from b[anchor ..], then a match of ml
+/// bytes at distance off. Picks the repeat code and updates srep the way
+/// the decoder will.
+export fn pzs_store(e: PzsEnc*, anchor: int64, ll: int64, off: int64, ml: int64) {
+  var d: uint8* = e->lit + e->nlit;
+  var s: uint8* = e->b + anchor;
+  if (anchor + ll + 16 <= e->blen) {
+    var j: int64 = 0;
+    while (j < ll) {
+      press_wr64(d + j, press_rd64(s + j));
+      press_wr64(d + j + 8, press_rd64(s + j + 8));
+      j = j + 16;
+    }
+  } else if (ll > 0) {
+    memcpy(d, s, ll);
+  }
+  e->nlit = e->nlit + ll;
+  var ob: uint32 = pzs_rep_update(&e->srep[0], (uint32)off, ll);
+  var k: int64 = e->nseq;
+  e->sll[k] = (uint32)ll;
+  e->sml[k] = (uint32)ml;
+  e->sob[k] = ob;
+  e->nseq = k + 1;
+}
+
+/// Appends the literals b[anchor .. end] that follow the last match.
+export fn pzs_store_last(e: PzsEnc*, anchor: int64, end: int64) {
+  if (end > anchor) {
+    memcpy(e->lit + e->nlit, e->b + anchor, end - anchor);
+    e->nlit = e->nlit + (end - anchor);
+  }
+}

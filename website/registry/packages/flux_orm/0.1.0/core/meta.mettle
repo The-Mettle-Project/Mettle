@@ -1,0 +1,632 @@
+// flux_orm/core/meta.mettle — model metadata, generated from the compiler.
+//
+// Mettle has compile-time reflection and nothing at run time: typeof(T).fields
+// gives every field's name, offset, size and type kind while compiling, and
+// leaves no descriptor table behind. So the ORM does not hand-write a field
+// list and does not memcpy a model. Each model module runs one `comptime for`
+// over its own struct (core/schema shows the shape) and gets an RcField[]
+// where the offsets came from the compiler.
+//
+// Access is therefore a typed load/store at a compiler-reported offset, chosen
+// by the field's *kind*: we never assume a layout, we ask for it.
+
+import "std/mem";
+
+import "status";
+import "value";
+
+// Field flags, OR-ed into RcField.flags (usually through RcColumn.flags).
+// RC_F_PK marks the primary key (at most one, and it must be NOT NULL);
+// RC_F_NOT_NULL refuses NULL; RC_F_UNIQUE asks the store for a unique column.
+// RC_F_TIMESTAMP is a marker only: nothing reads it, so a time column also
+// needs `ty: RC_T_TIME` in its RcColumn.
+export const RC_F_PK: int32 = 1;
+export const RC_F_AUTO: int32 = 2;      // integer primary key assigned by the store
+export const RC_F_NOT_NULL: int32 = 4;
+export const RC_F_UNIQUE: int32 = 8;
+export const RC_F_READ_ONLY: int32 = 16; // never written after insert
+export const RC_F_TIMESTAMP: int32 = 32; // wire type is RC_T_TIME
+// Optimistic-lock row version. The ORM owns it: insert writes 1, every save
+// writes old + 1 and only matches the row while it still holds old, so a write
+// based on a stale read changes nothing and answers RC_ERR_CONFLICT. At most
+// one per table, RC_T_I64 and NOT NULL, never the primary key.
+export const RC_F_VERSION: int32 = 64;
+// Timestamps the ORM fills from core/clock, on RC_T_TIME fields only.
+// CREATED is set on insert and never written again; UPDATED is set on insert
+// and on every save that writes something.
+export const RC_F_CREATED: int32 = 128;
+export const RC_F_UPDATED: int32 = 256;
+
+export const RC_MAX_FIELDS: int32 = 64;  // one uint64 null bitmap
+
+// One field of a model, filled by rc_schema_field and rc_meta_apply.
+export struct RcField {
+  name: string;   // Mettle field name
+  column: string; // database column name (defaults to name)
+  kind: Kind;     // compiler type kind, from typeof(T).fields
+  ty: int32;      // wire type, RC_T_*
+  offset: int32;  // byte offset reported by the compiler
+  size: int32;    // byte size reported by the compiler
+  flags: int32;   // RC_F_*
+}
+
+// A model's metadata. Copied by value; `fields` is borrowed from the schema
+// that built it (core/schema) and must outlive every copy.
+export struct RcMeta {
+  // table name in the store
+  table: string;
+  name: string;      // model name, for diagnostics
+  size: int32;       // sizeof(Model)
+  // the field array, in struct order; borrowed
+  fields: RcField*;
+  // number of entries in `fields`
+  n_fields: int32;
+  pk: int32;         // index of the primary key field, -1 if none
+}
+
+// A hand-written override applied after generation. `ty` of 0 keeps the
+// generated wire type; an empty column keeps the field name.
+export struct RcColumn {
+  // field index to change (0-based, RcMeta order)
+  index: int32;
+  // new column name; empty keeps the current one
+  column: string;
+  // new wire type RC_T_*; RC_T_NULL (0) keeps the current one
+  ty: int32;
+  // RC_F_* flags to add; existing flags are never cleared
+  flags: int32;
+}
+
+// --- kind mapping ------------------------------------------------------------
+// The single place where the compiler's Kind enum is translated. Everything
+// else stores RC_T_* and never looks at Kind again.
+
+// The default wire type for a compiler type kind.
+//   k   f.type.kind from `typeof(T).fields`
+// Returns RC_T_BOOL, RC_T_I64 (signed ints, uint8..uint32, enums), RC_T_U64,
+// RC_T_F64 or RC_T_TEXT; RC_T_UNSUPPORTED for any other kind, which
+// rc_meta_check then refuses. Never returns RC_T_TIME: that needs an override.
+export fn rc_kind_type(k: Kind) -> int32 {
+  if (k == Kind.Bool) { return RC_T_BOOL; }
+  if (k == Kind.Int8 || k == Kind.Int16 || k == Kind.Int32 || k == Kind.Int64) {
+    return RC_T_I64;
+  }
+  if (k == Kind.Uint8 || k == Kind.Uint16 || k == Kind.Uint32) { return RC_T_I64; }
+  if (k == Kind.Uint64) { return RC_T_U64; }
+  if (k == Kind.Float32 || k == Kind.Float64) { return RC_T_F64; }
+  if (k == Kind.String) { return RC_T_TEXT; }
+  if (k == Kind.Enum) { return RC_T_I64; }
+  return RC_T_UNSUPPORTED;
+}
+
+// --- null bitmap -------------------------------------------------------------
+// Mettle has no null for a scalar, so nullability lives beside the struct as a
+// bit per field. The struct holds a zero; the bit is the truth.
+
+// True when bit `i` of `mask` is set (field i is NULL). False for an `i`
+// outside 0..63.
+export fn rc_nulls_has(mask: uint64, i: int32) -> bool {
+  if (i < 0 || i >= RC_MAX_FIELDS) { return false; }
+  var bit: uint64 = (uint64)1 << (uint64)i;
+  if ((mask & bit) != (uint64)0) { return true; }
+  return false;
+}
+
+// Returns `mask` with bit `i` set (field i NULL). An `i` outside 0..63 returns
+// `mask` unchanged.
+export fn rc_nulls_set(mask: uint64, i: int32) -> uint64 {
+  if (i < 0 || i >= RC_MAX_FIELDS) { return mask; }
+  return mask | ((uint64)1 << (uint64)i);
+}
+
+// Returns `mask` with bit `i` cleared (field i not NULL). An `i` outside 0..63
+// returns `mask` unchanged.
+export fn rc_nulls_clear(mask: uint64, i: int32) -> uint64 {
+  if (i < 0 || i >= RC_MAX_FIELDS) { return mask; }
+  return mask & ~((uint64)1 << (uint64)i);
+}
+
+// --- lookup ------------------------------------------------------------------
+
+// A copy of field `i` (0-based, RcMeta order).
+//   m   the metadata
+//   i   field index
+// Returns the field. An out-of-range `i` returns a blank field: empty name and
+// column, Kind.Void, ty RC_T_UNSUPPORTED, zero offset, size and flags.
+export fn rc_meta_field(m: RcMeta, i: int32) -> RcField {
+  if (i < 0 || i >= m.n_fields) {
+    var bad: RcField;
+    bad.name = "";
+    bad.column = "";
+    bad.kind = Kind.Void;
+    bad.ty = RC_T_UNSUPPORTED;
+    bad.offset = 0;
+    bad.size = 0;
+    bad.flags = 0;
+    return bad;
+  }
+  return m.fields[i];
+}
+
+// Finds a field by name.
+//   m      the metadata
+//   name   Mettle field name, tried first; then column name
+// Returns the field index, or -1 when no field or column has that name.
+export fn rc_meta_find(m: RcMeta, name: string) -> int32 {
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (m.fields[i].name == name) { return i; }
+    i = i + 1;
+  }
+  i = 0;
+  while (i < m.n_fields) {
+    if (m.fields[i].column == name) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// Index of the primary key field, or -1 when the table has none. Valid only
+// after rc_meta_finalize.
+export fn rc_meta_pk(m: RcMeta) -> int32 { return m.pk; }
+
+// True when any field carries at least one of `flags` (an RC_F_* mask).
+export fn rc_meta_any(m: RcMeta, flags: int32) -> bool {
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if ((m.fields[i].flags & flags) != 0) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// Index of the first RC_F_VERSION field, -1 when the table has none.
+export fn rc_meta_version(m: RcMeta) -> int32 {
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if ((m.fields[i].flags & RC_F_VERSION) != 0) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// True when the table has a primary key and it carries RC_F_AUTO.
+export fn rc_meta_is_auto(m: RcMeta) -> bool {
+  if (m.pk < 0 || m.pk >= m.n_fields) { return false; }
+  if ((m.fields[m.pk].flags & RC_F_AUTO) != 0) { return true; }
+  return false;
+}
+
+// --- finalize ----------------------------------------------------------------
+
+// Applies one RcColumn override to `m->fields` (see RcColumn for each part).
+//   m   the metadata; its field array is modified in place
+//   c   the override
+// Returns RC_OK; RC_ERR_USAGE when `m` is 0 or `c.index` is out of range.
+// Does not validate the result; rc_meta_finalize does.
+export fn rc_meta_apply(m: RcMeta*, c: RcColumn) -> int32 {
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (c.index < 0 || c.index >= m->n_fields) { return RC_ERR_USAGE; }
+  if (c.column.length > (uint64)0) { m->fields[c.index].column = c.column; }
+  if (c.ty != RC_T_NULL) { m->fields[c.index].ty = c.ty; }
+  m->fields[c.index].flags = m->fields[c.index].flags | c.flags;
+  return RC_OK;
+}
+
+// Applies the hand-written column overrides, resolves the primary key and
+// validates the table. Takes a pointer because it writes m->pk.
+//   m        the metadata; fields and pk are modified in place
+//   cols     overrides, applied in order; may be 0 when `n_cols` is 0
+//   n_cols   number of entries in `cols`
+// Returns RC_OK; RC_ERR_USAGE when `m` is 0, an override's index is out of
+// range (earlier overrides stay applied), or two fields carry RC_F_PK;
+// otherwise whatever rc_meta_check returns.
+export fn rc_meta_finalize(m: RcMeta*, cols: RcColumn*, n_cols: int32) -> int32 {
+  if (m == 0) { return RC_ERR_USAGE; }
+  if (n_cols > 0 && cols == 0) { return RC_ERR_USAGE; }
+  var i: int32 = 0;
+  while (i < n_cols) {
+    var rc: int32 = rc_meta_apply(m, cols[i]);
+    if (rc != RC_OK) { return rc; }
+    i = i + 1;
+  }
+  m->pk = -1;
+  i = 0;
+  while (i < m->n_fields) {
+    if ((m->fields[i].flags & RC_F_PK) != 0) {
+      if (m->pk >= 0) { return RC_ERR_USAGE; }
+      m->pk = i;
+    }
+    i = i + 1;
+  }
+  return rc_meta_check(*m, 0);
+}
+
+// Validates the table. Every failure here is a programming error caught at
+// startup, not at query time: this is the ORM's equivalent of a build check.
+//   m     the metadata, after rc_meta_finalize
+//   bad   may be 0; receives the offending field index for a per-field
+//         failure and -1 on success. For the table-wide checks it is -1, or
+//         the last field for the PK checks, so do not rely on it there.
+// Returns RC_OK, or:
+//   RC_ERR_UNSUPPORTED  more than 64 fields; a field with an unsupported wire
+//                       type; RC_F_AUTO on a non-RC_T_I64 field; CREATED or
+//                       UPDATED on a non-RC_T_TIME field; RC_F_VERSION on a
+//                       non-RC_T_I64 field
+//   RC_ERR_USAGE        no fields; size <= 0; empty table name; a field with
+//                       an empty name or column, negative offset, size <= 0,
+//                       or reaching past `size`; RC_F_AUTO without RC_F_PK;
+//                       both CREATED and UPDATED, or either on a PK or VERSION
+//                       field; a VERSION field that is nullable or the PK; two
+//                       fields with one column name; more than one PK, a
+//                       nullable PK, or `pk` not pointing at the PK field;
+//                       more than one VERSION field
+export fn rc_meta_check(m: RcMeta, bad: int32*) -> int32 {
+  if (bad != 0) { *bad = -1; }
+  if (m.fields == 0 || m.n_fields <= 0) { return RC_ERR_USAGE; }
+  if (m.n_fields > RC_MAX_FIELDS) { return RC_ERR_UNSUPPORTED; }
+  if (m.size <= 0) { return RC_ERR_USAGE; }
+  if (m.table.length == (uint64)0) { return RC_ERR_USAGE; }
+
+  var i: int32 = 0;
+  while (i < m.n_fields) {
+    if (bad != 0) { *bad = i; }
+    if (m.fields[i].name.length == (uint64)0) { return RC_ERR_USAGE; }
+    if (m.fields[i].column.length == (uint64)0) { return RC_ERR_USAGE; }
+    if (m.fields[i].ty == RC_T_UNSUPPORTED) { return RC_ERR_UNSUPPORTED; }
+    if (m.fields[i].offset < 0) { return RC_ERR_USAGE; }
+    if (m.fields[i].size <= 0) { return RC_ERR_USAGE; }
+    if (m.fields[i].offset + m.fields[i].size > m.size) { return RC_ERR_USAGE; }
+    if ((m.fields[i].flags & RC_F_AUTO) != 0 && m.fields[i].ty != RC_T_I64) {
+      return RC_ERR_UNSUPPORTED;
+    }
+    if ((m.fields[i].flags & RC_F_AUTO) != 0 && (m.fields[i].flags & RC_F_PK) == 0) {
+      return RC_ERR_USAGE;
+    }
+    var stamp: int32 = m.fields[i].flags & (RC_F_CREATED | RC_F_UPDATED);
+    if (stamp != 0) {
+      if (m.fields[i].ty != RC_T_TIME) { return RC_ERR_UNSUPPORTED; }
+      if (stamp == (RC_F_CREATED | RC_F_UPDATED)) { return RC_ERR_USAGE; }
+      if ((m.fields[i].flags & (RC_F_PK | RC_F_VERSION)) != 0) { return RC_ERR_USAGE; }
+    }
+    if ((m.fields[i].flags & RC_F_VERSION) != 0) {
+      if (m.fields[i].ty != RC_T_I64) { return RC_ERR_UNSUPPORTED; }
+      if ((m.fields[i].flags & RC_F_NOT_NULL) == 0) { return RC_ERR_USAGE; }
+      if ((m.fields[i].flags & RC_F_PK) != 0) { return RC_ERR_USAGE; }
+    }
+    var j: int32 = i + 1;
+    while (j < m.n_fields) {
+      if (m.fields[i].column == m.fields[j].column) { return RC_ERR_USAGE; }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  // Exactly one PK flag, and pk must point at it. A hand-built table that
+  // skipped rc_meta_finalize is refused rather than silently treated as
+  // keyless.
+  var pk_count: int32 = 0;
+  var pk_at: int32 = -1;
+  i = 0;
+  while (i < m.n_fields) {
+    if ((m.fields[i].flags & RC_F_PK) != 0) {
+      pk_count = pk_count + 1;
+      pk_at = i;
+      if ((m.fields[i].flags & RC_F_NOT_NULL) == 0) { return RC_ERR_USAGE; }
+    }
+    i = i + 1;
+  }
+  if (pk_count > 1) { return RC_ERR_USAGE; }
+  var n_version: int32 = 0;
+  i = 0;
+  while (i < m.n_fields) {
+    if ((m.fields[i].flags & RC_F_VERSION) != 0) {
+      n_version = n_version + 1;
+      if (n_version > 1) {
+        if (bad != 0) { *bad = i; }
+        return RC_ERR_USAGE;
+      }
+    }
+    i = i + 1;
+  }
+  if (pk_count == 1 && m.pk != pk_at) { return RC_ERR_USAGE; }
+  if (pk_count == 0 && m.pk != -1) { return RC_ERR_USAGE; }
+  if (bad != 0) { *bad = -1; }
+  return RC_OK;
+}
+
+// --- field access ------------------------------------------------------------
+
+// Reads field `i` (0-based, RcMeta order) out of a model struct. Used by
+// rc_entity_get_field; apps normally call rc_entity_get.
+//   m       the model's metadata
+//   model   the model struct; borrowed
+//   nulls   the model's null bitmap
+//   i       field index
+//   out     receives RcNull when bit `i` of `nulls` is set; otherwise RcBool,
+//           RcInt (signed ints, enums, and unsigned ints up to 32 bits),
+//           RcUint (uint64), RcFloat, RcText (borrows the model's string),
+//           or RcTime for an int64 field
+//           whose wire type is RC_T_TIME
+// Returns RC_OK; RC_ERR_USAGE when `out` or `model` is 0 or `i` is out of
+// range; RC_ERR_UNSUPPORTED for a kind with no mapping.
+export fn rc_meta_get(m: RcMeta, model: rawptr, nulls: uint64, i: int32,
+                     out: RcValue*) -> int32 {
+  if (out == 0 || model == 0) { return RC_ERR_USAGE; }
+  if (i < 0 || i >= m.n_fields) { return RC_ERR_USAGE; }
+  if (rc_nulls_has(nulls, i)) { *out = RcNull; return RC_OK; }
+  var at: uint8* = (uint8*)model + (int64)m.fields[i].offset;
+  switch (m.fields[i].kind) {
+    case Kind.Bool: {
+      var p: bool* = (bool*)at;
+      *out = RcBool(*p);
+      return RC_OK;
+    }
+    case Kind.Int8: {
+      var p: int8* = (int8*)at;
+      *out = RcInt((int64)*p);
+      return RC_OK;
+    }
+    case Kind.Int16: {
+      var p: int16* = (int16*)at;
+      *out = RcInt((int64)*p);
+      return RC_OK;
+    }
+    case Kind.Int32: {
+      var p: int32* = (int32*)at;
+      *out = RcInt((int64)*p);
+      return RC_OK;
+    }
+    case Kind.Int64: {
+      var p: int64* = (int64*)at;
+      // A column overridden to TIMESTAMP carries that intent in the value, so
+      // an adapter can pick the time encoding without seeing the schema.
+      if (m.fields[i].ty == RC_T_TIME) {
+        *out = RcTime(*p);
+        return RC_OK;
+      }
+      *out = RcInt(*p);
+      return RC_OK;
+    }
+    case Kind.Uint8: {
+      var p: uint8* = (uint8*)at;
+      *out = RcInt((int64)*p);   // fits, and matches its RC_T_I64 wire type
+      return RC_OK;
+    }
+    case Kind.Uint16: {
+      var p: uint16* = (uint16*)at;
+      *out = RcInt((int64)*p);   // fits, and matches its RC_T_I64 wire type
+      return RC_OK;
+    }
+    case Kind.Uint32: {
+      var p: uint32* = (uint32*)at;
+      *out = RcInt((int64)*p);   // fits, and matches its RC_T_I64 wire type
+      return RC_OK;
+    }
+    case Kind.Uint64: {
+      var p: uint64* = (uint64*)at;
+      *out = RcUint(*p);
+      return RC_OK;
+    }
+    case Kind.Float32: {
+      var p: float32* = (float32*)at;
+      *out = RcFloat((float64)*p);
+      return RC_OK;
+    }
+    case Kind.Float64: {
+      var p: float64* = (float64*)at;
+      *out = RcFloat(*p);
+      return RC_OK;
+    }
+    case Kind.String: {
+      var p: string* = (string*)at;
+      *out = RcText(*p);
+      return RC_OK;
+    }
+    case Kind.Enum: {
+      // A plain enum is an integer; its width is the compiler's choice.
+      if (m.fields[i].size == 1) {
+        var p: int8* = (int8*)at;
+        *out = RcInt((int64)*p);
+        return RC_OK;
+      }
+      if (m.fields[i].size == 2) {
+        var p: int16* = (int16*)at;
+        *out = RcInt((int64)*p);
+        return RC_OK;
+      }
+      if (m.fields[i].size == 4) {
+        var p: int32* = (int32*)at;
+        *out = RcInt((int64)*p);
+        return RC_OK;
+      }
+      var p: int64* = (int64*)at;
+      *out = RcInt(*p);
+      return RC_OK;
+    }
+    default: { return RC_ERR_UNSUPPORTED; }
+  }
+}
+
+fn rc_range_ok(v: int64, lo: int64, hi: int64) -> bool {
+  if (v < lo) { return false; }
+  if (v > hi) { return false; }
+  return true;
+}
+
+// Writes field `i` (0-based, RcMeta order) of a model struct and updates its
+// null bit. Used by rc_entity_set_field and the loaders; apps normally call
+// rc_entity_set. Does not check RC_F_READ_ONLY.
+//   m       the model's metadata
+//   model   the model struct; written in place
+//   nulls   the model's null bitmap; bit `i` is set for RcNull, cleared
+//           otherwise
+//   i       field index
+//   v       the value. RcNull zeroes the field's bytes. Text is stored as a
+//           view, so its bytes must outlive the model. A bool field also
+//           takes RcInt 0 or 1, which is how stores hand a bool back.
+// Returns RC_OK; RC_ERR_USAGE when `model` or `nulls` is 0 or `i` is out of
+// range; RC_ERR_CONSTRAINT for RcNull on a NOT NULL field; RC_ERR_CAST when
+// `v`'s arm does not convert (rules of rc_value_as_*); RC_ERR_RANGE when the
+// number does not fit the field (enums must be >= 0); RC_ERR_UNSUPPORTED for a
+// kind with no mapping. On error the model and `nulls` are unchanged.
+export fn rc_meta_set(m: RcMeta, model: rawptr, nulls: uint64*, i: int32,
+                      v: RcValue) -> int32 {
+  if (model == 0 || nulls == 0) { return RC_ERR_USAGE; }
+  if (i < 0 || i >= m.n_fields) { return RC_ERR_USAGE; }
+  var f: RcField = m.fields[i];
+  var at: uint8* = (uint8*)model + (int64)f.offset;
+
+  if (rc_value_is_null(v)) {
+    if ((f.flags & RC_F_NOT_NULL) != 0) { return RC_ERR_CONSTRAINT; }
+    // Clear the storage so a reloaded/zeroed row is byte-deterministic, and
+    // record the null in the bitmap, which is the actual truth.
+    memset((rawptr)at, 0, (int64)f.size);
+    *nulls = rc_nulls_set(*nulls, i);
+    return RC_OK;
+  }
+
+  switch (f.kind) {
+    case Kind.Bool: {
+      // Stores keep a bool as INTEGER 0/1 and hand it back as RcInt.
+      var b: bool = false;
+      var rc: int32 = RC_OK;
+      match (v) {
+        case RcInt(x): {
+          if (x != (int64)0 && x != (int64)1) { return RC_ERR_RANGE; }
+          b = x == (int64)1;
+        }
+        case RcNull: { rc = rc_value_as_bool(v, &b); }
+        case RcBool(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcUint(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcFloat(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcTime(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcText(_x): { rc = rc_value_as_bool(v, &b); }
+        case RcBlob(_x): { rc = rc_value_as_bool(v, &b); }
+      }
+      if (rc != RC_OK) { return rc; }
+      var p: bool* = (bool*)at;
+      *p = b;
+      break;
+    }
+    case Kind.Int8: {
+      var x: int64 = 0;
+      var rc: int32 = rc_value_as_i64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      if (!rc_range_ok(x, -128, 127)) { return RC_ERR_RANGE; }
+      var p: int8* = (int8*)at;
+      *p = (int8)x;
+      break;
+    }
+    case Kind.Int16: {
+      var x: int64 = 0;
+      var rc: int32 = rc_value_as_i64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      if (!rc_range_ok(x, -32768, 32767)) { return RC_ERR_RANGE; }
+      var p: int16* = (int16*)at;
+      *p = (int16)x;
+      break;
+    }
+    case Kind.Int32: {
+      var x: int64 = 0;
+      var rc: int32 = rc_value_as_i64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      if (!rc_range_ok(x, -2147483648, 2147483647)) { return RC_ERR_RANGE; }
+      var p: int32* = (int32*)at;
+      *p = (int32)x;
+      break;
+    }
+    case Kind.Int64: {
+      var x: int64 = 0;
+      var rc: int32 = rc_value_as_i64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      var p: int64* = (int64*)at;
+      *p = x;
+      break;
+    }
+    case Kind.Uint8: {
+      var x: uint64 = 0;
+      var rc: int32 = rc_value_as_u64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      if (x > (uint64)255) { return RC_ERR_RANGE; }
+      var p: uint8* = (uint8*)at;
+      *p = (uint8)x;
+      break;
+    }
+    case Kind.Uint16: {
+      var x: uint64 = 0;
+      var rc: int32 = rc_value_as_u64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      if (x > (uint64)65535) { return RC_ERR_RANGE; }
+      var p: uint16* = (uint16*)at;
+      *p = (uint16)x;
+      break;
+    }
+    case Kind.Uint32: {
+      var x: uint64 = 0;
+      var rc: int32 = rc_value_as_u64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      if (x > (uint64)4294967295) { return RC_ERR_RANGE; }
+      var p: uint32* = (uint32*)at;
+      *p = (uint32)x;
+      break;
+    }
+    case Kind.Uint64: {
+      var x: uint64 = 0;
+      var rc: int32 = rc_value_as_u64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      var p: uint64* = (uint64*)at;
+      *p = x;
+      break;
+    }
+    case Kind.Float32: {
+      var x: float64 = 0.0;
+      var rc: int32 = rc_value_as_f64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      if (x > 3.402823466e38 || x < -3.402823466e38) { return RC_ERR_RANGE; }
+      var p: float32* = (float32*)at;
+      *p = (float32)x;
+      break;
+    }
+    case Kind.Float64: {
+      var x: float64 = 0.0;
+      var rc: int32 = rc_value_as_f64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      var p: float64* = (float64*)at;
+      *p = x;
+      break;
+    }
+    case Kind.String: {
+      var s: string;
+      var rc: int32 = rc_value_as_text(v, &s);
+      if (rc != RC_OK) { return rc; }
+      var p: string* = (string*)at;
+      *p = s;
+      break;
+    }
+    case Kind.Enum: {
+      var x: int64 = 0;
+      var rc: int32 = rc_value_as_i64(v, &x);
+      if (rc != RC_OK) { return rc; }
+      if (f.size == 1) {
+        if (!rc_range_ok(x, 0, 127)) { return RC_ERR_RANGE; }
+        var p: int8* = (int8*)at;
+        *p = (int8)x;
+      } else if (f.size == 2) {
+        if (!rc_range_ok(x, 0, 32767)) { return RC_ERR_RANGE; }
+        var p: int16* = (int16*)at;
+        *p = (int16)x;
+      } else if (f.size == 4) {
+        if (!rc_range_ok(x, 0, 2147483647)) { return RC_ERR_RANGE; }
+        var p: int32* = (int32*)at;
+        *p = (int32)x;
+      } else {
+        var p: int64* = (int64*)at;
+        *p = x;
+      }
+      break;
+    }
+    default: { return RC_ERR_UNSUPPORTED; }
+  }
+  *nulls = rc_nulls_clear(*nulls, i);
+  return RC_OK;
+}

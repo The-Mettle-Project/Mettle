@@ -1,0 +1,98 @@
+// gRPC over TLS (h2 with ALPN, RFC 7301), with mtls doing the TLS.
+// Not imported by "grpc/grpc": import "grpc/tls" to use it, which brings
+// in mtls and cryptex.
+//
+// The client's MtlsConfig needs roots (and, for mutual TLS, its own
+// certificate); the server's needs its certificate chain and key, and for
+// mutual TLS cfg.roots and cfg.client_auth = MTLS_CLIENT_AUTH_REQUIRE.
+// Both sides offer ALPN "h2" here; a peer that picks anything else is
+// refused, as gRPC requires.
+import "std/mem";
+import "std/socket";
+import "mtls/mtls";
+import "grpc/h2";
+
+export const GRPC_TLS_OK = 0;
+export const GRPC_TLS_E_CONNECT = -1;     // TCP connect or the handshake failed
+export const GRPC_TLS_E_ALPN = -2;        // the peer did not agree to h2
+
+fn s_read(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var r: int64 = mtls_stream_read((MtlsStream*)ctx, p, n);
+  if (r < 0) { return -1; }
+  return r;
+}
+
+fn s_write(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  return mtls_stream_write((MtlsStream*)ctx, p, n);
+}
+
+fn s_close(ctx: rawptr) -> int64 {
+  mtls_stream_close((MtlsStream*)ctx);
+  return 0;
+}
+
+fn s_buffered(ctx: rawptr) -> bool {
+  var c: MtlsConn* = ((MtlsStream*)ctx)->c;
+  if (c == 0) { return false; }
+  if (c->apppos < c->applen) { return true; }
+  // A whole record may already sit in the input buffer.
+  if (c->inlen > 0 && c->err == 0) {
+    mtls_conn_process(c);
+    return c->apppos < c->applen;
+  }
+  return false;
+}
+
+fn stream_of(s: MtlsStream*) -> NetStream {
+  var ns: NetStream;
+  ns.ctx = (rawptr)s;
+  ns.read = &s_read;
+  ns.write = &s_write;
+  ns.close = &s_close;
+  ns.fd = s->fd;
+  return ns;
+}
+
+fn has_h2(cfg: MtlsConfig*) {
+  for i in 0..cfg->nalpn {
+    if (cfg->alpn[i] == "h2") { return; }
+  }
+  mtls_config_add_alpn(cfg, "h2");
+}
+
+fn start(t: GrpcH2*, s: MtlsStream*, is_server: bool) -> int32 {
+  if (mtls_conn_alpn(s->c) != "h2") {
+    mtls_stream_close(s);
+    return GRPC_TLS_E_ALPN;
+  }
+  grpc_h2_init(t, stream_of(s), is_server, (H2cConfig*)0);
+  t->buffered = &s_buffered;
+  return GRPC_TLS_OK;
+}
+
+// Connects to host:port and runs the TLS handshake, checking the server's
+// certificate against host. s must live as long as t.
+export fn grpc_tls_dial(t: GrpcH2*, s: MtlsStream*, host: string, port: int32, cfg: MtlsConfig*, timeout_ms: int64) -> int32 {
+  has_h2(cfg);
+  if (mtls_dial(s, host, port, cfg, timeout_ms) != MTLS_OK) { return GRPC_TLS_E_CONNECT; }
+  return start(t, s, false);
+}
+
+// The same with a server name that differs from the host to connect to.
+export fn grpc_tls_dial_name(t: GrpcH2*, s: MtlsStream*, host: string, port: int32, server_name: string, cfg: MtlsConfig*, timeout_ms: int64) -> int32 {
+  has_h2(cfg);
+  if (mtls_dial_name(s, host, port, server_name, cfg, timeout_ms) != MTLS_OK) { return GRPC_TLS_E_CONNECT; }
+  return start(t, s, false);
+}
+
+// Runs the server side of the handshake on an accepted socket (which s
+// then owns).
+export fn grpc_tls_accept(t: GrpcH2*, s: MtlsStream*, fd: int64, cfg: MtlsConfig*) -> int32 {
+  has_h2(cfg);
+  if (mtls_stream_server(s, fd, cfg) != MTLS_OK) {
+    sock_close(fd);
+    return GRPC_TLS_E_CONNECT;
+  }
+  s->owns_fd = true;
+  return start(t, s, true);
+}

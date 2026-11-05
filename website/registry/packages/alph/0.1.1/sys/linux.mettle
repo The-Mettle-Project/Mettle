@@ -1,0 +1,109 @@
+// alph/sys/linux: the Linux x86-64 system call numbers and flags alph uses.
+//
+// Every raw syscall in the runtime goes through these names, so a port to
+// another platform starts here.
+
+// System call numbers.
+export const ALPH_SYS_READ: int64 = 0;
+export const ALPH_SYS_WRITE: int64 = 1;
+export const ALPH_SYS_CLOSE: int64 = 3;
+export const ALPH_SYS_MMAP: int64 = 9;
+export const ALPH_SYS_MPROTECT: int64 = 10;
+export const ALPH_SYS_MUNMAP: int64 = 11;
+export const ALPH_SYS_SOCKET: int64 = 41;
+export const ALPH_SYS_CONNECT: int64 = 42;
+export const ALPH_SYS_SHUTDOWN: int64 = 48;
+export const ALPH_SYS_BIND: int64 = 49;
+export const ALPH_SYS_LISTEN: int64 = 50;
+export const ALPH_SYS_GETSOCKNAME: int64 = 51;
+export const ALPH_SYS_SETSOCKOPT: int64 = 54;
+export const ALPH_SYS_RECVMSG: int64 = 47;
+export const ALPH_SYS_GETSOCKOPT: int64 = 55;
+export const ALPH_SYS_FCNTL: int64 = 72;
+export const ALPH_SYS_SIGALTSTACK: int64 = 131;
+export const ALPH_SYS_FUTEX: int64 = 202;
+export const ALPH_SYS_SCHED_GETAFFINITY: int64 = 204;
+export const ALPH_SYS_CLOCK_GETTIME: int64 = 228;
+export const ALPH_SYS_EPOLL_WAIT: int64 = 232;
+export const ALPH_SYS_EPOLL_PWAIT2: int64 = 441;
+export const ALPH_SYS_PRCTL: int64 = 157;
+export const ALPH_PR_SET_TIMERSLACK: int64 = 29;
+export const ALPH_SYS_EPOLL_CTL: int64 = 233;
+export const ALPH_SYS_ACCEPT4: int64 = 288;
+export const ALPH_SYS_EVENTFD2: int64 = 290;
+export const ALPH_SYS_EPOLL_CREATE1: int64 = 291;
+export const ALPH_SYS_OPEN: int64 = 2;
+export const ALPH_SYS_RT_SIGPROCMASK: int64 = 14;
+export const ALPH_SYS_RT_SIGACTION: int64 = 13;
+export const ALPH_SYS_ACCESS: int64 = 21;
+export const ALPH_SYS_DUP2: int64 = 33;
+export const ALPH_SYS_CLONE: int64 = 56;
+export const ALPH_SYS_EXECVE: int64 = 59;
+export const ALPH_SYS_KILL: int64 = 62;
+export const ALPH_SYS_CHDIR: int64 = 80;
+export const ALPH_SYS_SETPGID: int64 = 109;
+export const ALPH_SYS_EXIT_GROUP: int64 = 231;
+export const ALPH_SYS_WAITID: int64 = 247;
+export const ALPH_SYS_PIPE2: int64 = 293;
+export const ALPH_SYS_PIDFD_OPEN: int64 = 434;
+export const ALPH_SYS_SIGNALFD4: int64 = 289;
+export const ALPH_SYS_GETPID: int64 = 39;
+export const ALPH_SYS_GETPGID: int64 = 121;
+
+// Flags for those calls.
+export const ALPH_PROT_NONE: int64 = 0;
+export const ALPH_PROT_READ_WRITE: int64 = 3;
+export const ALPH_MAP_PRIVATE_ANONYMOUS: int64 = 0x22;
+export const ALPH_SS_DISABLE: int64 = 2;
+export const ALPH_CLOCK_MONOTONIC: int64 = 1;
+export const ALPH_FUTEX_WAIT_PRIVATE: int64 = 128;
+export const ALPH_FUTEX_WAKE_PRIVATE: int64 = 129;
+export const ALPH_O_NONBLOCK: int64 = 2048;
+export const ALPH_O_CLOEXEC: int64 = 524288;
+export const ALPH_F_GETFL: int64 = 3;
+export const ALPH_F_SETFL: int64 = 4;
+export const ALPH_EPOLL_CTL_ADD: int64 = 1;
+export const ALPH_EPOLL_CTL_DEL: int64 = 2;
+export const ALPH_EPOLL_CTL_MOD: int64 = 3;
+export const ALPH_EPOLLIN: int64 = 1;
+export const ALPH_EPOLLOUT: int64 = 4;
+export const ALPH_EPOLLERR: int64 = 8;
+export const ALPH_EPOLLHUP: int64 = 16;
+export const ALPH_EPOLLRDHUP: int64 = 8192;
+export const ALPH_EPOLLONESHOT: int64 = 1073741824;
+export const ALPH_AF_INET: int64 = 2;
+export const ALPH_SOCK_STREAM: int64 = 1;
+export const ALPH_SOCK_NONBLOCK: int64 = 2048;
+export const ALPH_SOCK_CLOEXEC: int64 = 524288;
+export const ALPH_SOL_SOCKET: int64 = 1;
+export const ALPH_SO_TIMESTAMPING: int64 = 37;   // SO_TIMESTAMPING_OLD: timespecs, 64-bit on x86-64
+export const ALPH_SOF_RX_SOFTWARE: int64 = 8;
+export const ALPH_SOF_SOFTWARE: int64 = 16;
+export const ALPH_SO_REUSEADDR: int64 = 2;
+export const ALPH_SO_ERROR: int64 = 4;
+export const ALPH_SO_REUSEPORT: int64 = 15;
+export const ALPH_IPPROTO_TCP: int64 = 6;
+export const ALPH_TCP_NODELAY: int64 = 1;
+export const ALPH_EAGAIN: int64 = 11;
+export const ALPH_EINPROGRESS: int64 = 115;
+export const ALPH_ENOENT: int64 = 2;
+export const ALPH_O_RDONLY: int64 = 0;
+export const ALPH_O_RDWR: int64 = 2;
+export const ALPH_O_WRONLY: int64 = 1;
+export const ALPH_O_CREAT: int64 = 64;
+export const ALPH_O_TRUNC: int64 = 512;
+export const ALPH_X_OK: int64 = 1;
+export const ALPH_SIGCHLD: int64 = 17;
+export const ALPH_SIGKILL: int64 = 9;
+export const ALPH_SIGHUP: int64 = 1;
+export const ALPH_SIGINT: int64 = 2;
+export const ALPH_SIGTERM: int64 = 15;
+export const ALPH_SIG_BLOCK: int64 = 0;
+export const ALPH_SIG_SETMASK: int64 = 2;
+export const ALPH_IDTYPE_PID: int64 = 1;
+export const ALPH_WNOHANG: int64 = 1;
+export const ALPH_WEXITED: int64 = 4;
+export const ALPH_CLD_EXITED: int64 = 1;
+
+// The memory page size, for guard pages.
+export const ALPH_PAGE_SIZE: int64 = 4096;

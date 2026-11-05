@@ -1,0 +1,118 @@
+// raize/poll/sys — the Linux system calls the event loop needs.
+//
+// Mettle's stdlib has no poll/select/epoll and no nonblocking accept, but the
+// dev compiler's `syscall(nr, ...)` builtin reaches the kernel directly
+// (docs/design/realtime.md §1). These wrappers are the only place raw
+// syscall numbers appear.
+//
+// x86-64 Linux only: the numbers below are the x86-64 table, and aarch64 has
+// no plain epoll_wait. Every wrapper returns the kernel's raw result: a
+// count or fd when >= 0, `-errno` when negative. Callers compare against
+// RZ_EAGAIN / RZ_EINTR, never against -1.
+//
+// `syscall` cannot run in the compile-time interpreter, so nothing here has
+// @test blocks; tests/fixtures/poll exercises it over real sockets.
+
+export const RZ_SYS_READ: int64 = 0;
+export const RZ_SYS_WRITE: int64 = 1;
+export const RZ_SYS_CLOSE: int64 = 3;
+export const RZ_SYS_FCNTL: int64 = 72;
+export const RZ_SYS_SENDTO: int64 = 44;
+export const RZ_SYS_RECVFROM: int64 = 45;
+export const RZ_SYS_EPOLL_WAIT: int64 = 232;
+export const RZ_SYS_EPOLL_CTL: int64 = 233;
+export const RZ_SYS_ACCEPT4: int64 = 288;
+export const RZ_SYS_EVENTFD2: int64 = 290;
+export const RZ_SYS_EPOLL_CREATE1: int64 = 291;
+
+export const RZ_EINTR: int64 = -4;
+export const RZ_EAGAIN: int64 = -11;
+
+export const RZ_O_NONBLOCK: int64 = 2048;
+export const RZ_O_CLOEXEC: int64 = 524288;     // also SOCK_CLOEXEC, EPOLL_CLOEXEC, EFD_CLOEXEC
+export const RZ_MSG_NOSIGNAL: int64 = 16384;
+
+export const RZ_EPOLLIN: int32 = 1;
+export const RZ_EPOLLOUT: int32 = 4;
+export const RZ_EPOLLERR: int32 = 8;
+export const RZ_EPOLLHUP: int32 = 16;
+export const RZ_EPOLLRDHUP: int32 = 8192;
+
+export const RZ_EPOLL_CTL_ADD: int64 = 1;
+export const RZ_EPOLL_CTL_DEL: int64 = 2;
+export const RZ_EPOLL_CTL_MOD: int64 = 3;
+
+// struct epoll_event is packed on x86-64: u32 events, then u64 data.
+export const RZ_EPOLL_EVENT_SIZE: int64 = 12;
+
+export fn rz_sys_close(fd: int64) -> int64 {
+  return syscall(RZ_SYS_CLOSE, fd);
+}
+
+export fn rz_sys_set_nonblock(fd: int64) -> int64 {
+  var fl: int64 = syscall(RZ_SYS_FCNTL, fd, 3, 0);          // F_GETFL
+  if (fl < 0) { return fl; }
+  return syscall(RZ_SYS_FCNTL, fd, 4, fl | RZ_O_NONBLOCK);  // F_SETFL
+}
+
+// Accepts one connection as a nonblocking, close-on-exec socket.
+export fn rz_sys_accept_nb(listen_fd: int64) -> int64 {
+  return syscall(RZ_SYS_ACCEPT4, listen_fd, 0, 0, RZ_O_NONBLOCK | RZ_O_CLOEXEC);
+}
+
+export fn rz_sys_recv(fd: int64, p: uint8*, n: int64) -> int64 {
+  return syscall(RZ_SYS_RECVFROM, fd, (int64)p, n, 0, 0, 0);
+}
+
+// send with MSG_NOSIGNAL: a peer that went away is -EPIPE, not SIGPIPE.
+export fn rz_sys_send(fd: int64, p: uint8*, n: int64) -> int64 {
+  return syscall(RZ_SYS_SENDTO, fd, (int64)p, n, RZ_MSG_NOSIGNAL, 0, 0);
+}
+
+export fn rz_sys_epoll_create() -> int64 {
+  return syscall(RZ_SYS_EPOLL_CREATE1, RZ_O_CLOEXEC);
+}
+
+fn rz_sys_put_u32(p: uint8*, v: int64) {
+  p[0] = (uint8)(v & 255);
+  p[1] = (uint8)((v >> 8) & 255);
+  p[2] = (uint8)((v >> 16) & 255);
+  p[3] = (uint8)((v >> 24) & 255);
+}
+
+export fn rz_sys_get_u32(p: uint8*) -> int64 {
+  return (int64)p[0] | ((int64)p[1] << 8) | ((int64)p[2] << 16) | ((int64)p[3] << 24);
+}
+
+export fn rz_sys_get_u64(p: uint8*) -> int64 {
+  return rz_sys_get_u32(p) | (rz_sys_get_u32(p + 4) << 32);
+}
+
+export fn rz_sys_epoll_ctl(ep: int64, op: int64, fd: int64, events: int32, tag: int64) -> int64 {
+  var ev: uint8[12];
+  rz_sys_put_u32(&ev[0], (int64)events);
+  rz_sys_put_u32(&ev[4], tag & 0xFFFFFFFF);
+  rz_sys_put_u32(&ev[8], (tag >> 32) & 0xFFFFFFFF);
+  return syscall(RZ_SYS_EPOLL_CTL, ep, op, fd, (int64)&ev[0]);
+}
+
+// Waits into `raw` (max * 12 bytes). Returns the event count or -errno.
+export fn rz_sys_epoll_wait(ep: int64, raw: uint8*, max: int32, timeout_ms: int32) -> int64 {
+  return syscall(RZ_SYS_EPOLL_WAIT, ep, (int64)raw, (int64)max, (int64)timeout_ms);
+}
+
+export fn rz_sys_eventfd() -> int64 {
+  return syscall(RZ_SYS_EVENTFD2, 0, RZ_O_NONBLOCK | RZ_O_CLOEXEC);
+}
+
+// Adds 1 to the eventfd counter. Safe from any thread.
+export fn rz_sys_eventfd_signal(fd: int64) -> int64 {
+  var one: int64 = 1;
+  return syscall(RZ_SYS_WRITE, fd, (int64)&one, 8);
+}
+
+// Resets the eventfd counter to 0 (nonblocking: -EAGAIN when already 0).
+export fn rz_sys_eventfd_drain(fd: int64) -> int64 {
+  var v: int64 = 0;
+  return syscall(RZ_SYS_READ, fd, (int64)&v, 8);
+}

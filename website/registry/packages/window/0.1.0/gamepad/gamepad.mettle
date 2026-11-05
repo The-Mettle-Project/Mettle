@@ -1,0 +1,424 @@
+// gamepad: one model for every pad, in the layout of the W3C Gamepad "standard
+// gamepad" and SDL3's SDL_Gamepad: four face buttons named by position, two
+// sticks, two analog triggers, shoulders, d-pad, back / guide / start.
+//
+// Pads are mapped by, in order: a line from an SDL_GameControllerDB mapping
+// file (window_gamepad_add_mappings), then the Linux gamepad specification
+// (Documentation/input/gamepad.rst), which most Linux pad drivers follow.
+import "std/mem";
+import "../core/types.mettle";
+import "evdev.mettle" if linux;
+import "xinput.mettle" if windows;
+
+// Buttons (SDL3 order).
+export const WINDOW_PAD_SOUTH = 0;           // A on Xbox, Cross on PlayStation
+export const WINDOW_PAD_EAST = 1;            // B / Circle
+export const WINDOW_PAD_WEST = 2;            // X / Square
+export const WINDOW_PAD_NORTH = 3;           // Y / Triangle
+export const WINDOW_PAD_BACK = 4;
+export const WINDOW_PAD_GUIDE = 5;
+export const WINDOW_PAD_START = 6;
+export const WINDOW_PAD_LEFT_STICK = 7;
+export const WINDOW_PAD_RIGHT_STICK = 8;
+export const WINDOW_PAD_LEFT_SHOULDER = 9;
+export const WINDOW_PAD_RIGHT_SHOULDER = 10;
+export const WINDOW_PAD_DPAD_UP = 11;
+export const WINDOW_PAD_DPAD_DOWN = 12;
+export const WINDOW_PAD_DPAD_LEFT = 13;
+export const WINDOW_PAD_DPAD_RIGHT = 14;
+export const WINDOW_PAD_MISC = 15;
+export const WINDOW_PAD_BUTTON_COUNT = 16;
+
+// Axes. Sticks go -1..1 (down and right are positive); triggers go 0..1.
+export const WINDOW_AXIS_LEFT_X = 0;
+export const WINDOW_AXIS_LEFT_Y = 1;
+export const WINDOW_AXIS_RIGHT_X = 2;
+export const WINDOW_AXIS_RIGHT_Y = 3;
+export const WINDOW_AXIS_LEFT_TRIGGER = 4;
+export const WINDOW_AXIS_RIGHT_TRIGGER = 5;
+export const WINDOW_AXIS_COUNT = 6;
+
+export const WINDOW_PAD_MAX = 16;
+
+// Where one gamepad element comes from on the raw device.
+// kind: 0 none, 1 raw button, 2 raw axis, 3 hat bit.
+export struct WindowPadBind {
+  kind: int32;
+  index: int32;        // raw button / axis / hat index
+  mask: int32;         // hat bit (1 up, 2 right, 4 down, 8 left)
+  half: int32;         // axis input: 0 whole, 1 positive half, -1 negative half
+  invert: bool;
+}
+
+export struct WindowPadMap {
+  buttons: WindowPadBind[16];
+  axes: WindowPadBind[6];
+  out_half: int32[6];  // output half-axis (+leftx style), 0 = whole
+}
+
+export struct WindowGamepad {
+  connected: bool;
+  name: uint8[128];
+  name_len: int32;
+  guid: uint8[16];
+  buttons: bool[16];
+  axes: float32[6];
+  map: WindowPadMap;
+  // raw state, filled by the platform
+  raw_buttons: bool[64];
+  raw_axes: float32[16];     // normalized -1..1
+  raw_hats: int32[4];
+  nraw_buttons: int32;
+  nraw_axes: int32;
+  nraw_hats: int32;
+  plat: rawptr;
+}
+
+export var g_pads: WindowGamepad[16];
+export var g_pad_quiet: bool = false;   // set while settling a new pad: update without events
+
+struct PadMapping {
+  guid: uint8[16];
+  name: uint8[128];
+  name_len: int32;
+  map: WindowPadMap;
+}
+
+var g_mappings: PadMapping*;
+var g_mapping_count: int32 = 0;
+var g_mapping_cap: int32 = 0;
+
+// ---------- SDL_GameControllerDB parsing ----------
+fn hexv(c: uint8) -> int32 {
+  if (c >= (uint8)48 && c <= (uint8)57) { return (int32)c - 48; }
+  if (c >= (uint8)97 && c <= (uint8)102) { return (int32)c - 87; }
+  if (c >= (uint8)65 && c <= (uint8)70) { return (int32)c - 55; }
+  return -1;
+}
+
+fn same(s: uint8*, n: int64, lit: string) -> bool {
+  if (n != (int64)lit.length) { return false; }
+  for i: int64 in 0..n { if (s[i] != lit.chars[i]) { return false; } }
+  return true;
+}
+
+// Output element name -> (is_axis, index); -1 when unknown.
+fn element(s: uint8*, n: int64, is_axis: bool*) -> int32 {
+  *is_axis = false;
+  if (same(s, n, "a")) { return WINDOW_PAD_SOUTH; }
+  if (same(s, n, "b")) { return WINDOW_PAD_EAST; }
+  if (same(s, n, "x")) { return WINDOW_PAD_WEST; }
+  if (same(s, n, "y")) { return WINDOW_PAD_NORTH; }
+  if (same(s, n, "back")) { return WINDOW_PAD_BACK; }
+  if (same(s, n, "guide")) { return WINDOW_PAD_GUIDE; }
+  if (same(s, n, "start")) { return WINDOW_PAD_START; }
+  if (same(s, n, "leftstick")) { return WINDOW_PAD_LEFT_STICK; }
+  if (same(s, n, "rightstick")) { return WINDOW_PAD_RIGHT_STICK; }
+  if (same(s, n, "leftshoulder")) { return WINDOW_PAD_LEFT_SHOULDER; }
+  if (same(s, n, "rightshoulder")) { return WINDOW_PAD_RIGHT_SHOULDER; }
+  if (same(s, n, "dpup")) { return WINDOW_PAD_DPAD_UP; }
+  if (same(s, n, "dpdown")) { return WINDOW_PAD_DPAD_DOWN; }
+  if (same(s, n, "dpleft")) { return WINDOW_PAD_DPAD_LEFT; }
+  if (same(s, n, "dpright")) { return WINDOW_PAD_DPAD_RIGHT; }
+  if (same(s, n, "misc1")) { return WINDOW_PAD_MISC; }
+  *is_axis = true;
+  if (same(s, n, "leftx")) { return WINDOW_AXIS_LEFT_X; }
+  if (same(s, n, "lefty")) { return WINDOW_AXIS_LEFT_Y; }
+  if (same(s, n, "rightx")) { return WINDOW_AXIS_RIGHT_X; }
+  if (same(s, n, "righty")) { return WINDOW_AXIS_RIGHT_Y; }
+  if (same(s, n, "lefttrigger")) { return WINDOW_AXIS_LEFT_TRIGGER; }
+  if (same(s, n, "righttrigger")) { return WINDOW_AXIS_RIGHT_TRIGGER; }
+  return -1;
+}
+
+fn parse_int(s: uint8*, n: int64, at: int64*) -> int32 {
+  var v: int32 = 0;
+  var any: bool = false;
+  while (*at < n && s[*at] >= (uint8)48 && s[*at] <= (uint8)57 && v < 100000) {
+    v = v * 10 + ((int32)s[*at] - 48);
+    *at = *at + 1;
+    any = true;
+  }
+  if (!any) { return -1; }
+  return v;
+}
+
+// One binding value: bN, aN, +aN, -aN, aN~, hN.M. False when malformed.
+fn parse_bind(s: uint8*, n: int64, b: WindowPadBind*) -> bool {
+  var z: WindowPadBind;
+  *b = z;
+  var i: int64 = 0;
+  if (i < n && (s[i] == (uint8)43 || s[i] == (uint8)45)) {
+    if (s[i] == (uint8)43) { b->half = 1; } else { b->half = -1; }
+    i = i + 1;
+  }
+  if (i >= n) { return false; }
+  var c: uint8 = s[i];
+  i = i + 1;
+  if (c == (uint8)98) {
+    b->kind = 1;
+    b->index = parse_int(s, n, &i);
+    return b->index >= 0 && b->index < 64 && i == n;
+  }
+  if (c == (uint8)97) {
+    b->kind = 2;
+    b->index = parse_int(s, n, &i);
+    if (i < n && s[i] == (uint8)126) { b->invert = true; i = i + 1; }
+    return b->index >= 0 && b->index < 16 && i == n;
+  }
+  if (c == (uint8)104) {
+    b->kind = 3;
+    b->index = parse_int(s, n, &i);
+    if (i >= n || s[i] != (uint8)46) { return false; }
+    i = i + 1;
+    b->mask = parse_int(s, n, &i);
+    return b->index >= 0 && b->index < 4 && b->mask > 0 && b->mask <= 8 && i == n;
+  }
+  return false;
+}
+
+// Parses one mapping line. "platform:" entries for another OS are skipped by the caller.
+fn parse_line(s: uint8*, n: int64, out: PadMapping*, platform_ok: bool*) -> bool {
+  var z: PadMapping;
+  *out = z;
+  *platform_ok = true;
+  if (n < 34) { return false; }
+  for k in 0..16 {
+    var hi: int32 = hexv(s[k * 2]);
+    var lo: int32 = hexv(s[k * 2 + 1]);
+    if (hi < 0 || lo < 0) { return false; }
+    out->guid[k] = (uint8)(hi * 16 + lo);
+  }
+  if (s[32] != (uint8)44) { return false; }
+  var i: int64 = 33;
+  var ns: int64 = i;
+  while (i < n && s[i] != (uint8)44) { i = i + 1; }
+  var nl: int64 = i - ns;
+  if (nl > 127) { nl = 127; }
+  for k: int64 in 0..nl { out->name[k] = s[ns + k]; }
+  out->name_len = (int32)nl;
+  var fields: int32 = 0;
+  while (i < n) {
+    i = i + 1;                                   // skip ','
+    var fs: int64 = i;
+    while (i < n && s[i] != (uint8)44) { i = i + 1; }
+    var fe: int64 = i;
+    if (fe <= fs) { continue; }
+    var colon: int64 = fs;
+    while (colon < fe && s[colon] != (uint8)58) { colon = colon + 1; }
+    if (colon >= fe) { continue; }
+    var key: uint8* = &s[fs];
+    var klen: int64 = colon - fs;
+    var val: uint8* = &s[colon + 1];
+    var vlen: int64 = fe - colon - 1;
+    if (same(key, klen, "platform")) {
+      *platform_ok = same(val, vlen, window_pad_platform_name());
+      continue;
+    }
+    var out_half: int32 = 0;
+    if (klen > 1 && (key[0] == (uint8)43 || key[0] == (uint8)45)) {
+      if (key[0] == (uint8)43) { out_half = 1; } else { out_half = -1; }
+      key = &key[1];
+      klen = klen - 1;
+    }
+    var is_axis: bool = false;
+    var el: int32 = element(key, klen, &is_axis);
+    if (el < 0) { continue; }
+    var b: WindowPadBind;
+    if (!parse_bind(val, vlen, &b)) { continue; }
+    if (is_axis) { out->map.axes[el] = b; out->map.out_half[el] = out_half; }
+    else { out->map.buttons[el] = b; }
+    fields = fields + 1;
+  }
+  return fields > 0;
+}
+
+/// Adds mappings in SDL_GameControllerDB format (one per line; # starts a
+/// comment). Lines for other platforms are skipped. Returns how many were added.
+/// Pads already connected pick up a new mapping at once.
+export fn window_gamepad_add_mappings(text: string) -> int32 {
+  var s: uint8* = text.chars;
+  var n: int64 = (int64)text.length;
+  var added: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var ls: int64 = i;
+    while (i < n && s[i] != (uint8)10 && s[i] != (uint8)13) { i = i + 1; }
+    var le: int64 = i;
+    while (i < n && (s[i] == (uint8)10 || s[i] == (uint8)13)) { i = i + 1; }
+    while (ls < le && (s[ls] == (uint8)32 || s[ls] == (uint8)9)) { ls = ls + 1; }
+    if (le - ls < 34 || s[ls] == (uint8)35) { continue; }
+    var m: PadMapping;
+    var ok_platform: bool = true;
+    if (!parse_line(&s[ls], le - ls, &m, &ok_platform) || !ok_platform) { continue; }
+    var slot: int32 = -1;
+    for k in 0..g_mapping_count {
+      var same_guid: bool = true;
+      for j in 0..16 { if (g_mappings[k].guid[j] != m.guid[j]) { same_guid = false; } }
+      if (same_guid) { slot = (int32)k; }
+    }
+    if (slot < 0) {
+      if (g_mapping_count == g_mapping_cap) {
+        var cap: int32 = g_mapping_cap * 2;
+        if (cap < 32) { cap = 32; }
+        var nm: PadMapping* = (PadMapping*)malloc((int64)cap * (int64)sizeof(PadMapping));
+        for k in 0..g_mapping_count { nm[k] = g_mappings[k]; }
+        if (g_mappings != 0) { free(g_mappings); }
+        g_mappings = nm;
+        g_mapping_cap = cap;
+      }
+      slot = g_mapping_count;
+      g_mapping_count = g_mapping_count + 1;
+    }
+    g_mappings[slot] = m;
+    added = added + 1;
+  }
+  for p in 0..WINDOW_PAD_MAX {
+    if (g_pads[p].connected) { window_gamepad_choose_map(&g_pads[p]); }
+  }
+  return added;
+}
+
+/// Picks the mapping for a pad: a database entry for its GUID, else the platform default.
+export fn window_gamepad_choose_map(pad: WindowGamepad*) {
+  for k in 0..g_mapping_count {
+    var hit: bool = true;
+    // The CRC bytes (2..3) of SDL GUIDs are ignored when matching, as SDL does.
+    for j in 0..16 { if (j != 2 && j != 3 && g_mappings[k].guid[j] != pad->guid[j]) { hit = false; } }
+    if (hit) { pad->map = g_mappings[k].map; return; }
+  }
+  window_gamepad_default_map(pad);
+}
+
+// ---------- state ----------
+fn bind_value(pad: WindowGamepad*, b: WindowPadBind*) -> float32 {
+  var v: float32 = 0.0;
+  switch (b->kind) {
+    case 1: { if (b->index < 64 && pad->raw_buttons[b->index]) { v = 1.0; } }
+    case 2: {
+      if (b->index < 16) { v = pad->raw_axes[b->index]; }
+      if (b->invert) { v = -v; }
+      if (b->half == 1) { if (v < 0.0) { v = 0.0; } }
+      if (b->half == -1) { if (v > 0.0) { v = 0.0; } else { v = -v; } }
+    }
+    case 3: { if (b->index < 4 && (pad->raw_hats[b->index] & b->mask) != 0) { v = 1.0; } }
+    default: { }
+  }
+  return v;
+}
+
+/// Recomputes a pad's buttons and axes from its raw state and queues events
+/// for what changed. Platforms call this after reading input.
+export fn window_gamepad_update(index: int32) {
+  var pad: WindowGamepad* = &g_pads[index];
+  for b in 0..WINDOW_PAD_BUTTON_COUNT {
+    var bind: WindowPadBind* = &pad->map.buttons[b];
+    var v: float32 = bind_value(pad, bind);
+    // A button mapped to a whole axis (a trigger used as a button) is down past halfway.
+    var down: bool = v > 0.5;
+    if (bind->kind == 2 && bind->half == 0) { down = v > 0.0; }
+    if (down != pad->buttons[b]) {
+      pad->buttons[b] = down;
+      var ev: WindowEvent;
+      ev.kind = WINDOW_EV_GAMEPAD_UP;
+      if (down) { ev.kind = WINDOW_EV_GAMEPAD_DOWN; }
+      ev.pad = index; ev.button = (int32)b;
+      if (!g_pad_quiet) { window_push_event(&ev); }
+    }
+  }
+  for a in 0..WINDOW_AXIS_COUNT {
+    var bind2: WindowPadBind* = &pad->map.axes[a];
+    var v2: float32 = bind_value(pad, bind2);
+    var trigger: bool = a == WINDOW_AXIS_LEFT_TRIGGER || a == WINDOW_AXIS_RIGHT_TRIGGER;
+    if (trigger) {
+      // A whole-range trigger axis rests at -1: move it to 0..1. A button gives 0 or 1.
+      if (bind2->kind == 2 && bind2->half == 0) { v2 = (v2 + 1.0) * 0.5; }
+      if (v2 < 0.0) { v2 = 0.0; }
+    } else if (pad->map.out_half[a] == -1) {
+      v2 = -v2;
+    }
+    if (v2 > 1.0) { v2 = 1.0; }
+    if (v2 < -1.0) { v2 = -1.0; }
+    var dv: float32 = v2 - pad->axes[a];
+    if (dv > 0.0005 || dv < -0.0005 || (v2 == 0.0 && pad->axes[a] != 0.0)) {
+      pad->axes[a] = v2;
+      var ev2: WindowEvent;
+      ev2.kind = WINDOW_EV_GAMEPAD_AXIS;
+      ev2.pad = index; ev2.axis = (int32)a; ev2.value = v2;
+      if (!g_pad_quiet) { window_push_event(&ev2); }
+    }
+  }
+}
+
+/// Takes a free slot for a new pad (-1 when all 16 are used).
+export fn window_gamepad_slot() -> int32 {
+  for i in 0..WINDOW_PAD_MAX {
+    if (!g_pads[i].connected) {
+      var z: WindowGamepad;
+      g_pads[i] = z;
+      return (int32)i;
+    }
+  }
+  return -1;
+}
+
+export fn window_gamepad_announce(index: int32, added: bool) {
+  var ev: WindowEvent;
+  ev.pad = index;
+  ev.kind = WINDOW_EV_GAMEPAD_REMOVED;
+  if (added) { ev.kind = WINDOW_EV_GAMEPAD_ADDED; }
+  window_push_event(&ev);
+}
+
+// ---------- public API ----------
+export fn window_gamepad_init() { window_pad_plat_init(); }
+export fn window_gamepad_shutdown() { window_pad_plat_shutdown(); }
+export fn window_gamepad_pump() { window_pad_plat_pump(); }
+
+/// How many pads are connected.
+export fn window_gamepad_count() -> int32 {
+  var n: int32 = 0;
+  for i in 0..WINDOW_PAD_MAX { if (g_pads[i].connected) { n = n + 1; } }
+  return n;
+}
+/// Pads keep their index while connected; indexes of unplugged pads are reused.
+export fn window_gamepad_connected(pad: int32) -> bool { return pad >= 0 && pad < WINDOW_PAD_MAX && g_pads[pad].connected; }
+export fn window_gamepad_name(pad: int32) -> string {
+  var s: string = "";
+  if (!window_gamepad_connected(pad)) { return s; }
+  s.chars = &g_pads[pad].name[0]; s.length = (uint64)g_pads[pad].name_len;
+  return s;
+}
+export fn window_gamepad_button(pad: int32, button: int32) -> bool {
+  if (!window_gamepad_connected(pad) || button < 0 || button >= WINDOW_PAD_BUTTON_COUNT) { return false; }
+  return g_pads[pad].buttons[button];
+}
+export fn window_gamepad_axis(pad: int32, axis: int32) -> float32 {
+  if (!window_gamepad_connected(pad) || axis < 0 || axis >= WINDOW_AXIS_COUNT) { return 0.0; }
+  return g_pads[pad].axes[axis];
+}
+/// The pad's SDL-style GUID as 32 hex digits (for mapping files).
+export fn window_gamepad_guid(pad: int32, out: uint8*) {
+  const H: string = "0123456789abcdef";
+  for i in 0..16 {
+    var b: int32 = 0;
+    if (window_gamepad_connected(pad)) { b = (int32)g_pads[pad].guid[i]; }
+    out[i * 2] = H.chars[b >> 4];
+    out[i * 2 + 1] = H.chars[b & 15];
+  }
+  out[32] = (uint8)0;
+}
+/// Rumbles the pad: low / high are the two motor strengths (0..1), for ms milliseconds.
+/// False when the pad cannot rumble.
+export fn window_gamepad_rumble(pad: int32, low: float32, high: float32, ms: int32) -> bool {
+  if (!window_gamepad_connected(pad)) { return false; }
+  var l: float32 = low; var h: float32 = high;
+  if (l < 0.0) { l = 0.0; }
+  if (l > 1.0) { l = 1.0; }
+  if (h < 0.0) { h = 0.0; }
+  if (h > 1.0) { h = 1.0; }
+  var t: int32 = ms;
+  if (t < 0) { t = 0; }
+  if (t > 30000) { t = 30000; }
+  return window_pad_plat_rumble(pad, l, h, t);
+}

@@ -1,0 +1,109 @@
+// Text: shapes a string with font (OpenType GSUB/GPOS shaping), turns the
+// glyph outlines into a path and fills or strokes it. (x, y) is the start
+// of the baseline; size is pixels per em in user space.
+
+import "std/mem";
+import "font/font";
+import "../core/base";
+import "../geom/path";
+import "../geom/stroke";
+import "../raster/coverage";
+import "../paint/paint";
+import "context";
+
+// Appends glyph g's outline at pen position (ox, oy), scale k (font units
+// to user units, y flipped).
+fn glyph_into(face: FontFace*, g: int32, ox: float32, oy: float32, k: float32, fp: FontPath*, out: CanvasPath*) {
+  fp->cmds.len = 0;
+  fp->pts.len = 0;
+  fp->open = false;
+  if (!font_glyph_path(face, g, fp)) { return; }
+  var j: int64 = 0;
+  var pts: float32* = fp->pts.data;
+  for i in 0..fp->cmds.len {
+    var c: uint8 = fp->cmds.data[i];
+    if (c == FONT_MOVE) {
+      canvas_move_to(out, ox + pts[j] * k, oy - pts[j + 1] * k);
+      j = j + 2;
+    } else if (c == FONT_LINE) {
+      canvas_line_to(out, ox + pts[j] * k, oy - pts[j + 1] * k);
+      j = j + 2;
+    } else if (c == FONT_QUAD) {
+      canvas_quad_to(out, ox + pts[j] * k, oy - pts[j + 1] * k, ox + pts[j + 2] * k, oy - pts[j + 3] * k);
+      j = j + 4;
+    } else if (c == FONT_CUBIC) {
+      canvas_cubic_to(out, ox + pts[j] * k, oy - pts[j + 1] * k, ox + pts[j + 2] * k, oy - pts[j + 3] * k,
+                      ox + pts[j + 4] * k, oy - pts[j + 5] * k);
+      j = j + 6;
+    } else {
+      canvas_close(out);
+    }
+  }
+}
+
+/// Appends the outlines of text (UTF-8) to out, baseline starting at
+/// (x, y), size pixels per em. Returns the advance width in user units.
+export fn canvas_text_path(face: FontFace*, text: string, x: float32, y: float32, size: float32, out: CanvasPath*) -> float32 {
+  if (face == 0 || out == 0 || !(size > 0.0)) { return 0.0; }
+  var buf: FontBuffer;
+  memset(&buf, 0, sizeof(FontBuffer));
+  if (!font_shape(face, text.chars, (int64)text.length, (FontShapeOpts*)0, &buf)) {
+    font_buffer_free(&buf);
+    return 0.0;
+  }
+  var k: float32 = font_scale_em(face, size);
+  var fp: FontPath;
+  memset(&fp, 0, sizeof(FontPath));
+  var pen: float32 = 0.0;
+  var peny: float32 = 0.0;
+  for i in 0..buf.g.len {
+    var gl: FontGlyph = buf.g.data[i];
+    var gx: float32 = x + (pen + (float32)gl.x_off) * k;
+    var gy: float32 = y - (peny + (float32)gl.y_off) * k;
+    glyph_into(face, gl.id, gx, gy, k, &fp, out);
+    pen = pen + (float32)gl.x_adv;
+    peny = peny + (float32)gl.y_adv;
+  }
+  font_path_free(&fp);
+  font_buffer_free(&buf);
+  return pen * k;
+}
+
+/// The advance width of text in user units.
+export fn canvas_measure_text(face: FontFace*, text: string, size: float32) -> float32 {
+  if (face == 0 || !(size > 0.0)) { return 0.0; }
+  var buf: FontBuffer;
+  memset(&buf, 0, sizeof(FontBuffer));
+  var w: float32 = 0.0;
+  if (font_shape(face, text.chars, (int64)text.length, (FontShapeOpts*)0, &buf)) {
+    var pen: int64 = 0;
+    for i in 0..buf.g.len { pen = pen + (int64)buf.g.data[i].x_adv; }
+    w = (float32)pen * font_scale_em(face, size);
+  }
+  font_buffer_free(&buf);
+  return w;
+}
+
+/// Fills text. Glyph outlines use the non-zero rule, as fonts expect.
+export fn canvas_fill_text(ctx: CanvasContext*, face: FontFace*, text: string, x: float32, y: float32, size: float32, p: CanvasPaint*) -> int32 {
+  if (face == 0 || p == 0) { return CANVAS_E_ARG; }
+  var path: CanvasPath;
+  memset(&path, 0, sizeof(CanvasPath));
+  canvas_text_path(face, text, x, y, size, &path);
+  var rc: int32 = CANVAS_E_MEM;
+  if (!path.failed) { rc = canvas_fill_path(ctx, &path, p, CANVAS_NONZERO); }
+  canvas_path_free(&path);
+  return rc;
+}
+
+/// Strokes the outlines of text.
+export fn canvas_stroke_text(ctx: CanvasContext*, face: FontFace*, text: string, x: float32, y: float32, size: float32, st: CanvasStroke*, p: CanvasPaint*) -> int32 {
+  if (face == 0 || p == 0 || st == 0) { return CANVAS_E_ARG; }
+  var path: CanvasPath;
+  memset(&path, 0, sizeof(CanvasPath));
+  canvas_text_path(face, text, x, y, size, &path);
+  var rc: int32 = CANVAS_E_MEM;
+  if (!path.failed) { rc = canvas_stroke_path(ctx, &path, st, p); }
+  canvas_path_free(&path);
+  return rc;
+}

@@ -1,0 +1,455 @@
+// Time-based and counter-based one-time passwords for two-factor sign-in:
+// HOTP (RFC 4226), TOTP (RFC 6238), the base32 text people type or scan
+// (RFC 4648) and the otpauth:// provisioning URI that authenticator apps
+// import (as a QR code). Pure Mettle on top of an internal HMAC-SHA1, which
+// is what every authenticator app speaks; plain SHA-1 is not exposed.
+//
+// Secret handling is constant time in the data: the secret and the code
+// derived from it never steer a branch, index or division (the dynamic
+// truncation, the modulo and the digit formatting use masks and
+// multiplications). Branches depend on lengths, steps and the public
+// separators of pasted text only.
+
+import "cryptex/core/status";
+import "cryptex/core/types";
+import "cryptex/core/util";
+import "cryptex/hash/sha1";
+
+/// CR_TOTP_SECRET_BYTES: the recommended size of an authenticator secret, in
+/// bytes (160 bits, the HMAC-SHA1 output size; RFC 4226 requires at least
+/// 16). Generate one with cr_random_bytes.
+/// in: -
+/// returns: 20
+/// owns: nothing
+/// thread: constant
+/// example: var sec: uint8[20]; cr_random_bytes(&sec[0], CR_TOTP_SECRET_BYTES);
+export const CR_TOTP_SECRET_BYTES: int64 = 20;
+
+// Largest secret the base32 functions accept (keeps 8n + 4 far from overflow).
+const CR_TOTP_MAX: int64 = 1099511627775;
+
+// All-ones (-1) if lo <= c <= hi, else 0. Arithmetic only (see encode.mettle).
+fn totp_in(c: int32, lo: int32, hi: int32) -> int32 {
+  return ~((c - lo) >> 31) & ((c - hi - 1) >> 31);
+}
+
+// All-ones if x >= k, else 0 (small values).
+fn totp_ge(x: int32, k: int32) -> int32 {
+  return ~((x - k) >> 31);
+}
+
+// Base32 character for a 5-bit value x in 0..31: 'A'..'Z' then '2'..'7'.
+fn totp_b32_char(x: int32) -> uint8 {
+  return (uint8)(x + 65 + (totp_ge(x, 26) & -41));
+}
+
+// Base32 value of c (either case) in the low bits; *bad gets all-ones OR-ed
+// in when c is outside the alphabet.
+fn totp_b32_val(c: int32, bad: int32*) -> int32 {
+  var up: int32 = totp_in(c, 65, 90);
+  var lo: int32 = totp_in(c, 97, 122);
+  var dg: int32 = totp_in(c, 50, 55);
+  *bad = *bad | ~(up | lo | dg);
+  return (up & (c - 65)) | (lo & (c - 97)) | (dg & (c - 24));
+}
+
+// v mod d for v < 2^31 and a public d, by shift and conditional subtract
+// (no division instruction, no branch on v).
+fn totp_mod(v: uint32, d: uint32) -> uint32 {
+  var r: uint64 = 0;
+  var dd: uint64 = (uint64)d;
+  for i in 0..31 {
+    r = (r << 1) | (uint64)((v >> (30 - i)) & 1);
+    var t: uint64 = r - dd;
+    var ge: uint64 = (uint64)1 ^ (t >> 63);
+    r = r - (dd & ((uint64)0 - ge));
+  }
+  return (uint32)r;
+}
+
+// The HOTP value of RFC 4226 section 5.3 without argument checks.
+fn totp_hotp(secret: uint8*, n: int64, counter: uint64, digits: int32) -> uint32 {
+  var ctr: uint8[8];
+  for i in 0..8 {
+    ctr[i] = (uint8)(counter >> (56 - 8 * i));
+  }
+  var mac: uint8[20];
+  crx_hmac_sha1(&mac[0], secret, n, &ctr[0], 8);
+  // Dynamic truncation: the offset is secret, so every candidate word is read
+  // and the right one is selected with a mask.
+  var off: uint32 = (uint32)(mac[19] & 15);
+  var word: uint32 = 0;
+  for j in 0..16 {
+    var x: uint32 = (uint32)j ^ off;
+    var eq: uint32 = (x - 1) >> 31;
+    var w: uint32 = ((uint32)mac[j] << 24) | ((uint32)mac[j + 1] << 16) | ((uint32)mac[j + 2] << 8) | (uint32)mac[j + 3];
+    word = word | (w & ((uint32)0 - eq));
+  }
+  word = word & (uint32)0x7fffffff;
+  var m: uint32 = 1000000;
+  if (digits == 7) { m = 10000000; }
+  if (digits == 8) { m = 100000000; }
+  var code: uint32 = totp_mod(word, m);
+  cr_wipe(&ctr[0], 8);
+  cr_wipe(&mac[0], 20);
+  return code;
+}
+
+// Writes v (< 10^digits) as exactly `digits` ASCII digits with leading
+// zeros. Division by ten is a multiplication by its reciprocal.
+fn totp_format(out: uint8*, v: uint32, digits: int32) {
+  var x: uint32 = v;
+  var i: int32 = digits;
+  while (i > 0) {
+    i = i - 1;
+    var q: uint32 = (uint32)(((uint64)x * (uint64)(uint32)0xcccccccd) >> 35);
+    out[i] = (uint8)((uint32)48 + (x - q * (uint32)10));
+    x = q;
+  }
+}
+
+/// Computes an HMAC-based one-time password (HOTP, RFC 4226 section 5):
+/// HMAC-SHA1 of the 8-byte big-endian counter under the secret, dynamic
+/// truncation, then the result modulo 10^digits.
+/// in: out; secret readable for n bytes, 1 <= n <= 64 (CR_TOTP_SECRET_BYTES
+///   recommended; RFC 4226 requires at least 16); counter; digits 6, 7 or 8
+/// returns: CR_OK and *out = the code as a number (format it with leading
+///   zeros to `digits` digits); CR_E_ARG for a null pointer, n outside
+///   1..64 or digits outside 6..8 (*out = 0 when out is not null)
+/// owns: nothing; the secret stays the caller's, internal temporaries are
+///   wiped
+/// thread: any thread (no shared state)
+/// example: var code: uint32; cr_hotp(&code, &sec[0], 20, counter, 6);
+export fn cr_hotp(out: uint32*, secret: uint8*, n: int64, counter: uint64, digits: int32) -> int32 {
+  if (out == 0) { return CR_E_ARG; }
+  *out = 0;
+  if (secret == 0 || n < 1 || n > 64 || digits < 6 || digits > 8) { return CR_E_ARG; }
+  *out = totp_hotp(secret, n, counter, digits);
+  return CR_OK;
+}
+
+/// Computes a time-based one-time password (TOTP, RFC 6238 with HMAC-SHA1):
+/// the HOTP of the counter floor(unix_time / period).
+/// in: out; secret readable for n bytes, 1 <= n <= 64; unix_time >= 0 (seconds
+///   since 1970-01-01 UTC); period 1..300 seconds (30 is what authenticator
+///   apps use); digits 6, 7 or 8 (6 is what authenticator apps use)
+/// returns: CR_OK and *out = the code as a number (format it with leading
+///   zeros to `digits` digits); CR_E_ARG for any argument outside these
+///   ranges or a null pointer (*out = 0 when out is not null)
+/// owns: nothing; internal temporaries are wiped
+/// thread: any thread (no shared state)
+/// example: var code: uint32; cr_totp(&code, &sec[0], 20, now, 30, 6);
+export fn cr_totp(out: uint32*, secret: uint8*, n: int64, unix_time: int64, period: int32, digits: int32) -> int32 {
+  if (out == 0) { return CR_E_ARG; }
+  *out = 0;
+  if (unix_time < 0 || period < 1 || period > 300) { return CR_E_ARG; }
+  return cr_hotp(out, secret, n, (uint64)(unix_time / (int64)period), digits);
+}
+
+/// Checks a code a user typed against the codes for the time steps from
+/// window steps before to window steps after the current one (to tolerate
+/// clock drift and typing delay). The code for every step in the range is
+/// computed and compared with cr_equal, with no early exit, so timing does
+/// not reveal which step (if any) matched.
+/// REPLAY: a code stays valid for its whole step, so the caller must keep the
+/// last accepted step per user and reject a matched step <= that one (store
+/// the new step when a code is accepted), or one code can be used twice.
+/// Throttle failed attempts too; six digits are guessable.
+/// in: code, exactly `digits` ASCII digits '0'..'9'; secret readable for n
+///   bytes, 1 <= n <= 64; unix_time >= 0; period 1..300; digits 6..8;
+///   window 0..10 steps on each side; matched_step, where the matching step
+///   number (unix_time / period + offset) goes (may be 0)
+/// returns: true if the code matches one of the steps; false otherwise and
+///   for any invalid argument or a code that is not `digits` ASCII digits
+///   (it fails closed). *matched_step = the step that matched, else -1
+///   (when matched_step is not null)
+/// owns: nothing; internal temporaries are wiped
+/// thread: any thread (no shared state)
+/// example: var step: int64; if (cr_totp_verify(typed, &sec[0], 20, now, 30, 6, 1, &step) && step > last_step) { accept(step); }
+export fn cr_totp_verify(code: string, secret: uint8*, n: int64, unix_time: int64, period: int32, digits: int32, window: int32, matched_step: int64*) -> bool {
+  if (matched_step != 0) { *matched_step = -1; }
+  if (secret == 0 || n < 1 || n > 64 || digits < 6 || digits > 8) { return false; }
+  if (unix_time < 0 || period < 1 || period > 300 || window < 0 || window > 10) { return false; }
+  if (code.length != (uint64)digits) { return false; }
+  for i in 0..digits {
+    var c: uint8 = code.chars[i];
+    if (c < 48 || c > 57) { return false; }
+  }
+  var now: int64 = unix_time / (int64)period;
+  var found: uint64 = 0;
+  var step: int64 = -1;
+  var cand: uint8[8];
+  var k: int32 = 0 - window;
+  while (k <= window) {
+    var s: int64 = now + (int64)k;
+    // Steps before the epoch do not exist (public condition).
+    if (s >= 0) {
+      var v: uint32 = totp_hotp(secret, n, (uint64)s, digits);
+      totp_format(&cand[0], v, digits);
+      var eq: uint64 = 0;
+      if (cr_equal(&cand[0], code.chars, (int64)digits)) { eq = 1; }
+      var mask: uint64 = (uint64)0 - eq;
+      found = found | eq;
+      step = (int64)(((uint64)step & ~mask) | ((uint64)s & mask));
+    }
+    k = k + 1;
+  }
+  cr_wipe(&cand[0], 8);
+  if (matched_step != 0) { *matched_step = step; }
+  return found != 0;
+}
+
+/// Writes a secret as RFC 4648 base32 (alphabet A-Z 2-7, uppercase, no
+/// padding), the text authenticator apps accept and show. Capacity needed:
+/// (8n + 4) / 5 + 1 bytes (the text plus a nul).
+/// in: out writable for out_cap bytes; out_len; secret readable for n bytes,
+///   n >= 0
+/// returns: CR_OK and *out_len = the text length (a nul follows it);
+///   CR_E_ARG (null out or out_len, null secret with n > 0, n < 0 or
+///   absurdly large); CR_E_SPACE if out_cap < (8n + 4) / 5 + 1 (nothing
+///   written). On error *out_len = 0
+/// owns: nothing; the caller owns out (it holds the secret: wipe it with
+///   cr_wipe when done)
+/// thread: any thread (no shared state)
+/// example: var t: uint8[33]; var tl: int64; cr_totp_secret_text(&t[0], 33, &tl, &sec[0], 20);
+export fn cr_totp_secret_text(out: uint8*, out_cap: int64, out_len: int64*, secret: uint8*, n: int64) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || n < 0 || n > CR_TOTP_MAX || (secret == 0 && n > 0)) { return CR_E_ARG; }
+  var chars: int64 = (n * 8 + 4) / 5;
+  if (out_cap < chars + 1) { return CR_E_SPACE; }
+  var acc: uint32 = 0;
+  var bits: int32 = 0;
+  var o: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    acc = (acc << 8) | (uint32)secret[i];
+    bits = bits + 8;
+    while (bits >= 5) {
+      bits = bits - 5;
+      out[o] = totp_b32_char((int32)((acc >> bits) & 31));
+      o = o + 1;
+    }
+    acc = acc & (((uint32)1 << bits) - 1);
+    i = i + 1;
+  }
+  if (bits > 0) {
+    out[o] = totp_b32_char((int32)((acc << (5 - bits)) & 31));
+    o = o + 1;
+  }
+  out[o] = 0;
+  *out_len = o;
+  cr_wipe((uint8*)&acc, 4);
+  return CR_OK;
+}
+
+/// Reads the base32 text people paste or type into a secret: accepts
+/// lowercase, skips spaces and '-' (so "jbsw y3dp-ehpk 3pxp" works) and
+/// rejects everything else, including '=' padding. The text must be
+/// canonical: a last group of 1, 3 or 6 characters, or non-zero trailing
+/// bits, is refused. The spaces and '-' are the only characters whose
+/// position is treated as public.
+/// in: out writable for out_cap bytes; out_len; text (not necessarily nul
+///   terminated)
+/// returns: CR_OK and *out_len = the decoded length (5 bytes per 8
+///   characters); CR_E_DECODE for a bad character, bad group length or
+///   non-zero trailing bits; CR_E_SPACE if out_cap is smaller than the
+///   decoded length; CR_E_ARG (null out or out_len, null text with length
+///   > 0, negative out_cap). On error *out_len = 0 and out's first out_cap
+///   bytes are wiped
+/// owns: nothing; the caller owns out (a secret: wipe it with cr_wipe when
+///   done)
+/// thread: any thread (no shared state)
+/// example: var sec: uint8[64]; var sl: int64; cr_totp_secret_from_text(&sec[0], 64, &sl, typed);
+export fn cr_totp_secret_from_text(out: uint8*, out_cap: int64, out_len: int64*, text: string) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  var n: int64 = (int64)text.length;
+  if (out == 0 || out_cap < 0 || n > CR_TOTP_MAX || (text.chars == 0 && n > 0)) { return CR_E_ARG; }
+  // Count the characters that are not separators.
+  var m: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)text.chars[i];
+    if (c != 32 && c != 45) { m = m + 1; }
+    i = i + 1;
+  }
+  var r: int64 = m % 8;
+  if (r == 1 || r == 3 || r == 6) {
+    cr_wipe(out, out_cap);
+    return CR_E_DECODE;
+  }
+  var need: int64 = (m * 5) / 8;
+  if (out_cap < need) {
+    cr_wipe(out, out_cap);
+    return CR_E_SPACE;
+  }
+  var bad: int32 = 0;
+  var acc: uint32 = 0;
+  var bits: int32 = 0;
+  var o: int64 = 0;
+  i = 0;
+  while (i < n) {
+    var c2: int32 = (int32)text.chars[i];
+    i = i + 1;
+    if (c2 == 32 || c2 == 45) { continue; }
+    var v: int32 = totp_b32_val(c2, &bad);
+    acc = (acc << 5) | (uint32)v;
+    bits = bits + 5;
+    // bits depends on the position only, never on the data.
+    if (bits >= 8) {
+      bits = bits - 8;
+      out[o] = (uint8)((acc >> bits) & 255);
+      o = o + 1;
+    }
+    acc = acc & (((uint32)1 << bits) - 1);
+  }
+  // The 0..4 leftover bits must be zero.
+  bad = bad | (int32)acc;
+  cr_wipe((uint8*)&acc, 4);
+  if (bad != 0) {
+    cr_wipe(out, out_cap);
+    return CR_E_DECODE;
+  }
+  *out_len = o;
+  return CR_OK;
+}
+
+// True for A-Z a-z 0-9 - . _ ~ (the bytes percent-encoding leaves alone).
+fn totp_unreserved(c: uint8) -> bool {
+  if (c >= 65 && c <= 90) { return true; }
+  if (c >= 97 && c <= 122) { return true; }
+  if (c >= 48 && c <= 57) { return true; }
+  return c == 45 || c == 46 || c == 95 || c == 126;
+}
+
+// Length of s after percent-encoding.
+fn totp_enc_len(s: string) -> int64 {
+  var len: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    if (totp_unreserved(s.chars[i])) { len = len + 1; } else { len = len + 3; }
+    i = i + 1;
+  }
+  return len;
+}
+
+// Appends raw bytes; returns the new position.
+fn totp_put(out: uint8*, pos: int64, s: string) -> int64 {
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    out[pos + i] = s.chars[i];
+    i = i + 1;
+  }
+  return pos + (int64)s.length;
+}
+
+// Appends s percent-encoded (%XX, uppercase hex); returns the new position.
+fn totp_put_enc(out: uint8*, pos: int64, s: string) -> int64 {
+  var p: int64 = pos;
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    var c: uint8 = s.chars[i];
+    if (totp_unreserved(c)) {
+      out[p] = c;
+      p = p + 1;
+    } else {
+      var hi: int32 = (int32)(c >> 4);
+      var lo: int32 = (int32)(c & 15);
+      out[p] = 37;
+      if (hi < 10) { out[p + 1] = (uint8)(48 + hi); } else { out[p + 1] = (uint8)(55 + hi); }
+      if (lo < 10) { out[p + 2] = (uint8)(48 + lo); } else { out[p + 2] = (uint8)(55 + lo); }
+      p = p + 3;
+    }
+    i = i + 1;
+  }
+  return p;
+}
+
+// Decimal digits in v (v >= 0).
+fn totp_dec_len(v: int32) -> int64 {
+  var len: int64 = 1;
+  var x: int32 = v;
+  while (x >= 10) {
+    x = x / 10;
+    len = len + 1;
+  }
+  return len;
+}
+
+// Appends v (>= 0) in decimal; returns the new position.
+fn totp_put_dec(out: uint8*, pos: int64, v: int32) -> int64 {
+  var len: int64 = totp_dec_len(v);
+  var x: int32 = v;
+  var i: int64 = len;
+  while (i > 0) {
+    i = i - 1;
+    out[pos + i] = (uint8)(48 + x % 10);
+    x = x / 10;
+  }
+  return pos + len;
+}
+
+// True if s has 1..255 bytes and no ':'.
+fn totp_label_ok(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n < 1 || n > 255 || s.chars == 0) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    if (s.chars[i] == 58) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Builds the otpauth:// URI that authenticator apps import (usually shown
+/// as a QR code): otpauth://totp/ISSUER:ACCOUNT?secret=...&issuer=ISSUER&
+/// algorithm=SHA1&digits=D&period=P, with issuer and account percent-encoded
+/// (every byte except A-Z a-z 0-9 - . _ ~ becomes %XX, uppercase hex). It
+/// ends with a nul after the text.
+/// in: out writable for out_cap bytes; out_len; issuer and account, each 1..255
+///   bytes without ':' (the service name, and the user's name or email);
+///   secret_text, the secret as base32 A-Z 2-7 (cr_totp_secret_text) and not
+///   empty; digits 6..8 (apps only show 6 reliably); period 1..300 (30)
+/// returns: CR_OK and *out_len = the URI length (a nul follows it); CR_E_ARG
+///   for a bad label, secret text, digits or period or a null pointer;
+///   CR_E_SPACE if out_cap is too small (nothing written). On error
+///   *out_len = 0
+/// owns: nothing; the caller owns out (it contains the secret: wipe it with
+///   cr_wipe when done)
+/// thread: any thread (no shared state)
+/// example: var u: uint8[512]; var ul: int64; cr_totp_uri(&u[0], 512, &ul, "Mettle", "nox@example.com", st, 6, 30);
+export fn cr_totp_uri(out: uint8*, out_cap: int64, out_len: int64*, issuer: string, account: string, secret_text: string, digits: int32, period: int32) -> int32 {
+  if (out_len == 0) { return CR_E_ARG; }
+  *out_len = 0;
+  if (out == 0 || out_cap < 0 || digits < 6 || digits > 8 || period < 1 || period > 300) { return CR_E_ARG; }
+  if (!totp_label_ok(issuer) || !totp_label_ok(account)) { return CR_E_ARG; }
+  var sn: int64 = (int64)secret_text.length;
+  if (sn < 1 || sn > 4096 || secret_text.chars == 0) { return CR_E_ARG; }
+  var i: int64 = 0;
+  while (i < sn) {
+    var c: uint8 = secret_text.chars[i];
+    var ok: bool = (c >= 65 && c <= 90) || (c >= 50 && c <= 55);
+    if (!ok) { return CR_E_ARG; }
+    i = i + 1;
+  }
+  var enc_issuer: int64 = totp_enc_len(issuer);
+  var need: int64 = 15 + enc_issuer + 1 + totp_enc_len(account) + 8 + sn + 8 + enc_issuer + 23 + totp_dec_len(digits) + 8 + totp_dec_len(period) + 1;
+  if (out_cap < need) { return CR_E_SPACE; }
+  var p: int64 = 0;
+  p = totp_put(out, p, "otpauth://totp/");
+  p = totp_put_enc(out, p, issuer);
+  p = totp_put(out, p, ":");
+  p = totp_put_enc(out, p, account);
+  p = totp_put(out, p, "?secret=");
+  p = totp_put(out, p, secret_text);
+  p = totp_put(out, p, "&issuer=");
+  p = totp_put_enc(out, p, issuer);
+  p = totp_put(out, p, "&algorithm=SHA1&digits=");
+  p = totp_put_dec(out, p, digits);
+  p = totp_put(out, p, "&period=");
+  p = totp_put_dec(out, p, period);
+  out[p] = 0;
+  *out_len = p;
+  return CR_OK;
+}

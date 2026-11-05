@@ -1,0 +1,229 @@
+// raize_api/cors: cross-origin resource sharing.
+//
+// Follows the WHATWG Fetch standard, "CORS protocol" (section 3.2): the
+// Access-Control-* response headers, the preflight request (OPTIONS with
+// Access-Control-Request-Method) and the Vary: Origin rule for caches.
+// Header lists follow RFC 9110 sections 5.6.1 and 12.5.5 (Vary).
+//
+//   rapi_use_cors(api, "https://app.example.com https://admin.example.com", true, 600);
+//   rapi_use_cors(api, "*", false, 0);
+//
+// The hook runs at the edge, before the request is matched, so 404 and 405
+// problems carry the same headers and a preflight is answered without an
+// operation for OPTIONS.
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/header";
+import "raize_core/context/response";
+import "../route/api";
+import "../route/dispatch";
+
+// What the hook needs, kept in api->cors for the life of the app.
+struct RapiCors {
+  origins: string;      // the allow list, space separated
+  any: bool;            // the list holds "*"
+  credentials: bool;
+  max_age: int64;       // seconds, 0 to leave Access-Control-Max-Age out
+}
+
+// The response headers a browser script may read (Fetch: Access-Control-Expose-Headers).
+const RAPI_CORS_EXPOSE: string = "Location, ETag, Link, Retry-After, RateLimit, RateLimit-Policy, Deprecation, Sunset, Idempotent-Replayed";
+
+/// Adds `token` to the response's Vary header (RFC 9110 section 12.5.5) unless it is
+/// already listed or Vary is "*". Existing values are kept.
+/// ctx: the request being answered. token: a header name such as "Origin".
+export fn rapi_vary_add(ctx: RzContext*, token: string) {
+  var cur: string = rz_resp_header_get(ctx->resp, "Vary");
+  if (cur.length == 0) {
+    rz_ctx_set_header(ctx, "Vary", token);
+    return;
+  }
+  if (rz_header_has_token(cur, "*") || rz_header_has_token(cur, token)) { return; }
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, cur);
+  rz_buf_add(b, ", ");
+  rz_buf_add(b, token);
+  rz_ctx_set_header(ctx, "Vary", rz_buf_str(b));
+  rz_buf_free(b);
+}
+
+// Space (or comma, tab, newline) separated words.
+fn rapi__cors_word(s: string, pos: int64*, out: string*) -> bool {
+  var n: int64 = (int64)s.length;
+  var i: int64 = *pos;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (c == 32 || c == 9 || c == 10 || c == 13 || c == 44) { i = i + 1; } else { break; }
+  }
+  if (i >= n) {
+    *pos = n;
+    return false;
+  }
+  var start: int64 = i;
+  while (i < n) {
+    var d: int32 = (int32)s.chars[i];
+    if (d == 32 || d == 9 || d == 10 || d == 13 || d == 44) { break; }
+    i = i + 1;
+  }
+  *out = rz_str_sub(s, start, i);
+  *pos = i;
+  return true;
+}
+
+// True for a plausible serialized origin: visible ASCII, no spaces, not huge.
+fn rapi__cors_origin_ok(origin: string) -> bool {
+  var n: int64 = (int64)origin.length;
+  if (n == 0 || n > 512) { return false; }
+  for i in 0..n {
+    var c: int32 = (int32)origin.chars[i];
+    if (c < 33 || c > 126) { return false; }
+  }
+  return true;
+}
+
+// True when the origin is in the allow list. "null" must be listed by name; "*"
+// does not cover it. Origins compare without case, ignoring a trailing slash.
+fn rapi__cors_allowed(st: RapiCors*, origin: string) -> bool {
+  if (!rapi__cors_origin_ok(origin)) { return false; }
+  var is_null: bool = origin == "null";
+  var pos: int64 = 0;
+  var w: string = rz_str_empty();
+  while (rapi__cors_word(st->origins, &pos, &w)) {
+    if (w == "*") {
+      if (!is_null) { return true; }
+      continue;
+    }
+    var item: string = w;
+    if (item.length > 1 && item.chars[item.length - 1] == 47) {
+      item = rz_str_sub(item, 0, (int64)item.length - 1);
+    }
+    if (rz_str_eq_ci(item, origin)) { return true; }
+  }
+  return false;
+}
+
+// The method named by Access-Control-Request-Method must be a token and be one of
+// the verbs in `methods` ("GET, HEAD, POST, OPTIONS"). Methods are case sensitive.
+fn rapi__cors_method_ok(methods: string, verb: string) -> bool {
+  if (verb.length == 0 || verb.length > 32) { return false; }
+  for k in 0..verb.length {
+    if (!rz_char_is_tchar((int32)verb.chars[k])) { return false; }
+  }
+  var n: int64 = (int64)methods.length;
+  var i: int64 = 0;
+  while (i <= n) {
+    var j: int64 = rz_str_find_byte_from(methods, 44, i);
+    if (j < 0) { j = n; }
+    var piece: string = rz_header_trim(rz_str_sub(methods, i, j));
+    i = j + 1;
+    if (piece.length > 0 && rz_str_eq(piece, verb)) { return true; }
+  }
+  return false;
+}
+
+// Access-Control-Request-Headers: checks every name is a token and lists them in
+// lower case. Returns "" (nothing owned) when the list is empty or has a bad name.
+fn rapi__cors_header_list(ctx: RzContext*, raw: string) -> string {
+  var b: RzBuf* = rz_buf_new();
+  var good: bool = true;
+  var count: int32 = 0;
+  var n: int64 = (int64)raw.length;
+  var i: int64 = 0;
+  while (i <= n) {
+    var j: int64 = rz_str_find_byte_from(raw, 44, i);
+    if (j < 0) { j = n; }
+    var nm: string = rz_header_trim(rz_str_sub(raw, i, j));
+    i = j + 1;
+    if (nm.length == 0) { continue; }
+    if (!rz_header_name_ok(nm) || count >= 64) { good = false; break; }
+    if (count > 0) { rz_buf_add(b, ", "); }
+    for k in 0..nm.length {
+      rz_buf_add_byte(b, rz_char_lower((int32)nm.chars[k]));
+    }
+    count = count + 1;
+  }
+  var out: string = rz_str_empty();
+  if (good && count > 0) { out = rz_arena_str(ctx->arena, rz_buf_str(b)); }
+  rz_buf_free(b);
+  return out;
+}
+
+// The preflight answer for an allowed origin (Fetch: CORS-preflight request).
+fn rapi__cors_preflight(st: RapiCors*, api: RapiApi*, ctx: RzContext*, asked: string) -> int32 {
+  var methods: string = rapi_allowed(api, rapi_rel_path(api, ctx));
+  if (methods.length == 0) { return RAPI_NEXT; }    // no operation here: the 404 path
+  var verb: string = rz_header_trim(asked);
+  if (rapi__cors_method_ok(methods, verb)) {
+    rz_ctx_set_header(ctx, "Access-Control-Allow-Methods", methods);
+    var raw: string = rz_ctx_header(ctx, "Access-Control-Request-Headers");
+    if (raw.length > 0) {
+      rapi_vary_add(ctx, "Access-Control-Request-Headers");
+      var names: string = rapi__cors_header_list(ctx, raw);
+      if (names.length > 0) { rz_ctx_set_header(ctx, "Access-Control-Allow-Headers", names); }
+    }
+    if (st->max_age > 0) {
+      var tmp: uint8[24];
+      rz_ctx_set_header(ctx, "Access-Control-Max-Age", rz_int_buf(st->max_age, &tmp[0], 24));
+    }
+  }
+  rz_str_free(methods);
+  return rz_ctx_empty(ctx, 204);
+}
+
+// The edge hook.
+fn rapi__cors_edge(api: RapiApi*, ctx: RzContext*) -> int32 {
+  var st: RapiCors* = (RapiCors*)api->cors;
+  if (st == 0) { return RAPI_NEXT; }
+  var origin: string = rz_ctx_header(ctx, "Origin");
+  if (origin.length == 0) { return RAPI_NEXT; }
+  var asked: string = rz_ctx_header(ctx, "Access-Control-Request-Method");
+  var preflight: bool = ctx->req->verb == "OPTIONS" && asked.length > 0;
+  rapi_vary_add(ctx, "Origin");
+  if (!rapi__cors_allowed(st, origin)) {
+    // No CORS headers: the browser refuses the response by itself.
+    if (preflight) { return rz_ctx_empty(ctx, 204); }
+    return RAPI_NEXT;
+  }
+  if (st->any && !st->credentials) {
+    rz_ctx_set_header(ctx, "Access-Control-Allow-Origin", "*");
+  } else {
+    rz_ctx_set_header(ctx, "Access-Control-Allow-Origin", origin);
+  }
+  if (st->credentials) { rz_ctx_set_header(ctx, "Access-Control-Allow-Credentials", "true"); }
+  rz_ctx_set_header(ctx, "Access-Control-Expose-Headers", RAPI_CORS_EXPOSE);
+  if (!preflight) { return RAPI_NEXT; }
+  return rapi__cors_preflight(st, api, ctx, asked);
+}
+
+/// Turns on CORS for every request under the API.
+/// origins: space-separated exact origins ("https://a.com https://b.com"), or "*" for
+///   any origin. "null" is only allowed when listed.
+/// credentials: allow cookies and Authorization (Access-Control-Allow-Credentials).
+///   With credentials the request's origin is always echoed, never "*".
+/// max_age: seconds a browser may cache a preflight answer, 0 to leave it out.
+/// Calling it again changes the settings.
+export fn rapi_use_cors(api: RapiApi*, origins: string, credentials: bool, max_age: int64) {
+  var st: RapiCors* = (RapiCors*)api->cors;
+  var fresh: bool = st == 0;
+  if (fresh) {
+    st = (RapiCors*)calloc(1, sizeof(RapiCors));
+    if (st == 0) { return; }
+  } else {
+    rz_str_free(st->origins);
+  }
+  st->origins = rz_str_dup(rz_str_trim(origins));
+  st->credentials = credentials;
+  st->max_age = max_age;
+  st->any = false;
+  var pos: int64 = 0;
+  var w: string = rz_str_empty();
+  while (rapi__cors_word(st->origins, &pos, &w)) {
+    if (w == "*") { st->any = true; }
+  }
+  if (fresh) {
+    api->cors = (rawptr)st;
+    rapi_edge(api, &rapi__cors_edge);
+  }
+}

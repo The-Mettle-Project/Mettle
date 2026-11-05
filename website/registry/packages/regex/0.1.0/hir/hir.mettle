@@ -1,0 +1,101 @@
+// HIR: the pattern after parsing, with flags already applied.
+//
+// Nodes live in one array and refer to each other by index. Children of a
+// concatenation or alternation form a list through `next`.
+
+import "std/mem";
+import "regex/core/vec";
+import "regex/hir/class";
+
+export const RX_H_EMPTY = 0;    // matches the empty string
+export const RX_H_LIT = 1;      // x = code point (flag 0) or byte (flag 1)
+export const RX_H_CLASS = 2;    // x = class index, flag 1 = byte class
+export const RX_H_LOOK = 3;     // x = RX_LOOK_*
+export const RX_H_REPEAT = 4;   // x = min, y = max (-1 = no limit), flag 1 = greedy
+export const RX_H_CAPTURE = 5;  // x = group index
+export const RX_H_CONCAT = 6;
+export const RX_H_ALT = 7;
+
+// Zero-width assertions.
+export const RX_LOOK_START_TEXT = 1;      // \A, ^ without (?m)
+export const RX_LOOK_END_TEXT = 2;        // \z, $ without (?m)
+export const RX_LOOK_START_LF = 3;        // (?m)^
+export const RX_LOOK_END_LF = 4;          // (?m)$
+export const RX_LOOK_START_CRLF = 5;      // (?mR)^
+export const RX_LOOK_END_CRLF = 6;        // (?mR)$
+export const RX_LOOK_WORD_A = 7;          // (?-u)\b
+export const RX_LOOK_NOT_WORD_A = 8;      // (?-u)\B
+export const RX_LOOK_WORD_U = 9;          // \b
+export const RX_LOOK_NOT_WORD_U = 10;     // \B
+export const RX_LOOK_WSTART_A = 11;       // (?-u)\b{start}, \<
+export const RX_LOOK_WEND_A = 12;         // (?-u)\b{end}, \>
+export const RX_LOOK_WSTART_U = 13;
+export const RX_LOOK_WEND_U = 14;
+export const RX_LOOK_WSTART_HALF_A = 15;  // \b{start-half}
+export const RX_LOOK_WEND_HALF_A = 16;    // \b{end-half}
+export const RX_LOOK_WSTART_HALF_U = 17;
+export const RX_LOOK_WEND_HALF_U = 18;
+
+export struct RxNode {
+  kind: int32;
+  x: int32;
+  y: int32;
+  flag: int32;
+  sub: int32;    // first child, or -1
+  next: int32;   // next sibling, or -1
+}
+
+export struct RxHir {
+  nodes: RxVec<RxNode>;
+  classes: RxVec<RxClass>;
+  names: RxVec<string>;   // group names by index; "" when unnamed. Index 0 is the whole match.
+  root: int32;
+  looks: uint32;          // bit (1 << kind) for each look kind used
+}
+
+export fn rx_hir_node(h: RxHir*, kind: int32, x: int32, y: int32, flag: int32, sub: int32) -> int32 {
+  var n: RxNode = { kind: kind, x: x, y: y, flag: flag, sub: sub, next: -1 };
+  rx_vpush(&h->nodes, n);
+  return (int32)(h->nodes.len - 1);
+}
+
+/// Adds a class (taking ownership of its ranges) and returns its node.
+export fn rx_hir_class(h: RxHir*, c: RxClass*, bytes: bool) -> int32 {
+  rx_vpush(&h->classes, *c);
+  var f: int32 = 0;
+  if (bytes) { f = 1; }
+  return rx_hir_node(h, RX_H_CLASS, (int32)(h->classes.len - 1), 0, f, -1);
+}
+
+export fn rx_hir_free(h: RxHir*) {
+  for i in 0..h->classes.len { rx_cls_free(&h->classes.data[i]); }
+  rx_vfree(&h->classes);
+  rx_vfree(&h->nodes);
+  for i in 0..h->names.len {
+    var s: string = h->names.data[i];
+    if (s.length > 0) { free(s.chars); }
+  }
+  rx_vfree(&h->names);
+}
+
+/// The look kind seen from the other end, for the reverse program.
+export fn rx_look_reverse(k: int32) -> int32 {
+  switch (k) {
+    case 1: { return 2; }
+    case 2: { return 1; }
+    case 3: { return 4; }
+    case 4: { return 3; }
+    case 5: { return 6; }
+    case 6: { return 5; }
+    case 11: { return 12; }
+    case 12: { return 11; }
+    case 13: { return 14; }
+    case 14: { return 13; }
+    case 15: { return 16; }
+    case 16: { return 15; }
+    case 17: { return 18; }
+    case 18: { return 17; }
+    default: { }
+  }
+  return k;
+}

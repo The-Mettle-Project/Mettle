@@ -1,0 +1,313 @@
+// raize/config/types — the config value, its documented defaults, its codes.
+//
+// This is the bottom of the config module: no environment, no filesystem, no
+// validation policy. `env.mettle` parses, `validate.mettle` checks, and
+// `config.mettle` is the facade a program imports.
+//
+// ## Immutability (why there is no lock)
+//
+// `RzConfig` is filled during startup and then never written again. The
+// pointer is handed to the server, the static handler and the template
+// renderer, and every one of them only reads it. Nothing on the request path
+// writes a field, so there is no lock, no atomic and no copy-per-request.
+// `rz_config_freeze` marks the end of startup; after it, load/set/validate
+// refuse, because a call after freeze means the startup ordering is wrong.
+//
+// ## Fixed capacities, no allocation
+//
+// Every string lives in a fixed byte array inside the struct and is exposed as
+// a borrowed view. There is no allocation to free and a value that does not
+// fit is an error, never a truncation.
+
+import "std/mem";
+import "../str/str";
+import "../context/header";
+
+export const RZ_CFG_ORIGIN_MAX: int32 = 256;
+export const RZ_CFG_ENV_MAX: int32 = 32;
+export const RZ_CFG_PROXY_MAX: int32 = 16;          // "255.255.255.255" + NUL
+
+// Documented defaults. Every one is asserted by tests/unit/config_test.mettle.
+export const RZ_CFG_DEFAULT_PORT: int32 = 8080;
+export const RZ_CFG_DEFAULT_WORKERS: int32 = 4;
+export const RZ_CFG_DEFAULT_MAX_BODY: int64 = 1048576;      // 1 MiB
+export const RZ_CFG_DEFAULT_MAX_HEADER: int64 = 8192;       // 8 KiB
+export const RZ_CFG_DEFAULT_KEEPALIVE: int32 = 100;
+export const RZ_CFG_DEFAULT_TIMEOUT_MS: int32 = 10000;      // 10 s
+export const RZ_CFG_DEFAULT_CACHE_MAX_AGE: int32 = 60;
+export const RZ_CFG_DEFAULT_ALLOW_ORIGIN: string = "*";
+export const RZ_CFG_DEFAULT_ENV: string = "dev";
+export const RZ_CFG_DEFAULT_BACKLOG: int32 = 64;
+
+export const RZ_CFG_MIN_PORT: int32 = 1;
+export const RZ_CFG_MAX_PORT: int32 = 65535;
+export const RZ_CFG_MIN_WORKERS: int32 = 1;
+export const RZ_CFG_MAX_WORKERS: int32 = 64;                // @parallel runtime cap
+export const RZ_CFG_MIN_BODY: int64 = 1024;
+export const RZ_CFG_MAX_BODY: int64 = 67108864;             // 64 MiB hard cap
+export const RZ_CFG_MIN_HEADER: int64 = 1024;
+export const RZ_CFG_MAX_HEADER: int64 = RZ_MAX_HEADER_BYTES; // parser hard cap 8192
+export const RZ_CFG_MIN_KEEPALIVE: int32 = 1;
+export const RZ_CFG_MIN_TIMEOUT_MS: int32 = 1;
+export const RZ_CFG_MIN_CACHE_MAX_AGE: int32 = 0;
+
+// The server's receive-buffer ceiling (RZ_MAX_CONN_BUF in server/types). Kept
+// here as a literal so types.mettle does not have to import the server.
+export const RZ_CFG_MAX_BUF_CAP: int64 = 65536;
+export const RZ_CFG_BUF_SLACK: int64 = 8192;
+
+export const RZ_CFG_ERR_MAX: int32 = 16;
+export const RZ_CFG_ERR_FIELD: int32 = 32;
+export const RZ_CFG_ERR_TEXT: int32 = 192;
+
+// Error codes. One per variable, so rz_config_strerror can name the offending
+// variable and its allowed range from the code alone.
+export const RZ_CFG_OK: int32 = 0;
+export const RZ_CFG_E_ARGS: int32 = 1;
+export const RZ_CFG_E_FROZEN: int32 = 2;
+export const RZ_CFG_E_PORT: int32 = 4;
+export const RZ_CFG_E_WORKERS: int32 = 5;
+export const RZ_CFG_E_MAX_BODY: int32 = 6;
+export const RZ_CFG_E_MAX_HEADER: int32 = 7;
+export const RZ_CFG_E_KEEPALIVE: int32 = 8;
+export const RZ_CFG_E_TIMEOUT: int32 = 9;
+export const RZ_CFG_E_CACHE: int32 = 10;
+export const RZ_CFG_E_ORIGIN: int32 = 13;
+export const RZ_CFG_E_ENV: int32 = 15;
+export const RZ_CFG_E_UNKNOWN_KEY: int32 = 16;
+/// internal: config. RAIZE_TRUSTED_PROXY is not an IPv4 address.
+export const RZ_CFG_E_PROXY: int32 = 19;
+
+export struct RzConfig {
+  port: int32;                  // 8080
+  workers: int32;               // 4, cap 64
+  max_body: int64;              // 1048576
+  max_header_bytes: int64;      // 8192
+  keepalive_max: int32;         // 100
+  read_timeout_ms: int32;       // 10000
+  cache_max_age: int32;         // 60
+  allow_origin: uint8[256];     // default "*"
+  allow_origin_len: int32;
+  env: uint8[32];               // default "dev"; no RAIZE_ENV variable
+  env_len: int32;
+  trusted_proxy: uint8[16];     // RZ_CFG_PROXY_MAX; "" = none (X-Forwarded-For ignored)
+  trusted_proxy_len: int32;
+  frozen: bool;                 // set once by rz_config_freeze
+}
+
+export struct RzConfigError {
+  field: uint8[32];
+  field_len: int32;
+  text: uint8[192];
+  text_len: int32;
+}
+
+export struct RzConfigErrors {
+  items: RzConfigError[16];
+  count: int32;
+}
+
+// ---------------------------------------------------------------------------
+// Text storage, views, parsing primitives
+// ---------------------------------------------------------------------------
+
+export fn rz_cfg_copy(dst: uint8*, cap: int32, lenp: int32*, s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n > (int64)cap - 1) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    dst[i] = s.chars[i];
+    i = i + 1;
+  }
+  dst[n] = 0;
+  *lenp = (int32)n;
+  return true;
+}
+
+export fn rz_cfg_view(buf: uint8*, len: int32) -> string {
+  var s: string;
+  s.chars = buf;
+  s.length = (uint64)len;
+  return s;
+}
+
+// Digits only: no sign, no spaces, no trailing junk, no empty string, and
+// overflow checked before it can wrap. `"+5"`, `"5x"`, `" 5"`, `""` and a
+// 20-digit value are all false.
+export fn rz_cfg_parse_digits(s: string, out: int64*) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n <= 0) { return false; }
+  var v: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var ch: int32 = (int32)s.chars[i];
+    if (ch < 48 || ch > 57) { return false; }
+    var d: int64 = (int64)(ch - 48);
+    if (v > (9223372036854775807 - d) / 10) { return false; }
+    v = v * 10 + d;
+    i = i + 1;
+  }
+  *out = v;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Defaults (step 1 of the load order)
+// ---------------------------------------------------------------------------
+
+export fn rz_config_default() -> RzConfig {
+  var c: RzConfig;
+  memset((rawptr)&c, 0, sizeof(RzConfig));
+  c.port = RZ_CFG_DEFAULT_PORT;
+  c.workers = RZ_CFG_DEFAULT_WORKERS;
+  c.max_body = RZ_CFG_DEFAULT_MAX_BODY;
+  c.max_header_bytes = RZ_CFG_DEFAULT_MAX_HEADER;
+  c.keepalive_max = RZ_CFG_DEFAULT_KEEPALIVE;
+  c.read_timeout_ms = RZ_CFG_DEFAULT_TIMEOUT_MS;
+  c.cache_max_age = RZ_CFG_DEFAULT_CACHE_MAX_AGE;
+  rz_cfg_copy(&c.allow_origin[0], RZ_CFG_ORIGIN_MAX, &c.allow_origin_len, RZ_CFG_DEFAULT_ALLOW_ORIGIN);
+  rz_cfg_copy(&c.env[0], RZ_CFG_ENV_MAX, &c.env_len, RZ_CFG_DEFAULT_ENV);
+  c.frozen = false;
+  return c;
+}
+
+// ---------------------------------------------------------------------------
+// Accessors (all read-only; there is no setter for a single field except
+// rz_config_set, which the facade guards with the freeze flag)
+// ---------------------------------------------------------------------------
+
+export fn rz_config_port(c: RzConfig*) -> int32 { if (c == 0) { return 0; } return c->port; }
+export fn rz_config_workers(c: RzConfig*) -> int32 { if (c == 0) { return 0; } return c->workers; }
+export fn rz_config_read_timeout_ms(c: RzConfig*) -> int32 { if (c == 0) { return 0; } return c->read_timeout_ms; }
+export fn rz_config_keepalive(c: RzConfig*) -> int32 { if (c == 0) { return 0; } return c->keepalive_max; }
+export fn rz_config_max_body(c: RzConfig*) -> int64 { if (c == 0) { return 0; } return c->max_body; }
+export fn rz_config_max_header_bytes(c: RzConfig*) -> int64 { if (c == 0) { return 0; } return c->max_header_bytes; }
+export fn rz_config_cache_max_age(c: RzConfig*) -> int32 { if (c == 0) { return 0; } return c->cache_max_age; }
+
+export fn rz_config_allow_origin(c: RzConfig*) -> string {
+  if (c == 0) { return ""; }
+  return rz_cfg_view(&c->allow_origin[0], c->allow_origin_len);
+}
+
+/// internal: app/run. The trusted reverse proxy's address ("" = none).
+/// in:      c the config
+/// returns: a view into `c`
+/// owns:    nothing; valid while `c` lives
+export fn rz_config_trusted_proxy(c: RzConfig*) -> string {
+  if (c == 0) { return ""; }
+  return rz_cfg_view(&c->trusted_proxy[0], c->trusted_proxy_len);
+}
+
+export fn rz_config_env(c: RzConfig*) -> string {
+  if (c == 0) { return ""; }
+  return rz_cfg_view(&c->env[0], c->env_len);
+}
+
+// At least max_header_bytes + 8192 so a full request head fits beside slack,
+// clamped to the server's 64 KiB receive buffer.
+export fn rz_config_buf_cap(c: RzConfig*) -> int64 {
+  if (c == 0) { return RZ_CFG_BUF_SLACK; }
+  var cap: int64 = c->max_header_bytes + RZ_CFG_BUF_SLACK;
+  if (cap > RZ_CFG_MAX_BUF_CAP) { cap = RZ_CFG_MAX_BUF_CAP; }
+  return cap;
+}
+
+// ---------------------------------------------------------------------------
+// Freeze
+// ---------------------------------------------------------------------------
+
+// Marks the end of startup. Idempotent. After this every load/set/validate
+// refuses; there is no unfreeze, because a config changing under a worker is
+// the bug this exists to prevent.
+export fn rz_config_freeze(c: RzConfig*) -> int32 {
+  if (c == 0) { return RZ_CFG_E_ARGS; }
+  c->frozen = true;
+  return RZ_CFG_OK;
+}
+
+export fn rz_config_frozen(c: RzConfig*) -> bool {
+  if (c == 0) { return false; }
+  return c->frozen;
+}
+
+// ---------------------------------------------------------------------------
+// Error list
+// ---------------------------------------------------------------------------
+
+export fn rz_config_errors_reset(e: RzConfigErrors*) {
+  if (e == 0) { return; }
+  e->count = 0;
+}
+
+export fn rz_config_error_count(e: RzConfigErrors*) -> int32 {
+  if (e == 0) { return 0; }
+  return e->count;
+}
+
+export fn rz_config_error_field(e: RzConfigErrors*, i: int32) -> string {
+  if (e == 0 || i < 0 || i >= e->count) { return ""; }
+  return rz_cfg_view(&e->items[i].field[0], e->items[i].field_len);
+}
+
+export fn rz_config_error_text(e: RzConfigErrors*, i: int32) -> string {
+  if (e == 0 || i < 0 || i >= e->count) { return ""; }
+  return rz_cfg_view(&e->items[i].text[0], e->items[i].text_len);
+}
+
+// 0 added, -1 no list or full. The text is built with rz_cfg_err_add.
+export fn rz_cfg_err_new(e: RzConfigErrors*, field: string) -> int32 {
+  if (e == 0 || e->count >= RZ_CFG_ERR_MAX) { return -1; }
+  var i: int32 = e->count;
+  rz_cfg_copy(&e->items[i].field[0], RZ_CFG_ERR_FIELD, &e->items[i].field_len, field);
+  e->items[i].text_len = 0;
+  e->items[i].text[0] = 0;
+  e->count = i + 1;
+  return i;
+}
+
+export fn rz_cfg_err_add(e: RzConfigErrors*, i: int32, s: string) {
+  if (e == 0 || i < 0 || i >= e->count) { return; }
+  var it: RzConfigError* = &e->items[i];
+  var room: int64 = (int64)RZ_CFG_ERR_TEXT - (int64)it->text_len - 1;
+  if (room <= 0) { return; }
+  var n: int64 = (int64)s.length;
+  if (n > room) { n = room; }
+  if (n > 0) {
+    memcpy((rawptr)&it->text[it->text_len], (rawptr)s.chars, n);
+  }
+  it->text_len = it->text_len + (int32)n;
+  it->text[it->text_len] = 0;
+}
+
+export fn rz_cfg_err_add_int(e: RzConfigErrors*, i: int32, n: int64) {
+  var tmp: uint8[24];
+  var s: string = rz_int_buf(n, &tmp[0], 24);
+  rz_cfg_err_add(e, i, s);
+}
+
+export fn rz_cfg_err_add_quoted(e: RzConfigErrors*, i: int32, s: string) {
+  rz_cfg_err_add(e, i, "\"");
+  rz_cfg_err_add(e, i, s);
+  rz_cfg_err_add(e, i, "\"");
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+export fn rz_config_strerror(code: int32) -> string {
+  if (code == RZ_CFG_E_ARGS) { return "config: null argument"; }
+  if (code == RZ_CFG_E_FROZEN) { return "config: frozen after startup; load/set/validate refused"; }
+  if (code == RZ_CFG_E_PORT) { return "RAIZE_PORT: not a number or out of range (allowed 1..65535)"; }
+  if (code == RZ_CFG_E_WORKERS) { return "RAIZE_WORKERS: not a number or out of range (allowed 1..64)"; }
+  if (code == RZ_CFG_E_MAX_BODY) { return "RAIZE_MAX_BODY_BYTES: not a number or out of range (allowed 1024..67108864)"; }
+  if (code == RZ_CFG_E_MAX_HEADER) { return "RAIZE_MAX_HEADER_BYTES: not a number or out of range (allowed 1024..8192)"; }
+  if (code == RZ_CFG_E_KEEPALIVE) { return "RAIZE_KEEPALIVE_MAX: not a number or out of range (allowed >= 1)"; }
+  if (code == RZ_CFG_E_TIMEOUT) { return "RAIZE_READ_TIMEOUT_MS: not a number or out of range (allowed >= 1)"; }
+  if (code == RZ_CFG_E_CACHE) { return "RAIZE_CACHE_MAX_AGE: not a number or out of range (allowed >= 0)"; }
+  if (code == RZ_CFG_E_ORIGIN) { return "RAIZE_ALLOWED_ORIGIN: must be a non-empty origin (allowed 1..255 bytes)"; }
+  if (code == RZ_CFG_E_ENV) { return "env: must be a non-empty name (allowed 1..31 bytes)"; }
+  if (code == RZ_CFG_E_UNKNOWN_KEY) { return "config: unknown config variable"; }
+  if (code == RZ_CFG_E_PROXY) { return "RAIZE_TRUSTED_PROXY: not an IPv4 address (a.b.c.d)"; }
+  return "config: unknown error code";
+}

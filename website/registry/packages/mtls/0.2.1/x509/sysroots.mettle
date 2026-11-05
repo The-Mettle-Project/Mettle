@@ -1,0 +1,16 @@
+// Loading the operating system's trust store into MtlsRoots. The platform
+// part lives in sysroots_posix.mettle (bundle files) and sysroots_windows.mettle
+// (Crypt32); both export mtls_sysroots_native and only one is compiled in.
+
+import "mtls/core/err";
+import "mtls/x509/verify";
+import "mtls/x509/rootfile";
+import "mtls/x509/sysroots_posix.mettle" if posix;
+import "mtls/x509/sysroots_windows.mettle" if windows;
+
+/// mtls_roots_load_system: adds the system's trusted roots to r. Returns the
+/// number added (certificates that do not parse are counted in r->skipped),
+/// or a negative MTLS_E_* if no trust store could be found.
+export fn mtls_roots_load_system(r: MtlsRoots*) -> int32 {
+  return mtls_sysroots_native(r);
+}

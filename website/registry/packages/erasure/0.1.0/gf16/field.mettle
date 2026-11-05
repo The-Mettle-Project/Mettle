@@ -1,0 +1,97 @@
+// Arithmetic in GF(2^16) with the polynomial x^16 + x^12 + x^3 + x + 1
+// (0x1100B), the default for w = 16 in Jerasure and GF-Complete.
+// Symbols are 16-bit little-endian words.
+
+import "std/mem";
+
+export const ERASURE_GF16_POLY: int32 = 0x1100b;
+
+var g16_exp: uint16* = 0;    // 2^i for i in 0..131070 (doubled)
+var g16_log: uint16* = 0;    // log of x for x != 0
+
+/// Builds the tables (about 384 KB). Safe to call many times.
+export fn erasure_gf16_init() {
+  if (g16_exp != 0) { return; }
+  var e: uint16* = (uint16*)malloc(131072 * 2);
+  var l: uint16* = (uint16*)malloc(65536 * 2);
+  var x: int32 = 1;
+  for i in 0..65535 {
+    e[i] = (uint16)x;
+    e[i + 65535] = (uint16)x;
+    l[x] = (uint16)i;
+    x = x << 1;
+    if (x >= 65536) { x = x ^ ERASURE_GF16_POLY; }
+  }
+  e[131070] = e[0];
+  e[131071] = e[1];
+  l[0] = 0;
+  g16_log = l;
+  g16_exp = e;
+}
+
+/// a * b.
+export fn erasure_gf16_mul(a: uint16, b: uint16) -> uint16 {
+  if (a == 0 || b == 0) { return 0; }
+  return g16_exp[(int64)g16_log[a] + (int64)g16_log[b]];
+}
+
+/// 1 / a (0 for 0).
+export fn erasure_gf16_inv(a: uint16) -> uint16 {
+  if (a == 0) { return 0; }
+  return g16_exp[65535 - (int64)g16_log[a]];
+}
+
+/// 2 to the power n.
+export fn erasure_gf16_exp(n: int32) -> uint16 { return g16_exp[n % 65535]; }
+
+/// Fills lo[256] and hi[256] so that c * x = lo[x & 255] ^ hi[x >> 8].
+/// Built from c * 2^i with XORs only, since multiplying by c is linear.
+export fn erasure_gf16_tables(c: uint16, lo: uint16*, hi: uint16*) {
+  var base: uint16[16];
+  var v: int32 = (int32)c;
+  for i in 0..16 {
+    base[i] = (uint16)v;
+    v = v << 1;
+    if (v >= 65536) { v = v ^ ERASURE_GF16_POLY; }
+  }
+  lo[0] = 0;
+  hi[0] = 0;
+  var top: int32 = 0;
+  for x in 1..256 {
+    if ((x >> (top + 1)) != 0) { top = top + 1; }
+    var rest: int32 = x ^ (1 << top);
+    lo[x] = lo[rest] ^ base[top];
+    hi[x] = hi[rest] ^ base[top + 8];
+  }
+}
+
+/// dst ^= c * src (or dst = c * src when set is true), over n symbols.
+/// tab holds 512 uint16 of scratch space.
+export fn erasure_gf16_mul_add(dst: uint16*, src: uint16*, n: int64, c: uint16, tab: uint16*, set: bool) {
+  if (c == 0) {
+    if (set) { for i in 0..n { dst[i] = 0; } }
+    return;
+  }
+  if (c == 1) {
+    if (set) {
+      for i in 0..n { dst[i] = src[i]; }
+    } else {
+      for i in 0..n { dst[i] = dst[i] ^ src[i]; }
+    }
+    return;
+  }
+  var lo: uint16* = tab;
+  var hi: uint16* = tab + 256;
+  erasure_gf16_tables(c, lo, hi);
+  if (set) {
+    for i in 0..n {
+      var s: uint16 = src[i];
+      dst[i] = lo[s & 255] ^ hi[s >> 8];
+    }
+  } else {
+    for i in 0..n {
+      var s: uint16 = src[i];
+      dst[i] = dst[i] ^ lo[s & 255] ^ hi[s >> 8];
+    }
+  }
+}

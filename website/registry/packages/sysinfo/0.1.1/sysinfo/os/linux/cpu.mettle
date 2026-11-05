@@ -1,0 +1,449 @@
+// CPU: usage from /proc/stat (proc(5)), model and vendor from /proc/cpuinfo,
+// topology and frequency from /sys/devices/system/cpu (cpufreq), and
+// temperatures from hwmon (coretemp, k10temp, zenpower, cpu_thermal) with
+// thermal zones as a fallback.
+import "std/mem";
+import "std/fs";
+import "std/time";
+import "../../types.mettle";
+import "util.mettle";
+import "ctx.mettle";
+
+const SYSINFO_LX_NT = 10;   // counters kept per CPU line
+
+export struct SysinfoLxCpu {
+  perm: SysinfoLxPool;
+  fd_stat: int64;
+  // Counters from the last refresh. Slot 0 is the whole machine and slot
+  // 1 + n is CPU n. Each slot holds SYSINFO_LX_NT values.
+  prev: uint64*;
+  prev_cap: int32;            // slots
+  have_prev: bool;
+  prev_ctxt: int64;
+  prev_intr: int64;
+  prev_ns: int64;
+  cores_cap: int32;
+  // Per CPU number (index = cpu), opened lazily.
+  fd_freq: int64*;
+  freq_min: float64*;
+  freq_max: float64*;
+  core_id: int32*;
+  pkg_id: int32*;
+  fd_temp: int64*;            // the core temperature file for that CPU
+  per_cap: int32;
+  use_cpuinfo_freq: bool;
+  fd_pkg_temp: int64;
+  // core temperature files found in hwmon: key = package * 65536 + core
+  t_key: int32[256];
+  t_fd: int64[256];
+  n_t: int32;
+}
+
+fn sysinfo_lx_cpu_ensure(st: SysinfoLxCpu*, cpu: int32) {
+  if (cpu < st->per_cap && st->fd_freq != 0) { return; }
+  var old: int32 = st->per_cap;
+  var c: int32 = old;
+  st->fd_freq = (int64*)sysinfo_lx_grow((uint8*)st->fd_freq, &c, cpu + 1, 8);
+  c = old;
+  st->freq_min = (float64*)sysinfo_lx_grow((uint8*)st->freq_min, &c, cpu + 1, 8);
+  c = old;
+  st->freq_max = (float64*)sysinfo_lx_grow((uint8*)st->freq_max, &c, cpu + 1, 8);
+  c = old;
+  st->core_id = (int32*)sysinfo_lx_grow((uint8*)st->core_id, &c, cpu + 1, 4);
+  c = old;
+  st->pkg_id = (int32*)sysinfo_lx_grow((uint8*)st->pkg_id, &c, cpu + 1, 4);
+  c = old;
+  st->fd_temp = (int64*)sysinfo_lx_grow((uint8*)st->fd_temp, &c, cpu + 1, 8);
+  for k in old..c {
+    st->fd_freq[k] = -2;      // -2: not looked up yet
+    st->fd_temp[k] = -2;
+    st->freq_min[k] = -1.0;
+    st->freq_max[k] = -1.0;
+    st->core_id[k] = -1;
+    st->pkg_id[k] = -1;
+  }
+  st->per_cap = c;
+}
+
+fn sysinfo_lx_cpu_slots(st: SysinfoLxCpu*, slots: int32) {
+  if (slots <= st->prev_cap && st->prev != 0) { return; }
+  var c: int32 = st->prev_cap;
+  st->prev = (uint64*)sysinfo_lx_grow((uint8*)st->prev, &c, slots, 8 * SYSINFO_LX_NT);
+  st->prev_cap = c;
+}
+
+// Percentages from the change between two sets of counters.
+// Order: user nice system idle iowait irq softirq steal guest guest_nice.
+export fn sysinfo_lx_cpu_usage(now: uint64*, before: uint64*, u: SysinfoCpuUsage*) {
+  var d: float64[10];
+  var total: float64 = 0.0;
+  for k in 0..10 {
+    var x: float64 = 0.0;
+    if (now[k] > before[k]) { x = (float64)(now[k] - before[k]); }
+    d[k] = x;
+    if (k < 8) { total = total + x; }   // guest is already inside user
+  }
+  var blank: SysinfoCpuUsage;
+  *u = blank;
+  if (total <= 0.0) { return; }
+  var f: float64 = 100.0 / total;
+  u->user = d[0] * f;
+  u->nice = d[1] * f;
+  u->system = d[2] * f;
+  u->idle = d[3] * f;
+  u->iowait = d[4] * f;
+  u->irq = d[5] * f;
+  u->softirq = d[6] * f;
+  u->steal = d[7] * f;
+  u->guest = (d[8] + d[9]) * f;
+  u->busy = 100.0 - u->idle - u->iowait;
+  if (u->busy < 0.0) { u->busy = 0.0; }
+}
+
+fn sysinfo_lx_cpu_core_slot(st: SysinfoLxCpu*, out: SysinfoCpu*, idx: int32) -> SysinfoCore* {
+  if (idx >= st->cores_cap || out->cores == 0) {
+    var c: int32 = st->cores_cap;
+    out->cores = (SysinfoCore*)sysinfo_lx_grow((uint8*)out->cores, &c, idx + 1, sizeof(SysinfoCore));
+    st->cores_cap = c;
+  }
+  return &out->cores[idx];
+}
+
+// Parses /proc/stat text: usage per CPU (as the change since the last call),
+// context switches and interrupts. secs is the time since the last call.
+export fn sysinfo_lx_cpu_parse_stat(st: SysinfoLxCpu*, out: SysinfoCpu*, text: string, secs: float64) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  var now: uint64[10];
+  var n: int32 = 0;
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, "cpu")) {
+      s.i = s.i + 3;
+      var cpu: int32 = -1;
+      if (s.i < s.n && s.p[s.i] >= (uint8)48 && s.p[s.i] <= (uint8)57) {
+        var v: uint64 = sysinfo_lx_u64(&s);
+        if (v > (uint64)65535) { sysinfo_lx_next_line(&s); continue; }
+        cpu = (int32)v;
+      }
+      for k in 0..10 { now[k] = sysinfo_lx_u64(&s); }
+      var slot: int32 = cpu + 1;
+      sysinfo_lx_cpu_slots(st, slot + 1);
+      var before: uint64* = st->prev + (int64)slot * (int64)SYSINFO_LX_NT;
+      var u: SysinfoCpuUsage* = &out->total;
+      if (cpu >= 0) {
+        sysinfo_lx_cpu_ensure(st, cpu);
+        var core: SysinfoCore* = sysinfo_lx_cpu_core_slot(st, out, n);
+        core->cpu = cpu;
+        u = &core->usage;
+        n = n + 1;
+      }
+      if (st->have_prev) {
+        sysinfo_lx_cpu_usage(&now[0], before, u);
+      } else {
+        var blank: SysinfoCpuUsage;
+        *u = blank;
+      }
+      for k in 0..10 { before[k] = now[k]; }
+    } else if (sysinfo_lx_at(&s, "ctxt ")) {
+      s.i = s.i + 5;
+      var v: int64 = sysinfo_lx_i64(&s);
+      out->ctx_switches = v;
+      if (st->have_prev) { out->ctx_switches_s = sysinfo_lx_rate(v, st->prev_ctxt, secs); }
+      st->prev_ctxt = v;
+    } else if (sysinfo_lx_at(&s, "intr ")) {
+      s.i = s.i + 5;
+      var v: int64 = sysinfo_lx_i64(&s);
+      out->interrupts = v;
+      if (st->have_prev) { out->interrupts_s = sysinfo_lx_rate(v, st->prev_intr, secs); }
+      st->prev_intr = v;
+    }
+    sysinfo_lx_next_line(&s);
+  }
+  // A CPU that went offline and came back has older counters in its slot;
+  // the usage clamps keep that from showing as junk.
+  out->logical = n;
+  st->have_prev = true;
+}
+
+// Model and vendor from /proc/cpuinfo text, and the "cpu MHz" of each
+// processor when freq is true. On ARM the vendor comes from the implementer
+// code.
+export fn sysinfo_lx_cpu_parse_cpuinfo(st: SysinfoLxCpu*, out: SysinfoCpu*, text: string, names: bool, freq: bool) {
+  var s: SysinfoLxScan = sysinfo_lx_scan_str(text);
+  var cpu: int32 = -1;
+  var implementer: int64 = -1;
+  var part: string = sysinfo_lx_view(s.p, 0);
+  var model: string = part;
+  var vendor: string = part;
+  while (!sysinfo_lx_end(&s)) {
+    if (sysinfo_lx_at(&s, "processor")) {
+      if (sysinfo_lx_after_colon(&s)) { cpu = (int32)sysinfo_lx_u64(&s); }
+    } else if (names && model.length == (uint64)0 && sysinfo_lx_at(&s, "model name")) {
+      if (sysinfo_lx_after_colon(&s)) { model = sysinfo_lx_trim(sysinfo_lx_line(&s)); continue; }
+    } else if (names && vendor.length == (uint64)0 && sysinfo_lx_at(&s, "vendor_id")) {
+      if (sysinfo_lx_after_colon(&s)) { vendor = sysinfo_lx_trim(sysinfo_lx_line(&s)); continue; }
+    } else if (names && implementer < 0 && sysinfo_lx_at(&s, "CPU implementer")) {
+      if (sysinfo_lx_after_colon(&s)) { implementer = (int64)sysinfo_lx_hex(&s); }
+    } else if (names && part.length == (uint64)0 && sysinfo_lx_at(&s, "CPU part")) {
+      if (sysinfo_lx_after_colon(&s)) { part = sysinfo_lx_trim(sysinfo_lx_line(&s)); continue; }
+    } else if (freq && sysinfo_lx_at(&s, "cpu MHz")) {
+      if (sysinfo_lx_after_colon(&s) && cpu >= 0) {
+        var mhz: float64 = sysinfo_lx_f64(&s);
+        for k in 0..out->logical {
+          if (out->cores[k].cpu == cpu) { out->cores[k].freq_mhz = mhz; }
+        }
+      }
+    }
+    sysinfo_lx_next_line(&s);
+  }
+  if (!names) { return; }
+  if (vendor.length == (uint64)0 && implementer >= 0) {
+    switch ((int32)implementer) {
+      case 65: { vendor = "ARM"; }
+      case 66: { vendor = "Broadcom"; }
+      case 67: { vendor = "Cavium"; }
+      case 72: { vendor = "HiSilicon"; }
+      case 78: { vendor = "NVIDIA"; }
+      case 80: { vendor = "APM"; }
+      case 81: { vendor = "Qualcomm"; }
+      case 83: { vendor = "Samsung"; }
+      case 97: { vendor = "Apple"; }
+      case 192: { vendor = "Ampere"; }
+      default: { vendor = "ARM"; }
+    }
+  }
+  if (model.length == (uint64)0 && part.length > (uint64)0) {
+    var tmp: uint8[96];
+    var k: int64 = 0;
+    var pre: string = "CPU part ";
+    for i in 0..pre.length { tmp[k] = (uint8)pre[i]; k = k + 1; }
+    for i in 0..part.length { if (k < 96) { tmp[k] = (uint8)part[i]; k = k + 1; } }
+    model = sysinfo_lx_view(&tmp[0], k);
+    out->model = sysinfo_lx_pool_add(&st->perm, model);
+  } else {
+    out->model = sysinfo_lx_pool_add(&st->perm, model);
+  }
+  out->vendor = sysinfo_lx_pool_add(&st->perm, vendor);
+}
+
+// Reads topology and frequency limits for one CPU, once.
+fn sysinfo_lx_cpu_lookup(st: SysinfoLxCpu*, c: SysinfoLxCtx*, cpu: int32) {
+  var p: SysinfoLxPath;
+  sysinfo_lx_path_at(&p, c->root, "/sys/devices/system/cpu/cpu");
+  sysinfo_lx_path_num(&p, (int64)cpu);
+  var base: int64 = p.n;
+  sysinfo_lx_path_add(&p, "/topology/core_id");
+  st->core_id[cpu] = (int32)sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), -1);
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/topology/physical_package_id");
+  st->pkg_id[cpu] = (int32)sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), -1);
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/cpufreq/cpuinfo_min_freq");
+  var v: int64 = sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), -1);
+  if (v > 0) { st->freq_min[cpu] = (float64)v / 1000.0; }
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/cpufreq/cpuinfo_max_freq");
+  v = sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), -1);
+  if (v > 0) { st->freq_max[cpu] = (float64)v / 1000.0; }
+  p.n = base;
+  sysinfo_lx_path_add(&p, "/cpufreq/scaling_cur_freq");
+  st->fd_freq[cpu] = sysinfo_lx_open(sysinfo_lx_path_str(&p));
+  // the core temperature file, by package and core
+  st->fd_temp[cpu] = -1;
+  var pk: int32 = st->pkg_id[cpu];
+  if (pk < 0) { pk = 0; }
+  var key: int32 = pk * 65536 + st->core_id[cpu];
+  for k in 0..st->n_t {
+    if (st->t_key[k] == key) { st->fd_temp[cpu] = st->t_fd[k]; }
+  }
+}
+
+fn sysinfo_lx_name_is(buf: uint8*, n: int64, t: string) -> bool {
+  return sysinfo_lx_eq(sysinfo_lx_view(buf, n), t);
+}
+
+// Looks through hwmon for CPU temperature chips. Remembers the package
+// file and each core file (coretemp labels them "Core N").
+fn sysinfo_lx_cpu_find_temps(st: SysinfoLxCpu*, c: SysinfoLxCtx*, out: SysinfoCpu*) {
+  st->fd_pkg_temp = -1;
+  var p: SysinfoLxPath;
+  var names: SysinfoLxNames;
+  var name: uint8[64];
+  var lab: uint8[64];
+  var dir: SysinfoLxPath;
+  sysinfo_lx_path_at(&dir, c->root, "/sys/class/hwmon");
+  var count: int32 = sysinfo_lx_names(sysinfo_lx_path_str(&dir), "", &names);
+  for ci in 0..count {
+      p = dir;
+      sysinfo_lx_path_add(&p, "/");
+      sysinfo_lx_path_add(&p, sysinfo_lx_names_at(&names, ci));
+      var chip: int64 = p.n;
+      sysinfo_lx_path_add(&p, "/name");
+      var nn: int64 = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &name[0], 64);
+      var intel: bool = sysinfo_lx_name_is(&name[0], nn, "coretemp");
+      var amd: bool = sysinfo_lx_name_is(&name[0], nn, "k10temp") || sysinfo_lx_name_is(&name[0], nn, "zenpower");
+      var arm: bool = sysinfo_lx_name_is(&name[0], nn, "cpu_thermal") || sysinfo_lx_name_is(&name[0], nn, "soc_thermal");
+      if (!intel && !amd && !arm) { continue; }
+      var pkg: int32 = 0;
+      var misses: int32 = 0;
+      var t: int32 = 1;
+      while (t < 256 && misses < 8) {
+        p.n = chip;
+        sysinfo_lx_path_add(&p, "/temp");
+        sysinfo_lx_path_num(&p, (int64)t);
+        var base: int64 = p.n;
+        sysinfo_lx_path_add(&p, "_input");
+        var fd: int64 = sysinfo_lx_open(sysinfo_lx_path_str(&p));
+        if (fd < 0) { misses = misses + 1; t = t + 1; continue; }
+        misses = 0;
+        p.n = base;
+        sysinfo_lx_path_add(&p, "_label");
+        var ln: int64 = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &lab[0], 64);
+        if (ln < 0) { ln = 0; }
+        var ls: SysinfoLxScan = sysinfo_lx_scan(&lab[0], ln);
+        var used: bool = false;
+        var is_pkg: bool = arm || (amd && (ln == 0 || sysinfo_lx_at(&ls, "Tctl") || sysinfo_lx_at(&ls, "Tdie")))
+          || (intel && (sysinfo_lx_at(&ls, "Package id") || sysinfo_lx_at(&ls, "Physical id")));
+        if (is_pkg) {
+          if (intel) {
+            ls.i = 10;
+            if (sysinfo_lx_at(&ls, "Physical")) { ls.i = 11; }
+            pkg = (int32)sysinfo_lx_u64(&ls);
+          }
+          // Tdie (the real die temperature) wins over Tctl, which may be offset.
+          if (st->fd_pkg_temp < 0 || sysinfo_lx_at(&ls, "Tdie")) {
+            if (st->fd_pkg_temp >= 0) { sysinfo_lx_close(st->fd_pkg_temp); }
+            st->fd_pkg_temp = fd;
+            used = true;
+            p.n = base;
+            sysinfo_lx_path_add(&p, "_crit");
+            var crit: int64 = sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), 0);
+            if (crit <= 0) {
+              p.n = base;
+              sysinfo_lx_path_add(&p, "_max");
+              crit = sysinfo_lx_read_i64(sysinfo_lx_path_str(&p), 0);
+            }
+            if (crit > 0) { out->temp_crit_c = (float64)crit / 1000.0; }
+          }
+        } else if (intel && sysinfo_lx_at(&ls, "Core ") && st->n_t < 256) {
+          ls.i = 5;
+          st->t_key[st->n_t] = pkg * 65536 + (int32)sysinfo_lx_u64(&ls);
+          st->t_fd[st->n_t] = fd;
+          st->n_t = st->n_t + 1;
+          used = true;
+        }
+        if (!used) { sysinfo_lx_close(fd); }
+        t = t + 1;
+      }
+  }
+  if (st->fd_pkg_temp >= 0) { sysinfo_lx_names_free(&names); return; }
+  // Fallback: a thermal zone for the package.
+  sysinfo_lx_path_at(&dir, c->root, "/sys/class/thermal");
+  count = sysinfo_lx_names(sysinfo_lx_path_str(&dir), "thermal_zone", &names);
+  for zi in 0..count {
+    p = dir;
+    sysinfo_lx_path_add(&p, "/");
+    sysinfo_lx_path_add(&p, sysinfo_lx_names_at(&names, zi));
+    var zone: int64 = p.n;
+    sysinfo_lx_path_add(&p, "/type");
+    var nn: int64 = sysinfo_lx_read_small(sysinfo_lx_path_str(&p), &name[0], 64);
+    if (sysinfo_lx_name_is(&name[0], nn, "x86_pkg_temp") || sysinfo_lx_name_is(&name[0], nn, "cpu-thermal")
+        || sysinfo_lx_name_is(&name[0], nn, "cpu_thermal") || sysinfo_lx_name_is(&name[0], nn, "soc-thermal")) {
+      p.n = zone;
+      sysinfo_lx_path_add(&p, "/temp");
+      st->fd_pkg_temp = sysinfo_lx_open(sysinfo_lx_path_str(&p));
+      if (st->fd_pkg_temp >= 0) { break; }
+    }
+  }
+  sysinfo_lx_names_free(&names);
+}
+
+fn sysinfo_lx_milli_c(fd: int64) -> float64 {
+  var v: int64 = sysinfo_lx_fd_i64(fd, -1000000000);
+  if (v == -1000000000) { return SYSINFO_NA_TEMP; }
+  return (float64)v / 1000.0;
+}
+
+export fn sysinfo_lx_cpu_init(st: SysinfoLxCpu*, c: SysinfoLxCtx*, out: SysinfoCpu*) -> int32 {
+  var p: SysinfoLxPath;
+  st->fd_stat = sysinfo_lx_open(sysinfo_lx_ctx_path(c, &p, "/proc/stat"));
+  out->pkg_temp_c = SYSINFO_NA_TEMP;
+  out->temp_crit_c = SYSINFO_NA_TEMP;
+  out->physical = -1;
+  out->packages = -1;
+  var n: int64 = sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/proc/cpuinfo"), &c->buf);
+  if (n < 0) { n = 0; }
+  sysinfo_lx_cpu_parse_cpuinfo(st, out, sysinfo_lx_view(c->buf.p, n), true, false);
+  sysinfo_lx_cpu_find_temps(st, c, out);
+  if (st->fd_stat < 0) { out->status = SYSINFO_E_IO; return SYSINFO_E_IO; }
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_cpu_refresh(st: SysinfoLxCpu*, c: SysinfoLxCtx*, out: SysinfoCpu*) -> int32 {
+  var n: int64 = sysinfo_lx_fd_slurp(st->fd_stat, &c->buf);
+  if (n <= 0) { out->status = SYSINFO_E_IO; return SYSINFO_E_IO; }
+  var t: int64 = time_mono_ns();
+  var secs: float64 = (float64)(t - st->prev_ns) / 1000000000.0;
+  st->prev_ns = t;
+  sysinfo_lx_cpu_parse_stat(st, out, sysinfo_lx_view(c->buf.p, n), secs);
+  c->ncpu = out->logical;
+  // topology, limits and frequency
+  var need_info: bool = false;
+  var pairs: int32 = 0;
+  var pkgs: int32 = 0;
+  for k in 0..out->logical {
+    var core: SysinfoCore* = &out->cores[k];
+    var cpu: int32 = core->cpu;
+    if (st->fd_freq[cpu] == -2) { sysinfo_lx_cpu_lookup(st, c, cpu); }
+    core->core_id = st->core_id[cpu];
+    core->package_id = st->pkg_id[cpu];
+    core->freq_min_mhz = st->freq_min[cpu];
+    core->freq_max_mhz = st->freq_max[cpu];
+    core->freq_mhz = -1.0;
+    if (st->fd_freq[cpu] >= 0) {
+      var khz: int64 = sysinfo_lx_fd_i64(st->fd_freq[cpu], -1);
+      if (khz > 0) { core->freq_mhz = (float64)khz / 1000.0; }
+    } else {
+      need_info = true;
+    }
+    core->temp_c = SYSINFO_NA_TEMP;
+    if (st->fd_temp[cpu] >= 0) { core->temp_c = sysinfo_lx_milli_c(st->fd_temp[cpu]); }
+    // count distinct cores and packages among the CPUs seen so far
+    if (core->core_id >= 0) {
+      var seen: bool = false;
+      var seen_pkg: bool = false;
+      for j in 0..k {
+        var o: SysinfoCore* = &out->cores[j];
+        if (o->package_id == core->package_id) {
+          seen_pkg = true;
+          if (o->core_id == core->core_id) { seen = true; }
+        }
+      }
+      if (!seen) { pairs = pairs + 1; }
+      if (!seen_pkg) { pkgs = pkgs + 1; }
+    }
+  }
+  if (pairs > 0) { out->physical = pairs; out->packages = pkgs; }
+  if (need_info) {
+    var p: SysinfoLxPath;
+    n = sysinfo_lx_slurp(sysinfo_lx_ctx_path(c, &p, "/proc/cpuinfo"), &c->buf);
+    if (n > 0) { sysinfo_lx_cpu_parse_cpuinfo(st, out, sysinfo_lx_view(c->buf.p, n), false, true); }
+  }
+  if (st->fd_pkg_temp >= 0) { out->pkg_temp_c = sysinfo_lx_milli_c(st->fd_pkg_temp); }
+  out->status = SYSINFO_OK;
+  return SYSINFO_OK;
+}
+
+export fn sysinfo_lx_cpu_free(st: SysinfoLxCpu*, out: SysinfoCpu*) {
+  sysinfo_lx_close(st->fd_stat);
+  sysinfo_lx_close(st->fd_pkg_temp);
+  for k in 0..st->per_cap { sysinfo_lx_close(st->fd_freq[k]); }
+  for k in 0..st->n_t { sysinfo_lx_close(st->t_fd[k]); }
+  if (st->prev != 0) { free(st->prev); }
+  if (st->fd_freq != 0) {
+    free(st->fd_freq); free(st->freq_min); free(st->freq_max);
+    free(st->core_id); free(st->pkg_id); free(st->fd_temp);
+  }
+  if (out->cores != 0) { free(out->cores); }
+  out->cores = (SysinfoCore*)0;
+  sysinfo_lx_pool_free(&st->perm);
+}

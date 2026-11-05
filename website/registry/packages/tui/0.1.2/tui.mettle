@@ -1,0 +1,28 @@
+// tui: terminal user interfaces in pure Mettle.
+//
+//   import "tui/tui";
+//
+// This file has no exports of its own, so it re-exports every module
+// below. All exported names start with tui_, Tui or TUI_.
+//
+//   types    colours, styles, cells, rectangles, buffers
+//   color    true colour, 256 and 16 colour fallbacks, gradients
+//   width    UTF-8 and character widths (UAX #11)
+//   buf      the cell buffer and writing text into it
+//   render   the diff renderer and the output buffer
+//   input    bytes to key, mouse and paste events
+//   app      the session, frames, the event loop and timers
+//   layout   splitting rectangles
+//   widgets  blocks, borders, text, spans, lists, tables, scrollbars
+//   charts   gauges, meters, sparklines, braille canvas, graphs
+
+import "types";
+import "color";
+import "width";
+import "buf";
+import "render";
+import "input";
+import "app";
+import "layout";
+import "widgets";
+import "charts";

@@ -1,0 +1,77 @@
+// raize_auth/status: the status vocabulary every fallible raize_auth call returns.
+// thread: constants and pure functions; safe on any thread.
+//
+// RA_OK is 0 and every error is negative (the raize convention). The first
+// nine codes line up with raize_web's RZ_E_* so an adapter can pass them on.
+
+/// Success.
+export const RA_OK: int32 = 0;
+/// Misuse: a null handle, a buffer too small, a call in the wrong order.
+export const RA_E_USAGE: int32 = -1;
+/// Malformed input (a bad encoded hash, bad base64, an empty key).
+export const RA_E_INVALID: int32 = -2;
+/// No record for that token, code or key.
+export const RA_E_NOT_FOUND: int32 = -3;
+/// A record with that key already exists.
+export const RA_E_CONFLICT: int32 = -4;
+/// A fixed capacity is exhausted (a store or a buffer).
+export const RA_E_FULL: int32 = -5;
+/// An allocation failed.
+export const RA_E_NOMEM: int32 = -6;
+/// The operation is not supported here.
+export const RA_E_UNSUPPORTED: int32 = -7;
+/// The store's backend failed (a database error, a closed connection).
+export const RA_E_STORE: int32 = -8;
+/// An I/O operation failed.
+export const RA_E_IO: int32 = -9;
+/// A token or code has expired.
+export const RA_E_EXPIRED: int32 = -10;
+/// A token was revoked.
+export const RA_E_REVOKED: int32 = -11;
+/// A value did not match what was expected.
+export const RA_E_MISMATCH: int32 = -12;
+/// Locked after too many failed attempts.
+export const RA_E_LOCKED: int32 = -13;
+/// The API token's scope does not cover what was asked.
+export const RA_E_SCOPE: int32 = -14;
+/// Access denied: wrong password, unknown login, disabled account, or a
+/// rule refused the action. (-15 and -16 are reserved.)
+export const RA_E_DENIED: int32 = -17;
+/// The crypto library reported a failure.
+export const RA_E_CRYPTO: int32 = -18;
+
+/// Names a status in a few words, for logs and error messages.
+///
+/// in:      code     RA_OK or any RA_E_* value
+/// returns: a short lowercase phrase; "unknown status" for any other value
+/// owns:    the result is a static string; never free it
+/// thread:  any
+/// example:
+///   println("login: {ra_status_text(rc)}");
+export fn ra_status_text(code: int32) -> string {
+  if (code == RA_OK) { return "ok"; }
+  if (code == RA_E_USAGE) { return "misuse"; }
+  if (code == RA_E_INVALID) { return "invalid input"; }
+  if (code == RA_E_NOT_FOUND) { return "not found"; }
+  if (code == RA_E_CONFLICT) { return "conflict"; }
+  if (code == RA_E_FULL) { return "capacity exhausted"; }
+  if (code == RA_E_NOMEM) { return "out of memory"; }
+  if (code == RA_E_UNSUPPORTED) { return "unsupported"; }
+  if (code == RA_E_STORE) { return "store error"; }
+  if (code == RA_E_IO) { return "i/o failure"; }
+  if (code == RA_E_EXPIRED) { return "expired"; }
+  if (code == RA_E_REVOKED) { return "revoked"; }
+  if (code == RA_E_MISMATCH) { return "mismatch"; }
+  if (code == RA_E_LOCKED) { return "locked"; }
+  if (code == RA_E_SCOPE) { return "scope not allowed"; }
+  if (code == RA_E_DENIED) { return "access denied"; }
+  if (code == RA_E_CRYPTO) { return "crypto failure"; }
+  return "unknown status";
+}
+
+@test fn t_ra_status_codes() -> int32 {
+  if (RA_OK != 0 || RA_E_USAGE != -1 || RA_E_DENIED != -17) { return 1; }
+  if (ra_status_text(RA_E_LOCKED) != "locked") { return 2; }
+  if (ra_status_text(99) != "unknown status") { return 3; }
+  return 0;
+}

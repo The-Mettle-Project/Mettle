@@ -1,0 +1,109 @@
+// AudioPcm: a block of sound held in memory, interleaved (for stereo:
+// L R L R ...). Decoders fill one; encoders, the mixer and the devices
+// read one.
+//
+//   var pcm: AudioPcm;
+//   audio_load_file("music.flac", &pcm, 0);
+//   ... pcm.frames frames of pcm.channels samples at pcm.rate Hz ...
+//   audio_pcm_free(&pcm);
+
+import "std/mem";
+import "status";
+
+// Sample formats. Signed integers are full scale for their size, so
+// AUDIO_S32 from a 24-bit file holds value << 8. `bits` says how many of
+// the top bits carry data.
+export const AUDIO_U8: int32 = 1;     // unsigned 8-bit, 128 is silence
+export const AUDIO_S16: int32 = 2;    // signed 16-bit
+export const AUDIO_S24: int32 = 3;    // signed 24-bit packed in 3 bytes
+export const AUDIO_S32: int32 = 4;    // signed 32-bit
+export const AUDIO_F32: int32 = 5;    // float, -1.0 to 1.0
+export const AUDIO_F64: int32 = 6;    // double, -1.0 to 1.0
+
+// The most channels any part of audio handles.
+export const AUDIO_MAX_CHANNELS: int32 = 8;
+
+export struct AudioPcm {
+  data: uint8*;     // frames * channels samples, interleaved
+  frames: int64;
+  channels: int32;
+  rate: int32;      // frames per second
+  fmt: int32;       // AUDIO_U8 .. AUDIO_F64
+  bits: int32;      // bits of real data per sample (16 for a 16-bit file)
+  mask: uint32;     // speaker layout, WAVE_FORMAT_EXTENSIBLE bits; 0 = default
+}
+
+/// Bytes in one sample of a format, or 0 for an unknown format.
+export fn audio_fmt_size(fmt: int32) -> int32 {
+  switch (fmt) {
+    case 1: { return 1; }
+    case 2: { return 2; }
+    case 3: { return 3; }
+    case 4: { return 4; }
+    case 5: { return 4; }
+    case 6: { return 8; }
+    default: { }
+  }
+  return 0;
+}
+
+/// Bytes in one frame of the block.
+export fn audio_pcm_frame_size(p: AudioPcm*) -> int64 {
+  return (int64)audio_fmt_size(p->fmt) * (int64)p->channels;
+}
+
+/// Allocates zeroed room for `frames` frames. Frees what was there.
+export fn audio_pcm_alloc(p: AudioPcm*, frames: int64, channels: int32, rate: int32, fmt: int32) -> int32 {
+  audio_pcm_free(p);
+  if (channels < 1 || channels > AUDIO_MAX_CHANNELS || frames < 0 || rate < 0) { return AUDIO_E_ARG; }
+  var ss: int64 = (int64)audio_fmt_size(fmt);
+  if (ss == 0) { return AUDIO_E_ARG; }
+  var bytes: int64 = frames * ss * (int64)channels;
+  if (frames > ((int64)1 << 40)) { return AUDIO_E_LIMIT; }
+  var n: int64 = bytes;
+  if (n < 1) { n = 1; }
+  var d: uint8* = (uint8*)calloc(n, 1);
+  if (d == 0) { return AUDIO_E_MEM; }
+  p->data = d;
+  p->frames = frames;
+  p->channels = channels;
+  p->rate = rate;
+  p->fmt = fmt;
+  p->bits = (int32)ss * 8;
+  if (fmt == AUDIO_F32 || fmt == AUDIO_F64) { p->bits = 0; }
+  p->mask = 0;
+  return AUDIO_OK;
+}
+
+/// Frees the samples and leaves the block empty.
+export fn audio_pcm_free(p: AudioPcm*) {
+  if (p->data != 0) { free(p->data); }
+  p->data = (uint8*)0;
+  p->frames = 0;
+}
+
+// What a decoder learns from the headers of a stream.
+export struct AudioInfo {
+  channels: int32;
+  rate: int32;
+  frames: int64;    // total frames, or -1 when the stream does not say
+  fmt: int32;       // the stream's own sample format (AUDIO_S16, AUDIO_F32 ...)
+  bits: int32;      // bits per sample in the stream; 0 for lossy formats
+  mask: uint32;     // speaker layout bits, 0 = default for the channel count
+}
+
+/// The usual WAVE_FORMAT_EXTENSIBLE speaker mask for a channel count.
+export fn audio_default_mask(ch: int32) -> uint32 {
+  switch (ch) {
+    case 1: { return 0x4; }        // FC
+    case 2: { return 0x3; }        // FL FR
+    case 3: { return 0x7; }        // FL FR FC
+    case 4: { return 0x33; }       // FL FR BL BR
+    case 5: { return 0x37; }       // FL FR FC BL BR
+    case 6: { return 0x3F; }       // FL FR FC LFE BL BR
+    case 7: { return 0x13F; }      // 5.1 + BC
+    case 8: { return 0x63F; }      // 7.1: 5.1 + SL SR
+    default: { }
+  }
+  return 0;
+}

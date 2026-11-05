@@ -1,0 +1,35 @@
+// Status codes. Every audio function that can fail returns one of these.
+// AUDIO_OK is zero and every error is negative, so `rc < 0` means failure.
+
+export const AUDIO_OK: int32 = 0;
+export const AUDIO_END: int32 = 1;              // no more data (not an error)
+export const AUDIO_E_ARG: int32 = -1;           // a bad argument
+export const AUDIO_E_DATA: int32 = -2;          // the input is not valid data of this format
+export const AUDIO_E_TRUNC: int32 = -3;         // the input ended early
+export const AUDIO_E_CHECK: int32 = -4;         // a checksum in the data does not match
+export const AUDIO_E_LIMIT: int32 = -5;         // larger than the limits allow
+export const AUDIO_E_MEM: int32 = -6;           // out of memory
+export const AUDIO_E_UNSUPPORTED: int32 = -7;   // valid data that uses a feature audio lacks
+export const AUDIO_E_IO: int32 = -8;            // a file could not be opened, read or written
+export const AUDIO_E_FORMAT: int32 = -9;        // the data is not in any format audio knows
+export const AUDIO_E_DEVICE: int32 = -10;       // the sound device failed or is missing
+
+/// A short English message for a status code.
+export fn audio_error_text(rc: int32) -> string {
+  switch (rc) {
+    case 0: { return "ok"; }
+    case 1: { return "end of data"; }
+    case -1: { return "bad argument"; }
+    case -2: { return "invalid data"; }
+    case -3: { return "input ended early"; }
+    case -4: { return "checksum mismatch"; }
+    case -5: { return "too large for the limits"; }
+    case -6: { return "out of memory"; }
+    case -7: { return "unsupported feature"; }
+    case -8: { return "file error"; }
+    case -9: { return "unknown audio format"; }
+    case -10: { return "sound device error"; }
+    default: { }
+  }
+  return "unknown error";
+}

@@ -1,0 +1,447 @@
+//! Sample input of a chart: pushes, bar-style values by category, in-place overwrite by x,
+//! clearing, ring size (mp_chart_keep), the sliding window (mp_chart_window) and the
+//! caller's current time (mp_chart_set_now), with getters for the newest x, the ring size,
+//! the window and whether the chart is live. Each call takes the chart's lock hooks,
+//! records its first failure as the sticky error and moves seq only when the data or the
+//! setting changed. Uses chart/chart, data/col and core.
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/str";
+import "mistplot/data/col";
+import "mistplot/chart/chart";
+
+const SAMPLES_CATS_MIN: int32 = 8;
+
+fn samples_push(c: MpChart*, s: int32, x: float64, y: float64) -> int32 {
+  var rc: int32 = mp_col_push(&c->series[(int64)s].col, x, y);
+  if (rc != MP_OK) { return rc; }
+  if (is_finite(x) != 0 && (!c->has_latest || x > c->latest_x)) {
+    c->latest_x = x;
+    c->has_latest = true;
+  }
+  c->stats.pushes = c->stats.pushes + 1;
+  return MP_OK;
+}
+
+/// Appends one sample to series s.
+/// Non-finite samples are stored but never drawn. In a live chart (mp_chart_keep > 0) a full
+/// series overwrites its oldest sample.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index from mp_chart_series. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param x Sample x. Units: data units (seconds when the x format is MP_FMT_TIME). Valid: any;
+///   keep x nondecreasing per series for O(width) frames, otherwise frames cost O(n).
+/// @param y Sample y. Units: data units. Valid: any.
+/// @return MP_OK, or an error code (also recorded as the chart's sticky error).
+/// @error MP_ERR_ARG c is 0 or s is out of range; nothing changes.
+/// @error MP_ERR_ALLOC an unbounded series could not grow; the series is unchanged.
+/// @error MP_ERR_LIMIT an unbounded series already holds MP_MAX_COUNT samples; unchanged.
+/// @mem Nothing is retained from the arguments.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(1) amortized; no allocation in a live chart after its ring filled once.
+export fn mp_chart_push(c: MpChart*, s: int32, x: float64, y: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  if (s >= 0 && s < c->n_series) { rc = samples_push(c, s, x, y); }
+  if (rc == MP_OK) { mp_chart_touch(c); }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Appends n samples to series s, as n calls of mp_chart_push under one lock.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param xs Sample x values. Units: data units. Valid: n readable values (0 when n is 0).
+/// @param ys Sample y values. Units: data units. Valid: n readable values (0 when n is 0).
+/// @param n Sample count. Valid: 0 .. MP_MAX_COUNT.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0, s is out of range, n < 0 or a needed array is 0; nothing changes.
+/// @error MP_ERR_LIMIT n is above MP_MAX_COUNT; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT a push failed; the samples before it were appended.
+/// @mem Nothing is retained from the arrays.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(n) amortized.
+export fn mp_chart_push_n(c: MpChart*, s: int32, xs: float64*, ys: float64*,
+                          n: int64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (s < 0 || s >= c->n_series || n < 0 || (n > 0 && (xs == 0 || ys == 0))) {
+    rc = MP_ERR_ARG;
+  } else if (n > MP_MAX_COUNT) {
+    rc = MP_ERR_LIMIT;
+  }
+  var i: int64 = 0;
+  while (rc == MP_OK && i < n) {
+    rc = samples_push(c, s, xs[i], ys[i]);
+    i = i + 1;
+  }
+  if (i > 0) { mp_chart_touch(c); }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Number of samples series s holds (after any ring overwrite).
+///
+/// @param c The chart. Valid: non-zero; 0 gives 0.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1; others give 0.
+/// @return The sample count.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_len(c: MpChart*, s: int32) -> int64 {
+  if (c == 0) { return 0; }
+  mp_chart_enter(c);
+  var n: int64 = 0;
+  if (s >= 0 && s < c->n_series) { n = mp_col_len(&c->series[(int64)s].col); }
+  mp_chart_leave(c);
+  return n;
+}
+
+fn samples_clear(c: MpChart*) {
+  var i: int32 = 0;
+  while (i < c->n_series) {
+    mp_col_clear(&c->series[(int64)i].col);
+    i = i + 1;
+  }
+  var j: int32 = 0;
+  while (j < c->n_cats) {
+    mp_str_free(c->cats[(int64)j]);
+    j = j + 1;
+  }
+  c->n_cats = 0;
+  c->latest_x = 0.0;
+  c->has_latest = false;
+  c->ease_ok = false;
+}
+
+/// Removes every sample and category; series, names, style and window stay.
+///
+/// @param c The chart. Valid: non-zero; 0 is ignored.
+/// @mem Category names are freed; sample storage is kept for reuse.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(series + categories).
+export fn mp_chart_clear(c: MpChart*) {
+  if (c == 0) { return; }
+  mp_chart_enter(c);
+  samples_clear(c);
+  mp_chart_touch(c);
+  mp_chart_leave(c);
+}
+
+/// Removes every sample of series s.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or s is out of range; nothing changes.
+/// @mem Sample storage is kept for reuse.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_clear_series(c: MpChart*, s: int32) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  if (s >= 0 && s < c->n_series) {
+    mp_col_clear(&c->series[(int64)s].col);
+    mp_chart_touch(c);
+    rc = MP_OK;
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+fn samples_cat_index(c: MpChart*, category: string) -> int32 {
+  var j: int32 = 0;
+  while (j < c->n_cats) {
+    if (c->cats[(int64)j] == category) { return j; }
+    j = j + 1;
+  }
+  return -1;
+}
+
+fn samples_cat_add(c: MpChart*, category: string) -> int32 {
+  if ((int64)category.length > MP_MAX_TEXT) { return -MP_ERR_LIMIT; }
+  if (c->n_cats >= MP_MAX_CATEGORIES) { return -MP_ERR_LIMIT; }
+  if (c->n_cats == c->cap_cats) {
+    var cap: int32 = c->cap_cats * 2;
+    if (cap < SAMPLES_CATS_MIN) { cap = SAMPLES_CATS_MIN; }
+    var p: string* = (string*)mp_alloc((int64)cap * (int64)sizeof(string));
+    if (p == 0) { return -MP_ERR_ALLOC; }
+    var i: int32 = 0;
+    while (i < c->n_cats) {
+      p[(int64)i] = c->cats[(int64)i];
+      i = i + 1;
+    }
+    if (c->cats != 0) { mp_free((rawptr)c->cats); }
+    c->cats = p;
+    c->cap_cats = cap;
+  }
+  var copy: string = mp_str_dup(category);
+  if ((int64)copy.length == 0 && (int64)category.length > 0) { return -MP_ERR_ALLOC; }
+  c->cats[(int64)c->n_cats] = copy;
+  c->n_cats = c->n_cats + 1;
+  return c->n_cats - 1;
+}
+
+// Sample j of the column becomes (j, y); missing samples before it are NaN.
+fn samples_set_at(c: MpChart*, s: int32, j: int32, y: float64) -> int32 {
+  var col: MpCol* = &c->series[(int64)s].col;
+  var zero: float64 = 0.0;
+  while (mp_col_len(col) < (int64)j) {
+    var rc: int32 = samples_push(c, s, (float64)mp_col_len(col), zero / zero);
+    if (rc != MP_OK) { return rc; }
+  }
+  if (mp_col_len(col) == (int64)j) { return samples_push(c, s, (float64)j, y); }
+  return mp_col_set(col, (int64)j, (float64)j, y);
+}
+
+/// Sets series s at a category, for bar charts: categories are added in first-seen order
+/// and category k is band k (sample k of every series). Missing samples before it are NaN.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param category Category name. Valid: up to MP_MAX_TEXT bytes; "" is a category too.
+/// @param y Value. Units: data units. Valid: any; non-finite draws no bar.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or s is out of range; nothing changes.
+/// @error MP_ERR_LIMIT MP_MAX_CATEGORIES reached or the name is too long; nothing changes.
+/// @error MP_ERR_ALLOC a copy or the series could not grow; the category may have been added.
+/// @mem category is copied once, when first seen.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(categories) for the lookup.
+export fn mp_chart_set_value(c: MpChart*, s: int32, category: string, y: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  if (s >= 0 && s < c->n_series) {
+    var j: int32 = samples_cat_index(c, category);
+    rc = MP_OK;
+    if (j < 0) {
+      j = samples_cat_add(c, category);
+      if (j < 0) { rc = -j; } else { mp_chart_touch(c); }
+    }
+    var col: MpCol* = &c->series[(int64)s].col;
+    var same: bool = rc == MP_OK && (int64)j < mp_col_len(col) &&
+                     mp_col_y(col, (int64)j) == y && mp_col_x(col, (int64)j) == (float64)j;
+    if (rc == MP_OK && !same) {
+      rc = samples_set_at(c, s, j, y);
+      mp_chart_touch(c);
+    }
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Makes every series a ring of n samples (keeping the newest), or unbounded with 0.
+/// Series added later get the same ring size.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param n Samples kept per series. Valid: 0 .. MP_MAX_COUNT.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or n < 0; nothing changes.
+/// @error MP_ERR_LIMIT n is above MP_MAX_COUNT; nothing changes.
+/// @mem Ring storage is allocated at each series' first push and grows up to n slots.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(samples moved) when shrinking.
+export fn mp_chart_keep(c: MpChart*, n: int64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (n < 0) { rc = MP_ERR_ARG; } else if (n > MP_MAX_COUNT) { rc = MP_ERR_LIMIT; }
+  if (rc == MP_OK && n != c->keep) {
+    c->keep = n;
+    var i: int32 = 0;
+    while (i < c->n_series) {
+      mp_col_set_keep(&c->series[(int64)i].col, n);
+      i = i + 1;
+    }
+    mp_chart_touch(c);
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Shows only the newest span of x: [latest x - span, latest x], where latest x is the
+/// largest finite x pushed to any series and the start is clamped up to the oldest retained
+/// sample (so the axis starts at the first sample until the data covers the span). Each
+/// line enters from the plot's left edge. 0 shows everything. With mp_chart_set_now the
+/// window is [now - span, now] instead.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param span Window width. Units: data units. Valid: finite and >= 0.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or span is negative or not finite; nothing changes.
+/// @mem Nothing is allocated.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_window(c: MpChart*, span: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (is_finite(span) == 0 || span < 0.0) { rc = MP_ERR_ARG; }
+  if (rc == MP_OK && span != c->span) {
+    c->span = span;
+    mp_chart_touch(c);
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Sets the current time for a live chart, so it scrolls continuously instead of in steps
+/// at each sample. While a window span is set (mp_chart_window), every frame's x domain is
+/// exactly [t - span, t], whatever the newest sample: the sample before t - span is
+/// interpolated onto the left edge, and a line to a sample newer than t is cut at the
+/// right edge. It also turns on the eased y domain (mp_chart_set_y_ease). Call it once per
+/// displayed frame with the host's clock in x units; the chart never reads a clock.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param t The current time. Units: data units (seconds when the x format is MP_FMT_TIME).
+///   Valid: finite.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or t is not finite; nothing changes.
+/// @mem Nothing is allocated.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(1); seq moves only when t differs from the current time.
+export fn mp_chart_set_now(c: MpChart*, t: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (is_finite(t) == 0) { rc = MP_ERR_ARG; }
+  if (rc == MP_OK && (!c->has_now || t != c->now)) {
+    c->has_now = true;
+    c->now = t;
+    mp_chart_touch(c);
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Forgets the time set by mp_chart_set_now: the window follows the newest sample again
+/// and the y domain is the plain automatic one (data, zero and nice ticks).
+///
+/// @param c The chart. Valid: non-zero.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(1); seq moves only when a time was set.
+export fn mp_chart_clear_now(c: MpChart*) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  if (c->has_now) {
+    c->has_now = false;
+    c->now = 0.0;
+    c->ease_ok = false;
+    mp_chart_touch(c);
+  }
+  mp_chart_leave(c);
+  return MP_OK;
+}
+
+/// The ring size set by mp_chart_keep.
+///
+/// @param c The chart. Valid: non-zero; 0 gives 0.
+/// @return Samples kept per series; 0 = unbounded.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_keep_count(c: MpChart*) -> int64 {
+  if (c == 0) { return 0; }
+  mp_chart_enter(c);
+  var n: int64 = c->keep;
+  mp_chart_leave(c);
+  return n;
+}
+
+/// The window span set by mp_chart_window.
+///
+/// @param c The chart. Valid: non-zero; 0 gives 0.
+/// @return The span in data units; 0 = everything is shown.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_window_span(c: MpChart*) -> float64 {
+  if (c == 0) { return 0.0; }
+  mp_chart_enter(c);
+  var span: float64 = c->span;
+  mp_chart_leave(c);
+  return span;
+}
+
+/// Whether the chart is live: it has a ring (mp_chart_keep) or a window (mp_chart_window).
+/// Hosts use it to decide whether to keep redrawing.
+///
+/// @param c The chart. Valid: non-zero; 0 gives false.
+/// @return true when the ring size or the window span is above 0.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_is_live(c: MpChart*) -> bool {
+  if (c == 0) { return false; }
+  mp_chart_enter(c);
+  var live: bool = c->keep > 0 || c->span > 0.0;
+  mp_chart_leave(c);
+  return live;
+}
+
+/// The x of the newest sample of series s that has a finite x. For a series whose x values
+/// are nondecreasing it is also the largest x.
+///
+/// @param c The chart. Valid: non-zero; 0 gives NaN.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1; others give NaN.
+/// @return The x in data units, or NaN when the series is empty, holds no finite x or the
+///   arguments are bad.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_last_x(c: MpChart*, s: int32) -> float64 {
+  if (c == 0) { return NAN(); }
+  mp_chart_enter(c);
+  var x: float64 = NAN();
+  if (s >= 0 && s < c->n_series && c->series[(int64)s].col.has_last) {
+    x = c->series[(int64)s].col.last_x;
+  }
+  mp_chart_leave(c);
+  return x;
+}
+
+/// Overwrites the sample of series s whose x equals x, keeping its x: the in-place update
+/// of a row that already sits in a time-ordered series. Does nothing when the series is
+/// not sorted by x or holds no sample at x; the caller then reloads instead.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param x The x to find. Units: data units. Valid: finite; compared for exact equality.
+/// @param y The new value. Units: data units. Valid: any.
+/// @return MP_OK when a sample was overwritten, or an error code.
+/// @error MP_ERR_ARG c is 0 or s is out of range (recorded as the sticky error); nothing
+///   changes.
+/// @error MP_ERR_STATE the series x values are not sorted, or no sample has this x; nothing
+///   changes and the sticky error is left alone (a miss is an answer, not a setup fault).
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(log n) on a sorted series.
+export fn mp_chart_set_at_x(c: MpChart*, s: int32, x: float64, y: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  if (s >= 0 && s < c->n_series) {
+    rc = MP_ERR_STATE;
+    var col: MpCol* = &c->series[(int64)s].col;
+    if (mp_col_sorted(col)) {
+      var i: int64 = mp_col_lower_bound(col, x);
+      if (i < mp_col_len(col) && mp_col_x(col, i) == x) {
+        rc = mp_col_set(col, i, x, y);
+        if (rc == MP_OK) { mp_chart_touch(c); }
+      }
+    }
+  }
+  if (rc != MP_ERR_STATE) { mp_chart_fail(c, rc); }
+  mp_chart_leave(c);
+  return rc;
+}

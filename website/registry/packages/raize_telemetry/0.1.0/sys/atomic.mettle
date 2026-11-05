@@ -1,0 +1,25 @@
+// raize_telemetry/sys/atomic: pointer atomics on x86-64 (Linux, System V ABI).
+//
+// Mettle has no host atomic built-ins yet (Mettle reports/008), so these are
+// @naked functions, the technique alph uses in alph/src/sys/atomic.mettle.
+// The optimizer sees an opaque call and cannot move memory accesses across
+// it. x86-64 is TSO: a plain load already has acquire order. The store uses
+// xchg, which is sequentially consistent. Replace with built-ins when 008
+// lands.
+
+// Reads *p with acquire order. Thread: any.
+@naked export fn tm__load_ptr(p: rawptr*) -> rawptr {
+  asm {
+    mov rax, [rdi]
+    ret
+  }
+}
+
+// Writes v to *p, sequentially consistent: every earlier write is visible to
+// a thread that loads v. Thread: any.
+@naked export fn tm__store_ptr_sc(p: rawptr*, v: rawptr) {
+  asm {
+    xchg [rdi], rsi
+    ret
+  }
+}

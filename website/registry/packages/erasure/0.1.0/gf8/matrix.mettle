@@ -1,0 +1,106 @@
+// Small dense matrices over GF(2^8), stored row-major in a uint8 block.
+// Used to build the coding matrix and to invert the rows of the shards
+// that survive.
+
+import "std/mem";
+import "erasure/core/status";
+import "erasure/gf8/field";
+
+/// out (r x c) = a (r x n) times b (n x c).
+export fn erasure_gf8_mat_mul(a: uint8*, b: uint8*, out: uint8*, r: int32, n: int32, c: int32) {
+  for i in 0..r {
+    for j in 0..c {
+      var s: uint8 = 0;
+      for t in 0..n {
+        s = s ^ erasure_gf8_mul(a[(int64)i * n + t], b[(int64)t * c + j]);
+      }
+      out[(int64)i * c + j] = s;
+    }
+  }
+}
+
+/// Inverts the n x n matrix m in place (Gauss-Jordan elimination).
+/// Returns ERASURE_OK, or ERASURE_E_ARG if m is singular.
+export fn erasure_gf8_mat_invert(m: uint8*, n: int32) -> int32 {
+  var w: int64 = (int64)n * 2;
+  var a: uint8* = (uint8*)malloc((int64)n * w);
+  if (a == 0) { return ERASURE_E_MEM; }
+  for i in 0..n {
+    for j in 0..n {
+      a[i * w + j] = m[(int64)i * n + j];
+      var e: uint8 = 0;
+      if (i == j) { e = 1; }
+      a[i * w + n + j] = e;
+    }
+  }
+  for col in 0..n {
+    // Find a row with a nonzero entry in this column.
+    var p: int32 = -1;
+    for r in col..n {
+      if (a[(int64)r * w + col] != 0) { p = r; break; }
+    }
+    if (p < 0) { free(a); return ERASURE_E_ARG; }
+    if (p != col) {
+      for j in 0..w {
+        var tmp: uint8 = a[(int64)p * w + j];
+        a[(int64)p * w + j] = a[(int64)col * w + j];
+        a[(int64)col * w + j] = tmp;
+      }
+    }
+    var d: uint8 = a[(int64)col * w + col];
+    if (d != 1) {
+      var di: uint8 = erasure_gf8_inv(d);
+      for j in 0..w { a[(int64)col * w + j] = erasure_gf8_mul(a[(int64)col * w + j], di); }
+    }
+    for r in 0..n {
+      if (r == col) { continue; }
+      var f: uint8 = a[(int64)r * w + col];
+      if (f == 0) { continue; }
+      var row: uint8* = erasure_gf8_mul_row(f);
+      for j in 0..w { a[(int64)r * w + j] = a[(int64)r * w + j] ^ row[a[(int64)col * w + j]]; }
+    }
+  }
+  for i in 0..n {
+    for j in 0..n { m[(int64)i * n + j] = a[(int64)i * w + n + j]; }
+  }
+  free(a);
+  return ERASURE_OK;
+}
+
+/// Systematic Vandermonde coding matrix, (k + m) x k. The top k rows are the
+/// identity. Built like klauspost/reedsolomon and Backblaze: take the
+/// Vandermonde matrix v[r][c] = r^c and multiply it by the inverse of its top
+/// square, so any k rows stay invertible and shards match those libraries.
+export fn erasure_gf8_vandermonde(out: uint8*, k: int32, m: int32) -> int32 {
+  var n: int32 = k + m;
+  var v: uint8* = (uint8*)malloc((int64)n * k);
+  var top: uint8* = (uint8*)malloc((int64)k * k);
+  if (v == 0 || top == 0) { free(v); free(top); return ERASURE_E_MEM; }
+  for r in 0..n {
+    for c in 0..k { v[(int64)r * k + c] = erasure_gf8_pow((uint8)r, c); }
+  }
+  for i in 0..((int64)k * k) { top[i] = v[i]; }
+  var rc: int32 = erasure_gf8_mat_invert(top, k);
+  if (rc == ERASURE_OK) { erasure_gf8_mat_mul(v, top, out, n, k, k); }
+  free(v);
+  free(top);
+  return rc;
+}
+
+/// Systematic Cauchy coding matrix, (k + m) x k: identity on top, then
+/// row r (r >= k) has entries 1 / (r xor c). Every square sub-matrix of a
+/// Cauchy matrix is invertible. Same layout as klauspost's WithCauchyMatrix.
+export fn erasure_gf8_cauchy(out: uint8*, k: int32, m: int32) {
+  var n: int32 = k + m;
+  for r in 0..n {
+    for c in 0..k {
+      var v: uint8 = 0;
+      if (r < k) {
+        if (r == c) { v = 1; }
+      } else {
+        v = erasure_gf8_inv((uint8)(r ^ c));
+      }
+      out[(int64)r * k + c] = v;
+    }
+  }
+}

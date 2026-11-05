@@ -1,0 +1,219 @@
+// alph/work/task: one-shot tasks and a bounded parallel map, like Elixir's
+// Task and Task.async_stream.
+//
+// A task is a short-lived actor that runs one function and answers. The
+// caller does not block: it gets a ref, and the answer arrives as a message
+// with that ref, so "await" is handling ALPH_TAG_TASK_DONE. A task that
+// crashes answers with ALPH_TAG_DOWN, and one that runs too long with
+// ALPH_TAG_TIMEOUT, as for any alph_request; its late answer is dropped.
+//
+//   fn square(ctx: AlphCtx*, data: rawptr, size: int64) -> int64 ... {
+//     return *(int64*)data * *(int64*)data;
+//   }
+//   var ref: int64 = alph_task(ctx, (rawptr)&n, 8, 1000, &square);
+//   ... ALPH_TAG_TASK_DONE with m->ref == ref: m->arg is the square
+//
+// alph_task_map runs one function over many items with at most a given
+// number running at once, and answers once with every result in order.
+
+import "std/mem";
+import "alph/core/mailbox";
+import "alph/core/node";
+
+// The answer to alph_task: arg = what the function returned; ref = the ref
+// alph_task returned.
+export const ALPH_TAG_TASK_DONE: int64 = 51;
+
+// The answer to alph_task_map: arg = how many items failed; the payload is
+// one AlphTaskResult per item, in item order. ref = the ref alph_task_map
+// returned.
+export const ALPH_TAG_TASK_ALL: int64 = 52;
+
+const ALPH_TAG_TASK_GO: int64 = 53;
+const ALPH_TAG_TASK_MAP_GO: int64 = 54;
+
+// One item's outcome in an ALPH_TAG_TASK_ALL answer.
+//
+//   ok     1 when the function returned, 0 when it crashed or timed out
+//   value  what it returned, 0 when it failed
+export struct AlphTaskResult {
+  ok: int64;
+  value: int64;
+}
+
+// A task actor's state: the function it runs on the request's payload.
+struct AlphTask {
+  work: fn(AlphCtx*, rawptr, int64) -> int64 with alloc, syscall, asm;
+}
+
+fn alph_task_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag != ALPH_TAG_TASK_GO) {
+    return ALPH_CONTINUE;
+  }
+  var t: AlphTask* = (AlphTask*)ctx->state;
+  var size: int64 = 0;
+  var data: rawptr = alph_msg_bytes(m, &size);
+  var result: int64 = t->work(ctx, data, size);
+  alph_reply(ctx, m, ALPH_TAG_TASK_DONE, result);
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+// Starts a task running work on a copy of size bytes at data, with
+// timeout_ms to answer (0 waits for ever). work gets the task's own ctx, so
+// it may allocate, send and spawn like any handler; it must not block.
+//
+// Returns the ref the answer carries (ALPH_TAG_TASK_DONE, or ALPH_TAG_DOWN
+// when the task crashed, or ALPH_TAG_TIMEOUT), or 0 when the node is full,
+// or ALPH_FULL or ALPH_NOMEM as alph_request. Thread: a handler.
+export fn alph_task(ctx: AlphCtx*, data: rawptr, size: int64, timeout_ms: int64,
+                    work: fn(AlphCtx*, rawptr, int64) -> int64 with alloc, syscall, asm) -> int64 {
+  var t: AlphTask;
+  t.work = work;
+  var pid: int64 = alph_spawn_value<AlphTask>(ctx, 0, &t, &alph_task_handle);
+  if (pid == 0) {
+    return 0;
+  }
+  return alph_request_bytes(ctx, pid, ALPH_TAG_TASK_GO, data, size, timeout_ms);
+}
+
+// A map's coordinator. The items follow it in its state; results and the
+// running tasks live in its heap once it starts.
+struct AlphTaskMap {
+  work: fn(AlphCtx*, rawptr, int64) -> int64 with alloc, syscall, asm;
+  count: int64;
+  item_size: int64;
+  max: int64;            // tasks at once
+  item_timeout_ms: int64;
+  next: int64;           // next item to start
+  running: int64;
+  finished: int64;
+  failed: int64;
+  results: int64;        // AlphTaskResult[count]
+  slots: int64;          // int64[max * 2]: ref and item of each running task; ref 0 is free
+  owner: int64;          // who asked, and the request's ref
+  owner_ref: int64;
+}
+
+fn alph_map_item(mp: AlphTaskMap*, ctx: AlphCtx*, i: int64) -> rawptr {
+  return (rawptr)((int64)ctx->state + (int64)sizeof(AlphTaskMap) + i * mp->item_size);
+}
+
+// Starts tasks until max run or no items are left. An item whose task
+// cannot start counts as failed.
+fn alph_map_fill(ctx: AlphCtx*, mp: AlphTaskMap*) {
+  while (mp->running < mp->max && mp->next < mp->count) {
+    var i: int64 = mp->next;
+    mp->next = mp->next + 1;
+    var ref: int64 = alph_task(ctx, alph_map_item(mp, ctx, i), mp->item_size, mp->item_timeout_ms, mp->work);
+    if (ref <= 0) {
+      mp->failed = mp->failed + 1;
+      mp->finished = mp->finished + 1;
+    } else {
+      for k: int64 in 0..mp->max {
+        var slot: int64* = (int64*)(mp->slots + k * 16);
+        if (slot[0] == 0) {
+          slot[0] = ref;
+          slot[1] = i;
+          break;
+        }
+      }
+      mp->running = mp->running + 1;
+    }
+  }
+}
+
+// Answers the owner once every item is done. Returns ALPH_STOP when it did.
+fn alph_map_finish(ctx: AlphCtx*, mp: AlphTaskMap*) -> int64 {
+  if (mp->finished < mp->count) {
+    return ALPH_CONTINUE;
+  }
+  var req: AlphMsg;
+  memset((rawptr)&req, 0, (int64)sizeof(AlphMsg));
+  req.from = mp->owner;
+  req.ref = mp->owner_ref;
+  alph_reply_full(ctx, &req, ALPH_TAG_TASK_ALL, mp->failed, (rawptr)mp->results,
+                  mp->count * (int64)sizeof(AlphTaskResult));
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+fn alph_map_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var mp: AlphTaskMap* = (AlphTaskMap*)ctx->state;
+  if (m->tag == ALPH_TAG_TASK_MAP_GO) {
+    mp->owner = m->from;
+    mp->owner_ref = m->ref;
+    mp->results = (int64)alph_alloc(ctx, mp->count * (int64)sizeof(AlphTaskResult) + 8);
+    mp->slots = (int64)alph_alloc(ctx, mp->max * 16);
+    if (mp->results == 0 || mp->slots == 0) {
+      alph_reply(ctx, m, ALPH_TAG_TASK_ALL, mp->count);  // no memory: every item failed, no payload
+      return alph_stop(ctx, ALPH_NORMAL);
+    }
+    memset((rawptr)mp->results, 0, mp->count * (int64)sizeof(AlphTaskResult));
+    memset((rawptr)mp->slots, 0, mp->max * 16);
+    alph_map_fill(ctx, mp);
+    return alph_map_finish(ctx, mp);
+  }
+  if (m->tag != ALPH_TAG_TASK_DONE && m->tag != ALPH_TAG_DOWN && m->tag != ALPH_TAG_TIMEOUT) {
+    return ALPH_CONTINUE;
+  }
+  for k: int64 in 0..mp->max {
+    var slot: int64* = (int64*)(mp->slots + k * 16);
+    if (m->ref != 0 && slot[0] == m->ref) {
+      var i: int64 = slot[1];
+      slot[0] = 0;
+      var r: AlphTaskResult* = (AlphTaskResult*)(mp->results + i * (int64)sizeof(AlphTaskResult));
+      if (m->tag == ALPH_TAG_TASK_DONE) {
+        r->ok = 1;
+        r->value = m->arg;
+      } else {
+        mp->failed = mp->failed + 1;
+      }
+      mp->running = mp->running - 1;
+      mp->finished = mp->finished + 1;
+      alph_map_fill(ctx, mp);
+      return alph_map_finish(ctx, mp);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+// Runs work over count items of item_size bytes each, at items, with at
+// most max_tasks tasks at once, each given item_timeout_ms (0: no limit).
+// The items are copied. The answer, once every item is done, is
+// ALPH_TAG_TASK_ALL: arg = how many failed, payload = an AlphTaskResult per
+// item in order. A coordinator actor does the work, so the caller stays
+// free; if it crashes the answer is ALPH_TAG_DOWN, and timeout_ms bounds
+// the whole map (0: no limit).
+//
+// Returns the ref the answer carries, 0 when the node is full or out of
+// memory, or as alph_request. Thread: a handler.
+export fn alph_task_map(ctx: AlphCtx*, items: rawptr, count: int64, item_size: int64, max_tasks: int64,
+                        item_timeout_ms: int64, timeout_ms: int64,
+                        work: fn(AlphCtx*, rawptr, int64) -> int64 with alloc, syscall, asm) -> int64 {
+  if (count < 0 || item_size < 0 || max_tasks < 1) {
+    return 0;
+  }
+  var head: int64 = (int64)sizeof(AlphTaskMap);
+  var block: rawptr = malloc(head + count * item_size + 8);
+  if (block == 0) {
+    return 0;
+  }
+  memset(block, 0, head);
+  var mp: AlphTaskMap* = (AlphTaskMap*)block;
+  mp->work = work;
+  mp->count = count;
+  mp->item_size = item_size;
+  mp->max = max_tasks;
+  if (mp->max > count && count > 0) {
+    mp->max = count;
+  }
+  mp->item_timeout_ms = item_timeout_ms;
+  if (count * item_size > 0) {
+    memcpy((rawptr)((int64)block + head), items, count * item_size);
+  }
+  var pid: int64 = alph_spawn_bytes(ctx, 0, block, head + count * item_size, &alph_map_handle);
+  free(block);
+  if (pid == 0) {
+    return 0;
+  }
+  return alph_request(ctx, pid, ALPH_TAG_TASK_MAP_GO, 0, timeout_ms);
+}

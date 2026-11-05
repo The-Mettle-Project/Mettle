@@ -1,0 +1,6 @@
+// mythic_plat: selects the native platform at compile time; headless is always compiled.
+// Exactly one of the guarded files defines mythic_plat_native_create (DECISIONS §1, §8).
+import "mythic_types";
+import "mythic_plat_x11.mettle" if linux;
+import "mythic_plat_win32.mettle" if windows;
+import "mythic_plat_headless";

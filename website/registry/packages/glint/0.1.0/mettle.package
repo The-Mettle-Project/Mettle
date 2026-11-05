@@ -1,0 +1,7 @@
+name = glint
+version = 0.1.0
+description = OpenGL 4.6 for Mettle: every core function and enum, extensions, EGL/GLX/WGL contexts, windows and headless
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Glint
+compiler = 0.18.0
+platforms = linux windows

@@ -1,0 +1,389 @@
+// raize_api/auth: who is calling, and what they may do.
+//
+//   rapi_use_bearer(api, "tasks", &verify_token);
+//   rapi_group_secure(api, "tasks:read");                     // or rapi_secure(op, "tasks:write")
+//   rapi_policy(op, &owns_task, "only the owner may change a task");
+//
+//   fn verify_token(r: RapiReq*, token: string) -> bool {
+//     // look the token up; on success say who it is and what it allows
+//     r->subject = rz_arena_str(r->ctx->arena, "user-7");
+//     r->scopes = "tasks:read tasks:write";
+//     return true;
+//   }
+//
+// Follows:
+//   - RFC 6750 (Bearer tokens): section 2.1 for the header (Authorization: Bearer
+//     <b64token>, the scheme name is case-insensitive), section 3 for the
+//     WWW-Authenticate challenge and the error codes invalid_token and
+//     insufficient_scope.
+//   - RFC 9110 section 11: 401 carries a WWW-Authenticate challenge (11.6.1), 403 says
+//     the caller is known but not allowed.
+//   - OpenAPI 3.1 Security Scheme Object: the scheme is listed under
+//     components.securitySchemes and each secured operation gets a security
+//     requirement with its scopes.
+// Every error is a problem details document (RFC 9457).
+//
+// How a request is judged, in order:
+//   1. If the request carries a credential for the scheme, it is checked even on a
+//      public operation, so a handler can see who is calling. A malformed or rejected
+//      credential is 401 (RFC 6750 calls a malformed token invalid_token too).
+//      A different Authorization scheme (Basic, ...) is not ours and is ignored.
+//   2. A secured operation (rapi_secure, rapi_group_secure) with no credential is 401
+//      with a challenge; a caller who lacks one of the operation's scopes is 403 with
+//      error="insufficient_scope" and the scopes needed. All scopes are required.
+//   3. Every policy set on the operation with rapi_policy must pass, or the answer is 403
+//      with the policy's text as the detail.
+// Register this module before anything that needs r->subject (for example
+// rapi_use_idempotency).
+//
+// The verify callback is the only place that knows about token storage, so API tokens
+// from raize_auth (see ~/Projects/mettle/raize_auth) plug in here: look the presented
+// token up there and copy the owner and scopes into the request. This module does not
+// depend on raize_auth.
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/header";
+import "../route/api";
+import "../problem/problem";
+
+/// The longest token or API key accepted, in bytes.
+export const RAPI_AUTH_TOKEN_MAX: int32 = 4096;
+
+const RAPI_AUTH_NONE: int32 = 0;
+const RAPI_AUTH_BEARER: int32 = 1;
+const RAPI_AUTH_KEY: int32 = 2;
+const RAPI_POLICIES_MAX: int32 = 256;
+
+struct RapiAuth {
+  kind: int32;                           // RAPI_AUTH_*
+  verify: fn(RapiReq*, string) -> bool;
+  header: string;                        // the API key header
+  chal: string;                          // the challenge without error members
+  has_realm: bool;
+}
+
+struct RapiPolicy {
+  op: RapiOp*;
+  check: fn(RapiReq*) -> bool;
+  why: string;
+}
+
+// Policies, written at startup only and read by every request.
+var g_rapi_pol: RapiPolicy* = 0;
+var g_rapi_npol: int32 = 0;
+
+// ---------------------------------------------------------------------------
+// Text helpers
+// ---------------------------------------------------------------------------
+
+// Adds `s` to `b` as the inside of a quoted-string (RFC 9110 section 5.6.4).
+// Anything but printable ASCII becomes '?'.
+fn rapi__auth_quote(b: RzBuf*, s: string) {
+  for i in 0..s.length {
+    var c: int32 = (int32)s.chars[i];
+    if (c < 32 || c > 126) { rz_buf_add_byte(b, 63); continue; }
+    if (c == 34 || c == 92) { rz_buf_add_byte(b, 92); }
+    rz_buf_add_byte(b, c);
+  }
+}
+
+// Builds `<scheme> realm="<realm>"` (just the scheme for an empty realm).
+fn rapi__auth_challenge_base(scheme: string, realm: string) -> string {
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, scheme);
+  if (realm.length > 0) {
+    rz_buf_add(b, " realm=\"");
+    rapi__auth_quote(b, realm);
+    rz_buf_add(b, "\"");
+  }
+  var out: string = rz_str_dup(rz_buf_str(b));
+  rz_buf_free(b);
+  return out;
+}
+
+// True when `tok` is one of the space-separated words of `list`.
+fn rapi__auth_has_word(list: string, tok: string) -> bool {
+  var n: int64 = (int64)list.length;
+  var i: int64 = 0;
+  while (i < n) {
+    while (i < n && list.chars[i] == 32) { i = i + 1; }
+    var j: int64 = i;
+    while (j < n && list.chars[j] != 32) { j = j + 1; }
+    if (j > i && rz_str_eq(rz_str_sub(list, i, j), tok)) { return true; }
+    i = j;
+  }
+  return false;
+}
+
+// True when every space-separated word of `need` is in `have`.
+fn rapi__auth_scopes_ok(have: string, need: string) -> bool {
+  var n: int64 = (int64)need.length;
+  var i: int64 = 0;
+  while (i < n) {
+    while (i < n && need.chars[i] == 32) { i = i + 1; }
+    var j: int64 = i;
+    while (j < n && need.chars[j] != 32) { j = j + 1; }
+    if (j > i && !rapi__auth_has_word(have, rz_str_sub(need, i, j))) { return false; }
+    i = j;
+  }
+  return true;
+}
+
+/// True when the caller holds every scope in `scope` (one scope, or several separated
+/// by spaces). An empty `scope` needs nothing, so the answer is true.
+export fn rapi_has_scope(r: RapiReq*, scope: string) -> bool {
+  return rapi__auth_scopes_ok(r->scopes, scope);
+}
+
+// ---------------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------------
+
+// RFC 6750 section 2.1: b64token = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+fn rapi__auth_b64token(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n == 0 || n > (int64)RAPI_AUTH_TOKEN_MAX) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    var ok: bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+      || c == 45 || c == 46 || c == 95 || c == 126 || c == 43 || c == 47;
+    if (!ok) { break; }
+    i = i + 1;
+  }
+  if (i == 0) { return false; }
+  while (i < n && s.chars[i] == 61) { i = i + 1; }
+  return i == n;
+}
+
+/// Reads an Authorization header value for a Bearer credential (RFC 6750 section 2.1).
+///
+/// in:      raw  the header value, surrounding spaces already removed
+/// out:     out  the token, a view into `raw`
+/// returns: 0 when there is no Bearer credential (empty, or another scheme),
+///          1 when there is one and the token is well formed,
+///          2 when it is Bearer but malformed (no token, a bad character, too long)
+export fn rapi_bearer_token(raw: string, out: string*) -> int32 {
+  var n: int64 = (int64)raw.length;
+  var i: int64 = 0;
+  while (i < n && raw.chars[i] != 32) { i = i + 1; }
+  if (!rz_str_eq_ci(rz_str_sub(raw, 0, i), "Bearer")) { return 0; }
+  while (i < n && raw.chars[i] == 32) { i = i + 1; }
+  var token: string = rz_str_sub(raw, i, n);
+  if (!rapi__auth_b64token(token)) { return 2; }
+  *out = token;
+  return 1;
+}
+
+// An API key: visible ASCII only.
+fn rapi__auth_key_ok(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n == 0 || n > (int64)RAPI_AUTH_TOKEN_MAX) { return false; }
+  for i in 0..n {
+    var c: int32 = (int32)s.chars[i];
+    if (c < 33 || c > 126) { return false; }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Answers
+// ---------------------------------------------------------------------------
+
+// Sets WWW-Authenticate: the challenge, then `extra` (auth-params) when it is not empty.
+fn rapi__auth_challenge(r: RapiReq*, st: RapiAuth*, extra: string) {
+  var v: string = st->chal;
+  if (extra.length > 0) {
+    if (st->has_realm) { v = "{st->chal}, {extra}"; }
+    else { v = "{st->chal} {extra}"; }
+  }
+  rz_ctx_set_header(r->ctx, "WWW-Authenticate", v);
+}
+
+// 401. For Bearer, `error` ("invalid_token" or "") and `desc` go into the challenge.
+fn rapi__auth_401(r: RapiReq*, st: RapiAuth*, error: string, desc: string, detail: string) -> int32 {
+  var extra: string = "";
+  if (error.length > 0 && st->kind == RAPI_AUTH_BEARER) {
+    extra = "error=\"{error}\", error_description=\"{desc}\"";
+  }
+  rapi__auth_challenge(r, st, extra);
+  return rapi_problem(r->ctx, 401, detail);
+}
+
+fn rapi__auth_403_scope(r: RapiReq*, st: RapiAuth*) -> int32 {
+  var need: string = r->op->scopes;
+  if (st->kind == RAPI_AUTH_BEARER) {
+    var b: RzBuf* = rz_buf_new();
+    rz_buf_add(b, "error=\"insufficient_scope\", error_description=\"the token lacks a scope this operation needs\", scope=\"");
+    rapi__auth_quote(b, need);
+    rz_buf_add(b, "\"");
+    rapi__auth_challenge(r, st, rz_buf_str(b));
+    rz_buf_free(b);
+  }
+  return rapi_problem(r->ctx, 403, rz_arena_str(r->ctx->arena, "this operation needs the scope: {need}"));
+}
+
+// Checks the credential the request carries, if any. Returns RAPI_NEXT and sets
+// *authed when there is a good one, or the status of the 401 it sent.
+fn rapi__auth_credential(r: RapiReq*, st: RapiAuth*, authed: bool*) -> int32 {
+  var ctx: RzContext* = r->ctx;
+  var req: RzRequest* = ctx->req;
+  var token: string = "";
+  var verify: fn(RapiReq*, string) -> bool = st->verify;
+  if (st->kind == RAPI_AUTH_BEARER) {
+    var kind: int32 = rapi_bearer_token(rz_ctx_header(ctx, "Authorization"), &token);
+    if (kind == 1 && rz_header_count_named(req->headers, req->header_count, "Authorization") > 1) { kind = 2; }
+    if (kind == 0) { return RAPI_NEXT; }
+    if (kind == 2) {
+      return rapi__auth_401(r, st, "invalid_token", "the access token is malformed",
+        "the Authorization header is malformed; send one header: Authorization: Bearer <token>");
+    }
+    if (!verify(r, token)) {
+      r->principal = 0;
+      r->subject = "";
+      r->scopes = "";
+      return rapi__auth_401(r, st, "invalid_token", "the access token is not valid", "the access token is expired, revoked or not valid");
+    }
+    *authed = true;
+    return RAPI_NEXT;
+  }
+  // An API key in a header.
+  if (rz_header_count_named(req->headers, req->header_count, st->header) == 0) { return RAPI_NEXT; }
+  token = rz_ctx_header(ctx, st->header);
+  if (rz_header_count_named(req->headers, req->header_count, st->header) > 1 || !rapi__auth_key_ok(token)) {
+    return rapi__auth_401(r, st, "", "", "the API key header is malformed");
+  }
+  if (!verify(r, token)) {
+    r->principal = 0;
+    r->subject = "";
+    r->scopes = "";
+    return rapi__auth_401(r, st, "", "", "the API key is not valid");
+  }
+  *authed = true;
+  return RAPI_NEXT;
+}
+
+fn rapi__auth_before(r: RapiReq*) -> int32 {
+  var st: RapiAuth* = (RapiAuth*)r->api->auth;
+  if (st == 0) { return RAPI_NEXT; }
+  var op: RapiOp* = r->op;
+  var authed: bool = false;
+  if (st->kind != RAPI_AUTH_NONE) {
+    var rc: int32 = rapi__auth_credential(r, st, &authed);
+    if (rc != RAPI_NEXT) { return rc; }
+  }
+  if (op->security) {
+    if (st->kind == RAPI_AUTH_NONE) {
+      return rapi_problem(r->ctx, 401, "this operation needs authentication, but the API has no authentication set up");
+    }
+    if (!authed) { return rapi__auth_401(r, st, "", "", "authentication is required"); }
+    if (!rapi__auth_scopes_ok(r->scopes, op->scopes)) { return rapi__auth_403_scope(r, st); }
+  }
+  for i in 0..g_rapi_npol {
+    var p: RapiPolicy* = &g_rapi_pol[i];
+    if (p->op != op) { continue; }
+    var check: fn(RapiReq*) -> bool = p->check;
+    if (!check(r)) { return rapi_problem(r->ctx, 403, p->why); }
+  }
+  return RAPI_NEXT;
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+// The API's auth state; made, with its hook, the first time it is needed.
+fn rapi__auth_state(api: RapiApi*) -> RapiAuth* {
+  if (api->auth != 0) { return (RapiAuth*)api->auth; }
+  var st: RapiAuth* = (RapiAuth*)calloc(1, sizeof(RapiAuth));
+  st->chal = "";
+  st->header = "";
+  api->auth = (rawptr)st;
+  rapi_before(api, &rapi__auth_before);
+  return st;
+}
+
+/// Turns on Bearer token authentication (RFC 6750) and lists the scheme in the
+/// OpenAPI document as "bearerAuth".
+///
+/// in:      api     the API
+///          realm   the realm in WWW-Authenticate challenges ("" to leave it out)
+///          verify  called with the request and the token of a Bearer credential. When
+///                  the token is good it sets r->subject (the caller's id), r->scopes
+///                  (space-separated) and optionally r->principal, and returns true.
+///                  Strings it stores must live as long as the request (rz_arena_str).
+export fn rapi_use_bearer(api: RapiApi*, realm: string, verify: fn(RapiReq*, string) -> bool) {
+  var st: RapiAuth* = rapi__auth_state(api);
+  if (st->kind != RAPI_AUTH_NONE) { rapi__set_error(api, "authentication was set up twice"); return; }
+  st->kind = RAPI_AUTH_BEARER;
+  st->verify = verify;
+  st->chal = rapi__auth_challenge_base("Bearer", realm);
+  st->has_realm = realm.length > 0;
+  api->security_name = "bearerAuth";
+  api->security_json = "{{\"type\":\"http\",\"scheme\":\"bearer\"}";
+}
+
+/// Turns on API key authentication from a request header and lists the scheme in the
+/// OpenAPI document as "apiKeyAuth".
+///
+/// in:      api     the API
+///          header  the header that carries the key ("X-API-Key")
+///          verify  called with the request and the key; as for rapi_use_bearer
+export fn rapi_use_api_key(api: RapiApi*, header: string, verify: fn(RapiReq*, string) -> bool) {
+  if (!rz_header_name_ok(header)) { rapi__set_error(api, "rapi_use_api_key: bad header name"); return; }
+  var st: RapiAuth* = rapi__auth_state(api);
+  if (st->kind != RAPI_AUTH_NONE) { rapi__set_error(api, "authentication was set up twice"); return; }
+  st->kind = RAPI_AUTH_KEY;
+  st->verify = verify;
+  st->header = rz_str_dup(header);
+  // There is no registered scheme for API keys; ApiKey names it in the challenge.
+  st->chal = rapi__auth_challenge_base("ApiKey", api->title);
+  st->has_realm = api->title.length > 0;
+  api->security_name = "apiKeyAuth";
+  var b: RzBuf* = rz_buf_new();
+  rz_buf_add(b, "{{\"type\":\"apiKey\",\"in\":\"header\",\"name\":\"");
+  rz_buf_add(b, header);
+  rz_buf_add(b, "\"}");
+  api->security_json = rz_str_dup(rz_buf_str(b));
+  rz_buf_free(b);
+}
+
+// The API that holds `op`, or 0.
+fn rapi__auth_api_of(op: RapiOp*) -> RapiApi* {
+  var n: int32 = 0;
+  var apis: RapiApi** = rapi__apis(&n);
+  for a in 0..n {
+    for i in 0..apis[a]->nops {
+      if (apis[a]->ops[i] == op) { return apis[a]; }
+    }
+  }
+  return (RapiApi*)0;
+}
+
+/// Adds a rule for an operation: after the caller is authenticated, `check` must
+/// return true or the answer is 403 with `why` as the detail. An operation can have
+/// several policies; all must pass. Policies are for startup: do not add them while
+/// requests are being served.
+///
+/// in:      op     the operation
+///          check  gets the request (r->subject, r->scopes, parameters, body)
+///          why    the detail of the 403 problem
+export fn rapi_policy(op: RapiOp*, check: fn(RapiReq*) -> bool, why: string) {
+  if (op == 0) { return; }
+  var api: RapiApi* = rapi__auth_api_of(op);
+  if (api != 0) { rapi__auth_state(api); }
+  if (g_rapi_pol == 0) {
+    g_rapi_pol = (RapiPolicy*)calloc((int64)RAPI_POLICIES_MAX, sizeof(RapiPolicy));
+  }
+  if (g_rapi_npol >= RAPI_POLICIES_MAX) {
+    if (api != 0) { rapi__set_error(api, "more than 256 policies"); }
+    return;
+  }
+  var p: RapiPolicy* = &g_rapi_pol[g_rapi_npol];
+  p->op = op;
+  p->check = check;
+  p->why = rz_str_dup(why);
+  g_rapi_npol = g_rapi_npol + 1;
+}

@@ -1,0 +1,486 @@
+// A small JSON parser (RFC 8259) that builds a tree in an arena.
+//
+// Used for service configs. Strings are unescaped to UTF-8, numbers are
+// float64 (integers up to 2^53 are exact), nesting is limited to 64
+// levels, and no input can make the parser read past the end of the text.
+// Bytes outside the escapes are not checked for UTF-8.
+import "std/mem";
+import "grpc/arena";
+
+export const GRPC_JSON_NULL = 0;
+export const GRPC_JSON_BOOL = 1;
+export const GRPC_JSON_NUMBER = 2;
+export const GRPC_JSON_STRING = 3;
+export const GRPC_JSON_ARRAY = 4;
+export const GRPC_JSON_OBJECT = 5;
+
+// One value. Arrays use items[0..count). Objects use keys[i] and items[i],
+// in document order (a repeated key keeps both entries).
+export struct GrpcJson {
+  kind: int32;
+  b: bool;
+  num: float64;
+  str: string;
+  items: GrpcJson*;
+  keys: string*;
+  count: int64;
+}
+
+const MAX_DEPTH: int32 = 64;
+
+struct JsonParser {
+  a: GrpcArena*;
+  s: string;
+  n: int64;
+  pos: int64;
+  failed: bool;
+  msg: string;
+  at: int64;
+}
+
+// Records the first error, at the current position.
+fn jp_fail(p: JsonParser*, msg: string) -> bool {
+  if (!p->failed) {
+    p->failed = true;
+    p->msg = msg;
+    p->at = p->pos;
+  }
+  return false;
+}
+
+// The byte at pos, or -1 at the end.
+fn jp_peek(p: JsonParser*) -> int32 {
+  if (p->pos >= p->n) { return -1; }
+  return (int32)p->s.chars[p->pos];
+}
+
+fn jp_skip_ws(p: JsonParser*) {
+  while (p->pos < p->n) {
+    var c: uint8 = p->s.chars[p->pos];
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      p->pos = p->pos + 1;
+    } else {
+      break;
+    }
+  }
+}
+
+fn jp_hex(c: uint8) -> int32 {
+  if (c >= 48 && c <= 57) { return (int32)c - 48; }
+  if (c >= 97 && c <= 102) { return (int32)c - 87; }
+  if (c >= 65 && c <= 70) { return (int32)c - 55; }
+  return -1;
+}
+
+// Four hex digits at s[i..i+4), or -1. The caller checks i + 4 <= n.
+fn jp_hex4(s: string, i: int64) -> int32 {
+  var v: int32 = 0;
+  for k in 0..4 {
+    var h: int32 = jp_hex(s.chars[i + k]);
+    if (h < 0) { return -1; }
+    v = v * 16 + h;
+  }
+  return v;
+}
+
+// The byte a one-letter escape stands for, or -1.
+fn jp_simple_escape(c: uint8) -> int32 {
+  if (c == 34) { return 34; }
+  if (c == 92) { return 92; }
+  if (c == 47) { return 47; }
+  if (c == 98) { return 8; }
+  if (c == 102) { return 12; }
+  if (c == 110) { return 10; }
+  if (c == 114) { return 13; }
+  if (c == 116) { return 9; }
+  return -1;
+}
+
+// Writes code point cp as UTF-8 at buf[o]; returns the new offset.
+fn jp_put_utf8(buf: uint8*, o: int64, cp: int32) -> int64 {
+  var at: int64 = o;
+  if (cp < 0x80) {
+    buf[at] = (uint8)cp;
+    return at + 1;
+  }
+  if (cp < 0x800) {
+    buf[at] = (uint8)(0xC0 | (cp >> 6));
+    buf[at + 1] = (uint8)(0x80 | (cp & 0x3F));
+    return at + 2;
+  }
+  if (cp < 0x10000) {
+    buf[at] = (uint8)(0xE0 | (cp >> 12));
+    buf[at + 1] = (uint8)(0x80 | ((cp >> 6) & 0x3F));
+    buf[at + 2] = (uint8)(0x80 | (cp & 0x3F));
+    return at + 3;
+  }
+  buf[at] = (uint8)(0xF0 | (cp >> 18));
+  buf[at + 1] = (uint8)(0x80 | ((cp >> 12) & 0x3F));
+  buf[at + 2] = (uint8)(0x80 | ((cp >> 6) & 0x3F));
+  buf[at + 3] = (uint8)(0x80 | (cp & 0x3F));
+  return at + 4;
+}
+
+// Parses the string at pos (on the opening quote) into out.
+fn jp_string(p: JsonParser*, out: string*) -> bool {
+  var start: int64 = p->pos + 1;
+  var end: int64 = -1;
+  var i: int64 = start;
+  // First find the closing quote; an escape hides the byte after it.
+  while (i < p->n) {
+    var c: uint8 = p->s.chars[i];
+    if (c == 34) {
+      end = i;
+      break;
+    }
+    if (c < 32) {
+      p->pos = i;
+      return jp_fail(p, "control character in string");
+    }
+    if (c == 92) { i = i + 2; } else { i = i + 1; }
+  }
+  if (end < 0) {
+    p->pos = p->n;
+    return jp_fail(p, "unterminated string");
+  }
+  // The result is never longer than the source text.
+  var buf: uint8* = (uint8*)grpc_arena_alloc(p->a, end - start + 1);
+  var o: int64 = 0;
+  i = start;
+  while (i < end) {
+    var c: uint8 = p->s.chars[i];
+    if (c != 92) {
+      buf[o] = c;
+      o = o + 1;
+      i = i + 1;
+    } else {
+      // i + 1 < end here: the scan above skipped the byte after a backslash.
+      var e: uint8 = p->s.chars[i + 1];
+      var simple: int32 = jp_simple_escape(e);
+      if (simple >= 0) {
+        buf[o] = (uint8)simple;
+        o = o + 1;
+        i = i + 2;
+      } else if (e == 117) {
+        if (i + 6 > end) {
+          p->pos = i;
+          return jp_fail(p, "bad \\u escape");
+        }
+        var cp: int32 = jp_hex4(p->s, i + 2);
+        if (cp < 0) {
+          p->pos = i;
+          return jp_fail(p, "bad \\u escape");
+        }
+        i = i + 6;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+          // A high surrogate must be followed by \u and a low one.
+          if (i + 6 > end || p->s.chars[i] != 92 || p->s.chars[i + 1] != 117) {
+            p->pos = i - 6;
+            return jp_fail(p, "lone surrogate");
+          }
+          var lo: int32 = jp_hex4(p->s, i + 2);
+          if (lo < 0xDC00 || lo > 0xDFFF) {
+            p->pos = i - 6;
+            return jp_fail(p, "lone surrogate");
+          }
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          i = i + 6;
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+          p->pos = i - 6;
+          return jp_fail(p, "lone surrogate");
+        }
+        o = jp_put_utf8(buf, o, cp);
+      } else {
+        p->pos = i;
+        return jp_fail(p, "bad escape");
+      }
+    }
+  }
+  out->chars = buf;
+  out->length = (uint64)o;
+  p->pos = end + 1;
+  return true;
+}
+
+const POW10: float64[23] = [
+  1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+  1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+];
+
+// Parses a number per the RFC grammar. The first 18 significant digits
+// are kept; the rest only move the exponent.
+fn jp_number(p: JsonParser*, out: GrpcJson*) -> bool {
+  var start: int64 = p->pos;
+  var neg: bool = false;
+  var mant: int64 = 0;
+  var nd: int32 = 0;
+  var e10: int64 = 0;
+  var c: int32 = jp_peek(p);
+  if (c == 45) {
+    neg = true;
+    p->pos = p->pos + 1;
+    c = jp_peek(p);
+  }
+  if (c == 48) {
+    p->pos = p->pos + 1;
+    c = jp_peek(p);
+  } else if (c >= 49 && c <= 57) {
+    while (c >= 48 && c <= 57) {
+      if (nd < 18) {
+        mant = mant * 10 + (int64)(c - 48);
+        if (mant != 0) { nd = nd + 1; }
+      } else {
+        e10 = e10 + 1;
+      }
+      p->pos = p->pos + 1;
+      c = jp_peek(p);
+    }
+  } else {
+    return jp_fail(p, "bad number");
+  }
+  if (c == 46) {
+    p->pos = p->pos + 1;
+    c = jp_peek(p);
+    if (c < 48 || c > 57) { return jp_fail(p, "bad number"); }
+    while (c >= 48 && c <= 57) {
+      if (nd < 18) {
+        mant = mant * 10 + (int64)(c - 48);
+        e10 = e10 - 1;
+        if (mant != 0) { nd = nd + 1; }
+      }
+      p->pos = p->pos + 1;
+      c = jp_peek(p);
+    }
+  }
+  if (c == 101 || c == 69) {
+    p->pos = p->pos + 1;
+    c = jp_peek(p);
+    var esign: int64 = 1;
+    if (c == 43 || c == 45) {
+      if (c == 45) { esign = -1; }
+      p->pos = p->pos + 1;
+      c = jp_peek(p);
+    }
+    if (c < 48 || c > 57) { return jp_fail(p, "bad number"); }
+    var ex: int64 = 0;
+    while (c >= 48 && c <= 57) {
+      if (ex < 100000) { ex = ex * 10 + (int64)(c - 48); }
+      p->pos = p->pos + 1;
+      c = jp_peek(p);
+    }
+    e10 = e10 + esign * ex;
+  }
+  var r: float64 = 0.0;
+  if (mant != 0) {
+    if ((int64)nd + e10 > 309) {
+      p->pos = start;
+      return jp_fail(p, "number out of range");
+    }
+    if ((int64)nd + e10 >= -340) {
+      r = (float64)mant;
+      var e: int64 = e10;
+      while (e > 22) {
+        r = r * 1e22;
+        e = e - 22;
+      }
+      if (e > 0) { r = r * POW10[e]; }
+      while (e < -22) {
+        r = r / 1e22;
+        e = e + 22;
+      }
+      if (e < 0) { r = r / POW10[-e]; }
+      if (r > 1.7976931348623157e308) {
+        p->pos = start;
+        return jp_fail(p, "number out of range");
+      }
+    }
+  }
+  if (neg) { r = -r; }
+  out->kind = GRPC_JSON_NUMBER;
+  out->num = r;
+  return true;
+}
+
+// Matches an exact word (true, false, null) at pos.
+fn jp_word(p: JsonParser*, w: string) -> bool {
+  var len: int64 = (int64)w.length;
+  if (p->pos + len > p->n) { return jp_fail(p, "bad literal"); }
+  for i in 0..len {
+    if (p->s.chars[p->pos + i] != w.chars[i]) { return jp_fail(p, "bad literal"); }
+  }
+  p->pos = p->pos + len;
+  return true;
+}
+
+fn jp_grow_items(a: GrpcArena*, buf: GrpcJson*, n: int64, cap: int64) -> GrpcJson* {
+  var ncap: int64 = 4;
+  if (cap > 0) { ncap = cap * 2; }
+  var nb: GrpcJson* = (GrpcJson*)grpc_arena_alloc_zeroed(a, ncap * sizeof(GrpcJson));
+  if (n > 0) { memcpy(nb, buf, n * sizeof(GrpcJson)); }
+  return nb;
+}
+
+fn jp_grow_keys(a: GrpcArena*, buf: string*, n: int64, cap: int64) -> string* {
+  var ncap: int64 = 4;
+  if (cap > 0) { ncap = cap * 2; }
+  var nb: string* = (string*)grpc_arena_alloc_zeroed(a, ncap * sizeof(string));
+  if (n > 0) { memcpy(nb, buf, n * sizeof(string)); }
+  return nb;
+}
+
+fn jp_array(p: JsonParser*, out: GrpcJson*, depth: int32) -> bool {
+  if (depth >= MAX_DEPTH) { return jp_fail(p, "nesting too deep"); }
+  p->pos = p->pos + 1;
+  var buf: GrpcJson* = (GrpcJson*)0;
+  var n: int64 = 0;
+  var cap: int64 = 0;
+  jp_skip_ws(p);
+  if (jp_peek(p) == 93) {
+    p->pos = p->pos + 1;
+  } else {
+    while (true) {
+      if (n == cap) {
+        buf = jp_grow_items(p->a, buf, n, cap);
+        if (cap == 0) { cap = 4; } else { cap = cap * 2; }
+      }
+      if (!jp_value(p, &buf[n], depth + 1)) { return false; }
+      n = n + 1;
+      jp_skip_ws(p);
+      var c: int32 = jp_peek(p);
+      if (c == 44) {
+        p->pos = p->pos + 1;
+      } else if (c == 93) {
+        p->pos = p->pos + 1;
+        break;
+      } else if (c < 0) {
+        return jp_fail(p, "unexpected end");
+      } else {
+        return jp_fail(p, "expected , or ]");
+      }
+    }
+  }
+  out->kind = GRPC_JSON_ARRAY;
+  out->items = buf;
+  out->count = n;
+  return true;
+}
+
+fn jp_object(p: JsonParser*, out: GrpcJson*, depth: int32) -> bool {
+  if (depth >= MAX_DEPTH) { return jp_fail(p, "nesting too deep"); }
+  p->pos = p->pos + 1;
+  var items: GrpcJson* = (GrpcJson*)0;
+  var keys: string* = (string*)0;
+  var n: int64 = 0;
+  var cap: int64 = 0;
+  jp_skip_ws(p);
+  if (jp_peek(p) == 125) {
+    p->pos = p->pos + 1;
+  } else {
+    while (true) {
+      jp_skip_ws(p);
+      var c: int32 = jp_peek(p);
+      if (c < 0) { return jp_fail(p, "unexpected end"); }
+      if (c != 34) { return jp_fail(p, "expected string key"); }
+      if (n == cap) {
+        items = jp_grow_items(p->a, items, n, cap);
+        keys = jp_grow_keys(p->a, keys, n, cap);
+        if (cap == 0) { cap = 4; } else { cap = cap * 2; }
+      }
+      if (!jp_string(p, &keys[n])) { return false; }
+      jp_skip_ws(p);
+      c = jp_peek(p);
+      if (c < 0) { return jp_fail(p, "unexpected end"); }
+      if (c != 58) { return jp_fail(p, "expected :"); }
+      p->pos = p->pos + 1;
+      if (!jp_value(p, &items[n], depth + 1)) { return false; }
+      n = n + 1;
+      jp_skip_ws(p);
+      c = jp_peek(p);
+      if (c == 44) {
+        p->pos = p->pos + 1;
+      } else if (c == 125) {
+        p->pos = p->pos + 1;
+        break;
+      } else if (c < 0) {
+        return jp_fail(p, "unexpected end");
+      } else {
+        return jp_fail(p, "expected , or }");
+      }
+    }
+  }
+  out->kind = GRPC_JSON_OBJECT;
+  out->items = items;
+  out->keys = keys;
+  out->count = n;
+  return true;
+}
+
+fn jp_value(p: JsonParser*, out: GrpcJson*, depth: int32) -> bool {
+  var zero: GrpcJson;
+  *out = zero;
+  jp_skip_ws(p);
+  var c: int32 = jp_peek(p);
+  if (c < 0) { return jp_fail(p, "unexpected end"); }
+  if (c == 123) { return jp_object(p, out, depth); }
+  if (c == 91) { return jp_array(p, out, depth); }
+  if (c == 34) {
+    out->kind = GRPC_JSON_STRING;
+    return jp_string(p, &out->str);
+  }
+  if (c == 45 || (c >= 48 && c <= 57)) { return jp_number(p, out); }
+  if (c == 116) {
+    out->kind = GRPC_JSON_BOOL;
+    out->b = true;
+    return jp_word(p, "true");
+  }
+  if (c == 102) {
+    out->kind = GRPC_JSON_BOOL;
+    return jp_word(p, "false");
+  }
+  if (c == 110) {
+    out->kind = GRPC_JSON_NULL;
+    return jp_word(p, "null");
+  }
+  return jp_fail(p, "unexpected character");
+}
+
+// The error text, "json: <what> at byte <offset>", copied into the arena.
+fn jp_error(p: JsonParser*) -> string {
+  var m: string = "json: {p->msg} at byte {p->at}";
+  var buf: uint8* = (uint8*)grpc_arena_alloc(p->a, (int64)m.length + 1);
+  memcpy(buf, m.chars, (int64)m.length);
+  var r: string;
+  r.chars = buf;
+  r.length = m.length;
+  free(m.chars);
+  return r;
+}
+
+// Parses text into a tree allocated from a. Returns "" and sets *out on
+// success; otherwise returns the error and sets *out to 0.
+export fn grpc_json_parse(a: GrpcArena*, text: string, out: GrpcJson**) -> string {
+  *out = (GrpcJson*)0;
+  var p: JsonParser;
+  p.a = a;
+  p.s = text;
+  p.n = (int64)text.length;
+  var root: GrpcJson* = (GrpcJson*)grpc_arena_alloc_zeroed(a, sizeof(GrpcJson));
+  if (!jp_value(&p, root, 0)) { return jp_error(&p); }
+  jp_skip_ws(&p);
+  if (p.pos != p.n) {
+    jp_fail(&p, "unexpected trailing data");
+    return jp_error(&p);
+  }
+  *out = root;
+  return "";
+}
+
+// The first value stored under key in an object, or 0 if o is 0, is not
+// an object, or has no such key.
+export fn grpc_json_get(o: GrpcJson*, key: string) -> GrpcJson* {
+  if (o == 0 || o->kind != GRPC_JSON_OBJECT) { return (GrpcJson*)0; }
+  for i in 0..o->count {
+    if (o->keys[i] == key) { return &o->items[i]; }
+  }
+  return (GrpcJson*)0;
+}

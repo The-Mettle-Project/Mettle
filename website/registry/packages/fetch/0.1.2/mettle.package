@@ -1,0 +1,9 @@
+name = fetch
+version = 0.1.2
+description = A high-level HTTP client for Mettle on top of std/http: connection pooling, redirects, cookies, gzip and deflate
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Fetch
+compiler = 0.18.0
+platforms = linux windows
+require = mtls 0.2.1
+require = press 0.1.0

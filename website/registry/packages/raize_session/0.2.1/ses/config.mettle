@@ -1,0 +1,155 @@
+// Configuration and the manager handle. Times are unix seconds and every
+// time-dependent call takes `now`, so tests and applications choose the
+// clock (inject a fixed time in tests; pass the wall clock in production).
+//
+// Defaults (ses_config_defaults), after OWASP's session management cheat
+// sheet:
+//   idle_timeout       1800   30 minutes without a request ends a session
+//   absolute_lifetime 28800   8 hours after login ends it regardless
+//   touch_interval       60   persist last_seen at most once a minute
+//   rotate_interval    3600   ses_needs_rotation true after an hour
+//   token_bytes          32   256 bits of randomness (minimum 32, max 64)
+// The secret keys start zeroed; ses_config_check refuses a zero key, so an
+// application cannot forget to set one.
+
+import "cryptex/cryptex";
+import "status";
+import "types";
+import "store";
+
+/// SesConfig: session policy and the server secret.
+/// Fields:
+///   idle_timeout       seconds without a touch before a session expires (> 0)
+///   absolute_lifetime  seconds after creation before it expires (>= idle_timeout)
+///   touch_interval     minimum seconds between persisted touches (0..idle_timeout-1)
+///   rotate_interval    seconds after which ses_needs_rotation says true (0 = never)
+///   token_bytes        random bytes per session token (32..64)
+///   key                current HMAC-SHA256 key for ses_sign (must not be all zero)
+///   prev_key           previous key, accepted by ses_verify while has_prev_key
+///   has_prev_key       true during a key rotation
+/// in: - (start from ses_config_defaults, then set key)
+/// returns: -
+/// owns: secret (key, prev_key): load them from your secret store; the
+///   manager keeps a copy that ses_close wipes; wipe your own copy too
+/// thread: plain value; no shared state
+/// example: var c: SesConfig; ses_config_defaults(&c); cr_random_bytes(&c.key.b[0], 32);
+export struct SesConfig {
+  idle_timeout: int64;
+  absolute_lifetime: int64;
+  touch_interval: int64;
+  rotate_interval: int64;
+  token_bytes: int64;
+  key: CrKey32;
+  prev_key: CrKey32;
+  has_prev_key: bool;
+}
+
+/// SesManager: the handle every session call takes: a checked copy of the
+/// config and the application's store.
+/// in: - (initialize with ses_init)
+/// returns: -
+/// owns: holds a copy of the secret keys (ses_close wipes them) and borrows
+///   the store: the store must outlive the manager
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: var m: SesManager; if (ses_init(&m, &cfg, &st) != SES_OK) { return 1; }
+export struct SesManager {
+  cfg: SesConfig;
+  store: SesStore*;
+  ready: bool;
+}
+
+/// Fills a config with the safe defaults listed at the top of config.mettle.
+/// The keys are zeroed: set cfg.key before ses_init.
+/// in: c, the config to fill
+/// returns: SES_OK; SES_E_ARG for a null c
+/// owns: nothing
+/// thread: any thread (no crypto call)
+/// example: var c: SesConfig; ses_config_defaults(&c);
+export fn ses_config_defaults(c: SesConfig*) -> int32 {
+  if (c == 0) { return SES_E_ARG; }
+  c->idle_timeout = 1800;
+  c->absolute_lifetime = 28800;
+  c->touch_interval = 60;
+  c->rotate_interval = 3600;
+  c->token_bytes = 32;
+  for i in 0..32 {
+    c->key.b[i] = 0;
+    c->prev_key.b[i] = 0;
+  }
+  c->has_prev_key = false;
+  return SES_OK;
+}
+
+fn ses_cfg_key_zero(k: CrKey32*) -> bool {
+  var acc: int32 = 0;
+  for i in 0..32 {
+    acc = acc | (int32)k->b[i];
+  }
+  return acc == 0;
+}
+
+/// Checks a config for unsafe or inconsistent values.
+/// in: c, a config
+/// returns: SES_OK, or SES_E_CONFIG when: idle_timeout <= 0;
+///   absolute_lifetime < idle_timeout; touch_interval < 0 or
+///   >= idle_timeout; rotate_interval < 0; token_bytes outside 32..64;
+///   key all zero; has_prev_key with prev_key all zero or equal to key.
+///   SES_E_ARG for a null c
+/// owns: nothing
+/// thread: any thread (no crypto call; the key test reads every byte)
+/// example: if (ses_config_check(&c) != SES_OK) { return 1; }
+export fn ses_config_check(c: SesConfig*) -> int32 {
+  if (c == 0) { return SES_E_ARG; }
+  if (c->idle_timeout <= 0) { return SES_E_CONFIG; }
+  if (c->absolute_lifetime < c->idle_timeout) { return SES_E_CONFIG; }
+  if (c->touch_interval < 0 || c->touch_interval >= c->idle_timeout) { return SES_E_CONFIG; }
+  if (c->rotate_interval < 0) { return SES_E_CONFIG; }
+  if (c->token_bytes < 32 || c->token_bytes > 64) { return SES_E_CONFIG; }
+  if (ses_cfg_key_zero(&c->key)) { return SES_E_CONFIG; }
+  if (c->has_prev_key) {
+    if (ses_cfg_key_zero(&c->prev_key)) { return SES_E_CONFIG; }
+    var same: int32 = 0;
+    for i in 0..32 {
+      same = same | ((int32)c->key.b[i] ^ (int32)c->prev_key.b[i]);
+    }
+    if (same == 0) { return SES_E_CONFIG; }
+  }
+  return SES_OK;
+}
+
+/// Initializes a manager: checks the config, copies it, checks the store
+/// and initializes the crypto library.
+/// in: m, the manager to fill; c, a config; st, a complete SesStore
+/// returns: SES_OK; SES_E_ARG (null pointer, incomplete store);
+///   SES_E_CONFIG (see ses_config_check); SES_E_CRYPTO (cr_init failed).
+///   On error m is not usable
+/// owns: m copies *c (including the keys); m borrows st, which must outlive m
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: var m: SesManager; if (ses_init(&m, &cfg, &st) != SES_OK) { return 1; }
+export fn ses_init(m: SesManager*, c: SesConfig*, st: SesStore*) -> int32 {
+  if (m == 0 || c == 0) { return SES_E_ARG; }
+  m->ready = false;
+  if (!ses_store_complete(st)) { return SES_E_ARG; }
+  var rc: int32 = ses_config_check(c);
+  if (rc != SES_OK) { return rc; }
+  if (cr_init() != CR_OK) { return SES_E_CRYPTO; }
+  m->cfg = *c;
+  m->store = st;
+  m->ready = true;
+  return SES_OK;
+}
+
+/// Wipes the manager's copy of the keys and marks it unusable.
+/// in: m, a manager (0 is ignored)
+/// returns: nothing
+/// owns: the store is not touched (it stays the application's)
+/// thread: any thread (pure Mettle crypto, cryptex 0.2.0)
+/// example: defer ses_close(&m);
+export fn ses_close(m: SesManager*) {
+  if (m == 0) { return; }
+  cr_wipe(&m->cfg.key.b[0], 32);
+  cr_wipe(&m->cfg.prev_key.b[0], 32);
+  m->cfg.has_prev_key = false;
+  m->store = 0;
+  m->ready = false;
+}

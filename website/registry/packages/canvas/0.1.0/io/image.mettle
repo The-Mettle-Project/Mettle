@@ -1,0 +1,98 @@
+// Pixmaps to and from image files, through Etch. Files hold straight
+// (not premultiplied) RGBA; pixmaps hold premultiplied pixels.
+
+import "etch/etch";
+import "../core/base";
+import "../core/pixmap";
+
+fn etch_rc(rc: int32) -> int32 {
+  if (rc == ETCH_OK) { return CANVAS_OK; }
+  if (rc == ETCH_E_MEM) { return CANVAS_E_MEM; }
+  if (rc == ETCH_E_IO) { return CANVAS_E_IO; }
+  if (rc == ETCH_E_LIMIT) { return CANVAS_E_LIMIT; }
+  if (rc == ETCH_E_ARG) { return CANVAS_E_ARG; }
+  return CANVAS_E_PARSE;
+}
+
+/// A new straight-alpha RGBA8 EtchImage of the pixmap (free it with
+/// etch_image_free).
+export fn canvas_pixmap_to_image(pm: CanvasPixmap*, img: EtchImage*) -> int32 {
+  if (pm == 0 || pm->data == 0) { return CANVAS_E_ARG; }
+  var rc: int32 = etch_image_new(img, pm->width, pm->height, ETCH_RGBA8);
+  if (rc != ETCH_OK) { return etch_rc(rc); }
+  for y in 0..pm->height {
+    var s: uint32* = canvas_pixmap_row(pm, y);
+    var d: uint8* = img->data + (int64)y * img->stride;
+    for x in 0..pm->width {
+      var p: uint32 = s[x];
+      var r: uint32 = p & 255;
+      var g: uint32 = (p >> 8) & 255;
+      var b: uint32 = (p >> 16) & 255;
+      var a: uint32 = p >> 24;
+      if (pm->order == CANVAS_BGRA) { var t: uint32 = r; r = b; b = t; }
+      if (a != 0 && a != 255) {
+        r = (r * 255 + a / 2) / a; if (r > 255) { r = 255; }
+        g = (g * 255 + a / 2) / a; if (g > 255) { g = 255; }
+        b = (b * 255 + a / 2) / a; if (b > 255) { b = 255; }
+      } else if (a == 0) { r = 0; g = 0; b = 0; }
+      var o: int64 = (int64)x * 4;
+      d[o] = (uint8)r; d[o + 1] = (uint8)g; d[o + 2] = (uint8)b; d[o + 3] = (uint8)a;
+    }
+  }
+  return CANVAS_OK;
+}
+
+/// A new pixmap from an Etch image of any format.
+export fn canvas_pixmap_from_image(img: EtchImage*, pm: CanvasPixmap*) -> int32 {
+  if (img == 0 || img->data == 0) { return CANVAS_E_ARG; }
+  var c: EtchImage;
+  var rc: int32 = etch_convert(img, ETCH_RGBA8, &c);
+  if (rc != ETCH_OK) { return etch_rc(rc); }
+  rc = canvas_pixmap_new(pm, c.width, c.height);
+  if (rc != CANVAS_OK) { etch_image_free(&c); return rc; }
+  for y in 0..c.height {
+    var s: uint8* = c.data + (int64)y * c.stride;
+    var d: uint32* = canvas_pixmap_row(pm, y);
+    for x in 0..c.width {
+      var o: int64 = (int64)x * 4;
+      var a: uint32 = (uint32)s[o + 3];
+      var r: uint32 = canvas_div255((uint32)s[o] * a);
+      var g: uint32 = canvas_div255((uint32)s[o + 1] * a);
+      var b: uint32 = canvas_div255((uint32)s[o + 2] * a);
+      d[x] = r | (g << 8) | (b << 16) | (a << 24);
+    }
+  }
+  etch_image_free(&c);
+  return CANVAS_OK;
+}
+
+/// Saves the pixmap; the format comes from the file name (.png, .qoi,
+/// .bmp, .tga, .jpg ...).
+export fn canvas_pixmap_save(pm: CanvasPixmap*, path: string) -> int32 {
+  var img: EtchImage;
+  var rc: int32 = canvas_pixmap_to_image(pm, &img);
+  if (rc != CANVAS_OK) { return rc; }
+  rc = etch_rc(etch_save(path, &img));
+  etch_image_free(&img);
+  return rc;
+}
+
+/// PNG bytes of the pixmap, written into buf (free with etch_buf_free).
+export fn canvas_pixmap_encode_png(pm: CanvasPixmap*, buf: EtchBuf*) -> int32 {
+  var img: EtchImage;
+  var rc: int32 = canvas_pixmap_to_image(pm, &img);
+  if (rc != CANVAS_OK) { return rc; }
+  rc = etch_rc(etch_encode(&img, ETCH_FMT_PNG, buf));
+  etch_image_free(&img);
+  return rc;
+}
+
+/// Loads an image file into a new pixmap.
+export fn canvas_pixmap_load(pm: CanvasPixmap*, path: string) -> int32 {
+  var img: EtchImage;
+  var rc: int32 = etch_load(path, &img, (EtchOpts*)0);
+  if (rc != ETCH_OK) { return etch_rc(rc); }
+  rc = canvas_pixmap_from_image(&img, pm);
+  etch_image_free(&img);
+  return rc;
+}

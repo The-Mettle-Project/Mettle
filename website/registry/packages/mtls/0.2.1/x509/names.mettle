@@ -1,0 +1,270 @@
+// Host names: matching a host against a certificate's subjectAltName (RFC
+// 6125 style, SAN only, the subject CN is ignored) and checking dNSName
+// name constraints (RFC 5280 4.2.1.10).
+
+import "std/mem";
+import "mtls/core/bytes";
+import "mtls/x509/der";
+import "mtls/x509/cert";
+
+fn mtls_x_lower(c: int32) -> int32 {
+  if (c >= 65 && c <= 90) { return c + 32; }
+  return c;
+}
+
+// Equal ignoring ASCII case.
+fn mtls_x_eq_nocase(a: uint8*, an: int64, b: uint8*, bn: int64) -> bool {
+  if (an != bn) { return false; }
+  for i in 0..an {
+    if (mtls_x_lower((int32)a[i]) != mtls_x_lower((int32)b[i])) { return false; }
+  }
+  return true;
+}
+
+fn mtls_x_hexval(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return -1;
+}
+
+// Dotted quad with no leading zeros and nothing else.
+fn mtls_x_ip4(p: uint8*, n: int64, out: uint8*) -> bool {
+  var part: int32 = 0;
+  var val: int32 = 0;
+  var digits: int32 = 0;
+  for i in 0..n {
+    var c: int32 = (int32)p[i];
+    if (c >= 48 && c <= 57) {
+      if (digits > 0 && val == 0) { return false; }
+      val = val * 10 + (c - 48);
+      digits = digits + 1;
+      if (digits > 3 || val > 255) { return false; }
+    } else if (c == 46) {
+      if (digits == 0 || part >= 3) { return false; }
+      out[part] = (uint8)val;
+      part = part + 1;
+      val = 0;
+      digits = 0;
+    } else {
+      return false;
+    }
+  }
+  if (digits == 0 || part != 3) { return false; }
+  out[3] = (uint8)val;
+  return true;
+}
+
+fn mtls_x_ip6(p: uint8*, n: int64, out: uint8*) -> bool {
+  var groups: int32[8];
+  var ng: int32 = 0;
+  var gap: int32 = -1;
+  var i: int64 = 0;
+  if (n < 2) { return false; }
+  if (p[0] == (uint8)58) {
+    if (p[1] != (uint8)58) { return false; }
+    gap = 0;
+    i = 2;
+  }
+  while (i < n) {
+    var start: int64 = i;
+    var dotted: bool = false;
+    while (i < n && p[i] != (uint8)58) {
+      if (p[i] == (uint8)46) { dotted = true; }
+      i = i + 1;
+    }
+    if (i == start) { return false; }
+    if (dotted) {
+      if (i != n || ng > 6) { return false; }
+      var q: uint8[4];
+      if (!mtls_x_ip4(p + start, i - start, &q[0])) { return false; }
+      groups[ng] = ((int32)q[0] << 8) | (int32)q[1];
+      groups[ng + 1] = ((int32)q[2] << 8) | (int32)q[3];
+      ng = ng + 2;
+    } else {
+      if (i - start > 4 || ng >= 8) { return false; }
+      var v: int32 = 0;
+      for j in start..i {
+        var h: int32 = mtls_x_hexval((int32)p[j]);
+        if (h < 0) { return false; }
+        v = v * 16 + h;
+      }
+      groups[ng] = v;
+      ng = ng + 1;
+    }
+    if (i == n) { break; }
+    i = i + 1;   // the ':'
+    if (i < n && p[i] == (uint8)58) {
+      if (gap >= 0) { return false; }
+      gap = ng;
+      i = i + 1;
+    } else if (i == n) {
+      return false;
+    }
+  }
+  if (gap < 0 && ng != 8) { return false; }
+  if (gap >= 0 && ng > 7) { return false; }
+  var o: int32 = 0;
+  var skip: int32 = 8 - ng;
+  for g in 0..8 {
+    var idx: int32 = g;
+    var zero: bool = false;
+    if (gap >= 0 && g >= gap && g < gap + skip) { zero = true; }
+    if (gap >= 0 && g >= gap + skip) { idx = g - skip; }
+    var val: int32 = 0;
+    if (!zero) { val = groups[idx]; }
+    out[o] = (uint8)((val >> 8) & 255);
+    out[o + 1] = (uint8)(val & 255);
+    o = o + 2;
+  }
+  return true;
+}
+
+/// mtls_host_ip: parses an IPv4 or IPv6 literal (IPv6 may be in [brackets])
+/// into out (4 or 16 bytes, so give it 16) and returns its length, or 0
+/// when host is not an IP literal.
+export fn mtls_host_ip(host: string, out: uint8*) -> int32 {
+  var p: uint8* = host.chars;
+  var n: int64 = (int64)host.length;
+  if (n >= 2 && p[0] == (uint8)91 && p[n - 1] == (uint8)93) {
+    if (mtls_x_ip6(p + 1, n - 2, out)) { return 16; }
+    return 0;
+  }
+  if (mtls_x_ip4(p, n, out)) { return 4; }
+  if (mtls_x_ip6(p, n, out)) { return 16; }
+  return 0;
+}
+
+// A usable DNS host: letters, digits, '-', '_' and dots, no empty label.
+fn mtls_x_valid_host(p: uint8*, n: int64) -> bool {
+  if (n < 1 || n > 253) { return false; }
+  var label: int64 = 0;
+  for i in 0..n {
+    var c: int32 = (int32)p[i];
+    if (c == 46) {
+      if (label == 0) { return false; }
+      label = 0;
+    } else {
+      var ok: bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 95;
+      if (!ok) { return false; }
+      label = label + 1;
+      if (label > 63) { return false; }
+    }
+  }
+  return label > 0;
+}
+
+/// mtls_host_match_dns: whether a dNSName pattern from a certificate covers
+/// host. Case-insensitive. A wildcard counts only as the whole leftmost
+/// label ("*.example.com"), matches exactly one non-empty label, and needs
+/// at least two labels after the star.
+export fn mtls_host_match_dns(pat: uint8*, pn: int64, host: string) -> bool {
+  var hp: uint8* = host.chars;
+  var hn: int64 = (int64)host.length;
+  if (hn > 1 && hp[hn - 1] == (uint8)46) { hn = hn - 1; }   // "example.com."
+  if (!mtls_x_valid_host(hp, hn)) { return false; }
+  if (pn < 1 || pat[pn - 1] == (uint8)46) { return false; }
+  if (pat[0] == (uint8)42) {
+    if (pn < 4 || pat[1] != (uint8)46) { return false; }
+    var rest: uint8* = pat + 2;
+    var rn: int64 = pn - 2;
+    var dots: int32 = 0;
+    for i in 0..rn {
+      if (rest[i] == (uint8)42) { return false; }
+      if (rest[i] == (uint8)46) { dots = dots + 1; }
+    }
+    if (dots < 1) { return false; }
+    // The first label of host, then the rest must equal.
+    var k: int64 = 0;
+    while (k < hn && hp[k] != (uint8)46) { k = k + 1; }
+    if (k == 0 || k >= hn) { return false; }
+    return mtls_x_eq_nocase(hp + k + 1, hn - k - 1, rest, rn);
+  }
+  for i in 0..pn {
+    if (pat[i] == (uint8)42) { return false; }
+  }
+  return mtls_x_eq_nocase(pat, pn, hp, hn);
+}
+
+/// mtls_cert_match_host: true if host is covered by c's subjectAltName. An
+/// IP literal matches only iPAddress entries; any other host only dNSName
+/// entries. The subject CN is never looked at. Empty host: false.
+export fn mtls_cert_match_host(c: MtlsCert*, host: string) -> bool {
+  if (host.length == (uint64)0 || !c->has_san) { return false; }
+  var ip: uint8[16];
+  var iplen: int32 = mtls_host_ip(host, &ip[0]);
+  var r: MtlsRd = mtls_rd(c->san, c->sanlen);
+  var kind: int32 = 0;
+  var p: uint8* = 0;
+  var n: int64 = 0;
+  while (mtls_cert_san_next(&r, &kind, &p, &n)) {
+    if (iplen > 0) {
+      if (kind == MTLS_SAN_IP && n == (int64)iplen && memcmp(p, &ip[0], n) == 0) { return true; }
+    } else if (kind == MTLS_SAN_DNS) {
+      if (mtls_host_match_dns(p, n, host)) { return true; }
+    }
+  }
+  return false;
+}
+
+/// mtls_dns_in_subtree: whether the DNS name is inside a dNSName constraint.
+/// "example.com" covers itself and every subdomain, ".example.com" only the
+/// subdomains, and an empty constraint covers everything.
+export fn mtls_dns_in_subtree(name: uint8*, nn: int64, cons: uint8*, cn: int64) -> bool {
+  if (cn == 0) { return true; }
+  if (cons[0] == (uint8)46) {
+    if (nn <= cn) { return false; }
+    return mtls_x_eq_nocase(name + (nn - cn), cn, cons, cn);
+  }
+  if (mtls_x_eq_nocase(name, nn, cons, cn)) { return true; }
+  if (nn <= cn) { return false; }
+  if (name[nn - cn - 1] != (uint8)46) { return false; }
+  return mtls_x_eq_nocase(name + (nn - cn), cn, cons, cn);
+}
+
+// Is the name allowed by one list of subtrees? For the permitted list some
+// dNSName subtree must cover the name (if it has any); for the excluded list
+// none may.
+fn mtls_x_nc_list(list: uint8*, ln: int64, name: uint8*, nn: int64, wildcard: bool, permitted: bool) -> bool {
+  var r: MtlsRd = mtls_rd(list, ln);
+  var dns_subtrees: int32 = 0;
+  var hit: bool = false;
+  while (mtls_rd_left(&r) > 0) {
+    var st: MtlsRd;
+    var base: MtlsDerTlv;
+    if (!mtls_der_seq(&r, &st) || !mtls_der_tlv(&st, &base)) { return false; }
+    if (base.tag != 0x82) { continue; }
+    dns_subtrees = dns_subtrees + 1;
+    if (mtls_dns_in_subtree(name, nn, base.body, base.bodylen)) { hit = true; }
+    // "*.x" also stands for names below x, so an excluded subtree that
+    // lies inside x is touched too.
+    if (wildcard && !permitted && mtls_dns_in_subtree(base.body, base.bodylen, name, nn)) { hit = true; }
+  }
+  if (r.bad) { return false; }
+  if (permitted) { return dns_subtrees == 0 || hit; }
+  return !hit;
+}
+
+/// mtls_nc_check: checks the dNSName entries of cert against the name
+/// constraints of ca. True when they all pass (or ca has none).
+export fn mtls_nc_check(ca: MtlsCert*, cert: MtlsCert*) -> bool {
+  if (!ca->has_nc || !cert->has_san) { return true; }
+  var r: MtlsRd = mtls_rd(cert->san, cert->sanlen);
+  var kind: int32 = 0;
+  var p: uint8* = 0;
+  var n: int64 = 0;
+  while (mtls_cert_san_next(&r, &kind, &p, &n)) {
+    if (kind != MTLS_SAN_DNS) { continue; }
+    var name: uint8* = p;
+    var nn: int64 = n;
+    var wild: bool = false;
+    if (nn > 2 && name[0] == (uint8)42 && name[1] == (uint8)46) {
+      wild = true;
+      name = name + 2;
+      nn = nn - 2;
+    }
+    if (ca->nc_permlen > 0 && !mtls_x_nc_list(ca->nc_perm, ca->nc_permlen, name, nn, wild, true)) { return false; }
+    if (ca->nc_excllen > 0 && !mtls_x_nc_list(ca->nc_excl, ca->nc_excllen, name, nn, wild, false)) { return false; }
+  }
+  return true;
+}

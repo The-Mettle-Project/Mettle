@@ -1,0 +1,254 @@
+// raize/app/run — rz_run: record the declarations, resolve config, derive the wiring, serve.
+// reference: app
+// thread: rz_run runs on the main thread; it starts the hub and the server workers.
+//
+// Exit codes are a contract: 0 after a clean stop (SIGTERM or SIGINT), 1 for any
+// declaration, configuration or startup error (all printed, nothing served), 2 when
+// the port cannot be bound (nothing printed as "listening").
+
+import "std/io";
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/context";
+import "raize_core/config/config";
+import "raize_core/router/router";
+import "raize_core/server/server";
+import "raize_core/server/signals";
+import "raize_core/context/peer";
+import "raize_core/middleware/chain";
+import "raize_core/middleware/recover";
+import "raize_realtime/hub/hub";
+import "raize_realtime/channel/channel";
+import "raize_signal/signal";
+import "types";
+import "declare";
+import "web";
+import "use";
+import "timer";
+
+// Request bodies above this are answered 413 (the config's max_body_bytes).
+var g_max_body: int64 = 0;
+
+// The value after `--port` on the command line ("" when absent), copied. Mettle has no
+// argv on this path, so it is read from /proc/self/cmdline (as the examples did).
+fn rz__argv_port(found: bool*) -> string {
+  *found = false;
+  var fp: cstring = fopen("/proc/self/cmdline", "rb");
+  if (fp == 0) { return rz_str_empty(); }
+  var buf: uint8[2048];
+  var n: int64 = fread((cstring)&buf[0], 1, 2048, fp);
+  fclose(fp);
+  var start: int64 = 0;
+  var want: bool = false;
+  for i in 0..n {
+    if (buf[i] == 0) {
+      var a: string = rz_str_view(&buf[start], i - start);
+      if (want) { *found = true; return rz_str_dup(a); }
+      want = rz_str_eq(a, "--port");
+      start = i + 1;
+    }
+  }
+  *found = want;
+  return rz_str_empty();
+}
+
+fn rz__config_errors(app: RzApp*, e: RzConfigErrors*, fix: string) {
+  for i in 0..rz_config_error_count(e) {
+    rz__app_error(app, "{rz_config_error_text(e, (int32)i)} — {fix}");
+  }
+  rz_config_errors_reset(e);
+}
+
+// framework defaults < rz_default < RAIZE_* < --port, then validate and freeze.
+// Operators always win over the code (D2); every bad value is reported, per layer.
+fn rz__app_config(app: RzApp*) {
+  var e: RzConfigErrors;
+  rz_config_errors_reset(&e);
+  var c: RzConfig* = &app->state->config;
+  for i in 0..app->state->ndefaults {
+    var d: Rz_Default* = &app->state->defaults[i];
+    rz_config_apply(c, "rz_default(\"{d->key}\")", d->key, d->value, &e);
+  }
+  rz__config_errors(app, &e, "fix the rz_default call in the declaration function");
+  rz_config_from_env(c, &e);
+  rz__config_errors(app, &e, "set the variable to an allowed value or unset it");
+  var found: bool = false;
+  var port: string = rz__argv_port(&found);
+  if (found) {
+    rz_config_apply(c, "--port", "port", port, &e);
+    rz_str_free(port);
+  }
+  rz__config_errors(app, &e, "pass --port N with N in 1..65535");
+  rz_config_validate(c, &e);
+  rz__config_errors(app, &e, "fix that setting");
+  rz_config_freeze(c);
+  g_max_body = rz_config_max_body(c);
+}
+
+// The chain's terminal: body cap, then guards, then the router.
+fn rz__app_terminal(ctx: RzContext*) -> int32 {
+  if (g_max_body > 0 && ctx->req != 0 && ctx->req->body_len > g_max_body) {
+    return rz_ctx_text(ctx, 413, "payload too large\n");
+  }
+  var rc: int32 = rz__app_run_guards(ctx, ctx->req->path);
+  if (rc != RZ_OK) { return rc; }
+  return rz_router_handle(rz__app_current()->state->router, ctx);
+}
+
+fn rz__app_socket(ctx: RzContext*) -> int32 {
+  return rz_chan_upgrade(ctx, rz__app_current()->state->chans);
+}
+
+// GET /signal/websocket?path=<page> (DECISIONS F5): the page's guards run here, so a
+// 2-arg mount sees the user they set, and the socket may join only that page's Signal.
+fn rz__app_signal_socket(ctx: RzContext*) -> int32 {
+  var path: string = rz_path_normalize(rz_ctx_query(ctx, "path"), ctx->arena);
+  if (path.length == 0) {
+    return rz_ctx_text(ctx, 400, "signal socket: pass ?path=<page path> (signal.js does)\n");
+  }
+  var rc: int32 = rz__app_run_guards(ctx, path);
+  if (rc != RZ_OK) { return rc; }
+  return rz__chan_upgrade_at(ctx, rz__app_current()->state->chans, path);
+}
+
+// Each rz_channel declaration onto the channel router, and /socket/websocket for them.
+fn rz__derive_channels(app: RzApp*) {
+  var st: Rz_AppState* = app->state;
+  var n: int32 = 0;
+  var decls: Rz_ChannelDecl* = rz__app_channels(app, &n);
+  for i in 0..n {
+    var d: Rz_ChannelDecl* = &decls[i];
+    if (rz_chan_define(st->chans, d->pattern, d->join, d->handle_in, d->leave) != 0) {
+      rz__app_error(app, "rz_channel(\"{d->pattern}\"): cannot register the channel — declare at most {RZ_CHAN_MAX_DEFS} channels and Signals together");
+    }
+  }
+  rz_get(app, "/socket/websocket", &rz__app_socket);
+}
+
+// Hub and channel router when a Signal or a channel is declared; then the Signal
+// routes and the channel socket. An rz_channel declaration is never left unwired:
+// a hub that cannot start is a startup error (exit 1, nothing served).
+fn rz__derive_sockets(app: RzApp*) {
+  var st: Rz_AppState* = app->state;
+  if (st->nsignals == 0 && st->nchannels == 0) { return; }
+  st->hub = rz_hub_new(rz_hub_opts_default());
+  if (st->hub == 0 || rz_hub_start(st->hub) != 0) {
+    rz__app_error(app, "cannot start the socket hub for the declared Signals and channels — check the process limits on threads and file descriptors");
+    return;
+  }
+  st->chans = rz_chan_router_new(st->hub, 0);
+  if (st->chans == 0) { rz__app_error(app, "out of memory making the channel router — lower the load or add memory"); return; }
+  for i in 0..st->nsignals {
+    var m: Rz_SignalMount* = &st->signals[i];
+    if (rz__signal_define(st->chans, m->name, m->path, m->size, m->mount, m->handle, m->view, m->leave) != 0) {
+      rz__app_error(app, "{m->name}_signal: cannot register the Signal — mount fewer than 32 Signals, each once");
+    }
+  }
+  if (st->nsignals > 0) {
+    rz_get(app, "/signal/websocket", &rz__app_signal_socket);
+    rz_get(app, "/rz/signal.js", &rz_signal_js);
+  }
+  if (st->nchannels > 0) { rz__derive_channels(app); }
+}
+
+// Static dirs, Signals, router, chain and server; every failure is recorded.
+fn rz__app_derive(app: RzApp*) {
+  var st: Rz_AppState* = app->state;
+  rz__app_derive_statics(app);
+  rz__derive_sockets(app);
+  var ip: uint32 = 0;
+  if (rz__ipv4_parse(rz_config_trusted_proxy(&st->config), &ip)) { rz__peer_set_trusted(ip); }
+  st->router = rz_router_new();
+  if (st->router == 0) { rz__app_error(app, "out of memory making the router — add memory"); return; }
+  for i in 0..st->nroutes {
+    var r: Rz_Route* = &st->routes[i];
+    var rc: int32 = rz_router_add(st->router, r->verb, r->path, r->handler);
+    if (rc != RZ_OK) {
+      rz__app_error(app, "route {r->verb} {r->path}: {rz_router_strerror(rc)} — fix the pattern or remove the duplicate");
+    }
+  }
+  rz__app_build_chain(app, &rz__app_terminal);
+  if (st->chain == 0) { return; }
+  var opts: RzServerOpts = rz_server_opts_default();
+  rz_config_to_opts(&st->config, &opts);
+  st->server = rz_server_new(opts);
+  if (st->server == 0 || rz_server_set_handler(st->server, rz_chain_handler(st->chain)) != 0) {
+    rz__app_error(app, "cannot make the server — check the workers and buffer settings");
+  }
+}
+
+fn rz__app_report(app: RzApp*) -> bool {
+  var st: Rz_AppState* = app->state;
+  for i in 0..st->errors->len { println("{st->name}: {st->errors->items[i]}"); }
+  return st->errors->len > 0;
+}
+
+fn rz__bind_reason(err: int32) -> string {
+  if (err == 98) { return "address in use"; }
+  if (err == 13) { return "permission denied"; }
+  return "error {err}";
+}
+
+// Bound and announced: run the timers and the signal watcher around the workers.
+// Returns 0 after a clean stop, 1 when a thread could not be started.
+fn rz__app_serve(app: RzApp*) -> int32 {
+  var st: Rz_AppState* = app->state;
+  var timers: int64 = rz__timers_start(app);
+  var watch: Rz_SigWatch;
+  watch.srv = st->server;
+  watch.done = 0;
+  watch.got = 0;
+  var wh: int64 = rz__signals_watch(&watch);
+  var rc: int32 = 0;
+  if (timers < 0 || wh == 0) {
+    println("{st->name}: cannot start the timer or signal thread — raise the process thread limit");
+    rc = 1;
+  } else if (rz_server_serve(st->server) != 0) {
+    println("{st->name}: cannot start the worker threads — lower RAIZE_WORKERS or raise the thread limit");
+    rc = 1;
+  }
+  rz_server_stop(st->server);
+  rz__signals_watch_end(&watch, wh);
+  rz__timers_stop(app, timers);
+  return rc;
+}
+
+/// Runs an app: calls `declare` to record what the app is, resolves configuration
+/// (framework defaults < rz_default < RAIZE_* < --port N), reports every mistake at
+/// once as `<name>: <what> — <fix>`, derives the static mounts, hub, channel
+/// router, Signal routes, the channel socket GET /socket/websocket (when any
+/// rz_channel is declared), JSON APIs and the chain (recover, rz_use* in order, body
+/// cap, guards, router), binds, prints `<name>: listening on 127.0.0.1:<port>`,
+/// starts the timers and serves until SIGTERM or SIGINT.
+///
+/// in:      name     the program name; prefixes every message ("slice: ...")
+///          declare  the declaration function; runs once, on this thread
+/// returns: 0 after a clean stop (SIGTERM/SIGINT); 1 when a declaration, config or
+///          startup error was printed; 2 when the port cannot be bound
+/// owns:    the app and everything made through it are freed before returning
+/// thread:  main only, once per process; SIGTERM and SIGINT are blocked in every
+///          thread and taken by a watcher thread (so they always mean "stop")
+/// example:
+///   fn main() -> int32 { return rz_run("slice", &slice_app); }
+export fn rz_run(name: string, declare: fn(RzApp*) -> void) -> int32 {
+  rz__signals_block();
+  var app: RzApp* = rz__app_new(name);
+  if (app == 0) { println("{name}: out of memory at startup — add memory"); return 1; }
+  rz__app_set_current(app);
+  declare(app);
+  rz__app_config(app);
+  if (app->state->errors->len == 0) { rz__app_derive(app); }
+  if (rz__app_report(app)) { rz__app_free(app); return 1; }
+  var srv: RzServer* = app->state->server;
+  var port: int32 = rz_config_port(&app->state->config);
+  if (rz_server_bind(srv) != 0) {
+    println("{name}: cannot listen on :{port} ({rz__bind_reason(rz_server_last_error(srv))}) — stop the other process or pass --port N");
+    rz__app_free(app);
+    return 2;
+  }
+  println("{name}: listening on 127.0.0.1:{port}");
+  var rc: int32 = rz__app_serve(app);
+  rz__app_free(app);
+  return rc;
+}

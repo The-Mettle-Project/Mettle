@@ -1,0 +1,261 @@
+// raize_api/rest: REST operations for a raize resource.
+//
+//   rapi_group(api, "/v1");
+//   rapi_resource(api, "/tasks", task_resource(), dl);
+//
+// gives, for the actions the resource declares (@read, @create, @update,
+// @destroy, @action):
+//
+//   GET    /v1/tasks           200 page (limit, offset, sort, filter, fields)
+//   GET    /v1/tasks/:id       200 record, 404
+//   POST   /v1/tasks           201 record + Location, 422
+//   PATCH  /v1/tasks/:id       200 record, 404, 422 (absent members keep their values)
+//   DELETE /v1/tasks/:id       204, 404
+//   POST   /v1/tasks/:id/name  200 record, 404, 422
+//
+// Bodies are decoded straight into the resource's record layout, and the
+// resource's own checks (@required, @min_length, @max_length) run in raize; their
+// messages come back as problem details with a JSON Pointer per field. The schemas
+// in the OpenAPI document are <Type>, <Type>Create and <Type>Update.
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_resource/resource";
+import "../types/type";
+import "../problem/problem";
+import "../route/api";
+import "../route/request";
+import "../route/respond";
+import "../query/query";
+
+/// The REST face of one resource.
+export struct RapiResource {
+  api: RapiApi*;
+  def: RzResourceDef*;
+  dl: RzDataLayer*;
+  path: string;               // full path of the collection under the API base ("/v1/tasks")
+  record: RapiType*;          // <Type>
+  create: RapiType*;          // <Type>Create, 0 without @create
+  update: RapiType*;          // <Type>Update, 0 without @update
+  create_map: int32[16];      // create field i -> resource field
+  update_map: int32[16];
+  listing: RapiListing*;
+}
+
+struct RapiResOp {
+  res: RapiResource*;
+  action: string;             // custom action name, "" for the others
+}
+
+fn rapi__res_field_type(f: RzField*) -> RapiType* {
+  var t: RapiType* = (RapiType*)0;
+  if (f->kind == RZ_KIND_INT32) { t = rapi_int32_t(); }
+  else if (f->kind == RZ_KIND_INT64) { t = rapi_int64_t(); }
+  else if (f->kind == RZ_KIND_BOOL) { t = rapi_bool_t(); }
+  else {
+    t = rapi_string_t();
+    if (f->min_len >= 0) { t->min_len = (int64)f->min_len; }
+    if (f->max_len >= 0) { t->max_len = (int64)f->max_len; }
+  }
+  return t;
+}
+
+// An input type with the fields `accept` names, at the record's offsets.
+fn rapi__res_input(def: RzResourceDef*, name: string, accept: int64, required: bool, map: int32*) -> RapiType* {
+  var t: RapiType* = rapi_object_t(name, def->size);
+  for i in 0..def->nfields {
+    if ((accept & ((int64)1 << (int64)i)) == 0) { continue; }
+    var f: RzField* = &def->fields[i];
+    var req: bool = required && (f->flags & RZ_FIELD_REQUIRED) != 0;
+    map[t->nfields] = (int32)i;
+    rapi_field(t, f->name, rapi__res_field_type(f), (int64)f->offset, req);
+  }
+  return rapi_closed(t);
+}
+
+/// The API type of a resource's records (field 0, the id, read-only).
+export fn rapi_resource_type(def: RzResourceDef*) -> RapiType* {
+  var t: RapiType* = rapi_object_t(def->type_name, def->size);
+  for i in 0..def->nfields {
+    var f: RzField* = &def->fields[i];
+    rapi_field(t, f->name, rapi__res_field_type(f), (int64)f->offset, true);
+  }
+  if (def->nfields > 0) { rapi_read_only(t, def->fields[0].name); }
+  return t;
+}
+
+fn rapi__res_of(r: RapiReq*) -> RapiResOp* { return (RapiResOp*)r->op->ud2; }
+
+// Sends the problem for a failed resource action.
+fn rapi__res_fail(r: RapiReq*, rc: int32, errs: RzErrors*) -> int32 {
+  if (rc == RZ_E_NOT_FOUND) {
+    var id: int64 = rapi_int(r, "id");
+    return rapi_fail(r, 404, rz_arena_str(r->ctx->arena, "no record with id {id}"));
+  }
+  if (rc == RZ_E_FULL) { return rapi_fail(r, 409, "the store is full"); }
+  if (rc == RZ_E_CONFLICT) { return rapi_fail(r, 409, ""); }
+  if (rc == RZ_E_INVALID) {
+    rapi_errors_clear(r->errs);
+    for i in 0..errs->count {
+      var fe: RzFieldError* = &errs->items[i];
+      var text: string = rz_arena_str(r->ctx->arena, rz_str_view(&fe->text[0], (int64)fe->len));
+      rapi_errors_body(r->errs, rz_arena_str(r->ctx->arena, "#/" + fe->field), text);
+    }
+    return rapi_problem_errors(r->ctx, 422, "the record is invalid", r->errs);
+  }
+  return rapi_fail(r, 500, "");
+}
+
+fn rapi__res_send(r: RapiReq*, status: int32, rec: rawptr) -> int32 {
+  return rapi_json(r, status, rapi__res_of(r)->res->record, rec);
+}
+
+fn rapi__res_list(r: RapiReq*) -> int32 {
+  var res: RapiResource* = rapi__res_of(r)->res;
+  var q: RapiQuery;
+  var st: int32 = rapi_query_parse(r, &q);
+  if (st != RAPI_NEXT) { return st; }
+  var recs: RzRecords;
+  var rc: int32 = rz__read(res->dl, res->def, &recs, r->ctx->arena);
+  if (rc != RZ_OK) { return rapi__res_fail(r, rc, (RzErrors*)0); }
+  var page: rawptr = (rawptr)0;
+  var n: int64 = 0;
+  if (!rapi_query_apply(&q, res->record, recs.items, (int64)recs.count, r->ctx->arena, &page, &n)) { return rapi_fail(r, 500, ""); }
+  return rapi_json_page(r, &q, res->record, page, n);
+}
+
+fn rapi__res_get(r: RapiReq*) -> int32 {
+  var res: RapiResource* = rapi__res_of(r)->res;
+  var rec: rawptr = (rawptr)rz_arena_alloc_zeroed(r->ctx->arena, res->def->size);
+  var rc: int32 = rz__get(res->dl, res->def, rapi_int(r, "id"), rec, r->ctx->arena);
+  if (rc != RZ_OK) { return rapi__res_fail(r, rc, (RzErrors*)0); }
+  return rapi__res_send(r, 200, rec);
+}
+
+fn rapi__res_create(r: RapiReq*) -> int32 {
+  var res: RapiResource* = rapi__res_of(r)->res;
+  var errs: RzErrors;
+  var id: int64 = 0;
+  var rc: int32 = rz__create(res->dl, res->def, r->body, &id, &errs);
+  if (rc != RZ_OK) { return rapi__res_fail(r, rc, &errs); }
+  var rec: rawptr = (rawptr)rz_arena_alloc_zeroed(r->ctx->arena, res->def->size);
+  rc = rz__get(res->dl, res->def, id, rec, r->ctx->arena);
+  if (rc != RZ_OK) { return rapi__res_fail(r, rc, (RzErrors*)0); }
+  var loc: string = rz_arena_str(r->ctx->arena, r->api->base + res->path + "/{id}");
+  rz_ctx_set_header(r->ctx, "Location", loc);
+  return rapi__res_send(r, 201, rec);
+}
+
+fn rapi__res_update(r: RapiReq*) -> int32 {
+  var res: RapiResource* = rapi__res_of(r)->res;
+  var mask: int64 = 0;
+  for i in 0..res->update->nfields {
+    if ((r->present & ((int64)1 << (int64)i)) != 0) {
+      mask = mask | ((int64)1 << (int64)res->update_map[i]);
+    }
+  }
+  var errs: RzErrors;
+  var out: rawptr = (rawptr)rz_arena_alloc_zeroed(r->ctx->arena, res->def->size);
+  var rc: int32 = rz__update(res->dl, res->def, rapi_int(r, "id"), r->body, mask, &errs, out, r->ctx->arena);
+  if (rc != RZ_OK) { return rapi__res_fail(r, rc, &errs); }
+  return rapi__res_send(r, 200, out);
+}
+
+fn rapi__res_destroy(r: RapiReq*) -> int32 {
+  var res: RapiResource* = rapi__res_of(r)->res;
+  var errs: RzErrors;
+  var rc: int32 = rz__destroy(res->dl, res->def, rapi_int(r, "id"), &errs);
+  if (rc != RZ_OK) { return rapi__res_fail(r, rc, &errs); }
+  return rapi_no_content(r);
+}
+
+fn rapi__res_custom(r: RapiReq*) -> int32 {
+  var ro: RapiResOp* = rapi__res_of(r);
+  var res: RapiResource* = ro->res;
+  var errs: RzErrors;
+  var out: rawptr = (rawptr)rz_arena_alloc_zeroed(r->ctx->arena, res->def->size);
+  var rc: int32 = rz__action(res->dl, res->def, ro->action, rapi_int(r, "id"), &errs, out, r->ctx->arena);
+  if (rc != RZ_OK) { return rapi__res_fail(r, rc, &errs); }
+  return rapi__res_send(r, 200, out);
+}
+
+fn rapi__res_op(res: RapiResource*, op: RapiOp*, action: string, summary: string) {
+  if (op == 0) { return; }
+  var ro: RapiResOp* = (RapiResOp*)calloc(1, sizeof(RapiResOp));
+  ro->res = res;
+  ro->action = rz_str_dup(action);
+  op->ud2 = (rawptr)ro;
+  rapi_summary(op, summary);
+  rapi_tag(op, res->def->type_name);
+}
+
+fn rapi__res_id(op: RapiOp*) {
+  rapi_path_param(op, "id", rapi_range(rapi_int64_t(), 1, RAPI_UNSET), "The record's id");
+}
+
+/// Declares the REST operations of resource `def` stored in `dl` under `path`
+/// (inside the open group). Declares only the operations its actions allow.
+/// returns: the resource, to adjust its listing (res->listing) or types
+export fn rapi_resource(api: RapiApi*, path: string, def: RzResourceDef*, dl: RzDataLayer*) -> RapiResource* {
+  var res: RapiResource* = (RapiResource*)calloc(1, sizeof(RapiResource));
+  res->api = api;
+  res->def = def;
+  res->dl = dl;
+  res->path = rz_str_dup(api->prefix + path);
+  if (def == 0 || !def->ready) {
+    rapi__set_error(api, "resource at {path}: the definition is not ready");
+    return res;
+  }
+  res->record = rapi_resource_type(def);
+  var tn: string = def->type_name;
+  var item: string = path + "/:id";
+  for i in 0..def->nactions {
+    var a: RzAction* = &def->actions[i];
+    if (a->kind == RZ__ACTION_READ) {
+      var lop: RapiOp* = rapi_get(api, path, &rapi__res_list);
+      rapi__res_op(res, lop, "", "List " + tn + " records");
+      var l: RapiListing* = rapi_listing(lop, res->record, 50, 200);
+      var all: RzBuf* = rz_buf_new();
+      for k in 0..def->nfields {
+        if (k > 0) { rz_buf_add_byte(all, 32); }
+        rz_buf_add(all, def->fields[k].name);
+      }
+      var names: string = rz_str_dup(rz_buf_str(all));
+      rz_buf_free(all);
+      rapi_listing_sort(lop, l, names);
+      rapi_listing_filter(lop, l, names);
+      rapi_listing_fields(lop, l);
+      res->listing = l;
+      var gop: RapiOp* = rapi_get(api, item, &rapi__res_get);
+      rapi__res_op(res, gop, "", "Get a " + tn);
+      rapi__res_id(gop);
+      rapi_returns(gop, 200, res->record, "The record");
+    } else if (a->kind == RZ__ACTION_CREATE) {
+      res->create = rapi__res_input(def, tn + "Create", a->accept, true, &res->create_map[0]);
+      var cop: RapiOp* = rapi_post(api, path, &rapi__res_create);
+      rapi__res_op(res, cop, "", "Create a " + tn);
+      rapi_body(cop, res->create);
+      rapi_returns(cop, 201, res->record, "The new record");
+    } else if (a->kind == RZ__ACTION_UPDATE) {
+      res->update = rapi__res_input(def, tn + "Update", a->accept, false, &res->update_map[0]);
+      var uop: RapiOp* = rapi_patch(api, item, &rapi__res_update);
+      rapi__res_op(res, uop, "", "Update a " + tn);
+      rapi__res_id(uop);
+      rapi_body(uop, res->update);
+      rapi_returns(uop, 200, res->record, "The updated record");
+    } else if (a->kind == RZ__ACTION_DESTROY) {
+      var dop: RapiOp* = rapi_delete(api, item, &rapi__res_destroy);
+      rapi__res_op(res, dop, "", "Delete a " + tn);
+      rapi__res_id(dop);
+      rapi_returns(dop, 204, (RapiType*)0, "Deleted");
+    } else if (a->kind == RZ__ACTION_CUSTOM) {
+      var xop: RapiOp* = rapi_post(api, item + "/" + a->name, &rapi__res_custom);
+      rapi__res_op(res, xop, a->name, "Run " + a->name + " on a " + tn);
+      rapi__res_id(xop);
+      rapi_returns(xop, 200, res->record, "The changed record");
+    }
+  }
+  return res;
+}

@@ -1,0 +1,113 @@
+// Varints, zigzag and fixed-width integers: the building blocks of protobuf,
+// MessagePack and CBOR. The put functions write to raw memory the caller has
+// already made room for; the size functions say how much room is needed.
+
+// Bytes a varint takes: 1 to 10.
+@inline export fn codec_varint_size(v: uint64) -> int64 {
+  if (v < 128) { return 1; }
+  var n: int64 = 1;
+  while (v >= 128) {
+    v = v >> 7;
+    n = n + 1;
+  }
+  return n;
+}
+
+// Writes v as a varint at p (LEB128, low 7 bits first). Returns the bytes written.
+@inline export fn codec_put_varint(p: uint8*, v: uint64) -> int64 {
+  if (v < 128) {
+    p[0] = (uint8)v;
+    return 1;
+  }
+  var n: int64 = 0;
+  while (v >= 128) {
+    p[n] = (uint8)((v & 127) | 128);
+    v = v >> 7;
+    n = n + 1;
+  }
+  p[n] = (uint8)v;
+  return n + 1;
+}
+
+// Zigzag maps signed to unsigned so small negatives stay short: 0,-1,1,-2 -> 0,1,2,3.
+@inline export fn codec_zigzag64(v: int64) -> uint64 {
+  return ((uint64)v << 1) ^ (uint64)(v >> 63);
+}
+@inline export fn codec_zigzag32(v: int32) -> uint32 {
+  return ((uint32)v << 1) ^ (uint32)(v >> 31);
+}
+@inline export fn codec_unzigzag64(v: uint64) -> int64 {
+  return (int64)(v >> 1) ^ -((int64)(v & 1));
+}
+@inline export fn codec_unzigzag32(v: uint32) -> int32 {
+  return (int32)(v >> 1) ^ -((int32)(v & 1));
+}
+
+// Little-endian stores and loads.
+@inline export fn codec_put_le32(p: uint8*, v: uint32) {
+  p[0] = (uint8)v;
+  p[1] = (uint8)(v >> 8);
+  p[2] = (uint8)(v >> 16);
+  p[3] = (uint8)(v >> 24);
+}
+@inline export fn codec_put_le64(p: uint8*, v: uint64) {
+  codec_put_le32(p, (uint32)v);
+  codec_put_le32(p + 4, (uint32)(v >> 32));
+}
+@inline export fn codec_get_le32(p: uint8*) -> uint32 {
+  return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+@inline export fn codec_get_le64(p: uint8*) -> uint64 {
+  return (uint64)codec_get_le32(p) | ((uint64)codec_get_le32(p + 4) << 32);
+}
+
+// Big-endian stores and loads (MessagePack, CBOR, network order).
+@inline export fn codec_put_be16(p: uint8*, v: uint16) {
+  p[0] = (uint8)(v >> 8);
+  p[1] = (uint8)v;
+}
+@inline export fn codec_put_be32(p: uint8*, v: uint32) {
+  p[0] = (uint8)(v >> 24);
+  p[1] = (uint8)(v >> 16);
+  p[2] = (uint8)(v >> 8);
+  p[3] = (uint8)v;
+}
+@inline export fn codec_put_be64(p: uint8*, v: uint64) {
+  codec_put_be32(p, (uint32)(v >> 32));
+  codec_put_be32(p + 4, (uint32)v);
+}
+@inline export fn codec_get_be16(p: uint8*) -> uint16 {
+  return (uint16)(((uint32)p[0] << 8) | (uint32)p[1]);
+}
+@inline export fn codec_get_be32(p: uint8*) -> uint32 {
+  return ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | (uint32)p[3];
+}
+@inline export fn codec_get_be64(p: uint8*) -> uint64 {
+  return ((uint64)codec_get_be32(p) << 32) | (uint64)codec_get_be32(p + 4);
+}
+
+// Float bits, without changing the bits (NaN payloads survive).
+@inline export fn codec_f64_bits(f: float64) -> uint64 { return *(uint64*)&f; }
+@inline export fn codec_f32_bits(f: float32) -> uint32 { return *(uint32*)&f; }
+@inline export fn codec_bits_f64(b: uint64) -> float64 { return *(float64*)&b; }
+@inline export fn codec_bits_f32(b: uint32) -> float32 { return *(float32*)&b; }
+
+// Checks the registry runs with `mettle test`.
+@test fn codec_test_varint_size() -> int32 {
+  if (codec_varint_size(0) != 1 || codec_varint_size(127) != 1 || codec_varint_size(128) != 2) { return 1; }
+  if (codec_varint_size(0xffffffffffffffff) != 10) { return 2; }
+  return 0;
+}
+
+@test fn codec_test_zigzag() -> int32 {
+  if (codec_zigzag64(-1) != 1 || codec_zigzag64(1) != 2) { return 1; }
+  if (codec_unzigzag64(codec_zigzag64(-123456789)) != -123456789) { return 2; }
+  if (codec_unzigzag32(codec_zigzag32(-7)) != -7) { return 3; }
+  return 0;
+}
+
+@test fn codec_test_varint_bytes() -> int32 {
+  var buf: uint8[10];
+  if (codec_put_varint(&buf[0], (uint64)300) != 2 || buf[0] != 0xac || buf[1] != 0x02) { return 1; }
+  return 0;
+}

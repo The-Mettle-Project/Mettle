@@ -1,0 +1,514 @@
+// core/scales_test — core/format (incl. mp_fmt_clock) + core/scale + core/ticks.
+//
+// Pure: no files, no externs, so the same checks run in the compile-time
+// interpreter and in both compiled builds. Every exact string is asserted with
+// mp_expect_str; no "contains" where an exact string is possible.
+
+import "std/math";
+import "mistplot/test/harness";
+import "mistplot/core/format";
+import "mistplot/core/scale";
+import "mistplot/core/ticks";
+
+fn check_format() {
+  var b: uint8[64];
+
+  mp_expect_str("fmt_int neg", mp_fmt_int((int64)-42, &b[0], 64), "-42");
+  mp_expect_str("fmt_int zero", mp_fmt_int((int64)0, &b[0], 64), "0");
+  mp_expect_str("fmt_int big",
+                mp_fmt_int((int64)9007199254740993, &b[0], 64),
+                "9007199254740993");
+  var imin: int64 = (int64)-9223372036854775807 - (int64)1;
+  mp_expect_str("fmt_int int64 min", mp_fmt_int(imin, &b[0], 64),
+                "-9223372036854775808");
+
+  mp_expect_str("fixed 3 digits of 0.1+0.2",
+                mp_fmt_fixed(0.30000000000000004, 3, &b[0], 64), "0.300");
+  mp_expect_str("fixed negative", mp_fmt_fixed(-1.5, 3, &b[0], 64), "-1.500");
+  mp_expect_str("fixed pads zeros", mp_fmt_fixed(2.0, 3, &b[0], 64), "2.000");
+  mp_expect_str("fixed no minus zero", mp_fmt_fixed(0.0 - 0.0, 3, &b[0], 64),
+                "0.000");
+  mp_expect_str("fixed no minus zero d0",
+                mp_fmt_fixed(0.0 - 0.0, 0, &b[0], 64), "0");
+  mp_expect_str("fixed tiny rounds to zero",
+                mp_fmt_fixed(-0.0001, 2, &b[0], 64), "0.00");
+  mp_expect_str("fixed half away up", mp_fmt_fixed(1.25, 1, &b[0], 64), "1.3");
+  mp_expect_str("fixed half away down", mp_fmt_fixed(-1.25, 1, &b[0], 64),
+                "-1.3");
+  mp_expect_str("fixed carry", mp_fmt_fixed(0.9996, 3, &b[0], 64), "1.000");
+  mp_expect_str("fixed nan", mp_fmt_fixed(NAN(), 3, &b[0], 64), "NaN");
+  mp_expect_str("fixed inf", mp_fmt_fixed(INF(), 2, &b[0], 64), "inf");
+  mp_expect_str("fixed -inf", mp_fmt_fixed(0.0 - INF(), 2, &b[0], 64), "-inf");
+  // |v| >= 1e15 and (decimals == 0 && 0 < |v| < 1e-4) fall back to auto.
+  mp_expect_str("fixed falls back to auto (large)",
+                mp_fmt_fixed(1e16, 2, &b[0], 64), "1e+16");
+  mp_expect_str("fixed falls back to auto (tiny)",
+                mp_fmt_fixed(0.00001234, 0, &b[0], 64), "1.234e-05");
+
+  mp_expect_str("auto zero", mp_fmt_auto(0.0, &b[0], 64), "0");
+  mp_expect_str("auto trims", mp_fmt_auto(1234.5, &b[0], 64), "1234.5");
+  mp_expect_str("auto integer", mp_fmt_auto(100.0, &b[0], 64), "100");
+  mp_expect_str("auto six sig digits", mp_fmt_auto(3.14159265, &b[0], 64),
+                "3.14159");
+  mp_expect_str("auto small fixed", mp_fmt_auto(0.0001, &b[0], 64), "0.0001");
+  mp_expect_str("auto scientific at 1e7", mp_fmt_auto(1e7, &b[0], 64),
+                "1e+07");
+  mp_expect_str("auto scientific below 1e-4", mp_fmt_auto(0.00001, &b[0], 64),
+                "1e-05");
+  mp_expect_str("auto negative", mp_fmt_auto(-0.5, &b[0], 64), "-0.5");
+
+  mp_expect_str("si kilo", mp_fmt_si(1234.0, &b[0], 64), "1.23k");
+  mp_expect_str("si mega", mp_fmt_si(1500000.0, &b[0], 64), "1.5M");
+  mp_expect_str("si giga", mp_fmt_si(2500000000.0, &b[0], 64), "2.5G");
+  mp_expect_str("si tera", mp_fmt_si(1e12, &b[0], 64), "1T");
+  mp_expect_str("si milli", mp_fmt_si(0.0043, &b[0], 64), "4.3m");
+  mp_expect_str("si micro", mp_fmt_si(0.0000025, &b[0], 64), "2.5µ");
+  mp_expect_str("si nano", mp_fmt_si(1.2e-9, &b[0], 64), "1.2n");
+  mp_expect_str("si plain", mp_fmt_si(999.0, &b[0], 64), "999");
+  mp_expect_str("si zero", mp_fmt_si(0.0, &b[0], 64), "0");
+  mp_expect_str("si negative", mp_fmt_si(-1234.0, &b[0], 64), "-1.23k");
+
+  // Half away from zero at digit 0 (2.5 -> 3, -2.5 -> -3) and clamping of the
+  // requested decimal count: negative means 0, more than 9 means 9.
+  mp_expect_str("fixed half up at zero digits",
+                mp_fmt_fixed(2.5, 0, &b[0], 64), "3");
+  mp_expect_str("fixed half down at zero digits",
+                mp_fmt_fixed(0.0 - 2.5, 0, &b[0], 64), "-3");
+  mp_expect_str("fixed 0.5 at zero digits", mp_fmt_fixed(0.5, 0, &b[0], 64),
+                "1");
+  mp_expect_str("fixed negative decimals clamp to 0",
+                mp_fmt_fixed(1.5, -3, &b[0], 64), "2");
+  mp_expect_str("fixed decimals clamp to 9",
+                mp_fmt_fixed(0.1234567891, 12, &b[0], 64), "0.123456789");
+  // Carry crosses the decimal point and the integer digits.
+  mp_expect_str("fixed carry past 9.999",
+                mp_fmt_fixed(9.9999999, 3, &b[0], 64), "10.000");
+  mp_expect_str("fixed large below the fallback",
+                mp_fmt_fixed(1e14, 2, &b[0], 64), "100000000000000.00");
+
+  // -0.0 prints as 0 everywhere, and auto stays fixed while the exponent is
+  // 6 even when the value needs more than six digits to say exactly.
+  mp_expect_str("auto no minus zero", mp_fmt_auto(0.0 - 0.0, &b[0], 64), "0");
+  mp_expect_str("si no minus zero", mp_fmt_si(0.0 - 0.0, &b[0], 64), "0");
+  mp_expect_str("auto fixed at exponent 6",
+                mp_fmt_auto(9999999.0, &b[0], 64), "9999999");
+  // Documented boundary choice: the fixed/scientific split uses the exponent of
+  // the input, so a value just below 1e7 that rounds up to 1e7 stays fixed and
+  // prints eight digits ("%g" would print 1e+07). Deterministic and exact.
+  mp_expect_str("auto carries into a decade without going scientific",
+                mp_fmt_auto(9999999.5, &b[0], 64), "10000000");
+  mp_expect_str("auto carries below the split",
+                mp_fmt_auto(999999.9, &b[0], 64), "1000000");
+  mp_expect_str("fixed at the 1e15 fallback",
+                mp_fmt_fixed(1e15, 2, &b[0], 64), "1e+15");
+  mp_expect_str("fixed neg near zero at zero digits",
+                mp_fmt_fixed(0.0 - 0.4, 0, &b[0], 64), "0");
+  mp_expect_str("fixed exact at zero digits", mp_fmt_fixed(2.0, 0, &b[0], 64),
+                "2");
+  mp_expect_str("auto top of the range", mp_fmt_auto(1e308, &b[0], 64),
+                "1e+308");
+  mp_expect_str("auto top negative", mp_fmt_auto(0.0 - 1e308, &b[0], 64),
+                "-1e+308");
+
+  // SI promotes at 999.5 (3 significant digits) and keeps the unit floor at n.
+  mp_expect_str("si promotes at 999.5", mp_fmt_si(999.7, &b[0], 64), "1k");
+  mp_expect_str("si keeps 999.4", mp_fmt_si(999.4, &b[0], 64), "999");
+  mp_expect_str("si micro without a decimal",
+                mp_fmt_si(0.0005, &b[0], 64), "500µ");
+  mp_expect_str("si below the smallest unit",
+                mp_fmt_si(1e-12, &b[0], 64), "0.001n");
+  mp_expect_str("si above the largest unit",
+                mp_fmt_si(1e15, &b[0], 64), "1000T");
+
+  // Denormals: the mantissa must stay in [1,10) and a finite value must never
+  // print as "inf" (they did: 1e-323 printed "infe-324", 1e-320 printed
+  // "10.0198e-321"). These are the exact IEEE-754 decimal expansions of the
+  // nearest doubles, so the assertion also pins the mantissa normalisation.
+  mp_expect_str("auto denormal 1e-320",
+                mp_fmt_auto(1e-320, &b[0], 64), "9.99989e-321");
+  mp_expect_str("auto denormal 5e-320",
+                mp_fmt_auto(5e-320, &b[0], 64), "4.99994e-320");
+  mp_expect_str("auto denormal 1e-323",
+                mp_fmt_auto(1e-323, &b[0], 64), "9.88131e-324");
+
+  // A short buffer must not write out of bounds and must report "".
+  var tiny: uint8[8];
+  mp_expect_str("fmt short buffer", mp_fmt_fixed(1.5, 3, &tiny[0], 8), "");
+  mp_expect_str("fmt_int short buffer",
+                mp_fmt_int((int64)1, &tiny[0], 8), "");
+  var nul: uint8* = 0;
+  mp_expect_str("fmt null buffer", mp_fmt_fixed(1.5, 3, nul, 64), "");
+}
+
+fn check_scale() {
+  var lin: MpScale = mp_scale_linear(0.0, 100.0, 10.0, 410.0);
+  mp_expect("linear valid", lin.valid);
+  mp_expect_near("linear map d0", mp_scale_map(lin, 0.0), 10.0, 1e-9);
+  mp_expect_near("linear map d1", mp_scale_map(lin, 100.0), 410.0, 1e-9);
+  mp_expect_near("linear map mid", mp_scale_map(lin, 50.0), 210.0, 1e-9);
+  mp_expect_near("linear invert roundtrip",
+                 mp_scale_invert(lin, mp_scale_map(lin, 37.0)), 37.0, 1e-9);
+
+  // A value axis is flipped by the caller: d0 -> bottom, d1 -> top.
+  var yflip: MpScale = mp_scale_linear(0.0, 100.0, 300.0, 0.0);
+  mp_expect_near("linear flipped d0", mp_scale_map(yflip, 0.0), 300.0, 1e-9);
+  mp_expect_near("linear flipped d1", mp_scale_map(yflip, 100.0), 0.0, 1e-9);
+
+  var deg: MpScale = mp_scale_linear(5.0, 5.0, 0.0, 100.0);
+  mp_expect("degenerate domain invalid", !deg.valid);
+  mp_expect_near("degenerate maps to midpoint", mp_scale_map(deg, 5.0),
+                 50.0, 1e-9);
+  mp_expect_near("degenerate maps any value", mp_scale_map(deg, 999.0),
+                 50.0, 1e-9);
+
+  var lg: MpScale = mp_scale_log(1.0, 1000.0, 0.0, 300.0);
+  mp_expect("log valid", lg.valid);
+  mp_expect_near("log map d0", mp_scale_map(lg, 1.0), 0.0, 1e-9);
+  mp_expect_near("log map across a decade", mp_scale_map(lg, 10.0),
+                 100.0, 1e-9);
+  mp_expect_near("log map d1", mp_scale_map(lg, 1000.0), 300.0, 1e-9);
+  mp_expect_near("log invert", mp_scale_invert(lg, 100.0), 10.0, 1e-6);
+  mp_expect_near("log clamps v<=0", mp_scale_map(lg, 0.0), 0.0, 1e-9);
+  mp_expect_near("log clamps negative", mp_scale_map(lg, -5.0), 0.0, 1e-9);
+
+  var bad: MpScale = mp_scale_log(0.0, 10.0, 20.0, 220.0);
+  mp_expect("log invalid domain", !bad.valid);
+  mp_expect_near("log invalid maps r0", mp_scale_map(bad, 5.0), 20.0, 1e-9);
+
+  var band: MpScale = mp_scale_band(0.0, 100.0, 4, 0.2);
+  mp_expect("band valid", band.valid);
+  mp_expect_near("band width", mp_scale_band_width(band), 20.0, 1e-9);
+  mp_expect_near("band first starts after pad", mp_scale_band_start(band, 0),
+                 2.5, 1e-9);
+  mp_expect_near("band first centre", mp_scale_band_center(band, 0),
+                 12.5, 1e-9);
+  mp_expect_near("band last start", mp_scale_band_start(band, 3), 77.5, 1e-9);
+  // Without pad the first band starts at r0 and the last one ends at r1.
+  var band_np: MpScale = mp_scale_band(0.0, 100.0, 4, 0.0);
+  mp_expect_near("band starts at r0", mp_scale_band_start(band_np, 0),
+                 0.0, 1e-9);
+  mp_expect_near("band ends at r1",
+                 mp_scale_band_start(band_np, 3) +
+                 mp_scale_band_width(band_np), 100.0, 1e-9);
+  mp_expect_near("band invert is the index", mp_scale_invert(band, 37.0),
+                 1.48, 1e-9);
+  mp_expect_near("band map inverts", mp_scale_map(band, 2.0), 50.0, 1e-9);
+  // pad is clamped to 0..0.9, so a pad of 5 means "almost no band".
+  mp_expect_near("band pad clamps high",
+                 mp_scale_band_width(mp_scale_band(0.0, 80.0, 4, 5.0)),
+                 2.0, 1e-9);
+  mp_expect_near("band pad clamps low",
+                 mp_scale_band_width(mp_scale_band(0.0, 80.0, 4, -1.0)),
+                 20.0, 1e-9);
+  var band0: MpScale = mp_scale_band(0.0, 80.0, 0, 0.0);
+  mp_expect("band zero count invalid", !band0.valid);
+  mp_expect_near("band zero count width", mp_scale_band_width(band0),
+                 0.0, 1e-9);
+
+  // Degenerate and non-finite domains: valid=false, midpoint (linear and log)
+  // for a degenerate domain, and invert still answers the domain start instead
+  // of NaN. A non-positive log domain has no midpoint to speak of, so it keeps
+  // the r0 fallback.
+  var lgd: MpScale = mp_scale_log(10.0, 10.0, 40.0, 240.0);
+  mp_expect("log degenerate domain invalid", !lgd.valid);
+  mp_expect_near("log degenerate maps the midpoint", mp_scale_map(lgd, 10.0),
+                 140.0, 1e-9);
+  mp_expect_near("log degenerate invert is d0", mp_scale_invert(lgd, 100.0),
+                 10.0, 1e-9);
+  var lz: MpScale = mp_scale_log(0.0, 10.0, 20.0, 220.0);
+  mp_expect("log non-positive domain invalid", !lz.valid);
+  mp_expect_near("log non-positive domain maps r0", mp_scale_map(lz, 5.0),
+                 20.0, 1e-9);
+  var nf: MpScale = mp_scale_linear(NAN(), 1.0, 0.0, 100.0);
+  mp_expect("non-finite domain invalid", !nf.valid);
+  mp_expect_near("non-finite domain maps midpoint", mp_scale_map(nf, 0.5),
+                 50.0, 1e-9);
+  mp_expect_near("degenerate invert is d0", mp_scale_invert(deg, 50.0),
+                 5.0, 1e-9);
+
+  // Band geometry from the scale's formula, checked on both ends: with pad the
+  // first band starts step*pad/2 after r0 and the last ends the same distance
+  // before r1, so the gaps are symmetric.
+  var b7: MpScale = mp_scale_band(10.0, 250.0, 7, 0.15);
+  var b7step: float64 = (250.0 - 10.0) / 7.0;
+  mp_expect("band 7 valid", b7.valid);
+  mp_expect_near("band7 width", mp_scale_band_width(b7), b7step * 0.85,
+                 1e-9);
+  mp_expect_near("band7 left gap", mp_scale_band_start(b7, 0) - 10.0,
+                 b7step * 0.075, 1e-9);
+  mp_expect_near("band7 right gap",
+                 250.0 - (mp_scale_band_start(b7, 6) +
+                          mp_scale_band_width(b7)),
+                 b7step * 0.075, 1e-9);
+  mp_expect_near("band7 last centre", mp_scale_band_center(b7, 6),
+                 10.0 + 6.0 * b7step + b7step * 0.075 + b7step * 0.85 * 0.5,
+                 1e-9);
+  var bi: int32 = 0;
+  var band_rt: bool = true;
+  while (bi < 7) {
+    var bp: float64 = mp_scale_map(b7, (float64)bi);
+    var bv: float64 = mp_scale_invert(b7, bp);
+    var bd: float64 = bv - (float64)bi;
+    if (bd < 0.0) { bd = 0.0 - bd; }
+    if (bd > 1e-9) { band_rt = false; }
+    bi = bi + 1;
+  }
+  mp_expect("band invert(map(i)) == i for every band", band_rt);
+  var one: MpScale = mp_scale_band(0.0, 50.0, 1, 0.0);
+  mp_expect_near("band n=1 width is the range", mp_scale_band_width(one),
+                 50.0, 1e-9);
+  mp_expect_near("band n=1 start is r0", mp_scale_band_start(one, 0),
+                 0.0, 1e-9);
+
+  // Log invert across decades and an inverted (d0 > d1) log domain.
+  var lg4: MpScale = mp_scale_log(1.0, 10000.0, 0.0, 400.0);
+  mp_expect_near("log invert 10",
+                 mp_scale_invert(lg4, mp_scale_map(lg4, 10.0)), 10.0, 1e-9);
+  mp_expect_near("log invert 1000",
+                 mp_scale_invert(lg4, mp_scale_map(lg4, 1000.0)),
+                 1000.0, 1e-6);
+  var yflip_log: MpScale = mp_scale_log(1.0, 1000.0, 300.0, 0.0);
+  mp_expect_near("log flipped d0", mp_scale_map(yflip_log, 1.0), 300.0, 1e-9);
+  mp_expect_near("log flipped d1", mp_scale_map(yflip_log, 1000.0), 0.0, 1e-9);
+  var inv_log: MpScale = mp_scale_log(1000.0, 1.0, 0.0, 300.0);
+  mp_expect("log d0>d1 still valid", inv_log.valid);
+  mp_expect_near("log d0>d1 maps d0 to r0", mp_scale_map(inv_log, 1000.0),
+                 0.0, 1e-9);
+  mp_expect_near("log d0>d1 maps d1 to r1", mp_scale_map(inv_log, 1.0),
+                 300.0, 1e-9);
+}
+
+fn check_ticks() {
+  var out: float64[24];
+
+  mp_expect_near("step 0..97/5", mp_tick_step(0.0, 97.0, 5), 20.0, 1e-9);
+  mp_expect_near("step 0..100/5", mp_tick_step(0.0, 100.0, 5), 20.0, 1e-9);
+  mp_expect_near("step 0..1/5", mp_tick_step(0.0, 1.0, 5), 0.2, 1e-9);
+  mp_expect_near("step 0..10/5", mp_tick_step(0.0, 10.0, 5), 2.0, 1e-9);
+  mp_expect_near("step target 1 is the span", mp_tick_step(0.0, 10.0, 1),
+                 10.0, 1e-9);
+  mp_expect_near("step inverted domain", mp_tick_step(10.0, 0.0, 5),
+                 0.0, 1e-9);
+  // A subnormal span cannot be divided into 1/2/5 steps without underflow:
+  // the whole span is the only usable step.
+  mp_expect("step subnormal span is the span",
+            mp_tick_step(0.0, 1e-320, 5) == 1e-320);
+  // Consequence, pinned: tick values are rounded to at most 10^-9 (the
+  // formatter's decimal limit), so a subnormal span collapses to one tick.
+  mp_expect_i64("subnormal span yields a single tick",
+                (int64)mp_ticks_linear(0.0, 1e-320, 5, &out[0], 24),
+                (int64)1);
+
+  mp_expect_near("nice up", mp_tick_nice(3.7, true), 5.0, 1e-9);
+  mp_expect_near("nice down", mp_tick_nice(3.7, false), 2.0, 1e-9);
+  mp_expect_near("nice negative up", mp_tick_nice(-3.7, true), -5.0, 1e-9);
+  mp_expect_near("nice zero", mp_tick_nice(0.0, true), 0.0, 1e-9);
+
+  var n: int32 = mp_ticks_linear(0.0, 97.0, 5, &out[0], 24);
+  mp_expect_i64("linear tick count 0..97", (int64)n, (int64)5);
+  mp_expect_near("linear first tick", out[0], 0.0, 1e-9);
+  mp_expect_near("linear second tick", out[1], 20.0, 1e-9);
+  mp_expect_near("linear last tick", out[4], 80.0, 1e-9);
+  var prev: float64 = out[0];
+  var mono: bool = true;
+  var inside: bool = true;
+  var i: int32 = 1;
+  while (i < n) {
+    if (!(out[(int64)i] > prev)) { mono = false; }
+    prev = out[(int64)i];
+    i = i + 1;
+  }
+  i = 0;
+  while (i < n) {
+    if (out[(int64)i] < 0.0 || out[(int64)i] > 97.0) { inside = false; }
+    i = i + 1;
+  }
+  mp_expect("linear ticks strictly increasing", mono);
+  mp_expect("linear ticks inside the domain", inside);
+  var dd: int32 = n - 5;
+  if (dd < 0) { dd = 0 - dd; }
+  mp_expect("linear tick count within target+-2", dd <= 2);
+
+  // 0.1+0.2 must not leak into a label: values are snapped to the step.
+  n = mp_ticks_linear(0.1, 0.9, 5, &out[0], 24);
+  mp_expect_i64("linear tick count 0.1..0.9", (int64)n, (int64)4);
+  mp_expect_near("linear snapped 0.2", out[0], 0.2, 1e-12);
+  mp_expect_near("linear snapped 0.8", out[3], 0.8, 1e-12);
+  var b: uint8[64];
+  mp_expect_str("linear snapped label",
+                mp_fmt_fixed(out[1], 3, &b[0], 64), "0.400");
+
+  mp_expect_i64("linear empty domain",
+                (int64)mp_ticks_linear(5.0, 5.0, 5, &out[0], 24), (int64)0);
+  mp_expect_i64("linear inverted domain",
+                (int64)mp_ticks_linear(10.0, 0.0, 5, &out[0], 24), (int64)0);
+  mp_expect_i64("linear respects cap",
+                (int64)mp_ticks_linear(0.0, 100.0, 5, &out[0], 3), (int64)3);
+
+  var lg: float64[24];
+  var nl: int32 = mp_ticks_log(1.0, 1000.0, &lg[0], 24);
+  mp_expect_i64("log tick count", (int64)nl, (int64)4);
+  mp_expect_near("log tick 1", lg[0], 1.0, 1e-9);
+  mp_expect_near("log tick 10", lg[1], 10.0, 1e-9);
+  mp_expect_near("log tick 100", lg[2], 100.0, 1e-9);
+  mp_expect_near("log tick 1000", lg[3], 1000.0, 1e-9);
+
+  // 2..8 holds no decade: it falls back to a linear axis over the domain.
+  var fl: float64[24];
+  var nf: int32 = mp_ticks_log(2.0, 8.0, &fl[0], 24);
+  mp_expect_i64("log fallback count", (int64)nf, (int64)4);
+  mp_expect_near("log fallback first", fl[0], 2.0, 1e-9);
+  mp_expect_near("log fallback last", fl[3], 8.0, 1e-9);
+  mp_expect_i64("log rejects non-positive",
+                (int64)mp_ticks_log(0.0, 100.0, &fl[0], 24), (int64)0);
+
+  // Asserted rather than implied: the ticks of one axis are evenly spaced (the
+  // difference between neighbours is the step).
+  n = mp_ticks_linear(0.0, 97.0, 5, &out[0], 24);
+  var even: bool = true;
+  i = 1;
+  while (i < n) {
+    var gap: float64 = (out[(int64)i] - out[(int64)i - 1]) - 20.0;
+    if (gap < 0.0) { gap = 0.0 - gap; }
+    if (gap > 1e-9) { even = false; }
+    i = i + 1;
+  }
+  mp_expect("linear ticks evenly spaced", even);
+
+  // The step is always a 1/2/5 x 10^k multiple for every plausible target.
+  var mant: bool = true;
+  var tt: int32 = 2;
+  while (tt <= 12) {
+    var st: float64 = mp_tick_step(0.0, 97.0, tt);
+    var mag: float64 = pow(10.0, floor(log10(st)));
+    var norm: float64 = st / mag;
+    if (!(norm > 0.999999 && norm < 1.000001) &&
+        !(norm > 1.999999 && norm < 2.000001) &&
+        !(norm > 4.999999 && norm < 5.000001) &&
+        !(norm > 9.999999 && norm < 10.000001)) {
+      mant = false;
+    }
+    tt = tt + 1;
+  }
+  mp_expect("tick step mantissa is 1/2/5/10", mant);
+
+  var in_range: bool = true;
+  var tt2: int32 = 2;
+  while (tt2 <= 12) {
+    var c: int32 = mp_ticks_linear(0.0, 97.0, tt2, &out[0], 24);
+    var dd2: int32 = c - tt2;
+    if (dd2 < 0) { dd2 = 0 - dd2; }
+    if (c == 0 || dd2 > 2) { in_range = false; }
+    tt2 = tt2 + 1;
+  }
+  mp_expect("tick counts within target+-2 for target 2..12", in_range);
+  // The chart layer asks for ~5 ticks; the property must hold for that target
+  // over every span a real axis uses (tiny, fractional, huge). For target 13
+  // and up the 1/2/5 grid cannot stay within 2: the count jumps by up to 2.5x
+  // between neighbouring steps.
+  var spans: float64[5];
+  spans[0] = 1.0;
+  spans[1] = 5.0;
+  spans[2] = 0.5;
+  spans[3] = 100.0;
+  spans[4] = 1000000.0;
+  var span_ok: bool = true;
+  var sp: int32 = 0;
+  while (sp < 5) {
+    var cn: int32 = mp_ticks_linear(0.0, spans[(int64)sp], 5, &out[0], 24);
+    var de: int32 = cn - 5;
+    if (de < 0) { de = 0 - de; }
+    if (cn == 0 || de > 2) { span_ok = false; }
+    sp = sp + 1;
+  }
+  mp_expect("target 5 stays within +-2 across spans", span_ok);
+
+  var nul: float64* = 0;
+  mp_expect_i64("ticks reject a null out array",
+                (int64)mp_ticks_linear(0.0, 1.0, 5, nul, 8), (int64)0);
+  mp_expect_i64("ticks cap 0 writes nothing",
+                (int64)mp_ticks_linear(0.0, 1.0, 5, &out[0], 0), (int64)0);
+
+  // One decade is exactly the two boundary powers; five decades are five
+  // exact powers (no fallback when the span covers a decade).
+  var d1: float64[8];
+  var nd1: int32 = mp_ticks_log(10.0, 100.0, &d1[0], 8);
+  mp_expect_i64("log single decade count", (int64)nd1, (int64)2);
+  mp_expect_near("log single decade first", d1[0], 10.0, 1e-9);
+  mp_expect_near("log single decade last", d1[1], 100.0, 1e-9);
+  var nd2: int32 = mp_ticks_log(0.1, 10000.0, &d1[0], 8);
+  mp_expect_i64("log five decades count", (int64)nd2, (int64)6);
+  var powers: bool = true;
+  var pi: int32 = 1;
+  while (pi < nd2) {
+    if (!(d1[(int64)pi] > d1[(int64)pi - 1])) { powers = false; }
+    pi = pi + 1;
+  }
+  mp_expect("log ticks strictly increasing", powers);
+  var exact: bool = true;
+  pi = 0;
+  while (pi < nd2) {
+    var pv: float64 = d1[(int64)pi];
+    if (!(pow(10.0, round(log10(pv))) == pv)) { exact = false; }
+    pi = pi + 1;
+  }
+  mp_expect("log ticks are exact powers of ten", exact);
+  mp_expect_i64("log respects cap",
+                (int64)mp_ticks_log(0.1, 10000.0, &d1[0], 2), (int64)2);
+
+  mp_expect_near("nice 10 up", mp_tick_nice(10.0, true), 10.0, 1e-9);
+  mp_expect_near("nice 2 down", mp_tick_nice(2.0, false), 2.0, 1e-9);
+  mp_expect_near("nice 0.3 down", mp_tick_nice(0.3, false), 0.2, 1e-9);
+  mp_expect_near("nice 0.3 up", mp_tick_nice(0.3, true), 0.5, 1e-9);
+}
+
+// mp_fmt_clock (MP_FMT_TIME): mm:ss under an hour, h:mm:ss from one hour on,
+// truncation toward zero, a sign only on a non-zero clock, auto fallback.
+fn check_clock() {
+  var b: uint8[64];
+  mp_expect_str("clock zero", mp_fmt_clock(0.0, &b[0], 64), "00:00");
+  mp_expect_str("clock seconds", mp_fmt_clock(5.0, &b[0], 64), "00:05");
+  mp_expect_str("clock minute", mp_fmt_clock(65.0, &b[0], 64), "01:05");
+  mp_expect_str("clock truncates", mp_fmt_clock(59.999, &b[0], 64), "00:59");
+  mp_expect_str("clock last mm:ss", mp_fmt_clock(3599.9, &b[0], 64), "59:59");
+  mp_expect_str("clock one hour", mp_fmt_clock(3600.0, &b[0], 64), "1:00:00");
+  mp_expect_str("clock h:mm:ss", mp_fmt_clock(3661.7, &b[0], 64), "1:01:01");
+  mp_expect_str("clock day minus one", mp_fmt_clock(86399.0, &b[0], 64),
+                "23:59:59");
+  mp_expect_str("clock hours unpadded and unbounded",
+                mp_fmt_clock(360000.0, &b[0], 64), "100:00:00");
+  mp_expect_str("clock negative", mp_fmt_clock(-65.0, &b[0], 64), "-01:05");
+  mp_expect_str("clock negative truncates toward zero",
+                mp_fmt_clock(-65.9, &b[0], 64), "-01:05");
+  mp_expect_str("clock negative hour", mp_fmt_clock(-3600.0, &b[0], 64),
+                "-1:00:00");
+  mp_expect_str("clock -0.5 has no sign", mp_fmt_clock(-0.5, &b[0], 64),
+                "00:00");
+  mp_expect_str("clock nan falls back", mp_fmt_clock(NAN(), &b[0], 64), "NaN");
+  mp_expect_str("clock inf falls back", mp_fmt_clock(INF(), &b[0], 64), "inf");
+  mp_expect_str("clock -inf falls back", mp_fmt_clock(0.0 - INF(), &b[0], 64),
+                "-inf");
+  mp_expect_str("clock huge falls back", mp_fmt_clock(1e15, &b[0], 64),
+                "1e+15");
+  mp_expect_str("clock below 1e15 stays a clock",
+                mp_fmt_clock(999999999999999.0, &b[0], 64),
+                "277777777777:46:39");
+  mp_expect_str("clock short buffer", mp_fmt_clock(65.0, &b[0], 8), "");
+}
+
+export fn main() -> int32 {
+  check_format();
+  check_scale();
+  check_ticks();
+  check_clock();
+  return mp_summary();
+}
+
+@test fn t_scale() -> int32 {
+  check_format();
+  check_scale();
+  check_ticks();
+  check_clock();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

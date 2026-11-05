@@ -1,0 +1,253 @@
+// raize/resource/action — the actions behind every generated code interface.
+// internal
+// thread: any; the data layer serializes access to its records.
+//
+// rzpp generates `note_create(dl, text, id, errs)` and friends as thin typed wrappers
+// that fill a record and call rz__create / rz__read / rz__get / rz__count /
+// rz__update / rz__destroy / rz__action here. Update and custom actions run inside the
+// layer's atomic `modify`; a failed validation stores nothing. Accepted strings are trimmed; validations run before
+// anything is stored; `errs` may be 0 and is reset on entry.
+
+import "std/mem";
+import "raize_core/str/str";
+import "raize_core/core/status";
+import "raize_core/context/arena";
+import "def";
+import "errors";
+import "layer";
+
+/// internal: resource/action, resource/api. Checks the record's validations
+/// (@required, @min_length, @max_length) and records one message per failing field.
+/// An empty value is only checked by @required (Ash's rule: lengths apply to values).
+/// in:      def   the resource
+///          rec   the record to check (strings already trimmed)
+///          errs  receives messages; may be 0
+/// returns: RZ_OK or RZ_E_INVALID
+/// owns:    nothing
+export fn rz__validate(def: RzResourceDef*, rec: rawptr, errs: RzErrors*) -> int32 {
+  var rc: int32 = RZ_OK;
+  for i in 0..def->nfields {
+    var f: RzField* = &def->fields[i];
+    if (f->kind == RZ_KIND_STRING) {
+      var n: int64 = (int64)rz_field_get_str(rec, f).length;
+      if ((f->flags & RZ_FIELD_REQUIRED) != 0 && n == 0) {
+        rz__errors_add(errs, f->name, "can't be blank");
+        rc = RZ_E_INVALID;
+      } else if (n > 0 && f->min_len >= 0 && n < (int64)f->min_len) {
+        rz__errors_add(errs, f->name, "is too short (at least {f->min_len})");
+        rc = RZ_E_INVALID;
+      } else if (f->max_len >= 0 && n > (int64)f->max_len) {
+        rz__errors_add(errs, f->name, "is too long (at most {f->max_len})");
+        rc = RZ_E_INVALID;
+      }
+    }
+  }
+  return rc;
+}
+
+// Trims every accepted string field in place (the views shrink; nothing is copied).
+fn rz__trim_accepted(def: RzResourceDef*, rec: rawptr, accept: int64) {
+  for i in 0..def->nfields {
+    var f: RzField* = &def->fields[i];
+    if (f->kind == RZ_KIND_STRING && (accept & ((int64)1 << i)) != 0) {
+      rz_field_set_str(rec, f, rz_str_trim(rz_field_get_str(rec, f)));
+    }
+  }
+}
+
+fn rz__check(dl: RzDataLayer*, def: RzResourceDef*, kind: int32, name: string, errs: RzErrors*) -> int32 {
+  rz_errors_clear(errs);
+  if (dl == 0 || def == 0 || dl->def != def) { return rz__errors_code(errs, RZ_E_USAGE); }
+  if (rz__resource_action(def, kind, name) < 0) { return rz__errors_code(errs, RZ_E_UNSUPPORTED); }
+  return RZ_OK;
+}
+
+/// internal: generated <snake>_create, resource/api. Trims the accepted strings of
+/// `rec`, validates it and inserts it.
+/// in:      dl    the data layer
+///          def   its resource
+///          rec   the record (accepted fields set, the rest zero); trimmed in place
+///          id    receives the new id; may be 0
+///          errs  receives messages; may be 0
+/// returns: RZ_OK; RZ_E_INVALID; RZ_E_FULL; RZ_E_NOMEM; RZ_E_USAGE when `dl` is 0 or
+///          stores another resource; RZ_E_UNSUPPORTED without @create; a layer's own code
+/// owns:    `rec` is borrowed; the layer keeps its own copy
+export fn rz__create(dl: RzDataLayer*, def: RzResourceDef*, rec: rawptr, id: int64*, errs: RzErrors*) -> int32 {
+  var rc: int32 = rz__check(dl, def, RZ__ACTION_CREATE, "", errs);
+  if (rc != RZ_OK) { return rc; }
+  var a: int32 = rz__resource_action(def, RZ__ACTION_CREATE, "");
+  rz__trim_accepted(def, rec, def->actions[a].accept);
+  rc = rz__validate(def, rec, errs);
+  if (rc != RZ_OK) { return rz__errors_code(errs, rc); }
+  var new_id: int64 = 0;
+  rc = dl->insert(dl->ud, rec, &new_id);
+  if (rc == RZ_OK) {
+    rz_field_set_int(rec, &def->fields[0], new_id);
+    if (id != 0) { *id = new_id; }
+  }
+  return rz__errors_code(errs, rc);
+}
+
+/// internal: generated <snake>_read, resource/api. Every record, in id order.
+/// in:      dl     the data layer
+///          def    its resource
+///          out    receives the records (count 0 on an error)
+///          arena  holds them
+/// returns: RZ_OK; RZ_E_NOMEM; RZ_E_USAGE; RZ_E_UNSUPPORTED without @read; a layer's own code
+/// owns:    the records and their strings are arena-owned
+export fn rz__read(dl: RzDataLayer*, def: RzResourceDef*, out: RzRecords*, arena: RzArena*) -> int32 {
+  out->items = 0;
+  out->count = 0;
+  var rc: int32 = rz__check(dl, def, RZ__ACTION_READ, "", 0);
+  if (rc != RZ_OK) { return rc; }
+  return dl->scan(dl->ud, out, arena);
+}
+
+/// internal: generated <snake>_get, resource/api. One record by id.
+/// in:      dl     the data layer
+///          def    its resource
+///          id     the record
+///          out    def->size writable bytes
+///          arena  holds its strings
+/// returns: RZ_OK; RZ_E_NOT_FOUND; RZ_E_NOMEM; RZ_E_USAGE; RZ_E_UNSUPPORTED; a layer's own code
+/// owns:    `out`'s strings are arena-owned
+export fn rz__get(dl: RzDataLayer*, def: RzResourceDef*, id: int64, out: rawptr, arena: RzArena*) -> int32 {
+  var rc: int32 = rz__check(dl, def, RZ__ACTION_READ, "", 0);
+  if (rc != RZ_OK) { return rc; }
+  return dl->get(dl->ud, id, out, arena);
+}
+
+/// internal: generated <snake>_count. Records stored, or 0 on misuse.
+/// in:      dl   the data layer
+///          def  its resource
+/// returns: the count (0 when `dl` is 0 or stores another resource)
+/// owns:    nothing
+export fn rz__count(dl: RzDataLayer*, def: RzResourceDef*) -> int32 {
+  if (dl == 0 || dl->def != def) { return 0; }
+  return dl->count(dl->ud);
+}
+
+/// internal: generated <snake>_destroy, resource/api. Removes one record.
+/// in:      dl    the data layer
+///          def   its resource
+///          id    the record
+///          errs  receives the status; may be 0
+/// returns: RZ_OK; RZ_E_NOT_FOUND; RZ_E_USAGE; RZ_E_UNSUPPORTED without @destroy; a layer's own code
+/// owns:    nothing
+export fn rz__destroy(dl: RzDataLayer*, def: RzResourceDef*, id: int64, errs: RzErrors*) -> int32 {
+  var rc: int32 = rz__check(dl, def, RZ__ACTION_DESTROY, "", errs);
+  if (rc != RZ_OK) { return rc; }
+  return rz__errors_code(errs, dl->remove(dl->ud, id));
+}
+
+// Runs `apply` on record `id` inside the layer's modify, then copies the changed
+// record (from `*result`, set by apply on success) to `out` when asked.
+fn rz__modify(dl: RzDataLayer*, def: RzResourceDef*, id: int64, apply: fn(rawptr, rawptr) -> int32, arg: rawptr, result: rawptr*, out: rawptr, arena: RzArena*) -> int32 {
+  var scratch: RzArena* = arena;
+  if (scratch == 0) { scratch = rz_arena_new(); }
+  if (scratch == 0) { return RZ_E_NOMEM; }
+  var rc: int32 = dl->modify(dl->ud, id, apply, arg, scratch);
+  if (rc == RZ_OK && out != 0 && arena != 0 && *result != 0) { memcpy(out, *result, def->size); }
+  if (arena == 0) { rz_arena_free(scratch); }
+  return rc;
+}
+
+struct Rz_ChangeArg {
+  def: RzResourceDef*;          // static
+  change: fn(rawptr) -> void;   // the generated typed wrapper
+  errs: RzErrors*;              // may be 0
+  result: rawptr;               // the changed record (arena), set on success
+}
+
+fn rz__apply_change(arg: rawptr, rec: rawptr) -> int32 {
+  var a: Rz_ChangeArg* = (Rz_ChangeArg*)arg;
+  var change: fn(rawptr) -> void = a->change;
+  change(rec);
+  var rc: int32 = rz__validate(a->def, rec, a->errs);
+  if (rc == RZ_OK) { a->result = rec; }
+  return rc;
+}
+
+/// internal: generated <snake>_<action>, resource/api. Runs custom action `name`:
+/// load, change, validate, store (atomically).
+/// in:      dl     the data layer
+///          def    its resource
+///          name   the action
+///          id     the record
+///          errs   receives messages; may be 0
+///          out    receives the changed record when not 0
+///          arena  holds `out`'s strings; 0 uses a temporary arena (then pass out 0)
+/// returns: RZ_OK; RZ_E_NOT_FOUND; RZ_E_INVALID; RZ_E_NOMEM; RZ_E_USAGE;
+///          RZ_E_UNSUPPORTED when the resource has no action `name`; a layer's own code
+/// owns:    `out`'s strings are arena-owned
+export fn rz__action(dl: RzDataLayer*, def: RzResourceDef*, name: string, id: int64, errs: RzErrors*, out: rawptr, arena: RzArena*) -> int32 {
+  var rc: int32 = rz__check(dl, def, RZ__ACTION_CUSTOM, name, errs);
+  if (rc != RZ_OK) { return rc; }
+  var a: int32 = rz__resource_action(def, RZ__ACTION_CUSTOM, name);
+  var arg: Rz_ChangeArg;
+  arg.def = def;
+  arg.change = def->actions[a].change;
+  arg.errs = errs;
+  arg.result = 0;
+  rc = rz__modify(dl, def, id, &rz__apply_change, (rawptr)&arg, &arg.result, out, arena);
+  return rz__errors_code(errs, rc);
+}
+
+struct Rz_UpdateArg {
+  def: RzResourceDef*;   // static
+  src: rawptr;           // the new values; borrowed for the call
+  mask: int64;           // fields to take from src (accepted and present)
+  errs: RzErrors*;       // may be 0
+  result: rawptr;        // the updated record (arena), set on success
+}
+
+// Takes the masked fields from src (strings trimmed), then validates the whole record.
+fn rz__apply_update(arg: rawptr, rec: rawptr) -> int32 {
+  var a: Rz_UpdateArg* = (Rz_UpdateArg*)arg;
+  var def: RzResourceDef* = a->def;
+  for i in 1..def->nfields {
+    var f: RzField* = &def->fields[i];
+    if ((a->mask & ((int64)1 << i)) != 0) {
+      if (f->kind == RZ_KIND_STRING) {
+        rz_field_set_str(rec, f, rz_str_trim(rz_field_get_str(a->src, f)));
+      } else if (f->kind == RZ_KIND_BOOL) {
+        rz_field_set_bool(rec, f, rz_field_get_bool(a->src, f));
+      } else {
+        rz_field_set_int(rec, f, rz_field_get_int(a->src, f));
+      }
+    }
+  }
+  var rc: int32 = rz__validate(def, rec, a->errs);
+  if (rc == RZ_OK) { a->result = rec; }
+  return rc;
+}
+
+/// internal: generated <snake>_update, resource/api. Sets the fields of `src` named by
+/// `mask` (only accepted ones; strings trimmed) on record `id`, validates the whole
+/// record and stores it (atomically). Other fields keep their stored values.
+/// in:      dl     the data layer
+///          def    its resource
+///          id     the record
+///          src    a record holding the new values; borrowed
+///          mask   bit i = take field i (the generated code passes every accepted field,
+///                 the JSON API the keys present in the body)
+///          errs   receives messages; may be 0
+///          out    receives the updated record when not 0
+///          arena  holds `out`'s strings; 0 uses a temporary arena (then pass out 0)
+/// returns: RZ_OK; RZ_E_NOT_FOUND; RZ_E_INVALID; RZ_E_NOMEM; RZ_E_USAGE;
+///          RZ_E_UNSUPPORTED without @update; a layer's own code
+/// owns:    `out`'s strings are arena-owned or view `src`
+export fn rz__update(dl: RzDataLayer*, def: RzResourceDef*, id: int64, src: rawptr, mask: int64, errs: RzErrors*, out: rawptr, arena: RzArena*) -> int32 {
+  var rc: int32 = rz__check(dl, def, RZ__ACTION_UPDATE, "", errs);
+  if (rc != RZ_OK) { return rc; }
+  if (src == 0) { return rz__errors_code(errs, RZ_E_USAGE); }
+  var a: int32 = rz__resource_action(def, RZ__ACTION_UPDATE, "");
+  var arg: Rz_UpdateArg;
+  arg.def = def;
+  arg.src = src;
+  arg.mask = mask & def->actions[a].accept;
+  arg.errs = errs;
+  arg.result = 0;
+  rc = rz__modify(dl, def, id, &rz__apply_update, (rawptr)&arg, &arg.result, out, arena);
+  return rz__errors_code(errs, rc);
+}

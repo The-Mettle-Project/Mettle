@@ -1,0 +1,703 @@
+// X.509 certificate parsing (RFC 5280), strict DER, no allocation.
+//
+// MtlsCert keeps pointers into the DER it was parsed from, so that buffer
+// has to outlive the struct. mtls_cert_parse_copy takes its own copy for
+// callers who cannot promise that. Parsing only checks that the bytes are
+// well-formed; whether a certificate may be trusted is up to verify.mettle.
+// Algorithms and key types we cannot use are not parse errors: the cert
+// parses and the unusable part is marked (sig_key / pub.kind = none), so
+// that a trust store can still hold it.
+
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+import "mtls/crypto/sig";
+import "mtls/x509/der";
+
+/// sig_key value for ECDSA signatures: the curve comes from the issuer's key.
+export const MTLS_XKEY_EC: int32 = 10;
+
+// keyUsage bits (RFC 5280 4.2.1.3), as masks of MtlsCert.ku.
+export const MTLS_KU_DIGITAL_SIGNATURE: int32 = 1;
+export const MTLS_KU_NON_REPUDIATION: int32 = 2;
+export const MTLS_KU_KEY_ENCIPHERMENT: int32 = 4;
+export const MTLS_KU_DATA_ENCIPHERMENT: int32 = 8;
+export const MTLS_KU_KEY_AGREEMENT: int32 = 16;
+export const MTLS_KU_KEY_CERT_SIGN: int32 = 32;
+export const MTLS_KU_CRL_SIGN: int32 = 64;
+
+// extKeyUsage flags in MtlsCert.eku.
+export const MTLS_EKU_SERVER: int32 = 1;
+export const MTLS_EKU_CLIENT: int32 = 2;
+export const MTLS_EKU_ANY: int32 = 4;
+export const MTLS_EKU_OTHER: int32 = 8;
+
+// subjectAltName GeneralName kinds, as the tag byte they have in DER.
+export const MTLS_SAN_EMAIL: int32 = 0x81;
+export const MTLS_SAN_DNS: int32 = 0x82;
+export const MTLS_SAN_URI: int32 = 0x86;
+export const MTLS_SAN_IP: int32 = 0x87;
+
+export struct MtlsCert {
+  der: uint8*;
+  derlen: int64;
+  owned: uint8*;        // the private copy of der, or 0 (see mtls_cert_free)
+
+  tbs: uint8*;          // the signed bytes (the whole TBSCertificate TLV)
+  tbslen: int64;
+  sig_key: int32;       // key family that must have signed: MTLS_KEY_ED25519, MTLS_KEY_RSA, MTLS_XKEY_EC, or MTLS_KEY_NONE (unsupported)
+  sig_hash: int32;      // MTLS_SHA256 / 384 / 512 (0 for Ed25519)
+  sig_pad: int32;       // MTLS_PAD_*
+  sig: uint8*;          // signature bytes (BIT STRING content)
+  siglen: int64;
+
+  version: int32;       // 1, 2 or 3
+  serial: uint8*;       // INTEGER content as encoded
+  seriallen: int64;
+  issuer: uint8*;       // whole Name TLV; names are compared as bytes
+  issuerlen: int64;
+  subject: uint8*;
+  subjectlen: int64;
+  not_before: int64;    // unix seconds
+  not_after: int64;
+  spki: uint8*;         // whole SubjectPublicKeyInfo TLV (what pins hash)
+  spkilen: int64;
+  pub: MtlsPubKey;     // kind = MTLS_KEY_NONE for key types we do not use
+
+  has_bc: bool;
+  is_ca: bool;
+  has_pathlen: bool;
+  pathlen: int32;
+  has_ku: bool;
+  ku: int32;
+  has_eku: bool;
+  eku: int32;
+  has_san: bool;
+  san: uint8*;          // content of the GeneralNames SEQUENCE
+  sanlen: int64;
+  has_nc: bool;
+  nc_critical: bool;
+  nc_perm: uint8*;      // content of permittedSubtrees (GeneralSubtree elements)
+  nc_permlen: int64;
+  nc_excl: uint8*;
+  nc_excllen: int64;
+  nc_other: bool;       // some subtree is not a dNSName
+  ski: uint8*;
+  skilen: int64;
+  aki: uint8*;
+  akilen: int64;
+  unknown_critical: bool;
+  self_issued: bool;    // subject and issuer are the same bytes
+}
+
+fn mtls_x_check_name(t: MtlsDerTlv*, allow_empty: bool) -> bool {
+  var r: MtlsRd = mtls_rd(t->body, t->bodylen);
+  var count: int32 = 0;
+  while (mtls_rd_left(&r) > 0) {
+    var set: MtlsRd;
+    if (!mtls_der_set(&r, &set)) { return false; }
+    var nattr: int32 = 0;
+    while (mtls_rd_left(&set) > 0) {
+      var atv: MtlsRd;
+      if (!mtls_der_seq(&set, &atv)) { return false; }
+      var op: uint8* = 0;
+      var on: int64 = 0;
+      if (!mtls_der_oid(&atv, &op, &on)) { return false; }
+      if (!mtls_der_skip(&atv)) { return false; }
+      if (!mtls_rd_ok_end(&atv)) { return false; }
+      nattr = nattr + 1;
+    }
+    if (set.bad || nattr == 0) { return false; }
+    count = count + 1;
+  }
+  if (r.bad) { return false; }
+  if (count == 0 && !allow_empty) { return false; }
+  return true;
+}
+
+// ---- signature algorithm ----------------------------------------------
+
+// Reads a hash AlgorithmIdentifier. Gives MTLS_SHA*, 0 for a hash we do not
+// use, or -1 when the bytes are malformed.
+fn mtls_x_hash_alg(r: MtlsRd*) -> int32 {
+  var body: MtlsRd;
+  if (!mtls_der_seq(r, &body)) { return -1; }
+  var op: uint8* = 0;
+  var on: int64 = 0;
+  if (!mtls_der_oid(&body, &op, &on)) { return -1; }
+  if (mtls_rd_left(&body) > 0) {
+    if (!mtls_der_null(&body)) { return -1; }
+  }
+  if (!mtls_rd_ok_end(&body)) { return -1; }
+  if (mtls_der_oid_is(op, on, "608648016503040201")) { return MTLS_SHA256; }
+  if (mtls_der_oid_is(op, on, "608648016503040202")) { return MTLS_SHA384; }
+  if (mtls_der_oid_is(op, on, "608648016503040203")) { return MTLS_SHA512; }
+  return 0;
+}
+
+fn mtls_x_set_sig(c: MtlsCert*, key: int32, hash: int32, pad: int32) {
+  c->sig_key = key;
+  c->sig_hash = hash;
+  c->sig_pad = pad;
+}
+
+// RSASSA-PSS-params (RFC 4055 3.1). Only the shape TLS and the web use is
+// marked supported: MGF1 with the same hash, salt as long as the hash.
+fn mtls_x_pss(c: MtlsCert*, ai: MtlsRd*) -> bool {
+  var pr: MtlsRd;
+  if (!mtls_der_seq(ai, &pr)) { return false; }
+  if (!mtls_rd_ok_end(ai)) { return false; }
+  var ok: bool = true;
+  var hash: int32 = 0;
+  var h: MtlsRd;
+  if (mtls_der_opt(&pr, 0xa0, &h)) {
+    hash = mtls_x_hash_alg(&h);
+    if (hash < 0 || !mtls_rd_ok_end(&h)) { return false; }
+  } else {
+    ok = false;
+  }
+  var m: MtlsRd;
+  if (mtls_der_opt(&pr, 0xa1, &m)) {
+    var mb: MtlsRd;
+    if (!mtls_der_seq(&m, &mb)) { return false; }
+    var op: uint8* = 0;
+    var on: int64 = 0;
+    if (!mtls_der_oid(&mb, &op, &on)) { return false; }
+    var mh: int32 = mtls_x_hash_alg(&mb);
+    if (mh < 0 || !mtls_rd_ok_end(&mb) || !mtls_rd_ok_end(&m)) { return false; }
+    if (!mtls_der_oid_is(op, on, "2a864886f70d010108") || mh != hash) { ok = false; }
+  } else {
+    ok = false;
+  }
+  var s: MtlsRd;
+  if (mtls_der_opt(&pr, 0xa2, &s)) {
+    var salt: int64 = 0;
+    if (!mtls_der_small(&s, &salt) || !mtls_rd_ok_end(&s)) { return false; }
+    if (salt != (int64)mtls_hash_len(hash)) { ok = false; }
+  } else {
+    ok = false;
+  }
+  var tr: MtlsRd;
+  if (mtls_der_opt(&pr, 0xa3, &tr)) {
+    var tv: int64 = 0;
+    if (!mtls_der_small(&tr, &tv) || !mtls_rd_ok_end(&tr)) { return false; }
+    if (tv != 1) { ok = false; }
+  }
+  if (!mtls_rd_ok_end(&pr)) { return false; }
+  if (ok && hash != 0) { mtls_x_set_sig(c, MTLS_KEY_RSA, hash, MTLS_PAD_PSS); }
+  return true;
+}
+
+// Parameters must be NULL or absent.
+fn mtls_x_params_null(ai: MtlsRd*) -> bool {
+  if (mtls_rd_left(ai) > 0) {
+    if (!mtls_der_null(ai)) { return false; }
+  }
+  return mtls_rd_ok_end(ai);
+}
+
+// ai is the content of an AlgorithmIdentifier. Fills the sig_* fields.
+fn mtls_x_sigalg(c: MtlsCert*, ai: MtlsRd*) -> bool {
+  var op: uint8* = 0;
+  var on: int64 = 0;
+  mtls_x_set_sig(c, MTLS_KEY_NONE, 0, MTLS_PAD_NONE);
+  if (!mtls_der_oid(ai, &op, &on)) { return false; }
+  if (mtls_der_oid_is(op, on, "2a864886f70d01010b")) {
+    mtls_x_set_sig(c, MTLS_KEY_RSA, MTLS_SHA256, MTLS_PAD_PKCS1);
+    return mtls_x_params_null(ai);
+  }
+  if (mtls_der_oid_is(op, on, "2a864886f70d01010c")) {
+    mtls_x_set_sig(c, MTLS_KEY_RSA, MTLS_SHA384, MTLS_PAD_PKCS1);
+    return mtls_x_params_null(ai);
+  }
+  if (mtls_der_oid_is(op, on, "2a864886f70d01010d")) {
+    mtls_x_set_sig(c, MTLS_KEY_RSA, MTLS_SHA512, MTLS_PAD_PKCS1);
+    return mtls_x_params_null(ai);
+  }
+  if (mtls_der_oid_is(op, on, "2a864886f70d01010a")) {
+    return mtls_x_pss(c, ai);
+  }
+  if (mtls_der_oid_is(op, on, "2a8648ce3d040302")) {
+    mtls_x_set_sig(c, MTLS_XKEY_EC, MTLS_SHA256, MTLS_PAD_NONE);
+    return mtls_rd_ok_end(ai);
+  }
+  if (mtls_der_oid_is(op, on, "2a8648ce3d040303")) {
+    mtls_x_set_sig(c, MTLS_XKEY_EC, MTLS_SHA384, MTLS_PAD_NONE);
+    return mtls_rd_ok_end(ai);
+  }
+  if (mtls_der_oid_is(op, on, "2a8648ce3d040304")) {
+    mtls_x_set_sig(c, MTLS_XKEY_EC, MTLS_SHA512, MTLS_PAD_NONE);
+    return mtls_rd_ok_end(ai);
+  }
+  if (mtls_der_oid_is(op, on, "2b6570")) {
+    mtls_x_set_sig(c, MTLS_KEY_ED25519, 0, MTLS_PAD_NONE);
+    return mtls_rd_ok_end(ai);
+  }
+  // Unknown (sha1WithRSA, md5, ...): the cert still parses.
+  return true;
+}
+
+// ---- public key -------------------------------------------------------
+
+fn mtls_x_bitlen(p: uint8*, n: int64) -> int64 {
+  if (n < 1) { return 0; }
+  var b: int32 = (int32)p[0];
+  var bits: int64 = (n - 1) * 8;
+  while (b != 0) {
+    bits = bits + 1;
+    b = b >> 1;
+  }
+  return bits;
+}
+
+fn mtls_x_rsa_key(c: MtlsCert*, kp: uint8*, kn: int64) -> bool {
+  var r: MtlsRd = mtls_rd(kp, kn);
+  var seq: MtlsRd;
+  if (!mtls_der_seq(&r, &seq) || !mtls_rd_ok_end(&r)) { return false; }
+  var np: uint8* = 0;
+  var nn: int64 = 0;
+  var ep: uint8* = 0;
+  var en: int64 = 0;
+  if (!mtls_der_uint(&seq, &np, &nn) || !mtls_der_uint(&seq, &ep, &en)) { return false; }
+  if (!mtls_rd_ok_end(&seq)) { return false; }
+  var bits: int64 = mtls_x_bitlen(np, nn);
+  if (bits < 1024 || bits > 16384) { return false; }
+  if (en < 1 || en > 8 || (ep[en - 1] & (uint8)1) == (uint8)0) { return false; }
+  if (en == 1 && ep[0] < (uint8)3) { return false; }
+  c->pub.kind = MTLS_KEY_RSA;
+  c->pub.key = np;
+  c->pub.keylen = nn;
+  c->pub.exp = ep;
+  c->pub.explen = en;
+  return true;
+}
+
+fn mtls_x_spki(c: MtlsCert*, spki: MtlsRd*) -> bool {
+  var ai: MtlsRd;
+  if (!mtls_der_seq(spki, &ai)) { return false; }
+  var op: uint8* = 0;
+  var on: int64 = 0;
+  if (!mtls_der_oid(&ai, &op, &on)) { return false; }
+  var kp: uint8* = 0;
+  var kn: int64 = 0;
+  c->pub.kind = MTLS_KEY_NONE;
+  if (mtls_der_oid_is(op, on, "2b6570")) {
+    if (!mtls_rd_ok_end(&ai)) { return false; }
+    if (!mtls_der_bits_bytes(spki, &kp, &kn) || kn != 32) { return false; }
+    c->pub.kind = MTLS_KEY_ED25519;
+    c->pub.key = kp;
+    c->pub.keylen = 32;
+  } else if (mtls_der_oid_is(op, on, "2a8648ce3d0201")) {
+    var curve: int32 = MTLS_KEY_NONE;
+    if (mtls_der_peek(&ai) == MTLS_ASN1_OID) {
+      var cp: uint8* = 0;
+      var cn: int64 = 0;
+      if (!mtls_der_oid(&ai, &cp, &cn)) { return false; }
+      if (mtls_der_oid_is(cp, cn, "2a8648ce3d030107")) { curve = MTLS_KEY_P256; }
+      if (mtls_der_oid_is(cp, cn, "2b81040022")) { curve = MTLS_KEY_P384; }
+    } else if (!mtls_der_skip(&ai)) {
+      return false;
+    }
+    if (!mtls_rd_ok_end(&ai)) { return false; }
+    if (!mtls_der_bits_bytes(spki, &kp, &kn)) { return false; }
+    if (curve == MTLS_KEY_P256 || curve == MTLS_KEY_P384) {
+      var want: int64 = 65;
+      if (curve == MTLS_KEY_P384) { want = 97; }
+      if (kn != want || kp[0] != (uint8)4) { return false; }
+      c->pub.kind = curve;
+      c->pub.key = kp;
+      c->pub.keylen = kn;
+    }
+  } else if (mtls_der_oid_is(op, on, "2a864886f70d010101")) {
+    if (!mtls_x_params_null(&ai)) { return false; }
+    if (!mtls_der_bits_bytes(spki, &kp, &kn)) { return false; }
+    if (!mtls_x_rsa_key(c, kp, kn)) { return false; }
+  } else {
+    // Some other key type: skip its parameters and bits.
+    if (!mtls_der_bits_bytes(spki, &kp, &kn)) { return false; }
+  }
+  return mtls_rd_ok_end(spki);
+}
+
+// ---- extensions -------------------------------------------------------
+
+fn mtls_x_ext_bc(c: MtlsCert*, v: MtlsRd*) -> bool {
+  var seq: MtlsRd;
+  if (!mtls_der_seq(v, &seq)) { return false; }
+  c->has_bc = true;
+  c->is_ca = false;
+  if (mtls_der_peek(&seq) == MTLS_ASN1_BOOLEAN) {
+    var ca: bool = false;
+    if (!mtls_der_bool(&seq, &ca)) { return false; }
+    if (!ca) { return false; }   // FALSE is the default, DER leaves it out
+    c->is_ca = true;
+  }
+  if (mtls_der_peek(&seq) == MTLS_ASN1_INTEGER) {
+    var pl: int64 = 0;
+    if (!mtls_der_small(&seq, &pl)) { return false; }
+    if (pl > 1000000) { pl = 1000000; }
+    c->has_pathlen = true;
+    c->pathlen = (int32)pl;
+  }
+  return mtls_rd_ok_end(&seq);
+}
+
+fn mtls_x_ext_ku(c: MtlsCert*, v: MtlsRd*) -> bool {
+  var p: uint8* = 0;
+  var n: int64 = 0;
+  var u: int32 = 0;
+  if (!mtls_der_bits(v, &p, &n, &u)) { return false; }
+  c->has_ku = true;
+  c->ku = 0;
+  for k in 0..2 {
+    if ((int64)k < n) {
+      for j in 0..8 {
+        if ((((int32)p[k] >> (7 - j)) & 1) != 0) {
+          c->ku = c->ku | (1 << (k * 8 + j));
+        }
+      }
+    }
+  }
+  return true;
+}
+
+fn mtls_x_ext_eku(c: MtlsCert*, v: MtlsRd*) -> bool {
+  var seq: MtlsRd;
+  if (!mtls_der_seq(v, &seq)) { return false; }
+  if (mtls_rd_left(&seq) == 0) { return false; }
+  c->has_eku = true;
+  c->eku = 0;
+  while (mtls_rd_left(&seq) > 0) {
+    var op: uint8* = 0;
+    var on: int64 = 0;
+    if (!mtls_der_oid(&seq, &op, &on)) { return false; }
+    if (mtls_der_oid_is(op, on, "2b06010505070301")) {
+      c->eku = c->eku | MTLS_EKU_SERVER;
+    } else if (mtls_der_oid_is(op, on, "2b06010505070302")) {
+      c->eku = c->eku | MTLS_EKU_CLIENT;
+    } else if (mtls_der_oid_is(op, on, "551d2500")) {
+      c->eku = c->eku | MTLS_EKU_ANY;
+    } else {
+      c->eku = c->eku | MTLS_EKU_OTHER;
+    }
+  }
+  return !seq.bad;
+}
+
+fn mtls_x_ext_san(c: MtlsCert*, v: MtlsRd*) -> bool {
+  var seq: MtlsRd;
+  if (!mtls_der_seq(v, &seq)) { return false; }
+  if (mtls_rd_left(&seq) == 0) { return false; }
+  c->has_san = true;
+  c->san = seq.p;
+  c->sanlen = seq.n;
+  var t: MtlsDerTlv;
+  while (mtls_rd_left(&seq) > 0) {
+    if (!mtls_der_tlv(&seq, &t)) { return false; }
+    if (t.tag == 0x82 || t.tag == 0x81 || t.tag == 0x86) {
+      // IA5String: 7-bit text.
+      if (t.tag == 0x82 && t.bodylen == 0) { return false; }
+      for i in 0..t.bodylen {
+        if (t.body[i] >= (uint8)128) { return false; }
+        if (t.tag == 0x82 && t.body[i] == (uint8)0) { return false; }
+      }
+    } else if (t.tag == 0x87) {
+      if (t.bodylen != 4 && t.bodylen != 16) { return false; }
+    } else if (t.tag != 0xa0 && t.tag != 0xa3 && t.tag != 0xa4 && t.tag != 0xa5 && t.tag != 0x88) {
+      return false;
+    }
+  }
+  return !seq.bad;
+}
+
+// Checks the GeneralSubtree list in r (RFC 5280 4.2.1.10).
+fn mtls_x_subtrees(c: MtlsCert*, r: MtlsRd*) -> bool {
+  var count: int32 = 0;
+  while (mtls_rd_left(r) > 0) {
+    var st: MtlsRd;
+    if (!mtls_der_seq(r, &st)) { return false; }
+    var base: MtlsDerTlv;
+    if (!mtls_der_tlv(&st, &base)) { return false; }
+    if (base.tag != 0x82) { c->nc_other = true; }
+    // minimum must be 0 (the default, so absent) and maximum absent.
+    if (!mtls_rd_ok_end(&st)) { return false; }
+    count = count + 1;
+  }
+  return !r->bad && count > 0;
+}
+
+fn mtls_x_ext_nc(c: MtlsCert*, v: MtlsRd*, critical: bool) -> bool {
+  var seq: MtlsRd;
+  if (!mtls_der_seq(v, &seq)) { return false; }
+  c->has_nc = true;
+  c->nc_critical = critical;
+  var any: bool = false;
+  var perm: MtlsRd;
+  if (mtls_der_opt(&seq, 0xa0, &perm)) {
+    c->nc_perm = perm.p;
+    c->nc_permlen = perm.n;
+    if (!mtls_x_subtrees(c, &perm)) { return false; }
+    any = true;
+  }
+  var excl: MtlsRd;
+  if (mtls_der_opt(&seq, 0xa1, &excl)) {
+    c->nc_excl = excl.p;
+    c->nc_excllen = excl.n;
+    if (!mtls_x_subtrees(c, &excl)) { return false; }
+    any = true;
+  }
+  return any && mtls_rd_ok_end(&seq);
+}
+
+fn mtls_x_ext_aki(c: MtlsCert*, v: MtlsRd*) -> bool {
+  var seq: MtlsRd;
+  if (!mtls_der_seq(v, &seq)) { return false; }
+  var t: MtlsDerTlv;
+  if (mtls_der_peek(&seq) == 0x80) {
+    if (!mtls_der_tlv(&seq, &t)) { return false; }
+    c->aki = t.body;
+    c->akilen = t.bodylen;
+  }
+  while (mtls_rd_left(&seq) > 0) {
+    if (!mtls_der_tlv(&seq, &t)) { return false; }
+  }
+  return !seq.bad;
+}
+
+fn mtls_x_ext_known_ignored(op: uint8*, on: int64) -> bool {
+  if (mtls_der_oid_is(op, on, "551d20")) { return true; }          // certificatePolicies
+  if (mtls_der_oid_is(op, on, "551d1f")) { return true; }          // cRLDistributionPoints
+  if (mtls_der_oid_is(op, on, "2b06010505070101")) { return true; } // authorityInfoAccess
+  if (mtls_der_oid_is(op, on, "2b0601050507010b")) { return true; } // subjectInfoAccess
+  if (mtls_der_oid_is(op, on, "551d12")) { return true; }          // issuerAltName
+  if (mtls_der_oid_is(op, on, "551d2e")) { return true; }          // freshestCRL
+  if (mtls_der_oid_is(op, on, "551d09")) { return true; }          // subjectDirectoryAttributes
+  return false;
+}
+
+fn mtls_x_extensions(c: MtlsCert*, outer: MtlsRd*) -> bool {
+  var seq: MtlsRd;
+  if (!mtls_der_seq(outer, &seq)) { return false; }
+  if (!mtls_rd_ok_end(outer)) { return false; }
+  if (mtls_rd_left(&seq) == 0) { return false; }
+  var first: MtlsRd = seq;
+  var idx: int32 = 0;
+  while (mtls_rd_left(&seq) > 0) {
+    var ext: MtlsRd;
+    if (!mtls_der_seq(&seq, &ext)) { return false; }
+    var op: uint8* = 0;
+    var on: int64 = 0;
+    if (!mtls_der_oid(&ext, &op, &on)) { return false; }
+    var critical: bool = false;
+    if (mtls_der_peek(&ext) == MTLS_ASN1_BOOLEAN) {
+      if (!mtls_der_bool(&ext, &critical)) { return false; }
+      if (!critical) { return false; }   // FALSE is the default
+    }
+    var vp: uint8* = 0;
+    var vn: int64 = 0;
+    if (!mtls_der_octets(&ext, &vp, &vn)) { return false; }
+    if (!mtls_rd_ok_end(&ext)) { return false; }
+    // The same extension twice is an error.
+    var scan: MtlsRd = first;
+    for _k in 0..idx {
+      var e2: MtlsRd;
+      var p2: uint8* = 0;
+      var n2: int64 = 0;
+      if (!mtls_der_seq(&scan, &e2) || !mtls_der_oid(&e2, &p2, &n2)) { return false; }
+      if (mtls_bytes_eq(op, on, p2, n2)) { return false; }
+    }
+    idx = idx + 1;
+    var v: MtlsRd = mtls_rd(vp, vn);
+    var ok: bool = true;
+    if (mtls_der_oid_is(op, on, "551d13")) {
+      ok = mtls_x_ext_bc(c, &v);
+    } else if (mtls_der_oid_is(op, on, "551d0f")) {
+      ok = mtls_x_ext_ku(c, &v);
+    } else if (mtls_der_oid_is(op, on, "551d25")) {
+      ok = mtls_x_ext_eku(c, &v);
+    } else if (mtls_der_oid_is(op, on, "551d11")) {
+      ok = mtls_x_ext_san(c, &v);
+    } else if (mtls_der_oid_is(op, on, "551d1e")) {
+      ok = mtls_x_ext_nc(c, &v, critical);
+    } else if (mtls_der_oid_is(op, on, "551d23")) {
+      ok = mtls_x_ext_aki(c, &v);
+    } else if (mtls_der_oid_is(op, on, "551d0e")) {
+      var sp: uint8* = 0;
+      var sn: int64 = 0;
+      ok = mtls_der_octets(&v, &sp, &sn);
+      c->ski = sp;
+      c->skilen = sn;
+    } else if (mtls_x_ext_known_ignored(op, on)) {
+      ok = mtls_der_skip(&v);
+    } else {
+      if (critical) { c->unknown_critical = true; }
+      v = mtls_rd(vp, 0);
+    }
+    if (!ok || !mtls_rd_ok_end(&v)) { return false; }
+  }
+  return !seq.bad;
+}
+
+// ---- the certificate --------------------------------------------------
+
+fn mtls_x_parse_tbs(c: MtlsCert*, tbs: MtlsRd*, outer_alg: MtlsDerTlv*) -> bool {
+  c->version = 1;
+  var vr: MtlsRd;
+  if (mtls_der_opt(tbs, 0xa0, &vr)) {
+    var v: int64 = 0;
+    if (!mtls_der_small(&vr, &v) || !mtls_rd_ok_end(&vr)) { return false; }
+    if (v < 1 || v > 2) { return false; }   // v1 is the default and is not encoded
+    c->version = (int32)v + 1;
+  }
+  if (!mtls_der_int(tbs, &c->serial, &c->seriallen)) { return false; }
+  // The inner signature algorithm has to repeat the outer one exactly.
+  var inner: MtlsDerTlv;
+  if (!mtls_der_tlv(tbs, &inner) || inner.tag != MTLS_ASN1_SEQUENCE) { return false; }
+  if (!mtls_bytes_eq(inner.full, inner.fulllen, outer_alg->full, outer_alg->fulllen)) { return false; }
+  var t: MtlsDerTlv;
+  if (!mtls_der_tlv(tbs, &t) || t.tag != MTLS_ASN1_SEQUENCE || !mtls_x_check_name(&t, false)) { return false; }
+  c->issuer = t.full;
+  c->issuerlen = t.fulllen;
+  var val: MtlsRd;
+  if (!mtls_der_seq(tbs, &val)) { return false; }
+  if (!mtls_der_time(&val, &c->not_before) || !mtls_der_time(&val, &c->not_after)) { return false; }
+  if (!mtls_rd_ok_end(&val)) { return false; }
+  if (!mtls_der_tlv(tbs, &t) || t.tag != MTLS_ASN1_SEQUENCE || !mtls_x_check_name(&t, true)) { return false; }
+  c->subject = t.full;
+  c->subjectlen = t.fulllen;
+  if (!mtls_der_tlv(tbs, &t) || t.tag != MTLS_ASN1_SEQUENCE) { return false; }
+  c->spki = t.full;
+  c->spkilen = t.fulllen;
+  var spki_body: MtlsRd = mtls_rd(t.body, t.bodylen);
+  if (!mtls_x_spki(c, &spki_body)) { return false; }
+  // Unique identifiers (v2, v3) carry no meaning here.
+  var uid: MtlsRd;
+  if (mtls_der_opt(tbs, 0x81, &uid)) {
+    if (c->version < 2) { return false; }
+  }
+  if (mtls_der_opt(tbs, 0x82, &uid)) {
+    if (c->version < 2) { return false; }
+  }
+  var exts: MtlsRd;
+  if (mtls_der_opt(tbs, 0xa3, &exts)) {
+    if (c->version != 3) { return false; }
+    if (!mtls_x_extensions(c, &exts)) { return false; }
+  }
+  return mtls_rd_ok_end(tbs);
+}
+
+/// mtls_cert_parse: parses one DER certificate. The pointers in *c point
+/// into der, which must stay alive and unchanged while c is used.
+/// Returns MTLS_OK, or MTLS_E_DECODE if the bytes are not a well-formed
+/// certificate. No other input makes it fail, whatever the bytes are.
+export fn mtls_cert_parse(c: MtlsCert*, der: uint8*, n: int64) -> int32 {
+  memset(c, 0, (int64)sizeof(MtlsCert));
+  c->pub.kind = MTLS_KEY_NONE;
+  if (der == 0 || n <= 0) { return MTLS_E_DECODE; }
+  c->der = der;
+  c->derlen = n;
+  var r: MtlsRd = mtls_rd(der, n);
+  var cert: MtlsRd;
+  if (!mtls_der_seq(&r, &cert) || !mtls_rd_ok_end(&r)) { return MTLS_E_DECODE; }
+  var tbs: MtlsDerTlv;
+  if (!mtls_der_tlv(&cert, &tbs) || tbs.tag != MTLS_ASN1_SEQUENCE) { return MTLS_E_DECODE; }
+  c->tbs = tbs.full;
+  c->tbslen = tbs.fulllen;
+  var alg: MtlsDerTlv;
+  if (!mtls_der_tlv(&cert, &alg) || alg.tag != MTLS_ASN1_SEQUENCE) { return MTLS_E_DECODE; }
+  var ai: MtlsRd = mtls_rd(alg.body, alg.bodylen);
+  if (!mtls_x_sigalg(c, &ai)) { return MTLS_E_DECODE; }
+  if (!mtls_der_bits_bytes(&cert, &c->sig, &c->siglen)) { return MTLS_E_DECODE; }
+  if (!mtls_rd_ok_end(&cert)) { return MTLS_E_DECODE; }
+  var body: MtlsRd = mtls_rd(tbs.body, tbs.bodylen);
+  if (!mtls_x_parse_tbs(c, &body, &alg)) {
+    memset(c, 0, (int64)sizeof(MtlsCert));
+    c->pub.kind = MTLS_KEY_NONE;
+    return MTLS_E_DECODE;
+  }
+  c->self_issued = mtls_bytes_eq(c->subject, c->subjectlen, c->issuer, c->issuerlen);
+  return MTLS_OK;
+}
+
+/// mtls_cert_parse_copy: like mtls_cert_parse, but on a private copy of the
+/// bytes, so the caller may drop its buffer. Release with mtls_cert_free.
+export fn mtls_cert_parse_copy(c: MtlsCert*, der: uint8*, n: int64) -> int32 {
+  memset(c, 0, (int64)sizeof(MtlsCert));
+  c->pub.kind = MTLS_KEY_NONE;
+  if (der == 0 || n <= 0) { return MTLS_E_DECODE; }
+  var copy: uint8* = malloc(n);
+  if (copy == 0) { return MTLS_E_NOMEM; }
+  memcpy(copy, der, n);
+  var rc: int32 = mtls_cert_parse(c, copy, n);
+  if (rc != MTLS_OK) {
+    free(copy);
+    return rc;
+  }
+  c->owned = copy;
+  return MTLS_OK;
+}
+
+/// mtls_cert_free: releases the copy made by mtls_cert_parse_copy (a no-op
+/// for certs from mtls_cert_parse) and clears c.
+export fn mtls_cert_free(c: MtlsCert*) {
+  if (c->owned != 0) { free(c->owned); }
+  memset(c, 0, (int64)sizeof(MtlsCert));
+  c->pub.kind = MTLS_KEY_NONE;
+}
+
+/// mtls_cert_spki_sha256: the SHA-256 of the SubjectPublicKeyInfo (32 bytes
+/// into out), the value public-key pins use.
+export fn mtls_cert_spki_sha256(c: MtlsCert*, out: uint8*) {
+  mtls_hash(MTLS_SHA256, c->spki, c->spkilen, out);
+}
+
+/// mtls_cert_san_next: reads the next subjectAltName entry. Start with
+/// `var r: MtlsRd = mtls_rd(c->san, c->sanlen);` and loop while it returns
+/// true. kind is MTLS_SAN_DNS, MTLS_SAN_IP, ... (the DER tag byte).
+export fn mtls_cert_san_next(r: MtlsRd*, kind: int32*, p: uint8**, n: int64*) -> bool {
+  var t: MtlsDerTlv;
+  *kind = 0;
+  *p = mtls_rd_cur(r);
+  *n = 0;
+  if (mtls_rd_left(r) <= 0) { return false; }
+  if (!mtls_der_tlv(r, &t)) { return false; }
+  *kind = t.tag;
+  *p = t.body;
+  *n = t.bodylen;
+  return true;
+}
+
+/// mtls_cert_cn: the first commonName of the subject, for display only
+/// (a view into the DER, not checked for odd characters). Empty if there is
+/// none or it uses an encoding we do not decode.
+export fn mtls_cert_cn(c: MtlsCert*) -> string {
+  var empty: string = "";
+  var t: MtlsDerTlv;
+  var r: MtlsRd = mtls_rd(c->subject, c->subjectlen);
+  if (!mtls_der_tlv(&r, &t)) { return empty; }
+  var names: MtlsRd = mtls_rd(t.body, t.bodylen);
+  while (mtls_rd_left(&names) > 0) {
+    var set: MtlsRd;
+    if (!mtls_der_set(&names, &set)) { return empty; }
+    while (mtls_rd_left(&set) > 0) {
+      var atv: MtlsRd;
+      if (!mtls_der_seq(&set, &atv)) { return empty; }
+      var op: uint8* = 0;
+      var on: int64 = 0;
+      if (!mtls_der_oid(&atv, &op, &on)) { return empty; }
+      if (!mtls_der_tlv(&atv, &t)) { return empty; }
+      if (mtls_der_oid_is(op, on, "550403")) {
+        var tg: int32 = t.tag;
+        if (tg == 0x0c || tg == 0x13 || tg == 0x14 || tg == 0x16 || tg == 0x1a || tg == 0x12) {
+          var s: string;
+          s.chars = t.body;
+          s.length = (uint64)t.bodylen;
+          return s;
+        }
+        return empty;
+      }
+    }
+  }
+  return empty;
+}

@@ -1,0 +1,177 @@
+// raize_api/types/format: checks for string formats and UTF-8.
+//
+// date-time  RFC 3339 section 5.6 ("2026-11-05T09:30:00Z", offsets, fractions)
+// date       RFC 3339 full-date
+// email      a practical subset of RFC 5322 addr-spec: local@domain, no spaces
+// uuid       RFC 9562 text form, 8-4-4-4-12 hex digits
+// uri        RFC 3986: a scheme, then ':'
+// Other formats are documentation only, as JSON Schema 2020-12 allows.
+
+/// Counts UTF-8 code points in s, or returns -1 when s is not valid UTF-8
+/// (RFC 3629: no overlongs, no surrogates, nothing above U+10FFFF).
+export fn rapi_utf8_count(s: string) -> int64 {
+  var n: int64 = 0;
+  var i: int64 = 0;
+  var len: int64 = (int64)s.length;
+  while (i < len) {
+    var c: int32 = (int32)s.chars[i];
+    if (c < 128) { i = i + 1; n = n + 1; continue; }
+    var need: int32 = 0;
+    var cp: int32 = 0;
+    var lo: int32 = 0;
+    if (c >= 194 && c <= 223) { need = 1; cp = c & 31; lo = 128; }
+    else if (c >= 224 && c <= 239) { need = 2; cp = c & 15; lo = 2048; }
+    else if (c >= 240 && c <= 244) { need = 3; cp = c & 7; lo = 65536; }
+    else { return -1; }
+    if (i + (int64)need >= len) { return -1; }
+    for k in 1..(need + 1) {
+      var cc: int32 = (int32)s.chars[i + (int64)k];
+      if ((cc & 192) != 128) { return -1; }
+      cp = (cp << 6) | (cc & 63);
+    }
+    if (cp < lo || cp > 1114111 || (cp >= 55296 && cp <= 57343)) { return -1; }
+    i = i + (int64)need + 1;
+    n = n + 1;
+  }
+  return n;
+}
+
+fn rapi__digits(s: string, from: int64, n: int64) -> bool {
+  if (from + n > (int64)s.length) { return false; }
+  for i in from..(from + n) {
+    var c: int32 = (int32)s.chars[i];
+    if (c < 48 || c > 57) { return false; }
+  }
+  return true;
+}
+
+fn rapi__num(s: string, from: int64, n: int64) -> int32 {
+  var v: int32 = 0;
+  for i in from..(from + n) { v = v * 10 + ((int32)s.chars[i] - 48); }
+  return v;
+}
+
+fn rapi__is_hex(c: int32) -> bool {
+  return (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+fn rapi__leap(y: int32) -> bool {
+  return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+
+fn rapi__date_at(s: string, at: int64) -> bool {
+  if (!rapi__digits(s, at, 4) || s.chars[at + 4] != 45 || !rapi__digits(s, at + 5, 2)) { return false; }
+  if (s.chars[at + 7] != 45 || !rapi__digits(s, at + 8, 2)) { return false; }
+  var y: int32 = rapi__num(s, at, 4);
+  var m: int32 = rapi__num(s, at + 5, 2);
+  var d: int32 = rapi__num(s, at + 8, 2);
+  if (m < 1 || m > 12 || d < 1) { return false; }
+  var dim: int32 = 31;
+  if (m == 4 || m == 6 || m == 9 || m == 11) { dim = 30; }
+  if (m == 2) {
+    dim = 28;
+    if (rapi__leap(y)) { dim = 29; }
+  }
+  return d <= dim;
+}
+
+/// RFC 3339 full-date: YYYY-MM-DD with a real day of the month.
+export fn rapi_is_date(s: string) -> bool {
+  if (s.length != 10) { return false; }
+  return rapi__date_at(s, 0);
+}
+
+/// RFC 3339 date-time. Accepts 't' and 'z' as RFC 3339 allows, and a leap second (60).
+export fn rapi_is_date_time(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n < 20) { return false; }
+  if (!rapi__date_at(s, 0)) { return false; }
+  var t: int32 = (int32)s.chars[10];
+  if (t != 84 && t != 116) { return false; }
+  if (!rapi__digits(s, 11, 2) || s.chars[13] != 58 || !rapi__digits(s, 14, 2) || s.chars[16] != 58 || !rapi__digits(s, 17, 2)) { return false; }
+  if (rapi__num(s, 11, 2) > 23 || rapi__num(s, 14, 2) > 59 || rapi__num(s, 17, 2) > 60) { return false; }
+  var i: int64 = 19;
+  if (s.chars[i] == 46) {
+    i = i + 1;
+    var start: int64 = i;
+    while (i < n && s.chars[i] >= 48 && s.chars[i] <= 57) { i = i + 1; }
+    if (i == start) { return false; }
+  }
+  if (i >= n) { return false; }
+  var z: int32 = (int32)s.chars[i];
+  if (z == 90 || z == 122) { return i + 1 == n; }
+  if (z != 43 && z != 45) { return false; }
+  if (i + 6 != n) { return false; }
+  if (!rapi__digits(s, i + 1, 2) || s.chars[i + 3] != 58 || !rapi__digits(s, i + 4, 2)) { return false; }
+  return rapi__num(s, i + 1, 2) <= 23 && rapi__num(s, i + 4, 2) <= 59;
+}
+
+/// RFC 9562 UUID in its text form (any version), case-insensitive.
+export fn rapi_is_uuid(s: string) -> bool {
+  if (s.length != 36) { return false; }
+  for i in 0..36 {
+    var c: int32 = (int32)s.chars[i];
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (c != 45) { return false; }
+    } else if (!rapi__is_hex(c)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// A practical email check: one '@', a non-empty local part, a domain with a dot
+/// inside it, no spaces or control characters, at most 254 bytes.
+export fn rapi_is_email(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n < 3 || n > 254) { return false; }
+  var at: int64 = -1;
+  for i in 0..n {
+    var c: int32 = (int32)s.chars[i];
+    if (c <= 32 || c == 127) { return false; }
+    if (c == 64) {
+      if (at >= 0) { return false; }
+      at = (int64)i;
+    }
+  }
+  if (at < 1 || at > 64 || at >= n - 1) { return false; }
+  var dot: bool = false;
+  for i in (at + 1)..n {
+    if (s.chars[i] == 46) {
+      if (i == at + 1 || i == n - 1) { return false; }
+      dot = true;
+    }
+  }
+  return dot;
+}
+
+/// RFC 3986 absolute URI: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":" then no spaces.
+export fn rapi_is_uri(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n < 2) { return false; }
+  var c0: int32 = (int32)s.chars[0];
+  if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) { return false; }
+  var i: int64 = 1;
+  while (i < n && s.chars[i] != 58) {
+    var c: int32 = (int32)s.chars[i];
+    var ok: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46;
+    if (!ok) { return false; }
+    i = i + 1;
+  }
+  if (i >= n) { return false; }
+  for k in i..n {
+    var c: int32 = (int32)s.chars[k];
+    if (c <= 32 || c == 127) { return false; }
+  }
+  return true;
+}
+
+/// Checks `s` against `format`. Unknown formats pass.
+export fn rapi_format_ok(format: string, s: string) -> bool {
+  if (format == "date-time") { return rapi_is_date_time(s); }
+  if (format == "date") { return rapi_is_date(s); }
+  if (format == "uuid") { return rapi_is_uuid(s); }
+  if (format == "email") { return rapi_is_email(s); }
+  if (format == "uri") { return rapi_is_uri(s); }
+  return true;
+}

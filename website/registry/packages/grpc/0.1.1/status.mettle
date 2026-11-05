@@ -1,0 +1,215 @@
+// Status codes and the status a call ends with.
+//
+// Codes and names: grpc/grpc doc/statuscodes.md. The message travels in the
+// grpc-message trailer, percent-encoded as doc/PROTOCOL-HTTP2.md says: bytes
+// outside 0x20..0x7E, and '%' itself, become %XX.
+import "std/mem";
+import "std/strbuf";
+import "grpc/arena";
+
+export const GRPC_OK = 0;
+export const GRPC_CANCELLED = 1;
+export const GRPC_UNKNOWN = 2;
+export const GRPC_INVALID_ARGUMENT = 3;
+export const GRPC_DEADLINE_EXCEEDED = 4;
+export const GRPC_NOT_FOUND = 5;
+export const GRPC_ALREADY_EXISTS = 6;
+export const GRPC_PERMISSION_DENIED = 7;
+export const GRPC_RESOURCE_EXHAUSTED = 8;
+export const GRPC_FAILED_PRECONDITION = 9;
+export const GRPC_ABORTED = 10;
+export const GRPC_OUT_OF_RANGE = 11;
+export const GRPC_UNIMPLEMENTED = 12;
+export const GRPC_INTERNAL = 13;
+export const GRPC_UNAVAILABLE = 14;
+export const GRPC_DATA_LOSS = 15;
+export const GRPC_UNAUTHENTICATED = 16;
+
+// The end of a call. `details` holds the bytes of a google.rpc.Status
+// message (the grpc-status-details-bin trailer), or is empty.
+export struct GrpcStatus {
+  code: int32;
+  message: string;
+  details: string;
+}
+
+// A handler may return this instead of a status to say it will finish the
+// call itself later (grpc_srv_finish).
+export const GRPC_PENDING = -1;
+
+export fn grpc_status(code: int32, message: string) -> GrpcStatus {
+  var s: GrpcStatus;
+  s.code = code;
+  s.message = message;
+  return s;
+}
+
+// Frees the message and details of a status that owns them: the ones
+// grpc_unary and the generated unary stubs return.
+export fn grpc_status_free(s: GrpcStatus*) {
+  if (s->message.length > 0) { free(s->message.chars); }
+  if (s->details.length > 0) { free(s->details.chars); }
+  var z: string;
+  s->message = z;
+  s->details = z;
+}
+
+export fn grpc_status_ok(s: GrpcStatus*) -> bool {
+  return s->code == GRPC_OK;
+}
+
+const NAMES: string[17] = [
+  "OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED",
+  "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED",
+  "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED",
+  "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"
+];
+
+// The canonical name ("UNAVAILABLE"), as used in service configs.
+export fn grpc_code_name(code: int32) -> string {
+  if (code < 0 || code > 16) { return "UNKNOWN"; }
+  return NAMES[code];
+}
+
+fn upper(c: uint8) -> uint8 {
+  if (c >= 97 && c <= 122) { return c - 32; }
+  return c;
+}
+
+// A code from its name, any case ("unavailable"), or -1.
+export fn grpc_code_parse(name: string) -> int32 {
+  for i in 0..17 {
+    var n: string = NAMES[i];
+    if (n.length == name.length) {
+      var same: bool = true;
+      for k in 0..(int64)n.length {
+        if (upper(name.chars[k]) != n.chars[k]) { same = false; break; }
+      }
+      if (same) { return (int32)i; }
+    }
+  }
+  return -1;
+}
+
+// The code a grpc-status value names. A value that is not a number in
+// 0..16 is not a code; spec says treat it as UNKNOWN.
+export fn grpc_code_from_wire(v: string) -> int32 {
+  if (v.length == 0 || v.length > 2) { return GRPC_UNKNOWN; }
+  var n: int32 = 0;
+  for i in 0..(int64)v.length {
+    var c: uint8 = v.chars[i];
+    if (c < 48 || c > 57) { return GRPC_UNKNOWN; }
+    n = n * 10 + (int32)(c - 48);
+  }
+  if (n > 16) { return GRPC_UNKNOWN; }
+  return n;
+}
+
+// Codes a library must never produce on its own, only pass through from
+// an application (statuscodes.md); used to sanitize control-plane codes.
+export fn grpc_code_is_reserved_for_app(code: int32) -> bool {
+  return code == GRPC_INVALID_ARGUMENT || code == GRPC_NOT_FOUND ||
+    code == GRPC_ALREADY_EXISTS || code == GRPC_FAILED_PRECONDITION ||
+    code == GRPC_ABORTED || code == GRPC_OUT_OF_RANGE || code == GRPC_DATA_LOSS;
+}
+
+// The status for an HTTP response that carried no grpc-status
+// (doc/http-grpc-status-mapping.md).
+export fn grpc_code_from_http(http_status: int32) -> int32 {
+  switch (http_status) {
+    case 400: { return GRPC_INTERNAL; }
+    case 401: { return GRPC_UNAUTHENTICATED; }
+    case 403: { return GRPC_PERMISSION_DENIED; }
+    case 404: { return GRPC_UNIMPLEMENTED; }
+    case 429: { return GRPC_UNAVAILABLE; }
+    case 502: { return GRPC_UNAVAILABLE; }
+    case 503: { return GRPC_UNAVAILABLE; }
+    case 504: { return GRPC_UNAVAILABLE; }
+    default: { }
+  }
+  return GRPC_UNKNOWN;
+}
+
+const HEX: string = "0123456789ABCDEF";
+
+// Length of the percent-encoded form of s.
+export fn grpc_message_encoded_len(s: string) -> int64 {
+  var n: int64 = 0;
+  for i in 0..(int64)s.length {
+    var c: uint8 = s.chars[i];
+    if (c < 32 || c > 126 || c == 37) { n = n + 3; } else { n = n + 1; }
+  }
+  return n;
+}
+
+// Percent-encodes s for grpc-message into out (grpc_message_encoded_len
+// bytes). Returns the bytes written.
+export fn grpc_message_encode(s: string, out: uint8*) -> int64 {
+  var n: int64 = 0;
+  for i in 0..(int64)s.length {
+    var c: uint8 = s.chars[i];
+    if (c < 32 || c > 126 || c == 37) {
+      out[n] = 37;
+      out[n + 1] = HEX.chars[(c >> 4) & 15];
+      out[n + 2] = HEX.chars[c & 15];
+      n = n + 3;
+    } else {
+      out[n] = c;
+      n = n + 1;
+    }
+  }
+  return n;
+}
+
+fn hexval(c: uint8) -> int32 {
+  if (c >= 48 && c <= 57) { return (int32)(c - 48); }
+  if (c >= 65 && c <= 70) { return (int32)(c - 55); }
+  if (c >= 97 && c <= 102) { return (int32)(c - 87); }
+  return -1;
+}
+
+// Decodes a grpc-message value into out (at most s.length bytes). A '%'
+// not followed by two hex digits is kept as it is, as the spec asks.
+// Returns the bytes written.
+export fn grpc_message_decode(s: string, out: uint8*) -> int64 {
+  var n: int64 = 0;
+  var i: int64 = 0;
+  var len: int64 = (int64)s.length;
+  while (i < len) {
+    var c: uint8 = s.chars[i];
+    if (c == 37 && i + 2 < len) {
+      var h: int32 = hexval(s.chars[i + 1]);
+      var l: int32 = hexval(s.chars[i + 2]);
+      if (h >= 0 && l >= 0) {
+        out[n] = (uint8)(h * 16 + l);
+        n = n + 1;
+        i = i + 3;
+        continue;
+      }
+    }
+    out[n] = c;
+    n = n + 1;
+    i = i + 1;
+  }
+  return n;
+}
+
+// Arena helpers: copies of the encoded and decoded forms.
+export fn grpc_message_encode_in(a: GrpcArena*, s: string) -> string {
+  var n: int64 = grpc_message_encoded_len(s);
+  var r: string;
+  if (n == 0) { return r; }
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, n);
+  r.chars = p;
+  r.length = (uint64)grpc_message_encode(s, p);
+  return r;
+}
+
+export fn grpc_message_decode_in(a: GrpcArena*, s: string) -> string {
+  var r: string;
+  if (s.length == 0) { return r; }
+  var p: uint8* = (uint8*)grpc_arena_alloc(a, (int64)s.length);
+  r.chars = p;
+  r.length = (uint64)grpc_message_decode(s, p);
+  return r;
+}

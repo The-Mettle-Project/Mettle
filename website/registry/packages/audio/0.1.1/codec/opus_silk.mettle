@@ -1,0 +1,1370 @@
+// The SILK layer of Opus (RFC 6716 section 4.2): a linear-prediction
+// speech decoder working at 8, 12 or 16 kHz, followed by the resampler
+// to 48 kHz. A port of the fixed-point decoder of libopus (BSD,
+// Copyright (c) 2006-2011 Skype Limited): dec_API.c, decode_frame.c,
+// decode_indices.c, decode_pulses.c, shell_coder.c, code_signs.c,
+// decode_parameters.c, gain_quant.c, NLSF_decode.c, NLSF_stabilize.c,
+// NLSF2A.c, LPC_fit.c, LPC_inv_pred_gain.c, decode_pitch.c,
+// decode_core.c, stereo_*.c and resampler*.c. It is integer arithmetic
+// throughout, so it gives the same samples as the reference.
+//
+// Not ported: the packet loss concealment and comfort noise of the
+// reference (silk/PLC.c, silk/CNG.c). A lost frame here is silence.
+
+import "../core/status";
+import "opus_rc";
+import "opus_silk_tab";
+
+const MAX_LPC: int32 = 16;
+const LTP_ORDER: int32 = 5;
+const TYPE_NO_VOICE: int32 = 0;
+const TYPE_VOICED: int32 = 2;
+const CODE_INDEP: int32 = 0;
+const CODE_INDEP_NO_LTP: int32 = 1;
+const CODE_COND: int32 = 2;
+
+export struct AudioOpusSilkRs {
+  iir: int32[6];
+  fir: int16[8];
+  delay: int16[48];
+  kind: int32;          // 0 copy, 1 up 2x, 2 up 2x then FIR interpolation
+  batch: int32;
+  inv_ratio: int32;
+  fs_in_k: int32;
+  fs_out_k: int32;
+  input_delay: int32;
+}
+
+export struct AudioOpusSilkCh {
+  prev_gain: int32;
+  exc: int32[320];
+  slpc: int32[16];
+  out_buf: int16[480];
+  lag_prev: int32;
+  last_gain_index: int32;
+  fs_khz: int32;
+  fs_api: int32;
+  nb_subfr: int32;
+  frame_length: int32;
+  subfr_length: int32;
+  ltp_mem_length: int32;
+  lpc_order: int32;
+  prev_nlsf: int16[16];
+  first_frame_after_reset: int32;
+  frames_decoded: int32;
+  frames_per_packet: int32;
+  ec_prev_signal_type: int32;
+  ec_prev_lag_index: int32;
+  vad_flags: int32[3];
+  lbrr_flag: int32;
+  lbrr_flags: int32[3];
+  rs: AudioOpusSilkRs;
+  loss_cnt: int32;
+  prev_signal_type: int32;
+  // quantization indices of the current frame
+  gains_idx: int32[4];
+  ltp_idx: int32[4];
+  nlsf_idx: int32[17];
+  lag_index: int32;
+  contour_index: int32;
+  signal_type: int32;
+  quant_offset_type: int32;
+  nlsf_interp: int32;
+  per_index: int32;
+  ltp_scale_index: int32;
+  seed: int32;
+}
+
+// per frame parameters (silk_decoder_control)
+struct SilkCtrl {
+  pitch_l: int32[4];
+  gains: int32[4];
+  pred: int16[32];       // two sets of 16
+  ltp: int16[20];
+  ltp_scale: int32;
+}
+
+export struct AudioOpusSilk {
+  c0: AudioOpusSilkCh;
+  c1: AudioOpusSilkCh;
+  pred_prev: int32[2];
+  s_mid: int16[2];
+  s_side: int16[2];
+  n_api: int32;
+  n_internal: int32;
+  prev_decode_only_middle: int32;
+  // set by the caller before each packet
+  api_channels: int32;
+  internal_rate: int32;
+  internal_channels: int32;
+  payload_ms: int32;
+  // scratch
+  pulses: int16[336];
+  tmp1: int16[644];       // 2 x (320 + 2)
+  tmp2: int16[960];
+  sltp: int16[320];
+  sltp_q15: int32[640];
+  res: int32[80];
+  slpc_buf: int32[96];
+  rsbuf: int16[328];
+}
+
+// ---- fixed-point helpers (SigProc_FIX.h, macros.h) ----
+
+@inline fn smulwb(a: int32, b: int32) -> int32 { return (int32)(((int64)a * (int64)(int16)b) >> 16); }
+@inline fn smlawb(a: int32, b: int32, c: int32) -> int32 { return a + (int32)(((int64)b * (int64)(int16)c) >> 16); }
+@inline fn smulww(a: int32, b: int32) -> int32 { return (int32)(((int64)a * (int64)b) >> 16); }
+@inline fn smlaww(a: int32, b: int32, c: int32) -> int32 { return a + (int32)(((int64)b * (int64)c) >> 16); }
+@inline fn smulbb(a: int32, b: int32) -> int32 { return (int32)(int16)a * (int32)(int16)b; }
+@inline fn smmul(a: int32, b: int32) -> int32 { return (int32)(((int64)a * (int64)b) >> 32); }
+@inline fn rshift_round(a: int32, s: int32) -> int32 {
+  if (s == 1) { return (a >> 1) + (a & 1); }
+  return ((a >> (s - 1)) + 1) >> 1;
+}
+@inline fn rshift_round64(a: int64, s: int32) -> int64 {
+  if (s == 1) { return (a >> 1) + (a & 1); }
+  return ((a >> (s - 1)) + 1) >> 1;
+}
+@inline fn sat16(a: int32) -> int32 {
+  if (a > 32767) { return 32767; }
+  if (a < -32768) { return -32768; }
+  return a;
+}
+@inline fn iabs(a: int32) -> int32 { if (a < 0) { return -a; } return a; }
+@inline fn imin(a: int32, b: int32) -> int32 { if (a < b) { return a; } return b; }
+@inline fn imax(a: int32, b: int32) -> int32 { if (a > b) { return a; } return b; }
+fn limit(a: int32, l1: int32, l2: int32) -> int32 {
+  if (l1 > l2) {
+    if (a > l1) { return l1; }
+    if (a < l2) { return l2; }
+    return a;
+  }
+  if (a > l2) { return l2; }
+  if (a < l1) { return l1; }
+  return a;
+}
+fn lshift_sat32(a: int32, s: int32) -> int32 {
+  var lo: int32 = (int32)0x80000000 >> s;
+  var hi: int32 = 0x7FFFFFFF >> s;
+  return limit(a, lo, hi) << s;
+}
+fn add_sat32(a: int32, b: int32) -> int32 {
+  var r: int64 = (int64)a + (int64)b;
+  if (r > 2147483647) { return 2147483647; }
+  if (r < -2147483648) { return (int32)0x80000000; }
+  return (int32)r;
+}
+fn sub_sat32(a: int32, b: int32) -> int32 {
+  var r: int64 = (int64)a - (int64)b;
+  if (r > 2147483647) { return 2147483647; }
+  if (r < -2147483648) { return (int32)0x80000000; }
+  return (int32)r;
+}
+fn clz32(x: int32) -> int32 {
+  if (x == 0) { return 32; }
+  return 32 - audio_opus_ilog((uint32)x);
+}
+
+fn inverse32_varq(b32: int32, qres: int32) -> int32 {
+  var b_headrm: int32 = clz32(iabs(b32)) - 1;
+  var b32_nrm: int32 = b32 << b_headrm;
+  var d: int32 = b32_nrm >> 16;
+  if (d == 0) { return 0; }
+  var b32_inv: int32 = (0x7FFFFFFF >> 2) / d;
+  var result: int32 = b32_inv << 16;
+  var err_q32: int32 = ((1 << 29) - smulwb(b32_nrm, b32_inv)) << 3;
+  result = smlaww(result, err_q32, b32_inv);
+  var lshift: int32 = 61 - b_headrm - qres;
+  if (lshift <= 0) { return lshift_sat32(result, -lshift); }
+  if (lshift < 32) { return result >> lshift; }
+  return 0;
+}
+
+fn div32_varq(a32: int32, b32: int32, qres: int32) -> int32 {
+  var a_headrm: int32 = clz32(iabs(a32)) - 1;
+  var a32_nrm: int32 = a32 << a_headrm;
+  var b_headrm: int32 = clz32(iabs(b32)) - 1;
+  var b32_nrm: int32 = b32 << b_headrm;
+  var d: int32 = b32_nrm >> 16;
+  if (d == 0) { return 0; }
+  var b32_inv: int32 = (0x7FFFFFFF >> 2) / d;
+  var result: int32 = smulwb(a32_nrm, b32_inv);
+  a32_nrm = a32_nrm - (smmul(b32_nrm, result) << 3);
+  result = smlawb(result, a32_nrm, b32_inv);
+  var lshift: int32 = 29 + a_headrm - b_headrm - qres;
+  if (lshift < 0) { return lshift_sat32(result, -lshift); }
+  if (lshift < 32) { return result >> lshift; }
+  return 0;
+}
+
+fn log2lin(in_log: int32) -> int32 {
+  if (in_log < 0) { return 0; }
+  if (in_log >= 3967) { return 0x7FFFFFFF; }
+  var out: int32 = 1 << (in_log >> 7);
+  var frac: int32 = in_log & 0x7F;
+  if (in_log < 2048) {
+    out = out + ((out * smlawb(frac, smulbb(frac, 128 - frac), -174)) >> 7);
+  } else {
+    out = out + (out >> 7) * smlawb(frac, smulbb(frac, 128 - frac), -174);
+  }
+  return out;
+}
+
+// ---- resampler (resampler.c, resampler_private_IIR_FIR.c, up2_HQ.c) ----
+
+fn rate_id(r: int32) -> int32 {
+  var a: int32 = r >> 12;
+  if (r > 16000) { a = a - 1; }
+  if (r > 24000) { a = a >> 1; }
+  return a - 1;
+}
+
+fn rs_init(s: AudioOpusSilkRs*, fs_in: int32, fs_out: int32) -> int32 {
+  for i in 0..6 { s->iir[i] = 0; }
+  for i in 0..8 { s->fir[i] = 0; }
+  for i in 0..48 { s->delay[i] = 0; }
+  if ((fs_in != 8000 && fs_in != 12000 && fs_in != 16000) ||
+      (fs_out != 8000 && fs_out != 12000 && fs_out != 16000 && fs_out != 24000 && fs_out != 48000)) {
+    return -1;
+  }
+  s->input_delay = (int32)AUDIO_OPUS_SILK_DELAY_DEC[rate_id(fs_in) * 5 + rate_id(fs_out)];
+  s->fs_in_k = fs_in / 1000;
+  s->fs_out_k = fs_out / 1000;
+  s->batch = s->fs_in_k * 10;
+  var up2x: int32 = 0;
+  if (fs_out > fs_in) {
+    if (fs_out == fs_in * 2) {
+      s->kind = 1;
+    } else {
+      s->kind = 2;
+      up2x = 1;
+    }
+  } else if (fs_out < fs_in) {
+    return -1;   // the decoder never resamples down
+  } else {
+    s->kind = 0;
+  }
+  s->inv_ratio = ((fs_in << (14 + up2x)) / fs_out) << 2;
+  while (smulww(s->inv_ratio, fs_out) < (fs_in << up2x)) { s->inv_ratio = s->inv_ratio + 1; }
+  return 0;
+}
+
+fn up2_hq(st: int32*, out: int16*, inp: int16*, len: int32) {
+  var c00: int32 = (int32)AUDIO_OPUS_SILK_UP2_HQ_0[0];
+  var c01: int32 = (int32)AUDIO_OPUS_SILK_UP2_HQ_0[1];
+  var c02: int32 = (int32)AUDIO_OPUS_SILK_UP2_HQ_0[2];
+  var c10: int32 = (int32)AUDIO_OPUS_SILK_UP2_HQ_1[0];
+  var c11: int32 = (int32)AUDIO_OPUS_SILK_UP2_HQ_1[1];
+  var c12: int32 = (int32)AUDIO_OPUS_SILK_UP2_HQ_1[2];
+  for k in 0..len {
+    var in32: int32 = (int32)inp[k] << 10;
+    var y: int32 = in32 - st[0];
+    var x: int32 = smulwb(y, c00);
+    var o1: int32 = st[0] + x;
+    st[0] = in32 + x;
+    y = o1 - st[1];
+    x = smulwb(y, c01);
+    var o2: int32 = st[1] + x;
+    st[1] = o1 + x;
+    y = o2 - st[2];
+    x = smlawb(y, y, c02);
+    o1 = st[2] + x;
+    st[2] = o2 + x;
+    out[2 * k] = (int16)sat16(rshift_round(o1, 10));
+    y = in32 - st[3];
+    x = smulwb(y, c10);
+    o1 = st[3] + x;
+    st[3] = in32 + x;
+    y = o1 - st[4];
+    x = smulwb(y, c11);
+    o2 = st[4] + x;
+    st[4] = o1 + x;
+    y = o2 - st[5];
+    x = smlawb(y, y, c12);
+    o1 = st[5] + x;
+    st[5] = o2 + x;
+    out[2 * k + 1] = (int16)sat16(rshift_round(o1, 10));
+  }
+}
+
+fn iir_fir(sd: AudioOpusSilk*, s: AudioOpusSilkRs*, out0: int16*, inp0: int16*, len0: int32) -> int16* {
+  var buf: int16* = &sd->rsbuf[0];
+  var out: int16* = out0;
+  var inp: int16* = inp0;
+  var len: int32 = len0;
+  for i in 0..8 { buf[i] = s->fir[i]; }
+  var inc: int32 = s->inv_ratio;
+  var n: int32 = 0;
+  while (true) {
+    n = imin(len, s->batch);
+    up2_hq(&s->iir[0], buf + 8, inp, n);
+    var max_index: int32 = n << 17;
+    var idx: int32 = 0;
+    while (idx < max_index) {
+      var ti: int32 = smulwb(idx & 0xFFFF, 12);
+      var bp: int16* = buf + (idx >> 16);
+      var f0: int32 = ti * 4;
+      var f1: int32 = (11 - ti) * 4;
+      var r: int32 = smulbb((int32)bp[0], (int32)AUDIO_OPUS_SILK_FRAC_FIR_12[f0]);
+      r = r + smulbb((int32)bp[1], (int32)AUDIO_OPUS_SILK_FRAC_FIR_12[f0 + 1]);
+      r = r + smulbb((int32)bp[2], (int32)AUDIO_OPUS_SILK_FRAC_FIR_12[f0 + 2]);
+      r = r + smulbb((int32)bp[3], (int32)AUDIO_OPUS_SILK_FRAC_FIR_12[f0 + 3]);
+      r = r + smulbb((int32)bp[4], (int32)AUDIO_OPUS_SILK_FRAC_FIR_12[f1 + 3]);
+      r = r + smulbb((int32)bp[5], (int32)AUDIO_OPUS_SILK_FRAC_FIR_12[f1 + 2]);
+      r = r + smulbb((int32)bp[6], (int32)AUDIO_OPUS_SILK_FRAC_FIR_12[f1 + 1]);
+      r = r + smulbb((int32)bp[7], (int32)AUDIO_OPUS_SILK_FRAC_FIR_12[f1]);
+      *out = (int16)sat16(rshift_round(r, 15));
+      out = out + 1;
+      idx = idx + inc;
+    }
+    inp = inp + n;
+    len = len - n;
+    if (len > 0) {
+      for i in 0..8 { buf[i] = buf[(n << 1) + i]; }
+    } else {
+      break;
+    }
+  }
+  for i in 0..8 { s->fir[i] = buf[(n << 1) + i]; }
+  return out;
+}
+
+fn rs_run(sd: AudioOpusSilk*, s: AudioOpusSilkRs*, out: int16*, inp: int16*, in_len: int32) {
+  var nsamp: int32 = s->fs_in_k - s->input_delay;
+  for i in 0..nsamp { s->delay[s->input_delay + i] = inp[i]; }
+  if (s->kind == 1) {
+    up2_hq(&s->iir[0], out, &s->delay[0], s->fs_in_k);
+    up2_hq(&s->iir[0], out + s->fs_out_k, inp + nsamp, in_len - s->fs_in_k);
+  } else if (s->kind == 2) {
+    iir_fir(sd, s, out, &s->delay[0], s->fs_in_k);
+    iir_fir(sd, s, out + s->fs_out_k, inp + nsamp, in_len - s->fs_in_k);
+  } else {
+    for i in 0..s->fs_in_k { out[i] = s->delay[i]; }
+    for i in 0..in_len - s->fs_in_k { out[s->fs_out_k + i] = inp[nsamp + i]; }
+  }
+  for i in 0..s->input_delay { s->delay[i] = inp[in_len - s->input_delay + i]; }
+}
+
+// ---- decoder state ----
+
+fn chan(s: AudioOpusSilk*, n: int32) -> AudioOpusSilkCh* {
+  if (n == 0) { return &s->c0; }
+  return &s->c1;
+}
+
+fn reset_chan(c: AudioOpusSilkCh*) {
+  c->prev_gain = 65536;
+  for i in 0..320 { c->exc[i] = 0; }
+  for i in 0..16 { c->slpc[i] = 0; c->prev_nlsf[i] = 0; }
+  for i in 0..480 { c->out_buf[i] = 0; }
+  c->lag_prev = 0;
+  c->last_gain_index = 0;
+  c->fs_khz = 0;
+  c->fs_api = 0;
+  c->nb_subfr = 0;
+  c->frame_length = 0;
+  c->subfr_length = 0;
+  c->ltp_mem_length = 0;
+  c->lpc_order = 0;
+  c->first_frame_after_reset = 1;
+  c->frames_decoded = 0;
+  c->frames_per_packet = 0;
+  c->ec_prev_signal_type = 0;
+  c->ec_prev_lag_index = 0;
+  for i in 0..3 { c->vad_flags[i] = 0; c->lbrr_flags[i] = 0; }
+  c->lbrr_flag = 0;
+  c->rs.kind = 0;
+  c->rs.fs_in_k = 0;
+  c->rs.fs_out_k = 0;
+  c->rs.input_delay = 0;
+  c->rs.batch = 0;
+  c->rs.inv_ratio = 0;
+  c->loss_cnt = 0;
+  c->prev_signal_type = 0;
+}
+
+export fn audio_opus_silk_reset(s: AudioOpusSilk*) {
+  reset_chan(&s->c0);
+  reset_chan(&s->c1);
+  s->pred_prev[0] = 0;
+  s->pred_prev[1] = 0;
+  s->s_mid[0] = 0;
+  s->s_mid[1] = 0;
+  s->s_side[0] = 0;
+  s->s_side[1] = 0;
+  s->prev_decode_only_middle = 0;
+}
+
+export fn audio_opus_silk_init(s: AudioOpusSilk*, channels: int32) {
+  audio_opus_silk_reset(s);
+  s->n_api = 0;
+  s->n_internal = 0;
+  s->api_channels = channels;
+  s->internal_rate = 16000;
+  s->internal_channels = 1;
+  s->payload_ms = 20;
+}
+
+fn set_fs(c: AudioOpusSilkCh*, fs_khz: int32, fs_api: int32) -> int32 {
+  var ret: int32 = 0;
+  c->subfr_length = 5 * fs_khz;
+  var frame_length: int32 = c->nb_subfr * c->subfr_length;
+  if (c->fs_khz != fs_khz || c->fs_api != fs_api) {
+    ret = rs_init(&c->rs, fs_khz * 1000, fs_api);
+    c->fs_api = fs_api;
+  }
+  if (c->fs_khz != fs_khz || frame_length != c->frame_length) {
+    if (c->fs_khz != fs_khz) {
+      c->ltp_mem_length = 20 * fs_khz;
+      if (fs_khz == 8 || fs_khz == 12) { c->lpc_order = 10; } else { c->lpc_order = 16; }
+      c->first_frame_after_reset = 1;
+      c->lag_prev = 100;
+      c->last_gain_index = 10;
+      c->prev_signal_type = TYPE_NO_VOICE;
+      for i in 0..480 { c->out_buf[i] = 0; }
+      for i in 0..16 { c->slpc[i] = 0; }
+    }
+    c->fs_khz = fs_khz;
+    c->frame_length = frame_length;
+  }
+  return ret;
+}
+
+// ---- side information (decode_indices.c) ----
+
+fn nlsf_unpack(c: AudioOpusSilkCh*, ec_ix: int32*, pred: int32*, cb1: int32) {
+  var order: int32 = c->lpc_order;
+  for i in 0..order / 2 {
+    var entry: int32 = 0;
+    var pa: int32 = 0;
+    var pb: int32 = 0;
+    if (order == 16) {
+      entry = (int32)AUDIO_OPUS_SILK_CB2_SEL_WB[cb1 * 8 + i];
+      pa = (int32)AUDIO_OPUS_SILK_PRED_WB_Q8[2 * i + (entry & 1) * 15];
+      pb = (int32)AUDIO_OPUS_SILK_PRED_WB_Q8[2 * i + ((entry >> 4) & 1) * 15 + 1];
+    } else {
+      entry = (int32)AUDIO_OPUS_SILK_CB2_SEL_NBMB[cb1 * 5 + i];
+      pa = (int32)AUDIO_OPUS_SILK_PRED_NBMB_Q8[2 * i + (entry & 1) * 9];
+      pb = (int32)AUDIO_OPUS_SILK_PRED_NBMB_Q8[2 * i + ((entry >> 4) & 1) * 9 + 1];
+    }
+    ec_ix[2 * i] = ((entry >> 1) & 7) * 9;
+    pred[2 * i] = pa;
+    ec_ix[2 * i + 1] = ((entry >> 5) & 7) * 9;
+    pred[2 * i + 1] = pb;
+  }
+}
+
+fn decode_indices(c: AudioOpusSilkCh*, dec: AudioOpusRc*, frame_index: int32, decode_lbrr: bool, cond: int32) {
+  var ix: int32 = 0;
+  if (decode_lbrr || c->vad_flags[frame_index] != 0) {
+    ix = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_TYPE_OFFSET_VAD_ICDF[0], 8) + 2;
+  } else {
+    ix = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_TYPE_OFFSET_NO_VAD_ICDF[0], 8);
+  }
+  c->signal_type = ix >> 1;
+  c->quant_offset_type = ix & 1;
+  if (cond == CODE_COND) {
+    c->gains_idx[0] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_DELTA_GAIN_ICDF[0], 8);
+  } else {
+    c->gains_idx[0] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_GAIN_ICDF[c->signal_type * 8], 8) << 3;
+    c->gains_idx[0] = c->gains_idx[0] + audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_UNIFORM8_ICDF[0], 8);
+  }
+  for i in 1..c->nb_subfr {
+    c->gains_idx[i] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_DELTA_GAIN_ICDF[0], 8);
+  }
+  var order: int32 = c->lpc_order;
+  if (order == 16) {
+    c->nlsf_idx[0] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_CB1_WB_ICDF[(c->signal_type >> 1) * 32], 8);
+  } else {
+    c->nlsf_idx[0] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_CB1_NBMB_ICDF[(c->signal_type >> 1) * 32], 8);
+  }
+  var ec_ix: int32[16];
+  var pred: int32[16];
+  nlsf_unpack(c, &ec_ix[0], &pred[0], c->nlsf_idx[0]);
+  for i in 0..order {
+    if (order == 16) {
+      ix = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_CB2_ICDF_WB[ec_ix[i]], 8);
+    } else {
+      ix = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_CB2_ICDF_NBMB[ec_ix[i]], 8);
+    }
+    if (ix == 0) {
+      ix = ix - audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_NLSF_EXT_ICDF[0], 8);
+    } else if (ix == 8) {
+      ix = ix + audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_NLSF_EXT_ICDF[0], 8);
+    }
+    c->nlsf_idx[i + 1] = ix - 4;
+  }
+  if (c->nb_subfr == 4) {
+    c->nlsf_interp = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_NLSF_INTERP_ICDF[0], 8);
+  } else {
+    c->nlsf_interp = 4;
+  }
+  if (c->signal_type == TYPE_VOICED) {
+    var absolute: bool = true;
+    if (cond == CODE_COND && c->ec_prev_signal_type == TYPE_VOICED) {
+      var delta: int32 = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_PITCH_DELTA_ICDF[0], 8);
+      if (delta > 0) {
+        delta = delta - 9;
+        c->lag_index = (int32)(int16)(c->ec_prev_lag_index + delta);
+        absolute = false;
+      }
+    }
+    if (absolute) {
+      c->lag_index = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_PITCH_LAG_ICDF[0], 8) * (c->fs_khz >> 1);
+      if (c->fs_khz == 16) {
+        c->lag_index = c->lag_index + audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_UNIFORM8_ICDF[0], 8);
+      } else if (c->fs_khz == 12) {
+        c->lag_index = c->lag_index + audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_UNIFORM6_ICDF[0], 8);
+      } else {
+        c->lag_index = c->lag_index + audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_UNIFORM4_ICDF[0], 8);
+      }
+    }
+    c->ec_prev_lag_index = c->lag_index;
+    if (c->fs_khz == 8) {
+      if (c->nb_subfr == 4) {
+        c->contour_index = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_PITCH_CONTOUR_NB_ICDF[0], 8);
+      } else {
+        c->contour_index = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_PITCH_CONTOUR_10MS_NB_ICDF[0], 8);
+      }
+    } else {
+      if (c->nb_subfr == 4) {
+        c->contour_index = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_PITCH_CONTOUR_ICDF[0], 8);
+      } else {
+        c->contour_index = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_PITCH_CONTOUR_10MS_ICDF[0], 8);
+      }
+    }
+    c->per_index = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_LTP_PER_INDEX_ICDF[0], 8);
+    for k in 0..c->nb_subfr {
+      if (c->per_index == 0) {
+        c->ltp_idx[k] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_LTP_GAIN_ICDF_0[0], 8);
+      } else if (c->per_index == 1) {
+        c->ltp_idx[k] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_LTP_GAIN_ICDF_1[0], 8);
+      } else {
+        c->ltp_idx[k] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_LTP_GAIN_ICDF_2[0], 8);
+      }
+    }
+    if (cond == CODE_INDEP) {
+      c->ltp_scale_index = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_LTPSCALE_ICDF[0], 8);
+    } else {
+      c->ltp_scale_index = 0;
+    }
+  }
+  c->ec_prev_signal_type = c->signal_type;
+  c->seed = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_UNIFORM4_ICDF[0], 8);
+}
+
+// ---- excitation (decode_pulses.c, shell_coder.c, code_signs.c) ----
+
+fn shell_table(which: int32, i: int32) -> uint8* {
+  if (which == 0) { return &AUDIO_OPUS_SILK_SHELL_0[i]; }
+  if (which == 1) { return &AUDIO_OPUS_SILK_SHELL_1[i]; }
+  if (which == 2) { return &AUDIO_OPUS_SILK_SHELL_2[i]; }
+  return &AUDIO_OPUS_SILK_SHELL_3[i];
+}
+
+fn split(c1: int16*, c2: int16*, dec: AudioOpusRc*, p: int32, which: int32) {
+  if (p > 0) {
+    var v: int32 = audio_opus_rc_icdf(dec, shell_table(which, (int32)AUDIO_OPUS_SILK_SHELL_OFFSETS[p]), 8);
+    c1[0] = (int16)v;
+    c2[0] = (int16)(p - v);
+  } else {
+    c1[0] = 0;
+    c2[0] = 0;
+  }
+}
+
+fn shell_decoder(p0: int16*, dec: AudioOpusRc*, pulses4: int32) {
+  var p3: int16[2];
+  var p2: int16[4];
+  var p1: int16[8];
+  split(&p3[0], &p3[1], dec, pulses4, 3);
+  split(&p2[0], &p2[1], dec, (int32)p3[0], 2);
+  split(&p1[0], &p1[1], dec, (int32)p2[0], 1);
+  split(p0, p0 + 1, dec, (int32)p1[0], 0);
+  split(p0 + 2, p0 + 3, dec, (int32)p1[1], 0);
+  split(&p1[2], &p1[3], dec, (int32)p2[1], 1);
+  split(p0 + 4, p0 + 5, dec, (int32)p1[2], 0);
+  split(p0 + 6, p0 + 7, dec, (int32)p1[3], 0);
+  split(&p2[2], &p2[3], dec, (int32)p3[1], 2);
+  split(&p1[4], &p1[5], dec, (int32)p2[2], 1);
+  split(p0 + 8, p0 + 9, dec, (int32)p1[4], 0);
+  split(p0 + 10, p0 + 11, dec, (int32)p1[5], 0);
+  split(&p1[6], &p1[7], dec, (int32)p2[3], 1);
+  split(p0 + 12, p0 + 13, dec, (int32)p1[6], 0);
+  split(p0 + 14, p0 + 15, dec, (int32)p1[7], 0);
+}
+
+fn decode_pulses(dec: AudioOpusRc*, pulses: int16*, signal_type: int32, quant_offset_type: int32, frame_length: int32) {
+  var rate_level: int32 = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_RATE_LEVELS_ICDF[(signal_type >> 1) * 9], 8);
+  var iter: int32 = frame_length >> 4;
+  if (iter * 16 < frame_length) { iter = iter + 1; }
+  var sum_pulses: int32[20];
+  var nshifts: int32[20];
+  for i in 0..iter {
+    nshifts[i] = 0;
+    sum_pulses[i] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_PULSES_PER_BLOCK_ICDF[rate_level * 18], 8);
+    while (sum_pulses[i] == 17) {
+      nshifts[i] = nshifts[i] + 1;
+      var off: int32 = 0;
+      if (nshifts[i] == 10) { off = 1; }
+      sum_pulses[i] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_PULSES_PER_BLOCK_ICDF[9 * 18 + off], 8);
+    }
+  }
+  for i in 0..iter {
+    if (sum_pulses[i] > 0) {
+      shell_decoder(pulses + i * 16, dec, sum_pulses[i]);
+    } else {
+      for k in 0..16 { pulses[i * 16 + k] = 0; }
+    }
+  }
+  for i in 0..iter {
+    if (nshifts[i] > 0) {
+      var nls: int32 = nshifts[i];
+      var pp: int16* = pulses + i * 16;
+      for k in 0..16 {
+        var abs_q: int32 = (int32)pp[k];
+        for j in 0..nls {
+          abs_q = abs_q << 1;
+          abs_q = abs_q + audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_LSB_ICDF[0], 8);
+        }
+        pp[k] = (int16)abs_q;
+      }
+      sum_pulses[i] = sum_pulses[i] | (nls << 5);
+    }
+  }
+  // signs
+  var icdf: uint8[2];
+  icdf[1] = 0;
+  var base: int32 = 7 * (quant_offset_type + (signal_type << 1));
+  var blocks: int32 = (frame_length + 8) >> 4;
+  for i in 0..blocks {
+    var p: int32 = sum_pulses[i];
+    if (p > 0) {
+      icdf[0] = AUDIO_OPUS_SILK_SIGN_ICDF[base + imin(p & 0x1F, 6)];
+      var q: int16* = pulses + i * 16;
+      for j in 0..16 {
+        if (q[j] > 0) {
+          var b: int32 = audio_opus_rc_icdf(dec, &icdf[0], 8);
+          q[j] = (int16)((int32)q[j] * ((b << 1) - 1));
+        }
+      }
+    }
+  }
+}
+
+// ---- parameters (decode_parameters.c, gain_quant.c, NLSF_*.c) ----
+
+fn gains_dequant(gains: int32*, ind: int32*, prev_ind: int32*, conditional: bool, nb_subfr: int32) {
+  for k in 0..nb_subfr {
+    if (k == 0 && !conditional) {
+      *prev_ind = imax(ind[k], *prev_ind - 16);
+    } else {
+      var ind_tmp: int32 = ind[k] - 4;
+      var thr: int32 = 2 * 36 - 64 + *prev_ind;
+      if (ind_tmp > thr) {
+        *prev_ind = *prev_ind + (ind_tmp << 1) - thr;
+      } else {
+        *prev_ind = *prev_ind + ind_tmp;
+      }
+    }
+    *prev_ind = limit(*prev_ind, 0, 63);
+    gains[k] = log2lin(imin(smulwb(1907825, *prev_ind) + 2090, 3967));
+  }
+}
+
+fn nlsf_stabilize(nlsf: int16*, dmin: int16*, l: int32) {
+  var loops: int32 = 0;
+  while (loops < 20) {
+    var min_diff: int32 = (int32)nlsf[0] - (int32)dmin[0];
+    var ii: int32 = 0;
+    for i in 1..l {
+      var diff: int32 = (int32)nlsf[i] - ((int32)nlsf[i - 1] + (int32)dmin[i]);
+      if (diff < min_diff) { min_diff = diff; ii = i; }
+    }
+    var diff2: int32 = (1 << 15) - ((int32)nlsf[l - 1] + (int32)dmin[l]);
+    if (diff2 < min_diff) { min_diff = diff2; ii = l; }
+    if (min_diff >= 0) { return; }
+    if (ii == 0) {
+      nlsf[0] = dmin[0];
+    } else if (ii == l) {
+      nlsf[l - 1] = (int16)((1 << 15) - (int32)dmin[l]);
+    } else {
+      var min_center: int32 = 0;
+      for k in 0..ii { min_center = min_center + (int32)dmin[k]; }
+      min_center = min_center + ((int32)dmin[ii] >> 1);
+      var max_center: int32 = 1 << 15;
+      var k2: int32 = l;
+      while (k2 > ii) { max_center = max_center - (int32)dmin[k2]; k2 = k2 - 1; }
+      max_center = max_center - ((int32)dmin[ii] >> 1);
+      var center: int32 = (int32)(int16)limit(rshift_round((int32)nlsf[ii - 1] + (int32)nlsf[ii], 1), min_center, max_center);
+      nlsf[ii - 1] = (int16)(center - ((int32)dmin[ii] >> 1));
+      nlsf[ii] = (int16)((int32)nlsf[ii - 1] + (int32)dmin[ii]);
+    }
+    loops = loops + 1;
+  }
+  // fall back: sort, then force the distances
+  for i in 1..l {
+    var v: int16 = nlsf[i];
+    var j: int32 = i - 1;
+    while (j >= 0 && nlsf[j] > v) {
+      nlsf[j + 1] = nlsf[j];
+      j = j - 1;
+    }
+    nlsf[j + 1] = v;
+  }
+  nlsf[0] = (int16)imax((int32)nlsf[0], (int32)dmin[0]);
+  for i in 1..l {
+    var s: int32 = sat16((int32)nlsf[i - 1] + (int32)dmin[i]);
+    nlsf[i] = (int16)imax((int32)nlsf[i], s);
+  }
+  nlsf[l - 1] = (int16)imin((int32)nlsf[l - 1], (1 << 15) - (int32)dmin[l]);
+  var i2: int32 = l - 2;
+  while (i2 >= 0) {
+    nlsf[i2] = (int16)imin((int32)nlsf[i2], (int32)nlsf[i2 + 1] - (int32)dmin[i2 + 1]);
+    i2 = i2 - 1;
+  }
+}
+
+fn nlsf_decode(c: AudioOpusSilkCh*, nlsf: int16*) {
+  var order: int32 = c->lpc_order;
+  var ec_ix: int32[16];
+  var pred: int32[16];
+  var cb1: int32 = c->nlsf_idx[0];
+  nlsf_unpack(c, &ec_ix[0], &pred[0], cb1);
+  var step: int32 = 11796;          // 0.18 in Q16
+  if (order == 16) { step = 9830; }  // 0.15 in Q16
+  var res: int32[16];
+  var out: int32 = 0;
+  var i: int32 = order - 1;
+  while (i >= 0) {
+    var pq: int32 = smulbb(out, pred[i]) >> 8;
+    out = c->nlsf_idx[i + 1] << 10;
+    if (out > 0) { out = out - 102; } else if (out < 0) { out = out + 102; }
+    out = smlawb(pq, out, step);
+    res[i] = out;
+    i = i - 1;
+  }
+  for k in 0..order {
+    var cbv: int32 = 0;
+    var w: int32 = 0;
+    if (order == 16) {
+      cbv = (int32)AUDIO_OPUS_SILK_CB1_WB_Q8[cb1 * 16 + k];
+      w = (int32)AUDIO_OPUS_SILK_CB1_WB_W_Q9[cb1 * 16 + k];
+    } else {
+      cbv = (int32)AUDIO_OPUS_SILK_CB1_NBMB_Q8[cb1 * 10 + k];
+      w = (int32)AUDIO_OPUS_SILK_CB1_NBMB_W_Q9[cb1 * 10 + k];
+    }
+    var t: int32 = (((int32)(int16)res[k] << 14) / w) + (cbv << 7);
+    nlsf[k] = (int16)limit(t, 0, 32767);
+  }
+  if (order == 16) {
+    nlsf_stabilize(nlsf, &AUDIO_OPUS_SILK_DMIN_WB_Q15[0], 16);
+  } else {
+    nlsf_stabilize(nlsf, &AUDIO_OPUS_SILK_DMIN_NBMB_Q15[0], 10);
+  }
+}
+
+fn bwexpander_32(ar: int32*, d: int32, chirp0: int32) {
+  var chirp: int32 = chirp0;
+  var cm1: int32 = chirp - 65536;
+  for i in 0..d - 1 {
+    ar[i] = smulww(chirp, ar[i]);
+    chirp = chirp + rshift_round(chirp * cm1, 16);
+  }
+  ar[d - 1] = smulww(chirp, ar[d - 1]);
+}
+
+fn bwexpander(ar: int16*, d: int32, chirp0: int32) {
+  var chirp: int32 = chirp0;
+  var cm1: int32 = chirp - 65536;
+  for i in 0..d - 1 {
+    ar[i] = (int16)rshift_round(chirp * (int32)ar[i], 16);
+    chirp = chirp + rshift_round(chirp * cm1, 16);
+  }
+  ar[d - 1] = (int16)rshift_round(chirp * (int32)ar[d - 1], 16);
+}
+
+fn lpc_fit(a_out: int16*, a_in: int32*, qout: int32, qin: int32, d: int32) {
+  var i: int32 = 0;
+  var idx: int32 = 0;
+  while (i < 10) {
+    var maxabs: int32 = 0;
+    for k in 0..d {
+      var av: int32 = iabs(a_in[k]);
+      if (av > maxabs) { maxabs = av; idx = k; }
+    }
+    maxabs = rshift_round(maxabs, qin - qout);
+    if (maxabs > 32767) {
+      maxabs = imin(maxabs, 163838);
+      var chirp: int32 = 65470 - ((maxabs - 32767) << 14) / ((maxabs * (idx + 1)) >> 2);
+      bwexpander_32(a_in, d, chirp);
+    } else {
+      break;
+    }
+    i = i + 1;
+  }
+  if (i == 10) {
+    for k in 0..d {
+      a_out[k] = (int16)sat16(rshift_round(a_in[k], qin - qout));
+      a_in[k] = (int32)a_out[k] << (qin - qout);
+    }
+  } else {
+    for k in 0..d { a_out[k] = (int16)rshift_round(a_in[k], qin - qout); }
+  }
+}
+
+fn mul32_frac_q31(a: int32, b: int32) -> int32 {
+  return (int32)rshift_round64((int64)a * (int64)b, 31);
+}
+
+// 1 when the filter is stable enough (silk_LPC_inverse_pred_gain != 0)
+fn lpc_stable(a_q12: int16*, order: int32) -> bool {
+  var a: int32[16];
+  var dc: int32 = 0;
+  for k in 0..order {
+    dc = dc + (int32)a_q12[k];
+    a[k] = (int32)a_q12[k] << 12;
+  }
+  if (dc >= 4096) { return false; }
+  var limit_qa: int32 = 16773022;
+  var inv_gain: int32 = 1 << 30;
+  var k: int32 = order - 1;
+  while (k > 0) {
+    if (a[k] > limit_qa || a[k] < -limit_qa) { return false; }
+    var rc: int32 = -(a[k] << 7);
+    var rc_mult1: int32 = (1 << 30) - smmul(rc, rc);
+    inv_gain = smmul(inv_gain, rc_mult1) << 2;
+    if (inv_gain < 107374) { return false; }
+    var mult2q: int32 = 32 - clz32(iabs(rc_mult1));
+    var rc_mult2: int32 = inverse32_varq(rc_mult1, mult2q + 30);
+    for n in 0..(k + 1) >> 1 {
+      var t1: int32 = a[n];
+      var t2: int32 = a[k - n - 1];
+      var t64: int64 = rshift_round64((int64)sub_sat32(t1, mul32_frac_q31(t2, rc)) * (int64)rc_mult2, mult2q);
+      if (t64 > 2147483647 || t64 < -2147483648) { return false; }
+      a[n] = (int32)t64;
+      t64 = rshift_round64((int64)sub_sat32(t2, mul32_frac_q31(t1, rc)) * (int64)rc_mult2, mult2q);
+      if (t64 > 2147483647 || t64 < -2147483648) { return false; }
+      a[k - n - 1] = (int32)t64;
+    }
+    k = k - 1;
+  }
+  if (a[0] > limit_qa || a[0] < -limit_qa) { return false; }
+  var rc0: int32 = -(a[0] << 7);
+  var m1: int32 = (1 << 30) - smmul(rc0, rc0);
+  inv_gain = smmul(inv_gain, m1) << 2;
+  if (inv_gain < 107374) { return false; }
+  return true;
+}
+
+fn find_poly(out: int32*, c: int32*, dd: int32) {
+  out[0] = 1 << 16;
+  out[1] = -c[0];
+  for k in 1..dd {
+    var ftmp: int32 = c[2 * k];
+    out[k + 1] = (out[k - 1] << 1) - (int32)rshift_round64((int64)ftmp * (int64)out[k], 16);
+    var n: int32 = k;
+    while (n > 1) {
+      out[n] = out[n] + out[n - 2] - (int32)rshift_round64((int64)ftmp * (int64)out[n - 1], 16);
+      n = n - 1;
+    }
+    out[1] = out[1] - ftmp;
+  }
+}
+
+const ORDER16: int32[16] = [0, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1];
+const ORDER10: int32[10] = [0, 9, 6, 3, 4, 5, 8, 1, 2, 7];
+
+fn nlsf2a(a_q12: int16*, nlsf: int16*, d: int32) {
+  var cos_lsf: int32[16];
+  for k in 0..d {
+    var f_int: int32 = (int32)nlsf[k] >> 8;
+    var f_frac: int32 = (int32)nlsf[k] - (f_int << 8);
+    if (f_int < 0) { f_int = 0; }
+    if (f_int > 127) { f_int = 127; }
+    var cv: int32 = (int32)AUDIO_OPUS_SILK_LSF_COS_Q12[f_int];
+    var delta: int32 = (int32)AUDIO_OPUS_SILK_LSF_COS_Q12[f_int + 1] - cv;
+    var o: int32 = ORDER10[imin(k, 9)];
+    if (d == 16) { o = ORDER16[k]; }
+    cos_lsf[o] = rshift_round((cv << 8) + delta * f_frac, 4);
+  }
+  var dd: int32 = d >> 1;
+  var p: int32[9];
+  var q: int32[9];
+  find_poly(&p[0], &cos_lsf[0], dd);
+  find_poly(&q[0], &cos_lsf[1], dd);
+  var a32: int32[16];
+  for k in 0..dd {
+    var pt: int32 = p[k + 1] + p[k];
+    var qt: int32 = q[k + 1] - q[k];
+    a32[k] = -qt - pt;
+    a32[d - k - 1] = qt - pt;
+  }
+  lpc_fit(a_q12, &a32[0], 12, 17, d);
+  var i: int32 = 0;
+  while (!lpc_stable(a_q12, d) && i < 16) {
+    bwexpander_32(&a32[0], d, 65536 - (2 << i));
+    for k in 0..d { a_q12[k] = (int16)rshift_round(a32[k], 5); }
+    i = i + 1;
+  }
+}
+
+fn decode_pitch(lag_index: int32, contour: int32, lags: int32*, fs_khz: int32, nb_subfr: int32) {
+  var min_lag: int32 = 2 * fs_khz;
+  var max_lag: int32 = 18 * fs_khz;
+  var lag: int32 = min_lag + lag_index;
+  for k in 0..nb_subfr {
+    var off: int32 = 0;
+    if (fs_khz == 8) {
+      if (nb_subfr == 4) {
+        off = (int32)AUDIO_OPUS_SILK_CB_LAGS_STAGE2[k * 11 + imin(contour, 10)];
+      } else {
+        off = (int32)AUDIO_OPUS_SILK_CB_LAGS_STAGE2_10MS[k * 3 + imin(contour, 2)];
+      }
+    } else {
+      if (nb_subfr == 4) {
+        off = (int32)AUDIO_OPUS_SILK_CB_LAGS_STAGE3[k * 34 + imin(contour, 33)];
+      } else {
+        off = (int32)AUDIO_OPUS_SILK_CB_LAGS_STAGE3_10MS[k * 12 + imin(contour, 11)];
+      }
+    }
+    lags[k] = limit(lag + off, min_lag, max_lag);
+  }
+}
+
+fn decode_parameters(c: AudioOpusSilkCh*, ctrl: SilkCtrl*, cond: int32) {
+  gains_dequant(&ctrl->gains[0], &c->gains_idx[0], &c->last_gain_index, cond == CODE_COND, c->nb_subfr);
+  var nlsf: int16[16];
+  var nlsf0: int16[16];
+  nlsf_decode(c, &nlsf[0]);
+  var order: int32 = c->lpc_order;
+  nlsf2a(&ctrl->pred[16], &nlsf[0], order);
+  if (c->first_frame_after_reset == 1) { c->nlsf_interp = 4; }
+  if (c->nlsf_interp < 4) {
+    for i in 0..order {
+      nlsf0[i] = (int16)((int32)c->prev_nlsf[i] + ((c->nlsf_interp * ((int32)nlsf[i] - (int32)c->prev_nlsf[i])) >> 2));
+    }
+    nlsf2a(&ctrl->pred[0], &nlsf0[0], order);
+  } else {
+    for i in 0..order { ctrl->pred[i] = ctrl->pred[16 + i]; }
+  }
+  for i in 0..order { c->prev_nlsf[i] = nlsf[i]; }
+  if (c->loss_cnt != 0) {
+    bwexpander(&ctrl->pred[0], order, 63570);
+    bwexpander(&ctrl->pred[16], order, 63570);
+  }
+  if (c->signal_type == TYPE_VOICED) {
+    decode_pitch(c->lag_index, c->contour_index, &ctrl->pitch_l[0], c->fs_khz, c->nb_subfr);
+    for k in 0..c->nb_subfr {
+      var ix: int32 = c->ltp_idx[k];
+      for i in 0..LTP_ORDER {
+        var v: int32 = 0;
+        if (c->per_index == 0) {
+          v = (int32)AUDIO_OPUS_SILK_LTP_VQ_0[imin(ix, 7) * 5 + i];
+        } else if (c->per_index == 1) {
+          v = (int32)AUDIO_OPUS_SILK_LTP_VQ_1[imin(ix, 15) * 5 + i];
+        } else {
+          v = (int32)AUDIO_OPUS_SILK_LTP_VQ_2[imin(ix, 31) * 5 + i];
+        }
+        ctrl->ltp[k * LTP_ORDER + i] = (int16)(v << 7);
+      }
+    }
+    ctrl->ltp_scale = (int32)AUDIO_OPUS_SILK_LTPSCALES_Q14[imin(c->ltp_scale_index, 2)];
+  } else {
+    for k in 0..4 { ctrl->pitch_l[k] = 0; }
+    for k in 0..20 { ctrl->ltp[k] = 0; }
+    c->per_index = 0;
+    ctrl->ltp_scale = 0;
+  }
+}
+
+// ---- synthesis (decode_core.c) ----
+
+fn lpc_analysis_filter(out: int16*, inp: int16*, b: int16*, len: int32, d: int32) {
+  var ix: int32 = d;
+  while (ix < len) {
+    var ip: int16* = inp + (ix - 1);
+    var acc: int32 = smulbb((int32)ip[0], (int32)b[0]);
+    for j in 1..d {
+      acc = acc + smulbb((int32)ip[-j], (int32)b[j]);
+    }
+    acc = ((int32)ip[1] << 12) - acc;
+    out[ix] = (int16)sat16(rshift_round(acc, 12));
+    ix = ix + 1;
+  }
+  for j in 0..d { out[j] = 0; }
+}
+
+fn decode_core(sd: AudioOpusSilk*, c: AudioOpusSilkCh*, ctrl: SilkCtrl*, xq: int16*, pulses: int16*) {
+  var sltp: int16* = &sd->sltp[0];
+  var sltp_q15: int32* = &sd->sltp_q15[0];
+  var res: int32* = &sd->res[0];
+  var slpc: int32* = &sd->slpc_buf[0];
+  var offset: int32 = (int32)AUDIO_OPUS_SILK_QUANT_OFFSETS_Q10[(c->signal_type >> 1) * 2 + c->quant_offset_type];
+  var interp_flag: bool = c->nlsf_interp < 4;
+  var seed: int32 = c->seed;
+  for i in 0..c->frame_length {
+    seed = 907633515 + seed * 196314165;
+    var e: int32 = (int32)pulses[i] << 14;
+    if (e > 0) { e = e - (80 << 4); } else if (e < 0) { e = e + (80 << 4); }
+    e = e + (offset << 4);
+    if (seed < 0) { e = -e; }
+    c->exc[i] = e;
+    seed = seed + (int32)pulses[i];
+  }
+  for i in 0..MAX_LPC { slpc[i] = c->slpc[i]; }
+  var pexc: int32 = 0;
+  var pxq: int32 = 0;
+  var sltp_idx: int32 = c->ltp_mem_length;
+  var order: int32 = c->lpc_order;
+  var subfr: int32 = c->subfr_length;
+  var lag: int32 = 0;
+  for k in 0..c->nb_subfr {
+    var a: int16* = &ctrl->pred[(k >> 1) * 16];
+    var b: int16* = &ctrl->ltp[k * LTP_ORDER];
+    var signal_type: int32 = c->signal_type;
+    var gain_q10: int32 = ctrl->gains[k] >> 6;
+    var inv_gain: int32 = inverse32_varq(ctrl->gains[k], 47);
+    var gain_adj: int32 = 65536;
+    if (ctrl->gains[k] != c->prev_gain) {
+      gain_adj = div32_varq(c->prev_gain, ctrl->gains[k], 16);
+      for i in 0..MAX_LPC { slpc[i] = smulww(gain_adj, slpc[i]); }
+    }
+    c->prev_gain = ctrl->gains[k];
+    if (c->loss_cnt != 0 && c->prev_signal_type == TYPE_VOICED && c->signal_type != TYPE_VOICED && k < 2) {
+      for i in 0..LTP_ORDER { b[i] = 0; }
+      b[2] = 4096;
+      signal_type = TYPE_VOICED;
+      ctrl->pitch_l[k] = c->lag_prev;
+    }
+    if (signal_type == TYPE_VOICED) {
+      lag = ctrl->pitch_l[k];
+      if (k == 0 || (k == 2 && interp_flag)) {
+        var start_idx: int32 = c->ltp_mem_length - lag - order - LTP_ORDER / 2;
+        if (start_idx < 0) { start_idx = 0; }
+        if (k == 2) {
+          for i in 0..2 * subfr { c->out_buf[c->ltp_mem_length + i] = xq[i]; }
+        }
+        lpc_analysis_filter(sltp + start_idx, &c->out_buf[start_idx + k * subfr], a, c->ltp_mem_length - start_idx, order);
+        if (k == 0) {
+          inv_gain = smulwb(inv_gain, ctrl->ltp_scale) << 2;
+        }
+        var cnt: int32 = imin(lag + LTP_ORDER / 2, c->ltp_mem_length);
+        for i in 0..cnt {
+          sltp_q15[sltp_idx - i - 1] = smulwb(inv_gain, (int32)sltp[c->ltp_mem_length - i - 1]);
+        }
+      } else {
+        if (gain_adj != 65536) {
+          var cnt2: int32 = imin(lag + LTP_ORDER / 2, sltp_idx);
+          for i in 0..cnt2 {
+            sltp_q15[sltp_idx - i - 1] = smulww(gain_adj, sltp_q15[sltp_idx - i - 1]);
+          }
+        }
+      }
+    }
+    var pres: int32* = res;
+    if (signal_type == TYPE_VOICED) {
+      var pl: int32 = sltp_idx - lag + LTP_ORDER / 2;
+      for i in 0..subfr {
+        var p: int32* = sltp_q15 + pl;
+        var ltp_pred: int32 = 2;
+        ltp_pred = smlawb(ltp_pred, p[0], (int32)b[0]);
+        ltp_pred = smlawb(ltp_pred, p[-1], (int32)b[1]);
+        ltp_pred = smlawb(ltp_pred, p[-2], (int32)b[2]);
+        ltp_pred = smlawb(ltp_pred, p[-3], (int32)b[3]);
+        ltp_pred = smlawb(ltp_pred, p[-4], (int32)b[4]);
+        pl = pl + 1;
+        res[i] = c->exc[pexc + i] + (ltp_pred << 1);
+        sltp_q15[sltp_idx] = res[i] << 1;
+        sltp_idx = sltp_idx + 1;
+      }
+    } else {
+      pres = &c->exc[pexc];
+    }
+    for i in 0..subfr {
+      var lp: int32 = order >> 1;
+      var sp: int32* = slpc + (MAX_LPC + i - 1);
+      for j in 0..order { lp = smlawb(lp, sp[-j], (int32)a[j]); }
+      slpc[MAX_LPC + i] = add_sat32(pres[i], lshift_sat32(lp, 4));
+      xq[pxq + i] = (int16)sat16(rshift_round(smulww(slpc[MAX_LPC + i], gain_q10), 8));
+    }
+    for i in 0..MAX_LPC { slpc[i] = slpc[subfr + i]; }
+    pexc = pexc + subfr;
+    pxq = pxq + subfr;
+  }
+  for i in 0..MAX_LPC { c->slpc[i] = slpc[i]; }
+}
+
+fn decode_frame(sd: AudioOpusSilk*, c: AudioOpusSilkCh*, dec: AudioOpusRc*, out: int16*, lost: int32, cond: int32) -> int32 {
+  var l: int32 = c->frame_length;
+  if (l <= 0 || l > 320) { return AUDIO_E_DATA; }
+  var ctrl: SilkCtrl;
+  ctrl.ltp_scale = 0;
+  if (lost == 0) {
+    decode_indices(c, dec, c->frames_decoded, false, cond);
+    var pulses: int16* = &sd->pulses[0];
+    decode_pulses(dec, pulses, c->signal_type, c->quant_offset_type, l);
+    decode_parameters(c, &ctrl, cond);
+    decode_core(sd, c, &ctrl, out, pulses);
+    c->loss_cnt = 0;
+    c->prev_signal_type = c->signal_type;
+    c->first_frame_after_reset = 0;
+    c->lag_prev = ctrl.pitch_l[c->nb_subfr - 1];
+  } else {
+    // concealment is silence (see the note at the top)
+    for i in 0..l { out[i] = 0; }
+    c->loss_cnt = c->loss_cnt + 1;
+  }
+  var mv: int32 = c->ltp_mem_length - l;
+  if (mv < 0) { mv = 0; }
+  for i in 0..mv { c->out_buf[i] = c->out_buf[i + l]; }
+  for i in 0..l { c->out_buf[mv + i] = out[i]; }
+  return AUDIO_OK;
+}
+
+// ---- stereo (stereo_decode_pred.c, stereo_MS_to_LR.c) ----
+
+fn stereo_decode_pred(dec: AudioOpusRc*, pred: int32*) {
+  var ix: int32[6];
+  var n: int32 = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_STEREO_JOINT_ICDF[0], 8);
+  ix[2] = n / 5;
+  ix[5] = n - 5 * ix[2];
+  for k in 0..2 {
+    ix[k * 3] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_UNIFORM3_ICDF[0], 8);
+    ix[k * 3 + 1] = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_UNIFORM5_ICDF[0], 8);
+  }
+  for k in 0..2 {
+    var i0: int32 = ix[k * 3] + 3 * ix[k * 3 + 2];
+    if (i0 > 14) { i0 = 14; }
+    var low: int32 = (int32)AUDIO_OPUS_SILK_STEREO_PRED_Q13[i0];
+    var step: int32 = smulwb((int32)AUDIO_OPUS_SILK_STEREO_PRED_Q13[i0 + 1] - low, 6554);
+    pred[k] = low + smulbb(step, 2 * ix[k * 3 + 1] + 1);
+  }
+  pred[0] = pred[0] - pred[1];
+}
+
+fn ms_to_lr(s: AudioOpusSilk*, x1: int16*, x2: int16*, pred: int32*, fs_khz: int32, len: int32) {
+  x1[0] = s->s_mid[0];
+  x1[1] = s->s_mid[1];
+  x2[0] = s->s_side[0];
+  x2[1] = s->s_side[1];
+  s->s_mid[0] = x1[len];
+  s->s_mid[1] = x1[len + 1];
+  s->s_side[0] = x2[len];
+  s->s_side[1] = x2[len + 1];
+  var p0: int32 = s->pred_prev[0];
+  var p1: int32 = s->pred_prev[1];
+  var denom: int32 = 65536 / (8 * fs_khz);
+  var d0: int32 = rshift_round(smulbb(pred[0] - s->pred_prev[0], denom), 16);
+  var d1: int32 = rshift_round(smulbb(pred[1] - s->pred_prev[1], denom), 16);
+  var ilen: int32 = 8 * fs_khz;
+  for n in 0..len {
+    if (n < ilen) {
+      p0 = p0 + d0;
+      p1 = p1 + d1;
+    } else if (n == ilen) {
+      p0 = pred[0];
+      p1 = pred[1];
+    }
+    var sum: int32 = (((int32)x1[n] + (int32)x1[n + 2]) + ((int32)x1[n + 1] << 1)) << 9;
+    sum = smlawb((int32)x2[n + 1] << 8, sum, p0);
+    sum = smlawb(sum, (int32)x1[n + 1] << 11, p1);
+    x2[n + 1] = (int16)sat16(rshift_round(sum, 8));
+  }
+  s->pred_prev[0] = pred[0];
+  s->pred_prev[1] = pred[1];
+  for n in 0..len {
+    var a: int32 = (int32)x1[n + 1] + (int32)x2[n + 1];
+    var b: int32 = (int32)x1[n + 1] - (int32)x2[n + 1];
+    x1[n + 1] = (int16)sat16(a);
+    x2[n + 1] = (int16)sat16(b);
+  }
+}
+
+// ---- one SILK frame (dec_API.c) ----
+
+/// Decodes the next 10 or 20 ms SILK frame of the packet into `out`
+/// (48 kHz, s->api_channels interleaved). `first` is true for the first
+/// call of a packet. lost != 0 conceals a frame. *got is set to frames.
+export fn audio_opus_silk_decode(s: AudioOpusSilk*, lost: int32, first: bool, dec: AudioOpusRc*, out: int16*, room: int32, got: int32*) -> int32 {
+  *got = 0;
+  var nint: int32 = s->internal_channels;
+  var napi: int32 = s->api_channels;
+  if (nint < 1 || nint > 2 || napi < 1 || napi > 2) { return AUDIO_E_ARG; }
+  var c0: AudioOpusSilkCh* = &s->c0;
+  var c1: AudioOpusSilkCh* = &s->c1;
+  if (first) {
+    for n in 0..nint { chan(s, n)->frames_decoded = 0; }
+  }
+  if (nint > s->n_internal) { reset_chan(c1); }
+  var stereo_to_mono: bool = nint == 1 && s->n_internal == 2 && s->internal_rate == 1000 * c0->fs_khz;
+  if (c0->frames_decoded == 0) {
+    for n in 0..nint {
+      var c: AudioOpusSilkCh* = chan(s, n);
+      var ms: int32 = s->payload_ms;
+      if (ms == 10) {
+        c->frames_per_packet = 1;
+        c->nb_subfr = 2;
+      } else if (ms == 20) {
+        c->frames_per_packet = 1;
+        c->nb_subfr = 4;
+      } else if (ms == 40) {
+        c->frames_per_packet = 2;
+        c->nb_subfr = 4;
+      } else if (ms == 60) {
+        c->frames_per_packet = 3;
+        c->nb_subfr = 4;
+      } else {
+        return AUDIO_E_DATA;
+      }
+      var fs: int32 = (s->internal_rate >> 10) + 1;
+      if (fs != 8 && fs != 12 && fs != 16) { return AUDIO_E_DATA; }
+      if (set_fs(c, fs, 48000) != 0) { return AUDIO_E_DATA; }
+    }
+  }
+  if (napi == 2 && nint == 2 && (s->n_api == 1 || s->n_internal == 1)) {
+    s->pred_prev[0] = 0;
+    s->pred_prev[1] = 0;
+    s->s_side[0] = 0;
+    s->s_side[1] = 0;
+    c1->rs = c0->rs;
+  }
+  s->n_api = napi;
+  s->n_internal = nint;
+  if (c0->frames_decoded >= c0->frames_per_packet) { return AUDIO_E_DATA; }
+
+  var pred: int32[2];
+  pred[0] = 0;
+  pred[1] = 0;
+  var decode_only_middle: int32 = 0;
+  if (lost == 0 && c0->frames_decoded == 0) {
+    for n in 0..nint {
+      var c: AudioOpusSilkCh* = chan(s, n);
+      for i in 0..c->frames_per_packet { c->vad_flags[i] = audio_opus_rc_bit_logp(dec, 1); }
+      c->lbrr_flag = audio_opus_rc_bit_logp(dec, 1);
+    }
+    for n in 0..nint {
+      var c: AudioOpusSilkCh* = chan(s, n);
+      for i in 0..3 { c->lbrr_flags[i] = 0; }
+      if (c->lbrr_flag != 0) {
+        if (c->frames_per_packet == 1) {
+          c->lbrr_flags[0] = 1;
+        } else {
+          var sym: int32 = 0;
+          if (c->frames_per_packet == 2) {
+            sym = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_LBRR_FLAGS_2_ICDF[0], 8) + 1;
+          } else {
+            sym = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_LBRR_FLAGS_3_ICDF[0], 8) + 1;
+          }
+          for i in 0..c->frames_per_packet { c->lbrr_flags[i] = (sym >> i) & 1; }
+        }
+      }
+    }
+    // skip the redundant (LBRR) frames: decode and drop them
+    for i in 0..c0->frames_per_packet {
+      for n in 0..nint {
+        var c: AudioOpusSilkCh* = chan(s, n);
+        if (c->lbrr_flags[i] != 0) {
+          if (nint == 2 && n == 0) {
+            stereo_decode_pred(dec, &pred[0]);
+            if (c1->lbrr_flags[i] == 0) {
+              decode_only_middle = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_STEREO_MID_ONLY_ICDF[0], 8);
+            }
+          }
+          var cond: int32 = CODE_INDEP;
+          if (i > 0 && c->lbrr_flags[i - 1] != 0) { cond = CODE_COND; }
+          // decoding indices changes the entropy coding history, as in the reference
+          decode_indices(c, dec, i, true, cond);
+          decode_pulses(dec, &s->pulses[0], c->signal_type, c->quant_offset_type, c->frame_length);
+        }
+      }
+    }
+  }
+  if (nint == 2) {
+    if (lost == 0) {
+      stereo_decode_pred(dec, &pred[0]);
+      if (c1->vad_flags[c0->frames_decoded] == 0) {
+        decode_only_middle = audio_opus_rc_icdf(dec, &AUDIO_OPUS_SILK_STEREO_MID_ONLY_ICDF[0], 8);
+      } else {
+        decode_only_middle = 0;
+      }
+    } else {
+      pred[0] = s->pred_prev[0];
+      pred[1] = s->pred_prev[1];
+    }
+  }
+  if (nint == 2 && decode_only_middle == 0 && s->prev_decode_only_middle == 1) {
+    for i in 0..480 { c1->out_buf[i] = 0; }
+    for i in 0..16 { c1->slpc[i] = 0; }
+    c1->lag_prev = 100;
+    c1->last_gain_index = 10;
+    c1->prev_signal_type = TYPE_NO_VOICE;
+    c1->first_frame_after_reset = 1;
+  }
+  var fl: int32 = c0->frame_length;
+  var t0: int16* = &s->tmp1[0];
+  var t1: int16* = &s->tmp1[fl + 2];
+  var has_side: bool = false;
+  if (lost == 0) {
+    has_side = decode_only_middle == 0;
+  } else {
+    has_side = s->prev_decode_only_middle == 0;
+  }
+  var nout_dec: int32 = fl;
+  for n in 0..nint {
+    var c: AudioOpusSilkCh* = chan(s, n);
+    var tp: int16* = t0;
+    if (n == 1) { tp = t1; }
+    if (n == 0 || has_side) {
+      var fi: int32 = c0->frames_decoded - n;
+      var cond: int32 = CODE_COND;
+      if (fi <= 0) {
+        cond = CODE_INDEP;
+      } else if (n > 0 && s->prev_decode_only_middle != 0) {
+        cond = CODE_INDEP_NO_LTP;
+      }
+      if (c->frame_length != fl) { return AUDIO_E_DATA; }
+      var rc: int32 = decode_frame(s, c, dec, tp + 2, lost, cond);
+      if (rc < 0) { return rc; }
+    } else {
+      for i in 0..nout_dec { tp[2 + i] = 0; }
+    }
+    c->frames_decoded = c->frames_decoded + 1;
+  }
+  if (napi == 2 && nint == 2) {
+    ms_to_lr(s, t0, t1, &pred[0], c0->fs_khz, nout_dec);
+  } else {
+    t0[0] = s->s_mid[0];
+    t0[1] = s->s_mid[1];
+    s->s_mid[0] = t0[nout_dec];
+    s->s_mid[1] = t0[nout_dec + 1];
+  }
+  var nout: int32 = nout_dec * 48 / c0->fs_khz;
+  if (nout > room || nout > 960) { return AUDIO_E_LIMIT; }
+  var rout: int16* = &s->tmp2[0];
+  if (napi == 1) { rout = out; }
+  for n in 0..imin(napi, nint) {
+    var c: AudioOpusSilkCh* = chan(s, n);
+    var tp: int16* = t0;
+    if (n == 1) { tp = t1; }
+    rs_run(s, &c->rs, rout, tp + 1, nout_dec);
+    if (napi == 2) {
+      for i in 0..nout { out[n + 2 * i] = rout[i]; }
+    }
+  }
+  if (napi == 2 && nint == 1) {
+    if (stereo_to_mono) {
+      rs_run(s, &c1->rs, rout, t0 + 1, nout_dec);
+      for i in 0..nout { out[1 + 2 * i] = rout[i]; }
+    } else {
+      for i in 0..nout { out[1 + 2 * i] = out[2 * i]; }
+    }
+  }
+  if (lost != 0) {
+    for n in 0..s->n_internal { chan(s, n)->last_gain_index = 10; }
+  } else {
+    s->prev_decode_only_middle = decode_only_middle;
+  }
+  *got = nout;
+  return AUDIO_OK;
+}

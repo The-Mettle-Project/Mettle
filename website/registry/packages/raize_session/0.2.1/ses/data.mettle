@@ -1,0 +1,236 @@
+// Per-session data (a small bounded string map) and flash messages. Both
+// are stored in the record in one encoding: entries of
+//   [key length: 1 byte][value length: 2 bytes, little-endian][key][value]
+// Plain Mettle, no crypto. Changes mark the session dirty; ses_save or
+// ses_touch persists them. Values read are views into the session.
+//
+// A corrupt encoding (from a misbehaving store) is read up to the first bad
+// entry; the rest is ignored, never read out of bounds.
+
+import "std/mem";
+import "std/conv";
+import "status";
+import "types";
+
+// Size of the entry at off, or -1 if it does not fit in len.
+fn ses_kv_entry(buf: uint8*, len: int64, off: int64) -> int64 {
+  if (off + 3 > len) { return -1; }
+  var kl: int64 = (int64)buf[off];
+  var vl: int64 = (int64)buf[off + 1] | ((int64)buf[off + 2] << 8);
+  if (kl == 0) { return -1; }
+  var sz: int64 = 3 + kl + vl;
+  if (off + sz > len) { return -1; }
+  return sz;
+}
+
+fn ses_kv_key_is(buf: uint8*, off: int64, key: string) -> bool {
+  var kl: int64 = (int64)buf[off];
+  if (kl != (int64)key.length) { return false; }
+  return mem_equal((cstring)&buf[off + 3], (cstring)key.chars, kl) == 1;
+}
+
+// Offset of the entry with this key, or -1.
+fn ses_kv_find(buf: uint8*, len: int64, key: string) -> int64 {
+  var off: int64 = 0;
+  while (off < len) {
+    var sz: int64 = ses_kv_entry(buf, len, off);
+    if (sz < 0) { return -1; }
+    if (ses_kv_key_is(buf, off, key)) { return off; }
+    off = off + sz;
+  }
+  return -1;
+}
+
+// Offset of the i-th entry, or -1.
+fn ses_kv_nth(buf: uint8*, len: int64, i: int32) -> int64 {
+  var off: int64 = 0;
+  var k: int32 = 0;
+  while (off < len) {
+    var sz: int64 = ses_kv_entry(buf, len, off);
+    if (sz < 0) { return -1; }
+    if (k == i) { return off; }
+    k = k + 1;
+    off = off + sz;
+  }
+  return -1;
+}
+
+fn ses_kv_count(buf: uint8*, len: int64) -> int32 {
+  var off: int64 = 0;
+  var k: int32 = 0;
+  while (off < len) {
+    var sz: int64 = ses_kv_entry(buf, len, off);
+    if (sz < 0) { return k; }
+    k = k + 1;
+    off = off + sz;
+  }
+  return k;
+}
+
+fn ses_kv_remove(buf: uint8*, len: int64*, off: int64) {
+  var sz: int64 = ses_kv_entry(buf, *len, off);
+  if (sz < 0) { return; }
+  var tail: int64 = *len - off - sz;
+  if (tail > 0) { memmove(&buf[off], &buf[off + sz], tail); }
+  memset((rawptr)&buf[*len - sz], 0, sz);
+  *len = *len - sz;
+}
+
+fn ses_kv_append(buf: uint8*, len: int64*, key: string, value: string) {
+  var off: int64 = *len;
+  var kl: int64 = (int64)key.length;
+  var vl: int64 = (int64)value.length;
+  buf[off] = (uint8)kl;
+  buf[off + 1] = (uint8)(vl & 255);
+  buf[off + 2] = (uint8)((vl >> 8) & 255);
+  memcpy(&buf[off + 3], key.chars, kl);
+  if (vl > 0) { memcpy(&buf[off + 3 + kl], value.chars, vl); }
+  *len = off + 3 + kl + vl;
+}
+
+fn ses_kv_value(buf: uint8*, off: int64) -> string {
+  var kl: int64 = (int64)buf[off];
+  var vl: int64 = (int64)buf[off + 1] | ((int64)buf[off + 2] << 8);
+  return str_from_bytes((cstring)&buf[off + 3 + kl], vl);
+}
+
+fn ses_kv_key(buf: uint8*, off: int64) -> string {
+  return str_from_bytes((cstring)&buf[off + 3], (int64)buf[off]);
+}
+
+/// Reads a session data value.
+/// in: s, a live session; key, 1..SES_DATA_KEY_MAX bytes; out, receives
+///   the value
+/// returns: SES_OK; SES_E_NOT_FOUND (no such key); SES_E_INVALID (s not
+///   live); SES_E_ARG (null pointer, bad key length)
+/// owns: *out is a view into s, valid until s changes; copy it to keep it
+/// thread: any thread (pure Mettle; no crypto call)
+/// example: var cart: string; if (ses_data_get(&s, "cart", &cart) == SES_OK) { ... }
+export fn ses_data_get(s: SesSession*, key: string, out: string*) -> int32 {
+  if (s == 0 || out == 0) { return SES_E_ARG; }
+  *out = "";
+  if (!s->live) { return SES_E_INVALID; }
+  if (key.length == 0 || key.length > (uint64)SES_DATA_KEY_MAX) { return SES_E_ARG; }
+  var off: int64 = ses_kv_find(&s->rec.data[0], s->rec.data_len, key);
+  if (off < 0) { return SES_E_NOT_FOUND; }
+  *out = ses_kv_value(&s->rec.data[0], off);
+  return SES_OK;
+}
+
+/// Sets (inserts or replaces) a session data value; persisted by the next
+/// ses_save / ses_touch.
+/// in: s, a live session; key, 1..SES_DATA_KEY_MAX bytes; value,
+///   0..SES_DATA_VALUE_MAX bytes (any bytes)
+/// returns: SES_OK; SES_E_LIMIT (key or value too long, more than
+///   SES_DATA_ENTRIES_MAX keys, or SES_DATA_CAP bytes exceeded; s
+///   unchanged); SES_E_INVALID (s not live); SES_E_ARG (null s, empty key)
+/// owns: copies key and value into s
+/// thread: any thread (pure Mettle; no crypto call)
+/// example: ses_data_set(&s, "theme", "dark");
+export fn ses_data_set(s: SesSession*, key: string, value: string) -> int32 {
+  if (s == 0 || key.length == 0) { return SES_E_ARG; }
+  if (!s->live) { return SES_E_INVALID; }
+  if (key.length > (uint64)SES_DATA_KEY_MAX || value.length > (uint64)SES_DATA_VALUE_MAX) { return SES_E_LIMIT; }
+  var buf: uint8* = &s->rec.data[0];
+  var len: int64 = s->rec.data_len;
+  if (len < 0 || len > (int64)SES_DATA_CAP) { len = 0; }
+  var off: int64 = ses_kv_find(buf, len, key);
+  var count: int32 = ses_kv_count(buf, len);
+  var freed: int64 = 0;
+  if (off >= 0) {
+    freed = ses_kv_entry(buf, len, off);
+    count = count - 1;
+  }
+  var need: int64 = 3 + (int64)key.length + (int64)value.length;
+  if (count + 1 > SES_DATA_ENTRIES_MAX) { return SES_E_LIMIT; }
+  if (len - freed + need > (int64)SES_DATA_CAP) { return SES_E_LIMIT; }
+  if (off >= 0) { ses_kv_remove(buf, &len, off); }
+  ses_kv_append(buf, &len, key, value);
+  s->rec.data_len = len;
+  s->dirty = true;
+  return SES_OK;
+}
+
+/// Deletes a session data key; persisted by the next ses_save / ses_touch.
+/// in: s, a live session; key, 1..SES_DATA_KEY_MAX bytes
+/// returns: SES_OK; SES_E_NOT_FOUND; SES_E_INVALID (s not live); SES_E_ARG
+/// owns: nothing
+/// thread: any thread (pure Mettle; no crypto call)
+/// example: ses_data_del(&s, "cart");
+export fn ses_data_del(s: SesSession*, key: string) -> int32 {
+  if (s == 0) { return SES_E_ARG; }
+  if (!s->live) { return SES_E_INVALID; }
+  if (key.length == 0 || key.length > (uint64)SES_DATA_KEY_MAX) { return SES_E_ARG; }
+  var len: int64 = s->rec.data_len;
+  var off: int64 = ses_kv_find(&s->rec.data[0], len, key);
+  if (off < 0) { return SES_E_NOT_FOUND; }
+  ses_kv_remove(&s->rec.data[0], &len, off);
+  s->rec.data_len = len;
+  s->dirty = true;
+  return SES_OK;
+}
+
+/// Counts a session's data entries.
+/// in: s, a session
+/// returns: the number of keys (0 when s is not live)
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: var n: int32 = ses_data_count(&s);
+export fn ses_data_count(s: SesSession*) -> int32 {
+  if (s == 0 || !s->live) { return 0; }
+  return ses_kv_count(&s->rec.data[0], s->rec.data_len);
+}
+
+/// Queues a one-shot flash message: it is stored with the session (by the
+/// next ses_save / ses_touch) and handed out by the next ses_lookup only.
+/// in: s, a live session; kind, 1..SES_FLASH_KIND_MAX bytes ("notice",
+///   "error", ...); text, 0..SES_FLASH_TEXT_MAX bytes
+/// returns: SES_OK; SES_E_LIMIT (kind or text too long, more than
+///   SES_FLASH_MAX queued, or SES_FLASH_CAP bytes exceeded; s unchanged);
+///   SES_E_INVALID (s not live); SES_E_ARG (null s, empty kind)
+/// owns: copies kind and text into s
+/// thread: any thread (pure Mettle; no crypto call)
+/// example: ses_flash_add(&s, "notice", "Profile saved."); ses_save(&m, &s);
+export fn ses_flash_add(s: SesSession*, kind: string, text: string) -> int32 {
+  if (s == 0 || kind.length == 0) { return SES_E_ARG; }
+  if (!s->live) { return SES_E_INVALID; }
+  if (kind.length > (uint64)SES_FLASH_KIND_MAX || text.length > (uint64)SES_FLASH_TEXT_MAX) { return SES_E_LIMIT; }
+  var buf: uint8* = &s->rec.flash[0];
+  var len: int64 = s->rec.flash_len;
+  if (len < 0 || len > (int64)SES_FLASH_CAP) { len = 0; }
+  if (ses_kv_count(buf, len) + 1 > SES_FLASH_MAX) { return SES_E_LIMIT; }
+  if (len + 3 + (int64)kind.length + (int64)text.length > (int64)SES_FLASH_CAP) { return SES_E_LIMIT; }
+  ses_kv_append(buf, &len, kind, text);
+  s->rec.flash_len = len;
+  s->dirty = true;
+  return SES_OK;
+}
+
+/// Counts the flash messages this request received (taken by ses_lookup).
+/// in: s, a session
+/// returns: the number of messages (0 when none or s is not live)
+/// owns: nothing
+/// thread: any thread (pure)
+/// example: for i in 0..ses_flash_count(&s) { ... }
+export fn ses_flash_count(s: SesSession*) -> int32 {
+  if (s == 0 || !s->live) { return 0; }
+  return ses_kv_count(&s->flash_in[0], s->flash_in_len);
+}
+
+/// Reads the i-th flash message this request received.
+/// in: s, a session; i, 0..ses_flash_count-1; kind and text receive views
+/// returns: SES_OK; SES_E_NOT_FOUND (i out of range); SES_E_ARG
+/// owns: the views borrow s; copy them to keep them
+/// thread: any thread (pure)
+/// example: var k: string; var t: string; ses_flash_at(&s, 0, &k, &t);
+export fn ses_flash_at(s: SesSession*, i: int32, kind: string*, text: string*) -> int32 {
+  if (s == 0 || kind == 0 || text == 0) { return SES_E_ARG; }
+  *kind = "";
+  *text = "";
+  if (!s->live || i < 0) { return SES_E_NOT_FOUND; }
+  var off: int64 = ses_kv_nth(&s->flash_in[0], s->flash_in_len, i);
+  if (off < 0) { return SES_E_NOT_FOUND; }
+  *kind = ses_kv_key(&s->flash_in[0], off);
+  *text = ses_kv_value(&s->flash_in[0], off);
+  return SES_OK;
+}

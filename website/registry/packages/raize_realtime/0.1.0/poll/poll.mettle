@@ -1,0 +1,158 @@
+// raize/poll — an epoll event loop core, plus a cross-thread mailbox.
+//
+// RzPoll owns an epoll instance and an eventfd "waker". The loop thread calls
+// rz_poll_wait and walks the returned events; any other thread calls
+// rz_poll_post to hand it a message, which wakes the loop. That is the whole
+// threading contract (docs/design/realtime.md §5): fds and per-connection
+// state belong to the loop thread, everyone else talks through the mailbox.
+//
+// Tags: every registered fd carries a caller-chosen int64 tag, returned with
+// its events. Tag 0 is reserved for the waker; when it fires, rz_poll_wait
+// drains the eventfd and reports one event with tag RZ_POLL_WAKE so the loop
+// knows to call rz_poll_take until it returns false.
+//
+// The mailbox is a bounded ring under a spin lock: posting never allocates,
+// and a full mailbox is reported (false) rather than grown. Messages are
+// plain values (kind, a, b, ptr): ownership of `ptr` passes to the loop.
+
+import "std/mem";
+import "std/thread";
+import "sys";
+
+export const RZ_POLL_WAKE: int64 = 0;
+export const RZ_POLL_MAX_EVENTS: int32 = 256;
+
+export struct RzPollEvent {
+  events: int32;
+  tag: int64;
+}
+
+export struct RzPollMsg {
+  kind: int32;
+  a: int64;
+  b: int64;
+  ptr: rawptr;
+}
+
+export struct RzPoll {
+  ep: int64;
+  wake_fd: int64;
+  raw: uint8*;             // RZ_POLL_MAX_EVENTS packed epoll_events
+  count: int32;            // events from the last wait
+  ring: RzPollMsg*;
+  ring_cap: int32;
+  head: int32;             // next to take
+  len: int32;
+  lock: int32;
+  dropped: int32;          // posts refused because the ring was full
+}
+
+export fn rz_poll_free(p: RzPoll*) {
+  if (p == 0) { return; }
+  if (p->ep >= 0) { rz_sys_close(p->ep); }
+  if (p->wake_fd >= 0) { rz_sys_close(p->wake_fd); }
+  if (p->raw != 0) { free(p->raw); }
+  if (p->ring != 0) { free(p->ring); }
+  free(p);
+}
+
+// Creates the poller with a mailbox of `ring_cap` messages. Returns 0 when
+// the kernel refuses an fd or memory runs out.
+export fn rz_poll_new(ring_cap: int32) -> RzPoll* {
+  var p: RzPoll* = (RzPoll*)calloc(1, sizeof(RzPoll));
+  if (p == 0) { return 0; }
+  p->ep = rz_sys_epoll_create();
+  p->wake_fd = rz_sys_eventfd();
+  if (ring_cap < 1) { ring_cap = 1; }
+  p->ring_cap = ring_cap;
+  p->raw = (uint8*)malloc((int64)RZ_POLL_MAX_EVENTS * RZ_EPOLL_EVENT_SIZE);
+  p->ring = (RzPollMsg*)calloc((int64)ring_cap, sizeof(RzPollMsg));
+  if (p->ep < 0 || p->wake_fd < 0 || p->raw == 0 || p->ring == 0) {
+    rz_poll_free(p);
+    return 0;
+  }
+  if (rz_sys_epoll_ctl(p->ep, RZ_EPOLL_CTL_ADD, p->wake_fd, RZ_EPOLLIN, RZ_POLL_WAKE) < 0) {
+    rz_poll_free(p);
+    return 0;
+  }
+  return p;
+}
+
+// Registers fd with an event mask and a tag (> 0). Returns 0 or -errno.
+export fn rz_poll_add(p: RzPoll*, fd: int64, events: int32, tag: int64) -> int64 {
+  if (p == 0 || tag == RZ_POLL_WAKE) { return -22; }   // EINVAL
+  return rz_sys_epoll_ctl(p->ep, RZ_EPOLL_CTL_ADD, fd, events, tag);
+}
+
+export fn rz_poll_mod(p: RzPoll*, fd: int64, events: int32, tag: int64) -> int64 {
+  if (p == 0 || tag == RZ_POLL_WAKE) { return -22; }
+  return rz_sys_epoll_ctl(p->ep, RZ_EPOLL_CTL_MOD, fd, events, tag);
+}
+
+export fn rz_poll_del(p: RzPoll*, fd: int64) -> int64 {
+  if (p == 0) { return -22; }
+  return rz_sys_epoll_ctl(p->ep, RZ_EPOLL_CTL_DEL, fd, 0, 0);
+}
+
+// Waits up to timeout_ms (-1 = forever). Returns the number of events (0 on
+// timeout or EINTR) or -errno. Read them with rz_poll_event.
+export fn rz_poll_wait(p: RzPoll*, timeout_ms: int32) -> int32 {
+  p->count = 0;
+  var n: int64 = rz_sys_epoll_wait(p->ep, p->raw, RZ_POLL_MAX_EVENTS, timeout_ms);
+  if (n == RZ_EINTR) { return 0; }
+  if (n < 0) { return (int32)n; }
+  p->count = (int32)n;
+  var i: int32 = 0;
+  while (i < p->count) {
+    if (rz_sys_get_u64(p->raw + (int64)i * RZ_EPOLL_EVENT_SIZE + 4) == RZ_POLL_WAKE) {
+      rz_sys_eventfd_drain(p->wake_fd);
+    }
+    i = i + 1;
+  }
+  return p->count;
+}
+
+export fn rz_poll_event(p: RzPoll*, i: int32) -> RzPollEvent {
+  var e: RzPollEvent;
+  e.events = 0;
+  e.tag = -1;
+  if (p == 0 || i < 0 || i >= p->count) { return e; }
+  var at: uint8* = p->raw + (int64)i * RZ_EPOLL_EVENT_SIZE;
+  e.events = (int32)rz_sys_get_u32(at);
+  e.tag = rz_sys_get_u64(at + 4);
+  return e;
+}
+
+// Posts a message from any thread and wakes the loop. Returns false when the
+// mailbox is full (the message was not taken; `ptr` still belongs to the
+// caller).
+export fn rz_poll_post(p: RzPoll*, msg: RzPollMsg) -> bool {
+  if (p == 0) { return false; }
+  spin_lock(&p->lock);
+  if (p->len >= p->ring_cap) {
+    p->dropped = p->dropped + 1;
+    spin_unlock(&p->lock);
+    return false;
+  }
+  var slot: int32 = (p->head + p->len) % p->ring_cap;
+  p->ring[slot] = msg;
+  p->len = p->len + 1;
+  spin_unlock(&p->lock);
+  rz_sys_eventfd_signal(p->wake_fd);
+  return true;
+}
+
+// Takes the oldest message (loop thread). Returns false when empty.
+export fn rz_poll_take(p: RzPoll*, out: RzPollMsg*) -> bool {
+  if (p == 0 || out == 0) { return false; }
+  spin_lock(&p->lock);
+  if (p->len == 0) {
+    spin_unlock(&p->lock);
+    return false;
+  }
+  *out = p->ring[p->head];
+  p->head = (p->head + 1) % p->ring_cap;
+  p->len = p->len - 1;
+  spin_unlock(&p->lock);
+  return true;
+}

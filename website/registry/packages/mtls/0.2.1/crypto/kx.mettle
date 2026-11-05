@@ -1,0 +1,107 @@
+// Key exchange for the handshake: X25519 (RFC 7748), P-256 and P-384
+// (SEC 1, uncompressed points).
+// Group numbers are the TLS NamedGroup values.
+
+import "std/mem";
+import "cryptex/core/types";
+import "cryptex/core/status";
+import "cryptex/core/util";
+import "cryptex/ecc/kx";
+import "cryptex/ecc/p256";
+import "cryptex/ecc/p384";
+import "mtls/core/err";
+
+export const MTLS_GROUP_SECP256R1: int32 = 23;
+export const MTLS_GROUP_SECP384R1: int32 = 24;
+export const MTLS_GROUP_X25519: int32 = 29;
+
+export struct MtlsKx {
+  group: int32;
+  sk: uint8[48];
+  pk: uint8[97];
+  pklen: int32;
+}
+
+export fn mtls_kx_supported(group: int32) -> bool {
+  return group == MTLS_GROUP_X25519 || group == MTLS_GROUP_SECP256R1 || group == MTLS_GROUP_SECP384R1;
+}
+
+/// mtls_kx_new: makes a fresh key pair; kx->pk holds the public share.
+export fn mtls_kx_new(kx: MtlsKx*, group: int32) -> int32 {
+  memset(kx, 0, (int64)sizeof(MtlsKx));
+  kx->group = group;
+  if (group == MTLS_GROUP_SECP256R1) {
+    var psk: CrP256Secret;
+    if (cr_p256_keypair(&kx->pk[0], 97, &psk) != CR_OK) { return MTLS_E_CRYPTO; }
+    memcpy(&kx->sk[0], &psk.b[0], 32);
+    cr_wipe(&psk.b[0], 32);
+    kx->pklen = 65;
+    return MTLS_OK;
+  }
+  if (group == MTLS_GROUP_SECP384R1) {
+    var qsk: CrP384Secret;
+    if (cr_p384_keypair(&kx->pk[0], 97, &qsk) != CR_OK) { return MTLS_E_CRYPTO; }
+    memcpy(&kx->sk[0], &qsk.b[0], 48);
+    cr_wipe(&qsk.b[0], 48);
+    kx->pklen = 97;
+    return MTLS_OK;
+  }
+  if (group != MTLS_GROUP_X25519) { return MTLS_E_UNSUPPORTED; }
+  var pk: CrX25519Public;
+  var sk: CrX25519Secret;
+  if (cr_x25519_keypair(&pk, &sk) != CR_OK) { return MTLS_E_CRYPTO; }
+  memcpy(&kx->sk[0], &sk.b[0], 32);
+  memcpy(&kx->pk[0], &pk.b[0], 32);
+  kx->pklen = 32;
+  cr_wipe(&sk.b[0], 32);
+  return MTLS_OK;
+}
+
+/// mtls_kx_shared: the shared secret with the peer's public share. Writes
+/// 32 bytes for X25519 and P-256, 48 for P-384, and sets *olen.
+export fn mtls_kx_shared(kx: MtlsKx*, peer: uint8*, plen: int64, out: uint8*, olen: int64*) -> int32 {
+  *olen = 0;
+  if (kx->group == MTLS_GROUP_SECP256R1) {
+    // cryptex checks the point is on the curve (fails with CR_E_KEY).
+    if (plen != 65) { return MTLS_E_DECODE; }
+    var psk: CrP256Secret;
+    var k: CrKey32;
+    memcpy(&psk.b[0], &kx->sk[0], 32);
+    var prc: int32 = cr_p256_ecdh(&k, &psk, peer, plen);
+    cr_wipe(&psk.b[0], 32);
+    if (prc != CR_OK) { return MTLS_E_CRYPTO; }
+    memcpy(out, &k.b[0], 32);
+    cr_wipe(&k.b[0], 32);
+    *olen = 32;
+    return MTLS_OK;
+  }
+  if (kx->group == MTLS_GROUP_SECP384R1) {
+    if (plen != 97) { return MTLS_E_DECODE; }
+    var qsk: CrP384Secret;
+    memcpy(&qsk.b[0], &kx->sk[0], 48);
+    var qrc: int32 = cr_p384_ecdh(out, 48, &qsk, peer, plen);
+    cr_wipe(&qsk.b[0], 48);
+    if (qrc != CR_OK) { return MTLS_E_CRYPTO; }
+    *olen = 48;
+    return MTLS_OK;
+  }
+  if (kx->group != MTLS_GROUP_X25519) { return MTLS_E_UNSUPPORTED; }
+  if (plen != 32) { return MTLS_E_DECODE; }
+  var sk: CrX25519Secret;
+  var pk: CrX25519Public;
+  var sh: CrX25519Shared;
+  memcpy(&sk.b[0], &kx->sk[0], 32);
+  memcpy(&pk.b[0], peer, 32);
+  var rc: int32 = cr_x25519_shared(&sh, &sk, &pk);
+  cr_wipe(&sk.b[0], 32);
+  if (rc != CR_OK) { return MTLS_E_CRYPTO; }
+  memcpy(out, &sh.b[0], 32);
+  cr_wipe(&sh.b[0], 32);
+  *olen = 32;
+  return MTLS_OK;
+}
+
+/// mtls_kx_wipe: erases the secret half.
+export fn mtls_kx_wipe(kx: MtlsKx*) {
+  cr_wipe(&kx->sk[0], 48);
+}

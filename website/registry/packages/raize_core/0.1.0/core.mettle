@@ -1,0 +1,18 @@
+// raize_core facade: `import "raize_core/core"` brings in the whole core layer.
+// Each area can also be imported alone, e.g. `import "raize_core/router/router"`.
+//
+// This module exports nothing itself.
+import "str/str";
+import "core/status";
+import "context/context";
+import "router/router";
+import "server/server";
+import "middleware/chain";
+import "middleware/logging";
+import "middleware/recover";
+import "middleware/cors";
+import "middleware/auth";
+import "middleware/auth_token";
+import "middleware/headers";
+import "config/config";
+import "static/static";

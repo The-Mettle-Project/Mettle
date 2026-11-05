@@ -1,0 +1,12 @@
+// Glint: OpenGL 4.6 for Mettle. Import "glint/glint" to get everything:
+// the GL 4.6 core functions and enums (glint_gl), ARB/KHR/EXT extensions
+// (glint_ext), contexts and windows for Linux (EGL, GLX) and Windows (WGL),
+// headless contexts, and small helpers. glint_math (vectors and matrices) is
+// separate: import "glint/glint_math" if you want it.
+import "glint_types";
+import "glint_gl";
+import "glint_ext";
+import "glint_common";
+import "glint_shader";
+import "glint_linux.mettle" if linux;
+import "glint_windows.mettle" if windows;

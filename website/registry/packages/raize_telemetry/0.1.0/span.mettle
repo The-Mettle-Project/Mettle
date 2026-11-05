@@ -1,0 +1,99 @@
+// raize_telemetry/span: start / stop / exception events around a piece of work.
+//
+//   g_req = tm_span_events("raize.request");            // once, at startup
+//   var s: TmSpan = tm_span_start(&g_req, &meta[0], 2);
+//   ... work ...
+//   tm_span_stop(&s, &meas[0], 1, &meta[0], 2);
+//
+// .start carries system_time and monotonic_time. .stop and .exception carry
+// duration_ns (monotonic) followed by the caller's measurements, capped at
+// TM_SPAN_MAX_MEAS entries in all. .exception appends meta `kind` and
+// `reason` to the caller's metadata, under the same cap. When the target
+// event has no handlers, nothing is built.
+
+import "value";
+import "core";
+import "sys/clock";
+import "std/mem";
+
+export const TM_SPAN_MAX_MEAS = 16;
+
+export struct TmSpanEvents {
+  start: int32;
+  stop: int32;
+  exception: int32;
+}
+
+// Holds the event ids by value, so a copy of a span stays valid.
+export struct TmSpan {
+  start: int32;
+  stop: int32;
+  exception: int32;
+  start_mono_ns: int64;
+}
+
+// Registers prefix.start, prefix.stop and prefix.exception.
+export fn tm_span_events(prefix: string) -> TmSpanEvents {
+  var ev: TmSpanEvents;
+  var a: string = prefix + ".start";
+  ev.start = tm_event(a);
+  free(a.chars);
+  var b: string = prefix + ".stop";
+  ev.stop = tm_event(b);
+  free(b.chars);
+  var c: string = prefix + ".exception";
+  ev.exception = tm_event(c);
+  free(c.chars);
+  return ev;
+}
+
+export fn tm_span_start(ev: TmSpanEvents*, meta: TmKV*, n_meta: int32) -> TmSpan {
+  var s: TmSpan;
+  s.start = ev->start;
+  s.stop = ev->stop;
+  s.exception = ev->exception;
+  s.start_mono_ns = tm_monotonic_ns();
+  if (tm_has_handlers(s.start)) {
+    var meas: TmKV[2];
+    meas[0] = tm_int("system_time", tm_system_time_ns());
+    meas[1] = tm_int("monotonic_time", s.start_mono_ns);
+    tm_execute(s.start, &meas[0], 2, meta, n_meta);
+  }
+  return s;
+}
+
+// buf[0] = duration_ns, then meas[0..n_meas) up to the cap. Returns the count.
+fn tm__span_meas(s: TmSpan*, buf: TmKV*, meas: TmKV*, n_meas: int32) -> int32 {
+  buf[0] = tm_int("duration_ns", tm_monotonic_ns() - s->start_mono_ns);
+  var n: int32 = 1;
+  for i in 0..n_meas {
+    if (n >= TM_SPAN_MAX_MEAS) { break; }
+    buf[n] = meas[i];
+    n = n + 1;
+  }
+  return n;
+}
+
+export fn tm_span_stop(s: TmSpan*, meas: TmKV*, n_meas: int32, meta: TmKV*, n_meta: int32) {
+  if (!tm_has_handlers(s->stop)) { return; }
+  var buf: TmKV[16];
+  var n: int32 = tm__span_meas(s, &buf[0], meas, n_meas);
+  tm_execute(s->stop, &buf[0], n, meta, n_meta);
+}
+
+export fn tm_span_exception(s: TmSpan*, kind: string, reason: string,
+                            meas: TmKV*, n_meas: int32, meta: TmKV*, n_meta: int32) {
+  if (!tm_has_handlers(s->exception)) { return; }
+  var buf: TmKV[16];
+  var n: int32 = tm__span_meas(s, &buf[0], meas, n_meas);
+  var mbuf: TmKV[16];
+  var nm: int32 = 0;
+  for i in 0..n_meta {
+    if (nm >= TM_SPAN_MAX_MEAS - 2) { break; }
+    mbuf[nm] = meta[i];
+    nm = nm + 1;
+  }
+  mbuf[nm] = tm_str("kind", kind);
+  mbuf[nm + 1] = tm_str("reason", reason);
+  tm_execute(s->exception, &buf[0], n, &mbuf[0], nm + 2);
+}

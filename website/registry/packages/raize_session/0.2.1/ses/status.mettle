@@ -1,0 +1,127 @@
+// Status codes shared by every session module. 0 is success; every error is
+// negative. Functions that count (prune, revoke-all) return a count >= 0 or
+// one of these.
+
+/// SES_OK: the operation succeeded.
+/// in: -
+/// returns: 0
+/// owns: nothing
+/// thread: constant
+/// example: if (ses_create(&m, uid, now, &tok, &s) != SES_OK) { ... }
+export const SES_OK: int32 = 0;
+/// SES_E_ARG: an argument is invalid (null pointer, empty or oversized
+/// string, bad character in a cookie name or value).
+/// in: -
+/// returns: -1
+/// owns: nothing
+/// thread: constant
+/// example: ses_create(&m, "", now, &tok, &s) == SES_E_ARG
+export const SES_E_ARG: int32 = -1;
+/// SES_E_SPACE: the caller's output buffer is too small. Nothing usable is
+/// written.
+/// in: -
+/// returns: -2
+/// owns: nothing
+/// thread: constant
+/// example: ses_sign(&m, p, v, &buf[0], 4, &n) == SES_E_SPACE
+export const SES_E_SPACE: int32 = -2;
+/// SES_E_NOT_FOUND: no such session (unknown or malformed token), no such
+/// data key, or no such cookie. Store implementations return it from get
+/// and del for a missing hash.
+/// in: -
+/// returns: -3
+/// owns: nothing
+/// thread: constant
+/// example: if (rc == SES_E_NOT_FOUND) { show_login(); }
+export const SES_E_NOT_FOUND: int32 = -3;
+/// SES_E_EXPIRED: the session passed its idle or absolute expiry.
+/// in: -
+/// returns: -4
+/// owns: nothing
+/// thread: constant
+/// example: if (rc == SES_E_EXPIRED) { show_login("session expired"); }
+export const SES_E_EXPIRED: int32 = -4;
+/// SES_E_REVOKED: the session was revoked (logout, admin action).
+/// in: -
+/// returns: -5
+/// owns: nothing
+/// thread: constant
+/// example: if (rc == SES_E_REVOKED) { show_login(); }
+export const SES_E_REVOKED: int32 = -5;
+/// SES_E_INVALID: a signature or CSRF value did not verify, or a session
+/// handle is not live.
+/// in: -
+/// returns: -6
+/// owns: nothing
+/// thread: constant
+/// example: if (ses_verify(&m, p, sv, &v, &old) == SES_E_INVALID) { reject(); }
+export const SES_E_INVALID: int32 = -6;
+/// SES_E_LIMIT: a size limit was hit (data map full, key or value too long,
+/// too many flash messages). Store implementations may return it when they
+/// are full.
+/// in: -
+/// returns: -7
+/// owns: nothing
+/// thread: constant
+/// example: if (ses_data_set(&s, k, v) == SES_E_LIMIT) { ... }
+export const SES_E_LIMIT: int32 = -7;
+/// SES_E_STORE: the store backend failed (I/O, database error).
+/// in: -
+/// returns: -8
+/// owns: nothing
+/// thread: constant
+/// example: if (rc == SES_E_STORE) { return http_503(); }
+export const SES_E_STORE: int32 = -8;
+/// SES_E_CRYPTO: the crypto library failed (initialization or randomness).
+/// in: -
+/// returns: -9
+/// owns: nothing
+/// thread: constant
+/// example: if (ses_init(&m, &cfg, &st) == SES_E_CRYPTO) { abort(); }
+export const SES_E_CRYPTO: int32 = -9;
+/// SES_E_PARSE: a Cookie header is not valid RFC 6265 cookie-string syntax.
+/// in: -
+/// returns: -10
+/// owns: nothing
+/// thread: constant
+/// example: ses_cookie_find("a b=c", n, &v) == SES_E_PARSE
+export const SES_E_PARSE: int32 = -10;
+/// SES_E_DUPLICATE: a Cookie header carries the requested name more than
+/// once (cookie tossing). The value is not returned.
+/// in: -
+/// returns: -11
+/// owns: nothing
+/// thread: constant
+/// example: ses_cookie_find("sid=a; sid=b", n, &v) == SES_E_DUPLICATE
+export const SES_E_DUPLICATE: int32 = -11;
+/// SES_E_CONFIG: a SesConfig is unsafe or inconsistent (zero secret, token
+/// shorter than 32 bytes, idle timeout above the absolute lifetime, ...).
+/// in: -
+/// returns: -12
+/// owns: nothing
+/// thread: constant
+/// example: if (ses_config_check(&cfg) != SES_OK) { fix_config(); }
+export const SES_E_CONFIG: int32 = -12;
+
+/// Names a status code for logs.
+/// in: code, a SES_* status
+/// returns: a static string such as "SES_E_ARG" ("SES_E_UNKNOWN" otherwise)
+/// owns: nothing; the result points at a string literal, never free it
+/// thread: any thread (pure)
+/// example: println(ses_status_name(rc));
+export fn ses_status_name(code: int32) -> string {
+  if (code == SES_OK) { return "SES_OK"; }
+  if (code == SES_E_ARG) { return "SES_E_ARG"; }
+  if (code == SES_E_SPACE) { return "SES_E_SPACE"; }
+  if (code == SES_E_NOT_FOUND) { return "SES_E_NOT_FOUND"; }
+  if (code == SES_E_EXPIRED) { return "SES_E_EXPIRED"; }
+  if (code == SES_E_REVOKED) { return "SES_E_REVOKED"; }
+  if (code == SES_E_INVALID) { return "SES_E_INVALID"; }
+  if (code == SES_E_LIMIT) { return "SES_E_LIMIT"; }
+  if (code == SES_E_STORE) { return "SES_E_STORE"; }
+  if (code == SES_E_CRYPTO) { return "SES_E_CRYPTO"; }
+  if (code == SES_E_PARSE) { return "SES_E_PARSE"; }
+  if (code == SES_E_DUPLICATE) { return "SES_E_DUPLICATE"; }
+  if (code == SES_E_CONFIG) { return "SES_E_CONFIG"; }
+  return "SES_E_UNKNOWN";
+}

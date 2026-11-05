@@ -1,0 +1,234 @@
+// The server reflection service, grpc.reflection.v1.ServerReflection
+// (grpc/grpc doc/server-reflection.md), also answered on the older
+// grpc.reflection.v1alpha path, which has the same messages. Tools such as
+// grpcurl use it to find services and message types at run time.
+//
+// Files come from the generated <Service>_file_descriptors functions:
+//   grpc_reflection_add(&r, &Greeter_file_descriptors);
+// Extension queries are answered NOT_FOUND (this library has no extensions).
+import "std/mem";
+import "codec/core/list";
+import "codec/core/status";
+import "grpc/status";
+import "grpc/metadata";
+import "grpc/call";
+import "grpc/server";
+import "grpc/gen/google/protobuf/descriptor_pb";
+import "grpc/gen/grpc/reflection/v1/reflection_pb";
+import "grpc/gen/grpc/reflection/v1/reflection_grpc";
+
+export const GRPC_REFLECTION_V1ALPHA_PATH: string = "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo";
+
+struct ReflFile {
+  name: string;
+  bytes: string;             // the serialized FileDescriptorProto
+  deps: CodecList<string>;
+  symbols: CodecList<string>;
+}
+
+export struct GrpcReflection {
+  handlers: GrpcPbServerReflection_Handlers;
+  files: CodecList<ReflFile>;
+  services: CodecList<string>;
+}
+
+fn copy(s: string) -> string {
+  var r: string;
+  if (s.length == 0) { return r; }
+  var p: uint8* = (uint8*)malloc((int64)s.length);
+  memcpy(p, s.chars, (int64)s.length);
+  r.chars = p;
+  r.length = s.length;
+  return r;
+}
+
+fn join(pkg: string, name: string) -> string {
+  if (pkg.length == 0) { return copy(name); }
+  return pkg + "." + name;
+}
+
+fn add_message_symbols(f: ReflFile*, scope: string, m: GrpcPbDescriptorProto*) {
+  var full: string = join(scope, m->name);
+  codec_list_push(&f->symbols, full);
+  for i in 0..m->nested_type.len { add_message_symbols(f, full, &m->nested_type.data[i]); }
+  for i in 0..m->enum_type.len { codec_list_push(&f->symbols, join(full, m->enum_type.data[i].name)); }
+}
+
+fn find_file(r: GrpcReflection*, name: string) -> int64 {
+  for i in 0..r->files.len {
+    if (r->files.data[i].name == name) { return i; }
+  }
+  return -1;
+}
+
+// Adds one descriptor (base64 of a FileDescriptorProto). False if it does
+// not decode.
+export fn grpc_reflection_add_file(r: GrpcReflection*, b64: string) -> bool {
+  var p: uint8* = (uint8*)malloc((int64)b64.length + 4);
+  var n: int64 = grpc_b64_decode(b64.chars, (int64)b64.length, p);
+  if (n < 0) {
+    free(p);
+    return false;
+  }
+  var bytes: string;
+  bytes.chars = p;
+  bytes.length = (uint64)n;
+  var d: GrpcPbFileDescriptorProto;
+  GrpcPbFileDescriptorProto_init(&d);
+  if (GrpcPbFileDescriptorProto_decode(&d, bytes) != CODEC_OK) {
+    GrpcPbFileDescriptorProto_free(&d);
+    free(p);
+    return false;
+  }
+  if (find_file(r, d.name) >= 0) {
+    GrpcPbFileDescriptorProto_free(&d);
+    free(p);
+    return true;
+  }
+  var f: ReflFile;
+  f.name = copy(d.name);
+  f.bytes = bytes;
+  for i in 0..d.dependency.len { codec_list_push(&f.deps, copy(d.dependency.data[i])); }
+  for i in 0..d.message_type.len { add_message_symbols(&f, d.package, &d.message_type.data[i]); }
+  for i in 0..d.enum_type.len { codec_list_push(&f.symbols, join(d.package, d.enum_type.data[i].name)); }
+  for i in 0..d.service.len {
+    var s: GrpcPbServiceDescriptorProto* = &d.service.data[i];
+    var sfull: string = join(d.package, s->name);
+    codec_list_push(&f.symbols, sfull);
+    codec_list_push(&r->services, copy(sfull));
+    for k in 0..s->method_.len { codec_list_push(&f.symbols, sfull + "." + s->method_.data[k].name); }
+  }
+  codec_list_push(&r->files, f);
+  GrpcPbFileDescriptorProto_free(&d);
+  return true;
+}
+
+// Adds every descriptor a generated <Service>_file_descriptors gives.
+export fn grpc_reflection_add(r: GrpcReflection*, fds: fn(string*, int64) -> int64) -> bool {
+  var list: string[64];
+  var n: int64 = fds(&list[0], 64);
+  if (n > 64) { n = 64; }
+  var ok: bool = true;
+  for i in 0..n {
+    if (!grpc_reflection_add_file(r, list[i])) { ok = false; }
+  }
+  return ok;
+}
+
+// ---- answering ------------------------------------------------------------------
+
+// Adds file fi and everything it depends on to out, each once.
+fn collect(r: GrpcReflection*, fi: int64, seen: bool*, out: GrpcPbFileDescriptorResponse*) {
+  if (seen[fi]) { return; }
+  seen[fi] = true;
+  var f: ReflFile* = &r->files.data[fi];
+  codec_list_push(&out->file_descriptor_proto, f->bytes);
+  for i in 0..f->deps.len {
+    var k: int64 = find_file(r, f->deps.data[i]);
+    if (k >= 0) { collect(r, k, seen, out); }
+  }
+}
+
+fn reply_error(c: GrpcCall*, resp: GrpcPbServerReflectionResponse*, code: int32, msg: string) {
+  var e: GrpcPbErrorResponse;
+  GrpcPbErrorResponse_init(&e);
+  e.error_code = code;
+  e.error_message = msg;
+  resp->error_response = &e;
+  resp->message_response_case = GrpcPbServerReflectionResponse_FIELD_error_response;
+  GrpcPbServerReflection_ServerReflectionInfo_reply(c, resp);
+}
+
+fn reply_files(r: GrpcReflection*, c: GrpcCall*, resp: GrpcPbServerReflectionResponse*, fi: int64) {
+  var fdr: GrpcPbFileDescriptorResponse;
+  GrpcPbFileDescriptorResponse_init(&fdr);
+  var seen: bool* = (bool*)calloc(r->files.len + 1, 1);
+  collect(r, fi, seen, &fdr);
+  free(seen);
+  resp->file_descriptor_response = &fdr;
+  resp->message_response_case = GrpcPbServerReflectionResponse_FIELD_file_descriptor_response;
+  GrpcPbServerReflection_ServerReflectionInfo_reply(c, resp);
+  codec_list_free(&fdr.file_descriptor_proto);
+}
+
+fn on_request(u: rawptr, c: GrpcCall*, req: GrpcPbServerReflectionRequest*) {
+  var r: GrpcReflection* = (GrpcReflection*)u;
+  var resp: GrpcPbServerReflectionResponse;
+  GrpcPbServerReflectionResponse_init(&resp);
+  resp.valid_host = req->host;
+  resp.original_request = req;
+  var which: int32 = req->message_request_case;
+  if (which == GrpcPbServerReflectionRequest_FIELD_list_services) {
+    var ls: GrpcPbListServiceResponse;
+    GrpcPbListServiceResponse_init(&ls);
+    for i in 0..r->services.len {
+      var sr: GrpcPbServiceResponse;
+      GrpcPbServiceResponse_init(&sr);
+      sr.name = r->services.data[i];
+      codec_list_push(&ls.service, sr);
+    }
+    resp.list_services_response = &ls;
+    resp.message_response_case = GrpcPbServerReflectionResponse_FIELD_list_services_response;
+    GrpcPbServerReflection_ServerReflectionInfo_reply(c, &resp);
+    codec_list_free(&ls.service);
+    return;
+  }
+  if (which == GrpcPbServerReflectionRequest_FIELD_file_by_filename) {
+    var fi: int64 = find_file(r, req->file_by_filename);
+    if (fi < 0) {
+      reply_error(c, &resp, GRPC_NOT_FOUND, "file not found");
+      return;
+    }
+    reply_files(r, c, &resp, fi);
+    return;
+  }
+  if (which == GrpcPbServerReflectionRequest_FIELD_file_containing_symbol) {
+    var sym: string = req->file_containing_symbol;
+    for i in 0..r->files.len {
+      var f: ReflFile* = &r->files.data[i];
+      for k in 0..f->symbols.len {
+        if (f->symbols.data[k] == sym) {
+          reply_files(r, c, &resp, i);
+          return;
+        }
+      }
+    }
+    reply_error(c, &resp, GRPC_NOT_FOUND, "symbol not found");
+    return;
+  }
+  if (which == GrpcPbServerReflectionRequest_FIELD_file_containing_extension ||
+      which == GrpcPbServerReflectionRequest_FIELD_all_extension_numbers_of_type) {
+    reply_error(c, &resp, GRPC_NOT_FOUND, "extensions not supported");
+    return;
+  }
+  reply_error(c, &resp, GRPC_INVALID_ARGUMENT, "unknown request");
+}
+
+export fn grpc_reflection_init(r: GrpcReflection*) {
+  r->handlers.user = (rawptr)r;
+  r->handlers.ServerReflectionInfo = &on_request;
+  grpc_reflection_add(r, &GrpcPbServerReflection_file_descriptors);
+}
+
+// Adds the service to a server (both the v1 and v1alpha paths). r must
+// outlive the server.
+export fn grpc_reflection_register(r: GrpcReflection*, s: GrpcServer*) {
+  GrpcPbServerReflection_register(s, &r->handlers);
+  var d: GrpcMethodDesc* = grpc_server_find(s, GrpcPbServerReflection_ServerReflectionInfo_PATH);
+  if (d != 0) {
+    var alpha: GrpcMethodDesc = *d;
+    alpha.path = GRPC_REFLECTION_V1ALPHA_PATH;
+    grpc_server_add(s, &alpha);
+  }
+}
+
+export fn grpc_reflection_free(r: GrpcReflection*) {
+  for i in 0..r->files.len {
+    var f: ReflFile* = &r->files.data[i];
+    free(f->bytes.chars);
+    codec_list_free(&f->deps);
+    codec_list_free(&f->symbols);
+  }
+  codec_list_free(&r->files);
+  codec_list_free(&r->services);
+}

@@ -1,0 +1,351 @@
+// Finite State Entropy (tANS) tables for Zstandard: reading and writing
+// table descriptions, building decode and encode tables, and cost guesses.
+
+import "std/mem";
+import "std/math" as m;
+import "../core/status";
+import "../core/buf";
+import "common";
+
+/// One decode table cell. For sequence tables `base` and `extra` give the
+/// value baseline and its extra bit count. For plain tables `base` is the
+/// symbol.
+export struct PzsSeqD {
+  base: uint32;
+  nbits: uint8;
+  extra: uint8;
+  next: uint16;
+}
+
+// Table kinds for pzs_fse_build_dt.
+export const PZS_K_PLAIN: int32 = 0;
+export const PZS_K_LL: int32 = 1;
+export const PZS_K_ML: int32 = 2;
+export const PZS_K_OF: int32 = 3;
+
+// Reads up to 25 bits at bit position pos. Bytes past n read as zero.
+fn nc_bits(p: uint8*, n: int64, pos: int64, k: int64) -> uint32 {
+  var by: int64 = pos >> 3;
+  var v: uint64 = 0;
+  for j in 0..4 {
+    if (by + j < n) { v = v | ((uint64)p[by + j] << (uint64)(8 * j)); }
+  }
+  return (uint32)((v >> (uint64)(pos & 7)) & (((uint64)1 << (uint64)k) - 1));
+}
+
+/// Reads an FSE table description from p[0 .. n] into norm[0 .. maxSym].
+/// Sets *log_out. Returns the bytes used, or a negative status.
+export fn pzs_fse_read_ncount(p: uint8*, n: int64, norm: int16*, maxSym: int32, maxLog: int32, log_out: int32*) -> int64 {
+  if (n < 1) { return (int64)PRESS_E_DATA; }
+  var log: int32 = (int32)nc_bits(p, n, 0, 4) + 5;
+  if (log > maxLog) { return (int64)PRESS_E_DATA; }
+  var pos: int64 = 4;
+  var remaining: int32 = (1 << log) + 1;
+  var threshold: int32 = 1 << log;
+  var nb: int32 = log + 1;
+  var sym: int32 = 0;
+  var prev0: bool = false;
+  while (remaining > 1 && sym <= maxSym) {
+    if (prev0) {
+      var n0: int32 = sym;
+      while (true) {
+        var r: int32 = (int32)nc_bits(p, n, pos, 2);
+        pos = pos + 2;
+        n0 = n0 + r;
+        if (r != 3) { break; }
+        if (pos > n * 8) { return (int64)PRESS_E_DATA; }
+      }
+      if (n0 > maxSym) { return (int64)PRESS_E_DATA; }
+      while (sym < n0) { norm[sym] = 0; sym = sym + 1; }
+    }
+    var mx: int32 = (2 * threshold - 1) - remaining;
+    var bits: int32 = (int32)nc_bits(p, n, pos, (int64)nb);
+    var count: int32 = 0;
+    if ((bits & (threshold - 1)) < mx) {
+      count = bits & (threshold - 1);
+      pos = pos + (int64)(nb - 1);
+    } else {
+      count = bits & (2 * threshold - 1);
+      if (count >= threshold) { count = count - mx; }
+      pos = pos + (int64)nb;
+    }
+    count = count - 1;
+    if (count < 0) { remaining = remaining + count; } else { remaining = remaining - count; }
+    norm[sym] = (int16)count;
+    sym = sym + 1;
+    prev0 = count == 0;
+    while (remaining < threshold) { nb = nb - 1; threshold = threshold >> 1; }
+    if (pos > n * 8) { return (int64)PRESS_E_DATA; }
+  }
+  if (remaining != 1) { return (int64)PRESS_E_DATA; }
+  while (sym <= maxSym) { norm[sym] = 0; sym = sym + 1; }
+  var used: int64 = (pos + 7) >> 3;
+  if (used > n) { return (int64)PRESS_E_DATA; }
+  *log_out = log;
+  return used;
+}
+
+// Spreads the symbols over a table of 1 << log cells. Returns false when
+// the counts do not fill the table exactly.
+fn spread(syms: uint8*, norm: int16*, nsym: int32, log: int32) -> bool {
+  var size: int32 = 1 << log;
+  var high: int32 = size - 1;
+  for s in 0..nsym {
+    if (norm[s] == -1) { syms[high] = (uint8)s; high = high - 1; }
+  }
+  var step: int32 = (size >> 1) + (size >> 3) + 3;
+  var mask: int32 = size - 1;
+  var pos: int32 = 0;
+  for s in 0..nsym {
+    var c: int32 = (int32)norm[s];
+    for _k in 0..c {
+      syms[pos] = (uint8)s;
+      pos = (pos + step) & mask;
+      while (pos > high) { pos = (pos + step) & mask; }
+    }
+  }
+  return pos == 0;
+}
+
+/// Builds a decode table from normalized counts. `kind` says how to fill
+/// base and extra (PZS_K_PLAIN, PZS_K_LL, PZS_K_ML or PZS_K_OF).
+export fn pzs_fse_build_dt(dt: PzsSeqD*, norm: int16*, nsym: int32, log: int32, kind: int32) -> int32 {
+  var syms: uint8[512];
+  var next: uint16[64];
+  var size: int32 = 1 << log;
+  for s in 0..nsym {
+    if (norm[s] == -1) { next[s] = 1; } else { next[s] = (uint16)norm[s]; }
+  }
+  if (!spread(&syms[0], norm, nsym, log)) { return PRESS_E_DATA; }
+  for u in 0..size {
+    var s: int32 = (int32)syms[u];
+    var x: uint32 = (uint32)next[s];
+    next[s] = (uint16)(x + 1);
+    var nb: int32 = log - pzs_hb32(x);
+    dt[u].nbits = (uint8)nb;
+    dt[u].next = (uint16)((x << (uint32)nb) - (uint32)size);
+    pzs_fill_cell(&dt[u], s, kind);
+  }
+  return PRESS_OK;
+}
+
+/// Sets base and extra of one decode cell for symbol s.
+export fn pzs_fill_cell(c: PzsSeqD*, s: int32, kind: int32) {
+  switch (kind) {
+    case 1: { c->base = PZS_LL_BASE[s]; c->extra = PZS_LL_BITS[s]; }
+    case 2: { c->base = PZS_ML_BASE[s]; c->extra = PZS_ML_BITS[s]; }
+    case 3: { c->base = (uint32)1 << (uint32)s; c->extra = (uint8)s; }
+    default: { c->base = (uint32)s; c->extra = 0; }
+  }
+}
+
+/// Fills a one-cell table that always gives symbol s (RLE mode).
+export fn pzs_fse_rle_dt(dt: PzsSeqD*, s: int32, kind: int32) {
+  dt[0].nbits = 0;
+  dt[0].next = 0;
+  pzs_fill_cell(&dt[0], s, kind);
+}
+
+// ---------------------------------------------------------------------------
+// Encoding side.
+
+/// An FSE encode table plus the normalized counts it came from.
+export struct PzsFseC {
+  log: int32;
+  nsym: int32;
+  st: uint16[512];
+  dnb: uint32[64];
+  dfs: int32[64];
+  norm: int16[64];
+}
+
+/// Builds an encode table from normalized counts (nsym <= 64, log <= 9).
+export fn pzs_fse_build_ct(ct: PzsFseC*, norm: int16*, nsym: int32, log: int32) {
+  var syms: uint8[512];
+  var cumul: int32[65];
+  var size: int32 = 1 << log;
+  ct->log = log;
+  ct->nsym = nsym;
+  cumul[0] = 0;
+  for s in 0..nsym {
+    ct->norm[s] = norm[s];
+    if (norm[s] == -1) { cumul[s + 1] = cumul[s] + 1; }
+    else if (norm[s] > 0) { cumul[s + 1] = cumul[s] + (int32)norm[s]; }
+    else { cumul[s + 1] = cumul[s]; }
+  }
+  spread(&syms[0], norm, nsym, log);
+  for u in 0..size {
+    var s: int32 = (int32)syms[u];
+    ct->st[cumul[s]] = (uint16)(size + u);
+    cumul[s] = cumul[s] + 1;
+  }
+  var total: int32 = 0;
+  for s in 0..nsym {
+    var c: int32 = (int32)norm[s];
+    if (c == 0) {
+      ct->dnb[s] = (uint32)(((log + 1) << 16) - size);
+      ct->dfs[s] = 0;
+    } else if (c == -1 || c == 1) {
+      ct->dnb[s] = (uint32)((log << 16) - size);
+      ct->dfs[s] = total - 1;
+      total = total + 1;
+    } else {
+      var maxOut: int32 = log - pzs_hb32((uint32)(c - 1));
+      var minPlus: int32 = c << maxOut;
+      ct->dnb[s] = (uint32)((maxOut << 16) - minPlus);
+      ct->dfs[s] = total - c;
+      total = total + c;
+    }
+  }
+}
+
+/// The first state for an encode run that ends with symbol s.
+@inline export fn pzs_fse_init_state(ct: PzsFseC*, s: int32) -> uint32 {
+  var nbOut: uint32 = (ct->dnb[s] + (uint32)32768) >> 16;
+  var value: uint32 = (nbOut << 16) - ct->dnb[s];
+  return (uint32)ct->st[(int32)(value >> nbOut) + ct->dfs[s]];
+}
+
+/// Encodes symbol s: writes the low bits of the state and moves on.
+@inline export fn pzs_fse_encode(w: PzsBitW*, ct: PzsFseC*, state: uint32*, s: int32) {
+  var st: uint32 = *state;
+  var nb: uint32 = (st + ct->dnb[s]) >> 16;
+  pzs_bw_add(w, (uint64)st, (int64)nb);
+  *state = (uint32)ct->st[(int32)(st >> nb) + ct->dfs[s]];
+}
+
+/// A table log that suits n symbols drawn from an alphabet of nsym.
+export fn pzs_fse_pick_log(maxLog: int32, n: int64, nsym: int32) -> int32 {
+  var log: int32 = maxLog;
+  var srcBits: int32 = pzs_hb32((uint32)(n - 1)) - 2;
+  if (n <= 1) { srcBits = 0; }
+  var minBits: int32 = pzs_hb32((uint32)n) + 1;
+  var symBits: int32 = pzs_hb32((uint32)(nsym - 1)) + 2;
+  if (symBits < minBits) { minBits = symBits; }
+  if (srcBits < log) { log = srcBits; }
+  if (minBits > log) { log = minBits; }
+  if (log < 5) { log = 5; }
+  if (log > maxLog) { log = maxLog; }
+  return log;
+}
+
+/// Turns counts into normalized counts that sum to 1 << log. Every used
+/// symbol gets at least 1. Needs total > 0 and at most 1 << log used symbols.
+export fn pzs_fse_normalize(norm: int16*, count: uint32*, nsym: int32, total: int64, log: int32) {
+  var size: int64 = (int64)1 << (int64)log;
+  var sum: int64 = 0;
+  for s in 0..nsym {
+    var c: int64 = (int64)count[s];
+    if (c == 0) { norm[s] = 0; continue; }
+    var v: int64 = (c * size) / total;
+    if (v < 1) { v = 1; }
+    norm[s] = (int16)v;
+    sum = sum + v;
+  }
+  // Hand out or take back slots where it costs the fewest bits.
+  while (sum < size) {
+    var best: int32 = -1;
+    var bg: float64 = -1.0;
+    for s in 0..nsym {
+      if (count[s] == 0) { continue; }
+      var g: float64 = (float64)count[s] / ((float64)norm[s] + 0.5);
+      if (g > bg) { bg = g; best = s; }
+    }
+    norm[best] = (int16)(norm[best] + 1);
+    sum = sum + 1;
+  }
+  while (sum > size) {
+    var best: int32 = -1;
+    var bl: float64 = 0.0;
+    for s in 0..nsym {
+      if (norm[s] <= 1) { continue; }
+      var l: float64 = (float64)count[s] / ((float64)norm[s] - 0.5);
+      if (best < 0 || l < bl) { bl = l; best = s; }
+    }
+    norm[best] = (int16)(norm[best] - 1);
+    sum = sum - 1;
+  }
+}
+
+/// Writes a table description for norm[0 .. nsym] into p. Returns bytes
+/// written (p needs room for 8 + nsym * 2 bytes).
+export fn pzs_fse_write_ncount(p: uint8*, norm: int16*, nsym: int32, log: int32) -> int64 {
+  var bits: uint64 = (uint64)(log - 5);
+  var nbits: int64 = 4;
+  var out: int64 = 0;
+  var remaining: int32 = (1 << log) + 1;
+  var threshold: int32 = 1 << log;
+  var nb: int32 = log + 1;
+  var sym: int32 = 0;
+  var prev0: bool = false;
+  while (remaining > 1 && sym < nsym) {
+    if (prev0) {
+      var start: int32 = sym;
+      while (sym < nsym && norm[sym] == 0) { sym = sym + 1; }
+      var run: int32 = sym - start;
+      while (run >= 3) {
+        bits = bits | ((uint64)3 << (uint64)nbits);
+        nbits = nbits + 2;
+        run = run - 3;
+        if (nbits >= 32) { press_wr32(p + out, (uint32)bits); out = out + 4; bits = bits >> 32; nbits = nbits - 32; }
+      }
+      bits = bits | ((uint64)run << (uint64)nbits);
+      nbits = nbits + 2;
+    }
+    var c: int32 = (int32)norm[sym];
+    sym = sym + 1;
+    var mx: int32 = (2 * threshold - 1) - remaining;
+    if (c < 0) { remaining = remaining + c; } else { remaining = remaining - c; }
+    var v: int32 = c + 1;
+    if (v >= threshold) { v = v + mx; }
+    bits = bits | ((uint64)v << (uint64)nbits);
+    nbits = nbits + (int64)nb;
+    if (v < mx) { nbits = nbits - 1; }
+    prev0 = c == 0;
+    while (remaining < threshold) { nb = nb - 1; threshold = threshold >> 1; }
+    if (nbits >= 32) { press_wr32(p + out, (uint32)bits); out = out + 4; bits = bits >> 32; nbits = nbits - 32; }
+  }
+  while (nbits > 0) {
+    p[out] = (uint8)(bits & 255);
+    out = out + 1;
+    bits = bits >> 8;
+    nbits = nbits - 8;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Cost guesses in 1/256 bit units.
+
+var g_log2: uint32* = (uint32*)0;
+
+/// log2(x) * 256 for x >= 1, accurate to about 1/256 bit.
+export fn pzs_log2_256(x: uint64) -> int64 {
+  if (g_log2 == 0) {
+    var t: uint32* = (uint32*)malloc(4096 * 4);
+    t[0] = 0;
+    for i in 1..4096 { t[i] = (uint32)(m.log2((float64)i) * 256.0 + 0.5); }
+    g_log2 = t;
+  }
+  if (x < 4096) { return (int64)g_log2[x]; }
+  var h: int64 = 0;
+  var y: uint64 = x;
+  while (y >= 4096) { y = y >> 1; h = h + 1; }
+  return (int64)g_log2[y] + h * 256;
+}
+
+/// Bits (times 256) to code count[] with the given normalized counts, or
+/// -1 when a used symbol has no slot.
+export fn pzs_fse_cost(count: uint32*, nsym: int32, norm: int16*, nnorm: int32, log: int32) -> int64 {
+  var cost: int64 = 0;
+  var base: int64 = (int64)log * 256;
+  for s in 0..nsym {
+    if (count[s] == 0) { continue; }
+    if (s >= nnorm) { return -1; }
+    var c: int32 = (int32)norm[s];
+    if (c == 0) { return -1; }
+    if (c < 0) { c = 1; }
+    cost = cost + (int64)count[s] * (base - pzs_log2_256((uint64)c));
+  }
+  return cost;
+}

@@ -1,0 +1,498 @@
+// Windows: WGL on Glint's own window, on an HWND the app already has, or on a
+// hidden window for headless use. opengl32.dll is loaded at run time with
+// LoadLibraryA, so the .exe does not import it.
+import "std/io";
+import "std/mem";
+import "glint_types";
+import "glint_gl";
+import "glint_common";
+
+struct GlintW32Msg { hwnd: int64; message: uint32; wparam: int64; lparam: int64; time: uint32; pt_x: int32; pt_y: int32; priv: uint32; }
+struct GlintW32Rect { left: int32; top: int32; right: int32; bottom: int32; }
+struct GlintW32Class {
+  cb_size: uint32; style: uint32; wnd_proc: fn(int64, uint32, int64, int64) -> int64;
+  cls_extra: int32; wnd_extra: int32; instance: int64; icon: int64; cursor: int64; background: int64;
+  menu_name: uint16*; class_name: uint16*; icon_sm: int64;
+}
+
+extern fn glint_w32_GetModuleHandleW(name: uint16*) -> int64 = "GetModuleHandleW";
+extern fn glint_w32_LoadLibraryA(name: cstring) -> int64 = "LoadLibraryA";
+extern fn glint_w32_GetProcAddress(m: int64, name: cstring) -> int64 = "GetProcAddress";
+extern fn glint_w32_QueryPerformanceCounter(out: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn glint_w32_QueryPerformanceFrequency(out: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn glint_w32_RegisterClassExW(wc: GlintW32Class*) -> uint16 = "RegisterClassExW";
+extern fn glint_w32_CreateWindowExW(ex: uint32, cls: uint16*, title: uint16*, style: uint32, x: int32, y: int32, w: int32, h: int32, parent: int64, menu: int64, inst: int64, param: int64) -> int64 = "CreateWindowExW";
+extern fn glint_w32_DefWindowProcW(hwnd: int64, msg: uint32, wp: int64, lp: int64) -> int64 = "DefWindowProcW";
+extern fn glint_w32_DestroyWindow(hwnd: int64) -> int32 = "DestroyWindow";
+extern fn glint_w32_ShowWindow(hwnd: int64, cmd: int32) -> int32 = "ShowWindow";
+extern fn glint_w32_PeekMessageW(m: GlintW32Msg*, hwnd: int64, lo: uint32, hi: uint32, remove: uint32) -> int32 = "PeekMessageW";
+extern fn glint_w32_TranslateMessage(m: GlintW32Msg*) -> int32 = "TranslateMessage";
+extern fn glint_w32_DispatchMessageW(m: GlintW32Msg*) -> int64 = "DispatchMessageW";
+extern fn glint_w32_GetDC(hwnd: int64) -> int64 = "GetDC";
+extern fn glint_w32_ReleaseDC(hwnd: int64, hdc: int64) -> int32 = "ReleaseDC";
+extern fn glint_w32_GetClientRect(hwnd: int64, r: GlintW32Rect*) -> int32 = "GetClientRect";
+extern fn glint_w32_AdjustWindowRectEx(r: GlintW32Rect*, style: uint32, menu: int32, ex: uint32) -> int32 = "AdjustWindowRectEx";
+extern fn glint_w32_SetWindowPos(hwnd: int64, after: int64, x: int32, y: int32, w: int32, h: int32, flags: uint32) -> int32 = "SetWindowPos";
+extern fn glint_w32_SetWindowTextW(hwnd: int64, s: uint16*) -> int32 = "SetWindowTextW";
+extern fn glint_w32_SetWindowLongPtrW(hwnd: int64, idx: int32, v: int64) -> int64 = "SetWindowLongPtrW";
+extern fn glint_w32_GetWindowLongPtrW(hwnd: int64, idx: int32) -> int64 = "GetWindowLongPtrW";
+extern fn glint_w32_GetKeyState(vk: int32) -> int16 = "GetKeyState";
+extern fn glint_w32_LoadCursorW(inst: int64, id: int64) -> int64 = "LoadCursorW";
+extern fn glint_w32_ChoosePixelFormat(hdc: int64, pfd: uint8*) -> int32 = "ChoosePixelFormat";
+extern fn glint_w32_SetPixelFormat(hdc: int64, fmt: int32, pfd: uint8*) -> int32 = "SetPixelFormat";
+extern fn glint_w32_GetPixelFormat(hdc: int64) -> int32 = "GetPixelFormat";
+extern fn glint_w32_DescribePixelFormat(hdc: int64, fmt: int32, n: uint32, pfd: uint8*) -> int32 = "DescribePixelFormat";
+extern fn glint_w32_SwapBuffers(hdc: int64) -> int32 = "SwapBuffers";
+extern fn glint_w32_SystemParametersInfoW(action: uint32, p: uint32, out: rawptr, ini: uint32) -> int32 = "SystemParametersInfoW";
+extern fn glint_w32_GetFileAttributesExA(path: cstring, level: int32, out: uint8*) -> int32 = "GetFileAttributesExA";
+
+extern fn glint_w32_CreateFileA(path: cstring, access: uint32, share: uint32, sec: rawptr, disp: uint32, flags: uint32, tmpl: int64) -> int64 = "CreateFileA";
+extern fn glint_w32_ReadFile(h: int64, buf: uint8*, n: uint32, got: uint32*, ov: uint8*) -> int32 = "ReadFile";
+extern fn glint_w32_CloseHandle(h: int64) -> int32 = "CloseHandle";
+
+// Read-by-offset file access, sharing the file with programs that write it.
+export fn glint_internal_fopen_read(path: cstring) -> int64 {
+  var h: int64 = glint_w32_CreateFileA(path, 2147483648, 7, (rawptr)0, 3, 128, 0);   // GENERIC_READ, share all, OPEN_EXISTING
+  if (h == -1 || h == 0) { return -1; }
+  return h;
+}
+export fn glint_internal_fread_at(h: int64, buf: uint8*, n: int64, off: int64) -> int64 {
+  var ov: uint8[32];
+  memset((rawptr)&ov[0], 0, 32);
+  *(uint32*)(&ov[0] + 16) = (uint32)(off & 4294967295);
+  *(uint32*)(&ov[0] + 20) = (uint32)(off >> 32);
+  var got: uint32 = 0;
+  if (glint_w32_ReadFile(h, buf, (uint32)n, &got, &ov[0]) == 0) { return 0; }
+  return (int64)got;
+}
+export fn glint_internal_fclose(h: int64) { glint_w32_CloseHandle(h); }
+
+// A file's last write time (100 ns units), 0 if it can't be read.
+export fn glint_internal_mtime(path: cstring) -> int64 {
+  var d: uint8[40];
+  if (glint_w32_GetFileAttributesExA(path, 0, &d[0]) == 0) { return 0; }
+  var lo: uint32 = *(uint32*)(&d[0] + 20);
+  var hi: uint32 = *(uint32*)(&d[0] + 24);
+  return ((int64)hi << 32) | (int64)lo;
+}
+
+struct GlintWgl {
+  CreateContext: fn(int64) -> int64;
+  DeleteContext: fn(int64) -> int32;
+  MakeCurrent: fn(int64, int64) -> int32;
+  GetProcAddress: fn(cstring) -> int64;
+  ChoosePixelFormatARB: fn(int64, int32*, float32*, uint32, int32*, uint32*) -> int32;
+  CreateContextAttribsARB: fn(int64, int64, int32*) -> int64;
+  SwapIntervalEXT: fn(int32) -> int32;
+}
+
+var wgl: GlintWgl;
+var opengl32: int64 = 0;
+var g_class_ok: bool = false;
+var g_class_name: uint16[16];
+
+fn wgl_getproc(name: cstring) -> int64 {
+  var p: int64 = 0;
+  if (wgl.GetProcAddress != 0) { p = wgl.GetProcAddress(name); }
+  // wglGetProcAddress gives 0 (or 1, 2, 3, -1 on some drivers) for GL 1.1 names.
+  if (p == 0 || p == 1 || p == 2 || p == 3 || p == -1) { p = glint_w32_GetProcAddress(opengl32, name); }
+  return p;
+}
+
+// Address of any GL or extension function, 0 if the driver lacks it.
+export fn glint_getproc(name: cstring) -> int64 { return wgl_getproc(name); }
+
+// UTF-8 to a NUL-terminated UTF-16 copy (characters past U+FFFF become '?').
+fn wide(s: string) -> uint16* {
+  var n: int64 = (int64)s.length;
+  var out: uint16* = (uint16*)malloc((n + 1) * 2);
+  var i: int64 = 0;
+  var o: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)(uint8)s[i];
+    if (c < 128) { out[o] = (uint16)c; i += 1; }
+    else if (c < 224 && i + 1 < n) { out[o] = (uint16)(((c & 31) << 6) | ((int32)(uint8)s[i + 1] & 63)); i += 2; }
+    else if (c < 240 && i + 2 < n) {
+      out[o] = (uint16)(((c & 15) << 12) | (((int32)(uint8)s[i + 1] & 63) << 6) | ((int32)(uint8)s[i + 2] & 63)); i += 3;
+    } else { out[o] = (uint16)63; i += 4; }
+    o += 1;
+  }
+  out[o] = 0;
+  return out;
+}
+
+fn w32_key(vk: int64) -> int32 {
+  if ((vk >= 65 && vk <= 90) || (vk >= 48 && vk <= 57) || vk == 32) { return (int32)vk; }
+  if (vk >= 112 && vk <= 123) { return GLINT_KEY_F1 + (int32)(vk - 112); }
+  switch ((int32)vk) {
+    case 27: { return GLINT_KEY_ESCAPE; }
+    case 13: { return GLINT_KEY_ENTER; }
+    case 9: { return GLINT_KEY_TAB; }
+    case 8: { return GLINT_KEY_BACKSPACE; }
+    case 45: { return GLINT_KEY_INSERT; }
+    case 46: { return GLINT_KEY_DELETE; }
+    case 37: { return GLINT_KEY_LEFT; }
+    case 38: { return GLINT_KEY_UP; }
+    case 39: { return GLINT_KEY_RIGHT; }
+    case 40: { return GLINT_KEY_DOWN; }
+    case 33: { return GLINT_KEY_PAGE_UP; }
+    case 34: { return GLINT_KEY_PAGE_DOWN; }
+    case 36: { return GLINT_KEY_HOME; }
+    case 35: { return GLINT_KEY_END; }
+    case 16: { return GLINT_KEY_LEFT_SHIFT; }
+    case 17: { return GLINT_KEY_LEFT_CTRL; }
+    case 18: { return GLINT_KEY_LEFT_ALT; }
+    default: { return GLINT_KEY_UNKNOWN; }
+  }
+  return GLINT_KEY_UNKNOWN;
+}
+
+fn w32_mods() -> int32 {
+  var m: int32 = 0;
+  if (glint_w32_GetKeyState(16) < 0) { m = m | GLINT_MOD_SHIFT; }
+  if (glint_w32_GetKeyState(17) < 0) { m = m | GLINT_MOD_CTRL; }
+  if (glint_w32_GetKeyState(18) < 0) { m = m | GLINT_MOD_ALT; }
+  return m;
+}
+
+fn lo16(v: int64) -> int32 { return (int32)(int16)(v & 65535); }
+fn hi16(v: int64) -> int32 { return (int32)(int16)((v >> 16) & 65535); }
+
+fn glint_w32_wndproc(hwnd: int64, msg: uint32, wp: int64, lp: int64) -> int64 {
+  var ctx: GlintContext* = (GlintContext*)glint_w32_GetWindowLongPtrW(hwnd, -21);   // GWLP_USERDATA
+  if (ctx == 0) { return glint_w32_DefWindowProcW(hwnd, msg, wp, lp); }
+  var e: GlintEvent;
+  e.kind = GLINT_EV_NONE;
+  var m: int32 = (int32)msg;
+  if (m == 16) { e.kind = GLINT_EV_CLOSE; glint_internal_push(ctx, e); return 0; }              // WM_CLOSE
+  if (m == 20) { return 1; }                                                                     // WM_ERASEBKGND
+  if (m == 5) {                                                                                  // WM_SIZE
+    var w: int32 = (int32)(lp & 65535);
+    var h: int32 = (int32)((lp >> 16) & 65535);
+    if (w > 0 && h > 0 && (w != ctx->width || h != ctx->height)) { e.kind = GLINT_EV_RESIZE; e.w = w; e.h = h; }
+  } else if (m == 256 || m == 260 || m == 257 || m == 261) {                                    // KEYDOWN SYSKEYDOWN KEYUP SYSKEYUP
+    e.kind = GLINT_EV_KEY_DOWN;
+    if (m == 257 || m == 261) { e.kind = GLINT_EV_KEY_UP; }
+    e.key = w32_key(wp);
+    e.mods = w32_mods();
+  } else if (m == 512) {                                                                         // WM_MOUSEMOVE
+    e.kind = GLINT_EV_MOUSE_MOVE; e.x = lo16(lp); e.y = hi16(lp);
+  } else if (m == 513 || m == 514 || m == 516 || m == 517 || m == 519 || m == 520) {             // buttons
+    e.kind = GLINT_EV_MOUSE_DOWN;
+    if (m == 514 || m == 517 || m == 520) { e.kind = GLINT_EV_MOUSE_UP; }
+    e.button = GLINT_MOUSE_LEFT;
+    if (m == 516 || m == 517) { e.button = GLINT_MOUSE_RIGHT; }
+    if (m == 519 || m == 520) { e.button = GLINT_MOUSE_MIDDLE; }
+    e.x = lo16(lp); e.y = hi16(lp); e.mods = w32_mods();
+  } else if (m == 522) {                                                                         // WM_MOUSEWHEEL
+    e.kind = GLINT_EV_SCROLL; e.dy = 1;
+    if (hi16(wp) < 0) { e.dy = -1; }
+  } else if (m == 7 || m == 8) {                                                                 // SETFOCUS KILLFOCUS
+    e.kind = GLINT_EV_FOCUS; e.x = 1;
+    if (m == 8) { e.x = 0; }
+  }
+  if (e.kind != GLINT_EV_NONE) { glint_internal_push(ctx, e); }
+  return glint_w32_DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+fn w32_class() -> bool {
+  if (g_class_ok) { return true; }
+  var name: string = "GlintWindow";
+  for i in 0..11 { g_class_name[i] = (uint16)name[i]; }
+  g_class_name[11] = 0;
+  var wc: GlintW32Class;
+  wc.cb_size = 80;
+  wc.style = 32 | 2 | 1;                                   // CS_OWNDC | CS_HREDRAW | CS_VREDRAW
+  wc.wnd_proc = &glint_w32_wndproc;
+  wc.instance = glint_w32_GetModuleHandleW((uint16*)0);
+  wc.cursor = glint_w32_LoadCursorW(0, 32512);             // IDC_ARROW
+  wc.class_name = &g_class_name[0];
+  if (glint_w32_RegisterClassExW(&wc) == (uint16)0) { glint_internal_fail("RegisterClassExW failed"); return false; }
+  g_class_ok = true;
+  return true;
+}
+
+fn w32_window(title: string, w: int32, h: int32, resizable: bool, visible: bool) -> int64 {
+  return w32_window_at(title, w, h, resizable, visible, false, 0, 0);
+}
+
+fn w32_window_at(title: string, w: int32, h: int32, resizable: bool, visible: bool, place: bool, x: int32, y: int32) -> int64 {
+  if (!w32_class()) { return 0; }
+  var style: uint32 = 13565952;                            // WS_OVERLAPPEDWINDOW
+  if (!resizable) { style = 13238272; }                    // WS_OVERLAPPED | CAPTION | SYSMENU | MINIMIZEBOX
+  var r: GlintW32Rect = { left: 0, top: 0, right: w, bottom: h };
+  glint_w32_AdjustWindowRectEx(&r, style, 0, 0);
+  var t: uint16* = wide(title);
+  var cw: int32 = -2147483648;                             // CW_USEDEFAULT
+  var wx: int32 = cw;
+  var wy: int32 = cw;
+  if (place) { wx = x; wy = y; }
+  var hwnd: int64 = glint_w32_CreateWindowExW(0, &g_class_name[0], t, style, wx, wy, r.right - r.left, r.bottom - r.top,
+                                              0, 0, glint_w32_GetModuleHandleW((uint16*)0), 0);
+  free((rawptr)t);
+  if (hwnd == 0) { glint_internal_fail("CreateWindowExW failed"); return 0; }
+  if (visible) { glint_w32_ShowWindow(hwnd, 5); }          // SW_SHOW
+  return hwnd;
+}
+
+fn basic_pfd(pfd: uint8*) {
+  memset((rawptr)pfd, 0, 40);
+  *(uint16*)pfd = (uint16)40;
+  *(uint16*)(pfd + 2) = (uint16)1;
+  *(uint32*)(pfd + 4) = (uint32)(4 | 32 | 1);              // DRAW_TO_WINDOW | SUPPORT_OPENGL | DOUBLEBUFFER
+  pfd[9] = (uint8)32;                                      // cColorBits
+  pfd[16] = (uint8)8;                                      // cAlphaBits
+  pfd[23] = (uint8)24;                                     // cDepthBits
+  pfd[24] = (uint8)8;                                      // cStencilBits
+}
+
+// Load opengl32 and the WGL_ARB functions (they need a throwaway context first).
+fn load_wgl() -> bool {
+  if (opengl32 != 0) { return true; }
+  opengl32 = glint_w32_LoadLibraryA("opengl32.dll");
+  if (opengl32 == 0) { glint_internal_fail("opengl32.dll not found"); return false; }
+  wgl.CreateContext = (fn(int64) -> int64)glint_w32_GetProcAddress(opengl32, "wglCreateContext");
+  wgl.DeleteContext = (fn(int64) -> int32)glint_w32_GetProcAddress(opengl32, "wglDeleteContext");
+  wgl.MakeCurrent = (fn(int64, int64) -> int32)glint_w32_GetProcAddress(opengl32, "wglMakeCurrent");
+  wgl.GetProcAddress = (fn(cstring) -> int64)glint_w32_GetProcAddress(opengl32, "wglGetProcAddress");
+  var dummy: int64 = w32_window("glint", 16, 16, false, false);
+  if (dummy == 0) { return false; }
+  var dc: int64 = glint_w32_GetDC(dummy);
+  var pfd: uint8[40];
+  basic_pfd(&pfd[0]);
+  var fmt: int32 = glint_w32_ChoosePixelFormat(dc, &pfd[0]);
+  glint_w32_SetPixelFormat(dc, fmt, &pfd[0]);
+  var rc: int64 = wgl.CreateContext(dc);
+  if (rc == 0 || wgl.MakeCurrent(dc, rc) == 0) { glint_internal_fail("the first WGL context failed"); return false; }
+  wgl.ChoosePixelFormatARB = (fn(int64, int32*, float32*, uint32, int32*, uint32*) -> int32)wgl.GetProcAddress("wglChoosePixelFormatARB");
+  wgl.CreateContextAttribsARB = (fn(int64, int64, int32*) -> int64)wgl.GetProcAddress("wglCreateContextAttribsARB");
+  wgl.SwapIntervalEXT = (fn(int32) -> int32)wgl.GetProcAddress("wglSwapIntervalEXT");
+  wgl.MakeCurrent(0, 0);
+  wgl.DeleteContext(rc);
+  glint_w32_ReleaseDC(dummy, dc);
+  glint_w32_DestroyWindow(dummy);
+  if (wgl.CreateContextAttribsARB == 0) { glint_internal_fail("no WGL_ARB_create_context"); return false; }
+  return true;
+}
+
+fn wgl_on_hwnd(ctx: GlintContext*, cfg: GlintConfig*) -> bool {
+  if (!load_wgl()) { return false; }
+  ctx->hdc = glint_w32_GetDC(ctx->win);
+  if (ctx->hdc == 0) { glint_internal_fail("GetDC failed: not a window"); return false; }
+  var pfd: uint8[40];
+  if (glint_w32_GetPixelFormat(ctx->hdc) == 0) {
+    var fmt: int32 = 0;
+    if (wgl.ChoosePixelFormatARB != 0) {
+      var a: int32[32];
+      var i: int32 = 0;
+      a[i] = 8193; a[i + 1] = 1; i += 2;                   // WGL_DRAW_TO_WINDOW_ARB
+      a[i] = 8208; a[i + 1] = 1; i += 2;                   // WGL_SUPPORT_OPENGL_ARB
+      a[i] = 8209; a[i + 1] = 1; i += 2;                   // WGL_DOUBLE_BUFFER_ARB
+      a[i] = 8211; a[i + 1] = 8235; i += 2;                // WGL_PIXEL_TYPE_ARB = TYPE_RGBA
+      a[i] = 8212; a[i + 1] = 32; i += 2;                  // WGL_COLOR_BITS_ARB
+      a[i] = 8219; a[i + 1] = 8; i += 2;                   // WGL_ALPHA_BITS_ARB
+      a[i] = 8226; a[i + 1] = cfg->depth_bits; i += 2;     // WGL_DEPTH_BITS_ARB
+      a[i] = 8227; a[i + 1] = cfg->stencil_bits; i += 2;   // WGL_STENCIL_BITS_ARB
+      if (cfg->samples > 0) { a[i] = 8257; a[i + 1] = 1; a[i + 2] = 8258; a[i + 3] = cfg->samples; i += 4; }
+      if (cfg->srgb) { a[i] = 8361; a[i + 1] = 1; i += 2; }   // WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB
+      a[i] = 0;
+      var n: uint32 = 0;
+      if (wgl.ChoosePixelFormatARB(ctx->hdc, &a[0], (float32*)0, 1, &fmt, &n) == 0 || n == 0) { fmt = 0; }
+    }
+    basic_pfd(&pfd[0]);
+    if (fmt == 0) { fmt = glint_w32_ChoosePixelFormat(ctx->hdc, &pfd[0]); }
+    glint_w32_DescribePixelFormat(ctx->hdc, fmt, 40, &pfd[0]);
+    if (glint_w32_SetPixelFormat(ctx->hdc, fmt, &pfd[0]) == 0) { glint_internal_fail("SetPixelFormat failed"); return false; }
+  }
+  var maj: int32 = cfg->want_major;
+  var min: int32 = cfg->want_minor;
+  var rc: int64 = 0;
+  while (rc == 0) {
+    var a: int32[10];
+    a[0] = 8337; a[1] = maj;                               // WGL_CONTEXT_MAJOR_VERSION_ARB
+    a[2] = 8338; a[3] = min;                               // WGL_CONTEXT_MINOR_VERSION_ARB
+    a[4] = 37158; a[5] = 1;                                // WGL_CONTEXT_PROFILE_MASK_ARB = CORE
+    a[6] = 8340; a[7] = 0;                                 // WGL_CONTEXT_FLAGS_ARB
+    if (cfg->debug) { a[7] = 1; }
+    a[8] = 0;
+    var share: int64 = 0;
+    if (ctx->share != 0) { share = ctx->share->hglrc; }
+    rc = wgl.CreateContextAttribsARB(ctx->hdc, share, &a[0]);
+    if (rc == 0 && !glint_internal_next_version(&maj, &min, cfg)) { break; }
+  }
+  if (rc == 0) { glint_internal_fail("wglCreateContextAttribsARB failed for every GL version tried"); return false; }
+  if (wgl.MakeCurrent(ctx->hdc, rc) == 0) { glint_internal_fail("wglMakeCurrent failed"); return false; }
+  ctx->hglrc = rc;
+  ctx->backend = GLINT_BACKEND_WGL;
+  if (wgl.SwapIntervalEXT != 0) { wgl.SwapIntervalEXT(cfg->vsync); }
+  return true;
+}
+
+fn cfg_or_default(cfg: GlintConfig*, store: GlintConfig*) -> GlintConfig* {
+  if (cfg != 0) { return cfg; }
+  *store = glint_config();
+  return store;
+}
+
+fn client_size(ctx: GlintContext*) {
+  var r: GlintW32Rect;
+  glint_w32_GetClientRect(ctx->win, &r);
+  ctx->width = r.right - r.left;
+  ctx->height = r.bottom - r.top;
+}
+
+fn open_own(title: string, w: int32, h: int32, cfg: GlintConfig*, kind: int32, visible: bool) -> GlintContext* {
+  var ctx: GlintContext* = new GlintContext;
+  ctx->kind = kind;
+  ctx->win = w32_window_at(title, w, h, cfg->resizable, visible, cfg->place, cfg->x, cfg->y);
+  if (ctx->win == 0) { free((rawptr)ctx); return (GlintContext*)0; }
+  ctx->owns_win = true;
+  glint_w32_SetWindowLongPtrW(ctx->win, -21, (int64)ctx);
+  ctx->width = w;
+  ctx->height = h;
+  if (kind == GLINT_KIND_WINDOW) { client_size(ctx); }
+  if (!wgl_on_hwnd(ctx, cfg) || !glint_internal_setup(ctx, cfg, &glint_getproc)) { glint_close(ctx); return (GlintContext*)0; }
+  return ctx;
+}
+
+// Open a window with a GL context and make it current. cfg may be 0 for defaults.
+// Returns 0 on failure; glint_error() says why.
+export fn glint_open_window(title: string, w: int32, h: int32, cfg_in: GlintConfig*) -> GlintContext* {
+  var store: GlintConfig;
+  var cfg: GlintConfig* = cfg_or_default(cfg_in, &store);
+  return open_own(title, w, h, cfg, GLINT_KIND_WINDOW, cfg->visible);
+}
+
+// Make a GL context on a window the app already has. On Windows `handle` is
+// the HWND. If the window has no pixel format yet, Glint sets one. The app
+// keeps its window procedure and its events.
+export fn glint_open_existing(handle: int64, cfg_in: GlintConfig*) -> GlintContext* {
+  var store: GlintConfig;
+  var cfg: GlintConfig* = cfg_or_default(cfg_in, &store);
+  var ctx: GlintContext* = new GlintContext;
+  ctx->kind = GLINT_KIND_EXISTING;
+  ctx->win = handle;
+  client_size(ctx);
+  if (!wgl_on_hwnd(ctx, cfg) || !glint_internal_setup(ctx, cfg, &glint_getproc)) { glint_close(ctx); return (GlintContext*)0; }
+  return ctx;
+}
+
+// A context with no visible window: drawing goes to an off-screen w x h
+// framebuffer (glint_framebuffer(ctx)). WGL needs a window, so a hidden one is used.
+export fn glint_open_headless(w: int32, h: int32, cfg_in: GlintConfig*) -> GlintContext* {
+  var store: GlintConfig;
+  var cfg: GlintConfig* = cfg_or_default(cfg_in, &store);
+  return open_own("glint", w, h, cfg, GLINT_KIND_HEADLESS, false);
+}
+
+// An off-screen context that shares textures, buffers and shaders with
+// `parent`; it draws into a texture (glint_color_texture). It is current when
+// this returns: call glint_make_current(parent) to go back. Uses a hidden window.
+export fn glint_open_shared(parent: GlintContext*, w: int32, h: int32) -> GlintContext* {
+  var cfg: GlintConfig = glint_config();
+  cfg.want_major = parent->gl_major; cfg.want_minor = parent->gl_minor;
+  cfg.major = parent->gl_major; cfg.minor = parent->gl_minor;
+  var ctx: GlintContext* = new GlintContext;
+  ctx->kind = GLINT_KIND_HEADLESS;
+  ctx->fbo_tex = true;
+  ctx->share = parent;
+  ctx->width = w;
+  ctx->height = h;
+  ctx->win = w32_window("glint", w, h, false, false);
+  ctx->owns_win = ctx->win != 0;
+  if (ctx->win == 0 || !wgl_on_hwnd(ctx, &cfg) || !glint_internal_setup(ctx, &cfg, &glint_getproc)) {
+    glint_close(ctx);
+    glint_make_current(parent);
+    return (GlintContext*)0;
+  }
+  return ctx;
+}
+
+// Size of the work area (the screen without the taskbar) in pixels.
+export fn glint_screen_size(w: int32*, h: int32*) -> bool {
+  var r: GlintW32Rect;
+  if (glint_w32_SystemParametersInfoW(48, 0, (rawptr)&r, 0) == 0) { return false; }   // SPI_GETWORKAREA
+  *w = r.right - r.left;
+  *h = r.bottom - r.top;
+  return true;
+}
+
+// X11 only; on Windows this returns false.
+export fn glint_x11_visual(cfg: GlintConfig*, visual_id: int64*, depth: int32*) -> bool {
+  glint_internal_fail("glint_x11_visual is for X11");
+  return false;
+}
+
+// WGL has no damage swap: this swaps the whole frame and returns false.
+export fn glint_swap_damage(ctx: GlintContext*, rects: int32*, n: int32) -> bool {
+  glint_swap(ctx);
+  return false;
+}
+
+// WGL cannot tell the back buffer's age: 0 means redraw everything
+// (1 for headless contexts, whose framebuffer keeps its contents).
+export fn glint_buffer_age(ctx: GlintContext*) -> int32 {
+  if (ctx->kind == GLINT_KIND_HEADLESS) { return 1; }
+  return 0;
+}
+
+export fn glint_make_current(ctx: GlintContext*) -> bool { return wgl.MakeCurrent(ctx->hdc, ctx->hglrc) != 0; }
+
+export fn glint_swap(ctx: GlintContext*) {
+  if (ctx->kind == GLINT_KIND_HEADLESS) { glFlush(); return; }
+  glint_w32_SwapBuffers(ctx->hdc);
+}
+
+export fn glint_set_vsync(ctx: GlintContext*, n: int32) -> bool {
+  if (wgl.SwapIntervalEXT == 0) { return false; }
+  return wgl.SwapIntervalEXT(n) != 0;
+}
+
+export fn glint_resize(ctx: GlintContext*, w: int32, h: int32) -> bool {
+  if (ctx->kind == GLINT_KIND_HEADLESS) { return glint_internal_make_fbo(ctx, w, h, 0); }
+  if (ctx->kind == GLINT_KIND_WINDOW) {
+    var r: GlintW32Rect = { left: 0, top: 0, right: w, bottom: h };
+    glint_w32_AdjustWindowRectEx(&r, 13565952, 0, 0);
+    glint_w32_SetWindowPos(ctx->win, 0, 0, 0, r.right - r.left, r.bottom - r.top, 2 | 4);   // SWP_NOMOVE | SWP_NOZORDER
+  }
+  ctx->width = w;
+  ctx->height = h;
+  return true;
+}
+
+export fn glint_set_title(ctx: GlintContext*, title: string) {
+  if (ctx->kind != GLINT_KIND_WINDOW) { return; }
+  var t: uint16* = wide(title);
+  glint_w32_SetWindowTextW(ctx->win, t);
+  free((rawptr)t);
+}
+
+export fn glint_poll(ctx: GlintContext*, out: GlintEvent*) -> bool {
+  if (ctx->owns_win) {
+    var m: GlintW32Msg;
+    while (glint_w32_PeekMessageW(&m, 0, 0, 0, 1) != 0) {   // PM_REMOVE
+      glint_w32_TranslateMessage(&m);
+      glint_w32_DispatchMessageW(&m);
+    }
+  }
+  return glint_internal_pop(ctx, out);
+}
+
+export fn glint_close(ctx: GlintContext*) {
+  if (ctx == 0) { return; }
+  if (ctx->hglrc != 0) { wgl.MakeCurrent(0, 0); wgl.DeleteContext(ctx->hglrc); }
+  if (ctx->hdc != 0) { glint_w32_ReleaseDC(ctx->win, ctx->hdc); }
+  if (ctx->owns_win && ctx->win != 0) {
+    glint_w32_SetWindowLongPtrW(ctx->win, -21, 0);
+    glint_w32_DestroyWindow(ctx->win);
+  }
+  free((rawptr)ctx);
+}
+
+export fn glint_time() -> float64 {
+  var f: int64 = 0;
+  var c: int64 = 0;
+  glint_w32_QueryPerformanceFrequency(&f);
+  glint_w32_QueryPerformanceCounter(&c);
+  return (float64)c / (float64)f;
+}

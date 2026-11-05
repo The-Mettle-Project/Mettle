@@ -10795,6 +10795,9 @@ try {
   Write-PkgText (Join-Path $badPackage "LICENSE") "MIT`n"
   Write-PkgText (Join-Path $badPackage "tool.exe") "MZ"
   Assert-PkgFails (Invoke-Pkg @("pack", $badPackage)) "not binaries" "a package holding a binary"
+  Remove-Item (Join-Path $badPackage "tool.exe")
+  Write-PkgText (Join-Path $badPackage "mettle.package") "name = bad`nversion = 1.0.0`ndescription = x`nlicense = MIT`nplatforms = linux beos`n"
+  Assert-PkgFails (Invoke-Pkg @("pack", $badPackage)) "platforms is a list" "an unknown platform"
 
   Write-CaseResult -Name "mettle_pkg_client" -Passed $true
 }

@@ -1,0 +1,85 @@
+// A small bump allocator on malloc. Calls and connections make and drop
+// many short-lived arenas, and malloc-backed blocks keep that cheap.
+import "std/mem";
+
+struct GrpcArenaBlock {
+  next: GrpcArenaBlock*;
+  size: int64;
+}
+
+export struct GrpcArena {
+  first: GrpcArenaBlock*;
+  cur: GrpcArenaBlock*;
+  pos: int64;              // next free byte in cur, from the block start
+}
+
+const HEADER: int64 = 16;
+const BLOCK: int64 = 4096;
+
+fn new_block(size: int64) -> GrpcArenaBlock* {
+  var b: GrpcArenaBlock* = (GrpcArenaBlock*)malloc(size);
+  if (b == 0) { return b; }
+  b->next = (GrpcArenaBlock*)0;
+  b->size = size;
+  return b;
+}
+
+export fn grpc_arena_new() -> GrpcArena* {
+  var a: GrpcArena* = (GrpcArena*)malloc(sizeof(GrpcArena));
+  a->first = new_block(BLOCK);
+  a->cur = a->first;
+  a->pos = HEADER;
+  return a;
+}
+
+// n bytes, 8-byte aligned, valid until reset or free.
+export fn grpc_arena_alloc(a: GrpcArena*, n: int64) -> rawptr {
+  var need: int64 = (n + 7) & -8;
+  if (a->pos + need > a->cur->size) {
+    // Reuse the next block if a reset kept it, else make one.
+    var nb: GrpcArenaBlock* = a->cur->next;
+    if (nb == 0 || nb->size < need + HEADER) {
+      var size: int64 = BLOCK;
+      if (need + HEADER > size) { size = need + HEADER; }
+      var b: GrpcArenaBlock* = new_block(size);
+      if (b == 0) { return (rawptr)0; }
+      b->next = a->cur->next;
+      a->cur->next = b;
+      nb = b;
+    }
+    a->cur = nb;
+    a->pos = HEADER;
+  }
+  var p: uint8* = (uint8*)a->cur + a->pos;
+  a->pos = a->pos + need;
+  return (rawptr)p;
+}
+
+export fn grpc_arena_alloc_zeroed(a: GrpcArena*, n: int64) -> rawptr {
+  var p: rawptr = grpc_arena_alloc(a, n);
+  if (p != 0 && n > 0) { memset(p, 0, n); }
+  return p;
+}
+
+// Forgets everything allocated; keeps the first block for reuse.
+export fn grpc_arena_reset(a: GrpcArena*) {
+  var b: GrpcArenaBlock* = a->first->next;
+  while (b != 0) {
+    var next: GrpcArenaBlock* = b->next;
+    free(b);
+    b = next;
+  }
+  a->first->next = (GrpcArenaBlock*)0;
+  a->cur = a->first;
+  a->pos = HEADER;
+}
+
+export fn grpc_arena_free(a: GrpcArena*) {
+  var b: GrpcArenaBlock* = a->first;
+  while (b != 0) {
+    var next: GrpcArenaBlock* = b->next;
+    free(b);
+    b = next;
+  }
+  free(a);
+}

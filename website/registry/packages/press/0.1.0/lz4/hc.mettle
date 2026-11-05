@@ -1,0 +1,126 @@
+// LZ4 compressor for levels 2..12: hash chains with lazy matching.
+//
+// Every position is put in a chain keyed by a hash of its first 4 bytes.
+// For each position we walk the chain, newest first, and keep the longest
+// match. A higher level walks more links. Before a match is used, the next
+// position is tried too, and wins if it gives a longer match.
+
+import "std/mem";
+import "../core/buf";
+import "emit";
+
+const PLZ_HC_BITS: int32 = 15;     // 32768 slots: the hash keeps the top 15 bits (shift by 17)
+const PLZ_HC_MUL: uint32 = 2654435761;
+
+struct PlzHc {
+  base: uint8*;
+  htab: int32*;       // newest position for each hash, -1 if none
+  ctab: uint16*;      // for each position (mod 64K): distance to the one before
+  next: int64;        // positions below this are already in the chains
+  limit: int64;       // a match may not run past this (n - 5)
+  attempts: int32;    // chain links to follow per search
+  ref: int64;         // result of the last search: where the match is
+}
+
+@inline fn plz_hc_hash(p: uint8*) -> int64 {
+  return (int64)((press_rd32(p) * PLZ_HC_MUL) >> 17);
+}
+
+// Puts every position below `upto` into the chains.
+fn plz_hc_insert(s: PlzHc*, upto: int64) {
+  var idx: int64 = s->next;
+  var ht: int32* = s->htab;
+  var ct: uint16* = s->ctab;
+  while (idx < upto) {
+    var h: int64 = plz_hc_hash(s->base + idx);
+    var delta: int64 = idx - (int64)ht[h];
+    if (delta > 65535) { delta = 65535; }
+    ct[idx & 65535] = (uint16)delta;
+    ht[h] = (int32)idx;
+    idx = idx + 1;
+  }
+  if (upto > s->next) { s->next = upto; }
+}
+
+// Longest match for position ip that is longer than `longest`, or `longest`
+// itself when there is none. The match start is left in s->ref.
+fn plz_hc_find(s: PlzHc*, ip: int64, longest: int64) -> int64 {
+  plz_hc_insert(s, ip);
+  var base: uint8* = s->base;
+  var ct: uint16* = s->ctab;
+  var maxlen: int64 = s->limit - ip;
+  var best: int64 = longest;
+  if (best >= maxlen) { return best; }
+  var pat: uint32 = press_rd32(base + ip);
+  var cand: int64 = (int64)s->htab[plz_hc_hash(base + ip)];
+  var nb: int32 = s->attempts;
+  var work: int64 = (int64)nb * 4;    // budget of 8-byte compares, so long repeats stay cheap
+  while (cand >= 0 && ip - cand <= 65535 && nb > 0) {
+    nb = nb - 1;
+    if (base[cand + best] == base[ip + best] && press_rd32(base + cand) == pat) {
+      var len: int64 = 4 + plz_count(base + ip + 4, base + cand + 4, maxlen - 4);
+      work = work - (len >> 3);
+      if (len > best) {
+        best = len;
+        s->ref = cand;
+        if (best >= maxlen) { break; }
+      }
+      if (work <= 0) { break; }
+    }
+    var d: int64 = (int64)ct[cand & 65535];
+    if (d == 0) { break; }
+    cand = cand - d;
+  }
+  return best;
+}
+
+/// Compresses n bytes with the hash-chain matcher into dst (room for
+/// press_lz4_block_bound(n) bytes). Returns the length, or -1 when memory
+/// runs out.
+export fn plz_hc_compress(src: uint8*, n: int64, level: int32, dst: uint8*) -> int64 {
+  if (n < 13) { return plz_emit_last(dst, 0, src, 0, n); }
+  var s: PlzHc;
+  s.base = src;
+  s.htab = (int32*)malloc((int64)4 << PLZ_HC_BITS);
+  s.ctab = (uint16*)calloc(65536, 2);
+  if (s.htab == 0 || s.ctab == 0) {
+    if (s.htab != 0) { free(s.htab); }
+    if (s.ctab != 0) { free(s.ctab); }
+    return -1;
+  }
+  memset(s.htab, 255, (int64)4 << PLZ_HC_BITS);
+  s.next = 0;
+  s.limit = n - 5;
+  var shift: int32 = level;
+  if (shift > 12) { shift = 12; }
+  s.attempts = 1 << shift;          // level 2 follows 4 links, level 9 follows 512
+  var mflimit: int64 = n - 12;      // last position where a match may start
+  var op: int64 = 0;
+  var anchor: int64 = 0;
+  var ip: int64 = 0;
+  while (ip <= mflimit) {
+    var len: int64 = plz_hc_find(&s, ip, 3);
+    if (len < 4) { ip = ip + 1; continue; }
+    var ref: int64 = s.ref;
+    // Lazy step: if the next position starts a longer match, skip one byte.
+    while (ip + 1 <= mflimit) {
+      var len2: int64 = plz_hc_find(&s, ip + 1, len);
+      if (len2 <= len) { break; }
+      ip = ip + 1;
+      len = len2;
+      ref = s.ref;
+    }
+    // Grow the match backwards over equal literal bytes.
+    while (ip > anchor && ref > 0 && src[ip - 1] == src[ref - 1]) {
+      ip = ip - 1;
+      ref = ref - 1;
+      len = len + 1;
+    }
+    op = plz_emit(dst, op, src, anchor, ip - anchor, ip - ref, len);
+    ip = ip + len;
+    anchor = ip;
+  }
+  free(s.htab);
+  free(s.ctab);
+  return plz_emit_last(dst, op, src, anchor, n);
+}

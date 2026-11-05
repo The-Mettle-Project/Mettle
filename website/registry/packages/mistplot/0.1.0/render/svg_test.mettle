@@ -1,0 +1,206 @@
+// The SVG serializer on small hand-built scenes: one exact document covering every node
+// kind and attribute rule, gradient de-duplication, dotted caps, determinism, argument
+// errors and leaks.
+
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/render/svg";
+
+fn wp(b: MpBuf*, s: string) {
+  if (mp_buf_puts(b, s) != MP_OK) { mp_expect("expected document append", false); }
+}
+
+fn none() -> MpColor { return mp_rgba(0, 0, 0, 0); }
+fn blue() -> MpColor { return mp_rgba(66, 105, 208, 255); }
+
+fn build_sample(s: MpScene*) {
+  mp_scene_rect(s, mp_rect(0.0, 0.0, 120.0, 80.0), mp_rgba(255, 255, 255, 255), none(),
+                0.0, MP_CLS_BG);
+  mp_scene_line(s, 10.0, 60.5, 110.0, 60.5, mp_rgba(229, 231, 235, 255), 1.0,
+                MP_CLS_GRID);
+  mp_scene_path_begin(s, 4, 4, mp_rgba(66, 105, 208, 71), mp_rgba(66, 105, 208, 5),
+                      none(), 0.0, 0, MP_NF_GRADIENT, MP_CLS_SERIES);
+  mp_scene_path_move(s, 10.0, 60.0);
+  mp_scene_path_cubic(s, 30.0, 20.0, 50.0, 20.0, 70.0, 40.0);
+  mp_scene_path_line(s, 70.0, 60.0);
+  mp_scene_path_close(s);
+  mp_scene_path_end(s);
+  mp_scene_poly_begin(s, 3, blue(), 2.0, MP_DASH_DASHED, MP_NF_ROUND, MP_CLS_SERIES);
+  mp_scene_poly_add(s, 10.0, 60.0);
+  mp_scene_poly_add(s, 40.125, 33.333);
+  mp_scene_poly_add(s, 70.0, 40.0);
+  mp_scene_poly_end(s);
+  mp_scene_marker(s, 40.0, 30.0, 3.5, MP_MARK_CIRCLE, mp_rgba(66, 105, 208, 204),
+                  mp_rgba(255, 255, 255, 255), 1.0, MP_CLS_SERIES + 1);
+  mp_scene_marker(s, 50.0, 30.0, 3.0, MP_MARK_DIAMOND, blue(), none(), 0.0,
+                  MP_CLS_SERIES + 2);
+  mp_scene_text(s, 12.0, 15.0, "Q&A <1>", 15.0, mp_rgba(17, 24, 39, 255),
+                MP_ALIGN_START, MP_NF_BOLD, MP_CLS_TITLE, 50.0);
+  mp_scene_text(s, 110.0, 75.0, "1.5k", 11.0, mp_rgba(107, 114, 128, 255),
+                MP_ALIGN_END, MP_NF_TABULAR, MP_CLS_TICK, 20.0);
+}
+
+fn want_sample(w: MpBuf*) {
+  wp(w, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 80\" width=\"120\"");
+  wp(w, " height=\"80\" style=\"max-width:100%;height:auto\" role=\"img\"");
+  wp(w, " aria-label=\"Q&amp;A &quot;chart&quot;\" font-family=\"system-ui,");
+  wp(w, " -apple-system, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif\">\n");
+  wp(w, "  <rect x=\"0\" y=\"0\" width=\"120\" height=\"80\" fill=\"#ffffff\"");
+  wp(w, " class=\"mp-c-bg\"/>\n");
+  wp(w, "  <line x1=\"10\" y1=\"60.5\" x2=\"110\" y2=\"60.5\" stroke=\"#e5e7eb\"");
+  wp(w, " stroke-width=\"1\" class=\"mp-c-grid\"/>\n");
+  wp(w, "  <defs><linearGradient id=\"mp-g-4269d0474269d005\" x2=\"0\" y2=\"1\"><stop");
+  wp(w, " offset=\"0\" stop-color=\"#4269d0\" stop-opacity=\"0.28\"/><stop offset=\"1\"");
+  wp(w, " stop-color=\"#4269d0\" stop-opacity=\"0.02\"/></linearGradient></defs>\n");
+  wp(w, "  <path d=\"M10,60 C30,20 50,20 70,40 L70,60 Z\"");
+  wp(w, " fill=\"url(#mp-g-4269d0474269d005)\" class=\"mp-c-series mp-s-0\"/>\n");
+  wp(w, "  <polyline points=\"10,60 40.13,33.33 70,40\" fill=\"none\" stroke=\"#4269d0\"");
+  wp(w, " stroke-width=\"2\" stroke-linejoin=\"round\" stroke-linecap=\"round\"");
+  wp(w, " stroke-dasharray=\"8 6\" class=\"mp-c-series mp-s-0\"/>\n");
+  wp(w, "  <circle cx=\"40\" cy=\"30\" r=\"3.5\" fill=\"#4269d0\" fill-opacity=\"0.8\"");
+  wp(w, " stroke=\"#ffffff\" stroke-width=\"1\" class=\"mp-c-series mp-s-1\"/>\n");
+  wp(w, "  <path d=\"M50,27 L53,30 L50,33 L47,30 Z\" fill=\"#4269d0\"");
+  wp(w, " class=\"mp-c-series mp-s-2\"/>\n");
+  wp(w, "  <text x=\"12\" y=\"15\" fill=\"#111827\" font-size=\"15\" font-weight=\"600\"");
+  wp(w, " class=\"mp-c-title\">Q&amp;A &lt;1&gt;</text>\n");
+  wp(w, "  <text x=\"110\" y=\"75\" fill=\"#6b7280\" font-size=\"11\"");
+  wp(w, " text-anchor=\"end\" style=\"font-variant-numeric:tabular-nums\"");
+  wp(w, " class=\"mp-c-tick\">1.5k</text>\n");
+  wp(w, "</svg>\n");
+}
+
+fn check_sample() {
+  var live0: int64 = mp_alloc_live();
+  var s: MpScene* = mp_scene_new();
+  var out: MpBuf* = mp_buf_new(64);
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || out == 0 || w == 0) { return; }
+  build_sample(s);
+  want_sample(w);
+  var t: MpTarget = mp_target(120.0, 80.0);
+  mp_expect_i64("sample renders", (int64)mp_svg_scene(s, &t, "", "Q&A \"chart\"", out),
+                (int64)MP_OK);
+  mp_expect_str("sample document", mp_buf_str(out), mp_buf_str(w));
+  mp_expect_i64("render again", (int64)mp_svg_scene(s, &t, "", "Q&A \"chart\"", out),
+                (int64)MP_OK);
+  mp_expect_str("deterministic", mp_buf_str(out), mp_buf_str(w));
+  mp_scene_clear(s);
+  build_sample(s);
+  mp_svg_scene(s, &t, "", "Q&A \"chart\"", out);
+  mp_expect_str("rebuilt scene, same bytes", mp_buf_str(out), mp_buf_str(w));
+  mp_scene_free(s);
+  mp_buf_free(out);
+  mp_buf_free(w);
+  mp_expect_i64("sample leaks", mp_alloc_live(), live0);
+}
+
+// Two paths with one gradient share one <defs>; a different gradient gets its own.
+fn check_gradients() {
+  var s: MpScene* = mp_scene_new();
+  var out: MpBuf* = mp_buf_new(64);
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || out == 0 || w == 0) { return; }
+  var k: int32 = 0;
+  while (k < 3) {
+    var top: MpColor = mp_rgba(255, 0, 0, 255);
+    if (k == 2) { top = mp_rgba(0, 0, 255, 128); }
+    mp_scene_path_begin(s, 2, 2, top, none(), none(), 0.0, 0, MP_NF_GRADIENT, 0);
+    mp_scene_path_move(s, 0.0, 0.0);
+    mp_scene_path_line(s, 1.0, 1.0);
+    mp_scene_path_end(s);
+    k = k + 1;
+  }
+  var t: MpTarget = mp_target(10.0, 10.0);
+  mp_svg_scene(s, &t, "serif", "", out);
+  wp(w, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\" width=\"10\"");
+  wp(w, " height=\"10\" style=\"max-width:100%;height:auto\" role=\"img\"");
+  wp(w, " font-family=\"serif\">\n");
+  wp(w, "  <defs><linearGradient id=\"mp-g-ff0000ff00000000\" x2=\"0\" y2=\"1\">");
+  wp(w, "<stop offset=\"0\" stop-color=\"#ff0000\"/><stop offset=\"1\"");
+  wp(w, " stop-color=\"#000000\" stop-opacity=\"0\"/></linearGradient></defs>\n");
+  wp(w, "  <path d=\"M0,0 L1,1\" fill=\"url(#mp-g-ff0000ff00000000)\" class=\"mp-c-bg\"/>\n");
+  wp(w, "  <path d=\"M0,0 L1,1\" fill=\"url(#mp-g-ff0000ff00000000)\" class=\"mp-c-bg\"/>\n");
+  wp(w, "  <defs><linearGradient id=\"mp-g-0000ff8000000000\" x2=\"0\" y2=\"1\">");
+  wp(w, "<stop offset=\"0\" stop-color=\"#0000ff\" stop-opacity=\"0.5\"/><stop offset=\"1\"");
+  wp(w, " stop-color=\"#000000\" stop-opacity=\"0\"/></linearGradient></defs>\n");
+  wp(w, "  <path d=\"M0,0 L1,1\" fill=\"url(#mp-g-0000ff8000000000)\" class=\"mp-c-bg\"/>\n");
+  wp(w, "</svg>\n");
+  mp_expect_str("gradient defs once per id", mp_buf_str(out), mp_buf_str(w));
+  mp_scene_free(s);
+  mp_buf_free(out);
+  mp_buf_free(w);
+}
+
+// Dotted strokes get round caps even without MP_NF_ROUND; square markers are rects.
+fn check_dotted_square() {
+  var s: MpScene* = mp_scene_new();
+  var out: MpBuf* = mp_buf_new(64);
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || out == 0 || w == 0) { return; }
+  mp_scene_poly_begin(s, 2, blue(), 1.5, MP_DASH_DOTTED, 0, MP_CLS_SERIES + 12);
+  mp_scene_poly_add(s, -0.001, 2.0);
+  mp_scene_poly_add(s, 4.0, 2.0);
+  mp_scene_poly_end(s);
+  mp_scene_marker(s, 5.0, 5.0, 2.0, MP_MARK_SQUARE, none(), blue(), 1.0, MP_CLS_LEGEND);
+  var t: MpTarget = mp_target(8.0, 8.0);
+  mp_svg_scene(s, &t, "", "", out);
+  wp(w, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 8 8\" width=\"8\"");
+  wp(w, " height=\"8\" style=\"max-width:100%;height:auto\" role=\"img\"");
+  wp(w, " font-family=\"system-ui, -apple-system, Segoe UI, Roboto, Helvetica Neue,");
+  wp(w, " Arial, sans-serif\">\n");
+  wp(w, "  <polyline points=\"0,2 4,2\" fill=\"none\" stroke=\"#4269d0\" stroke-width=\"1.5\"");
+  wp(w, " stroke-linecap=\"round\" stroke-dasharray=\"0.01 3\" class=\"mp-c-series mp-s-12\"/>\n");
+  wp(w, "  <rect x=\"3\" y=\"3\" width=\"4\" height=\"4\" fill=\"none\" stroke=\"#4269d0\"");
+  wp(w, " stroke-width=\"1\" class=\"mp-c-legend\"/>\n");
+  wp(w, "</svg>\n");
+  mp_expect_str("dotted and square", mp_buf_str(out), mp_buf_str(w));
+  mp_scene_free(s);
+  mp_buf_free(out);
+  mp_buf_free(w);
+}
+
+fn check_errors() {
+  var s: MpScene* = mp_scene_new();
+  var out: MpBuf* = mp_buf_new(64);
+  if (s == 0 || out == 0) { return; }
+  var t: MpTarget = mp_target(10.0, 10.0);
+  mp_expect_i64("out 0", (int64)mp_svg_scene(s, &t, "", "", 0), (int64)MP_ERR_ARG);
+  wp(out, "junk");
+  mp_expect_i64("scene 0", (int64)mp_svg_scene(0, &t, "", "", out), (int64)MP_ERR_ARG);
+  mp_expect_i64("error clears out", mp_buf_len(out), 0);
+  mp_expect_i64("target 0", (int64)mp_svg_scene(s, 0, "", "", out), (int64)MP_ERR_ARG);
+  var bad: MpTarget = mp_target(0.0, 10.0);
+  mp_expect_i64("zero width", (int64)mp_svg_scene(s, &bad, "", "", out), (int64)MP_ERR_ARG);
+  var zero: float64 = 0.0;
+  bad = mp_target(10.0, zero / zero);
+  mp_expect_i64("NaN height", (int64)mp_svg_scene(s, &bad, "", "", out), (int64)MP_ERR_ARG);
+  mp_scene_poly_begin(s, 1, blue(), 1.0, 0, 0, 0);
+  mp_expect_i64("open poly", (int64)mp_svg_scene(s, &t, "", "", out), (int64)MP_ERR_STATE);
+  mp_expect_i64("state error clears out", mp_buf_len(out), 0);
+  mp_scene_free(s);
+  mp_buf_free(out);
+}
+
+fn run_all() {
+  check_sample();
+  check_gradients();
+  check_dotted_square();
+  check_errors();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_svg_scene() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

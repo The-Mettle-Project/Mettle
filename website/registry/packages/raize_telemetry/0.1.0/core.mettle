@@ -1,0 +1,297 @@
+// raize_telemetry/core: event registry, handlers, execute.
+//
+// The live state is one immutable TmTable, published through g_tm_table.
+// Writers (tm_event, tm_attach*, tm_detach) take g_tm_mutex, build a new
+// table, publish it with a seq-cst store, and chain the old table on `prev`.
+// Retired tables are freed only by tm_shutdown, so a reader that loaded an
+// old table can keep using it. tm_execute takes no lock: one acquire load of
+// g_tm_table, a bounds check and a loop over the event's handlers.
+//
+// Ownership:
+// - Event names and attachment strings are copies owned by the registry.
+//   Names live until tm_shutdown. Attachment strings are freed on detach,
+//   since only writers read them, and only from the current table.
+// - Each table owns its own names/off/hs/att arrays (not the strings).
+
+import "std/mem";
+import "std/thread";
+import "value";
+import "sys/atomic";
+
+export const TM_OK: int32 = 0;
+export const TM_ERR_EXISTS: int32 = -1;
+export const TM_ERR_NOT_FOUND: int32 = -2;
+export const TM_ERR_UNINIT: int32 = -3;
+export const TM_ERR_FULL: int32 = -4;
+export const TM_ERR_ARG: int32 = -5;
+
+// What a handler receives. Every pointer and string in it is borrowed for
+// the call only; `name` stays valid until tm_shutdown.
+export struct TmEvent {
+  id: int32;
+  name: string;
+  meas: TmKV*;
+  n_meas: int32;
+  meta: TmKV*;
+  n_meta: int32;
+}
+
+struct TmHandler {
+  f: fn(TmEvent*, rawptr) -> void;
+  cfg: rawptr;
+}
+
+struct TmAttachment {
+  hid: string;
+  prefix: string;
+  f: fn(TmEvent*, rawptr) -> void;
+  cfg: rawptr;
+}
+
+struct TmTable {
+  n_events: int32;
+  names: string*;
+  off: int32*;
+  hs: TmHandler*;
+  n_att: int32;
+  att: TmAttachment*;
+  prev: TmTable*;
+}
+
+var g_tm_ready: int32 = 0;
+var g_tm_mutex: int64 = 0;
+var g_tm_table: rawptr = 0;
+
+fn tm__current() -> TmTable* {
+  var t: TmTable* = tm__load_ptr(&g_tm_table);
+  return t;
+}
+
+fn tm__copy_str(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  var buf: uint8* = (uint8*)malloc(n + 1);
+  if (n > 0) { mem_copy((cstring)buf, (cstring)s.chars, n); }
+  buf[n] = 0;
+  var out: string;
+  out.chars = buf;
+  out.length = (uint64)n;
+  return out;
+}
+
+// Whole-segment prefix match: "a.b" matches "a.b" and "a.b.c", not "a.bc".
+// The empty prefix matches every name.
+fn tm__prefix_match(prefix: string, name: string) -> bool {
+  var pl: int64 = (int64)prefix.length;
+  var nl: int64 = (int64)name.length;
+  if (pl == 0) { return true; }
+  if (nl < pl) { return false; }
+  for i: int64 in 0..pl {
+    if (name[i] != prefix[i]) { return false; }
+  }
+  if (nl == pl) { return true; }
+  return name[pl] == '.';
+}
+
+// Row j handles `name` if its prefix matches and no earlier row of the same
+// handler id matches too, so a handler runs once per event.
+fn tm__selected(att: TmAttachment*, j: int32, name: string) -> bool {
+  if (!tm__prefix_match(att[j].prefix, name)) { return false; }
+  for k in 0..j {
+    if (att[k].hid == att[j].hid && tm__prefix_match(att[k].prefix, name)) { return false; }
+  }
+  return true;
+}
+
+// Builds a table that takes ownership of the `names` and `att` arrays.
+fn tm__build(names: string*, n: int32, att: TmAttachment*, m: int32, prev: TmTable*) -> TmTable* {
+  var t: TmTable* = new TmTable;
+  t->n_events = n;
+  t->names = names;
+  t->n_att = m;
+  t->att = att;
+  t->prev = prev;
+  t->off = (int32*)malloc((int64)sizeof(int32) * (int64)(n + 1));
+  var total: int32 = 0;
+  for e in 0..n {
+    t->off[e] = total;
+    for j in 0..m {
+      if (tm__selected(att, j, names[e])) { total = total + 1; }
+    }
+  }
+  t->off[n] = total;
+  t->hs = (TmHandler*)malloc((int64)sizeof(TmHandler) * (int64)(total + 1));
+  var k: int32 = 0;
+  for e in 0..n {
+    for j in 0..m {
+      if (tm__selected(att, j, names[e])) {
+        t->hs[k].f = att[j].f;
+        t->hs[k].cfg = att[j].cfg;
+        k = k + 1;
+      }
+    }
+  }
+  return t;
+}
+
+fn tm__free_table(t: TmTable*) {
+  if (t->names != 0) { free(t->names); }
+  if (t->att != 0) { free(t->att); }
+  free(t->off);
+  free(t->hs);
+  free(t);
+}
+
+fn tm__copy_names(t: TmTable*, extra: int32) -> string* {
+  var n: int32 = t->n_events + extra;
+  if (n == 0) { return (string*)0; }
+  var names: string* = (string*)malloc((int64)sizeof(string) * (int64)n);
+  for i in 0..t->n_events { names[i] = t->names[i]; }
+  return names;
+}
+
+fn tm__alloc_att(m: int32) -> TmAttachment* {
+  if (m == 0) { return (TmAttachment*)0; }
+  var att: TmAttachment* = (TmAttachment*)malloc((int64)sizeof(TmAttachment) * (int64)m);
+  return att;
+}
+
+// Main thread, before any other tm_ call and before starting threads.
+// Idempotent: a later call returns TM_OK and changes nothing.
+export fn tm_init() -> int32 {
+  if (g_tm_ready != 0) { return TM_OK; }
+  g_tm_mutex = mutex_create();
+  if (g_tm_mutex == 0) { return TM_ERR_UNINIT; }
+  tm__store_ptr_sc(&g_tm_table, tm__build((string*)0, 0, (TmAttachment*)0, 0, (TmTable*)0));
+  g_tm_ready = 1;
+  return TM_OK;
+}
+
+// After every thread has stopped calling tm_. Frees all tables and strings.
+export fn tm_shutdown() {
+  if (g_tm_ready == 0) { return; }
+  var t: TmTable* = tm__current();
+  for i in 0..t->n_events { free(t->names[i].chars); }
+  for j in 0..t->n_att {
+    free(t->att[j].hid.chars);
+    free(t->att[j].prefix.chars);
+  }
+  while (t != 0) {
+    var p: TmTable* = t->prev;
+    tm__free_table(t);
+    t = p;
+  }
+  tm__store_ptr_sc(&g_tm_table, (rawptr)0);
+  mutex_close(g_tm_mutex);
+  g_tm_mutex = 0;
+  g_tm_ready = 0;
+}
+
+// The id for a dotted event name, registering it on first use. Idempotent.
+// Call at startup and keep the id in a global. Returns < 0 on error.
+export fn tm_event(name: string) -> int32 {
+  if (g_tm_ready == 0) { return TM_ERR_UNINIT; }
+  mutex_lock_infinite(g_tm_mutex);
+  defer mutex_unlock(g_tm_mutex);
+  var t: TmTable* = tm__current();
+  for i in 0..t->n_events {
+    if (t->names[i] == name) { return i; }
+  }
+  var n: int32 = t->n_events + 1;
+  var names: string* = tm__copy_names(t, 1);
+  names[n - 1] = tm__copy_str(name);
+  var att: TmAttachment* = tm__alloc_att(t->n_att);
+  for j in 0..t->n_att { att[j] = t->att[j]; }
+  tm__store_ptr_sc(&g_tm_table, tm__build(names, n, att, t->n_att, t));
+  return n - 1;
+}
+
+// Attaches f under every prefix in prefixes[0..n). cfg must stay valid until
+// tm_shutdown: an execute on another thread may still call f after detach.
+export fn tm_attach_many(handler_id: string, prefixes: string*, n: int32,
+                         f: fn(TmEvent*, rawptr) -> void, cfg: rawptr) -> int32 {
+  if (g_tm_ready == 0) { return TM_ERR_UNINIT; }
+  if (n <= 0 || f == 0) { return TM_ERR_ARG; }
+  mutex_lock_infinite(g_tm_mutex);
+  defer mutex_unlock(g_tm_mutex);
+  var t: TmTable* = tm__current();
+  for j in 0..t->n_att {
+    if (t->att[j].hid == handler_id) { return TM_ERR_EXISTS; }
+  }
+  var m: int32 = t->n_att + n;
+  var att: TmAttachment* = tm__alloc_att(m);
+  for j in 0..t->n_att { att[j] = t->att[j]; }
+  for i in 0..n {
+    var row: TmAttachment* = &att[t->n_att + i];
+    row->hid = tm__copy_str(handler_id);
+    row->prefix = tm__copy_str(prefixes[i]);
+    row->f = f;
+    row->cfg = cfg;
+  }
+  var names: string* = tm__copy_names(t, 0);
+  tm__store_ptr_sc(&g_tm_table, tm__build(names, t->n_events, att, m, t));
+  return TM_OK;
+}
+
+export fn tm_attach(handler_id: string, prefix: string,
+                    f: fn(TmEvent*, rawptr) -> void, cfg: rawptr) -> int32 {
+  var p: string[1];
+  p[0] = prefix;
+  return tm_attach_many(handler_id, &p[0], 1, f, cfg);
+}
+
+// Removes every prefix attached under handler_id. The handler may still run
+// once more on threads that already loaded the old table.
+export fn tm_detach(handler_id: string) -> int32 {
+  if (g_tm_ready == 0) { return TM_ERR_UNINIT; }
+  mutex_lock_infinite(g_tm_mutex);
+  defer mutex_unlock(g_tm_mutex);
+  var t: TmTable* = tm__current();
+  var keep: int32 = 0;
+  for j in 0..t->n_att {
+    if (t->att[j].hid != handler_id) { keep = keep + 1; }
+  }
+  if (keep == t->n_att) { return TM_ERR_NOT_FOUND; }
+  var att: TmAttachment* = tm__alloc_att(keep);
+  var k: int32 = 0;
+  for j in 0..t->n_att {
+    if (t->att[j].hid != handler_id) {
+      att[k] = t->att[j];
+      k = k + 1;
+    } else {
+      free(t->att[j].hid.chars);
+      free(t->att[j].prefix.chars);
+    }
+  }
+  var names: string* = tm__copy_names(t, 0);
+  tm__store_ptr_sc(&g_tm_table, tm__build(names, t->n_events, att, keep, t));
+  return TM_OK;
+}
+
+// True if at least one handler is attached to id. Use it to skip building
+// measurements on hot paths. Thread: any.
+export fn tm_has_handlers(id: int32) -> bool {
+  var t: TmTable* = tm__current();
+  if (t == 0 || id < 0 || id >= t->n_events) { return false; }
+  return t->off[id + 1] > t->off[id];
+}
+
+// Calls every handler attached to id, in attach order, on this thread.
+// meas and meta are borrowed for the call only. Thread: any.
+export fn tm_execute(id: int32, meas: TmKV*, n_meas: int32, meta: TmKV*, n_meta: int32) {
+  var t: TmTable* = tm__current();
+  if (t == 0 || id < 0 || id >= t->n_events) { return; }
+  var a: int32 = t->off[id];
+  var b: int32 = t->off[id + 1];
+  if (a == b) { return; }
+  var ev: TmEvent;
+  ev.id = id;
+  ev.name = t->names[id];
+  ev.meas = meas;
+  ev.n_meas = n_meas;
+  ev.meta = meta;
+  ev.n_meta = n_meta;
+  for i in a..b {
+    var f: fn(TmEvent*, rawptr) -> void = t->hs[i].f;
+    f(&ev, t->hs[i].cfg);
+  }
+}

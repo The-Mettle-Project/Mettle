@@ -1,0 +1,34 @@
+// Status codes. Every Press function that can fail returns one of these.
+// PRESS_OK is zero and every error is negative, so `rc < 0` means failure.
+
+import "std/mem";
+
+export const PRESS_OK: int32 = 0;
+export const PRESS_E_ARG: int32 = -1;         // a bad argument (null pointer, negative length, bad level)
+export const PRESS_E_DATA: int32 = -2;        // the input is not valid data for this format
+export const PRESS_E_TRUNC: int32 = -3;       // the input ended before the data did
+export const PRESS_E_CHECK: int32 = -4;       // a checksum in the data does not match
+export const PRESS_E_LIMIT: int32 = -5;       // the output would pass the buffer's limit
+export const PRESS_E_MEM: int32 = -6;         // out of memory
+export const PRESS_E_UNSUPPORTED: int32 = -7; // valid data that needs a feature Press lacks (a zstd dictionary)
+export const PRESS_E_STATE: int32 = -8;       // a stream call made in the wrong order
+
+// Streaming decoders return this from finish when the input ends too early.
+// It is the same value as PRESS_E_TRUNC.
+
+/// A short English message for a status code.
+export fn press_error_text(rc: int32) -> string {
+  switch (rc) {
+    case 0: { return "ok"; }
+    case -1: { return "bad argument"; }
+    case -2: { return "invalid data"; }
+    case -3: { return "input ended early"; }
+    case -4: { return "checksum mismatch"; }
+    case -5: { return "output limit reached"; }
+    case -6: { return "out of memory"; }
+    case -7: { return "unsupported feature"; }
+    case -8: { return "stream used in the wrong order"; }
+    default: { }
+  }
+  return "unknown error";
+}

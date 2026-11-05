@@ -1,0 +1,339 @@
+// raize_api/route/request: parameters from the path, query and headers, typed and
+// checked before the handler runs, and the handler's accessors for them.
+//
+// Query arrays use OpenAPI's default style (form, explode): ?tag=a&tag=b.
+// Header and path arrays use the simple style: a,b.
+import "std/mem";
+import "json";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/context/arena";
+import "raize_core/context/query";
+import "../types/type";
+import "../types/decode";
+import "../problem/problem";
+import "api";
+
+/// Parses a whole decimal int64: an optional '-', then digits, no overflow.
+export fn rapi_parse_int(s: string, out: int64*) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n == 0 || n > 20) { return false; }
+  var i: int64 = 0;
+  var neg: bool = false;
+  if (s.chars[0] == 45) { neg = true; i = 1; }
+  if (i >= n) { return false; }
+  var v: uint64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (c < 48 || c > 57) { return false; }
+    v = v * (uint64)10 + (uint64)(c - 48);
+    if (v > (uint64)9223372036854775807 + (uint64)1) { return false; }
+    i = i + 1;
+  }
+  if (!neg && v > (uint64)9223372036854775807) { return false; }
+  if (neg) { *out = (int64)((uint64)0 - v); } else { *out = (int64)v; }
+  return true;
+}
+
+/// Parses a JSON number (RFC 8259 grammar, correctly rounded).
+export fn rapi_parse_number(s: string, out: float64*) -> bool {
+  if (s.length == 0) { return false; }
+  var r: JsonReader;
+  json_begin(&r, s);
+  if (json_next(&r) != JSON_NUMBER) { return false; }
+  var v: float64 = json_read_float64(&r);
+  if (json_next(&r) != JSON_END) { return false; }
+  *out = v;
+  return true;
+}
+
+// Converts one text value into `v` as type t. Returns "" or what is wrong.
+fn rapi__scalar(t: RapiType*, text: string, v: RapiValue*, arena: RzArena*) -> string {
+  v->s = text;
+  var k: int32 = t->kind;
+  if (k == RAPI_T_INT) {
+    var n: int64 = 0;
+    if (!rapi_parse_int(text, &n)) { return "must be an integer"; }
+    var issue: string = rapi_int_issue(t, n, arena);
+    if (issue.length > 0) { return issue; }
+    v->i = n;
+    v->f = (float64)n;
+    return "";
+  }
+  if (k == RAPI_T_NUMBER) {
+    var f: float64 = 0.0;
+    if (!rapi_parse_number(text, &f)) { return "must be a number"; }
+    v->f = f;
+    return "";
+  }
+  if (k == RAPI_T_BOOL) {
+    if (text == "true") { v->i = 1; return ""; }
+    if (text == "false") { v->i = 0; return ""; }
+    return "must be true or false";
+  }
+  return rapi_string_issue(t, text, arena);
+}
+
+fn rapi__in_word(in: int32) -> string {
+  if (in == RAPI_IN_PATH) { return "path"; }
+  if (in == RAPI_IN_QUERY) { return "query"; }
+  return "header";
+}
+
+/// One decoded query pair.
+export struct RapiPair {
+  name: string;
+  value: string;
+}
+
+/// Every name=value pair of the request's query, percent-decoded ('+' is a space),
+/// in order, in the request arena. Returns the count; *out gets the pairs.
+export fn rapi_query_pairs(r: RapiReq*, out: RapiPair**) -> int32 {
+  var arena: RzArena* = r->ctx->arena;
+  var q: string = r->ctx->req->query;
+  var len: int64 = (int64)q.length;
+  var total: int64 = 1;
+  for i in 0..q.length {
+    if (q.chars[i] == 38) { total = total + 1; }
+  }
+  var pairs: RapiPair* = (RapiPair*)rz_arena_alloc(arena, total * (int64)sizeof(RapiPair));
+  if (pairs == 0) { *out = pairs; return 0; }
+  var n: int32 = 0;
+  var start: int64 = 0;
+  var k: int64 = 0;
+  while (k <= len) {
+    if (k == len || q.chars[k] == 38) {
+      if (k > start) {
+        var pair: string = rz_str_sub(q, start, k);
+        var eq: int64 = rz_str_find_byte(pair, 61);
+        var raw_name: string = pair;
+        var raw_value: string = "";
+        if (eq >= 0) {
+          raw_name = rz_str_sub(pair, 0, eq);
+          raw_value = rz_str_from(pair, eq + 1);
+        }
+        pairs[n].name = rz_pct_decode(raw_name, true, arena);
+        pairs[n].value = rz_pct_decode(raw_value, true, arena);
+        n = n + 1;
+      }
+      start = k + 1;
+    }
+    k = k + 1;
+  }
+  *out = pairs;
+  return n;
+}
+
+// Collects the raw texts of parameter p. Path values come from `seg`.
+fn rapi__texts(r: RapiReq*, p: RapiParam*, seg: string, out: string*, cap: int32) -> int32 {
+  var arena: RzArena* = r->ctx->arena;
+  var n: int32 = 0;
+  if (p->in == RAPI_IN_PATH) {
+    out[0] = seg;
+    return 1;
+  }
+  if (p->in == RAPI_IN_QUERY) {
+    var pairs: RapiPair* = (RapiPair*)0;
+    var np: int32 = rapi_query_pairs(r, &pairs);
+    for i in 0..np {
+      if (!rz_str_eq(pairs[i].name, p->name)) { continue; }
+      if (n < cap) { out[n] = pairs[i].value; }
+      n = n + 1;
+    }
+    return n;
+  }
+  var req: RzRequest* = r->ctx->req;
+  for i in 0..req->header_count {
+    if (rz_str_eq_ci(req->headers[i].name, p->name)) {
+      if (n < cap) { out[n] = rz_header_trim(req->headers[i].value); }
+      n = n + 1;
+    }
+  }
+  return n;
+}
+
+// Splits "a,b" into items (simple style), trimming spaces.
+fn rapi__split_commas(s: string, arena: RzArena*, out: string**) -> int64 {
+  var count: int64 = 1;
+  for i in 0..s.length {
+    if (s.chars[i] == 44) { count = count + 1; }
+  }
+  var items: string* = (string*)rz_arena_alloc(arena, count * (int64)sizeof(string));
+  if (items == 0) { return 0; }
+  var start: int64 = 0;
+  var k: int64 = 0;
+  for i in 0..(s.length + 1) {
+    if (i == s.length || s.chars[i] == 44) {
+      items[k] = rz_str_trim(rz_str_sub(s, start, (int64)i));
+      k = k + 1;
+      start = (int64)i + 1;
+    }
+  }
+  *out = items;
+  return count;
+}
+
+/// internal: route/dispatch. Parses every declared parameter of r->op. `segs` holds
+/// the request's path segments, in the same order as the template's.
+/// returns: true when all are valid; otherwise r->errs says why
+export fn rapi__parse_params(r: RapiReq*, segs: string*) -> bool {
+  var op: RapiOp* = r->op;
+  var arena: RzArena* = r->ctx->arena;
+  var texts: string[64];
+  for pi in 0..op->nparams {
+    var p: RapiParam* = &op->params[pi];
+    var v: RapiValue* = &r->vals[pi];
+    var seg: string = "";
+    if (p->in == RAPI_IN_PATH) {
+      for si in 0..op->nsegs {
+        if (op->is_param[si] && rz_str_eq(op->segs[si], p->name)) { seg = segs[si]; }
+      }
+    }
+    var n: int32 = rapi__texts(r, p, seg, &texts[0], 64);
+    var loc: string = rapi__in_word(p->in);
+    if (n == 0 && p->def.length > 0) {
+      texts[0] = p->def;
+      n = 1;
+    }
+    if (n == 0) {
+      if (p->required) { rapi_errors_param(r->errs, loc, p->name, "is required"); }
+      continue;
+    }
+    if (n > 64) {
+      rapi_errors_param(r->errs, loc, p->name, "is given too many times");
+      continue;
+    }
+    var t: RapiType* = p->type;
+    if (t->kind != RAPI_T_ARRAY) {
+      if (n > 1) {
+        rapi_errors_param(r->errs, loc, p->name, "is given more than once");
+        continue;
+      }
+      var issue: string = rapi__scalar(t, texts[0], v, arena);
+      if (issue.length > 0) { rapi_errors_param(r->errs, loc, p->name, issue); continue; }
+      v->set = true;
+      continue;
+    }
+    // Arrays.
+    var items: string* = (string*)0;
+    var count: int64 = 0;
+    if (p->in == RAPI_IN_QUERY) {
+      items = (string*)rz_arena_alloc(arena, (int64)n * (int64)sizeof(string));
+      for i in 0..n { items[i] = texts[i]; }
+      count = (int64)n;
+    } else {
+      count = rapi__split_commas(texts[0], arena, &items);
+    }
+    var bad: bool = false;
+    for i in 0..count {
+      var tmp: RapiValue;
+      var issue: string = rapi__scalar(t->items, items[i], &tmp, arena);
+      if (issue.length > 0) {
+        rapi_errors_param(r->errs, loc, p->name, rz_arena_str(arena, "item {i}: {issue}"));
+        bad = true;
+        break;
+      }
+    }
+    if (bad) { continue; }
+    if (t->min_items != RAPI_UNSET && count < t->min_items) {
+      rapi_errors_param(r->errs, loc, p->name, rz_arena_str(arena, "must have at least {t->min_items} items"));
+      continue;
+    }
+    if (t->max_items != RAPI_UNSET && count > t->max_items) {
+      rapi_errors_param(r->errs, loc, p->name, rz_arena_str(arena, "must have at most {t->max_items} items"));
+      continue;
+    }
+    v->list = items;
+    v->n = count;
+    v->set = true;
+  }
+  return rapi_errors_count(r->errs) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Accessors for handlers. Parameters were checked before the handler ran, so a
+// declared parameter of the right type always reads back cleanly.
+// ---------------------------------------------------------------------------
+
+fn rapi__val(r: RapiReq*, name: string) -> RapiValue* {
+  var op: RapiOp* = r->op;
+  for i in 0..op->nparams {
+    var p: RapiParam* = &op->params[i];
+    var same: bool = rz_str_eq(p->name, name);
+    if (p->in == RAPI_IN_HEADER) { same = rz_str_eq_ci(p->name, name); }
+    if (same) { return &r->vals[i]; }
+  }
+  return (RapiValue*)0;
+}
+
+/// True when parameter `name` was given (or has a default).
+export fn rapi_has(r: RapiReq*, name: string) -> bool {
+  var v: RapiValue* = rapi__val(r, name);
+  return v != 0 && v->set;
+}
+
+/// Parameter `name` as text ("" when absent).
+export fn rapi_str(r: RapiReq*, name: string) -> string {
+  var v: RapiValue* = rapi__val(r, name);
+  if (v == 0 || !v->set) { return ""; }
+  return v->s;
+}
+
+/// Integer parameter `name` (0 when absent).
+export fn rapi_int(r: RapiReq*, name: string) -> int64 {
+  var v: RapiValue* = rapi__val(r, name);
+  if (v == 0 || !v->set) { return 0; }
+  return v->i;
+}
+
+/// Number parameter `name` (0 when absent).
+export fn rapi_float(r: RapiReq*, name: string) -> float64 {
+  var v: RapiValue* = rapi__val(r, name);
+  if (v == 0 || !v->set) { return 0.0; }
+  return v->f;
+}
+
+/// Boolean parameter `name` (false when absent).
+export fn rapi_bool(r: RapiReq*, name: string) -> bool {
+  var v: RapiValue* = rapi__val(r, name);
+  if (v == 0 || !v->set) { return false; }
+  return v->i != 0;
+}
+
+/// Number of items in array parameter `name`.
+export fn rapi_count(r: RapiReq*, name: string) -> int64 {
+  var v: RapiValue* = rapi__val(r, name);
+  if (v == 0 || !v->set) { return 0; }
+  return v->n;
+}
+
+/// Item `i` of array parameter `name` as text ("" when out of range).
+export fn rapi_str_at(r: RapiReq*, name: string, i: int64) -> string {
+  var v: RapiValue* = rapi__val(r, name);
+  if (v == 0 || !v->set || i < 0 || i >= v->n) { return ""; }
+  return v->list[i];
+}
+
+/// Item `i` of an integer array parameter.
+export fn rapi_int_at(r: RapiReq*, name: string, i: int64) -> int64 {
+  var out: int64 = 0;
+  rapi_parse_int(rapi_str_at(r, name, i), &out);
+  return out;
+}
+
+/// The decoded request body (cast it to your struct), or 0 when there was none.
+export fn rapi_body_of(r: RapiReq*) -> rawptr { return r->body; }
+
+/// True when top-level body member `name` was present (for PATCH: absent members
+/// keep their stored value).
+export fn rapi_body_has(r: RapiReq*, name: string) -> bool {
+  if (r->op->body == 0) { return false; }
+  var i: int32 = rapi_field_index(r->op->body, name);
+  if (i < 0) { return false; }
+  return (r->present & ((int64)1 << (int64)i)) != 0;
+}
+
+/// A request header ("" when absent), whether declared or not.
+export fn rapi_header(r: RapiReq*, name: string) -> string {
+  return rz_req_header(r->ctx->req, name);
+}

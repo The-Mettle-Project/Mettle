@@ -1,0 +1,7 @@
+name = window
+version = 0.1.0
+description = Windows and input for Mettle: X11, Wayland and Win32 windows, keyboard, mouse, gamepad, clipboard, drag and drop
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Window
+compiler = 0.18.0
+platforms = linux windows

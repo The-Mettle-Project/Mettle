@@ -1,0 +1,108 @@
+// Opus multistream packets (RFC 7845 section 5.1.1, libopus
+// opus_multistream_decoder.c): several Opus streams, the first
+// `ncoupled` of them stereo, packed in one packet, and a table that says
+// which decoded channel feeds each output channel.
+
+import "std/mem";
+import "../core/status";
+import "opus_pkt";
+
+export const AUDIO_OPUS_MAX_STREAMS: int32 = 8;
+
+export struct AudioOpusMs {
+  channels: int32;
+  nstreams: int32;
+  ncoupled: int32;
+  mapping: uint8[8];      // per output channel: stream channel index, 255 = silent
+  decs: AudioOpusDec*;    // nstreams decoders
+  buf: float32*;          // one stream's output, 5760 x 2
+}
+
+export fn audio_opus_ms_free(m: AudioOpusMs*) {
+  if (m->decs != 0) { free(m->decs); }
+  if (m->buf != 0) { free(m->buf); }
+  m->decs = (AudioOpusDec*)0;
+  m->buf = (float32*)0;
+}
+
+/// Sets up the decoders. mapping holds `channels` entries.
+export fn audio_opus_ms_init(m: AudioOpusMs*, channels: int32, nstreams: int32, ncoupled: int32, mapping: uint8*) -> int32 {
+  audio_opus_ms_free(m);
+  if (channels < 1 || channels > 8) { return AUDIO_E_UNSUPPORTED; }
+  if (nstreams < 1 || ncoupled < 0 || ncoupled > nstreams) { return AUDIO_E_DATA; }
+  if (nstreams > AUDIO_OPUS_MAX_STREAMS) { return AUDIO_E_LIMIT; }
+  for c in 0..channels {
+    var v: int32 = (int32)mapping[c];
+    if (v != 255 && v >= nstreams + ncoupled) { return AUDIO_E_DATA; }
+    m->mapping[c] = mapping[c];
+  }
+  m->channels = channels;
+  m->nstreams = nstreams;
+  m->ncoupled = ncoupled;
+  m->decs = (AudioOpusDec*)calloc((int64)nstreams, sizeof(AudioOpusDec));
+  m->buf = (float32*)calloc(5760 * 2, 4);
+  if (m->decs == 0 || m->buf == 0) { audio_opus_ms_free(m); return AUDIO_E_MEM; }
+  for s in 0..nstreams {
+    var ch: int32 = 1;
+    if (s < ncoupled) { ch = 2; }
+    audio_opus_dec_init(&m->decs[s], ch);
+  }
+  return AUDIO_OK;
+}
+
+export fn audio_opus_ms_reset(m: AudioOpusMs*) {
+  if (m->decs == 0) { return; }
+  for s in 0..m->nstreams { audio_opus_dec_reset(&m->decs[s]); }
+}
+
+// Copies channel `sc` of the stream output (stride st) to every output
+// channel mapped to stream channel `idx`.
+fn ms_scatter(m: AudioOpusMs*, pcm: float32*, idx: int32, src: float32*, stride: int32, frames: int32) {
+  var nch: int32 = m->channels;
+  for c in 0..nch {
+    if ((int32)m->mapping[c] == idx) {
+      for i in 0..frames { pcm[i * nch + c] = src[i * stride]; }
+    }
+  }
+}
+
+/// Decodes one multistream packet into pcm (interleaved, m->channels,
+/// room for 5760 frames). Returns frames or < 0. data == 0 conceals
+/// `lost_frames` frames.
+export fn audio_opus_ms_decode(m: AudioOpusMs*, data: uint8*, len0: int32, pcm: float32*, lost_frames: int32) -> int32 {
+  if (m->decs == 0) { return AUDIO_E_ARG; }
+  var nch: int32 = m->channels;
+  var p: uint8* = data;
+  var len: int32 = len0;
+  var frames: int32 = -1;
+  for s in 0..m->nstreams {
+    var d: AudioOpusDec* = &m->decs[s];
+    var ret: int32 = 0;
+    if (data == 0) {
+      ret = audio_opus_dec_lost(d, m->buf, lost_frames);
+    } else {
+      if (len <= 0) { return AUDIO_E_DATA; }
+      var used: int32 = 0;
+      ret = audio_opus_dec_packet(d, p, len, m->buf, 5760, s != m->nstreams - 1, &used);
+      if (ret > 0) {
+        p = p + used;
+        len = len - used;
+      }
+    }
+    if (ret <= 0) { return AUDIO_E_DATA; }
+    if (frames >= 0 && ret != frames) { return AUDIO_E_DATA; }
+    frames = ret;
+    if (s < m->ncoupled) {
+      ms_scatter(m, pcm, 2 * s, m->buf, 2, frames);
+      ms_scatter(m, pcm, 2 * s + 1, m->buf + 1, 2, frames);
+    } else {
+      ms_scatter(m, pcm, m->ncoupled + s, m->buf, 1, frames);
+    }
+  }
+  for c in 0..nch {
+    if (m->mapping[c] == 255) {
+      for i in 0..frames { pcm[i * nch + c] = 0.0; }
+    }
+  }
+  return frames;
+}

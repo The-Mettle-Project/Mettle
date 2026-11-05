@@ -1,0 +1,216 @@
+// Parsing of ClientHello and ServerHello into plain structs. Parsing only
+// checks the shape (lengths, duplicates); what the values mean is decided
+// by the client and server code.
+
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/tls/consts";
+
+export struct MtlsCH {
+  ver: int32;
+  random: uint8*;
+  sid: MtlsRd;
+  suites: MtlsRd;
+  comp: MtlsRd;
+  has_sni: bool;
+  sni: MtlsRd;
+  has_groups: bool;
+  groups: MtlsRd;
+  has_ks: bool;
+  ks: MtlsRd;
+  has_sv: bool;
+  sv: MtlsRd;
+  has_sigs: bool;
+  sigs: MtlsRd;          // the extension body (a vec16 list)
+  has_alpn: bool;
+  alpn: MtlsRd;          // the protocol name list
+  has_psk_modes: bool;
+  psk_modes: MtlsRd;
+  has_psk: bool;
+  psk_ids: MtlsRd;
+  psk_binders: MtlsRd;
+  binders_off: int64;    // offset of the binders vector in the whole message
+  has_cookie: bool;
+  cookie: MtlsRd;
+  ems: bool;
+  reneg: bool;
+  has_ticket: bool;
+  ticket: MtlsRd;
+  early_data: bool;
+  has_pf: bool;
+  pf: MtlsRd;
+}
+
+export struct MtlsSH {
+  ver: int32;
+  random: uint8[32];
+  sid: MtlsRd;
+  suite: int32;
+  comp: int32;
+  sv: int32;             // supported_versions, 0 if absent
+  has_ks: bool;
+  ks_group: int32;
+  ks_pub: MtlsRd;        // empty in a HelloRetryRequest
+  psk_sel: int32;        // -1 if absent
+  has_cookie: bool;
+  cookie: MtlsRd;
+  ems: bool;
+  has_reneg: bool;
+  reneg_len: int64;
+  has_alpn: bool;
+  alpn: MtlsRd;
+  has_ticket: bool;
+  has_pf: bool;
+  pf: MtlsRd;
+  has_sni: bool;
+  bad_ext: int32;        // first extension type we do not expect, -1 if none
+}
+
+fn mtls_seen(seen: int32*, n: int32*, t: int32) -> bool {
+  for i in 0..*n {
+    if (seen[i] == t) { return true; }
+  }
+  if (*n < 64) {
+    seen[*n] = t;
+    *n = *n + 1;
+  }
+  return false;
+}
+
+/// mtls_parse_ch: msg/n is the whole message including its 4-byte header.
+/// Returns MTLS_OK, or an alert number as a negative code: -(alert + 1000).
+export fn mtls_parse_ch(msg: uint8*, n: int64, ch: MtlsCH*) -> int32 {
+  memset(ch, 0, (int64)sizeof(MtlsCH));
+  var r: MtlsRd = mtls_rd(msg + 4, n - 4);
+  ch->ver = mtls_rd_u16(&r);
+  ch->random = mtls_rd_cur(&r);
+  mtls_rd_skip(&r, 32);
+  ch->sid = mtls_rd_vec8(&r);
+  ch->suites = mtls_rd_vec16(&r);
+  ch->comp = mtls_rd_vec8(&r);
+  if (r.bad || ch->sid.n > 32 || ch->suites.n < 2 || (ch->suites.n & 1) != 0 || ch->comp.n < 1) {
+    return -(1000 + MTLS_ALERT_DECODE_ERROR);
+  }
+  if (mtls_rd_left(&r) == 0) { return MTLS_OK; }
+  var exts: MtlsRd = mtls_rd_vec16(&r);
+  if (!mtls_rd_ok_end(&r)) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+  var seen: int32[64];
+  var nseen: int32 = 0;
+  while (mtls_rd_left(&exts) > 0) {
+    if (ch->has_psk) { return -(1000 + MTLS_ALERT_ILLEGAL_PARAMETER); }  // pre_shared_key must be last
+    var t: int32 = mtls_rd_u16(&exts);
+    var b: MtlsRd = mtls_rd_vec16(&exts);
+    if (exts.bad) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+    if (mtls_seen(&seen[0], &nseen, t)) { return -(1000 + MTLS_ALERT_ILLEGAL_PARAMETER); }
+    switch (t) {
+      case 0: {
+        var list: MtlsRd = mtls_rd_vec16(&b);
+        while (mtls_rd_left(&list) > 0) {
+          var kind: int32 = mtls_rd_u8(&list);
+          var name: MtlsRd = mtls_rd_vec16(&list);
+          if (kind == 0 && !ch->has_sni) {
+            ch->has_sni = true;
+            ch->sni = name;
+          }
+        }
+        if (list.bad || !mtls_rd_ok_end(&b)) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+      }
+      case 10: { ch->has_groups = true; ch->groups = mtls_rd_vec16(&b); }
+      case 11: { ch->has_pf = true; ch->pf = mtls_rd_vec8(&b); }
+      case 13: { ch->has_sigs = true; ch->sigs = b; mtls_rd_skip(&b, mtls_rd_left(&b)); }
+      case 16: { ch->has_alpn = true; ch->alpn = mtls_rd_vec16(&b); }
+      case 23: { ch->ems = true; }
+      case 35: { ch->has_ticket = true; ch->ticket = b; mtls_rd_skip(&b, mtls_rd_left(&b)); }
+      case 41: {
+        ch->has_psk = true;
+        ch->psk_ids = mtls_rd_vec16(&b);
+        ch->binders_off = ((int64)b.p - (int64)msg) + b.pos;
+        ch->psk_binders = mtls_rd_vec16(&b);
+      }
+      case 42: { ch->early_data = true; }
+      case 43: { ch->has_sv = true; ch->sv = mtls_rd_vec8(&b); }
+      case 44: { ch->has_cookie = true; ch->cookie = mtls_rd_vec16(&b); }
+      case 45: { ch->has_psk_modes = true; ch->psk_modes = mtls_rd_vec8(&b); }
+      case 51: { ch->has_ks = true; ch->ks = mtls_rd_vec16(&b); }
+      case 0xff01: { ch->reneg = true; }
+      default: { mtls_rd_skip(&b, mtls_rd_left(&b)); }
+    }
+    if (t != 23 && t != 42 && t != 0xff01 && t != 0 && !mtls_rd_ok_end(&b)) {
+      return -(1000 + MTLS_ALERT_DECODE_ERROR);
+    }
+  }
+  if (exts.bad) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+  return MTLS_OK;
+}
+
+/// mtls_parse_sh: like mtls_parse_ch, for ServerHello and
+/// HelloRetryRequest. `hrr` tells which extensions are legal.
+export fn mtls_parse_sh(msg: uint8*, n: int64, sh: MtlsSH*) -> int32 {
+  memset(sh, 0, (int64)sizeof(MtlsSH));
+  sh->psk_sel = -1;
+  sh->bad_ext = -1;
+  var r: MtlsRd = mtls_rd(msg + 4, n - 4);
+  sh->ver = mtls_rd_u16(&r);
+  mtls_rd_copy(&r, &sh->random[0], 32);
+  sh->sid = mtls_rd_vec8(&r);
+  sh->suite = mtls_rd_u16(&r);
+  sh->comp = mtls_rd_u8(&r);
+  if (r.bad || sh->sid.n > 32) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+  if (mtls_rd_left(&r) == 0) { return MTLS_OK; }
+  var exts: MtlsRd = mtls_rd_vec16(&r);
+  if (!mtls_rd_ok_end(&r)) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+  var seen: int32[64];
+  var nseen: int32 = 0;
+  while (mtls_rd_left(&exts) > 0) {
+    var t: int32 = mtls_rd_u16(&exts);
+    var b: MtlsRd = mtls_rd_vec16(&exts);
+    if (exts.bad) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+    if (mtls_seen(&seen[0], &nseen, t)) { return -(1000 + MTLS_ALERT_ILLEGAL_PARAMETER); }
+    switch (t) {
+      case 0: { sh->has_sni = true; }
+      case 11: { sh->has_pf = true; sh->pf = mtls_rd_vec8(&b); }
+      case 16: { sh->has_alpn = true; sh->alpn = mtls_rd_vec16(&b); }
+      case 23: { sh->ems = true; }
+      case 35: { sh->has_ticket = true; }
+      case 41: { sh->psk_sel = mtls_rd_u16(&b); }
+      case 43: { sh->sv = mtls_rd_u16(&b); }
+      case 44: { sh->has_cookie = true; sh->cookie = mtls_rd_vec16(&b); }
+      case 51: {
+        sh->has_ks = true;
+        sh->ks_group = mtls_rd_u16(&b);
+        if (mtls_rd_left(&b) > 0) { sh->ks_pub = mtls_rd_vec16(&b); }
+      }
+      case 0xff01: {
+        sh->has_reneg = true;
+        var rv: MtlsRd = mtls_rd_vec8(&b);
+        sh->reneg_len = rv.n;
+      }
+      default: {
+        if (sh->bad_ext < 0) { sh->bad_ext = t; }
+        mtls_rd_skip(&b, mtls_rd_left(&b));
+      }
+    }
+    if (!mtls_rd_ok_end(&b)) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+  }
+  if (exts.bad) { return -(1000 + MTLS_ALERT_DECODE_ERROR); }
+  return MTLS_OK;
+}
+
+/// mtls_alert_of: turns a parse result into (code, alert) for mtls_fail.
+export fn mtls_parse_alert(rc: int32) -> int32 {
+  if (rc <= -1000) { return -rc - 1000; }
+  return MTLS_ALERT_DECODE_ERROR;
+}
+
+/// mtls_host_is_ip: true for an IPv4 or IPv6 literal (no SNI for those).
+export fn mtls_host_is_ip(p: uint8*, n: int64) -> bool {
+  if (n == 0) { return false; }
+  var digits_dots: bool = true;
+  for i in 0..n {
+    var ch: int32 = (int32)p[i];
+    if (ch == 58) { return true; }  // ':' only appears in IPv6
+    if (!((ch >= 48 && ch <= 57) || ch == 46)) { digits_dots = false; }
+  }
+  return digits_dots;
+}

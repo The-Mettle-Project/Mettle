@@ -1,0 +1,182 @@
+// flux_orm/migration/schema.mettle — schema changes for up and down steps,
+// after Ecto's drop table, alter table add, create index and drop index.
+//
+// Each one builds the SQL text and the same change as an RcStmt and runs it
+// through rc_adapter_run, so a migration callback works with text stores and
+// with MeoDB alike. All of them are idempotent where SQL allows it
+// (IF EXISTS / IF NOT EXISTS). Each `_field` form takes 0-based field indexes;
+// the plain form takes column (or field) names and resolves them with
+// rc_meta_find. Call them from a migration's `up` / `down` callback, which
+// runs inside that migration's transaction.
+//
+// Every one returns RC_OK, the codes listed on it, RC_ERR_NOMEM when a buffer
+// cannot grow, or whatever the adapter returns for the statement (MeoDB v1
+// answers RC_ERR_UNSUPPORTED to both index ops). Nothing is left to free.
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/buf";
+import "../adapter/adapter";
+import "../adapter/stmt";
+import "ddl";
+
+fn rc_schema_run(a: RcAdapter*, b: RcBuf*, st: RcStmt*) -> int32 {
+  var res: RcResult;
+  var rc: int32 = rc_adapter_run(a, rc_buf_text(b), st, (RcValue*)0, 0, &res);
+  if (rc != RC_OK) { return rc; }
+  rc_result_free(&res);
+  return RC_OK;
+}
+
+// Drops m's table: DROP TABLE IF EXISTS "table".
+//   a  the adapter; borrowed
+//   m  the model's meta; only m.table is used
+// Returns RC_OK, or RC_ERR_USAGE when a is 0 or m.table is empty.
+export fn rc_migration_drop(a: RcAdapter*, m: RcMeta) -> int32 {
+  if (a == 0 || m.table.length == (uint64)0) { return RC_ERR_USAGE; }
+  var b: RcBuf = rc_buf_new(64);
+  if (b.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&b);
+  var rc: int32 = rc_buf_put(&b, "DROP TABLE IF EXISTS ");
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, m.table); }
+  if (rc != RC_OK) { return rc; }
+  var st: RcStmt = rc_stmt_new(RC_OP_DROP, m.table);
+  defer rc_stmt_free(&st);
+  st.if_not_exists = true;
+  return rc_schema_run(a, &b, &st);
+}
+
+// Adds one field of m to its table: ALTER TABLE "table" ADD COLUMN "col" TYPE.
+//   a      the adapter; borrowed
+//   m      the model's meta, already including the new field
+//   field  0-based index of the field to add
+// Returns RC_OK, or:
+//   RC_ERR_USAGE        a is 0, m is malformed, or field is out of range
+//   RC_ERR_UNSUPPORTED  the field is a key, NOT NULL or UNIQUE (existing rows
+//                       have no value for it and there are no column defaults
+//                       yet), has no column affinity, or m fails rc_meta_check
+//                       as unsupported
+export fn rc_migration_add_column_field(a: RcAdapter*, m: RcMeta, field: int32) -> int32 {
+  if (a == 0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+  if (field < 0 || field >= m.n_fields) { return RC_ERR_USAGE; }
+  var f: RcField = m.fields[field];
+  if ((f.flags & (RC_F_PK | RC_F_NOT_NULL | RC_F_UNIQUE)) != 0) {
+    return RC_ERR_UNSUPPORTED;
+  }
+  var ty: string = rc_migration_affinity(f.ty);
+  if (ty.length == (uint64)0) { return RC_ERR_UNSUPPORTED; }
+  var b: RcBuf = rc_buf_new(96);
+  if (b.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&b);
+  rc = rc_buf_put(&b, "ALTER TABLE ");
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, m.table); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, " ADD COLUMN "); }
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, f.column); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, " "); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, ty); }
+  if (rc != RC_OK) { return rc; }
+  var st: RcStmt = rc_stmt_new(RC_OP_ADD_COLUMN, m.table);
+  defer rc_stmt_free(&st);
+  rc = rc_stmt_col(&st, f.column, f.ty, 0);
+  if (rc != RC_OK) { return rc; }
+  return rc_schema_run(a, &b, &st);
+}
+
+// Creates an index on m's table:
+// CREATE [UNIQUE] INDEX IF NOT EXISTS "name" ON "table" ("a", "b", ...).
+//   a       the adapter; borrowed
+//   m       the model's meta
+//   name    index name; borrowed, must be non-empty
+//   fields  n 0-based field indexes, in index column order; borrowed
+//   n       number of fields, > 0
+//   unique  true for a UNIQUE index
+// Returns RC_OK, or RC_ERR_USAGE when a or fields is 0, n <= 0, name is
+// empty, m is malformed or a field index is out of range (rc_meta_check's
+// RC_ERR_UNSUPPORTED also passes through); otherwise the adapter's code. On
+// MeoDB: an existing name is an OK no-op; RC_ERR_CONFLICT when a UNIQUE index
+// meets duplicate values; RC_ERR_UNSUPPORTED for n > 1; RC_ERR_USAGE when the
+// column already has an index (its UNIQUE or PK one included).
+export fn rc_migration_create_index_field(a: RcAdapter*, m: RcMeta, name: string,
+                                          fields: int32*, n: int32,
+                                          unique: bool) -> int32 {
+  if (a == 0 || fields == 0 || n <= 0) { return RC_ERR_USAGE; }
+  if (name.length == (uint64)0) { return RC_ERR_USAGE; }
+  var rc: int32 = rc_meta_check(m, 0);
+  if (rc != RC_OK) { return rc; }
+  var b: RcBuf = rc_buf_new(128);
+  if (b.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&b);
+  var st: RcStmt = rc_stmt_new(RC_OP_CREATE_INDEX, m.table);
+  defer rc_stmt_free(&st);
+  st.name = name;
+  st.unique = unique;
+  st.if_not_exists = true;
+  rc = rc_buf_put(&b, "CREATE ");
+  if (rc == RC_OK && unique) { rc = rc_buf_put(&b, "UNIQUE "); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, "INDEX IF NOT EXISTS "); }
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, name); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, " ON "); }
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, m.table); }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, " ("); }
+  var i: int32 = 0;
+  while (rc == RC_OK && i < n) {
+    var f: int32 = fields[i];
+    if (f < 0 || f >= m.n_fields) { return RC_ERR_USAGE; }
+    if (i > 0) { rc = rc_buf_put(&b, ", "); }
+    if (rc == RC_OK) { rc = rc_buf_ident(&b, m.fields[f].column); }
+    if (rc == RC_OK) { rc = rc_stmt_col(&st, m.fields[f].column, m.fields[f].ty, 0); }
+    i = i + 1;
+  }
+  if (rc == RC_OK) { rc = rc_buf_put(&b, ")"); }
+  if (rc != RC_OK) { return rc; }
+  return rc_schema_run(a, &b, &st);
+}
+
+// Drops an index: DROP INDEX IF EXISTS "name".
+//   a     the adapter; borrowed
+//   m     the meta of the table the index belongs to; only m.table is used
+//   name  index name; borrowed, must be non-empty
+// Returns RC_OK, or RC_ERR_USAGE when a is 0 or name is empty; otherwise the
+// adapter's code. A missing name is an OK no-op (IF EXISTS). The unnamed
+// indexes behind UNIQUE and PK columns cannot be dropped.
+export fn rc_migration_drop_index(a: RcAdapter*, m: RcMeta, name: string) -> int32 {
+  if (a == 0 || name.length == (uint64)0) { return RC_ERR_USAGE; }
+  var b: RcBuf = rc_buf_new(64);
+  if (b.data == 0) { return RC_ERR_NOMEM; }
+  defer rc_buf_free(&b);
+  var rc: int32 = rc_buf_put(&b, "DROP INDEX IF EXISTS ");
+  if (rc == RC_OK) { rc = rc_buf_ident(&b, name); }
+  if (rc != RC_OK) { return rc; }
+  var st: RcStmt = rc_stmt_new(RC_OP_DROP_INDEX, m.table);
+  defer rc_stmt_free(&st);
+  st.name = name;
+  st.if_not_exists = true;
+  return rc_schema_run(a, &b, &st);
+}
+
+// --- by column name --------------------------------------------------------------
+
+// rc_migration_add_column_field for the field called `column` (a field or
+// column name; borrowed). An unknown name is RC_ERR_USAGE.
+export fn rc_migration_add_column(a: RcAdapter*, m: RcMeta, column: string) -> int32 {
+  return rc_migration_add_column_field(a, m, rc_meta_find(m, column));
+}
+
+// rc_migration_create_index_field with names: `columns` holds n field or
+// column names (borrowed), 0 < n <= RC_MAX_FIELDS. Returns RC_ERR_USAGE when
+// columns is 0, n is out of range or a name is unknown; otherwise as the
+// `_field` form.
+export fn rc_migration_create_index(a: RcAdapter*, m: RcMeta, name: string,
+                                    columns: string*, n: int32, unique: bool) -> int32 {
+  if (columns == 0 || n <= 0 || n > RC_MAX_FIELDS) { return RC_ERR_USAGE; }
+  var fields: int32[64];
+  var i: int32 = 0;
+  while (i < n) {
+    fields[i] = rc_meta_find(m, columns[i]);
+    i = i + 1;
+  }
+  return rc_migration_create_index_field(a, m, name, &fields[0], n, unique);
+}

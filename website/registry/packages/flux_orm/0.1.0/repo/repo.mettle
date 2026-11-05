@@ -1,0 +1,539 @@
+// flux_orm/repo/repo.mettle — one place to read and write models, after
+// Ecto's Repo. The session is the repo: every call takes an RcSession* and
+// runs on its adapter, inside its transaction if one is open.
+//
+//   rc_repo_insert(s, cs, e)          insert a NEW entity, applying cs first
+//   rc_repo_update(s, cs, e)          save cs's dirty fields
+//   rc_repo_delete(s, e)              delete by key
+//   rc_repo_get(s, m, pk, model, e)   load by key; RC_ERR_NOT_FOUND if none
+//   rc_repo_one(s, q, model, e)       exactly one row
+//   rc_repo_all(s, q, rows)           every row; read them with rc_rows_get
+//   rc_repo_update_all(s, q, &n)      rows from rc_query_update_all + WHERE
+//   rc_repo_delete_all(s, q, &n)      rows from rc_query_delete + WHERE
+//   rc_repo_count(s, q, &n)           rc_query_count + WHERE
+//
+// Loaded models point into results the session keeps (text fields are views
+// into them), so they stay valid until rc_session_clear and must not be used
+// after it. Every entity a read hands back is CLEAN. Adapter failures come
+// back unchanged as their RC_ERR_* code (RC_ERR_ADAPTER, RC_ERR_CLOSED,
+// RC_ERR_CONSTRAINT, RC_ERR_UNSUPPORTED, ...).
+
+import "std/mem";
+
+import "../core/status";
+import "../core/value";
+import "../core/meta";
+import "../core/entity";
+import "../core/session";
+import "../core/clock";
+import "../core/persist";
+import "../adapter/adapter";
+import "../query/builder";
+import "../changeset/changeset";
+import "../relation/relation";
+import "../relation/load";
+
+// The rows of one rc_repo_all; read row i with rc_rows_get. Nothing in it is
+// owned: `res` belongs to the session and is valid until rc_session_clear.
+export struct RcRows {
+  meta: RcMeta;    // the table the rows are for (the query's meta)
+  res: RcResult*;  // the kept result, 0 when the query failed
+  n: int32;        // number of rows
+}
+
+// Inserts a NEW entity, applying a changeset to its model first, e.g.
+// rc_repo_insert(&s, &cs, &e) with e = rc_entity_new(m, (rawptr)&post).
+// An auto primary key that is NULL is left to the store and read back.
+//   s    the session
+//   cs   the changes to apply first, or 0 to insert the model as it is
+//   e    the entity; must be NEW. Its model is written in place
+// Returns RC_OK: e is CLEAN, with its auto key, version 1 and created/updated
+// times filled in. Otherwise:
+//   RC_ERR_USAGE     s or e is 0, or e is not NEW
+//   any code of rc_changeset_apply (RC_ERR_USAGE when cs has an error);
+//                    nothing is sent
+//   RC_ERR_CONFLICT  duplicate key; recorded on cs as "has already been
+//                    taken" (see rc_changeset_unique) when cs is not 0
+//   RC_ERR_ADAPTER   the store did not return the auto key
+//   RC_ERR_NOMEM, rc_meta_check's code, the clock's code (for timestamps),
+//   or the adapter's code
+// On failure e stays NEW, but its model keeps the applied changes and may
+// hold the version and timestamps set for the insert.
+export fn rc_repo_insert(s: RcSession*, cs: RcChangeset*, e: RcEntity*) -> int32 {
+  if (s == 0 || e == 0) { return RC_ERR_USAGE; }
+  if (e->state != RC_ST_NEW) { return RC_ERR_USAGE; }
+  if (cs != 0) {
+    var rc: int32 = rc_changeset_apply(cs, e);
+    if (rc != RC_OK) { return rc; }
+  }
+  var out: int32 = rc_persist_insert(rc_session_adapter(s), e);
+  if (out == RC_ERR_CONFLICT && cs != 0) { rc_changeset_conflict(cs); }
+  return out;
+}
+
+// Saves a changeset's changed fields to a loaded entity's row, e.g.
+// rc_repo_update(&s, &cs, &e) after rc_repo_get and rc_changeset_bind.
+// Only the changed columns are written; a versioned table refuses a stale
+// write. This is rc_changeset_save on the session's adapter, which documents
+// every code.
+//   s    the session
+//   cs   the changes; must not be 0
+//   e    the entity; CLEAN or DIRTY, with a primary key
+// Returns RC_OK (e is CLEAN, or unchanged when nothing changed);
+// RC_ERR_USAGE when s or cs is 0; RC_ERR_CONFLICT for a stale row or a
+// duplicate key; RC_ERR_NOT_FOUND when the row is gone (unversioned table);
+// any other code of rc_changeset_save.
+export fn rc_repo_update(s: RcSession*, cs: RcChangeset*, e: RcEntity*) -> int32 {
+  if (s == 0) { return RC_ERR_USAGE; }
+  return rc_changeset_save(rc_session_adapter(s), cs, e);
+}
+
+// Deletes an entity's row by primary key, e.g. rc_repo_delete(&s, &e). A
+// versioned table deletes only while the row still has the model's version.
+//   s    the session
+//   e    the entity; not DELETED, with a primary key. The model is untouched
+// Returns RC_OK and e becomes DELETED. Otherwise:
+//   RC_ERR_USAGE     s or e is 0, e is DELETED, or e has no primary key
+//   RC_ERR_NOT_FOUND unversioned table, and no row had that key; e keeps its
+//                    state
+//   RC_ERR_CONFLICT  versioned table, and the row was changed or deleted
+//                    since it was loaded; e keeps its state
+//   RC_ERR_NOMEM, or the adapter's code
+export fn rc_repo_delete(s: RcSession*, e: RcEntity*) -> int32 {
+  if (s == 0) { return RC_ERR_USAGE; }
+  return rc_persist_delete(rc_session_adapter(s), e);
+}
+
+// Inserts many models in one statement, like Ecto's Repo.insert_all, e.g.
+// rc_repo_insert_all(&s, user_meta(), (rawptr)&users[0], 3, &n).
+// No changesets: each model is sent as it is. RC_F_AUTO columns are left out
+// (the store assigns them; ids are not read back), and no field is NULL, so
+// use rc_repo_insert for rows that need either. Before sending, each model's
+// version field is set to 1 and its CREATED/UPDATED fields to the clock's
+// time, as rc_repo_insert does. One statement means all rows or none.
+//   s       the session
+//   m       the table
+//   models  n model structs back to back (an array), m.size bytes each
+//   n       rows, at least 1
+//   count   receives the rows inserted (0 on failure)
+// Returns RC_OK, or:
+//   RC_ERR_USAGE        a pointer is 0, n < 1, every column is RC_F_AUTO, or
+//                       a timestamp is needed and no clock is set
+//   RC_ERR_UNSUPPORTED  a field kind has no mapping, or the batch is larger
+//                       than the server accepts in one frame (split it)
+//   RC_ERR_CONFLICT     a duplicate key; nothing was inserted
+//   RC_ERR_NOMEM, or the adapter's code
+// On failure the models may hold the version and timestamps set above.
+export fn rc_repo_insert_all(s: RcSession*, m: RcMeta, models: rawptr, n: int32,
+                             count: int32*) -> int32 {
+  if (count == 0) { return RC_ERR_USAGE; }
+  *count = 0;
+  if (s == 0 || models == 0 || n < 1) { return RC_ERR_USAGE; }
+  var q: RcQuery = rc_query_insert_batch(m, n);
+  defer rc_query_free(&q);
+  if (q.err != RC_OK) { return q.err; }
+  var now: int64 = 0;
+  var stamps: bool = rc_meta_any(m, RC_F_CREATED | RC_F_UPDATED);
+  if (stamps) {
+    var rc0: int32 = rc_clock_now(&now);
+    if (rc0 != RC_OK) { return rc0; }
+  }
+  var vf: int32 = rc_meta_version(m);
+  var r: int32 = 0;
+  while (r < n) {
+    var model: rawptr = (rawptr)((uint8*)models + (int64)r * (int64)m.size);
+    var nulls: uint64 = 0;
+    var i: int32 = 0;
+    while (i < m.n_fields) {
+      var flags: int32 = m.fields[i].flags;
+      var rc: int32 = RC_OK;
+      if ((flags & (RC_F_CREATED | RC_F_UPDATED)) != 0) {
+        rc = rc_meta_set(m, model, &nulls, i, RcTime(now));
+      } else if (i == vf) {
+        rc = rc_meta_set(m, model, &nulls, i, RcInt(1));
+      }
+      if (rc == RC_OK && (flags & RC_F_AUTO) == 0) {
+        var v: RcValue = RcNull;
+        rc = rc_meta_get(m, model, 0, i, &v);
+        if (rc == RC_OK) { rc = rc_query_push_arg(&q, v); }
+      }
+      if (rc != RC_OK) { return rc; }
+      i = i + 1;
+    }
+    r = r + 1;
+  }
+  var res: RcResult;
+  var rc: int32 = rc_query_exec(&q, rc_session_adapter(s), &res);
+  if (rc != RC_OK) { return rc; }
+  *count = res.affected;
+  rc_result_free(&res);
+  return RC_OK;
+}
+
+// Loads one row by primary key, like Ecto's Repo.get, e.g.
+// rc_repo_get(&s, user_meta(), RcInt(7), (rawptr)&u, &e).
+//   s      the session; keeps the result the model points into
+//   m      the table; must have a primary key
+//   pk     the key value
+//   model  the caller's model struct, m.size bytes; zeroed and filled here.
+//          Its text fields point into the session's kept result, valid
+//          until rc_session_clear
+//   e      receives a CLEAN entity for model
+// Returns RC_OK, or:
+//   RC_ERR_USAGE      s, model or e is 0, or m has no primary key
+//   RC_ERR_NOT_FOUND  no row has that key
+//   RC_ERR_ADAPTER    the row's columns do not match m
+//   RC_ERR_RANGE, RC_ERR_CAST  a column value does not fit its model field
+//   RC_ERR_NOMEM, rc_meta_check's code, or the adapter's code
+// On failure *e is not set and model must not be used.
+export fn rc_repo_get(s: RcSession*, m: RcMeta, pk: RcValue, model: rawptr,
+                      e: RcEntity*) -> int32 {
+  if (s == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  memset(model, 0, (int64)m.size);
+  var nulls: uint64 = 0;
+  var res: RcResult;
+  var rc: int32 = rc_persist_load(rc_session_adapter(s), m, pk, model, &nulls, &res);
+  if (rc != RC_OK) { return rc; }
+  var kept: RcResult* = 0;
+  rc = rc_session_keep(s, &res, &kept);
+  if (rc != RC_OK) {
+    rc_result_free(&res);
+    memset(model, 0, (int64)m.size);   // its text pointed into res
+    return rc;
+  }
+  *e = rc_entity_loaded(m, model, nulls);
+  return RC_OK;
+}
+
+// Runs q and keeps its result in the session.
+fn rc_repo_run(s: RcSession*, q: RcQuery*, out: RcResult**) -> int32 {
+  var res: RcResult;
+  var rc: int32 = rc_query_exec(q, rc_session_adapter(s), &res);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_session_keep(s, &res, out);
+  if (rc != RC_OK) { rc_result_free(&res); }
+  return rc;
+}
+
+// Runs a select and keeps every row, like Ecto's Repo.all:
+//   var q: RcQuery = rc_query_select(m);
+//   rc_query_where(&q, "age", RC_CMP_GE, RcInt(18));
+//   rc = rc_repo_all(&s, &q, &rows);    // then rc_rows_get(&rows, i, ...)
+//   rc_query_free(&q);
+//   s     the session; keeps the result until rc_session_clear
+//   q     the query, from rc_query_select; borrowed, still the caller's to
+//         free
+//   rows  receives the rows (n is 0 and res is 0 on failure). Nothing in it
+//         needs freeing
+// Returns RC_OK (also for zero rows); RC_ERR_USAGE when s, q or rows is 0;
+// the query's own error when it was refused while being built; RC_ERR_NOMEM;
+// or the adapter's code.
+export fn rc_repo_all(s: RcSession*, q: RcQuery*, rows: RcRows*) -> int32 {
+  if (s == 0 || q == 0 || rows == 0) { return RC_ERR_USAGE; }
+  rows->meta = q->meta;
+  rows->res = 0;
+  rows->n = 0;
+  var res: RcResult* = 0;
+  var rc: int32 = rc_repo_run(s, q, &res);
+  if (rc != RC_OK) { return rc; }
+  rows->res = res;
+  rows->n = res->n_rows;
+  return RC_OK;
+}
+
+// Runs a select that must match exactly one row and loads it, like Ecto's
+// Repo.one, e.g. rc_repo_one(&s, &q, (rawptr)&u, &e).
+//   s      the session; keeps the result until rc_session_clear
+//   q      the query, from rc_query_select; borrowed
+//   model  the caller's model struct; zeroed and filled. Its text fields
+//          point into the session's kept result
+//   e      receives a CLEAN entity for model
+// Returns RC_OK, or:
+//   RC_ERR_USAGE      a pointer is 0, or more than one row matched (the
+//                     query was not narrow enough, like Ecto's
+//                     MultipleResultsError)
+//   RC_ERR_NOT_FOUND  no row matched
+//   any code of rc_repo_all or rc_rows_get
+export fn rc_repo_one(s: RcSession*, q: RcQuery*, model: rawptr, e: RcEntity*) -> int32 {
+  if (s == 0 || q == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  var rows: RcRows;
+  var rc: int32 = rc_repo_all(s, q, &rows);
+  if (rc != RC_OK) { return rc; }
+  if (rows.n == 0) { return RC_ERR_NOT_FOUND; }
+  if (rows.n > 1) { return RC_ERR_USAGE; }
+  return rc_rows_get(&rows, 0, model, e);
+}
+
+// Loads the one row whose column equals v, like Ecto's Repo.get_by, e.g.
+// rc_repo_get_by(&s, user_meta(), "email", RcText("ada@x.io"), (rawptr)&u, &e).
+//   s       the session; keeps the result until rc_session_clear
+//   m       the table
+//   column  field name, or column name if no field has it
+//   v       the value to match; borrowed
+//   model   the caller's model struct; zeroed and filled. Its text fields
+//           point into the session's kept result
+//   e       receives a CLEAN entity for model
+// Returns RC_OK, or:
+//   RC_ERR_USAGE      a pointer is 0, column is unknown, or more than one row
+//                     matched (use a unique column)
+//   RC_ERR_NOT_FOUND  no row matched
+//   any code of rc_repo_one
+export fn rc_repo_get_by(s: RcSession*, m: RcMeta, column: string, v: RcValue,
+                         model: rawptr, e: RcEntity*) -> int32 {
+  var field: int32 = rc_meta_find(m, column);
+  if (field < 0) { return RC_ERR_USAGE; }
+  return rc_repo_get_by_field(s, m, field, v, model, e);
+}
+
+// rc_repo_get_by with a 0-based field index in place of the name. Returns
+// the same codes; RC_ERR_USAGE when field is out of range.
+export fn rc_repo_get_by_field(s: RcSession*, m: RcMeta, field: int32, v: RcValue,
+                               model: rawptr, e: RcEntity*) -> int32 {
+  if (s == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  var q: RcQuery = rc_query_select(m);
+  defer rc_query_free(&q);
+  var rc: int32 = rc_query_where_field(&q, field, RC_CMP_EQ, v);
+  if (rc != RC_OK) { return rc; }
+  rc = rc_query_limit(&q, 2);   // 2 is enough to tell one row from many
+  if (rc != RC_OK) { return rc; }
+  return rc_repo_one(s, &q, model, e);
+}
+
+// Tells whether any row matches, like Ecto's Repo.exists?, e.g.
+// rc_repo_exists(&s, &q, &found) with q from rc_query_count plus WHERE terms.
+//   s      the session
+//   q      from rc_query_count; borrowed
+//   found  receives true when at least one row matches (false on failure)
+// Returns the codes of rc_repo_count. Nothing is kept.
+export fn rc_repo_exists(s: RcSession*, q: RcQuery*, found: bool*) -> int32 {
+  if (found == 0) { return RC_ERR_USAGE; }
+  *found = false;
+  var n: int64 = 0;
+  var rc: int32 = rc_repo_count(s, q, &n);
+  if (rc == RC_OK) { *found = n > 0; }
+  return rc;
+}
+
+// Loads row i of an rc_repo_all into a model.
+//   rows   from rc_repo_all
+//   i      0-based row, below rows->n
+//   model  the caller's model struct, rows->meta.size bytes; zeroed and
+//          filled. Its text fields point into the session's kept result,
+//          valid until rc_session_clear
+//   e      receives a CLEAN entity for model
+// Returns RC_OK, or:
+//   RC_ERR_USAGE    a pointer is 0, rows holds no result, or i is out of
+//                   range
+//   RC_ERR_ADAPTER  the result's columns are not the meta's fields (the
+//                   query did not select every column)
+//   RC_ERR_RANGE, RC_ERR_CAST  a column value does not fit its model field
+export fn rc_rows_get(rows: RcRows*, i: int32, model: rawptr, e: RcEntity*) -> int32 {
+  if (rows == 0 || rows->res == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  memset(model, 0, (int64)rows->meta.size);
+  var nulls: uint64 = 0;
+  var rc: int32 = rc_persist_hydrate(rows->meta, rows->res, i, model, &nulls);
+  if (rc != RC_OK) { return rc; }
+  *e = rc_entity_loaded(rows->meta, model, nulls);
+  return RC_OK;
+}
+
+// Runs an update_all or delete query; *n receives the rows it changed.
+fn rc_repo_write_all(s: RcSession*, q: RcQuery*, n: int32*) -> int32 {
+  if (s == 0 || q == 0 || n == 0) { return RC_ERR_USAGE; }
+  *n = 0;
+  var res: RcResult;
+  var rc: int32 = rc_query_exec(q, rc_session_adapter(s), &res);
+  if (rc != RC_OK) { return rc; }
+  *n = res.affected;
+  rc_result_free(&res);
+  return RC_OK;
+}
+
+// Updates every matching row in one statement, like Ecto's
+// Repo.update_all:
+//   var q: RcQuery = rc_query_update_all(m);
+//   rc_query_set(&q, "active", RcBool(false));
+//   rc_query_where(&q, "age", RC_CMP_LT, RcInt(18));
+//   rc = rc_repo_update_all(&s, &q, &n);
+// Loaded entities are not touched; reload them to see the change.
+//   s    the session
+//   q    from rc_query_update_all, with at least one SET and one WHERE term;
+//        borrowed
+//   n    receives the number of rows changed (0 on failure)
+// Returns RC_OK; RC_ERR_USAGE when a pointer is 0 or q has no SET value or
+// no WHERE term; the query's own error when it was refused while being
+// built; or the adapter's code. Nothing is kept in the session.
+export fn rc_repo_update_all(s: RcSession*, q: RcQuery*, n: int32*) -> int32 {
+  return rc_repo_write_all(s, q, n);
+}
+
+// Deletes every matching row in one statement, like Ecto's Repo.delete_all,
+// e.g. rc_repo_delete_all(&s, &q, &n) with q from rc_query_delete plus a
+// WHERE term. Loaded entities are not touched.
+//   s    the session
+//   q    from rc_query_delete, with at least one WHERE term (a delete with no
+//        WHERE is refused); borrowed
+//   n    receives the number of rows deleted (0 on failure)
+// Returns RC_OK; RC_ERR_USAGE when a pointer is 0 or q has no WHERE term;
+// the query's own error when it was refused while being built; or the
+// adapter's code. Nothing is kept in the session.
+export fn rc_repo_delete_all(s: RcSession*, q: RcQuery*, n: int32*) -> int32 {
+  return rc_repo_write_all(s, q, n);
+}
+
+// Counts matching rows, e.g. rc_repo_count(&s, &q, &n) with q from
+// rc_query_count plus any WHERE terms.
+//   s    the session
+//   q    from rc_query_count; borrowed
+//   n    receives the count (0 on failure)
+// Returns RC_OK; RC_ERR_USAGE when a pointer is 0; RC_ERR_ADAPTER when the
+// store does not answer one row of one column; RC_ERR_CAST or RC_ERR_RANGE
+// when that value is not an int64; the query's own error; or the adapter's
+// code (RC_ERR_UNSUPPORTED when it cannot count). Nothing is kept.
+export fn rc_repo_count(s: RcSession*, q: RcQuery*, n: int64*) -> int32 {
+  if (s == 0 || q == 0 || n == 0) { return RC_ERR_USAGE; }
+  *n = 0;
+  var res: RcResult;
+  var rc: int32 = rc_query_exec(q, rc_session_adapter(s), &res);
+  if (rc != RC_OK) { return rc; }
+  if (res.n_rows != 1 || res.n_cols != 1) {
+    rc_result_free(&res);
+    return RC_ERR_ADAPTER;
+  }
+  rc = rc_result_i64(&res, 0, 0, n);
+  rc_result_free(&res);
+  return rc;
+}
+
+// --- preload -------------------------------------------------------------------
+// After Ecto's Repo.preload: one statement loads a relation for every owner
+// (two for has_many_through), never one per owner.
+//
+//   var pre: RcPreload;
+//   rc_repo_preload(&s, &users, &posts_rel, &pre);   // users from rc_repo_all
+//   var n: int32 = rc_preload_count(&pre, &user);    // user: one of the rows
+//   rc_preload_get(&pre, &user, 0, (rawptr)&post, &post_e);
+
+// The related rows rc_repo_preload loaded. The session holds them until
+// rc_session_clear; there is nothing to free.
+export struct RcPreload {
+  rel: RcRelationResult*;   // the loaded relation, held by the session
+  local: int32;             // owner field holding the key
+  meta: RcMeta;             // the target model
+}
+
+fn rc_repo_release_relation(p: rawptr) {
+  rc_relation_free((RcRelationResult*)p);
+  free(p);
+}
+
+fn rc_repo_preload_keys(s: RcSession*, rel: RcRelation*, owner: RcMeta, keys: RcValue*,
+                        n: int32, out: RcPreload*) -> int32 {
+  if (rel->target.n_fields == 0) { return RC_ERR_USAGE; }
+  var through: RcMeta* = 0;
+  if (rel->kind == RC_REL_HAS_MANY_THROUGH) { through = &rel->through; }
+  var rr: RcRelationResult* = malloc(sizeof(RcRelationResult));
+  if (rr == 0) { return RC_ERR_NOMEM; }
+  memset((rawptr)rr, 0, (int64)sizeof(RcRelationResult));
+  var a: RcAdapter* = rc_session_adapter(s);
+  var rc: int32 = rc_relation_load(a, rel, owner, rel->target, through, keys, n, rr);
+  if (rc == RC_OK) { rc = rc_session_hold(s, (rawptr)rr, &rc_repo_release_relation); }
+  if (rc != RC_OK) {
+    rc_repo_release_relation((rawptr)rr);
+    return rc;
+  }
+  out->rel = rr;
+  out->local = rel->local_field;
+  out->meta = rel->target;
+  return RC_OK;
+}
+
+// Loads `rel` for every row of `rows` in one statement.
+//   s     the session; it holds the loaded rows until rc_session_clear
+//   rows  owners from rc_repo_all over the relation's owner model
+//   rel   from rc_relation_has_many / belongs_to / has_many_through (they
+//         carry the target model; the index form rc_relation does not)
+//   out   receives the result; read it with rc_preload_count / rc_preload_get
+// Returns RC_OK; RC_ERR_USAGE when an argument is 0, rel was built without a
+// target model, or the rows are not of the relation's owner model; any code
+// of rc_relation_load (RC_ERR_CAST for a non-integer key, the adapter's code).
+// Owners with a NULL key, and owners with no related rows, get 0 rows.
+export fn rc_repo_preload(s: RcSession*, rows: RcRows*, rel: RcRelation*,
+                          out: RcPreload*) -> int32 {
+  if (s == 0 || rows == 0 || rel == 0 || out == 0) { return RC_ERR_USAGE; }
+  if (rel->local_field < 0 || rel->local_field >= rows->meta.n_fields) {
+    return RC_ERR_USAGE;
+  }
+  var n: int32 = rows->n;
+  var keys: RcValue* = 0;
+  if (n > 0) {
+    keys = malloc((int64)n * (int64)sizeof(RcValue));
+    if (keys == 0) { return RC_ERR_NOMEM; }
+  }
+  var i: int32 = 0;
+  while (i < n) {
+    keys[i] = rc_result_borrow(rows->res, i, rel->local_field);
+    i = i + 1;
+  }
+  var rc: int32 = rc_repo_preload_keys(s, rel, rows->meta, keys, n, out);
+  if (keys != 0) { free((rawptr)keys); }
+  return rc;
+}
+
+// rc_repo_preload for one loaded entity (from rc_repo_get, rc_repo_one or
+// rc_rows_get). Same arguments and codes, with `owner` in place of `rows`.
+export fn rc_repo_preload_one(s: RcSession*, owner: RcEntity*, rel: RcRelation*,
+                              out: RcPreload*) -> int32 {
+  if (s == 0 || owner == 0 || rel == 0 || out == 0) { return RC_ERR_USAGE; }
+  var key: RcValue = RcNull;
+  var rc: int32 = rc_entity_get_field(owner, rel->local_field, &key);
+  if (rc != RC_OK) { return rc; }
+  return rc_repo_preload_keys(s, rel, owner->meta, &key, 1, out);
+}
+
+// The owner's group in the loaded relation, or -1 when it has none.
+fn rc_preload_group(p: RcPreload*, owner: RcEntity*) -> int32 {
+  if (p == 0 || p->rel == 0 || owner == 0) { return -1; }
+  var key: RcValue = RcNull;
+  if (rc_entity_get_field(owner, p->local, &key) != RC_OK) { return -1; }
+  var k: int64 = 0;
+  if (rc_value_as_i64(key, &k) != RC_OK) { return -1; }
+  return rc_relation_group(p->rel, k);
+}
+
+// How many related rows `owner` has (at most 1 for belongs_to).
+//   p      from rc_repo_preload / rc_repo_preload_one
+//   owner  one of the owners the preload was run for
+// Returns the count; 0 for an owner with none, a NULL key, or an owner that
+// was not in the preload.
+export fn rc_preload_count(p: RcPreload*, owner: RcEntity*) -> int32 {
+  var g: int32 = rc_preload_group(p, owner);
+  if (g < 0) { return 0; }
+  var n: int32 = rc_relation_count(p->rel, g);
+  if (n < 0) { return 0; }
+  return n;
+}
+
+// Reads related row i of `owner` into `model` (zeroed here) and sets *e to a
+// CLEAN entity for it, ready to edit and save.
+//   p      from rc_repo_preload / rc_repo_preload_one
+//   owner  one of the owners the preload was run for
+//   i      0 .. rc_preload_count(p, owner) - 1
+//   model  storage for one target model (p->meta.size bytes); its text
+//          fields point into rows the session holds
+//   e      receives the entity
+// Returns RC_OK; RC_ERR_USAGE when an argument is 0, the owner has no such
+// row, or i is out of range; RC_ERR_ADAPTER / RC_ERR_RANGE / RC_ERR_CAST when
+// a stored value does not fit the model.
+export fn rc_preload_get(p: RcPreload*, owner: RcEntity*, i: int32, model: rawptr,
+                         e: RcEntity*) -> int32 {
+  if (p == 0 || owner == 0 || model == 0 || e == 0) { return RC_ERR_USAGE; }
+  var g: int32 = rc_preload_group(p, owner);
+  if (g < 0) { return RC_ERR_USAGE; }
+  memset(model, 0, (int64)p->meta.size);
+  var nulls: uint64 = 0;
+  var rc: int32 = rc_relation_hydrate(p->rel, g, i, model, &nulls);
+  if (rc != RC_OK) { return rc; }
+  *e = rc_entity_loaded(p->meta, model, nulls);
+  return RC_OK;
+}
