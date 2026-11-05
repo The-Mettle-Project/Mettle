@@ -3,31 +3,119 @@
 
 #define IR_POPCOUNT_BYTE_UNROLL 8
 
-static int ir_popcount_body_is_v_shift_step(const IRInstruction *instruction,
-                                            const char *v_symbol) {
-  if (!instruction || instruction->op != IR_OP_BINARY || instruction->is_float ||
-      !instruction->text || !v_symbol) {
+typedef struct {
+  const char *v;
+  const char *count;
+  const char *bit;
+  const char *bit_cast;
+  const char *half;
+  int saw_add;
+  int saw_shift;
+  int v_written;
+  int use_int32_cast;
+  int use_uint8_cast;
+} IRPopcountBody;
+
+static int ir_popcount_is_binary(const IRInstruction *in, const char *op) {
+  return in->op == IR_OP_BINARY && !in->is_float && in->text &&
+         strcmp(in->text, op) == 0;
+}
+
+static int ir_popcount_is_half(const IRInstruction *in, const char *v) {
+  return ir_operand_is_symbol_named(&in->lhs, v) &&
+         ((ir_popcount_is_binary(in, "/") &&
+           ir_operand_is_int_value(&in->rhs, 2)) ||
+          (ir_popcount_is_binary(in, ">>") &&
+           ir_operand_is_int_value(&in->rhs, 1)));
+}
+
+static int ir_popcount_take_add(IRPopcountBody *body, const IRInstruction *in) {
+  const IROperand *other = NULL;
+  if (!body->bit || body->saw_add || body->saw_shift ||
+      ir_operand_is_symbol_named(&in->dest, body->v)) {
     return 0;
   }
+  if (ir_operand_is_symbol_named(&in->lhs, in->dest.name)) {
+    other = &in->rhs;
+  } else if (ir_operand_is_symbol_named(&in->rhs, in->dest.name)) {
+    other = &in->lhs;
+  }
+  if (!other || !(ir_operand_is_temp_named(other, body->bit) ||
+                  (body->bit_cast &&
+                   ir_operand_is_temp_named(other, body->bit_cast)))) {
+    return 0;
+  }
+  body->count = in->dest.name;
+  body->saw_add = 1;
+  return 1;
+}
 
-  if (strcmp(instruction->text, "/") == 0 &&
-      ir_operand_is_symbol_named(&instruction->lhs, v_symbol) &&
-      ir_operand_is_int_value(&instruction->rhs, 2)) {
+static int ir_popcount_take_half(IRPopcountBody *body, const IRInstruction *in) {
+  if (!body->saw_add || body->saw_shift) {
+    return 0;
+  }
+  body->saw_shift = 1;
+  if (ir_operand_is_symbol_named(&in->dest, body->v)) {
+    body->v_written = 1;
     return 1;
   }
+  if (in->dest.kind != IR_OPERAND_TEMP || !in->dest.name) {
+    return 0;
+  }
+  body->half = in->dest.name;
+  return 1;
+}
 
-  if (strcmp(instruction->text, ">>") == 0 &&
-      ir_operand_is_symbol_named(&instruction->lhs, v_symbol) &&
-      ir_operand_is_int_value(&instruction->rhs, 1)) {
+static int ir_popcount_take_write_back(IRPopcountBody *body,
+                                       const IRInstruction *in) {
+  if (body->v_written || !body->half ||
+      !ir_operand_is_temp_named(&in->lhs, body->half)) {
+    return 0;
+  }
+  if (in->op == IR_OP_CAST) {
+    if (!in->text || !strstr(in->text, "uint8")) {
+      return 0;
+    }
+    body->use_uint8_cast = 1;
+  }
+  body->v_written = 1;
+  return 1;
+}
+
+static int ir_popcount_take(IRPopcountBody *body, const IRInstruction *in) {
+  if (in->op == IR_OP_NOP) {
     return 1;
   }
-
-  return 0;
+  if (ir_popcount_is_binary(in, "&") &&
+      ir_operand_is_symbol_named(&in->lhs, body->v) &&
+      ir_operand_is_int_value(&in->rhs, 1) && in->dest.kind == IR_OPERAND_TEMP &&
+      in->dest.name && !body->bit && !body->saw_shift) {
+    body->bit = in->dest.name;
+    return 1;
+  }
+  if (in->op == IR_OP_CAST && in->text && strstr(in->text, "int32") &&
+      in->dest.kind == IR_OPERAND_TEMP && in->dest.name && body->bit &&
+      !body->bit_cast && ir_operand_is_temp_named(&in->lhs, body->bit)) {
+    body->bit_cast = in->dest.name;
+    body->use_int32_cast = 1;
+    return 1;
+  }
+  if (ir_popcount_is_binary(in, "+") && ir_operand_is_symbol(&in->dest)) {
+    return ir_popcount_take_add(body, in);
+  }
+  if (ir_popcount_is_half(in, body->v)) {
+    return ir_popcount_take_half(body, in);
+  }
+  if ((in->op == IR_OP_ASSIGN || in->op == IR_OP_CAST) &&
+      ir_operand_is_symbol_named(&in->dest, body->v)) {
+    return ir_popcount_take_write_back(body, in);
+  }
+  return in->dest.kind == IR_OPERAND_TEMP &&
+         ir_instruction_is_trivially_dead_if_dest_unused(in);
 }
 
 static int ir_type_name_is_byte(const char *name) {
-  return name && (strcmp(name, "uint8") == 0 || strcmp(name, "int8") == 0 ||
-                  strcmp(name, "bool") == 0 || strcmp(name, "char") == 0);
+  return name && (strcmp(name, "uint8") == 0 || strcmp(name, "char") == 0);
 }
 
 static int ir_symbol_is_byte_wide(const IRFunction *function,
@@ -63,101 +151,20 @@ static int ir_popcount_body_matches(const IRFunction *function, size_t body_star
     return 0;
   }
 
-  int saw_and = 0;
-  int saw_add = 0;
-  int saw_shift = 0;
-  const char *count_symbol = NULL;
-  int use_int32_cast = 0;
-  int use_uint8_cast = 0;
-
+  IRPopcountBody body = {0};
+  body.v = v_symbol;
   for (size_t i = body_start; i < body_end; i++) {
-    const IRInstruction *instruction = &function->instructions[i];
-    if (!instruction || instruction->op == IR_OP_NOP) {
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        strcmp(instruction->text, "&") == 0 &&
-        ir_operand_is_symbol_named(&instruction->lhs, v_symbol) &&
-        ir_operand_is_int_value(&instruction->rhs, 1)) {
-      saw_and = 1;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_CAST && instruction->text &&
-        strstr(instruction->text, "int32") &&
-        instruction->dest.kind == IR_OPERAND_TEMP) {
-      use_int32_cast = 1;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        strcmp(instruction->text, "+") == 0 &&
-        ir_operand_is_symbol(&instruction->dest)) {
-      if (count_symbol && strcmp(count_symbol, instruction->dest.name) != 0) {
-        return 0;
-      }
-      count_symbol = instruction->dest.name;
-      if (ir_operand_is_symbol_named(&instruction->lhs, count_symbol) ||
-          ir_operand_is_symbol_named(&instruction->rhs, count_symbol)) {
-        saw_add = 1;
-        continue;
-      }
+    if (!ir_popcount_take(&body, &function->instructions[i])) {
       return 0;
     }
-
-    if (ir_popcount_body_is_v_shift_step(instruction, v_symbol)) {
-      saw_shift = 1;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && !instruction->is_float && instruction->text &&
-        strcmp(instruction->text, ">>") == 0 &&
-        ir_operand_is_symbol_named(&instruction->lhs, v_symbol) &&
-        ir_operand_is_int_value(&instruction->rhs, 1) &&
-        instruction->dest.kind == IR_OPERAND_TEMP) {
-      saw_shift = 1;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        strcmp(instruction->text, "/") == 0 &&
-        ir_operand_is_symbol_named(&instruction->lhs, v_symbol) &&
-        ir_operand_is_int_value(&instruction->rhs, 2) &&
-        instruction->dest.kind == IR_OPERAND_TEMP) {
-      saw_shift = 1;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_CAST && instruction->text &&
-        strstr(instruction->text, "uint8") &&
-        ir_operand_is_symbol_named(&instruction->dest, v_symbol)) {
-      use_uint8_cast = 1;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_ASSIGN &&
-        ir_operand_is_symbol_named(&instruction->dest, v_symbol)) {
-      continue;
-    }
-
-    if (ir_instruction_writes_destination(instruction) &&
-        ir_operand_is_symbol(&instruction->dest)) {
-      if (!ir_operand_is_symbol_named(&instruction->dest, v_symbol) &&
-          !(count_symbol &&
-            ir_operand_is_symbol_named(&instruction->dest, count_symbol))) {
-        return 0;
-      }
-    }
   }
-
-  if (!saw_and || !saw_add || !saw_shift || !count_symbol) {
+  if (!body.saw_add || !body.saw_shift || !body.v_written) {
     return 0;
   }
 
-  *count_symbol_out = count_symbol;
-  *use_int32_cast_out = use_int32_cast;
-  *use_uint8_cast_out = use_uint8_cast;
+  *count_symbol_out = body.count;
+  *use_int32_cast_out = body.use_int32_cast;
+  *use_uint8_cast_out = body.use_uint8_cast;
   return 1;
 }
 
@@ -489,251 +496,221 @@ static int ir_try_find_loop_latch(const IRFunction *function, size_t header_inde
   return 1;
 }
 
-static int ir_try_match_popcount_buffer_call_body(const IRFunction *function,
-                                                 size_t body_start,
-                                                 size_t body_end,
-                                                 const char **total_symbol_out,
-                                                 const char **load_source_out,
-                                                 int *load_via_ptr_out) {
-  if (!function || !total_symbol_out || !load_source_out || !load_via_ptr_out ||
-      body_start >= body_end) {
+typedef struct {
+  const char *advance;
+  const char *addr_temp;
+  const char *addr_base;
+  const char *load_temp;
+  const char *byte_temp;
+  const char *load_source;
+  int load_via_ptr;
+  const char *v;
+  const char *count;
+  const char *done;
+  const char *count_cast;
+  const char *total;
+  IRPopcountBody step;
+  int in_step;
+  int steps;
+  int phase;
+} IRPopcountBuffer;
+
+static int ir_pbf_skippable(const IRInstruction *in) {
+  return in->op == IR_OP_NOP || in->op == IR_OP_DECLARE_LOCAL ||
+         ir_instruction_is_profile_hook(in);
+}
+
+static int ir_pbf_is_byte_source(const IRPopcountBuffer *m, const IROperand *op) {
+  return (m->load_temp && ir_operand_is_temp_named(op, m->load_temp)) ||
+         (m->byte_temp && ir_operand_is_temp_named(op, m->byte_temp));
+}
+
+static int ir_pbf_take_load(IRPopcountBuffer *m, const IRInstruction *in) {
+  int into_symbol = ir_operand_is_symbol(&in->dest);
+  if (m->load_temp || m->v || !in->dest.name ||
+      (in->dest.kind != IR_OPERAND_TEMP && !into_symbol) ||
+      in->rhs.kind != IR_OPERAND_INT || in->rhs.int_value != 1) {
     return 0;
   }
-
-  size_t call_index = (size_t)-1;
-  const char *total_symbol = NULL;
-  const char *load_source = NULL;
-  int load_via_ptr = 0;
-
-  for (size_t i = body_start; i < body_end; i++) {
-    const IRInstruction *instruction = &function->instructions[i];
-    if (!instruction || instruction->op == IR_OP_NOP ||
-        instruction->op == IR_OP_DECLARE_LOCAL) {
-      continue;
-    }
-
-    if (ir_instruction_is_profile_hook(instruction)) {
-      continue;
-    }
-
-    if (instruction->op == IR_OP_LOAD && instruction->dest.kind == IR_OPERAND_TEMP &&
-        instruction->dest.name && instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 1) {
-      if (ir_operand_is_symbol(&instruction->lhs)) {
-        load_source = instruction->lhs.name;
-        load_via_ptr = 1;
-      } else if (instruction->lhs.kind == IR_OPERAND_TEMP &&
-                 instruction->lhs.name) {
-        size_t producer_index = 0;
-        const IRInstruction *addr = NULL;
-        if (ir_find_last_writer_before(function, i, IR_OPERAND_TEMP,
-                                       instruction->lhs.name, &producer_index)) {
-          addr = &function->instructions[producer_index];
-        }
-        if (addr && addr->op == IR_OP_BINARY && addr->text &&
-            strcmp(addr->text, "+") == 0 &&
-            ir_operand_is_symbol(&addr->lhs) &&
-            addr->dest.kind == IR_OPERAND_TEMP &&
-            ir_operand_is_temp_named(&addr->dest, instruction->lhs.name)) {
-          load_source = addr->lhs.name;
-          load_via_ptr = 0;
-        }
-      }
-      continue;
-    }
-
-    if (instruction->op == IR_OP_CALL && instruction->text &&
-        strcmp(instruction->text, "popcount_byte") == 0) {
-      call_index = i;
-      continue;
-    }
-
-    if (ir_instruction_is_profile_hook(instruction)) {
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        strcmp(instruction->text, "+") == 0 &&
-        ir_operand_is_symbol(&instruction->dest) &&
-        (ir_operand_is_symbol_named(&instruction->lhs, instruction->dest.name) ||
-         ir_operand_is_symbol_named(&instruction->rhs, instruction->dest.name))) {
-      total_symbol = instruction->dest.name;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_CAST || instruction->op == IR_OP_ASSIGN) {
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        strcmp(instruction->text, "+") == 0 &&
-        instruction->dest.kind == IR_OPERAND_TEMP) {
-      continue;
-    }
-
+  if (ir_operand_is_symbol(&in->lhs)) {
+    m->load_source = in->lhs.name;
+    m->load_via_ptr = 1;
+  } else if (m->addr_temp && ir_operand_is_temp_named(&in->lhs, m->addr_temp)) {
+    m->load_source = m->addr_base;
+    m->load_via_ptr = 0;
+  } else {
     return 0;
   }
-
-  if (call_index == (size_t)-1 || !total_symbol || !load_source) {
-    return 0;
+  if (into_symbol) {
+    m->v = in->dest.name;
+  } else {
+    m->load_temp = in->dest.name;
   }
-
-  *total_symbol_out = total_symbol;
-  *load_source_out = load_source;
-  *load_via_ptr_out = load_via_ptr;
   return 1;
+}
+
+static int ir_pbf_take_prefix(IRPopcountBuffer *m, const IRInstruction *in) {
+  if (ir_popcount_is_binary(in, "+") && in->dest.kind == IR_OPERAND_TEMP &&
+      in->dest.name && ir_operand_is_symbol(&in->lhs) &&
+      ir_operand_is_symbol_named(&in->rhs, m->advance) && !m->addr_temp) {
+    m->addr_temp = in->dest.name;
+    m->addr_base = in->lhs.name;
+    return 1;
+  }
+  if (in->op == IR_OP_LOAD) {
+    return ir_pbf_take_load(m, in);
+  }
+  if (in->op == IR_OP_CAST && in->text && strstr(in->text, "uint8") &&
+      in->dest.kind == IR_OPERAND_TEMP && in->dest.name && !m->byte_temp &&
+      m->load_temp && ir_operand_is_temp_named(&in->lhs, m->load_temp)) {
+    m->byte_temp = in->dest.name;
+    return 1;
+  }
+  if (in->op == IR_OP_ASSIGN && ir_operand_is_symbol(&in->dest)) {
+    if (ir_operand_is_int_value(&in->lhs, 0) && !m->count) {
+      m->count = in->dest.name;
+      return 1;
+    }
+    if (ir_pbf_is_byte_source(m, &in->lhs) && !m->v) {
+      m->v = in->dest.name;
+      return 1;
+    }
+    return 0;
+  }
+  if (in->op == IR_OP_BRANCH_ZERO && m->v && m->count && in->text &&
+      ir_operand_is_symbol_named(&in->lhs, m->v) &&
+      strcmp(m->v, m->count) != 0) {
+    m->done = in->text;
+    m->phase = 1;
+    memset(&m->step, 0, sizeof(m->step));
+    m->step.v = m->v;
+    m->in_step = 1;
+    return 1;
+  }
+  return 0;
+}
+
+static int ir_pbf_close_step(IRPopcountBuffer *m) {
+  if (!m->in_step) {
+    return 1;
+  }
+  m->in_step = 0;
+  if (!m->step.saw_add || !m->step.saw_shift || !m->step.v_written ||
+      !m->step.count || strcmp(m->step.count, m->count) != 0) {
+    return 0;
+  }
+  m->steps++;
+  return 1;
+}
+
+static int ir_pbf_take_steps(IRPopcountBuffer *m, const IRInstruction *in) {
+  if (in->op == IR_OP_BRANCH_ZERO || in->op == IR_OP_LABEL) {
+    if (!ir_pbf_close_step(m)) {
+      return 0;
+    }
+    if (in->op == IR_OP_LABEL) {
+      if (!in->text || strcmp(in->text, m->done) != 0) {
+        return 0;
+      }
+      m->phase = 2;
+      return 1;
+    }
+    if (!in->text || strcmp(in->text, m->done) != 0 ||
+        !ir_operand_is_symbol_named(&in->lhs, m->v)) {
+      return 0;
+    }
+    memset(&m->step, 0, sizeof(m->step));
+    m->step.v = m->v;
+    m->in_step = 1;
+    return 1;
+  }
+  return m->in_step && ir_popcount_take(&m->step, in);
+}
+
+static int ir_pbf_take_suffix(IRPopcountBuffer *m, const IRInstruction *in) {
+  if (in->op == IR_OP_CAST && in->dest.kind == IR_OPERAND_TEMP && in->dest.name &&
+      !m->count_cast && !m->total &&
+      ir_operand_is_symbol_named(&in->lhs, m->count)) {
+    m->count_cast = in->dest.name;
+    return 1;
+  }
+  if (ir_popcount_is_binary(in, "+") && ir_operand_is_symbol(&in->dest) &&
+      !m->total && strcmp(in->dest.name, m->count) != 0 &&
+      strcmp(in->dest.name, m->v) != 0) {
+    const IROperand *other = NULL;
+    if (ir_operand_is_symbol_named(&in->lhs, in->dest.name)) {
+      other = &in->rhs;
+    } else if (ir_operand_is_symbol_named(&in->rhs, in->dest.name)) {
+      other = &in->lhs;
+    }
+    if (!other || !(ir_operand_is_symbol_named(other, m->count) ||
+                    (m->count_cast &&
+                     ir_operand_is_temp_named(other, m->count_cast)))) {
+      return 0;
+    }
+    m->total = in->dest.name;
+    return 1;
+  }
+  return 0;
+}
+
+static int ir_pbf_symbol_read_outside(const IRFunction *function,
+                                      const char *name, size_t first,
+                                      size_t last) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (i >= first && i < last) {
+      continue;
+    }
+    if (ir_operand_is_symbol_named(&in->lhs, name) ||
+        ir_operand_is_symbol_named(&in->rhs, name) ||
+        (in->op == IR_OP_ADDRESS_OF &&
+         ir_operand_is_symbol_named(&in->dest, name))) {
+      return 1;
+    }
+    for (size_t a = 0; a < in->argument_count; a++) {
+      if (ir_operand_is_symbol_named(&in->arguments[a], name)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
 }
 
 static int ir_try_match_popcount_buffer_inlined_body(
     const IRFunction *function, size_t body_start, size_t body_end,
-    const char **total_symbol_out, const char **load_source_out,
-    int *load_via_ptr_out, const char **v_symbol_out) {
-  if (!function || !total_symbol_out || !load_source_out || !load_via_ptr_out ||
-      !v_symbol_out || body_start >= body_end) {
-    return 0;
-  }
-
-  const char *total_symbol = NULL;
-  const char *load_source = NULL;
-  int load_via_ptr = 0;
-  const char *v_symbol = NULL;
-  const char *count_symbol = NULL;
-  size_t popcount_start = body_end;
-  size_t popcount_end = body_start;
-
+    const char *advance_symbol, const char **total_symbol_out,
+    const char **load_source_out, int *load_via_ptr_out) {
+  IRPopcountBuffer m;
+  memset(&m, 0, sizeof(m));
+  m.advance = advance_symbol;
   for (size_t i = body_start; i < body_end; i++) {
-    const IRInstruction *instruction = &function->instructions[i];
-    if (!instruction || instruction->op == IR_OP_NOP ||
-        instruction->op == IR_OP_DECLARE_LOCAL) {
+    const IRInstruction *in = &function->instructions[i];
+    int ok = 0;
+    if (ir_pbf_skippable(in)) {
       continue;
     }
-
-    if (ir_instruction_is_profile_hook(instruction)) {
-      continue;
+    if (m.phase == 0) {
+      ok = ir_pbf_take_prefix(&m, in);
+    } else if (m.phase == 1) {
+      ok = ir_pbf_take_steps(&m, in);
+    } else {
+      ok = ir_pbf_take_suffix(&m, in);
     }
-
-    if (instruction->op == IR_OP_LOAD && instruction->dest.kind == IR_OPERAND_TEMP &&
-        instruction->dest.name && instruction->rhs.kind == IR_OPERAND_INT &&
-        instruction->rhs.int_value == 1) {
-      if (ir_operand_is_symbol(&instruction->lhs)) {
-        load_source = instruction->lhs.name;
-        load_via_ptr = 1;
-      } else if (instruction->lhs.kind == IR_OPERAND_TEMP &&
-                 instruction->lhs.name) {
-        size_t producer_index = 0;
-        if (ir_find_last_writer_before(function, i, IR_OPERAND_TEMP,
-                                       instruction->lhs.name, &producer_index)) {
-          const IRInstruction *addr = &function->instructions[producer_index];
-          if (addr->op == IR_OP_BINARY && addr->text &&
-              strcmp(addr->text, "+") == 0 &&
-              ir_operand_is_symbol(&addr->lhs)) {
-            load_source = addr->lhs.name;
-            load_via_ptr = 0;
-          }
-        }
-      }
-      continue;
+    if (!ok) {
+      return 0;
     }
-
-    if (instruction->op == IR_OP_ASSIGN && instruction->dest.kind == IR_OPERAND_SYMBOL &&
-        instruction->dest.name && instruction->lhs.kind == IR_OPERAND_INT &&
-        instruction->lhs.int_value == 0) {
-      count_symbol = instruction->dest.name;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_ASSIGN && instruction->dest.kind == IR_OPERAND_SYMBOL &&
-        instruction->dest.name &&
-        (instruction->lhs.kind == IR_OPERAND_TEMP ||
-         instruction->lhs.kind == IR_OPERAND_SYMBOL)) {
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BRANCH_ZERO &&
-        ir_operand_is_symbol(&instruction->lhs)) {
-      v_symbol = instruction->lhs.name;
-      if (popcount_start == body_end) {
-        popcount_start = i;
-      }
-      popcount_end = i + 1;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        strcmp(instruction->text, "+") == 0 &&
-        ir_operand_is_symbol(&instruction->dest) &&
-        count_symbol &&
-        ir_operand_is_symbol_named(&instruction->dest, count_symbol)) {
-      if (popcount_end <= i) {
-        popcount_end = i + 1;
-      }
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        strcmp(instruction->text, "+") == 0 &&
-        ir_operand_is_symbol(&instruction->dest) &&
-        (ir_operand_is_symbol_named(&instruction->lhs, instruction->dest.name) ||
-         ir_operand_is_symbol_named(&instruction->rhs, instruction->dest.name))) {
-      total_symbol = instruction->dest.name;
-      continue;
-    }
-
-    if (instruction->op == IR_OP_CAST || instruction->op == IR_OP_LABEL) {
-      continue;
-    }
-
-    if (ir_instruction_is_profile_hook(instruction)) {
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        (strcmp(instruction->text, "&") == 0 ||
-         strcmp(instruction->text, ">>") == 0 ||
-         strcmp(instruction->text, "/") == 0)) {
-      if (popcount_end <= i) {
-        popcount_end = i + 1;
-      }
-      continue;
-    }
-
-    if (instruction->op == IR_OP_ASSIGN) {
-      continue;
-    }
-
-    if (instruction->op == IR_OP_BINARY && instruction->text &&
-        strcmp(instruction->text, "+") == 0 &&
-        instruction->dest.kind == IR_OPERAND_TEMP) {
-      continue;
-    }
-
+  }
+  if (m.phase != 2 || !m.total || !m.load_source ||
+      m.steps < IR_POPCOUNT_BYTE_UNROLL ||
+      !ir_symbol_is_byte_wide(function, m.v) ||
+      ir_pbf_symbol_read_outside(function, m.v, body_start, body_end) ||
+      ir_pbf_symbol_read_outside(function, m.count, body_start, body_end)) {
     return 0;
   }
-
-  if (!total_symbol || !load_source || !v_symbol || !count_symbol ||
-      popcount_start >= body_end) {
-    return 0;
-  }
-
-  int saw_unrolled_shift = 0;
-  for (size_t i = popcount_start; i < body_end; i++) {
-    const IRInstruction *instruction = &function->instructions[i];
-    if (instruction->op == IR_OP_BINARY && !instruction->is_float && instruction->text &&
-        strcmp(instruction->text, ">>") == 0 &&
-        ir_operand_is_symbol_named(&instruction->lhs, v_symbol) &&
-        ir_operand_is_int_value(&instruction->rhs, 1)) {
-      saw_unrolled_shift = 1;
-      break;
-    }
-  }
-  if (!saw_unrolled_shift) {
-    return 0;
-  }
-
-  *total_symbol_out = total_symbol;
-  *load_source_out = load_source;
-  *load_via_ptr_out = load_via_ptr;
-  *v_symbol_out = v_symbol;
+  *total_symbol_out = m.total;
+  *load_source_out = m.load_source;
+  *load_via_ptr_out = m.load_via_ptr;
   return 1;
 }
 
@@ -758,6 +735,7 @@ static int ir_popcount_emit_fused_load_byte(IRInstructionVector *vector,
     load_ins.dest = ir_operand_temp(raw_temp);
     load_ins.lhs = ir_operand_symbol(load_source);
     load_ins.rhs = ir_operand_int(1);
+    load_ins.is_unsigned = 1;
     if (!load_ins.dest.name || !load_ins.lhs.name ||
         !ir_instruction_vector_append_move(vector, &load_ins)) {
       ir_instruction_destroy_storage(&load_ins);
@@ -785,6 +763,7 @@ static int ir_popcount_emit_fused_load_byte(IRInstructionVector *vector,
     load_ins.dest = ir_operand_temp(raw_temp);
     load_ins.lhs = ir_operand_temp(addr_temp);
     load_ins.rhs = ir_operand_int(1);
+    load_ins.is_unsigned = 1;
     if (!load_ins.dest.name || !load_ins.lhs.name ||
         !ir_instruction_vector_append_move(vector, &load_ins)) {
       ir_instruction_destroy_storage(&load_ins);
@@ -831,24 +810,16 @@ static int ir_try_fuse_popcount_buffer_at(IRFunction *function,
   const char *load_source = NULL;
   int load_via_ptr = 0;
 
-  if (ir_try_match_popcount_buffer_call_body(function, body_start, increment_index,
-                                             &total_symbol, &load_source,
-                                             &load_via_ptr)) {
-  } else {
-    const char *v_symbol = NULL;
-    if (!ir_try_match_popcount_buffer_inlined_body(
-            function, body_start, increment_index, &total_symbol, &load_source,
-            &load_via_ptr, &v_symbol)) {
-      return 1;
-    }
-    (void)v_symbol;
-  }
-
   const IRInstruction *increment = &function->instructions[increment_index];
   if (increment->op != IR_OP_BINARY || !increment->dest.name) {
     return 1;
   }
   const char *advance_symbol = increment->dest.name;
+  if (!ir_try_match_popcount_buffer_inlined_body(
+          function, body_start, increment_index, advance_symbol, &total_symbol,
+          &load_source, &load_via_ptr)) {
+    return 1;
+  }
 
   char prefix[32];
   char v_temp[64];
@@ -1129,63 +1100,53 @@ static int ir_try_fold_collatz_odd_step_at(IRFunction *function,
     return 1;
   }
 
-  IRInstruction odd_fold_shift = {0};
-  IRInstruction odd_fold_count = {0};
-  IRInstruction even_fold_count = {0};
-  if (!ir_clone_instruction_plain(even_step, &odd_fold_shift) ||
-      !ir_clone_instruction_plain(count_inc, &odd_fold_count) ||
-      !ir_clone_instruction_plain(count_inc, &even_fold_count)) {
-    ir_instruction_destroy_storage(&odd_fold_shift);
-    ir_instruction_destroy_storage(&odd_fold_count);
-    ir_instruction_destroy_storage(&even_fold_count);
+  enum { ODD_COUNT, ODD_GUARD, ODD_EXIT, ODD_SHIFT, ODD_COUNT_AGAIN, EVEN_COUNT,
+         FOLD_COUNT };
+  IRInstruction fold[FOLD_COUNT];
+  char guard_temp[64];
+  int cloned = 1;
+  memset(fold, 0, sizeof(fold));
+  snprintf(guard_temp, sizeof(guard_temp), "collatz%zu_%zu_g", header_index,
+           function->instruction_count);
+  cloned = ir_clone_instruction_plain(count_inc, &fold[ODD_COUNT]) &&
+           ir_clone_instruction_plain(guard, &fold[ODD_GUARD]) &&
+           ir_clone_instruction_plain(guard_branch, &fold[ODD_EXIT]) &&
+           ir_clone_instruction_plain(even_step, &fold[ODD_SHIFT]) &&
+           ir_clone_instruction_plain(count_inc, &fold[ODD_COUNT_AGAIN]) &&
+           ir_clone_instruction_plain(count_inc, &fold[EVEN_COUNT]);
+  if (cloned) {
+    ir_operand_destroy(&fold[ODD_GUARD].dest);
+    fold[ODD_GUARD].dest = ir_operand_temp(guard_temp);
+    ir_operand_destroy(&fold[ODD_EXIT].lhs);
+    fold[ODD_EXIT].lhs = ir_operand_temp(guard_temp);
+    mettle_free_string(fold[ODD_SHIFT].text);
+    fold[ODD_SHIFT].text = mettle_strdup(">>");
+    ir_operand_destroy(&fold[ODD_SHIFT].rhs);
+    fold[ODD_SHIFT].rhs = ir_operand_int(1);
+    cloned = fold[ODD_GUARD].dest.name && fold[ODD_EXIT].lhs.name &&
+             fold[ODD_SHIFT].text;
+  }
+  for (int k = 0; cloned && k < EVEN_COUNT; k++) {
+    if (!ir_instruction_insert_move(function, join_label_index + (size_t)k,
+                                    &fold[k])) {
+      cloned = 0;
+    }
+  }
+  if (cloned &&
+      !ir_instruction_insert_move(function, even_jump_index, &fold[EVEN_COUNT])) {
+    cloned = 0;
+  }
+  if (!cloned) {
+    for (int k = 0; k < FOLD_COUNT; k++) {
+      ir_instruction_destroy_storage(&fold[k]);
+    }
     return 0;
   }
 
-  mettle_free_string(odd_fold_shift.text);
-  odd_fold_shift.text = mettle_strdup(">>");
-  ir_operand_destroy(&odd_fold_shift.rhs);
-  odd_fold_shift.rhs = ir_operand_int(1);
-  if (!odd_fold_shift.text) {
-    ir_instruction_destroy_storage(&odd_fold_shift);
-    ir_instruction_destroy_storage(&odd_fold_count);
-    ir_instruction_destroy_storage(&even_fold_count);
+  if (count_inc_index + FOLD_COUNT >= function->instruction_count) {
     return 0;
   }
-
-  if (ir_operand_is_int_value(&odd_fold_count.rhs, 1)) {
-    ir_operand_destroy(&odd_fold_count.rhs);
-    odd_fold_count.rhs = ir_operand_int(2);
-  } else if (ir_operand_is_int_value(&odd_fold_count.lhs, 1)) {
-    ir_operand_destroy(&odd_fold_count.lhs);
-    odd_fold_count.lhs = ir_operand_int(2);
-  } else {
-    ir_instruction_destroy_storage(&odd_fold_shift);
-    ir_instruction_destroy_storage(&odd_fold_count);
-    ir_instruction_destroy_storage(&even_fold_count);
-    return 0;
-  }
-
-  if (!ir_instruction_insert_move(function, join_label_index, &odd_fold_shift)) {
-    ir_instruction_destroy_storage(&odd_fold_shift);
-    ir_instruction_destroy_storage(&odd_fold_count);
-    ir_instruction_destroy_storage(&even_fold_count);
-    return 0;
-  }
-  if (!ir_instruction_insert_move(function, join_label_index + 1,
-                                  &odd_fold_count)) {
-    ir_instruction_destroy_storage(&odd_fold_count);
-    ir_instruction_destroy_storage(&even_fold_count);
-    return 0;
-  }
-  if (!ir_instruction_insert_move(function, even_jump_index, &even_fold_count)) {
-    ir_instruction_destroy_storage(&even_fold_count);
-    return 0;
-  }
-
-  if (count_inc_index + 3 >= function->instruction_count) {
-    return 0;
-  }
-  ir_instruction_make_nop(&function->instructions[count_inc_index + 3]);
+  ir_instruction_make_nop(&function->instructions[count_inc_index + FOLD_COUNT]);
 
   if (changed) {
     *changed = 1;

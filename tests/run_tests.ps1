@@ -2350,7 +2350,7 @@ $cases = @(
     Path          = "tests/test_opt_collatz_odd_fold.mettle"
     ShouldSucceed = $true
     Args          = @("-O", "--dump-ir")
-    IrMustMatch   = @("(?s)%\.?t[0-9]+ = 3 \* @x(?:__ssa[0-9]+)?.*@x(?:__ssa[0-9]+)? = %\.?t[0-9]+ \+ 1.*@x(?:__ssa[0-9]+)? = @x(?:__ssa[0-9]+)? >> 1.*@count(?:__ssa[0-9]+)? = @count(?:__ssa[0-9]+)? \+ 2.*jump ir_while_")
+    IrMustMatch   = @("(?s)%\.?t[0-9]+ = 3 \* @x(?:__ssa[0-9]+)?.*@x(?:__ssa[0-9]+)? = %\.?t[0-9]+ \+ 1.*@count(?:__ssa[0-9]+)? = @count(?:__ssa[0-9]+)? \+ 1.*branch_zero %collatz[0-9_]+g -> ir_while_end.*@x(?:__ssa[0-9]+)? = @x(?:__ssa[0-9]+)? >> 1.*@count(?:__ssa[0-9]+)? = @count(?:__ssa[0-9]+)? \+ 1.*jump ir_while_")
   },
   @{
     Name          = "opt_popcount_fold"
@@ -21711,6 +21711,13 @@ $issueRegressions = @(
   @{ Name = "rotate_add_struct_fields"; Entry = "tests/issues/rotate_add_struct_fields.mettle"; Args = @(); Expect = @("-4 -10 -4 -10 89 144 -100162") },
   @{ Name = "rotate_add_struct_fields_release"; Entry = "tests/issues/rotate_add_struct_fields.mettle"; Args = @("--release"); Expect = @("-4 -10 -4 -10 89 144 -100162") },
   @{ Name = "rotate_add_struct_fields_opt"; Entry = "tests/issues/rotate_add_struct_fields.mettle"; Args = @("-O"); Expect = @("-4 -10 -4 -10 89 144 -100162") },
+  @{ Name = "collatz_fold_wrapping_step"; Entry = "tests/issues/collatz_fold_wrapping_step.mettle"; Args = @(); Expect = @("100000 -2147383646 11100001 6171261") },
+  @{ Name = "collatz_fold_wrapping_step_release"; Entry = "tests/issues/collatz_fold_wrapping_step.mettle"; Args = @("--release"); Expect = @("100000 -2147383646 11100001 6171261") },
+  @{ Name = "popcount_fold_needs_the_bit"; Entry = "tests/issues/popcount_fold_needs_the_bit.mettle"; Args = @(); Expect = @("8 2 1 1 8 -7517344508052352816") },
+  @{ Name = "popcount_fold_needs_the_bit_release"; Entry = "tests/issues/popcount_fold_needs_the_bit.mettle"; Args = @("--release"); Expect = @("8 2 1 1 8 -7517344508052352816") },
+  @{ Name = "popcount_buffer_fuse_checks_the_body"; Entry = "tests/issues/popcount_buffer_fuse_checks_the_body.mettle"; Args = @(); Expect = @("16936 454 261 261") },
+  @{ Name = "popcount_buffer_fuse_checks_the_body_release"; Entry = "tests/issues/popcount_buffer_fuse_checks_the_body.mettle"; Args = @("--release"); Expect = @("16936 454 261 261") },
+  @{ Name = "popcount_buffer_fuse_checks_the_body_opt"; Entry = "tests/issues/popcount_buffer_fuse_checks_the_body.mettle"; Args = @("-O"); Expect = @("16936 454 261 261") },
   @{ Name = "interp_recycles_freed_buffers"; Command = @("test", "tests/issues/interp_recycles_freed_buffers.mettle"); Expect = @("2 passed") },
   @{ Name = "test_fn_called_from_main"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @(); Expect = @("0 0") },
   @{ Name = "test_fn_called_from_main_release"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @("--release"); Expect = @("0 0") },

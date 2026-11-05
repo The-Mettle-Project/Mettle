@@ -1,0 +1,71 @@
+import "std/io";
+import "std/mem";
+
+@noinline fn popcount_byte(b: uint8) -> int64 { return (int64)b * 2; }
+
+@noinline fn named_like_popcount(buf: uint8*, n: int64) -> int64 {
+  var total: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    total = total + popcount_byte(buf[i]);
+    i = i + 1;
+  }
+  return total;
+}
+
+@noinline fn bit_lengths(buf: uint8*, n: int64) -> int64 {
+  var total: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: uint8 = buf[i];
+    var c: int64 = 0;
+    while (v != 0) {
+      c = c + 1;
+      v = v >> 1;
+    }
+    total = total + c;
+    i = i + 1;
+  }
+  return total;
+}
+
+fn byte_bits(b: uint8) -> int32 {
+  var count: int32 = 0;
+  var v: uint8 = b;
+  while (v != 0) {
+    count = count + (int32)(v & 1);
+    v = (uint8)(v / 2);
+  }
+  return count;
+}
+
+@noinline fn high_bytes(buf: cstring, len: int64) -> int64 {
+  var total: int64 = 0;
+  var i: int64 = 0;
+  while (i < len) {
+    total = total + (int64)byte_bits((uint8)buf[i]);
+    i = i + 1;
+  }
+  return total;
+}
+
+@noinline fn direct(buf: uint8*, n: int64) -> int64 {
+  var total: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    var v: uint8 = buf[i];
+    var c: int32 = 0;
+    while (v != 0) { c = c + (int32)(v & 1); v = v >> 1; }
+    total = total + (int64)c;
+    i = i + 1;
+  }
+  return total;
+}
+
+fn main() -> int32 {
+  var buf: uint8* = (uint8*)malloc(64);
+  for i in 0..64 { buf[i] = (uint8)(i * 37 + 11); }
+  buf[0] = 255;
+  println("{named_like_popcount(buf, 64)} {bit_lengths(buf, 64)} {high_bytes((cstring)buf, 64)} {direct(buf, 64)}");
+  return 0;
+}

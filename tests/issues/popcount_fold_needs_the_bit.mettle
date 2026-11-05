@@ -1,0 +1,51 @@
+import "std/io";
+
+@noinline fn bitlen(b: uint8) -> int32 {
+  var v: uint8 = b;
+  var c: int32 = 0;
+  while (v != 0) {
+    var _t: uint8 = v & 1;
+    c = c + 1;
+    v = v >> 1;
+  }
+  return c;
+}
+
+@noinline fn shifted_first(b: uint8) -> int32 {
+  var v: uint8 = b;
+  var c: int32 = 0;
+  while (v != 0) {
+    v = v >> 1;
+    c = c + (int32)(v & 1);
+  }
+  return c;
+}
+
+@noinline fn signed_halves(b: int8) -> int32 {
+  var v: int8 = b;
+  var c: int32 = 0;
+  while (v != 0) {
+    c = c + (int32)(v & 1);
+    v = (int8)(v / 2);
+  }
+  return c;
+}
+
+@noinline fn pc(b: uint8) -> int32 {
+  var v: uint8 = b;
+  var c: int32 = 0;
+  while (v != 0) {
+    c = c + (int32)(v & 1);
+    v = v >> 1;
+  }
+  return c;
+}
+
+fn main() -> int32 {
+  var s: int64 = 0;
+  for i in 0..256 {
+    s = s * 7 + (int64)bitlen((uint8)i) * 3 + (int64)shifted_first((uint8)i) * 5 + (int64)pc((uint8)i) + (int64)signed_halves((int8)(i - 128)) * 11;
+  }
+  println("{bitlen(200)} {shifted_first(7)} {signed_halves(-1)} {signed_halves(-128)} {pc(255)} {s}");
+  return 0;
+}
