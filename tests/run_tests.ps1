@@ -8258,6 +8258,31 @@ catch {
   Write-CaseResult -Name "safe_parameter_address" -Passed $false -Reason $_.Exception.Message
 }
 
+# Pointers --safe could not follow, which a correct program must still be
+# allowed to use. Each runs plain, under --safe and under --safe --release.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  foreach ($fixture in @("test_safe_region_module")) {
+    foreach ($mode in @(@(), @("--safe"), @("--safe", "--release"))) {
+      $trackExe = Join-Path $tmpDir "$fixture.exe"
+      $trackBuild = & $CompilerPath --build @mode "tests/$fixture.mettle" -o $trackExe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "$fixture did not build ('$($mode -join ' ')'): $trackBuild"
+      }
+      $trackOut = & $trackExe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or $trackOut -notmatch "wrong=0") {
+        throw "$fixture failed ('$($mode -join ' ')'): exit $LASTEXITCODE`n$trackOut"
+      }
+    }
+  }
+  Write-CaseResult -Name "safe_tracked_pointers" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_tracked_pointers" -Passed $false -Reason $_.Exception.Message
+}
+
 # Every environment knob, set, against the answer it must not change. A knob
 # that turns an optimization off is a policy decision, and a pass that reports
 # declining as failing takes the compile down with an internal error. That has

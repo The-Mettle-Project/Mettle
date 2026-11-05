@@ -39,6 +39,7 @@ typedef struct {
   uint32_t next_free;
   uint64_t identity;
   uint32_t heap;
+  uint32_t foreign;
 } SafetyRegion;
 
 #if defined(__GNUC__)
@@ -132,6 +133,7 @@ static uint32_t safety_region_acquire(uintptr_t start, uint64_t size) {
     reused->next_free = 0;
     reused->identity = (generation << 24) | id;
     reused->heap = 1;
+    reused->foreign = 0;
     __atomic_store_n(&reused->state, (uint32_t)SAFETY_STATE_LIVE,
                      __ATOMIC_RELEASE);
     return id;
@@ -159,6 +161,7 @@ static uint32_t safety_region_acquire(uintptr_t start, uint64_t size) {
   fresh->next_free = 0;
   fresh->identity = (generation << 24) | id;
   fresh->heap = 1;
+  fresh->foreign = 0;
   __atomic_store_n(&fresh->state, (uint32_t)SAFETY_STATE_LIVE,
                    __ATOMIC_RELEASE);
   return id;

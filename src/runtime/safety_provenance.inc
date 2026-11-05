@@ -15,10 +15,20 @@ static SafetyRegion safety_identity_snapshot(uint64_t identity) {
   return result;
 }
 
+// A pointer with no identity may still sit in memory the program named with
+// memory_region, in any module. Only those regions answer by address.
+static uint64_t safety_foreign_identity(const void *base) {
+  if (!base) return 0;
+  SafetyRegion region = safety_snapshot((uintptr_t)base);
+  return region.state == SAFETY_STATE_LIVE && region.foreign ? region.identity : 0;
+}
+
 void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size,
                                   uint32_t kind, uint32_t line,
                                   uint64_t identity) {
   (void)kind;
+  SafetyRegion region = {0};
+  if (!identity) identity = safety_foreign_identity(base);
   if (!identity) {
     if (size <= 0 || safety_allocator_depth()) return;
     SafetyFailure failure = {base ? "memory access has no tracked allocation identity" :
@@ -27,7 +37,7 @@ void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size
     return;
   }
   if (size <= 0) return;
-  SafetyRegion region = safety_identity_snapshot(identity);
+  region = safety_identity_snapshot(identity);
   uintptr_t start = (uintptr_t)base;
   uintptr_t address = start + (uintptr_t)offset;
   int wrapped = offset >= 0 ? address < start : address > start;
@@ -40,6 +50,7 @@ void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size
 }
 
 int64_t mettle_safety_span_identity(const void *base, uint64_t identity) {
+  if (!identity) identity = safety_foreign_identity(base);
   if (!identity) return 0;
   SafetyRegion region = safety_identity_snapshot(identity);
   uintptr_t address = (uintptr_t)base;
@@ -256,9 +267,14 @@ void mettle_safety_region_begin(void *pointer, int64_t size) {
   if (!pointer || size <= 0)
     safety_internal_failure("Fatal error: a foreign memory region needs an address and a positive size");
   SafetyRegion known = safety_snapshot((uintptr_t)pointer);
-  if (known.state == SAFETY_STATE_LIVE && (uintptr_t)pointer == known.start &&
-      (uint64_t)size == known.size) return;
-  mettle_safety_register_static(pointer, (uint64_t)size);
+  if (known.state != SAFETY_STATE_LIVE || (uintptr_t)pointer != known.start ||
+      (uint64_t)size != known.size)
+    mettle_safety_register_static(pointer, (uint64_t)size);
+  safety_lock();
+  uint32_t id = safety_lookup((uintptr_t)pointer);
+  SafetyRegion *region = id >= SAFETY_ID_FIRST ? safety_region(id) : NULL;
+  if (region && region->start == (uintptr_t)pointer) region->foreign = 1;
+  safety_unlock();
 }
 
 void mettle_safety_entry_arguments(void *vector) {
