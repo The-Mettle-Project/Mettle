@@ -1,4 +1,5 @@
 #include "monomorphize.h"
+#include "codegen/target.h"
 #include "common.h"
 #include "string_intern.h"
 #include "common.h"
@@ -5090,6 +5091,190 @@ static void adapt_process_fn(ASTNode *fnnode, ASTNode **top_decls,
   free(locals.items);
 }
 
+static int c_abi_type_is_aggregate(const char *type) {
+  static const char *const scalars[] = {
+      "void",    "int8",    "int16",   "int32",    "int64",  "uint8",
+      "uint16",  "uint32",  "uint64",  "float16",  "bfloat16", "float32",
+      "float64", "bool",    "char",    "cstring",  "rawptr",
+  };
+  size_t length = type ? strlen(type) : 0;
+  if (length == 0 || type[length - 1] == '*' || strncmp(type, "fn(", 3) == 0 ||
+      strncmp(type, "Fn(", 3) == 0) {
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof(scalars) / sizeof(scalars[0]); i++) {
+    if (strcmp(type, scalars[i]) == 0) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int c_abi_function_needs_thunk(const FunctionDeclaration *fd) {
+  if (!fd || !(fd->is_exported || fd->is_extern || !fd->body) ||
+      fd->return_type_count > 1) {
+    return 0;
+  }
+  if (c_abi_type_is_aggregate(fd->return_type)) {
+    return 1;
+  }
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    if (c_abi_type_is_aggregate(fd->parameter_types[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static const char *c_abi_thunk_for(const FunctionDeclaration *fd,
+                                   ASTNode *program, Program *prog,
+                                   int *had_error) {
+  char name[512];
+  CCBuf src = {0};
+  const char *ret = fd->return_type ? fd->return_type : "void";
+  snprintf(name, sizeof(name), "__cabi_thunk_%s", fd->name);
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *d = prog->declarations[i];
+    if (d && d->type == AST_FUNCTION_DECLARATION && d->data &&
+        strcmp(((FunctionDeclaration *)d->data)->name, name) == 0) {
+      return ((FunctionDeclaration *)d->data)->name;
+    }
+  }
+  cc_buf_add(&src, "fn ");
+  cc_buf_add(&src, name);
+  cc_buf_add(&src, "(");
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    if (i > 0) {
+      cc_buf_add(&src, ", ");
+    }
+    cc_buf_add_num(&src, "p", i);
+    cc_buf_add(&src, ": ");
+    cc_buf_add(&src, fd->parameter_types[i]);
+  }
+  cc_buf_add(&src, ") -> ");
+  cc_buf_add(&src, ret);
+  cc_buf_add(&src, " {\n  ");
+  cc_buf_add(&src, strcmp(ret, "void") == 0 ? "" : "return ");
+  cc_buf_add(&src, fd->name);
+  cc_buf_add(&src, "(");
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    if (i > 0) {
+      cc_buf_add(&src, ", ");
+    }
+    cc_buf_add_num(&src, "p", i);
+  }
+  cc_buf_add(&src, ");\n}\n");
+  if (!src.data) {
+    *had_error = 1;
+    return NULL;
+  }
+
+  Lexer *lx = lexer_create(src.data);
+  Parser *ps = lx ? parser_create(lx) : NULL;
+  ASTNode *sub = ps ? parser_parse_program(ps) : NULL;
+  Program *subp = (sub && sub->type == AST_PROGRAM) ? (Program *)sub->data : NULL;
+  free(src.data);
+  if (!subp || subp->declaration_count != 1) {
+    *had_error = 1;
+    return NULL;
+  }
+  ASTNode *d = subp->declarations[0];
+  ASTNode **grown = realloc(prog->declarations,
+                            (prog->declaration_count + 1) * sizeof(ASTNode *));
+  if (!grown) {
+    *had_error = 1;
+    return NULL;
+  }
+  d->location = program->location;
+  prog->declarations = grown;
+  prog->declarations[prog->declaration_count++] = d;
+  ast_add_child(program, d);
+  return ((FunctionDeclaration *)d->data)->name;
+}
+
+static int c_abi_name_is_local(const AdaptLocals *locals,
+                               const FunctionDeclaration *fn, const char *name) {
+  for (size_t i = 0; locals && i < locals->count; i++) {
+    if (strcmp(locals->items[i].name, name) == 0) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; fn && i < fn->parameter_count; i++) {
+    if (fn->parameter_names[i] && strcmp(fn->parameter_names[i], name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static Identifier *c_abi_taken_function(ASTNode *node) {
+  if (node && node->type == AST_IDENTIFIER) {
+    return (Identifier *)node->data;
+  }
+  if (node && node->type == AST_UNARY_EXPRESSION && node->data) {
+    UnaryExpression *unary = (UnaryExpression *)node->data;
+    if (unary->operator && strcmp(unary->operator, "&") == 0 && unary->operand &&
+        unary->operand->type == AST_IDENTIFIER) {
+      return (Identifier *)unary->operand->data;
+    }
+  }
+  return NULL;
+}
+
+typedef struct {
+  AdaptLocals locals;
+  const FunctionDeclaration *fn;
+} CAbiScope;
+
+static void c_abi_thunk_walk(ASTNode *node, ASTNode **top_decls,
+                             size_t top_count, ASTNode *program, Program *prog,
+                             const CAbiScope *scope, int *had_error) {
+  if (!node || *had_error) {
+    return;
+  }
+  CAbiScope own = {{0}, NULL};
+  if (node->type == AST_FUNCTION_DECLARATION && !scope && node->data) {
+    FunctionDeclaration *fd = (FunctionDeclaration *)node->data;
+    own.fn = fd;
+    adapt_locals_collect(fd->body, &own.locals);
+    scope = &own;
+  }
+
+  Identifier *taken = c_abi_taken_function(node);
+  if (taken && taken->name &&
+      !c_abi_name_is_local(scope ? &scope->locals : NULL, scope ? scope->fn : NULL,
+                           taken->name)) {
+    FunctionDeclaration *target =
+        adapt_fn_index_find(top_decls, top_count, taken->name, -1);
+    if (c_abi_function_needs_thunk(target)) {
+      const char *thunk = c_abi_thunk_for(target, program, prog, had_error);
+      if (thunk) {
+        taken->name = (char *)string_intern(thunk);
+      }
+    }
+  } else {
+    int to_c = 0;
+    const CallExpression *call = NULL;
+    if (node->type == AST_FUNCTION_CALL && node->data) {
+      call = (const CallExpression *)node->data;
+      FunctionDeclaration *callee =
+          call->function_name
+              ? adapt_fn_index_find(top_decls, top_count, call->function_name, -1)
+              : NULL;
+      to_c = callee && (callee->is_extern || !callee->body);
+    }
+    for (size_t i = 0; i < node->child_count; i++) {
+      ASTNode *child = node->children[i];
+      if (to_c && c_abi_taken_function(child)) {
+        continue;
+      }
+      c_abi_thunk_walk(child, top_decls, top_count, program, prog, scope,
+                       had_error);
+    }
+  }
+  free(own.locals.items);
+}
+
 int closure_adapt_program(ASTNode *program, ErrorReporter *reporter) {
   (void)reporter;
   if (!program || program->type != AST_PROGRAM)
@@ -5150,6 +5335,15 @@ int closure_adapt_program(ASTNode *program, ErrorReporter *reporter) {
         adapt_wrap_if_needed(&vd->initializer, decl, vd->type_name, top_decls,
                              top_count, &cache, program, prog, &had_error);
       }
+    }
+  }
+
+  if (!had_error && mtlc_target()->arch == MTLC_TARGET_ARCH_X86_64 &&
+      mtlc_target()->os != MTLC_TARGET_OS_WINDOWS) {
+    size_t written = prog->declaration_count;
+    for (size_t i = 0; i < written; i++) {
+      c_abi_thunk_walk(prog->declarations[i], top_decls, top_count, program,
+                       prog, NULL, &had_error);
     }
   }
 

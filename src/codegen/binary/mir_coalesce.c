@@ -1,4 +1,5 @@
 #include "codegen/binary/mir_color.h"
+#include "codegen/target.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -303,6 +304,22 @@ void mir_color_note_phys_hints(MirColorState *st) {
   }
   for (size_t i = 0; i < fn->insn_count; i++) {
     const MirInst *in = &fn->insns[i];
+    if ((in->op == MIR_SHL || in->op == MIR_SHR || in->op == MIR_SAR) &&
+        in->b.kind == MIR_OPK_VREG && mtlc_target()->arch == MTLC_TARGET_ARCH_X86_64) {
+      MirOperand count_register = mir_op_phys(BINARY_GP_RCX, MIR_RC_GP);
+      const MirOperand *values[2] = {&in->dst, &in->a};
+      mir_coalesce_hint_phys(st, &in->b, &count_register);
+      for (int k = 0; k < 2; k++) {
+        if (values[k]->kind == MIR_OPK_VREG) {
+          MirVregId held = mir_color_find(st, values[k]->vreg);
+          if (held >= 0 && (size_t)held < st->count &&
+              held != mir_color_find(st, in->b.vreg)) {
+            st->avoid_shift_count[held] = 1;
+          }
+        }
+      }
+      continue;
+    }
     if (in->op != MIR_MOV) {
       continue;
     }

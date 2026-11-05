@@ -1,0 +1,25 @@
+import "std/io";
+import "std/mem";
+struct Face { a: int64; b: int64; }
+fn key_of(f: Face*, g: int32) -> uint64 {
+  var h: uint64 = 1469598103934665603;
+  h = (h ^ (uint64)(int64)f) * 1099511628211;
+  h = (h ^ (uint64)(uint32)g) * 1099511628211;
+  return h ^ (h >> 29);
+}
+fn put(tbl: int64*, f: Face*, g: int32) {
+  var tmp: uint8* = (uint8*)malloc(80);
+  tmp[0] = 1;
+  free(tmp);
+  var k: uint64 = key_of(f, g);
+  var i: int64 = (int64)(k & 255);
+  var p: int64* = tbl + i;
+  *p = 7;
+}
+fn main() -> int32 {
+  var f: Face;
+  var tbl: int64* = (int64*)malloc(256 * 8);
+  for g in 0..4 { put(tbl, &f, g); }
+  println("ok");
+  return 0;
+}

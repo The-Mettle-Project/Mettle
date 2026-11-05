@@ -187,7 +187,9 @@ leaves the actual release to its owner. Keep the original address for ending
 the region. Describe the region before making aliases that need its identity.
 Declaring the exact same live range keeps its identity. A different range gets
 its own record. Replacing a record at the same start address retires its old
-identity, so use this API for foreign memory whose contract you control.
+identity, so use this API for foreign memory whose contract you control. A
+pointer with no identity whose address lies inside a described region is
+checked against that region, whichever module described it.
 
 This API is a trust boundary. A false extent or a foreign owner that frees the
 memory too soon can defeat the checks. Foreign code and assembly still control

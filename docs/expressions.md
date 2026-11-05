@@ -60,6 +60,17 @@ the shift count, so this does not produce the zero the code reads as
 `bool` and stop as soon as the answer is known, so the right side is not
 evaluated when the left settles it.
 
+Comparing a signed integer with an unsigned one happens in the wider type. If
+the signed side is the wider, every value fits and the answer is exact. If the
+unsigned side is as wide or wider, the comparison is unsigned, and a negative
+value reads as a huge one. That second case draws [M0125](diagnostics.md) unless
+the compiler can see the signed side is not negative:
+
+```text
+warning[M0125]: `<` compares `int32` with `uint64` as unsigned, so a negative
+value reads as a huge one
+```
+
 `!` negates, and produces a `bool` like the rest of them:
 
 ```mettle

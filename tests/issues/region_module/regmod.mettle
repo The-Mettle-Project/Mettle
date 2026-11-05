@@ -1,0 +1,2 @@
+import "std/mem";
+export fn reg_begin(p: uint8*, n: int64) { memory_region(p, n); }

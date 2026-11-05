@@ -1,0 +1,11 @@
+import "std/io";
+import "regmod";
+extern fn raw_alloc(n: int64) -> uint8* = "malloc";
+fn main() -> int32 {
+  var raw: uint8* = raw_alloc(4096);
+  reg_begin(raw, 4096);
+  var mem: uint64* = (uint64*)raw;
+  mem[3] = 7;
+  println("{mem[3]}");
+  return 0;
+}

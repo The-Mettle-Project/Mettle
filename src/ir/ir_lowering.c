@@ -347,7 +347,9 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
       (function->instruction_count == 0 ||
        function->instructions[function->instruction_count - 1].op !=
            IR_OP_RETURN)) {
-    IROperand implicit_value = ir_operand_none();
+    IROperand implicit_value = function->name && !strcmp(function->name, "main")
+                                   ? ir_operand_int(0)
+                                   : ir_operand_none();
     if (!ir_emit_return_with_defers(context, function, &defers, &implicit_value,
                                     declaration->location)) {
       ir_operand_destroy(&implicit_value);

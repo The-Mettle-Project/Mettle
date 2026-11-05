@@ -45,6 +45,7 @@ typedef struct {
   unsigned char *use_depth;
   MirVregId *rep;
   int *phys_hint;
+  unsigned char *avoid_shift_count;
   MirVregId *copy_partner;
   size_t merged_copies;
   unsigned long long coalesce_work;

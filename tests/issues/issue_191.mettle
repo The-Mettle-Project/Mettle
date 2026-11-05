@@ -1,0 +1,72 @@
+import "std/io";
+import "std/mem";
+import "std/core";
+import "std/collections";
+struct Cmp { a: int32; b: int64; }
+struct Range { sets: List<Cmp>; more: List<int32>; style: int32; pre: bool; note: uint8*; }
+struct Err1 { at: int64; why: string; }
+fn range_new(style: int32, pre: bool) -> Range {
+  var r: Range;
+  r.sets = list_init<Cmp>();
+  r.more = list_init<int32>();
+  r.style = style;
+  r.pre = pre;
+  return r;
+}
+fn range_free(r: Range*) { list_free<Cmp>(&r->sets); list_free<int32>(&r->more); }
+fn mk_err<T>(at: int64, why: string) -> Result<T, Err1> {
+  var e: Err1;
+  e.at = at;
+  e.why = why;
+  return Err(e);
+}
+fn parse_set(s: string, st: int64, en: int64, pre: bool, out: List<Cmp>*) -> Result<int32, Err1> {
+  if (st > en) { return mk_err<int32>(st, "backwards"); }
+  var c: Cmp;
+  c.a = (int32)(en - st);
+  c.b = st;
+  var pushed = list_push<Cmp>(out, c);
+  return Ok(0);
+}
+export fn npm_parse(text: string, include_pre: bool) -> Result<Range, Err1> {
+  var r: Range = range_new(1, include_pre);
+  var n: int64 = (int64)text.length;
+  var s: uint8* = (uint8*)malloc(n + 1);
+  defer free(s);
+  var map: int64* = (int64*)malloc((n + 1) * 8);
+  defer free(map);
+  var set: List<Cmp> = list_init<Cmp>();
+  defer list_free<Cmp>(&set);
+  var at: int64 = 0;
+  while (true) {
+    if (at >= n) { break; }
+    map[at] = at;
+    match (parse_set(text, at, n - 1 - at, include_pre, &set)) {
+      case Ok(z): { }
+      case Err(e): { range_free(&r); return mk_err<Range>(map[at], e.why); }
+    }
+    at = at + 3;
+  }
+  for i in 0..set.length { var p2 = list_push<Cmp>(&r.sets, set.data[i]); }
+  return Ok(r);
+}
+fn main() -> int32 {
+  var ra = ed_ok(); var rb = ed_err(); var rc = ed_direct(); var rd = st_ret(); println(str_ret()); println("{rd.at}");
+  match (npm_parse("abcdefg", true)) {
+    case Ok(v): { println("ok {v.sets.length} {v.style}"); }
+    case Err(e): { println("err {e.at} {e.why}"); }
+  }
+  match (npm_parse("abcdefghijklmnop", false)) {
+    case Ok(v): { println("ok {v.sets.length} {v.style}"); }
+    case Err(e): { println("err {e.at} {e.why}"); }
+  }
+  return 0;
+}
+fn ok_val() -> Result<int32, Err1> { return Ok(1); }
+fn err_val() -> Result<int32, Err1> { return mk_err<int32>(2, "bad"); }
+fn ed_ok() -> Result<int32, Err1> { errdefer println("ed_ok errdefer"); defer println("ed_ok defer"); return ok_val(); }
+fn ed_err() -> Result<int32, Err1> { errdefer println("ed_err errdefer"); defer println("ed_err defer"); return err_val(); }
+fn ed_direct() -> Result<int32, Err1> { errdefer println("direct errdefer"); return Err(mk_e()); }
+fn mk_e() -> Err1 { var e: Err1; e.at = 1; e.why = "w"; return e; }
+fn st_ret() -> Err1 { errdefer println("st errdefer"); defer println("st defer"); return mk_e(); }
+fn str_ret() -> string { errdefer println("str errdefer"); defer println("str defer"); return mk_e().why; }

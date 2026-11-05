@@ -327,6 +327,7 @@ static int ir_emit_errdefer_condition(IRLoweringContext *context,
   if (!value_type || value_type->kind != TYPE_TAGGED_ENUM) {
     Type *shape = declared ? declared : value_type;
     int aggregate = shape && (shape->kind == TYPE_STRUCT ||
+                              shape->kind == TYPE_TAGGED_ENUM ||
                               shape->kind == TYPE_STRING ||
                               shape->kind == TYPE_SLICE ||
                               shape->kind == TYPE_ARRAY ||
@@ -482,7 +483,10 @@ int ir_emit_return_with_defers(IRLoweringContext *context,
     return 0;
   }
 
-  if (value->kind == IR_OPERAND_SYMBOL && ir_defer_scope_has_any(defers)) {
+  if ((value->kind == IR_OPERAND_SYMBOL ||
+       (value->kind == IR_OPERAND_TEMP &&
+        ir_return_type_is_copyable_aggregate(ir_current_return_type(context)))) &&
+      ir_defer_scope_has_any(defers)) {
     Type *return_type = ir_current_return_type(context);
     if (ir_return_type_is_plain_scalar(context)) {
       IRInstruction take = {0};

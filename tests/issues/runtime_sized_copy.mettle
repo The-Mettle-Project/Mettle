@@ -1,0 +1,51 @@
+import "std/io";
+import "std/mem";
+
+var g_seen: int64 = 0;
+
+@noinline fn copy(d: uint8*, s: uint8*, n: int64) { memcpy(d, s, n); }
+
+@noinline fn copy_in_loop(d: uint8*, s: uint8*, n: int64, rounds: int32) -> int64 {
+  var pos: int64 = 0;
+  for r in 0..rounds {
+    memcpy(d + pos, s + (int64)r, n);
+    pos = pos + n;
+    g_seen = g_seen + 1;
+  }
+  return pos;
+}
+
+fn check(n: int64) -> int32 {
+  var src: uint8* = (uint8*)malloc(n + 64);
+  var dst: uint8* = (uint8*)malloc(n + 64);
+  for i in 0..n + 64 {
+    src[i] = (uint8)((i * 7 + 3) & 255);
+    dst[i] = (uint8)0xEE;
+  }
+  copy(dst + 16, src + 16, n);
+  var bad: int32 = 0;
+  for i in 0..16 { if (dst[i] != (uint8)0xEE) { bad = bad + 1; } }
+  for i in 0..n { if (dst[16 + i] != src[16 + i]) { bad = bad + 1; } }
+  for i in 0..32 { if (dst[16 + n + i] != (uint8)0xEE) { bad = bad + 1; } }
+  free(src);
+  free(dst);
+  return bad;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  for n in 0..200 { bad = bad + check((int64)n); }
+  bad = bad + check(4096);
+  println("bad {bad}");
+  var s: uint8* = (uint8*)malloc(4096);
+  var d: uint8* = (uint8*)malloc(4096);
+  for i in 0..4096 { s[i] = (uint8)(i & 255); }
+  for n in 1..40 {
+    var pos: int64 = copy_in_loop(d, s, (int64)n, 10);
+    var sum: int64 = 0;
+    for i in 0..pos { sum = sum + (int64)d[i]; }
+    if (n % 13 == 0) { println("{n} {pos} {sum}"); }
+  }
+  println("seen {g_seen}");
+  return 0;
+}

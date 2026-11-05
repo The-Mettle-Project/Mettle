@@ -323,9 +323,9 @@ export fn format_i64(buf: uint8*, buf_len: int32, pattern: string, value: int64)
     return -1;
   }
 
-  while (src < pattern.length) {
+  while ((uint64)src < pattern.length) {
     if (pattern.chars[src] == 37) {
-      if (src + 1 < pattern.length) {
+      if ((uint64)(src + 1) < pattern.length) {
         if (pattern.chars[src + 1] == 100) {
           if (dst + num_len >= buf_len) {
             return -1;
@@ -379,7 +379,7 @@ export fn cstr_ncmp(buf: uint8*, offset: int32, needle: string, buf_len: int32) 
   if (offset > buf_len) { return -1; }
 
   var i: int32 = 0;
-  while (i < needle.length) {
+  while ((uint64)i < needle.length) {
     if (offset + i >= buf_len) { return -1; }
     if (buf[offset + i] != needle.chars[i]) {
       return buf[offset + i] - needle.chars[i];

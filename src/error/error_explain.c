@@ -331,6 +331,21 @@ static const ErrorCodeDoc DOCS[] = {
      "Unsigned arithmetic is not checked. Wrapping is what unsigned types are\n"
      "reached for in a hash or a checksum, and a check there would refuse the\n"
      "programs that want it.\n"},
+    {"M0125", "A signed value compared with an unsigned one",
+     "A comparison of a signed and an unsigned integer happens in the wider\n"
+     "of the two types. When the signed side is the wider, every value of both\n"
+     "fits and the answer is exact. When the unsigned side is as wide or wider,\n"
+     "the comparison is unsigned, so a negative value reads as a huge one.\n"
+     "\n"
+     "Example:\n"
+     "    var i: int32 = -1;\n"
+     "    if (i < s.length) { ... }     // M0125: false, s.length is uint64\n"
+     "\n"
+     "The warning stays quiet when the signed side cannot be negative: a\n"
+     "constant, a `for` range counter, or a value a dominating test bounds.\n"
+     "\n"
+     "Fix: cast one side so the comparison says what it means.\n"
+     "    if ((int64)i < (int64)s.length) { ... }\n"},
     {"M0124", "A constant signed operation does not fit its type",
      "An integer literal with no other context is `int32`, and arithmetic\n"
      "on two of them happens in `int32`. When both operands are constants and\n"

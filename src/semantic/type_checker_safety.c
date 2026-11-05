@@ -215,14 +215,6 @@ static int type_checker_compare_unsigned(TypeCheckerCompare kind,
   }
 }
 
-static int type_checker_operand_is_unsigned(TypeChecker *checker,
-                                            ASTNode *operand) {
-  int bits = 0;
-  int is_signed = 0;
-  Type *type = checker ? type_checker_infer_type(checker, operand) : NULL;
-  return type_checker_integer_type_shape(type, &bits, &is_signed) &&
-         !is_signed;
-}
 
 static void type_checker_store_shaped(const TypeCheckerIntFold *f,
                                       long long value,
@@ -412,9 +404,11 @@ static int type_checker_eval_binary(TypeChecker *checker, ASTNode *expression,
   result_type = checker ? type_checker_infer_type(checker, expression) : NULL;
   fold.shaped = type_checker_integer_type_shape(result_type, &fold.bits,
                                                 &fold.is_signed);
-  fold.compare_unsigned =
-      type_checker_operand_is_unsigned(checker, binary_expr->left) ||
-      type_checker_operand_is_unsigned(checker, binary_expr->right);
+  if (checker) {
+    fold.compare_unsigned = type_checker_compare_is_unsigned(
+        type_checker_infer_type(checker, binary_expr->left),
+        type_checker_infer_type(checker, binary_expr->right));
+  }
   return type_checker_fold_int_binary(binary_expr->operator, &fold, out_value);
 }
 
@@ -1735,6 +1729,76 @@ void type_checker_warn_pointer_integer_round_trip(TypeChecker *checker,
       checker->error_reporter, ERROR_SEMANTIC, expression->location, message,
       help);
   error_reporter_set_last_code(checker->error_reporter, "M0120");
+}
+
+static int g_sign_compare_quiet = 0;
+
+void type_checker_sign_compare_quiet(int delta) {
+  g_sign_compare_quiet += delta;
+}
+
+int type_checker_compare_is_unsigned(const Type *left, const Type *right) {
+  int left_bits = 0;
+  int left_signed = 0;
+  int right_bits = 0;
+  int right_signed = 0;
+  int left_int = type_checker_integer_type_shape(left, &left_bits, &left_signed);
+  int right_int =
+      type_checker_integer_type_shape(right, &right_bits, &right_signed);
+  if (left_int && right_int && left_signed != right_signed) {
+    int signed_bits = left_signed ? left_bits : right_bits;
+    int unsigned_bits = left_signed ? right_bits : left_bits;
+    return signed_bits <= unsigned_bits;
+  }
+  return (left_int && !left_signed) || (right_int && !right_signed);
+}
+
+void type_checker_warn_mixed_sign_compare(TypeChecker *checker,
+                                          SourceLocation location,
+                                          const char *op, ASTNode *left,
+                                          Type *left_type, ASTNode *right,
+                                          Type *right_type) {
+  int left_bits = 0;
+  int left_signed = 0;
+  int right_bits = 0;
+  int right_signed = 0;
+  char message[512];
+  char help[512];
+  ASTNode *signed_side;
+  Type *signed_type;
+  Type *unsigned_type;
+  int has_min = 0;
+  int has_max = 0;
+  long long min = 0;
+  long long max = 0;
+
+  if (!checker || !checker->error_reporter || g_sign_compare_quiet > 0 ||
+      !type_checker_integer_type_shape(left_type, &left_bits, &left_signed) ||
+      !type_checker_integer_type_shape(right_type, &right_bits, &right_signed) ||
+      left_signed == right_signed ||
+      !type_checker_compare_is_unsigned(left_type, right_type)) {
+    return;
+  }
+  signed_side = left_signed ? left : right;
+  signed_type = left_signed ? left_type : right_type;
+  unsigned_type = left_signed ? right_type : left_type;
+  if (type_checker_expression_range(checker, signed_side, &has_min, &min,
+                                    &has_max, &max) &&
+      has_min && min >= 0) {
+    return;
+  }
+  snprintf(message, sizeof(message),
+           "`%s` compares `%s` with `%s` as unsigned, so a negative value reads "
+           "as a huge one",
+           op, signed_type->name, unsigned_type->name);
+  snprintf(help, sizeof(help),
+           "cast one side so the comparison says what it means: (%s)<signed "
+           "side> if it cannot be negative, (%s)<unsigned side> if the value "
+           "fits",
+           unsigned_type->name, signed_type->name);
+  error_reporter_add_warning_with_suggestion(checker->error_reporter,
+                                             ERROR_SEMANTIC, location, message, help);
+  error_reporter_set_last_code(checker->error_reporter, "M0125");
 }
 
 void type_checker_warn_recv_buffer_bounds(TypeChecker *checker,

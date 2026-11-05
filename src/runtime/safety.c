@@ -39,6 +39,7 @@ typedef struct {
   uint32_t next_free;
   uint64_t identity;
   uint32_t heap;
+  uint32_t foreign;
 } SafetyRegion;
 
 #if defined(__GNUC__)
@@ -325,6 +326,7 @@ static void safety_register_region(void *pointer, uint64_t size, uint32_t heap) 
     safety_internal_failure("Fatal error: unable to allocate memory safety metadata");
   }
   safety_region(id)->heap = heap;
+  safety_region(id)->foreign = 0;
   __atomic_add_fetch(&g_safety_live_regions, 1, __ATOMIC_RELAXED);
   safety_unlock();
 }
@@ -618,6 +620,7 @@ int64_t mettle_safety_span(const void *base) {
 void mettle_safety_check_affine(const void *base, int64_t offset, int64_t length,
     uint32_t kind, uint32_t line, uint64_t identity, int64_t width, int64_t step) {
   if (length <= 0) return;
+  if (identity == SAFETY_IDENTITY_MIXED) identity = mettle_safety_identity(base);
   if (!identity || width <= 0 || step <= 0) {
     mettle_safety_check_identity(base, offset, width, kind, line, identity);
     return;

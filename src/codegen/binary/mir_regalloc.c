@@ -1059,10 +1059,6 @@ static void mir_compute_coalesce_hints(MirFunction *fn,
     if (in->op == MIR_IMUL && in->b.kind == MIR_OPK_IMM) {
       continue;
     }
-    if ((in->op == MIR_SHL || in->op == MIR_SHR || in->op == MIR_SAR) &&
-        in->b.kind != MIR_OPK_IMM) {
-      continue;
-    }
     MirVregId d = in->dst.vreg;
     MirVregId cand = MIR_VREG_NONE;
     if (in->a.kind == MIR_OPK_VREG && in->a.vreg != d &&
@@ -1958,6 +1954,7 @@ static void mir_color_state_free(MirColorState *st) {
   free(st->use_depth);
   free(st->rep);
   free(st->phys_hint);
+  free(st->avoid_shift_count);
   free(st->copy_partner);
 }
 
@@ -1991,11 +1988,13 @@ static int mir_color_state_init(MirColorState *st, MirFunction *fn,
   st->narrow_src = mir_build_narrowing_extend_map(fn);
   st->rep = (MirVregId *)malloc(n * sizeof(MirVregId));
   st->phys_hint = (int *)malloc(n * sizeof(int));
+  st->avoid_shift_count = (unsigned char *)calloc(n, sizeof(unsigned char));
   st->copy_partner = (MirVregId *)malloc(n * sizeof(MirVregId));
   if ((!st->inter && !st->rows) || !st->mask || !st->degree || !st->cost ||
       !st->colorable ||
       !st->removed || !st->reg_count || !st->metric || !st->stack ||
-      !st->use_depth || !st->rep || !st->phys_hint || !st->copy_partner) {
+      !st->use_depth || !st->rep || !st->phys_hint || !st->copy_partner ||
+      !st->avoid_shift_count) {
     mir_color_state_free(st);
     return 0;
   }
@@ -2351,6 +2350,10 @@ static int mir_color_choose_reg(const MirColorState *st, MirVregId v,
 
   if (avoid >= 0 && (preferred & ~(1u << (unsigned)avoid)) != 0) {
     preferred &= ~(1u << (unsigned)avoid);
+  }
+  if (st->avoid_shift_count[v] &&
+      (preferred & ~(1u << (unsigned)BINARY_GP_RCX)) != 0) {
+    preferred &= ~(1u << (unsigned)BINARY_GP_RCX);
   }
   if (vr->coalesce_hint != MIR_VREG_NONE) {
     const MirVreg *hv = &st->fn->vregs[vr->coalesce_hint];

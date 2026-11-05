@@ -1,0 +1,11 @@
+import "std/io";
+struct N { a: int32; label: string; }
+fn str_sum(s: string) -> int64 { var t: int64 = 0; for i in 0..s.length { t = t * 7 + (int64)s[i]; } return t; }
+fn pick_label(n: N*, flag: bool) -> string { if (flag) { return n->label; } return "none"; }
+fn plain() -> string { return ""; }
+fn main() -> int32 {
+  var n1: N;
+  n1.label = "one";
+  println("{str_sum(pick_label(&n1, true))} {str_sum(pick_label(&n1, false))} {str_sum(plain())}");
+  return 0;
+}

@@ -1625,6 +1625,27 @@ static int ir_try_fold_integer_unary(IRInstruction *instruction, int *changed) {
   return 1;
 }
 
+static int ir_try_fold_integer_cast(IRInstruction *instruction, int *changed) {
+  int bits = 0;
+  int is_unsigned = 0;
+  unsigned long long value;
+  if (!instruction || instruction->op != IR_OP_CAST || instruction->is_float ||
+      !instruction->text || instruction->lhs.kind != IR_OPERAND_INT ||
+      instruction->dest.kind == IR_OPERAND_NONE ||
+      !ir_int_type_name_info(instruction->text, &bits, &is_unsigned) ||
+      bits <= 0 || bits > 64) {
+    return 1;
+  }
+  value = (unsigned long long)instruction->lhs.int_value;
+  if (bits < 64) {
+    value &= (1ULL << bits) - 1ULL;
+    if (!is_unsigned && (value & (1ULL << (bits - 1)))) {
+      value |= ~((1ULL << bits) - 1ULL);
+    }
+  }
+  return ir_rewrite_to_assign_int(instruction, (long long)value, changed);
+}
+
 static int ir_simplify_branch(IRInstruction *instruction, int *changed) {
   if (!instruction) {
     return 0;
@@ -1775,6 +1796,7 @@ int ir_constant_and_branch_simplify_pass(IRFunction *function,
     if (!ir_try_fold_integer_binary(instruction, &ranges, i, changed) ||
         !ir_try_fold_float_reciprocal(instruction, changed) ||
         !ir_try_fold_integer_unary(instruction, changed) ||
+        !ir_try_fold_integer_cast(instruction, changed) ||
         !ir_value_range_simplify(&ranges, i, instruction, changed) ||
         !ir_simplify_redundant_assign(instruction, changed) ||
         !ir_simplify_branch(instruction, changed)) {

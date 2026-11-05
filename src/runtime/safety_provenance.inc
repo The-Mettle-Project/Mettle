@@ -1,4 +1,6 @@
 
+#define SAFETY_IDENTITY_MIXED UINT64_MAX
+
 uint64_t mettle_safety_identity(const void *pointer) {
   if (!pointer) return 0;
   SafetyRegion region = safety_snapshot((uintptr_t)pointer);
@@ -19,6 +21,11 @@ void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size
                                   uint32_t kind, uint32_t line,
                                   uint64_t identity) {
   (void)kind;
+  if (identity == SAFETY_IDENTITY_MIXED) identity = mettle_safety_identity(base);
+  if (!identity && base) {
+    SafetyRegion known = safety_snapshot((uintptr_t)base);
+    if (known.state == SAFETY_STATE_LIVE && known.foreign) identity = known.identity;
+  }
   if (!identity) {
     if (size <= 0 || safety_allocator_depth()) return;
     SafetyFailure failure = {base ? "memory access has no tracked allocation identity" :
@@ -40,6 +47,7 @@ void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size
 }
 
 int64_t mettle_safety_span_identity(const void *base, uint64_t identity) {
+  if (identity == SAFETY_IDENTITY_MIXED) identity = mettle_safety_identity(base);
   if (!identity) return 0;
   SafetyRegion region = safety_identity_snapshot(identity);
   uintptr_t address = (uintptr_t)base;
@@ -49,7 +57,7 @@ int64_t mettle_safety_span_identity(const void *base, uint64_t identity) {
 }
 
 uint64_t mettle_safety_merge_identity(uint64_t a, uint64_t b) {
-  return !a ? b : !b || a == b ? a : UINT64_MAX;
+  return !a ? b : !b || a == b ? a : SAFETY_IDENTITY_MIXED;
 }
 
 uint64_t mettle_safety_subtract_identity(uint64_t a, uint64_t b) {
@@ -238,6 +246,7 @@ void mettle_safety_value_clear(void *destination, uint64_t size) {
 
 void mettle_safety_free_identity(void *pointer, uint64_t identity) {
   if (!pointer) return;
+  if (identity == SAFETY_IDENTITY_MIXED) identity = mettle_safety_identity(pointer);
   if (!identity) {
     safety_internal_failure("Fatal error: free has no tracked allocation identity");
   }
@@ -259,6 +268,13 @@ void mettle_safety_region_begin(void *pointer, int64_t size) {
   if (known.state == SAFETY_STATE_LIVE && (uintptr_t)pointer == known.start &&
       (uint64_t)size == known.size) return;
   mettle_safety_register_static(pointer, (uint64_t)size);
+  safety_lock();
+  {
+    uint32_t id = safety_lookup((uintptr_t)pointer);
+    SafetyRegion *region = id >= SAFETY_ID_FIRST ? safety_region(id) : NULL;
+    if (region) region->foreign = 1;
+  }
+  safety_unlock();
 }
 
 void mettle_safety_entry_arguments(void *vector) {
@@ -458,6 +474,42 @@ void mettle_safety_call_arg_copy(void *call, uint64_t index, const void *source,
   if (!frame || index >= frame->count)
     safety_internal_failure("Fatal error: invalid aggregate safety argument slot");
   frame->arguments[index] = (uint64_t)(uintptr_t)safety_packet_capture(frame, source, size);
+}
+
+void mettle_safety_string_fresh(void *record) {
+  const void *data;
+  uint64_t chars;
+  SafetyRegion known;
+  if (!record) return;
+  data = *(const void *const *)record;
+  if (!data) return;
+  chars = ((const uint64_t *)record)[1] + 1;
+  known = safety_snapshot((uintptr_t)data);
+  if (!(known.state == SAFETY_STATE_LIVE && (uintptr_t)data >= known.start &&
+        chars <= known.size && (uintptr_t)data - known.start <= known.size - chars)) {
+    mettle_safety_register((void *)data, chars);
+    known = safety_snapshot((uintptr_t)data);
+  }
+  mettle_safety_value_store(record, (uint64_t)(uintptr_t)data, known.identity,
+                            sizeof(void *));
+}
+
+void mettle_safety_string_release(const void *record) {
+  const void *data = record ? *(const void *const *)record : NULL;
+  SafetyRegion known;
+  if (!data) return;
+  known = safety_snapshot((uintptr_t)data);
+  if (known.state == SAFETY_STATE_LIVE && known.heap &&
+      known.start == (uintptr_t)data) {
+    mettle_safety_unregister((void *)data);
+  }
+}
+
+uint64_t mettle_safety_c_string_identity(const void *text) {
+  uint64_t length = 0;
+  if (!text) return 0;
+  while (((const char *)text)[length]) length++;
+  return mettle_safety_literal_identity(text, length + 1);
 }
 
 void mettle_safety_string_contents(void *record, uint64_t chars) {

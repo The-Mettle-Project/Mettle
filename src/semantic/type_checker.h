@@ -232,6 +232,7 @@ int type_checker_push_range_guard(TypeChecker *checker, const char *name,
 size_t type_checker_guard_depth(const TypeChecker *checker);
 void type_checker_pop_guards(TypeChecker *checker, size_t depth);
 void type_checker_movement_index_drop(TypeChecker *checker);
+int type_checker_compare_is_unsigned(const Type *left, const Type *right);
 int type_checker_expression_range(TypeChecker *checker, ASTNode *expr,
                                   int *has_min, long long *min, int *has_max,
                                   long long *max);

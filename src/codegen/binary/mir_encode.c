@@ -864,6 +864,20 @@ static int encode_shift(MirFunction *fn, const MirInst *in) {
   if (!ok) {
     return 0;
   }
+  if (dst_reg && D != BINARY_GP_RCX && cnt != D) {
+    if (!operand_in_phys(fn, &in->a, D) && !materialize_into(fn, &in->a, D)) {
+      return 0;
+    }
+    if (cnt != BINARY_GP_RCX &&
+        !binary_emit_mov_reg_reg(code, BINARY_GP_RCX, cnt)) {
+      return enc_err(fn, "out of memory moving shift count");
+    }
+    if (!(w32 ? binary_emit_shift_reg_cl_32(code, sub, D)
+              : binary_emit_shift_reg_cl(code, sub, D))) {
+      return enc_err(fn, "out of memory in shift");
+    }
+    return 1;
+  }
   if (!materialize_into(fn, &in->a, SCRATCH_A)) {
     return 0;
   }
@@ -3489,7 +3503,11 @@ static int mir_encode_branch(MirEncodeState *st, const MirInst *in) {
     case MIR_JCC: {
       int rok;
       BinaryGpRegister creg = value_reg(fn, &in->a, SCRATCH_A, &rok);
-      if (!rok || !binary_emit_test_reg_reg(&ctx->code, creg)) {
+      if (!rok ||
+          !(in->b.kind == MIR_OPK_IMM
+                ? binary_emit_test_reg_imm32(&ctx->code, creg,
+                                             (uint32_t)in->b.imm)
+                : binary_emit_test_reg_reg(&ctx->code, creg))) {
         ok = enc_err(fn, "out of memory in branch test");
         break;
       }

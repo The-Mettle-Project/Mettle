@@ -1,0 +1,9 @@
+import "std/io";
+export fn main() -> int32 {
+  var s: string = "abc";
+  var i: int32 = -1;
+  var j: int64 = -1;
+  if (i < s.length) { println("int32 -1 < 3: true"); } else { println("int32 -1 < 3: false"); }
+  if (j < s.length) { println("int64 -1 < 3: true"); } else { println("int64 -1 < 3: false"); }
+  return 0;
+}

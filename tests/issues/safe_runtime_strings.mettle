@@ -1,0 +1,22 @@
+import "std/io";
+import "std/mem";
+fn first(s: string) -> int32 { return (int32)s[0]; }
+fn sum(s: string) -> int64 { var t: int64 = 0; for i in 0..s.length { t = t + (int64)s[i]; } return t; }
+fn cp(s: string) -> uint8* { var b: uint8* = (uint8*)malloc((int64)s.length + 1); memcpy(b, s.chars, (int64)s.length); return b; }
+fn main() -> int32 {
+  var n: int32 = 12;
+  var a: string = "abc";
+  var b: string = a + "def";
+  var c: string = "x{n}y{a}z";
+  var d: string = c + b + "{n}";
+  println("{first(b)} {sum(b)} {first(c)} {sum(c)} {sum(d)} {d}");
+  var e: uint8* = cp(d);
+  println("{e[0]}");
+  free(e);
+  for i in 0..1000 { var t: string = "item {i}"; if (first(t) != 105) { println("bad"); } }
+  var f: float64 = 2.5;
+  var fl: bool = true;
+  var ch: char = 'q';
+  println("{f} {fl} {ch} {first("{f}")} {first("{fl}")} {first("{ch}")}");
+  return 0;
+}

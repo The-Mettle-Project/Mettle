@@ -29,7 +29,7 @@ export fn sync_os_wait(addr: int32*, expected: int32, timeout_ns: int64) {
   var ms: uint32 = (uint32)0xFFFFFFFF;   // INFINITE
   if (timeout_ns >= 0) {
     var m: int64 = (timeout_ns + 999999) / 1000000;
-    if (m > 0xFFFFFFFE) { m = 0xFFFFFFFE; }
+    if (m > (int64)0xFFFFFFFE) { m = (int64)0xFFFFFFFE; }
     ms = (uint32)m;
   }
   sync_w_acquire(&g_sync_locks[b]);

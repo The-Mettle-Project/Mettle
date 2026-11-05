@@ -751,7 +751,14 @@ int type_checker_check_for_statement(TypeChecker *checker,
   }
 
   if (for_stmt->condition) {
+    int range_header = for_stmt->initializer &&
+                       for_stmt->initializer->type == AST_VAR_DECLARATION &&
+                       for_stmt->initializer->data &&
+                       ((VarDeclaration *)for_stmt->initializer->data)
+                           ->structural_type;
+    type_checker_sign_compare_quiet(range_header ? 1 : 0);
     Type *cond_type = type_checker_infer_type(checker, for_stmt->condition);
+    type_checker_sign_compare_quiet(range_header ? -1 : 0);
     if (!cond_type) {
       free(post_init_snapshot);
       type_checker_init_tracker_exit_scope(checker);

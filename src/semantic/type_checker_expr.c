@@ -4897,6 +4897,9 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
       return NULL;
     }
 
+    type_checker_warn_mixed_sign_compare(checker, location, op, binop->left,
+                                         left_type, binop->right, right_type);
+
     if (left_type->kind == TYPE_STRING && !is_equality) {
       type_checker_set_error_at_location(
           checker, location,

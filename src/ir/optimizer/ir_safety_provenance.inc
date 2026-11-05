@@ -240,6 +240,29 @@ static int origin_runtime_check(SafetyOrigins *origins, IRInstruction *in) {
   return in->text && ir_instruction_vector_append_move(&origins->out, in);
 }
 
+static int origin_makes_runtime_string(SafetyOrigins *origins,
+                                       const IRInstruction *in) {
+  if (in->op == IR_OP_BINARY) {
+    return in->allocates && in->text && !strcmp(in->text, "+") && in->value_type &&
+           in->value_type->kind == MTLC_TYPE_STRING;
+  }
+  if (in->op != IR_OP_CALL || !in->text || in->dest.kind == IR_OPERAND_NONE ||
+      strncmp(in->text, "mettle_string_", 14) != 0) {
+    return 0;
+  }
+  const IRModuleSymbol *symbol = ir_program_lookup_symbol(origins->program, in->text);
+  const MtlcType *type = symbol && symbol->return_type ? symbol->return_type
+                                                       : in->value_type;
+  return type && type->kind == MTLC_TYPE_STRING;
+}
+
+static int origin_returns_c_string(SafetyOrigins *origins, const IRInstruction *in) {
+  if (in->op != IR_OP_CALL || !in->text || in->dest.kind == IR_OPERAND_NONE) return 0;
+  const IRModuleSymbol *symbol = ir_program_lookup_symbol(origins->program, in->text);
+  const char *linked = symbol && symbol->link_name ? symbol->link_name : in->text;
+  return !strcmp(linked, "getenv");
+}
+
 static int origin_return(SafetyOrigins *origins, SourceLocation location,
                           const IROperand *value, const IROperand *entry) {
   size_t size = origin_aggregate_size(origins, value);
@@ -410,6 +433,20 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
 
   IROpcode op = in->op;
   int is_float = in->is_float;
+  int fresh_string = origin_makes_runtime_string(origins, in);
+  int c_string_result = origin_returns_c_string(origins, in);
+  if (call && in->text && !strcmp(in->text, "mettle_string_free") &&
+      in->argument_count == 1) {
+    IROperand record = ir_operand_none();
+    int released = origin_address(origins, location, &in->arguments[0], &record);
+    if (released) released = origin_call(origins, location, "mettle_safety_string_release",
+                                         &record, 1, NULL);
+    ir_operand_destroy(&record);
+    if (!released) {
+      ir_operand_destroy(&memory_result);
+      goto done;
+    }
+  }
   int subtract = op == IR_OP_BINARY && in->text && !strcmp(in->text, "-");
   int arithmetic = op == IR_OP_BINARY && in->text &&
       strcmp(in->text, "==") && strcmp(in->text, "!=") && strcmp(in->text, "<") &&
@@ -417,6 +454,27 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
       strcmp(in->text, "&&") && strcmp(in->text, "||");
   if (!ir_instruction_vector_append_move(&origins->out, in)) {
     ir_operand_destroy(&memory_result);
+    goto done;
+  }
+  if (fresh_string) {
+    IROperand record = ir_operand_none();
+    int described = origin_address(origins, location, &dest, &record);
+    if (described) described = origin_call(origins, location, "mettle_safety_string_fresh",
+                                           &record, 1, NULL);
+    ir_operand_destroy(&record);
+    if (!described) {
+      ir_operand_destroy(&memory_result);
+      goto done;
+    }
+  }
+  if (c_string_result && output) {
+    if (!origin_call(origins, location, "mettle_safety_c_string_identity", &dest, 1,
+                     &output->identity)) {
+      ir_operand_destroy(&memory_result);
+      goto done;
+    }
+    if (!origin_save(origins, location, &dest)) goto done;
+    ok = 1;
     goto done;
   }
   if (output && (memory_copy || memory_fill)) {
@@ -524,6 +582,61 @@ fail:
   return 0;
 }
 
+static int origin_hoist_string_literal(SafetyOrigins *origins, MtlcType *string_type,
+                                       const IRInstruction *in, IROperand *operand) {
+  IROperand local, seed_args[2];
+  IROperand slot = ir_operand_none();
+  IRInstruction decl = {0}, copy = {0};
+  SafetyOrigin *origin = NULL;
+  char name[64];
+  long long chars;
+  int described;
+
+  snprintf(name, sizeof(name), ".strlit_%u", g_safety_next_id++);
+  local = ir_operand_symbol(name);
+  if (!local.name) return 0;
+  chars = (long long)ir_operand_string_length(operand) + 1;
+
+  decl.op = IR_OP_DECLARE_LOCAL;
+  decl.location = in->location;
+  decl.value_type = string_type;
+  decl.text = mettle_strdup("string");
+  if (!decl.text || !ir_operand_clone(&local, &decl.dest) ||
+      !ir_instruction_vector_append_move(&origins->out, &decl)) {
+    ir_instruction_destroy_storage(&decl);
+    ir_operand_destroy(&local);
+    return 0;
+  }
+
+  copy.op = IR_OP_ASSIGN;
+  copy.location = in->location;
+  copy.value_type = string_type;
+  if (!ir_operand_clone(&local, &copy.dest) || !ir_operand_clone(operand, &copy.lhs) ||
+      !ir_instruction_vector_append_move(&origins->out, &copy)) {
+    ir_instruction_destroy_storage(&copy);
+    ir_operand_destroy(&local);
+    return 0;
+  }
+
+  described = origin_address(origins, in->location, &local, &slot);
+  if (described) {
+    seed_args[0] = slot;
+    seed_args[1] = ir_operand_int(chars);
+    described = origin_call(origins, in->location, "mettle_safety_string_contents",
+                            seed_args, 2, NULL);
+  }
+  ir_operand_destroy(&slot);
+  if (!described || !origin_add(origins, &local)) {
+    ir_operand_destroy(&local);
+    return 0;
+  }
+  origin = origin_find(origins, &local);
+  if (origin) origin->type = string_type;
+  ir_operand_destroy(operand);
+  *operand = local;
+  return 1;
+}
+
 static int safety_origins_function(IRProgram *program, IRFunction *function) {
   SafetyOrigins origins = {0};
   origins.program = program;
@@ -572,74 +685,24 @@ static int safety_origins_function(IRProgram *program, IRFunction *function) {
     for (size_t i = 0; string_type && i < function->instruction_count; i++) {
       IRInstruction *in = &function->instructions[i];
       const IRModuleSymbol *callee = NULL;
+      if (in->op == IR_OP_RETURN && in->lhs.kind == IR_OPERAND_STRING &&
+          in->lhs.name && function->return_type_name &&
+          strcmp(function->return_type_name, "string") == 0) {
+        if (!origin_hoist_string_literal(&origins, string_type, in, &in->lhs)) goto done;
+        continue;
+      }
       if (in->op != IR_OP_CALL || !in->text || !in->argument_count) continue;
       if (strncmp(in->text, "mettle_safety_", 14) == 0) continue;
       callee = ir_program_lookup_symbol(program, in->text);
       if (!callee || callee->is_extern || !callee->param_types) continue;
       for (size_t a = 0; a < in->argument_count && a < callee->param_count; a++) {
-        IROperand local, seed_args[2];
-        IRInstruction decl = {0}, copy = {0};
-        SafetyOrigin *origin = NULL;
-        char name[64];
-        long long chars;
         if (in->arguments[a].kind != IR_OPERAND_STRING || !in->arguments[a].name)
           continue;
         if (!callee->param_types[a] ||
             callee->param_types[a]->kind != MTLC_TYPE_STRING)
           continue;
-
-        snprintf(name, sizeof(name), ".strlit_%u", g_safety_next_id++);
-        local = ir_operand_symbol(name);
-        if (!local.name) goto done;
-        chars = (long long)ir_operand_string_length(&in->arguments[a]) + 1;
-
-        decl.op = IR_OP_DECLARE_LOCAL;
-        decl.location = in->location;
-        decl.value_type = string_type;
-        decl.text = mettle_strdup("string");
-        if (!decl.text || !ir_operand_clone(&local, &decl.dest) ||
-            !ir_instruction_vector_append_move(&origins.out, &decl)) {
-          ir_instruction_destroy_storage(&decl);
-          ir_operand_destroy(&local);
+        if (!origin_hoist_string_literal(&origins, string_type, in, &in->arguments[a]))
           goto done;
-        }
-
-        copy.op = IR_OP_ASSIGN;
-        copy.location = in->location;
-        copy.value_type = string_type;
-        if (!ir_operand_clone(&local, &copy.dest) ||
-            !ir_operand_clone(&in->arguments[a], &copy.lhs) ||
-            !ir_instruction_vector_append_move(&origins.out, &copy)) {
-          ir_instruction_destroy_storage(&copy);
-          ir_operand_destroy(&local);
-          goto done;
-        }
-
-        {
-          IROperand slot = ir_operand_none();
-          int described = origin_address(&origins, in->location, &local, &slot);
-          if (described) {
-            seed_args[0] = slot;
-            seed_args[1] = ir_operand_int(chars);
-            described = origin_call(&origins, in->location,
-                                    "mettle_safety_string_contents",
-                                    seed_args, 2, NULL);
-          }
-          ir_operand_destroy(&slot);
-          if (!described) {
-            ir_operand_destroy(&local);
-            goto done;
-          }
-        }
-
-        if (!origin_add(&origins, &local)) {
-          ir_operand_destroy(&local);
-          goto done;
-        }
-        origin = origin_find(&origins, &local);
-        if (origin) origin->type = string_type;
-        ir_operand_destroy(&in->arguments[a]);
-        in->arguments[a] = local;
       }
     }
   }

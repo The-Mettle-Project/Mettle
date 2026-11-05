@@ -200,6 +200,12 @@ long long
 type_checker_extract_known_pointer_alignment(TypeChecker *checker,
                                              ASTNode *expression);
 
+void type_checker_sign_compare_quiet(int delta);
+void type_checker_warn_mixed_sign_compare(TypeChecker *checker,
+                                          SourceLocation location,
+                                          const char *op, ASTNode *left,
+                                          Type *left_type,
+                                          ASTNode *right, Type *right_type);
 void type_checker_warn_pointer_integer_round_trip(TypeChecker *checker,
                                                  ASTNode *expression,
                                                  CastExpression *cast_expr,

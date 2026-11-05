@@ -4,6 +4,7 @@
 
 extern long long mir_encode_last_spills;
 #include "codegen/binary/strength_rules.h"
+#include "codegen/target.h"
 
 #include "codegen/binary/mir_annotate.h"
 #include "common.h"
@@ -4202,6 +4203,16 @@ static int mir_lower_ir_kernel(MirFunction *fn, CodeGenerator *g,
     return 0;
   }
 
+  if (in->op == IR_OP_MEMCPY_INLINE && in->rhs.kind == IR_OPERAND_INT &&
+      in->rhs.int_value > 0 && in->rhs.int_value <= MIR_STRUCT_COPY_UNROLL_MAX) {
+    MirOperand to = mir_value_operand(fn, g, ctx, map, &in->dest);
+    MirOperand from = mir_value_operand(fn, g, ctx, map, &in->lhs);
+    if (to.kind == MIR_OPK_VREG && from.kind == MIR_OPK_VREG) {
+      return mir_emit_struct_copy(fn, to.vreg, from.vreg,
+                                  (int)in->rhs.int_value);
+    }
+  }
+
   MirKernelAux *aux = (MirKernelAux *)calloc(1, sizeof(MirKernelAux));
   if (!mir_function_own_aux(fn, aux)) {
     return 0;
@@ -6394,6 +6405,147 @@ static void mir_call_mark_preserved(MirFunction *fn, const IRInstruction *in,
   }
 }
 
+static int mir_emit_short_fill(MirFunction *fn, MirVregId base, long long value,
+                               int size) {
+  unsigned long long pattern =
+      (unsigned long long)(value & 0xFF) * 0x0101010101010101ULL;
+  MirVregId held = mir_new_vreg(fn, MIR_RC_GP, 8);
+  if (held == MIR_VREG_NONE ||
+      !mir_emit1(fn, MIR_MOV, mir_op_vreg(held), mir_op_imm((int64_t)pattern),
+                 mir_op_none(), 8, 0, 0)) {
+    return 0;
+  }
+  for (int k = 0; k < size;) {
+    int rem = size - k;
+    int w = rem >= 8 ? 8 : (rem >= 4 ? 4 : (rem >= 2 ? 2 : 1));
+    if (!mir_emit1(fn, MIR_MOV, mir_op_mem_vreg(base, MIR_VREG_NONE, 1, k),
+                   mir_op_vreg(held), mir_op_none(), w, 1, 0)) {
+      return 0;
+    }
+    k += w;
+  }
+  return 1;
+}
+
+static const char *mir_new_copy_label(MirFunction *fn) {
+  static unsigned serial = 0;
+  char name[32];
+  snprintf(name, sizeof(name), ".mcopy_%u", serial++);
+  return (const char *)mir_function_own_aux(fn, mettle_strdup(name));
+}
+
+static int mir_emit_copy_load(MirFunction *fn, MirVregId *held, MirVregId base,
+                              MirVregId index, int disp, int width) {
+  *held = mir_new_vreg(fn, MIR_RC_GP, 8);
+  return *held != MIR_VREG_NONE &&
+         mir_emit1(fn, MIR_MOV, mir_op_vreg(*held),
+                   mir_op_mem_vreg(base, index, 1, disp), mir_op_none(), width,
+                   1, 0);
+}
+
+static int mir_emit_copy_store(MirFunction *fn, MirVregId held, MirVregId base,
+                               MirVregId index, int disp, int width) {
+  return mir_emit1(fn, MIR_MOV, mir_op_mem_vreg(base, index, 1, disp),
+                   mir_op_vreg(held), mir_op_none(), width, 1, 0);
+}
+
+static int mir_emit_copy_pair(MirFunction *fn, MirVregId to, MirVregId from,
+                              MirVregId count, int width, const char *end) {
+  MirVregId front;
+  MirVregId back;
+  return mir_emit_copy_load(fn, &front, from, MIR_VREG_NONE, 0, width) &&
+         mir_emit_copy_load(fn, &back, from, count, -width, width) &&
+         mir_emit_copy_store(fn, front, to, MIR_VREG_NONE, 0, width) &&
+         mir_emit_copy_store(fn, back, to, count, -width, width) &&
+         mir_emit1(fn, MIR_JMP, mir_op_label(end), mir_op_none(), mir_op_none(),
+                   8, 0, 0);
+}
+
+static int mir_emit_runtime_sized_copy(MirFunction *fn, MirVregId to,
+                                       MirVregId from, MirVregId count) {
+  const BinaryAbi *abi = code_generator_binary_active_abi();
+  const char *wide = mir_new_copy_label(fn);
+  const char *huge = mir_new_copy_label(fn);
+  const char *under8 = mir_new_copy_label(fn);
+  const char *under4 = mir_new_copy_label(fn);
+  const char *end = mir_new_copy_label(fn);
+  MirVregId half = mir_new_vreg(fn, MIR_RC_GP, 8);
+  MirVregId b0, b1, b2, q0, q1, q2, q3;
+
+  if (!wide || !huge || !under8 || !under4 || !end || half == MIR_VREG_NONE ||
+      !abi || abi->int_param_count < 3) {
+    return 0;
+  }
+  return mir_emit1(fn, MIR_CMPBR, mir_op_label(wide), mir_op_vreg(count),
+                   mir_op_imm(16), 8, 1, 0x87) &&
+         mir_emit1(fn, MIR_CMPBR, mir_op_label(under8), mir_op_vreg(count),
+                   mir_op_imm(8), 8, 1, 0x82) &&
+         mir_emit_copy_pair(fn, to, from, count, 8, end) &&
+         mir_emit1(fn, MIR_LABEL, mir_op_label(under8), mir_op_none(),
+                   mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_CMPBR, mir_op_label(under4), mir_op_vreg(count),
+                   mir_op_imm(4), 8, 1, 0x82) &&
+         mir_emit_copy_pair(fn, to, from, count, 4, end) &&
+         mir_emit1(fn, MIR_LABEL, mir_op_label(under4), mir_op_none(),
+                   mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_CMPBR, mir_op_label(end), mir_op_vreg(count),
+                   mir_op_imm(0), 8, 1, 0x84) &&
+         mir_emit1(fn, MIR_SHR, mir_op_vreg(half), mir_op_vreg(count),
+                   mir_op_imm(1), 8, 1, 0) &&
+         mir_emit_copy_load(fn, &b0, from, MIR_VREG_NONE, 0, 1) &&
+         mir_emit_copy_load(fn, &b1, from, half, 0, 1) &&
+         mir_emit_copy_load(fn, &b2, from, count, -1, 1) &&
+         mir_emit_copy_store(fn, b0, to, MIR_VREG_NONE, 0, 1) &&
+         mir_emit_copy_store(fn, b1, to, half, 0, 1) &&
+         mir_emit_copy_store(fn, b2, to, count, -1, 1) &&
+         mir_emit1(fn, MIR_JMP, mir_op_label(end), mir_op_none(), mir_op_none(),
+                   8, 0, 0) &&
+         mir_emit1(fn, MIR_LABEL, mir_op_label(wide), mir_op_none(),
+                   mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_CMPBR, mir_op_label(huge), mir_op_vreg(count),
+                   mir_op_imm(32), 8, 1, 0x87) &&
+         mir_emit_copy_load(fn, &q0, from, MIR_VREG_NONE, 0, 8) &&
+         mir_emit_copy_load(fn, &q1, from, MIR_VREG_NONE, 8, 8) &&
+         mir_emit_copy_load(fn, &q2, from, count, -16, 8) &&
+         mir_emit_copy_load(fn, &q3, from, count, -8, 8) &&
+         mir_emit_copy_store(fn, q0, to, MIR_VREG_NONE, 0, 8) &&
+         mir_emit_copy_store(fn, q1, to, MIR_VREG_NONE, 8, 8) &&
+         mir_emit_copy_store(fn, q2, to, count, -16, 8) &&
+         mir_emit_copy_store(fn, q3, to, count, -8, 8) &&
+         mir_emit1(fn, MIR_JMP, mir_op_label(end), mir_op_none(), mir_op_none(),
+                   8, 0, 0) &&
+         mir_emit1(fn, MIR_LABEL, mir_op_label(huge), mir_op_none(),
+                   mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_MOV,
+                   mir_op_phys(abi->int_param_registers[0], MIR_RC_GP),
+                   mir_op_vreg(to), mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_MOV,
+                   mir_op_phys(abi->int_param_registers[1], MIR_RC_GP),
+                   mir_op_vreg(from), mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_MOV,
+                   mir_op_phys(abi->int_param_registers[2], MIR_RC_GP),
+                   mir_op_vreg(count), mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_REP_MOVSB, mir_op_symbol("memcpy"), mir_op_none(),
+                   mir_op_none(), 8, 0, 0) &&
+         mir_emit1(fn, MIR_LABEL, mir_op_label(end), mir_op_none(),
+                   mir_op_none(), 8, 0, 0);
+}
+
+static int mir_emit_copy_result(MirFunction *fn, CodeGenerator *g,
+                                BinaryFunctionContext *ctx, MirNameMap *map,
+                                const IRInstruction *in, MirOperand to) {
+  MirOperand result;
+  if (in->dest.kind == IR_OPERAND_NONE) {
+    return 1;
+  }
+  result = mir_value_operand(fn, g, ctx, map, &in->dest);
+  if (result.kind != MIR_OPK_VREG) {
+    fn->has_error = 1;
+    return 0;
+  }
+  return mir_emit1(fn, MIR_MOV, result, to, mir_op_none(), 8, 0, 0);
+}
+
 static int mir_lower_call(MirFunction *fn, CodeGenerator *g,
                           BinaryFunctionContext *ctx, MirNameMap *map,
                           const IRInstruction *in,
@@ -6422,6 +6574,30 @@ static int mir_lower_call(MirFunction *fn, CodeGenerator *g,
   }
   if (mir_call_is_syscall(in)) {
     return mir_lower_syscall(fn, g, ctx, map, in);
+  }
+  if (in->text && !strcmp(in->text, "memset") && in->argument_count == 3 &&
+      in->arguments[1].kind == IR_OPERAND_INT &&
+      in->arguments[2].kind == IR_OPERAND_INT &&
+      in->arguments[2].int_value > 0 &&
+      in->arguments[2].int_value <= MIR_STRUCT_COPY_UNROLL_MAX) {
+    MirOperand to = mir_value_operand(fn, g, ctx, map, &in->arguments[0]);
+    if (to.kind == MIR_OPK_VREG) {
+      return mir_emit_short_fill(fn, to.vreg, in->arguments[1].int_value,
+                                 (int)in->arguments[2].int_value) &&
+             mir_emit_copy_result(fn, g, ctx, map, in, to);
+    }
+  }
+  if (in->text && !strcmp(in->text, "memcpy") && in->argument_count == 3 &&
+      (in->arguments[2].kind == IR_OPERAND_TEMP ||
+       in->arguments[2].kind == IR_OPERAND_SYMBOL)) {
+    MirOperand to = mir_value_operand(fn, g, ctx, map, &in->arguments[0]);
+    MirOperand from = mir_value_operand(fn, g, ctx, map, &in->arguments[1]);
+    MirOperand count = mir_value_operand(fn, g, ctx, map, &in->arguments[2]);
+    if (to.kind == MIR_OPK_VREG && from.kind == MIR_OPK_VREG &&
+        count.kind == MIR_OPK_VREG) {
+      return mir_emit_runtime_sized_copy(fn, to.vreg, from.vreg, count.vreg) &&
+             mir_emit_copy_result(fn, g, ctx, map, in, to);
+    }
   }
   if (!mir_call_declare_external(fn, g, in)) {
     return 0;
@@ -9357,6 +9533,49 @@ static void mir_fuse_bit_test_branch(MirFunction *fn) {
     if (!mir_bit_test_rewrite(fn, &test)) {
       break;
     }
+  }
+  free(uses);
+  free(defs);
+}
+
+static void mir_fuse_mask_test_branch(MirFunction *fn) {
+  int *uses = NULL;
+  int *defs = NULL;
+
+  if (!fn || fn->insn_count < 2 || fn->vreg_count == 0 ||
+      mtlc_target()->arch != MTLC_TARGET_ARCH_X86_64 ||
+      !mir_count_vreg_uses_defs(fn, &uses, &defs)) {
+    return;
+  }
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    MirInst *mask = &fn->insns[i];
+    size_t next;
+    MirInst *br;
+    MirVregId held;
+    if (mask->op != MIR_AND || mask->dst.kind != MIR_OPK_VREG ||
+        mask->a.kind != MIR_OPK_VREG || mask->b.kind != MIR_OPK_IMM ||
+        mask->b.imm <= 0 || mask->b.imm > 0x7FFFFFFF || mask->is_float ||
+        fn->vregs[mask->a.vreg].rclass != MIR_RC_GP) {
+      continue;
+    }
+    next = mir_next_real_insn(fn, i);
+    if (next >= fn->insn_count) {
+      continue;
+    }
+    br = &fn->insns[next];
+    held = mask->dst.vreg;
+    if (br->a.kind != MIR_OPK_VREG || br->a.vreg != held ||
+        (br->cc != 0x84 && br->cc != 0x85) || uses[held] != 1 ||
+        defs[held] != 1 || fn->vregs[held].address_taken ||
+        !(br->op == MIR_JCC ||
+          (br->op == MIR_CMPBR && br->b.kind == MIR_OPK_IMM && br->b.imm == 0))) {
+      continue;
+    }
+    br->op = MIR_JCC;
+    br->a = mask->a;
+    br->b = mir_op_imm(mask->b.imm);
+    br->width = 8;
+    mask->op = MIR_NOP;
   }
   free(uses);
   free(defs);
@@ -13001,6 +13220,7 @@ static const MirPass MIR_PASSES[] = {
     {"mir_rotate_loops", 1, mir_rotate_loops},
     {"mir_thread_branch_over_jump", 1, mir_thread_branch_over_jump},
     {"mir_fuse_bit_test_branch", 1, mir_fuse_bit_test_branch},
+    {"mir_fuse_mask_test_branch", 1, mir_fuse_mask_test_branch},
     {"mir_place_const_pool", 0, mir_place_const_pool},
     {"mir_sink_cold_exits", 1, mir_sink_cold_exits},
     {"mir_guard_counter_wrap", 1, mir_guard_counter_wrap},

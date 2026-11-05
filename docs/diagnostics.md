@@ -115,6 +115,7 @@ Memory and range diagnostics:
 | M0122 | A message was written after it was handed to a task |
 | M0123 | A signed operation left its type |
 | M0124 | A constant signed operation does not fit its type |
+| M0125 | A signed value compared with an unsigned one |
 
 [Memory safety](memory-safety.md) and [Borrow checker](borrow-checker.md)
 cover the M codes in context.

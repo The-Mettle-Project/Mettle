@@ -1,0 +1,57 @@
+import "std/io";
+
+struct Pair { a: int32; b: int32; }
+struct Big { a: int64; b: int64; c: int64; }
+struct Fl { x: float64; y: float64; }
+
+export fn show(s: string) -> int32 {
+  println("got: {s}");
+  return (int32)s.length;
+}
+export fn swap(p: Pair) -> Pair {
+  var r: Pair;
+  r.a = p.b;
+  r.b = p.a;
+  return r;
+}
+export fn total(k: int32, b: Big) -> int64 { return b.a + b.b + b.c + (int64)k; }
+export fn flip(f: Fl) -> Fl {
+  var r: Fl;
+  r.x = f.y;
+  r.y = f.x;
+  return r;
+}
+export fn name_of(k: int32) -> string { return if (k > 0) { "pos" } else { "neg" }; }
+
+struct Table { on_show: fn(string) -> int32; }
+
+var g_show: fn(string) -> int32 = &show;
+
+fn call_it(f: fn(string) -> int32) -> int32 { return f("hello"); }
+
+export fn main() -> int32 {
+  println("{call_it(&show)} {call_it(show)} {show("direct")}");
+  var p: Pair;
+  p.a = 1;
+  p.b = 2;
+  var sw: fn(Pair) -> Pair = &swap;
+  var q: Pair = sw(p);
+  var bg: Big;
+  bg.a = 1;
+  bg.b = 2;
+  bg.c = 3;
+  var to: fn(int32, Big) -> int64 = &total;
+  var fl: Fl;
+  fl.x = 1.5;
+  fl.y = 2.5;
+  var fp: fn(Fl) -> Fl = &flip;
+  var r: Fl = fp(fl);
+  var nm: fn(int32) -> string = &name_of;
+  println("{q.a} {q.b} {to(4, bg)} {r.x} {r.y} {nm(1)} {nm(-1)}");
+  var t: Table;
+  t.on_show = &show;
+  println("{t.on_show("field")} {g_show("global")}");
+  var c: Fn(string) -> int32 = &show;
+  println("{c("closure")}");
+  return 0;
+}
