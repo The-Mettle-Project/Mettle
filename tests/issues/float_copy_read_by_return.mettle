@@ -1,0 +1,23 @@
+import "std/io";
+
+fn pick(x: int32) -> int32 { return x * 2 + 1; }
+
+fn through(f: fn(int32) -> int32, x: int32) -> int32 { return f(x); }
+
+fn spend(k: int32) -> int64 {
+  var s: string = "k{k}";
+  return (int64)s.length;
+}
+
+fn halve(a: int32, f: float64) -> int32 {
+  var sel: int32 = switch (a & 3) { case 0: a, case 1: a + 1, default: a };
+  var first: int64 = spend(a - sel);
+  var second: int64 = spend(through(&pick, a));
+  var copy: int32 = (int32)(f * 0.5);
+  return (int32)(f * 0.5);
+}
+
+fn main() -> int32 {
+  println("{halve(37, -1.5)} {halve(10, 9.0)} {halve(3, 101.0)}");
+  return 0;
+}

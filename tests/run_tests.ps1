@@ -21701,6 +21701,8 @@ $issueRegressions = @(
   @{ Name = "safe_release_parallel_runs_on_one_thread"; Entry = "tests/test_parallel_loop.mettle"; Args = @("--safe", "--release"); Expect = @() },
   @{ Name = "safe_neighbour_region_keeps_slot_identity"; Entry = "tests/issues/safe_neighbour_region_keeps_slot_identity.mettle"; Args = @("--safe"); Expect = @("ok") },
   @{ Name = "jump_ends_at_closing_brace"; Entry = "tests/issues/jump_ends_at_brace.mettle"; Args = @(); Expect = @("8 2 4") },
+  @{ Name = "float_copy_read_by_return"; Entry = "tests/issues/float_copy_read_by_return.mettle"; Args = @("--release"); Expect = @("0 4 50") },
+  @{ Name = "float_copy_read_by_return_O"; Entry = "tests/issues/float_copy_read_by_return.mettle"; Args = @("-O"); Expect = @("0 4 50") },
   @{ Name = "sroa_keeps_a_piece_written_by_arithmetic"; Entry = "tests/issues/sroa_unread_piece_arithmetic.mettle"; Args = @("-O"); Expect = @("0") },
   @{ Name = "safe_keeps_the_declaration_of_a_dead_addressed_local"; Entry = "tests/issues/safe_dead_block_addressed_local.mettle"; Args = @("--safe", "--release"); Expect = @("5") },
   @{ Name = "main_returns_an_exit_status"; Command = @("--build", "tests/issues/err_main_returns_string.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("'main' returns the exit status") },

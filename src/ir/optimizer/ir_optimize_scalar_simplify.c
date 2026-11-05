@@ -3129,6 +3129,12 @@ static int ir_symbol_read_count_after_until_write_or_control(
       return -1;
     }
     if (instruction->op == IR_OP_RETURN) {
+      if (ir_instruction_reads_symbol_operand(instruction, symbol_name)) {
+        count++;
+        if (only_read_index_out) {
+          *only_read_index_out = i;
+        }
+      }
       return count;
     }
     if (instruction->op == IR_OP_LABEL || instruction->op == IR_OP_BRANCH_ZERO ||
