@@ -1220,6 +1220,14 @@ static void ir_sroa_count_writes(const IRFunction *function, IRSroaHash *piece_w
     if (in->op == IR_OP_ADDRESS_OF && ir_sroa_operand_is_piece(&in->lhs)) {
       ir_sroa_count_up(piece_writes, in->lhs.name, 2);
     }
+    if (in->op == IR_OP_ROTATE_ADD) {
+      if (ir_sroa_operand_is_piece(&in->lhs)) {
+        ir_sroa_count_up(piece_writes, in->lhs.name, 2);
+      }
+      if (ir_sroa_operand_is_piece(&in->rhs)) {
+        ir_sroa_count_up(piece_writes, in->rhs.name, 2);
+      }
+    }
     if (ir_instruction_writes_destination(in)) {
       if (ir_sroa_operand_is_piece(&in->dest)) {
         ir_sroa_count_up(piece_writes, in->dest.name, 1);

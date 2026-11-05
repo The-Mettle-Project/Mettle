@@ -2793,6 +2793,26 @@ int ir_operand_is_symbol_named(const IROperand *operand,
          strcmp(operand->name, name) == 0;
 }
 
+static int ir_temp_read_outside(const IRFunction *function, const char *temp,
+                                size_t first, size_t last) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (i >= first && i <= last) {
+      continue;
+    }
+    if (ir_operand_is_temp_named(&ins->lhs, temp) ||
+        ir_operand_is_temp_named(&ins->rhs, temp)) {
+      return 1;
+    }
+    for (size_t a = 0; a < ins->argument_count; a++) {
+      if (ir_operand_is_temp_named(&ins->arguments[a], temp)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 static int ir_try_fuse_rotate_add_at(IRFunction *function, size_t index,
                                      int *changed) {
   if (!function || index + 3 >= function->instruction_count) {
@@ -2846,6 +2866,11 @@ static int ir_try_fuse_rotate_add_at(IRFunction *function, size_t index,
       ir_operand_is_temp(&assign_b->lhs) &&
       strcmp(assign_b->lhs.name, temp_sum) == 0;
   if (!b_from_next && !b_from_temp) {
+    return 1;
+  }
+  if (strcmp(sym_a, sym_b) == 0 || strcmp(sym_next, sym_a) == 0 ||
+      strcmp(sym_next, sym_b) == 0 ||
+      ir_temp_read_outside(function, temp_sum, index + 1, index + 3)) {
     return 1;
   }
 

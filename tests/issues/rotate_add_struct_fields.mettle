@@ -1,0 +1,30 @@
+import "std/io";
+
+struct Pt { x: int64; y: int64; }
+
+fn step(s: Pt) -> Pt { var p: Pt; p.x = s.y; p.y = s.x + s.y; return p; }
+
+fn twice_per_round(v: Pt) -> int64 {
+  var a: Pt = v;
+  for i in 0..3 {
+    a = step(a);
+    a = step(a);
+  }
+  return a.x * 1000 + a.y;
+}
+
+fn main() -> int32 {
+  var a: Pt;
+  a.x = 2;
+  a.y = -6;
+  for i in 0..1 { a = step(a); a = step(a); }
+  var b: Pt;
+  b.x = 2;
+  b.y = -6;
+  for i in 0..2 { b = step(b); }
+  var u: int64 = 1;
+  var w: int64 = 1;
+  for i in 0..10 { var t: int64 = u + w; u = w; w = t; }
+  println("{a.x} {a.y} {b.x} {b.y} {u} {w} {twice_per_round(a)}");
+  return 0;
+}
