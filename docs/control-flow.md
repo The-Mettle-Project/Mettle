@@ -124,7 +124,8 @@ fn abs(x: int32) -> int32 {
 ```
 
 This compiles to the same code as writing `return` in each arm. `return` still
-works everywhere, and the two mix freely.
+works everywhere, and the two mix freely. A function with a result that can
+reach its closing brace without either one is an error.
 
 `main` has one exception. A last call in `main` leaves the exit status alone,
 because programs have always ended that way. If the call returns a value that
