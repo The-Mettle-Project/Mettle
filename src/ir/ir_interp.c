@@ -530,7 +530,15 @@ static unsigned long long ii_add_buffer_ex(IRInterpMachine *machine,
     return 0;
   }
   size_t index;
-  if (allow_reuse && machine->free_slot_count > 0) {
+  if (!machine->free_slot_count && machine->buffer_count >= II_MAX_BUFFERS) {
+    for (size_t i = 0; i < machine->buffer_count; i++) {
+      if (machine->buffers[i].freed && machine->buffers[i].data) {
+        ii_reclaim_buffer(machine, i);
+      }
+    }
+  }
+  if ((allow_reuse || machine->buffer_count >= II_MAX_BUFFERS) &&
+      machine->free_slot_count > 0) {
     index = machine->free_slots[--machine->free_slot_count];
   } else {
     if (machine->buffer_count >= II_MAX_BUFFERS) {
@@ -635,7 +643,7 @@ static int ii_string_literal(IRInterpMachine *machine, const char *text,
     ii_fail(machine, IR_INTERP_TRAP, "string literal storage");
     return 0;
   }
-  IIBuffer *buf = &machine->buffers[machine->buffer_count - 1];
+  IIBuffer *buf = &machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE];
   memcpy(buf->data, text, length);
   unsigned long long chars = addr;
   unsigned long long chars_length = (unsigned long long)length;
@@ -672,7 +680,7 @@ static unsigned long long ii_make_string(IRInterpMachine *machine,
   if (!addr) {
     return 0;
   }
-  IIBuffer *buf = &machine->buffers[machine->buffer_count - 1];
+  IIBuffer *buf = &machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE];
   if (bytes && length > 0) {
     memcpy(buf->data, bytes, length);
   }
@@ -5751,12 +5759,10 @@ static int ii_op_new(IRInterpMachine *machine, IIFrame *frame,
     ii_fail(machine, IR_INTERP_TRAP, "new allocation");
     return 0;
   }
-  machine->buffers[machine->buffer_count - 1].alloc_line =
-      insn->location.line;
-  machine->buffers[machine->buffer_count - 1].alloc_column =
-      insn->location.column;
-  machine->buffers[machine->buffer_count - 1].alloc_file =
-      insn->location.filename;
+  IIBuffer *made = &machine->buffers[(addr - II_ADDR_BASE) / II_ADDR_STRIDE];
+  made->alloc_line = insn->location.line;
+  made->alloc_column = insn->location.column;
+  made->alloc_file = insn->location.filename;
   IRInterpValue value = ii_int_value((long long)addr);
   if (!ii_store_dest(machine, frame, &insn->dest, &value)) {
     return 0;

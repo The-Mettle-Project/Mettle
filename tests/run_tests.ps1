@@ -21702,6 +21702,7 @@ $issueRegressions = @(
   @{ Name = "safe_release_parallel_runs_on_one_thread"; Entry = "tests/test_parallel_loop.mettle"; Args = @("--safe", "--release"); Expect = @() },
   @{ Name = "safe_neighbour_region_keeps_slot_identity"; Entry = "tests/issues/safe_neighbour_region_keeps_slot_identity.mettle"; Args = @("--safe"); Expect = @("ok") },
   @{ Name = "jump_ends_at_closing_brace"; Entry = "tests/issues/jump_ends_at_brace.mettle"; Args = @(); Expect = @("8 2 4") },
+  @{ Name = "interp_recycles_freed_buffers"; Command = @("test", "tests/issues/interp_recycles_freed_buffers.mettle"); Expect = @("2 passed") },
   @{ Name = "test_fn_called_from_main"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @(); Expect = @("0 0") },
   @{ Name = "test_fn_called_from_main_release"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @("--release"); Expect = @("0 0") },
   @{ Name = "test_fn_assert_fails_natively"; Entry = "tests/issues/test_fn_assert_fails_natively.mettle"; Args = @("--release"); Expect = @("before", "Fatal error: assert_eq failed in test 'wrong_sum' at line 4") },
