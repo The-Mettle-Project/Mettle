@@ -21706,6 +21706,8 @@ $issueRegressions = @(
   @{ Name = "string_local_reassigned_is_freed_release"; Entry = "tests/issues/string_local_reassigned_is_freed.mettle"; Args = @("--release"); Expect = @("4496 allocations, 4496 frees", "3386 3780") },
   @{ Name = "string_returned_fresh_is_freed"; Entry = "tests/issues/string_returned_fresh_is_freed.mettle"; Args = @(); Expect = @("3603 allocations, 3601 frees", "5260 x7 x7") },
   @{ Name = "string_returned_fresh_is_freed_safe_release"; Entry = "tests/issues/string_returned_fresh_is_freed.mettle"; Args = @("--safe", "--release"); Expect = @("3603 allocations, 3601 frees", "5260 x7 x7") },
+  @{ Name = "trait_method_chain_generic"; Entry = "tests/issues/trait_method_chain_generic.mettle"; Args = @(); Expect = @("12 40 17") },
+  @{ Name = "trait_method_chain_generic_release"; Entry = "tests/issues/trait_method_chain_generic.mettle"; Args = @("--release"); Expect = @("12 40 17") },
   @{ Name = "interp_recycles_freed_buffers"; Command = @("test", "tests/issues/interp_recycles_freed_buffers.mettle"); Expect = @("2 passed") },
   @{ Name = "test_fn_called_from_main"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @(); Expect = @("0 0") },
   @{ Name = "test_fn_called_from_main_release"; Entry = "tests/issues/test_fn_called_from_main.mettle"; Args = @("--release"); Expect = @("0 0") },

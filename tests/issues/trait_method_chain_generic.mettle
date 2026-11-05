@@ -1,0 +1,22 @@
+import "std/io";
+
+trait D { fn d(self: Self) -> Self; }
+impl D for int32 { fn d(self: Self) -> Self { return self * 2; } }
+
+trait Shift { fn up(self: Self, by: int64) -> Self; fn get(self: Self) -> int64; }
+struct Cell { v: int64; }
+impl Shift for Cell {
+  fn up(self: Self, by: int64) -> Self { var c: Cell; c.v = self.v + by; return c; }
+  fn get(self: Self) -> int64 { return self.v; }
+}
+
+fn q<T: D>(v: T) -> T { return v.d().d(); }
+fn three<T: D>(v: T) -> T { return v.d().d().d(); }
+fn walk<T: Shift>(v: T) -> int64 { return v.up(3).up(4).get(); }
+
+fn main() -> int32 {
+  var c: Cell;
+  c.v = 10;
+  println("{q(3)} {three(5)} {walk(c)}");
+  return 0;
+}

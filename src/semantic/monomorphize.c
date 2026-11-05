@@ -2222,10 +2222,51 @@ static TraitImpl *mono_find_impl_for_method(MonoContext *ctx,
   return found;
 }
 
+static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
+                                           MonoVarEnv *env, int depth) {
+  CallExpression *call = NULL;
+  const char *self_type = NULL;
+  TraitImpl *impl = NULL;
+  ASTNode *method = NULL;
+  FunctionDeclaration *decl = NULL;
+  int ambiguous = 0;
+
+  if (!node || depth > 64) {
+    return NULL;
+  }
+  if (node->type == AST_IDENTIFIER) {
+    Identifier *identifier = (Identifier *)node->data;
+    return identifier && identifier->name ? mono_env_lookup(env, identifier->name)
+                                          : NULL;
+  }
+  if (node->type != AST_FUNCTION_CALL) {
+    return NULL;
+  }
+  call = (CallExpression *)node->data;
+  if (!call || call->object || !call->written_name || !call->function_name ||
+      strncmp(call->function_name, "__trait_", 8) != 0 ||
+      call->argument_count == 0) {
+    return NULL;
+  }
+  self_type = mono_receiver_type_name(ctx, call->arguments[0], env, depth + 1);
+  impl = mono_find_impl_for_method(ctx, self_type, call->written_name,
+                                   &ambiguous);
+  method = impl ? mono_find_function_method(impl->methods, impl->method_count,
+                                            call->written_name)
+                : NULL;
+  decl = method ? (FunctionDeclaration *)method->data : NULL;
+  if (!decl || !decl->return_type) {
+    return NULL;
+  }
+  if (strcmp(decl->return_type, "Self") == 0) {
+    return impl->for_type_name;
+  }
+  return decl->return_type;
+}
+
 static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
                                           MonoVarEnv *env) {
   CallExpression *call = NULL;
-  Identifier *object_id = NULL;
   const char *object_type = NULL;
   TraitImpl *impl = NULL;
   char *mangled = NULL;
@@ -2238,17 +2279,11 @@ static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
   }
 
   call = (CallExpression *)node->data;
-  if (!call || !call->object || call->object->type != AST_IDENTIFIER ||
-      !call->function_name) {
+  if (!call || !call->object || !call->function_name) {
     return 1;
   }
 
-  object_id = (Identifier *)call->object->data;
-  if (!object_id || !object_id->name) {
-    return 1;
-  }
-
-  object_type = mono_env_lookup(env, object_id->name);
+  object_type = mono_receiver_type_name(ctx, call->object, env, 0);
   if (!object_type) {
     return 1;
   }
@@ -2258,8 +2293,8 @@ static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
   if (ambiguous) {
     char message[512];
     snprintf(message, sizeof(message),
-             "Trait method call '%s.%s' is ambiguous for type '%s'",
-             object_id->name, call->function_name, object_type);
+             "Trait method call '.%s' is ambiguous for type '%s'",
+             call->function_name, object_type);
     mono_report_error(ctx, node->location, message);
     return 0;
   }
@@ -2269,11 +2304,12 @@ static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
 
   mangled = mono_mangle_impl_method_name(impl->trait_name, impl->for_type_name,
                                          call->function_name);
-  self_arg = ast_clone_node(call->object);
+  self_arg = call->object->type == AST_IDENTIFIER ? ast_clone_node(call->object)
+                                                  : call->object;
   new_args = malloc((call->argument_count + 1) * sizeof(ASTNode *));
   if (!mangled || !self_arg || !new_args) {
     free(mangled);
-    if (self_arg) {
+    if (self_arg && self_arg != call->object) {
       ast_destroy_node(self_arg);
     }
     free(new_args);
@@ -2289,7 +2325,9 @@ static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
   free(call->arguments);
   call->arguments = new_args;
   call->argument_count++;
-  ast_add_child(node, self_arg);
+  if (self_arg != call->object) {
+    ast_add_child(node, self_arg);
+  }
 
   if (!call->written_name) {
     call->written_name = strdup(call->function_name);
