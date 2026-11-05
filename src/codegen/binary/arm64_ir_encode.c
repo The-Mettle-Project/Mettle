@@ -3875,6 +3875,15 @@ static int arm64_object_emit_global(Arm64ObjectContext *object,
                                       size);
 }
 
+static void arm64_check_callees_have_bodies(Arm64Emit *code, const LblMap *functions) {
+  for (int i = 0; !code->error && i < functions->count; i++) {
+    if (!code->label_bound[functions->ids[i]]) {
+      arm64_fail(code, "a call targets '%s', which this object has no body for",
+                 functions->names[i]);
+    }
+  }
+}
+
 int arm64_ir_write_object(const IRProgram *prog, const char *path, char *error,
                           size_t error_capacity) {
   BinaryEmitter *emitter = NULL;
@@ -3989,12 +3998,7 @@ int arm64_ir_write_object(const IRProgram *prog, const char *path, char *error,
       break;
     }
   }
-  for (int i = 0; !code.error && i < functions.count; i++) {
-    if (!code.label_bound[functions.ids[i]]) {
-      arm64_fail(&code, "a call targets '%s', which this object has no body for",
-                 functions.names[i]);
-    }
-  }
+  arm64_check_callees_have_bodies(&code, &functions);
   if (code.error || !arm64_emit_finalize(&code)) {
     arm64_object_error(error, error_capacity,
                        code.reason[0] ? code.reason

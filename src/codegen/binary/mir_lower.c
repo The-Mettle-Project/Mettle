@@ -8316,6 +8316,20 @@ static void mir_compute_address_folds(const IRFunction *f,
   mir_compute_address_fold_at(f, folds, skip, uses);
 }
 
+static int mir_emit_folded_store(MirFunction *fn, MirOperand mem, MirOperand val,
+                                 int size) {
+  if (size == 1 || size == 2 || size == 4 || size == 8) {
+    return mir_emit1(fn, MIR_MOV, mem, val, mir_op_none(), size, 0, 0);
+  }
+  MirVregId dst_base = mir_new_vreg(fn, MIR_RC_GP, 8);
+  if (dst_base == MIR_VREG_NONE || val.kind != MIR_OPK_VREG ||
+      !mir_emit1(fn, MIR_LEA, mir_op_vreg(dst_base), mem, mir_op_none(), 8, 0, 0)) {
+    fn->has_error = 1;
+    return 0;
+  }
+  return mir_emit_struct_copy(fn, dst_base, val.vreg, size);
+}
+
 static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
                                    BinaryFunctionContext *ctx, MirNameMap *map,
                                    const IRInstruction *in,
@@ -8418,17 +8432,7 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
                        0);
     }
   }
-  MirOperand val = mir_value_operand(fn, g, ctx, map, &in->lhs);
-  if (size != 1 && size != 2 && size != 4 && size != 8) {
-    MirVregId dst_base = mir_new_vreg(fn, MIR_RC_GP, 8);
-    if (dst_base == MIR_VREG_NONE || val.kind != MIR_OPK_VREG ||
-        !mir_emit1(fn, MIR_LEA, mir_op_vreg(dst_base), mem, mir_op_none(), 8, 0, 0)) {
-      fn->has_error = 1;
-      return 0;
-    }
-    return mir_emit_struct_copy(fn, dst_base, val.vreg, size);
-  }
-  return mir_emit1(fn, MIR_MOV, mem, val, mir_op_none(), size, 0, 0);
+  return mir_emit_folded_store(fn, mem, mir_value_operand(fn, g, ctx, map, &in->lhs), size);
 }
 
 static int mir_op_low32_is_self_contained(MirOpcode op) {
