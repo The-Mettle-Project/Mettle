@@ -1,0 +1,45 @@
+import "std/io";
+import "std/mem";
+struct N { a: int32; b: int32; next: N*; label: string; tag: uint8; }
+struct Item { id: int32; cls: uint8; end: int64; }
+struct Buf { data: Item*; len: int64; }
+struct D { n: N*; m: N*; tab: int32*; lslot: uint8*; slen: uint8*; name: string; v: int64[4]; buf: Buf*; }
+var g_acc: int64 = 0;
+@noinline fn note(x: int64) { g_acc = g_acc * 31 + x; }
+fn pick_label(n: N*, flag: bool) -> string { if (flag) { return n->label; } return "none"; }
+fn get_item(d: D*, i: int64, out: Item*) { *out = d->buf->data[i & 7]; }
+fn str_sum(s: string) -> int64 { var t: int64 = 0; for i in 0..s.length { t = t * 7 + (int64)s[i]; } return t; }
+
+fn f0(d: D*, flag: bool, p0: int32) -> int32 {
+  var np1: N* = d->n;
+  var x2: int32 = np1->a + np1->b;
+  if ((d->n->a) != (d->n->a)) {
+    switch (((p0) & 7)) {
+      case 6: {
+        var x3: int32 = (int32)d->lslot[(x2) & 15];
+        var x3l: int32 = (int32)d->slen[x3];
+        var it4: Item;
+        get_item(d, (int64)(x3l), &it4);
+      }
+      case 5: {
+        note(str_sum(pick_label(d->n->next, (((d->n->b) * (((p0) | (x2))))) >= ((int32)d->lslot[(x2) & 15]))));
+        var it7: Item;
+        get_item(d, (int64)(x2), &it7);
+      }
+    }
+    if ((p0) >= (d->n->next->b)) {
+      note(str_sum(pick_label(d->n->next, !flag)));
+    }
+  }
+  return (int32)d->lslot[(p0) & 15];
+}
+
+fn main() -> int32 {
+  var n1: N; var n2: N; var n3: N;
+  var d: D;
+  d.n = &n1;
+  d.lslot = (uint8*)calloc(16, 1);
+  var t: int64 = 0;
+  t = t * 33 + (int64)f0(&d, false, 7);
+  println("{t}");
+}

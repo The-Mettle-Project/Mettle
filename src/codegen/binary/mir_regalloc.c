@@ -2106,6 +2106,22 @@ static void mir_color_build_interference(MirColorState *st) {
   mir_color_add_interval_edges(st);
 }
 
+static void mir_color_add_parameter_edges(MirColorState *st) {
+  const MirFunction *fn = st->fn;
+  for (size_t a = 0; a < fn->param_count; a++) {
+    MirVregId pa = fn->params[a].vreg;
+    if ((size_t)pa >= st->count || !st->colorable[pa]) {
+      continue;
+    }
+    for (size_t b = a + 1; b < fn->param_count; b++) {
+      MirVregId pb = fn->params[b].vreg;
+      if ((size_t)pb < st->count && st->colorable[pb] && pa != pb) {
+        mir_inter_add(st, (size_t)pa, (size_t)pb);
+      }
+    }
+  }
+}
+
 static void mir_color_add_narrowing_edges(MirColorState *st) {
   if (!st->narrow_src) {
     return;
@@ -2637,6 +2653,7 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
   }
   mir_color_build_interference(&st);
   mir_color_add_narrowing_edges(&st);
+  mir_color_add_parameter_edges(&st);
   for (size_t v = 0; v < st.count; v++) {
     st.rep[v] = (MirVregId)v;
   }

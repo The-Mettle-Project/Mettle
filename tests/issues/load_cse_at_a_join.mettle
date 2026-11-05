@@ -1,0 +1,38 @@
+import "std/io";
+struct N { a: int32; b: int32; next: N*; label: string; tag: uint8; }
+struct Item { id: int32; cls: uint8; end: int64; }
+struct Buf { data: Item*; len: int64; }
+struct D { n: N*; m: N*; tab: int32*; lslot: uint8*; slen: uint8*; name: string; v: int64[4]; buf: Buf*; }
+var g_acc: int64 = 0;
+@noinline fn note(x: int64) { g_acc = g_acc * 31 + x; }
+fn get_item(d: D*, i: int64, out: Item*) { *out = d->buf->data[i & 7]; }
+
+@noinline fn f0(d: D*, flag: bool, p0: int32) -> int32 {
+  var x1: int32 = ((p0) * (p0));
+  if (!flag) {
+    var np2: N* = d->n;
+    if (!flag) { np2 = np2->next; }
+    var x3: int32 = np2->a + np2->b;
+    switch (((d->n->a) & 7)) {
+      case 3: {
+        var it4: Item;
+        var x5: int32 = x3;
+        if (flag) { get_item(d, (int64)(x1), &it4); x5 = (int32)it4.cls; }
+      }
+      default: {
+        note((int64)(d->n->b));
+      }
+    }
+  }
+  return d->n->a;
+}
+
+fn main() -> int32 {
+  var n1: N; var n2: N; var n3: N;
+  n1.a = 7; n1.b = 9; n1.next = &n2; n1.label = "one"; n1.tag = (uint8)1;
+  var d: D;
+  d.n = &n1;
+  var t: int64 = 0;
+  t = t * 33 + (int64)f0(&d, false, 8);
+  println("{t} {g_acc}");
+}

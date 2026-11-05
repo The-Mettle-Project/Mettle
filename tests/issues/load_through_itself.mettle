@@ -1,0 +1,26 @@
+import "std/io";
+struct L { v: int32; next: L*; }
+@noinline fn two_ahead(p: L*) -> int32 {
+  var a: L* = p;
+  a = a->next;
+  var b: L* = a->next;
+  return a->v * 10 + b->v;
+}
+@noinline fn walk(p: L*, n: int32) -> int32 {
+  var q: L* = p;
+  var t: int32 = 0;
+  for i in 0..n {
+    q = q->next;
+    var r: L* = q->next;
+    t = t * 10 + r->v;
+  }
+  return t;
+}
+fn main() -> int32 {
+  var c: L; var b: L; var a: L;
+  a.v = 1; a.next = &b;
+  b.v = 2; b.next = &c;
+  c.v = 3; c.next = &a;
+  println("{two_ahead(&a)} {walk(&a, 4)}");
+  return 0;
+}

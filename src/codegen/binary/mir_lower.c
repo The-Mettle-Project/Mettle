@@ -9972,7 +9972,10 @@ static size_t mir_load_table_intersect(MirAvailableLoad *dst, size_t dst_n,
   size_t n = 0;
   for (size_t a = 0; a < dst_n; a++) {
     for (size_t b = 0; b < keep_n; b++) {
-      if (dst[a].dst == keep[b].dst) {
+      if (dst[a].dst == keep[b].dst && dst[a].width == keep[b].width &&
+          dst[a].is_unsigned == keep[b].is_unsigned &&
+          dst[a].is_float == keep[b].is_float &&
+          mir_mem_same(&dst[a].mem, &keep[b].mem)) {
         dst[n++] = dst[a];
         break;
       }
@@ -10174,7 +10177,8 @@ static size_t mir_cse_drop_entries_using(MirVregId written,
 
 static size_t mir_cse_record_load(const MirInst *in, size_t at,
                                   MirAvailableLoad *table, size_t table_n) {
-  if (table_n >= MIR_LOAD_TABLE_MAX) {
+  if (table_n >= MIR_LOAD_TABLE_MAX || in->a.mem.base == in->dst.vreg ||
+      in->a.mem.index == in->dst.vreg) {
     return table_n;
   }
   table[table_n].def = (int)at;

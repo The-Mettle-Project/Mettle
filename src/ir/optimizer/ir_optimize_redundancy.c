@@ -4576,6 +4576,44 @@ static int fwd_rewrite_load(FwdCtx *ctx, IRInstruction *ins, long long size,
   return 1;
 }
 
+static int fwd_operand_names(const IROperand *op, IROperandKind kind,
+                             const char *name) {
+  return op->kind == kind && op->name && name && strcmp(op->name, name) == 0;
+}
+
+static int fwd_address_is_current(const IRBasicBlock *block, size_t at,
+                                  const IROperand *pointer, const REAddr *addr) {
+  IROperand current = *pointer;
+  if (!addr->valid || addr->portable || addr->is_address_of || !addr->name) {
+    return 1;
+  }
+  if (fwd_operand_names(&current, addr->kind, addr->name)) {
+    return 1;
+  }
+  for (size_t j = at; j-- > 0;) {
+    const IRInstruction *in = &block->instructions[j];
+    if (in->op == IR_OP_NOP || !ir_instruction_writes_destination(in)) {
+      continue;
+    }
+    if (fwd_operand_names(&in->dest, addr->kind, addr->name) &&
+        !fwd_operand_names(&current, addr->kind, addr->name)) {
+      return 0;
+    }
+    if (fwd_operand_names(&in->dest, current.kind, current.name)) {
+      if ((in->op != IR_OP_ASSIGN && in->op != IR_OP_BINARY) ||
+          (in->lhs.kind != IR_OPERAND_TEMP &&
+           in->lhs.kind != IR_OPERAND_SYMBOL)) {
+        return 0;
+      }
+      current = in->lhs;
+      if (fwd_operand_names(&current, addr->kind, addr->name)) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 static int fwd_transfer(FwdCtx *ctx, const IRBasicBlock *block, FwdSet *set,
                         int rewrite) {
   for (size_t i = 0; i < block->instruction_count; i++) {
@@ -4589,9 +4627,15 @@ static int fwd_transfer(FwdCtx *ctx, const IRBasicBlock *block, FwdSet *set,
     }
 
     if (ins->op == IR_OP_STORE) {
+      REAddr written;
+      memset(&written, 0, sizeof(written));
       re_instruction_write_region(ctx->function, ctx->defs, ctx->addr_taken,
                                   ins, wbase, sizeof(wbase), &woff, &wsize,
                                   &wtype);
+      re_resolve_addr(ctx->function, ctx->defs, &ins->dest, &written, 0);
+      if (!fwd_address_is_current(block, i, &ins->dest, &written)) {
+        wbase[0] = '\0';
+      }
       fwd_kill_region(set, ctx->function, wbase[0] ? wbase : NULL, woff, wsize,
                       wtype);
       if (!ins->is_volatile && !ins->is_float && wbase[0] &&
@@ -4624,7 +4668,9 @@ static int fwd_transfer(FwdCtx *ctx, const IRBasicBlock *block, FwdSet *set,
           (ins->dest.kind == IR_OPERAND_TEMP ||
            ins->dest.kind == IR_OPERAND_SYMBOL)) {
         re_resolve_addr(ctx->function, ctx->defs, &ins->lhs, &addr, 0);
-        have = addr.valid && addr.name && fwd_addr_base(&addr, base, sizeof(base));
+        have = addr.valid && addr.name &&
+               fwd_address_is_current(block, i, &ins->lhs, &addr) &&
+               fwd_addr_base(&addr, base, sizeof(base));
       }
       if (have) {
         const FwdFact *fact = fwd_set_find(set, base, addr.offset, size);
@@ -4645,7 +4691,8 @@ static int fwd_transfer(FwdCtx *ctx, const IRBasicBlock *block, FwdSet *set,
                         wsize, wtype);
       }
       fwd_kill_name(set, ins->dest.kind, ins->dest.name);
-      if (have && !hit && fwd_value_is_trackable(ctx, &ins->dest)) {
+      if (have && !hit && fwd_value_is_trackable(ctx, &ins->dest) &&
+          !fwd_operand_names(&ins->dest, addr.kind, addr.name)) {
         FwdFact fact;
         memset(&fact, 0, sizeof(fact));
         fact.base = base;
