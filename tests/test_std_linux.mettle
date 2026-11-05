@@ -1,0 +1,144 @@
+// std/linux: the named system call wrappers, each checked for its result and
+// its -errno. Linux only.
+import "std/linux"
+import "std/thread"
+import "std/process"
+
+var g_word: int32 = 0;
+
+fn waker(arg: cstring) -> uint32 {
+  thread_sleep_ms((uint32)20);
+  g_word = 1;
+  linux_futex_wake(&g_word, 1);
+  return (uint32)0;
+}
+
+fn spawn(f: fn(cstring) -> uint32) -> int64 {
+  var tid: uint32 = (uint32)0;
+  return CreateThread((cstring)0, (uint64)0, f, (cstring)0, (uint32)0, &tid);
+}
+
+// Copies s into buf with a nul on the end.
+fn cpath(s: string, buf: uint8*) -> uint8* {
+  for i in 0..s.length { buf[i] = (uint8)s[i]; }
+  buf[(int64)s.length] = (uint8)0;
+  return buf;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  // The child half of the exit_group check.
+  if (argc > 1) {
+    linux_exit_group(42);
+    return 1;
+  }
+
+  // Identity. On the main thread the thread id is the process id.
+  var pid: int64 = linux_getpid();
+  if (pid <= 0) { return 1; }
+  if (linux_gettid() != pid) { return 2; }
+  if (linux_kill(pid, 0) != 0) { return 3; }
+  if (linux_kill(2147483000, 0) != -3) { return 4; }       // ESRCH
+  if (linux_sched_yield() != 0) { return 5; }
+
+  // Files: write, seek, read back, errors.
+  var path: uint8[32];
+  cpath("/dev/zero", &path[0]);
+  var zero: int64 = linux_openat(LINUX_AT_FDCWD, &path[0], LINUX_O_RDONLY | LINUX_O_CLOEXEC, 0);
+  if (zero < 0) { return 6; }
+  var buf: uint8[16];
+  for i in 0..16 { buf[i] = (uint8)7; }
+  if (linux_read(zero, &buf[0], 16) != 16) { return 7; }
+  for i in 0..16 { if (buf[i] != (uint8)0) { return 8; } }
+  if (linux_write(zero, &buf[0], 4) != -9) { return 9; }   // EBADF: opened read-only
+  if (linux_lseek(zero, 5, 0) != 0) { return 10; }         // /dev/zero reports offset 0
+  if (linux_close(zero) != 0) { return 11; }
+  if (linux_close(zero) != -9) { return 12; }
+  if (linux_read(zero, &buf[0], 1) != -9) { return 13; }
+  var missing: uint8[32];
+  cpath("/no/such/file", &missing[0]);
+  if (linux_openat(LINUX_AT_FDCWD, &missing[0], LINUX_O_RDONLY, 0) != -2) { return 14; }   // ENOENT
+  var null_path: uint8[16];
+  cpath("/dev/null", &null_path[0]);
+  var null_fd: int64 = linux_openat(LINUX_AT_FDCWD, &null_path[0], LINUX_O_WRONLY, 0);
+  if (null_fd < 0) { return 15; }
+  if (linux_write(null_fd, &buf[0], 16) != 16) { return 16; }
+  linux_close(null_fd);
+
+  // Memory: an anonymous map is writable, then unmapped.
+  var m: int64 = linux_mmap(0, 8192, LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0);
+  if (m <= 0) { return 17; }
+  var mp: uint8* = (uint8*)m;
+  mp[0] = (uint8)9;
+  mp[8191] = (uint8)10;
+  if (mp[0] != (uint8)9 || mp[8191] != (uint8)10) { return 18; }
+  if (linux_munmap(m, 8192) != 0) { return 19; }
+  if (linux_munmap(m + 1, 4096) != -22) { return 20; }     // EINVAL: not page aligned
+  if (linux_mmap(0, 0, LINUX_PROT_READ, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, -1, 0) != -22) { return 21; }
+
+  // Randomness.
+  var ra: uint8[32];
+  var rb: uint8[32];
+  if (linux_getrandom(&ra[0], 32, 0) != 32) { return 22; }
+  if (linux_getrandom(&rb[0], 32, 0) != 32) { return 23; }
+  var same: int32 = 1;
+  for i in 0..32 { if (ra[i] != rb[i]) { same = 0; } }
+  if (same != 0) { return 24; }
+
+  // Clocks and sleeping.
+  var t0: int64[2];
+  var t1: int64[2];
+  if (linux_clock_gettime(LINUX_CLOCK_MONOTONIC, &t0[0]) != 0) { return 25; }
+  var nap: int64[2];
+  nap[0] = 0;
+  nap[1] = 20000000;
+  if (linux_nanosleep(&nap[0], (int64*)0) != 0) { return 26; }
+  if (linux_clock_gettime(LINUX_CLOCK_MONOTONIC, &t1[0]) != 0) { return 27; }
+  var ns: int64 = (t1[0] - t0[0]) * 1000000000 + (t1[1] - t0[1]);
+  if (ns < 20000000) { return 28; }
+  if (linux_clock_gettime(LINUX_CLOCK_REALTIME, &t1[0]) != 0 || t1[0] < 1600000000) { return 29; }
+  if (linux_clock_gettime(999, &t1[0]) != -22) { return 30; }
+
+  // ppoll: a readable descriptor, a bad one, and a timeout on an idle one.
+  var zfd: int64 = linux_openat(LINUX_AT_FDCWD, &path[0], LINUX_O_RDONLY, 0);
+  var pf: LinuxPollFd[2];
+  pf[0].fd = (int32)zfd;
+  pf[0].events = (int16)LINUX_POLLIN;
+  pf[1].fd = 9999;
+  pf[1].events = (int16)LINUX_POLLIN;
+  var none: int64[2];
+  if (linux_ppoll(&pf[0], 2, &none[0]) != 2) { return 31; }
+  if ((int32)pf[0].revents != LINUX_POLLIN) { return 32; }
+  if ((int32)pf[1].revents != LINUX_POLLNVAL) { return 33; }
+  linux_close(zfd);
+
+  // futex: a stale value, a timeout, a wake with nobody waiting.
+  g_word = 0;
+  if (linux_futex_wait(&g_word, 1, (int64*)0) != -LINUX_EAGAIN) { return 34; }
+  var short: int64[2];
+  short[0] = 0;
+  short[1] = 5000000;
+  if (linux_futex_wait(&g_word, 0, &short[0]) != -LINUX_ETIMEDOUT) { return 35; }
+  if (linux_futex_wake(&g_word, 1) != 0) { return 36; }
+
+  // futex across threads: the other thread flips the word and wakes us.
+  g_word = 0;
+  var th: int64 = spawn(waker);
+  if (th == 0) { return 37; }
+  while (g_word == 0) {
+    var r: int64 = linux_futex_wait(&g_word, 0, (int64*)0);
+    if (r != 0 && r != -LINUX_EAGAIN && r != -LINUX_EINTR) { return 38; }
+  }
+  thread_join_infinite(th);
+
+  // exit_group ends a child with its code.
+  var args: string[2] = ["/proc/self/exe", "child"];
+  var o: ProcOptions;
+  proc_options_init(&o, args);
+  var p: Proc;
+  if (proc_spawn(&o, &p) != 0) { return 39; }
+  var st: ProcStatus;
+  if (proc_wait(&p, &st) != 0) { return 40; }
+  if (st.signaled != 0 || st.code != 42) { return 41; }
+  proc_close(&p);
+  return 0;
+}

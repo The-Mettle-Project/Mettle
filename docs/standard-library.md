@@ -420,6 +420,40 @@ Pages from the operating system, under the heap. Both platforms, with a
 On Linux these make raw system calls, so they also work in a self-contained
 ELF (`--emit-arm64`), which links no libc.
 
+## std/linux
+
+Named wrappers for common Linux system calls, so a program does not hard-code
+numbers. Linux only, on x86-64 and AArch64: `std/linux_sys` picks the call
+numbers for the target CPU. The wrappers use the `syscall` builtin, which the
+released compiler does not have yet.
+
+Each wrapper returns the kernel's raw result: a count or value, or `-errno`.
+
+| Function | Call |
+|----------|------|
+| `linux_read(fd, buf: uint8*, n) -> int64` | `read` |
+| `linux_write(fd, buf: uint8*, n) -> int64` | `write` |
+| `linux_close(fd) -> int64` | `close` |
+| `linux_openat(dirfd, path: uint8*, flags, mode) -> int64` | `openat`; `path` ends in a nul |
+| `linux_lseek(fd, offset, whence) -> int64` | `lseek` |
+| `linux_getpid()`, `linux_gettid() -> int64` | `getpid`, `gettid` |
+| `linux_kill(pid, sig) -> int64` | `kill` |
+| `linux_sched_yield() -> int64` | `sched_yield` |
+| `linux_futex_wait(word: int32*, expected: int32, timeout: int64*) -> int64` | `futex` wait, process-private; `timeout` is `{sec, nsec}` or `(int64*)0` |
+| `linux_futex_wake(word: int32*, count: int32) -> int64` | `futex` wake; returns how many woke |
+| `linux_getrandom(buf: uint8*, n, flags) -> int64` | `getrandom` |
+| `linux_clock_gettime(clock, out: int64*) -> int64` | `out` is `{sec, nsec}` |
+| `linux_nanosleep(req: int64*, rem: int64*) -> int64` | `nanosleep` |
+| `linux_mmap(addr, length, prot, flags, fd, offset) -> int64` | The address, or `-errno` |
+| `linux_munmap(addr, length) -> int64` | `munmap` |
+| `linux_ppoll(fds: LinuxPollFd*, nfds, timeout: int64*) -> int64` | `ppoll` with no signal mask |
+| `linux_exit_group(code)` | Ends every thread; does not return |
+
+`LinuxPollFd` has `fd: int32`, `events: int16` and `revents: int16`. The
+module also exports the flags these calls take: `LINUX_AT_FDCWD`,
+`LINUX_O_*`, `LINUX_PROT_*`, `LINUX_MAP_*`, `LINUX_CLOCK_*`, `LINUX_POLL*` and
+a few errno values (`LINUX_EAGAIN`, `LINUX_EINTR`, `LINUX_ETIMEDOUT`).
+
 ## std/thread
 
 Threads, mutexes, and atomics. Both platforms, with a `.linux` half and a
