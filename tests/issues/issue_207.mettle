@@ -1,0 +1,16 @@
+import "std/mem";
+struct Box { v: int32; }
+var g_slot: int64;
+fn keep() {
+  var b: Box* = new Box;
+  b->v = 5;
+  asm {
+    mov rax, {b}
+    mov {g_slot}, rax
+  }
+}
+fn drop() {
+  var b: Box* = (Box*)g_slot;
+  free(b);
+}
+export fn main() -> int32 { keep(); drop(); return 0; }

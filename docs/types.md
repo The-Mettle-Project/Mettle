@@ -108,7 +108,9 @@ contributes its value, sign-extended or zero-extended by its own type, and the
 `+ - * <<` arithmetic between them runs at `int64`, so `a[pos + i]` reaches the
 element the sum names and never a wrapped one. A narrow variable used as an
 index still carries whatever wrapped value it holds, and a call inside an index
-still wraps its own arguments and result at their declared types. Ordinary
+still wraps its own arguments and result at their declared types. The operands
+of any other operator, and the operand of a cast, evaluate at their own types,
+so `a[(c << 4) >> k]` with `c: uint32` drops the bits a `uint32` drops. Ordinary
 arithmetic outside brackets is unchanged.
 
 Building with `--assume-no-signed-overflow` tells the compiler that signed

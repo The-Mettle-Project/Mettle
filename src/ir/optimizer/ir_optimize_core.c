@@ -963,6 +963,33 @@ static int ir_addr_taken_seed_module_globals(IRTempValueMap *set,
   return 1;
 }
 
+static int ir_addr_taken_add_asm_bindings(IRTempValueMap *set, const char *text,
+                                          const IROperand *one) {
+  char name[128];
+  const char *at = text ? strchr(text, '{') : NULL;
+  while (at) {
+    const char *cursor = at + 1;
+    size_t length = 0;
+    while (*cursor == ' ' || *cursor == '\t') {
+      cursor++;
+    }
+    while ((isalnum((unsigned char)*cursor) || *cursor == '_') &&
+           length + 1 < sizeof(name)) {
+      name[length++] = *cursor++;
+    }
+    name[length] = '\0';
+    while (*cursor == ' ' || *cursor == '\t') {
+      cursor++;
+    }
+    if (length > 0 && *cursor == '}' &&
+        !ir_temp_value_map_set(set, name, one)) {
+      return 0;
+    }
+    at = strchr(at + 1, '{');
+  }
+  return 1;
+}
+
 int ir_addr_taken_set_build(const IRFunction *function, IRTempValueMap *set) {
   static const IROperand one = {.kind = IR_OPERAND_INT, .int_value = 1};
   if (!function || !set) {
@@ -978,6 +1005,10 @@ int ir_addr_taken_set_build(const IRFunction *function, IRTempValueMap *set) {
       if (!ir_temp_value_map_set(set, ins->lhs.name, &one)) {
         return 0;
       }
+    }
+    if (ins->op == IR_OP_INLINE_ASM &&
+        !ir_addr_taken_add_asm_bindings(set, ins->text, &one)) {
+      return 0;
     }
   }
   return 1;

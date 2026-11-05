@@ -199,7 +199,30 @@ typedef struct {
   int bits;
   int is_signed;
   int shaped;
+  int compare_unsigned;
 } TypeCheckerIntFold;
+
+static int type_checker_compare_unsigned(TypeCheckerCompare kind,
+                                         unsigned long long a,
+                                         unsigned long long b) {
+  switch (kind) {
+  case TC_CMP_LT: return a < b;
+  case TC_CMP_LE: return a <= b;
+  case TC_CMP_GT: return a > b;
+  case TC_CMP_GE: return a >= b;
+  default:
+    return type_checker_compare_ints(kind, (long long)a, (long long)b);
+  }
+}
+
+static int type_checker_operand_is_unsigned(TypeChecker *checker,
+                                            ASTNode *operand) {
+  int bits = 0;
+  int is_signed = 0;
+  Type *type = checker ? type_checker_infer_type(checker, operand) : NULL;
+  return type_checker_integer_type_shape(type, &bits, &is_signed) &&
+         !is_signed;
+}
 
 static void type_checker_store_shaped(const TypeCheckerIntFold *f,
                                       long long value,
@@ -325,7 +348,12 @@ static int type_checker_fold_int_binary(const char *op,
     return 0;
   }
   type_checker_constant_from_int(
-      out_value, type_checker_compare_ints(compare, f->left, f->right));
+      out_value,
+      f->compare_unsigned
+          ? type_checker_compare_unsigned(compare,
+                                          (unsigned long long)f->left,
+                                          (unsigned long long)f->right)
+          : type_checker_compare_ints(compare, f->left, f->right));
   return 1;
 }
 
@@ -384,6 +412,9 @@ static int type_checker_eval_binary(TypeChecker *checker, ASTNode *expression,
   result_type = checker ? type_checker_infer_type(checker, expression) : NULL;
   fold.shaped = type_checker_integer_type_shape(result_type, &fold.bits,
                                                 &fold.is_signed);
+  fold.compare_unsigned =
+      type_checker_operand_is_unsigned(checker, binary_expr->left) ||
+      type_checker_operand_is_unsigned(checker, binary_expr->right);
   return type_checker_fold_int_binary(binary_expr->operator, &fold, out_value);
 }
 

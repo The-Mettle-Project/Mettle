@@ -1,0 +1,6 @@
+struct Box { v: int32; }
+fn keep() {
+  var b: Box* = new Box;
+  asm { mov rax, {b} }
+}
+export fn main() -> int32 { keep(); return 0; }

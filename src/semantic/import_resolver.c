@@ -2318,13 +2318,20 @@ static int declaration_private_copy_present(ASTNode *const *declarations,
                                             size_t count, ASTNode *decl) {
   const char *name = get_declaration_name(decl);
   int present = 0;
-  if (!name || strncmp(name, "__import_", 9) != 0) {
+  int is_private = name && strncmp(name, "__import_", 9) == 0;
+  if (!name) {
     return 0;
   }
   for (size_t i = 0; i < count; i++) {
     const char *other = get_declaration_name(declarations[i]);
+    const char *file = declarations[i]->location.filename;
     if (declarations[i]->type == decl->type && other &&
-        strcmp(other, name) == 0) {
+        strcmp(other, name) == 0 &&
+        (is_private ||
+         (file && decl->location.filename &&
+          strcmp(file, decl->location.filename) == 0 &&
+          declarations[i]->location.line == decl->location.line &&
+          declarations[i]->location.column == decl->location.column))) {
       present = 1;
       if (!decl->check_only) {
         declarations[i]->check_only = 0;

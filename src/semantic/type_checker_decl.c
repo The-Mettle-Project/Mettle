@@ -320,6 +320,8 @@ int type_checker_process_struct_declaration(TypeChecker *checker,
       char error_msg[512];
       snprintf(error_msg, sizeof(error_msg),
                "Unknown type '%s' in struct field", decl->field_types[i]);
+      type_checker_explain_bad_array(checker, decl->field_types[i], error_msg,
+                                     sizeof(error_msg));
       type_checker_set_error_at_location(checker, struct_decl->location,
                                          error_msg);
       free(field_types);

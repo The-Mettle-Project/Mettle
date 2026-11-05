@@ -1,0 +1,83 @@
+import "std/io";
+import "std/mem";
+
+fn pass_str(s: string) -> string { return s; }
+fn pass_alias(s: string) -> string { var t: string = s; return t; }
+fn sometimes(s: string, k: int32) -> string { if (k > 0) { return s; } return "lit"; }
+fn length_of(s: string) -> int64 { return (int64)s.length; }
+fn keep(s: string) -> string { g_kept = s; return s; }
+var g_kept: string = "";
+struct Box { s: string; }
+
+fn returned(i: int32) -> string { var r: string = "ret{i}"; return r; }
+fn tail(i: int32) -> string { var r: string = "tail{i}"; if (i > 100) { return "big"; } return r; }
+fn into_field(i: int32, b: Box*) { var r: string = "field{i}"; b->s = r; }
+fn into_global(i: int32) { var r: string = "global{i}"; g_kept = r; }
+fn alias_view(i: int32) -> string { var r: string = "alias{i}"; var q: string = r; return q; }
+fn through_chars(i: int32) -> uint8* { var r: string = "chars{i}"; return r.chars; }
+fn via_closure(i: int32) -> Fn() -> string {
+  var r: string = "clo{i}";
+  return fn() -> string { return r; };
+}
+fn nested_scope(i: int32) -> string {
+  var out: string = "";
+  for j in 0..2 {
+    var r: string = "n{i}{j}";
+    if (j == 1) { out = r; }
+  }
+  return out;
+}
+fn sized(i: int32) -> int64 {
+  var r: string = "abc{i}";
+  var t: int64 = (int64)r.length;
+  t = t + length_of(r);
+  if (r == "abc7") { t = t + 100; }
+  if (r[0] == 'a') { t = t + 1000; }
+  var joined: string = r + "x";
+  t = t + (int64)joined.length;
+  println("{r} {joined}");
+  return t;
+}
+fn early(i: int32) -> int64 {
+  var r: string = "e{i}";
+  if (i == 1) { return (int64)r.length; }
+  for j in 0..3 {
+    var s: string = "{r}{j}";
+    if (j == 1) { continue; }
+    if (j == 2) { break; }
+    println(s);
+  }
+  defer println("deferred {r}");
+  return (int64)r.length + 1;
+}
+fn main() -> int32 {
+  println(returned(1));
+  println(tail(2));
+  var b: Box;
+  into_field(3, &b);
+  println(b.s);
+  into_global(4);
+  println(g_kept);
+  println(alias_view(5));
+  var cp: uint8* = through_chars(6);
+  println("{cp[5]}");
+  var c: Fn() -> string = via_closure(7);
+  println(c());
+  println(nested_scope(8));
+  println("{sized(7)}");
+  println("{early(1)} {early(2)}");
+  println(pass_str("p{1}"));
+  println(sometimes("q{2}", 1));
+  println(sometimes("r{3}", 0));
+  println(pass_alias("a{4}"));
+  var kept: string = keep("k{5}");
+  println("{kept} {g_kept}");
+  var total: int64 = 0;
+  for i: int32 in 0..2000000 {
+    var r: string = pass_str("item {i}");
+    var q: string = "item {i}";
+    total = total + (int64)r.length + (int64)q.length;
+  }
+  println("{total}");
+  return 0;
+}

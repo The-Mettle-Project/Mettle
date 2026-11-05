@@ -176,10 +176,21 @@ static int mir_sink_targets(const MirCfg *cfg, int block, MirVregId v,
   return edges >= 2 && dead_edge && count > 0;
 }
 
+static int mir_sink_pending_reads(const MirInsertions *list, size_t first,
+                                  MirVregId v) {
+  for (size_t k = first; k < list->count; k++) {
+    if (mir_inst_reads(&list->items[k].inst, v)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int mir_sink_block_loads(MirFunction *fn, const MirCfg *cfg, int block,
                                 int *targets, MirInsertions *list) {
   const MirCfgBlock *blk = &cfg->blocks[block];
   size_t capacity = cfg->block_count;
+  size_t first_pending = list->count;
   if (blk->rpo < 0 || blk->end - blk->start < 2) {
     return 1;
   }
@@ -188,6 +199,7 @@ static int mir_sink_block_loads(MirFunction *fn, const MirCfg *cfg, int block,
     size_t count = 0;
     if (!mir_inst_is_vreg_load(&load) ||
         fn->vregs[load.dst.vreg].address_taken ||
+        mir_sink_pending_reads(list, first_pending, load.dst.vreg) ||
         !mir_sink_path_is_clear(fn, blk, (size_t)at) ||
         !mir_sink_targets(cfg, block, load.dst.vreg, targets, capacity,
                           &count)) {

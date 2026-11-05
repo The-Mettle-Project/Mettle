@@ -190,7 +190,9 @@ static int ir_lower_multi_assignment(IRLoweringContext *context,
         !ir_make_temp_operand(context, &field_value)) {
       goto cleanup;
     }
-    if (field_type->size > 8 && field_type->size <= (size_t)INT_MAX) {
+    if (field_type->size != 0 && field_type->size != 1 &&
+        field_type->size != 2 && field_type->size != 4 &&
+        field_type->size != 8 && field_type->size <= (size_t)INT_MAX) {
       IROperand target_address = ir_operand_none();
       IRInstruction copy = {0};
       int copied = 0;
@@ -669,6 +671,36 @@ static int ir_lower_zeroed_aggregate_local(IRLoweringContext *context,
   return 1;
 }
 
+static int ir_lower_zeroed_scalar_local(IRLoweringContext *context,
+                                        IRFunction *function, ASTNode *statement,
+                                        const VarDeclaration *declaration,
+                                        Type *decl_type,
+                                        const char *local_name) {
+  int float_bits = ir_named_type_float_bits(context, declaration->type_name);
+  IRInstruction assign = {0};
+  int ok;
+  if (decl_type->kind == TYPE_TAGGED_ENUM ||
+      (float_bits != 0 && float_bits != 32 && float_bits != 64) ||
+      (decl_type->size != 1 && decl_type->size != 2 && decl_type->size != 4 &&
+       decl_type->size != 8)) {
+    return ir_emit_zero_fill_local(context, function, local_name, decl_type,
+                                   statement->location);
+  }
+  assign.op = IR_OP_ASSIGN;
+  assign.location = statement->location;
+  assign.dest = ir_operand_symbol(local_name);
+  assign.lhs = float_bits ? ir_operand_float_sized(0.0, float_bits)
+                          : ir_operand_int(0);
+  ir_assign_apply_float_bits(&assign, &assign.lhs, float_bits);
+  ok = assign.dest.name && ir_emit(context, function, &assign);
+  ir_operand_destroy(&assign.dest);
+  ir_operand_destroy(&assign.lhs);
+  if (!ok) {
+    ir_set_error(context, "Out of memory while zeroing a local");
+  }
+  return ok;
+}
+
 static int ir_lower_var_declaration(IRLoweringContext *context, IRFunction *function,
                                    ASTNode *statement) {
   VarDeclaration *declaration = (VarDeclaration *)statement->data;
@@ -753,6 +785,15 @@ static int ir_lower_var_declaration(IRLoweringContext *context, IRFunction *func
                                        local_name, declaration->name)) {
     return 0;
   }
+  if (!declaration->initializer && decl_type &&
+      decl_type->kind != TYPE_ARRAY && decl_type->kind != TYPE_STRUCT &&
+      decl_type->kind != TYPE_SLICE && decl_type->kind != TYPE_STRING &&
+      declaration->address_space == AST_ADDRESS_SPACE_DEFAULT &&
+      !function->is_kernel &&
+      !ir_lower_zeroed_scalar_local(context, function, statement, declaration,
+                                    decl_type, local_name)) {
+    return 0;
+  }
 
   if (declaration->initializer &&
       declaration->initializer->type == AST_AGGREGATE_LITERAL) {
@@ -764,6 +805,200 @@ static int ir_lower_var_declaration(IRLoweringContext *context, IRFunction *func
   if (declaration->initializer &&
       !ir_lower_var_initializer(context, function, declaration, decl_type,
                                 local_name, statement)) {
+    return 0;
+  }
+  return 1;
+}
+
+static int ir_names_string_view(const ASTNode *node, const char *name) {
+  if (node && node->type == AST_FUNCTION_CALL && node->data) {
+    const CallExpression *call = (const CallExpression *)node->data;
+    if (call->function_name && call->argument_count == 1 && call->arguments &&
+        strcmp(call->function_name, "__mtl_interp") == 0) {
+      node = call->arguments[0];
+    }
+  }
+  if (!node || node->type != AST_IDENTIFIER || !node->data) {
+    return 0;
+  }
+  return strcmp(((const Identifier *)node->data)->name, name) == 0;
+}
+
+static int ir_string_expression_keeps_local(IRLoweringContext *context,
+                                            const ASTNode *node,
+                                            const char *name) {
+  if (!node) {
+    return 1;
+  }
+  switch (node->type) {
+  case AST_NUMBER_LITERAL:
+  case AST_STRING_LITERAL:
+    return 1;
+  case AST_IDENTIFIER:
+    return !ir_names_string_view(node, name);
+  case AST_BINARY_EXPRESSION: {
+    const BinaryExpression *binary = (const BinaryExpression *)node->data;
+    return (ir_names_string_view(binary->left, name) ||
+            ir_string_expression_keeps_local(context, binary->left, name)) &&
+           (ir_names_string_view(binary->right, name) ||
+            ir_string_expression_keeps_local(context, binary->right, name));
+  }
+  case AST_UNARY_EXPRESSION:
+    return ir_string_expression_keeps_local(
+        context, ((const UnaryExpression *)node->data)->operand, name);
+  case AST_CAST_EXPRESSION:
+    return ir_string_expression_keeps_local(
+        context, ((const CastExpression *)node->data)->operand, name);
+  case AST_MEMBER_ACCESS: {
+    const MemberAccess *access = (const MemberAccess *)node->data;
+    if (ir_names_string_view(access->object, name)) {
+      return access->member && strcmp(access->member, "length") == 0;
+    }
+    return ir_string_expression_keeps_local(context, access->object, name);
+  }
+  case AST_INDEX_EXPRESSION: {
+    const ArrayIndexExpression *index =
+        (const ArrayIndexExpression *)node->data;
+    return (ir_names_string_view(index->array, name) ||
+            ir_string_expression_keeps_local(context, index->array, name)) &&
+           ir_string_expression_keeps_local(context, index->index, name);
+  }
+  case AST_FUNCTION_CALL: {
+    const CallExpression *call = (const CallExpression *)node->data;
+    if (call->object &&
+        !ir_string_expression_keeps_local(context, call->object, name)) {
+      return 0;
+    }
+    for (size_t i = 0; i < call->argument_count; i++) {
+      if (ir_names_string_view(call->arguments[i], name)) {
+        if (call->is_indirect_call || call->object || !call->function_name ||
+            !type_checker_callee_borrows(context->type_checker,
+                                         call->function_name, i)) {
+          return 0;
+        }
+      } else if (!ir_string_expression_keeps_local(context, call->arguments[i],
+                                                   name)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+  default:
+    return 0;
+  }
+}
+
+static int ir_string_statement_keeps_local(IRLoweringContext *context,
+                                           const ASTNode *node,
+                                           const char *name) {
+  if (!node) {
+    return 1;
+  }
+  switch (node->type) {
+  case AST_PROGRAM: {
+    const Program *block = (const Program *)node->data;
+    for (size_t i = 0; block && i < block->declaration_count; i++) {
+      if (!ir_string_statement_keeps_local(context, block->declarations[i],
+                                           name)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+  case AST_VAR_DECLARATION: {
+    const VarDeclaration *declaration = (const VarDeclaration *)node->data;
+    return declaration->name && strcmp(declaration->name, name) != 0 &&
+           ir_string_expression_keeps_local(context, declaration->initializer,
+                                            name);
+  }
+  case AST_ASSIGNMENT: {
+    const Assignment *assignment = (const Assignment *)node->data;
+    if (assignment->target_count > 0 ||
+        (assignment->variable_name &&
+         strcmp(assignment->variable_name, name) == 0)) {
+      return 0;
+    }
+    return ir_string_expression_keeps_local(context, assignment->target, name) &&
+           ir_string_expression_keeps_local(context, assignment->value, name);
+  }
+  case AST_IF_STATEMENT: {
+    const IfStatement *branch = (const IfStatement *)node->data;
+    if (!ir_string_expression_keeps_local(context, branch->condition, name) ||
+        !ir_string_statement_keeps_local(context, branch->then_branch, name) ||
+        !ir_string_statement_keeps_local(context, branch->else_branch, name)) {
+      return 0;
+    }
+    for (size_t i = 0; i < branch->else_if_count; i++) {
+      if (!ir_string_expression_keeps_local(context,
+                                            branch->else_ifs[i].condition,
+                                            name) ||
+          !ir_string_statement_keeps_local(context, branch->else_ifs[i].body,
+                                           name)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+  case AST_WHILE_STATEMENT: {
+    const WhileStatement *loop = (const WhileStatement *)node->data;
+    return ir_string_expression_keeps_local(context, loop->condition, name) &&
+           ir_string_statement_keeps_local(context, loop->body, name);
+  }
+  case AST_FOR_STATEMENT: {
+    const ForStatement *loop = (const ForStatement *)node->data;
+    return ir_string_statement_keeps_local(context, loop->initializer, name) &&
+           ir_string_expression_keeps_local(context, loop->condition, name) &&
+           ir_string_statement_keeps_local(context, loop->increment, name) &&
+           ir_string_statement_keeps_local(context, loop->body, name);
+  }
+  case AST_RETURN_STATEMENT: {
+    const ReturnStatement *ret = (const ReturnStatement *)node->data;
+    return !ret || (ret->value_count <= 1 &&
+                    ir_string_expression_keeps_local(context, ret->value, name));
+  }
+  case AST_BREAK_STATEMENT:
+  case AST_CONTINUE_STATEMENT:
+    return !node->data ||
+           ((const LoopControlStatement *)node->data)->value == NULL;
+  case AST_DEFER_STATEMENT:
+  case AST_ERRDEFER_STATEMENT:
+    return ir_string_statement_keeps_local(
+        context, ((const DeferStatement *)node->data)->statement, name);
+  default:
+    return ir_string_expression_keeps_local(context, node, name);
+  }
+}
+
+static int ir_schedule_string_local_release(IRLoweringContext *context,
+                                            ASTNode *statement,
+                                            IRDeferScope *defers) {
+  const VarDeclaration *declaration = (const VarDeclaration *)statement->data;
+  size_t index = context->block_statement_index;
+  Type *type;
+
+  if (!defers || !context->type_checker || !declaration->name ||
+      !declaration->initializer || declaration->is_const ||
+      !context->block_statements || index >= context->block_statement_count ||
+      context->block_statements[index] != statement) {
+    return 1;
+  }
+  type = declaration->initializer->resolved_type
+             ? declaration->initializer->resolved_type
+             : ir_infer_expression_type(context, declaration->initializer);
+  if (!type || type->kind != TYPE_STRING ||
+      !ir_string_temp_is_owned(context, declaration->initializer)) {
+    return 1;
+  }
+  for (size_t i = index + 1; i < context->block_statement_count; i++) {
+    if (!ir_string_statement_keeps_local(context, context->block_statements[i],
+                                         declaration->name)) {
+      return 1;
+    }
+  }
+  if (!ir_defer_stack_push_string_release(
+          context, &defers->stack, statement,
+          ir_local_ir_name(context, declaration->name))) {
+    ir_set_error(context, "Out of memory while releasing a string local");
     return 0;
   }
   return 1;
@@ -1683,7 +1918,8 @@ static int ir_lower_statement_unmarked(IRLoweringContext *context,
   }
 
   case AST_VAR_DECLARATION:
-    return ir_lower_var_declaration(context, function, statement);
+    return ir_lower_var_declaration(context, function, statement) &&
+           ir_schedule_string_local_release(context, statement, defers);
 
   case AST_ASSIGNMENT:
     return ir_lower_assignment(context, function, statement);

@@ -35,6 +35,9 @@ typedef struct {
   unsigned frees_maybe;
   unsigned stores;
   int returns_fresh;
+  unsigned stores_elsewhere;
+  unsigned returned_params;
+  int returns_other;
 } MemFnSummary;
 
 typedef struct {
@@ -974,11 +977,13 @@ static void mem_collect_param_store(MemCtx *ctx, MemLocal *local) {
   if (ctx->mode != MEM_MODE_SUMMARY || !local || !ctx->collect) {
     return;
   }
+  unsigned mask = local->param_alias_mask;
   if (local->param_index >= 0 && local->param_index < MEM_MAX_PARAMS &&
       !local->reassigned) {
-    ctx->collect->stores |= 1u << local->param_index;
+    mask |= 1u << local->param_index;
   }
-  ctx->collect->stores |= local->param_alias_mask;
+  ctx->collect->stores |= mask;
+  ctx->collect->stores_elsewhere |= mask;
 }
 
 static void mem_collect_param_maybe_free(MemCtx *ctx, MemLocal *local) {
@@ -2254,11 +2259,53 @@ static void mem_walk_return(MemCtx *ctx, ASTNode *statement) {
     }
   }
   MemLocal *returned = mem_expr_as_local(ctx, ret->value);
+  if (ctx->mode == MEM_MODE_SUMMARY && ctx->collect) {
+    unsigned handed = 0;
+    if (returned) {
+      handed = returned->param_alias_mask;
+      if (returned->param_index >= 0 && returned->param_index < MEM_MAX_PARAMS &&
+          !returned->reassigned) {
+        handed |= 1u << returned->param_index;
+      }
+    }
+    if (handed == 0 || (handed & (handed - 1)) != 0) {
+      ctx->collect->returns_other = 1;
+    } else {
+      ctx->collect->returned_params |= handed;
+    }
+  }
   if (returned && returned->is_pointer) {
     returned->escaped = 1;
-    mem_collect_param_store(ctx, returned);
+    if (ctx->mode == MEM_MODE_SUMMARY && ctx->collect) {
+      unsigned elsewhere = ctx->collect->stores_elsewhere;
+      mem_collect_param_store(ctx, returned);
+      ctx->collect->stores_elsewhere = elsewhere;
+    }
   }
   return;
+}
+
+static void mem_note_asm_bindings(MemCtx *ctx, const InlineAsm *inline_asm) {
+  const char *at = inline_asm && inline_asm->assembly_code
+                       ? strchr(inline_asm->assembly_code, '{')
+                       : NULL;
+  for (; at; at = strchr(at + 1, '{')) {
+    char name[128];
+    size_t length = 0;
+    const char *cursor = at + 1;
+    while (*cursor == ' ' || *cursor == '\t') {
+      cursor++;
+    }
+    while (*cursor && *cursor != '}' && *cursor != ' ' && *cursor != '\t' &&
+           length + 1 < sizeof(name)) {
+      name[length++] = *cursor++;
+    }
+    name[length] = '\0';
+    MemLocal *local = mem_find_local(ctx, name);
+    if (local) {
+      local->escaped = 1;
+    }
+  }
 }
 
 static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
@@ -2266,6 +2313,9 @@ static void mem_walk_statement(MemCtx *ctx, ASTNode *statement) {
     return;
   }
   switch (statement->type) {
+  case AST_INLINE_ASM:
+    mem_note_asm_bindings(ctx, (const InlineAsm *)statement->data);
+    return;
   case AST_VAR_DECLARATION: {
     VarDeclaration *decl = (VarDeclaration *)statement->data;
     if (!decl || !decl->name) {
@@ -2642,6 +2692,13 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
       checker->borrow_facts[checker->borrow_fact_count].stores = items[i].stores;
       checker->borrow_facts[checker->borrow_fact_count].frees =
           items[i].frees_definite | items[i].frees_maybe;
+      checker->borrow_facts[checker->borrow_fact_count].handed_back =
+          !items[i].returns_other && items[i].returned_params != 0 &&
+                  (items[i].returned_params & (items[i].returned_params - 1)) == 0
+              ? items[i].returned_params
+              : 0u;
+      checker->borrow_facts[checker->borrow_fact_count].stores_elsewhere =
+          items[i].stores_elsewhere;
       checker->borrow_fact_count++;
     }
   }
@@ -2688,6 +2745,23 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
   free(items);
   free(decls);
   return !checker->has_error;
+}
+
+int type_checker_callee_hands_back(const TypeChecker *checker,
+                                   const char *callee, size_t index) {
+  if (!checker || !callee || index >= MEM_MAX_PARAMS) {
+    return 0;
+  }
+  for (size_t i = 0; i < checker->borrow_fact_count; i++) {
+    if (checker->borrow_facts[i].name &&
+        strcmp(checker->borrow_facts[i].name, callee) == 0) {
+      unsigned bit = 1u << index;
+      return checker->borrow_facts[i].handed_back == bit &&
+             (checker->borrow_facts[i].stores_elsewhere & bit) == 0u &&
+             (checker->borrow_facts[i].frees & bit) == 0u;
+    }
+  }
+  return 0;
 }
 
 int type_checker_callee_borrows(const TypeChecker *checker, const char *callee,

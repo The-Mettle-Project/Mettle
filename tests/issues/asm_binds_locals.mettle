@@ -1,0 +1,92 @@
+import "std/io";
+var g_out: int64 = 0;
+@noinline fn write_const() -> int64 {
+  var a: int64 = 0;
+  asm {
+    mov rax, 41
+    mov {a}, rax
+  }
+  return a + 1;
+}
+@noinline fn read_only() -> int64 {
+  var a: int64 = 7;
+  asm {
+    mov rax, {a}
+    mov {g_out}, rax
+  }
+  return 0;
+}
+@noinline fn read_param(p: int64) -> int64 {
+  var r: int64 = 0;
+  asm {
+    mov rax, {p}
+    add rax, 1
+    mov {r}, rax
+  }
+  return r;
+}
+@noinline fn write_param(p: int64) -> int64 {
+  asm {
+    mov rax, 100
+    mov {p}, rax
+  }
+  return p;
+}
+@noinline fn branchy(k: int32) -> int64 {
+  var a: int64 = 5;
+  if (k > 0) {
+    asm {
+      mov rax, 50
+      mov {a}, rax
+    }
+  }
+  return a;
+}
+@noinline fn loopy(n: int32) -> int64 {
+  var a: int64 = 0;
+  for i in 0..n {
+    asm {
+      mov rax, {a}
+      add rax, 2
+      mov {a}, rax
+    }
+  }
+  return a;
+}
+@noinline fn narrow() -> int32 {
+  var a: int32 = 3;
+  var b: uint8 = 0;
+  asm {
+    mov eax, 9
+    mov {a}, eax
+    mov al, 200
+    mov {b}, al
+  }
+  return a + (int32)b;
+}
+@noinline fn two_uses() -> int64 {
+  var a: int64 = 1;
+  var b: int64 = a + 1;
+  asm {
+    mov rax, {b}
+    add rax, {a}
+    mov {a}, rax
+  }
+  return a + b;
+}
+@noinline fn fl() -> float64 {
+  var f: float64 = 1.5;
+  asm {
+    movsd xmm0, {f}
+    addsd xmm0, xmm0
+    movsd {f}, xmm0
+  }
+  return f;
+}
+fn main() -> int32 {
+  println("{write_const()}");
+  read_only();
+  println("{g_out}");
+  println("{read_param(1)} {write_param(1)} {branchy(0)} {branchy(1)} {loopy(3)} {narrow()} {two_uses()} {fl()}");
+  return 0;
+}

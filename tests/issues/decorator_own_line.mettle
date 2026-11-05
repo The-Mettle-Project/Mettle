@@ -1,0 +1,22 @@
+import "std/io";
+
+@inline
+@pure
+fn square(x: int64) -> int64 {
+  return x * x;
+}
+
+fn main() -> int32 {
+  var t: int64 = 0;
+  @unroll(4)
+  for i: int32 in 0..100 {
+    t = t + (int64)i;
+  }
+  @simd
+
+  for i: int32 in 0..100 {
+    t = t + square((int64)i);
+  }
+  println("{t}");
+  return 0;
+}

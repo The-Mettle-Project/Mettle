@@ -1,0 +1,2 @@
+import { cos, sin } from "std/math";
+export fn b_val() -> float64 { return cos(0.0) + sin(0.0); }

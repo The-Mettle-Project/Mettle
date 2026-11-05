@@ -255,22 +255,29 @@ string built for one call and handed to a function that neither keeps nor
 returns it is unreachable the moment that call returns, and that is not a
 promise anyone writes: it is what the [memory analysis](borrow-checker.md)
 inferred about that parameter. `println("frames {n}")` therefore allocates once
-and frees once. Where there is no such fact, an extern, a call through a
-pointer, a callee that stores the view or hands it back, nothing is released
-and the string is the program's, exactly as the result of `a + b` is:
+and frees once. A callee that only hands its parameter back passes that block
+to its result, so `pass("frames {n}")` counts as the same one string.
+
+A local holding such a string is released when its scope ends, on every path
+out, as long as nothing can keep it: the local is read, compared, measured,
+copied into another string or passed to a function that borrows, and never
+reassigned, aliased, stored, returned, captured or asked for `.chars`. Anything
+else leaves the string to the program, exactly as a result of `a + b` is when
+you keep it:
 
 ```mettle
 println("frames {n}");        // one block, taken and released
-var label: string = "f {n}";  // one block, and it is yours
+var label: string = "f {n}";  // released at the end of this scope
 println(label);
-free(label.chars);
+var kept: string = "k {n}";   // yours: .chars means you took the bytes
+free(kept.chars);
 ```
 
 A `string` is a borrowed view, so a function that keeps one past the call is
-keeping a borrow. The compiler reads a callee that stores its parameter or
-returns it as doing exactly that and releases nothing; what it cannot see is a
-callee that hands the bytes to an `extern` which keeps them, since nothing
-states what an `extern` does with a pointer.
+keeping a borrow. The compiler reads a callee that stores its parameter as
+doing exactly that and releases nothing; what it cannot see is a callee that
+hands the bytes to an `extern` which keeps them, since nothing states what an
+`extern` does with a pointer.
 
 `--record-trace` puts this on a ledger: every block a run takes and every one
 it releases, with the site, for `mettle check-trace` to hold a rule to.

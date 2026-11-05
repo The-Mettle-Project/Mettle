@@ -2879,6 +2879,9 @@ static Type *type_checker_infer_address_of(TypeChecker *checker,
     Identifier *id = (Identifier *)unop->operand->data;
     if (id && id->name) {
       Symbol *sym = type_checker_resolve_identifier(checker, id);
+      if (sym && sym->kind == SYMBOL_VARIABLE) {
+        type_checker_init_tracker_set_initialized(checker, id->name);
+      }
       if (sym && sym->kind == SYMBOL_FUNCTION) {
         Type **param_types = sym->data.function.parameter_types;
         size_t param_count = sym->data.function.parameter_count;

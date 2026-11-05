@@ -1,0 +1,43 @@
+import "std/io";
+
+struct R3 { a: int8; b: uint8; c: int8; }
+struct C2 { p: char; q: char; }
+struct A3 { v: uint8[3]; }
+enum W { Hold(R3), Other(int32), Nothing }
+
+fn pass(v: R3) -> R3 { return v; }
+fn indirect(f: fn(R3) -> R3, v: R3) -> R3 { return f(v); }
+fn make() -> R3 { var r: R3; r.a = (int8)-5; r.b = (uint8)200; r.c = (int8)7; return r; }
+fn wrap(v: R3) -> W { return Hold(v); }
+fn unwrap(w: W) -> R3 {
+  var d: R3;
+  match (w) {
+    case Hold(v): { return v; }
+    case Other(o): { d.a = (int8)1; }
+    case Nothing: { d.a = (int8)2; }
+  }
+  return d;
+}
+fn pair() -> (R3, int32) { return (make(), 5); }
+fn closed(v: R3) -> Fn() -> R3 { return fn() -> R3 { return v; }; }
+
+fn main() -> int32 {
+  var a: R3 = make();
+  var x: R3 = indirect(pass, a);
+  var f: Fn(R3) -> R3 = fn(q: R3) -> R3 { return q; };
+  var y: R3 = f(a);
+  var u: R3 = unwrap(wrap(a));
+  var t: R3;
+  var n: int32 = 0;
+  (t, n) = pair();
+  var c: Fn() -> R3 = closed(a);
+  var z: R3 = c();
+  var chars: C2;
+  chars.p = 'q';
+  chars.q = 'r';
+  var parts: A3;
+  parts.v[2] = (uint8)9;
+  var kept: A3 = parts;
+  println("{x.a} {x.b} {x.c} {y.c} {u.b} {t.a} {n} {z.c} {chars.p}{chars.q} {kept.v[2]}");
+  return 0;
+}

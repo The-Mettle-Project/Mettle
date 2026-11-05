@@ -613,7 +613,7 @@ $cases = @(
     Name          = "err_const_array_nonconst"
     Path          = "tests/err_const_array_nonconst.mettle"
     ShouldSucceed = $false
-    Pattern       = "Undefined type 'int32\[COUNT\]'"
+    Pattern       = "Array size 'COUNT' in 'int32\[COUNT\]' is not an integer constant"
   },
   @{
     Name          = "err_const_float_nonconst"
@@ -5618,9 +5618,9 @@ try {
   $took = ($lines | Where-Object { $_ -match "^alloc\|" }).Count
   $gave = ($lines | Where-Object { $_ -match "^free\|" }).Count
   if ($took -lt 100) { throw "the fixture took only $took blocks; it is not exercising the path" }
-  # Three outlive their statement on purpose: the one a callee returned, the
-  # one a callee kept, and the one the program bound to a name.
-  if ($took - $gave -ne 3) { throw "the ledger is off: $took taken, $gave released, expected a difference of 3" }
+  # One outlives everything on purpose: the one a callee kept. The one a callee
+  # handed back dies with the print, the one bound to a name with its scope.
+  if ($took - $gave -ne 1) { throw "the ledger is off: $took taken, $gave released, expected a difference of 1" }
 
   # Interpolation runs in the compile-time interpreter too, and the same
   # conversions have to answer there.
@@ -21567,6 +21567,34 @@ $issueRegressions = @(
   @{ Name = "float_literal_as_condition_release"; Entry = "tests/issues/float_condition.mettle"; Args = @("--release"); Expect = @("101001 3 7 false true true false") },
   @{ Name = "aggregate_equality_is_an_error"; Command = @("--build", "tests/issues/err_compare_struct.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("compare the fields") },
   @{ Name = "string_order_is_an_error"; Command = @("--build", "tests/issues/err_compare_string_order.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("str_compare") },
+  @{ Name = "asm_binding_must_name_a_variable"; Command = @("--build", "tests/issues/err_asm_binding.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("no variable 'nothing_here' is in scope") },
+  @{ Name = "global_divide_by_zero_is_an_error"; Command = @("--build", "tests/issues/err_global_divide_by_zero.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("could not be computed") },
+  @{ Name = "global_calling_extern_is_an_error"; Command = @("--build", "tests/issues/err_global_calls_extern.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("could not be computed") },
+  @{ Name = "far_constant_offset"; Entry = "tests/issues/far_constant_offset.mettle"; Args = @(); Expect = @("6 8 6 9") },
+  @{ Name = "far_constant_offset_release"; Entry = "tests/issues/far_constant_offset.mettle"; Args = @("--release"); Expect = @("6 8 6 9") },
+  @{ Name = "odd_aggregate_through_indirect_calls"; Entry = "tests/issues/odd_aggregate_indirect.mettle"; Args = @(); Expect = @("-5 200 7 7 200 -5 5 7 qr 9") },
+  @{ Name = "odd_aggregate_through_indirect_calls_release"; Entry = "tests/issues/odd_aggregate_indirect.mettle"; Args = @("--release"); Expect = @("-5 200 7 7 200 -5 5 7 qr 9") },
+  @{ Name = "indirect_call_returning_struct_is_returned"; Entry = "tests/issues/indirect_call_returns_struct.mettle"; Args = @(); Expect = @("3 3 2") },
+  @{ Name = "indirect_call_returning_struct_is_returned_release"; Entry = "tests/issues/indirect_call_returns_struct.mettle"; Args = @("--release"); Expect = @("3 3 2") },
+  @{ Name = "string_local_released_only_when_nothing_keeps_it"; Entry = "tests/issues/string_local_release.mettle"; Args = @(); Expect = @("ret1", "field3", "global4", "alias5", "54", "clo7", "n81", "abc7 abc7x", "1113", "deferred e2", "2 3", "k5 k5", "45777780") },
+  @{ Name = "string_local_released_only_when_nothing_keeps_it_release"; Entry = "tests/issues/string_local_release.mettle"; Args = @("--release"); Expect = @("ret1", "field3", "global4", "alias5", "54", "clo7", "n81", "abc7 abc7x", "1113", "deferred e2", "2 3", "k5 k5", "45777780") },
+  @{ Name = "unsigned_constant_compare_folds_unsigned"; Entry = "tests/issues/unsigned_constant_compare.mettle"; Args = @(); Expect = @("true", "true", "9223372036854775680", "5", "1152921504606846960", "true", "2147483647", "268435455", "true", "true", "1", "0", "100") },
+  @{ Name = "decorator_on_its_own_line"; Entry = "tests/issues/decorator_own_line.mettle"; Args = @(); Expect = @("333300") },
+  @{ Name = "bad_array_size_says_why"; Command = @("--build", "tests/issues/err_bad_array_size.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Array size 'n' in 'int32[n]' is not an integer constant", "too large; an array holds at most 2147483647 bytes", "Array type 'int32[0]' has no elements", "Array size 'gn' in 'int32[gn]' is not an integer constant", "Undefined type 'Nope'", "Array size 'Z' in 'int32[Z]' is 0") },
+  @{ Name = "issue_load_sunk_past_its_base"; Entry = "tests/issues/issue_193.mettle"; Args = @(); Expect = @("anchored 7 unanchored 9") },
+  @{ Name = "issue_load_sunk_past_its_base_release"; Entry = "tests/issues/issue_193.mettle"; Args = @("--release"); Expect = @("anchored 7 unanchored 9") },
+  @{ Name = "asm_binds_locals_and_params"; Entry = "tests/issues/asm_binds_locals.mettle"; Args = @(); Expect = @("42", "7", "2 100 5 50 6 209 5 3.0") },
+  @{ Name = "asm_binds_locals_and_params_release"; Entry = "tests/issues/asm_binds_locals.mettle"; Args = @("--release"); Expect = @("42", "7", "2 100 5 50 6 209 5 3.0") },
+  @{ Name = "issue_asm_operand_under_safe"; Command = @("--safe", "--build", "tests/issues/issue_208.mettle", "-o", ".tmp/issue_208.exe"); Expect = @("Built executable") },
+  @{ Name = "issue_asm_read_is_no_leak"; Command = @("--build", "tests/issues/issue_207.mettle", "-o", ".tmp/issue_207.exe"); Expect = @("Built executable"); Refuse = @("M0107") },
+  @{ Name = "unset_scalar_starts_zeroed"; Entry = "tests/issues/unset_scalar_starts_zeroed.mettle"; Args = @(); Expect = @("0 0 0 0 0 false 0 0.0 0.0 0 0", "A 0", "0") },
+  @{ Name = "unset_scalar_starts_zeroed_release"; Entry = "tests/issues/unset_scalar_starts_zeroed.mettle"; Args = @("--release"); Expect = @("0 0 0 0 0 false 0 0.0 0.0 0 0", "A 0", "0") },
+  @{ Name = "issue_shift_in_an_index_wraps"; Entry = "tests/issues/issue_195.mettle"; Args = @(); Expect = @("1 1") },
+  @{ Name = "issue_shift_in_an_index_wraps_release"; Entry = "tests/issues/issue_195.mettle"; Args = @("--release"); Expect = @("1 1") },
+  @{ Name = "issue_two_modules_select_one_name"; Entry = "tests/issues/import_same_name/main.mettle"; Args = @(); Expect = @("1.0 1.0") },
+  @{ Name = "issue_indirect_call_tagged_enum"; Command = @("--build", "tests/issues/issue_209.mettle", "-o", ".tmp/issue_209.exe"); Expect = @("Built executable") },
+  @{ Name = "indirect_call_small_aggregates"; Entry = "tests/issues/indirect_small_aggregate.mettle"; Args = @(); Expect = @("6 40 6", "2.5", "6 14 6", "4321", "3.0 4.0 4.5 3.5", "10", "2 1 2.5 1.5", "43") },
+  @{ Name = "indirect_call_small_aggregates_release"; Entry = "tests/issues/indirect_small_aggregate.mettle"; Args = @("--release"); Expect = @("6 40 6", "2.5", "6 14 6", "4321", "3.0 4.0 4.5 3.5", "10", "2 1 2.5 1.5", "43") },
   @{ Name = "parse_errors_name_every_token"; Command = @("--build", "tests/issues/err_token_name.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Expected ']', found '..'") },
   @{ Name = "multiline_string_keeps_line_numbers"; Command = @("--build", "tests/issues/err_multiline_string_line.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("err_multiline_string_line.mettle:5:") },
   @{ Name = "issue_profile_runtime_skips_naked";Entry = "tests/issues/issue_162.mettle"; Args = @("--profile-runtime"); Expect = @("7") },
@@ -21594,6 +21622,11 @@ foreach ($case in $issueRegressions) {
     foreach ($want in $case.Expect) {
       if (-not $out.Contains($want)) {
         throw "expected '$want', got:`n$out"
+      }
+    }
+    foreach ($refused in @($case.Refuse)) {
+      if ($refused -and $out.Contains($refused)) {
+        throw "'$refused' should not appear, got:`n$out"
       }
     }
     Write-CaseResult -Name $case.Name -Passed $true

@@ -1,0 +1,2 @@
+import { cos } from "std/math";
+export fn a_val() -> float64 { return cos(0.0); }

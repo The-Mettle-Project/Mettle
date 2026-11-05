@@ -1,0 +1,18 @@
+import "std/io";
+
+fn read_far(p: int32*) -> int32 { return p[2147483648] + 1; }
+fn write_far(p: uint8*, v: int32) { p[4294967296] = (uint8)v; }
+fn read_index(p: int32*, i: int64) -> int32 { return p[i + 2147483648] + 1; }
+fn back(p: int32*) -> int32 { return p[-2147483649] + 1; }
+
+fn main() -> int32 {
+  var cell: int32[4] = [5, 6, 7, 8];
+  var low: uint8[8];
+  var at: int32* = &cell[0];
+  var r1: int32 = read_far((int32*)((int64)at - (int64)2147483648 * 4));
+  var r2: int32 = read_index((int32*)((int64)at - (int64)2147483648 * 4), 2);
+  var r3: int32 = back((int32*)((int64)at + (int64)2147483649 * 4));
+  write_far((uint8*)((int64)&low[0] - (int64)4294967296), 9);
+  println("{r1} {r2} {r3} {low[0]}");
+  return 0;
+}

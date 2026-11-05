@@ -624,7 +624,8 @@ static int const_call_run(IRProgram *program, TypeChecker *tc, SymbolTable *st,
                          MTLC_CONST_CALL_FUEL);
   g_const_call_steps +=
       MTLC_CONST_CALL_FUEL - ir_interp_fuel_remaining(machine);
-  if (status != IR_INTERP_OK) {
+  if (status != IR_INTERP_OK || ir_interp_extern_trace_count(machine) > 0 ||
+      out_value->undefined) {
     ir_interp_destroy(machine);
     return 0;
   }
@@ -767,6 +768,16 @@ static void populate_variable_symbol(IRProgram *program, TypeChecker *tc,
         }
       } else {
         populate_scalar_initializer(program, tc, st, &entry, vd->initializer);
+      }
+      if (entry.has_unfoldable_initializer && tc && tc->error_reporter) {
+        char message[512];
+        snprintf(message, sizeof(message),
+                 "the initializer of global '%s' could not be computed at "
+                 "compile time: it divides by zero, runs too long, or calls "
+                 "something outside the program. Move it into a function",
+                 vd->name);
+        error_reporter_add_error(tc->error_reporter, ERROR_SEMANTIC,
+                                 vd->initializer->location, message);
       }
     }
   }

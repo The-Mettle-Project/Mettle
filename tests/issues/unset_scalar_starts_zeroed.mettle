@@ -1,0 +1,26 @@
+import "std/io";
+enum E { A(int32), B(string), N }
+enum P { X, Y }
+fn setp(p: int64*, k: int64) { if (k > 0) { *p = k; } }
+fn sf(p: float32*) { }
+fn se(p: E*) { }
+fn sq(p: P*) { }
+fn sc(p: Fn(int32) -> int32*) { }
+@noinline fn dirty() -> int64 { var a: int64[32]; for i in 0..32 { a[i] = -1; } return a[3]; }
+@noinline fn check() -> int64 {
+  var a: int64; var b: int32; var c: int16; var d: int8; var e: uint8; var f: bool; var g: char;
+  var h: float32; var i: float64; var j: int32*; var k: E; var l: P;
+  var ap: int64* = &a; var bp: int32* = &b; var cp: int16* = &c; var dp: int8* = &d; var ep: uint8* = &e; var fp: bool* = &f;
+  var gp: char* = &g; var hp: float32* = &h; var ip: float64* = &i; var jp: int32** = &j; var kp: E* = &k; var lp: P* = &l;
+  println("{*ap} {*bp} {*cp} {*dp} {*ep} {*fp} {(int32)*gp} {*hp} {*ip} {(int64)*jp} {(int32)*lp}");
+  match (*kp) { case A(v): { println("A {v}"); } case B(s): { println("B"); } case N: { println("N"); } }
+  var t: int64 = 0;
+  for z in 0..3 {
+    var w: int64;
+    var wp: int64* = &w;
+    t = t + *wp;
+    *wp = 9;
+  }
+  return t;
+}
+fn main() -> int32 { dirty(); println("{check()}"); return 0; }

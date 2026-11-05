@@ -242,6 +242,92 @@ Type *type_checker_parse_array_type(TypeChecker *checker,
   return type_checker_canon_type(checker, array_type);
 }
 
+int type_checker_explain_bad_array(TypeChecker *checker, const char *name,
+                                   char *out, size_t out_size) {
+  const char *lbracket = NULL;
+  const char *rbracket = NULL;
+  if (!type_checker_array_outer_group(name, &lbracket, &rbracket) ||
+      lbracket == name || rbracket == lbracket + 1) {
+    return 0;
+  }
+  size_t base_len = (size_t)(lbracket - name);
+  size_t tail_len = strlen(rbracket + 1);
+  char *base_name = malloc(base_len + tail_len + 1);
+  if (!base_name) {
+    return 0;
+  }
+  memcpy(base_name, name, base_len);
+  memcpy(base_name + base_len, rbracket + 1, tail_len);
+  base_name[base_len + tail_len] = '\0';
+  Type *base = type_checker_get_type_by_name(checker, base_name);
+  if (!base) {
+    int explained =
+        type_checker_explain_bad_array(checker, base_name, out, out_size);
+    if (!explained) {
+      snprintf(out, out_size, "Undefined type '%s'", base_name);
+    }
+    free(base_name);
+    return 1;
+  }
+  free(base_name);
+
+  int size_len = (int)(rbracket - lbracket - 1);
+  const char *size_text = lbracket + 1;
+  int literal = 1;
+  unsigned long long count = 0;
+  int too_many = 0;
+  for (const char *d = size_text; d < rbracket; d++) {
+    if (*d < '0' || *d > '9') {
+      literal = 0;
+      break;
+    }
+    if (count > (ULLONG_MAX - 9ull) / 10ull) {
+      too_many = 1;
+    } else {
+      count = count * 10ull + (unsigned long long)(*d - '0');
+    }
+  }
+  if (literal && !too_many && count == 0) {
+    snprintf(out, out_size, "Array type '%s' has no elements; a size is 1 or more",
+             name);
+    return 1;
+  }
+  if (!literal) {
+    char size_name[128];
+    if ((size_t)size_len >= sizeof(size_name)) {
+      return 0;
+    }
+    memcpy(size_name, size_text, (size_t)size_len);
+    size_name[size_len] = '\0';
+    Symbol *size = symbol_table_lookup(checker->symbol_table, size_name);
+    if (!size || (!size->has_constant_value && size->kind != SYMBOL_CONSTANT) ||
+        size->constant_is_float || !type_checker_is_integer_type(size->type)) {
+      snprintf(out, out_size,
+               "Array size '%s' in '%s' is not an integer constant", size_name,
+               name);
+      return 1;
+    }
+    long long value = size->has_constant_value
+                          ? size->constant_integer_value
+                          : size->data.constant.value;
+    if (value <= 0) {
+      snprintf(out, out_size,
+               "Array size '%s' in '%s' is %lld; a size is 1 or more", size_name,
+               name, value);
+      return 1;
+    }
+    count = (unsigned long long)value;
+  }
+  if (too_many || (base->size > 0 &&
+                   count > (unsigned long long)INT_MAX / base->size)) {
+    snprintf(out, out_size,
+             "Array type '%s' is too large; an array holds at most %d bytes",
+             name, INT_MAX);
+    return 1;
+  }
+  return 0;
+}
+
 int type_checker_ensure_multi_return_type(TypeChecker *checker,
                                           FunctionDeclaration *function,
                                           SourceLocation location) {

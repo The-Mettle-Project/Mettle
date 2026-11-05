@@ -1,0 +1,4 @@
+import "std/io";
+import "a197";
+import "b197";
+fn main() -> int32 { println("{a_val()} {b_val()}"); return 0; }

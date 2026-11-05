@@ -1116,6 +1116,9 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
     if (!parser_parse_one_decorator(parser, out)) {
       return 0;
     }
+    while (parser->current_token.type == TOKEN_NEWLINE) {
+      parser_advance(parser);
+    }
   }
 
   if (out->is_inline && out->is_noinline) {
@@ -2871,7 +2874,11 @@ static ASTNode *parser_parse_defer_or_errdefer(Parser *parser,
     return NULL;
   }
 
-  parser_expect_statement_end(parser);
+  if (parser->previous_token_type != TOKEN_RBRACE ||
+      parser_match(parser, TOKEN_SEMICOLON) ||
+      parser_match(parser, TOKEN_NEWLINE)) {
+    parser_expect_statement_end(parser);
+  }
   if (token_type == TOKEN_DEFER) {
     return ast_create_defer_statement(stmt, location);
   }

@@ -159,10 +159,14 @@ typedef struct TypeCheckerBorrowFact {
   const char *name;
   unsigned stores;
   unsigned frees;
+  unsigned handed_back;
+  unsigned stores_elsewhere;
 } TypeCheckerBorrowFact;
 
 int type_checker_callee_borrows(const TypeChecker *checker, const char *callee,
                                 size_t index);
+int type_checker_callee_hands_back(const TypeChecker *checker,
+                                   const char *callee, size_t index);
 
 int type_checker_predicate_is_relational(TypeChecker *checker,
                                          struct ASTNode *predicate,

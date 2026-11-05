@@ -1,0 +1,7 @@
+fn main() -> int32 {
+  var x: int64 = 1;
+  asm {
+    mov rax, {nothing_here}
+  }
+  return (int32)x;
+}

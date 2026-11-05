@@ -89,6 +89,7 @@ typedef struct {
     char *capture_call_name;
     char **capture_arg_temps;
     size_t capture_arg_count;
+    char *release_string;
   } *entries;
   size_t count;
   size_t capacity;
@@ -414,6 +415,12 @@ int ir_emit_defers_until_scope(IRLoweringContext *context,
                                IRFunction *function, const IRDeferScope *from,
                                const IRDeferScope *stop);
 
+int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node);
+int ir_emit_string_free(IRLoweringContext *context, IRFunction *function,
+                        const IROperand *value, SourceLocation location);
+int ir_defer_stack_push_string_release(IRLoweringContext *context,
+                                       IRDeferStack *stack, ASTNode *node,
+                                       const char *local_name);
 int ir_defer_stack_push(IRLoweringContext *context, IRDeferStack *stack,
                                ASTNode *node, int is_err);
 

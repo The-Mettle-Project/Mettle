@@ -1,0 +1,19 @@
+import "std/io";
+import "std/mem";
+struct N { a: int32; b: int32; }
+struct D { n: N*; tab: int32*; }
+@noinline fn pick(d: D*, anchored: bool, slot: int64) -> int32 {
+  var s: int32 = d->tab[slot];
+  if (s != 0) { return s; }
+  var id: int32 = d->n->b;
+  if (anchored) { id = d->n->a; }
+  return id;
+}
+fn main() -> int32 {
+  var n: N = { a: 7, b: 9 };
+  var d: D;
+  d.n = &n;
+  d.tab = (int32*)calloc(4, 4);
+  println("anchored {pick(&d, true, 1)} unanchored {pick(&d, false, 1)}");
+  return 0;
+}

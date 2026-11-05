@@ -882,7 +882,8 @@ static int mir_temp_is_indirect_call_result(const IRFunction *irf,
     return 0;
   }
   in = mir_temp_first_def(irf, op->name);
-  return in && in->op == IR_OP_CALL_INDIRECT && in->lhs.kind == IR_OPERAND_TEMP;
+  return in && in->op == IR_OP_CALL_INDIRECT &&
+         (in->lhs.kind == IR_OPERAND_TEMP || in->lhs.kind == IR_OPERAND_SYMBOL);
 }
 
 static int mir_indirect_source_is_supported(CodeGenerator *g,
@@ -1175,8 +1176,7 @@ static int mir_indirect_call_uses_own_types(const MtlcType *ft,
   for (size_t a = 0; ft->fn_param_types && a < ft->fn_param_count; a++) {
     MtlcType *pt = ft->fn_param_types[a];
     if (pt && (code_generator_type_is_aggregate(pt) ||
-               code_generator_binary_type_is_string(pt)) &&
-        code_generator_abi_classify(pt) == ABI_PASS_INDIRECT) {
+               code_generator_binary_type_is_string(pt))) {
       return 1;
     }
   }
@@ -8148,10 +8148,17 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
   if (fold->index.kind == IR_OPERAND_INT) {
     long long disp = fold->index.int_value * (long long)fold->scale + fold->disp;
     if (disp < -2147483648LL || disp > 2147483647LL) {
-      fn->has_error = 1;
-      return 0;
+      MirVregId far = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (far == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_MOV, mir_op_vreg(far), mir_op_imm(disp),
+                     mir_op_none(), 8, 0, 0)) {
+        fn->has_error = 1;
+        return 0;
+      }
+      mem = mir_op_mem_vreg(baseo.vreg, far, 1, 0);
+    } else {
+      mem = mir_op_mem_vreg(baseo.vreg, MIR_VREG_NONE, 0, (int)disp);
     }
-    mem = mir_op_mem_vreg(baseo.vreg, MIR_VREG_NONE, 0, (int)disp);
   } else {
     MirOperand idxo = mir_value_operand(fn, g, ctx, map, &fold->index);
     if (idxo.kind != MIR_OPK_VREG) {
@@ -8159,10 +8166,20 @@ static int mir_lower_folded_access(MirFunction *fn, CodeGenerator *g,
       return 0;
     }
     if (fold->disp < -2147483648LL || fold->disp > 2147483647LL) {
-      fn->has_error = 1;
-      return 0;
+      MirVregId far = mir_new_vreg(fn, MIR_RC_GP, 8);
+      MirVregId moved = mir_new_vreg(fn, MIR_RC_GP, 8);
+      if (far == MIR_VREG_NONE || moved == MIR_VREG_NONE ||
+          !mir_emit1(fn, MIR_MOV, mir_op_vreg(far), mir_op_imm(fold->disp),
+                     mir_op_none(), 8, 0, 0) ||
+          !mir_emit1(fn, MIR_ADD, mir_op_vreg(moved), baseo, mir_op_vreg(far),
+                     8, 0, 0)) {
+        fn->has_error = 1;
+        return 0;
+      }
+      mem = mir_op_mem_vreg(moved, idxo.vreg, fold->scale, 0);
+    } else {
+      mem = mir_op_mem_vreg(baseo.vreg, idxo.vreg, fold->scale, (int)fold->disp);
     }
-    mem = mir_op_mem_vreg(baseo.vreg, idxo.vreg, fold->scale, (int)fold->disp);
   }
   int size = code_generator_binary_get_access_size(g, ctx, &in->rhs);
   if (size <= 0) {

@@ -1,0 +1,19 @@
+import "std/io";
+const K1: int32 = (int32)(((uint64)1) < ((uint64)18446744073709551360));
+fn main() -> int32 {
+  println("{((uint64)1) < ((uint64)18446744073709551360)}");
+  println("{((uint64)18446744073709551360) > ((uint64)1)}");
+  println("{((uint64)18446744073709551360) / ((uint64)2)}");
+  println("{((uint64)18446744073709551360) % ((uint64)7)}");
+  println("{((uint64)18446744073709551360) >> 4}");
+  println("{((uint32)4294967295) > ((uint32)1)}");
+  println("{((uint32)4294967295) / ((uint32)2)}");
+  println("{((uint32)4294967295) >> 4}");
+  println("{((uint8)200) > ((uint8)100)}");
+  println("{((int8)-1) < ((int8)1)}");
+  println("{K1}");
+  var d: int64 = 100;
+  println("{d % (int64)(((uint64)1) < ((uint64)18446744073709551360))}");
+  println("{d / (int64)(((uint64)1) < ((uint64)18446744073709551360))}");
+  return 0;
+}

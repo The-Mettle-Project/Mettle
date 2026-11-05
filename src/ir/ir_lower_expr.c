@@ -255,14 +255,16 @@ static int ir_indirect_arg_passes_by_address(Type *type) {
   return type && type->name &&
          (type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE ||
           type->kind == TYPE_TAGGED_ENUM) &&
-         type->size > 8 && type->size <= (size_t)INT_MAX;
+         type->size != 0 && type->size != 1 && type->size != 2 &&
+         type->size != 4 && type->size != 8 && type->size <= (size_t)INT_MAX;
 }
 
 static int ir_indirect_return_passes_by_pointer(Type *type) {
   return type && type->name &&
          (type->kind == TYPE_STRUCT || type->kind == TYPE_STRING ||
           type->kind == TYPE_SLICE || type->kind == TYPE_TAGGED_ENUM) &&
-         type->size > 8 && type->size <= (size_t)INT_MAX;
+         type->size != 0 && type->size != 1 && type->size != 2 &&
+         type->size != 4 && type->size != 8 && type->size <= (size_t)INT_MAX;
 }
 
 static int ir_make_indirect_return_slot(IRLoweringContext *context,
@@ -451,7 +453,7 @@ static void ir_declare_string_free_helper(IRLoweringContext *context) {
   ir_program_add_symbol(context->program, &entry);
 }
 
-static int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node) {
+int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node) {
   Type *type = NULL;
   if (!context || !node || !context->type_checker) {
     return 0;
@@ -469,6 +471,17 @@ static int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node) {
   }
   {
     CallExpression *call = (CallExpression *)node->data;
+    if (call && call->function_name && call->arguments && !call->object &&
+        !call->is_indirect_call &&
+        strcmp(call->function_name, "__mtl_interp") != 0) {
+      for (size_t i = 0; i < call->argument_count; i++) {
+        if (type_checker_callee_hands_back(context->type_checker,
+                                           call->function_name, i)) {
+          return ir_string_temp_is_owned(context, call->arguments[i]);
+        }
+      }
+      return 0;
+    }
     if (!call || !call->function_name ||
         strcmp(call->function_name, "__mtl_interp") != 0 ||
         call->argument_count != 1 || !call->arguments) {
@@ -502,8 +515,8 @@ static int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node) {
   }
 }
 
-static int ir_emit_string_free(IRLoweringContext *context, IRFunction *function,
-                               const IROperand *value, SourceLocation location) {
+int ir_emit_string_free(IRLoweringContext *context, IRFunction *function,
+                        const IROperand *value, SourceLocation location) {
   IROperand argument[1];
   IRInstruction call = {0};
   if (!context || !function || !value) {
@@ -2009,7 +2022,9 @@ static int ir_try_load_aggregate_by_value(IRLoweringContext *context,
       (value_type->kind != TYPE_STRUCT && value_type->kind != TYPE_ARRAY &&
        value_type->kind != TYPE_STRING && value_type->kind != TYPE_SLICE &&
        value_type->kind != TYPE_TAGGED_ENUM) ||
-      value_type->size <= 8 || value_type->size > (size_t)INT_MAX) {
+      value_type->size == 0 || value_type->size == 1 || value_type->size == 2 ||
+      value_type->size == 4 || value_type->size == 8 ||
+      value_type->size > (size_t)INT_MAX) {
     return -1;
   }
 
@@ -3458,6 +3473,13 @@ static int ir_lower_expression_inner(IRLoweringContext *context,
                                      ASTNode *expression,
                                      IROperand *out_value);
 
+static int ir_binary_keeps_address_width(const ASTNode *expression) {
+  const BinaryExpression *binary = (const BinaryExpression *)expression->data;
+  const char *op = binary ? binary->operator : NULL;
+  return op && (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
+                strcmp(op, "*") == 0 || strcmp(op, "<<") == 0);
+}
+
 int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                         ASTNode *expression, IROperand *out_value) {
   int saved_depth = context ? context->address_width_depth : 0;
@@ -3468,7 +3490,10 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
        expression->type == AST_LAMBDA_EXPRESSION ||
        expression->type == AST_CLOSURE_ADAPT_EXPRESSION ||
        expression->type == AST_NEW_EXPRESSION ||
-       expression->type == AST_VALUE_SCOPE)) {
+       expression->type == AST_VALUE_SCOPE ||
+       expression->type == AST_CAST_EXPRESSION ||
+       (expression->type == AST_BINARY_EXPRESSION &&
+        !ir_binary_keeps_address_width(expression)))) {
     context->address_width_depth = 0;
   }
   lowered = ir_lower_expression_inner(context, function, expression, out_value);

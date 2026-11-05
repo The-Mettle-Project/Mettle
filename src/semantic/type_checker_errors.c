@@ -476,10 +476,20 @@ void type_checker_report_undefined_symbol(TypeChecker *checker,
   char error_msg[512];
   snprintf(error_msg, sizeof(error_msg), "Undefined %s '%s'", symbol_type,
            symbol_name);
+  int bad_array = strcmp(symbol_type, "type") == 0 &&
+                  type_checker_explain_bad_array(checker, symbol_name, error_msg,
+                                                 sizeof(error_msg));
 
   checker->has_error = 1;
   free(checker->error_message);
   checker->error_message = strdup(error_msg);
+
+  if (bad_array && checker->error_reporter) {
+    SourceSpan span = source_span_from_location(location, strlen(symbol_name));
+    error_reporter_add_error_with_span_and_suggestion(
+        checker->error_reporter, ERROR_SEMANTIC, span, error_msg, NULL);
+    return;
+  }
 
   if (checker->error_reporter) {
     char suggestion[256];

@@ -522,6 +522,7 @@ void binary_label_fixup_table_destroy(BinaryLabelFixupTable *table);
 int binary_label_table_define(BinaryLabelTable *table, const char *name, size_t offset);
 void binary_label_table_destroy(BinaryLabelTable *table);
 int binary_named_slot_table_add(BinaryNamedSlotTable *table, const char *name, int offset);
+int binary_named_slot_table_set(BinaryNamedSlotTable *table, const char *name, int offset);
 void binary_named_slot_table_destroy(BinaryNamedSlotTable *table);
 int binary_named_slot_table_get_offset(const BinaryNamedSlotTable *table, const char *name);
 void binary_offset_table_destroy(BinaryOffsetTable *table);

@@ -1,0 +1,13 @@
+const Z: int32 = 0;
+var gn: int32 = 3;
+fn f(n: int32) {
+  var a: int32[n];
+}
+fn main() -> int32 {
+  var big: uint8[3000000000];
+  var zero: int32[0];
+  var g: int32[gn];
+  var u: Nope[3];
+  var z: int32[Z];
+  return 0;
+}

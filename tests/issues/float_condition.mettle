@@ -1,6 +1,10 @@
 import "std/io";
 
+fn defer_on_one_line(cell: int32*) -> int32 { defer { *cell = 1; } return 2; }
+
 fn main() -> int32 {
+  var deferred: int32 = 0;
+  if (defer_on_one_line(&deferred) + deferred != 3) { return 1; }
   var n: int32 = 0;
   var f: float64 = 0.5;
   if (1.5) { n = n + 1; }

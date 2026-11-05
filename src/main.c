@@ -5874,9 +5874,19 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
                                int emit_runtime_checks, int emit_safety_checks,
                                IRProgram **out_ir_program,
                                char **out_ir_error) {
+  int errors_before_lowering =
+      type_checker && type_checker->error_reporter
+          ? error_reporter_get_error_count(type_checker->error_reporter)
+          : 0;
   *out_ir_program =
       ir_lower_program(program, type_checker, symbol_table, out_ir_error,
                        emit_runtime_checks, emit_safety_checks);
+  if (type_checker && type_checker->error_reporter &&
+      error_reporter_get_error_count(type_checker->error_reporter) >
+          errors_before_lowering) {
+    error_reporter_print_errors(type_checker->error_reporter);
+    return 0;
+  }
   if (*out_ir_program) {
     const char *const *type_names = NULL;
     const char *const *type_layouts = NULL;

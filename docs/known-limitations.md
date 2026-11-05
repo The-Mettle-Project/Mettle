@@ -515,12 +515,12 @@ either the compiler reports it:
 error[E0002]: Expression nests more than 4096 levels deep
 ```
 
-Nesting is what counts, not length: `a + b + c + ...` folds in a loop and costs
-one level however long it runs. The ceiling exists because each level is a
-frame in the recursive descent and in every pass that walks the tree
-afterwards, and without it deep enough input exhausted the stack and killed the
-process with no diagnostic. It sits an order of magnitude below where that
-happened.
+A chain counts too. `a + b + c + ...` builds a tree that leans left, so each
+operator is one level and a chain holds about 4000 terms. The ceiling exists
+because each level is a frame in the recursive descent and in every pass that
+walks the tree afterwards, and without it deep enough input exhausted the stack
+and killed the process with no diagnostic. It sits an order of magnitude below
+where that happened.
 
 Unreachable-code analysis is block-local and conservative. Some dead paths in
 complex control flow are not diagnosed.

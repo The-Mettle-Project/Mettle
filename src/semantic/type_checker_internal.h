@@ -24,6 +24,8 @@ typedef struct TrackedBufferExtent {
 } TrackedBufferExtent;
 
 void type_checker_bake_local_sizes(TypeChecker *checker, char **type_text);
+int type_checker_explain_bad_array(TypeChecker *checker, const char *name,
+                                   char *out, size_t out_size);
 Type *type_checker_parse_array_type(TypeChecker *checker,
                                            const char *name);
 

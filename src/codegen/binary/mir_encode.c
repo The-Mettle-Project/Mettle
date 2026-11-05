@@ -2706,8 +2706,8 @@ static int mir_encode_inline_asm(MirFunction *fn, const MirInst *in) {
     if (off <= 0) {
       return enc_err(fn, "an asm operand has no frame home");
     }
-    if (!binary_named_slot_table_add(&ctx->local_slots, aux->names[k], off) ||
-        !binary_named_slot_table_add(&ctx->address_taken_symbols,
+    if (!binary_named_slot_table_set(&ctx->local_slots, aux->names[k], off) ||
+        !binary_named_slot_table_set(&ctx->address_taken_symbols,
                                      aux->names[k], off)) {
       return enc_err(fn, "out of memory binding an asm operand");
     }

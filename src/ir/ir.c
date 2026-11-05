@@ -2225,7 +2225,8 @@ MtlcType *ir_program_lookup_type(const IRProgram *program, const char *name) {
   if (!program || !name) {
     return NULL;
   }
-  size_t idx = ir_type_index_find(program, name);
+  size_t idx = ir_type_index_find(program, strcmp(name, "char") == 0 ? "uint8"
+                                                                     : name);
   return idx != (size_t)-1 ? program->type_registry[idx].type : NULL;
 }
 

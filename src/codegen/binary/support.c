@@ -235,6 +235,19 @@ int binary_named_slot_table_add(BinaryNamedSlotTable *table,
   return 1;
 }
 
+int binary_named_slot_table_set(BinaryNamedSlotTable *table, const char *name,
+                                int offset) {
+  if (table && name && offset > 0) {
+    for (size_t i = 0; i < table->count; i++) {
+      if (table->items[i].name && strcmp(table->items[i].name, name) == 0) {
+        table->items[i].offset = offset;
+        return 1;
+      }
+    }
+  }
+  return binary_named_slot_table_add(table, name, offset);
+}
+
 void binary_named_slot_table_destroy(BinaryNamedSlotTable *table) {
   if (!table) {
     return;

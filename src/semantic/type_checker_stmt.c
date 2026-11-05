@@ -1213,6 +1213,53 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
   return type_checker_check_conflict_free(checker, statement);
 }
 
+static int type_checker_check_asm_bindings(TypeChecker *checker,
+                                           ASTNode *statement) {
+  const InlineAsm *inline_asm = (const InlineAsm *)statement->data;
+  const char *at;
+
+  if (!inline_asm || !inline_asm->assembly_code ||
+      type_checker_in_kernel_body(checker)) {
+    return 1;
+  }
+  for (at = strchr(inline_asm->assembly_code, '{'); at;
+       at = strchr(at + 1, '{')) {
+    const char *start = at + 1;
+    const char *end;
+    char name[128];
+    size_t length;
+    while (*start == ' ' || *start == '\t') {
+      start++;
+    }
+    end = start;
+    while (*end && *end != '}' && *end != ' ' && *end != '\t') {
+      end++;
+    }
+    length = (size_t)(end - start);
+    while (*end == ' ' || *end == '\t') {
+      end++;
+    }
+    if (*end != '}') {
+      continue;
+    }
+    if (length == 0 || length >= sizeof(name)) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "'{}' in an asm block names a variable, and this one names nothing");
+      return 0;
+    }
+    memcpy(name, start, length);
+    name[length] = '\0';
+    if (!symbol_table_lookup(checker->symbol_table, name)) {
+      type_checker_set_error_at_location(
+          checker, statement->location,
+          "asm names '{%s}', and no variable '%s' is in scope", name, name);
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
     Program *block = (Program *)statement->data;
     if (block) {
@@ -1710,7 +1757,7 @@ static int type_checker_check_statement_body(TypeChecker *checker,
     return type_checker_check_continue(checker, statement);
 
   case AST_INLINE_ASM:
-    return 1;
+    return type_checker_check_asm_bindings(checker, statement);
 
   case AST_COMPTIME_FOR:
     type_checker_set_error_at_location(

@@ -1,0 +1,8 @@
+extern fn outside() -> int32;
+fn build() -> int32[2] {
+  var t: int32[2];
+  t[0] = outside();
+  return t;
+}
+var table: int32[2] = build();
+fn main() -> int32 { return table[0]; }

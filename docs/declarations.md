@@ -55,7 +55,9 @@ var node = new Node;
 [Types](types.md#leaving-the-type-off) lists which initializers state a type.
 
 Every `var` is mutable. A local with no initializer starts zeroed, and so does
-an array or struct declared without one.
+an array or struct declared without one. Reading a scalar that nothing has
+assigned yet is an error, since it is usually a mistake. Taking its address is
+fine, so `var x: int64; set(&x);` works, and the callee sees zero.
 
 A local you declare and never read draws a warning. A leading underscore says
 you meant it.

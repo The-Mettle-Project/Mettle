@@ -1,0 +1,11 @@
+enum Msg { Add(int32), Reset }
+struct St { n: int32; }
+fn handle(st: St*, m: Msg) -> int32 {
+  return match (m) { case Add(v): v, default: 0 };
+}
+export fn main() -> int32 {
+  var st: St;
+  var g: fn(St*, Msg) -> int32 = &handle;
+  var m: Msg = Add(6);
+  return g(&st, m) - 6;
+}
