@@ -254,6 +254,15 @@ static void vr_declared_range(IRValueRangeCtx *ctx, const char *symbol,
                  VR_TYPE_UNSIGNED(enc->int_value), out);
 }
 
+static int vr_symbol_is_parameter(const IRFunction *fn, const char *symbol) {
+  for (size_t i = 0; fn->parameter_names && i < fn->parameter_count; i++) {
+    if (fn->parameter_names[i] && strcmp(fn->parameter_names[i], symbol) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int vr_symbol_address_taken(IRValueRangeCtx *ctx, const char *symbol) {
   return symbol && ir_temp_value_map_lookup(&ctx->addr_taken, symbol) != NULL;
 }
@@ -629,7 +638,8 @@ static int vr_symbol_is_monotone_counter(IRValueRangeCtx *ctx,
   const IROperand *enc = ir_temp_value_map_lookup(&ctx->decl_types, symbol);
   int result = 0;
   if (enc && enc->kind == IR_OPERAND_INT && VR_TYPE_BITS(enc->int_value) == 64 &&
-      !VR_TYPE_UNSIGNED(enc->int_value)) {
+      !VR_TYPE_UNSIGNED(enc->int_value) &&
+      !vr_symbol_is_parameter(ctx->function, symbol)) {
     if (vr_symbol_sites_ready(ctx)) {
       result = vr_monotone_from_sites(ctx, symbol);
     } else {
@@ -671,7 +681,8 @@ static const IRInstruction *vr_sole_writer(IRValueRangeCtx *ctx,
                ? &fn->instructions[only->int_value - 1]
                : NULL;
   }
-  if (operand->kind != IR_OPERAND_SYMBOL || !vr_symbol_sites_ready(ctx) ||
+  if (operand->kind != IR_OPERAND_SYMBOL ||
+      vr_symbol_is_parameter(fn, operand->name) || !vr_symbol_sites_ready(ctx) ||
       !ir_name_index_find(&ctx->symbol_groups, operand->name, &group)) {
     return NULL;
   }
@@ -771,7 +782,7 @@ static int vr_counter_bounds_scan(IRValueRangeCtx *ctx, const char *symbol,
   long long limit = 0;
   size_t group = 0;
 
-  if (!vr_symbol_sites_ready(ctx) ||
+  if (vr_symbol_is_parameter(fn, symbol) || !vr_symbol_sites_ready(ctx) ||
       !ir_name_index_find(&ctx->symbol_groups, symbol, &group)) {
     return 0;
   }

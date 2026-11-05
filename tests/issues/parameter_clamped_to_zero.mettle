@@ -1,0 +1,50 @@
+import "std/io";
+
+@noinline fn clamp_low(x: int64) -> int64 {
+  if (x < 0) { x = 0; }
+  return x;
+}
+
+@noinline fn replace_negative(x: int64) -> int64 {
+  if (x < 0) { x = 5; }
+  return x;
+}
+
+@noinline fn step_up(x: int64, k: int32) -> int64 {
+  if (k > 2) { x = x + 1; }
+  if (x < 0) { return -1; }
+  return x;
+}
+
+@noinline fn read_then_reset(x: int64, limit: int64) -> int64 {
+  var seen: int64 = 0;
+  if (x < 0) { seen = 100; }
+  x = 0;
+  while (x < limit) { x = x + 1; }
+  return seen + x;
+}
+
+@noinline fn view(p: uint8*, n: int64) -> string {
+  var r: string;
+  r.chars = p;
+  r.length = (uint64)n;
+  return r;
+}
+
+@noinline fn sub(s: string, start: int64, end: int64) -> string {
+  var n: int64 = (int64)s.length;
+  if (start < 0) { start = 0; }
+  if (end > n) { end = n; }
+  if (end <= start) { return view(s.chars, 0); }
+  return view(&s.chars[start], end - start);
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var k: int64 = (int64)argc;
+  println("{clamp_low(k - 2)} {clamp_low(k + 2)} {replace_negative(k - 2)} {replace_negative(k)}");
+  println("{step_up(k - 9, 1)} {step_up(k - 9, 5)} {step_up(k, 5)} {read_then_reset(k - 2, 3)} {read_then_reset(k, 3)}");
+  var a: string = sub("hello", k - 2, k - 1);
+  var c: string = sub("hello", k - 3, k + 1);
+  println("[{a}] {a.length} [{c}]");
+  return 0;
+}
