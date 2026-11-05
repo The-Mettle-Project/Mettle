@@ -7,8 +7,11 @@ extern fn term_w_set_mode(h: int64, mode: uint32) -> int32 = "SetConsoleMode";
 extern fn term_w_read(h: int64, buf: uint8*, n: uint32, got: uint32*, ov: uint8*) -> int32 = "ReadFile";
 extern fn term_w_write(h: int64, buf: uint8*, n: uint32, put: uint32*, ov: uint8*) -> int32 = "WriteFile";
 extern fn term_w_error() -> uint32 = "GetLastError";
+extern fn term_w_ctrl_event(event: uint32, group: uint32) -> int32 = "GenerateConsoleCtrlEvent";
 
 const ENABLE_ECHO_INPUT = 4;
+const ENABLE_PROCESSED_INPUT = 1;
+const ENABLE_LINE_INPUT = 2;
 
 fn term_handle(fd: int64) -> int64 {
   // STD_INPUT_HANDLE is -10, STD_OUTPUT_HANDLE -11, STD_ERROR_HANDLE -12.
@@ -49,3 +52,29 @@ export fn term_os_write(fd: int64, buf: uint8*, n: int64) -> int64 {
   if (term_w_write(term_handle(fd), buf, (uint32)n, &put, (uint8*)0) == 0) { return -(int64)term_w_error(); }
   return (int64)put;
 }
+
+// Echo, line editing and signal keys off; returns 0 or a negative code.
+var g_term_saved: uint32 = 0;
+
+export fn term_os_secret_begin(fd: int64) -> int64 {
+  var h: int64 = term_handle(fd);
+  if (term_w_get_mode(h, &g_term_saved) == 0) { return -(int64)term_w_error(); }
+  var quiet: uint32 = g_term_saved & ~((uint32)ENABLE_ECHO_INPUT | (uint32)ENABLE_PROCESSED_INPUT | (uint32)ENABLE_LINE_INPUT);
+  if (term_w_set_mode(h, quiet) == 0) { return -(int64)term_w_error(); }
+  return 0;
+}
+
+export fn term_os_secret_end(fd: int64) {
+  term_w_set_mode(term_handle(fd), g_term_saved);
+}
+
+export fn term_os_raise(sig: int32) {
+  if (sig == TERM_SIGINT) {
+    term_w_ctrl_event((uint32)0, (uint32)0);   // CTRL_C_EVENT
+  } else {
+    term_w_ctrl_event((uint32)1, (uint32)0);   // CTRL_BREAK_EVENT
+  }
+}
+
+export const TERM_SIGINT = 2;
+export const TERM_SIGQUIT = 3;
