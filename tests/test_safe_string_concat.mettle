@@ -1,0 +1,35 @@
+import "std/io";
+import "std/mem";
+
+fn first(s: string) -> int32 { return (int32)s[0]; }
+
+fn join(a: string, b: string) -> string { return a + b; }
+
+// Strings built with + and by interpolation are read byte by byte.
+fn main() -> int32 {
+  var wrong: int32 = 0;
+  var a: string = "abc";
+  var b: string = a + "def";
+  if (first(b) != 97) { wrong = wrong + 1; }
+  if (b[5] != (char)102) { wrong = wrong + 1; }
+
+  var n: int32 = 42;
+  var c: string = "n={n}";
+  if (c[2] != (char)52 || c.length != 4) { wrong = wrong + 1; }
+
+  var d: string = join(b, "!");
+  if (d[6] != (char)33) { wrong = wrong + 1; }
+
+  var buf: uint8* = (uint8*)malloc(16);
+  memcpy(buf, d.chars, 7);
+  if (buf[0] != 97 || buf[6] != 33) { wrong = wrong + 1; }
+  free(buf);
+
+  var line: string = "";
+  for i in 0..50 {
+    line = line + "x{i}";
+    if (line[0] != (char)120) { wrong = wrong + 1; }
+  }
+  println("string concat wrong={wrong}");
+  return wrong;
+}

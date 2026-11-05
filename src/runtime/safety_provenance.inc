@@ -15,10 +15,28 @@ static SafetyRegion safety_identity_snapshot(uint64_t identity) {
   return result;
 }
 
+// Two different identities met in one value, as in a table pointer plus an
+// index hashed from another pointer. Which one is the base is unknown, so
+// the address decides.
+static uint64_t safety_resolve_identity(const void *base, uint64_t identity) {
+  return identity == UINT64_MAX ? mettle_safety_identity(base) : identity;
+}
+
+// A pointer with no identity may still sit in memory the program named with
+// memory_region, in any module. Only those regions answer by address.
+static uint64_t safety_foreign_identity(const void *base) {
+  if (!base) return 0;
+  SafetyRegion region = safety_snapshot((uintptr_t)base);
+  return region.state == SAFETY_STATE_LIVE && region.foreign ? region.identity : 0;
+}
+
 void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size,
                                   uint32_t kind, uint32_t line,
                                   uint64_t identity) {
   (void)kind;
+  SafetyRegion region = {0};
+  identity = safety_resolve_identity(base, identity);
+  if (!identity) identity = safety_foreign_identity(base);
   if (!identity) {
     if (size <= 0 || safety_allocator_depth()) return;
     SafetyFailure failure = {base ? "memory access has no tracked allocation identity" :
@@ -27,7 +45,7 @@ void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size
     return;
   }
   if (size <= 0) return;
-  SafetyRegion region = safety_identity_snapshot(identity);
+  region = safety_identity_snapshot(identity);
   uintptr_t start = (uintptr_t)base;
   uintptr_t address = start + (uintptr_t)offset;
   int wrapped = offset >= 0 ? address < start : address > start;
@@ -40,6 +58,8 @@ void mettle_safety_check_identity(const void *base, int64_t offset, int64_t size
 }
 
 int64_t mettle_safety_span_identity(const void *base, uint64_t identity) {
+  identity = safety_resolve_identity(base, identity);
+  if (!identity) identity = safety_foreign_identity(base);
   if (!identity) return 0;
   SafetyRegion region = safety_identity_snapshot(identity);
   uintptr_t address = (uintptr_t)base;
@@ -238,6 +258,7 @@ void mettle_safety_value_clear(void *destination, uint64_t size) {
 
 void mettle_safety_free_identity(void *pointer, uint64_t identity) {
   if (!pointer) return;
+  identity = safety_resolve_identity(pointer, identity);
   if (!identity) {
     safety_internal_failure("Fatal error: free has no tracked allocation identity");
   }
@@ -256,9 +277,14 @@ void mettle_safety_region_begin(void *pointer, int64_t size) {
   if (!pointer || size <= 0)
     safety_internal_failure("Fatal error: a foreign memory region needs an address and a positive size");
   SafetyRegion known = safety_snapshot((uintptr_t)pointer);
-  if (known.state == SAFETY_STATE_LIVE && (uintptr_t)pointer == known.start &&
-      (uint64_t)size == known.size) return;
-  mettle_safety_register_static(pointer, (uint64_t)size);
+  if (known.state != SAFETY_STATE_LIVE || (uintptr_t)pointer != known.start ||
+      (uint64_t)size != known.size)
+    mettle_safety_register_static(pointer, (uint64_t)size);
+  safety_lock();
+  uint32_t id = safety_lookup((uintptr_t)pointer);
+  SafetyRegion *region = id >= SAFETY_ID_FIRST ? safety_region(id) : NULL;
+  if (region && region->start == (uintptr_t)pointer) region->foreign = 1;
+  safety_unlock();
 }
 
 void mettle_safety_entry_arguments(void *vector) {
@@ -295,6 +321,21 @@ uint64_t mettle_safety_string_identity(const void *record, uint64_t size) {
   uint64_t data_identity = mettle_safety_literal_identity(data, size);
   mettle_safety_value_store((void *)record, (uint64_t)(uintptr_t)data, data_identity, sizeof(void *));
   return identity;
+}
+
+// The runtime's own string builders allocate behind the tracker's back. The
+// compiler calls this on each result, where the record sits.
+void mettle_safety_string_owned(void *record) {
+  const void *data = record ? *(const void *const *)record : NULL;
+  if (!data) return;
+  mettle_safety_register((void *)data, ((const uint64_t *)record)[1] + 1);
+  mettle_safety_value_store(record, (uint64_t)(uintptr_t)data,
+                            mettle_safety_identity(data), sizeof(void *));
+}
+
+void mettle_safety_string_release(void *record) {
+  const void *data = record ? *(const void *const *)record : NULL;
+  if (data) mettle_safety_unregister((void *)data);
 }
 
 void mettle_safety_global_pointer(void *slot, uint64_t mode, uint64_t size) {

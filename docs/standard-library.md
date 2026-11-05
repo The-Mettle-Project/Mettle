@@ -89,7 +89,8 @@ Building a `string`:
 
 | Function | Effect |
 |----------|--------|
-| `str_from_bytes(p: cstring, n: int64) -> string` | View n bytes |
+| `str_from_bytes(p: cstring, n: int64) -> string` | View n bytes. Not a copy: it dangles once `p` is gone |
+| `str_dup(s: string) -> string` | Heap copy with a NUL after it; free it with `free(copy.chars)` |
 | `str_from_cstr(s: cstring) -> string` | View up to the nul |
 | `str_slice(s: string, start: int64, len: int64) -> string` | A sub-view |
 
@@ -419,6 +420,40 @@ Pages from the operating system, under the heap. Both platforms, with a
 On Linux these make raw system calls, so they also work in a self-contained
 ELF (`--emit-arm64`), which links no libc.
 
+## std/linux
+
+Named wrappers for common Linux system calls, so a program does not hard-code
+numbers. Linux only, on x86-64 and AArch64: `std/linux_sys` picks the call
+numbers for the target CPU. The wrappers use the `syscall` builtin, which the
+released compiler does not have yet.
+
+Each wrapper returns the kernel's raw result: a count or value, or `-errno`.
+
+| Function | Call |
+|----------|------|
+| `linux_read(fd, buf: uint8*, n) -> int64` | `read` |
+| `linux_write(fd, buf: uint8*, n) -> int64` | `write` |
+| `linux_close(fd) -> int64` | `close` |
+| `linux_openat(dirfd, path: uint8*, flags, mode) -> int64` | `openat`; `path` ends in a nul |
+| `linux_lseek(fd, offset, whence) -> int64` | `lseek` |
+| `linux_getpid()`, `linux_gettid() -> int64` | `getpid`, `gettid` |
+| `linux_kill(pid, sig) -> int64` | `kill` |
+| `linux_sched_yield() -> int64` | `sched_yield` |
+| `linux_futex_wait(word: int32*, expected: int32, timeout: int64*) -> int64` | `futex` wait, process-private; `timeout` is `{sec, nsec}` or `(int64*)0` |
+| `linux_futex_wake(word: int32*, count: int32) -> int64` | `futex` wake; returns how many woke |
+| `linux_getrandom(buf: uint8*, n, flags) -> int64` | `getrandom` |
+| `linux_clock_gettime(clock, out: int64*) -> int64` | `out` is `{sec, nsec}` |
+| `linux_nanosleep(req: int64*, rem: int64*) -> int64` | `nanosleep` |
+| `linux_mmap(addr, length, prot, flags, fd, offset) -> int64` | The address, or `-errno` |
+| `linux_munmap(addr, length) -> int64` | `munmap` |
+| `linux_ppoll(fds: LinuxPollFd*, nfds, timeout: int64*) -> int64` | `ppoll` with no signal mask |
+| `linux_exit_group(code)` | Ends every thread; does not return |
+
+`LinuxPollFd` has `fd: int32`, `events: int16` and `revents: int16`. The
+module also exports the flags these calls take: `LINUX_AT_FDCWD`,
+`LINUX_O_*`, `LINUX_PROT_*`, `LINUX_MAP_*`, `LINUX_CLOCK_*`, `LINUX_POLL*` and
+a few errno values (`LINUX_EAGAIN`, `LINUX_EINTR`, `LINUX_ETIMEDOUT`).
+
 ## std/thread
 
 Threads, mutexes, and atomics. Both platforms, with a `.linux` half and a
@@ -733,6 +768,13 @@ positive `code` and a `message`. `net_error_text(code)` describes a code.
 | `sock_recv_exact(fd, buf, n) -> int64` | Receive exactly `n` bytes; 0 if the peer closed first |
 | `sock_wait(fd, events, timeout_ms) -> int64` | Wait for one socket |
 
+**Streams.** `NetStream` is one byte stream: `ctx`, `read`, `write` and `close`
+function pointers, and `fd`, the socket to poll, or -1. `read` and `write`
+return a count, 0 at the end, or a negative code. `net_stream_socket(fd)` makes
+one over a connected socket. A TLS library supplies its own, and std/http and
+std/h2conn run over either. `net_stream_read`, `net_stream_write_all` and
+`net_stream_close` call through it.
+
 **Names.** `net_resolve(host, port, want, out: NetAddr*, max, timeout_ms) ->
 Result<int32, DnsError>` returns how many addresses it wrote. `want` is
 `DNS_WANT_ANY`, `_V4` or `_V6`. It tries, in order: an IP literal,
@@ -904,8 +946,10 @@ The inputs are checked first, and on an error nothing is appended.
 ### Client and server pieces
 
 `http_request(arena, verb, url, headers, nheaders, body, timeout_ms) ->
-Result<HttpClientResponse*, string>` makes one blocking request. Only `http://`
-works; `https://` gives the error `TLS is not supported yet`. It sends `Host`,
+Result<HttpClientResponse*, string>` makes one blocking request over TCP, for
+`http://` URLs. For `https://`, open a TLS stream and call
+`http_request_on(&stream, arena, verb, url, headers, nheaders, body,
+timeout_ms)`, which sends the same request on any `NetStream`. It sends `Host`,
 `Content-Length` (for a body, or for POST, PUT and PATCH) and `Connection:
 close`, and reads the whole reply: `Content-Length`, chunked, or until close.
 1xx replies are skipped. Redirects are not followed. A `Host` header of yours
@@ -923,7 +967,8 @@ match (http_get(arena, "http://127.0.0.1:8080/items?id=7", 3000)) {
 }
 ```
 
-`http_read_head(fd, buf, cap, have, timeout_ms, &head_end) -> int64` is for
+`http_read_head(fd, buf, cap, have, timeout_ms, &head_end) -> int64` (or
+`http_read_head_on(&stream, ...)` for any `NetStream`) is for
 servers. It reads until `buf` holds a whole head and returns the bytes now in
 `buf`, with `head_end` set to where the head ends. `have` is how many bytes are
 already in `buf` (left over on a keep-alive connection, or 0). `timeout_ms` is
@@ -1248,6 +1293,109 @@ out, cap) -> int64` writes one, using the coarsest unit that is exact (`5S`,
 `h2_grpc_status_name(code)`, `h2_grpc_status_parse(text)` (-1 if invalid) and
 `h2_grpc_status_from_http(http_status)` (the mapping for a response with no
 `grpc-status`) round them out.
+
+## std/h2conn
+
+An HTTP/2 connection, client or server, on top of `std/http2` and `std/hpack`. It owns
+stream state, flow-control windows, the SETTINGS exchange, CONTINUATION joining, GOAWAY and
+PING. The core never blocks and never touches a socket: you feed it bytes, take events out,
+and drain the frames it queues. Blocking helpers over a `NetStream` sit on top, so a TLS
+stream from another library plugs in the same way. h2c with prior knowledge needs nothing
+more than the connection: the client queues the preface itself. Linux, macOS and Windows.
+
+```mettle
+var cfg: H2cConfig;
+h2c_config_default(&cfg);
+var c: H2c* = h2c_new(false, &cfg);          // true for a server
+// loop:
+//   bytes from the transport  ->  h2c_feed(c, p, n)
+//   while (h2c_next_event(c, &ev) != 0) { ... }
+//   h2c_pending_output(c, &p) -> write n bytes -> h2c_output_consumed(c, n)
+```
+
+### Setup and plumbing
+
+| Function | Effect |
+|----------|--------|
+| `h2c_config_default(&cfg)` | Fills `H2cConfig`: `max_concurrent_streams` (100), `max_streams` (256), `initial_window` and `conn_window` (65535), `max_frame_size` (16384), `max_header_list_size` (65536), `header_table_size` (4096), `max_output` (1 MiB), `manual_flow` (false) |
+| `h2c_new(is_server, &cfg) -> H2c*` | Makes a connection and queues the preface (client) and SETTINGS. Null if memory runs out |
+| `h2c_free(c)` | Frees it and everything it allocated |
+| `h2c_feed(c, p, n) -> int64` | Hands in transport bytes; returns how many it took. Less than `n` only when the one-frame input buffer is full: drain events, then feed the rest. Negative once the connection is dead |
+| `h2c_input_space(c, &p)`, `h2c_input_commit(c, n)` | Read straight into the input buffer instead of copying |
+| `h2c_next_event(c, &ev) -> int32` | The next event kind, or 0 when more input is needed |
+| `h2c_pending_output(c, &p) -> int64`, `h2c_output_consumed(c, n)`, `h2c_wants_write(c)` | The queued frames, and dropping what the transport took |
+| `h2c_eof(c)` | The transport ended; reports `H2C_EV_CLOSED` |
+
+### Events
+
+`H2cEvent.kind` is one of:
+
+| Kind | Fields | Meaning |
+|------|--------|---------|
+| `H2C_EV_SETTINGS`, `H2C_EV_SETTINGS_ACK` | | The peer's SETTINGS are applied (read them with `h2c_peer_settings`); the peer accepted ours |
+| `H2C_EV_HEADERS` | `stream_id`, `headers`, `header_count`, `end_stream`, `new_stream` | A stream's first header block. A server sees a new stream here. With `end_stream` it is a headers-only request or a trailers-only response |
+| `H2C_EV_DATA` | `stream_id`, `data`, `length`, `end_stream` | Body bytes |
+| `H2C_EV_TRAILERS` | `stream_id`, `headers`, `header_count` | The closing header block; the stream's receive side is done |
+| `H2C_EV_RESET` | `stream_id`, `error_code`, `by_peer`, `unprocessed`, `user` | The stream is dead. `by_peer` is false when this side reset it for a protocol fault. `unprocessed` marks a stream a GOAWAY left unseen (code `H2_REFUSED_STREAM`): safe to retry |
+| `H2C_EV_GOAWAY` | `last_stream_id`, `error_code`, `debug` | The peer is shutting down. Each of your streams above `last_stream_id` also gets a `RESET` with `unprocessed` set |
+| `H2C_EV_PING`, `H2C_EV_PING_ACK` | `ping[8]`, `rtt_ms` | The peer pinged (already answered); your ping came back |
+| `H2C_EV_WRITABLE` | `stream_id`, `window` | A stream that `h2c_send_data` cut short can send again |
+| `H2C_EV_SLOT_FREE` | `count` | Streams finished, or the peer raised its limit: try `h2c_open_stream` again |
+| `H2C_EV_CLOSED` | `error_code`, `debug` | The connection failed or ended. A failing connection has queued GOAWAY; drain the output |
+
+Header strings, `DATA` bytes and the GOAWAY text are valid until the next
+`h2c_next_event`, `h2c_feed`, `h2c_input_space` or `h2c_pump`. Copy what you keep.
+`h2c_find_header(list, n, name, &value)` looks a header up.
+
+### Streams
+
+A stream is named by its id.
+
+| Function | Effect |
+|----------|--------|
+| `h2c_open_stream(c, headers, n, end_stream) -> int32` | Client: opens a stream and sends the request headers; returns the id. `H2C_ERR_NO_SLOT` at the peer's concurrent stream limit, `H2C_ERR_GOAWAY` after a GOAWAY |
+| `h2c_send_headers(c, id, headers, n, end_stream) -> int32` | Server: the response headers (one call with `end_stream` is a trailers-only response). A second call on the same stream sends trailers and ends it |
+| `h2c_send_data(c, id, p, n, end_stream) -> int64` | Queues DATA, as much as the stream window, the connection window and the output cap allow. Returns the bytes taken, maybe 0; send the rest after `H2C_EV_WRITABLE`. `end_stream` counts only with the last byte |
+| `h2c_reset_stream(c, id, code) -> int32` | Sends RST_STREAM; the stream is gone at once |
+| `h2c_consumed(c, id, n)` | With `manual_flow`: the application used `n` DATA bytes, so refill the peer's windows. Without it the windows refill as DATA arrives |
+| `h2c_stream_slots(c)`, `h2c_stream_writable(c, id)` | Streams that can be opened now; bytes `h2c_send_data` would take now |
+| `h2c_stream_set_user(c, id, p)`, `h2c_stream_user(c, id)` | A pointer of yours per stream (also on its `RESET` event) |
+
+Header lists are checked both ways against RFC 9113 section 8. A bad list is `H2C_ERR_BAD_HEADER` on send; a bad one from the peer resets the stream.
+
+### Connection
+
+| Function | Effect |
+|----------|--------|
+| `h2c_ping(c, data8) -> int32` | Sends a PING; up to 8 may be outstanding. The reply is `H2C_EV_PING_ACK` with the same bytes and the round trip |
+| `h2c_goaway(c, last_stream_id, code, debug) -> int32` | Sends GOAWAY. A negative last id means the highest stream accepted. Send `H2_MAX_STREAM_ID` first for a graceful shutdown, then the real one |
+| `h2c_peer_settings(c) -> H2Settings*` | The peer's SETTINGS, as applied |
+| `h2c_open_count(c)`, `h2c_error(c)`, `h2c_is_dead(c)`, `h2c_is_done(c)`, `h2c_goaway_received(c, &last)` | State. `h2c_is_done` is true after a GOAWAY either way once no streams remain and the output is flushed |
+
+A protocol error from the peer ends the connection with GOAWAY, or resets only the stream when the fault is the stream's. Memory is bounded: input is one frame deep, and output, streams and header lists are capped by the config.
+
+### Blocking helpers
+
+| Function | Effect |
+|----------|--------|
+| `h2c_flush(c, &ns) -> int64` | Writes all queued output to a `NetStream`. 0 or a negative error |
+| `h2c_pump(c, &ns, timeout_ms) -> int64` | Flushes, then waits for bytes and feeds them. Bytes read, 0 on timeout, `H2C_PUMP_EOF` (-1) at end of stream, or a negative `-NET_E*` code. Call `h2c_next_event` until it returns 0 before pumping again |
+| `h2c_call(c, &ns, arena, headers, n, body, body_len, max_body, timeout_ms, &out) -> int32` | One request and its whole response, with flow control, on a connection nobody else is using. `H2cResponse` holds `headers`, `trailers` and `body` in the arena. 0, or `H2C_ERR_RESET`, `H2C_ERR_GOAWAY`, `H2C_ERR_TOO_LARGE`, `H2C_ERR_TIMEOUT`, `H2C_ERR_IO`, `H2C_ERR_PROTOCOL` |
+| `h2c_serve(c, &ns, handler, user, max_body, timeout_ms) -> int32` | Serves a server connection until the peer closes it (0), it fails, or it idles. Reads each request whole, calls `handler(user, &request, &reply, arena)`, sends the reply with flow control |
+
+```mettle
+fn handler(user: rawptr, rq: H2cRequest*, rp: H2cReply*, a: Arena*) -> int32 {
+  // fill rp->headers (with :status), rp->body, and optionally rp->trailers
+  return 0;      // non-zero resets the stream
+}
+
+var ns: NetStream = net_stream_socket(fd);      // or a TLS stream
+var c: H2c* = h2c_new(true, &cfg);
+h2c_serve(c, &ns, &handler, 0, 4194304, 30000);
+```
+
+Not handled: informational (1xx) responses, PUSH_PROMISE (refused), PRIORITY (parsed and
+ignored), the SETTINGS timeout.
 
 ## std/file
 

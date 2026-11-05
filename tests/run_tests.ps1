@@ -1843,6 +1843,8 @@ $cases = @(
   # natively in both modes and under the compile-time interpreter.
   @{ Name = "views"; Path = "tests/test_views.mettle"; ShouldSucceed = $true },
   @{ Name = "views_release"; Path = "tests/test_views.mettle"; ShouldSucceed = $true; Args = @("--release") },
+  @{ Name = "std_str_dup"; Path = "tests/test_std_str_dup.mettle"; ShouldSucceed = $true },
+  @{ Name = "std_str_dup_release"; Path = "tests/test_std_str_dup.mettle"; ShouldSucceed = $true; Args = @("--release") },
   @{ Name = "std_time"; Path = "tests/test_std_time.mettle"; ShouldSucceed = $true },
   @{ Name = "std_time_release"; Path = "tests/test_std_time.mettle"; ShouldSucceed = $true; Args = @("--release") },
   @{ Name = "std_datetime_interp"; Path = "tests/test_std_datetime_interp.mettle"; ShouldSucceed = $true
@@ -3271,11 +3273,19 @@ if ($IsLinux) {
     @{ Name = "std_socket_release"; Path = "tests/test_std_socket.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_http"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true },
     @{ Name = "std_http_release"; Path = "tests/test_std_http.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_http_stream"; Path = "tests/test_std_http_stream.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_http_stream_release"; Path = "tests/test_std_http_stream.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_h2conn"; Path = "tests/test_std_h2conn.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_h2conn_release"; Path = "tests/test_std_h2conn.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_sync"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true },
     @{ Name = "std_sync_release"; Path = "tests/test_std_sync.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "mutex_timeout_deadline"; Path = "tests/test_mutex_timeout_deadline.mettle"; ShouldSucceed = $true },
+    @{ Name = "clock_fast"; Path = "tests/test_clock_fast.mettle"; ShouldSucceed = $true },
+    @{ Name = "clock_fast_release"; Path = "tests/test_clock_fast.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_process"; Path = "tests/test_std_process.mettle"; ShouldSucceed = $true },
     @{ Name = "std_process_release"; Path = "tests/test_std_process.mettle"; ShouldSucceed = $true; Args = @("--release") },
+    @{ Name = "std_linux"; Path = "tests/test_std_linux.mettle"; ShouldSucceed = $true },
+    @{ Name = "std_linux_release"; Path = "tests/test_std_linux.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_sys"; Path = "tests/test_std_sys.mettle"; ShouldSucceed = $true },
     @{ Name = "std_sys_release"; Path = "tests/test_std_sys.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_term"; Path = "tests/test_std_term.mettle"; ShouldSucceed = $true },
@@ -3283,7 +3293,9 @@ if ($IsLinux) {
     @{ Name = "std_fs_release"; Path = "tests/test_std_fs.mettle"; ShouldSucceed = $true; Args = @("--release") },
     @{ Name = "std_dl"; Path = "tests/test_std_dl.mettle"; ShouldSucceed = $true; Args = @("-l:libc.so.6") },
     @{ Name = "std_dl_release"; Path = "tests/test_std_dl.mettle"; ShouldSucceed = $true; Args = @("--release", "-l:libc.so.6") },
-    @{ Name = "thread_id_cached"; Path = "tests/test_thread_id_cached.mettle"; ShouldSucceed = $true }
+    @{ Name = "thread_id_cached"; Path = "tests/test_thread_id_cached.mettle"; ShouldSucceed = $true },
+    @{ Name = "malloc_threads"; Path = "tests/test_malloc_threads.mettle"; ShouldSucceed = $true },
+    @{ Name = "malloc_threads_release"; Path = "tests/test_malloc_threads.mettle"; ShouldSucceed = $true; Args = @("--release") }
   )
 }
 
@@ -8248,6 +8260,31 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "safe_parameter_address" -Passed $false -Reason $_.Exception.Message
+}
+
+# Pointers --safe could not follow, which a correct program must still be
+# allowed to use. Each runs plain, under --safe and under --safe --release.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  foreach ($fixture in @("test_safe_region_module", "test_safe_hash_index", "test_safe_string_concat")) {
+    foreach ($mode in @(@(), @("--safe"), @("--safe", "--release"))) {
+      $trackExe = Join-Path $tmpDir "$fixture.exe"
+      $trackBuild = & $CompilerPath --build @mode "tests/$fixture.mettle" -o $trackExe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "$fixture did not build ('$($mode -join ' ')'): $trackBuild"
+      }
+      $trackOut = & $trackExe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0 -or $trackOut -notmatch "wrong=0") {
+        throw "$fixture failed ('$($mode -join ' ')'): exit $LASTEXITCODE`n$trackOut"
+      }
+    }
+  }
+  Write-CaseResult -Name "safe_tracked_pointers" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "safe_tracked_pointers" -Passed $false -Reason $_.Exception.Message
 }
 
 # Every environment knob, set, against the answer it must not change. A knob

@@ -1,0 +1,186 @@
+// The runtime's malloc keeps a cache of small blocks per thread. This
+// hands blocks between threads (one allocates, another frees) and checks
+// that nothing gets corrupted: every block carries a pattern that is
+// checked before it is freed, and blocks of other threads are never
+// touched. Threads then exit with full caches and a new thread and the
+// main thread must still get working, distinct blocks.
+import "std/sync";
+import "std/thread";
+import "std/mem";
+import "std/io";
+
+struct Queue {
+  m: SyncMutex;
+  cond: SyncCond;
+  head: int32;
+  count: int32;
+  ptr: int64[32];
+  size: int64[32];
+  seed: int64[32];
+}
+
+var g_q: Queue[8];
+var g_bad: int32 = 0;
+var g_done: int32 = 0;
+
+fn pattern(seed: int64, i: int64) -> int32 {
+  return (int32)((seed * (int64)31 + i * (int64)7 + (int64)5) & (int64)0xFF);
+}
+
+fn sample_step(size: int64) -> int64 {
+  if (size <= (int64)256) { return (int64)1; }
+  return (int64)13;
+}
+
+fn fill(p: cstring, size: int64, seed: int64) {
+  var step: int64 = sample_step(size);
+  var i: int64 = 0;
+  while (i < size) {
+    *((int8*)((int64)p + i)) = (int8)pattern(seed, i);
+    i = i + step;
+  }
+  *((int8*)((int64)p + size - (int64)1)) = (int8)pattern(seed, size - (int64)1);
+}
+
+fn verify(p: cstring, size: int64, seed: int64) -> bool {
+  var step: int64 = sample_step(size);
+  var i: int64 = 0;
+  while (i < size) {
+    if (((int32)*((int8*)((int64)p + i)) & 0xFF) != pattern(seed, i)) { return false; }
+    i = i + step;
+  }
+  return ((int32)*((int8*)((int64)p + size - (int64)1)) & 0xFF) == pattern(seed, size - (int64)1);
+}
+
+fn size_for(i: int64, t: int64) -> int64 {
+  if (i % (int64)997 == (int64)0) { return (int64)20000 + i % (int64)5000; }
+  if (i % (int64)211 == (int64)0) { return (int64)8000 + t; }
+  return ((i * (int64)37 + t * (int64)11) % (int64)4200) + (int64)1;
+}
+
+fn push(q: Queue*, p: cstring, size: int64, seed: int64) {
+  sync_mutex_lock(&q->m);
+  while (q->count == 32) { sync_cond_wait(&q->cond, &q->m); }
+  var at: int32 = (q->head + q->count) % 32;
+  q->ptr[at] = (int64)p;
+  q->size[at] = size;
+  q->seed[at] = seed;
+  q->count = q->count + 1;
+  sync_cond_broadcast(&q->cond);
+  sync_mutex_unlock(&q->m);
+}
+
+// Takes a block from the queue, checks it, and frees it on this thread.
+fn pop_and_free(q: Queue*) {
+  sync_mutex_lock(&q->m);
+  while (q->count == 0) { sync_cond_wait(&q->cond, &q->m); }
+  var at: int32 = q->head;
+  var p: cstring = (cstring)q->ptr[at];
+  var size: int64 = q->size[at];
+  var seed: int64 = q->seed[at];
+  q->head = (q->head + 1) % 32;
+  q->count = q->count - 1;
+  sync_cond_broadcast(&q->cond);
+  sync_mutex_unlock(&q->m);
+  if (!verify(p, size, seed)) { atomic_inc_i32(&g_bad); }
+  free(p);
+}
+
+// Thread t sends to queue t and receives from queue t xor 1, so every pair
+// of threads frees each other's blocks.
+fn worker(arg: cstring) -> uint32 {
+  var t: int64 = (int64)arg;
+  var out: Queue* = &g_q[(int32)t];
+  var in: Queue* = &g_q[(int32)(t ^ (int64)1)];
+  var mine: cstring[16];
+  var mine_size: int64[16];
+  for j in 0..16 { mine[j] = (cstring)0; }
+  for i in 0..6000 {
+    var size: int64 = size_for((int64)i, t);
+    var seed: int64 = t * (int64)1000003 + (int64)i;
+    var p: cstring = malloc(size);
+    if (p == 0) { atomic_inc_i32(&g_bad); return (uint32)1; }
+    fill(p, size, seed);
+    if (i % 5 == 3) {
+      // Grow the block; the old contents must come along.
+      var bigger: int64 = size * (int64)2 + (int64)1;
+      var r: cstring = realloc(p, bigger);
+      if (r == 0) { atomic_inc_i32(&g_bad); return (uint32)1; }
+      if (!verify(r, size, seed)) { atomic_inc_i32(&g_bad); }
+      fill(r, bigger, seed);
+      p = r;
+      size = bigger;
+    }
+    push(out, p, size, seed);
+
+    // Blocks this thread keeps for a while, so caches fill and drain.
+    var k: int32 = i % 16;
+    if (mine[k] != 0) {
+      if (!verify(mine[k], mine_size[k], (int64)k + t * (int64)77)) { atomic_inc_i32(&g_bad); }
+      free(mine[k]);
+    }
+    var ms: int64 = (int64)((i % 7) * 40 + 8);
+    mine[k] = calloc(1, ms);
+    if (mine[k] == 0) { atomic_inc_i32(&g_bad); return (uint32)1; }
+    for z in 0..ms {
+      if (*((int8*)((int64)mine[k] + (int64)z)) != (int8)0) { atomic_inc_i32(&g_bad); }
+    }
+    mine_size[k] = ms;
+    fill(mine[k], ms, (int64)k + t * (int64)77);
+
+    pop_and_free(in);
+  }
+  for j in 0..16 {
+    if (mine[j] != 0) { free(mine[j]); }
+  }
+  atomic_inc_i32(&g_done);
+  return (uint32)0;
+}
+
+fn start(f: fn(cstring) -> uint32, n: int64) -> int64 {
+  var tid: uint32 = 0;
+  return CreateThread((cstring)0, (uint64)0, f, (cstring)n, (uint32)0, &tid);
+}
+
+var g_seen: int64[10];
+
+// A thread that fills its cache with 48-byte blocks and exits.
+fn short_lived(arg: cstring) -> uint32 {
+  var held: cstring[10];
+  for i in 0..10 { held[i] = malloc(48); g_seen[i] = (int64)held[i]; }
+  for i in 0..10 { free(held[i]); }
+  return (uint32)0;
+}
+
+fn main() -> int32 {
+  for round in 0..3 {
+    var h: int64[8];
+    g_done = 0;
+    for i in 0..8 { h[i] = start(&worker, (int64)i); }
+    for i in 0..8 { thread_join_infinite(h[i]); }
+    if (g_bad != 0) { println("malloc_threads: corruption in round {round}"); return 1; }
+    if (g_done != 8) { println("malloc_threads: a worker failed in round {round}"); return 2; }
+  }
+
+  // The blocks a thread cached are back in the shared heap when it exits.
+  var s: int64 = start(&short_lived, (int64)0);
+  thread_join_infinite(s);
+  var got: cstring[3000];
+  var found: int32 = 0;
+  for i in 0..3000 {
+    got[i] = malloc(48);
+    if (got[i] == 0) { return 3; }
+    fill(got[i], 48, (int64)i);
+    for j in 0..10 {
+      if ((int64)got[i] == g_seen[j]) { found = found + 1; }
+    }
+  }
+  if (found != 10) { println("malloc_threads: {found} of 10 blocks of an exited thread came back"); return 4; }
+  // Blocks are distinct and unharmed.
+  for i in 0..3000 {
+    if (!verify(got[i], 48, (int64)i)) { println("malloc_threads: block {i} overwritten"); return 5; }
+  }
+  for i in 0..3000 { free(got[i]); }
+  println("malloc_threads: ok");
+  return 0;
+}

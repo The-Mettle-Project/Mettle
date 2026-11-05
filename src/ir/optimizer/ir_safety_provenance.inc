@@ -258,6 +258,16 @@ static int origin_return(SafetyOrigins *origins, SourceLocation location,
   return ok;
 }
 
+// Runtime helpers that return a string in a block of their own.
+static int origin_builds_string(const char *name) {
+  static const char *const builders[] = {
+    "mettle_string_concat", "mettle_string_from_uint", "mettle_string_from_int",
+    "mettle_string_from_char", "mettle_string_from_cstring", "mettle_string_from_f64"};
+  for (size_t i = 0; name && i < sizeof(builders) / sizeof(builders[0]); i++)
+    if (!strcmp(name, builders[i])) return 1;
+  return 0;
+}
+
 static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
                               const IROperand *entry) {
   if (in->op == IR_OP_SAFETY_CHECK) {
@@ -410,6 +420,17 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
 
   IROpcode op = in->op;
   int is_float = in->is_float;
+  int fresh_string = aggregate_size && origin_value_is_string(origins, &dest) &&
+      ((op == IR_OP_BINARY && in->text && !strcmp(in->text, "+")) ||
+       (op == IR_OP_CALL && origin_builds_string(in->text)));
+  if (op == IR_OP_CALL && in->text && !strcmp(in->text, "mettle_string_free") &&
+      in->argument_count == 1 && origin_aggregate_size(origins, &in->arguments[0])) {
+    IROperand record = ir_operand_none();
+    int released = origin_address(origins, location, &in->arguments[0], &record) &&
+        origin_call(origins, location, "mettle_safety_string_release", &record, 1, NULL);
+    ir_operand_destroy(&record);
+    if (!released) goto done;
+  }
   int subtract = op == IR_OP_BINARY && in->text && !strcmp(in->text, "-");
   int arithmetic = op == IR_OP_BINARY && in->text &&
       strcmp(in->text, "==") && strcmp(in->text, "!=") && strcmp(in->text, "<") &&
@@ -464,6 +485,13 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
              op != IR_OP_DECLARE_LOCAL) {
     IROperand zero = ir_operand_int(0);
     if (!origin_assign(origins, location, &output->identity, &zero)) goto done;
+  }
+  if (fresh_string) {
+    IROperand record = ir_operand_none();
+    int owned = origin_address(origins, location, &dest, &record) &&
+        origin_call(origins, location, "mettle_safety_string_owned", &record, 1, NULL);
+    ir_operand_destroy(&record);
+    if (!owned) goto done;
   }
   if (op == IR_OP_STORE && rhs.kind == IR_OPERAND_INT && rhs.int_value <= 8) {
     IROperand zero = ir_operand_int(0);

@@ -1936,6 +1936,7 @@ mt_hosted_initialize(int argc, char **argv, char **envp) {
 
 static int mt_initialize_initial_tls(mt_i64 argc, char **argv);
 static int mt_thread_pointer_installed(void);
+static void mt_vdso_init(mt_i64 argc, char **argv);
 #if defined(MTLC_HOST_PREFIX_H)
 static void mt_raise_stack_limit(void);
 #endif
@@ -1949,6 +1950,7 @@ void mettle_rt_startup(mt_i64 argc, char **argv) {
     _exit(127);
   }
   mt_environment = argv + argc + 1;
+  mt_vdso_init(argc, argv);
   if (mt_thread_pointer_installed()) {
     mt_stack_high = (void *)argv;
   }
@@ -2381,6 +2383,179 @@ static int mt_initialize_initial_tls(mt_i64 argc, char **argv) {
     return mt_install_thread_pointer((void *)result, mapping_size);
   }
   return 1;
+}
+
+#define MT_AT_SYSINFO_EHDR 33
+#define MT_PT_LOAD 1
+#define MT_PT_DYNAMIC 2
+#define MT_PT_PHDR 6
+#define MT_DT_NULL 0
+#define MT_DT_HASH 4
+#define MT_DT_STRTAB 5
+#define MT_DT_SYMTAB 6
+#define MT_DT_DEBUG 21
+#define MT_DT_GNU_HASH 0x6ffffef5
+#define MT_DT_VERSYM 0x6ffffff0
+#define MT_DT_VERDEF 0x6ffffffc
+#define MT_STT_FUNC 2
+
+#if defined(__aarch64__)
+#define MT_VDSO_CLOCK_NAME "__kernel_clock_gettime"
+#define MT_VDSO_CLOCK_VERSION "LINUX_2.6.39"
+#else
+#define MT_VDSO_CLOCK_NAME "__vdso_clock_gettime"
+#define MT_VDSO_CLOCK_VERSION "LINUX_2.6"
+#endif
+
+typedef struct MtElfDyn {
+  mt_i64 tag;
+  mt_u64 value;
+} MtElfDyn;
+
+typedef struct MtElfSym {
+  mt_u32 name;
+  mt_u8 info;
+  mt_u8 other;
+  mt_u16 section;
+  mt_u64 value;
+  mt_u64 size;
+} MtElfSym;
+
+typedef struct MtElfVerdef {
+  mt_u16 version;
+  mt_u16 flags;
+  mt_u16 index;
+  mt_u16 count;
+  mt_u32 hash;
+  mt_u32 aux;
+  mt_u32 next;
+} MtElfVerdef;
+
+typedef struct MtElfVerdaux {
+  mt_u32 name;
+  mt_u32 next;
+} MtElfVerdaux;
+
+static int (*mt_vdso_clock_gettime)(int, void *);
+
+static int mt_vdso_version_is(const MtElfVerdef *definition, mt_u32 index,
+                              const char *strings, const char *version) {
+  for (;;) {
+    if (!(definition->flags & 1) && definition->index == index) {
+      const MtElfVerdaux *aux =
+          (const MtElfVerdaux *)((const mt_u8 *)definition + definition->aux);
+      return strcmp(strings + aux->name, version) == 0;
+    }
+    if (!definition->next) return 0;
+    definition = (const MtElfVerdef *)((const mt_u8 *)definition +
+                                       definition->next);
+  }
+}
+
+/* Finds a function in the vDSO image by name and version, or returns null. */
+static void *mt_vdso_find(const mt_u8 *image, const char *name,
+                          const char *version) {
+  if (image[0] != 0x7f || image[1] != 'E' || image[2] != 'L' ||
+      image[3] != 'F' || image[4] != 2) {
+    return MT_NULL;
+  }
+  mt_u64 header_offset = *(const mt_u64 *)(image + 32);
+  mt_u64 header_size = *(const mt_u16 *)(image + 54);
+  mt_u64 header_count = *(const mt_u16 *)(image + 56);
+  if (header_size < sizeof(MtElfProgramHeader)) return MT_NULL;
+
+  const MtElfDyn *dynamic = MT_NULL;
+  mt_u64 bias = 0;
+  int have_load = 0;
+  for (mt_u64 i = 0; i < header_count; i++) {
+    const MtElfProgramHeader *header = (const MtElfProgramHeader *)
+        (image + header_offset + i * header_size);
+    if (header->type == MT_PT_LOAD && !have_load) {
+      have_load = 1;
+      bias = (mt_u64)image + header->offset - header->virtual_address;
+    } else if (header->type == MT_PT_DYNAMIC) {
+      dynamic = (const MtElfDyn *)(image + header->offset);
+    }
+  }
+  if (!have_load || !dynamic) return MT_NULL;
+
+  const MtElfSym *symbols = MT_NULL;
+  const char *strings = MT_NULL;
+  const mt_u32 *hash = MT_NULL;
+  const mt_u32 *gnu_hash = MT_NULL;
+  const mt_u16 *versions = MT_NULL;
+  const MtElfVerdef *definitions = MT_NULL;
+  for (const MtElfDyn *entry = dynamic; entry->tag != 0; entry++) {
+    void *address = (void *)(bias + entry->value);
+    if (entry->tag == MT_DT_SYMTAB) symbols = (const MtElfSym *)address;
+    else if (entry->tag == MT_DT_STRTAB) strings = (const char *)address;
+    else if (entry->tag == MT_DT_HASH) hash = (const mt_u32 *)address;
+    else if (entry->tag == MT_DT_GNU_HASH) gnu_hash = (const mt_u32 *)address;
+    else if (entry->tag == MT_DT_VERSYM) versions = (const mt_u16 *)address;
+    else if (entry->tag == MT_DT_VERDEF) {
+      definitions = (const MtElfVerdef *)address;
+    }
+  }
+  if (!symbols || !strings || (!hash && !gnu_hash)) return MT_NULL;
+
+  /* The symbol table has no length field; take it from the hash table. */
+  mt_u32 count = 0;
+  if (hash) {
+    count = hash[1];
+  } else {
+    mt_u32 bucket_count = gnu_hash[0];
+    mt_u32 first = gnu_hash[1];
+    const mt_u32 *buckets = (const mt_u32 *)((const mt_u8 *)gnu_hash + 16 +
+                                             (mt_u64)gnu_hash[2] * 8);
+    const mt_u32 *chain = buckets + bucket_count;
+    mt_u32 last = 0;
+    for (mt_u32 i = 0; i < bucket_count; i++) {
+      if (buckets[i] > last) last = buckets[i];
+    }
+    if (last < first) {
+      count = first;
+    } else {
+      while (!(chain[last - first] & 1)) last++;
+      count = last + 1;
+    }
+  }
+
+  for (mt_u32 i = 0; i < count; i++) {
+    const MtElfSym *symbol = &symbols[i];
+    if (symbol->section == 0 || (symbol->info & 0xf) != MT_STT_FUNC) continue;
+    if (strcmp(strings + symbol->name, name) != 0) continue;
+    if (versions && definitions &&
+        !mt_vdso_version_is(definitions, versions[i] & 0x7fff, strings,
+                            version)) {
+      continue;
+    }
+    return (void *)(bias + symbol->value);
+  }
+  return MT_NULL;
+}
+
+static void mt_vdso_init(mt_i64 argc, char **argv) {
+  char **environment = argv + argc + 1;
+  while (*environment) environment++;
+  const mt_u8 *image = MT_NULL;
+  for (mt_u64 *auxiliary = (mt_u64 *)(environment + 1); auxiliary[0];
+       auxiliary += 2) {
+    if (auxiliary[0] == MT_AT_SYSINFO_EHDR) image = (const mt_u8 *)auxiliary[1];
+  }
+  if (image) {
+    mt_vdso_clock_gettime = (int (*)(int, void *))mt_vdso_find(
+        image, MT_VDSO_CLOCK_NAME, MT_VDSO_CLOCK_VERSION);
+  }
+}
+
+/* Reads through the vDSO; on any error, redoes it as a real call. */
+static int mt_clock_read(int clock_id, void *timespec_value) {
+  if (mt_vdso_clock_gettime && mt_vdso_clock_gettime(clock_id,
+                                                      timespec_value) == 0) {
+    return 0;
+  }
+  return (int)mt_sys_result(mt_syscall6(MT_SYS_CLOCK_GETTIME, clock_id,
+                                        (mt_i64)timespec_value, 0, 0, 0, 0));
 }
 
 typedef struct MtKernelSigaction {
@@ -2893,8 +3068,7 @@ int mettle_dir_list_md_files(const char *root, char *paths, mt_i32 capacity,
 int gettimeofday(void *time_value, void *timezone_value) {
   mt_i64 timespec_value[2] = {0, 0};
   (void)timezone_value;
-  if (mt_sys_result(mt_syscall6(MT_SYS_CLOCK_GETTIME, 0,
-                                (mt_i64)timespec_value, 0, 0, 0, 0)) < 0) {
+  if (mt_clock_read(0, timespec_value) < 0) {
     return -1;
   }
   ((mt_i64 *)time_value)[0] = timespec_value[0];
@@ -3054,12 +3228,38 @@ int mprotect(void *address, mt_size length, int protection) {
 #define MT_HEAP_CHUNK_MIN (256u * 1024u)
 #define MT_HEAP_CHUNK_MAX (8u * 1024u * 1024u)
 #define MT_HEAP_CLASS_BYTES(c) ((mt_size)16 << (c))
+#define MT_HEAP_COUNT_STEP 256
 
-static void *mt_heap_free_list[MT_HEAP_CLASS_COUNT];
+/* A block is a 16-byte header (class tag, size) and the user bytes. A free
+   block keeps the next free block in its first user word. */
+#define MT_BLOCK_NEXT(base) (*(mt_u64 **)((base) + 2))
+#define MT_BATCH_NEXT(base) (*(mt_u64 **)((base) + 3))
+
+/* The shared heap is a stack of batches per class. A batch is a chain of
+   free blocks; its first block holds the chain length in header word 1 and
+   the next batch in its second user word. */
+static mt_u64 *mt_heap_batches[MT_HEAP_CLASS_COUNT];
 static char *mt_heap_bump;
 static mt_size mt_heap_bump_left;
 static mt_size mt_heap_chunk_size;
 static volatile int mt_heap_lock;
+
+#if defined(MT_HOSTED) || defined(MT_SHARED_RUNTIME)
+#define MT_HEAP_CACHED 0
+#else
+/* Classes 0..8 (16 to 4096 bytes) get a per-thread cache. */
+#define MT_HEAP_CACHED 9
+typedef struct MtHeapBin {
+  mt_u64 *head;
+  mt_u32 count;
+} MtHeapBin;
+
+static __thread MtHeapBin mt_heap_bins[MT_HEAP_CACHED];
+static __thread mt_u32 mt_heap_allocs_local;
+static __thread mt_u32 mt_heap_frees_local;
+static const mt_u8 mt_heap_batch_size[MT_HEAP_CACHED] = {64, 64, 64, 64, 64,
+                                                          32, 16, 8,  4};
+#endif
 
 static int mt_heap_class_of(mt_size size) {
   if (size <= 16) {
@@ -3092,6 +3292,30 @@ static void mt_heap_release(void) {
   __atomic_store_n(&mt_heap_lock, 0, __ATOMIC_RELEASE);
 }
 
+/* Counts are kept per thread and added to the totals every 256 calls. */
+static void mt_heap_count_alloc(void) {
+#if MT_HEAP_CACHED
+  if (++mt_heap_allocs_local == MT_HEAP_COUNT_STEP) {
+    mt_heap_allocs_local = 0;
+    __atomic_fetch_add(&mt_allocation_count, MT_HEAP_COUNT_STEP,
+                       __ATOMIC_RELAXED);
+  }
+#else
+  __atomic_fetch_add(&mt_allocation_count, 1, __ATOMIC_RELAXED);
+#endif
+}
+
+static void mt_heap_count_free(void) {
+#if MT_HEAP_CACHED
+  if (++mt_heap_frees_local == MT_HEAP_COUNT_STEP) {
+    mt_heap_frees_local = 0;
+    __atomic_fetch_add(&mt_free_count, MT_HEAP_COUNT_STEP, __ATOMIC_RELAXED);
+  }
+#else
+  __atomic_fetch_add(&mt_free_count, 1, __ATOMIC_RELAXED);
+#endif
+}
+
 __attribute__((noinline)) static void *mt_heap_map(mt_size bytes) {
 #if defined(MT_HOSTED)
   return mt_hosted_map(bytes);
@@ -3119,21 +3343,146 @@ __attribute__((noinline)) static int mt_heap_refill(void) {
   return 1;
 }
 
-__attribute__((noinline)) static mt_u64 *mt_heap_take(int class_index) {
-  mt_u64 *base;
+/* Takes a chain of free blocks of one class from the shared heap: a whole
+   batch if there is one, else up to `want` blocks cut from the bump chunk. */
+__attribute__((noinline)) static mt_u64 *mt_heap_fetch(int class_index,
+                                                       mt_u32 want,
+                                                       mt_u32 *count_out) {
   mt_size block_bytes = MT_HEAP_CLASS_BYTES(class_index) + MT_HEAP_HEADER;
+  mt_u64 *base;
+  mt_size count;
 
   mt_heap_acquire();
-  base = (mt_u64 *)mt_heap_free_list[class_index];
+  base = mt_heap_batches[class_index];
   if (base) {
-    mt_heap_free_list[class_index] = *(void **)(base + 2);
-  } else if (mt_heap_bump_left >= block_bytes || mt_heap_refill()) {
-    base = (mt_u64 *)mt_heap_bump;
-    mt_heap_bump += block_bytes;
-    mt_heap_bump_left -= block_bytes;
+    mt_heap_batches[class_index] = MT_BATCH_NEXT(base);
+    mt_heap_release();
+    *count_out = (mt_u32)base[1];
+    return base;
   }
+  if (mt_heap_bump_left < block_bytes && !mt_heap_refill()) {
+    mt_heap_release();
+    return MT_NULL;
+  }
+  count = mt_heap_bump_left / block_bytes;
+  if (count > want) {
+    count = want;
+  }
+  base = (mt_u64 *)mt_heap_bump;
+  mt_heap_bump += count * block_bytes;
+  mt_heap_bump_left -= count * block_bytes;
   mt_heap_release();
+  for (mt_size i = 0; i + 1 < count; i++) {
+    mt_u64 *block = (mt_u64 *)((char *)base + i * block_bytes);
+    MT_BLOCK_NEXT(block) = (mt_u64 *)((char *)block + block_bytes);
+  }
+  MT_BLOCK_NEXT((mt_u64 *)((char *)base + (count - 1) * block_bytes)) =
+      MT_NULL;
+  *count_out = (mt_u32)count;
   return base;
+}
+
+/* Gives a chain of `count` free blocks back to the shared heap. */
+static void mt_heap_push(int class_index, mt_u64 *head, mt_u32 count) {
+  head[1] = count;
+  mt_heap_acquire();
+  MT_BATCH_NEXT(head) = mt_heap_batches[class_index];
+  mt_heap_batches[class_index] = head;
+  mt_heap_release();
+}
+
+#if MT_HEAP_CACHED
+__attribute__((noinline)) static mt_u64 *mt_heap_cache_fill(int class_index) {
+  MtHeapBin *bin = &mt_heap_bins[class_index];
+  mt_u32 count = 0;
+  mt_u64 *base = mt_heap_fetch(class_index, mt_heap_batch_size[class_index],
+                               &count);
+  if (base) {
+    bin->head = MT_BLOCK_NEXT(base);
+    bin->count = count - 1;
+  }
+  return base;
+}
+
+/* The bin is full: the newest batch-size blocks go back to the shared heap. */
+__attribute__((noinline)) static void mt_heap_cache_spill(int class_index) {
+  MtHeapBin *bin = &mt_heap_bins[class_index];
+  mt_u32 batch = mt_heap_batch_size[class_index];
+  mt_u64 *head = bin->head;
+  mt_u64 *tail = head;
+  for (mt_u32 i = 1; i < batch; i++) {
+    tail = MT_BLOCK_NEXT(tail);
+  }
+  bin->head = MT_BLOCK_NEXT(tail);
+  bin->count -= batch;
+  MT_BLOCK_NEXT(tail) = MT_NULL;
+  mt_heap_push(class_index, head, batch);
+}
+#endif
+
+/* Called as a runtime thread ends: its cached blocks go back to the shared
+   heap and its counts into the totals. */
+static void mt_heap_thread_exit(void) {
+#if MT_HEAP_CACHED
+  for (int c = 0; c < MT_HEAP_CACHED; c++) {
+    MtHeapBin *bin = &mt_heap_bins[c];
+    if (bin->head) {
+      mt_heap_push(c, bin->head, bin->count);
+      bin->head = MT_NULL;
+      bin->count = 0;
+    }
+  }
+  __atomic_fetch_add(&mt_allocation_count, mt_heap_allocs_local,
+                     __ATOMIC_RELAXED);
+  __atomic_fetch_add(&mt_free_count, mt_heap_frees_local, __ATOMIC_RELAXED);
+  mt_heap_allocs_local = 0;
+  mt_heap_frees_local = 0;
+#endif
+}
+
+static mt_u64 *mt_heap_take_linked(int class_index);
+
+/* Clears the free-list links, so a fresh block reads as zero. */
+static mt_u64 *mt_heap_take(int class_index) {
+  mt_u64 *base = mt_heap_take_linked(class_index);
+  if (base) {
+    base[2] = 0;
+    base[3] = 0;
+  }
+  return base;
+}
+
+static mt_u64 *mt_heap_take_linked(int class_index) {
+  mt_u32 count;
+#if MT_HEAP_CACHED
+  if (class_index < MT_HEAP_CACHED) {
+    MtHeapBin *bin = &mt_heap_bins[class_index];
+    mt_u64 *base = bin->head;
+    if (base) {
+      bin->head = MT_BLOCK_NEXT(base);
+      bin->count--;
+      return base;
+    }
+    return mt_heap_cache_fill(class_index);
+  }
+#endif
+  return mt_heap_fetch(class_index, 1, &count);
+}
+
+static void mt_heap_give(mt_u64 *base, int class_index) {
+#if MT_HEAP_CACHED
+  if (class_index < MT_HEAP_CACHED) {
+    MtHeapBin *bin = &mt_heap_bins[class_index];
+    MT_BLOCK_NEXT(base) = bin->head;
+    bin->head = base;
+    if (++bin->count >= 2u * mt_heap_batch_size[class_index]) {
+      mt_heap_cache_spill(class_index);
+    }
+    return;
+  }
+#endif
+  MT_BLOCK_NEXT(base) = MT_NULL;
+  mt_heap_push(class_index, base, 1);
 }
 
 void *malloc(mt_size size) {
@@ -3159,7 +3508,7 @@ void *malloc(mt_size size) {
   }
   base[0] = tag;
   base[1] = size;
-  mt_allocation_count++;
+  mt_heap_count_alloc();
   return base + 2;
 }
 
@@ -3194,7 +3543,7 @@ void free(void *memory) {
       (base[0] > MT_HEAP_CLASS_COUNT && base[0] != base[1] + MT_HEAP_HEADER)) {
     mt_heap_bad_free();
   }
-  mt_free_count++;
+  mt_heap_count_free();
   if (base[0] > MT_HEAP_CLASS_COUNT) {
 #if defined(MT_HOSTED)
     mt_hosted_unmap(base, base[0]);
@@ -3203,10 +3552,7 @@ void free(void *memory) {
 #endif
     return;
   }
-  mt_heap_acquire();
-  *(void **)memory = mt_heap_free_list[base[0] - 1];
-  mt_heap_free_list[base[0] - 1] = base;
-  mt_heap_release();
+  mt_heap_give(base, (int)base[0] - 1);
 }
 
 void *realloc(void *memory, mt_size size) {
@@ -3420,8 +3766,7 @@ int shutdown(int fd, int how) {
 }
 
 int clock_gettime(int clock_id, void *timespec_value) {
-  return (int)mt_sys_result(mt_syscall6(MT_SYS_CLOCK_GETTIME, clock_id,
-                                        (mt_i64)timespec_value, 0, 0, 0, 0));
+  return mt_clock_read(clock_id, timespec_value);
 }
 
 int nanosleep(const void *request, void *remaining) {
@@ -3524,34 +3869,11 @@ static void mt_thread_child(MtThread *thread) {
   thread->result = thread->pthread_start
                        ? thread->pthread_start(thread->argument)
                        : (mt_u64)thread->start(thread->argument);
+  mt_heap_thread_exit();
   mt_syscall6(MT_SYS_EXIT, 0, 0, 0, 0, 0, 0);
   for (;;) {
   }
 }
-
-#define MT_PT_DYNAMIC 2
-#define MT_PT_PHDR 6
-#define MT_DT_NULL 0
-#define MT_DT_HASH 4
-#define MT_DT_STRTAB 5
-#define MT_DT_SYMTAB 6
-#define MT_DT_DEBUG 21
-#define MT_DT_GNU_HASH 0x6ffffef5
-#define MT_DT_VERSYM 0x6ffffff0
-
-typedef struct MtElfDyn {
-  mt_i64 tag;
-  mt_u64 value;
-} MtElfDyn;
-
-typedef struct MtElfSym {
-  mt_u32 name;
-  mt_u8 info;
-  mt_u8 other;
-  mt_u16 section;
-  mt_u64 value;
-  mt_u64 size;
-} MtElfSym;
 
 typedef struct MtLinkMap {
   mt_u64 base;
@@ -3747,6 +4069,7 @@ static void *mt_glibc_thread_entry(void *raw) {
   thread->result = thread->pthread_start
                        ? thread->pthread_start(thread->argument)
                        : (mt_u64)thread->start(thread->argument);
+  mt_heap_thread_exit();
   __atomic_store_n(&thread->tid, 0, __ATOMIC_RELEASE);
   mt_futex(&thread->tid, MT_FUTEX_WAKE, 0x7fffffff, MT_NULL);
   return MT_NULL;
@@ -4102,6 +4425,7 @@ mt_i64 pthread_self(void) { return (mt_i64)mettle_thread_current_id(); }
 
 MT_NORETURN void pthread_exit(void *result) {
   (void)result;
+  mt_heap_thread_exit();
   mt_syscall6(MT_SYS_EXIT, 0, 0, 0, 0, 0, 0);
   for (;;) {
   }
@@ -6351,6 +6675,9 @@ int sscanf(const char *input, const char *format, ...) {
 }
 
 void mettle_alloc_report(void) {
+#if !defined(_WIN32)
+  mt_heap_thread_exit();
+#endif
   fprintf(stderr, "Owned runtime heap: %llu allocations, %llu frees\n",
           (unsigned long long)__atomic_load_n(&mt_allocation_count,
                                               __ATOMIC_RELAXED),

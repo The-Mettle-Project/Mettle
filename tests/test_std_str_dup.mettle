@@ -1,0 +1,20 @@
+// str_dup gives a copy that outlives the buffer it came from.
+import "std/conv";
+import "std/mem";
+
+fn mk() -> string {
+  var buf: uint8[8];
+  buf[0] = (uint8)104;
+  buf[1] = (uint8)105;
+  return str_dup(str_from_bytes((cstring)&buf[0], 2));
+}
+
+fn main() -> int32 {
+  var s: string = mk();
+  if (s != "hi" || s.chars[2] != (uint8)0) { return 1; }
+  var e: string = str_dup("");
+  if (e.length != (uint64)0 || e.chars == 0 || e.chars[0] != (uint8)0) { return 2; }
+  free(s.chars);
+  free(e.chars);
+  return 0;
+}

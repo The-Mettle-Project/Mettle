@@ -1,0 +1,85 @@
+// std/http over a NetStream that is not a bare socket: the client uses a
+// wrapper with no fd to poll (as a TLS stream may have), and the server reads
+// with http_read_head_on.
+import "std/http";
+import "std/socket";
+import "std/thread";
+import "std/arena";
+
+struct Counted {
+  fd: int64;
+  read_bytes: int64;
+  write_bytes: int64;
+}
+
+fn counted_read(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var c: Counted* = (Counted*)ctx;
+  var r: int64 = sock_recv(c->fd, p, n);
+  if (r > 0) { c->read_bytes = c->read_bytes + r; }
+  return r;
+}
+
+fn counted_write(ctx: rawptr, p: uint8*, n: int64) -> int64 {
+  var c: Counted* = (Counted*)ctx;
+  var r: int64 = sock_send(c->fd, p, n);
+  if (r > 0) { c->write_bytes = c->write_bytes + r; }
+  return r;
+}
+
+fn counted_close(ctx: rawptr) -> int64 {
+  var c: Counted* = (Counted*)ctx;
+  return sock_close(c->fd);
+}
+
+var g_listen: int64 = -1;
+var g_server_ok: int32 = 0;
+
+fn server(arg: cstring) -> uint32 {
+  var fd: int64 = sock_accept(g_listen, (NetAddr*)0);
+  if (fd < 0) { return (uint32)1; }
+  var st: NetStream = net_stream_socket(fd);
+  var buf: uint8[2048];
+  var head_end: int64 = 0;
+  var have: int64 = http_read_head_on(&st, &buf[0], 2048, 0, 2000, &head_end);
+  var req: HttpRequest;
+  var v: string;
+  v.chars = &buf[0];
+  v.length = (uint64)head_end;
+  if (have > 0 && http_parse_request(v, &req) == head_end && req.target == "/s") { g_server_ok = 1; }
+  var reply: string = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstream";
+  net_stream_write_all(&st, reply.chars, (int64)reply.length);
+  net_stream_close(&st);
+  return (uint32)0;
+}
+
+fn main() -> int32 {
+  var any: NetAddr = net_addr_loopback(NET_IPV4, 0);
+  match (tcp_listen(&any, 4)) { case Ok(fd): { g_listen = fd; } case Err(e): { return 1; } }
+  var sa: NetAddr;
+  sock_local_addr(g_listen, &sa);
+  var tid: uint32 = 0;
+  var th: int64 = CreateThread((cstring)0, (uint64)0, &server, (cstring)0, (uint32)0, &tid);
+  var fd: int64 = tcp_connect_addr(&sa, 2000);
+  if (fd < 0) { return 2; }
+  var c: Counted;
+  c.fd = fd;
+  var st: NetStream;
+  st.ctx = (rawptr)&c;
+  st.read = &counted_read;
+  st.write = &counted_write;
+  st.close = &counted_close;
+  st.fd = -1;
+  var arena: Arena* = arena_init(0);
+  var url: string = "http://127.0.0.1:{sa.port}/s";
+  var ok: int32 = 3;
+  match (http_request_on(&st, arena, "GET", url, (HttpHeader*)0, 0, "", 3000)) {
+    case Ok(r): { if (r->status == 200 && r->body == "stream") { ok = 0; } }
+    case Err(e): { ok = 4; }
+  }
+  net_stream_close(&st);
+  thread_join_infinite(th);
+  if (ok != 0) { return ok; }
+  if (g_server_ok != 1) { return 5; }
+  if (c.write_bytes == 0 || c.read_bytes != 44) { return 6; }   // the reply is 44 bytes
+  return 0;
+}

@@ -92,7 +92,7 @@ export const HTTP_ERR_TOO_SMALL = -22;          // caller's buffer is too small
 export const HTTP_ERR_NAME = -23;               // writer: header name is not a token
 export const HTTP_ERR_VALUE = -24;              // writer: CR, LF, NUL or another control byte in a value
 export const HTTP_ERR_NOMEM = -25;              // out of memory
-export const HTTP_ERR_TLS = -26;                // https needs TLS, which is not supported yet
+export const HTTP_ERR_TLS = -26;                // https: open a TLS stream and use http_request_on
 export const HTTP_ERR_CONNECT = -27;            // client: could not connect
 export const HTTP_ERR_IO = -28;                 // a socket read or write failed
 export const HTTP_ERR_TIMEOUT = -29;            // a socket read or write timed out
@@ -127,7 +127,7 @@ export fn http_error_text(code: int64) -> string {
     case -23: { return "bad header name"; }
     case -24: { return "bad header value"; }
     case -25: { return "out of memory"; }
-    case -26: { return "TLS is not supported yet"; }
+    case -26: { return "https needs a TLS stream: use http_request_on"; }
     case -27: { return "connect failed"; }
     case -28: { return "socket error"; }
     case -29: { return "timed out"; }
@@ -1283,18 +1283,20 @@ export fn http_write_last_chunk_trailers(b: StrBuf*, h: HttpHeader*, n: int32) -
 // Reads one chunk of up to n bytes into p, waiting until deadline (a
 // net_now_ms time; -1 for none). Returns the bytes read, 0 if the peer
 // closed, HTTP_ERR_TIMEOUT or HTTP_ERR_IO.
-fn hp_recv(fd: int64, p: uint8*, n: int64, deadline: int64) -> int64 {
+fn hp_recv(st: NetStream*, p: uint8*, n: int64, deadline: int64) -> int64 {
   while (true) {
-    var wait: int64 = -1;
-    if (deadline >= 0) {
-      wait = deadline - net_now_ms();
-      if (wait < 0) { return HTTP_ERR_TIMEOUT; }
+    if (st->fd >= 0) {
+      var wait: int64 = -1;
+      if (deadline >= 0) {
+        wait = deadline - net_now_ms();
+        if (wait < 0) { return HTTP_ERR_TIMEOUT; }
+      }
+      var w: int64 = sock_wait(st->fd, NET_POLL_IN, wait);
+      if (w == 0) { return HTTP_ERR_TIMEOUT; }
+      if (w < 0) { return HTTP_ERR_IO; }
     }
-    var w: int64 = sock_wait(fd, NET_POLL_IN, wait);
-    if (w == 0) { return HTTP_ERR_TIMEOUT; }
-    if (w < 0) { return HTTP_ERR_IO; }
-    var r: int64 = sock_recv(fd, p, n);
-    if (r == -NET_EINTR || r == -NET_EAGAIN) { continue; }
+    var r: int64 = net_stream_read(st, p, n);
+    if (r == -NET_EAGAIN) { continue; }
     if (r < 0) { return HTTP_ERR_IO; }
     return r;
   }
@@ -1318,7 +1320,7 @@ fn hp_deadline(timeout_ms: int64) -> int64 {
 // HTTP_ERR_TIMEOUT, HTTP_ERR_IO, HTTP_ERR_HEAD_TOO_LARGE when cap or
 // HTTP_MAX_HEAD bytes passed without a blank line, or the error
 // http_find_head_end reports for a bad byte.
-export fn http_read_head(fd: int64, buf: uint8*, cap: int64, have: int64, timeout_ms: int64, head_end: int64*) -> int64 {
+export fn http_read_head_on(st: NetStream*, buf: uint8*, cap: int64, have: int64, timeout_ms: int64, head_end: int64*) -> int64 {
   var deadline: int64 = hp_deadline(timeout_ms);
   var n: int64 = have;
   while (true) {
@@ -1329,12 +1331,17 @@ export fn http_read_head(fd: int64, buf: uint8*, cap: int64, have: int64, timeou
       return n;
     }
     if (n >= cap) { return HTTP_ERR_HEAD_TOO_LARGE; }
-    var r: int64 = hp_recv(fd, buf + n, cap - n, deadline);
+    var r: int64 = hp_recv(st, buf + n, cap - n, deadline);
     if (r < 0) { return r; }
     if (r == 0) { return HTTP_ERR_CLOSED; }
     n = n + r;
   }
   return 0;
+}
+
+export fn http_read_head(fd: int64, buf: uint8*, cap: int64, have: int64, timeout_ms: int64, head_end: int64*) -> int64 {
+  var st: NetStream = net_stream_socket(fd);
+  return http_read_head_on(&st, buf, cap, have, timeout_ms, head_end);
 }
 
 // What http_request returns. Everything in it lives in the arena.
@@ -1350,7 +1357,7 @@ export struct HttpClientResponse {
 export const HTTP_CLIENT_MAX_BODY: int64 = 67108864;
 
 struct HpConn {
-  fd: int64;
+  st: NetStream*;
   deadline: int64;
   rbuf: uint8*;
   rcap: int64;
@@ -1397,10 +1404,10 @@ fn hp_send_code(r: int64) -> int64 {
 // Sends the request and reads the response into out. Returns 0 or an error.
 // The buffers in c are the caller's to free.
 fn hp_exchange(c: HpConn*, arena: Arena*, head: string, body: string, is_head: bool, out: HttpClientResponse*) -> int64 {
-  var s: int64 = sock_send_all(c->fd, head.chars, (int64)head.length);
+  var s: int64 = net_stream_write_all(c->st, head.chars, (int64)head.length);
   if (s < 0) { return hp_send_code(s); }
   if (body.length > 0) {
-    s = sock_send_all(c->fd, body.chars, (int64)body.length);
+    s = net_stream_write_all(c->st, body.chars, (int64)body.length);
     if (s < 0) { return hp_send_code(s); }
   }
 
@@ -1429,7 +1436,7 @@ fn hp_exchange(c: HpConn*, arena: Arena*, head: string, body: string, is_head: b
         c->rbuf = bigger;
         c->rcap = c->rcap * 2;
       }
-      var n: int64 = hp_recv(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen, c->deadline);
+      var n: int64 = hp_recv(c->st, c->rbuf + c->rlen, c->rcap - c->rlen, c->deadline);
       if (n < 0) { return n; }
       if (n == 0) { return HTTP_ERR_CLOSED; }
       c->rlen = c->rlen + n;
@@ -1462,7 +1469,7 @@ fn hp_exchange(c: HpConn*, arena: Arena*, head: string, body: string, is_head: b
     memcpy(c->body, c->rbuf, take);
     c->blen = take;
     while (c->blen < kind.length) {
-      var n2: int64 = hp_recv(c->fd, c->body + c->blen, kind.length - c->blen, c->deadline);
+      var n2: int64 = hp_recv(c->st, c->body + c->blen, kind.length - c->blen, c->deadline);
       if (n2 < 0) { return n2; }
       if (n2 == 0) { return HTTP_ERR_CLOSED; }
       c->blen = c->blen + n2;
@@ -1482,7 +1489,7 @@ fn hp_exchange(c: HpConn*, arena: Arena*, head: string, body: string, is_head: b
         if (st == HTTP_CHUNK_DONE) { done = true; }
       }
       if (!done) {
-        var n3: int64 = hp_recv(c->fd, c->rbuf, c->rcap, c->deadline);
+        var n3: int64 = hp_recv(c->st, c->rbuf, c->rcap, c->deadline);
         if (n3 < 0) { return n3; }
         if (n3 == 0) { return HTTP_ERR_CLOSED; }
         avail = n3;
@@ -1496,7 +1503,7 @@ fn hp_exchange(c: HpConn*, arena: Arena*, head: string, body: string, is_head: b
     var open: bool = true;
     while (open) {
       if (!hp_body_reserve(c, c->blen + 4096)) { return HTTP_ERR_NOMEM; }
-      var n4: int64 = hp_recv(c->fd, c->body + c->blen, c->bcap - c->blen, c->deadline);
+      var n4: int64 = hp_recv(c->st, c->body + c->blen, c->bcap - c->blen, c->deadline);
       if (n4 < 0) { return n4; }
       if (n4 == 0) {
         open = false;
@@ -1523,8 +1530,8 @@ fn hp_text(arena: Arena*, a: string, b: string) -> string {
   return strbuf_finish_string(sb);
 }
 
-// A blocking HTTP/1.1 request over plain TCP. Only http:// URLs: an https://
-// URL gives the error "TLS is not supported yet". It opens one connection,
+// A blocking HTTP/1.1 request over plain TCP, for http:// URLs. For https,
+// open a TLS stream and use http_request_on. It opens one connection,
 // sends the request with Host, Content-Length (for a body, or for POST, PUT and
 // PATCH) and "Connection: close", reads the whole response, and closes. The
 // reply may use Content-Length, chunked, or close-delimited framing; interim
@@ -1539,11 +1546,7 @@ fn hp_text(arena: Arena*, a: string, b: string) -> string {
 // together; 0 or less means no limit. A body over HTTP_CLIENT_MAX_BODY is an
 // error. The result and everything it points to are allocated in arena. The
 // error is a short message; it is in the arena too when it has detail.
-export fn http_request(arena: Arena*, verb: string, url: string, headers: HttpHeader*, nheaders: int32, body: string, timeout_ms: int64) -> Result<HttpClientResponse*, string> {
-  var u: HttpUrl;
-  if (http_url_parse(url, &u) != 0) { return Err("bad URL"); }
-  if (u.tls != 0) { return Err(http_error_text(HTTP_ERR_TLS)); }
-  if (!hp_ieq(u.scheme, "http")) { return Err("not an http URL"); }
+fn hp_build_head(arena: Arena*, verb: string, url: string, u: HttpUrl*, headers: HttpHeader*, nheaders: int32, body: string) -> Result<string, string> {
 
   var has_host: bool = false;
   for i in 0..nheaders {
@@ -1556,10 +1559,10 @@ export fn http_request(arena: Arena*, verb: string, url: string, headers: HttpHe
   // The request target: path and query.
   var tb: StrBuf* = strbuf_new(arena, 128);
   if (tb == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
-  strbuf_append_string(tb, u.path);
-  if (u.query.length > 0) {
+  strbuf_append_string(tb, u->path);
+  if (u->query.length > 0) {
     strbuf_append_byte(tb, (uint8)63);
-    strbuf_append_string(tb, u.query);
+    strbuf_append_string(tb, u->query);
   }
 
   // The headers to send: yours, then Host, Content-Length and Connection.
@@ -1573,12 +1576,12 @@ export fn http_request(arena: Arena*, verb: string, url: string, headers: HttpHe
   if (!has_host) {
     var hb: StrBuf* = strbuf_new(arena, 64);
     if (hb == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
-    if (u.ipv6 != 0) { strbuf_append_byte(hb, (uint8)91); }
-    strbuf_append_string(hb, u.host);
-    if (u.ipv6 != 0) { strbuf_append_byte(hb, (uint8)93); }
-    if (u.port != 80) {
+    if (u->ipv6 != 0) { strbuf_append_byte(hb, (uint8)91); }
+    strbuf_append_string(hb, u->host);
+    if (u->ipv6 != 0) { strbuf_append_byte(hb, (uint8)93); }
+    if (u->port != hp_default_port(u)) {
       strbuf_append_byte(hb, (uint8)58);
-      strbuf_append_int(hb, (int64)u.port);
+      strbuf_append_int(hb, (int64)u->port);
     }
     all[count].name = "Host";
     all[count].value = strbuf_finish_string(hb);
@@ -1601,29 +1604,63 @@ export fn http_request(arena: Arena*, verb: string, url: string, headers: HttpHe
   var wrote: int64 = http_write_request_head(hd, verb, strbuf_finish_string(tb), all, count);
   if (wrote < 0) { return Err(http_error_text(wrote)); }
 
+  return Ok(strbuf_finish_string(hd));
+}
+
+fn hp_default_port(u: HttpUrl*) -> int32 {
+  if (u->tls != 0) { return 443; }
+  return 80;
+}
+
+// Sends one request on a stream you opened (a socket, or a TLS session for
+// https) and reads the whole response. It sends Connection: close, so close
+// the stream afterwards. See http_request for the rest.
+export fn http_request_on(st: NetStream*, arena: Arena*, verb: string, url: string, headers: HttpHeader*, nheaders: int32, body: string, timeout_ms: int64) -> Result<HttpClientResponse*, string> {
+  var u: HttpUrl;
+  if (http_url_parse(url, &u) != 0) { return Err("bad URL"); }
+  var head: string;
+  match (hp_build_head(arena, verb, url, &u, headers, nheaders, body)) {
+    case Ok(h): { head = h; }
+    case Err(e): { return Err(e); }
+  }
+  return hp_send(st, arena, verb, head, body, timeout_ms);
+}
+
+fn hp_send(st: NetStream*, arena: Arena*, verb: string, head: string, body: string, timeout_ms: int64) -> Result<HttpClientResponse*, string> {
+  var resp: HttpClientResponse* = (HttpClientResponse*)arena_alloc_zeroed(arena, (int64)sizeof(HttpClientResponse));
+  if (resp == 0) { return Err(http_error_text(HTTP_ERR_NOMEM)); }
+  var c: HpConn;
+  c.st = st;
+  c.deadline = hp_deadline(timeout_ms);
+  var code: int64 = hp_exchange(&c, arena, head, body, verb == "HEAD", resp);
+  if (c.rbuf != 0) { free(c.rbuf); }
+  if (c.body != 0) { free(c.body); }
+  if (code != 0) { return Err(http_error_text(code)); }
+  return Ok(resp);
+}
+
+export fn http_request(arena: Arena*, verb: string, url: string, headers: HttpHeader*, nheaders: int32, body: string, timeout_ms: int64) -> Result<HttpClientResponse*, string> {
+  var u: HttpUrl;
+  if (http_url_parse(url, &u) != 0) { return Err("bad URL"); }
+  if (u.tls != 0) { return Err(http_error_text(HTTP_ERR_TLS)); }
+  if (!hp_ieq(u.scheme, "http")) { return Err("not an http URL"); }
+  var head: string;
+  match (hp_build_head(arena, verb, url, &u, headers, nheaders, body)) {
+    case Ok(h): { head = h; }
+    case Err(e): { return Err(e); }
+  }
   var connect_ms: int64 = timeout_ms;
   if (connect_ms <= 0) { connect_ms = -1; }
   var fd: int64 = 0;
   match (tcp_connect(u.host, u.port, connect_ms)) {
-    case Ok(s): { fd = s; }
+    case Ok(sk): { fd = sk; }
     case Err(e): { return Err(hp_text(arena, "connect failed: ", e.message)); }
   }
-
-  var resp: HttpClientResponse* = (HttpClientResponse*)arena_alloc_zeroed(arena, (int64)sizeof(HttpClientResponse));
-  if (resp == 0) {
-    sock_close(fd);
-    return Err(http_error_text(HTTP_ERR_NOMEM));
-  }
-  var c: HpConn;
-  c.fd = fd;
-  c.deadline = hp_deadline(timeout_ms);
   if (timeout_ms > 0) { sock_set_timeout(fd, -1, timeout_ms); }
-  var code: int64 = hp_exchange(&c, arena, strbuf_finish_string(hd), body, verb == "HEAD", resp);
-  if (c.rbuf != 0) { free(c.rbuf); }
-  if (c.body != 0) { free(c.body); }
-  sock_close(fd);
-  if (code != 0) { return Err(http_error_text(code)); }
-  return Ok(resp);
+  var st: NetStream = net_stream_socket(fd);
+  var r: Result<HttpClientResponse*, string> = hp_send(&st, arena, verb, head, body, timeout_ms);
+  net_stream_close(&st);
+  return r;
 }
 
 // GET url with no extra headers. See http_request.
