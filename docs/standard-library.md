@@ -6,9 +6,16 @@ pass [`--prelude`](compilation.md) to get the common ones without asking.
 Signatures below are copied from the source. A module lists only what it
 exports; a module with no `export` at all is entirely public.
 
-Several modules ship a `.linux.mettle` sibling. A `std/` import with no
-extension picks the platform half on its own, so `import "std/io"` is right on
-both systems.
+Several modules ship a `.linux.mettle` or `.macos.mettle` sibling. A `std/`
+import with no extension picks the platform half on its own (on macOS the
+`.macos` file first, then the `.linux` one), so `import "std/io"` is right on
+every system. A platform half is a backend of its module, not a module of its
+own.
+
+Some libraries are not in std. JSON, CSV, logging, gRPC calls, UUIDs and the
+HTTPS client are the registry packages `json`, `csv`, `log`, `grpc`, `uuid`
+and `fetch`; [Packages](packages.md) covers how to get them. HTTP/1.1,
+HTTP/2 and WebSocket are in std, over the socket and `NetStream` transport.
 
 ## std/core
 
@@ -25,7 +32,7 @@ carries why. `Option` is for a value that may not be there. Read either with
 
 ## std/io
 
-Console and file input and output. Both platforms.
+Console and file input and output. Linux, macOS and Windows.
 
 | Function | Effect |
 |----------|--------|
@@ -60,7 +67,11 @@ directly:
 | `fread(buf: cstring, size: int64, count: int64, fp: cstring) -> int64` | Read |
 | `fwrite(buf: cstring, size: int64, count: int64, fp: cstring) -> int64` | Write |
 | `fgets(buf: cstring, size: int32, fp: cstring) -> cstring` | Read a line |
+| `fputs(s: cstring, fp: cstring) -> int32` | Write a nul-terminated string |
+| `fflush(fp: cstring) -> int32` | Flush |
 | `get_stdin()`, `get_stdout()`, `get_stderr()` | The standard streams |
+
+`puts`, `putchar` and `getchar` are declared too.
 
 Two wrappers make line reading pleasant, returning a `string` view of the
 buffer you hand them:
@@ -75,8 +86,8 @@ into nul-terminated memory from the allocator you pass, for handing to C.
 
 ## std/conv
 
-Character tests, string slicing and searching, and number conversion. Both
-platforms.
+Character tests, string slicing and searching, and number conversion. Linux,
+macOS and Windows.
 
 Character tests take and return [`char`](types.md):
 
@@ -123,13 +134,14 @@ Numbers:
 | `int_to_dec(buf: uint8*, n: int64) -> int32` | Digits written |
 | `format_i64(buf: uint8*, buf_len: int32, pattern: string, value: int64) -> int32` | Pattern format |
 
-`cstr_len`, `streq`, and `cstr_ncmp` work on `cstring` for the C boundary.
+`cstr_len`, `streq`, and `cstr_ncmp` work on `cstring` for the C boundary,
+and the C library's `atoi` and `atol` are declared.
 
 ## std/encoding
 
-Strict hexadecimal and RFC 4648 Base64 over arbitrary bytes. Both platforms.
-A `string` is a byte view here, so embedded nuls are ordinary input; use
-`str_from_bytes` to make one from a pointer and length.
+Strict hexadecimal and RFC 4648 Base64 over arbitrary bytes. Linux, macOS and
+Windows. A `string` is a byte view here, so embedded nuls are ordinary input;
+use `str_from_bytes` to make one from a pointer and length.
 
 Size queries return `Result<int64, string>`:
 
@@ -163,8 +175,8 @@ Decoding accepts text with or without correct padding, and is as strict as
 
 ## std/math
 
-Floating-point maths in Mettle source, no libm on the link line. Both
-platforms.
+Floating-point maths in Mettle source, no libm on the link line. Linux,
+macOS and Windows.
 
 Constants are functions, so `PI()` and `E()`:
 
@@ -175,7 +187,8 @@ EPSILON  F32_EPSILON  MAX_FINITE  MIN_POSITIVE
 DEG_PER_RAD  RAD_PER_DEG
 ```
 
-Classification: `is_nan`, `is_inf`, `is_finite`, `signbit`.
+Classification: `is_nan`, `is_inf`, `is_finite`, `signbit`. Each returns an
+`int32`, 1 or 0.
 
 Sign and range: `fabs`, `copysign`, `fsign`, `fmin`, `fmax`, `fclamp`,
 `saturate`.
@@ -186,17 +199,34 @@ Float to integer with the mode named, rather than the one a cast picks:
 `floor_i32`, `ceil_i32`, `trunc_i32`, `round_i32`, and their `_i64` siblings.
 All are `@inline`.
 
-Powers and roots: `sqrt`, `rsqrt`, `hypot`, `cbrt`, `pow`, `ldexp`, `frexp`.
+Powers and roots: `sqrt`, `rsqrt`, `hypot`, `cbrt`, `pow`,
+`ldexp(x, n: int32)`, `frexp(x, exponent_out: int32*)`.
 
 Exponential and logarithm: `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`,
 `log1p`.
 
 Trigonometry: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`.
+Hyperbolic: `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`.
+
+Angles and interpolation: `degrees`, `radians`, `wrap(value, lo, hi)`,
+`wrap_angle` (into -pi..pi), `angle_diff(from, to)`, `lerp(a, b, t)`,
+`inv_lerp(a, b, value)`, `remap(value, in_lo, in_hi, out_lo, out_hi)`,
+`smoothstep` and `smootherstep(edge0, edge1, x)`.
+`approx_eq(a, b, tolerance)` and `approx_zero(x, tolerance)` return 1 or 0.
 
 Bit access: `f64_bits(x) -> int64`, `f64_from_bits(b) -> float64`,
 `f64_raw_exponent(x) -> int32`.
 
-Every one takes and returns `float64`.
+The functions above take and return `float64` unless noted.
+
+Integers, on `int64` unless noted: `abs(x: int32) -> int32`, `labs`, `min`,
+`max`, `clamp`, `isign`, `ipow(base, exponent: int32)`, `isqrt`, `gcd`, `lcm`,
+`is_pow2 -> int32`, `next_pow2`, `ilog2 -> int32` (-1 for n <= 0), and
+`idiv_floor` and `imod_floor`, which round down and return 0 for a zero
+divisor.
+
+`float32`: `f32_abs`, `f32_min`, `f32_max`, `f32_clamp`, `f32_lerp`,
+`f32_sqrt`.
 
 Accuracy: the kernels carry enough terms that their truncation error sits below
 one unit in the last place, so results are accurate to about 1 ulp for arguments
@@ -210,7 +240,7 @@ They fold to a single load, so `PI()` costs nothing over a literal.
 
 ## std/mem
 
-Raw memory moves. Both platforms.
+Raw memory moves. Linux, macOS and Windows.
 
 | Function | Effect |
 |----------|--------|
@@ -228,14 +258,18 @@ Raw memory moves. Both platforms.
 `mem_copy` requires that the ranges do not overlap; reach for `mem_move` when
 they might.
 
-`memory_region` describes a borrowed region from foreign code so Mettle can
-dereference it under [`--safe`](memory-safety.md). The caller must know the
-whole region is live. Ending the region retires its identity; the foreign owner
-still releases the bytes.
+The C library's `malloc`, `calloc`, `realloc`, `free`, `memset`, `memcpy`,
+`memmove` and `memcmp` are declared here too.
+
+`memory_region(ptr: rawptr, size: int64)` describes a borrowed region from
+foreign code so Mettle can dereference it under [`--safe`](memory-safety.md).
+The caller must know the whole region is live. `memory_region_end(ptr)` ends
+the region and retires its identity; the foreign owner still releases the
+bytes.
 
 ## std/alloc
 
-Mettle's own thread-safe heap, written in Mettle. Both platforms.
+Mettle's own thread-safe heap, written in Mettle. Linux, macOS and Windows.
 [Heap allocation](heap-allocation.md) covers when to reach for it.
 
 The short names allocate from a shared default heap:
@@ -287,8 +321,8 @@ the `calloc` names zero explicitly.
 
 ## std/arena
 
-Bump allocation with a whole-region reset. Both platforms. Good for work with
-one clear end, a request, a frame, a parse.
+Bump allocation with a whole-region reset. Linux, macOS and Windows. Good for
+work with one clear end, a request, a frame, a parse.
 
 | Function | Effect |
 |----------|--------|
@@ -304,7 +338,7 @@ one clear end, a request, a frame, a parse.
 
 ## std/strbuf
 
-A growable byte buffer over an [arena](#stdarena). Both platforms.
+A growable byte buffer over an [arena](#stdarena). Linux, macOS and Windows.
 
 | Function | Effect |
 |----------|--------|
@@ -326,8 +360,8 @@ current storage.
 
 ## std/collections
 
-Generic owning collections. Both platforms. Import `std/core` as well when
-matching their `Result` and `Option` returns.
+Generic owning collections. Linux, macOS and Windows. Import `std/core` as well
+when matching their `Result` and `Option` returns.
 
 `List<T>` is a growable contiguous array. A zero-initialized value and
 `list_init<T>()` are both empty and ready to use:
@@ -383,8 +417,8 @@ network input.
 
 ## std/utf8
 
-Code points over the byte view a [`string`](types.md) gives you. Both
-platforms.
+Code points over the byte view a [`string`](types.md) gives you. Linux,
+macOS and Windows.
 
 | Function | Effect |
 |----------|--------|
@@ -408,8 +442,7 @@ character index.
 
 ## std/osmem
 
-Pages from the operating system, under the heap. Both platforms, with a
-`.linux` half.
+Pages from the operating system, under the heap. Linux, macOS and Windows.
 
 | Function | Effect |
 |----------|--------|
@@ -459,10 +492,22 @@ module also exports the flags these calls take: `LINUX_AT_FDCWD`,
 `LINUX_SIG_BLOCK`, `LINUX_SIG_UNBLOCK`, `LINUX_SIG_SETMASK`, `LINUX_SFD_*` and
 a few errno values (`LINUX_EAGAIN`, `LINUX_EINTR`, `LINUX_ETIMEDOUT`).
 
+## std/linux_sys
+
+The Linux system call numbers for the target CPU, as `LINUX_SYS_*` constants,
+for the `syscall` builtin: `syscall(LINUX_SYS_MUNMAP, p, n)`. It imports
+`std/linux_sys_x86_64` or `std/linux_sys_aarch64` by CPU. The Linux halves of
+the other modules use it.
+
 ## std/thread
 
-Threads, mutexes, and atomics. Both platforms, with a `.linux` half and a
-`thread_posix` variant.
+Threads, mutexes, and atomics. Linux, macOS and Windows. The names follow
+Win32; the `.linux` half, which macOS uses too, binds them to the runtime's own
+threads.
+
+Start a thread with `CreateThread(0, 0, &start, arg, 0, 0) -> int64`, where
+`start` is a `fn(cstring) -> uint32` and the second argument is the stack size
+(0 for the default). It returns the handle.
 
 Threads: `thread_join(handle: int64, timeout_ms: uint32) -> uint32`,
 `thread_join_infinite`, `thread_detach`, `thread_close`,
@@ -478,7 +523,8 @@ Spin locks on an `int32*`: `spin_try_lock`, `spin_lock`, `spin_unlock`. The
 lock variable must be a shared `int32` initialised to 0.
 
 Wait results come back as `WAIT_OBJECT_0()`, `WAIT_TIMEOUT()`, or
-`WAIT_FAILED()`, and `INFINITE()` is the timeout that never expires.
+`WAIT_FAILED()`, and `INFINITE()` is the timeout that never expires. They live
+in `std/wait_codes`, which `std/thread` imports.
 
 The externs that perform nothing carry `with none`: the atomics, the waits,
 the handle close, and the yield a spin lock backs off with. That is what lets
@@ -486,6 +532,13 @@ a real-time path declare `forbids alloc` and hold it across taking a lock. The
 ones that do take a resource, `CreateThread` and `CreateMutexA`, declare
 nothing and are read as performing anything, which is what an unannotated
 extern means.
+
+`std/thread_posix` is a separate module over the C library's pthreads, for
+Linux and macOS. It declares the `pthread_*` calls and adds
+`mutex_create_posix() -> cstring`, `mutex_lock_posix`, `mutex_trylock_posix`,
+`mutex_unlock_posix`, `mutex_destroy_posix`, `thread_join_posix(thread: int64)
+-> int32`, `thread_detach_posix` and `thread_sleep_ms_posix(milliseconds:
+uint32)`.
 
 ## std/sync
 
@@ -517,8 +570,8 @@ Windows it is built from kernel32's SRW locks and condition variables.
 
 ## std/parallel
 
-Runs one body over a range of indexes across the machine's cores. Both
-platforms: Windows threads, pthreads elsewhere.
+Runs one body over a range of indexes across the machine's cores. Linux,
+macOS and Windows: Windows threads, pthreads elsewhere.
 
 | Function | Effect |
 |----------|--------|
@@ -529,6 +582,7 @@ platforms: Windows threads, pthreads elsewhere.
 | `parallel_fill_i64(destination: int64*, count: int64, value: int64)` | Fill `int64` |
 | `parallel_zero(destination: rawptr, bytes: int64)` | Zero bytes |
 | `parallel_copy(destination: rawptr, source: rawptr, bytes: int64)` | Copy, moving correctly when the buffers overlap |
+| `parallel_threads() -> int64` | The most threads a call uses: the core count, or `METTLE_PARALLEL_THREADS` |
 
 The body has type `fn(rawptr, int64, int64) -> int32` and is called once per
 chunk with the context and that chunk's half-open range. It must be safe to
@@ -608,6 +662,67 @@ Queries over a program: `function_calls(f, callee) -> bool`,
 `function_reaches(p, f, callee) -> bool`, which follows direct calls
 transitively. [Rules](rules.md) covers what a rule is and what it sees.
 
+## std/layout
+
+Layout metafunctions, which decide where a struct's fields live.
+[Metaprogramming](metaprogramming.md#layouts) covers them.
+`import "std/layout";` gives `@soa`, `@hot_cold(a, b)`, `@compact`,
+`@tagged(pointer, tag, bits)` and `@allocate_with(take, give)`.
+
+To write one, take and return a `Layout`: `regions: Region[]` (`stride`,
+`align`), `places: Place[]` (where each field goes), `allocator` and
+`releaser`. `layout_default(t: TypeInfo) -> Layout` is the plain layout,
+`layout_field(t, name) -> FieldInfo` and `layout_type(p: Program, name) ->
+TypeInfo` look things up, and `tag_bits_in_pointer(t, l, pointer, tag, bits)
+-> Layout` is the function behind `@tagged`.
+
+## std/meta
+
+Generators, which write code for a declaration.
+[Metaprogramming](metaprogramming.md#generators) covers them.
+`import "std/meta";` gives `@memoize`, `@trace`, `grad(f)` and `@dyn` on a
+trait.
+
+A generator takes a `FunctionInfo` (or a `TraitInfo` for `@dyn`) and returns a
+`Generated`. Build one with `generated(text)`, `generated_as(name, text)` or
+`refuse(why)`. `Text` with `text_add(t: Text*, s: string)` and
+`text_done(t: Text*) -> string` collects the source, and
+`render_function(f, name) -> Generated`, `signature_text(name, f)` and
+`arguments_text(f)` write the parts of a function. `type_is_float`,
+`type_is_integer` and `type_is_pointer` test a type name. The `memo_*`, `ad_*`
+and `trace_*` functions are the run-time support the generated code calls.
+
+## std/pass
+
+Optimizer passes written in Mettle.
+[Metaprogramming](metaprogramming.md#passes) covers them. A `@pass(point) fn`
+takes and returns a `PassFunction`: `name`, `return_type`, `param_names`,
+`param_types` and `code: PassOp[]`. A `PassOp` has `op`, `text`, `dest`, `lhs`,
+`rhs` and `args` (each a `PassOperand`), and flags such as `is_float`.
+
+| Function | Effect |
+|----------|--------|
+| `operand_int(value: int64) -> PassOperand` | An integer operand |
+| `operand_temp(name: string) -> PassOperand` | A temporary |
+| `new_op(op: string, place: int64) -> PassOp` | A new operation |
+| `same_operand(a: PassOperand, b: PassOperand) -> bool` | Compare two operands |
+| `fresh_id(code: PassOp[], prefix: string) -> int64` | The first `n` for which no temporary in `code` is named `prefix` then `n` |
+| `joined(prefix: string, value: int64) -> string` | `prefix` followed by the number |
+
+`PassOperand.kind` is one of `OPERAND_NONE`, `_TEMP`, `_SYMBOL`, `_INT`,
+`_FLOAT`, `_STRING` and `_LABEL`. `or_chain_bitset(f)` is a worked pass that
+ships with the module.
+
+## std/regalloc
+
+Register allocation written in Mettle.
+[Metaprogramming](metaprogramming.md#register-allocation) covers it. A
+`@regalloc fn` takes an `AllocGraph` (`function`, `vregs: AllocVreg[]`) and
+returns an `Assignment` (`registers: int64[]`, one per vreg, -1 to spill). An
+`AllocVreg` has `id`, `rclass`, `width`, `allowed` (a register mask), `saved`,
+`cost`, `hint` and `neighbors`. `chaitin_briggs(g: AllocGraph) -> Assignment`
+is a ready allocator.
+
 ## std/target
 
 `TargetDesc`, the record a target description is written as: `name`, `arch`,
@@ -666,9 +781,9 @@ macOS and Windows. fd 0 is standard input, 1 output and 2 error.
 | `term_raw_begin(fd) -> int64` | Save the terminal's settings and turn on raw mode. 0, or a negative code |
 | `term_raw_end(fd) -> int64` | Put back the settings `term_raw_begin` saved. 0, or a negative code |
 | `term_size(fd, cols: int32*, rows: int32*) -> int64` | The window size in character cells. 0, or a negative code |
-| `term_signal_fd(signals: int32...) -> int64` | Block the signals and return a descriptor that becomes readable when one arrives |
+| `term_signal_fd(signals: int32[..]) -> int64` | Block the signals and return a descriptor that becomes readable when one arrives |
 | `term_signal_next(fd) -> int32` | Wait for the next signal on the descriptor and return its number |
-| `term_signal_end(fd, signals: int32...)` | Close the descriptor and unblock the signals |
+| `term_signal_end(fd, signals: int32[..])` | Close the descriptor and unblock the signals |
 
 When standard input is a pipe or a file, `term_read_secret` reads the line as
 it is, so scripts can feed a password in.
@@ -820,10 +935,50 @@ To resolve on your own event loop, take `dns_system_servers(out, max)`, build
 a query with `dns_new_id` and `dns_build_query`, send it on your own
 non-blocking UDP socket, and read the reply with `dns_parse_response`.
 
+## std/netaddr
+
+`import "std/netaddr";` gives the address type and constants of
+[std/socket](#stdsocket), and makes no OS calls. It holds `NetAddr`,
+`NetHostPort` (`host`, `port`), `NetPollFd`, `net_addr_parse`, `net_addr_v4`,
+`net_addr_loopback`, `net_addr_any`, `net_addr_equal(a: NetAddr, b: NetAddr) ->
+bool`, `net_addr_is_loopback`, `net_split_host_port`, `net_addr_format(a:
+NetAddr, buf: uint8*, cap: int64) -> int64` and `net_addr_format_ip`, and the
+`NET_IPV4`, `NET_TCP`, `NET_OPT_*`, `NET_SHUT_*` and `NET_POLL_*` constants.
+`NET_ADDR_FORMAT_MAX` (64) bytes always hold a formatted address.
+
+## std/dns
+
+`import "std/dns";` is host-name lookup, described under
+[std/socket](#stdsocket).
+
+| Function | Effect |
+|----------|--------|
+| `net_resolve(host: string, port: int32, want: int32, out: NetAddr*, max: int32, timeout_ms: int64) -> Result<int32, DnsError>` | The whole lookup |
+| `dns_query(server: NetAddr*, name: string, qtype: int32, port: int32, out: NetAddr*, max: int32, timeout_ms: int64) -> int32` | Ask one server |
+| `dns_build_query(id: int32, name: string, qtype: int32, buf: uint8*, cap: int64) -> int64` | Write a query message |
+| `dns_parse_response(msg: uint8*, n: int64, id: int32, port: int32, out: NetAddr*, max: int32) -> Result<DnsAnswer, string>` | Read the A and AAAA records of a reply |
+| `dns_hosts_lookup(text: string, name: string, port: int32, want: int32, out: NetAddr*, max: int32) -> int32` | Look a name up in hosts-file text |
+| `dns_parse_resolv_conf(text: string, out: NetAddr*, max: int32) -> int32` | The servers in resolv.conf text |
+| `dns_system_servers(out: NetAddr*, max: int32) -> int32`, `dns_new_id() -> int32` | The system's servers; a fresh query id |
+
+`DnsAnswer` has `rcode` (0, or 3 for no such name), `truncated` (ask again
+over TCP) and `count`. `DnsError` has `code` and `message`. The constants are
+`DNS_TYPE_A`, `DNS_TYPE_AAAA`, `DNS_TYPE_CNAME`, `DNS_WANT_ANY`, `_V4` and
+`_V6`, `DNS_MAX_SERVERS` (3), `DNS_MAX_ADDRS` (16) and the `DNS_ERR_*` codes.
+
 ## std/net
 
-TCP and UDP sockets. Windows, over Winsock. On Linux import
-`std/net_posix` instead; `std/prelude` leaves both out for that reason.
+The older TCP and UDP API, in the Winsock style. Use [std/socket](#stdsocket)
+for new code. On Windows it is Winsock. The `.linux` and `.macos` halves give
+the same calls over BSD sockets, except `set_nonblocking`, `set_nodelay`,
+`FIONBIO()` and `TCP_NODELAY()`, which are Windows only. `std/prelude` leaves
+networking out.
+
+`std/net_posix` is a separate POSIX copy whose names end in `_posix`:
+`net_posix_init`, `net_posix_cleanup`, `socket_tcp_posix`, `socket_udp_posix`,
+`sockaddr_in_posix`, `sockaddr_in_any_posix`, `set_reuseaddr_posix`, and
+`send_all_posix(sock: int64, buf: cstring, len: int64) -> Result<int64,
+int32>`.
 
 Setup: `net_init() -> Result<int32, int32>`, `net_cleanup()`,
 `net_is_initialized()`, `net_last_error()`.
@@ -974,9 +1129,10 @@ The inputs are checked first, and on an error nothing is appended.
 
 `http_request(arena, verb, url, headers, nheaders, body, timeout_ms) ->
 Result<HttpClientResponse*, string>` makes one blocking request over TCP, for
-`http://` URLs. For `https://`, open a TLS stream and call
-`http_request_on(&stream, arena, verb, url, headers, nheaders, body,
-timeout_ms)`, which sends the same request on any `NetStream`. It sends `Host`,
+`http://` URLs. For `https://`, use the registry package `fetch`, or open a
+TLS stream and call `http_request_on(&stream, arena, verb, url, headers,
+nheaders, body, timeout_ms)`, which sends the same request on any
+`NetStream`. It sends `Host`,
 `Content-Length` (for a body, or for POST, PUT and PATCH) and `Connection:
 close`, and reads the whole reply: `Content-Length`, chunked, or until close.
 1xx replies are skipped. Redirects are not followed. A `Host` header of yours
@@ -1031,8 +1187,9 @@ Server side:
 | `ws_write_101(buf: StrBuf*, client_key, protocol) -> int32` | Appends the 101 response. `protocol` may be `""`. Returns 1, or 0 and the buffer is unchanged |
 | `ws_write_refusal(buf, status) -> int32` | Appends a 400, 405 or 426 response (426 names version 13) |
 
-Client side. The stdlib has no random source, so you draw 16 random bytes and
-pass them in. Keep them: the answer is checked against them.
+Client side. Draw 16 random bytes, for example with `random_bytes` from
+[std/random](#stdrandom), and pass them in. Keep them: the answer is checked
+against them.
 
 | Function | Effect |
 |----------|--------|
@@ -1319,7 +1476,8 @@ out, cap) -> int64` writes one, using the coarsest unit that is exact (`5S`,
 `H2_GRPC_OK` to `H2_GRPC_UNAUTHENTICATED` are the `grpc-status` codes.
 `h2_grpc_status_name(code)`, `h2_grpc_status_parse(text)` (-1 if invalid) and
 `h2_grpc_status_from_http(http_status)` (the mapping for a response with no
-`grpc-status`) round them out.
+`grpc-status`) round them out. This is framing only: the gRPC client and
+server are the registry package `grpc`.
 
 ## std/h2conn
 
@@ -1455,14 +1613,15 @@ Locks are `flock` locks on Linux and macOS: advisory, and held per open, so a
 second `file_open` of the same file in the same process conflicts too. On
 Windows they are `LockFileEx` locks, which are mandatory.
 
-**Memory maps.** `file_map(fd, offset, length, flags, &m: FileMap) -> int64`
-maps part of an open file. `flags` is `FILE_MAP_READ`, plus `FILE_MAP_WRITE`
-for writes that reach the file, plus `FILE_MAP_PRIVATE` to keep those writes in
-this process instead. Any offset works: `m.data` points at the byte asked for,
-and `m.length` is the length. The file must already be long enough, so grow it
-with `file_truncate` first. `file_map_sync(&m)` writes a shared map's changes
-to the file; on Windows it does not wait for the device, so call `file_sync`
-as well. `file_unmap(&m)` releases it, and a second call does nothing.
+**Memory maps.** `file_map(fd: int64, offset: int64, length: int64, flags:
+int32, out: FileMap*) -> int64` maps part of an open file into `out`. `flags` is
+`FILE_MAP_READ`, plus `FILE_MAP_WRITE` for writes that reach the file, plus
+`FILE_MAP_PRIVATE` to keep those writes in this process instead. Any offset
+works: `data` points at the byte asked for, and `length` is the length. The
+file must already be long enough, so grow it with `file_truncate` first.
+`file_map_sync(&m)` writes a shared map's changes to the file; on Windows it
+does not wait for the device, so call `file_sync` as well. `file_unmap(&m)`
+releases it, and a second call does nothing.
 
 ## std/fs
 
@@ -1480,7 +1639,8 @@ a `buf` and `cap` you give, put a NUL after it, and return its length. If it
 does not fit, they return `-FS_ERANGE`. `mode` arguments are permission bits,
 such as `0o755`.
 
-**Stat.** `fs_stat(path, &st: FsStat) -> int64` follows symbolic links.
+**Stat.** `fs_stat(path: string, out: FsStat*) -> int64` follows symbolic
+links.
 `fs_lstat` describes a link itself. `FsStat` has `kind` (`FS_FILE`, `FS_DIR`,
 `FS_SYMLINK` or `FS_OTHER`), `size`, `mode` (the low 12 permission bits; 0 on
 Windows), and `mtime_ns`, `atime_ns` and `ctime_ns` (Unix nanoseconds).
@@ -1578,7 +1738,8 @@ it if you need that. A dot at the start of a name is part of the name:
 
 ## std/dir
 
-Paths and directories. Windows.
+The older directory helpers, on `cstring` paths. The runtime provides them on
+Linux, macOS and Windows. New code uses [std/fs](#stdfs).
 
 | Function | Effect |
 |----------|--------|
@@ -1635,7 +1796,7 @@ pipes, or -1. Pipe ends are close-on-exec. The child's signal mask is
 cleared, so signals blocked by `proc_signal_fd` do not reach it.
 
 On Linux the inherited environment is the one the process started with
-(`/proc/self/environ`); variables set later with `putenv` are not passed on.
+(`/proc/self/environ`); variables set later with `env_set` are not passed on.
 
 ### Waiting and killing
 
@@ -1732,8 +1893,8 @@ only if the parent's own handle is inheritable.
 
 ## std/bench
 
-`bench_time_us() -> int64` reads a microsecond clock. Both platforms, with a
-`.linux` half.
+`bench_time_us() -> int64` reads a microsecond clock. Linux, macOS and
+Windows.
 
 ## std/time
 
@@ -1798,17 +1959,76 @@ or 0 on failure.
 means UTC. `time_parse_http(s: string) -> Result<int64, string>` reads an HTTP
 date and returns unix nanoseconds.
 
+## std/datetime
+
+The clock-free half of [std/time](#stdtime). The `TIME_*` units, `DateTime`,
+the date functions, the formatters and the parsers shown there all live here;
+only the clocks, the sleeps and `time_now_utc` are in `std/time`. It reads no
+clock, so `import "std/datetime";` works in the compile-time interpreter.
+
 ## std/gpu
 
-Device memory, streams, and launches for the [GPU targets](gpu.md).
+Device memory, streams, and launches for the [GPU targets](gpu.md). Host
+code imports it; kernels import [std/warp](#stdwarp). With the Metal provider
+it resolves to `gpu.metal.mettle`, which has the same functions.
 
 On Linux, link the CUDA driver with `-lcuda`. Nothing else is needed.
+
+Most calls return a status, 0 on success. `gpu_error_name(status)` and
+`gpu_error_text(status)` describe one.
+
+| Group | Functions |
+|-------|-----------|
+| Device | `gpu_init() -> int64`, `gpu_init_on(ordinal)`, `gpu_device_count`, `gpu_device_name(ordinal, buffer, capacity) -> string`, `gpu_sm_count`, `gpu_warp_size`, `gpu_total_memory`, `gpu_compute_capability`, `gpu_device_attribute`, `gpu_driver_version`, `gpu_provider_name` |
+| Kernels | `gpu_open(path: cstring) -> int32`, `gpu_open_on`, `gpu_open_kernels(stem)`, `gpu_module(image: uint8*) -> int64`, `gpu_module_file`, `gpu_func(mod, name: cstring) -> int64`, `gpu_jit_log` |
+| Memory | `gpu_malloc(bytes) -> int64`, `gpu_free`, `gpu_managed_malloc`, `gpu_host_mapped_malloc`, `gpu_to_device(dst, src, bytes)`, `gpu_to_host(dst, src, bytes)`, and `_async` forms that take a stream |
+| Launch | `gpu_launch(f, grid, block, params: int64*, nargs) -> int32`, `gpu_launch_3d`, `gpu_launch_on`, `gpu_launch_indirect`, `gpu_launch_sync`, `gpu_sync` |
+| Streams and events | `gpu_stream_create`, `gpu_stream_sync`, `gpu_stream_destroy`, `gpu_event_create`, `gpu_event_record(event, stream)`, `gpu_event_sync`, `gpu_event_elapsed_ms(start, finish, ms_out: float32*)`, `gpu_stream_wait_event` |
+| Graphs | `gpu_graph_capture_begin(stream)`, `gpu_graph_capture_end(stream) -> int64`, `gpu_graph_launch`, `gpu_graph_destroy` |
+
+The CUDA driver calls (`cuInit`, `cuMemAlloc_v2` and the rest) are declared
+too, under their own names.
 
 `gpu_stream_done(stream)` and `gpu_event_done(event)` check without waiting.
 They return 1 if the work before them has finished, 0 if it is still running,
 or a negative CUDA error. A scheduler can use them to poll the GPU. On Metal,
 an event is done once it is recorded, but `gpu_stream_done` still waits, since
 the provider has no way to ask without waiting yet.
+
+## std/warp
+
+Device code for kernels: `import "std/warp";` in a kernel file, never in host
+code. [GPU offload](gpu.md) covers it.
+
+- `Uniform<T>`, a value every work item of the group holds the same.
+- The `layout_*` constants a register tile's `layout` names: `layout_row`,
+  `layout_col`, `layout_swizzle32`, `layout_swizzle64`, `layout_swizzle128`,
+  `layout_interleave`, `layout_fragment_a`, `layout_fragment_b` and
+  `layout_fragment_c`.
+- Warp collectives, each `requires Warp`: `warp_sum_f32`, `warp_sum_u32`,
+  `warp_max_f32`, `warp_min_f32`, `warp_broadcast_f32(value, lane: int32)`,
+  `warp_shuffle_f32(value, lane)`, `warp_shuffle_u32(value, lane)`,
+  `warp_ballot(predicate: bool, word: int32) -> uint32`,
+  `warp_any(predicate) -> bool` and `warp_all(predicate) -> bool`.
+
+## std/numerics
+
+Numerics contracts for kernels, covered in
+[GPU offload](gpu.md#numerics-contracts). `import "std/numerics";` gives the
+`Numerics` struct (`k_order: NumericsOrder`, with the one order
+`k_ascending`) and three calls for a harness:
+
+| Function | Effect |
+|----------|--------|
+| `numerics_input(bytes: int64) -> uint8*` | Memory whose every byte is an input of the proof |
+| `numerics_same(a: float32*, b: float32*, rows: int32, cols: int32, ld: int32) -> int32` | Claim two matrices are the same bits |
+| `numerics_tensor_map_2d(map, base, element_bytes, width, height, row_bytes, box_width, box_height, swizzle)` | Describe a tensor map to the interpreter |
+
+## std/tune
+
+One type, `TuneResult` (`row`, `key`, `verdict`, `median_us`, `chosen`): a
+row of the file `mettle tune` writes. See
+[contract-safe tuning](gpu.md#contract-safe-tuning).
 
 ## std/tracy
 
@@ -1827,6 +2047,23 @@ Raw Win32 declarations the other Windows modules build on.
 
 `live_tick(tick: int64)` tells a [live build](live.md) which tick it is on. A
 patch built with `--live-at-tick N` waits until the tick reaches `N`.
+
+## Internal modules
+
+These exist so the public modules can share code or reach the OS. Import the
+public module instead; their names may change.
+
+| Module | Used by | Holds |
+|--------|---------|-------|
+| `std/env_os` | std/env | `env_os_args` per platform |
+| `std/random_os` | std/random | `random_os_fill` per platform |
+| `std/sync_os` | std/sync | Wait-on-address and a monotonic clock |
+| `std/term_os` | std/term | The terminal calls per platform |
+| `std/time_os` | std/time | `time_unix_ns`, `time_mono_ns`, `time_sleep_ns` |
+| `std/socket_os` | std/socket | The raw socket calls per platform |
+| `std/wait_codes` | std/thread | `INFINITE()` and the `WAIT_*()` results |
+| `std/posix_spin` | std/thread_posix, std/net_posix | A spin lock over `posix_cas_i32` |
+| `std/macos_abi` | the macOS halves of std/file and std/fs | `macos_c_stat`, `macos_c_readdir` and the other libc calls whose struct layout depends on the CPU, from `macos_abi_x86_64` or `macos_abi_aarch64` |
 
 ## std/prelude
 
