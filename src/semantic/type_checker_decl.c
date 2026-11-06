@@ -635,7 +635,7 @@ static char *type_checker_mangle_generic_enum_name(const char *base,
       if (*p == '*') {
         memcpy(result + pos, "_ptr", 4);
         pos += 4;
-      } else if (*p == '<' || *p == '>' || *p == ',' || *p == ' ') {
+      } else if (!isalnum((unsigned char)*p) && *p != '_') {
         result[pos++] = '_';
       } else {
         result[pos++] = *p;

@@ -1,0 +1,33 @@
+import "std/io";
+import "std/core";
+struct Stack<T> { items: T[16]; n: int64; }
+fn Stack_push__ptr<T>(s: Stack<T>*, v: T) { s->items[s->n] = v; s->n = s->n + 1; }
+fn Stack_pop__ptr<T>(s: Stack<T>*) -> Option<T> {
+  if (s->n == 0) { return None; }
+  s->n = s->n - 1;
+  return Some(s->items[s->n]);
+}
+fn Stack_peek<T>(s: Stack<T>) -> T { return s.items[s.n - 1]; }
+fn pair_sum<A, B>(a: A, b: B) -> int64 { return (int64)a + (int64)b; }
+struct Box<T> { v: T; }
+fn Box_get<T>(b: Box<T>) -> T { return b.v; }
+fn main() -> int32 {
+  var s: Stack<int64>;
+  s.n = 0;
+  var p: Stack<int64>* = &s;
+  for i in 0..5 { p->push((int64)i * 3); }
+  var top: int64 = s.peek();
+  var popped: int64 = 0;
+  match (p->pop()) { case Some(v): { popped = v; } case None: { popped = -1; } }
+  var fs: Stack<float64>;
+  fs.n = 0;
+  var f: float64 = 1.25;
+  (&fs)->push(f);
+  var x: int64 = 41;
+  var bp: Box<int64*>;
+  bp.v = &x;
+  var a: int32 = 3;
+  var b: int64 = 4;
+  println("{top} {popped} {s.n} {fs.peek()} {*bp.get()} {pair_sum(a, b)}");
+  return 0;
+}

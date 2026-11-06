@@ -1,0 +1,23 @@
+import "std/io";
+struct Box<T> { v: T; tag: int32; }
+fn Box_get<T>(b: Box<T>) -> T { return b.v; }
+enum Shape<T> { Circle(T), Square(T), Dot }
+trait Area { fn area(self: Self) -> int64; }
+impl Area for int64 { fn area(self: Self) -> int64 { return self * self; } }
+fn total<T: Area>(s: Shape<T>) -> int64 {
+  match (s) {
+    case Circle(r): { return r.area() * 3; }
+    case Square(w): { return w.area(); }
+    case Dot: { return 0; }
+  }
+}
+fn main() -> int32 {
+  var b: Box<int64> = { v: 5, tag: 2 };
+  var c: Box<float64> = { v: 0.5, tag: 1 };
+  var r: int64 = 4;
+  var s1: Shape<int64> = Circle(r);
+  var s2: Shape<int64> = Square(r);
+  var s3: Shape<int64> = Dot;
+  println("{b.get()} {c.get()} {b.tag} {total(s1)} {total(s2)} {total(s3)}");
+  return 0;
+}

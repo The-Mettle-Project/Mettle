@@ -5,6 +5,7 @@
 #include "common.h"
 #include "lexer/lexer.h"
 #include "parser/parser.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,7 +91,7 @@ static char *mangle_name(const char *base, char **type_args,
       if (*p == '*') {
         memcpy(result + pos, "_ptr", 4);
         pos += 4;
-      } else if (*p == '<' || *p == '>' || *p == ',') {
+      } else if (!isalnum((unsigned char)*p) && *p != '_') {
         result[pos++] = '_';
       } else {
         result[pos++] = *p;
@@ -710,10 +711,18 @@ static int mono_add_instantiation(MonoContext *ctx, const char *generic_name,
   return 1;
 }
 
+static int mono_nesting_step(const char *text, const char *p) {
+  if (*p == '<' || *p == '(')
+    return 1;
+  if (*p == ')')
+    return -1;
+  return *p == '>' && !(p > text && p[-1] == '-') ? -1 : 0;
+}
+
 static int parse_generic_type_name(const char *type_str, char **out_base,
                                    char ***out_args, size_t *out_arg_count) {
   const char *lt = strchr(type_str, '<');
-  if (!lt)
+  if (!lt || strncmp(type_str, "Fn(", 3) == 0)
     return 0;
 
   size_t base_len = (size_t)(lt - type_str);
@@ -727,14 +736,10 @@ static int parse_generic_type_name(const char *type_str, char **out_base,
   const char *gt = NULL;
   int depth = 1;
   for (const char *p = start; *p; p++) {
-    if (*p == '<')
-      depth++;
-    else if (*p == '>') {
-      depth--;
-      if (depth == 0) {
-        gt = p;
-        break;
-      }
+    depth += mono_nesting_step(type_str, p);
+    if (depth == 0) {
+      gt = p;
+      break;
     }
   }
 
@@ -755,12 +760,9 @@ static int parse_generic_type_name(const char *type_str, char **out_base,
     const char *arg_start = p;
     int inner_depth = 0;
     while (p < gt) {
-      if (*p == '<')
-        inner_depth++;
-      else if (*p == '>')
-        inner_depth--;
-      else if (*p == ',' && inner_depth == 0)
+      if (*p == ',' && inner_depth == 0)
         break;
+      inner_depth += mono_nesting_step(type_str, p);
       p++;
     }
 
@@ -838,18 +840,10 @@ static char *substitute_function_type_string(const char *type_str,
   const char *ret = scan + 2;
   const char *ret_end = ret;
   int angle = 0;
-  int paren = 0;
   while (*ret_end) {
-    if (*ret_end == '<')
-      angle++;
-    else if (*ret_end == '>')
-      angle--;
-    else if (*ret_end == '(')
-      paren++;
-    else if (*ret_end == ')')
-      paren--;
-    else if (*ret_end == ' ' && angle == 0 && paren == 0)
+    if (*ret_end == ' ' && angle == 0)
       break;
+    angle += mono_nesting_step(type_str, ret_end);
     ret_end++;
   }
 
@@ -865,20 +859,11 @@ static char *substitute_function_type_string(const char *type_str,
 
   const char *item = params;
   int item_angle = 0;
-  int item_paren = 0;
   for (const char *c = params; c <= params_end; c++) {
     int at_end = c == params_end;
-    if (!at_end) {
-      if (*c == '<')
-        item_angle++;
-      else if (*c == '>')
-        item_angle--;
-      else if (*c == '(')
-        item_paren++;
-      else if (*c == ')')
-        item_paren--;
-    }
-    if (at_end || (*c == ',' && item_angle == 0 && item_paren == 0)) {
+    if (!at_end)
+      item_angle += mono_nesting_step(type_str, c);
+    if (at_end || (*c == ',' && item_angle == 0)) {
       if (c > item) {
         char *piece = malloc((size_t)(c - item) + 1);
         memcpy(piece, item, (size_t)(c - item));
@@ -944,14 +929,11 @@ static char *substitute_type_string(const char *type_str, char **param_names,
   const char *lbr = NULL;
   int depth = 0;
   for (size_t i = 0; i < ts_len; i++) {
-    if (type_str[i] == '<')
-      depth++;
-    else if (type_str[i] == '>')
-      depth--;
-    else if (type_str[i] == '[' && depth == 0) {
+    if (type_str[i] == '[' && depth == 0) {
       lbr = type_str + i;
       break;
     }
+    depth += mono_nesting_step(type_str, type_str + i);
   }
 
   if (lbr) {
@@ -1666,15 +1648,12 @@ static void rewrite_generic_type_name_in_place(char **slot,
   (void)type_param_count;
 
   for (size_t i = 0; i < len; i++) {
-    if (type_str[i] == '<') {
-      depth++;
-    } else if (type_str[i] == '>') {
-      depth--;
-    } else if (type_str[i] == '[' && depth == 0) {
+    if (type_str[i] == '[' && depth == 0) {
       array_suffix = type_str + i;
       len = i;
       break;
     }
+    depth += mono_nesting_step(type_str, type_str + i);
   }
 
   while (len > 0 && type_str[len - 1] == '*') {
@@ -2297,10 +2276,17 @@ static const char *mono_receiver_part_type(MonoContext *ctx, ASTNode *node,
   }
   if (node->type == AST_UNARY_EXPRESSION) {
     UnaryExpression *unary = (UnaryExpression *)node->data;
-    return unary && unary->operator && strcmp(unary->operator, "*") == 0
-               ? adapt_element_type(mono_receiver_type_name(
-                                        ctx, unary->operand, env, depth + 1),
-                                    1)
+    const char *inner = unary && unary->operator
+                            ? mono_receiver_type_name(ctx, unary->operand, env,
+                                                      depth + 1)
+                            : NULL;
+    if (inner && strcmp(unary->operator, "&") == 0) {
+      char pointer[512];
+      snprintf(pointer, sizeof(pointer), "%s*", inner);
+      return string_intern(pointer);
+    }
+    return inner && strcmp(unary->operator, "*") == 0
+               ? adapt_element_type(inner, 1)
                : NULL;
   }
   return NULL;
@@ -2618,7 +2604,7 @@ static int mono_rewrite_trait_method_calls_in_node(MonoContext *ctx,
     return 1;
   }
 
-  if (node->type == AST_MATCH_STATEMENT && ctx->generic_method_pass) {
+  if (node->type == AST_MATCH_STATEMENT) {
     return mono_rewrite_in_match(ctx, node, env);
   }
 
@@ -2801,21 +2787,13 @@ static int mono_match_generic_args(const char *pattern, const char *actual,
     char *p_arg;
     char *a_arg;
     int ok;
-    while (*p_end && (depth > 0 || (*p_end != ',' && *p_end != '>'))) {
-      if (*p_end == '<') {
-        depth++;
-      } else if (*p_end == '>') {
-        depth--;
-      }
+    while (*p_end && (depth > 0 || (*p_end != ',' && mono_nesting_step(pattern, p_end) >= 0))) {
+      depth += mono_nesting_step(pattern, p_end);
       p_end++;
     }
     depth = 0;
-    while (*a_end && (depth > 0 || (*a_end != ',' && *a_end != '>'))) {
-      if (*a_end == '<') {
-        depth++;
-      } else if (*a_end == '>') {
-        depth--;
-      }
+    while (*a_end && (depth > 0 || (*a_end != ',' && mono_nesting_step(actual, a_end) >= 0))) {
+      depth += mono_nesting_step(actual, a_end);
       a_end++;
     }
     p_arg = mono_text_trim_dup(p_scan);
@@ -5295,7 +5273,7 @@ static size_t mono_split_type_args(const char *type, char **args, size_t max) {
     return 0;
   }
   for (const char *p = open + 1; p < type + length && count < max; p++) {
-    depth += *p == '<' ? 1 : (*p == '>' ? -1 : 0);
+    depth += mono_nesting_step(type, p);
     if ((*p == ',' && depth == 0) || depth < 0) {
       while (*start == ' ') {
         start++;
