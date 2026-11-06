@@ -254,28 +254,81 @@ export fn fmod(x: float64, y: float64) -> float64 {
   return copysign(a, x);
 }
 
+fn sqrt_square(a: uint64, hi: uint64*, lo: uint64*) {
+  var a1: uint64 = a >> (uint64)32;
+  var a0: uint64 = a & (uint64)4294967295;
+  var cross: uint64 = a1 * a0;
+  var low: uint64 = a0 * a0;
+  var mid: uint64 = cross << (uint64)33;
+  var sum: uint64 = low + mid;
+  var carry: uint64 = 0;
+  if (sum < low) { carry = 1; }
+  *hi = a1 * a1 + (cross >> (uint64)31) + carry;
+  *lo = sum;
+}
+
+fn sqrt_below(ahi: uint64, alo: uint64, bhi: uint64, blo: uint64) -> bool {
+  return ahi < bhi || (ahi == bhi && alo < blo);
+}
+
+fn sqrt_estimate(x: float64) -> float64 {
+  var e: int32 = 0;
+  var m: float64 = frexp(x, &e);
+  if ((e & 1) != 0) {
+    m = m * 2.0;
+    e = e - 1;
+  }
+  var y: float64 = 0.41731 + 0.59016 * m;
+  y = 0.5 * (y + m / y);
+  y = 0.5 * (y + m / y);
+  y = 0.5 * (y + m / y);
+  y = 0.5 * (y + m / y);
+  return ldexp(y, e / 2);
+}
+
 export fn sqrt(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
   if (x < 0.0) { return NAN(); }
   if (x == 0.0) { return x; }
   if (is_inf(x) != 0) { return x; }
 
-  var e: int32 = 0;
-  var m: float64 = frexp(x, &e);
-
-  if ((e & 1) != 0) {
-    m = m * 2.0;
-    e = e - 1;
+  var bits: int64 = f64_bits(x);
+  var exponent: int64 = (bits >> 52) & 2047;
+  var mant: uint64 = (uint64)(bits & 4503599627370495);
+  if (exponent == 0) {
+    exponent = 1;
+    while ((mant & (uint64)4503599627370496) == (uint64)0) {
+      mant = mant << (uint64)1;
+      exponent = exponent - 1;
+    }
+  } else {
+    mant = mant | (uint64)4503599627370496;
   }
-
-  var y: float64 = 0.41731 + 0.59016 * m;
-  y = 0.5 * (y + m / y);
-  y = 0.5 * (y + m / y);
-  y = 0.5 * (y + m / y);
-  y = 0.5 * (y + m / y);
-  y = 0.5 * (y + m / y);
-
-  return ldexp(y, e / 2);
+  var e2: int64 = exponent - 1075;
+  if ((e2 & 1) != 0) {
+    mant = mant << (uint64)1;
+    e2 = e2 - 1;
+  }
+  var half: int32 = (int32)((e2 - 52) / 2);
+  var y: uint64 = (uint64)(int64)ldexp(sqrt_estimate(x), -half);
+  var four_hi: uint64 = mant >> (uint64)10;
+  var four_lo: uint64 = mant << (uint64)54;
+  var hi: uint64 = 0;
+  var lo: uint64 = 0;
+  for _attempt in 0..4 {
+    sqrt_square(y * (uint64)2 + (uint64)1, &hi, &lo);
+    if (!sqrt_below(four_hi, four_lo, hi, lo)) {
+      y = y + (uint64)1;
+      continue;
+    }
+    sqrt_square(y * (uint64)2 - (uint64)1, &hi, &lo);
+    if (sqrt_below(four_hi, four_lo, hi, lo)) {
+      y = y - (uint64)1;
+      continue;
+    }
+    break;
+  }
+  return ldexp((float64)y, half);
 }
 
 export fn rsqrt(x: float64) -> float64 {
@@ -460,31 +513,150 @@ export fn cbrt(x: float64) -> float64 {
   return copysign(y, x);
 }
 
+fn dd_two_prod(a: float64, b: float64, err: float64*) -> float64 {
+  var p: float64 = a * b;
+  var ca: float64 = 134217729.0 * a;
+  var ah: float64 = ca - (ca - a);
+  var al: float64 = a - ah;
+  var cb: float64 = 134217729.0 * b;
+  var bh: float64 = cb - (cb - b);
+  var bl: float64 = b - bh;
+  *err = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+  return p;
+}
+
+fn dd_mul(ah: float64, al: float64, bh: float64, bl: float64,
+          lo: float64*) -> float64 {
+  var e: float64 = 0.0;
+  var p: float64 = dd_two_prod(ah, bh, &e);
+  e = e + (ah * bl + al * bh);
+  var s: float64 = p + e;
+  *lo = e - (s - p);
+  return s;
+}
+
+fn pow_log_dd(x: float64, lo: float64*) -> float64 {
+  var k: int32 = 0;
+  var m: float64 = frexp(x, &k);
+  if (m < 0.70710678118654752) {
+    m = m * 2.0;
+    k = k - 1;
+  }
+  var f: float64 = m - 1.0;
+  var s_hi: float64 = 2.0 + f;
+  var s_lo: float64 = f - (s_hi - 2.0);
+  var t_hi: float64 = f / s_hi;
+  var pe: float64 = 0.0;
+  var p: float64 = dd_two_prod(t_hi, s_hi, &pe);
+  var t_lo: float64 = (((f - p) - pe) - t_hi * s_lo) / s_hi;
+  var z: float64 = t_hi * t_hi;
+  var q: float64 = 1.0 / 23.0;
+  q = q * z + 1.0 / 21.0;
+  q = q * z + 1.0 / 19.0;
+  q = q * z + 1.0 / 17.0;
+  q = q * z + 1.0 / 15.0;
+  q = q * z + 1.0 / 13.0;
+  q = q * z + 1.0 / 11.0;
+  q = q * z + 1.0 / 9.0;
+  q = q * z + 1.0 / 7.0;
+  q = q * z + 1.0 / 5.0;
+  q = q * z + 1.0 / 3.0;
+  var tail: float64 = 2.0 * t_hi * z * q;
+  var two_t: float64 = 2.0 * t_hi;
+  var mh: float64 = two_t + tail;
+  var ml: float64 = (two_t - mh) + tail + 2.0 * t_lo;
+  var kh: float64 = (float64)k * 6.93147180369123816490e-01;
+  var kl: float64 = (float64)k * 1.90821492927058770002e-10;
+  var sum: float64 = kh + mh;
+  var bb: float64 = sum - kh;
+  var err: float64 = (kh - (sum - bb)) + (mh - bb);
+  var rest: float64 = err + ml + kl;
+  var hi: float64 = sum + rest;
+  *lo = rest - (hi - sum);
+  return hi;
+}
+
+fn pow_int_dd(base: float64, n: int64, lo: float64*) -> float64 {
+  var acc_h: float64 = 1.0;
+  var acc_l: float64 = 0.0;
+  var b_h: float64 = base;
+  var b_l: float64 = 0.0;
+  var left: int64 = n;
+  while (left > 0) {
+    if ((left & 1) != 0) {
+      acc_h = dd_mul(acc_h, acc_l, b_h, b_l, &acc_l);
+    }
+    left = left >> 1;
+    if (left > 0) {
+      b_h = dd_mul(b_h, b_l, b_h, b_l, &b_l);
+    }
+  }
+  *lo = acc_l;
+  return acc_h;
+}
+
+fn pow_positive(base: float64, exponent: float64) -> float64 {
+  var magnitude: float64 = exponent * log2(base);
+  if (magnitude > 1100.0) { return INF(); }
+  if (magnitude < -1200.0) { return 0.0; }
+  if (exponent == trunc(exponent) && fabs(exponent) <= 64.0 &&
+      fabs(magnitude) < 1000.0) {
+    var acc_l: float64 = 0.0;
+    var acc_h: float64 = pow_int_dd(base, (int64)fabs(exponent), &acc_l);
+    if (exponent > 0.0) { return acc_h + acc_l; }
+    var q: float64 = 1.0 / acc_h;
+    var qe: float64 = 0.0;
+    var qp: float64 = dd_two_prod(q, acc_h, &qe);
+    var correction: float64 = ((1.0 - qp) - qe) - q * acc_l;
+    return q + q * correction;
+  }
+  var log_lo: float64 = 0.0;
+  var log_hi: float64 = pow_log_dd(base, &log_lo);
+  var p_lo: float64 = 0.0;
+  var p_hi: float64 = dd_mul(exponent, 0.0, log_hi, log_lo, &p_lo);
+  if (p_hi > 709.8) { return INF(); }
+  if (p_hi < -745.2) { return 0.0; }
+  var r: float64 = exp(p_hi);
+  return r + r * p_lo;
+}
+
 export fn pow(base: float64, exponent: float64) -> float64 {
   if (exponent == 0.0) { return 1.0; }
   if (is_nan(base) != 0) { return base; }
   if (is_nan(exponent) != 0) { return exponent; }
   if (base == 1.0) { return 1.0; }
 
-  if (exponent == trunc(exponent) && fabs(exponent) <= 1024.0) {
-    var n: int64 = (int64)fabs(exponent);
-    var acc: float64 = 1.0;
-    var b: float64 = base;
-    while (n > 0) {
-      if ((n & 1) != 0) { acc = acc * b; }
-      b = b * b;
-      n = n >> 1;
+  if (is_finite(base) == 0 || is_finite(exponent) == 0 || base == 0.0 ||
+      fabs(exponent) > 1.0e300) {
+    if (exponent == trunc(exponent) && fabs(exponent) <= 1024.0) {
+      var n: int64 = (int64)fabs(exponent);
+      var acc: float64 = 1.0;
+      var b: float64 = base;
+      while (n > 0) {
+        if ((n & 1) != 0) { acc = acc * b; }
+        b = b * b;
+        n = n >> 1;
+      }
+      if (exponent < 0.0) { return 1.0 / acc; }
+      return acc;
     }
-    if (exponent < 0.0) { return 1.0 / acc; }
-    return acc;
+    if (base < 0.0) { return NAN(); }
+    if (base == 0.0) {
+      if (exponent < 0.0) { return INF(); }
+      return 0.0;
+    }
+    return exp2(exponent * log2(base));
   }
 
-  if (base < 0.0) { return NAN(); }
-  if (base == 0.0) {
-    if (exponent < 0.0) { return INF(); }
-    return 0.0;
+  if (base < 0.0) {
+    if (exponent != trunc(exponent)) { return NAN(); }
+    var odd: bool = fabs(exponent) < 9007199254740992.0 &&
+                    ((int64)fabs(exponent) & 1) != 0;
+    var r: float64 = pow_positive(-base, exponent);
+    if (odd) { return -r; }
+    return r;
   }
-  return exp2(exponent * log2(base));
+  return pow_positive(base, exponent);
 }
 
 fn sin_kernel(r: float64) -> float64 {
