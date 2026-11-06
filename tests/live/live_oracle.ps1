@@ -62,7 +62,9 @@ $undefined = @(
     "test_safe_global_pointer.mettle",
     "test_crash_report_frames.mettle",
     "test_safe_vec_dot.mettle",
-    "test_safe_vec_sum.mettle"
+    "test_safe_vec_sum.mettle",
+    "test_safe_affine_short.mettle",
+    "test_safe_call_short.mettle"
 )
 if ($Optimize) { $undefined += "test_schedule_joins.mettle" }
 if ($IsLinux) { $undefined += "test_naked_interrupt.mettle" }
