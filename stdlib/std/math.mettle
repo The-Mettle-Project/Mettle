@@ -389,28 +389,83 @@ export fn exp2(x: float64) -> float64 {
   return ldexp(exp_kernel(r * LN2()), (int32)k);
 }
 
+fn exp_reduced(x: float64, n_out: int32*, lo: float64*) -> float64 {
+  var k: float64 = round(x * LOG2E());
+  var head: float64 = x - k * LN2_HI();
+  var r: float64 = head - k * LN2_LO();
+  var r_lo: float64 = (head - r) - k * LN2_LO();
+  var p: float64 = 1.1470745597729725e-11;
+  p = p * r + 1.6059043836821613e-10;
+  p = p * r + 2.08767569878681e-09;
+  p = p * r + 2.505210838544172e-08;
+  p = p * r + 2.755731922398589e-07;
+  p = p * r + 2.7557319223985893e-06;
+  p = p * r + 2.48015873015873e-05;
+  p = p * r + 1.984126984126984e-04;
+  p = p * r + 1.388888888888889e-03;
+  p = p * r + 8.333333333333333e-03;
+  p = p * r + 4.1666666666666664e-02;
+  p = p * r + 1.6666666666666666e-01;
+  p = p * r + 5.0e-01;
+  var sq_lo: float64 = 0.0;
+  var sq: float64 = dd_two_prod(r, r, &sq_lo);
+  var tail: float64 = (sq * p + sq_lo * 0.5) + r_lo * (1.0 + r);
+  var em: float64 = r + tail;
+  *lo = tail - (em - r);
+  *n_out = (int32)k;
+  return em;
+}
+
+fn exp_half_huge(a: float64) -> float64 {
+  var n: int32 = 0;
+  var em_lo: float64 = 0.0;
+  var em: float64 = exp_reduced(a, &n, &em_lo);
+  var one: float64 = 1.0 + em;
+  var one_lo: float64 = (em - (one - 1.0)) + em_lo;
+  return ldexp(one + one_lo, n - 1);
+}
+
+fn expm1_dd(x: float64, lo: float64*) -> float64 {
+  *lo = 0.0;
+  if (fabs(x) < 5.551115123125783e-17) { return x; }
+  var n: int32 = 0;
+  var em_lo: float64 = 0.0;
+  var em: float64 = exp_reduced(x, &n, &em_lo);
+  if (n == 0) {
+    *lo = em_lo;
+    return em;
+  }
+  if (n <= -57) {
+    *lo = 0.0;
+    return -1.0 + ldexp(1.0 + em, n);
+  }
+  if (n >= 57) {
+    var one: float64 = 1.0 + em;
+    var one_lo: float64 = (em - (one - 1.0)) + em_lo;
+    *lo = ldexp(one_lo, n);
+    return ldexp(one, n);
+  }
+  var scale: float64 = ldexp(1.0, n);
+  var b: float64 = em * scale;
+  var s1: float64 = scale - 1.0;
+  var e1: float64 = (scale - s1) - 1.0;
+  var s2: float64 = s1 + b;
+  var bb: float64 = s2 - s1;
+  var e2: float64 = (s1 - (s2 - bb)) + (b - bb);
+  var rest: float64 = e1 + e2 + em_lo * scale;
+  var hi: float64 = s2 + rest;
+  *lo = rest - (hi - s2);
+  return hi;
+}
+
 export fn expm1(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
-  if (fabs(x) < 0.35) {
-    var p: float64 = 4.779477332387385e-14;
-    p = p * x + 7.647163731819816e-13;
-    p = p * x + 1.1470745597729725e-11;
-    p = p * x + 1.6059043836821613e-10;
-    p = p * x + 2.08767569878681e-09;
-    p = p * x + 2.505210838544172e-08;
-    p = p * x + 2.755731922398589e-07;
-    p = p * x + 2.7557319223985893e-06;
-    p = p * x + 2.48015873015873e-05;
-    p = p * x + 1.984126984126984e-04;
-    p = p * x + 1.388888888888889e-03;
-    p = p * x + 8.333333333333333e-03;
-    p = p * x + 4.1666666666666664e-02;
-    p = p * x + 1.6666666666666666e-01;
-    p = p * x + 5.0e-01;
-    p = p * x + 1.0;
-    return p * x;
-  }
-  return exp(x) - 1.0;
+  if (x > 709.782712893384) { return INF(); }
+  if (x < -40.0) { return -1.0; }
+  if (fabs(x) < 5.551115123125783e-17) { return x; }
+  var lo: float64 = 0.0;
+  var hi: float64 = expm1_dd(x, &lo);
+  return hi + lo;
 }
 
 fn log_kernel(m: float64) -> float64 {
@@ -438,16 +493,9 @@ export fn log(x: float64) -> float64 {
   if (x == 0.0) { return -INF(); }
   if (is_inf(x) != 0) { return x; }
 
-  var e: int32 = 0;
-  var m: float64 = frexp(x, &e);
-
-  if (m < SQRT1_2()) {
-    m = m * 2.0;
-    e = e - 1;
-  }
-
-  var ef: float64 = (float64)e;
-  return (ef * LN2_HI() + log_kernel(m)) + ef * LN2_LO();
+  var lo: float64 = 0.0;
+  var hi: float64 = pow_log_dd(x, &lo);
+  return hi + lo;
 }
 
 export fn log2(x: float64) -> float64 {
@@ -479,24 +527,33 @@ export fn log10(x: float64) -> float64 {
   return hi + lo;
 }
 
+fn log1p_dd(x: float64, x_lo: float64, lo: float64*) -> float64 {
+  *lo = 0.0;
+  if (fabs(x) < 5.551115123125783e-17) {
+    *lo = x_lo;
+    return x;
+  }
+  var u: float64 = 1.0 + x;
+  var bb: float64 = u - 1.0;
+  var err: float64 = ((1.0 - (u - bb)) + (x - bb)) + x_lo;
+  var l_lo: float64 = 0.0;
+  var l_hi: float64 = pow_log_dd(u, &l_lo);
+  var rest: float64 = l_lo + err / u;
+  var hi: float64 = l_hi + rest;
+  var part: float64 = hi - l_hi;
+  *lo = (l_hi - (hi - part)) + (rest - part);
+  return hi;
+}
+
 export fn log1p(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
   if (x < -1.0) { return NAN(); }
   if (x == -1.0) { return -INF(); }
-  if (fabs(x) < 0.2) {
-    var s: float64 = x / (2.0 + x);
-    var z: float64 = s * s;
-    var p: float64 = 6.6666666666666666e-02;
-    p = p * z + 7.6923076923076927e-02;
-    p = p * z + 9.0909090909090912e-02;
-    p = p * z + 1.1111111111111111e-01;
-    p = p * z + 1.4285714285714285e-01;
-    p = p * z + 2.0e-01;
-    p = p * z + 3.3333333333333331e-01;
-    p = p * z + 1.0;
-    return 2.0 * s * p;
-  }
-  return log(1.0 + x);
+  if (is_inf(x) != 0) { return x; }
+  if (fabs(x) < 5.551115123125783e-17) { return x; }
+  var lo: float64 = 0.0;
+  var hi: float64 = log1p_dd(x, 0.0, &lo);
+  return hi + lo;
 }
 
 export fn cbrt(x: float64) -> float64 {
@@ -508,7 +565,12 @@ export fn cbrt(x: float64) -> float64 {
   var y: float64 = exp(log(a) * 0.3333333333333333);
   y = (2.0 * y + a / (y * y)) * 0.3333333333333333;
   y = (2.0 * y + a / (y * y)) * 0.3333333333333333;
-  y = (2.0 * y + a / (y * y)) * 0.3333333333333333;
+  var sq_lo: float64 = 0.0;
+  var sq: float64 = dd_two_prod(y, y, &sq_lo);
+  var cube_lo: float64 = 0.0;
+  var cube: float64 = dd_mul(sq, sq_lo, y, 0.0, &cube_lo);
+  var residual: float64 = (a - cube) - cube_lo;
+  y = y + residual / (3.0 * sq);
   return copysign(y, x);
 }
 
@@ -658,173 +720,375 @@ export fn pow(base: float64, exponent: float64) -> float64 {
   return pow_positive(base, exponent);
 }
 
-fn sin_kernel(r: float64) -> float64 {
-  var z: float64 = r * r;
-  var p: float64 = -8.2206352466243297e-18;
-  p = p * z + 2.8114572543455206e-15;
-  p = p * z + -7.6471637318198165e-13;
-  p = p * z + 1.6059043836821613e-10;
-  p = p * z + -2.5052108385441720e-08;
-  p = p * z + 2.7557319223985893e-06;
-  p = p * z + -1.9841269841269841e-04;
-  p = p * z + 8.3333333333333333e-03;
-  p = p * z + -1.6666666666666666e-01;
-  p = p * z + 1.0;
-  return r * p;
+fn sin_kernel(x: float64, y: float64, lo: float64*) -> float64 {
+  var z: float64 = x * x;
+  var v: float64 = z * x;
+  var r: float64 = 8.33333333332248946124e-03 + z * (-1.98412698298579493134e-04 + z * (2.75573137070700676789e-06 + z * (-2.50507602534068634195e-08 + z * 1.58969099521155010221e-10)));
+  var tail: float64 = -((z * (0.5 * y - v * r) - y) - v * -1.66666666666666324348e-01);
+  var hi: float64 = x + tail;
+  *lo = tail - (hi - x);
+  return hi;
 }
 
-fn cos_kernel(r: float64) -> float64 {
-  var z: float64 = r * r;
-  var p: float64 = 4.1103176233121648e-19;
-  p = p * z + -1.5619206968586226e-16;
-  p = p * z + 4.7794773323873853e-14;
-  p = p * z + -1.1470745597729725e-11;
-  p = p * z + 2.0876756987868099e-09;
-  p = p * z + -2.7557319223985893e-07;
-  p = p * z + 2.4801587301587302e-05;
-  p = p * z + -1.3888888888888889e-03;
-  p = p * z + 4.1666666666666664e-02;
-  p = p * z + -5.0e-01;
-  p = p * z + 1.0;
-  return p;
+fn cos_kernel(x: float64, y: float64, lo: float64*) -> float64 {
+  var z: float64 = x * x;
+  var w: float64 = z * z;
+  var r: float64 = z * (4.16666666666666019037e-02 + z * (-1.38888888888741095749e-03 + z * 2.48015872894767294178e-05)) + w * w * (-2.75573143513906633035e-07 + z * (2.08757232129817482790e-09 + z * -1.13596475577881948265e-11));
+  var hz: float64 = 0.5 * z;
+  var head: float64 = 1.0 - hz;
+  var rest: float64 = ((1.0 - head) - hz) + (z * r - x * y);
+  var hi: float64 = head + rest;
+  *lo = rest - (hi - head);
+  return hi;
 }
 
-fn reduce_pio2(x: float64, quadrant_out: int32*) -> float64 {
-  var n: float64 = round(x * (2.0 / PI()));
-  *quadrant_out = (int32)((int64)n & 3);
-  return (x - n * PIO2_HI()) - n * PIO2_LO();
+fn pio2_bits64(limbs: uint64*, pos: int32) -> uint64 {
+  var w: int32 = pos / 32;
+  var sh: int32 = pos % 32;
+  var v: uint64 = limbs[w] | (limbs[w + 1] << 32);
+  if (sh == 0) { return v; }
+  return (v >> (uint64)sh) | (limbs[w + 2] << (uint64)(64 - sh));
+}
+
+fn reduce_pio2_large(x: float64, lo_out: float64*, quadrant_out: int32*) -> float64 {
+  var table: uint64[40] = [0xA2F9836E, 0x4E441529, 0xFC2757D1, 0xF534DDC0, 0xDB629599, 0x3C439041, 0xFE5163AB, 0xDEBBC561, 0xB7246E3A, 0x424DD2E0, 0x06492EEA, 0x09D1921C, 0xFE1DEB1C, 0xB129A73E, 0xE88235F5, 0x2EBB4484, 0xE99C7026, 0xB45F7E41, 0x3991D639, 0x835339F4, 0x9C845F8B, 0xBDF9283B, 0x1FF897FF, 0xDE05980F, 0xEF2F118B, 0x5A0A6D1F, 0x6D367ECF, 0x27CB09B7, 0x4F463F66, 0x9E5FEA2D, 0x7527BAC7, 0xEBE5F17B, 0x3D0739F7, 0x8A5292EA, 0x6BFB5FB1, 0x1F8D5D08, 0x56033046, 0xFC7B6BAB, 0xF0CFBC20, 0x9AF4361D];
+  var limbs: uint64[11];
+  for k in 0..11 { limbs[k] = 0; }
+  var bits: int64 = f64_bits(x);
+  var m: uint64 = (uint64)((bits & FRAC_MASK()) | 0x0010000000000000);
+  var e: int32 = (int32)((bits >> 52) & EXP_MASK()) - 1075;
+  var i0: int32 = 0;
+  if (e >= 2) { i0 = (e - 2) / 32; }
+  for j in 0..7 {
+    var c: uint64 = table[i0 + (int32)j];
+    var k: int32 = 6 - (int32)j;
+    var p_lo: uint64 = (m & 0xFFFFFFFF) * c;
+    var p_hi: uint64 = (m >> 32) * c;
+    limbs[k] = limbs[k] + (p_lo & 0xFFFFFFFF);
+    limbs[k + 1] = limbs[k + 1] + (p_lo >> 32) + (p_hi & 0xFFFFFFFF);
+    limbs[k + 2] = limbs[k + 2] + (p_hi >> 32);
+  }
+  for k in 0..10 {
+    limbs[k + 1] = limbs[k + 1] + (limbs[k] >> 32);
+    limbs[k] = limbs[k] & 0xFFFFFFFF;
+  }
+  var s: int32 = 32 * (i0 + 7) - e;
+  var q: int32 = (int32)(pio2_bits64(&limbs[0], s) & 3);
+  var hi: uint64 = pio2_bits64(&limbs[0], s - 64);
+  var lo: uint64 = pio2_bits64(&limbs[0], s - 128);
+  var negative: bool = (hi >> 63) != 0;
+  if (negative) {
+    q = q + 1;
+    lo = ~lo + 1;
+    hi = ~hi;
+    if (lo == 0) { hi = hi + 1; }
+  }
+  var a: float64 = (float64)(hi >> 11) * 1.1102230246251565e-16;
+  var b: float64 = (float64)(((hi & 0x7FF) << 42) | (lo >> 22)) * 1.2325951644078310e-32;
+  var c3: float64 = (float64)(lo & 0x3FFFFF) * 2.9387358770557188e-39;
+  var f_hi: float64 = a + b;
+  var f_lo: float64 = (b - (f_hi - a)) + c3;
+  var r_lo: float64 = 0.0;
+  var r_hi: float64 = dd_mul(f_hi, f_lo, 1.5707963267948966, 6.123233995736766e-17, &r_lo);
+  if (negative) {
+    r_hi = -r_hi;
+    r_lo = -r_lo;
+  }
+  *lo_out = r_lo;
+  *quadrant_out = q & 3;
+  return r_hi;
+}
+
+fn reduce_pio2(x: float64, lo_out: float64*, quadrant_out: int32*) -> float64 {
+  var a: float64 = fabs(x);
+  if (a <= 0.78539816339744828) {
+    *lo_out = 0.0;
+    *quadrant_out = 0;
+    return x;
+  }
+  var r_hi: float64 = 0.0;
+  var r_lo: float64 = 0.0;
+  var q: int32 = 0;
+  if (a < 1647099.0) {
+    var n: float64 = round(a * 0.63661977236758134);
+    var t1: float64 = a - n * 1.57079632673412561417e+00;
+    var w2: float64 = n * 6.07710050630396597660e-11;
+    var t2: float64 = t1 - w2;
+    var e2: float64 = (t1 - t2) - w2;
+    var w3: float64 = n * 2.02226624871116645580e-21;
+    var t3: float64 = t2 - w3;
+    var e3: float64 = (t2 - t3) - w3;
+    var tail: float64 = (e2 + e3) - n * 8.47842766036889956997e-32;
+    r_hi = t3 + tail;
+    r_lo = tail - (r_hi - t3);
+    q = (int32)((int64)n & 3);
+  } else {
+    r_hi = reduce_pio2_large(a, &r_lo, &q);
+  }
+  if (x < 0.0) {
+    r_hi = -r_hi;
+    r_lo = -r_lo;
+    q = (4 - q) & 3;
+  }
+  *lo_out = r_lo;
+  *quadrant_out = q;
+  return r_hi;
 }
 
 export fn sin(x: float64) -> float64 {
   if (is_finite(x) == 0) { return NAN(); }
   var q: int32 = 0;
-  var r: float64 = reduce_pio2(x, &q);
-  if (q == 0) { return sin_kernel(r); }
-  if (q == 1) { return cos_kernel(r); }
-  if (q == 2) { return -sin_kernel(r); }
-  return -cos_kernel(r);
+  var y: float64 = 0.0;
+  var r: float64 = reduce_pio2(x, &y, &q);
+  var lo: float64 = 0.0;
+  if (q == 0) { return sin_kernel(r, y, &lo); }
+  if (q == 1) { return cos_kernel(r, y, &lo); }
+  if (q == 2) { return -sin_kernel(r, y, &lo); }
+  return -cos_kernel(r, y, &lo);
 }
 
 export fn cos(x: float64) -> float64 {
   if (is_finite(x) == 0) { return NAN(); }
   var q: int32 = 0;
-  var r: float64 = reduce_pio2(x, &q);
-  if (q == 0) { return cos_kernel(r); }
-  if (q == 1) { return -sin_kernel(r); }
-  if (q == 2) { return -cos_kernel(r); }
-  return sin_kernel(r);
+  var y: float64 = 0.0;
+  var r: float64 = reduce_pio2(x, &y, &q);
+  var lo: float64 = 0.0;
+  if (q == 0) { return cos_kernel(r, y, &lo); }
+  if (q == 1) { return -sin_kernel(r, y, &lo); }
+  if (q == 2) { return -cos_kernel(r, y, &lo); }
+  return sin_kernel(r, y, &lo);
 }
 
 export fn tan(x: float64) -> float64 {
   if (is_finite(x) == 0) { return NAN(); }
   var q: int32 = 0;
-  var r: float64 = reduce_pio2(x, &q);
-  var s: float64 = sin_kernel(r);
-  var c: float64 = cos_kernel(r);
-  if ((q & 1) != 0) { return -c / s; }
-  return s / c;
+  var y: float64 = 0.0;
+  var r: float64 = reduce_pio2(x, &y, &q);
+  if (r == 0.0) { return x; }
+  var s_lo: float64 = 0.0;
+  var c_lo: float64 = 0.0;
+  var s_hi: float64 = sin_kernel(r, y, &s_lo);
+  var c_hi: float64 = cos_kernel(r, y, &c_lo);
+  var n_hi: float64 = s_hi;
+  var n_lo: float64 = s_lo;
+  var d_hi: float64 = c_hi;
+  var d_lo: float64 = c_lo;
+  if ((q & 1) != 0) {
+    n_hi = -c_hi;
+    n_lo = -c_lo;
+    d_hi = s_hi;
+    d_lo = s_lo;
+  }
+  var t: float64 = n_hi / d_hi;
+  var pe: float64 = 0.0;
+  var p: float64 = dd_two_prod(t, d_hi, &pe);
+  var rem: float64 = (((n_hi - p) - pe) + n_lo) - t * d_lo;
+  return t + rem / d_hi;
 }
 
-fn atan_kernel(t: float64) -> float64 {
+fn atan_positive(a: float64, a_lo: float64, lo: float64*) -> float64 {
+  *lo = 0.0;
+  if (a >= 7.378697629483821e+19) {
+    *lo = 6.123233995736766e-17;
+    return 1.5707963267948966;
+  }
+  if (a < 3.725290298461914e-09) { return a + a_lo; }
+  var t: float64 = a;
+  var head: float64 = 0.0;
+  var head_lo: float64 = 0.0;
+  var id: int32 = -1;
+  if (a >= 0.4375) {
+    if (a < 0.6875) {
+      id = 0;
+      t = (2.0 * a - 1.0) / (2.0 + a);
+      head = 4.63647609000806093515e-01;
+      head_lo = 2.26987774529616870924e-17;
+    } else if (a < 1.1875) {
+      id = 1;
+      t = (a - 1.0) / (a + 1.0);
+      head = 7.85398163397448278999e-01;
+      head_lo = 3.06161699786838301793e-17;
+    } else if (a < 2.4375) {
+      id = 2;
+      t = (a - 1.5) / (1.0 + 1.5 * a);
+      head = 9.82793723247329054082e-01;
+      head_lo = 1.39033110312309984516e-17;
+    } else {
+      id = 3;
+      t = -1.0 / a;
+      head = 1.57079632679489655800e+00;
+      head_lo = 6.12323399573676603587e-17;
+    }
+  }
+  var correction: float64 = a_lo / (1.0 + a * a);
   var z: float64 = t * t;
-  var p: float64 = -3.2258064516129031e-02;
-  p = p * z + 3.4482758620689655e-02;
-  p = p * z + -3.7037037037037035e-02;
-  p = p * z + 4.0e-02;
-  p = p * z + -4.3478260869565216e-02;
-  p = p * z + 4.7619047619047616e-02;
-  p = p * z + -5.2631578947368418e-02;
-  p = p * z + 5.8823529411764705e-02;
-  p = p * z + -6.6666666666666666e-02;
-  p = p * z + 7.6923076923076927e-02;
-  p = p * z + -9.0909090909090912e-02;
-  p = p * z + 1.1111111111111111e-01;
-  p = p * z + -1.4285714285714285e-01;
-  p = p * z + 2.0e-01;
-  p = p * z + -3.3333333333333331e-01;
-  p = p * z + 1.0;
-  return t * p;
+  var w: float64 = z * z;
+  var s1: float64 = z * (3.33333333333329318027e-01 + w * (1.42857142725034663711e-01 + w * (9.09088713343650656196e-02 + w * (6.66107313738753120669e-02 + w * (4.97687799461593236017e-02 + w * 1.62858201153657823623e-02)))));
+  var s2: float64 = w * (-1.99999999998764832476e-01 + w * (-1.11111104054623557880e-01 + w * (-7.69187620504482999495e-02 + w * (-5.83357013379057348645e-02 + w * -3.65315727442169155270e-02))));
+  if (id < 0) {
+    var small_tail: float64 = t * (s1 + s2) - correction;
+    var small: float64 = t - small_tail;
+    *lo = (t - small) - small_tail;
+    return small;
+  }
+  var tail: float64 = ((t * (s1 + s2) - head_lo) - correction) - t;
+  var hi: float64 = head - tail;
+  *lo = (head - hi) - tail;
+  return hi;
 }
 
 export fn atan(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
-  if (is_inf(x) != 0) { return copysign(HALF_PI(), x); }
-
-  var a: float64 = fabs(x);
-  var invert: int32 = 0;
-  if (a > 1.0) {
-    a = 1.0 / a;
-    invert = 1;
-  }
-
-  var shifted: int32 = 0;
-  if (a > 0.26794919243112270) {
-    a = (a * 1.7320508075688772 - 1.0) / (1.7320508075688772 + a);
-    shifted = 1;
-  }
-
-  var r: float64 = atan_kernel(a);
-  if (shifted != 0) { r = r + 0.5235987755982989; }
-  if (invert != 0) { r = HALF_PI() - r; }
-  return copysign(r, x);
+  var lo: float64 = 0.0;
+  return copysign(atan_positive(fabs(x), 0.0, &lo), x);
 }
 
 export fn atan2(y: float64, x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
   if (is_nan(y) != 0) { return y; }
 
-  if (x == 0.0) {
-    if (y > 0.0) { return HALF_PI(); }
-    if (y < 0.0) { return -HALF_PI(); }
-    return 0.0;
+  var west: bool = x < 0.0 || (x == 0.0 && signbit(x) != 0);
+  if (y == 0.0) {
+    if (west) { return copysign(PI(), y); }
+    return y;
   }
+  if (x == 0.0) { return copysign(HALF_PI(), y); }
+  if (is_inf(x) != 0) {
+    if (is_inf(y) != 0) {
+      if (west) { return copysign(2.356194490192345, y); }
+      return copysign(QUARTER_PI(), y);
+    }
+    if (west) { return copysign(PI(), y); }
+    return copysign(0.0, y);
+  }
+  if (is_inf(y) != 0) { return copysign(HALF_PI(), y); }
+  var q_lo: float64 = 0.0;
+  var q: float64 = dd_quotient(fabs(y), 0.0, fabs(x), 0.0, &q_lo);
+  if (is_finite(q_lo) == 0) { q_lo = 0.0; }
+  var r_lo: float64 = 0.0;
+  var r: float64 = atan_positive(q, q_lo, &r_lo);
+  if (west) {
+    var s: float64 = 3.141592653589793 - r;
+    var err: float64 = (3.141592653589793 - s) - r;
+    r = s + ((err + 1.2246467991473532e-16) - r_lo);
+  }
+  return copysign(r, y);
+}
 
-  var r: float64 = atan(y / x);
-  if (x > 0.0) { return r; }
-  if (y >= 0.0) { return r + PI(); }
-  return r - PI();
+fn dd_sqrt(q: float64, q_lo: float64, lo: float64*) -> float64 {
+  var s: float64 = sqrt(q);
+  var pe: float64 = 0.0;
+  var p: float64 = dd_two_prod(s, s, &pe);
+  *lo = (((q - p) - pe) + q_lo) / (2.0 * s);
+  return s;
+}
+
+fn dd_quotient(n_hi: float64, n_lo: float64, d_hi: float64, d_lo: float64, lo: float64*) -> float64 {
+  var t: float64 = n_hi / d_hi;
+  var pe: float64 = 0.0;
+  var p: float64 = dd_two_prod(t, d_hi, &pe);
+  *lo = ((((n_hi - p) - pe) + n_lo) - t * d_lo) / d_hi;
+  return t;
 }
 
 export fn asin(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
   if (x > 1.0 || x < -1.0) { return NAN(); }
-  return atan2(x, sqrt((1.0 - x) * (1.0 + x)));
+  var a: float64 = fabs(x);
+  if (a == 1.0) { return copysign(HALF_PI(), x); }
+  if (a < 3.725290298461914e-09) { return x; }
+  var pe: float64 = 0.0;
+  var p: float64 = dd_two_prod(a, a, &pe);
+  var q: float64 = 1.0 - p;
+  var q_lo: float64 = ((1.0 - q) - p) - pe;
+  var s_lo: float64 = 0.0;
+  var s: float64 = dd_sqrt(q, q_lo, &s_lo);
+  var y_lo: float64 = 0.0;
+  var y: float64 = dd_quotient(a, 0.0, s, s_lo, &y_lo);
+  var lo: float64 = 0.0;
+  return copysign(atan_positive(y, y_lo, &lo), x);
 }
 
 export fn acos(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
   if (x > 1.0 || x < -1.0) { return NAN(); }
-  return atan2(sqrt((1.0 - x) * (1.0 + x)), x);
+  if (x == 1.0) { return 0.0; }
+  if (x == -1.0) { return PI(); }
+  var u: float64 = 1.0 - x;
+  var u_lo: float64 = (1.0 - u) - x;
+  var v: float64 = 1.0 + x;
+  var v_lo: float64 = (1.0 - v) + x;
+  var r_lo: float64 = 0.0;
+  var r: float64 = dd_quotient(u, u_lo, v, v_lo, &r_lo);
+  var s_lo: float64 = 0.0;
+  var s: float64 = dd_sqrt(r, r_lo, &s_lo);
+  var lo: float64 = 0.0;
+  return 2.0 * atan_positive(s, s_lo, &lo);
+}
+
+fn dd_div(n_hi: float64, n_lo: float64, d_hi: float64, d_lo: float64) -> float64 {
+  var t: float64 = n_hi / d_hi;
+  var pe: float64 = 0.0;
+  var p: float64 = dd_two_prod(t, d_hi, &pe);
+  var rem: float64 = (((n_hi - p) - pe) + n_lo) - t * d_lo;
+  return t + rem / d_hi;
 }
 
 export fn sinh(x: float64) -> float64 {
   if (is_finite(x) == 0) { return x; }
-  if (fabs(x) < 0.35) {
-    var t: float64 = expm1(x);
-    return 0.5 * (t + t / (t + 1.0));
-  }
-  var e: float64 = exp(x);
-  return 0.5 * (e - 1.0 / e);
+  var a: float64 = fabs(x);
+  if (a < 3.725290298461914e-09) { return x; }
+  if (a > 709.0) { return copysign(exp_half_huge(a), x); }
+  var e_lo: float64 = 0.0;
+  var e: float64 = expm1_dd(a, &e_lo);
+  var d: float64 = e + 1.0;
+  var d_lo: float64 = ((1.0 - d) + e) + e_lo;
+  if (e > 1.0) { d_lo = ((e - d) + 1.0) + e_lo; }
+  var q: float64 = dd_div(e, e_lo, d, d_lo);
+  var s: float64 = e + q;
+  var sb: float64 = s - e;
+  var s_lo: float64 = ((e - (s - sb)) + (q - sb)) + e_lo;
+  return copysign(0.5 * (s + s_lo), x);
 }
 
 export fn cosh(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
   if (is_inf(x) != 0) { return INF(); }
-  var e: float64 = exp(fabs(x));
-  return 0.5 * (e + 1.0 / e);
+  var a: float64 = fabs(x);
+  if (a > 709.0) { return exp_half_huge(a); }
+  var e_lo: float64 = 0.0;
+  var e: float64 = expm1_dd(a, &e_lo);
+  var d: float64 = e + 1.0;
+  var d_lo: float64 = ((1.0 - d) + e) + e_lo;
+  if (e > 1.0) { d_lo = ((e - d) + 1.0) + e_lo; }
+  var inv: float64 = dd_div(1.0, 0.0, d, d_lo);
+  var s: float64 = d + inv;
+  var sb: float64 = s - d;
+  var s_lo: float64 = ((d - (s - sb)) + (inv - sb)) + d_lo;
+  return 0.5 * (s + s_lo);
 }
 
 export fn tanh(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
-  if (x > 20.0) { return 1.0; }
-  if (x < -20.0) { return -1.0; }
-  var t: float64 = expm1(2.0 * x);
-  return t / (t + 2.0);
+  var a: float64 = fabs(x);
+  if (a > 22.0) { return copysign(1.0, x); }
+  if (a < 3.725290298461914e-09) { return x; }
+  var e_lo: float64 = 0.0;
+  var e: float64 = expm1_dd(2.0 * a, &e_lo);
+  var d: float64 = e + 2.0;
+  var d_lo: float64 = ((2.0 - d) + e) + e_lo;
+  if (e > 2.0) { d_lo = ((e - d) + 2.0) + e_lo; }
+  return copysign(dd_div(e, e_lo, d, d_lo), x);
 }
 
 export fn asinh(x: float64) -> float64 {
   if (is_finite(x) == 0) { return x; }
   var a: float64 = fabs(x);
+  if (a >= 268435456.0) {
+    var l_lo: float64 = 0.0;
+    var l_hi: float64 = pow_log_dd(a, &l_lo);
+    return copysign(l_hi + (6.931471805599453e-01 + (l_lo + 2.3190468138462996e-17)), x);
+  }
   var r: float64 = log1p(a + a * a / (1.0 + sqrt(a * a + 1.0)));
   return copysign(r, x);
 }
@@ -833,7 +1097,28 @@ export fn acosh(x: float64) -> float64 {
   if (is_nan(x) != 0) { return x; }
   if (x < 1.0) { return NAN(); }
   if (is_inf(x) != 0) { return x; }
-  return log(x + sqrt((x - 1.0) * (x + 1.0)));
+  if (x >= 268435456.0) {
+    var l_lo: float64 = 0.0;
+    var l_hi: float64 = pow_log_dd(x, &l_lo);
+    return l_hi + (6.931471805599453e-01 + (l_lo + 2.3190468138462996e-17));
+  }
+  var t: float64 = x - 1.0;
+  if (t == 0.0) { return 0.0; }
+  var t2: float64 = t + 2.0;
+  var t2_lo: float64 = (2.0 - t2) + t;
+  if (t > 2.0) { t2_lo = (t - t2) + 2.0; }
+  var q_lo: float64 = 0.0;
+  var q: float64 = dd_mul(t, 0.0, t2, t2_lo, &q_lo);
+  var s: float64 = sqrt(q);
+  var pe: float64 = 0.0;
+  var p: float64 = dd_two_prod(s, s, &pe);
+  var s_lo: float64 = (((q - p) - pe) + q_lo) / (2.0 * s);
+  var y: float64 = t + s;
+  var yb: float64 = y - t;
+  var y_lo: float64 = ((t - (y - yb)) + (s - yb)) + s_lo;
+  var lo: float64 = 0.0;
+  var hi: float64 = log1p_dd(y, y_lo, &lo);
+  return hi + lo;
 }
 
 export fn atanh(x: float64) -> float64 {
@@ -841,8 +1126,15 @@ export fn atanh(x: float64) -> float64 {
   var a: float64 = fabs(x);
   if (a > 1.0) { return NAN(); }
   if (a == 1.0) { return copysign(INF(), x); }
-  var r: float64 = 0.5 * log1p(2.0 * a / (1.0 - a));
-  return copysign(r, x);
+  if (a < 3.725290298461914e-09) { return x; }
+  var p_lo: float64 = 0.0;
+  var p: float64 = log1p_dd(a, 0.0, &p_lo);
+  var m_lo: float64 = 0.0;
+  var m: float64 = log1p_dd(-a, 0.0, &m_lo);
+  var d: float64 = p - m;
+  var db: float64 = d - p;
+  var d_lo: float64 = ((p - (d - db)) + (-m - db)) + (p_lo - m_lo);
+  return copysign(0.5 * (d + d_lo), x);
 }
 
 export fn degrees(radians_in: float64) -> float64 {

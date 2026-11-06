@@ -1,0 +1,11 @@
+import "std/io";
+import "std/math";
+fn main() -> int32 {
+  println("{f64_bits(sin(1.0e22))} {f64_bits(cos(1.0e300))} {f64_bits(tan(5.319372648326541416e+255))}");
+  println("{f64_bits(sin(3.0e9))} {f64_bits(sin(1.0e15))} {f64_bits(sinh(710.0))} {f64_bits(cosh(-710.4))}");
+  println("{f64_bits(asinh(1.0e300))} {f64_bits(expm1(0.3922411041444208))} {f64_bits(log1p(-0.20274859658473526))}");
+  println("{f64_bits(atanh(-0.09696595243378336))} {f64_bits(acosh(1.0938908579365054))} {f64_bits(asin(0.7373052215209552))} {f64_bits(acos(0.6014479692443746))}");
+  println("{f64_bits(atan2(-0.0, -1.0))} {f64_bits(atan2(INF(), -INF()))} {f64_bits(atan2(1.0, -INF()))} {f64_bits(atan2(0.0, -0.0))} {f64_bits(atan2(0.5021208520941591, -0.0001335375780735004))}");
+  println("{signbit(expm1(-0.0))} {signbit(log1p(-0.0))} {signbit(sin(-0.0))} {signbit(tan(-0.0))}");
+  return 0;
+}
