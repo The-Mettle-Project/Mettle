@@ -465,6 +465,24 @@ int ir_fused_loop_claims_symbols(const IRFunction *function,
   return 1;
 }
 
+static int ir_install_claimed_loop(IRFunction *function, size_t header_index,
+                                   size_t jump_index, IRInstruction *fused,
+                                   int *changed) {
+  if (!ir_fused_loop_claims_body(function, header_index, jump_index, fused)) {
+    ir_instruction_destroy_storage(fused);
+    return 1;
+  }
+  ir_instruction_destroy_storage(&function->instructions[header_index]);
+  function->instructions[header_index] = *fused;
+  for (size_t i = header_index + 1; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
 static int ir_sum_accumulator_is_int64(const IRFunction *function,
                                        const char *sym) {
   const char *t = ir_function_local_declared_type(function, sym);
@@ -687,20 +705,8 @@ static int ir_try_vectorize_sum_i32_at(IRFunction *function, size_t header_index
     return 0;
   }
 
-  if (!ir_fused_loop_claims_body(function, header_index, jump_index, &fused)) {
-    ir_instruction_destroy_storage(&fused);
-    return 1;
-  }
-  ir_instruction_destroy_storage(header);
-  *header = fused;
-  for (size_t i = header_index + 1; i <= jump_index; i++) {
-    ir_instruction_make_nop(&function->instructions[i]);
-  }
-
-  if (changed) {
-    *changed = 1;
-  }
-  return 1;
+  return ir_install_claimed_loop(function, header_index, jump_index, &fused,
+                                 changed);
 }
 
 int ir_simd_sum_i32_pass(IRFunction *function, int *changed) {
@@ -969,20 +975,8 @@ static int ir_try_vectorize_sum_u8_at(IRFunction *function, size_t header_index,
     return 0;
   }
 
-  if (!ir_fused_loop_claims_body(function, header_index, jump_index, &fused)) {
-    ir_instruction_destroy_storage(&fused);
-    return 1;
-  }
-  ir_instruction_destroy_storage(header);
-  *header = fused;
-  for (size_t i = header_index + 1; i <= jump_index; i++) {
-    ir_instruction_make_nop(&function->instructions[i]);
-  }
-
-  if (changed) {
-    *changed = 1;
-  }
-  return 1;
+  return ir_install_claimed_loop(function, header_index, jump_index, &fused,
+                                 changed);
 }
 
 int ir_simd_sum_u8_pass(IRFunction *function, int *changed) {
@@ -1224,19 +1218,8 @@ static int ir_try_vectorize_byte_map_at(IRFunction *function,
     fused.arguments[2 * s + 1] = ir_operand_int(op_consts[s]);
   }
 
-  if (!ir_fused_loop_claims_body(function, header_index, jump_index, &fused)) {
-    ir_instruction_destroy_storage(&fused);
-    return 1;
-  }
-  ir_instruction_destroy_storage(header);
-  *header = fused;
-  for (size_t i = header_index + 1; i <= jump_index; i++) {
-    ir_instruction_make_nop(&function->instructions[i]);
-  }
-  if (changed) {
-    *changed = 1;
-  }
-  return 1;
+  return ir_install_claimed_loop(function, header_index, jump_index, &fused,
+                                 changed);
 }
 
 int ir_simd_byte_map_pass(IRFunction *function, int *changed) {
@@ -1451,19 +1434,8 @@ static int ir_try_vectorize_lcg_at(IRFunction *function, size_t header_index,
   fused.arguments[1] = ir_operand_int(C);
   fused.arguments[2] = ir_operand_int(MASK);
 
-  if (!ir_fused_loop_claims_body(function, header_index, jump_index, &fused)) {
-    ir_instruction_destroy_storage(&fused);
-    return 1;
-  }
-  ir_instruction_destroy_storage(header);
-  *header = fused;
-  for (size_t i = header_index + 1; i <= jump_index; i++) {
-    ir_instruction_make_nop(&function->instructions[i]);
-  }
-  if (changed) {
-    *changed = 1;
-  }
-  return 1;
+  return ir_install_claimed_loop(function, header_index, jump_index, &fused,
+                                 changed);
 }
 
 int ir_simd_lcg_pass(IRFunction *function, int *changed) {

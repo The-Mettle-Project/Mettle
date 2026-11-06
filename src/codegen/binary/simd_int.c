@@ -1142,7 +1142,7 @@ int code_generator_binary_emit_simd_reverse_copy_i32(
     }
   }
 
-  if (!wcs_patch_here(b, j_scalar) || !wcs_patch_here(b, j_short) ||
+  if (!wcs_patch_both_here(b, j_scalar, j_short) ||
       !binary_emit_mov_reg_mem32(b, BINARY_GP_R9, BINARY_GP_RCX, 0) ||
       !binary_emit_mov_mem_reg32(b, BINARY_GP_RDX, 0, BINARY_GP_R9) ||
       !binary_emit_movsxd_reg_reg32(b, BINARY_GP_R9, BINARY_GP_R9) ||
@@ -1744,7 +1744,7 @@ int code_generator_binary_emit_prefix_sum_i32(
         !wcs_avx_vzeroupper(b)) {
       return 0;
     }
-    if (!wcs_patch_here(b, j_novec) || !wcs_patch_here(b, j_too_close)) {
+    if (!wcs_patch_both_here(b, j_novec, j_too_close)) {
       return 0;
     }
   }

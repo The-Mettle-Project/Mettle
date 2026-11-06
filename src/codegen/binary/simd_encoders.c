@@ -192,6 +192,10 @@ int wcs_patch_here(BinaryCodeBuffer *b, size_t disp_off) {
   return 1;
 }
 
+int wcs_patch_both_here(BinaryCodeBuffer *b, size_t first, size_t second) {
+  return wcs_patch_here(b, first) && wcs_patch_here(b, second);
+}
+
 int wcs_patch_to(BinaryCodeBuffer *b, size_t disp_off,
                         size_t target) {
   long long delta = (long long)target - (long long)(disp_off + 4);

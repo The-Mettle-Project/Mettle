@@ -711,6 +711,7 @@ int wcs_or_reg_reg(BinaryCodeBuffer *b, int dst, int src);
 int wcs_paddd(BinaryCodeBuffer *b, int dst, int src);
 int wcs_paddq(BinaryCodeBuffer *b, int dst, int src);
 int wcs_patch_here(BinaryCodeBuffer *b, size_t disp_off);
+int wcs_patch_both_here(BinaryCodeBuffer *b, size_t first, size_t second);
 int wcs_patch_to(BinaryCodeBuffer *b, size_t disp_off, size_t target);
 int wcs_pmaxsd(BinaryCodeBuffer *b, int dst, int src);
 int wcs_pminsd(BinaryCodeBuffer *b, int dst, int src);

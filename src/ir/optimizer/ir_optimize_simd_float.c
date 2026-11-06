@@ -2663,6 +2663,31 @@ static int ir_minmax_acc_width(const IRFunction *function, const char *acc,
   return 0;
 }
 
+static int ir_minmax_reads_an_accumulator(const VLoopDag *d,
+                                          const IRMinMaxDiamond *diamonds,
+                                          int n_diamonds) {
+  for (int s = 0; s < d->n_scalars; s++) {
+    for (int j = 0; j < n_diamonds; j++) {
+      if (d->scalars[s] && strcmp(d->scalars[s], diamonds[j].acc) == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int ir_minmax_claims_loop(const IRFunction *function,
+                                 size_t header_index, size_t jump_index,
+                                 IROpcode op, const IRMinMaxDiamond *diamonds,
+                                 int n_diamonds) {
+  const char *claimed[IR_MINMAX_MAX_ACCUMULATORS];
+  for (int k = 0; k < n_diamonds; k++) {
+    claimed[k] = diamonds[k].acc;
+  }
+  return ir_fused_loop_claims_symbols(function, header_index, jump_index, op,
+                                      claimed, (size_t)n_diamonds);
+}
+
 static int ir_try_vectorize_minmax_at(IRFunction *function, size_t header_index,
                                       int *changed) {
   const char *iv_symbol = NULL;
@@ -2790,12 +2815,8 @@ static int ir_try_vectorize_minmax_at(IRFunction *function, size_t header_index,
         goto refuse;
       }
     }
-    for (int s = 0; s < d.n_scalars; s++) {
-      for (int j = 0; j < n_diamonds; j++) {
-        if (d.scalars[s] && strcmp(d.scalars[s], diamonds[j].acc) == 0) {
-          goto refuse;
-        }
-      }
+    if (ir_minmax_reads_an_accumulator(&d, diamonds, n_diamonds)) {
+      goto refuse;
     }
     depth = vloop_eval_depth(&d, root);
     if (depth > VLOOP_REG_BUDGET - 1 || d.n_arrays > VLOOP_MAX_ARRAYS) {
@@ -2813,16 +2834,9 @@ static int ir_try_vectorize_minmax_at(IRFunction *function, size_t header_index,
     }
   }
 
-  {
-    const char *claimed[IR_MINMAX_MAX_ACCUMULATORS];
-    for (int k = 0; k < n_diamonds; k++) {
-      claimed[k] = diamonds[k].acc;
-    }
-    if (!ir_fused_loop_claims_symbols(function, header_index, jump_index,
-                                      fused[0].op, claimed,
-                                      (size_t)n_diamonds)) {
-      goto refuse;
-    }
+  if (!ir_minmax_claims_loop(function, header_index, jump_index, fused[0].op,
+                             diamonds, n_diamonds)) {
+    goto refuse;
   }
   for (int k = 0; k < n_diamonds; k++) {
     ir_instruction_destroy_storage(&function->instructions[header_index + k]);
