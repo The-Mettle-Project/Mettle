@@ -3,7 +3,7 @@
     "version": "0.18.0",
     "date": "2026-11-05",
     "previous": "0.17.0",
-    "commits": 617,
+    "commits": 655,
     "notes": "0.18.0.md",
     "claim": "Build rules, layouts, optimizer passes and the register allocator are now Mettle code you write.",
     "chart": {
