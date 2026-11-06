@@ -1,0 +1,6 @@
+import "std/io";
+import "std/math";
+fn main() -> int32 {
+  println("{round_i64(0.49999999999999994)} {round_i64(-0.49999999999999994)} {round_i64(4503599627370497.0)} {round_i32(2.5)} {round_i32(-2.5)} {round_i64(-4503599627370497.0)}");
+  return 0;
+}

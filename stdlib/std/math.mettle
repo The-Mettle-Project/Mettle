@@ -222,13 +222,11 @@ export fn fract(x: float64) -> float64 {
 }
 
 @inline export fn round_i64(x: float64) -> int64 {
-  if (x >= 0.0) { return (int64)(x + 0.5); }
-  return (int64)(x - 0.5);
+  return (int64)round(x);
 }
 
 @inline export fn round_i32(x: float64) -> int32 {
-  if (x >= 0.0) { return (int32)(x + 0.5); }
-  return (int32)(x - 0.5);
+  return (int32)round(x);
 }
 
 export fn fmod(x: float64, y: float64) -> float64 {
@@ -375,9 +373,12 @@ export fn exp(x: float64) -> float64 {
   if (x > 709.782712893384) { return INF(); }
   if (x < -745.1332191019411) { return 0.0; }
 
-  var k: float64 = round(x * LOG2E());
-  var r: float64 = (x - k * LN2_HI()) - k * LN2_LO();
-  return ldexp(exp_kernel(r), (int32)k);
+  var n: int32 = 0;
+  var em_lo: float64 = 0.0;
+  var em: float64 = exp_reduced(x, &n, &em_lo);
+  var one: float64 = 1.0 + em;
+  var one_lo: float64 = (em - (one - 1.0)) + em_lo;
+  return ldexp(one + one_lo, n);
 }
 
 export fn exp2(x: float64) -> float64 {
