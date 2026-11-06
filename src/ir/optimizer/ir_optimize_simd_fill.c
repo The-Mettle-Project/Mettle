@@ -1,6 +1,8 @@
 #include "ir_optimize_internal.h"
 #include "ir_loop_shape.h"
 
+#define FILL_NO_MATCH (-1)
+
 static int ir_simd_element_size_ok(long long size) {
   return size == 1 || size == 2 || size == 4 || size == 8;
 }
@@ -163,6 +165,24 @@ static int ir_fill_install(IRFunction *function, size_t header_index,
     }
   }
 
+  const char *counter = final_assign_to;
+  for (size_t k = header_index + 1; !counter && k <= jump_index; k++) {
+    const IRInstruction *in = &function->instructions[k];
+    if (in->op == IR_OP_NOP || in->op == IR_OP_DECLARE_LOCAL) {
+      continue;
+    }
+    if (in->op == IR_OP_BINARY && ir_operand_is_symbol(&in->lhs)) {
+      counter = in->lhs.name;
+    }
+    break;
+  }
+  if (!ir_fused_loop_claims_body_with(function, header_index, jump_index,
+                                      &fused, counter)) {
+    ir_instruction_destroy_storage(&final_assign);
+    ir_instruction_destroy_storage(&producer_clone);
+    ir_instruction_destroy_storage(&fused);
+    return FILL_NO_MATCH;
+  }
   ir_instruction_destroy_storage(&function->instructions[header_index]);
   memset(&function->instructions[header_index], 0,
          sizeof(function->instructions[header_index]));
@@ -363,8 +383,6 @@ static int ir_fill_frame(IRFunction *function, size_t header_index,
   *matched = 1;
   return 1;
 }
-
-#define FILL_NO_MATCH (-1)
 
 static int ir_fill_try_pointer_walk(IRFunction *function, size_t header_index,
                                     size_t branch_index, size_t jump_index,
@@ -796,7 +814,7 @@ static int ir_fill_try_indexed(IRFunction *function, size_t header_index,
   ok = ir_fill_install(function, header_index, jump_index, 0, size,
                        &shape.addr->lhs, count_op, &value, start_op, offset_op,
                        offset_producer, NULL, NULL, changed);
-  if (ok) {
+  if (ok == 1) {
     ir_fill_retag_fused(function, header_index, offset_producer, iv_name,
                         index_width);
   }
@@ -910,7 +928,7 @@ static int ir_fill_try_byte_walk(IRFunction *function, size_t header_index,
   int ok = ir_fill_install(function, header_index, jump_index, 2,
                            size, &addr->lhs, &compare->rhs, &value, &start,
                            NULL, NULL, NULL, NULL, changed);
-  if (ok && iv_name) {
+  if (ok == 1 && iv_name) {
     IRInstruction *fused = &function->instructions[header_index];
     ir_operand_destroy(&fused->dest);
     fused->dest = ir_operand_symbol(iv_name);

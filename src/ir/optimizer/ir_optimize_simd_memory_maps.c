@@ -220,6 +220,10 @@ int ir_fuse_while_loop_to_insn(IRFunction *function, size_t header_index,
     ir_instruction_destroy_storage(fused);
     return 0;
   }
+  if (!ir_fused_loop_claims_body(function, header_index, jump_index, fused)) {
+    ir_instruction_destroy_storage(fused);
+    return 1;
+  }
   ir_instruction_destroy_storage(&function->instructions[header_index]);
   function->instructions[header_index] = *fused;
   memset(fused, 0, sizeof(*fused));

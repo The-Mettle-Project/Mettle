@@ -362,6 +362,10 @@ static int ir_float_body_is_pure_reduction(IRFunction *function, size_t lo,
 static void ir_install_fused_reduction(IRFunction *function,
                                        size_t header_index, size_t jump_index,
                                        IRInstruction *fused, int *changed) {
+  if (!ir_fused_loop_claims_body(function, header_index, jump_index, fused)) {
+    ir_instruction_destroy_storage(fused);
+    return;
+  }
   ir_instruction_destroy_storage(&function->instructions[header_index]);
   function->instructions[header_index] = *fused;
   for (size_t i = header_index + 1; i <= jump_index; i++) {
@@ -2809,6 +2813,17 @@ static int ir_try_vectorize_minmax_at(IRFunction *function, size_t header_index,
     }
   }
 
+  {
+    const char *claimed[IR_MINMAX_MAX_ACCUMULATORS];
+    for (int k = 0; k < n_diamonds; k++) {
+      claimed[k] = diamonds[k].acc;
+    }
+    if (!ir_fused_loop_claims_symbols(function, header_index, jump_index,
+                                      fused[0].op, claimed,
+                                      (size_t)n_diamonds)) {
+      goto refuse;
+    }
+  }
   for (int k = 0; k < n_diamonds; k++) {
     ir_instruction_destroy_storage(&function->instructions[header_index + k]);
     function->instructions[header_index + k] = fused[k];

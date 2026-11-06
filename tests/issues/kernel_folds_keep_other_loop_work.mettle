@@ -1,0 +1,95 @@
+import "std/io";
+import "std/mem";
+
+var seen: int64 = 0;
+
+@noinline fn dot_counted(a: int32*, b: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  for i in 0..n {
+    s = s + (int64)a[i] * (int64)b[i];
+    seen = seen + 1;
+  }
+  return s;
+}
+
+@noinline fn sum_with_side(a: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var side: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    s = s + (int64)a[i];
+    side = side + i;
+    i = i + 1;
+  }
+  return side * 1000 + s;
+}
+
+@noinline fn min_marked(a: int32*, n: int64) -> int64 {
+  var s: int32 = a[0];
+  for i in 0..n {
+    if (a[i] < s) { s = a[i]; }
+    if (i == 3) { seen = seen + 100; }
+  }
+  return (int64)s;
+}
+
+@noinline fn scale_counted(a: int32*, b: int32*, n: int64) {
+  for i in 0..n {
+    b[i] = a[i] * 3;
+    seen = seen + 1;
+  }
+}
+
+@noinline fn affine_marked(a: float64*, b: float64*, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    b[i] = a[i] * 2.0 + 1.0;
+    if (i == 3) { seen = seen + 100; }
+    i = i + 1;
+  }
+}
+
+@noinline fn prefix_every_other(a: int32*, b: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    s = s + (int64)a[i];
+    b[i] = (int32)s;
+    i = i + 2;
+  }
+  return s;
+}
+
+@noinline fn dot_f64_side(a: float64*, b: float64*, n: int64) -> int64 {
+  var s: float64 = 0.0;
+  var side: int64 = 0;
+  for i in 0..n {
+    s = s + a[i] * b[i];
+    side = side + i;
+  }
+  return side * 1000 + (int64)s;
+}
+
+fn main() -> int32 {
+  var a: int32* = (int32*)malloc(4 * 80);
+  var b: int32* = (int32*)malloc(4 * 80);
+  var f: float64* = (float64*)malloc(8 * 80);
+  var g: float64* = (float64*)malloc(8 * 80);
+  for i in 0..80 {
+    a[i] = (int32)((i * 7) % 13) - 3;
+    b[i] = 1;
+    f[i] = (float64)((i * 5) % 11);
+    g[i] = 2.0;
+  }
+  var h: int64 = 0;
+  h = h * 31 + dot_counted(a, a, 33);
+  h = h * 31 + sum_with_side(a, 33);
+  h = h * 31 + min_marked(a, 33);
+  scale_counted(a, b, 33);
+  affine_marked(f, g, 33);
+  h = h * 31 + prefix_every_other(a, b + 40, 33);
+  h = h * 31 + dot_f64_side(f, f, 33);
+  for i in 0..80 { h = h * 7 + (int64)b[i] + (int64)g[i]; }
+  println("{h} {seen}");
+  return 0;
+}

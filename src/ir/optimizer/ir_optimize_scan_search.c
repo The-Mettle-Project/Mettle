@@ -651,6 +651,10 @@ static int ir_body_is_prefix_sum_loop(const IRFunction *function,
       saw_sum_add = 1;
       continue;
     }
+    if (ir_operand_is_symbol_named(&ins->dest, iv) &&
+        !ir_try_parse_direct_unit_increment(ins, iv)) {
+      return 0;
+    }
     if (ir_operand_is_symbol(&ins->dest) &&
         strcmp(ins->dest.name, iv) != 0 &&
         !ir_prefix_sum_symbol_is_body_local(function, header_index,
@@ -1202,6 +1206,11 @@ static int ir_fuse_counted_loop(IRFunction *function, size_t header_index,
   }
   fused->argument_count = 1;
   fused->arguments[0] = loop->len;
+  if (!ir_fused_loop_claims_body(function, header_index, loop->jump_index,
+                                 fused)) {
+    ir_instruction_destroy_storage(fused);
+    return 1;
+  }
 
   ir_instruction_destroy_storage(loop->header);
   *loop->header = *fused;

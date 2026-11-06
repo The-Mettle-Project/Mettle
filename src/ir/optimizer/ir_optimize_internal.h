@@ -600,6 +600,16 @@ int ir_label_value_map_merge_incoming(IRLabelValueMap *map,
                                              const char *label,
                                              const IRTempValueMap *incoming,
                                              int *changed);
+int ir_fused_loop_claims_body(const IRFunction *function, size_t header_index,
+                              size_t jump_index, const IRInstruction *fused);
+int ir_fused_loop_claims_body_with(const IRFunction *function,
+                                   size_t header_index, size_t jump_index,
+                                   const IRInstruction *fused,
+                                   const char *also);
+int ir_fused_loop_claims_symbols(const IRFunction *function,
+                                 size_t header_index, size_t jump_index,
+                                 IROpcode op, const char *const *names,
+                                 size_t name_count);
 int ir_loop_body_is_unclaimable(const IRFunction *function, size_t start,
                                        size_t end);
 
