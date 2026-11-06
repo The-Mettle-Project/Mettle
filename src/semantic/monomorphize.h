@@ -8,6 +8,10 @@
 
 int monomorphize_program(ASTNode *program, ErrorReporter *reporter);
 
+void mono_pointer_receiver_message(char *out, size_t size, const char *type,
+                                   const char *method, const char *function,
+                                   const ASTNode *receiver);
+
 int monomorphize_generated(ASTNode *fragment, ASTNode *whole,
                            ErrorReporter *reporter, int *new_generics);
 

@@ -1,0 +1,13 @@
+import "std/io";
+
+struct Counter { n: int32; }
+fn Counter_bump__ptr(c: Counter*, by: int32) { c->n += by; }
+
+fn main() -> int32 {
+  var c: Counter;
+  c.n = 0;
+  c.bump(2);
+  (&c).bump(3);
+  println("{c.n}");
+  return 0;
+}

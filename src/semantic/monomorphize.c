@@ -2400,6 +2400,48 @@ static int mono_prepend_receiver(ASTNode *node, CallExpression *call,
   return 1;
 }
 
+void mono_pointer_receiver_message(char *out, size_t size, const char *type,
+                                   const char *method, const char *function,
+                                   const ASTNode *receiver) {
+  const char *name = NULL;
+  if (receiver && receiver->type == AST_IDENTIFIER && receiver->data) {
+    name = ((const Identifier *)receiver->data)->name;
+  }
+  if (name) {
+    snprintf(out, size,
+             "Method '%s' on '%s' takes a pointer receiver ('%s'); call it "
+             "through a pointer with '->', as '(&%s)->%s(...)'",
+             method, type, function, name, method);
+  } else {
+    snprintf(out, size,
+             "Method '%s' on '%s' takes a pointer receiver ('%s'); call it "
+             "through a pointer with '->'",
+             method, type, function);
+  }
+}
+
+static int mono_refuse_value_receiver(MonoContext *ctx, ASTNode *node,
+                                      CallExpression *call, const char *type,
+                                      const char *name) {
+  char pointer_name[540];
+  char message[1024];
+  int ambiguous = 0;
+  GenericDef *def = NULL;
+
+  snprintf(pointer_name, sizeof(pointer_name), "%s%s", name,
+           MONO_PTR_RECEIVER_SUFFIX);
+  def = find_generic_def(ctx, pointer_name);
+  if (!def || def->is_struct ||
+      mono_find_impl_for_method(ctx, type, call->function_name, &ambiguous) ||
+      ambiguous) {
+    return 1;
+  }
+  mono_pointer_receiver_message(message, sizeof(message), type,
+                                call->function_name, pointer_name, call->object);
+  mono_report_error(ctx, node->location, message);
+  return 0;
+}
+
 static int mono_rewrite_generic_method_call(MonoContext *ctx, ASTNode *node,
                                             MonoVarEnv *env) {
   CallExpression *call = (CallExpression *)node->data;
@@ -2446,6 +2488,9 @@ static int mono_rewrite_generic_method_call(MonoContext *ctx, ASTNode *node,
     snprintf(name, sizeof(name), "%.*s_%s", (int)(open - type), type,
              call->function_name);
     def = find_generic_def(ctx, name);
+    if (!def && !mono_refuse_value_receiver(ctx, node, call, type, name)) {
+      return 0;
+    }
   }
   if (!def || def->is_struct) {
     return 1;

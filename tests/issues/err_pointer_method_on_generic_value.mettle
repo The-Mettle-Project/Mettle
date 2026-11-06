@@ -1,0 +1,12 @@
+import "std/io";
+
+struct Stack<T> { items: T[16]; count: int32; }
+fn Stack_push__ptr<T>(s: Stack<T>*, v: T) { s->items[s->count] = v; s->count += 1; }
+
+fn main() -> int32 {
+  var s: Stack<int32>;
+  s.count = 0;
+  s.push(92);
+  println("{s.count}");
+  return 0;
+}

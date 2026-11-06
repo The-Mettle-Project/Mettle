@@ -338,6 +338,31 @@ static ASTNode *type_checker_pointer_receiver(TypeChecker *checker,
   return unary->operand;
 }
 
+static void type_checker_report_undefined_method(TypeChecker *checker,
+                                                 ASTNode *expression,
+                                                 CallExpression *call,
+                                                 const char *struct_name,
+                                                 const char *mangled_name) {
+  char pointer_name[512];
+  char message[1024];
+
+  snprintf(pointer_name, sizeof(pointer_name), "%s_%s%s", struct_name,
+           call->function_name, MONO_PTR_RECEIVER_SUFFIX);
+  if (strcmp(pointer_name, mangled_name) != 0 &&
+      symbol_table_lookup(checker->symbol_table, pointer_name)) {
+    mono_pointer_receiver_message(message, sizeof(message), struct_name,
+                                  call->function_name, pointer_name,
+                                  call->object);
+    type_checker_set_error_at_location(checker, expression->location, "%s",
+                                       message);
+    return;
+  }
+  type_checker_set_error_at_location(
+      checker, expression->location,
+      "Undefined method '%s.%s' (expected function '%s')", struct_name,
+      call->function_name, mangled_name);
+}
+
 Type *type_checker_method_receiver_struct_type(Type *receiver_type) {
   if (!receiver_type) {
     return NULL;
@@ -467,10 +492,8 @@ int type_checker_desugar_struct_method_call(TypeChecker *checker,
       return 1;
     }
 
-    type_checker_set_error_at_location(
-        checker, expression->location,
-        "Undefined method '%s.%s' (expected function '%s')",
-        struct_type->name, call->function_name, mangled_name);
+    type_checker_report_undefined_method(checker, expression, call,
+                                         struct_type->name, mangled_name);
     free(mangled_name);
     return 0;
   }
