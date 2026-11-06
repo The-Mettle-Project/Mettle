@@ -211,11 +211,11 @@ main { padding-bottom: 72px; }
       Mettle
     </a>
     <nav class="sections" aria-label="Sections">
-      <a href="#live">Live</a>
       <a href="#compiler">Compiler</a>
       <a href="#proof">Proof</a>
       <a href="#speed">Speed</a>
       <a href="#language">Language</a>
+      <a href="#live">Live</a>
       <a href="#machines">Machines</a>
       <a href="#toolchain">Toolchain</a>
       <a href="#made">Made with</a>
@@ -239,33 +239,14 @@ main { padding-bottom: 72px; }
 
 <main>
 <div class="wrap what">
-  <p>Save a file and the running program takes the new code. The compiler that builds it runs layouts, passes and a register allocator you write.</p>
-  <p class="then">A live build runs within 0.7% of a normal one. Sixteen whole programs average {{C_O3}}&times; the run time of <code>clang -O3</code>. The parser, optimizer, assembler, linkers and runtime are one codebase with no LLVM.</p>
+  <p>Struct layouts, optimizer passes and the register allocator are Mettle functions in your own program.</p>
+  <p class="then">The compiler runs them, checks what they return, and proves the claims you write beside your code. Sixteen whole programs average {{C_O3}}&times; the run time of <code>clang -O3</code>. The parser, optimizer, assembler, linkers and runtime are one codebase with no LLVM.</p>
 </div>
-
-<section class="wrap sec" id="live">
-  <div class="head">
-    <h2>Change it while it runs</h2>
-    <p class="lead"><code>mettle live app.mettle</code> builds and starts the program, and each save becomes a patch that lands at the next <code>quiesce</code>. Function bodies, signatures and struct layouts all change. Every frame on the stack moves to the new code with its locals, and heap objects convert in place, even to and from columns.</p>
-  </div>
-  <div class="row">
-    <div class="say"><h3><a href="{{DOCS}}live.md">A crash waits for its fix</a></h3><p>A fault pauses the program until a save fixes it. Then it continues from its last <code>quiesce</code>. In this recording the fix landed in {{LIVE_FIX_MS}} ms.</p></div>
-    <pre class="snip"><span class="out">{{LIVE_LINES}}</span></pre>
-  </div>
-  <div class="more">
-    <dl class="index">
-      <div><dt><code>--live-undo</code></dt><dd>Takes a patch back, layout changes included.</dd></div>
-      <div><dt><code>--live-at-tick N</code></dt><dd>Lands a patch on the same tick in every running copy.</dd></div>
-      <div><dt><a href="{{DOCS}}live.md">What it costs</a></dt><dd>Within 0.7% of a normal build, geometric mean over Suite 3.</dd></div>
-      <div><dt>Where</dt><dd>Windows x64 and Linux x64.</dd></div>
-    </dl>
-  </div>
-</section>
 
 <section class="wrap sec" id="compiler">
   <div class="head">
     <h2>Program the compiler</h2>
-    <p class="lead">Layouts, code generators, optimizer passes, register allocators and build rules are Mettle functions in your program. The compiler runs them while it builds and checks what they hand back. <code>mettle expand</code> prints the result as plain Mettle.</p>
+    <p class="lead">Each one runs while the program builds, and the compiler checks what it hands back: a pass against the function it replaced, an allocator against which values are live together, a generator against the rule it ships with. <code>mettle expand</code> prints the result as plain Mettle.</p>
   </div>
   <div class="row">
     <div class="say"><h3><a href="{{DOCS}}metaprogramming.md">Decide where fields live</a></h3><p><code>@soa</code> gives each field its own column, and the loop stays as written. <code>@hot_cold</code>, <code>@compact</code>, <code>@tagged</code> and <code>@allocate_with</code> are library code too, and <code>@layout</code> writes your own.</p><p class="small">One million records, best of 40 passes, against the same fields in a plain struct.</p></div>
@@ -384,6 +365,25 @@ main { padding-bottom: 72px; }
       <div><dt><a href="{{DOCS}}expressions.md">Interpolated strings</a></dt><dd>Any expression fits in the braces: <code>"twice={n * 2}"</code>.</dd></div>
       <div><dt><a href="{{DOCS}}standard-library.md">Standard library</a></dt><dd>1282 functions, from system calls up through sockets, TLS streams, HTTP/2, processes, threads and collections.</dd></div>
       <div><dt><a href="{{DOCS}}standard-library.md"><code>std/math</code></a></dt><dd>Every function within one ulp of the true result. <code>sin</code>, <code>cos</code> and <code>tan</code> reduce any argument exactly.</dd></div>
+    </dl>
+  </div>
+</section>
+
+<section class="wrap sec" id="live">
+  <div class="head">
+    <h2>Change it while it runs</h2>
+    <p class="lead"><code>mettle live app.mettle</code> builds and starts the program, and each save becomes a patch that lands at the next <code>quiesce</code>. Function bodies, signatures and struct layouts all change. Every frame on the stack moves to the new code with its locals, and heap objects convert in place, even to and from columns.</p>
+  </div>
+  <div class="row">
+    <div class="say"><h3><a href="{{DOCS}}live.md">A crash waits for its fix</a></h3><p>A fault pauses the program until a save fixes it. Then it continues from its last <code>quiesce</code>. In this recording the fix landed in {{LIVE_FIX_MS}} ms.</p></div>
+    <pre class="snip"><span class="out">{{LIVE_LINES}}</span></pre>
+  </div>
+  <div class="more">
+    <dl class="index">
+      <div><dt><code>--live-undo</code></dt><dd>Takes a patch back, layout changes included.</dd></div>
+      <div><dt><code>--live-at-tick N</code></dt><dd>Lands a patch on the same tick in every running copy.</dd></div>
+      <div><dt><a href="{{DOCS}}live.md">What it costs</a></dt><dd>Within 0.7% of a normal build, geometric mean over Suite 3.</dd></div>
+      <div><dt>Where</dt><dd>Windows x64 and Linux x64.</dd></div>
     </dl>
   </div>
 </section>
