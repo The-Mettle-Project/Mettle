@@ -1,0 +1,18 @@
+import "std/io";
+
+struct P { x: int64; y: int64; }
+
+fn first<T>(xs: T[..]) -> T { return xs[0]; }
+fn count<T>(label: int64, xs: T[..]) -> int64 { return label * 100 + xs.length; }
+
+fn main() -> int32 {
+  var a: int64 = 7;
+  var b: int64 = 9;
+  var f: float64 = 2.5;
+  var p: P;
+  p.x = 3;
+  p.y = 4;
+  var q: P = first(p, p);
+  println("{first(a, b)} {first(f, f)} {first(9, 8)} {count(3, a, b, a)} {q.x + q.y}");
+  return 0;
+}

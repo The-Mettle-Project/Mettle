@@ -1,0 +1,22 @@
+import "std/io";
+trait Area { fn area(self: Self) -> int64; }
+struct Sq { s: int64; }
+struct Holder { inner: Sq; n: int64; }
+impl Area for Sq { fn area(self: Self) -> int64 { return self.s * self.s; } }
+impl Area for int64 { fn area(self: Self) -> int64 { return self * 3; } }
+fn total<T: Area>(xs: T[], n: int64) -> int64 {
+  var t: int64 = 0;
+  for i in 0..n { t = t + xs[i].area(); }
+  return t;
+}
+fn via_ptr<T: Area>(p: T*) -> int64 { return (*p).area(); }
+fn main() -> int32 {
+  var sq: Sq[3];
+  for i in 0..3 { sq[i].s = (int64)i + 1; }
+  var h: Holder;
+  h.inner.s = 6;
+  var ns: int64[2];
+  ns[0] = 4; ns[1] = 5;
+  println("{total(sq, 3)} {total(ns, 2)} {via_ptr(&sq[1])} {h.inner.area()} {sq[2].area()}");
+  return 0;
+}

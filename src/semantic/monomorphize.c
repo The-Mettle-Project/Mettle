@@ -2222,6 +2222,42 @@ static TraitImpl *mono_find_impl_for_method(MonoContext *ctx,
   return found;
 }
 
+static const char *adapt_element_type(const char *type, int deref);
+static const char *adapt_field_type(Program *prog, const char *struct_type,
+                                    const char *field);
+
+static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
+                                           MonoVarEnv *env, int depth);
+
+static const char *mono_receiver_part_type(MonoContext *ctx, ASTNode *node,
+                                           MonoVarEnv *env, int depth) {
+  if (node->type == AST_INDEX_EXPRESSION) {
+    ArrayIndexExpression *index = (ArrayIndexExpression *)node->data;
+    return index ? adapt_element_type(mono_receiver_type_name(
+                                          ctx, index->array, env, depth + 1),
+                                      0)
+                 : NULL;
+  }
+  if (node->type == AST_MEMBER_ACCESS) {
+    MemberAccess *member = (MemberAccess *)node->data;
+    return member && member->member
+               ? adapt_field_type(ctx->module,
+                                  mono_receiver_type_name(ctx, member->object,
+                                                          env, depth + 1),
+                                  member->member)
+               : NULL;
+  }
+  if (node->type == AST_UNARY_EXPRESSION) {
+    UnaryExpression *unary = (UnaryExpression *)node->data;
+    return unary && unary->operator && strcmp(unary->operator, "*") == 0
+               ? adapt_element_type(mono_receiver_type_name(
+                                        ctx, unary->operand, env, depth + 1),
+                                    1)
+               : NULL;
+  }
+  return NULL;
+}
+
 static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
                                            MonoVarEnv *env, int depth) {
   CallExpression *call = NULL;
@@ -2240,7 +2276,7 @@ static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
                                           : NULL;
   }
   if (node->type != AST_FUNCTION_CALL) {
-    return NULL;
+    return mono_receiver_part_type(ctx, node, env, depth);
   }
   call = (CallExpression *)node->data;
   if (!call || call->object || !call->written_name || !call->function_name ||
@@ -3351,6 +3387,26 @@ static int mono_literal_fits_type(const ASTNode *argument, const char *type) {
          (strncmp(type, "int", 3) == 0 || strncmp(type, "uint", 4) == 0);
 }
 
+static const char *mono_parameter_for_argument(const FunctionDeclaration *fd,
+                                               size_t index, int *gathered) {
+  const char *last = NULL;
+  size_t length = 0;
+  *gathered = 0;
+  if (fd->parameter_count == 0) {
+    return NULL;
+  }
+  last = fd->parameter_types[fd->parameter_count - 1];
+  length = last ? strlen(last) : 0;
+  if (index + 1 < fd->parameter_count) {
+    return fd->parameter_types[index];
+  }
+  if (length > 4 && strcmp(last + length - 4, "[..]") == 0) {
+    *gathered = 1;
+    return string_intern_n(last, length - 4);
+  }
+  return index + 1 == fd->parameter_count ? last : NULL;
+}
+
 static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
                                      MonoVarEnv *env) {
   CallExpression *call = (CallExpression *)node->data;
@@ -3381,10 +3437,16 @@ static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
   }
 
   for (int pass = 0; pass < 2; pass++) {
-    for (i = 0; i < call->argument_count && i < fd->parameter_count; i++) {
-      long literal_param = mono_literal_param_index(
-          def, fd->parameter_types[i], call->arguments[i]);
+    for (i = 0; i < call->argument_count; i++) {
+      int gathered = 0;
+      const char *parameter_type = mono_parameter_for_argument(fd, i, &gathered);
+      long literal_param = -1;
       char *actual = NULL;
+      if (!parameter_type) {
+        break;
+      }
+      literal_param =
+          mono_literal_param_index(def, parameter_type, call->arguments[i]);
       if ((literal_param >= 0) != (pass == 1)) {
         continue;
       }
@@ -3393,13 +3455,17 @@ static int mono_infer_call_type_args(MonoContext *ctx, ASTNode *node,
       if (!actual) {
         continue;
       }
+      if (gathered && actual[0] && actual[strlen(actual) - 1] == ']') {
+        free(actual);
+        continue;
+      }
       if (literal_param >= 0 && bindings[literal_param].bound &&
           mono_literal_fits_type(call->arguments[i],
                                  bindings[literal_param].bound)) {
         free(actual);
         continue;
       }
-      if (!mono_match_type_text(fd->parameter_types[i], actual,
+      if (!mono_match_type_text(parameter_type, actual,
                                 def->type_params, def->type_param_count,
                                 bindings)) {
         char message[512];
