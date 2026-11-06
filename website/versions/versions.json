@@ -1,9 +1,9 @@
 [
   {
     "version": "0.18.0",
-    "date": "2026-11-05",
+    "date": "2026-11-06",
     "previous": "0.17.0",
-    "commits": 655,
+    "commits": 663,
     "notes": "0.18.0.md",
     "claim": "Build rules, layouts, optimizer passes and the register allocator are now Mettle code you write.",
     "chart": {
