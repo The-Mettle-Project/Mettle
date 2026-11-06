@@ -1,0 +1,36 @@
+import "std/io";
+import "std/core";
+struct Box<T> { v: T; }
+fn Box_get<T>(b: Box<T>) -> T { return b.v; }
+trait Scale { fn scale(self: Self, k: int64) -> Self; }
+impl Scale for int64 { fn scale(self: Self, k: int64) -> Self { return self * k; } }
+fn first_some<T>(xs: Option<T>[], n: int64, d: T) -> T {
+  for i in 0..n {
+    match (xs[i]) {
+      case Some(v): { return v; }
+      case None: {}
+    }
+  }
+  return d;
+}
+fn sum_boxes(bs: Box<int64>[], n: int64) -> int64 {
+  var s: int64 = 0;
+  for i in 0..n { s = s + bs[i].get(); }
+  return s;
+}
+fn adder<T: Scale>(k: int64) -> Fn(T) -> T {
+  return fn(x: T) -> T { return x.scale(k); };
+}
+fn main() -> int32 {
+  var os: Option<int64>[3];
+  os[0] = None; os[1] = Some((int64)9); os[2] = Some((int64)4);
+  var bs: Box<int64>[3];
+  for i in 0..3 { bs[i].v = (int64)i * 10; }
+  var f: Fn(int64) -> int64 = adder<int64>(3);
+  var d: int64 = -1;
+  var ob: Option<Box<int64>> = Some(bs[2]);
+  var got: int64 = 0;
+  match (ob) { case Some(b): { got = b.get(); } case None: { got = -5; } }
+  println("{first_some(os, 3, d)} {sum_boxes(bs, 3)} {f(7)} {got}");
+  return 0;
+}

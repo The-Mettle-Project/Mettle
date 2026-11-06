@@ -1,0 +1,27 @@
+import "std/io";
+trait Weight { fn weight(self: Self) -> int64; }
+struct Rock { kg: int64; }
+impl Weight for Rock { fn weight(self: Self) -> int64 { return self.kg; } }
+impl Weight for int64 { fn weight(self: Self) -> int64 { return self * 2; } }
+struct Box<T> { v: T; }
+fn Box_get<T>(b: Box<T>) -> T { return b.v; }
+fn total<T: Weight>(xs: T[]) -> int64 {
+  var s: int64 = 0;
+  for x in xs { s = s + x.weight(); }
+  return s;
+}
+fn box_total(bs: Box<int64>[]) -> int64 {
+  var s: int64 = 0;
+  for b in bs { s = s + b.get(); }
+  return s;
+}
+fn main() -> int32 {
+  var rs: Rock[3];
+  for i in 0..3 { rs[i].kg = (int64)i + 1; }
+  var ns: int64[2];
+  ns[0] = 5; ns[1] = 6;
+  var bs: Box<int64>[2];
+  bs[0].v = 4; bs[1].v = 9;
+  println("{total(rs)} {total(ns)} {box_total(bs)}");
+  return 0;
+}

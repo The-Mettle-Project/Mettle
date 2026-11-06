@@ -1,0 +1,14 @@
+import "std/io";
+struct Box<T> { v: T; }
+struct Holder { inner: Box<int64>; }
+fn Box_get<T>(b: Box<T>) -> T { return b.v; }
+fn main() -> int32 {
+  var inner: Box<int64>;
+  inner.v = 7;
+  var outer: Box<Box<int64>>;
+  outer.v = inner;
+  var h: Holder;
+  h.inner = inner;
+  println("{outer.v.get()} {h.inner.get()}");
+  return 0;
+}

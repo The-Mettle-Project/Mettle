@@ -2232,6 +2232,8 @@ static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
                                            MonoVarEnv *env, int depth);
 static char *mono_substitute_written(const char *text, char **params,
                                      char **args, size_t count);
+static const char *mono_apply_type_args(const char *text, const char *instance,
+                                        char **params, size_t param_count);
 
 static const char *mono_receiver_part_type(MonoContext *ctx, ASTNode *node,
                                            MonoVarEnv *env, int depth) {
@@ -2487,11 +2489,74 @@ static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
   return 1;
 }
 
+static const char *mono_match_payload_type(MonoContext *ctx,
+                                           const char *enum_type,
+                                           const char *variant) {
+  const char *open = enum_type ? strchr(enum_type, '<') : NULL;
+  size_t length = enum_type ? strlen(enum_type) : 0;
+  if (!open || !ctx->module || !variant || enum_type[length - 1] != '>') {
+    return NULL;
+  }
+  for (size_t d = 0; d < ctx->module->declaration_count; d++) {
+    ASTNode *decl = ctx->module->declarations[d];
+    EnumDeclaration *ed = decl && decl->type == AST_ENUM_DECLARATION
+                              ? (EnumDeclaration *)decl->data
+                              : NULL;
+    if (!ed || !ed->name || ed->type_param_count == 0 ||
+        strlen(ed->name) != (size_t)(open - enum_type) ||
+        strncmp(ed->name, enum_type, (size_t)(open - enum_type)) != 0) {
+      continue;
+    }
+    for (size_t v = 0; v < ed->variant_count; v++) {
+      if (!ed->variants[v].name || strcmp(ed->variants[v].name, variant) != 0 ||
+          !ed->variants[v].payload_type) {
+        continue;
+      }
+      return mono_apply_type_args(ed->variants[v].payload_type, enum_type,
+                                  ed->type_params, ed->type_param_count);
+    }
+  }
+  return NULL;
+}
+
+static int mono_rewrite_trait_method_calls_in_node(MonoContext *ctx,
+                                                   ASTNode *node,
+                                                   MonoVarEnv *env);
+
+static int mono_rewrite_in_match(MonoContext *ctx, ASTNode *node,
+                                 MonoVarEnv *env) {
+  MatchStatement *ms = (MatchStatement *)node->data;
+  const char *matched = NULL;
+  if (!ms || !mono_rewrite_trait_method_calls_in_node(ctx, ms->expression, env)) {
+    return ms ? 0 : 1;
+  }
+  matched = mono_receiver_type_name(ctx, ms->expression, env, 0);
+  for (size_t a = 0; a < ms->arm_count; a++) {
+    size_t scope = env->count;
+    const char *payload =
+        ms->arms[a].binding_name
+            ? mono_match_payload_type(ctx, matched, ms->arms[a].variant_name)
+            : NULL;
+    if (payload && !mono_env_add(env, ms->arms[a].binding_name, (char *)payload)) {
+      return 0;
+    }
+    if (!mono_rewrite_trait_method_calls_in_node(ctx, ms->arms[a].body, env)) {
+      return 0;
+    }
+    env->count = scope;
+  }
+  return 1;
+}
+
 static int mono_rewrite_trait_method_calls_in_node(MonoContext *ctx,
                                                    ASTNode *node,
                                                    MonoVarEnv *env) {
   if (!node || !env) {
     return 1;
+  }
+
+  if (node->type == AST_MATCH_STATEMENT && ctx->generic_method_pass) {
+    return mono_rewrite_in_match(ctx, node, env);
   }
 
   if (node->type == AST_FUNCTION_CALL) {
@@ -2517,7 +2582,13 @@ static int mono_rewrite_trait_method_calls_in_node(MonoContext *ctx,
         !mono_rewrite_trait_method_calls_in_node(ctx, decl->initializer, env)) {
       return 0;
     }
-    if (decl && !mono_env_add(env, decl->name, decl->type_name)) {
+    const char *local_type = decl ? decl->type_name : NULL;
+    if (decl && !local_type) {
+      local_type = decl->capture_type
+                       ? decl->capture_type
+                       : mono_receiver_type_name(ctx, decl->initializer, env, 0);
+    }
+    if (decl && !mono_env_add(env, decl->name, (char *)local_type)) {
       mono_report_error(ctx, node->location,
                         "Failed to track local type for trait method call");
       return 0;
@@ -2527,6 +2598,15 @@ static int mono_rewrite_trait_method_calls_in_node(MonoContext *ctx,
 
   {
     size_t scope = env->count;
+    if (node->type == AST_LAMBDA_EXPRESSION && node->data) {
+      FunctionDeclaration *lambda = (FunctionDeclaration *)node->data;
+      for (size_t p = 0; p < lambda->parameter_count; p++) {
+        if (!mono_env_add(env, lambda->parameter_names[p],
+                          lambda->parameter_types[p])) {
+          return 0;
+        }
+      }
+    }
     for (size_t i = 0; i < node->child_count; i++) {
       if (!mono_rewrite_trait_method_calls_in_node(ctx, node->children[i],
                                                    env)) {
@@ -3691,12 +3771,18 @@ static int mono_infer_type_args_in_node(MonoContext *ctx, ASTNode *node,
 
   if (node->type == AST_MATCH_STATEMENT && node->data) {
     MatchStatement *match = (MatchStatement *)node->data;
+    const char *matched = NULL;
     if (!mono_infer_type_args_in_node(ctx, match->expression, env)) {
       return 0;
     }
+    matched = mono_receiver_type_name(ctx, match->expression, env, 0);
     for (i = 0; i < match->arm_count; i++) {
       size_t scope = env->count;
-      if (!mono_env_add(env, match->arms[i].binding_name, NULL) ||
+      const char *payload =
+          match->arms[i].binding_name
+              ? mono_match_payload_type(ctx, matched, match->arms[i].variant_name)
+              : NULL;
+      if (!mono_env_add(env, match->arms[i].binding_name, (char *)payload) ||
           !mono_infer_type_args_in_node(ctx, match->arms[i].body, env)) {
         return 0;
       }
@@ -5136,13 +5222,57 @@ static const char *adapt_local_type(const AdaptLocals *locals,
 
 static size_t mono_base_type_length(const char *type_str);
 
+static size_t mono_split_type_args(const char *type, char **args, size_t max) {
+  const char *open = type ? strchr(type, '<') : NULL;
+  size_t length = type ? strlen(type) : 0;
+  size_t count = 0;
+  int depth = 0;
+  const char *start = open ? open + 1 : NULL;
+  if (!open || type[length - 1] != '>') {
+    return 0;
+  }
+  for (const char *p = open + 1; p < type + length && count < max; p++) {
+    depth += *p == '<' ? 1 : (*p == '>' ? -1 : 0);
+    if ((*p == ',' && depth == 0) || depth < 0) {
+      while (*start == ' ') {
+        start++;
+      }
+      args[count++] = (char *)string_intern_n(start, (size_t)(p - start));
+      start = p + 1;
+    }
+  }
+  return count;
+}
+
+static const char *mono_apply_type_args(const char *text, const char *instance,
+                                        char **params, size_t param_count) {
+  char *args[8];
+  char *written = NULL;
+  const char *result = NULL;
+  if (!text || param_count == 0 ||
+      mono_split_type_args(instance, args, 8) != param_count) {
+    return text;
+  }
+  written = mono_substitute_written(text, params, args, param_count);
+  result = written ? string_intern(written) : text;
+  free(written);
+  return result;
+}
+
 static const char *adapt_field_type(Program *prog, const char *struct_type,
                                     const char *field) {
   size_t base_length;
+  const char *instance = NULL;
+  const char *open = NULL;
   if (!prog || !struct_type || !field) {
     return NULL;
   }
   base_length = mono_base_type_length(struct_type);
+  instance = string_intern_n(struct_type, base_length);
+  open = strchr(instance, '<');
+  if (open) {
+    base_length = (size_t)(open - instance);
+  }
   for (size_t i = 0; i < prog->declaration_count; i++) {
     ASTNode *decl = prog->declarations[i];
     StructDeclaration *sd = NULL;
@@ -5156,7 +5286,8 @@ static const char *adapt_field_type(Program *prog, const char *struct_type,
     }
     for (size_t f = 0; f < sd->field_count; f++) {
       if (sd->field_names[f] && strcmp(sd->field_names[f], field) == 0) {
-        return sd->field_types[f];
+        return mono_apply_type_args(sd->field_types[f], instance,
+                                    sd->type_params, sd->type_param_count);
       }
     }
     return NULL;
