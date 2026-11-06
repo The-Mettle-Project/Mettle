@@ -1,0 +1,18 @@
+import "std/io";
+struct Box<T> { v: T; n: int32; }
+fn Box_get<T>(b: Box<T>) -> T { return b.v; }
+fn Box_set__ptr<T>(b: Box<T>*, v: T) { b->v = v; b->n = b->n + 1; }
+fn wrap<T>(v: T) -> Box<T> { var b: Box<T>; b.v = v; b.n = 1; return b; }
+fn twice<T>(b: Box<T>) -> T { return b.get(); }
+fn main() -> int32 {
+  var n: int64 = 41;
+  var a: Box<int64> = wrap(n);
+  var f: float64 = 2.5;
+  var b: Box<float64> = wrap(f);
+  var p: Box<int64>* = &a;
+  p->set(n + 1);
+  var arr: Box<int64>[2];
+  arr[1] = wrap(n);
+  println("{a.get()} {b.get()} {a.n} {twice(b)} {arr[1].get()} {wrap(n).get()}");
+  return 0;
+}

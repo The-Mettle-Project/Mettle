@@ -55,6 +55,8 @@ typedef struct {
   ASTNode **decl_slots;
   size_t decl_slot_count;
   size_t decls_indexed;
+  int generic_method_pass;
+  size_t generic_method_rewrites;
 } MonoContext;
 
 static char *substitute_type_string(const char *type_str, char **param_names,
@@ -2228,6 +2230,8 @@ static const char *adapt_field_type(Program *prog, const char *struct_type,
 
 static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
                                            MonoVarEnv *env, int depth);
+static char *mono_substitute_written(const char *text, char **params,
+                                     char **args, size_t count);
 
 static const char *mono_receiver_part_type(MonoContext *ctx, ASTNode *node,
                                            MonoVarEnv *env, int depth) {
@@ -2279,6 +2283,22 @@ static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
     return mono_receiver_part_type(ctx, node, env, depth);
   }
   call = (CallExpression *)node->data;
+  if (call && !call->object && call->function_name && call->type_arg_count > 0) {
+    GenericDef *generic = find_generic_def(ctx, call->function_name);
+    FunctionDeclaration *generic_fd =
+        generic && !generic->is_struct && generic->node
+            ? (FunctionDeclaration *)generic->node->data
+            : NULL;
+    if (generic_fd && generic_fd->return_type &&
+        call->type_arg_count == generic->type_param_count) {
+      char *written = mono_substitute_written(
+          generic_fd->return_type, generic->type_params, call->type_args,
+          generic->type_param_count);
+      const char *result = written ? string_intern(written) : NULL;
+      free(written);
+      return result;
+    }
+  }
   if (!call || call->object || !call->written_name || !call->function_name ||
       strncmp(call->function_name, "__trait_", 8) != 0 ||
       call->argument_count == 0) {
@@ -2300,6 +2320,93 @@ static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
   return decl->return_type;
 }
 
+static int mono_prepend_receiver(ASTNode *node, CallExpression *call,
+                                 ASTNode *receiver, char *function_name) {
+  ASTNode *self_arg = ast_clone_node(receiver);
+  ASTNode **new_args = malloc((call->argument_count + 1) * sizeof(ASTNode *));
+  if (!self_arg || !new_args || !function_name) {
+    if (self_arg) {
+      ast_destroy_node(self_arg);
+    }
+    free(new_args);
+    mettle_free_string(function_name);
+    return 0;
+  }
+  new_args[0] = self_arg;
+  for (size_t i = 0; i < call->argument_count; i++) {
+    new_args[i + 1] = call->arguments[i];
+  }
+  free(call->arguments);
+  call->arguments = new_args;
+  call->argument_count++;
+  ast_add_child(node, self_arg);
+  if (!call->written_name) {
+    call->written_name = strdup(call->function_name);
+  }
+  mettle_free_string(call->function_name);
+  call->function_name = function_name;
+  call->object = NULL;
+  return 1;
+}
+
+static int mono_rewrite_generic_method_call(MonoContext *ctx, ASTNode *node,
+                                            MonoVarEnv *env) {
+  CallExpression *call = (CallExpression *)node->data;
+  ASTNode *receiver = NULL;
+  const char *type = NULL;
+  const char *open = NULL;
+  int via_pointer = 0;
+  char name[512];
+  GenericDef *def = NULL;
+
+  if (!call || !call->object || !call->function_name) {
+    return 1;
+  }
+  receiver = call->object;
+  if (receiver->type == AST_UNARY_EXPRESSION) {
+    UnaryExpression *unary = (UnaryExpression *)receiver->data;
+    if (unary && unary->operator && strcmp(unary->operator, "*") == 0) {
+      const char *pointer = mono_receiver_type_name(ctx, unary->operand, env, 0);
+      size_t length = pointer ? strlen(pointer) : 0;
+      open = pointer ? strchr(pointer, '<') : NULL;
+      if (length > 1 && pointer[length - 1] == '*' && open && open != pointer) {
+        snprintf(name, sizeof(name), "%.*s_%s%s", (int)(open - pointer), pointer,
+                 call->function_name, MONO_PTR_RECEIVER_SUFFIX);
+        def = find_generic_def(ctx, name);
+        if (def && !def->is_struct) {
+          receiver = unary->operand;
+          via_pointer = 1;
+        }
+      }
+    }
+  }
+  if (!via_pointer) {
+    type = mono_receiver_type_name(ctx, receiver, env, 0);
+    if (!type && receiver->type == AST_FUNCTION_CALL && receiver->data &&
+        ((CallExpression *)receiver->data)->function_name &&
+        ((CallExpression *)receiver->data)->type_arg_count == 0 &&
+        find_generic_def(ctx, ((CallExpression *)receiver->data)->function_name)) {
+      ctx->generic_method_rewrites++;
+    }
+    open = type ? strchr(type, '<') : NULL;
+    if (!open || open == type) {
+      return 1;
+    }
+    snprintf(name, sizeof(name), "%.*s_%s", (int)(open - type), type,
+             call->function_name);
+    def = find_generic_def(ctx, name);
+  }
+  if (!def || def->is_struct) {
+    return 1;
+  }
+  if (!mono_prepend_receiver(node, call, receiver, strdup(name))) {
+    mono_report_error(ctx, node->location, "Failed to rewrite a generic method call");
+    return 0;
+  }
+  ctx->generic_method_rewrites++;
+  return 1;
+}
+
 static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
                                           MonoVarEnv *env) {
   CallExpression *call = NULL;
@@ -2309,6 +2416,12 @@ static int mono_rewrite_trait_method_call(MonoContext *ctx, ASTNode *node,
   ASTNode **new_args = NULL;
   ASTNode *self_arg = NULL;
   int ambiguous = 0;
+
+  if (ctx && ctx->generic_method_pass) {
+    return node && node->type == AST_FUNCTION_CALL
+               ? mono_rewrite_generic_method_call(ctx, node, env)
+               : 1;
+  }
 
   if (!ctx || !node || node->type != AST_FUNCTION_CALL || !env) {
     return 1;
@@ -3706,7 +3819,7 @@ static int mono_rewrite_trait_method_calls(MonoContext *ctx, ASTNode *program) {
     ASTNode *decl = prog->declarations[i];
     if (decl && decl->type == AST_FUNCTION_DECLARATION) {
       FunctionDeclaration *fn = (FunctionDeclaration *)decl->data;
-      if (fn && fn->type_param_count == 0 &&
+      if (fn && (fn->type_param_count == 0 || ctx->generic_method_pass) &&
           !mono_rewrite_trait_method_calls_in_function(ctx, decl)) {
         return 0;
       }
@@ -5790,6 +5903,25 @@ int monomorphize_generated(ASTNode *fragment, ASTNode *whole,
   return ok;
 }
 
+static int mono_infer_with_generic_methods(MonoContext *ctx, ASTNode *program) {
+  for (int round = 0; round < 8; round++) {
+    ctx->generic_method_rewrites = 0;
+    ctx->generic_method_pass = 1;
+    if (!mono_rewrite_trait_method_calls(ctx, program)) {
+      ctx->generic_method_pass = 0;
+      return 0;
+    }
+    ctx->generic_method_pass = 0;
+    if (!mono_infer_type_args(ctx, program)) {
+      return 0;
+    }
+    if (ctx->generic_method_rewrites == 0) {
+      break;
+    }
+  }
+  return 1;
+}
+
 int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   if (!program || program->type != AST_PROGRAM)
     return 1;
@@ -5814,7 +5946,7 @@ int monomorphize_program(ASTNode *program, ErrorReporter *reporter) {
   }
 
   ctx.module = prog;
-  if (!mono_infer_type_args(&ctx, program)) {
+  if (!mono_infer_with_generic_methods(&ctx, program)) {
     success = 0;
     goto cleanup;
   }

@@ -203,6 +203,10 @@ var q: Point* = &p;
 q->scale(2);
 ```
 
+A generic struct takes generic methods the same way. `fn Box_get<T>(b: Box<T>)
+-> T` is called as `b.get()` on any `Box`, and `fn Box_set__ptr<T>(b: Box<T>*,
+v: T)` as `p->set(v)`; the type argument comes from the receiver.
+
 Naming the wrong form gets a diagnostic that says which function it looked
 for:
 
