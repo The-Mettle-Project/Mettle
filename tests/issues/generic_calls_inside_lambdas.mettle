@@ -1,0 +1,18 @@
+import "std/io";
+
+struct Box<T> { v: T; }
+fn Box_get<T>(b: Box<T>) -> T { return b.v; }
+fn mk<T>(v: T) -> Box<T> { var b: Box<T>; b.v = v; return b; }
+fn id<T>(x: T) -> T { return x; }
+fn make_box() -> Box<int64> { var b: Box<int64>; b.v = 11; return b; }
+
+fn main() -> int32 {
+  var x: int64 = 5;
+  var bx: Box<int64> = mk(x);
+  var f: Fn(int64) -> int64 = fn(q: int64) -> int64 { return id(q) * 2; };
+  var g: Fn(Box<int64>) -> int64 = fn(q: Box<int64>) -> int64 { return q.get() * 3; };
+  var now: int64 = (fn(q: Box<int64>) -> int64 { return q.get() + id(q.v); })(bx);
+  var made: int64 = (fn(n: int64) -> int64 { return mk(n).get() * 7; })(x);
+  println("{f(x)} {g(bx)} {now} {made} {make_box().get()}");
+  return 0;
+}

@@ -1045,6 +1045,25 @@ static char *substitute_type_string(const char *type_str, char **param_names,
   return strdup(type_str);
 }
 
+static void substitute_lambda_signature(FunctionDeclaration *lambda,
+                                        char **param_names, char **arg_names,
+                                        size_t count, MonoContext *ctx) {
+  if (!lambda) {
+    return;
+  }
+  for (size_t i = 0; i <= lambda->parameter_count; i++) {
+    char **slot = i < lambda->parameter_count ? &lambda->parameter_types[i]
+                                              : &lambda->return_type;
+    char *new_type = *slot ? substitute_type_string(*slot, param_names,
+                                                    arg_names, count, ctx)
+                           : NULL;
+    if (new_type) {
+      mettle_free_string(*slot);
+      *slot = new_type;
+    }
+  }
+}
+
 static void substitute_types_in_ast(ASTNode *node, char **param_names,
                                     char **arg_names, size_t count,
                                     MonoContext *ctx) {
@@ -1270,6 +1289,7 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
       substitute_types_in_ast(ds->statement, param_names, arg_names, count, ctx);
     break;
   }
+  case AST_FUNC_PTR_CALL:
   case AST_GPU_LAUNCH:
   case AST_VALUE_SCOPE:
   case AST_YIELD_STATEMENT:
@@ -1279,28 +1299,8 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
     }
     break;
   case AST_LAMBDA_EXPRESSION: {
-    FunctionDeclaration *lambda = (FunctionDeclaration *)node->data;
-    if (lambda) {
-      for (size_t i = 0; i < lambda->parameter_count; i++) {
-        char *new_type =
-            lambda->parameter_types[i]
-                ? substitute_type_string(lambda->parameter_types[i],
-                                         param_names, arg_names, count, ctx)
-                : NULL;
-        if (new_type) {
-          mettle_free_string(lambda->parameter_types[i]);
-          lambda->parameter_types[i] = new_type;
-        }
-      }
-      if (lambda->return_type) {
-        char *new_type = substitute_type_string(
-            lambda->return_type, param_names, arg_names, count, ctx);
-        if (new_type) {
-          mettle_free_string(lambda->return_type);
-          lambda->return_type = new_type;
-        }
-      }
-    }
+    substitute_lambda_signature((FunctionDeclaration *)node->data, param_names,
+                                arg_names, count, ctx);
     for (size_t i = 0; i < node->child_count; i++) {
       substitute_types_in_ast(node->children[i], param_names, arg_names, count,
                               ctx);
@@ -1417,6 +1417,26 @@ static void collect_generic_defs(ASTNode *program, MonoContext *ctx) {
   }
 }
 
+static void collect_type_instantiations(ASTNode *node, MonoContext *ctx);
+
+static void collect_function_instantiations(ASTNode *node, MonoContext *ctx) {
+  FunctionDeclaration *fd = (FunctionDeclaration *)node->data;
+  if (!fd || fd->type_param_count != 0) {
+    return;
+  }
+  if (fd->body) {
+    collect_type_instantiations(fd->body, ctx);
+  }
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    if (fd->parameter_types[i]) {
+      record_generic_type_use(ctx, fd->parameter_types[i], node->location);
+    }
+  }
+  if (fd->return_type) {
+    record_generic_type_use(ctx, fd->return_type, node->location);
+  }
+}
+
 static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
   if (!node)
     return;
@@ -1452,22 +1472,10 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
     }
     break;
   }
-  case AST_FUNCTION_DECLARATION: {
-    FunctionDeclaration *fd = (FunctionDeclaration *)node->data;
-    if (fd && fd->type_param_count == 0 && fd->body)
-      collect_type_instantiations(fd->body, ctx);
-    if (fd && fd->type_param_count == 0) {
-      for (size_t i = 0; i < fd->parameter_count; i++) {
-        if (fd->parameter_types[i]) {
-          record_generic_type_use(ctx, fd->parameter_types[i], node->location);
-        }
-      }
-      if (fd->return_type) {
-        record_generic_type_use(ctx, fd->return_type, node->location);
-      }
-    }
+  case AST_LAMBDA_EXPRESSION:
+  case AST_FUNCTION_DECLARATION:
+    collect_function_instantiations(node, ctx);
     break;
-  }
   case AST_STRUCT_DECLARATION: {
     StructDeclaration *sd = (StructDeclaration *)node->data;
     if (sd && sd->type_param_count == 0) {
@@ -1624,6 +1632,7 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
       collect_type_instantiations(ds->statement, ctx);
     break;
   }
+  case AST_FUNC_PTR_CALL:
   case AST_GPU_LAUNCH:
   case AST_VALUE_SCOPE:
   case AST_YIELD_STATEMENT:
@@ -1706,6 +1715,27 @@ static void rewrite_generic_type_name_in_place(char **slot,
   free(core);
 }
 
+static void rewrite_generic_references(ASTNode *node, MonoContext *ctx);
+
+static void rewrite_function_references(ASTNode *node, MonoContext *ctx) {
+  FunctionDeclaration *fd = (FunctionDeclaration *)node->data;
+  if (!fd || fd->type_param_count != 0) {
+    return;
+  }
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    if (fd->parameter_types[i]) {
+      rewrite_generic_type_name_in_place(&fd->parameter_types[i], NULL, NULL, 0,
+                                         ctx);
+    }
+  }
+  if (fd->return_type) {
+    rewrite_generic_type_name_in_place(&fd->return_type, NULL, NULL, 0, ctx);
+  }
+  if (fd->body) {
+    rewrite_generic_references(fd->body, ctx);
+  }
+}
+
 static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
   if (!node)
     return;
@@ -1781,23 +1811,10 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
     }
     break;
   }
-  case AST_FUNCTION_DECLARATION: {
-    FunctionDeclaration *fd = (FunctionDeclaration *)node->data;
-    if (fd && fd->type_param_count == 0) {
-      for (size_t i = 0; i < fd->parameter_count; i++) {
-        if (fd->parameter_types[i]) {
-          rewrite_generic_type_name_in_place(&fd->parameter_types[i], NULL,
-                                             NULL, 0, ctx);
-        }
-      }
-      if (fd->return_type) {
-        rewrite_generic_type_name_in_place(&fd->return_type, NULL, NULL, 0, ctx);
-      }
-      if (fd->body)
-        rewrite_generic_references(fd->body, ctx);
-    }
+  case AST_LAMBDA_EXPRESSION:
+  case AST_FUNCTION_DECLARATION:
+    rewrite_function_references(node, ctx);
     break;
-  }
   case AST_STRUCT_DECLARATION: {
     StructDeclaration *sd = (StructDeclaration *)node->data;
     if (sd && sd->type_param_count == 0) {
@@ -1961,6 +1978,7 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
       rewrite_generic_references(ds->statement, ctx);
     break;
   }
+  case AST_FUNC_PTR_CALL:
   case AST_GPU_LAUNCH:
   case AST_VALUE_SCOPE:
   case AST_YIELD_STATEMENT:
@@ -2190,6 +2208,29 @@ static int mono_node_opens_scope(const ASTNode *node) {
          node->type == AST_COMPTIME_FOR || node->type == AST_LAMBDA_EXPRESSION;
 }
 
+static int mono_impl_type_matches(const char *impl_type, const char *type_name) {
+  char *base = NULL;
+  char **args = NULL;
+  size_t count = 0;
+  int same = 0;
+  if (strcmp(impl_type, type_name) == 0) {
+    return 1;
+  }
+  if (!strchr(impl_type, '<') ||
+      !parse_generic_type_name(impl_type, &base, &args, &count)) {
+    return 0;
+  }
+  char *mangled = mangle_name(base, args, count);
+  same = mangled && strcmp(mangled, type_name) == 0;
+  mettle_free_string(mangled);
+  free(base);
+  for (size_t i = 0; i < count; i++) {
+    free(args[i]);
+  }
+  free(args);
+  return same;
+}
+
 static TraitImpl *mono_find_impl_for_method(MonoContext *ctx,
                                             const char *type_name,
                                             const char *method_name,
@@ -2205,7 +2246,8 @@ static TraitImpl *mono_find_impl_for_method(MonoContext *ctx,
 
   for (size_t i = 0; i < ctx->impl_count; i++) {
     TraitImpl *impl = &ctx->impls[i];
-    if (!impl->for_type_name || strcmp(impl->for_type_name, type_name) != 0) {
+    if (!impl->for_type_name ||
+        !mono_impl_type_matches(impl->for_type_name, type_name)) {
       continue;
     }
     if (!mono_find_function_method(impl->methods, impl->method_count,
@@ -2264,6 +2306,39 @@ static const char *mono_receiver_part_type(MonoContext *ctx, ASTNode *node,
   return NULL;
 }
 
+static const char *mono_plain_call_result_type(MonoContext *ctx,
+                                               CallExpression *call) {
+  if (call->type_arg_count > 0) {
+    GenericDef *generic = find_generic_def(ctx, call->function_name);
+    FunctionDeclaration *generic_fd =
+        generic && !generic->is_struct && generic->node
+            ? (FunctionDeclaration *)generic->node->data
+            : NULL;
+    if (!generic_fd || !generic_fd->return_type ||
+        call->type_arg_count != generic->type_param_count) {
+      return NULL;
+    }
+    char *written = mono_substitute_written(generic_fd->return_type,
+                                            generic->type_params,
+                                            call->type_args,
+                                            generic->type_param_count);
+    const char *result = written ? string_intern(written) : NULL;
+    free(written);
+    return result;
+  }
+  for (size_t d = 0; ctx->module && d < ctx->module->declaration_count; d++) {
+    ASTNode *decl = ctx->module->declarations[d];
+    FunctionDeclaration *fd = decl && decl->type == AST_FUNCTION_DECLARATION
+                                  ? (FunctionDeclaration *)decl->data
+                                  : NULL;
+    if (fd && fd->name && fd->type_param_count == 0 && fd->return_type &&
+        strcmp(fd->name, call->function_name) == 0) {
+      return fd->return_type;
+    }
+  }
+  return NULL;
+}
+
 static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
                                            MonoVarEnv *env, int depth) {
   CallExpression *call = NULL;
@@ -2285,21 +2360,9 @@ static const char *mono_receiver_type_name(MonoContext *ctx, ASTNode *node,
     return mono_receiver_part_type(ctx, node, env, depth);
   }
   call = (CallExpression *)node->data;
-  if (call && !call->object && call->function_name && call->type_arg_count > 0) {
-    GenericDef *generic = find_generic_def(ctx, call->function_name);
-    FunctionDeclaration *generic_fd =
-        generic && !generic->is_struct && generic->node
-            ? (FunctionDeclaration *)generic->node->data
-            : NULL;
-    if (generic_fd && generic_fd->return_type &&
-        call->type_arg_count == generic->type_param_count) {
-      char *written = mono_substitute_written(
-          generic_fd->return_type, generic->type_params, call->type_args,
-          generic->type_param_count);
-      const char *result = written ? string_intern(written) : NULL;
-      free(written);
-      return result;
-    }
+  if (call && !call->object && call->function_name &&
+      strncmp(call->function_name, "__trait_", 8) != 0) {
+    return mono_plain_call_result_type(ctx, call);
   }
   if (!call || call->object || !call->written_name || !call->function_name ||
       strncmp(call->function_name, "__trait_", 8) != 0 ||

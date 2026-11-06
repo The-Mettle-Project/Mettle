@@ -1,0 +1,11 @@
+import "std/io";
+struct Box<T> { v: T; }
+trait Size { fn size(self: Self) -> int64; }
+impl Size for Box<int64> { fn size(self: Self) -> int64 { return self.v * 10; } }
+fn measure<T: Size>(x: T) -> int64 { return x.size(); }
+fn main() -> int32 {
+  var b: Box<int64>;
+  b.v = 4;
+  println("{b.size()} {measure(b)}");
+  return 0;
+}
