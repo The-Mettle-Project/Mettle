@@ -21721,6 +21721,8 @@ $issueRegressions = @(
   @{ Name = "word_count_fold_checks_the_body"; Entry = "tests/issues/word_count_fold_checks_the_body.mettle"; Args = @(); Expect = @("9 6007 20 6") },
   @{ Name = "word_count_fold_checks_the_body_release"; Entry = "tests/issues/word_count_fold_checks_the_body.mettle"; Args = @("--release"); Expect = @("9 6007 20 6") },
   @{ Name = "generic_gathered_parameter_infers"; Entry = "tests/issues/generic_gathered_parameter_infers.mettle"; Args = @(); Expect = @("7 2.5 9 303 7") },
+  @{ Name = "rounding_keeps_negative_zero"; Entry = "tests/issues/rounding_keeps_negative_zero.mettle"; Args = @(); Expect = @("1 1 1 1 1 0 -1.0 1.0 -1.0 3.0") },
+  @{ Name = "rounding_keeps_negative_zero_release"; Entry = "tests/issues/rounding_keeps_negative_zero.mettle"; Args = @("--release"); Expect = @("1 1 1 1 1 0 -1.0 1.0 -1.0 3.0") },
   @{ Name = "trait_call_on_indexed_receiver"; Entry = "tests/issues/trait_call_on_indexed_receiver.mettle"; Args = @(); Expect = @("14 27 4 36 9") },
   @{ Name = "trait_call_on_indexed_receiver_release"; Entry = "tests/issues/trait_call_on_indexed_receiver.mettle"; Args = @("--release"); Expect = @("14 27 4 36 9") },
   @{ Name = "kernel_folds_keep_other_loop_work"; Entry = "tests/issues/kernel_folds_keep_other_loop_work.mettle"; Args = @(); Expect = @("5937621446691145662 266") },

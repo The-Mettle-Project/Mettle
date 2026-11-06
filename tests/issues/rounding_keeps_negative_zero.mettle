@@ -1,0 +1,7 @@
+import "std/io";
+import "std/math";
+
+fn main() -> int32 {
+  println("{signbit(trunc(-0.3))} {signbit(floor(-0.0))} {signbit(ceil(-0.5))} {signbit(round(-0.4))} {signbit(ceil(-1e-300))} {signbit(trunc(0.3))} {floor(-0.3)} {ceil(0.2)} {round(-0.5)} {round(2.5)}");
+  return 0;
+}
