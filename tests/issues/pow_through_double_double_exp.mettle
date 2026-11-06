@@ -1,0 +1,6 @@
+import "std/io";
+import "std/math";
+fn main() -> int32 {
+  println("{f64_bits(pow(0.7017277010949722, -42.99214490993577))} {f64_bits(pow(1.2738302816373348, -57.39289251813557))} {f64_bits(pow(10.0, 308.25))}");
+  return 0;
+}

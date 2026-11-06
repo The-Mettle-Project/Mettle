@@ -622,11 +622,17 @@ fn pow_log_dd(x: float64, lo: float64*) -> float64 {
   q = q * z + 1.0 / 9.0;
   q = q * z + 1.0 / 7.0;
   q = q * z + 1.0 / 5.0;
-  q = q * z + 1.0 / 3.0;
-  var tail: float64 = 2.0 * t_hi * z * q;
+  var sq_lo: float64 = 0.0;
+  var sq: float64 = dd_two_prod(t_hi, t_hi, &sq_lo);
+  sq_lo = sq_lo + 2.0 * t_hi * t_lo;
+  var cube_lo: float64 = 0.0;
+  var cube: float64 = dd_mul(sq, sq_lo, t_hi, t_lo, &cube_lo);
+  var third_lo: float64 = 0.0;
+  var third: float64 = dd_mul(cube, cube_lo, 0.6666666666666666, 3.700743415417188e-17, &third_lo);
+  var higher: float64 = 2.0 * t_hi * z * z * q;
   var two_t: float64 = 2.0 * t_hi;
-  var mh: float64 = two_t + tail;
-  var ml: float64 = (two_t - mh) + tail + 2.0 * t_lo;
+  var mh: float64 = two_t + third;
+  var ml: float64 = (two_t - mh) + third + ((third_lo + higher) + 2.0 * t_lo);
   var kh: float64 = (float64)k * 6.93147180369123816490e-01;
   var kl: float64 = (float64)k * 1.90821492927058770002e-10;
   var sum: float64 = kh + mh;
@@ -678,8 +684,12 @@ fn pow_positive(base: float64, exponent: float64) -> float64 {
   var p_hi: float64 = dd_mul(exponent, 0.0, log_hi, log_lo, &p_lo);
   if (p_hi > 709.8) { return INF(); }
   if (p_hi < -745.2) { return 0.0; }
-  var r: float64 = exp(p_hi);
-  return r + r * p_lo;
+  var n: int32 = 0;
+  var em_lo: float64 = 0.0;
+  var em: float64 = exp_reduced(p_hi, &n, &em_lo);
+  var one: float64 = 1.0 + em;
+  var one_lo: float64 = ((em - (one - 1.0)) + em_lo) + p_lo * one;
+  return ldexp(one + one_lo, n);
 }
 
 export fn pow(base: float64, exponent: float64) -> float64 {
