@@ -72,6 +72,8 @@ frontend can drive instead. The documentation is organized the same way.
   declared-type prover and the effect pass.
 - [Effects](effects.md): `effect`, `with`, `forbids`, `requires`, `provides`; what a function does and needs, inferred through the call graph and proven on every build, down to a global two threads write with nothing ordering them.
 - [ML-driven IR optimization](ml-opt.md): `--ml-opt` and its validation gate.
+- [mettle explain](explain.md): the report as a terminal UI, a tab for each
+  part of what the compiler did.
 - [The --explain-json schema](explain-json.md): the machine-readable
   optimization report.
 - [gnn_oracle](ml-opt-oracle.md): the design of the successor model.

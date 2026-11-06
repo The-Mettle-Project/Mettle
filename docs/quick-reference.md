@@ -495,6 +495,7 @@ mettle --build app.mettle              # executable
 mettle --release --build app.mettle    # optimized
 mettle --safe --build app.mettle       # bounds-checked
 mettle --release --explain app.mettle  # what the optimizer did
+mettle explain app.mettle              # browse it in a terminal UI
 mettle test app.mettle                 # run @test functions
 mettle trace app.mettle total 4        # trace one function
 mettle explain M0110                   # explain a diagnostic

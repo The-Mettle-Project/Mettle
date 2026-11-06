@@ -36,12 +36,20 @@ void ir_explain_set_output_path(const char *path) {
 }
 
 static MTLC_THREAD_LOCAL int g_explain_json = 0;
+static MTLC_THREAD_LOCAL int g_explain_text = 1;
+static MTLC_THREAD_LOCAL FILE *g_explain_stream = NULL;
+static MTLC_THREAD_LOCAL const char *g_explain_source_path = NULL;
 static MTLC_THREAD_LOCAL int g_explain_retain_remarks = 0;
 static MTLC_THREAD_LOCAL char *g_json_buf = NULL;
 static MTLC_THREAD_LOCAL size_t g_json_len = 0;
 static MTLC_THREAD_LOCAL size_t g_json_cap = 0;
 
 void ir_explain_set_json(int enabled) { g_explain_json = enabled; }
+void ir_explain_set_text(int enabled) { g_explain_text = enabled; }
+void ir_explain_set_stream(FILE *out) { g_explain_stream = out; }
+void ir_explain_set_source_path(const char *path) {
+  g_explain_source_path = path;
+}
 
 static void ir_explain_json_raw(const char *fmt, ...) {
   va_list args;
@@ -98,6 +106,26 @@ static void ir_explain_json_str(const char *s) {
     }
   }
   ir_explain_json_raw("\"");
+}
+
+static void ir_explain_json_file_str(FILE *out, const char *s) {
+  if (!s) {
+    fputs("null", out);
+    return;
+  }
+  fputc('"', out);
+  for (; *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '"' || c == '\\') {
+      fputc('\\', out);
+      fputc(c, out);
+    } else if (c < 0x20) {
+      fprintf(out, "\\u%04x", c);
+    } else {
+      fputc(c, out);
+    }
+  }
+  fputc('"', out);
 }
 
 static MTLC_THREAD_LOCAL char *g_report_buf = NULL;
@@ -2111,6 +2139,8 @@ static void ir_explain_json_remark(const IRExplainRemark *r, const char *kind,
   ir_explain_json_raw("}");
 }
 
+static void ir_explain_payoff_json(void);
+
 static void ir_explain_typed_flush(void) {
   if (g_explain_json) {
     ir_explain_json_raw("\"proven_by_type\":[");
@@ -2119,10 +2149,13 @@ static void ir_explain_typed_flush(void) {
       ir_explain_json_raw("%s{\"line\":%zu,\"type\":", i ? "," : "",
                           n->line);
       ir_explain_json_str(n->type_name);
+      ir_explain_json_raw(",\"fn\":");
+      ir_explain_json_str(n->function_name);
       ir_explain_json_raw(",\"min\":%lld,\"max\":%lld,\"length\":%zu}",
                           n->min, n->max, n->length);
     }
-    ir_explain_json_raw("],");
+    ir_explain_json_raw("],\"provenByTypeTotal\":%zu,", g_typed_total);
+    ir_explain_payoff_json();
   }
   if (!g_explain || (g_typed_total == 0 && ir_explain_payoff_total() == 0)) {
     return;
@@ -2176,6 +2209,29 @@ static MTLC_THREAD_LOCAL size_t g_effect_total = 0;
 static MTLC_THREAD_LOCAL IRExplainLedgerRow *g_ledger_rules = NULL;
 static MTLC_THREAD_LOCAL size_t g_ledger_rule_count = 0;
 static MTLC_THREAD_LOCAL size_t g_ledger_rule_total = 0;
+static MTLC_THREAD_LOCAL IRExplainLedgerRow *g_layout = NULL;
+static MTLC_THREAD_LOCAL size_t g_layout_count = 0;
+static MTLC_THREAD_LOCAL size_t g_layout_total = 0;
+
+void ir_explain_layout_note(size_t line, const char *function_name,
+                            const char *detail) {
+  IRExplainLedgerRow *grown;
+  if (g_layout_count >= IR_EXPLAIN_LEDGER_MAX) {
+    return;
+  }
+  grown = realloc(g_layout, (g_layout_count + 1) * sizeof(*g_layout));
+  if (!grown) {
+    return;
+  }
+  g_layout = grown;
+  memset(&g_layout[g_layout_count], 0, sizeof(*g_layout));
+  g_layout[g_layout_count].a = function_name ? strdup(function_name) : NULL;
+  g_layout[g_layout_count].b = detail ? strdup(detail) : NULL;
+  g_layout[g_layout_count].line = line;
+  g_layout_count++;
+}
+
+void ir_explain_layout_total(size_t total) { g_layout_total = total; }
 
 void ir_explain_ledger_set_collect(int enabled) { g_ledger_collect = enabled; }
 
@@ -2223,6 +2279,33 @@ void ir_explain_type_payoff(const char *file, size_t line,
   row->line = line;
 }
 
+static void ledger_json(const char *key, const IRExplainLedgerRow *rows,
+                        size_t count, size_t total, const char *const *names,
+                        int with_line, int with_steps) {
+  ir_explain_json_raw("\"%s\":[", key);
+  for (size_t i = 0; i < count; i++) {
+    const char *values[4] = {rows[i].a, rows[i].b, rows[i].c, rows[i].d};
+    int first = 1;
+    ir_explain_json_raw("%s{", i ? "," : "");
+    for (int f = 0; f < 4; f++) {
+      if (!names[f]) {
+        continue;
+      }
+      ir_explain_json_raw("%s\"%s\":", first ? "" : ",", names[f]);
+      ir_explain_json_str(values[f]);
+      first = 0;
+    }
+    if (with_line) {
+      ir_explain_json_raw(",\"line\":%zu", rows[i].line);
+    }
+    if (with_steps) {
+      ir_explain_json_raw(",\"steps\":%lld", rows[i].steps);
+    }
+    ir_explain_json_raw("}");
+  }
+  ir_explain_json_raw("],\"%sTotal\":%zu,", key, total);
+}
+
 static void ledger_more(size_t total, size_t shown) {
   if (total > shown) {
     ir_explain_emit("  %s(%zu more not listed)%s\n", clr(EXPLAIN_DIM),
@@ -2230,6 +2313,12 @@ static void ledger_more(size_t total, size_t shown) {
   }
 }
 size_t ir_explain_payoff_total(void) { return g_payoff_total; }
+
+static void ir_explain_payoff_json(void) {
+  static const char *const names[4] = {"type", "what", "detail", "fn"};
+  ledger_json("payoffs", g_payoffs, g_payoff_count, g_payoff_total, names, 1,
+              0);
+}
 
 void ir_explain_payoff_rows(void) {
   if (g_payoff_total == 0) {
@@ -2304,8 +2393,28 @@ void ir_explain_rule_ran(const char *rule, const char *verdict,
 }
 
 void ir_explain_ledger_flush(void) {
+  static const char *const proof_names[4] = {"type", "expression", "route",
+                                             "consumer"};
+  static const char *const effect_names[4] = {"fn", "performs", "needs", NULL};
+  static const char *const rule_names[4] = {"rule", "verdict", NULL, NULL};
+  static const char *const belief_names[4] = {"what", "why", NULL, NULL};
+  static const char *const layout_names[4] = {"fn", "detail", NULL, NULL};
   if (!g_explain) {
     return;
+  }
+  if (g_explain_json) {
+    ledger_json("layout", g_layout, g_layout_count,
+                g_layout_total > g_layout_count ? g_layout_total
+                                                : g_layout_count,
+                layout_names, 1, 0);
+    ledger_json("proofs", g_proofs, g_proof_count, g_proof_total, proof_names,
+                1, 0);
+    ledger_json("effects", g_effects, g_effect_count, g_effect_total,
+                effect_names, 0, 0);
+    ledger_json("rules", g_ledger_rules, g_ledger_rule_count,
+                g_ledger_rule_total, rule_names, 0, 1);
+    ledger_json("beliefs", g_beliefs, g_belief_count, g_belief_total,
+                belief_names, 0, 0);
   }
   if (g_proof_total > 0) {
     ir_explain_print_header("types proven");
@@ -2414,6 +2523,18 @@ void ir_explain_ledger_release(void) {
   ledger_free(&g_proofs, &g_proof_count, &g_proof_total);
   ledger_free(&g_effects, &g_effect_count, &g_effect_total);
   ledger_free(&g_ledger_rules, &g_ledger_rule_count, &g_ledger_rule_total);
+  ledger_free(&g_layout, &g_layout_count, &g_layout_total);
+}
+
+static const char *ir_explain_safety_why(const IRExplainSafetyNote *n) {
+  return n->kind == IR_SAFETY_SURVIVOR_REGION
+             ? "the object's size is not known here, so the runtime is asked "
+               "which allocation the pointer came from"
+         : n->kind == IR_SAFETY_SURVIVOR_SPAN
+             ? "nothing bounds the index, but the pointer holds still, so the "
+               "loop resolves its allocation once and this compares against it"
+             : "the index is not a constant and no loop bounds it, so it is "
+               "compared against the object's extent";
 }
 
 static void ir_explain_safety_flush(void) {
@@ -2437,9 +2558,13 @@ static void ir_explain_safety_flush(void) {
                                                                : "extent");
       ir_explain_json_raw(",\"function\":");
       ir_explain_json_str(n->function_name);
+      ir_explain_json_raw(",\"why\":");
+      ir_explain_json_str(ir_explain_safety_why(n));
       ir_explain_json_raw("}");
     }
-    ir_explain_json_raw("]},");
+    ir_explain_json_raw("],\"survivorsTotal\":%zu},",
+                        g_safety_extent_tests + g_safety_region_calls +
+                            g_safety_spanned);
   }
 
   ir_explain_typed_flush();
@@ -2478,15 +2603,7 @@ static void ir_explain_safety_flush(void) {
 
   for (size_t i = 0; i < g_safety_count; i++) {
     const IRExplainSafetyNote *n = &g_safety[i];
-    const char *why =
-        n->kind == IR_SAFETY_SURVIVOR_REGION
-            ? "the object's size is not known here, so the runtime is asked "
-              "which allocation the pointer came from"
-        : n->kind == IR_SAFETY_SURVIVOR_SPAN
-            ? "nothing bounds the index, but the pointer holds still, so the "
-              "loop resolves its allocation once and this compares against it"
-            : "the index is not a constant and no loop bounds it, so it is "
-              "compared against the object's extent";
+    const char *why = ir_explain_safety_why(n);
     ir_explain_emit("  %sline %zu%s%s%s: %s\n", clr(EXPLAIN_BOLD), n->line,
                     clr(EXPLAIN_RESET), n->function_name ? " in " : "",
                     n->function_name ? n->function_name : "", why);
@@ -3415,8 +3532,9 @@ void ir_explain_finalize(int force_stderr) {
   }
 
   char *sidecar = NULL;
-  int diverted = 0;
-  if (!force_stderr && ir_explain_report_lines() > threshold &&
+  int diverted = !g_explain_text;
+  if (g_explain_text && !force_stderr && !g_explain_stream &&
+      ir_explain_report_lines() > threshold &&
       (sidecar = ir_explain_sidecar_path()) != NULL) {
     FILE *out = fopen(sidecar, "wb");
     if (out) {
@@ -3433,7 +3551,13 @@ void ir_explain_finalize(int force_stderr) {
         const char *source = g_explain_focus_file
                                  ? ir_explain_path_basename(g_explain_focus_file)
                                  : "";
-        fprintf(out, "{\"schema\":2,\"source\":\"%s\",", source);
+        fputs("{\"schema\":2,\"source\":", out);
+        ir_explain_json_file_str(out, source);
+        fputs(",\"path\":", out);
+        ir_explain_json_file_str(out, g_explain_source_path
+                                          ? g_explain_source_path
+                                          : g_explain_focus_file);
+        fputc(',', out);
         fwrite(g_json_buf, 1, g_json_len, out);
         fprintf(out,
                 "\"stats\":{\"loopsVectorized\":%zu,\"loopsScalar\":%zu,"
@@ -3470,7 +3594,8 @@ void ir_explain_finalize(int force_stderr) {
   ir_explain_source_free();
 
   if (!diverted) {
-    int fd = explain_fileno(stderr);
+    FILE *stream = g_explain_stream ? g_explain_stream : stderr;
+    int fd = explain_fileno(stream);
     int columns = (fd >= 0 && explain_isatty(fd)) ? ir_explain_terminal_columns()
                                                   : 0;
     const char *forced = getenv("METTLE_EXPLAIN_COLUMNS");
@@ -3479,12 +3604,12 @@ void ir_explain_finalize(int force_stderr) {
     }
     diag_style_output_begin();
     if (columns >= 40) {
-      ir_explain_write_wrapped(stderr, (size_t)columns);
+      ir_explain_write_wrapped(stream, (size_t)columns);
     } else {
-      fwrite(g_report_buf, 1, g_report_len, stderr);
+      fwrite(g_report_buf, 1, g_report_len, stream);
     }
     diag_style_output_end();
-  } else {
+  } else if (g_explain_text) {
     diag_style_output_begin();
     {
       char label[64];
@@ -3525,8 +3650,11 @@ void ir_explain_finalize(int force_stderr) {
               g_digest.start_here_proven ? "[proven] " : "", lead,
               clr(EXPLAIN_RESET));
     }
-    fprintf(stderr, "  full report (%zu lines): %s%s%s\n\n",
+    fprintf(stderr, "  full report (%zu lines): %s%s%s\n",
             ir_explain_report_lines(), clr(EXPLAIN_BOLD), sidecar,
+            clr(EXPLAIN_RESET));
+    fprintf(stderr, "  browse it: %smettle explain %s%s\n\n", clr(EXPLAIN_BOLD),
+            g_explain_focus_file ? g_explain_focus_file : "<file>",
             clr(EXPLAIN_RESET));
     diag_style_output_end();
   }

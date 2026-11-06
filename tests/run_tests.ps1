@@ -13058,6 +13058,78 @@ catch {
   Write-CaseResult -Name "ownership_strings_are_inspectable" -Passed $false -Reason $_.Exception.Message
 }
 
+# mettle explain <file> builds the file with --release --explain-json into a
+# cache and opens the report as a TUI. --screen and --keys drive the same TUI
+# against a virtual terminal and print the last frame, so every tab, the
+# detail pane, the source view, the filter, links and the help are checked
+# here as text.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $savedCache = $env:METTLE_CACHE
+  $env:METTLE_CACHE = Join-Path $tmpDir "explain-cache"
+  function Invoke-ExplainScreen([string]$File, [string]$Keys, [string]$Screen = "140x30", [string[]]$Extra = @()) {
+    $explainArgs = @("explain", $File) + $Extra + @("--screen=$Screen")
+    if ($Keys) { $explainArgs += "--keys=$Keys" }
+    $text = (& $CompilerPath @explainArgs 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "mettle explain $File --keys=$Keys failed: $text" }
+    return $text
+  }
+  function Assert-Screen([string]$Text, [string[]]$Expected, [string]$What) {
+    foreach ($e in $Expected) {
+      if ($Text -notmatch [regex]::Escape($e)) { throw "${What}: missing '$e' in:`n$Text" }
+    }
+  }
+  $demo = "tests/explain_demo.mettle"
+  Assert-Screen (Invoke-ExplainScreen $demo "") @(
+      "1 Overview 5", "2 Optimizer 25", "5 Functions", "7 Passes",
+      "Loops      3 vectorized, 12 scalar, 5 fixes proven",
+      "Start here", "matvec:38", "Enter opens this in Optimizer",
+      "matvec, loop at line 38", "dot-shape-address") "overview"
+  Assert-Screen (Invoke-ExplainScreen $demo "2 j j j") @(
+      "Line     What             Verdict", "sum_bytes, loop at line 27",
+      "Reason    this is a byte-sum loop", "Verified",
+      "for i in 0..n {", "byte-sum-narrow-acc  Byte sum into") "optimizer"
+  Assert-Screen (Invoke-ExplainScreen $demo "1 enter") @("matvec, loop at line 38") "link from overview"
+  if ((Invoke-ExplainScreen $demo "1 enter") -match "Enter opens this") { throw "enter on a start-here entry did not follow its link" }
+  Assert-Screen (Invoke-ExplainScreen $demo "2 j j j s") @("fn sum_bytes(data: uint8*, n: int32)", "s back to the detail") "source view"
+  Assert-Screen (Invoke-ExplainScreen $demo "2 / text:hoist enter") @('"hoist"  3 of 25') "filter"
+  Assert-Screen (Invoke-ExplainScreen $demo "2 m") @("missed only") "missed filter"
+  Assert-Screen (Invoke-ExplainScreen $demo "5") @("Function", "Instructions", "main", "Registers") "functions"
+  Assert-Screen (Invoke-ExplainScreen $demo "6") @("Taken on trust", "memset") "proofs"
+  Assert-Screen (Invoke-ExplainScreen $demo "7") @("remove_unused_labels", "Runs") "passes"
+  Assert-Screen (Invoke-ExplainScreen $demo "?") @("Keys", "missed only, with a fix only, all") "help"
+  Assert-Screen (Invoke-ExplainScreen $demo "2" "64x20") @("2 Optimizer", "saxpy, loop at line 12", "q quit") "narrow layout"
+  Assert-Screen (Invoke-ExplainScreen $demo "" "30x8") @("needs 40 by 12") "too small"
+  Assert-Screen (Invoke-ExplainScreen "tests/test_ownership_paths.mettle" "3 j j") @(
+      "Line  Record", "Written out", "var __tmp") "ownership"
+  Assert-Screen (Invoke-ExplainScreen "tests/test_ownership_strings.mettle" "4" "140x24" @("--safe")) @(
+      "accesses", "Checked at run time") "memory under --safe"
+
+  $saved = Get-ChildItem (Join-Path $env:METTLE_CACHE "explain") -Filter "explain_demo-*.explain.json" | Select-Object -First 1
+  if (-not $saved) { throw "the cache holds no explain_demo report" }
+  $model = Get-Content $saved.FullName -Raw | ConvertFrom-Json
+  foreach ($key in @("path", "remarks", "ownership", "beliefs", "beliefsTotal", "proofs", "effects", "rules", "layout", "payoffs", "passes")) {
+    if ($null -eq $model.PSObject.Properties[$key]) { throw "the report has no '$key'" }
+  }
+  Assert-Screen (Invoke-ExplainScreen $saved.FullName "2") @("sum_bytes", "Verdict") "saved report"
+  $text = (& $CompilerPath explain $saved.FullName --text 2>&1 | Out-String)
+  Assert-Screen $text @("Optimizer", "Start here", "Fix: declare the accumulator as int64") "saved report as text"
+  $piped = (& $CompilerPath explain $demo 2>$null | Out-String)
+  Assert-Screen $piped @("optimization report", "where to start") "report without a terminal"
+  $missing = (& $CompilerPath explain tests/no_such_file.mettle 2>&1 | Out-String)
+  if ($LASTEXITCODE -eq 0 -or $missing -notmatch "does not exist") { throw "a missing file was not reported: $missing" }
+  $code = (& $CompilerPath explain E0004 2>&1 | Out-String)
+  if ($code -notmatch "E0004: Type mismatch") { throw "mettle explain CODE stopped working: $code" }
+  $env:METTLE_CACHE = $savedCache
+  Write-CaseResult -Name "explain_tui" -Passed $true
+}
+catch {
+  $failed++
+  $env:METTLE_CACHE = $savedCache
+  Write-CaseResult -Name "explain_tui" -Passed $false -Reason $_.Exception.Message
+}
+
 foreach ($valueMode in @("debug", "optimized", "release", "safe")) {
   $total++
   $caseName = "value_control_flow_$valueMode"

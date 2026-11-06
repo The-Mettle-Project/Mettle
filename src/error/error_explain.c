@@ -1840,6 +1840,30 @@ static const char *nearest_code(const char *code) {
   return best;
 }
 
+int mettle_explain_lookup(const char *code, const char **title,
+                          const char **body) {
+  char normalized[128];
+  if (!code || !code[0]) {
+    return 0;
+  }
+  normalize_code(code, normalized, sizeof(normalized));
+  for (size_t i = 0; i < DOCS_COUNT; i++) {
+    if (code_equal_fold(DOCS[i].code, normalized)) {
+      *title = DOCS[i].title;
+      *body = DOCS[i].body;
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < DECISIONS_COUNT; i++) {
+    if (code_equal_fold(DECISIONS[i].code, normalized)) {
+      *title = DECISIONS[i].title;
+      *body = DECISIONS[i].body;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int mettle_explain_error_code(const char *code) {
   if (!code || strcmp(code, "list") == 0 || strcmp(code, "all") == 0) {
     print_code_list();

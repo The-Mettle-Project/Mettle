@@ -149,7 +149,8 @@ the only claims in a build the compiler did not establish itself, and
 checked.
 
 [The `--explain-json` schema](explain-json.md) documents the machine-readable
-form.
+form, and [`mettle explain app.mettle`](explain.md) builds a file and opens that
+report in a terminal UI with a tab for each part.
 
 ## Asking why
 
@@ -256,6 +257,8 @@ JSON object per diagnostic on stderr for tooling.
 mettle help <topic>
 mettle docs [topic]
 mettle explain <CODE>
+mettle explain <file.mettle> [build flags]
+mettle explain <report.explain.json>
 mettle test <file> [--filter=S]
 mettle trace <file> <fn> [args...]
 mettle pkg <command>
@@ -270,7 +273,8 @@ covers it.
 
 `explain` takes a diagnostic code such as `E0004` or `M0103`, or an
 [`--explain` decision code](explain-json.md) such as `dot-shape-address`.
-`explain list` prints the index.
+`explain list` prints the index. Given a source file or a saved
+`.explain.json`, it opens the [explain TUI](explain.md) instead.
 
 `test` runs the `@test` functions in the compile-time interpreter, with no
 codegen and no linking. `trace` interprets one function and prints a

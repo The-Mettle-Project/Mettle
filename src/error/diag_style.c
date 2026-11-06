@@ -77,12 +77,23 @@ static int diag_stderr_is_tty(void) {
   return fd >= 0 && isatty(fd);
 }
 
+static int g_color_cached = -1;
+static int diag_style_color_decide(void);
+
+void diag_style_set_color(int enabled) { g_color_cached = enabled ? 1 : 0; }
+
 int diag_style_color(void) {
-  static int cached = -1;
+  int cached = g_color_cached;
   if (cached >= 0) {
     return cached;
   }
+  cached = diag_style_color_decide();
+  g_color_cached = cached;
+  return cached;
+}
 
+static int diag_style_color_decide(void) {
+  int cached;
   const char *force = getenv("CLICOLOR_FORCE");
   if (force && force[0] != '\0' && strcmp(force, "0") != 0) {
 #ifdef _WIN32

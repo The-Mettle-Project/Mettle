@@ -528,6 +528,19 @@ static void gpu_note_proof(TypeChecker *checker, const Type *view,
   snprintf(note->detail, sizeof(note->detail), "%s", detail);
 }
 
+size_t type_checker_gpu_type_note_total(void) { return g_gpu_note_total; }
+
+int type_checker_gpu_type_note_at(size_t index, size_t *line,
+                                  const char **owner, const char **detail) {
+  if (index >= g_gpu_note_count) {
+    return 0;
+  }
+  *line = g_gpu_notes[index].line;
+  *owner = g_gpu_notes[index].owner;
+  *detail = g_gpu_notes[index].detail;
+  return 1;
+}
+
 void type_checker_print_gpu_type_report(FILE *out) {
   if (!g_gpu_report || !out) {
     return;

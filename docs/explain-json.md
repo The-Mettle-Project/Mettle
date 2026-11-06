@@ -17,12 +17,17 @@ number it does not know.
 | Field | Type | Contents |
 |-------|------|----------|
 | `schema` | number | Schema version, currently 2 |
-| `source` | string | The entry file |
+| `source` | string | The entry file's name |
+| `path` | string | The entry file's absolute path |
 | `changes` | object | What moved since the last build |
 | `remarks` | array | Every optimization decision |
 | `startHere` | array | The decisions worth acting on first |
 | `safety` | object | `--safe` checks that survived elision |
+| `proven_by_type` | array | Bounds checks a declared type removed |
+| `payoffs` | array | Optimizations a declared type earned |
+| `ownership` | array | Every drop, move and live bit, from [ownership](ownership.md) |
 | `memory` | array | Memory diagnostics for this file |
+| `layout`, `proofs`, `effects`, `rules`, `beliefs` | array | The ledger: layout facts, conversions proven, effects held, rules run, and what the build took on trust |
 | `backend` | object | How much of the program reached the register-allocating backend |
 | `functions` | array | Per-function totals |
 | `loops` | array | Per-loop cost model |
@@ -80,9 +85,11 @@ clone and confirmed it worked.
 
 ## changes
 
-`baseline` is true on a first build, when there is nothing to compare against.
-Otherwise `entries` lists what improved and what regressed since the last
-build of the same file.
+`baseline` is true when an earlier build of the same file left a baseline to
+compare against. `entries` then lists what improved and what regressed since
+that build, each with `kind`, `fn`, `line`, `direction` (`improved` or
+`regressed`) and, for a regression, `reason`. On a first build `baseline` is
+false and `entries` is empty.
 
 ## functions
 
@@ -130,7 +137,38 @@ the functions and lines it touched with a `delta` each.
 ## safety
 
 `enabled` says whether `--safe` was on. `survivors` lists the checks that
-static elision could not remove, which is where the run-time cost lives.
+static elision could not remove, which is where the run-time cost lives: each
+has `line`, `function`, `kind` (`extent`, `span` or `runtime`) and `why`.
+`survivorsTotal` counts them all, since the list stops at its cap. With `--safe`
+on, `accesses`, `proved`, `hoisted`, `spanned`, `exempt`, `extentTests` and
+`regionCalls` give the totals.
+
+## proven_by_type and payoffs
+
+`proven_by_type` lists bounds checks a declared type removed: `line`, `fn`,
+`type`, `min`, `max` and the array `length`. `payoffs` lists other
+optimizations a declared type earned: `line`, `fn`, `type`, `what` and
+`detail`. `provenByTypeTotal` and `payoffsTotal` count past the cap.
+
+## ownership
+
+One entry per record: `kind` (`scope-drop`, `parameter-drop`, `arm-drop`,
+`assign-drop`, `discard-drop`, `temporary`, `glue`, `move`, `live-bit` or
+`drop-runs`), `line`, `column`, `function`, `subject`, `type`, `text` (the Mettle
+the compiler wrote), `reason`, `lowered`, `optimized` and `inserted`.
+
+## The ledger
+
+| Field | Entry fields |
+|-------|--------------|
+| `layout` | `line`, `fn`, `detail`: placement and layout facts the types state |
+| `proofs` | `line`, `type`, `expression`, `route`, `consumer`: conversions into a declared type |
+| `effects` | `fn`, `performs`, `needs` |
+| `rules` | `rule`, `verdict`, `steps` |
+| `beliefs` | `what`, `why`: claims the build took on trust |
+
+Each has a `<name>Total` beside it, such as `beliefsTotal`, that counts past
+the cap of 64 entries.
 
 ## memory
 
@@ -150,5 +188,6 @@ the per-instruction codegen provenance. That is a different schema, and
 
 ## See also
 
+- [mettle explain](explain.md), which reads this file
 - [Compilation](compilation.md)
 - [Diagnostics](diagnostics.md)

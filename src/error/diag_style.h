@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 int diag_style_color(void);
+void diag_style_set_color(int enabled);
 int diag_style_unicode(void);
 
 int diag_style_wrap(void);

@@ -202,6 +202,9 @@ void type_checker_report_proofs(const TypeChecker *checker, FILE *out);
 
 void type_checker_set_gpu_type_report(int enabled);
 void type_checker_print_gpu_type_report(FILE *out);
+size_t type_checker_gpu_type_note_total(void);
+int type_checker_gpu_type_note_at(size_t index, size_t *line,
+                                  const char **owner, const char **detail);
 long long type_checker_proof_steps(const TypeChecker *checker);
 int type_checker_proof_ceiling_hit(const TypeChecker *checker);
 int type_checker_why_proof(const TypeChecker *checker, const char *site,

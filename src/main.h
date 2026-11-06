@@ -59,6 +59,11 @@ typedef struct {
   int explain_all;
   int explain_json;
   const char *explain_filter;
+  int explain_view;
+  int explain_view_text;
+  int explain_view_columns;
+  int explain_view_rows;
+  const char *explain_view_keys;
   int annotate_asm;
   int asm_syntax;
   int annotate_q_lo;

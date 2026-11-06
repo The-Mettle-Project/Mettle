@@ -3,6 +3,8 @@
 
 #include "ir.h"
 
+#include <stdio.h>
+
 typedef struct IRGlobalIntConst {
   const char *name;
   long long value;
@@ -61,6 +63,12 @@ void ir_explain_backend_cost(const char *function_name, const char *filename,
 void ir_explain_target_flush(const char *target_name);
 void ir_explain_set_output_path(const char *path);
 void ir_explain_set_json(int enabled);
+void ir_explain_set_text(int enabled);
+void ir_explain_set_stream(FILE *out);
+void ir_explain_layout_note(size_t line, const char *function_name,
+                            const char *detail);
+void ir_explain_layout_total(size_t total);
+void ir_explain_set_source_path(const char *path);
 void ir_explain_set_filter(const char *selector);
 void ir_explain_set_retain_remarks(int enabled);
 size_t ir_explain_remark_count(void);

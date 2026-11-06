@@ -48,6 +48,7 @@
 #include "ir/ir_twins.h"
 #include "ir/ir_machine.h"
 #include "pkg.h"
+#include "explain/explain_command.h"
 #include "tune.h"
 #include "ir/ir_trace.h"
 #include "ir/ir_explain_ledger.h"
@@ -567,6 +568,8 @@ static int print_help_topic(const char *program_name, const char *argv0,
     printf("  mettle explain <CODE>       extended docs for a code (try: "
            "mettle explain E0004)\n");
     printf("  mettle explain list         index of every code\n");
+    printf("  mettle explain app.mettle   build it with --release and browse "
+           "what the compiler did\n");
     printf("  --error-format=json         one JSON object per diagnostic on "
            "stderr, for editors/CI\n");
     printf("  NO_COLOR / CLICOLOR_FORCE   disable / force ANSI colors\n\n");
@@ -4017,8 +4020,14 @@ static DriverFlagResult parse_flag_diagnostics(CompilerOptions *options,
                                      int argc, char *argv[],
                                      int *index) {
   int i = *index;
+  int explain_flag = options->explain_view
+                         ? mettle_explain_parse_flag(options, argv[i])
+                         : 0;
   (void)argc;
   (void)flags;
+  if (explain_flag != 0) {
+    return explain_flag < 0 ? DRIVER_FLAG_FAILED : DRIVER_FLAG_TAKEN;
+  }
   if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
     options->debug_mode = 1;
     options->generate_debug_symbols = 1;
@@ -4820,7 +4829,23 @@ int main(int argc, char *argv[]) {
     if (run_tool_subcommand(argc, argv, &tool_exit_code)) {
       return tool_exit_code;
     }
-    if (strcmp(argv[1], "explain") == 0) {
+    int explain_target = strcmp(argv[1], "explain") == 0 && argc >= 3
+                             ? mettle_explain_is_view_target(argv[2])
+                             : 0;
+    if (explain_target < 0) {
+      return 1;
+    }
+    if (explain_target > 0) {
+      size_t n = strlen(argv[2]);
+      if (n > 5 && strcmp(argv[2] + n - 5, ".json") == 0) {
+        return mettle_explain_report_file(argc - 2, argv + 2);
+      }
+      options.explain_view = 1;
+      for (int i = 1; i + 1 < argc; i++) {
+        argv[i] = argv[i + 1];
+      }
+      argc--;
+    } else if (strcmp(argv[1], "explain") == 0) {
       if (argc >= 4) {
         return explain_rule_code(argv[2], argv[3]);
       }
@@ -5164,6 +5189,17 @@ int main(int argc, char *argv[]) {
 
   options.building_executable =
       flags.build_executable || options.live_patch_target != NULL;
+
+  if (options.explain_view) {
+    int viewed = mettle_explain_view(&options);
+    free(build_output_filename);
+    free(object_output_filename);
+    free((void *)options.import_directories);
+    free((void *)options.link_arguments);
+    free(auto_stdlib_directory);
+    free(auto_runtime_directory);
+    return viewed;
+  }
 
   double command_profile_start =
       options.profile ? compiler_profile_now_ms() : 0.0;
@@ -6060,6 +6096,15 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
       options->explain_all ? NULL : options->input_filename;
   ir_explain_set_output_path(options->output_filename);
   ir_explain_set_json(options->explain_json ? 1 : 0);
+  ir_explain_set_text(options->explain_view ? 0 : 1);
+  {
+    static char *source_path = NULL;
+    free(source_path);
+    source_path = options->input_filename
+                      ? mettle_realpath(options->input_filename, NULL)
+                      : NULL;
+    ir_explain_set_source_path(source_path);
+  }
   ir_explain_set_filter(options->explain_filter);
   if (options->explain_json && !options->annotate_asm) {
     mir_annotate_set_enabled(1);
@@ -7129,8 +7174,19 @@ static int compile_stage_type_reports(CompileContext *ctx) {
   if (options->report_proofs) {
     type_checker_report_proofs(ctx->type_checker, stdout);
   }
-  if (options->report_gpu_types || options->explain || options->explain_all) {
-    type_checker_print_gpu_type_report(stderr);
+  if (options->explain_view) {
+    size_t line = 0;
+    const char *owner = NULL;
+    const char *detail = NULL;
+    for (size_t i = 0;
+         type_checker_gpu_type_note_at(i, &line, &owner, &detail); i++) {
+      ir_explain_layout_note(line, owner, detail);
+    }
+    ir_explain_layout_total(type_checker_gpu_type_note_total());
+  } else if (options->report_gpu_types || options->explain ||
+             options->explain_all) {
+    type_checker_print_gpu_type_report(options->explain_view_text ? stdout
+                                                                  : stderr);
   }
   if (options->why_mode && options->why_subject &&
       (options->why_subject[0] >= '0' && options->why_subject[0] <= '9')) {
