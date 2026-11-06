@@ -156,6 +156,8 @@ typedef struct {
   size_t proof_log_capacity;
   struct TypeCheckerBorrowFact *borrow_facts;
   size_t borrow_fact_count;
+  size_t *borrow_fact_index;
+  size_t borrow_fact_slots;
 } TypeChecker;
 
 typedef struct TypeCheckerBorrowFact {

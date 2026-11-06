@@ -2698,6 +2698,70 @@ static int mem_string_expr_is_fresh(const TypeChecker *checker,
   return type_checker_callee_returns_fresh(checker, call->function_name);
 }
 
+static size_t mem_fact_hash(const char *name) {
+  size_t hash = 1469598103934665603ull;
+  for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+    hash = (hash ^ *p) * 1099511628211ull;
+  }
+  return hash;
+}
+
+static void mem_index_facts(TypeChecker *checker) {
+  size_t slots = 16;
+  free(checker->borrow_fact_index);
+  checker->borrow_fact_index = NULL;
+  checker->borrow_fact_slots = 0;
+  while (slots < checker->borrow_fact_count * 2) {
+    slots <<= 1;
+  }
+  size_t *index = malloc(slots * sizeof(size_t));
+  if (!index) {
+    return;
+  }
+  for (size_t s = 0; s < slots; s++) {
+    index[s] = SIZE_MAX;
+  }
+  for (size_t i = 0; i < checker->borrow_fact_count; i++) {
+    const char *name = checker->borrow_facts[i].name;
+    size_t s = name ? mem_fact_hash(name) & (slots - 1) : 0;
+    while (name && index[s] != SIZE_MAX &&
+           strcmp(checker->borrow_facts[index[s]].name, name) != 0) {
+      s = (s + 1) & (slots - 1);
+    }
+    if (name && index[s] == SIZE_MAX) {
+      index[s] = i;
+    }
+  }
+  checker->borrow_fact_index = index;
+  checker->borrow_fact_slots = slots;
+}
+
+static const TypeCheckerBorrowFact *mem_find_fact(const TypeChecker *checker,
+                                                  const char *callee) {
+  if (!checker || !callee) {
+    return NULL;
+  }
+  if (!checker->borrow_fact_index) {
+    for (size_t i = 0; i < checker->borrow_fact_count; i++) {
+      if (checker->borrow_facts[i].name &&
+          strcmp(checker->borrow_facts[i].name, callee) == 0) {
+        return &checker->borrow_facts[i];
+      }
+    }
+    return NULL;
+  }
+  size_t mask = checker->borrow_fact_slots - 1;
+  for (size_t s = mem_fact_hash(callee) & mask;
+       checker->borrow_fact_index[s] != SIZE_MAX; s = (s + 1) & mask) {
+    const TypeCheckerBorrowFact *fact =
+        &checker->borrow_facts[checker->borrow_fact_index[s]];
+    if (strcmp(fact->name, callee) == 0) {
+      return fact;
+    }
+  }
+  return NULL;
+}
+
 static int mem_returns_are_fresh(const TypeChecker *checker,
                                  const ASTNode *node, int *seen) {
   if (!node || node->type == AST_LAMBDA_EXPRESSION) {
@@ -2806,9 +2870,10 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
     }
   }
 
-  if (checker->borrow_facts) {
-    free(checker->borrow_facts);
-  }
+  free(checker->borrow_facts);
+  free(checker->borrow_fact_index);
+  checker->borrow_fact_index = NULL;
+  checker->borrow_fact_slots = 0;
   checker->borrow_facts = calloc(table.count, sizeof(TypeCheckerBorrowFact));
   checker->borrow_fact_count = 0;
   if (checker->borrow_facts) {
@@ -2831,6 +2896,7 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
           mem_fn_may_return_fresh(decls[i]);
       checker->borrow_fact_count++;
     }
+    mem_index_facts(checker);
     mem_settle_returns_fresh(checker, decls, table.count);
   }
 
@@ -2880,47 +2946,23 @@ int type_checker_check_program_memory(TypeChecker *checker, ASTNode *program) {
 
 int type_checker_callee_returns_fresh(const TypeChecker *checker,
                                       const char *callee) {
-  if (!checker || !callee) {
-    return 0;
-  }
-  for (size_t i = 0; i < checker->borrow_fact_count; i++) {
-    if (checker->borrow_facts[i].name &&
-        strcmp(checker->borrow_facts[i].name, callee) == 0) {
-      return checker->borrow_facts[i].returns_fresh;
-    }
-  }
-  return 0;
+  const TypeCheckerBorrowFact *fact = mem_find_fact(checker, callee);
+  return fact && fact->returns_fresh;
 }
 
 int type_checker_callee_hands_back(const TypeChecker *checker,
                                    const char *callee, size_t index) {
-  if (!checker || !callee || index >= MEM_MAX_PARAMS) {
-    return 0;
-  }
-  for (size_t i = 0; i < checker->borrow_fact_count; i++) {
-    if (checker->borrow_facts[i].name &&
-        strcmp(checker->borrow_facts[i].name, callee) == 0) {
-      unsigned bit = 1u << index;
-      return checker->borrow_facts[i].handed_back == bit &&
-             (checker->borrow_facts[i].stores_elsewhere & bit) == 0u &&
-             (checker->borrow_facts[i].frees & bit) == 0u;
-    }
-  }
-  return 0;
+  const TypeCheckerBorrowFact *fact =
+      index < MEM_MAX_PARAMS ? mem_find_fact(checker, callee) : NULL;
+  unsigned bit = 1u << index;
+  return fact && fact->handed_back == bit &&
+         (fact->stores_elsewhere & bit) == 0u && (fact->frees & bit) == 0u;
 }
 
 int type_checker_callee_borrows(const TypeChecker *checker, const char *callee,
                                 size_t index) {
-  if (!checker || !callee || index >= MEM_MAX_PARAMS) {
-    return 0;
-  }
-  for (size_t i = 0; i < checker->borrow_fact_count; i++) {
-    if (checker->borrow_facts[i].name &&
-        strcmp(checker->borrow_facts[i].name, callee) == 0) {
-      unsigned bit = 1u << index;
-      return (checker->borrow_facts[i].stores & bit) == 0u &&
-             (checker->borrow_facts[i].frees & bit) == 0u;
-    }
-  }
-  return 0;
+  const TypeCheckerBorrowFact *fact =
+      index < MEM_MAX_PARAMS ? mem_find_fact(checker, callee) : NULL;
+  unsigned bit = 1u << index;
+  return fact && (fact->stores & bit) == 0u && (fact->frees & bit) == 0u;
 }

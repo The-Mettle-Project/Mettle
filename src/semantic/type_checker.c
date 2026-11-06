@@ -176,6 +176,7 @@ void type_checker_destroy(TypeChecker *checker) {
     }
     free(checker->proof_log);
     free(checker->borrow_facts);
+    free(checker->borrow_fact_index);
     free(checker->loop_trips);
     type_destroy(checker->builtin_int8);
     type_destroy(checker->builtin_int16);
