@@ -1,0 +1,9 @@
+import "std/io";
+import "std/math";
+fn main() -> int32 {
+  var a: float64 = fract(-1.0e-20);
+  var b: float64 = fract(-2.5);
+  var c: float64 = fract(3.75);
+  println("{a < 1.0} {b} {c} {fract(-0.0)} {f64_bits(a)}");
+  return 0;
+}
