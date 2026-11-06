@@ -5498,6 +5498,58 @@ static void adapt_wrap_value(ASTNode **slot, ASTNode *owner,
                        program, prog, had_error);
 }
 
+static const char *adapt_call_result_type(CallExpression *maker,
+                                          ASTNode **top_decls, size_t top_count,
+                                          const AdaptLocals *locals,
+                                          Program *prog) {
+  FunctionDeclaration *made = NULL;
+  const char *receiver = NULL;
+  char method[256];
+  size_t length = 0;
+  if (!maker || !maker->function_name) {
+    return NULL;
+  }
+  if (!maker->object) {
+    made = adapt_fn_index_find(top_decls, top_count, maker->function_name,
+                               (long long)maker->argument_count);
+    return made ? made->return_type : NULL;
+  }
+  receiver = adapt_expression_type(maker->object, locals, prog);
+  if (!receiver) {
+    return NULL;
+  }
+  length = strlen(receiver);
+  while (length > 0 && receiver[length - 1] == '*') {
+    length--;
+  }
+  snprintf(method, sizeof(method), "%.*s_%s", (int)length, receiver,
+           maker->function_name);
+  made = adapt_fn_index_find(top_decls, top_count, method,
+                             (long long)maker->argument_count + 1);
+  if (!made) {
+    snprintf(method, sizeof(method), "%.*s_%s__ptr", (int)length, receiver,
+             maker->function_name);
+    made = adapt_fn_index_find(top_decls, top_count, method,
+                               (long long)maker->argument_count + 1);
+  }
+  return made ? made->return_type : NULL;
+}
+
+static void adapt_wrap_arguments(ASTNode **arguments, size_t count,
+                                 ASTNode *owner, FunctionDeclaration *fd,
+                                 const char *callee, ASTNode **top_decls,
+                                 size_t top_count, AdaptCache *cache,
+                                 ASTNode *program, Program *prog,
+                                 int *had_error) {
+  for (size_t a = 0; a < count && (fd || callee); a++) {
+    const char *expected = fd ? fd->parameter_types[a] : adapt_fn_type_param(callee, a);
+    if (expected) {
+      adapt_wrap_value(&arguments[a], owner, expected, top_decls, top_count,
+                       cache, program, prog, had_error);
+    }
+  }
+}
+
 static void adapt_walk(ASTNode *node, const char *current_return_type,
                        ASTNode **top_decls, size_t top_count,
                        AdaptCache *cache, ASTNode *program, Program *prog,
@@ -5531,37 +5583,33 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
   } else if (node->type == AST_FUNC_PTR_CALL) {
     FuncPtrCall *fp_call = (FuncPtrCall *)node->data;
     const char *callee = fp_call ? adapt_expression_type(fp_call->function, locals, prog) : NULL;
-    for (size_t a = 0; callee && a < fp_call->argument_count; a++) {
-      const char *expected = adapt_fn_type_param(callee, a);
-      if (expected) {
-        adapt_wrap_value(&fp_call->arguments[a], node, expected, top_decls,
-                         top_count, cache, program, prog, had_error);
-      }
+    if (!callee && fp_call && fp_call->function &&
+        fp_call->function->type == AST_FUNCTION_CALL) {
+      callee = adapt_call_result_type((CallExpression *)fp_call->function->data,
+                                      top_decls, top_count, locals, prog);
+    }
+    if (fp_call) {
+      adapt_wrap_arguments(fp_call->arguments, fp_call->argument_count, node,
+                           NULL, callee, top_decls, top_count, cache, program,
+                           prog, had_error);
     }
   } else if (node->type == AST_FUNCTION_CALL) {
     CallExpression *call = (CallExpression *)node->data;
+    FunctionDeclaration *fd =
+        call && !call->object && call->function_name
+            ? adapt_fn_index_find(top_decls, top_count, call->function_name,
+                                  (long long)call->argument_count)
+            : NULL;
+    const char *callee = NULL;
     if (call && call->object && call->function_name) {
-      const char *callee = adapt_field_type(prog, adapt_expression_type(call->object, locals, prog), call->function_name);
-      for (size_t a = 0; callee && a < call->argument_count; a++) {
-        const char *expected = adapt_fn_type_param(callee, a);
-        if (expected) {
-          adapt_wrap_value(&call->arguments[a], node, expected, top_decls,
-                           top_count, cache, program, prog, had_error);
-        }
-      }
+      callee = adapt_field_type(prog, adapt_expression_type(call->object, locals, prog), call->function_name);
+    } else if (call && !fd && call->function_name) {
+      callee = adapt_local_type(locals, call->function_name);
     }
-    if (call && !call->object && call->function_name) {
-      FunctionDeclaration *fd =
-          adapt_fn_index_find(top_decls, top_count, call->function_name,
-                              (long long)call->argument_count);
-      const char *callee = fd ? NULL : adapt_local_type(locals, call->function_name);
-      for (size_t a = 0; a < call->argument_count && (fd || callee); a++) {
-        const char *expected = fd ? fd->parameter_types[a] : adapt_fn_type_param(callee, a);
-        if (expected) {
-          adapt_wrap_value(&call->arguments[a], node, expected, top_decls,
-                           top_count, cache, program, prog, had_error);
-        }
-      }
+    if (call) {
+      adapt_wrap_arguments(call->arguments, call->argument_count, node, fd,
+                           callee, top_decls, top_count, cache, program, prog,
+                           had_error);
     }
   }
 

@@ -270,6 +270,26 @@ static int type_checker_refuse_bare_pointer(TypeChecker *checker,
   return 1;
 }
 
+static void type_checker_report_fn_kind_mismatch(
+    TypeChecker *checker, SourceLocation where, size_t span_length,
+    Type *dest_type, Type *src_type, const char *expected, const char *actual) {
+  char expected_kind[256];
+  char actual_kind[256];
+  if (dest_type && src_type && dest_type->kind == TYPE_FUNCTION_POINTER &&
+      src_type->kind == TYPE_FUNCTION_POINTER && strcmp(expected, actual) == 0 &&
+      strncmp(expected + 1, "n(", 2) == 0 &&
+      (dest_type->closure_env != NULL) != (src_type->closure_env != NULL)) {
+    snprintf(expected_kind, sizeof(expected_kind), "%s%s",
+             dest_type->closure_env ? "Fn" : "fn", expected + 2);
+    snprintf(actual_kind, sizeof(actual_kind), "%s%s",
+             src_type->closure_env ? "Fn" : "fn", actual + 2);
+    expected = expected_kind;
+    actual = actual_kind;
+  }
+  type_checker_report_type_mismatch_span(checker, where, span_length, expected,
+                                         actual);
+}
+
 void type_checker_report_assign_mismatch(TypeChecker *checker,
                                          const ASTNode *src_expr,
                                          SourceLocation location,
@@ -337,8 +357,8 @@ void type_checker_report_assign_mismatch(TypeChecker *checker,
     return;
   }
   if (!is_integer_pair) {
-    type_checker_report_type_mismatch_span(checker, where, span_length,
-                                           expected, actual);
+    type_checker_report_fn_kind_mismatch(checker, where, span_length, dest_type,
+                                         src_type, expected, actual);
     return;
   }
 
