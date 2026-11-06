@@ -97,6 +97,8 @@ export struct ProcOptions {
   stdin: int32;      // PROC_INHERIT, PROC_PIPE or PROC_NULL
   stdout: int32;     // PROC_INHERIT, PROC_PIPE or PROC_NULL
   stderr: int32;     // the same, or PROC_TO_STDOUT
+  use_pty: int32;    // 1: run on the pty slave in pty_fd as its terminal (Linux)
+  pty_fd: int64;     // a slave from pty_open, used only when use_pty is 1
 }
 
 // A running (or finished) child. The pipe fields hold the parent's ends of
@@ -295,6 +297,7 @@ export fn proc_spawn(opts: ProcOptions*, out: Proc*) -> int64 {
   out->stdin_fd = -1;
   out->stdout_fd = -1;
   out->stderr_fd = -1;
+  if (opts->use_pty != 0) { return -50; }   // ERROR_NOT_SUPPORTED: std/pty is Linux only for now
   if (opts->stdin == PROC_TO_STDOUT || opts->stdout == PROC_TO_STDOUT) { return -PROC_EINVAL; }
   var nargs: int64 = (int64)opts->argv.length;
   if (nargs == 0) { return -PROC_EINVAL; }
