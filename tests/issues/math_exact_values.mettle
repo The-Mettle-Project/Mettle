@@ -1,0 +1,21 @@
+import "std/io";
+import "std/math";
+fn main() -> int32 {
+  var bad: int64 = 0;
+  for n in -60..61 {
+    var x: float64 = (float64)n;
+    if (exp2(x) != ldexp(1.0, (int32)n)) { bad = bad + 1; println("exp2 {n}"); }
+    if (log2(ldexp(1.0, (int32)n)) != x) { bad = bad + 1; println("log2 {n}"); }
+  }
+  var p: float64 = 1.0;
+  for n in 0..23 {
+    if (log10(p) != (float64)n) { println("log10 {n} {log10(p)}"); bad = bad + 1; }
+    p = p * 10.0;
+  }
+  for n in 1..50 {
+    var c: float64 = (float64)(n * n * n);
+    if (cbrt(c) != (float64)n) { println("cbrt {n} {cbrt(c)}"); bad = bad + 1; }
+  }
+  println("{bad} {exp(0.0)} {log(1.0)} {exp(1.0)} {sin(0.0)} {cos(0.0)} {atan2(0.0, -1.0)} {tanh(0.0)}");
+  return 0;
+}

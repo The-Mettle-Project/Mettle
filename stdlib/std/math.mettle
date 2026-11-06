@@ -471,13 +471,12 @@ export fn log10(x: float64) -> float64 {
   if (x == 0.0) { return -INF(); }
   if (is_inf(x) != 0) { return x; }
 
-  var e: int32 = 0;
-  var m: float64 = frexp(x, &e);
-  if (m < SQRT1_2()) {
-    m = m * 2.0;
-    e = e - 1;
-  }
-  return (float64)e * LOG10_2() + log_kernel(m) * LOG10E();
+  var log_lo: float64 = 0.0;
+  var log_hi: float64 = pow_log_dd(x, &log_lo);
+  var lo: float64 = 0.0;
+  var hi: float64 = dd_mul(log_hi, log_lo, 0.4342944819032518,
+                           1.098319650216765e-17, &lo);
+  return hi + lo;
 }
 
 export fn log1p(x: float64) -> float64 {

@@ -21725,6 +21725,8 @@ $issueRegressions = @(
   @{ Name = "sqrt_is_correctly_rounded"; Entry = "tests/issues/sqrt_is_correctly_rounded.mettle"; Args = @(); Expect = @("-6405850069211988089 4609047870845172685 4.0") },
   @{ Name = "sqrt_is_correctly_rounded_release"; Entry = "tests/issues/sqrt_is_correctly_rounded.mettle"; Args = @("--release"); Expect = @("-6405850069211988089 4609047870845172685 4.0") },
   @{ Name = "pow_within_one_ulp"; Entry = "tests/issues/pow_within_one_ulp.mettle"; Args = @(); Expect = @("0 1024.0 0.125 -8.0 nan -inf") },
+  @{ Name = "math_exact_values"; Entry = "tests/issues/math_exact_values.mettle"; Args = @(); Expect = @("0 1.0 0.0 2.718282 0.0 1.0 3.141593 0.0") },
+  @{ Name = "math_exact_values_release"; Entry = "tests/issues/math_exact_values.mettle"; Args = @("--release"); Expect = @("0 1.0 0.0 2.718282 0.0 1.0 3.141593 0.0") },
   @{ Name = "pow_within_one_ulp_release"; Entry = "tests/issues/pow_within_one_ulp.mettle"; Args = @("--release"); Expect = @("0 1024.0 0.125 -8.0 nan -inf") },
   @{ Name = "rounding_keeps_negative_zero_release"; Entry = "tests/issues/rounding_keeps_negative_zero.mettle"; Args = @("--release"); Expect = @("1 1 1 1 1 0 -1.0 1.0 -1.0 3.0") },
   @{ Name = "trait_call_on_indexed_receiver"; Entry = "tests/issues/trait_call_on_indexed_receiver.mettle"; Args = @(); Expect = @("14 27 4 36 9") },
