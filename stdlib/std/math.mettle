@@ -1232,7 +1232,12 @@ export fn isign(x: int64) -> int64 {
 }
 
 export fn ipow(base: int64, exponent: int32) -> int64 {
-  if (exponent < 0) { return 0; }
+  if (exponent < 0) {
+    if (base == 1) { return 1; }
+    if (base == -1 && (exponent & 1) != 0) { return -1; }
+    if (base == -1) { return 1; }
+    return 0;
+  }
   var result: int64 = 1;
   var b: int64 = base;
   var e: int32 = exponent;

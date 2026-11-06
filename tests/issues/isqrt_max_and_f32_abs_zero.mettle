@@ -3,5 +3,6 @@ import "std/math";
 fn main() -> int32 {
   var neg: float32 = -0.0;
   println("{isqrt(9223372036854775807)} {isqrt(9223372030926249001)} {isqrt(9223372030926249000)} {isqrt(15)} {isqrt(16)} {isqrt(1)} {signbit((float64)f32_abs(neg))}");
+  println("{ipow(1, -3)} {ipow(-1, -3)} {ipow(-1, -4)} {ipow(2, -1)} {ipow(-3, 3)}");
   return 0;
 }
