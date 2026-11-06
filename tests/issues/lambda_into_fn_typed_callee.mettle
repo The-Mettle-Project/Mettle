@@ -1,0 +1,11 @@
+import "std/io";
+struct Holder { f: Fn(Fn(int64) -> int64) -> int64; }
+fn twice(f: Fn(Fn(int64) -> int64) -> int64) -> int64 { return f(fn(z: int64) -> int64 { return z + 1; }) * 2; }
+fn main() -> int32 {
+  var k: int64 = 5;
+  var g: Fn(Fn(int64) -> int64) -> int64 = fn(h: Fn(int64) -> int64) -> int64 { return h(20); };
+  var hs: Holder;
+  hs.f = fn(h: Fn(int64) -> int64) -> int64 { return h(3) + k; };
+  println("{g(fn(z: int64) -> int64 { return z + 1; })} {twice(g)} {hs.f(fn(z: int64) -> int64 { return z * 7; })}");
+  return 0;
+}

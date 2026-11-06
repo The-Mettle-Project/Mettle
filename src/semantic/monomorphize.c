@@ -5221,31 +5221,69 @@ typedef struct {
   size_t capacity;
 } AdaptLocals;
 
+static void adapt_locals_add(AdaptLocals *locals, const char *name,
+                             const char *type_name) {
+  if (!name || !type_name) {
+    return;
+  }
+  if (locals->count == locals->capacity) {
+    size_t grown = locals->capacity ? locals->capacity * 2 : 8;
+    AdaptLocalType *items = (AdaptLocalType *)realloc(
+        locals->items, grown * sizeof(AdaptLocalType));
+    if (!items) {
+      return;
+    }
+    locals->items = items;
+    locals->capacity = grown;
+  }
+  locals->items[locals->count].name = name;
+  locals->items[locals->count].type_name = type_name;
+  locals->count++;
+}
+
 static void adapt_locals_collect(ASTNode *node, AdaptLocals *locals) {
   if (!node) {
     return;
   }
   if (node->type == AST_VAR_DECLARATION) {
     VarDeclaration *vd = (VarDeclaration *)node->data;
-    if (vd && vd->name && vd->type_name) {
-      if (locals->count == locals->capacity) {
-        size_t grown = locals->capacity ? locals->capacity * 2 : 8;
-        AdaptLocalType *items = (AdaptLocalType *)realloc(
-            locals->items, grown * sizeof(AdaptLocalType));
-        if (!items) {
-          return;
-        }
-        locals->items = items;
-        locals->capacity = grown;
-      }
-      locals->items[locals->count].name = vd->name;
-      locals->items[locals->count].type_name = vd->type_name;
-      locals->count++;
+    if (vd) {
+      adapt_locals_add(locals, vd->name, vd->type_name);
     }
   }
   for (size_t i = 0; i < node->child_count; i++) {
     adapt_locals_collect(node->children[i], locals);
   }
+}
+
+static const char *adapt_fn_type_param(const char *type, size_t index) {
+  const char *p = NULL;
+  const char *start = NULL;
+  size_t at = 0;
+  int depth = 0;
+  if (!type || (strncmp(type, "Fn(", 3) != 0 && strncmp(type, "fn(", 3) != 0)) {
+    return NULL;
+  }
+  start = type + 3;
+  for (p = start; *p; p++) {
+    int closing = depth == 0 && *p == ')';
+    if ((*p == ',' && depth == 0) || closing) {
+      if (at == index) {
+        while (start < p && *start == ' ') {
+          start++;
+        }
+        return p > start ? string_intern_n(start, (size_t)(p - start)) : NULL;
+      }
+      if (closing) {
+        return NULL;
+      }
+      at++;
+      start = p + 1;
+      continue;
+    }
+    depth += mono_nesting_step(type, p);
+  }
+  return NULL;
 }
 
 static const char *adapt_local_type(const AdaptLocals *locals,
@@ -5490,17 +5528,38 @@ static void adapt_walk(ASTNode *node, const char *current_return_type,
                        adapt_assignment_target_type(assign, locals, prog),
                        top_decls, top_count, cache, program, prog, had_error);
     }
+  } else if (node->type == AST_FUNC_PTR_CALL) {
+    FuncPtrCall *fp_call = (FuncPtrCall *)node->data;
+    const char *callee = fp_call ? adapt_expression_type(fp_call->function, locals, prog) : NULL;
+    for (size_t a = 0; callee && a < fp_call->argument_count; a++) {
+      const char *expected = adapt_fn_type_param(callee, a);
+      if (expected) {
+        adapt_wrap_value(&fp_call->arguments[a], node, expected, top_decls,
+                         top_count, cache, program, prog, had_error);
+      }
+    }
   } else if (node->type == AST_FUNCTION_CALL) {
     CallExpression *call = (CallExpression *)node->data;
+    if (call && call->object && call->function_name) {
+      const char *callee = adapt_field_type(prog, adapt_expression_type(call->object, locals, prog), call->function_name);
+      for (size_t a = 0; callee && a < call->argument_count; a++) {
+        const char *expected = adapt_fn_type_param(callee, a);
+        if (expected) {
+          adapt_wrap_value(&call->arguments[a], node, expected, top_decls,
+                           top_count, cache, program, prog, had_error);
+        }
+      }
+    }
     if (call && !call->object && call->function_name) {
       FunctionDeclaration *fd =
           adapt_fn_index_find(top_decls, top_count, call->function_name,
                               (long long)call->argument_count);
-      if (fd) {
-        for (size_t a = 0; a < call->argument_count; a++) {
-          adapt_wrap_value(&call->arguments[a], node, fd->parameter_types[a],
-                           top_decls, top_count, cache, program, prog,
-                           had_error);
+      const char *callee = fd ? NULL : adapt_local_type(locals, call->function_name);
+      for (size_t a = 0; a < call->argument_count && (fd || callee); a++) {
+        const char *expected = fd ? fd->parameter_types[a] : adapt_fn_type_param(callee, a);
+        if (expected) {
+          adapt_wrap_value(&call->arguments[a], node, expected, top_decls,
+                           top_count, cache, program, prog, had_error);
         }
       }
     }
@@ -5518,6 +5577,10 @@ static void adapt_process_fn(ASTNode *fnnode, ASTNode **top_decls,
   AdaptLocals locals = {0};
   if (!fd || !fd->body)
     return;
+  for (size_t i = 0; i < fd->parameter_count; i++) {
+    adapt_locals_add(&locals, fd->parameter_names ? fd->parameter_names[i] : NULL,
+                     fd->parameter_types[i]);
+  }
   adapt_locals_collect(fd->body, &locals);
   adapt_walk(fd->body, fd->return_type, top_decls, top_count, cache, program,
             prog, had_error, &locals);
