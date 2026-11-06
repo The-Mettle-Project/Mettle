@@ -1435,6 +1435,47 @@ static int ir_memcmp_byte_loop_tail_is_zero_return(const IRFunction *function,
   return saw_exit_label && saw_return;
 }
 
+static int ir_memcmp_name_declared_in(const IRFunction *function, size_t lo,
+                                      size_t hi, const char *name) {
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL &&
+        ir_operand_is_symbol_named(&ins->dest, name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_memcmp_byte_loop_body_is_pure(const IRFunction *function,
+                                            const IRWhileLoopBounds *bounds,
+                                            const char *iv_symbol) {
+  int unit_steps = 0;
+  for (size_t i = bounds->branch_index + 1; i < bounds->jump_index; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_NOP || ins->op == IR_OP_RETURN) {
+      continue;
+    }
+    if (ir_instruction_has_side_effect(ins)) {
+      return 0;
+    }
+    if (!ir_instruction_writes_destination(ins) ||
+        !ir_operand_is_symbol(&ins->dest)) {
+      continue;
+    }
+    if (strcmp(ins->dest.name, iv_symbol) == 0) {
+      if (!ir_try_parse_direct_unit_increment(ins, iv_symbol)) {
+        return 0;
+      }
+      unit_steps++;
+    } else if (!ir_memcmp_name_declared_in(function, bounds->branch_index + 1,
+                                           bounds->jump_index, ins->dest.name)) {
+      return 0;
+    }
+  }
+  return unit_steps == 1;
+}
+
 static int ir_try_memcmp_byte_loop_function(IRFunction *function,
                                             int *changed) {
   const char *a_symbol = NULL;
@@ -1548,7 +1589,8 @@ static int ir_try_memcmp_byte_loop_function(IRFunction *function,
       ir_memcmp_byte_loop_tail_is_zero_return(function, exit_label_index);
 
   if (!saw_a_load || !saw_b_load || !saw_neq || !saw_diff_return ||
-      !saw_zero_return) {
+      !saw_zero_return ||
+      !ir_memcmp_byte_loop_body_is_pure(function, &bounds, iv_symbol)) {
     return 1;
   }
 
@@ -1570,15 +1612,25 @@ static int ir_try_memcmp_byte_loop_function(IRFunction *function,
     call.arguments[1] = ir_operand_symbol(b_symbol);
     call.arguments[2] = ir_operand_symbol(len_symbol);
 
-    cast.op = IR_OP_CAST;
+    IRInstruction high = {0};
+    high.op = IR_OP_BINARY;
+    high.location = call.location;
+    high.dest = ir_operand_temp("__memcmp_result_high");
+    high.lhs = ir_operand_temp("__memcmp_result_i32");
+    high.rhs = ir_operand_int(32);
+    high.text = mettle_strdup("<<");
+
+    cast.op = IR_OP_BINARY;
     cast.location = call.location;
     cast.dest = ir_operand_temp("__memcmp_result_i64");
-    cast.lhs = ir_operand_temp("__memcmp_result_i32");
-    cast.text = mettle_strdup("int64");
-    if (!cast.text) {
+    cast.lhs = ir_operand_temp("__memcmp_result_high");
+    cast.rhs = ir_operand_int(32);
+    cast.text = mettle_strdup(">>");
+    if (!cast.text || !high.text || header_index + 3 >= function->instruction_count) {
       ir_instruction_destroy_storage(&call);
+      ir_instruction_destroy_storage(&high);
       ir_instruction_destroy_storage(&cast);
-      return 0;
+      return !cast.text || !high.text ? 0 : 1;
     }
 
     ret.op = IR_OP_RETURN;
@@ -1588,10 +1640,12 @@ static int ir_try_memcmp_byte_loop_function(IRFunction *function,
     ir_instruction_destroy_storage(&function->instructions[header_index]);
     function->instructions[header_index] = call;
     ir_instruction_destroy_storage(&function->instructions[header_index + 1]);
-    function->instructions[header_index + 1] = cast;
+    function->instructions[header_index + 1] = high;
     ir_instruction_destroy_storage(&function->instructions[header_index + 2]);
-    function->instructions[header_index + 2] = ret;
-    for (size_t i = header_index + 3; i < function->instruction_count; i++) {
+    function->instructions[header_index + 2] = cast;
+    ir_instruction_destroy_storage(&function->instructions[header_index + 3]);
+    function->instructions[header_index + 3] = ret;
+    for (size_t i = header_index + 4; i < function->instruction_count; i++) {
       ir_instruction_make_nop(&function->instructions[i]);
     }
   }

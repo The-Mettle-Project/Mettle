@@ -21720,6 +21720,8 @@ $issueRegressions = @(
   @{ Name = "popcount_buffer_fuse_checks_the_body_opt"; Entry = "tests/issues/popcount_buffer_fuse_checks_the_body.mettle"; Args = @("-O"); Expect = @("16936 454 261 261") },
   @{ Name = "word_count_fold_checks_the_body"; Entry = "tests/issues/word_count_fold_checks_the_body.mettle"; Args = @(); Expect = @("9 6007 20 6") },
   @{ Name = "word_count_fold_checks_the_body_release"; Entry = "tests/issues/word_count_fold_checks_the_body.mettle"; Args = @("--release"); Expect = @("9 6007 20 6") },
+  @{ Name = "memcmp_fold_checks_the_loop"; Entry = "tests/issues/memcmp_fold_checks_the_loop.mettle"; Args = @(); Expect = @("-2 25 0 -23 3 0") },
+  @{ Name = "memcmp_fold_checks_the_loop_release"; Entry = "tests/issues/memcmp_fold_checks_the_loop.mettle"; Args = @("--release"); Expect = @("-2 25 0 -23 3 0") },
   @{ Name = "simd_kernels_stay_in_bounds"; Entry = "tests/issues/simd_kernels_stay_in_bounds.mettle"; Args = @(); Expect = @("5307900274032702030 0 544298947873657325") },
   @{ Name = "simd_kernels_stay_in_bounds_release"; Entry = "tests/issues/simd_kernels_stay_in_bounds.mettle"; Args = @("--release"); Expect = @("5307900274032702030 0 544298947873657325") },
   @{ Name = "insertion_sort_fold_checks_signedness"; Entry = "tests/issues/insertion_sort_fold_checks_signedness.mettle"; Args = @(); Expect = @("-8629474113019807376") },
