@@ -172,7 +172,9 @@ int ir_lower_switch_statement(IRLoweringContext *context,
 
   IROperand switch_value = ir_operand_none();
   if (!ir_lower_expression(context, function, switch_data->expression,
-                           &switch_value)) {
+                           &switch_value) ||
+      !ir_ownership_after_unit(context, function, switch_data->expression,
+                               switch_data->expression->location)) {
     free(end_label);
     return 0;
   }
@@ -387,7 +389,9 @@ int ir_lower_match_statement(IRLoweringContext *context,
   }
 
   if (!ir_lower_expression(context, function, match->expression,
-                           &subject_value)) {
+                           &subject_value) ||
+      !ir_ownership_after_unit(context, function, match->expression,
+                               match->expression->location)) {
     return 0;
   }
 
@@ -605,6 +609,11 @@ int ir_lower_match_statement(IRLoweringContext *context,
       ir_operand_destroy(&payload_address);
     }
 
+    if (!ir_ownership_after_unit(context, function, arm,
+                                 arm->body ? arm->body->location
+                                           : statement->location)) {
+      goto cleanup;
+    }
     if (arm->body &&
         !ir_lower_statement_with_defers(context, function, arm->body, defers)) {
       goto cleanup;
@@ -807,7 +816,10 @@ int ir_lower_yield_statement(IRLoweringContext *context, IRFunction *function,
     }
     frame = &context->value_frames[frame_index];
   }
-  if (!ir_emit_defers_until_scope(context, function, defers, frame->defers)) {
+  if (!ir_ownership_after_unit(context, function, statement,
+                               statement->location) ||
+      !ir_emit_defers_at_exit(context, function, defers, frame->defers,
+                              statement)) {
     return 0;
   }
   return ir_emit_jump_instruction(context, function, frame->end_label,

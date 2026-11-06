@@ -157,6 +157,8 @@ static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node
   dst->meta_optimized = src->meta_optimized;
   dst->meta_point = src->meta_point;
   dst->generated_by = src->generated_by;
+  dst->is_explicit = src->is_explicit;
+  dst->ownership_role = src->ownership_role;
   dst->name = ast_intern_string(src->name);
   dst->return_type = ast_intern_string(src->return_type);
   dst->return_type_count = src->return_type_count;
@@ -285,6 +287,7 @@ static ASTNode *ast_clone_struct_declaration(ASTNode *clone, const ASTNode *node
   dst->meta_decorator_count = src->meta_decorator_count;
   dst->meta_layout = src->meta_layout;
   dst->meta_ref_hint = src->meta_ref_hint;
+  dst->drop_function = ast_intern_string(src->drop_function);
   dst->name = ast_intern_string(src->name);
   dst->field_count = src->field_count;
   dst->method_count = src->method_count;
@@ -2102,6 +2105,8 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->meta_optimized = 0;
   func_decl->meta_point = NULL;
   func_decl->generated_by = NULL;
+  func_decl->is_explicit = 0;
+  func_decl->ownership_role = 0;
   func_decl->rewrite_role = 0;
   func_decl->effects_with = NULL;
   func_decl->effects_with_count = 0;
@@ -2174,6 +2179,7 @@ ASTNode *ast_create_struct_declaration(const char *name, char **field_names,
   struct_decl->meta_decorator_count = 0;
   struct_decl->meta_layout = NULL;
   struct_decl->meta_ref_hint = 0;
+  struct_decl->drop_function = NULL;
 
   if (field_count > 0) {
     struct_decl->field_names = malloc(field_count * sizeof(char *));

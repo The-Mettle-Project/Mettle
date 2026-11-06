@@ -22,6 +22,8 @@ int ir_defer_stack_push(IRLoweringContext *context, IRDeferStack *stack,
   stack->entries[stack->count].capture_arg_temps = NULL;
   stack->entries[stack->count].capture_arg_count = 0;
   stack->entries[stack->count].release_string = NULL;
+  stack->entries[stack->count].drop_root_name = NULL;
+  stack->entries[stack->count].drop_root_index = -1;
   stack->count++;
   return 1;
 }
@@ -79,7 +81,9 @@ int ir_defer_capture_call(IRLoweringContext *context,
     return 0;
   }
   if (strcmp(call->function_name, "sizeof") == 0 ||
-      strcmp(call->function_name, "static_assert") == 0) {
+      strcmp(call->function_name, "static_assert") == 0 ||
+      strcmp(call->function_name, "drop") == 0 ||
+      strcmp(call->function_name, "forget") == 0) {
     return 0;
   }
   for (size_t i = 0; i < call->argument_count; i++) {
@@ -221,8 +225,17 @@ int ir_emit_deferred_calls_filtered(IRLoweringContext *context,
     if (!defer_stmt || !defer_stmt->statement) {
       continue;
     }
-    if (!ir_lower_deferred_statement(context, function,
-                                     defer_stmt->statement)) {
+    const char *saved_root = context->drop_root_name;
+    long saved_index = context->drop_root_index;
+    context->drop_root_name = stack->entries[i - 1].drop_root_name;
+    context->drop_root_index = stack->entries[i - 1].drop_root_index;
+    context->lowering_deferred++;
+    int lowered =
+        ir_lower_deferred_statement(context, function, defer_stmt->statement);
+    context->lowering_deferred--;
+    context->drop_root_name = saved_root;
+    context->drop_root_index = saved_index;
+    if (!lowered) {
       return 0;
     }
   }
@@ -268,6 +281,17 @@ int ir_emit_defers_until_scope(IRLoweringContext *context,
     }
   }
   return 1;
+}
+
+int ir_emit_defers_at_exit(IRLoweringContext *context, IRFunction *function,
+                           const IRDeferScope *from, const IRDeferScope *stop,
+                           const ASTNode *exit) {
+  const ASTNode *saved = context->ownership_exit;
+  int ok = 0;
+  context->ownership_exit = exit;
+  ok = ir_emit_defers_until_scope(context, function, from, stop);
+  context->ownership_exit = saved;
+  return ok;
 }
 
 int ir_emit_deferred_scopes(IRLoweringContext *context,

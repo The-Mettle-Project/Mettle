@@ -1766,6 +1766,11 @@ int ir_lower_call_expression(IRLoweringContext *context,
                                   out_value);
   }
 
+  if (!call->object && (strcmp(call->function_name, "drop") == 0 ||
+                        strcmp(call->function_name, "forget") == 0)) {
+    return ir_lower_drop_call(context, function, expression, out_value);
+  }
+
   if (context->emit_task_checks &&
       call->task_capture_argument != SIZE_MAX &&
       !ir_emit_task_capture_check(context, function, expression, call)) {

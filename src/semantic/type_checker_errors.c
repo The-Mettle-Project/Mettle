@@ -1,4 +1,5 @@
 #include "type_checker_internal.h"
+#include "ownership.h"
 
 void type_checker_set_error(TypeChecker *checker, const char *format, ...) {
   if (!checker || !format)
@@ -443,6 +444,8 @@ void type_checker_warn_unused_locals(TypeChecker *checker) {
     if (!s->name || s->name[0] == '_' || s->name[0] == '.' || !s->decl_line)
       continue;
     if (s->decl_file && main_file && strcmp(s->decl_file, main_file) != 0)
+      continue;
+    if (ownership_type_owns(checker, s->type))
       continue;
     char msg[256];
     snprintf(msg, sizeof(msg), "unused %s '%s'",

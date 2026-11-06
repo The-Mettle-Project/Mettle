@@ -2,6 +2,7 @@
 #include "common.h"
 #include "../ir_machine.h"
 #include "../ir_explain_memory.h"
+#include "../ir_explain_ownership.h"
 #include "../ir_explain_safety.h"
 #include "../ir_explain_ledger.h"
 #include "../../error/diag_style.h"
@@ -204,6 +205,29 @@ static MTLC_THREAD_LOCAL size_t g_mem_count = 0;
 static MTLC_THREAD_LOCAL size_t g_mem_capacity = 0;
 static MTLC_THREAD_LOCAL int g_mem_collect = 0;
 static MTLC_THREAD_LOCAL char *g_mem_focus = NULL;
+
+typedef struct {
+  char *file;
+  size_t line;
+  size_t column;
+  char *kind;
+  char *function;
+  char *subject;
+  char *type;
+  char *text;
+  char *reason;
+  char *lowered;
+  int inserted;
+  const void *key;
+  size_t calls_left;
+  int scanned;
+} IRExplainOwnNote;
+
+static MTLC_THREAD_LOCAL IRExplainOwnNote *g_own_notes = NULL;
+static MTLC_THREAD_LOCAL size_t g_own_count = 0;
+static MTLC_THREAD_LOCAL size_t g_own_capacity = 0;
+static MTLC_THREAD_LOCAL int g_own_collect = 0;
+static MTLC_THREAD_LOCAL char *g_own_focus = NULL;
 
 typedef struct {
   size_t line;
@@ -446,6 +470,99 @@ void ir_explain_memory_note(const char *file, int severity, size_t line,
   n->code = code ? strdup(code) : NULL;
   n->headline = strdup(headline);
   n->fix = fix ? strdup(fix) : NULL;
+}
+
+void ir_explain_ownership_set_collect(int enabled, const char *focus_file) {
+  g_own_collect = enabled;
+  free(g_own_focus);
+  g_own_focus = NULL;
+  if (enabled && focus_file) {
+    const char *base = ir_explain_path_basename(focus_file);
+    if (base && *base) {
+      g_own_focus = strdup(base);
+    }
+  }
+}
+
+static char *ir_explain_own_dup(const char *text) {
+  return text ? strdup(text) : NULL;
+}
+
+void ir_explain_ownership_note(const IRExplainOwnershipRecord *record) {
+  IRExplainOwnNote *note = NULL;
+  if (!g_own_collect || !record) {
+    return;
+  }
+  if (g_own_focus && record->file &&
+      strcmp(ir_explain_path_basename(record->file), g_own_focus) != 0) {
+    return;
+  }
+  if (g_own_count == g_own_capacity) {
+    size_t new_cap = g_own_capacity ? g_own_capacity * 2 : 16;
+    IRExplainOwnNote *grown =
+        realloc(g_own_notes, new_cap * sizeof(*grown));
+    if (!grown) {
+      return;
+    }
+    g_own_notes = grown;
+    g_own_capacity = new_cap;
+  }
+  note = &g_own_notes[g_own_count++];
+  memset(note, 0, sizeof(*note));
+  note->file = ir_explain_own_dup(record->file);
+  note->line = record->line;
+  note->column = record->column;
+  note->kind = ir_explain_own_dup(record->kind);
+  note->function = ir_explain_own_dup(record->function);
+  note->subject = ir_explain_own_dup(record->subject);
+  note->type = ir_explain_own_dup(record->type);
+  note->text = ir_explain_own_dup(record->text);
+  note->reason = ir_explain_own_dup(record->reason);
+  note->lowered = ir_explain_own_dup(record->lowered);
+  note->inserted = record->inserted;
+  note->key = record->key;
+}
+
+void ir_explain_ownership_scan(const void *ir_program) {
+  const IRProgram *program = (const IRProgram *)ir_program;
+  for (size_t n = 0; n < g_own_count; n++) {
+    g_own_notes[n].calls_left = 0;
+    g_own_notes[n].scanned = program != NULL;
+  }
+  for (size_t f = 0; program && f < program->function_count; f++) {
+    const IRFunction *function = program->functions[f];
+    for (size_t i = 0; function && i < function->instruction_count; i++) {
+      const IRInstruction *in = &function->instructions[i];
+      if (in->op != IR_OP_CALL || !in->ast_ref) {
+        continue;
+      }
+      for (size_t n = 0; n < g_own_count; n++) {
+        if (g_own_notes[n].key == in->ast_ref) {
+          g_own_notes[n].calls_left++;
+        }
+      }
+    }
+  }
+}
+
+static void ir_explain_ownership_free(void) {
+  for (size_t i = 0; i < g_own_count; i++) {
+    IRExplainOwnNote *note = &g_own_notes[i];
+    free(note->file);
+    free(note->kind);
+    free(note->function);
+    free(note->subject);
+    free(note->type);
+    free(note->text);
+    free(note->reason);
+    free(note->lowered);
+  }
+  free(g_own_notes);
+  g_own_notes = NULL;
+  g_own_count = 0;
+  g_own_capacity = 0;
+  free(g_own_focus);
+  g_own_focus = NULL;
 }
 
 int ir_explain_file_enabled(const char *filename) {
@@ -2382,6 +2499,90 @@ static void ir_explain_safety_flush(void) {
   ir_explain_emit("\n");
 }
 
+static void ir_explain_own_after(const IRExplainOwnNote *note, char *out,
+                                 size_t size) {
+  out[0] = '\0';
+  if (!note->key || !note->scanned) {
+    return;
+  }
+  if (note->calls_left > 0) {
+    snprintf(out, size, "%zu call%s left after optimization",
+             note->calls_left, note->calls_left == 1 ? "" : "s");
+  } else {
+    snprintf(out, size, "inlined by the optimizer; --annotate-asm shows the "
+                        "instructions at line %zu",
+             note->line);
+  }
+}
+
+static void ir_explain_ownership_json(void) {
+  char after[160];
+  ir_explain_json_raw("\"ownership\":[");
+  for (size_t i = 0; i < g_own_count; i++) {
+    const IRExplainOwnNote *n = &g_own_notes[i];
+    ir_explain_own_after(n, after, sizeof(after));
+    ir_explain_json_raw("%s{\"kind\":", i ? "," : "");
+    ir_explain_json_str(n->kind);
+    ir_explain_json_raw(",\"line\":%zu,\"column\":%zu,\"function\":", n->line,
+                        n->column);
+    ir_explain_json_str(n->function);
+    ir_explain_json_raw(",\"subject\":");
+    ir_explain_json_str(n->subject);
+    ir_explain_json_raw(",\"type\":");
+    ir_explain_json_str(n->type);
+    ir_explain_json_raw(",\"text\":");
+    ir_explain_json_str(n->text);
+    ir_explain_json_raw(",\"reason\":");
+    ir_explain_json_str(n->reason);
+    ir_explain_json_raw(",\"lowered\":");
+    ir_explain_json_str(n->lowered);
+    ir_explain_json_raw(",\"optimized\":");
+    ir_explain_json_str(after[0] ? after : NULL);
+    ir_explain_json_raw(",\"inserted\":%s}", n->inserted ? "true" : "false");
+  }
+  ir_explain_json_raw("],");
+}
+
+static void ir_explain_ownership_flush(void) {
+  const char *function = NULL;
+  char after[160];
+  if (g_explain_json) {
+    ir_explain_ownership_json();
+  }
+  if (!g_explain || g_own_count == 0) {
+    return;
+  }
+  ir_explain_print_header("ownership report");
+  ir_explain_emit("  %zu record%s: drops the compiler inserted, drops you "
+                  "wrote, moves, and live bits\n",
+                  g_own_count, g_own_count == 1 ? "" : "s");
+  for (size_t i = 0; i < g_own_count; i++) {
+    const IRExplainOwnNote *n = &g_own_notes[i];
+    if (!function || !n->function || strcmp(function, n->function) != 0) {
+      function = n->function;
+      ir_explain_emit("  %sin %s%s\n", clr(EXPLAIN_BOLD),
+                      function ? function : "?", clr(EXPLAIN_RESET));
+    }
+    ir_explain_emit("    line %zu, %s%s: %s\n", n->line, n->kind,
+                    n->inserted ? ", inserted" : "",
+                    n->reason ? n->reason : "");
+    if (n->text) {
+      ir_explain_emit("      %s%s written out: %s%s\n", clr(EXPLAIN_DIM),
+                      glyph_elbow(), n->text, clr(EXPLAIN_RESET));
+    }
+    if (n->lowered) {
+      ir_explain_emit("      %s%s lowered to: %s%s\n", clr(EXPLAIN_DIM),
+                      glyph_elbow(), n->lowered, clr(EXPLAIN_RESET));
+    }
+    ir_explain_own_after(n, after, sizeof(after));
+    if (after[0]) {
+      ir_explain_emit("      %s%s %s%s\n", clr(EXPLAIN_DIM), glyph_elbow(),
+                      after, clr(EXPLAIN_RESET));
+    }
+  }
+  ir_explain_emit("\n");
+}
+
 static void ir_explain_memory_flush(void) {
   if (g_explain_json) {
     ir_explain_json_raw("\"memory\":[");
@@ -2990,6 +3191,7 @@ void ir_explain_flush(void) {
 
   ir_explain_safety_flush();
   ir_explain_memory_flush();
+  ir_explain_ownership_flush();
   ir_explain_ledger_flush();
 }
 
@@ -3247,6 +3449,7 @@ void ir_explain_finalize(int force_stderr) {
   g_mem_capacity = 0;
   free(g_mem_focus);
   g_mem_focus = NULL;
+  ir_explain_ownership_free();
   ir_explain_source_free();
 
   if (!diverted) {

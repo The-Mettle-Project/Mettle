@@ -198,6 +198,8 @@ typedef struct {
   int meta_optimized;
   char *meta_point;
   const char *generated_by;
+  int is_explicit;
+  int ownership_role;
 } FunctionDeclaration;
 
 typedef struct {
@@ -224,6 +226,7 @@ typedef struct {
   size_t meta_decorator_count;
   struct TypeMetaLayout *meta_layout;
   int meta_ref_hint;
+  char *drop_function;
 } StructDeclaration;
 
 typedef struct {

@@ -1,5 +1,6 @@
 #include "ir_optimize_internal.h"
 #include "../ir_verify.h"
+#include "../ir_explain_ownership.h"
 
 typedef struct {
   IROptPassId id;
@@ -899,6 +900,7 @@ static int ir_optimize_portable_program_pipeline(
 
   ir_explain_set_program(NULL);
   ir_gpu_call_graph_destroy(&graph);
+  ir_explain_ownership_scan(program);
   ir_explain_flush();
   ir_pass_time_report();
   ir_verify_end_program();
@@ -1135,6 +1137,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
   contracts_ok &= !ir_optimize_had_user_error();
 
   ir_inline_explain_report_remaining(program);
+  ir_explain_ownership_scan(program);
   ir_explain_flush();
   if (!contracts_ok) {
     ir_explain_finalize(1);

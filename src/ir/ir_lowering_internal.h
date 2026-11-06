@@ -78,6 +78,11 @@ typedef struct {
   size_t value_frame_count;
   size_t value_frame_capacity;
   int pin_identifier_reads;
+  const ASTNode *ownership_exit;
+  int lowering_deferred;
+  const char *drop_root_name;
+  long drop_root_index;
+  ASTNode *current_function_node;
 } IRLoweringContext;
 
 int ir_lower_index_expression(IRLoweringContext *context, IRFunction *function,
@@ -91,6 +96,8 @@ typedef struct {
     char **capture_arg_temps;
     size_t capture_arg_count;
     char *release_string;
+    const char *drop_root_name;
+    long drop_root_index;
   } *entries;
   size_t count;
   size_t capacity;
@@ -170,6 +177,17 @@ const char *ir_local_ir_name(IRLoweringContext *context, const char *name);
 
 const IRLocalBinding *ir_local_binding_find(IRLoweringContext *context,
                                             const char *name);
+long ir_local_binding_index(IRLoweringContext *context, const char *name);
+
+int ir_lower_drop_call(IRLoweringContext *context, IRFunction *function,
+                       ASTNode *expression, IROperand *out_value);
+int ir_ownership_after_unit(IRLoweringContext *context, IRFunction *function,
+                            const void *unit, SourceLocation location);
+int ir_ownership_function_entry(IRLoweringContext *context,
+                                IRFunction *function, ASTNode *declaration);
+void ir_ownership_capture_defer_root(IRLoweringContext *context,
+                                     ASTNode *defer_statement,
+                                     const char **root_name, long *root_index);
 
 int ir_emit_local_declaration(IRLoweringContext *context,
                                      IRFunction *function,
@@ -415,6 +433,9 @@ const IRControlFrame *ir_continue_target_frame(IRLoweringContext *context,
 int ir_emit_defers_until_scope(IRLoweringContext *context,
                                IRFunction *function, const IRDeferScope *from,
                                const IRDeferScope *stop);
+int ir_emit_defers_at_exit(IRLoweringContext *context, IRFunction *function,
+                           const IRDeferScope *from, const IRDeferScope *stop,
+                           const ASTNode *exit);
 
 int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node);
 int ir_emit_string_copy_into(IRLoweringContext *context, IRFunction *function,

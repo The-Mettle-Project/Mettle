@@ -881,6 +881,119 @@ static const ErrorCodeDoc DOCS[] = {
      "`mettle test`, `mettle trace` and `--verify` re-check every proven\n"
      "conversion as the interpreter runs, and `--check-proofs` does the\n"
      "same inside a compiled program, in `--release` too.\n"},
+    {"O0001", "Use of a value after it moved",
+     "A value that owns a resource moved: into a by-value parameter, a\n"
+     "return, a variable, a field or a drop. After a move the old name no\n"
+     "longer holds anything, so reading it, borrowing it or moving it again\n"
+     "is an error. \"On some paths\" means one branch moved it and another\n"
+     "did not.\n"
+     "\n"
+     "    var a = open(\"log\");\n"
+     "    consume(a);\n"
+     "    write(&a, \"x\");    // a moved into consume\n"
+     "\n"
+     "Fix: pass a pointer (`&a`) to a function that only needs to look, or\n"
+     "put a new value in `a` before using it again.\n"},
+    {"O0002", "Use of a value with a part moved out",
+     "A field of a struct moved out on its own. The rest of the struct is\n"
+     "still there and is dropped at the end of its scope, but the struct\n"
+     "as a whole cannot be used, borrowed or moved.\n"
+     "\n"
+     "Fix: use the fields that are still there, or assign the moved field\n"
+     "a new value first.\n"},
+    {"O0003", "Moving a field out of a type with a destructor",
+     "A struct with its own `drop` method gets the whole value when it is\n"
+     "dropped, so none of its fields can be moved out or dropped on their\n"
+     "own.\n"
+     "\n"
+     "Fix: `mem_take(&s.field)` moves the field out and leaves a zero value\n"
+     "behind, and `mem_replace(&s.field, value)` leaves the value you give\n"
+     "it.\n"},
+    {"O0004", "A move that only happens sometimes inside an expression",
+     "The right side of `&&` and `||` runs only when the left side lets it.\n"
+     "A move there would leave the value moved on some runs and not others\n"
+     "in the middle of one expression.\n"
+     "\n"
+     "Fix: write it as an `if` statement, so each branch moves or keeps the\n"
+     "value and the compiler can follow both.\n"},
+    {"O0005", "errdefer that drops or moves an owned value",
+     "An owned value is dropped at the end of its scope on every path out,\n"
+     "an error return included. An `errdefer` that drops or moves it again\n"
+     "would drop it twice.\n"
+     "\n"
+     "Fix: remove the errdefer; the value is already handled.\n"},
+    {"O0006", "Assigning into part of a moved value",
+     "The whole struct moved away, so there is nothing to assign a field\n"
+     "of.\n"
+     "\n"
+     "Fix: assign the whole struct first.\n"},
+    {"O0007", "Calling a destructor by name",
+     "`T_drop__ptr` runs only the type's own cleanup. Calling it leaves the\n"
+     "fields undropped and leaves the compiler thinking the value is still\n"
+     "alive, so it would be dropped again at the end of its scope.\n"
+     "\n"
+     "Fix: write `drop(value)`. It runs the destructor, drops the fields,\n"
+     "and marks the value gone.\n"},
+    {"O0008", "Moving out of a global",
+     "A global lives for the whole run and is never dropped, so a value\n"
+     "cannot be moved out of it and leave nothing behind.\n"
+     "\n"
+     "Fix: `mem_take(&global)` or `mem_replace(&global, value)`.\n"},
+    {"O0009", "Moving out of memory reached through a pointer or index",
+     "The compiler follows locals, parameters and their fields. Memory\n"
+     "behind a pointer or inside an array element belongs to something\n"
+     "else that will drop it, so moving out of it would drop it twice.\n"
+     "\n"
+     "Fix: `mem_take(p)` moves the value out and leaves zero behind;\n"
+     "`mem_replace(p, value)` leaves the value you give it.\n"},
+    {"O0010", "An owning value declared in a loop header",
+     "A `for` header has no block of its own to drop the value at the end\n"
+     "of.\n"
+     "\n"
+     "Fix: declare it before the loop.\n"},
+    {"O0011", "A destructor with the wrong shape",
+     "A destructor is the method `drop` with a pointer receiver:\n"
+     "`fn T_drop__ptr(self: T*)` or `method drop()` inside the struct. It\n"
+     "takes nothing else and returns nothing. A by-value `T_drop` would\n"
+     "receive its own copy and drop that, forever.\n"},
+    {"O0012", "A function named drop or forget",
+     "`drop(x)` and `forget(x)` are built in. `drop` runs a value's\n"
+     "destructor and its fields' destructors and marks it gone; `forget`\n"
+     "marks it gone and runs nothing. The compiler inserts calls to `drop`\n"
+     "itself, so the name cannot mean anything else.\n"
+     "\n"
+     "Fix: rename the function.\n"},
+    {"O0020", "`@explicit` code leaves an owned value undropped",
+     "In an `@explicit` function the compiler inserts no drops. A value\n"
+     "that still owns a resource when its scope ends would leak, so it is\n"
+     "an error, and the message says what the compiler would have written.\n"
+     "\n"
+     "Fix: `defer drop(x);` after the declaration drops it at the end of\n"
+     "its scope unless it moved, which is what implicit code does.\n"
+     "Dropping or moving it on every path works as well. `--fix` writes\n"
+     "the defer.\n"},
+    {"O0021", "`@explicit` assignment over an owned value",
+     "Assigning to a variable that still owns a resource would lose the\n"
+     "old value without dropping it.\n"
+     "\n"
+     "Fix: drop the old value first. Implicit code evaluates the new value,\n"
+     "then drops the old one, then stores; `--fix` writes it that way.\n"},
+    {"O0022", "`@explicit` code throws an owned value away",
+     "A call returns a value that owns a resource and nothing keeps it.\n"
+     "\n"
+     "Fix: `drop(f());`, or keep the value. `--fix` writes the drop.\n"},
+    {"O0023", "`@explicit` code uses an owned temporary",
+     "A value that owns a resource is used without a name, as in\n"
+     "`open(path).size`. Implicit code holds it in a hidden local until the\n"
+     "statement ends and drops it there.\n"
+     "\n"
+     "Fix: put it in a variable, use it, and drop it. `--fix` writes that\n"
+     "when the value is a call in a plain statement.\n"},
+    {"O0099", "Internal ownership error",
+     "The drops the compiler inserted into a function did not account for\n"
+     "every owned value when it checked its own work. This is a compiler\n"
+     "bug; the build stops so the program never runs with a missing or\n"
+     "doubled drop. `mettle expand` shows what was inserted.\n"},
 };
 
 typedef enum {

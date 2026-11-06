@@ -65,7 +65,7 @@ LIBMTLC_VERSION = 0.2.0
 # Source files
 LEXER_SOURCES = $(SRCDIR)/lexer/lexer.c
 PARSER_SOURCES = $(SRCDIR)/parser/parser.c $(SRCDIR)/parser/ast.c $(SRCDIR)/parser/ast_dump.c $(SRCDIR)/parser/ast_print.c
-SEMANTIC_SOURCES = $(SRCDIR)/semantic/symbol_table.c $(SRCDIR)/semantic/comptime_value.c $(SRCDIR)/semantic/type_layout.c $(SRCDIR)/semantic/comptime_expand.c $(SRCDIR)/semantic/rule_reflect.c $(SRCDIR)/semantic/meta_stage.c $(SRCDIR)/semantic/type_checker_refine.c $(SRCDIR)/semantic/type_checker_uniform.c $(SRCDIR)/semantic/type_checker_gpu_intrinsics.c $(SRCDIR)/semantic/type_checker_effects.c $(SRCDIR)/semantic/target_desc.c $(SRCDIR)/semantic/type_query.c $(SRCDIR)/semantic/type_checker.c $(SRCDIR)/semantic/type_checker_types.c $(SRCDIR)/semantic/type_checker_errors.c $(SRCDIR)/semantic/type_checker_safety.c $(SRCDIR)/semantic/type_checker_init_tracker.c $(SRCDIR)/semantic/type_checker_decl.c $(SRCDIR)/semantic/type_checker_match.c $(SRCDIR)/semantic/type_checker_value.c $(SRCDIR)/semantic/type_checker_stmt.c $(SRCDIR)/semantic/type_checker_expr.c $(SRCDIR)/semantic/type_checker_aggregate.c $(SRCDIR)/semantic/type_checker_tensor_epilogue.c $(SRCDIR)/semantic/type_checker_tile.c $(SRCDIR)/semantic/type_checker_memory.c $(SRCDIR)/semantic/schedule_expand.c $(SRCDIR)/semantic/machine_desc.c $(SRCDIR)/semantic/register_allocator.c $(SRCDIR)/semantic/import_resolver.c $(SRCDIR)/semantic/monomorphize.c
+SEMANTIC_SOURCES = $(SRCDIR)/semantic/symbol_table.c $(SRCDIR)/semantic/comptime_value.c $(SRCDIR)/semantic/type_layout.c $(SRCDIR)/semantic/comptime_expand.c $(SRCDIR)/semantic/rule_reflect.c $(SRCDIR)/semantic/meta_stage.c $(SRCDIR)/semantic/type_checker_refine.c $(SRCDIR)/semantic/type_checker_uniform.c $(SRCDIR)/semantic/type_checker_gpu_intrinsics.c $(SRCDIR)/semantic/type_checker_effects.c $(SRCDIR)/semantic/target_desc.c $(SRCDIR)/semantic/type_query.c $(SRCDIR)/semantic/type_checker.c $(SRCDIR)/semantic/type_checker_types.c $(SRCDIR)/semantic/type_checker_errors.c $(SRCDIR)/semantic/type_checker_safety.c $(SRCDIR)/semantic/type_checker_init_tracker.c $(SRCDIR)/semantic/type_checker_decl.c $(SRCDIR)/semantic/type_checker_match.c $(SRCDIR)/semantic/type_checker_value.c $(SRCDIR)/semantic/type_checker_stmt.c $(SRCDIR)/semantic/type_checker_expr.c $(SRCDIR)/semantic/type_checker_aggregate.c $(SRCDIR)/semantic/type_checker_tensor_epilogue.c $(SRCDIR)/semantic/type_checker_tile.c $(SRCDIR)/semantic/type_checker_memory.c $(SRCDIR)/semantic/schedule_expand.c $(SRCDIR)/semantic/machine_desc.c $(SRCDIR)/semantic/register_allocator.c $(SRCDIR)/semantic/import_resolver.c $(SRCDIR)/semantic/monomorphize.c $(SRCDIR)/semantic/ownership.c $(SRCDIR)/semantic/ownership_walk.c $(SRCDIR)/semantic/ownership_edit.c $(SRCDIR)/semantic/ownership_report.c
 # The AST->IR lowering pass is a FRONTEND concern (it consumes the frontend AST
 # and type system), so it links into the mettle driver, not into libmtlc.
 LOWERING_SOURCES = \
@@ -78,7 +78,8 @@ LOWERING_SOURCES = \
 	$(SRCDIR)/ir/ir_lower_switch_match.c \
 	$(SRCDIR)/ir/ir_lower_tile.c \
 	$(SRCDIR)/ir/ir_lower_types.c \
-	$(SRCDIR)/ir/ir_lower_live.c
+	$(SRCDIR)/ir/ir_lower_live.c \
+	$(SRCDIR)/ir/ir_lower_ownership.c
 # Backend IR core (everything in src/ir except the lowering TUs) + optimizer.
 IR_CORE_SOURCES = $(filter-out $(LOWERING_SOURCES),$(wildcard $(SRCDIR)/ir/*.c)) $(wildcard $(SRCDIR)/ir/optimizer/*.c)
 # Public libmtlc API surface, and the frontend-side type-translation adapter.

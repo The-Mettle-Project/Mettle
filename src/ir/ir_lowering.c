@@ -335,6 +335,10 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
   context->value_frame_count = 0;
   context->pin_identifier_reads =
       ir_value_scope_writes_locals(function_data->body, 0);
+  if (!ir_ownership_function_entry(context, function, declaration)) {
+    ir_function_destroy(function);
+    return NULL;
+  }
   if (function_data->body &&
       !ir_lower_statement_with_defers(context, function, function_data->body,
                                       &defers)) {
@@ -350,6 +354,7 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
     IROperand implicit_value = function->name && !strcmp(function->name, "main")
                                    ? ir_operand_int(0)
                                    : ir_operand_none();
+    context->ownership_exit = declaration;
     if (!ir_emit_return_with_defers(context, function, &defers, &implicit_value,
                                     declaration->location)) {
       ir_operand_destroy(&implicit_value);

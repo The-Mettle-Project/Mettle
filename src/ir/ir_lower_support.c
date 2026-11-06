@@ -137,10 +137,28 @@ const char *ir_local_bind_parameter(IRLoweringContext *context,
   return ir_local_bind_impl(context, name, type_text, 0);
 }
 
+long ir_local_binding_index(IRLoweringContext *context, const char *name) {
+  if (!context || !name) {
+    return -1;
+  }
+  for (size_t i = context->local_binding_count; i-- > 0;) {
+    const IRLocalBinding *b = &context->local_bindings[i];
+    if (b->active && strcmp(b->name, name) == 0) {
+      return (long)i;
+    }
+  }
+  return -1;
+}
+
 const IRLocalBinding *ir_local_binding_find(IRLoweringContext *context,
                                             const char *name) {
   if (!context || !name) {
     return NULL;
+  }
+  if (context->drop_root_name && context->drop_root_index >= 0 &&
+      (size_t)context->drop_root_index < context->local_binding_count &&
+      strcmp(context->drop_root_name, name) == 0) {
+    return &context->local_bindings[context->drop_root_index];
   }
   for (size_t i = context->local_binding_count; i-- > 0;) {
     const IRLocalBinding *b = &context->local_bindings[i];

@@ -30,6 +30,7 @@
 #include "ir/ir_lowering.h"
 #include "ir/ir_optimize.h"
 #include "ir/ir_explain_memory.h"
+#include "ir/ir_explain_ownership.h"
 #include "ir/ir_profile.h"
 #include "ir/ir_debug_hooks.h"
 #include "semantic/import_resolver.h"
@@ -41,6 +42,7 @@
 #include "ir/ir_opt_cost.h"
 #include "ir/ir_trace_record.h"
 #include "semantic/machine_desc.h"
+#include "semantic/ownership.h"
 #include "ir/ir_effects.h"
 #include "ir/ir_purity.h"
 #include "ir/ir_twins.h"
@@ -7064,6 +7066,9 @@ static int compile_stage_type_check(CompileContext *ctx) {
   ir_explain_memory_set_collect(
       ctx->options->explain && ctx->options->optimize,
       ctx->options->explain_all ? NULL : ctx->options->input_filename);
+  ir_explain_ownership_set_collect(
+      ctx->options->explain && ctx->options->optimize,
+      ctx->options->explain_all ? NULL : ctx->options->input_filename);
 
   compiler_set_phase(PROFILE_PHASE_TYPE_CHECK);
   ctx->phase_start = compiler_profile_begin(&ctx->profile);
@@ -7131,13 +7136,35 @@ static int compile_stage_type_reports(CompileContext *ctx) {
   return COMPILE_CONTINUE;
 }
 
+static int compile_stage_ownership(CompileContext *ctx) {
+  ownership_reset();
+  ownership_set_apply_fixes(ctx->options->apply_rule_fixes);
+  ownership_set_report_focus(ctx->options->explain_all
+                                 ? NULL
+                                 : ctx->options->input_filename);
+  if (ownership_run(ctx->type_checker, ctx->program, ctx->error_reporter)) {
+    return COMPILE_CONTINUE;
+  }
+  error_reporter_print_errors(ctx->error_reporter);
+  if (ctx->options->apply_rule_fixes) {
+    int applied = ownership_write_fixes(stdout);
+    if (applied > 0) {
+      fprintf(stdout, "fix: wrote %d edit%s; compile again to check them\n",
+              applied, applied == 1 ? "" : "s");
+    }
+  }
+  return 1;
+}
+
 static int compile_stage_expand(CompileContext *ctx) {
   size_t unprintable = 0;
   if (!ctx->options->expand_mode) {
     return COMPILE_CONTINUE;
   }
+  ast_print_set_notes(ownership_note, ownership_block_end_note);
   unprintable = ast_print_program(stdout, ctx->program, expand_annotate,
                                   ctx->type_checker);
+  ast_print_set_notes(NULL, NULL);
   if (unprintable > 0) {
     fprintf(stderr,
             "\nnote: %zu node%s had no source form and were printed as "
@@ -7353,6 +7380,9 @@ static int compile_stage_lower_ir(CompileContext *ctx) {
                               &ctx->ir_error_message);
   compiler_profile_add(&ctx->profile, PROFILE_PHASE_IR_LOWERING,
                        ctx->phase_start);
+  if (ir_ok) {
+    ownership_publish_explain();
+  }
   return ir_ok ? COMPILE_CONTINUE : 1;
 }
 
@@ -8050,6 +8080,7 @@ static const CompileStage COMPILE_STAGES[] = {
     compile_stage_metaprogram_report,
     compile_stage_type_reports,
     compile_stage_proof_budget,
+    compile_stage_ownership,
     compile_stage_expand,
     compile_stage_drop_tests,
     compile_stage_lowering_modes,

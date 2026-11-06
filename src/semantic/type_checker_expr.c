@@ -3324,6 +3324,21 @@ static Type *type_checker_infer_named_builtin(TypeChecker *checker,
     return type_checker_interp_builtin(checker, call, expression);
   }
 
+  if (!call->object && (strcmp(call->function_name, "drop") == 0 ||
+                        strcmp(call->function_name, "forget") == 0)) {
+    if (call->argument_count != 1 || !call->arguments ||
+        !call->arguments[0]) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "%s takes one value: the place or the value to %s",
+          call->function_name, call->function_name);
+      return NULL;
+    }
+    return type_checker_infer_type(checker, call->arguments[0])
+               ? checker->builtin_void
+               : NULL;
+  }
+
   *handled = 0;
   return NULL;
 }

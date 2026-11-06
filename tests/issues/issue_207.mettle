@@ -9,8 +9,8 @@ fn keep() {
     mov {g_slot}, rax
   }
 }
-fn drop() {
+fn release() {
   var b: Box* = (Box*)g_slot;
   free(b);
 }
-export fn main() -> int32 { keep(); drop(); return 0; }
+export fn main() -> int32 { keep(); release(); return 0; }

@@ -788,6 +788,7 @@ typedef struct {
   int is_naked;
   int is_interrupt;
   int is_rule;
+  int is_explicit;
   int simd_mode;
   int unroll_factor;
   int uniform_mode;
@@ -983,6 +984,13 @@ static int parser_parse_one_decorator(Parser *parser,
     }
     out->is_rule = 1;
     parser_advance(parser);
+  } else if (strcmp(name, "explicit") == 0) {
+    if (out->is_explicit) {
+      parser_set_error(parser, "Duplicate '@explicit' decorator");
+      return 0;
+    }
+    out->is_explicit = 1;
+    parser_advance(parser);
   } else if (strcmp(name, "conflict_free") == 0) {
     if (out->conflict_free_mode) {
       parser_set_error(parser, "Duplicate '@conflict_free' decorator");
@@ -1100,6 +1108,7 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   out->is_naked = 0;
   out->is_interrupt = 0;
   out->is_rule = 0;
+  out->is_explicit = 0;
   out->simd_mode = SIMD_ATTR_NONE;
   out->unroll_factor = 0;
   out->uniform_mode = 0;
@@ -1129,8 +1138,8 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   if (out->meta_role != META_ROLE_NONE &&
       (out->is_inline || out->is_noinline || out->is_pure || out->is_noalloc ||
        out->is_test || out->is_swappable || out->is_naked ||
-       out->is_interrupt || out->is_rule || out->simd_mode != SIMD_ATTR_NONE ||
-       out->meta_count > 0)) {
+       out->is_interrupt || out->is_rule || out->is_explicit ||
+       out->simd_mode != SIMD_ATTR_NONE || out->meta_count > 0)) {
     parser_set_error(parser,
                      "'@layout' and '@generate' stand alone: a metafunction "
                      "runs while compiling and never becomes code, so no other "
@@ -1140,7 +1149,8 @@ static int parser_parse_decorator_chain(Parser *parser, ParsedDecorators *out) {
   if (out->is_rule &&
       (out->is_inline || out->is_noinline || out->is_pure || out->is_noalloc ||
        out->is_test || out->is_swappable || out->is_naked ||
-       out->is_interrupt || out->simd_mode != SIMD_ATTR_NONE)) {
+       out->is_interrupt || out->is_explicit ||
+       out->simd_mode != SIMD_ATTR_NONE)) {
     parser_set_error(parser,
                      "'@rule' stands alone: a rule runs while compiling and "
                      "never becomes code, so no other decorator applies to it");
@@ -1171,7 +1181,7 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
       decos.meta_count > 0 && !decos.is_inline && !decos.is_noinline &&
       !decos.is_pure && !decos.is_noalloc && !decos.is_noreturn &&
       !decos.is_test && !decos.is_swappable && !decos.is_naked &&
-      !decos.is_interrupt &&
+      !decos.is_interrupt && !decos.is_explicit &&
       !decos.is_rule && decos.simd_mode == SIMD_ATTR_NONE &&
       decos.meta_role == META_ROLE_NONE;
   if (only_library_decorators && decl->type == AST_STRUCT_DECLARATION) {
@@ -1203,6 +1213,7 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
       decos.is_noreturn && !decos.is_inline && !decos.is_noinline &&
       !decos.is_pure && !decos.is_noalloc && !decos.is_test &&
       !decos.is_swappable && !decos.is_naked && !decos.is_interrupt &&
+      !decos.is_explicit &&
       !decos.is_rule && decos.simd_mode == SIMD_ATTR_NONE &&
       decos.meta_count == 0 && decos.meta_role == META_ROLE_NONE;
   if (fd->is_extern && !only_noreturn) {
@@ -1228,6 +1239,7 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
   fd->is_naked = decos.is_naked;
   fd->is_interrupt = decos.is_interrupt;
   fd->is_rule = decos.is_rule;
+  fd->is_explicit = decos.is_explicit;
   fd->simd_mode = decos.simd_mode;
   fd->numerics_contract = decos.numerics_contract;
   if (fd->is_naked && fd->is_interrupt) {
@@ -2636,11 +2648,11 @@ static ASTNode *parser_parse_decorated_statement(Parser *parser) {
   }
   if (decos.is_inline || decos.is_noinline || decos.is_pure ||
       decos.is_noalloc || decos.is_noreturn || decos.is_swappable ||
-      decos.is_rule) {
+      decos.is_rule || decos.is_explicit) {
     parser_set_error(parser,
                      "'@inline', '@noinline', '@pure', '@noalloc', "
-                     "'@noreturn', '@swappable', and '@rule' apply to a "
-                     "function, not a loop");
+                     "'@noreturn', '@swappable', '@explicit' and '@rule' apply "
+                     "to a function, not a loop");
     return NULL;
   }
   if (decos.simd_mode == SIMD_ATTR_NONE && !decos.unroll_factor &&
@@ -9443,6 +9455,9 @@ ASTNode *parser_parse_block(Parser *parser) {
   parser->loop_else_blocked = saved_blocked;
   parser->bare_value_arm = saved_arm;
 
+  if (parser->current_token.type == TOKEN_RBRACE) {
+    block->location = parser_current_location(parser);
+  }
   if (!parser_expect(parser, TOKEN_RBRACE)) {
     ast_destroy_node(block);
     return NULL;

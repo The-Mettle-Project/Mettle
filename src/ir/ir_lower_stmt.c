@@ -1413,7 +1413,9 @@ static int ir_lower_for_statement(IRLoweringContext *context, IRFunction *functi
 
   if (for_data->condition) {
     size_t for_branch_before = function->instruction_count;
-    if (!ir_emit_condition_false_branch(context, function,
+    if (!ir_ownership_after_unit(context, function, for_data->condition,
+                                 for_data->condition->location) ||
+        !ir_emit_condition_false_branch(context, function,
                                         for_data->condition, end_label)) {
       ir_local_scope_leave(context);
       free(condition_label);
@@ -1556,7 +1558,9 @@ static int ir_lower_while_statement(IRLoweringContext *context, IRFunction *func
   }
 
   size_t while_branch_before = function->instruction_count;
-  if (!ir_emit_condition_false_branch(context, function,
+  if (!ir_ownership_after_unit(context, function, while_data->condition,
+                               while_data->condition->location) ||
+      !ir_emit_condition_false_branch(context, function,
                                       while_data->condition, loop_end)) {
     free(loop_start);
     free(loop_end);
@@ -1635,7 +1639,9 @@ static int ir_lower_if_statement(IRLoweringContext *context, IRFunction *functio
     }
 
     size_t branches_before = function->instruction_count;
-    if (!ir_emit_condition_false_branch(context, function, current_cond,
+    if (!ir_ownership_after_unit(context, function, current_cond,
+                                 current_cond->location) ||
+        !ir_emit_condition_false_branch(context, function, current_cond,
                                         next_label)) {
       free(next_label);
       free(end_label);
@@ -1765,8 +1771,15 @@ static int ir_lower_return_statement(IRLoweringContext *context, IRFunction *fun
       return 0;
     }
   }
-  if (!ir_emit_return_with_defers(context, function, defers, &value,
-                                  statement->location)) {
+  const ASTNode *saved_exit = context->ownership_exit;
+  context->ownership_exit = statement;
+  int returned =
+      ir_ownership_after_unit(context, function, statement,
+                              statement->location) &&
+      ir_emit_return_with_defers(context, function, defers, &value,
+                                 statement->location);
+  context->ownership_exit = saved_exit;
+  if (!returned) {
     ir_operand_destroy(&value);
     return 0;
   }
@@ -1823,8 +1836,11 @@ static int ir_lower_block(IRLoweringContext *context, IRFunction *function,
     }
   }
 
+  const ASTNode *saved_exit = context->ownership_exit;
+  context->ownership_exit = statement;
   int ok =
       ir_emit_deferred_calls_non_err(context, function, &block_scope.stack);
+  context->ownership_exit = saved_exit;
   ir_defer_stack_free(&block_scope.stack);
   ir_local_scope_leave(context);
   context->current_expansion_note = saved_expansion_note;
@@ -1846,8 +1862,10 @@ static int ir_lower_break_statement(IRLoweringContext *context, IRFunction *func
     }
     return 0;
   }
-  if (!ir_emit_defers_until_scope(context, function, defers,
-                                  frame->defers)) {
+  if (!ir_ownership_after_unit(context, function, statement,
+                               statement->location) ||
+      !ir_emit_defers_at_exit(context, function, defers, frame->defers,
+                              statement)) {
     return 0;
   }
   return ir_emit_jump_instruction(context, function, target,
@@ -1869,8 +1887,10 @@ static int ir_lower_continue_statement(IRLoweringContext *context, IRFunction *f
     }
     return 0;
   }
-  if (!ir_emit_defers_until_scope(context, function, defers,
-                                  frame->defers)) {
+  if (!ir_ownership_after_unit(context, function, statement,
+                               statement->location) ||
+      !ir_emit_defers_at_exit(context, function, defers, frame->defers,
+                              statement)) {
     return 0;
   }
   return ir_emit_jump_instruction(context, function, target,
@@ -1905,6 +1925,10 @@ static int ir_lower_defer_statement(IRLoweringContext *context, IRFunction *func
     defers->stack.entries[idx].capture_arg_temps = cap_temps;
     defers->stack.entries[idx].capture_arg_count = cap_count;
   }
+  ir_ownership_capture_defer_root(
+      context, statement,
+      &defers->stack.entries[defers->stack.count - 1].drop_root_name,
+      &defers->stack.entries[defers->stack.count - 1].drop_root_index);
   return 1;
 }
 
@@ -1916,8 +1940,8 @@ static int ir_lower_fallthrough_statement(IRLoweringContext *context, IRFunction
                           "after it");
     return 0;
   }
-  if (!ir_emit_defers_until_scope(context, function, defers,
-                                  frame->defers)) {
+  if (!ir_emit_defers_at_exit(context, function, defers, frame->defers,
+                              statement)) {
     return 0;
   }
   return ir_emit_jump_instruction(context, function,
@@ -1949,6 +1973,13 @@ int ir_lower_statement_with_defers(IRLoweringContext *context,
   }
   ok = ir_lower_statement_unmarked(context, function, statement, defers);
   context->current_defers = saved_defers;
+  if (ok && statement->type != AST_RETURN_STATEMENT &&
+      statement->type != AST_YIELD_STATEMENT &&
+      statement->type != AST_BREAK_STATEMENT &&
+      statement->type != AST_CONTINUE_STATEMENT) {
+    ok = ir_ownership_after_unit(context, function, statement,
+                                 statement->location);
+  }
   if (ok && marked) {
     ok = ir_lower_live_mark(context, function, 0, statement->location);
   }

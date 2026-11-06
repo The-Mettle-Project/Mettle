@@ -719,6 +719,13 @@ Symbol *symbol_table_lookup_current_scope(SymbolTable *table,
   return scope_lookup_symbol(table->current_scope, name);
 }
 
+Symbol *symbol_table_lookup_global(SymbolTable *table, const char *name) {
+  if (!table || !name || !table->global_scope) {
+    return NULL;
+  }
+  return scope_lookup_symbol(table->global_scope, name);
+}
+
 void symbol_table_insert(SymbolTable *table, Symbol *symbol) {
   if (!table || !symbol || !table->current_scope) {
     return;

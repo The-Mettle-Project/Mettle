@@ -4217,6 +4217,7 @@ static ASTNode *mono_lift_one_method(MonoContext *ctx, const char *struct_name,
   fn->is_swappable = md->is_swappable;
   fn->is_naked = md->is_naked;
   fn->is_interrupt = md->is_interrupt;
+  fn->is_explicit = md->is_explicit;
   fn->simd_mode = md->simd_mode;
   if (!receiver_is_pointer) {
     md->body = NULL;
@@ -4257,11 +4258,16 @@ static int mono_lift_struct_methods(MonoContext *ctx, Program *prog,
         continue;
       }
 
+      int is_destructor = strcmp(md->name, "drop") == 0;
       for (int ptr = 1; ptr >= 0; ptr--) {
         ASTNode *fn_node = NULL;
         ASTNode **grown = NULL;
 
-        if (ptr && !mono_name_set_has(&pointer_methods, md->name)) {
+        if (ptr && !is_destructor &&
+            !mono_name_set_has(&pointer_methods, md->name)) {
+          continue;
+        }
+        if (!ptr && is_destructor) {
           continue;
         }
 
@@ -4290,6 +4296,31 @@ static int mono_lift_struct_methods(MonoContext *ctx, Program *prog,
 done:
   free(pointer_methods.names);
   return ok;
+}
+
+static int mono_request_destructor(MonoContext *ctx, GenericDef *def,
+                                   ASTNode *mono_node, size_t index) {
+  char name[512];
+  GenericDef *destructor = NULL;
+  StructDeclaration *sd = (StructDeclaration *)mono_node->data;
+  char **type_args = ctx->instances[index].type_args;
+  size_t type_arg_count = ctx->instances[index].type_arg_count;
+  if (!sd || !def->name) {
+    return 1;
+  }
+  snprintf(name, sizeof(name), "%s_drop%s", def->name,
+           MONO_PTR_RECEIVER_SUFFIX);
+  destructor = find_generic_def(ctx, name);
+  if (!destructor || destructor->is_struct ||
+      destructor->type_param_count != type_arg_count) {
+    return 1;
+  }
+  sd->drop_function = mangle_name(name, type_args, type_arg_count);
+  if (!sd->drop_function) {
+    return 0;
+  }
+  return mono_add_instantiation(ctx, name, type_args, type_arg_count,
+                                mono_node->location);
 }
 
 static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
@@ -4329,6 +4360,10 @@ static int mono_emit_instantiation(MonoContext *ctx, Program *prog,
 
   if (!mono_node) {
     return 1;
+  }
+  if (def->is_struct && !mono_request_destructor(ctx, def, mono_node, index)) {
+    *success = 0;
+    return 0;
   }
 
   for (size_t j = deps_start; j < ctx->instance_count; j++) {
