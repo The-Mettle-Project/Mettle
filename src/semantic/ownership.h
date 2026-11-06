@@ -53,6 +53,7 @@ typedef struct {
 typedef struct {
   int bit;
   int value;
+  int source;
 } OwnBitWrite;
 
 int ownership_run(TypeChecker *checker, ASTNode *program,

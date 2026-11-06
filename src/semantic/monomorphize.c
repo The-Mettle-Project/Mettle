@@ -2092,6 +2092,7 @@ static ASTNode *create_monomorphized_function(GenericDef *def,
 
   mettle_free_string(fd->name);
   fd->name = strdup(inst->mangled_name);
+  fd->is_generic_instance = 1;
 
   for (size_t i = 0; i < fd->type_param_count; i++)
     mettle_free_string(fd->type_params[i]);

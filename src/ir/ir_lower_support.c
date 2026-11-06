@@ -123,7 +123,6 @@ static const char *ir_local_bind_impl(IRLoweringContext *context,
   slot->depth = context->local_scope_depth;
   slot->active = 1;
   slot->owns_ir_name = owns;
-  slot->owns_string = 0;
   return ir_name;
 }
 

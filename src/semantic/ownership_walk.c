@@ -9,7 +9,8 @@ typedef enum {
   OWN_CTX_MOVE,
   OWN_CTX_ADDRESS,
   OWN_CTX_DISCARD,
-  OWN_CTX_TEMP
+  OWN_CTX_TEMP,
+  OWN_CTX_CONSUMED
 } OwnCtx;
 
 typedef struct {
@@ -331,10 +332,11 @@ static void own_prescan_list(OwnWalker *w, OwnNames *names, ASTNode **items,
 }
 
 static void own_prescan_declare(OwnWalker *w, OwnNames *names,
-                                ASTNode *node, ASTNode *block) {
+                                ASTNode *node, ASTNode *block, size_t index) {
   VarDeclaration *decl = (VarDeclaration *)node->data;
   struct Type *type = NULL;
   int binding = -1;
+  int string_local = 0;
   if (!decl) {
     return;
   }
@@ -344,9 +346,22 @@ static void own_prescan_declare(OwnWalker *w, OwnNames *names,
     return;
   }
   type = own_declared_type(w->checker, decl);
-  if (own_type_owns(w->checker, type)) {
+  if (block && own_is_string_type(type)) {
+    int source = decl->initializer &&
+                         decl->initializer->type == AST_IDENTIFIER &&
+                         decl->initializer->data
+                     ? own_names_find(
+                           names,
+                           ((Identifier *)decl->initializer->data)->name)
+                     : -1;
+    int handed = source >= 0 && w->bindings[source].is_string;
+    string_local = own_string_local_is_tracked(w->checker, block, index, decl,
+                                               handed);
+  }
+  if (own_type_owns(w->checker, type) || string_local) {
     binding = own_new_binding(w, decl->name, type, OWN_BIND_LOCAL, node,
                               block, node->location);
+    w->bindings[binding].is_string = string_local;
     own_map_put(&w->declarations, node, binding);
   }
   own_names_add(names, decl->name, binding);
@@ -358,7 +373,7 @@ static void own_prescan_block(OwnWalker *w, OwnNames *names, ASTNode *node) {
   for (size_t i = 0; block && i < block->declaration_count; i++) {
     ASTNode *statement = block->declarations[i];
     if (statement && statement->type == AST_VAR_DECLARATION) {
-      own_prescan_declare(w, names, statement, node);
+      own_prescan_declare(w, names, statement, node, i);
     } else {
       own_prescan(w, names, statement);
     }
@@ -494,7 +509,7 @@ static void own_prescan(OwnWalker *w, OwnNames *names, ASTNode *node) {
     own_prescan_block(w, names, node);
     return;
   case AST_VAR_DECLARATION:
-    own_prescan_declare(w, names, node, NULL);
+    own_prescan_declare(w, names, node, NULL, 0);
     return;
   case AST_IDENTIFIER:
     own_prescan_identifier(w, names, node);
@@ -631,7 +646,7 @@ static int own_ancestor_with_destructor(OwnWalker *w, int place) {
   return -1;
 }
 
-static void own_event(OwnWalker *w, int place, int value) {
+static void own_event_from(OwnWalker *w, int place, int value, int source) {
   if (w->mode != OWN_MODE_CHECK || w->silent > 0 || !w->unit) {
     return;
   }
@@ -644,7 +659,12 @@ static void own_event(OwnWalker *w, int place, int value) {
   w->events[w->event_count].unit = w->unit;
   w->events[w->event_count].place = place;
   w->events[w->event_count].value = value;
+  w->events[w->event_count].source = source;
   w->event_count++;
+}
+
+static void own_event(OwnWalker *w, int place, int value) {
+  own_event_from(w, place, value, -1);
 }
 
 static SourceLocation own_site(const ASTNode *node) {
@@ -670,8 +690,14 @@ static void own_report_moved_use(OwnWalker *w, int place, ASTNode *node,
     return;
   }
   own_error(w, "O0001", node->location,
-            "use the value before it moves, or give the receiver a pointer "
-            "with '&' so it borrows",
+            p->last_drop && site == p->last_drop
+                ? (strcmp(what, "drop") == 0
+                       ? "a value is dropped once: remove this drop or the "
+                         "earlier one"
+                       : "use the value before the drop, or move the drop "
+                         "after this line")
+                : "use the value before it moves, or give the receiver a "
+                  "pointer with '&' so it borrows",
             "%s of `%s` after it %s%s", what, p->path,
             p->last_drop && site == p->last_drop ? "was dropped"
                                                  : "moved",
@@ -682,10 +708,14 @@ static void own_report_moved_use(OwnWalker *w, int place, ASTNode *node,
   }
 }
 
+static int own_place_is_string(const OwnWalker *w, int place) {
+  return place >= 0 && w->bindings[w->places[place].binding].is_string;
+}
+
 static void own_use(OwnWalker *w, int place, ASTNode *node, int whole,
                     const char *what) {
   int moved_child = -1;
-  if (w->state.dead || place < 0) {
+  if (w->state.dead || place < 0 || own_place_is_string(w, place)) {
     return;
   }
   if (own_effective(w, &w->state, place) & OWN_MOVED) {
@@ -755,6 +785,55 @@ static void own_move(OwnWalker *w, int place, ASTNode *node) {
   own_event(w, place, 0);
   w->places[place].last_move = node;
   own_record_move(w, place, node);
+}
+
+static int own_string_source(OwnWalker *w, ASTNode *node) {
+  int binding = node && node->type == AST_IDENTIFIER ? own_root_binding(w, node)
+                                                     : -1;
+  return binding >= 0 && w->bindings[binding].is_string
+             ? w->bindings[binding].root
+             : -1;
+}
+
+static void own_hand_over(OwnWalker *w, int source, ASTNode *node,
+                          const char *into, int kept) {
+  char note[300];
+  char reason[300];
+  if (w->state.dead || source < 0) {
+    return;
+  }
+  own_set_subtree(w, &w->state, source, OWN_MOVED);
+  own_event(w, source, 0);
+  w->places[source].last_move = node;
+  if (!own_reporting(w)) {
+    return;
+  }
+  snprintf(note, sizeof(note), "`%s` moves into `%s` here",
+           w->places[source].path, into ? into : "?");
+  own_note_statement(w->note_statement, note);
+  snprintf(reason, sizeof(reason), "`%s` hands its string to `%s`, %s",
+           w->places[source].path, into ? into : "?",
+           kept ? "which drops it in turn"
+                : "which nothing drops, so the string lives until the "
+                  "program ends");
+  own_add_record(OWN_RECORD_MOVE, node->location,
+                 w->bindings[w->places[source].binding].location,
+                 own_function_name(w), w->places[source].path,
+                 w->places[source].type, NULL, reason, 0, 1);
+}
+
+static void own_take_string(OwnWalker *w, int place, int before, int source) {
+  if (w->state.dead) {
+    return;
+  }
+  if (before == OWN_LIVE || before == OWN_MOVED || before == 0) {
+    int live = before == OWN_LIVE;
+    own_set_subtree(w, &w->state, place, live ? OWN_LIVE : OWN_MOVED);
+    own_event(w, place, live);
+    return;
+  }
+  own_set_subtree(w, &w->state, place, OWN_LIVE | OWN_MOVED);
+  own_event_from(w, place, 0, source);
 }
 
 static void own_reinit(OwnWalker *w, int place, ASTNode *node) {
@@ -1164,7 +1243,9 @@ static OwnFrame *own_find_value_frame(OwnWalker *w, int scope_id) {
 }
 
 static void own_rvalue(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
-  if (!own_node_owns(w, node) || ctx == OWN_CTX_MOVE) {
+  int owning = own_node_owns(w, node);
+  if (ctx == OWN_CTX_MOVE || ctx == OWN_CTX_CONSUMED ||
+      (!owning && !own_string_owned(w->checker, node))) {
     return;
   }
   if (ctx == OWN_CTX_DISCARD) {
@@ -1172,6 +1253,17 @@ static void own_rvalue(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
     return;
   }
   own_add_obligation(w, OWN_OB_TEMPORARY, -1, node, w->root, own_site(node));
+}
+
+static OwnCtx own_value_ctx(OwnWalker *w, struct Type *type) {
+  if (own_type_owns(w->checker, type)) {
+    return OWN_CTX_MOVE;
+  }
+  return own_is_string_type(type) ? OWN_CTX_CONSUMED : OWN_CTX_READ;
+}
+
+static OwnCtx own_node_value_ctx(OwnWalker *w, ASTNode *node) {
+  return node ? own_value_ctx(w, node->resolved_type) : OWN_CTX_READ;
 }
 
 static int own_is_named_builtin(const char *name) {
@@ -1202,13 +1294,34 @@ static int own_place_of(OwnWalker *w, ASTNode *node, int *exact) {
   return -1;
 }
 
+static void own_not_built_string(OwnWalker *w, ASTNode *arg) {
+  char subject[200];
+  own_error(w, "O0015", arg->location,
+            "drop a string where it holds what interpolation, `+` or a "
+            "function that builds one returned; a literal or a view of "
+            "someone else's string is not yours to free",
+            "`%s` holds no string this function built, so there is nothing "
+            "to drop",
+            own_place_text(arg, subject, sizeof(subject)));
+}
+
+static int own_in_generic_instance(const OwnWalker *w) {
+  return w->function && w->function->is_generic_instance;
+}
+
 static void own_drop_tracked(OwnWalker *w, ASTNode *call, ASTNode *arg,
                              int place, int forget) {
   OwnSteps steps;
   int owner = own_ancestor_with_destructor(w, place);
   if (!w->state.dead &&
       own_effective(w, &w->state, place) == OWN_MOVED) {
-    own_report_moved_use(w, place, arg, forget ? "forget" : "drop");
+    ASTNode *site = w->places[place].last_drop ? w->places[place].last_drop
+                                               : w->places[place].last_move;
+    if (own_place_is_string(w, place) && (!site || site == call)) {
+      own_not_built_string(w, arg);
+    } else {
+      own_report_moved_use(w, place, arg, forget ? "forget" : "drop");
+    }
     return;
   }
   if (owner >= 0) {
@@ -1246,6 +1359,16 @@ static void own_drop_call(OwnWalker *w, ASTNode *node, CallExpression *call,
     own_drop_tracked(w, node, arg, place, forget);
     return;
   }
+  if (own_is_string_type(arg->resolved_type)) {
+    if (own_string_owned(w->checker, arg)) {
+      own_expr(w, arg, OWN_CTX_MOVE);
+    } else if (own_in_generic_instance(w)) {
+      own_expr(w, arg, OWN_CTX_READ);
+    } else {
+      own_not_built_string(w, arg);
+    }
+    return;
+  }
   if (place >= 0) {
     own_use(w, place, arg, 0, "drop");
     return;
@@ -1258,10 +1381,33 @@ static void own_drop_call(OwnWalker *w, ASTNode *node, CallExpression *call,
   own_expr(w, arg, OWN_CTX_MOVE);
 }
 
-static void own_call_args(OwnWalker *w, ASTNode **args, size_t count) {
+static int own_is_interp_call_expr(const CallExpression *call) {
+  return call && call->function_name && !call->object &&
+         strcmp(call->function_name, "__mtl_interp") == 0;
+}
+
+static OwnCtx own_arg_ctx(OwnWalker *w, CallExpression *call, ASTNode *arg,
+                          size_t index) {
+  if (own_node_owns(w, arg)) {
+    return OWN_CTX_MOVE;
+  }
+  if (!arg || !own_is_string_type(arg->resolved_type)) {
+    return OWN_CTX_READ;
+  }
+  if (w->in_capture) {
+    return OWN_CTX_CONSUMED;
+  }
+  if (call && (own_is_interp_call_expr(call) ||
+               own_callee_borrows(w->checker, call, index))) {
+    return OWN_CTX_TEMP;
+  }
+  return OWN_CTX_CONSUMED;
+}
+
+static void own_call_args(OwnWalker *w, CallExpression *call, ASTNode **args,
+                          size_t count) {
   for (size_t i = 0; i < count; i++) {
-    own_expr(w, args[i], own_node_owns(w, args[i]) ? OWN_CTX_MOVE
-                                                   : OWN_CTX_READ);
+    own_expr(w, args[i], own_arg_ctx(w, call, args[i], i));
   }
 }
 
@@ -1317,7 +1463,7 @@ static void own_call(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
                                                              : OWN_CTX_READ);
   }
   own_check_gathered(w, call);
-  own_call_args(w, call->arguments, call->argument_count);
+  own_call_args(w, call, call->arguments, call->argument_count);
   own_rvalue(w, node, ctx);
 }
 
@@ -1420,9 +1566,17 @@ static void own_unary(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
   own_expr(w, unary->operand, OWN_CTX_READ);
 }
 
-static void own_binary(OwnWalker *w, ASTNode *node) {
+static OwnCtx own_operand_ctx(int concat, ASTNode *operand) {
+  if (concat && operand && own_is_string_type(operand->resolved_type)) {
+    return OWN_CTX_CONSUMED;
+  }
+  return OWN_CTX_READ;
+}
+
+static void own_binary(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
   BinaryExpression *binary = (BinaryExpression *)node->data;
   ASTNode *saved_root = w->root;
+  int concat = 0;
   if (!binary) {
     return;
   }
@@ -1437,8 +1591,11 @@ static void own_binary(OwnWalker *w, ASTNode *node) {
     w->root = saved_root;
     return;
   }
-  own_expr(w, binary->left, OWN_CTX_READ);
-  own_expr(w, binary->right, OWN_CTX_READ);
+  concat = binary->operator && strcmp(binary->operator, "+") == 0 &&
+           own_is_string_type(node->resolved_type);
+  own_expr(w, binary->left, own_operand_ctx(concat, binary->left));
+  own_expr(w, binary->right, own_operand_ctx(concat, binary->right));
+  own_rvalue(w, node, ctx);
 }
 
 static void own_index(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
@@ -1467,7 +1624,7 @@ static void own_aggregate(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
   if (!literal) {
     return;
   }
-  own_call_args(w, literal->elements, literal->element_count);
+  own_call_args(w, NULL, literal->elements, literal->element_count);
   own_expr(w, literal->repeat_count, OWN_CTX_READ);
   own_rvalue(w, node, ctx);
 }
@@ -1486,7 +1643,7 @@ static void own_func_ptr_call(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
     return;
   }
   own_expr(w, call->function, OWN_CTX_READ);
-  own_call_args(w, call->arguments, call->argument_count);
+  own_call_args(w, NULL, call->arguments, call->argument_count);
   own_rvalue(w, node, ctx);
 }
 
@@ -1527,7 +1684,7 @@ static void own_expr(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
     own_unary(w, node, ctx);
     return;
   case AST_BINARY_EXPRESSION:
-    own_binary(w, node);
+    own_binary(w, node, ctx);
     return;
   case AST_INDEX_EXPRESSION:
     own_index(w, node, ctx);
@@ -1567,14 +1724,21 @@ static void own_set_unit(OwnWalker *w, ASTNode *unit, ASTNode *root) {
 static void own_var_declaration(OwnWalker *w, ASTNode *node) {
   VarDeclaration *decl = (VarDeclaration *)node->data;
   int binding = -1;
+  int source = -1;
+  int before = 0;
+  int kept = 0;
   struct Type *type = decl ? own_declared_type(w->checker, decl) : NULL;
   own_set_unit(w, node, decl ? decl->initializer : NULL);
   if (!decl) {
     return;
   }
-  own_expr(w, decl->initializer, own_type_owns(w->checker, type)
-                                     ? OWN_CTX_MOVE
-                                     : OWN_CTX_READ);
+  source = own_is_string_type(type) ? own_string_source(w, decl->initializer)
+                                    : -1;
+  if (source >= 0) {
+    before = w->state.dead ? 0 : own_effective(w, &w->state, source);
+  } else {
+    own_expr(w, decl->initializer, own_value_ctx(w, type));
+  }
   if (own_map_get(&w->declarations, node, &binding) && binding >= 0) {
     if (!w->statement_block && w->mode == OWN_MODE_CHECK) {
       own_error(w, "O0010", node->location,
@@ -1584,7 +1748,16 @@ static void own_var_declaration(OwnWalker *w, ASTNode *node) {
                 decl->name);
     }
     own_declare(w, binding);
+    kept = w->bindings[binding].is_string;
+    if (kept && source >= 0) {
+      own_take_string(w, w->bindings[binding].root, before, source);
+    } else if (kept && !w->state.dead &&
+               !own_string_owned(w->checker, decl->initializer)) {
+      own_set_subtree(w, &w->state, w->bindings[binding].root, OWN_MOVED);
+      own_event(w, w->bindings[binding].root, 0);
+    }
   }
+  own_hand_over(w, source, decl->initializer, decl->name, kept);
 }
 
 static int own_previous_drops(OwnWalker *w, ASTNode *target) {
@@ -1609,14 +1782,25 @@ static int own_previous_drops(OwnWalker *w, ASTNode *target) {
 }
 
 static void own_assign_tracked(OwnWalker *w, ASTNode *node, ASTNode *target,
-                               int place) {
+                               int place, int source, int before) {
   OwnSteps steps;
+  Assignment *assign = (Assignment *)node->data;
   if (own_plan(w, &w->state, place, &steps) > 0) {
     own_add_obligation(w, OWN_OB_ASSIGN_DROP, w->places[place].binding, node,
                        target, node->location);
   }
   free(steps.steps);
   own_reinit(w, place, node);
+  if (!own_place_is_string(w, place)) {
+    return;
+  }
+  if (source >= 0) {
+    own_take_string(w, place, before, source);
+  } else if (!w->state.dead &&
+             !own_string_owned(w->checker, assign ? assign->value : NULL)) {
+    own_set_subtree(w, &w->state, place, OWN_MOVED);
+    own_event(w, place, 0);
+  }
 }
 
 static void own_assign_untracked(OwnWalker *w, ASTNode *node,
@@ -1648,33 +1832,48 @@ static void own_assignment(OwnWalker *w, ASTNode *node) {
   int exact = 0;
   int place = -1;
   int binding = -1;
+  int source = -1;
+  int before = 0;
   own_set_unit(w, node, assign ? assign->value : NULL);
   if (!assign) {
     return;
   }
   if (assign->target_count > 0) {
-    own_expr(w, assign->value, OWN_CTX_READ);
+    own_expr(w, assign->value, own_node_value_ctx(w, assign->value));
     for (size_t i = 0; i < assign->target_count; i++) {
       own_expr(w, assign->targets[i], OWN_CTX_ADDRESS);
     }
     return;
   }
   target = assign->target;
+  source = target ? -1 : own_string_source(w, assign->value);
+  before = source >= 0 && !w->state.dead
+               ? own_effective(w, &w->state, source)
+               : 0;
   binding = target ? -1 : own_assigned_binding(w, node);
   if (binding >= 0) {
-    own_expr(w, assign->value, OWN_CTX_MOVE);
-    own_assign_tracked(w, node, NULL, w->bindings[binding].root);
+    if (source < 0) {
+      own_expr(w, assign->value, OWN_CTX_MOVE);
+    }
+    own_assign_tracked(w, node, NULL, w->bindings[binding].root, source,
+                       before);
+    own_hand_over(w, source, assign->value, assign->variable_name,
+                  w->bindings[binding].is_string);
     return;
   }
   place = own_place_of(w, target, &exact);
   if (place >= 0 && exact) {
     own_expr(w, assign->value, OWN_CTX_MOVE);
-    own_assign_tracked(w, node, target, place);
+    own_assign_tracked(w, node, target, place, -1, 0);
     return;
   }
   if (!target || (!own_node_owns(w, target) &&
                   !own_node_owns(w, assign->value))) {
-    own_expr(w, assign->value, OWN_CTX_READ);
+    if (source >= 0) {
+      own_hand_over(w, source, assign->value, assign->variable_name, 0);
+    } else {
+      own_expr(w, assign->value, own_node_value_ctx(w, assign->value));
+    }
     own_expr(w, target, OWN_CTX_ADDRESS);
     return;
   }
@@ -1687,13 +1886,10 @@ static void own_return(OwnWalker *w, ASTNode *node) {
   own_set_unit(w, node, ret ? ret->value : NULL);
   if (ret && ret->value_count > 1) {
     for (size_t i = 0; i < ret->value_count; i++) {
-      own_expr(w, ret->values[i], own_node_owns(w, ret->values[i])
-                                      ? OWN_CTX_MOVE
-                                      : OWN_CTX_READ);
+      own_expr(w, ret->values[i], own_node_value_ctx(w, ret->values[i]));
     }
   } else if (ret && ret->value) {
-    own_expr(w, ret->value, own_node_owns(w, ret->value) ? OWN_CTX_MOVE
-                                                        : OWN_CTX_READ);
+    own_expr(w, ret->value, own_node_value_ctx(w, ret->value));
   }
   own_exit_to(w, node, 0, NULL);
 }
@@ -2002,6 +2198,11 @@ static void own_defer_drop(OwnWalker *w, ASTNode *node, ASTNode *call_node,
                         call_node, place);
     return;
   }
+  if (arg && own_is_string_type(arg->resolved_type) &&
+      !own_in_generic_instance(w)) {
+    own_not_built_string(w, arg);
+    return;
+  }
   own_scope_add_defer(w, OWN_DEFER_DROP_UNTRACKED, node, call_node, -1);
 }
 
@@ -2034,7 +2235,9 @@ static void own_defer(OwnWalker *w, ASTNode *node) {
     return;
   }
   if (own_defer_captures(defer->statement)) {
+    w->in_capture++;
     own_expr(w, defer->statement, OWN_CTX_DISCARD);
+    w->in_capture--;
     return;
   }
   own_scope_add_defer(w, OWN_DEFER_STATEMENT, node, NULL, -1);
@@ -2073,8 +2276,7 @@ static void own_yield(OwnWalker *w, ASTNode *node) {
               : own_find_value_frame(w, yield->scope_id);
   own_set_unit(w, node, yield->value);
   if (yield->value) {
-    own_expr(w, yield->value, own_node_owns(w, yield->value) ? OWN_CTX_MOVE
-                                                            : OWN_CTX_READ);
+    own_expr(w, yield->value, own_node_value_ctx(w, yield->value));
   }
   if (!frame) {
     w->state.dead = 1;
@@ -2300,8 +2502,11 @@ static void own_assign_bits(OwnWalker *w) {
     binding = &w->bindings[w->places[i].binding];
     w->places[i].bit = own_new_bit(w->places[i].path, binding->location.line);
     snprintf(note, sizeof(note),
-             "`%s` moves on some paths only, so the live bit %s records "
-             "whether it still holds a value",
+             binding->is_string
+                 ? "`%s` holds a string this function built on some paths "
+                   "only, so the live bit %s records whether it holds one"
+                 : "`%s` moves on some paths only, so the live bit %s "
+                   "records whether it still holds a value",
              w->places[i].path, ownership_bit_name(w->places[i].bit));
     own_note_statement(binding->kind == OWN_BIND_LOCAL ? binding->declaration
                                                        : w->function_node,
@@ -2312,20 +2517,42 @@ static void own_assign_bits(OwnWalker *w) {
                    w->bindings[w->places[i].binding].location,
                    own_function_name(w), w->places[i].path, w->places[i].type,
                    NULL,
-                   "moves on some paths and not others, so a live bit decides "
-                   "at each drop whether it still holds a value",
+                   binding->is_string
+                       ? "holds a string this function built on some paths "
+                         "and not others, so a live bit decides at each drop "
+                         "whether there is one to free"
+                       : "moves on some paths and not others, so a live bit "
+                         "decides at each drop whether it still holds a value",
                    0, 0);
   }
 }
 
+static void own_copied_bits(OwnWalker *w) {
+  for (size_t e = w->event_count; e > 0; e--) {
+    OwnEvent *event = &w->events[e - 1];
+    if (event->source < 0) {
+      continue;
+    }
+    for (size_t i = 0; i < w->place_count; i++) {
+      if (w->places[i].wants_bit &&
+          own_is_ancestor(w, event->place, (int)i)) {
+        w->places[event->source].wants_bit = 1;
+      }
+    }
+  }
+}
+
 void own_commit_outputs(OwnWalker *w) {
+  own_copied_bits(w);
   own_assign_bits(w);
   for (size_t e = 0; e < w->event_count; e++) {
     OwnEvent *event = &w->events[e];
+    int source = event->source >= 0 ? w->places[event->source].bit : -1;
     for (size_t i = 0; i < w->place_count; i++) {
       if (w->places[i].bit >= 0 &&
           own_is_ancestor(w, event->place, (int)i)) {
-        own_store_unit_write(event->unit, w->places[i].bit, event->value);
+        own_store_unit_write(event->unit, w->places[i].bit, event->value,
+                             source);
       }
     }
   }

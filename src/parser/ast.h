@@ -200,6 +200,7 @@ typedef struct {
   const char *generated_by;
   int is_explicit;
   int ownership_role;
+  int is_generic_instance;
 } FunctionDeclaration;
 
 typedef struct {

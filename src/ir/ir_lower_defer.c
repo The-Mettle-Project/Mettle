@@ -21,22 +21,9 @@ int ir_defer_stack_push(IRLoweringContext *context, IRDeferStack *stack,
   stack->entries[stack->count].capture_call_name = NULL;
   stack->entries[stack->count].capture_arg_temps = NULL;
   stack->entries[stack->count].capture_arg_count = 0;
-  stack->entries[stack->count].release_string = NULL;
   stack->entries[stack->count].drop_root_name = NULL;
   stack->entries[stack->count].drop_root_index = -1;
   stack->count++;
-  return 1;
-}
-
-int ir_defer_stack_push_string_release(IRLoweringContext *context,
-                                       IRDeferStack *stack, ASTNode *node,
-                                       const char *local_name) {
-  char *owned = mettle_strdup(local_name);
-  if (!owned || !ir_defer_stack_push(context, stack, node, 0)) {
-    free(owned);
-    return 0;
-  }
-  stack->entries[stack->count - 1].release_string = owned;
   return 1;
 }
 
@@ -45,7 +32,6 @@ void ir_defer_stack_free(IRDeferStack *stack) {
     return;
   }
   for (size_t i = 0; i < stack->count; i++) {
-    free(stack->entries[i].release_string);
     if (stack->entries[i].capture_arg_temps) {
       for (size_t j = 0; j < stack->entries[i].capture_arg_count; j++) {
         free(stack->entries[i].capture_arg_temps[j]);
@@ -166,16 +152,6 @@ int ir_emit_deferred_calls_filtered(IRLoweringContext *context,
     ASTNode *defer_node = stack->entries[i - 1].node;
     int is_err = stack->entries[i - 1].is_err;
     if (!include_err && is_err) {
-      continue;
-    }
-    if (stack->entries[i - 1].release_string && defer_node) {
-      IROperand held = ir_operand_symbol(stack->entries[i - 1].release_string);
-      int released =
-          ir_emit_string_free(context, function, &held, defer_node->location);
-      ir_operand_destroy(&held);
-      if (!released) {
-        return 0;
-      }
       continue;
     }
     if (!defer_node || (defer_node->type != AST_DEFER_STATEMENT &&

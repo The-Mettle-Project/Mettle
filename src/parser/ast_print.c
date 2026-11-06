@@ -9,6 +9,8 @@ typedef struct {
   size_t unprintable;
   AstPrintAnnotator annotate;
   void *context;
+  int skip_indent;
+  const ASTNode *inline_end;
 } AstPrinter;
 
 static void print_statement(AstPrinter *printer, const ASTNode *node);
@@ -16,6 +18,10 @@ static void print_expression(AstPrinter *printer, const ASTNode *node);
 static void print_block(AstPrinter *printer, const ASTNode *node);
 static void print_match_statement(AstPrinter *printer, const ASTNode *node);
 static void print_switch_statement(AstPrinter *printer, const ASTNode *node);
+static void print_declaration_text(AstPrinter *printer,
+                                   const VarDeclaration *decl);
+static void print_assignment_text(AstPrinter *printer,
+                                  const Assignment *assign);
 
 static AstPrintNote g_statement_note = NULL;
 static AstPrintNote g_block_end_note = NULL;
@@ -46,6 +52,15 @@ static void print_block_end_note(AstPrinter *printer, const ASTNode *block) {
   }
 }
 
+static void print_inline_statement(AstPrinter *printer, const ASTNode *node) {
+  const ASTNode *saved = printer->inline_end;
+  printer->skip_indent = 1;
+  printer->inline_end = node;
+  print_statement(printer, node);
+  printer->skip_indent = 0;
+  printer->inline_end = saved;
+}
+
 static void print_value_scope(AstPrinter *printer, const ValueScope *scope) {
   if (!scope || !scope->body) {
     fputs("{ }", printer->out);
@@ -59,18 +74,30 @@ static void print_value_scope(AstPrinter *printer, const ValueScope *scope) {
                              : NULL;
   if (scope->kind == VALUE_SCOPE_LOOP && block &&
       block->declaration_count == 2) {
-    print_statement(printer, block->declarations[0]);
-    fputs("else", printer->out);
+    print_inline_statement(printer, block->declarations[0]);
+    fputs(" else", printer->out);
     print_block(printer, block->declarations[1]);
     return;
   }
-  print_statement(printer, scope->body);
+  print_inline_statement(printer, scope->body);
 }
 
 static void print_indent(AstPrinter *printer) {
+  if (printer->skip_indent) {
+    printer->skip_indent = 0;
+    return;
+  }
   for (int i = 0; i < printer->depth; i++) {
     fputs("    ", printer->out);
   }
+}
+
+static void print_line_end(AstPrinter *printer, const ASTNode *node) {
+  if (printer->inline_end == node) {
+    printer->inline_end = NULL;
+    return;
+  }
+  fputc('\n', printer->out);
 }
 
 static void print_provenance(AstPrinter *printer, const ASTNode *block) {
@@ -104,9 +131,83 @@ static void print_unprintable(AstPrinter *printer, const char *what) {
   printer->unprintable++;
 }
 
+static void print_string_body(AstPrinter *printer, const char *value);
+
 static void print_string_literal(AstPrinter *printer, const char *value) {
   fputc('"', printer->out);
+  print_string_body(printer, value);
+  fputc('"', printer->out);
+}
+
+static int print_is_interp_call(const ASTNode *node) {
+  const CallExpression *call = node && node->type == AST_FUNCTION_CALL
+                                   ? (const CallExpression *)node->data
+                                   : NULL;
+  return call && !call->object && call->function_name &&
+         call->argument_count == 1 &&
+         strcmp(call->function_name, "__mtl_interp") == 0;
+}
+
+static int print_same_place(const ASTNode *a, const ASTNode *b) {
+  return a->location.line == b->location.line &&
+         a->location.column == b->location.column &&
+         a->location.filename == b->location.filename;
+}
+
+static int print_interp_chain(const ASTNode *node, const ASTNode *origin,
+                              int *calls) {
+  if (!node || !print_same_place(node, origin)) {
+    return 0;
+  }
+  if (node->type == AST_STRING_LITERAL) {
+    return 1;
+  }
+  if (print_is_interp_call(node)) {
+    (*calls)++;
+    return 1;
+  }
+  if (node->type != AST_BINARY_EXPRESSION || !node->data) {
+    return 0;
+  }
+  const BinaryExpression *binary = (const BinaryExpression *)node->data;
+  return binary->operator && strcmp(binary->operator, "+") == 0 &&
+         print_interp_chain(binary->left, origin, calls) &&
+         print_interp_chain(binary->right, origin, calls);
+}
+
+static void print_interp_pieces(AstPrinter *printer, const ASTNode *node) {
+  if (node->type == AST_BINARY_EXPRESSION) {
+    const BinaryExpression *binary = (const BinaryExpression *)node->data;
+    print_interp_pieces(printer, binary->left);
+    print_interp_pieces(printer, binary->right);
+  } else if (node->type == AST_STRING_LITERAL) {
+    const StringLiteral *literal = (const StringLiteral *)node->data;
+    print_string_body(printer, literal ? literal->value : "");
+  } else {
+    fputc('{', printer->out);
+    print_expression(printer,
+                     ((const CallExpression *)node->data)->arguments[0]);
+    fputc('}', printer->out);
+  }
+}
+
+static int print_interpolation(AstPrinter *printer, const ASTNode *node) {
+  int calls = 0;
+  if (!print_interp_chain(node, node, &calls) || calls == 0) {
+    return 0;
+  }
+  fputc('"', printer->out);
+  print_interp_pieces(printer, node);
+  fputc('"', printer->out);
+  return 1;
+}
+
+static void print_string_body(AstPrinter *printer, const char *value) {
   for (const char *p = value ? value : ""; *p; p++) {
+    if (*p == '{') {
+      fputs("{{", printer->out);
+      continue;
+    }
     switch (*p) {
     case '"':
       fputs("\\\"", printer->out);
@@ -128,7 +229,6 @@ static void print_string_literal(AstPrinter *printer, const char *value) {
       break;
     }
   }
-  fputc('"', printer->out);
 }
 
 static void print_new_expression(AstPrinter *printer,
@@ -188,6 +288,9 @@ static void print_expression(AstPrinter *printer, const ASTNode *node) {
     const BinaryExpression *binary = (const BinaryExpression *)node->data;
     if (!binary) {
       print_unprintable(printer, "binary expression");
+      break;
+    }
+    if (print_interpolation(printer, node)) {
       break;
     }
     fputc('(', printer->out);
@@ -266,6 +369,9 @@ static void print_expression(AstPrinter *printer, const ASTNode *node) {
       print_unprintable(printer, "call");
       break;
     }
+    if (print_interpolation(printer, node)) {
+      break;
+    }
     if (call->object) {
       print_expression(printer, call->object);
       fputc('.', printer->out);
@@ -336,6 +442,85 @@ static void print_block(AstPrinter *printer, const ASTNode *node) {
   fputs("}", printer->out);
 }
 
+static int print_names(const ASTNode *node, const char *name) {
+  return node && node->type == AST_IDENTIFIER && node->data &&
+         ((const Identifier *)node->data)->name &&
+         strcmp(((const Identifier *)node->data)->name, name) == 0;
+}
+
+static int print_range_header(AstPrinter *printer, const ForStatement *loop) {
+  const VarDeclaration *decl =
+      loop->initializer && loop->initializer->type == AST_VAR_DECLARATION
+          ? (const VarDeclaration *)loop->initializer->data
+          : NULL;
+  const BinaryExpression *bound =
+      loop->condition && loop->condition->type == AST_BINARY_EXPRESSION
+          ? (const BinaryExpression *)loop->condition->data
+          : NULL;
+  const Assignment *step =
+      loop->increment && loop->increment->type == AST_ASSIGNMENT
+          ? (const Assignment *)loop->increment->data
+          : NULL;
+  const BinaryExpression *next =
+      step && step->value && step->value->type == AST_BINARY_EXPRESSION
+          ? (const BinaryExpression *)step->value->data
+          : NULL;
+  const NumberLiteral *one =
+      next && next->right && next->right->type == AST_NUMBER_LITERAL
+          ? (const NumberLiteral *)next->right->data
+          : NULL;
+  if (!decl || !decl->name || !decl->initializer || decl->is_const ||
+      !bound || !bound->operator || !step || step->target ||
+      !step->variable_name || !next || !next->operator || !one ||
+      one->is_float || one->int_value != 1 ||
+      strcmp(step->variable_name, decl->name) != 0 ||
+      strcmp(next->operator, "+") != 0 ||
+      !print_names(next->left, decl->name) ||
+      !print_names(bound->left, decl->name) ||
+      (strcmp(bound->operator, "<") != 0 &&
+       strcmp(bound->operator, "<=") != 0)) {
+    return 0;
+  }
+  fprintf(printer->out, "for %s", decl->name);
+  if (decl->type_name) {
+    fprintf(printer->out, ": %s", decl->type_name);
+  }
+  fputs(" in ", printer->out);
+  print_expression(printer, decl->initializer);
+  fputs(strcmp(bound->operator, "<=") == 0 ? "..=" : "..", printer->out);
+  print_expression(printer, bound->right);
+  return 1;
+}
+
+static void print_for_header(AstPrinter *printer, const ForStatement *loop) {
+  fputs("for (", printer->out);
+  if (loop->initializer &&
+      loop->initializer->type == AST_VAR_DECLARATION &&
+      loop->initializer->data) {
+    print_declaration_text(printer,
+                           (const VarDeclaration *)loop->initializer->data);
+  } else if (loop->initializer &&
+             loop->initializer->type == AST_ASSIGNMENT &&
+             loop->initializer->data) {
+    print_assignment_text(printer,
+                          (const Assignment *)loop->initializer->data);
+  } else if (loop->initializer) {
+    print_expression(printer, loop->initializer);
+  }
+  fputs("; ", printer->out);
+  if (loop->condition) {
+    print_expression(printer, loop->condition);
+  }
+  fputs("; ", printer->out);
+  if (loop->increment && loop->increment->type == AST_ASSIGNMENT &&
+      loop->increment->data) {
+    print_assignment_text(printer, (const Assignment *)loop->increment->data);
+  } else if (loop->increment) {
+    print_expression(printer, loop->increment);
+  }
+  fputc(')', printer->out);
+}
+
 static void print_loop_statement(AstPrinter *printer,
                                  const ASTNode *node) {
   switch (node->type) {
@@ -345,11 +530,14 @@ case AST_WHILE_STATEMENT: {
     break;
   }
   print_indent(printer);
+  if (loop->label) {
+    fprintf(printer->out, "%s: ", loop->label);
+  }
   fputs("while (", printer->out);
   print_expression(printer, loop->condition);
   fputc(')', printer->out);
   print_block(printer, loop->body);
-  fputc('\n', printer->out);
+  print_line_end(printer, node);
   break;
 }
 
@@ -359,14 +547,14 @@ case AST_FOR_STATEMENT: {
     break;
   }
   print_indent(printer);
-  fputs("for (", printer->out);
-  if (loop->initializer) {
-    fputs("/* init */ ", printer->out);
+  if (loop->label) {
+    fprintf(printer->out, "%s: ", loop->label);
   }
-  print_expression(printer, loop->condition);
-  fputc(')', printer->out);
+  if (!print_range_header(printer, loop)) {
+    print_for_header(printer, loop);
+  }
   print_block(printer, loop->body);
-  fputc('\n', printer->out);
+  print_line_end(printer, node);
   break;
 }
 
@@ -391,17 +579,46 @@ case AST_COMPTIME_FOR: {
   }
 }
 
+static void print_declaration_text(AstPrinter *printer,
+                                   const VarDeclaration *decl) {
+  fprintf(printer->out, "%s %s", decl->is_const ? "const" : "var",
+          decl->name ? decl->name : "<name>");
+  if (decl->type_name) {
+    fprintf(printer->out, ": %s", decl->type_name);
+  }
+  if (decl->initializer) {
+    fputs(" = ", printer->out);
+    print_expression(printer, decl->initializer);
+  }
+}
+
+static void print_assignment_text(AstPrinter *printer,
+                                  const Assignment *assign) {
+  if (assign->target) {
+    print_expression(printer, assign->target);
+  } else {
+    fputs(assign->variable_name ? assign->variable_name : "<target>",
+          printer->out);
+  }
+  fputs(" = ", printer->out);
+  print_expression(printer, assign->value);
+}
+
 static void print_statement(AstPrinter *printer, const ASTNode *node) {
+  int inline_form = 0;
   if (!node) {
     return;
   }
-  if (g_statement_note) {
+  inline_form = printer->inline_end == node;
+  if (g_statement_note && !inline_form) {
     print_note_line(printer, g_statement_note(node));
   }
 
   switch (node->type) {
   case AST_PROGRAM:
-    print_provenance(printer, node);
+    if (!inline_form) {
+      print_provenance(printer, node);
+    }
     print_indent(printer);
     fputs("{\n", printer->out);
     printer->depth++;
@@ -411,7 +628,8 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     printer->depth--;
     print_block_end_note(printer, node);
     print_indent(printer);
-    fputs("}\n", printer->out);
+    fputs("}", printer->out);
+    print_line_end(printer, node);
     break;
 
   case AST_VAR_DECLARATION: {
@@ -420,15 +638,7 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
       break;
     }
     print_indent(printer);
-    fprintf(printer->out, "%s %s", decl->is_const ? "const" : "var",
-            decl->name ? decl->name : "<name>");
-    if (decl->type_name) {
-      fprintf(printer->out, ": %s", decl->type_name);
-    }
-    if (decl->initializer) {
-      fputs(" = ", printer->out);
-      print_expression(printer, decl->initializer);
-    }
+    print_declaration_text(printer, decl);
     fputs(";\n", printer->out);
     break;
   }
@@ -439,14 +649,7 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
       break;
     }
     print_indent(printer);
-    if (assign->target) {
-      print_expression(printer, assign->target);
-    } else {
-      fputs(assign->variable_name ? assign->variable_name : "<target>",
-            printer->out);
-    }
-    fputs(" = ", printer->out);
-    print_expression(printer, assign->value);
+    print_assignment_text(printer, assign);
     fputs(";\n", printer->out);
     break;
   }
@@ -483,7 +686,7 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
       fputs(" else", printer->out);
       print_block(printer, branch->else_branch);
     }
-    fputc('\n', printer->out);
+    print_line_end(printer, node);
     break;
   }
 
@@ -628,7 +831,8 @@ static void print_match_statement(AstPrinter *printer, const ASTNode *node) {
   }
   printer->depth--;
   print_indent(printer);
-  fputs("}\n", printer->out);
+  fputs("}", printer->out);
+  print_line_end(printer, node);
 }
 
 static void print_switch_statement(AstPrinter *printer, const ASTNode *node) {
@@ -667,7 +871,8 @@ static void print_switch_statement(AstPrinter *printer, const ASTNode *node) {
   }
   printer->depth--;
   print_indent(printer);
-  fputs("}\n", printer->out);
+  fputs("}", printer->out);
+  print_line_end(printer, node);
 }
 
 static void print_effect_clause(AstPrinter *printer, const char *word,
@@ -769,6 +974,7 @@ static void print_function_declaration(AstPrinter *printer, const ASTNode *node)
     print_statement(printer, decl->body->children[i]);
   }
   printer->depth--;
+  print_block_end_note(printer, decl->body);
   fputs("}\n\n", printer->out);
   return;
 }

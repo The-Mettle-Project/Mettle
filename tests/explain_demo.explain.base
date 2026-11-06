@@ -18,7 +18,7 @@ L	lcg_hash	0	S	133
 L	main	0	S	146
 L	main	1	S	153
 C	main	saxpy	0	I	157
-C	main	with_call	0	R	158
+C	main	with_call	0	I	158
 C	main	matvec	0	I	159
 L	main	2	S	162
 C	main	sum_bytes	0	I	163
@@ -32,4 +32,4 @@ C	main	chain	0	I	169
 C	main	skew	0	I	169
 C	main	opaque	0	I	170
 C	main	tiny_fixed	0	I	170
-C	main	lcg_hash	0	R	171
+C	main	lcg_hash	0	I	171

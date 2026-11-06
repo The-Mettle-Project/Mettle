@@ -407,7 +407,7 @@ int ownership_call_is_planned(const ASTNode *drop_call) {
   return own_map_get(&g_own.planned_calls, drop_call, NULL);
 }
 
-void own_store_unit_write(const void *unit, int bit, int value) {
+void own_store_unit_write(const void *unit, int bit, int value, int source) {
   int index = 0;
   OwnUnitEntry *entry = NULL;
   if (!own_map_get(&g_own.unit_index, unit, &index)) {
@@ -422,9 +422,10 @@ void own_store_unit_write(const void *unit, int bit, int value) {
     own_map_put(&g_own.unit_index, unit, index);
   }
   entry = &g_own.units[index];
-  for (size_t i = entry->count; i > 0; i--) {
+  for (size_t i = entry->count; source < 0 && i > 0; i--) {
     if (entry->writes[i - 1].bit == bit) {
-      if (entry->writes[i - 1].value == value) {
+      if (entry->writes[i - 1].source < 0 &&
+          entry->writes[i - 1].value == value) {
         return;
       }
       break;
@@ -439,6 +440,7 @@ void own_store_unit_write(const void *unit, int bit, int value) {
   entry->writes = writes;
   entry->writes[entry->count].bit = bit;
   entry->writes[entry->count].value = value;
+  entry->writes[entry->count].source = source;
   entry->count++;
 }
 
@@ -576,8 +578,17 @@ void own_add_fix(OwnFixKind kind, SourceLocation at, const char *text,
   fix->statement_line = at.line;
   fix->statement_column = at.column;
   fix->statement_returns = 0;
+  fix->end_line = at.line;
+  fix->end_column = at.column;
   fix->text = own_strdup(text);
   fix->node = node;
+}
+
+void own_set_fix_end(SourceLocation end) {
+  if (g_own.fix_count > 0 && end.line > 0) {
+    g_own.fixes[g_own.fix_count - 1].end_line = end.line;
+    g_own.fixes[g_own.fix_count - 1].end_column = end.column;
+  }
 }
 
 void own_add_statement_fix(OwnFixKind kind, SourceLocation at,
@@ -1198,6 +1209,9 @@ static int own_node_involves_ownership(TypeChecker *checker,
     return 0;
   }
   if (node->resolved_type && own_type_owns(checker, node->resolved_type)) {
+    return 1;
+  }
+  if (own_string_owned(checker, (ASTNode *)node)) {
     return 1;
   }
   if (node->type == AST_VAR_DECLARATION && node->data &&

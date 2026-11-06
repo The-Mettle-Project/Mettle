@@ -269,16 +269,18 @@ inferred about that parameter. `println("frames {n}")` therefore allocates once
 and frees once. A callee that only hands its parameter back passes that block
 to its result, so `pass("frames {n}")` counts as the same one string.
 
-A local holding such a string is released when its scope ends, on every path
-out, as long as nothing can keep it: the local is read, compared, measured,
-copied into another string or passed to a function that borrows, and never
-reassigned, aliased, stored, returned, captured or asked for `.chars`. Anything
-else leaves the string to the program, exactly as a result of `a + b` is when
-you keep it:
+A local holding such a string is dropped when its scope ends, on every path
+out, and before an assignment gives it a new one. It may be read, compared,
+measured, copied into another string, passed to a function that borrows,
+reassigned, or handed to another local at its last use, which then drops it.
+Storing it, returning it, capturing it or asking for `.chars` leaves the
+string to the program, exactly as a result of `a + b` is when you keep it.
+[Ownership](ownership.md#strings) has the rules, and `mettle expand` prints
+every drop:
 
 ```mettle
 println("frames {n}");        // one block, taken and released
-var label: string = "f {n}";  // released at the end of this scope
+var label: string = "f {n}";  // dropped at the end of this scope
 println(label);
 var kept: string = "k {n}";   // yours: .chars means you took the bytes
 free(kept.chars);

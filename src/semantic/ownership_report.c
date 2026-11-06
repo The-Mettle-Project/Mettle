@@ -196,7 +196,27 @@ static size_t own_line_start(const char *text, size_t at) {
 static size_t own_skip_quoted(const char *text, size_t size, size_t at) {
   char quote = text[at++];
   while (at < size && text[at] != quote) {
-    at += text[at] == '\\' ? 2 : 1;
+    if (text[at] == '\\') {
+      at += 2;
+    } else if (quote == '"' && text[at] == '{' && at + 1 < size &&
+               text[at + 1] == '{') {
+      at += 2;
+    } else if (quote == '"' && text[at] == '{') {
+      int depth = 1;
+      at++;
+      while (at < size && depth > 0) {
+        if (text[at] == '"' || text[at] == '\'') {
+          at = own_skip_quoted(text, size, at);
+        } else if (text[at] == '{') {
+          depth++;
+        } else if (text[at] == '}') {
+          depth--;
+        }
+        at++;
+      }
+    } else {
+      at++;
+    }
   }
   return at;
 }
@@ -334,27 +354,53 @@ static size_t own_call_start(const char *text, size_t at) {
   return at;
 }
 
-static size_t own_call_end(const char *text, size_t size, size_t at) {
+static size_t own_group_end(const char *text, size_t size, size_t at) {
   int depth = 0;
-  while (at < size && ((text[at] >= 'a' && text[at] <= 'z') ||
-                       (text[at] >= 'A' && text[at] <= 'Z') ||
-                       (text[at] >= '0' && text[at] <= '9') ||
-                       text[at] == '_')) {
-    at++;
-  }
-  if (at >= size || text[at] != '(') {
-    return 0;
-  }
   for (; at < size; at++) {
     if (text[at] == '"' || text[at] == '\'') {
       at = own_skip_quoted(text, size, at);
-    } else if (text[at] == '(') {
+    } else if (text[at] == '(' || text[at] == '[') {
       depth++;
-    } else if (text[at] == ')' && --depth == 0) {
+    } else if ((text[at] == ')' || text[at] == ']') && --depth == 0) {
       return at + 1;
     }
   }
   return 0;
+}
+
+static size_t own_primary_end(const char *text, size_t size, size_t at) {
+  if (at >= size) {
+    return 0;
+  }
+  if (text[at] == '"' || text[at] == '\'') {
+    at = own_skip_quoted(text, size, at);
+    return at < size ? at + 1 : 0;
+  }
+  if (text[at] == '(') {
+    return own_group_end(text, size, at);
+  }
+  if (!own_is_name_char(text[at])) {
+    return 0;
+  }
+  for (;;) {
+    while (at < size && own_is_name_char(text[at])) {
+      at++;
+    }
+    if (at < size && (text[at] == '(' || text[at] == '[')) {
+      at = own_group_end(text, size, at);
+      if (at == 0) {
+        return 0;
+      }
+    } else if (at + 1 < size && text[at] == '.' &&
+               own_is_name_char(text[at + 1])) {
+      at++;
+    } else if (at + 2 < size && text[at] == '-' && text[at + 1] == '>' &&
+               own_is_name_char(text[at + 2])) {
+      at += 2;
+    } else {
+      return at;
+    }
+  }
 }
 
 static int own_edit_temporary(const char *text, size_t size,
@@ -362,7 +408,10 @@ static int own_edit_temporary(const char *text, size_t size,
                               size_t *count) {
   size_t call =
       own_call_start(text, own_offset_of(text, size, fix->line, fix->column));
-  size_t call_end = own_call_end(text, size, call);
+  size_t call_end = own_primary_end(
+      text, size,
+      own_call_start(text, own_offset_of(text, size, fix->end_line,
+                                         fix->end_column)));
   size_t statement = own_offset_of(text, size, fix->statement_line,
                                    fix->statement_column);
   size_t line_start = own_line_start(text, statement);
@@ -370,7 +419,7 @@ static int own_edit_temporary(const char *text, size_t size,
   char *held = NULL;
   char *declare = NULL;
   size_t length = 0;
-  if (!indent || call_end == 0) {
+  if (!indent || call_end <= call) {
     free(indent);
     return 0;
   }

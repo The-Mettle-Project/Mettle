@@ -1,0 +1,76 @@
+import "std/io";
+
+extern fn mettle_alloc_report();
+
+var g_kept: string = "";
+
+fn label(n: int32) -> string {
+  return "label {n}";
+}
+
+fn width(s: string) -> int64 {
+  return (int64)s.length;
+}
+
+fn joined(a: string, b: string) -> string {
+  return a + "/" + b;
+}
+
+fn early(n: int32) -> int64 {
+  var s: string = "early {n}";
+  if (n % 2 == 0) {
+    return (int64)s.length;
+  }
+  var t: string = s + "!";
+  return (int64)t.length;
+}
+
+fn reassigned(n: int32) -> int64 {
+  var s: string = "start";
+  for k: int32 in 0..3 {
+    s = "step {k} of {n}";
+  }
+  return (int64)s.length;
+}
+
+fn picked(n: int32) -> int64 {
+  var s: string = "";
+  if (n % 3 == 0) {
+    s = "fizz {n}";
+  } else if (n % 3 == 1) {
+    s = label(n);
+  }
+  return (int64)s.length;
+}
+
+fn work(rounds: int32) -> int64 {
+  var total: int64 = 0;
+  for i: int32 in 0..rounds {
+    var a: string = "a{i}";
+    var b: string = label(i);
+    var c: string = joined(a, b);
+    total = total + width(c) + width("tmp {i}") + width(a + b);
+    total = total + early(i) + reassigned(i) + picked(i);
+    if (i == rounds - 1) {
+      g_kept = c;
+    }
+  }
+  return total;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var rounds: int32 = 10;
+  if (argc > 1) {
+    rounds = 0;
+    var at: int64 = 0;
+    while (argv[1][at] != 0) {
+      rounds = rounds * 10 + ((int32)argv[1][at] - 48);
+      at = at + 1;
+    }
+  }
+  var total: int64 = work(rounds);
+  println("total {total}");
+  println("kept {g_kept}");
+  mettle_alloc_report();
+  return 0;
+}

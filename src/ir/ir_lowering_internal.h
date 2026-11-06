@@ -35,7 +35,6 @@ typedef struct {
   int depth;
   int active;
   int owns_ir_name;
-  int owns_string;
 } IRLocalBinding;
 
 typedef struct {
@@ -95,7 +94,6 @@ typedef struct {
     char *capture_call_name;
     char **capture_arg_temps;
     size_t capture_arg_count;
-    char *release_string;
     const char *drop_root_name;
     long drop_root_index;
   } *entries;
@@ -438,14 +436,8 @@ int ir_emit_defers_at_exit(IRLoweringContext *context, IRFunction *function,
                            const ASTNode *exit);
 
 int ir_string_temp_is_owned(IRLoweringContext *context, ASTNode *node);
-int ir_emit_string_copy_into(IRLoweringContext *context, IRFunction *function,
-                             const char *symbol, struct Type *frontend_type,
-                             SourceLocation location);
 int ir_emit_string_free(IRLoweringContext *context, IRFunction *function,
                         const IROperand *value, SourceLocation location);
-int ir_defer_stack_push_string_release(IRLoweringContext *context,
-                                       IRDeferStack *stack, ASTNode *node,
-                                       const char *local_name);
 int ir_defer_stack_push(IRLoweringContext *context, IRDeferStack *stack,
                                ASTNode *node, int is_err);
 

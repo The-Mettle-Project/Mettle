@@ -539,48 +539,6 @@ int ir_emit_string_free(IRLoweringContext *context, IRFunction *function,
   return ir_emit(context, function, &call);
 }
 
-int ir_emit_string_copy_into(IRLoweringContext *context, IRFunction *function,
-                             const char *symbol, Type *frontend_type,
-                             SourceLocation location) {
-  IROperand copy = ir_operand_none();
-  IROperand call_args[2];
-  MtlcType *call_types[2];
-  MtlcType *string_type = mtlc_type_from_frontend(frontend_type);
-  IRInstruction call = {0};
-  IRInstruction assign = {0};
-  int ok;
-  if (!ir_make_temp_operand(context, &copy)) {
-    return 0;
-  }
-  call_args[0] = ir_operand_symbol(symbol);
-  call_args[1] = ir_operand_string("");
-  call_types[0] = string_type;
-  call_types[1] = string_type;
-  call.op = IR_OP_CALL;
-  call.location = location;
-  call.dest = copy;
-  call.text = "mettle_string_concat";
-  call.arguments = call_args;
-  call.argument_types = call_types;
-  call.argument_count = 2;
-  call.value_type = string_type;
-  call.allocates = 1;
-  ir_declare_string_concat_helper(context);
-  ok = ir_emit(context, function, &call);
-  ir_operand_destroy(&call_args[0]);
-  ir_operand_destroy(&call_args[1]);
-  if (ok) {
-    assign.op = IR_OP_ASSIGN;
-    assign.location = location;
-    assign.dest = ir_operand_symbol(symbol);
-    assign.lhs = copy;
-    ok = ir_emit(context, function, &assign);
-    ir_operand_destroy(&assign.dest);
-  }
-  ir_operand_destroy(&copy);
-  return ok;
-}
-
 static int ir_task_argument_is_repeatable(ASTNode *node) {
   int guard = 0;
   while (node && guard++ < 16) {
@@ -938,26 +896,6 @@ static int ir_lower_call_through_env(IRLoweringContext *context, IRFunction *fun
   }
   free(instruction.argument_types);
   instruction.argument_types = NULL;
-
-  if (call->function_name && !call->is_indirect_call && !call->object) {
-    for (size_t i = 0; i < call->argument_count; i++) {
-      if (!ir_string_temp_is_owned(context, call->arguments[i]) ||
-          !type_checker_callee_borrows(context->type_checker,
-                                       call->function_name, i)) {
-        continue;
-      }
-      if (!ir_emit_string_free(context, function, &arguments[i],
-                               expression->location)) {
-        for (size_t j = 0; j < emitted_argument_count; j++) {
-          ir_operand_destroy(&emitted_arguments[j]);
-        }
-        free(prefixed_arguments);
-        free(arguments);
-        ir_operand_destroy(&destination);
-        return 0;
-      }
-    }
-  }
 
   for (size_t i = 0; i < emitted_argument_count; i++) {
     ir_operand_destroy(&emitted_arguments[i]);

@@ -1,0 +1,28 @@
+import "std/io";
+
+fn borrowed(s: string) {
+  drop(s);
+}
+
+fn literal() {
+  var t: string = "fixed";
+  drop(t);
+}
+
+fn twice(n: int32) {
+  var s: string = "n {n}";
+  drop(s);
+  drop(s);
+}
+
+@explicit fn shown(n: int32) {
+  println("shown {n}");
+}
+
+fn main() -> int32 {
+  borrowed("x");
+  literal();
+  twice(1);
+  shown(2);
+  return 0;
+}

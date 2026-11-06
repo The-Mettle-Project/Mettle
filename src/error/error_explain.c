@@ -977,6 +977,14 @@ static const ErrorCodeDoc DOCS[] = {
      "\n"
      "Fix: pass pointers, or give the function a parameter of the owning\n"
      "type.\n"},
+    {"O0015", "A drop of a string the function did not build",
+     "A string is a view. It owns its bytes only when interpolation, `+`,\n"
+     "or a function that returns a fresh string built it in this function.\n"
+     "A literal, a parameter, a field or a string another variable kept is\n"
+     "someone else's, and freeing it would break whoever owns it.\n"
+     "\n"
+     "Fix: remove the drop. Strings this function built are dropped for it\n"
+     "at the end of their scope; `mettle expand` shows where.\n"},
     {"O0020", "`@explicit` code leaves an owned value undropped",
      "In an `@explicit` function the compiler inserts no drops. A value\n"
      "that still owns a resource when its scope ends would leak, so it is\n"
@@ -998,11 +1006,12 @@ static const ErrorCodeDoc DOCS[] = {
      "Fix: `drop(f());`, or keep the value. `--fix` writes the drop.\n"},
     {"O0023", "`@explicit` code uses an owned temporary",
      "A value that owns a resource is used without a name, as in\n"
-     "`open(path).size`. Implicit code holds it in a hidden local until the\n"
-     "statement ends and drops it there.\n"
+     "`open(path).size` or `println(\"n = {n}\")`, whose interpolation\n"
+     "builds a string on the heap. Implicit code holds it in a hidden local\n"
+     "until the statement ends and drops it there.\n"
      "\n"
      "Fix: put it in a variable, use it, and drop it. `--fix` writes that\n"
-     "when the value is a call in a plain statement.\n"},
+     "when the value sits in a statement.\n"},
     {"O0099", "Internal ownership error",
      "The drops the compiler inserted into a function did not account for\n"
      "every owned value when it checked its own work. This is a compiler\n"

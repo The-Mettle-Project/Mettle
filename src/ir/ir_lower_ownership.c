@@ -139,6 +139,50 @@ static void ir_own_note(const ASTNode *expression, const OwnDropStep *steps,
   ownership_note_compiled(expression, text);
 }
 
+static int ir_own_drop_string(IRLoweringContext *context, IRFunction *function,
+                              ASTNode *expression, ASTNode *arg,
+                              const OwnDropPlan *plan, SourceLocation at) {
+  IROperand value = ir_operand_none();
+  char *skip = NULL;
+  int guard = plan && plan->step_count > 0 ? plan->steps[0].guard : -1;
+  int ok = 1;
+  if (plan && plan->step_count == 0) {
+    return 1;
+  }
+  if (!plan && ir_own_is_place(arg)) {
+    return 1;
+  }
+  if (!ir_lower_expression(context, function, arg, &value)) {
+    return 0;
+  }
+  if (guard >= 0 && ownership_bit_name(guard)) {
+    IRInstruction branch = {0};
+    skip = ir_new_label_name(context, "drop_skip");
+    branch.op = IR_OP_BRANCH_ZERO;
+    branch.location = at;
+    branch.lhs = ir_operand_symbol(ownership_bit_name(guard));
+    branch.text = skip;
+    ok = skip && branch.lhs.name && ir_emit(context, function, &branch);
+    ir_operand_destroy(&branch.lhs);
+  }
+  ok = ok && ir_emit_string_free(context, function, &value, at);
+  ir_operand_destroy(&value);
+  if (skip) {
+    ok = ok && ir_emit_label_instruction(context, function, skip, at);
+    free(skip);
+  }
+  ownership_note_compiled(expression,
+                          guard >= 0 ? "1 call to mettle_string_free, behind "
+                                       "a live bit"
+                                     : "1 call to mettle_string_free");
+  return ok;
+}
+
+static int ir_own_is_string(Type *type) {
+  type = ir_own_strip(type);
+  return type && type->kind == TYPE_STRING;
+}
+
 int ir_lower_drop_call(IRLoweringContext *context, IRFunction *function,
                        ASTNode *expression, IROperand *out_value) {
   CallExpression *call = (CallExpression *)expression->data;
@@ -164,7 +208,8 @@ int ir_lower_drop_call(IRLoweringContext *context, IRFunction *function,
     type = ir_infer_expression_type(context, arg);
   }
   if (strcmp(call->function_name, "forget") == 0 ||
-      !ownership_type_owns(context->type_checker, type)) {
+      (!ownership_type_owns(context->type_checker, type) &&
+       !ir_own_is_string(type))) {
     return ir_own_is_place(arg) ? 1 : ir_own_discard(context, function, arg);
   }
   plan = ownership_drop_plan(expression, exit);
@@ -173,6 +218,9 @@ int ir_lower_drop_call(IRLoweringContext *context, IRFunction *function,
                  "internal error: no drop plan for this exit from line %zu",
                  expression->location.line);
     return 0;
+  }
+  if (ir_own_is_string(type)) {
+    return ir_own_drop_string(context, function, expression, arg, plan, at);
   }
   memset(&whole, 0, sizeof(whole));
   whole.type = type;
@@ -223,15 +271,22 @@ int ir_ownership_after_unit(IRLoweringContext *context, IRFunction *function,
     if (!name) {
       continue;
     }
+    const char *source = writes[i].source >= 0
+                             ? ownership_bit_name(writes[i].source)
+                             : NULL;
     assign.op = IR_OP_ASSIGN;
     assign.location = location;
     assign.dest = ir_operand_symbol(name);
-    assign.lhs = ir_operand_int(writes[i].value);
-    if (!assign.dest.name || !ir_emit(context, function, &assign)) {
+    assign.lhs = source ? ir_operand_symbol(source)
+                        : ir_operand_int(writes[i].value);
+    if (!assign.dest.name || (source && !assign.lhs.name) ||
+        !ir_emit(context, function, &assign)) {
       ir_operand_destroy(&assign.dest);
+      ir_operand_destroy(&assign.lhs);
       return 0;
     }
     ir_operand_destroy(&assign.dest);
+    ir_operand_destroy(&assign.lhs);
   }
   return 1;
 }

@@ -22,6 +22,7 @@ typedef struct {
   int needs_drop;
   int reported;
   int declared;
+  int is_string;
 } OwnBinding;
 
 typedef struct {
@@ -108,6 +109,7 @@ typedef struct {
   const void *unit;
   int place;
   int value;
+  int source;
 } OwnEvent;
 
 typedef struct {
@@ -160,6 +162,7 @@ typedef struct OwnWalker {
   int conditional;
   int in_errdefer;
   int in_deferred;
+  int in_capture;
   int errors;
   int internal_errors;
 } OwnWalker;
@@ -187,6 +190,8 @@ typedef struct {
   size_t statement_line;
   size_t statement_column;
   int statement_returns;
+  size_t end_line;
+  size_t end_column;
   char *text;
   ASTNode *node;
 } OwnFix;
@@ -196,6 +201,7 @@ void own_add_fix(OwnFixKind kind, SourceLocation at, const char *text,
 void own_add_statement_fix(OwnFixKind kind, SourceLocation at,
                            SourceLocation statement, int returns,
                            const char *text);
+void own_set_fix_end(SourceLocation end);
 size_t own_fix_count(void);
 OwnFix *own_fix_at(size_t index);
 void own_note_block_end(ASTNode *block, const char *text);
@@ -217,6 +223,15 @@ struct Type *own_param_type(TypeChecker *checker, FunctionDeclaration *fd,
 char *own_type_text(struct Type *type);
 void own_require_glue(TypeChecker *checker, struct Type *type,
                       SourceLocation site);
+
+int own_is_string_type(struct Type *type);
+int own_is_interp_call(const ASTNode *node);
+int own_string_owned(TypeChecker *checker, ASTNode *node);
+int own_callee_borrows(TypeChecker *checker, CallExpression *call,
+                       size_t index);
+int own_string_local_is_tracked(TypeChecker *checker, ASTNode *block,
+                                size_t index, VarDeclaration *decl,
+                                int handed);
 
 int own_walk_function(OwnWalker *walker);
 void own_walker_init(OwnWalker *walker, TypeChecker *checker,
@@ -252,7 +267,7 @@ void own_add_record(OwnRecordKind kind, SourceLocation at,
                     const char *reason, int inserted, int written);
 void own_store_plan(const ASTNode *drop_call, const ASTNode *exit,
                     OwnDropStep *steps, size_t count, int unreachable);
-void own_store_unit_write(const void *unit, int bit, int value);
+void own_store_unit_write(const void *unit, int bit, int value, int source);
 int own_new_bit(const char *path, size_t line);
 void own_store_function_bit(const ASTNode *function, int bit);
 void own_link_compiled(const ASTNode *drop_call);

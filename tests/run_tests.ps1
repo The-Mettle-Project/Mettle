@@ -12961,6 +12961,9 @@ try {
     if ($out -notmatch [regex]::Escape($expected)) { throw "expand is missing '$expected': $out" }
   }
   if ($out -match "no source form") { throw "expand left a node unprinted: $out" }
+  if ($out -notmatch "println\(""nested end""\);\r?\n    // drops ``o``\r?\n}") {
+    throw "expand does not say what a function's closing brace drops: $out"
+  }
   $json = & $CompilerPath -i tests/test_ownership_paths.mettle --ownership-json 2>&1 | Out-String
   if ($json -notmatch '"kind":"drop-runs"' -or $json -notmatch '"kind":"move"') {
     throw "--ownership-json is missing records: $json"
@@ -12977,6 +12980,82 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "ownership_is_inspectable" -Passed $false -Reason $_.Exception.Message
+}
+
+# A string the function built is dropped like any owned value: at scope end,
+# before a reassignment, after a statement that only borrowed it, or never,
+# when it moves into a global. The same program runs 10 and 5000 rounds; the
+# blocks still live at the end must not grow with the round count.
+foreach ($strMode in @("debug", "release", "safe")) {
+  $total++
+  $caseName = "ownership_strings_$strMode"
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "$caseName.exe"
+    $extraArgs = @()
+    if ($strMode -eq "release") { $extraArgs = @("--release") }
+    if ($strMode -eq "safe") { $extraArgs = @("--safe") }
+    $buildOut = & $CompilerPath --build @extraArgs tests/test_ownership_strings.mettle -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "build failed ($strMode): $buildOut" }
+    $live = @{}
+    foreach ($rounds in @(@{ N = "10"; Out = "total 470`nkept a9/label 9" }, @{ N = "5000"; Out = "total 340662`nkept a4999/label 4999" })) {
+      $runOut = ((cmd /c "`"$exePath`" $($rounds.N) 2>&1" | Out-String) -replace "`r`n", "`n").TrimEnd()
+      if ($runOut -notmatch "Owned runtime heap: (\d+) allocations, (\d+) frees") { throw "no heap ledger ($strMode, $($rounds.N)): $runOut" }
+      $live[$rounds.N] = [int64]$Matches[1] - [int64]$Matches[2]
+      if ($rounds.N -eq "5000" -and [int64]$Matches[1] -lt 100000) { throw "5000 rounds took only $($Matches[1]) blocks" }
+      $printed = ($runOut -split "`n" | Where-Object { $_ -notmatch "Owned runtime heap" }) -join "`n"
+      if ($printed -ne $rounds.Out) { throw "output mismatch ($strMode, $($rounds.N)):`n$printed" }
+    }
+    if ($live["10"] -ne $live["5000"]) { throw "strings leak ($strMode): $($live['10']) blocks live after 10 rounds, $($live['5000']) after 5000" }
+    Write-CaseResult -Name $caseName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+  }
+}
+
+# The string drops print like every other drop, and the expansion is Mettle
+# a reader can follow: interpolations as written, range loops as ranges.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $out = & $CompilerPath expand tests/test_ownership_strings.mettle --focus 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
+  foreach ($expected in @(
+      "defer drop(a);",
+      "holds a string this function built, so it is dropped",
+      "moves into ``s`` here",
+      "``c`` moves into ``g_kept`` here",
+      "drops ``c`` if it has not moved",
+      "the string this interpolation builds is not kept",
+      "the string this ``+`` builds is not kept",
+      "is still computed first",
+      "for k: int32 in 0..3 {",
+      "return ""label {n}"";",
+      "total = {")) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "expand is missing '$expected': $out" }
+  }
+  foreach ($absent in @("__mtl_interp", "/* init */", "no source form")) {
+    if ($out -match [regex]::Escape($absent)) { throw "expand printed '$absent': $out" }
+  }
+  $out = & $CompilerPath --build tests/err_ownership_strings.mettle -o (Join-Path $tmpDir "err_ownership_strings.exe") 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "a program that drops strings it never built compiled" }
+  foreach ($expected in @(
+      "error[O0015]: ``s`` holds no string this function built",
+      "error[O0015]: ``t`` holds no string this function built",
+      "error[O0001]: drop of ``s`` after it was dropped",
+      "a value is dropped once",
+      "error[O0023]: the string this interpolation builds is used without a name")) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }
+  }
+  $explained = & $CompilerPath explain O0015 2>&1 | Out-String
+  if ($explained -notmatch "A string is a view") { throw "mettle explain O0015 has no entry: $explained" }
+  Write-CaseResult -Name "ownership_strings_are_inspectable" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ownership_strings_are_inspectable" -Passed $false -Reason $_.Exception.Message
 }
 
 foreach ($valueMode in @("debug", "optimized", "release", "safe")) {
@@ -21878,8 +21957,8 @@ $issueRegressions = @(
   @{ Name = "safe_release_parallel_runs_on_one_thread"; Entry = "tests/test_parallel_loop.mettle"; Args = @("--safe", "--release"); Expect = @() },
   @{ Name = "safe_neighbour_region_keeps_slot_identity"; Entry = "tests/issues/safe_neighbour_region_keeps_slot_identity.mettle"; Args = @("--safe"); Expect = @("ok") },
   @{ Name = "jump_ends_at_closing_brace"; Entry = "tests/issues/jump_ends_at_brace.mettle"; Args = @(); Expect = @("8 2 4") },
-  @{ Name = "string_local_reassigned_is_freed"; Entry = "tests/issues/string_local_reassigned_is_freed.mettle"; Args = @(); Expect = @("4496 allocations, 4496 frees", "3386 3780") },
-  @{ Name = "string_local_reassigned_is_freed_release"; Entry = "tests/issues/string_local_reassigned_is_freed.mettle"; Args = @("--release"); Expect = @("4496 allocations, 4496 frees", "3386 3780") },
+  @{ Name = "string_local_reassigned_is_freed"; Entry = "tests/issues/string_local_reassigned_is_freed.mettle"; Args = @(); Expect = @("3996 allocations, 3996 frees", "3386 3780") },
+  @{ Name = "string_local_reassigned_is_freed_release"; Entry = "tests/issues/string_local_reassigned_is_freed.mettle"; Args = @("--release"); Expect = @("3996 allocations, 3996 frees", "3386 3780") },
   @{ Name = "string_returned_fresh_is_freed"; Entry = "tests/issues/string_returned_fresh_is_freed.mettle"; Args = @(); Expect = @("3603 allocations, 3601 frees", "5260 x7 x7") },
   @{ Name = "string_returned_fresh_is_freed_safe_release"; Entry = "tests/issues/string_returned_fresh_is_freed.mettle"; Args = @("--safe", "--release"); Expect = @("3603 allocations, 3601 frees", "5260 x7 x7") },
   @{ Name = "trait_method_chain_generic"; Entry = "tests/issues/trait_method_chain_generic.mettle"; Args = @(); Expect = @("12 40 17") },

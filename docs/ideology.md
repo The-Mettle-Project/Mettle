@@ -291,9 +291,9 @@ Go through these in order. The first failure ends it.
   freestanding targets, described machines.
 - `--verify`, `--explain` with simulated fixes and a list of beliefs, `mettle expand`.
 - Drops and moves for every type with a `drop` method, its fields, arrays and enum
-  payloads, with live bits where a value moves on some paths only. `mettle expand`
-  prints them, `--explain` lists them, the editor shows them, and `@explicit` refuses
-  them with fixes.
+  payloads, and for strings built by interpolation and `+`, with live bits where a
+  value moves on some paths only. `mettle expand` prints them, `--explain` lists them,
+  the editor shows them, and `@explicit` refuses them with fixes.
 
 ## What doesn't work yet
 
@@ -303,8 +303,9 @@ Go through these in order. The first failure ends it.
 - Emitters and the order of the built-in passes. Nothing reaches those from Mettle.
 - The loader arriving with the first change. A live build links it now.
 - Snapshots and crash rewind.
-- Heap strings made by interpolation and `+`. Older code in IR lowering frees them at
-  scope exit and after calls, and records none of it.
+- Freeing a built string once it leaves the function: returned without proof that
+  it is fresh, stored in a struct or a global, or kept by a callee. Those bytes live
+  until the program ends.
 - Moving the older runtime components to Mettle. The crash handler, profiler, safety and
   debug code are still C.
 

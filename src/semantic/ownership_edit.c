@@ -201,15 +201,69 @@ int own_places_equal(const ASTNode *a, const ASTNode *b) {
   }
 }
 
+static size_t own_append(char *out, size_t size, size_t used,
+                         const char *text) {
+  while (text && *text && used + 1 < size) {
+    out[used++] = *text++;
+  }
+  out[used < size ? used : size - 1] = '\0';
+  return used;
+}
+
+static int own_interp_piece(const ASTNode *node, const ASTNode *origin) {
+  if (!node || node->location.line != origin->location.line ||
+      node->location.column != origin->location.column) {
+    return 0;
+  }
+  if (node->type == AST_STRING_LITERAL || own_is_interp_call(node)) {
+    return 1;
+  }
+  const BinaryExpression *binary = node->type == AST_BINARY_EXPRESSION
+                                       ? (const BinaryExpression *)node->data
+                                       : NULL;
+  return binary && binary->operator && strcmp(binary->operator, "+") == 0 &&
+         own_interp_piece(binary->left, origin) &&
+         own_interp_piece(binary->right, origin);
+}
+
+static size_t own_place_print(const ASTNode *place, char *out, size_t size,
+                              size_t used);
+
+static size_t own_interp_print(const ASTNode *node, char *out, size_t size,
+                               size_t used) {
+  if (node->type == AST_BINARY_EXPRESSION) {
+    const BinaryExpression *binary = (const BinaryExpression *)node->data;
+    used = own_interp_print(binary->left, out, size, used);
+    return own_interp_print(binary->right, out, size, used);
+  }
+  if (node->type == AST_STRING_LITERAL) {
+    const char *text = ((const StringLiteral *)node->data)->value;
+    for (; text && *text; text++) {
+      char one[3] = {*text, *text == '{' ? '{' : '\0', '\0'};
+      used = own_append(out, size, used, one);
+    }
+    return used;
+  }
+  used = own_append(out, size, used, "{");
+  used = own_place_print(((const CallExpression *)node->data)->arguments[0],
+                         out, size, used);
+  return own_append(out, size, used, "}");
+}
+
 static size_t own_place_print(const ASTNode *place, char *out, size_t size,
                               size_t used) {
   if (!place || used + 1 >= size) {
     return used;
   }
+  if ((place->type == AST_BINARY_EXPRESSION || own_is_interp_call(place)) &&
+      own_interp_piece(place, place)) {
+    used = own_append(out, size, used, "\"");
+    used = own_interp_print(place, out, size, used);
+    return own_append(out, size, used, "\"");
+  }
   switch (place->type) {
   case AST_IDENTIFIER:
-    return used + (size_t)snprintf(out + used, size - used, "%s",
-                                   ((Identifier *)place->data)->name);
+    return own_append(out, size, used, ((Identifier *)place->data)->name);
   case AST_MEMBER_ACCESS: {
     const MemberAccess *access = (const MemberAccess *)place->data;
     const ASTNode *object = access->object;
@@ -217,37 +271,52 @@ static size_t own_place_print(const ASTNode *place, char *out, size_t size,
         strcmp(((UnaryExpression *)object->data)->operator, "*") == 0) {
       used = own_place_print(((UnaryExpression *)object->data)->operand, out,
                              size, used);
-      return used + (size_t)snprintf(out + used, size - used, "->%s",
-                                     access->member);
+      used = own_append(out, size, used, "->");
+      return own_append(out, size, used, access->member);
     }
     used = own_place_print(object, out, size, used);
-    return used +
-           (size_t)snprintf(out + used, size - used, ".%s", access->member);
+    used = own_append(out, size, used, ".");
+    return own_append(out, size, used, access->member);
   }
   case AST_UNARY_EXPRESSION:
-    used += (size_t)snprintf(out + used, size - used, "%s",
-                             ((UnaryExpression *)place->data)->operator);
+    used = own_append(out, size, used,
+                      ((UnaryExpression *)place->data)->operator);
     return own_place_print(((UnaryExpression *)place->data)->operand, out,
                            size, used);
   case AST_INDEX_EXPRESSION:
     used = own_place_print(((ArrayIndexExpression *)place->data)->array, out,
                            size, used);
-    used += (size_t)snprintf(out + used, size - used, "[");
+    used = own_append(out, size, used, "[");
     used = own_place_print(((ArrayIndexExpression *)place->data)->index, out,
                            size, used);
-    return used + (size_t)snprintf(out + used, size - used, "]");
-  case AST_NUMBER_LITERAL:
-    return used + (size_t)snprintf(out + used, size - used, "%lld",
-                                   ((NumberLiteral *)place->data)->int_value);
-  case AST_FUNCTION_CALL:
-    return used + (size_t)snprintf(out + used, size - used, "%s(...)",
-                                   ((CallExpression *)place->data)
-                                           ->function_name
-                                       ? ((CallExpression *)place->data)
-                                             ->function_name
-                                       : "?");
+    return own_append(out, size, used, "]");
+  case AST_NUMBER_LITERAL: {
+    char number[32];
+    snprintf(number, sizeof(number), "%lld",
+             ((NumberLiteral *)place->data)->int_value);
+    return own_append(out, size, used, number);
+  }
+  case AST_STRING_LITERAL: {
+    used = own_append(out, size, used, "\"");
+    used = own_interp_print(place, out, size, used);
+    return own_append(out, size, used, "\"");
+  }
+  case AST_BINARY_EXPRESSION: {
+    const BinaryExpression *binary = (const BinaryExpression *)place->data;
+    used = own_place_print(binary->left, out, size, used);
+    used = own_append(out, size, used, " ");
+    used = own_append(out, size, used, binary->operator);
+    used = own_append(out, size, used, " ");
+    return own_place_print(binary->right, out, size, used);
+  }
+  case AST_FUNCTION_CALL: {
+    const CallExpression *call = (const CallExpression *)place->data;
+    used = own_append(out, size, used,
+                      call->function_name ? call->function_name : "?");
+    return own_append(out, size, used, "(...)");
+  }
   default:
-    return used + (size_t)snprintf(out + used, size - used, "...");
+    return own_append(out, size, used, "...");
   }
 }
 
@@ -314,8 +383,11 @@ static int own_insert_scope_drop(OwnWalker *w, OwnBinding *binding) {
       return 0;
     }
     snprintf(reason, sizeof(reason),
-             "`%s` owns a resource, so it is dropped when its scope ends, "
-             "unless it has moved",
+             binding->is_string
+                 ? "`%s` holds a string this function built, so it is "
+                   "dropped when its scope ends, unless it has moved"
+                 : "`%s` owns a resource, so it is dropped when its scope "
+                   "ends, unless it has moved",
              binding->name);
     own_block_insert(binding->block, (size_t)index + 1, defer);
   } else if (binding->kind == OWN_BIND_PARAM) {
@@ -557,6 +629,54 @@ static int own_is_trivial(const ASTNode *node) {
   return 0;
 }
 
+static ASTNode *own_leftmost(ASTNode *node) {
+  while (node) {
+    if (node->type == AST_BINARY_EXPRESSION) {
+      node = ((BinaryExpression *)node->data)->left;
+    } else if (node->type == AST_MEMBER_ACCESS) {
+      node = ((MemberAccess *)node->data)->object;
+    } else if (node->type == AST_INDEX_EXPRESSION) {
+      node = ((ArrayIndexExpression *)node->data)->array;
+    } else {
+      return node;
+    }
+  }
+  return node;
+}
+
+static ASTNode *own_rightmost(ASTNode *node) {
+  while (node) {
+    if (node->type == AST_BINARY_EXPRESSION) {
+      node = ((BinaryExpression *)node->data)->right;
+    } else if (node->type == AST_UNARY_EXPRESSION) {
+      node = ((UnaryExpression *)node->data)->operand;
+    } else if (node->type == AST_CAST_EXPRESSION) {
+      node = ((CastExpression *)node->data)->operand;
+    } else {
+      return own_leftmost(node);
+    }
+  }
+  return node;
+}
+
+static int own_is_interpolation(const ASTNode *first, const ASTNode *last) {
+  return first && last &&
+         (first->type == AST_STRING_LITERAL || own_is_interp_call(first)) &&
+         first->location.line == last->location.line &&
+         first->location.column == last->location.column;
+}
+
+static int own_built_string(ASTNode *node, const char **what) {
+  int interpolation =
+      own_is_interpolation(own_leftmost(node), own_rightmost(node));
+  if (!node || !own_is_string_type(node->resolved_type) ||
+      (!interpolation && node->type != AST_BINARY_EXPRESSION)) {
+    return 0;
+  }
+  *what = interpolation ? "interpolation" : "`+`";
+  return 1;
+}
+
 static size_t own_collect_hoists(ASTNode *root, ASTNode *target,
                                  ASTNode **hoist, size_t max) {
   ASTNode *path[256];
@@ -608,22 +728,36 @@ static int own_name_temporary(OwnWalker *w, OwnObligation *ob) {
   if (!root) {
     return 0;
   }
+  const char *built = NULL;
   own_place_text(ob->node, subject, sizeof(subject));
   hoists = own_collect_hoists(root, ob->node, hoist, 16);
   for (size_t i = 0; i < hoists; i++) {
     char *held = own_temp_name("__arg");
+    char note[300];
     ASTNode *value = own_node_move_out(hoist[i]);
     prefix[i] = own_make_var(held, value);
     own_become_identifier(hoist[i], held, value->resolved_type);
+    snprintf(note, sizeof(note),
+             "inserted: `%s` holds what is written before `%s`, so it is "
+             "still computed first",
+             held, name);
+    own_note_statement(prefix[i], note);
+  }
+  if (own_built_string(ob->node, &built)) {
+    snprintf(reason, sizeof(reason),
+             "the string this %s builds is not kept, so it is held in `%s` "
+             "until the statement ends and dropped there",
+             built, name);
+  } else {
+    snprintf(reason, sizeof(reason),
+             "the value %s returns is not kept, so it is held in `%s` until "
+             "the statement ends and dropped there",
+             subject, name);
   }
   ASTNode *value = own_node_move_out(ob->node);
   prefix[hoists] = own_make_var(name, value);
   own_become_identifier(ob->node, name, value->resolved_type);
   snprintf(text, sizeof(text), "var %s = %s;", name, subject);
-  snprintf(reason, sizeof(reason),
-           "the value %s returns is not kept, so it is held in `%s` until "
-           "the statement ends and dropped there",
-           subject, name);
   own_record_inserted(w, prefix[hoists], OWN_RECORD_TEMPORARY, subject,
                       value->resolved_type, ob->node->location,
                       ob->node->location, text, reason);
@@ -831,25 +965,39 @@ static void own_explicit_one(OwnWalker *w, OwnObligation *ob) {
                         ob->node->location, "", NULL);
     return;
   default: {
-    int statement_level = ob->kind == OWN_OB_TEMPORARY && ob->statement &&
-                          ob->node->type == AST_FUNCTION_CALL;
+    int statement_level = ob->kind == OWN_OB_TEMPORARY && ob->statement;
     char *holder = own_temp_name("held_");
+    ASTNode *first = own_leftmost(ob->node);
+    ASTNode *last = own_rightmost(ob->node);
+    const char *built = NULL;
     own_place_text(ob->node, subject, sizeof(subject));
-    snprintf(message, sizeof(message),
-             "the value %s returns owns a resource and is used without a "
-             "name, and `@explicit` code drops nothing on its own",
-             subject);
-    snprintf(help, sizeof(help),
-             "put it in a variable first, as `var %s = %s;`, and drop it "
-             "when the statement is done%s",
-             holder, subject, statement_level ? "; --fix writes it" : "");
+    if (own_built_string(ob->node, &built)) {
+      snprintf(message, sizeof(message),
+               "the string this %s builds is used without a name, and "
+               "`@explicit` code drops nothing on its own",
+               built);
+      snprintf(help, sizeof(help),
+               "put it in a variable first, as `var %s = ...;`, and drop it "
+               "when the statement is done%s",
+               holder, statement_level ? "; --fix writes it" : "");
+    } else {
+      snprintf(message, sizeof(message),
+               "the value %s returns owns a resource and is used without a "
+               "name, and `@explicit` code drops nothing on its own",
+               subject);
+      snprintf(help, sizeof(help),
+               "put it in a variable first, as `var %s = %s;`, and drop it "
+               "when the statement is done%s",
+               holder, subject, statement_level ? "; --fix writes it" : "");
+    }
     own_report_explicit(w, ob, "O0023", message, help, OWN_FIX_REPLACE,
-                        ob->node->location, NULL, NULL);
+                        first->location, NULL, NULL);
     if (statement_level) {
-      own_add_statement_fix(OWN_FIX_TEMPORARY, ob->node->location,
+      own_add_statement_fix(OWN_FIX_TEMPORARY, first->location,
                             ob->statement->location,
                             ob->statement->type == AST_RETURN_STATEMENT,
                             holder);
+      own_set_fix_end(last->location);
     }
     return;
   }

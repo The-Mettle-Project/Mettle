@@ -34,8 +34,9 @@ pointer and returns nothing. A by-value `T_drop` is an error (`O0011`).
 
 Owning spreads outward. A struct with an owning field owns, a fixed array of
 owning elements owns, and a tagged enum with an owning payload owns, so
-`Option<File>` owns. Pointers, slices and strings own nothing: memory behind a
-pointer belongs to whoever frees it.
+`Option<File>` owns. Pointers and slices own nothing: memory behind a pointer
+belongs to whoever frees it. A string owns its bytes only when the function
+built it; [Strings](#strings) has the rule.
 
 A local declared without an initializer starts zeroed, and a zeroed value gets
 dropped like any other. Write `drop` so that the zero value is safe to drop.
@@ -114,6 +115,83 @@ order.
 
 A value matched on in `match` is held the same way while the arms run, so an
 arm can take its payload.
+
+## Strings
+
+A `string` is a view: a pointer and a length. It owns its bytes when this
+function built them, with interpolation, with `+`, or by calling a function
+that returns a fresh string. A local holding such a string is dropped like any
+owning value: at the end of its scope, on every early exit, and before an
+assignment replaces it.
+
+```mettle
+fn greet(name: string, times: int32) {
+  var line = "hello {name}";
+  for i in 0..times {
+    line = line + "!";
+  }
+  println(line);
+  println("said it {times} times");
+}
+```
+
+`mettle expand greet.mettle --focus` prints:
+
+```mettle
+fn greet(name: string, times: int32) {
+    var line: string = "hello {name}";
+    // inserted: `line` holds a string this function built, so it is dropped when its scope ends, unless it has moved
+    defer drop(line);
+    for i in 0..times {
+        {
+            var __next1 = (line + "!");
+            // inserted: the value `line` held is dropped before the assignment replaces it
+            drop(line);
+            // `__next1` moves into `line` here
+            line = __next1;
+        }
+    }
+    println(line);
+    {
+        // inserted: the string this interpolation builds is not kept, so it is held in `__tmp2` until the statement ends and dropped there
+        var __tmp2 = "said it {times} times";
+        // inserted: `__tmp2` holds a string this function built, so it is dropped when its scope ends, unless it has moved
+        defer drop(__tmp2);
+        println(__tmp2);
+        // drops `__tmp2`
+    }
+    // drops `line`
+}
+```
+
+A string that holds a literal or someone else's view has nothing to free.
+When a local starts with a literal and is later given a built string, a live
+bit records which one it holds.
+
+```mermaid
+flowchart LR
+  B[built: interpolation, +, fresh call] --> O[owned local]
+  O -->|scope ends, assigned over| X[dropped]
+  O -->|last use: var t = s, t = s| T[moves to t]
+  O -->|stored in a global| G[moves out, never dropped]
+  O -->|returned, kept by a callee, put in a struct| E[never dropped]
+```
+
+Assigning a local string to another local at its last use moves it, and the
+new local drops it. Storing it in a global moves it out, and nothing drops it
+after that. A string the compiler cannot follow, because it is returned, put
+in a struct, stored through a pointer, or passed to a function that keeps its
+argument, is never dropped. Its bytes stay allocated until the program ends,
+and `mettle expand` shows no drop for it.
+
+`+` frees its operands that are temporaries, so `a + "x{i}"` frees the
+interpolation as it concatenates. A built string passed to a function that
+only reads it, as in `println("n = {n}")`, is a temporary: it lives until the
+statement ends.
+
+`drop(s)` on a string this function did not build is an error (`O0015`).
+Generic code is the exception: `drop(key)` inside `HashMap<string, V>` does
+nothing, because the map never owned the key's bytes.
 
 ## drop and forget
 
@@ -213,6 +291,7 @@ instead of writing it.
 - `O0012`: a function named `drop` or `forget`.
 - `O0013`: a closure that captures an owning value.
 - `O0014`: an owning value passed to a gathered `T[..]` parameter.
+- `O0015`: a drop of a string the function did not build.
 - `O0020` to `O0023`: what `@explicit` code is missing.
 - `O0099`: the compiler's own insertions failed its check.
 

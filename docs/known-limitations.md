@@ -263,9 +263,11 @@ generic function rather than at the call.
 A `for` header cannot declare a value that owns a resource, and a gathered
 `T[..]` parameter cannot take one.
 
-Heap strings built by interpolation and `+` are freed by older code in IR
-lowering, which records nothing, so they do not show in `mettle expand`,
-`--explain` or the editor.
+A built string that leaves the function's view is never freed: one returned
+from a function the compiler cannot prove returns fresh strings, put in a
+struct, stored through a pointer or in a global, or passed to a function that
+keeps its argument. A string handed from one local to another inside a loop
+counts as leaving, and so does one a `defer` reads before the hand-over.
 
 ## Borrow analysis
 
