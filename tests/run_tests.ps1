@@ -12803,6 +12803,182 @@ foreach ($deferMode in @("debug", "release")) {
   }
 }
 
+# Drops and moves. A value that owns a resource is dropped exactly once: at
+# the end of its scope, on every path out, or where an assignment replaces
+# it, unless it moved first. The printed order is the contract. Release
+# proves the optimizer keeps every destructor call in place, and --safe
+# proves the checked build agrees.
+$ownershipCases = @(
+  @{
+    File = "tests/test_ownership_drops.mettle"
+    Expected = @(
+      "-- pair", "consume 10", "drop 10", "pair end", "drop 11",
+      "-- reassign", "drop 20", "reassigned", "drop 21",
+      "-- loop", "iteration 1", "drop 30", "drop 31", "drop 32", "loop end",
+      "-- early", "drop 41", "drop 40", "early 1", "drop 42", "drop 40",
+      "early 2",
+      "-- option", "got 50", "drop 50", "option end", "drop 51",
+      "-- temp", "id 60", "drop 60", "drop 61", "temp end",
+      "-- array", "array end", "drop 72", "drop 71", "drop 70",
+      "-- defer", "defer end", "drop 81", "user defer", "drop 80",
+      "-- guard", "guard end", "box dropped", "guard 7 released"
+    ) -join "`n"
+  },
+  @{
+    File = "tests/test_ownership_paths.mettle"
+    Expected = @(
+      "-- reinit loop", "consume 1", "drop 1", "consume 2", "drop 2",
+      "reinit end", "drop 3",
+      "-- nested", "nested end", "drop 12", "drop 11", "drop 10",
+      "-- refill", "consume 20", "drop 20", "refill end", "drop 21",
+      "drop 22",
+      "-- forget", "drop 31", "after point drop", "forget end", "drop 32",
+      "-- pick", "drop 41", "picked 40", "drop 40", "picked 41",
+      "-- block value", "drop 51", "block value 50", "drop 50",
+      "-- labeled", "drop 70", "drop 71", "drop 60", "drop 70", "drop 61",
+      "labeled end",
+      "-- switch", "consume 80", "drop 80", "drop 81", "switch end 1",
+      "default case", "switch end 2", "drop 80",
+      "-- match", "some 90", "drop 90", "nothing", "main end", "drop 41",
+      "drop 40"
+    ) -join "`n"
+  }
+)
+
+foreach ($ownCase in $ownershipCases) {
+  foreach ($ownMode in @("debug", "release", "safe")) {
+    $total++
+    $caseName = "ownership_" + [IO.Path]::GetFileNameWithoutExtension($ownCase.File) + "_" + $ownMode
+    try {
+      if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+      $exePath = Join-Path $tmpDir "$caseName.exe"
+      $extraArgs = @()
+      if ($ownMode -eq "release") { $extraArgs = @("--release") }
+      if ($ownMode -eq "safe") { $extraArgs = @("--safe") }
+      $buildOut = & $CompilerPath --build @extraArgs $ownCase.File -o $exePath 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "build failed ($ownMode): $buildOut"
+      }
+      $runOut = ((& $exePath 2>&1 | Out-String) -replace "`r`n", "`n").TrimEnd()
+      if ($runOut -ne $ownCase.Expected) {
+        throw "output mismatch ($ownMode):`n--- expected ---`n$($ownCase.Expected)`n--- got ---`n$runOut"
+      }
+      Write-CaseResult -Name $caseName -Passed $true
+    }
+    catch {
+      $failed++
+      Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+    }
+  }
+}
+
+# A moved value is gone. Using it, moving it again, moving it on a second
+# pass through a loop, moving out of a pointer, calling a destructor by name
+# and moving inside '&&' are each refused with the site that moved it.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $out = & $CompilerPath --build tests/err_ownership_moves.mettle -o (Join-Path $tmpDir "err_ownership_moves.exe") 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "a program that uses moved values compiled" }
+  foreach ($expected in @(
+      "error[O0001]: use of ``a`` after it moved",
+      "move of ``a`` after it moved on some paths",
+      "which this same line moved on the pass before",
+      "error[O0009]",
+      "error[O0007]",
+      "error[O0004]",
+      "``a`` moved here")) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "missing '$expected' in: $out" }
+  }
+  Write-CaseResult -Name "ownership_move_errors" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ownership_move_errors" -Passed $false -Reason $_.Exception.Message
+}
+
+# @explicit code gets no inserted drops: each missing one is an error, --fix
+# writes exactly what the compiler would have inserted, and the result runs
+# the same as the implicit version of the same code.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $explicitDir = Join-Path $tmpDir "ownership_explicit"
+  New-Item -ItemType Directory -Force $explicitDir | Out-Null
+  $explicitSrc = Join-Path $explicitDir "explicit.mettle"
+  $implicitSrc = Join-Path $explicitDir "implicit.mettle"
+  $explicitText = Get-Content tests/err_ownership_explicit.mettle -Raw
+  Set-Content -Path $explicitSrc -Value $explicitText -NoNewline -Encoding ascii
+  Set-Content -Path $implicitSrc -Value ($explicitText -replace "@explicit ", "") -NoNewline -Encoding ascii
+  $explicitExe = Join-Path $explicitDir "explicit.exe"
+  $implicitExe = Join-Path $explicitDir "implicit.exe"
+  $out = & $CompilerPath --build $explicitSrc -o $explicitExe 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "@explicit code with missing drops compiled" }
+  foreach ($code in @("O0020", "O0021", "O0022")) {
+    if ($out -notmatch "error\[$code\]") { throw "missing $code in: $out" }
+  }
+  $fixOut = & $CompilerPath --build --fix $explicitSrc -o $explicitExe 2>&1 | Out-String
+  if ($fixOut -notmatch "fix: wrote") { throw "--fix wrote nothing: $fixOut" }
+  $fixedText = Get-Content $explicitSrc -Raw
+  foreach ($expected in @("defer drop(a);", "drop(make(3));", "drop(a);", "defer drop(h);")) {
+    if ($fixedText -notmatch [regex]::Escape($expected)) { throw "--fix did not write '$expected': $fixedText" }
+  }
+  $buildOut = & $CompilerPath --build $explicitSrc -o $explicitExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "the fixed @explicit file does not compile: $buildOut" }
+  $buildOut = & $CompilerPath --build $implicitSrc -o $implicitExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "the implicit twin does not compile: $buildOut" }
+  $explicitRun = ((& $explicitExe 2>&1 | Out-String) -replace "`r`n", "`n").TrimEnd()
+  $implicitRun = ((& $implicitExe 2>&1 | Out-String) -replace "`r`n", "`n").TrimEnd()
+  if ($explicitRun -ne $implicitRun) {
+    throw "@explicit and implicit code disagree:`n--- explicit ---`n$explicitRun`n--- implicit ---`n$implicitRun"
+  }
+  if ($explicitRun -notmatch "param 9`ndrop 9") { throw "unexpected output: $explicitRun" }
+  Write-CaseResult -Name "ownership_explicit_fix_round_trip" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ownership_explicit_fix_round_trip" -Passed $false -Reason $_.Exception.Message
+}
+
+# Every drop the compiler inserts is visible three ways: mettle expand writes
+# it out as Mettle with its reason, --ownership-json hands it to the editor,
+# and --explain says what it compiled to.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $out = & $CompilerPath expand tests/test_ownership_paths.mettle --focus 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "expand failed: $out" }
+  foreach ($expected in @(
+      "defer drop(x);",
+      "// ``x`` moves here",
+      "// drops ``a``",
+      "match v {",
+      "case Some(h):",
+      "takes the payload out of the matched value",
+      "live bit",
+      "fn __drop_Outer(self: Outer*)",
+      "drop(self->last);")) {
+    if ($out -notmatch [regex]::Escape($expected)) { throw "expand is missing '$expected': $out" }
+  }
+  if ($out -match "no source form") { throw "expand left a node unprinted: $out" }
+  $json = & $CompilerPath -i tests/test_ownership_paths.mettle --ownership-json 2>&1 | Out-String
+  if ($json -notmatch '"kind":"drop-runs"' -or $json -notmatch '"kind":"move"') {
+    throw "--ownership-json is missing records: $json"
+  }
+  $explainOut = & $CompilerPath tests/test_ownership_paths.mettle --release --explain -o (Join-Path $tmpDir "ownership_explain.obj") 2>&1 | Out-String
+  $explainSidecar = Join-Path $tmpDir "ownership_explain.explain.txt"
+  if (-not (Test-Path $explainSidecar)) { throw "--explain wrote no report: $explainOut" }
+  $explain = Get-Content $explainSidecar -Raw
+  if ($explain -notmatch "ownership report" -or $explain -notmatch "lowered to: 1 call to") {
+    throw "--explain has no ownership report: $explain"
+  }
+  Write-CaseResult -Name "ownership_is_inspectable" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "ownership_is_inspectable" -Passed $false -Reason $_.Exception.Message
+}
+
 foreach ($valueMode in @("debug", "optimized", "release", "safe")) {
   $total++
   $caseName = "value_control_flow_$valueMode"

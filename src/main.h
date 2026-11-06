@@ -87,6 +87,9 @@ typedef struct {
   void *trace_rule_checker;
   int report_twins;
   int apply_rule_fixes;
+  int print_fixes;
+  int ownership_json;
+  int expand_focus;
   int why_mode;
   const char *why_subject;
   const char *why_what;

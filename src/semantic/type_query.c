@@ -1,5 +1,6 @@
 #include "type_checker_internal.h"
 #include "import_resolver.h"
+#include "ownership.h"
 
 typedef struct {
   uint32_t type_index;
@@ -232,7 +233,8 @@ int type_checker_type_member_exists(const char *member) {
          (strcmp(member, "kind") == 0 || strcmp(member, "name") == 0 ||
           strcmp(member, "size") == 0 || strcmp(member, "align") == 0 ||
           strcmp(member, "fields") == 0 || strcmp(member, "pointee") == 0 ||
-          strcmp(member, "element") == 0 || strcmp(member, "len") == 0);
+          strcmp(member, "element") == 0 || strcmp(member, "len") == 0 ||
+          strcmp(member, "owns") == 0);
 }
 
 int type_checker_eval_type_member(TypeChecker *checker, ComptimeValue type_value,
@@ -270,6 +272,10 @@ int type_checker_eval_type_member(TypeChecker *checker, ComptimeValue type_value
   }
   if (strcmp(member, "align") == 0) {
     *out_value = comptime_int((long long)type->alignment);
+    return 1;
+  }
+  if (strcmp(member, "owns") == 0) {
+    *out_value = comptime_int(ownership_type_owns(checker, type) ? 1 : 0);
     return 1;
   }
   if (strcmp(member, "fields") == 0) {

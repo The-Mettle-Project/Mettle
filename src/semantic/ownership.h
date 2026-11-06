@@ -47,6 +47,7 @@ typedef struct {
 typedef struct {
   OwnDropStep *steps;
   size_t step_count;
+  int unreachable;
 } OwnDropPlan;
 
 typedef struct {
@@ -84,6 +85,8 @@ void ownership_set_report_focus(const char *focus);
 void ownership_print_report(FILE *out);
 void ownership_print_json(FILE *out, int leading_comma);
 int ownership_write_fixes(FILE *out);
+int ownership_print_fixed_source(FILE *out, const char *path);
+void ownership_print_editor_json(FILE *out);
 void ownership_set_apply_fixes(int enabled);
 
 #endif

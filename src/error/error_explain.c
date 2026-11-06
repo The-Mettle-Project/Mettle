@@ -963,6 +963,20 @@ static const ErrorCodeDoc DOCS[] = {
      "itself, so the name cannot mean anything else.\n"
      "\n"
      "Fix: rename the function.\n"},
+    {"O0013", "A closure that captures an owned value",
+     "A closure copies what it captures into a heap environment, and that\n"
+     "environment is never dropped. A captured owning value would be\n"
+     "dropped where it was declared while the closure still held a copy.\n"
+     "\n"
+     "Fix: capture a pointer to it: `var held = &name;` before the lambda,\n"
+     "and `*held` inside.\n"},
+    {"O0014", "An owned value passed to a gathered parameter",
+     "A last parameter written `T[..]` collects the extra arguments into a\n"
+     "slice. A slice owns nothing, so an owning value passed there would\n"
+     "never be dropped.\n"
+     "\n"
+     "Fix: pass pointers, or give the function a parameter of the owning\n"
+     "type.\n"},
     {"O0020", "`@explicit` code leaves an owned value undropped",
      "In an `@explicit` function the compiler inserts no drops. A value\n"
      "that still owns a resource when its scope ends would leak, so it is\n"

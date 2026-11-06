@@ -1093,7 +1093,9 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
           }
         }
       }
-      if (ce->function_name && strcmp(ce->function_name, "sizeof") == 0 &&
+      if (ce->function_name &&
+          (strcmp(ce->function_name, "sizeof") == 0 ||
+           strcmp(ce->function_name, "typeof") == 0) &&
           ce->argument_count == 1 && ce->arguments[0] &&
           ce->arguments[0]->type == AST_IDENTIFIER) {
         Identifier *type_id = (Identifier *)ce->arguments[0]->data;

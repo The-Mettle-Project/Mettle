@@ -246,6 +246,27 @@ A plain function value already sitting in a variable is not adapted to a
 closure type. Take the address at the point you need it, `&twice`, which is
 accepted at a declaration, an argument, a return, and an assignment.
 
+A closure cannot capture a value that owns a resource, because its environment
+is never dropped. Capture a pointer to it.
+
+## Ownership
+
+The compiler follows locals, parameters, match payloads and their fields.
+Memory behind a pointer, inside a slice or from `new` is never dropped for you:
+write `drop(*p)` before `free(p)`. Moving a value out of an array element, a
+field reached through a pointer or a global takes `mem_take` or `mem_replace`.
+
+Generic code that copies a value, such as `list_get` or `hash_map_get`, cannot
+be instantiated with a type that owns a resource, and the error points into the
+generic function rather than at the call.
+
+A `for` header cannot declare a value that owns a resource, and a gathered
+`T[..]` parameter cannot take one.
+
+Heap strings built by interpolation and `+` are freed by older code in IR
+lowering, which records nothing, so they do not show in `mettle expand`,
+`--explain` or the editor.
+
 ## Borrow analysis
 
 A borrow handed across a call boundary is not followed: the interior pointer
@@ -441,6 +462,9 @@ defer point and replays them at scope exit.
 A deferred method call, `defer obj.m(...)`, and a deferred call through a
 function pointer re-evaluate their operands at scope exit. Snapshot into a
 local first when you need the value from the defer point.
+
+`defer drop(x)` is evaluated at scope exit on purpose: it drops whatever `x`
+holds then, and nothing if `x` has moved.
 
 `errdefer` is function-only and convention-based: any non-zero explicit return
 is treated as an error.

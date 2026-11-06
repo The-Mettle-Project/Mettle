@@ -160,6 +160,9 @@ int ir_lower_drop_call(IRLoweringContext *context, IRFunction *function,
     ir_set_error(context, "drop takes one value");
     return 0;
   }
+  if (!type) {
+    type = ir_infer_expression_type(context, arg);
+  }
   if (strcmp(call->function_name, "forget") == 0 ||
       !ownership_type_owns(context->type_checker, type)) {
     return ir_own_is_place(arg) ? 1 : ir_own_discard(context, function, arg);
@@ -179,7 +182,9 @@ int ir_lower_drop_call(IRLoweringContext *context, IRFunction *function,
     count = plan->step_count;
   }
   if (count == 0) {
-    ir_own_note(expression, steps, 0, NULL);
+    if (!plan || !plan->unreachable) {
+      ir_own_note(expression, steps, 0, NULL);
+    }
     return 1;
   }
   if (!(ir_own_is_place(arg)

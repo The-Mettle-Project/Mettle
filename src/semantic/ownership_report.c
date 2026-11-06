@@ -477,6 +477,57 @@ static int own_edit_compare(const void *a, const void *b) {
   return 0;
 }
 
+static int own_same_file(const char *a, const char *b) {
+  if (!a || !b) {
+    return 0;
+  }
+  for (; *a && *b; a++, b++) {
+    char x = *a == '\\' ? '/' : *a;
+    char y = *b == '\\' ? '/' : *b;
+    if (x != y) {
+      return 0;
+    }
+  }
+  return *a == *b;
+}
+
+static void own_write_edited(FILE *out, const char *text, size_t size,
+                             OwnEdit *edits, size_t count) {
+  size_t cursor = 0;
+  for (size_t i = count; i > 0; i--) {
+    OwnEdit *edit = &edits[i - 1];
+    if (edit->start < cursor) {
+      continue;
+    }
+    fwrite(text + cursor, 1, edit->start - cursor, out);
+    fputs(edit->text ? edit->text : "", out);
+    cursor = edit->end;
+  }
+  fwrite(text + cursor, 1, size - cursor, out);
+}
+
+static size_t own_collect_edits(const char *path, const char *text,
+                                size_t size, OwnEdit **out_edits) {
+  OwnEdit *edits = calloc(own_fix_count() * 3 + 1, sizeof(*edits));
+  size_t count = 0;
+  for (size_t i = 0; edits && i < own_fix_count(); i++) {
+    OwnFix *fix = own_fix_at(i);
+    if (own_same_file(fix->file, path) && fix->text) {
+      own_edit_for(text, size, fix, edits, &count);
+    }
+  }
+  qsort(edits, count, sizeof(*edits), own_edit_compare);
+  *out_edits = edits;
+  return count;
+}
+
+static void own_free_edits(OwnEdit *edits, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    free(edits[i].text);
+  }
+  free(edits);
+}
+
 static int own_apply_file(const char *path, FILE *report) {
   size_t size = 0;
   char *text = own_read_file(path, &size);
@@ -486,38 +537,78 @@ static int own_apply_file(const char *path, FILE *report) {
   if (!text) {
     return 0;
   }
-  edits = calloc(own_fix_count() * 3 + 1, sizeof(*edits));
-  for (size_t i = 0; edits && i < own_fix_count(); i++) {
-    OwnFix *fix = own_fix_at(i);
-    if (fix->file && strcmp(fix->file, path) == 0 && fix->text) {
-      own_edit_for(text, size, fix, edits, &count);
-    }
-  }
-  qsort(edits, count, sizeof(*edits), own_edit_compare);
+  count = own_collect_edits(path, text, size, &edits);
   out = count > 0 ? fopen(path, "wb") : NULL;
   if (out) {
-    size_t cursor = 0;
-    for (size_t i = count; i > 0; i--) {
-      OwnEdit *edit = &edits[i - 1];
-      fwrite(text + cursor, 1, edit->start - cursor, out);
-      fputs(edit->text ? edit->text : "", out);
-      cursor = edit->end;
-    }
-    fwrite(text + cursor, 1, size - cursor, out);
+    own_write_edited(out, text, size, edits, count);
     fclose(out);
     for (size_t i = 0; report && i < own_fix_count(); i++) {
       OwnFix *fix = own_fix_at(i);
-      if (strcmp(fix->file, path) == 0 && fix->text) {
+      if (own_same_file(fix->file, path) && fix->text) {
         own_report_fix(report, fix);
       }
     }
   }
-  for (size_t i = 0; i < count; i++) {
-    free(edits[i].text);
-  }
-  free(edits);
+  own_free_edits(edits, count);
   free(text);
   return out ? (int)count : 0;
+}
+
+int ownership_print_fixed_source(FILE *out, const char *path) {
+  size_t size = 0;
+  char *text = own_read_file(path, &size);
+  OwnEdit *edits = NULL;
+  size_t count = 0;
+  if (!text) {
+    return 0;
+  }
+  count = own_collect_edits(path, text, size, &edits);
+  own_write_edited(out, text, size, edits, count);
+  own_free_edits(edits, count);
+  free(text);
+  return 1;
+}
+
+static const char *own_fix_kind_word(OwnFixKind kind) {
+  switch (kind) {
+  case OWN_FIX_INSERT_AFTER:
+    return "insert-after";
+  case OWN_FIX_INSERT_BEFORE:
+    return "insert-before";
+  case OWN_FIX_WRAP_DROP:
+    return "wrap-drop";
+  case OWN_FIX_ASSIGN_HOLD:
+    return "assign-hold";
+  case OWN_FIX_TEMPORARY:
+    return "temporary";
+  default:
+    return "replace";
+  }
+}
+
+void ownership_print_editor_json(FILE *out) {
+  size_t shown = 0;
+  fputc('{', out);
+  ownership_print_json(out, 0);
+  fputs(",\"fixes\":[", out);
+  for (size_t i = 0; i < own_fix_count(); i++) {
+    const OwnFix *fix = own_fix_at(i);
+    if (!fix->text) {
+      continue;
+    }
+    if (shown++ > 0) {
+      fputc(',', out);
+    }
+    fputs("{\"kind\":", out);
+    own_json_string(out, own_fix_kind_word(fix->kind));
+    fputs(",\"file\":", out);
+    own_json_string(out, fix->file);
+    fprintf(out, ",\"line\":%zu,\"column\":%zu,\"text\":", fix->line,
+            fix->column);
+    own_json_string(out, fix->text);
+    fputc('}', out);
+  }
+  fputs("]}\n", out);
 }
 
 int ownership_write_fixes(FILE *report) {
@@ -526,7 +617,7 @@ int ownership_write_fixes(FILE *report) {
     OwnFix *fix = own_fix_at(i);
     int seen = 0;
     for (size_t j = 0; j < i; j++) {
-      if (strcmp(own_fix_at(j)->file, fix->file) == 0) {
+      if (own_same_file(own_fix_at(j)->file, fix->file)) {
         seen = 1;
         break;
       }

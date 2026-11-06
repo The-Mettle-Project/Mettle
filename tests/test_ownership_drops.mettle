@@ -1,0 +1,144 @@
+import "std/io";
+import "std/core";
+
+struct Handle {
+  id: int32;
+}
+
+fn Handle_drop__ptr(h: Handle*) {
+  if (h->id != 0) {
+    println("drop {h->id}");
+  }
+}
+
+fn make(id: int32) -> Handle {
+  var h: Handle = { id: id };
+  return h;
+}
+
+fn consume(h: Handle) {
+  println("consume {h.id}");
+}
+
+struct Pair {
+  left: Handle;
+  right: Handle;
+}
+
+struct Guard {
+  name: int32;
+
+  method drop() {
+    println("guard {this.name} released");
+  }
+}
+
+struct Box<T> {
+  value: T;
+}
+
+fn Box_drop__ptr<T>(b: Box<T>*) {
+  println("box dropped");
+}
+
+fn pair_test() {
+  println("-- pair");
+  var p: Pair = { left: make(10), right: make(11) };
+  consume(p.left);
+  println("pair end");
+}
+
+fn reassign_test() {
+  println("-- reassign");
+  var h = make(20);
+  h = make(21);
+  println("reassigned");
+}
+
+fn loop_test() {
+  println("-- loop");
+  var i: int32 = 0;
+  while (i < 3) {
+    var h = make(30 + i);
+    i = i + 1;
+    if (i == 2) {
+      continue;
+    }
+    if (i == 3) {
+      break;
+    }
+    println("iteration {i}");
+  }
+  println("loop end");
+}
+
+fn early(flag: bool) -> int32 {
+  var a = make(40);
+  if (flag) {
+    var b = make(41);
+    return 1;
+  }
+  var c = make(42);
+  return 2;
+}
+
+fn option_test() {
+  println("-- option");
+  var some: Option<Handle> = Some(make(50));
+  match some {
+    case Some(h): {
+      println("got {h.id}");
+    }
+    case None: {
+      println("none");
+    }
+  }
+  var other: Option<Handle> = Some(make(51));
+  println("option end");
+}
+
+fn temp_test() {
+  println("-- temp");
+  println("id {make(60).id}");
+  make(61);
+  println("temp end");
+}
+
+fn array_test() {
+  println("-- array");
+  var hs: Handle[3];
+  hs[0] = make(70);
+  hs[1] = make(71);
+  hs[2] = make(72);
+  println("array end");
+}
+
+fn defer_test() {
+  println("-- defer");
+  var a = make(80);
+  defer println("user defer");
+  var b = make(81);
+  println("defer end");
+}
+
+fn guard_test() {
+  println("-- guard");
+  var g: Guard = { name: 7 };
+  var boxed: Box<int32> = { value: 3 };
+  println("guard end");
+}
+
+fn main() -> int32 {
+  pair_test();
+  reassign_test();
+  loop_test();
+  println("-- early");
+  println("early {early(true)}");
+  println("early {early(false)}");
+  option_test();
+  temp_test();
+  array_test();
+  defer_test();
+  guard_test();
+  return 0;
+}

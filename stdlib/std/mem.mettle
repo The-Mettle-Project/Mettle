@@ -154,3 +154,18 @@ export fn buf_dup(src: rawptr, len: int64) -> rawptr {
   memcpy(dst, src, len);
   return dst;
 }
+
+export fn mem_take<T>(place: T*) -> T {
+  var out: T;
+  mem_copy((cstring)&out, (cstring)place, sizeof(T));
+  mem_zero((cstring)place, sizeof(T));
+  return out;
+}
+
+export fn mem_replace<T>(place: T*, value: T) -> T {
+  var out: T;
+  mem_copy((cstring)&out, (cstring)place, sizeof(T));
+  mem_copy((cstring)place, (cstring)&value, sizeof(T));
+  forget(value);
+  return out;
+}

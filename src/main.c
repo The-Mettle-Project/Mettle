@@ -4276,6 +4276,12 @@ static DriverFlagResult parse_flag_checks(CompilerOptions *options,
     options->report_twins = 1;
   } else if (strcmp(argv[i], "--fix") == 0) {
     options->apply_rule_fixes = 1;
+  } else if (strcmp(argv[i], "--fix-print") == 0) {
+    options->print_fixes = 1;
+  } else if (strcmp(argv[i], "--ownership-json") == 0) {
+    options->ownership_json = 1;
+  } else if (strcmp(argv[i], "--focus") == 0) {
+    options->expand_focus = 1;
   } else if (strcmp(argv[i], "--report-effects") == 0) {
     options->report_effects = 1;
   } else if (strncmp(argv[i], "--proof-budget=", 15) == 0) {
@@ -7137,12 +7143,26 @@ static int compile_stage_type_reports(CompileContext *ctx) {
 }
 
 static int compile_stage_ownership(CompileContext *ctx) {
+  int ok = 0;
   ownership_reset();
   ownership_set_apply_fixes(ctx->options->apply_rule_fixes);
   ownership_set_report_focus(ctx->options->explain_all
                                  ? NULL
                                  : ctx->options->input_filename);
-  if (ownership_run(ctx->type_checker, ctx->program, ctx->error_reporter)) {
+  ok = ownership_run(ctx->type_checker, ctx->program, ctx->error_reporter);
+  if (ctx->options->ownership_json) {
+    ownership_print_editor_json(stdout);
+    if (!ok) {
+      error_reporter_print_errors(ctx->error_reporter);
+    }
+    return ok ? 0 : 1;
+  }
+  if (ctx->options->print_fixes) {
+    return ownership_print_fixed_source(stdout, ctx->options->input_filename)
+               ? 0
+               : 1;
+  }
+  if (ok) {
     return COMPILE_CONTINUE;
   }
   error_reporter_print_errors(ctx->error_reporter);
@@ -7156,14 +7176,35 @@ static int compile_stage_ownership(CompileContext *ctx) {
   return 1;
 }
 
+static int expand_keep_declaration(const ASTNode *declaration,
+                                   const void *context) {
+  const char *want = (const char *)context;
+  const char *have = declaration ? declaration->location.filename : NULL;
+  if (!want || !have) {
+    return 0;
+  }
+  for (; *want && *have; want++, have++) {
+    char a = *want == '\\' ? '/' : *want;
+    char b = *have == '\\' ? '/' : *have;
+    if (a != b) {
+      return 0;
+    }
+  }
+  return *want == *have;
+}
+
 static int compile_stage_expand(CompileContext *ctx) {
   size_t unprintable = 0;
   if (!ctx->options->expand_mode) {
     return COMPILE_CONTINUE;
   }
   ast_print_set_notes(ownership_note, ownership_block_end_note);
+  if (ctx->options->expand_focus) {
+    ast_print_set_filter(expand_keep_declaration, ctx->input_filename);
+  }
   unprintable = ast_print_program(stdout, ctx->program, expand_annotate,
                                   ctx->type_checker);
+  ast_print_set_filter(NULL, NULL);
   ast_print_set_notes(NULL, NULL);
   if (unprintable > 0) {
     fprintf(stderr,

@@ -32,10 +32,9 @@ export fn list_reserve<T>(items: List<T>*, minimum: int64) -> Result<int32, stri
   var allocation: T[] = new T[new_capacity];
   var new_data: T* = allocation.data;
   if (new_data == 0) { return Err("out of memory"); }
-  var i: int64 = (int64)0;
-  while (i < items->length) {
-    new_data[i] = items->data[i];
-    i = i + (int64)1;
+  if (items->length > (int64)0) {
+    mem_copy((cstring)new_data, (cstring)items->data,
+             items->length * sizeof(T));
   }
   if (items->data != 0) { free(items->data); }
   items->data = new_data;
@@ -50,7 +49,8 @@ export fn list_push<T>(items: List<T>*, value: T) -> Result<int32, string> {
     case Ok(ignored): { }
     case Err(why): { return Err(why); }
   }
-  items->data[items->length] = value;
+  mem_copy((cstring)&items->data[items->length], (cstring)&value, sizeof(T));
+  forget(value);
   items->length = items->length + (int64)1;
   return Ok(0);
 }
@@ -58,7 +58,7 @@ export fn list_push<T>(items: List<T>*, value: T) -> Result<int32, string> {
 export fn list_pop<T>(items: List<T>*) -> Option<T> {
   if (items == 0 || items->length == (int64)0) { return None; }
   items->length = items->length - (int64)1;
-  return Some(items->data[items->length]);
+  return Some(mem_take<T>(&items->data[items->length]));
 }
 
 export fn list_get_ptr<T>(items: List<T>*, index: int64) -> T* {
@@ -81,26 +81,41 @@ export fn list_set<T>(items: List<T>*, index: int64, value: T) -> bool {
 
 export fn list_remove<T>(items: List<T>*, index: int64) -> Option<T> {
   if (items == 0 || index < (int64)0 || index >= items->length) { return None; }
-  var removed: T = items->data[index];
-  var i: int64 = index;
-  while (i + (int64)1 < items->length) {
-    items->data[i] = items->data[i + (int64)1];
-    i = i + (int64)1;
+  var removed: T = mem_take<T>(&items->data[index]);
+  var after: int64 = items->length - index - (int64)1;
+  if (after > (int64)0) {
+    mem_move((cstring)&items->data[index], (cstring)&items->data[index + (int64)1],
+             after * sizeof(T));
   }
   items->length = items->length - (int64)1;
   return Some(removed);
 }
 
+fn list_drop_items<T>(items: List<T>*) {
+  if (typeof(T).owns != 0) {
+    while (items->length > (int64)0) {
+      items->length = items->length - (int64)1;
+      drop(items->data[items->length]);
+    }
+  }
+  items->length = (int64)0;
+}
+
 export fn list_clear<T>(items: List<T>*) {
-  if (items != 0) { items->length = (int64)0; }
+  if (items != 0) { list_drop_items<T>(items); }
 }
 
 export fn list_free<T>(items: List<T>*) {
   if (items == 0) { return; }
+  list_drop_items<T>(items);
   if (items->data != 0) { free(items->data); }
   items->data = 0;
   items->length = (int64)0;
   items->capacity = (int64)0;
+}
+
+export fn List_drop__ptr<T>(items: List<T>*) {
+  list_free<T>(items);
 }
 
 export struct HashEntry<K, V> {
@@ -131,7 +146,7 @@ export fn hash_map_init<K, V>(hash_fn: fn(rawptr) -> uint64,
   return out;
 }
 
-fn hash_map_find<K, V>(map: HashMap<K, V>*, key: K, hash: uint64) -> int64 {
+fn hash_map_find<K, V>(map: HashMap<K, V>*, key: K*, hash: uint64) -> int64 {
   if (map->capacity == (int64)0) { return (int64)-1; }
   var slot: int64 = (int64)(hash & (uint64)(map->capacity - (int64)1));
   var probes: int64 = (int64)0;
@@ -139,7 +154,7 @@ fn hash_map_find<K, V>(map: HashMap<K, V>*, key: K, hash: uint64) -> int64 {
     var entry: HashEntry<K, V>* = &map->slots[slot];
     if (entry->state == 0) { return (int64)-1; }
     if (entry->state == 1 && entry->hash == hash &&
-        map->equal_fn((rawptr)&entry->key, (rawptr)&key)) {
+        map->equal_fn((rawptr)&entry->key, (rawptr)key)) {
       return slot;
     }
     slot = (slot + (int64)1) & (map->capacity - (int64)1);
@@ -167,7 +182,11 @@ fn hash_map_rehash<K, V>(map: HashMap<K, V>*, new_capacity: int64) -> int32 {
       while (new_slots[slot].state == 1) {
         slot = (slot + (int64)1) & (new_capacity - (int64)1);
       }
-      new_slots[slot] = *old;
+      new_slots[slot].hash = old->hash;
+      mem_copy((cstring)&new_slots[slot].key, (cstring)&old->key, sizeof(K));
+      mem_copy((cstring)&new_slots[slot].value, (cstring)&old->value,
+               sizeof(V));
+      new_slots[slot].state = 1;
     }
     i = i + (int64)1;
   }
@@ -200,7 +219,7 @@ export fn hash_map_put<K, V>(map: HashMap<K, V>*, key: K,
     value: V) -> Result<int32, string> {
   if (map == 0) { return Err("null map"); }
   var hash: uint64 = map->hash_fn((rawptr)&key);
-  var found: int64 = hash_map_find<K, V>(map, key, hash);
+  var found: int64 = hash_map_find<K, V>(map, &key, hash);
   if (found >= (int64)0) {
     map->slots[found].value = value;
     return Ok(0);
@@ -223,8 +242,10 @@ export fn hash_map_put<K, V>(map: HashMap<K, V>*, key: K,
     map->used = map->used + (int64)1;
   }
   map->slots[slot].hash = hash;
-  map->slots[slot].key = key;
-  map->slots[slot].value = value;
+  mem_copy((cstring)&map->slots[slot].key, (cstring)&key, sizeof(K));
+  forget(key);
+  mem_copy((cstring)&map->slots[slot].value, (cstring)&value, sizeof(V));
+  forget(value);
   map->slots[slot].state = 1;
   map->length = map->length + (int64)1;
   return Ok(0);
@@ -233,7 +254,7 @@ export fn hash_map_put<K, V>(map: HashMap<K, V>*, key: K,
 export fn hash_map_get_ptr<K, V>(map: HashMap<K, V>*, key: K) -> V* {
   if (map == 0) { return 0; }
   var hash: uint64 = map->hash_fn((rawptr)&key);
-  var found: int64 = hash_map_find<K, V>(map, key, hash);
+  var found: int64 = hash_map_find<K, V>(map, &key, hash);
   if (found < (int64)0) { return 0; }
   return &map->slots[found].value;
 }
@@ -251,16 +272,34 @@ export fn hash_map_contains<K, V>(map: HashMap<K, V>*, key: K) -> bool {
 export fn hash_map_remove<K, V>(map: HashMap<K, V>*, key: K) -> Option<V> {
   if (map == 0) { return None; }
   var hash: uint64 = map->hash_fn((rawptr)&key);
-  var found: int64 = hash_map_find<K, V>(map, key, hash);
+  var found: int64 = hash_map_find<K, V>(map, &key, hash);
   if (found < (int64)0) { return None; }
-  var removed: V = map->slots[found].value;
+  var removed: V = mem_take<V>(&map->slots[found].value);
+  if (typeof(K).owns != 0) {
+    drop(map->slots[found].key);
+  }
   map->slots[found].state = 2;
   map->length = map->length - (int64)1;
   return Some(removed);
 }
 
+fn hash_map_drop_entries<K, V>(map: HashMap<K, V>*) {
+  if (typeof(K).owns == 0 && typeof(V).owns == 0) {
+    return;
+  }
+  var i: int64 = map->capacity;
+  while (i > (int64)0) {
+    i = i - (int64)1;
+    if (map->slots[i].state == 1) {
+      drop(map->slots[i].value);
+      drop(map->slots[i].key);
+    }
+  }
+}
+
 export fn hash_map_clear<K, V>(map: HashMap<K, V>*) {
   if (map == 0) { return; }
+  hash_map_drop_entries<K, V>(map);
   var i: int64 = (int64)0;
   while (i < map->capacity) {
     map->slots[i].state = 0;
@@ -272,9 +311,14 @@ export fn hash_map_clear<K, V>(map: HashMap<K, V>*) {
 
 export fn hash_map_free<K, V>(map: HashMap<K, V>*) {
   if (map == 0) { return; }
+  hash_map_drop_entries<K, V>(map);
   if (map->slots != 0) { free(map->slots); }
   map->slots = 0;
   map->length = (int64)0;
   map->capacity = (int64)0;
   map->used = (int64)0;
+}
+
+export fn HashMap_drop__ptr<K, V>(map: HashMap<K, V>*) {
+  hash_map_free<K, V>(map);
 }

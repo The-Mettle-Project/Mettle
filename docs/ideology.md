@@ -290,6 +290,10 @@ Go through these in order. The first failure ends it.
 - PE and ELF linkers, x86-64 and AArch64 backends, GPU kernels as PTX, SPIR-V and Metal,
   freestanding targets, described machines.
 - `--verify`, `--explain` with simulated fixes and a list of beliefs, `mettle expand`.
+- Drops and moves for every type with a `drop` method, its fields, arrays and enum
+  payloads, with live bits where a value moves on some paths only. `mettle expand`
+  prints them, `--explain` lists them, the editor shows them, and `@explicit` refuses
+  them with fixes.
 
 ## What doesn't work yet
 
@@ -299,8 +303,8 @@ Go through these in order. The first failure ends it.
 - Emitters and the order of the built-in passes. Nothing reaches those from Mettle.
 - The loader arriving with the first change. A live build links it now.
 - Snapshots and crash rewind.
-- Drops, moves and `@explicit`. Until they land, the compiler frees heap strings made
-  by interpolation and `+` at scope exit and after calls, and records none of it.
+- Heap strings made by interpolation and `+`. Older code in IR lowering frees them at
+  scope exit and after calls, and records none of it.
 - Moving the older runtime components to Mettle. The crash handler, profiler, safety and
   debug code are still C.
 

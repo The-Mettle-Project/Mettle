@@ -21,30 +21,31 @@ frontend, see [Writing a frontend](embedding.md).
 
 ## Memory
 
-8. [Heap allocation](heap-allocation.md)
-9. [Memory safety](memory-safety.md)
-10. [Borrow checker](borrow-checker.md), including what a task may be handed
+8. [Ownership](ownership.md): drops, moves, `@explicit`, and how to see each
+9. [Heap allocation](heap-allocation.md)
+10. [Memory safety](memory-safety.md)
+11. [Borrow checker](borrow-checker.md), including what a task may be handed
 
 ## Building
 
-11. [Getting started](getting-started.md)
-12. [Compilation](compilation.md)
-13. [Diagnostics](diagnostics.md)
-14. [Compile-time execution](testing.md)
-15. [C interoperability](c-interop.md)
-16. [Runtime model](runtime-model.md), including schedules as data
-17. [Rewrite rules](rewrite-rules.md)
-18. [Rules](rules.md)
-19. [Effects](effects.md), including which globals two threads share
+12. [Getting started](getting-started.md)
+13. [Compilation](compilation.md)
+14. [Diagnostics](diagnostics.md)
+15. [Compile-time execution](testing.md)
+16. [C interoperability](c-interop.md)
+17. [Runtime model](runtime-model.md), including schedules as data
+18. [Rewrite rules](rewrite-rules.md)
+19. [Rules](rules.md)
+20. [Effects](effects.md), including which globals two threads share
 
 ## Beyond the CPU
 
-20. [GPU offload](gpu.md)
+21. [GPU offload](gpu.md)
 
 ## Reference
 
-21. [Quick reference](quick-reference.md)
-22. [Known limitations](known-limitations.md)
+22. [Quick reference](quick-reference.md)
+23. [Known limitations](known-limitations.md)
 
 Every mechanism above reports what it spent and what it assumed: `--explain`
 carries sections for the types proven, the effects held, the rules run, and

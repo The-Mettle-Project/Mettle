@@ -424,6 +424,9 @@ static int own_insert_assign_drop(OwnWalker *w, OwnObligation *ob) {
   if (!place || !assign) {
     return 0;
   }
+  if (!place->resolved_type) {
+    place->resolved_type = assign->value ? assign->value->resolved_type : NULL;
+  }
   own_place_text(place, subject, sizeof(subject));
   drop = own_make_drop(w, place, ob->node->location);
   snprintf(text, sizeof(text), "drop(%s);", subject);

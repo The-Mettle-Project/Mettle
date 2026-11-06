@@ -2543,9 +2543,25 @@ static void ir_explain_ownership_json(void) {
   ir_explain_json_raw("],");
 }
 
+static int ir_explain_own_compare(const void *a, const void *b) {
+  const IRExplainOwnNote *x = (const IRExplainOwnNote *)a;
+  const IRExplainOwnNote *y = (const IRExplainOwnNote *)b;
+  if (x->line != y->line) {
+    return x->line < y->line ? -1 : 1;
+  }
+  if (x->column != y->column) {
+    return x->column < y->column ? -1 : 1;
+  }
+  return 0;
+}
+
 static void ir_explain_ownership_flush(void) {
   const char *function = NULL;
   char after[160];
+  if (g_own_count > 1) {
+    qsort(g_own_notes, g_own_count, sizeof(*g_own_notes),
+          ir_explain_own_compare);
+  }
   if (g_explain_json) {
     ir_explain_ownership_json();
   }
@@ -2563,8 +2579,9 @@ static void ir_explain_ownership_flush(void) {
       ir_explain_emit("  %sin %s%s\n", clr(EXPLAIN_BOLD),
                       function ? function : "?", clr(EXPLAIN_RESET));
     }
-    ir_explain_emit("    line %zu, %s%s: %s\n", n->line, n->kind,
-                    n->inserted ? ", inserted" : "",
+    ir_explain_emit("    line %zu, %s%s%s%s%s: %s\n", n->line, n->kind,
+                    n->subject ? " `" : "", n->subject ? n->subject : "",
+                    n->subject ? "`" : "", n->inserted ? ", inserted" : "",
                     n->reason ? n->reason : "");
     if (n->text) {
       ir_explain_emit("      %s%s written out: %s%s\n", clr(EXPLAIN_DIM),

@@ -1,0 +1,153 @@
+import "std/io";
+import "std/core";
+
+struct Handle {
+  id: int32;
+}
+
+fn Handle_drop__ptr(h: Handle*) {
+  if (h->id != 0) {
+    println("drop {h->id}");
+  }
+}
+
+fn make(id: int32) -> Handle {
+  var h: Handle = { id: id };
+  return h;
+}
+
+fn consume(h: Handle) {
+  println("consume {h.id}");
+}
+
+struct Pair {
+  left: Handle;
+  right: Handle;
+}
+
+struct Outer {
+  tag: int32;
+  pair: Pair;
+  last: Handle;
+}
+
+fn reinit_loop() {
+  println("-- reinit loop");
+  var x = make(1);
+  var i: int32 = 0;
+  while (i < 2) {
+    consume(x);
+    x = make(2 + i);
+    i = i + 1;
+  }
+  println("reinit end");
+}
+
+fn nested_glue() {
+  println("-- nested");
+  var o: Outer = { tag: 1, pair: { left: make(10), right: make(11) }, last: make(12) };
+  println("nested end");
+}
+
+fn partial_refill() {
+  println("-- refill");
+  var p: Pair = { left: make(20), right: make(21) };
+  consume(p.left);
+  p.left = make(22);
+  println("refill end");
+}
+
+fn forget_and_point_drop() {
+  println("-- forget");
+  var a = make(30);
+  var b = make(31);
+  forget(a);
+  drop(b);
+  println("after point drop");
+  b = make(32);
+  println("forget end");
+}
+
+fn pick(flag: bool) -> Handle {
+  var a = make(40);
+  var b = make(41);
+  if (flag) {
+    return a;
+  }
+  return b;
+}
+
+fn block_value() {
+  println("-- block value");
+  var held = {
+    var t = make(50);
+    var other = make(51);
+    t
+  };
+  println("block value {held.id}");
+}
+
+fn labeled() {
+  println("-- labeled");
+  var i: int32 = 0;
+  outer: while (i < 2) {
+    var a = make(60 + i);
+    var j: int32 = 0;
+    while (j < 2) {
+      var b = make(70 + j);
+      if (i == 1) {
+        break outer;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  println("labeled end");
+}
+
+fn switching(n: int32) {
+  var a = make(80);
+  switch (n) {
+    case 1: {
+      var b = make(81);
+      consume(a);
+    }
+    default: {
+      println("default case");
+    }
+  }
+  println("switch end {n}");
+}
+
+fn matching(v: Option<Handle>) {
+  match v {
+    case Some(h): {
+      println("some {h.id}");
+    }
+    default: {
+      println("nothing");
+    }
+  }
+}
+
+fn main() -> int32 {
+  reinit_loop();
+  nested_glue();
+  partial_refill();
+  forget_and_point_drop();
+  println("-- pick");
+  var picked = pick(true);
+  println("picked {picked.id}");
+  var other = pick(false);
+  println("picked {other.id}");
+  block_value();
+  labeled();
+  println("-- switch");
+  switching(1);
+  switching(2);
+  println("-- match");
+  matching(Some(make(90)));
+  matching(None);
+  println("main end");
+  return 0;
+}

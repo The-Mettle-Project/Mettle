@@ -29,6 +29,8 @@ frontend can drive instead. The documentation is organized the same way.
 
 ## Memory
 
+- [Ownership](ownership.md): drops and moves the compiler inserts, how to see
+  each one, and `@explicit`.
 - [Heap allocation](heap-allocation.md): the allocators and how to pair them.
 - [Memory safety](memory-safety.md): what the compiler proves, and `--safe`.
 - [Borrow checker](borrow-checker.md): pointers that outlive what they point

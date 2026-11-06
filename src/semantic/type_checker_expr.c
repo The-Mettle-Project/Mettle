@@ -4088,7 +4088,7 @@ static Type *type_checker_infer_type_query(TypeChecker *checker,
           checker, expression->location,
           "type '%s' has no field or query '%s'; a Type answers 'kind', "
           "'name', 'size', 'align', 'fields', 'pointee', 'element', "
-          "and 'len'",
+          "'len' and 'owns'",
           referred->name ? referred->name : "<anonymous>", member->member);
       return NULL;
     }

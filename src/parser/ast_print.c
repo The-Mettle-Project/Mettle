@@ -14,9 +14,13 @@ typedef struct {
 static void print_statement(AstPrinter *printer, const ASTNode *node);
 static void print_expression(AstPrinter *printer, const ASTNode *node);
 static void print_block(AstPrinter *printer, const ASTNode *node);
+static void print_match_statement(AstPrinter *printer, const ASTNode *node);
+static void print_switch_statement(AstPrinter *printer, const ASTNode *node);
 
 static AstPrintNote g_statement_note = NULL;
 static AstPrintNote g_block_end_note = NULL;
+static AstPrintFilter g_keep_declaration = NULL;
+static const void *g_keep_context = NULL;
 
 void ast_print_set_notes(AstPrintNote statement_note,
                          AstPrintNote block_end_note) {
@@ -490,8 +494,29 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     break;
 
   case AST_BREAK_STATEMENT:
+  case AST_CONTINUE_STATEMENT: {
+    const LoopControlStatement *control =
+        (const LoopControlStatement *)node->data;
     print_indent(printer);
-    fputs("break;\n", printer->out);
+    fputs(node->type == AST_BREAK_STATEMENT ? "break" : "continue",
+          printer->out);
+    if (control && control->target_label) {
+      fprintf(printer->out, " %s", control->target_label);
+    }
+    if (control && control->value) {
+      fputc(' ', printer->out);
+      print_expression(printer, control->value);
+    }
+    fputs(";\n", printer->out);
+    break;
+  }
+
+  case AST_MATCH_STATEMENT:
+    print_match_statement(printer, node);
+    break;
+
+  case AST_SWITCH_STATEMENT:
+    print_switch_statement(printer, node);
     break;
 
   case AST_VALUE_SCOPE:
@@ -521,11 +546,6 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     fputc('\n', printer->out);
     break;
   }
-
-  case AST_CONTINUE_STATEMENT:
-    print_indent(printer);
-    fputs("continue;\n", printer->out);
-    break;
 
   case AST_FUNCTION_CALL:
     print_indent(printer);
@@ -558,10 +578,96 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
 
   default:
     print_indent(printer);
+    if (node->type >= AST_IDENTIFIER && node->type <= AST_LAMBDA_EXPRESSION) {
+      print_expression(printer, node);
+      fputs(";\n", printer->out);
+      break;
+    }
     print_unprintable(printer, "this statement");
     fputc('\n', printer->out);
     break;
   }
+}
+
+static void print_arm_body(AstPrinter *printer, const ASTNode *body) {
+  if (body && body->type == AST_PROGRAM) {
+    print_block(printer, body);
+    fputc('\n', printer->out);
+    return;
+  }
+  fputc('\n', printer->out);
+  printer->depth++;
+  print_statement(printer, body);
+  printer->depth--;
+}
+
+static void print_match_statement(AstPrinter *printer, const ASTNode *node) {
+  const MatchStatement *match = (const MatchStatement *)node->data;
+  if (!match) {
+    return;
+  }
+  print_indent(printer);
+  fputs("match ", printer->out);
+  print_expression(printer, match->expression);
+  fputs(" {\n", printer->out);
+  printer->depth++;
+  for (size_t i = 0; i < match->arm_count; i++) {
+    const MatchArm *arm = &match->arms[i];
+    print_indent(printer);
+    if (arm->is_default) {
+      fputs("default:", printer->out);
+    } else {
+      fprintf(printer->out, "case %s", arm->variant_name ? arm->variant_name
+                                                          : "<variant>");
+      if (arm->binding_name) {
+        fprintf(printer->out, "(%s)", arm->binding_name);
+      }
+      fputc(':', printer->out);
+    }
+    print_arm_body(printer, arm->body);
+  }
+  printer->depth--;
+  print_indent(printer);
+  fputs("}\n", printer->out);
+}
+
+static void print_switch_statement(AstPrinter *printer, const ASTNode *node) {
+  const SwitchStatement *sw = (const SwitchStatement *)node->data;
+  if (!sw) {
+    return;
+  }
+  print_indent(printer);
+  fputs("switch (", printer->out);
+  print_expression(printer, sw->expression);
+  fputs(") {\n", printer->out);
+  printer->depth++;
+  for (size_t i = 0; i < sw->case_count; i++) {
+    const CaseClause *clause =
+        sw->cases[i] ? (const CaseClause *)sw->cases[i]->data : NULL;
+    if (!clause) {
+      continue;
+    }
+    print_indent(printer);
+    if (clause->is_default) {
+      fputs("default:", printer->out);
+    } else {
+      fputs("case ", printer->out);
+      print_expression(printer, clause->value);
+      if (clause->value_high) {
+        fputs("..", printer->out);
+        print_expression(printer, clause->value_high);
+      }
+      fputc(':', printer->out);
+    }
+    if (clause->body) {
+      print_arm_body(printer, clause->body);
+    } else {
+      fputc('\n', printer->out);
+    }
+  }
+  printer->depth--;
+  print_indent(printer);
+  fputs("}\n", printer->out);
 }
 
 static void print_effect_clause(AstPrinter *printer, const char *word,
@@ -769,9 +875,18 @@ size_t ast_print_program(FILE *out, const ASTNode *program,
   }
   AstPrinter printer = {out, 0, 0, annotate, context};
   for (size_t i = 0; i < program->child_count; i++) {
+    if (g_keep_declaration &&
+        !g_keep_declaration(program->children[i], g_keep_context)) {
+      continue;
+    }
     print_declaration(&printer, program->children[i]);
   }
   return printer.unprintable;
+}
+
+void ast_print_set_filter(AstPrintFilter keep, const void *context) {
+  g_keep_declaration = keep;
+  g_keep_context = context;
 }
 
 void ast_print_statement_at(FILE *out, const ASTNode *statement, int depth) {

@@ -1050,7 +1050,9 @@ and floats, between `char` and integers, and between pointer types.
 `typeof(T)` yields a `Type`, a value the compiler can ask questions of while
 compiling. `Type` has `.fields`, and each `Field` has `.name`, `.type`,
 `.offset`, and `.index`. `.type` is itself a `Type`, so `f.type.size` is the
-field's size.
+field's size. `.owns` is 1 when values of the type own a resource and are
+dropped at the end of their scope, and 0 otherwise; see
+[Ownership](ownership.md).
 
 ```mettle
 comptime for f in typeof(Point).fields {

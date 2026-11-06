@@ -254,9 +254,16 @@ Raw memory moves. Linux, macOS and Windows.
 | `alloc_zeroed(n: int64) -> rawptr` | Allocate and zero |
 | `buf_dup(src: rawptr, len: int64) -> rawptr` | Allocate a copy |
 | `malloc_trim(pad: int64) -> int32` | Return idle heap pages to the system now; 1 when any went back |
+| `mem_take<T>(place: T*) -> T` | Move the value out and leave a zero value behind |
+| `mem_replace<T>(place: T*, value: T) -> T` | Move the value out and leave `value` behind |
 
 `mem_copy` requires that the ranges do not overlap; reach for `mem_move` when
 they might.
+
+`mem_take` and `mem_replace` move a value that owns a resource out of memory
+the compiler does not follow, such as an array element, a field reached through
+a pointer or a global. The zero value `mem_take` leaves behind is dropped like
+any other, so it has to be safe to drop; see [Ownership](ownership.md).
 
 The C library's `malloc`, `calloc`, `realloc`, `free`, `memset`, `memcpy`,
 `memmove` and `memcmp` are declared here too.
@@ -393,11 +400,18 @@ keys. `std/hash` supplies ready-made callbacks for `string` and `int64` keys.
 | `hash_map_clear<K, V>(map: HashMap<K, V>*)` | Keep storage, remove every entry |
 | `hash_map_free<K, V>(map: HashMap<K, V>*)` | Release the slot array |
 
-Both collections shallow-copy their elements. They do not clone strings, free
-pointees, or run destructors, and copying the collection itself does not clone
-its storage. Pass the owning value by pointer and call its `free` exactly once.
-Pointers from `list_get_ptr` and `hash_map_get_ptr` are invalidated by growth or
-rehashing. A failed growth leaves the original collection usable.
+Both collections own what they hold. An element that owns a resource moves in
+on `list_push` and `hash_map_put`, moves out on `list_pop`, `list_remove` and
+`hash_map_remove`, and is dropped by `list_set` and `hash_map_put` when they
+replace it, by `list_clear`, `hash_map_clear` and the frees, and when the
+collection itself is dropped. A `List` or `HashMap` value is dropped at the end
+of its scope like any owning value, so calling its `free` is optional, and
+passing one by value moves it. `list_get` and `hash_map_get` copy, so they take
+plain elements only; reach a value that owns a resource through
+`list_get_ptr` or `hash_map_get_ptr`. They do not clone strings or free
+pointees. Pointers from `list_get_ptr` and `hash_map_get_ptr` are invalidated by
+growth or rehashing. A failed growth leaves the original collection usable.
+See [Ownership](ownership.md).
 
 ## std/hash
 

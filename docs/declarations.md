@@ -207,6 +207,11 @@ A generic struct takes generic methods the same way. `fn Box_get<T>(b: Box<T>)
 -> T` is called as `b.get()` on any `Box`, and `fn Box_set__ptr<T>(b: Box<T>*,
 v: T)` as `p->set(v)`; the type argument comes from the receiver.
 
+A method named `drop` is the type's destructor. It takes the pointer form,
+`fn T_drop__ptr(self: T*)` or `method drop()` inside the struct, and a type
+that has one owns a resource: its values are dropped when their scope ends
+unless they moved. [Ownership](ownership.md) has the rules.
+
 Naming the wrong form gets a diagnostic that says which function it looked
 for:
 
@@ -300,6 +305,7 @@ A decorator sits before a declaration and asks the compiler for something.
 | `@test` | A compile-time test, run by `mettle test` |
 | `@rule` | A property the program requires of itself, checked on every build; see [Rules](rules.md) |
 | `@naked` | No prologue, no frame, no epilogue; the body is `asm` only |
+| `@explicit` | The compiler inserts no drops here; each one missing is an error `--fix` can write, see [Ownership](ownership.md) |
 | `@interrupt` | Entered by the CPU; the compiler emits the save/restore and the interrupt return |
 
 ```mettle
@@ -522,6 +528,11 @@ fn work(n: int32) -> int32 {
 ```
 
 A `defer` inside a loop body runs at the end of each iteration.
+
+A deferred call evaluates its arguments where the `defer` is written. `defer
+drop(x);` is the exception: it drops whatever `x` holds when the scope ends,
+and nothing if `x` has moved by then. The compiler writes `defer drop(x);`
+after each local that owns a resource; see [Ownership](ownership.md).
 
 `errdefer` runs only when the function returns an error, which means an `Err`
 arm of a [`Result`](types.md). Use it to undo work a failed call leaves

@@ -237,6 +237,26 @@ defer free(p);
 Runs on every path out of the scope, in reverse order of declaration.
 `errdefer` runs only when the function returns an `Err`.
 
+## Drops
+
+```mettle
+struct Buffer {
+  bytes: uint8*;
+  method drop() { free(this.bytes); }
+}
+
+fn fill() -> Buffer {
+  var scratch: Buffer = { bytes: malloc(64) };
+  var out: Buffer = { bytes: malloc(256) };
+  return out;
+}
+```
+
+`scratch` is dropped when `fill` returns; `out` moves to the caller.
+`mettle expand file.mettle --focus` prints the drops the compiler wrote in.
+`@explicit fn` turns insertion off, and `--fix` writes what is missing. See
+[Ownership](ownership.md).
+
 ## Heap
 
 ```mettle

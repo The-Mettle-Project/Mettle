@@ -72,6 +72,8 @@ typedef struct {
   size_t type_count;
   size_t type_capacity;
   struct Type **glue_queue;
+  SourceLocation *glue_sites;
+  size_t glue_site_capacity;
   size_t glue_count;
   size_t glue_capacity;
   size_t glue_done;
@@ -243,6 +245,7 @@ static void own_free_tables(void) {
   }
   free(g_own.types);
   free(g_own.glue_queue);
+  free(g_own.glue_sites);
 }
 
 void ownership_reset(void) {
@@ -263,16 +266,32 @@ void ownership_reset(void) {
 
 void ownership_set_apply_fixes(int enabled) { g_own.apply_fixes = enabled; }
 
-int own_new_bit(void) {
+int own_new_bit(const char *path, size_t line) {
   size_t capacity = (size_t)g_own.bit_count;
   char **grown = realloc(g_own.bit_names,
                          (capacity + 1) * sizeof(*g_own.bit_names));
-  char name[48];
+  char name[300];
+  size_t used = 0;
   if (!grown) {
     return -1;
   }
   g_own.bit_names = grown;
-  snprintf(name, sizeof(name), "own$live%d", g_own.bit_count);
+  used = (size_t)snprintf(name, sizeof(name), "own$live$");
+  for (const char *p = path ? path : "value"; *p && used + 24 < sizeof(name);
+       p++) {
+    name[used++] = *p == '.' ? '$' : *p;
+  }
+  snprintf(name + used, sizeof(name) - used, "$%zu", line);
+  used = strlen(name);
+  for (int suffix = 2, clash = 1; clash; suffix++) {
+    clash = 0;
+    for (int i = 0; i < g_own.bit_count && !clash; i++) {
+      clash = strcmp(g_own.bit_names[i], name) == 0;
+    }
+    if (clash) {
+      snprintf(name + used, sizeof(name) - used, "$%d", suffix);
+    }
+  }
   g_own.bit_names[g_own.bit_count] = own_strdup(name);
   return g_own.bit_count++;
 }
@@ -346,7 +365,7 @@ static OwnPlanEntry *own_find_plan(const ASTNode *drop_call,
 }
 
 void own_store_plan(const ASTNode *drop_call, const ASTNode *exit,
-                    OwnDropStep *steps, size_t count) {
+                    OwnDropStep *steps, size_t count, int unreachable) {
   OwnPlanEntry *existing = own_find_plan(drop_call, exit);
   OwnPlanEntry *grown = NULL;
   int head = -1;
@@ -354,6 +373,7 @@ void own_store_plan(const ASTNode *drop_call, const ASTNode *exit,
     free(existing->plan.steps);
     existing->plan.steps = steps;
     existing->plan.step_count = count;
+    existing->plan.unreachable = unreachable;
     return;
   }
   grown = own_grow(g_own.plans, &g_own.plan_capacity, g_own.plan_count,
@@ -370,6 +390,7 @@ void own_store_plan(const ASTNode *drop_call, const ASTNode *exit,
   g_own.plans[g_own.plan_count].exit = exit;
   g_own.plans[g_own.plan_count].plan.steps = steps;
   g_own.plans[g_own.plan_count].plan.step_count = count;
+  g_own.plans[g_own.plan_count].plan.unreachable = unreachable;
   g_own.plans[g_own.plan_count].next = head;
   own_map_put(&g_own.planned_calls, drop_call, 1);
   own_map_put(&g_own.plan_heads, drop_call, (int)g_own.plan_count);
@@ -891,7 +912,8 @@ static char *own_glue_name(struct Type *type) {
   return own_strdup(name);
 }
 
-void own_require_glue(TypeChecker *checker, struct Type *type) {
+void own_require_glue(TypeChecker *checker, struct Type *type,
+                      SourceLocation site) {
   type = own_strip(type);
   if (!own_type_needs_glue(checker, type)) {
     return;
@@ -907,6 +929,15 @@ void own_require_glue(TypeChecker *checker, struct Type *type) {
     return;
   }
   g_own.glue_queue = grown;
+  SourceLocation *sites = own_grow(g_own.glue_sites,
+                                   &g_own.glue_site_capacity,
+                                   g_own.glue_count,
+                                   sizeof(*g_own.glue_sites));
+  if (!sites) {
+    return;
+  }
+  g_own.glue_sites = sites;
+  g_own.glue_sites[g_own.glue_count] = site;
   g_own.glue_queue[g_own.glue_count++] = type;
 }
 
@@ -1011,7 +1042,7 @@ static void own_glue_struct_body(TypeChecker *checker, struct Type *type,
     if (!own_type_owns(checker, field_type)) {
       continue;
     }
-    own_require_glue(checker, field_type);
+    own_require_glue(checker, field_type, at);
     own_block_insert(
         body, index++,
         own_drop_of(own_self_field(type->field_names[f - 1], at), at));
@@ -1037,7 +1068,7 @@ static void own_glue_array_body(TypeChecker *checker, struct Type *type,
   ASTNode *loop_body = own_make_block(at);
   ASTNode *loop = ast_create_node(AST_WHILE_STATEMENT, at);
   WhileStatement *data = calloc(1, sizeof(WhileStatement));
-  own_require_glue(checker, type->base_type);
+  own_require_glue(checker, type->base_type, at);
   own_block_insert(loop_body, 0, step);
   own_block_insert(loop_body, 1, own_drop_of(element, at));
   data->condition = condition;
@@ -1068,7 +1099,7 @@ static void own_glue_enum_body(TypeChecker *checker, struct Type *type,
       continue;
     }
     ASTNode *arm_body = own_make_block(at);
-    own_require_glue(checker, payload);
+    own_require_glue(checker, payload, at);
     own_block_insert(arm_body, 0,
                      own_drop_of(ast_create_identifier("payload", at), at));
     arms[arm_count].variant_name = type->tagged_variant_names[v];
@@ -1087,13 +1118,17 @@ static void own_glue_enum_body(TypeChecker *checker, struct Type *type,
   free(arms);
 }
 
-static ASTNode *own_build_glue(TypeChecker *checker, struct Type *type) {
+static ASTNode *own_build_glue(TypeChecker *checker, struct Type *type,
+                               SourceLocation site) {
   char *name = own_glue_name(type);
   char *pointee = own_type_text(type->kind == TYPE_ARRAY ? type->base_type
                                                          : type);
   char param_type[600];
   SourceLocation at = own_type_location(
       type->kind == TYPE_ARRAY ? type->base_type : type);
+  if (at.line == 0) {
+    at = site;
+  }
   ASTNode *body = own_make_block(at);
   char *names[1] = {"self"};
   char *types[1] = {param_type};
@@ -1115,34 +1150,40 @@ static ASTNode *own_build_glue(TypeChecker *checker, struct Type *type) {
   return fn;
 }
 
-static void own_glue_record(struct Type *type, ASTNode *fn) {
+static void own_glue_record(TypeChecker *checker, struct Type *type,
+                            ASTNode *fn, SourceLocation site) {
   char reason[400];
   char *text = own_type_text(type);
   FunctionDeclaration *fd = (FunctionDeclaration *)fn->data;
-  snprintf(reason, sizeof(reason),
-           "dropping a %s drops %s, last to first", text ? text : "value",
-           type->kind == TYPE_ARRAY        ? "each element"
-           : type->kind == TYPE_TAGGED_ENUM ? "the payload of the variant it "
-                                              "holds"
-                                            : "its own destructor first, then "
-                                              "each owning field");
-  own_attach_note(fn, OWN_RECORD_GLUE, fd->name, type, fn->location,
-                  fn->location, reason, fd->name);
-  own_add_record(OWN_RECORD_GLUE, fn->location, fn->location, fd->name,
-                 fd->name, type, NULL, reason, 1, 0);
+  const char *what = "each owning field, last to first";
+  SourceLocation at = fn->location.line > 0 ? fn->location : site;
+  if (type->kind == TYPE_ARRAY) {
+    what = "each element, last to first";
+  } else if (type->kind == TYPE_TAGGED_ENUM) {
+    what = "the payload of the variant it holds";
+  } else if (own_destructor_name(checker, type)) {
+    what = "its own drop method, then each owning field, last to first";
+  }
+  snprintf(reason, sizeof(reason), "dropping a %s runs %s",
+           text ? text : "value", what);
+  own_attach_note(fn, OWN_RECORD_GLUE, fd->name, type, at, at, reason,
+                  fd->name);
+  own_add_record(OWN_RECORD_GLUE, at, at, fd->name, fd->name, type, NULL,
+                 reason, 1, 0);
   free(text);
 }
 
 static int own_generate_glue(TypeChecker *checker, ASTNode *program) {
   int ok = 1;
   while (g_own.glue_done < g_own.glue_count) {
+    SourceLocation site = g_own.glue_sites[g_own.glue_done];
     struct Type *type = g_own.glue_queue[g_own.glue_done++];
-    ASTNode *fn = own_build_glue(checker, type);
+    ASTNode *fn = own_build_glue(checker, type, site);
     if (!fn) {
       return 0;
     }
     own_program_append(program, fn);
-    own_glue_record(type, fn);
+    own_glue_record(checker, type, fn, site);
     if (!type_checker_register_function_signature(checker, fn) ||
         !type_checker_process_declaration(checker, fn)) {
       ok = 0;

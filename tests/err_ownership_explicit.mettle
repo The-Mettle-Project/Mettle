@@ -1,0 +1,41 @@
+import "std/io";
+
+struct Handle {
+  id: int32;
+}
+
+fn Handle_drop__ptr(h: Handle*) {
+  println("drop {h->id}");
+}
+
+fn make(id: int32) -> Handle {
+  var h: Handle = { id: id };
+  return h;
+}
+
+fn consume(h: Handle) {
+  println("consume {h.id}");
+}
+
+@explicit fn work(flag: bool) {
+  var a = make(1);
+  var b = make(2);
+  consume(b);
+  make(3);
+  a = make(4);
+  if (flag) {
+    consume(a);
+  }
+  println("work end");
+}
+
+@explicit fn takes_param(h: Handle) {
+  println("param {h.id}");
+}
+
+fn main() -> int32 {
+  work(false);
+  work(true);
+  takes_param(make(9));
+  return 0;
+}

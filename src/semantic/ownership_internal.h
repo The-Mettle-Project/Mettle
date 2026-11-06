@@ -115,6 +115,7 @@ typedef struct {
   ASTNode *exit;
   OwnDropStep *steps;
   size_t count;
+  int unreachable;
 } OwnPendingPlan;
 
 typedef struct OwnWalker {
@@ -155,6 +156,7 @@ typedef struct OwnWalker {
   ASTNode *note_statement;
   ASTNode *statement_block;
   ASTNode *root;
+  ASTNode *current_exit;
   int conditional;
   int in_errdefer;
   int in_deferred;
@@ -213,7 +215,8 @@ struct Type *own_declared_type(TypeChecker *checker, VarDeclaration *decl);
 struct Type *own_param_type(TypeChecker *checker, FunctionDeclaration *fd,
                             size_t index);
 char *own_type_text(struct Type *type);
-void own_require_glue(TypeChecker *checker, struct Type *type);
+void own_require_glue(TypeChecker *checker, struct Type *type,
+                      SourceLocation site);
 
 int own_walk_function(OwnWalker *walker);
 void own_walker_init(OwnWalker *walker, TypeChecker *checker,
@@ -248,9 +251,9 @@ void own_add_record(OwnRecordKind kind, SourceLocation at,
                     const char *subject, struct Type *type, const char *text,
                     const char *reason, int inserted, int written);
 void own_store_plan(const ASTNode *drop_call, const ASTNode *exit,
-                    OwnDropStep *steps, size_t count);
+                    OwnDropStep *steps, size_t count, int unreachable);
 void own_store_unit_write(const void *unit, int bit, int value);
-int own_new_bit(void);
+int own_new_bit(const char *path, size_t line);
 void own_store_function_bit(const ASTNode *function, int bit);
 void own_link_compiled(const ASTNode *drop_call);
 int own_is_glue_function(const FunctionDeclaration *fd);

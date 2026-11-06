@@ -1,0 +1,63 @@
+import "std/io";
+
+struct Handle {
+  id: int32;
+}
+
+fn Handle_drop__ptr(h: Handle*) {
+  println("drop {h->id}");
+}
+
+fn make(id: int32) -> Handle {
+  var h: Handle = { id: id };
+  return h;
+}
+
+fn consume(h: Handle) {
+  println("consume {h.id}");
+}
+
+fn use_after_move() {
+  var a = make(1);
+  consume(a);
+  println("{a.id}");
+}
+
+fn maybe_moved(flag: bool) {
+  var a = make(2);
+  if (flag) {
+    consume(a);
+  }
+  consume(a);
+}
+
+fn moved_in_loop() {
+  var a = make(3);
+  var i: int32 = 0;
+  while (i < 2) {
+    consume(a);
+    i = i + 1;
+  }
+}
+
+fn out_of_pointer(p: Handle*) -> Handle {
+  return *p;
+}
+
+fn direct_destructor() {
+  var a = make(4);
+  Handle_drop__ptr(&a);
+}
+
+fn conditional_move(flag: bool) -> bool {
+  var a = make(5);
+  return flag && takes(a);
+}
+
+fn takes(h: Handle) -> bool {
+  return h.id > 0;
+}
+
+fn main() -> int32 {
+  return 0;
+}

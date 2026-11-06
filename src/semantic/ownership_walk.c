@@ -811,7 +811,8 @@ static void own_plan_place(OwnWalker *w, const OwnState *state, int place,
   if (own_descendant_moved(w, state, place) < 0) {
     own_add_step(&out->steps, &out->count, &out->capacity, path, depth,
                  w->places[place].type, guard);
-    own_require_glue(w->checker, w->places[place].type);
+    own_require_glue(w->checker, w->places[place].type,
+                     w->bindings[w->places[place].binding].location);
     return;
   }
   for (size_t f = type ? type->field_count : 0; f > 0; f--) {
@@ -827,7 +828,8 @@ static void own_plan_place(OwnWalker *w, const OwnState *state, int place,
     } else {
       own_add_step(&out->steps, &out->count, &out->capacity, path, depth + 1,
                    field_type, guard);
-      own_require_glue(w->checker, field_type);
+      own_require_glue(w->checker, field_type,
+                       w->bindings[w->places[place].binding].location);
     }
   }
 }
@@ -844,7 +846,7 @@ static size_t own_plan(OwnWalker *w, const OwnState *state, int place,
 }
 
 static void own_store_or_free(OwnWalker *w, ASTNode *call, ASTNode *exit,
-                              OwnSteps *steps) {
+                              OwnSteps *steps, int unreachable) {
   OwnPendingPlan *grown = NULL;
   if (w->mode != OWN_MODE_CHECK || w->silent > 0) {
     free(steps->steps);
@@ -861,6 +863,7 @@ static void own_store_or_free(OwnWalker *w, ASTNode *call, ASTNode *exit,
   w->pending[w->pending_count].exit = exit;
   w->pending[w->pending_count].steps = steps->steps;
   w->pending[w->pending_count].count = steps->count;
+  w->pending[w->pending_count].unreachable = unreachable;
   w->pending_count++;
 }
 
@@ -895,9 +898,9 @@ static void own_add_obligation(OwnWalker *w, OwnObligationKind kind,
   ob->exit_at = exit_at;
 }
 
-static void own_note_drop_run(OwnWalker *w, OwnDeferEntry *entry,
-                              ASTNode *exit, const OwnSteps *steps) {
-  char note[300];
+static void own_drop_run_text(OwnWalker *w, OwnDeferEntry *entry,
+                              const OwnSteps *steps, char *out, size_t size,
+                              int quoted) {
   const char *path = w->places[entry->place].path;
   int guarded = 0;
   int partial = 0;
@@ -905,9 +908,19 @@ static void own_note_drop_run(OwnWalker *w, OwnDeferEntry *entry,
     guarded = guarded || steps->steps[i].guard >= 0;
     partial = partial || steps->steps[i].depth > 0;
   }
-  snprintf(note, sizeof(note), "drops %s`%s`%s", partial ? "what is left of "
-                                                         : "",
-           path, guarded ? " if it has not moved" : "");
+  snprintf(out, size, "%s%s%s%s%s", quoted ? "drops " : "drop(",
+           partial ? "what is left of " : "", quoted ? "`" : "", path,
+           quoted ? "`" : ")");
+  if (guarded) {
+    size_t used = strlen(out);
+    snprintf(out + used, size - used, " if it has not moved");
+  }
+}
+
+static void own_note_drop_run(OwnWalker *w, OwnDeferEntry *entry,
+                              ASTNode *exit, const OwnSteps *steps) {
+  char note[300];
+  own_drop_run_text(w, entry, steps, note, sizeof(note), 1);
   if (exit && exit->type == AST_PROGRAM) {
     own_note_block_end(exit, note);
   } else if (exit && exit->type != AST_FUNCTION_DECLARATION) {
@@ -918,11 +931,13 @@ static void own_note_drop_run(OwnWalker *w, OwnDeferEntry *entry,
 static void own_record_drop_run(OwnWalker *w, OwnDeferEntry *entry,
                                 ASTNode *exit, const OwnSteps *steps) {
   char reason[300];
+  char text[300];
   const char *path = entry->place >= 0 ? w->places[entry->place].path : "?";
   if (!own_reporting(w) || steps->count == 0) {
     return;
   }
   own_note_drop_run(w, entry, exit, steps);
+  own_drop_run_text(w, entry, steps, text, sizeof(text), 0);
   snprintf(reason, sizeof(reason), "`%s` is dropped here%s", path,
            ownership_node_is_inserted(entry->defer)
                ? ", by the drop the compiler inserted"
@@ -930,7 +945,7 @@ static void own_record_drop_run(OwnWalker *w, OwnDeferEntry *entry,
   own_add_record(OWN_RECORD_DROP_RUN, own_site(exit),
                  own_site(entry->defer), own_function_name(w), path,
                  entry->place >= 0 ? w->places[entry->place].type : NULL,
-                 NULL, reason, ownership_node_is_inserted(entry->defer), 1);
+                 text, reason, ownership_node_is_inserted(entry->defer), 1);
   own_link_compiled(entry->call);
 }
 
@@ -955,7 +970,7 @@ static void own_run_defer(OwnWalker *w, OwnDeferEntry *entry, ASTNode *exit,
   case OWN_DEFER_DROP:
     own_plan(w, state, entry->place, &steps);
     own_record_drop_run(w, entry, exit, &steps);
-    own_store_or_free(w, entry->call, exit, &steps);
+    own_store_or_free(w, entry->call, exit, &steps, state->dead);
     if (!state->dead) {
       own_set_subtree(w, state, entry->place, OWN_MOVED);
     }
@@ -967,11 +982,15 @@ static void own_run_defer(OwnWalker *w, OwnDeferEntry *entry, ASTNode *exit,
     return;
   case OWN_DEFER_DROP_UNTRACKED:
     return;
-  case OWN_DEFER_STATEMENT:
+  case OWN_DEFER_STATEMENT: {
+    ASTNode *saved_exit = w->current_exit;
+    w->current_exit = exit;
     if (!state->dead) {
       own_run_deferred_statement(w, entry, state);
     }
+    w->current_exit = saved_exit;
     return;
+  }
   }
 }
 
@@ -1201,7 +1220,8 @@ static void own_drop_tracked(OwnWalker *w, ASTNode *call, ASTNode *arg,
   }
   if (!forget) {
     own_plan(w, &w->state, place, &steps);
-    own_store_or_free(w, call, NULL, &steps);
+    own_store_or_free(w, call, w->in_deferred ? w->current_exit : NULL,
+                      &steps, w->state.dead);
   }
   if (w->in_errdefer) {
     own_move(w, place, arg);
@@ -1245,6 +1265,31 @@ static void own_call_args(OwnWalker *w, ASTNode **args, size_t count) {
   }
 }
 
+static void own_check_gathered(OwnWalker *w, CallExpression *call) {
+  Symbol *callee = call->function_name && !call->is_indirect_call
+                       ? symbol_table_lookup_global(w->checker->symbol_table,
+                                                    call->function_name)
+                       : NULL;
+  size_t fixed = 0;
+  if (!callee || callee->kind != SYMBOL_FUNCTION ||
+      !callee->data.function.is_variadic ||
+      callee->data.function.parameter_count == 0) {
+    return;
+  }
+  fixed = callee->data.function.parameter_count - 1;
+  for (size_t i = fixed; i < call->argument_count; i++) {
+    if (own_node_owns(w, call->arguments[i])) {
+      own_error(w, "O0014", call->arguments[i]->location,
+                "pass a pointer, or give the function a parameter of the "
+                "owning type",
+                "`%s` gathers its last arguments into a slice, and a slice "
+                "owns nothing, so this value would never be dropped",
+                call->function_name);
+      return;
+    }
+  }
+}
+
 static void own_call(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
   CallExpression *call = (CallExpression *)node->data;
   const char *name = call ? call->function_name : NULL;
@@ -1271,14 +1316,30 @@ static void own_call(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
     own_expr(w, call->object, own_node_owns(w, call->object) ? OWN_CTX_MOVE
                                                              : OWN_CTX_READ);
   }
+  own_check_gathered(w, call);
   own_call_args(w, call->arguments, call->argument_count);
   own_rvalue(w, node, ctx);
+}
+
+static int own_is_global_variable(OwnWalker *w, ASTNode *node) {
+  Identifier *id = (Identifier *)node->data;
+  Symbol *symbol = id && id->name ? symbol_table_lookup_global(
+                                        w->checker->symbol_table, id->name)
+                                  : NULL;
+  return symbol && symbol->kind == SYMBOL_VARIABLE;
 }
 
 static void own_identifier(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
   int binding = own_root_binding(w, node);
   if (binding < 0) {
-    if (ctx == OWN_CTX_MOVE && own_node_owns(w, node)) {
+    if (!own_node_owns(w, node)) {
+      return;
+    }
+    if (!own_is_global_variable(w, node)) {
+      own_rvalue(w, node, ctx);
+      return;
+    }
+    if (ctx == OWN_CTX_MOVE) {
       Identifier *id = (Identifier *)node->data;
       own_error(w, "O0008", node->location,
                 "take it with mem_take(&name) or mem_replace(&name, value)",
@@ -1429,6 +1490,28 @@ static void own_func_ptr_call(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
   own_rvalue(w, node, ctx);
 }
 
+static void own_lambda(OwnWalker *w, ASTNode *node) {
+  FunctionDeclaration *lambda = (FunctionDeclaration *)node->data;
+  for (size_t i = 0; lambda && i < lambda->captured_count; i++) {
+    struct Type *type =
+        lambda->captured_types && lambda->captured_types[i]
+            ? type_checker_get_type_by_name(w->checker,
+                                            lambda->captured_types[i])
+            : NULL;
+    if (!own_type_owns(w->checker, type)) {
+      continue;
+    }
+    own_error(w, "O0013", node->location,
+              "capture a pointer instead: `var held = &name;` before the "
+              "lambda, and use `*held` inside it",
+              "this closure would copy `%s`, which owns a resource, into an "
+              "environment that is never dropped",
+              lambda->captured_names && lambda->captured_names[i]
+                  ? lambda->captured_names[i]
+                  : "?");
+  }
+}
+
 static void own_expr(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
   if (!node) {
     return;
@@ -1465,6 +1548,8 @@ static void own_expr(OwnWalker *w, ASTNode *node, OwnCtx ctx) {
     own_value_scope(w, node, ctx);
     return;
   case AST_LAMBDA_EXPRESSION:
+    own_lambda(w, node);
+    return;
   case AST_NUMBER_LITERAL:
   case AST_STRING_LITERAL:
     return;
@@ -1581,17 +1666,19 @@ static void own_assignment(OwnWalker *w, ASTNode *node) {
     own_assign_tracked(w, node, NULL, w->bindings[binding].root);
     return;
   }
-  if (!target || !own_node_owns(w, target)) {
+  place = own_place_of(w, target, &exact);
+  if (place >= 0 && exact) {
+    own_expr(w, assign->value, OWN_CTX_MOVE);
+    own_assign_tracked(w, node, target, place);
+    return;
+  }
+  if (!target || (!own_node_owns(w, target) &&
+                  !own_node_owns(w, assign->value))) {
     own_expr(w, assign->value, OWN_CTX_READ);
     own_expr(w, target, OWN_CTX_ADDRESS);
     return;
   }
   own_expr(w, assign->value, OWN_CTX_MOVE);
-  place = own_place_of(w, target, &exact);
-  if (place >= 0 && exact) {
-    own_assign_tracked(w, node, target, place);
-    return;
-  }
   own_assign_untracked(w, node, target);
 }
 
@@ -2211,7 +2298,7 @@ static void own_assign_bits(OwnWalker *w) {
       continue;
     }
     binding = &w->bindings[w->places[i].binding];
-    w->places[i].bit = own_new_bit();
+    w->places[i].bit = own_new_bit(w->places[i].path, binding->location.line);
     snprintf(note, sizeof(note),
              "`%s` moves on some paths only, so the live bit %s records "
              "whether it still holds a value",
@@ -2248,7 +2335,8 @@ void own_commit_outputs(OwnWalker *w) {
       int guard = plan->steps[s].guard;
       plan->steps[s].guard = guard >= 0 ? w->places[guard].bit : -1;
     }
-    own_store_plan(plan->call, plan->exit, plan->steps, plan->count);
+    own_store_plan(plan->call, plan->exit, plan->steps, plan->count,
+                   plan->unreachable);
     plan->steps = NULL;
   }
   w->pending_count = 0;
