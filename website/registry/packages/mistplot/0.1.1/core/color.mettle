@@ -1,0 +1,291 @@
+//! RGBA colours, CSS serialization, the palette and the light and dark themes. Uses
+//! core/format (channel integers) and std/conv; it must not import core/buf, which imports
+//! it. MpTheme lives here so it nests only same-module types. Nothing allocates:
+//! mp_color_css writes into the caller's buffer. Opaque colours serialize as #rrggbb,
+//! others as rgba(r,g,b,a) with a CSS alpha fraction.
+
+import "std/conv";
+import "mistplot/core/format";
+
+/// An sRGB colour with straight (not premultiplied) alpha.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpColor {
+  r: uint8;   /// red, 0 .. 255
+  g: uint8;   /// green, 0 .. 255
+  b: uint8;   /// blue, 0 .. 255
+  a: uint8;   /// alpha, 0 (transparent) .. 255 (opaque)
+}
+
+/// Number of palette slots in an MpTheme.
+export const MP_PALETTE_MAX: int32 = 10;
+
+/// CSS font-family used when a chart sets no font.
+export const MP_FONT_STACK: string = "system-ui, -apple-system, Segoe UI, Roboto, " +
+  "Helvetica Neue, Arial, sans-serif";
+
+/// Chart colours: surfaces, text roles and the series palette.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpTheme {
+  bg: MpColor;                   /// chart background
+  title: MpColor;                /// title text
+  text: MpColor;                 /// body text: axis titles, legend
+  muted: MpColor;                /// subtitle, tick labels, "No data"
+  grid: MpColor;                 /// grid lines
+  axis: MpColor;                 /// baseline and tick marks
+  palette: MpColor[10];          /// series colours; slots >= n_palette are unused
+  n_palette: int32;              /// used palette slots, 1 .. MP_PALETTE_MAX
+}
+
+/// An opaque colour.
+///
+/// @param r Red. Valid: 0 .. 255.
+/// @param g Green. Valid: 0 .. 255.
+/// @param b Blue. Valid: 0 .. 255.
+/// @return The colour with alpha 255.
+export fn mp_rgb(r: uint8, g: uint8, b: uint8) -> MpColor {
+  var c: MpColor;
+  c.r = r;
+  c.g = g;
+  c.b = b;
+  c.a = 255;
+  return c;
+}
+
+/// A colour with alpha.
+///
+/// @param r Red. Valid: 0 .. 255.
+/// @param g Green. Valid: 0 .. 255.
+/// @param b Blue. Valid: 0 .. 255.
+/// @param a Alpha. Valid: 0 (transparent) .. 255 (opaque).
+/// @return The colour.
+export fn mp_rgba(r: uint8, g: uint8, b: uint8, a: uint8) -> MpColor {
+  var c: MpColor;
+  c.r = r;
+  c.g = g;
+  c.b = b;
+  c.a = a;
+  return c;
+}
+
+/// An opaque colour from 0xRRGGBB.
+///
+/// @param rgb The colour as 0xRRGGBB. Valid: any; bits above 24 are ignored.
+/// @return The colour with alpha 255.
+export fn mp_hex(rgb: uint32) -> MpColor {
+  return mp_rgb((uint8)((rgb >> 16) & 0xFF), (uint8)((rgb >> 8) & 0xFF),
+                (uint8)(rgb & 0xFF));
+}
+
+/// The RGB channels of a colour as 0xRRGGBB (alpha dropped).
+///
+/// @param c The colour. Valid: any.
+/// @return 0xRRGGBB.
+export fn mp_color_hex(c: MpColor) -> uint32 {
+  return ((uint32)c.r << 16) | ((uint32)c.g << 8) | (uint32)c.b;
+}
+
+/// Whether two colours are identical, alpha included.
+///
+/// @param a First colour. Valid: any.
+/// @param b Second colour. Valid: any.
+/// @return true when all four channels match.
+export fn mp_color_eq(a: MpColor, b: MpColor) -> bool {
+  return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+}
+
+/// A colour with its alpha replaced.
+///
+/// @param c The colour. Valid: any.
+/// @param a New alpha. Valid: 0 .. 255.
+/// @return c with alpha a.
+export fn mp_color_alpha(c: MpColor, a: uint8) -> MpColor {
+  return mp_rgba(c.r, c.g, c.b, a);
+}
+
+fn color_lerp(a: uint8, b: uint8, t: float64) -> uint8 {
+  var v: float64 = (float64)a + ((float64)b - (float64)a) * t;
+  return (uint8)(int32)(v + 0.5);
+}
+
+/// Linear blend of two colours, every channel (alpha included) rounded to nearest.
+///
+/// @param a Colour at t = 0. Valid: any.
+/// @param b Colour at t = 1. Valid: any.
+/// @param t Blend factor. Valid: 0 .. 1; values outside are clamped and NaN gives a.
+/// @return The blended colour.
+export fn mp_color_mix(a: MpColor, b: MpColor, t: float64) -> MpColor {
+  var k: float64 = t;
+  if (!(k >= 0.0)) { k = 0.0; }
+  if (k > 1.0) { k = 1.0; }
+  return mp_rgba(color_lerp(a.r, b.r, k), color_lerp(a.g, b.g, k),
+                 color_lerp(a.b, b.b, k), color_lerp(a.a, b.a, k));
+}
+
+// Copies a channel value (0..255) at `pos`; returns the new offset.
+fn color_put_u8(out: uint8*, pos: int64, v: uint8) -> int64 {
+  var buf: uint8[32];
+  var s: string = mp_fmt_int((int64)v, &buf[0], 32);
+  var j: int64 = 0;
+  while (j < (int64)s.length) {
+    out[pos] = s.chars[j];
+    pos = pos + 1;
+    j = j + 1;
+  }
+  return pos;
+}
+
+/// A colour as CSS: "#rrggbb" when opaque, else "rgba(r,g,b,f)" with f = a/255 to three
+/// decimals ("0.502").
+///
+/// @param c The colour. Valid: any.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The CSS text, or "" when out is 0 or cap < 32.
+/// @mem Writes into out and returns a view of it: valid while out is, never free it.
+/// @thread Safe from any thread (with distinct buffers).
+export fn mp_color_css(c: MpColor, out: uint8*, cap: int64) -> string {
+  if (out == 0 || cap < 32) { return ""; }
+  var pos: int64 = 0;
+  if (c.a == 255) {
+    var v: uint32 = mp_color_hex(c);
+    var digits: uint8[6];
+    var i: int32 = 5;
+    while (i >= 0) {
+      var d: int32 = (int32)(v & 0xF);
+      if (d < 10) {
+        digits[(int64)i] = (uint8)(48 + d);
+      } else {
+        digits[(int64)i] = (uint8)(87 + d);
+      }
+      v = v >> 4;
+      i = i - 1;
+    }
+    out[0] = 35;
+    var k: int64 = 0;
+    while (k < 6) {
+      out[1 + k] = digits[k];
+      k = k + 1;
+    }
+    return str_from_bytes((cstring)out, 7);
+  }
+  var pre: string = "rgba(";
+  var i2: int64 = 0;
+  while (i2 < (int64)pre.length) {
+    out[pos] = pre.chars[i2];
+    pos = pos + 1;
+    i2 = i2 + 1;
+  }
+  pos = color_put_u8(out, pos, c.r);
+  out[pos] = 44;
+  pos = pos + 1;
+  pos = color_put_u8(out, pos, c.g);
+  out[pos] = 44;
+  pos = pos + 1;
+  pos = color_put_u8(out, pos, c.b);
+  out[pos] = 44;
+  pos = pos + 1;
+  // CSS alpha is a 0..1 fraction, not the raw byte. 128 -> 0.502.
+  var q: int32 = ((int32)c.a * 1000 + 127) / 255;
+  if (q >= 1000) {
+    out[pos] = 49;
+    pos = pos + 1;
+  } else {
+    out[pos] = 48;
+    out[pos + 1] = 46;
+    pos = pos + 2;
+    out[pos] = (uint8)(48 + q / 100);
+    out[pos + 1] = (uint8)(48 + (q / 10) % 10);
+    out[pos + 2] = (uint8)(48 + q % 10);
+    pos = pos + 3;
+  }
+  out[pos] = 41;
+  pos = pos + 1;
+  return str_from_bytes((cstring)out, pos);
+}
+
+// Observable-10, shared by both themes.
+fn color_palette(t: MpTheme*) {
+  t->palette[0] = mp_hex(0x4269D0);
+  t->palette[1] = mp_hex(0xEFB118);
+  t->palette[2] = mp_hex(0xFF725C);
+  t->palette[3] = mp_hex(0x6CC5B0);
+  t->palette[4] = mp_hex(0x3CA951);
+  t->palette[5] = mp_hex(0xFF8AB7);
+  t->palette[6] = mp_hex(0xA463F2);
+  t->palette[7] = mp_hex(0x97BBF5);
+  t->palette[8] = mp_hex(0x9C6B4E);
+  t->palette[9] = mp_hex(0x9498A0);
+  t->n_palette = MP_PALETTE_MAX;
+}
+
+/// The light theme: white background, grey-900 title, Observable-10 palette.
+///
+/// @return The theme.
+export fn mp_theme_light() -> MpTheme {
+  var t: MpTheme;
+  t.bg = mp_hex(0xFFFFFF);
+  t.title = mp_hex(0x111827);
+  t.text = mp_hex(0x374151);
+  t.muted = mp_hex(0x6B7280);
+  t.grid = mp_hex(0xE5E7EB);
+  t.axis = mp_hex(0x9CA3AF);
+  color_palette(&t);
+  return t;
+}
+
+/// The dark theme: grey-900 background, near-white title, Observable-10 palette.
+///
+/// @return The theme.
+export fn mp_theme_dark() -> MpTheme {
+  var t: MpTheme;
+  t.bg = mp_hex(0x111827);
+  t.title = mp_hex(0xF9FAFB);
+  t.text = mp_hex(0xD1D5DB);
+  t.muted = mp_hex(0x9CA3AF);
+  t.grid = mp_hex(0x1F2937);
+  t.axis = mp_hex(0x4B5563);
+  color_palette(&t);
+  return t;
+}
+
+/// The colour of series i: the theme palette, repeating.
+///
+/// @param t The theme. Valid: non-zero with n_palette in 1 .. MP_PALETTE_MAX; 0 or an empty
+///   palette gives the first Observable-10 colour, a larger count is treated as the maximum.
+/// @param i Series index. Valid: any; negative indices wrap too.
+/// @return palette[i mod n_palette].
+/// @mem t is only read.
+/// @thread Safe from any thread while t is not being written.
+export fn mp_theme_series(t: MpTheme*, i: int32) -> MpColor {
+  if (t == 0 || t->n_palette <= 0) { return mp_hex(0x4269D0); }
+  var n: int32 = t->n_palette;
+  if (n > MP_PALETTE_MAX) { n = MP_PALETTE_MAX; }
+  var k: int32 = i % n;
+  if (k < 0) { k = k + n; }
+  return t->palette[(int64)k];
+}
+
+/// Whether two themes draw identically: every colour role and the used palette slots.
+///
+/// @param a First theme. Valid: non-zero; 0 equals only 0.
+/// @param b Second theme. Valid: non-zero; 0 equals only 0.
+/// @return true when they match.
+/// @mem a and b are only read.
+/// @thread Safe from any thread while neither is being written.
+export fn mp_theme_eq(a: MpTheme*, b: MpTheme*) -> bool {
+  if (a == 0 || b == 0) { return a == b; }
+  if (!mp_color_eq(a->bg, b->bg) || !mp_color_eq(a->title, b->title)) { return false; }
+  if (!mp_color_eq(a->text, b->text) || !mp_color_eq(a->muted, b->muted)) { return false; }
+  if (!mp_color_eq(a->grid, b->grid) || !mp_color_eq(a->axis, b->axis)) { return false; }
+  if (a->n_palette != b->n_palette) { return false; }
+  var n: int32 = a->n_palette;
+  if (n > MP_PALETTE_MAX) { n = MP_PALETTE_MAX; }
+  var i: int32 = 0;
+  while (i < n) {
+    if (!mp_color_eq(a->palette[(int64)i], b->palette[(int64)i])) { return false; }
+    i = i + 1;
+  }
+  return true;
+}

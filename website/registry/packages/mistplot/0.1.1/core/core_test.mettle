@@ -1,0 +1,321 @@
+// core/core_test — core/error, mem, str, extent, target, color, geom and the buf writers.
+//
+// Pure: no files, no externs of its own, so the same checks run in the compile-time
+// interpreter and in both compiled builds. Each check group ends with a leak check.
+
+import "std/math";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/str";
+import "mistplot/core/extent";
+import "mistplot/core/target";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+
+fn check_error() {
+  mp_expect_str("error ok", mp_error_str(MP_OK), "ok");
+  mp_expect_str("error arg", mp_error_str(MP_ERR_ARG), "invalid argument");
+  mp_expect_str("error alloc", mp_error_str(MP_ERR_ALLOC), "out of memory");
+  mp_expect_str("error state", mp_error_str(MP_ERR_STATE), "invalid state");
+  mp_expect_str("error io", mp_error_str(MP_ERR_IO), "i/o error");
+  mp_expect_str("error limit", mp_error_str(MP_ERR_LIMIT), "limit exceeded");
+  mp_expect_str("error unknown", mp_error_str(99), "unknown error");
+  mp_expect_str("error negative", mp_error_str(-1), "unknown error");
+  mp_expect_i64("max count", MP_MAX_COUNT, (int64)268435456);
+}
+
+fn check_mem() {
+  var live0: int64 = mp_alloc_live();
+  var count0: int64 = mp_alloc_count();
+  mp_expect("alloc 0 is null", mp_alloc(0) == 0);
+  mp_expect("alloc -1 is null", mp_alloc(-1) == 0);
+  mp_expect("alloc_zero 0 is null", mp_alloc_zero(0) == 0);
+  mp_expect_i64("no count for refused", mp_alloc_count(), count0);
+  var p: uint8* = (uint8*)mp_alloc(16);
+  mp_expect("alloc 16", p != 0);
+  mp_expect_i64("live +1", mp_alloc_live(), live0 + 1);
+  var z: uint8* = (uint8*)mp_alloc_zero(32);
+  mp_expect("zeroed", z != 0 && z[0] == 0 && z[31] == 0);
+  p[0] = 7;
+  p[15] = 9;
+  var q: uint8* = (uint8*)mp_realloc((rawptr)p, 4096);
+  mp_expect("realloc keeps bytes", q != 0 && q[0] == 7 && q[15] == 9);
+  mp_expect_i64("realloc counts once", mp_alloc_count(), count0 + 3);
+  mp_expect_i64("realloc keeps live", mp_alloc_live(), live0 + 2);
+  mp_expect("realloc 0 bytes refused", mp_realloc(0, 0) == 0);
+  var r: rawptr = mp_realloc(0, 8);
+  mp_expect_i64("realloc from null adds live", mp_alloc_live(), live0 + 3);
+  mp_free(r);
+  mp_free((rawptr)q);
+  mp_free((rawptr)z);
+  mp_free(0);
+  mp_expect_i64("mem no leak", mp_alloc_live(), live0);
+}
+
+fn check_str() {
+  var live0: int64 = mp_alloc_live();
+  var e: string = mp_str_dup("");
+  mp_expect_i64("dup empty no alloc", mp_alloc_live(), live0);
+  mp_expect_str("dup empty", e, "");
+  var n: int32 = 42;
+  var tmp: string = "series {n}";
+  var d: string = mp_str_dup(tmp);
+  mp_expect_str("dup copies", d, "series 42");
+  mp_expect("dup is a new block", d.chars != tmp.chars);
+  mp_expect_i64("dup allocs", mp_alloc_live(), live0 + 1);
+  var s: string = "";
+  mp_expect_i64("assign", (int64)mp_str_assign(&s, "abc"), (int64)MP_OK);
+  mp_expect_str("assign value", s, "abc");
+  mp_expect_i64("assign self view", (int64)mp_str_assign(&s, s), (int64)MP_OK);
+  mp_expect_str("assign self value", s, "abc");
+  mp_expect_i64("assign replace", (int64)mp_str_assign(&s, d), (int64)MP_OK);
+  mp_expect_str("assign replaced", s, "series 42");
+  mp_expect_i64("assign null dst", (int64)mp_str_assign(0, "x"), (int64)MP_ERR_ARG);
+  mp_expect_i64("assign empty", (int64)mp_str_assign(&s, ""), (int64)MP_OK);
+  mp_expect_str("assign empty value", s, "");
+  mp_str_free(s);
+  mp_str_free(d);
+  mp_str_free("");
+  mp_expect_i64("str no leak", mp_alloc_live(), live0);
+}
+
+fn check_utf8() {
+  mp_expect_i64("utf8 empty", mp_utf8_len(""), (int64)0);
+  mp_expect_i64("utf8 ascii", mp_utf8_len("abc"), (int64)3);
+  mp_expect_i64("utf8 middot", mp_utf8_len("a·b"), (int64)3);
+  mp_expect_i64("utf8 braille", mp_utf8_len("⠀⣿"), (int64)2);
+  mp_expect_i64("utf8 astral", mp_utf8_len("😀x"), (int64)2);
+  var bad: uint8[6];
+  bad[0] = 0xC0;   // overlong lead
+  bad[1] = 0xAF;
+  bad[2] = 0xE2;   // truncated 3-byte sequence
+  bad[3] = 0x82;
+  bad[4] = 0xED;   // surrogate lead followed by a high continuation byte
+  bad[5] = 0xA0;
+  var bs: string = str_from_bytes((cstring)&bad[0], 6);
+  mp_expect_i64("utf8 invalid bytes count one each", mp_utf8_len(bs), (int64)6);
+  var s: string = "a·€😀";
+  mp_expect_i64("next ascii", mp_utf8_next(s, 0), (int64)1);
+  mp_expect_i64("next 2-byte", mp_utf8_next(s, 1), (int64)3);
+  mp_expect_i64("next 3-byte", mp_utf8_next(s, 3), (int64)6);
+  mp_expect_i64("next 4-byte", mp_utf8_next(s, 6), (int64)10);
+  mp_expect_i64("next inside sequence", mp_utf8_next(s, 2), (int64)3);
+  mp_expect_i64("next at end", mp_utf8_next(s, 10), (int64)10);
+  mp_expect_i64("next past end", mp_utf8_next(s, 99), (int64)10);
+  mp_expect_i64("next negative", mp_utf8_next(s, -5), (int64)0);
+}
+
+fn check_extent() {
+  var e: MpExtent = mp_extent_empty();
+  mp_expect("empty invalid", !e.valid);
+  mp_extent_add(&e, NAN(), 1.0);
+  mp_extent_add(&e, 1.0, INF());
+  mp_expect("non-finite skipped", !e.valid);
+  mp_extent_add(&e, 2.0, -1.0);
+  mp_extent_add(&e, -3.0, 5.0);
+  mp_expect("valid", e.valid);
+  mp_expect_near("min x", e.min_x, -3.0, 0.0);
+  mp_expect_near("max x", e.max_x, 2.0, 0.0);
+  mp_expect_near("min y", e.min_y, -1.0, 0.0);
+  mp_expect_near("max y", e.max_y, 5.0, 0.0);
+  mp_extent_add(0, 1.0, 1.0);
+  var f: MpExtent = mp_extent_empty();
+  mp_extent_add(&f, 10.0, 0.0);
+  var u: MpExtent = mp_extent_union(e, f);
+  mp_expect_near("union max x", u.max_x, 10.0, 0.0);
+  mp_expect_near("union min y", u.min_y, -1.0, 0.0);
+  var v: MpExtent = mp_extent_union(mp_extent_empty(), f);
+  mp_expect("union with empty", v.valid && v.min_x == 10.0 && v.max_x == 10.0);
+  var w: MpExtent = mp_extent_union(mp_extent_empty(), mp_extent_empty());
+  mp_expect("union of empties", !w.valid);
+}
+
+fn test_measure_cb(ctx: rawptr, s: string, size: float64) -> float64 {
+  var k: float64* = (float64*)ctx;
+  return *k * (float64)s.length + size;
+}
+
+fn check_target() {
+  var t: MpTarget = mp_target(640.0, 400.0);
+  mp_expect("target size", t.width == 640.0 && t.height == 400.0 && t.scale == 1.0);
+  mp_expect_i64("target heuristic", (int64)t.measure, (int64)MP_MEASURE_HEURISTIC);
+  mp_expect_near("heuristic w", mp_target_text_w(&t, "abcd", 10.0), 23.2, 1e-9);
+  mp_expect_near("heuristic w counts code points",
+                 mp_target_text_w(&t, "a·b", 10.0), 17.4, 1e-9);
+  mp_expect_near("heuristic h", mp_target_text_h(&t, 10.0), 12.0, 1e-9);
+  var h: MpTarget = mp_target_hidpi(640.0, 400.0, 2.0);
+  mp_expect_near("hidpi scale", h.scale, 2.0, 0.0);
+  mp_expect("hidpi key differs", mp_target_key(&h) != mp_target_key(&t));
+  var c: MpTarget = mp_target_cells(100, 28);
+  mp_expect("cells size", c.width == 800.0 && c.height == 448.0);
+  mp_expect_near("cells w", mp_target_text_w(&c, "a·b", 30.0), 24.0, 0.0);
+  mp_expect_near("cells h", mp_target_text_h(&c, 30.0), 16.0, 0.0);
+  var t2: MpTarget = mp_target(640.0, 400.0);
+  mp_expect("equal targets equal keys", mp_target_key(&t) == mp_target_key(&t2));
+  var z1: MpTarget = mp_target(0.0, 1.0);
+  var z2: MpTarget = mp_target(0.0 - 0.0, 1.0);
+  mp_expect("signed zero keys", mp_target_key(&z1) == mp_target_key(&z2));
+  var k: float64 = 2.0;
+  mp_target_set_measure(&t2, &test_measure_cb, (rawptr)&k, (uint64)7);
+  mp_expect_i64("custom mode", (int64)t2.measure, (int64)MP_MEASURE_CUSTOM);
+  mp_expect_near("custom w", mp_target_text_w(&t2, "abc", 10.0), 16.0, 0.0);
+  mp_expect_near("custom h", mp_target_text_h(&t2, 10.0), 12.0, 1e-9);
+  var key7: uint64 = mp_target_key(&t2);
+  mp_expect("custom key differs", key7 != mp_target_key(&t));
+  mp_target_set_measure(&t2, &test_measure_cb, 0, (uint64)8);
+  mp_expect("measurer key changes key", mp_target_key(&t2) != key7);
+  mp_expect_near("null target w", mp_target_text_w(0, "abc", 10.0), 0.0, 0.0);
+  mp_expect("null target key", mp_target_key(0) == (uint64)0);
+}
+
+fn num_str(b: MpBuf*, v: float64) -> string {
+  mp_buf_clear(b);
+  mp_buf_put_num(b, v);
+  return mp_buf_str(b);
+}
+
+fn check_buf() {
+  var live0: int64 = mp_alloc_live();
+  var b: MpBuf* = mp_buf_new(0);
+  mp_expect("buf new", b != 0 && b->cap == 64);
+  mp_expect_i64("buf counted", mp_alloc_live(), live0 + 2);
+  mp_expect_str("num int", num_str(b, 12.0), "12");
+  mp_expect_str("num neg int", num_str(b, -340.0), "-340");
+  mp_expect_str("num zero", num_str(b, 0.0), "0");
+  mp_expect_str("num minus zero", num_str(b, 0.0 - 0.0), "0");
+  mp_expect_str("num tiny negative", num_str(b, -0.004), "0");
+  mp_expect_str("num two decimals", num_str(b, 3.14159), "3.14");
+  mp_expect_str("num trims", num_str(b, 2.5), "2.5");
+  mp_expect_str("num trims to int", num_str(b, 1.999), "2");
+  mp_expect_str("num neg frac", num_str(b, -0.25), "-0.25");
+  mp_expect_str("num leading zero", num_str(b, 0.05), "0.05");
+  mp_expect_str("num nan", num_str(b, NAN()), "0");
+  mp_expect_str("num inf", num_str(b, INF()), "0");
+  mp_expect_str("num huge", num_str(b, 1e9), "0");
+  mp_expect_str("num near huge", num_str(b, 999999999.5), "999999999.5");
+  mp_expect_i64("num null", (int64)mp_buf_put_num(0, 1.0), (int64)MP_ERR_ARG);
+  mp_buf_clear(b);
+  mp_buf_put_utf8(b, 0x41);
+  mp_buf_put_utf8(b, 0xB7);
+  mp_buf_put_utf8(b, 0x2800);
+  mp_buf_put_utf8(b, 0x1F600);
+  mp_expect_str("utf8 encode", mp_buf_str(b), "A·⠀😀");
+  mp_expect_i64("utf8 bytes", mp_buf_len(b), (int64)10);
+  mp_expect_i64("utf8 surrogate", (int64)mp_buf_put_utf8(b, 0xD800), (int64)MP_ERR_ARG);
+  mp_expect_i64("utf8 too big", (int64)mp_buf_put_utf8(b, 0x110000), (int64)MP_ERR_ARG);
+  mp_expect_i64("utf8 negative", (int64)mp_buf_put_utf8(b, -1), (int64)MP_ERR_ARG);
+  mp_expect_i64("utf8 rejected writes nothing", mp_buf_len(b), (int64)10);
+  var i: int32 = 0;
+  while (i < 100) {
+    mp_buf_puts(b, "0123456789");
+    i = i + 1;
+  }
+  mp_expect_i64("buf grew", mp_buf_len(b), (int64)1010);
+  mp_expect_i64("growth keeps live", mp_alloc_live(), live0 + 2);
+  mp_buf_free(b);
+  mp_expect_i64("buf no leak", mp_alloc_live(), live0);
+}
+
+fn css(c: MpColor) -> string {
+  var tmp: uint8[48];
+  return mp_str_dup(mp_color_css(c, &tmp[0], 48));
+}
+
+fn check_css(name: string, c: MpColor, want: string) {
+  var s: string = css(c);
+  mp_expect_str(name, s, want);
+  mp_str_free(s);
+}
+
+fn check_color() {
+  var live0: int64 = mp_alloc_live();
+  mp_expect("rgb", mp_color_eq(mp_rgb(1, 2, 3), mp_rgba(1, 2, 3, 255)));
+  mp_expect("hex", mp_color_eq(mp_hex(0x4269D0), mp_rgb(0x42, 0x69, 0xD0)));
+  mp_expect("hex ignores high bits", mp_color_eq(mp_hex(0xFF000001), mp_rgb(0, 0, 1)));
+  mp_expect("color_hex", mp_color_hex(mp_rgba(0x12, 0x34, 0x56, 7)) == (uint32)0x123456);
+  mp_expect("eq sees alpha", !mp_color_eq(mp_rgb(1, 2, 3), mp_rgba(1, 2, 3, 254)));
+  mp_expect("alpha", mp_color_eq(mp_color_alpha(mp_rgb(9, 8, 7), 51), mp_rgba(9, 8, 7, 51)));
+  var a: MpColor = mp_rgba(0, 100, 255, 0);
+  var b: MpColor = mp_rgba(255, 200, 0, 255);
+  mp_expect("mix 0", mp_color_eq(mp_color_mix(a, b, 0.0), a));
+  mp_expect("mix 1", mp_color_eq(mp_color_mix(a, b, 1.0), b));
+  mp_expect("mix half", mp_color_eq(mp_color_mix(a, b, 0.5), mp_rgba(128, 150, 128, 128)));
+  mp_expect("mix clamps", mp_color_eq(mp_color_mix(a, b, 7.0), b));
+  mp_expect("mix nan", mp_color_eq(mp_color_mix(a, b, NAN()), a));
+  check_css("css opaque", mp_hex(0x4269D0), "#4269d0");
+  check_css("css alpha", mp_rgba(1, 2, 3, 128), "rgba(1,2,3,0.502)");
+  mp_expect_i64("font stack", (int64)MP_FONT_STACK.length, (int64)77);
+  mp_expect_i64("str no leak in color", mp_alloc_live(), live0);
+}
+
+fn check_theme() {
+  var l: MpTheme = mp_theme_light();
+  var d: MpTheme = mp_theme_dark();
+  mp_expect("light bg", mp_color_hex(l.bg) == (uint32)0xFFFFFF);
+  mp_expect("light title", mp_color_hex(l.title) == (uint32)0x111827);
+  mp_expect("light text", mp_color_hex(l.text) == (uint32)0x374151);
+  mp_expect("light muted", mp_color_hex(l.muted) == (uint32)0x6B7280);
+  mp_expect("light grid", mp_color_hex(l.grid) == (uint32)0xE5E7EB);
+  mp_expect("light axis", mp_color_hex(l.axis) == (uint32)0x9CA3AF);
+  mp_expect("dark bg", mp_color_hex(d.bg) == (uint32)0x111827);
+  mp_expect("dark title", mp_color_hex(d.title) == (uint32)0xF9FAFB);
+  mp_expect("dark text", mp_color_hex(d.text) == (uint32)0xD1D5DB);
+  mp_expect("dark muted", mp_color_hex(d.muted) == (uint32)0x9CA3AF);
+  mp_expect("dark grid", mp_color_hex(d.grid) == (uint32)0x1F2937);
+  mp_expect("dark axis", mp_color_hex(d.axis) == (uint32)0x4B5563);
+  mp_expect_i64("palette size", (int64)l.n_palette, (int64)MP_PALETTE_MAX);
+  mp_expect("palette 0", mp_color_hex(mp_theme_series(&l, 0)) == (uint32)0x4269D0);
+  mp_expect("palette 9", mp_color_hex(mp_theme_series(&d, 9)) == (uint32)0x9498A0);
+  mp_expect("palette wraps", mp_color_hex(mp_theme_series(&l, 12)) == (uint32)0xFF725C);
+  mp_expect("palette negative", mp_color_hex(mp_theme_series(&l, -1)) == (uint32)0x9498A0);
+  mp_expect("series null theme", mp_color_hex(mp_theme_series(0, 3)) == (uint32)0x4269D0);
+  var l2: MpTheme = mp_theme_light();
+  mp_expect("theme eq", mp_theme_eq(&l, &l2));
+  mp_expect("theme ne", !mp_theme_eq(&l, &d));
+  l2.palette[3] = mp_rgb(0, 0, 0);
+  mp_expect("theme palette ne", !mp_theme_eq(&l, &l2));
+  l2 = mp_theme_light();
+  l2.n_palette = 4;
+  mp_expect("theme count ne", !mp_theme_eq(&l, &l2));
+  mp_expect("theme null", mp_theme_eq(0, 0) && !mp_theme_eq(&l, 0));
+}
+
+fn check_geom() {
+  mp_expect_near("clamp in", mp_clamp(0.5, 0.0, 1.0), 0.5, 0.0);
+  mp_expect_near("clamp low", mp_clamp(-2.0, -1.0, 1.0), -1.0, 0.0);
+  mp_expect_near("clamp high", mp_clamp(9.0, -1.0, 1.0), 1.0, 0.0);
+  mp_expect_near("clamp nan", mp_clamp(NAN(), 2.0, 3.0), 2.0, 0.0);
+  mp_expect_near("clamp inverted", mp_clamp(9.0, 3.0, 2.0), 3.0, 0.0);
+  var r: MpRect = mp_rect_shrink(mp_rect(0.0, 0.0, 100.0, 50.0),
+                                 mp_insets(1.0, 2.0, 3.0, 4.0));
+  mp_expect("shrink", r.x == 4.0 && r.y == 1.0 && r.w == 94.0 && r.h == 46.0);
+  mp_expect("contains edge", mp_rect_contains(r, 4.0, 47.0));
+  mp_expect("outside", !mp_rect_contains(r, 3.9, 10.0));
+  mp_expect("nan outside", !mp_rect_contains(r, NAN(), 10.0));
+}
+
+fn run_all() {
+  check_error();
+  check_mem();
+  check_str();
+  check_utf8();
+  check_extent();
+  check_target();
+  check_buf();
+  check_color();
+  check_theme();
+  check_geom();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_core() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

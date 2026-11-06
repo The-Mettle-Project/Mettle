@@ -1,0 +1,81 @@
+//! The whole test vocabulary: counted expectations that print one FAIL line each, and a
+//! summary that turns the failure count into an exit code. Pure (no externs, files or
+//! threads) so every test file that imports it also runs in the compile-time interpreter.
+//! A test file exports `main` (so the compiled gate can run it) and declares `@test fn`
+//! wrappers that call the same `check_*` functions (so `mettle test` runs it in the
+//! interpreter). The counters are process-wide and not thread-safe: use one test thread.
+
+import "std/io";
+
+/// Expectations evaluated so far in this process.
+export var mp_checks: int32 = 0;
+/// Expectations that failed so far in this process.
+export var mp_fails: int32 = 0;
+
+/// Expects a condition to hold; prints "FAIL <name>" when it does not.
+///
+/// @param name Label printed on failure. Valid: any string.
+/// @param cond The condition. Valid: any.
+/// @mem name is only read; nothing is retained.
+export fn mp_expect(name: string, cond: bool) {
+  mp_checks = mp_checks + 1;
+  if (!cond) {
+    mp_fails = mp_fails + 1;
+    println("FAIL {name}");
+  }
+}
+
+/// Expects two integers to be equal; prints both on failure.
+///
+/// @param name Label printed on failure. Valid: any string.
+/// @param got The value under test. Valid: any.
+/// @param want The expected value. Valid: any.
+/// @mem name is only read; nothing is retained.
+export fn mp_expect_i64(name: string, got: int64, want: int64) {
+  mp_checks = mp_checks + 1;
+  if (got != want) {
+    mp_fails = mp_fails + 1;
+    println("FAIL {name}: got {got} want {want}");
+  }
+}
+
+/// Expects two strings to be byte-for-byte equal; prints both in brackets on failure.
+///
+/// @param name Label printed on failure. Valid: any string.
+/// @param got The text under test. Valid: any string.
+/// @param want The expected text. Valid: any string.
+/// @mem All three strings are only read; nothing is retained.
+export fn mp_expect_str(name: string, got: string, want: string) {
+  mp_checks = mp_checks + 1;
+  if (got != want) {
+    mp_fails = mp_fails + 1;
+    println("FAIL {name}: got [{got}] want [{want}]");
+  }
+}
+
+/// Expects two floats to differ by at most eps; prints both on failure.
+/// A NaN difference never exceeds eps in this comparison, so check NaN separately.
+///
+/// @param name Label printed on failure. Valid: any string.
+/// @param got The value under test. Valid: any.
+/// @param want The expected value. Valid: any.
+/// @param eps Largest accepted absolute difference. Valid: >= 0.
+/// @mem name is only read; nothing is retained.
+export fn mp_expect_near(name: string, got: float64, want: float64, eps: float64) {
+  mp_checks = mp_checks + 1;
+  var d: float64 = got - want;
+  if (d < 0.0) { d = -d; }
+  if (d > eps) {
+    mp_fails = mp_fails + 1;
+    println("FAIL {name}: got {got} want {want} eps {eps}");
+  }
+}
+
+/// Prints "<checks> checks, <fails> failed" and gives the process exit code.
+///
+/// @return 0 when every expectation held, otherwise 1.
+export fn mp_summary() -> int32 {
+  println("{mp_checks} checks, {mp_fails} failed");
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

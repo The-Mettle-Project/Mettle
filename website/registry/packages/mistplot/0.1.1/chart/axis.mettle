@@ -1,0 +1,211 @@
+//! Axes of one frame: grid lines, the x baseline, x tick marks, tick labels thinned to a
+//! uniform stride, and the axis titles; plus mp_axis_text, the one placement rule for every
+//! text node of a chart. Grid lines, the baseline, tick marks and text baselines are
+//! snapped to device pixels. Uses chart/layout, scene and core.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/scene/snap";
+import "mistplot/chart/chart";
+import "mistplot/chart/layout";
+
+fn axis_left(x: float64, w: float64, align: int32) -> float64 {
+  if (align == MP_ALIGN_CENTER) { return x - w * 0.5; }
+  if (align == MP_ALIGN_END) { return x - w; }
+  return x;
+}
+
+/// Emits one line of text whose line box starts at top: the measured box is shifted by the
+/// least amount that keeps it inside the canvas, a text wider than the canvas is dropped,
+/// and the baseline (top + half the line height + 0.35 * size) is snapped.
+///
+/// @param l The layout. Valid: non-zero.
+/// @param x Anchor x for align. Units: px. Valid: any.
+/// @param top Top of the line box. Units: px. Valid: any; clamped into the canvas.
+/// @param label The text. Valid: any UTF-8; "" emits nothing.
+/// @param size Font size. Units: px. Valid: > 0.
+/// @param color Text colour. Valid: any.
+/// @param align MP_ALIGN_*. Valid: 0 .. 2.
+/// @param flags MP_NF_BOLD and/or MP_NF_TABULAR. Valid: any bits.
+/// @param cls Node class. Valid: any.
+/// @return MP_OK, or the scene's error.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT the scene could not grow; nothing is added.
+/// @mem label is copied into the scene.
+/// @thread Call with the chart entered.
+export fn mp_axis_text(l: MpLayout*, x: float64, top: float64, label: string, size: float64,
+                       color: MpColor, align: int32, flags: int32, cls: int32) -> int32 {
+  if ((int64)label.length == 0) { return MP_OK; }
+  var w: float64 = mp_target_text_w(l->t, label, size);
+  if (w > l->w) { return MP_OK; }
+  var lh: float64 = mp_target_text_h(l->t, size);
+  var ax: float64 = x;
+  var left: float64 = axis_left(x, w, align);
+  if (left < 0.0) { ax = ax - left; }
+  if (left + w > l->w) { ax = ax - (left + w - l->w); }
+  var ty: float64 = top;
+  if (ty + lh > l->h) { ty = l->h - lh; }
+  if (ty < 0.0) { ty = 0.0; }
+  var base: float64 = mp_snap_edge(ty + lh * 0.5 + size * 0.35, l->scale);
+  return mp_scene_text(l->s, ax, base, label, size, color, align, flags, cls, w);
+}
+
+/// Position of an x tick: a band centre on a band axis, else the mapped value.
+///
+/// @param l The layout. Valid: non-zero, scales built.
+/// @param v Tick value (band index on a band axis). Valid: any.
+/// @return The x position, px.
+/// @mem Reads l only.
+/// @thread Call with the chart entered.
+export fn mp_axis_x_pos(l: MpLayout*, v: float64) -> float64 {
+  if (l->band) { return mp_scale_band_center(l->xs, (int32)v); }
+  return mp_scale_map(l->xs, v);
+}
+
+// Smallest stride k >= 1 at which labels 0, k, 2k, ... keep gap between their boxes.
+fn axis_stride(lo: float64*, hi: float64*, n: int32, gap: float64) -> int32 {
+  var k: int32 = 1;
+  while (k < n) {
+    var fits: bool = true;
+    var i: int32 = k;
+    while (i < n && fits) {
+      var a: float64 = lo[(int64)i];
+      var b: float64 = hi[(int64)i];
+      var pa: float64 = lo[(int64)(i - k)];
+      var pb: float64 = hi[(int64)(i - k)];
+      if (!(a >= pb + gap || pa >= b + gap)) { fits = false; }
+      i = i + k;
+    }
+    if (fits) { return k; }
+    k = k + 1;
+  }
+  return k;
+}
+
+fn axis_grid(l: MpLayout*) -> int32 {
+  var c: MpChart* = l->c;
+  var p: MpRect = l->plot;
+  var lw: float64 = mp_snap_width(1.0, l->scale);
+  var rc: int32 = MP_OK;
+  var i: int32 = 0;
+  if (c->grid == MP_GRID_Y || c->grid == MP_GRID_XY) {
+    while (i < l->ny && rc == MP_OK) {
+      var py: float64 = mp_snap_line(mp_scale_map(l->ys, l->yv[(int64)i]), 1.0, l->scale);
+      if (py >= p.y && py < p.y + p.h - 0.5) {
+        rc = mp_scene_line(l->s, p.x, py, p.x + p.w, py, c->theme.grid, lw, MP_CLS_GRID);
+      }
+      i = i + 1;
+    }
+  }
+  if ((c->grid == MP_GRID_X || c->grid == MP_GRID_XY) && !l->band) {
+    i = 0;
+    while (i < l->nx && rc == MP_OK) {
+      var px: float64 = mp_snap_line(mp_axis_x_pos(l, l->xv[(int64)i]), 1.0, l->scale);
+      if (px >= p.x && px <= p.x + p.w) {
+        rc = mp_scene_line(l->s, px, p.y, px, p.y + p.h, c->theme.grid, lw, MP_CLS_GRID);
+      }
+      i = i + 1;
+    }
+  }
+  return rc;
+}
+
+fn axis_baseline(l: MpLayout*) -> int32 {
+  var p: MpRect = l->plot;
+  var lw: float64 = mp_snap_width(1.0, l->scale);
+  var by: float64 = mp_snap_line(p.y + p.h, 1.0, l->scale);
+  var rc: int32 = mp_scene_line(l->s, p.x, by, p.x + p.w, by, l->c->theme.axis, lw,
+                                MP_CLS_AXIS);
+  if (l->cells) { return rc; }
+  var i: int32 = 0;
+  while (i < l->nx && rc == MP_OK) {
+    var px: float64 = mp_snap_line(mp_axis_x_pos(l, l->xv[(int64)i]), 1.0, l->scale);
+    if (px >= p.x - 0.5 && px <= p.x + p.w + 0.5) {
+      rc = mp_scene_line(l->s, px, by, px, by + 4.0, l->c->theme.axis, lw, MP_CLS_TICK);
+    }
+    i = i + 1;
+  }
+  return rc;
+}
+
+fn axis_y_labels(l: MpLayout*) -> int32 {
+  var b: uint8[64];
+  var lo: float64[64];
+  var hi: float64[64];
+  var lh: float64 = mp_target_text_h(l->t, MP_SIZE_TICK);
+  var i: int32 = 0;
+  while (i < l->ny) {
+    var top: float64 = mp_scale_map(l->ys, l->yv[(int64)i]) - lh * 0.5;
+    lo[(int64)i] = top;
+    hi[(int64)i] = top + lh;
+    i = i + 1;
+  }
+  var gap: float64 = 2.0;
+  if (l->cells) { gap = 0.0; }
+  var k: int32 = axis_stride(&lo[0], &hi[0], l->ny, gap);
+  var rc: int32 = MP_OK;
+  i = 0;
+  while (i < l->ny && rc == MP_OK) {
+    var s: string = mp_layout_y_label(l, i, &b[0], 64);
+    rc = mp_axis_text(l, l->plot.x - l->tick_gap, lo[(int64)i], s, MP_SIZE_TICK,
+                      l->c->theme.muted, MP_ALIGN_END, MP_NF_TABULAR, MP_CLS_TICK);
+    i = i + k;
+  }
+  return rc;
+}
+
+fn axis_x_labels(l: MpLayout*) -> int32 {
+  var b: uint8[64];
+  var lo: float64[64];
+  var hi: float64[64];
+  var i: int32 = 0;
+  while (i < l->nx) {
+    var s: string = mp_layout_x_label(l, i, &b[0], 64);
+    var w: float64 = mp_target_text_w(l->t, s, MP_SIZE_TICK);
+    var a: float64 = mp_clamp(mp_axis_x_pos(l, l->xv[(int64)i]) - w * 0.5, 0.0, l->w - w);
+    lo[(int64)i] = a;
+    hi[(int64)i] = a + w;
+    i = i + 1;
+  }
+  var gap: float64 = 6.0;
+  if (l->cells) { gap = l->t->cell_w; }
+  var k: int32 = axis_stride(&lo[0], &hi[0], l->nx, gap);
+  var rc: int32 = MP_OK;
+  i = 0;
+  while (i < l->nx && rc == MP_OK) {
+    var s2: string = mp_layout_x_label(l, i, &b[0], 64);
+    rc = mp_axis_text(l, mp_axis_x_pos(l, l->xv[(int64)i]), l->xtick_y, s2, MP_SIZE_TICK,
+                      l->c->theme.muted, MP_ALIGN_CENTER, MP_NF_TABULAR, MP_CLS_TICK);
+    i = i + k;
+  }
+  return rc;
+}
+
+/// Draws grid, baseline, tick marks, tick labels and axis titles, in that order.
+///
+/// @param l The layout. Valid: non-zero, laid out with scales built.
+/// @return MP_OK, or the scene's error.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT the scene could not grow; the axes are partial.
+/// @mem Writes into l->s only.
+/// @thread Call with the chart entered.
+export fn mp_axis_draw(l: MpLayout*) -> int32 {
+  var rc: int32 = axis_grid(l);
+  if (rc == MP_OK) { rc = axis_baseline(l); }
+  if (rc == MP_OK) { rc = axis_y_labels(l); }
+  if (rc == MP_OK) { rc = axis_x_labels(l); }
+  var c: MpChart* = l->c;
+  if (rc == MP_OK) {
+    rc = mp_axis_text(l, l->plot.x + l->plot.w * 0.5, l->xlab_y, c->x_label, MP_SIZE_TEXT,
+                      c->theme.text, MP_ALIGN_CENTER, 0, MP_CLS_LABEL);
+  }
+  if (rc == MP_OK) {
+    rc = mp_axis_text(l, l->pad_x, l->ylab_y, c->y_label, MP_SIZE_TEXT, c->theme.text,
+                      MP_ALIGN_START, 0, MP_CLS_LABEL);
+  }
+  return rc;
+}

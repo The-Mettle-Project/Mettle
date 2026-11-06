@@ -1,0 +1,113 @@
+// mp_chart_term: the chart laid out on the cell grid, one line per row, plain output with
+// no ESC byte, the explicit-theme switch, MP_TERM_HOME framing and argument errors.
+
+import "std/conv";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/chart/frame";
+import "mistplot/render/term";
+
+fn count_byte(s: string, b: int32) -> int64 {
+  var n: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    if ((int32)s.chars[i] == b) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+fn chart() -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_title(c, "Load");
+  var s: int32 = mp_chart_series(c, "cpu");
+  var i: int32 = 0;
+  while (i < 20) {
+    mp_chart_push(c, s, (float64)i, (float64)(i % 7));
+    i = i + 1;
+  }
+  return c;
+}
+
+fn check_term() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = chart();
+  var out: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("plain", (int64)mp_chart_term(c, 40, 12, MP_TERM_BRAILLE | MP_TERM_PLAIN, out),
+                (int64)MP_OK);
+  var doc: string = mp_buf_str(out);
+  mp_expect_i64("one line per row", count_byte(doc, 10), 12);
+  mp_expect_i64("no ESC", count_byte(doc, 27), 0);
+  mp_expect("title on the first row", str_starts_with(doc, " Load\n") != 0);
+  mp_expect_i64("colour", (int64)mp_chart_term(c, 40, 12, MP_TERM_AUTO, out), (int64)MP_OK);
+  doc = mp_buf_str(out);
+  mp_expect("series colour", str_contains(doc, "38;2;66;105;208m") != 0);
+  mp_expect("no background without a theme", str_contains(doc, "[48;2;") == 0);
+  mp_chart_set_theme(c, mp_theme_dark());
+  mp_chart_term(c, 40, 12, MP_TERM_AUTO, out);
+  doc = mp_buf_str(out);
+  mp_expect("theme background", str_contains(doc, "48;2;17;24;39m") != 0);
+  mp_chart_term(c, 40, 12, MP_TERM_ASCII | MP_TERM_HOME, out);
+  doc = mp_buf_str(out);
+  mp_expect("home first", (int64)doc.length > 3 && (int32)doc.chars[0] == 27);
+  mp_expect_i64("zero cols", (int64)mp_chart_term(c, 0, 12, MP_TERM_AUTO, out),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("too many cols", (int64)mp_chart_term(c, MP_TERM_MAX_COLS + 1, 12, 0, out),
+                (int64)MP_ERR_LIMIT);
+  mp_expect_i64("bad mode", (int64)mp_chart_term(c, 40, 12, 9, out), (int64)MP_ERR_ARG);
+  mp_expect_i64("cleared", mp_buf_len(out), 0);
+  mp_buf_free(out);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+// Steady frames reuse the chart scratch; a caller grid gives the same text as mp_term_scene.
+fn check_grid() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = chart();
+  var out: MpBuf* = mp_buf_new(8192);
+  var ref: MpBuf* = mp_buf_new(8192);
+  mp_chart_term(c, 40, 12, MP_TERM_BRAILLE, out);
+  var n0: int64 = mp_alloc_count();
+  mp_chart_term(c, 40, 12, MP_TERM_BRAILLE, out);
+  mp_expect_i64("steady term frame allocates nothing", mp_alloc_count() - n0, 0);
+  var t: MpTarget = mp_target_cells(40, 12);
+  var bytes: int64 = mp_term_grid_bytes(&t);
+  mp_expect_i64("grid bytes", bytes, 40 * 12 * MP_TERM_CELL_BYTES);
+  var grid: uint8* = (uint8*)mp_alloc(bytes);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  mp_expect_i64("alloc grid", (int64)mp_term_scene(s, &t, MP_TERM_BRAILLE, ref), (int64)MP_OK);
+  mp_expect_i64("caller grid", (int64)mp_term_scene_grid(s, &t, MP_TERM_BRAILLE, grid, bytes,
+                                                        out), (int64)MP_OK);
+  mp_expect("same text", str_compare(mp_buf_str(out), mp_buf_str(ref)) == 0);
+  mp_term_scene_grid(s, &t, MP_TERM_BRAILLE, grid, bytes, out);
+  mp_expect("same text on reuse", str_compare(mp_buf_str(out), mp_buf_str(ref)) == 0);
+  mp_expect_i64("small grid", (int64)mp_term_scene_grid(s, &t, MP_TERM_BRAILLE, grid,
+                                                       bytes - 1, out), (int64)MP_ERR_ARG);
+  mp_free((rawptr)grid);
+  mp_buf_free(ref);
+  mp_buf_free(out);
+  mp_chart_free(c);
+  mp_expect_i64("grid leak-free", mp_alloc_live(), base);
+}
+
+export fn main() -> int32 {
+  check_term();
+  check_grid();
+  return mp_summary();
+}
+
+@test fn t_chart_term() -> int32 {
+  check_term();
+  check_grid();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

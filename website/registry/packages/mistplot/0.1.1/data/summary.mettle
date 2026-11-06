@@ -1,0 +1,637 @@
+//! MpSummary, the O(width) frame engine for large sorted columns: a ring of min/max
+//! buckets on an absolute grid (bucket k covers [k*bw, (k+1)*bw) with bw a power of two,
+//! so bucket edges never depend on history). Pushes update it in O(1); a frame merges
+//! the visible buckets into pixel columns. Uses data/col, data/decimate (the fallback
+//! for unsorted columns) and core/{error,mem}. The ring is allocated once, at the first
+//! rebuild; afterwards nothing allocates. Every emitted point is a real sample, and the
+//! y extent of the emitted points equals the y extent of the visible samples.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/data/col";
+import "mistplot/data/decimate";
+
+/// Default buckets per visible domain (the bucket width is a power of two near span / B).
+export const MP_SUMMARY_BUCKETS: int32 = 2048;
+
+/// Columns shorter than this are cheaper to scan directly than to summarise.
+export const MP_SUMMARY_MIN_LEN: int64 = 8192;
+
+const SUM_EXP_MASK: int64 = 0x7FF0000000000000;
+const SUM_K_LIMIT: float64 = 4611686018427387904.0;   // 2^62
+const SUM_BW_MIN: float64 = 1.0e-290;
+
+/// One bucket: the first, min-y, max-y and last finite sample whose x falls into it.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpSumBucket {
+  k: int64;     /// bucket index: floor(x / bw)
+  fx: float64;  /// first sample x
+  fy: float64;  /// first sample y
+  nx: float64;  /// x of the first sample with the smallest y
+  ny: float64;  /// smallest y
+  mx: float64;  /// x of the first sample with the largest y
+  my: float64;  /// largest y
+  lx: float64;  /// last sample x
+  ly: float64;  /// last sample y
+}
+
+/// Bucket summary of one column. Initialise with mp_summary_init, release with
+/// mp_summary_free. Read nb, rebuilds and fallbacks; the rest is internal state.
+///
+/// @mem Owns ring (allocated through core/mem at the first rebuild); borrows nothing.
+export struct MpSummary {
+  ring: MpSumBucket*;  /// bucket ring, ring_cap slots; 0 before the first rebuild
+  ring_cap: int64;     /// slots: 2 * nb + 2
+  head: int64;         /// slot of the oldest bucket
+  len: int64;          /// buckets held, in increasing k
+  nb: int32;           /// buckets per domain; MP_SUMMARY_BUCKETS unless changed
+  span: float64;       /// window span; 0 = show everything (doubling ladder)
+  bw: float64;         /// bucket width, a power of two
+  inv_bw: float64;     /// 1 / bw (exact)
+  valid: bool;         /// the ring matches the column up to `seen` pushes
+  gen: int64;          /// the column's gen at the last rebuild
+  seen: int64;         /// column pushes accounted for
+  has_last: bool;      /// last_x is set
+  last_x: float64;     /// newest finite x pushed (order check)
+  k_cover: int64;      /// every bucket k >= k_cover holds all of its samples
+  rebuilds: int64;     /// full rebuilds so far
+  fallbacks: int64;    /// frames that fell back to mp_col_decimate
+}
+
+/// Initialises an empty summary in window-less mode without allocating.
+///
+/// @param s The summary. Valid: non-zero; previous contents are forgotten, not freed.
+/// @mem Nothing is allocated.
+export fn mp_summary_init(s: MpSummary*) {
+  if (s == 0) { return; }
+  s->ring = 0;
+  s->ring_cap = 0;
+  s->head = 0;
+  s->len = 0;
+  s->nb = MP_SUMMARY_BUCKETS;
+  s->span = 0.0;
+  s->bw = 0.0;
+  s->inv_bw = 0.0;
+  s->valid = false;
+  s->gen = 0;
+  s->seen = 0;
+  s->has_last = false;
+  s->last_x = 0.0;
+  s->k_cover = 0;
+  s->rebuilds = 0;
+  s->fallbacks = 0;
+}
+
+/// Releases the ring and re-initialises the summary.
+///
+/// @param s The summary. Valid: an initialised summary, or 0 (ignored).
+/// @mem Frees ring; the struct itself is not freed.
+export fn mp_summary_free(s: MpSummary*) {
+  if (s == 0) { return; }
+  if (s->ring != 0) { mp_free((rawptr)s->ring); }
+  mp_summary_init(s);
+}
+
+/// Forces a rebuild at the next emit (keeps the ring storage, nb and span).
+///
+/// @param s The summary. Valid: any; 0 is ignored.
+/// @mem Nothing is freed.
+export fn mp_summary_reset(s: MpSummary*) {
+  if (s == 0) { return; }
+  s->valid = false;
+}
+
+/// Sets the window span; a changed span forces a rebuild at the next emit.
+/// In window mode (span > 0) the bucket width is the largest power of two <= span / nb.
+/// With span 0 it follows the visible width on a doubling ladder.
+///
+/// @param s The summary. Valid: non-zero.
+/// @param span Window span. Units: data units. Valid: finite and >= 0.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0 or span is negative or not finite; nothing changes.
+/// @mem Nothing is allocated.
+export fn mp_summary_set_span(s: MpSummary*, span: float64) -> int32 {
+  if (s == 0 || is_finite(span) == 0 || span < 0.0) { return MP_ERR_ARG; }
+  if (span != s->span) {
+    s->span = span;
+    s->valid = false;
+  }
+  return MP_OK;
+}
+
+// Largest power of two <= v, or 0 when v is not a usable positive width.
+fn sum_pow2_floor(v: float64) -> float64 {
+  if (is_finite(v) == 0 || !(v >= SUM_BW_MIN)) { return 0.0; }
+  return f64_from_bits(f64_bits(v) & SUM_EXP_MASK);
+}
+
+// Bucket index of x into *k; false when it would not fit an int64 exactly.
+fn sum_kabs(s: MpSummary*, x: float64, k: int64*) -> bool {
+  var t: float64 = x * s->inv_bw;
+  if (!(t > -SUM_K_LIMIT && t < SUM_K_LIMIT)) { return false; }
+  var i: int64 = (int64)t;
+  if ((float64)i > t) { i = i - 1; }
+  *k = i;
+  return true;
+}
+
+fn sum_slot(s: MpSummary*, i: int64) -> int64 {
+  var k: int64 = s->head + i;
+  if (k >= s->ring_cap) { k = k - s->ring_cap; }
+  return k;
+}
+
+fn sum_bucket_start(b: MpSumBucket*, k: int64, x: float64, y: float64) {
+  b->k = k;
+  b->fx = x;
+  b->fy = y;
+  b->nx = x;
+  b->ny = y;
+  b->mx = x;
+  b->my = y;
+  b->lx = x;
+  b->ly = y;
+}
+
+fn sum_bucket_add(b: MpSumBucket*, x: float64, y: float64) {
+  b->lx = x;
+  b->ly = y;
+  if (y < b->ny) {
+    b->nx = x;
+    b->ny = y;
+  }
+  if (y > b->my) {
+    b->mx = x;
+    b->my = y;
+  }
+}
+
+// Folds b (later in x) into a.
+fn sum_bucket_merge(a: MpSumBucket*, b: MpSumBucket*) {
+  a->lx = b->lx;
+  a->ly = b->ly;
+  if (b->ny < a->ny) {
+    a->nx = b->nx;
+    a->ny = b->ny;
+  }
+  if (b->my > a->my) {
+    a->mx = b->mx;
+    a->my = b->my;
+  }
+}
+
+// Doubles the bucket width, merging bucket pairs (2j, 2j+1) into j.
+fn sum_merge_pairs(s: MpSummary*) {
+  var w: int64 = -1;
+  var r: int64 = 0;
+  while (r < s->len) {
+    var b: MpSumBucket = s->ring[sum_slot(s, r)];
+    b.k = b.k >> 1;
+    if (w >= 0 && s->ring[sum_slot(s, w)].k == b.k) {
+      sum_bucket_merge(&s->ring[sum_slot(s, w)], &b);
+    } else {
+      w = w + 1;
+      s->ring[sum_slot(s, w)] = b;
+    }
+    r = r + 1;
+  }
+  s->len = w + 1;
+  s->bw = s->bw * 2.0;
+  s->inv_bw = s->inv_bw * 0.5;
+  s->k_cover = (s->k_cover + 1) >> 1;
+}
+
+// Adds a finite sample at or after every sample already held; false when its bucket
+// index cannot be represented.
+fn sum_add(s: MpSummary*, x: float64, y: float64) -> bool {
+  var k: int64 = 0;
+  if (!sum_kabs(s, x, &k)) { return false; }
+  if (s->len > 0 && s->ring[sum_slot(s, s->len - 1)].k == k) {
+    sum_bucket_add(&s->ring[sum_slot(s, s->len - 1)], x, y);
+    return true;
+  }
+  if (s->len == s->ring_cap) {
+    if (s->span > 0.0) {
+      var old: int64 = s->ring[s->head].k + 1;
+      if (old > s->k_cover) { s->k_cover = old; }
+      s->head = sum_slot(s, 1);
+      s->len = s->len - 1;
+    } else {
+      sum_merge_pairs(s);
+      if (!sum_kabs(s, x, &k)) { return false; }
+      if (s->ring[sum_slot(s, s->len - 1)].k == k) {
+        sum_bucket_add(&s->ring[sum_slot(s, s->len - 1)], x, y);
+        return true;
+      }
+    }
+  }
+  sum_bucket_start(&s->ring[sum_slot(s, s->len)], k, x, y);
+  s->len = s->len + 1;
+  return true;
+}
+
+/// Feeds one sample that was just pushed to the summarised column.
+/// Call it after every push to the column, in the same order, or never: emit replays the
+/// newest pushes it has not seen, so skipping only some of them forces a rebuild. An x
+/// below the previous finite x invalidates the summary (the column is then unsorted and
+/// frames use mp_col_decimate until it is cleared).
+///
+/// @param s The summary. Valid: any; 0 is ignored.
+/// @param x Sample x. Units: data units. Valid: any; non-finite samples are skipped.
+/// @param y Sample y. Units: data units. Valid: any; non-finite samples are skipped.
+/// @mem Nothing is allocated (a full ring drops or merges buckets instead).
+/// @cost O(1) amortized.
+export fn mp_summary_push(s: MpSummary*, x: float64, y: float64) {
+  if (s == 0 || !s->valid) { return; }
+  s->seen = s->seen + 1;
+  if (is_finite(x) == 0) { return; }
+  if (s->has_last && x < s->last_x) {
+    s->valid = false;
+    return;
+  }
+  s->last_x = x;
+  s->has_last = true;
+  if (is_finite(y) == 0) { return; }
+  if (!sum_add(s, x, y)) { s->valid = false; }
+}
+
+// Ensures a ring of 2 * nb + 2 slots.
+fn sum_reserve(s: MpSummary*) -> int32 {
+  var want: int64 = 2 * (int64)s->nb + 2;
+  if (s->ring != 0 && s->ring_cap == want) { return MP_OK; }
+  if (want > MP_MAX_COUNT) { return MP_ERR_LIMIT; }
+  var r: MpSumBucket* = (MpSumBucket*)mp_alloc(want * sizeof(MpSumBucket));
+  if (r == 0) { return MP_ERR_ALLOC; }
+  if (s->ring != 0) { mp_free((rawptr)s->ring); }
+  s->ring = r;
+  s->ring_cap = want;
+  return MP_OK;
+}
+
+// Rebuilds the ring from col[i0 ..] with bucket width bw.
+fn sum_rebuild(s: MpSummary*, col: MpCol*, i0: int64, bw: float64) -> int32 {
+  s->valid = false;
+  if (!(bw > 0.0)) { return MP_ERR_STATE; }
+  var rc: int32 = sum_reserve(s);
+  if (rc != MP_OK) { return rc; }
+  s->bw = bw;
+  s->inv_bw = 1.0 / bw;
+  s->head = 0;
+  s->len = 0;
+  s->has_last = false;
+  s->k_cover = 0;
+  if (!sum_kabs(s, mp_col_x(col, i0), &s->k_cover)) { return MP_ERR_STATE; }
+  s->k_cover = s->k_cover + 1;
+  var i: int64 = i0;
+  while (i < mp_col_len(col)) {
+    var x: float64 = mp_col_x(col, i);
+    var y: float64 = mp_col_y(col, i);
+    if (is_finite(x) != 0) {
+      s->last_x = x;
+      s->has_last = true;
+      if (is_finite(y) != 0 && !sum_add(s, x, y)) { return MP_ERR_STATE; }
+    }
+    i = i + 1;
+  }
+  s->gen = col->gen;
+  s->seen = col->pushes;
+  s->valid = true;
+  s->rebuilds = s->rebuilds + 1;
+  return MP_OK;
+}
+
+// Replays pushes the summary missed; false when only a rebuild can catch up.
+fn sum_sync(s: MpSummary*, col: MpCol*) -> bool {
+  if (!s->valid || col->gen != s->gen || s->seen > col->pushes) { return false; }
+  var miss: int64 = col->pushes - s->seen;
+  var n: int64 = mp_col_len(col);
+  if (miss > n) { return false; }
+  var i: int64 = n - miss;
+  while (i < n && s->valid) {
+    mp_summary_push(s, mp_col_x(col, i), mp_col_y(col, i));
+    i = i + 1;
+  }
+  return s->valid;
+}
+
+// Bucket width a rebuild should use for visible finite x range [xa, xb].
+fn sum_want_bw(s: MpSummary*, xa: float64, xb: float64) -> float64 {
+  if (s->span > 0.0) { return sum_pow2_floor(s->span / (float64)s->nb); }
+  if (xb > xa) { return sum_pow2_floor((xb - xa) / (float64)s->nb); }
+  return sum_pow2_floor(fmax(fabs(xa), 1.0));
+}
+
+// In all mode keeps width / bw within [nb / 2, 2 nb]; false when a rebuild is needed.
+fn sum_level(s: MpSummary*, xa: float64, xb: float64) -> bool {
+  if (s->span > 0.0) { return s->bw == sum_want_bw(s, xa, xb); }
+  if (!(xb > xa)) { return true; }
+  var nb: float64 = (float64)s->nb;
+  var count: float64 = (xb - xa) * s->inv_bw;
+  if (count > 4.0 * nb || count < 0.5 * nb) { return false; }
+  while (count > 2.0 * nb) {
+    sum_merge_pairs(s);
+    count = count * 0.5;
+  }
+  return true;
+}
+
+// Whether the ring can serve visible x range [xa, xb] (bucket k0 is always rescanned).
+fn sum_covers(s: MpSummary*, xa: float64, xb: float64) -> bool {
+  var k0: int64 = 0;
+  var k1: int64 = 0;
+  if (!sum_kabs(s, xa, &k0) || !sum_kabs(s, xb, &k1)) { return false; }
+  return k0 + 1 >= s->k_cover;
+}
+
+// Brings the ring in line with col for visible samples [i_lo, i_hi): MP_OK, MP_ERR_ALLOC,
+// or MP_ERR_STATE when the caller must fall back to mp_col_decimate.
+fn sum_prepare(s: MpSummary*, col: MpCol*, i_lo: int64, xb: float64) -> int32 {
+  if (s->nb < 1 || (int64)s->nb > MP_MAX_COUNT / 4) { return MP_ERR_STATE; }
+  var xa: float64 = mp_col_x(col, i_lo);
+  var fresh: bool = false;
+  if (!sum_sync(s, col) || !sum_level(s, xa, xb)) {
+    var rc: int32 = sum_rebuild(s, col, i_lo, sum_want_bw(s, xa, xb));
+    if (rc != MP_OK) { return rc; }
+    fresh = true;
+  }
+  if (sum_covers(s, xa, xb)) { return MP_OK; }
+  if (fresh) { return MP_ERR_STATE; }
+  var rc2: int32 = sum_rebuild(s, col, i_lo, sum_want_bw(s, xa, xb));
+  if (rc2 != MP_OK) { return rc2; }
+  if (sum_covers(s, xa, xb)) { return MP_OK; }
+  return MP_ERR_STATE;
+}
+
+// First index >= i with a finite x > x1, or the length (sorted column).
+fn sum_upper(col: MpCol*, x1: float64, i: int64) -> int64 {
+  var lo: int64 = i;
+  var hi: int64 = mp_col_len(col);
+  while (lo < hi) {
+    var mid: int64 = lo + (hi - lo) / 2;
+    var m: int64 = mid;
+    while (m < hi && is_finite(mp_col_x(col, m)) == 0) { m = m + 1; }
+    if (m == hi || mp_col_x(col, m) > x1) {
+      hi = mid;
+    } else {
+      lo = m + 1;
+    }
+  }
+  while (lo < mp_col_len(col) && is_finite(mp_col_x(col, lo)) == 0) { lo = lo + 1; }
+  return lo;
+}
+
+// Writes the last sample before i_lo with finite x and y; returns 0 or 1.
+fn sum_lead(col: MpCol*, i_lo: int64, xs: float64*, ys: float64*) -> int64 {
+  var j: int64 = i_lo - 1;
+  while (j >= 0) {
+    var x: float64 = mp_col_x(col, j);
+    var y: float64 = mp_col_y(col, j);
+    if (is_finite(x) != 0 && is_finite(y) != 0) {
+      xs[0] = x;
+      ys[0] = y;
+      return 1;
+    }
+    j = j - 1;
+  }
+  return 0;
+}
+
+// Copies the finite samples of [i_lo, i_hi).
+fn sum_copy(col: MpCol*, i_lo: int64, i_hi: int64, xs: float64*, ys: float64*) -> int64 {
+  var n: int64 = 0;
+  var i: int64 = i_lo;
+  while (i < i_hi) {
+    var x: float64 = mp_col_x(col, i);
+    var y: float64 = mp_col_y(col, i);
+    if (is_finite(x) != 0 && is_finite(y) != 0) {
+      xs[n] = x;
+      ys[n] = y;
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+// Aggregates the finite samples of [i, end) into b; returns false when there are none.
+fn sum_scan(col: MpCol*, i: int64, end: int64, k: int64, b: MpSumBucket*) -> bool {
+  var any: bool = false;
+  var j: int64 = i;
+  while (j < end) {
+    var x: float64 = mp_col_x(col, j);
+    var y: float64 = mp_col_y(col, j);
+    if (is_finite(x) != 0 && is_finite(y) != 0) {
+      if (any) {
+        sum_bucket_add(b, x, y);
+      } else {
+        sum_bucket_start(b, k, x, y);
+        any = true;
+      }
+    }
+    j = j + 1;
+  }
+  return any;
+}
+
+// Pixel-column accumulator: buckets fold into `cur` until one lands in another column.
+struct SumOut {
+  xs: float64*;
+  ys: float64*;
+  n: int64;
+  cap: int64;
+  x0: float64;
+  colw: float64;
+  ncol: int64;
+  ci: int64;
+  cur: MpSumBucket;
+}
+
+fn sum_out_point(o: SumOut*, start: int64, x: float64, y: float64) {
+  var j: int64 = start;
+  while (j < o->n) {
+    if (o->xs[j] == x && o->ys[j] == y) { return; }
+    j = j + 1;
+  }
+  if (o->n >= o->cap) { return; }
+  o->xs[o->n] = x;
+  o->ys[o->n] = y;
+  o->n = o->n + 1;
+}
+
+// Emits the current column's distinct first/min/max/last points in x order (stable).
+fn sum_out_flush(o: SumOut*) {
+  if (o->ci < 0) { return; }
+  var px: float64[4];
+  var py: float64[4];
+  px[0] = o->cur.fx;
+  py[0] = o->cur.fy;
+  px[1] = o->cur.nx;
+  py[1] = o->cur.ny;
+  px[2] = o->cur.mx;
+  py[2] = o->cur.my;
+  px[3] = o->cur.lx;
+  py[3] = o->cur.ly;
+  var i: int64 = 1;
+  while (i < 4) {
+    var vx: float64 = px[i];
+    var vy: float64 = py[i];
+    var j: int64 = i - 1;
+    while (j >= 0 && px[j] > vx) {
+      px[j + 1] = px[j];
+      py[j + 1] = py[j];
+      j = j - 1;
+    }
+    px[j + 1] = vx;
+    py[j + 1] = vy;
+    i = i + 1;
+  }
+  var start: int64 = o->n;
+  var t: int64 = 0;
+  while (t < 4) {
+    sum_out_point(o, start, px[t], py[t]);
+    t = t + 1;
+  }
+  o->ci = -1;
+}
+
+fn sum_out_feed(o: SumOut*, b: MpSumBucket*) {
+  var ci: int64 = 0;
+  if (o->colw > 0.0) {
+    var f: float64 = (b->fx - o->x0) / o->colw;
+    if (f > (float64)o->ncol) { f = (float64)o->ncol; }
+    if (f > 0.0) { ci = (int64)f; }
+    if (ci > o->ncol - 1) { ci = o->ncol - 1; }
+  }
+  if (ci == o->ci) {
+    sum_bucket_merge(&o->cur, b);
+    return;
+  }
+  sum_out_flush(o);
+  o->ci = ci;
+  o->cur = *b;
+}
+
+// Index where the last bucket k1 of the visible range [.., i_hi) starts in the column.
+fn sum_bucket_begin(s: MpSummary*, col: MpCol*, i_hi: int64, k1: int64,
+                    floor_i: int64) -> int64 {
+  var j: int64 = i_hi;
+  while (j > floor_i) {
+    var x: float64 = mp_col_x(col, j - 1);
+    var k: int64 = 0;
+    if (is_finite(x) != 0) {
+      if (!sum_kabs(s, x, &k) || k != k1) { return j; }
+    }
+    j = j - 1;
+  }
+  return j;
+}
+
+// Feeds bucket k0 (rescanned from the column), the interior ring buckets and bucket k1
+// (rescanned when it holds samples past x1) into o.
+fn sum_feed_range(s: MpSummary*, col: MpCol*, i_lo: int64, i_hi: int64, x1: float64,
+                  xb: float64, o: SumOut*) {
+  var k0: int64 = 0;
+  var k1: int64 = 0;
+  sum_kabs(s, mp_col_x(col, i_lo), &k0);
+  sum_kabs(s, xb, &k1);
+  var b: MpSumBucket;
+  var end0: int64 = i_hi;
+  if (k1 > k0) { end0 = sum_first_after(s, col, i_lo, i_hi, k0); }
+  if (sum_scan(col, i_lo, end0, k0, &b)) { sum_out_feed(o, &b); }
+  if (k1 == k0) { return; }
+  var r: int64 = 0;
+  while (r < s->len && s->ring[sum_slot(s, r)].k <= k0) { r = r + 1; }
+  while (r < s->len) {
+    var rb: MpSumBucket* = &s->ring[sum_slot(s, r)];
+    if (rb->k > k1) { break; }
+    if (rb->k == k1 && rb->lx > x1) {
+      var j1: int64 = sum_bucket_begin(s, col, i_hi, k1, end0);
+      if (sum_scan(col, j1, i_hi, k1, &b)) { sum_out_feed(o, &b); }
+    } else {
+      sum_out_feed(o, rb);
+    }
+    r = r + 1;
+  }
+}
+
+// First index in [i, end) whose finite x lies in a bucket after k0, or end.
+fn sum_first_after(s: MpSummary*, col: MpCol*, i: int64, end: int64, k0: int64) -> int64 {
+  var j: int64 = i;
+  while (j < end) {
+    var x: float64 = mp_col_x(col, j);
+    var k: int64 = 0;
+    if (is_finite(x) != 0 && (!sum_kabs(s, x, &k) || k > k0)) { return j; }
+    j = j + 1;
+  }
+  return end;
+}
+
+/// Writes the visible samples of col in [x0, x1], reduced to at most cap points.
+/// When the visible samples fit they are copied as they are. Otherwise the summary is
+/// synced (or rebuilt from the column) and its buckets are merged into
+/// min(cols, MP_SUMMARY_BUCKETS, cap / 4) equal pixel columns; each column emits its
+/// distinct first, min-y, max-y and last samples in x order. An unsorted column (or a
+/// range the bucket grid cannot represent) falls back to mp_col_decimate. With lead, the
+/// last sample before x0 with finite x and y is written first.
+///
+/// @param s The summary. Valid: an initialised summary.
+/// @param col The column it summarises. Valid: non-zero; always the same column.
+/// @param x0 Visible start (inclusive). Units: data units. Valid: finite; otherwise 0.
+/// @param x1 Visible end (inclusive). Units: data units. Valid: finite and >= x0;
+///   otherwise 0.
+/// @param cols Pixel columns. Units: device px. Valid: >= 1; above MP_SUMMARY_BUCKETS
+///   it is clamped.
+/// @param lead Whether to write the last sample before x0 first.
+/// @param xs Output x, nondecreasing. Valid: non-zero with room for cap values.
+/// @param ys Output y. Valid: non-zero with room for cap values.
+/// @param cap Output capacity. Units: points. Valid: >= 1; with fewer than 4 * cols + 1
+///   slots the column count is lowered, and below 5 the output is truncated.
+/// @return Points written (0 .. cap), or a negated error code.
+/// @error MP_ERR_ARG s, col, xs or ys is 0, cols < 1 or cap < 1; nothing is written.
+/// @error MP_ERR_ALLOC the bucket ring could not be allocated; the summary stays invalid.
+/// @mem Writes only xs[0 .. cap) and ys[0 .. cap). The first rebuild allocates the ring
+///   (about 72 * (2 * nb + 2) bytes); nothing else is allocated, ever.
+/// @cost O(log n + nb + cols) per frame plus O(n / nb) for the two edge buckets; a
+///   rebuild (first frame, span change, keep or clear) is O(n).
+export fn mp_summary_emit(s: MpSummary*, col: MpCol*, x0: float64, x1: float64,
+                          cols: int32, lead: bool, xs: float64*, ys: float64*,
+                          cap: int64) -> int64 {
+  if (s == 0 || col == 0 || xs == 0 || ys == 0 || cols < 1 || cap < 1) {
+    return -(int64)MP_ERR_ARG;
+  }
+  if (is_finite(x0) == 0 || is_finite(x1) == 0 || x1 < x0) { return 0; }
+  if (!mp_col_sorted(col)) { return mp_col_decimate(col, x0, x1, cols, lead, xs, ys, cap); }
+  var i_lo: int64 = mp_col_lower_bound(col, x0);
+  var i_hi: int64 = sum_upper(col, x1, i_lo);
+  var n: int64 = 0;
+  if (lead) { n = sum_lead(col, i_lo, xs, ys); }
+  if (n >= cap || i_lo >= i_hi) { return n; }
+  if (i_hi - i_lo <= cap - n) { return n + sum_copy(col, i_lo, i_hi, xs + n, ys + n); }
+  var j: int64 = i_hi - 1;
+  while (is_finite(mp_col_x(col, j)) == 0) { j = j - 1; }
+  var xb: float64 = mp_col_x(col, j);
+  var rc: int32 = sum_prepare(s, col, i_lo, xb);
+  if (rc == MP_ERR_ALLOC) { return -(int64)MP_ERR_ALLOC; }
+  if (rc != MP_OK) {
+    s->fallbacks = s->fallbacks + 1;
+    return mp_col_decimate(col, x0, x1, cols, lead, xs, ys, cap);
+  }
+  var o: SumOut;
+  o.xs = xs + n;
+  o.ys = ys + n;
+  o.n = 0;
+  o.cap = cap - n;
+  o.x0 = x0;
+  o.ncol = (int64)cols;
+  if (o.ncol > (int64)MP_SUMMARY_BUCKETS) { o.ncol = (int64)MP_SUMMARY_BUCKETS; }
+  if (o.ncol > o.cap / 4) { o.ncol = o.cap / 4; }
+  if (o.ncol < 1) { o.ncol = 1; }
+  o.colw = (x1 - x0) / (float64)o.ncol;
+  o.ci = -1;
+  sum_feed_range(s, col, i_lo, i_hi, x1, xb, &o);
+  sum_out_flush(&o);
+  return n + o.n;
+}

@@ -1,0 +1,356 @@
+//! The frame pipeline: views, then domains (fixed, zero, nice and log rules, or the eased
+//! y domain of a live chart), ticks, the measured layout, final scales, and the scene in
+//! painter's order: background, plot, grid, baseline, tick labels, axis titles, marks,
+//! legend, title. A chart without visible
+//! data draws its title and a muted, centred "No data". The scene is cached per chart and
+//! rebuilt only when seq or the target key changed. Uses every chart/* internal module.
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/format";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
+import "mistplot/core/ticks";
+import "mistplot/core/target";
+import "mistplot/data/summary";
+import "mistplot/scene/scene";
+import "mistplot/chart/chart";
+import "mistplot/chart/view";
+import "mistplot/chart/layout";
+import "mistplot/chart/axis";
+import "mistplot/chart/marks";
+import "mistplot/chart/legend";
+
+const FRAME_TICKS: int32 = 5;
+// Eased y domain of a live chart (see mp_chart_set_y_ease). Units: x units (seconds).
+const FRAME_TAU_GROW: float64 = 0.04;
+const FRAME_TAU_SHRINK: float64 = 0.8;
+const FRAME_EASE_MAX_DT: float64 = 1.0;
+const FRAME_HEADROOM: float64 = 0.15;
+
+fn frame_time(fmt: int32) -> bool {
+  return fmt == MP_FMT_TIME || fmt == MP_FMT_TIME_TENTHS;
+}
+
+// A time axis whose clock step is below one second shows tenths.
+fn frame_fmt(fmt: int32, logv: bool, d0: float64, d1: float64) -> int32 {
+  if (fmt != MP_FMT_TIME || logv) { return fmt; }
+  var st: float64 = mp_tick_step_time(d0, d1, FRAME_TICKS);
+  if (st > 0.0 && st < 1.0) { return MP_FMT_TIME_TENTHS; }
+  return fmt;
+}
+
+fn frame_ticks(logv: bool, time: bool, d0: float64, d1: float64, out: float64*) -> int32 {
+  if (logv) { return mp_ticks_log(d0, d1, out, MP_TICK_MAX); }
+  if (time) {
+    return mp_ticks_step(d0, d1, mp_tick_step_time(d0, d1, FRAME_TICKS), out, MP_TICK_MAX);
+  }
+  return mp_ticks_linear(d0, d1, FRAME_TICKS, out, MP_TICK_MAX);
+}
+
+fn frame_log_ok(on: bool, d0: float64, d1: float64) -> bool {
+  return on && d0 > 0.0 && d1 > d0 && is_finite(d0) != 0 && is_finite(d1) != 0;
+}
+
+fn frame_ease_step(cur: float64, target: float64, dt: float64, grow: bool) -> float64 {
+  var tau: float64 = FRAME_TAU_SHRINK;
+  if (grow) { tau = FRAME_TAU_GROW; }
+  return cur + (target - cur) * (1.0 - exp(0.0 - dt / tau));
+}
+
+// Moves the eased domain towards the data plus headroom; returns false (and forgets the
+// eased state) when this chart does not ease.
+fn frame_y_eased(l: MpLayout*, r: MpViewRange*) -> bool {
+  var c: MpChart* = l->c;
+  if (!c->y_ease || !c->has_now || c->kind == MP_BAR || c->y_fixed || c->y_log) {
+    c->ease_ok = false;
+    return false;
+  }
+  var lo: float64 = r->y0;
+  var hi: float64 = r->y1;
+  if (c->y_zero && lo > 0.0) { lo = 0.0; }
+  if (c->y_zero && hi < 0.0) { hi = 0.0; }
+  var h: float64 = hi - lo;
+  if (!(h > 0.0)) { h = fabs(hi); }
+  if (!(h > 0.0)) { h = 1.0; }
+  var tlo: float64 = lo - FRAME_HEADROOM * h;
+  var thi: float64 = hi + FRAME_HEADROOM * h;
+  if (c->y_zero && lo == 0.0) { tlo = 0.0; }
+  if (c->y_zero && hi == 0.0 && lo < 0.0) { thi = 0.0; }
+  var dt: float64 = c->now - c->ease_t;
+  if (!c->ease_ok || dt < 0.0 || dt > FRAME_EASE_MAX_DT) {
+    c->ease_lo = tlo;
+    c->ease_hi = thi;
+  } else if (dt > 0.0) {
+    c->ease_hi = frame_ease_step(c->ease_hi, thi, dt, thi > c->ease_hi);
+    c->ease_lo = frame_ease_step(c->ease_lo, tlo, dt, tlo < c->ease_lo);
+  }
+  // Data never leaves the plot: an end inside the data moves out to it at once.
+  if (c->ease_hi < hi) { c->ease_hi = hi; }
+  if (c->ease_lo > lo) { c->ease_lo = lo; }
+  if (is_finite(c->ease_lo) == 0 || is_finite(c->ease_hi) == 0 ||
+      !(c->ease_hi > c->ease_lo)) {
+    c->ease_lo = tlo;
+    c->ease_hi = thi;
+  }
+  c->ease_ok = true;
+  c->ease_t = c->now;
+  l->y0 = c->ease_lo;
+  l->y1 = c->ease_hi;
+  l->ylog = false;
+  return true;
+}
+
+fn frame_y_domain(l: MpLayout*, r: MpViewRange*) {
+  var c: MpChart* = l->c;
+  if (frame_y_eased(l, r)) {
+    l->yfmt = frame_fmt(c->y_fmt, false, l->y0, l->y1);
+    l->ny = frame_ticks(false, frame_time(c->y_fmt), l->y0, l->y1, &l->yv[0]);
+    return;
+  }
+  var bar: bool = c->kind == MP_BAR;
+  l->y0 = r->y0;
+  l->y1 = r->y1;
+  if (c->y_fixed) {
+    l->y0 = c->y_lo;
+    l->y1 = c->y_hi;
+  }
+  l->ylog = !bar && frame_log_ok(c->y_log, l->y0, l->y1);
+  var zero: bool = (bar || c->y_zero) && !l->ylog && !c->y_fixed;
+  if (zero && l->y0 > 0.0) { l->y0 = 0.0; }
+  if (zero && l->y1 < 0.0) { l->y1 = 0.0; }
+  if (l->y1 == l->y0) {
+    if (zero && l->y0 == 0.0) {
+      l->y1 = 1.0;
+    } else {
+      l->y0 = l->y0 - 1.0;
+      l->y1 = l->y1 + 1.0;
+    }
+  }
+  if (!c->y_fixed && !l->ylog) {
+    mp_ticks_nice(&l->y0, &l->y1, FRAME_TICKS, frame_time(c->y_fmt));
+  }
+  l->yfmt = frame_fmt(c->y_fmt, l->ylog, l->y0, l->y1);
+  l->ny = frame_ticks(l->ylog, frame_time(c->y_fmt), l->y0, l->y1, &l->yv[0]);
+}
+
+fn frame_x_domain(l: MpLayout*, r: MpViewRange*) {
+  var c: MpChart* = l->c;
+  if (c->kind == MP_BAR) {
+    l->band = true;
+    l->bands = r->bands;
+    l->x0 = 0.0;
+    l->x1 = (float64)r->bands;
+    l->xfmt = MP_FMT_INT;
+    l->nx = r->bands;
+    if (l->nx > MP_TICK_MAX) { l->nx = MP_TICK_MAX; }
+    var j: int32 = 0;
+    while (j < l->nx) {
+      l->xv[(int64)j] = (float64)j;
+      j = j + 1;
+    }
+    return;
+  }
+  l->band = false;
+  l->bands = 0;
+  l->x0 = r->x0;
+  l->x1 = r->x1;
+  if (l->x1 == l->x0) {
+    l->x0 = l->x0 - 1.0;
+    l->x1 = l->x1 + 1.0;
+  }
+  l->xlog = frame_log_ok(c->x_log, l->x0, l->x1);
+  if (c->kind == MP_SCATTER && !c->x_fixed && !r->windowed && !l->xlog) {
+    mp_ticks_nice(&l->x0, &l->x1, FRAME_TICKS, frame_time(c->x_fmt));
+  }
+  l->xfmt = frame_fmt(c->x_fmt, l->xlog, l->x0, l->x1);
+  l->nx = frame_ticks(l->xlog, frame_time(c->x_fmt), l->x0, l->x1, &l->xv[0]);
+}
+
+fn frame_scales(l: MpLayout*) {
+  var p: MpRect = l->plot;
+  if (l->band) {
+    l->xs = mp_scale_band(p.x, p.x + p.w, l->bands, l->c->bar_gap);
+  } else if (l->xlog) {
+    l->xs = mp_scale_log(l->x0, l->x1, p.x, p.x + p.w);
+  } else {
+    l->xs = mp_scale_linear(l->x0, l->x1, p.x, p.x + p.w);
+  }
+  if (l->ylog) {
+    l->ys = mp_scale_log(l->y0, l->y1, p.y + p.h, p.y);
+  } else {
+    l->ys = mp_scale_linear(l->y0, l->y1, p.y + p.h, p.y);
+  }
+}
+
+fn frame_titles(l: MpLayout*) -> int32 {
+  var c: MpChart* = l->c;
+  var rc: int32 = mp_axis_text(l, l->pad_x, l->title_y, c->title, MP_SIZE_TITLE,
+                               c->theme.title, MP_ALIGN_START, MP_NF_BOLD, MP_CLS_TITLE);
+  if (rc != MP_OK) { return rc; }
+  return mp_axis_text(l, l->pad_x, l->sub_y, c->subtitle, MP_SIZE_TEXT, c->theme.muted,
+                      MP_ALIGN_START, 0, MP_CLS_TITLE);
+}
+
+fn frame_no_data(l: MpLayout*) -> int32 {
+  var p: MpRect = l->plot;
+  var lh: float64 = mp_target_text_h(l->t, MP_SIZE_TEXT);
+  return mp_axis_text(l, p.x + p.w * 0.5, p.y + (p.h - lh) * 0.5, "No data", MP_SIZE_TEXT,
+                      l->c->theme.muted, MP_ALIGN_CENTER, 0, MP_CLS_LABEL);
+}
+
+fn frame_emit(l: MpLayout*) -> int32 {
+  var c: MpChart* = l->c;
+  var none: MpColor = mp_rgba(0, 0, 0, 0);
+  var rc: int32 = mp_scene_rect(l->s, mp_rect(0.0, 0.0, l->w, l->h), c->theme.bg, none, 0.0,
+                                MP_CLS_BG);
+  if (rc != MP_OK) { return rc; }
+  if (l->any) {
+    rc = mp_scene_rect(l->s, l->plot, c->theme.bg, none, 0.0, MP_CLS_PLOT);
+    if (rc == MP_OK) { rc = mp_axis_draw(l); }
+    if (rc == MP_OK) { rc = mp_marks_draw(l); }
+  } else {
+    rc = frame_no_data(l);
+  }
+  if (rc == MP_OK) { rc = mp_legend_draw(l); }
+  if (rc == MP_OK) { rc = frame_titles(l); }
+  return rc;
+}
+
+fn frame_info(l: MpLayout*) {
+  var c: MpChart* = l->c;
+  var o: MpChartInfo;
+  o.valid = l->any;
+  o.kind = c->kind;
+  o.plot = l->plot;
+  o.x = l->xs;
+  o.y = l->ys;
+  o.x0 = l->x0;
+  o.x1 = l->x1;
+  o.y0 = l->y0;
+  o.y1 = l->y1;
+  o.n_bands = l->bands;
+  o.x_fmt = l->xfmt;
+  o.y_fmt = l->yfmt;
+  o.width = l->w;
+  o.height = l->h;
+  o.scale = l->scale;
+  c->info = o;
+}
+
+fn frame_target_ok(t: MpTarget*) -> bool {
+  if (t == 0) { return false; }
+  if (!(t->width > 0.0) || !(t->height > 0.0) || t->width >= 1e9 || t->height >= 1e9) {
+    return false;
+  }
+  return t->scale > 0.0 && t->scale <= 64.0;
+}
+
+fn frame_cols(t: MpTarget*) -> int32 {
+  var v: float64 = ceil(t->width * t->scale);
+  if (v >= (float64)MP_SUMMARY_BUCKETS) { return MP_SUMMARY_BUCKETS; }
+  if (!(v >= 1.0)) { return 1; }
+  return (int32)v;
+}
+
+fn frame_build(c: MpChart*, t: MpTarget*) -> int32 {
+  var r: MpViewRange;
+  var rc: int32 = mp_view_build(c, frame_cols(t), &r);
+  if (rc != MP_OK) { return rc; }
+  var l: MpLayout;
+  l.c = c;
+  l.t = t;
+  l.s = c->scene;
+  mp_layout_init(&l);
+  l.any = r.any;
+  l.band = false;
+  l.bands = 0;
+  l.xlog = false;
+  l.ylog = false;
+  l.xfmt = c->x_fmt;
+  l.yfmt = c->y_fmt;
+  l.x0 = 0.0;
+  l.x1 = 1.0;
+  l.y0 = 0.0;
+  l.y1 = 1.0;
+  if (l.any) {
+    frame_x_domain(&l, &r);
+    frame_y_domain(&l, &r);
+  }
+  l.legend = mp_legend_size(c, t, l.w - 2.0 * l.pad_x);
+  rc = mp_layout_compute(&l);
+  if (rc != MP_OK) { return rc; }
+  frame_scales(&l);
+  mp_scene_clear(c->scene);
+  rc = frame_emit(&l);
+  frame_info(&l);
+  return rc;
+}
+
+/// Builds (or reuses) the chart's scene for a target, with the chart entered.
+///
+/// @param c The chart. Valid: non-zero, entered or locked.
+/// @param t The target. Valid: non-zero, width and height finite in (0, 1e9), scale in
+///   (0, 64].
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG t is 0 or out of range; the cache is unchanged.
+/// @error MP_ERR_ALLOC a view, the scratch or the scene could not grow; the cache is
+///   invalid until the next successful build.
+/// @mem The scene stays owned by the chart (c->scene).
+/// @thread Call with the chart entered or locked.
+/// @cost O(cols + nodes) per large sorted series when rebuilt; O(1) when cached.
+/// @internal
+export fn mp_frame_scene(c: MpChart*, t: MpTarget*) -> int32 {
+  if (!frame_target_ok(t)) { return mp_chart_fail(c, MP_ERR_ARG); }
+  var key: uint64 = mp_target_key(t);
+  if (c->scene_ok && c->scene_seq == c->seq && c->scene_key == key) { return MP_OK; }
+  c->scene_ok = false;
+  c->stats.scene_builds = c->stats.scene_builds + 1;
+  var rc: int32 = frame_build(c, t);
+  if (rc != MP_OK) {
+    c->info.valid = false;
+    return mp_chart_fail(c, rc);
+  }
+  c->scene_ok = true;
+  c->scene_seq = c->seq;
+  c->scene_key = key;
+  return MP_OK;
+}
+
+/// The chart's scene for a target, rebuilt only when the chart or the target changed.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param t The target. Valid: non-zero, width and height finite in (0, 1e9), scale in
+///   (0, 64].
+/// @return The scene, or 0 when c is 0 or the build failed (see mp_chart_error).
+/// @error MP_ERR_ARG t is 0 or out of range (0 returned, error recorded).
+/// @error MP_ERR_ALLOC the frame could not be built (0 returned, error recorded).
+/// @mem Borrowed: valid while you hold mp_chart_lock and until the next render call.
+/// @thread Call between mp_chart_lock and mp_chart_unlock when other threads use c.
+/// @cost As mp_frame_scene.
+export fn mp_chart_scene(c: MpChart*, t: MpTarget*) -> MpScene* {
+  if (c == 0) { return 0; }
+  mp_chart_enter(c);
+  var rc: int32 = mp_frame_scene(c, t);
+  var s: MpScene* = 0;
+  if (rc == MP_OK) { s = c->scene; }
+  mp_chart_leave(c);
+  return s;
+}
+
+/// Copies the geometry of the last built frame.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param out Receives it. Valid: non-zero.
+/// @return MP_OK, or MP_ERR_ARG.
+/// @error MP_ERR_ARG c or out is 0; out is unchanged.
+/// @mem Writes *out only; out->valid is false before the first frame with data.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_info(c: MpChart*, out: MpChartInfo*) -> int32 {
+  if (c == 0 || out == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  *out = c->info;
+  mp_chart_leave(c);
+  return MP_OK;
+}

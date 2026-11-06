@@ -1,0 +1,514 @@
+// data/decimate_test: mp_col_decimate on sorted and unsorted columns. Whatever the input,
+// the output must stay within cap, be real samples from [x0, x1] in x order, and keep
+// the window's lowest and highest y. Degenerate ranges, bucket counts and capacities
+// must not crash or write outside the output.
+
+import "std/math";
+import "std/io";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/data/col";
+import "mistplot/data/decimate";
+
+const GUARD: int64 = 8;
+const SENTINEL: float64 = -7777.5;
+
+var g_rng: uint64 = 2685821657736338717;
+var g_big: bool = true;
+
+fn rnd() -> uint64 {
+  var x: uint64 = g_rng;
+  x = x ^ (x << 13);
+  x = x ^ (x >> 7);
+  x = x ^ (x << 17);
+  g_rng = x;
+  return x;
+}
+
+fn rnd_int(n: int64) -> int64 {
+  return (int64)(rnd() % (uint64)n);
+}
+
+fn rnd_f() -> float64 {
+  return (float64)(rnd() >> 11) / 9007199254740992.0;
+}
+
+fn fin(v: float64) -> bool {
+  return is_finite(v) != 0;
+}
+
+// An output array of cap values followed by GUARD sentinels.
+fn out_new(cap: int64) -> float64* {
+  var p: float64* = (float64*)mp_alloc((cap + GUARD) * 8);
+  var i: int64 = 0;
+  while (i < cap + GUARD) {
+    p[i] = SENTINEL;
+    i = i + 1;
+  }
+  return p;
+}
+
+fn guard_ok(p: float64*, cap: int64) -> bool {
+  var i: int64 = cap;
+  while (i < cap + GUARD) {
+    if (p[i] != SENTINEL) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// Whether (x, y) is a sample of the column.
+fn is_sample(c: MpCol*, x: float64, y: float64) -> bool {
+  var i: int64 = 0;
+  while (i < mp_col_len(c)) {
+    if (mp_col_x(c, i) == x && mp_col_y(c, i) == y) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// Lowest and highest y among usable samples in [x0, x1]; false when there are none.
+fn window_extent(c: MpCol*, x0: float64, x1: float64, lo: float64*, hi: float64*) -> bool {
+  var any: bool = false;
+  var i: int64 = 0;
+  while (i < mp_col_len(c)) {
+    var x: float64 = mp_col_x(c, i);
+    var y: float64 = mp_col_y(c, i);
+    if (fin(x) && fin(y) && x >= x0 && x <= x1) {
+      if (!any || y < *lo) { *lo = y; }
+      if (!any || y > *hi) { *hi = y; }
+      any = true;
+    }
+    i = i + 1;
+  }
+  return any;
+}
+
+fn usable_count(c: MpCol*, x0: float64, x1: float64) -> int64 {
+  var n: int64 = 0;
+  var i: int64 = 0;
+  while (i < mp_col_len(c)) {
+    var x: float64 = mp_col_x(c, i);
+    if (fin(x) && fin(mp_col_y(c, i)) && x >= x0 && x <= x1) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+fn has_y(ys: float64*, n: int64, y: float64) -> bool {
+  var i: int64 = 0;
+  while (i < n) {
+    if (ys[i] == y) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// Every property that must hold for a call without lead; name tags the failures.
+fn check_out(name: string, c: MpCol*, x0: float64, x1: float64, xs: float64*,
+             ys: float64*, n: int64, cap: int64) {
+  var before: int32 = mp_fails;
+  mp_expect("out: within cap", n >= 0 && n <= cap);
+  mp_expect("out: nothing written past cap", guard_ok(xs, cap) && guard_ok(ys, cap));
+  // a copy of an unsorted column keeps column order; reduced output is always in x order
+  var lo: float64 = 0.0;
+  var hi: float64 = 0.0;
+  var in_order: bool = mp_col_sorted(c) || usable_count(c, x0, x1) > cap;
+  var ordered: bool = true;
+  var inside: bool = true;
+  var real: bool = true;
+  var i: int64 = 0;
+  while (i < n) {
+    if (in_order && i > 0 && xs[i] < xs[i - 1]) { ordered = false; }
+    if (!(xs[i] >= x0 && xs[i] <= x1)) { inside = false; }
+    if (!is_sample(c, xs[i], ys[i])) { real = false; }
+    i = i + 1;
+  }
+  mp_expect("out: x in order", ordered);
+  mp_expect("out: only samples from [x0, x1]", inside);
+  mp_expect("out: only real samples", real);
+  if (window_extent(c, x0, x1, &lo, &hi)) {
+    mp_expect("out: minimum survives", has_y(ys, n, lo));
+    mp_expect("out: maximum survives", has_y(ys, n, hi));
+  } else {
+    mp_expect_i64("out: empty window", n, 0);
+  }
+  if (mp_fails != before) { println("  ^ in {name}"); }
+}
+
+fn check_args() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_col_push(&c, 1.0, 1.0);
+  var xs: float64* = out_new(16);
+  var ys: float64* = out_new(16);
+  var e: int64 = -(int64)MP_ERR_ARG;
+  mp_expect_i64("args: col 0", mp_col_decimate(0, 0.0, 1.0, 4, false, xs, ys, 16), e);
+  mp_expect_i64("args: xs 0", mp_col_decimate(&c, 0.0, 1.0, 4, false, 0, ys, 16), e);
+  mp_expect_i64("args: ys 0", mp_col_decimate(&c, 0.0, 1.0, 4, false, xs, 0, 16), e);
+  mp_expect_i64("args: zero buckets", mp_col_decimate(&c, 0.0, 1.0, 0, false, xs, ys, 16), e);
+  mp_expect_i64("args: negative buckets",
+                mp_col_decimate(&c, 0.0, 1.0, -5, false, xs, ys, 16), e);
+  mp_expect_i64("args: zero cap", mp_col_decimate(&c, 0.0, 1.0, 4, false, xs, ys, 0), e);
+  mp_expect_i64("args: negative cap", mp_col_decimate(&c, 0.0, 1.0, 4, false, xs, ys, -3), e);
+  mp_expect("args: nothing written", guard_ok(xs, 0) && xs[0] == SENTINEL && ys[0] == SENTINEL);
+  mp_expect_i64("args: valid call", mp_col_decimate(&c, 0.0, 2.0, 4, false, xs, ys, 16), 1);
+  mp_free((rawptr)xs);
+  mp_free((rawptr)ys);
+  mp_col_free(&c);
+}
+
+// A dense sine plus one low and one high spike, pushed in the given x order.
+fn fill_spiky(c: MpCol*, n: int64, shuffled: bool, spike_lo: int64, spike_hi: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    var k: int64 = i;
+    if (shuffled) { k = (i * 7919) % n; }
+    var y: float64 = sin((float64)k * 0.05);
+    if (k == spike_lo) { y = -5.0; }
+    if (k == spike_hi) { y = 6.0; }
+    mp_col_push(c, (float64)k, y);
+    i = i + 1;
+  }
+}
+
+fn check_peaks() {
+  var n: int64 = 5000;
+  if (!g_big) { n = 480; }
+  var pass: int32 = 0;
+  while (pass < 2) {
+    var shuffled: bool = pass == 1;
+    var before: int32 = mp_fails;
+    var c: MpCol;
+    mp_col_init(&c);
+    var lo_at: int64 = n / 4;
+    var hi_at: int64 = n * 2 / 3;
+    fill_spiky(&c, n, shuffled, hi_at, lo_at);
+    mp_expect("peaks: column order", mp_col_sorted(&c) == !shuffled);
+    var cap: int64 = n / 12;
+    var xs: float64* = out_new(cap);
+    var ys: float64* = out_new(cap);
+    var a0: int64 = mp_alloc_count();
+    var m: int64 = mp_col_decimate(&c, 0.0, (float64)(n - 1), (int32)(cap / 4), false, xs, ys, cap);
+    mp_expect_i64("peaks: no allocation", mp_alloc_count() - a0, 0);
+    mp_expect("peaks: reduced", m > cap / 4 && m <= cap);
+    check_out("peaks", &c, 0.0, (float64)(n - 1), xs, ys, m, cap);
+    mp_expect("peaks: low spike kept", has_y(ys, m, -5.0));
+    mp_expect("peaks: high spike kept", has_y(ys, m, 6.0));
+
+    // the spikes only count while inside the window
+    var w0: float64 = (float64)n * 0.4;
+    var w1: float64 = (float64)n * 0.6;
+    m = mp_col_decimate(&c, w0, w1, (int32)(cap / 4), false, xs, ys, cap);
+    check_out("peaks window", &c, w0, w1, xs, ys, m, cap);
+    mp_expect("peaks window: outside spikes dropped",
+              !has_y(ys, m, -5.0) && !has_y(ys, m, 6.0));
+    m = mp_col_decimate(&c, (float64)n * 0.2, (float64)n * 0.7, (int32)(cap / 4), false, xs, ys,
+                        cap);
+    mp_expect("peaks window: spikes inside kept",
+              has_y(ys, m, -5.0) && has_y(ys, m, 6.0));
+
+    // a smaller cap lowers the bucket count but not the peaks
+    var small: int64 = 40;
+    m = mp_col_decimate(&c, 0.0, (float64)(n - 1), 1000, false, xs, ys, small);
+    mp_expect("peaks small cap: within cap", m > 0 && m <= small);
+    mp_expect("peaks small cap: spikes kept", has_y(ys, m, -5.0) && has_y(ys, m, 6.0));
+    if (mp_fails != before && shuffled) { println("  ^ in the unsorted column"); }
+    mp_free((rawptr)xs);
+    mp_free((rawptr)ys);
+    mp_col_free(&c);
+    pass = pass + 1;
+  }
+}
+
+fn check_copy() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_col_push(&c, 5.0, 50.0);
+  mp_col_push(&c, 1.0, 10.0);
+  mp_col_push(&c, NAN(), 7.0);
+  mp_col_push(&c, 3.0, NAN());
+  mp_col_push(&c, INF(), 1.0);
+  mp_col_push(&c, 2.0, -INF());
+  mp_col_push(&c, 4.0, 40.0);
+  mp_col_push(&c, 9.0, 90.0);
+  var xs: float64* = out_new(16);
+  var ys: float64* = out_new(16);
+  var m: int64 = mp_col_decimate(&c, 0.0, 8.0, 4, false, xs, ys, 16);
+  mp_expect_i64("copy: usable samples only", m, 3);
+  mp_expect("copy: column order, nothing resorted",
+            xs[0] == 5.0 && xs[1] == 1.0 && xs[2] == 4.0);
+  mp_expect("copy: y follows x", ys[0] == 50.0 && ys[1] == 10.0 && ys[2] == 40.0);
+  mp_expect("copy: guard", guard_ok(xs, 16));
+  m = mp_col_decimate(&c, 1.0, 5.0, 4, false, xs, ys, 16);
+  mp_expect_i64("copy: bounds are inclusive", m, 3);
+  m = mp_col_decimate(&c, 6.0, 8.0, 4, false, xs, ys, 16);
+  mp_expect_i64("copy: empty window", m, 0);
+  mp_col_free(&c);
+
+  // exactly cap samples still copy; one more goes through the buckets
+  mp_col_init(&c);
+  var i: int64 = 0;
+  while (i < 12) {
+    mp_col_push(&c, (float64)i, (float64)(i % 3));
+    i = i + 1;
+  }
+  m = mp_col_decimate(&c, 0.0, 11.0, 2, false, xs, ys, 12);
+  mp_expect_i64("copy: exactly cap", m, 12);
+  mp_col_push(&c, 12.0, 0.0);
+  m = mp_col_decimate(&c, 0.0, 12.0, 2, false, xs, ys, 12);
+  mp_expect("copy: one over cap is reduced", m > 0 && m <= 12);
+  mp_col_free(&c);
+  mp_free((rawptr)xs);
+  mp_free((rawptr)ys);
+}
+
+fn check_lead() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_col_push(&c, 1.0, 11.0);
+  mp_col_push(&c, 2.0, 12.0);
+  mp_col_push(&c, NAN(), 13.0);
+  mp_col_push(&c, 3.0, NAN());
+  mp_col_push(&c, 6.0, 16.0);
+  mp_col_push(&c, 7.0, 17.0);
+  var xs: float64* = out_new(16);
+  var ys: float64* = out_new(16);
+  var m: int64 = mp_col_decimate(&c, 5.0, 8.0, 4, true, xs, ys, 16);
+  mp_expect_i64("lead: one extra point", m, 3);
+  mp_expect("lead: starts at the last usable sample before x0", xs[0] == 2.0 && ys[0] == 12.0);
+  m = mp_col_decimate(&c, 5.0, 8.0, 4, false, xs, ys, 16);
+  mp_expect_i64("lead: off", m, 2);
+  m = mp_col_decimate(&c, 0.5, 8.0, 4, true, xs, ys, 16);
+  mp_expect_i64("lead: nothing before x0", m, 4);
+  mp_col_free(&c);
+
+  // through the buckets: bounded, in order, and the lead leads
+  mp_col_init(&c);
+  var i: int64 = 0;
+  while (i < 3000) {
+    mp_col_push(&c, (float64)i, sin((float64)i * 0.1));
+    i = i + 1;
+  }
+  var cap: int64 = 200;
+  var bx: float64* = out_new(cap);
+  var by: float64* = out_new(cap);
+  m = mp_col_decimate(&c, 1000.5, 2000.0, 50, true, bx, by, cap);
+  mp_expect("lead buckets: within cap", m > 0 && m <= cap);
+  mp_expect("lead buckets: guard", guard_ok(bx, cap) && guard_ok(by, cap));
+  mp_expect("lead buckets: starts at the sample before x0", bx[0] == 1000.0);
+  var ordered: bool = true;
+  i = 1;
+  while (i < m) {
+    if (bx[i] < bx[i - 1]) { ordered = false; }
+    i = i + 1;
+  }
+  mp_expect("lead buckets: x in order", ordered);
+  mp_expect("lead buckets: nothing after x1", bx[m - 1] <= 2000.0);
+  mp_free((rawptr)bx);
+  mp_free((rawptr)by);
+  mp_free((rawptr)xs);
+  mp_free((rawptr)ys);
+  mp_col_free(&c);
+}
+
+fn check_degenerate() {
+  var c: MpCol;
+  mp_col_init(&c);
+  var i: int64 = 0;
+  while (i < 200) {
+    mp_col_push(&c, (float64)i, (float64)((i * 37) % 101));
+    i = i + 1;
+  }
+  var cap: int64 = 32;
+  var xs: float64* = out_new(cap);
+  var ys: float64* = out_new(cap);
+  mp_expect_i64("range: x0 > x1", mp_col_decimate(&c, 50.0, 10.0, 8, false, xs, ys, cap), 0);
+  mp_expect_i64("range: NaN x0", mp_col_decimate(&c, NAN(), 10.0, 8, false, xs, ys, cap), 0);
+  mp_expect_i64("range: NaN x1", mp_col_decimate(&c, 0.0, NAN(), 8, false, xs, ys, cap), 0);
+  mp_expect_i64("range: infinite x1", mp_col_decimate(&c, 0.0, INF(), 8, false, xs, ys, cap), 0);
+  mp_expect_i64("range: infinite x0", mp_col_decimate(&c, -INF(), 5.0, 8, false, xs, ys, cap), 0);
+  mp_expect_i64("range: nothing there", mp_col_decimate(&c, 500.0, 600.0, 8, false, xs, ys, cap),
+                0);
+  mp_expect("range: nothing written", xs[0] == SENTINEL && ys[0] == SENTINEL);
+
+  // x0 == x1: one x value; the single bucket still keeps its extremes
+  var m: int64 = mp_col_decimate(&c, 7.0, 7.0, 8, false, xs, ys, cap);
+  mp_expect_i64("range equal: the one sample", m, 1);
+  mp_expect("range equal: it is that sample", xs[0] == 7.0 && ys[0] == (float64)((7 * 37) % 101));
+  mp_col_free(&c);
+
+  mp_col_init(&c);
+  i = 0;
+  while (i < 300) {
+    mp_col_push(&c, 5.0, (float64)((i * 53) % 97));
+    i = i + 1;
+  }
+  m = mp_col_decimate(&c, 5.0, 5.0, 8, false, xs, ys, cap);
+  check_out("range equal many", &c, 5.0, 5.0, xs, ys, m, cap);
+  mp_expect("range equal many: reduced to a bucket", m >= 2 && m <= 4);
+  m = mp_col_decimate(&c, 5.0, 6.0, 8, false, xs, ys, cap);
+  check_out("range one x", &c, 5.0, 6.0, xs, ys, m, cap);
+  mp_col_free(&c);
+
+  // bucket counts: one, and far more than the output can hold
+  mp_col_init(&c);
+  var nd: int64 = 2000;
+  if (!g_big) { nd = 200; }
+  var xe: float64 = (float64)(nd - 1);
+  fill_spiky(&c, nd, true, nd * 7 / 20, nd * 13 / 20);
+  m = mp_col_decimate(&c, 0.0, xe, 1, false, xs, ys, cap);
+  check_out("buckets: one", &c, 0.0, xe, xs, ys, m, cap);
+  mp_expect("buckets: one yields at most four", m >= 2 && m <= 4);
+  m = mp_col_decimate(&c, 0.0, xe, 100000, false, xs, ys, cap);
+  check_out("buckets: huge", &c, 0.0, xe, xs, ys, m, cap);
+  mp_expect("buckets: huge fills the output", m >= cap - 4);
+  m = mp_col_decimate(&c, 0.0, xe, 2147483647, false, xs, ys, cap);
+  check_out("buckets: int32 max", &c, 0.0, xe, xs, ys, m, cap);
+
+  // capacity below one bucket: truncated, never overrun
+  var cp: int64 = 1;
+  while (cp <= 5) {
+    var tx: float64* = out_new(cp);
+    var ty: float64* = out_new(cp);
+    m = mp_col_decimate(&c, 0.0, xe, 16, false, tx, ty, cp);
+    mp_expect("cap: within cap", m >= 1 && m <= cp);
+    mp_expect("cap: guard", guard_ok(tx, cp) && guard_ok(ty, cp));
+    var ok: bool = true;
+    var q: int64 = 0;
+    while (q < m) {
+      if (!is_sample(&c, tx[q], ty[q])) { ok = false; }
+      if (q > 0 && tx[q] < tx[q - 1]) { ok = false; }
+      q = q + 1;
+    }
+    mp_expect("cap: real samples in order", ok);
+    mp_free((rawptr)tx);
+    mp_free((rawptr)ty);
+    cp = cp + 1;
+  }
+  mp_col_free(&c);
+
+  // empty column, and a column of nothing usable
+  mp_col_init(&c);
+  mp_expect_i64("empty column", mp_col_decimate(&c, 0.0, 10.0, 4, true, xs, ys, cap), 0);
+  mp_col_push(&c, NAN(), NAN());
+  mp_col_push(&c, 1.0, NAN());
+  mp_expect_i64("only unusable samples", mp_col_decimate(&c, 0.0, 10.0, 4, true, xs, ys, cap),
+                0);
+  mp_col_free(&c);
+  mp_free((rawptr)xs);
+  mp_free((rawptr)ys);
+}
+
+// A ring that has wrapped, with duplicates and unusable samples mixed in.
+fn check_ring() {
+  var c: MpCol;
+  mp_col_init(&c);
+  var keep: int64 = 700;
+  var pushed: int64 = 2000;
+  if (!g_big) {
+    keep = 200;
+    pushed = 500;
+  }
+  mp_col_set_keep(&c, keep);
+  var i: int64 = 0;
+  while (i < pushed) {
+    var x: float64 = (float64)(i / 2);
+    var y: float64 = sin((float64)i * 0.3) * 4.0;
+    if (i % 97 == 0) { y = NAN(); }
+    if (i % 113 == 0) { x = NAN(); }
+    if (i == pushed - 150) { y = 20.0; }
+    if (i == pushed - 60) { y = -20.0; }
+    mp_col_push(&c, x, y);
+    i = i + 1;
+  }
+  var cap: int64 = 120;
+  var xs: float64* = out_new(cap);
+  var ys: float64* = out_new(cap);
+  var xe: float64 = (float64)(pushed / 2);
+  var m: int64 = mp_col_decimate(&c, 0.0, xe, 30, false, xs, ys, cap);
+  check_out("ring", &c, 0.0, xe, xs, ys, m, cap);
+  mp_expect("ring: spikes", has_y(ys, m, 20.0) && has_y(ys, m, -20.0));
+  mp_expect("ring: reduced", m > 30 && m <= cap);
+  mp_free((rawptr)xs);
+  mp_free((rawptr)ys);
+  mp_col_free(&c);
+}
+
+fn check_fuzz() {
+  var rounds: int32 = 0;
+  var total: int32 = 300;
+  var max_n: int64 = 600;
+  var max_cap: int64 = 150;
+  if (!g_big) {
+    total = 10;
+    max_n = 120;
+    max_cap = 40;
+  }
+  while (rounds < total) {
+    var c: MpCol;
+    mp_col_init(&c);
+    var n: int64 = 1 + rnd_int(max_n);
+    var xmax: int64 = 1 + rnd_int(400);
+    var unsorted: bool = rnd_int(2) == 0;
+    var x: float64 = 0.0;
+    var i: int64 = 0;
+    while (i < n) {
+      var px: float64 = (float64)rnd_int(xmax);
+      if (!unsorted) {
+        x = x + (float64)rnd_int(3) * 0.5;
+        px = x;
+      }
+      var py: float64 = rnd_f() * 100.0 - 50.0;
+      var u: int64 = rnd_int(40);
+      if (u == 0) { py = NAN(); }
+      if (u == 1) { px = NAN(); }
+      if (u == 2) { py = INF(); }
+      mp_col_push(&c, px, py);
+      i = i + 1;
+    }
+    var hi_x: float64 = x;
+    if (unsorted) { hi_x = (float64)xmax; }
+    var x0: float64 = rnd_f() * hi_x * 0.6;
+    var x1: float64 = x0 + rnd_f() * hi_x;
+    var cap: int64 = 1 + rnd_int(max_cap);
+    var cols: int32 = (int32)(1 + rnd_int(100));
+    var xs: float64* = out_new(cap);
+    var ys: float64* = out_new(cap);
+    var m: int64 = mp_col_decimate(&c, x0, x1, cols, false, xs, ys, cap);
+    if (cap >= 4) {
+      check_out("fuzz", &c, x0, x1, xs, ys, m, cap);
+    } else {
+      mp_expect("fuzz: tiny cap", m >= 0 && m <= cap && guard_ok(xs, cap));
+    }
+    mp_free((rawptr)xs);
+    mp_free((rawptr)ys);
+    mp_col_free(&c);
+    rounds = rounds + 1;
+  }
+}
+
+fn run_all(big: bool) {
+  g_big = big;
+  var live0: int64 = mp_alloc_live();
+  check_args();
+  check_peaks();
+  check_copy();
+  check_lead();
+  check_degenerate();
+  check_ring();
+  check_fuzz();
+  mp_expect_i64("everything freed", mp_alloc_live(), live0);
+}
+
+export fn main() -> int32 {
+  run_all(true);
+  return mp_summary();
+}
+
+@test fn t_decimate() -> int32 {
+  run_all(false);
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

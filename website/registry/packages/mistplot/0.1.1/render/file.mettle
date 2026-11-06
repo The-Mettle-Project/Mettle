@@ -1,0 +1,72 @@
+//! The only MistPlot module that touches the file system: writes a buffer to a path, and
+//! a chart's SVG to a file. Uses std/io (fopen, fwrite, fclose), core and render/svg. No
+//! temporary file and no rename: a failed write leaves a truncated file.
+
+import "std/io";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/chart/chart";
+import "mistplot/render/svg";
+
+/// Writes the bytes of b to path, replacing the file.
+///
+/// @param b The bytes. Valid: non-zero; may be empty (an empty file is written).
+/// @param path File path. Valid: non-empty, no NUL byte, at most 4096 bytes.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG b is 0 or path is empty, too long or contains a NUL; nothing is written.
+/// @error MP_ERR_ALLOC the NUL-terminated copy of path could not be allocated.
+/// @error MP_ERR_IO the open, write or close failed; a failed write leaves a truncated file.
+/// @mem path is copied for the call; nothing is retained.
+/// @thread Safe from any thread (with distinct buffers and paths).
+export fn mp_buf_save(b: MpBuf*, path: string) -> int32 {
+  var n: int64 = (int64)path.length;
+  if (b == 0 || n == 0 || n > 4096) { return MP_ERR_ARG; }
+  var p: uint8* = (uint8*)mp_alloc(n + 1);
+  if (p == 0) { return MP_ERR_ALLOC; }
+  var i: int64 = 0;
+  var bad: bool = false;
+  while (i < n) {
+    p[i] = path.chars[i];
+    if (p[i] == 0) { bad = true; }
+    i = i + 1;
+  }
+  p[n] = 0;
+  var rc: int32 = MP_ERR_ARG;
+  if (!bad) {
+    var mode: string = "wb";
+    var fp: cstring = fopen((cstring)p, mode.chars);
+    rc = MP_ERR_IO;
+    if (fp != 0) {
+      var len: int64 = mp_buf_len(b);
+      var wrote: int64 = 0;
+      if (len > 0) { wrote = fwrite((cstring)b->data, 1, len, fp); }
+      var closed: int32 = fclose(fp);
+      if (wrote == len && closed == 0) { rc = MP_OK; }
+    }
+  }
+  mp_free((rawptr)p);
+  return rc;
+}
+
+/// Renders a chart as SVG at w x h px and writes it to path.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param w Width. Units: px. Valid: finite, in (0, 1e9).
+/// @param h Height. Units: px. Valid: finite, in (0, 1e9).
+/// @param path File path. Valid: as for mp_buf_save.
+/// @return MP_OK, or an error code (render errors are also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0, the size is out of range or path is invalid; no file is written.
+/// @error MP_ERR_ALLOC the buffer or the frame could not be allocated; no file is written.
+/// @error MP_ERR_IO the file could not be written.
+/// @mem A temporary buffer is allocated and freed; nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_save_svg(c: MpChart*, w: float64, h: float64, path: string) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  var b: MpBuf* = mp_buf_new(8192);
+  if (b == 0) { return MP_ERR_ALLOC; }
+  var rc: int32 = mp_chart_svg(c, w, h, b);
+  if (rc == MP_OK) { rc = mp_buf_save(b, path); }
+  mp_buf_free(b);
+  return rc;
+}

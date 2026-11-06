@@ -1,0 +1,45 @@
+// core/format_test — mp_fmt_u64 and mp_fmt_value (the other formatters are covered by
+// core/scales_test).
+//
+// Pure: no files, no externs of its own; runs in the interpreter and both builds.
+
+import "std/math";
+import "mistplot/test/harness";
+import "mistplot/core/format";
+
+fn check_u64() {
+  var b: uint8[64];
+  mp_expect_str("u64 zero", mp_fmt_u64((uint64)0, &b[0], 64), "0");
+  mp_expect_str("u64 small", mp_fmt_u64((uint64)1234, &b[0], 64), "1234");
+  var max: uint64 = (uint64)0xFFFFFFFFFFFFFFFF;
+  mp_expect_str("u64 max", mp_fmt_u64(max, &b[0], 64), "18446744073709551615");
+  mp_expect_str("u64 short buffer", mp_fmt_u64((uint64)1, &b[0], 8), "");
+  mp_expect_str("u64 null", mp_fmt_u64((uint64)1, 0, 64), "");
+}
+
+fn check_value() {
+  var b: uint8[64];
+  mp_expect_str("value auto", mp_fmt_value(1234.5, 0, &b[0], 64), "1234.5");
+  mp_expect_str("value si", mp_fmt_value(1234.0, 1, &b[0], 64), "1.23k");
+  mp_expect_str("value int rounds", mp_fmt_value(2.5, 2, &b[0], 64), "3");
+  mp_expect_str("value int negative", mp_fmt_value(-2.5, 2, &b[0], 64), "-3");
+  mp_expect_str("value int nan", mp_fmt_value(NAN(), 2, &b[0], 64), "NaN");
+  mp_expect_str("value int huge", mp_fmt_value(1e19, 2, &b[0], 64), "1e+19");
+  mp_expect_str("value clock", mp_fmt_value(3725.0, 3, &b[0], 64), "1:02:05");
+  mp_expect_str("value tenths", mp_fmt_value(65.25, 4, &b[0], 64), "01:05.3");
+  mp_expect_str("value unknown is auto", mp_fmt_value(0.5, 99, &b[0], 64), "0.5");
+  mp_expect_str("value short buffer", mp_fmt_value(1.0, 0, &b[0], 16), "");
+}
+
+export fn main() -> int32 {
+  check_u64();
+  check_value();
+  return mp_summary();
+}
+
+@test fn t_format() -> int32 {
+  check_u64();
+  check_value();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

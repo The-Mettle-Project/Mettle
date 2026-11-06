@@ -1,0 +1,74 @@
+//! The bounding box of a set of (x, y) samples. Imports nothing and allocates nothing.
+//! Non-finite samples are skipped, never stored, so one NaN cannot turn a domain into
+//! NaN and collapse every mark; a set of only non-finite samples has no valid extent.
+
+/// Bounding box of the finite samples seen so far.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpExtent {
+  min_x: float64;   /// smallest finite x, data units (0 while invalid)
+  max_x: float64;   /// largest finite x, data units (0 while invalid)
+  min_y: float64;   /// smallest finite y, data units (0 while invalid)
+  max_y: float64;   /// largest finite y, data units (0 while invalid)
+  valid: bool;      /// true once at least one finite sample was added
+}
+
+/// An extent with no samples.
+///
+/// @return An invalid extent with every bound 0.
+export fn mp_extent_empty() -> MpExtent {
+  var e: MpExtent;
+  e.min_x = 0.0;
+  e.max_x = 0.0;
+  e.min_y = 0.0;
+  e.max_y = 0.0;
+  e.valid = false;
+  return e;
+}
+
+fn extent_finite(v: float64) -> bool {
+  if (v != v) { return false; }
+  return v <= 1e308 && v >= 0.0 - 1e308;
+}
+
+/// Grows an extent to include one sample.
+///
+/// @param e The extent. Valid: non-zero; 0 is ignored.
+/// @param x Sample x. Units: data units. Valid: any; the sample is skipped when x or y is
+///   NaN or infinite.
+/// @param y Sample y. Units: data units. Valid: any (see x).
+/// @mem e is updated in place; nothing is retained.
+/// @thread One thread at a time per e.
+/// @cost O(1).
+export fn mp_extent_add(e: MpExtent*, x: float64, y: float64) {
+  if (e == 0) { return; }
+  if (!extent_finite(x) || !extent_finite(y)) { return; }
+  if (!e->valid) {
+    e->min_x = x;
+    e->max_x = x;
+    e->min_y = y;
+    e->max_y = y;
+    e->valid = true;
+    return;
+  }
+  if (x < e->min_x) { e->min_x = x; }
+  if (x > e->max_x) { e->max_x = x; }
+  if (y < e->min_y) { e->min_y = y; }
+  if (y > e->max_y) { e->max_y = y; }
+}
+
+/// The smallest extent that covers two extents.
+///
+/// @param a First extent. Valid: any; an invalid extent contributes nothing.
+/// @param b Second extent. Valid: any; an invalid extent contributes nothing.
+/// @return The union; invalid only when both inputs are invalid.
+export fn mp_extent_union(a: MpExtent, b: MpExtent) -> MpExtent {
+  if (!a.valid) { return b; }
+  if (!b.valid) { return a; }
+  var e: MpExtent = a;
+  if (b.min_x < e.min_x) { e.min_x = b.min_x; }
+  if (b.max_x > e.max_x) { e.max_x = b.max_x; }
+  if (b.min_y < e.min_y) { e.min_y = b.min_y; }
+  if (b.max_y > e.max_y) { e.max_y = b.max_y; }
+  return e;
+}

@@ -1,0 +1,114 @@
+//! Rectangles, insets and clamps for layout. Pure value math: no imports, no allocation.
+//! Rects use a top-left origin with +y down, in logical px. Shrinking by more than the
+//! extent gives a negative w or h on purpose: clamping is the layout's job.
+
+/// An axis-aligned rectangle.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpRect {
+  x: float64;   /// left edge, px
+  y: float64;   /// top edge, px
+  w: float64;   /// width, px (may be negative after mp_rect_shrink)
+  h: float64;   /// height, px (may be negative after mp_rect_shrink)
+}
+
+/// Distances inward from each side of a rectangle.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpInsets {
+  top: float64;      /// px
+  right: float64;    /// px
+  bottom: float64;   /// px
+  left: float64;     /// px
+}
+
+/// A rectangle from its top-left corner and size.
+///
+/// @param x Left edge. Units: px. Valid: any.
+/// @param y Top edge. Units: px. Valid: any.
+/// @param w Width. Units: px. Valid: any.
+/// @param h Height. Units: px. Valid: any.
+/// @return The rectangle.
+export fn mp_rect(x: float64, y: float64, w: float64, h: float64) -> MpRect {
+  var r: MpRect;
+  r.x = x;
+  r.y = y;
+  r.w = w;
+  r.h = h;
+  return r;
+}
+
+/// Insets from four side distances, in CSS order.
+///
+/// @param top Top inset. Units: px. Valid: any.
+/// @param right Right inset. Units: px. Valid: any.
+/// @param bottom Bottom inset. Units: px. Valid: any.
+/// @param left Left inset. Units: px. Valid: any.
+/// @return The insets.
+export fn mp_insets(top: float64, right: float64, bottom: float64,
+                    left: float64) -> MpInsets {
+  var i: MpInsets;
+  i.top = top;
+  i.right = right;
+  i.bottom = bottom;
+  i.left = left;
+  return i;
+}
+
+/// A rectangle moved inward by insets.
+///
+/// @param r The rectangle. Valid: any.
+/// @param ins The insets. Valid: any; larger than the size gives a negative w or h.
+/// @return The shrunk rectangle.
+export fn mp_rect_shrink(r: MpRect, ins: MpInsets) -> MpRect {
+  return mp_rect(r.x + ins.left, r.y + ins.top,
+                 r.w - ins.left - ins.right, r.h - ins.top - ins.bottom);
+}
+
+/// Whether a point lies in a rectangle, edges included.
+///
+/// @param r The rectangle. Valid: any; a negative w or h contains nothing.
+/// @param px Point x. Units: px. Valid: any; NaN is outside.
+/// @param py Point y. Units: px. Valid: any; NaN is outside.
+/// @return true when r.x <= px <= r.x + r.w and r.y <= py <= r.y + r.h.
+export fn mp_rect_contains(r: MpRect, px: float64, py: float64) -> bool {
+  if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) { return true; }
+  return false;
+}
+
+/// A rectangle moved inward by the same distance on every side.
+///
+/// @param r The rectangle. Valid: any.
+/// @param inset Distance. Units: px. Valid: any.
+/// @return The shrunk rectangle.
+export fn mp_rect_inside(r: MpRect, inset: float64) -> MpRect {
+  return mp_rect_shrink(r, mp_insets(inset, inset, inset, inset));
+}
+
+/// Sum of the left and right insets.
+///
+/// @param ins The insets. Valid: any.
+/// @return left + right, px.
+export fn mp_insets_h(ins: MpInsets) -> float64 {
+  return ins.left + ins.right;
+}
+
+/// Sum of the top and bottom insets.
+///
+/// @param ins The insets. Valid: any.
+/// @return top + bottom, px.
+export fn mp_insets_v(ins: MpInsets) -> float64 {
+  return ins.top + ins.bottom;
+}
+
+/// A value limited to [lo, hi].
+///
+/// @param v The value. Valid: any; NaN gives lo.
+/// @param lo Lower bound. Valid: any finite value <= hi; when lo > hi the result is lo.
+/// @param hi Upper bound. Valid: any finite value >= lo.
+/// @return lo when v < lo (or NaN), hi when v > hi, else v.
+export fn mp_clamp(v: float64, lo: float64, hi: float64) -> float64 {
+  if (v >= lo && v <= hi) { return v; }
+  if (v > hi && hi >= lo) { return hi; }
+  return lo;
+}
