@@ -1247,12 +1247,9 @@ export fn ipow(base: int64, exponent: int32) -> int64 {
 export fn isqrt(n: int64) -> int64 {
   if (n <= 0) { return 0; }
   if (n < 4) { return 1; }
-  var x: int64 = n;
-  var y: int64 = (x + 1) / 2;
-  while (y < x) {
-    x = y;
-    y = (x + n / x) / 2;
-  }
+  var x: int64 = (int64)sqrt((float64)n);
+  while (x > n / x) { x = x - 1; }
+  while (x + 1 <= n / (x + 1)) { x = x + 1; }
   return x;
 }
 
@@ -1317,6 +1314,7 @@ export fn imod_floor(a: int64, b: int64) -> int64 {
 
 export fn f32_abs(x: float32) -> float32 {
   if (x < 0.0) { return -x; }
+  if (x == 0.0) { return 0.0; }
   return x;
 }
 
