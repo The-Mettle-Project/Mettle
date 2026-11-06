@@ -1,0 +1,19 @@
+import "std/io";
+import "std/math";
+import "std/meta";
+
+@memoize fn paths(n: int64) -> int64 {
+  if (n < 2) { return 1; }
+  return paths(n - 1) + paths(n - 2);
+}
+
+fn loss(x: float64, y: float64) -> float64 {
+  return x * x * y + sin(y);
+}
+
+fn main() -> int32 {
+  var g = grad(loss)(2.0, 3.0);
+  println("paths(90) = {paths(90)}");
+  println("loss = {g.value}, d/dx = {g.d_x}, d/dy = {g.d_y}");
+  return 0;
+}

@@ -1,0 +1,53 @@
+import "std/io";
+import "std/layout";
+import "std/time";
+
+@soa struct Body {
+  x: float32; y: float32; z: float32;
+  vx: float32; vy: float32; vz: float32;
+  mass: float32; heat: float32;
+}
+
+struct Packed {
+  x: float32; y: float32; z: float32;
+  vx: float32; vy: float32; vz: float32;
+  mass: float32; heat: float32;
+}
+
+@noinline fn weigh(bs: Body[]) -> float32 {
+  var sum: float32 = 0.0;
+  for i in 0..bs.length { sum = sum + bs[i].mass; }
+  return sum;
+}
+
+@noinline fn weigh_packed(ps: Packed[]) -> float32 {
+  var sum: float32 = 0.0;
+  for i in 0..ps.length { sum = sum + ps[i].mass; }
+  return sum;
+}
+
+fn main() -> int32 {
+  const N = 1048576;
+  var bs = new Body[N];
+  var ps = new Packed[N];
+  for i in 0..N {
+    bs[i].mass = (float32)(i & 7);
+    ps[i].mass = (float32)(i & 7);
+  }
+  var best_soa = (int64)1000000000;
+  var best_packed = (int64)1000000000;
+  var check: float32 = 0.0;
+  for round in 0..40 {
+    var t0 = time_mono_ns();
+    check = check + weigh(bs);
+    var t1 = time_mono_ns();
+    check = check - weigh_packed(ps);
+    var t2 = time_mono_ns();
+    if (t1 - t0 < best_soa) { best_soa = t1 - t0; }
+    if (t2 - t1 < best_packed) { best_packed = t2 - t1; }
+  }
+  println("plain struct  {best_packed / 1000} us");
+  println("@soa          {best_soa / 1000} us");
+  println("difference    {check}");
+  return 0;
+}

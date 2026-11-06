@@ -63,6 +63,45 @@ def compile_in(run_id, source, args, name="checksum.mettle"):
     return out, code, cwd
 
 
+def build_and_run(run_id, source, args):
+    out, code, cwd = compile_in(run_id, source, ["--build"] + args, source)
+    require(code == 0, source + " to build, found " + out)
+    ran, code = run(cwd, [os.path.join(cwd, source[: -len(".mettle")] + EXE)])
+    require(code == 0, source + " to run, found " + ran)
+    return ran.strip()
+
+
+def excerpt(source, spans):
+    lines = read(os.path.join(EXHIBITS, source)).split("\n")
+    out = []
+    for span in spans:
+        if span is None:
+            out.append("")
+            continue
+        first, last, dedent = (span + (0,))[:3]
+        out.extend(l[dedent:] if l.startswith(" " * dedent) else l for l in lines[first - 1 : last])
+    return esc("\n".join(out))
+
+
+def speed_chart(suite3):
+    lo, hi = 0.3, 1.4
+    x = lambda v: (v - lo) / (hi - lo) * 100
+    base = x(1.0)
+    rows = []
+    for r in suite3["rows"]:
+        ratio = r["m"] / r["o3"]
+        native = r["native"] / r["o3"]
+        left, right = sorted((base, x(ratio)))
+        ahead = " ahead" if ratio < 1 else ""
+        rows.append(
+            '<li><span class="nm">%s</span><span class="tr"><i class="bar%s" style="left:%.2f%%;width:%.2f%%"></i>'
+            '<i class="nat" style="left:%.2f%%"></i></span><span class="vl">%.2f&times;</span></li>'
+            % (esc(r["name"]), ahead, left, right - left, x(native), ratio)
+        )
+    ticks = "".join('<span style="left:%.2f%%">%s</span>' % (x(v), label) for v, label in ((0.5, "0.5"), (1.0, "clang -O3"), (1.25, "1.25")))
+    return '<ol class="s-rows" style="--base:%.2f%%">%s</ol><div class="s-axis" aria-hidden="true"><span></span><span class="s-ticks">%s</span><span></span></div>' % (base, "".join(rows), ticks)
+
+
 def explain_lines(out):
     rows = []
     for line in out.split("\n"):
@@ -155,6 +194,20 @@ def main():
     freed = read(os.path.join(EXHIBITS, "checksum-free-early.mettle")).split("\n")
     require(freed[16].strip() == "free(data);" and freed[17].strip().startswith("println"), "the early free on lines 17 and 18")
 
+    layout_out = build_and_run("layout", "layout.mettle", ["--release"])
+    timed = dict((m.group(1), int(m.group(2))) for m in re.finditer(r"^(plain struct|@soa)\s+(\d+) us$", layout_out, re.M))
+    require(len(timed) == 2 and timed["@soa"] * 3 < timed["plain struct"] and "difference    0.0" in layout_out, "@soa to beat the plain struct by 3 times, found " + layout_out)
+
+    generate_out = build_and_run("generate", "generate.mettle", [])
+    require("paths(90) = 4660046610375530309" in generate_out and "d/dx = 12.0, d/dy = 3.010008" in generate_out, "the memoized count and the gradient, found " + generate_out)
+
+    passed, code, _ = compile_in("pass", "pass.mettle", ["--build", "--release"], "pass.mettle")
+    pass_error = re.search(r"^.*(error\[L0007\]: .*)\n\s*(counterexample .*)\n\s*(divergence: .*)$", passed, re.M)
+    require(code != 0 and pass_error, "L0007 from the wrong pass, found " + passed)
+
+    language_out = build_and_run("language", "language.mettle", ["--release"])
+    require(language_out == "A B C", "the language exhibit to print A B C, found " + language_out)
+
     rule_src = read(os.path.join(EXHIBITS, "rules.mettle")).split("\n")
     ruled, code, _ = compile_in("rule", "rules.mettle", ["--build"], "rules.mettle")
     rule_error = re.search(r"^error\[R0002\]: .*$", ruled, re.M)
@@ -225,6 +278,21 @@ def main():
         "{{MACHINE_OUT}}": esc("$ mettle emulate little.mettle\n" + machine_out[0]),
         "{{GPU_CODE}}": esc(kernel_src.replace("b: float32*, c:", "b: float32*,\n" + " " * 25 + "c:") + "\n\n" + launch),
         "{{LIVE_FIX_MS}}": session["facts"]["{{LIVE_FIX_MS}}"],
+        "{{LAYOUT_CODE}}": excerpt("layout.mettle", [(5, 9), None, (17, 21)]),
+        "{{LAYOUT_OUT}}": esc("\n".join(l for l in layout_out.split("\n") if not l.startswith("difference"))),
+        "{{GENERATE_CODE}}": excerpt("generate.mettle", [(5, 8), None, (10, 12), None, (15, 17, 2)]),
+        "{{GENERATE_OUT}}": esc(generate_out),
+        "{{PASS_CODE}}": excerpt("pass.mettle", [(4, 14), None, (16, 18)]),
+        "{{PASS_NOTE}}": esc(pass_error.group(1) + "\n" + pass_error.group(2) + "\n" + pass_error.group(3)),
+        "{{LANGUAGE_CODE}}": excerpt("language.mettle", [(3, 9), None, (11, 20)]),
+        "{{LANGUAGE_OUT}}": esc(language_out),
+        "{{DEADLINE_CODE}}": excerpt("deadline.mettle", [(3, 7)]),
+        "{{TWIN_CODE}}": excerpt("twins.mettle", [(3, 10)]),
+        "{{REWRITE_CODE}}": excerpt("rewrite.mettle", [(9, 12)]),
+        "{{DEMAND_CODE}}": excerpt("checksum-early-exit.mettle", [(4, 11)]),
+        "{{SPEED_CHART}}": speed_chart(suite3),
+        "{{BUILD_LINES}}": "{:,}".format(json.loads(read(os.path.join(EXHIBITS, "build_speed.json")))["lines"]),
+        "{{BUILD_M_W}}": "%.1f" % (float(suite3["build_m"]) / float(suite3["build_c"]) * 100),
     }
 
     page = read(os.path.join(HERE, "template.html"))

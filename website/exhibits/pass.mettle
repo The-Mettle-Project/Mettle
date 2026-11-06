@@ -1,0 +1,23 @@
+import "std/io";
+import "std/pass";
+
+@pass(cleanup) fn x_plus_x(f: PassFunction) -> PassFunction {
+  for i in 0..f.code.length {
+    var op = f.code[i];
+    if (op.op == "binary" && op.text == "+" && !op.is_float &&
+        op.lhs.kind == OPERAND_SYMBOL && op.lhs.name == op.rhs.name) {
+      f.code[i].text = "<<";
+      f.code[i].rhs = operand_int(2);
+    }
+  }
+  return f;
+}
+
+@noinline fn twice(x: int64) -> int64 {
+  return x + x;
+}
+
+fn main() -> int32 {
+  println("{twice(21)}");
+  return 0;
+}
