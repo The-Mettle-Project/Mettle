@@ -12,6 +12,7 @@ extern fn __mtlc_metal_alloc_mapped(bytes: int64, device_out: int64*) -> uint8* 
 extern fn __mtlc_metal_free_mapped(host: uint8*) -> int32 = "mettle_metal_rt_free_mapped";
 extern fn __mtlc_metal_to_device(dst: int64, src: uint8*, bytes: int64) -> int32 = "mettle_metal_rt_to_device";
 extern fn __mtlc_metal_to_host(dst: uint8*, src: int64, bytes: int64) -> int32 = "mettle_metal_rt_to_host";
+extern fn __mtlc_metal_fill(dst: int64, value: uint32, element_bytes: int32, count: int64) -> int32 = "mettle_metal_rt_fill";
 extern fn __mtlc_metal_launch(f: int64, gx: int32, gy: int32, gz: int32,
                               bx: int32, by: int32, bz: int32,
                               shared_bytes: int32, stream: int64,
@@ -190,6 +191,15 @@ export fn gpu_host_mapped_malloc(bytes: int64, dev_ptr_out: int64*) -> uint8* {
 @inline export fn gpu_to_host(dst: uint8*, src: int64, bytes: int64) -> int32 {
   return __mtlc_metal_to_host(dst, src, bytes);
 }
+@inline export fn gpu_memset(dst: int64, value: uint8, bytes: int64) -> int32 {
+  return __mtlc_metal_fill(dst, (uint32)value, 1, bytes);
+}
+@inline export fn gpu_memset_u16(dst: int64, value: uint16, count: int64) -> int32 {
+  return __mtlc_metal_fill(dst, (uint32)value, 2, count);
+}
+@inline export fn gpu_memset_u32(dst: int64, value: uint32, count: int64) -> int32 {
+  return __mtlc_metal_fill(dst, value, 4, count);
+}
 @inline export fn gpu_sync() -> int32 { return __mtlc_metal_sync(); }
 @inline export fn gpu_flush() -> int32 { return __mtlc_metal_flush(); }
 @inline export fn gpu_barrier_off() -> int32 { return __mtlc_metal_barriers(0); }
@@ -207,6 +217,18 @@ export fn gpu_stream_create() -> int64 { return 1; }
 @inline export fn gpu_to_host_async(dst: uint8*, src: int64, bytes: int64,
                             stream: int64) -> int32 {
   return __mtlc_metal_to_host(dst, src, bytes);
+}
+@inline export fn gpu_memset_async(dst: int64, value: uint8, bytes: int64,
+                                   stream: int64) -> int32 {
+  return __mtlc_metal_fill(dst, (uint32)value, 1, bytes);
+}
+@inline export fn gpu_memset_u16_async(dst: int64, value: uint16, count: int64,
+                                       stream: int64) -> int32 {
+  return __mtlc_metal_fill(dst, (uint32)value, 2, count);
+}
+@inline export fn gpu_memset_u32_async(dst: int64, value: uint32, count: int64,
+                                       stream: int64) -> int32 {
+  return __mtlc_metal_fill(dst, value, 4, count);
 }
 
 var g_metal_event_ms: float64[256];
@@ -348,7 +370,19 @@ export fn gpu_module_bind(mod: int64) -> int64 {
 
 @inline export fn gpu_module_bound() -> int64 { return g_gpu_bound_module; }
 
+var g_gpu_embedded_source: uint8* = (uint8*)0;
+
+export fn mtlc_gpu_register_module(source: uint8*) {
+  g_gpu_embedded_source = source;
+}
+
 export fn mtlc_gpu_kernel_handle(name: cstring) -> int64 {
+  if (g_gpu_bound_module == 0 && g_gpu_embedded_source != (uint8*)0) {
+    if (gpu_init() == 0 || gpu_module(g_gpu_embedded_source) == 0) {
+      __mtlc_metal_fail(__mtlc_metal_cstr("mettle: the kernels built into this program would not load"),
+                        __mtlc_metal_cstr(""), __mtlc_metal_cstr(""));
+    }
+  }
   if (g_gpu_bound_module == 0) {
     __mtlc_metal_fail(__mtlc_metal_cstr("mettle: dispatch of kernel '"), name,
                       __mtlc_metal_cstr("' before any GPU module was loaded"));

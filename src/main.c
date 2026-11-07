@@ -293,6 +293,9 @@ static char *directory_from_path(const char *path) {
   return dir;
 }
 
+static int g_compiler_argc = 0;
+static char **g_compiler_argv = NULL;
+
 static char *get_executable_path(const char *argv0) {
   static char *cached_path = NULL;
   static int cached = 0;
@@ -3323,6 +3326,48 @@ static int add_string_option(const char ***list, size_t *count,
   return 1;
 }
 
+#ifndef _WIN32
+static int library_is_libc(const char *name) {
+  const char *base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  if (base[0] == ':') {
+    base++;
+  }
+  return strcmp(base, "c") == 0 || strncmp(base, "libc.so", 7) == 0;
+}
+
+static int bind_libc_for_dlopen(CompilerOptions *options,
+                                const char *object_path) {
+  if (!host_target_is_elf() ||
+      !object_needs_runtime_object(object_path, "dlopen")) {
+    return 1;
+  }
+  for (size_t i = 0; i < options->shared_library_count; i++) {
+    if (library_is_libc(options->shared_libraries[i])) {
+      return 1;
+    }
+  }
+  return add_string_option(&options->shared_libraries,
+                           &options->shared_library_count, ":libc.so.6");
+}
+#endif
+
+static int mettle_link_built_executable(CompilerOptions *options,
+                                        const char *executable_filename,
+                                        const char *runtime_directory) {
+#ifndef _WIN32
+  if (!bind_libc_for_dlopen(options, options->output_filename)) {
+    return 1;
+  }
+  return mettle_link_elf_executable(options->output_filename,
+                                    executable_filename, options,
+                                    runtime_directory);
+#else
+  return mettle_link_object_file(options->output_filename, executable_filename,
+                                 runtime_directory, options);
+#endif
+}
+
 static int add_link_argument(CompilerOptions *options, const char *argument) {
   if (!options || !argument || argument[0] == '\0') {
     return 0;
@@ -4233,6 +4278,8 @@ static DriverFlagResult parse_flag_gpu(CompilerOptions *options,
     options->report_occupancy = 1;
   } else if (strcmp(argv[i], "--gpu-checks") == 0) {
     options->gpu_checks = 1;
+  } else if (strcmp(argv[i], "--device-image") == 0) {
+    options->device_image = 1;
   } else if (strcmp(argv[i], "--report-launches") == 0) {
     options->report_launches = 1;
   } else if (strcmp(argv[i], "--report-gpu-types") == 0) {
@@ -4833,6 +4880,8 @@ static int main_explain_command(int *argc, char **argv,
 
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
+  g_compiler_argc = argc;
+  g_compiler_argv = argv;
   mettle_compiler_crash_install(argc, argv);
   mettle_compiler_self_profile_start();
   char *auto_stdlib_directory = NULL;
@@ -5296,15 +5345,8 @@ int main(int argc, char *argv[]) {
   } else if (result == 0 && flags.build_executable) {
     double build_profile_start =
         options.profile ? compiler_profile_now_ms() : 0.0;
-#ifndef _WIN32
-    result = mettle_link_elf_executable(options.output_filename,
-                                        build_output_filename, &options,
-                                        auto_runtime_directory);
-#else
-    result = mettle_link_object_file(options.output_filename,
-                                     build_output_filename,
-                                     auto_runtime_directory, &options);
-#endif
+    result = mettle_link_built_executable(&options, build_output_filename,
+                                          auto_runtime_directory);
     if (result == 0 && !g_link_output_ownership_verified) {
       char ownership_error[256];
       int owned =
@@ -6520,7 +6562,9 @@ static int compile_emit_ptx(IRProgram *ir_program, ASTNode *program,
       ptx_tile_report_text()[0]) {
     printf("register tiles\n%s\n", ptx_tile_report_text());
   }
-  printf("Generated PTX: %s\n", output_filename);
+  if (!options->device_image) {
+    printf("Generated PTX: %s\n", output_filename);
+  }
   if (!compile_write_kernel_declarations(program, options, input_filename,
                                          output_filename)) {
     return 1;
@@ -6616,7 +6660,9 @@ static int compile_emit_metal(IRProgram *ir_program, ASTNode *program,
   if (options->explain && options->optimize) {
     ir_explain_target_flush("Metal");
   }
-  printf("Generated Metal: %s\n", output_filename);
+  if (!options->device_image) {
+    printf("Generated Metal: %s\n", output_filename);
+  }
   if (!compile_write_kernel_declarations(program, options, input_filename,
                                          output_filename)) {
     return 1;
@@ -7547,6 +7593,106 @@ static int compile_stage_lower_ir(CompileContext *ctx) {
   return ir_ok ? COMPILE_CONTINUE : 1;
 }
 
+static int compile_device_flag(const char *argument) {
+  static const char *const exact[] = {"-O",        "-O1",          "-O2",
+                                      "-O3",       "--release",    "--gpu-checks",
+                                      NULL};
+  static const char *const prefixes[] = {"--gpu-arch=", "--ptx-version=",
+                                         "--gpu-tensor-tuple-budget=",
+                                         "--stdlib=", NULL};
+  for (size_t i = 0; exact[i]; i++) {
+    if (strcmp(argument, exact[i]) == 0) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; prefixes[i]; i++) {
+    if (strncmp(argument, prefixes[i], strlen(prefixes[i])) == 0) {
+      return 1;
+    }
+  }
+  return strncmp(argument, "-I", 2) == 0 && argument[2] != '\0';
+}
+
+static size_t compile_device_flags(const char **out, size_t used) {
+  for (int i = 1; i < g_compiler_argc; i++) {
+    const char *argument = g_compiler_argv[i];
+    if ((strcmp(argument, "--stdlib") == 0 || strcmp(argument, "-I") == 0) &&
+        i + 1 < g_compiler_argc) {
+      out[used++] = argument;
+      out[used++] = g_compiler_argv[++i];
+    } else if (compile_device_flag(argument)) {
+      out[used++] = argument;
+    }
+  }
+  return used;
+}
+
+static char *compile_device_image(CompileContext *ctx, int metal) {
+  const char **argv_list = NULL;
+  char path[4096];
+  char *self = get_executable_path(g_compiler_argc ? g_compiler_argv[0] : NULL);
+  char *image = NULL;
+  size_t used = 0;
+  snprintf(path, sizeof(path), "%s.kernels.%s", ctx->output_filename,
+           metal ? "metal" : "ptx");
+  argv_list = calloc((size_t)g_compiler_argc + 8u, sizeof(*argv_list));
+  if (!self || !argv_list) {
+    free(self);
+    free(argv_list);
+    return NULL;
+  }
+  argv_list[used++] = self;
+  argv_list[used++] = metal ? "--emit-metal" : "--emit-ptx";
+  argv_list[used++] = "--device-image";
+  used = compile_device_flags(argv_list, used);
+  argv_list[used++] = ctx->input_filename;
+  argv_list[used++] = "-o";
+  argv_list[used++] = path;
+  if (mettle_run_process(self, argv_list) == 0) {
+    image = read_file(path);
+  }
+  remove(path);
+  free(self);
+  free(argv_list);
+  return image;
+}
+
+static int compile_stage_embed_kernels(CompileContext *ctx) {
+  const CompilerOptions *options = ctx->options;
+  const char *register_name = "mtlc_gpu_register_module";
+  int metal = options->gpu_provider == 2 ||
+              (options->gpu_provider == 0 && host_target_is_macho());
+  char *image = NULL;
+  int embedded = 0;
+  if (!options->building_executable || options->emit_ptx ||
+      options->emit_spirv || options->emit_metal || options->test_mode ||
+      !ir_program_defines_kernels(ctx->ir_program)) {
+    return COMPILE_CONTINUE;
+  }
+  if (!ir_program_can_register_device_image(ctx->ir_program, register_name)) {
+    return ir_program_embed_device_image(ctx->ir_program, NULL, 0, NULL,
+                                         register_name)
+               ? COMPILE_CONTINUE
+               : 1;
+  }
+  image = compile_device_image(ctx, metal);
+  if (!image) {
+    fprintf(stderr, "error: the kernels in %s did not compile for the GPU\n",
+            ctx->input_filename);
+    return 1;
+  }
+  embedded = ir_program_embed_device_image(
+      ctx->ir_program, image, strlen(image),
+      mtlc_type_array(mtlc_type_scalar(MTLC_TYPE_UINT8), strlen(image) + 1),
+      register_name);
+  free(image);
+  if (!embedded) {
+    fprintf(stderr, "Error: could not build the kernels into the program\n");
+    return 1;
+  }
+  return COMPILE_CONTINUE;
+}
+
 static int compile_stage_swap_check(CompileContext *ctx) {
   CompilerOptions *options = ctx->options;
   if (!options->swap_check_mode) {
@@ -8247,6 +8393,7 @@ static const CompileStage COMPILE_STAGES[] = {
     compile_stage_drop_tests,
     compile_stage_lowering_modes,
     compile_stage_lower_ir,
+    compile_stage_embed_kernels,
     compile_stage_swap_check,
     compile_stage_effects,
     compile_stage_twins,

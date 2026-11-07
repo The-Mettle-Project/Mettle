@@ -7049,6 +7049,80 @@ const IRInstruction *ir_function_find_declaration_frozen(
   return ir_function_find_declaration(function, symbol_name, 0);
 }
 
+int ir_program_defines_kernels(const IRProgram *program) {
+  for (size_t i = 0; program && i < program->function_count; i++) {
+    const IRFunction *fn = program->functions[i];
+    if (fn && fn->is_kernel && fn->instruction_count > 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static IRFunction *ir_program_function_named(IRProgram *program,
+                                             const char *name) {
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *fn = program->functions[i];
+    if (fn && fn->name && strcmp(fn->name, name) == 0) {
+      return fn;
+    }
+  }
+  return NULL;
+}
+
+int ir_program_can_register_device_image(IRProgram *program,
+                                         const char *register_name) {
+  return ir_program_function_named(program, "main") &&
+         ir_program_function_named(program, register_name);
+}
+
+int ir_program_embed_device_image(IRProgram *program, const char *image,
+                                  size_t size, const MtlcType *image_type,
+                                  const char *register_name) {
+  IRModuleSymbol image_symbol = {0};
+  IRFunction *entry = ir_program_function_named(program, "main");
+  size_t kept = 0;
+  if (image) {
+    if (!ir_program_can_register_device_image(program, register_name)) {
+      return 0;
+    }
+    image_symbol.name = (char *)IR_DEVICE_IMAGE_SYMBOL;
+    image_symbol.kind = IR_MODSYM_VARIABLE;
+    image_symbol.type = (MtlcType *)image_type;
+    image_symbol.init_bytes = (unsigned char *)image;
+    image_symbol.init_bytes_size = size + 1;
+    if (!image_symbol.type || !ir_program_add_symbol(program, &image_symbol)) {
+      return 0;
+    }
+    IRInstruction address = {0};
+    IRInstruction call = {0};
+    address.op = IR_OP_ADDRESS_OF;
+    address.dest = ir_operand_temp(".tdevice_image");
+    address.lhs = ir_operand_symbol(IR_DEVICE_IMAGE_SYMBOL);
+    call.op = IR_OP_CALL;
+    call.text = (char *)register_name;
+    call.dest = ir_operand_none();
+    call.arguments = &address.dest;
+    call.argument_count = 1;
+    int inserted = ir_function_insert_instruction(entry, 0, &address) &&
+                   ir_function_insert_instruction(entry, 1, &call);
+    ir_operand_destroy(&address.lhs);
+    ir_operand_destroy(&address.dest);
+    if (!inserted) {
+      return 0;
+    }
+  }
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *fn = program->functions[i];
+    if (fn && fn->is_kernel && fn->instruction_count > 0) {
+      continue;
+    }
+    program->functions[kept++] = fn;
+  }
+  program->function_count = kept;
+  return 1;
+}
+
 int ir_program_eliminate_dead_functions(IRProgram *program, int keep_exports) {
   IrFnNameTable table;
   unsigned char *live = NULL;

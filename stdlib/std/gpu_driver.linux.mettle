@@ -1,0 +1,1 @@
+export const GPU_DRIVER_LIBRARY: string = "libcuda.so.1";

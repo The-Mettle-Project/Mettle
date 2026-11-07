@@ -3,21 +3,22 @@
 libmtlc has three GPU code generators, NVIDIA PTX, SPIR-V (OpenCL) and Metal
 Shading Language for Apple GPUs, all emitted from the same IR with no `nvcc`,
 no `cudart`, and no LLVM. Through the reference frontend, kernels are written
-in Mettle, compiled to a `.ptx` module with `--emit-ptx` (a `.spv` module with
-`--emit-spirv`, a `.metal` file with `--emit-metal`), and, for the
-CUDA path, launched from a normal Mettle host program via the
-[`std/gpu`](standard-library.md#stdgpu) bindings and the `dispatch` statement.
-(A frontend driving libmtlc directly reaches the same generators through
-`mtlc_emit`; see [Writing a frontend for libmtlc](embedding.md).)
+in Mettle next to the host code that launches them through
+[`std/gpu`](standard-library.md#stdgpu) and the `dispatch` statement.
+`mettle --build` compiles the kernels for the GPU in the same command and
+builds the module into the executable. `--emit-ptx` (`--emit-spirv`,
+`--emit-metal`) still writes a module on its own for a host that loads one at
+run time. (A frontend driving libmtlc directly reaches the same generators
+through `mtlc_emit`; see [Writing a frontend for libmtlc](embedding.md).)
 
-The model is two-stage and explicit: kernels live in their own file, the
-host manages device memory itself, and `dispatch` only performs the launch. This
-mirrors how real GPU code manages persistent VRAM.
+The host manages device memory itself, and `dispatch` only performs the
+launch. This mirrors how real GPU code manages persistent VRAM.
 
 ## Writing a kernel
 
-A kernel file is compiled with `mettle --emit-ptx`. Use the `kernel` keyword for
-GPU entry points (it parses like `fn` and is emitted as a PTX `.entry`):
+Use the `kernel` keyword for GPU entry points. It parses like `fn` and is
+emitted as a PTX `.entry`. A kernel can sit in the host's own file or in a
+module the host imports:
 
 ```mettle
 kernel vadd(a: float32*, b: float32*, c: float32*, n: int32) {
@@ -922,11 +923,22 @@ decode the same masks directly with 64-bit addresses and f32 FMA. Invalid masks
 remain outside the source contract; both paths clamp them to the safe `0011`
 mask before use as defensive hardening.
 
+The stable-WMMA interior also needs every operand's leading dimension to be a
+whole number of 16-byte units and every base 32-byte aligned. A uniform runtime
+guard checks both and sends any other matrix to the same exact replay, so an
+odd `lda` costs speed and never changes a result.
+
 TF32 tails, reduced-precision accumulator/result, saturating integer tails,
-and other sparse ratios/types remain explicit capability errors. Native
-transpose, scaled paths, and bounded structured sparsity are offline-assembler
-qualified, not device-numerically qualified. The OpenCL 2.0 SPIR-V profile also
-rejects the operation explicitly.
+and other sparse ratios/types remain explicit capability errors. The OpenCL 2.0
+SPIR-V profile also rejects the operation explicitly.
+
+Every family above runs on a compute 12.0 GPU against exact host oracles:
+`tests/gpu/tensor_regions_device.mettle` covers dense f16, bf16, f64 and i8,
+each transpose form, unscaled FP8 and both structured 2:4 forms, at odd and
+16-byte strides, tail shapes, K below one chunk and K=0, with poisoned padding
+that must stay untouched. `tests/gpu/tensor_scaled_device.mettle` covers
+MXFP6, MXFP4, NVFP4 and transposed MXFP8 with varied block scales. GB10
+execution is not measured.
 
 CUDA 12.9 offline assembly accepts the five native-interior fixtures, three
 exact-transpose fixtures, two unscaled direct-MMA FP8 fixtures, and four scaled
@@ -1022,9 +1034,13 @@ suite assembles with zero spills at 40 registers for a two-MMA stable-WMMA
 scale/ReLU chain, 58 for a two-MMA FP8 matrix-bias/clamp chain, and 31 for a
 staged commit handoff. Both the fused loop exit and guarded-loop replay use 40
 registers; the forced memory-replay module peaks at 66 registers.
-These are offline structural/resource results, not GB10 execution or
-performance evidence. The current OpenCL 2.0 SPIR-V profile rejects the
-operation explicitly until it has exact collective ordering and lowering.
+`tests/gpu/tensor_tiles_device.mettle` runs five standalone epilogues on a
+compute 12.0 GPU against exact host results: column bias with scales and ReLU,
+a 19x37 column-major matrix with a row-major matrix bias, clamp and workgroup
+scope, f64 row bias, f16 identity, and column-major bf16 with ReLU. GB10
+execution and performance are not measured. The current OpenCL 2.0 SPIR-V
+profile rejects the operation explicitly until it has exact collective
+ordering and lowering.
 
 Structured sparsity has an equally backend-neutral memory contract. A is the
 sparse operand; logical K is divided into consecutive groups of 2, 4, or 8 for
@@ -1194,9 +1210,10 @@ with zero spills and no `tcgen05` dependency. A-fragment coordinates and
 the lower-row/upper-row halves of the metadata word have also been checked
 against the PTX 8.8 fragment equations and Figure 119. A CPU oracle checks
 compressed selected-value order, compact masks, transpose, odd K, K=0, and
-no-op bounds. This remains CPU semantic plus offline structural evidence only;
-GPU sparse numerics, malformed-input behavior beyond defensive clamping,
-performance, and actual GB10 execution remain unqualified gates.
+no-op bounds. On a compute 12.0 GPU, f16 and bf16 whole tiles and bounded f16
+and transposed bf16 regions match exact host results, partial final groups
+included. Malformed-input behavior beyond defensive clamping, performance, and
+GB10 execution are not measured.
 
 With `-O`, adjacent exact compositions of the form `D=A0*B0+C;
 D=A1*B1+D; ...` become one backend-neutral tensor-chain instruction. Fusion is
@@ -1840,10 +1857,13 @@ import "std/io";
 import "std/mem";
 import "std/gpu";
 
-extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
+kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) { c[i] = a[i] + b[i]; }
+}
 
 fn main() -> int32 {
-  if (gpu_open("kernels.ptx") == 0) { return 1; }
+  if (gpu_init() == 0) { return 1; }
 
   var n: int32 = 1 << 20;
   var bytes: int64 = (int64)n * 4;
@@ -1858,6 +1878,7 @@ fn main() -> int32 {
   var dc: int64 = gpu_malloc(bytes);
   gpu_to_device(da, (uint8*)ha, bytes);
   gpu_to_device(db, (uint8*)hb, bytes);
+  gpu_memset(dc, (uint8)0, bytes);
 
   dispatch vadd[work: n](da, db, dc, n);
 
@@ -1866,6 +1887,40 @@ fn main() -> int32 {
   return 0;
 }
 ```
+
+```bash
+mettle -O --build vadd.mettle -o vadd.exe
+```
+
+The build runs a device pass over the same source, compiles every kernel it
+reaches for the GPU, and builds the module into the executable. The first
+dispatch of one of those kernels loads it. Kernel bodies and helpers that only
+kernels call never reach the host code; a helper both sides call is compiled
+for both. A kernel the device pass refuses fails the build with that pass's
+error. `mettle test` runs the same kernels on the CPU grid runner.
+
+The module targets what `--gpu-arch` selects, the local GPU when no flag is
+given. Build with `--gpu-arch=portable` for an executable that has to run on
+other NVIDIA GPUs. With `--gpu-provider=metal`, the device pass writes Metal
+Shading Language instead and the Metal provider builds it on first dispatch.
+
+### Loading a module at run time
+
+A host can also launch kernels from a module built on its own. Write it with
+`--emit-ptx`, declare each kernel with `extern kernel`, and open the module
+before the first dispatch:
+
+```mettle
+extern kernel(block = 256) vadd(a: float32*, b: float32*, c: float32*, n: int32);
+
+fn main() -> int32 {
+  if (gpu_open("kernels.ptx") == 0) { return 1; }
+  ...
+}
+```
+
+A dispatch looks a kernel up in the module built into the program first and
+then in the module `gpu_open` bound, so both kinds can be used together.
 
 ### Declarations the host cannot get wrong
 
@@ -2028,30 +2083,32 @@ graphs.
 ## Building
 
 ```bash
-# 0. see what this machine has, and what step 1 will target
+# see what this machine has, and what a build will target
 mettle --gpu-info
 
-# 1. compile optimized kernels for the local GPU (auto-detected via the
-#    driver; falls back to the DGX Spark GB10 profile when no GPU is visible)
+# kernels and host in one executable, for the local GPU (auto-detected via
+# the driver; the DGX Spark GB10 profile when no GPU is visible)
+mettle -O --build app.mettle -o app.exe
+
+# the same, but refuse to build at all if this machine has no GPU
+mettle -O --build --gpu-arch=native app.mettle -o app.exe
+
+# pin a profile, for example DGX Spark GB10
+mettle -O --build --gpu-arch=gb10 app.mettle -o app.exe
+
+# a forward-compatible baseline any recent NVIDIA GPU can run
+mettle -O --build --gpu-arch=portable app.mettle -o app.exe
+
+# a module on its own, for a host that opens it at run time
 mettle -O --emit-ptx kernels.mettle -o kernels.ptx
-
-# The same, but refuse to build at all if this machine has no GPU:
-mettle -O --emit-ptx --gpu-arch=native kernels.mettle -o kernels.ptx
-
-# Or pin a profile explicitly, for example DGX Spark GB10:
-mettle -O --emit-ptx --gpu-arch=gb10 kernels.mettle -o kernels.ptx
-
-# A forward-compatible development baseline is also available:
-mettle -O --emit-ptx --gpu-arch=portable kernels.mettle -o kernels.ptx
-
-# 2. build the host, linking the CUDA driver import stub (build-time only)
-mettle --build host.mettle -o host.exe \
-  --link-arg "<CUDA>/lib/x64/cuda.lib"        # Windows x86-64
 ```
 
-The host links `nvcuda`, the OS driver, as an explicit vendor API. There is no
-bundled CUDA DLL. At run time the driver JITs
-the PTX to SASS for the installed GPU.
+Nothing from CUDA is linked. `std/gpu` loads the driver the first time a
+program calls it, `nvcuda.dll` on Windows and `libcuda.so.1` on Linux, so a
+build needs no CUDA toolkit and a machine without the driver gets an error from
+`gpu_init` naming the library that would not load. On Linux the build links
+`libc.so.6` for the loader, the only shared library the executable needs. At
+run time the driver JITs the PTX to SASS for the installed GPU.
 
 ### Reporting and check flags
 
@@ -2412,8 +2469,10 @@ every emitted file with it.
   Status-returning `gpu_launch_3d` remains available when recovery is required.
   Provider-neutral launch attributes beyond geometry, dynamic shared bytes, and
   stream are not represented yet.
-- Kernels and host code live in separate files (the kernel file is compiled
-  with `--emit-ptx`; the host with `--build`).
+- A single build embeds one module, compiled for one `--gpu-arch`. An
+  executable meant for several GPU generations needs `--gpu-arch=portable`.
+- A scalar `dispatch` argument is converted to the kernel parameter's type, as
+  a call would convert it, so `-0.5` reaches a `float32` parameter as -0.5.
 - A record kernel parameter is passed by value. The OpenCL 2.0 SPIR-V profile
   rejects by-value record parameters and results; pass a pointer there.
 

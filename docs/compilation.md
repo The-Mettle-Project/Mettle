@@ -30,7 +30,7 @@ the backend one program, so you never compile imported files separately.
 | Option | Product |
 |--------|---------|
 | `--emit-obj` | A native object. This is the default. |
-| `--build` | An executable: PE on Windows, ELF on Linux. |
+| `--build` | An executable: PE on Windows, ELF on Linux. Kernels in the program are compiled for the GPU and built into it. |
 | `--emit-arm64` | A self-contained AArch64 Linux executable. |
 | `--emit-arm64-obj` | An AArch64 relocatable object. The default on an ARM host. |
 | `--emit-ptx` | Declared kernels as NVIDIA PTX. |
@@ -226,7 +226,7 @@ emitted by the baseline one and run slower.
 | Option | Effect |
 |--------|--------|
 | `--gpu-info` | Report local GPUs, driver, ptxas, and the target `--emit-ptx` would pick. Takes no input file. |
-| `--gpu-arch=A` | `native`, `gb10`, `portable`, `sm_NN`, or `compute_NN`. |
+| `--gpu-arch=A` | `native`, `gb10`, `portable`, `sm_NN`, or `compute_NN`, for `--emit-ptx` and for the kernels `--build` embeds. |
 | `--ptx-version=M.m` | Override the emitted PTX ISA version. |
 | `--emit-kernel-decls[=F]` | Also write each kernel's host-side `extern kernel` declaration. |
 | `--report-occupancy` | Registers per thread and the occupancy ceiling, from `ptxas -v`. |

@@ -7474,6 +7474,53 @@ static void ptx_emit_tensor_matmul_scalar(
             label_id, phase, mask, label_id);
 }
 
+static unsigned ptx_tensor_storage_bits(MtlcTensorElement element) {
+  switch (element) {
+  case MTLC_TENSOR_ELEMENT_BIT1:
+    return 1;
+  case MTLC_TENSOR_ELEMENT_INT4:
+  case MTLC_TENSOR_ELEMENT_UINT4:
+  case MTLC_TENSOR_ELEMENT_FLOAT4_E2M1:
+    return 4;
+  case MTLC_TENSOR_ELEMENT_TFLOAT32:
+    return 32;
+  default:
+    return (unsigned)ptx_tensor_matmul_element_bytes(element) * 8u;
+  }
+}
+
+static void ptx_tensor_matmul_wmma_guard(PtxFn *fn, const IRInstruction *in,
+                                         int direct_mma, char bases[6][24],
+                                         char strides64[4][24],
+                                         const char *native) {
+  const MtlcTensorMmaDesc *desc = &IR_TENSOR_MMA(in);
+  if (direct_mma) {
+    return;
+  }
+  MtlcTensorElement elements[4] = {desc->a_element, desc->b_element,
+                                   desc->accumulator_element,
+                                   desc->result_element};
+  sb_printf(&fn->body,
+            "\t// mtlc.tensor_matmul stable-wmma stride and base alignment guard\n");
+  for (size_t i = 0; i < 4; i++) {
+    unsigned bits = ptx_tensor_storage_bits(elements[i]);
+    char remainder[24], aligned[24];
+    if (bits == 0 || 128u % bits != 0) continue;
+    reg_name(PC_B64, new_reg(fn, PC_B64), remainder);
+    reg_name(PC_PRED, new_reg(fn, PC_PRED), aligned);
+    sb_printf(&fn->body,
+              "\tand.b64 %s, %s, %u;\n"
+              "\tsetp.eq.u64 %s, %s, 0;\n"
+              "\tand.pred %s, %s, %s;\n"
+              "\tand.b64 %s, %s, 31;\n"
+              "\tsetp.eq.u64 %s, %s, 0;\n"
+              "\tand.pred %s, %s, %s;\n",
+              remainder, strides64[i], 128u / bits - 1u, aligned, remainder,
+              native, native, aligned, remainder, bases[i], aligned, remainder,
+              native, native, aligned);
+  }
+}
+
 static int ptx_tensor_matmul_bind_pointer(PtxFn *fn, const char *name,
                                           PtxVal descriptor,
                                           int register_index) {
@@ -7679,6 +7726,8 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
               metadata_stride_fits, metadata_stride_roundtrip,
               metadata_stride64, native, native, metadata_stride_fits);
   }
+  ptx_tensor_matmul_wmma_guard(fn, in, use_direct_mma, bases, strides64,
+                               native);
   sb_printf(&fn->body,
             "\t@%s bra mtlc_tensor_matmul_%llu_native;\n"
             "\tbra mtlc_tensor_matmul_%llu_scalar;\n",

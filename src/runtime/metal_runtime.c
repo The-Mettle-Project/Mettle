@@ -297,6 +297,27 @@ int32_t mettle_metal_rt_to_host(uint8_t *dst, int64_t src, int64_t bytes) {
   return 0;
 }
 
+int32_t mettle_metal_rt_fill(int64_t dst, uint32_t value, int32_t element_bytes,
+                             int64_t count) {
+  int64_t bytes = count * (int64_t)element_bytes;
+  unsigned char *at;
+  if (element_bytes != 1 && element_bytes != 2 && element_bytes != 4) {
+    return 1;
+  }
+  if (mettle_metal_rt_sync() != 0 || !rt_span_ok(dst, bytes, "a fill on the GPU")) {
+    return 1;
+  }
+  at = (unsigned char *)mettle_metal_rt_host(dst);
+  if (element_bytes == 1) {
+    memset(at, (int)(value & 0xFFu), (size_t)bytes);
+    return 0;
+  }
+  for (int64_t i = 0; i < count; i++) {
+    memcpy(at + i * element_bytes, &value, (size_t)element_bytes);
+  }
+  return 0;
+}
+
 static size_t rt_align_up(size_t value, size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }

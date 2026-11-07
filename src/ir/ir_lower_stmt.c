@@ -1900,6 +1900,61 @@ static int ir_lower_statement_unmarked(IRLoweringContext *context,
   }
 }
 
+static Type *ir_gpu_launch_scalar_parameter(IRLoweringContext *context,
+                                            GpuLaunchStatement *launch,
+                                            size_t index) {
+  if (!launch->typed_kernel || !launch->kernel ||
+      launch->kernel->type != AST_IDENTIFIER || !launch->kernel->data ||
+      !context->type_checker) {
+    return NULL;
+  }
+  const char *kernel_name = ((Identifier *)launch->kernel->data)->name;
+  Symbol *kernel_symbol =
+      kernel_name ? symbol_table_lookup(context->type_checker->symbol_table,
+                                        kernel_name)
+                  : NULL;
+  Type *declared =
+      kernel_symbol && kernel_symbol->kind == SYMBOL_FUNCTION &&
+              kernel_symbol->data.function.parameter_types &&
+              index < kernel_symbol->data.function.parameter_count
+          ? kernel_symbol->data.function.parameter_types[index]
+          : NULL;
+  if (declared && (declared->kind == TYPE_FLOAT32 ||
+                   declared->kind == TYPE_FLOAT64 ||
+                   declared->kind == TYPE_FLOAT16 ||
+                   declared->kind == TYPE_BFLOAT16 ||
+                   type_checker_is_integer_type(declared))) {
+    return declared;
+  }
+  return NULL;
+}
+
+static int ir_gpu_launch_convert_argument(IRLoweringContext *context,
+                                          IRFunction *function,
+                                          ASTNode *source, Type *source_type,
+                                          Type *declared, IROperand *value) {
+  IROperand converted = ir_operand_none();
+  IRInstruction cast = {0};
+  if (!ir_make_temp_operand(context, &converted)) {
+    return 0;
+  }
+  cast.op = IR_OP_CAST;
+  cast.location = source->location;
+  cast.dest = converted;
+  cast.lhs = *value;
+  cast.text = (char *)ir_backend_type_name(declared->name);
+  cast.value_type = mtlc_type_from_frontend(declared);
+  cast.is_float = ir_expression_is_floating(context, source);
+  cast.is_unsigned = !cast.is_float && ir_type_is_unsigned_integer(source_type);
+  if (cast.is_float) {
+    cast.float_bits = ir_expression_float_bits(context, source);
+  }
+  int emitted = ir_emit(context, function, &cast);
+  ir_operand_destroy(value);
+  *value = converted;
+  return emitted;
+}
+
 static int ir_lower_gpu_launch_work(IRLoweringContext *context,
                                     IRFunction *function,
                                     GpuLaunchStatement *launch,
@@ -2045,28 +2100,16 @@ static int ir_lower_gpu_launch(IRLoweringContext *context,
     if (!source_type) {
       source_type = ir_infer_expression_type(context, source_arg);
     }
-    if (launch->typed_kernel && source_arg &&
-        source_arg->type == AST_NUMBER_LITERAL && launch->kernel &&
-        launch->kernel->type == AST_IDENTIFIER && launch->kernel->data &&
-        context->type_checker) {
-      const char *kernel_name = ((Identifier *)launch->kernel->data)->name;
-      Symbol *kernel_symbol =
-          kernel_name ? symbol_table_lookup(context->type_checker->symbol_table,
-                                            kernel_name)
-                      : NULL;
-      Type *declared =
-          kernel_symbol && kernel_symbol->kind == SYMBOL_FUNCTION &&
-                  kernel_symbol->data.function.parameter_types &&
-                  i < kernel_symbol->data.function.parameter_count
-              ? kernel_symbol->data.function.parameter_types[i]
-              : NULL;
-      if (declared && (declared->kind == TYPE_FLOAT32 ||
-                       declared->kind == TYPE_FLOAT64 ||
-                       declared->kind == TYPE_FLOAT16 ||
-                       declared->kind == TYPE_BFLOAT16 ||
-                       type_checker_is_integer_type(declared))) {
-        source_type = declared;
-      }
+    Type *declared = ir_gpu_launch_scalar_parameter(context, launch, i);
+    if (declared && source_arg && source_arg->type != AST_NUMBER_LITERAL &&
+        source_type && source_type->kind != declared->kind &&
+        !ir_gpu_launch_convert_argument(context, function, source_arg,
+                                        source_type, declared,
+                                        &arguments[controls + i])) {
+      goto gpu_launch_lower_fail;
+    }
+    if (declared) {
+      source_type = declared;
     }
     argument_types[controls + i] =
         mtlc_type_from_frontend(source_type);

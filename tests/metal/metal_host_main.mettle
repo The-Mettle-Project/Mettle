@@ -67,6 +67,11 @@ fn check_mixed() -> int32 {
   if (out[5] != (int64)12) { return 28; }
   if (out[6] != (int64)-2) { return 29; }
   if (out[7] != (int64)424242) { return 30; }
+  dispatch host_mixed[1, 32](dout, -5, 65000, -2.25, wide, p, true, -7);
+  if (gpu_to_host((uint8*)&out[0], dout, 64) != 0) { return 31; }
+  if (out[0] != (int64)-5 || out[1] != (int64)65000) { return 32; }
+  if (out[2] != (int64)-9) { return 33; }
+  if (out[7] != (int64)-7) { return 34; }
   gpu_free(dout);
   return 0;
 }

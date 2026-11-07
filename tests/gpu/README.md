@@ -5,7 +5,7 @@ PTX/SPIR-V structure, and assembler acceptance. It does not claim device
 execution. `hardware_harness.c` is the real CUDA Driver differential gate.
 
 The harness compiles `hardware_kernels.mettle` with `-O`, loads the resulting
-PTX through the Driver API, and checks 33 independent contracts against CPU
+PTX through the Driver API, and checks 34 independent contracts against CPU
 oracles:
 
 - all XYZ thread, block, block-size, and grid-size indices;
@@ -64,11 +64,29 @@ oracles:
   for complete 16x16x16 regions and covers M/N/K edges with typed scalar work;
   19x23x21 simultaneously exercises the tensor interior and all edge classes,
   16x16x7 proves the scalar-only path, and both preserve poisoned padding;
-- compiler-native `tensor_matmul` bounded regions for f16, bf16, f64, and i8,
-  including block-derived 2-D origins, runtime or padded static strides,
-  resident full-K WMMA, exact cooperative M/N/K edges, 64-bit addressing,
-  tuple-budget fallback, and explicit unsupported-family/SPIR-V diagnostics;
 - natural-width i8/u8/i16/u16/bool launch parameters.
+
+Three single-build Mettle programs then check the tensor paths the harness does
+not reach, each against an exact host oracle written in Mettle. Inputs are
+small integers, so every product and sum is exact in every format and a result
+either matches bit for bit or is wrong:
+
+- `tensor_regions_device.mettle`: `tensor_matmul` regions for dense f16, bf16,
+  f64 and i8, f16 `transpose_a` and `transpose_b`, f64 with both transposes,
+  unscaled E4M3 x E5M2, and structured 2:4 f16 and transposed bf16, at
+  19x23x21, 32x48x64, 16x16x7, 37x29x70 and K=0, each at odd strides (exact
+  replay) and 16-byte strides (native interior), with poisoned padding that
+  must stay untouched;
+- `tensor_scaled_device.mettle`: block-scaled MXFP6, MXFP4 and NVFP4 regions at
+  odd and byte-aligned strides, and transposed MXFP8 at static strides, with
+  varied UE8M0 and UE4M3 scales;
+- `tensor_tiles_device.mettle`: whole-tile bf16 with mixed layouts, tf32, f64,
+  i8 and u8 saturating past the int32 range, packed u4 and i4, b1
+  XOR-popcount, 2:4 sparse f16 and bf16 tiles, and five `tensor_epilogue`
+  forms.
+
+Each is built with `mettle -O --build`, kernels and host in one step, and runs
+under compute-sanitizer memcheck when `-Sanitizer` is set.
 
 The harness includes no CUDA headers and dynamically loads the Driver API, so
 the same C source builds on Windows x86-64 and Linux AArch64. This is deliberate:

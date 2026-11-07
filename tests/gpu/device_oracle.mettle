@@ -1,0 +1,111 @@
+import "std/io";
+import "std/mem";
+import "std/gpu";
+
+var g_rng: int64 = 0x2545F4914F6CDD1D;
+var g_failures: int32 = 0;
+var g_cases: int32 = 0;
+
+export fn rng_seed(seed: int64) { g_rng = seed | 1; }
+
+export fn rng_int(lo: int32, hi: int32) -> int32 {
+  g_rng = g_rng ^ (g_rng << 13);
+  g_rng = g_rng ^ ((g_rng >> 7) & 0x01FFFFFFFFFFFFFF);
+  g_rng = g_rng ^ (g_rng << 17);
+  var span: int64 = (int64)(hi - lo + 1);
+  return lo + (int32)((g_rng & 0x7FFFFFFFFFFFFFFF) % span);
+}
+
+export fn at(row: int64, column: int64, ld: int64, column_major: bool) -> int64 {
+  if (column_major) { return column * ld + row; }
+  return row * ld + column;
+}
+
+export fn operand_at(row: int64, column: int64, ld: int64, column_major: bool,
+                     transpose: bool) -> int64 {
+  if (transpose) { return at(column, row, ld, column_major); }
+  return at(row, column, ld, column_major);
+}
+
+fn magnitude_exponent(m: int32) -> int32 {
+  var e: int32 = 0;
+  while ((m >> (e + 1)) != 0) { e = e + 1; }
+  return e;
+}
+
+export fn half_bits(v: int32) -> uint16 {
+  if (v == 0) { return (uint16)0; }
+  var sign: int32 = if (v < 0) 0x8000 else 0;
+  var m: int32 = if (v < 0) -v else v;
+  var e: int32 = magnitude_exponent(m);
+  var fraction: int32 = (m << (10 - e)) & 0x3FF;
+  return (uint16)(sign | ((e + 15) << 10) | fraction);
+}
+
+export fn f32_bits(value: float32) -> uint32 {
+  var x: float32 = value;
+  return *(uint32*)&x;
+}
+
+export fn f32_from_bits(bits: uint32) -> float32 {
+  var x: uint32 = bits;
+  return *(float32*)&x;
+}
+
+export fn bf16_bits(v: int32) -> uint16 {
+  return (uint16)(f32_bits((float32)v) >> (uint32)16);
+}
+
+export fn half_value(bits: uint16) -> float32 {
+  var exponent: int32 = ((int32)bits >> 10) & 0x1F;
+  var fraction: int32 = (int32)bits & 0x3FF;
+  var sign: uint32 = ((uint32)bits & (uint32)0x8000) << (uint32)16;
+  if (exponent == 0 && fraction == 0) { return f32_from_bits(sign); }
+  return f32_from_bits(sign | (uint32)((exponent - 15 + 127) << 23) | (uint32)(fraction << 13));
+}
+
+export fn bf16_value(bits: uint16) -> float32 {
+  return f32_from_bits((uint32)bits << (uint32)16);
+}
+
+export fn minifloat_bits(v: int32, exponent_bits: int32, mantissa_bits: int32,
+                         bias: int32) -> uint8 {
+  if (v == 0) { return (uint8)0; }
+  var sign: int32 = if (v < 0) 1 << (exponent_bits + mantissa_bits) else 0;
+  var m: int32 = if (v < 0) -v else v;
+  var e: int32 = magnitude_exponent(m);
+  var fraction: int32 = ((m << mantissa_bits) >> e) & ((1 << mantissa_bits) - 1);
+  return (uint8)(sign | ((e + bias) << mantissa_bits) | fraction);
+}
+
+export fn to_gpu(host: rawptr, bytes: int64) -> int64 {
+  var device: int64 = gpu_malloc(bytes);
+  if (device == 0 || gpu_to_device(device, (uint8*)host, bytes) != 0) {
+    println("[FAIL] could not stage {bytes} bytes on the GPU");
+    g_failures = g_failures + 1;
+  }
+  return device;
+}
+
+export fn from_gpu(host: rawptr, device: int64, bytes: int64) {
+  if (gpu_sync() != 0 || gpu_to_host((uint8*)host, device, bytes) != 0) {
+    println("[FAIL] could not read {bytes} bytes back from the GPU");
+    g_failures = g_failures + 1;
+  }
+}
+
+export fn check(name: string, bad: int64) {
+  g_cases = g_cases + 1;
+  if (bad == 0) {
+    println("[PASS] {name}");
+  } else {
+    println("[FAIL] {name}: {bad} values differ from the host oracle");
+    g_failures = g_failures + 1;
+  }
+}
+
+export fn summary(program: string) -> int32 {
+  var passed: int32 = g_cases - g_failures;
+  println("{program}: {passed}/{g_cases} passed");
+  return g_failures;
+}

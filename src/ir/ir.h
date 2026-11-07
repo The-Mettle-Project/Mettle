@@ -642,6 +642,13 @@ const IRInstruction *ir_function_find_declaration(const IRFunction *function,
                                                  const char *symbol_name,
                                                  int symbols_only);
 int ir_program_eliminate_dead_functions(IRProgram *program, int keep_exports);
+#define IR_DEVICE_IMAGE_SYMBOL "__mettle_device_image"
+int ir_program_defines_kernels(const IRProgram *program);
+int ir_program_can_register_device_image(IRProgram *program,
+                                         const char *register_name);
+int ir_program_embed_device_image(IRProgram *program, const char *image,
+                                  size_t size, const MtlcType *image_type,
+                                  const char *register_name);
 int ir_program_drop_rewrite_rules(IRProgram *program);
 
 int ir_init_image_is_all_zero(const IRModuleSymbol *symbol);

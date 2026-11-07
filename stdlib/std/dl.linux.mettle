@@ -1,5 +1,5 @@
 // Linux shared libraries for std/dl, through libc's dlopen. A Linux build
-// links no libc by default, so build with -l:libc.so.6 to use this.
+// whose object calls dlopen links libc.so.6 for it.
 
 extern fn dl_c_open(path: uint8*, flags: int32) -> rawptr = "dlopen";
 extern fn dl_c_sym(handle: rawptr, name: uint8*) -> rawptr = "dlsym";

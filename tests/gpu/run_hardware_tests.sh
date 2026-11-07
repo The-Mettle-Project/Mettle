@@ -378,12 +378,26 @@ if [[ -n "$MXFP6_PTX" ]]; then
 fi
 "$HARNESS" "${HARNESS_ARGS[@]}"
 
+NUMERICS_ARCH="$GPU_ARCH"
+if [[ "$GPU_ARCH" != "gb10" && $COMPUTE_MAJOR -ge 9 ]]; then
+  NUMERICS_ARCH="sm_${COMPUTE_MAJOR}${COMPUTE_MINOR}a"
+fi
+NUMERICS_PROGRAMS=(tensor_regions_device tensor_scaled_device tensor_tiles_device)
+for numerics in "${NUMERICS_PROGRAMS[@]}"; do
+  "$COMPILER" -O --build "--gpu-arch=$NUMERICS_ARCH" \
+    "$ROOT/tests/gpu/$numerics.mettle" -o "$TMP/$numerics"
+  "$TMP/$numerics"
+done
+
 if [[ $SANITIZER -eq 1 ]]; then
   command -v compute-sanitizer >/dev/null
   compute-sanitizer --tool memcheck --error-exitcode=86 \
     "$HARNESS" "${HARNESS_ARGS[@]}"
   compute-sanitizer --tool racecheck --error-exitcode=87 \
     "$HARNESS" "${HARNESS_ARGS[@]}"
+  for numerics in "${NUMERICS_PROGRAMS[@]}"; do
+    compute-sanitizer --tool memcheck --error-exitcode=86 "$TMP/$numerics"
+  done
 fi
 
 # Experimental TMA is deliberately the final phase and a separate process.

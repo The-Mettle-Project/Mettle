@@ -17,8 +17,7 @@ mettle --gpu-info
 mettle -O --emit-ptx decode_kernels.mettle -o decode_kernels.ptx \
   --emit-kernel-decls=decode_decls.mettle --report-occupancy
 
-mettle --build --release decode_host.mettle -o decode_host.exe \
-  --link-arg "<CUDA>/lib/x64/cuda.lib"
+mettle --build --release decode_host.mettle -o decode_host.exe
 
 ./decode_host.exe
 ```

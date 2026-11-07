@@ -1,0 +1,306 @@
+import "std/io";
+import "std/mem";
+import "std/gpu";
+import "device_oracle";
+
+kernel scaled_mxfp6(a: uint8*, b: uint8*, c: float32*, d: float32*,
+                    a_scale: uint8*, b_scale: uint8*,
+                    m: uint32, n: uint32, k: uint32,
+                    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k32, a_type: e3m2, b_type: e2m3,
+                accumulator_type: f32, result_type: f32,
+                a_packing: dense_subbyte, b_packing: dense_subbyte,
+                a_scale_mode: block32, b_scale_mode: block32,
+                a_scale_type: ue8m0, b_scale_type: ue8m0,
+                a_scale: a_scale, b_scale: b_scale,
+                a_layout: row, b_layout: col,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+                a_scale_ld: 9, b_scale_ld: 11);
+}
+
+kernel scaled_mxfp4(a: uint8*, b: uint8*, c: float32*, d: float32*,
+                    a_scale: uint8*, b_scale: uint8*,
+                    m: uint32, n: uint32, k: uint32,
+                    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k64, a_type: e2m1, b_type: e2m1,
+                accumulator_type: f32, result_type: f32,
+                a_packing: dense_subbyte, b_packing: dense_subbyte,
+                a_scale_mode: block32, b_scale_mode: block32,
+                a_scale_type: ue8m0, b_scale_type: ue8m0,
+                a_scale: a_scale, b_scale: b_scale,
+                a_layout: row, b_layout: col,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+                a_scale_ld: 9, b_scale_ld: 11);
+}
+
+kernel scaled_nvfp4(a: uint8*, b: uint8*, c: float32*, d: float32*,
+                    a_scale: uint8*, b_scale: uint8*,
+                    m: uint32, n: uint32, k: uint32,
+                    lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k64, a_type: e2m1, b_type: e2m1,
+                accumulator_type: f32, result_type: f32,
+                a_packing: dense_subbyte, b_packing: dense_subbyte,
+                a_scale_mode: block16, b_scale_mode: block16,
+                a_scale_type: ue4m3, b_scale_type: ue4m3,
+                a_scale: a_scale, b_scale: b_scale,
+                a_layout: row, b_layout: col,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd,
+                a_scale_ld: 17, b_scale_ld: 19);
+}
+
+kernel scaled_mxfp8_transpose(a: uint8*, b: uint8*, c: float32*, d: float32*,
+                              a_scale: uint8*, b_scale: uint8*,
+                              m: uint32, n: uint32, k: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k32, a_type: e4m3, b_type: e5m2,
+                accumulator_type: f32, result_type: f32,
+                a_scale_mode: block32, b_scale_mode: block32,
+                a_scale_type: ue8m0, b_scale_type: ue8m0,
+                a_scale: a_scale, b_scale: b_scale,
+                a_layout: col, b_layout: row,
+                transpose_a: true, transpose_b: true,
+                lda: 131, ldb: 137, ldc: 139, ldd: 149,
+                a_scale_ld: 9, b_scale_ld: 11);
+}
+
+const S_MXFP6 = 0;
+const S_MXFP4 = 1;
+const S_NVFP4 = 2;
+const S_MXFP8_T = 3;
+
+var g_aligned: bool = false;
+
+struct Scaled {
+  m: int64;
+  n: int64;
+  k: int64;
+  lda: int64;
+  ldb: int64;
+  ldc: int64;
+  ldd: int64;
+  block_k: int64;
+  a_scale_ld: int64;
+  b_scale_ld: int64;
+  a_bits: int64;
+  b_bits: int64;
+}
+
+fn put_bits(base: uint8*, index: int64, bits: int64, value: int32) {
+  var position: int64 = index * bits;
+  for i: int64 in 0..bits {
+    var bit: int32 = (value >> (int32)i) & 1;
+    var at_byte: int64 = (position + i) / 8;
+    var shift: int32 = (int32)((position + i) % 8);
+    base[at_byte] = (uint8)(((int32)base[at_byte] & ~(1 << shift)) | (bit << shift));
+  }
+}
+
+fn encode(which: int32, v: int32, is_b: bool) -> int32 {
+  if (which == S_MXFP6 && !is_b) { return (int32)minifloat_bits(v, 3, 2, 3); }
+  if (which == S_MXFP6) { return (int32)minifloat_bits(v, 2, 3, 1); }
+  if (which == S_MXFP8_T && !is_b) { return (int32)minifloat_bits(v, 4, 3, 7); }
+  if (which == S_MXFP8_T) { return (int32)minifloat_bits(v, 5, 2, 15); }
+  return (int32)minifloat_bits(v, 2, 1, 1);
+}
+
+fn scale_code(which: int32, pick: int32) -> int32 {
+  if (which == S_NVFP4) {
+    if (pick == 0) { return 56; }
+    if (pick == 1) { return 64; }
+    if (pick == 2) { return 48; }
+    if (pick == 3) { return 60; }
+    return 68;
+  }
+  return 125 + pick;
+}
+
+fn scale_value(which: int32, code: int32) -> float64 {
+  if (which == S_NVFP4) {
+    var exponent: int32 = (code >> 3) & 15;
+    var fraction: float64 = 1.0 + (float64)(code & 7) / 8.0;
+    var v: float64 = fraction;
+    var e: int32 = exponent - 7;
+    while (e > 0) { v = v * 2.0; e = e - 1; }
+    while (e < 0) { v = v * 0.5; e = e + 1; }
+    return v;
+  }
+  var p: float64 = 1.0;
+  var e2: int32 = code - 127;
+  while (e2 > 0) { p = p * 2.0; e2 = e2 - 1; }
+  while (e2 < 0) { p = p * 0.5; e2 = e2 + 1; }
+  return p;
+}
+
+fn stride(inner: int64, bits: int64, odd: int64) -> int64 {
+  var unit: int64 = if (bits == 6) 16 else if (bits == 4) 32 else 16;
+  if (g_aligned) { return (inner + unit - 1) / unit * unit + unit; }
+  return inner + odd;
+}
+
+fn run_scaled(name: string, which: int32, s: Scaled*) -> int64 {
+  var blocks: int64 = (s->k + s->block_k - 1) / s->block_k;
+  var la: int32* = (int32*)calloc(s->m * s->k + 1, 4);
+  var lb: int32* = (int32*)calloc(s->k * s->n + 1, 4);
+  var lc: int32* = (int32*)calloc(s->m * s->n + 1, 4);
+  var sa: uint8* = (uint8*)calloc(s->m * s->a_scale_ld + 1, 1);
+  var sb: uint8* = (uint8*)calloc(s->n * s->b_scale_ld + 1, 1);
+  for i: int64 in 0..s->m * s->k { la[i] = rng_int(-4, 4); }
+  for i: int64 in 0..s->k * s->n { lb[i] = rng_int(-4, 4); }
+  for i: int64 in 0..s->m * s->n { lc[i] = rng_int(-20, 20); }
+  for i: int64 in 0..s->m * s->a_scale_ld { sa[i] = (uint8)scale_code(which, rng_int(0, 4)); }
+  for i: int64 in 0..s->n * s->b_scale_ld { sb[i] = (uint8)scale_code(which, rng_int(0, 4)); }
+
+  var transposed: bool = which == S_MXFP8_T;
+  var a_bytes: int64 = (s->m * s->lda * s->a_bits + 7) / 8 + 64;
+  var b_bytes: int64 = (s->n * s->ldb * s->b_bits + 7) / 8 + 64;
+  var ha: uint8* = (uint8*)calloc(a_bytes, 1);
+  var hb: uint8* = (uint8*)calloc(b_bytes, 1);
+  for i: int64 in 0..s->m * s->lda { put_bits(ha, i, s->a_bits, encode(which, 3, false)); }
+  for i: int64 in 0..s->n * s->ldb { put_bits(hb, i, s->b_bits, encode(which, 2, true)); }
+  for r: int64 in 0..s->m {
+    for q: int64 in 0..s->k {
+      put_bits(ha, operand_at(r, q, s->lda, transposed, transposed), s->a_bits,
+               encode(which, la[r * s->k + q], false));
+    }
+  }
+  for q: int64 in 0..s->k {
+    for c: int64 in 0..s->n {
+      put_bits(hb, operand_at(q, c, s->ldb, !transposed, transposed), s->b_bits,
+               encode(which, lb[q * s->n + c], true));
+    }
+  }
+  var hc: float32* = (float32*)malloc((s->m * s->ldc + 1) * 4);
+  var hd: float32* = (float32*)malloc((s->m * s->ldd + 1) * 4);
+  for i: int64 in 0..s->m * s->ldc + 1 { hc[i] = 5000.0; }
+  for i: int64 in 0..s->m * s->ldd + 1 { hd[i] = -77.0; }
+  for r: int64 in 0..s->m {
+    for c: int64 in 0..s->n { hc[r * s->ldc + c] = (float32)lc[r * s->n + c]; }
+  }
+
+  var da: int64 = to_gpu((rawptr)ha, a_bytes);
+  var db: int64 = to_gpu((rawptr)hb, b_bytes);
+  var dc: int64 = to_gpu((rawptr)hc, (s->m * s->ldc + 1) * 4);
+  var dd: int64 = to_gpu((rawptr)hd, (s->m * s->ldd + 1) * 4);
+  var dsa: int64 = to_gpu((rawptr)sa, s->m * s->a_scale_ld + 1);
+  var dsb: int64 = to_gpu((rawptr)sb, s->n * s->b_scale_ld + 1);
+  var gx: uint32 = (uint32)((s->n + 15) / 16);
+  var gy: uint32 = (uint32)((s->m + 15) / 16);
+  var m: uint32 = (uint32)s->m;
+  var n: uint32 = (uint32)s->n;
+  var k: uint32 = (uint32)s->k;
+  var lda: uint32 = (uint32)s->lda;
+  var ldb: uint32 = (uint32)s->ldb;
+  var ldc: uint32 = (uint32)s->ldc;
+  var ldd: uint32 = (uint32)s->ldd;
+  if (which == S_MXFP6) {
+    dispatch scaled_mxfp6[grid: (gx, gy, 1), block: (32, 1, 1)](da, db, dc, dd, dsa, dsb, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == S_MXFP4) {
+    dispatch scaled_mxfp4[grid: (gx, gy, 1), block: (32, 1, 1)](da, db, dc, dd, dsa, dsb, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == S_NVFP4) {
+    dispatch scaled_nvfp4[grid: (gx, gy, 1), block: (32, 1, 1)](da, db, dc, dd, dsa, dsb, m, n, k, lda, ldb, ldc, ldd);
+  } else {
+    dispatch scaled_mxfp8_transpose[grid: (gx, gy, 1), block: (32, 1, 1)](da, db, dc, dd, dsa, dsb, m, n, k);
+  }
+  from_gpu((rawptr)hd, dd, (s->m * s->ldd + 1) * 4);
+
+  var bad: int64 = 0;
+  for r: int64 in 0..s->m {
+    for c: int64 in 0..s->ldd {
+      var want: float64 = -77.0;
+      if (c < s->n) {
+        want = (float64)lc[r * s->n + c];
+        for q: int64 in 0..s->k {
+          var block_index: int64 = q / s->block_k;
+          var x: float64 = (float64)la[r * s->k + q] *
+                           scale_value(which, (int32)sa[r * s->a_scale_ld + block_index]);
+          var y: float64 = (float64)lb[q * s->n + c] *
+                           scale_value(which, (int32)sb[c * s->b_scale_ld + block_index]);
+          want = want + x * y;
+        }
+      }
+      if ((float64)hd[r * s->ldd + c] != want) { bad = bad + 1; }
+    }
+  }
+  if (blocks > s->a_scale_ld) { bad = bad + 1000000; }
+  gpu_free(da);
+  gpu_free(db);
+  gpu_free(dc);
+  gpu_free(dd);
+  gpu_free(dsa);
+  gpu_free(dsb);
+  free((rawptr)la);
+  free((rawptr)lb);
+  free((rawptr)lc);
+  free((rawptr)sa);
+  free((rawptr)sb);
+  free((rawptr)ha);
+  free((rawptr)hb);
+  free((rawptr)hc);
+  free((rawptr)hd);
+  var dims: string = "{s->m}x{s->n}x{s->k}";
+  var strides: string = if (which == S_MXFP8_T) "static strides" else if (g_aligned) "byte-aligned strides" else "odd strides";
+  check("{name} {dims}, {strides}", bad);
+  return bad;
+}
+
+fn scaled(which: int32, m: int64, n: int64, k: int64) -> Scaled {
+  var s: Scaled;
+  s.m = m;
+  s.n = n;
+  s.k = k;
+  s.block_k = if (which == S_NVFP4) 16 else 32;
+  s.a_scale_ld = if (which == S_NVFP4) 17 else 9;
+  s.b_scale_ld = if (which == S_NVFP4) 19 else 11;
+  s.a_bits = if (which == S_MXFP6) 6 else if (which == S_MXFP8_T) 8 else 4;
+  s.b_bits = s.a_bits;
+  if (which == S_MXFP8_T) {
+    s.lda = 131;
+    s.ldb = 137;
+    s.ldc = 139;
+    s.ldd = 149;
+  } else {
+    s.lda = stride(k, s.a_bits, 3);
+    s.ldb = stride(k, s.b_bits, 5);
+    s.ldc = n + 2;
+    s.ldd = n + 5;
+  }
+  return s;
+}
+
+fn main() -> int32 {
+  if (gpu_init() == 0) { return 99; }
+  rng_seed(9182736);
+  var sizes: int64[9];
+  sizes[0] = 19; sizes[1] = 23; sizes[2] = 70;
+  sizes[3] = 32; sizes[4] = 48; sizes[5] = 128;
+  sizes[6] = 16; sizes[7] = 16; sizes[8] = 7;
+  for pass: int64 in 0..6 {
+    var p: int64 = pass % 3;
+    g_aligned = pass >= 3;
+    var m: int64 = sizes[p * 3];
+    var n: int64 = sizes[p * 3 + 1];
+    var k: int64 = sizes[p * 3 + 2];
+    var s: Scaled = scaled(S_MXFP6, m, n, k);
+    run_scaled("tensor_matmul MXFP6 e3m2 x e2m3, UE8M0 block32", S_MXFP6, &s);
+    s = scaled(S_MXFP4, m, n, k);
+    run_scaled("tensor_matmul MXFP4 e2m1, UE8M0 block32", S_MXFP4, &s);
+    s = scaled(S_NVFP4, m, n, k);
+    run_scaled("tensor_matmul NVFP4 e2m1, UE4M3 block16", S_NVFP4, &s);
+    if (!g_aligned) {
+      s = scaled(S_MXFP8_T, m, n, k);
+      run_scaled("tensor_matmul MXFP8 e4m3 x e5m2 transposed, UE8M0 block32", S_MXFP8_T, &s);
+    }
+  }
+  return summary("scaled tensor regions on the GPU");
+}

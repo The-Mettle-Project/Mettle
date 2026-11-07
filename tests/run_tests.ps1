@@ -17604,6 +17604,8 @@ try {
   if ([regex]::Matches($matmulText,
         "mtlc\.tensor_matmul native interior runtime-K resident stable-wmma").Count -ne 5 -or
       [regex]::Matches($matmulText,
+        "mtlc\.tensor_matmul stable-wmma stride and base alignment guard").Count -ne 5 -or
+      [regex]::Matches($matmulText,
         "mtlc\.tensor_matmul cooperative-full exact M/N/K edge replay").Count -ne 5 -or
       [regex]::Matches($matmulText,
         "mtlc\.tensor_matmul cooperative-tail exact M/N/K edge replay").Count -ne 5 -or
@@ -17644,6 +17646,8 @@ try {
       [regex]::Matches($transposeText, "wmma\.mma").Count -ne 6 -or
       [regex]::Matches($transposeText, "wmma\.load\.c\.sync").Count -ne 3 -or
       [regex]::Matches($transposeText, "wmma\.store\.d\.sync").Count -ne 3 -or
+      [regex]::Matches($transposeText,
+        "mtlc\.tensor_matmul stable-wmma stride and base alignment guard").Count -ne 3 -or
       $transposeText -notmatch "mul\.lo\.u64") {
     throw "tensor_matmul transpose lost its backend-local native view or exact edge replay"
   }
@@ -22263,6 +22267,8 @@ $issueRegressions = @(
   @{ Name = "interp_realloc_and_large"; Command = @("test", "tests/issues/interp_realloc_and_large.mettle"); Refuse = @("LEAKED", "failed", "skipped"); Expect = @("3 passed") },
   @{ Name = "interp_threads"; Command = @("test", "tests/issues/interp_threads.mettle"); Refuse = @("LEAKED", "failed", "skipped"); Expect = @("4 passed") },
   @{ Name = "interp_files"; Command = @("test", "tests/issues/interp_files.mettle"); Refuse = @("LEAKED", "failed", "skipped"); Expect = @("4 passed") },
+  @{ Name = "single_build_cpu_grid"; Command = @("test", "tests/gpu/single_build.mettle"); Refuse = @("failed", "skipped"); Expect = @("1 passed") },
+  @{ Name = "err_single_build_device_call"; Command = @("--build", "tests/gpu/err_single_build_device_call.mettle", "-o", ".tmp/err_single_build.exe"); Expect = @("calls external or missing 'puts'", "did not compile for the GPU") },
   @{ Name = "lane_vectorizer"; Entry = "tests/issues/lane_vectorizer.mettle"; Args = @(); Expect = @("bad 0") },
   @{ Name = "lane_vectorizer_O"; Entry = "tests/issues/lane_vectorizer.mettle"; Args = @("-O"); Expect = @("bad 0") },
   @{ Name = "lane_vectorizer_release"; Entry = "tests/issues/lane_vectorizer.mettle"; Args = @("--release"); Expect = @("bad 0") },
@@ -22300,6 +22306,25 @@ foreach ($case in $issueRegressions) {
     $failed++
     Write-CaseResult -Name $case.Name -Passed $false -Reason $_.Exception.Message
   }
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $singleExe = Join-Path $tmpDir ("single_build" + $(if ($script:OnWindows) { ".exe" } else { "" }))
+  $buildOut = & $CompilerPath -O --build tests/gpu/single_build.mettle -o $singleExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "a host file with kernels did not build in one step: $buildOut" }
+  if ($buildOut -match "Generated PTX") { throw "the device pass printed its own banner: $buildOut" }
+  $image = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($singleExe))
+  if (-not $image.Contains(".visible .entry saxpy_offset(")) { throw "the executable carries no PTX for its kernel" }
+  if (Get-ChildItem -Path $tmpDir -Filter "*.kernels.ptx" -ErrorAction SilentlyContinue) {
+    throw "the device pass left its PTX file behind"
+  }
+  Write-CaseResult -Name "single_build_embeds_kernels" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "single_build_embeds_kernels" -Passed $false -Reason $_.Exception.Message
 }
 
 # Differential miscompile fuzzer gate. Generates UB-free programs, builds each

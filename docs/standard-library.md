@@ -853,8 +853,9 @@ var cos_fn: fn(float64) -> float64 = (fn(float64) -> float64)dl_sym(m, "cos");
 var one: float64 = cos_fn(0.0);
 ```
 
-A Linux build links no libc by default, and `dlopen` lives in libc, so build
-with `-l:libc.so.6`. macOS uses libSystem's `dlopen`, and Windows uses
+A Linux build links no libc by default. `dlopen` lives in libc, so a build
+whose object calls it links `libc.so.6` on its own. macOS uses libSystem's
+`dlopen`, and Windows uses
 `LoadLibraryA` and `GetProcAddress`, where `dl_error` gives the Win32 error
 code as text.
 
@@ -1995,7 +1996,12 @@ Device memory, streams, and launches for the [GPU targets](gpu.md). Host
 code imports it; kernels import [std/warp](#stdwarp). With the Metal provider
 it resolves to `gpu.metal.mettle`, which has the same functions.
 
-On Linux, link the CUDA driver with `-lcuda`. Nothing else is needed.
+Nothing from CUDA is linked. The first call loads the driver, `nvcuda.dll` on
+Windows and `libcuda.so.1` on Linux, and every `cu*` function keeps the
+driver's own name and signature. Without the driver, `gpu_init` reports which
+library would not load, `gpu_driver_loaded()` is false, and each `cu*` call
+returns `CUDA_ERROR_NO_DEVICE`; an entry point the installed driver lacks
+returns `CUDA_ERROR_NOT_FOUND`.
 
 Most calls return a status, 0 on success. `gpu_error_name(status)` and
 `gpu_error_text(status)` describe one.
@@ -2004,7 +2010,7 @@ Most calls return a status, 0 on success. `gpu_error_name(status)` and
 |-------|-----------|
 | Device | `gpu_init() -> int64`, `gpu_init_on(ordinal)`, `gpu_device_count`, `gpu_device_name(ordinal, buffer, capacity) -> string`, `gpu_sm_count`, `gpu_warp_size`, `gpu_total_memory`, `gpu_compute_capability`, `gpu_device_attribute`, `gpu_driver_version`, `gpu_provider_name` |
 | Kernels | `gpu_open(path: cstring) -> int32`, `gpu_open_on`, `gpu_open_kernels(stem)`, `gpu_module(image: uint8*) -> int64`, `gpu_module_file`, `gpu_func(mod, name: cstring) -> int64`, `gpu_jit_log` |
-| Memory | `gpu_malloc(bytes) -> int64`, `gpu_free`, `gpu_managed_malloc`, `gpu_host_mapped_malloc`, `gpu_to_device(dst, src, bytes)`, `gpu_to_host(dst, src, bytes)`, and `_async` forms that take a stream |
+| Memory | `gpu_malloc(bytes) -> int64`, `gpu_free`, `gpu_managed_malloc`, `gpu_host_mapped_malloc`, `gpu_to_device(dst, src, bytes)`, `gpu_to_host(dst, src, bytes)`, `gpu_memset(dst, value: uint8, bytes)`, `gpu_memset_u16(dst, value, count)`, `gpu_memset_u32(dst, value, count)`, and `_async` forms of each that take a stream |
 | Launch | `gpu_launch(f, grid, block, params: int64*, nargs) -> int32`, `gpu_launch_3d`, `gpu_launch_on`, `gpu_launch_indirect`, `gpu_launch_sync`, `gpu_sync` |
 | Streams and events | `gpu_stream_create`, `gpu_stream_sync`, `gpu_stream_destroy`, `gpu_event_create`, `gpu_event_record(event, stream)`, `gpu_event_sync`, `gpu_event_elapsed_ms(start, finish, ms_out: float32*)`, `gpu_stream_wait_event` |
 | Graphs | `gpu_graph_capture_begin(stream)`, `gpu_graph_capture_end(stream) -> int64`, `gpu_graph_launch`, `gpu_graph_destroy` |

@@ -1,0 +1,9 @@
+import "std/io";
+import "std/gpu";
+
+kernel(block = 64) speaks(a: float32*) {
+  puts("from the device");
+  a[thread.x] = 1.0;
+}
+
+fn main() -> int32 { return 0; }

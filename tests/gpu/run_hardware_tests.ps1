@@ -498,7 +498,7 @@ try {
   $tileArch = if ($GpuArch -eq "gb10") { "gb10" } elseif ($computeMajor -ge 9) { "sm_$computeMajor$($computeMinor)a" } else { $GpuArch }
   & $compiler -O --emit-ptx "--gpu-arch=$tileArch" (Join-Path $root "tests/gpu/register_tiles.mettle") -o $tilePtx
   if ($LASTEXITCODE -ne 0) { throw "register tile PTX compilation failed" }
-  & $compiler --build (Join-Path $root "tests/gpu/register_tiles_host.mettle") -o $tileHost --link-arg (Join-Path $env:CUDA_PATH "lib/x64/cuda.lib")
+  & $compiler --build (Join-Path $root "tests/gpu/register_tiles_host.mettle") -o $tileHost
   if ($LASTEXITCODE -ne 0) { throw "register tile host compilation failed" }
   & $tileHost $tilePtx
   if ($LASTEXITCODE -ne 0) { throw "register tiles on the GPU differ from the interpreter reference" }
@@ -507,7 +507,7 @@ try {
   $gridHost = Join-Path $temp "grid_runner_host.exe"
   & $compiler -O --emit-ptx "--gpu-arch=$tileArch" (Join-Path $root "tests/gpu/grid_runner.mettle") -o $gridPtx
   if ($LASTEXITCODE -ne 0) { throw "grid runner PTX compilation failed" }
-  & $compiler --build (Join-Path $root "tests/gpu/grid_runner_host.mettle") -o $gridHost --link-arg (Join-Path $env:CUDA_PATH "lib/x64/cuda.lib")
+  & $compiler --build (Join-Path $root "tests/gpu/grid_runner_host.mettle") -o $gridHost
   if ($LASTEXITCODE -ne 0) { throw "grid runner host compilation failed" }
   & $gridHost $gridPtx
   if ($LASTEXITCODE -ne 0) { throw "block-scaled int8 on the GPU differs from the CPU grid runner" }
@@ -516,10 +516,19 @@ try {
   $graphHost = Join-Path $temp "graph_handles_host.exe"
   & $compiler -O --emit-ptx "--gpu-arch=$tileArch" (Join-Path $root "tests/gpu/graph_handles.mettle") -o $graphPtx
   if ($LASTEXITCODE -ne 0) { throw "graph handle PTX compilation failed" }
-  & $compiler --build (Join-Path $root "tests/gpu/graph_handles_host.mettle") -o $graphHost --link-arg (Join-Path $env:CUDA_PATH "lib/x64/cuda.lib")
+  & $compiler --build (Join-Path $root "tests/gpu/graph_handles_host.mettle") -o $graphHost
   if ($LASTEXITCODE -ne 0) { throw "graph handle host compilation failed" }
   & $graphHost $graphPtx
   if ($LASTEXITCODE -ne 0) { throw "CUDA graph handles or the indirect-dispatch fallback failed on the GPU" }
+
+  $numericsPrograms = @("tensor_regions_device", "tensor_scaled_device", "tensor_tiles_device")
+  foreach ($numerics in $numericsPrograms) {
+    $numericsExe = Join-Path $temp "$numerics.exe"
+    & $compiler -O --build "--gpu-arch=$tileArch" (Join-Path $root "tests/gpu/$numerics.mettle") -o $numericsExe
+    if ($LASTEXITCODE -ne 0) { throw "$numerics single build failed" }
+    & $numericsExe
+    if ($LASTEXITCODE -ne 0) { throw "$numerics differs from its host oracle on the GPU" }
+  }
 
   if ($Sanitizer) {
     $computeSanitizer = Get-Command compute-sanitizer -ErrorAction SilentlyContinue
@@ -532,6 +541,10 @@ try {
     & $computeSanitizer.Source --tool racecheck --error-exitcode=87 `
       $harness @harnessArgs
     if ($LASTEXITCODE -ne 0) { throw "compute-sanitizer racecheck failed" }
+    foreach ($numerics in $numericsPrograms) {
+      & $computeSanitizer.Source --tool memcheck --error-exitcode=86 (Join-Path $temp "$numerics.exe")
+      if ($LASTEXITCODE -ne 0) { throw "compute-sanitizer memcheck failed on $numerics" }
+    }
   }
 
   # Experimental TMA is deliberately the final phase and a separate process.

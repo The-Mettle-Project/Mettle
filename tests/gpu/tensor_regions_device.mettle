@@ -1,0 +1,429 @@
+import "std/io";
+import "std/mem";
+import "std/gpu";
+import "device_oracle";
+
+kernel region_f16(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                  m: uint32, n: uint32, k: uint32,
+                  lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k16, input_type: f16, output_type: f32,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+var g_aligned: bool = false;
+
+kernel region_f16_ta(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                     m: uint32, n: uint32, k: uint32,
+                     lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k16, input_type: f16, output_type: f32,
+                a_layout: row, b_layout: col, transpose_a: true,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel region_f16_tb(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                     m: uint32, n: uint32, k: uint32,
+                     lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k16, input_type: f16, output_type: f32,
+                a_layout: col, b_layout: col, transpose_b: true,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel region_bf16(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                   m: uint32, n: uint32, k: uint32,
+                   lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k16, input_type: bf16, output_type: f32,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel region_f64(a: float64*, b: float64*, c: float64*, d: float64*,
+                  m: uint32, n: uint32, k: uint32,
+                  lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)8;
+  var column: uint32 = (uint32)block.x * (uint32)8;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m8n8k4, input_type: f64, output_type: f64,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel region_f64_tab(a: float64*, b: float64*, c: float64*, d: float64*,
+                      m: uint32, n: uint32, k: uint32,
+                      lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)8;
+  var column: uint32 = (uint32)block.x * (uint32)8;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m8n8k4, input_type: f64, output_type: f64,
+                a_layout: col, b_layout: row,
+                transpose_a: true, transpose_b: true,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel region_i8(a: int8*, b: int8*, c: int32*, d: int32*,
+                 m: uint32, n: uint32, k: uint32,
+                 lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k16, input_type: i8, output_type: i32,
+                overflow: wrap, lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel region_fp8(a: uint8*, b: uint8*, c: float32*, d: float32*,
+                  m: uint32, n: uint32, k: uint32,
+                  lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k32, a_type: e4m3, b_type: e5m2,
+                accumulator_type: f32, result_type: f32,
+                a_layout: row, b_layout: col,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel region_sparse_f16(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                         metadata: uint8*, m: uint32, n: uint32, k: uint32,
+                         lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k16, input_type: f16, output_type: f32,
+                a_layout: row, b_layout: col,
+                sparsity: structured_2_to_4, metadata: metadata,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+kernel region_sparse_bf16_ta(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                             metadata: uint8*, m: uint32, n: uint32, k: uint32,
+                             lda: uint32, ldb: uint32, ldc: uint32, ldd: uint32) {
+  var row: uint32 = (uint32)block.y * (uint32)16;
+  var column: uint32 = (uint32)block.x * (uint32)16;
+  tensor_matmul(a, b, c, d, row, column, m, n, k,
+                shape: m16n16k16, input_type: bf16, output_type: f32,
+                a_layout: col, b_layout: col, transpose_a: true,
+                sparsity: structured_2_to_4, metadata: metadata,
+                lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+}
+
+const KIND_F16 = 0;
+const KIND_BF16 = 1;
+const KIND_F64 = 2;
+const KIND_I8 = 3;
+const KIND_FP8 = 4;
+
+const W_F16 = 0;
+const W_F16_TA = 1;
+const W_F16_TB = 2;
+const W_BF16 = 3;
+const W_F64 = 4;
+const W_F64_TAB = 5;
+const W_I8 = 6;
+const W_FP8 = 7;
+const W_SPARSE_F16 = 8;
+const W_SPARSE_BF16_TA = 9;
+
+struct Region {
+  m: int64;
+  n: int64;
+  k: int64;
+  stored_k: int64;
+  a_col: bool;
+  b_col: bool;
+  ta: bool;
+  tb: bool;
+  tile: int64;
+  lda: int64;
+  ldb: int64;
+  ldc: int64;
+  ldd: int64;
+  a_elements: int64;
+  b_elements: int64;
+}
+
+fn operand_bytes(kind: int32) -> int64 {
+  if (kind == KIND_F16 || kind == KIND_BF16) { return 2; }
+  if (kind == KIND_F64) { return 8; }
+  return 1;
+}
+
+fn accumulator_bytes(kind: int32) -> int64 {
+  if (kind == KIND_F64) { return 8; }
+  return 4;
+}
+
+fn operand_span(kind: int32) -> int32 {
+  if (kind == KIND_F64) { return 5; }
+  if (kind == KIND_I8) { return 8; }
+  if (kind == KIND_FP8) { return 4; }
+  return 3;
+}
+
+fn put_operand(kind: int32, base: uint8*, index: int64, v: int32, is_b: bool) {
+  if (kind == KIND_F16) { ((uint16*)base)[index] = half_bits(v); }
+  else if (kind == KIND_BF16) { ((uint16*)base)[index] = bf16_bits(v); }
+  else if (kind == KIND_F64) { ((float64*)base)[index] = (float64)v; }
+  else if (kind == KIND_I8) { ((int8*)base)[index] = (int8)v; }
+  else if (is_b) { base[index] = minifloat_bits(v, 5, 2, 15); }
+  else { base[index] = minifloat_bits(v, 4, 3, 7); }
+}
+
+fn put_accumulator(kind: int32, base: uint8*, index: int64, v: int64) {
+  if (kind == KIND_F64) { ((float64*)base)[index] = (float64)v; }
+  else if (kind == KIND_I8) { ((int32*)base)[index] = (int32)v; }
+  else { ((float32*)base)[index] = (float32)v; }
+}
+
+fn accumulator_is(kind: int32, base: uint8*, index: int64, v: int64) -> bool {
+  if (kind == KIND_F64) { return ((float64*)base)[index] == (float64)v; }
+  if (kind == KIND_I8) { return ((int32*)base)[index] == (int32)v; }
+  return ((float32*)base)[index] == (float32)v;
+}
+
+fn padded(inner: int64, unit: int64, odd: int64) -> int64 {
+  if (g_aligned) { return (inner + unit - 1) / unit * unit + unit; }
+  return inner + odd;
+}
+
+fn region_layout(r: Region*, kind: int32) {
+  var a_rows: int64 = if (r->ta) r->stored_k else r->m;
+  var a_cols: int64 = if (r->ta) r->m else r->stored_k;
+  var b_rows: int64 = if (r->tb) r->n else r->k;
+  var b_cols: int64 = if (r->tb) r->k else r->n;
+  var a_inner: int64 = if (r->a_col) a_rows else a_cols;
+  var b_inner: int64 = if (r->b_col) b_rows else b_cols;
+  var operand_unit: int64 = 16 / operand_bytes(kind);
+  var accumulator_unit: int64 = 16 / accumulator_bytes(kind);
+  r->lda = padded(a_inner, operand_unit, 3);
+  r->ldb = padded(b_inner, operand_unit, 5);
+  r->ldc = padded(r->n, accumulator_unit, 2);
+  r->ldd = padded(r->n, accumulator_unit, 5) + accumulator_unit;
+  r->a_elements = (if (r->a_col) a_cols else a_rows) * r->lda + 1;
+  r->b_elements = (if (r->b_col) b_cols else b_rows) * r->ldb + 1;
+}
+
+fn launch(which: int32, r: Region*, a: int64, b: int64, c: int64, d: int64,
+          metadata: int64) {
+  var gx: uint32 = (uint32)((r->n + r->tile - 1) / r->tile);
+  var gy: uint32 = (uint32)((r->m + r->tile - 1) / r->tile);
+  if (gx == (uint32)0) { gx = (uint32)1; }
+  if (gy == (uint32)0) { gy = (uint32)1; }
+  var m: uint32 = (uint32)r->m;
+  var n: uint32 = (uint32)r->n;
+  var k: uint32 = (uint32)r->k;
+  var lda: uint32 = (uint32)r->lda;
+  var ldb: uint32 = (uint32)r->ldb;
+  var ldc: uint32 = (uint32)r->ldc;
+  var ldd: uint32 = (uint32)r->ldd;
+  if (which == W_F16) {
+    dispatch region_f16[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == W_F16_TA) {
+    dispatch region_f16_ta[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == W_F16_TB) {
+    dispatch region_f16_tb[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == W_BF16) {
+    dispatch region_bf16[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == W_F64) {
+    dispatch region_f64[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == W_F64_TAB) {
+    dispatch region_f64_tab[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == W_I8) {
+    dispatch region_i8[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == W_FP8) {
+    dispatch region_fp8[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, m, n, k, lda, ldb, ldc, ldd);
+  } else if (which == W_SPARSE_F16) {
+    dispatch region_sparse_f16[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, metadata, m, n, k, lda, ldb, ldc, ldd);
+  } else {
+    dispatch region_sparse_bf16_ta[grid: (gx, gy, 1), block: (32, 1, 1)](a, b, c, d, metadata, m, n, k, lda, ldb, ldc, ldd);
+  }
+}
+
+fn sparse_mask() -> int32 {
+  var choice: int32 = rng_int(0, 5);
+  if (choice == 0) { return 3; }
+  if (choice == 1) { return 5; }
+  if (choice == 2) { return 6; }
+  if (choice == 3) { return 9; }
+  if (choice == 4) { return 10; }
+  return 12;
+}
+
+fn run_region(name: string, which: int32, kind: int32, sparse: bool,
+              r: Region*) -> int64 {
+  var groups: int64 = (r->k + 3) / 4;
+  r->stored_k = if (sparse) groups * 2 else r->k;
+  region_layout(r, kind);
+  var la: int32* = (int32*)calloc(r->m * (groups * 4 + 1) + 1, 4);
+  var lb: int32* = (int32*)calloc(r->k * r->n + 1, 4);
+  var lc: int32* = (int32*)calloc(r->m * r->n + 1, 4);
+  var masks: uint8* = (uint8*)calloc(r->m * groups + 1, 1);
+  var width: int64 = groups * 4;
+  var span: int32 = operand_span(kind);
+  for row: int64 in 0..r->m {
+    for q: int64 in 0..width {
+      la[row * width + q] = if (sparse) 0 else rng_int(-span, span);
+    }
+    if (sparse) {
+      for g: int64 in 0..groups {
+        var mask: int32 = sparse_mask();
+        masks[row * groups + g] = (uint8)mask;
+        for bit: int64 in 0..4 {
+          if (((mask >> (int32)bit) & 1) != 0) {
+            la[row * width + g * 4 + bit] = rng_int(-span, span);
+          }
+        }
+      }
+    }
+  }
+  for q: int64 in 0..r->k {
+    for column: int64 in 0..r->n { lb[q * r->n + column] = rng_int(-span, span); }
+  }
+  for row: int64 in 0..r->m {
+    for column: int64 in 0..r->n { lc[row * r->n + column] = rng_int(-20, 20); }
+  }
+
+  var esz: int64 = operand_bytes(kind);
+  var asz: int64 = accumulator_bytes(kind);
+  var ha: uint8* = (uint8*)malloc(r->a_elements * esz);
+  var hb: uint8* = (uint8*)malloc(r->b_elements * esz);
+  var hc: uint8* = (uint8*)malloc((r->m * r->ldc + 1) * asz);
+  var hd: uint8* = (uint8*)malloc((r->m * r->ldd + 1) * asz);
+  for i: int64 in 0..r->a_elements { put_operand(kind, ha, i, 15, false); }
+  for i: int64 in 0..r->b_elements { put_operand(kind, hb, i, 12, true); }
+  for i: int64 in 0..r->m * r->ldc + 1 { put_accumulator(kind, hc, i, 5000); }
+  for i: int64 in 0..r->m * r->ldd + 1 { put_accumulator(kind, hd, i, -77); }
+  for row: int64 in 0..r->m {
+    if (sparse) {
+      for g: int64 in 0..groups {
+        var mask: int32 = (int32)masks[row * groups + g];
+        var slot: int64 = g * 2;
+        for bit: int64 in 0..4 {
+          if (((mask >> (int32)bit) & 1) != 0) {
+            put_operand(kind, ha, operand_at(row, slot, r->lda, r->a_col, r->ta),
+                        la[row * width + g * 4 + bit], false);
+            slot = slot + 1;
+          }
+        }
+      }
+    } else {
+      for q: int64 in 0..r->k {
+        put_operand(kind, ha, operand_at(row, q, r->lda, r->a_col, r->ta),
+                    la[row * width + q], false);
+      }
+    }
+  }
+  for q: int64 in 0..r->k {
+    for column: int64 in 0..r->n {
+      put_operand(kind, hb, operand_at(q, column, r->ldb, r->b_col, r->tb),
+                  lb[q * r->n + column], true);
+    }
+  }
+  for row: int64 in 0..r->m {
+    for column: int64 in 0..r->n {
+      put_accumulator(kind, hc, row * r->ldc + column, (int64)lc[row * r->n + column]);
+    }
+  }
+
+  var da: int64 = to_gpu((rawptr)ha, r->a_elements * esz);
+  var db: int64 = to_gpu((rawptr)hb, r->b_elements * esz);
+  var dc: int64 = to_gpu((rawptr)hc, (r->m * r->ldc + 1) * asz);
+  var dd: int64 = to_gpu((rawptr)hd, (r->m * r->ldd + 1) * asz);
+  var dm: int64 = to_gpu((rawptr)masks, r->m * groups + 1);
+  launch(which, r, da, db, dc, dd, dm);
+  from_gpu((rawptr)hd, dd, (r->m * r->ldd + 1) * asz);
+
+  var bad: int64 = 0;
+  for row: int64 in 0..r->m {
+    for column: int64 in 0..r->ldd {
+      var want: int64 = -77;
+      if (column < r->n) {
+        want = (int64)lc[row * r->n + column];
+        for q: int64 in 0..r->k {
+          want = want + (int64)la[row * width + q] * (int64)lb[q * r->n + column];
+        }
+      }
+      if (!accumulator_is(kind, hd, row * r->ldd + column, want)) { bad = bad + 1; }
+    }
+  }
+  if (!accumulator_is(kind, hd, r->m * r->ldd, -77)) { bad = bad + 1; }
+  gpu_free(da);
+  gpu_free(db);
+  gpu_free(dc);
+  gpu_free(dd);
+  gpu_free(dm);
+  free((rawptr)la);
+  free((rawptr)lb);
+  free((rawptr)lc);
+  free((rawptr)masks);
+  free((rawptr)ha);
+  free((rawptr)hb);
+  free((rawptr)hc);
+  free((rawptr)hd);
+  var dims: string = "{r->m}x{r->n}x{r->k}";
+  var strides: string = if (g_aligned) "16-byte strides" else "odd strides";
+  check("{name} {dims}, {strides}", bad);
+  return bad;
+}
+
+fn region(m: int64, n: int64, k: int64, tile: int64, a_col: bool, b_col: bool,
+          ta: bool, tb: bool) -> Region {
+  var r: Region;
+  r.m = m;
+  r.n = n;
+  r.k = k;
+  r.tile = tile;
+  r.a_col = a_col;
+  r.b_col = b_col;
+  r.ta = ta;
+  r.tb = tb;
+  return r;
+}
+
+fn main() -> int32 {
+  if (gpu_init() == 0) { return 99; }
+  rng_seed(20261107);
+  var shapes: int64[15];
+  shapes[0] = 19; shapes[1] = 23; shapes[2] = 21;
+  shapes[3] = 32; shapes[4] = 48; shapes[5] = 64;
+  shapes[6] = 16; shapes[7] = 16; shapes[8] = 7;
+  shapes[9] = 37; shapes[10] = 29; shapes[11] = 70;
+  shapes[12] = 16; shapes[13] = 16; shapes[14] = 0;
+  for pass: int64 in 0..10 {
+    var s: int64 = pass % 5;
+    g_aligned = pass >= 5;
+    var m: int64 = shapes[s * 3];
+    var n: int64 = shapes[s * 3 + 1];
+    var k: int64 = shapes[s * 3 + 2];
+    var r: Region = region(m, n, k, 16, false, true, false, false);
+    run_region("tensor_matmul f16 to f32", W_F16, KIND_F16, false, &r);
+    if (k == 0) { continue; }
+    r = region(m, n, k, 16, false, true, true, false);
+    run_region("tensor_matmul f16 transpose_a", W_F16_TA, KIND_F16, false, &r);
+    r = region(m, n, k, 16, true, true, false, true);
+    run_region("tensor_matmul f16 transpose_b", W_F16_TB, KIND_F16, false, &r);
+    r = region(m, n, k, 16, false, true, false, false);
+    run_region("tensor_matmul bf16 to f32", W_BF16, KIND_BF16, false, &r);
+    r = region(m, n, k, 8, false, true, false, false);
+    run_region("tensor_matmul f64", W_F64, KIND_F64, false, &r);
+    r = region(m, n, k, 8, true, false, true, true);
+    run_region("tensor_matmul f64 transpose_a transpose_b", W_F64_TAB, KIND_F64, false, &r);
+    r = region(m, n, k, 16, false, true, false, false);
+    run_region("tensor_matmul i8 to i32", W_I8, KIND_I8, false, &r);
+    r = region(m, n, k, 16, false, true, false, false);
+    run_region("tensor_matmul e4m3 x e5m2 to f32", W_FP8, KIND_FP8, false, &r);
+    r = region(m, n, k, 16, false, true, false, false);
+    run_region("tensor_matmul 2:4 sparse f16", W_SPARSE_F16, KIND_F16, true, &r);
+    r = region(m, n, k, 16, true, true, true, false);
+    run_region("tensor_matmul 2:4 sparse bf16 transpose_a", W_SPARSE_BF16_TA, KIND_BF16, true, &r);
+  }
+  return summary("bounded tensor regions on the GPU");
+}

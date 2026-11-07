@@ -1,0 +1,488 @@
+import "std/io";
+import "std/mem";
+import "std/gpu";
+import "device_oracle";
+
+kernel tile_bf16(a: uint16*, b: uint16*, c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, m: 32, n: 8, k: 16, input_type: bf16, output_type: f32,
+             a_layout: col, b_layout: row, d_layout: col,
+             lda: 32, ldb: 8, ldc: 8, ldd: 32);
+}
+
+kernel tile_tf32(a: float32*, b: float32*, c: float32*, d: float32*) {
+  tensor_mma(a, b, c, d, shape: m16n16k8, input_type: tf32, output_type: f32);
+}
+
+kernel tile_f64(a: float64*, b: float64*, c: float64*, d: float64*) {
+  tensor_mma(a, b, c, d, shape: m8n8k4, input_type: f64, output_type: f64,
+             rounding: nearest_even);
+}
+
+kernel tile_i8_saturate(a: int8*, b: int8*, c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: i8, output_type: i32,
+             overflow: saturate_finite);
+}
+
+kernel tile_u8_saturate(a: uint8*, b: uint8*, c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m32n32k16, input_type: u8, output_type: i32,
+             overflow: saturate_finite);
+}
+
+kernel tile_u4(a: uint8*, b: uint8*, c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m8n8k32, input_type: u4, output_type: i32);
+}
+
+kernel tile_i4(a: uint8*, b: uint8*, c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m8n8k32, input_type: i4, output_type: i32);
+}
+
+kernel tile_b1_xor(a: uint8*, b: uint8*, c: int32*, d: int32*) {
+  tensor_mma(a, b, c, d, shape: m8n8k128, input_type: b1, output_type: i32,
+             math: xor_popcount);
+}
+
+kernel tile_sparse_f16(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                       metadata: uint8*) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: 8, ldb: 16, ldc: 16, ldd: 16,
+             sparsity: structured_2_to_4, metadata: metadata);
+}
+
+kernel tile_sparse_bf16(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                        metadata: uint8*) {
+  tensor_mma(a, b, c, d, shape: m16n16k16, input_type: bf16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             sparsity: structured_2_to_4, metadata: metadata);
+}
+
+kernel epilogue_f32_column_relu(d: float32*, bias: float32*, alpha: float32,
+                                beta: float32) {
+  tensor_epilogue(d, shape: m32n16, element_type: f32,
+                  bias_mode: column, bias: bias,
+                  alpha: alpha, beta: beta, activation: relu);
+}
+
+kernel epilogue_f32_matrix_clamp(d: float32*, bias: float32*, alpha: float32,
+                                 beta: float32, minimum: float32,
+                                 maximum: float32, ldd: int32, ldbias: uint64) {
+  tensor_epilogue(d, m: 19, n: 37, element_type: f32,
+                  layout: col, ldd: ldd,
+                  bias_mode: matrix, bias: bias,
+                  bias_layout: row, ldbias: ldbias,
+                  alpha: alpha, beta: beta,
+                  activation: clamp, clamp_min: minimum, clamp_max: maximum,
+                  scope: workgroup);
+}
+
+kernel epilogue_f64_row(d: float64*, bias: float64*, beta: float64) {
+  tensor_epilogue(d, shape: m8n13, element_type: f64,
+                  bias_mode: row, bias: bias, beta: beta,
+                  activation: identity);
+}
+
+kernel epilogue_f16_identity(d: uint16*) {
+  tensor_epilogue(d, shape: m16n16, element_type: f16);
+}
+
+kernel epilogue_bf16_column_relu(d: uint16*, bias: uint16*) {
+  tensor_epilogue(d, shape: m16n32, element_type: bf16,
+                  layout: col, bias_mode: column, bias: bias,
+                  activation: relu);
+}
+
+const T_BF16 = 0;
+const T_TF32 = 1;
+const T_F64 = 2;
+const T_I8 = 3;
+const T_U8 = 4;
+const T_U4 = 5;
+const T_I4 = 6;
+const T_B1 = 7;
+const T_SPARSE_F16 = 8;
+const T_SPARSE_BF16 = 9;
+
+struct Tile {
+  m: int64;
+  n: int64;
+  k: int64;
+  a_col: bool;
+  b_col: bool;
+  d_col: bool;
+  lda: int64;
+  ldb: int64;
+  ldc: int64;
+  ldd: int64;
+  lo: int32;
+  hi: int32;
+  saturate: bool;
+  sparse: bool;
+}
+
+fn tile_operand_bits(which: int32) -> int64 {
+  if (which == T_TF32) { return 32; }
+  if (which == T_F64) { return 64; }
+  if (which == T_I8 || which == T_U8) { return 8; }
+  if (which == T_U4 || which == T_I4) { return 4; }
+  if (which == T_B1) { return 1; }
+  return 16;
+}
+
+fn tile_accumulator_bytes(which: int32) -> int64 {
+  if (which == T_F64) { return 8; }
+  return 4;
+}
+
+fn tile_integer(which: int32) -> bool {
+  return which >= T_I8 && which <= T_B1;
+}
+
+fn put_tile_operand(which: int32, base: uint8*, index: int64, v: int32) {
+  if (which == T_BF16 || which == T_SPARSE_BF16) { ((uint16*)base)[index] = bf16_bits(v); }
+  else if (which == T_SPARSE_F16) { ((uint16*)base)[index] = half_bits(v); }
+  else if (which == T_TF32) { ((float32*)base)[index] = (float32)v; }
+  else if (which == T_F64) { ((float64*)base)[index] = (float64)v; }
+  else if (which == T_I8 || which == T_U8) { base[index] = (uint8)v; }
+  else if (which == T_U4 || which == T_I4) {
+    var shift: int32 = (int32)(index % 2) * 4;
+    var byte: int32 = (int32)base[index / 2] & ~(0xF << shift);
+    base[index / 2] = (uint8)(byte | ((v & 0xF) << shift));
+  } else {
+    var bit: int32 = (int32)(index % 8);
+    var cell: int32 = (int32)base[index / 8] & ~(1 << bit);
+    base[index / 8] = (uint8)(cell | ((v & 1) << bit));
+  }
+}
+
+fn put_tile_accumulator(which: int32, base: uint8*, index: int64, v: int64) {
+  if (which == T_F64) { ((float64*)base)[index] = (float64)v; }
+  else if (tile_integer(which)) { ((int32*)base)[index] = (int32)v; }
+  else { ((float32*)base)[index] = (float32)v; }
+}
+
+fn tile_accumulator_is(which: int32, base: uint8*, index: int64, v: int64) -> bool {
+  if (which == T_F64) { return ((float64*)base)[index] == (float64)v; }
+  if (tile_integer(which)) { return ((int32*)base)[index] == (int32)v; }
+  return ((float32*)base)[index] == (float32)v;
+}
+
+fn launch_tile(which: int32, a: int64, b: int64, c: int64, d: int64, meta: int64) {
+  if (which == T_BF16) { dispatch tile_bf16[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d); }
+  else if (which == T_TF32) { dispatch tile_tf32[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d); }
+  else if (which == T_F64) { dispatch tile_f64[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d); }
+  else if (which == T_I8) { dispatch tile_i8_saturate[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d); }
+  else if (which == T_U8) { dispatch tile_u8_saturate[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d); }
+  else if (which == T_U4) { dispatch tile_u4[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d); }
+  else if (which == T_I4) { dispatch tile_i4[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d); }
+  else if (which == T_B1) { dispatch tile_b1_xor[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d); }
+  else if (which == T_SPARSE_F16) { dispatch tile_sparse_f16[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d, meta); }
+  else { dispatch tile_sparse_bf16[grid: (1, 1, 1), block: (32, 1, 1)](a, b, c, d, meta); }
+}
+
+fn pick_mask() -> int32 {
+  var choice: int32 = rng_int(0, 5);
+  if (choice == 0) { return 3; }
+  if (choice == 1) { return 5; }
+  if (choice == 2) { return 6; }
+  if (choice == 3) { return 9; }
+  if (choice == 4) { return 10; }
+  return 12;
+}
+
+fn run_tile(name: string, which: int32, t: Tile*) -> int64 {
+  var la: int32* = (int32*)calloc(t->m * t->k, 4);
+  var lb: int32* = (int32*)calloc(t->k * t->n, 4);
+  var lc: int64* = (int64*)calloc(t->m * t->n, 8);
+  var groups: int64 = t->k / 4;
+  var masks: uint8* = (uint8*)calloc(t->m * groups + 1, 1);
+  var stored_k: int64 = if (t->sparse) t->k / 2 else t->k;
+  for r: int64 in 0..t->m {
+    if (t->sparse) {
+      for g: int64 in 0..groups {
+        var mask: int32 = pick_mask();
+        masks[r * groups + g] = (uint8)mask;
+        for bit: int64 in 0..4 {
+          if (((mask >> (int32)bit) & 1) != 0) {
+            la[r * t->k + g * 4 + bit] = rng_int(t->lo, t->hi);
+          }
+        }
+      }
+    } else {
+      for q: int64 in 0..t->k { la[r * t->k + q] = rng_int(t->lo, t->hi); }
+    }
+  }
+  for q: int64 in 0..t->k {
+    for c: int64 in 0..t->n { lb[q * t->n + c] = rng_int(t->lo, t->hi); }
+  }
+  for r: int64 in 0..t->m {
+    for c: int64 in 0..t->n {
+      var base: int64 = (int64)rng_int(-20, 20);
+      if (t->saturate) {
+        base = if (rng_int(0, 1) == 0) 2147483600 + (int64)rng_int(0, 40)
+               else -2147483600 - (int64)rng_int(0, 40);
+      }
+      lc[r * t->n + c] = base;
+    }
+  }
+
+  var bits: int64 = tile_operand_bits(which);
+  var a_extent: int64 = (if (t->a_col) stored_k else t->m) * t->lda;
+  var b_extent: int64 = (if (t->b_col) t->n else t->k) * t->ldb;
+  var a_bytes: int64 = (a_extent * bits + 7) / 8 + 16;
+  var b_bytes: int64 = (b_extent * bits + 7) / 8 + 16;
+  var acc: int64 = tile_accumulator_bytes(which);
+  var c_bytes: int64 = t->m * t->n * acc + 64;
+  var d_bytes: int64 = t->m * t->n * acc + 64;
+  var ha: uint8* = (uint8*)calloc(a_bytes, 1);
+  var hb: uint8* = (uint8*)calloc(b_bytes, 1);
+  var hc: uint8* = (uint8*)calloc(c_bytes, 1);
+  var hd: uint8* = (uint8*)calloc(d_bytes, 1);
+  for r: int64 in 0..t->m {
+    var slot: int64 = 0;
+    for q: int64 in 0..t->k {
+      if (t->sparse) {
+        var mask: int32 = (int32)masks[r * groups + q / 4];
+        if (((mask >> (int32)(q % 4)) & 1) != 0) {
+          put_tile_operand(which, ha, at(r, slot, t->lda, t->a_col), la[r * t->k + q]);
+          slot = slot + 1;
+        }
+      } else {
+        put_tile_operand(which, ha, at(r, q, t->lda, t->a_col), la[r * t->k + q]);
+      }
+    }
+  }
+  for q: int64 in 0..t->k {
+    for c: int64 in 0..t->n {
+      put_tile_operand(which, hb, at(q, c, t->ldb, t->b_col), lb[q * t->n + c]);
+    }
+  }
+  for r: int64 in 0..t->m {
+    for c: int64 in 0..t->n {
+      put_tile_accumulator(which, hc, at(r, c, t->ldc, false), lc[r * t->n + c]);
+      put_tile_accumulator(which, hd, at(r, c, t->ldd, t->d_col), -77);
+    }
+  }
+  var da: int64 = to_gpu((rawptr)ha, a_bytes);
+  var db: int64 = to_gpu((rawptr)hb, b_bytes);
+  var dc: int64 = to_gpu((rawptr)hc, c_bytes);
+  var dd: int64 = to_gpu((rawptr)hd, d_bytes);
+  var dm: int64 = to_gpu((rawptr)masks, t->m * groups + 1);
+  launch_tile(which, da, db, dc, dd, dm);
+  from_gpu((rawptr)hd, dd, d_bytes);
+
+  var bad: int64 = 0;
+  for r: int64 in 0..t->m {
+    for c: int64 in 0..t->n {
+      var want: int64 = lc[r * t->n + c];
+      for q: int64 in 0..t->k {
+        var x: int64 = (int64)la[r * t->k + q];
+        var y: int64 = (int64)lb[q * t->n + c];
+        if (which == T_B1) { want = want + ((x ^ y) & 1); }
+        else { want = want + x * y; }
+      }
+      if (t->saturate && want > 2147483647) { want = 2147483647; }
+      if (t->saturate && want < -2147483648) { want = -2147483648; }
+      if (!tile_accumulator_is(which, hd, at(r, c, t->ldd, t->d_col), want)) { bad = bad + 1; }
+    }
+  }
+  gpu_free(da);
+  gpu_free(db);
+  gpu_free(dc);
+  gpu_free(dd);
+  gpu_free(dm);
+  free((rawptr)la);
+  free((rawptr)lb);
+  free((rawptr)lc);
+  free((rawptr)masks);
+  free((rawptr)ha);
+  free((rawptr)hb);
+  free((rawptr)hc);
+  free((rawptr)hd);
+  check(name, bad);
+  return bad;
+}
+
+fn tile(m: int64, n: int64, k: int64, a_col: bool, b_col: bool, d_col: bool,
+        lo: int32, hi: int32) -> Tile {
+  var t: Tile;
+  t.m = m;
+  t.n = n;
+  t.k = k;
+  t.a_col = a_col;
+  t.b_col = b_col;
+  t.d_col = d_col;
+  t.lda = if (a_col) m else k;
+  t.ldb = if (b_col) k else n;
+  t.ldc = n;
+  t.ldd = if (d_col) m else n;
+  t.lo = lo;
+  t.hi = hi;
+  t.saturate = false;
+  t.sparse = false;
+  return t;
+}
+
+fn relu(x: float32) -> float32 {
+  if (x < 0.0) { return 0.0; }
+  return x;
+}
+
+fn clamped(x: float32, low: float32, high: float32) -> float32 {
+  var v: float32 = x;
+  if (v < low) { v = low; }
+  if (v > high) { v = high; }
+  return v;
+}
+
+fn run_epilogues() {
+  var d: float32* = (float32*)malloc(32 * 16 * 4);
+  var want: float32* = (float32*)malloc(32 * 16 * 4);
+  var bias: float32* = (float32*)malloc(16 * 4);
+  for c: int64 in 0..16 { bias[c] = (float32)rng_int(-5, 5); }
+  for i: int64 in 0..32 * 16 {
+    d[i] = (float32)rng_int(-10, 10);
+    want[i] = relu(0.5 * d[i] + 2.0 * bias[i % 16]);
+  }
+  var dd: int64 = to_gpu((rawptr)d, 32 * 16 * 4);
+  var db: int64 = to_gpu((rawptr)bias, 16 * 4);
+  dispatch epilogue_f32_column_relu[grid: (1, 1, 1), block: (32, 1, 1)](dd, db, 0.5, 2.0);
+  from_gpu((rawptr)d, dd, 32 * 16 * 4);
+  var bad: int64 = 0;
+  for i: int64 in 0..32 * 16 { if (d[i] != want[i]) { bad = bad + 1; } }
+  check("tensor_epilogue f32 column bias, alpha, beta, relu", bad);
+  gpu_free(dd);
+  gpu_free(db);
+
+  var ldd: int64 = 23;
+  var ldbias: int64 = 41;
+  var dm: float32* = (float32*)malloc(37 * ldd * 4);
+  var wm: float32* = (float32*)malloc(37 * ldd * 4);
+  var bm: float32* = (float32*)malloc(19 * ldbias * 4);
+  for i: int64 in 0..19 * ldbias { bm[i] = (float32)rng_int(-6, 6); }
+  for i: int64 in 0..37 * ldd { dm[i] = -77.0; wm[i] = -77.0; }
+  for r: int64 in 0..19 {
+    for c: int64 in 0..37 {
+      var v: float32 = (float32)rng_int(-8, 8);
+      dm[c * ldd + r] = v;
+      wm[c * ldd + r] = clamped(1.5 * v + -0.5 * bm[r * ldbias + c], -4.0, 6.0);
+    }
+  }
+  dd = to_gpu((rawptr)dm, 37 * ldd * 4);
+  db = to_gpu((rawptr)bm, 19 * ldbias * 4);
+  dispatch epilogue_f32_matrix_clamp[grid: (1, 1, 1), block: (64, 1, 1)](
+      dd, db, 1.5, -0.5, -4.0, 6.0, (int32)ldd, (uint64)ldbias);
+  from_gpu((rawptr)dm, dd, 37 * ldd * 4);
+  bad = 0;
+  for i: int64 in 0..37 * ldd { if (dm[i] != wm[i]) { bad = bad + 1; } }
+  check("tensor_epilogue f32 19x37 column-major, row-major matrix bias, clamp, workgroup", bad);
+  gpu_free(dd);
+  gpu_free(db);
+
+  var d64: float64* = (float64*)malloc(8 * 13 * 8);
+  var w64: float64* = (float64*)malloc(8 * 13 * 8);
+  var b64: float64* = (float64*)malloc(8 * 8);
+  for r: int64 in 0..8 { b64[r] = (float64)rng_int(-9, 9); }
+  for i: int64 in 0..8 * 13 {
+    d64[i] = (float64)rng_int(-30, 30);
+    w64[i] = d64[i] + -1.5 * b64[i / 13];
+  }
+  dd = to_gpu((rawptr)d64, 8 * 13 * 8);
+  db = to_gpu((rawptr)b64, 8 * 8);
+  dispatch epilogue_f64_row[grid: (1, 1, 1), block: (32, 1, 1)](dd, db, -1.5);
+  from_gpu((rawptr)d64, dd, 8 * 13 * 8);
+  bad = 0;
+  for i: int64 in 0..8 * 13 { if (d64[i] != w64[i]) { bad = bad + 1; } }
+  check("tensor_epilogue f64 8x13 row bias, beta", bad);
+  gpu_free(dd);
+  gpu_free(db);
+
+  var h16: uint16* = (uint16*)malloc(16 * 16 * 2);
+  var k16: uint16* = (uint16*)malloc(16 * 16 * 2);
+  for i: int64 in 0..16 * 16 { h16[i] = half_bits(rng_int(-1000, 1000)); k16[i] = h16[i]; }
+  dd = to_gpu((rawptr)h16, 16 * 16 * 2);
+  dispatch epilogue_f16_identity[grid: (1, 1, 1), block: (32, 1, 1)](dd);
+  from_gpu((rawptr)h16, dd, 16 * 16 * 2);
+  bad = 0;
+  for i: int64 in 0..16 * 16 { if (h16[i] != k16[i]) { bad = bad + 1; } }
+  check("tensor_epilogue f16 identity", bad);
+  gpu_free(dd);
+
+  var hb16: uint16* = (uint16*)malloc(16 * 32 * 2);
+  var wb16: uint16* = (uint16*)malloc(16 * 32 * 2);
+  var bb16: uint16* = (uint16*)malloc(32 * 2);
+  var bias_int: int32[32];
+  for c: int64 in 0..32 { bias_int[c] = rng_int(-10, 10); bb16[c] = bf16_bits(bias_int[c]); }
+  for c: int64 in 0..32 {
+    for r: int64 in 0..16 {
+      var v: int32 = rng_int(-20, 20);
+      hb16[c * 16 + r] = bf16_bits(v);
+      var sum: int32 = v + bias_int[c];
+      wb16[c * 16 + r] = if (sum < 0) (uint16)0 else bf16_bits(sum);
+    }
+  }
+  dd = to_gpu((rawptr)hb16, 16 * 32 * 2);
+  db = to_gpu((rawptr)bb16, 32 * 2);
+  dispatch epilogue_bf16_column_relu[grid: (1, 1, 1), block: (32, 1, 1)](dd, db);
+  from_gpu((rawptr)hb16, dd, 16 * 32 * 2);
+  bad = 0;
+  for i: int64 in 0..16 * 32 { if (hb16[i] != wb16[i]) { bad = bad + 1; } }
+  check("tensor_epilogue bf16 column-major column bias, relu", bad);
+  gpu_free(dd);
+  gpu_free(db);
+  free((rawptr)d);
+  free((rawptr)want);
+  free((rawptr)bias);
+  free((rawptr)dm);
+  free((rawptr)wm);
+  free((rawptr)bm);
+  free((rawptr)d64);
+  free((rawptr)w64);
+  free((rawptr)b64);
+  free((rawptr)h16);
+  free((rawptr)k16);
+  free((rawptr)hb16);
+  free((rawptr)wb16);
+  free((rawptr)bb16);
+}
+
+fn main() -> int32 {
+  if (gpu_init() == 0) { return 99; }
+  rng_seed(77134);
+  for round: int64 in 0..3 {
+    var t: Tile = tile(32, 8, 16, true, false, true, -4, 4);
+    t.lda = 32;
+    t.ldb = 8;
+    t.ldc = 8;
+    t.ldd = 32;
+    run_tile("tensor_mma bf16 m32n8k16 column A, row B, column D", T_BF16, &t);
+    t = tile(16, 16, 8, false, true, false, -6, 6);
+    run_tile("tensor_mma tf32 m16n16k8", T_TF32, &t);
+    t = tile(8, 8, 4, false, true, false, -9, 9);
+    run_tile("tensor_mma f64 m8n8k4 nearest-even", T_F64, &t);
+    t = tile(16, 16, 16, false, true, false, -128, 127);
+    t.saturate = true;
+    run_tile("tensor_mma i8 m16n16k16 saturating past int32", T_I8, &t);
+    t = tile(32, 32, 16, false, true, false, 0, 255);
+    t.saturate = true;
+    run_tile("tensor_mma u8 m32n32k16 saturating past int32", T_U8, &t);
+    t = tile(16, 16, 16, false, true, false, -128, 127);
+    run_tile("tensor_mma i8 m16n16k16 in range", T_I8, &t);
+    t = tile(8, 8, 32, false, true, false, 0, 15);
+    run_tile("tensor_mma u4 m8n8k32 packed", T_U4, &t);
+    t = tile(8, 8, 32, false, true, false, -8, 7);
+    run_tile("tensor_mma i4 m8n8k32 packed", T_I4, &t);
+    t = tile(8, 8, 128, false, true, false, 0, 1);
+    run_tile("tensor_mma b1 m8n8k128 xor-popcount", T_B1, &t);
+    t = tile(16, 16, 16, false, true, false, -3, 3);
+    t.sparse = true;
+    t.lda = 8;
+    t.ldb = 16;
+    run_tile("tensor_mma 2:4 sparse f16 m16n16k16", T_SPARSE_F16, &t);
+    t = tile(16, 16, 16, false, true, false, -3, 3);
+    t.sparse = true;
+    t.lda = 8;
+    run_tile("tensor_mma 2:4 sparse bf16 m16n16k16", T_SPARSE_BF16, &t);
+  }
+  run_epilogues();
+  return summary("tensor tiles and epilogues on the GPU");
+}

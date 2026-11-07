@@ -41,6 +41,7 @@ typedef struct {
   int report_occupancy;
   int report_sms;
   int gpu_checks;
+  int device_image;
   int report_launches;
   int report_gpu_types;
   int emit_spirv;
