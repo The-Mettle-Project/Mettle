@@ -627,7 +627,16 @@ functions directly when the work does not fit a counted loop.
 
 `min_chunk` is the smallest range worth a thread. Below `min_chunk * 2` the
 body runs once on the calling thread, so a short range costs one call and no
-thread. The caller always runs the last chunk itself.
+thread.
+
+Above that, the range is cut into about 16 chunks per thread, none smaller
+than `min_chunk`, and each thread, the caller included, starts on its own
+contiguous share. A thread that runs out takes the back half of the largest
+share left, so a slow or preempted thread holds up only the chunk it is in.
+The caller works until nothing is left to take, then waits for the chunks
+still running. Idle threads spin for about 100 microseconds and then sleep,
+so a program that does serial work between ranges does not burn the other
+cores.
 
 `METTLE_PARALLEL_THREADS` overrides the core count at run time, capped at 64.
 

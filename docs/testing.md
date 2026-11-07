@@ -98,14 +98,22 @@ It models real memory, so most code runs:
 - Strings with their actual bytes, including literals and interpolation
 - Structs and arrays, passed and returned by value
 - Globals, with their initializers
-- Heap allocation and the modeled string externs
+- Heap allocation of any size, `realloc` included, and the modeled string
+  externs
 - Closures, called through function-address tokens
 - Tagged enums, `match`, `defer`
+- Threads: `std/thread`, `std/sync`, `parallel_range` and Linux futexes run as
+  fibers under a deterministic scheduler that switches every 2000
+  instructions, keeps a virtual clock for sleeps and timed waits, and reports a
+  deadlock when every thread waits on another
+- Files: `std/file`, `std/fs`, `std/dir`, file mappings and stdio streams reach
+  the host's own file system, through Win32 on Windows and system calls on
+  Linux
+- Kernels: `dispatch` runs the grid on the CPU, one work item at a time
 
 It stops at what it cannot model: a call into a foreign library whose behavior
-it does not know, inline assembly, and anything that reads the operating
-system. A function that reaches one of those reports an unsupported construct
-rather than guessing.
+it does not know, inline assembly, and sockets or processes. A function that
+reaches one of those reports an unsupported construct rather than guessing.
 
 ## The same interpreter elsewhere
 
