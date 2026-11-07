@@ -4841,6 +4841,7 @@ int main(int argc, char *argv[]) {
         return mettle_explain_report_file(argc - 2, argv + 2);
       }
       options.explain_view = 1;
+      options.explain_view_key = mettle_explain_build_key(argc - 3, argv + 3);
       for (int i = 1; i + 1 < argc; i++) {
         argv[i] = argv[i + 1];
       }
@@ -7113,7 +7114,9 @@ static int compile_stage_metaprogram_report(CompileContext *ctx) {
 
 static int compile_stage_type_check(CompileContext *ctx) {
   int tc_ok = 0;
-  ir_explain_ledger_set_collect(ctx->options->explain);
+  ir_explain_ledger_set_collect(
+      ctx->options->explain,
+      ctx->options->explain_all ? NULL : ctx->options->input_filename);
   ir_explain_memory_set_collect(
       ctx->options->explain && ctx->options->optimize,
       ctx->options->explain_all ? NULL : ctx->options->input_filename);

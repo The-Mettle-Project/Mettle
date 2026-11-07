@@ -1,0 +1,198 @@
+import "std/io";
+import "std/core";
+import "std/mem";
+import "std/collections";
+
+type Bearing = int32 where value >= 0 && value < 360;
+type Sector = int32 where value >= 0 && value < 12;
+
+struct Trail {
+  points: int32*;
+  cap: int32;
+  head: int32;
+  count: int32;
+
+  method drop() {
+    free(this.points);
+  }
+}
+
+struct Track {
+  id: int32;
+  threat: int32;
+  trail: Trail;
+
+  method drop() {
+    println("  track {this.id} released, {this.trail.count} bearings");
+  }
+}
+
+fn trail_new(cap: int32) -> Trail {
+  var out: Trail = { points: malloc((int64)cap * 4), cap: cap, head: 0, count: 0 };
+  return out;
+}
+
+fn trail_push(t: Trail*, bearing: Bearing) {
+  t->points[t->head] = bearing;
+  t->head = (t->head + 1) % t->cap;
+  if (t->count < t->cap) {
+    t->count = t->count + 1;
+  }
+}
+
+fn trail_spread(t: Trail*) -> int32 {
+  var lo: int32 = 360;
+  var hi: int32 = 0;
+  for i in 0..t->count {
+    var b = t->points[i];
+    if (b < lo) { lo = b; }
+    if (b > hi) { hi = b; }
+  }
+  return hi - lo;
+}
+
+fn record(bearings: int32[], cap: int32) -> Trail {
+  var t = trail_new(cap);
+  for b in bearings {
+    if (b >= 0 && b < 360) {
+      trail_push(&t, b);
+    }
+  }
+  return t;
+}
+
+fn track_open(id: int32, threat: int32, bearings: int32[]) -> Track {
+  var t: Track = { id: id, threat: threat, trail: record(bearings, 8) };
+  return t;
+}
+
+fn sector_of(b: Bearing) -> Sector {
+  return b / 30;
+}
+
+fn retire(t: Track) -> int32 {
+  println("  retire track {t.id}, spread {trail_spread(&t.trail)}");
+  return t.trail.count;
+}
+
+fn sweep(tracks: List<Track>*, hostile: List<Track>*) -> int32 {
+  var retired: int32 = 0;
+  while (tracks->length > 0) {
+    match (list_pop<Track>(tracks)) {
+      case Some(t): {
+        if (t.threat >= 7) {
+          list_push<Track>(hostile, t);
+        } else if (t.threat >= 3) {
+          retired = retired + retire(t);
+        }
+      }
+      case None: { }
+    }
+  }
+  return retired;
+}
+
+fn heat_map(tracks: List<Track>*, heat: int32[]) {
+  for k in 0..tracks->length {
+    var t = list_get_ptr<Track>(tracks, k);
+    for i in 0..t->trail.count {
+      var cell = t->trail.points[i] / 10;
+      heat[cell] = heat[cell] + 1;
+    }
+  }
+}
+
+fn sectors(tracks: List<Track>*) -> int32 {
+  var counts: int32[12];
+  for k in 0..tracks->length {
+    var t = list_get_ptr<Track>(tracks, k);
+    var b = t->trail.points[0];
+    if (b >= 0 && b < 360) {
+      var s = sector_of(b);
+      counts[s] = counts[s] + 1;
+    }
+  }
+  var busiest: int32 = 0;
+  for s in 0..12 {
+    if (counts[s] > counts[busiest]) { busiest = s; }
+  }
+  return busiest;
+}
+
+fn returns(heat: int32[]) -> int32 {
+  var total: int32 = 0;
+  for i in 0..heat.length {
+    total = total + heat[i];
+  }
+  return total;
+}
+
+fn callsigns(hostile: List<Track>*) -> int32 {
+  var line = "hostile:";
+  for k in 0..hostile->length {
+    var t = list_get_ptr<Track>(hostile, k);
+    line = line + " T{t->id}";
+  }
+  println(line);
+  return (int32)hostile->length;
+}
+
+fn cool(heat: int32[]) {
+  for i in 0..heat.length {
+    heat[i] = heat[i] >> 1;
+  }
+}
+
+fn ghosts(raw: int32[]) -> int64 {
+  return raw.length - (int64)record(raw, 8).count;
+}
+
+@explicit fn kept(raw: int32[]) -> int32 {
+  var probe = record(raw, 8);
+  defer drop(probe);
+  return probe.count;
+}
+
+fn main() -> int32 {
+  var stale_us: int32 = 60 * 60 * 1000 * 1000;
+  var a: int32[5] = [12, 15, 19, 24, 31];
+  var b: int32[4] = [95, 101, 400, 110];
+  var c: int32[6] = [181, 176, 170, -8, 163, 158];
+  var d: int32[3] = [270, 268, 266];
+  var e: int32[2] = [315, 316];
+
+  var tracks: List<Track> = list_init<Track>();
+  var hostile: List<Track> = list_init<Track>();
+  var heat: int32[36];
+
+  var first = track_open(1, 8, a);
+  list_push<Track>(&tracks, first);
+  list_push<Track>(&tracks, track_open(2, 4, b));
+  list_push<Track>(&tracks, track_open(3, 9, c));
+  list_push<Track>(&tracks, track_open(4, 1, d));
+  list_push<Track>(&tracks, track_open(5, 6, e));
+
+  println("contacts {tracks.length}, stale after {stale_us} us");
+  println("track 3 kept {kept(c)} returns, {ghosts(c)} ghost");
+  heat_map(&tracks, heat);
+  println("returns {returns(heat)}, busiest sector {sectors(&tracks)}");
+  cool(heat);
+  println("after cooling {returns(heat)}");
+
+  println("drop the newest contact");
+  list_pop<Track>(&tracks);
+
+  var scan = trail_new(4);
+  for pass in 0..2 {
+    trail_push(&scan, 90 * pass);
+    println("scan {pass} holds {scan.count}");
+    scan = trail_new(4 + pass);
+  }
+
+  println("sweep");
+  var retired = sweep(&tracks, &hostile);
+  println("retired {retired} bearings");
+  callsigns(&hostile);
+  println("end of watch");
+  return 0;
+}

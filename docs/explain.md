@@ -45,6 +45,17 @@ flowchart LR
 The detail pane shows the selected entry, the source lines it is about, and the
 long explanation for its code, the same text `mettle explain <code>` prints.
 
+[`examples/raii_demo`](../examples/raii_demo/raii_demo.mettle) is a radar
+track file written to fill every tab. Its tracks own heap trails, so the
+Ownership tab has every kind of record: scope, parameter, arm, assignment and
+discard drops, temporaries, moves, live bits and drop glue. Under `--safe` the
+Memory tab lists each bounds check that stayed, grouped by function, beside a
+planted constant overflow:
+
+```bash
+mettle explain examples/raii_demo/raii_demo.mettle --safe
+```
+
 ## Keys
 
 - left and right, Tab and Shift+Tab, or 1 to 7: switch tabs

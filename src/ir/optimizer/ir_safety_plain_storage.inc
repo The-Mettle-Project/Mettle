@@ -209,7 +209,6 @@ static SafetyPlainArray *safety_plain_root(SafetyPlainStorage *state,
         }
         return found;
       }
-      const IRModuleSymbol *decl = ir_program_lookup_symbol(state->program, fn->name);
     }
     if (!ir_function_find_declaration(fn, value->name, 1))
       for (size_t a = 0; a < state->count; a++)

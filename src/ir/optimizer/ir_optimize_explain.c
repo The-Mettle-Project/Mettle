@@ -373,14 +373,30 @@ void ir_explain_safety_set_collect(int enabled, const char *focus_file) {
   }
 }
 
+static MTLC_THREAD_LOCAL size_t g_safety_file[6];
+
+static int ir_explain_safety_in_focus(const char *file) {
+  return !g_safety_focus ||
+         (file && strcmp(ir_explain_path_basename(file), g_safety_focus) == 0);
+}
+
+void ir_explain_safety_settled(const char *file, IRSafetySettledKind kind) {
+  if (g_safety_collect && ir_explain_safety_in_focus(file) &&
+      (unsigned)kind <= IR_SAFETY_SETTLED_EXEMPT) {
+    g_safety_file[kind]++;
+  }
+}
+
 void ir_explain_safety_note(const char *file, size_t line,
                             const char *function_name,
                             IRSafetySurvivorKind kind) {
-  if (!g_safety_collect || g_safety_count >= IR_EXPLAIN_SAFETY_MAX_NOTES) {
+  if (!g_safety_collect || !ir_explain_safety_in_focus(file)) {
     return;
   }
-  if (g_safety_focus && file &&
-      strcmp(ir_explain_path_basename(file), g_safety_focus) != 0) {
+  if ((unsigned)kind <= IR_SAFETY_SURVIVOR_SPAN) {
+    g_safety_file[3 + kind]++;
+  }
+  if (g_safety_count >= IR_EXPLAIN_SAFETY_MAX_NOTES) {
     return;
   }
   if (g_safety_count >= g_safety_capacity) {
@@ -450,6 +466,15 @@ void ir_explain_safety_totals(size_t emitted, size_t proved, size_t hoisted,
                               size_t extent_tests, size_t region_calls) {
   if (!g_safety_collect) {
     return;
+  }
+  if (g_safety_focus) {
+    proved = g_safety_file[IR_SAFETY_SETTLED_PROVED];
+    hoisted = g_safety_file[IR_SAFETY_SETTLED_HOISTED];
+    exempt = g_safety_file[IR_SAFETY_SETTLED_EXEMPT];
+    extent_tests = g_safety_file[3 + IR_SAFETY_SURVIVOR_EXTENT];
+    region_calls = g_safety_file[3 + IR_SAFETY_SURVIVOR_REGION];
+    spanned = g_safety_file[3 + IR_SAFETY_SURVIVOR_SPAN];
+    emitted = proved + hoisted + exempt + extent_tests + region_calls + spanned;
   }
   g_safety_have_totals = 1;
   g_safety_emitted = emitted;
@@ -2233,7 +2258,19 @@ void ir_explain_layout_note(size_t line, const char *function_name,
 
 void ir_explain_layout_total(size_t total) { g_layout_total = total; }
 
-void ir_explain_ledger_set_collect(int enabled) { g_ledger_collect = enabled; }
+static MTLC_THREAD_LOCAL const char *g_ledger_focus = NULL;
+
+void ir_explain_ledger_set_collect(int enabled, const char *focus_file) {
+  g_ledger_collect = enabled;
+  g_ledger_focus = focus_file;
+}
+
+static int ledger_in_focus(const char *file) {
+  const char *focus = g_ledger_focus ? g_ledger_focus : g_explain_focus_file;
+  return !file || !focus ||
+         strcmp(ir_explain_path_basename(file),
+                ir_explain_path_basename(focus)) == 0;
+}
 
 static IRExplainLedgerRow *ledger_push(IRExplainLedgerRow **table,
                                        size_t *count, size_t *total) {
@@ -2263,9 +2300,7 @@ void ir_explain_type_payoff(const char *file, size_t line,
                             const char *function_name, const char *type_name,
                             const char *what, const char *detail) {
   IRExplainLedgerRow *row;
-  if (file && g_explain_focus_file &&
-      strcmp(ir_explain_path_basename(file),
-             ir_explain_path_basename(g_explain_focus_file)) != 0) {
+  if (!ledger_in_focus(file)) {
     return;
   }
   row = ledger_push(&g_payoffs, &g_payoff_count, &g_payoff_total);
@@ -2368,10 +2403,13 @@ void ir_explain_proof_held(const char *type_name, const char *expression,
   row->line = line;
 }
 
-void ir_explain_effect_held(const char *function, const char *performs,
-                            const char *needs) {
-  IRExplainLedgerRow *row =
-      ledger_push(&g_effects, &g_effect_count, &g_effect_total);
+void ir_explain_effect_held(const char *file, const char *function,
+                            const char *performs, const char *needs) {
+  IRExplainLedgerRow *row;
+  if (!ledger_in_focus(file)) {
+    return;
+  }
+  row = ledger_push(&g_effects, &g_effect_count, &g_effect_total);
   if (!row) {
     return;
   }

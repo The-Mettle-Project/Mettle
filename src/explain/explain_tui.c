@@ -480,6 +480,10 @@ static void ex_build_detail(ExUi *ui) {
     const char *label =
         i > 0 && ex_same(shown->fields[i - 1].label, f->label) ? NULL
                                                                 : f->label;
+    if (label && ex_text_width(label) > label_w) {
+      ex_wrap(&ui->detail, 0, width, label, EXA_DIM, NULL, 0);
+      label = NULL;
+    }
     ex_wrap(&ui->detail, label_w + 2, width - label_w - 2, f->text, attr,
             label, EXA_DIM);
   }

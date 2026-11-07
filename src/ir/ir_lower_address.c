@@ -2003,7 +2003,6 @@ static int ir_column_access_begin(IRLoweringContext *context,
     out->count = ir_operand_int(out->known_count);
   } else if (array_type->kind == TYPE_SLICE && type_view_rank(array_type) == 1 &&
              !array_type->view_extents[0]) {
-    IROperand length_slot = ir_operand_none();
     IRInstruction load = {0};
     if (!ir_lower_lvalue_address(context, function, indexing->array,
                                  &slice_address, NULL) ||

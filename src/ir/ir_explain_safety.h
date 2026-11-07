@@ -9,7 +9,15 @@ typedef enum {
   IR_SAFETY_SURVIVOR_SPAN = 2
 } IRSafetySurvivorKind;
 
+typedef enum {
+  IR_SAFETY_SETTLED_PROVED = 0,
+  IR_SAFETY_SETTLED_HOISTED = 1,
+  IR_SAFETY_SETTLED_EXEMPT = 2
+} IRSafetySettledKind;
+
 void ir_explain_safety_set_collect(int enabled, const char *focus_file);
+
+void ir_explain_safety_settled(const char *file, IRSafetySettledKind kind);
 
 void ir_explain_safety_note(const char *file, size_t line,
                             const char *function_name,

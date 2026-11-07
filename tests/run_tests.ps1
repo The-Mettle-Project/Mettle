@@ -1286,6 +1286,16 @@ $cases = @(
     )
   },
   @{
+    Name          = "slice_store_loop_vectorizes_beside_punning"
+    Path          = "tests/test_local_address_escape.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain=loops")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      'halve \(loop @ line \d+\): vectorized -> 8-wide int32 element-wise map'
+    )
+  },
+  @{
     # A mixed-width float loop gets no kernel. The advice names which width to
     # keep, and the compiler proves it: it retypes the minority on a clone and
     # re-runs its own vectorizer. Each mixed loop is followed by the same loop
@@ -13101,10 +13111,25 @@ try {
   Assert-Screen (Invoke-ExplainScreen $demo "?") @("Keys", "missed only, with a fix only, all") "help"
   Assert-Screen (Invoke-ExplainScreen $demo "2" "64x20") @("2 Optimizer", "saxpy, loop at line 12", "q quit") "narrow layout"
   Assert-Screen (Invoke-ExplainScreen $demo "" "30x8") @("needs 40 by 12") "too small"
-  Assert-Screen (Invoke-ExplainScreen "tests/test_ownership_paths.mettle" "3 j j") @(
+  Assert-Screen (Invoke-ExplainScreen "tests/test_ownership_paths.mettle" "3") @(
       "Line  Record", "Written out", "var __tmp") "ownership"
   Assert-Screen (Invoke-ExplainScreen "tests/test_ownership_strings.mettle" "4" "140x24" @("--safe")) @(
-      "accesses", "Checked at run time") "memory under --safe"
+      "accesses", "asks the runtime for the allocation, 2 accesses") "memory under --safe"
+  $raii = "examples/raii_demo/raii_demo.mettle"
+  Assert-Screen (Invoke-ExplainScreen $raii "") @("Loops      1 vectorized", "Ownership  31 inserted") "raii overview"
+  $ownership = Invoke-ExplainScreen $raii "3" "140x200"
+  Assert-Screen $ownership @("glue            ``__drop_Track``", "arm drop        ``t``", "live bit", "assign drop     ``line``",
+      "parameter drop  ``t``", "discard drop", "temporary") "raii ownership"
+  foreach ($group in @("sweep", "retire", "main")) {
+    $headers = ([regex]::Matches($ownership, "(?m)^  $group\s*│")).Count
+    if ($headers -ne 1) { throw "raii ownership: group '$group' has $headers headers:`n$ownership" }
+  }
+  $memory = Invoke-ExplainScreen $raii "4" "140x40" @("--safe")
+  Assert-Screen $memory @("Memory report", "3600000 * 1000", "trail_push", "accesses", "M0124") "raii memory"
+  $proofs = Invoke-ExplainScreen $raii "6" "140x60"
+  Assert-Screen $proofs @("'Sector' holds 0..11", "Effects inferred and checked", "trail_new") "raii proofs"
+  if ($proofs -match "get_stdin") { throw "raii proofs: the effects list reaches into the standard library:`n$proofs" }
+  Assert-Screen (Invoke-ExplainScreen $raii "2 / text:trail_new enter") @("Callee instructions") "long field label"
 
   $saved = Get-ChildItem (Join-Path $env:METTLE_CACHE "explain") -Filter "explain_demo-*.explain.json" | Select-Object -First 1
   if (-not $saved) { throw "the cache holds no explain_demo report" }
@@ -13128,6 +13153,27 @@ catch {
   $failed++
   $env:METTLE_CACHE = $savedCache
   Write-CaseResult -Name "explain_tui" -Passed $false -Reason $_.Exception.Message
+}
+
+foreach ($escapeMode in @("debug", "release", "safe")) {
+  $total++
+  $caseName = "local_address_escape_$escapeMode"
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "$caseName.exe"
+    $extraArgs = @()
+    if ($escapeMode -eq "release") { $extraArgs = @("--release") }
+    if ($escapeMode -eq "safe") { $extraArgs = @("--safe") }
+    $buildOut = & $CompilerPath --build --linker internal @extraArgs tests/test_local_address_escape.mettle -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "local address escape build failed ($escapeMode): $buildOut" }
+    $runOut = ((& $exePath 2>&1 | Out-String) -replace "`r`n", "`n").TrimEnd()
+    if ($runOut -ne "done") { throw "local address escape mismatch ($escapeMode):`n$runOut" }
+    Write-CaseResult -Name $caseName -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name $caseName -Passed $false -Reason $_.Exception.Message
+  }
 }
 
 foreach ($valueMode in @("debug", "optimized", "release", "safe")) {

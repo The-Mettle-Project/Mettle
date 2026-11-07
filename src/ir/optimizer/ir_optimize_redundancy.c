@@ -472,11 +472,241 @@ static int re_kills_append(REKillLog *log, const char *base, long long off,
   return 1;
 }
 
+typedef struct {
+  const IRFunction *function;
+  REMap derived;
+  REMap kept;
+  const char **roots;
+  size_t root_count;
+  int all;
+} RELocalAddrs;
+
+static MTLC_THREAD_LOCAL const RELocalAddrs *g_re_local_addrs;
+
+static int re_local_op_is_plain(IROpcode op) {
+  switch (op) {
+  case IR_OP_NOP:
+  case IR_OP_LABEL:
+  case IR_OP_JUMP:
+  case IR_OP_BRANCH_ZERO:
+  case IR_OP_BRANCH_EQ:
+  case IR_OP_DECLARE_LOCAL:
+  case IR_OP_ASSIGN:
+  case IR_OP_ADDRESS_OF:
+  case IR_OP_LOAD:
+  case IR_OP_STORE:
+  case IR_OP_BINARY:
+  case IR_OP_UNARY:
+  case IR_OP_CAST:
+  case IR_OP_CALL:
+  case IR_OP_CALL_INDIRECT:
+  case IR_OP_NEW:
+  case IR_OP_RETURN:
+  case IR_OP_SELECT:
+  case IR_OP_PHI:
+  case IR_OP_SAFETY_CHECK:
+  case IR_OP_PREFETCH:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static long long re_local_derived(const RELocalAddrs *facts,
+                                  const IROperand *operand) {
+  char key[RE_NAME_MAX];
+  if (!operand || operand->kind != IR_OPERAND_TEMP || !operand->name ||
+      !re_name_key(key, sizeof(key), IR_OPERAND_TEMP, operand->name)) {
+    return 0;
+  }
+  return re_map_get(&facts->derived, key);
+}
+
+static int re_local_root_index(RELocalAddrs *facts, const char *name) {
+  const char **grown;
+  for (size_t r = 0; r < facts->root_count; r++) {
+    if (strcmp(facts->roots[r], name) == 0) {
+      return (int)r;
+    }
+  }
+  grown = realloc((void *)facts->roots,
+                  (facts->root_count + 1) * sizeof(*facts->roots));
+  if (!grown) {
+    return -1;
+  }
+  facts->roots = grown;
+  facts->roots[facts->root_count] = name;
+  return (int)facts->root_count++;
+}
+
+static int re_local_escape(RELocalAddrs *facts, long long derived) {
+  char key[RE_NAME_MAX];
+  const char *root = facts->roots[(derived - 1) >> 8];
+  if (!re_name_key(key, sizeof(key), IR_OPERAND_SYMBOL, root)) {
+    return 0;
+  }
+  return re_map_set(&facts->kept, key, -1);
+}
+
+static int re_local_extend(RELocalAddrs *facts, const REDefs *defs,
+                           const IRInstruction *ins, long long from,
+                           int *grew) {
+  char key[RE_NAME_MAX];
+  long long depth = (from - 1) & 0xff;
+  long long value = from + 1;
+  if (ins->dest.kind != IR_OPERAND_TEMP || !ins->dest.name ||
+      re_def_count(defs, IR_OPERAND_TEMP, ins->dest.name) != 1 ||
+      depth + 2 >= RE_MAX_ADDR_DEPTH ||
+      !re_name_key(key, sizeof(key), IR_OPERAND_TEMP, ins->dest.name)) {
+    return re_local_escape(facts, from);
+  }
+  if (re_map_get(&facts->derived, key) == value) {
+    return 1;
+  }
+  *grew = 1;
+  return re_map_set(&facts->derived, key, value);
+}
+
+static int re_local_offset_add(const IRInstruction *ins, long long lhs,
+                               long long rhs) {
+  return ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
+         strcmp(ins->text, "+") == 0 &&
+         ((lhs && !rhs && ins->rhs.kind == IR_OPERAND_INT) ||
+          (rhs && !lhs && ins->lhs.kind == IR_OPERAND_INT));
+}
+
+static int re_local_write_is_logged(IROpcode op) {
+  switch (op) {
+  case IR_OP_DECLARE_LOCAL:
+  case IR_OP_ASSIGN:
+  case IR_OP_ADDRESS_OF:
+  case IR_OP_LOAD:
+  case IR_OP_BINARY:
+  case IR_OP_UNARY:
+  case IR_OP_CAST:
+  case IR_OP_SELECT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int re_local_visit(RELocalAddrs *facts, const REDefs *defs,
+                          const IRInstruction *ins, int *grew) {
+  long long lhs = re_local_derived(facts, &ins->lhs);
+  long long rhs = re_local_derived(facts, &ins->rhs);
+  if (ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+      ir_instruction_writes_destination(ins) &&
+      !re_local_write_is_logged(ins->op)) {
+    char key[RE_NAME_MAX];
+    if (!re_name_key(key, sizeof(key), IR_OPERAND_SYMBOL, ins->dest.name) ||
+        !re_map_set(&facts->kept, key, -1)) {
+      return 0;
+    }
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    long long arg = re_local_derived(facts, &ins->arguments[a]);
+    if (arg && !re_local_escape(facts, arg)) {
+      return 0;
+    }
+  }
+  if (ins->op == IR_OP_ADDRESS_OF && ins->lhs.kind == IR_OPERAND_SYMBOL &&
+      ins->lhs.name) {
+    int root;
+    if (!ir_function_symbol_is_parameter(facts->function, ins->lhs.name) &&
+        !ir_function_local_declared_type(facts->function, ins->lhs.name)) {
+      return 1;
+    }
+    root = re_local_root_index(facts, ins->lhs.name);
+    if (root < 0) {
+      return 0;
+    }
+    {
+      char key[RE_NAME_MAX];
+      if (!re_name_key(key, sizeof(key), IR_OPERAND_SYMBOL, ins->lhs.name)) {
+        return 0;
+      }
+      if (re_map_get(&facts->kept, key) == 0 &&
+          !re_map_set(&facts->kept, key, 1)) {
+        return 0;
+      }
+    }
+    return re_local_extend(facts, defs, ins, ((long long)root << 8) + 1,
+                           grew);
+  }
+  if (ins->op == IR_OP_LOAD && lhs && !rhs) {
+    return 1;
+  }
+  if (ins->op == IR_OP_STORE) {
+    if ((lhs && !re_local_escape(facts, lhs)) ||
+        (rhs && !re_local_escape(facts, rhs))) {
+      return 0;
+    }
+    return 1;
+  }
+  if (ins->op == IR_OP_ASSIGN && lhs && !rhs) {
+    return re_local_extend(facts, defs, ins, lhs, grew);
+  }
+  if (re_local_offset_add(ins, lhs, rhs)) {
+    return re_local_extend(facts, defs, ins, lhs ? lhs : rhs, grew);
+  }
+  if ((lhs && !re_local_escape(facts, lhs)) ||
+      (rhs && !re_local_escape(facts, rhs))) {
+    return 0;
+  }
+  return 1;
+}
+
+static void re_local_addrs_destroy(RELocalAddrs *facts) {
+  re_map_destroy(&facts->derived);
+  re_map_destroy(&facts->kept);
+  free((void *)facts->roots);
+  memset(facts, 0, sizeof(*facts));
+}
+
+static void re_local_addrs_build(const IRFunction *function,
+                                 const REDefs *defs, RELocalAddrs *facts) {
+  int grew = 1;
+  memset(facts, 0, sizeof(*facts));
+  facts->function = function;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    if (!re_local_op_is_plain(function->instructions[i].op)) {
+      facts->all = 1;
+      return;
+    }
+  }
+  for (int round = 0; grew && round < 16; round++) {
+    grew = 0;
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      if (!re_local_visit(facts, defs, &function->instructions[i], &grew)) {
+        facts->all = 1;
+        return;
+      }
+    }
+  }
+  facts->all = grew;
+}
+
+static int re_base_stays_local(const IRFunction *function, const char *base) {
+  const RELocalAddrs *facts = g_re_local_addrs;
+  char key[RE_NAME_MAX];
+  if (!facts || facts->function != function || facts->all || !base ||
+      base[0] != '&' ||
+      !re_name_key(key, sizeof(key), IR_OPERAND_SYMBOL, base + 1)) {
+    return 0;
+  }
+  return re_map_get(&facts->kept, key) > 0;
+}
+
 static int re_kill_hits(const IRFunction *function, const REMemRegion *kill,
                         const char *mem_base, long long mem_off,
                         long long mem_size, unsigned mem_class) {
   if (kill->base && mem_base && strcmp(kill->base, mem_base) == 0) {
     return kill->off < mem_off + mem_size && mem_off < kill->off + kill->size;
+  }
+  if (re_base_stays_local(function, kill->base) ||
+      re_base_stays_local(function, mem_base)) {
+    return 0;
   }
   if (ir_alias_classes_distinct(kill->alias_class, mem_class)) {
     return 0;
@@ -2355,7 +2585,12 @@ int ir_hoist_invariant_loads_pass(IRFunction *function, int *changed) {
     defs.addr_taken = &addr_taken;
     if (ir_addr_taken_set_build(function, &addr_taken) &&
         re_collect_defs(function, &defs)) {
+      RELocalAddrs locals;
+      re_local_addrs_build(function, &defs, &locals);
+      g_re_local_addrs = &locals;
       moved = re_try_hoist_one_load(function, &defs, &addr_taken, changed);
+      g_re_local_addrs = NULL;
+      re_local_addrs_destroy(&locals);
     }
     re_map_destroy(&defs.defs);
     re_map_destroy(&defs.def_at);

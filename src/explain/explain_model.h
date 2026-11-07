@@ -42,6 +42,8 @@ typedef struct {
   int link_tab;
   int link_entry;
   char *search;
+  int order;
+  int repeat;
 } ExEntry;
 
 typedef struct {

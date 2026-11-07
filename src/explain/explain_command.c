@@ -63,6 +63,22 @@ int mettle_explain_parse_flag(CompilerOptions *options, const char *arg) {
   return 0;
 }
 
+unsigned mettle_explain_build_key(int argc, char **argv) {
+  unsigned hash = 2166136261u;
+  for (int i = 0; i < argc; i++) {
+    const char *arg = argv[i];
+    if (!arg || strncmp(arg, "--screen=", 9) == 0 ||
+        strncmp(arg, "--keys=", 7) == 0 || strcmp(arg, "--text") == 0) {
+      continue;
+    }
+    for (const char *p = arg; *p; p++) {
+      hash = (hash ^ (unsigned char)*p) * 16777619u;
+    }
+    hash = (hash ^ 0xffu) * 16777619u;
+  }
+  return hash;
+}
+
 static char *ex_read_file(const char *path, size_t *length) {
   FILE *in = fopen(path, "rb");
   long size;
@@ -214,12 +230,13 @@ static int ex_make_dirs(char *path) {
   return mettle_path_is_directory(path);
 }
 
-static char *ex_cache_object(const char *input, const char *absolute) {
+static char *ex_cache_object(const char *input, const char *absolute,
+                              unsigned key) {
   char root[1024];
   char dir[1100];
   const char *base = input;
   const char *dot = NULL;
-  unsigned hash = 2166136261u;
+  unsigned hash = key;
   char *path;
   size_t stem;
   for (const char *p = input; *p; p++) {
@@ -278,7 +295,8 @@ static char *ex_json_beside(const char *object) {
 
 int mettle_explain_view(CompilerOptions *options) {
   char *absolute = mettle_realpath(options->input_filename, NULL);
-  char *object = ex_cache_object(options->input_filename, absolute);
+  char *object = ex_cache_object(options->input_filename, absolute,
+                                 options->explain_view_key);
   int headless = options->explain_view_columns > 0;
   int text = options->explain_view_text ||
              (!headless && !ex_term_interactive());

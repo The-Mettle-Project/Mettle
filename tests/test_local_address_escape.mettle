@@ -1,0 +1,74 @@
+import "std/io";
+import "std/core";
+import "std/collections";
+
+fn shrink(n: int64*) {
+  *n = *n - 1;
+}
+
+fn walk(heat: int32[]) -> int64 {
+  var steps: int64 = 0;
+  var i: int64 = 0;
+  while (i < heat.length) {
+    heat[i] = heat[i] + 1;
+    shrink(&heat.length);
+    steps = steps + 1;
+    i = i + 1;
+  }
+  return steps;
+}
+
+fn halve(heat: int32[]) {
+  for i in 0..heat.length {
+    heat[i] = heat[i] >> 1;
+  }
+}
+
+struct Window {
+  lo: int64;
+  hi: int64;
+}
+
+@noinline fn window(k: int64) -> Window {
+  var w: Window = { lo: k, hi: k * 2 };
+  return w;
+}
+
+fn widths(n: int64) -> int64 {
+  var total: int64 = 0;
+  var w: Window = window(0);
+  for i in 0..n {
+    w = window(i);
+    total = total + w.hi - w.lo;
+  }
+  return total;
+}
+
+fn fill(xs: List<int32>*) {
+  list_push<int32>(xs, 4);
+}
+
+fn main() -> int32 {
+  var heat: int32[36];
+  for i in 0..36 {
+    heat[i] = i * 4;
+  }
+  var xs: List<int32> = list_init<int32>();
+  fill(&xs);
+  halve(heat);
+  var steps = walk(heat);
+  if (steps != 18) {
+    println("walk ran {steps} steps");
+    return 1;
+  }
+  if (heat[17] != 35 || heat[35] != 70) {
+    println("halve wrote {heat[17]} and {heat[35]}");
+    return 1;
+  }
+  if (widths(10) != 45) {
+    println("widths came to {widths(10)}");
+    return 1;
+  }
+  println("done");
+  return 0;
+}

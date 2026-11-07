@@ -2140,6 +2140,8 @@ static int safety_strip_function(IRFunction *function, IRSafetyStats *stats) {
         stats->emitted++;
         stats->exempt++;
       }
+      ir_explain_safety_settled(instruction->location.filename,
+                                IR_SAFETY_SETTLED_EXEMPT);
       continue;
     }
     if (!ir_instruction_vector_append_move(&out, instruction)) {
@@ -2335,12 +2337,16 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
       if (stats) {
         stats->proved++;
       }
+      ir_explain_safety_settled(access.location.filename,
+                                IR_SAFETY_SETTLED_PROVED);
       continue;
     }
     if (outcome[i] == SAFETY_HOISTED) {
       if (stats) {
         stats->hoisted++;
       }
+      ir_explain_safety_settled(access.location.filename,
+                                IR_SAFETY_SETTLED_HOISTED);
       continue;
     }
     if (outcome[i] == SAFETY_SPANNED) {

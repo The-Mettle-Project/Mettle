@@ -152,6 +152,183 @@ static void ex_finish(ExEntry *entry) {
   entry->search = search;
 }
 
+static void ex_entry_free(ExEntry *e) {
+  free(e->group);
+  for (int c = 0; c < EX_CELLS; c++) {
+    free(e->cells[c]);
+  }
+  free(e->title);
+  for (size_t f = 0; f < e->field_count; f++) {
+    free(e->fields[f].label);
+    free(e->fields[f].text);
+  }
+  free(e->fields);
+  free(e->code);
+  free(e->search);
+}
+
+static char *ex_words(const char *key) {
+  size_t n = key ? strlen(key) : 0;
+  char *out = malloc(n * 2 + 1);
+  size_t o = 0;
+  if (!out) {
+    return NULL;
+  }
+  for (size_t i = 0; i < n; i++) {
+    char c = key[i];
+    if (c == '-' || c == '_') {
+      out[o++] = ' ';
+    } else if (isupper((unsigned char)c) && o > 0) {
+      out[o++] = ' ';
+      out[o++] = (char)tolower((unsigned char)c);
+    } else if (o == 0) {
+      out[o++] = (char)toupper((unsigned char)c);
+    } else {
+      out[o++] = c;
+    }
+  }
+  out[o] = '\0';
+  return out;
+}
+
+static int ex_same_text(const char *a, const char *b) {
+  return a == b || (a && b && strcmp(a, b) == 0);
+}
+
+static long long ex_function_line(const ExJson *root, const char *fn) {
+  const ExJson *functions = ex_json_get(root, "functions");
+  if (!fn) {
+    return -1;
+  }
+  for (size_t i = 0; i < ex_json_count(functions); i++) {
+    const ExJson *f = ex_json_at(functions, i);
+    if (ex_same_text(ex_json_text(f, "fn"), fn)) {
+      return ex_json_int(f, "line", -1);
+    }
+  }
+  return -1;
+}
+
+typedef struct {
+  long long rank;
+  const char *group;
+  int line;
+  int order;
+  size_t index;
+} ExSortKey;
+
+static int ex_key_order(const void *a, const void *b) {
+  const ExSortKey *x = (const ExSortKey *)a;
+  const ExSortKey *y = (const ExSortKey *)b;
+  int named;
+  if (x->rank != y->rank) {
+    return x->rank < y->rank ? -1 : 1;
+  }
+  named = strcmp(x->group ? x->group : "", y->group ? y->group : "");
+  if (named != 0) {
+    return named;
+  }
+  if (x->line != y->line) {
+    return x->line < y->line ? -1 : 1;
+  }
+  if (x->order != y->order) {
+    return x->order < y->order ? -1 : 1;
+  }
+  return x->index < y->index ? -1 : x->index > y->index;
+}
+
+static void ex_order_groups(ExTab *tab, const ExJson *root,
+                            const char *lead) {
+  ExSortKey *keys;
+  ExEntry *sorted;
+  if (tab->count < 2) {
+    return;
+  }
+  keys = malloc(tab->count * sizeof(*keys));
+  sorted = malloc(tab->capacity * sizeof(*sorted));
+  if (!keys || !sorted) {
+    free(keys);
+    free(sorted);
+    return;
+  }
+  for (size_t i = 0; i < tab->count; i++) {
+    const ExEntry *e = &tab->entries[i];
+    long long rank = -1;
+    if (!lead || !ex_same_text(e->group, lead)) {
+      rank = ex_function_line(root, e->group);
+      if (rank < 0) {
+        rank = e->line;
+        for (size_t j = 0; j < tab->count; j++) {
+          if (ex_same_text(tab->entries[j].group, e->group) &&
+              tab->entries[j].line < rank) {
+            rank = tab->entries[j].line;
+          }
+        }
+      }
+    }
+    keys[i].rank = rank;
+    keys[i].group = e->group;
+    keys[i].line = e->line;
+    keys[i].order = e->order;
+    keys[i].index = i;
+  }
+  qsort(keys, tab->count, sizeof(*keys), ex_key_order);
+  for (size_t i = 0; i < tab->count; i++) {
+    sorted[i] = tab->entries[keys[i].index];
+  }
+  free(tab->entries);
+  tab->entries = sorted;
+  free(keys);
+}
+
+static int ex_same_entry(const ExEntry *a, const ExEntry *b) {
+  if (a->line != b->line || a->end_line != b->end_line ||
+      a->tone != b->tone || a->flags != b->flags ||
+      a->field_count != b->field_count || !ex_same_text(a->group, b->group) ||
+      !ex_same_text(a->title, b->title) || !ex_same_text(a->code, b->code)) {
+    return 0;
+  }
+  for (int c = 0; c < EX_CELLS; c++) {
+    if (!ex_same_text(a->cells[c], b->cells[c])) {
+      return 0;
+    }
+  }
+  for (size_t f = 0; f < a->field_count; f++) {
+    if (!ex_same_text(a->fields[f].label, b->fields[f].label) ||
+        !ex_same_text(a->fields[f].text, b->fields[f].text)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void ex_merge_repeats(ExTab *tab, const char *label) {
+  size_t kept = 0;
+  for (size_t i = 0; i < tab->count; i++) {
+    size_t j = 0;
+    while (j < kept && !ex_same_entry(&tab->entries[j], &tab->entries[i])) {
+      j++;
+    }
+    if (j < kept) {
+      tab->entries[j].repeat++;
+      ex_entry_free(&tab->entries[i]);
+      continue;
+    }
+    if (kept != i) {
+      tab->entries[kept] = tab->entries[i];
+    }
+    tab->entries[kept].repeat = 1;
+    kept++;
+  }
+  tab->count = kept;
+  for (size_t i = 0; i < tab->count; i++) {
+    if (tab->entries[i].repeat > 1) {
+      ex_field_owned(&tab->entries[i], label,
+                     ex_fmt("%d", tab->entries[i].repeat), EX_TONE_PLAIN);
+    }
+  }
+}
+
 static void ex_build_optimizer(ExReport *report, const ExJson *root) {
   ExTab *tab = &report->tabs[EX_TAB_OPTIMIZER];
   const ExJson *remarks = ex_json_get(root, "remarks");
@@ -217,11 +394,8 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
       for (size_t q = 0; quantities && quantities->kind == EXJ_OBJECT &&
                          q < quantities->count;
            q++) {
-        char *label = ex_spaced(quantities->keys[q]);
+        char *label = ex_words(quantities->keys[q]);
         char *value = ex_fmt("%lld", (long long)quantities->items[q]->number);
-        if (label && label[0]) {
-          label[0] = (char)toupper((unsigned char)label[0]);
-        }
         ex_field(entry, label, value, EX_TONE_PLAIN);
         free(label);
         free(value);
@@ -229,6 +403,7 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
     }
     ex_finish(entry);
   }
+  ex_order_groups(tab, root, NULL);
 }
 
 static int ex_find_remark(const ExTab *tab, const char *fn, long long line,
@@ -443,6 +618,10 @@ static void ex_build_ownership(ExReport *report, const ExJson *root) {
                                     line)
                            : ex_fmt("%s at line %lld", label, line);
     entry->line = (int)line;
+    entry->order = !kind                              ? 1
+                   : strcmp(kind, "temporary") == 0 ? 0
+                   : strcmp(kind, "drop-runs") == 0 ? 2
+                                                     : 1;
     entry->tone = inserted ? EX_TONE_PLAIN : EX_TONE_DONE;
     ex_field(entry, "Written out", ex_json_text(r, "text"), EX_TONE_PLAIN);
     ex_field(entry, "Reason", ex_json_text(r, "reason"), EX_TONE_PLAIN);
@@ -454,6 +633,7 @@ static void ex_build_ownership(ExReport *report, const ExJson *root) {
              EX_TONE_PLAIN);
     ex_finish(entry);
   }
+  ex_order_groups(tab, root, NULL);
 }
 
 static void ex_build_memory(ExReport *report, const ExJson *root) {
@@ -511,30 +691,65 @@ static void ex_build_memory(ExReport *report, const ExJson *root) {
     ex_field(entry, "Fix", ex_json_text(n, "fix"), EX_TONE_PLAIN);
     ex_finish(entry);
   }
-  for (size_t i = 0; i < ex_json_count(survivors); i++) {
-    const ExJson *s = ex_json_at(survivors, i);
-    const char *kind = ex_json_text(s, "kind");
-    const char *fn = ex_json_text(s, "function");
-    long long line = ex_json_int(s, "line", 0);
-    ExEntry *entry = ex_add(tab, "Checked at run time");
-    const char *what = kind && strcmp(kind, "runtime") == 0
-                           ? "asks the runtime for the allocation"
-                       : kind && strcmp(kind, "span") == 0
-                           ? "checked once per loop"
-                           : "compared against the extent";
-    if (!entry) {
-      return;
+  {
+    size_t first = tab->count;
+    size_t listed = ex_json_count(survivors);
+    long long total = ex_json_int(safety, "survivorsTotal", (long long)listed);
+    for (size_t i = 0; i < listed; i++) {
+      const ExJson *s = ex_json_at(survivors, i);
+      const char *kind = ex_json_text(s, "kind");
+      const char *fn = ex_json_text(s, "function");
+      long long line = ex_json_int(s, "line", 0);
+      const char *what = kind && strcmp(kind, "runtime") == 0
+                             ? "asks the runtime for the allocation"
+                         : kind && strcmp(kind, "span") == 0
+                             ? "checked once per loop"
+                             : "compared against the extent";
+      ExEntry *entry = NULL;
+      for (size_t j = first; j < tab->count && !entry; j++) {
+        ExEntry *e = &tab->entries[j];
+        if (e->line == line && ex_same_text(e->group, fn ? fn : "?") &&
+            ex_same_text(e->cells[1], what)) {
+          entry = e;
+        }
+      }
+      if (entry) {
+        entry->repeat++;
+        continue;
+      }
+      entry = ex_add(tab, fn ? fn : "?");
+      if (!entry) {
+        return;
+      }
+      entry->cells[0] = ex_fmt("%lld", line);
+      entry->cells[1] = ex_strdup(what);
+      entry->line = (int)line;
+      entry->repeat = 1;
+      entry->tone = EX_TONE_PLAIN;
+      ex_field(entry, "Why", ex_json_text(s, "why"), EX_TONE_PLAIN);
+      ex_field(entry, "Function", fn, EX_TONE_PLAIN);
     }
-    entry->cells[0] = ex_fmt("%lld", line);
-    entry->cells[1] = ex_strdup(what);
-    entry->title = ex_fmt("bounds check at line %lld%s%s", line,
-                          fn ? " in " : "", fn ? fn : "");
-    entry->line = (int)line;
-    entry->tone = EX_TONE_PLAIN;
-    ex_field(entry, "Why", ex_json_text(s, "why"), EX_TONE_PLAIN);
-    ex_field(entry, "Function", fn, EX_TONE_PLAIN);
-    ex_finish(entry);
+    for (size_t j = first; j < tab->count; j++) {
+      ExEntry *e = &tab->entries[j];
+      if (e->repeat > 1) {
+        char *row = ex_fmt("%s, %d accesses", e->cells[1], e->repeat);
+        free(e->cells[1]);
+        e->cells[1] = row;
+        e->title = ex_fmt("%d bounds checks at line %d in %s", e->repeat,
+                          e->line, e->group);
+        ex_field_owned(e, "Accesses", ex_fmt("%d", e->repeat),
+                       EX_TONE_PLAIN);
+      } else {
+        e->title = ex_fmt("bounds check at line %d in %s", e->line, e->group);
+      }
+      ex_finish(e);
+    }
+    if (total > (long long)listed) {
+      ex_summary(tab, ex_fmt("%zu of the %lld run-time checks are listed",
+                             listed, total));
+    }
   }
+  ex_order_groups(tab, root, "Memory report");
 }
 
 static int ex_function_order(const void *a, const void *b) {
@@ -546,6 +761,91 @@ static int ex_function_order(const void *a, const void *b) {
     return cx > cy ? -1 : 1;
   }
   return (int)(ex_json_int(x, "line", 0) - ex_json_int(y, "line", 0));
+}
+
+typedef struct {
+  long long line;
+  const char *bound;
+  int kernel;
+  int estimated;
+  long long low;
+  long long high;
+  int copies;
+} ExLoopRow;
+
+static int ex_loop_row_order(const void *a, const void *b) {
+  const ExLoopRow *x = (const ExLoopRow *)a;
+  const ExLoopRow *y = (const ExLoopRow *)b;
+  if (x->line != y->line) {
+    return x->line < y->line ? -1 : 1;
+  }
+  return x->low < y->low ? -1 : x->low > y->low;
+}
+
+static void ex_loop_fields(ExEntry *entry, const ExJson *loops,
+                           const char *fn) {
+  size_t total = ex_json_count(loops);
+  size_t count = 0;
+  ExLoopRow *rows = total ? calloc(total, sizeof(*rows)) : NULL;
+  if (!rows || !fn) {
+    free(rows);
+    return;
+  }
+  for (size_t l = 0; l < total; l++) {
+    const ExJson *loop = ex_json_at(loops, l);
+    ExLoopRow row;
+    size_t r = 0;
+    if (!ex_same_text(ex_json_text(loop, "fn"), fn)) {
+      continue;
+    }
+    row.line = ex_json_int(loop, "line", 0);
+    row.bound = ex_json_text(loop, "bottleneck");
+    row.kernel = ex_json_flag(loop, "hasKernel");
+    row.estimated = ex_json_flag(loop, "estimated");
+    row.low = row.high = ex_json_int(loop, "cyclesPerIter", 0);
+    row.copies = 1;
+    while (r < count &&
+           !(rows[r].line == row.line && rows[r].kernel == row.kernel &&
+             rows[r].estimated == row.estimated &&
+             ex_same_text(rows[r].bound, row.bound))) {
+      r++;
+    }
+    if (r < count) {
+      rows[r].copies++;
+      if (row.low < rows[r].low) {
+        rows[r].low = row.low;
+      }
+      if (row.high > rows[r].high) {
+        rows[r].high = row.high;
+      }
+      continue;
+    }
+    rows[count++] = row;
+  }
+  if (count > 1) {
+    qsort(rows, count, sizeof(*rows), ex_loop_row_order);
+  }
+  for (size_t r = 0; r < count; r++) {
+    const ExLoopRow *row = &rows[r];
+    char cycles[64];
+    char copies[32] = "";
+    if (row->low == row->high) {
+      snprintf(cycles, sizeof(cycles), "%lld", row->low);
+    } else {
+      snprintf(cycles, sizeof(cycles), "%lld to %lld", row->low, row->high);
+    }
+    if (row->copies > 1) {
+      snprintf(copies, sizeof(copies), ", %d copies", row->copies);
+    }
+    ex_field_owned(entry, "Loop",
+                   ex_fmt("line %lld: %s cycles per iteration%s%s%s%s%s",
+                          row->line, cycles, row->bound ? ", bound by " : "",
+                          row->bound ? row->bound : "",
+                          row->kernel ? ", runs a kernel" : "",
+                          row->estimated ? ", estimated" : "", copies),
+                   EX_TONE_PLAIN);
+  }
+  free(rows);
 }
 
 static void ex_build_functions(ExReport *report, const ExJson *root) {
@@ -630,25 +930,7 @@ static void ex_build_functions(ExReport *report, const ExJson *root) {
                           ex_json_int(f, "hotCost", 0),
                           ex_json_int(f, "vectorOps", 0)),
                    EX_TONE_PLAIN);
-    for (size_t l = 0; l < ex_json_count(loops); l++) {
-      const ExJson *loop = ex_json_at(loops, l);
-      const char *bound = ex_json_text(loop, "bottleneck");
-      const char *owner = ex_json_text(loop, "fn");
-      if (!owner || !fn || strcmp(owner, fn) != 0) {
-        continue;
-      }
-      ex_field_owned(entry, "Loop",
-                     ex_fmt("line %lld: %lld cycles per iteration%s%s%s%s",
-                            ex_json_int(loop, "line", 0),
-                            ex_json_int(loop, "cyclesPerIter", 0),
-                            bound ? ", bound by " : "", bound ? bound : "",
-                            ex_json_flag(loop, "hasKernel")
-                                ? ", runs a kernel"
-                                : "",
-                            ex_json_flag(loop, "estimated") ? ", estimated"
-                                                            : ""),
-                     EX_TONE_PLAIN);
-    }
+    ex_loop_fields(entry, loops, fn);
     for (size_t c = 0; c < ex_json_count(graph); c++) {
       const ExJson *edge = ex_json_at(graph, c);
       const char *caller = ex_json_text(edge, "caller");
@@ -866,6 +1148,7 @@ static void ex_build_proofs(ExReport *report, const ExJson *root) {
     ex_finish(entry);
   }
   ex_more(tab, root, "beliefsTotal", "Beliefs", ex_json_count(beliefs));
+  ex_merge_repeats(tab, "Places");
 }
 
 static int ex_pass_order(const void *a, const void *b) {
@@ -1031,19 +1314,7 @@ void ex_report_free(ExReport *report) {
   for (int t = 0; t < EX_TAB_COUNT; t++) {
     ExTab *tab = &report->tabs[t];
     for (size_t i = 0; i < tab->count; i++) {
-      ExEntry *e = &tab->entries[i];
-      free(e->group);
-      for (int c = 0; c < EX_CELLS; c++) {
-        free(e->cells[c]);
-      }
-      free(e->title);
-      for (size_t f = 0; f < e->field_count; f++) {
-        free(e->fields[f].label);
-        free(e->fields[f].text);
-      }
-      free(e->fields);
-      free(e->code);
-      free(e->search);
+      ex_entry_free(&tab->entries[i]);
     }
     free(tab->entries);
     for (size_t s = 0; s < tab->summary_count; s++) {

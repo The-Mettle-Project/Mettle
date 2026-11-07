@@ -5,6 +5,7 @@
 
 int mettle_explain_is_view_target(const char *arg);
 int mettle_explain_parse_flag(CompilerOptions *options, const char *arg);
+unsigned mettle_explain_build_key(int argc, char **argv);
 int mettle_explain_report_file(int argc, char **argv);
 int mettle_explain_view(CompilerOptions *options);
 

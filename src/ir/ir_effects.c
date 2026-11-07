@@ -1828,7 +1828,8 @@ static void ledger_effects(Ctx *ctx) {
     if (!used && !need_used) {
       continue;
     }
-    ir_explain_effect_held(display_name(efn->fn->name),
+    ir_explain_effect_held(efn->fn->location.filename,
+                           display_name(efn->fn->name),
                            used ? performs : NULL,
                            need_used ? needs : NULL);
   }

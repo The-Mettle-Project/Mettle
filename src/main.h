@@ -64,6 +64,7 @@ typedef struct {
   int explain_view_columns;
   int explain_view_rows;
   const char *explain_view_keys;
+  unsigned explain_view_key;
   int annotate_asm;
   int asm_syntax;
   int annotate_q_lo;
