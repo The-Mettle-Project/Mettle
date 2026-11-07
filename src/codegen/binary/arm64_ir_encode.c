@@ -1345,11 +1345,27 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const StrSet *fs,
 static void lower_unary(Arm64Emit *e, SlotMap *s, const StrSet *fs,
                         const IRInstruction *in) {
   const char *op = in->text;
+  if (strcmp(op, "f32bits") == 0 || strcmp(op, "f64bits") == 0) {
+    int d = op[1] == '6';
+    load_float_operand(e, s, fs, &in->lhs, d, 0, R_LHS);
+    arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+    store_dest(e, s, &in->dest, R_RES);
+    return;
+  }
+  if (strcmp(op, "bitsf") == 0) {
+    int d = in->float_bits != 32;
+    Arm64Reg a = load_into(e, s, &in->lhs, R_LHS);
+    arm64_emit_word(e, arm64_fmov_gp(d, 0, a));
+    arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+    store_dest(e, s, &in->dest, R_RES);
+    return;
+  }
   if (in->is_float || operand_is_float(fs, &in->lhs)) {
     int d = float_op_bits(fs, &in->lhs, NULL, in->float_bits) != 32;
-    if (strcmp(op, "-") == 0) {
+    if (strcmp(op, "-") == 0 || strcmp(op, "sqrt") == 0) {
       load_float_operand(e, s, fs, &in->lhs, d, 0, R_LHS);
-      arm64_emit_word(e, arm64_fneg(d, 0, 0));
+      arm64_emit_word(e, op[0] == '-' ? arm64_fneg(d, 0, 0)
+                                      : arm64_fsqrt(d, 0, 0));
       arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
       store_dest(e, s, &in->dest, R_RES);
       return;

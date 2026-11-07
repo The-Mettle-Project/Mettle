@@ -1490,7 +1490,7 @@ $cases = @(
   @{ Name = "lambda"; Path = "tests/test_lambda.mettle"; ShouldSucceed = $true },
   @{ Name = "err_var_inferred"; Path = "tests/err_var_inferred.mettle"; ShouldSucceed = $false; Pattern = "global variable 'total' requires an explicit type"; OutputMustNotMatch = @("Undefined variable") },
   @{ Name = "err_var_inferred_promotion"; Path = "tests/err_var_inferred_promotion.mettle"; ShouldSucceed = $false; Pattern = "'int32 \* int64' gives 'int64' by promotion"; OutputMustMatch = @("write 'var total: int64 = \.\.\.'"); OutputMustNotMatch = @("Undefined variable") },
-  @{ Name = "err_var_inferred_float_literal"; Path = "tests/err_var_inferred_float_literal.mettle"; ShouldSucceed = $false; Pattern = "'float32 \* float64' gives 'float64' by promotion" },
+  @{ Name = "err_var_inferred_float_promotion"; Path = "tests/err_var_inferred_float_promotion.mettle"; ShouldSucceed = $false; Pattern = "'float32 \* float64' gives 'float64' by promotion" },
   @{ Name = "err_var_inferred_void"; Path = "tests/err_var_inferred_void.mettle"; ShouldSucceed = $false; Pattern = "'x' needs a written type: its initializer returns nothing" },
   @{ Name = "err_var_inferred_aggregate"; Path = "tests/err_var_inferred_aggregate.mettle"; ShouldSucceed = $false; Pattern = "an aggregate literal takes the type of what it initializes"; OutputMustNotMatch = @("Undefined variable") },
   @{ Name = "err_var_inferred_capture"; Path = "tests/err_var_inferred_capture.mettle"; ShouldSucceed = $false; Pattern = "cannot capture 'side' in a closure" },
@@ -22184,8 +22184,9 @@ $issueRegressions = @(
   @{ Name = "float_copy_read_by_return_O"; Entry = "tests/issues/float_copy_read_by_return.mettle"; Args = @("-O"); Expect = @("0 4 50") },
   @{ Name = "sroa_keeps_a_piece_written_by_arithmetic"; Entry = "tests/issues/sroa_unread_piece_arithmetic.mettle"; Args = @("-O"); Expect = @("0") },
   @{ Name = "safe_keeps_the_declaration_of_a_dead_addressed_local"; Entry = "tests/issues/safe_dead_block_addressed_local.mettle"; Args = @("--safe", "--release"); Expect = @("5") },
-  @{ Name = "pointer_method_on_value"; Command = @("--build", "tests/issues/err_pointer_method_on_value.mettle", "-o", ".tmp/issue_err.exe"); Refuse = @("Built executable", "Undefined method"); Expect = @("Method 'bump' on 'Counter' takes a pointer receiver", "'(&c)->bump(...)'", "err_pointer_method_on_value.mettle:10:") },
-  @{ Name = "pointer_method_on_generic_value"; Command = @("--build", "tests/issues/err_pointer_method_on_generic_value.mettle", "-o", ".tmp/issue_err.exe"); Refuse = @("Built executable", "Undefined method"); Expect = @("Method 'push' on 'Stack<int32>' takes a pointer receiver", "'(&s)->push(...)'") },
+  @{ Name = "pointer_method_on_value"; Entry = "tests/issues/pointer_method_on_value.mettle"; Args = @(); Expect = @("5") },
+  @{ Name = "pointer_method_on_generic_value"; Entry = "tests/issues/pointer_method_on_generic_value.mettle"; Args = @(); Expect = @("1") },
+  @{ Name = "pointer_method_on_temporary"; Command = @("--build", "tests/issues/err_pointer_method_on_temporary.mettle", "-o", ".tmp/issue_err.exe"); Refuse = @("Built executable"); Expect = @("this one is a temporary") },
   @{ Name = "function_falls_off_its_end"; Command = @("--build", "tests/issues/err_function_falls_off_end.mettle", "-o", ".tmp/issue_err.exe"); Refuse = @("Built executable"); Expect = @("Function 'f' can reach its end without returning a 'int32'", "Function 'g' can reach its end without returning a 'E'") },
   @{ Name = "main_returns_an_exit_status"; Command = @("--build", "tests/issues/err_main_returns_string.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("'main' returns the exit status") },
   @{ Name = "address_of_constant_is_a_diagnostic"; Command = @("--build", "tests/issues/err_address_of_constant.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("is a constant and has no address") },
@@ -22223,7 +22224,20 @@ $issueRegressions = @(
   @{ Name = "naked_skips_effect_checks"; Command = @("--verify", "--build", "tests/issues/naked_with_effect_checks.mettle", "-o", ".tmp/issue_naked_verify.exe"); Refuse = @("is ``@naked``"); Expect = @("Built executable") },
   @{ Name = "signature_error_stops_the_build"; Command = @("--build", "tests/issues/err_with_none_on_body.mettle", "-o", ".tmp/issue_err.exe"); Refuse = @("Built executable"); Expect = @("stands alone") },
   @{ Name = "random_range_extremes"; Entry = "tests/issues/random_range_extremes.mettle"; Args = @("--check-overflow"); Refuse = @("Fatal error"); Expect = @("bad 0") },
-  @{ Name = "verify_follows_pointers"; Command = @("--verify", "--build", "tests/issues/verify_follows_pointers.mettle", "-o", ".tmp/issue_verify.exe"); Refuse = @("MISCOMPILE"); Expect = @("Built executable") }
+  @{ Name = "verify_follows_pointers"; Command = @("--verify", "--build", "tests/issues/verify_follows_pointers.mettle", "-o", ".tmp/issue_verify.exe"); Refuse = @("MISCOMPILE"); Expect = @("Built executable") },
+  @{ Name = "float_literal_takes_float32"; Entry = "tests/issues/float_literal_takes_float32.mettle"; Args = @(); Expect = @("16 0.26 4.5 false") },
+  @{ Name = "float_literal_takes_float32_release"; Entry = "tests/issues/float_literal_takes_float32.mettle"; Args = @("--release"); Expect = @("16 0.26 4.5 false") },
+  @{ Name = "float_literal_map_vectorizes"; Command = @("--release", "--explain", "tests/issues/float_literal_takes_float32.mettle", "-o", ".tmp/issue_flit.obj"); Expect = @("scale (loop @ line 5): vectorized") },
+  @{ Name = "if_arm_and_case_list"; Entry = "tests/issues/if_arm_and_case_list.mettle"; Args = @(); Expect = @("6 7", "-5 5 12 1 0", "1 1 1 3 0", "10 10 20 20 0") },
+  @{ Name = "if_arm_and_case_list_release"; Entry = "tests/issues/if_arm_and_case_list.mettle"; Args = @("--release"); Expect = @("6 7", "-5 5 12 1 0", "1 1 1 3 0", "10 10 20 20 0") },
+  @{ Name = "panic_stops_with_message"; Entry = "tests/issues/panic_stops_with_message.mettle"; Args = @(); Refuse = @("Fatal error"); Expect = @("5 3", "panic: odd value 7", "in half") },
+  @{ Name = "panic_fails_the_test"; Command = @("test", "tests/issues/panic_stops_with_message.mettle"); Expect = @("crashed: panic: odd value 7", "1 passed, 1 failed") },
+  @{ Name = "float32_math_and_sqrt"; Entry = "tests/issues/float32_math_and_sqrt.mettle"; Args = @(); Expect = @("bad 0") },
+  @{ Name = "float32_math_and_sqrt_release"; Entry = "tests/issues/float32_math_and_sqrt.mettle"; Args = @("--release"); Expect = @("bad 0") },
+  @{ Name = "float32_math_in_the_interpreter"; Command = @("test", "tests/issues/float32_math_and_sqrt.mettle"); Expect = @("1 passed") },
+  @{ Name = "selective_import_then_time"; Entry = "tests/issues/selective_import_then_time.mettle"; Args = @(); Expect = @("clock ok") },
+  @{ Name = "unknown_signature_type_is_named"; Command = @("tests/issues/err_unknown_signature_type.mettle", "-o", ".tmp/issue_err.obj"); Refuse = @("Unknown error"); Expect = @("Undefined type 'Missing<int64>'") },
+  @{ Name = "interp_array_values_copy"; Command = @("test", "tests/issues/interp_array_values_copy.mettle"); Expect = @("1 passed") }
 )
 foreach ($case in $issueRegressions) {
   $total++

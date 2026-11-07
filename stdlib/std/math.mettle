@@ -1,15 +1,17 @@
-export fn f64_bits(x: float64) -> int64 {
-  var v: float64 = x;
-  var pf: float64* = &v;
-  var pi: int64* = (int64*)pf;
-  return *pi;
+@inline export fn f64_bits(x: float64) -> int64 {
+  return __mtl_f64_bits(x);
 }
 
-export fn f64_from_bits(b: int64) -> float64 {
-  var v: int64 = b;
-  var pi: int64* = &v;
-  var pf: float64* = (float64*)pi;
-  return *pf;
+@inline export fn f64_from_bits(b: int64) -> float64 {
+  return __mtl_f64_from_bits(b);
+}
+
+@inline export fn bits_from_f32(x: float32) -> uint32 {
+  return __mtl_f32_bits(x);
+}
+
+@inline export fn f32_from_bits(b: uint32) -> float32 {
+  return __mtl_f32_from_bits(b);
 }
 
 fn EXP_MASK() -> int64 { return 0x7FF; }
@@ -254,81 +256,8 @@ export fn fmod(x: float64, y: float64) -> float64 {
   return copysign(a, x);
 }
 
-fn sqrt_square(a: uint64, hi: uint64*, lo: uint64*) {
-  var a1: uint64 = a >> (uint64)32;
-  var a0: uint64 = a & (uint64)4294967295;
-  var cross: uint64 = a1 * a0;
-  var low: uint64 = a0 * a0;
-  var mid: uint64 = cross << (uint64)33;
-  var sum: uint64 = low + mid;
-  var carry: uint64 = 0;
-  if (sum < low) { carry = 1; }
-  *hi = a1 * a1 + (cross >> (uint64)31) + carry;
-  *lo = sum;
-}
-
-fn sqrt_below(ahi: uint64, alo: uint64, bhi: uint64, blo: uint64) -> bool {
-  return ahi < bhi || (ahi == bhi && alo < blo);
-}
-
-fn sqrt_estimate(x: float64) -> float64 {
-  var e: int32 = 0;
-  var m: float64 = frexp(x, &e);
-  if ((e & 1) != 0) {
-    m = m * 2.0;
-    e = e - 1;
-  }
-  var y: float64 = 0.41731 + 0.59016 * m;
-  y = 0.5 * (y + m / y);
-  y = 0.5 * (y + m / y);
-  y = 0.5 * (y + m / y);
-  y = 0.5 * (y + m / y);
-  return ldexp(y, e / 2);
-}
-
-export fn sqrt(x: float64) -> float64 {
-  if (is_nan(x) != 0) { return x; }
-  if (x < 0.0) { return NAN(); }
-  if (x == 0.0) { return x; }
-  if (is_inf(x) != 0) { return x; }
-
-  var bits: int64 = f64_bits(x);
-  var exponent: int64 = (bits >> 52) & 2047;
-  var mant: uint64 = (uint64)(bits & 4503599627370495);
-  if (exponent == 0) {
-    exponent = 1;
-    while ((mant & (uint64)4503599627370496) == (uint64)0) {
-      mant = mant << (uint64)1;
-      exponent = exponent - 1;
-    }
-  } else {
-    mant = mant | (uint64)4503599627370496;
-  }
-  var e2: int64 = exponent - 1075;
-  if ((e2 & 1) != 0) {
-    mant = mant << (uint64)1;
-    e2 = e2 - 1;
-  }
-  var half: int32 = (int32)((e2 - 52) / 2);
-  var y: uint64 = (uint64)(int64)ldexp(sqrt_estimate(x), -half);
-  var four_hi: uint64 = mant >> (uint64)10;
-  var four_lo: uint64 = mant << (uint64)54;
-  var hi: uint64 = 0;
-  var lo: uint64 = 0;
-  for _attempt in 0..4 {
-    sqrt_square(y * (uint64)2 + (uint64)1, &hi, &lo);
-    if (!sqrt_below(four_hi, four_lo, hi, lo)) {
-      y = y + (uint64)1;
-      continue;
-    }
-    sqrt_square(y * (uint64)2 - (uint64)1, &hi, &lo);
-    if (sqrt_below(four_hi, four_lo, hi, lo)) {
-      y = y - (uint64)1;
-      continue;
-    }
-    break;
-  }
-  return ldexp((float64)y, half);
+@inline export fn sqrt(x: float64) -> float64 {
+  return __mtl_sqrt(x);
 }
 
 export fn rsqrt(x: float64) -> float64 {
@@ -1329,32 +1258,195 @@ export fn imod_floor(a: int64, b: int64) -> int64 {
   return a - idiv_floor(a, b) * b;
 }
 
-export fn f32_abs(x: float32) -> float32 {
-  if (x < 0.0) { return -x; }
-  if (x == 0.0) { return 0.0; }
-  return x;
+@inline export fn f32_abs(x: float32) -> float32 {
+  return f32_from_bits(bits_from_f32(x) & (uint32)0x7FFFFFFF);
 }
 
-export fn f32_min(a: float32, b: float32) -> float32 {
-  if (a < b) { return a; }
-  return b;
+@inline export fn f32_copysign(magnitude: float32, sign: float32) -> float32 {
+  return f32_from_bits((bits_from_f32(magnitude) & (uint32)0x7FFFFFFF) |
+                       (bits_from_f32(sign) & (uint32)0x80000000));
 }
 
-export fn f32_max(a: float32, b: float32) -> float32 {
-  if (a > b) { return a; }
-  return b;
+@inline export fn f32_min(a: float32, b: float32) -> float32 {
+  return if (a < b) a else b;
 }
 
-export fn f32_clamp(value: float32, lo: float32, hi: float32) -> float32 {
-  if (value < lo) { return lo; }
-  if (value > hi) { return hi; }
-  return value;
+@inline export fn f32_max(a: float32, b: float32) -> float32 {
+  return if (a > b) a else b;
 }
 
-export fn f32_lerp(a: float32, b: float32, t: float32) -> float32 {
+@inline export fn f32_clamp(value: float32, lo: float32, hi: float32) -> float32 {
+  var low: float32 = if (value < lo) lo else value;
+  return if (low > hi) hi else low;
+}
+
+@inline export fn f32_lerp(a: float32, b: float32, t: float32) -> float32 {
   return a + (b - a) * t;
 }
 
-export fn f32_sqrt(x: float32) -> float32 {
-  return (float32)sqrt((float64)x);
+@inline export fn f32_sqrt(x: float32) -> float32 {
+  return __mtl_sqrt(x);
+}
+
+@inline export fn f32_rsqrt(x: float32) -> float32 {
+  return 1.0 / __mtl_sqrt(x);
+}
+
+@inline export fn f32_trunc(x: float32) -> float32 {
+  var whole: float32 = f32_copysign((float32)(int32)x, x);
+  return if (f32_abs(x) < 8388608.0) whole else x;
+}
+
+@inline export fn f32_floor(x: float32) -> float32 {
+  var t: float32 = f32_trunc(x);
+  return if (t > x) t - 1.0 else t;
+}
+
+@inline export fn f32_ceil(x: float32) -> float32 {
+  var t: float32 = f32_trunc(x);
+  return if (t < x) t + 1.0 else t;
+}
+
+@inline export fn f32_round(x: float32) -> float32 {
+  var t: float32 = f32_trunc(x);
+  var away: float32 = t + f32_copysign(1.0, x);
+  return if (f32_abs(x - t) >= 0.5) away else t;
+}
+
+@inline fn f32_scale_pow2(p: float32, n: float32) -> float32 {
+  var k: int32 = (int32)(if (n == n) n else 0.0);
+  var k1: int32 = k >> 1;
+  var k2: int32 = k - k1;
+  var a: float32 = f32_from_bits((uint32)(k1 + 127) << (uint32)23);
+  var b: float32 = f32_from_bits((uint32)(k2 + 127) << (uint32)23);
+  return p * a * b;
+}
+
+@inline export fn f32_exp(x: float32) -> float32 {
+  var c: float32 = if (x > 88.75) 88.75 else x;
+  c = if (c < -104.0) -104.0 else c;
+  var n: float32 = (c * 1.4426950408889634 + 12582912.0) - 12582912.0;
+  var r: float32 = c - n * 0.693359375;
+  r = r - n * -2.12194440e-4;
+  var q: float32 = (((0.0013901287456974387 * r + 0.008363144472241402) * r +
+                     0.04166685417294502) * r + 0.16666577756404877) * r + 0.5;
+  return f32_scale_pow2(q * (r * r) + r + 1.0, n);
+}
+
+@inline export fn f32_exp2(x: float32) -> float32 {
+  return f32_exp(x * 0.6931471805599453);
+}
+
+@inline export fn f32_log(x: float32) -> float32 {
+  var tiny: bool = x < 1.17549435e-38;
+  var xs: float32 = if (tiny) x * 8388608.0 else x;
+  var b: uint32 = bits_from_f32(xs);
+  var bias: int32 = if (tiny) 150 else 127;
+  var e: int32 = (int32)((b >> (uint32)23) & (uint32)255) - bias;
+  var m: float32 = f32_from_bits((b & (uint32)0x007FFFFF) | (uint32)0x3F800000);
+  var big: bool = m > 1.41421356;
+  m = if (big) m * 0.5 else m;
+  e = if (big) e + 1 else e;
+  var t: float32 = m - 1.0;
+  var z: float32 = t * t;
+  var p: float32 = (((((((0.07037681341171265 * t - 0.11514607816934586) * t +
+                         0.11676998436450958) * t - 0.12420140951871872) * t +
+                       0.14249323308467865) * t - 0.16668057441711426) * t +
+                     0.2000071406364441) * t - 0.24999994039535522) * t +
+                   0.3333333134651184;
+  var fe: float32 = (float32)e;
+  var y: float32 = p * z * t;
+  y = y + fe * -2.12194440e-4;
+  y = y - z * 0.5;
+  var r: float32 = t + y + fe * 0.693359375;
+  r = if (x > 3.40282347e38) x else r;
+  r = if (x == 0.0) f32_from_bits((uint32)0xFF800000) else r;
+  r = if (x < 0.0) f32_from_bits((uint32)0x7FC00000) else r;
+  return if (x != x) x else r;
+}
+
+@inline export fn f32_log2(x: float32) -> float32 {
+  return f32_log(x) * 1.4426950408889634;
+}
+
+@inline export fn f32_log10(x: float32) -> float32 {
+  return f32_log(x) * 0.4342944819032518;
+}
+
+export fn f32_pow(base: float32, exponent: float32) -> float32 {
+  return (float32)pow((float64)base, (float64)exponent);
+}
+
+@inline export fn f32_tanh(x: float32) -> float32 {
+  var a: float32 = f32_abs(x);
+  var s: float32 = x * x;
+  var q: float32 = (((-0.006096941418945789 * s + 0.02099735662341118) * s -
+                     0.05385095253586769) * s + 0.13332770764827728) * s -
+                   0.333333283662796;
+  var small: float32 = q * s * x + x;
+  var big: float32 = 1.0 - 2.0 / (f32_exp(a + a) + 1.0);
+  big = f32_copysign(big, x);
+  return if (a < 0.625) small else big;
+}
+
+@inline export fn f32_sigmoid(x: float32) -> float32 {
+  var e: float32 = f32_exp(-f32_abs(x));
+  var d: float32 = 1.0 + e;
+  return if (x >= 0.0) 1.0 / d else e / d;
+}
+
+@inline export fn f32_erf(x: float32) -> float32 {
+  var a: float32 = f32_abs(x);
+  var s: float32 = x * x;
+  var p: float32 = ((((8.790517313173041e-05 * s - 0.0008248029043897986) * s +
+                      0.005210821516811848) * s - 0.026863522827625275) * s +
+                    0.11283771693706512) * s - 0.37612637877464294;
+  var small: float32 = (p * s + 0.12837916709551256) * x + x;
+  var t: float32 = if (a > 4.0) 4.0 else a;
+  var l: float32 = (((((((1.6024856677177013e-06 * t - 4.5354492613114417e-05) * t +
+                         0.0005907144513912499) * t - 0.004730277694761753) * t +
+                       0.02633552812039852) * t - 0.10992515832185745) * t -
+                     0.6319953799247742) * t - 1.130131483078003) * t +
+                   0.0002942715073004365;
+  var big: float32 = f32_copysign(1.0 - f32_exp(l), x);
+  return if (a < 0.9277) small else big;
+}
+
+@inline export fn f32_gelu(x: float32) -> float32 {
+  return 0.5 * x * (1.0 + f32_erf(x * 0.7071067811865476));
+}
+
+fn f32_sincos_reduced(x: float32, quadrant_offset: int64) -> float32 {
+  var xd: float64 = (float64)x;
+  var jd: float64 = (xd * 0.6366197723675814 + 6755399441055744.0) - 6755399441055744.0;
+  var rd: float64 = (xd - jd * 1.57079632673412561417e+00) - jd * 6.07710050650619224932e-11;
+  var r: float32 = (float32)rd;
+  var s: float32 = r * r;
+  var sq: float32 = ((2.7249411687080283e-06 * s - 0.00019840082677546889) * s +
+                     0.008333331905305386) * s - 0.1666666716337204;
+  var cq: float32 = ((-2.73006861561953e-07 * s + 2.4800598112051375e-05) * s -
+                     0.00138888880610466) * s + 0.0416666679084301;
+  var sn: float32 = sq * s * r + r;
+  var cs: float32 = cq * (s * s) - s * 0.5 + 1.0;
+  var quadrant: int64 = ((int64)jd + quadrant_offset) & 3;
+  var v: float32 = if ((quadrant & 1) != 0) cs else sn;
+  return if ((quadrant & 2) != 0) -v else v;
+}
+
+export fn f32_sin(x: float32) -> float32 {
+  if (f32_abs(x) > 1600000.0) {
+    return (float32)sin((float64)x);
+  }
+  return f32_sincos_reduced(x, 0);
+}
+
+export fn f32_cos(x: float32) -> float32 {
+  if (f32_abs(x) > 1600000.0) {
+    return (float32)cos((float64)x);
+  }
+  return f32_sincos_reduced(x, 1);
+}
+
+export fn f32_tan(x: float32) -> float32 {
+  return (float32)tan((float64)x);
 }

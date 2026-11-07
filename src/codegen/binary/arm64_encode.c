@@ -223,6 +223,10 @@ uint32_t arm64_fneg(int is_double, int fd, int fn) {
   uint32_t base = is_double ? 0x1E614000u : 0x1E214000u;
   return base | (R5(fn) << 5) | R5(fd);
 }
+uint32_t arm64_fsqrt(int is_double, int fd, int fn) {
+  uint32_t base = is_double ? 0x1E61C000u : 0x1E21C000u;
+  return base | (R5(fn) << 5) | R5(fd);
+}
 uint32_t arm64_fcmp(int is_double, int fn, int fm) {
   uint32_t base = is_double ? 0x1E602000u : 0x1E202000u;
   return base | (R5(fm) << 16) | (R5(fn) << 5);

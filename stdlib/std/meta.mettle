@@ -283,6 +283,26 @@ fn emit_op(r: Render*, op: IROp) {
       emit_store_to(r, op.dest, "(int64)({value_read(op.lhs)} == 0)");
       return;
     }
+    if (op.text == "sqrt") {
+      emit_store_to(r, op.dest, "__mtl_sqrt({value_read(op.lhs)})");
+      return;
+    }
+    if (op.text == "f32bits") {
+      emit_store_to(r, op.dest, "(int64)__mtl_f32_bits((float32){value_read(op.lhs)})");
+      return;
+    }
+    if (op.text == "f64bits") {
+      emit_store_to(r, op.dest, "__mtl_f64_bits((float64){value_read(op.lhs)})");
+      return;
+    }
+    if (op.text == "bitsf") {
+      if (op.dest.type_name == "float32") {
+        emit_store_to(r, op.dest, "__mtl_f32_from_bits((uint32){value_read(op.lhs)})");
+      } else {
+        emit_store_to(r, op.dest, "__mtl_f64_from_bits({value_read(op.lhs)})");
+      }
+      return;
+    }
     emit_store_to(r, op.dest, "{op.text}{value_read(op.lhs)}");
     return;
   }
@@ -1209,7 +1229,15 @@ fn ad_emit_op(r: Render*, op: IROp, root: FunctionInfo) {
     return;
   }
   if (op.op == "unary" && type_is_float(op.dest.type_name)) {
-    text_add(t, "  d__{op.dest.text} = ad_node({ad_shadow_of(op.lhs)}, -1.0, (int64)-1, 0.0);\n");
+    if (op.text == "bitsf") {
+      text_add(t, "  d__{op.dest.text} = (int64)-1;\n");
+    } else if (op.text == "sqrt") {
+      text_add(t, "  d__{op.dest.text} = ad_node({ad_shadow_of(op.lhs)}, 0.5 / __mtl_sqrt({as_f64(op.lhs)}), (int64)-1, 0.0);\n");
+    } else if (op.text == "+") {
+      text_add(t, "  d__{op.dest.text} = ad_node({ad_shadow_of(op.lhs)}, 1.0, (int64)-1, 0.0);\n");
+    } else {
+      text_add(t, "  d__{op.dest.text} = ad_node({ad_shadow_of(op.lhs)}, -1.0, (int64)-1, 0.0);\n");
+    }
     emit_op(r, op);
     return;
   }

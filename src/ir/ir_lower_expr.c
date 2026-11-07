@@ -1689,6 +1689,147 @@ static int ir_lower_native_assert(IRLoweringContext *context,
   return ok;
 }
 
+static int ir_call_is_panic(IRLoweringContext *context,
+                            const CallExpression *call) {
+  Symbol *symbol;
+  if (call->object || call->argument_count != 1 ||
+      strcmp(call->function_name, "panic") != 0) {
+    return 0;
+  }
+  symbol = symbol_table_lookup(context->symbol_table, "panic");
+  return symbol && symbol->is_builtin;
+}
+
+static void ir_declare_panic_helper(IRLoweringContext *context) {
+  IRModuleSymbol entry = {0};
+  MtlcType *params[2];
+  if (ir_program_lookup_symbol(context->program, "mettle_crash_panic")) {
+    return;
+  }
+  params[0] = mtlc_type_from_frontend(context->type_checker->builtin_rawptr);
+  params[1] = mtlc_type_from_frontend(context->type_checker->builtin_uint64);
+  entry.name = (char *)"mettle_crash_panic";
+  entry.kind = IR_MODSYM_FUNCTION;
+  entry.is_extern = 1;
+  entry.type = mtlc_type_from_frontend(context->type_checker->builtin_void);
+  entry.return_type = entry.type;
+  entry.param_types = params;
+  entry.param_count = 2;
+  ir_program_add_symbol(context->program, &entry);
+}
+
+static int ir_lower_panic(IRLoweringContext *context, IRFunction *function,
+                          ASTNode *expression, const CallExpression *call,
+                          IROperand *out_value) {
+  IROperand message = ir_operand_none();
+  IROperand arguments[2] = {ir_operand_none(), ir_operand_none()};
+  int ok;
+  if (!ir_lower_expression(context, function, call->arguments[0], &message)) {
+    return 0;
+  }
+  ok = ir_string_operand_fields(context, function, &message,
+                                expression->location, &arguments[0],
+                                &arguments[1]);
+  if (ok) {
+    IRInstruction instruction = {0};
+    instruction.op = IR_OP_CALL;
+    instruction.location = expression->location;
+    instruction.text = (char *)"mettle_crash_panic";
+    instruction.arguments = arguments;
+    instruction.argument_count = 2;
+    ir_declare_panic_helper(context);
+    ok = ir_emit(context, function, &instruction);
+  }
+  ir_operand_destroy(&message);
+  ir_operand_destroy(&arguments[0]);
+  ir_operand_destroy(&arguments[1]);
+  if (ok && out_value) {
+    *out_value = ir_operand_none();
+  }
+  return ok;
+}
+
+static int ir_lower_float_bits_builtin(IRLoweringContext *context,
+                                       IRFunction *function,
+                                       ASTNode *expression,
+                                       const CallExpression *call,
+                                       IROperand *out_value, int *handled) {
+  static const struct {
+    const char *name;
+    const char *text;
+    int result_float_bits;
+  } ops[] = {
+      {"__mtl_sqrt", "sqrt", -1},
+      {"__mtl_f32_bits", "f32bits", 0},
+      {"__mtl_f64_bits", "f64bits", 0},
+      {"__mtl_f32_from_bits", "bitsf", 32},
+      {"__mtl_f64_from_bits", "bitsf", 64},
+  };
+  size_t which = sizeof(ops) / sizeof(ops[0]);
+  for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+    if (strcmp(call->function_name, ops[i].name) == 0) {
+      which = i;
+    }
+  }
+  *handled = which < sizeof(ops) / sizeof(ops[0]);
+  if (!*handled) {
+    return 0;
+  }
+  IROperand operand = ir_operand_none();
+  IROperand destination = ir_operand_none();
+  if (!ir_lower_expression(context, function, call->arguments[0], &operand)) {
+    return 0;
+  }
+  if (!ir_make_temp_operand(context, &destination)) {
+    ir_operand_destroy(&operand);
+    return 0;
+  }
+  int float_bits = ops[which].result_float_bits < 0
+                       ? ir_expression_float_bits(context, expression)
+                       : ops[which].result_float_bits;
+  IRInstruction instruction = {0};
+  instruction.op = IR_OP_UNARY;
+  instruction.location = expression->location;
+  instruction.dest = destination;
+  instruction.lhs = operand;
+  instruction.text = (char *)ops[which].text;
+  instruction.is_float = float_bits != 0;
+  instruction.float_bits = float_bits;
+  if (float_bits) {
+    instruction.dest.float_bits = float_bits;
+    destination.float_bits = float_bits;
+  }
+  int ok = ir_emit(context, function, &instruction);
+  ir_operand_destroy(&operand);
+  if (!ok) {
+    ir_operand_destroy(&destination);
+    return 0;
+  }
+  *out_value = destination;
+  return 1;
+}
+
+static int ir_lower_intrinsic_call(IRLoweringContext *context,
+                                   IRFunction *function, ASTNode *expression,
+                                   CallExpression *call, IROperand *out_value,
+                                   int *handled) {
+  *handled = 1;
+  if (ir_call_is_native_assert(context, function, call)) {
+    return ir_lower_native_assert(context, function, expression, call,
+                                  out_value);
+  }
+  if (ir_call_is_panic(context, call)) {
+    return ir_lower_panic(context, function, expression, call, out_value);
+  }
+  *handled = 0;
+  if (call->object || call->argument_count != 1 ||
+      strncmp(call->function_name, "__mtl_", 6) != 0) {
+    return 0;
+  }
+  return ir_lower_float_bits_builtin(context, function, expression, call,
+                                     out_value, handled);
+}
+
 int ir_lower_call_expression(IRLoweringContext *context,
                                     IRFunction *function, ASTNode *expression,
                                     IROperand *out_value) {
@@ -1699,9 +1840,13 @@ int ir_lower_call_expression(IRLoweringContext *context,
     return 0;
   }
 
-  if (ir_call_is_native_assert(context, function, call)) {
-    return ir_lower_native_assert(context, function, expression, call,
-                                  out_value);
+  {
+    int handled = 0;
+    int lowered = ir_lower_intrinsic_call(context, function, expression, call,
+                                          out_value, &handled);
+    if (handled) {
+      return lowered;
+    }
   }
 
   if (!call->object && (strcmp(call->function_name, "drop") == 0 ||
@@ -2888,6 +3033,15 @@ static int ir_lower_unary_expression(IRLoweringContext *context,
   if (!ir_lower_expression(context, function, unary->operand, &operand)) {
     return 0;
   }
+  if (operand.kind == IR_OPERAND_FLOAT &&
+      (strcmp(unary->operator, "-") == 0 ||
+       strcmp(unary->operator, "+") == 0)) {
+    if (unary->operator[0] == '-') {
+      operand.float_value = -operand.float_value;
+    }
+    *out_value = operand;
+    return 1;
+  }
 
   IROperand destination = ir_operand_none();
   if (!ir_make_temp_operand(context, &destination)) {
@@ -3736,7 +3890,11 @@ static int ir_lower_expression_inner(IRLoweringContext *context,
       return 0;
     }
     if (literal->is_float) {
-      *out_value = ir_operand_float(literal->float_value);
+      Type *literal_type = ir_infer_expression_type(context, expression);
+      *out_value =
+          literal_type && literal_type->kind == TYPE_FLOAT32
+              ? ir_operand_float_sized((double)(float)literal->float_value, 32)
+              : ir_operand_float(literal->float_value);
     } else {
       *out_value = ir_operand_int(literal->int_value);
     }

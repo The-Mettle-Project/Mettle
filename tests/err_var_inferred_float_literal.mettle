@@ -1,6 +1,0 @@
-// A float literal is float64, so this would quietly widen a float32.
-fn main() -> int32 {
-  var half: float32 = 0.5;
-  var doubled = half * 2.0;
-  return (int32)doubled;
-}

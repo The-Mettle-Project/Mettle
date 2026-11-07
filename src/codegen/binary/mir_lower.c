@@ -1947,13 +1947,16 @@ static int mir_gate_convert(CodeGenerator *generator,
       return mir_trace_bail(ir_function, "unary:float_or_unsupported");
     }
     if (in->is_float) {
-      if (strcmp(in->text, "-") != 0 && strcmp(in->text, "+") != 0) {
+      if (strcmp(in->text, "-") != 0 && strcmp(in->text, "+") != 0 &&
+          strcmp(in->text, "sqrt") != 0 && strcmp(in->text, "bitsf") != 0) {
         return mir_trace_bail(ir_function, "unary:float_or_unsupported");
       }
     } else if (strcmp(in->text, "-") != 0 && strcmp(in->text, "~") != 0 &&
                strcmp(in->text, "+") != 0 && strcmp(in->text, "!") != 0 &&
                strcmp(in->text, "popcnt") != 0 &&
-               strcmp(in->text, "popcnt64") != 0) {
+               strcmp(in->text, "popcnt64") != 0 &&
+               strcmp(in->text, "f32bits") != 0 &&
+               strcmp(in->text, "f64bits") != 0) {
       return mir_trace_bail(ir_function, "unary:float_or_unsupported");
     }
     if (in->dest.kind != IR_OPERAND_TEMP && in->dest.kind != IR_OPERAND_SYMBOL) {
@@ -4770,12 +4773,25 @@ static int mir_lower_unary(MirFunction *fn, CodeGenerator *g,
   case IR_OP_UNARY: {
     MirOperand dst = mir_value_operand(fn, g, ctx, map, &in->dest);
     const char *op = in->text ? in->text : "";
+    if (strcmp(op, "f32bits") == 0 || strcmp(op, "f64bits") == 0) {
+      int w = op[1] == '3' ? 4 : 8;
+      MirOperand x = coerce_float_operand(fn, g, ctx, map, &in->lhs, w);
+      return mir_emit1(fn, MIR_MOVD_TO_GP, dst, x, mir_op_none(), w, 0, 0);
+    }
+    if (in->is_float && strcmp(op, "bitsf") == 0) {
+      int w = in->float_bits == 32 ? 4 : 8;
+      MirOperand a = mir_value_operand(fn, g, ctx, map, &in->lhs);
+      return mir_emit1(fn, MIR_MOVD_TO_XMM, dst, a, mir_op_none(), w, 0, 0);
+    }
     if (in->is_float) {
       int fb = code_generator_binary_instruction_result_float_bits(g, ctx, in);
       int w = fb ? fb / 8 : 8;
       MirOperand x = coerce_float_operand(fn, g, ctx, map, &in->lhs, w);
       if (strcmp(op, "+") == 0) {
         return mir_emit_fmov(fn, dst, x, w);
+      }
+      if (strcmp(op, "sqrt") == 0) {
+        return mir_emit1(fn, MIR_FSQRT, dst, x, mir_op_none(), w, 0, 0);
       }
       MirOperand mask = mir_op_fimm(binary_semantics_float_sign_mask(w * 8));
       return mir_emit1(fn, MIR_FXOR, dst, mask, x, w, 0, 0);

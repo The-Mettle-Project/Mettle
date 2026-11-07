@@ -115,6 +115,7 @@
 #define tolower mtlc_host_tolower
 #define toupper mtlc_host_toupper
 #define sqrtf mtlc_host_sqrtf
+#define sqrt mtlc_host_sqrt
 #define fabs mtlc_host_fabs
 #define exp mtlc_host_exp
 #define expf mtlc_host_expf

@@ -118,6 +118,7 @@ int mtlc_host_iscntrl(int);
 int mtlc_host_tolower(int);
 int mtlc_host_toupper(int);
 float mtlc_host_sqrtf(float);
+double mtlc_host_sqrt(double);
 double mtlc_host_fabs(double);
 double mtlc_host_exp(double);
 float mtlc_host_expf(float);

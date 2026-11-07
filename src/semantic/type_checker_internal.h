@@ -36,6 +36,9 @@ int type_checker_ensure_multi_return_type(TypeChecker *checker,
 Type *type_checker_pointer_to(TypeChecker *checker, Type *base);
 Type *type_checker_element_ref_to(TypeChecker *checker, Type *base);
 int type_checker_takes_null(const Type *type, ASTNode *value);
+int type_checker_is_float_literal_tree(const ASTNode *node);
+int type_checker_adopt_float_literal(TypeChecker *checker, ASTNode *literal,
+                                     Type **literal_type, Type *partner);
 
 Type *type_checker_slice_of(TypeChecker *checker, Type *element);
 Type *type_checker_view_of(TypeChecker *checker, Type *element, size_t rank);

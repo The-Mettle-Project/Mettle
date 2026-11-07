@@ -286,6 +286,15 @@ switch (code) {
 }
 ```
 
+A comma list says the same in one line, and each entry may be a range:
+
+```mettle
+switch (code) {
+  case 1, 2, 10..12: { println("small"); }
+  default: { println("other"); }
+}
+```
+
 `fallthrough;` asks a case that does have a body to continue into the next one
 as well. It may sit anywhere in the case, including inside an `if`, and the
 case it names is the one written next, whatever the value that case tests:
@@ -366,6 +375,28 @@ When two enums in scope share a variant name, qualify the constructor:
 
 `return expr` leaves the function with a value. A function declared with no
 return type leaves with a bare `return`, or by running off the end.
+
+## panic
+
+`panic(message)` stops the program. It needs no import. The message is any
+`string`, interpolation included, and the crash report prints it with the
+function and the stack; a build with `-s` names the statement:
+
+```mettle
+fn half(x: int32) -> int32 {
+  if (x % 2 != 0) { panic("odd value {x}"); }
+  return x / 2;
+}
+```
+
+```text
+panic: odd value 7
+  --> half.mettle:2:21 in half
+```
+
+The process exits with code 1. `panic` never returns, so it can stand where a
+value is due: `if (x > 0) x else panic("needs a positive value")`. Under
+`mettle test` a panic fails the test and prints the message.
 
 ## defer and errdefer
 

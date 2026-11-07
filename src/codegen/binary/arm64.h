@@ -85,6 +85,7 @@ uint32_t arm64_fsub(int is_double, int fd, int fn, int fm);
 uint32_t arm64_fmul(int is_double, int fd, int fn, int fm);
 uint32_t arm64_fdiv(int is_double, int fd, int fn, int fm);
 uint32_t arm64_fneg(int is_double, int fd, int fn);
+uint32_t arm64_fsqrt(int is_double, int fd, int fn);
 uint32_t arm64_fcmp(int is_double, int fn, int fm);
 uint32_t arm64_scvtf(int is_double, int fd, Arm64Reg xn);
 uint32_t arm64_fcvtzs(int is_double, Arm64Reg xd, int fn);

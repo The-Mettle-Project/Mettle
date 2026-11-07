@@ -108,6 +108,7 @@ int ir_effects_name_is_known_clean(const char *name) {
     return 0;
   }
   if (strstr(name, "crash_trap") != NULL ||
+      strcmp(name, "mettle_crash_panic") == 0 ||
       strncmp(name, "mettle_effects_", 15) == 0 ||
       strncmp(name, "mettle_refine_", 14) == 0 ||
       strncmp(name, "mettle_safety_", 14) == 0 ||

@@ -1,0 +1,10 @@
+import { exit } from "std/process";
+import "std/time";
+import "std/io";
+
+fn main() -> int32 {
+  var t: int64 = time_mono_ns();
+  if (t < 0) { exit(2); }
+  println("clock ok");
+  return 0;
+}

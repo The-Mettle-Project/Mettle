@@ -1,6 +1,8 @@
 #include "type_checker_internal.h"
 #include "import_resolver.h"
 
+static void type_checker_register_panic_builtin(TypeChecker *checker);
+
 Symbol *type_checker_resolve_identifier(TypeChecker *checker,
                                         Identifier *identifier) {
   if (!checker || !checker->symbol_table || !identifier ||
@@ -115,8 +117,44 @@ type_checker_create_with_error_reporter(SymbolTable *symbol_table,
 
   type_checker_register_test_builtin(checker, "assert", 1);
   type_checker_register_test_builtin(checker, "assert_eq", 2);
+  type_checker_register_panic_builtin(checker);
 
   return checker;
+}
+
+static void type_checker_register_panic_builtin(TypeChecker *checker) {
+  Symbol *symbol = NULL;
+  Type **param_types = NULL;
+  char **param_names = NULL;
+  if (!checker || !checker->symbol_table ||
+      symbol_table_lookup_current_scope(checker->symbol_table, "panic")) {
+    return;
+  }
+  symbol = symbol_create("panic", SYMBOL_FUNCTION, checker->builtin_void);
+  param_types = malloc(sizeof(Type *));
+  param_names = malloc(sizeof(char *));
+  if (!symbol || !param_types || !param_names) {
+    free(param_types);
+    free(param_names);
+    if (symbol) {
+      symbol_destroy(symbol);
+    }
+    return;
+  }
+  param_types[0] = checker->builtin_string;
+  param_names[0] = strdup("message");
+  symbol->data.function.parameter_count = 1;
+  symbol->data.function.parameter_types = param_types;
+  symbol->data.function.parameter_names = param_names;
+  symbol->data.function.return_type = checker->builtin_void;
+  symbol->is_extern = 1;
+  symbol->is_builtin = 1;
+  symbol->is_noreturn = 1;
+  symbol->is_initialized = 1;
+  symbol->link_name = strdup("panic");
+  if (!symbol_table_declare(checker->symbol_table, symbol)) {
+    symbol_destroy(symbol);
+  }
 }
 
 void type_checker_register_test_builtin(TypeChecker *checker, const char *name,
@@ -272,6 +310,26 @@ int type_checker_validate_rule_signature(TypeChecker *checker,
   return 0;
 }
 
+static Type *type_checker_signature_type(TypeChecker *checker,
+                                         ASTNode *declaration,
+                                         const char *name) {
+  int errors_before = checker->error_reporter
+                          ? error_reporter_get_error_count(
+                                checker->error_reporter)
+                          : 0;
+  char *message_before = checker->error_message;
+  Type *type = name ? type_checker_get_type_by_name(checker, name) : NULL;
+  int reported = checker->error_reporter
+                     ? error_reporter_get_error_count(checker->error_reporter) >
+                           errors_before
+                     : checker->error_message != message_before;
+  if (!type && name && !reported) {
+    type_checker_report_undefined_symbol(checker, declaration->location, name,
+                                         "type");
+  }
+  return type;
+}
+
 int type_checker_register_function_signature(TypeChecker *checker,
                                                     ASTNode *declaration) {
   if (!checker || !declaration ||
@@ -296,8 +354,8 @@ int type_checker_register_function_signature(TypeChecker *checker,
 
   Type *return_type = NULL;
   if (func_decl->return_type) {
-    return_type =
-        type_checker_get_type_by_name(checker, func_decl->return_type);
+    return_type = type_checker_signature_type(checker, declaration,
+                                              func_decl->return_type);
     if (!return_type)
       return 0;
     if (type_checker_is_tile(return_type)) {
@@ -323,8 +381,8 @@ int type_checker_register_function_signature(TypeChecker *checker,
     if (!param_types)
       return 0;
     for (size_t i = 0; i < func_decl->parameter_count; i++) {
-      param_types[i] =
-          type_checker_get_type_by_name(checker, func_decl->parameter_types[i]);
+      param_types[i] = type_checker_signature_type(
+          checker, declaration, func_decl->parameter_types[i]);
       if (!param_types[i]) {
         free(param_types);
         return 0;

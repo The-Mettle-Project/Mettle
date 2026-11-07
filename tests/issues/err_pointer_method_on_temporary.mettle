@@ -1,0 +1,10 @@
+import "std/io";
+
+struct Counter { n: int32; }
+fn Counter_bump__ptr(c: Counter*, by: int32) { c->n += by; }
+fn fresh() -> Counter { var c: Counter; c.n = 0; return c; }
+
+fn main() -> int32 {
+  fresh().bump(2);
+  return 0;
+}

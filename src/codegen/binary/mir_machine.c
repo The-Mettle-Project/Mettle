@@ -64,6 +64,7 @@ static const MirOpInfo MIR_OP_INFO[MIR_OPCODE_COUNT] = {
     [MIR_FMUL] = {MIR_DEF | MIR_COMM, 0u},
     [MIR_FDIV] = {MIR_DEF | MIR_COAL, 0u},
     [MIR_FXOR] = {MIR_DEF | MIR_COMM, 0u},
+    [MIR_FSQRT] = {MIR_DEF, 0u},
     [MIR_FDUP] = {MIR_DEF, 0u},
     [MIR_FEXTHI] = {MIR_DEF, 0u},
     [MIR_CVTSI2F] = {MIR_DEF, 0u},

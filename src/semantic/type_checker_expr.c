@@ -1,5 +1,6 @@
 #include "type_checker_internal.h"
 #include <limits.h>
+#include <math.h>
 #include "codegen/target.h"
 #include "monomorphize.h"
 #include "string_intern.h"
@@ -380,6 +381,65 @@ Type *type_checker_method_receiver_struct_type(Type *receiver_type) {
   return NULL;
 }
 
+static int type_checker_auto_address_receiver(TypeChecker *checker,
+                                              ASTNode *expression,
+                                              CallExpression *call,
+                                              Type *struct_type,
+                                              Type *receiver_type,
+                                              char **out_name) {
+  size_t length = strlen(struct_type->name) + 1 + strlen(call->function_name) +
+                  strlen(MONO_PTR_RECEIVER_SUFFIX) + 1;
+  char *name = malloc(length);
+  ASTNode *object = call->object;
+  if (!name) {
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "Out of memory while resolving struct method call");
+    return -1;
+  }
+  snprintf(name, length, "%s_%s%s", struct_type->name, call->function_name,
+           MONO_PTR_RECEIVER_SUFFIX);
+  if (type_is_element_ref(receiver_type) ||
+      !symbol_table_lookup(checker->symbol_table, name)) {
+    free(name);
+    return 0;
+  }
+  if (receiver_type->kind == TYPE_POINTER) {
+    *out_name = name;
+    return 1;
+  }
+  if (!type_checker_is_lvalue_expression(object)) {
+    type_checker_set_error_at_location(
+        checker, object->location,
+        "'%s' writes through its receiver, and this one is a temporary; "
+        "store it in a variable first",
+        name);
+    free(name);
+    return -1;
+  }
+  ASTNode *address = ast_create_unary_expression("&", object, object->location);
+  if (!address) {
+    free(name);
+    type_checker_set_error_at_location(
+        checker, expression->location,
+        "Out of memory while resolving struct method call");
+    return -1;
+  }
+  for (size_t i = 0; i < expression->child_count; i++) {
+    if (expression->children[i] == object) {
+      expression->children[i] = address;
+      break;
+    }
+  }
+  call->object = address;
+  if (!type_checker_infer_type(checker, address)) {
+    free(name);
+    return -1;
+  }
+  *out_name = name;
+  return 1;
+}
+
 int type_checker_desugar_struct_method_call(TypeChecker *checker,
                                                    ASTNode *expression,
                                                    CallExpression *call) {
@@ -451,6 +511,21 @@ int type_checker_desugar_struct_method_call(TypeChecker *checker,
     }
     snprintf(mangled_name, name_len, "%s_%s", struct_type->name,
              call->function_name);
+  }
+
+  if (!symbol_table_lookup(checker->symbol_table, mangled_name) &&
+      !pointer_receiver) {
+    char *pointer_name = NULL;
+    int addressed = type_checker_auto_address_receiver(
+        checker, expression, call, struct_type, receiver_type, &pointer_name);
+    if (addressed < 0) {
+      free(mangled_name);
+      return 0;
+    }
+    if (addressed > 0) {
+      free(mangled_name);
+      mangled_name = pointer_name;
+    }
   }
 
   if (!symbol_table_lookup(checker->symbol_table, mangled_name)) {
@@ -3243,6 +3318,65 @@ static Type *type_checker_interp_builtin(TypeChecker *checker,
   return NULL;
 }
 
+static Type *type_checker_float_bits_builtin(TypeChecker *checker,
+                                             ASTNode *expression,
+                                             CallExpression *call,
+                                             int *handled) {
+  static const struct {
+    const char *name;
+    TypeKind takes;
+    TypeKind takes_too;
+  } builtins[] = {
+      {"__mtl_sqrt", TYPE_FLOAT32, TYPE_FLOAT64},
+      {"__mtl_f32_bits", TYPE_FLOAT32, TYPE_FLOAT32},
+      {"__mtl_f64_bits", TYPE_FLOAT64, TYPE_FLOAT64},
+      {"__mtl_f32_from_bits", TYPE_UINT32, TYPE_INT32},
+      {"__mtl_f64_from_bits", TYPE_INT64, TYPE_UINT64},
+  };
+  size_t which = sizeof(builtins) / sizeof(builtins[0]);
+  for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
+    if (strcmp(call->function_name, builtins[i].name) == 0) {
+      which = i;
+    }
+  }
+  *handled = which < sizeof(builtins) / sizeof(builtins[0]);
+  if (!*handled) {
+    return NULL;
+  }
+  if (call->argument_count != 1) {
+    type_checker_set_error_at_location(checker, expression->location,
+                                       "%s takes one value",
+                                       call->function_name);
+    return NULL;
+  }
+  Type *argument = type_checker_infer_type(checker, call->arguments[0]);
+  if (!argument) {
+    return NULL;
+  }
+  Type *base = type_checker_refinement_base(argument);
+  int takes_bits = which >= 3 && type_checker_is_integer_type(base) &&
+                   base->kind != TYPE_BOOL && base->kind != TYPE_CHAR;
+  if (!takes_bits && base->kind != builtins[which].takes &&
+      base->kind != builtins[which].takes_too) {
+    type_checker_set_error_at_location(
+        checker, call->arguments[0]->location, "%s does not take '%s'",
+        call->function_name, argument->name ? argument->name : "?");
+    return NULL;
+  }
+  switch (which) {
+  case 0:
+    return base;
+  case 1:
+    return checker->builtin_uint32;
+  case 2:
+    return checker->builtin_int64;
+  case 3:
+    return checker->builtin_float32;
+  default:
+    return checker->builtin_float64;
+  }
+}
+
 static Type *type_checker_infer_named_builtin(TypeChecker *checker,
                                               ASTNode *expression,
                                               CallExpression *call,
@@ -3322,6 +3456,15 @@ static Type *type_checker_infer_named_builtin(TypeChecker *checker,
 
   if (strcmp(call->function_name, "__mtl_interp") == 0) {
     return type_checker_interp_builtin(checker, call, expression);
+  }
+
+  if (!call->object && strncmp(call->function_name, "__mtl_", 6) == 0) {
+    int math_handled = 0;
+    Type *math = type_checker_float_bits_builtin(checker, expression, call,
+                                                 &math_handled);
+    if (math_handled) {
+      return math;
+    }
   }
 
   if (!call->object && (strcmp(call->function_name, "drop") == 0 ||
@@ -4802,6 +4945,102 @@ static Type *type_checker_comparison_result(TypeChecker *checker,
   return checker->builtin_bool;
 }
 
+static int literal_tree_walk(const ASTNode *node, int *has_float,
+                             int *fits_float32) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_NUMBER_LITERAL) {
+    const NumberLiteral *literal = (const NumberLiteral *)node->data;
+    if (!literal || literal->is_char) {
+      return 0;
+    }
+    if (literal->is_float) {
+      *has_float = 1;
+      if (fabs(literal->float_value) >= 3.4028235677973366e38) {
+        *fits_float32 = 0;
+      }
+    }
+    return 1;
+  }
+  if (node->type == AST_UNARY_EXPRESSION) {
+    const UnaryExpression *unary = (const UnaryExpression *)node->data;
+    return unary && unary->operator &&
+           (!strcmp(unary->operator, "-") || !strcmp(unary->operator, "+")) &&
+           literal_tree_walk(unary->operand, has_float, fits_float32);
+  }
+  if (node->type == AST_BINARY_EXPRESSION) {
+    const BinaryExpression *binary = (const BinaryExpression *)node->data;
+    const char *op = binary ? binary->operator : NULL;
+    return op && strchr("+-*/", op[0]) && op[1] == '\0' &&
+           literal_tree_walk(binary->left, has_float, fits_float32) &&
+           literal_tree_walk(binary->right, has_float, fits_float32);
+  }
+  return 0;
+}
+
+int type_checker_is_float_literal_tree(const ASTNode *node) {
+  int has_float = 0, fits = 1;
+  return literal_tree_walk(node, &has_float, &fits) && has_float;
+}
+
+static void literal_tree_retype(ASTNode *node, Type *target) {
+  if (!node || !node->resolved_type ||
+      node->resolved_type->kind != TYPE_FLOAT64) {
+    return;
+  }
+  node->resolved_type = target;
+  if (node->type == AST_UNARY_EXPRESSION) {
+    literal_tree_retype(((UnaryExpression *)node->data)->operand, target);
+  } else if (node->type == AST_BINARY_EXPRESSION) {
+    literal_tree_retype(((BinaryExpression *)node->data)->left, target);
+    literal_tree_retype(((BinaryExpression *)node->data)->right, target);
+  }
+}
+
+int type_checker_adopt_float_literal(TypeChecker *checker, ASTNode *literal,
+                                     Type **literal_type, Type *partner) {
+  int has_float = 0, fits = 1;
+  Type *base = partner ? type_checker_refinement_base(partner) : NULL;
+  if (!literal || !*literal_type || (*literal_type)->kind != TYPE_FLOAT64 ||
+      !base ||
+      (base->kind != TYPE_FLOAT32 && base->kind != TYPE_FLOAT16 &&
+       base->kind != TYPE_BFLOAT16) ||
+      !literal_tree_walk(literal, &has_float, &fits) || !has_float) {
+    return 0;
+  }
+  if (!fits) {
+    type_checker_set_error_at_location(
+        checker, literal->location,
+        "This literal is beyond float32's range, so it cannot take the "
+        "float32 type of the other operand; cast the other operand to "
+        "float64 to compute in float64");
+    return -1;
+  }
+  literal_tree_retype(literal, checker->builtin_float32);
+  *literal_type = checker->builtin_float32;
+  return 1;
+}
+
+static int binary_operand_types(TypeChecker *checker, BinaryExpression *binop,
+                                Type **left_type, Type **right_type) {
+  *left_type = type_checker_infer_type(checker, binop->left);
+  *right_type = type_checker_infer_type(checker, binop->right);
+  if (!*left_type || !*right_type) {
+    return 0;
+  }
+  if (type_checker_reject_comptime_escape(checker, binop->left->location,
+                                          *left_type) ||
+      type_checker_reject_comptime_escape(checker, binop->right->location,
+                                          *right_type)) {
+    return 0;
+  }
+  return type_checker_adopt_float_literal(checker, binop->left, left_type,
+                                          *right_type) >= 0 &&
+         type_checker_adopt_float_literal(checker, binop->right, right_type,
+                                          *left_type) >= 0;
+}
+
 Type *type_checker_check_binary_expression(TypeChecker *checker,
                                            BinaryExpression *binop,
                                            SourceLocation location) {
@@ -4815,16 +5054,9 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
     return NULL;
   }
 
-  Type *left_type = type_checker_infer_type(checker, binop->left);
-  Type *right_type = type_checker_infer_type(checker, binop->right);
-
-  if (!left_type || !right_type) {
-    return NULL;
-  }
-  if (type_checker_reject_comptime_escape(checker, binop->left->location,
-                                          left_type) ||
-      type_checker_reject_comptime_escape(checker, binop->right->location,
-                                          right_type)) {
+  Type *left_type = NULL;
+  Type *right_type = NULL;
+  if (!binary_operand_types(checker, binop, &left_type, &right_type)) {
     return NULL;
   }
 

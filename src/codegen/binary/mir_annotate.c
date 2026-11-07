@@ -396,6 +396,7 @@ static const char *scalar_mnemonic(const MirInst *in) {
   case MIR_FSUB: return in->width == 4 ? "subss" : "subsd";
   case MIR_FMUL: return in->width == 4 ? "mulss" : "mulsd";
   case MIR_FDIV: return in->width == 4 ? "divss" : "divsd";
+  case MIR_FSQRT: return in->width == 4 ? "sqrtss" : "sqrtsd";
   case MIR_UCOMIS: return in->width == 4 ? "ucomiss" : "ucomisd";
   default:
     return (unsigned)in->op < (unsigned)MIR_OPCODE_COUNT
@@ -629,6 +630,7 @@ static const MirOpCost MIR_OP_COSTS[MIR_OPCODE_COUNT] = {
     [MIR_FXOR] = {"float", "p01", M_P01, 50, 4, 0, 0},
     [MIR_FMUL] = {"float", "p01", M_P01, 50, 4, 0, 0},
     [MIR_FDIV] = {"float", "p0", M_P0, 400, 14, 0, 0},
+    [MIR_FSQRT] = {"float", "p0", M_P0, 450, 15, 0, 0},
     [MIR_UCOMIS] = {"float", "p0", M_P0, 100, 2, 0, 0},
     [MIR_CVTSI2F] = {"float", "p01", M_P01, 100, 5, 0, 0},
     [MIR_CVTF2SI] = {"float", "p01", M_P01, 100, 5, 0, 0},
@@ -732,6 +734,10 @@ static MirOpCost cost_of_instruction(const MirFunction *fn, const MirInst *in,
   case MIR_FDIV:
     cost.centi = in->width == 4 ? 300 : 400;
     cost.lat = in->width == 4 ? 11 : 14;
+    break;
+  case MIR_FSQRT:
+    cost.centi = in->width == 4 ? 300 : 450;
+    cost.lat = in->width == 4 ? 12 : 15;
     break;
   default:
     break;

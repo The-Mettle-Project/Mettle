@@ -1,0 +1,25 @@
+import "std/io";
+import "std/math";
+
+fn bits_ok() -> int32 {
+  var bad: int32 = 0;
+  if (f64_bits(sqrt(2.0)) != 4609047870845172685) { bad = bad + 1; }
+  if (bits_from_f32(f32_sqrt(2.0)) != (uint32)1068827891) { bad = bad + 2; }
+  if (bits_from_f32(f32_exp(1.0)) != (uint32)1076754516) { bad = bad + 4; }
+  if (bits_from_f32(f32_log(10.0)) != (uint32)1075010958) { bad = bad + 8; }
+  if (f32_log(0.0) > -3.0e38) { bad = bad + 16; }
+  if (f32_log(-1.0) == f32_log(-1.0)) { bad = bad + 32; }
+  if (f32_erf(4.5) != 1.0 || f32_erf(-4.5) != -1.0) { bad = bad + 64; }
+  if (f32_tanh(20.0) != 1.0 || f32_sigmoid(-200.0) != 0.0) { bad = bad + 128; }
+  if (f32_floor(-2.5) != -3.0 || f32_round(-2.5) != -3.0 || f32_ceil(2.25) != 3.0) { bad = bad + 256; }
+  if (f32_trunc(3.0e9) != 3.0e9) { bad = bad + 512; }
+  if (f32_from_bits(bits_from_f32(-0.0)) != 0.0 || bits_from_f32(-0.0) != (uint32)0x80000000) { bad = bad + 1024; }
+  return bad;
+}
+
+@test fn math_bits() { assert_eq(bits_ok(), 0); }
+
+fn main() -> int32 {
+  println("bad {bits_ok()}");
+  return 0;
+}

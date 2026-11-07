@@ -574,6 +574,11 @@ static void mettle_crash_write_trap_headline(uint32_t kind, const char *message,
     mettle_crash_write_stderr(", length ");
     mettle_crash_write_decimal_uint64(arg1);
     mettle_crash_write_stderr(")");
+  } else if (kind == METTLE_CRASH_TRAP_PANIC) {
+    mettle_crash_write_stderr("panic: ");
+    if (message && arg0) {
+      mettle_crash_write_stderr_bytes(message, (size_t)arg0);
+    }
   } else if (message && message[0] != '\0') {
     mettle_crash_write_stderr(message);
   } else {
@@ -1177,6 +1182,15 @@ void mettle_crash_trap_ex(uint32_t kind, const char *message,
                           uint64_t arg1) {
   mettle_crash_trap_impl(kind, message, program_counter, frame_pointer, arg0,
                          arg1);
+}
+
+__attribute__((noinline)) void mettle_crash_panic(const char *message,
+                                                  uint64_t length) {
+  void *const *frame = (void *const *)__builtin_frame_address(0);
+  mettle_crash_trap_impl(
+      METTLE_CRASH_TRAP_PANIC, message,
+      (const char *)__builtin_return_address(0) - 1, frame ? frame[0] : NULL,
+      length, 0);
 }
 
 void mettle_crash_trap(const char *message, const void *program_counter,

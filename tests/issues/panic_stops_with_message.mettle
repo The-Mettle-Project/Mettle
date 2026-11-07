@@ -1,0 +1,19 @@
+import "std/io";
+
+fn half(x: int32) -> int32 {
+  if (x % 2 != 0) { panic("odd value {x}"); }
+  return x / 2;
+}
+
+fn positive(x: int32) -> int32 {
+  return if (x > 0) x else panic("needs a positive value");
+}
+
+@test fn halves_even() { assert_eq(half(8), 4); }
+@test fn halves_odd() { assert_eq(half(7), 3); }
+
+fn main() -> int32 {
+  println("{half(10)} {positive(3)}");
+  println("{half(7)}");
+  return 0;
+}

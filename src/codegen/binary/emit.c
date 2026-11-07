@@ -706,7 +706,8 @@ int code_generator_binary_instruction_result_is_float64(
   case IR_OP_UNARY:
     op = instruction->text;
     return instruction->is_float && op &&
-           (strcmp(op, "+") == 0 || strcmp(op, "-") == 0);
+           (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
+            strcmp(op, "sqrt") == 0 || strcmp(op, "bitsf") == 0);
 
   case IR_OP_CALL:
     symbol = generator && generator->ir_program && instruction->text

@@ -134,14 +134,27 @@ static inline double mt_tanh(double value) {
 }
 
 static inline float mt_sqrtf(float value) {
-  if (value <= 0.0f) {
-    return value == 0.0f ? value : 0.0f / 0.0f;
-  }
-  float estimate = value >= 1.0f ? value : 1.0f;
-  for (int i = 0; i < 16; i++) {
-    estimate = 0.5f * (estimate + value / estimate);
-  }
-  return estimate;
+  float root;
+#if defined(__x86_64__)
+  __asm__("sqrtss %1, %0" : "=x"(root) : "x"(value));
+#elif defined(__aarch64__)
+  __asm__("fsqrt %s0, %s1" : "=w"(root) : "w"(value));
+#else
+  root = __builtin_sqrtf(value);
+#endif
+  return root;
+}
+
+static inline double mt_sqrt(double value) {
+  double root;
+#if defined(__x86_64__)
+  __asm__("sqrtsd %1, %0" : "=x"(root) : "x"(value));
+#elif defined(__aarch64__)
+  __asm__("fsqrt %d0, %d1" : "=w"(root) : "w"(value));
+#else
+  root = __builtin_sqrt(value);
+#endif
+  return root;
 }
 
 #endif

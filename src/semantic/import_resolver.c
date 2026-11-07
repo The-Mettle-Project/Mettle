@@ -452,6 +452,11 @@ static char *resolve_dependency_import(const char *current_file_path,
 }
 
 typedef struct {
+  char *old_name;
+  char *new_name;
+} NameRewrite;
+
+typedef struct {
   char **resolved_files;
   size_t resolved_count;
   size_t resolved_capacity;
@@ -463,12 +468,9 @@ typedef struct {
   size_t chain_capacity;
   ErrorReporter *reporter;
   const ImportResolverOptions *options;
+  NameRewrite *carried_rewrites;
+  size_t carried_rewrite_count;
 } ImportContext;
-
-typedef struct {
-  char *old_name;
-  char *new_name;
-} NameRewrite;
 
 typedef struct {
   char *alias;
@@ -600,6 +602,8 @@ static int import_context_init_child(ImportContext *child,
   return 1;
 }
 
+static void free_name_rewrites(NameRewrite *rewrites, size_t rewrite_count);
+
 static void import_context_destroy(ImportContext *ctx) {
   if (!ctx) {
     return;
@@ -608,6 +612,7 @@ static void import_context_destroy(ImportContext *ctx) {
   free_string_array(ctx->resolved_files, ctx->resolved_count);
   free_string_array(ctx->active_files, ctx->active_count);
   free_string_array(ctx->import_chain, ctx->chain_depth);
+  free_name_rewrites(ctx->carried_rewrites, ctx->carried_rewrite_count);
   memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -3906,10 +3911,38 @@ static int import_platform_matches(const char *guard,
   return strcmp(guard, "windows") == 0 && !target_is_elf;
 }
 
+static void take_carried_rewrites(ImportContext *child,
+                                  const ImportDeclaration *import_decl,
+                                  NameRewrite **rewrites, size_t *count,
+                                  size_t *capacity, int *had_error) {
+  int visible = !import_decl->namespace_alias &&
+                import_decl->selected_count == 0;
+  for (size_t r = 0; visible && r < child->carried_rewrite_count; r++) {
+    if (!add_name_rewrite(rewrites, count, capacity,
+                          child->carried_rewrites[r].old_name,
+                          child->carried_rewrites[r].new_name)) {
+      *had_error = 1;
+    }
+  }
+  free_name_rewrites(child->carried_rewrites, child->carried_rewrite_count);
+  child->carried_rewrites = NULL;
+  child->carried_rewrite_count = 0;
+}
+
+static void hand_rewrites_to_importer(ImportContext *ctx, int is_nested,
+                                      NameRewrite *rewrites, size_t count) {
+  if (!is_nested) {
+    free_name_rewrites(rewrites, count);
+    return;
+  }
+  free_name_rewrites(ctx->carried_rewrites, ctx->carried_rewrite_count);
+  ctx->carried_rewrites = rewrites;
+  ctx->carried_rewrite_count = count;
+}
+
 static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                                           const char *current_file_path,
                                           int *had_error, int is_nested) {
-  (void)is_nested;
   if (!program || program->type != AST_PROGRAM)
     return program;
   Program *prog_data = (Program *)program->data;
@@ -4132,6 +4165,9 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
           imported_program = process_imports_recursive(import_ctx,
                                                        imported_program,
                                                        full_path, had_error, 1);
+          take_carried_rewrites(import_ctx, import_decl, &importer_rewrites,
+                                &importer_rewrite_count,
+                                &importer_rewrite_capacity, had_error);
           process_import_strs_in_node(import_ctx, imported_program, full_path,
                                       had_error);
         }
@@ -4518,7 +4554,8 @@ process_imports_cleanup:
                              importer_rewrite_count, NULL, 0, NULL, 0)) {
     *had_error = 1;
   }
-  free_name_rewrites(importer_rewrites, importer_rewrite_count);
+  hand_rewrites_to_importer(ctx, is_nested, importer_rewrites,
+                            importer_rewrite_count);
 
   return program;
 }
@@ -4642,6 +4679,8 @@ static int resolve_imports_keeping(ASTNode *program, const char *base_path,
   ctx.chain_capacity = 0;
   ctx.reporter = reporter;
   ctx.options = options;
+  ctx.carried_rewrites = NULL;
+  ctx.carried_rewrite_count = 0;
 
   char *abs_base = canonicalize_path(base_path);
   if (abs_base) {

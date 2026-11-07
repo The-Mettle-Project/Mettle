@@ -1247,6 +1247,21 @@ static int encode_cvtf2f(MirFunction *fn, const MirInst *in) {
                                 : 1;
 }
 
+static int encode_fsqrt(MirFunction *fn, const MirInst *in) {
+  int ok;
+  BinaryXmmRegister aval = xmm_value(fn, &in->a, FSCRATCH_A, in->width, &ok);
+  if (!ok) {
+    return 0;
+  }
+  BinaryXmmRegister D;
+  BinaryXmmRegister target = dst_is_xmm_reg(fn, &in->dst, &D) ? D : FSCRATCH_B;
+  if (!vex_xmm_3op(fn, in->width == 4 ? 2 : 3, 0x51, target, aval, aval)) {
+    return enc_err(fn, "out of memory in sqrt");
+  }
+  return (target == FSCRATCH_B) ? xmm_store(fn, &in->dst, FSCRATCH_B, in->width)
+                                : 1;
+}
+
 static int encode_cvtph2ps(MirFunction *fn, const MirInst *in) {
   BinaryCodeBuffer *code = &fn->context->code;
   int ok;
@@ -3382,6 +3397,9 @@ static int mir_encode_float_convert(MirEncodeState *st, const MirInst *in) {
     case MIR_CVTF2F:
       ok = encode_cvtf2f(fn, in);
       break;
+    case MIR_FSQRT:
+      ok = encode_fsqrt(fn, in);
+      break;
     case MIR_CVTPH2PS:
       ok = encode_cvtph2ps(fn, in);
       break;
@@ -3397,19 +3415,28 @@ static int mir_encode_float_convert(MirEncodeState *st, const MirInst *in) {
         int dst_in_reg = dst_is_xmm_reg(fn, &in->dst, &D);
         BinaryXmmRegister target = dst_in_reg ? D : FSCRATCH_B;
         if (!ok2) { ok = 0; break; }
-        if (!binary_emit_movd_xmm_reg(&fn->context->code, target, areg)) {
+        if (!(in->width == 8
+                  ? wcs_vex_movq_xmm_reg(&fn->context->code, (int)target,
+                                         (int)areg)
+                  : wcs_vex_movd_xmm_reg(&fn->context->code, (int)target,
+                                         (int)areg))) {
           ok = enc_err(fn, "out of memory in movd2xmm");
           break;
         }
-        ok = dst_in_reg ? 1 : xmm_store(fn, &in->dst, FSCRATCH_B, 4);
+        ok = dst_in_reg ? 1 : xmm_store(fn, &in->dst, FSCRATCH_B, in->width);
         break;
       }
-      BinaryXmmRegister aval = xmm_value(fn, &in->a, FSCRATCH_A, 4, &ok2);
+      BinaryXmmRegister aval =
+          xmm_value(fn, &in->a, FSCRATCH_A, in->width, &ok2);
       BinaryGpRegister D;
       int dst_in_reg = dst_is_reg(fn, &in->dst, &D);
       BinaryGpRegister target = dst_in_reg ? D : SCRATCH_A;
       if (!ok2) { ok = 0; break; }
-      if (!binary_emit_movd_reg_xmm(&fn->context->code, target, aval)) {
+      if (!(in->width == 8
+                ? wcs_vex_movq_reg_xmm(&fn->context->code, (int)target,
+                                       (int)aval)
+                : wcs_vex_movd_reg_xmm(&fn->context->code, (int)target,
+                                       (int)aval))) {
         ok = enc_err(fn, "out of memory in movd2gp");
         break;
       }
@@ -4476,6 +4503,7 @@ static const MirEncodeHandler MIR_ENCODERS[MIR_OPCODE_COUNT] = {
     [MIR_CVTSI2F] = mir_encode_float_convert,
     [MIR_CVTF2SI] = mir_encode_float_convert,
     [MIR_CVTF2F] = mir_encode_float_convert,
+    [MIR_FSQRT] = mir_encode_float_convert,
     [MIR_CVTPH2PS] = mir_encode_float_convert,
     [MIR_CVTPS2PH] = mir_encode_float_convert,
     [MIR_MOVD_TO_XMM] = mir_encode_float_convert,

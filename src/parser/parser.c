@@ -55,6 +55,16 @@ static int parser_at_contextual_keyword(Parser *parser, const char *word,
          parser->peek_token.type == following;
 }
 
+static void parser_promote_kernel_keyword(Parser *parser) {
+  if (parser->current_token.type == TOKEN_IDENTIFIER &&
+      parser->current_token.value &&
+      strcmp(parser->current_token.value, "kernel") == 0 &&
+      (parser_is_identifier_like(parser->peek_token.type) ||
+       parser->peek_token.type == TOKEN_LPAREN)) {
+    parser->current_token.type = TOKEN_KERNEL;
+  }
+}
+
 static void parser_report_lexer_token_error(Parser *parser,
                                             const Token *token) {
   if (!parser || !token || token->type != TOKEN_ERROR) {
@@ -1232,6 +1242,7 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
 
 static ASTNode *parser_parse_extern_declaration(Parser *parser) {
   parser_advance(parser);
+  parser_promote_kernel_keyword(parser);
   if (parser->current_token.type == TOKEN_FUNCTION ||
       parser->current_token.type == TOKEN_FN ||
       parser->current_token.type == TOKEN_KERNEL) {
@@ -1905,6 +1916,7 @@ ASTNode *parser_parse_declaration(Parser *parser) {
   if (!parser)
     return NULL;
 
+  parser_promote_kernel_keyword(parser);
   if (parser_at_contextual_keyword(parser, "comptime", TOKEN_FOR)) {
     return parser_parse_comptime_for(parser, 1);
   }
@@ -7831,6 +7843,38 @@ static int parser_token_continues_condition(TokenType type) {
          (parser_is_binary_operator(type) && type != TOKEN_MULTIPLY);
 }
 
+static ASTNode *parser_condition_or_prefixed_arm(Parser *parser,
+                                                 ASTNode *condition,
+                                                 int *out_needs_block) {
+  ParserSavedState saved = parser_save_state(parser);
+  int saved_brace_depth = parser->brace_depth;
+  int saved_expression_depth = parser->expression_depth;
+  ASTNode *copy = ast_clone_node(condition);
+  ASTNode *continued = NULL;
+  parser->error_message = NULL;
+  parser->error_reporter = NULL;
+  if (copy) {
+    continued = parser_parse_binary_from(parser, copy, 0);
+  }
+  if (continued && !parser->has_error) {
+    parser_skip_newlines(parser);
+    if (parser->current_token.type == TOKEN_LBRACE) {
+      parser->error_reporter = saved.error_reporter;
+      parser_discard_saved_state(&saved);
+      ast_destroy_node(condition);
+      *out_needs_block = 1;
+      return continued;
+    }
+  }
+  ast_destroy_node(continued);
+  parser_restore_state(parser, &saved);
+  parser_discard_saved_state(&saved);
+  parser->brace_depth = saved_brace_depth;
+  parser->expression_depth = saved_expression_depth;
+  *out_needs_block = 0;
+  return condition;
+}
+
 static ASTNode *parser_parse_condition(Parser *parser, const char *group,
                                        int *out_needs_block) {
   *out_needs_block = 0;
@@ -7859,6 +7903,12 @@ static ASTNode *parser_parse_condition(Parser *parser, const char *group,
     parser_set_error(parser, message);
     ast_destroy_node(condition);
     return NULL;
+  }
+  if (parser->current_token.type == TOKEN_MINUS ||
+      parser->current_token.type == TOKEN_PLUS ||
+      parser->current_token.type == TOKEN_AMPERSAND) {
+    return parser_condition_or_prefixed_arm(parser, condition,
+                                            out_needs_block);
   }
   if (parser_token_continues_condition(parser->current_token.type)) {
     *out_needs_block = 1;
@@ -9021,6 +9071,76 @@ ASTNode *parser_parse_switch_statement(Parser *parser) {
   return parser_parse_switch_core(parser, 0);
 }
 
+static int parser_parse_case_label(Parser *parser, ASTNode **out_value,
+                                   ASTNode **out_high) {
+  parser->in_case_label++;
+  *out_value = parser_parse_expression(parser);
+  parser->in_case_label--;
+  *out_high = NULL;
+  if (!*out_value) {
+    parser_set_error(parser, "Expected constant expression after 'case'");
+    return 0;
+  }
+  if (parser->current_token.type != TOKEN_DOT_DOT) {
+    return 1;
+  }
+  parser_advance(parser);
+  parser->in_case_label++;
+  *out_high = parser_parse_expression(parser);
+  parser->in_case_label--;
+  if (!*out_high) {
+    parser_set_error(parser, "Expected upper bound expression after '..'");
+    ast_destroy_node(*out_value);
+    *out_value = NULL;
+    return 0;
+  }
+  return 1;
+}
+
+static ASTNode *parser_shared_case_label(Parser *parser, ASTNode *value,
+                                         ASTNode *high,
+                                         SourceLocation location) {
+  ASTNode *body = ast_create_program();
+  ASTNode *clause = body ? ast_create_case_clause(value, body, 0, location)
+                         : NULL;
+  if (!clause) {
+    ast_destroy_node(body);
+    ast_destroy_node(value);
+    ast_destroy_node(high);
+    parser_set_error(parser, "Memory allocation failed for switch case");
+    return NULL;
+  }
+  if (high) {
+    ((CaseClause *)clause->data)->value_high = high;
+    ast_add_child(clause, high);
+  }
+  return clause;
+}
+
+static int parser_parse_case_labels(Parser *parser, ASTNode ***cases,
+                                    size_t *case_count, ASTNode **value,
+                                    ASTNode **high, SourceLocation *location) {
+  if (!parser_parse_case_label(parser, value, high)) {
+    return 0;
+  }
+  while (parser->current_token.type == TOKEN_COMMA) {
+    ASTNode *shared = parser_shared_case_label(parser, *value, *high, *location);
+    *value = *high = NULL;
+    if (!shared) {
+      return 0;
+    }
+    *cases = realloc(*cases, (*case_count + 1) * sizeof(ASTNode *));
+    (*cases)[(*case_count)++] = shared;
+    parser_advance(parser);
+    parser_skip_newlines(parser);
+    *location = parser_current_location(parser);
+    if (!parser_parse_case_label(parser, value, high)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static ASTNode *parser_parse_switch_core(Parser *parser, int as_value) {
   if (!parser)
     return NULL;
@@ -9065,24 +9185,9 @@ static ASTNode *parser_parse_switch_core(Parser *parser, int as_value) {
 
     if (parser->current_token.type == TOKEN_CASE) {
       parser_advance(parser);
-      parser->in_case_label++;
-      case_value = parser_parse_expression(parser);
-      parser->in_case_label--;
-      if (!case_value) {
-        parser_set_error(parser, "Expected constant expression after 'case'");
+      if (!parser_parse_case_labels(parser, &cases, &case_count, &case_value,
+                                    &case_high, &case_loc)) {
         break;
-      }
-      if (parser->current_token.type == TOKEN_DOT_DOT) {
-        parser_advance(parser);
-        parser->in_case_label++;
-        case_high = parser_parse_expression(parser);
-        parser->in_case_label--;
-        if (!case_high) {
-          parser_set_error(parser,
-                           "Expected upper bound expression after '..'");
-          ast_destroy_node(case_value);
-          break;
-        }
       }
     } else if (parser->current_token.type == TOKEN_DEFAULT) {
       if (seen_default) {

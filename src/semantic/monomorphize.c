@@ -1,4 +1,5 @@
 #include "monomorphize.h"
+#include "type_checker.h"
 #include "codegen/target.h"
 #include "common.h"
 #include "string_intern.h"
@@ -2425,9 +2426,9 @@ void mono_pointer_receiver_message(char *out, size_t size, const char *type,
   }
 }
 
-static int mono_refuse_value_receiver(MonoContext *ctx, ASTNode *node,
-                                      CallExpression *call, const char *type,
-                                      const char *name) {
+static int mono_value_receiver_fallback(MonoContext *ctx, ASTNode *node,
+                                        CallExpression *call, const char *type,
+                                        const char *name) {
   char pointer_name[540];
   char message[1024];
   int ambiguous = 0;
@@ -2440,6 +2441,26 @@ static int mono_refuse_value_receiver(MonoContext *ctx, ASTNode *node,
       mono_find_impl_for_method(ctx, type, call->function_name, &ambiguous) ||
       ambiguous) {
     return 1;
+  }
+  size_t type_length = strlen(type);
+  ASTNode *receiver = NULL;
+  if (type_length && type[type_length - 1] == '*') {
+    receiver = ast_clone_node(call->object);
+  } else if (type_checker_is_lvalue_expression(call->object)) {
+    receiver = ast_create_unary_expression("&", ast_clone_node(call->object),
+                                           call->object->location);
+  }
+  if (receiver) {
+    int rewritten =
+        mono_prepend_receiver(node, call, receiver, strdup(pointer_name));
+    ast_destroy_node(receiver);
+    if (!rewritten) {
+      mono_report_error(ctx, node->location,
+                        "Failed to rewrite a generic method call");
+      return 0;
+    }
+    ctx->generic_method_rewrites++;
+    return 2;
   }
   mono_pointer_receiver_message(message, sizeof(message), type,
                                 call->function_name, pointer_name, call->object);
@@ -2493,8 +2514,11 @@ static int mono_rewrite_generic_method_call(MonoContext *ctx, ASTNode *node,
     snprintf(name, sizeof(name), "%.*s_%s", (int)(open - type), type,
              call->function_name);
     def = find_generic_def(ctx, name);
-    if (!def && !mono_refuse_value_receiver(ctx, node, call, type, name)) {
-      return 0;
+    if (!def) {
+      int fallback = mono_value_receiver_fallback(ctx, node, call, type, name);
+      if (fallback != 1) {
+        return fallback == 2;
+      }
     }
   }
   if (!def || def->is_struct) {

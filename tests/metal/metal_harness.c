@@ -1167,12 +1167,12 @@ static void contract_float_rules(void) {
     want[1] = metal_f32((float)(1.0 / v));
     want[2] = metal_f32((float)(-3.000001e38));
     want[3] = metal_f32(inputs[t] + 0.1f);
-    if (v > 0.1) flag += 1;
-    if (v >= 0.1) flag += 2;
-    if (v < 0.1) flag += 4;
-    if (v <= 0.1) flag += 8;
-    if (v == 0.1) flag += 16;
-    if (v != 0.1) flag += 32;
+    if (inputs[t] > 0.1f) flag += 1;
+    if (inputs[t] >= 0.1f) flag += 2;
+    if (inputs[t] < 0.1f) flag += 4;
+    if (inputs[t] <= 0.1f) flag += 8;
+    if (inputs[t] == 0.1f) flag += 16;
+    if (inputs[t] != 0.1f) flag += 32;
     if (v > 1.0) flag += 64;
     for (int k = 0; k < 4; k++) {
       if (f32_bits(((float *)out.host)[t * 4 + k]) != f32_bits(want[k])) {

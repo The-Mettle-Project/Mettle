@@ -1,0 +1,29 @@
+fn make(seed: int64) -> int64[6] {
+  var s: int64[6];
+  for i in 0..6 { s[i] = seed * 10 + (int64)i; }
+  return s;
+}
+
+fn walk() -> int64 {
+  var a: int64[6] = make(3);
+  var b: int64[6] = make(5);
+  var total: int64 = 0;
+  for which in 0..2 {
+    var strs: int64[6] = if (which == 0) a else b;
+    strs[0] = 99;
+    total = total + strs[5] + a[1] + b[1];
+  }
+  return total + a[0] + b[0];
+}
+
+var shared: int64[3];
+
+@test fn arrays_copy() -> int32 {
+  assert_eq(walk(), (35 + 31 + 51) + (55 + 31 + 51) + 30 + 50);
+  var local: int64[3];
+  local[0] = 4;
+  shared = local;
+  local[0] = 5;
+  assert_eq(shared[0], 4);
+  return 0;
+}

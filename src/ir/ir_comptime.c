@@ -28,6 +28,11 @@ void ir_comptime_set_trace_rules(int (*hook)(void *, const char *),
 #define ICT_TEST_FUEL 20000000LL
 #define ICT_TRACE_FUEL 2000000LL
 
+static int ict_trap_detail_is_message(const char *detail) {
+  return detail && (strncmp(detail, "Fatal error", 11) == 0 ||
+                    strncmp(detail, "panic: ", 7) == 0);
+}
+
 static int ict_color(void) {
   static int cached = -1;
   if (cached < 0) {
@@ -254,7 +259,7 @@ int ir_comptime_run_tests(IRProgram *program, ErrorReporter *reporter,
       break;
     case IR_INTERP_GUARD_TRAP: {
       const char *detail = ir_interp_status_detail(machine);
-      if (detail && strncmp(detail, "Fatal error", 11) == 0) {
+      if (ict_trap_detail_is_message(detail)) {
         printf("test %s ... %sFAILED%s (crashed: %s)\n", display, red, reset,
                detail);
       } else {
@@ -672,7 +677,7 @@ int ir_comptime_trace(IRProgram *program, ErrorReporter *reporter,
   }
   case IR_INTERP_GUARD_TRAP: {
     const char *detail = ir_interp_status_detail(machine);
-    if (detail && strncmp(detail, "Fatal error", 11) == 0) {
+    if (ict_trap_detail_is_message(detail)) {
       printf("%scrashed%s: %s\n", bold, reset, detail);
     } else {
       printf("%scrashed%s: runtime guard trap (null dereference or "

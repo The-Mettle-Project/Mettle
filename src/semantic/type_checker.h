@@ -234,6 +234,7 @@ int type_checker_register_variant_constructor(TypeChecker *checker, Type *te,
                                               size_t index, int from_generic);
 int type_checker_is_floating_type(Type *type);
 int type_checker_is_numeric_type(Type *type);
+int type_checker_is_lvalue_expression(ASTNode *expression);
 
 int type_checker_body_assigns(const ASTNode *node, const char *name);
 int type_checker_push_guard(TypeChecker *checker, ASTNode *condition,

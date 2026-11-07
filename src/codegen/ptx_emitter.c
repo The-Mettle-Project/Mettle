@@ -8058,6 +8058,7 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
 }
 
 static void emit_binary(PtxFn *fn, const IRInstruction *in);
+static void emit_unary(PtxFn *fn, const IRInstruction *in);
 static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
                           FILE *out, int target_arch, char target_variant,
                           int isa_major, int isa_minor,
@@ -8813,39 +8814,9 @@ static void ptx_emit_arith(IRProgram *program, IRFunction *func, PtxFn *fn,
   case IR_OP_BINARY:
     emit_binary(fn, in);
     break;
-  case IR_OP_UNARY: {
-    const char *t = in->text ? in->text : "";
-    PtxVal sv = operand_desc(fn, &in->lhs);
-    PtxClass c = in->is_float ? (in->float_bits == 32 ? PC_F32 : PC_F64)
-                              : (sv.cls == PC_B64 ? PC_B64 : PC_B32);
-    char s[24];
-    use_as(fn, &in->lhs, c, s);
-    PtxVal dv = {0};
-    dv.cls = c;
-    dv = destination_value(fn, &in->dest, dv);
-    char dn[24];
-    reg_name(c, dv.idx, dn);
-    if (!strcmp(t, "-")) {
-      sb_printf(&fn->body, "\tneg.%s %s, %s;\n", type_suffix_for_class(c, 0),
-                dn, s);
-    } else if (!strcmp(t, "~")) {
-      sb_printf(&fn->body, "\tnot.%s %s, %s;\n", c == PC_B64 ? "b64" : "b32",
-                dn, s);
-    } else if (!strcmp(t, "!")) {
-      int p = new_reg(fn, PC_PRED);
-      char pn[24];
-      reg_name(PC_PRED, p, pn);
-      sb_printf(&fn->body, "\tsetp.eq.%s %s, %s, 0;\n",
-                c == PC_B64 ? "s64" : "s32", pn, s);
-      sb_printf(&fn->body, "\tselp.u32 %s, 1, 0, %s;\n", dn, pn);
-    } else {
-      fn_error(fn, "PTX: unsupported unary op '%s'", t);
-    }
-    if (in->dest.name) {
-      bind_value(fn, in->dest.name, dv);
-    }
+  case IR_OP_UNARY:
+    emit_unary(fn, in);
     break;
-  }
   case IR_OP_CAST: {
     PtxVal target = in->value_type ? descriptor_from_type(in->value_type)
                                    : descriptor_from_typename(in->text);
@@ -11158,6 +11129,66 @@ static PtxClass ptx_integer_result_class(const IRInstruction *in,
   if (ptx_u32_immediate_beside_u32(&in->rhs, la)) rc = PC_B32;
   if (ptx_u32_immediate_beside_u32(&in->lhs, ra)) lc = PC_B32;
   return (lc == PC_B64 || rc == PC_B64) ? PC_B64 : PC_B32;
+}
+
+static void emit_bitcast(PtxFn *fn, const IRInstruction *in, const char *t) {
+  int wide = !strcmp(t, "f64bits") ||
+             (!strcmp(t, "bitsf") && in->float_bits != 32);
+  PtxClass from = t[0] == 'f' ? (wide ? PC_F64 : PC_F32)
+                              : (wide ? PC_B64 : PC_B32);
+  PtxClass to = t[0] == 'f' ? (wide ? PC_B64 : PC_B32)
+                            : (wide ? PC_F64 : PC_F32);
+  char s[24];
+  use_as(fn, &in->lhs, from, s);
+  PtxVal dv = {0};
+  dv.cls = to;
+  dv = destination_value(fn, &in->dest, dv);
+  char dn[24];
+  reg_name(to, dv.idx, dn);
+  sb_printf(&fn->body, "\tmov.b%d %s, %s;\n", wide ? 64 : 32, dn, s);
+  if (in->dest.name) {
+    bind_value(fn, in->dest.name, dv);
+  }
+}
+
+static void emit_unary(PtxFn *fn, const IRInstruction *in) {
+  const char *t = in->text ? in->text : "";
+  if (!strcmp(t, "f32bits") || !strcmp(t, "f64bits") || !strcmp(t, "bitsf")) {
+    emit_bitcast(fn, in, t);
+    return;
+  }
+  PtxVal sv = operand_desc(fn, &in->lhs);
+  PtxClass c = in->is_float ? (in->float_bits == 32 ? PC_F32 : PC_F64)
+                            : (sv.cls == PC_B64 ? PC_B64 : PC_B32);
+  char s[24];
+  use_as(fn, &in->lhs, c, s);
+  PtxVal dv = {0};
+  dv.cls = c;
+  dv = destination_value(fn, &in->dest, dv);
+  char dn[24];
+  reg_name(c, dv.idx, dn);
+  if (!strcmp(t, "-")) {
+    sb_printf(&fn->body, "\tneg.%s %s, %s;\n", type_suffix_for_class(c, 0),
+              dn, s);
+  } else if (!strcmp(t, "~")) {
+    sb_printf(&fn->body, "\tnot.%s %s, %s;\n", c == PC_B64 ? "b64" : "b32",
+              dn, s);
+  } else if (!strcmp(t, "sqrt") && in->is_float) {
+    sb_printf(&fn->body, "\tsqrt.rn.%s %s, %s;\n",
+              c == PC_F32 ? "f32" : "f64", dn, s);
+  } else if (!strcmp(t, "!")) {
+    int p = new_reg(fn, PC_PRED);
+    char pn[24];
+    reg_name(PC_PRED, p, pn);
+    sb_printf(&fn->body, "\tsetp.eq.%s %s, %s, 0;\n",
+              c == PC_B64 ? "s64" : "s32", pn, s);
+    sb_printf(&fn->body, "\tselp.u32 %s, 1, 0, %s;\n", dn, pn);
+  } else {
+    fn_error(fn, "PTX: unsupported unary op '%s'", t);
+  }
+  if (in->dest.name) {
+    bind_value(fn, in->dest.name, dv);
+  }
 }
 
 static void emit_binary(PtxFn *fn, const IRInstruction *in) {

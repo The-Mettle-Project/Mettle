@@ -271,6 +271,7 @@ int mtlc_host_iscntrl(int c) { return iscntrl(c); }
 int mtlc_host_tolower(int c) { return tolower(c); }
 int mtlc_host_toupper(int c) { return toupper(c); }
 float mtlc_host_sqrtf(float x) { return sqrtf(x); }
+double mtlc_host_sqrt(double x) { return sqrt(x); }
 double mtlc_host_fabs(double x) { return fabs(x); }
 double mtlc_host_exp(double x) { return exp(x); }
 float mtlc_host_expf(float x) { return expf(x); }

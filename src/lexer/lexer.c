@@ -619,7 +619,6 @@ static const LexWord g_lex_keywords[] = {
     {"export", TOKEN_EXPORT},
     {"extern", TOKEN_EXTERN},
     {"import", TOKEN_IMPORT},
-    {"kernel", TOKEN_KERNEL},
     {"method", TOKEN_METHOD},
     {"return", TOKEN_RETURN},
     {"string", TOKEN_STRING_TYPE},
@@ -639,7 +638,7 @@ static const LexWord g_lex_keywords[] = {
     {"workgroup", TOKEN_WORKGROUP},
     {"import_str", TOKEN_IMPORT_STR},
 };
-static const unsigned char g_lex_keywords_span[] = {0, 0, 0, 2, 6, 12, 23, 35, 40, 43, 44, 45};
+static const unsigned char g_lex_keywords_span[] = {0, 0, 0, 2, 6, 12, 23, 34, 39, 42, 43, 44};
 static const LexWord g_lex_asm_words[] = {
     {"je", TOKEN_JE},
     {"jg", TOKEN_JG},

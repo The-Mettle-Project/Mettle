@@ -1,0 +1,30 @@
+import "std/io";
+import "std/math";
+
+fn scale(x: float32*, y: float32*, n: int64) {
+  for i: int64 in 0..n { y[i] = x[i] * 0.1 + 0.7978845608; }
+}
+
+fn negate_half(x: float32*, y: float32*, n: int64) {
+  for i: int64 in 0..n { y[i] = x[i] * -0.5; }
+}
+
+fn main() -> int32 {
+  var x: float32[16];
+  var y: float32[16];
+  var z: float32[16];
+  for i: int64 in 0..16 { x[i] = (float32)i * 0.37 - 2.0; }
+  scale(&x[0], &y[0], 16);
+  negate_half(&x[0], &z[0], 16);
+  var same: int32 = 0;
+  for i: int64 in 0..16 {
+    var want: float32 = x[i] * (float32)0.1 + (float32)0.7978845608;
+    if (bits_from_f32(want) == bits_from_f32(y[i])) { same = same + 1; }
+  }
+  var f: float32 = 1.5;
+  var i: int64 = 3;
+  var mixed: float32 = f * i;
+  var near: bool = f > 1.4999999999;
+  println("{same} {z[4]} {mixed} {near}");
+  return 0;
+}

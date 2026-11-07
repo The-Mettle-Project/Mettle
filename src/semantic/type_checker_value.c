@@ -275,7 +275,8 @@ static const char *value_scope_word(ValueScopeKind kind) {
 }
 
 static int value_is_bare_literal(const ASTNode *value) {
-  return value->type == AST_NUMBER_LITERAL;
+  return value->type == AST_NUMBER_LITERAL ||
+         type_checker_is_float_literal_tree(value);
 }
 
 static int value_takes_target(const ASTNode *value) {
@@ -330,6 +331,11 @@ static int value_unify_without_target(TypeChecker *checker, ASTNode *value,
       (type_checker_takes_null(found, frame->first_value) ||
        type_checker_is_assignable_from(checker, found, frame->result,
                                        frame->first_value))) {
+    Type *first = frame->result;
+    if (type_checker_adopt_float_literal(checker, frame->first_value, &first,
+                                         found) < 0) {
+      return 0;
+    }
     frame->result = found;
     frame->first_value = value;
     return 1;
@@ -386,6 +392,11 @@ int type_checker_check_yield(TypeChecker *checker, ASTNode *statement) {
     return 1;
   }
   frame->saw_value = 1;
+  if (type_checker_adopt_float_literal(
+          checker, value, &found,
+          frame->target ? frame->target : frame->result) < 0) {
+    return 0;
+  }
   if (!frame->target) {
     return value_unify_without_target(checker, value, frame, found);
   }

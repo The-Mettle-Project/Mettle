@@ -140,6 +140,7 @@ typedef enum {
   MIR_FMUL,
   MIR_FDIV,
   MIR_FXOR,
+  MIR_FSQRT,
   MIR_FDUP,
   MIR_FEXTHI,
   MIR_CVTSI2F,

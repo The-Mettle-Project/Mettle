@@ -2257,6 +2257,11 @@ static void emit_unary(MslFn *fn, const IRInstruction *in) {
       store_dest(fn, in, expr, MC_F32);
       return;
     }
+    if (!strcmp(t, "sqrt")) {
+      snprintf(expr, sizeof(expr), "sqrt(%s)", x);
+      store_dest(fn, in, expr, MC_F32);
+      return;
+    }
     mod_error(fn->m, "Metal: unsupported float unary '%s' in '%s'", t,
               fn_name(fn));
     return;

@@ -11,6 +11,7 @@ typedef enum {
   METTLE_CRASH_TRAP_UNKNOWN = 0,
   METTLE_CRASH_TRAP_NULL_DEREF = 1,
   METTLE_CRASH_TRAP_ARRAY_BOUNDS = 2,
+  METTLE_CRASH_TRAP_PANIC = 3,
 } MettleCrashTrapKind;
 
 typedef struct {
@@ -87,6 +88,7 @@ void mettle_crash_trap_ex(uint32_t kind, const char *message,
                           const void *program_counter,
                           const void *frame_pointer, uint64_t arg0,
                           uint64_t arg1);
+void mettle_crash_panic(const char *message, uint64_t length);
 void mettle_crash_write_stderr_bytes(const char *text, size_t length);
 void mettle_crash_write_stderr(const char *text);
 

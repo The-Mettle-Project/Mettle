@@ -203,6 +203,10 @@ var q: Point* = &p;
 q->scale(2);
 ```
 
+A variable, field or element calls it with `.` as well, and the compiler takes
+its address: `p.scale(2)` is `(&p)->scale(2)`. A temporary has no address, so
+calling a pointer method on one is an error that says to store it first.
+
 A generic struct takes generic methods the same way. `fn Box_get<T>(b: Box<T>)
 -> T` is called as `b.get()` on any `Box`, and `fn Box_set__ptr<T>(b: Box<T>*,
 v: T)` as `p->set(v)`; the type argument comes from the receiver.

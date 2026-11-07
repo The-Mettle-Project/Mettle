@@ -279,6 +279,51 @@ static int ir_spill_string_temp_to_local(IRLoweringContext *context,
   return value->name != NULL;
 }
 
+int ir_string_operand_fields(IRLoweringContext *context, IRFunction *function,
+                             IROperand *value, SourceLocation location,
+                             IROperand *out_chars, IROperand *out_length) {
+  IROperand address = ir_operand_none();
+  IROperand length_address = ir_operand_none();
+  int ok;
+  if (value->kind != IR_OPERAND_SYMBOL &&
+      !ir_spill_string_temp_to_local(context, function, value, location)) {
+    return 0;
+  }
+  if (!ir_make_temp_operand(context, out_chars) ||
+      !ir_make_temp_operand(context, out_length) ||
+      !ir_make_temp_operand(context, &length_address) ||
+      !ir_emit_address_of_symbol(context, function, value->name, location,
+                                 &address)) {
+    ir_operand_destroy(&length_address);
+    return 0;
+  }
+  IRInstruction load_chars = {0};
+  load_chars.op = IR_OP_LOAD;
+  load_chars.location = location;
+  load_chars.dest = *out_chars;
+  load_chars.lhs = address;
+  load_chars.rhs = ir_operand_int(8);
+  IRInstruction offset = {0};
+  offset.op = IR_OP_BINARY;
+  offset.location = location;
+  offset.dest = length_address;
+  offset.lhs = address;
+  offset.rhs = ir_operand_int(8);
+  offset.text = (char *)"+";
+  IRInstruction load_length = {0};
+  load_length.op = IR_OP_LOAD;
+  load_length.location = location;
+  load_length.dest = *out_length;
+  load_length.lhs = length_address;
+  load_length.rhs = ir_operand_int(8);
+  ok = ir_emit(context, function, &load_chars) &&
+       ir_emit(context, function, &offset) &&
+       ir_emit(context, function, &load_length);
+  ir_operand_destroy(&address);
+  ir_operand_destroy(&length_address);
+  return ok;
+}
+
 int ir_coerce_string_operand_to_cstring(IRLoweringContext *context,
                                                IRFunction *function,
                                                IROperand *value,

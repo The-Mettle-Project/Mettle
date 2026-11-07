@@ -140,6 +140,9 @@ int ir_coerce_string_operand_to_cstring(IRLoweringContext *context,
                                                IRFunction *function,
                                                IROperand *value,
                                                SourceLocation location);
+int ir_string_operand_fields(IRLoweringContext *context, IRFunction *function,
+                             IROperand *value, SourceLocation location,
+                             IROperand *out_chars, IROperand *out_length);
 
 int ir_should_build_slice_from_array(Type *target_type,
                                      ASTNode *value_expression);

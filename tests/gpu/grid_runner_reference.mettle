@@ -18,7 +18,7 @@ fn grid_q4_inputs(a: int8*, b: uint8*, sa: float32*, sb: uint16*) {
   }
   for i in 0..64 {
     r = r * (uint32)1664525 + (uint32)1013904223;
-    sa[i] = (float32)((int32)((r >> 16) & (uint32)1023)) / 4096.0 + 0.01;
+    sa[i] = (float32)((float64)((int32)((r >> 16) & (uint32)1023)) / 4096.0 + 0.01);
     r = r * (uint32)1664525 + (uint32)1013904223;
     sb[i] = (uint16)((uint32)0x2C00 | ((r >> 16) & (uint32)0x03FF));
   }

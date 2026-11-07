@@ -283,6 +283,7 @@ static const char *const MIR_OPCODE_NAMES[MIR_OPCODE_COUNT] = {
     [MIR_FADD] = "fadd",
     [MIR_FSUB] = "fsub",
     [MIR_FXOR] = "fxor",
+    [MIR_FSQRT] = "fsqrt",
     [MIR_FMUL] = "fmul",
     [MIR_FDIV] = "fdiv",
     [MIR_FDUP] = "fdup",

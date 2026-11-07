@@ -1,0 +1,6 @@
+fn main() -> int32 {
+  var half: float32 = 0.5;
+  var wide: float64 = 2.0;
+  var doubled = half * wide;
+  return (int32)doubled;
+}

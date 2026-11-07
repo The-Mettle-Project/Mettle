@@ -235,6 +235,8 @@ struct IRInterpMachine {
   char detail[320];
 
   SourceLocation current_call_loc;
+  const IRInstruction *current_insn;
+  const IRFunction *current_fn;
 
   int assert_failed;
   size_t assert_line;
@@ -476,11 +478,28 @@ void ir_interp_set_override(IRInterpMachine *machine, const char *name,
 
 static void ii_fail(IRInterpMachine *machine, IRInterpStatus status,
                     const char *detail) {
-  if (machine->status == IR_INTERP_OK) {
-    machine->status = status;
-    snprintf(machine->detail, sizeof(machine->detail), "%s",
-             detail ? detail : "");
+  if (machine->status != IR_INTERP_OK) {
+    return;
   }
+  machine->status = status;
+  const IRInstruction *at = machine->current_insn;
+  if (status == IR_INTERP_TRAP && at && at->location.line > 0) {
+    const char *file = at->location.filename ? at->location.filename : "?";
+    const char *slash = strrchr(file, '/');
+    const char *backslash = strrchr(file, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+      slash = backslash;
+    }
+    snprintf(machine->detail, sizeof(machine->detail), "%s at %s:%zu in %s",
+             detail ? detail : "", slash ? slash + 1 : file,
+             (size_t)at->location.line,
+             machine->current_fn && machine->current_fn->name
+                 ? machine->current_fn->name
+                 : "?");
+    return;
+  }
+  snprintf(machine->detail, sizeof(machine->detail), "%s",
+           detail ? detail : "");
 }
 
 static int ii_free_slot_push(IRInterpMachine *machine, size_t index) {
@@ -1629,6 +1648,7 @@ static unsigned long long ii_global_storage(IRInterpMachine *machine,
     var->has_local_storage = 1;
     var->value = ii_int_value((long long)addr);
     var->agg_size = (sym->type && (sym->type->kind == MTLC_TYPE_STRUCT ||
+                                   sym->type->kind == MTLC_TYPE_ARRAY ||
                                    sym->type->kind == MTLC_TYPE_TAGGED_ENUM))
                         ? size
                         : 0;
@@ -2100,21 +2120,7 @@ static int ii_cast(IRInterpMachine *machine, const IRInstruction *insn,
 }
 
 static double ii_sqrt(double value) {
-  if (value <= 0.0) {
-    return value == 0.0 ? value : 0.0 / 0.0;
-  }
-  if (value != value || value > 1.7e308) {
-    return value;
-  }
-  double estimate = value >= 1.0 ? value : 1.0;
-  for (int i = 0; i < 64; i++) {
-    double next = 0.5 * (estimate + value / estimate);
-    if (next == estimate) {
-      break;
-    }
-    estimate = next;
-  }
-  return estimate;
+  return sqrt(value);
 }
 
 static double ii_trunc(double value) {
@@ -3452,6 +3458,25 @@ static int ii_extern_runtime_check(IRInterpMachine *machine, const char *name,
       return -1;
     }
     return 1;
+  }
+
+  if (strcmp(name, "mettle_crash_panic") == 0 && arg_count == 2) {
+    char detail[200] = "panic: ";
+    long long length = ii_as_int(&args[1]);
+    long long offset = 0;
+    IIBuffer *buffer =
+        length > 0 ? ii_addr_to_buffer(machine,
+                                       (unsigned long long)ii_as_int(&args[0]),
+                                       length, &offset)
+                   : NULL;
+    if (buffer) {
+      size_t take = (size_t)length < sizeof(detail) - 8 ? (size_t)length
+                                                        : sizeof(detail) - 8;
+      memcpy(detail + 7, buffer->data + offset, take);
+      detail[7 + take] = '\0';
+    }
+    ii_fail(machine, IR_INTERP_GUARD_TRAP, detail);
+    return -1;
   }
 
   if (strncmp(name, "mettle_crash_trap", 17) == 0) {
@@ -6043,6 +6068,32 @@ static int ii_op_unary(IRInterpMachine *machine, IIFrame *frame,
     out = ii_int_value(~ii_as_int(&a));
   } else if (strcmp(op, "+") == 0) {
     out = a;
+  } else if (strcmp(op, "sqrt") == 0) {
+    double v = ii_as_float(&a);
+    out = ii_float_value(insn->float_bits == 32 ? (double)sqrtf((float)v)
+                                                : sqrt(v));
+  } else if (strcmp(op, "f32bits") == 0) {
+    float v = (float)ii_as_float(&a);
+    uint32_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    out = ii_int_value((long long)bits);
+  } else if (strcmp(op, "f64bits") == 0) {
+    double v = ii_as_float(&a);
+    long long bits;
+    memcpy(&bits, &v, sizeof(bits));
+    out = ii_int_value(bits);
+  } else if (strcmp(op, "bitsf") == 0) {
+    long long raw = ii_as_int(&a);
+    if (insn->float_bits == 32) {
+      uint32_t bits = (uint32_t)raw;
+      float v;
+      memcpy(&v, &bits, sizeof(v));
+      out = ii_float_value((double)v);
+    } else {
+      double v;
+      memcpy(&v, &raw, sizeof(v));
+      out = ii_float_value(v);
+    }
   } else {
     ii_fail(machine, IR_INTERP_UNSUPPORTED, "unary op");
     return 0;
@@ -6175,6 +6226,7 @@ static int ii_give_local_storage(IRInterpMachine *machine, IIFrame *frame,
   }
   var->value = ii_int_value((long long)addr);
   var->slotted = count == 1;
+  var->agg_size = count > 1 ? count * elem_size : 0;
   var->slot_size = elem_size;
   var->slot_is_float = is_float;
   var->slot_is_unsigned = is_unsigned;
@@ -6662,6 +6714,8 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
     }
     const IRInstruction *insn = &fn->instructions[pc];
     size_t executed_pc = pc;
+    machine->current_insn = insn;
+    machine->current_fn = fn;
 
     if (machine->num) {
       num_store_set_site(machine->num, (uint32_t)insn->location.line,

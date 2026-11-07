@@ -1847,6 +1847,25 @@ static Type *type_checker_promote_base_types(TypeChecker *checker, Type *left,
                                              Type *right,
                                              const char *operator);
 
+static Type *type_checker_promote_floating(TypeChecker *checker, Type *left,
+                                           Type *right) {
+  int left_is_small =
+      left->kind == TYPE_FLOAT16 || left->kind == TYPE_BFLOAT16;
+  int right_is_small =
+      right->kind == TYPE_FLOAT16 || right->kind == TYPE_BFLOAT16;
+  if ((left_is_small || right_is_small) && left->kind != TYPE_FLOAT64 &&
+      right->kind != TYPE_FLOAT64) {
+    return checker->builtin_float32;
+  }
+  if (!type_checker_is_floating_type(right)) {
+    return left;
+  }
+  if (!type_checker_is_floating_type(left)) {
+    return right;
+  }
+  return type_checker_get_larger_type(checker, left, right);
+}
+
 Type *type_checker_promote_types(TypeChecker *checker, Type *left, Type *right,
                                  const char *operator) {
   Type *result;
@@ -1924,16 +1943,7 @@ static Type *type_checker_promote_base_types(TypeChecker *checker, Type *left,
 
     if (type_checker_is_floating_type(left) ||
         type_checker_is_floating_type(right)) {
-      int left_is_small = left->kind == TYPE_FLOAT16 || left->kind == TYPE_BFLOAT16;
-      int right_is_small = right->kind == TYPE_FLOAT16 || right->kind == TYPE_BFLOAT16;
-      if ((left_is_small || right_is_small) &&
-          left->kind != TYPE_FLOAT64 && right->kind != TYPE_FLOAT64) {
-        return checker->builtin_float32;
-      }
-      if (left_is_small && right_is_small) {
-        return checker->builtin_float32;
-      }
-      return type_checker_get_larger_type(checker, left, right);
+      return type_checker_promote_floating(checker, left, right);
     }
 
     if (type_checker_is_integer_type(left) &&

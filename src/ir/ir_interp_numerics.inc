@@ -376,6 +376,13 @@ static int ii_sym_unary(IRInterpMachine *machine, const IRInstruction *insn,
     *out = ii_sym_value(machine, num_op(machine->num, NUM_XOR, 64, 0, args, 2), 0);
     return 1;
   }
+  if (strcmp(op, "sqrt") == 0) {
+    unsigned width = insn->float_bits == 32 ? 32 : 64;
+    NumTerm arg = ii_sym_term(machine, a, width, 1);
+    *out = ii_sym_value(machine,
+                        num_op(machine->num, NUM_FSQRT, width, 0, &arg, 1), 1);
+    return 1;
+  }
   ii_misuse();
   *out = ii_int_value(0);
   return 1;

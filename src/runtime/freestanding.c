@@ -7648,6 +7648,8 @@ int toupper(int character) {
 
 float sqrtf(float value) { return mt_sqrtf(value); }
 
+double sqrt(double value) { return mt_sqrt(value); }
+
 float expf(float value) { return (float)mt_exp((double)value); }
 
 float tanhf(float value) { return (float)mt_tanh((double)value); }
