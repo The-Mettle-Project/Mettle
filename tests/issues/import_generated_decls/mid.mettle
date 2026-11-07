@@ -1,0 +1,3 @@
+import "./lib";
+
+export fn via_mid() -> int32 { return sizes() * 2; }

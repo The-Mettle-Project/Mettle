@@ -1,0 +1,17 @@
+struct Width {
+  name: string;
+  size: int32;
+}
+
+const WIDTHS: Width[2] = [
+  { name: "one", size: 1 },
+  { name: "two", size: 2 }
+];
+
+fn scaled(x: int32) -> int32 { return x * 10; }
+
+comptime for w in WIDTHS.rows {
+  fn ident("size_", w.name)() -> int32 { return scaled(w.size); }
+}
+
+export fn sizes() -> int32 { return size_one() + size_two(); }

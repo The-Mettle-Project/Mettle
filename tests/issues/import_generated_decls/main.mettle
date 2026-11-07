@@ -1,0 +1,9 @@
+import "std/io";
+import "./lib";
+import "./mid";
+import { sizes } from "./lib";
+
+fn main() -> int32 {
+  println("{sizes()} {via_mid()}");
+  return 0;
+}

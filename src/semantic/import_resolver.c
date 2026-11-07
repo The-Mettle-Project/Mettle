@@ -2349,11 +2349,27 @@ static int declaration_is_public_for_import(
   return 1;
 }
 
+static int same_source_position(const ASTNode *a, const ASTNode *b) {
+  const char *fa = a->location.filename;
+  const char *fb = b->location.filename;
+  return fa && fb && strcmp(fa, fb) == 0 && a->location.line == b->location.line &&
+         a->location.column == b->location.column;
+}
+
 static int declaration_private_copy_present(ASTNode *const *declarations,
                                             size_t count, ASTNode *decl) {
   const char *name = get_declaration_name(decl);
   int present = 0;
   int is_private = name && strncmp(name, "__import_", 9) == 0;
+  if (decl->type == AST_COMPTIME_FOR) {
+    for (size_t i = 0; i < count; i++) {
+      if (declarations[i] && declarations[i]->type == AST_COMPTIME_FOR &&
+          same_source_position(declarations[i], decl)) {
+        return 1;
+      }
+    }
+    return 0;
+  }
   if (!name) {
     return 0;
   }
@@ -2771,6 +2787,10 @@ static void stamp_source_locations(ASTNode *node, const char *filename) {
   for (size_t i = 0; i < node->child_count; i++) {
     stamp_source_locations(node->children[i], filename);
   }
+}
+
+static int generates_declarations(const ASTNode *decl) {
+  return decl && decl->type == AST_COMPTIME_FOR;
 }
 
 static int is_declaration_exported(ASTNode *decl) {
@@ -4270,6 +4290,13 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                 include_flags[selected_index] = 1;
               }
 
+              for (size_t j = 0; j < imported_prog_data->declaration_count;
+                   j++) {
+                if (generates_declarations(imported_prog_data->declarations[j])) {
+                  include_flags[j] = 1;
+                }
+              }
+
               if (import_succeeded &&
                   !expand_import_dependency_closure(
                       imported_prog_data, include_flags, &required_names,
@@ -4298,8 +4325,10 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
               } else {
                 for (size_t j = 0; j < imported_prog_data->declaration_count;
                      j++) {
-                  include_flags[j] = is_declaration_exported(
-                      imported_prog_data->declarations[j]);
+                  include_flags[j] =
+                      is_declaration_exported(
+                          imported_prog_data->declarations[j]) ||
+                      generates_declarations(imported_prog_data->declarations[j]);
                 }
                 if (!expand_import_dependency_closure(
                         imported_prog_data, include_flags, &required_names,
