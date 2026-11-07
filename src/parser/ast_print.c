@@ -15,6 +15,13 @@ typedef struct {
 
 static void print_statement(AstPrinter *printer, const ASTNode *node);
 static void print_expression(AstPrinter *printer, const ASTNode *node);
+static void print_number_literal(AstPrinter *printer,
+                                 const NumberLiteral *literal);
+static void print_member_access(AstPrinter *printer,
+                                const MemberAccess *member);
+static void print_call(AstPrinter *printer, const CallExpression *call);
+static void print_aggregate(AstPrinter *printer,
+                            const AggregateLiteral *literal);
 static void print_block(AstPrinter *printer, const ASTNode *node);
 static void print_match_statement(AstPrinter *printer, const ASTNode *node);
 static void print_switch_statement(AstPrinter *printer, const ASTNode *node);
@@ -258,27 +265,9 @@ static void print_expression(AstPrinter *printer, const ASTNode *node) {
     fputs(id && id->name ? id->name : "<anonymous>", printer->out);
     break;
   }
-  case AST_NUMBER_LITERAL: {
-    const NumberLiteral *literal = (const NumberLiteral *)node->data;
-    if (!literal) {
-      fputs("0", printer->out);
-    } else if (literal->is_float) {
-      char spelled[64];
-      for (int precision = 6; precision <= 17; precision++) {
-        snprintf(spelled, sizeof(spelled), "%.*g", precision,
-                 literal->float_value);
-        if (atof(spelled) == literal->float_value) {
-          break;
-        }
-      }
-      fputs(spelled, printer->out);
-    } else if (literal->int_radix == 16) {
-      fprintf(printer->out, "0x%llx", (unsigned long long)literal->int_value);
-    } else {
-      fprintf(printer->out, "%lld", literal->int_value);
-    }
+  case AST_NUMBER_LITERAL:
+    print_number_literal(printer, (const NumberLiteral *)node->data);
     break;
-  }
   case AST_STRING_LITERAL: {
     const StringLiteral *literal = (const StringLiteral *)node->data;
     print_string_literal(printer, literal ? literal->value : "");
@@ -312,26 +301,9 @@ static void print_expression(AstPrinter *printer, const ASTNode *node) {
     fputc(')', printer->out);
     break;
   }
-  case AST_MEMBER_ACCESS: {
-    const MemberAccess *member = (const MemberAccess *)node->data;
-    const UnaryExpression *through = NULL;
-    if (!member) {
-      print_unprintable(printer, "member access");
-      break;
-    }
-    through = member->object && member->object->type == AST_UNARY_EXPRESSION
-                  ? (const UnaryExpression *)member->object->data
-                  : NULL;
-    if (through && through->operator && strcmp(through->operator, "*") == 0) {
-      print_expression(printer, through->operand);
-      fprintf(printer->out, "->%s",
-              member->member ? member->member : "<field>");
-      break;
-    }
-    print_expression(printer, member->object);
-    fprintf(printer->out, ".%s", member->member ? member->member : "<field>");
+  case AST_MEMBER_ACCESS:
+    print_member_access(printer, (const MemberAccess *)node->data);
     break;
-  }
   case AST_INDEX_EXPRESSION: {
     const ArrayIndexExpression *index =
         (const ArrayIndexExpression *)node->data;
@@ -363,62 +335,104 @@ static void print_expression(AstPrinter *printer, const ASTNode *node) {
   case AST_VALUE_SCOPE:
     print_value_scope(printer, (const ValueScope *)node->data);
     break;
-  case AST_FUNCTION_CALL: {
-    const CallExpression *call = (const CallExpression *)node->data;
-    if (!call) {
-      print_unprintable(printer, "call");
-      break;
+  case AST_FUNCTION_CALL:
+    if (!node->data || !print_interpolation(printer, node)) {
+      print_call(printer, (const CallExpression *)node->data);
     }
-    if (print_interpolation(printer, node)) {
-      break;
-    }
-    if (call->object) {
-      print_expression(printer, call->object);
-      fputc('.', printer->out);
-    }
-    fputs(call->function_name ? call->function_name : "<callee>",
-          printer->out);
-    fputc('(', printer->out);
-    for (size_t i = 0; i < call->argument_count; i++) {
-      if (i) {
-        fputs(", ", printer->out);
-      }
-      if (call->argument_names && call->argument_names[i]) {
-        fprintf(printer->out, "%s: ", call->argument_names[i]);
-      }
-      print_expression(printer, call->arguments[i]);
-    }
-    fputc(')', printer->out);
     break;
-  }
-  case AST_AGGREGATE_LITERAL: {
-    const AggregateLiteral *literal = (const AggregateLiteral *)node->data;
-    if (!literal) {
-      print_unprintable(printer, "aggregate literal");
-      break;
-    }
-    fputs(literal->is_struct ? "{ " : "[", printer->out);
-    for (size_t i = 0; i < literal->element_count; i++) {
-      if (i) {
-        fputs(", ", printer->out);
-      }
-      if (literal->is_struct && literal->field_names &&
-          literal->field_names[i]) {
-        fprintf(printer->out, "%s: ", literal->field_names[i]);
-      }
-      print_expression(printer, literal->elements[i]);
-    }
-    if (literal->repeat_count) {
-      fputs("; ", printer->out);
-      print_expression(printer, literal->repeat_count);
-    }
-    fputs(literal->is_struct ? " }" : "]", printer->out);
+  case AST_AGGREGATE_LITERAL:
+    print_aggregate(printer, (const AggregateLiteral *)node->data);
     break;
-  }
   default:
     print_unprintable(printer, "this expression");
     break;
   }
+}
+
+static void print_number_literal(AstPrinter *printer,
+                                 const NumberLiteral *literal) {
+  if (!literal) {
+    fputs("0", printer->out);
+  } else if (literal->is_float) {
+    char spelled[64];
+    for (int precision = 6; precision <= 17; precision++) {
+      snprintf(spelled, sizeof(spelled), "%.*g", precision,
+               literal->float_value);
+      if (atof(spelled) == literal->float_value) {
+        break;
+      }
+    }
+    fputs(spelled, printer->out);
+  } else if (literal->int_radix == 16) {
+    fprintf(printer->out, "0x%llx", (unsigned long long)literal->int_value);
+  } else {
+    fprintf(printer->out, "%lld", literal->int_value);
+  }
+}
+
+static void print_member_access(AstPrinter *printer,
+                                const MemberAccess *member) {
+  const UnaryExpression *through = NULL;
+  if (!member) {
+    print_unprintable(printer, "member access");
+    return;
+  }
+  through = member->object && member->object->type == AST_UNARY_EXPRESSION
+                ? (const UnaryExpression *)member->object->data
+                : NULL;
+  if (through && through->operator && strcmp(through->operator, "*") == 0) {
+    print_expression(printer, through->operand);
+    fprintf(printer->out, "->%s", member->member ? member->member : "<field>");
+    return;
+  }
+  print_expression(printer, member->object);
+  fprintf(printer->out, ".%s", member->member ? member->member : "<field>");
+}
+
+static void print_call(AstPrinter *printer, const CallExpression *call) {
+  if (!call) {
+    print_unprintable(printer, "call");
+    return;
+  }
+  if (call->object) {
+    print_expression(printer, call->object);
+    fputc('.', printer->out);
+  }
+  fputs(call->function_name ? call->function_name : "<callee>", printer->out);
+  fputc('(', printer->out);
+  for (size_t i = 0; i < call->argument_count; i++) {
+    if (i) {
+      fputs(", ", printer->out);
+    }
+    if (call->argument_names && call->argument_names[i]) {
+      fprintf(printer->out, "%s: ", call->argument_names[i]);
+    }
+    print_expression(printer, call->arguments[i]);
+  }
+  fputc(')', printer->out);
+}
+
+static void print_aggregate(AstPrinter *printer,
+                            const AggregateLiteral *literal) {
+  if (!literal) {
+    print_unprintable(printer, "aggregate literal");
+    return;
+  }
+  fputs(literal->is_struct ? "{ " : "[", printer->out);
+  for (size_t i = 0; i < literal->element_count; i++) {
+    if (i) {
+      fputs(", ", printer->out);
+    }
+    if (literal->is_struct && literal->field_names && literal->field_names[i]) {
+      fprintf(printer->out, "%s: ", literal->field_names[i]);
+    }
+    print_expression(printer, literal->elements[i]);
+  }
+  if (literal->repeat_count) {
+    fputs("; ", printer->out);
+    print_expression(printer, literal->repeat_count);
+  }
+  fputs(literal->is_struct ? " }" : "]", printer->out);
 }
 
 static void print_block(AstPrinter *printer, const ASTNode *node) {
@@ -604,6 +618,66 @@ static void print_assignment_text(AstPrinter *printer,
   print_expression(printer, assign->value);
 }
 
+static void print_if_statement(AstPrinter *printer, const ASTNode *node) {
+  const IfStatement *branch = (const IfStatement *)node->data;
+  if (!branch) {
+    return;
+  }
+  print_indent(printer);
+  fputs("if (", printer->out);
+  print_expression(printer, branch->condition);
+  fputc(')', printer->out);
+  print_block(printer, branch->then_branch);
+  for (size_t i = 0; i < branch->else_if_count; i++) {
+    fputs(" else if (", printer->out);
+    print_expression(printer, branch->else_ifs[i].condition);
+    fputc(')', printer->out);
+    print_block(printer, branch->else_ifs[i].body);
+  }
+  if (branch->else_branch) {
+    fputs(" else", printer->out);
+    print_block(printer, branch->else_branch);
+  }
+  print_line_end(printer, node);
+}
+
+static void print_loop_control(AstPrinter *printer, const ASTNode *node) {
+  const LoopControlStatement *control =
+      (const LoopControlStatement *)node->data;
+  print_indent(printer);
+  fputs(node->type == AST_BREAK_STATEMENT ? "break" : "continue",
+        printer->out);
+  if (control && control->target_label) {
+    fprintf(printer->out, " %s", control->target_label);
+  }
+  if (control && control->value) {
+    fputc(' ', printer->out);
+    print_expression(printer, control->value);
+  }
+  fputs(";\n", printer->out);
+}
+
+static void print_yield_statement(AstPrinter *printer,
+                                  const YieldStatement *yield) {
+  print_indent(printer);
+  if (yield && yield->from_break) {
+    fputs("break", printer->out);
+    if (yield->label) {
+      fprintf(printer->out, " %s", yield->label);
+    }
+    if (yield->value) {
+      fputc(' ', printer->out);
+      print_expression(printer, yield->value);
+    }
+    fputs(";\n", printer->out);
+    return;
+  }
+  if (yield && yield->value) {
+    print_expression(printer, yield->value);
+  }
+  fputc('\n', printer->out);
+}
+
 static void print_statement(AstPrinter *printer, const ASTNode *node) {
   int inline_form = 0;
   if (!node) {
@@ -666,29 +740,9 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     break;
   }
 
-  case AST_IF_STATEMENT: {
-    const IfStatement *branch = (const IfStatement *)node->data;
-    if (!branch) {
-      break;
-    }
-    print_indent(printer);
-    fputs("if (", printer->out);
-    print_expression(printer, branch->condition);
-    fputc(')', printer->out);
-    print_block(printer, branch->then_branch);
-    for (size_t i = 0; i < branch->else_if_count; i++) {
-      fputs(" else if (", printer->out);
-      print_expression(printer, branch->else_ifs[i].condition);
-      fputc(')', printer->out);
-      print_block(printer, branch->else_ifs[i].body);
-    }
-    if (branch->else_branch) {
-      fputs(" else", printer->out);
-      print_block(printer, branch->else_branch);
-    }
-    print_line_end(printer, node);
+  case AST_IF_STATEMENT:
+    print_if_statement(printer, node);
     break;
-  }
 
   case AST_WHILE_STATEMENT:
   case AST_FOR_STATEMENT:
@@ -697,22 +751,9 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     break;
 
   case AST_BREAK_STATEMENT:
-  case AST_CONTINUE_STATEMENT: {
-    const LoopControlStatement *control =
-        (const LoopControlStatement *)node->data;
-    print_indent(printer);
-    fputs(node->type == AST_BREAK_STATEMENT ? "break" : "continue",
-          printer->out);
-    if (control && control->target_label) {
-      fprintf(printer->out, " %s", control->target_label);
-    }
-    if (control && control->value) {
-      fputc(' ', printer->out);
-      print_expression(printer, control->value);
-    }
-    fputs(";\n", printer->out);
+  case AST_CONTINUE_STATEMENT:
+    print_loop_control(printer, node);
     break;
-  }
 
   case AST_MATCH_STATEMENT:
     print_match_statement(printer, node);
@@ -728,27 +769,9 @@ static void print_statement(AstPrinter *printer, const ASTNode *node) {
     fputc('\n', printer->out);
     break;
 
-  case AST_YIELD_STATEMENT: {
-    const YieldStatement *yield = (const YieldStatement *)node->data;
-    print_indent(printer);
-    if (yield && yield->from_break) {
-      fputs("break", printer->out);
-      if (yield->label) {
-        fprintf(printer->out, " %s", yield->label);
-      }
-      if (yield->value) {
-        fputc(' ', printer->out);
-        print_expression(printer, yield->value);
-      }
-      fputs(";\n", printer->out);
-      break;
-    }
-    if (yield && yield->value) {
-      print_expression(printer, yield->value);
-    }
-    fputc('\n', printer->out);
+  case AST_YIELD_STATEMENT:
+    print_yield_statement(printer, (const YieldStatement *)node->data);
     break;
-  }
 
   case AST_FUNCTION_CALL:
     print_indent(printer);
@@ -1079,7 +1102,7 @@ size_t ast_print_program(FILE *out, const ASTNode *program,
   if (!out || !program) {
     return 0;
   }
-  AstPrinter printer = {out, 0, 0, annotate, context};
+  AstPrinter printer = {out, 0, 0, annotate, context, 0, NULL};
   for (size_t i = 0; i < program->child_count; i++) {
     if (g_keep_declaration &&
         !g_keep_declaration(program->children[i], g_keep_context)) {
@@ -1096,7 +1119,7 @@ void ast_print_set_filter(AstPrintFilter keep, const void *context) {
 }
 
 void ast_print_statement_at(FILE *out, const ASTNode *statement, int depth) {
-  AstPrinter printer = {out, depth, 0, NULL, NULL};
+  AstPrinter printer = {out, depth, 0, NULL, NULL, 0, NULL};
   AstPrintNote saved_statement = g_statement_note;
   AstPrintNote saved_block = g_block_end_note;
   g_statement_note = NULL;

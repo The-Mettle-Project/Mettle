@@ -150,6 +150,24 @@ static char *ir_find_switch_default_label(SwitchStatement *switch_data,
   return end_label;
 }
 
+static int ir_lower_scrutinee(IRLoweringContext *context, IRFunction *function,
+                              ASTNode *expression, IROperand *value) {
+  return ir_lower_expression(context, function, expression, value) &&
+         ir_ownership_after_unit(context, function, expression,
+                                 expression->location);
+}
+
+static int ir_lower_arm_body(IRLoweringContext *context, IRFunction *function,
+                             MatchArm *arm, ASTNode *statement,
+                             IRDeferScope *defers) {
+  SourceLocation at = arm->body ? arm->body->location : statement->location;
+  if (!ir_ownership_after_unit(context, function, arm, at)) {
+    return 0;
+  }
+  return !arm->body ||
+         ir_lower_statement_with_defers(context, function, arm->body, defers);
+}
+
 int ir_lower_switch_statement(IRLoweringContext *context,
                                      IRFunction *function, ASTNode *statement,
                                      IRDeferScope *defers) {
@@ -171,10 +189,8 @@ int ir_lower_switch_statement(IRLoweringContext *context,
   }
 
   IROperand switch_value = ir_operand_none();
-  if (!ir_lower_expression(context, function, switch_data->expression,
-                           &switch_value) ||
-      !ir_ownership_after_unit(context, function, switch_data->expression,
-                               switch_data->expression->location)) {
+  if (!ir_lower_scrutinee(context, function, switch_data->expression,
+                          &switch_value)) {
     free(end_label);
     return 0;
   }
@@ -388,10 +404,8 @@ int ir_lower_match_statement(IRLoweringContext *context,
     return 0;
   }
 
-  if (!ir_lower_expression(context, function, match->expression,
-                           &subject_value) ||
-      !ir_ownership_after_unit(context, function, match->expression,
-                               match->expression->location)) {
+  if (!ir_lower_scrutinee(context, function, match->expression,
+                          &subject_value)) {
     return 0;
   }
 
@@ -609,13 +623,7 @@ int ir_lower_match_statement(IRLoweringContext *context,
       ir_operand_destroy(&payload_address);
     }
 
-    if (!ir_ownership_after_unit(context, function, arm,
-                                 arm->body ? arm->body->location
-                                           : statement->location)) {
-      goto cleanup;
-    }
-    if (arm->body &&
-        !ir_lower_statement_with_defers(context, function, arm->body, defers)) {
+    if (!ir_lower_arm_body(context, function, arm, statement, defers)) {
       goto cleanup;
     }
 

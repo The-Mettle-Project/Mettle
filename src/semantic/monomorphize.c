@@ -68,6 +68,10 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
                                     MonoContext *ctx);
 static GenericDef *find_generic_def(MonoContext *ctx, const char *name);
 
+static int mono_is_type_query(const char *name) {
+  return name && (strcmp(name, "sizeof") == 0 || strcmp(name, "typeof") == 0);
+}
+
 static char *mangle_name(const char *base, char **type_args,
                            size_t type_arg_count) {
   size_t len = strlen(base);
@@ -1093,9 +1097,7 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
           }
         }
       }
-      if (ce->function_name &&
-          (strcmp(ce->function_name, "sizeof") == 0 ||
-           strcmp(ce->function_name, "typeof") == 0) &&
+      if (mono_is_type_query(ce->function_name) &&
           ce->argument_count == 1 && ce->arguments[0] &&
           ce->arguments[0]->type == AST_IDENTIFIER) {
         Identifier *type_id = (Identifier *)ce->arguments[0]->data;

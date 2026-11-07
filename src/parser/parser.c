@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -802,6 +803,43 @@ typedef struct {
   size_t meta_count;
 } ParsedDecorators;
 
+static int *parser_flag_decorator(ParsedDecorators *out, const char *name) {
+  static const struct {
+    const char *name;
+    size_t offset;
+  } flags[] = {
+      {"noalloc", offsetof(ParsedDecorators, is_noalloc)},
+      {"noreturn", offsetof(ParsedDecorators, is_noreturn)},
+      {"noinline", offsetof(ParsedDecorators, is_noinline)},
+      {"pure", offsetof(ParsedDecorators, is_pure)},
+      {"test", offsetof(ParsedDecorators, is_test)},
+      {"swappable", offsetof(ParsedDecorators, is_swappable)},
+      {"naked", offsetof(ParsedDecorators, is_naked)},
+      {"interrupt", offsetof(ParsedDecorators, is_interrupt)},
+      {"rule", offsetof(ParsedDecorators, is_rule)},
+      {"explicit", offsetof(ParsedDecorators, is_explicit)},
+  };
+  for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+    if (strcmp(name, flags[i].name) == 0) {
+      return (int *)((char *)out + flags[i].offset);
+    }
+  }
+  return NULL;
+}
+
+static int parser_take_flag_decorator(Parser *parser, int *flag,
+                                      const char *name) {
+  if (*flag) {
+    char message[96];
+    snprintf(message, sizeof(message), "Duplicate '@%s' decorator", name);
+    parser_set_error(parser, message);
+    return 0;
+  }
+  *flag = 1;
+  parser_advance(parser);
+  return 1;
+}
+
 static int parser_parse_meta_decorator(Parser *parser, ParsedDecorators *out) {
   MetaDecorator *grown =
       realloc(out->meta, (out->meta_count + 1) * sizeof(MetaDecorator));
@@ -921,76 +959,9 @@ static int parser_parse_one_decorator(Parser *parser,
       out->is_inline_contract = 1;
       parser_advance(parser);
     }
-  } else if (strcmp(name, "noalloc") == 0) {
-    if (out->is_noalloc) {
-      parser_set_error(parser, "Duplicate '@noalloc' decorator");
-      return 0;
-    }
-    out->is_noalloc = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "noreturn") == 0) {
-    if (out->is_noreturn) {
-      parser_set_error(parser, "Duplicate '@noreturn' decorator");
-      return 0;
-    }
-    out->is_noreturn = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "noinline") == 0) {
-    if (out->is_noinline) {
-      parser_set_error(parser, "Duplicate '@noinline' decorator");
-      return 0;
-    }
-    out->is_noinline = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "pure") == 0) {
-    if (out->is_pure) {
-      parser_set_error(parser, "Duplicate '@pure' decorator");
-      return 0;
-    }
-    out->is_pure = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "test") == 0) {
-    if (out->is_test) {
-      parser_set_error(parser, "Duplicate '@test' decorator");
-      return 0;
-    }
-    out->is_test = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "swappable") == 0) {
-    if (out->is_swappable) {
-      parser_set_error(parser, "Duplicate '@swappable' decorator");
-      return 0;
-    }
-    out->is_swappable = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "naked") == 0) {
-    if (out->is_naked) {
-      parser_set_error(parser, "Duplicate '@naked' decorator");
-      return 0;
-    }
-    out->is_naked = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "interrupt") == 0) {
-    if (out->is_interrupt) {
-      parser_set_error(parser, "Duplicate '@interrupt' decorator");
-      return 0;
-    }
-    out->is_interrupt = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "rule") == 0) {
-    if (out->is_rule) {
-      parser_set_error(parser, "Duplicate '@rule' decorator");
-      return 0;
-    }
-    out->is_rule = 1;
-    parser_advance(parser);
-  } else if (strcmp(name, "explicit") == 0) {
-    if (out->is_explicit) {
-      parser_set_error(parser, "Duplicate '@explicit' decorator");
-      return 0;
-    }
-    out->is_explicit = 1;
-    parser_advance(parser);
+  } else if (parser_flag_decorator(out, name)) {
+    return parser_take_flag_decorator(parser, parser_flag_decorator(out, name),
+                                      name);
   } else if (strcmp(name, "conflict_free") == 0) {
     if (out->conflict_free_mode) {
       parser_set_error(parser, "Duplicate '@conflict_free' decorator");
@@ -1170,6 +1141,13 @@ static ASTNode *parser_parse_comptime_for(Parser *parser, int declarations);
 static ASTNode *parser_parse_type_declaration(Parser *parser);
 static char *parser_parse_type_annotation(Parser *parser);
 
+static int parser_has_function_decorator(const ParsedDecorators *decos) {
+  return decos->is_inline || decos->is_noinline || decos->is_pure ||
+         decos->is_noalloc || decos->is_test || decos->is_swappable ||
+         decos->is_naked || decos->is_interrupt || decos->is_explicit ||
+         decos->is_rule || decos->simd_mode != SIMD_ATTR_NONE;
+}
+
 static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
   ParsedDecorators decos;
   if (!parser_parse_decorator_chain(parser, &decos))
@@ -1178,11 +1156,8 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
   if (!decl)
     return NULL;
   int only_library_decorators =
-      decos.meta_count > 0 && !decos.is_inline && !decos.is_noinline &&
-      !decos.is_pure && !decos.is_noalloc && !decos.is_noreturn &&
-      !decos.is_test && !decos.is_swappable && !decos.is_naked &&
-      !decos.is_interrupt && !decos.is_explicit &&
-      !decos.is_rule && decos.simd_mode == SIMD_ATTR_NONE &&
+      decos.meta_count > 0 && !decos.is_noreturn &&
+      !parser_has_function_decorator(&decos) &&
       decos.meta_role == META_ROLE_NONE;
   if (only_library_decorators && decl->type == AST_STRUCT_DECLARATION) {
     StructDeclaration *sd = (StructDeclaration *)decl->data;
@@ -1210,11 +1185,7 @@ static ASTNode *parser_parse_decorated_declaration(Parser *parser) {
   fd->meta_optimized = decos.meta_optimized;
   fd->meta_point = decos.meta_point;
   int only_noreturn =
-      decos.is_noreturn && !decos.is_inline && !decos.is_noinline &&
-      !decos.is_pure && !decos.is_noalloc && !decos.is_test &&
-      !decos.is_swappable && !decos.is_naked && !decos.is_interrupt &&
-      !decos.is_explicit &&
-      !decos.is_rule && decos.simd_mode == SIMD_ATTR_NONE &&
+      decos.is_noreturn && !parser_has_function_decorator(&decos) &&
       decos.meta_count == 0 && decos.meta_role == META_ROLE_NONE;
   if (fd->is_extern && !only_noreturn) {
     parser_set_error(parser,

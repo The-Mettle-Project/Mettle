@@ -4020,14 +4020,8 @@ static DriverFlagResult parse_flag_diagnostics(CompilerOptions *options,
                                      int argc, char *argv[],
                                      int *index) {
   int i = *index;
-  int explain_flag = options->explain_view
-                         ? mettle_explain_parse_flag(options, argv[i])
-                         : 0;
   (void)argc;
   (void)flags;
-  if (explain_flag != 0) {
-    return explain_flag < 0 ? DRIVER_FLAG_FAILED : DRIVER_FLAG_TAKEN;
-  }
   if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
     options->debug_mode = 1;
     options->generate_debug_symbols = 1;
@@ -4285,12 +4279,6 @@ static DriverFlagResult parse_flag_checks(CompilerOptions *options,
     options->report_twins = 1;
   } else if (strcmp(argv[i], "--fix") == 0) {
     options->apply_rule_fixes = 1;
-  } else if (strcmp(argv[i], "--fix-print") == 0) {
-    options->print_fixes = 1;
-  } else if (strcmp(argv[i], "--ownership-json") == 0) {
-    options->ownership_json = 1;
-  } else if (strcmp(argv[i], "--focus") == 0) {
-    options->expand_focus = 1;
   } else if (strcmp(argv[i], "--report-effects") == 0) {
     options->report_effects = 1;
   } else if (strncmp(argv[i], "--proof-budget=", 15) == 0) {
@@ -4532,12 +4520,45 @@ static DriverFlagResult parse_flag_target(CompilerOptions *options,
   return DRIVER_FLAG_TAKEN;
 }
 
+static DriverFlagResult parse_flag_explain_view(CompilerOptions *options,
+                                                DriverFlags *flags, int argc,
+                                                char *argv[], int *index) {
+  int taken;
+  (void)flags;
+  (void)argc;
+  if (!options->explain_view) {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  taken = mettle_explain_parse_flag(options, argv[*index]);
+  return taken < 0 ? DRIVER_FLAG_FAILED
+         : taken   ? DRIVER_FLAG_TAKEN
+                   : DRIVER_FLAG_UNMATCHED;
+}
+
+static DriverFlagResult parse_flag_ownership(CompilerOptions *options,
+                                             DriverFlags *flags, int argc,
+                                             char *argv[], int *index) {
+  const char *arg = argv[*index];
+  (void)flags;
+  (void)argc;
+  if (strcmp(arg, "--fix-print") == 0) {
+    options->print_fixes = 1;
+  } else if (strcmp(arg, "--ownership-json") == 0) {
+    options->ownership_json = 1;
+  } else if (strcmp(arg, "--focus") == 0) {
+    options->expand_focus = 1;
+  } else {
+    return DRIVER_FLAG_UNMATCHED;
+  }
+  return DRIVER_FLAG_TAKEN;
+}
+
 typedef DriverFlagResult (*DriverFlagParser)(CompilerOptions *, DriverFlags *,
                                              int, char **, int *);
 
 static const DriverFlagParser DRIVER_FLAG_PARSERS[] = {
-    parse_flag_output, parse_flag_diagnostics, parse_flag_gpu,
-    parse_flag_checks,
+    parse_flag_explain_view, parse_flag_output, parse_flag_diagnostics,
+    parse_flag_gpu, parse_flag_checks, parse_flag_ownership,
     parse_flag_codegen, parse_flag_target};
 
 static int subcommand_flag_takes_value(const char *argument) {
@@ -4778,6 +4799,38 @@ static int run_tool_subcommand(int argc, char **argv, int *exit_code) {
   return 0;
 }
 
+static int main_explain_command(int *argc, char **argv,
+                                CompilerOptions *options, int *exit_code) {
+  int target;
+  size_t n;
+  if (strcmp(argv[1], "explain") != 0) {
+    return 0;
+  }
+  target = *argc >= 3 ? mettle_explain_is_view_target(argv[2]) : 0;
+  if (target == 0) {
+    *exit_code = *argc >= 4 ? explain_rule_code(argv[2], argv[3])
+                            : mettle_explain_error_code(*argc >= 3 ? argv[2]
+                                                                   : NULL);
+    return 1;
+  }
+  if (target < 0) {
+    *exit_code = 1;
+    return 1;
+  }
+  n = strlen(argv[2]);
+  if (n > 5 && strcmp(argv[2] + n - 5, ".json") == 0) {
+    *exit_code = mettle_explain_report_file(*argc - 2, argv + 2);
+    return 1;
+  }
+  options->explain_view = 1;
+  options->explain_view_key = mettle_explain_build_key(*argc - 3, argv + 3);
+  for (int i = 1; i + 1 < *argc; i++) {
+    argv[i] = argv[i + 1];
+  }
+  (*argc)--;
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
   mettle_compiler_crash_install(argc, argv);
@@ -4829,28 +4882,9 @@ int main(int argc, char *argv[]) {
     if (run_tool_subcommand(argc, argv, &tool_exit_code)) {
       return tool_exit_code;
     }
-    int explain_target = strcmp(argv[1], "explain") == 0 && argc >= 3
-                             ? mettle_explain_is_view_target(argv[2])
-                             : 0;
-    if (explain_target < 0) {
-      return 1;
-    }
-    if (explain_target > 0) {
-      size_t n = strlen(argv[2]);
-      if (n > 5 && strcmp(argv[2] + n - 5, ".json") == 0) {
-        return mettle_explain_report_file(argc - 2, argv + 2);
-      }
-      options.explain_view = 1;
-      options.explain_view_key = mettle_explain_build_key(argc - 3, argv + 3);
-      for (int i = 1; i + 1 < argc; i++) {
-        argv[i] = argv[i + 1];
-      }
-      argc--;
-    } else if (strcmp(argv[1], "explain") == 0) {
-      if (argc >= 4) {
-        return explain_rule_code(argv[2], argv[3]);
-      }
-      return mettle_explain_error_code(argc >= 3 ? argv[2] : NULL);
+    int explain_exit = 0;
+    if (main_explain_command(&argc, argv, &options, &explain_exit)) {
+      return explain_exit;
     }
     if (strcmp(argv[1], "expand") == 0) {
       options.expand_mode = 1;
