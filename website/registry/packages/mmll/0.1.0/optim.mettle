@@ -1,0 +1,435 @@
+import "std/mem";
+import "std/math";
+import "./tensor";
+import "./kernels";
+import "./graph";
+
+export const OPT_SGD = 0;
+export const OPT_ADAM = 1;
+export const OPT_ADAMW = 2;
+
+export struct Optimizer {
+  kind: int32;
+  params: Params*;
+  lr: float64;
+  momentum: float64;
+  dampening: float64;
+  nesterov: bool;
+  beta1: float64;
+  beta2: float64;
+  eps: float64;
+  weight_decay: float64;
+  steps: int64;
+  first: float32**;
+  second: float32**;
+  slots: int32;
+  clip: float64;
+  norm: float64;
+  dfirst: float32*;
+  dsecond: float32*;
+}
+
+fn optimizer_new(kind: int32, ps: Params*, lr: float64) -> Optimizer* {
+  var o: Optimizer* = new Optimizer;
+  o->kind = kind;
+  o->params = ps;
+  o->lr = lr;
+  o->beta1 = 0.9;
+  o->beta2 = 0.999;
+  o->eps = 1.0e-8;
+  return o;
+}
+
+export fn sgd(ps: Params*, lr: float64, momentum: float64, weight_decay: float64, nesterov: bool) -> Optimizer* {
+  if (nesterov && momentum <= 0.0) { mmll_fail("nesterov needs momentum"); }
+  var o: Optimizer* = optimizer_new(OPT_SGD, ps, lr);
+  o->momentum = momentum;
+  o->weight_decay = weight_decay;
+  o->nesterov = nesterov;
+  return o;
+}
+
+export fn adam(ps: Params*, lr: float64, beta1: float64, beta2: float64, eps: float64, weight_decay: float64) -> Optimizer* {
+  var o: Optimizer* = optimizer_new(OPT_ADAM, ps, lr);
+  o->beta1 = beta1;
+  o->beta2 = beta2;
+  o->eps = eps;
+  o->weight_decay = weight_decay;
+  return o;
+}
+
+export fn adamw(ps: Params*, lr: float64, beta1: float64, beta2: float64, eps: float64, weight_decay: float64) -> Optimizer* {
+  var o: Optimizer* = optimizer_new(OPT_ADAMW, ps, lr);
+  o->beta1 = beta1;
+  o->beta2 = beta2;
+  o->eps = eps;
+  o->weight_decay = weight_decay;
+  return o;
+}
+
+export fn optimizer_free(o: Optimizer*) {
+  var dev: Device* = o->params->dev;
+  if (dev != 0) {
+    if (o->dfirst != 0) { dev->free((rawptr)o->dfirst); }
+    if (o->dsecond != 0) { dev->free((rawptr)o->dsecond); }
+  }
+  for i in 0..o->slots {
+    if (o->first[i] != 0) { free((rawptr)o->first[i]); }
+    if (o->second[i] != 0) { free((rawptr)o->second[i]); }
+  }
+  if (o->first != 0) { free((rawptr)o->first); }
+  if (o->second != 0) { free((rawptr)o->second); }
+  free((rawptr)o);
+}
+
+fn ensure_slots(o: Optimizer*) {
+  var need: int32 = o->params->count;
+  if (need <= o->slots) { return; }
+  o->first = (float32**)realloc((rawptr)o->first, (int64)need * 8);
+  o->second = (float32**)realloc((rawptr)o->second, (int64)need * 8);
+  for i in o->slots..need {
+    o->first[i] = (float32*)0;
+    o->second[i] = (float32*)0;
+  }
+  o->slots = need;
+}
+
+fn state(slot: float32**, n: int64) -> float32* {
+  if (*slot == 0) {
+    *slot = (float32*)calloc(1, if (n < 1) 4 else n * 4);
+  }
+  return *slot;
+}
+
+struct StepJob {
+  kind: int32;
+  w: float32*;
+  g: float32*;
+  m: float32*;
+  v: float32*;
+  n: int64;
+  lr: float32;
+  momentum: float32;
+  dampening: float32;
+  nesterov: bool;
+  first_step: bool;
+  beta1: float32;
+  beta2: float32;
+  eps: float32;
+  decay: float32;
+  shrink: float32;
+  correct1: float32;
+  correct2: float32;
+}
+
+const STEP_CHUNK = 16384;
+
+fn step_range(j: StepJob*, lo: int64, hi: int64) {
+  var one: float32 = 1.0;
+  var w: float32* = j->w;
+  var g: float32* = j->g;
+  if (j->kind == OPT_SGD) {
+    for i: int64 in lo..hi {
+      var d: float32 = g[i] + j->decay * w[i];
+      if (j->m != 0) {
+        var buf: float32 = if j->first_step { d } else { j->momentum * j->m[i] + (one - j->dampening) * d };
+        j->m[i] = buf;
+        d = if j->nesterov { d + j->momentum * buf } else { buf };
+      }
+      w[i] = w[i] - j->lr * d;
+    }
+    return;
+  }
+  var b1: float32 = j->beta1;
+  var b2: float32 = j->beta2;
+  var m: float32* = j->m;
+  var v: float32* = j->v;
+  for i: int64 in lo..hi {
+    var d: float32 = g[i] + j->decay * w[i];
+    var mi: float32 = b1 * m[i] + (one - b1) * d;
+    var vi: float32 = b2 * v[i] + (one - b2) * d * d;
+    m[i] = mi;
+    v[i] = vi;
+    var mhat: float32 = mi * j->correct1;
+    var vhat: float32 = vi * j->correct2;
+    w[i] = w[i] * j->shrink - j->lr * mhat / (sqrt_f32(vhat) + j->eps);
+  }
+}
+
+@noinline fn step_chunks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: StepJob* = (StepJob*)ctx;
+  for c: int64 in lo..hi {
+    var s: int64 = c * STEP_CHUNK;
+    var e: int64 = s + STEP_CHUNK;
+    if (e > j->n) { e = j->n; }
+    step_range(j, s, e);
+  }
+  return 0;
+}
+
+export fn Optimizer_clip_at__ptr(o: Optimizer*, max_norm: float64) {
+  o->clip = max_norm;
+}
+
+export fn Optimizer_last_norm__ptr(o: Optimizer*) -> float64 {
+  var ps: Params* = o->params;
+  if (ps->dev == 0 || o->clip <= 0.0) { return o->norm; }
+  var squares: float32 = 0.0;
+  ps->dev->get((rawptr)&squares, (rawptr)ps->scratch, 4);
+  return sqrt((float64)squares);
+}
+
+fn step_call(o: Optimizer*, decay: bool) -> StepCall {
+  var c: StepCall;
+  var t: float64 = (float64)o->steps;
+  var wd: float64 = if decay { o->weight_decay } else { 0.0 };
+  c.kind = o->kind;
+  c.lr = (float32)o->lr;
+  c.decay = if o->kind == OPT_ADAMW { (float32)0.0 } else { (float32)wd };
+  c.shrink = if o->kind == OPT_ADAMW { (float32)(1.0 - o->lr * wd) } else { (float32)1.0 };
+  c.momentum = (float32)o->momentum;
+  c.dampening = (float32)o->dampening;
+  c.nesterov = o->nesterov;
+  c.first = o->steps == 1;
+  c.beta1 = (float32)o->beta1;
+  c.beta2 = (float32)o->beta2;
+  c.eps = (float32)o->eps;
+  if (o->kind != OPT_SGD) {
+    c.correct1 = (float32)(1.0 / (1.0 - pow(o->beta1, t)));
+    c.correct2 = (float32)(1.0 / (1.0 - pow(o->beta2, t)));
+  }
+  return c;
+}
+
+fn device_moments(o: Optimizer*) {
+  var ps: Params* = o->params;
+  if (o->dfirst != 0 || ps->weights == 0) { return; }
+  var dev: Device* = ps->dev;
+  var wants_first: bool = o->kind != OPT_SGD || o->momentum > 0.0;
+  if (wants_first) {
+    o->dfirst = (float32*)dev->alloc(ps->weights * 4);
+    dev->fill(o->dfirst, 0.0, ps->weights);
+  }
+  if (o->kind != OPT_SGD) {
+    o->dsecond = (float32*)dev->alloc(ps->weights * 4);
+    dev->fill(o->dsecond, 0.0, ps->weights);
+  }
+}
+
+fn device_run(o: Optimizer*, at: int64, n: int64, decay: bool, factor: float32*) {
+  if (n <= 0) { return; }
+  var ps: Params* = o->params;
+  var dev: Device* = ps->dev;
+  var c: StepCall = step_call(o, decay);
+  var m: float32* = if o->dfirst != 0 { o->dfirst + at } else { (float32*)0 };
+  var v: float32* = if o->dsecond != 0 { o->dsecond + at } else { (float32*)0 };
+  var f: fn(rawptr, float32*, float32*, float32*, float32*, int64, StepCall*, float32*) -> void = dev->step;
+  f(dev->state, ps->values + at, ps->grads + at, m, v, n, &c, factor);
+}
+
+fn device_step(o: Optimizer*) {
+  var ps: Params* = o->params;
+  var dev: Device* = ps->dev;
+  device_moments(o);
+  o->steps = o->steps + 1;
+  var factor: float32* = (float32*)0;
+  if (o->clip > 0.0) {
+    ps->squares_on_device(ps->scratch);
+    factor = ps->scratch + 1;
+    var f: fn(rawptr, float32*, float32, float32*) -> void = dev->clip;
+    f(dev->state, ps->scratch, (float32)o->clip, factor);
+  }
+  if (!ps->any_frozen()) {
+    device_run(o, 0, ps->decayed, true, factor);
+    device_run(o, ps->decayed, ps->weights - ps->decayed, false, factor);
+    return;
+  }
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if (p->kind != PARAM_WEIGHT || p->frozen) { continue; }
+    device_run(o, p->offset, p->value.shape.size(), p->decay, factor);
+  }
+}
+
+export fn Optimizer_step__ptr(o: Optimizer*) {
+  if (o->params->dev != 0) {
+    device_step(o);
+    return;
+  }
+  if (o->clip > 0.0) { o->norm = clip_grad_norm(o->params, o->clip); }
+  ensure_slots(o);
+  o->steps = o->steps + 1;
+  var t: float64 = (float64)o->steps;
+  var j: StepJob* = new StepJob;
+  for i in 0..o->params->count {
+    var p: Param* = o->params->items[i];
+    if (p->kind != PARAM_WEIGHT || p->frozen || p->grad == 0) { continue; }
+    var n: int64 = p->value.shape.size();
+    j->kind = o->kind;
+    j->w = p->value.data;
+    j->g = p->grad;
+    j->n = n;
+    j->lr = (float32)o->lr;
+    var wd: float64 = if p->decay { o->weight_decay } else { 0.0 };
+    j->decay = if o->kind == OPT_ADAMW { (float32)0.0 } else { (float32)wd };
+    j->shrink = if o->kind == OPT_ADAMW { (float32)(1.0 - o->lr * wd) } else { (float32)1.0 };
+    if (o->kind == OPT_SGD) {
+      j->momentum = (float32)o->momentum;
+      j->dampening = (float32)o->dampening;
+      j->nesterov = o->nesterov;
+      j->m = if o->momentum > 0.0 { state(&o->first[i], n) } else { (float32*)0 };
+      j->first_step = o->steps == 1;
+    } else {
+      j->beta1 = (float32)o->beta1;
+      j->beta2 = (float32)o->beta2;
+      j->eps = (float32)o->eps;
+      j->m = state(&o->first[i], n);
+      j->v = state(&o->second[i], n);
+      j->correct1 = (float32)(1.0 / (1.0 - pow(o->beta1, t)));
+      j->correct2 = (float32)(1.0 / (1.0 - pow(o->beta2, t)));
+    }
+    run_parallel(&step_chunks, (rawptr)j, (n + STEP_CHUNK - 1) / STEP_CHUNK, STEP_CHUNK * 8);
+  }
+  free((rawptr)j);
+}
+
+export fn Optimizer_zero_grad__ptr(o: Optimizer*) {
+  o->params->zero_grad();
+}
+
+export fn Optimizer_set_lr__ptr(o: Optimizer*, lr: float64) {
+  o->lr = lr;
+}
+
+export fn grad_norm(ps: Params*) -> float64 {
+  if (ps->dev != 0) {
+    ps->squares_on_device(ps->scratch + 2);
+    var squares: float32 = 0.0;
+    ps->dev->get((rawptr)&squares, (rawptr)(ps->scratch + 2), 4);
+    return sqrt((float64)squares);
+  }
+  var total: float64 = 0.0;
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if (p->kind != PARAM_WEIGHT || p->frozen || p->grad == 0) { continue; }
+    var n: int64 = p->value.shape.size();
+    var at: int64 = 0;
+    while (at < n) {
+      var len: int64 = n - at;
+      if (len > 4096) { len = 4096; }
+      total = total + (float64)dot_f32(p->grad + at, p->grad + at, len);
+      at = at + len;
+    }
+  }
+  return sqrt(total);
+}
+
+export fn clip_grad_norm(ps: Params*, max_norm: float64) -> float64 {
+  var norm: float64 = grad_norm(ps);
+  if (norm > max_norm && norm > 0.0) {
+    var factor: float32 = (float32)(max_norm / (norm + 1.0e-6));
+    for i in 0..ps->count {
+      var p: Param* = ps->items[i];
+      if (p->kind != PARAM_WEIGHT || p->frozen || p->grad == 0) { continue; }
+      if (ps->dev != 0) {
+        ps->dev->add(p->dgrad, p->dgrad, factor - (float32)1.0, p->value.shape.size());
+      } else {
+        scale_f32(p->grad, factor, p->value.shape.size());
+      }
+    }
+  }
+  return norm;
+}
+
+export fn lr_cosine(step: int64, warmup: int64, total: int64, peak: float64, floor: float64) -> float64 {
+  if (step < warmup) { return peak * (float64)(step + 1) / (float64)warmup; }
+  if (step >= total) { return floor; }
+  var progress: float64 = (float64)(step - warmup) / (float64)(if (total - warmup < 1) 1 else total - warmup);
+  return floor + 0.5 * (peak - floor) * (1.0 + cos(3.141592653589793 * progress));
+}
+
+export fn lr_linear(step: int64, warmup: int64, total: int64, peak: float64, floor: float64) -> float64 {
+  if (step < warmup) { return peak * (float64)(step + 1) / (float64)warmup; }
+  if (step >= total) { return floor; }
+  var progress: float64 = (float64)(step - warmup) / (float64)(if (total - warmup < 1) 1 else total - warmup);
+  return peak + (floor - peak) * progress;
+}
+
+export fn lr_step(step: int64, every: int64, gamma: float64, base: float64) -> float64 {
+  return base * pow(gamma, (float64)(step / (if (every < 1) 1 else every)));
+}
+
+@test fn adam_matches_hand_steps() -> int32 {
+  var ps: Params* = params_new();
+  var p: Param* = ps->add("w", shape(2), PARAM_WEIGHT, true);
+  p->value.data[0] = 1.0;
+  p->value.data[1] = -2.0;
+  var o: Optimizer* = adam(ps, 0.1, 0.9, 0.999, 1.0e-8, 0.0);
+  var m0: float64 = 0.0;
+  var v0: float64 = 0.0;
+  var w0: float64 = 1.0;
+  for step in 1..4 {
+    var grad0: float64 = 2.0 * w0;
+    p->grad[0] = (float32)grad0;
+    p->grad[1] = (float32)(2.0 * (float64)p->value.data[1]);
+    o->step();
+    m0 = 0.9 * m0 + 0.1 * grad0;
+    v0 = 0.999 * v0 + 0.001 * grad0 * grad0;
+    var mh: float64 = m0 / (1.0 - pow(0.9, (float64)step));
+    var vh: float64 = v0 / (1.0 - pow(0.999, (float64)step));
+    w0 = w0 - 0.1 * mh / (sqrt(vh) + 1.0e-8);
+  }
+  var d: float64 = (float64)p->value.data[0] - w0;
+  if (d < 0.0) { d = -d; }
+  optimizer_free(o);
+  params_free(ps);
+  if (d > 1.0e-5) { return 1; }
+  return 0;
+}
+
+@test fn sgd_momentum_and_decay() -> int32 {
+  var ps: Params* = params_new();
+  var p: Param* = ps->add("w", shape(1), PARAM_WEIGHT, true);
+  var b: Param* = ps->add("b", shape(1), PARAM_WEIGHT, false);
+  p->value.data[0] = 1.0;
+  b->value.data[0] = 1.0;
+  var o: Optimizer* = sgd(ps, 0.5, 0.9, 0.1, false);
+  p->grad[0] = 1.0;
+  b->grad[0] = 1.0;
+  o->step();
+  if (p->value.data[0] != (float32)(1.0 - 0.5 * 1.1)) { return 1; }
+  if (b->value.data[0] != (float32)0.5) { return 2; }
+  p->grad[0] = 1.0;
+  b->grad[0] = 1.0;
+  o->step();
+  var w1: float64 = 1.0 - 0.5 * 1.1;
+  var buf: float64 = 0.9 * 1.1 + (1.0 + 0.1 * w1);
+  var want: float64 = w1 - 0.5 * buf;
+  var d: float64 = (float64)p->value.data[0] - want;
+  if (d < 0.0) { d = -d; }
+  if (d > 1.0e-6) { return 3; }
+  optimizer_free(o);
+  params_free(ps);
+  return 0;
+}
+
+@test fn adamw_decays_only_matrices() -> int32 {
+  var ps: Params* = params_new();
+  var w: Param* = ps->add("w", shape(1, 1), PARAM_WEIGHT, true);
+  var b: Param* = ps->add("b", shape(1), PARAM_WEIGHT, false);
+  w->value.data[0] = 2.0;
+  b->value.data[0] = 2.0;
+  var o: Optimizer* = adamw(ps, 0.1, 0.9, 0.999, 1.0e-8, 0.5);
+  o->step();
+  if (w->value.data[0] != (float32)(2.0 * 0.95)) { return 1; }
+  if (b->value.data[0] != (float32)2.0) { return 2; }
+  w->grad[0] = 3.0;
+  b->grad[0] = 3.0;
+  var norm: float64 = clip_grad_norm(ps, 1.0);
+  if (norm < 4.24 || norm > 4.25) { return 3; }
+  var after: float64 = grad_norm(ps);
+  if (after > 1.0 || after < 0.999) { return 4; }
+  optimizer_free(o);
+  params_free(ps);
+  return 0;
+}

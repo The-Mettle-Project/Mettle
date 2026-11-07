@@ -1,0 +1,285 @@
+import "std/mem";
+import "std/math";
+import "./tensor";
+import "./kernels";
+import "./graph";
+import "./ops_elementwise";
+import "./ops_shape";
+import "./ops_matmul";
+import "./ops_nn";
+import "./ops_conv";
+import "./ops_attention";
+
+export fn init_normal(p: Param*, rng: Rng*, std: float64) {
+  tensor_normal(p->value, rng, 0.0, std);
+}
+
+export fn init_uniform(p: Param*, rng: Rng*, bound: float64) {
+  tensor_uniform(p->value, rng, -bound, bound);
+}
+
+export fn init_constant(p: Param*, value: float64) {
+  p->value.fill((float32)value);
+}
+
+fn fans(p: Param*, fan_in: int64*, fan_out: int64*) {
+  var s: Shape = p->value.shape;
+  if (s.rank < 2) {
+    *fan_in = s.size();
+    *fan_out = s.size();
+    return;
+  }
+  var field: int64 = 1;
+  for i in 2..s.rank { field = field * s.dims[i]; }
+  *fan_in = s.dims[1] * field;
+  *fan_out = s.dims[0] * field;
+}
+
+export fn init_xavier_uniform(p: Param*, rng: Rng*, gain: float64) {
+  var fi: int64 = 0;
+  var fo: int64 = 0;
+  fans(p, &fi, &fo);
+  init_uniform(p, rng, gain * sqrt(6.0 / (float64)(fi + fo)));
+}
+
+export fn init_kaiming_normal(p: Param*, rng: Rng*) {
+  var fi: int64 = 0;
+  var fo: int64 = 0;
+  fans(p, &fi, &fo);
+  init_normal(p, rng, sqrt(2.0 / (float64)fi));
+}
+
+export fn init_kaiming_uniform(p: Param*, rng: Rng*) {
+  var fi: int64 = 0;
+  var fo: int64 = 0;
+  fans(p, &fi, &fo);
+  init_uniform(p, rng, sqrt(6.0 / (float64)fi));
+}
+
+export struct Linear {
+  weight: Param*;
+  bias: Param*;
+  in_features: int64;
+  out_features: int64;
+}
+
+export fn make_linear(ps: Params*, name: string, in_features: int64, out_features: int64, with_bias: bool, rng: Rng*) -> Linear {
+  var l: Linear;
+  l.in_features = in_features;
+  l.out_features = out_features;
+  l.weight = ps->add("{name}.weight", shape(out_features, in_features), PARAM_WEIGHT, true);
+  var bound: float64 = 1.0 / sqrt((float64)in_features);
+  init_uniform(l.weight, rng, bound);
+  if (with_bias) {
+    l.bias = ps->add("{name}.bias", shape(out_features), PARAM_WEIGHT, false);
+    init_uniform(l.bias, rng, bound);
+  }
+  return l;
+}
+
+export fn Linear_forward(l: Linear, x: Var) -> Var {
+  var g: Graph* = x.g;
+  if (l.bias == 0) { return linear_nobias(x, g->param(l.weight)); }
+  return linear(x, g->param(l.weight), g->param(l.bias));
+}
+
+export struct Embedding {
+  table: Param*;
+  count: int64;
+  width: int64;
+}
+
+export fn make_embedding(ps: Params*, name: string, count: int64, width: int64, rng: Rng*) -> Embedding {
+  var e: Embedding;
+  e.count = count;
+  e.width = width;
+  e.table = ps->add("{name}.weight", shape(count, width), PARAM_WEIGHT, true);
+  init_normal(e.table, rng, 1.0);
+  return e;
+}
+
+export fn Embedding_lookup(e: Embedding, g: Graph*, ids: int32*, dims: int64[..]) -> Var {
+  var s: Shape;
+  s.rank = (int32)dims.length + 1;
+  for i in 0..dims.length { s.dims[i] = dims[i]; }
+  s.dims[dims.length] = e.width;
+  return gather_rows(g->param(e.table), ids, s);
+}
+
+export struct LayerNorm {
+  weight: Param*;
+  bias: Param*;
+  eps: float64;
+}
+
+export fn make_layer_norm(ps: Params*, name: string, width: int64, eps: float64) -> LayerNorm {
+  var n: LayerNorm;
+  n.eps = eps;
+  n.weight = ps->add("{name}.weight", shape(width), PARAM_WEIGHT, false);
+  n.bias = ps->add("{name}.bias", shape(width), PARAM_WEIGHT, false);
+  init_constant(n.weight, 1.0);
+  return n;
+}
+
+export fn LayerNorm_forward(n: LayerNorm, x: Var) -> Var {
+  var g: Graph* = x.g;
+  return layer_norm(x, g->param(n.weight), g->param(n.bias), n.eps);
+}
+
+export struct RMSNorm {
+  weight: Param*;
+  eps: float64;
+}
+
+export fn make_rms_norm(ps: Params*, name: string, width: int64, eps: float64) -> RMSNorm {
+  var n: RMSNorm;
+  n.eps = eps;
+  n.weight = ps->add("{name}.weight", shape(width), PARAM_WEIGHT, false);
+  init_constant(n.weight, 1.0);
+  return n;
+}
+
+export fn RMSNorm_forward(n: RMSNorm, x: Var) -> Var {
+  return rms_norm(x, x.g->param(n.weight), n.eps);
+}
+
+export struct Conv2d {
+  weight: Param*;
+  bias: Param*;
+  stride: int64;
+  pad: int64;
+  dilation: int64;
+}
+
+export fn make_conv2d(ps: Params*, name: string, in_channels: int64, out_channels: int64, size: int64, stride: int64, pad: int64, with_bias: bool, rng: Rng*) -> Conv2d {
+  var c: Conv2d;
+  c.stride = stride;
+  c.pad = pad;
+  c.dilation = 1;
+  c.weight = ps->add("{name}.weight", shape(out_channels, in_channels, size, size), PARAM_WEIGHT, true);
+  var bound: float64 = 1.0 / sqrt((float64)(in_channels * size * size));
+  init_uniform(c.weight, rng, bound);
+  if (with_bias) {
+    c.bias = ps->add("{name}.bias", shape(out_channels), PARAM_WEIGHT, false);
+    init_uniform(c.bias, rng, bound);
+  }
+  return c;
+}
+
+export fn Conv2d_forward(c: Conv2d, x: Var) -> Var {
+  var g: Graph* = x.g;
+  if (c.bias == 0) { return conv2d_nobias(x, g->param(c.weight), c.stride, c.pad); }
+  return conv2d_dilated(x, g->param(c.weight), g->param(c.bias), c.stride, c.pad, c.dilation);
+}
+
+export struct BatchNorm {
+  weight: Param*;
+  bias: Param*;
+  running_mean: Param*;
+  running_var: Param*;
+  momentum: float64;
+  eps: float64;
+}
+
+export fn make_batch_norm(ps: Params*, name: string, channels: int64) -> BatchNorm {
+  var b: BatchNorm;
+  b.momentum = 0.1;
+  b.eps = 1.0e-5;
+  b.weight = ps->add("{name}.weight", shape(channels), PARAM_WEIGHT, false);
+  b.bias = ps->add("{name}.bias", shape(channels), PARAM_WEIGHT, false);
+  b.running_mean = ps->add("{name}.running_mean", shape(channels), PARAM_BUFFER, false);
+  b.running_var = ps->add("{name}.running_var", shape(channels), PARAM_BUFFER, false);
+  init_constant(b.weight, 1.0);
+  init_constant(b.running_var, 1.0);
+  return b;
+}
+
+export fn BatchNorm_forward(b: BatchNorm, x: Var) -> Var {
+  var g: Graph* = x.g;
+  var mean: float32* = if g->on_device() { b.running_mean->dvalue } else { b.running_mean->value.data };
+  var variance: float32* = if g->on_device() { b.running_var->dvalue } else { b.running_var->value.data };
+  return batch_norm(x, g->param(b.weight), g->param(b.bias), mean, variance, b.momentum, b.eps);
+}
+
+export struct Mlp {
+  fc: Linear;
+  proj: Linear;
+  dropout: float64;
+}
+
+export fn make_mlp(ps: Params*, name: string, width: int64, hidden: int64, dropout_p: float64, rng: Rng*) -> Mlp {
+  var m: Mlp;
+  m.fc = make_linear(ps, "{name}.fc", width, hidden, true, rng);
+  m.proj = make_linear(ps, "{name}.proj", hidden, width, true, rng);
+  m.dropout = dropout_p;
+  return m;
+}
+
+export fn Mlp_forward(m: Mlp, x: Var) -> Var {
+  return dropout(m.proj.forward(m.fc.forward(x).gelu_tanh()), m.dropout);
+}
+
+export struct Attention {
+  qkv: Linear;
+  proj: Linear;
+  heads: int64;
+  width: int64;
+  dropout: float64;
+  causal: bool;
+}
+
+export fn make_attention(ps: Params*, name: string, width: int64, heads: int64, causal: bool, dropout_p: float64, rng: Rng*) -> Attention {
+  if (width % heads != 0) { mmll_fail("attention width {width} does not split into {heads} heads"); }
+  var a: Attention;
+  a.qkv = make_linear(ps, "{name}.qkv", width, 3 * width, true, rng);
+  a.proj = make_linear(ps, "{name}.proj", width, width, true, rng);
+  a.heads = heads;
+  a.width = width;
+  a.dropout = dropout_p;
+  a.causal = causal;
+  return a;
+}
+
+export fn Attention_forward(a: Attention, x: Var) -> Var {
+  var s: Shape = x.shape();
+  if (s.rank != 3 || s.dims[2] != a.width) {
+    mmll_fail("attention takes [batch, time, {a.width}], got {s.text()}");
+  }
+  var mixed: Var = self_attention(a.qkv.forward(x), a.heads, a.causal, a.dropout);
+  return dropout(a.proj.forward(mixed), a.dropout);
+}
+
+export fn attention_composed(qkv: Var, heads: int64, causal: bool, dropout_p: float64) -> Var {
+  var s: Shape = qkv.shape();
+  var b: int64 = s.dims[0];
+  var t: int64 = s.dims[1];
+  var c: int64 = s.dims[2] / 3;
+  var hd: int64 = c / heads;
+  var q: Var = qkv.slice(2, 0, c).view(b, t, heads, hd).transpose(1, 2);
+  var k: Var = qkv.slice(2, c, c).view(b, t, heads, hd).transpose(1, 2);
+  var v: Var = qkv.slice(2, 2 * c, c).view(b, t, heads, hd).transpose(1, 2);
+  var scores: Var = q.matmul_t(k).scale(1.0 / sqrt((float64)hd));
+  var weights: Var = if causal { scores.causal_softmax() } else { scores.softmax() };
+  return dropout(weights, dropout_p).matmul(v).transpose(1, 2).view(b, t, c);
+}
+
+export struct Block {
+  ln1: LayerNorm;
+  attn: Attention;
+  ln2: LayerNorm;
+  mlp: Mlp;
+}
+
+export fn make_block(ps: Params*, name: string, width: int64, heads: int64, dropout_p: float64, rng: Rng*) -> Block {
+  var b: Block;
+  b.ln1 = make_layer_norm(ps, "{name}.ln1", width, 1.0e-5);
+  b.attn = make_attention(ps, "{name}.attn", width, heads, true, dropout_p, rng);
+  b.ln2 = make_layer_norm(ps, "{name}.ln2", width, 1.0e-5);
+  b.mlp = make_mlp(ps, "{name}.mlp", width, 4 * width, dropout_p, rng);
+  return b;
+}
+
+export fn Block_forward(b: Block, x: Var) -> Var {
+  var h: Var = x.add(b.attn.forward(b.ln1.forward(x)));
+  return h.add(b.mlp.forward(b.ln2.forward(h)));
+}

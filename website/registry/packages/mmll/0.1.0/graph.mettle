@@ -1,0 +1,927 @@
+import "std/mem";
+import "std/time";
+import "./tensor";
+import "./kernels";
+
+export const OP_LEAF = 0;
+export const OP_ADD = 1;
+export const OP_SUB = 2;
+export const OP_MUL = 3;
+export const OP_DIV = 4;
+export const OP_ADD_SCALAR = 5;
+export const OP_MUL_SCALAR = 6;
+export const OP_POW_SCALAR = 7;
+export const OP_NEG = 8;
+export const OP_EXP = 9;
+export const OP_LOG = 10;
+export const OP_SQRT = 11;
+export const OP_TANH = 12;
+export const OP_SIGMOID = 13;
+export const OP_RELU = 14;
+export const OP_LEAKY_RELU = 15;
+export const OP_GELU = 16;
+export const OP_GELU_TANH = 17;
+export const OP_SILU = 18;
+export const OP_SOFTPLUS = 19;
+export const OP_ABS = 20;
+export const OP_CLAMP = 21;
+export const OP_SQUARE = 22;
+export const OP_SUM_ALL = 30;
+export const OP_MEAN_ALL = 31;
+export const OP_SUM = 32;
+export const OP_MEAN = 33;
+export const OP_MAX = 34;
+export const OP_RESHAPE = 40;
+export const OP_TRANSPOSE = 41;
+export const OP_SLICE = 42;
+export const OP_CONCAT = 43;
+export const OP_MATMUL = 50;
+export const OP_MATMUL_NT = 51;
+export const OP_LINEAR = 52;
+export const OP_SOFTMAX = 60;
+export const OP_LOG_SOFTMAX = 61;
+export const OP_CAUSAL_SOFTMAX = 62;
+export const OP_CROSS_ENTROPY = 63;
+export const OP_MSE = 64;
+export const OP_BCE_LOGITS = 65;
+export const OP_LAYER_NORM = 70;
+export const OP_RMS_NORM = 71;
+export const OP_DROPOUT = 72;
+export const OP_GATHER_ROWS = 73;
+export const OP_ATTENTION = 74;
+export const OP_CACHED_ATTENTION = 75;
+export const OP_CONV2D = 80;
+export const OP_MAX_POOL2D = 81;
+export const OP_AVG_POOL2D = 82;
+export const OP_BATCH_NORM = 83;
+
+export const PARAM_WEIGHT = 0;
+export const PARAM_BUFFER = 1;
+
+export struct Param {
+  name: string;
+  value: Tensor;
+  grad: float32*;
+  kind: int32;
+  decay: bool;
+  frozen: bool;
+  dvalue: float32*;
+  dgrad: float32*;
+  offset: int64;
+}
+
+export struct StepCall {
+  kind: int32;
+  lr: float32;
+  beta1: float32;
+  beta2: float32;
+  eps: float32;
+  decay: float32;
+  shrink: float32;
+  correct1: float32;
+  correct2: float32;
+  momentum: float32;
+  dampening: float32;
+  nesterov: bool;
+  first: bool;
+}
+
+export struct Device {
+  state: rawptr;
+  persist: fn(rawptr, int64) -> rawptr;
+  release: fn(rawptr, rawptr) -> void;
+  set: fn(rawptr, float32*, float32, int64) -> void;
+  upload: fn(rawptr, rawptr, rawptr, int64) -> void;
+  download: fn(rawptr, rawptr, rawptr, int64) -> void;
+  forward: fn(rawptr, Graph*, int32) -> void;
+  backward: fn(rawptr, Graph*, int32) -> void;
+  add: fn(rawptr, float32*, float32*, float32, int64) -> void;
+  squares: fn(rawptr, float32*, float32*, int64) -> void;
+  clip: fn(rawptr, float32*, float32, float32*) -> void;
+  step: fn(rawptr, float32*, float32*, float32*, float32*, int64, StepCall*, float32*) -> void;
+  sync: fn(rawptr) -> void;
+}
+
+export fn Device_wait__ptr(d: Device*) {
+  var f: fn(rawptr) -> void = d->sync;
+  f(d->state);
+}
+
+export fn Device_alloc__ptr(d: Device*, bytes: int64) -> rawptr {
+  var f: fn(rawptr, int64) -> rawptr = d->persist;
+  var p: rawptr = f(d->state, bytes);
+  if (p == 0) { mmll_fail("the device is out of memory ({bytes} bytes)"); }
+  return p;
+}
+
+export fn Device_free__ptr(d: Device*, p: rawptr) {
+  var f: fn(rawptr, rawptr) -> void = d->release;
+  f(d->state, p);
+}
+
+export fn Device_fill__ptr(d: Device*, p: float32*, value: float32, n: int64) {
+  if (n <= 0) { return; }
+  var f: fn(rawptr, float32*, float32, int64) -> void = d->set;
+  f(d->state, p, value, n);
+}
+
+export fn Device_add__ptr(d: Device*, dst: float32*, src: float32*, alpha: float32, n: int64) {
+  if (n <= 0) { return; }
+  var f: fn(rawptr, float32*, float32*, float32, int64) -> void = d->add;
+  f(d->state, dst, src, alpha, n);
+}
+
+export fn Device_put__ptr(d: Device*, dst: rawptr, src: rawptr, bytes: int64) {
+  if (bytes <= 0) { return; }
+  var f: fn(rawptr, rawptr, rawptr, int64) -> void = d->upload;
+  f(d->state, dst, src, bytes);
+}
+
+export fn Device_get__ptr(d: Device*, dst: rawptr, src: rawptr, bytes: int64) {
+  if (bytes <= 0) { return; }
+  var f: fn(rawptr, rawptr, rawptr, int64) -> void = d->download;
+  f(d->state, dst, src, bytes);
+}
+
+export struct Params {
+  items: Param**;
+  count: int32;
+  capacity: int32;
+  dev: Device*;
+  values: float32*;
+  grads: float32*;
+  slots: int64;
+  weights: int64;
+  decayed: int64;
+  scratch: float32*;
+}
+
+export struct Bump {
+  block: uint8*;
+  used: int64;
+  size: int64;
+  retired: uint8**;
+  retired_count: int32;
+  retired_capacity: int32;
+  spent: int64;
+  peak: int64;
+}
+
+export struct Node {
+  op: int32;
+  a: int32;
+  b: int32;
+  c: int32;
+  value: Tensor;
+  grad: float32*;
+  requires: bool;
+  param: Param*;
+  i0: int64;
+  i1: int64;
+  i2: int64;
+  i3: int64;
+  i4: int64;
+  i5: int64;
+  f0: float32;
+  f1: float32;
+  saved: float32*;
+  saved2: float32*;
+  ints: int32*;
+  ext: rawptr;
+}
+
+export struct Graph {
+  nodes: Node*;
+  count: int32;
+  capacity: int32;
+  host: Bump;
+  device: Bump;
+  record: bool;
+  training: bool;
+  rng: Rng;
+  profiling: bool;
+  last_op: int32;
+  last_mark: int64;
+  forward_ns: int64[96];
+  backward_ns: int64[96];
+  calls: int64[96];
+  dev: Device*;
+}
+
+export fn op_name(op: int32) -> string {
+  switch (op) {
+    case 0: { return "leaf"; }
+    case 1: { return "add"; }
+    case 2: { return "sub"; }
+    case 3: { return "mul"; }
+    case 4: { return "div"; }
+    case 5: { return "shift"; }
+    case 6: { return "scale"; }
+    case 7: { return "pow"; }
+    case 8: { return "neg"; }
+    case 9: { return "exp"; }
+    case 10: { return "log"; }
+    case 11: { return "sqrt"; }
+    case 12: { return "tanh"; }
+    case 13: { return "sigmoid"; }
+    case 14: { return "relu"; }
+    case 15: { return "leaky_relu"; }
+    case 16: { return "gelu"; }
+    case 17: { return "gelu_tanh"; }
+    case 18: { return "silu"; }
+    case 19: { return "softplus"; }
+    case 20: { return "abs"; }
+    case 21: { return "clamp"; }
+    case 22: { return "square"; }
+    case 30: { return "sum"; }
+    case 31: { return "mean"; }
+    case 32: { return "sum_axis"; }
+    case 33: { return "mean_axis"; }
+    case 34: { return "max_axis"; }
+    case 40: { return "reshape"; }
+    case 41: { return "transpose"; }
+    case 42: { return "slice"; }
+    case 43: { return "concat"; }
+    case 50: { return "matmul"; }
+    case 51: { return "matmul_t"; }
+    case 52: { return "linear"; }
+    case 60: { return "softmax"; }
+    case 61: { return "log_softmax"; }
+    case 62: { return "causal_softmax"; }
+    case 63: { return "cross_entropy"; }
+    case 64: { return "mse_loss"; }
+    case 65: { return "bce_with_logits"; }
+    case 70: { return "layer_norm"; }
+    case 71: { return "rms_norm"; }
+    case 72: { return "dropout"; }
+    case 73: { return "gather_rows"; }
+    case 74: { return "self_attention"; }
+    case 75: { return "cached_attention"; }
+    case 80: { return "conv2d"; }
+    case 81: { return "max_pool2d"; }
+    case 82: { return "avg_pool2d"; }
+    case 83: { return "batch_norm"; }
+    default: { return "op"; }
+  }
+  return "op";
+}
+
+fn profile_mark(g: Graph*, next_op: int32) {
+  if (g->dev != 0) { g->dev->wait(); }
+  var now: int64 = time_mono_ns();
+  if (g->last_op >= 0) {
+    g->forward_ns[g->last_op] = g->forward_ns[g->last_op] + (now - g->last_mark);
+  }
+  g->last_op = next_op;
+  g->last_mark = now;
+}
+
+export fn Graph_profile__ptr(g: Graph*, on: bool) {
+  g->profiling = on;
+  g->last_op = -1;
+  for i in 0..96 {
+    g->forward_ns[i] = 0;
+    g->backward_ns[i] = 0;
+    g->calls[i] = 0;
+  }
+}
+
+export fn Graph_profile_close__ptr(g: Graph*) {
+  if (g->profiling) { profile_mark(g, -1); }
+}
+
+export fn Graph_profile_backward__ptr(g: Graph*, op: int32, ns: int64) {
+  g->backward_ns[op] = g->backward_ns[op] + ns;
+}
+
+export fn Graph_profile_report__ptr(g: Graph*) -> string {
+  g->profile_close();
+  var total: int64 = 0;
+  for i in 0..96 { total = total + g->forward_ns[i] + g->backward_ns[i]; }
+  var text: string = "op                  calls   forward ms  backward ms   share\n";
+  var order: int32[96];
+  for i in 0..96 { order[i] = i; }
+  for i in 0..96 {
+    var best: int32 = i;
+    for j in i + 1..96 {
+      var tj: int64 = g->forward_ns[order[j]] + g->backward_ns[order[j]];
+      var tb: int64 = g->forward_ns[order[best]] + g->backward_ns[order[best]];
+      if (tj > tb) { best = j; }
+    }
+    var keep: int32 = order[i];
+    order[i] = order[best];
+    order[best] = keep;
+  }
+  for k in 0..96 {
+    var i: int32 = order[k];
+    var spent: int64 = g->forward_ns[i] + g->backward_ns[i];
+    if (spent == 0 && g->calls[i] == 0) { continue; }
+    var name: string = op_name(i);
+    var pad: string = "";
+    for p in name.length..18 { pad = "{pad} "; }
+    var share: float64 = if total > 0 { 100.0 * (float64)spent / (float64)total } else { 0.0 };
+    text = "{text}{name}{pad}{fixed(g->calls[i], 7)}  {millis(g->forward_ns[i])}  {millis(g->backward_ns[i])}  {percent(share)}\n";
+  }
+  return "{text}total {millis(total)} ms\n";
+}
+
+fn fixed(n: int64, width: int32) -> string {
+  var s: string = "{n}";
+  while ((int64)s.length < (int64)width) { s = " {s}"; }
+  return s;
+}
+
+fn millis(ns: int64) -> string {
+  var tenths: int64 = ns / 100000;
+  var s: string = "{tenths / 10}.{tenths % 10}";
+  while (s.length < 11) { s = " {s}"; }
+  return s;
+}
+
+fn percent(p: float64) -> string {
+  var tenths: int64 = (int64)(p * 10.0 + 0.5);
+  var s: string = "{tenths / 10}.{tenths % 10}%";
+  while (s.length < 6) { s = " {s}"; }
+  return s;
+}
+
+export struct Var {
+  g: Graph*;
+  id: int32;
+}
+
+export fn params_new() -> Params* {
+  return new Params;
+}
+
+export fn Params_add__ptr(ps: Params*, name: string, s: Shape, kind: int32, decay: bool) -> Param* {
+  if (ps->find(name) != 0) { mmll_fail("a parameter named '{name}' already exists"); }
+  if (ps->count == ps->capacity) {
+    var cap: int32 = if (ps->capacity == 0) 16 else ps->capacity * 2;
+    var grown: Param** = (Param**)realloc((rawptr)ps->items, (int64)cap * 8);
+    if (grown == 0) { mmll_fail("out of memory for the parameter list"); }
+    ps->items = grown;
+    ps->capacity = cap;
+  }
+  var p: Param* = new Param;
+  p->name = "{name}";
+  p->value = tensor_new(s);
+  p->kind = kind;
+  p->decay = decay;
+  p->frozen = kind == PARAM_BUFFER;
+  if (kind == PARAM_WEIGHT) {
+    var n: int64 = s.size();
+    p->grad = (float32*)calloc(1, if (n < 1) 4 else n * 4);
+  }
+  ps->items[ps->count] = p;
+  ps->count = ps->count + 1;
+  return p;
+}
+
+export fn Params_any_frozen__ptr(ps: Params*) -> bool {
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if (p->kind == PARAM_WEIGHT && p->frozen) { return true; }
+  }
+  return false;
+}
+
+export fn Params_squares_on_device__ptr(ps: Params*, out: float32*) {
+  var dev: Device* = ps->dev;
+  var f: fn(rawptr, float32*, float32*, int64) -> void = dev->squares;
+  dev->fill(out, 0.0, 1);
+  if (!ps->any_frozen()) {
+    f(dev->state, out, ps->grads, ps->weights);
+    return;
+  }
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if (p->kind != PARAM_WEIGHT || p->frozen) { continue; }
+    f(dev->state, out, p->dgrad, p->value.shape.size());
+  }
+}
+
+export fn Params_find__ptr(ps: Params*, name: string) -> Param* {
+  for i in 0..ps->count {
+    if (ps->items[i]->name == name) { return ps->items[i]; }
+  }
+  return (Param*)0;
+}
+
+export fn Params_get__ptr(ps: Params*, name: string) -> Param* {
+  var p: Param* = ps->find(name);
+  if (p == 0) { mmll_fail("no parameter named '{name}'"); }
+  return p;
+}
+
+export fn Params_size__ptr(ps: Params*) -> int64 {
+  var total: int64 = 0;
+  for i in 0..ps->count {
+    if (ps->items[i]->kind == PARAM_WEIGHT) { total = total + ps->items[i]->value.shape.size(); }
+  }
+  return total;
+}
+
+export fn Params_zero_grad__ptr(ps: Params*) {
+  if (ps->dev != 0) {
+    ps->dev->fill(ps->grads, 0.0, ps->weights);
+    return;
+  }
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if (p->grad != 0) { zero_f32(p->grad, p->value.shape.size()); }
+  }
+}
+
+fn padded(n: int64) -> int64 {
+  return (n + 63) / 64 * 64;
+}
+
+fn place(ps: Params*, at: int64, weights: bool, decay: bool) -> int64 {
+  var next: int64 = at;
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if ((p->kind == PARAM_WEIGHT) != weights) { continue; }
+    if (weights && p->decay != decay) { continue; }
+    p->offset = next;
+    next = next + padded(p->value.shape.size());
+  }
+  return next;
+}
+
+export fn Params_to_device__ptr(ps: Params*, dev: Device*) {
+  if (ps->dev == dev) { return; }
+  if (ps->dev != 0) { mmll_fail("these parameters already live on another device"); }
+  var decayed: int64 = place(ps, 0, true, true);
+  var weights: int64 = place(ps, decayed, true, false);
+  var slots: int64 = place(ps, weights, false, false);
+  ps->values = (float32*)dev->alloc((if (slots < 64) 64 else slots) * 4);
+  ps->grads = (float32*)dev->alloc((if (weights < 64) 64 else weights) * 4);
+  ps->scratch = (float32*)dev->alloc(256);
+  dev->fill(ps->scratch, 0.0, 64);
+  dev->fill(ps->values, 0.0, slots);
+  dev->fill(ps->grads, 0.0, weights);
+  ps->slots = slots;
+  ps->weights = weights;
+  ps->decayed = decayed;
+  ps->dev = dev;
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    p->dvalue = ps->values + p->offset;
+    p->dgrad = if p->kind == PARAM_WEIGHT { ps->grads + p->offset } else { (float32*)0 };
+    var n: int64 = p->value.shape.size();
+    dev->put((rawptr)p->dvalue, (rawptr)p->value.data, n * 4);
+    if (p->grad != 0) { dev->put((rawptr)p->dgrad, (rawptr)p->grad, n * 4); }
+  }
+}
+
+export fn Params_fetch__ptr(ps: Params*) {
+  if (ps->dev == 0) { return; }
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    var n: int64 = p->value.shape.size();
+    ps->dev->get((rawptr)p->value.data, (rawptr)p->dvalue, n * 4);
+    if (p->grad != 0) { ps->dev->get((rawptr)p->grad, (rawptr)p->dgrad, n * 4); }
+  }
+}
+
+export fn Params_push__ptr(ps: Params*) {
+  if (ps->dev == 0) { return; }
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    ps->dev->put((rawptr)p->dvalue, (rawptr)p->value.data, p->value.shape.size() * 4);
+  }
+}
+
+export fn Params_freeze__ptr(ps: Params*, prefix: string) -> int32 {
+  var hit: int32 = 0;
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if (p->kind == PARAM_WEIGHT && starts_with(p->name, prefix)) {
+      p->frozen = true;
+      hit = hit + 1;
+    }
+  }
+  return hit;
+}
+
+export fn Params_unfreeze__ptr(ps: Params*, prefix: string) -> int32 {
+  var hit: int32 = 0;
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if (p->kind == PARAM_WEIGHT && starts_with(p->name, prefix)) {
+      p->frozen = false;
+      hit = hit + 1;
+    }
+  }
+  return hit;
+}
+
+fn starts_with(text: string, prefix: string) -> bool {
+  if (prefix.length > text.length) { return false; }
+  for i in 0..prefix.length {
+    if (text[i] != prefix[i]) { return false; }
+  }
+  return true;
+}
+
+export fn params_free(ps: Params*) {
+  if (ps->dev != 0) {
+    ps->dev->free((rawptr)ps->values);
+    ps->dev->free((rawptr)ps->grads);
+    ps->dev->free((rawptr)ps->scratch);
+  }
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    tensor_free(&p->value);
+    if (p->grad != 0) { free((rawptr)p->grad); }
+    var _name: string = mem_take(&p->name);
+    free((rawptr)p);
+  }
+  if (ps->items != 0) { free((rawptr)ps->items); }
+  free((rawptr)ps);
+}
+
+export fn graph_new() -> Graph* {
+  var g: Graph* = new Graph;
+  g->record = true;
+  g->training = true;
+  g->rng = rng_new(0x5EED);
+  g->last_op = -1;
+  return g;
+}
+
+export fn graph_on(dev: Device*) -> Graph* {
+  var g: Graph* = graph_new();
+  g->dev = dev;
+  return g;
+}
+
+export fn graph_free(g: Graph*) {
+  g->reset();
+  arena_drop(&g->host, (Device*)0);
+  arena_drop(&g->device, g->dev);
+  if (g->nodes != 0) { free((rawptr)g->nodes); }
+  free((rawptr)g);
+}
+
+fn arena_block(dev: Device*, size: int64) -> uint8* {
+  if (dev != 0) { return (uint8*)dev->alloc(size + 256); }
+  var p: uint8* = (uint8*)malloc(size + 64);
+  if (p == 0) { mmll_fail("out of memory for the graph arena ({size} bytes)"); }
+  return p;
+}
+
+fn arena_give(dev: Device*, block: uint8*) {
+  if (dev != 0) {
+    dev->free((rawptr)block);
+  } else {
+    free((rawptr)block);
+  }
+}
+
+fn arena_drop(a: Bump*, dev: Device*) {
+  if (a->block != 0) { arena_give(dev, a->block); }
+  if (a->retired != 0) { free((rawptr)a->retired); }
+  a->block = (uint8*)0;
+  a->retired = (uint8**)0;
+}
+
+fn arena_rewind(a: Bump*, dev: Device*) {
+  var total: int64 = a->spent + a->used;
+  if (total > a->peak) { a->peak = total; }
+  if (a->retired_count > 0) {
+    for i in 0..a->retired_count { arena_give(dev, a->retired[i]); }
+    a->retired_count = 0;
+    arena_give(dev, a->block);
+    a->size = (a->peak + 65535) / 65536 * 65536;
+    a->block = arena_block(dev, a->size);
+  }
+  a->used = 0;
+  a->spent = 0;
+}
+
+fn arena_take(a: Bump*, dev: Device*, bytes: int64) -> rawptr {
+  var unit: int64 = if dev != 0 { 256 } else { 64 };
+  var want: int64 = (bytes + unit - 1) / unit * unit;
+  if (want < unit) { want = unit; }
+  if (a->used + want > a->size) {
+    if (a->block != 0) {
+      if (a->retired_count == a->retired_capacity) {
+        var cap: int32 = if (a->retired_capacity == 0) 8 else a->retired_capacity * 2;
+        a->retired = (uint8**)realloc((rawptr)a->retired, (int64)cap * 8);
+        a->retired_capacity = cap;
+      }
+      a->retired[a->retired_count] = a->block;
+      a->retired_count = a->retired_count + 1;
+      a->spent = a->spent + a->used;
+    }
+    var size: int64 = a->size * 2;
+    if (size < 1048576) { size = 1048576; }
+    if (size < want) { size = (want + 65535) / 65536 * 65536; }
+    a->block = arena_block(dev, size);
+    a->size = size;
+    a->used = 0;
+  }
+  var base: uint64 = (uint64)a->block;
+  var aligned: uint64 = (base + (uint64)(unit - 1)) & ~(uint64)(unit - 1);
+  var p: rawptr = (rawptr)(aligned + (uint64)a->used);
+  a->used = a->used + want;
+  return p;
+}
+
+export fn Graph_reset__ptr(g: Graph*) {
+  if (g->profiling) {
+    profile_mark(g, -1);
+    g->last_op = -1;
+  }
+  arena_rewind(&g->host, (Device*)0);
+  arena_rewind(&g->device, g->dev);
+  g->count = 0;
+}
+
+export fn Graph_seed__ptr(g: Graph*, seed: uint64) {
+  g->rng = rng_new(seed);
+}
+
+export fn Graph_on_device__ptr(g: Graph*) -> bool {
+  return g->dev != 0;
+}
+
+export fn Graph_alloc__ptr(g: Graph*, bytes: int64) -> rawptr {
+  if (g->dev != 0) { return arena_take(&g->device, g->dev, bytes); }
+  return arena_take(&g->host, (Device*)0, bytes);
+}
+
+export fn Graph_host_alloc__ptr(g: Graph*, bytes: int64) -> rawptr {
+  return arena_take(&g->host, (Device*)0, bytes);
+}
+
+export fn Graph_floats__ptr(g: Graph*, n: int64) -> float32* {
+  return (float32*)g->alloc(n * 4);
+}
+
+export fn Graph_zeros_raw__ptr(g: Graph*, n: int64) -> float32* {
+  var p: float32* = (float32*)g->alloc(n * 4);
+  if (g->dev != 0) {
+    g->dev->fill(p, 0.0, n);
+  } else {
+    zero_f32(p, n);
+  }
+  return p;
+}
+
+export fn Graph_ints__ptr(g: Graph*, n: int64) -> int32* {
+  return (int32*)g->host_alloc(n * 4);
+}
+
+export fn Graph_index__ptr(g: Graph*, n: int64) -> int32* {
+  return (int32*)g->alloc(if (n < 1) 4 else n * 4);
+}
+
+export fn Graph_index_from__ptr(g: Graph*, host: int32*, n: int64) -> int32* {
+  var p: int32* = g->index(n);
+  if (g->dev != 0) {
+    g->dev->put((rawptr)p, (rawptr)host, n * 4);
+  } else {
+    memcpy((rawptr)p, (rawptr)host, n * 4);
+  }
+  return p;
+}
+
+fn leaf_data(g: Graph*, t: Tensor) -> float32* {
+  if (g->dev == 0) { return t.data; }
+  var n: int64 = t.shape.size();
+  var p: float32* = g->floats(if (n < 1) 1 else n);
+  g->dev->put((rawptr)p, (rawptr)t.data, n * 4);
+  return p;
+}
+
+export fn Graph_push__ptr(g: Graph*, op: int32, a: int32, b: int32, c: int32, s: Shape) -> int32 {
+  if (g->count == g->capacity) {
+    var cap: int32 = if (g->capacity == 0) 256 else g->capacity * 2;
+    var grown: Node* = (Node*)realloc((rawptr)g->nodes, (int64)cap * sizeof(Node));
+    if (grown == 0) { mmll_fail("out of memory for graph nodes"); }
+    g->nodes = grown;
+    g->capacity = cap;
+  }
+  if (g->profiling) {
+    profile_mark(g, op);
+    g->calls[op] = g->calls[op] + 1;
+  }
+  var id: int32 = g->count;
+  g->count = g->count + 1;
+  var n: Node* = &g->nodes[id];
+  memset((rawptr)n, 0, sizeof(Node));
+  n->op = op;
+  n->a = a;
+  n->b = b;
+  n->c = c;
+  n->value.shape = s;
+  var requires: bool = false;
+  if (g->record) {
+    if (a >= 0 && g->nodes[a].requires) { requires = true; }
+    if (b >= 0 && g->nodes[b].requires) { requires = true; }
+    if (c >= 0 && g->nodes[c].requires) { requires = true; }
+  }
+  n->requires = requires;
+  if (op != OP_LEAF && op != OP_RESHAPE) {
+    var size: int64 = s.size();
+    n->value.data = (float32*)g->alloc(if (size < 1) 4 else size * 4);
+  }
+  return id;
+}
+
+export fn Graph_node__ptr(g: Graph*, id: int32) -> Node* {
+  return &g->nodes[id];
+}
+
+export fn Graph_data__ptr(g: Graph*, id: int32) -> float32* {
+  return g->nodes[id].value.data;
+}
+
+export fn Graph_input__ptr(g: Graph*, t: Tensor) -> Var {
+  var data: float32* = leaf_data(g, t);
+  var id: int32 = g->push(OP_LEAF, -1, -1, -1, t.shape);
+  g->nodes[id].value.data = data;
+  return { g: g, id: id };
+}
+
+export fn Graph_resident__ptr(g: Graph*, data: float32*, s: Shape) -> Var {
+  var id: int32 = g->push(OP_LEAF, -1, -1, -1, s);
+  g->nodes[id].value.data = data;
+  return { g: g, id: id };
+}
+
+export fn Graph_param__ptr(g: Graph*, p: Param*) -> Var {
+  if (g->dev != 0 && p->dvalue == 0) {
+    mmll_fail("parameter '{p->name}' is not on the device; call ps->to_device(dev) first");
+  }
+  if (g->dev == 0 && p->dvalue != 0) {
+    mmll_fail("parameter '{p->name}' lives on a device; build this graph with graph_on(dev)");
+  }
+  var id: int32 = g->push(OP_LEAF, -1, -1, -1, p->value.shape);
+  var n: Node* = &g->nodes[id];
+  n->value.data = if g->dev != 0 { p->dvalue } else { p->value.data };
+  n->param = p;
+  n->requires = g->record && !p->frozen && p->kind == PARAM_WEIGHT;
+  return { g: g, id: id };
+}
+
+export fn Graph_variable__ptr(g: Graph*, t: Tensor) -> Var {
+  var data: float32* = leaf_data(g, t);
+  var id: int32 = g->push(OP_LEAF, -1, -1, -1, t.shape);
+  var n: Node* = &g->nodes[id];
+  n->value.data = data;
+  n->requires = g->record;
+  return { g: g, id: id };
+}
+
+export fn Graph_full__ptr(g: Graph*, s: Shape, value: float64) -> Var {
+  var id: int32 = g->push(OP_LEAF, -1, -1, -1, s);
+  var size: int64 = s.size();
+  var data: float32* = g->floats(if (size < 1) 1 else size);
+  if (g->dev != 0) {
+    g->dev->fill(data, (float32)value, size);
+  } else {
+    fill_f32(data, (float32)value, size);
+  }
+  g->nodes[id].value.data = data;
+  return { g: g, id: id };
+}
+
+export fn Graph_values__ptr(g: Graph*, values: float32[], s: Shape) -> Var {
+  if ((int64)values.length != s.size()) {
+    mmll_fail("{values.length} values do not fill a {s.text()} tensor");
+  }
+  var id: int32 = g->push(OP_LEAF, -1, -1, -1, s);
+  var data: float32* = g->floats(if (s.size() < 1) 1 else s.size());
+  if (g->dev != 0) {
+    g->dev->put((rawptr)data, (rawptr)&values[0], s.size() * 4);
+  } else {
+    for i in 0..values.length { data[i] = values[i]; }
+  }
+  g->nodes[id].value.data = data;
+  return { g: g, id: id };
+}
+
+export fn Graph_grad_of__ptr(g: Graph*, id: int32) -> float32* {
+  var n: Node* = &g->nodes[id];
+  if (n->grad != 0) { return n->grad; }
+  if (n->op == OP_RESHAPE) {
+    var shared: float32* = g->grad_of(n->a);
+    g->nodes[id].grad = shared;
+    return shared;
+  }
+  if (n->param != 0) {
+    n->grad = if g->dev != 0 { n->param->dgrad } else { n->param->grad };
+    return n->grad;
+  }
+  var size: int64 = n->value.shape.size();
+  var p: float32* = g->zeros_raw(if (size < 1) 1 else size);
+  g->nodes[id].grad = p;
+  return p;
+}
+
+export fn Graph_forward_on_device__ptr(g: Graph*, id: int32) -> bool {
+  if (g->dev == 0) { return false; }
+  var f: fn(rawptr, Graph*, int32) -> void = g->dev->forward;
+  f(g->dev->state, g, id);
+  return true;
+}
+
+export fn Graph_backward_on_device__ptr(g: Graph*, id: int32) -> bool {
+  if (g->dev == 0) { return false; }
+  var f: fn(rawptr, Graph*, int32) -> void = g->dev->backward;
+  f(g->dev->state, g, id);
+  return true;
+}
+
+export fn Graph_fetch__ptr(g: Graph*, data: float32*, s: Shape) -> Tensor {
+  var t: Tensor = tensor_new(s);
+  var n: int64 = s.size();
+  if (data == 0) {
+    zero_f32(t.data, n);
+  } else if (g->dev != 0) {
+    g->dev->get((rawptr)t.data, (rawptr)data, n * 4);
+  } else {
+    copy_f32(t.data, data, n);
+  }
+  return t;
+}
+
+export fn Var_value(v: Var) -> Tensor {
+  return v.g->nodes[v.id].value;
+}
+
+export fn Var_shape(v: Var) -> Shape {
+  return v.g->nodes[v.id].value.shape;
+}
+
+export fn Var_data(v: Var) -> float32* {
+  return v.g->nodes[v.id].value.data;
+}
+
+export fn Var_size(v: Var) -> int64 {
+  return v.g->nodes[v.id].value.shape.size();
+}
+
+export fn Var_item(v: Var) -> float32 {
+  var g: Graph* = v.g;
+  if (g->dev == 0) { return g->nodes[v.id].value.data[0]; }
+  var out: float32 = 0.0;
+  g->dev->get((rawptr)&out, (rawptr)g->nodes[v.id].value.data, 4);
+  return out;
+}
+
+export fn Var_fetch(v: Var) -> Tensor {
+  return v.g->fetch(v.g->nodes[v.id].value.data, v.g->nodes[v.id].value.shape);
+}
+
+export fn Var_fetch_grad(v: Var) -> Tensor {
+  return v.g->fetch(v.g->nodes[v.id].grad, v.g->nodes[v.id].value.shape);
+}
+
+export fn Var_requires_grad(v: Var) -> bool {
+  return v.g->nodes[v.id].requires;
+}
+
+export fn Var_grad(v: Var) -> Tensor {
+  var n: Node* = &v.g->nodes[v.id];
+  return { data: n->grad, shape: n->value.shape };
+}
+
+@test fn arena_grows_and_settles() -> int32 {
+  var g: Graph* = graph_new();
+  var first: float32* = g->floats(100);
+  var big: float32* = g->floats(500000);
+  var again: float32* = g->floats(300000);
+  big[499999] = 1.0;
+  again[0] = 2.0;
+  first[99] = 3.0;
+  if (g->host.retired_count < 1) { return 1; }
+  g->reset();
+  if (g->host.retired_count != 0) { return 2; }
+  if (g->host.size < 800000 * 4) { return 3; }
+  var p: float32* = g->floats(800000);
+  p[799999] = 1.0;
+  if (g->host.retired_count != 0) { return 4; }
+  if (((uint64)p & (uint64)63) != (uint64)0) { return 5; }
+  graph_free(g);
+  return 0;
+}
+
+@test fn params_hold_names_and_grads() -> int32 {
+  var ps: Params* = params_new();
+  var w: Param* = ps->add("layer.weight", shape(3, 4), PARAM_WEIGHT, true);
+  var r: Param* = ps->add("layer.running_mean", shape(4), PARAM_BUFFER, false);
+  if (ps->size() != 12) { return 1; }
+  if (ps->get("layer.weight") != w) { return 2; }
+  if (r->grad != 0 || !r->frozen) { return 3; }
+  w->grad[5] = 2.0;
+  ps->zero_grad();
+  if (w->grad[5] != 0.0) { return 4; }
+  if (ps->freeze("layer.") != 1 || !w->frozen) { return 5; }
+  params_free(ps);
+  return 0;
+}

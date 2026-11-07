@@ -1,0 +1,504 @@
+import "std/mem";
+import "std/math";
+import "./tensor";
+import "./kernels";
+import "./graph";
+
+const CHUNK = 8192;
+const MODE_FORWARD = 0;
+const MODE_BACKWARD = 1;
+
+struct MapJob {
+  mode: int32;
+  op: int32;
+  out: float32*;
+  x: float32*;
+  y: float32*;
+  dy: float32*;
+  f0: float32;
+  f1: float32;
+  n: int64;
+}
+
+fn unary_forward_range(op: int32, out: float32*, x: float32*, f0: float32, f1: float32, n: int64) {
+  var zero: float32 = 0.0;
+  var half: float32 = 0.5;
+  var one: float32 = 1.0;
+  switch (op) {
+    case OP_NEG: { for i: int64 in 0..n { out[i] = -x[i]; } }
+    case OP_EXP: { for i: int64 in 0..n { out[i] = exp_f32(x[i]); } }
+    case OP_LOG: { for i: int64 in 0..n { out[i] = log_f32(x[i]); } }
+    case OP_SQRT: { for i: int64 in 0..n { out[i] = sqrt_f32(x[i]); } }
+    case OP_TANH: { for i: int64 in 0..n { out[i] = tanh_f32(x[i]); } }
+    case OP_SIGMOID: { for i: int64 in 0..n { out[i] = sigmoid_f32(x[i]); } }
+    case OP_RELU: {
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        out[i] = if v > zero { v } else { zero };
+      }
+    }
+    case OP_LEAKY_RELU: {
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        out[i] = if v > zero { v } else { f0 * v };
+      }
+    }
+    case OP_GELU: {
+      var inv_root2: float32 = 0.70710678118654752;
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        out[i] = half * v * (one + erf_f32(v * inv_root2));
+      }
+    }
+    case OP_GELU_TANH: {
+      var k2: float32 = -1.5957691216057308;
+      var c: float32 = 0.044715;
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        out[i] = v / (one + exp_f32(k2 * (v + c * v * v * v)));
+      }
+    }
+    case OP_SILU: { for i: int64 in 0..n { out[i] = x[i] * sigmoid_f32(x[i]); } }
+    case OP_SOFTPLUS: {
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        var a: float32 = if v < zero { -v } else { v };
+        var m: float32 = if v > zero { v } else { zero };
+        out[i] = m + log_f32(one + exp_f32(-a));
+      }
+    }
+    case OP_ABS: {
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        out[i] = if v < zero { -v } else { v };
+      }
+    }
+    case OP_CLAMP: {
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        v = if v < f0 { f0 } else { v };
+        out[i] = if v > f1 { f1 } else { v };
+      }
+    }
+    case OP_SQUARE: { for i: int64 in 0..n { out[i] = x[i] * x[i]; } }
+    case OP_ADD_SCALAR: { for i: int64 in 0..n { out[i] = x[i] + f0; } }
+    case OP_MUL_SCALAR: { for i: int64 in 0..n { out[i] = x[i] * f0; } }
+    case OP_POW_SCALAR: {
+      for i: int64 in 0..n { out[i] = (float32)pow((float64)x[i], (float64)f0); }
+    }
+    default: { mmll_fail("op {op} is not elementwise"); }
+  }
+}
+
+fn unary_backward_range(op: int32, dx: float32*, dy: float32*, x: float32*, y: float32*, f0: float32, f1: float32, n: int64) {
+  var zero: float32 = 0.0;
+  var half: float32 = 0.5;
+  var one: float32 = 1.0;
+  var two: float32 = 2.0;
+  switch (op) {
+    case OP_NEG: { for i: int64 in 0..n { dx[i] = dx[i] - dy[i]; } }
+    case OP_EXP: { for i: int64 in 0..n { dx[i] = dx[i] + dy[i] * y[i]; } }
+    case OP_LOG: { for i: int64 in 0..n { dx[i] = dx[i] + dy[i] / x[i]; } }
+    case OP_SQRT: {
+      for i: int64 in 0..n {
+        var s: float32 = y[i];
+        dx[i] = dx[i] + (if s > zero { dy[i] * half / s } else { zero });
+      }
+    }
+    case OP_TANH: { for i: int64 in 0..n { dx[i] = dx[i] + dy[i] * (one - y[i] * y[i]); } }
+    case OP_SIGMOID: { for i: int64 in 0..n { dx[i] = dx[i] + dy[i] * y[i] * (one - y[i]); } }
+    case OP_RELU: {
+      for i: int64 in 0..n {
+        dx[i] = dx[i] + (if x[i] > zero { dy[i] } else { zero });
+      }
+    }
+    case OP_LEAKY_RELU: {
+      for i: int64 in 0..n {
+        dx[i] = dx[i] + (if x[i] > zero { dy[i] } else { f0 * dy[i] });
+      }
+    }
+    case OP_GELU: {
+      var inv_root2: float32 = 0.70710678118654752;
+      var inv_root_2pi: float32 = 0.39894228040143268;
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        var cdf: float32 = half * (one + erf_f32(v * inv_root2));
+        var pdf: float32 = inv_root_2pi * exp_f32(-half * v * v);
+        dx[i] = dx[i] + dy[i] * (cdf + v * pdf);
+      }
+    }
+    case OP_GELU_TANH: {
+      var k2: float32 = -1.5957691216057308;
+      var c: float32 = 0.044715;
+      var c3: float32 = 0.134145;
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        var s: float32 = one / (one + exp_f32(k2 * (v + c * v * v * v)));
+        var d: float32 = s - k2 * v * s * (one - s) * (one + c3 * v * v);
+        dx[i] = dx[i] + dy[i] * d;
+      }
+    }
+    case OP_SILU: {
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        var s: float32 = sigmoid_f32(v);
+        dx[i] = dx[i] + dy[i] * s * (one + v * (one - s));
+      }
+    }
+    case OP_SOFTPLUS: { for i: int64 in 0..n { dx[i] = dx[i] + dy[i] * sigmoid_f32(x[i]); } }
+    case OP_ABS: {
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        var s: float32 = if v > zero { one } else { if v < zero { -one } else { zero } };
+        dx[i] = dx[i] + dy[i] * s;
+      }
+    }
+    case OP_CLAMP: {
+      for i: int64 in 0..n {
+        var v: float32 = x[i];
+        var inside: bool = v >= f0 && v <= f1;
+        dx[i] = dx[i] + (if inside { dy[i] } else { zero });
+      }
+    }
+    case OP_SQUARE: { for i: int64 in 0..n { dx[i] = dx[i] + two * x[i] * dy[i]; } }
+    case OP_ADD_SCALAR: { add_into_f32(dx, dy, n); }
+    case OP_MUL_SCALAR: { axpy_f32(dx, f0, dy, n); }
+    case OP_POW_SCALAR: {
+      var p: float64 = (float64)f0;
+      for i: int64 in 0..n {
+        dx[i] = dx[i] + dy[i] * (float32)(p * pow((float64)x[i], p - 1.0));
+      }
+    }
+    default: { mmll_fail("op {op} has no elementwise gradient"); }
+  }
+}
+
+fn binary_same_range(op: int32, out: float32*, a: float32*, b: float32*, n: int64) {
+  switch (op) {
+    case OP_ADD: { for i: int64 in 0..n { out[i] = a[i] + b[i]; } }
+    case OP_SUB: { for i: int64 in 0..n { out[i] = a[i] - b[i]; } }
+    case OP_MUL: { for i: int64 in 0..n { out[i] = a[i] * b[i]; } }
+    case OP_DIV: { for i: int64 in 0..n { out[i] = a[i] / b[i]; } }
+    default: { mmll_fail("op {op} is not binary"); }
+  }
+}
+
+fn binary_same_backward_range(op: int32, which: int32, dst: float32*, dy: float32*, a: float32*, b: float32*, n: int64) {
+  switch (op) {
+    case OP_ADD: { add_into_f32(dst, dy, n); }
+    case OP_SUB: {
+      if (which == 0) { add_into_f32(dst, dy, n); } else { for i: int64 in 0..n { dst[i] = dst[i] - dy[i]; } }
+    }
+    case OP_MUL: {
+      if (which == 0) {
+        for i: int64 in 0..n { dst[i] = dst[i] + dy[i] * b[i]; }
+      } else {
+        for i: int64 in 0..n { dst[i] = dst[i] + dy[i] * a[i]; }
+      }
+    }
+    case OP_DIV: {
+      if (which == 0) {
+        for i: int64 in 0..n { dst[i] = dst[i] + dy[i] / b[i]; }
+      } else {
+        for i: int64 in 0..n {
+          var q: float32 = b[i];
+          dst[i] = dst[i] - dy[i] * a[i] / (q * q);
+        }
+      }
+    }
+    default: { mmll_fail("op {op} is not binary"); }
+  }
+}
+
+@noinline fn map_chunks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: MapJob* = (MapJob*)ctx;
+  for c: int64 in lo..hi {
+    var s: int64 = c * CHUNK;
+    var e: int64 = s + CHUNK;
+    if (e > j->n) { e = j->n; }
+    var len: int64 = e - s;
+    switch (j->mode) {
+      case 0: { unary_forward_range(j->op, j->out + s, j->x + s, j->f0, j->f1, len); }
+      case 1: {
+        var yp: float32* = if j->y == 0 { (float32*)0 } else { j->y + s };
+        unary_backward_range(j->op, j->out + s, j->dy + s, j->x + s, yp, j->f0, j->f1, len);
+      }
+      case 2: { binary_same_range(j->op, j->out + s, j->x + s, j->y + s, len); }
+      case 3: { binary_same_backward_range(j->op, 0, j->out + s, j->dy + s, j->x + s, j->y + s, len); }
+      case 4: { binary_same_backward_range(j->op, 1, j->out + s, j->dy + s, j->x + s, j->y + s, len); }
+      default: {}
+    }
+  }
+  return 0;
+}
+
+fn run_map(mode: int32, op: int32, out: float32*, x: float32*, y: float32*, dy: float32*, f0: float32, f1: float32, n: int64) {
+  if (n <= 0) { return; }
+  if (n <= CHUNK) {
+    switch (mode) {
+      case 0: { unary_forward_range(op, out, x, f0, f1, n); }
+      case 1: { unary_backward_range(op, out, dy, x, y, f0, f1, n); }
+      case 2: { binary_same_range(op, out, x, y, n); }
+      case 3: { binary_same_backward_range(op, 0, out, dy, x, y, n); }
+      case 4: { binary_same_backward_range(op, 1, out, dy, x, y, n); }
+      default: {}
+    }
+    return;
+  }
+  var j: MapJob* = new MapJob;
+  j->mode = mode;
+  j->op = op;
+  j->out = out;
+  j->x = x;
+  j->y = y;
+  j->dy = dy;
+  j->f0 = f0;
+  j->f1 = f1;
+  j->n = n;
+  var heavy: int64 = if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_NEG || op == OP_ADD_SCALAR || op == OP_MUL_SCALAR || op == OP_SQUARE || op == OP_RELU) 2 else 24;
+  run_parallel(&map_chunks, (rawptr)j, (n + CHUNK - 1) / CHUNK, CHUNK * heavy);
+  free((rawptr)j);
+}
+
+fn unary(x: Var, op: int32, f0: float32, f1: float32) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  var id: int32 = g->push(op, x.id, -1, -1, s);
+  g->nodes[id].f0 = f0;
+  g->nodes[id].f1 = f1;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  run_map(MODE_FORWARD, op, g->data(id), g->data(x.id), (float32*)0, (float32*)0, f0, f1, s.size());
+  return { g: g, id: id };
+}
+
+export fn backward_unary(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var op: int32 = n->op;
+  var size: int64 = n->value.shape.size();
+  var dy: float32* = n->grad;
+  var f0: float32 = n->f0;
+  var f1: float32 = n->f1;
+  var x: float32* = g->data(n->a);
+  var y: float32* = n->value.data;
+  var dx: float32* = g->grad_of(n->a);
+  run_map(MODE_BACKWARD, op, dx, x, y, dy, f0, f1, size);
+}
+
+export fn Var_neg(x: Var) -> Var { return unary(x, OP_NEG, 0.0, 0.0); }
+export fn Var_exp(x: Var) -> Var { return unary(x, OP_EXP, 0.0, 0.0); }
+export fn Var_log(x: Var) -> Var { return unary(x, OP_LOG, 0.0, 0.0); }
+export fn Var_sqrt(x: Var) -> Var { return unary(x, OP_SQRT, 0.0, 0.0); }
+export fn Var_tanh(x: Var) -> Var { return unary(x, OP_TANH, 0.0, 0.0); }
+export fn Var_sigmoid(x: Var) -> Var { return unary(x, OP_SIGMOID, 0.0, 0.0); }
+export fn Var_relu(x: Var) -> Var { return unary(x, OP_RELU, 0.0, 0.0); }
+export fn Var_leaky_relu(x: Var, slope: float64) -> Var { return unary(x, OP_LEAKY_RELU, (float32)slope, 0.0); }
+export fn Var_gelu(x: Var) -> Var { return unary(x, OP_GELU, 0.0, 0.0); }
+export fn Var_gelu_tanh(x: Var) -> Var { return unary(x, OP_GELU_TANH, 0.0, 0.0); }
+export fn Var_silu(x: Var) -> Var { return unary(x, OP_SILU, 0.0, 0.0); }
+export fn Var_softplus(x: Var) -> Var { return unary(x, OP_SOFTPLUS, 0.0, 0.0); }
+export fn Var_abs(x: Var) -> Var { return unary(x, OP_ABS, 0.0, 0.0); }
+export fn Var_clamp(x: Var, lo: float64, hi: float64) -> Var { return unary(x, OP_CLAMP, (float32)lo, (float32)hi); }
+export fn Var_square(x: Var) -> Var { return unary(x, OP_SQUARE, 0.0, 0.0); }
+export fn Var_shift(x: Var, amount: float64) -> Var { return unary(x, OP_ADD_SCALAR, (float32)amount, 0.0); }
+export fn Var_scale(x: Var, factor: float64) -> Var { return unary(x, OP_MUL_SCALAR, (float32)factor, 0.0); }
+
+export fn Var_pow(x: Var, power: float64) -> Var {
+  if (power == 2.0) { return unary(x, OP_SQUARE, 0.0, 0.0); }
+  if (power == 1.0) { return unary(x, OP_MUL_SCALAR, 1.0, 0.0); }
+  return unary(x, OP_POW_SCALAR, (float32)power, 0.0);
+}
+
+export fn broadcast_shape(a: Shape, b: Shape) -> Shape {
+  var r: int32 = if (a.rank > b.rank) a.rank else b.rank;
+  var out: Shape;
+  out.rank = r;
+  for i in 0..r {
+    var ai: int32 = a.rank - r + i;
+    var bi: int32 = b.rank - r + i;
+    var da: int64 = if (ai >= 0) a.dims[ai] else 1;
+    var db: int64 = if (bi >= 0) b.dims[bi] else 1;
+    if (da != db && da != 1 && db != 1) {
+      mmll_fail("cannot broadcast {a.text()} with {b.text()}");
+    }
+    out.dims[i] = if (da == 1) db else da;
+  }
+  return out;
+}
+
+export fn broadcast_strides(s: Shape, out: Shape) -> int64[6] {
+  var strides: int64[6];
+  var running: int64 = 1;
+  var i: int32 = out.rank - 1;
+  while (i >= 0) {
+    var si: int32 = s.rank - out.rank + i;
+    if (si >= 0) {
+      var d: int64 = s.dims[si];
+      strides[i] = if (d == 1) 0 else running;
+      running = running * d;
+    } else {
+      strides[i] = 0;
+    }
+    i = i - 1;
+  }
+  return strides;
+}
+
+fn binary_row(op: int32, out: float32*, a: float32*, sa: int64, b: float32*, sb: int64, n: int64) {
+  if (sa == 1 && sb == 1) {
+    binary_same_range(op, out, a, b, n);
+    return;
+  }
+  if (sa == 1) {
+    var bv: float32 = b[0];
+    switch (op) {
+      case OP_ADD: { for i: int64 in 0..n { out[i] = a[i] + bv; } }
+      case OP_SUB: { for i: int64 in 0..n { out[i] = a[i] - bv; } }
+      case OP_MUL: { for i: int64 in 0..n { out[i] = a[i] * bv; } }
+      case OP_DIV: { for i: int64 in 0..n { out[i] = a[i] / bv; } }
+      default: {}
+    }
+    return;
+  }
+  if (sb == 1) {
+    var av: float32 = a[0];
+    switch (op) {
+      case OP_ADD: { for i: int64 in 0..n { out[i] = av + b[i]; } }
+      case OP_SUB: { for i: int64 in 0..n { out[i] = av - b[i]; } }
+      case OP_MUL: { for i: int64 in 0..n { out[i] = av * b[i]; } }
+      case OP_DIV: { for i: int64 in 0..n { out[i] = av / b[i]; } }
+      default: {}
+    }
+    return;
+  }
+  var v: float32 = 0.0;
+  switch (op) {
+    case OP_ADD: { v = a[0] + b[0]; }
+    case OP_SUB: { v = a[0] - b[0]; }
+    case OP_MUL: { v = a[0] * b[0]; }
+    case OP_DIV: { v = a[0] / b[0]; }
+    default: {}
+  }
+  fill_f32(out, v, n);
+}
+
+fn binary(a: Var, b: Var, op: int32) -> Var {
+  if (a.g != b.g) { mmll_fail("the two operands belong to different graphs"); }
+  var g: Graph* = a.g;
+  var sa: Shape = a.shape();
+  var sb: Shape = b.shape();
+  if (sa.equal(sb)) {
+    var id: int32 = g->push(op, a.id, b.id, -1, sa);
+    if (g->forward_on_device(id)) { return { g: g, id: id }; }
+    run_map(2, op, g->data(id), g->data(a.id), g->data(b.id), (float32*)0, 0.0, 0.0, sa.size());
+    return { g: g, id: id };
+  }
+  var so: Shape = broadcast_shape(sa, sb);
+  var id: int32 = g->push(op, a.id, b.id, -1, so);
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var stra: int64[6] = broadcast_strides(sa, so);
+  var strb: int64[6] = broadcast_strides(sb, so);
+  var out: float32* = g->data(id);
+  var pa: float32* = g->data(a.id);
+  var pb: float32* = g->data(b.id);
+  var inner: int64 = so.last();
+  var rows: int64 = so.rows();
+  var last: int32 = so.rank - 1;
+  var index: int64[6];
+  var offa: int64 = 0;
+  var offb: int64 = 0;
+  for r: int64 in 0..rows {
+    binary_row(op, out + r * inner, pa + offa, stra[last], pb + offb, strb[last], inner);
+    var d: int32 = last - 1;
+    while (d >= 0) {
+      index[d] = index[d] + 1;
+      offa = offa + stra[d];
+      offb = offb + strb[d];
+      if (index[d] < so.dims[d]) { break; }
+      offa = offa - stra[d] * so.dims[d];
+      offb = offb - strb[d] * so.dims[d];
+      index[d] = 0;
+      d = d - 1;
+    }
+  }
+  return { g: g, id: id };
+}
+
+export fn backward_binary(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var op: int32 = n->op;
+  var so: Shape = n->value.shape;
+  var dy: float32* = n->grad;
+  var ia: int32 = n->a;
+  var ib: int32 = n->b;
+  var sa: Shape = g->nodes[ia].value.shape;
+  var sb: Shape = g->nodes[ib].value.shape;
+  var pa: float32* = g->data(ia);
+  var pb: float32* = g->data(ib);
+  if (sa.equal(so) && sb.equal(so)) {
+    if (g->nodes[ia].requires) {
+      run_map(3, op, g->grad_of(ia), pa, pb, dy, 0.0, 0.0, so.size());
+    }
+    if (g->nodes[ib].requires) {
+      run_map(4, op, g->grad_of(ib), pa, pb, dy, 0.0, 0.0, so.size());
+    }
+    return;
+  }
+  var stra: int64[6] = broadcast_strides(sa, so);
+  var strb: int64[6] = broadcast_strides(sb, so);
+  var inner: int64 = so.last();
+  var rows: int64 = so.rows();
+  var last: int32 = so.rank - 1;
+  var tmp: float32* = g->floats(if (inner < 1) 1 else inner);
+  for which in 0..2 {
+    var target: int32 = if (which == 0) ia else ib;
+    if (!g->nodes[target].requires) { continue; }
+    var dst: float32* = g->grad_of(target);
+    var dst_last: int64 = if (which == 0) stra[last] else strb[last];
+    var index: int64[6];
+    var offa: int64 = 0;
+    var offb: int64 = 0;
+    for r: int64 in 0..rows {
+      var row: float32* = dy + r * inner;
+      var sx: int64 = stra[last];
+      var sy: int64 = strb[last];
+      var ax: float32* = pa + offa;
+      var bx: float32* = pb + offb;
+      for j: int64 in 0..inner {
+        var av: float32 = ax[j * sx];
+        var bv: float32 = bx[j * sy];
+        var d: float32 = row[j];
+        var c: float32 = d;
+        switch (op) {
+          case OP_SUB: { c = if (which == 0) d else -d; }
+          case OP_MUL: { c = if (which == 0) d * bv else d * av; }
+          case OP_DIV: { c = if (which == 0) d / bv else -d * av / (bv * bv); }
+          default: {}
+        }
+        tmp[j] = c;
+      }
+      var off: int64 = if (which == 0) offa else offb;
+      if (dst_last == 1) {
+        add_into_f32(dst + off, tmp, inner);
+      } else {
+        dst[off] = dst[off] + sum_f32(tmp, inner);
+      }
+      var dd: int32 = last - 1;
+      while (dd >= 0) {
+        index[dd] = index[dd] + 1;
+        offa = offa + stra[dd];
+        offb = offb + strb[dd];
+        if (index[dd] < so.dims[dd]) { break; }
+        offa = offa - stra[dd] * so.dims[dd];
+        offb = offb - strb[dd] * so.dims[dd];
+        index[dd] = 0;
+        dd = dd - 1;
+      }
+    }
+  }
+}
+
+export fn Var_add(a: Var, b: Var) -> Var { return binary(a, b, OP_ADD); }
+export fn Var_sub(a: Var, b: Var) -> Var { return binary(a, b, OP_SUB); }
+export fn Var_mul(a: Var, b: Var) -> Var { return binary(a, b, OP_MUL); }
+export fn Var_div(a: Var, b: Var) -> Var { return binary(a, b, OP_DIV); }

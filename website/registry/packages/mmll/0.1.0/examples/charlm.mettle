@@ -1,0 +1,115 @@
+import "std/io";
+import "std/mem";
+import "std/core";
+import "std/conv";
+import "std/time";
+import "../mmll";
+import "../gpu";
+
+fn arg_or(argc: int32, argv: cstring*, at: int32, fallback: int64) -> int64 {
+  if (argc <= at) { return fallback; }
+  return str_to_i64_or(str_from_cstr(argv[at]), fallback);
+}
+
+fn evaluate(m: Gpt, g: Graph*, tokens: int32*, count: int64, batch: int64, time: int64, rng: Rng*, x: int32*, y: int32*) -> float64 {
+  g->record = false;
+  g->training = false;
+  var total: float64 = 0.0;
+  for i in 0..8 {
+    g->reset();
+    sample_windows(tokens, count, batch, time, rng, x, y);
+    total = total + (float64)m.loss(g, x, y, batch, time).item();
+  }
+  g->record = true;
+  g->training = true;
+  return total / 8.0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 2) {
+    println("usage: charlm <corpus.txt> [steps] [width] [layers] [context] [batch] [cpu|gpu]");
+    return 1;
+  }
+  var on_gpu: bool = argc > 7 && str_from_cstr(argv[7]) == "gpu";
+  var path: string = str_from_cstr(argv[1]);
+  var steps: int64 = arg_or(argc, argv, 2, 2000);
+  var width: int64 = arg_or(argc, argv, 3, 192);
+  var layers: int64 = arg_or(argc, argv, 4, 4);
+  var context: int64 = arg_or(argc, argv, 5, 128);
+  var batch: int64 = arg_or(argc, argv, 6, 32);
+  var text: Bytes;
+  match (read_file(path)) {
+    case Ok(b): { text = b; }
+    case Err(e): {
+      println("charlm: {e}");
+      return 1;
+    }
+  }
+  var vocab: ByteVocab = byte_vocab(text);
+  var tokens: int32* = (int32*)malloc(text.length * 4);
+  var count: int64 = vocab.encode(text, tokens);
+  var split: int64 = count * 9 / 10;
+  println("{count} tokens, {vocab.size} symbols, {split} for training");
+  var cfg: GptConfig = { vocab: (int64)vocab.size, context: context, width: width, heads: width / 32, layers: layers, dropout: 0.1, tied: true };
+  var ps: Params* = params_new();
+  var rng: Rng = rng_new(2026);
+  var m: Gpt = make_gpt(ps, cfg, &rng);
+  println("{ps->size()} parameters: width {width}, {layers} layers, {cfg.heads} heads, context {context}, batch {batch}");
+  var g: Graph* = graph_new();
+  if (on_gpu) {
+    var dev: Device* = gpu_device();
+    ps->to_device(dev);
+    graph_free(g);
+    g = graph_on(dev);
+    println("training on the GPU");
+  }
+  var opt: Optimizer* = adamw(ps, 3.0e-3, 0.9, 0.95, 1.0e-8, 0.1);
+  opt->clip_at(1.0);
+  var x: int32* = (int32*)malloc(batch * context * 4);
+  var y: int32* = (int32*)malloc(batch * context * 4);
+  var started: int64 = time_mono_ns();
+  var window: int64 = time_mono_ns();
+  var running: float64 = 0.0;
+  for step: int64 in 0..steps {
+    opt->set_lr(lr_cosine(step, 100, steps, 3.0e-3, 3.0e-4));
+    g->reset();
+    sample_windows(tokens, split, batch, context, &rng, x, y);
+    var loss: Var = m.loss(g, x, y, batch, context);
+    loss.backward();
+    opt->step();
+    opt->zero_grad();
+    if ((step + 1) % 10 == 0) { running = running + (float64)loss.item(); }
+    if ((step + 1) % 100 == 0) {
+      var now: int64 = time_mono_ns();
+      var rate: float64 = (float64)(100 * batch * context) / ((float64)(now - window) / 1.0e9);
+      var held: float64 = evaluate(m, g, tokens + split, count - split, batch, context, &rng, x, y);
+      println("step {step + 1}: train {running / 10.0}, held out {held}, {rate} tokens/s");
+      running = 0.0;
+      window = time_mono_ns();
+    }
+  }
+  println("trained in {(float64)(time_mono_ns() - started) / 1.0e9} s");
+  var prompt: int32* = (int32*)malloc(16 * 4);
+  var seed: string = "The compiler ";
+  var plen: int64 = 0;
+  for i in 0..seed.length {
+    var id: int32 = vocab.id((uint8)seed.chars[i]);
+    if (id >= 0) {
+      prompt[plen] = id;
+      plen = plen + 1;
+    }
+  }
+  var out: int32* = (int32*)malloc(context * 4);
+  var made: int64 = m.generate(g, prompt, plen, out, context - plen, 0.8, 0, &rng);
+  var sample: uint8* = (uint8*)malloc(plen + made + 1);
+  for i: int64 in 0..plen { sample[i] = vocab.byte(prompt[i]); }
+  for i: int64 in 0..made { sample[plen + i] = vocab.byte(out[i]); }
+  println("---");
+  println(str_from_bytes((cstring)sample, plen + made));
+  println("---");
+  match (save_safetensors(ps, "charlm.safetensors")) {
+    case Ok(n): { println("saved charlm.safetensors, {n} bytes"); }
+    case Err(e): { println("charlm: {e}"); }
+  }
+  return 0;
+}
