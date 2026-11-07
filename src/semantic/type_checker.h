@@ -334,6 +334,7 @@ Type *type_checker_canon_type(TypeChecker *checker, Type *type);
 
 int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block,
                                        int module_scope);
+int type_checker_expand_next_directive(TypeChecker *checker, ASTNode *block);
 int type_checker_expand_directive_now(TypeChecker *checker, ASTNode *directive,
                                       ASTNode ***out, size_t *out_count);
 int type_checker_prepare_directives(TypeChecker *checker, ASTNode *program);

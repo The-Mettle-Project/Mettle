@@ -1,0 +1,34 @@
+import "std/io";
+
+struct Width {
+  name: string;
+  size: int32;
+}
+
+const WIDTHS: Width[2] = [
+  { name: "two", size: 2 },
+  { name: "five", size: 5 }
+];
+
+comptime for w in WIDTHS.rows {
+  fn ident("sum_", w.name)() -> int32 {
+    const COUNT: int32 = w.size * 2;
+    var total: int32 = 0;
+    comptime for i in 0..COUNT { total = total + i; }
+    return total;
+  }
+}
+
+fn squares() -> int32 {
+  const LIMIT: int32 = 4;
+  var total: int32 = 0;
+  comptime for i in 0..LIMIT { total = total + i * i; }
+  const MORE: int32 = LIMIT + 1;
+  comptime for i in LIMIT..MORE { total = total + 100 * i; }
+  return total;
+}
+
+fn main() -> int32 {
+  println("{sum_two()} {sum_five()} {squares()}");
+  return 0;
+}

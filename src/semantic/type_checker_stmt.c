@@ -1297,13 +1297,19 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
       }
 
       int block_ok =
-          type_checker_declare_expansion_binding(checker, statement) &&
-          type_checker_expand_comptime_block(checker, statement, 0);
+          type_checker_declare_expansion_binding(checker, statement);
       int reached_terminator = 0;
       size_t block_guard_depth = type_checker_guard_depth(checker);
       for (size_t i = 0; i < statement->child_count; i++) {
         ASTNode *child = statement->children[i];
-        if (child && child->type == AST_COMPTIME_FOR) {
+        while (child && child->type == AST_COMPTIME_FOR) {
+          if (!type_checker_expand_next_directive(checker, statement)) {
+            block_ok = 0;
+            break;
+          }
+          child = i < statement->child_count ? statement->children[i] : NULL;
+        }
+        if (!child || child->type == AST_COMPTIME_FOR) {
           continue;
         }
         if (reached_terminator && checker->error_reporter && child) {

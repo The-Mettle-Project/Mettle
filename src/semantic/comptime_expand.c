@@ -1430,6 +1430,10 @@ int type_checker_expand_directive_now(TypeChecker *checker, ASTNode *directive,
   return 1;
 }
 
+int type_checker_expand_next_directive(TypeChecker *checker, ASTNode *block) {
+  return expand_one_round(checker, block, 0, 1);
+}
+
 int type_checker_expand_comptime_block(TypeChecker *checker, ASTNode *block,
                                        int module_scope) {
   if (!module_scope) {

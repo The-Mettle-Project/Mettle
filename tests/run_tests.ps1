@@ -22034,6 +22034,7 @@ $issueRegressions = @(
   @{ Name = "issue_import_private_in_literals"; Entry = "tests/issues/import_private_literals/main.mettle"; Args = @(); Expect = @("16 16 16 8") },
   @{ Name = "issue_import_private_in_comptime_for"; Entry = "tests/issues/import_private_comptime_for/main.mettle"; Args = @(); Expect = @("5 3") },
   @{ Name = "issue_import_generated_declarations"; Entry = "tests/issues/import_generated_decls/main.mettle"; Args = @(); Expect = @("30 60") },
+  @{ Name = "issue_comptime_for_local_const"; Entry = "tests/issues/comptime_for_local_const.mettle"; Args = @(); Expect = @("6 45 414") },
   @{ Name = "issue_param_shadows_const"; Entry = "tests/issues/shadowing/const_param.mettle"; Args = @(); Expect = @("9 (want 9)") },
   @{ Name = "issue_local_shadows_const"; Entry = "tests/issues/shadowing/local_const.mettle"; Args = @(); Expect = @("9 (want 9)") },
   @{ Name = "issue_param_shadows_function"; Entry = "tests/issues/shadowing/fn_param.mettle"; Args = @(); Expect = @("true (want true)", "argument (right)") },
