@@ -203,7 +203,7 @@ typedef struct {
   int displacement;
 } BinaryMarshaledOperand;
 
-#define BINARY_MAX_MARSHALED_OPERANDS 8
+#define BINARY_MAX_MARSHALED_OPERANDS 16
 
 typedef struct {
   BinaryCodeBuffer code;
@@ -603,6 +603,7 @@ int code_generator_binary_emit_simd_sum_f64( CodeGenerator *generator, BinaryFun
 int code_generator_binary_emit_simd_sum_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_dot_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_dot_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
+int code_generator_binary_emit_simd_multidot_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_affine_map_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_affine_map_f32( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);
 int code_generator_binary_emit_simd_i2f_reduce_f64( CodeGenerator *generator, BinaryFunctionContext *context, const IRInstruction *instruction);

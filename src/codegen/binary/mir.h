@@ -202,7 +202,7 @@ typedef struct {
   int preserves_xmm;
 } MirInst;
 
-#define MIR_KERNEL_MAX_SLOTS 8
+#define MIR_KERNEL_MAX_SLOTS 16
 
 typedef struct {
   const IRInstruction *ir;

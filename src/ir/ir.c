@@ -2627,6 +2627,7 @@ static const char *const IR_OPCODE_NAMES[IR_OP_KIND_COUNT] = {
     [IR_OP_TENSOR_EPILOGUE] = "tensor_epilogue",
     [IR_OP_TENSOR_COMMIT] = "tensor_commit",
     [IR_OP_TENSOR_SCALE_ROWS] = "tensor_scale_rows",
+    [IR_OP_SIMD_MULTIDOT_F32] = "simd_multidot_f32",
     [IR_OP_ASSIGN] = "assign",
     [IR_OP_ADDRESS_OF] = "addr_of",
     [IR_OP_LOAD] = "load",

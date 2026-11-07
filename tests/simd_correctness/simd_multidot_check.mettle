@@ -1,0 +1,145 @@
+import "std/io";
+import "std/mem";
+
+fn block2(a: float32*, b0: float32*, b1: float32*, n: int64, out: float32*) {
+  var s0: float32 = 3.0;
+  var s1: float32 = -2.0;
+  @simd! for i: int64 in 0..n {
+    s0 = s0 + a[i] * b0[i];
+    s1 = s1 + a[i] * b1[i];
+  }
+  out[0] = s0;
+  out[1] = s1;
+}
+
+fn block2x2(a0: float32*, a1: float32*, b0: float32*, b1: float32*, n: int64, out: float32*) {
+  var s00: float32 = 0.0;
+  var s01: float32 = 0.0;
+  var s10: float32 = 0.0;
+  var s11: float32 = 0.0;
+  @simd! for i: int64 in 0..n {
+    var x0: float32 = a0[i];
+    var x1: float32 = a1[i];
+    var y0: float32 = b0[i];
+    var y1: float32 = b1[i];
+    s00 = s00 + x0 * y0;
+    s01 = s01 + x0 * y1;
+    s10 = s10 + x1 * y0;
+    s11 = s11 + x1 * y1;
+  }
+  out[0] = s00;
+  out[1] = s01;
+  out[2] = s10;
+  out[3] = s11;
+}
+
+fn block4x2(a0: float32*, a1: float32*, a2: float32*, a3: float32*, b0: float32*, b1: float32*, n: int64, out: float32*) {
+  var s00: float32 = 0.0;
+  var s01: float32 = 0.0;
+  var s10: float32 = 0.0;
+  var s11: float32 = 0.0;
+  var s20: float32 = 0.0;
+  var s21: float32 = 0.0;
+  var s30: float32 = 0.0;
+  var s31: float32 = 0.0;
+  @simd! for i: int64 in 0..n {
+    s00 = s00 + a0[i] * b0[i];
+    s01 = s01 + a0[i] * b1[i];
+    s10 = s10 + a1[i] * b0[i];
+    s11 = s11 + a1[i] * b1[i];
+    s20 = s20 + a2[i] * b0[i];
+    s21 = s21 + a2[i] * b1[i];
+    s30 = s30 + a3[i] * b0[i];
+    s31 = s31 + a3[i] * b1[i];
+  }
+  out[0] = s00;
+  out[1] = s01;
+  out[2] = s10;
+  out[3] = s11;
+  out[4] = s20;
+  out[5] = s21;
+  out[6] = s30;
+  out[7] = s31;
+}
+
+fn block1x4(a: float32*, b0: float32*, b1: float32*, b2: float32*, b3: float32*, n: int64, out: float32*) {
+  var s0: float32 = 0.0;
+  var s1: float32 = 0.0;
+  var s2: float32 = 0.0;
+  var s3: float32 = 0.0;
+  @simd! for i: int64 in 0..n {
+    var x: float32 = a[i];
+    s0 = s0 + x * b0[i];
+    s1 = s1 + x * b1[i];
+    s2 = s2 + x * b2[i];
+    s3 = s3 + x * b3[i];
+  }
+  out[0] = s0;
+  out[1] = s1;
+  out[2] = s2;
+  out[3] = s3;
+}
+
+fn chained(a: float32*, b: float32*, n: int64, out: float32*) {
+  var s0: float32 = 0.0;
+  var s1: float32 = 0.0;
+  for i: int64 in 0..n {
+    s0 = s0 + a[i] * b[i];
+    s1 = s1 + s0 * b[i];
+  }
+  out[0] = s0;
+  out[1] = s1;
+}
+
+fn exact(a: float32*, b: float32*, n: int64, init: float64) -> float64 {
+  var s: float64 = init;
+  for i: int64 in 0..n { s = s + (float64)a[i] * (float64)b[i]; }
+  return s;
+}
+
+fn chained_exact(a: float32*, b: float32*, n: int64, out: float64*) {
+  var s0: float64 = 0.0;
+  var s1: float64 = 0.0;
+  for i: int64 in 0..n {
+    s0 = s0 + (float64)a[i] * (float64)b[i];
+    s1 = s1 + s0 * (float64)b[i];
+  }
+  out[0] = s0;
+  out[1] = s1;
+}
+
+fn main() -> int32 {
+  var cap: int64 = 80;
+  var m: float32* = (float32*)malloc(8 * cap * 4);
+  for i: int64 in 0..8 * cap { m[i] = (float32)((i * 7 + 3) % 9) - 4.0; }
+  var r: float32*[8];
+  for j in 0..8 { r[j] = m + (int64)j * cap; }
+  var out: float32[8];
+  var failures: int32 = 0;
+  for n: int64 in 0..cap {
+    block2(r[0], r[1], r[2], n, &out[0]);
+    if ((float64)out[0] != exact(r[0], r[1], n, 3.0) || (float64)out[1] != exact(r[0], r[2], n, -2.0)) { failures = failures + 1; }
+    block2x2(r[0], r[1], r[2], r[3], n, &out[0]);
+    if ((float64)out[0] != exact(r[0], r[2], n, 0.0) || (float64)out[1] != exact(r[0], r[3], n, 0.0)) { failures = failures + 1; }
+    if ((float64)out[2] != exact(r[1], r[2], n, 0.0) || (float64)out[3] != exact(r[1], r[3], n, 0.0)) { failures = failures + 1; }
+    block4x2(r[0], r[1], r[2], r[3], r[4], r[5], n, &out[0]);
+    for row in 0..4 {
+      if ((float64)out[2 * row] != exact(r[row], r[4], n, 0.0) || (float64)out[2 * row + 1] != exact(r[row], r[5], n, 0.0)) { failures = failures + 1; }
+    }
+    block1x4(r[7], r[3], r[4], r[5], r[6], n, &out[0]);
+    for col in 0..4 {
+      if ((float64)out[col] != exact(r[7], r[3 + col], n, 0.0)) { failures = failures + 1; }
+    }
+    var want: float64[2];
+    chained(r[0], r[1], n, &out[0]);
+    chained_exact(r[0], r[1], n, &want[0]);
+    if ((float64)out[0] != want[0] || (float64)out[1] != want[1]) { failures = failures + 1; }
+  }
+  free((rawptr)m);
+  if (failures == 0) {
+    println("MULTIDOT SIMD: ALL OK");
+  } else {
+    println("MULTIDOT SIMD: {failures} FAILURES");
+  }
+  return failures;
+}

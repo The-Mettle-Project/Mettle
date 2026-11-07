@@ -584,6 +584,258 @@ static int ir_try_vectorize_dot_float_at(IRFunction *function,
   return 1;
 }
 
+#define IR_MULTIDOT_MAX 8
+
+typedef struct {
+  const char *acc;
+  const char *base_a;
+  const char *base_b;
+  size_t update_index;
+} IRMultidotTerm;
+
+static int ir_multidot_load_base(IRFunction *function, size_t before, size_t lo,
+                                 size_t hi, const IROperand *op, const char *iv,
+                                 const char **base) {
+  int bits = 0;
+  if (op->kind == IR_OPERAND_TEMP && op->name) {
+    return ir_decode_float_indexed_load(function, before, op->name, iv, base,
+                                        &bits) &&
+           bits == 32;
+  }
+  if (op->kind != IR_OPERAND_SYMBOL || !op->name) {
+    return 0;
+  }
+  const IRInstruction *def = NULL;
+  size_t def_index = 0;
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ir_instruction_writes_destination(ins) &&
+        ir_operand_is_symbol_named(&ins->dest, op->name)) {
+      if (def) {
+        return 0;
+      }
+      def = ins;
+      def_index = i;
+    }
+  }
+  if (!def || def_index >= before ||
+      ir_symbol_live_after_loop(function, hi + 1, op->name)) {
+    return 0;
+  }
+  if (def->op == IR_OP_LOAD && def->is_float && ir_operand_is_temp(&def->lhs) &&
+      def->rhs.kind == IR_OPERAND_INT && def->rhs.int_value == 4) {
+    return ir_decode_float_indexed_address(function, def_index, def->lhs.name,
+                                           iv, base, &bits) &&
+           bits == 32;
+  }
+  if (def->op == IR_OP_ASSIGN && ir_operand_is_temp(&def->lhs)) {
+    return ir_decode_float_indexed_load(function, def_index, def->lhs.name, iv,
+                                        base, &bits) &&
+           bits == 32;
+  }
+  return 0;
+}
+
+static int ir_multidot_names(const IRMultidotTerm *terms, int count,
+                             const char *name) {
+  for (int i = 0; i < count; i++) {
+    if (strcmp(terms[i].acc, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_multidot_is_base(const IRMultidotTerm *terms, int count,
+                               const char *name) {
+  for (int i = 0; i < count; i++) {
+    if (strcmp(terms[i].base_a, name) == 0 ||
+        strcmp(terms[i].base_b, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_multidot_reads_acc(const IRInstruction *ins,
+                                 const IRMultidotTerm *terms, int count) {
+  if (ins->lhs.kind == IR_OPERAND_SYMBOL && ins->lhs.name &&
+      ir_multidot_names(terms, count, ins->lhs.name)) {
+    return 1;
+  }
+  if (ins->rhs.kind == IR_OPERAND_SYMBOL && ins->rhs.name &&
+      ir_multidot_names(terms, count, ins->rhs.name)) {
+    return 1;
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    const IROperand *op = &ins->arguments[a];
+    if (op->kind == IR_OPERAND_SYMBOL && op->name &&
+        ir_multidot_names(terms, count, op->name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_multidot_body_is_claimed(IRFunction *function, size_t lo,
+                                       size_t hi, size_t increment,
+                                       const char *iv,
+                                       const IRMultidotTerm *terms, int k) {
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    int is_update = 0;
+    for (int t = 0; t < k; t++) {
+      if (terms[t].update_index == i) {
+        is_update = 1;
+      }
+    }
+    if (is_update || i == increment || ins->op == IR_OP_NOP ||
+        ins->op == IR_OP_DECLARE_LOCAL) {
+      continue;
+    }
+    if (ins->op != IR_OP_BINARY && ins->op != IR_OP_LOAD &&
+        ins->op != IR_OP_ASSIGN && ins->op != IR_OP_CAST) {
+      return 0;
+    }
+    if (ir_multidot_reads_acc(ins, terms, k)) {
+      return 0;
+    }
+    if (!ir_instruction_writes_destination(ins) ||
+        ins->dest.kind == IR_OPERAND_TEMP) {
+      continue;
+    }
+    if (ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name ||
+        strcmp(ins->dest.name, iv) == 0 ||
+        ir_multidot_names(terms, k, ins->dest.name) ||
+        ir_multidot_is_base(terms, k, ins->dest.name) ||
+        ir_symbol_live_after_loop(function, hi + 1, ins->dest.name)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ir_try_split_multidot_float_at(IRFunction *function,
+                                          size_t header_index, int *changed,
+                                          int *taken) {
+  const char *iv_symbol = NULL;
+  size_t branch_index = 0;
+  size_t jump_index = 0;
+  IROperand bound = {0};
+  int matched = 0;
+  IRMultidotTerm terms[IR_MULTIDOT_MAX];
+  int k = 0;
+
+  *taken = 0;
+  if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
+                                &branch_index, &jump_index, &bound, &matched)) {
+    return 0;
+  }
+  if (!matched) {
+    return 1;
+  }
+  size_t lo = branch_index + 1;
+  size_t hi = jump_index;
+  size_t increment = hi;
+  while (increment > lo) {
+    increment--;
+    if (function->instructions[increment].op != IR_OP_NOP) {
+      break;
+    }
+  }
+  for (size_t i = lo; i < hi; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (!(ins->op == IR_OP_BINARY && ins->is_float && ins->text &&
+          strcmp(ins->text, "+") == 0 && ins->dest.kind == IR_OPERAND_SYMBOL &&
+          ins->dest.name &&
+          ir_operand_is_symbol_named(&ins->lhs, ins->dest.name) &&
+          ir_operand_is_temp(&ins->rhs))) {
+      continue;
+    }
+    const IRInstruction *mul =
+        ir_find_temp_producer_before(function, i, ins->rhs.name);
+    if (!mul || mul < &function->instructions[lo] || mul->op != IR_OP_BINARY ||
+        !mul->is_float || !mul->text || strcmp(mul->text, "*") != 0) {
+      continue;
+    }
+    const char *base_a = NULL;
+    const char *base_b = NULL;
+    size_t mul_index = (size_t)(mul - function->instructions);
+    if (!ir_multidot_load_base(function, mul_index, lo, hi, &mul->lhs,
+                               iv_symbol, &base_a) ||
+        !ir_multidot_load_base(function, mul_index, lo, hi, &mul->rhs,
+                               iv_symbol, &base_b)) {
+      continue;
+    }
+    if (k == IR_MULTIDOT_MAX) {
+      ir_operand_destroy(&bound);
+      return 1;
+    }
+    terms[k].acc = ins->dest.name;
+    terms[k].base_a = base_a;
+    terms[k].base_b = base_b;
+    terms[k].update_index = i;
+    k++;
+  }
+  if (k < 2) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  for (int t = 0; t < k; t++) {
+    const char *acc_type = ir_function_local_declared_type(function, terms[t].acc);
+    if (!acc_type || strcmp(acc_type, "float32") != 0 ||
+        strcmp(terms[t].acc, iv_symbol) == 0 ||
+        ir_symbol_address_taken(function, terms[t].acc) ||
+        ir_multidot_names(terms, t, terms[t].acc) ||
+        ir_multidot_is_base(terms, k, terms[t].acc) ||
+        !ir_symbol_is_float_array_base(function, terms[t].base_a) ||
+        !ir_symbol_is_float_array_base(function, terms[t].base_b)) {
+      ir_operand_destroy(&bound);
+      return 1;
+    }
+  }
+  if (!ir_multidot_body_is_claimed(function, lo, hi, increment, iv_symbol,
+                                   terms, k) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+
+  IRInstruction fused[IR_MULTIDOT_MAX];
+  memset(fused, 0, sizeof(fused));
+  for (int t = 0; t < k; t++) {
+    fused[t].op = IR_OP_SIMD_DOT_F32;
+    fused[t].location = function->instructions[header_index].location;
+    fused[t].is_float = 1;
+    fused[t].float_bits = 32;
+    fused[t].dest = ir_operand_symbol(terms[t].acc);
+    fused[t].lhs = ir_operand_symbol(terms[t].base_a);
+    fused[t].rhs = ir_operand_symbol(terms[t].base_b);
+    fused[t].arguments = calloc(1, sizeof(IROperand));
+    if (!fused[t].arguments || !ir_operand_clone(&bound, &fused[t].arguments[0])) {
+      for (int u = 0; u <= t; u++) {
+        ir_instruction_destroy_storage(&fused[u]);
+      }
+      ir_operand_destroy(&bound);
+      return 0;
+    }
+    fused[t].argument_count = 1;
+  }
+  for (int t = 0; t < k; t++) {
+    ir_instruction_destroy_storage(&function->instructions[header_index + t]);
+    function->instructions[header_index + t] = fused[t];
+  }
+  for (size_t i = header_index + (size_t)k; i <= jump_index; i++) {
+    ir_instruction_make_nop(&function->instructions[i]);
+  }
+  ir_operand_destroy(&bound);
+  *taken = 1;
+  if (changed) {
+    *changed = 1;
+  }
+  return 1;
+}
+
 int ir_simd_dot_float_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
@@ -591,7 +843,11 @@ int ir_simd_dot_float_pass(IRFunction *function, int *changed) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     if (function->instructions[i].op == IR_OP_LABEL &&
         ir_label_is_while_header(function->instructions[i].text)) {
-      if (!ir_try_vectorize_dot_float_at(function, i, changed)) {
+      int taken = 0;
+      if (!ir_try_split_multidot_float_at(function, i, changed, &taken)) {
+        return 0;
+      }
+      if (!taken && !ir_try_vectorize_dot_float_at(function, i, changed)) {
         return 0;
       }
     }

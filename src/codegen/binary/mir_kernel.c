@@ -39,6 +39,8 @@ static const MirIrKernel kMirIrKernels[] = {
      code_generator_binary_emit_simd_dot_f64, 0},
     {IR_OP_SIMD_DOT_F32, "simd_dot_f32",
      code_generator_binary_emit_simd_dot_f32, 0},
+    {IR_OP_SIMD_MULTIDOT_F32, "simd_multidot_f32",
+     code_generator_binary_emit_simd_multidot_f32, GPCLOB(BINARY_GP_R12)},
 
     {IR_OP_SIMD_COPY, "simd_copy", code_generator_binary_emit_simd_copy,
      0},

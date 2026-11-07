@@ -2260,6 +2260,226 @@ int code_generator_binary_emit_simd_dot_f32(
                                                       BINARY_GP_RAX);
 }
 
+#define MULTIDOT_SAVE_BYTES 176
+#define MULTIDOT_COUNT_DISP 160
+
+static const BinaryGpRegister kMultidotBases[6] = {
+    BINARY_GP_RCX, BINARY_GP_RDX, BINARY_GP_R8,
+    BINARY_GP_R9,  BINARY_GP_R10, BINARY_GP_R11};
+
+static int multidot_rsp_adjust(BinaryCodeBuffer *b, int sub) {
+  return binary_code_buffer_append_u8(b, 0x48) &&
+         binary_code_buffer_append_u8(b, 0x81) &&
+         binary_code_buffer_append_u8(b, sub ? 0xEC : 0xC4) &&
+         binary_code_buffer_append_u32(b, MULTIDOT_SAVE_BYTES);
+}
+
+static int multidot_and_r12_imm8(BinaryCodeBuffer *b, signed char mask) {
+  return binary_code_buffer_append_u8(b, 0x49) &&
+         binary_code_buffer_append_u8(b, 0x83) &&
+         binary_code_buffer_append_u8(b, 0xE4) &&
+         binary_code_buffer_append_u8(b, (unsigned char)mask);
+}
+
+static int multidot_slot(const BinaryFunctionContext *context,
+                         const IROperand *operand, BinaryGpRegister *base,
+                         int *disp) {
+  for (size_t i = 0; i < context->marshaled_operand_count; i++) {
+    if (context->marshaled_operands[i].operand == operand) {
+      *base = (BinaryGpRegister)context->marshaled_operands[i].base_register;
+      *disp = context->marshaled_operands[i].displacement;
+      if (*base == BINARY_GP_RSP) {
+        *disp += MULTIDOT_SAVE_BYTES;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int multidot_step(BinaryCodeBuffer *b, int k_count, int d_count,
+                         const int *pa, const int *pb, int acc_base,
+                         int disp) {
+  for (int d = 0; d < d_count; d++) {
+    if (!wcs_vex_movups_ymm_sib(b, 8 + d, kMultidotBases[d], BINARY_GP_RAX,
+                                disp)) {
+      return 0;
+    }
+  }
+  for (int k = 0; k < k_count; k++) {
+    if (!wcs_avx_vfmadd231ps_ymm(b, acc_base + k, 8 + pa[k], 8 + pb[k])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+int code_generator_binary_emit_simd_multidot_f32(
+    CodeGenerator *generator, BinaryFunctionContext *context,
+    const IRInstruction *instruction) {
+  BinaryCodeBuffer *b = NULL;
+  int pa[8];
+  int pb[8];
+  if (!generator || !context || !instruction || !instruction->arguments ||
+      instruction->argument_count < 3) {
+    code_generator_set_error(generator, "Malformed simd_multidot_f32");
+    return 0;
+  }
+  const IROperand *args = instruction->arguments;
+  int k_count = (int)args[0].int_value;
+  int d_count = (int)args[1].int_value;
+  if (k_count < 2 || k_count > 8 || d_count < 1 || d_count > 6 ||
+      instruction->argument_count !=
+          (size_t)(3 + k_count + d_count + 2 * k_count)) {
+    code_generator_set_error(generator, "Malformed simd_multidot_f32");
+    return 0;
+  }
+  for (int k = 0; k < k_count; k++) {
+    pa[k] = (int)args[3 + k_count + d_count + 2 * k].int_value;
+    pb[k] = (int)args[4 + k_count + d_count + 2 * k].int_value;
+    if (pa[k] < 0 || pa[k] >= d_count || pb[k] < 0 || pb[k] >= d_count) {
+      code_generator_set_error(generator, "Malformed simd_multidot_f32");
+      return 0;
+    }
+  }
+  int unroll = k_count <= 4 ? 2 : 1;
+  int stride = 8 * unroll;
+  b = &context->code;
+
+  if (!code_generator_binary_emit_operand_load(generator, context, &args[2],
+                                               BINARY_GP_RAX) ||
+      !binary_emit_mov_reg_reg(b, BINARY_GP_R12, BINARY_GP_RAX) ||
+      !binary_emit_shift_reg_imm8(b, 7, BINARY_GP_R12, 63) ||
+      !binary_code_buffer_append_u8(b, 0x49) ||
+      !binary_code_buffer_append_u8(b, 0xF7) ||
+      !binary_code_buffer_append_u8(b, 0xD4) ||
+      !binary_emit_alu_reg_reg(b, 0x21, BINARY_GP_R12, BINARY_GP_RAX)) {
+    return 0;
+  }
+  for (int d = 0; d < d_count; d++) {
+    if (!code_generator_binary_emit_operand_load(
+            generator, context, &args[3 + k_count + d], kMultidotBases[d])) {
+      return 0;
+    }
+  }
+  if (!multidot_rsp_adjust(b, 1)) {
+    return 0;
+  }
+  for (int r = 0; r < 10; r++) {
+    if (!wcs_vex_movups_mem_xmm(b, BINARY_GP_RSP, 16 * r, 6 + r)) {
+      return 0;
+    }
+  }
+  if (!binary_emit_mov_mem_reg(b, BINARY_GP_RSP, MULTIDOT_COUNT_DISP,
+                               BINARY_GP_R12)) {
+    return 0;
+  }
+  for (int a = 0; a < k_count * unroll; a++) {
+    if (!wcs_avx_vpxor_ymm(b, a, a, a)) {
+      return 0;
+    }
+  }
+  if (!binary_emit_alu_reg_reg(b, 0x31, BINARY_GP_RAX, BINARY_GP_RAX) ||
+      !multidot_and_r12_imm8(b, (signed char)-stride)) {
+    return 0;
+  }
+
+  size_t loop_top = b->size;
+  size_t j_vec_done = 0;
+  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RAX, BINARY_GP_R12) ||
+      !wcs_jcc(b, 0x83, &j_vec_done)) {
+    return 0;
+  }
+  for (int u = 0; u < unroll; u++) {
+    if (!multidot_step(b, k_count, d_count, pa, pb, u * k_count, 32 * u)) {
+      return 0;
+    }
+  }
+  {
+    size_t j_back = 0;
+    if (!wcs_addsub_reg_imm8(b, BINARY_GP_RAX, 0, (unsigned char)stride) ||
+        !wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top) ||
+        !wcs_patch_here(b, j_vec_done)) {
+      return 0;
+    }
+  }
+  if (unroll == 2) {
+    size_t j_eight_done = 0;
+    for (int k = 0; k < k_count; k++) {
+      if (!wcs_avx_vaddps_ymm(b, k, k, k_count + k)) {
+        return 0;
+      }
+    }
+    if (!binary_emit_mov_reg_mem(b, BINARY_GP_R12, BINARY_GP_RSP,
+                                 MULTIDOT_COUNT_DISP) ||
+        !multidot_and_r12_imm8(b, (signed char)-8) ||
+        !binary_emit_cmp_reg_reg(b, BINARY_GP_RAX, BINARY_GP_R12) ||
+        !wcs_jcc(b, 0x83, &j_eight_done) ||
+        !multidot_step(b, k_count, d_count, pa, pb, 0, 0) ||
+        !wcs_addsub_reg_imm8(b, BINARY_GP_RAX, 0, 8) ||
+        !wcs_patch_here(b, j_eight_done)) {
+      return 0;
+    }
+  }
+  for (int k = 0; k < k_count; k++) {
+    if (!wcs_avx_vextractf128(b, 15, k, 1) ||
+        !wcs_vex_addps_xmm(b, k, k, 15) || !wcs_vex_haddps_xmm(b, k, k, k) ||
+        !wcs_vex_haddps_xmm(b, k, k, k)) {
+      return 0;
+    }
+  }
+  if (!binary_emit_mov_reg_mem(b, BINARY_GP_R12, BINARY_GP_RSP,
+                               MULTIDOT_COUNT_DISP)) {
+    return 0;
+  }
+  size_t tail_top = b->size;
+  size_t j_tail_done = 0;
+  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RAX, BINARY_GP_R12) ||
+      !wcs_jcc(b, 0x83, &j_tail_done)) {
+    return 0;
+  }
+  for (int d = 0; d < d_count; d++) {
+    if (!wcs_vex_movss_xmm_sib(b, 8 + d, kMultidotBases[d], BINARY_GP_RAX, 0)) {
+      return 0;
+    }
+  }
+  for (int k = 0; k < k_count; k++) {
+    if (!wcs_fmadd231ss(b, k, 8 + pa[k], 8 + pb[k])) {
+      return 0;
+    }
+  }
+  {
+    size_t j_back = 0;
+    if (!wcs_addsub_reg_imm8(b, BINARY_GP_RAX, 0, 1) ||
+        !wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, tail_top) ||
+        !wcs_patch_here(b, j_tail_done)) {
+      return 0;
+    }
+  }
+  for (int k = 0; k < k_count; k++) {
+    BinaryGpRegister base = BINARY_GP_RSP;
+    int disp = 0;
+    if (!multidot_slot(context, &args[3 + k], &base, &disp)) {
+      code_generator_set_error(generator,
+                               "simd_multidot_f32 accumulator is not staged");
+      return 0;
+    }
+    if (!binary_emit_mov_reg_mem(b, BINARY_GP_RCX, base, disp) ||
+        !wcs_vex_movd_xmm_reg(b, 14, BINARY_GP_RCX) ||
+        !wcs_vex_addss_rrr(b, k, k, 14) ||
+        !wcs_vex_movd_reg_xmm(b, BINARY_GP_RCX, k) ||
+        !binary_emit_mov_mem_reg(b, base, disp, BINARY_GP_RCX)) {
+      return 0;
+    }
+  }
+  for (int r = 0; r < 10; r++) {
+    if (!wcs_vex_movups_xmm_mem(b, 6 + r, BINARY_GP_RSP, 16 * r)) {
+      return 0;
+    }
+  }
+  return multidot_rsp_adjust(b, 0) && wcs_avx_vzeroupper(b);
+}
+
 static uint32_t exp_f32_bits(float f) {
   uint32_t u;
   memcpy(&u, &f, 4);

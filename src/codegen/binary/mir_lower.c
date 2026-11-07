@@ -13172,6 +13172,137 @@ static int mir_lower_at(MirFunction *fn, CodeGenerator *generator,
                            vr_oracle);
 }
 
+static int mir_dot_operand_ok(CodeGenerator *g, const IROperand *op) {
+  if (!op || !op->name ||
+      (op->kind != IR_OPERAND_SYMBOL && op->kind != IR_OPERAND_TEMP)) {
+    return 0;
+  }
+  return op->kind == IR_OPERAND_TEMP || !mir_name_is_global_variable(g, op->name);
+}
+
+static int mir_dot_same_count(const IROperand *a, const IROperand *b) {
+  if (a->kind != b->kind) {
+    return 0;
+  }
+  if (a->kind == IR_OPERAND_INT) {
+    return a->int_value == b->int_value;
+  }
+  return a->name && b->name && strcmp(a->name, b->name) == 0;
+}
+
+static int mir_dot_member(CodeGenerator *g, const IRInstruction *in) {
+  return in->op == IR_OP_SIMD_DOT_F32 && in->float_bits == 32 &&
+         in->arguments && in->argument_count >= 1 &&
+         in->dest.kind == IR_OPERAND_SYMBOL &&
+         mir_dot_operand_ok(g, &in->dest) && mir_dot_operand_ok(g, &in->lhs) &&
+         mir_dot_operand_ok(g, &in->rhs) &&
+         (in->arguments[0].kind == IR_OPERAND_INT ||
+          mir_dot_operand_ok(g, &in->arguments[0]));
+}
+
+static int mir_dot_name_at(const IROperand *const *ops, int n,
+                           const char *name) {
+  for (int i = 0; i < n; i++) {
+    if (strcmp(ops[i]->name, name) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static IROperand mir_dot_int(long long v) {
+  IROperand o;
+  memset(&o, 0, sizeof(o));
+  o.kind = IR_OPERAND_INT;
+  o.int_value = v;
+  return o;
+}
+
+static IRInstruction *mir_build_multidot(MirFunction *fn, CodeGenerator *g,
+                                         const IRFunction *ir, size_t start,
+                                         size_t *last_out) {
+  const IRInstruction *first = &ir->instructions[start];
+  const IROperand *dests[8];
+  const IROperand *arrays[6];
+  int pa[8];
+  int pb[8];
+  int k = 0;
+  int d = 0;
+  size_t last = start;
+  if (!mir_dot_member(g, first)) {
+    return NULL;
+  }
+  const IROperand *count = &first->arguments[0];
+  for (size_t i = start; i < ir->instruction_count && k < 8; i++) {
+    const IRInstruction *in = &ir->instructions[i];
+    if (in->op == IR_OP_NOP) {
+      continue;
+    }
+    if (!mir_dot_member(g, in) || !mir_dot_same_count(&in->arguments[0], count)) {
+      break;
+    }
+    const char *dn = in->dest.name;
+    if (mir_dot_name_at(dests, k, dn) >= 0 ||
+        mir_dot_name_at(arrays, d, dn) >= 0 ||
+        strcmp(dn, in->lhs.name) == 0 || strcmp(dn, in->rhs.name) == 0 ||
+        (count->kind != IR_OPERAND_INT && strcmp(dn, count->name) == 0) ||
+        mir_dot_name_at(dests, k, in->lhs.name) >= 0 ||
+        mir_dot_name_at(dests, k, in->rhs.name) >= 0) {
+      break;
+    }
+    int ia = mir_dot_name_at(arrays, d, in->lhs.name);
+    int ib = mir_dot_name_at(arrays, d, in->rhs.name);
+    int extra = (ia < 0) + (ib < 0 && strcmp(in->lhs.name, in->rhs.name) != 0);
+    if (d + extra > 6) {
+      break;
+    }
+    if (ia < 0) {
+      ia = d;
+      arrays[d++] = &in->lhs;
+    }
+    if (ib < 0) {
+      ib = mir_dot_name_at(arrays, d, in->rhs.name);
+      if (ib < 0) {
+        ib = d;
+        arrays[d++] = &in->rhs;
+      }
+    }
+    dests[k] = &in->dest;
+    pa[k] = ia;
+    pb[k] = ib;
+    k++;
+    last = i;
+  }
+  if (k < 2) {
+    return NULL;
+  }
+  size_t argc = (size_t)(3 + k + d + 2 * k);
+  IRInstruction *group = (IRInstruction *)calloc(1, sizeof(IRInstruction));
+  IROperand *args = (IROperand *)calloc(argc, sizeof(IROperand));
+  if (!mir_function_own_aux(fn, group) || !mir_function_own_aux(fn, args)) {
+    return NULL;
+  }
+  args[0] = mir_dot_int(k);
+  args[1] = mir_dot_int(d);
+  args[2] = *count;
+  for (int j = 0; j < k; j++) {
+    args[3 + j] = *dests[j];
+    args[3 + k + d + 2 * j] = mir_dot_int(pa[j]);
+    args[4 + k + d + 2 * j] = mir_dot_int(pb[j]);
+  }
+  for (int j = 0; j < d; j++) {
+    args[3 + k + j] = *arrays[j];
+  }
+  group->op = IR_OP_SIMD_MULTIDOT_F32;
+  group->location = first->location;
+  group->is_float = 1;
+  group->float_bits = 32;
+  group->arguments = args;
+  group->argument_count = argc;
+  *last_out = last;
+  return group;
+}
+
 static int mir_lower_instructions(MirFunction *fn, CodeGenerator *generator,
                                   BinaryFunctionContext *context,
                                   MirNameMap *map, IRFunction *ir_function,
@@ -13201,6 +13332,31 @@ static int mir_lower_instructions(MirFunction *fn, CodeGenerator *generator,
   mir_compute_const_compare_skips(generator, context, ir_function, &uses,
                                   fold_skip);
   mir_compute_select_compare_skips(ir_function, &uses, fold_skip);
+  IRInstruction **groups = (IRInstruction **)calloc(
+      ir_function->instruction_count, sizeof(IRInstruction *));
+  if (!groups) {
+    mir_temp_use_destroy(&uses);
+    free(fold_skip);
+    free(folds);
+    return 0;
+  }
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    size_t last = i;
+    if (fold_skip[i] || ir_function->instructions[i].op != IR_OP_SIMD_DOT_F32) {
+      continue;
+    }
+    groups[i] = mir_build_multidot(fn, generator, ir_function, i, &last);
+    if (fn->has_error) {
+      ok = 0;
+      break;
+    }
+    if (groups[i]) {
+      for (size_t j = i + 1; j <= last; j++) {
+        fold_skip[j] = 1;
+      }
+      i = last;
+    }
+  }
   fn->temp_uses = &uses;
   for (size_t i = 0; ok && i < ir_function->instruction_count; i++) {
     IROpcode op = ir_function->instructions[i].op;
@@ -13216,8 +13372,12 @@ static int mir_lower_instructions(MirFunction *fn, CodeGenerator *generator,
     if (mem_op && wb->at_count > 0) {
       ok = mir_emit_global_alias_flush(fn, generator, map, wb);
     }
-    ok = ok && mir_lower_at(fn, generator, context, map, ir_function, &i, folds,
-                            wb, vr_oracle);
+    if (groups[i]) {
+      ok = ok && mir_lower_ir_kernel(fn, generator, context, map, groups[i]);
+    } else {
+      ok = ok && mir_lower_at(fn, generator, context, map, ir_function, &i,
+                              folds, wb, vr_oracle);
+    }
     if (ok && store_op && wb->at_count > 0) {
       ok = mir_emit_global_reload_names(fn, generator, map, wb->at,
                                        wb->at_count);
@@ -13228,6 +13388,7 @@ static int mir_lower_instructions(MirFunction *fn, CodeGenerator *generator,
   }
   fn->temp_uses = NULL;
   mir_temp_use_destroy(&uses);
+  free(groups);
   free(fold_skip);
   free(folds);
   return ok;

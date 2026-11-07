@@ -7092,6 +7092,12 @@ $simdRuntimeCases = @(
     IrMustMatch     = @("simd_sum_f64", "simd_sum_f32", "simd_dot_f64", "simd_dot_f32", "simd_affine_map_f64", "simd_affine_map_f32", "simd_vloop_f64")
   },
   @{
+    Name            = "simd_correctness_multidot"
+    Path            = "tests/simd_correctness/simd_multidot_check.mettle"
+    OutputMustMatch = "MULTIDOT SIMD: ALL OK"
+    IrMustMatch     = @("simd_dot_f32")
+  },
+  @{
     Name            = "simd_correctness_byte"
     Path            = "tests/simd_correctness/simd_byte_check.mettle"
     OutputMustMatch = "BYTE SIMD: ALL OK"
