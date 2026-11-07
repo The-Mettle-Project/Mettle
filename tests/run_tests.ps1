@@ -14872,8 +14872,9 @@ foreach ($threads in @("1", "4", "0")) {
     if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
     $previous = $env:METTLE_PARALLEL_THREADS
     $env:METTLE_PARALLEL_THREADS = $threads
-    $out = & $exePath 2>&1 | Out-String
-    $code = $LASTEXITCODE
+    $run = Invoke-ProgramCapture -Path $exePath -TimeoutSeconds 60
+    $out = $run.Output
+    $code = $run.Exit
     $env:METTLE_PARALLEL_THREADS = $previous
     if ($code -ne 0 -or $out -notmatch "PASS") {
       throw "a stolen range ran twice or not at all at $threads threads (mask $code): $out"
