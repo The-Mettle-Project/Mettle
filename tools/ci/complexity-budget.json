@@ -93,7 +93,7 @@
     "src/ir/optimizer/ir_optimize_egraph.c::eg_saturate_round": 51,
     "src/ir/optimizer/ir_optimize_egraph.c::ir_egraph_simplify_pass": 84,
     "src/ir/optimizer/ir_optimize_explain.c::ir_explain_backend_flush": 61,
-    "src/ir/optimizer/ir_optimize_explain.c::ir_explain_flush": 61,
+    "src/ir/optimizer/ir_optimize_explain.c::ir_explain_flush": 56,
     "src/ir/optimizer/ir_optimize_if_convert.c::ir_ifconv_try_at": 68,
     "src/ir/optimizer/ir_optimize_induction_cleanup.c::ir_eliminate_congruent_ivs_pass": 68,
     "src/ir/optimizer/ir_optimize_inline.c::ir_inline_calls_in_function": 46,

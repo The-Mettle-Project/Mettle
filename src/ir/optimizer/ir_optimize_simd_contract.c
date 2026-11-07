@@ -649,6 +649,9 @@ const char *ir_simd_bail_id_name(int id) {
   case IR_SIMD_BAIL_STRIDED_ACCESS:      return "strided-access";
   case IR_SIMD_BAIL_UNBOUNDED_SHIFT:     return "unbounded-shift";
   case IR_SIMD_BAIL_VARIABLE_SHIFT:      return "variable-shift";
+  case IR_SIMD_BAIL_COUNTER_STORE:       return "counter-store";
+  case IR_SIMD_BAIL_SCATTER_STORE:       return "scatter-store";
+  case IR_SIMD_BAIL_CHOSEN_INDEX:        return "chosen-index";
   case IR_SIMD_BAIL_UNRECOGNIZED_SHAPE:  return "unrecognized-shape";
   }
   return "unknown";
@@ -1018,14 +1021,34 @@ static int ir_simd_bail_call_in_body(IrSimdBail *d) {
   if (d->callee) {
     for (size_t i = 0; i < d->function->instruction_count; i++) {
       const IRInstruction *in = &d->function->instructions[i];
-      if (!in->text || strcmp(in->text, d->callee) ||
-          ir_safety_intrinsic(in) == IR_SAFETY_INTRINSIC_NONE) continue;
+      IRSafetyIntrinsic kind = in->text && strcmp(in->text, d->callee) == 0
+                                   ? ir_safety_intrinsic(in)
+                                   : IR_SAFETY_INTRINSIC_NONE;
+      if (kind == IR_SAFETY_INTRINSIC_NONE) continue;
       snprintf(d->reason, d->reason_cap,
-               "each iteration retains a memory safety operation; its bounds "
-               "or pointer origin could not be proved independent of the iteration");
-      snprintf(d->fix, d->fix_cap,
-               "keep the checked scalar loop, or expose a fixed array extent "
-               "and an affine index so the compiler can prove the range");
+               "`--safe` keeps a check inside the loop, from line %zu: %s. A "
+               "vector body has no place for a check per element",
+               in->location.line,
+               kind == IR_SAFETY_INTRINSIC_CHECK
+                   ? "a bounds check against an extent the loop does not "
+                     "hold fixed"
+               : kind == IR_SAFETY_INTRINSIC_LIFETIME
+                   ? "it registers or releases memory every iteration"
+                   : "it asks the runtime which allocation a pointer came "
+                     "from, every iteration");
+      if (kind == IR_SAFETY_INTRINSIC_CHECK) {
+        snprintf(d->fix, d->fix_cap,
+                 "a build without `--safe` drops the check and gives this "
+                 "loop the vectorizer's own verdict. Under `--safe`, index "
+                 "an array whose length the loop bound already proves, such "
+                 "as `for i in 0..a.length`, and the check leaves the loop");
+      } else {
+        snprintf(d->fix, d->fix_cap,
+                 "nothing to change in the loop: this is `--safe` catching a "
+                 "use after free through a pointer the loop does not pin. A "
+                 "build without `--safe` drops it and gives this loop the "
+                 "vectorizer's own verdict");
+      }
       ir_simd_advisory(d);
       ir_simd_diag(d, IR_SIMD_BAIL_SAFETY_IN_BODY);
       return 1;
@@ -1033,6 +1056,22 @@ static int ir_simd_bail_call_in_body(IrSimdBail *d) {
     IRFunction *callee_fn =
         g_explain_program ? ir_program_find_function(g_explain_program, d->callee)
                           : NULL;
+    char shown[128];
+    ir_display_name(d->callee, shown, sizeof(shown));
+    if (g_explain_program && !callee_fn &&
+        strncmp(d->callee, "mettle_string_", 14) == 0) {
+      snprintf(d->reason, d->reason_cap,
+               "each iteration builds a string, and the runtime's `%s` does "
+               "that work out of line. Text has no lanes to vectorize",
+               d->callee);
+      snprintf(d->fix, d->fix_cap,
+               "nothing to change if the string is the point. Building it "
+               "once outside the loop, or writing the pieces straight to the "
+               "output, saves an allocation per iteration");
+      ir_simd_advisory(d);
+      ir_simd_diag(d, IR_SIMD_BAIL_EXTERN_CALL_IN_BODY);
+      return 1;
+    }
     if (g_explain_program && !callee_fn) {
       snprintf(d->reason, d->reason_cap,
                "each iteration calls `%s`, an external function with no body "
@@ -1051,11 +1090,11 @@ static int ir_simd_bail_call_in_body(IrSimdBail *d) {
     snprintf(d->reason, d->reason_cap,
              "each iteration calls `%s`; loops vectorize only after every "
              "call in the body has been inlined away",
-             d->callee);
+             shown);
     snprintf(d->fix, d->fix_cap,
              "make `%s` inline-eligible (small body, or mark it @inline), or "
              "hoist the call out of the loop",
-             d->callee);
+             shown);
     ir_simd_diag(d, IR_SIMD_BAIL_CALL_IN_BODY);
     return 1;
   }
@@ -1097,6 +1136,55 @@ static int ir_simd_bail_inline_asm(IrSimdBail *d) {
   return 0;
 }
 
+static size_t ir_simd_arm_of(const IrSimdBail *d, size_t def_at);
+
+static void ir_simd_source_name(const char *name, char *out, size_t cap) {
+  char *cut;
+  snprintf(out, cap, "%s", name ? name : "?");
+  cut = strstr(out, "__ssa");
+  if (cut) {
+    *cut = '\0';
+  }
+  cut = strstr(out, "$$");
+  if (cut) {
+    *cut = '\0';
+  }
+}
+
+static int ir_simd_bail_two_extrema(IrSimdBail *d) {
+  char names[2][64];
+  size_t arms[2] = {0, 0};
+  size_t found = 0;
+  for (size_t i = d->begin + 1; i < d->end && found < 2; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    char shown[64];
+    size_t arm = ins->op == IR_OP_STORE ? 0 : ir_simd_arm_of(d, i);
+    if (ins->dest.kind != IR_OPERAND_SYMBOL || !ins->dest.name || arm == 0) {
+      continue;
+    }
+    ir_simd_source_name(ins->dest.name, shown, sizeof(shown));
+    if (found == 1 && (strcmp(names[0], shown) == 0 || arms[0] == arm)) {
+      continue;
+    }
+    arms[found] = arm;
+    snprintf(names[found++], sizeof(names[0]), "%s", shown);
+  }
+  if (found < 2) {
+    return 0;
+  }
+  snprintf(d->reason, d->reason_cap,
+           "the loop keeps two running extremes, `%s` and `%s`, and the "
+           "extremum kernel carries one per loop",
+           names[0], names[1]);
+  snprintf(d->fix, d->fix_cap,
+           "split it into one loop for `%s` and one for `%s`, each comparing "
+           "the element directly (`if (a[i] < %s) { %s = a[i]; }`); each "
+           "becomes a vpminsd or vpmaxsd reduction",
+           names[0], names[1], names[0], names[0]);
+  ir_simd_diag(d, IR_SIMD_BAIL_EXTREMUM_SHAPE);
+  return 1;
+}
+
 static int ir_simd_bail_control_flow(IrSimdBail *d) {
   if (d->branch_count > 1 || d->jump_count > 1) {
     int outward_branches = 0;
@@ -1132,6 +1220,9 @@ static int ir_simd_bail_control_flow(IrSimdBail *d) {
       const char *written = NULL;
       IRBranchShape shape =
           ir_region_branch_shape(d->function, d->begin, d->end, &written);
+      if (shape == IR_BRANCH_SHAPE_EXTREMUM && ir_simd_bail_two_extrema(d)) {
+        return 1;
+      }
       if (shape == IR_BRANCH_SHAPE_EXTREMUM) {
         const char *acc_type =
             written ? ir_function_local_declared_type(d->function, written) : NULL;
@@ -1198,15 +1289,26 @@ static int ir_simd_bail_control_flow(IrSimdBail *d) {
         return 1;
       }
     }
-    snprintf(d->reason, d->reason_cap,
-             "the loop body branches on data, with an `if`, `&&` or `||` each "
-             "iteration. An `if` that only chooses a value becomes a lane "
-             "select and vectorizes, so this one does something a masked "
-             "lane cannot: a store, a call, or a nest deeper than the kernel "
-             "has registers for");
-    snprintf(d->fix, d->fix_cap,
-             "keep the arms to choosing a value, or split the work into two "
-             "simpler loops");
+    if (d->store_count > 0) {
+      snprintf(d->reason, d->reason_cap,
+               "the body branches on data and writes memory under the branch "
+               "(%d store%s). An `if` that only chooses a value becomes a "
+               "lane select, but a store some lanes skip needs a masked store, "
+               "and the compiler emits none",
+               d->store_count, d->store_count == 1 ? "" : "s");
+      snprintf(d->fix, d->fix_cap,
+               "compute the value with a select and store it every iteration "
+               "(`a[i] = c ? x : a[i]`), or move the guarded work into a "
+               "loop of its own");
+    } else {
+      snprintf(d->reason, d->reason_cap,
+               "the body branches on data, and its arms set more values than "
+               "one lane select carries: %d branches lead to %zu join points",
+               d->branch_count, d->branch_target_count);
+      snprintf(d->fix, d->fix_cap,
+               "reduce each arm to one value chosen by one comparison, or "
+               "split the work into two simpler loops");
+    }
     ir_simd_diag(d, IR_SIMD_BAIL_CONTROL_FLOW);
     return 1;
   }
@@ -1410,6 +1512,233 @@ static int ir_simd_bail_dot_shape_address(IrSimdBail *d) {
   return 0;
 }
 
+static const IRInstruction *ir_simd_def_in(const IrSimdBail *d,
+                                           const IROperand *op, size_t *at) {
+  const IRInstruction *found = NULL;
+  if (!op->name ||
+      (op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL)) {
+    return NULL;
+  }
+  for (size_t i = d->begin + 1; i < d->end; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    if (ins->op != IR_OP_STORE && ins->dest.kind == op->kind &&
+        ins->dest.name && strcmp(ins->dest.name, op->name) == 0) {
+      found = ins;
+      if (at) {
+        *at = i;
+      }
+    }
+  }
+  return found;
+}
+
+static int ir_simd_chain_loads(const IrSimdBail *d, const IROperand *op,
+                               int depth) {
+  const IRInstruction *def = ir_simd_def_in(d, op, NULL);
+  if (!def || depth > 8) {
+    return 0;
+  }
+  if (def->op == IR_OP_LOAD) {
+    return 1;
+  }
+  return ir_simd_chain_loads(d, &def->lhs, depth + 1) ||
+         ir_simd_chain_loads(d, &def->rhs, depth + 1);
+}
+
+static int ir_simd_same_address(const IrSimdBail *d, const IROperand *a,
+                                const IROperand *b) {
+  const IRInstruction *da;
+  const IRInstruction *db;
+  if (!a->name || !b->name) {
+    return 0;
+  }
+  if (a->kind == b->kind && strcmp(a->name, b->name) == 0) {
+    return 1;
+  }
+  da = ir_simd_def_in(d, a, NULL);
+  db = ir_simd_def_in(d, b, NULL);
+  return da && db && da->op == IR_OP_BINARY && db->op == IR_OP_BINARY &&
+         da->text && db->text && strcmp(da->text, db->text) == 0 &&
+         ir_operand_equals(&da->lhs, &db->lhs) &&
+         (ir_operand_equals(&da->rhs, &db->rhs) ||
+          ir_simd_same_address(d, &da->rhs, &db->rhs));
+}
+
+static int ir_simd_chain_loads_at(const IrSimdBail *d, const IROperand *op,
+                                  const IROperand *address, int depth) {
+  const IRInstruction *def = ir_simd_def_in(d, op, NULL);
+  if (!def || depth > 8) {
+    return 0;
+  }
+  if (def->op == IR_OP_LOAD) {
+    return ir_simd_same_address(d, &def->lhs, address);
+  }
+  return ir_simd_chain_loads_at(d, &def->lhs, address, depth + 1) ||
+         ir_simd_chain_loads_at(d, &def->rhs, address, depth + 1);
+}
+
+static const IROperand *ir_simd_index_operand(const IrSimdBail *d,
+                                              const IROperand *address) {
+  const IRInstruction *def = ir_simd_def_in(d, address, NULL);
+  const IROperand *index;
+  if (!def || def->op != IR_OP_BINARY || !def->text ||
+      strcmp(def->text, "+") != 0) {
+    return NULL;
+  }
+  index = &def->rhs;
+  for (int hop = 0; hop < 4; hop++) {
+    const IRInstruction *step = ir_simd_def_in(d, index, NULL);
+    if (!step || !((step->op == IR_OP_BINARY && step->text &&
+                    (strcmp(step->text, "<<") == 0 ||
+                     strcmp(step->text, "*") == 0) &&
+                    step->rhs.kind == IR_OPERAND_INT) ||
+                   step->op == IR_OP_CAST)) {
+      break;
+    }
+    index = &step->lhs;
+  }
+  return index;
+}
+
+static int ir_simd_bail_counter_store(IrSimdBail *d) {
+  int varying = 0;
+  if (d->store_count == 0 || d->load_count != 0) {
+    return 0;
+  }
+  for (size_t i = d->begin + 1; i < d->end; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    if (ins->op == IR_OP_STORE && ir_simd_def_in(d, &ins->lhs, NULL)) {
+      varying++;
+    }
+  }
+  if (varying == 0) {
+    return 0;
+  }
+  if (d->store_count == 1) {
+    snprintf(d->reason, d->reason_cap,
+             "each iteration stores a value computed from the loop counter, "
+             "a ramp such as `a[i] = i`. The fill kernel stores one fixed "
+             "value, and no kernel builds a ramp");
+  } else {
+    snprintf(d->reason, d->reason_cap,
+             "%d of the body's %d stores write a value computed from the loop "
+             "counter, a ramp such as `a[i] = i`. The fill kernel stores one "
+             "fixed value, and no kernel builds a ramp",
+             varying, d->store_count);
+  }
+  snprintf(d->fix, d->fix_cap,
+           "nothing to change in the loop: the compiler has no ramp kernel. "
+           "A loop that stores one fixed value, such as `a[i] = 0`, becomes "
+           "a fill");
+  ir_simd_advisory(d);
+  ir_simd_diag(d, IR_SIMD_BAIL_COUNTER_STORE);
+  return 1;
+}
+
+static int ir_simd_bail_scatter_store(IrSimdBail *d) {
+  for (size_t i = d->begin + 1; i < d->end; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    const IROperand *index;
+    if (ins->op != IR_OP_STORE) {
+      continue;
+    }
+    index = ir_simd_index_operand(d, &ins->dest);
+    if (!index || !ir_simd_chain_loads(d, index, 0)) {
+      continue;
+    }
+    if (ir_simd_chain_loads_at(d, &ins->lhs, &ins->dest, 0)) {
+      snprintf(d->reason, d->reason_cap,
+               "this is a histogram: the element each iteration updates is "
+               "chosen by a value the loop reads, so two lanes of one vector "
+               "can land on the same element and a vector store would keep "
+               "only one of their updates. Catching that collision takes "
+               "AVX-512's vpconflictd, and AVX2 has nothing like it");
+    } else {
+      snprintf(d->reason, d->reason_cap,
+               "the store's index is a value the loop reads from memory, a "
+               "scatter. AVX2 can gather but cannot scatter, so each lane "
+               "would be its own store anyway");
+    }
+    snprintf(d->fix, d->fix_cap,
+             "nothing to change: the scalar loop is the floor for a scatter "
+             "on this target");
+    ir_simd_advisory(d);
+    ir_simd_diag(d, IR_SIMD_BAIL_SCATTER_STORE);
+    return 1;
+  }
+  return 0;
+}
+
+static size_t ir_simd_arm_of(const IrSimdBail *d, size_t def_at) {
+  size_t arm = 0;
+  for (size_t i = d->begin + 1; i < def_at; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    if (ins->op != IR_OP_BRANCH_ZERO || !ins->text ||
+        strncmp(ins->text, "ir_for_end", 10) == 0 ||
+        strncmp(ins->text, "ir_while_end", 12) == 0) {
+      continue;
+    }
+    for (size_t j = def_at + 1; j < d->end; j++) {
+      const IRInstruction *lab = &d->function->instructions[j];
+      if (lab->op == IR_OP_LABEL && lab->text &&
+          strcmp(lab->text, ins->text) == 0) {
+        arm = i + 1;
+        break;
+      }
+    }
+  }
+  return arm;
+}
+
+static int ir_simd_def_in_arm(const IrSimdBail *d, size_t def_at) {
+  return ir_simd_arm_of(d, def_at) != 0;
+}
+
+static int ir_simd_bail_chosen_index(IrSimdBail *d) {
+  if (d->branch_count < 2) {
+    return 0;
+  }
+  for (size_t i = d->begin + 1; i < d->end; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    const IROperand *index;
+    size_t def_at = 0;
+    char shown[96];
+    char *cut;
+    if (ins->op != IR_OP_LOAD) {
+      continue;
+    }
+    index = ir_simd_index_operand(d, &ins->lhs);
+    if (!index || index->kind != IR_OPERAND_SYMBOL ||
+        !ir_simd_def_in(d, index, &def_at) || !ir_simd_def_in_arm(d, def_at)) {
+      continue;
+    }
+    snprintf(shown, sizeof(shown), "%s", index->name);
+    cut = strstr(shown, "__ssa");
+    if (cut) {
+      *cut = '\0';
+    }
+    cut = strstr(shown, "$$");
+    if (cut) {
+      *cut = '\0';
+    }
+    snprintf(d->reason, d->reason_cap,
+             "the condition reads an element at `%s`, and `%s` is set inside "
+             "the `if`, so each iteration's load waits on the choice the one "
+             "before it made. That chain is serial, whatever the lanes",
+             shown, shown);
+    snprintf(d->fix, d->fix_cap,
+             "carrying the best value beside its index (`if (a[i] > best) { "
+             "best = a[i]; %s = i; }`) takes the waiting load out of each "
+             "iteration. No kernel vectorizes an index of the maximum yet, so "
+             "the loop stays scalar either way",
+             shown);
+    ir_simd_advisory(d);
+    ir_simd_diag(d, IR_SIMD_BAIL_CHOSEN_INDEX);
+    return 1;
+  }
+  return 0;
+}
+
 static int ir_simd_bail_store_only_fill(IrSimdBail *d) {
   if (d->store_count > 0 && d->load_count == 0) {
     if (d->store_count > 1) {
@@ -1555,6 +1884,8 @@ static const IrSimdBailRule IR_SIMD_BAIL_RULES[] = {
     ir_simd_bail_indirect_call,
     ir_simd_bail_allocation,
     ir_simd_bail_inline_asm,
+    ir_simd_bail_scatter_store,
+    ir_simd_bail_chosen_index,
     ir_simd_bail_control_flow,
     ir_simd_bail_int16_elements,
     ir_simd_bail_int64_elements,
@@ -1565,6 +1896,7 @@ static const IrSimdBailRule IR_SIMD_BAIL_RULES[] = {
     ir_simd_bail_int32_sum_accumulator,
     ir_simd_bail_body_local,
     ir_simd_bail_dot_shape_address,
+    ir_simd_bail_counter_store,
     ir_simd_bail_store_only_fill,
     ir_simd_bail_strided_access,
     ir_simd_bail_shift_shape,
@@ -2433,6 +2765,9 @@ char headline[192], reason[320], fix[320];
         function, L->begin, L->end, callee, sizeof(callee), kernel_desc,
         sizeof(kernel_desc), &was_noinline, &decline_reason, &nest_after);
     if (sim == -1) {
+      char shown[128];
+      ir_display_name(callee, shown, sizeof(shown));
+      snprintf(callee, sizeof(callee), "%s", shown);
       if (decline_reason) {
         snprintf(reason, sizeof(reason),
                  "each iteration calls `%s`, and `@inline` cannot help: "

@@ -699,6 +699,9 @@ void ir_explain_remark_code(const char *code);
 void ir_explain_remark_extent(size_t end_line);
 void ir_explain_remark_trivial(void);
 void ir_explain_remark_advisory(void);
+void ir_explain_remark_declined(void);
+void ir_explain_loop_trips(const char *function_name, SourceLocation location,
+                           long long trips);
 void ir_explain_remark_partial(const char *what_still_blocks);
 void ir_explain_remark_quantity(const char *name, long value);
 
@@ -748,6 +751,9 @@ typedef enum {
   IR_SIMD_BAIL_UNBOUNDED_SHIFT,
   IR_SIMD_BAIL_VARIABLE_SHIFT,
   IR_SIMD_BAIL_RELOADED_BASE,
+  IR_SIMD_BAIL_COUNTER_STORE,
+  IR_SIMD_BAIL_SCATTER_STORE,
+  IR_SIMD_BAIL_CHOSEN_INDEX,
   IR_SIMD_BAIL_UNRECOGNIZED_SHAPE
 } IRSimdBailId;
 const char *ir_simd_bail_id_name(int id);

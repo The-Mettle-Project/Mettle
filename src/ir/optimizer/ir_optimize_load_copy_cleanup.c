@@ -278,6 +278,18 @@ static int ir_hoist_symbol_is_global(const IRFunction *function,
          ir_function_local_declared_type(function, sym) == NULL;
 }
 
+static int ir_hoist_symbol_is_frame_array(const IRFunction *function,
+                                          const char *sym, size_t header) {
+  for (size_t i = 0; sym && i < header; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_DECLARE_LOCAL && ins->dest.name && ins->text &&
+        strcmp(ins->dest.name, sym) == 0) {
+      return strchr(ins->text, '[') != NULL;
+    }
+  }
+  return 0;
+}
+
 static void ir_rename_read_slot(IROperand *slot, const char *temp,
                                 const char *name, IROperandKind kind) {
   int float_bits;
@@ -405,7 +417,8 @@ int ir_hoist_global_bases_pass(IRFunction *function, int *changed) {
           continue;
         }
       }
-      if (!ir_hoist_symbol_is_global(function, global)) {
+      if (!ir_hoist_symbol_is_global(function, global) &&
+          !ir_hoist_symbol_is_frame_array(function, global, header)) {
         continue;
       }
       ptr_type = ir_hoist_base_pointer_type(function, i, latch, temp);
@@ -1268,19 +1281,29 @@ static int ir_licm_op_is_pure_arith(const IRFunction *function,
   if (strcmp(ins->text, "/") != 0 && strcmp(ins->text, "%") != 0) {
     return 1;
   }
-  if (!ir_licm_divisor_never_zero(function, ins)) {
-    return 0;
+  return ir_licm_divisor_never_zero(function, ins);
+}
+
+static void ir_licm_note_typed_divisor(const IRFunction *function,
+                                       const IRInstruction *ins) {
+  const char *declared;
+  if (!ir_explain_enabled() || ins->op != IR_OP_BINARY || !ins->text ||
+      (strcmp(ins->text, "/") != 0 && strcmp(ins->text, "%") != 0) ||
+      ins->rhs.kind != IR_OPERAND_SYMBOL || !ins->rhs.name) {
+    return;
   }
-  if (ir_explain_enabled()) {
-    ir_explain_type_payoff(
-        ins->location.filename, ins->location.line,
-        function ? function->name : NULL,
-        ir_function_local_declared_type(function, ins->rhs.name),
-        "a loop-invariant divide was hoisted out of the loop",
-        "rules the divisor out of being zero, so the trap that keeps a divide "
-        "in place cannot happen; consumed by invariant-arithmetic LICM");
+  declared = ir_function_local_declared_type(function, ins->rhs.name);
+  if (!ir_type_is_nonzero(declared)) {
+    return;
   }
-  return 1;
+  ir_explain_type_payoff(
+      ins->location.filename, ins->location.line,
+      function ? function->name : NULL, declared,
+      strcmp(ins->text, "/") == 0
+          ? "a loop-invariant divide was hoisted out of the loop"
+          : "a loop-invariant remainder was hoisted out of the loop",
+      "rules the divisor out of being zero, so the trap that keeps a divide "
+      "in place cannot happen; consumed by invariant-arithmetic LICM");
 }
 
 static int ir_licm_operand_named(const IROperand *op, const char **name) {
@@ -1461,6 +1484,7 @@ int ir_hoist_invariant_arith_pass(IRFunction *function, int *changed) {
     }
     for (size_t k = 0; k < pick_count; k++) {
       IRInstruction hoisted;
+      ir_licm_note_typed_divisor(function, &function->instructions[picked[k]]);
       if (!ir_clone_instruction_plain(&function->instructions[picked[k]],
                                       &hoisted)) {
         return 0;

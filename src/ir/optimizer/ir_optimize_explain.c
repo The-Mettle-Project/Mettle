@@ -24,6 +24,11 @@
 #define explain_fileno fileno
 #endif
 
+static int ir_explain_str_eq(const char *a, const char *b);
+static char *ir_explain_strdup(const char *s);
+static long long ir_explain_known_trips(const char *function_name,
+                                        size_t line);
+
 static MTLC_THREAD_LOCAL int g_explain = 0;
 static MTLC_THREAD_LOCAL const char *g_explain_focus_file = NULL;
 static MTLC_THREAD_LOCAL const char *g_explain_output_path = NULL;
@@ -186,6 +191,7 @@ typedef struct {
 
 typedef struct {
   char *function_name;
+  char *inlined_into;
   char *entity;
   size_t line;
   size_t column;
@@ -200,6 +206,7 @@ typedef struct {
   size_t depth;
   int trivial;
   int advisory;
+  int declined;
   IRExplainQuantity quantities[IR_EXPLAIN_MAX_QUANTITIES];
   size_t quantity_count;
 } IRExplainRemark;
@@ -421,6 +428,7 @@ typedef struct {
   long long min;
   long long max;
   size_t length;
+  size_t places;
 } IRExplainTypedNote;
 
 static MTLC_THREAD_LOCAL IRExplainTypedNote *g_typed = NULL;
@@ -440,6 +448,13 @@ void ir_explain_safety_typed_note(const char *file, size_t line,
     return;
   }
   g_typed_total++;
+  for (size_t i = 0; i < g_typed_count; i++) {
+    if (g_typed[i].line == line && g_typed[i].length == length &&
+        ir_explain_str_eq(g_typed[i].type_name, type_name)) {
+      g_typed[i].places++;
+      return;
+    }
+  }
   if (g_typed_count >= IR_EXPLAIN_SAFETY_MAX_NOTES) {
     return;
   }
@@ -459,6 +474,7 @@ void ir_explain_safety_typed_note(const char *file, size_t line,
   note->min = min;
   note->max = max;
   note->length = length;
+  note->places = 1;
 }
 
 void ir_explain_safety_totals(size_t emitted, size_t proved, size_t hoisted,
@@ -574,6 +590,35 @@ void ir_explain_ownership_note(const IRExplainOwnershipRecord *record) {
   note->lowered = ir_explain_own_dup(record->lowered);
   note->inserted = record->inserted;
   note->key = record->key;
+}
+
+static void ir_explain_remark_free_one(IRExplainRemark *r) {
+  free(r->function_name);
+  free(r->inlined_into);
+  free(r->entity);
+  free(r->headline);
+  free(r->reason);
+  free(r->fix);
+  free(r->verified);
+  free(r->partial);
+  free(r->code);
+  for (size_t q = 0; q < r->quantity_count; q++) {
+    free(r->quantities[q].name);
+  }
+}
+
+static int ir_explain_remark_has_twin(size_t at) {
+  const IRExplainRemark *r = &g_remarks[at];
+  for (size_t j = 0; j < g_remark_count; j++) {
+    const IRExplainRemark *o = &g_remarks[j];
+    if (j != at && (!o->inlined_into || j < at) && o->line == r->line &&
+        ir_explain_str_eq(o->function_name, r->function_name) &&
+        ir_explain_str_eq(o->entity, r->entity) &&
+        ir_explain_str_eq(o->headline, r->headline)) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 void ir_explain_ownership_scan(const void *ir_program) {
@@ -1317,6 +1362,97 @@ void ir_explain_function_before(const IRFunction *function) {
   entry->instructions_after = entry->instructions_before;
 }
 
+static int ir_explain_in_focus_file(const IRFunction *fn) {
+  return fn && fn->name && fn->location.filename && fn->location.line > 0 &&
+         strcmp(ir_explain_path_basename(fn->location.filename),
+                ir_explain_path_basename(g_explain_focus_file)) == 0;
+}
+
+static size_t ir_explain_window_end(const IRProgram *program,
+                                    const IRFunction *fn) {
+  size_t next = (size_t)-1;
+  size_t hi = fn->location.line;
+  for (size_t f = 0; f < program->function_count; f++) {
+    const IRFunction *other = program->functions[f];
+    if (ir_explain_in_focus_file(other) && strncmp(other->name, "__", 2) &&
+        other->location.line > fn->location.line && other->location.line < next) {
+      next = other->location.line;
+    }
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    size_t line = fn->instructions[i].location.line;
+    if (line > hi && line < next) {
+      hi = line;
+    }
+  }
+  return hi;
+}
+
+static const char *ir_explain_line_owner(const IRProgram *program,
+                                         size_t line) {
+  const IRFunction *best = NULL;
+  const IRFunction *glue = NULL;
+  for (size_t f = 0; f < program->function_count; f++) {
+    const IRFunction *fn = program->functions[f];
+    if (!ir_explain_in_focus_file(fn) || fn->location.line > line) {
+      continue;
+    }
+    if (strncmp(fn->name, "__", 2) == 0) {
+      glue = fn->location.line == line ? fn : glue;
+      continue;
+    }
+    if ((!best || fn->location.line > best->location.line) &&
+        line <= ir_explain_window_end(program, fn)) {
+      best = fn;
+    }
+  }
+  return best ? best->name : glue ? glue->name : NULL;
+}
+
+static void ir_explain_drop_twins(void) {
+  size_t kept = 0;
+  char *twin = calloc(g_remark_count ? g_remark_count : 1, 1);
+  if (!twin) {
+    return;
+  }
+  for (size_t i = 0; i < g_remark_count; i++) {
+    twin[i] = g_remarks[i].inlined_into && ir_explain_remark_has_twin(i);
+  }
+  for (size_t i = 0; i < g_remark_count; i++) {
+    if (twin[i]) {
+      ir_explain_remark_free_one(&g_remarks[i]);
+      continue;
+    }
+    g_remarks[kept++] = g_remarks[i];
+  }
+  free(twin);
+  g_remark_count = kept;
+}
+
+void ir_explain_attribute_remarks(const void *ir_program) {
+  const IRProgram *program = (const IRProgram *)ir_program;
+  if (!program || !g_explain_focus_file) {
+    return;
+  }
+  for (size_t i = 0; i < g_remark_count; i++) {
+    IRExplainRemark *r = &g_remarks[i];
+    const char *owner;
+    const IRFunction *home = ir_program_find_function(
+        (IRProgram *)program, r->function_name);
+    if (strncmp(r->function_name, "__", 2) == 0 ||
+        !ir_explain_in_focus_file(home)) {
+      continue;
+    }
+    owner = ir_explain_line_owner(program, r->line);
+    if (!owner || strcmp(owner, r->function_name) == 0) {
+      continue;
+    }
+    r->inlined_into = r->function_name;
+    r->function_name = ir_explain_strdup(owner);
+  }
+  ir_explain_drop_twins();
+}
+
 void ir_explain_function_after(const IRFunction *function) {
   if (!g_explain || g_explain_hypothesis || !function || !function->name ||
       function->instruction_count == 0 ||
@@ -1389,6 +1525,7 @@ void ir_explain_remark(const char *function_name, const char *entity,
 
   IRExplainRemark *r = &g_remarks[g_remark_count++];
   r->function_name = ir_explain_strdup(function_name ? function_name : "?");
+  r->inlined_into = NULL;
   r->entity = ir_explain_text_dup(entity ? entity : "loop");
   r->line = location.line;
   r->column = location.column;
@@ -1403,6 +1540,7 @@ void ir_explain_remark(const char *function_name, const char *entity,
   r->depth = 0;
   r->trivial = 0;
   r->advisory = 0;
+  r->declined = 0;
   r->quantity_count = 0;
   g_last_remark_recorded = 1;
 }
@@ -1439,6 +1577,13 @@ void ir_explain_remark_advisory(void) {
   IRExplainRemark *r = ir_explain_last_remark();
   if (r) {
     r->advisory = 1;
+  }
+}
+
+void ir_explain_remark_declined(void) {
+  IRExplainRemark *r = ir_explain_last_remark();
+  if (r) {
+    r->declined = 1;
   }
 }
 
@@ -1555,6 +1700,28 @@ static int ir_explain_remark_compare(const void *a, const void *b) {
 #define IR_EXPLAIN_GROUP_MIN 4
 #define IR_EXPLAIN_GROUP_LIST_MAX 6
 
+static const char *ir_explain_shown(const char *name, char *buf, size_t cap) {
+  ir_display_name(name, buf, cap);
+  return buf;
+}
+
+static const char *ir_explain_shown_entity(const char *entity, char *buf,
+                                           size_t cap) {
+  char inner[160];
+  char shown[192];
+  size_t len = entity ? strlen(entity) : 0;
+  if (len < 11 || strncmp(entity, "call to `", 9) != 0 ||
+      entity[len - 1] != '`' || len - 10 >= sizeof(inner)) {
+    snprintf(buf, cap, "%s", entity ? entity : "loop");
+    return buf;
+  }
+  memcpy(inner, entity + 9, len - 10);
+  inner[len - 10] = '\0';
+  ir_display_name(inner, shown, sizeof(shown));
+  snprintf(buf, cap, "call to `%s`", shown);
+  return buf;
+}
+
 static int ir_explain_str_eq(const char *a, const char *b) {
   if (!a || !b) {
     return a == b;
@@ -1600,8 +1767,10 @@ static void ir_explain_group_callee_list(const IRExplainRemark *remarks,
         !ir_explain_remarks_groupable(&remarks[first], &remarks[j])) {
       continue;
     }
+    char raw[96];
     char callee[96];
-    ir_explain_entity_callee(remarks[j].entity, callee, sizeof(callee));
+    ir_explain_entity_callee(remarks[j].entity, raw, sizeof(raw));
+    ir_display_name(raw, callee, sizeof(callee));
     size_t k = 0;
     for (; k < n_names; k++) {
       if (strcmp(names[k], callee) == 0) {
@@ -1988,7 +2157,8 @@ static size_t ir_explain_rank_fixes(int apply_filter, size_t *order,
 
   for (size_t i = 0; i < g_remark_count; i++) {
     const IRExplainRemark *r = &g_remarks[i];
-    if (r->positive || (apply_filter && !ir_explain_remark_selected(r))) {
+    if (r->positive || r->declined ||
+        (apply_filter && !ir_explain_remark_selected(r))) {
       continue;
     }
     if (r->code && strcmp(r->code, "outer-of-nest") == 0) {
@@ -2126,8 +2296,9 @@ static void ir_explain_render_start_here(void) {
   char location[IR_EXPLAIN_START_MAX][160];
   for (size_t i = 0; i < shown; i++) {
     const IRExplainRemark *r = &g_remarks[order[i]];
-    snprintf(location[i], sizeof(location[0]), "%s:%zu", r->function_name,
-             r->line);
+    char shown[128];
+    snprintf(location[i], sizeof(location[0]), "%s:%zu",
+             ir_explain_shown(r->function_name, shown, sizeof(shown)), r->line);
     size_t len = strlen(location[i]);
     if (len > location_width) {
       location_width = len;
@@ -2253,6 +2424,13 @@ static void ir_explain_json_remark(const IRExplainRemark *r, const char *kind,
   if (r->advisory) {
     ir_explain_json_raw(",\"advisory\":true");
   }
+  if (r->declined) {
+    ir_explain_json_raw(",\"declined\":true");
+  }
+  if (r->inlined_into) {
+    ir_explain_json_raw(",\"inlinedInto\":");
+    ir_explain_json_str(r->inlined_into);
+  }
   if (r->quantity_count > 0) {
     ir_explain_json_raw(",\"quantities\":{");
     for (size_t q = 0; q < r->quantity_count; q++) {
@@ -2277,8 +2455,9 @@ static void ir_explain_typed_flush(void) {
       ir_explain_json_str(n->type_name);
       ir_explain_json_raw(",\"fn\":");
       ir_explain_json_str(n->function_name);
-      ir_explain_json_raw(",\"min\":%lld,\"max\":%lld,\"length\":%zu}",
-                          n->min, n->max, n->length);
+      ir_explain_json_raw(
+          ",\"min\":%lld,\"max\":%lld,\"length\":%zu,\"places\":%zu}", n->min,
+          n->max, n->length, n->places);
     }
     ir_explain_json_raw("],\"provenByTypeTotal\":%zu,", g_typed_total);
     ir_explain_payoff_json();
@@ -2294,13 +2473,17 @@ static void ir_explain_typed_flush(void) {
   }
   for (size_t i = 0; i < g_typed_count; i++) {
     const IRExplainTypedNote *n = &g_typed[i];
+    char places[32] = "";
+    if (n->places > 1) {
+      snprintf(places, sizeof(places), ", %zu accesses", n->places);
+    }
     ir_explain_emit("  %sline %zu%s%s%s: '%s' holds %lld..%lld, inside an "
-                    "array of %zu  %s[P0002]%s\n",
+                    "array of %zu%s  %s[P0002]%s\n",
                     clr(EXPLAIN_BOLD), n->line, clr(EXPLAIN_RESET),
                     n->function_name ? " in " : "",
                     n->function_name ? n->function_name : "",
                     n->type_name ? n->type_name : "?", n->min, n->max,
-                    n->length, clr(EXPLAIN_DIM), clr(EXPLAIN_RESET));
+                    n->length, places, clr(EXPLAIN_DIM), clr(EXPLAIN_RESET));
     ir_explain_echo_source(n->line);
   }
   if (g_typed_total > g_typed_count) {
@@ -2403,6 +2586,12 @@ void ir_explain_type_payoff(const char *file, size_t line,
   IRExplainLedgerRow *row;
   if (!ledger_in_focus(file)) {
     return;
+  }
+  for (size_t i = 0; i < g_payoff_count; i++) {
+    if (g_payoffs[i].line == line && ir_explain_str_eq(g_payoffs[i].b, what) &&
+        ir_explain_str_eq(g_payoffs[i].a, type_name)) {
+      return;
+    }
   }
   row = ledger_push(&g_payoffs, &g_payoff_count, &g_payoff_total);
   if (!row) {
@@ -3044,6 +3233,15 @@ static void ir_explain_hotspots_json(void) {
     spots[count].code = cost->has_kernel ? "vectorized" : NULL;
     spots[count].cost =
         (long)cost->cycles_per_iter * ir_explain_depth_weight(cost->depth);
+    {
+      long long trips =
+          ir_explain_known_trips(cost->function_name, cost->head_line);
+      if (trips > 0) {
+        spots[count].cost = (long)((long long)cost->cycles_per_iter *
+                                   ir_explain_depth_weight(cost->depth) *
+                                   trips / 10);
+      }
+    }
     count++;
   }
   for (size_t i = 0; i < g_remark_count; i++) {
@@ -3166,6 +3364,55 @@ static void ir_explain_call_graph_json(void) {
   ir_explain_json_raw("],");
 }
 
+typedef struct {
+  char *function_name;
+  size_t line;
+  long long trips;
+} IRExplainTrips;
+
+#define IR_EXPLAIN_TRIPS_MAX 512
+static MTLC_THREAD_LOCAL IRExplainTrips g_trips[IR_EXPLAIN_TRIPS_MAX];
+static MTLC_THREAD_LOCAL size_t g_trip_count = 0;
+
+void ir_explain_loop_trips(const char *function_name, SourceLocation location,
+                           long long trips) {
+  if (!g_explain || !function_name || trips <= 0 ||
+      !ir_explain_location_enabled(&location)) {
+    return;
+  }
+  for (size_t i = 0; i < g_trip_count; i++) {
+    if (g_trips[i].line == location.line &&
+        strcmp(g_trips[i].function_name, function_name) == 0) {
+      g_trips[i].trips = trips;
+      return;
+    }
+  }
+  if (g_trip_count < IR_EXPLAIN_TRIPS_MAX) {
+    g_trips[g_trip_count].function_name = ir_explain_strdup(function_name);
+    g_trips[g_trip_count].line = location.line;
+    g_trips[g_trip_count].trips = trips;
+    g_trip_count++;
+  }
+}
+
+static long long ir_explain_known_trips(const char *function_name,
+                                        size_t line) {
+  for (size_t i = 0; i < g_trip_count; i++) {
+    if (g_trips[i].line == line &&
+        ir_explain_str_eq(g_trips[i].function_name, function_name)) {
+      return g_trips[i].trips;
+    }
+  }
+  return 0;
+}
+
+static void ir_explain_trips_release(void) {
+  for (size_t i = 0; i < g_trip_count; i++) {
+    free(g_trips[i].function_name);
+  }
+  g_trip_count = 0;
+}
+
 static void ir_explain_loop_costs_json(void) {
   if (!g_explain_json) {
     return;
@@ -3173,8 +3420,13 @@ static void ir_explain_loop_costs_json(void) {
   ir_explain_json_raw("\"loops\":[");
   for (size_t i = 0; i < g_loop_cost_count; i++) {
     const IRExplainLoopCost *cost = &g_loop_costs[i];
+    long long trips =
+        ir_explain_known_trips(cost->function_name, cost->head_line);
     ir_explain_json_raw("%s{\"fn\":", i ? "," : "");
     ir_explain_json_str(cost->function_name);
+    if (trips > 0) {
+      ir_explain_json_raw(",\"trips\":%lld", trips);
+    }
     ir_explain_json_raw(",\"line\":%zu,\"endLine\":%zu,\"depth\":%d,"
                         "\"cyclesPerIter\":%d,\"bottleneck\":",
                         cost->head_line, cost->tail_line, cost->depth,
@@ -3276,6 +3528,43 @@ static void ir_explain_passes_json(void) {
   g_pass_count = 0;
 }
 
+static void ir_explain_print_remark(const IRExplainRemark *r) {
+  char fn_shown[160];
+  char entity_shown[224];
+  char host_shown[160];
+  ir_explain_emit(
+      "  %s%s%s (%s @ line %zu%s%s): %s%s%s%s\n", clr(EXPLAIN_BOLD),
+      ir_explain_shown(r->function_name, fn_shown, sizeof(fn_shown)),
+      clr(EXPLAIN_RESET),
+      ir_explain_shown_entity(r->entity, entity_shown, sizeof(entity_shown)),
+      r->line, r->inlined_into ? ", inlined into " : "",
+      r->inlined_into
+          ? ir_explain_shown(r->inlined_into, host_shown, sizeof(host_shown))
+          : "",
+      clr(r->positive ? EXPLAIN_GREEN : r->declined ? EXPLAIN_DIM : EXPLAIN_RED),
+      r->headline, clr(EXPLAIN_RESET), ir_explain_code_tag(r));
+  if (r->reason) {
+    if (!r->declined) {
+      ir_explain_echo_source_range(r->line, r->end_line);
+    }
+    ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
+                    glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
+  }
+  if (r->fix) {
+    ir_explain_emit("      %s%s %s: %s%s\n", clr(EXPLAIN_DIM), glyph_elbow(),
+                    r->advisory ? "note" : "fix", r->fix, clr(EXPLAIN_RESET));
+  }
+  if (r->verified) {
+    ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
+                    glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
+                    clr(EXPLAIN_RESET));
+  }
+  if (r->partial) {
+    ir_explain_emit("      %s%s still blocked: %s%s\n", clr(EXPLAIN_DIM),
+                    glyph_elbow(), r->partial, clr(EXPLAIN_RESET));
+  }
+}
+
 void ir_explain_flush(void) {
   if (!g_explain) {
     return;
@@ -3322,12 +3611,16 @@ void ir_explain_flush(void) {
           ir_explain_group_callee_list(g_remarks, i, callees,
                                        sizeof(callees));
           if (show) {
-            ir_explain_emit("  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s%s\n",
-                            clr(EXPLAIN_BOLD), r->function_name,
-                            clr(EXPLAIN_RESET), group_count, r->line, last_line,
-                            clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
-                            r->headline, clr(EXPLAIN_RESET),
-                            ir_explain_code_tag(r));
+            char fn_shown[160];
+            ir_explain_emit(
+                "  %s%s%s (%zu calls, lines %zu-%zu): %s%s%s%s\n",
+                clr(EXPLAIN_BOLD),
+                ir_explain_shown(r->function_name, fn_shown, sizeof(fn_shown)),
+                clr(EXPLAIN_RESET), group_count, r->line, last_line,
+                clr(r->positive    ? EXPLAIN_GREEN
+                    : r->declined ? EXPLAIN_DIM
+                                  : EXPLAIN_RED),
+                r->headline, clr(EXPLAIN_RESET), ir_explain_code_tag(r));
             if (r->reason) {
               ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
                               glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
@@ -3367,31 +3660,7 @@ void ir_explain_flush(void) {
       }
 
       if (show) {
-        ir_explain_emit("  %s%s%s (%s @ line %zu): %s%s%s%s\n",
-                        clr(EXPLAIN_BOLD), r->function_name, clr(EXPLAIN_RESET),
-                        r->entity, r->line,
-                        clr(r->positive ? EXPLAIN_GREEN : EXPLAIN_RED),
-                        r->headline, clr(EXPLAIN_RESET),
-                        ir_explain_code_tag(r));
-        if (r->reason) {
-          ir_explain_echo_source_range(r->line, r->end_line);
-          ir_explain_emit("      %s%s reason: %s%s\n", clr(EXPLAIN_DIM),
-                          glyph_elbow(), r->reason, clr(EXPLAIN_RESET));
-        }
-        if (r->fix) {
-          ir_explain_emit("      %s%s %s: %s%s\n", clr(EXPLAIN_DIM),
-                          glyph_elbow(), r->advisory ? "note" : "fix", r->fix,
-                          clr(EXPLAIN_RESET));
-        }
-        if (r->verified) {
-          ir_explain_emit("      %s%s verified: %s%s%s\n", clr(EXPLAIN_DIM),
-                          glyph_elbow(), clr(EXPLAIN_GREEN), r->verified,
-                          clr(EXPLAIN_RESET));
-        }
-        if (r->partial) {
-          ir_explain_emit("      %s%s still blocked: %s%s\n", clr(EXPLAIN_DIM),
-                          glyph_elbow(), r->partial, clr(EXPLAIN_RESET));
-        }
+        ir_explain_print_remark(r);
       }
       if (r->verified) {
         g_digest.fixes_verified++;
@@ -3471,6 +3740,7 @@ void ir_explain_flush(void) {
 static void ir_explain_release_remarks(void) {
   for (size_t i = 0; i < g_remark_count; i++) {
     free(g_remarks[i].function_name);
+    free(g_remarks[i].inlined_into);
     free(g_remarks[i].entity);
     free(g_remarks[i].headline);
     free(g_remarks[i].reason);
@@ -4348,6 +4618,7 @@ void ir_explain_backend_flush(void) {
   g_loop_costs = NULL;
   g_loop_cost_count = 0;
   g_loop_cost_capacity = 0;
+  ir_explain_trips_release();
   for (size_t i = 0; i < g_function_cost_count; i++) {
     free(g_function_costs[i].function_name);
   }

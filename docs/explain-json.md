@@ -56,6 +56,8 @@ One entry per decision. This is the same material `--explain` prints.
 | `callee` | string or null | For a call remark |
 | `depth` | number | Loop nesting depth |
 | `code` | string | The decision code, such as `store-only-fill` |
+| `declined` | bool | True when the optimizer chose not to act and loses nothing by it, such as a call outside every loop kept as a call |
+| `inlinedInto` | string | The function this copy of the code was inlined into; `fn` is then the function that wrote it |
 | `quantities` | object | Numbers behind the verdict, such as `calleeInstructions` |
 
 `mettle explain <code>` prints the long form of any `code` value.
@@ -67,9 +69,10 @@ One entry per decision. This is the same material `--explain` prints.
   "line": 7,
   "positive": false,
   "headline": "NOT vectorized",
-  "reason": "the loop fills the stack array `xs`, whose address is retaken on every iteration; the fill kernel indexes off one invariant base pointer, and a fresh base each iteration is not one",
-  "fix": "bind the array to a pointer once before the loop (`var p: int32* = &xs[0];`) and write `p[i]` in the body",
-  "code": "store-only-fill",
+  "reason": "this is a histogram: the element each iteration updates is chosen by a value the loop reads, so two lanes of one vector can land on the same element and a vector store would keep only one of their updates. Catching that collision takes AVX-512's vpconflictd, and AVX2 has nothing like it",
+  "fix": "nothing to change: the scalar loop is the floor for a scatter on this target",
+  "advisory": true,
+  "code": "scatter-store",
   "depth": 1,
   "column": 3,
   "endLine": 7
@@ -110,9 +113,12 @@ false and `entries` is empty.
 
 `fn`, `line`, `endLine`, `depth`, `cyclesPerIter`, `bottleneck` (the port or
 unit that limits it, such as `store`), `hasKernel` (whether a vectorizer
-claimed it), and `estimated`. `cyclesPerIter` is in hundredths of a cycle, so
-`50` is half a cycle. A loop the backend inlined from another file is left
-out, since its lines belong to that file.
+claimed it), `estimated`, and `trips` when the loop runs a constant number of
+times. `cyclesPerIter` is in hundredths of a cycle, so `50` is half a cycle.
+The Overview ranks loops by cycles times ten per nesting level, and a loop
+with known `trips` counts that many iterations where an unknown one counts
+ten. A loop the backend inlined from another file is left out, since its
+lines belong to that file.
 
 ## machine
 

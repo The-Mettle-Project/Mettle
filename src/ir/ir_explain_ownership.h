@@ -21,5 +21,6 @@ typedef struct {
 void ir_explain_ownership_set_collect(int enabled, const char *focus_file);
 void ir_explain_ownership_note(const IRExplainOwnershipRecord *record);
 void ir_explain_ownership_scan(const void *ir_program);
+void ir_explain_attribute_remarks(const void *ir_program);
 
 #endif

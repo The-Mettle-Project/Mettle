@@ -900,6 +900,7 @@ static int ir_optimize_portable_program_pipeline(
 
   ir_explain_set_program(NULL);
   ir_gpu_call_graph_destroy(&graph);
+  ir_explain_attribute_remarks(program);
   ir_explain_ownership_scan(program);
   ir_explain_flush();
   ir_pass_time_report();
@@ -1137,6 +1138,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
   contracts_ok &= !ir_optimize_had_user_error();
 
   ir_inline_explain_report_remaining(program);
+  ir_explain_attribute_remarks(program);
   ir_explain_ownership_scan(program);
   ir_explain_flush();
   if (!contracts_ok) {

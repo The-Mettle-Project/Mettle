@@ -1188,6 +1188,110 @@ int ir_type_is_nonzero(const char *type_name) {
   return 0;
 }
 
+typedef struct {
+  char *out;
+  size_t cap;
+  size_t len;
+} IRNameBuf;
+
+static void ir_name_put(IRNameBuf *b, const char *s, size_t n) {
+  for (size_t i = 0; i < n && b->len + 1 < b->cap; i++) {
+    b->out[b->len++] = s[i];
+  }
+  b->out[b->len] = '\0';
+}
+
+static void ir_name_put_type(IRNameBuf *b, const char *s, size_t n) {
+  size_t stars = 0;
+  while (n > 4 && strncmp(s + n - 4, "_ptr", 4) == 0) {
+    n -= 4;
+    stars++;
+  }
+  ir_name_put(b, s, n);
+  while (stars-- > 0) {
+    ir_name_put(b, "*", 1);
+  }
+}
+
+static void ir_name_put_args(IRNameBuf *b, const char *args) {
+  const char *p = args;
+  ir_name_put(b, "<", 1);
+  while (*p) {
+    const char *end = strstr(p, "__");
+    size_t n = end ? (size_t)(end - p) : strlen(p);
+    if (p != args) {
+      ir_name_put(b, ", ", 2);
+    }
+    ir_name_put_type(b, p, n);
+    p += n;
+    if (*p) {
+      p += 2;
+    }
+  }
+  ir_name_put(b, ">", 1);
+}
+
+static int ir_name_put_method(IRNameBuf *b, const char *p, const char *split) {
+  const char *dot = memchr(p, '_', (size_t)(split - p));
+  if (!dot || p[0] < 'A' || p[0] > 'Z' || strncmp(split, "__ptr", 5) != 0 ||
+      (split[5] != '\0' && strncmp(split + 5, "__", 2) != 0)) {
+    return 0;
+  }
+  ir_name_put(b, p, (size_t)(dot - p));
+  if (split[5]) {
+    ir_name_put_args(b, split + 7);
+  }
+  ir_name_put(b, ".", 1);
+  ir_name_put(b, dot + 1, (size_t)(split - dot - 1));
+  return 1;
+}
+
+static void ir_name_put_generic(IRNameBuf *b, const char *p) {
+  const char *split = p[0] ? strstr(p + 1, "__") : NULL;
+  if (!split || !split[2]) {
+    ir_name_put(b, p, strlen(p));
+    return;
+  }
+  if (ir_name_put_method(b, p, split)) {
+    return;
+  }
+  ir_name_put(b, p, (size_t)(split - p));
+  ir_name_put_args(b, split + 2);
+}
+
+static int ir_name_put_trait(IRNameBuf *b, const char *p) {
+  const char *type = strstr(p, "__");
+  const char *method = type ? strstr(type + 2, "__") : NULL;
+  if (!method || !method[2]) {
+    return 0;
+  }
+  ir_name_put_type(b, type + 2, (size_t)(method - type - 2));
+  ir_name_put(b, ".", 1);
+  ir_name_put(b, method + 2, strlen(method + 2));
+  return 1;
+}
+
+void ir_display_name(const char *name, char *out, size_t cap) {
+  IRNameBuf b = {out, cap, 0};
+  const char *p = name ? name : "?";
+  if (!out || cap == 0) {
+    return;
+  }
+  out[0] = '\0';
+  while (strncmp(p, "__import_", 9) == 0 && strchr(p + 9, '_')) {
+    p = strchr(p + 9, '_') + 1;
+  }
+  if (strncmp(p, "__drop_", 7) == 0 && p[7]) {
+    ir_name_put(&b, "drop glue for ", 14);
+    ir_name_put_generic(&b, p + 7);
+    return;
+  }
+  if (strncmp(p, "__trait_", 8) == 0 && ir_name_put_trait(&b, p + 8)) {
+    return;
+  }
+  ir_name_put_generic(&b, p);
+}
+
 IRFunction *ir_function_create(const char *name) {
   IRFunction *function = calloc(1, sizeof(IRFunction));
   if (!function) {

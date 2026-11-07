@@ -97,6 +97,37 @@ static int ir_function_name_is_inline_denylisted(const char *name) {
 }
 
 static MTLC_THREAD_LOCAL const char *g_inline_refusal_code = NULL;
+static MTLC_THREAD_LOCAL char g_inline_why[256];
+static size_t ir_function_non_nop_instruction_count(const IRFunction *function);
+
+static int ir_inline_call_counts(const IRInstruction *instruction) {
+  if (instruction->op == IR_OP_CALL_INDIRECT) {
+    return 1;
+  }
+  return instruction->op == IR_OP_CALL &&
+         (!instruction->text ||
+          strncmp(instruction->text, "mettle_safety_", 14) != 0);
+}
+
+static size_t ir_inline_call_total(const IRFunction *function) {
+  size_t total = 0;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    total += (size_t)ir_inline_call_counts(&function->instructions[i]);
+  }
+  return total;
+}
+
+static const char *ir_inline_call_count_why(const IRFunction *function,
+                                            size_t budget) {
+  char shown[128];
+  size_t total = ir_inline_call_total(function);
+  ir_display_name(function->name, shown, sizeof(shown));
+  snprintf(g_inline_why, sizeof(g_inline_why),
+           "`%s` makes %zu call%s of its own, and a callee here may make at "
+           "most %zu",
+           shown, total, total == 1 ? "" : "s", budget);
+  return g_inline_why;
+}
 
 #define IR_INLINE_WHY(target, id, text)                                        \
   do {                                                                         \
@@ -198,9 +229,16 @@ static int ir_inline_scan_body(const IRFunction *function, int forced,
     }
     scan->non_nop_count++;
     if (ir_inline_over_body_budget(function, forced, body_budget, scan)) {
-      IR_INLINE_WHY(why_not, "callee-over-budget",
-                    "the callee's body is over the profile-adjusted inline "
-                    "instruction budget");
+      char shown[128];
+      ir_display_name(function->name, shown, sizeof(shown));
+      snprintf(g_inline_why, sizeof(g_inline_why),
+               "`%s` is %zu instructions, and a callee here may be at most %zu",
+               shown,
+               scan->cleaned_count != SIZE_MAX
+                   ? scan->cleaned_count
+                   : ir_function_non_nop_instruction_count(function),
+               body_budget);
+      IR_INLINE_WHY(why_not, "callee-over-budget", g_inline_why);
       *fix = "mark the callee @inline to override the budget, or compile "
              "with --pgo so a measured-hot callee overrides it";
       return 0;
@@ -215,13 +253,11 @@ static int ir_inline_scan_body(const IRFunction *function, int forced,
     if (ir_inline_label_is_while(instruction)) {
       scan->has_while_label = 1;
     }
-    if (instruction->op == IR_OP_CALL ||
-        instruction->op == IR_OP_CALL_INDIRECT) {
+    if (ir_inline_call_counts(instruction)) {
       scan->call_count++;
       if (!forced && scan->call_count > nested_call_budget) {
         IR_INLINE_WHY(why_not, "callee-call-count",
-                      "the callee makes more calls of its own than the "
-                      "profile-adjusted inline call-count budget allows");
+                      ir_inline_call_count_why(function, nested_call_budget));
         *fix = "mark the callee @inline to override the call-count cap";
         return 0;
       }
@@ -1326,13 +1362,15 @@ static void ir_inline_site_reason(IRFunction *caller,
              !ir_opt_site_is_hot(caller, instruction->location) &&
              !ir_call_site_is_in_loop(
                  caller, (size_t)(instruction - caller->instructions))) {
-    IR_INLINE_WHY(reason, "caller-over-budget",
-                  "the calling function is over the profile-adjusted caller "
-                  "budget, and this call site is not measured hot or inside a "
-                  "loop, so it runs at most once per call of the function and "
-                  "keeping it a real call costs nothing measurable (loop-resident "
-                  "calls, measured-hot sites, tiny call-free callees, and "
-                  "@inline-marked callees still inline here)");
+    char shown[128];
+    ir_display_name(caller->name, shown, sizeof(shown));
+    snprintf(g_inline_why, sizeof(g_inline_why),
+             "`%s` is already %zu instructions against a budget of %zu, and "
+             "this call sits outside every loop, so it runs once per call of "
+             "`%s`",
+             shown, ir_function_non_nop_instruction_count(caller),
+             (size_t)ir_opt_inline_caller_budget(caller), shown);
+    IR_INLINE_WHY(reason, "caller-over-budget", g_inline_why);
   } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
              instruction->argument_count != callee->parameter_count) {
     IR_INLINE_WHY(reason, "argument-count",
@@ -1345,6 +1383,27 @@ static void ir_inline_site_reason(IRFunction *caller,
                   "inlining rounds reached their limit before this call could "
                   "be revisited");
   }
+}
+
+static int ir_inline_refusal_is_declined(IRFunction *caller,
+                                         const IRInstruction *instruction,
+                                         const char *code) {
+  size_t site = (size_t)(instruction - caller->instructions);
+  if (code && (strcmp(code, "callee-has-kernel") == 0 ||
+               strcmp(code, "caller-over-budget") == 0)) {
+    return 1;
+  }
+  if (code && strcmp(code, "recursive") == 0) {
+    return 0;
+  }
+  return !ir_call_site_is_in_loop(caller, site) &&
+         !ir_opt_site_is_hot(caller, instruction->location);
+}
+
+static int ir_inline_callee_is_written(const IRFunction *callee) {
+  return callee->name && strncmp(callee->name, "__", 2) != 0 &&
+         callee->location.filename &&
+         ir_explain_file_enabled(callee->location.filename);
 }
 
 void ir_inline_explain_report_remaining(IRProgram *program) {
@@ -1373,6 +1432,11 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
       const char *fix = NULL;
       ir_inline_site_reason(function, instruction, callee, &reason, &fix);
       const char *refusal_code = g_inline_refusal_code;
+      int declined = ir_inline_refusal_is_declined(function, instruction,
+                                                   refusal_code);
+      if (declined || !ir_inline_callee_is_written(callee)) {
+        fix = NULL;
+      }
 
       const char *verified = NULL;
       int advisory = 0;
@@ -1404,9 +1468,13 @@ void ir_inline_explain_report_remaining(IRProgram *program) {
       char entity[160];
       snprintf(entity, sizeof(entity), "call to `%s`", instruction->text);
       ir_explain_remark(function->name, entity, instruction->location, 0,
-                        "NOT inlined", reason, fix, verified);
+                        declined ? "kept as a call" : "NOT inlined", reason,
+                        fix, verified);
       if (advisory) {
         ir_explain_remark_advisory();
+      }
+      if (declined) {
+        ir_explain_remark_declined();
       }
       ir_explain_remark_code(refusal_code);
       ir_explain_remark_quantity("calleeInstructions",

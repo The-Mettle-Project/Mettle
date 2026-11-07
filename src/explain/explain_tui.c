@@ -1,5 +1,6 @@
 #include "explain_tui.h"
 #include "../error/error_explain.h"
+#include "../ir/ir.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -1044,7 +1045,9 @@ static void ex_draw_list(ExUi *ui, ExScreen *s) {
       ex_draw_columns(ui, s, y, widths);
     } else if (row->kind == EX_ROW_GROUP) {
       const ExEntry *e = &tab->entries[row->index];
-      ex_put(s, ui->list_x + 2, y, ui->list_w - 3, e->group, EXA_BOLD);
+      char shown[160];
+      ir_display_name(e->group, shown, sizeof(shown));
+      ex_put(s, ui->list_x + 2, y, ui->list_w - 3, shown, EXA_BOLD);
     } else if (row->kind == EX_ROW_ENTRY) {
       ex_draw_entry_row(ui, s, y, &tab->entries[row->index], widths,
                         row->index == ui->selected[ui->tab]);
@@ -1633,7 +1636,9 @@ void ex_report_print(const ExReport *report, FILE *out) {
     for (size_t i = 0; i < tab->count; i++) {
       const ExEntry *e = &tab->entries[i];
       if (e->group && (!grouped || !ex_same(group, e->group))) {
-        fprintf(out, "  %s\n", e->group);
+        char shown[160];
+        ir_display_name(e->group, shown, sizeof(shown));
+        fprintf(out, "  %s\n", shown);
         group = e->group;
         grouped = 1;
       }

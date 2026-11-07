@@ -809,7 +809,7 @@
         {
           "args": [],
           "exit": 1,
-          "fatal": "Fatal error: use of memory after it was freed: 8 bytes at offset 0 (line 7)"
+          "fatal": "Fatal error: use of memory after it was freed: 8 bytes at offset 0 of a 32 byte allocation (line 7)"
         }
       ]
     },

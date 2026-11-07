@@ -30,7 +30,9 @@ flowchart LR
    run. Enter on any of them opens the loop in Optimizer.
 2. **Optimizer**: every loop and call by function, with the verdict, the reason
    it declined, the fix, and whether the fix was applied to a copy of the
-   function and re-checked. A scalar loop shows its cycles per iteration and
+   function and re-checked. A call outside every loop that stays a call reads
+   "kept as a call" and does not count as a miss. Code inlined into another
+   function is listed under the function that wrote it, with the host named. A scalar loop shows its cycles per iteration and
    the port that bounds it. A vectorized loop shows its vector body, the
    instructions of one pass, and what a pass costs: the larger of the front
    end's four instructions a cycle, two loads, one store, the floating point

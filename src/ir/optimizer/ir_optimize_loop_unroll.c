@@ -604,6 +604,8 @@ static int ir_try_unroll_loop_at(IRFunction *function, size_t header_index,
                       : (start_value - limit_value);
   }
 
+  ir_explain_loop_trips(function->name,
+                        function->instructions[header_index].location, trips);
   long long max_trips =
       ir_opt_unroll_max_trip_count(function,
                                    function->instructions[header_index].location);

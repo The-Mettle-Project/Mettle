@@ -785,7 +785,7 @@ $cases = @(
       # call-in-body: program-level simulation (pretend-remove @noinline,
       # re-run the INLINER on a caller clone, revectorize)
       'verified: simulated removing `@noinline` from `damp`',
-      'verified: re-checked with @inline pretend-applied: the structural guards pass',
+      'chain \(call to `step1` @ line \d+\): kept as a call',
       # int16 elements + int32 accumulator: the fix honestly names BOTH
       # required changes
       'use int32 elements and declare the accumulator as int64',
@@ -1189,8 +1189,8 @@ $cases = @(
       # cold one-shot call sites in an over-budget caller fold into ONE calm
       # entry that explains why NOT inlining is the right call -- and hands
       # out no fix advice (there is nothing worth fixing)
-      'main \(8 calls, lines \d+-\d+\): NOT inlined',
-      'reason: the calling function is over the profile-adjusted caller budget, and this call site is not measured hot or inside a loop',
+      'main \(8 calls, lines \d+-\d+\): kept as a call',
+      'reason: `main` is already \d+ instructions against a budget of \d+, and this call sits outside every loop, so it runs once per call of `main`',
       'calls: f1 \(x3\), f2 \(x2\), f3 \(x2\), f4',
       # tiny call-free callees are exempt from the caller budget: the
       # accessor still inlines into the over-budget main
@@ -1266,21 +1266,14 @@ $cases = @(
       'two_regions \(loop @ line \d+\): vectorized',
       # 1-byte elements reach the splat kernel like every other width
       'byte_fill \(loop @ line \d+\): vectorized -> 16-byte splat stores',
-      'the loop fills the stack array `a`, whose address is retaken on every iteration',
-      'fix: bind the array to a pointer once before the loop \(`var p: float32\* = &a\[0\];`\)',
-      'local_fill_bound \(loop @ line \d+\): vectorized',
-      # one loop misses the kernel and it has work to do
-      'where to start \(1 of 1 missed optimization has a fix',
-      # the stack-array advice is not believed, it is checked: the
-      # compiler binds the pointer on a clone and re-runs, and the kernel
-      # it names is the one local_fill_bound actually gets below
-      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> 16-byte splat stores',
-      # so it leads the triage, and it is the only entry with work in it
-      '1\. proven local_fill:\d+  bind the array to a pointer once'
+      # a stack array's address leaves the loop, so it fills like a pointer
+      'local_fill \(loop @ line \d+\): vectorized -> 16-byte splat stores',
+      'local_fill_bound \(loop @ line \d+\): vectorized'
     )
     OutputMustNotMatch = @(
       # the advice that could not be followed
       'its store address did not match the fill vectorizer',
+      'whose address is retaken on every iteration',
       # the loop that does vectorize must not be reported as a refusal
       'the body writes 2 destinations'
     )
@@ -13078,6 +13071,7 @@ try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $savedCache = $env:METTLE_CACHE
   $env:METTLE_CACHE = Join-Path $tmpDir "explain-cache"
+  Remove-Item -Recurse -Force $env:METTLE_CACHE -ErrorAction SilentlyContinue
   function Invoke-ExplainScreen([string]$File, [string]$Keys, [string]$Screen = "140x30", [string[]]$Extra = @()) {
     $explainArgs = @("explain", $File) + $Extra + @("--screen=$Screen")
     if ($Keys) { $explainArgs += "--keys=$Keys" }
@@ -13093,7 +13087,7 @@ try {
   $demo = "tests/explain_demo.mettle"
   Assert-Screen (Invoke-ExplainScreen $demo "" "140x80") @(
       "1 Overview 11", "2 Optimizer 25", "5 Functions", "7 Passes",
-      "Loops      3 vectorized, 12 scalar, 5 fixes proven",
+      "Loops      4 vectorized, 11 scalar, 4 fixes proven",
       "Start here", "matvec:38", "Enter opens this in Optimizer",
       "matvec, loop at line 38", "dot-shape-address") "overview"
   Assert-Screen (Invoke-ExplainScreen $demo "2 j j j" "140x80") @(
@@ -13121,7 +13115,7 @@ try {
   Assert-Screen $ownership @("glue            ``__drop_Track``", "arm drop        ``t``", "live bit", "assign drop     ``line``",
       "parameter drop  ``t``", "discard drop", "temporary") "raii ownership"
   foreach ($group in @("sweep", "retire", "main")) {
-    $headers = ([regex]::Matches($ownership, "(?m)^  $group\s*│")).Count
+    $headers = ([regex]::Matches($ownership, "(?m)^  $group +\S")).Count
     if ($headers -ne 1) { throw "raii ownership: group '$group' has $headers headers:`n$ownership" }
   }
   $memory = Invoke-ExplainScreen $raii "4" "140x40" @("--safe")

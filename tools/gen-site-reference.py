@@ -35,7 +35,8 @@ GROUP_ORDER = [
      "verdict. Each names the specific shape the loop had that no SIMD kernel "
      "could claim."),
     ("inline-refusal", "Why a call was not inlined",
-     "Printed after a NOT inlined verdict. The inliner declines for reasons "
+     "Printed after a NOT inlined or kept as a call verdict. The inliner "
+     "declines for reasons "
      "that are all budget, shape, or contract, and each has a name."),
     ("applied", "What the optimizer applied",
      "The positive verdicts. These say what the compiler did do, and what it "

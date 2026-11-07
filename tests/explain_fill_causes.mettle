@@ -14,7 +14,7 @@ fn byte_fill(p: uint8*, n: int32) {
     while (i < n) { p[i] = 7; i = i + 1; }
 }
 
-// A stack array: its address is retaken every iteration.
+// A stack array: its address leaves the loop and the fill takes it.
 fn local_fill(n: int32) -> float32 {
     var a: float32[64];
     var i: int32 = 0;
@@ -22,8 +22,7 @@ fn local_fill(n: int32) -> float32 {
     return a[0];
 }
 
-// The same array bound to a pointer once: this one vectorizes, which is what
-// makes the advice above a fact rather than a hope.
+// The same array bound to a pointer by hand fills the same way.
 fn local_fill_bound(n: int32) -> float32 {
     var a: float32[64];
     var p: float32* = &a[0];

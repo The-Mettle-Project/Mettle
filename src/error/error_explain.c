@@ -1239,17 +1239,43 @@ static const DecisionDoc DECISIONS[] = {
      "  - 1-byte elements. The kernel covers 2, 4 and 8 bytes. This is a gap\n"
      "    in the compiler; there is nothing to change in the loop.\n"
      "\n"
-     "  - A stack array as the destination. `a[i]` on a local array recomputes\n"
-     "    the array's address every iteration, and the kernel indexes off one\n"
-     "    invariant base. Bind it once and write through the pointer:\n"
-     "        var p: float32* = &a[0];\n"
-     "        for i in 0..n { p[i] = 1.0; }\n"
-     "    The generated code is the same either way; only the shape the\n"
-     "    recognizer sees changes.\n"
-     "\n"
      "  - An address the kernel cannot follow. It handles `a[i]`, `a[c + i]`\n"
      "    with `c` invariant, and a pointer walked by a constant stride. Lift\n"
      "    the invariant part of the index into a base pointer before the loop.\n"},
+    {"counter-store", DECISION_VECTOR_REFUSAL,
+     "A ramp: the loop stores its own counter",
+     "`a[i] = i`, `xs[i] = (float32)i` and every other store of a value\n"
+     "computed from the loop counter is a ramp. The fill kernel writes one\n"
+     "fixed value, and the compiler has no kernel that steps a vector of\n"
+     "counters, so a ramp stays a scalar loop of one store per element.\n"
+     "\n"
+     "A store of a value that does not change, `a[i] = 0`, is a fill and\n"
+     "becomes 16- or 32-byte splat stores, on a stack array as well as\n"
+     "through a pointer.\n"},
+    {"scatter-store", DECISION_VECTOR_REFUSAL,
+     "A store whose index the loop reads from memory",
+     "When the element a store writes is chosen by data, `heat[cell] = ...`\n"
+     "with `cell` read from an array, the store is a scatter. AVX2 can\n"
+     "gather loads but has no scatter store, so a vector body would still\n"
+     "store one lane at a time.\n"
+     "\n"
+     "The commonest case is a histogram, `h[x[i]] = h[x[i]] + 1`. Two lanes\n"
+     "of one vector can pick the same element, and a vector update would\n"
+     "keep only one of the two increments. AVX-512 detects that collision\n"
+     "with vpconflictd; AVX2 cannot, and the scalar loop is the floor.\n"},
+    {"chosen-index", DECISION_VECTOR_REFUSAL,
+     "The condition reads at an index the loop chose",
+     "`if (a[i] > a[best]) { best = i; }` finds the index of the largest\n"
+     "element, but it reads `a[best]` in the comparison, and `best` is set\n"
+     "inside the `if`. Every iteration's load waits on the previous\n"
+     "iteration's choice, so the iterations form a chain.\n"
+     "\n"
+     "Fix: keep the best value in a variable of its own beside its index:\n"
+     "\n"
+     "    var best_value = a[0];\n"
+     "    for i in 0..n {\n"
+     "        if (a[i] > best_value) { best_value = a[i]; best = i; }\n"
+     "    }\n"},
     {"extremum-shape", DECISION_VECTOR_REFUSAL,
      "Running minimum or maximum the kernel just missed",
      "`if (a[i] > best) { best = a[i]; }` is a shape the compiler vectorizes:\n"

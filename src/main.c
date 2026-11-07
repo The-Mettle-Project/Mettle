@@ -7220,8 +7220,9 @@ static int compile_stage_type_reports(CompileContext *ctx) {
       ir_explain_layout_note(line, owner, detail);
     }
     ir_explain_layout_total(type_checker_gpu_type_note_total());
-  } else if (options->report_gpu_types || options->explain ||
-             options->explain_all) {
+  } else if (options->report_gpu_types ||
+             ((options->explain || options->explain_all) &&
+              type_checker_gpu_type_note_total() > 0)) {
     type_checker_print_gpu_type_report(options->explain_view_text ? stdout
                                                                   : stderr);
   }

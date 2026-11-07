@@ -1,5 +1,6 @@
 #include "explain_model.h"
 #include "../error/error_explain.h"
+#include "../ir/ir.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -39,6 +40,24 @@ static char *ex_fmt(const char *format, ...) {
   vsnprintf(out, (size_t)needed + 1, format, args);
   va_end(args);
   return out;
+}
+
+static const char *ex_shown(const char *name, char *buf, size_t cap) {
+  ir_display_name(name ? name : "?", buf, cap);
+  return buf;
+}
+
+static char *ex_shown_entity(const char *entity) {
+  char inner[160];
+  char shown[192];
+  size_t len = entity ? strlen(entity) : 0;
+  if (len < 11 || strncmp(entity, "call to `", 9) != 0 ||
+      entity[len - 1] != '`' || len - 10 >= sizeof(inner)) {
+    return ex_strdup(entity);
+  }
+  memcpy(inner, entity + 9, len - 10);
+  inner[len - 10] = '\0';
+  return ex_fmt("call to `%s`", ex_shown(inner, shown, sizeof(shown)));
 }
 
 static char *ex_spaced(const char *text) {
@@ -689,30 +708,38 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
     long long count = ex_json_int(r, "count", 1);
     int positive = ex_json_flag(r, "positive");
     int advisory = ex_json_flag(r, "advisory");
+    int declined = ex_json_flag(r, "declined");
+    const char *host = ex_json_text(r, "inlinedInto");
+    char fn_shown[160];
+    char host_shown[160];
     ExEntry *entry = ex_add(tab, fn ? fn : "?");
     if (!entry) {
       return;
     }
+    ex_shown(fn, fn_shown, sizeof(fn_shown));
     entry->function = ex_strdup(fn);
     if (kind && strcmp(kind, "calls-folded") == 0) {
       long long last = ex_json_int(r, "lineEnd", line);
       entry->cells[0] = ex_fmt("%lld-%lld", line, last);
       entry->cells[1] = ex_fmt("%lld calls", count);
       entry->end_line = (int)last;
-      entry->title = ex_fmt("%s, %lld calls on lines %lld to %lld",
-                            fn ? fn : "?", count, line, last);
+      entry->title = ex_fmt("%s, %lld calls on lines %lld to %lld", fn_shown,
+                            count, line, last);
     } else {
+      char *shown_entity = ex_shown_entity(entity ? entity : kind);
       entry->cells[0] = ex_fmt("%lld", line);
-      entry->cells[1] = ex_strdup(entity ? entity : kind);
+      entry->cells[1] = shown_entity;
       entry->end_line = (int)end_line;
-      entry->title = ex_fmt("%s, %s at line %lld", fn ? fn : "?",
-                            entity ? entity : "?", line);
+      entry->title = ex_fmt("%s, %s at line %lld", fn_shown,
+                            shown_entity ? shown_entity : "?", line);
     }
     entry->cells[2] = ex_strdup(headline);
     entry->line = (int)line;
     entry->code = ex_strdup(ex_json_text(r, "code"));
     if (positive || ex_json_flag(r, "trivial")) {
       entry->tone = EX_TONE_DONE;
+    } else if (declined) {
+      entry->tone = EX_TONE_PLAIN;
     } else {
       entry->tone = verified ? EX_TONE_FIXABLE : EX_TONE_MISSED;
       entry->flags |= EXF_MISSED;
@@ -721,7 +748,14 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
       entry->flags |= EXF_FIXABLE;
     }
     ex_field(entry, "Verdict", headline,
-             positive ? EX_TONE_DONE : EX_TONE_MISSED);
+             positive   ? EX_TONE_DONE
+             : declined ? EX_TONE_PLAIN
+                        : EX_TONE_MISSED);
+    if (host) {
+      ex_field(entry, "Inlined into", ex_shown(host, host_shown,
+                                               sizeof(host_shown)),
+               EX_TONE_PLAIN);
+    }
     ex_field(entry, "Reason", ex_json_text(r, "reason"), EX_TONE_PLAIN);
     ex_field(entry, advisory ? "Note" : "Fix", fix, EX_TONE_PLAIN);
     ex_field(entry, "Verified", verified, EX_TONE_FIXABLE);
@@ -845,10 +879,14 @@ static void ex_hot_loops(ExTab *tab, const ExTab *optimizer,
     long long line = ex_json_int(loop, "line", 0);
     long long cycles = ex_json_int(loop, "cyclesPerIter", 0);
     long long depth = ex_json_int(loop, "depth", 0);
+    long long trips = ex_json_int(loop, "trips", 0);
     long long cost = cycles;
     size_t k = 0;
     for (long long d = 0; d < depth && d < 3; d++) {
       cost *= 10;
+    }
+    if (trips > 0) {
+      cost = cost * trips / 10;
     }
     sum += cost;
     while (k < count && !(hot[k].line == line && ex_same_text(hot[k].fn, fn))) {
