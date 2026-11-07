@@ -22,6 +22,7 @@ typedef struct {
   int mem_addr;
   size_t mem_size;
   size_t mem_align;
+  size_t ptr_align;
 } PtxVal;
 
 typedef struct {
@@ -346,6 +347,27 @@ static PtxVal destination_value(PtxFn *fn, const IROperand *dest,
   }
   computed.idx = new_reg(fn, computed.cls);
   return computed;
+}
+
+static size_t ptx_offset_alignment(const IRInstruction *in, const PtxVal *la,
+                                   const PtxVal *ra) {
+  const PtxVal *pointer = la->is_ptr ? la : ra;
+  const IROperand *offset = la->is_ptr ? &in->rhs : &in->lhs;
+  const char *op = in->text ? in->text : "+";
+  if (!pointer->ptr_align || offset->kind != IR_OPERAND_INT ||
+      (strcmp(op, "+") != 0 && strcmp(op, "-") != 0)) {
+    return 0;
+  }
+  unsigned long long bits =
+      (unsigned long long)pointer->ptr_align | (unsigned long long)offset->int_value;
+  return (size_t)(bits & (~bits + 1ULL));
+}
+
+static long long ptx_copy_alignment(const PtxVal *dest, const PtxVal *source) {
+  size_t a = dest->ptr_align ? dest->ptr_align : 4;
+  size_t b = source->ptr_align ? source->ptr_align : 4;
+  size_t align = a < b ? a : b;
+  return align >= 8 ? 8 : (long long)align;
 }
 
 static MtlcTypeKind base_kind_from_name(const char *s, int *is_unsigned) {
@@ -8775,10 +8797,12 @@ static void ptx_emit_memory(IRProgram *program, IRFunction *func, PtxFn *fn,
                  (int)addr.address_space);
         break;
       }
+      long long widest = ptx_copy_alignment(&addr, &source);
       while (offset < total) {
-        long long width = total - offset >= 8 ? 8
-                          : total - offset >= 4 ? 4
-                          : total - offset >= 2 ? 2 : 1;
+        long long width = widest;
+        while (width > total - offset) {
+          width >>= 1;
+        }
         const char *suffix = width == 8 ? "b64"
                              : width == 4 ? "b32"
                              : width == 2 ? "u16" : "u8";
@@ -9078,13 +9102,24 @@ static void ptx_emit_general_call(IRProgram *program, IRFunction *func,
           }
         } else if (result_is_record) {
           char pointer[24];
-          result_desc.mem_addr = new_reg(fn, PC_B64);
-          reg_name(PC_B64, result_desc.mem_addr, pointer);
-          sb_printf(&fn->body, "\tmov.u64 %s, %s;\n", pointer, result_storage);
-          ptx_block_copy(fn, ".local", pointer, ".param", return_parameter,
-                         result_desc.mem_size, result_desc.mem_align);
-          if (in->dest.name) {
-            bind_value(fn, in->dest.name, result_desc);
+          PtxBinding *home = in->dest.kind == IR_OPERAND_SYMBOL
+                                 ? named_binding(fn, &in->dest)
+                                 : NULL;
+          if (home && home->val.mem_local && home->val.mem_aggregate &&
+              home->val.mem_size == result_desc.mem_size) {
+            reg_name(PC_B64, home->val.mem_addr, pointer);
+            ptx_block_copy(fn, ".local", pointer, ".param", return_parameter,
+                           result_desc.mem_size, result_desc.mem_align);
+          } else {
+            result_desc.mem_addr = new_reg(fn, PC_B64);
+            reg_name(PC_B64, result_desc.mem_addr, pointer);
+            sb_printf(&fn->body, "\tmov.u64 %s, %s;\n", pointer,
+                      result_storage);
+            ptx_block_copy(fn, ".local", pointer, ".param", return_parameter,
+                           result_desc.mem_size, result_desc.mem_align);
+            if (in->dest.name) {
+              bind_value(fn, in->dest.name, result_desc);
+            }
           }
         } else if (in->dest.name) {
           result_desc = destination_value(fn, &in->dest, result_desc);
@@ -10524,6 +10559,7 @@ static void ptx_emit_result(IRProgram *program, IRFunction *func, PtxFn *fn,
     a.is_ptr = 1;
     a.is_unsigned = 1;
     a.elem = home->val.mem_aggregate ? MTLC_TYPE_VOID : home->val.elem;
+    a.ptr_align = home->val.mem_aggregate ? home->val.mem_align : 0;
     a.address_space = MTLC_ADDRESS_SPACE_PRIVATE;
     if (in->dest.name) {
       bind_value(fn, in->dest.name, a);
@@ -11294,6 +11330,7 @@ static void emit_binary(PtxFn *fn, const IRInstruction *in) {
     dv.elem = la.is_ptr ? la.elem : ra.elem;
     dv.address_space =
         la.is_ptr ? la.address_space : ra.address_space;
+    dv.ptr_align = ptx_offset_alignment(in, &la, &ra);
   } else {
     dv.cls = ptx_integer_result_class(in, &la, &ra);
     dv.is_unsigned = la.is_unsigned || ra.is_unsigned;

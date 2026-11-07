@@ -3638,6 +3638,20 @@ static int ir_lower_identifier_value(IRLoweringContext *context, IRFunction *fun
       *out_value = ir_operand_int(symbol->data.constant.value);
       return 1;
     }
+    if (symbol && symbol->kind == SYMBOL_VARIABLE && symbol->is_immutable &&
+        symbol->has_constant_value && symbol->constant_is_float &&
+        !symbol->is_extern && symbol->scope &&
+        symbol->scope->type == SCOPE_GLOBAL && symbol->type) {
+      if (symbol->type->kind == TYPE_FLOAT32) {
+        *out_value = ir_operand_float_sized(
+            (double)(float)symbol->constant_float_value, 32);
+        return 1;
+      }
+      if (symbol->type->kind == TYPE_FLOAT64) {
+        *out_value = ir_operand_float(symbol->constant_float_value);
+        return 1;
+      }
+    }
 
     if (symbol && symbol->kind == SYMBOL_TAGGED_ENUM_CONSTRUCTOR &&
         symbol->data.constructor.payload_type == NULL) {

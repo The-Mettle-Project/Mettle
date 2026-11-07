@@ -635,9 +635,7 @@ static int ir_append_parameter_materialization(
     declare_local.text = mettle_strdup(type_name);
     MtlcType *parameter_type =
         callee_symbol ? callee_symbol->param_types[i] : NULL;
-    if (parameter_type && (parameter_type->kind == MTLC_TYPE_STRUCT ||
-                           parameter_type->kind == MTLC_TYPE_ARRAY ||
-                           parameter_type->kind == MTLC_TYPE_TAGGED_ENUM)) {
+    if (parameter_type) {
       declare_local.value_type = parameter_type;
     }
     if (!declare_local.dest.name || !declare_local.text ||
