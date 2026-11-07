@@ -1,0 +1,14 @@
+fn zero32() -> float32 { return (float32)0.0; }
+fn bump(x: float32) -> float32 { return x + (float32)1.0; }
+
+export fn shadowed() -> int32 {
+  var total: int32 = 0;
+  comptime for bump in 0..3 { total = total + bump; }
+  return total;
+}
+
+export fn filled() -> float32 {
+  var acc: float32[4];
+  comptime for i in 0..4 { acc[i] = bump(zero32()) * (float32)(i + 1); }
+  return acc[0] + acc[3];
+}

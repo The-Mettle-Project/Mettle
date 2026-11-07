@@ -1,0 +1,7 @@
+import "std/io";
+import { filled, shadowed } from "./lib";
+
+fn main() -> int32 {
+  println("{(int32)filled()} {shadowed()}");
+  return 0;
+}

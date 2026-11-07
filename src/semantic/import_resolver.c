@@ -1505,6 +1505,36 @@ static int rewrite_statement_names(ASTNode *node, const NameRewrite *rewrites,
     return 1;
   }
 
+  case AST_COMPTIME_FOR: {
+    ComptimeForStatement *directive = (ComptimeForStatement *)node->data;
+    RewriteScope loop_scope;
+    if (!directive) {
+      return 1;
+    }
+    if (directive->sequence &&
+        !rewrite_node_names(directive->sequence, rewrites, rewrite_count,
+                            bindings, binding_count, scope, 1)) {
+      return 0;
+    }
+    if (directive->range_end &&
+        !rewrite_node_names(directive->range_end, rewrites, rewrite_count,
+                            bindings, binding_count, scope, 1)) {
+      return 0;
+    }
+
+    memset(&loop_scope, 0, sizeof(loop_scope));
+    loop_scope.parent = scope;
+    if (!scope_add_name(&loop_scope, directive->binding_name) ||
+        (directive->body &&
+         !rewrite_node_names(directive->body, rewrites, rewrite_count,
+                             bindings, binding_count, &loop_scope, 1))) {
+      scope_cleanup(&loop_scope);
+      return 0;
+    }
+    scope_cleanup(&loop_scope);
+    return 1;
+  }
+
   default:
     break;
   }
@@ -3112,6 +3142,7 @@ static void collect_dependency_names(ASTNode *node, char ***names,
   case AST_IF_STATEMENT:
   case AST_WHILE_STATEMENT:
   case AST_FOR_STATEMENT:
+  case AST_COMPTIME_FOR:
     for (size_t i = 0; i < node->child_count; i++) {
       collect_dependency_names(node->children[i], names, count, capacity);
     }
@@ -3798,7 +3829,8 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
   }
   case AST_IF_STATEMENT:
   case AST_WHILE_STATEMENT:
-  case AST_FOR_STATEMENT: {
+  case AST_FOR_STATEMENT:
+  case AST_COMPTIME_FOR: {
     for (size_t i = 0; i < node->child_count; i++) {
       process_import_strs_in_node(ctx, node->children[i], current_file_path,
                                   had_error);
