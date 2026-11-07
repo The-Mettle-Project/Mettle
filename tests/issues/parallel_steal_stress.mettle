@@ -1,0 +1,141 @@
+import "std/io";
+import "std/mem";
+import "std/parallel";
+import "std/thread";
+
+struct Count {
+  hits: int32*;
+  stall_every: int64;
+}
+
+struct Nest {
+  outer: int32*;
+  inner: int32*;
+}
+
+struct Twin {
+  hits: int32*;
+  n: int64;
+  rounds: int64;
+  bad: int64;
+}
+
+var g_seed: int64 = 88172645463325252;
+
+fn next_random() -> int64 {
+  g_seed = g_seed ^ (g_seed << 13);
+  g_seed = g_seed ^ ((g_seed >> 7) & 0x01FFFFFFFFFFFFFF);
+  g_seed = g_seed ^ (g_seed << 17);
+  return g_seed & 0x7FFFFFFFFFFFFFFF;
+}
+
+fn count_body(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var c: Count* = (Count*)ctx;
+  for i: int64 in lo..hi {
+    InterlockedIncrement(&c->hits[i]);
+  }
+  if (c->stall_every > 0 && lo % c->stall_every == 0) {
+    Sleep((uint32)1);
+  }
+  return 0;
+}
+
+fn exactly_once(hits: int32*, lo: int64, hi: int64, n: int64) -> bool {
+  var ok: bool = true;
+  for i: int64 in 0..n {
+    var want: int32 = if (i >= lo && i < hi) 1 else 0;
+    if (hits[i] != want) { ok = false; }
+    hits[i] = 0;
+  }
+  return ok;
+}
+
+fn inner_body(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var hits: int32* = (int32*)ctx;
+  for i: int64 in lo..hi { InterlockedIncrement(&hits[i]); }
+  return 0;
+}
+
+fn outer_body(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var nest: Nest* = (Nest*)ctx;
+  for i: int64 in lo..hi {
+    InterlockedIncrement(&nest->outer[i]);
+    parallel_range(&inner_body, (rawptr)&nest->inner[i * 64], 0, 64, 4);
+  }
+  return 0;
+}
+
+fn twin_thread(p: cstring) -> uint32 {
+  var t: Twin* = (Twin*)p;
+  var c: Count* = new Count;
+  c->hits = t->hits;
+  c->stall_every = 0;
+  for r: int64 in 0..t->rounds {
+    parallel_range(&count_body, (rawptr)c, 0, t->n, 16);
+    for i: int64 in 0..t->n {
+      if (t->hits[i] != 1) { t->bad = t->bad + 1; }
+      t->hits[i] = 0;
+    }
+  }
+  free((rawptr)c);
+  return (uint32)0;
+}
+
+fn main() -> int32 {
+  var fails: int32 = 0;
+  var n: int64 = 60000;
+  var c: Count* = new Count;
+  c->hits = (int32*)calloc(n, 4);
+  c->stall_every = 0;
+
+  var wrong: int64 = 0;
+  for call: int64 in 0..4000 {
+    var lo: int64 = next_random() % 1000;
+    var hi: int64 = lo + next_random() % 50000;
+    var chunk: int64 = 1 + next_random() % 2048;
+    parallel_range(&count_body, (rawptr)c, lo, hi, chunk);
+    if (!exactly_once(c->hits, lo, hi, n)) { wrong = wrong + 1; }
+  }
+  if (wrong != 0) { fails = fails | 1; }
+
+  var s: Count* = new Count;
+  s->hits = c->hits;
+  s->stall_every = 512;
+  wrong = 0;
+  for call: int64 in 0..40 {
+    parallel_range(&count_body, (rawptr)s, 0, 40000, 64);
+    if (!exactly_once(s->hits, 0, 40000, n)) { wrong = wrong + 1; }
+  }
+  if (wrong != 0) { fails = fails | 2; }
+
+  var nest: Nest* = new Nest;
+  nest->outer = (int32*)calloc(256, 4);
+  nest->inner = (int32*)calloc(256 * 64, 4);
+  parallel_range(&outer_body, (rawptr)nest, 0, 256, 1);
+  if (!exactly_once(nest->outer, 0, 256, 256) ||
+      !exactly_once(nest->inner, 0, 256 * 64, 256 * 64)) {
+    fails = fails | 4;
+  }
+
+  var a: Twin* = new Twin;
+  var b: Twin* = new Twin;
+  a->hits = (int32*)calloc(20000, 4);
+  b->hits = (int32*)calloc(20000, 4);
+  a->n = 20000;
+  b->n = 20000;
+  a->rounds = 300;
+  b->rounds = 300;
+  var tid: uint32 = (uint32)0;
+  var ta: int64 = CreateThread((cstring)0, (uint64)0, &twin_thread, (cstring)a, (uint32)0, &tid);
+  var tb: int64 = CreateThread((cstring)0, (uint64)0, &twin_thread, (cstring)b, (uint32)0, &tid);
+  thread_join_infinite(ta);
+  thread_join_infinite(tb);
+  if (a->bad != 0 || b->bad != 0) { fails = fails | 8; }
+
+  if (fails == 0) {
+    println("PASS");
+  } else {
+    println("FAIL {fails}");
+  }
+  return fails;
+}

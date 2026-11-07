@@ -14863,6 +14863,28 @@ foreach ($threads in @("1", "4")) {
     Write-CaseResult -Name "parallel_range_$threads" -Passed $false -Reason $_.Exception.Message
   }
 }
+foreach ($threads in @("1", "4", "0")) {
+  $total++
+  try {
+    if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+    $exePath = Join-Path $tmpDir "parallel_steal_$threads.exe"
+    $buildOut = & $CompilerPath --build --release "tests/issues/parallel_steal_stress.mettle" -o $exePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "build failed: $buildOut" }
+    $previous = $env:METTLE_PARALLEL_THREADS
+    $env:METTLE_PARALLEL_THREADS = $threads
+    $out = & $exePath 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $env:METTLE_PARALLEL_THREADS = $previous
+    if ($code -ne 0 -or $out -notmatch "PASS") {
+      throw "a stolen range ran twice or not at all at $threads threads (mask $code): $out"
+    }
+    Write-CaseResult -Name "parallel_steal_$threads" -Passed $true
+  }
+  catch {
+    $failed++
+    Write-CaseResult -Name "parallel_steal_$threads" -Passed $false -Reason $_.Exception.Message
+  }
+}
 # Measured profile round trip: --pgo-gen counts blocks at run time and
 # --pgo-use reads them back. Both builds number the blocks on the same
 # pre-optimization IR, so the ids line up with no map file; if that numbering
