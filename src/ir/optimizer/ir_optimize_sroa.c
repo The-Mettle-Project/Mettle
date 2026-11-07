@@ -43,12 +43,16 @@ static int ir_sroa_scalar_access_width(int size) {
   return size == 1 || size == 2 || size == 4 || size == 8;
 }
 
-static int ir_sroa_note_slot(IRSroaSlot *slots, size_t *slot_count,
+static size_t ir_sroa_slot_cap(const IRFunction *function) {
+  return function->is_kernel ? IR_SROA_MAX_SLOTS : IR_SROA_HOST_SLOTS;
+}
+
+static int ir_sroa_note_slot(IRSroaSlot *slots, size_t *slot_count, size_t cap,
                              long long offset, int size, int is_float,
                              int float_bits, int is_unsigned, int alias_class) {
   IRSroaSlot *slot = ir_sroa_find_slot(slots, *slot_count, offset);
   if (!slot) {
-    if (*slot_count >= IR_SROA_MAX_SLOTS) {
+    if (*slot_count >= cap) {
       return 0;
     }
     slot = &slots[(*slot_count)++];
@@ -84,14 +88,16 @@ static void ir_sroa_sort_slots(IRSroaSlot *slots, size_t count) {
 typedef struct {
   IRSroaSlot slots[IR_SROA_MAX_SLOTS];
   size_t slot_count;
+  size_t slot_cap;
 } IRSroaLayout;
 
 static int ir_sroa_merge_slots(IRSroaLayout *merged, const IRSroaSlot *slots,
                                size_t slot_count) {
   for (size_t s = 0; s < slot_count; s++) {
-    if (!ir_sroa_note_slot(merged->slots, &merged->slot_count, slots[s].offset,
-                           slots[s].size, slots[s].is_float, slots[s].float_bits,
-                           slots[s].is_unsigned, slots[s].alias_class)) {
+    if (!ir_sroa_note_slot(merged->slots, &merged->slot_count, merged->slot_cap,
+                           slots[s].offset, slots[s].size, slots[s].is_float,
+                           slots[s].float_bits, slots[s].is_unsigned,
+                           slots[s].alias_class)) {
       return 0;
     }
   }
@@ -113,8 +119,6 @@ typedef struct {
   const char *name;
   size_t decl_index;
   size_t layout;
-  IRSroaAddr addrs[IR_SROA_MAX_SLOTS * 2];
-  size_t addr_count;
 } IRSroaFlatMember;
 
 typedef struct {
@@ -172,7 +176,6 @@ static const IRSroaHashEnt *ir_sroa_hash_get(const IRSroaHash *h,
 }
 
 static void ir_sroa_collect_all_addrs(IRFunction *function,
-                                      IRSroaFlatMember *members,
                                       const IRSroaHash *member_hash,
                                       IRSroaHash *addr_hash) {
   for (size_t i = 0; i < function->instruction_count; i++) {
@@ -184,14 +187,6 @@ static void ir_sroa_collect_all_addrs(IRFunction *function,
       if (!m) {
         continue;
       }
-      IRSroaFlatMember *fm = &members[m->member];
-      if (fm->addr_count >= IR_ARRAY_COUNT(fm->addrs)) {
-        continue;
-      }
-      fm->addrs[fm->addr_count].temp = insn->dest.name;
-      fm->addrs[fm->addr_count].offset = 0;
-      fm->addrs[fm->addr_count].valid = 1;
-      fm->addr_count++;
       ir_sroa_hash_put(addr_hash, insn->dest.name, m->member, 0);
     }
   }
@@ -206,16 +201,8 @@ static void ir_sroa_collect_all_addrs(IRFunction *function,
       if (!base) {
         continue;
       }
-      IRSroaFlatMember *fm = &members[base->member];
-      if (fm->addr_count >= IR_ARRAY_COUNT(fm->addrs)) {
-        continue;
-      }
-      long long off = base->offset + insn->rhs.int_value;
-      fm->addrs[fm->addr_count].temp = insn->dest.name;
-      fm->addrs[fm->addr_count].offset = off;
-      fm->addrs[fm->addr_count].valid = 1;
-      fm->addr_count++;
-      ir_sroa_hash_put(addr_hash, insn->dest.name, base->member, off);
+      ir_sroa_hash_put(addr_hash, insn->dest.name, base->member,
+                       base->offset + insn->rhs.int_value);
     }
   }
 }
@@ -617,6 +604,7 @@ typedef struct {
   int comp_fail;
   IRSroaSlot slots[IR_SROA_MAX_SLOTS];
   size_t slot_count;
+  size_t slot_cap;
   size_t partners[IR_SROA_MAX_GROUP];
   size_t partner_count;
   size_t addr_count;
@@ -645,10 +633,6 @@ static void ir_sroa_rec_add_addr(IRSroaRec *recs, size_t owner,
                                  IRSroaHash *addr_hash, const char *temp,
                                  long long offset) {
   IRSroaRec *rec = &recs[owner];
-  if (rec->addr_count >= IR_SROA_MAX_SLOTS * 2) {
-    rec->eligible = 0;
-    return;
-  }
   const IRSroaHashEnt *dup = ir_sroa_hash_get(addr_hash, temp);
   if (dup) {
     recs[dup->member].eligible = 0;
@@ -693,8 +677,9 @@ static void ir_sroa_note_access(IRSroaRec *rec, const IRInstruction *insn,
                                 long long offset) {
   int size = insn->rhs.kind == IR_OPERAND_INT ? (int)insn->rhs.int_value : 8;
   if (!ir_sroa_scalar_access_width(size) ||
-      !ir_sroa_note_slot(rec->slots, &rec->slot_count, offset, size, insn->is_float,
-                         insn->float_bits, insn->is_unsigned, insn->alias_class)) {
+      !ir_sroa_note_slot(rec->slots, &rec->slot_count, rec->slot_cap, offset,
+                         size, insn->is_float, insn->float_bits,
+                         insn->is_unsigned, insn->alias_class)) {
     rec->eligible = 0;
   }
 }
@@ -906,6 +891,7 @@ static int ir_sroa_round(IRFunction *function, int *changed,
     rec->name = insn->dest.name;
     rec->decl_index = i;
     rec->eligible = 1;
+    rec->slot_cap = ir_sroa_slot_cap(function);
     rec_count++;
   }
   if (rec_count == 0) {
@@ -913,7 +899,7 @@ static int ir_sroa_round(IRFunction *function, int *changed,
     return 0;
   }
   if (!ir_sroa_hash_init(&rec_hash, rec_count) ||
-      !ir_sroa_hash_init(&addr_hash, rec_count * IR_SROA_MAX_SLOTS * 2)) {
+      !ir_sroa_hash_init(&addr_hash, function->instruction_count + 16)) {
     free(rec_hash.ents);
     free(addr_hash.ents);
     free(recs);
@@ -1025,6 +1011,7 @@ static int ir_sroa_round(IRFunction *function, int *changed,
       }
     }
     IRSroaLayout merged = {0};
+    merged.slot_cap = ir_sroa_slot_cap(function);
     if (!comp_ok ||
         !ir_sroa_component_layout(function, recs, comp, comp_count, &merged)) {
       continue;
@@ -1062,7 +1049,6 @@ static int ir_sroa_round(IRFunction *function, int *changed,
       fm->name = recs[comp[c]].name;
       fm->decl_index = recs[comp[c]].decl_index;
       fm->layout = layout_count;
-      fm->addr_count = 0;
     }
     layout_count++;
   }
@@ -1088,14 +1074,12 @@ static int ir_sroa_round(IRFunction *function, int *changed,
   IRSroaHash member_hash = {0};
   IRSroaHash xform_addr_hash = {0};
   int rc = ir_sroa_hash_init(&member_hash, member_count) &&
-           ir_sroa_hash_init(&xform_addr_hash,
-                             member_count * IR_SROA_MAX_SLOTS * 2);
+           ir_sroa_hash_init(&xform_addr_hash, function->instruction_count + 16);
   if (rc) {
     for (size_t m = 0; m < member_count; m++) {
       ir_sroa_hash_put(&member_hash, members[m].name, m, 0);
     }
-    ir_sroa_collect_all_addrs(function, members, &member_hash,
-                              &xform_addr_hash);
+    ir_sroa_collect_all_addrs(function, &member_hash, &xform_addr_hash);
     rc = ir_sroa_transform_all(function, members, member_count, layouts,
                                &member_hash, &xform_addr_hash);
   }

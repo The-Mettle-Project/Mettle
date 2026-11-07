@@ -1,0 +1,11 @@
+kernel(block = 64) running_rows(src: float32 global*, out: float32 global*, rows: int32) {
+  var acc: float32[32];
+  comptime for e in 0..32 { acc[e] = 0.0; }
+  for r in 0..rows {
+    var row: float32 global* = src + r * 32;
+    comptime for e in 0..32 { acc[e] = acc[e] + row[e] * row[e]; }
+  }
+  var total: float32 = 0.0;
+  comptime for e in 0..32 { total = total + acc[e]; }
+  out[thread.x] = total;
+}

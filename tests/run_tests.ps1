@@ -18068,6 +18068,24 @@ catch {
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $arrayPtx = Join-Path $tmpDir "gpu_private_array_registers.ptx"
+  $arrayOut = & $CompilerPath -O --emit-ptx --gpu-arch=portable `
+    tests/gpu/private_array_registers.mettle -o $arrayPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "emit failed: $arrayOut" }
+  $arrayText = Get-Content -Raw $arrayPtx
+  if ($arrayText -match "\.local") {
+    throw "a private array indexed only by constants stayed in local memory"
+  }
+  Write-CaseResult -Name "gpu_private_array_registers" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_private_array_registers" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10Ptx = Join-Path $tmpDir "ptx_emit_gb10.ptx"
   $gb10Cubin = Join-Path $tmpDir "ptx_emit_gb10.cubin"
   $emitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `

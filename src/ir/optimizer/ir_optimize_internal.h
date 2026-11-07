@@ -237,7 +237,8 @@ typedef struct {
   int width_bits;
 } IRAffineMapTerms;
 
-#define IR_SROA_MAX_SLOTS 16
+#define IR_SROA_MAX_SLOTS 64
+#define IR_SROA_HOST_SLOTS 16
 #define IR_SROA_MAX_GROUP 8
 
 typedef struct {
