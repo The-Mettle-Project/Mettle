@@ -1,0 +1,423 @@
+// The frame pipeline on small charts: composition of the line fixture, "No data",
+// snapping at scale 1 and 1.5, bars on the baseline, legend placement, the scene cache,
+// smoothing without overshoot, and zero allocations in steady live frames (scene and SVG).
+
+import "std/math";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/chart/series";
+import "mistplot/chart/frame";
+import "mistplot/render/svg";
+
+fn line_chart() -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var a: int32 = mp_chart_series(c, "api");
+  var b: int32 = mp_chart_series(c, "cache");
+  var i: int32 = 0;
+  while (i < 13) {
+    mp_chart_push(c, a, (float64)i, 10.0 + (float64)(i * 7 % 11));
+    mp_chart_push(c, b, (float64)i, 5.0 + (float64)(i * 3 % 7));
+    i = i + 1;
+  }
+  mp_chart_set_title(c, "Throughput");
+  mp_chart_set_x_label(c, "seconds");
+  return c;
+}
+
+fn count(s: MpScene*, kind: int32, cls: int32) -> int64 {
+  var n: int64 = 0;
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->kind == kind && (cls < 0 || nd->cls == cls)) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+fn has_text(s: MpScene*, want: string) -> bool {
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->kind == MP_NODE_TEXT && mp_scene_node_text(s, nd) == want) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn inside(s: MpScene*, w: float64, h: float64) -> bool {
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    var x0: float64 = nd->x;
+    var x1: float64 = nd->x + nd->w;
+    if (nd->kind == MP_NODE_TEXT) {
+      x0 = nd->x;
+      if (nd->align == MP_ALIGN_CENTER) { x0 = nd->x - nd->w * 0.5; }
+      if (nd->align == MP_ALIGN_END) { x0 = nd->x - nd->w; }
+      x1 = x0 + nd->w;
+    }
+    if (!(x0 >= -0.01 && x1 <= w + 0.01 && nd->y >= -0.01 && nd->y <= h + 0.01)) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn check_line() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = line_chart();
+  var t: MpTarget = mp_target(640.0, 400.0);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  mp_expect("scene", s != 0);
+  mp_expect_i64("one background", count(s, MP_NODE_RECT, MP_CLS_BG), 1);
+  mp_expect_i64("plot rect", count(s, MP_NODE_RECT, MP_CLS_PLOT), 1);
+  mp_expect_i64("two lines and two swatches", count(s, MP_NODE_POLY, -1), 4);
+  mp_expect("title", has_text(s, "Throughput"));
+  mp_expect("legend", has_text(s, "cache"));
+  mp_expect("x title", has_text(s, "seconds"));
+  mp_expect("inside", inside(s, 640.0, 400.0));
+  var info: MpChartInfo;
+  mp_chart_info(c, &info);
+  mp_expect("info valid", info.valid);
+  mp_expect("x domain", info.x0 == 0.0 && info.x1 == 12.0);
+  mp_expect("y from zero", info.y0 == 0.0 && info.y1 >= 20.0);
+  mp_expect("plot snapped", info.plot.x == floor(info.plot.x) && info.plot.y == floor(info.plot.y));
+  var g: int64 = 0;
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->kind == MP_NODE_LINE && nd->cls == MP_CLS_GRID) {
+      var y: float64 = mp_scene_node_pts(s, nd)[1];
+      if (y - floor(y) != 0.5) { g = g + 1; }
+    }
+    i = i + 1;
+  }
+  mp_expect_i64("grid on half pixels", g, 0);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_polyline_points() {
+  var c: MpChart* = line_chart();
+  var t: MpTarget = mp_target(320.0, 200.0);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  var n: int64 = 0;
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->kind == MP_NODE_POLY && nd->cls == MP_CLS_SERIES) { n = (int64)nd->pts_len; }
+    i = i + 1;
+  }
+  mp_expect_i64("series 0 has 13 points", n, 26);
+  mp_chart_free(c);
+}
+
+fn check_no_data() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_title(c, "Empty");
+  mp_chart_series(c, "a");
+  var t: MpTarget = mp_target(300.0, 200.0);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  mp_expect("no data text", has_text(s, "No data"));
+  mp_expect("title kept", has_text(s, "Empty"));
+  mp_expect_i64("no lines", count(s, MP_NODE_POLY, -1), 0);
+  var info: MpChartInfo;
+  mp_chart_info(c, &info);
+  mp_expect("info invalid", !info.valid);
+  var bad: MpTarget = mp_target(0.0, 10.0);
+  mp_expect("bad target", mp_chart_scene(c, &bad) == 0);
+  mp_expect_i64("recorded", (int64)mp_chart_error(c), (int64)MP_ERR_ARG);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_hidpi() {
+  var c: MpChart* = line_chart();
+  var t: MpTarget = mp_target_hidpi(640.0, 400.0, 1.5);
+  mp_chart_scene(c, &t);
+  var info: MpChartInfo;
+  mp_chart_info(c, &info);
+  var p: MpRect = info.plot;
+  var dx: float64 = p.x * 1.5 - floor(p.x * 1.5 + 0.5);
+  var dy: float64 = (p.y + p.h) * 1.5 - floor((p.y + p.h) * 1.5 + 0.5);
+  mp_expect("left edge on a device px", fabs(dx) < 1e-9);
+  mp_expect("bottom edge on a device px", fabs(dy) < 1e-9);
+  mp_expect("scale reported", info.scale == 1.5);
+  mp_chart_free(c);
+}
+
+fn check_bars() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_BAR);
+  var a: int32 = mp_chart_series(c, "a");
+  var b: int32 = mp_chart_series(c, "b");
+  mp_chart_set_value(c, a, "x", 3.0);
+  mp_chart_set_value(c, a, "y", 0.001);
+  mp_chart_set_value(c, b, "x", 5.0);
+  mp_chart_set_value(c, b, "y", 2.0);
+  var t: MpTarget = mp_target(400.0, 300.0);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  var info: MpChartInfo;
+  mp_chart_info(c, &info);
+  mp_expect_i64("bands", (int64)info.n_bands, 2);
+  mp_expect_i64("4 bars", count(s, MP_NODE_RECT, MP_CLS_SERIES) +
+                count(s, MP_NODE_RECT, MP_CLS_SERIES + 1), 4);
+  mp_expect("category label", has_text(s, "y"));
+  var bottom: float64 = info.plot.y + info.plot.h;
+  var ok: bool = true;
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->kind == MP_NODE_RECT && nd->cls >= MP_CLS_SERIES) {
+      if (nd->y + nd->h != bottom || !(nd->h >= 1.0)) { ok = false; }
+    }
+    i = i + 1;
+  }
+  mp_expect("bars stand on the baseline, at least 1 px", ok);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_legend() {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var a: int32 = mp_chart_series(c, "solo");
+  mp_chart_push(c, a, 0.0, 1.0);
+  mp_chart_push(c, a, 1.0, 2.0);
+  var t: MpTarget = mp_target(400.0, 300.0);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  mp_expect("auto: no legend for one series", !has_text(s, "solo"));
+  mp_chart_set_legend(c, MP_LEGEND_RIGHT);
+  s = mp_chart_scene(c, &t);
+  var info: MpChartInfo;
+  mp_chart_info(c, &info);
+  var right: bool = false;
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->kind == MP_NODE_TEXT && nd->cls == MP_CLS_LEGEND) {
+      right = nd->x > info.plot.x + info.plot.w;
+    }
+    i = i + 1;
+  }
+  mp_expect("right legend right of the plot", right);
+  mp_chart_set_legend(c, MP_LEGEND_BOTTOM);
+  s = mp_chart_scene(c, &t);
+  mp_chart_info(c, &info);
+  var below: bool = false;
+  i = 0;
+  while (i < mp_scene_count(s)) {
+    var nd2: MpNode* = mp_scene_node(s, i);
+    if (nd2->kind == MP_NODE_TEXT && nd2->cls == MP_CLS_LEGEND) {
+      below = nd2->y > info.plot.y + info.plot.h;
+    }
+    i = i + 1;
+  }
+  mp_expect("bottom legend below the plot", below);
+  mp_chart_free(c);
+}
+
+fn check_cache() {
+  var c: MpChart* = line_chart();
+  var t: MpTarget = mp_target(300.0, 200.0);
+  mp_chart_scene(c, &t);
+  mp_chart_scene(c, &t);
+  var st: MpChartStats;
+  mp_chart_stats(c, &st);
+  mp_expect_i64("cached", st.scene_builds, 1);
+  mp_chart_set_title(c, "Throughput");
+  mp_chart_scene(c, &t);
+  mp_chart_stats(c, &st);
+  mp_expect_i64("equal title keeps the cache", st.scene_builds, 1);
+  mp_chart_push(c, 0, 13.0, 3.0);
+  mp_chart_scene(c, &t);
+  var t2: MpTarget = mp_target(301.0, 200.0);
+  mp_chart_scene(c, &t2);
+  mp_chart_stats(c, &st);
+  mp_expect_i64("push and size rebuild", st.scene_builds, 3);
+  var out: MpBuf* = mp_buf_new(64);
+  var v1: string = mp_chart_svg_view(c, 300.0, 200.0);
+  var v2: string = mp_chart_svg_view(c, 300.0, 200.0);
+  mp_chart_stats(c, &st);
+  mp_expect_i64("svg view cached", st.svg_renders, 1);
+  mp_expect("same view", v1.chars == v2.chars && (int64)v1.length > 100);
+  mp_buf_free(out);
+  mp_chart_free(c);
+}
+
+// Every cubic stays inside its segment's y range (16 samples per segment).
+fn cubics_ok(s: MpScene*, nd: MpNode*) -> bool {
+  var p: float64* = mp_scene_node_pts(s, nd);
+  var cmd: uint8* = mp_scene_node_cmds(s, nd);
+  var k: int64 = 0;
+  var px: float64 = 0.0;
+  var py: float64 = 0.0;
+  var j: int64 = 0;
+  while (j < (int64)nd->cmd_len) {
+    var op: int32 = (int32)cmd[j];
+    if (op == MP_PATH_CUBIC) {
+      var y3: float64 = p[k + 5];
+      var lo: float64 = fmin(py, y3) - 1e-9;
+      var hi: float64 = fmax(py, y3) + 1e-9;
+      var q: int32 = 0;
+      while (q <= 16) {
+        var u: float64 = (float64)q / 16.0;
+        var v: float64 = 1.0 - u;
+        var y: float64 = v * v * v * py + 3.0 * v * v * u * p[k + 1] + 3.0 * v * u * u * p[k + 3] +
+                         u * u * u * y3;
+        if (y < lo || y > hi) { return false; }
+        q = q + 1;
+      }
+      px = p[k + 4];
+      py = y3;
+      k = k + 6;
+    } else if (op == MP_PATH_MOVE || op == MP_PATH_LINE) {
+      px = p[k];
+      py = p[k + 1];
+      k = k + 2;
+    }
+    j = j + 1;
+  }
+  return px == px;
+}
+
+fn check_smooth() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_AREA);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_series_set_smooth(c, s, true);
+  var ys: float64[8] = [1.0, 5.0, 2.0, 2.0, 8.0, 3.0, 9.0, 0.0];
+  var i: int32 = 0;
+  while (i < 8) {
+    mp_chart_push(c, s, (float64)i, ys[i]);
+    i = i + 1;
+  }
+  var t: MpTarget = mp_target(400.0, 240.0);
+  var sc: MpScene* = mp_chart_scene(c, &t);
+  mp_expect_i64("fill and stroke paths", count(sc, MP_NODE_PATH, MP_CLS_SERIES), 2);
+  var ok: bool = true;
+  var grad: bool = false;
+  var j: int64 = 0;
+  while (j < mp_scene_count(sc)) {
+    var nd: MpNode* = mp_scene_node(sc, j);
+    if (nd->kind == MP_NODE_PATH) {
+      if (!cubics_ok(sc, nd)) { ok = false; }
+      if ((nd->flags & MP_NF_GRADIENT) != 0) { grad = nd->fill.a == 71 && nd->fill2.a == 5; }
+    }
+    j = j + 1;
+  }
+  mp_expect("no overshoot", ok);
+  mp_expect("gradient 0.28 to 0.02", grad);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_steady_alloc() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_keep(c, 200);
+  mp_chart_window(c, 20.0);
+  var s: int32 = mp_chart_series(c, "a");
+  var out: MpBuf* = mp_buf_new(64);
+  var t: MpTarget = mp_target(200.0, 120.0);
+  var i: int32 = 0;
+  while (i < 300) {
+    mp_chart_push(c, s, (float64)i * 0.25, sin((float64)i * 0.1));
+    if (i % 100 == 99) { mp_chart_svg_target(c, &t, out); }
+    i = i + 1;
+  }
+  var a0: int64 = mp_alloc_count();
+  while (i < 305) {
+    mp_chart_push(c, s, (float64)i * 0.25, sin((float64)i * 0.1));
+    mp_chart_scene(c, &t);
+    mp_chart_svg_target(c, &t, out);
+    i = i + 1;
+  }
+  mp_expect_i64("steady frames allocate nothing", mp_alloc_count() - a0, 0);
+  mp_expect_i64("no error", (int64)mp_chart_error(c), (int64)MP_OK);
+  mp_buf_free(out);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn run_all() {
+  check_line();
+  check_polyline_points();
+  check_no_data();
+  check_hidpi();
+  check_bars();
+  check_legend();
+  check_cache();
+  check_smooth();
+  check_steady_alloc();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_line() -> int32 {
+  check_line();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_polyline_points() -> int32 {
+  check_polyline_points();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_no_data() -> int32 {
+  check_no_data();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_hidpi() -> int32 {
+  check_hidpi();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_bars() -> int32 {
+  check_bars();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_legend() -> int32 {
+  check_legend();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_cache() -> int32 {
+  check_cache();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_smooth() -> int32 {
+  check_smooth();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_steady_alloc() -> int32 {
+  check_steady_alloc();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

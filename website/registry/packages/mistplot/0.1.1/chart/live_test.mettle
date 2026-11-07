@@ -1,0 +1,361 @@
+// Live charts: window ranges (startup, sliding, single x), the lead point clipped onto the
+// window start, rings, the caller's time (continuous x domain, eased y domain), and the
+// summary path for large sorted series versus the O(n) fallback for unsorted ones. check_summary needs more than MP_SUMMARY_MIN_LEN samples,
+// which is over the interpreter's step budget, so it runs in the native builds only.
+
+import "std/math";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/chart/frame";
+
+fn frame(c: MpChart*, info: MpChartInfo*) {
+  var t: MpTarget = mp_target(200.0, 120.0);
+  mp_chart_scene(c, &t);
+  mp_chart_info(c, info);
+}
+
+fn check_window() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_window(c, 30.0);
+  var i: int32 = 0;
+  while (i <= 10) {
+    mp_chart_push(c, s, (float64)i, (float64)i);
+    i = i + 1;
+  }
+  var info: MpChartInfo;
+  frame(c, &info);
+  mp_expect("startup starts at the first sample", info.x0 == 0.0 && info.x1 == 10.0);
+  while (i <= 100) {
+    mp_chart_push(c, s, (float64)i, (float64)i);
+    i = i + 1;
+  }
+  frame(c, &info);
+  mp_expect("slides at the span", info.x0 == 70.0 && info.x1 == 100.0);
+  mp_chart_push(c, s, 100.5, 3.0);
+  frame(c, &info);
+  mp_expect("fractional slide", info.x0 == 70.5 && info.x1 == 100.5);
+  var d: MpSeriesData* = &c->series[(int64)s];
+  mp_expect("first view point on the window start", d->vx[0] == 70.5);
+  mp_expect("lead interpolated", fabs(d->vy[0] - 70.5) < 1e-9);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_single_x() {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_window(c, 5.0);
+  mp_chart_push(c, s, 7.0, 1.0);
+  mp_chart_push(c, s, 7.0, 2.0);
+  var info: MpChartInfo;
+  frame(c, &info);
+  mp_expect("one x opens the span", info.x0 == 7.0 && info.x1 == 12.0);
+  mp_chart_window(c, 0.0);
+  frame(c, &info);
+  mp_expect("no window widens a single x", info.x0 == 6.0 && info.x1 == 8.0);
+  mp_chart_free(c);
+}
+
+fn check_ring() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_AREA);
+  mp_chart_keep(c, 50);
+  var s: int32 = mp_chart_series(c, "a");
+  var i: int32 = 0;
+  while (i < 120) {
+    mp_chart_push(c, s, (float64)i, 1.0);
+    i = i + 1;
+  }
+  mp_expect_i64("ring keeps the newest", mp_chart_len(c, s), 50);
+  var info: MpChartInfo;
+  frame(c, &info);
+  mp_expect("domain is the retained data", info.x0 == 70.0 && info.x1 == 119.0);
+  mp_chart_clear(c);
+  frame(c, &info);
+  mp_expect("cleared chart has no data", !info.valid);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_summary() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  var i: int32 = 0;
+  while (i < 9000) {
+    mp_chart_push(c, s, (float64)i, (float64)(i % 17));
+    i = i + 1;
+  }
+  var info: MpChartInfo;
+  frame(c, &info);
+  var st: MpChartStats;
+  mp_chart_stats(c, &st);
+  mp_expect_i64("one rebuild", st.summary_rebuilds, 1);
+  mp_expect("reduced", c->series[0].vn <= 4 * 200 + 2);
+  mp_expect("extremes kept", info.y0 == 0.0 && info.y1 >= 16.0);
+  mp_chart_push(c, s, 9000.0, 5.0);
+  frame(c, &info);
+  mp_chart_stats(c, &st);
+  mp_expect_i64("pushes sync without a rebuild", st.summary_rebuilds, 1);
+  mp_chart_push(c, s, 10.0, 5.0);
+  frame(c, &info);
+  mp_chart_stats(c, &st);
+  mp_expect_i64("out of order falls back", st.summary_rebuilds, 1);
+  mp_expect("still drawn", info.valid && c->series[0].vn > 0);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+// x = 0 .. 40 at y, window 10.
+fn now_chart(y: float64) -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_window(c, 10.0);
+  var i: int32 = 0;
+  while (i <= 40) {
+    mp_chart_push(c, s, (float64)i, y);
+    i = i + 1;
+  }
+  return c;
+}
+
+fn has_text(s: MpScene*, want: string) -> bool {
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->kind == MP_NODE_TEXT && mp_scene_node_text(s, nd) == want) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn check_now_x() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_window(c, 10.0);
+  var i: int32 = 0;
+  while (i <= 20) {
+    mp_chart_push(c, s, (float64)i, (float64)i);
+    i = i + 1;
+  }
+  mp_expect("set_now ok", mp_chart_set_now(c, 15.25) == MP_OK);
+  var info: MpChartInfo;
+  frame(c, &info);
+  mp_expect("x domain is [now - span, now]", info.x0 == 5.25 && info.x1 == 15.25);
+  var d: MpSeriesData* = &c->series[(int64)s];
+  mp_expect("lead on the left edge", d->vx[0] == 5.25 && fabs(d->vy[0] - 5.25) < 1e-9);
+  mp_expect("cut at the right edge", d->vx[d->vn - 1] == 15.25 &&
+            fabs(d->vy[d->vn - 1] - 15.25) < 1e-9);
+  mp_chart_set_now(c, 15.5);
+  frame(c, &info);
+  mp_expect("scrolls between samples", info.x0 == 5.5 && info.x1 == 15.5);
+  mp_chart_set_now(c, 25.75);
+  frame(c, &info);
+  mp_expect("runs ahead of the newest sample", info.x0 == 15.75 && info.x1 == 25.75);
+  mp_expect("line ends at the newest sample", d->vx[d->vn - 1] == 20.0);
+  mp_chart_clear_now(c);
+  frame(c, &info);
+  mp_expect("clear_now follows the newest sample", info.x0 == 10.0 && info.x1 == 20.0);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_now_seq() {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var q: int64 = mp_chart_seq(c);
+  mp_chart_set_now(c, 1.0);
+  mp_expect_i64("new time bumps", mp_chart_seq(c), q + 1);
+  mp_chart_set_now(c, 1.0);
+  mp_expect_i64("same time does not", mp_chart_seq(c), q + 1);
+  mp_chart_set_now(c, 1.5);
+  mp_expect_i64("changed time bumps", mp_chart_seq(c), q + 2);
+  mp_expect("NaN rejected", mp_chart_set_now(c, NAN()) == MP_ERR_ARG);
+  mp_expect_i64("NaN changes nothing", mp_chart_seq(c), q + 2);
+  mp_chart_error_clear(c);
+  mp_chart_set_y_ease(c, true);
+  mp_expect_i64("ease already on", mp_chart_seq(c), q + 2);
+  mp_chart_clear_now(c);
+  mp_expect_i64("clear_now bumps", mp_chart_seq(c), q + 3);
+  mp_chart_clear_now(c);
+  mp_expect_i64("second clear_now does not", mp_chart_seq(c), q + 3);
+  mp_chart_free(c);
+}
+
+fn check_ease_rise_fall() {
+  var c: MpChart* = now_chart(10.0);
+  var info: MpChartInfo;
+  var t: float64 = 20.0;
+  mp_chart_set_now(c, t);
+  frame(c, &info);
+  mp_expect("first frame jumps to data + 15%", fabs(info.y1 - 11.5) < 1e-12 && info.y0 == 0.0);
+  var dt: float64 = 1.0 / 60.0;
+  mp_chart_set_at_x(c, 0, 15.0, 12.0);
+  t = t + dt;
+  mp_chart_set_now(c, t);
+  frame(c, &info);
+  var want: float64 = 11.5 + (13.8 - 11.5) * (1.0 - exp(0.0 - dt / 0.04));
+  mp_expect("rise uses tau 0.04", fabs(info.y1 - want) < 1e-9);
+  mp_expect("rise is fast", (info.y1 - 11.5) / (13.8 - 11.5) > 0.3);
+  mp_chart_set_at_x(c, 0, 15.0, 10.0);
+  var prev: float64 = info.y1;
+  t = t + dt;
+  mp_chart_set_now(c, t);
+  frame(c, &info);
+  want = prev + (11.5 - prev) * (1.0 - exp(0.0 - dt / 0.8));
+  mp_expect("fall uses tau 0.8", fabs(info.y1 - want) < 1e-9);
+  mp_expect("fall is slow", (prev - info.y1) / (prev - 11.5) < 0.03);
+  mp_chart_set_at_x(c, 0, 15.0, 50.0);
+  t = t + dt;
+  mp_chart_set_now(c, t);
+  frame(c, &info);
+  mp_expect("a spike is never cut off", info.y1 >= 50.0);
+  var t2: MpTarget = mp_target(90.0, 60.0);
+  var hold: float64 = info.y1;
+  mp_chart_scene(c, &t2);
+  mp_chart_info(c, &info);
+  mp_expect("a second target at the same time keeps the domain", info.y1 == hold);
+  t = t + 10.0;
+  mp_chart_set_now(c, t);
+  frame(c, &info);
+  mp_expect("a long gap jumps", fabs(info.y1 - 11.5) < 1e-12);
+  mp_chart_free(c);
+}
+
+// Falls from 34.5 towards 11.5 over one second in steps of 1/fps.
+fn fall_after(fps: int32) -> float64 {
+  var c: MpChart* = now_chart(10.0);
+  mp_chart_set_at_x(c, 0, 15.0, 30.0);
+  var info: MpChartInfo;
+  mp_chart_set_now(c, 20.0);
+  frame(c, &info);
+  mp_chart_set_at_x(c, 0, 15.0, 10.0);
+  var k: int32 = 1;
+  while (k <= fps) {
+    mp_chart_set_now(c, 20.0 + (float64)k / (float64)fps);
+    frame(c, &info);
+    k = k + 1;
+  }
+  mp_chart_free(c);
+  return info.y1;
+}
+
+fn check_ease_rate_free() {
+  var a: float64 = fall_after(60);
+  var b: float64 = fall_after(30);
+  var want: float64 = 11.5 + 23.0 * exp(0.0 - 1.0 / 0.8);
+  mp_expect("60 fps matches the closed form", fabs(a - want) < 1e-6);
+  mp_expect("30 fps matches 60 fps", fabs(a - b) < 1e-6);
+}
+
+fn check_ease_ticks() {
+  var c: MpChart* = now_chart(100.0);
+  mp_chart_set_now(c, 20.0);
+  var t: MpTarget = mp_target(200.0, 400.0);
+  var sc: MpScene* = mp_chart_scene(c, &t);
+  var info: MpChartInfo;
+  mp_chart_info(c, &info);
+  mp_expect("domain not widened to a tick", fabs(info.y1 - 115.0) < 1e-9);
+  mp_expect("tick inside", has_text(sc, "100"));
+  mp_expect("no tick outside", !has_text(sc, "120"));
+  var out: int64 = 0;
+  var i: int64 = 0;
+  while (i < mp_scene_count(sc)) {
+    var nd: MpNode* = mp_scene_node(sc, i);
+    if (nd->kind == MP_NODE_LINE && nd->cls == MP_CLS_GRID) {
+      var y: float64 = mp_scene_node_pts(sc, nd)[1];
+      if (y < info.plot.y - 1.0 || y > info.plot.y + info.plot.h + 1.0) { out = out + 1; }
+    }
+    i = i + 1;
+  }
+  mp_expect_i64("grid inside the plot", out, 0);
+  mp_chart_set_y_ease(c, false);
+  frame(c, &info);
+  mp_expect("ease off: nice domain", info.y0 == 0.0 && info.y1 == 100.0);
+  mp_chart_set_y_ease(c, true);
+  mp_chart_set_y_range(c, 0.0, 400.0);
+  frame(c, &info);
+  mp_expect("fixed range wins", info.y0 == 0.0 && info.y1 == 400.0);
+  mp_chart_set_y_auto(c);
+  mp_chart_set_y_zero(c, false);
+  mp_chart_set_at_x(c, 0, 15.0, 120.0);
+  frame(c, &info);
+  mp_expect("no zero: headroom both sides", fabs(info.y0 - 97.0) < 1e-9 &&
+            fabs(info.y1 - 123.0) < 1e-9);
+  mp_chart_clear_now(c);
+  frame(c, &info);
+  mp_expect("clear_now: plain auto domain again", info.y0 == 99.0 && info.y1 == 101.0 &&
+            info.x1 == 40.0);
+  mp_chart_free(c);
+}
+
+fn check_now_determinism() {
+  var a: MpChart* = now_chart(5.0);
+  var b: MpChart* = now_chart(5.0);
+  var ia: MpChartInfo;
+  var ib: MpChartInfo;
+  var k: int32 = 0;
+  while (k < 8) {
+    var t: float64 = 20.0 + (float64)k * 0.07;
+    mp_chart_set_at_x(a, 0, 18.0, (float64)(k * 3));
+    mp_chart_set_at_x(b, 0, 18.0, (float64)(k * 3));
+    mp_chart_set_now(a, t);
+    mp_chart_set_now(b, t);
+    frame(a, &ia);
+    frame(b, &ib);
+    k = k + 1;
+  }
+  mp_expect("same calls, same frame", ia.x0 == ib.x0 && ia.x1 == ib.x1 && ia.y0 == ib.y0 &&
+            ia.y1 == ib.y1 && mp_scene_count(a->scene) == mp_scene_count(b->scene));
+  mp_chart_free(a);
+  mp_chart_free(b);
+}
+
+fn check_now() {
+  check_now_x();
+  check_now_seq();
+  check_ease_rise_fall();
+  check_ease_rate_free();
+  check_ease_ticks();
+  check_now_determinism();
+}
+
+fn run_all() {
+  check_window();
+  check_single_x();
+  check_ring();
+  check_now();
+  check_summary();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_window() -> int32 {
+  check_window();
+  check_single_x();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_now() -> int32 {
+  check_now();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_ring() -> int32 {
+  check_ring();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

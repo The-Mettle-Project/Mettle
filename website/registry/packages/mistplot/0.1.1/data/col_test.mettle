@@ -1,0 +1,581 @@
+// data/col_test: MpCol growth, ring overwrite, keep changes, sorted tracking,
+// lower_bound, non-finite samples and the size guards. The ring is also fuzzed against a
+// plain array model.
+
+import "std/math";
+import "std/io";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/data/col";
+
+var g_rng: uint64 = 88172645463325252;
+var g_big: bool = true;
+
+fn rnd() -> uint64 {
+  var x: uint64 = g_rng;
+  x = x ^ (x << 13);
+  x = x ^ (x >> 7);
+  x = x ^ (x << 17);
+  g_rng = x;
+  return x;
+}
+
+fn rnd_int(n: int64) -> int64 {
+  return (int64)(rnd() % (uint64)n);
+}
+
+fn fin(v: float64) -> bool {
+  return is_finite(v) != 0;
+}
+
+fn rc(r: int32) -> int64 {
+  return (int64)r;
+}
+
+// True when column slot i holds (x, y); NaN matches NaN.
+fn same(a: float64, b: float64) -> bool {
+  if (a != a) { return b != b; }
+  return a == b;
+}
+
+// The column holds exactly x = first, first + 1, ... with y = 10 x.
+fn holds_run(c: MpCol*, first: int64, n: int64) -> bool {
+  if (mp_col_len(c) != n) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    if (mp_col_x(c, i) != (float64)(first + i)) { return false; }
+    if (mp_col_y(c, i) != (float64)(first + i) * 10.0) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn push_run(c: MpCol*, from: int64, to: int64) {
+  var i: int64 = from;
+  while (i < to) {
+    mp_col_push(c, (float64)i, (float64)i * 10.0);
+    i = i + 1;
+  }
+}
+
+fn check_init() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_expect_i64("init: empty", mp_col_len(&c), 0);
+  mp_expect("init: sorted", mp_col_sorted(&c));
+  mp_expect("init: x of nothing is NaN", mp_col_x(&c, 0) != mp_col_x(&c, 0));
+  mp_expect("init: no storage", c.xs == 0 && c.ys == 0 && c.cap == 0);
+  mp_expect_i64("init: unbounded", c.keep, 0);
+  mp_expect_i64("init: lower_bound of nothing", mp_col_lower_bound(&c, 1.0), 0);
+  mp_expect_i64("init: live", mp_alloc_live(), 0);
+
+  mp_expect_i64("null: len", mp_col_len(0), 0);
+  mp_expect("null: x is NaN", !fin(mp_col_x(0, 0)));
+  mp_expect("null: y is NaN", !fin(mp_col_y(0, 0)));
+  mp_expect("null: sorted", mp_col_sorted(0));
+  mp_expect_i64("null: lower_bound", mp_col_lower_bound(0, 1.0), 0);
+  mp_expect_i64("null: push", rc(mp_col_push(0, 1.0, 1.0)), (int64)MP_ERR_ARG);
+  mp_expect_i64("null: set", rc(mp_col_set(0, 0, 1.0, 1.0)), (int64)MP_ERR_ARG);
+  mp_expect_i64("null: set_keep", rc(mp_col_set_keep(0, 4)), (int64)MP_ERR_ARG);
+  mp_col_clear(0);
+  mp_col_free(0);
+  mp_col_init(0);
+  mp_expect("null: calls survive", true);
+}
+
+fn check_grow() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_expect_i64("grow: push", rc(mp_col_push(&c, 0.0, 0.0)), (int64)MP_OK);
+  mp_expect("grow: storage arrives with the first push", c.xs != 0 && c.cap >= 1);
+  push_run(&c, 1, 1000);
+  mp_expect("grow: keeps every sample", holds_run(&c, 0, 1000));
+  mp_expect("grow: cap covers n", c.cap >= 1000);
+  mp_expect("grow: geometric, not per push", c.cap < 2000);
+  mp_expect_i64("grow: pushes", c.pushes, 1000);
+  mp_expect_i64("grow: gen untouched by pushes", c.gen, 0);
+  mp_expect("grow: sorted", mp_col_sorted(&c));
+  mp_expect("grow: out of range index is NaN", !fin(mp_col_x(&c, 1000)));
+  mp_expect("grow: negative index is NaN", !fin(mp_col_y(&c, -1)));
+
+  // many pushes cost far fewer allocations than pushes (two arrays per growth)
+  var a0: int64 = mp_alloc_count();
+  push_run(&c, 1000, 5000);
+  mp_expect("grow: allocations are logarithmic", mp_alloc_count() - a0 <= 12);
+  mp_expect("grow: still intact", holds_run(&c, 0, 5000));
+  mp_col_free(&c);
+  mp_expect_i64("grow: free", mp_alloc_live(), 0);
+  mp_expect_i64("grow: free resets", mp_col_len(&c), 0);
+  mp_expect("grow: free resets storage", c.xs == 0 && c.cap == 0);
+  mp_col_free(&c);
+  mp_expect_i64("grow: double free is harmless", mp_alloc_live(), 0);
+  mp_expect_i64("grow: reusable after free", rc(mp_col_push(&c, 1.0, 2.0)), (int64)MP_OK);
+  mp_col_free(&c);
+}
+
+fn check_keep() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_expect_i64("keep: set", rc(mp_col_set_keep(&c, 5)), (int64)MP_OK);
+  mp_expect_i64("keep: gen bumped", c.gen, 1);
+  mp_expect_i64("keep: same value is a no-op", rc(mp_col_set_keep(&c, 5)), (int64)MP_OK);
+  mp_expect_i64("keep: gen unchanged by a no-op", c.gen, 1);
+  push_run(&c, 0, 3);
+  mp_expect("keep: below keep behaves like grow", holds_run(&c, 0, 3));
+  push_run(&c, 3, 5);
+  mp_expect("keep: exactly full", holds_run(&c, 0, 5));
+  var a0: int64 = mp_alloc_count();
+  push_run(&c, 5, 12);
+  mp_expect("keep: overwrites the oldest", holds_run(&c, 7, 5));
+  mp_expect_i64("keep: a full ring does not allocate", mp_alloc_count() - a0, 0);
+  push_run(&c, 12, 1000);
+  mp_expect("keep: many wraps", holds_run(&c, 995, 5));
+  mp_expect_i64("keep: pushes counts every push", c.pushes, 1000);
+  mp_expect_i64("keep: storage stays at keep", c.cap, 5);
+  mp_expect_i64("keep: gen untouched by pushes", c.gen, 1);
+  mp_expect_i64("keep: lower_bound on a wrapped ring", mp_col_lower_bound(&c, 997.0), 2);
+  mp_expect_i64("keep: lower_bound past the end", mp_col_lower_bound(&c, 1000.0), 5);
+  mp_col_free(&c);
+
+  // keep = 1
+  mp_col_init(&c);
+  mp_col_set_keep(&c, 1);
+  push_run(&c, 0, 4);
+  mp_expect("keep 1: newest only", holds_run(&c, 3, 1));
+  mp_col_free(&c);
+  mp_expect_i64("keep: live", mp_alloc_live(), 0);
+}
+
+fn check_set_keep() {
+  var c: MpCol;
+  mp_col_init(&c);
+  push_run(&c, 0, 20);
+  mp_expect_i64("set_keep: shrink", rc(mp_col_set_keep(&c, 8)), (int64)MP_OK);
+  mp_expect("set_keep: shrinking keeps the newest", holds_run(&c, 12, 8));
+  mp_expect_i64("set_keep: storage shrinks with it", c.cap, 8);
+  mp_expect_i64("set_keep: nothing allocated beyond one pair", mp_alloc_live(), 2);
+  push_run(&c, 20, 23);
+  mp_expect("set_keep: ring continues", holds_run(&c, 15, 8));
+
+  // shrink a ring that has wrapped
+  mp_expect_i64("set_keep: shrink wrapped", rc(mp_col_set_keep(&c, 3)), (int64)MP_OK);
+  mp_expect("set_keep: wrapped shrink keeps the newest", holds_run(&c, 20, 3));
+  push_run(&c, 23, 24);
+  mp_expect("set_keep: and keeps rolling", holds_run(&c, 21, 3));
+
+  // grow the ring: contents survive, then the extra room fills before overwriting
+  mp_expect_i64("set_keep: grow", rc(mp_col_set_keep(&c, 6)), (int64)MP_OK);
+  mp_expect("set_keep: growing drops nothing", holds_run(&c, 21, 3));
+  push_run(&c, 24, 27);
+  mp_expect("set_keep: grown ring fills", holds_run(&c, 21, 6));
+  push_run(&c, 27, 28);
+  mp_expect("set_keep: grown ring then overwrites", holds_run(&c, 22, 6));
+
+  // unbounded again: nothing dropped, then it grows past the old keep
+  mp_expect_i64("set_keep: unbounded", rc(mp_col_set_keep(&c, 0)), (int64)MP_OK);
+  mp_expect("set_keep: unbounded drops nothing", holds_run(&c, 22, 6));
+  push_run(&c, 28, 60);
+  mp_expect("set_keep: unbounded grows", holds_run(&c, 22, 38));
+
+  // shrink to a keep equal to the length keeps everything
+  mp_col_set_keep(&c, 38);
+  mp_expect("set_keep: equal keep", holds_run(&c, 22, 38));
+  mp_col_set_keep(&c, 1);
+  mp_expect("set_keep: down to one", holds_run(&c, 59, 1));
+
+  mp_expect_i64("set_keep: negative", rc(mp_col_set_keep(&c, -1)), (int64)MP_ERR_ARG);
+  mp_expect("set_keep: negative changed nothing", holds_run(&c, 59, 1) && c.keep == 1);
+  mp_col_free(&c);
+  mp_expect_i64("set_keep: live", mp_alloc_live(), 0);
+}
+
+fn check_sorted() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_push(&c, 3.0, 0.0);
+  mp_expect("sorted: equal x keeps it", mp_col_sorted(&c));
+  mp_col_push(&c, 2.5, 0.0);
+  mp_expect("sorted: out of order push clears it", !mp_col_sorted(&c));
+  mp_col_push(&c, 10.0, 0.0);
+  mp_col_push(&c, 11.0, 0.0);
+  mp_expect("sorted: later in-order pushes do not restore it", !mp_col_sorted(&c));
+  mp_col_set_keep(&c, 3);
+  mp_expect("sorted: set_keep does not restore it", !mp_col_sorted(&c));
+  mp_col_clear(&c);
+  mp_expect("sorted: clear restores it", mp_col_sorted(&c));
+  mp_expect_i64("sorted: clear empties", mp_col_len(&c), 0);
+  mp_expect_i64("sorted: clear keeps keep", c.keep, 3);
+  mp_col_push(&c, 5.0, 0.0);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_expect("sorted: the first push after clear sets no order", !mp_col_sorted(&c));
+  mp_col_clear(&c);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, 0.5, 0.0);
+  mp_expect("sorted: has_last is reset by clear", !mp_col_sorted(&c));
+  mp_col_clear(&c);
+  mp_col_push(&c, 100.0, 0.0);
+  mp_col_clear(&c);
+  mp_col_push(&c, -100.0, 0.0);
+  mp_expect("sorted: last_x is forgotten by clear", mp_col_sorted(&c));
+
+  // eviction does not change the flag, even when the out-of-order sample is gone
+  mp_col_clear(&c);
+  mp_col_push(&c, 3.0, 0.0);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_push(&c, 4.0, 0.0);
+  mp_col_push(&c, 5.0, 0.0);
+  mp_expect("sorted: stays cleared after the culprit is evicted", !mp_col_sorted(&c));
+
+  // mp_col_set
+  mp_col_free(&c);
+  mp_col_init(&c);
+  push_run(&c, 0, 5);
+  mp_col_set(&c, 2, 2.5, 0.0);
+  mp_expect("set: within its neighbours", mp_col_sorted(&c));
+  mp_col_set(&c, 2, 3.0, 0.0);
+  mp_expect("set: equal to a neighbour", mp_col_sorted(&c));
+  mp_col_set(&c, 0, -7.0, 0.0);
+  mp_expect("set: smaller first", mp_col_sorted(&c));
+  mp_col_set(&c, 4, 40.0, 0.0);
+  mp_expect("set: larger last", mp_col_sorted(&c));
+  mp_col_push(&c, 39.0, 0.0);
+  mp_expect("set: last_x follows a set of the newest", !mp_col_sorted(&c));
+  mp_col_clear(&c);
+  push_run(&c, 0, 5);
+  mp_col_set(&c, 2, 3.5, 0.0);
+  mp_expect("set: above the next neighbour", !mp_col_sorted(&c));
+  mp_col_clear(&c);
+  push_run(&c, 0, 5);
+  mp_col_set(&c, 2, 0.5, 0.0);
+  mp_expect("set: below the previous neighbour", !mp_col_sorted(&c));
+
+  // across non-finite neighbours
+  mp_col_clear(&c);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_push(&c, 3.0, 0.0);
+  mp_col_set(&c, 1, 2.0, 0.0);
+  mp_expect("set: fills a gap in order", mp_col_sorted(&c));
+  mp_col_set(&c, 1, NAN(), 0.0);
+  mp_col_set(&c, 1, 5.0, 0.0);
+  mp_expect("set: skips the gap to find the next finite x", !mp_col_sorted(&c));
+  mp_col_clear(&c);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_set(&c, 1, NAN(), 0.0);
+  mp_expect("set: a non-finite x never clears it", mp_col_sorted(&c));
+
+  // the newest finite x moves even when non-finite samples follow it
+  mp_col_clear(&c);
+  mp_col_push(&c, 20.0, 0.0);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_set(&c, 0, 46.0, 0.0);
+  mp_col_push(&c, 23.0, 0.0);
+  mp_expect("set: last_x follows the newest finite sample", !mp_col_sorted(&c));
+  mp_col_clear(&c);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_set(&c, 1, NAN(), 0.0);
+
+  var g: int64 = c.gen;
+  mp_col_set(&c, 0, 1.0, 5.0);
+  mp_expect_i64("set: bumps gen", c.gen, g + 1);
+  mp_expect_i64("set: out of range", rc(mp_col_set(&c, 2, 0.0, 0.0)), (int64)MP_ERR_ARG);
+  mp_expect_i64("set: negative index", rc(mp_col_set(&c, -1, 0.0, 0.0)), (int64)MP_ERR_ARG);
+  mp_expect_i64("set: a failed set leaves gen", c.gen, g + 1);
+  mp_expect_near("set: writes y", mp_col_y(&c, 0), 5.0, 0.0);
+  mp_col_free(&c);
+  mp_expect_i64("sorted: live", mp_alloc_live(), 0);
+}
+
+fn check_lower_bound() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_push(&c, 5.0, 0.0);
+  mp_expect_i64("lb: before all", mp_col_lower_bound(&c, 0.0), 0);
+  mp_expect_i64("lb: exact first", mp_col_lower_bound(&c, 1.0), 0);
+  mp_expect_i64("lb: first of duplicates", mp_col_lower_bound(&c, 2.0), 1);
+  mp_expect_i64("lb: between", mp_col_lower_bound(&c, 2.5), 4);
+  mp_expect_i64("lb: exact last", mp_col_lower_bound(&c, 5.0), 4);
+  mp_expect_i64("lb: after all", mp_col_lower_bound(&c, 5.5), 5);
+  mp_expect_i64("lb: NaN gives len", mp_col_lower_bound(&c, NAN()), 5);
+  mp_expect_i64("lb: -inf", mp_col_lower_bound(&c, -INF()), 0);
+  mp_expect_i64("lb: +inf", mp_col_lower_bound(&c, INF()), 5);
+
+  // non-finite samples are skipped
+  mp_col_clear(&c);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_push(&c, 2.0, 0.0);
+  mp_col_push(&c, INF(), 0.0);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_push(&c, 3.0, 0.0);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_expect("lb nan: still sorted", mp_col_sorted(&c));
+  mp_expect_i64("lb nan: leading NaNs", mp_col_lower_bound(&c, 0.0), 2);
+  mp_expect_i64("lb nan: exact", mp_col_lower_bound(&c, 1.0), 2);
+  mp_expect_i64("lb nan: lands on a finite sample", mp_col_lower_bound(&c, 1.5), 4);
+  mp_expect_i64("lb nan: through an infinite one", mp_col_lower_bound(&c, 2.5), 8);
+  mp_expect_i64("lb nan: past the last finite", mp_col_lower_bound(&c, 3.5), 10);
+
+  // unsorted: first sample in column order that qualifies
+  mp_col_clear(&c);
+  mp_col_push(&c, 5.0, 0.0);
+  mp_col_push(&c, 1.0, 0.0);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_push(&c, 3.0, 0.0);
+  mp_expect("lb unsorted: flagged", !mp_col_sorted(&c));
+  mp_expect_i64("lb unsorted: first qualifying", mp_col_lower_bound(&c, 2.0), 0);
+  mp_expect_i64("lb unsorted: later one", mp_col_lower_bound(&c, 5.5), 4);
+  mp_expect_i64("lb unsorted: NaN", mp_col_lower_bound(&c, NAN()), 4);
+  mp_col_free(&c);
+}
+
+// Random sorted rings (with gaps and wraps) against a linear scan.
+fn check_lower_bound_fuzz() {
+  var c: MpCol;
+  var bad: int64 = 0;
+  var round: int32 = 0;
+  var total: int32 = 200;
+  if (!g_big) { total = 15; }
+  while (round < total) {
+    mp_col_init(&c);
+    var keep: int64 = 0;
+    if (rnd_int(2) == 0) { keep = 1 + rnd_int(40); }
+    mp_col_set_keep(&c, keep);
+    var n: int64 = rnd_int(120);
+    var x: float64 = 0.0;
+    var i: int64 = 0;
+    while (i < n) {
+      x = x + (float64)rnd_int(3);
+      var v: float64 = x;
+      if (rnd_int(6) == 0) { v = NAN(); }
+      if (rnd_int(40) == 0) { v = INF(); }
+      mp_col_push(&c, v, 0.0);
+      i = i + 1;
+    }
+    if (!mp_col_sorted(&c)) { bad = bad + 1; }
+    var q: int32 = 0;
+    while (q < 20) {
+      var t: float64 = (float64)rnd_int(2 * n + 4) * 0.5 - 1.0;
+      var want: int64 = mp_col_len(&c);
+      var k: int64 = 0;
+      while (k < mp_col_len(&c)) {
+        var kx: float64 = mp_col_x(&c, k);
+        if (fin(kx) && kx >= t) {
+          want = k;
+          break;
+        }
+        k = k + 1;
+      }
+      if (mp_col_lower_bound(&c, t) != want) { bad = bad + 1; }
+      q = q + 1;
+    }
+    mp_col_free(&c);
+    round = round + 1;
+  }
+  mp_expect_i64("lb fuzz: matches a linear scan", bad, 0);
+}
+
+fn check_nonfinite() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_col_push(&c, NAN(), 1.0);
+  mp_col_push(&c, 4.0, NAN());
+  mp_col_push(&c, INF(), 2.0);
+  mp_col_push(&c, 5.0, -INF());
+  mp_expect_i64("nonfinite: all stored", mp_col_len(&c), 4);
+  mp_expect("nonfinite: NaN x read back", !fin(mp_col_x(&c, 0)));
+  mp_expect_near("nonfinite: y beside a NaN x", mp_col_y(&c, 0), 1.0, 0.0);
+  mp_expect_near("nonfinite: x beside a NaN y", mp_col_x(&c, 1), 4.0, 0.0);
+  mp_expect("nonfinite: NaN y read back", mp_col_y(&c, 1) != mp_col_y(&c, 1));
+  mp_expect("nonfinite: inf x read back", mp_col_x(&c, 2) == INF());
+  mp_expect("nonfinite: -inf y read back", mp_col_y(&c, 3) == -INF());
+  mp_expect("nonfinite: never mark it unsorted", mp_col_sorted(&c));
+  mp_expect_near("nonfinite: last_x ignores them", c.last_x, 5.0, 0.0);
+  mp_col_push(&c, 4.5, 0.0);
+  mp_expect("nonfinite: order is judged on finite x only", !mp_col_sorted(&c));
+  mp_expect_i64("nonfinite: pushes", c.pushes, 5);
+
+  // a column that only ever saw non-finite x
+  mp_col_clear(&c);
+  mp_col_push(&c, NAN(), 0.0);
+  mp_col_push(&c, INF(), 0.0);
+  mp_col_push(&c, -INF(), 0.0);
+  mp_expect("nonfinite only: sorted", mp_col_sorted(&c));
+  mp_expect("nonfinite only: has_last unset", !c.has_last);
+  mp_expect_i64("nonfinite only: lower_bound", mp_col_lower_bound(&c, 0.0), 3);
+  mp_col_free(&c);
+}
+
+fn check_limits() {
+  var c: MpCol;
+  mp_col_init(&c);
+  mp_expect_i64("limit: keep above the maximum",
+                rc(mp_col_set_keep(&c, MP_MAX_COUNT + 1)), (int64)MP_ERR_LIMIT);
+  mp_expect_i64("limit: refused keep changes nothing", c.keep, 0);
+  mp_expect_i64("limit: refused keep leaves gen", c.gen, 0);
+  mp_expect_i64("limit: huge keep",
+                rc(mp_col_set_keep(&c, 9223372036854775807)), (int64)MP_ERR_LIMIT);
+  mp_expect_i64("limit: the maximum itself", rc(mp_col_set_keep(&c, MP_MAX_COUNT)),
+                (int64)MP_OK);
+  mp_expect_i64("limit: and allocates nothing", mp_alloc_live(), 0);
+  mp_expect_i64("limit: first push still small", rc(mp_col_push(&c, 1.0, 1.0)),
+                (int64)MP_OK);
+  mp_expect("limit: storage is not sized by keep", c.cap < 1000);
+  mp_col_free(&c);
+
+  // A column that already holds MP_MAX_COUNT samples is faked by its counters; the
+  // guard fires before any storage is touched.
+  mp_col_init(&c);
+  c.n = MP_MAX_COUNT;
+  c.cap = MP_MAX_COUNT;
+  var r: int32 = mp_col_push(&c, 1.0, 1.0);
+  mp_expect_i64("limit: push on a full unbounded column", rc(r), (int64)MP_ERR_LIMIT);
+  mp_expect_i64("limit: n unchanged", c.n, MP_MAX_COUNT);
+  mp_expect_i64("limit: pushes unchanged", c.pushes, 0);
+  mp_expect("limit: no state change", c.sorted && !c.has_last);
+  mp_expect_i64("limit: nothing allocated", mp_alloc_live(), 0);
+  mp_col_init(&c);
+  mp_expect_i64("limit: live", mp_alloc_live(), 0);
+}
+
+// Random pushes, keep changes, sets and clears against a plain array model.
+fn check_model_fuzz() {
+  var mx: float64[64];
+  var my: float64[64];
+  var c: MpCol;
+  var bad: int64 = 0;
+  var sorted_bad: int64 = 0;
+  var round: int32 = 0;
+  var total: int32 = 100;
+  if (!g_big) { total = 6; }
+  while (round < total) {
+    mp_col_init(&c);
+    var keep: int64 = 0;
+    var n: int64 = 0;
+    var want_sorted: bool = true;
+    var op: int32 = 0;
+    while (op < 400) {
+      var r: int64 = rnd_int(100);
+      if (r < 70) {
+        var x: float64 = (float64)rnd_int(50);
+        var y: float64 = (float64)rnd_int(1000);
+        if (rnd_int(10) == 0) { x = NAN(); }
+        if (n == 64 && keep == 0) {
+          // the model is full: stop growing
+          keep = 64;
+          mp_col_set_keep(&c, keep);
+        }
+        if (keep > 0 && n == keep) {
+          var j: int64 = 1;
+          while (j < n) {
+            mx[j - 1] = mx[j];
+            my[j - 1] = my[j];
+            j = j + 1;
+          }
+          n = n - 1;
+        }
+        mx[n] = x;
+        my[n] = y;
+        n = n + 1;
+        mp_col_push(&c, x, y);
+      } else if (r < 80) {
+        var nk: int64 = rnd_int(40);
+        if (nk > 0 && nk < n) {
+          var drop: int64 = n - nk;
+          var j: int64 = 0;
+          while (j < nk) {
+            mx[j] = mx[j + drop];
+            my[j] = my[j + drop];
+            j = j + 1;
+          }
+          n = nk;
+        }
+        keep = nk;
+        mp_col_set_keep(&c, nk);
+      } else if (r < 90) {
+        if (n > 0) {
+          var i: int64 = rnd_int(n);
+          var x: float64 = (float64)rnd_int(50);
+          mx[i] = x;
+          my[i] = -1.0;
+          mp_col_set(&c, i, x, -1.0);
+        }
+      } else if (r < 92) {
+        n = 0;
+        want_sorted = true;
+        mp_col_clear(&c);
+      } else {
+        // read-only probe
+        if (mp_col_len(&c) != n) { bad = bad + 1; }
+      }
+      // a model-derived sorted flag may only be stricter than the column's:
+      // when the surviving finite x really are unsorted the column must say so
+      var fx: float64 = -1.0;
+      var truly: bool = true;
+      var t: int64 = 0;
+      while (t < n) {
+        if (fin(mx[t])) {
+          if (mx[t] < fx) { truly = false; }
+          fx = mx[t];
+        }
+        t = t + 1;
+      }
+      if (!truly && mp_col_sorted(&c)) { sorted_bad = sorted_bad + 1; }
+      if (mp_col_len(&c) != n) { bad = bad + 1; }
+      var k: int64 = 0;
+      while (k < n) {
+        if (!same(mp_col_x(&c, k), mx[k]) || !same(mp_col_y(&c, k), my[k])) {
+          bad = bad + 1;
+        }
+        k = k + 1;
+      }
+      op = op + 1;
+    }
+    if (want_sorted && !mp_col_sorted(&c) && n == 0) { sorted_bad = sorted_bad + 1; }
+    mp_col_free(&c);
+    round = round + 1;
+  }
+  mp_expect_i64("model fuzz: contents match", bad, 0);
+  mp_expect_i64("model fuzz: unsorted data is never reported sorted", sorted_bad, 0);
+}
+
+fn run_all(big: bool) {
+  g_big = big;
+  var live0: int64 = mp_alloc_live();
+  check_init();
+  check_grow();
+  check_keep();
+  check_set_keep();
+  check_sorted();
+  check_lower_bound();
+  check_lower_bound_fuzz();
+  check_nonfinite();
+  check_limits();
+  check_model_fuzz();
+  mp_expect_i64("everything freed", mp_alloc_live(), live0);
+}
+
+export fn main() -> int32 {
+  run_all(true);
+  return mp_summary();
+}
+
+@test fn t_col() -> int32 {
+  run_all(false);
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

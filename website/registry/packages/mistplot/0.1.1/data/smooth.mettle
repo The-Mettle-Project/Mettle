@@ -1,0 +1,70 @@
+//! Monotone cubic tangents (Steffen's method, as in d3's curveMonotoneX) for smoothing a
+//! polyline without overshoot: each Hermite segment between two points stays within the
+//! y range of those points. Uses core/error; pure arithmetic, no allocation. Callers
+//! split their points into runs of strictly increasing finite x before calling.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+
+fn smooth_sign(v: float64) -> float64 {
+  if (v > 0.0) { return 1.0; }
+  if (v < 0.0) { return -1.0; }
+  return 0.0;
+}
+
+// Steffen's interior tangent from the secants and widths on either side.
+fn smooth_mid(s0: float64, s1: float64, h0: float64, h1: float64) -> float64 {
+  var p: float64 = (s0 * h1 + s1 * h0) / (h0 + h1);
+  var a: float64 = fabs(s0);
+  var b: float64 = fabs(s1);
+  var c: float64 = 0.5 * fabs(p);
+  var m: float64 = a;
+  if (b < m) { m = b; }
+  if (c < m) { m = c; }
+  return (smooth_sign(s0) + smooth_sign(s1)) * m;
+}
+
+/// Computes the tangent dy/dx at every point of a run for monotone cubic smoothing.
+/// Interior tangents follow Steffen; each end uses its one-sided secant. The cubic for
+/// segment i then has control points (x_i + h/3, y_i + m_i h/3) and
+/// (x_i+1 - h/3, y_i+1 - m_i+1 h/3), where h = x_i+1 - x_i.
+///
+/// @param xs Point x. Units: px or data units. Valid: n finite values, strictly increasing.
+/// @param ys Point y. Units: same space as the tangents wanted. Valid: n finite values.
+/// @param n Point count. Valid: >= 0; 1 point gets tangent 0.
+/// @param out Receives n tangents. Valid: room for n values; may not alias xs or ys.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG a pointer is 0 (with n > 0), n < 0, or the points are not finite with
+///   strictly increasing x; out is not written.
+/// @mem Writes only out[0 .. n); nothing is retained.
+/// @cost O(n); no allocation.
+export fn mp_smooth_slopes(xs: float64*, ys: float64*, n: int64, out: float64*) -> int32 {
+  if (n < 0) { return MP_ERR_ARG; }
+  if (n == 0) { return MP_OK; }
+  if (xs == 0 || ys == 0 || out == 0) { return MP_ERR_ARG; }
+  var i: int64 = 0;
+  while (i < n) {
+    if (is_finite(xs[i]) == 0 || is_finite(ys[i]) == 0) { return MP_ERR_ARG; }
+    if (i > 0 && !(xs[i] > xs[i - 1])) { return MP_ERR_ARG; }
+    i = i + 1;
+  }
+  if (n == 1) {
+    out[0] = 0.0;
+    return MP_OK;
+  }
+  var h0: float64 = xs[1] - xs[0];
+  var s0: float64 = (ys[1] - ys[0]) / h0;
+  out[0] = s0;
+  i = 1;
+  while (i < n - 1) {
+    var h1: float64 = xs[i + 1] - xs[i];
+    var s1: float64 = (ys[i + 1] - ys[i]) / h1;
+    out[i] = smooth_mid(s0, s1, h0, h1);
+    h0 = h1;
+    s0 = s1;
+    i = i + 1;
+  }
+  out[n - 1] = s0;
+  return MP_OK;
+}

@@ -1,0 +1,290 @@
+//! HTML output: a chart as a <figure> fragment, and the live embed (a div plus one small
+//! script) that keeps a chart's SVG current by polling an endpoint, or by fetching only
+//! when a Phoenix channel announces a new frame tag. The scripts are constants: caller
+//! values only ever appear as HTML-escaped attributes, never inside JavaScript. Uses
+//! core/buf, chart/chart and render/svg.
+
+import "mistplot/core/error";
+import "mistplot/core/buf";
+import "mistplot/chart/chart";
+import "mistplot/render/svg";
+
+/// Largest poll interval mp_html_live accepts (one hour). Units: ms.
+export const MP_LIVE_MAX_INTERVAL_MS: int32 = 3600000;
+
+// The polling script, one line per entry. A literal `{{` is one `{` in Mettle.
+const HTML_POLL_LINES: int32 = 32;
+const HTML_POLL: string[32] = [
+  "<script>",
+  "(function () {{",
+  "  var el = document.currentScript.previousElementSibling;",
+  "  var src = el.getAttribute(\"data-src\");",
+  "  var base = parseInt(el.getAttribute(\"data-interval\"), 10) || 1000;",
+  "  base = Math.max(1, Math.min(base, 3600000));",
+  "  var wait = base;",
+  "  var tag = null;",
+  "  function tick() {{",
+  "    if (!el.isConnected) {{ return; }",
+  "    var h = {{};",
+  "    if (tag !== null) {{ h[\"If-None-Match\"] = tag; }",
+  "    fetch(src, {{ headers: h, cache: \"no-store\" }).then(function (r) {{",
+  "      if (r.status === 304) {{ return null; }",
+  "      if (!r.ok) {{ throw new Error(\"HTTP \" + r.status); }",
+  "      var et = r.headers.get(\"ETag\");",
+  "      return r.text().then(function (t) {{ return {{ t: t, et: et }; });",
+  "    }).then(function (res) {{",
+  "      if (res !== null) {{",
+  "        el.innerHTML = res.t;",
+  "        tag = res.et;",
+  "      }",
+  "      wait = base;",
+  "    }).catch(function () {{",
+  "      wait = Math.max(base, Math.min(wait * 2, base * 32, 60000));",
+  "    }).then(function () {{",
+  "      if (el.isConnected) {{ setTimeout(tick, wait); }",
+  "    });",
+  "  }",
+  "  tick();",
+  "})();",
+  "</script>"
+];
+
+// The channel script: polls only while the socket is down, fetches on announced tags.
+const HTML_WS_LINES: int32 = 118;
+const HTML_WS: string[118] = [
+  "<script>",
+  "(function () {{",
+  "  var el = document.currentScript.previousElementSibling;",
+  "  var src = el.getAttribute(\"data-src\");",
+  "  var base = parseInt(el.getAttribute(\"data-interval\"), 10) || 1000;",
+  "  base = Math.max(1, Math.min(base, 3600000));",
+  "  var topic = el.getAttribute(\"data-topic\");",
+  "  var wsu = new URL(el.getAttribute(\"data-ws\"), location.href);",
+  "  wsu.protocol = wsu.protocol.replace(/^http/, \"ws\");",
+  "  wsu.searchParams.set(\"vsn\", \"2.0.0\");",
+  "  var wait = base, tag = null, busy = false, again = null, live = false;",
+  "  var timer = null, ws = null, hb = null, rt = null;",
+  "  var rwait = 1000, ref = 0, jref = null;",
+  "  function stop() {{",
+  "    clearTimeout(timer);",
+  "    clearTimeout(rt);",
+  "    clearInterval(hb);",
+  "    var s = ws;",
+  "    ws = null;",
+  "    live = false;",
+  "    if (s !== null) {{ s.close(); }",
+  "  }",
+  "  function arm(ms) {{",
+  "    clearTimeout(timer);",
+  "    timer = setTimeout(function () {{ timer = null; kick(); }, ms);",
+  "  }",
+  "  function stale(t) {{",
+  "    return typeof t === \"string\" && '\"' + t + '\"' !== tag;",
+  "  }",
+  "  function want(t) {{",
+  "    if (!stale(t)) {{ return; }",
+  "    if (busy) {{ again = t; } else {{ kick(); }",
+  "  }",
+  "  function kick() {{",
+  "    if (!el.isConnected) {{ stop(); return; }",
+  "    if (busy) {{ return; }",
+  "    busy = true;",
+  "    again = null;",
+  "    var ok = true;",
+  "    var h = {{};",
+  "    if (tag !== null) {{ h[\"If-None-Match\"] = tag; }",
+  "    fetch(src, {{ headers: h, cache: \"no-store\" }).then(function (r) {{",
+  "      if (r.status === 304) {{ return null; }",
+  "      if (!r.ok) {{ throw new Error(\"HTTP \" + r.status); }",
+  "      var et = r.headers.get(\"ETag\");",
+  "      return r.text().then(function (t) {{ return {{ t: t, et: et }; });",
+  "    }).then(function (res) {{",
+  "      if (res !== null) {{",
+  "        el.innerHTML = res.t;",
+  "        tag = res.et;",
+  "      }",
+  "      wait = base;",
+  "    }).catch(function () {{",
+  "      ok = false;",
+  "      wait = Math.max(base, Math.min(wait * 2, base * 32, 60000));",
+  "    }).then(function () {{",
+  "      busy = false;",
+  "      if (!el.isConnected) {{ stop(); return; }",
+  "      if (!ok || !live) {{ arm(wait); return; }",
+  "      if (again !== null) {{ want(again); }",
+  "    });",
+  "  }",
+  "  function retry() {{",
+  "    rt = setTimeout(connect, rwait);",
+  "    rwait = Math.min(rwait * 2, 30000);",
+  "  }",
+  "  function down(s) {{",
+  "    if (ws !== s) {{ return; }",
+  "    ws = null;",
+  "    live = false;",
+  "    clearInterval(hb);",
+  "    s.close();",
+  "    if (!el.isConnected) {{ stop(); return; }",
+  "    if (!busy && timer === null) {{ arm(wait); }",
+  "    retry();",
+  "  }",
+  "  function send(s, m) {{ s.send(JSON.stringify(m)); }",
+  "  function connect() {{",
+  "    rt = null;",
+  "    if (!el.isConnected) {{ stop(); return; }",
+  "    var s;",
+  "    try {{ s = new WebSocket(wsu.href); } catch (e) {{ retry(); return; }",
+  "    ws = s;",
+  "    s.onopen = function () {{",
+  "      if (ws !== s) {{ return; }",
+  "      jref = String(++ref);",
+  "      send(s, [jref, jref, topic, \"phx_join\", {{}]);",
+  "      hb = setInterval(function () {{",
+  "        if (!el.isConnected) {{ stop(); return; }",
+  "        send(s, [null, String(++ref), \"phoenix\", \"heartbeat\", {{}]);",
+  "      }, 30000);",
+  "    };",
+  "    s.onmessage = function (e) {{",
+  "      if (ws !== s) {{ return; }",
+  "      if (!el.isConnected) {{ stop(); return; }",
+  "      var m = JSON.parse(e.data);",
+  "      if (m[2] !== topic) {{ return; }",
+  "      var p = m[4] || {{};",
+  "      if (m[3] === \"phx_reply\" && m[1] === jref) {{",
+  "        if (p.status !== \"ok\") {{ down(s); return; }",
+  "        live = true;",
+  "        rwait = 1000;",
+  "        clearTimeout(timer);",
+  "        timer = null;",
+  "        want((p.response || {{}).tag);",
+  "      } else if (m[3] === \"frame\" && live) {{",
+  "        want(p.tag);",
+  "      } else if (m[3] === \"phx_error\" || m[3] === \"phx_close\") {{",
+  "        down(s);",
+  "      }",
+  "    };",
+  "    s.onclose = function () {{ down(s); };",
+  "    s.onerror = function () {{ down(s); };",
+  "  }",
+  "  kick();",
+  "  connect();",
+  "})();",
+  "</script>"
+];
+
+fn html_line(ws: bool, i: int32) -> string {
+  if (ws) { return HTML_WS[i]; }
+  return HTML_POLL[i];
+}
+
+fn html_script(out: MpBuf*, ws: bool) -> int32 {
+  var n: int32 = HTML_POLL_LINES;
+  if (ws) { n = HTML_WS_LINES; }
+  var rc: int32 = MP_OK;
+  var i: int32 = 0;
+  while (i < n && rc == MP_OK) {
+    rc = mp_buf_puts(out, html_line(ws, i));
+    if (rc == MP_OK) { rc = mp_buf_putc(out, 10); }
+    i = i + 1;
+  }
+  return rc;
+}
+
+// Each line of s prefixed with two spaces; the final newline opens no extra line.
+fn html_indent(out: MpBuf*, s: string) -> int32 {
+  var n: int64 = (int64)s.length;
+  var rc: int32 = mp_buf_puts(out, "  ");
+  var i: int64 = 0;
+  while (i < n && rc == MP_OK) {
+    var ch: uint8 = s.chars[i];
+    rc = mp_buf_putc(out, (int32)ch);
+    if (rc == MP_OK && ch == 10 && i + 1 < n) { rc = mp_buf_puts(out, "  "); }
+    i = i + 1;
+  }
+  return rc;
+}
+
+/// Renders a chart as an HTML fragment: <figure class="mp-figure"> holding the SVG (indented
+/// two spaces) and no figcaption, since the title is in the SVG and its aria-label.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param w Width. Units: px. Valid: finite, in (0, 1e9).
+/// @param h Height. Units: px. Valid: finite, in (0, 1e9).
+/// @param out Receives the fragment. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code (also recorded as the chart's sticky error).
+/// @error MP_ERR_ARG c or out is 0, or the size is out of range; out is empty.
+/// @error MP_ERR_ALLOC the frame, the SVG cache or out could not grow; out is empty or
+///   partial.
+/// @mem out belongs to the caller. The SVG goes through the chart's own cache.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_html(c: MpChart*, w: float64, h: float64, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = mp_svg_cached(c, w, h);
+  if (rc == MP_OK) { rc = mp_buf_puts(out, "<figure class=\"mp-figure\">\n"); }
+  if (rc == MP_OK) { rc = html_indent(out, mp_buf_str(c->svg)); }
+  if (rc == MP_OK) { rc = mp_buf_puts(out, "</figure>\n"); }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+fn html_attr(out: MpBuf*, name: string, v: string) -> int32 {
+  var rc: int32 = mp_buf_puts(out, name);
+  if (rc == MP_OK) { rc = mp_buf_put_esc(out, v); }
+  if (rc == MP_OK) { rc = mp_buf_putc(out, 34); }
+  return rc;
+}
+
+fn html_div(url: string, interval_ms: int32, ws_url: string, topic: string,
+            initial_svg: string, out: MpBuf*) -> int32 {
+  var rc: int32 = html_attr(out, "<div class=\"mp-live\" data-src=\"", url);
+  if (rc == MP_OK) { rc = mp_buf_puts(out, " data-interval=\""); }
+  if (rc == MP_OK) { rc = mp_buf_put_i64(out, (int64)interval_ms); }
+  if (rc == MP_OK) { rc = mp_buf_putc(out, 34); }
+  if (rc == MP_OK && (int64)ws_url.length > 0) {
+    rc = html_attr(out, " data-ws=\"", ws_url);
+    if (rc == MP_OK) { rc = html_attr(out, " data-topic=\"", topic); }
+  }
+  if (rc == MP_OK) { rc = mp_buf_putc(out, 62); }
+  if (rc == MP_OK) { rc = mp_buf_puts(out, initial_svg); }
+  if (rc == MP_OK) { rc = mp_buf_puts(out, "</div>\n"); }
+  return rc;
+}
+
+/// Writes a live embed: <div class="mp-live" data-src=URL data-interval=N> holding
+/// initial_svg, then a script that fetches url with If-None-Match and swaps the div's
+/// content on 200. With ws_url empty it polls every interval_ms (doubling the delay on
+/// errors, at most 32 intervals or 60 s); otherwise it joins topic on the Phoenix socket at
+/// ws_url and fetches only when a "frame" tag differs from the ETag on screen, polling
+/// while the socket is down. Both stop once the div leaves the document.
+///
+/// @param url Endpoint returning the chart's SVG with an ETag (e.g. mp_raize_svg). Valid:
+///   non-empty; HTML-escaped into an attribute.
+/// @param interval_ms Poll interval. Units: ms. Valid: 1 .. MP_LIVE_MAX_INTERVAL_MS.
+/// @param ws_url Socket URL, relative to the page or absolute. Valid: any; "" selects the
+///   polling script.
+/// @param topic Channel topic. Valid: non-empty when ws_url is set; ignored otherwise.
+/// @param initial_svg First frame, inserted raw so the chart paints before the first fetch.
+///   Valid: MistPlot SVG output or "", never untrusted markup.
+/// @param out Receives the HTML. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG out is 0, url is empty, interval_ms is out of range, or ws_url is set
+///   with an empty topic; out is empty.
+/// @error MP_ERR_ALLOC out could not grow; out is partial.
+/// @mem out belongs to the caller; nothing is retained.
+/// @thread Safe from any thread (with distinct outputs).
+export fn mp_html_live(url: string, interval_ms: int32, ws_url: string, topic: string,
+                       initial_svg: string, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if ((int64)url.length == 0) { return MP_ERR_ARG; }
+  if (interval_ms <= 0 || interval_ms > MP_LIVE_MAX_INTERVAL_MS) { return MP_ERR_ARG; }
+  var ws: bool = (int64)ws_url.length > 0;
+  if (ws && (int64)topic.length == 0) { return MP_ERR_ARG; }
+  var rc: int32 = html_div(url, interval_ms, ws_url, topic, initial_svg, out);
+  if (rc == MP_OK) { rc = html_script(out, ws); }
+  return rc;
+}

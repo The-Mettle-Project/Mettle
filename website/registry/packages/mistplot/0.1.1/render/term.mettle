@@ -1,0 +1,1156 @@
+//! Draws a scene into a grid of terminal cells and writes it as UTF-8 text, with ANSI SGR
+//! colour unless MP_TERM_PLAIN is set. Depends on core (error, mem, buf, color, target,
+//! str), scene/scene, scene/path and std/math. The grid is cols x rows cells of
+//! t->cell_w x t->cell_h px (mp_target_cells gives 8 x 16); a scene px (x, y) lies in cell
+//! (floor(x / cell_w), floor(y / cell_h)). Cells are layered: text beats marks (dots, bars,
+//! half-blocks, ASCII strokes), marks beat the axis rule, the axis rule beats grid rules,
+//! and grid rules are drawn only into empty cells. Area fills, stroke-only rects and dash
+//! patterns are not drawn (dashed lines come out solid). Output is a pure function of the
+//! scene, the target and the mode; each row ends with a newline and trailing blank cells
+//! are trimmed. mp_chart_term lays a chart out on the cell grid (chart/frame) first.
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/str";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/scene/path";
+import "mistplot/chart/chart";
+import "mistplot/chart/frame";
+
+/// Terminal mode: MP_TERM_BLOCKS when the scene is mostly bars (its series-class rects
+/// outnumber its other series-class non-text nodes), otherwise MP_TERM_BRAILLE.
+export const MP_TERM_AUTO: int32 = 0;
+/// Terminal mode: lines, paths, markers and bars as Braille dots, 2 x 4 per cell.
+export const MP_TERM_BRAILLE: int32 = 1;
+/// Terminal mode: bars in eighths of a cell, lines and markers as half-blocks.
+export const MP_TERM_BLOCKS: int32 = 2;
+/// Terminal mode: ASCII strokes (- | / \ +), @ or o markers, bars as background colour.
+export const MP_TERM_ASCII: int32 = 3;
+/// Mode flag: no escape sequences at all (no colour, no MP_TERM_HOME framing).
+export const MP_TERM_PLAIN: int32 = 16;
+/// Mode flag: ESC[H before the first row and ESC[K at the end of every row, for redrawing
+/// in place. Ignored with MP_TERM_PLAIN.
+export const MP_TERM_HOME: int32 = 32;
+/// Mode flag: the chart has a theme, so text, ticks and grid use the scene's colours and
+/// background (MP_CLS_BG, MP_CLS_PLOT) rects are painted. Without it text uses the
+/// terminal's own foreground, ticks and grid are dim and no background is painted.
+export const MP_TERM_THEME: int32 = 64;
+/// Most columns mp_term_scene accepts.
+export const MP_TERM_MAX_COLS: int32 = 1000;
+/// Most rows mp_term_scene accepts.
+export const MP_TERM_MAX_ROWS: int32 = 500;
+/// Bytes per cell of the grid that mp_term_scene_grid draws into.
+export const MP_TERM_CELL_BYTES: int64 = 32;
+
+const TERM_MODE_BITS: int32 = 15;
+const TERM_FLAG_BITS: int32 = 112;
+
+// Cell layers, lowest first.
+const TERM_EMPTY: int32 = 0;
+const TERM_GRID: int32 = 1;
+const TERM_AXIS: int32 = 2;
+const TERM_MARK: int32 = 3;
+const TERM_TEXT: int32 = 4;
+
+// Foreground kinds: the terminal's own, SGR 2 dim, or 24-bit colour.
+const TERM_INK_DEFAULT: int32 = 0;
+const TERM_INK_DIM: int32 = 1;
+const TERM_INK_RGB: int32 = 2;
+
+const TERM_CP_HRULE: int32 = 0x2500;
+const TERM_CP_VRULE: int32 = 0x2502;
+const TERM_CP_UPPER: int32 = 0x2580;
+const TERM_CP_LOWER: int32 = 0x2584;
+const TERM_CP_FULL: int32 = 0x2588;
+const TERM_CP_TOP8: int32 = 0x2594;
+const TERM_CP_BRAILLE: int32 = 0x2800;
+
+struct TermCell {
+  level: int32;   // TERM_EMPTY .. TERM_TEXT
+  cp: int32;      // glyph of rule, bar, ASCII and text cells
+  mask: int32;    // Braille dots, or half-block bits (1 top, 2 bottom)
+  ink: int32;     // TERM_INK_*
+  fg: MpColor;
+  bg: MpColor;    // alpha 0 = the terminal's background
+  top: MpColor;   // upper half colour (BLOCKS)
+  bot: MpColor;   // lower half colour (BLOCKS)
+}
+
+struct TermGrid {
+  cells: TermCell*;
+  cols: int32;
+  rows: int32;
+  cw: float64;
+  ch: float64;
+  mode: int32;    // MP_TERM_BRAILLE, BLOCKS or ASCII
+  sx: int32;      // raster units per cell across
+  sy: int32;      // raster units per cell down
+  plain: bool;
+  home: bool;
+  themed: bool;
+}
+
+struct TermPen {
+  ink: int32;
+  fg: MpColor;
+  bg: MpColor;
+}
+
+struct TermOut {
+  b: MpBuf*;
+  rc: int32;
+}
+
+fn term_finite(v: float64) -> bool {
+  return v - v == 0.0;
+}
+
+fn term_cell(g: TermGrid*, col: int64, row: int64) -> TermCell* {
+  if (col < 0 || row < 0 || col >= (int64)g->cols || row >= (int64)g->rows) { return 0; }
+  return &g->cells[row * (int64)g->cols + col];
+}
+
+fn term_put(c: TermCell*, level: int32, cp: int32, ink: int32, fg: MpColor) {
+  if (c == 0) { return; }
+  c->level = level;
+  c->cp = cp;
+  c->mask = 0;
+  c->ink = ink;
+  c->fg = fg;
+}
+
+// Ink of text, tick and grid nodes: theme colours when themed, else the terminal's own.
+fn term_ui_ink(g: TermGrid*, cls: int32) -> int32 {
+  if (g->themed || cls >= MP_CLS_SERIES) { return TERM_INK_RGB; }
+  if (cls == MP_CLS_TICK || cls == MP_CLS_GRID) { return TERM_INK_DIM; }
+  return TERM_INK_DEFAULT;
+}
+
+// Raster units (Braille dots, half cells or cells) whose centres lie in [lo, hi]; when
+// none does, the unit holding the midpoint. False when the range misses 0 .. n-1.
+fn term_span(lo: float64, hi: float64, unit: float64, n: int32, r: int64*) -> bool {
+  var a: float64 = ceil(lo / unit - 0.5);
+  var b: float64 = floor(hi / unit - 0.5);
+  if (a > b) {
+    a = floor((lo + hi) * 0.5 / unit);
+    b = a;
+  }
+  if (a < 0.0) { a = 0.0; }
+  if (b > (float64)(n - 1)) { b = (float64)(n - 1); }
+  if (a > b) { return false; }
+  r[0] = (int64)a;
+  r[1] = (int64)b;
+  return true;
+}
+
+// Shifts and masks instead of / and %: dx and dy are known non-negative here, and this is
+// the innermost loop of every Braille frame.
+fn term_dot(g: TermGrid*, dx: int64, dy: int64, fg: MpColor) {
+  if (dx < 0 || dy < 0) { return; }
+  var col: int64 = dx >> 1;
+  var row: int64 = dy >> 2;
+  if (col >= (int64)g->cols || row >= (int64)g->rows) { return; }
+  var c: TermCell* = &g->cells[row * (int64)g->cols + col];
+  var level: int32 = c->level;
+  if (level == TERM_TEXT) { return; }
+  var lx: int32 = (int32)(dx & 1);
+  var ly: int32 = (int32)(dy & 3);
+  var bit: int32 = 0x40 << lx;
+  if (ly < 3) { bit = 1 << (ly + 3 * lx); }
+  if (level != TERM_MARK) {
+    c->mask = bit;
+  } else {
+    c->mask = c->mask | bit;
+  }
+  c->level = TERM_MARK;
+  c->ink = TERM_INK_RGB;
+  c->fg = fg;
+}
+
+fn term_half(g: TermGrid*, hx: int64, hy: int64, fg: MpColor) {
+  if (hx < 0 || hy < 0) { return; }
+  var c: TermCell* = term_cell(g, hx, hy / 2);
+  if (c == 0 || c->level == TERM_TEXT) { return; }
+  if (c->level != TERM_MARK) { c->mask = 0; }
+  if (hy % 2 == 0) {
+    c->mask = c->mask | 1;
+    c->top = fg;
+  } else {
+    c->mask = c->mask | 2;
+    c->bot = fg;
+  }
+  c->level = TERM_MARK;
+  c->cp = 0;
+  c->ink = TERM_INK_RGB;
+  c->fg = fg;
+}
+
+// One raster unit of a mark: a Braille dot or a half cell.
+fn term_fine(g: TermGrid*, ux: int64, uy: int64, fg: MpColor) {
+  if (g->mode == MP_TERM_BRAILLE) {
+    term_dot(g, ux, uy, fg);
+  } else {
+    term_half(g, ux, uy, fg);
+  }
+}
+
+// ORs Braille dot bits into the cell at (col, row), as that many term_dot calls would.
+fn term_dots(g: TermGrid*, col: int64, row: int64, bits: int32, fg: MpColor) {
+  if (bits == 0 || col < 0 || row < 0) { return; }
+  if (col >= (int64)g->cols || row >= (int64)g->rows) { return; }
+  var c: TermCell* = &g->cells[row * (int64)g->cols + col];
+  if (c->level == TERM_TEXT) { return; }
+  if (c->level != TERM_MARK) {
+    c->mask = bits;
+  } else {
+    c->mask = c->mask | bits;
+  }
+  c->level = TERM_MARK;
+  c->ink = TERM_INK_RGB;
+  c->fg = fg;
+}
+
+// Braille bits of dot column lx (0 or 1), dot rows a .. b (0 .. 3) of one cell.
+fn term_col_bits(lx: int32, a: int64, b: int64) -> int32 {
+  var bits: int32 = 0;
+  if (a <= 2) {
+    var top: int32 = (int32)b;
+    if (top > 2) { top = 2; }
+    bits = ((2 << top) - (1 << (int32)a)) << (3 * lx);
+  }
+  if (b == 3) { bits = bits | (0x40 << lx); }
+  return bits;
+}
+
+// A vertical run of dots at dot column x from y0 to y1, one cell at a time in the order
+// Bresenham visits them. Most segments of a dense line stay inside one dot column.
+fn term_braille_vrun(g: TermGrid*, x: int64, y0: int64, y1: int64, fg: MpColor) {
+  var lo: int64 = y0;
+  var hi: int64 = y1;
+  var step: int64 = 1;
+  if (y0 > y1) {
+    lo = y1;
+    hi = y0;
+    step = -1;
+  }
+  var lx: int32 = (int32)(x & 1);
+  var row: int64 = y0 >> 2;
+  var last: int64 = y1 >> 2;
+  while (true) {
+    var a: int64 = row * 4;
+    var b: int64 = a + 3;
+    if (a < lo) { a = lo; }
+    if (b > hi) { b = hi; }
+    term_dots(g, x >> 1, row, term_col_bits(lx, a - row * 4, b - row * 4), fg);
+    if (row == last) { return; }
+    row = row + step;
+  }
+}
+
+// Bresenham in Braille dots. Consecutive dots in one cell are gathered and written once;
+// the result equals one term_dot per dot.
+fn term_braille_line(g: TermGrid*, x0: int64, y0: int64, x1: int64, y1: int64,
+                     fg: MpColor) {
+  if (x0 == x1) {
+    term_braille_vrun(g, x0, y0, y1, fg);
+    return;
+  }
+  var dx: int64 = x1 - x0;
+  if (dx < 0) { dx = 0 - dx; }
+  var dy: int64 = y1 - y0;
+  if (dy > 0) { dy = 0 - dy; }
+  var sx: int64 = 1;
+  if (x0 > x1) { sx = -1; }
+  var sy: int64 = 1;
+  if (y0 > y1) { sy = -1; }
+  var err: int64 = dx + dy;
+  var x: int64 = x0;
+  var y: int64 = y0;
+  var cc: int64 = x >> 1;
+  var cr: int64 = y >> 2;
+  var acc: int32 = 0;
+  while (true) {
+    var col: int64 = x >> 1;
+    var row: int64 = y >> 2;
+    if (col != cc || row != cr) {
+      term_dots(g, cc, cr, acc, fg);
+      cc = col;
+      cr = row;
+      acc = 0;
+    }
+    var lx: int32 = (int32)(x & 1);
+    var ly: int32 = (int32)(y & 3);
+    if (ly < 3) { acc = acc | (1 << (ly + 3 * lx)); } else { acc = acc | (0x40 << lx); }
+    if (x == x1 && y == y1) { break; }
+    var e2: int64 = 2 * err;
+    if (e2 >= dy) {
+      err = err + dy;
+      x = x + sx;
+    }
+    if (e2 <= dx) {
+      err = err + dx;
+      y = y + sy;
+    }
+  }
+  term_dots(g, cc, cr, acc, fg);
+}
+
+fn term_line_fine(g: TermGrid*, x0: int64, y0: int64, x1: int64, y1: int64, fg: MpColor) {
+  if (g->mode == MP_TERM_BRAILLE) {
+    term_braille_line(g, x0, y0, x1, y1, fg);
+    return;
+  }
+  var dx: int64 = x1 - x0;
+  if (dx < 0) { dx = 0 - dx; }
+  var dy: int64 = y1 - y0;
+  if (dy > 0) { dy = 0 - dy; }
+  var sx: int64 = 1;
+  if (x0 > x1) { sx = -1; }
+  var sy: int64 = 1;
+  if (y0 > y1) { sy = -1; }
+  var err: int64 = dx + dy;
+  var x: int64 = x0;
+  var y: int64 = y0;
+  while (true) {
+    term_half(g, x, y, fg);
+    if (x == x1 && y == y1) { return; }
+    var e2: int64 = 2 * err;
+    if (e2 >= dy) {
+      err = err + dy;
+      x = x + sx;
+    }
+    if (e2 <= dx) {
+      err = err + dx;
+      y = y + sy;
+    }
+  }
+}
+
+// A stroke glyph in ASCII mode: a cell that already holds another glyph becomes `+`.
+fn term_ascii_plot(g: TermGrid*, col: int64, row: int64, cp: int32, ink: int32,
+                   fg: MpColor) {
+  var c: TermCell* = term_cell(g, col, row);
+  if (c == 0 || c->level == TERM_TEXT) { return; }
+  var glyph: int32 = cp;
+  if (c->level == TERM_MARK && c->cp != cp) { glyph = 43; }
+  term_put(c, TERM_MARK, glyph, ink, fg);
+}
+
+// The glyph of a step: - horizontal, | vertical, \ when x and y move the same way, /
+// otherwise.
+fn term_ascii_dir(mx: bool, my: bool, sx: int64, sy: int64) -> int32 {
+  if (mx && my) {
+    if ((sx > 0) == (sy > 0)) { return 92; }
+    return 47;
+  }
+  if (my) { return 124; }
+  return 45;
+}
+
+// Bresenham in cells; a cell's glyph is the direction of the step leaving it and the last
+// cell keeps the incoming one.
+fn term_ascii_seg(g: TermGrid*, x0: int64, y0: int64, x1: int64, y1: int64, ink: int32,
+                  fg: MpColor) {
+  var dx: int64 = x1 - x0;
+  if (dx < 0) { dx = 0 - dx; }
+  var dy: int64 = y1 - y0;
+  if (dy > 0) { dy = 0 - dy; }
+  var sx: int64 = 1;
+  if (x0 > x1) { sx = -1; }
+  var sy: int64 = 1;
+  if (y0 > y1) { sy = -1; }
+  var err: int64 = dx + dy;
+  var cp: int32 = 45;
+  var x: int64 = x0;
+  var y: int64 = y0;
+  while (x != x1 || y != y1) {
+    var e2: int64 = 2 * err;
+    var mx: bool = e2 >= dy;
+    var my: bool = e2 <= dx;
+    cp = term_ascii_dir(mx, my, sx, sy);
+    term_ascii_plot(g, x, y, cp, ink, fg);
+    if (mx) {
+      err = err + dy;
+      x = x + sx;
+    }
+    if (my) {
+      err = err + dx;
+      y = y + sy;
+    }
+  }
+  term_ascii_plot(g, x, y, cp, ink, fg);
+}
+
+// One Liang-Barsky edge test on t = [t0, t1]; false when the segment misses.
+fn term_clip_edge(p: float64, q: float64, t: float64*) -> bool {
+  if (p == 0.0) { return q >= 0.0; }
+  var r: float64 = q / p;
+  if (p < 0.0) {
+    if (r > t[1]) { return false; }
+    if (r > t[0]) { t[0] = r; }
+  } else {
+    if (r < t[0]) { return false; }
+    if (r < t[1]) { t[1] = r; }
+  }
+  return true;
+}
+
+fn term_in_box(x: float64, y: float64, w: float64, h: float64) -> bool {
+  return x >= -1.0 && x <= w + 1.0 && y >= -1.0 && y <= h + 1.0;
+}
+
+// Clips p = (x0, y0, x1, y1) to [-1, w + 1] x [-1, h + 1] so rasterizing stays bounded.
+fn term_clip(p: float64*, w: float64, h: float64) -> bool {
+  var t: float64[2];
+  t[0] = 0.0;
+  t[1] = 1.0;
+  var dx: float64 = p[2] - p[0];
+  var dy: float64 = p[3] - p[1];
+  if (term_in_box(p[0], p[1], w, h) && term_in_box(p[2], p[3], w, h)) {
+    // Every edge test keeps t = [0, 1]; the end is still recomputed as x0 + 1 * dx below.
+    p[2] = p[0] + dx;
+    p[3] = p[1] + dy;
+    return true;
+  }
+  if (!term_clip_edge(0.0 - dx, p[0] + 1.0, &t[0])) { return false; }
+  if (!term_clip_edge(dx, w + 1.0 - p[0], &t[0])) { return false; }
+  if (!term_clip_edge(0.0 - dy, p[1] + 1.0, &t[0])) { return false; }
+  if (!term_clip_edge(dy, h + 1.0 - p[1], &t[0])) { return false; }
+  var x0: float64 = p[0];
+  var y0: float64 = p[1];
+  p[0] = x0 + t[0] * dx;
+  p[1] = y0 + t[0] * dy;
+  p[2] = x0 + t[1] * dx;
+  p[3] = y0 + t[1] * dy;
+  return true;
+}
+
+// A segment in scene px, drawn in the grid's raster units.
+fn term_seg(g: TermGrid*, x0: float64, y0: float64, x1: float64, y1: float64, ink: int32,
+            fg: MpColor) {
+  if (!term_finite(x0) || !term_finite(y0) || !term_finite(x1) || !term_finite(y1)) {
+    return;
+  }
+  var ux: float64 = g->cw / (float64)g->sx;
+  var uy: float64 = g->ch / (float64)g->sy;
+  var p: float64[4];
+  p[0] = x0 / ux;
+  p[1] = y0 / uy;
+  p[2] = x1 / ux;
+  p[3] = y1 / uy;
+  var w: float64 = (float64)(g->cols * g->sx);
+  var h: float64 = (float64)(g->rows * g->sy);
+  if (!term_clip(&p[0], w, h)) { return; }
+  var ix0: int64 = floor_i64(p[0]);
+  var iy0: int64 = floor_i64(p[1]);
+  var ix1: int64 = floor_i64(p[2]);
+  var iy1: int64 = floor_i64(p[3]);
+  if (g->mode == MP_TERM_ASCII) {
+    term_ascii_seg(g, ix0, iy0, ix1, iy1, ink, fg);
+  } else {
+    term_line_fine(g, ix0, iy0, ix1, iy1, fg);
+  }
+}
+
+// A line, polyline or stroked path, flattened at half a raster unit.
+fn term_stroke(g: TermGrid*, s: MpScene*, nd: MpNode*, ink: int32) {
+  var it: MpPathIter;
+  var tol: float64 = 0.5 * g->cw / (float64)g->sx;
+  if (mp_path_iter(s, nd, &it, tol) != MP_OK) { return; }
+  var px: float64 = 0.0;
+  var py: float64 = 0.0;
+  var lone: bool = false;
+  var x: float64 = 0.0;
+  var y: float64 = 0.0;
+  var k: int32 = mp_path_next(&it, &x, &y);
+  while (k != 0) {
+    if (k == MP_PATH_MOVE) {
+      if (lone) { term_seg(g, px, py, px, py, ink, nd->stroke); }
+      lone = true;
+    } else {
+      term_seg(g, px, py, x, y, ink, nd->stroke);
+      lone = false;
+    }
+    px = x;
+    py = y;
+    k = mp_path_next(&it, &x, &y);
+  }
+  if (lone) { term_seg(g, px, py, px, py, ink, nd->stroke); }
+}
+
+fn term_rule_cell(c: TermCell*, level: int32, cp: int32, ink: int32, fg: MpColor) {
+  if (c == 0) { return; }
+  if (level == TERM_GRID && c->level != TERM_EMPTY) { return; }
+  if (c->level > level) { return; }
+  term_put(c, level, cp, ink, fg);
+}
+
+// A grid, tick or axis line as a row of ─ or a column of │ (by its longer extent).
+fn term_rule(g: TermGrid*, s: MpScene*, nd: MpNode*, level: int32, ink: int32) {
+  var p: float64* = mp_scene_node_pts(s, nd);
+  if (p == 0 || nd->pts_len < 4) { return; }
+  if (!term_finite(p[0] + p[1] + p[2] + p[3])) { return; }
+  var r: int64[2];
+  if (fabs(p[2] - p[0]) >= fabs(p[3] - p[1])) {
+    var row: float64 = floor((p[1] + p[3]) * 0.5 / g->ch);
+    if (row < 0.0 || row >= (float64)g->rows) { return; }
+    if (!term_span(fmin(p[0], p[2]), fmax(p[0], p[2]), g->cw, g->cols, &r[0])) { return; }
+    var col: int64 = r[0];
+    while (col <= r[1]) {
+      term_rule_cell(term_cell(g, col, (int64)row), level, TERM_CP_HRULE, ink, nd->stroke);
+      col = col + 1;
+    }
+    return;
+  }
+  var cx: float64 = floor((p[0] + p[2]) * 0.5 / g->cw);
+  if (cx < 0.0 || cx >= (float64)g->cols) { return; }
+  if (!term_span(fmin(p[1], p[3]), fmax(p[1], p[3]), g->ch, g->rows, &r[0])) { return; }
+  var rw: int64 = r[0];
+  while (rw <= r[1]) {
+    term_rule_cell(term_cell(g, (int64)cx, rw), level, TERM_CP_VRULE, ink, nd->stroke);
+    rw = rw + 1;
+  }
+}
+
+fn term_line_node(g: TermGrid*, s: MpScene*, nd: MpNode*) {
+  var cls: int32 = nd->cls;
+  var ascii: bool = g->mode == MP_TERM_ASCII;
+  if (cls == MP_CLS_GRID || cls == MP_CLS_TICK) {
+    var ink: int32 = term_ui_ink(g, cls);
+    if (ascii) { term_stroke(g, s, nd, ink); } else { term_rule(g, s, nd, TERM_GRID, ink); }
+    return;
+  }
+  if (cls == MP_CLS_AXIS && !ascii) {
+    term_rule(g, s, nd, TERM_AXIS, TERM_INK_RGB);
+    return;
+  }
+  term_stroke(g, s, nd, TERM_INK_RGB);
+}
+
+// Background colour for the cells whose centres lie in the rect.
+fn term_bg(g: TermGrid*, x: float64, y: float64, w: float64, h: float64, c: MpColor) {
+  var cr: int64[2];
+  var rr: int64[2];
+  if (!term_span(x, x + w, g->cw, g->cols, &cr[0])) { return; }
+  if (!term_span(y, y + h, g->ch, g->rows, &rr[0])) { return; }
+  var row: int64 = rr[0];
+  while (row <= rr[1]) {
+    var col: int64 = cr[0];
+    while (col <= cr[1]) {
+      var cell: TermCell* = term_cell(g, col, row);
+      cell->bg = c;
+      if (g->mode == MP_TERM_ASCII && cell->level != TERM_TEXT) {
+        term_put(cell, TERM_EMPTY, 0, TERM_INK_DEFAULT, c);
+      }
+      col = col + 1;
+    }
+    row = row + 1;
+  }
+}
+
+// A bar as Braille dots: every dot whose centre lies in the rect.
+fn term_rect_dots(g: TermGrid*, x: float64, y: float64, w: float64, h: float64,
+                  c: MpColor) {
+  var cr: int64[2];
+  var rr: int64[2];
+  var ux: float64 = g->cw / 2.0;
+  var uy: float64 = g->ch / 4.0;
+  if (!term_span(x, x + w, ux, g->cols * 2, &cr[0])) { return; }
+  if (!term_span(y, y + h, uy, g->rows * 4, &rr[0])) { return; }
+  var dy: int64 = rr[0];
+  while (dy <= rr[1]) {
+    var dx: int64 = cr[0];
+    while (dx <= cr[1]) {
+      term_dot(g, dx, dy, c);
+      dx = dx + 1;
+    }
+    dy = dy + 1;
+  }
+}
+
+// Block glyph for the part [y, y + h] of the row [top, top + ch], in eighths: lower
+// eighths unless the bar hangs from the row's top (then ▔, ▀ or █); 0 when under 1/16.
+fn term_bar_cp(top: float64, ch: float64, y: float64, h: float64) -> int32 {
+  var ov: float64 = fmin(top + ch, y + h) - fmax(top, y);
+  var n: int32 = (int32)floor(ov / ch * 8.0 + 0.5);
+  if (n <= 0) { return 0; }
+  if (n > 8) { n = 8; }
+  if (y <= top && y + h < top + ch) {
+    if (n <= 2) { return TERM_CP_TOP8; }
+    if (n <= 5) { return TERM_CP_UPPER; }
+    return TERM_CP_FULL;
+  }
+  return TERM_CP_UPPER + n;
+}
+
+// A bar in BLOCKS mode: the columns whose centres it covers, the rows in eighths.
+fn term_bar(g: TermGrid*, x: float64, y: float64, w: float64, h: float64, c: MpColor) {
+  var cr: int64[2];
+  if (!term_span(x, x + w, g->cw, g->cols, &cr[0])) { return; }
+  var r0: float64 = fmin(fmax(floor(y / g->ch), 0.0), (float64)g->rows);
+  var r1: float64 = fmin(floor((y + h) / g->ch), (float64)(g->rows - 1));
+  var row: int64 = (int64)r0;
+  while ((float64)row <= r1) {
+    var cp: int32 = term_bar_cp((float64)row * g->ch, g->ch, y, h);
+    var col: int64 = cr[0];
+    while (cp != 0 && col <= cr[1]) {
+      var cell: TermCell* = term_cell(g, col, row);
+      if (cell->level != TERM_TEXT) { term_put(cell, TERM_MARK, cp, TERM_INK_RGB, c); }
+      col = col + 1;
+    }
+    row = row + 1;
+  }
+}
+
+// Plain ASCII has no background colour, so a bar is drawn as #.
+fn term_ascii_fill(g: TermGrid*, x: float64, y: float64, w: float64, h: float64,
+                   c: MpColor) {
+  var cr: int64[2];
+  var rr: int64[2];
+  if (!term_span(x, x + w, g->cw, g->cols, &cr[0])) { return; }
+  if (!term_span(y, y + h, g->ch, g->rows, &rr[0])) { return; }
+  var row: int64 = rr[0];
+  while (row <= rr[1]) {
+    var col: int64 = cr[0];
+    while (col <= cr[1]) {
+      var cell: TermCell* = term_cell(g, col, row);
+      if (cell->level != TERM_TEXT) { term_put(cell, TERM_MARK, 35, TERM_INK_RGB, c); }
+      col = col + 1;
+    }
+    row = row + 1;
+  }
+}
+
+fn term_rect(g: TermGrid*, nd: MpNode*) {
+  if (nd->fill.a == 0) { return; }
+  var x: float64 = fmin(nd->x, nd->x + nd->w);
+  var y: float64 = fmin(nd->y, nd->y + nd->h);
+  var w: float64 = fabs(nd->w);
+  var h: float64 = fabs(nd->h);
+  if (!term_finite(x + y + w + h)) { return; }
+  if (nd->cls == MP_CLS_BG || nd->cls == MP_CLS_PLOT) {
+    if (g->themed) { term_bg(g, x, y, w, h, nd->fill); }
+    return;
+  }
+  if (g->mode == MP_TERM_BRAILLE) {
+    term_rect_dots(g, x, y, w, h, nd->fill);
+  } else if (g->mode == MP_TERM_BLOCKS) {
+    term_bar(g, x, y, w, h, nd->fill);
+  } else if (g->plain) {
+    term_ascii_fill(g, x, y, w, h, nd->fill);
+  } else {
+    term_bg(g, x, y, w, h, nd->fill);
+  }
+}
+
+fn term_inside(shape: int32, dx: float64, dy: float64, r: float64) -> bool {
+  if (shape == MP_MARK_CIRCLE) { return dx * dx + dy * dy <= r * r + 1e-9; }
+  if (shape == MP_MARK_DIAMOND) { return fabs(dx) + fabs(dy) <= r + 1e-9; }
+  return true;
+}
+
+// A marker as the dots or half cells whose centres lie in its shape (at least one).
+fn term_marker_fine(g: TermGrid*, nd: MpNode*, fg: MpColor) {
+  var ux: float64 = g->cw / (float64)g->sx;
+  var uy: float64 = g->ch / (float64)g->sy;
+  var r: float64 = fabs(nd->r);
+  var cr: int64[2];
+  var rr: int64[2];
+  var hit: bool = false;
+  if (term_span(nd->x - r, nd->x + r, ux, g->cols * g->sx, &cr[0]) &&
+      term_span(nd->y - r, nd->y + r, uy, g->rows * g->sy, &rr[0])) {
+    var iy: int64 = rr[0];
+    while (iy <= rr[1]) {
+      var ix: int64 = cr[0];
+      while (ix <= cr[1]) {
+        var dx: float64 = ((float64)ix + 0.5) * ux - nd->x;
+        var dy: float64 = ((float64)iy + 0.5) * uy - nd->y;
+        if (term_inside(nd->marker, dx, dy, r)) {
+          term_fine(g, ix, iy, fg);
+          hit = true;
+        }
+        ix = ix + 1;
+      }
+      iy = iy + 1;
+    }
+  }
+  if (!hit) { term_fine(g, floor_i64(nd->x / ux), floor_i64(nd->y / uy), fg); }
+}
+
+fn term_ascii_set(g: TermGrid*, col: int64, row: int64, cp: int32, fg: MpColor) {
+  var c: TermCell* = term_cell(g, col, row);
+  if (c != 0 && c->level != TERM_TEXT) { term_put(c, TERM_MARK, cp, TERM_INK_RGB, fg); }
+}
+
+fn term_ascii_octants(g: TermGrid*, cx: int64, cy: int64, x: int64, y: int64,
+                      fg: MpColor) {
+  term_ascii_set(g, cx + x, cy + y, 111, fg);
+  term_ascii_set(g, cx + y, cy + x, 111, fg);
+  term_ascii_set(g, cx - y, cy + x, 111, fg);
+  term_ascii_set(g, cx - x, cy + y, 111, fg);
+  term_ascii_set(g, cx - x, cy - y, 111, fg);
+  term_ascii_set(g, cx - y, cy - x, 111, fg);
+  term_ascii_set(g, cx + y, cy - x, 111, fg);
+  term_ascii_set(g, cx + x, cy - y, 111, fg);
+}
+
+// ASCII marker: @ under a radius of 1.5 columns, else a midpoint circle of o (in cells,
+// so not round on screen).
+fn term_ascii_marker(g: TermGrid*, nd: MpNode*, fg: MpColor) {
+  var cx: int64 = floor_i64(nd->x / g->cw);
+  var cy: int64 = floor_i64(nd->y / g->ch);
+  var r: float64 = fabs(nd->r) / g->cw;
+  if (r < 1.5) {
+    term_ascii_set(g, cx, cy, 64, fg);
+    return;
+  }
+  if (r > (float64)(g->cols + g->rows)) { r = (float64)(g->cols + g->rows); }
+  var x: int64 = (int64)(r + 0.5);
+  var y: int64 = 0;
+  var err: int64 = 1 - x;
+  while (x >= y) {
+    term_ascii_octants(g, cx, cy, x, y, fg);
+    y = y + 1;
+    if (err < 0) {
+      err = err + 2 * y + 1;
+    } else {
+      x = x - 1;
+      err = err + 2 * (y - x) + 1;
+    }
+  }
+}
+
+fn term_marker(g: TermGrid*, nd: MpNode*) {
+  var fg: MpColor = nd->fill;
+  if (fg.a == 0) { fg = nd->stroke; }
+  if (fg.a == 0) { return; }
+  if (!term_finite(nd->x + nd->y + nd->r)) { return; }
+  if (fabs(nd->x) + fabs(nd->r) > 1e9 || fabs(nd->y) + fabs(nd->r) > 1e9) { return; }
+  if (g->mode == MP_TERM_ASCII) {
+    term_ascii_marker(g, nd, fg);
+  } else {
+    term_marker_fine(g, nd, fg);
+  }
+}
+
+// The code point of bytes [i, j) as mp_utf8_next delimits them; ? for an invalid byte
+// or a control character.
+fn term_decode(s: string, i: int64, j: int64) -> int32 {
+  var b0: int32 = (int32)s.chars[i];
+  if (j - i == 1) {
+    if (b0 < 32 || b0 >= 127) { return 63; }
+    return b0;
+  }
+  var cp: int32 = b0 & 0x07;
+  if (j - i == 2) { cp = b0 & 0x1F; }
+  if (j - i == 3) { cp = b0 & 0x0F; }
+  var k: int64 = i + 1;
+  while (k < j) {
+    cp = (cp << 6) | ((int32)s.chars[k] & 0x3F);
+    k = k + 1;
+  }
+  if (cp >= 0x80 && cp < 0xA0) { return 63; }
+  return cp;
+}
+
+// Text: one cell per code point on the row holding y - 0.35 * size (about the middle
+// of the glyphs above the baseline); cells off the grid are dropped whole.
+fn term_text(g: TermGrid*, s: MpScene*, nd: MpNode*) {
+  var txt: string = mp_scene_node_text(s, nd);
+  var n: int64 = (int64)txt.length;
+  if (n == 0 || !term_finite(nd->x + nd->y + nd->size)) { return; }
+  var row: float64 = floor((nd->y - 0.35 * nd->size) / g->ch);
+  if (row < 0.0 || row >= (float64)g->rows) { return; }
+  var cps: float64 = (float64)mp_utf8_len(txt);
+  var start: float64 = nd->x / g->cw;
+  if (nd->align == MP_ALIGN_CENTER) { start = start - cps * 0.5; }
+  if (nd->align == MP_ALIGN_END) { start = start - cps; }
+  if (fabs(start) > 1e9) { return; }
+  var col: int64 = floor_i64(start + 0.5);
+  var ink: int32 = term_ui_ink(g, nd->cls);
+  if (nd->fill.a == 0) { ink = TERM_INK_DEFAULT; }
+  var i: int64 = 0;
+  while (i < n && col < (int64)g->cols) {
+    var j: int64 = mp_utf8_next(txt, i);
+    var c: TermCell* = term_cell(g, col, (int64)row);
+    if (c != 0) { term_put(c, TERM_TEXT, term_decode(txt, i, j), ink, nd->fill); }
+    col = col + 1;
+    i = j;
+  }
+}
+
+fn term_node(g: TermGrid*, s: MpScene*, nd: MpNode*) {
+  var stroked: bool = nd->stroke_w > 0.0 && nd->stroke.a != 0;
+  switch (nd->kind) {
+    case MP_NODE_RECT: { term_rect(g, nd); }
+    case MP_NODE_LINE: {
+      if (stroked) { term_line_node(g, s, nd); }
+    }
+    case MP_NODE_POLY: {
+      if (stroked) { term_stroke(g, s, nd, TERM_INK_RGB); }
+    }
+    case MP_NODE_PATH: {
+      if (stroked) { term_stroke(g, s, nd, TERM_INK_RGB); }
+    }
+    case MP_NODE_MARKER: { term_marker(g, nd); }
+    case MP_NODE_TEXT: { term_text(g, s, nd); }
+    default: { }
+  }
+}
+
+// MP_TERM_AUTO: blocks when series rects outnumber the other series marks.
+fn term_auto(s: MpScene*) -> int32 {
+  var bars: int64 = 0;
+  var other: int64 = 0;
+  var i: int64 = 0;
+  var n: int64 = mp_scene_count(s);
+  while (i < n) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->cls >= MP_CLS_SERIES) {
+      if (nd->kind == MP_NODE_RECT) {
+        bars = bars + 1;
+      } else if (nd->kind != MP_NODE_TEXT) {
+        other = other + 1;
+      }
+    }
+    i = i + 1;
+  }
+  if (bars > other) { return MP_TERM_BLOCKS; }
+  return MP_TERM_BRAILLE;
+}
+
+// Grid size from the target: cols = round(width / cell_w), rows = round(height / cell_h).
+fn term_size(g: TermGrid*, t: MpTarget*) -> int32 {
+  if (!(t->width > 0.0) || !(t->height > 0.0)) { return MP_ERR_ARG; }
+  if (!(t->cell_w > 0.0) || !(t->cell_h > 0.0)) { return MP_ERR_ARG; }
+  if (!term_finite(t->width + t->height + t->cell_w + t->cell_h)) { return MP_ERR_ARG; }
+  var fc: float64 = t->width / t->cell_w;
+  var fr: float64 = t->height / t->cell_h;
+  if (fc < 0.5 || fr < 0.5) { return MP_ERR_ARG; }
+  if (fc >= (float64)MP_TERM_MAX_COLS + 0.5) { return MP_ERR_LIMIT; }
+  if (fr >= (float64)MP_TERM_MAX_ROWS + 0.5) { return MP_ERR_LIMIT; }
+  g->cols = (int32)floor(fc + 0.5);
+  g->rows = (int32)floor(fr + 0.5);
+  g->cw = t->cell_w;
+  g->ch = t->cell_h;
+  return MP_OK;
+}
+
+fn term_setup(g: TermGrid*, s: MpScene*, mode: int32) {
+  g->mode = mode & TERM_MODE_BITS;
+  if (g->mode == MP_TERM_AUTO) { g->mode = term_auto(s); }
+  g->plain = (mode & MP_TERM_PLAIN) != 0;
+  g->home = (mode & MP_TERM_HOME) != 0 && !g->plain;
+  g->themed = (mode & MP_TERM_THEME) != 0;
+  g->sx = 1;
+  g->sy = 1;
+  if (g->mode == MP_TERM_BRAILLE) {
+    g->sx = 2;
+    g->sy = 4;
+  } else if (g->mode == MP_TERM_BLOCKS) {
+    g->sy = 2;
+  }
+}
+
+fn term_s(o: TermOut*, s: string) {
+  if (o->rc == MP_OK) { o->rc = mp_buf_puts(o->b, s); }
+}
+
+fn term_c(o: TermOut*, c: int32) {
+  if (o->rc == MP_OK) { o->rc = mp_buf_putc(o->b, c); }
+}
+
+fn term_cp(o: TermOut*, cp: int32) {
+  if (o->rc == MP_OK) { o->rc = mp_buf_put_utf8(o->b, cp); }
+}
+
+fn term_esc(o: TermOut*, s: string) {
+  term_c(o, 27);
+  term_s(o, s);
+}
+
+fn term_num(o: TermOut*, v: uint8) {
+  if (o->rc == MP_OK) { o->rc = mp_buf_put_i64(o->b, (int64)v); }
+}
+
+// ESC[38;2;r;g;bm (foreground) or ESC[48;2;r;g;bm (background).
+fn term_sgr(o: TermOut*, bg: bool, c: MpColor) {
+  if (bg) { term_esc(o, "[48;2;"); } else { term_esc(o, "[38;2;"); }
+  term_num(o, c.r);
+  term_c(o, 59);
+  term_num(o, c.g);
+  term_c(o, 59);
+  term_num(o, c.b);
+  term_c(o, 109);
+}
+
+fn term_rgb_eq(a: MpColor, b: MpColor) -> bool {
+  return a.r == b.r && a.g == b.g && a.b == b.b;
+}
+
+// The glyph a cell shows and the pen it needs.
+fn term_look(g: TermGrid*, c: TermCell*, want: TermPen*) -> int32 {
+  want->ink = c->ink;
+  want->fg = c->fg;
+  want->bg = c->bg;
+  if (c->level == TERM_EMPTY) { return 32; }
+  if (c->level != TERM_MARK || c->mask == 0) { return c->cp; }
+  if (g->mode == MP_TERM_BRAILLE) { return TERM_CP_BRAILLE + c->mask; }
+  if (c->mask == 1) {
+    want->fg = c->top;
+    return TERM_CP_UPPER;
+  }
+  if (c->mask == 2) {
+    want->fg = c->bot;
+    return TERM_CP_LOWER;
+  }
+  want->fg = c->top;
+  if (term_rgb_eq(c->top, c->bot) || g->plain) { return TERM_CP_FULL; }
+  want->bg = c->bot;
+  return TERM_CP_UPPER;
+}
+
+// Moves the pen to `want`. A space keeps the current foreground, which it cannot show.
+fn term_pen(o: TermOut*, cur: TermPen*, want: TermPen*, space: bool) {
+  var ink: int32 = want->ink;
+  var fg: MpColor = want->fg;
+  if (space) {
+    ink = cur->ink;
+    fg = cur->fg;
+  }
+  var has_bg: bool = want->bg.a != 0;
+  var reset: bool = cur->bg.a != 0 && !has_bg;
+  if (cur->ink != TERM_INK_DEFAULT && cur->ink != ink) { reset = true; }
+  if (reset) {
+    term_esc(o, "[0m");
+    cur->ink = TERM_INK_DEFAULT;
+    cur->bg.a = 0;
+    if (space) { ink = TERM_INK_DEFAULT; }
+  }
+  if (ink == TERM_INK_DIM && cur->ink != TERM_INK_DIM) { term_esc(o, "[2m"); }
+  if (ink == TERM_INK_RGB && (cur->ink != TERM_INK_RGB || !term_rgb_eq(cur->fg, fg))) {
+    term_sgr(o, false, fg);
+  }
+  if (has_bg && (cur->bg.a == 0 || !term_rgb_eq(cur->bg, want->bg))) {
+    term_sgr(o, true, want->bg);
+  }
+  cur->ink = ink;
+  cur->fg = fg;
+  cur->bg = want->bg;
+}
+
+fn term_blank(g: TermGrid*, c: TermCell*) -> bool {
+  var want: TermPen;
+  if (term_look(g, c, &want) != 32) { return false; }
+  return g->plain || c->bg.a == 0;
+}
+
+fn term_row(g: TermGrid*, o: TermOut*, row: int64) {
+  var last: int64 = (int64)g->cols - 1;
+  while (last >= 0 && term_blank(g, term_cell(g, last, row))) { last = last - 1; }
+  var cur: TermPen;
+  cur.ink = TERM_INK_DEFAULT;
+  cur.bg.a = 0;
+  var want: TermPen;
+  var col: int64 = 0;
+  while (col <= last) {
+    var cp: int32 = term_look(g, term_cell(g, col, row), &want);
+    if (!g->plain) { term_pen(o, &cur, &want, cp == 32); }
+    term_cp(o, cp);
+    col = col + 1;
+  }
+  if (!g->plain && (cur.ink != TERM_INK_DEFAULT || cur.bg.a != 0)) { term_esc(o, "[0m"); }
+  if (g->home) { term_esc(o, "[K"); }
+  term_c(o, 10);
+}
+
+fn term_mode_ok(mode: int32) -> bool {
+  if (mode < 0 || (mode & ~(TERM_MODE_BITS | TERM_FLAG_BITS)) != 0) { return false; }
+  return (mode & TERM_MODE_BITS) <= MP_TERM_ASCII;
+}
+
+fn term_draw(g: TermGrid*, s: MpScene*, out: MpBuf*) -> int32 {
+  var i: int64 = 0;
+  var n: int64 = mp_scene_count(s);
+  while (i < n) {
+    term_node(g, s, mp_scene_node(s, i));
+    i = i + 1;
+  }
+  var o: TermOut;
+  o.b = out;
+  o.rc = MP_OK;
+  if (g->home) { term_esc(&o, "[H"); }
+  var row: int64 = 0;
+  while (row < (int64)g->rows && o.rc == MP_OK) {
+    term_row(g, &o, row);
+    row = row + 1;
+  }
+  return o.rc;
+}
+
+/// Writes a scene as terminal text, one line per row of a cols x rows cell grid.
+/// The grid is round(t->width / t->cell_w) x round(t->height / t->cell_h) cells; build t
+/// with mp_target_cells and lay the scene out on it. mode is one of MP_TERM_AUTO,
+/// MP_TERM_BRAILLE, MP_TERM_BLOCKS or MP_TERM_ASCII, plus any of MP_TERM_PLAIN,
+/// MP_TERM_HOME and MP_TERM_THEME. Text takes one cell per code point (never split) on
+/// the row holding y - 0.35 * size, and overwrites anything else in its cells. In
+/// BRAILLE and BLOCKS, grid and tick lines become dim ─ or │ (theme colour with
+/// MP_TERM_THEME) in empty cells only, the axis line is ─ in its own colour, and a mark
+/// cell takes the colour of the last series that drew into it. In BRAILLE, lines and
+/// paths are flattened at half a dot. In BLOCKS, bars cover the columns whose centres
+/// they contain and fill rows in eighths (▁ .. █), and lines and markers use ▀ ▄ half
+/// cells with a background colour where two colours share a cell. Series always use
+/// 24-bit colour; without MP_TERM_THEME other text uses the terminal's foreground,
+/// ticks and grid use SGR 2 and no background is painted. Colour changes are emitted
+/// only where needed and every coloured row ends with ESC[0m.
+///
+/// @param s The scene. Valid: non-zero, with no polyline or path open.
+/// @param t The target; width, height, cell_w and cell_h are read. Valid: non-zero, all
+///   four finite and > 0, giving 1 .. MP_TERM_MAX_COLS columns and 1 .. MP_TERM_MAX_ROWS
+///   rows.
+/// @param mode Mode plus flags. Valid: a mode 0 .. 3 OR any of MP_TERM_PLAIN,
+///   MP_TERM_HOME, MP_TERM_THEME; other bits are MP_ERR_ARG.
+/// @param out Receives the text. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s, t or out is 0, mode is unknown, or the size is not finite or
+///   rounds to 0 cells; out is empty.
+/// @error MP_ERR_LIMIT more than MP_TERM_MAX_COLS columns or MP_TERM_MAX_ROWS rows; out
+///   is empty.
+/// @error MP_ERR_STATE a polyline or path is still open; out is empty.
+/// @error MP_ERR_ALLOC the cell grid could not be allocated (out is empty) or out could
+///   not grow (out holds the rows written so far).
+/// @mem out belongs to the caller; nothing is retained from the arguments. The cell grid
+///   (MP_TERM_CELL_BYTES per cell) is allocated and freed inside every call; use
+///   mp_term_scene_grid to supply it instead.
+/// @thread One thread at a time per scene and per out.
+/// @cost O(nodes + points + cells); one allocation for the grid plus the growth of out.
+export fn mp_term_scene(s: MpScene*, t: MpTarget*, mode: int32, out: MpBuf*) -> int32 {
+  return mp_term_scene_grid(s, t, mode, 0, 0, out);
+}
+
+// Clears a caller's grid; a word loop, since the core never calls libc memset.
+fn term_zero(p: uint8*, bytes: int64) {
+  var w: int64* = (int64*)p;
+  var n: int64 = bytes / 8;
+  var i: int64 = 0;
+  while (i < n) {
+    w[i] = 0;
+    i = i + 1;
+  }
+}
+
+/// Bytes of cell grid that mp_term_scene_grid needs for a target: cols x rows x
+/// MP_TERM_CELL_BYTES, with the grid size computed as in mp_term_scene.
+///
+/// @param t The target. Valid: non-zero, as for mp_term_scene.
+/// @return The byte count, or 0 when t is 0 or its size is invalid or over the limits.
+/// @mem Reads *t only.
+/// @cost O(1).
+export fn mp_term_grid_bytes(t: MpTarget*) -> int64 {
+  if (t == 0) { return 0; }
+  var g: TermGrid;
+  if (term_size(&g, t) != MP_OK) { return 0; }
+  return (int64)g.cols * (int64)g.rows * (int64)sizeof(TermCell);
+}
+
+/// As mp_term_scene, drawing into a cell grid the caller provides, so repeated frames
+/// allocate nothing but the growth of out. The output is identical to mp_term_scene's.
+///
+/// @param s The scene. Valid: non-zero, with no polyline or path open.
+/// @param t The target. Valid: as for mp_term_scene.
+/// @param mode Mode plus flags. Valid: as for mp_term_scene.
+/// @param grid Cell storage, cleared by this call. Valid: 0 (then a grid is allocated and
+///   freed inside the call, as mp_term_scene does), or 8-byte aligned with at least
+///   mp_term_grid_bytes(t) bytes.
+/// @param cap Bytes at grid. Valid: >= mp_term_grid_bytes(t) when grid is non-zero;
+///   ignored when grid is 0.
+/// @param out Receives the text. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s, t or out is 0, mode is unknown, the size is not finite or rounds
+///   to 0 cells, or grid is non-zero and cap is too small; out is empty.
+/// @error MP_ERR_LIMIT more than MP_TERM_MAX_COLS columns or MP_TERM_MAX_ROWS rows; out
+///   is empty.
+/// @error MP_ERR_STATE a polyline or path is still open; out is empty.
+/// @error MP_ERR_ALLOC grid is 0 and the grid could not be allocated (out is empty), or
+///   out could not grow (out holds the rows written so far).
+/// @mem grid stays the caller's and is only borrowed for the call; its contents
+///   afterwards are unspecified. out belongs to the caller.
+/// @thread One thread at a time per scene, per grid and per out.
+/// @cost O(nodes + points + cells); no allocation besides the growth of out when grid is
+///   given.
+export fn mp_term_scene_grid(s: MpScene*, t: MpTarget*, mode: int32, grid: uint8*,
+                             cap: int64, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (s == 0 || t == 0 || !term_mode_ok(mode)) { return MP_ERR_ARG; }
+  var g: TermGrid;
+  var rc: int32 = term_size(&g, t);
+  if (rc != MP_OK) { return rc; }
+  if (s->open >= 0) { return MP_ERR_STATE; }
+  term_setup(&g, s, mode);
+  var bytes: int64 = (int64)g.cols * (int64)g.rows * (int64)sizeof(TermCell);
+  if (grid != 0) {
+    if (cap < bytes) { return MP_ERR_ARG; }
+    term_zero(grid, bytes);
+    g.cells = (TermCell*)grid;
+    return term_draw(&g, s, out);
+  }
+  g.cells = (TermCell*)mp_alloc_zero(bytes);
+  if (g.cells == 0) { return MP_ERR_ALLOC; }
+  rc = term_draw(&g, s, out);
+  mp_free(g.cells);
+  return rc;
+}
+
+/// Renders a chart as terminal text of cols x rows cells, laid out on the cell grid
+/// (mp_target_cells). Without an explicit theme (mp_chart_set_theme) titles and labels use
+/// the terminal's own colours; with one, MP_TERM_THEME is added and the theme's colours and
+/// background are used. Area fills are skipped and dashes are drawn solid.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param cols Columns. Units: cells. Valid: 1 .. MP_TERM_MAX_COLS.
+/// @param rows Rows. Units: cells. Valid: 1 .. MP_TERM_MAX_ROWS.
+/// @param mode MP_TERM_AUTO, BRAILLE, BLOCKS or ASCII, plus MP_TERM_PLAIN and/or
+///   MP_TERM_HOME. Valid: as for mp_term_scene; a MP_TERM_THEME bit is ignored (the
+///   chart decides).
+/// @param out Receives the text. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code (also recorded as the chart's sticky error).
+/// @error MP_ERR_ARG c or out is 0, the mode is unknown or cols or rows is below 1; out is
+///   empty.
+/// @error MP_ERR_LIMIT cols or rows is above its maximum; out is empty.
+/// @error MP_ERR_ALLOC the frame, the cell grid or out could not grow; out is empty or
+///   partial.
+/// @mem out belongs to the caller. The cell grid lives in the chart's scratch, which only
+///   grows, so repeated frames of one size allocate nothing but the growth of out.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost The frame (cached per seq and size) plus O(nodes + points + cells).
+export fn mp_chart_term(c: MpChart*, cols: int32, rows: int32, mode: int32,
+                        out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (cols < 1 || rows < 1 || !term_mode_ok(mode)) {
+    rc = MP_ERR_ARG;
+  } else if (cols > MP_TERM_MAX_COLS || rows > MP_TERM_MAX_ROWS) {
+    rc = MP_ERR_LIMIT;
+  }
+  var t: MpTarget = mp_target_cells(cols, rows);
+  if (rc == MP_OK) { rc = mp_frame_scene(c, &t); }
+  var m: int32 = mode & ~MP_TERM_THEME;
+  if (c->theme_explicit) { m = m | MP_TERM_THEME; }
+  if (rc == MP_OK) {
+    var bytes: int64 = mp_term_grid_bytes(&t);
+    var grid: uint8* = mp_chart_scratch(c, bytes);
+    rc = MP_ERR_ALLOC;
+    if (grid != 0) { rc = mp_term_scene_grid(c->scene, &t, m, grid, bytes, out); }
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}

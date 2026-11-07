@@ -1,0 +1,684 @@
+// data/summary_test: MpSummary against an independent reference. Every frame of a fuzzed
+// push sequence (NaN samples, out-of-order pushes, keep changes, clears, span changes,
+// missed summary pushes) must equal what a from-scratch scan of the column produces on
+// the same bucket grid, emit only real samples, keep the window's exact y extent and
+// never pass cap. The compiled run fuzzes longer than the interpreter run.
+
+import "std/math";
+import "std/io";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/data/col";
+import "mistplot/data/decimate";
+import "mistplot/data/summary";
+
+var g_rng: uint64 = 0;
+var g_frames: int64 = 0;
+var g_bucket_frames: int64 = 0;
+var g_merges: int64 = 0;
+var g_drops: int64 = 0;
+var g_ref_bucket: bool = false;
+
+fn rnd() -> uint64 {
+  var x: uint64 = g_rng;
+  x = x ^ (x << 13);
+  x = x ^ (x >> 7);
+  x = x ^ (x << 17);
+  g_rng = x;
+  return x;
+}
+
+fn rnd_int(n: int64) -> int64 {
+  return (int64)(rnd() % (uint64)n);
+}
+
+fn rnd_f() -> float64 {
+  return (float64)(rnd() >> 11) / 9007199254740992.0;
+}
+
+fn fin(v: float64) -> bool {
+  return is_finite(v) != 0;
+}
+
+// ------------------------------------------------------------ reference
+
+struct RefOut {
+  xs: float64*;
+  ys: float64*;
+  n: int64;
+  cap: int64;
+  x0: float64;
+  colw: float64;
+  ncol: int64;
+  ci: int64;
+  b: MpSumBucket;
+}
+
+fn ref_point(o: RefOut*, start: int64, x: float64, y: float64) {
+  var j: int64 = start;
+  while (j < o->n) {
+    if (o->xs[j] == x && o->ys[j] == y) { return; }
+    j = j + 1;
+  }
+  if (o->n < o->cap) {
+    o->xs[o->n] = x;
+    o->ys[o->n] = y;
+    o->n = o->n + 1;
+  }
+}
+
+fn ref_flush(o: RefOut*) {
+  if (o->ci < 0) { return; }
+  var px: float64[4];
+  var py: float64[4];
+  px[0] = o->b.fx;
+  py[0] = o->b.fy;
+  px[1] = o->b.nx;
+  py[1] = o->b.ny;
+  px[2] = o->b.mx;
+  py[2] = o->b.my;
+  px[3] = o->b.lx;
+  py[3] = o->b.ly;
+  // selection order: smallest x first, earlier slot on ties (stable)
+  var start: int64 = o->n;
+  var used: bool[4];
+  var t: int32 = 0;
+  while (t < 4) {
+    var best: int64 = -1;
+    var q: int64 = 0;
+    while (q < 4) {
+      if (!used[q] && (best < 0 || px[q] < px[best])) { best = q; }
+      q = q + 1;
+    }
+    used[best] = true;
+    ref_point(o, start, px[best], py[best]);
+    t = t + 1;
+  }
+  o->ci = -1;
+}
+
+// Folds one complete bucket into the pixel column its first x falls in.
+fn ref_bucket(o: RefOut*, b: MpSumBucket*) {
+  var ci: int64 = 0;
+  if (o->colw > 0.0) {
+    ci = (int64)floor((b->fx - o->x0) / o->colw);
+    if (ci < 0) { ci = 0; }
+    if (ci > o->ncol - 1) { ci = o->ncol - 1; }
+  }
+  if (ci == o->ci) {
+    o->b.lx = b->lx;
+    o->b.ly = b->ly;
+    if (b->ny < o->b.ny) {
+      o->b.nx = b->nx;
+      o->b.ny = b->ny;
+    }
+    if (b->my > o->b.my) {
+      o->b.mx = b->mx;
+      o->b.my = b->my;
+    }
+    return;
+  }
+  ref_flush(o);
+  o->ci = ci;
+  o->b = *b;
+}
+
+// Buckets the visible samples [i_lo, i_hi) directly on grid bw and emits them.
+fn ref_buckets(c: MpCol*, bw: float64, i_lo: int64, i_hi: int64, o: RefOut*) {
+  var cur: MpSumBucket;
+  var have: bool = false;
+  var i: int64 = i_lo;
+  while (i < i_hi) {
+    var x: float64 = mp_col_x(c, i);
+    var y: float64 = mp_col_y(c, i);
+    if (fin(x) && fin(y)) {
+      var k: int64 = (int64)floor(x / bw);
+      if (have && k == cur.k) {
+        cur.lx = x;
+        cur.ly = y;
+        if (y < cur.ny) {
+          cur.nx = x;
+          cur.ny = y;
+        }
+        if (y > cur.my) {
+          cur.mx = x;
+          cur.my = y;
+        }
+      } else {
+        if (have) { ref_bucket(o, &cur); }
+        cur.k = k;
+        cur.fx = x;
+        cur.fy = y;
+        cur.nx = x;
+        cur.ny = y;
+        cur.mx = x;
+        cur.my = y;
+        cur.lx = x;
+        cur.ly = y;
+        have = true;
+      }
+    }
+    i = i + 1;
+  }
+  if (have) { ref_bucket(o, &cur); }
+  ref_flush(o);
+}
+
+fn ref_lower(c: MpCol*, x0: float64) -> int64 {
+  var i: int64 = 0;
+  while (i < mp_col_len(c)) {
+    var x: float64 = mp_col_x(c, i);
+    if (fin(x) && x >= x0) { return i; }
+    i = i + 1;
+  }
+  return mp_col_len(c);
+}
+
+fn ref_upper(c: MpCol*, x1: float64, from: int64) -> int64 {
+  var i: int64 = from;
+  while (i < mp_col_len(c)) {
+    var x: float64 = mp_col_x(c, i);
+    if (fin(x) && x > x1) { return i; }
+    i = i + 1;
+  }
+  return mp_col_len(c);
+}
+
+// What mp_summary_emit must produce on a sorted column when the bucket grid is bw.
+fn ref_emit(c: MpCol*, bw: float64, x0: float64, x1: float64, cols: int32, lead: bool,
+            xs: float64*, ys: float64*, cap: int64) -> int64 {
+  var i_lo: int64 = ref_lower(c, x0);
+  var i_hi: int64 = ref_upper(c, x1, i_lo);
+  var n: int64 = 0;
+  if (lead) {
+    var j: int64 = i_lo - 1;
+    while (j >= 0 && n == 0) {
+      if (fin(mp_col_x(c, j)) && fin(mp_col_y(c, j))) {
+        xs[0] = mp_col_x(c, j);
+        ys[0] = mp_col_y(c, j);
+        n = 1;
+      }
+      j = j - 1;
+    }
+  }
+  if (n >= cap || i_lo >= i_hi) { return n; }
+  var o: RefOut;
+  o.xs = xs + n;
+  o.ys = ys + n;
+  o.n = 0;
+  o.cap = cap - n;
+  if (i_hi - i_lo <= cap - n) {
+    var i: int64 = i_lo;
+    while (i < i_hi) {
+      if (fin(mp_col_x(c, i)) && fin(mp_col_y(c, i))) {
+        ref_point(&o, o.n, mp_col_x(c, i), mp_col_y(c, i));
+      }
+      i = i + 1;
+    }
+    return n + o.n;
+  }
+  o.x0 = x0;
+  o.ncol = (int64)cols;
+  if (o.ncol > (int64)MP_SUMMARY_BUCKETS) { o.ncol = (int64)MP_SUMMARY_BUCKETS; }
+  if (o.ncol > o.cap / 4) { o.ncol = o.cap / 4; }
+  if (o.ncol < 1) { o.ncol = 1; }
+  o.colw = (x1 - x0) / (float64)o.ncol;
+  o.ci = -1;
+  g_ref_bucket = true;
+  ref_buckets(c, bw, i_lo, i_hi, &o);
+  return n + o.n;
+}
+
+// ------------------------------------------------------------ properties
+
+// Whether (x, y) is a finite sample of the column (binary search on sorted columns).
+fn is_sample(c: MpCol*, x: float64, y: float64) -> bool {
+  var i: int64 = 0;
+  if (mp_col_sorted(c)) { i = mp_col_lower_bound(c, x); }
+  while (i < mp_col_len(c)) {
+    var cx: float64 = mp_col_x(c, i);
+    if (cx == x && mp_col_y(c, i) == y) { return true; }
+    if (mp_col_sorted(c) && fin(cx) && cx > x) { return false; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// Real samples, x nondecreasing on a sorted column, and (with room for every column) the
+// window's exact y extent among the points that lie in [x0, x1].
+// mp_col_decimate buckets its lead sample with the rest, so a lead that is a bucket's
+// extreme can hide a window extreme there: the extent is checked only without it.
+fn check_props(c: MpCol*, x0: float64, x1: float64, xs: float64*,
+               ys: float64*, n: int64, cap: int64, lead: bool) -> bool {
+  if (n < 0 || n > cap) { return false; }
+  var ok: bool = true;
+  var lo: float64 = INF();
+  var hi: float64 = -INF();
+  var k: int64 = 0;
+  while (k < n) {
+    if (!is_sample(c, xs[k], ys[k])) { ok = false; }
+    if (mp_col_sorted(c) && k > 0 && xs[k] < xs[k - 1]) { ok = false; }
+    if (xs[k] >= x0 && xs[k] <= x1) {
+      lo = fmin(lo, ys[k]);
+      hi = fmax(hi, ys[k]);
+    }
+    k = k + 1;
+  }
+  if (cap < 9 || (lead && !mp_col_sorted(c))) { return ok; }
+  var wlo: float64 = INF();
+  var whi: float64 = -INF();
+  var i: int64 = 0;
+  while (i < mp_col_len(c)) {
+    var x: float64 = mp_col_x(c, i);
+    var y: float64 = mp_col_y(c, i);
+    if (fin(x) && fin(y) && x >= x0 && x <= x1) {
+      wlo = fmin(wlo, y);
+      whi = fmax(whi, y);
+    }
+    i = i + 1;
+  }
+  return ok && lo == wlo && hi == whi;
+}
+
+// ------------------------------------------------------------ fuzz
+
+struct Fz {
+  keep: int64;         // ring size, 0 = unbounded
+  span: float64;       // window span, 0 = everything
+  nb: int32;           // buckets per domain
+  steps: int32;        // actions
+  disorder: bool;      // allow out-of-order pushes
+  feed: bool;          // mirror every push into the summary (else emit catches up)
+  fails: int32;        // frames that disagreed
+  fresh_fails: int32;  // window frames where a fresh summary disagreed
+  prop_fails: int32;   // frames that broke a property
+  rb: int64;           // rebuilds, bw and k_cover after the previous frame
+  bw: float64;
+  kc: int64;
+}
+
+fn fz_push(f: Fz*, c: MpCol*, s: MpSummary*, x: float64*) {
+  var count: int64 = 1 + rnd_int(40);
+  var j: int64 = 0;
+  while (j < count) {
+    var r: int64 = rnd_int(1000);
+    var step: float64 = rnd_f();
+    if (r < 100) { step = 0.0; }
+    if (r >= 990) { step = f->span * 1.5 + 50.0 * rnd_f(); }
+    *x = *x + step;
+    var px: float64 = *x;
+    var py: float64 = 100.0 * rnd_f() - 50.0;
+    if (rnd_int(100) < 3) { py = NAN(); }
+    if (rnd_int(100) < 1) { px = NAN(); }
+    if (f->disorder && rnd_int(400) == 0) { px = *x - 5.0 * rnd_f() - 0.5; }
+    mp_col_push(c, px, py);
+    if (f->feed) { mp_summary_push(s, px, py); }
+    j = j + 1;
+  }
+}
+
+fn first_finite_x(c: MpCol*) -> float64 {
+  var i: int64 = 0;
+  while (i < mp_col_len(c)) {
+    if (fin(mp_col_x(c, i))) { return mp_col_x(c, i); }
+    i = i + 1;
+  }
+  return NAN();
+}
+
+fn fz_emit(f: Fz*, c: MpCol*, s: MpSummary*, xs: float64*, ys: float64*, rx: float64*,
+           ry: float64*) {
+  if (!c->has_last) { return; }
+  var x1: float64 = c->last_x;
+  var x0: float64 = first_finite_x(c);
+  if (f->span > 0.0 && x1 - f->span > x0) { x0 = x1 - f->span; }
+  if (rnd_int(8) == 0) { x0 = x0 - 3.0 * rnd_f(); }
+  if (rnd_int(8) == 0) { x1 = x1 - 2.0 * rnd_f(); }
+  if (!fin(x0) || x1 < x0) { return; }
+  var cols: int32 = 1 + (int32)rnd_int(24);
+  if (rnd_int(16) == 0) { cols = 3000; }
+  var cap: int64 = 4 * (int64)cols + 1;
+  if (rnd_int(6) == 0) { cap = 1 + rnd_int(12); }
+  if (cap > 4096) { cap = 4096; }
+  var lead: bool = rnd_int(3) != 0;
+  var fb: int64 = s->fallbacks;
+  var n: int64 = mp_summary_emit(s, c, x0, x1, cols, lead, xs, ys, cap);
+  var m: int64 = 0;
+  if (!mp_col_sorted(c) || s->fallbacks != fb) {
+    m = mp_col_decimate(c, x0, x1, cols, lead, rx, ry, cap);
+  } else {
+    g_ref_bucket = false;
+    m = ref_emit(c, s->bw, x0, x1, cols, lead, rx, ry, cap);
+    if (g_ref_bucket) { g_bucket_frames = g_bucket_frames + 1; }
+  }
+  g_frames = g_frames + 1;
+  if (s->rebuilds == f->rb && s->bw > f->bw) { g_merges = g_merges + 1; }
+  if (s->rebuilds == f->rb && s->bw == f->bw && s->k_cover > f->kc) { g_drops = g_drops + 1; }
+  f->rb = s->rebuilds;
+  f->bw = s->bw;
+  f->kc = s->k_cover;
+  var same: bool = n == m;
+  var k: int64 = 0;
+  while (same && k < n) {
+    if (xs[k] != rx[k] || ys[k] != ry[k]) { same = false; }
+    k = k + 1;
+  }
+  if (!same) { f->fails = f->fails + 1; }
+  if (!check_props(c, x0, x1, xs, ys, n, cap, lead)) {
+    f->prop_fails = f->prop_fails + 1;
+  }
+  if (f->span > 0.0 && mp_col_sorted(c) && rnd_int(4) == 0) {
+    fz_fresh(f, c, s, x0, x1, cols, lead, xs, ys, n, cap, rx, ry);
+  }
+}
+
+// A summary built from nothing must agree with the incremental one in window mode,
+// where the bucket grid depends only on the span.
+fn fz_fresh(f: Fz*, c: MpCol*, s: MpSummary*, x0: float64, x1: float64, cols: int32,
+            lead: bool, xs: float64*, ys: float64*, n: int64, cap: int64, rx: float64*,
+            ry: float64*) {
+  var t: MpSummary;
+  mp_summary_init(&t);
+  t.nb = s->nb;
+  mp_summary_set_span(&t, s->span);
+  var m: int64 = mp_summary_emit(&t, c, x0, x1, cols, lead, rx, ry, cap);
+  var same: bool = n == m;
+  var k: int64 = 0;
+  while (same && k < n) {
+    if (xs[k] != rx[k] || ys[k] != ry[k]) { same = false; }
+    k = k + 1;
+  }
+  if (!same) { f->fresh_fails = f->fresh_fails + 1; }
+  mp_summary_free(&t);
+}
+
+fn fz_act(f: Fz*, c: MpCol*, s: MpSummary*, x: float64*) {
+  var r: int64 = rnd_int(100);
+  if (r < 2) {
+    mp_col_clear(c);
+    *x = *x + 10.0 * rnd_f() - 5.0;
+  } else if (r < 5 && f->keep > 0) {
+    var k: int64 = f->keep / 2 + rnd_int(f->keep);
+    mp_col_set_keep(c, k);
+  } else if (r < 7 && f->span > 0.0) {
+    var sp: float64 = f->span * (0.5 + rnd_f());
+    mp_summary_set_span(s, sp);
+  } else if (r < 9 && f->span == 0.0) {
+    mp_summary_reset(s);
+  }
+}
+
+fn fz_run(f: Fz*, seed: uint64) {
+  g_rng = seed;
+  var c: MpCol;
+  var s: MpSummary;
+  mp_col_init(&c);
+  mp_col_set_keep(&c, f->keep);
+  mp_summary_init(&s);
+  s.nb = f->nb;
+  mp_summary_set_span(&s, f->span);
+  var xs: float64* = (float64*)mp_alloc(4096 * 8);
+  var ys: float64* = (float64*)mp_alloc(4096 * 8);
+  var rx: float64* = (float64*)mp_alloc(4096 * 8);
+  var ry: float64* = (float64*)mp_alloc(4096 * 8);
+  var x: float64 = 1000.0 * rnd_f() - 500.0;
+  var i: int32 = 0;
+  while (i < f->steps) {
+    fz_push(f, &c, &s, &x);
+    fz_act(f, &c, &s, &x);
+    fz_emit(f, &c, &s, xs, ys, rx, ry);
+    i = i + 1;
+  }
+  mp_free((rawptr)xs);
+  mp_free((rawptr)ys);
+  mp_free((rawptr)rx);
+  mp_free((rawptr)ry);
+  mp_summary_free(&s);
+  mp_col_free(&c);
+}
+
+fn fz_case(name: string, keep: int64, span: float64, nb: int32, steps: int32,
+           disorder: bool, seed: uint64) {
+  var f: Fz;
+  f.keep = keep;
+  f.span = span;
+  f.nb = nb;
+  f.steps = steps;
+  f.disorder = disorder;
+  f.feed = (seed & (uint64)1) == (uint64)0;
+  f.fails = 0;
+  f.fresh_fails = 0;
+  f.prop_fails = 0;
+  f.rb = 0;
+  f.bw = 0.0;
+  f.kc = 0;
+  fz_run(&f, seed);
+  mp_expect_i64(name, (int64)f.fails, 0);
+  mp_expect_i64("fresh summary agrees", (int64)f.fresh_fails, 0);
+  mp_expect_i64("properties hold", (int64)f.prop_fails, 0);
+}
+
+fn check_fuzz(big: bool) {
+  var steps: int32 = 10;
+  if (big) { steps = 1500; }
+  var live0: int64 = mp_alloc_live();
+  fz_case("window, ring", 300, 6.0, 4, steps, false, (uint64)88172645463325252);
+  fz_case("window, unbounded", 0, 9.0, 8, steps, false, (uint64)1234567);
+  fz_case("all, ring", 400, 0.0, 4, steps, false, (uint64)987654321);
+  fz_case("all, unbounded", 0, 0.0, 8, steps, false, (uint64)55555);
+  fz_case("window, disorder", 200, 5.0, 4, steps, true, (uint64)424242);
+  fz_case("all, disorder", 0, 0.0, 4, steps, true, (uint64)31337);
+  if (big) {
+    fz_case("window, default nb", 20000, 40.0, MP_SUMMARY_BUCKETS, 800, false,
+            (uint64)777);
+    fz_case("all, default nb", 0, 0.0, MP_SUMMARY_BUCKETS, 800, false, (uint64)999);
+    fz_case("window, nb 1", 100, 3.0, 1, steps, false, (uint64)2468);
+    fz_case("all, nb 1", 100, 0.0, 1, steps, false, (uint64)1357);
+  }
+  mp_expect_i64("fuzz frees everything", mp_alloc_live(), live0);
+  if (big) {
+    mp_expect("fuzz reaches the bucket path", g_bucket_frames > 0);
+    mp_expect("fuzz merges bucket pairs", g_merges > 0);
+    mp_expect("fuzz drops old buckets", g_drops > 0);
+  }
+}
+
+// ------------------------------------------------------------ targeted
+
+fn check_args() {
+  var c: MpCol;
+  var s: MpSummary;
+  mp_col_init(&c);
+  mp_summary_init(&s);
+  var xs: float64[8];
+  var ys: float64[8];
+  var e: int64 = -(int64)MP_ERR_ARG;
+  mp_expect_i64("emit: null summary", mp_summary_emit(0, &c, 0.0, 1.0, 1, false, &xs[0],
+                &ys[0], 8), e);
+  mp_expect_i64("emit: null column", mp_summary_emit(&s, 0, 0.0, 1.0, 1, false, &xs[0],
+                &ys[0], 8), e);
+  mp_expect_i64("emit: zero cols", mp_summary_emit(&s, &c, 0.0, 1.0, 0, false, &xs[0],
+                &ys[0], 8), e);
+  mp_expect_i64("emit: zero cap", mp_summary_emit(&s, &c, 0.0, 1.0, 1, false, &xs[0],
+                &ys[0], 0), e);
+  mp_expect_i64("emit: empty column", mp_summary_emit(&s, &c, 0.0, 1.0, 1, false, &xs[0],
+                &ys[0], 8), 0);
+  mp_col_push(&c, 0.5, 1.0);
+  mp_expect_i64("emit: reversed range", mp_summary_emit(&s, &c, 1.0, 0.0, 1, false,
+                &xs[0], &ys[0], 8), 0);
+  mp_expect_i64("emit: nan range", mp_summary_emit(&s, &c, NAN(), 1.0, 1, false, &xs[0],
+                &ys[0], 8), 0);
+  mp_expect_i64("span: negative", (int64)mp_summary_set_span(&s, -1.0),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("span: inf", (int64)mp_summary_set_span(&s, INF()), (int64)MP_ERR_ARG);
+  mp_expect_i64("span: null", (int64)mp_summary_set_span(0, 1.0), (int64)MP_ERR_ARG);
+  mp_expect("few samples need no ring", s.ring == 0);
+  mp_summary_free(&s);
+  mp_col_free(&c);
+}
+
+fn peak_y(i: int64) -> float64 {
+  if (i == 537) { return 100.0; }
+  if (i == 211) { return -50.0; }
+  return (float64)(i % 7);
+}
+
+// Peaks survive, output stays within 4 * cols + lead, and the lead is the last sample
+// before x0.
+fn check_peaks() {
+  var c: MpCol;
+  var s: MpSummary;
+  mp_col_init(&c);
+  mp_summary_init(&s);
+  s.nb = 16;
+  var i: int64 = 0;
+  while (i < 1000) {
+    mp_col_push(&c, (float64)i, peak_y(i));
+    i = i + 1;
+  }
+  var xs: float64[42];
+  var ys: float64[42];
+  xs[41] = 12345.0;
+  var n: int64 = mp_summary_emit(&s, &c, 100.5, 999.0, 10, true, &xs[0], &ys[0], 41);
+  mp_expect("peaks: within cap", n > 0 && n <= 41);
+  mp_expect_near("peaks: nothing past cap", xs[41], 12345.0, 0.0);
+  mp_expect_near("peaks: lead is the last sample before x0", xs[0], 100.0, 0.0);
+  mp_expect_near("peaks: first visible kept", xs[1], 101.0, 0.0);
+  mp_expect_near("peaks: last kept", xs[n - 1], 999.0, 0.0);
+  var up: bool = false;
+  var down: bool = false;
+  var k: int64 = 0;
+  while (k < n) {
+    if (ys[k] == 100.0) { up = true; }
+    if (ys[k] == -50.0) { down = true; }
+    k = k + 1;
+  }
+  mp_expect("peaks: upward peak survives", up);
+  mp_expect("peaks: downward peak survives", down);
+  mp_expect_i64("peaks: one rebuild", s.rebuilds, 1);
+  mp_summary_free(&s);
+  mp_col_free(&c);
+}
+
+// A full ring keeps pushing and drawing frames without allocating or rebuilding.
+fn check_steady(span: float64, keep: int64, total: int64, rounds: int32, nb: int32,
+                cols: int32) {
+  var c: MpCol;
+  var s: MpSummary;
+  mp_col_init(&c);
+  mp_col_set_keep(&c, keep);
+  mp_summary_init(&s);
+  s.nb = nb;
+  mp_summary_set_span(&s, span);
+  var xs: float64* = (float64*)mp_alloc(2048 * 4 * 8 + 8);
+  var ys: float64* = (float64*)mp_alloc(2048 * 4 * 8 + 8);
+  var x: float64 = 0.0;
+  var i: int64 = 0;
+  while (i < total) {
+    mp_col_push(&c, x, sin(x));
+    mp_summary_push(&s, x, sin(x));
+    x = x + 0.01;
+    i = i + 1;
+  }
+  var cap: int64 = 2048 * 4 + 1;
+  var first: float64 = c.last_x - span;
+  if (span == 0.0) { first = mp_col_x(&c, 0); }
+  var n: int64 = mp_summary_emit(&s, &c, first, c.last_x, cols, true, xs, ys, cap);
+  mp_expect("steady: first frame draws", n > 0);
+  var a0: int64 = mp_alloc_count();
+  var r0: int64 = s.rebuilds;
+  var bad: bool = false;
+  var r: int32 = 0;
+  while (r < rounds) {
+    var j: int32 = 0;
+    while (j < 100) {
+      mp_col_push(&c, x, sin(x));
+      mp_summary_push(&s, x, sin(x));
+      x = x + 0.01;
+      j = j + 1;
+    }
+    var x0: float64 = c.last_x - span;
+    if (span == 0.0) { x0 = mp_col_x(&c, 0); }
+    var m: int64 = mp_summary_emit(&s, &c, x0, c.last_x, cols, true, xs, ys, cap);
+    if (m < 2 || m > cap) { bad = true; }
+    r = r + 1;
+  }
+  mp_expect("steady: frames draw", !bad);
+  mp_expect_i64("steady: no allocation", mp_alloc_count() - a0, 0);
+  mp_expect_i64("steady: no rebuild", s.rebuilds - r0, 0);
+  mp_expect_i64("steady: no fallback", s.fallbacks, 0);
+  mp_free((rawptr)xs);
+  mp_free((rawptr)ys);
+  mp_summary_free(&s);
+  mp_col_free(&c);
+}
+
+// Epoch microseconds with a one-minute window: the grid stays exact.
+fn check_epoch() {
+  var c: MpCol;
+  var s: MpSummary;
+  mp_col_init(&c);
+  mp_col_set_keep(&c, 3000);
+  mp_summary_init(&s);
+  s.nb = 32;
+  mp_summary_set_span(&s, 60000000.0);
+  var t: float64 = 1700000000000000.0;
+  var i: int64 = 0;
+  while (i < 3000) {
+    var y: float64 = (float64)(i % 11);
+    if (i == 2900) { y = 99.0; }
+    mp_col_push(&c, t, y);
+    t = t + 25000.0;
+    i = i + 1;
+  }
+  var xs: float64[200];
+  var ys: float64[200];
+  var x1: float64 = c.last_x;
+  var x0: float64 = x1 - 60000000.0;
+  var n: int64 = mp_summary_emit(&s, &c, x0, x1, 40, true, &xs[0], &ys[0], 161);
+  var rx: float64[200];
+  var ry: float64[200];
+  var m: int64 = ref_emit(&c, s.bw, x0, x1, 40, true, &rx[0], &ry[0], 161);
+  mp_expect("epoch: draws", n > 0 && n <= 161);
+  mp_expect_i64("epoch: no fallback", s.fallbacks, 0);
+  mp_expect("epoch: properties", check_props(&c, x0, x1, &xs[0], &ys[0], n, 161,
+            true));
+  var same: bool = n == m;
+  var k: int64 = 0;
+  while (same && k < n) {
+    if (xs[k] != rx[k] || ys[k] != ry[k]) { same = false; }
+    k = k + 1;
+  }
+  mp_expect("epoch: matches the reference", same);
+  mp_summary_free(&s);
+  mp_col_free(&c);
+}
+
+fn run_all(big: bool) {
+  var live0: int64 = mp_alloc_live();
+  check_args();
+  check_peaks();
+  check_epoch();
+  check_fuzz(big);
+  if (big) {
+    check_steady(10.0, 50000, 60000, 60, MP_SUMMARY_BUCKETS, 1200);
+    check_steady(0.0, 50000, 60000, 60, MP_SUMMARY_BUCKETS, 1200);
+  } else {
+    check_steady(1.0, 400, 500, 2, 8, 6);
+  }
+  mp_expect_i64("everything freed", mp_alloc_live(), live0);
+}
+
+export fn main() -> int32 {
+  run_all(true);
+  println("{g_frames} fuzz frames, {g_bucket_frames} on the bucket path");
+  println("{g_merges} with merges, {g_drops} with drops");
+  return mp_summary();
+}
+
+@test fn t_summary() -> int32 {
+  run_all(false);
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

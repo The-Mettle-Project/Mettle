@@ -1,0 +1,53 @@
+// File output: a chart's SVG written to disk and read back byte for byte, and the path
+// errors. Uses std/io, so it runs only in the native builds.
+
+import "std/io";
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/render/svg";
+import "mistplot/render/file";
+
+fn check_save() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  mp_chart_push(c, s, 0.0, 1.0);
+  mp_chart_push(c, s, 1.0, 3.0);
+  var path: string = "build/file_test.svg";
+  mp_expect_i64("save", (int64)mp_chart_save_svg(c, 200.0, 100.0, path), (int64)MP_OK);
+  var want: MpBuf* = mp_buf_new(256);
+  mp_chart_svg(c, 200.0, 100.0, want);
+  var got: uint8* = (uint8*)mp_alloc(mp_buf_len(want) + 16);
+  var mode: string = "rb";
+  var fp: cstring = fopen("build/file_test.svg", mode.chars);
+  mp_expect("reopen", fp != 0);
+  var n: int64 = 0;
+  if (fp != 0) {
+    n = fread((cstring)got, 1, mp_buf_len(want) + 16, fp);
+    fclose(fp);
+  }
+  mp_expect_i64("size", n, mp_buf_len(want));
+  var same: bool = true;
+  var i: int64 = 0;
+  while (i < n && i < mp_buf_len(want)) {
+    if (got[i] != want->data[i]) { same = false; }
+    i = i + 1;
+  }
+  mp_expect("bytes", same);
+  mp_expect_i64("empty path", (int64)mp_buf_save(want, ""), (int64)MP_ERR_ARG);
+  mp_expect_i64("no dir", (int64)mp_buf_save(want, "build/no/such/dir/x.svg"), (int64)MP_ERR_IO);
+  mp_expect_i64("null buf", (int64)mp_buf_save(0, path), (int64)MP_ERR_ARG);
+  mp_free((rawptr)got);
+  mp_buf_free(want);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+export fn main() -> int32 {
+  check_save();
+  return mp_summary();
+}

@@ -1,0 +1,137 @@
+//! Owned string copies and UTF-8 walking. Objects copy every string they are given with
+//! mp_str_dup / mp_str_assign and release it with mp_str_free, so a caller's temporary
+//! can never dangle. An owned string is either "" (never allocated) or a heap copy.
+//! UTF-8 is decoded strictly: a byte that does not start a valid sequence counts as one
+//! code point of its own. Uses core/mem (counted) and core/error.
+
+import "std/conv";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+
+/// Heap copy of a string.
+///
+/// @param s Text to copy. Valid: any, up to MP_MAX_COUNT * 8 bytes; longer gives "".
+/// @return An owned copy, or "" when s is empty, too long or the allocation failed.
+/// @mem The caller owns the copy and releases it with mp_str_free. An empty result is a
+///   literal and allocates nothing; s is not retained.
+/// @thread Safe from any thread.
+/// @cost O(len); one allocation when s is non-empty.
+export fn mp_str_dup(s: string) -> string {
+  var n: int64 = (int64)s.length;
+  if (n <= 0 || n > MP_MAX_COUNT * 8) { return ""; }
+  var p: uint8* = (uint8*)mp_alloc(n);
+  if (p == 0) { return ""; }
+  var i: int64 = 0;
+  while (i < n) {
+    p[i] = s.chars[i];
+    i = i + 1;
+  }
+  return str_from_bytes((cstring)p, n);
+}
+
+/// Releases a string from mp_str_dup or mp_str_assign.
+///
+/// @param s The owned string. Valid: "" or a string returned by mp_str_dup; an empty
+///   string is ignored.
+/// @mem s is invalid afterwards. Never pass a literal or a borrowed view that is not empty.
+/// @thread Safe from any thread.
+export fn mp_str_free(s: string) {
+  if ((int64)s.length <= 0) { return; }
+  mp_free((rawptr)s.chars);
+}
+
+/// Replaces an owned string with a copy of s.
+/// The copy is made before the old string is freed, so s may be a view of *dst.
+///
+/// @param dst The owned string to replace. Valid: non-zero, pointing at "" or a string
+///   from mp_str_dup / mp_str_assign.
+/// @param s New text. Valid: any, up to MP_MAX_COUNT * 8 bytes.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG dst is 0; nothing changes.
+/// @error MP_ERR_ALLOC s is non-empty and the copy failed (or s is too long); *dst is
+///   unchanged.
+/// @mem *dst owns the new copy; the old one is freed. s is not retained.
+/// @thread One thread at a time per dst.
+/// @cost O(len(s)); one allocation when s is non-empty.
+export fn mp_str_assign(dst: string*, s: string) -> int32 {
+  if (dst == 0) { return MP_ERR_ARG; }
+  var copy: string = mp_str_dup(s);
+  if ((int64)copy.length == 0 && (int64)s.length > 0) { return MP_ERR_ALLOC; }
+  var old: string = *dst;
+  *dst = copy;
+  mp_str_free(old);
+  return MP_OK;
+}
+
+fn ustr_cont(s: string, i: int64, lo: int32, hi: int32) -> bool {
+  if (i >= (int64)s.length) { return false; }
+  var c: int32 = (int32)s.chars[i];
+  return c >= lo && c <= hi;
+}
+
+// Byte length of the valid sequence starting at i, or 1 for an invalid byte. The second
+// byte's range depends on the lead so overlong forms and surrogates are rejected.
+fn ustr_seq(s: string, i: int64) -> int64 {
+  var c: int32 = (int32)s.chars[i];
+  if (c < 0x80) { return 1; }
+  if (c >= 0xC2 && c <= 0xDF) {
+    if (ustr_cont(s, i + 1, 0x80, 0xBF)) { return 2; }
+    return 1;
+  }
+  var lo: int32 = 0x80;
+  var hi: int32 = 0xBF;
+  var n: int64 = 0;
+  if (c >= 0xE0 && c <= 0xEF) {
+    n = 3;
+    if (c == 0xE0) { lo = 0xA0; }
+    if (c == 0xED) { hi = 0x9F; }
+  } else if (c >= 0xF0 && c <= 0xF4) {
+    n = 4;
+    if (c == 0xF0) { lo = 0x90; }
+    if (c == 0xF4) { hi = 0x8F; }
+  } else {
+    return 1;
+  }
+  if (!ustr_cont(s, i + 1, lo, hi)) { return 1; }
+  var k: int64 = 2;
+  while (k < n) {
+    if (!ustr_cont(s, i + k, 0x80, 0xBF)) { return 1; }
+    k = k + 1;
+  }
+  return n;
+}
+
+/// Number of code points in a UTF-8 string.
+///
+/// @param s The text. Valid: any bytes; each byte that does not start a valid sequence
+///   counts as one code point.
+/// @return The code point count, 0 for "".
+/// @mem s is only read.
+/// @thread Safe from any thread.
+/// @cost O(len); no allocation.
+export fn mp_utf8_len(s: string) -> int64 {
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  var count: int64 = 0;
+  while (i < n) {
+    i = i + ustr_seq(s, i);
+    count = count + 1;
+  }
+  return count;
+}
+
+/// Byte index just after the code point that starts at byte i.
+///
+/// @param s The text. Valid: any bytes.
+/// @param i Byte index. Valid: 0 .. len-1; i < 0 returns 0 and i >= len returns len. An
+///   index inside a sequence counts as one invalid byte and returns i + 1.
+/// @return The next byte index, at most len.
+/// @mem s is only read.
+/// @thread Safe from any thread.
+/// @cost O(1); no allocation.
+export fn mp_utf8_next(s: string, i: int64) -> int64 {
+  var n: int64 = (int64)s.length;
+  if (i < 0) { return 0; }
+  if (i >= n) { return n; }
+  return i + ustr_seq(s, i);
+}

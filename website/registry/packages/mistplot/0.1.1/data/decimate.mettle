@@ -1,0 +1,208 @@
+//! Min/max decimation of a column into caller arrays: the O(n) path for columns that
+//! are unsorted or too small for data/summary. Uses data/col and core/error; allocates
+//! nothing (bucket bookkeeping lives in the output x array). Only samples with finite x
+//! and y inside the range take part. Buckets come from x alone, so push order never
+//! decides which samples survive: each bucket emits its first, min-y, max-y and last
+//! sample, sorted by (x, position), and the extremes of every bucket are always drawn.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/data/col";
+
+// Sorts up to four positions ascending and drops repeats in place; returns the count.
+fn dec_sort_unique(p: int64*, n: int32) -> int32 {
+  var i: int32 = 1;
+  while (i < n) {
+    var v: int64 = p[(int64)i];
+    var j: int32 = i - 1;
+    while (j >= 0 && p[(int64)j] > v) {
+      p[(int64)j + 1] = p[(int64)j];
+      j = j - 1;
+    }
+    p[(int64)j + 1] = v;
+    i = i + 1;
+  }
+  if (n == 0) { return 0; }
+  var m: int32 = 1;
+  var k: int32 = 1;
+  while (k < n) {
+    if (p[(int64)k] != p[(int64)m - 1]) {
+      p[(int64)m] = p[(int64)k];
+      m = m + 1;
+    }
+    k = k + 1;
+  }
+  return m;
+}
+
+// Sorts up to four positions by (x, position) and drops repeats; returns the count.
+fn dec_sort_xpos(c: MpCol*, p: int64*, n: int32) -> int32 {
+  var m: int32 = dec_sort_unique(p, n);
+  var i: int32 = 1;
+  while (i < m) {
+    var v: int64 = p[(int64)i];
+    var vx: float64 = mp_col_x(c, v);
+    var j: int32 = i - 1;
+    while (j >= 0 && mp_col_x(c, p[(int64)j]) > vx) {
+      p[(int64)j + 1] = p[(int64)j];
+      j = j - 1;
+    }
+    p[(int64)j + 1] = v;
+    i = i + 1;
+  }
+  return m;
+}
+
+fn dec_usable(x: float64, y: float64, x0: float64, x1: float64) -> bool {
+  if (is_finite(x) == 0 || is_finite(y) == 0) { return false; }
+  return x >= x0 && x <= x1;
+}
+
+// The largest finite x below x0 among samples with a finite y; x0 when there is none.
+fn dec_prev_x(c: MpCol*, x0: float64) -> float64 {
+  var best: float64 = x0;
+  var found: bool = false;
+  var i: int64 = 0;
+  while (i < mp_col_len(c)) {
+    var x: float64 = mp_col_x(c, i);
+    if (is_finite(x) != 0 && is_finite(mp_col_y(c, i)) != 0 && x < x0) {
+      if (!found || x > best) {
+        best = x;
+        found = true;
+      }
+    }
+    i = i + 1;
+  }
+  return best;
+}
+
+// Copies every usable sample in column order; the caller checked that they fit.
+fn dec_copy(c: MpCol*, x0: float64, x1: float64, xs: float64*, ys: float64*,
+            cap: int64) -> int64 {
+  var n: int64 = 0;
+  var i: int64 = 0;
+  while (i < mp_col_len(c) && n < cap) {
+    var x: float64 = mp_col_x(c, i);
+    var y: float64 = mp_col_y(c, i);
+    if (dec_usable(x, y, x0, x1)) {
+      xs[n] = x;
+      ys[n] = y;
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+// Fills bkp[4k .. 4k+3] with the first, min, max and last position of bucket k
+// (-1 = empty) in one pass over the column.
+fn dec_record(c: MpCol*, x0: float64, x1: float64, b: int64, bkp: float64*) {
+  var j: int64 = 0;
+  while (j < b * 4) {
+    bkp[j] = -1.0;
+    j = j + 1;
+  }
+  var span: float64 = x1 - x0;
+  var i: int64 = 0;
+  while (i < mp_col_len(c)) {
+    var x: float64 = mp_col_x(c, i);
+    var y: float64 = mp_col_y(c, i);
+    if (dec_usable(x, y, x0, x1)) {
+      var k: int64 = 0;
+      if (span > 0.0) {
+        k = (int64)((x - x0) / span * (float64)b);
+        if (k < 0) { k = 0; }
+        if (k > b - 1) { k = b - 1; }
+      }
+      var o: int64 = k * 4;
+      if (bkp[o] < 0.0) {
+        bkp[o] = (float64)i;
+        bkp[o + 1] = (float64)i;
+        bkp[o + 2] = (float64)i;
+      } else {
+        if (y < mp_col_y(c, (int64)bkp[o + 1])) { bkp[o + 1] = (float64)i; }
+        if (y > mp_col_y(c, (int64)bkp[o + 2])) { bkp[o + 2] = (float64)i; }
+      }
+      bkp[o + 3] = (float64)i;
+    }
+    i = i + 1;
+  }
+}
+
+// Emits the buckets in x order. Bucket k's positions are read into locals before its
+// first write, which lands at an index <= 4k, so output never clobbers unread entries.
+fn dec_emit(c: MpCol*, b: int64, bkp: float64*, xs: float64*, ys: float64*,
+            cap: int64) -> int64 {
+  var n: int64 = 0;
+  var bk: int64 = 0;
+  while (bk < b && n < cap) {
+    var q: int64 = bk * 4;
+    if (bkp[q] >= 0.0) {
+      var p: int64[4];
+      p[0] = (int64)bkp[q];
+      p[1] = (int64)bkp[q + 1];
+      p[2] = (int64)bkp[q + 2];
+      p[3] = (int64)bkp[q + 3];
+      var m: int32 = dec_sort_xpos(c, &p[0], 4);
+      var t: int32 = 0;
+      while (t < m && n < cap) {
+        xs[n] = mp_col_x(c, p[(int64)t]);
+        ys[n] = mp_col_y(c, p[(int64)t]);
+        n = n + 1;
+        t = t + 1;
+      }
+    }
+    bk = bk + 1;
+  }
+  return n;
+}
+
+/// Decimates the samples of col inside [x0, x1] into at most cap points.
+/// When at most cap samples take part they are copied as they are, oldest first.
+/// Otherwise [x0, x1] is split into b equal buckets (b = cols, lowered to cap / 4 and at
+/// least 1) and each bucket emits its distinct first, min-y, max-y and last samples,
+/// buckets in x order. With lead, the range starts instead at the largest finite x below
+/// x0 that has a finite y, so a line can enter the plot from its left edge.
+///
+/// @param col The column. Valid: non-zero.
+/// @param x0 Range start (inclusive). Units: data units. Valid: finite; otherwise 0 is
+///   returned.
+/// @param x1 Range end (inclusive). Units: data units. Valid: finite and >= x0;
+///   otherwise 0 is returned.
+/// @param cols Bucket count before the cap lowers it. Units: columns. Valid: >= 1.
+/// @param lead Whether to include the last sample before x0.
+/// @param xs Output x. Valid: non-zero with room for cap values.
+/// @param ys Output y. Valid: non-zero with room for cap values.
+/// @param cap Output capacity. Units: points. Valid: >= 1; below 4 the single bucket is
+///   truncated to cap points.
+/// @return Points written (0 .. cap), or -MP_ERR_ARG.
+/// @error MP_ERR_ARG col, xs or ys is 0, cols < 1 or cap < 1 (returned negated);
+///   nothing is written.
+/// @mem Writes only xs[0 .. cap) and ys[0 .. cap); xs also serves as scratch.
+/// @cost O(n), two or three passes; no allocation.
+export fn mp_col_decimate(col: MpCol*, x0: float64, x1: float64, cols: int32, lead: bool,
+                          xs: float64*, ys: float64*, cap: int64) -> int64 {
+  if (col == 0 || xs == 0 || ys == 0 || cols < 1 || cap < 1) {
+    return -(int64)MP_ERR_ARG;
+  }
+  if (is_finite(x0) == 0 || is_finite(x1) == 0 || x1 < x0) { return 0; }
+  var lo: float64 = x0;
+  if (lead) { lo = dec_prev_x(col, x0); }
+  var m: int64 = 0;
+  var i: int64 = 0;
+  while (i < mp_col_len(col)) {
+    if (dec_usable(mp_col_x(col, i), mp_col_y(col, i), lo, x1)) { m = m + 1; }
+    i = i + 1;
+  }
+  if (m <= cap) { return dec_copy(col, lo, x1, xs, ys, cap); }
+  var b: int64 = (int64)cols;
+  if (b > cap / 4) { b = cap / 4; }
+  if (b < 1) { b = 1; }
+  // Below four slots there is no room for one bucket's bookkeeping in xs.
+  var tiny: float64[4];
+  var bkp: float64* = xs;
+  if (b * 4 > cap) { bkp = &tiny[0]; }
+  dec_record(col, lo, x1, b, bkp);
+  return dec_emit(col, b, bkp, xs, ys, cap);
+}

@@ -1,0 +1,120 @@
+// Snapping at device scales 1, 1.25, 1.5 and 2: widths land on whole device pixels,
+// odd-width lines on pixel centres, even-width lines and edges on pixel boundaries.
+
+import "std/math";
+import "mistplot/test/harness";
+import "mistplot/scene/snap";
+
+const EPS: float64 = 0.000000001;
+
+// v * scale is a whole number (+ half when `half`).
+fn on_grid(v: float64, scale: float64, half: bool) -> bool {
+  var d: float64 = v * scale;
+  if (half) { d = d - 0.5; }
+  var r: float64 = floor(d + 0.5);
+  return t_abs(d - r) < 0.000001;
+}
+
+fn t_abs(v: float64) -> float64 {
+  if (v < 0.0) { return 0.0 - v; }
+  return v;
+}
+
+fn check_scale1() {
+  mp_expect_near("w 1 @1", mp_snap_width(1.0, 1.0), 1.0, EPS);
+  mp_expect_near("w 0.3 @1 -> 1", mp_snap_width(0.3, 1.0), 1.0, EPS);
+  mp_expect_near("w 2.4 @1 -> 2", mp_snap_width(2.4, 1.0), 2.0, EPS);
+  mp_expect_near("line 10.2 w1 @1", mp_snap_line(10.2, 1.0, 1.0), 10.5, EPS);
+  mp_expect_near("line 10.9 w1 @1", mp_snap_line(10.9, 1.0, 1.0), 10.5, EPS);
+  mp_expect_near("line 10.6 w2 @1", mp_snap_line(10.6, 2.0, 1.0), 11.0, EPS);
+  mp_expect_near("edge 3.49 @1", mp_snap_edge(3.49, 1.0), 3.0, EPS);
+  mp_expect_near("edge 3.5 @1", mp_snap_edge(3.5, 1.0), 4.0, EPS);
+  mp_expect_near("edge -2.6 @1", mp_snap_edge(-2.6, 1.0), -3.0, EPS);
+}
+
+fn check_scale125() {
+  mp_expect_near("w 1 @1.25 -> 0.8", mp_snap_width(1.0, 1.25), 0.8, EPS);
+  mp_expect_near("w 2 @1.25 -> 2.4", mp_snap_width(2.0, 1.25), 2.4, EPS);
+  // 1 px at 1.25 is 1 device px (odd): centre at 12.5 device px = 10.0 px.
+  mp_expect_near("line 10.1 w1 @1.25", mp_snap_line(10.1, 1.0, 1.25), 10.0, EPS);
+  // 2 px at 1.25 is 3 device px (odd): floor(12.875) + 0.5 = 12.5 -> 10.0 px.
+  mp_expect_near("line 10.3 w2 @1.25", mp_snap_line(10.3, 2.0, 1.25), 10.0, EPS);
+  mp_expect_near("edge 10.3 @1.25", mp_snap_edge(10.3, 1.25), 10.4, EPS);
+}
+
+fn check_scale15() {
+  mp_expect_near("w 1 @1.5 -> 4/3", mp_snap_width(1.0, 1.5), 2.0 / 1.5, EPS);
+  // 1 px at 1.5 rounds to 2 device px (even): round(15.3) = 15 -> 10 px.
+  mp_expect_near("line 10.2 w1 @1.5", mp_snap_line(10.2, 1.0, 1.5), 10.0, EPS);
+  mp_expect_near("line 10.4 w1 @1.5", mp_snap_line(10.4, 1.0, 1.5), 16.0 / 1.5, EPS);
+  mp_expect_near("edge 10.2 @1.5", mp_snap_edge(10.2, 1.5), 10.0, EPS);
+  mp_expect_near("edge 10.4 @1.5", mp_snap_edge(10.4, 1.5), 16.0 / 1.5, EPS);
+}
+
+fn check_scale2() {
+  mp_expect_near("w 1 @2", mp_snap_width(1.0, 2.0), 1.0, EPS);
+  mp_expect_near("w 0.5 @2 = one device px", mp_snap_width(0.5, 2.0), 0.5, EPS);
+  mp_expect_near("line 10.3 w1 @2 (even)", mp_snap_line(10.3, 1.0, 2.0), 10.5, EPS);
+  mp_expect_near("line 10.3 w0.5 @2 (odd)", mp_snap_line(10.3, 0.5, 2.0), 10.25, EPS);
+  mp_expect_near("edge 10.3 @2", mp_snap_edge(10.3, 2.0), 10.5, EPS);
+}
+
+// Invariants over a sweep of positions and widths at every scale.
+fn check_sweep() {
+  var scales: float64[4];
+  scales[0] = 1.0;
+  scales[1] = 1.25;
+  scales[2] = 1.5;
+  scales[3] = 2.0;
+  var bad: int32 = 0;
+  var k: int32 = 0;
+  while (k < 4) {
+    var sc: float64 = scales[k];
+    var i: int32 = 0;
+    while (i < 200) {
+      var v: float64 = (float64)i * 0.137 - 5.0;
+      var w: float64 = 0.25 + (float64)(i % 9) * 0.5;
+      var sw: float64 = mp_snap_width(w, sc);
+      var dw: float64 = floor(sw * sc + 0.5);
+      if (!on_grid(sw, sc, false) || dw < 1.0) { bad = bad + 1; }
+      var odd: bool = dw - 2.0 * floor(dw / 2.0) == 1.0;
+      var c: float64 = mp_snap_line(v, w, sc);
+      if (!on_grid(c, sc, odd)) { bad = bad + 1; }
+      if (t_abs(c - v) * sc > 1.0 + EPS) { bad = bad + 1; }
+      var e: float64 = mp_snap_edge(v, sc);
+      if (!on_grid(e, sc, false) || t_abs(e - v) * sc > 0.5 + EPS) { bad = bad + 1; }
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+  mp_expect_i64("sweep invariants", (int64)bad, 0);
+}
+
+fn check_bad_scale() {
+  mp_expect_near("scale 0 counts as 1", mp_snap_edge(3.4, 0.0), 3.0, EPS);
+  mp_expect_near("scale -2 counts as 1", mp_snap_line(3.4, 1.0, -2.0), 3.5, EPS);
+  var zero: float64 = 0.0;
+  var nan: float64 = zero / zero;
+  mp_expect_near("NaN scale counts as 1", mp_snap_width(2.0, nan), 2.0, EPS);
+  mp_expect_near("NaN width is one device px", mp_snap_width(nan, 2.0), 0.5, EPS);
+}
+
+fn run_all() {
+  check_scale1();
+  check_scale125();
+  check_scale15();
+  check_scale2();
+  check_sweep();
+  check_bad_scale();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_snap() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
