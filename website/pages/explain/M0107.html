@@ -21,7 +21,7 @@
 <p class="lede">Reported by the compiler as an error or warning.</p>
 <pre><code>mettle explain M0107</code></pre>
 
-<p>An allocation never escapes the function (not returned, not stored, not passed on) and is never freed: the memory is unreachable after the function returns.</p>
+<p>An allocation is never returned, stored or passed on, and never freed, so the memory is unreachable after the function returns.</p>
 <p>Fix: free it on every path (a <code>defer free(p);</code> right after the allocation covers early returns), or hand ownership out.</p>
 
 <h2>Related</h2>

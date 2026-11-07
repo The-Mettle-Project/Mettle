@@ -21,7 +21,7 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain int64-elements</code></pre>
 
-<p>The loop loads or stores int64/uint64. There is no 64-bit integer kernel yet, so the loop stays scalar.</p>
+<p>The loop loads or stores int64 or uint64. There is no 64-bit integer kernel yet, so the loop stays scalar.</p>
 <p>Fix: use int32 where the range allows it. Four lanes per vector become eight. Where the values genuinely need 64 bits, this loop is at its floor for now.</p>
 
 <h2>Related</h2>

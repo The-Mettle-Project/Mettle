@@ -21,7 +21,7 @@
 <p class="lede">Reported by the compiler as an error or warning.</p>
 <pre><code>mettle explain M0110</code></pre>
 
-<p>A pointer into a stack value (a field, an array element) escapes the scope that owns the value, e.g. saved to an outer variable inside a block. When the block exits the pointee dies.</p>
+<p>A pointer into a stack value, a field or an array element, escapes the scope that owns the value, for example saved to an outer variable inside a block. When the block exits the pointee dies.</p>
 <p>Fix: shorten the pointer&#x27;s lifetime to the value&#x27;s scope, or move the value itself to the outer scope / heap.</p>
 
 <h2>Related</h2>

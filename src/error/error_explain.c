@@ -13,7 +13,7 @@ static const ErrorCodeDoc DOCS[] = {
     {"E0001", "Lexical error",
      "The compiler could not turn part of the source text into tokens.\n"
      "Typical causes: an unterminated string literal, an invalid numeric\n"
-     "literal (e.g. 0x with no digits), or a stray character that is not\n"
+     "literal such as 0x with no digits, or a stray character that is not\n"
      "part of the language.\n"
      "\n"
      "Example:\n"
@@ -34,8 +34,7 @@ static const ErrorCodeDoc DOCS[] = {
      "        var x: int64 = 1;\n"
      "\n"
      "After a syntax error the parser resynchronizes at the next statement\n"
-     "boundary and keeps going, so one mistake reports once, not as a\n"
-     "cascade.\n"},
+     "boundary and keeps going, so one mistake reports once.\n"},
     {"E0003", "Semantic error",
      "The code is grammatically valid but does not make sense: an\n"
      "undefined variable or function, a duplicate declaration, a wrong\n"
@@ -126,15 +125,14 @@ static const ErrorCodeDoc DOCS[] = {
      "Fix: correct the index or the array size. Remember indices are\n"
      "0-based: the last element of `var a: int64[4]` is a[3].\n"},
     {"M0106", "Memory operation overflows a stack array",
-     "A memcpy/memset-style operation writes more bytes than the\n"
+     "A memcpy or memset writes more bytes than the\n"
      "destination stack array holds, smashing adjacent stack memory.\n"
      "\n"
      "Fix: pass the correct byte count (element count * element size), or\n"
      "grow the buffer.\n"},
     {"M0107", "Memory leak",
-     "An allocation never escapes the function (not returned, not stored,\n"
-     "not passed on) and is never freed: the memory is unreachable after\n"
-     "the function returns.\n"
+     "An allocation is never returned, stored or passed on, and never freed,\n"
+     "so the memory is unreachable after the function returns.\n"
      "\n"
      "Fix: free it on every path (a `defer free(p);` right after the\n"
      "allocation covers early returns), or hand ownership out.\n"},
@@ -151,9 +149,9 @@ static const ErrorCodeDoc DOCS[] = {
      "\n"
      "Fix: decide which side owns the pointer and free only there.\n"},
     {"M0110", "Borrowed interior pointer outlives its scope",
-     "A pointer into a stack value (a field, an array element) escapes the\n"
-     "scope that owns the value, e.g. saved to an outer variable inside a\n"
-     "block. When the block exits the pointee dies.\n"
+     "A pointer into a stack value, a field or an array element, escapes the\n"
+     "scope that owns the value, for example saved to an outer variable\n"
+     "inside a block. When the block exits the pointee dies.\n"
      "\n"
      "Fix: shorten the pointer's lifetime to the value's scope, or move\n"
      "the value itself to the outer scope / heap.\n"},
@@ -269,8 +267,8 @@ static const ErrorCodeDoc DOCS[] = {
      "is.\n"
      "\n"
      "Neither half is reported on its own, because each is sometimes the only\n"
-     "way to say a thing. An integer that really is an address -- a handle\n"
-     "from the operating system, a device pointer -- becomes a pointer by\n"
+     "way to say a thing. An integer that is an address, such as a handle\n"
+     "from the operating system or a device pointer, becomes a pointer by\n"
      "cast. A pointer becomes an integer to be printed, hashed or aligned.\n"
      "Only the round trip carries no information.\n"},
     {"M0121", "A task was handed a pointer into the frame that spawned it",
@@ -1109,18 +1107,18 @@ static const DecisionDoc DECISIONS[] = {
      "costs nothing to keep scalar.\n"},
     {"int16-elements", DECISION_VECTOR_REFUSAL,
      "16-bit integer elements have no kernel",
-     "The loop loads or stores int16/uint16. Mettle ships kernels for 8-bit\n"
-     "and 32-bit integers and for both float widths, but not for 16-bit.\n"
+     "The loop loads or stores int16 or uint16. Mettle has kernels for 8-bit\n"
+     "and 32-bit integers and for both float widths, and none for 16-bit.\n"
      "\n"
      "Fix: widen the array to int32. The loop then runs eight lanes at a time\n"
-     "instead of one, which more than pays for the extra memory in a hot loop.\n"
-     "Where the values fit in a byte, int8 is faster still.\n"
+     "where it ran one, which more than pays for the extra memory in a hot\n"
+     "loop. Where the values fit in a byte, int8 is faster still.\n"
      "\n"
-     "This is a gap in the compiler, not a fact about your code. The report\n"
-     "simulates the widening and tells you which kernel you would get.\n"},
+     "The missing kernel is the compiler's gap; the loop is fine. The report\n"
+     "simulates the widening and names the kernel you would get.\n"},
     {"int64-elements", DECISION_VECTOR_REFUSAL,
      "64-bit integer elements have no kernel",
-     "The loop loads or stores int64/uint64. There is no 64-bit integer kernel\n"
+     "The loop loads or stores int64 or uint64. There is no 64-bit integer kernel\n"
      "yet, so the loop stays scalar.\n"
      "\n"
      "Fix: use int32 where the range allows it. Four lanes per vector become\n"
@@ -1140,19 +1138,18 @@ static const DecisionDoc DECISIONS[] = {
      "    while (i < n) { counts[i] = 0; i += 1; }\n"
      "\n"
      "The local says the base does not change, which is what the loop meant.\n"
-     "This is a gap in the compiler's alias reasoning, not a fact about your\n"
-     "code.\n"},
+     "The compiler's alias reasoning cannot prove that on its own yet; the\n"
+     "code was right all along.\n"},
     {"serial-recurrence", DECISION_VECTOR_REFUSAL,
      "The loop carries a serial recurrence",
      "A value is computed from its own previous value through an operation\n"
-     "that does not reassociate: `*`, `/`, a shift, or a bitwise or xor op.\n"
-     "Iteration 2 cannot start until iteration 1 has finished, so the lanes\n"
-     "form a chain rather than eight independent pieces of work.\n"
+     "that does not reassociate: `*`, `/`, a shift, or a bitwise operation.\n"
+     "Iteration 2 cannot start until iteration 1 has finished, so the work is\n"
+     "one chain and there is nothing independent to spread across lanes.\n"
      "\n"
-     "This is the one refusal that is a fact about the algorithm rather than a\n"
-     "gap in the compiler. A hash, a linear congruential generator, an IIR\n"
-     "filter: the running state IS the algorithm, and the loop is already at\n"
-     "its scalar floor.\n"
+     "This is the one refusal that comes from the algorithm itself. In a hash,\n"
+     "a linear congruential generator or an IIR filter the running state is\n"
+     "the algorithm, and the loop is already at its scalar floor.\n"
      "\n"
      "What does vectorize: `+` and `-` reductions. Those reassociate, so the\n"
      "compiler splits them into per-lane partial sums and adds the lanes at\n"
@@ -1187,9 +1184,9 @@ static const DecisionDoc DECISIONS[] = {
     {"int32-sum-narrow-acc", DECISION_VECTOR_REFUSAL,
      "int32 sum into an accumulator narrower than int64",
      "Same rule as `byte-sum-narrow-acc`, one width up. The int32 sum kernel\n"
-     "(`vpaddd`) folds eight lanes into an int64 accumulator, because eight\n"
-     "int32 values summed can overflow int32 while the scalar loop, adding one\n"
-     "at a time, would not have.\n"
+     "sign-extends each element to 64 bits with `vpmovsxdq` and adds in 64-bit\n"
+     "lanes with `vpaddq`, so its total is an int64, and it is written for an\n"
+     "int64 accumulator.\n"
      "\n"
      "Fix: declare the accumulator int64. The elements stay int32; only the\n"
      "running total widens.\n"},
@@ -1199,8 +1196,9 @@ static const DecisionDoc DECISIONS[] = {
      "recognizers see a local write per iteration where they expected a plain\n"
      "array access.\n"
      "\n"
-     "This is a compiler limitation, not a problem in your code. Report the\n"
-     "loop if you hit it: the shape that produced it is worth fixing.\n"},
+     "The compiler cannot see through that temporary yet, and the code is\n"
+     "fine. Report the loop if you hit it; the shape that produced it is worth\n"
+     "fixing.\n"},
     {"body-local", DECISION_VECTOR_REFUSAL,
      "A local is declared inside the loop body",
      "The recognizers match on a straight run of loads, arithmetic and stores.\n"
@@ -1211,23 +1209,24 @@ static const DecisionDoc DECISIONS[] = {
      "the expression into the statement that uses it.\n"},
     {"dot-shape-address", DECISION_VECTOR_REFUSAL,
      "Dot product with an address the kernel cannot follow",
-     "The loop is a float multiply-accumulate, which is exactly the FMA dot\n"
+     "The loop is a float multiply and accumulate, which is the FMA dot\n"
      "product kernel's shape, but the addresses do not match. The kernel needs\n"
-     "each base to be a plain pointer indexed by the loop counter: `a[i]`, not\n"
-     "`a[r * cols + i]`.\n"
+     "each base to be a plain pointer indexed by the loop counter, `a[i]`;\n"
+     "`a[r * cols + i]` does not qualify.\n"
      "\n"
-     "Example, an inner product over one row of a matrix:\n"
+     "Example, an inner product over one row of a matrix, with the row's base\n"
+     "taken once outside the inner loop:\n"
      "    for r in 0..rows {\n"
-     "        var row: float32* = &m[r * cols];   // hoisted, invariant here\n"
+     "        var row: float32* = &m[r * cols];\n"
      "        for c in 0..cols {\n"
-     "            acc = acc + row[c] * x[c];      // now `base[i]`\n"
+     "            acc = acc + row[c] * x[c];\n"
      "        }\n"
      "    }\n"
      "\n"
      "Fix: lift the invariant part of the index into a pointer before the loop.\n"
      "The report checks first: when the other half of the index changes every\n"
-     "iteration the access really is non-unit-stride, and the report says so\n"
-     "instead of giving advice that cannot work.\n"},
+     "iteration the access really strides, and the report says so and gives\n"
+     "no advice.\n"},
     {"store-only-fill", DECISION_VECTOR_REFUSAL,
      "Fill loop the fill kernel could not claim",
      "The loop writes the same value over and over, which is the fill shape,\n"
@@ -1252,11 +1251,11 @@ static const DecisionDoc DECISIONS[] = {
      "    with `c` invariant, and a pointer walked by a constant stride. Lift\n"
      "    the invariant part of the index into a base pointer before the loop.\n"},
     {"extremum-shape", DECISION_VECTOR_REFUSAL,
-     "Running minimum/maximum the kernel just missed",
+     "Running minimum or maximum the kernel just missed",
      "`if (a[i] > best) { best = a[i]; }` is a shape the compiler vectorizes:\n"
-     "it reads the diamond as the operator it is and emits vmaxps/vmaxpd (or\n"
-     "vpmaxsd for int32), seeding every lane with the accumulator's incoming\n"
-     "value. So the branch is not what stopped this loop. Something else did:\n"
+     "it reads the diamond as the operator it is and emits vmaxps or vmaxpd,\n"
+     "or vpmaxsd for int32, seeding every lane with the accumulator's incoming\n"
+     "value. Something other than the branch stopped this loop:\n"
      "\n"
      "  - The counter does not start at 0. A scan seeded from `a[0]` and run\n"
      "    from `i = 1` is outside the kernel, which treats the loop's bound as\n"
@@ -1265,16 +1264,16 @@ static const DecisionDoc DECISIONS[] = {
      "\n"
      "  - The elements are not float32, float64 or int32. Those are the lane\n"
      "    widths the extremum kernel carries, and the width it reads is the\n"
-     "    ELEMENT's. A uint8 or int16 array stays scalar however the\n"
+     "    element's. A uint8 or int16 array stays scalar however the\n"
      "    accumulator is declared, so widening `best` alone moves nothing;\n"
      "    widen the array. uint32 is refused because vpmaxsd compares signed.\n"
      "\n"
      "  - The elements are narrower than the accumulator. `(int32)bytes[i]`\n"
-     "    widens per element; the kernel's lanes are the element width. This\n"
-     "    is a gap, not a problem with the loop.\n"
+     "    widens per element; the kernel's lanes are the element width. The\n"
+     "    compiler has no kernel for that yet.\n"
      "\n"
-     "  - The body also stores. Then it is a clamp, not a reduction. See\n"
-     "    `mettle explain clamp-store`.\n"},
+     "  - The body also stores. Then it is a clamp, which\n"
+     "    `mettle explain clamp-store` covers.\n"},
     {"predicated-count", DECISION_VECTOR_REFUSAL,
      "An accumulator updated only on the taken arm",
      "Over int32 elements, `if (a[i] > t) { c = c + 1; }` and\n"
@@ -1289,12 +1288,12 @@ static const DecisionDoc DECISIONS[] = {
      "    branchless form has no kernel either, so there is nothing to change\n"
      "    in the loop.\n"
      "  - An else arm that also writes the accumulator. That is a select on a\n"
-     "    loop-carried value, not an accumulate; there is no one addend.\n"
+     "    loop-carried value, with no single addend to accumulate.\n"
      "  - A guard on a computed value. The conversion reads a comparison of a\n"
      "    loaded element (`a[i] > t`, `a[i] == 0`); `if (a[i] & 6)` is a test\n"
      "    of an expression, and respelling it `(a[i] & 6) != 0` keeps it one.\n"
-     "    Add the comparison rather than branching on it and the kernel takes\n"
-     "    it, for any comparison:\n"
+     "    Add the comparison to the accumulator and the kernel takes it, for\n"
+     "    any comparison:\n"
      "\n"
      "        c = c + ((a[i] & 6) != 0);\n"},
     {"clamp-store", DECISION_VECTOR_REFUSAL,
@@ -1309,7 +1308,7 @@ static const DecisionDoc DECISIONS[] = {
      "stop it: float32 and float64 elements, which have no select kernel yet,\n"
      "and a nest deep enough that the values live at once outnumber the ymm\n"
      "registers the kernel has, which is six for an int32 map. Three levels of\n"
-     "`if`/`else` over distinct expressions is past that.\n"
+     "`if` and `else` over distinct expressions is past that.\n"
      "\n"
      "Splitting the deepest arm into its own loop is what usually helps.\n"},
     {"strided-access", DECISION_VECTOR_REFUSAL,
@@ -1319,19 +1318,17 @@ static const DecisionDoc DECISIONS[] = {
      "strided access has no kernel to land in. There is no gather or\n"
      "scatter form.\n"
      "\n"
-     "The stride is usually the data layout, not an accident, so there is\n"
-     "often nothing to change. When the layout IS free, splitting an\n"
+     "The stride usually comes from the data layout, so there is often\n"
+     "nothing to change. When the layout is free to change, splitting an\n"
      "interleaved array into one array per component makes every loop over it\n"
-     "unit-stride:\n"
-     "\n"
-     "    // instead of rgb[i*3+0], rgb[i*3+1], rgb[i*3+2]\n"
-     "    r[i], g[i], b[i]        // three loops, all vectorized\n"},
+     "unit-stride: `rgb[i*3+0]`, `rgb[i*3+1]` and `rgb[i*3+2]` become `r[i]`,\n"
+     "`g[i]` and `b[i]`, three loops that all vectorize.\n"},
     {"unbounded-shift", DECISION_VECTOR_REFUSAL,
      "A right shift whose input cannot be bounded",
      "Integer lanes are 32 bits wide. `+ - * & | ^ <<` are congruent mod 2^32,\n"
      "so the low 32 bits of a result depend only on the low 32 bits of its\n"
      "inputs and a lane reproduces them whatever width the scalar code used.\n"
-     "`>>` is the exception: it reads bits back DOWN, so a lane that wrapped\n"
+     "`>>` is the exception: it moves high bits down, so a lane that wrapped\n"
      "where the scalar did not would shift different bits in.\n"
      "\n"
      "The kernel takes a right shift only where the shifted value is provably\n"
@@ -1603,8 +1600,8 @@ static const DecisionDoc DECISIONS[] = {
     {"noalloc-verified", DECISION_APPLIED,
      "The @noalloc contract holds",
      "The function is marked @noalloc, and the compiler walked everything it\n"
-     "can reach and found no allocation on any path. The contract is proved,\n"
-     "not assumed. A violation would have been a compile error, not a warning.\n"},
+     "can reach and found no allocation on any path. The contract is proved;\n"
+     "a violation would have stopped the build with an error.\n"},
 };
 
 #define DOCS_COUNT (sizeof(DOCS) / sizeof(DOCS[0]))

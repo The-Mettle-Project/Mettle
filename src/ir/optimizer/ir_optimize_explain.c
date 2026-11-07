@@ -935,6 +935,107 @@ void ir_explain_backend_cost(const char *function_name, const char *filename,
   cost->estimated_spans = estimated_spans;
 }
 
+typedef struct {
+  char *function_name;
+  size_t line;
+  char *text;
+  char *ports;
+  char *origin;
+  int cost;
+  int latency;
+  int kernel;
+  int depth;
+  int label;
+  size_t offset;
+} IRExplainMachineInsn;
+
+#define IR_EXPLAIN_MACHINE_MAX 60000
+
+static MTLC_THREAD_LOCAL IRExplainMachineInsn *g_machine = NULL;
+static MTLC_THREAD_LOCAL size_t g_machine_count = 0;
+static MTLC_THREAD_LOCAL size_t g_machine_capacity = 0;
+static MTLC_THREAD_LOCAL size_t g_machine_total = 0;
+
+void ir_explain_machine_insn(const char *function_name, const char *filename,
+                             size_t line, const char *origin, const char *text,
+                             const char *ports, int cost, int latency,
+                             int kernel, int depth, int label, size_t offset) {
+  IRExplainMachineInsn *insn;
+  if (!g_explain || !g_explain_json || !function_name || !text ||
+      !ir_explain_file_enabled(filename)) {
+    return;
+  }
+  g_machine_total++;
+  if (g_machine_count >= IR_EXPLAIN_MACHINE_MAX) {
+    return;
+  }
+  if (g_machine_count == g_machine_capacity) {
+    size_t capacity = g_machine_capacity ? g_machine_capacity * 2 : 256;
+    IRExplainMachineInsn *grown =
+        realloc(g_machine, capacity * sizeof(IRExplainMachineInsn));
+    if (!grown) {
+      return;
+    }
+    g_machine = grown;
+    g_machine_capacity = capacity;
+  }
+  insn = &g_machine[g_machine_count++];
+  insn->function_name = ir_explain_strdup(function_name);
+  insn->line = line;
+  insn->text = ir_explain_strdup(text);
+  insn->ports = ports && ports[0] ? ir_explain_strdup(ports) : NULL;
+  insn->origin = origin ? ir_explain_strdup(origin) : NULL;
+  insn->cost = cost;
+  insn->latency = latency;
+  insn->kernel = kernel;
+  insn->depth = depth;
+  insn->label = label;
+  insn->offset = offset;
+}
+
+static void ir_explain_machine_json(void) {
+  const char *function = NULL;
+  if (!g_explain_json) {
+    return;
+  }
+  ir_explain_json_raw("\"machine\":[");
+  for (size_t i = 0; i < g_machine_count; i++) {
+    const IRExplainMachineInsn *m = &g_machine[i];
+    if (!function || strcmp(function, m->function_name) != 0) {
+      ir_explain_json_raw("%s{\"fn\":", function ? "]}," : "");
+      ir_explain_json_str(m->function_name);
+      ir_explain_json_raw(",\"insns\":[");
+      function = m->function_name;
+    } else {
+      ir_explain_json_raw(",");
+    }
+    ir_explain_json_raw("[%zu,", m->line);
+    ir_explain_json_str(m->text);
+    ir_explain_json_raw(",");
+    ir_explain_json_str(m->ports);
+    ir_explain_json_raw(",%d,%d,%d,%d,%d,", m->cost, m->latency, m->kernel,
+                        m->depth, m->label);
+    ir_explain_json_str(m->origin);
+    ir_explain_json_raw(",%zu]", m->offset);
+  }
+  ir_explain_json_raw("%s],\"machineTotal\":%zu,", function ? "]}" : "",
+                      g_machine_total);
+}
+
+static void ir_explain_machine_release(void) {
+  for (size_t i = 0; i < g_machine_count; i++) {
+    free(g_machine[i].function_name);
+    free(g_machine[i].text);
+    free(g_machine[i].ports);
+    free(g_machine[i].origin);
+  }
+  free(g_machine);
+  g_machine = NULL;
+  g_machine_count = 0;
+  g_machine_capacity = 0;
+  g_machine_total = 0;
+}
+
 #define IR_EXPLAIN_OPCODE_LIMIT ((size_t)IR_OP_SELECT + 1)
 #define IR_EXPLAIN_MAX_SITES 256
 #define IR_EXPLAIN_REPORTED_SITES 12
@@ -4232,6 +4333,8 @@ void ir_explain_backend_flush(void) {
 
   ir_explain_functions_json();
   ir_explain_loop_costs_json();
+  ir_explain_machine_json();
+  ir_explain_machine_release();
   ir_explain_call_graph_json();
   ir_explain_hotspots_json();
   ir_explain_passes_json();
@@ -4325,22 +4428,22 @@ IRFunction *ir_explain_clone_function(const IRFunction *src) {
 }
 
 static const char *const IR_KERNEL_DESC[IR_OP_KIND_COUNT] = {
-    [IR_OP_COUNT_WORD_STARTS] = "SSE2 word-start scan, 16 bytes/iteration",
+    [IR_OP_COUNT_WORD_STARTS] = "SSE2 word-start scan, 16 bytes an iteration",
     [IR_OP_MEMCPY_INLINE] = "inline memcpy (constant size)",
     [IR_OP_SIMD_COPY] = "32-byte AVX2 element copy (scalar when the regions overlap)",
-    [IR_OP_SIMD_SUM_I32] = "vpaddd, 8-wide int32 sum (AVX2)",
+    [IR_OP_SIMD_SUM_I32] = "vpmovsxdq + vpaddq, 8-wide int32 sum into int64 (AVX2)",
     [IR_OP_SIMD_SUM_U8] = "vpsadbw, 32-wide byte sum (AVX2)",
     [IR_OP_SIMD_BYTE_MAP] = "32-wide byte map (AVX2)",
-    [IR_OP_SIMD_FILL] = "16-byte splat stores (vectorized fill/memset)",
-    [IR_OP_SIMD_DOT_I32] = "vpmulld + vpaddd, 8-wide int32 dot product (AVX2)",
+    [IR_OP_SIMD_FILL] = "16-byte splat stores (vectorized fill)",
+    [IR_OP_SIMD_DOT_I32] = "vpmuldq + vpaddq, 8-wide int32 dot product into int64 (AVX2)",
     [IR_OP_SIMD_DOT_I8] = "vpmaddwd, 16-wide int8 dot product (AVX2)",
     [IR_OP_SIMD_SLP_MAC_I8] = "SLP int8 multiply-accumulate tile (AVX2)",
     [IR_OP_SIMD_SCALE_I32] = "8-wide int32 scale map (AVX2)",
-    [IR_OP_SIMD_CLAMP_I32] = "vpminsd/vpmaxsd, 8-wide int32 clamp (AVX2)",
+    [IR_OP_SIMD_CLAMP_I32] = "vpminsd + vpmaxsd, 8-wide int32 clamp (AVX2)",
     [IR_OP_SIMD_REVERSE_COPY_I32] = "8-wide int32 reverse copy (AVX2)",
     [IR_OP_LOWER_BOUND_I32] = "branchless lower-bound search",
     [IR_OP_PREFIX_SUM_I32] = "vectorized int32 prefix sum",
-    [IR_OP_SIMD_MINMAX_I32] = "vpminsd/vpmaxsd, 8-wide int32 min/max scan (AVX2)",
+    [IR_OP_SIMD_MINMAX_I32] = "vpminsd or vpmaxsd, 8-wide int32 minimum or maximum scan (AVX2)",
     [IR_OP_SIMD_SUM_F64] = "vaddpd, 4-wide float64 sum, 2 accumulators (AVX)",
     [IR_OP_SIMD_SUM_F32] = "vaddps, 8-wide float32 sum, 2 accumulators (AVX)",
     [IR_OP_SIMD_DOT_F64] = "vfmadd231pd, 4-wide float64 FMA dot product",
@@ -4348,7 +4451,7 @@ static const char *const IR_KERNEL_DESC[IR_OP_KIND_COUNT] = {
     [IR_OP_SIMD_AFFINE_MAP_F64] = "vfmadd231pd, 4-wide float64 affine map",
     [IR_OP_SIMD_AFFINE_MAP_F32] = "vfmadd231ps, 8-wide float32 affine map",
     [IR_OP_SIMD_EXP_F32] = "8-wide float32 exp (Cephes polynomial, AVX2)",
-    [IR_OP_SIMD_SILU_F32] = "8-wide float32 SiLU/SwiGLU gate (AVX2 exp poly)",
+    [IR_OP_SIMD_SILU_F32] = "8-wide float32 SiLU and SwiGLU gate (AVX2 exp poly)",
     [IR_OP_SIMD_I2F_REDUCE_F64] = "4-wide float64 counter reduction (AVX2)",
     [IR_OP_SIMD_MATMUL_N32] = "32x32 int32 matrix-multiply kernel",
     [IR_OP_SIMD_INSERTION_SORT_I32] = "accelerated int32 insertion sort",

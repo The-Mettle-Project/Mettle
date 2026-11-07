@@ -21,7 +21,7 @@
 <p class="lede">Reported by the compiler as an error or warning.</p>
 <pre><code>mettle explain M0106</code></pre>
 
-<p>A memcpy/memset-style operation writes more bytes than the destination stack array holds, smashing adjacent stack memory.</p>
+<p>A memcpy or memset writes more bytes than the destination stack array holds, smashing adjacent stack memory.</p>
 <p>Fix: pass the correct byte count (element count * element size), or grow the buffer.</p>
 
 <h2>Related</h2>

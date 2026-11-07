@@ -21,15 +21,15 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain dot-shape-address</code></pre>
 
-<p>The loop is a float multiply-accumulate, which is exactly the FMA dot product kernel&#x27;s shape, but the addresses do not match. The kernel needs each base to be a plain pointer indexed by the loop counter: <code>a[i]</code>, not <code>a[r * cols + i]</code>.</p>
-<p>Example, an inner product over one row of a matrix:</p>
+<p>The loop is a float multiply and accumulate, which is the FMA dot product kernel&#x27;s shape, but the addresses do not match. The kernel needs each base to be a plain pointer indexed by the loop counter, <code>a[i]</code>; <code>a[r * cols + i]</code> does not qualify.</p>
+<p>Example, an inner product over one row of a matrix, with the row&#x27;s base taken once outside the inner loop:</p>
 <pre><code>for r in 0..rows {
-    var row: float32* = &amp;m[r * cols];   // hoisted, invariant here
+    var row: float32* = &amp;m[r * cols];
     for c in 0..cols {
-        acc = acc + row[c] * x[c];      // now `base[i]`
+        acc = acc + row[c] * x[c];
     }
 }</code></pre>
-<p>Fix: lift the invariant part of the index into a pointer before the loop. The report checks first: when the other half of the index changes every iteration the access really is non-unit-stride, and the report says so instead of giving advice that cannot work.</p>
+<p>Fix: lift the invariant part of the index into a pointer before the loop. The report checks first: when the other half of the index changes every iteration the access really strides, and the report says so and gives no advice.</p>
 
 <h2>Related</h2>
 <ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li></ul>

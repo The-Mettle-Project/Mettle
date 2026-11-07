@@ -594,31 +594,30 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
                  "inlined call); only the innermost loop of a nest vectorizes");
   }
   if (branch_count > 1 || jump_count > 1) {
-    IR_SIMD_BAIL("the loop body branches on data (an `if` or `&&`/`||` per "
-                 "iteration); only straight-line loop bodies vectorize");
+    IR_SIMD_BAIL("the loop body branches on data, with an `if`, `&&` or `||` "
+                 "each iteration; only straight-line loop bodies vectorize");
   }
   if (has_i16) {
-    return "the loop accesses 16-bit integers, which have no vectorizer "
-           "(use int32/int8, or float32/float64)";
+    return "the loop accesses 16-bit integers, which no vectorizer takes; "
+           "use int32, int8, float32 or float64";
   }
   if (has_i64) {
-    return "the loop accesses 64-bit integers, which have no vectorizer "
-           "(use int32/int8, or float32/float64)";
+    return "the loop accesses 64-bit integers, which no vectorizer takes; "
+           "use int32, int8, float32 or float64";
   }
   {
     const char *ops[6];
     size_t n_ops = 0;
     if (ir_region_find_serial_recurrence(function, begin, end, ops, &n_ops)) {
       return "the loop carries a serial recurrence: a value is computed from "
-             "its own previous value through a non-reassociable operation "
-             "(`*`, `/`, a shift, or a bitwise/xor op), so the iterations form "
-             "a dependency chain; '+'/'-' reductions vectorize, but these do "
-             "not";
+             "its own previous value through `*`, `/`, a shift or a bitwise "
+             "operation, so each iteration waits on the one before it. Sums "
+             "and differences can be regrouped and vectorize; these cannot";
     }
   }
-  IR_SIMD_BAIL("no vectorizer recognized this loop's shape (e.g. a non-unit "
-               "stride, a loop-carried dependence, or a reduction/operation "
-               "no kernel covers)");
+  IR_SIMD_BAIL("no vectorizer recognized this loop's shape: a stride other "
+               "than one element, a value carried from one iteration to the "
+               "next, or a reduction no kernel covers");
 #undef IR_SIMD_BAIL
 }
 
@@ -1041,10 +1040,10 @@ static int ir_simd_bail_call_in_body(IrSimdBail *d) {
                "loop cannot vectorize as written",
                d->callee);
       snprintf(d->fix, d->fix_cap,
-               "none needed if the call IS the work (I/O, OS calls): the "
-               "scalar loop is the right code; if the call is loop-invariant, "
-               "hoist it; if it is hot compute, replace it with Mettle code "
-               "so the inliner can take it");
+               "if the call is the work, such as I/O or a system call, the "
+               "scalar loop is the right code. If it returns the same value "
+               "every iteration, hoist it. If it is hot arithmetic, write it "
+               "in Mettle so the inliner can take it");
       ir_simd_advisory(d);
       ir_simd_diag(d, IR_SIMD_BAIL_EXTERN_CALL_IN_BODY);
       return 1;
@@ -1117,15 +1116,15 @@ static int ir_simd_bail_control_flow(IrSimdBail *d) {
     if (d->has_return_in_body || outward_branches > 1) {
       snprintf(d->reason, d->reason_cap,
                "the loop can exit before its trip count, and its body does "
-               "more than test the exit condition; the search skip-ahead "
-               "kernel only covers pure find/mismatch loops (it must be safe "
-               "to skip the iterations before the first hit)");
+               "more than test the exit condition. The search kernel skips "
+               "ahead, so it covers only loops that look for a match or a "
+               "mismatch and do nothing in the iterations it skips");
       snprintf(d->fix, d->fix_cap,
-               "pure searches DO vectorize: `if (a[i] == key) ...` (or != < > "
-               "<= >=, key a constant/variable, or a[i] != b[i]) with nothing "
-               "else in the body becomes an 8-wide compare+movemask scan. "
-               "Split any per-iteration work out of this loop, or hoist the "
-               "search into its own loop and process from the found index");
+               "a loop whose body is only `if (a[i] == key) ...`, with any "
+               "comparison, a constant or variable key, or `a[i] != b[i]`, "
+               "becomes an 8-wide compare and movemask scan. Move the other "
+               "work out of this loop, or search in a loop of its own and "
+               "carry on from the index it finds");
       ir_simd_diag(d, IR_SIMD_BAIL_EARLY_EXIT);
       return 1;
     }
@@ -1139,7 +1138,7 @@ static int ir_simd_bail_control_flow(IrSimdBail *d) {
         snprintf(d->reason, d->reason_cap,
                  "this is a running %s, a shape that does vectorize, but "
                  "the kernel did not claim it%s%s%s",
-                 "minimum/maximum",
+                 "minimum or maximum",
                  acc_type ? " (`" : "", acc_type ? written : "",
                  acc_type ? "` is the accumulator)" : "");
         if (acc_type && strcmp(acc_type, "float64") != 0 &&
@@ -1192,19 +1191,19 @@ static int ir_simd_bail_control_flow(IrSimdBail *d) {
                  written ? written : "a local");
         snprintf(d->fix, d->fix_cap,
                  "if the elements are int32, split the deepest arm into its own "
-                 "loop so fewer values are live at once; otherwise this is a "
-                 "gap in the compiler, not a problem with the loop");
+                 "loop so fewer values are live at once; otherwise the "
+                 "compiler has no kernel for this loop yet");
         ir_simd_advisory(d);
         ir_simd_diag(d, IR_SIMD_BAIL_CLAMP_STORE);
         return 1;
       }
     }
     snprintf(d->reason, d->reason_cap,
-             "the loop body branches on data (an `if` or `&&`/`||` per "
-             "iteration). An `if` that only chooses a value is converted to a "
-             "lane select and does vectorize, so this one does something a "
-             "masked lane cannot: a store, a call, or a nest deeper than the "
-             "kernel has registers for");
+             "the loop body branches on data, with an `if`, `&&` or `||` each "
+             "iteration. An `if` that only chooses a value becomes a lane "
+             "select and vectorizes, so this one does something a masked "
+             "lane cannot: a store, a call, or a nest deeper than the kernel "
+             "has registers for");
     snprintf(d->fix, d->fix_cap,
              "keep the arms to choosing a value, or split the work into two "
              "simpler loops");
@@ -1217,7 +1216,7 @@ static int ir_simd_bail_control_flow(IrSimdBail *d) {
 static int ir_simd_bail_int16_elements(IrSimdBail *d) {
   if (d->has_i16) {
     snprintf(d->reason, d->reason_cap,
-             "the loop reads/writes 16-bit integers, and no 16-bit kernels "
+             "the loop reads or writes 16-bit integers, and no 16-bit kernels "
              "exist");
     if (d->has_int_accum) {
       const char *acc_type =
@@ -1242,7 +1241,7 @@ static int ir_simd_bail_int16_elements(IrSimdBail *d) {
 static int ir_simd_bail_int64_elements(IrSimdBail *d) {
   if (d->has_i64) {
     snprintf(d->reason, d->reason_cap,
-             "the loop reads/writes 64-bit integer arrays, and no 64-bit "
+             "the loop reads or writes 64-bit integers, and no 64-bit "
              "integer kernels exist");
     snprintf(d->fix, d->fix_cap, "use int32 arrays if the values fit");
     ir_simd_diag(d, IR_SIMD_BAIL_INT64_ELEMENTS);
@@ -1294,10 +1293,11 @@ static int ir_simd_bail_serial_recurrence(IrSimdBail *d) {
                "lanes",
                recur_symbol, n_ops ? op_list : "a non-reassociable operation");
       snprintf(d->fix, d->fix_cap,
-               "'+'/'-' reductions reassociate and DO vectorize; multiply, "
-               "divide, shift, and bitwise/xor recurrences are inherently "
-               "serial. If this running state IS the algorithm (a hash, an "
-               "RNG, an IIR filter), the loop is already at its scalar floor");
+               "sums and differences can be regrouped, so they vectorize. "
+               "Products, quotients, shifts and bitwise recurrences cannot. "
+               "When this running value is the algorithm, as in a hash, a "
+               "random number generator or an IIR filter, the loop is "
+               "already at its scalar floor");
       ir_simd_advisory(d);
       ir_simd_diag(d, IR_SIMD_BAIL_SERIAL_RECURRENCE);
       return 1;
@@ -1351,10 +1351,11 @@ static int ir_simd_bail_int32_sum_accumulator(IrSimdBail *d) {
         ir_function_local_declared_type(d->function, d->int_accum_sym);
     if (!acc_type || strcmp(acc_type, "int64") != 0) {
       snprintf(d->reason, d->reason_cap,
-               "this loop sums int32 values into `%s`, but the int32 "
-               "reduction kernel accumulates into int64 (eight lanes are "
-               "summed without overflow only there) and `%s` is %s",
-               d->int_accum_sym, d->int_accum_sym, acc_type ? acc_type : "narrower");
+               "this loop sums int32 values into `%s`, which is %s. The int32 "
+               "sum kernel widens each element and adds eight lanes into an "
+               "int64 total, so it needs `%s` to be int64",
+               d->int_accum_sym, acc_type ? acc_type : "narrower",
+               d->int_accum_sym);
       snprintf(d->fix, d->fix_cap, "declare the accumulator `%s` as int64",
                d->int_accum_sym);
       ir_simd_diag(d, IR_SIMD_BAIL_I32_SUM_NARROW_ACC);
@@ -1374,8 +1375,8 @@ static int ir_simd_bail_body_local(IrSimdBail *d) {
                "cannot see through it",
                d->body_local);
       snprintf(d->fix, d->fix_cap,
-               "a compiler limitation, not a code problem; write the "
-               "expression directly in the loop body to vectorize today");
+               "the recognizers cannot see through an inlined call's locals "
+               "yet; write the expression in the loop body and it vectorizes");
       ir_simd_diag(d, IR_SIMD_BAIL_INLINED_PARAM_LOCAL);
     } else {
       snprintf(d->reason, d->reason_cap,
@@ -1397,12 +1398,12 @@ static int ir_simd_bail_body_local(IrSimdBail *d) {
 static int ir_simd_bail_dot_shape_address(IrSimdBail *d) {
   if (d->has_float_mul && d->has_float_accum && d->load_count >= 2) {
     snprintf(d->reason, d->reason_cap,
-             "this is a float multiply-accumulate (dot-product shape), but no "
-             "kernel matched its address pattern. The bases must be plain "
-             "pointers indexed by the loop counter (base[i])");
+             "this is a float multiply and accumulate, a dot product, but no "
+             "kernel matched its addresses: each base must be a plain "
+             "pointer indexed by the loop counter, `base[i]`");
     snprintf(d->fix, d->fix_cap,
-             "hoist invariant index math into a pointer before the loop "
-             "(e.g. `var row: float32* = &m[r * cols];` then `row[c]`)");
+             "hoist invariant index math into a pointer before the loop: "
+             "`var row: float32* = &m[r * cols];` and then `row[c]`");
     ir_simd_diag(d, IR_SIMD_BAIL_DOT_SHAPE_ADDRESS);
     return 1;
   }
@@ -1439,7 +1440,7 @@ static int ir_simd_bail_store_only_fill(IrSimdBail *d) {
                element, d->rebased_array);
     } else {
       snprintf(d->reason, d->reason_cap,
-               "the loop only writes an invariant value (a fill/init pattern), "
+               "the loop only writes a value that does not change, a fill, "
                "but its store address did not match the fill vectorizer's "
                "shapes: a unit-stride element `a[i]`, `a[c + i]` with `c` a "
                "loop-invariant scalar, or a pointer walked by a constant "
@@ -1462,7 +1463,7 @@ static int ir_simd_bail_strided_access(IrSimdBail *d) {
       snprintf(d->reason, d->reason_cap,
                "the loop steps %lld elements at a time (`a[i*%lld]` or "
                "similar); every kernel walks its arrays one contiguous vector "
-               "per iteration, so no gather/scatter shape is covered",
+               "per iteration, and none of them gathers or scatters",
                stride, stride);
       snprintf(d->fix, d->fix_cap,
                "nothing to change here unless the layout can change: %s "
@@ -1604,9 +1605,9 @@ static void ir_simd_explain_bail(const IRFunction *function, size_t begin,
            "element width or carried dependence left to blame");
   snprintf(d.fix, d.fix_cap,
            "compare the loop against the shapes that do vectorize: "
-           "unit-stride `a[i]` (not `a[i*k]`) over int8/int32/float32/float64, "
-           "a straight-line body, and one of a map (`a[i] = expr`), a '+' "
-           "reduction (`s = s + expr`), or a dot product");
+           "unit-stride `a[i]` over int8, int32, float32 or float64, a "
+           "straight-line body, and one of a map (`a[i] = expr`), a sum "
+           "(`s = s + expr`) or a dot product");
   ir_simd_advisory(&d);
 }
 

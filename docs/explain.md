@@ -4,7 +4,7 @@
 with it as a terminal UI: every optimizer decision with its reason and the fix
 it proved, every drop and move the compiler inserted, the bounds checks that
 survived, the cost of each function, what the types proved, what the build
-took on trust, and what each pass changed.
+took on trust, what each pass changed, and the machine code each line became.
 
 ```bash
 mettle explain app.mettle
@@ -25,11 +25,18 @@ flowchart LR
 
 ## Tabs
 
-1. **Overview**: the totals, the fixes worth making first, and what changed
-   since the last run. Enter on a fix opens its loop in Optimizer.
+1. **Overview**: the totals, the fixes worth making first, the hottest loops
+   by their share of the static loop cost, and what changed since the last
+   run. Enter on any of them opens the loop in Optimizer.
 2. **Optimizer**: every loop and call by function, with the verdict, the reason
    it declined, the fix, and whether the fix was applied to a copy of the
-   function and re-checked.
+   function and re-checked. A scalar loop shows its cycles per iteration and
+   the port that bounds it. A vectorized loop shows its vector body, the
+   instructions of one pass, and what a pass costs: the larger of the front
+   end's four instructions a cycle, two loads, one store, the floating point
+   and integer vector ports, and port 5 for shuffles. When the pointer the
+   body advances agrees with the lane count, it also gives the cost of one
+   element.
 3. **Ownership**: each drop the compiler inserted, each drop you wrote, each
    move and each live bit, with the Mettle it wrote out and what that lowered
    to. [Ownership](ownership.md) has the rules.
@@ -42,8 +49,37 @@ flowchart LR
    every belief the build did not check.
 7. **Passes**: what each optimizer pass removed and where.
 
-The detail pane shows the selected entry, the source lines it is about, and the
-long explanation for its code, the same text `mettle explain <code>` prints.
+The detail pane shows the selected entry, the source lines it is about, the
+machine code those lines became, and the long explanation for its code, the
+same text `mettle explain <code>` prints.
+
+## Machine code
+
+Every entry that points at a line shows the instructions the backend emitted
+for it, decoded from the bytes in the object file. For a loop it shows the
+machine loop itself, found from its back edge. This is the saxpy loop from
+`tests/explain_demo.mettle`:
+
+```text
+Machine code  saxpy, lines 12 to 13: 70 instructions, 9 vector, 55 in a kernel
+        the machine loop, 9 instructions:
+    af                vmovups ymm0, [rcx]
+    b4                vmovups ymm1, [rdx]
+    b9                vmulps ymm0, ymm0, ymm4
+    be                vfmadd231ps ymm0, ymm5, ymm1
+    c3                vmovups [rdx], ymm0
+    c8                add rcx, 32
+    cc                add rdx, 32
+    d0                cmp rcx, r11
+    d3                jb 0xaf
+```
+
+Each row is the byte offset in the function, the cost model's reciprocal
+throughput in cycles with the ports it charges, and the instruction in Intel
+syntax. Vector kernel instructions are highlighted, and the cost model does
+not price them. `d` opens the whole function with each source line above the
+instructions it became, scrolled to the entry; code inlined from another file
+is marked with the file and line it came from.
 
 [`examples/raii_demo`](../examples/raii_demo/raii_demo.mettle) is a radar
 track file written to fill every tab. Its tracks own heap trails, so the
@@ -63,6 +99,7 @@ mettle explain examples/raii_demo/raii_demo.mettle --safe
 - PgUp, PgDn, Home, End: page, first, last
 - Enter: open the detail, or follow a link
 - s: the whole source file at this line
+- d: the machine code of the whole function at this line
 - Esc or Backspace: back
 - /: filter by any text in an entry
 - m, f, a: missed only, with a fix only, all

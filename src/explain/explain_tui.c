@@ -69,6 +69,8 @@ typedef struct {
   int tab;
   int focus;
   int source_view;
+  int anchor;
+  int anchor_pending;
   int selected[EX_TAB_COUNT];
   int list_top[EX_TAB_COUNT];
   int detail_top;
@@ -438,6 +440,288 @@ static void ex_build_source_view(ExUi *ui, const ExEntry *entry) {
   }
 }
 
+static void ex_entry_range(const ExEntry *entry, int *from, int *to) {
+  *from = entry->line;
+  *to = entry->end_line > entry->line ? entry->end_line : entry->line;
+}
+
+static int ex_code_rows(const ExMachineFn *code, int from, int to) {
+  int count = 0;
+  for (size_t i = 0; i < code->count; i++) {
+    count += !code->insns[i].label && code->insns[i].line >= from &&
+             code->insns[i].line <= to;
+  }
+  return count;
+}
+
+static const ExMachineFn *ex_entry_code(const ExUi *ui, const ExEntry *entry) {
+  const ExMachineFn *code = ex_report_machine(ui->report, entry->function);
+  const ExMachineFn *best = NULL;
+  int best_rows = 0;
+  int from;
+  int to;
+  if (code || entry->line <= 0) {
+    return code;
+  }
+  ex_entry_range(entry, &from, &to);
+  for (size_t f = 0; f < ui->report->machine_count; f++) {
+    int rows = ex_code_rows(&ui->report->machine[f], from, to);
+    if (rows > best_rows) {
+      best_rows = rows;
+      best = &ui->report->machine[f];
+    }
+  }
+  return best;
+}
+
+static void ex_insn_row(ExUi *ui, const ExInsn *insn, int marked) {
+  char where[32];
+  char cost[32];
+  ExLine *line = ex_line_new(&ui->detail);
+  if (insn->label) {
+    char text[200];
+    snprintf(text, sizeof(text), "%s:", insn->text ? insn->text : "?");
+    ex_line_seg(line, 8, text, strlen(text), EXA_QUIET);
+    return;
+  }
+  snprintf(where, sizeof(where), "%s%5llx", marked ? ui->g->range : " ",
+           (unsigned long long)insn->offset);
+  if (insn->cost > 0) {
+    char cycles[16];
+    if (insn->cost % 100 == 0) {
+      snprintf(cycles, sizeof(cycles), "%d", insn->cost / 100);
+    } else {
+      snprintf(cycles, sizeof(cycles), "%d.%02d", insn->cost / 100,
+               insn->cost % 100);
+    }
+    snprintf(cost, sizeof(cost), "%5s %s", cycles,
+             insn->ports ? insn->ports : "");
+  } else {
+    cost[0] = '\0';
+  }
+  ex_line_seg(line, 0, where, strlen(where), marked ? EXA_ACCENT : EXA_QUIET);
+  ex_line_seg(line, 8, cost, strlen(cost), EXA_QUIET);
+  ex_line_seg(line, 22, insn->text ? insn->text : "",
+              insn->text ? strlen(insn->text) : 0,
+              insn->kernel ? EXA_ACCENT : marked ? 0 : EXA_DIM);
+}
+
+static void ex_machine_counts(const ExMachineFn *code, int from, int to,
+                              int *rows, int *vector, int *kernel) {
+  *rows = 0;
+  *vector = 0;
+  *kernel = 0;
+  for (size_t i = 0; i < code->count; i++) {
+    const ExInsn *insn = &code->insns[i];
+    if (insn->label || insn->line < from || insn->line > to) {
+      continue;
+    }
+    (*rows)++;
+    *vector += insn->text && insn->text[0] == 'v' &&
+               (strstr(insn->text, "ymm") || strstr(insn->text, "xmm"));
+    *kernel += insn->kernel;
+  }
+}
+
+static int ex_insn_vector(const ExInsn *insn) {
+  return insn->text && insn->text[0] == 'v' &&
+         (strstr(insn->text, "ymm") || strstr(insn->text, "xmm"));
+}
+
+static int ex_find_loop(const ExMachineFn *code, int from, int to,
+                        size_t *first, size_t *last) {
+  int best_vector = -1;
+  int best_inside = -1;
+  size_t best_span = 0;
+  for (size_t j = 0; j < code->count; j++) {
+    const ExInsn *jump = &code->insns[j];
+    const char *target;
+    const char *jcc;
+    if (jump->label || !jump->text || jump->line < from || jump->line > to) {
+      continue;
+    }
+    jcc = jump->text[0] == 'j' ? jump->text : strstr(jump->text, "; j");
+    if (!jcc) {
+      continue;
+    }
+    target = strrchr(jcc, ' ');
+    if (!target) {
+      continue;
+    }
+    target++;
+    for (size_t k = 0; k < j; k++) {
+      const ExInsn *head = &code->insns[k];
+      int hit;
+      if (strncmp(target, "0x", 2) == 0) {
+        hit = !head->label && head->offset == strtoll(target, NULL, 16);
+      } else {
+        hit = head->label && head->text && strcmp(head->text, target) == 0;
+      }
+      if (hit) {
+        int vector = 0;
+        int rows = 0;
+        int inside = 0;
+        for (size_t m = k; m <= j; m++) {
+          const ExInsn *insn = &code->insns[m];
+          vector += ex_insn_vector(insn);
+          if (!insn->label) {
+            rows++;
+            inside += insn->line >= from && insn->line <= to;
+          }
+        }
+        inside = rows ? inside * 100 / rows : 0;
+        if (vector > best_vector ||
+            (vector == best_vector &&
+             (inside > best_inside ||
+              (inside == best_inside && j - k > best_span)))) {
+          best_vector = vector;
+          best_inside = inside;
+          best_span = j - k;
+          *first = k;
+          *last = j;
+        }
+        break;
+      }
+    }
+  }
+  return best_vector >= 0;
+}
+
+static void ex_machine_section(ExUi *ui, const ExEntry *entry) {
+  const ExMachineFn *code = ex_entry_code(ui, entry);
+  int width = ui->detail_w;
+  int from;
+  int to;
+  int rows;
+  int vector;
+  int kernel;
+  int shown = 0;
+  char head[256];
+  if (!code || code->count == 0) {
+    return;
+  }
+  if (entry->line <= 0 || ui->tab == EX_TAB_FUNCTIONS) {
+    from = 0;
+    to = 1 << 30;
+  } else {
+    ex_entry_range(entry, &from, &to);
+  }
+  ex_machine_counts(code, from, to, &rows, &vector, &kernel);
+  if (rows == 0) {
+    return;
+  }
+  ex_line_new(&ui->detail);
+  if (from == 0) {
+    snprintf(head, sizeof(head), "Machine code  %s: %d instructions", code->name,
+             rows);
+  } else if (from == to) {
+    snprintf(head, sizeof(head), "Machine code  %s, line %d: %d instructions",
+             code->name, from, rows);
+  } else {
+    snprintf(head, sizeof(head),
+             "Machine code  %s, lines %d to %d: %d instructions", code->name,
+             from, to, rows);
+  }
+  if (kernel) {
+    size_t n = strlen(head);
+    snprintf(head + n, sizeof(head) - n, ", %d vector, %d in a kernel", vector,
+             kernel);
+  } else if (vector) {
+    size_t n = strlen(head);
+    snprintf(head + n, sizeof(head) - n, ", %d vector", vector);
+  }
+  ex_wrap(&ui->detail, 0, width, head, EXA_BOLD, NULL, 0);
+  if (from == 0) {
+    ex_wrap(&ui->detail, 0, width, "d shows every instruction beside the line "
+                                   "it came from",
+            EXA_DIM, NULL, 0);
+    return;
+  }
+  {
+    size_t first = 0;
+    size_t last = 0;
+    if (ex_find_loop(code, from, to, &first, &last) && last - first < 40) {
+      char note[96];
+      int body = 0;
+      for (size_t i = first; i <= last; i++) {
+        body += !code->insns[i].label;
+      }
+      snprintf(note, sizeof(note), "the machine loop, %d instruction%s:",
+               body, body == 1 ? "" : "s");
+      ex_wrap(&ui->detail, 8, width - 8, note, EXA_DIM, NULL, 0);
+      for (size_t i = first; i <= last; i++) {
+        ex_insn_row(ui, &code->insns[i], 1);
+        shown += !code->insns[i].label;
+      }
+    } else {
+      for (size_t i = 0; i < code->count && shown < 18; i++) {
+        const ExInsn *insn = &code->insns[i];
+        if (insn->line < from || insn->line > to) {
+          continue;
+        }
+        ex_insn_row(ui, insn, 0);
+        shown += !insn->label;
+      }
+    }
+  }
+  if (rows > shown) {
+    char more[96];
+    snprintf(more, sizeof(more), "%d more; d shows the whole function",
+             rows - shown);
+    ex_wrap(&ui->detail, 8, width - 8, more, EXA_DIM, NULL, 0);
+  }
+}
+
+static void ex_build_machine_view(ExUi *ui, const ExEntry *entry) {
+  const ExMachineFn *code = ex_entry_code(ui, entry);
+  int from;
+  int to;
+  int last_line = -1;
+  const char *last_origin = NULL;
+  char head[160];
+  ui->anchor = 0;
+  if (!code || code->count == 0) {
+    ex_wrap(&ui->detail, 0, ui->detail_w,
+            "No machine code for this entry: its function was inlined into "
+            "every caller, or this target emits none.",
+            EXA_DIM, NULL, 0);
+    return;
+  }
+  ex_entry_range(entry, &from, &to);
+  if (ui->tab == EX_TAB_FUNCTIONS) {
+    from = to = -1;
+  }
+  snprintf(head, sizeof(head), "%s  %zu rows", code->name, code->count);
+  ex_wrap(&ui->detail, 0, ui->detail_w, head, EXA_BOLD, NULL, 0);
+  for (size_t i = 0; i < code->count; i++) {
+    const ExInsn *insn = &code->insns[i];
+    int marked = insn->line >= from && insn->line <= to && from > 0;
+    if (insn->line > 0 && insn->line != last_line) {
+      const char *text = ex_report_line(ui->report, insn->line);
+      char number[16];
+      ExLine *line = ex_line_new(&ui->detail);
+      snprintf(number, sizeof(number), "%5d", insn->line);
+      ex_line_seg(line, 0, number, strlen(number),
+                  marked ? EXA_BOLD | EXA_ACCENT : EXA_QUIET);
+      ex_line_seg(line, 8, text ? text : "", text ? strlen(text) : 0,
+                  marked ? EXA_BOLD : EXA_DIM);
+      last_line = insn->line;
+      last_origin = NULL;
+      if (marked && ui->anchor == 0) {
+        ui->anchor = (int)ui->detail.count - 1;
+      }
+    } else if (insn->line == 0 && insn->origin &&
+               (!last_origin || strcmp(last_origin, insn->origin) != 0)) {
+      char note[160];
+      snprintf(note, sizeof(note), "inlined from %s", insn->origin);
+      ex_wrap(&ui->detail, 8, ui->detail_w - 8, note, EXA_QUIET, NULL, 0);
+      last_origin = insn->origin;
+      last_line = 0;
+    }
+    ex_insn_row(ui, insn, marked);
+  }
+}
+
 static void ex_build_detail(ExUi *ui) {
   const ExEntry *entry = ex_current(ui);
   const ExEntry *shown = ex_shown(ui, entry);
@@ -447,6 +731,16 @@ static void ex_build_detail(ExUi *ui) {
   const char *body = NULL;
   ex_lines_clear(&ui->detail);
   if (!entry) {
+    return;
+  }
+  if (ui->source_view == 2) {
+    ex_build_machine_view(ui, shown);
+    if (ui->anchor_pending) {
+      ui->detail_top = ui->anchor > ui->detail_h / 3
+                           ? ui->anchor - ui->detail_h / 3
+                           : 0;
+      ui->anchor_pending = 0;
+    }
     return;
   }
   if (ui->source_view) {
@@ -512,6 +806,7 @@ static void ex_build_detail(ExUi *ui) {
       ex_line_seg(line, 8, text, strlen(text), inside ? 0 : EXA_DIM);
     }
   }
+  ex_machine_section(ui, shown);
   if (shown->code && mettle_explain_lookup(shown->code, &title, &body)) {
     char head[256];
     ex_line_new(&ui->detail);
@@ -827,10 +1122,14 @@ static void ex_draw_footer(ExUi *ui, ExScreen *s) {
     return;
   }
   {
-    const char *full = ui->source_view ? "%s scroll  s back to the detail  "
-                                         "esc back  ? help  q quit"
-                       : ui->focus == 1 ? "%s scroll  s whole file  esc back "
-                                          "to the list  ? help  q quit"
+    const char *full = ui->source_view == 2
+                           ? "%s scroll  d back to the detail  s whole file  "
+                             "esc back  ? help  q quit"
+                       : ui->source_view ? "%s scroll  s back to the detail  "
+                                           "d machine code  esc back  ? help  "
+                                           "q quit"
+                       : ui->focus == 1 ? "%s scroll  s whole file  d machine "
+                                          "code  esc back  ? help  q quit"
                                         : "%s move  %s tabs  enter open  / "
                                           "filter  m missed  f fix  a all  "
                                           "q quit";
@@ -875,6 +1174,7 @@ static void ex_draw_help(ExUi *ui, ExScreen *s) {
       {"pgup pgdn  home end", "page, first, last"},
       {"enter", "open the detail, or follow a link"},
       {"s", "the whole source file, at this line"},
+      {"d", "the machine code of this function, at this line"},
       {"esc  backspace", "back"},
       {"/", "filter by any text in the entry"},
       {"m  f  a", "missed only, with a fix only, all"},
@@ -1028,12 +1328,26 @@ static void ex_toggle_source(ExUi *ui) {
   if (!shown || ui->report->line_count == 0) {
     return;
   }
-  ui->source_view = !ui->source_view;
+  ui->source_view = ui->source_view == 1 ? 0 : 1;
   ui->focus = 1;
   ui->detail_top = ui->source_view
                        ? (shown->line > 0 ? shown->line - 1 - ui->detail_h / 3
                                           : 0)
                        : 0;
+  if (ui->detail_top < 0) {
+    ui->detail_top = 0;
+  }
+}
+
+static void ex_toggle_machine(ExUi *ui) {
+  const ExEntry *shown = ex_shown(ui, ex_current(ui));
+  if (!shown || ui->report->machine_count == 0) {
+    return;
+  }
+  ui->source_view = ui->source_view == 2 ? 0 : 2;
+  ui->focus = 1;
+  ui->detail_top = 0;
+  ui->anchor_pending = ui->source_view == 2;
 }
 
 static void ex_back(ExUi *ui) {
@@ -1131,6 +1445,60 @@ static void ex_typing(ExUi *ui, const ExKey *key) {
   }
 }
 
+static void ex_key_char(ExUi *ui, unsigned code) {
+  switch (code) {
+  case 'q':
+  case 3:
+    ui->quit = 1;
+    return;
+  case '?':
+    ui->help = 1;
+    return;
+  case '/':
+    ui->typing = 1;
+    ui->filter[0] = '\0';
+    ui->focus = 0;
+    return;
+  case 'j':
+  case 'k':
+    ex_step(ui, code == 'j' ? 1 : -1);
+    return;
+  case 'g':
+  case 'G':
+    ex_step(ui, code == 'G' ? 1000000 : -1000000);
+    return;
+  case 'h':
+  case 'l':
+    ex_switch_tab(ui, ui->tab + (code == 'l' ? 1 : -1));
+    return;
+  case 'm':
+  case 'f': {
+    int mode = code == 'm' ? 1 : 2;
+    ui->quick[ui->tab] = ui->quick[ui->tab] == mode ? 0 : mode;
+    ui->focus = 0;
+    return;
+  }
+  case 'a':
+    ui->quick[ui->tab] = 0;
+    ui->filter[0] = '\0';
+    return;
+  case 's':
+    ex_toggle_source(ui);
+    return;
+  case 'd':
+    ex_toggle_machine(ui);
+    return;
+  case ' ':
+    ex_step(ui, ex_page(ui));
+    return;
+  default:
+    if (code >= '1' && code < '1' + EX_TAB_COUNT) {
+      ex_switch_tab(ui, (int)(code - '1'));
+    }
+    return;
+  }
+}
+
 static void ex_key(ExUi *ui, const ExKey *key) {
   if (ui->typing) {
     ex_typing(ui, key);
@@ -1147,61 +1515,8 @@ static void ex_key(ExUi *ui, const ExKey *key) {
   }
   switch (key->kind) {
   case EXK_CHAR:
-    switch (key->code) {
-    case 'q':
-    case 3:
-      ui->quit = 1;
-      return;
-    case '?':
-      ui->help = 1;
-      return;
-    case '/':
-      ui->typing = 1;
-      ui->filter[0] = '\0';
-      ui->focus = 0;
-      return;
-    case 'j':
-      ex_step(ui, 1);
-      return;
-    case 'k':
-      ex_step(ui, -1);
-      return;
-    case 'g':
-      ex_step(ui, -1000000);
-      return;
-    case 'G':
-      ex_step(ui, 1000000);
-      return;
-    case 'h':
-      ex_switch_tab(ui, ui->tab - 1);
-      return;
-    case 'l':
-      ex_switch_tab(ui, ui->tab + 1);
-      return;
-    case 'm':
-      ui->quick[ui->tab] = ui->quick[ui->tab] == 1 ? 0 : 1;
-      ui->focus = 0;
-      return;
-    case 'f':
-      ui->quick[ui->tab] = ui->quick[ui->tab] == 2 ? 0 : 2;
-      ui->focus = 0;
-      return;
-    case 'a':
-      ui->quick[ui->tab] = 0;
-      ui->filter[0] = '\0';
-      return;
-    case 's':
-      ex_toggle_source(ui);
-      return;
-    case ' ':
-      ex_step(ui, ex_page(ui));
-      return;
-    default:
-      if (key->code >= '1' && key->code < '1' + EX_TAB_COUNT) {
-        ex_switch_tab(ui, (int)(key->code - '1'));
-      }
-      return;
-    }
+    ex_key_char(ui, key->code);
+    return;
   case EXK_UP:
     ex_step(ui, -1);
     return;

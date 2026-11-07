@@ -25,7 +25,7 @@
 <p>Fix: read the pointer once into a local and index the local.</p>
 <pre><code>var counts: int32* = t-&gt;counts;
 while (i &lt; n) { counts[i] = 0; i += 1; }</code></pre>
-<p>The local says the base does not change, which is what the loop meant. This is a gap in the compiler&#x27;s alias reasoning, not a fact about your code.</p>
+<p>The local says the base does not change, which is what the loop meant. The compiler&#x27;s alias reasoning cannot prove that on its own yet; the code was right all along.</p>
 
 <h2>Related</h2>
 <ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li></ul>

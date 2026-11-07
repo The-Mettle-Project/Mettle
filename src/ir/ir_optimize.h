@@ -57,6 +57,10 @@ void ir_explain_backend_loop(const char *function_name, const char *filename,
                              size_t head_line, size_t tail_line, int depth,
                              int cycles_per_iter, const char *bottleneck,
                              int has_kernel, int estimated);
+void ir_explain_machine_insn(const char *function_name, const char *filename,
+                             size_t line, const char *origin, const char *text,
+                             const char *ports, int cost, int latency,
+                             int kernel, int depth, int label, size_t offset);
 void ir_explain_backend_cost(const char *function_name, const char *filename,
                              int spills, int regs_used, int total_rthru,
                              long hot_cost, int vec_ops, int estimated_spans);

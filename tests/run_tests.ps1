@@ -710,8 +710,8 @@ $cases = @(
       # re-runs the optimizer, and only then claims it works
       'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpsadbw',
       # int32 sum into an int32 accumulator: diagnosis + proven int64 fix
-      'int32 reduction kernel accumulates into int64',
-      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpaddd',
+      'sum kernel widens each element and adds eight lanes into an int64 total',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpmovsxdq \+ vpaddq',
       # int16 elements into an int64 accumulator: retyping the elements is the
       # whole fix (the no-op (int32) cast is accepted by the sum recognizer),
       # and the simulation proves exactly that advice
@@ -737,7 +737,7 @@ $cases = @(
       # carried operators -- not the generic "no vectorizer recognized" fallback
       '`h` carries a loop-carried recurrence',
       'dependency chain that cannot run as independent SIMD lanes',
-      'multiply, divide, shift, and bitwise/xor recurrences are inherently serial'
+      'Products, quotients, shifts and bitwise recurrences cannot'
     )
   },
   @{
@@ -789,7 +789,7 @@ $cases = @(
       # int16 elements + int32 accumulator: the fix honestly names BOTH
       # required changes
       'use int32 elements and declare the accumulator as int64',
-      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpaddd',
+      'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpmovsxdq \+ vpaddq',
       # call-in-body resolved by the inliner itself: a small loop-bearing
       # callee inlines for real now, and the report explains the nest that
       # results rather than simulating a fix
@@ -13091,14 +13091,14 @@ try {
     }
   }
   $demo = "tests/explain_demo.mettle"
-  Assert-Screen (Invoke-ExplainScreen $demo "") @(
-      "1 Overview 5", "2 Optimizer 25", "5 Functions", "7 Passes",
+  Assert-Screen (Invoke-ExplainScreen $demo "" "140x80") @(
+      "1 Overview 11", "2 Optimizer 25", "5 Functions", "7 Passes",
       "Loops      3 vectorized, 12 scalar, 5 fixes proven",
       "Start here", "matvec:38", "Enter opens this in Optimizer",
       "matvec, loop at line 38", "dot-shape-address") "overview"
-  Assert-Screen (Invoke-ExplainScreen $demo "2 j j j") @(
+  Assert-Screen (Invoke-ExplainScreen $demo "2 j j j" "140x80") @(
       "Line     What             Verdict", "sum_bytes, loop at line 27",
-      "Reason    this is a byte-sum loop", "Verified",
+      "this is a byte-sum loop", "Verified", "Machine loop",
       "for i in 0..n {", "byte-sum-narrow-acc  Byte sum into") "optimizer"
   Assert-Screen (Invoke-ExplainScreen $demo "1 enter") @("matvec, loop at line 38") "link from overview"
   if ((Invoke-ExplainScreen $demo "1 enter") -match "Enter opens this") { throw "enter on a start-here entry did not follow its link" }
@@ -13130,6 +13130,21 @@ try {
   Assert-Screen $proofs @("'Sector' holds 0..11", "Effects inferred and checked", "trail_new") "raii proofs"
   if ($proofs -match "get_stdin") { throw "raii proofs: the effects list reaches into the standard library:`n$proofs" }
   Assert-Screen (Invoke-ExplainScreen $raii "2 / text:trail_new enter") @("Callee instructions") "long field label"
+  Assert-Screen (Invoke-ExplainScreen $demo "2 / text:saxpy enter" "150x46") @(
+      "Machine code  saxpy", "the machine loop, 9 instructions:", "vmulps ymm0, ymm0, ymm4",
+      "vfmadd231ps ymm0, ymm5, ymm1", "Vector body  9 instructions per pass, 5 of them vector") "vector machine loop"
+  Assert-Screen (Invoke-ExplainScreen $demo "2 / text:sum_ints enter" "150x46") @(
+      "Machine loop  0.50 cycles per iteration, bound by port 6", "the machine loop, 4 instructions:",
+      "movsxd rdx, dword ptr [r9+rax*4]") "scalar machine loop"
+  Assert-Screen (Invoke-ExplainScreen $demo "2 / text:saxpy enter d" "150x46") @(
+      "for i in 0..n {", "vfmadd231ps", "d back to the detail") "machine code view"
+  Assert-Screen (Invoke-ExplainScreen $demo "" "150x40") @("Hottest loops", "% ") "hottest loops"
+  $undecoded = foreach ($program in @("tests/explain_demo.mettle", "examples/raii_demo/raii_demo.mettle", "examples/matrix_mul/matrix_mul.mettle")) {
+    $env:METTLE_DISASM_CHECK = "1"
+    & $CompilerPath --release --explain-json $program -o (Join-Path $tmpDir "disasm_check.obj") 2>&1 | Select-String "not decoded"
+    Remove-Item Env:METTLE_DISASM_CHECK
+  }
+  if ($undecoded) { throw "the disassembler could not decode: $($undecoded -join "`n")" }
 
   $saved = Get-ChildItem (Join-Path $env:METTLE_CACHE "explain") -Filter "explain_demo-*.explain.json" | Select-Object -First 1
   if (-not $saved) { throw "the cache holds no explain_demo report" }

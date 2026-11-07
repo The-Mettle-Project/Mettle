@@ -22,7 +22,7 @@
 <pre><code>mettle explain inlined-param-local</code></pre>
 
 <p>The inliner left a <code>__inl_*</code> temporary inside the loop, and the recognizers see a local write per iteration where they expected a plain array access.</p>
-<p>This is a compiler limitation, not a problem in your code. Report the loop if you hit it: the shape that produced it is worth fixing.</p>
+<p>The compiler cannot see through that temporary yet, and the code is fine. Report the loop if you hit it; the shape that produced it is worth fixing.</p>
 
 <h2>Related</h2>
 <ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li></ul>

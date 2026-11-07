@@ -1,6 +1,7 @@
 #include "codegen/binary/mir_annotate.h"
 #include "common.h"
 #include "codegen/binary/mir.h"
+#include "codegen/binary/x86_disasm.h"
 #include "ir/ir.h"
 #include "ir/ir_optimize.h"
 #include "ir/ir_profile.h"
@@ -78,6 +79,7 @@ typedef struct {
   int loop_depth;
   unsigned char cost_estimated;
   int block;
+  char *file;
 } AnnotInsn;
 
 typedef struct {
@@ -1445,6 +1447,10 @@ void mir_annotate_record(const MirFunction *fn, const MirInst *in, int mir_index
     }
   }
   r->line = src_ir ? src_ir->location.line : 0;
+  if (src_ir && src_ir->location.filename && g.cur->file &&
+      strcmp(src_ir->location.filename, g.cur->file) != 0) {
+    r->file = dupstr(src_ir->location.filename);
+  }
 }
 
 void mir_annotate_record_synthetic(const char *label, const char *decision,
@@ -2190,6 +2196,7 @@ static void free_all(void) {
       free(r->note);
       free(r->target);
       free(r->label);
+      free(r->file);
     }
     free(f->insns);
     free(f->regs);
@@ -2205,6 +2212,78 @@ static void free_all(void) {
   g.func_count = g.func_cap = 0;
 }
 
+static int hex_digit(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+static size_t hex_to_bytes(const char *hex, unsigned char *out, size_t cap) {
+  size_t n = 0;
+  for (const char *p = hex; p && *p && n < cap;) {
+    int hi, lo;
+    if (*p == ' ') {
+      p++;
+      continue;
+    }
+    hi = hex_digit(p[0]);
+    lo = p[1] ? hex_digit(p[1]) : -1;
+    if (hi < 0 || lo < 0) return 0;
+    out[n++] = (unsigned char)(hi * 16 + lo);
+    p += 2;
+  }
+  return n;
+}
+
+static int publish_decoded(const AnnotFunc *f, const AnnotInsn *r,
+                           size_t line, const char *origin) {
+  unsigned char *code;
+  size_t n;
+  size_t at = 0;
+  X86DisasmInsn insn;
+  if (!r->bytes || r->len == 0) return 0;
+  code = (unsigned char *)malloc(r->len);
+  if (!code) return 0;
+  n = hex_to_bytes(r->bytes, code, r->len);
+  while (n == r->len && at < n) {
+    int length = x86_disasm_one(code + at, n - at, (long long)(r->off + at),
+                                &insn);
+    if (length <= 0) break;
+    at += (size_t)length;
+  }
+  if (n != r->len || at != n) {
+    if (getenv("METTLE_DISASM_CHECK")) {
+      fprintf(stderr, "disasm check: %s+%zu not decoded: %s [%s]\n", f->name,
+              r->off, r->intel ? r->intel : "?", r->bytes);
+    }
+    free(code);
+    return 0;
+  }
+  if (getenv("METTLE_DISASM_CHECK") && r->mir_index >= 0 && r->intel &&
+      r->intel[0] != '<') {
+    size_t want = 0;
+    while (r->intel[want] && r->intel[want] != ' ') want++;
+    x86_disasm_one(code, n, (long long)r->off, &insn);
+    if ((size_t)insn.length == n &&
+        (strlen(insn.mnemonic) != want ||
+         strncmp(insn.mnemonic, r->intel, want) != 0)) {
+      fprintf(stderr, "disasm check: %s+%zu %s | %s [%s]\n", f->name, r->off,
+              r->intel, insn.text, r->bytes);
+    }
+  }
+  for (at = 0; at < n; at += (size_t)insn.length) {
+    int priced = at == 0 && !r->is_kernel;
+    x86_disasm_one(code + at, n - at, (long long)(r->off + at), &insn);
+    ir_explain_machine_insn(f->name, f->file, line, origin, insn.text,
+                            priced ? r->ports : NULL, priced ? r->rthru : 0,
+                            priced ? r->lat : 0, r->is_kernel, r->loop_depth,
+                            0, r->off + at);
+  }
+  free(code);
+  return 1;
+}
+
 static void publish_costs_to_explain(void) {
   if (!ir_explain_enabled()) return;
   for (size_t fi = 0; fi < g.func_count; fi++) {
@@ -2214,10 +2293,38 @@ static void publish_costs_to_explain(void) {
                             f->cost_estimated);
     for (size_t li = 0; li < f->loop_count; li++) {
       const Loop *l = &f->loops[li];
+      if (l->start_rec >= 0 && (size_t)l->start_rec < f->insn_count &&
+          f->insns[l->start_rec].file) {
+        continue;
+      }
       ir_explain_backend_loop(f->name, f->file, l->head_line, l->tail_line,
                               l->depth, l->cycles_per_iter,
                               res_name[l->bottleneck], l->has_kernel,
                               l->has_estimated);
+    }
+    for (size_t ii = 0; ii < f->insn_count; ii++) {
+      const AnnotInsn *r = &f->insns[ii];
+      char origin[256];
+      const char *text = r->is_label ? r->label : r->intel;
+      size_t line = r->file ? 0 : r->line;
+      if (!text || !text[0]) continue;
+      origin[0] = '\0';
+      if (r->file) {
+        const char *base = r->file;
+        for (const char *p = r->file; *p; p++) {
+          if (*p == '/' || *p == '\\') base = p + 1;
+        }
+        snprintf(origin, sizeof(origin), "%s:%zu", base, r->line);
+      }
+      if (!r->is_label && !r->is_branch && text[0] != 'j' &&
+          !strchr(text, ';') && strncmp(text, "call", 4) != 0 &&
+          publish_decoded(f, r, line, origin[0] ? origin : NULL)) {
+        continue;
+      }
+      ir_explain_machine_insn(f->name, f->file, line,
+                              origin[0] ? origin : NULL, text, r->ports,
+                              r->rthru, r->lat, r->is_kernel, r->loop_depth,
+                              r->is_label, r->off);
     }
   }
 }

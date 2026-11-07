@@ -21,7 +21,7 @@
 <p class="lede">Reported by the compiler as an error or warning.</p>
 <pre><code>mettle explain E0001</code></pre>
 
-<p>The compiler could not turn part of the source text into tokens. Typical causes: an unterminated string literal, an invalid numeric literal (e.g. 0x with no digits), or a stray character that is not part of the language.</p>
+<p>The compiler could not turn part of the source text into tokens. Typical causes: an unterminated string literal, an invalid numeric literal such as 0x with no digits, or a stray character that is not part of the language.</p>
 <h3>Example</h3>
 <pre><code>var s: string = &quot;unterminated;</code></pre>
 <p>Fix: close the string, correct the literal, or delete the stray character. The caret in the diagnostic points at the first byte the lexer could not process.</p>

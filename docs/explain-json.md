@@ -31,6 +31,7 @@ number it does not know.
 | `backend` | object | How much of the program reached the register-allocating backend |
 | `functions` | array | Per-function totals |
 | `loops` | array | Per-loop cost model |
+| `machine`, `machineTotal` | array, number | The emitted instructions of every function in the file |
 | `callGraph` | array | Caller and callee pairs with inlining outcomes |
 | `hotspots` | array | The costliest sites |
 | `passes` | array | What each optimizer pass did |
@@ -109,7 +110,35 @@ false and `entries` is empty.
 
 `fn`, `line`, `endLine`, `depth`, `cyclesPerIter`, `bottleneck` (the port or
 unit that limits it, such as `store`), `hasKernel` (whether a vectorizer
-claimed it), and `estimated`.
+claimed it), and `estimated`. `cyclesPerIter` is in hundredths of a cycle, so
+`50` is half a cycle. A loop the backend inlined from another file is left
+out, since its lines belong to that file.
+
+## machine
+
+The machine code of every function in the file, as the backend emitted it.
+Each element is `{"fn": name, "insns": [...]}`, and each instruction is an
+array:
+
+```text
+[line, text, ports, cost, latency, kernel, depth, label, origin, offset]
+```
+
+- `line`: the source line it came from, or 0 when it came from another file.
+- `text`: Intel syntax, decoded from the emitted bytes. Branches and calls keep
+  their symbolic targets; a branch inside a vector kernel names the target's
+  offset.
+- `ports` and `cost`: the execution ports the cost model charges and its
+  reciprocal throughput in hundredths of a cycle. A vector kernel's
+  instructions carry neither.
+- `latency`: cycles until the result is ready.
+- `kernel`: 1 for an instruction inside a vector kernel.
+- `depth`: loop nesting depth.
+- `label`: 1 for a label row, whose `text` is the label's name.
+- `origin`: `file:line` for an instruction inlined from another file.
+- `offset`: the byte offset in the function.
+
+`machineTotal` counts every instruction seen; `machine` stops at 60000.
 
 ## backend
 

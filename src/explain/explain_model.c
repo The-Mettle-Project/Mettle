@@ -1,4 +1,5 @@
 #include "explain_model.h"
+#include "../error/error_explain.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -165,6 +166,15 @@ static void ex_entry_free(ExEntry *e) {
   free(e->fields);
   free(e->code);
   free(e->search);
+  free(e->function);
+}
+
+static void ex_cycles(char *out, size_t cap, long long centi) {
+  if (centi % 100 == 0) {
+    snprintf(out, cap, "%lld", centi / 100);
+  } else {
+    snprintf(out, cap, "%lld.%02lld", centi / 100, centi % 100);
+  }
 }
 
 static char *ex_words(const char *key) {
@@ -329,6 +339,334 @@ static void ex_merge_repeats(ExTab *tab, const char *label) {
   }
 }
 
+static const char *ex_bound_words(const char *bound, char *out, size_t cap) {
+  if (!bound) {
+    return NULL;
+  }
+  if (bound[0] == 'p' && bound[1] >= '0' && bound[1] <= '9') {
+    snprintf(out, cap, "port %s", bound + 1);
+  } else if (strcmp(bound, "load") == 0) {
+    snprintf(out, cap, "the load ports");
+  } else if (strcmp(bound, "store") == 0) {
+    snprintf(out, cap, "the store port");
+  } else {
+    snprintf(out, cap, "%s", bound);
+  }
+  return out;
+}
+
+static int ex_insn_is_vector(const ExInsn *insn) {
+  return insn->text && insn->text[0] == 'v' &&
+         (strstr(insn->text, "ymm") || strstr(insn->text, "xmm"));
+}
+
+static long long ex_branch_target(const ExInsn *insn) {
+  const char *at;
+  if (!insn->text || insn->text[0] != 'j') {
+    return -1;
+  }
+  at = strstr(insn->text, " 0x");
+  return at ? strtoll(at + 3, NULL, 16) : -1;
+}
+
+typedef struct {
+  int uops;
+  int loads;
+  int stores;
+  int fp;
+  int vint;
+  int shuffle;
+  int mul;
+} ExPressure;
+
+static int ex_starts(const char *text, const char *prefix) {
+  return strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+static const char *const EX_FUSING[] = {"cmp ", "test ", "add ", "sub ",
+                                         "and ", "inc ",  "dec "};
+static const char *const EX_PURE_LOADS[] = {"vmov", "mov", "vbroadcast",
+                                            "vpbroadcast"};
+static const char *const EX_FP_PORTS[] = {
+    "vfm",  "vfnm",  "vadd",  "vsub",     "vmul",    "vmin",     "vmax", "vcvt",
+    "vpsra", "vpsrl", "vpsll", "vpmaddwd", "vpmuldq", "vpmuludq", "vround",
+    "vdiv"};
+static const char *const EX_INT_PORTS[] = {
+    "vpadd", "vpsub", "vpand", "vpor",  "vpxor", "vpmin",   "vpmax",
+    "vpcmp", "vpabs", "vxorp", "vandp", "vorp",  "vpblend", "vblend"};
+
+static int ex_starts_any(const char *text, const char *const *list,
+                         size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    if (ex_starts(text, list[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+#define EX_STARTS_ANY(text, list) \
+  ex_starts_any(text, list, sizeof(list) / sizeof(list[0]))
+
+static void ex_price_vector(const char *text, ExPressure *p) {
+  if (EX_STARTS_ANY(text, EX_FP_PORTS)) {
+    p->fp++;
+  } else if (ex_starts(text, "vpmulld")) {
+    p->mul += 2;
+  } else if (EX_STARTS_ANY(text, EX_INT_PORTS)) {
+    p->vint++;
+  } else if (!ex_starts(text, "vmov") && !ex_starts(text, "vzero")) {
+    p->shuffle++;
+  }
+}
+
+static void ex_price(const char *text, ExPressure *p, int *fused) {
+  const char *comma = strchr(text, ',');
+  const char *bracket = strchr(text, '[');
+  int store = bracket && comma && bracket < comma;
+  if (*fused && text[0] == 'j') {
+    *fused = 0;
+    return;
+  }
+  *fused = EX_STARTS_ANY(text, EX_FUSING);
+  p->uops++;
+  if (store) {
+    p->stores++;
+    if (!ex_starts(text, "vmov") && !ex_starts(text, "mov")) {
+      p->loads++;
+      p->uops++;
+    }
+    return;
+  }
+  if (bracket) {
+    p->loads++;
+    if (EX_STARTS_ANY(text, EX_PURE_LOADS)) {
+      return;
+    }
+  }
+  if (text[0] == 'v') {
+    ex_price_vector(text, p);
+  }
+}
+
+static const char *ex_pressure_bound(const ExPressure *p, int *centi) {
+  struct {
+    const char *name;
+    int centi;
+  } limits[6] = {
+      {"the front end, four instructions a cycle", p->uops * 25},
+      {"the load ports", p->loads * 50},
+      {"the store port", p->stores * 100},
+      {"ports 0 and 1", (p->fp + p->mul) * 50},
+      {"ports 0, 1 and 5", (p->fp + p->mul + p->vint + p->shuffle) * 100 / 3},
+      {"port 5", p->shuffle * 100},
+  };
+  int best = 0;
+  for (int i = 1; i < 6; i++) {
+    if (limits[i].centi > limits[best].centi) {
+      best = i;
+    }
+  }
+  *centi = limits[best].centi;
+  return limits[best].name;
+}
+
+static int ex_headline_lanes(const char *headline, int *element_bytes) {
+  const char *wide = headline ? strstr(headline, "-wide ") : NULL;
+  const char *start;
+  const char *type;
+  int lanes;
+  if (!wide) {
+    return 0;
+  }
+  start = wide;
+  while (start > headline && start[-1] >= '0' && start[-1] <= '9') {
+    start--;
+  }
+  lanes = atoi(start);
+  type = wide + 6;
+  *element_bytes = ex_starts(type, "float64") || ex_starts(type, "int64") ? 8
+                   : ex_starts(type, "float32") || ex_starts(type, "int32") ||
+                           ex_starts(type, "uint32")
+                       ? 4
+                   : ex_starts(type, "int16") || ex_starts(type, "uint16") ? 2
+                   : ex_starts(type, "byte") || ex_starts(type, "int8") ||
+                           ex_starts(type, "uint8")
+                       ? 1
+                       : 0;
+  return lanes;
+}
+
+static void ex_vector_cost(ExEntry *entry, const ExMachineFn *code,
+                           long long from, long long to,
+                           const char *headline) {
+  ExPressure p;
+  int fused = 0;
+  int centi = 0;
+  int element_bytes = 0;
+  int lanes = ex_headline_lanes(headline, &element_bytes);
+  long long advance = 0;
+  const char *bound;
+  char cycles[24];
+  memset(&p, 0, sizeof(p));
+  for (size_t k = 0; k < code->count; k++) {
+    const ExInsn *insn = &code->insns[k];
+    if (!insn->kernel || insn->label || insn->offset < from ||
+        insn->offset > to || !insn->text) {
+      continue;
+    }
+    ex_price(insn->text, &p, &fused);
+    if (ex_starts(insn->text, "add r") && strchr(insn->text, ',')) {
+      long long step = atoll(strchr(insn->text, ',') + 1);
+      if (step > advance) {
+        advance = step;
+      }
+    }
+  }
+  bound = ex_pressure_bound(&p, &centi);
+  if (centi <= 0) {
+    return;
+  }
+  ex_cycles(cycles, sizeof(cycles), centi);
+  if (lanes > 0 && element_bytes > 0 && advance == (long long)lanes *
+                                                       element_bytes) {
+    char each[24];
+    ex_cycles(each, sizeof(each), (centi + lanes / 2) / lanes);
+    ex_field_owned(entry, "Vector cost",
+                   ex_fmt("about %s cycles per pass, bound by %s; a pass "
+                          "covers %d elements, about %s cycles each",
+                          cycles, bound, lanes, each),
+                   EX_TONE_DONE);
+  } else {
+    ex_field_owned(entry, "Vector cost",
+                   ex_fmt("about %s cycles per pass, bound by %s", cycles,
+                          bound),
+                   EX_TONE_DONE);
+  }
+}
+
+static void ex_vector_body(ExEntry *entry, const ExReport *report,
+                           const char *fn, int line, int end_line,
+                           const char *headline) {
+  const ExMachineFn *code = ex_report_machine(report, fn);
+  long long best_from = -1;
+  long long best_to = -1;
+  int best_vector = 0;
+  if (!code) {
+    return;
+  }
+  for (size_t i = 0; i < code->count; i++) {
+    const ExInsn *jump = &code->insns[i];
+    long long target = ex_branch_target(jump);
+    int vector = 0;
+    if (!jump->kernel || jump->line < line || jump->line > end_line ||
+        target < 0 || target >= jump->offset) {
+      continue;
+    }
+    for (size_t k = 0; k < code->count; k++) {
+      const ExInsn *insn = &code->insns[k];
+      if (insn->kernel && insn->offset >= target &&
+          insn->offset <= jump->offset && ex_insn_is_vector(insn)) {
+        vector += strstr(insn->text, "ymm") ? 2 : 1;
+      }
+    }
+    if (vector > best_vector) {
+      best_vector = vector;
+      best_from = target;
+      best_to = jump->offset;
+    }
+  }
+  if (best_vector == 0) {
+    return;
+  }
+  {
+    char list[512];
+    char names[32][24];
+    int uses[32];
+    int kinds = 0;
+    size_t n = 0;
+    int count = 0;
+    int vector = 0;
+    list[0] = '\0';
+    for (size_t k = 0; k < code->count; k++) {
+      const ExInsn *insn = &code->insns[k];
+      size_t word = 0;
+      int known = 0;
+      if (!insn->kernel || insn->offset < best_from ||
+          insn->offset > best_to || !insn->text) {
+        continue;
+      }
+      count++;
+      vector += ex_insn_is_vector(insn);
+      while (insn->text[word] && insn->text[word] != ' ' && word < 23) {
+        word++;
+      }
+      while (known < kinds && (strlen(names[known]) != word ||
+                               strncmp(names[known], insn->text, word) != 0)) {
+        known++;
+      }
+      if (known == kinds && kinds < 32) {
+        memcpy(names[kinds], insn->text, word);
+        names[kinds][word] = '\0';
+        uses[kinds++] = 0;
+      }
+      if (known < kinds) {
+        uses[known]++;
+      }
+      if (n + word + 3 < sizeof(list)) {
+        n += (size_t)snprintf(list + n, sizeof(list) - n, "%s%.*s",
+                              n ? ", " : "", (int)word, insn->text);
+      }
+    }
+    if (count > 12) {
+      n = 0;
+      for (int k = 0; k < kinds && n + 32 < sizeof(list); k++) {
+        if (uses[k] > 1) {
+          n += (size_t)snprintf(list + n, sizeof(list) - n, "%s%d %s",
+                                n ? ", " : "", uses[k], names[k]);
+        } else {
+          n += (size_t)snprintf(list + n, sizeof(list) - n, "%s%s",
+                                n ? ", " : "", names[k]);
+        }
+      }
+    }
+    ex_field_owned(entry, "Vector body",
+                   ex_fmt("%d instructions per pass, %d of them vector: %s",
+                          count, vector, list),
+                   EX_TONE_DONE);
+    ex_vector_cost(entry, code, best_from, best_to, headline);
+  }
+}
+
+static void ex_loop_cost_field(ExEntry *entry, const ExJson *root,
+                               const char *fn, long long line) {
+  const ExJson *loops = ex_json_get(root, "loops");
+  for (size_t i = 0; i < ex_json_count(loops); i++) {
+    const ExJson *loop = ex_json_at(loops, i);
+    char cycles[24];
+    char bound[48];
+    if (!ex_same_text(ex_json_text(loop, "fn"), fn) ||
+        ex_json_int(loop, "line", 0) != line) {
+      continue;
+    }
+    if (ex_json_flag(loop, "hasKernel")) {
+      return;
+    }
+    ex_cycles(cycles, sizeof(cycles), ex_json_int(loop, "cyclesPerIter", 0));
+    ex_field_owned(
+        entry, "Machine loop",
+        ex_fmt("%s cycles per iteration%s%s%s", cycles,
+               ex_json_text(loop, "bottleneck") ? ", bound by " : "",
+               ex_json_text(loop, "bottleneck")
+                   ? ex_bound_words(ex_json_text(loop, "bottleneck"), bound,
+                                    sizeof(bound))
+                   : "",
+               ex_json_flag(loop, "estimated") ? ", estimated" : ""),
+        EX_TONE_PLAIN);
+    return;
+  }
+}
+
 static void ex_build_optimizer(ExReport *report, const ExJson *root) {
   ExTab *tab = &report->tabs[EX_TAB_OPTIMIZER];
   const ExJson *remarks = ex_json_get(root, "remarks");
@@ -355,6 +693,7 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
     if (!entry) {
       return;
     }
+    entry->function = ex_strdup(fn);
     if (kind && strcmp(kind, "calls-folded") == 0) {
       long long last = ex_json_int(r, "lineEnd", line);
       entry->cells[0] = ex_fmt("%lld-%lld", line, last);
@@ -389,6 +728,13 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
     ex_field(entry, "Still blocked", ex_json_text(r, "stillBlocked"),
              EX_TONE_MISSED);
     ex_field(entry, "Calls", ex_json_text(r, "calls"), EX_TONE_PLAIN);
+    if (kind && strcmp(kind, "loop") == 0) {
+      ex_loop_cost_field(entry, root, fn, line);
+      if (positive) {
+        ex_vector_body(entry, report, fn, (int)line,
+                       end_line > line ? (int)end_line : (int)line, headline);
+      }
+    }
     {
       const ExJson *quantities = ex_json_get(r, "quantities");
       for (size_t q = 0; quantities && quantities->kind == EXJ_OBJECT &&
@@ -444,6 +790,148 @@ static void ex_count_ownership(const ExJson *root, long long *inserted,
       (*inserted)++;
     }
   }
+}
+
+static int ex_find_loop_remark(const ExTab *tab, const char *fn, long long line) {
+  int best = -1;
+  long long best_score = 0;
+  for (size_t i = 0; i < tab->count; i++) {
+    const ExEntry *e = &tab->entries[i];
+    int last = e->end_line > e->line ? e->end_line : e->line;
+    long long score;
+    if (!e->cells[1] || strcmp(e->cells[1], "loop") != 0 || line < e->line ||
+        line > last) {
+      continue;
+    }
+    score = (e->line == line ? 0 : 1000000) + (last - e->line) +
+            (ex_same_text(e->function, fn) ? 0 : 100000);
+    if (best < 0 || score < best_score) {
+      best = (int)i;
+      best_score = score;
+    }
+  }
+  return best;
+}
+
+typedef struct {
+  const char *fn;
+  long long line;
+  long long cost;
+  long long cycles;
+  const char *bound;
+  int kernel;
+  int copies;
+} ExHotLoop;
+
+static int ex_hot_order(const void *a, const void *b) {
+  const ExHotLoop *x = (const ExHotLoop *)a;
+  const ExHotLoop *y = (const ExHotLoop *)b;
+  return x->cost > y->cost ? -1 : x->cost < y->cost;
+}
+
+static void ex_hot_loops(ExTab *tab, const ExTab *optimizer,
+                         const ExJson *root) {
+  const ExJson *loops = ex_json_get(root, "loops");
+  size_t total = ex_json_count(loops);
+  size_t count = 0;
+  long long sum = 0;
+  ExHotLoop *hot = total ? calloc(total, sizeof(*hot)) : NULL;
+  if (!hot) {
+    return;
+  }
+  for (size_t i = 0; i < total; i++) {
+    const ExJson *loop = ex_json_at(loops, i);
+    const char *fn = ex_json_text(loop, "fn");
+    long long line = ex_json_int(loop, "line", 0);
+    long long cycles = ex_json_int(loop, "cyclesPerIter", 0);
+    long long depth = ex_json_int(loop, "depth", 0);
+    long long cost = cycles;
+    size_t k = 0;
+    for (long long d = 0; d < depth && d < 3; d++) {
+      cost *= 10;
+    }
+    sum += cost;
+    while (k < count && !(hot[k].line == line && ex_same_text(hot[k].fn, fn))) {
+      k++;
+    }
+    if (k == count) {
+      hot[count].fn = fn;
+      hot[count].line = line;
+      hot[count].cycles = cycles;
+      hot[count].bound = ex_json_text(loop, "bottleneck");
+      hot[count].kernel = ex_json_flag(loop, "hasKernel");
+      count++;
+    }
+    hot[k].cost += cost;
+    hot[k].copies++;
+  }
+  if (count > 1) {
+    qsort(hot, count, sizeof(*hot), ex_hot_order);
+  }
+  for (size_t i = 0; i < count && i < 6 && sum > 0; i++) {
+    const ExHotLoop *h = &hot[i];
+    long long share = h->cost * 100 / sum;
+    char cycles[24];
+    char bound[48];
+    int remark = ex_find_loop_remark(optimizer, h->fn, h->line);
+    const ExEntry *linked = remark >= 0 ? &optimizer->entries[remark] : NULL;
+    ExEntry *entry;
+    if (h->cost == 0 || (share == 0 && i >= 3)) {
+      break;
+    }
+    entry = ex_add(tab, "Hottest loops");
+    if (!entry) {
+      break;
+    }
+    ex_cycles(cycles, sizeof(cycles), h->cycles);
+    entry->function = ex_strdup(h->fn);
+    entry->cells[0] = ex_fmt("%lld%%", share);
+    entry->cells[1] = ex_fmt("%s:%lld", h->fn ? h->fn : "?", h->line);
+    {
+      const char *title = NULL;
+      const char *body = NULL;
+      if (linked && linked->tone != EX_TONE_DONE && linked->code &&
+          mettle_explain_lookup(linked->code, &title, &body)) {
+        entry->cells[2] = ex_strdup(title);
+      } else if (linked && linked->cells[2]) {
+        entry->cells[2] = ex_strdup(linked->cells[2]);
+      } else {
+        entry->cells[2] =
+            ex_strdup(h->kernel ? "runs a vector kernel" : "scalar");
+      }
+    }
+    entry->title = ex_fmt("%s, loop at line %lld", h->fn ? h->fn : "?",
+                          h->line);
+    entry->line = (int)h->line;
+    entry->tone = linked ? linked->tone : EX_TONE_PLAIN;
+    entry->flags = linked ? linked->flags : 0;
+    ex_field_owned(entry, "Share",
+                   ex_fmt("%lld%% of the static loop cost: cycles per "
+                          "iteration, times ten for each level of nesting",
+                          share),
+                   EX_TONE_PLAIN);
+    if (!h->kernel) {
+      ex_field_owned(entry, "Machine loop",
+                     ex_fmt("%s cycles per iteration%s%s", cycles,
+                            h->bound ? ", bound by " : "",
+                            h->bound ? ex_bound_words(h->bound, bound,
+                                                      sizeof(bound))
+                                     : ""),
+                     EX_TONE_PLAIN);
+    }
+    if (h->copies > 1) {
+      ex_field_owned(entry, "Copies",
+                     ex_fmt("%d, one for each place it was inlined",
+                            h->copies),
+                     EX_TONE_PLAIN);
+    }
+    if (linked) {
+      entry->link_tab = EX_TAB_OPTIMIZER;
+      entry->link_entry = remark;
+    }
+    ex_finish(entry);
+  }
+  free(hot);
 }
 
 static void ex_build_overview(ExReport *report, const ExJson *root) {
@@ -527,6 +1015,7 @@ static void ex_build_overview(ExReport *report, const ExJson *root) {
     if (!entry) {
       return;
     }
+    entry->function = ex_strdup(fn);
     entry->cells[0] = ex_fmt("%zu", i + 1);
     entry->cells[1] = ex_fmt("%s:%lld", fn ? fn : "?", line);
     entry->cells[2] = ex_strdup(ex_json_text(s, "fix"));
@@ -555,6 +1044,7 @@ static void ex_build_overview(ExReport *report, const ExJson *root) {
         ex_find_remark(optimizer, fn, line, ex_json_text(s, "code"));
     ex_finish(entry);
   }
+  ex_hot_loops(tab, optimizer, root);
   for (size_t i = 0; i < ex_json_count(entries); i++) {
     const ExJson *c = ex_json_at(entries, i);
     const char *fn = ex_json_text(c, "fn");
@@ -566,6 +1056,7 @@ static void ex_build_overview(ExReport *report, const ExJson *root) {
     if (!entry) {
       return;
     }
+    entry->function = ex_strdup(fn);
     entry->cells[0] = ex_strdup(regressed ? "worse" : "better");
     entry->cells[1] = ex_fmt("%s:%lld", fn ? fn : "?", line);
     entry->cells[2] =
@@ -611,6 +1102,7 @@ static void ex_build_ownership(ExReport *report, const ExJson *root) {
       free(label);
       return;
     }
+    entry->function = ex_strdup(ex_json_text(r, "function"));
     entry->cells[0] = ex_fmt("%lld", line);
     entry->cells[1] = label;
     entry->cells[2] = subject ? ex_fmt("`%s`", subject) : NULL;
@@ -721,6 +1213,7 @@ static void ex_build_memory(ExReport *report, const ExJson *root) {
       if (!entry) {
         return;
       }
+      entry->function = ex_strdup(fn);
       entry->cells[0] = ex_fmt("%lld", line);
       entry->cells[1] = ex_strdup(what);
       entry->line = (int)line;
@@ -828,11 +1321,15 @@ static void ex_loop_fields(ExEntry *entry, const ExJson *loops,
   for (size_t r = 0; r < count; r++) {
     const ExLoopRow *row = &rows[r];
     char cycles[64];
+    char low[24];
+    char high[24];
     char copies[32] = "";
+    ex_cycles(low, sizeof(low), row->low);
+    ex_cycles(high, sizeof(high), row->high);
     if (row->low == row->high) {
-      snprintf(cycles, sizeof(cycles), "%lld", row->low);
+      snprintf(cycles, sizeof(cycles), "%s", low);
     } else {
-      snprintf(cycles, sizeof(cycles), "%lld to %lld", row->low, row->high);
+      snprintf(cycles, sizeof(cycles), "%s to %s", low, high);
     }
     if (row->copies > 1) {
       snprintf(copies, sizeof(copies), ", %d copies", row->copies);
@@ -882,6 +1379,7 @@ static void ex_build_functions(ExReport *report, const ExJson *root) {
     if (!entry) {
       break;
     }
+    entry->function = ex_strdup(fn);
     entry->cells[0] = ex_strdup(fn);
     entry->cells[1] = ex_fmt("%lld", ex_json_int(f, "instructionsAfter", 0));
     entry->cells[2] = loops_total ? ex_fmt("%lld/%lld", loops_vec, loops_total)
@@ -1007,6 +1505,7 @@ static void ex_build_proofs(ExReport *report, const ExJson *root) {
     if (!entry) {
       return;
     }
+    entry->function = ex_strdup(ex_json_text(l, "fn"));
     entry->cells[0] = ex_fmt("line %lld", line);
     entry->cells[1] = ex_strdup(ex_json_text(l, "detail"));
     entry->title = ex_fmt("line %lld", line);
@@ -1024,6 +1523,7 @@ static void ex_build_proofs(ExReport *report, const ExJson *root) {
     if (!entry) {
       return;
     }
+    entry->function = ex_strdup(ex_json_text(t, "fn"));
     entry->cells[0] = ex_fmt("line %lld", line);
     entry->cells[1] = ex_fmt("'%s' holds %lld..%lld", type ? type : "?",
                              ex_json_int(t, "min", 0),
@@ -1049,6 +1549,7 @@ static void ex_build_proofs(ExReport *report, const ExJson *root) {
     if (!entry) {
       return;
     }
+    entry->function = ex_strdup(ex_json_text(p, "fn"));
     entry->cells[0] = ex_fmt("line %lld", line);
     entry->cells[1] = ex_strdup(ex_json_text(p, "what"));
     entry->title = ex_fmt("line %lld", line);
@@ -1094,6 +1595,7 @@ static void ex_build_proofs(ExReport *report, const ExJson *root) {
     if (!entry) {
       return;
     }
+    entry->function = ex_strdup(fn);
     entry->cells[0] = ex_strdup(fn);
     entry->cells[1] = ex_fmt("performs %s",
                              ex_json_text(e, "performs")
@@ -1281,6 +1783,67 @@ static void ex_load_source(ExReport *report, const char *path) {
   free(text);
 }
 
+static long long ex_item_int(const ExJson *array, size_t index) {
+  const ExJson *item = ex_json_at(array, index);
+  return item && item->kind == EXJ_NUMBER ? (long long)item->number : 0;
+}
+
+static char *ex_item_text(const ExJson *array, size_t index) {
+  const ExJson *item = ex_json_at(array, index);
+  return item && item->kind == EXJ_STRING ? ex_strdup(item->string) : NULL;
+}
+
+static void ex_build_machine(ExReport *report, const ExJson *root) {
+  const ExJson *machine = ex_json_get(root, "machine");
+  size_t count = ex_json_count(machine);
+  report->machine_total = ex_json_int(root, "machineTotal", 0);
+  if (count == 0) {
+    return;
+  }
+  report->machine = calloc(count, sizeof(ExMachineFn));
+  if (!report->machine) {
+    return;
+  }
+  for (size_t i = 0; i < count; i++) {
+    const ExJson *f = ex_json_at(machine, i);
+    const ExJson *insns = ex_json_get(f, "insns");
+    size_t n = ex_json_count(insns);
+    ExMachineFn *fn = &report->machine[report->machine_count++];
+    fn->name = ex_strdup(ex_json_text(f, "fn"));
+    fn->insns = n ? calloc(n, sizeof(ExInsn)) : NULL;
+    if (!fn->insns) {
+      continue;
+    }
+    for (size_t k = 0; k < n; k++) {
+      const ExJson *row = ex_json_at(insns, k);
+      ExInsn *insn = &fn->insns[fn->count++];
+      insn->line = (int)ex_item_int(row, 0);
+      insn->text = ex_item_text(row, 1);
+      insn->ports = ex_item_text(row, 2);
+      insn->cost = (int)ex_item_int(row, 3);
+      insn->latency = (int)ex_item_int(row, 4);
+      insn->kernel = (int)ex_item_int(row, 5);
+      insn->depth = (int)ex_item_int(row, 6);
+      insn->label = (int)ex_item_int(row, 7);
+      insn->origin = ex_item_text(row, 8);
+      insn->offset = ex_item_int(row, 9);
+    }
+  }
+}
+
+const ExMachineFn *ex_report_machine(const ExReport *report,
+                                     const char *function) {
+  if (!report || !function) {
+    return NULL;
+  }
+  for (size_t i = 0; i < report->machine_count; i++) {
+    if (ex_same_text(report->machine[i].name, function)) {
+      return &report->machine[i];
+    }
+  }
+  return NULL;
+}
+
 const char *ex_report_line(const ExReport *report, int line) {
   if (!report || line <= 0 || (size_t)line > report->line_count) {
     return NULL;
@@ -1297,6 +1860,7 @@ ExReport *ex_report_build(const ExJson *root, const char *source_path) {
   report->source_name = ex_strdup(ex_json_text(root, "source"));
   report->source_path = ex_strdup(path);
   ex_load_source(report, path);
+  ex_build_machine(report, root);
   ex_build_optimizer(report, root);
   ex_build_overview(report, root);
   ex_build_ownership(report, root);
@@ -1326,6 +1890,17 @@ void ex_report_free(ExReport *report) {
     free(report->lines[i]);
   }
   free(report->lines);
+  for (size_t i = 0; i < report->machine_count; i++) {
+    ExMachineFn *fn = &report->machine[i];
+    for (size_t k = 0; k < fn->count; k++) {
+      free(fn->insns[k].text);
+      free(fn->insns[k].ports);
+      free(fn->insns[k].origin);
+    }
+    free(fn->insns);
+    free(fn->name);
+  }
+  free(report->machine);
   free(report->source_name);
   free(report->source_path);
   free(report);

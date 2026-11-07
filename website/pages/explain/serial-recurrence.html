@@ -21,8 +21,8 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain serial-recurrence</code></pre>
 
-<p>A value is computed from its own previous value through an operation that does not reassociate: <code>*</code>, <code>/</code>, a shift, or a bitwise or xor op. Iteration 2 cannot start until iteration 1 has finished, so the lanes form a chain rather than eight independent pieces of work.</p>
-<p>This is the one refusal that is a fact about the algorithm rather than a gap in the compiler. A hash, a linear congruential generator, an IIR filter: the running state IS the algorithm, and the loop is already at its scalar floor.</p>
+<p>A value is computed from its own previous value through an operation that does not reassociate: <code>*</code>, <code>/</code>, a shift, or a bitwise operation. Iteration 2 cannot start until iteration 1 has finished, so the work is one chain and there is nothing independent to spread across lanes.</p>
+<p>This is the one refusal that comes from the algorithm itself. In a hash, a linear congruential generator or an IIR filter the running state is the algorithm, and the loop is already at its scalar floor.</p>
 <p>What does vectorize: <code>+</code> and <code>-</code> reductions. Those reassociate, so the compiler splits them into per-lane partial sums and adds the lanes at the end.</p>
 <p>Fix: none, unless the algorithm itself can change. Some hashes have a parallel form that hashes N independent streams and combines them.</p>
 

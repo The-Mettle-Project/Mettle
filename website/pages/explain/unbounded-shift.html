@@ -21,7 +21,7 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain unbounded-shift</code></pre>
 
-<p>Integer lanes are 32 bits wide. <code>+ - * &amp; | ^ &lt;&lt;</code> are congruent mod 2^32, so the low 32 bits of a result depend only on the low 32 bits of its inputs and a lane reproduces them whatever width the scalar code used. <code>&gt;&gt;</code> is the exception: it reads bits back DOWN, so a lane that wrapped where the scalar did not would shift different bits in.</p>
+<p>Integer lanes are 32 bits wide. <code>+ - * &amp; | ^ &lt;&lt;</code> are congruent mod 2^32, so the low 32 bits of a result depend only on the low 32 bits of its inputs and a lane reproduces them whatever width the scalar code used. <code>&gt;&gt;</code> is the exception: it moves high bits down, so a lane that wrapped where the scalar did not would shift different bits in.</p>
 <p>The kernel takes a right shift only where the shifted value is provably inside int32, and a multiply is not provable on its own. This is refused:</p>
 <pre><code>dst[i] = (r[i]*77 + g[i]*150 + b[i]*29) &gt;&gt; 8;</code></pre>
 <p>Masking bounds it, at the cost of one op per lane, and this vectorizes:</p>

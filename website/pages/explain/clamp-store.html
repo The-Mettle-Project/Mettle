@@ -22,7 +22,7 @@
 <pre><code>mettle explain clamp-store</code></pre>
 
 <p><code>if (v &gt; hi) { v = hi; }</code> before <code>a[i] = v</code> is a clamp, and over int32 elements it vectorizes: the branch becomes vpminsd or vpmaxsd, or a lane select when the arms are not the two compared values. A chain of them, including the one an inlined helper&#x27;s early returns leave behind, folds the same way.</p>
-<p>This code fires when that conversion did not carry the loop. Two things stop it: float32 and float64 elements, which have no select kernel yet, and a nest deep enough that the values live at once outnumber the ymm registers the kernel has, which is six for an int32 map. Three levels of <code>if</code>/<code>else</code> over distinct expressions is past that.</p>
+<p>This code fires when that conversion did not carry the loop. Two things stop it: float32 and float64 elements, which have no select kernel yet, and a nest deep enough that the values live at once outnumber the ymm registers the kernel has, which is six for an int32 map. Three levels of <code>if</code> and <code>else</code> over distinct expressions is past that.</p>
 <p>Splitting the deepest arm into its own loop is what usually helps.</p>
 
 <h2>Related</h2>

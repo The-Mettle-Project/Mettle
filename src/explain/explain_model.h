@@ -44,7 +44,27 @@ typedef struct {
   char *search;
   int order;
   int repeat;
+  char *function;
 } ExEntry;
+
+typedef struct {
+  int line;
+  char *text;
+  char *ports;
+  char *origin;
+  int cost;
+  int latency;
+  int kernel;
+  int depth;
+  int label;
+  long long offset;
+} ExInsn;
+
+typedef struct {
+  char *name;
+  ExInsn *insns;
+  size_t count;
+} ExMachineFn;
 
 typedef struct {
   const char *name;
@@ -64,10 +84,15 @@ typedef struct {
   char **lines;
   size_t line_count;
   ExTab tabs[EX_TAB_COUNT];
+  ExMachineFn *machine;
+  size_t machine_count;
+  long long machine_total;
 } ExReport;
 
 ExReport *ex_report_build(const ExJson *root, const char *source_path);
 void ex_report_free(ExReport *report);
 const char *ex_report_line(const ExReport *report, int line);
+const ExMachineFn *ex_report_machine(const ExReport *report,
+                                     const char *function);
 
 #endif

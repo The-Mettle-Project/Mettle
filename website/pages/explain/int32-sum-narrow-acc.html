@@ -21,7 +21,7 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain int32-sum-narrow-acc</code></pre>
 
-<p>Same rule as <code>byte-sum-narrow-acc</code>, one width up. The int32 sum kernel (<code>vpaddd</code>) folds eight lanes into an int64 accumulator, because eight int32 values summed can overflow int32 while the scalar loop, adding one at a time, would not have.</p>
+<p>Same rule as <code>byte-sum-narrow-acc</code>, one width up. The int32 sum kernel sign-extends each element to 64 bits with <code>vpmovsxdq</code> and adds in 64-bit lanes with <code>vpaddq</code>, so its total is an int64, and it is written for an int64 accumulator.</p>
 <p>Fix: declare the accumulator int64. The elements stay int32; only the running total widens.</p>
 
 <h2>Related</h2>

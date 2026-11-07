@@ -21,9 +21,9 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain int16-elements</code></pre>
 
-<p>The loop loads or stores int16/uint16. Mettle ships kernels for 8-bit and 32-bit integers and for both float widths, but not for 16-bit.</p>
-<p>Fix: widen the array to int32. The loop then runs eight lanes at a time instead of one, which more than pays for the extra memory in a hot loop. Where the values fit in a byte, int8 is faster still.</p>
-<p>This is a gap in the compiler, not a fact about your code. The report simulates the widening and tells you which kernel you would get.</p>
+<p>The loop loads or stores int16 or uint16. Mettle has kernels for 8-bit and 32-bit integers and for both float widths, and none for 16-bit.</p>
+<p>Fix: widen the array to int32. The loop then runs eight lanes at a time where it ran one, which more than pays for the extra memory in a hot loop. Where the values fit in a byte, int8 is faster still.</p>
+<p>The missing kernel is the compiler&#x27;s gap; the loop is fine. The report simulates the widening and names the kernel you would get.</p>
 
 <h2>Related</h2>
 <ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li></ul>
