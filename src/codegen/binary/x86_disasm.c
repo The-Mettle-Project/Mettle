@@ -69,7 +69,9 @@ static const char *const SHIFTS[8] = {"rol", "ror", "rcl", "rcr",
 static const DxVecOp VEC_OPS[] = {
     {1, 0, 0x10, -1, "movups", "V,W", 0},
     {1, 0, 0x11, -1, "movups", "W,V", 0},
+    {1, 0, 0x13, -1, "movlps", "w,v", 0},
     {1, 0, 0x14, -1, "unpcklps", "V,H,W", 0},
+    {1, 0, 0x17, -1, "movhps", "w,v", 0},
     {1, 0, 0x15, -1, "unpckhps", "V,H,W", 0},
     {1, 0, 0x28, -1, "movaps", "V,W", 0},
     {1, 0, 0x29, -1, "movaps", "W,V", 0},
@@ -245,6 +247,10 @@ static const DxVecOp VEC_OPS[] = {
     {2, 1, 0x28, -1, "pmuldq", "V,H,W", 0},
     {2, 1, 0x29, -1, "pcmpeqq", "V,H,W", 0},
     {2, 1, 0x2B, -1, "packusdw", "V,H,W", 0},
+    {2, 1, 0x2C, 0, "maskmovps", "V,H,W", 1},
+    {2, 1, 0x2D, 0, "maskmovpd", "V,H,W", 1},
+    {2, 1, 0x2E, 0, "maskmovps", "W,H,V", 1},
+    {2, 1, 0x2F, 0, "maskmovpd", "W,H,V", 1},
     {2, 1, 0x30, -1, "pmovzxbw", "V,w", 0},
     {2, 1, 0x31, -1, "pmovzxbd", "V,w", 0},
     {2, 1, 0x32, -1, "pmovzxbq", "V,w", 0},
@@ -638,9 +644,23 @@ static int dx_scalar_move(Dx *d, unsigned char op, X86DisasmInsn *out) {
   return dx_vector_form(d, name, op == 0x10 ? "v,h,w" : "w,h,v", out);
 }
 
+static int dx_half_move(Dx *d, unsigned char op, X86DisasmInsn *out) {
+  if (!dx_modrm(d)) {
+    return 0;
+  }
+  if (d->mod == 3) {
+    return dx_vector_form(d, op == 0x12 ? "movhlps" : "movlhps", "v,h,w",
+                          out);
+  }
+  return dx_vector_form(d, op == 0x12 ? "movlps" : "movhps", "v,h,w", out);
+}
+
 static int dx_vector(Dx *d, unsigned char op, X86DisasmInsn *out) {
   if (d->map == 1 && (op == 0x10 || op == 0x11) && (d->pp == 2 || d->pp == 3)) {
     return dx_scalar_move(d, op, out);
+  }
+  if (d->map == 1 && d->pp == 0 && (op == 0x12 || op == 0x16)) {
+    return dx_half_move(d, op, out);
   }
   if (d->map == 1 && d->pp == 1 && (op == 0x71 || op == 0x72 || op == 0x73)) {
     return dx_vector_shift_group(d, op, out);

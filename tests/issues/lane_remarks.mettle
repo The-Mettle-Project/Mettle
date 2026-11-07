@@ -1,0 +1,32 @@
+fn divide(k: int32*, m: int32*, n: int64) {
+  for i: int64 in 0..n { m[i] = k[i] / 7; }
+}
+
+fn hash(k: int32*, n: int64) -> int32 {
+  var h: int32 = 17;
+  for i: int64 in 0..n { h = h * 31 + k[i]; }
+  return h;
+}
+
+fn last_positive(x: float32*, n: int64) -> float32 {
+  var last: float32 = 0.0;
+  for i: int64 in 0..n { if (x[i] > 0.0) { last = x[i]; } }
+  return last;
+}
+
+fn wide_sum(k: int32*, n: int64) -> int64 {
+  var s: int64 = 0;
+  for i: int64 in 0..n { s = s + (int64)k[i] * (int64)k[i]; }
+  return s;
+}
+
+fn select_only(x: float32*, y: float32*, n: int64) {
+  for i: int64 in 0..n { y[i] = if (x[i] > 0.0) x[i] else 0.0; }
+}
+
+fn reassigned(x: float32*, y: float32*, n: int64) {
+  var t: float32 = 0.0;
+  for i: int64 in 0..n { t = x[2 * i] * 2.0; t = t + 1.0; y[i] = t; }
+}
+
+fn main() -> int32 { return 0; }

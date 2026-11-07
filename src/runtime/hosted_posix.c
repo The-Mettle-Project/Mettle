@@ -81,6 +81,13 @@ void mt_hosted_startup(int argc, char **argv) {
 
 int *mt_hosted_errno_location(void) { return &errno; }
 
+long long mettle_host_syscall6(long long number, long long a1, long long a2,
+                               long long a3, long long a4, long long a5,
+                               long long a6) {
+  long result = syscall(number, a1, a2, a3, a4, a5, a6);
+  return result == -1 ? -(long long)errno : (long long)result;
+}
+
 char **mt_hosted_environ(void) {
 #if defined(__APPLE__)
   return *_NSGetEnviron();

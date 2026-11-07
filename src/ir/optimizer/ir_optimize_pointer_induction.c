@@ -206,9 +206,9 @@ int ir_ptr_induction_iv_start_value(const IRFunction *function,
         ir_instruction_is_safety_scaffolding(ins)) {
       continue;
     }
-    if (ins->op == IR_OP_ASSIGN &&
+    if (ir_instruction_writes_destination(ins) &&
         ir_operand_is_symbol_named(&ins->dest, iv_symbol)) {
-      if (ins->lhs.kind == IR_OPERAND_INT) {
+      if (ins->op == IR_OP_ASSIGN && ins->lhs.kind == IR_OPERAND_INT) {
         *out_start = ins->lhs.int_value;
         return 1;
       }
@@ -922,7 +922,8 @@ int ir_pointer_induction_pass(IRFunction *function, int *changed) {
     int any_changed = 0;
 
     for (size_t i = 0; i < function->instruction_count; i++) {
-      if (function->instructions[i].op != IR_OP_LABEL) {
+      if (function->instructions[i].op != IR_OP_LABEL ||
+          ir_simd_lanes_accepts(function, i)) {
         continue;
       }
 

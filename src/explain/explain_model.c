@@ -492,9 +492,18 @@ static const char *ex_pressure_bound(const ExPressure *p, int *centi) {
 
 static int ex_headline_lanes(const char *headline, int *element_bytes) {
   const char *wide = headline ? strstr(headline, "-wide ") : NULL;
+  const char *bits = headline ? strstr(headline, " lanes of ") : NULL;
   const char *start;
   const char *type;
   int lanes;
+  if (!wide && bits) {
+    start = bits;
+    while (start > headline && start[-1] >= '0' && start[-1] <= '9') {
+      start--;
+    }
+    *element_bytes = atoi(bits + 10) / 8;
+    return atoi(start);
+  }
   if (!wide) {
     return 0;
   }
@@ -547,8 +556,9 @@ static void ex_vector_cost(ExEntry *entry, const ExMachineFn *code,
     return;
   }
   ex_cycles(cycles, sizeof(cycles), centi);
-  if (lanes > 0 && element_bytes > 0 && advance == (long long)lanes *
-                                                       element_bytes) {
+  if (lanes > 0 && element_bytes > 0 &&
+      (advance == (long long)lanes * element_bytes ||
+       advance == (long long)lanes)) {
     char each[24];
     ex_cycles(each, sizeof(each), (centi + lanes / 2) / lanes);
     ex_field_owned(entry, "Vector cost",

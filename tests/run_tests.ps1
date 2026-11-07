@@ -651,7 +651,7 @@ $cases = @(
     Path          = "tests/err_simd_contract_cf.mettle"
     ShouldSucceed = $false
     Args          = @("-O")
-    Pattern       = "@simd! loop was not vectorized: the loop body branches on data"
+    Pattern       = "@simd! loop was not vectorized: ``s`` is a running sum in int64"
   },
   @{
     # A pointer-deref loop with no user control flow must NOT be misreported as
@@ -709,8 +709,7 @@ $cases = @(
       # verified fix suggestions: the compiler SIMULATES the fix on a clone,
       # re-runs the optimizer, and only then claims it works
       'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpsadbw',
-      # int32 sum into an int32 accumulator: diagnosis + proven int64 fix
-      'sum kernel widens each element and adds eight lanes into an int64 total',
+      'sum_ints \(loop @ line 76\): vectorized -> 8 lanes of 32 bits',
       'verified: simulated that fix and re-ran the optimizer: this loop then vectorizes -> vpmovsxdq \+ vpaddq',
       # int16 elements into an int64 accumulator: retyping the elements is the
       # whole fix (the no-op (int32) cast is accepted by the sum recognizer),
@@ -735,9 +734,8 @@ $cases = @(
       # dependence analysis: a non-reassociable loop-carried recurrence (the
       # LCG/hash shape) is diagnosed as a genuine scalar floor, naming the
       # carried operators -- not the generic "no vectorizer recognized" fallback
-      '`h` carries a loop-carried recurrence',
-      'dependency chain that cannot run as independent SIMD lanes',
-      'Products, quotients, shifts and bitwise recurrences cannot'
+      '`h` carries its value from one iteration into the next through `\*`',
+      'the loop is already at its scalar floor'
     )
   },
   @{
@@ -1232,16 +1230,16 @@ $cases = @(
     Name          = "explain_selector"
     Path          = "tests/explain_demo.mettle"
     ShouldSucceed = $true
-    Args          = @("--release", "--explain=sum_ints")
+    Args          = @("--release", "--explain=sum_shorts")
     Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
     OutputMustMatch = @(
       'where to start',
-      'proven sum_ints:76',
-      'sum_ints \(loop @ line 76\): NOT vectorized  \[int32-sum-narrow-acc\]',
+      'proven sum_shorts:86',
+      'sum_shorts \(loop @ line 86\): NOT vectorized  \[int16-elements\]',
       # the loop body itself, quoted under the verdict
-      '77 \|     s = s \+ a\[i\];',
-      'findings hidden by --explain=sum_ints',
-      'mettle explain int32-sum-narrow-acc'
+      '87 \|     s = s \+ \(int32\)a\[i\];',
+      'findings hidden by --explain=sum_shorts',
+      'mettle explain int16-elements'
     )
     OutputMustNotMatch = @(
       'saxpy \(loop',
@@ -1369,7 +1367,7 @@ $cases = @(
       # counter is reset to 0 and the kernel claims it.
       'extent_from_first \(loop @ line 24\): vectorized -> 4-wide float64 vmaxpd',
       'count_above \(loop @ line 36\): NOT vectorized  \[predicated-count\]',
-      'over float elements there is nothing to change here',
+      'with 64-bit elements there is nothing to change here',
       'clamp_all \(loop @ line 46\): NOT vectorized  \[clamp-store\]',
       'green_sum \(loop @ line 60\): NOT vectorized  \[strided-access\]',
       'the loop steps 3 elements at a time',
@@ -10033,8 +10031,8 @@ try {
   # Schema 2: the structured half. Prose is for people; these are what tools key off.
   $coded = @($json.remarks | Where-Object { $_.code })
   if ($coded.Count -lt 5) { throw "JSON remarks missing stable codes: $($coded.Count)" }
-  if (-not @($json.remarks | Where-Object { $_.code -eq 'int32-sum-narrow-acc' }).Count) {
-    throw "JSON missing the int32-sum-narrow-acc diagnosis id"
+  if (-not @($json.remarks | Where-Object { $_.code -eq 'byte-sum-narrow-acc' }).Count) {
+    throw "JSON missing the byte-sum-narrow-acc diagnosis id"
   }
   if (-not @($json.remarks | Where-Object { $_.kind -eq 'loop' -and $_.endLine -gt $_.line }).Count) {
     throw "JSON loop remarks missing their source extent"
@@ -11735,8 +11733,9 @@ foreach ($variant in @("release", "debug", "release_scalar")) {
 }
 
 # Anti-rot guard, in both directions: the three that must be claimed, and the
-# two that must not. Rewriting `if (a[i] & 6)` as a multiply would add 2, 4 or 6
-# where the branch added 1, and the arithmetic would still look plausible.
+# two the rewrite must not claim. Rewriting `if (a[i] & 6)` as a multiply would
+# add 2, 4 or 6 where the branch added 1, and the arithmetic would still look
+# plausible.
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
@@ -11753,7 +11752,7 @@ try {
     }
   }
   foreach ($fn in @("two_sided", "nonbool_guard")) {
-    if ($coverOut -match "$fn \(loop @ line \d+\): vectorized") {
+    if ($coverOut -match "$fn \(loop @ line \d+\): vectorized -> (?!8 lanes of 32 bits)") {
       throw "$fn vectorized; the accumulate rewrite is claiming a shape it cannot reproduce"
     }
   }
@@ -12717,13 +12716,9 @@ $fixAdvicePairs = @(
   @{ Name = "i64";       Id = "int64-elements" },
   @{ Name = "dot";       Id = "dot-shape-address" },
   @{ Name = "extremum";  Id = "extremum-shape" },
-  @{ Name = "count";     Id = "predicated-count" },
-  @{ Name = "shift";     Id = "unbounded-shift" },
   @{ Name = "fill";      Id = "store-only-fill" },
   @{ Name = "search";    Id = "early-exit" },
   @{ Name = "noinline";  Id = "call-in-body" },
-  @{ Name = "explainshift";  Id = "unbounded-shift" },
-  @{ Name = "explainvshift"; Id = "variable-shift" },
   @{ Name = "reloadbase";    Id = "reloaded-base" }
 )
 
@@ -13093,7 +13088,7 @@ try {
   $demo = "tests/explain_demo.mettle"
   Assert-Screen (Invoke-ExplainScreen $demo "" "140x80") @(
       "1 Overview 11", "2 Optimizer 25", "5 Functions", "7 Passes",
-      "Loops      4 vectorized, 11 scalar, 4 fixes proven",
+      "Loops      6 vectorized, 9 scalar, 4 fixes proven",
       "Start here", "matvec:38", "Enter opens this in Optimizer",
       "matvec, loop at line 38", "dot-shape-address") "overview"
   Assert-Screen (Invoke-ExplainScreen $demo "2 j j j" "140x80") @(
@@ -13116,7 +13111,7 @@ try {
   Assert-Screen (Invoke-ExplainScreen "tests/test_ownership_strings.mettle" "4" "140x24" @("--safe")) @(
       "accesses", "asks the runtime for the allocation, 2 accesses") "memory under --safe"
   $raii = "examples/raii_demo/raii_demo.mettle"
-  Assert-Screen (Invoke-ExplainScreen $raii "") @("Loops      1 vectorized", "Ownership  31 inserted") "raii overview"
+  Assert-Screen (Invoke-ExplainScreen $raii "") @("Loops      2 vectorized", "Ownership  31 inserted") "raii overview"
   $ownership = Invoke-ExplainScreen $raii "3" "200x200"
   Assert-Screen $ownership @("moves at 84, 86, else freed at 88", "old value freed at 134, freed at 137 if it holds one",
       "never stored, freed at 183", "old value freed at 189, freed at 197", "Drop glue",
@@ -13146,9 +13141,14 @@ try {
   Assert-Screen (Invoke-ExplainScreen $demo "2 / text:saxpy enter" "150x46") @(
       "Machine code  saxpy", "the machine loop, 9 instructions:", "vmulps ymm0, ymm0, ymm4",
       "vfmadd231ps ymm0, ymm5, ymm1", "Vector body  9 instructions per pass, 5 of them vector") "vector machine loop"
-  Assert-Screen (Invoke-ExplainScreen $demo "2 / text:sum_ints enter" "150x46") @(
-      "Machine loop  0.50 cycles per iteration, bound by port 6", "the machine loop, 4 instructions:",
-      "movsxd rdx, dword ptr [r9+rax*4]") "scalar machine loop"
+  Assert-Screen (Invoke-ExplainScreen $demo "2 / text:apply_bias enter" "150x46") @(
+      "Machine loop  0.50 cycles per iteration, bound by port 6", "the machine loop, 5 instructions:",
+      "movsxd rdx, dword ptr [rax]") "scalar machine loop"
+  $lanes = Invoke-ExplainScreen $demo "2 / text:sum_ints enter" "150x46"
+  Assert-Screen $lanes @(
+      "Vector body  4 instructions per pass, 1 of them vector: vpaddd", "a pass covers 8 elements",
+      "vpaddd ymm13, ymm13, [rcx+r12*4]") "lane kernel machine loop"
+  if ($lanes -match "Machine loop  ") { throw "a lane kernel's loop is priced as its scalar tail:`n$lanes" }
   Assert-Screen (Invoke-ExplainScreen $demo "2 / text:saxpy enter d" "150x46") @(
       "for i in 0..n {", "vfmadd231ps", "d back to the detail") "machine code view"
   Assert-Screen (Invoke-ExplainScreen $demo "" "150x40") @("Hottest loops", "% ") "hottest loops"
@@ -22237,7 +22237,15 @@ $issueRegressions = @(
   @{ Name = "float32_math_in_the_interpreter"; Command = @("test", "tests/issues/float32_math_and_sqrt.mettle"); Expect = @("1 passed") },
   @{ Name = "selective_import_then_time"; Entry = "tests/issues/selective_import_then_time.mettle"; Args = @(); Expect = @("clock ok") },
   @{ Name = "unknown_signature_type_is_named"; Command = @("tests/issues/err_unknown_signature_type.mettle", "-o", ".tmp/issue_err.obj"); Refuse = @("Unknown error"); Expect = @("Undefined type 'Missing<int64>'") },
-  @{ Name = "interp_array_values_copy"; Command = @("test", "tests/issues/interp_array_values_copy.mettle"); Expect = @("1 passed") }
+  @{ Name = "interp_array_values_copy"; Command = @("test", "tests/issues/interp_array_values_copy.mettle"); Expect = @("1 passed") },
+  @{ Name = "interp_realloc_and_large"; Command = @("test", "tests/issues/interp_realloc_and_large.mettle"); Refuse = @("LEAKED", "failed", "skipped"); Expect = @("3 passed") },
+  @{ Name = "interp_threads"; Command = @("test", "tests/issues/interp_threads.mettle"); Refuse = @("LEAKED", "failed", "skipped"); Expect = @("4 passed") },
+  @{ Name = "interp_files"; Command = @("test", "tests/issues/interp_files.mettle"); Refuse = @("LEAKED", "failed", "skipped"); Expect = @("4 passed") },
+  @{ Name = "lane_vectorizer"; Entry = "tests/issues/lane_vectorizer.mettle"; Args = @(); Expect = @("bad 0") },
+  @{ Name = "lane_vectorizer_O"; Entry = "tests/issues/lane_vectorizer.mettle"; Args = @("-O"); Expect = @("bad 0") },
+  @{ Name = "lane_vectorizer_release"; Entry = "tests/issues/lane_vectorizer.mettle"; Args = @("--release"); Expect = @("bad 0") },
+  @{ Name = "lane_vectorizer_verify"; Command = @("--verify", "--release", "--build", "tests/issues/lane_vectorizer.mettle", "-o", ".tmp/issue_lanes_v.exe"); Refuse = @("MISCOMPILE"); Expect = @("Built executable") },
+  @{ Name = "lane_remarks"; Command = @("--release", "--explain", "tests/issues/lane_remarks.mettle", "-o", ".tmp/issue_lanes_r.obj"); Refuse = @("store under", "dot-shape-address", "serial-recurrence"); Expect = @("divides integers", "through ``*``", "condition held", "sum in int64", "select_only (loop @ line 24): vectorized", "[strided-access]") }
 )
 foreach ($case in $issueRegressions) {
   $total++

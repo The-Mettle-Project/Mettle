@@ -488,6 +488,27 @@ int ir_simd_sum_float_pass(IRFunction *function, int *changed) {
   return 1;
 }
 
+static int ir_decode_dot_operand(IRFunction *function, size_t before,
+                                 const char *temp, const char *iv,
+                                 const char **base, int *bits, int *widened) {
+  *widened = 0;
+  if (ir_decode_float_indexed_load(function, before, temp, iv, base, bits)) {
+    return 1;
+  }
+  const IRInstruction *cast = ir_find_temp_producer_before(function, before, temp);
+  if (!cast || cast->op != IR_OP_CAST || !cast->text ||
+      strcmp(cast->text, "float64") != 0 ||
+      cast->lhs.kind != IR_OPERAND_TEMP || !cast->lhs.name ||
+      !ir_decode_float_indexed_load(function, before, cast->lhs.name, iv, base,
+                                    bits) ||
+      *bits != 32) {
+    return 0;
+  }
+  *bits = 64;
+  *widened = 1;
+  return 1;
+}
+
 static int ir_try_vectorize_dot_float_at(IRFunction *function,
                                          size_t header_index, int *changed) {
   const char *iv_symbol = NULL;
@@ -501,6 +522,7 @@ static int ir_try_vectorize_dot_float_at(IRFunction *function,
   IRInstruction fused = {0};
   int matched = 0;
   int width_bits = 0;
+  int widen = 0;
   int found = 0;
 
   if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
@@ -521,6 +543,8 @@ static int ir_try_vectorize_dot_float_at(IRFunction *function,
     const IRInstruction *mul = NULL;
     int bits_a = 0;
     int bits_b = 0;
+    int widen_a = 0;
+    int widen_b = 0;
     const char *base_a = NULL;
     const char *base_b = NULL;
     if (!(ins->op == IR_OP_BINARY && ins->is_float && ins->text &&
@@ -536,17 +560,18 @@ static int ir_try_vectorize_dot_float_at(IRFunction *function,
         !mul->lhs.name || mul->rhs.kind != IR_OPERAND_TEMP || !mul->rhs.name) {
       continue;
     }
-    if (!ir_decode_float_indexed_load(function, i, mul->lhs.name, iv_symbol,
-                                      &base_a, &bits_a) ||
-        !ir_decode_float_indexed_load(function, i, mul->rhs.name, iv_symbol,
-                                      &base_b, &bits_b) ||
-        bits_a != bits_b) {
+    if (!ir_decode_dot_operand(function, i, mul->lhs.name, iv_symbol, &base_a,
+                               &bits_a, &widen_a) ||
+        !ir_decode_dot_operand(function, i, mul->rhs.name, iv_symbol, &base_b,
+                               &bits_b, &widen_b) ||
+        bits_a != bits_b || widen_a != widen_b) {
       continue;
     }
     sum_symbol = ins->dest.name;
     a_symbol = base_a;
     b_symbol = base_b;
     width_bits = bits_a;
+    widen = widen_a;
     found = 1;
   }
 
@@ -571,14 +596,15 @@ static int ir_try_vectorize_dot_float_at(IRFunction *function,
   fused.dest = ir_operand_symbol(sum_symbol);
   fused.lhs = ir_operand_symbol(a_symbol);
   fused.rhs = ir_operand_symbol(b_symbol);
-  fused.arguments = calloc(1, sizeof(IROperand));
+  fused.arguments = calloc(2, sizeof(IROperand));
   if (!fused.arguments) {
     ir_operand_destroy(&bound);
     ir_instruction_destroy_storage(&fused);
     return 0;
   }
-  fused.argument_count = 1;
+  fused.argument_count = widen ? 2 : 1;
   fused.arguments[0] = bound;
+  fused.arguments[1] = ir_operand_int(widen);
   ir_install_fused_reduction(function, header_index, jump_index, &fused,
                              changed);
   return 1;

@@ -33,7 +33,8 @@ static int ir_instruction_is_simd_marker(const IRInstruction *instruction) {
 }
 
 static int ir_op_is_vectorized(IROpcode op) {
-  return op >= IR_OP_COUNT_WORD_STARTS && op <= IR_OP_SIMD_OUTER_LANE_F64;
+  return (op >= IR_OP_COUNT_WORD_STARTS && op <= IR_OP_SIMD_OUTER_LANE_F64) ||
+         op == IR_OP_SIMD_LANES;
 }
 
 static const IRInstruction *ir_region_vectorized_ins(const IRFunction *function,
@@ -85,8 +86,9 @@ static const IRInstruction *ir_region_skipahead_ins(const IRFunction *function,
   }
   for (size_t i = begin + 1; i-- > 0;) {
     const IRInstruction *ins = &function->instructions[i];
-    if (ins->op == IR_OP_SIMD_FIND && ins->dest.kind == IR_OPERAND_SYMBOL &&
-        ins->dest.name && strcmp(ins->dest.name, iv) == 0) {
+    if ((ins->op == IR_OP_SIMD_FIND || ins->op == IR_OP_SIMD_LANES) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, iv) == 0) {
       return ins;
     }
     if (ins->op == IR_OP_LABEL ||
@@ -498,8 +500,13 @@ static const char *ir_region_find_serial_recurrence(const IRFunction *function,
 
 static int ir_region_has_runtime_check(const IRFunction *function, size_t begin,
                                        size_t end) {
+  int in_loop = 0;
   for (size_t i = begin + 1; i < end && i < function->instruction_count; i++) {
     const IRInstruction *ins = &function->instructions[i];
+    in_loop |= ins->op == IR_OP_LABEL && ir_label_is_while_header(ins->text);
+    if (!in_loop) {
+      continue;
+    }
     if ((ins->op == IR_OP_CALL || ins->op == IR_OP_CALL_INDIRECT) &&
         ins->text && strstr(ins->text, "crash_trap") != NULL) {
       return 1;
@@ -508,6 +515,17 @@ static int ir_region_has_runtime_check(const IRFunction *function, size_t begin,
          ins->op == IR_OP_JUMP || ins->op == IR_OP_LABEL) &&
         ir_label_is_runtime_check(ins->text)) {
       return 1;
+    }
+  }
+  return 0;
+}
+
+static size_t ir_region_header_line(const IRFunction *function, size_t begin,
+                                    size_t end) {
+  for (size_t i = begin; i < end; i++) {
+    const IRInstruction *ins = &function->instructions[i];
+    if (ins->op == IR_OP_LABEL && ir_label_is_while_header(ins->text)) {
+      return ins->location.line;
     }
   }
   return 0;
@@ -593,9 +611,20 @@ static const char *ir_simd_bail_reason(const IRFunction *function, size_t begin,
     IR_SIMD_BAIL("the loop body contains a nested loop (possibly from an "
                  "inlined call); only the innermost loop of a nest vectorizes");
   }
+  {
+    static char verdict[320];
+    char fix[240];
+    int why = ir_simd_lanes_verdict(function->name,
+                                    ir_region_header_line(function, begin, end),
+                                    verdict, sizeof(verdict), fix, sizeof(fix));
+    if (why != LANE_WHY_NONE && why != LANE_WHY_WIDTH) {
+      IR_SIMD_BAIL(verdict);
+    }
+  }
   if (branch_count > 1 || jump_count > 1) {
-    IR_SIMD_BAIL("the loop body branches on data, with an `if`, `&&` or `||` "
-                 "each iteration; only straight-line loop bodies vectorize");
+    IR_SIMD_BAIL("the loop body branches on data; the lane vectorizer runs "
+                 "branches as masks only when the counter steps by one up to "
+                 "a bound and every element is a 32-bit `base[i]`");
   }
   if (has_i16) {
     return "the loop accesses 16-bit integers, which no vectorizer takes; "
@@ -653,6 +682,9 @@ const char *ir_simd_bail_id_name(int id) {
   case IR_SIMD_BAIL_SCATTER_STORE:       return "scatter-store";
   case IR_SIMD_BAIL_CHOSEN_INDEX:        return "chosen-index";
   case IR_SIMD_BAIL_INVARIANT_ADDEND:    return "invariant-addend";
+  case IR_SIMD_BAIL_LANE_OPERATION:      return "lane-operation";
+  case IR_SIMD_BAIL_CARRIED_VALUE:       return "carried-value";
+  case IR_SIMD_BAIL_LANE_BUDGET:         return "lane-budget";
   case IR_SIMD_BAIL_UNRECOGNIZED_SHAPE:  return "unrecognized-shape";
   }
   return "unknown";
@@ -691,6 +723,22 @@ static void ir_recur_note_op(const char **ops, size_t *n_ops, const char *t) {
   }
 }
 
+static int ir_recur_set_this_iteration(const IRFunction *function,
+                                       size_t at, const char *sym) {
+  for (size_t k = at; k-- > 0;) {
+    const IRInstruction *ins = &function->instructions[k];
+    if (ins->op == IR_OP_LABEL) {
+      return 0;
+    }
+    if (ir_instruction_writes_destination(ins) &&
+        ins->dest.kind == IR_OPERAND_SYMBOL && ins->dest.name &&
+        strcmp(ins->dest.name, sym) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int ir_recur_operand_reaches(const IRFunction *function, size_t before,
                                     const IROperand *op, const char *sym,
                                     int *nonreassoc, const char **ops,
@@ -699,7 +747,7 @@ static int ir_recur_operand_reaches(const IRFunction *function, size_t before,
     return 0;
   }
   if (op->kind == IR_OPERAND_SYMBOL && op->name && strcmp(op->name, sym) == 0) {
-    return 1;
+    return !ir_recur_set_this_iteration(function, before, sym);
   }
   if (op->kind != IR_OPERAND_TEMP || !op->name) {
     return 0;
@@ -1159,6 +1207,39 @@ static int ir_simd_bail_inline_asm(IrSimdBail *d) {
   return 0;
 }
 
+static int ir_simd_bail_invariant_addend(IrSimdBail *d);
+
+static int ir_simd_bail_lane_verdict(IrSimdBail *d) {
+  size_t line = ir_region_header_line(d->function, d->begin, d->end);
+  char reason[320];
+  int why = ir_simd_lanes_verdict(d->function->name, line, reason,
+                                  sizeof(reason), d->fix, d->fix_cap);
+  if (why == LANE_WHY_CARRIED && ir_simd_bail_invariant_addend(d)) {
+    return 1;
+  }
+  if (why == LANE_WHY_WIDTH || why == LANE_WHY_NONE) {
+    d->fix[0] = '\0';
+    return 0;
+  }
+  snprintf(d->reason, d->reason_cap, "%s", reason);
+  switch (why) {
+  case LANE_WHY_SHAPE:
+    ir_simd_diag(d, IR_SIMD_BAIL_CONTROL_FLOW);
+    return 1;
+  case LANE_WHY_OP:
+    ir_simd_diag(d, IR_SIMD_BAIL_LANE_OPERATION);
+    return 1;
+  case LANE_WHY_CARRIED:
+    ir_simd_diag(d, IR_SIMD_BAIL_CARRIED_VALUE);
+    return 1;
+  case LANE_WHY_BUDGET:
+    ir_simd_diag(d, IR_SIMD_BAIL_LANE_BUDGET);
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 static size_t ir_simd_arm_of(const IrSimdBail *d, size_t def_at);
 
 static void ir_simd_source_name(const char *name, char *out, size_t cap) {
@@ -1206,6 +1287,30 @@ static int ir_simd_bail_two_extrema(IrSimdBail *d) {
            names[0], names[1], names[0], names[0]);
   ir_simd_diag(d, IR_SIMD_BAIL_EXTREMUM_SHAPE);
   return 1;
+}
+
+static void ir_simd_branch_obstacle(IrSimdBail *d, const char *lead,
+                                    const char *form) {
+  char width[320];
+  char unused[240];
+  int narrow =
+      ir_simd_lanes_verdict(d->function->name,
+                            ir_region_header_line(d->function, d->begin, d->end),
+                            width, sizeof(width), unused,
+                            sizeof(unused)) == LANE_WHY_WIDTH;
+  snprintf(d->reason, d->reason_cap,
+           "%s. The lane vectorizer runs that as %s over 32-bit elements when "
+           "the counter steps by one up to a bound and every element is read "
+           "as `base[i]`; %s",
+           lead, form,
+           narrow ? width : "this loop's counter or addresses fall outside that");
+  snprintf(d->fix, d->fix_cap,
+           narrow ? "store the elements as float32, int32 or uint32 when "
+                    "their range fits; with 64-bit elements there is nothing "
+                    "to change here"
+                  : "count with `for i in 0..n` and index each array by `i` "
+                    "alone, lifting any invariant offset into a pointer before "
+                    "the loop");
 }
 
 static int ir_simd_bail_control_flow(IrSimdBail *d) {
@@ -1275,63 +1380,24 @@ static int ir_simd_bail_control_flow(IrSimdBail *d) {
         return 1;
       }
       if (shape == IR_BRANCH_SHAPE_COUNT) {
-        snprintf(d->reason, d->reason_cap,
-                 "the body accumulates into `%s` under a condition. Over int32 "
-                 "elements that is made unconditional and vectorized, so this "
-                 "one is out for one of three reasons: the elements are float "
-                 "(no kernel, and the branchless form has none either), the "
-                 "guard is not a comparison (`if (x & 6)` fires on 2, 4 and 6 "
-                 "alike, and the addend would be multiplied by those), or an "
-                 "else arm writes `%s` too, which is a select rather than an "
-                 "accumulate",
-                 written ? written : "the accumulator",
+        char lead[160];
+        snprintf(lead, sizeof(lead), "the body adds into `%s` under a condition",
                  written ? written : "the accumulator");
-        snprintf(d->fix, d->fix_cap,
-                 "over int32 elements, add the comparison rather than "
-                 "branching on it: `%s = %s + ((a[i] & 6) != 0);` vectorizes, "
-                 "and so does any other comparison written that way. Over "
-                 "float elements there is nothing to change here",
-                 written ? written : "count", written ? written : "count");
+        ir_simd_branch_obstacle(d, lead, "a masked add");
         ir_simd_diag(d, IR_SIMD_BAIL_PREDICATED_COUNT);
         return 1;
       }
       if (shape == IR_BRANCH_SHAPE_CLAMP_STORE) {
-        snprintf(d->reason, d->reason_cap,
-                 "the body chooses `%s` under a condition before storing it. "
-                 "That shape does vectorize over int32 elements, as vpminsd, "
-                 "vpmaxsd or a lane select, so what stopped this one is either "
-                 "the element type (no float select kernel yet) or a nest too "
-                 "deep for the six ymm registers an int32 map has",
+        char lead[160];
+        snprintf(lead, sizeof(lead),
+                 "the body chooses `%s` under a condition before storing it",
                  written ? written : "a local");
-        snprintf(d->fix, d->fix_cap,
-                 "if the elements are int32, split the deepest arm into its own "
-                 "loop so fewer values are live at once; otherwise the "
-                 "compiler has no kernel for this loop yet");
-        ir_simd_advisory(d);
+        ir_simd_branch_obstacle(d, lead, "a select");
         ir_simd_diag(d, IR_SIMD_BAIL_CLAMP_STORE);
         return 1;
       }
     }
-    if (d->store_count > 0) {
-      snprintf(d->reason, d->reason_cap,
-               "the body branches on data and writes memory under the branch "
-               "(%d store%s). An `if` that only chooses a value becomes a "
-               "lane select, but a store some lanes skip needs a masked store, "
-               "and the compiler emits none",
-               d->store_count, d->store_count == 1 ? "" : "s");
-      snprintf(d->fix, d->fix_cap,
-               "compute the value with a select and store it every iteration "
-               "(`a[i] = c ? x : a[i]`), or move the guarded work into a "
-               "loop of its own");
-    } else {
-      snprintf(d->reason, d->reason_cap,
-               "the body branches on data, and its arms set more values than "
-               "one lane select carries: %d branches lead to %zu join points",
-               d->branch_count, d->branch_target_count);
-      snprintf(d->fix, d->fix_cap,
-               "reduce each arm to one value chosen by one comparison, or "
-               "split the work into two simpler loops");
-    }
+    ir_simd_branch_obstacle(d, "the body branches on data", "lane masks");
     ir_simd_diag(d, IR_SIMD_BAIL_CONTROL_FLOW);
     return 1;
   }
@@ -1520,8 +1586,58 @@ static int ir_simd_bail_body_local(IrSimdBail *d) {
   return 0;
 }
 
+static const char *ir_simd_loop_counter(const IrSimdBail *d) {
+  for (size_t i = d->begin; i + 1 < d->end; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    if (ins->op == IR_OP_LABEL && ir_label_is_while_header(ins->text)) {
+      const IRInstruction *cmp = &d->function->instructions[i + 1];
+      return cmp->op == IR_OP_BINARY && cmp->lhs.kind == IR_OPERAND_SYMBOL
+                 ? cmp->lhs.name
+                 : NULL;
+    }
+  }
+  return NULL;
+}
+
+static int ir_simd_address_is_plain(const IrSimdBail *d, size_t at,
+                                    const IROperand *addr, const char *iv) {
+  const IRInstruction *add =
+      addr->kind == IR_OPERAND_TEMP && addr->name
+          ? ir_find_temp_producer_before(d->function, at, addr->name)
+          : NULL;
+  if (!add || add->op != IR_OP_BINARY || !add->text ||
+      strcmp(add->text, "+") != 0) {
+    return 0;
+  }
+  const IROperand *index =
+      add->lhs.kind == IR_OPERAND_SYMBOL ? &add->rhs : &add->lhs;
+  const IRInstruction *scale =
+      index->kind == IR_OPERAND_TEMP && index->name
+          ? ir_find_temp_producer_before(d->function, at, index->name)
+          : NULL;
+  return scale && scale->op == IR_OP_BINARY && scale->text &&
+         (strcmp(scale->text, "<<") == 0 || strcmp(scale->text, "*") == 0) &&
+         ir_operand_is_symbol_named(&scale->lhs, iv) &&
+         scale->rhs.kind == IR_OPERAND_INT;
+}
+
+static int ir_simd_some_address_strays(const IrSimdBail *d) {
+  const char *iv = ir_simd_loop_counter(d);
+  if (!iv) {
+    return 1;
+  }
+  for (size_t i = d->begin; i < d->end; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    if (ins->op == IR_OP_LOAD && !ir_simd_address_is_plain(d, i, &ins->lhs, iv)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int ir_simd_bail_dot_shape_address(IrSimdBail *d) {
-  if (d->has_float_mul && d->has_float_accum && d->load_count >= 2) {
+  if (d->has_float_mul && d->has_float_accum && d->load_count >= 2 &&
+      ir_simd_some_address_strays(d)) {
     snprintf(d->reason, d->reason_cap,
              "this is a float multiply and accumulate, a dot product, but no "
              "kernel matched its addresses: each base must be a plain "
@@ -1637,23 +1753,23 @@ static int ir_simd_bail_counter_store(IrSimdBail *d) {
   if (varying == 0) {
     return 0;
   }
-  if (d->store_count == 1) {
-    snprintf(d->reason, d->reason_cap,
-             "each iteration stores a value computed from the loop counter, "
-             "a ramp such as `a[i] = i`. The fill kernel stores one fixed "
-             "value, and no kernel builds a ramp");
-  } else {
-    snprintf(d->reason, d->reason_cap,
-             "%d of the body's %d stores write a value computed from the loop "
-             "counter, a ramp such as `a[i] = i`. The fill kernel stores one "
-             "fixed value, and no kernel builds a ramp",
-             varying, d->store_count);
-  }
+  char width[320];
+  char unused[240];
+  int narrow = ir_simd_lanes_verdict(
+                   d->function->name,
+                   ir_region_header_line(d->function, d->begin, d->end), width,
+                   sizeof(width), unused, sizeof(unused)) == LANE_WHY_WIDTH;
+  snprintf(d->reason, d->reason_cap,
+           "%d of the body's %d stores write a ramp computed from the loop "
+           "counter, such as `a[i] = i`. The lane vectorizer builds ramps "
+           "over 32-bit elements%s%s",
+           varying, d->store_count, narrow ? ", but " : " when the counter "
+           "steps by one up to a bound",
+           narrow ? width : "");
   snprintf(d->fix, d->fix_cap,
-           "nothing to change in the loop: the compiler has no ramp kernel. "
-           "A loop that stores one fixed value, such as `a[i] = 0`, becomes "
-           "a fill");
-  ir_simd_advisory(d);
+           narrow ? "store 32-bit elements, or move the narrower stores into "
+                    "a loop of their own"
+                  : "count with `for i in 0..n` and store to `a[i]`");
   ir_simd_diag(d, IR_SIMD_BAIL_COUNTER_STORE);
   return 1;
 }
@@ -1712,28 +1828,70 @@ static const IRInstruction *ir_simd_split_sum(const IrSimdBail *d,
   return NULL;
 }
 
+static int ir_simd_symbol_written_in_region(const IRFunction *function,
+                                            size_t begin, size_t end,
+                                            const char *sym);
+
+static int ir_simd_value_is_invariant(const IrSimdBail *d, size_t before,
+                                      const IROperand *value, int depth) {
+  if (value->kind == IR_OPERAND_NONE || value->kind == IR_OPERAND_INT ||
+      value->kind == IR_OPERAND_FLOAT) {
+    return 1;
+  }
+  if (!value->name || depth > 6) {
+    return 0;
+  }
+  if (value->kind == IR_OPERAND_SYMBOL) {
+    return !ir_simd_symbol_written_in_region(d->function, d->begin, d->end,
+                                             value->name);
+  }
+  if (value->kind != IR_OPERAND_TEMP) {
+    return 0;
+  }
+  for (size_t i = before; i-- > 0;) {
+    const IRInstruction *def = &d->function->instructions[i];
+    if (def->dest.kind != IR_OPERAND_TEMP || !def->dest.name ||
+        strcmp(def->dest.name, value->name) != 0) {
+      continue;
+    }
+    return (def->op == IR_OP_BINARY || def->op == IR_OP_CAST ||
+            def->op == IR_OP_ASSIGN) &&
+           ir_simd_value_is_invariant(d, i, &def->lhs, depth + 1) &&
+           ir_simd_value_is_invariant(d, i, &def->rhs, depth + 1);
+  }
+  return 0;
+}
+
+static int ir_simd_addend_is_invariant(const IrSimdBail *d,
+                                       const IRInstruction *sum,
+                                       const IROperand *extra) {
+  return ir_simd_value_is_invariant(
+      d, (size_t)(sum - d->function->instructions), extra, 0);
+}
+
 static int ir_simd_bail_invariant_addend(IrSimdBail *d) {
   const IROperand *extra = NULL;
   const IRInstruction *sum = ir_simd_split_sum(d, &extra);
   const char *acc_type;
   char acc[64];
-  if (!sum || !d->has_i32_load || ir_simd_chain_loads(d, extra, 0)) {
+  if (!sum || !d->has_i32_load || ir_simd_chain_loads(d, extra, 0) ||
+      !ir_simd_addend_is_invariant(d, sum, extra)) {
     return 0;
   }
   ir_simd_source_name(sum->dest.name, acc, sizeof(acc));
   acc_type = ir_function_local_declared_type(d->function, sum->dest.name);
+  int wide = acc_type && strcmp(acc_type, "int64") == 0;
   snprintf(d->reason, d->reason_cap,
            "each iteration adds an element to `%s` and also a term that is "
-           "the same on every iteration. The sum kernel adds one element per "
-           "lane and nothing else, so the extra term keeps it out",
-           acc);
+           "the same on every iteration. The widening sum kernel adds one "
+           "element per lane and nothing else%s, so the extra term keeps it "
+           "out",
+           acc,
+           wide ? ", and 32-bit lanes cannot hold the int64 total" : "");
   snprintf(d->fix, d->fix_cap,
            "sum the elements alone, `%s = %s + a[i]`, and add the term once "
            "after the loop as `n * term`%s",
-           acc, acc,
-           acc_type && strcmp(acc_type, "int64") == 0
-               ? ""
-               : ", with the accumulator declared int64");
+           acc, acc, wide ? "" : ", with the accumulator declared int64");
   ir_simd_diag(d, IR_SIMD_BAIL_INVARIANT_ADDEND);
   return 1;
 }
@@ -1953,6 +2111,7 @@ static const IrSimdBailRule IR_SIMD_BAIL_RULES[] = {
     ir_simd_bail_indirect_call,
     ir_simd_bail_allocation,
     ir_simd_bail_inline_asm,
+    ir_simd_bail_lane_verdict,
     ir_simd_bail_scatter_store,
     ir_simd_bail_chosen_index,
     ir_simd_bail_control_flow,
@@ -3032,8 +3191,10 @@ int ir_verify_simd_contracts(IRFunction *function) {
     }
 
     int vec_op = ir_region_vectorized_op(function, begin_index, i);
-    if (vec_op < 0 && ir_region_skipahead_ins(function, begin_index, i)) {
-      vec_op = (int)IR_OP_SIMD_FIND;
+    if (vec_op < 0) {
+      const IRInstruction *ahead =
+          ir_region_skipahead_ins(function, begin_index, i);
+      vec_op = ahead ? (int)ahead->op : -1;
     }
     if (vec_op >= 0) {
       if (g_simd_report) {

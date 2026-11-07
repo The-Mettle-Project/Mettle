@@ -755,6 +755,9 @@ typedef enum {
   IR_SIMD_BAIL_SCATTER_STORE,
   IR_SIMD_BAIL_CHOSEN_INDEX,
   IR_SIMD_BAIL_INVARIANT_ADDEND,
+  IR_SIMD_BAIL_LANE_OPERATION,
+  IR_SIMD_BAIL_CARRIED_VALUE,
+  IR_SIMD_BAIL_LANE_BUDGET,
   IR_SIMD_BAIL_UNRECOGNIZED_SHAPE
 } IRSimdBailId;
 const char *ir_simd_bail_id_name(int id);
@@ -837,6 +840,19 @@ int ir_simd_dot_i32_pass(IRFunction *function, int *changed);
 int ir_simd_dot_i8_pass(IRFunction *function, int *changed);
 int ir_simd_slp_mac_i32_pass(IRFunction *function, int *changed);
 int ir_simd_slp_mac_i8_pass(IRFunction *function, int *changed);
+int ir_instruction_is_hoisted_null_check(const IRInstruction *insn);
+int ir_simd_lanes_pass(IRFunction *function, int *changed);
+int ir_simd_lanes_accepts(IRFunction *function, size_t header);
+enum {
+  LANE_WHY_NONE,
+  LANE_WHY_OP,
+  LANE_WHY_CARRIED,
+  LANE_WHY_BUDGET,
+  LANE_WHY_SHAPE,
+  LANE_WHY_WIDTH
+};
+int ir_simd_lanes_verdict(const char *fn, size_t line, char *reason,
+                          size_t reason_cap, char *fix, size_t fix_cap);
 int ir_simd_insertion_sort_i32_pass(IRFunction *function, int *changed);
 int ir_simd_memory_map_pass(IRFunction *function, int *changed);
 int ir_simd_minmax_i32_pass(IRFunction *function, int *changed);

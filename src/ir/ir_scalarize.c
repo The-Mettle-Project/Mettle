@@ -1,5 +1,6 @@
 #include "ir_scalarize.h"
 
+#include "ir_lanes.h"
 #include "optimizer/ir_optimize_internal.h"
 
 #include <stdio.h>
@@ -238,18 +239,30 @@ static void sc_float_sum(Sc *sc, const IRInstruction *insn) {
   sc_loop_end(sc, &loop, 1);
 }
 
+static IROperand sc_dot_operand(Sc *sc, const IROperand *base,
+                                const IROperand *index, int widen, int bits) {
+  long long size = widen ? 4 : bits / 8;
+  IROperand at = sc_address(sc, base, index, size);
+  IROperand value = sc_load(sc, &at, size, widen ? 32 : bits, 0);
+  ir_operand_destroy(&at);
+  if (!widen) {
+    return value;
+  }
+  IROperand wide = sc_cast(sc, "float64", &value);
+  ir_operand_destroy(&value);
+  return wide;
+}
+
 static void sc_float_dot(Sc *sc, const IRInstruction *insn) {
   int bits = insn->op == IR_OP_SIMD_DOT_F32 ? 32 : 64;
-  long long size = bits / 8;
+  int widen = insn->argument_count > 1 &&
+              insn->arguments[1].kind == IR_OPERAND_INT &&
+              insn->arguments[1].int_value == 1;
   ScLoop loop = sc_loop(sc, &insn->arguments[0]);
-  IROperand a_at = sc_address(sc, &insn->lhs, &loop.index, size);
-  IROperand b_at = sc_address(sc, &insn->rhs, &loop.index, size);
-  IROperand a = sc_load(sc, &a_at, size, bits, 0);
-  IROperand b = sc_load(sc, &b_at, size, bits, 0);
+  IROperand a = sc_dot_operand(sc, &insn->lhs, &loop.index, widen, bits);
+  IROperand b = sc_dot_operand(sc, &insn->rhs, &loop.index, widen, bits);
   IROperand product = sc_op(sc, "*", &a, &b, bits);
   sc_binary(sc, &insn->dest, "+", &insn->dest, &product, bits, 0);
-  ir_operand_destroy(&a_at);
-  ir_operand_destroy(&b_at);
   ir_operand_destroy(&a);
   ir_operand_destroy(&b);
   ir_operand_destroy(&product);
@@ -628,6 +641,20 @@ static void sc_lcg(Sc *sc, const IRInstruction *insn) {
   ir_operand_destroy(&wrapped);
   ir_operand_destroy(&masked);
   sc_loop_end(sc, &loop, 1);
+}
+
+static void sc_lanes(Sc *sc, const IRInstruction *insn) {
+  LaneLayout layout;
+  if (!ir_lanes_layout(insn, &layout)) {
+    return;
+  }
+  for (int r = 0; r < layout.n_reduce; r++) {
+    int fsum = insn->arguments[layout.kinds_at + r].int_value ==
+               LANE_REDUCE_FSUM;
+    IROperand identity = ir_operand_int(fsum ? 0x80000000LL : 0);
+    sc_store(sc, &insn->arguments[layout.partials_at + r], &identity, 4, 0);
+    ir_operand_destroy(&identity);
+  }
 }
 
 static void sc_i2f_reduce(Sc *sc, const IRInstruction *insn) {
@@ -1064,6 +1091,7 @@ int ir_scalarize_opcode_is_kernel(IROpcode op) {
   case IR_OP_SIMD_FIND:
   case IR_OP_SIMD_OUTER_LANE_F64:
   case IR_OP_SIMD_LCG_U32:
+  case IR_OP_SIMD_LANES:
   case IR_OP_PREFETCH:
   case IR_OP_SAFETY_CHECK:
   case IR_OP_PHI:
@@ -1160,6 +1188,9 @@ static int sc_expand(Sc *sc, const IRInstruction *insn, char *why,
     return 1;
   case IR_OP_SIMD_LCG_U32:
     sc_lcg(sc, insn);
+    return 1;
+  case IR_OP_SIMD_LANES:
+    sc_lanes(sc, insn);
     return 1;
   case IR_OP_PREFETCH:
   case IR_OP_SAFETY_CHECK:

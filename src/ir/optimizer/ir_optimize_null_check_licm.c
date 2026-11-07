@@ -21,8 +21,10 @@ static int ir_nullhoist_find_entry_test(const IRFunction *function,
                                         size_t *branch_index_out) {
   for (size_t k = header_index + 1; k < backedge_index; k++) {
     const IRInstruction *insn = &function->instructions[k];
+    size_t exit_index = 0;
     if (insn->op == IR_OP_BRANCH_ZERO && insn->text &&
-        strncmp(insn->text, "ir_while_end", 12) == 0) {
+        ir_find_label_index(function, insn->text, &exit_index) &&
+        exit_index > backedge_index) {
       *branch_index_out = k;
       return 1;
     }
@@ -33,6 +35,83 @@ static int ir_nullhoist_find_entry_test(const IRFunction *function,
   return 0;
 }
 
+int ir_instruction_is_hoisted_null_check(const IRInstruction *insn) {
+  static const char *const kPrefixes[] = {"ir_nullhoist_skip_", "ir_trap_null_",
+                                          "ir_nonnull_"};
+  if (insn->op == IR_OP_CALL) {
+    return insn->text && strcmp(insn->text, "mettle_crash_trap_ex") == 0;
+  }
+  if ((insn->op != IR_OP_LABEL && insn->op != IR_OP_JUMP &&
+       insn->op != IR_OP_BRANCH_ZERO) ||
+      !insn->text) {
+    return 0;
+  }
+  for (size_t p = 0; p < sizeof(kPrefixes) / sizeof(kPrefixes[0]); p++) {
+    if (strncmp(insn->text, kPrefixes[p], strlen(kPrefixes[p])) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_nullhoist_quiet_op(const IRInstruction *insn) {
+  switch (insn->op) {
+  case IR_OP_NOP:
+  case IR_OP_LABEL:
+  case IR_OP_JUMP:
+  case IR_OP_BRANCH_ZERO:
+  case IR_OP_BRANCH_EQ:
+  case IR_OP_ASSIGN:
+  case IR_OP_UNARY:
+  case IR_OP_LOAD:
+  case IR_OP_CAST:
+  case IR_OP_ADDRESS_OF:
+  case IR_OP_SELECT:
+  case IR_OP_DECLARE_LOCAL:
+    return 1;
+  case IR_OP_BINARY:
+    return insn->is_float || !insn->text ||
+           (strcmp(insn->text, "/") != 0 && strcmp(insn->text, "%") != 0);
+  default:
+    return 0;
+  }
+}
+
+static int ir_nullhoist_reached_first(const IRFunction *function,
+                                      size_t entry_branch, size_t check) {
+  for (size_t k = entry_branch + 1; k < check; k++) {
+    const IRInstruction *insn = &function->instructions[k];
+    if (!ir_nullhoist_quiet_op(insn)) {
+      return 0;
+    }
+    size_t target = 0;
+    int transfers = insn->op == IR_OP_JUMP || insn->op == IR_OP_BRANCH_ZERO ||
+                    insn->op == IR_OP_BRANCH_EQ;
+    if (transfers &&
+        (!ir_find_label_index(function, insn->text, &target) ||
+         target <= k || target >= check)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void ir_nullhoist_drop_dominated(IRFunction *function, size_t from,
+                                        size_t to, const char *symbol_name) {
+  for (size_t k = from; k < to; k++) {
+    size_t end = 0;
+    const char *checked = NULL;
+    if (!ir_match_null_trap_diamond(function, k, &end, &checked) ||
+        end >= to || strcmp(checked, symbol_name) != 0) {
+      continue;
+    }
+    for (size_t z = k; z <= end; z++) {
+      ir_instruction_make_nop(&function->instructions[z]);
+    }
+    k = end;
+  }
+}
+
 int ir_null_check_licm_pass(IRFunction *function, int *changed) {
   if (!function) {
     return 0;
@@ -40,8 +119,7 @@ int ir_null_check_licm_pass(IRFunction *function, int *changed) {
 
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *header = &function->instructions[i];
-    if (header->op != IR_OP_LABEL || !header->text ||
-        strncmp(header->text, "ir_while_", 9) != 0) {
+    if (header->op != IR_OP_LABEL || !ir_label_is_while_header(header->text)) {
       continue;
     }
     const char *loop_label = header->text;
@@ -100,23 +178,7 @@ int ir_null_check_licm_pass(IRFunction *function, int *changed) {
       if (entry_branch_index >= j) {
         continue;
       }
-      int straight_line = 1;
-      for (size_t k = entry_branch_index + 1; k < j; k++) {
-        switch (function->instructions[k].op) {
-        case IR_OP_LABEL:
-        case IR_OP_JUMP:
-        case IR_OP_BRANCH_ZERO:
-        case IR_OP_BRANCH_EQ:
-          straight_line = 0;
-          break;
-        default:
-          break;
-        }
-        if (!straight_line) {
-          break;
-        }
-      }
-      if (!straight_line) {
+      if (!ir_nullhoist_reached_first(function, entry_branch_index, j)) {
         continue;
       }
       size_t cond_span = entry_branch_index - i - 1;
@@ -187,6 +249,8 @@ int ir_null_check_licm_pass(IRFunction *function, int *changed) {
       for (size_t k = 0; k < span; k++) {
         ir_instruction_make_nop(&function->instructions[j + k]);
       }
+      ir_nullhoist_drop_dominated(function, i + 1, backedge_index,
+                                  symbol_name);
 
       if (function->instruction_count + total >
           function->instruction_capacity) {

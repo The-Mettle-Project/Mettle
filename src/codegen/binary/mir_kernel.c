@@ -67,6 +67,10 @@ static const MirIrKernel kMirIrKernels[] = {
      code_generator_binary_emit_simd_outer_lane_f64, 0},
     {IR_OP_SIMD_LCG_U32, "simd_lcg_u32",
      code_generator_binary_emit_simd_lcg_u32, 0, 0x03FFu},
+    {IR_OP_SIMD_LANES, "simd_lanes", code_generator_binary_emit_simd_lanes,
+     GPCLOB(BINARY_GP_RBX) | GPCLOB(BINARY_GP_RSI) | GPCLOB(BINARY_GP_RDI) |
+         GPCLOB(BINARY_GP_R12) | GPCLOB(BINARY_GP_R13),
+     0xFFFFu},
 };
 
 #define MIR_IR_KERNEL_COUNT \

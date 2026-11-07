@@ -1543,6 +1543,16 @@ static void waterfill(const int base[4], int add, int out[4]) {
   }
 }
 
+static int loop_runs_ahead_in_kernel(const AnnotFunc *f, const Loop *l) {
+  for (int j = 0; j < l->start_rec && j < (int)f->insn_count; j++) {
+    const AnnotInsn *r = &f->insns[j];
+    if (r->is_kernel && r->line >= l->head_line && r->line <= l->tail_line) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void analyze_function(AnnotFunc *f) {
   if (!f) return;
 
@@ -1595,6 +1605,7 @@ static void analyze_function(AnnotFunc *f) {
   for (size_t li = 0; li < f->loop_count; li++) {
     Loop *l = &f->loops[li];
     int flex = 0;
+    l->has_kernel = loop_runs_ahead_in_kernel(f, l);
     for (int j = l->start_rec; j <= l->end_rec && j < (int)f->insn_count; j++) {
       AnnotInsn *r = &f->insns[j];
       if (r->is_kernel) {
@@ -2260,8 +2271,10 @@ static int publish_decoded(const AnnotFunc *f, const AnnotInsn *r,
   }
   if (n != r->len || at != n) {
     if (getenv("METTLE_DISASM_CHECK")) {
-      fprintf(stderr, "disasm check: %s+%zu not decoded: %s [%s]\n", f->name,
-              r->off, r->intel ? r->intel : "?", r->bytes);
+      size_t shown = r->bytes && strlen(r->bytes) > at * 3 ? at * 3 : 0;
+      fprintf(stderr, "disasm check: %s+%zu not decoded at +%zu: %s [%.48s]\n",
+              f->name, r->off, at, r->intel ? r->intel : "?",
+              r->bytes ? r->bytes + shown : "");
     }
     free(code);
     return 0;

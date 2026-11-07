@@ -50,6 +50,7 @@ static int ir_ssa_opcode_requires_symbol(IROpcode op) {
   case IR_OP_PREFETCH:
   case IR_OP_NEW:
   case IR_OP_SIMD_FIND:
+  case IR_OP_SIMD_LANES:
   case IR_OP_COUNT_WORD_STARTS:
     return 1;
   default:

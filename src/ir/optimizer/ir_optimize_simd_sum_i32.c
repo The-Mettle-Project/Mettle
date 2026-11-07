@@ -771,7 +771,8 @@ int ir_iv_zero_at_header(const IRFunction *function, size_t header_index,
     const IRInstruction *ins = &function->instructions[i];
     if (ins->op == IR_OP_NOP || ins->op == IR_OP_DECLARE_LOCAL ||
         ir_instruction_is_safety_scaffolding(ins) ||
-        ir_instruction_is_ptr_count_guard(ins)) {
+        ir_instruction_is_ptr_count_guard(ins) ||
+        ir_instruction_is_hoisted_null_check(ins)) {
       continue;
     }
     if (ins->op == IR_OP_LABEL || ins->op == IR_OP_JUMP ||

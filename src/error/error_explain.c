@@ -1227,6 +1227,41 @@ static const DecisionDoc DECISIONS[] = {
      "The report checks first: when the other half of the index changes every\n"
      "iteration the access really strides, and the report says so and gives\n"
      "no advice.\n"},
+    {"lane-operation", DECISION_VECTOR_REFUSAL,
+     "An operation the 32-bit lanes cannot do exactly",
+     "The lane vectorizer runs any counted loop over 32-bit elements as eight\n"
+     "lanes of float32, int32 or uint32, including branches, selects,\n"
+     "conversions and bit casts. It stopped at one operation, which the\n"
+     "remark names by line:\n"
+     "\n"
+     "  - Arithmetic in float64. Lanes are 32 bits wide.\n"
+     "  - Integer division or remainder. AVX2 has no integer divide.\n"
+     "  - A value whose full 64 bits matter, such as an int64 compared or\n"
+     "    shifted right. Lanes keep the low 32 bits.\n"
+     "\n"
+     "Fix: keep the arithmetic in float32 or 32-bit integers when the range\n"
+     "fits, and widen once after the loop.\n"},
+    {"carried-value", DECISION_VECTOR_REFUSAL,
+     "A value carried from one iteration into the next",
+     "Lanes run eight iterations side by side, so no iteration may read what\n"
+     "the one before it wrote, except through a running sum, which regroups.\n"
+     "The remark names the value and how it is carried:\n"
+     "\n"
+     "  - Through an operation other than + or -, as in a hash or a filter.\n"
+     "    That chain is the algorithm, and the loop is at its scalar floor.\n"
+     "  - As the previous element, `prev = x[i]` read on the next pass. Read\n"
+     "    `x[i - 1]` from the array instead.\n"
+     "  - As the value from the last iteration whose condition held. Find\n"
+     "    that index in a loop of its own.\n"
+     "  - As a sum wider than 32 bits. Accumulate in int32 or float32 and\n"
+     "    widen after the loop.\n"},
+    {"lane-budget", DECISION_VECTOR_REFUSAL,
+     "More operands than the lane kernel stages",
+     "The lane kernel takes its arrays, loop-invariant values, sums and loop\n"
+     "bounds in at most 16 staged operands. A body over many arrays runs out.\n"
+     "\n"
+     "Fix: split the body into two loops over the same range, each over fewer\n"
+     "arrays.\n"},
     {"store-only-fill", DECISION_VECTOR_REFUSAL,
      "Fill loop the fill kernel could not claim",
      "The loop writes the same value over and over, which is the fill shape,\n"
@@ -1245,9 +1280,10 @@ static const DecisionDoc DECISIONS[] = {
     {"counter-store", DECISION_VECTOR_REFUSAL,
      "A ramp: the loop stores its own counter",
      "`a[i] = i`, `xs[i] = (float32)i` and every other store of a value\n"
-     "computed from the loop counter is a ramp. The fill kernel writes one\n"
-     "fixed value, and the compiler has no kernel that steps a vector of\n"
-     "counters, so a ramp stays a scalar loop of one store per element.\n"
+     "computed from the loop counter is a ramp. The lane vectorizer builds\n"
+     "ramps from a vector of counters over 32-bit elements when the counter\n"
+     "steps by one up to a bound. A ramp into 8-bit or 16-bit elements, or\n"
+     "one whose counter moves another way, stays a scalar loop.\n"
      "\n"
      "A store of a value that does not change, `a[i] = 0`, is a fill and\n"
      "becomes 16- or 32-byte splat stores, on a stack array as well as\n"
@@ -1265,10 +1301,12 @@ static const DecisionDoc DECISIONS[] = {
      "with vpconflictd; AVX2 cannot, and the scalar loop is the floor.\n"},
     {"invariant-addend", DECISION_VECTOR_REFUSAL,
      "A sum that also adds the same term every iteration",
-     "`s = s + a[i] + bias(k)` sums the elements and adds `bias(k)` on every\n"
-     "iteration. The term does not change inside the loop, and the compiler\n"
-     "hoists the call, but the sum kernel adds one element per lane and\n"
-     "nothing else, so the extra term keeps the loop scalar.\n"
+     "`s = s + a[i] + bias(k)`, with `s` an int64 and `a` int32, sums the\n"
+     "elements and adds `bias(k)` on every iteration. The term does not\n"
+     "change inside the loop, and the compiler hoists the call, but the\n"
+     "widening sum kernel adds one element per lane and nothing else, and\n"
+     "the 32-bit lanes cannot hold an int64 total, so the loop stays scalar.\n"
+     "An int32 `s` would vectorize as written, and could overflow.\n"
      "\n"
      "Fix: sum the elements alone and add the term once:\n"
      "\n"

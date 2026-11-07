@@ -56,8 +56,8 @@ fn bias(k: int32) -> int32 {
     return k * 3 + 1;
 }
 
-fn apply_bias(a: int32*, n: int32, k: int32) -> int32 {
-    var s: int32 = 0;
+fn apply_bias(a: int32*, n: int32, k: int32) -> int64 {
+    var s: int64 = 0;
     for i in 0..n {
         s = s + a[i] + bias(k);
     }
@@ -160,7 +160,7 @@ fn main() -> int32 {
     var iv: int32[64];
     i = 0;
     while (i < 64) { iv[i] = i; i = i + 1; }
-    var t: int32 = sum_bytes(&bs[0], 64) + apply_bias(&iv[0], 64, 7);
+    var t: int32 = sum_bytes(&bs[0], 64) + (int32)apply_bias(&iv[0], 64, 7);
     var sh: int16[64];
     i = 0;
     while (i < 64) { sh[i] = (int16)i; i = i + 1; }

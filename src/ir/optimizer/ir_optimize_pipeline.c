@@ -170,6 +170,7 @@ static const IROptNamedPass g_ir_recognizer_passes[] = {
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
     {"simd_slp_mac_i8", ir_simd_slp_mac_i8_pass,
      {IR_OPT_FEATURE_LOAD, IR_OPT_REQUIRE_NONE}},
+    {"simd_lanes", ir_simd_lanes_pass, IR_GATE_LOOP},
 };
 
 static const IROptNamedPass g_ir_post_recognizer_tail[] = {
@@ -309,8 +310,8 @@ static const IROptScheduledPass g_ir_fixpoint_passes[] = {
                              ir_thread_jump_targets_pass,
                              IR_OPT_FEATURE_LABEL, IR_OPT_BRANCH_TESTS),
     IR_OPT_PASS_WHEN_ALL(NULL_CHECK_LICM, ir_null_check_licm_pass,
-                         IR_OPT_FEATURE_WHILE_LABEL |
-                             IR_OPT_FEATURE_BRANCH_ZERO | IR_OPT_FEATURE_CALL),
+                         IR_OPT_FEATURE_LABEL | IR_OPT_FEATURE_BRANCH_ZERO |
+                             IR_OPT_FEATURE_CALL),
     IR_OPT_PASS_WHEN_ALL_ANY(REMOVE_EMPTY_CONDITIONAL_DIAMONDS,
                              ir_remove_empty_conditional_diamonds_pass,
                              IR_OPT_LABEL_JUMP,

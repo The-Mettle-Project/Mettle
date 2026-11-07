@@ -4909,9 +4909,54 @@ static const char *const IR_KERNEL_DESC[IR_OP_KIND_COUNT] = {
     [IR_OP_SIMD_INSERTION_SORT_I32] = "accelerated int32 insertion sort",
 };
 
+static void ir_explain_lanes_desc(const IRInstruction *ins, char *buf,
+                                  size_t cap) {
+  long long ops = ins->argument_count > 3 ? ins->arguments[3].int_value : 0;
+  long long sums = ins->argument_count > 4 ? ins->arguments[4].int_value : 0;
+  unsigned stores =
+      ins->argument_count > 5 ? (unsigned)ins->arguments[5].int_value : 0u;
+  int store_count = 0;
+  for (; stores; stores &= stores - 1) {
+    store_count++;
+  }
+  char work[64];
+  if (store_count && sums) {
+    snprintf(work, sizeof(work), "%d %s and %lld %s", store_count,
+             store_count == 1 ? "store" : "stores", sums,
+             sums == 1 ? "sum" : "sums");
+  } else if (store_count) {
+    snprintf(work, sizeof(work), "%d %s", store_count,
+             store_count == 1 ? "store" : "stores");
+  } else {
+    snprintf(work, sizeof(work), "%lld %s", sums, sums == 1 ? "sum" : "sums");
+  }
+  int keep_last = ins->argument_count > 6 && (ins->arguments[6].int_value & 2);
+  snprintf(buf, cap,
+           "8 lanes of 32 bits, %lld ops, %s (AVX2 lane vectorizer; the "
+           "scalar loop finishes the last %s)",
+           ops, work,
+           keep_last ? "1 to 8, so values read after the loop come from it"
+                     : "7 or fewer");
+}
+
+static int ir_explain_widened_dot_desc(const IRInstruction *ins, char *buf,
+                                       size_t cap) {
+  if (ins->op != IR_OP_SIMD_DOT_F64 || ins->argument_count < 2 ||
+      ins->arguments[1].int_value != 1) {
+    return 0;
+  }
+  snprintf(buf, cap,
+           "vcvtps2pd + vfmadd231pd, float32 widened exactly into a 4-wide "
+           "float64 FMA dot product");
+  return 1;
+}
+
 void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
   if (!ins) {
     snprintf(buf, cap, "a SIMD kernel");
+    return;
+  }
+  if (ir_explain_widened_dot_desc(ins, buf, cap)) {
     return;
   }
   switch (ins->op) {
@@ -4960,6 +5005,9 @@ void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
   case IR_OP_SIMD_OUTER_LANE_F64:
     snprintf(buf, cap, "vdivpd, 4 outer iterations in 4-wide float64 lockstep "
                        "(hides the inner recurrence's latency)");
+    return;
+  case IR_OP_SIMD_LANES:
+    ir_explain_lanes_desc(ins, buf, cap);
     return;
   default:
     break;

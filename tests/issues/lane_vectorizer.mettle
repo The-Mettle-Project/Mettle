@@ -1,0 +1,120 @@
+import "std/io";
+import "std/math";
+
+@noinline fn relu(x: float32*, y: float32*, n: int64) { for i: int64 in 0..n { y[i] = if (x[i] > 0.0) x[i] else 0.0; } }
+@noinline fn relu_r(x: float32*, y: float32*, n: int64) { var i: int64 = n - 1; while (i >= 0) { y[i] = if (x[i] > 0.0) x[i] else 0.0; i = i - 1; } }
+
+@noinline fn bound_to(x: float32*, y: float32*, n: int64) { for i: int64 in 0..n { var v: float32 = x[i]; if (v < -2.5) { v = -2.5; } if (v > 7.0) { v = 7.0; } y[i] = v; } }
+@noinline fn bound_to_r(x: float32*, y: float32*, n: int64) { var i: int64 = n - 1; while (i >= 0) { var v: float32 = x[i]; if (v < -2.5) { v = -2.5; } if (v > 7.0) { v = 7.0; } y[i] = v; i = i - 1; } }
+
+@noinline fn tanh_map(x: float32*, y: float32*, n: int64) { for i: int64 in 0..n { y[i] = f32_tanh(x[i]); } }
+@noinline fn tanh_map_r(x: float32*, y: float32*, n: int64) { var i: int64 = n - 1; while (i >= 0) { y[i] = f32_tanh(x[i]); i = i - 1; } }
+
+@noinline fn to_int(x: float32*, k: int32*, n: int64) { for i: int64 in 0..n { k[i] = (int32)(x[i] * 3.0); } }
+@noinline fn to_int_r(x: float32*, k: int32*, n: int64) { var i: int64 = n - 1; while (i >= 0) { k[i] = (int32)(x[i] * 3.0); i = i - 1; } }
+
+@noinline fn to_float(k: int32*, y: float32*, n: int64) { for i: int64 in 0..n { y[i] = (float32)k[i] * 0.5 + (float32)i; } }
+@noinline fn to_float_r(k: int32*, y: float32*, n: int64) { var i: int64 = n - 1; while (i >= 0) { y[i] = (float32)k[i] * 0.5 + (float32)i; i = i - 1; } }
+
+@noinline fn abs_bits(x: float32*, y: float32*, n: int64) { for i: int64 in 0..n { y[i] = f32_from_bits(bits_from_f32(x[i]) & (uint32)0x7FFFFFFF); } }
+@noinline fn abs_bits_r(x: float32*, y: float32*, n: int64) { var i: int64 = n - 1; while (i >= 0) { y[i] = f32_from_bits(bits_from_f32(x[i]) & (uint32)0x7FFFFFFF); i = i - 1; } }
+
+@noinline fn mix(a: int32*, b: int32*, c: int32*, n: int64) { for i: int64 in 0..n { var u: int32 = a[i]; var v: int32 = b[i]; c[i] = ((u * 7) ^ (v >> 3)) + (if (u < v) u else v); } }
+@noinline fn mix_r(a: int32*, b: int32*, c: int32*, n: int64) { var i: int64 = n - 1; while (i >= 0) { var u: int32 = a[i]; var v: int32 = b[i]; c[i] = ((u * 7) ^ (v >> 3)) + (if (u < v) u else v); i = i - 1; } }
+
+@noinline fn guarded(x: float32*, y: float32*, z: float32*, n: int64) { for i: int64 in 0..n { if (x[i] > 1.0) { y[i] = x[i] * 2.0; if (x[i] < 50.0) { z[i] = y[i] + z[i]; } } else { z[i] = -1.0; } } }
+@noinline fn guarded_r(x: float32*, y: float32*, z: float32*, n: int64) { var i: int64 = n - 1; while (i >= 0) { if (x[i] > 1.0) { y[i] = x[i] * 2.0; if (x[i] < 50.0) { z[i] = y[i] + z[i]; } } else { z[i] = -1.0; } i = i - 1; } }
+
+@noinline fn bounded(x: float32*, y: float32*, n: int64, m: int64) { for i: int64 in 0..n { if (i < m) { y[i] = x[i] + 1.0; } } }
+@noinline fn bounded_r(x: float32*, y: float32*, n: int64, m: int64) { var i: int64 = n - 1; while (i >= 0) { if (i < m) { y[i] = x[i] + 1.0; } i = i - 1; } }
+
+@noinline fn positive_sum(k: int32*, n: int64) -> int32 { var s: int32 = 0; for i: int64 in 0..n { if (k[i] > 0) { s = s + (k[i] >> 4); } } return s; }
+@noinline fn positive_sum_r(k: int32*, n: int64) -> int32 { var s: int32 = 0; var i: int64 = n - 1; while (i >= 0) { if (k[i] > 0) { s = s + (k[i] >> 4); } i = i - 1; } return s; }
+
+@noinline fn last_value(x: float32*, y: float32*, n: int64) -> float32 { var t: float32 = 0.0; for i: int64 in 0..n { t = x[i] * 2.0; t = t + 1.0; y[i] = t; } return t; }
+
+@noinline fn spread(p: float32*, n: int64) { for i: int64 in 0..4 * n { p[i] = 0.5 + (float32)i; } }
+
+@noinline fn dot_wide(a: float32*, b: float32*, n: int64) -> float64 { var s: float64 = 0.0; for i: int64 in 0..n { s = s + (float64)a[i] * (float64)b[i]; } return s; }
+
+fn next(state: uint64*) -> float64 {
+  *state = *state * (uint64)6364136223846793005 + (uint64)1442695040888963407;
+  return (float64)(*state >> (uint64)11) / 9007199254740992.0;
+}
+
+fn fill(x: float32*, k: int32*, n: int64, seed: uint64) {
+  var s: uint64 = seed;
+  for i: int64 in 0..n {
+    x[i] = (float32)(next(&s) * 200.0 - 100.0);
+    k[i] = (int32)(next(&s) * 4294967295.0 - 2147483648.0);
+  }
+  x[0] = f32_from_bits((uint32)0x7FC00000);
+  x[1] = -0.0;
+  x[2] = f32_from_bits((uint32)0x7F800000);
+  x[3] = 1.0e-42;
+  x[4] = 3.0e9;
+  x[5] = -3.0e9;
+}
+
+fn same(a: float32*, b: float32*, n: int64) -> bool {
+  for i: int64 in 0..n { if (bits_from_f32(a[i]) != bits_from_f32(b[i])) { return false; } }
+  return true;
+}
+
+fn samei(a: int32*, b: int32*, n: int64) -> bool {
+  for i: int64 in 0..n { if (a[i] != b[i]) { return false; } }
+  return true;
+}
+
+fn main() -> int32 {
+  var x: float32[64];
+  var x2: float32[64];
+  var y: float32[64];
+  var z: float32[64];
+  var y2: float32[64];
+  var z2: float32[64];
+  var k: int32[64];
+  var k2: int32[64];
+  var a: int32[64];
+  var b: int32[64];
+  var bad: int32 = 0;
+  for n: int64 in 0..41 {
+    for off: int64 in 0..3 {
+      fill(&x[0], &k[0], 64, (uint64)(n * 7 + off + 1));
+      fill(&x2[0], &k2[0], 64, (uint64)(n * 13 + off + 5));
+      var xp: float32* = &x[off];
+      relu(xp, &y[0], n); relu_r(xp, &z[0], n); if (!same(&y[0], &z[0], n)) { println("relu {n} {off}"); bad = bad + 1; }
+      bound_to(xp, &y[0], n); bound_to_r(xp, &z[0], n); if (!same(&y[0], &z[0], n)) { println("bound_to {n} {off}"); bad = bad + 1; }
+      tanh_map(xp, &y[0], n); tanh_map_r(xp, &z[0], n); if (!same(&y[0], &z[0], n)) { println("tanh {n} {off}"); bad = bad + 1; }
+      to_int(xp, &a[0], n); to_int_r(xp, &b[0], n); if (!samei(&a[0], &b[0], n)) { println("to_int {n} {off}"); bad = bad + 1; }
+      to_float(&k[off], &y[0], n); to_float_r(&k[off], &z[0], n); if (!same(&y[0], &z[0], n)) { println("to_float {n} {off}"); bad = bad + 1; }
+      abs_bits(xp, &y[0], n); abs_bits_r(xp, &z[0], n); if (!same(&y[0], &z[0], n)) { println("abs_bits {n} {off}"); bad = bad + 1; }
+      mix(&k[off], &k2[0], &a[0], n); mix_r(&k[off], &k2[0], &b[0], n); if (!samei(&a[0], &b[0], n)) { println("mix {n} {off}"); bad = bad + 1; }
+      for i: int64 in 0..64 { y[i] = x2[i]; z[i] = x[i]; y2[i] = x2[i]; z2[i] = x[i]; }
+      guarded(xp, &y[0], &z[0], n); guarded_r(xp, &y2[0], &z2[0], n);
+      if (!same(&y[0], &y2[0], 64) || !same(&z[0], &z2[0], 64)) { println("guarded {n} {off}"); bad = bad + 1; }
+      bounded(xp, &y[0], n, n / 2); bounded_r(xp, &y2[0], n, n / 2); if (!same(&y[0], &y2[0], 64)) { println("bounded {n} {off}"); bad = bad + 1; }
+      if (positive_sum(&k[off], n) != positive_sum_r(&k[off], n)) { println("positive_sum {n} {off}"); bad = bad + 1; }
+      var t: float32 = last_value(xp, &y[0], n);
+      var want: float32 = if (n > 0) x[off + n - 1] * 2.0 + 1.0 else 0.0;
+      if (bits_from_f32(t) != bits_from_f32(want)) { println("last_value {n} {off}"); bad = bad + 1; }
+      spread(&y[0], n / 4);
+      for i: int64 in 0..(n / 4) * 4 { if (y[i] != 0.5 + (float32)i) { println("spread {n} {off}"); bad = bad + 1; } }
+      for i: int64 in 0..64 { z2[i] = (float32)((float64)k2[i] * 1.0e-9); }
+      var exact: float64 = 0.0;
+      for i: int64 in 0..n { exact = exact + (float64)z2[i] * (float64)z2[i + 1]; }
+      var d: float64 = dot_wide(&z2[0], &z2[1], n) - exact;
+      if (d < 0.0) { d = -d; }
+      if (d > 1.0e-9) { println("dot_wide {n} {off}"); bad = bad + 1; }
+      for i: int64 in 0..64 { y[i] = x[i]; z[i] = x[i]; }
+      relu(&y[off], &y[off], n); relu_r(&z[off], &z[off], n); if (!same(&y[0], &z[0], 64)) { println("relu in place {n} {off}"); bad = bad + 1; }
+      for i: int64 in 0..64 { y[i] = x[i]; z[i] = x[i]; }
+      last_value(&y[0], &y[off + 1], n);
+      var j: int64 = 0;
+      while (j < n) { z[off + 1 + j] = z[j] * 2.0 + 1.0; j = j + 1; }
+      if (!same(&y[0], &z[0], 64)) { println("overlap {n} {off}"); bad = bad + 1; }
+    }
+  }
+  println("bad {bad}");
+  return 0;
+}

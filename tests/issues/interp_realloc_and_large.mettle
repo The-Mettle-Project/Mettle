@@ -1,0 +1,56 @@
+import "std/io";
+import "std/mem";
+import "std/conv";
+
+struct Entry { name: string; score: int64; }
+
+@test fn strings_survive_realloc() -> int64 {
+  var cap: int64 = 2;
+  var count: int64 = 0;
+  var items: Entry* = (Entry*)malloc(cap * 24);
+  for k: int64 in 0..9 {
+    if (count == cap) {
+      cap = cap * 2;
+      items = (Entry*)realloc((rawptr)items, cap * 24);
+    }
+    items[count].name = "item{k}";
+    items[count].score = k * 10;
+    count = count + 1;
+  }
+  var joined: string = "";
+  for k: int64 in 0..count { joined = "{joined}{items[k].name},"; }
+  assert(joined == "item0,item1,item2,item3,item4,item5,item6,item7,item8,");
+  free((rawptr)items);
+  return 0;
+}
+
+@test fn names_grow_past_sixteen_megabytes() -> int64 {
+  var cap: int64 = 1024;
+  var used: int64 = 0;
+  var names: uint8* = (uint8*)malloc(cap);
+  for k: int64 in 0..5 {
+    var want: int64 = used + 6000000;
+    while (cap < want) { cap = cap * 2; }
+    names = (uint8*)realloc((rawptr)names, cap);
+    names[used] = (uint8)(65 + k);
+    used = want;
+  }
+  var first: string = str_from_bytes((cstring)names, 1);
+  assert(first == "A");
+  assert(names[24000000] == (uint8)69);
+  free((rawptr)names);
+  return 0;
+}
+
+@test fn one_large_buffer() -> int64 {
+  var n: int64 = 40000000;
+  var p: uint8* = (uint8*)malloc(n);
+  p[0] = (uint8)1;
+  p[16777216] = (uint8)5;
+  p[n - 1] = (uint8)2;
+  assert_eq((int64)p[0] + (int64)p[16777216] + (int64)p[n - 1], 8);
+  free((rawptr)p);
+  return 0;
+}
+
+fn main() -> int32 { return 0; }

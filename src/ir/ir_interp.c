@@ -30,7 +30,7 @@ static void ii_misuse(void) {
 #define II_MAX_BUFFERS 65536
 #define II_MAX_DEPTH 256
 #define II_TRACE_CAP (1 << 20)
-#define II_MAX_BUFFER_SIZE (16LL * 1024 * 1024)
+#define II_MAX_BUFFER_SIZE (1LL << 36)
 
 #define II_FN_ADDR_BASE 0x0000100000000000ULL
 #define II_XFN_ADDR_BASE 0x0000180000000000ULL
@@ -49,6 +49,8 @@ typedef struct {
   unsigned char device_space;
   uint32_t *pending;
   uint32_t *shadow;
+  size_t head;
+  int continuation;
 } IIBuffer;
 
 typedef struct {
@@ -202,6 +204,87 @@ typedef struct {
   int *target;
 } IIJumpTable;
 
+typedef struct {
+  IRFunction *body;
+  IRInterpValue ctx;
+  int slots;
+  long long lo;
+  long long hi;
+  long long span;
+  long long count;
+  long long next;
+  long long done;
+  long long workers;
+} IIParallelJob;
+
+typedef struct {
+  IRInterpMachine *machine;
+  IRFiber *fiber;
+  IRFunction *body;
+  IRInterpValue arg;
+  IRInterpValue result;
+  IIParallelJob *job;
+  long long slot;
+  unsigned long long handle;
+  int id;
+  int finished;
+  int ok;
+  int timed;
+  int timed_out;
+  int depth;
+  int pure_depth;
+  const char *pure_fn;
+  int pure_declared;
+  const IRInstruction *current_insn;
+  const IRFunction *current_fn;
+  SourceLocation current_call_loc;
+  void *effects;
+  size_t effect_count;
+} IICpuThread;
+
+typedef struct {
+  unsigned long long key;
+  int owner;
+  int depth;
+  long long waiters;
+  unsigned long long generation;
+} IISyncObject;
+
+typedef struct {
+  IICpuThread **threads;
+  size_t count;
+  size_t capacity;
+  size_t live;
+  IISyncObject *objects;
+  size_t object_count;
+  size_t object_capacity;
+  IRFiberScheduler *scheduler;
+  IICpuThread *current;
+  long long slice;
+  unsigned long long progress;
+  long long clock_ns;
+  long long fuel_start;
+  int clock_started;
+} IICpu;
+
+typedef struct {
+  int kind;
+  unsigned long long host;
+  unsigned long long file;
+  unsigned long long view;
+  long long offset;
+  long long length;
+  int writable;
+  int eof;
+} IIHostHandle;
+
+typedef struct {
+  IIHostHandle *handles;
+  size_t count;
+  size_t capacity;
+  unsigned last_error;
+} IIFiles;
+
 struct IRInterpMachine {
   IRProgram *program;
   const char *override_name;
@@ -249,7 +332,6 @@ struct IRInterpMachine {
   void *value_hook_ctx;
   const IRFunction *value_hook_fn;
 
-  int held_mutex_count;
   int last_read_undefined;
   int last_socket_error;
   int branched_on_undefined;
@@ -274,6 +356,8 @@ struct IRInterpMachine {
 
   IIGpuGrid gpu;
   IIGpuThread *gpu_current;
+  IICpu cpu;
+  IIFiles files;
 
   NumStore *num;
   uint32_t num_inputs;
@@ -379,10 +463,15 @@ IRInterpMachine *ir_interp_create(IRProgram *program) {
   return machine;
 }
 
+static void ii_cpu_destroy(IRInterpMachine *machine);
+static void ii_files_destroy(IRInterpMachine *machine);
+
 void ir_interp_destroy(IRInterpMachine *machine) {
   if (!machine) {
     return;
   }
+  ii_cpu_destroy(machine);
+  ii_files_destroy(machine);
   for (size_t i = 0; i < machine->buffer_count; i++) {
     free(machine->buffers[i].data);
     free(machine->buffers[i].init_map);
@@ -531,6 +620,14 @@ static void ii_reclaim_buffer(IRInterpMachine *machine, size_t index) {
   buf->freed = 1;
   buf->escaped_local = 0;
   ii_free_slot_push(machine, index);
+  for (size_t w = index + 1; w < machine->buffer_count &&
+                             machine->buffers[w].continuation &&
+                             machine->buffers[w].head == index;
+       w++) {
+    machine->buffers[w].continuation = 0;
+    machine->buffers[w].freed = 1;
+    ii_free_slot_push(machine, w);
+  }
 }
 
 static void ii_mark_bytes(IIBuffer *buf, long long offset, long long length,
@@ -556,16 +653,24 @@ static unsigned long long ii_add_buffer_ex(IRInterpMachine *machine,
       }
     }
   }
-  if ((allow_reuse || machine->buffer_count >= II_MAX_BUFFERS) &&
+  size_t windows =
+      size > (long long)II_ADDR_STRIDE
+          ? (size_t)((size + (long long)II_ADDR_STRIDE - 1) /
+                     (long long)II_ADDR_STRIDE)
+          : 1;
+  if (windows == 1 && (allow_reuse || machine->buffer_count >= II_MAX_BUFFERS) &&
       machine->free_slot_count > 0) {
     index = machine->free_slots[--machine->free_slot_count];
   } else {
-    if (machine->buffer_count >= II_MAX_BUFFERS) {
+    if (machine->buffer_count + windows > II_MAX_BUFFERS) {
       return 0;
     }
-    if (machine->buffer_count == machine->buffer_capacity) {
+    if (machine->buffer_count + windows > machine->buffer_capacity) {
       size_t grown =
           machine->buffer_capacity ? machine->buffer_capacity * 2 : 16;
+      while (grown < machine->buffer_count + windows) {
+        grown *= 2;
+      }
       IIBuffer *table =
           (IIBuffer *)realloc(machine->buffers, grown * sizeof(IIBuffer));
       if (!table) {
@@ -587,6 +692,8 @@ static unsigned long long ii_add_buffer_ex(IRInterpMachine *machine,
   buf->init_map = NULL;
   buf->pending = NULL;
   buf->shadow = NULL;
+  buf->head = index;
+  buf->continuation = 0;
   buf->device_space = MTLC_ADDRESS_SPACE_DEFAULT;
   buf->data = (unsigned char *)malloc(size > 0 ? (size_t)size : 1);
   if (buf->data) {
@@ -610,8 +717,15 @@ static unsigned long long ii_add_buffer_ex(IRInterpMachine *machine,
   } else {
     memset(buf->data, 0, (size_t)size);
   }
+  for (size_t w = 1; w < windows; w++) {
+    IIBuffer *rest = &machine->buffers[index + w];
+    memset(rest, 0, sizeof(*rest));
+    rest->base = buf->base + w * II_ADDR_STRIDE;
+    rest->head = index;
+    rest->continuation = 1;
+  }
   if (index == machine->buffer_count) {
-    machine->buffer_count++;
+    machine->buffer_count += windows;
   }
   return buf->base;
 }
@@ -632,6 +746,9 @@ static IIBuffer *ii_addr_to_buffer(IRInterpMachine *machine,
     return NULL;
   }
   IIBuffer *buf = &machine->buffers[index];
+  if (buf->continuation) {
+    buf = &machine->buffers[buf->head];
+  }
   long long offset = (long long)(addr - buf->base);
   if (buf->freed || offset < 0 || size < 0 || offset + size > buf->size) {
     return NULL;
@@ -812,6 +929,18 @@ static int ii_pending_check(IRInterpMachine *machine, IIBuffer *buf,
                             long long offset, long long length);
 static int ii_sym_range(IIBuffer *buf, long long offset, long long length);
 static void ii_sym_clear(IIBuffer *buf, long long offset, long long length);
+
+static void ii_tag_new_buffers(IRInterpMachine *machine, size_t from,
+                               SourceLocation where) {
+  for (size_t bi = from; bi < machine->buffer_count; bi++) {
+    if (machine->buffers[bi].continuation) {
+      continue;
+    }
+    machine->buffers[bi].alloc_line = where.line;
+    machine->buffers[bi].alloc_column = where.column;
+    machine->buffers[bi].alloc_file = where.filename;
+  }
+}
 
 static int ii_mem_read(IRInterpMachine *machine, unsigned long long addr,
                        int size, unsigned long long *out) {
@@ -2910,87 +3039,6 @@ static int ii_extern_thread(IRInterpMachine *machine, const char *name,
     }
   }
 
-  if (arg_count >= 4 && (strcmp(name, "CreateThread") == 0 ||
-                         strcmp(name, "mettle_thread_create") == 0 ||
-                         strcmp(name, "pthread_create") == 0)) {
-    int answers_zero_on_success = strcmp(name, "pthread_create") == 0;
-    const char *thread_body_extern = NULL;
-    IRFunction *thread_body = ii_token_function(
-        machine, (unsigned long long)ii_as_int(&args[2]), &thread_body_extern);
-    unsigned long long handle_out =
-        answers_zero_on_success
-            ? (unsigned long long)ii_as_int(&args[0])
-            : (arg_count >= 6 ? (unsigned long long)ii_as_int(&args[5]) : 0);
-    if (machine->held_mutex_count > 0 || !thread_body ||
-        thread_body->instruction_count == 0) {
-      return -1;
-    }
-    {
-      IRInterpValue thread_arg = args[3];
-      IRInterpValue thread_result = ii_int_value(0);
-      if (!ii_exec_function(machine, thread_body, &thread_arg, 1,
-                            &thread_result)) {
-        return -1;
-      }
-    }
-    machine->next_thread_handle++;
-    if (handle_out &&
-        !ii_mem_write(machine, handle_out, answers_zero_on_success ? 8 : 4,
-                      machine->next_thread_handle)) {
-      return -1;
-    }
-    *result = ii_int_value(
-        answers_zero_on_success ? 0 : (long long)machine->next_thread_handle);
-    return 1;
-  }
-
-  return II_EXTERN_UNHANDLED;
-}
-
-static int ii_extern_process(IRInterpMachine *machine, const char *name,
-                        const IRInterpValue *args, size_t arg_count,
-                        IRInterpValue *result) {
-  if (arg_count >= 1 && (strcmp(name, "CreateMutexA") == 0 ||
-                         strcmp(name, "mettle_mutex_create") == 0)) {
-    machine->next_thread_handle++;
-    if (arg_count >= 2 && ii_as_int(&args[1]) != 0) {
-      machine->held_mutex_count++;
-    }
-    *result = ii_int_value((long long)machine->next_thread_handle);
-    return 1;
-  }
-
-  if (arg_count >= 1 && (strcmp(name, "pthread_mutex_lock") == 0 ||
-                         strcmp(name, "pthread_mutex_trylock") == 0 ||
-                         strcmp(name, "mettle_mutex_wait") == 0)) {
-    if (ir_trace_collecting()) {
-      ir_trace_record("lock", name, machine->current_call_loc.filename,
-                      machine->current_call_loc.line,
-                      machine->current_call_loc.column,
-                      ii_as_int(&args[0]));
-    }
-    machine->held_mutex_count++;
-    *result = ii_int_value(0);
-    return 1;
-  }
-
-  if (arg_count >= 1 && (strcmp(name, "pthread_mutex_unlock") == 0 ||
-                         strcmp(name, "ReleaseMutex") == 0 ||
-                         strcmp(name, "mettle_mutex_release") == 0)) {
-    if (ir_trace_collecting()) {
-      ir_trace_record("unlock", name, machine->current_call_loc.filename,
-                      machine->current_call_loc.line,
-                      machine->current_call_loc.column,
-                      ii_as_int(&args[0]));
-    }
-    if (machine->held_mutex_count > 0) {
-      machine->held_mutex_count--;
-    }
-    *result =
-        ii_int_value(strcmp(name, "pthread_mutex_unlock") == 0 ? 0 : 1);
-    return 1;
-  }
-
   return II_EXTERN_UNHANDLED;
 }
 
@@ -3000,13 +3048,6 @@ static int ii_extern_handle(IRInterpMachine *machine, const char *name,
   (void)machine;
   (void)args;
   (void)arg_count;
-  if (strcmp(name, "GetCurrentThreadId") == 0 ||
-      strcmp(name, "mettle_thread_current_id") == 0 ||
-      strcmp(name, "pthread_self") == 0) {
-    *result = ii_int_value(1);
-    return 1;
-  }
-
   if (strcmp(name, "CloseHandle") == 0 ||
       strcmp(name, "mettle_thread_close") == 0 ||
       strcmp(name, "mettle_mutex_close") == 0) {
@@ -3014,22 +3055,12 @@ static int ii_extern_handle(IRInterpMachine *machine, const char *name,
     return 1;
   }
 
-  if (strcmp(name, "pthread_join") == 0 ||
-      strcmp(name, "pthread_detach") == 0 ||
+  if (strcmp(name, "pthread_detach") == 0 ||
       strcmp(name, "pthread_mutex_init") == 0 ||
       strcmp(name, "pthread_mutex_destroy") == 0 ||
       strcmp(name, "pthread_cond_init") == 0 ||
       strcmp(name, "pthread_cond_destroy") == 0 ||
-      strcmp(name, "pthread_cond_wait") == 0 ||
-      strcmp(name, "pthread_cond_signal") == 0 ||
-      strcmp(name, "pthread_cond_broadcast") == 0 ||
-      strcmp(name, "mettle_thread_wait") == 0 ||
-      strcmp(name, "mettle_thread_detach") == 0 ||
-      strcmp(name, "WaitForSingleObject") == 0 ||
-      strcmp(name, "Sleep") == 0 ||
-      strcmp(name, "mettle_thread_sleep_ms") == 0 ||
-      strcmp(name, "usleep") == 0 || strcmp(name, "nanosleep") == 0 ||
-      strcmp(name, "posix_yield") == 0 || strcmp(name, "sched_yield") == 0) {
+      strcmp(name, "mettle_thread_detach") == 0) {
     *result = ii_int_value(0);
     return 1;
   }
@@ -3671,14 +3702,19 @@ static int ii_extern_numerics(IRInterpMachine *machine, const char *name,
                               const IRInterpValue *args, size_t arg_count,
                               IRInterpValue *result);
 
+#include "ir_interp_threads.inc"
+#include "ir_interp_files.inc"
+
 static const IIExternHandler II_EXTERN_HANDLERS[] = {
     ii_extern_numerics,
     ii_extern_allocate,
+    ii_extern_file_stream,
     ii_extern_stream,
     ii_extern_swap,
     ii_extern_socket,
+    ii_extern_cpu,
+    ii_extern_files,
     ii_extern_thread,
-    ii_extern_process,
     ii_extern_handle,
     ii_extern_memory,
     ii_extern_block,
@@ -4410,6 +4446,54 @@ static int ii_exec_int_search(IRInterpMachine *machine, IIFrame *frame,
   return 0;
 }
 
+static int ii_dot_term(IRInterpMachine *machine, const IRInstruction *insn,
+                       int widen, unsigned long long a, unsigned long long b,
+                       long long i, double *sum) {
+  if (widen || insn->op == IR_OP_SIMD_DOT_F32) {
+    float x, y;
+    if (!ii_read_f32(machine, a + (unsigned long long)i * 4, &x) ||
+        !ii_read_f32(machine, b + (unsigned long long)i * 4, &y)) {
+      return 0;
+    }
+    *sum = widen ? *sum + (double)x * (double)y
+                 : (double)(float)((float)*sum + x * y);
+    return 1;
+  }
+  double x, y;
+  if (!ii_read_f64(machine, a + (unsigned long long)i * 8, &x) ||
+      !ii_read_f64(machine, b + (unsigned long long)i * 8, &y)) {
+    return 0;
+  }
+  *sum += x * y;
+  return 1;
+}
+
+static int ii_exec_dot(IRInterpMachine *machine, IIFrame *frame,
+                       const IRInstruction *insn) {
+  unsigned long long a, b;
+  long long n;
+  IRInterpValue acc;
+  if (insn->argument_count < 1 ||
+      !ii_fetch_addr(machine, frame, &insn->lhs, &a) ||
+      !ii_fetch_addr(machine, frame, &insn->rhs, &b) ||
+      !ii_fetch_int(machine, frame, &insn->arguments[0], &n) ||
+      !ii_fetch(machine, frame, &insn->dest, &acc)) {
+    return 0;
+  }
+  double sum = ii_as_float(&acc);
+  int widen = insn->argument_count > 1 &&
+              insn->arguments[1].kind == IR_OPERAND_INT &&
+              insn->arguments[1].int_value == 1;
+  for (long long i = 0; i < n; i++) {
+    if (!ii_dot_term(machine, insn, widen, a, b, i, &sum)) {
+      return 0;
+    }
+  }
+  machine->fuel -= n;
+  IRInterpValue out = ii_float_value(sum);
+  return ii_store_dest(machine, frame, &insn->dest, &out);
+}
+
 static int ii_exec_float_reduce(IRInterpMachine *machine, IIFrame *frame,
                       const IRInstruction *insn, int *handled) {
   *handled = 1;
@@ -4446,39 +4530,8 @@ static int ii_exec_float_reduce(IRInterpMachine *machine, IIFrame *frame,
   }
 
   case IR_OP_SIMD_DOT_F64:
-  case IR_OP_SIMD_DOT_F32: {
-    unsigned long long a, b;
-    long long n;
-    IRInterpValue acc;
-    if (insn->argument_count < 1 ||
-        !ii_fetch_addr(machine, frame, &insn->lhs, &a) ||
-        !ii_fetch_addr(machine, frame, &insn->rhs, &b) ||
-        !ii_fetch_int(machine, frame, &insn->arguments[0], &n) ||
-        !ii_fetch(machine, frame, &insn->dest, &acc)) {
-      return 0;
-    }
-    double sum = ii_as_float(&acc);
-    for (long long i = 0; i < n; i++) {
-      if (insn->op == IR_OP_SIMD_DOT_F64) {
-        double x, y;
-        if (!ii_read_f64(machine, a + (unsigned long long)i * 8, &x) ||
-            !ii_read_f64(machine, b + (unsigned long long)i * 8, &y)) {
-          return 0;
-        }
-        sum += x * y;
-      } else {
-        float x, y;
-        if (!ii_read_f32(machine, a + (unsigned long long)i * 4, &x) ||
-            !ii_read_f32(machine, b + (unsigned long long)i * 4, &y)) {
-          return 0;
-        }
-        sum = (double)(float)((float)sum + x * y);
-      }
-    }
-    machine->fuel -= n;
-    IRInterpValue out = ii_float_value(sum);
-    return ii_store_dest(machine, frame, &insn->dest, &out);
-  }
+  case IR_OP_SIMD_DOT_F32:
+    return ii_exec_dot(machine, frame, insn);
 
   case IR_OP_SIMD_AFFINE_MAP_F64:
   case IR_OP_SIMD_AFFINE_MAP_F32: {
@@ -4830,10 +4883,14 @@ static int ii_exec_find(IRInterpMachine *machine, IIFrame *frame,
   return ii_store_dest(machine, frame, &insn->dest, &out);
 }
 
+#include "ir_interp_lanes.inc"
+
 static int ii_exec_random(IRInterpMachine *machine, IIFrame *frame,
                       const IRInstruction *insn, int *handled) {
   *handled = 1;
   switch (insn->op) {
+  case IR_OP_SIMD_LANES:
+    return ii_exec_lanes(machine, frame, insn);
   case IR_OP_SIMD_LCG_U32: {
     if (insn->argument_count < 3) {
       ii_fail(machine, IR_INTERP_UNSUPPORTED, "lcg arity");
@@ -5664,10 +5721,7 @@ static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
     ii_fail(machine, IR_INTERP_UNSUPPORTED, "call without callee");
     return 0;
   }
-  if (strcmp(insn->text, IR_SYSCALL_CALL_NAME) == 0) {
-    ii_fail(machine, IR_INTERP_UNSUPPORTED, "syscall");
-    return 0;
-  }
+  int is_syscall = strcmp(insn->text, IR_SYSCALL_CALL_NAME) == 0;
   IRInterpValue call_args[32];
   size_t call_arg_count = insn->argument_count;
   if (call_arg_count > 32) {
@@ -5692,6 +5746,11 @@ static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
     if (!ii_fetch(machine, frame, arg, &call_args[i])) {
       return 0;
     }
+  }
+  if (is_syscall) {
+    IRInterpValue sys_result = ii_int_value(0);
+    return ii_syscall(machine, call_args, call_arg_count, &sys_result) &&
+           ii_store_dest(machine, frame, &insn->dest, &sys_result);
   }
   if (!ii_copy_aggregate_args(machine, frame, insn->text, call_args,
                               call_arg_count)) {
@@ -5735,19 +5794,18 @@ static int ii_op_call(IRInterpMachine *machine, IIFrame *frame,
   } else {
     machine->current_call_loc = insn->location;
     size_t buffers_before = machine->buffer_count;
+    long long fuel_before = machine->fuel;
     int handled =
         ii_extern_call(machine, insn->text, call_args, call_arg_count,
                        &call_result);
+    buffers_before = machine->fuel == fuel_before ? buffers_before
+                                                  : machine->buffer_count;
     if (machine->num && handled == 0 && machine->status == IR_INTERP_OK &&
         strcmp(insn->text, "mtlc_gpu_kernel_handle") != 0) {
       ii_misuse();
     }
     if (strncmp(insn->text, "mettle_string_", 14) != 0) {
-      for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
-        machine->buffers[bi].alloc_line = insn->location.line;
-        machine->buffers[bi].alloc_column = insn->location.column;
-        machine->buffers[bi].alloc_file = insn->location.filename;
-      }
+      ii_tag_new_buffers(machine, buffers_before, insn->location);
     }
     if (handled < 0 || machine->status != IR_INTERP_OK) {
       if (machine->status == IR_INTERP_OK) {
@@ -5888,12 +5946,11 @@ static int ii_op_call_indirect(IRInterpMachine *machine, IIFrame *frame,
   } else if (extern_name) {
     machine->current_call_loc = insn->location;
     size_t buffers_before = machine->buffer_count;
+    long long fuel_before = machine->fuel;
     int handled = ii_extern_call(machine, extern_name, call_args,
                                  call_arg_count, &call_result);
-    for (size_t bi = buffers_before; bi < machine->buffer_count; bi++) {
-      machine->buffers[bi].alloc_line = insn->location.line;
-      machine->buffers[bi].alloc_column = insn->location.column;
-      machine->buffers[bi].alloc_file = insn->location.filename;
+    if (machine->fuel == fuel_before) {
+      ii_tag_new_buffers(machine, buffers_before, insn->location);
     }
     if (handled < 0 || machine->status != IR_INTERP_OK) {
       if (machine->status == IR_INTERP_OK) {
@@ -6679,6 +6736,18 @@ static unsigned long long ii_late_local_token(IRInterpMachine *machine,
   return 0;
 }
 
+static int ii_may_step(IRInterpMachine *machine, const IRFunction *fn) {
+  if (--machine->fuel < 0) {
+    ii_fail(machine, IR_INTERP_FUEL, fn->name ? fn->name : "?");
+    return 0;
+  }
+  if (machine->cpu.live && !machine->gpu.active &&
+      ++machine->cpu.slice >= II_CPU_SLICE) {
+    return ii_cpu_tick(machine);
+  }
+  return 1;
+}
+
 static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
                             const IRInterpValue *args, size_t arg_count,
                             IRInterpValue *result) {
@@ -6708,8 +6777,7 @@ static int ii_exec_function(IRInterpMachine *machine, IRFunction *fn,
 
   size_t pc = 0;
   while (pc < fn->instruction_count) {
-    if (--machine->fuel < 0) {
-      ii_fail(machine, IR_INTERP_FUEL, fn->name ? fn->name : "?");
+    if (!ii_may_step(machine, fn)) {
       goto done;
     }
     const IRInstruction *insn = &fn->instructions[pc];

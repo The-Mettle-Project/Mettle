@@ -3037,6 +3037,7 @@ static const int IR_HAS_SIDE_EFFECT[IR_OP_KIND_COUNT] = {
     [IR_OP_SIMD_VLOOP_F64] = 1,
     [IR_OP_SIMD_VLOOP_I32] = 1,
     [IR_OP_SIMD_FIND] = 1,
+    [IR_OP_SIMD_LANES] = 1,
     [IR_OP_SIMD_OUTER_LANE_F64] = 1,
     [IR_OP_RETURN] = 1,
     [IR_OP_INLINE_ASM] = 1,

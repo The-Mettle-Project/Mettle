@@ -1,0 +1,100 @@
+import "std/io";
+import "std/mem";
+import "std/thread";
+import "std/sync";
+import "std/parallel";
+
+struct Shared {
+  lock: SyncMutex;
+  ready: SyncCond;
+  total: int64;
+  items: int64[8];
+  produced: int64;
+  consumed: int64;
+}
+
+fn add_many(p: cstring) -> uint32 {
+  var s: Shared* = (Shared*)p;
+  for k: int64 in 0..500 {
+    sync_mutex_lock(&s->lock);
+    s->total = s->total + 1;
+    sync_mutex_unlock(&s->lock);
+  }
+  return (uint32)0;
+}
+
+@test fn locked_counter_from_two_threads() -> int64 {
+  var s: Shared* = new Shared;
+  var tid: uint32 = (uint32)0;
+  var a: int64 = CreateThread((cstring)0, (uint64)0, &add_many, (cstring)s, (uint32)0, &tid);
+  var b: int64 = CreateThread((cstring)0, (uint64)0, &add_many, (cstring)s, (uint32)0, &tid);
+  thread_join_infinite(a);
+  thread_join_infinite(b);
+  assert_eq(s->total, 1000);
+  free((rawptr)s);
+  return 0;
+}
+
+fn consume(p: cstring) -> uint32 {
+  var s: Shared* = (Shared*)p;
+  sync_mutex_lock(&s->lock);
+  while (s->consumed < 8) {
+    while (s->consumed == s->produced) { sync_cond_wait(&s->ready, &s->lock); }
+    s->total = s->total + s->items[s->consumed];
+    s->consumed = s->consumed + 1;
+  }
+  sync_mutex_unlock(&s->lock);
+  return (uint32)0;
+}
+
+fn produce(p: cstring) -> uint32 {
+  var s: Shared* = (Shared*)p;
+  for k: int64 in 0..8 {
+    sync_mutex_lock(&s->lock);
+    s->items[k] = k * 10;
+    s->produced = s->produced + 1;
+    sync_cond_signal(&s->ready);
+    sync_mutex_unlock(&s->lock);
+    thread_sleep_ms((uint32)1);
+  }
+  return (uint32)0;
+}
+
+@test fn consumer_waits_for_producer() -> int64 {
+  var s: Shared* = new Shared;
+  var tid: uint32 = (uint32)0;
+  var c: int64 = CreateThread((cstring)0, (uint64)0, &consume, (cstring)s, (uint32)0, &tid);
+  var p: int64 = CreateThread((cstring)0, (uint64)0, &produce, (cstring)s, (uint32)0, &tid);
+  thread_join_infinite(p);
+  thread_join_infinite(c);
+  assert_eq(s->total, 280);
+  free((rawptr)s);
+  return 0;
+}
+
+fn square_chunk(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var out: int64* = (int64*)ctx;
+  for i: int64 in lo..hi { out[i] = i * i; }
+  return 0;
+}
+
+@test fn parallel_range_covers_every_index() -> int64 {
+  var out: int64* = (int64*)malloc(1000 * 8);
+  parallel_range(&square_chunk, (rawptr)out, 0, 1000, 16);
+  var s: int64 = 0;
+  for i: int64 in 0..1000 { s = s + out[i]; }
+  assert_eq(s, 332833500);
+  free((rawptr)out);
+  return 0;
+}
+
+@test fn timed_lock_gives_up() -> int64 {
+  var other: SyncMutex* = new SyncMutex;
+  sync_mutex_lock(other);
+  assert(!sync_mutex_lock_timeout(other, 5));
+  sync_mutex_unlock(other);
+  free((rawptr)other);
+  return 0;
+}
+
+fn main() -> int32 { return 0; }

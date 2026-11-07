@@ -356,6 +356,7 @@ static int ir_profile_instruction_op_class(const IRInstruction *instruction,
     {IR_OP_SIMD_VLOOP_F64, METTLE_PROFILE_OP_SIMD},
     {IR_OP_SIMD_VLOOP_I32, METTLE_PROFILE_OP_SIMD},
     {IR_OP_SIMD_FIND, METTLE_PROFILE_OP_SIMD},
+    {IR_OP_SIMD_LANES, METTLE_PROFILE_OP_SIMD},
     {IR_OP_SIMD_OUTER_LANE_F64, METTLE_PROFILE_OP_SIMD},
   };
 

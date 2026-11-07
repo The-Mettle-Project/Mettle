@@ -1021,6 +1021,10 @@ int mettle_move_path(const char *from, const char *to) {
   return MoveFileExA(from, to, 1u) ? 0 : -1;
 }
 
+int rename(const char *from, const char *to) {
+  return MoveFileExA(from, to, 1u) ? 0 : -1;
+}
+
 int mettle_dir_list(const char *path, char *names, mt_i32 capacity) {
   char pattern[1024];
   MtFindData data;
@@ -2701,6 +2705,11 @@ static mt_i64 mt_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
 #else
 #error The freestanding Mettle runtime needs a syscall table for this target
 #endif
+
+mt_i64 mettle_host_syscall6(mt_i64 number, mt_i64 a1, mt_i64 a2, mt_i64 a3,
+                            mt_i64 a4, mt_i64 a5, mt_i64 a6) {
+  return mt_syscall6(number, a1, a2, a3, a4, a5, a6);
+}
 #endif
 
 #define MT_AT_FDCWD -100
