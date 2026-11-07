@@ -18,6 +18,10 @@ native executable. See [`calc/README.md`](calc/README.md) and
 [`raylib/`](raylib/) binds raylib 5.5 with nothing but `extern fn` declarations
 and draws a rotating, lit sphere at ~8,600 fps. See [`raylib/README.md`](raylib/README.md).
 
+[`cube/`](cube/) draws a lit, shadowed cube you can fly around with a
+rasterizer written as Mettle GPU kernels: clipping, tiled coverage, depth,
+a shadow map and shading, with no graphics API. See [`cube/README.md`](cube/README.md).
+
 [`video_player/`](video_player/) plays Motion JPEG video with PCM audio from an
 AVI file. The container parser, the baseline JPEG decoder, the inverse DCT, the
 chroma upsampler, and the playback clock are all Mettle; Win32 supplies the

@@ -1,0 +1,804 @@
+const TILE: int32 = 16;
+const BIN: int32 = 256;
+const SLOTS_PER_TRIANGLE: int32 = 6;
+const SAMPLES: int32 = 4;
+const NO_TRIANGLE: int32 = -1;
+const MAT_GROUND: int32 = 0;
+const MAT_STEEL: int32 = 1;
+const PI_F: float32 = 3.14159265;
+
+struct Vec3 {
+  x: float32;
+  y: float32;
+  z: float32;
+}
+
+struct View {
+  m: float32[16];
+  width: int32;
+  height: int32;
+  near: float32;
+  guard: float32;
+  facing: int32;
+  materials: int32;
+  samples: int32;
+}
+
+struct Slot {
+  x0: int32;
+  y0: int32;
+  x1: int32;
+  y1: int32;
+  x2: int32;
+  y2: int32;
+  z0: float32;
+  z1: float32;
+  z2: float32;
+  inv_area: float32;
+  left: int32;
+  top: int32;
+  right: int32;
+  bottom: int32;
+  source: int32;
+  bias: int32;
+}
+
+struct Frame {
+  eye: Vec3;
+  right: Vec3;
+  up: Vec3;
+  forward: Vec3;
+  moon: Vec3;
+  glow: Vec3;
+  box_min: Vec3;
+  box_max: Vec3;
+  light: float32[16];
+  width: int32;
+  height: int32;
+  shadow_size: int32;
+  pixel_angle: float32;
+  exposure: float32;
+  shadow_depth_range: float32;
+  shadow_texel: float32;
+  moon_tan: float32;
+  frame_index: int32;
+}
+
+@inline fn v3(x: float32, y: float32, z: float32) -> Vec3 {
+  var r: Vec3;
+  r.x = x;
+  r.y = y;
+  r.z = z;
+  return r;
+}
+
+@inline fn add(a: Vec3, b: Vec3) -> Vec3 { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+@inline fn sub(a: Vec3, b: Vec3) -> Vec3 { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+@inline fn mul(a: Vec3, b: Vec3) -> Vec3 { return v3(a.x * b.x, a.y * b.y, a.z * b.z); }
+@inline fn scale(a: Vec3, k: float32) -> Vec3 { return v3(a.x * k, a.y * k, a.z * k); }
+@inline fn dot(a: Vec3, b: Vec3) -> float32 { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+@inline fn cross(a: Vec3, b: Vec3) -> Vec3 {
+  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+@inline fn normalize(a: Vec3) -> Vec3 {
+  return scale(a, rsqrtf(dot(a, a)));
+}
+
+@inline fn mixv(a: Vec3, b: Vec3, t: float32) -> Vec3 {
+  return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+}
+
+@inline fn minf(a: float32, b: float32) -> float32 { if (a < b) { return a; } return b; }
+@inline fn maxf(a: float32, b: float32) -> float32 { if (a > b) { return a; } return b; }
+@inline fn clampf(x: float32, lo: float32, hi: float32) -> float32 { return minf(maxf(x, lo), hi); }
+@inline fn clamp01(x: float32) -> float32 { return clampf(x, 0.0, 1.0); }
+@inline fn mixf(a: float32, b: float32, t: float32) -> float32 { return a + (b - a) * t; }
+@inline fn mini(a: int32, b: int32) -> int32 { if (a < b) { return a; } return b; }
+@inline fn maxi(a: int32, b: int32) -> int32 { if (a > b) { return a; } return b; }
+
+@inline fn smooth_step(e0: float32, e1: float32, x: float32) -> float32 {
+  var t: float32 = clamp01((x - e0) / (e1 - e0));
+  return t * t * (3.0 - 2.0 * t);
+}
+
+@inline fn floorf(x: float32) -> float32 {
+  var t: float32 = (float32)(int32)x;
+  if (t > x) { return t - 1.0; }
+  return t;
+}
+
+@inline fn powf(x: float32, y: float32) -> float32 {
+  if (x <= 0.0) { return 0.0; }
+  return expf(logf(x) * y);
+}
+
+fn acosf(x: float32) -> float32 {
+  var a: float32 = fabsf(x);
+  var r: float32 = sqrtf(maxf(1.0 - a, 0.0)) * (1.5707288 + a * (-0.2121144 + a * (0.074261 - 0.0187293 * a)));
+  if (x < 0.0) { return PI_F - r; }
+  return r;
+}
+
+@inline fn hash3(x: int32, y: int32, z: int32) -> float32 {
+  var h: uint32 = (uint32)x * (uint32)0x8DA6B343 + (uint32)y * (uint32)0xD8163841 + (uint32)z * (uint32)0xCB1AB31F;
+  h = (h ^ (h >> 15)) * (uint32)0x2C1B3C6D;
+  h = (h ^ (h >> 12)) * (uint32)0x297A2D39;
+  h = h ^ (h >> 15);
+  return (float32)(h >> 8) * 0.000000059604645;
+}
+
+fn noise3(x: float32, y: float32, z: float32) -> float32 {
+  var fx: float32 = floorf(x);
+  var fy: float32 = floorf(y);
+  var fz: float32 = floorf(z);
+  var ix: int32 = (int32)fx;
+  var iy: int32 = (int32)fy;
+  var iz: int32 = (int32)fz;
+  var tx: float32 = x - fx;
+  var ty: float32 = y - fy;
+  var tz: float32 = z - fz;
+  tx = tx * tx * tx * (tx * (tx * 6.0 - 15.0) + 10.0);
+  ty = ty * ty * ty * (ty * (ty * 6.0 - 15.0) + 10.0);
+  tz = tz * tz * tz * (tz * (tz * 6.0 - 15.0) + 10.0);
+  var a: float32 = mixf(hash3(ix, iy, iz), hash3(ix + 1, iy, iz), tx);
+  var b: float32 = mixf(hash3(ix, iy + 1, iz), hash3(ix + 1, iy + 1, iz), tx);
+  var c: float32 = mixf(hash3(ix, iy, iz + 1), hash3(ix + 1, iy, iz + 1), tx);
+  var d: float32 = mixf(hash3(ix, iy + 1, iz + 1), hash3(ix + 1, iy + 1, iz + 1), tx);
+  return mixf(mixf(a, b, ty), mixf(c, d, ty), tz);
+}
+
+fn octave_weight(footprint: float32, frequency: float32) -> float32 {
+  return clamp01(1.5 - footprint * frequency * 2.0);
+}
+
+fn fbm(p: Vec3, frequency: float32, octaves: int32, footprint: float32) -> float32 {
+  var sum: float32 = 0.0;
+  var norm: float32 = 0.0;
+  var amp: float32 = 1.0;
+  var f: float32 = frequency;
+  for i in 0..octaves {
+    var w: float32 = octave_weight(footprint, f);
+    var n: float32 = 0.5;
+    if (w > 0.0) {
+      n = mixf(0.5, noise3(p.x * f + (float32)i * 17.3, p.y * f, p.z * f - (float32)i * 9.1), w);
+    }
+    sum = sum + n * amp;
+    norm = norm + amp;
+    amp = amp * 0.5;
+    f = f * 2.03;
+  }
+  return sum / norm;
+}
+
+fn clip_distance(plane: int32, x: float32, y: float32, w: float32, view: View*) -> float32 {
+  if (plane == 0) { return w - view->near; }
+  if (plane == 1) { return view->guard * w - x; }
+  if (plane == 2) { return view->guard * w + x; }
+  if (plane == 3) { return view->guard * w - y; }
+  return view->guard * w + y;
+}
+
+@inline fn snap(v: float32) -> int32 {
+  return (int32)floorf(v * 256.0 + 0.5);
+}
+
+@inline fn top_left(ax: int32, ay: int32, bx: int32, by: int32) -> int32 {
+  if (by < ay) { return 1; }
+  if (by == ay && bx > ax) { return 1; }
+  return 0;
+}
+
+fn emit_slot(slot: Slot*, view: View*, source: int32,
+             ax: int32, ay: int32, az: float32, bx: int32, by: int32, bz: float32,
+             cx: int32, cy: int32, cz: float32) {
+  var area: int64 = (int64)(bx - ax) * (int64)(cy - ay) - (int64)(by - ay) * (int64)(cx - ax);
+  if (view->facing > 0) {
+    area = 0 - area;
+    var tx: int32 = bx;
+    var ty: int32 = by;
+    var tz: float32 = bz;
+    bx = cx;
+    by = cy;
+    bz = cz;
+    cx = tx;
+    cy = ty;
+    cz = tz;
+  }
+  if (area <= 0) { return; }
+  var min_x: int32 = mini(ax, mini(bx, cx));
+  var max_x: int32 = maxi(ax, maxi(bx, cx));
+  var min_y: int32 = mini(ay, mini(by, cy));
+  var max_y: int32 = maxi(ay, maxi(by, cy));
+  var left: int32 = maxi(min_x >> 8, 0);
+  var top: int32 = maxi(min_y >> 8, 0);
+  var right: int32 = mini(max_x >> 8, view->width - 1);
+  var bottom: int32 = mini(max_y >> 8, view->height - 1);
+  if (left > right || top > bottom) { return; }
+  slot->x0 = ax;
+  slot->y0 = ay;
+  slot->x1 = bx;
+  slot->y1 = by;
+  slot->x2 = cx;
+  slot->y2 = cy;
+  slot->z0 = az;
+  slot->z1 = bz;
+  slot->z2 = cz;
+  slot->inv_area = 1.0 / (float32)area;
+  slot->left = left;
+  slot->top = top;
+  slot->right = right;
+  slot->bottom = bottom;
+  slot->bias = top_left(bx, by, cx, cy) | (top_left(cx, cy, ax, ay) << 1) | (top_left(ax, ay, bx, by) << 2);
+  slot->source = source;
+}
+
+kernel(block = 64) setup(scene: float32*, materials: int32*, count: int32, view: View, slots: Slot*) {
+  var tri: int32 = block.x * block_dim.x + thread.x;
+  if (tri >= count) { return; }
+  var base: int32 = tri * SLOTS_PER_TRIANGLE;
+  for k in 0..SLOTS_PER_TRIANGLE {
+    slots[base + k].source = NO_TRIANGLE;
+  }
+  if (((view.materials >> materials[tri]) & 1) == 0) { return; }
+
+  var ax: float32[9];
+  var ay: float32[9];
+  var az: float32[9];
+  var aw: float32[9];
+  var bx: float32[9];
+  var by: float32[9];
+  var bz: float32[9];
+  var bw: float32[9];
+  for v in 0..3 {
+    var px: float32 = scene[tri * 9 + v * 3];
+    var py: float32 = scene[tri * 9 + v * 3 + 1];
+    var pz: float32 = scene[tri * 9 + v * 3 + 2];
+    ax[v] = view.m[0] * px + view.m[1] * py + view.m[2] * pz + view.m[3];
+    ay[v] = view.m[4] * px + view.m[5] * py + view.m[6] * pz + view.m[7];
+    az[v] = view.m[8] * px + view.m[9] * py + view.m[10] * pz + view.m[11];
+    aw[v] = view.m[12] * px + view.m[13] * py + view.m[14] * pz + view.m[15];
+  }
+
+  var n: int32 = 3;
+  for plane in 0..5 {
+    if (n < 3) { break; }
+    var m: int32 = 0;
+    for i in 0..n {
+      var j: int32 = i + 1;
+      if (j == n) { j = 0; }
+      var di: float32 = clip_distance(plane, ax[i], ay[i], aw[i], &view);
+      var dj: float32 = clip_distance(plane, ax[j], ay[j], aw[j], &view);
+      if (di >= 0.0) {
+        bx[m] = ax[i];
+        by[m] = ay[i];
+        bz[m] = az[i];
+        bw[m] = aw[i];
+        m = m + 1;
+      }
+      if ((di >= 0.0) != (dj >= 0.0)) {
+        var inside: int32 = i;
+        var outside: int32 = j;
+        var din: float32 = di;
+        var dout: float32 = dj;
+        if (dj >= 0.0) {
+          inside = j;
+          outside = i;
+          din = dj;
+          dout = di;
+        }
+        var t: float32 = din / (din - dout);
+        bx[m] = ax[inside] + (ax[outside] - ax[inside]) * t;
+        by[m] = ay[inside] + (ay[outside] - ay[inside]) * t;
+        bz[m] = az[inside] + (az[outside] - az[inside]) * t;
+        bw[m] = aw[inside] + (aw[outside] - aw[inside]) * t;
+        m = m + 1;
+      }
+    }
+    for i in 0..m {
+      ax[i] = bx[i];
+      ay[i] = by[i];
+      az[i] = bz[i];
+      aw[i] = bw[i];
+    }
+    n = m;
+  }
+  if (n < 3) { return; }
+
+  var sx: int32[9];
+  var sy: int32[9];
+  var sz: float32[9];
+  var fw: float32 = (float32)view.width;
+  var fh: float32 = (float32)view.height;
+  for i in 0..n {
+    var iw: float32 = 1.0 / aw[i];
+    sx[i] = snap((ax[i] * iw * 0.5 + 0.5) * fw);
+    sy[i] = snap((0.5 - ay[i] * iw * 0.5) * fh);
+    sz[i] = az[i] * iw;
+  }
+  for k in 1..(n - 1) {
+    emit_slot(&slots[base + k - 1], &view, tri,
+              sx[0], sy[0], sz[0], sx[k], sy[k], sz[k], sx[k + 1], sy[k + 1], sz[k + 1]);
+  }
+}
+
+@inline fn sample_offset_x(samples: int32, s: int32) -> int32 {
+  if (samples == 1) { return 128; }
+  if (s == 0) { return 96; }
+  if (s == 1) { return 224; }
+  if (s == 2) { return 32; }
+  return 160;
+}
+
+@inline fn sample_offset_y(samples: int32, s: int32) -> int32 {
+  if (samples == 1) { return 128; }
+  if (s == 0) { return 32; }
+  if (s == 1) { return 96; }
+  if (s == 2) { return 160; }
+  return 224;
+}
+
+@inline fn edge(ax: int32, ay: int32, bx: int32, by: int32, px: int64, py: int64) -> int64 {
+  return (int64)(bx - ax) * (py - (int64)ay) - (int64)(by - ay) * (px - (int64)ax);
+}
+
+fn coverage_depth(slot: Slot*, px: int64, py: int64) -> float32 {
+  var bias: int32 = slot->bias;
+  var e0: int64 = edge(slot->x1, slot->y1, slot->x2, slot->y2, px, py);
+  if (e0 + (int64)(bias & 1) - 1 < 0) { return -1.0; }
+  var e1: int64 = edge(slot->x2, slot->y2, slot->x0, slot->y0, px, py);
+  if (e1 + (int64)((bias >> 1) & 1) - 1 < 0) { return -1.0; }
+  var e2: int64 = edge(slot->x0, slot->y0, slot->x1, slot->y1, px, py);
+  if (e2 + (int64)((bias >> 2) & 1) - 1 < 0) { return -1.0; }
+  var l0: float32 = (float32)e0 * slot->inv_area;
+  var l1: float32 = (float32)e1 * slot->inv_area;
+  var l2: float32 = (float32)e2 * slot->inv_area;
+  return slot->z0 * l0 + slot->z1 * l1 + slot->z2 * l2;
+}
+
+kernel(block = 256) raster(slots: Slot*, slot_count: int32, width: int32, height: int32,
+                           samples: int32, depth: float32*, ids: int32*) {
+  workgroup var hit: int32[256];
+  var lane: int32 = thread.x;
+  var tile_left: int32 = block.x * TILE;
+  var tile_top: int32 = block.y * TILE;
+  var x: int32 = tile_left + (lane & 15);
+  var y: int32 = tile_top + (lane >> 4);
+  var d0: float32 = 0.0;
+  var d1: float32 = 0.0;
+  var d2: float32 = 0.0;
+  var d3: float32 = 0.0;
+  var i0: int32 = NO_TRIANGLE;
+  var i1: int32 = NO_TRIANGLE;
+  var i2: int32 = NO_TRIANGLE;
+  var i3: int32 = NO_TRIANGLE;
+  var fx: int64 = (int64)x * 256;
+  var fy: int64 = (int64)y * 256;
+
+  var base: int32 = 0;
+  while (base < slot_count) {
+    var s: int32 = base + lane;
+    var keep: int32 = 0;
+    if (s < slot_count) {
+      if (slots[s].source != NO_TRIANGLE) {
+        if (slots[s].left < tile_left + TILE && slots[s].right >= tile_left) {
+          if (slots[s].top < tile_top + TILE && slots[s].bottom >= tile_top) { keep = 1; }
+        }
+      }
+    }
+    hit[lane] = keep;
+    barrier();
+    var span: int32 = mini(BIN, slot_count - base);
+    for k in 0..span {
+      if (hit[k] != 0) {
+        var slot: Slot* = &slots[base + k];
+        if (x >= slot->left && x <= slot->right && y >= slot->top && y <= slot->bottom) {
+          var source: int32 = slot->source;
+          var z: float32 = coverage_depth(slot, fx + (int64)sample_offset_x(samples, 0), fy + (int64)sample_offset_y(samples, 0));
+          if (z > d0) { d0 = z; i0 = source; }
+          if (samples > 1) {
+            z = coverage_depth(slot, fx + (int64)sample_offset_x(samples, 1), fy + (int64)sample_offset_y(samples, 1));
+            if (z > d1) { d1 = z; i1 = source; }
+            z = coverage_depth(slot, fx + (int64)sample_offset_x(samples, 2), fy + (int64)sample_offset_y(samples, 2));
+            if (z > d2) { d2 = z; i2 = source; }
+            z = coverage_depth(slot, fx + (int64)sample_offset_x(samples, 3), fy + (int64)sample_offset_y(samples, 3));
+            if (z > d3) { d3 = z; i3 = source; }
+          }
+        }
+      }
+    }
+    barrier();
+    base = base + BIN;
+  }
+
+  if (x < width && y < height) {
+    var pixel: int32 = y * width + x;
+    if (samples == 1) {
+      depth[pixel] = d0;
+    } else {
+      ids[pixel * 4] = i0;
+      ids[pixel * 4 + 1] = i1;
+      ids[pixel * 4 + 2] = i2;
+      ids[pixel * 4 + 3] = i3;
+    }
+  }
+}
+
+fn moon_color() -> Vec3 { return v3(0.50, 0.62, 0.86); }
+fn glow_color() -> Vec3 { return v3(0.105, 0.046, 0.014); }
+fn zenith_color() -> Vec3 { return v3(0.0016, 0.0024, 0.0050); }
+
+fn haze(frame: Frame*, dir: Vec3) -> Vec3 {
+  var flat_len: float32 = sqrtf(dir.x * dir.x + dir.z * dir.z) + 0.0001;
+  var toward: float32 = maxf((dir.x * frame->glow.x + dir.z * frame->glow.z) / flat_len, 0.0);
+  var glow_shape: float32 = 0.18 + 0.82 * toward * toward * toward;
+  var c: float32 = maxf(dot(dir, frame->moon), 0.0);
+  var mie: float32 = 0.05 * powf(c, 6.0) + 0.06 * powf(c, 60.0);
+  var base: Vec3 = v3(0.0038, 0.0044, 0.0060);
+  return add(add(base, scale(glow_color(), glow_shape)), scale(moon_color(), mie));
+}
+
+fn fog_amount(eye: Vec3, dir: Vec3, t: float32) -> float32 {
+  var density: float32 = 0.0045;
+  var falloff: float32 = 0.11;
+  var start: float32 = density * expf(0.0 - falloff * eye.y);
+  var k: float32 = falloff * dir.y;
+  var optical: float32 = start * t;
+  if (fabsf(k) > 0.00001) {
+    if (t > 1000000.0) {
+      if (k > 0.0) { optical = start / k; } else { return 1.0; }
+    } else {
+      optical = start * (1.0 - expf(0.0 - k * t)) / k;
+    }
+  }
+  return 1.0 - expf(0.0 - optical);
+}
+
+fn sky(frame: Frame*, dir: Vec3, with_moon: int32) -> Vec3 {
+  var up: float32 = maxf(dir.y, 0.0);
+  var horizon: Vec3 = haze(frame, dir);
+  var col: Vec3 = mixv(horizon, zenith_color(), clamp01(powf(up, 0.45)));
+  if (with_moon != 0) {
+    var c: float32 = dot(dir, frame->moon);
+    var radius: float32 = 0.0065;
+    var angle: float32 = sqrtf(maxf(2.0 - 2.0 * c, 0.0));
+    var edge_width: float32 = frame->pixel_angle * 1.2;
+    var disk: float32 = 1.0 - smooth_step(radius - edge_width, radius + edge_width, angle);
+    if (disk > 0.0) {
+      var mottle: float32 = 0.82 + 0.18 * noise3(dir.x * 900.0, dir.y * 900.0, dir.z * 900.0);
+      col = add(col, scale(v3(1.6, 1.7, 1.85), disk * mottle * 6.0));
+    }
+  }
+  return col;
+}
+
+fn env_brdf(f0: float32, rough: float32, ndv: float32) -> float32 {
+  var rx: float32 = rough * -1.0 + 1.0;
+  var ry: float32 = rough * -0.0275 + 0.0425;
+  var rz: float32 = rough * -0.572 + 1.04;
+  var rw: float32 = rough * 0.022 - 0.04;
+  var a004: float32 = minf(rx * rx, expf(-9.28 * ndv * 0.693147)) * rx + ry;
+  var ab_x: float32 = a004 * -1.04 + rz;
+  var ab_y: float32 = a004 * 1.04 + rw;
+  return f0 * ab_x + ab_y;
+}
+
+fn ggx(n: Vec3, v: Vec3, l: Vec3, rough: float32, f0: float32) -> float32 {
+  var h: Vec3 = normalize(add(v, l));
+  var ndl: float32 = maxf(dot(n, l), 0.0);
+  var ndv: float32 = maxf(dot(n, v), 0.0001);
+  var ndh: float32 = maxf(dot(n, h), 0.0);
+  var vdh: float32 = maxf(dot(v, h), 0.0);
+  var a: float32 = maxf(rough * rough, 0.002);
+  var a2: float32 = a * a;
+  var dd: float32 = ndh * ndh * (a2 - 1.0) + 1.0;
+  var d: float32 = a2 / (PI_F * dd * dd);
+  var k: float32 = a * 0.5;
+  var g: float32 = (ndl / (ndl * (1.0 - k) + k)) * (ndv / (ndv * (1.0 - k) + k));
+  var fc: float32 = powf(1.0 - vdh, 5.0);
+  var f: float32 = f0 + (1.0 - f0) * fc;
+  return d * g * f / (4.0 * ndv + 0.0001);
+}
+
+fn shadow_tap(map: float32*, size: int32, u: float32, v: float32, z: float32) -> float32 {
+  var x: float32 = u - 0.5;
+  var y: float32 = v - 0.5;
+  var fx: float32 = floorf(x);
+  var fy: float32 = floorf(y);
+  var tx: float32 = x - fx;
+  var ty: float32 = y - fy;
+  var ix: int32 = (int32)clampf(fx, 0.0, (float32)(size - 2));
+  var iy: int32 = (int32)clampf(fy, 0.0, (float32)(size - 2));
+  var row: int32 = iy * size + ix;
+  var a: float32 = 1.0;
+  var b: float32 = 1.0;
+  var c: float32 = 1.0;
+  var d: float32 = 1.0;
+  if (map[row] > z) { a = 0.0; }
+  if (map[row + 1] > z) { b = 0.0; }
+  if (map[row + size] > z) { c = 0.0; }
+  if (map[row + size + 1] > z) { d = 0.0; }
+  return mixf(mixf(a, b, tx), mixf(c, d, tx), ty);
+}
+
+fn moon_shadow(frame: Frame*, map: float32*, p: Vec3) -> float32 {
+  var size: int32 = frame->shadow_size;
+  var lx: float32 = frame->light[0] * p.x + frame->light[1] * p.y + frame->light[2] * p.z + frame->light[3];
+  var ly: float32 = frame->light[4] * p.x + frame->light[5] * p.y + frame->light[6] * p.z + frame->light[7];
+  var lz: float32 = frame->light[8] * p.x + frame->light[9] * p.y + frame->light[10] * p.z + frame->light[11];
+  var fs: float32 = (float32)size;
+  var u: float32 = (lx * 0.5 + 0.5) * fs;
+  var v: float32 = (0.5 - ly * 0.5) * fs;
+  var margin: float32 = 40.0;
+  if (u < margin || v < margin || u > fs - margin || v > fs - margin) { return 1.0; }
+  var z: float32 = lz + 0.006 / frame->shadow_depth_range;
+
+  var search: float32 = frame->moon_tan * 3.0 / frame->shadow_texel + 1.0;
+  var blockers: float32 = 0.0;
+  var blocker_depth: float32 = 0.0;
+  for i in 0..16 {
+    var r: float32 = sqrtf(((float32)i + 0.5) / 16.0) * search;
+    var a: float32 = (float32)i * 2.3999632;
+    var sx: int32 = (int32)(u + cosf(a) * r);
+    var sy: int32 = (int32)(v + sinf(a) * r);
+    var d: float32 = map[sy * size + sx];
+    if (d > z) {
+      blockers = blockers + 1.0;
+      blocker_depth = blocker_depth + d;
+    }
+  }
+  if (blockers == 0.0) { return 1.0; }
+  blocker_depth = blocker_depth / blockers;
+  var gap: float32 = (blocker_depth - z) * frame->shadow_depth_range;
+  var radius: float32 = maxf(gap * frame->moon_tan / frame->shadow_texel, 0.8);
+  radius = minf(radius, margin - 2.0);
+
+  var lit: float32 = 0.0;
+  for i in 0..32 {
+    var r: float32 = sqrtf(((float32)i + 0.5) / 32.0) * radius;
+    var a: float32 = (float32)i * 2.3999632 + 0.7;
+    lit = lit + shadow_tap(map, size, u + cosf(a) * r, v + sinf(a) * r, z);
+  }
+  return lit / 32.0;
+}
+
+fn face_form_factor(p: Vec3, n: Vec3, a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> float32 {
+  var ra: Vec3 = normalize(sub(a, p));
+  var rb: Vec3 = normalize(sub(b, p));
+  var rc: Vec3 = normalize(sub(c, p));
+  var rd: Vec3 = normalize(sub(d, p));
+  var sum: float32 = 0.0;
+  sum = sum + acosf(clampf(dot(ra, rb), -1.0, 1.0)) * dot(normalize(cross(ra, rb)), n);
+  sum = sum + acosf(clampf(dot(rb, rc), -1.0, 1.0)) * dot(normalize(cross(rb, rc)), n);
+  sum = sum + acosf(clampf(dot(rc, rd), -1.0, 1.0)) * dot(normalize(cross(rc, rd)), n);
+  sum = sum + acosf(clampf(dot(rd, ra), -1.0, 1.0)) * dot(normalize(cross(rd, ra)), n);
+  return fabsf(sum) / (2.0 * PI_F);
+}
+
+fn box_sky_occlusion(frame: Frame*, p: Vec3, n: Vec3) -> float32 {
+  var lo: Vec3 = frame->box_min;
+  var hi: Vec3 = frame->box_max;
+  var occluded: float32 = 0.0;
+  if (p.x > hi.x) {
+    occluded = occluded + face_form_factor(p, n, v3(hi.x, lo.y, lo.z), v3(hi.x, hi.y, lo.z), v3(hi.x, hi.y, hi.z), v3(hi.x, lo.y, hi.z));
+  }
+  if (p.x < lo.x) {
+    occluded = occluded + face_form_factor(p, n, v3(lo.x, lo.y, lo.z), v3(lo.x, lo.y, hi.z), v3(lo.x, hi.y, hi.z), v3(lo.x, hi.y, lo.z));
+  }
+  if (p.z > hi.z) {
+    occluded = occluded + face_form_factor(p, n, v3(lo.x, lo.y, hi.z), v3(hi.x, lo.y, hi.z), v3(hi.x, hi.y, hi.z), v3(lo.x, hi.y, hi.z));
+  }
+  if (p.z < lo.z) {
+    occluded = occluded + face_form_factor(p, n, v3(lo.x, lo.y, lo.z), v3(lo.x, hi.y, lo.z), v3(hi.x, hi.y, lo.z), v3(hi.x, lo.y, lo.z));
+  }
+  if (p.y > hi.y) {
+    occluded = occluded + face_form_factor(p, n, v3(lo.x, hi.y, lo.z), v3(lo.x, hi.y, hi.z), v3(hi.x, hi.y, hi.z), v3(hi.x, hi.y, lo.z));
+  }
+  return clamp01(1.0 - occluded);
+}
+
+fn hits_box(frame: Frame*, o: Vec3, d: Vec3) -> int32 {
+  var t0: float32 = 0.0;
+  var t1: float32 = 1000000.0;
+  var inv: float32 = 1.0 / d.x;
+  var a: float32 = (frame->box_min.x - o.x) * inv;
+  var b: float32 = (frame->box_max.x - o.x) * inv;
+  t0 = maxf(t0, minf(a, b));
+  t1 = minf(t1, maxf(a, b));
+  inv = 1.0 / d.y;
+  a = (frame->box_min.y - o.y) * inv;
+  b = (frame->box_max.y - o.y) * inv;
+  t0 = maxf(t0, minf(a, b));
+  t1 = minf(t1, maxf(a, b));
+  inv = 1.0 / d.z;
+  a = (frame->box_min.z - o.z) * inv;
+  b = (frame->box_max.z - o.z) * inv;
+  t0 = maxf(t0, minf(a, b));
+  t1 = minf(t1, maxf(a, b));
+  if (t1 > t0) { return 1; }
+  return 0;
+}
+
+fn ambient(frame: Frame*, n: Vec3) -> Vec3 {
+  var skyward: float32 = n.y * 0.5 + 0.5;
+  var sky_irr: Vec3 = mixv(v3(0.0016, 0.0017, 0.0019), v3(0.0105, 0.0125, 0.0180), skyward);
+  var toward: float32 = maxf(n.x * frame->glow.x + n.z * frame->glow.z, 0.0) * 0.75 + 0.25 * (1.0 - fabsf(n.y));
+  return add(sky_irr, scale(glow_color(), toward * 0.55));
+}
+
+fn shade_ground(frame: Frame*, map: float32*, p: Vec3, view_dir: Vec3, t: float32) -> Vec3 {
+  var n: Vec3 = v3(0.0, 1.0, 0.0);
+  var v: Vec3 = scale(view_dir, -1.0);
+  var ndv: float32 = maxf(v.y, 0.02);
+  var footprint: float32 = t * frame->pixel_angle / maxf(ndv, 0.08);
+
+  var q: Vec3 = v3(p.x, 0.0, p.z);
+  var large: float32 = fbm(q, 0.09, 3, footprint);
+  var mid: float32 = fbm(q, 0.8, 3, footprint);
+  var grain: float32 = fbm(q, 9.0, 3, footprint);
+  var albedo: float32 = 0.085 * (0.62 + 0.75 * large) * (0.8 + 0.4 * mid) * (0.82 + 0.36 * grain);
+  var wet: float32 = smooth_step(0.56, 0.66, large + (mid - 0.5) * 0.25);
+  albedo = albedo * mixf(1.0, 0.55, wet);
+  var rough: float32 = mixf(0.82 + 0.1 * grain, 0.08, wet);
+  var f0: float32 = mixf(0.04, 0.02, wet);
+
+  var occlusion: float32 = box_sky_occlusion(frame, p, n);
+  var l: Vec3 = frame->moon;
+  var ndl: float32 = maxf(l.y, 0.0);
+  var shadow: float32 = 1.0;
+  if (ndl > 0.0) { shadow = moon_shadow(frame, map, add(p, v3(0.0, 0.002, 0.0))); }
+
+  var direct: float32 = ndl * shadow;
+  var diffuse: Vec3 = scale(moon_color(), direct * albedo / PI_F * (1.0 - f0));
+  var spec: Vec3 = scale(moon_color(), direct * ggx(n, v, l, rough, f0));
+  var amb: Vec3 = scale(ambient(frame, n), albedo * occlusion);
+
+  var r: Vec3 = v3(view_dir.x, 0.0 - view_dir.y, view_dir.z);
+  var env: Vec3 = sky(frame, r, 0);
+  if (hits_box(frame, p, r) != 0) {
+    env = v3(0.0012, 0.0011, 0.0010);
+  }
+  var blurred: Vec3 = mixv(env, ambient(frame, v3(0.0, 1.0, 0.0)), clamp01(rough * 1.3));
+  var reflection: Vec3 = scale(blurred, env_brdf(f0, rough, ndv) * mixf(occlusion, 1.0, 0.5));
+  return add(add(diffuse, spec), add(amb, reflection));
+}
+
+fn shade_steel(frame: Frame*, map: float32*, p: Vec3, n: Vec3, view_dir: Vec3, t: float32) -> Vec3 {
+  var v: Vec3 = scale(view_dir, -1.0);
+  var ndv: float32 = maxf(dot(n, v), 0.02);
+  var footprint: float32 = t * frame->pixel_angle / maxf(ndv, 0.08);
+  var center: Vec3 = scale(add(frame->box_min, frame->box_max), 0.5);
+  var half: Vec3 = scale(sub(frame->box_max, frame->box_min), 0.5);
+  var q: Vec3 = sub(p, center);
+
+  var u: float32 = q.x;
+  var w: float32 = q.y;
+  var hu: float32 = half.x;
+  var hw: float32 = half.y;
+  if (fabsf(n.x) > 0.5) { u = q.z; hu = half.z; }
+  if (fabsf(n.y) > 0.5) { w = q.z; hw = half.z; }
+  var edge_dist: float32 = minf(hu - fabsf(u), hw - fabsf(w));
+
+  var oxide_noise: float32 = fbm(q, 1.6, 4, footprint);
+  var streak: float32 = 0.5;
+  if (fabsf(n.y) < 0.5) {
+    streak = fbm(v3(u * 9.0, q.y * 0.35, n.x * 3.0 + n.z * 7.0), 1.0, 3, footprint * 9.0);
+  }
+  var pits: float32 = fbm(q, 14.0, 2, footprint);
+  var oxide: float32 = smooth_step(0.46, 0.62, oxide_noise + (streak - 0.5) * 0.45);
+  var wear_noise: float32 = fbm(q, 22.0, 2, footprint);
+  var wear: float32 = 1.0 - smooth_step(0.004, 0.03 + 0.03 * wear_noise, edge_dist);
+  wear = wear * (1.0 - oxide * 0.6);
+
+  var f0: float32 = mixf(0.36, 0.04, oxide);
+  f0 = mixf(f0, 0.62, wear);
+  var rough: float32 = mixf(0.34 + 0.12 * pits, 0.78, oxide);
+  rough = mixf(rough, 0.2, wear);
+  rough = clampf(rough + (streak - 0.5) * 0.18, 0.08, 0.95);
+  var albedo: Vec3 = scale(v3(0.050, 0.038, 0.030), oxide * (0.7 + 0.6 * pits));
+  var metal_tint: Vec3 = v3(0.96, 0.98, 1.0);
+
+  var l: Vec3 = frame->moon;
+  var ndl: float32 = maxf(dot(n, l), 0.0);
+  var shadow: float32 = 1.0;
+  if (ndl > 0.0) { shadow = moon_shadow(frame, map, add(p, scale(n, 0.003))); }
+  var direct: float32 = ndl * shadow;
+  var spec: Vec3 = scale(mul(moon_color(), metal_tint), direct * ggx(n, v, l, rough, f0));
+  var diffuse: Vec3 = scale(mul(moon_color(), albedo), direct / PI_F);
+
+  var r: Vec3 = sub(view_dir, scale(n, 2.0 * dot(view_dir, n)));
+  var env: Vec3 = sky(frame, r, 0);
+  if (r.y < 0.0) {
+    var ground_seen: Vec3 = add(scale(ambient(frame, v3(0.0, 1.0, 0.0)), 0.06), scale(moon_color(), 0.06 * frame->moon.y / PI_F));
+    env = mixv(ground_seen, haze(frame, r), clamp01(1.0 + r.y * 6.0));
+  }
+  var blurred: Vec3 = mixv(env, ambient(frame, n), clamp01(rough * 1.1));
+  var reflection: Vec3 = scale(mul(blurred, metal_tint), env_brdf(f0, rough, ndv));
+  var amb: Vec3 = mul(ambient(frame, n), albedo);
+  return add(add(spec, diffuse), add(reflection, amb));
+}
+
+fn shade_sample(frame: Frame*, scene: float32*, materials: int32*, map: float32*,
+                id: int32, fx: float32, fy: float32) -> Vec3 {
+  var ndc_x: float32 = fx / (float32)frame->width * 2.0 - 1.0;
+  var ndc_y: float32 = 1.0 - fy / (float32)frame->height * 2.0;
+  var dir: Vec3 = normalize(add(frame->forward, add(scale(frame->right, ndc_x), scale(frame->up, ndc_y))));
+  if (id < 0) {
+    var s: Vec3 = sky(frame, dir, 1);
+    return mixv(s, haze(frame, dir), fog_amount(frame->eye, dir, 10000000.0));
+  }
+  var a: Vec3 = v3(scene[id * 9], scene[id * 9 + 1], scene[id * 9 + 2]);
+  var b: Vec3 = v3(scene[id * 9 + 3], scene[id * 9 + 4], scene[id * 9 + 5]);
+  var c: Vec3 = v3(scene[id * 9 + 6], scene[id * 9 + 7], scene[id * 9 + 8]);
+  var n: Vec3 = normalize(cross(sub(b, a), sub(c, a)));
+  var t: float32 = dot(sub(a, frame->eye), n) / dot(dir, n);
+  var p: Vec3 = add(frame->eye, scale(dir, t));
+  var col: Vec3 = v3(0.0, 0.0, 0.0);
+  if (materials[id] == MAT_GROUND) {
+    col = shade_ground(frame, map, p, dir, t);
+  } else {
+    col = shade_steel(frame, map, p, n, dir, t);
+  }
+  return mixv(col, haze(frame, dir), fog_amount(frame->eye, dir, t));
+}
+
+@inline fn tonemap(x: float32) -> float32 {
+  return clamp01(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14));
+}
+
+@inline fn encode_srgb(x: float32) -> float32 {
+  if (x <= 0.0031308) { return x * 12.92; }
+  return 1.055 * powf(x, 0.41666667) - 0.055;
+}
+
+@inline fn quantize(x: float32, dither: float32) -> uint32 {
+  var v: float32 = clampf(encode_srgb(x) * 255.0 + dither, 0.0, 255.0);
+  return (uint32)(int32)(v + 0.5);
+}
+
+kernel(block = 256) shade(frame: Frame, scene: float32*, materials: int32*, ids: int32*,
+                          map: float32*, pixels: uint32*) {
+  var pixel: int32 = block.x * block_dim.x + thread.x;
+  if (pixel >= frame.width * frame.height) { return; }
+  var x: int32 = pixel % frame.width;
+  var y: int32 = pixel / frame.width;
+  var id: int32[4];
+  for s in 0..SAMPLES {
+    id[s] = ids[pixel * 4 + s];
+  }
+
+  var r: float32 = 0.0;
+  var g: float32 = 0.0;
+  var b: float32 = 0.0;
+  for s in 0..SAMPLES {
+    var seen: int32 = 0;
+    for k in 0..s {
+      if (id[k] == id[s]) { seen = 1; }
+    }
+    if (seen == 0) {
+      var count: float32 = 0.0;
+      var cx: float32 = 0.0;
+      var cy: float32 = 0.0;
+      for k in s..SAMPLES {
+        if (id[k] == id[s]) {
+          count = count + 1.0;
+          cx = cx + (float32)sample_offset_x(SAMPLES, k);
+          cy = cy + (float32)sample_offset_y(SAMPLES, k);
+        }
+      }
+      var fx: float32 = (float32)x + cx / (count * 256.0);
+      var fy: float32 = (float32)y + cy / (count * 256.0);
+      var col: Vec3 = shade_sample(&frame, scene, materials, map, id[s], fx, fy);
+      var weight: float32 = count / (float32)SAMPLES;
+      r = r + tonemap(col.x * frame.exposure) * weight;
+      g = g + tonemap(col.y * frame.exposure) * weight;
+      b = b + tonemap(col.z * frame.exposure) * weight;
+    }
+  }
+
+  var h0: float32 = hash3(x, y, frame.frame_index);
+  var h1: float32 = hash3(y + 7919, x, frame.frame_index + 31);
+  var dither: float32 = h0 + h1 - 1.0;
+  pixels[pixel] = (quantize(r, dither) << 16) | (quantize(g, dither) << 8) | quantize(b, dither);
+}

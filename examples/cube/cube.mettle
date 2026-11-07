@@ -1,0 +1,600 @@
+import "std/io";
+import "std/mem";
+import "std/math";
+import "std/ui";
+import "std/win32";
+import "std/gpu";
+import "raster";
+
+struct BitmapInfoHeader {
+  size: uint32;
+  width: int32;
+  height: int32;
+  planes: uint16;
+  bit_count: uint16;
+  compression: uint32;
+  size_image: uint32;
+  x_pels_per_meter: int32;
+  y_pels_per_meter: int32;
+  clr_used: uint32;
+  clr_important: uint32;
+}
+
+extern fn Gdi_StretchDIBits(hdc: int64, xdst: int32, ydst: int32, wdst: int32, hdst: int32,
+                            xsrc: int32, ysrc: int32, wsrc: int32, hsrc: int32,
+                            bits: rawptr, info: rawptr, usage: uint32, rop: uint32) -> int32 = "StretchDIBits";
+extern fn Win_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn Win_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn Win_AdjustWindowRect(rect: UiRect*, style: uint32, menu: int32) -> int32 = "AdjustWindowRect";
+extern fn Win_GetAsyncKeyState(key: int32) -> int32 = "GetAsyncKeyState";
+extern fn Win_GetForegroundWindow() -> int64 = "GetForegroundWindow";
+extern fn Win_GetCursorPos(point: UiPoint*) -> int32 = "GetCursorPos";
+extern fn Win_SetCursorPos(x: int32, y: int32) -> int32 = "SetCursorPos";
+extern fn Win_ClientToScreen(hwnd: int64, point: UiPoint*) -> int32 = "ClientToScreen";
+extern fn Win_ShowCursor(show: int32) -> int32 = "ShowCursor";
+extern fn Win_SetCapture(hwnd: int64) -> int64 = "SetCapture";
+extern fn Win_ReleaseCapture() -> int32 = "ReleaseCapture";
+
+const SHADOW_SIZE: int32 = 2048;
+const GROUND_HALF: float64 = 2000.0;
+const FOV_Y: float64 = 1.0;
+const LOOK_SPEED: float64 = 0.0022;
+const MOVE_SPEED: float64 = 5.0;
+const FAST_SPEED: float64 = 18.0;
+const MODE_NONE: int32 = 0;
+const MODE_LOOK: int32 = 1;
+const MODE_ORBIT: int32 = 2;
+const WM_CAPTURECHANGED: uint32 = 533;
+
+var g_window: int64 = 0;
+var g_running: int32 = 1;
+var g_width: int32 = 0;
+var g_height: int32 = 0;
+var g_resized: int32 = 1;
+var g_qpc_frequency: int64 = 1;
+
+var g_scene: float32* = 0;
+var g_materials: int32* = 0;
+var g_triangles: int32 = 0;
+var d_scene: int64 = 0;
+var d_material_buffer: int64 = 0;
+var d_slots: int64 = 0;
+var d_shadow: int64 = 0;
+var d_ids: int64 = 0;
+var d_pixels: int64 = 0;
+var g_pixels: uint8* = 0;
+var g_buffer_width: int32 = 0;
+var g_buffer_height: int32 = 0;
+
+var g_eye_x: float64 = 6.2;
+var g_eye_y: float64 = 1.45;
+var g_eye_z: float64 = 7.4;
+var g_vel_x: float64 = 0.0;
+var g_vel_y: float64 = 0.0;
+var g_vel_z: float64 = 0.0;
+var g_yaw: float64 = 0.0;
+var g_pitch: float64 = 0.0;
+var g_yaw_target: float64 = 0.0;
+var g_pitch_target: float64 = 0.0;
+var g_mode: int32 = 0;
+var g_orbit_radius: float64 = 9.0;
+var g_orbit_target: float64 = 9.0;
+var g_orbit_yaw: float64 = 0.0;
+var g_orbit_pitch: float64 = 0.0;
+var g_orbit_yaw_target: float64 = 0.0;
+var g_orbit_pitch_target: float64 = 0.0;
+var g_wheel: int32 = 0;
+var g_restore: UiPoint;
+
+var g_moon_x: float64 = 0.0;
+var g_moon_y: float64 = 0.0;
+var g_moon_z: float64 = 0.0;
+var g_light: float32[16];
+
+fn now_seconds() -> float64 {
+  var counter: int64 = 0;
+  Win_QueryPerformanceCounter(&counter);
+  return (float64)counter / (float64)g_qpc_frequency;
+}
+
+fn push_triangle(index: int32, ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64,
+                 cx: float64, cy: float64, cz: float64, material: int32) {
+  var base: int32 = index * 9;
+  g_scene[base] = (float32)ax;
+  g_scene[base + 1] = (float32)ay;
+  g_scene[base + 2] = (float32)az;
+  g_scene[base + 3] = (float32)bx;
+  g_scene[base + 4] = (float32)by;
+  g_scene[base + 5] = (float32)bz;
+  g_scene[base + 6] = (float32)cx;
+  g_scene[base + 7] = (float32)cy;
+  g_scene[base + 8] = (float32)cz;
+  g_materials[index] = material;
+}
+
+fn push_quad(ax: float64, ay: float64, az: float64, bx: float64, by: float64, bz: float64,
+             cx: float64, cy: float64, cz: float64, dx: float64, dy: float64, dz: float64, material: int32) {
+  push_triangle(g_triangles, ax, ay, az, bx, by, bz, cx, cy, cz, material);
+  push_triangle(g_triangles + 1, ax, ay, az, cx, cy, cz, dx, dy, dz, material);
+  g_triangles = g_triangles + 2;
+}
+
+fn build_scene() {
+  g_scene = (float32*)malloc((int64)14 * 9 * 4);
+  g_materials = (int32*)malloc((int64)14 * 4);
+  push_quad(1.0, 0.0, 1.0, 1.0, 0.0, -1.0, 1.0, 2.0, -1.0, 1.0, 2.0, 1.0, MAT_STEEL);
+  push_quad(-1.0, 0.0, -1.0, -1.0, 0.0, 1.0, -1.0, 2.0, 1.0, -1.0, 2.0, -1.0, MAT_STEEL);
+  push_quad(-1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 2.0, 1.0, -1.0, 2.0, 1.0, MAT_STEEL);
+  push_quad(1.0, 0.0, -1.0, -1.0, 0.0, -1.0, -1.0, 2.0, -1.0, 1.0, 2.0, -1.0, MAT_STEEL);
+  push_quad(-1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 1.0, 2.0, -1.0, -1.0, 2.0, -1.0, MAT_STEEL);
+  push_quad(-1.0, 0.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0, -1.0, 0.0, 1.0, MAT_STEEL);
+  var g: float64 = GROUND_HALF;
+  push_quad(0.0 - g, 0.0, g, g, 0.0, g, g, 0.0, 0.0 - g, 0.0 - g, 0.0, 0.0 - g, MAT_GROUND);
+}
+
+fn set_row(m: float32*, row: int32, x: float64, y: float64, z: float64, w: float64) {
+  m[row * 4] = (float32)x;
+  m[row * 4 + 1] = (float32)y;
+  m[row * 4 + 2] = (float32)z;
+  m[row * 4 + 3] = (float32)w;
+}
+
+fn setup_moon() {
+  var elevation: float64 = 0.42;
+  var azimuth: float64 = -2.35;
+  g_moon_x = cos(elevation) * sin(azimuth);
+  g_moon_y = sin(elevation);
+  g_moon_z = 0.0 - cos(elevation) * cos(azimuth);
+
+  var fx: float64 = 0.0 - g_moon_x;
+  var fy: float64 = 0.0 - g_moon_y;
+  var fz: float64 = 0.0 - g_moon_z;
+  var rx: float64 = 0.0 - fz;
+  var rz: float64 = fx;
+  var rl: float64 = sqrt(rx * rx + rz * rz);
+  rx = rx / rl;
+  rz = rz / rl;
+  var ux: float64 = 0.0 - rz * fy;
+  var uy: float64 = rz * fx - rx * fz;
+  var uz: float64 = rx * fy;
+
+  var flat: float64 = sqrt(g_moon_x * g_moon_x + g_moon_z * g_moon_z);
+  var cx: float64 = 0.0 - g_moon_x / flat * 2.2;
+  var cy: float64 = 1.0;
+  var cz: float64 = 0.0 - g_moon_z / flat * 2.2;
+  var s: float64 = 5.6;
+  var depth: float64 = 20.0;
+  set_row(&g_light[0], 0, rx / s, 0.0, rz / s, 0.0 - (rx * cx + rz * cz) / s);
+  set_row(&g_light[0], 1, ux / s, uy / s, uz / s, 0.0 - (ux * cx + uy * cy + uz * cz) / s);
+  set_row(&g_light[0], 2, 0.0 - fx / depth, 0.0 - fy / depth, 0.0 - fz / depth, 0.5 + (fx * cx + fy * cy + fz * cz) / depth);
+  set_row(&g_light[0], 3, 0.0, 0.0, 0.0, 1.0);
+}
+
+fn render_shadow_map() {
+  var view: View;
+  for i in 0..16 { view.m[i] = g_light[i]; }
+  view.width = SHADOW_SIZE;
+  view.height = SHADOW_SIZE;
+  view.near = 0.0;
+  view.guard = 1.5;
+  view.facing = -1;
+  view.materials = 1 << MAT_STEEL;
+  view.samples = 1;
+  dispatch setup[work: g_triangles](d_scene, d_material_buffer, g_triangles, view, d_slots);
+  var tiles: int32 = SHADOW_SIZE / TILE;
+  dispatch raster[grid: (tiles, tiles, 1), block: (256, 1, 1)](d_slots, g_triangles * SLOTS_PER_TRIANGLE,
+                                                                SHADOW_SIZE, SHADOW_SIZE, 1, d_shadow, d_ids);
+}
+
+fn release_targets() {
+  if (d_ids != 0) { gpu_free(d_ids); d_ids = 0; }
+  if (d_pixels != 0) { gpu_free(d_pixels); d_pixels = 0; }
+  if (g_pixels != 0) { gpu_host_free(g_pixels); g_pixels = 0; }
+}
+
+fn ensure_targets() -> int32 {
+  if (g_width == g_buffer_width && g_height == g_buffer_height && d_pixels != 0) { return 1; }
+  gpu_sync();
+  release_targets();
+  var count: int64 = (int64)g_width * (int64)g_height;
+  d_ids = gpu_malloc(count * 16);
+  d_pixels = gpu_malloc(count * 4);
+  var mapped: int64 = 0;
+  g_pixels = gpu_host_mapped_malloc(count * 4, &mapped);
+  if (d_ids == 0 || d_pixels == 0 || g_pixels == 0) { return 0; }
+  g_buffer_width = g_width;
+  g_buffer_height = g_height;
+  return 1;
+}
+
+fn present(hdc: int64) {
+  if (g_pixels == 0) { return; }
+  var info: BitmapInfoHeader;
+  info.size = (uint32)40;
+  info.width = g_buffer_width;
+  info.height = 0 - g_buffer_height;
+  info.planes = (uint16)1;
+  info.bit_count = (uint16)32;
+  info.compression = (uint32)0;
+  info.size_image = (uint32)0;
+  info.x_pels_per_meter = 0;
+  info.y_pels_per_meter = 0;
+  info.clr_used = (uint32)0;
+  info.clr_important = (uint32)0;
+  Gdi_StretchDIBits(hdc, 0, 0, g_buffer_width, g_buffer_height, 0, 0, g_buffer_width, g_buffer_height,
+                    g_pixels, &info, (uint32)0, (uint32)0x00CC0020);
+}
+
+fn look_at(x: float64, y: float64, z: float64) {
+  var dx: float64 = x - g_eye_x;
+  var dy: float64 = y - g_eye_y;
+  var dz: float64 = z - g_eye_z;
+  var yaw: float64 = atan2(dx, 0.0 - dz);
+  while (yaw - g_yaw > 3.14159265358979) { yaw = yaw - 6.28318530717959; }
+  while (yaw - g_yaw < -3.14159265358979) { yaw = yaw + 6.28318530717959; }
+  g_yaw_target = yaw;
+  g_pitch_target = atan2(dy, sqrt(dx * dx + dz * dz));
+}
+
+fn client_center(point: UiPoint*) {
+  point->x = g_width / 2;
+  point->y = g_height / 2;
+  Win_ClientToScreen(g_window, point);
+}
+
+fn begin_drag(mode: int32) {
+  if (g_mode != MODE_NONE) { return; }
+  g_mode = mode;
+  Win_GetCursorPos(&g_restore);
+  Win_SetCapture(g_window);
+  Win_ShowCursor(0);
+  var center: UiPoint;
+  client_center(&center);
+  Win_SetCursorPos(center.x, center.y);
+  if (mode == MODE_ORBIT) {
+    var dx: float64 = g_eye_x;
+    var dy: float64 = g_eye_y - 1.0;
+    var dz: float64 = g_eye_z;
+    g_orbit_radius = sqrt(dx * dx + dy * dy + dz * dz);
+    g_orbit_target = g_orbit_radius;
+    g_orbit_yaw = atan2(dx, dz);
+    g_orbit_pitch = atan2(dy, sqrt(dx * dx + dz * dz));
+    g_orbit_yaw_target = g_orbit_yaw;
+    g_orbit_pitch_target = g_orbit_pitch;
+  }
+}
+
+fn end_drag() {
+  if (g_mode == MODE_NONE) { return; }
+  g_mode = MODE_NONE;
+  Win_ReleaseCapture();
+  Win_SetCursorPos(g_restore.x, g_restore.y);
+  Win_ShowCursor(1);
+}
+
+fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (msg == UI_WM_SIZE()) {
+    var w: int32 = (int32)(lparam & 0xFFFF);
+    var h: int32 = (int32)((lparam >> 16) & 0xFFFF);
+    if (w > 0 && h > 0) {
+      g_width = w;
+      g_height = h;
+      g_resized = 1;
+    }
+    return 0;
+  }
+  if (msg == UI_WM_ERASEBKGND()) { return 1; }
+  if (msg == UI_WM_PAINT()) {
+    var paint: UiPaintStruct;
+    var hdc: int64 = Ui_BeginPaint(hwnd, &paint);
+    present(hdc);
+    Ui_EndPaint(hwnd, &paint);
+    return 0;
+  }
+  if (msg == UI_WM_RBUTTONDOWN()) { begin_drag(MODE_LOOK); return 0; }
+  if (msg == UI_WM_LBUTTONDOWN()) { begin_drag(MODE_ORBIT); return 0; }
+  if (msg == UI_WM_RBUTTONUP() && g_mode == MODE_LOOK) { end_drag(); return 0; }
+  if (msg == UI_WM_LBUTTONUP() && g_mode == MODE_ORBIT) { end_drag(); return 0; }
+  if (msg == UI_WM_KILLFOCUS() || msg == WM_CAPTURECHANGED) {
+    end_drag();
+    return 0;
+  }
+  if (msg == UI_WM_MOUSEWHEEL()) {
+    var delta: int32 = (int32)((wparam >> 16) & 0xFFFF);
+    if (delta >= 32768) { delta = delta - 65536; }
+    g_wheel = g_wheel + delta;
+    return 0;
+  }
+  if (msg == UI_WM_KEYDOWN() && wparam == 27) {
+    Ui_DestroyWindow(hwnd);
+    return 0;
+  }
+  if (msg == UI_WM_DESTROY()) {
+    g_running = 0;
+    ui_quit(0);
+    return 0;
+  }
+  return ui_def_window_proc_auto(hwnd, msg, wparam, lparam);
+}
+
+fn key_down(key: int32) -> float64 {
+  if ((Win_GetAsyncKeyState(key) & 0x8000) != 0) { return 1.0; }
+  return 0.0;
+}
+
+fn approach(rate: float64, dt: float64) -> float64 {
+  return 1.0 - exp(0.0 - dt / rate);
+}
+
+fn push_out_of_cube() {
+  var margin: float64 = 0.18;
+  var lo: float64 = -1.0 - margin;
+  var hi: float64 = 1.0 + margin;
+  if (g_eye_x <= lo || g_eye_x >= hi || g_eye_z <= lo || g_eye_z >= hi || g_eye_y >= 2.0 + margin) { return; }
+  var px: float64 = hi - g_eye_x;
+  var nx: float64 = g_eye_x - lo;
+  var pz: float64 = hi - g_eye_z;
+  var nz: float64 = g_eye_z - lo;
+  var py: float64 = 2.0 + margin - g_eye_y;
+  var best: float64 = px;
+  if (nx < best) { best = nx; }
+  if (pz < best) { best = pz; }
+  if (nz < best) { best = nz; }
+  if (py < best) { best = py; }
+  if (best == px) { g_eye_x = hi; g_vel_x = 0.0; }
+  else if (best == nx) { g_eye_x = lo; g_vel_x = 0.0; }
+  else if (best == pz) { g_eye_z = hi; g_vel_z = 0.0; }
+  else if (best == nz) { g_eye_z = lo; g_vel_z = 0.0; }
+  else { g_eye_y = 2.0 + margin; g_vel_y = 0.0; }
+}
+
+fn update_camera(dt: float64) {
+  var focused: int32 = 0;
+  if (Win_GetForegroundWindow() == g_window) { focused = 1; }
+
+  if (g_mode != MODE_NONE) {
+    var cursor: UiPoint;
+    var center: UiPoint;
+    client_center(&center);
+    Win_GetCursorPos(&cursor);
+    var dx: int32 = cursor.x - center.x;
+    var dy: int32 = cursor.y - center.y;
+    if (dx != 0 || dy != 0) { Win_SetCursorPos(center.x, center.y); }
+    if (g_mode == MODE_LOOK) {
+      g_yaw_target = g_yaw_target + (float64)dx * LOOK_SPEED;
+      g_pitch_target = g_pitch_target - (float64)dy * LOOK_SPEED;
+      if (g_pitch_target > 1.5) { g_pitch_target = 1.5; }
+      if (g_pitch_target < -1.5) { g_pitch_target = -1.5; }
+    } else {
+      g_orbit_yaw_target = g_orbit_yaw_target - (float64)dx * LOOK_SPEED * 1.4;
+      g_orbit_pitch_target = g_orbit_pitch_target + (float64)dy * LOOK_SPEED * 1.4;
+      if (g_orbit_pitch_target > 1.45) { g_orbit_pitch_target = 1.45; }
+      if (g_orbit_pitch_target < -0.12) { g_orbit_pitch_target = -0.12; }
+    }
+  }
+
+  var notches: float64 = (float64)g_wheel / 120.0;
+  g_wheel = 0;
+  if (g_mode == MODE_ORBIT) {
+    var swing: float64 = approach(0.09, dt);
+    g_orbit_yaw = g_orbit_yaw + (g_orbit_yaw_target - g_orbit_yaw) * swing;
+    g_orbit_pitch = g_orbit_pitch + (g_orbit_pitch_target - g_orbit_pitch) * swing;
+    g_orbit_target = g_orbit_target * pow(0.88, notches);
+    if (g_orbit_target < 2.4) { g_orbit_target = 2.4; }
+    if (g_orbit_target > 80.0) { g_orbit_target = 80.0; }
+    g_orbit_radius = g_orbit_radius + (g_orbit_target - g_orbit_radius) * approach(0.12, dt);
+    var ring: float64 = cos(g_orbit_pitch) * g_orbit_radius;
+    g_eye_x = sin(g_orbit_yaw) * ring;
+    g_eye_y = 1.0 + sin(g_orbit_pitch) * g_orbit_radius;
+    g_eye_z = cos(g_orbit_yaw) * ring;
+    g_vel_x = 0.0;
+    g_vel_y = 0.0;
+    g_vel_z = 0.0;
+    look_at(0.0, 1.0, 0.0);
+  }
+
+  var look: float64 = approach(0.045, dt);
+  if (g_mode == MODE_ORBIT) { look = approach(0.02, dt); }
+  g_yaw = g_yaw + (g_yaw_target - g_yaw) * look;
+  g_pitch = g_pitch + (g_pitch_target - g_pitch) * look;
+  var cp: float64 = cos(g_pitch);
+  var fx: float64 = sin(g_yaw) * cp;
+  var fy: float64 = sin(g_pitch);
+  var fz: float64 = 0.0 - cos(g_yaw) * cp;
+  var rx: float64 = cos(g_yaw);
+  var rz: float64 = sin(g_yaw);
+
+  if (g_mode != MODE_ORBIT) {
+    var speed: float64 = MOVE_SPEED;
+    if (focused != 0 && key_down(0x10) > 0.0) { speed = FAST_SPEED; }
+    var ix: float64 = 0.0;
+    var iy: float64 = 0.0;
+    var iz: float64 = 0.0;
+    if (focused != 0) {
+      var forward: float64 = key_down(0x57) - key_down(0x53);
+      var strafe: float64 = key_down(0x44) - key_down(0x41);
+      var lift: float64 = key_down(0x45) + key_down(0x20) - key_down(0x51) - key_down(0x43);
+      ix = fx * forward + rx * strafe;
+      iy = fy * forward + lift;
+      iz = fz * forward + rz * strafe;
+      var len: float64 = sqrt(ix * ix + iy * iy + iz * iz);
+      if (len > 1.0) {
+        ix = ix / len;
+        iy = iy / len;
+        iz = iz / len;
+      }
+    }
+    var follow: float64 = approach(0.16, dt);
+    g_vel_x = g_vel_x + (ix * speed - g_vel_x) * follow;
+    g_vel_y = g_vel_y + (iy * speed - g_vel_y) * follow;
+    g_vel_z = g_vel_z + (iz * speed - g_vel_z) * follow;
+    if (notches != 0.0) {
+      g_vel_x = g_vel_x + fx * notches * 3.0;
+      g_vel_y = g_vel_y + fy * notches * 3.0;
+      g_vel_z = g_vel_z + fz * notches * 3.0;
+    }
+    g_eye_x = g_eye_x + g_vel_x * dt;
+    g_eye_y = g_eye_y + g_vel_y * dt;
+    g_eye_z = g_eye_z + g_vel_z * dt;
+  }
+  if (g_eye_y < 0.12) {
+    g_eye_y = 0.12;
+    if (g_vel_y < 0.0) { g_vel_y = 0.0; }
+  }
+  push_out_of_cube();
+}
+
+fn vec(x: float64, y: float64, z: float64) -> Vec3 {
+  var v: Vec3;
+  v.x = (float32)x;
+  v.y = (float32)y;
+  v.z = (float32)z;
+  return v;
+}
+
+fn render() {
+  var cp: float64 = cos(g_pitch);
+  var fx: float64 = sin(g_yaw) * cp;
+  var fy: float64 = sin(g_pitch);
+  var fz: float64 = 0.0 - cos(g_yaw) * cp;
+  var rx: float64 = cos(g_yaw);
+  var rz: float64 = sin(g_yaw);
+  var ux: float64 = 0.0 - rz * fy;
+  var uy: float64 = rz * fx - rx * fz;
+  var uz: float64 = rx * fy;
+  var ty: float64 = tan(FOV_Y * 0.5);
+  var tx: float64 = ty * (float64)g_width / (float64)g_height;
+  var near: float64 = 0.05;
+
+  var view: View;
+  set_row(&view.m[0], 0, rx / tx, 0.0, rz / tx, 0.0 - (rx * g_eye_x + rz * g_eye_z) / tx);
+  set_row(&view.m[0], 1, ux / ty, uy / ty, uz / ty, 0.0 - (ux * g_eye_x + uy * g_eye_y + uz * g_eye_z) / ty);
+  set_row(&view.m[0], 2, 0.0, 0.0, 0.0, near);
+  set_row(&view.m[0], 3, fx, fy, fz, 0.0 - (fx * g_eye_x + fy * g_eye_y + fz * g_eye_z));
+  view.width = g_width;
+  view.height = g_height;
+  view.near = (float32)near;
+  view.guard = 2.0;
+  view.facing = 1;
+  view.materials = (1 << MAT_GROUND) | (1 << MAT_STEEL);
+  view.samples = SAMPLES;
+
+  var frame: Frame;
+  frame.eye = vec(g_eye_x, g_eye_y, g_eye_z);
+  frame.right = vec(rx * tx, 0.0, rz * tx);
+  frame.up = vec(ux * ty, uy * ty, uz * ty);
+  frame.forward = vec(fx, fy, fz);
+  frame.moon = vec(g_moon_x, g_moon_y, g_moon_z);
+  frame.glow = vec(0.83, 0.0, 0.56);
+  frame.box_min = vec(-1.0, 0.0, -1.0);
+  frame.box_max = vec(1.0, 2.0, 1.0);
+  for i in 0..16 { frame.light[i] = g_light[i]; }
+  frame.width = g_width;
+  frame.height = g_height;
+  frame.shadow_size = SHADOW_SIZE;
+  frame.pixel_angle = (float32)(2.0 * ty / (float64)g_height);
+  frame.exposure = 2.4;
+  frame.shadow_depth_range = 20.0;
+  frame.shadow_texel = (float32)(2.0 * 5.6 / (float64)SHADOW_SIZE);
+  frame.moon_tan = 0.012;
+  frame.frame_index = 0;
+
+  dispatch setup[work: g_triangles](d_scene, d_material_buffer, g_triangles, view, d_slots);
+  var tiles_x: int32 = (g_width + TILE - 1) / TILE;
+  var tiles_y: int32 = (g_height + TILE - 1) / TILE;
+  dispatch raster[grid: (tiles_x, tiles_y, 1), block: (256, 1, 1)](d_slots, g_triangles * SLOTS_PER_TRIANGLE,
+                                                                    g_width, g_height, SAMPLES, d_shadow, d_ids);
+  dispatch shade[work: g_width * g_height](frame, d_scene, d_material_buffer, d_ids, d_shadow, d_pixels);
+  gpu_to_host(g_pixels, d_pixels, (int64)g_width * (int64)g_height * 4);
+}
+
+fn update_title(ms: float64) {
+  var tenths: int32 = (int32)(ms * 10.0 + 0.5);
+  var text: string = "cube  {g_width} x {g_height}  {tenths / 10}.{tenths % 10} ms";
+  var title: cstring = cstr(text, malloc);
+  if (title == 0) { return; }
+  ui_window_set_title(g_window, title);
+  free(title);
+}
+
+fn main() -> int32 {
+  Win_QueryPerformanceFrequency(&g_qpc_frequency);
+  if (g_qpc_frequency <= 0) { g_qpc_frequency = 1; }
+  if (gpu_init() == 0) {
+    Ui_MessageBoxA(0, "No CUDA device answered. The cube renders on an NVIDIA GPU.", "cube", (uint32)48);
+    return 1;
+  }
+
+  build_scene();
+  setup_moon();
+  d_scene = gpu_malloc((int64)g_triangles * 36);
+  d_material_buffer = gpu_malloc((int64)g_triangles * 4);
+  d_slots = gpu_malloc((int64)g_triangles * (int64)SLOTS_PER_TRIANGLE * 64);
+  d_shadow = gpu_malloc((int64)SHADOW_SIZE * (int64)SHADOW_SIZE * 4);
+  d_ids = gpu_malloc(16);
+  gpu_to_device(d_scene, (uint8*)g_scene, (int64)g_triangles * 36);
+  gpu_to_device(d_material_buffer, (uint8*)g_materials, (int64)g_triangles * 4);
+  render_shadow_map();
+  gpu_sync();
+  gpu_free(d_ids);
+  d_ids = 0;
+
+  var rect: UiRect = ui_make_rect(0, 0, 1600, 900);
+  Win_AdjustWindowRect(&rect, UI_WS_OVERLAPPEDWINDOW(), 0);
+  g_window = ui_window_create_centered("cube", rect.right - rect.left, rect.bottom - rect.top, &window_proc);
+  if (g_window == 0) { return 1; }
+  var client: UiRect = ui_window_client_rect(g_window);
+  g_width = client.right - client.left;
+  g_height = client.bottom - client.top;
+  look_at(0.0, 1.0, 0.0);
+  g_yaw = g_yaw_target;
+  g_pitch = g_pitch_target;
+  ui_window_show(g_window);
+
+  var last: float64 = now_seconds();
+  var title_at: float64 = last;
+  var frames: int32 = 0;
+  var spent: float64 = 0.0;
+  var message: UiMsg;
+  while (g_running != 0) {
+    while (Ui_PeekMessageA(&message, 0, 0, 0, UI_PM_REMOVE()) != 0) {
+      if (message.message == UI_WM_QUIT()) {
+        g_running = 0;
+        break;
+      }
+      Ui_TranslateMessage(&message);
+      Ui_DispatchMessageA(&message);
+    }
+    if (g_running == 0) { break; }
+    if (g_width <= 0 || g_height <= 0) {
+      win32_sleep_ms((uint32)10);
+      continue;
+    }
+
+    var now: float64 = now_seconds();
+    var dt: float64 = now - last;
+    last = now;
+    if (dt > 0.1) { dt = 0.1; }
+    update_camera(dt);
+    if (ensure_targets() == 0) {
+      Ui_MessageBoxA(0, "The GPU could not hold the frame buffers.", "cube", (uint32)48);
+      break;
+    }
+    render();
+    var hdc: int64 = Ui_GetDC(g_window);
+    present(hdc);
+    Ui_ReleaseDC(g_window, hdc);
+
+    frames = frames + 1;
+    spent = spent + (now_seconds() - now);
+    if (now - title_at > 0.5) {
+      update_title(spent * 1000.0 / (float64)frames);
+      title_at = now;
+      frames = 0;
+      spent = 0.0;
+    }
+  }
+  end_drag();
+  release_targets();
+  return 0;
+}
