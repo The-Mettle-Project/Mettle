@@ -35,7 +35,7 @@ int code_generator_binary_emit_simd_sum_f64(
   if (!code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->dest,
                                                BINARY_GP_RAX) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->lhs,
                                                BINARY_GP_RCX) ||
@@ -92,8 +92,8 @@ int code_generator_binary_emit_simd_sum_f64(
   }
 
   if (!wcs_patch_here(b, j_scalar) ||
-      !wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !binary_emit_addsd_xmm_xmm(b, BINARY_XMM3, BINARY_XMM0) ||
+      !wcs_vex_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+      !wcs_vex_addsd_xmm_xmm(b, BINARY_XMM3, BINARY_XMM0) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8)) {
     return 0;
   }
@@ -132,7 +132,7 @@ int code_generator_binary_emit_simd_sum_f32(
   if (!code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->dest,
                                                BINARY_GP_RAX) ||
-      !binary_emit_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
+      !wcs_vex_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->lhs,
                                                BINARY_GP_RCX) ||
@@ -189,8 +189,8 @@ int code_generator_binary_emit_simd_sum_f32(
   }
 
   if (!wcs_patch_here(b, j_scalar) ||
-      !wcs_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !binary_emit_addss_xmm_xmm(b, BINARY_XMM3, BINARY_XMM0) ||
+      !wcs_vex_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+      !wcs_vex_addss_xmm_xmm(b, BINARY_XMM3, BINARY_XMM0) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4)) {
     return 0;
   }
@@ -231,7 +231,7 @@ int code_generator_binary_emit_simd_dot_f64(
   if (!code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->dest,
                                                BINARY_GP_RAX) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->lhs,
                                                BINARY_GP_RCX) ||
@@ -296,8 +296,8 @@ int code_generator_binary_emit_simd_dot_f64(
   }
 
   if (!wcs_patch_here(b, j_scalar) ||
-      !wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0) ||
+      !wcs_vex_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+      !wcs_vex_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0) ||
       !wcs_fmadd231sd(b, 3, 0, 1) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 8) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 8)) {
@@ -322,26 +322,26 @@ int code_generator_binary_emit_simd_dot_f64(
 
 static int wcs_affine_f64_scalar_step(BinaryCodeBuffer *b, int b_is_one,
                                       int b_is_zero, int c_is_zero) {
-  if (!wcs_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
+  if (!wcs_vex_movsd_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+      !wcs_vex_movsd_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
     return 0;
   }
   if (b_is_one && c_is_zero) {
     if (!wcs_fmadd231sd(b, 1, 0, 4) ||
-        !wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+        !wcs_vex_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
       return 0;
     }
   } else {
-    if (!binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4)) {
+    if (!wcs_vex_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4)) {
       return 0;
     }
     if (!b_is_zero && !wcs_fmadd231sd(b, 0, 5, 1)) {
       return 0;
     }
-    if (!c_is_zero && !binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) {
+    if (!c_is_zero && !wcs_vex_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) {
       return 0;
     }
-    if (!wcs_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+    if (!wcs_vex_movsd_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
       return 0;
     }
   }
@@ -499,15 +499,15 @@ int code_generator_binary_emit_simd_affine_map_f64_inline(
       return 0;
     }
   } else if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, (long long)a_bits) ||
-             !binary_emit_movq_xmm_reg(b, BINARY_XMM4, BINARY_GP_RAX) ||
+             !wcs_vex_movq_xmm_reg(b, BINARY_XMM4, BINARY_GP_RAX) ||
              !wcs_avx_vbroadcastsd_ymm_xmm(b, 4, 4)) {
     return 0;
   }
   if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, (long long)b_bits) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM5, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM5, BINARY_GP_RAX) ||
       !wcs_avx_vbroadcastsd_ymm_xmm(b, 5, 5) ||
       !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, (long long)c_bits) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
       !wcs_avx_vbroadcastsd_ymm_xmm(b, 3, 3) ||
       !simd_clamped_count(b) ||
       !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 3) ||
@@ -550,17 +550,17 @@ int code_generator_binary_emit_simd_affine_map_f64(
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[1],
                                                BINARY_GP_RAX) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM4, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM4, BINARY_GP_RAX) ||
       !wcs_avx_vbroadcastsd_ymm_xmm(b, 4, 4) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[2],
                                                BINARY_GP_RAX) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM5, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM5, BINARY_GP_RAX) ||
       !wcs_avx_vbroadcastsd_ymm_xmm(b, 5, 5) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[3],
                                                BINARY_GP_RAX) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
       !wcs_avx_vbroadcastsd_ymm_xmm(b, 3, 3) ||
       !simd_clamped_count(b) ||
       !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 3) ||
@@ -639,20 +639,20 @@ int code_generator_binary_emit_simd_affine_map_f32_loop(BinaryCodeBuffer *b,
   }
   {
     size_t scalar_top = b->size;
-    if (!wcs_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-        !wcs_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
+    if (!wcs_vex_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+        !wcs_vex_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0)) {
       return 0;
     }
     if (b_is_one && c_is_zero) {
       if (!wcs_fmadd231ss(b, 1, 0, 4) ||
-          !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
+          !wcs_vex_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM1)) {
         return 0;
       }
-    } else if (!binary_emit_mulss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
+    } else if (!wcs_vex_mulss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM4) ||
                (!b_is_zero && !wcs_fmadd231ss(b, 0, 5, 1)) ||
                (!c_is_zero &&
-                !binary_emit_addss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) ||
-               !wcs_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
+                !wcs_vex_addss_xmm_xmm(b, BINARY_XMM0, BINARY_XMM3)) ||
+               !wcs_vex_movss_mem_xmm(b, BINARY_GP_RDX, 0, BINARY_XMM0)) {
       return 0;
     }
     if (!wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
@@ -679,15 +679,15 @@ int code_generator_binary_emit_simd_affine_map_f32_inline(
       return 0;
     }
   } else if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, a_bits) ||
-             !wcs_movd_xmm_reg(b, 4, BINARY_GP_RAX) ||
+             !wcs_vex_movd_xmm_reg(b, 4, BINARY_GP_RAX) ||
              !wcs_avx_vpbroadcastd_ymm(b, 4, 4)) {
     return 0;
   }
   if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, b_bits) ||
-      !wcs_movd_xmm_reg(b, 5, BINARY_GP_RAX) ||
+      !wcs_vex_movd_xmm_reg(b, 5, BINARY_GP_RAX) ||
       !wcs_avx_vpbroadcastd_ymm(b, 5, 5) ||
       !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, c_bits) ||
-      !wcs_movd_xmm_reg(b, 3, BINARY_GP_RAX) ||
+      !wcs_vex_movd_xmm_reg(b, 3, BINARY_GP_RAX) ||
       !wcs_avx_vpbroadcastd_ymm(b, 3, 3) ||
       !simd_clamped_count(b) ||
       !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
@@ -730,17 +730,17 @@ int code_generator_binary_emit_simd_affine_map_f32(
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[1],
                                                BINARY_GP_RAX) ||
-      !wcs_movd_xmm_reg(b, 4, BINARY_GP_RAX) ||
+      !wcs_vex_movd_xmm_reg(b, 4, BINARY_GP_RAX) ||
       !wcs_avx_vpbroadcastd_ymm(b, 4, 4) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[2],
                                                BINARY_GP_RAX) ||
-      !wcs_movd_xmm_reg(b, 5, BINARY_GP_RAX) ||
+      !wcs_vex_movd_xmm_reg(b, 5, BINARY_GP_RAX) ||
       !wcs_avx_vpbroadcastd_ymm(b, 5, 5) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->arguments[3],
                                                BINARY_GP_RAX) ||
-      !wcs_movd_xmm_reg(b, 3, BINARY_GP_RAX) ||
+      !wcs_vex_movd_xmm_reg(b, 3, BINARY_GP_RAX) ||
       !wcs_avx_vpbroadcastd_ymm(b, 3, 3) ||
       !simd_clamped_count(b) ||
       !binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R9, 2) ||
@@ -1044,7 +1044,7 @@ static int vloop_emit_slots(VloopKernel *k) {
   for (c = 0; c < k->n_consts; c++) {
     uint64_t bits = vloop_const_bits(k, &k->args[k->consts_off + c]);
     if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, bits) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+        !wcs_vex_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
         !wcs_avx_vbroadcastsd_ymm_xmm(b, 0, 0) ||
         !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RSP, 32 * c, 0)) {
       return 0;
@@ -1060,7 +1060,7 @@ static int vloop_emit_slots(VloopKernel *k) {
       if (!wcs_broadcast_i32_to_ymm(b, 0, BINARY_GP_RAX)) {
         return 0;
       }
-    } else if (!binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+    } else if (!wcs_vex_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
                !wcs_avx_vbroadcastsd_ymm_xmm(b, 0, 0)) {
       return 0;
     }
@@ -1080,24 +1080,24 @@ static int vloop_emit_iota_vector(VloopKernel *k) {
   if (k->f32) {
     return binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
                                      0x0000000100000000ULL) &&
-           binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) &&
+           wcs_vex_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) &&
            binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
                                      0x0000000300000002ULL) &&
-           binary_emit_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) &&
+           wcs_vex_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) &&
            wcs_avx_vpunpcklqdq_xmm(b, 0, 0, 2) &&
            binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
                                      0x0000000500000004ULL) &&
-           binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) &&
+           wcs_vex_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) &&
            binary_emit_mov_reg_imm64(b, BINARY_GP_RAX,
                                      0x0000000700000006ULL) &&
-           binary_emit_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) &&
+           wcs_vex_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) &&
            wcs_avx_vpunpcklqdq_xmm(b, 1, 1, 2) &&
            wcs_avx_vperm2i128(b, VLOOP_IOTA_CONST, 0, 1, 0x20);
   }
   return binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000100000000ULL) &&
-         binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) &&
+         wcs_vex_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) &&
          binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000300000002ULL) &&
-         binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) &&
+         wcs_vex_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) &&
          wcs_avx_vpunpcklqdq_xmm(b, VLOOP_IOTA_CONST, 0, 1);
 }
 
@@ -1105,7 +1105,7 @@ static int vloop_emit_accumulator(VloopKernel *k) {
   BinaryCodeBuffer *b = k->b;
   if (k->elem8 && !k->is_reduce &&
       (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x000000FF000000FFULL) ||
-       !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+       !wcs_vex_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
        !wcs_avx_vbroadcastsd_ymm_xmm(b, VLOOP_BYTE_MASK, 0))) {
     return 0;
   }
@@ -1118,7 +1118,7 @@ static int vloop_emit_accumulator(VloopKernel *k) {
     if (k->f32) {
       return wcs_broadcast_i32_to_ymm(b, 2, BINARY_GP_RAX);
     }
-    return binary_emit_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) &&
+    return wcs_vex_movq_xmm_reg(b, BINARY_XMM2, BINARY_GP_RAX) &&
            wcs_avx_vbroadcastsd_ymm_xmm(b, 2, 2);
   }
   if (!k->is_reduce) {
@@ -1130,8 +1130,8 @@ static int vloop_emit_accumulator(VloopKernel *k) {
   return code_generator_binary_emit_operand_load(k->generator, k->context,
                                                  &k->instruction->dest,
                                                  BINARY_GP_RAX) &&
-         (k->f32 ? binary_emit_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)
-                 : binary_emit_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)) &&
+         (k->f32 ? wcs_vex_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)
+                 : wcs_vex_movq_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX)) &&
          wcs_avx_vpxor_ymm(b, 2, 2, 2);
 }
 
@@ -1371,7 +1371,7 @@ static int vloop_vec_store(VloopKernel *k, int R) {
            wcs_avx_vpackusdw_ymm(b, R, R, R) &&
            wcs_avx_vpermq_ymm(b, R, R, 0x08) &&
            wcs_avx_vpackuswb_ymm(b, R, R, R) &&
-           wcs_movsd_mem_xmm(b, k->dst_reg, 0, R);
+           wcs_vex_movsd_mem_xmm(b, k->dst_reg, 0, R);
   }
   return wcs_avx_vmovups_mem_ymm(b, k->dst_reg, 0, R);
 }
@@ -1405,18 +1405,18 @@ static int vloop_tail_leaf(VloopKernel *k, VloopStack *st, int tag, int op0) {
          wcs_avx_vmovd_xmm_reg(b, R, BINARY_GP_RAX);
   } else if (tag == VLOOP_K_LOAD) {
     ok = k->i32 ? wcs_avx_vmovd_xmm_mem(b, R, k->arr_reg[op0], 0)
-                : (k->f32 ? wcs_movss_xmm_mem(b, R, k->arr_reg[op0], 0)
-                          : wcs_movsd_xmm_mem(b, R, k->arr_reg[op0], 0));
+                : (k->f32 ? wcs_vex_movss_xmm_mem(b, R, k->arr_reg[op0], 0)
+                          : wcs_vex_movsd_xmm_mem(b, R, k->arr_reg[op0], 0));
   } else if (tag == VLOOP_K_CONST || tag == VLOOP_K_SCALAR) {
     int disp = 32 * (tag == VLOOP_K_CONST ? op0 : k->n_consts + op0);
     ok = k->i32 ? wcs_avx_vmovd_xmm_mem(b, R, BINARY_GP_RSP, disp)
-                : (k->f32 ? wcs_movss_xmm_mem(b, R, BINARY_GP_RSP, disp)
-                          : wcs_movsd_xmm_mem(b, R, BINARY_GP_RSP, disp));
+                : (k->f32 ? wcs_vex_movss_xmm_mem(b, R, BINARY_GP_RSP, disp)
+                          : wcs_vex_movsd_xmm_mem(b, R, BINARY_GP_RSP, disp));
   } else {
     ok = k->i32 ? wcs_avx_vmovd_xmm_reg(b, R, BINARY_GP_R11)
-                : (k->f32 ? binary_emit_cvtsi2ss_xmm_reg(
+                : (k->f32 ? wcs_vex_cvtsi2ss_xmm_reg(
                                 b, (BinaryXmmRegister)R, BINARY_GP_R11)
-                          : binary_emit_cvtsi2sd_xmm_reg(
+                          : wcs_vex_cvtsi2sd_xmm_reg(
                                 b, (BinaryXmmRegister)R, BINARY_GP_R11));
   }
   if (!ok) {
@@ -1449,17 +1449,17 @@ static int vloop_tail_float_binop(VloopKernel *k, int tag, int ra, int rb) {
   BinaryXmmRegister B = (BinaryXmmRegister)rb;
   switch (tag) {
   case VLOOP_K_ADD:
-    return k->f32 ? binary_emit_addss_xmm_xmm(b, A, B)
-                  : binary_emit_addsd_xmm_xmm(b, A, B);
+    return k->f32 ? wcs_vex_addss_xmm_xmm(b, A, B)
+                  : wcs_vex_addsd_xmm_xmm(b, A, B);
   case VLOOP_K_SUB:
-    return k->f32 ? binary_emit_subss_xmm_xmm(b, A, B)
-                  : binary_emit_subsd_xmm_xmm(b, A, B);
+    return k->f32 ? wcs_vex_subss_xmm_xmm(b, A, B)
+                  : wcs_vex_subsd_xmm_xmm(b, A, B);
   case VLOOP_K_MUL:
-    return k->f32 ? binary_emit_mulss_xmm_xmm(b, A, B)
-                  : binary_emit_mulsd_xmm_xmm(b, A, B);
+    return k->f32 ? wcs_vex_mulss_xmm_xmm(b, A, B)
+                  : wcs_vex_mulsd_xmm_xmm(b, A, B);
   case VLOOP_K_DIV:
-    return k->f32 ? binary_emit_divss_xmm_xmm(b, A, B)
-                  : binary_emit_divsd_xmm_xmm(b, A, B);
+    return k->f32 ? wcs_vex_divss_xmm_xmm(b, A, B)
+                  : wcs_vex_divsd_xmm_xmm(b, A, B);
   default: return 0;
   }
 }
@@ -1516,16 +1516,16 @@ static int vloop_tail_store(VloopKernel *k, int R) {
       return wcs_avx_vpaddd_ymm(b, 2, 2, R);
     }
     return k->f32
-               ? binary_emit_addss_xmm_xmm(b, BINARY_XMM3, (BinaryXmmRegister)R)
-               : binary_emit_addsd_xmm_xmm(b, BINARY_XMM3,
+               ? wcs_vex_addss_xmm_xmm(b, BINARY_XMM3, (BinaryXmmRegister)R)
+               : wcs_vex_addsd_xmm_xmm(b, BINARY_XMM3,
                                            (BinaryXmmRegister)R);
   }
   if (k->elem8) {
     return wcs_avx_vpextrb_mem_xmm(b, k->dst_reg, 0, R);
   }
   return k->i32 ? wcs_avx_vmovd_mem_xmm(b, k->dst_reg, 0, R)
-                : (k->f32 ? wcs_movss_mem_xmm(b, k->dst_reg, 0, R)
-                          : wcs_movsd_mem_xmm(b, k->dst_reg, 0, R));
+                : (k->f32 ? wcs_vex_movss_mem_xmm(b, k->dst_reg, 0, R)
+                          : wcs_vex_movsd_mem_xmm(b, k->dst_reg, 0, R));
 }
 
 static int vloop_emit_tail_body(VloopKernel *k) {
@@ -1815,8 +1815,8 @@ int code_generator_binary_emit_simd_outer_lane_f64(
   if (!code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->dest,
                                                BINARY_GP_RAX) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM4, BINARY_GP_RAX) ||
-      !wcs_movsd_mem_xmm(b, BINARY_GP_RSP, total_off, 4) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM4, BINARY_GP_RAX) ||
+      !wcs_vex_movsd_mem_xmm(b, BINARY_GP_RSP, total_off, 4) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->lhs,
                                                BINARY_GP_R9) ||
@@ -1830,7 +1830,7 @@ int code_generator_binary_emit_simd_outer_lane_f64(
     uint64_t bits = 0;
     memcpy(&bits, &dv, sizeof(bits));
     if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, bits) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+        !wcs_vex_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
         !wcs_avx_vbroadcastsd_ymm_xmm(b, 0, 0) ||
         !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_RSP, 32 * c, 0)) {
       return 0;
@@ -1848,7 +1848,7 @@ int code_generator_binary_emit_simd_outer_lane_f64(
   }
   if (init_mode == 0) {
     if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, init_bits) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM4, BINARY_GP_RAX)) {
+        !wcs_vex_movq_xmm_reg(b, BINARY_XMM4, BINARY_GP_RAX)) {
       return 0;
     }
     for (int k = 0; k < K; k++) {
@@ -2000,8 +2000,8 @@ int code_generator_binary_emit_simd_outer_lane_f64(
   if (!wcs_patch_here(b, j_outer_end) || !wcs_avx_vzeroupper(b)) {
     return 0;
   }
-  if (!wcs_movsd_xmm_mem(b, 0, BINARY_GP_RSP, total_off) ||
-      !binary_emit_movq_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM0)) {
+  if (!wcs_vex_movsd_xmm_mem(b, 0, BINARY_GP_RSP, total_off) ||
+      !wcs_vex_movq_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM0)) {
     return 0;
   }
   if (!binary_emit_add_rsp_imm32(b, cbytes)) {
@@ -2038,9 +2038,9 @@ int code_generator_binary_emit_simd_i2f_reduce_f64(
 
   if (!wcs_avx_vpxor_ymm(b, 2, 2, 2) || !wcs_avx_vpxor_ymm(b, 3, 3, 3) ||
       !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000100000000ULL) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
       !binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0x0000000300000002ULL) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
       !wcs_avx_vpunpcklqdq_xmm(b, 5, 0, 1) ||
       !binary_emit_mov_reg_imm64(b, BINARY_GP_RCX, 0) ||
       !binary_emit_mov_reg_imm64(b, BINARY_GP_R8, (uint64_t)vec_end) ||
@@ -2057,7 +2057,7 @@ int code_generator_binary_emit_simd_i2f_reduce_f64(
     uint64_t kbits = 0;
     memcpy(&kbits, &kd, sizeof(kbits));
     if (!binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, kbits) ||
-        !binary_emit_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
+        !wcs_vex_movq_xmm_reg(b, BINARY_XMM1, BINARY_GP_RAX) ||
         !wcs_avx_vbroadcastsd_ymm_xmm(b, 1, 1) ||
         !wcs_avx_vmovups_mem_ymm(b, BINARY_GP_R11, (int)(32 * s), 1)) {
       return 0;
@@ -2103,33 +2103,33 @@ int code_generator_binary_emit_simd_i2f_reduce_f64(
   rem_top = b->size;
   if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R9) ||
       !wcs_jcc(b, 0x8D , &j_done) ||
-      !binary_emit_cvtsi2sd_xmm_reg(b, BINARY_XMM0, BINARY_GP_RCX)) {
+      !wcs_vex_cvtsi2sd_xmm_reg(b, BINARY_XMM0, BINARY_GP_RCX)) {
     return 0;
   }
   for (size_t s = 0; s < nsteps; s++) {
     int op = (int)instruction->arguments[1 + 2 * s].int_value;
-    if (!wcs_movsd_xmm_mem(b, 1, BINARY_GP_R11, (int)(32 * s))) {
+    if (!wcs_vex_movsd_xmm_mem(b, 1, BINARY_GP_R11, (int)(32 * s))) {
       return 0;
     }
     int ok = 0;
     switch (op) {
-    case 0: ok = binary_emit_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM1); break;
-    case 1: ok = binary_emit_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM1); break;
-    case 2: ok = binary_emit_subsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM1); break;
+    case 0: ok = wcs_vex_mulsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM1); break;
+    case 1: ok = wcs_vex_addsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM1); break;
+    case 2: ok = wcs_vex_subsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM1); break;
     case 3:
-      ok = binary_emit_subsd_xmm_xmm(b, BINARY_XMM1, BINARY_XMM0) &&
-           wcs_sse_f2(b, 0x10, 0, 1) ;
+      ok = wcs_vex_subsd_xmm_xmm(b, BINARY_XMM1, BINARY_XMM0) &&
+           wcs_vex_movsd_xmm_xmm(b, 0, 1);
       break;
-    case 4: ok = binary_emit_divsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM1); break;
+    case 4: ok = wcs_vex_divsd_xmm_xmm(b, BINARY_XMM0, BINARY_XMM1); break;
     default: code_generator_set_error(generator, "bad i2f step op"); return 0;
     }
     if (!ok) {
       return 0;
     }
   }
-  if (!binary_emit_cvttsd2si_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM0) ||
-      !binary_emit_cvtsi2sd_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
-      !binary_emit_addsd_xmm_xmm(b, BINARY_XMM3, BINARY_XMM0) ||
+  if (!wcs_vex_cvttsd2si_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM0) ||
+      !wcs_vex_cvtsi2sd_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+      !wcs_vex_addsd_xmm_xmm(b, BINARY_XMM3, BINARY_XMM0) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 1) ||
       !wcs_jcc(b, 0, &back) || !wcs_patch_to(b, back, rem_top)) {
     return 0;
@@ -2138,8 +2138,8 @@ int code_generator_binary_emit_simd_i2f_reduce_f64(
   if (!wcs_patch_here(b, j_done) ||
       !binary_emit_add_rsp_imm32(b, const_bytes)  ||
       !wcs_reduce_pd_acc_to_rax(b) ||
-      !binary_emit_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
-      !binary_emit_cvttsd2si_reg_xmm(b, BINARY_GP_R10, BINARY_XMM0) ||
+      !wcs_vex_movq_xmm_reg(b, BINARY_XMM0, BINARY_GP_RAX) ||
+      !wcs_vex_cvttsd2si_reg_xmm(b, BINARY_GP_R10, BINARY_XMM0) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->dest,
                                                BINARY_GP_RAX) ||
@@ -2171,7 +2171,7 @@ int code_generator_binary_emit_simd_dot_f32(
   if (!code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->dest,
                                                BINARY_GP_RAX) ||
-      !binary_emit_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
+      !wcs_vex_movd_xmm_reg(b, BINARY_XMM3, BINARY_GP_RAX) ||
       !code_generator_binary_emit_operand_load(generator, context,
                                                &instruction->lhs,
                                                BINARY_GP_RCX) ||
@@ -2236,8 +2236,8 @@ int code_generator_binary_emit_simd_dot_f32(
   }
 
   if (!wcs_patch_here(b, j_scalar) ||
-      !wcs_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
-      !wcs_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0) ||
+      !wcs_vex_movss_xmm_mem(b, 0, BINARY_GP_RCX, 0) ||
+      !wcs_vex_movss_xmm_mem(b, 1, BINARY_GP_RDX, 0) ||
       !wcs_fmadd231ss(b, 3, 0, 1) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 4) ||
       !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 4)) {

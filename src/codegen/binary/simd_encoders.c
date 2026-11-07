@@ -632,6 +632,93 @@ int wcs_avx_vmovsd_mem_xmm(BinaryCodeBuffer *b, int base, int disp, int src) {
          binary_code_buffer_append_u8(b, 0x11) &&
          wcs_avx_modrm_mem_disp(b, src, base, disp);
 }
+int wcs_vex_movss_xmm_mem(BinaryCodeBuffer *b, int xmm, int gpr, int disp) {
+  return wcs_vex3(b, 1, 2, 0, 0, xmm, gpr, 0) &&
+         binary_code_buffer_append_u8(b, 0x10) &&
+         wcs_avx_modrm_mem_disp(b, xmm, gpr, disp);
+}
+int wcs_vex_movss_mem_xmm(BinaryCodeBuffer *b, int gpr, int disp, int xmm) {
+  return wcs_vex3(b, 1, 2, 0, 0, xmm, gpr, 0) &&
+         binary_code_buffer_append_u8(b, 0x11) &&
+         wcs_avx_modrm_mem_disp(b, xmm, gpr, disp);
+}
+int wcs_vex_movsd_xmm_mem(BinaryCodeBuffer *b, int xmm, int gpr, int disp) {
+  return wcs_avx_vmovsd_xmm_mem(b, xmm, gpr, disp);
+}
+int wcs_vex_movsd_mem_xmm(BinaryCodeBuffer *b, int gpr, int disp, int xmm) {
+  return wcs_avx_vmovsd_mem_xmm(b, gpr, disp, xmm);
+}
+static int wcs_vex_scalar_rr(BinaryCodeBuffer *b, int pp, unsigned char op,
+                             int dst, int src) {
+  return wcs_vex3(b, 1, pp, 0, 0, dst, src, dst) &&
+         binary_code_buffer_append_u8(b, op) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+}
+int wcs_vex_addss_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 2, 0x58, dst, src);
+}
+int wcs_vex_mulss_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 2, 0x59, dst, src);
+}
+int wcs_vex_subss_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 2, 0x5C, dst, src);
+}
+int wcs_vex_divss_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 2, 0x5E, dst, src);
+}
+int wcs_vex_addsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 3, 0x58, dst, src);
+}
+int wcs_vex_mulsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 3, 0x59, dst, src);
+}
+int wcs_vex_subsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 3, 0x5C, dst, src);
+}
+int wcs_vex_divsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 3, 0x5E, dst, src);
+}
+int wcs_vex_movsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src) {
+  return wcs_vex_scalar_rr(b, 3, 0x10, dst, src);
+}
+int wcs_vex_cvtsi2sd_xmm_reg(BinaryCodeBuffer *b, int dst, int gpr) {
+  return wcs_vex3(b, 1, 3, 0, 1, dst, gpr, dst) &&
+         binary_code_buffer_append_u8(b, 0x2A) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (gpr & 7)));
+}
+int wcs_vex_cvtsi2ss_xmm_reg(BinaryCodeBuffer *b, int dst, int gpr) {
+  return wcs_vex3(b, 1, 2, 0, 1, dst, gpr, dst) &&
+         binary_code_buffer_append_u8(b, 0x2A) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (gpr & 7)));
+}
+static int wcs_vex_gpr_move(BinaryCodeBuffer *b, unsigned char op, int w,
+                            int xmm, int gpr) {
+  return wcs_vex3(b, 1, 1, 0, w, xmm, gpr, 0) &&
+         binary_code_buffer_append_u8(b, op) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((xmm & 7) << 3) | (gpr & 7)));
+}
+int wcs_vex_movd_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr) {
+  return wcs_vex_gpr_move(b, 0x6E, 0, xmm, gpr);
+}
+int wcs_vex_movq_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr) {
+  return wcs_vex_gpr_move(b, 0x6E, 1, xmm, gpr);
+}
+int wcs_vex_movd_reg_xmm(BinaryCodeBuffer *b, int gpr, int xmm) {
+  return wcs_vex_gpr_move(b, 0x7E, 0, xmm, gpr);
+}
+int wcs_vex_movq_reg_xmm(BinaryCodeBuffer *b, int gpr, int xmm) {
+  return wcs_vex_gpr_move(b, 0x7E, 1, xmm, gpr);
+}
+int wcs_vex_cvttsd2si_reg_xmm(BinaryCodeBuffer *b, int gpr, int xmm) {
+  return wcs_vex3(b, 1, 3, 0, 1, gpr, xmm, 0) &&
+         binary_code_buffer_append_u8(b, 0x2C) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((gpr & 7) << 3) | (xmm & 7)));
+}
 int wcs_avx_vunpckhpd_xmm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_vex3(b, 1, 1, 0, 0, dst, s2, s1) &&
          binary_code_buffer_append_u8(b, 0x15) &&

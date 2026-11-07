@@ -115,6 +115,26 @@ int wcs_movsd_xmm_mem(BinaryCodeBuffer *b, int xmm, int gpr, int disp);
 int wcs_movsd_mem_xmm(BinaryCodeBuffer *b, int gpr, int disp, int xmm);
 int wcs_movss_xmm_mem(BinaryCodeBuffer *b, int xmm, int gpr, int disp);
 int wcs_movss_mem_xmm(BinaryCodeBuffer *b, int gpr, int disp, int xmm);
+int wcs_vex_movss_xmm_mem(BinaryCodeBuffer *b, int xmm, int gpr, int disp);
+int wcs_vex_movss_mem_xmm(BinaryCodeBuffer *b, int gpr, int disp, int xmm);
+int wcs_vex_movsd_xmm_mem(BinaryCodeBuffer *b, int xmm, int gpr, int disp);
+int wcs_vex_movsd_mem_xmm(BinaryCodeBuffer *b, int gpr, int disp, int xmm);
+int wcs_vex_addss_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_mulss_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_subss_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_divss_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_addsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_mulsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_subsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_divsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_movsd_xmm_xmm(BinaryCodeBuffer *b, int dst, int src);
+int wcs_vex_cvtsi2sd_xmm_reg(BinaryCodeBuffer *b, int dst, int gpr);
+int wcs_vex_cvtsi2ss_xmm_reg(BinaryCodeBuffer *b, int dst, int gpr);
+int wcs_vex_cvttsd2si_reg_xmm(BinaryCodeBuffer *b, int gpr, int xmm);
+int wcs_vex_movd_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr);
+int wcs_vex_movq_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr);
+int wcs_vex_movd_reg_xmm(BinaryCodeBuffer *b, int gpr, int xmm);
+int wcs_vex_movq_reg_xmm(BinaryCodeBuffer *b, int gpr, int xmm);
 int simd_emit_prefixed_xmm_mem_disp(BinaryCodeBuffer *b, unsigned char prefix,
                                     unsigned char opcode, int xmm, int gpr,
                                     int displacement);
