@@ -12975,7 +12975,7 @@ try {
   $explainSidecar = Join-Path $tmpDir "ownership_explain.explain.txt"
   if (-not (Test-Path $explainSidecar)) { throw "--explain wrote no report: $explainOut" }
   $explain = Get-Content $explainSidecar -Raw
-  if ($explain -notmatch "ownership report" -or $explain -notmatch "lowered to: 1 call to") {
+  if ($explain -notmatch "ownership report" -or $explain -notmatch "defer drop\(x\), 1 call to") {
     throw "--explain has no ownership report: $explain"
   }
   Write-CaseResult -Name "ownership_is_inspectable" -Passed $true
@@ -13106,14 +13106,27 @@ try {
   Assert-Screen (Invoke-ExplainScreen $demo "2" "64x20") @("2 Optimizer", "saxpy, loop at line 12", "q quit") "narrow layout"
   Assert-Screen (Invoke-ExplainScreen $demo "" "30x8") @("needs 40 by 12") "too small"
   Assert-Screen (Invoke-ExplainScreen "tests/test_ownership_paths.mettle" "3") @(
-      "Line  Record", "Written out", "var __tmp") "ownership"
+      "Line  Value", "Written out", "var __tmp", "As the compiler rewrote it") "ownership"
   Assert-Screen (Invoke-ExplainScreen "tests/test_ownership_strings.mettle" "4" "140x24" @("--safe")) @(
       "accesses", "asks the runtime for the allocation, 2 accesses") "memory under --safe"
   $raii = "examples/raii_demo/raii_demo.mettle"
   Assert-Screen (Invoke-ExplainScreen $raii "") @("Loops      1 vectorized", "Ownership  31 inserted") "raii overview"
-  $ownership = Invoke-ExplainScreen $raii "3" "140x200"
-  Assert-Screen $ownership @("glue            ``__drop_Track``", "arm drop        ``t``", "live bit", "assign drop     ``line``",
-      "parameter drop  ``t``", "discard drop", "temporary") "raii ownership"
+  $ownership = Invoke-ExplainScreen $raii "3" "200x200"
+  Assert-Screen $ownership @("moves at 84, 86, else freed at 88", "old value freed at 134, freed at 137 if it holds one",
+      "never stored, freed at 183", "old value freed at 189, freed at 197", "Drop glue",
+      "Track.drop(self);  drop(self->trail);", "22 owned values: 18 freed where shown") "raii ownership"
+  if ($ownership -match "__next") { throw "raii ownership: a compiler temporary is listed as a value:`n$ownership" }
+  Assert-Screen (Invoke-ExplainScreen $raii "3 / text:retire enter e" "140x40") @(
+      "retire as the compiler rewrote it", "defer drop(t);", "+ marks a line it inserted") "raii expanded"
+  Assert-Screen (Invoke-ExplainScreen $raii "3 / text:callsigns enter" "160x60") @(
+      "Replaced     line 134", "Live bit", "frees the string's heap buffer",
+      "As the compiler rewrote it  callsigns") "raii value detail"
+  $plain = (& $CompilerPath explain $raii 2>&1 | Out-String)
+  Assert-Screen $plain @("``t`` (Track): moves at 84, 86, else freed at 88",
+      "``line`` (string): old value freed at 134, freed at 137",
+      "``scan`` (Trail): old value freed at 189, freed at 197") "raii plain ownership"
+  Assert-Screen (Invoke-ExplainScreen $demo "2 / text:apply_bias enter" "160x40") @(
+      "invariant-addend", "sum the elements alone") "invariant addend"
   foreach ($group in @("sweep", "retire", "main")) {
     $headers = ([regex]::Matches($ownership, "(?m)^  $group +\S")).Count
     if ($headers -ne 1) { throw "raii ownership: group '$group' has $headers headers:`n$ownership" }

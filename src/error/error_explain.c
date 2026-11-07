@@ -1263,6 +1263,20 @@ static const DecisionDoc DECISIONS[] = {
      "of one vector can pick the same element, and a vector update would\n"
      "keep only one of the two increments. AVX-512 detects that collision\n"
      "with vpconflictd; AVX2 cannot, and the scalar loop is the floor.\n"},
+    {"invariant-addend", DECISION_VECTOR_REFUSAL,
+     "A sum that also adds the same term every iteration",
+     "`s = s + a[i] + bias(k)` sums the elements and adds `bias(k)` on every\n"
+     "iteration. The term does not change inside the loop, and the compiler\n"
+     "hoists the call, but the sum kernel adds one element per lane and\n"
+     "nothing else, so the extra term keeps the loop scalar.\n"
+     "\n"
+     "Fix: sum the elements alone and add the term once:\n"
+     "\n"
+     "    var s: int64 = 0;\n"
+     "    for i in 0..n { s = s + a[i]; }\n"
+     "    s = s + (int64)n * bias(k);\n"
+     "\n"
+     "The loop then runs as vpmovsxdq and vpaddq, eight elements a pass.\n"},
     {"chosen-index", DECISION_VECTOR_REFUSAL,
      "The condition reads at an index the loop chose",
      "`if (a[i] > a[best]) { best = i; }` finds the index of the largest\n"

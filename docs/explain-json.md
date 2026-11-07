@@ -190,7 +190,15 @@ optimizations a declared type earned: `line`, `fn`, `type`, `what` and
 One entry per record: `kind` (`scope-drop`, `parameter-drop`, `arm-drop`,
 `assign-drop`, `discard-drop`, `temporary`, `glue`, `move`, `live-bit` or
 `drop-runs`), `line`, `column`, `function`, `subject`, `type`, `text` (the Mettle
-the compiler wrote), `reason`, `lowered`, `optimized` and `inserted`.
+the compiler wrote), `reason`, `lowered`, `optimized` and `inserted`. The TUI
+groups records into one value per subject, reading a temporary's name from its
+`text`.
+
+## expanded
+
+The main file as the compiler rewrote it, the same source `mettle expand`
+prints, with every inserted drop, defer and temporary. Each line starts with
+byte 1, the source line it came from, and byte 2.
 
 ## The ledger
 

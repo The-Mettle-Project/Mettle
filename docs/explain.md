@@ -39,9 +39,14 @@ flowchart LR
    and integer vector ports, and port 5 for shuffles. When the pointer the
    body advances agrees with the lane count, it also gives the cost of one
    element.
-3. **Ownership**: each drop the compiler inserted, each drop you wrote, each
-   move and each live bit, with the Mettle it wrote out and what that lowered
-   to. [Ownership](ownership.md) has the rules.
+3. **Ownership**: one entry per owned value, a local, a parameter, a match
+   payload or a temporary, with its whole life on one line: where it moves,
+   where the old value is freed on reassignment, and where it is freed for
+   good. The detail names the source line of every move and every free, the
+   live bit that guards a value that moves on some paths only, what its drop
+   runs, and the function as the compiler rewrote it, with each inserted line
+   marked `+`. Drop glue gets an entry per type, listing what dropping one
+   runs. [Ownership](ownership.md) has the rules.
 4. **Memory**: memory diagnostics, and under `--safe` the bounds checks that
    stayed and why each one did.
 5. **Functions**: every function by cost, with instruction counts, loops,
@@ -85,8 +90,11 @@ is marked with the file and line it came from.
 
 [`examples/raii_demo`](../examples/raii_demo/raii_demo.mettle) is a radar
 track file written to fill every tab. Its tracks own heap trails, so the
-Ownership tab has every kind of record: scope, parameter, arm, assignment and
-discard drops, temporaries, moves, live bits and drop glue. Under `--safe` the
+Ownership tab has every kind of life: a match payload that moves on two paths
+and is freed on the third behind a live bit, a string rebuilt every pass of a
+loop, a trail replaced each iteration, a parameter freed on return, a pop whose
+result is never stored, and the drop glue that runs `Track.drop` and then frees
+the trail. Under `--safe` the
 Memory tab lists each bounds check that stayed, grouped by function, beside a
 planted constant overflow:
 
@@ -102,6 +110,8 @@ mettle explain examples/raii_demo/raii_demo.mettle --safe
 - Enter: open the detail, or follow a link
 - s: the whole source file at this line
 - d: the machine code of the whole function at this line
+- e: the whole function as the compiler rewrote it, with every inserted drop,
+  defer and temporary marked `+`
 - Esc or Backspace: back
 - /: filter by any text in an entry
 - m, f, a: missed only, with a fix only, all

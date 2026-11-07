@@ -7315,6 +7315,32 @@ static int compile_stage_expand(CompileContext *ctx) {
   return 0;
 }
 
+static int compile_stage_explain_expand(CompileContext *ctx) {
+  char path[1024];
+  FILE *out;
+  if (!ctx->options->explain_json || !ctx->options->output_filename ||
+      ctx->options->expand_mode ||
+      snprintf(path, sizeof(path), "%s.expand",
+               ctx->options->output_filename) >= (int)sizeof(path)) {
+    return COMPILE_CONTINUE;
+  }
+  out = fopen(path, "wb");
+  if (!out) {
+    return COMPILE_CONTINUE;
+  }
+  ast_print_set_notes(ownership_note, ownership_block_end_note);
+  ast_print_set_filter(expand_keep_declaration, ctx->input_filename);
+  ast_print_set_line_tags(1);
+  ast_print_program(out, ctx->program, expand_annotate, ctx->type_checker);
+  ast_print_set_line_tags(0);
+  ast_print_set_filter(NULL, NULL);
+  ast_print_set_notes(NULL, NULL);
+  fclose(out);
+  ir_explain_set_expanded(read_file(path));
+  remove(path);
+  return COMPILE_CONTINUE;
+}
+
 static int compile_stage_expand_passes(CompileContext *ctx) {
   if (!ctx->expand_after_passes) {
     return COMPILE_CONTINUE;
@@ -8217,6 +8243,7 @@ static const CompileStage COMPILE_STAGES[] = {
     compile_stage_proof_budget,
     compile_stage_ownership,
     compile_stage_expand,
+    compile_stage_explain_expand,
     compile_stage_drop_tests,
     compile_stage_lowering_modes,
     compile_stage_lower_ir,

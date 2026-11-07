@@ -723,6 +723,101 @@ static void ex_build_machine_view(ExUi *ui, const ExEntry *entry) {
   }
 }
 
+static void ex_expand_row(ExUi *ui, const ExExpandLine *l, int number_shown,
+                          int marked) {
+  int indent = 8;
+  const char *text = l->text ? l->text : "";
+  while (*text == ' ') {
+    text++;
+    indent++;
+  }
+  if (l->note) {
+    ex_wrap(&ui->detail, indent, ui->detail_w - indent, text, EXA_QUIET, NULL,
+            0);
+    return;
+  }
+  {
+    ExLine *line = ex_line_new(&ui->detail);
+    if (number_shown) {
+      char number[16];
+      snprintf(number, sizeof(number), "%5d", l->line);
+      ex_line_seg(line, 0, number, strlen(number),
+                  marked ? EXA_BOLD | EXA_ACCENT : EXA_QUIET);
+    }
+    if (l->inserted) {
+      ex_line_seg(line, 6, "+", 1, EXA_ACCENT);
+    }
+    ex_line_seg(line, indent, text, strlen(text),
+                l->inserted ? EXA_ACCENT : marked ? 0 : EXA_DIM);
+  }
+}
+
+static int ex_expand_rows(ExUi *ui, const ExExpandFn *fn, int from, int to,
+                          int all) {
+  int last = -1;
+  int first_marked = -1;
+  for (size_t i = 0; i < fn->count; i++) {
+    const ExExpandLine *l = &fn->lines[i];
+    int marked = l->line >= from && l->line <= to && from > 0;
+    if (!all && !marked) {
+      continue;
+    }
+    if (marked && first_marked < 0) {
+      first_marked = (int)ui->detail.count;
+    }
+    ex_expand_row(ui, l, l->line > 0 && l->line != last && !l->note, marked);
+    if (!l->note && l->line > 0) {
+      last = l->line;
+    }
+  }
+  return first_marked;
+}
+
+static int ex_expanded_section(ExUi *ui, const ExEntry *entry) {
+  const ExExpandFn *fn = ex_report_expanded(ui->report, entry->function);
+  char head[200];
+  char shown[128];
+  int from;
+  int to;
+  if (!fn || fn->count == 0 || entry->line <= 0) {
+    return 0;
+  }
+  ex_entry_range(entry, &from, &to);
+  ir_display_name(fn->name, shown, sizeof(shown));
+  snprintf(head, sizeof(head),
+           "As the compiler rewrote it  %s, lines %d to %d; e shows all of it",
+           shown, from, to);
+  ex_line_new(&ui->detail);
+  ex_wrap(&ui->detail, 0, ui->detail_w, head, EXA_BOLD, NULL, 0);
+  ex_expand_rows(ui, fn, from, to, 0);
+  return 1;
+}
+
+static void ex_build_expanded_view(ExUi *ui, const ExEntry *entry) {
+  const ExExpandFn *fn = ex_report_expanded(ui->report, entry->function);
+  char head[200];
+  char shown[128];
+  int from;
+  int to;
+  ui->anchor = 0;
+  if (!fn) {
+    ex_wrap(&ui->detail, 0, ui->detail_w,
+            "No rewritten source for this entry: nothing in its function "
+            "owns a resource, or it lives in another file.",
+            EXA_DIM, NULL, 0);
+    return;
+  }
+  ex_entry_range(entry, &from, &to);
+  ir_display_name(fn->name, shown, sizeof(shown));
+  snprintf(head, sizeof(head),
+           "%s as the compiler rewrote it; + marks a line it inserted", shown);
+  ex_wrap(&ui->detail, 0, ui->detail_w, head, EXA_BOLD, NULL, 0);
+  {
+    int first = ex_expand_rows(ui, fn, from, to, 1);
+    ui->anchor = first > 0 ? first : 0;
+  }
+}
+
 static void ex_build_detail(ExUi *ui) {
   const ExEntry *entry = ex_current(ui);
   const ExEntry *shown = ex_shown(ui, entry);
@@ -734,8 +829,12 @@ static void ex_build_detail(ExUi *ui) {
   if (!entry) {
     return;
   }
-  if (ui->source_view == 2) {
-    ex_build_machine_view(ui, shown);
+  if (ui->source_view >= 2) {
+    if (ui->source_view == 3) {
+      ex_build_expanded_view(ui, shown);
+    } else {
+      ex_build_machine_view(ui, shown);
+    }
     if (ui->anchor_pending) {
       ui->detail_top = ui->anchor > ui->detail_h / 3
                            ? ui->anchor - ui->detail_h / 3
@@ -782,7 +881,8 @@ static void ex_build_detail(ExUi *ui) {
     ex_wrap(&ui->detail, label_w + 2, width - label_w - 2, f->text, attr,
             label, EXA_DIM);
   }
-  if (shown->line > 0 && ui->report->line_count > 0) {
+  if (ui->tab == EX_TAB_OWNERSHIP && ex_expanded_section(ui, shown)) {
+  } else if (shown->line > 0 && ui->report->line_count > 0) {
     int from = shown->line - 2;
     int last = shown->end_line > shown->line ? shown->end_line : shown->line;
     int to = last + 2;
@@ -914,7 +1014,8 @@ static void ex_column_widths(const ExUi *ui, int *widths, int available) {
   for (int c = 0; c < n - 1; c++) {
     int cap = c == 0 && (ui->tab == EX_TAB_FUNCTIONS || ui->tab == EX_TAB_PASSES)
                   ? 34
-                  : 24;
+              : c == 1 && ui->tab == EX_TAB_OWNERSHIP ? 16
+                                                      : 24;
     if (widths[c] > cap) {
       widths[c] = cap;
     }
@@ -1178,6 +1279,7 @@ static void ex_draw_help(ExUi *ui, ExScreen *s) {
       {"enter", "open the detail, or follow a link"},
       {"s", "the whole source file, at this line"},
       {"d", "the machine code of this function, at this line"},
+      {"e", "this function as the compiler rewrote it, every drop shown"},
       {"esc  backspace", "back"},
       {"/", "filter by any text in the entry"},
       {"m  f  a", "missed only, with a fix only, all"},
@@ -1353,6 +1455,17 @@ static void ex_toggle_machine(ExUi *ui) {
   ui->anchor_pending = ui->source_view == 2;
 }
 
+static void ex_toggle_expanded(ExUi *ui) {
+  const ExEntry *shown = ex_shown(ui, ex_current(ui));
+  if (!shown || ui->report->expanded_count == 0) {
+    return;
+  }
+  ui->source_view = ui->source_view == 3 ? 0 : 3;
+  ui->focus = 1;
+  ui->detail_top = 0;
+  ui->anchor_pending = ui->source_view == 3;
+}
+
 static void ex_back(ExUi *ui) {
   if (ui->source_view) {
     ui->source_view = 0;
@@ -1490,6 +1603,9 @@ static void ex_key_char(ExUi *ui, unsigned code) {
     return;
   case 'd':
     ex_toggle_machine(ui);
+    return;
+  case 'e':
+    ex_toggle_expanded(ui);
     return;
   case ' ':
     ex_step(ui, ex_page(ui));

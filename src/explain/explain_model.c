@@ -1118,52 +1118,607 @@ static void ex_build_overview(ExReport *report, const ExJson *root) {
   }
 }
 
+static size_t ex_display_code(const char *raw, size_t len, char *out,
+                              size_t cap) {
+  return ir_display_code(raw, len, out, cap);
+}
+
+static int ex_expand_header(const char *text, char *name, size_t cap) {
+  const char *p = text;
+  const char *end;
+  while (*p == '@') {
+    while (*p && *p != ' ') {
+      p++;
+    }
+    while (*p == ' ') {
+      p++;
+    }
+  }
+  if (strncmp(p, "export ", 7) == 0) {
+    p += 7;
+  }
+  if (strncmp(p, "fn ", 3) != 0) {
+    return 0;
+  }
+  p += 3;
+  end = strchr(p, '(');
+  if (!end || (size_t)(end - p) >= cap) {
+    return 0;
+  }
+  snprintf(name, cap, "%.*s", (int)(end - p), p);
+  return 1;
+}
+
+static ExExpandFn *ex_expand_open(ExReport *report, const char *name) {
+  ExExpandFn *grown =
+      realloc(report->expanded, (report->expanded_count + 1) * sizeof(*grown));
+  if (!grown) {
+    return NULL;
+  }
+  report->expanded = grown;
+  memset(&grown[report->expanded_count], 0, sizeof(*grown));
+  grown[report->expanded_count].name = ex_strdup(name);
+  return &grown[report->expanded_count++];
+}
+
+static void ex_expand_push(ExExpandFn *fn, int line, const char *text,
+                           int note, int inserted) {
+  if (fn->count == fn->capacity) {
+    size_t capacity = fn->capacity ? fn->capacity * 2 : 32;
+    ExExpandLine *grown = realloc(fn->lines, capacity * sizeof(*grown));
+    if (!grown) {
+      return;
+    }
+    fn->lines = grown;
+    fn->capacity = capacity;
+  }
+  fn->lines[fn->count].line = line;
+  fn->lines[fn->count].text = ex_strdup(text);
+  fn->lines[fn->count].note = note;
+  fn->lines[fn->count].inserted = inserted;
+  fn->count++;
+}
+
+static int ex_expand_names_compiler_local(const char *text) {
+  return strstr(text, "__tmp") || strstr(text, "__matched") ||
+         strstr(text, "__next");
+}
+
+static void ex_expand_line(ExReport *report, ExExpandFn **fn,
+                           int *after_inserted_note, const char *raw,
+                           size_t len) {
+  char body[1024];
+  char shown[1200];
+  char name[128];
+  const char *trimmed;
+  int tag = 0;
+  int note;
+  if (len > 0 && raw[0] == '\x01') {
+    const char *close = memchr(raw, '\x02', len);
+    tag = atoi(raw + 1);
+    if (close) {
+      len -= (size_t)(close + 1 - raw);
+      raw = close + 1;
+    }
+  }
+  snprintf(body, sizeof(body), "%.*s", (int)len, raw);
+  if (ex_expand_header(body, name, sizeof(name))) {
+    *fn = ex_expand_open(report, name);
+    *after_inserted_note = 0;
+  }
+  if (!*fn) {
+    return;
+  }
+  trimmed = body;
+  while (*trimmed == ' ') {
+    trimmed++;
+  }
+  note = strncmp(trimmed, "//", 2) == 0;
+  ex_display_code(body, strlen(body), shown, sizeof(shown));
+  ex_expand_push(*fn, tag, shown, note,
+                 !note && (*after_inserted_note ||
+                           strncmp((*fn)->name, "__drop_", 7) == 0 ||
+                           ex_expand_names_compiler_local(trimmed)));
+  *after_inserted_note = note && strncmp(trimmed, "// inserted", 11) == 0;
+  if (body[0] == '}') {
+    *fn = NULL;
+  }
+}
+
+static void ex_build_expanded(ExReport *report, const ExJson *root) {
+  const char *text = ex_json_text(root, "expanded");
+  ExExpandFn *fn = NULL;
+  int after_inserted_note = 0;
+  while (text && *text) {
+    const char *end = strchr(text, '\n');
+    size_t len = end ? (size_t)(end - text) : strlen(text);
+    ex_expand_line(report, &fn, &after_inserted_note, text, len);
+    text = end ? end + 1 : text + len;
+  }
+}
+
+#define EX_OWN_RECORDS 32
+
+typedef struct {
+  const char *function;
+  char key[96];
+  const ExJson *recs[EX_OWN_RECORDS];
+  size_t count;
+} ExOwnValue;
+
+static size_t ex_span_until(const char *text, const char *stops) {
+  size_t n = 0;
+  while (text[n] && !strchr(stops, text[n])) {
+    n++;
+  }
+  return n;
+}
+
+static int ex_kind_is(const ExJson *r, const char *kind) {
+  return ex_same_text(ex_json_text(r, "kind"), kind);
+}
+
+static void ex_own_key(const ExJson *r, char *key, size_t cap) {
+  const char *subject = ex_json_text(r, "subject");
+  const char *text = ex_json_text(r, "text");
+  const char *reason = ex_json_text(r, "reason");
+  const char *to = reason ? strstr(reason, "to `") : NULL;
+  if (ex_kind_is(r, "temporary") && text && strncmp(text, "var ", 4) == 0) {
+    size_t n = ex_span_until(text + 4, " =");
+    snprintf(key, cap, "%.*s", (int)n, text + 4);
+  } else if (ex_kind_is(r, "discard-drop")) {
+    snprintf(key, cap, "discard:%lld", ex_json_int(r, "line", 0));
+  } else if (subject && strncmp(subject, "__next", 6) == 0 && to &&
+             strchr(to + 4, '`')) {
+    snprintf(key, cap, "%.*s", (int)(strchr(to + 4, '`') - to - 4), to + 4);
+  } else {
+    snprintf(key, cap, "%s", subject ? subject : "?");
+  }
+}
+
+static int ex_own_target(const ExOwnValue *values, size_t count,
+                         const ExOwnValue *next) {
+  long long line = ex_json_int(next->recs[0], "line", 0);
+  for (size_t k = 0; k < count; k++) {
+    if (&values[k] == next || !ex_same_text(values[k].function, next->function)) {
+      continue;
+    }
+    for (size_t r = 0; r < values[k].count; r++) {
+      if (ex_kind_is(values[k].recs[r], "assign-drop") &&
+          ex_json_int(values[k].recs[r], "line", 0) == line) {
+        return (int)k;
+      }
+    }
+  }
+  return -1;
+}
+
+static size_t ex_own_fold_next(ExOwnValue *values, size_t count) {
+  size_t kept = 0;
+  for (size_t i = 0; i < count; i++) {
+    int target = strncmp(values[i].key, "__next", 6) == 0
+                     ? ex_own_target(values, count, &values[i])
+                     : -1;
+    ExOwnValue *into = target >= 0 ? &values[target] : NULL;
+    for (size_t r = 0; into && r < values[i].count &&
+                       into->count < EX_OWN_RECORDS;
+         r++) {
+      into->recs[into->count++] = values[i].recs[r];
+    }
+    values[i].count = into ? 0 : values[i].count;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (values[i].count > 0) {
+      values[kept++] = values[i];
+    }
+  }
+  return kept;
+}
+
+static ExOwnValue *ex_own_values(const ExJson *records, size_t *count_out) {
+  size_t total = ex_json_count(records);
+  size_t count = 0;
+  ExOwnValue *values = total ? calloc(total, sizeof(*values)) : NULL;
+  for (size_t i = 0; values && i < total; i++) {
+    const ExJson *r = ex_json_at(records, i);
+    const char *fn = ex_json_text(r, "function");
+    char key[96];
+    size_t k = 0;
+    if (ex_kind_is(r, "glue")) {
+      continue;
+    }
+    ex_own_key(r, key, sizeof(key));
+    while (k < count && !(ex_same_text(values[k].function, fn) &&
+                          strcmp(values[k].key, key) == 0)) {
+      k++;
+    }
+    if (k == count) {
+      values[count].function = fn;
+      snprintf(values[count].key, sizeof(values[count].key), "%s", key);
+      count++;
+    }
+    if (values[k].count < EX_OWN_RECORDS) {
+      values[k].recs[values[k].count++] = r;
+    }
+  }
+  *count_out = ex_own_fold_next(values, count);
+  return values;
+}
+
+static const ExJson *ex_own_find(const ExOwnValue *v, const char *kind) {
+  for (size_t i = 0; i < v->count; i++) {
+    if (ex_kind_is(v->recs[i], kind)) {
+      return v->recs[i];
+    }
+  }
+  return NULL;
+}
+
+static const ExJson *ex_own_origin(const ExOwnValue *v) {
+  static const char *const order[] = {"temporary", "parameter-drop",
+                                      "arm-drop", "scope-drop",
+                                      "discard-drop"};
+  for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+    const ExJson *r = ex_own_find(v, order[i]);
+    if (r) {
+      return r;
+    }
+  }
+  return v->recs[0];
+}
+
+static int ex_word_at(const char *text, const char *word) {
+  size_t n = strlen(word);
+  for (const char *p = strstr(text, word); p; p = strstr(p + 1, word)) {
+    int before = p > text && (isalnum((unsigned char)p[-1]) || p[-1] == '_');
+    int after = isalnum((unsigned char)p[n]) || p[n] == '_';
+    if (!before && !after) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void ex_own_span(const ExReport *report, const ExOwnValue *v,
+                        int *born, int *last) {
+  const ExExpandFn *fn = ex_report_expanded(report, v->function);
+  *born = 0;
+  *last = 0;
+  for (size_t i = 0; i < v->count; i++) {
+    int line = (int)ex_json_int(v->recs[i], "line", 0);
+    if (line > 0 && (*born == 0 || line < *born)) {
+      *born = line;
+    }
+    if (line > *last) {
+      *last = line;
+    }
+  }
+  for (size_t i = 0; fn && i < fn->count; i++) {
+    const ExExpandLine *l = &fn->lines[i];
+    if (!l->note && l->line > 0 && ex_word_at(l->text, v->key)) {
+      if (l->line < *born || *born == 0) {
+        *born = l->line;
+      }
+      break;
+    }
+  }
+}
+
+static int ex_own_folded(const ExOwnValue *v, const ExJson *r) {
+  return !ex_same_text(ex_json_text(r, "subject"), v->key);
+}
+
+static void ex_own_lines(const ExOwnValue *v, const char *kind, char *out,
+                         size_t cap) {
+  size_t used = 0;
+  out[0] = '\0';
+  for (size_t i = 0; i < v->count && used + 16 < cap; i++) {
+    if (ex_kind_is(v->recs[i], kind) &&
+        !(ex_kind_is(v->recs[i], "move") && ex_own_folded(v, v->recs[i]))) {
+      used += (size_t)snprintf(out + used, cap - used, "%s%lld",
+                               used ? ", " : "",
+                               ex_json_int(v->recs[i], "line", 0));
+    }
+  }
+}
+
+static int ex_own_guarded(const ExOwnValue *v) {
+  return ex_own_find(v, "live-bit") != NULL;
+}
+
+static char *ex_own_life(const ExOwnValue *v) {
+  char moves[96];
+  char frees[96];
+  char reassigned[96];
+  char discard[32];
+  ex_own_lines(v, "move", moves, sizeof(moves));
+  ex_own_lines(v, "drop-runs", frees, sizeof(frees));
+  ex_own_lines(v, "assign-drop", reassigned, sizeof(reassigned));
+  ex_own_lines(v, "discard-drop", discard, sizeof(discard));
+  char out[320];
+  size_t used = 0;
+  if (discard[0]) {
+    return ex_fmt("never stored, freed at %s", discard);
+  }
+  out[0] = '\0';
+  if (moves[0]) {
+    used += (size_t)snprintf(out + used, sizeof(out) - used, "moves at %s",
+                             moves);
+  }
+  if (reassigned[0] && used < sizeof(out)) {
+    used += (size_t)snprintf(out + used, sizeof(out) - used,
+                             "%sold value freed at %s", used ? ", " : "",
+                             reassigned);
+  }
+  if (frees[0] && used < sizeof(out)) {
+    used += (size_t)snprintf(out + used, sizeof(out) - used, "%s%s %s%s",
+                             used ? ", " : "",
+                             moves[0] ? "else freed at" : "freed at", frees,
+                             !moves[0] && ex_own_guarded(v)
+                                 ? " if it holds one"
+                                 : "");
+  }
+  return ex_strdup(used ? out : "moves out, never freed here");
+}
+
+static void ex_own_callee(const char *lowered, char *out, size_t cap) {
+  const char *at = lowered ? strstr(lowered, "call to ") : NULL;
+  size_t n;
+  out[0] = '\0';
+  if (!at) {
+    return;
+  }
+  at += 8;
+  n = ex_span_until(at, ", ");
+  snprintf(out, cap, "%.*s", (int)n, at);
+}
+
+static char *ex_own_glue_body(const ExReport *report, const char *glue) {
+  const ExExpandFn *fn = ex_report_expanded(report, glue);
+  char body[512];
+  size_t used = 0;
+  body[0] = '\0';
+  for (size_t i = 1; fn && i < fn->count && used + 8 < sizeof(body); i++) {
+    const char *t = fn->lines[i].text;
+    while (*t == ' ') {
+      t++;
+    }
+    if (fn->lines[i].note || !*t || strcmp(t, "}") == 0 ||
+        strcmp(t, "{") == 0) {
+      continue;
+    }
+    used += (size_t)snprintf(body + used, sizeof(body) - used, "%s%s",
+                             used ? "  " : "", t);
+  }
+  return used ? ex_strdup(body) : NULL;
+}
+
+static char *ex_own_drop_does(const ExReport *report, const ExOwnValue *v) {
+  char callee[128];
+  char shown[160];
+  for (size_t i = 0; i < v->count; i++) {
+    ex_own_callee(ex_json_text(v->recs[i], "lowered"), callee,
+                  sizeof(callee));
+    if (callee[0]) {
+      break;
+    }
+  }
+  if (!callee[0]) {
+    return NULL;
+  }
+  if (strncmp(callee, "__drop_", 7) == 0) {
+    char *body = ex_own_glue_body(report, callee);
+    char *out;
+    ir_display_name(callee, shown, sizeof(shown));
+    out = body ? ex_fmt("%s: %s", shown, body) : ex_strdup(shown);
+    free(body);
+    return out;
+  }
+  if (strcmp(callee, "mettle_string_free") == 0) {
+    return ex_strdup("frees the string's heap buffer (mettle_string_free)");
+  }
+  ir_display_name(callee, shown, sizeof(shown));
+  return ex_fmt("calls %s", shown);
+}
+
+static char *ex_own_name(const ExOwnValue *v) {
+  const ExJson *temp = ex_own_find(v, "temporary");
+  const ExJson *discard = ex_own_find(v, "discard-drop");
+  const char *expr = temp      ? ex_json_text(temp, "subject")
+                     : discard ? ex_json_text(discard, "subject")
+                               : NULL;
+  char shown[256];
+  if (!expr) {
+    return ex_fmt("`%s`", v->key);
+  }
+  ex_display_code(expr, strlen(expr), shown, sizeof(shown));
+  return ex_fmt("`%s`", shown);
+}
+
+static void ex_own_source_field(ExEntry *entry, const ExReport *report,
+                                const char *label, const ExJson *r,
+                                const char *tail) {
+  int line = (int)ex_json_int(r, "line", 0);
+  const char *text = ex_report_line(report, line);
+  char shown[256];
+  while (text && *text == ' ') {
+    text++;
+  }
+  ex_display_code(text ? text : "", text ? strlen(text) : 0, shown,
+                  sizeof(shown));
+  if (shown[0] && shown[strlen(shown) - 1] == ';') {
+    shown[strlen(shown) - 1] = '\0';
+  }
+  if (shown[0] == '}' || !shown[0]) {
+    snprintf(shown, sizeof(shown), "when its block ends");
+  }
+  ex_field_owned(entry, label,
+                 ex_fmt("line %d: %s%s%s", line, shown, tail ? ", " : "",
+                        tail ? tail : ""),
+                 EX_TONE_PLAIN);
+}
+
+static void ex_own_event_fields(ExEntry *entry, const ExReport *report,
+                                const ExOwnValue *v) {
+  for (size_t i = 0; i < v->count; i++) {
+    const ExJson *r = v->recs[i];
+    const char *text = ex_json_text(r, "text");
+    if (ex_kind_is(r, "move") && ex_own_folded(v, r)) {
+      ex_own_source_field(entry, report, "Replaced", r,
+                          "by a value built for it");
+    } else if (ex_kind_is(r, "move")) {
+      ex_own_source_field(entry, report, "Moves", r, NULL);
+    } else if (ex_kind_is(r, "drop-runs")) {
+      ex_own_source_field(entry, report, "Freed", r,
+                          text && strstr(text, "if it has not moved")
+                              ? "if it has not moved"
+                              : NULL);
+    } else if (ex_kind_is(r, "assign-drop")) {
+      ex_own_source_field(entry, report, "Freed", r,
+                          "the old value, before the assignment replaces it");
+    } else if (ex_kind_is(r, "discard-drop")) {
+      ex_own_source_field(entry, report, "Freed", r, "at once, never stored");
+    }
+  }
+}
+
+static void ex_own_written_fields(ExEntry *entry, const ExOwnValue *v) {
+  static const char *const order[] = {
+      "temporary",   "scope-drop",   "parameter-drop", "arm-drop",
+      "assign-drop", "discard-drop", "drop-runs"};
+  for (size_t k = 0; k < sizeof(order) / sizeof(order[0]); k++) {
+    for (size_t i = 0; i < v->count; i++) {
+      const char *text = ex_json_text(v->recs[i], "text");
+      char shown[256];
+      if (text && ex_kind_is(v->recs[i], order[k])) {
+        ex_display_code(text, strlen(text), shown, sizeof(shown));
+        ex_field(entry, "Written out", shown, EX_TONE_PLAIN);
+      }
+    }
+  }
+}
+
+static void ex_own_cost_fields(ExEntry *entry, const ExOwnValue *v) {
+  for (size_t i = 0; i < v->count; i++) {
+    const char *lowered = ex_json_text(v->recs[i], "lowered");
+    const char *optimized = ex_json_text(v->recs[i], "optimized");
+    char shown[256];
+    if (lowered && ex_kind_is(v->recs[i], "drop-runs")) {
+      ex_display_code(lowered, strlen(lowered), shown, sizeof(shown));
+      ex_field(entry, "Compiled to", shown, EX_TONE_PLAIN);
+      ex_field(entry, "Optimized", optimized, EX_TONE_PLAIN);
+    }
+  }
+}
+
+static void ex_own_value_entry(ExTab *tab, const ExReport *report,
+                               const ExOwnValue *v) {
+  const ExJson *origin = ex_own_origin(v);
+  const ExJson *bit = ex_own_find(v, "live-bit");
+  const char *type = ex_json_text(origin, "type");
+  char type_shown[128];
+  char fn_shown[128];
+  int born;
+  int last;
+  ExEntry *entry = ex_add(tab, v->function);
+  if (!entry) {
+    return;
+  }
+  ex_own_span(report, v, &born, &last);
+  ex_display_code(type ? type : "?", type ? strlen(type) : 1, type_shown,
+                  sizeof(type_shown));
+  ir_display_name(v->function, fn_shown, sizeof(fn_shown));
+  entry->function = ex_strdup(v->function);
+  entry->cells[0] = ex_fmt("%d", born);
+  entry->cells[1] = ex_own_name(v);
+  entry->cells[2] = ex_own_life(v);
+  entry->title = ex_fmt("%s in %s, a %s, lines %d to %d", entry->cells[1],
+                        fn_shown, type_shown, born, last);
+  entry->line = born;
+  entry->end_line = last;
+  entry->tone = ex_json_flag(origin, "inserted") ? EX_TONE_PLAIN
+                                                 : EX_TONE_DONE;
+  ex_field(entry, "Comes from", ex_json_text(origin, "reason"), EX_TONE_PLAIN);
+  ex_own_event_fields(entry, report, v);
+  ex_field(entry, "Live bit", bit ? ex_json_text(bit, "reason") : NULL,
+           EX_TONE_PLAIN);
+  ex_field_owned(entry, "Drop runs", ex_own_drop_does(report, v),
+                 EX_TONE_PLAIN);
+  ex_own_written_fields(entry, v);
+  ex_own_cost_fields(entry, v);
+  ex_finish(entry);
+}
+
+static void ex_own_glue_entry(ExTab *tab, const ExReport *report,
+                              const ExJson *r) {
+  const char *glue = ex_json_text(r, "subject");
+  const char *type = ex_json_text(r, "type");
+  char type_shown[128];
+  char *body = ex_own_glue_body(report, glue);
+  ExEntry *entry = ex_add(tab, "Drop glue");
+  if (!entry) {
+    free(body);
+    return;
+  }
+  ex_display_code(type ? type : "?", type ? strlen(type) : 1, type_shown,
+                  sizeof(type_shown));
+  entry->function = ex_strdup(glue);
+  entry->cells[0] = ex_fmt("%lld", ex_json_int(r, "line", 0));
+  entry->cells[1] = ex_fmt("`%s`", type_shown);
+  entry->cells[2] = body ? ex_strdup(body) : NULL;
+  entry->title = ex_fmt("what dropping a %s runs", type_shown);
+  entry->line = (int)ex_json_int(r, "line", 0);
+  ex_field(entry, "Runs", body, EX_TONE_PLAIN);
+  ex_field(entry, "Why", ex_json_text(r, "reason"), EX_TONE_PLAIN);
+  free(body);
+  ex_finish(entry);
+}
+
+static void ex_own_summary(ExTab *tab, const ExOwnValue *values, size_t count) {
+  size_t guarded = 0;
+  size_t moved = 0;
+  size_t freed = 0;
+  for (size_t i = 0; i < count; i++) {
+    guarded += ex_own_guarded(&values[i]) ? 1u : 0u;
+    moved += ex_own_find(&values[i], "move") ? 1u : 0u;
+    freed += ex_own_find(&values[i], "drop-runs") ||
+                     ex_own_find(&values[i], "discard-drop")
+                 ? 1u
+                 : 0u;
+  }
+  if (count == 0) {
+    return;
+  }
+  ex_summary(tab, ex_fmt("%zu owned value%s: %zu freed where shown, %zu "
+                         "moved somewhere on some path, %zu behind a live bit",
+                         count, count == 1 ? "" : "s", freed, moved, guarded));
+  ex_summary(tab, ex_strdup("e shows the function as the compiler rewrote "
+                            "it, with every inserted drop"));
+}
+
 static void ex_build_ownership(ExReport *report, const ExJson *root) {
   ExTab *tab = &report->tabs[EX_TAB_OWNERSHIP];
   const ExJson *records = ex_json_get(root, "ownership");
+  size_t count = 0;
+  ExOwnValue *values = ex_own_values(records, &count);
   tab->name = "Ownership";
   tab->columns[0] = "Line";
-  tab->columns[1] = "Record";
-  tab->columns[2] = "Value";
+  tab->columns[1] = "Value";
+  tab->columns[2] = "Life";
   tab->column_count = 3;
   tab->empty = "Nothing in this file owns a resource, so the compiler "
                "inserted no drops and followed no moves.";
-  for (size_t i = 0; i < ex_json_count(records); i++) {
-    const ExJson *r = ex_json_at(records, i);
-    const char *kind = ex_json_text(r, "kind");
-    const char *subject = ex_json_text(r, "subject");
-    long long line = ex_json_int(r, "line", 0);
-    int inserted = ex_json_flag(r, "inserted");
-    ExEntry *entry = ex_add(tab, ex_json_text(r, "function"));
-    char *label = ex_spaced(kind ? kind : "?");
-    if (!entry) {
-      free(label);
-      return;
-    }
-    entry->function = ex_strdup(ex_json_text(r, "function"));
-    entry->cells[0] = ex_fmt("%lld", line);
-    entry->cells[1] = label;
-    entry->cells[2] = subject ? ex_fmt("`%s`", subject) : NULL;
-    entry->title = subject ? ex_fmt("%s `%s` at line %lld", label, subject,
-                                    line)
-                           : ex_fmt("%s at line %lld", label, line);
-    entry->line = (int)line;
-    entry->order = !kind                              ? 1
-                   : strcmp(kind, "temporary") == 0 ? 0
-                   : strcmp(kind, "drop-runs") == 0 ? 2
-                                                     : 1;
-    entry->tone = inserted ? EX_TONE_PLAIN : EX_TONE_DONE;
-    ex_field(entry, "Written out", ex_json_text(r, "text"), EX_TONE_PLAIN);
-    ex_field(entry, "Reason", ex_json_text(r, "reason"), EX_TONE_PLAIN);
-    ex_field(entry, "Lowered to", ex_json_text(r, "lowered"), EX_TONE_PLAIN);
-    ex_field(entry, "Optimized", ex_json_text(r, "optimized"), EX_TONE_PLAIN);
-    ex_field(entry, "Type", ex_json_text(r, "type"), EX_TONE_PLAIN);
-    ex_field(entry, "Inserted",
-             inserted ? "by the compiler; mettle expand prints it" : NULL,
-             EX_TONE_PLAIN);
-    ex_finish(entry);
+  ex_own_summary(tab, values, count);
+  for (size_t i = 0; i < count; i++) {
+    ex_own_value_entry(tab, report, &values[i]);
   }
+  free(values);
   ex_order_groups(tab, root, NULL);
+  for (size_t i = 0; i < ex_json_count(records); i++) {
+    if (ex_kind_is(ex_json_at(records, i), "glue")) {
+      ex_own_glue_entry(tab, report, ex_json_at(records, i));
+    }
+  }
 }
 
 static void ex_build_memory(ExReport *report, const ExJson *root) {
@@ -1869,6 +2424,19 @@ static void ex_build_machine(ExReport *report, const ExJson *root) {
   }
 }
 
+const ExExpandFn *ex_report_expanded(const ExReport *report,
+                                     const char *function) {
+  if (!report || !function) {
+    return NULL;
+  }
+  for (size_t i = 0; i < report->expanded_count; i++) {
+    if (ex_same_text(report->expanded[i].name, function)) {
+      return &report->expanded[i];
+    }
+  }
+  return NULL;
+}
+
 const ExMachineFn *ex_report_machine(const ExReport *report,
                                      const char *function) {
   if (!report || !function) {
@@ -1899,6 +2467,7 @@ ExReport *ex_report_build(const ExJson *root, const char *source_path) {
   report->source_path = ex_strdup(path);
   ex_load_source(report, path);
   ex_build_machine(report, root);
+  ex_build_expanded(report, root);
   ex_build_optimizer(report, root);
   ex_build_overview(report, root);
   ex_build_ownership(report, root);
@@ -1939,6 +2508,15 @@ void ex_report_free(ExReport *report) {
     free(fn->name);
   }
   free(report->machine);
+  for (size_t i = 0; i < report->expanded_count; i++) {
+    ExExpandFn *fn = &report->expanded[i];
+    for (size_t k = 0; k < fn->count; k++) {
+      free(fn->lines[k].text);
+    }
+    free(fn->lines);
+    free(fn->name);
+  }
+  free(report->expanded);
   free(report->source_name);
   free(report->source_path);
   free(report);

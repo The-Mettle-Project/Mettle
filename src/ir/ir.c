@@ -1292,6 +1292,50 @@ void ir_display_name(const char *name, char *out, size_t cap) {
   ir_name_put_generic(&b, p);
 }
 
+static int ir_name_char(char c, int first) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+         (!first && c >= '0' && c <= '9');
+}
+
+static int ir_name_is_mangled(const char *token) {
+  return (strncmp(token, "__", 2) != 0 && strstr(token, "__")) ||
+         strncmp(token, "__drop_", 7) == 0;
+}
+
+size_t ir_display_code(const char *raw, size_t len, char *out, size_t cap) {
+  size_t used = 0;
+  int quoted = 0;
+  if (!out || cap == 0) {
+    return 0;
+  }
+  for (size_t i = 0; raw && i < len && used + 1 < cap;) {
+    size_t start = i;
+    char token[128];
+    char shown[160];
+    if (raw[i] == '"' && (i == 0 || raw[i - 1] != '\\')) {
+      quoted = !quoted;
+    }
+    if (quoted || !ir_name_char(raw[i], 1)) {
+      out[used++] = raw[i++];
+      continue;
+    }
+    while (i < len && ir_name_char(raw[i], 0)) {
+      i++;
+    }
+    snprintf(token, sizeof(token), "%.*s", (int)(i - start), raw + start);
+    if (ir_name_is_mangled(token)) {
+      ir_display_name(token, shown, sizeof(shown));
+    } else {
+      snprintf(shown, sizeof(shown), "%s", token);
+    }
+    for (const char *p = shown; *p && used + 1 < cap; p++) {
+      out[used++] = *p;
+    }
+  }
+  out[used] = '\0';
+  return used;
+}
+
 IRFunction *ir_function_create(const char *name) {
   IRFunction *function = calloc(1, sizeof(IRFunction));
   if (!function) {

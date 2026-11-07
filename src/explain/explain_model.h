@@ -67,6 +67,20 @@ typedef struct {
 } ExMachineFn;
 
 typedef struct {
+  int line;
+  char *text;
+  int note;
+  int inserted;
+} ExExpandLine;
+
+typedef struct {
+  char *name;
+  ExExpandLine *lines;
+  size_t count;
+  size_t capacity;
+} ExExpandFn;
+
+typedef struct {
   const char *name;
   const char *columns[EX_CELLS];
   int column_count;
@@ -87,12 +101,16 @@ typedef struct {
   ExMachineFn *machine;
   size_t machine_count;
   long long machine_total;
+  ExExpandFn *expanded;
+  size_t expanded_count;
 } ExReport;
 
 ExReport *ex_report_build(const ExJson *root, const char *source_path);
 void ex_report_free(ExReport *report);
 const char *ex_report_line(const ExReport *report, int line);
 const ExMachineFn *ex_report_machine(const ExReport *report,
+                                     const char *function);
+const ExExpandFn *ex_report_expanded(const ExReport *report,
                                      const char *function);
 
 #endif

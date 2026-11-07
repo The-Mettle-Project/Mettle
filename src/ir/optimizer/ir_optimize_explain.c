@@ -2951,17 +2951,31 @@ static void ir_explain_own_after(const IRExplainOwnNote *note, char *out,
     return;
   }
   if (note->calls_left > 0) {
-    snprintf(out, size, "%zu call%s left after optimization",
+    snprintf(out, size,
+             "%zu call%s left after optimization, counting every copy "
+             "inlining made",
              note->calls_left, note->calls_left == 1 ? "" : "s");
   } else {
-    snprintf(out, size, "inlined by the optimizer; --annotate-asm shows the "
-                        "instructions at line %zu",
-             note->line);
+    snprintf(out, size, "inlined at line %zu", note->line);
   }
+}
+
+static MTLC_THREAD_LOCAL char *g_expanded = NULL;
+
+void ir_explain_set_expanded(char *text) {
+  free(g_expanded);
+  g_expanded = text;
 }
 
 static void ir_explain_ownership_json(void) {
   char after[160];
+  if (g_expanded) {
+    ir_explain_json_raw("\"expanded\":");
+    ir_explain_json_str(g_expanded);
+    ir_explain_json_raw(",");
+    free(g_expanded);
+    g_expanded = NULL;
+  }
   ir_explain_json_raw("\"ownership\":[");
   for (size_t i = 0; i < g_own_count; i++) {
     const IRExplainOwnNote *n = &g_own_notes[i];
@@ -3000,6 +3014,181 @@ static int ir_explain_own_compare(const void *a, const void *b) {
   return 0;
 }
 
+static void ir_explain_own_key(const IRExplainOwnNote *n, char *key,
+                               size_t cap) {
+  const char *to = n->reason ? strstr(n->reason, "to `") : NULL;
+  if (n->kind && strcmp(n->kind, "temporary") == 0 && n->text &&
+      strncmp(n->text, "var ", 4) == 0) {
+    size_t len = 0;
+    while (n->text[4 + len] && n->text[4 + len] != ' ' &&
+           n->text[4 + len] != '=') {
+      len++;
+    }
+    snprintf(key, cap, "%.*s", (int)len, n->text + 4);
+  } else if (n->kind && strcmp(n->kind, "discard-drop") == 0) {
+    snprintf(key, cap, "discard:%zu", n->line);
+  } else if (n->subject && strncmp(n->subject, "__next", 6) == 0 && to &&
+             strchr(to + 4, '`')) {
+    snprintf(key, cap, "%.*s", (int)(strchr(to + 4, '`') - to - 4), to + 4);
+  } else if (n->subject && strncmp(n->subject, "__next", 6) == 0) {
+    const char *target = n->subject;
+    for (size_t i = 0; i < g_own_count; i++) {
+      const IRExplainOwnNote *o = &g_own_notes[i];
+      if (o->line == n->line && o->kind &&
+          strcmp(o->kind, "assign-drop") == 0 &&
+          ir_explain_str_eq(o->function, n->function) && o->subject) {
+        target = o->subject;
+      }
+    }
+    snprintf(key, cap, "%s", target);
+  } else {
+    snprintf(key, cap, "%s", n->subject ? n->subject : "?");
+  }
+}
+
+static int ir_explain_own_seen(size_t at, const char *key) {
+  for (size_t i = 0; i < at; i++) {
+    char other[96];
+    if (!ir_explain_str_eq(g_own_notes[i].function, g_own_notes[at].function)) {
+      continue;
+    }
+    ir_explain_own_key(&g_own_notes[i], other, sizeof(other));
+    if (strcmp(other, key) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void ir_explain_own_append(char *out, size_t cap, const char *kind,
+                                  const char *key, const char *function) {
+  size_t used = strlen(out);
+  for (size_t i = 0; i < g_own_count && used + 16 < cap; i++) {
+    const IRExplainOwnNote *n = &g_own_notes[i];
+    char other[96];
+    if (!n->kind || strcmp(n->kind, kind) != 0 ||
+        !ir_explain_str_eq(n->function, function)) {
+      continue;
+    }
+    ir_explain_own_key(n, other, sizeof(other));
+    if (strcmp(other, key) == 0 &&
+        !(strcmp(kind, "move") == 0 && !ir_explain_str_eq(n->subject, key))) {
+      used += (size_t)snprintf(out + used, cap - used, "%s%zu",
+                               out[used - 1] == ' ' ? "" : ", ", n->line);
+    }
+  }
+}
+
+static void ir_explain_own_life(const char *key, const char *function,
+                                char *out, size_t cap) {
+  char moves[96] = "moves at ";
+  char frees[96] = "freed at ";
+  char again[96] = "old value freed at ";
+  char once[96] = "never stored, freed at ";
+  const char *parts[4];
+  size_t count = 0;
+  size_t used = 0;
+  ir_explain_own_append(moves, sizeof(moves), "move", key, function);
+  ir_explain_own_append(frees, sizeof(frees), "drop-runs", key, function);
+  ir_explain_own_append(again, sizeof(again), "assign-drop", key, function);
+  ir_explain_own_append(once, sizeof(once), "discard-drop", key, function);
+  if (once[strlen(once) - 1] != ' ') {
+    parts[count++] = once;
+  }
+  if (moves[strlen(moves) - 1] != ' ') {
+    parts[count++] = moves;
+  }
+  if (again[strlen(again) - 1] != ' ') {
+    parts[count++] = again;
+  }
+  if (frees[strlen(frees) - 1] != ' ') {
+    parts[count++] = frees;
+  }
+  out[0] = '\0';
+  for (size_t i = 0; i < count && used < cap; i++) {
+    used += (size_t)snprintf(
+        out + used, cap - used, "%s%s%s", i ? ", " : "",
+        parts[i] == frees && moves[strlen(moves) - 1] != ' ' ? "else " : "",
+        parts[i]);
+  }
+}
+
+static int ir_explain_own_rank(const char *kind) {
+  static const char *const order[] = {"temporary",    "scope-drop",
+                                      "parameter-drop", "arm-drop",
+                                      "assign-drop",  "discard-drop",
+                                      "drop-runs"};
+  for (int i = 0; i < (int)(sizeof(order) / sizeof(order[0])); i++) {
+    if (kind && strcmp(kind, order[i]) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static void ir_explain_own_written(const IRExplainOwnNote *n, char *after,
+                                   size_t after_cap) {
+  char text[320];
+  char shown[400];
+  size_t len;
+  snprintf(text, sizeof(text), "%s", n->text);
+  len = strlen(text);
+  if (len > 0 && text[len - 1] == ';') {
+    text[len - 1] = '\0';
+  }
+  if (n->lowered) {
+    snprintf(text + strlen(text), sizeof(text) - strlen(text), ", %s",
+             n->lowered);
+  }
+  ir_explain_own_after(n, after, after_cap);
+  if (after[0]) {
+    snprintf(text + strlen(text), sizeof(text) - strlen(text), ", %s", after);
+  }
+  ir_display_code(text, strlen(text), shown, sizeof(shown));
+  ir_explain_emit("      %s%s line %zu: %s%s\n", clr(EXPLAIN_DIM),
+                  glyph_elbow(), n->line, shown, clr(EXPLAIN_RESET));
+}
+
+static void ir_explain_own_value(const char *key, const char *function,
+                                 char *after, size_t after_cap) {
+  char life[320];
+  char name[160];
+  const IRExplainOwnNote *lead = NULL;
+  ir_explain_own_life(key, function, life, sizeof(life));
+  for (size_t i = 0; i < g_own_count; i++) {
+    const IRExplainOwnNote *n = &g_own_notes[i];
+    char other[96];
+    ir_explain_own_key(n, other, sizeof(other));
+    if (!ir_explain_str_eq(n->function, function) || strcmp(other, key) != 0) {
+      continue;
+    }
+    if (!lead || (n->kind && strcmp(n->kind, "temporary") == 0)) {
+      lead = n;
+    }
+  }
+  char header[400];
+  snprintf(name, sizeof(name), "`%s` (%s)",
+           lead && lead->kind && strcmp(lead->kind, "temporary") == 0
+               ? lead->subject
+           : strncmp(key, "discard:", 8) == 0 && lead ? lead->subject
+                                                      : key,
+           lead && lead->type ? lead->type : "?");
+  ir_display_code(name, strlen(name), header, sizeof(header));
+  ir_explain_emit("    %s: %s\n", header, life);
+  for (int rank = 0; rank < 7; rank++) {
+    for (size_t i = 0; i < g_own_count; i++) {
+      const IRExplainOwnNote *n = &g_own_notes[i];
+      char other[96];
+      ir_explain_own_key(n, other, sizeof(other));
+      if (ir_explain_str_eq(n->function, function) &&
+          strcmp(other, key) == 0 && n->text &&
+          ir_explain_own_rank(n->kind) == rank) {
+        ir_explain_own_written(n, after, after_cap);
+      }
+    }
+  }
+}
+
 static void ir_explain_ownership_flush(void) {
   const char *function = NULL;
   char after[160];
@@ -3014,32 +3203,24 @@ static void ir_explain_ownership_flush(void) {
     return;
   }
   ir_explain_print_header("ownership report");
-  ir_explain_emit("  %zu record%s: drops the compiler inserted, drops you "
-                  "wrote, moves, and live bits\n",
-                  g_own_count, g_own_count == 1 ? "" : "s");
+  ir_explain_emit("  every owned value, where it moves and where it is freed; "
+                  "`mettle expand` prints the rewritten source\n");
   for (size_t i = 0; i < g_own_count; i++) {
     const IRExplainOwnNote *n = &g_own_notes[i];
+    char key[96];
+    if (n->kind && strcmp(n->kind, "glue") == 0) {
+      continue;
+    }
     if (!function || !n->function || strcmp(function, n->function) != 0) {
+      char shown[128];
       function = n->function;
       ir_explain_emit("  %sin %s%s\n", clr(EXPLAIN_BOLD),
-                      function ? function : "?", clr(EXPLAIN_RESET));
+                      ir_explain_shown(function, shown, sizeof(shown)),
+                      clr(EXPLAIN_RESET));
     }
-    ir_explain_emit("    line %zu, %s%s%s%s%s: %s\n", n->line, n->kind,
-                    n->subject ? " `" : "", n->subject ? n->subject : "",
-                    n->subject ? "`" : "", n->inserted ? ", inserted" : "",
-                    n->reason ? n->reason : "");
-    if (n->text) {
-      ir_explain_emit("      %s%s written out: %s%s\n", clr(EXPLAIN_DIM),
-                      glyph_elbow(), n->text, clr(EXPLAIN_RESET));
-    }
-    if (n->lowered) {
-      ir_explain_emit("      %s%s lowered to: %s%s\n", clr(EXPLAIN_DIM),
-                      glyph_elbow(), n->lowered, clr(EXPLAIN_RESET));
-    }
-    ir_explain_own_after(n, after, sizeof(after));
-    if (after[0]) {
-      ir_explain_emit("      %s%s %s%s\n", clr(EXPLAIN_DIM), glyph_elbow(),
-                      after, clr(EXPLAIN_RESET));
+    ir_explain_own_key(n, key, sizeof(key));
+    if (!ir_explain_own_seen(i, key)) {
+      ir_explain_own_value(key, n->function, after, sizeof(after));
     }
   }
   ir_explain_emit("\n");

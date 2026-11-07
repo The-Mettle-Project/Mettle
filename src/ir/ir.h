@@ -472,6 +472,7 @@ void ir_declare_float_bound(const char *type_name, double lo, double hi);
 void ir_declare_nonzero_type(const char *type_name);
 int ir_type_is_nonzero(const char *type_name);
 void ir_display_name(const char *name, char *out, size_t cap);
+size_t ir_display_code(const char *raw, size_t len, char *out, size_t cap);
 int ir_lookup_float_bound(const char *type_name, double *lo, double *hi);
 int ir_has_float_bounds(void);
 

@@ -652,6 +652,7 @@ const char *ir_simd_bail_id_name(int id) {
   case IR_SIMD_BAIL_COUNTER_STORE:       return "counter-store";
   case IR_SIMD_BAIL_SCATTER_STORE:       return "scatter-store";
   case IR_SIMD_BAIL_CHOSEN_INDEX:        return "chosen-index";
+  case IR_SIMD_BAIL_INVARIANT_ADDEND:    return "invariant-addend";
   case IR_SIMD_BAIL_UNRECOGNIZED_SHAPE:  return "unrecognized-shape";
   }
   return "unknown";
@@ -918,16 +919,38 @@ static void ir_simd_scan_memory(IrSimdBail *d, const IRInstruction *ins,
 
 }
 
+static int ir_simd_temp_adds_to(const IrSimdBail *d, const IROperand *temp,
+                                 const IROperand *acc) {
+  if (temp->kind != IR_OPERAND_TEMP || !temp->name) {
+    return 0;
+  }
+  for (size_t i = d->begin + 1; i < d->end; i++) {
+    const IRInstruction *def = &d->function->instructions[i];
+    if (def->op == IR_OP_BINARY && def->text && strcmp(def->text, "+") == 0 &&
+        def->dest.kind == IR_OPERAND_TEMP && def->dest.name &&
+        strcmp(def->dest.name, temp->name) == 0) {
+      return (ir_operand_is_symbol(&def->lhs) &&
+              ir_operand_names_match(&def->lhs, acc)) ||
+             (ir_operand_is_symbol(&def->rhs) &&
+              ir_operand_names_match(&def->rhs, acc));
+    }
+  }
+  return 0;
+}
+
 static void ir_simd_scan_binary(IrSimdBail *d, const IRInstruction *ins) {
-  if (!ins->is_float && ins->text && ins->text[0] == '+' &&
-      !ins->text[1] && ins->dest.kind == IR_OPERAND_SYMBOL &&
-      ins->dest.name &&
+  int plus = !ins->is_float && ins->text && ins->text[0] == '+' &&
+             !ins->text[1] && ins->dest.kind == IR_OPERAND_SYMBOL &&
+             ins->dest.name;
+  if (plus &&
       ((ir_operand_is_symbol(&ins->lhs) &&
         ir_operand_names_match(&ins->lhs, &ins->dest) &&
         ins->rhs.kind == IR_OPERAND_TEMP) ||
        (ir_operand_is_symbol(&ins->rhs) &&
         ir_operand_names_match(&ins->rhs, &ins->dest) &&
-        ins->lhs.kind == IR_OPERAND_TEMP))) {
+        ins->lhs.kind == IR_OPERAND_TEMP) ||
+       ir_simd_temp_adds_to(d, &ins->lhs, &ins->dest) ||
+       ir_simd_temp_adds_to(d, &ins->rhs, &ins->dest))) {
     d->has_int_accum = 1;
     d->int_accum_sym = ins->dest.name;
   }
@@ -1669,6 +1692,52 @@ static int ir_simd_bail_scatter_store(IrSimdBail *d) {
   return 0;
 }
 
+static const IRInstruction *ir_simd_split_sum(const IrSimdBail *d,
+                                              const IROperand **extra) {
+  for (size_t i = d->begin + 1; i < d->end; i++) {
+    const IRInstruction *ins = &d->function->instructions[i];
+    if (ins->op != IR_OP_BINARY || ins->is_float || !ins->text ||
+        strcmp(ins->text, "+") != 0 || ins->dest.kind != IR_OPERAND_SYMBOL) {
+      continue;
+    }
+    if (ir_simd_temp_adds_to(d, &ins->lhs, &ins->dest)) {
+      *extra = &ins->rhs;
+      return ins;
+    }
+    if (ir_simd_temp_adds_to(d, &ins->rhs, &ins->dest)) {
+      *extra = &ins->lhs;
+      return ins;
+    }
+  }
+  return NULL;
+}
+
+static int ir_simd_bail_invariant_addend(IrSimdBail *d) {
+  const IROperand *extra = NULL;
+  const IRInstruction *sum = ir_simd_split_sum(d, &extra);
+  const char *acc_type;
+  char acc[64];
+  if (!sum || !d->has_i32_load || ir_simd_chain_loads(d, extra, 0)) {
+    return 0;
+  }
+  ir_simd_source_name(sum->dest.name, acc, sizeof(acc));
+  acc_type = ir_function_local_declared_type(d->function, sum->dest.name);
+  snprintf(d->reason, d->reason_cap,
+           "each iteration adds an element to `%s` and also a term that is "
+           "the same on every iteration. The sum kernel adds one element per "
+           "lane and nothing else, so the extra term keeps it out",
+           acc);
+  snprintf(d->fix, d->fix_cap,
+           "sum the elements alone, `%s = %s + a[i]`, and add the term once "
+           "after the loop as `n * term`%s",
+           acc, acc,
+           acc_type && strcmp(acc_type, "int64") == 0
+               ? ""
+               : ", with the accumulator declared int64");
+  ir_simd_diag(d, IR_SIMD_BAIL_INVARIANT_ADDEND);
+  return 1;
+}
+
 static size_t ir_simd_arm_of(const IrSimdBail *d, size_t def_at) {
   size_t arm = 0;
   for (size_t i = d->begin + 1; i < def_at; i++) {
@@ -1893,6 +1962,7 @@ static const IrSimdBailRule IR_SIMD_BAIL_RULES[] = {
     ir_simd_bail_reloaded_base,
     ir_simd_bail_mixed_float_widths,
     ir_simd_bail_byte_sum_accumulator,
+    ir_simd_bail_invariant_addend,
     ir_simd_bail_int32_sum_accumulator,
     ir_simd_bail_body_local,
     ir_simd_bail_dot_shape_address,
@@ -2442,6 +2512,7 @@ static const struct {
 };
 
 #define IR_SIMD_FIX_PARTIAL 2
+#define IR_SIMD_FIX_DEAD_END 3
 static int ir_explain_simulate_fix(const IRFunction *function, size_t begin,
                                    size_t end, IRSimdFixMutator mutate,
                                    int diagnosis, char *desc, size_t desc_cap,
@@ -2481,7 +2552,10 @@ static int ir_explain_simulate_fix(const IRFunction *function, size_t begin,
                            next_reason_cap, scratch, sizeof(scratch),
                            &next_diagnosis, &next_advisory);
       if (next_diagnosis != IR_SIMD_BAIL_NONE && next_diagnosis != diagnosis) {
-        verified = IR_SIMD_FIX_PARTIAL;
+        verified = next_advisory &&
+                           next_diagnosis != IR_SIMD_BAIL_UNRECOGNIZED_SHAPE
+                       ? IR_SIMD_FIX_DEAD_END
+                       : IR_SIMD_FIX_PARTIAL;
       } else {
         next_reason[0] = '\0';
       }
@@ -2636,6 +2710,46 @@ static size_t ir_simd_loop_end_line(const IRFunction *function,
   return last;
 }
 
+
+typedef struct {
+  char *fix;
+  size_t fix_cap;
+  char *verified;
+  size_t verified_cap;
+  char *partial;
+  size_t partial_cap;
+} IrFixText;
+
+static int ir_explain_fix_verdict(int sim, const char *inapplicable_fix,
+                                  const char *next_reason,
+                                  const char *kernel_desc, IrFixText *t) {
+  if (sim == 1) {
+    snprintf(t->verified, t->verified_cap,
+             "simulated that fix and re-ran the optimizer: this loop "
+             "then vectorizes \xE2\x86\x92 %s",
+             kernel_desc);
+  } else if (sim == IR_SIMD_FIX_INAPPLICABLE && inapplicable_fix) {
+    snprintf(t->fix, t->fix_cap, "%s", inapplicable_fix);
+    return 1;
+  } else if (sim == IR_SIMD_FIX_PARTIAL && next_reason[0]) {
+    size_t used = strlen(t->fix);
+    snprintf(t->fix + used, t->fix_cap - used, " (first step only)");
+    snprintf(t->partial, t->partial_cap,
+             "re-checked with that change applied: the loop still does "
+             "not vectorize, because %s",
+             next_reason);
+  } else if (sim == IR_SIMD_FIX_DEAD_END && next_reason[0]) {
+    char tried[256];
+    snprintf(tried, sizeof(tried), "%s", t->fix);
+    snprintf(t->fix, t->fix_cap,
+             "nothing worth changing here. The compiler applied \"%s\" to "
+             "a copy of the loop, and it still would not vectorize",
+             tried);
+    snprintf(t->partial, t->partial_cap, "with that change, %s", next_reason);
+    return 1;
+  }
+  return 0;
+}
 
 static void ir_explain_report_loop(const IRFunction *function,
                                    const IRSimdLoopRecord *loops,
@@ -2819,22 +2933,10 @@ char headline[192], reason[320], fix[320];
         function, L->begin, L->end, diagnosis, kernel_desc,
         sizeof(kernel_desc), &inapplicable_fix, next_reason,
         sizeof(next_reason));
-    if (sim == 1) {
-      snprintf(verified, sizeof(verified),
-               "simulated that fix and re-ran the optimizer: this loop "
-               "then vectorizes \xE2\x86\x92 %s",
-               kernel_desc);
-    } else if (sim == IR_SIMD_FIX_INAPPLICABLE && inapplicable_fix) {
-      snprintf(fix, sizeof(fix), "%s", inapplicable_fix);
-      advisory = 1;
-    } else if (sim == IR_SIMD_FIX_PARTIAL && next_reason[0]) {
-      size_t used = strlen(fix);
-      snprintf(fix + used, sizeof(fix) - used, " (first step only)");
-      snprintf(partial, sizeof(partial),
-               "re-checked with that change applied: the loop still does "
-               "not vectorize, because %s",
-               next_reason);
-    }
+    IrFixText text = {fix, sizeof(fix), verified, sizeof(verified), partial,
+                      sizeof(partial)};
+    advisory |= ir_explain_fix_verdict(sim, inapplicable_fix, next_reason,
+                                       kernel_desc, &text);
   }
   ir_explain_remark(function->name, "loop", L->location, 0,
                     "NOT vectorized", reason, fix[0] ? fix : NULL,
