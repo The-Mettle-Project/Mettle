@@ -833,6 +833,38 @@ poll it next to the terminal input. Call it before starting threads. Windows
 has no signals, so it returns -ENOSYS there; read the console size again
 instead.
 
+## std/pty
+
+Pseudo-terminals, for terminal emulators and for driving a program as if a
+person were typing. Linux only for now. A pty is a pair: the program runs on
+the slave as its terminal, and you hold the master.
+
+| Function | Effect |
+|----------|--------|
+| `pty_open(t: Pty*) -> int64` | Open a new pair. `Pty` holds `master`, `slave` and `number` (N in `/dev/pts/N`). Both ends are close-on-exec. 0 or `-errno` |
+| `pty_set_size(t: Pty*, cols: int32, rows: int32) -> int64` | Set the window size the program sees; it gets `SIGWINCH` |
+| `pty_get_size(t: Pty*, cols: int32*, rows: int32*) -> int64` | Read the window size |
+| `pty_read(t: Pty*, buf: uint8*, cap: int64) -> int64` | Read the program's output. `-5` (EIO) once the program and every slave descriptor are gone |
+| `pty_write(t: Pty*, buf: uint8*, n: int64) -> int64` | Send bytes as if typed |
+| `pty_close_slave(t: Pty*)` | Close the parent's copy of the slave after starting the child |
+| `pty_close(t: Pty*)` | Close both ends |
+
+Start a program on it with `use_pty` and `pty_fd` in
+[`ProcOptions`](#stdprocess):
+
+```mettle
+var t: Pty;
+if (pty_open(&t) != 0) { return 1; }
+pty_set_size(&t, 80, 24);
+var opts: ProcOptions;
+proc_options_init(&opts, argv);
+opts.use_pty = 1;
+opts.pty_fd = t.slave;
+var p: Proc;
+proc_spawn(&opts, &p);
+pty_close_slave(&t);
+```
+
 ## std/dl
 
 Load a shared library at run time and look up its symbols. Linux, macOS and
@@ -1806,6 +1838,7 @@ proc_close(&p);
 | `env: string[]`, `has_env: int32` | `"NAME=value"` entries. With `has_env` 0 (the default) the child inherits the environment. With 1 it gets `env` alone, and an empty `env` means an empty environment |
 | `cwd: string` | The child's working directory. Empty keeps ours |
 | `stdin`, `stdout`, `stderr: int32` | `PROC_INHERIT` (default), `PROC_PIPE`, or `PROC_NULL`. `stderr` may also be `PROC_TO_STDOUT` |
+| `use_pty: int32`, `pty_fd: int64` | With `use_pty` 1, the child runs in a new session with the [pty](#stdpty) slave in `pty_fd` as fds 0, 1 and 2 and as its controlling terminal. The three streams must stay `PROC_INHERIT`. Linux only; elsewhere `proc_spawn` refuses it |
 
 `proc_options_init(o, argv)` zeroes the options and sets `argv`.
 

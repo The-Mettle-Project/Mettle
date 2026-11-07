@@ -68,6 +68,8 @@ export struct ProcOptions {
   stdin: int32;      // PROC_INHERIT, PROC_PIPE or PROC_NULL
   stdout: int32;     // PROC_INHERIT, PROC_PIPE or PROC_NULL
   stderr: int32;     // the same, or PROC_TO_STDOUT
+  use_pty: int32;    // 1: run on the pty slave in pty_fd as its terminal (Linux)
+  pty_fd: int64;     // a slave from pty_open, used only when use_pty is 1
 }
 
 // A running (or finished) child. The pipe fields hold the parent's ends of
@@ -103,6 +105,7 @@ struct ProcExec {
   out_fd: int64;
   err_fd: int64;
   err_to_out: int32;
+  ctty: int32;         // 1: setsid and take fd 0 as the controlling terminal
   errw: int64;         // where the child reports an exec failure
   errv: int64;
 }
@@ -428,6 +431,10 @@ fn proc_stdio(mode: int32, child_reads: int32, f: ProcFds*, child_end: int64*, p
   var empty: int64 = 0;
   syscall(LINUX_SYS_RT_SIGPROCMASK, 2, &empty, 0, 8);   // SIG_SETMASK
   var r: int64 = 0;
+  if (x.ctty != 0) {
+    r = syscall(LINUX_SYS_SETSID);
+    if (r < 0) { proc_child_die(x, -r); }
+  }
   if (x.in_fd >= 0) {
     r = syscall(LINUX_SYS_DUP3, x.in_fd, 0, 0);
     if (r < 0) { proc_child_die(x, -r); }
@@ -442,6 +449,10 @@ fn proc_stdio(mode: int32, child_reads: int32, f: ProcFds*, child_end: int64*, p
   }
   if (x.err_to_out != 0) {
     r = syscall(LINUX_SYS_DUP3, 1, 2, 0);
+    if (r < 0) { proc_child_die(x, -r); }
+  }
+  if (x.ctty != 0) {
+    r = syscall(LINUX_SYS_IOCTL, 0, 0x540E, 0);   // TIOCSCTTY
     if (r < 0) { proc_child_die(x, -r); }
   }
   if (x.cwd != (uint8*)0) {
@@ -485,6 +496,9 @@ export fn proc_spawn(opts: ProcOptions*, out: Proc*) -> int64 {
   out->stdout_fd = -1;
   out->stderr_fd = -1;
   if (opts->stdin == PROC_TO_STDOUT || opts->stdout == PROC_TO_STDOUT) { return -PROC_EINVAL; }
+  if (opts->use_pty != 0 && (opts->pty_fd < 0 || opts->stdin != PROC_INHERIT || opts->stdout != PROC_INHERIT || opts->stderr != PROC_INHERIT)) {
+    return -PROC_EINVAL;
+  }
 
   var x: ProcExec;
   var r: int64 = proc_prep(opts, &x);
@@ -510,6 +524,12 @@ export fn proc_spawn(opts: ProcOptions*, out: Proc*) -> int64 {
   x.out_fd = f.c_out;
   x.err_fd = f.c_err;
   if (opts->stderr == PROC_TO_STDOUT) { x.err_to_out = 1; }
+  if (opts->use_pty != 0) {
+    x.in_fd = opts->pty_fd;
+    x.out_fd = opts->pty_fd;
+    x.err_fd = opts->pty_fd;
+    x.ctty = 1;
+  }
   x.errw = f.ew;
 
   var pid: int64 = syscall(LINUX_SYS_CLONE, 17, 0, 0, 0, 0);   // SIGCHLD: a plain fork

@@ -1,0 +1,61 @@
+// std/pty: open a pair, set the size, run a shell on the slave as its
+// controlling terminal, and read what it prints from the master. Linux only.
+import "std/pty";
+import "std/process";
+import "std/conv";
+
+// Reads from the master until the program is gone (read gives EIO or 0).
+fn read_until_eof(t: Pty*, buf: uint8*, cap: int64) -> int64 {
+  var got: int64 = 0;
+  while (got < cap) {
+    var r: int64 = pty_read(t, &buf[got], cap - got);
+    if (r <= 0) { return got; }
+    got = got + r;
+  }
+  return got;
+}
+
+fn main() -> int32 {
+  var t: Pty;
+  if (pty_open(&t) != 0) { return 1; }
+  if (t.master < 0 || t.slave < 0 || t.number < 0) { return 2; }
+
+  if (pty_set_size(&t, 80, 24) != 0) { return 3; }
+  var cols: int32 = 0;
+  var rows: int32 = 0;
+  if (pty_get_size(&t, &cols, &rows) != 0) { return 4; }
+  if (cols != 80 || rows != 24) { return 5; }
+
+  // The child must see a terminal of that size, and own it.
+  var argv: string[3] = ["/bin/sh", "-c", "test -t 0 && echo TTY; stty size; ps -o tty= -p $$ | grep -q pts && echo CTTY"];
+  var opts: ProcOptions;
+  proc_options_init(&opts, argv);
+  opts.use_pty = 1;
+  opts.pty_fd = t.slave;
+  var p: Proc;
+  if (proc_spawn(&opts, &p) != 0) { return 6; }
+  pty_close_slave(&t);
+
+  var buf: uint8[512];
+  var n: int64 = read_until_eof(&t, &buf[0], 512);
+  var st: ProcStatus;
+  proc_wait(&p, &st);
+  proc_close(&p);
+  var out: string = str_from_bytes(&buf[0], n);
+  match (str_find(out, "TTY")) { case Some(i): {} case None: { return 7; } }
+  match (str_find(out, "24 80")) { case Some(i): {} case None: { return 8; } }
+  match (str_find(out, "CTTY")) { case Some(i): {} case None: { return 9; } }
+
+  // use_pty with a piped stream is refused.
+  var bad: ProcOptions;
+  proc_options_init(&bad, argv);
+  bad.use_pty = 1;
+  bad.pty_fd = 0;
+  bad.stdout = PROC_PIPE;
+  var q: Proc;
+  if (proc_spawn(&bad, &q) >= 0) { return 10; }
+
+  pty_close(&t);
+  if (t.master != -1 || t.slave != -1) { return 11; }
+  return 0;
+}
