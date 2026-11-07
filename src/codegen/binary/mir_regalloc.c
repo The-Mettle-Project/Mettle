@@ -2700,6 +2700,24 @@ static int mir_color_graph(MirFunction *fn, const BinaryGpRegister *gp_leaf_pool
   return 1;
 }
 
+static unsigned mir_inst_xmm_clobbers(const MirInst *in) {
+  switch (in->op) {
+  case MIR_IR_KERNEL: {
+    const MirKernelAux *ka = (const MirKernelAux *)in->aux;
+    const MirIrKernel *kern = ka ? mir_ir_kernel_at(ka->kernel_index) : NULL;
+    return kern ? kern->xmm_clobbers : 0u;
+  }
+  case MIR_SIMD_SILU_F32:
+    return 0x00FFu;
+  case MIR_SIMD_SLP_MAC:
+    return 0x007Fu;
+  case MIR_INLINE_ASM:
+    return 0xFFFFu;
+  default:
+    return 0u;
+  }
+}
+
 static int mir_regalloc_report_saved(MirFunction *fn) {
   if (!fn->context) {
     return 1;
@@ -2742,17 +2760,22 @@ static int mir_regalloc_report_saved(MirFunction *fn) {
       return 0;
     }
   }
-  int used_xmm[16];
-  memset(used_xmm, 0, sizeof(used_xmm));
+  unsigned used_xmm = 0;
   for (size_t i = 0; i < fn->vreg_count; i++) {
     MirVreg *vr = &fn->vregs[i];
     if (vr->in_register && vr->rclass == MIR_RC_XMM && vr->phys >= 8) {
-      used_xmm[vr->phys] = 1;
+      used_xmm |= 1u << (unsigned)vr->phys;
     }
   }
-  for (int reg = 8; reg < 16; reg++) {
-    if (used_xmm[reg] && !code_generator_binary_context_add_saved_xmm_register(
-                             fn->context, (BinaryXmmRegister)reg)) {
+  const BinaryAbi *abi = code_generator_binary_active_abi();
+  for (size_t i = 0; i < fn->insn_count; i++) {
+    used_xmm |= mir_inst_xmm_clobbers(&fn->insns[i]) &
+                (abi ? abi->xmm_callee_saved : 0u);
+  }
+  for (int reg = 6; reg < 16; reg++) {
+    if ((used_xmm & (1u << (unsigned)reg)) &&
+        !code_generator_binary_context_add_saved_xmm_register(
+            fn->context, (BinaryXmmRegister)reg)) {
       return 0;
     }
   }
@@ -3283,52 +3306,13 @@ int mir_regalloc(MirFunction *fn) {
   fn->spill_bytes =
       next_spill_offset - (fn->context ? fn->context->raw_frame_size : 0);
 
-  if (fn->context) {
-    int used_nonvol[16];
-    memset(used_nonvol, 0, sizeof(used_nonvol));
-    for (size_t i = 0; i < fn->vreg_count; i++) {
-      MirVreg *vr = &fn->vregs[i];
-      if (vr->in_register && vr->rclass == MIR_RC_GP &&
-          mir_gp_is_nonvolatile((BinaryGpRegister)vr->phys)) {
-        used_nonvol[vr->phys] = 1;
-      }
-    }
-    for (int reg = 0; reg < 16; reg++) {
-      if (used_nonvol[reg] &&
-          !code_generator_binary_context_add_saved_register(
-              fn->context, (BinaryGpRegister)reg)) {
-        free(order);
-        free(active);
-        free(narrow_src);
-        fn->has_error = 1;
-        return 0;
-      }
-    }
-
-    int used_xmm[16];
-    memset(used_xmm, 0, sizeof(used_xmm));
-    for (size_t i = 0; i < fn->vreg_count; i++) {
-      MirVreg *vr = &fn->vregs[i];
-      if (vr->in_register && vr->rclass == MIR_RC_XMM && vr->phys >= 8) {
-        used_xmm[vr->phys] = 1;
-      }
-    }
-    for (int reg = 8; reg < 16; reg++) {
-      if (used_xmm[reg] &&
-          !code_generator_binary_context_add_saved_xmm_register(
-              fn->context, (BinaryXmmRegister)reg)) {
-        free(order);
-        free(active);
-        free(narrow_src);
-        fn->has_error = 1;
-        return 0;
-      }
-    }
-  }
-
   free(order);
   free(active);
   free(narrow_src);
+  if (!mir_regalloc_report_saved(fn)) {
+    fn->has_error = 1;
+    return 0;
+  }
   mir_regalloc_trace_done(fn);
   return mir_regalloc_finish(fn);
 }

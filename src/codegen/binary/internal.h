@@ -225,8 +225,8 @@ typedef struct {
   BinaryGpRegister saved_registers[8];
   int saved_register_offsets[8];
   size_t saved_register_count;
-  BinaryXmmRegister saved_xmm_registers[8];
-  int saved_xmm_offsets[8];
+  BinaryXmmRegister saved_xmm_registers[10];
+  int saved_xmm_offsets[10];
   size_t saved_xmm_count;
   int raw_frame_size;
   int frame_size;
@@ -300,6 +300,7 @@ typedef struct {
   int shadow_space_size;
   BinaryGpRegister indirect_return_register;
   int counts_classes_separately;
+  unsigned xmm_callee_saved;
 } BinaryAbi;
 
 const BinaryAbi *code_generator_binary_active_abi(void);

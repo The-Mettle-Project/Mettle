@@ -15,6 +15,7 @@ static const BinaryAbi MS_X64_ABI = {
     32,
     BINARY_GP_RCX,
     0,
+    0xFFC0u,
 };
 
 static const BinaryGpRegister SYSV_INT_PARAMS[] = {
@@ -30,6 +31,7 @@ static const BinaryAbi SYSV_ABI = {
     0,
     BINARY_GP_RDI,
     1,
+    0u,
 };
 
 static const BinaryAbi *g_active_abi = &MS_X64_ABI;
@@ -64,6 +66,8 @@ void code_generator_binary_describe_abi(const BinaryGpRegister *int_regs,
   g_described_abi.shadow_space_size = shadow_space;
   g_described_abi.indirect_return_register = indirect_return;
   g_described_abi.counts_classes_separately = separate_classes ? 1 : 0;
+  g_described_abi.xmm_callee_saved =
+      separate_classes ? 0u : MS_X64_ABI.xmm_callee_saved;
   g_described_valid = 1;
 }
 

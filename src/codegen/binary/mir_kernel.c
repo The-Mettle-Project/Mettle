@@ -40,7 +40,8 @@ static const MirIrKernel kMirIrKernels[] = {
     {IR_OP_SIMD_DOT_F32, "simd_dot_f32",
      code_generator_binary_emit_simd_dot_f32, 0},
     {IR_OP_SIMD_MULTIDOT_F32, "simd_multidot_f32",
-     code_generator_binary_emit_simd_multidot_f32, GPCLOB(BINARY_GP_R12)},
+     code_generator_binary_emit_simd_multidot_f32, GPCLOB(BINARY_GP_R12),
+     0xFFFFu},
 
     {IR_OP_SIMD_COPY, "simd_copy", code_generator_binary_emit_simd_copy,
      0},
@@ -65,7 +66,7 @@ static const MirIrKernel kMirIrKernels[] = {
     {IR_OP_SIMD_OUTER_LANE_F64, "simd_outer_lane_f64",
      code_generator_binary_emit_simd_outer_lane_f64, 0},
     {IR_OP_SIMD_LCG_U32, "simd_lcg_u32",
-     code_generator_binary_emit_simd_lcg_u32, 0},
+     code_generator_binary_emit_simd_lcg_u32, 0, 0x03FFu},
 };
 
 #define MIR_IR_KERNEL_COUNT \

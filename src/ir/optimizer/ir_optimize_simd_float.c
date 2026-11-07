@@ -715,34 +715,10 @@ static int ir_multidot_body_is_claimed(IRFunction *function, size_t lo,
   return 1;
 }
 
-static int ir_try_split_multidot_float_at(IRFunction *function,
-                                          size_t header_index, int *changed,
-                                          int *taken) {
-  const char *iv_symbol = NULL;
-  size_t branch_index = 0;
-  size_t jump_index = 0;
-  IROperand bound = {0};
-  int matched = 0;
-  IRMultidotTerm terms[IR_MULTIDOT_MAX];
+static int ir_multidot_collect_terms(IRFunction *function, size_t lo,
+                                     size_t hi, const char *iv_symbol,
+                                     IRMultidotTerm *terms) {
   int k = 0;
-
-  *taken = 0;
-  if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
-                                &branch_index, &jump_index, &bound, &matched)) {
-    return 0;
-  }
-  if (!matched) {
-    return 1;
-  }
-  size_t lo = branch_index + 1;
-  size_t hi = jump_index;
-  size_t increment = hi;
-  while (increment > lo) {
-    increment--;
-    if (function->instructions[increment].op != IR_OP_NOP) {
-      break;
-    }
-  }
   for (size_t i = lo; i < hi; i++) {
     const IRInstruction *ins = &function->instructions[i];
     if (!(ins->op == IR_OP_BINARY && ins->is_float && ins->text &&
@@ -768,8 +744,7 @@ static int ir_try_split_multidot_float_at(IRFunction *function,
       continue;
     }
     if (k == IR_MULTIDOT_MAX) {
-      ir_operand_destroy(&bound);
-      return 1;
+      return -1;
     }
     terms[k].acc = ins->dest.name;
     terms[k].base_a = base_a;
@@ -777,10 +752,12 @@ static int ir_try_split_multidot_float_at(IRFunction *function,
     terms[k].update_index = i;
     k++;
   }
-  if (k < 2) {
-    ir_operand_destroy(&bound);
-    return 1;
-  }
+  return k;
+}
+
+static int ir_multidot_terms_valid(IRFunction *function,
+                                   const IRMultidotTerm *terms, int k,
+                                   const char *iv_symbol) {
   for (int t = 0; t < k; t++) {
     const char *acc_type = ir_function_local_declared_type(function, terms[t].acc);
     if (!acc_type || strcmp(acc_type, "float32") != 0 ||
@@ -790,17 +767,16 @@ static int ir_try_split_multidot_float_at(IRFunction *function,
         ir_multidot_is_base(terms, k, terms[t].acc) ||
         !ir_symbol_is_float_array_base(function, terms[t].base_a) ||
         !ir_symbol_is_float_array_base(function, terms[t].base_b)) {
-      ir_operand_destroy(&bound);
-      return 1;
+      return 0;
     }
   }
-  if (!ir_multidot_body_is_claimed(function, lo, hi, increment, iv_symbol,
-                                   terms, k) ||
-      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
-    ir_operand_destroy(&bound);
-    return 1;
-  }
+  return 1;
+}
 
+static int ir_multidot_replace_loop(IRFunction *function, size_t header_index,
+                                    size_t jump_index,
+                                    const IRMultidotTerm *terms, int k,
+                                    const IROperand *bound) {
   IRInstruction fused[IR_MULTIDOT_MAX];
   memset(fused, 0, sizeof(fused));
   for (int t = 0; t < k; t++) {
@@ -812,11 +788,10 @@ static int ir_try_split_multidot_float_at(IRFunction *function,
     fused[t].lhs = ir_operand_symbol(terms[t].base_a);
     fused[t].rhs = ir_operand_symbol(terms[t].base_b);
     fused[t].arguments = calloc(1, sizeof(IROperand));
-    if (!fused[t].arguments || !ir_operand_clone(&bound, &fused[t].arguments[0])) {
+    if (!fused[t].arguments || !ir_operand_clone(bound, &fused[t].arguments[0])) {
       for (int u = 0; u <= t; u++) {
         ir_instruction_destroy_storage(&fused[u]);
       }
-      ir_operand_destroy(&bound);
       return 0;
     }
     fused[t].argument_count = 1;
@@ -828,7 +803,50 @@ static int ir_try_split_multidot_float_at(IRFunction *function,
   for (size_t i = header_index + (size_t)k; i <= jump_index; i++) {
     ir_instruction_make_nop(&function->instructions[i]);
   }
+  return 1;
+}
+
+static int ir_try_split_multidot_float_at(IRFunction *function,
+                                          size_t header_index, int *changed,
+                                          int *taken) {
+  const char *iv_symbol = NULL;
+  size_t branch_index = 0;
+  size_t jump_index = 0;
+  IROperand bound = {0};
+  int matched = 0;
+  IRMultidotTerm terms[IR_MULTIDOT_MAX];
+
+  *taken = 0;
+  if (!ir_float_reduction_frame(function, header_index, &iv_symbol,
+                                &branch_index, &jump_index, &bound, &matched)) {
+    return 0;
+  }
+  if (!matched) {
+    return 1;
+  }
+  size_t lo = branch_index + 1;
+  size_t hi = jump_index;
+  size_t increment = hi;
+  while (increment > lo) {
+    increment--;
+    if (function->instructions[increment].op != IR_OP_NOP) {
+      break;
+    }
+  }
+  int k = ir_multidot_collect_terms(function, lo, hi, iv_symbol, terms);
+  if (k < 2 || !ir_multidot_terms_valid(function, terms, k, iv_symbol) ||
+      !ir_multidot_body_is_claimed(function, lo, hi, increment, iv_symbol,
+                                   terms, k) ||
+      ir_symbol_live_after_loop(function, jump_index + 1, iv_symbol)) {
+    ir_operand_destroy(&bound);
+    return 1;
+  }
+  int replaced = ir_multidot_replace_loop(function, header_index, jump_index,
+                                          terms, k, &bound);
   ir_operand_destroy(&bound);
+  if (!replaced) {
+    return 0;
+  }
   *taken = 1;
   if (changed) {
     *changed = 1;

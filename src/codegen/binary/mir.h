@@ -355,6 +355,7 @@ typedef struct {
   int (*emit)(CodeGenerator *generator, BinaryFunctionContext *context,
               const IRInstruction *instruction);
   unsigned gp_clobbers;
+  unsigned xmm_clobbers;
 } MirIrKernel;
 
 #define MIR_ASM_MAX_BINDS 16

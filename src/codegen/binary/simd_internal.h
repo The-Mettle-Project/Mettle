@@ -139,6 +139,11 @@ int wcs_vex_movups_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int disp);
 int wcs_vex_movups_mem_xmm(BinaryCodeBuffer *b, int base, int disp, int src);
 int wcs_vex_addps_xmm(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_vex_haddps_xmm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vhaddps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2);
+int wcs_avx_vperm2f128(BinaryCodeBuffer *b, int dst, int s1, int s2,
+                       unsigned char imm);
+int wcs_vex_addss_xmm_mem(BinaryCodeBuffer *b, int dst, int s1, int base,
+                          int disp);
 int wcs_vex_addss_rrr(BinaryCodeBuffer *b, int dst, int s1, int s2);
 int wcs_vex_movd_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr);
 int wcs_vex_movq_xmm_reg(BinaryCodeBuffer *b, int xmm, int gpr);

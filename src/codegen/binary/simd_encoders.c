@@ -770,6 +770,26 @@ int wcs_vex_addps_xmm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
 int wcs_vex_haddps_xmm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_vex_rrr128(b, 3, 0x7C, dst, s1, s2);
 }
+int wcs_avx_vhaddps_ymm(BinaryCodeBuffer *b, int dst, int s1, int s2) {
+  return wcs_vex3(b, 1, 3, 1, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0x7C) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7)));
+}
+int wcs_avx_vperm2f128(BinaryCodeBuffer *b, int dst, int s1, int s2,
+                       unsigned char imm) {
+  return wcs_vex3(b, 3, 1, 1, 0, dst, s2, s1) &&
+         binary_code_buffer_append_u8(b, 0x06) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (s2 & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
+}
+int wcs_vex_addss_xmm_mem(BinaryCodeBuffer *b, int dst, int s1, int base,
+                          int disp) {
+  return wcs_vex3(b, 1, 2, 0, 0, dst, base, s1) &&
+         binary_code_buffer_append_u8(b, 0x58) &&
+         wcs_avx_modrm_mem_disp(b, dst, base, disp);
+}
 int wcs_vex_addss_rrr(BinaryCodeBuffer *b, int dst, int s1, int s2) {
   return wcs_vex_rrr128(b, 2, 0x58, dst, s1, s2);
 }
