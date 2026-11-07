@@ -751,7 +751,7 @@ typedef struct {
   size_t members[4];
 } PtxVectorPlan;
 
-static int ptx_fold_constant(const IRFunction *func, size_t before,
+static int ptx_fold_constant(PtxFn *fn, const IRFunction *func, size_t before,
                              const IROperand *operand, long long *out,
                              unsigned depth) {
   if (!func || !operand || depth > 8) return 0;
@@ -760,7 +760,7 @@ static int ptx_fold_constant(const IRFunction *func, size_t before,
     return 1;
   }
   if ((operand->kind != IR_OPERAND_TEMP && operand->kind != IR_OPERAND_SYMBOL) ||
-      !operand->name)
+      !operand->name || ptx_name_is_redefined(fn, operand->name))
     return 0;
   for (size_t i = before; i > 0; i--) {
     const IRInstruction *producer = &func->instructions[i - 1];
@@ -768,11 +768,11 @@ static int ptx_fold_constant(const IRFunction *func, size_t before,
         strcmp(producer->dest.name, operand->name) != 0)
       continue;
     if (producer->op == IR_OP_ASSIGN || producer->op == IR_OP_CAST)
-      return ptx_fold_constant(func, i - 1, &producer->lhs, out, depth + 1);
+      return ptx_fold_constant(fn, func, i - 1, &producer->lhs, out, depth + 1);
     if (producer->op == IR_OP_BINARY && producer->text) {
       long long lhs = 0, rhs = 0;
-      if (!ptx_fold_constant(func, i - 1, &producer->lhs, &lhs, depth + 1) ||
-          !ptx_fold_constant(func, i - 1, &producer->rhs, &rhs, depth + 1))
+      if (!ptx_fold_constant(fn, func, i - 1, &producer->lhs, &lhs, depth + 1) ||
+          !ptx_fold_constant(fn, func, i - 1, &producer->rhs, &rhs, depth + 1))
         return 0;
       if (strcmp(producer->text, "*") == 0) { *out = lhs * rhs; return 1; }
       if (strcmp(producer->text, "+") == 0) { *out = lhs + rhs; return 1; }
@@ -788,7 +788,14 @@ static int ptx_fold_constant(const IRFunction *func, size_t before,
   return 0;
 }
 
-static void ptx_address_parts(const IRFunction *func, size_t index,
+static int ptx_operand_is_stable(PtxFn *fn, const IROperand *operand) {
+  if (!operand) return 0;
+  if (operand->kind != IR_OPERAND_TEMP && operand->kind != IR_OPERAND_SYMBOL)
+    return 1;
+  return operand->name && !ptx_name_is_redefined(fn, operand->name);
+}
+
+static void ptx_address_parts(PtxFn *fn, const IRFunction *func, size_t index,
                               const IROperand *address,
                               const IROperand **base, long long *offset) {
   *base = address;
@@ -796,6 +803,10 @@ static void ptx_address_parts(const IRFunction *func, size_t index,
   if (!func || !address || !address->name ||
       (address->kind != IR_OPERAND_TEMP && address->kind != IR_OPERAND_SYMBOL))
     return;
+  if (!ptx_operand_is_stable(fn, address)) {
+    *base = NULL;
+    return;
+  }
   for (size_t i = index; i > 0; i--) {
     const IRInstruction *producer = &func->instructions[i - 1];
     long long constant = 0;
@@ -805,7 +816,8 @@ static void ptx_address_parts(const IRFunction *func, size_t index,
     if (producer->op != IR_OP_BINARY || !producer->text ||
         strcmp(producer->text, "+") != 0)
       return;
-    if (ptx_fold_constant(func, i - 1, &producer->rhs, &constant, 0)) {
+    if (ptx_operand_is_stable(fn, &producer->lhs) &&
+        ptx_fold_constant(fn, func, i - 1, &producer->rhs, &constant, 0)) {
       *base = &producer->lhs;
       *offset = constant;
     }
@@ -867,7 +879,8 @@ static const MtlcType *ptx_load_pointer_type(const IRProgram *program,
   return NULL;
 }
 
-static PtxVectorPlan *ptx_plan_vector_loads(const IRProgram *program,
+static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
+                                            const IRProgram *program,
                                             const IRFunction *func) {
   PtxVectorPlan *plan;
   if (!func || func->instruction_count == 0) return NULL;
@@ -882,7 +895,7 @@ static PtxVectorPlan *ptx_plan_vector_loads(const IRProgram *program,
     size_t members[4];
     size_t found = 1;
     if (head->op != IR_OP_LOAD || plan[i].absorbed) continue;
-    ptx_address_parts(func, i, &head->lhs, &base, &offset);
+    ptx_address_parts(fn, func, i, &head->lhs, &base, &offset);
     pointer_type = ptx_load_pointer_type(program, func, base);
     if (!pointer_type || pointer_type->kind != MTLC_TYPE_POINTER ||
         !pointer_type->base_type || !pointer_type->pointee_align ||
@@ -900,7 +913,7 @@ static PtxVectorPlan *ptx_plan_vector_loads(const IRProgram *program,
       const IROperand *next_base = NULL;
       long long next_offset = 0;
       if (next->op == IR_OP_LOAD && !plan[j].absorbed) {
-        ptx_address_parts(func, j, &next->lhs, &next_base, &next_offset);
+        ptx_address_parts(fn, func, j, &next->lhs, &next_base, &next_offset);
         if (next_base && base && next_base->name && base->name &&
             next_base->kind == base->kind &&
             strcmp(next_base->name, base->name) == 0 &&
@@ -10983,7 +10996,7 @@ static void ptx_emit_vector_load(PtxEmit *e, size_t ii,
   MtlcTypeKind elem;
   const char *space;
 
-  ptx_address_parts(func, ii, &in->lhs, &base, &offset);
+  ptx_address_parts(&e->fn, func, ii, &in->lhs, &base, &offset);
   pointer_type = ptx_load_pointer_type(e->program, func, base);
   elem = pointer_type && pointer_type->base_type ? pointer_type->base_type->kind
                                                  : MTLC_TYPE_VOID;
@@ -11027,7 +11040,7 @@ static void ptx_emit_instruction(PtxEmit *e, size_t *ii, char **error,
 
 static void ptx_emit_body(PtxEmit *e, char **error, int target_arch) {
   clock_t analysis_start = clock();
-  PtxVectorPlan *plan = ptx_plan_vector_loads(e->program, e->func);
+  PtxVectorPlan *plan = ptx_plan_vector_loads(&e->fn, e->program, e->func);
   g_ptx_analysis_seconds +=
       (double)(clock() - analysis_start) / (double)CLOCKS_PER_SEC;
   for (size_t ii = 0; ii < e->func->instruction_count && !e->fn.error; ii++) {

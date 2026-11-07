@@ -18036,6 +18036,38 @@ catch {
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $runtimePtx = Join-Path $tmpDir "gpu_vector_runtime_index.ptx"
+  $runtimeOut = & $CompilerPath -O --emit-ptx --gpu-arch=portable --report-gpu-types `
+    tests/gpu/vector_runtime_index.mettle -o $runtimePtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "emit failed: $runtimeOut" }
+  if ($runtimeOut -notmatch "2 vector groups formed from a declared alignment, 6 separate loads removed") {
+    throw "expected the two row-pointer groups and nothing else: $runtimeOut"
+  }
+  $runtimeText = (Get-Content -Raw $runtimePtx) -replace "`r`n", "`n"
+  $runtimeBody = [regex]::Match($runtimeText, "(?s)\.entry runtime_rows.*?\n}").Value
+  $rowBody = [regex]::Match($runtimeText, "(?s)\.entry row_pointers.*?\n}").Value
+  if (-not $runtimeBody -or -not $rowBody) { throw "a kernel is missing from the module" }
+  if ($runtimeBody -match "ld\.shared\.v4") {
+    throw "a load indexed by the loop counter was widened from the bare base"
+  }
+  if (([regex]::Matches($rowBody, "ld\.shared\.v4\.f32")).Count -ne 2) {
+    throw "the row-pointer kernel lost its vector loads"
+  }
+  if ($ptxas) {
+    $runtimeCubin = Join-Path $tmpDir "gpu_vector_runtime_index.cubin"
+    $asmOut = & $ptxas.Source -arch=compute_75 $runtimePtx -o $runtimeCubin 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "ptxas rejected the module: $asmOut" }
+  }
+  Write-CaseResult -Name "gpu_vector_runtime_index" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_vector_runtime_index" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $gb10Ptx = Join-Path $tmpDir "ptx_emit_gb10.ptx"
   $gb10Cubin = Join-Path $tmpDir "ptx_emit_gb10.cubin"
   $emitOut = & $CompilerPath -O --emit-ptx --gpu-arch=gb10 `

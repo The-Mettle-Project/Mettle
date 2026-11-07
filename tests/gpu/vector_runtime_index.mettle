@@ -1,0 +1,28 @@
+kernel(block = 32) runtime_rows(src: float32 global*, out: float32 global*, groups: int32) {
+  workgroup var tile: float32[1024];
+  var t: int32 = thread.x;
+  for i in 0..32 { tile[t + 32 * i] = src[t + 32 * i]; }
+  barrier(workgroup, acq_rel);
+  var base: float32 shared align(16)* = (float32 shared align(16)*)&tile[0];
+  var acc: float32 = 0.0;
+  for g in 0..groups {
+    comptime for u in 0..4 {
+      var row: int32 = g * 4 + u;
+      comptime for e in 0..8 { acc = acc + base[row * 32 + e] * (float32)(e + 1); }
+    }
+  }
+  out[t] = acc;
+}
+
+kernel(block = 32) row_pointers(src: float32 global*, out: float32 global*, groups: int32) {
+  workgroup var tile: float32[1024];
+  var t: int32 = thread.x;
+  for i in 0..32 { tile[t + 32 * i] = src[t + 32 * i]; }
+  barrier(workgroup, acq_rel);
+  var acc: float32 = 0.0;
+  for g in 0..groups {
+    var row: float32 shared align(16)* = (float32 shared align(16)*)&tile[g * 32];
+    comptime for e in 0..8 { acc = acc + row[e] * (float32)(e + 1); }
+  }
+  out[t] = acc;
+}
