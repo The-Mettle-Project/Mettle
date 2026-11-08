@@ -9056,10 +9056,11 @@ foreach ($shiftCase in @(
 # operator's keystrokes, and a suite that hangs on one is worse than one that
 # fails on it.
 function Invoke-ProgramCapture {
-  param([string]$Path, [int]$TimeoutSeconds = 60)
+  param([string]$Path, [int]$TimeoutSeconds = 60, [string]$Arguments = "")
 
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $Path
+  $psi.Arguments = $Arguments
   $psi.UseShellExecute = $false
   $psi.RedirectStandardInput = $true
   $psi.RedirectStandardOutput = $true
@@ -13005,7 +13006,7 @@ foreach ($strMode in @("debug", "release", "safe")) {
     if ($LASTEXITCODE -ne 0) { throw "build failed ($strMode): $buildOut" }
     $live = @{}
     foreach ($rounds in @(@{ N = "10"; Out = "total 470`nkept a9/label 9" }, @{ N = "5000"; Out = "total 340662`nkept a4999/label 4999" })) {
-      $runOut = ((cmd /c "`"$exePath`" $($rounds.N) 2>&1" | Out-String) -replace "`r`n", "`n").TrimEnd()
+      $runOut = ((Invoke-ProgramCapture -Path $exePath -Arguments $rounds.N).Output -replace "`r`n", "`n").TrimEnd()
       if ($runOut -notmatch "Owned runtime heap: (\d+) allocations, (\d+) frees") { throw "no heap ledger ($strMode, $($rounds.N)): $runOut" }
       $live[$rounds.N] = [int64]$Matches[1] - [int64]$Matches[2]
       if ($rounds.N -eq "5000" -and [int64]$Matches[1] -lt 100000) { throw "5000 rounds took only $($Matches[1]) blocks" }

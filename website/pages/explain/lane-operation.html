@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lane-operation: An operation the 32-bit lanes cannot do exactly | Mettle</title>
+<meta name="description" content="lane-operation: An operation the 32-bit lanes cannot do exactly" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><img src="../assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<h1><span class="code">lane-operation</span>An operation the 32-bit lanes cannot do exactly</h1>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
+<pre><code>mettle explain lane-operation</code></pre>
+
+<p>The lane vectorizer runs any counted loop over 32-bit elements as eight lanes of float32, int32 or uint32, including branches, selects, conversions and bit casts. It stopped at one operation, which the remark names by line:</p>
+<ul><li><p>Arithmetic in float64. Lanes are 32 bits wide.</p></li><li><p>Integer division or remainder. AVX2 has no integer divide.</p></li><li><p>A value whose full 64 bits matter, such as an int64 compared or shifted right. Lanes keep the low 32 bits.</p></li></ul><p>Fix: keep the arithmetic in float32 or 32-bit integers when the range fits, and widen once after the loop.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></footer>
+</body>
+</html>

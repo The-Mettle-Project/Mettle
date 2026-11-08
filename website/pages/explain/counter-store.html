@@ -21,7 +21,7 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain counter-store</code></pre>
 
-<p><code>a[i] = i</code>, <code>xs[i] = (float32)i</code> and every other store of a value computed from the loop counter is a ramp. The fill kernel writes one fixed value, and the compiler has no kernel that steps a vector of counters, so a ramp stays a scalar loop of one store per element.</p>
+<p><code>a[i] = i</code>, <code>xs[i] = (float32)i</code> and every other store of a value computed from the loop counter is a ramp. The lane vectorizer builds ramps from a vector of counters over 32-bit elements when the counter steps by one up to a bound. A ramp into 8-bit or 16-bit elements, or one whose counter moves another way, stays a scalar loop.</p>
 <p>A store of a value that does not change, <code>a[i] = 0</code>, is a fill and becomes 16- or 32-byte splat stores, on a stack array as well as through a pointer.</p>
 
 <h2>Related</h2>

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>carried-value: A value carried from one iteration into the next | Mettle</title>
+<meta name="description" content="carried-value: A value carried from one iteration into the next" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><img src="../assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<h1><span class="code">carried-value</span>A value carried from one iteration into the next</h1>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
+<pre><code>mettle explain carried-value</code></pre>
+
+<p>Lanes run eight iterations side by side, so no iteration may read what the one before it wrote, except through a running sum, which regroups. The remark names the value and how it is carried:</p>
+<ul><li><p>Through an operation other than + or -, as in a hash or a filter. That chain is the algorithm, and the loop is at its scalar floor.</p></li><li><p>As the previous element, <code>prev = x[i]</code> read on the next pass. Read <code>x[i - 1]</code> from the array instead.</p></li><li><p>As the value from the last iteration whose condition held. Find that index in a loop of its own.</p></li><li><p>As a sum wider than 32 bits. Accumulate in int32 or float32 and widen after the loop.</p></li></ul>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></footer>
+</body>
+</html>

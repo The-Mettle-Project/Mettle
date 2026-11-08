@@ -21,7 +21,7 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain invariant-addend</code></pre>
 
-<p><code>s = s + a[i] + bias(k)</code> sums the elements and adds <code>bias(k)</code> on every iteration. The term does not change inside the loop, and the compiler hoists the call, but the sum kernel adds one element per lane and nothing else, so the extra term keeps the loop scalar.</p>
+<p><code>s = s + a[i] + bias(k)</code>, with <code>s</code> an int64 and <code>a</code> int32, sums the elements and adds <code>bias(k)</code> on every iteration. The term does not change inside the loop, and the compiler hoists the call, but the widening sum kernel adds one element per lane and nothing else, and the 32-bit lanes cannot hold an int64 total, so the loop stays scalar. An int32 <code>s</code> would vectorize as written, and could overflow.</p>
 <p>Fix: sum the elements alone and add the term once:</p>
 <pre><code>var s: int64 = 0;
 for i in 0..n { s = s + a[i]; }

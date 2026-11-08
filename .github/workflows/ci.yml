@@ -481,9 +481,14 @@ jobs:
       - name: Verify native GPU launch ABI without CUDA hardware
         run: |
           ./bin/mettle tests/test_gpu_dispatch.mettle -o /tmp/mettle-arm64-gpu.o
-          readelf -r /tmp/mettle-arm64-gpu.o | grep -q 'R_AARCH64_CALL26.*cuLaunchKernel'
-          gcc -no-pie /tmp/mettle-arm64-gpu.o tests/arm64/cuda_launch_stub.c -o /tmp/mettle-arm64-gpu
-          /tmp/mettle-arm64-gpu
+          readelf -r /tmp/mettle-arm64-gpu.o | grep -q 'R_AARCH64_CALL26.*dlsym'
+          ./bin/mettle --release --emit-obj src/runtime/string.mettle -o /tmp/mettle-arm64-string.o
+          gcc -std=c99 -O2 -D_GNU_SOURCE -Isrc -c src/runtime/atomics.c -o /tmp/mettle-arm64-atomics.o
+          mkdir -p /tmp/mettle-cuda-stub
+          gcc -shared -fPIC tests/arm64/cuda_launch_stub.c -o /tmp/mettle-cuda-stub/libcuda.so.1
+          gcc -no-pie /tmp/mettle-arm64-gpu.o /tmp/mettle-arm64-string.o /tmp/mettle-arm64-atomics.o \
+            -L/tmp/mettle-cuda-stub -l:libcuda.so.1 -ldl -o /tmp/mettle-arm64-gpu
+          LD_LIBRARY_PATH=/tmp/mettle-cuda-stub /tmp/mettle-arm64-gpu
 
   sanitize:
     name: Sanitizers (linux gcc)
