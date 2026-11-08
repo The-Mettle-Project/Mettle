@@ -1,0 +1,7 @@
+name = mmll
+version = 0.2.0
+description = Tensors, gradients, layers, Muon and Adam, safetensors checkpoints, on every CPU core or an NVIDIA GPU's tensor cores
+license = Apache-2.0
+source = https://github.com/The-Mettle-Project/Mettle/tree/master/website/registry/packages/mmll
+compiler = 0.18.0
+require = json 1.0.0

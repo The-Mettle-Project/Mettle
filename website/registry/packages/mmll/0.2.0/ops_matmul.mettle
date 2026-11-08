@@ -1,0 +1,191 @@
+import "std/mem";
+import "./tensor";
+import "./kernels";
+import "./graph";
+
+export fn batch_of(s: Shape) -> int64 {
+  var z: int64 = 1;
+  for i in 0..s.rank - 2 { z = z * s.dims[i]; }
+  return z;
+}
+
+fn matmul_any(a: Var, b: Var, trans_b: bool) -> Var {
+  var g: Graph* = a.g;
+  var sa: Shape = a.shape();
+  var sb: Shape = b.shape();
+  if (sa.rank < 2 || sb.rank < 2) {
+    mmll_fail("matmul needs two operands of rank 2 or more, got {sa.text()} and {sb.text()}");
+  }
+  var m: int64 = sa.dims[sa.rank - 2];
+  var k: int64 = sa.dims[sa.rank - 1];
+  var kb: int64 = if (trans_b) sb.dims[sb.rank - 1] else sb.dims[sb.rank - 2];
+  var n: int64 = if (trans_b) sb.dims[sb.rank - 2] else sb.dims[sb.rank - 1];
+  if (k != kb) {
+    var verb: string = if (trans_b) "matmul_t" else "matmul";
+    mmll_fail("{verb} of {sa.text()} and {sb.text()}: inner sizes {k} and {kb} differ");
+  }
+  var batched: bool = sb.rank > 2;
+  if (batched) {
+    if (sb.rank != sa.rank) { mmll_fail("a batched matmul needs equal ranks, got {sa.text()} and {sb.text()}"); }
+    for i in 0..sa.rank - 2 {
+      if (sa.dims[i] != sb.dims[i]) { mmll_fail("batch dimensions of {sa.text()} and {sb.text()} differ"); }
+    }
+  }
+  var out: Shape = sa.with(-1, n);
+  var op: int32 = if (trans_b) OP_MATMUL_NT else OP_MATMUL;
+  var id: int32 = g->push(op, a.id, b.id, -1, out);
+  g->nodes[id].i0 = if (batched) 1 else 0;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var pa: float32* = g->data(a.id);
+  var pb: float32* = g->data(b.id);
+  var pc: float32* = g->data(id);
+  if (!batched) {
+    var rows: int64 = sa.size() / (if (k < 1) 1 else k);
+    if (trans_b) {
+      gemm_nt(rows, n, k, pa, k, pb, k, pc, n, false);
+    } else {
+      var bt: float32* = g->floats(k * n);
+      transpose_f32(pb, k, n, bt);
+      gemm_nt(rows, n, k, pa, k, bt, k, pc, n, false);
+    }
+  } else {
+    var z: int64 = batch_of(sa);
+    if (trans_b) {
+      gemm_nt_batched(z, m, n, k, pa, k, m * k, pb, k, n * k, pc, n, m * n, false);
+    } else {
+      var bt: float32* = g->floats(z * k * n);
+      transpose_batched(z, pb, k, n, bt);
+      gemm_nt_batched(z, m, n, k, pa, k, m * k, bt, k, n * k, pc, n, m * n, false);
+    }
+  }
+  return { g: g, id: id };
+}
+
+export fn Var_matmul(a: Var, b: Var) -> Var { return matmul_any(a, b, false); }
+export fn Var_matmul_t(a: Var, b: Var) -> Var { return matmul_any(a, b, true); }
+
+export fn backward_matmul(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var trans_b: bool = node->op == OP_MATMUL_NT;
+  var batched: bool = node->i0 == 1;
+  var ia: int32 = node->a;
+  var ib: int32 = node->b;
+  var dc: float32* = node->grad;
+  var sa: Shape = g->nodes[ia].value.shape;
+  var sb: Shape = g->nodes[ib].value.shape;
+  var pa: float32* = g->data(ia);
+  var pb: float32* = g->data(ib);
+  var m: int64 = sa.dims[sa.rank - 2];
+  var k: int64 = sa.dims[sa.rank - 1];
+  var n: int64 = if (trans_b) sb.dims[sb.rank - 2] else sb.dims[sb.rank - 1];
+  if (!batched) {
+    var rows: int64 = sa.size() / (if (k < 1) 1 else k);
+    if (g->nodes[ia].requires) {
+      var da: float32* = g->grad_of(ia);
+      if (trans_b) {
+        var bt: float32* = g->floats(k * n);
+        transpose_f32(pb, n, k, bt);
+        gemm_nt(rows, k, n, dc, n, bt, n, da, k, true);
+      } else {
+        gemm_nt(rows, k, n, dc, n, pb, n, da, k, true);
+      }
+    }
+    if (g->nodes[ib].requires) {
+      var db: float32* = g->grad_of(ib);
+      var at: float32* = g->floats(rows * k);
+      var dct: float32* = g->floats(rows * n);
+      transpose_f32(pa, rows, k, at);
+      transpose_f32(dc, rows, n, dct);
+      if (trans_b) {
+        gemm_nt(n, k, rows, dct, rows, at, rows, db, k, true);
+      } else {
+        gemm_nt(k, n, rows, at, rows, dct, rows, db, n, true);
+      }
+    }
+    return;
+  }
+  var z: int64 = batch_of(sa);
+  if (g->nodes[ia].requires) {
+    var da: float32* = g->grad_of(ia);
+    if (trans_b) {
+      var bt: float32* = g->floats(z * k * n);
+      transpose_batched(z, pb, n, k, bt);
+      gemm_nt_batched(z, m, k, n, dc, n, m * n, bt, n, k * n, da, k, m * k, true);
+    } else {
+      gemm_nt_batched(z, m, k, n, dc, n, m * n, pb, n, k * n, da, k, m * k, true);
+    }
+  }
+  if (g->nodes[ib].requires) {
+    var db: float32* = g->grad_of(ib);
+    var at: float32* = g->floats(z * m * k);
+    var dct: float32* = g->floats(z * m * n);
+    transpose_batched(z, pa, m, k, at);
+    transpose_batched(z, dc, m, n, dct);
+    if (trans_b) {
+      gemm_nt_batched(z, n, k, m, dct, m, n * m, at, m, k * m, db, k, n * k, true);
+    } else {
+      gemm_nt_batched(z, k, n, m, at, m, k * m, dct, m, n * m, db, n, k * n, true);
+    }
+  }
+}
+
+export fn linear(x: Var, w: Var, bias: Var) -> Var {
+  return linear_any(x, w, bias.id, bias.g);
+}
+
+export fn linear_nobias(x: Var, w: Var) -> Var {
+  return linear_any(x, w, -1, x.g);
+}
+
+fn linear_any(x: Var, w: Var, bias_id: int32, bias_graph: Graph*) -> Var {
+  var g: Graph* = x.g;
+  if (w.g != g || bias_graph != g) { mmll_fail("linear operands belong to different graphs"); }
+  var sx: Shape = x.shape();
+  var sw: Shape = w.shape();
+  if (sw.rank != 2) { mmll_fail("a linear weight is [out, in], got {sw.text()}"); }
+  var k: int64 = sx.last();
+  var n: int64 = sw.dims[0];
+  if (sw.dims[1] != k) { mmll_fail("linear of {sx.text()} by a {sw.text()} weight: in features differ"); }
+  if (bias_id >= 0) {
+    var sbias: Shape = g->nodes[bias_id].value.shape;
+    if (sbias.size() != n) { mmll_fail("a linear bias needs {n} values, got {sbias.text()}"); }
+  }
+  var id: int32 = g->push(OP_LINEAR, x.id, w.id, bias_id, sx.with(-1, n));
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var rows: int64 = sx.size() / (if (k < 1) 1 else k);
+  var out: float32* = g->data(id);
+  gemm_nt(rows, n, k, g->data(x.id), k, g->data(w.id), k, out, n, false);
+  if (bias_id >= 0) { add_bias_rows(out, g->data(bias_id), rows, n); }
+  return { g: g, id: id };
+}
+
+export fn backward_linear(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var ix: int32 = node->a;
+  var iw: int32 = node->b;
+  var ib: int32 = node->c;
+  var dc: float32* = node->grad;
+  var sx: Shape = g->nodes[ix].value.shape;
+  var k: int64 = sx.last();
+  var n: int64 = g->nodes[iw].value.shape.dims[0];
+  var rows: int64 = sx.size() / (if (k < 1) 1 else k);
+  var px: float32* = g->data(ix);
+  var pw: float32* = g->data(iw);
+  if (g->nodes[ix].requires) {
+    var dx: float32* = g->grad_of(ix);
+    var wt: float32* = g->floats(k * n);
+    transpose_f32(pw, n, k, wt);
+    gemm_nt(rows, k, n, dc, n, wt, n, dx, k, true);
+  }
+  if (g->nodes[iw].requires) {
+    var dw: float32* = g->grad_of(iw);
+    var xt: float32* = g->floats(rows * k);
+    var dct: float32* = g->floats(rows * n);
+    transpose_f32(px, rows, k, xt);
+    transpose_f32(dc, rows, n, dct);
+    gemm_nt(n, k, rows, dct, rows, xt, rows, dw, k, true);
+  }
+  if (ib >= 0 && g->nodes[ib].requires) {
+    column_sums_into(g->grad_of(ib), dc, rows, n);
+  }
+}

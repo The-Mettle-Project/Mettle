@@ -1,0 +1,413 @@
+import "std/mem";
+import "std/math";
+import "./tensor";
+import "./kernels";
+import "./graph";
+import "./ops_nn";
+
+struct AttnJob {
+  qkv: float32*;
+  out: float32*;
+  probs: float32*;
+  dout: float32*;
+  dqkv: float32*;
+  batch: int64;
+  time: int64;
+  width: int64;
+  heads: int64;
+  head_dim: int64;
+  causal: bool;
+  scale: float32;
+  key: uint64;
+  threshold: uint64;
+  keep: float32;
+  dropping: bool;
+}
+
+fn gather_head(src: float32*, row_stride: int64, time: int64, dim: int64, dst: float32*) {
+  for t: int64 in 0..time { copy_f32(dst + t * dim, src + t * row_stride, dim); }
+}
+
+fn scatter_head_add(dst: float32*, row_stride: int64, time: int64, dim: int64, src: float32*) {
+  for t: int64 in 0..time { add_into_f32(dst + t * row_stride, src + t * dim, dim); }
+}
+
+fn local_transpose(src: float32*, rows: int64, cols: int64, dst: float32*) {
+  for r: int64 in 0..rows {
+    var row: float32* = src + r * cols;
+    for c: int64 in 0..cols { dst[c * rows + r] = row[c]; }
+  }
+}
+
+fn visible(j: AttnJob*, i: int64) -> int64 {
+  return if j->causal { i + 1 } else { j->time };
+}
+
+fn drop_mask(j: AttnJob*, base: int64, at: int64) -> float32 {
+  if (!j->dropping) { return 1.0; }
+  return if keep_hash(j->key, base + at) >= j->threshold { j->keep } else { (float32)0.0 };
+}
+
+@noinline fn attention_forward_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: AttnJob* = (AttnJob*)ctx;
+  var t_len: int64 = j->time;
+  var d: int64 = j->head_dim;
+  var c: int64 = j->width;
+  var stride: int64 = 3 * c;
+  var scratch: float32* = (float32*)malloc((4 * t_len * d + t_len) * 4);
+  var q: float32* = scratch;
+  var k: float32* = q + t_len * d;
+  var vt: float32* = k + t_len * d;
+  var v: float32* = vt + t_len * d;
+  var row: float32* = v + t_len * d;
+  for task: int64 in lo..hi {
+    var b: int64 = task / j->heads;
+    var h: int64 = task - b * j->heads;
+    var base: float32* = j->qkv + b * t_len * stride + h * d;
+    gather_head(base, stride, t_len, d, q);
+    gather_head(base + c, stride, t_len, d, k);
+    gather_head(base + 2 * c, stride, t_len, d, v);
+    local_transpose(v, t_len, d, vt);
+    var p_task: float32* = j->probs + task * t_len * t_len;
+    var o_base: float32* = j->out + b * t_len * c + h * d;
+    for i: int64 in 0..t_len {
+      var vis: int64 = visible(j, i);
+      var p: float32* = p_task + i * t_len;
+      var best: float32 = 0.0;
+      for t: int64 in 0..vis {
+        var s: float32 = dot_f32(q + i * d, k + t * d, d) * j->scale;
+        p[t] = s;
+        best = if t == 0 || s > best { s } else { best };
+      }
+      var total: float32 = 0.0;
+      for t: int64 in 0..vis {
+        var e: float32 = exp_f32(p[t] - best);
+        p[t] = e;
+        total = total + e;
+      }
+      scale_f32(p, (float32)1.0 / total, vis);
+      if (vis < t_len) { zero_f32(p + vis, t_len - vis); }
+      var used: float32* = p;
+      if (j->dropping) {
+        var mask_base: int64 = (task * t_len + i) * t_len;
+        for t: int64 in 0..vis { row[t] = p[t] * drop_mask(j, mask_base, t); }
+        used = row;
+      }
+      var o: float32* = o_base + i * c;
+      for e: int64 in 0..d { o[e] = dot_f32(used, vt + e * t_len, vis); }
+    }
+  }
+  free((rawptr)scratch);
+  return 0;
+}
+
+@noinline fn attention_backward_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: AttnJob* = (AttnJob*)ctx;
+  var t_len: int64 = j->time;
+  var d: int64 = j->head_dim;
+  var c: int64 = j->width;
+  var stride: int64 = 3 * c;
+  var scratch: float32* = (float32*)malloc((10 * t_len * d + 3 * t_len * t_len) * 4);
+  var q: float32* = scratch;
+  var k: float32* = q + t_len * d;
+  var v: float32* = k + t_len * d;
+  var dout: float32* = v + t_len * d;
+  var qt: float32* = dout + t_len * d;
+  var kt: float32* = qt + t_len * d;
+  var dout_t: float32* = kt + t_len * d;
+  var dq: float32* = dout_t + t_len * d;
+  var dk: float32* = dq + t_len * d;
+  var dv: float32* = dk + t_len * d;
+  var pd_t: float32* = dv + t_len * d;
+  var ds: float32* = pd_t + t_len * t_len;
+  var ds_t: float32* = ds + t_len * t_len;
+  for task: int64 in lo..hi {
+    var b: int64 = task / j->heads;
+    var h: int64 = task - b * j->heads;
+    var base: float32* = j->qkv + b * t_len * stride + h * d;
+    gather_head(base, stride, t_len, d, q);
+    gather_head(base + c, stride, t_len, d, k);
+    gather_head(base + 2 * c, stride, t_len, d, v);
+    gather_head(j->dout + b * t_len * c + h * d, c, t_len, d, dout);
+    local_transpose(q, t_len, d, qt);
+    local_transpose(k, t_len, d, kt);
+    local_transpose(dout, t_len, d, dout_t);
+    var p_task: float32* = j->probs + task * t_len * t_len;
+    for i: int64 in 0..t_len {
+      var vis: int64 = visible(j, i);
+      var p: float32* = p_task + i * t_len;
+      var mask_base: int64 = (task * t_len + i) * t_len;
+      var dsi: float32* = ds + i * t_len;
+      for t: int64 in 0..t_len {
+        var m: float32 = if t < vis { drop_mask(j, mask_base, t) } else { (float32)0.0 };
+        pd_t[t * t_len + i] = p[t] * m;
+        dsi[t] = if t < vis { dot_f32(dout + i * d, v + t * d, d) * m } else { (float32)0.0 };
+      }
+      var inner: float32 = dot_f32(p, dsi, vis);
+      for t: int64 in 0..vis { dsi[t] = p[t] * (dsi[t] - inner) * j->scale; }
+    }
+    local_transpose(ds, t_len, t_len, ds_t);
+    for t: int64 in 0..t_len {
+      var first: int64 = if j->causal { t } else { 0 };
+      var span: int64 = t_len - first;
+      for e: int64 in 0..d {
+        dv[t * d + e] = dot_f32(pd_t + t * t_len + first, dout_t + e * t_len + first, span);
+        dk[t * d + e] = dot_f32(ds_t + t * t_len + first, qt + e * t_len + first, span);
+      }
+    }
+    for i: int64 in 0..t_len {
+      var vis: int64 = visible(j, i);
+      for e: int64 in 0..d { dq[i * d + e] = dot_f32(ds + i * t_len, kt + e * t_len, vis); }
+    }
+    var dbase: float32* = j->dqkv + b * t_len * stride + h * d;
+    scatter_head_add(dbase, stride, t_len, d, dq);
+    scatter_head_add(dbase + c, stride, t_len, d, dk);
+    scatter_head_add(dbase + 2 * c, stride, t_len, d, dv);
+  }
+  free((rawptr)scratch);
+  return 0;
+}
+
+export fn self_attention(qkv: Var, heads: int64, causal: bool, dropout_p: float64) -> Var {
+  var g: Graph* = qkv.g;
+  var s: Shape = qkv.shape();
+  if (s.rank != 3 || s.dims[2] % 3 != 0) { mmll_fail("self_attention takes [batch, time, 3 * width], got {s.text()}"); }
+  var c: int64 = s.dims[2] / 3;
+  if (heads < 1 || c % heads != 0) { mmll_fail("width {c} does not split into {heads} heads"); }
+  if (dropout_p < 0.0 || dropout_p >= 1.0) { mmll_fail("attention dropout must be in [0, 1), got {dropout_p}"); }
+  var id: int32 = g->push(OP_ATTENTION, qkv.id, -1, -1, shape(s.dims[0], s.dims[1], c));
+  var j: AttnJob* = new AttnJob;
+  j->qkv = g->data(qkv.id);
+  j->out = g->data(id);
+  j->batch = s.dims[0];
+  j->time = s.dims[1];
+  j->width = c;
+  j->heads = heads;
+  j->head_dim = c / heads;
+  j->causal = causal;
+  j->scale = (float32)(1.0 / sqrt((float64)(c / heads)));
+  j->probs = if g->on_device() { (float32*)0 } else { g->floats(j->batch * heads * j->time * j->time) };
+  j->dropping = g->training && dropout_p > 0.0;
+  if (j->dropping) {
+    j->key = (&g->rng)->next();
+    j->threshold = drop_threshold(dropout_p);
+    j->keep = (float32)(1.0 / (1.0 - dropout_p));
+  }
+  var node: Node* = g->node(id);
+  node->saved = j->probs;
+  node->i0 = heads;
+  node->i1 = if causal { 1 } else { 0 };
+  node->i2 = if j->dropping { 1 } else { 0 };
+  node->i3 = (int64)j->key;
+  node->f0 = (float32)dropout_p;
+  if (g->forward_on_device(id)) {
+    free((rawptr)j);
+    return { g: g, id: id };
+  }
+  run_parallel(&attention_forward_tasks, (rawptr)j, j->batch * heads, j->time * j->time * j->head_dim * 2);
+  free((rawptr)j);
+  return { g: g, id: id };
+}
+
+struct RopeJob {
+  x: float32*;
+  y: float32*;
+  dy: float32*;
+  dx: float32*;
+  rstd: float32*;
+  freq: float32*;
+  time: int64;
+  width: int64;
+  heads: int64;
+  offset: int64;
+}
+
+const ROPE_EPS = 1.1920929e-7;
+
+fn rope_row(j: RopeJob*, r: int64) {
+  var c: int64 = j->width;
+  var hd: int64 = c / j->heads;
+  var half: int64 = hd / 2;
+  var table: float32* = j->freq + (r % j->time) * hd;
+  var x: float32* = j->x + r * 3 * c;
+  var y: float32* = j->y + r * 3 * c;
+  for seg: int64 in 0..2 * j->heads {
+    var xs: float32* = x + seg * hd;
+    var ys: float32* = y + seg * hd;
+    var sq: float32 = 0.0;
+    for i: int64 in 0..hd { sq = sq + xs[i] * xs[i]; }
+    var rs: float32 = (float32)(1.0 / sqrt((float64)sq / (float64)hd + ROPE_EPS));
+    j->rstd[r * 2 * j->heads + seg] = rs;
+    for i: int64 in 0..half {
+      var co: float32 = table[2 * i];
+      var si: float32 = table[2 * i + 1];
+      var a: float32 = xs[2 * i] * rs;
+      var b: float32 = xs[2 * i + 1] * rs;
+      ys[2 * i] = a * co - b * si;
+      ys[2 * i + 1] = a * si + b * co;
+    }
+  }
+  copy_f32(y + 2 * c, x + 2 * c, c);
+}
+
+fn rope_row_back(j: RopeJob*, r: int64) {
+  var c: int64 = j->width;
+  var hd: int64 = c / j->heads;
+  var half: int64 = hd / 2;
+  var table: float32* = j->freq + (r % j->time) * hd;
+  var x: float32* = j->x + r * 3 * c;
+  var dy: float32* = j->dy + r * 3 * c;
+  var dx: float32* = j->dx + r * 3 * c;
+  var tmp: float32[256];
+  for seg: int64 in 0..2 * j->heads {
+    var xs: float32* = x + seg * hd;
+    var ds: float32* = dy + seg * hd;
+    var rs: float32 = j->rstd[r * 2 * j->heads + seg];
+    var dot: float32 = 0.0;
+    for i: int64 in 0..half {
+      var co: float32 = table[2 * i];
+      var si: float32 = table[2 * i + 1];
+      var g0: float32 = ds[2 * i] * co + ds[2 * i + 1] * si;
+      var g1: float32 = ds[2 * i + 1] * co - ds[2 * i] * si;
+      tmp[2 * i] = g0;
+      tmp[2 * i + 1] = g1;
+      dot = dot + g0 * xs[2 * i] * rs + g1 * xs[2 * i + 1] * rs;
+    }
+    var mean: float32 = dot / (float32)hd;
+    var out: float32* = dx + seg * hd;
+    for i: int64 in 0..hd { out[i] = out[i] + rs * (tmp[i] - xs[i] * rs * mean); }
+  }
+  add_into_f32(dx + 2 * c, dy + 2 * c, c);
+}
+
+@noinline fn rope_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RopeJob* = (RopeJob*)ctx;
+  for r: int64 in lo..hi { rope_row(j, r); }
+  return 0;
+}
+
+@noinline fn rope_back_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RopeJob* = (RopeJob*)ctx;
+  for r: int64 in lo..hi { rope_row_back(j, r); }
+  return 0;
+}
+
+export fn rope_table(g: Graph*, time: int64, offset: int64, hd: int64, base: float64) -> float32* {
+  var n: int64 = time * hd;
+  var host: float32* = (float32*)malloc(n * 4);
+  for t: int64 in 0..time {
+    for i: int64 in 0..hd / 2 {
+      var inv: float32 = (float32)(1.0 / pow(base, (float64)(2 * i) / (float64)hd));
+      var angle: float32 = (float32)(t + offset) * inv;
+      host[t * hd + 2 * i] = (float32)cos((float64)angle);
+      host[t * hd + 2 * i + 1] = (float32)sin((float64)angle);
+    }
+  }
+  var out: float32* = g->floats(n);
+  if (g->on_device()) {
+    g->dev->put((rawptr)out, (rawptr)host, n * 4);
+  } else {
+    copy_f32(out, host, n);
+  }
+  free((rawptr)host);
+  return out;
+}
+
+export fn qk_norm_rope(qkv: Var, heads: int64, base: float64, offset: int64) -> Var {
+  var g: Graph* = qkv.g;
+  var s: Shape = qkv.shape();
+  if (s.rank < 2 || s.dims[s.rank - 1] % 3 != 0) { mmll_fail("qk_norm_rope takes [batch, time, 3 * width], got {s.text()}"); }
+  var c: int64 = s.dims[s.rank - 1] / 3;
+  if (heads < 1 || c % heads != 0 || (c / heads) % 2 != 0 || c / heads > 256) { mmll_fail("width {c} does not split into {heads} even heads of at most 256"); }
+  var time: int64 = s.dims[s.rank - 2];
+  var rows: int64 = s.rows();
+  var id: int32 = g->push(OP_QK_ROPE, qkv.id, -1, -1, s);
+  var node: Node* = g->node(id);
+  node->saved = g->floats(rows * 2 * heads);
+  node->saved2 = rope_table(g, time, offset, c / heads, base);
+  node->i0 = heads;
+  node->i1 = time;
+  node->i2 = offset;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var j: RopeJob = { x: g->data(qkv.id), y: g->data(id), dy: (float32*)0, dx: (float32*)0, rstd: node->saved, freq: node->saved2, time: time, width: c, heads: heads, offset: offset };
+  run_parallel(&rope_tasks, (rawptr)&j, rows, c * 16);
+  return { g: g, id: id };
+}
+
+export fn backward_qk_rope(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  if (!g->nodes[node->a].requires) { return; }
+  var s: Shape = node->value.shape;
+  var c: int64 = s.dims[s.rank - 1] / 3;
+  var j: RopeJob = { x: g->data(node->a), y: g->data(id), dy: node->grad, dx: g->grad_of(node->a), rstd: node->saved, freq: node->saved2, time: node->i1, width: c, heads: node->i0, offset: node->i2 };
+  run_parallel(&rope_back_tasks, (rawptr)&j, s.rows(), c * 24);
+}
+
+export fn cached_attention(qkv: Var, keys: float32*, values: float32*, at: int64, heads: int64) -> Var {
+  var g: Graph* = qkv.g;
+  var s: Shape = qkv.shape();
+  if (s.size() % 3 != 0 || s.rows() != 1) { mmll_fail("cached_attention takes one token as [1, 3 * width], got {s.text()}"); }
+  var c: int64 = s.last() / 3;
+  if (heads < 1 || c % heads != 0) { mmll_fail("width {c} does not split into {heads} heads"); }
+  if (g->record && g->nodes[qkv.id].requires) { mmll_fail("cached_attention is for generation and has no gradient; set g->record = false"); }
+  var id: int32 = g->push(OP_CACHED_ATTENTION, qkv.id, -1, -1, shape(1, c));
+  var node: Node* = g->node(id);
+  node->ext = (rawptr)keys;
+  node->saved = values;
+  node->saved2 = g->floats(heads * (at + 1));
+  node->i0 = heads;
+  node->i1 = at;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var q: float32* = g->data(qkv.id);
+  var out: float32* = g->data(id);
+  var hd: int64 = c / heads;
+  var scale: float32 = (float32)(1.0 / sqrt((float64)hd));
+  copy_f32(keys + at * c, q + c, c);
+  copy_f32(values + at * c, q + 2 * c, c);
+  zero_f32(out, c);
+  var scores: float32* = node->saved2;
+  for h: int64 in 0..heads {
+    var row: float32* = scores + h * (at + 1);
+    var best: float32 = 0.0;
+    for t: int64 in 0..at + 1 {
+      var v: float32 = dot_f32(q + h * hd, keys + t * c + h * hd, hd) * scale;
+      row[t] = v;
+      if (t == 0 || v > best) { best = v; }
+    }
+    var total: float32 = 0.0;
+    for t: int64 in 0..at + 1 {
+      var e: float32 = exp_f32(row[t] - best);
+      row[t] = e;
+      total = total + e;
+    }
+    var inv: float32 = (float32)1.0 / total;
+    for t: int64 in 0..at + 1 {
+      axpy_f32(out + h * hd, row[t] * inv, values + t * c + h * hd, hd);
+    }
+  }
+  return { g: g, id: id };
+}
+
+export fn backward_attention(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  if (!g->nodes[node->a].requires) { return; }
+  var s: Shape = g->nodes[node->a].value.shape;
+  var j: AttnJob* = new AttnJob;
+  j->qkv = g->data(node->a);
+  j->dout = node->grad;
+  j->probs = node->saved;
+  j->batch = s.dims[0];
+  j->time = s.dims[1];
+  j->width = s.dims[2] / 3;
+  j->heads = node->i0;
+  j->head_dim = j->width / j->heads;
+  j->causal = node->i1 == 1;
+  j->scale = (float32)(1.0 / sqrt((float64)j->head_dim));
+  j->dropping = node->i2 == 1;
+  j->key = (uint64)node->i3;
+  j->threshold = drop_threshold((float64)node->f0);
+  j->keep = (float32)(1.0 / (1.0 - (float64)node->f0));
+  j->dqkv = g->grad_of(node->a);
+  run_parallel(&attention_backward_tasks, (rawptr)j, j->batch * j->heads, j->time * j->time * j->head_dim * 5);
+  free((rawptr)j);
+}

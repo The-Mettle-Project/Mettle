@@ -1,0 +1,154 @@
+import "std/mem";
+import "std/time";
+import "./tensor";
+import "./kernels";
+import "./graph";
+import "./ops_elementwise";
+import "./ops_shape";
+import "./ops_matmul";
+import "./ops_nn";
+import "./ops_conv";
+import "./ops_attention";
+
+fn backward_node(g: Graph*, id: int32) {
+  var op: int32 = g->nodes[id].op;
+  if (op == OP_LEAF || op == OP_RESHAPE) { return; }
+  if (op >= OP_ADD && op <= OP_DIV) { backward_binary(g, id); return; }
+  if (op >= OP_ADD_SCALAR && op <= OP_SQUARE) { backward_unary(g, id); return; }
+  if (op >= OP_SUM_ALL && op <= OP_MAX) { backward_reduce(g, id); return; }
+  if (op == OP_TRANSPOSE) { backward_transpose(g, id); return; }
+  if (op == OP_SLICE) { backward_slice(g, id); return; }
+  if (op == OP_CONCAT) { backward_concat(g, id); return; }
+  if (op == OP_MATMUL || op == OP_MATMUL_NT) { backward_matmul(g, id); return; }
+  if (op == OP_LINEAR) { backward_linear(g, id); return; }
+  if (op >= OP_SOFTMAX && op <= OP_CAUSAL_SOFTMAX) { backward_softmax(g, id); return; }
+  if (op == OP_CROSS_ENTROPY) { backward_cross_entropy(g, id); return; }
+  if (op == OP_MSE) { backward_mse(g, id); return; }
+  if (op == OP_BCE_LOGITS) { backward_bce(g, id); return; }
+  if (op == OP_LAYER_NORM || op == OP_RMS_NORM) { backward_norm(g, id); return; }
+  if (op == OP_DROPOUT) { backward_dropout(g, id); return; }
+  if (op == OP_GATHER_ROWS) { backward_gather_rows(g, id); return; }
+  if (op == OP_ATTENTION) { backward_attention(g, id); return; }
+  if (op == OP_QK_ROPE) { backward_qk_rope(g, id); return; }
+  if (op == OP_CONV2D) { backward_conv2d(g, id); return; }
+  if (op == OP_MAX_POOL2D || op == OP_AVG_POOL2D) { backward_pool(g, id); return; }
+  if (op == OP_BATCH_NORM) { backward_batch_norm(g, id); return; }
+  mmll_fail("no gradient for op {op}");
+}
+
+export fn Var_backward(loss: Var) {
+  var g: Graph* = loss.g;
+  if (!g->record) { mmll_fail("backward on a graph that records nothing; set record before building it"); }
+  if (loss.size() != 1) { mmll_fail("backward needs a scalar, got {loss.shape().text()}; use backward_with for a seed"); }
+  if (!g->nodes[loss.id].requires) { return; }
+  var seed: float32* = g->grad_of(loss.id);
+  if (g->on_device()) {
+    var one: float32* = g->floats(1);
+    g->dev->fill(one, 1.0, 1);
+    g->dev->add(seed, one, 1.0, 1);
+  } else {
+    seed[0] = seed[0] + (float32)1.0;
+  }
+  run_backward(g, loss.id);
+}
+
+export fn Var_backward_with(out: Var, seed: Tensor) {
+  var g: Graph* = out.g;
+  if (!seed.shape.equal(out.shape())) {
+    mmll_fail("a seed of {seed.shape.text()} for an output of {out.shape().text()}");
+  }
+  if (!g->nodes[out.id].requires) { return; }
+  var n: int64 = seed.shape.size();
+  if (g->on_device()) {
+    var staged: float32* = g->floats(if (n < 1) 1 else n);
+    g->dev->put((rawptr)staged, (rawptr)seed.data, n * 4);
+    g->dev->add(g->grad_of(out.id), staged, 1.0, n);
+  } else {
+    add_into_f32(g->grad_of(out.id), seed.data, n);
+  }
+  run_backward(g, out.id);
+}
+
+fn backward_any(g: Graph*, id: int32) {
+  if (!g->backward_on_device(id)) { backward_node(g, id); }
+}
+
+fn run_backward(g: Graph*, from: int32) {
+  if (g->profiling) { g->profile_close(); }
+  var id: int32 = from;
+  while (id >= 0) {
+    if (g->nodes[id].requires && g->nodes[id].grad != 0) {
+      if (g->profiling) {
+        if (g->on_device()) { g->dev->wait(); }
+        var started: int64 = time_mono_ns();
+        backward_any(g, id);
+        if (g->on_device()) { g->dev->wait(); }
+        g->profile_backward(g->nodes[id].op, time_mono_ns() - started);
+      } else {
+        backward_any(g, id);
+      }
+    }
+    id = id - 1;
+  }
+}
+
+export fn gradcheck(build: fn(Graph*, Var*) -> Var, inputs: Tensor*, count: int32, eps: float64, tolerance: float64) -> float64 {
+  var g: Graph* = graph_new();
+  var vars: Var* = (Var*)malloc((int64)count * sizeof(Var));
+  for i in 0..count { vars[i] = g->variable(inputs[i]); }
+  var out: Var = build(g, vars);
+  var size: int64 = out.size();
+  var weights: float32* = (float32*)malloc(size * 4);
+  var rng: Rng = rng_new(99);
+  var rp: Rng* = &rng;
+  for i: int64 in 0..size { weights[i] = (float32)(rp->uniform() * 2.0 - 1.0); }
+  var seed: Tensor = tensor_view(weights, out.shape());
+  out.backward_with(seed);
+  var analytic: float32** = (float32**)malloc((int64)count * 8);
+  for i in 0..count {
+    var n: int64 = inputs[i].shape.size();
+    analytic[i] = (float32*)malloc(n * 4);
+    var gp: float32* = g->nodes[vars[i].id].grad;
+    for k: int64 in 0..n { analytic[i][k] = if gp == 0 { (float32)0.0 } else { gp[k] }; }
+  }
+  var worst: float64 = 0.0;
+  for i in 0..count {
+    var n: int64 = inputs[i].shape.size();
+    for k: int64 in 0..n {
+      var keep: float32 = inputs[i].data[k];
+      inputs[i].data[k] = (float32)((float64)keep + eps);
+      var up: float64 = weighted(build, inputs, count, weights);
+      inputs[i].data[k] = (float32)((float64)keep - eps);
+      var down: float64 = weighted(build, inputs, count, weights);
+      inputs[i].data[k] = keep;
+      var numeric: float64 = (up - down) / (2.0 * eps);
+      var exact: float64 = (float64)analytic[i][k];
+      var diff: float64 = numeric - exact;
+      if (diff < 0.0) { diff = -diff; }
+      var scale: float64 = if numeric < 0.0 { -numeric } else { numeric };
+      if (scale < 1.0) { scale = 1.0; }
+      var err: float64 = diff / scale;
+      if (err > worst) { worst = err; }
+    }
+    free((rawptr)analytic[i]);
+  }
+  free((rawptr)analytic);
+  free((rawptr)weights);
+  free((rawptr)vars);
+  graph_free(g);
+  return worst;
+}
+
+fn weighted(build: fn(Graph*, Var*) -> Var, inputs: Tensor*, count: int32, weights: float32*) -> float64 {
+  var g: Graph* = graph_new();
+  g->record = false;
+  var vars: Var* = (Var*)malloc((int64)count * sizeof(Var));
+  for i in 0..count { vars[i] = g->input(inputs[i]); }
+  var out: Var = build(g, vars);
+  var total: float64 = 0.0;
+  var p: float32* = out.data();
+  for k: int64 in 0..out.size() { total = total + (float64)p[k] * (float64)weights[k]; }
+  free((rawptr)vars);
+  graph_free(g);
+  return total;
+}

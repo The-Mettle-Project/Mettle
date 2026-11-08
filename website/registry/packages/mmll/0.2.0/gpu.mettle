@@ -1,0 +1,3547 @@
+import "std/mem";
+import "std/math";
+import "std/gpu";
+import "./tensor";
+import "./kernels";
+import "./graph";
+import "./ops_elementwise";
+import "./ops_shape";
+import "./ops_matmul";
+import "./ops_nn";
+
+struct Gemm {
+  a: float32*;
+  b: float32*;
+  c: float32*;
+  bias: float32*;
+  m: int32;
+  n: int32;
+  k: int32;
+  lda: int32;
+  ldb: int32;
+  ldc: int32;
+  ta: int32;
+  tb: int32;
+  accumulate: int32;
+  alpha: float32;
+  inner: int32;
+  sa_outer: int64;
+  sa_inner: int64;
+  sb_outer: int64;
+  sb_inner: int64;
+  sc_outer: int64;
+  sc_inner: int64;
+  splits: int32;
+  chunk: int32;
+  sp: int64;
+}
+
+struct Bcast {
+  dims: int32[6];
+  sa: int32[6];
+  sb: int32[6];
+  sd: int32[6];
+  rank: int32;
+  count: int32;
+  op: int32;
+  which: int32;
+}
+
+struct Adam {
+  lr: float32;
+  beta1: float32;
+  beta2: float32;
+  eps: float32;
+  decay: float32;
+  shrink: float32;
+  correct1: float32;
+  correct2: float32;
+  momentum: float32;
+  dampening: float32;
+  nesterov: int32;
+  first: int32;
+  kind: int32;
+}
+
+struct Flash {
+  qkv: float32*;
+  out: float32*;
+  lse: float32*;
+  dout: float32*;
+  dqkv: float32*;
+  delta: float32*;
+  time: int32;
+  width: int32;
+  heads: int32;
+  causal: int32;
+  scale: float32;
+  keep: float32;
+  key: uint64;
+  threshold: uint64;
+  dropping: int32;
+}
+
+struct GemmTile {
+  name: string;
+  tm: int32;
+  tn: int32;
+}
+
+const GEMM_TILES: GemmTile[3] = [
+  { name: "128x128", tm: 8, tn: 8 },
+  { name: "128x64", tm: 8, tn: 4 },
+  { name: "64x64", tm: 4, tn: 4 }
+];
+
+struct HeadShape {
+  name: string;
+  dim: int32;
+  parts: int32;
+}
+
+const HEAD_SHAPES: HeadShape[3] = [
+  { name: "32", dim: 32, parts: 1 },
+  { name: "64", dim: 64, parts: 2 },
+  { name: "128", dim: 128, parts: 4 }
+];
+
+struct Conv {
+  n: int32;
+  c: int32;
+  h: int32;
+  w: int32;
+  kh: int32;
+  kw: int32;
+  oh: int32;
+  ow: int32;
+  stride: int32;
+  pad: int32;
+  dilation: int32;
+}
+
+fn z32() -> float32 { return (float32)0.0; }
+fn one32() -> float32 { return (float32)1.0; }
+
+fn d_sigmoid(x: float32) -> float32 {
+  return one32() / (one32() + expf(-x));
+}
+
+fn d_tanh(x: float32) -> float32 {
+  var a: float32 = fabsf(x);
+  var e: float32 = expf((float32)-2.0 * a);
+  var t: float32 = (one32() - e) / (one32() + e);
+  if (x < z32()) { return -t; }
+  return t;
+}
+
+fn d_erf(x: float32) -> float32 {
+  var a: float32 = fabsf(x);
+  if (a < (float32)0.5) {
+    var z: float32 = x * x;
+    var s: float32 = (((((((float32)0.000106837606838 * z + (float32)-0.000757575757576) * z + (float32)0.00462962962963) * z + (float32)-0.0238095238095) * z + (float32)0.1) * z + (float32)-0.333333333333) * z + one32());
+    return (float32)1.1283791670955126 * x * s;
+  }
+  var t: float32 = one32() / (one32() + (float32)0.5 * a);
+  var poly: float32 = (float32)1.00002368 + t * ((float32)0.37409196 + t * ((float32)0.09678418 + t * ((float32)-0.18628806 + t * ((float32)0.27886807 + t * ((float32)-1.13520398 + t * ((float32)1.48851587 + t * ((float32)-0.82215223 + t * (float32)0.17087277)))))));
+  var y: float32 = one32() - t * expf(-a * a + (float32)-1.26551223 + t * poly);
+  if (x < z32()) { return -y; }
+  return y;
+}
+
+fn unary_value(op: int32, v: float32, f0: float32, f1: float32) -> float32 {
+  var half: float32 = 0.5;
+  if (op == 8) { return -v; }
+  if (op == 9) { return expf(v); }
+  if (op == 10) { return logf(v); }
+  if (op == 11) { return sqrtf(v); }
+  if (op == 12) { return d_tanh(v); }
+  if (op == 13) { return d_sigmoid(v); }
+  if (op == 14) { if (v > z32()) { return v; } return z32(); }
+  if (op == 15) { if (v > z32()) { return v; } return f0 * v; }
+  if (op == 16) { return half * v * (one32() + d_erf(v * (float32)0.70710678118654752)); }
+  if (op == 17) { return v / (one32() + expf((float32)-1.5957691216057308 * (v + (float32)0.044715 * v * v * v))); }
+  if (op == 18) { return v * d_sigmoid(v); }
+  if (op == 19) {
+    var m: float32 = z32();
+    if (v > z32()) { m = v; }
+    return m + logf(one32() + expf(-fabsf(v)));
+  }
+  if (op == 20) { return fabsf(v); }
+  if (op == 21) {
+    var c: float32 = v;
+    if (c < f0) { c = f0; }
+    if (c > f1) { c = f1; }
+    return c;
+  }
+  if (op == 22) { return v * v; }
+  if (op == 5) { return v + f0; }
+  if (op == 6) { return v * f0; }
+  return expf(f0 * logf(v));
+}
+
+fn unary_slope(op: int32, d: float32, v: float32, y: float32, f0: float32, f1: float32) -> float32 {
+  var half: float32 = 0.5;
+  if (op == 8) { return -d; }
+  if (op == 9) { return d * y; }
+  if (op == 10) { return d / v; }
+  if (op == 11) { if (y > z32()) { return d * half / y; } return z32(); }
+  if (op == 12) { return d * (one32() - y * y); }
+  if (op == 13) { return d * y * (one32() - y); }
+  if (op == 14) { if (v > z32()) { return d; } return z32(); }
+  if (op == 15) { if (v > z32()) { return d; } return f0 * d; }
+  if (op == 16) {
+    var cdf: float32 = half * (one32() + d_erf(v * (float32)0.70710678118654752));
+    var pdf: float32 = (float32)0.39894228040143268 * expf(-half * v * v);
+    return d * (cdf + v * pdf);
+  }
+  if (op == 17) {
+    var k2: float32 = -1.5957691216057308;
+    var s: float32 = one32() / (one32() + expf(k2 * (v + (float32)0.044715 * v * v * v)));
+    return d * (s - k2 * v * s * (one32() - s) * (one32() + (float32)0.134145 * v * v));
+  }
+  if (op == 18) {
+    var s: float32 = d_sigmoid(v);
+    return d * s * (one32() + v * (one32() - s));
+  }
+  if (op == 19) { return d * d_sigmoid(v); }
+  if (op == 20) {
+    if (v > z32()) { return d; }
+    if (v < z32()) { return -d; }
+    return z32();
+  }
+  if (op == 21) { if (v >= f0 && v <= f1) { return d; } return z32(); }
+  if (op == 22) { return (float32)2.0 * v * d; }
+  if (op == 5) { return d; }
+  if (op == 6) { return f0 * d; }
+  return d * f0 * expf((f0 - one32()) * logf(v));
+}
+
+fn binary_value(op: int32, a: float32, b: float32) -> float32 {
+  if (op == 1) { return a + b; }
+  if (op == 2) { return a - b; }
+  if (op == 3) { return a * b; }
+  return a / b;
+}
+
+fn binary_slope(op: int32, which: int32, d: float32, a: float32, b: float32) -> float32 {
+  if (op == 1) { return d; }
+  if (op == 2) { if (which == 0) { return d; } return -d; }
+  if (op == 3) { if (which == 0) { return d * b; } return d * a; }
+  if (which == 0) { return d / b; }
+  return -d * a / (b * b);
+}
+
+fn drop_bits(key: uint64, index: int64) -> uint64 {
+  var z: uint64 = key + (uint64)index * (uint64)0x9E3779B97F4A7C15;
+  z = (z ^ (z >> (uint64)30)) * (uint64)0xBF58476D1CE4E5B9;
+  z = (z ^ (z >> (uint64)27)) * (uint64)0x94D049BB133111EB;
+  return (z ^ (z >> (uint64)31)) >> (uint64)11;
+}
+
+kernel(block = 256) k_fill(p: float32*, value: float32, n: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    p[i] = value;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_add(dst: float32*, src: float32*, alpha: float32, n: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    dst[i] = dst[i] + alpha * src[i];
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_unary(op: int32, out: float32*, x: float32*, f0: float32, f1: float32, n: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    out[i] = unary_value(op, x[i], f0, f1);
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_unary_back(op: int32, dx: float32*, dy: float32*, x: float32*, y: float32*, f0: float32, f1: float32, n: int64, fresh: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var wants_y: bool = op == 9 || op == 11 || op == 12 || op == 13;
+  while (i < n) {
+    var yv: float32 = z32();
+    if (wants_y) { yv = y[i]; }
+    if (fresh != 0) {
+      dx[i] = unary_slope(op, dy[i], x[i], yv, f0, f1);
+    } else {
+      dx[i] = dx[i] + unary_slope(op, dy[i], x[i], yv, f0, f1);
+    }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_binary(op: int32, out: float32*, a: float32*, b: float32*, n: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    out[i] = binary_value(op, a[i], b[i]);
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_binary_back(op: int32, which: int32, dst: float32*, dy: float32*, a: float32*, b: float32*, n: int64, fresh: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    if (fresh != 0) {
+      dst[i] = binary_slope(op, which, dy[i], a[i], b[i]);
+    } else {
+      dst[i] = dst[i] + binary_slope(op, which, dy[i], a[i], b[i]);
+    }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_bcast(p: Bcast, out: float32*, a: float32*, b: float32*) {
+  var i: int32 = block.x * 256 + thread.x;
+  if (i >= p.count) { return; }
+  var rest: int32 = i;
+  var offa: int32 = 0;
+  var offb: int32 = 0;
+  var d: int32 = p.rank - 1;
+  while (d >= 0) {
+    var c: int32 = rest % p.dims[d];
+    rest = rest / p.dims[d];
+    offa = offa + c * p.sa[d];
+    offb = offb + c * p.sb[d];
+    d = d - 1;
+  }
+  out[i] = binary_value(p.op, a[offa], b[offb]);
+}
+
+kernel(block = 256) k_bcast_back(p: Bcast, dst: float32*, dst_count: int32, dy: float32*, a: float32*, b: float32*) {
+  var e: int32 = block.x * 256 + thread.x;
+  if (e >= dst_count) { return; }
+  var base: int32[6];
+  var reps: int32 = 1;
+  for d in 0..p.rank {
+    if (p.sd[d] != 0) {
+      base[d] = (e / p.sd[d]) % p.dims[d];
+    } else {
+      base[d] = 0;
+      reps = reps * p.dims[d];
+    }
+  }
+  var total: float32 = z32();
+  for r in 0..reps {
+    var rest: int32 = r;
+    var offo: int32 = 0;
+    var offa: int32 = 0;
+    var offb: int32 = 0;
+    var scale: int32 = 1;
+    var d: int32 = p.rank - 1;
+    while (d >= 0) {
+      var c: int32 = base[d];
+      if (p.sd[d] == 0) {
+        c = rest % p.dims[d];
+        rest = rest / p.dims[d];
+      }
+      offo = offo + c * scale;
+      scale = scale * p.dims[d];
+      offa = offa + c * p.sa[d];
+      offb = offb + c * p.sb[d];
+      d = d - 1;
+    }
+    total = total + binary_slope(p.op, p.which, dy[offo], a[offa], b[offb]);
+  }
+  dst[e] = dst[e] + total;
+}
+
+kernel(block = 256) k_partials(x: float32*, y: float32*, mode: int32, n: int64, partial: float32*) {
+  workgroup var lanes: float32[256];
+  var t: int32 = thread.x;
+  var i: int64 = (int64)block.x * 256 + (int64)t;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var acc: float32 = z32();
+  while (i < n) {
+    var v: float32 = x[i];
+    if (mode == 0) {
+      acc = acc + v;
+    } else if (mode == 1) {
+      acc = acc + v * v;
+    } else if (mode == 2) {
+      var d: float32 = v - y[i];
+      acc = acc + d * d;
+    } else {
+      var m: float32 = z32();
+      if (v > z32()) { m = v; }
+      acc = acc + m - v * y[i] + logf(one32() + expf(-fabsf(v)));
+    }
+    i = i + step;
+  }
+  lanes[t] = acc;
+  barrier(workgroup, acq_rel);
+  var width: int32 = 128;
+  while (width > 0) {
+    if (t < width) { lanes[t] = lanes[t] + lanes[t + width]; }
+    barrier(workgroup, acq_rel);
+    width = width / 2;
+  }
+  if (t == 0) { partial[block.x] = lanes[0]; }
+}
+
+kernel(block = 256) k_total(partial: float32*, count: int32, out: float32*, scale: float32, accumulate: int32) {
+  workgroup var lanes: float32[256];
+  var t: int32 = thread.x;
+  var acc: float32 = z32();
+  var i: int32 = t;
+  while (i < count) {
+    acc = acc + partial[i];
+    i = i + 256;
+  }
+  lanes[t] = acc;
+  barrier(workgroup, acq_rel);
+  var width: int32 = 128;
+  while (width > 0) {
+    if (t < width) { lanes[t] = lanes[t] + lanes[t + width]; }
+    barrier(workgroup, acq_rel);
+    width = width / 2;
+  }
+  if (t == 0) {
+    if (accumulate != 0) { out[0] = out[0] + lanes[0] * scale; } else { out[0] = lanes[0] * scale; }
+  }
+}
+
+kernel(block = 256) k_spread(dst: float32*, src: float32*, scale: float32, n: int64) {
+  var s: float32 = src[0] * scale;
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    dst[i] = dst[i] + s;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_pair_back(mode: int32, dx: float32*, x: float32*, y: float32*, dloss: float32*, scale: float32, sign: float32, n: int64) {
+  var s: float32 = dloss[0] * scale;
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    var v: float32 = x[i];
+    var g: float32 = z32();
+    if (mode == 2) {
+      g = (float32)2.0 * (v - y[i]);
+    } else if (sign > z32()) {
+      g = d_sigmoid(v) - y[i];
+    } else {
+      g = v;
+    }
+    dx[i] = dx[i] + sign * s * g;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_reduce_axis(op: int32, out: float32*, arg: int32*, x: float32*, outer: int32, len: int32, inner: int32, scale: float32) {
+  var id: int32 = block.x * 256 + thread.x;
+  if (id >= outer * inner) { return; }
+  var o: int32 = id / inner;
+  var i: int32 = id - o * inner;
+  var base: int64 = (int64)o * (int64)len * (int64)inner + (int64)i;
+  if (op == 34) {
+    var best: float32 = x[base];
+    var at: int32 = 0;
+    for k in 1..len {
+      var v: float32 = x[base + (int64)k * (int64)inner];
+      if (v > best) {
+        best = v;
+        at = k;
+      }
+    }
+    out[id] = best;
+    arg[id] = at;
+    return;
+  }
+  var total: float32 = z32();
+  for k in 0..len { total = total + x[base + (int64)k * (int64)inner]; }
+  out[id] = total * scale;
+}
+
+kernel(block = 256) k_reduce_axis_back(op: int32, dx: float32*, dy: float32*, arg: int32*, outer: int32, len: int32, inner: int32, scale: float32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  if (id >= (int64)outer * (int64)len * (int64)inner) { return; }
+  var span: int64 = (int64)len * (int64)inner;
+  var o: int64 = id / span;
+  var rest: int64 = id - o * span;
+  var k: int32 = (int32)(rest / (int64)inner);
+  var i: int64 = rest - (int64)k * (int64)inner;
+  var src: int64 = o * (int64)inner + i;
+  if (op == 34) {
+    if (arg[src] == k) { dx[id] = dx[id] + dy[src]; }
+    return;
+  }
+  dx[id] = dx[id] + dy[src] * scale;
+}
+
+kernel(block = 256) k_permute(dst: float32*, src: float32*, p: Bcast, accumulate: int32) {
+  var i: int32 = block.x * 256 + thread.x;
+  if (i >= p.count) { return; }
+  var rest: int32 = i;
+  var off: int32 = 0;
+  var d: int32 = p.rank - 1;
+  while (d >= 0) {
+    var c: int32 = rest % p.dims[d];
+    rest = rest / p.dims[d];
+    off = off + c * p.sa[d];
+    d = d - 1;
+  }
+  if (accumulate != 0) { dst[i] = dst[i] + src[off]; } else { dst[i] = src[off]; }
+}
+
+kernel(block = 256) k_blocks(dst: float32*, src: float32*, outer: int64, width: int64, dst_stride: int64, src_stride: int64, accumulate: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var total: int64 = outer * width;
+  while (id < total) {
+    var o: int64 = id / width;
+    var j: int64 = id - o * width;
+    var s: float32 = src[o * src_stride + j];
+    var at: int64 = o * dst_stride + j;
+    if (accumulate != 0) { dst[at] = dst[at] + s; } else { dst[at] = s; }
+    id = id + step;
+  }
+}
+
+comptime for tile in GEMM_TILES.rows {
+  kernel(block = 256) ident("k_gemm_", tile.name)(g: Gemm) {
+    const TM: int32 = tile.tm;
+    const TN: int32 = tile.tn;
+    const BM: int32 = tile.tm * 16;
+    const BN: int32 = tile.tn * 16;
+    const SA: int32 = tile.tm * 16 + 4;
+    const SB: int32 = tile.tn * 16 + 4;
+    const TILE_A: int32 = tile.tm * 512 + 128;
+    const TILE_B: int32 = tile.tn * 512 + 128;
+    workgroup var as: float32[TILE_A];
+    workgroup var bs: float32[TILE_B];
+    var t: int32 = thread.x;
+    var tx: int32 = t % 16;
+    var ty: int32 = t / 16;
+    var m: int32 = g.m;
+    var n: int32 = g.n;
+    var lda: int64 = (int64)g.lda;
+    var ldb: int64 = (int64)g.ldb;
+    var ldc: int64 = (int64)g.ldc;
+    var ta: int32 = (int32)workgroup_uniform((uint32)g.ta);
+    var tb: int32 = (int32)workgroup_uniform((uint32)g.tb);
+    var splits: int32 = (int32)workgroup_uniform((uint32)g.splits);
+    var chunk: int32 = (int32)workgroup_uniform((uint32)g.chunk);
+    var k_all: int32 = (int32)workgroup_uniform((uint32)g.k);
+    var inner: int32 = (int32)workgroup_uniform((uint32)g.inner);
+    var zz: int32 = block.z;
+    var split: int32 = zz % splits;
+    var z: int32 = zz / splits;
+    var zo: int32 = z / inner;
+    var zi: int32 = z - zo * inner;
+    var a: float32* = g.a + (int64)zo * g.sa_outer + (int64)zi * g.sa_inner;
+    var b: float32* = g.b + (int64)zo * g.sb_outer + (int64)zi * g.sb_inner;
+    var c: float32* = g.c + (int64)zo * g.sc_outer + (int64)zi * g.sc_inner + (int64)split * g.sp;
+    var row0: int32 = block.y * BM;
+    var col0: int32 = block.x * BN;
+    var k_begin: int32 = split * chunk;
+    var k_end: int32 = k_begin + chunk;
+    if (k_end > k_all) { k_end = k_all; }
+    var tiles: int32 = (k_end - k_begin + 15) / 16;
+    if (tiles < 0) { tiles = 0; }
+    var lane16: int32 = t % 16;
+    var a_ptr: float32* = a;
+    var b_ptr: float32* = b;
+    var a_seen: int32 = 0;
+    var b_seen: int32 = 0;
+    var a_gap: int64 = 16;
+    var b_gap: int64 = 16;
+    if (ta == 0) {
+      a_ptr = a + (int64)(row0 + ty) * lda + (int64)(k_begin + lane16);
+      a_gap = lda * 16;
+      comptime for i in 0..TM {
+        if (row0 + ty + 16 * i < m) { a_seen = a_seen | (1 << i); }
+      }
+    } else {
+      a_ptr = a + (int64)(k_begin + ty) * lda + (int64)(row0 + lane16);
+      comptime for i in 0..TM {
+        if (row0 + lane16 + 16 * i < m) { a_seen = a_seen | (1 << i); }
+      }
+    }
+    if (tb != 0) {
+      b_ptr = b + (int64)(col0 + ty) * ldb + (int64)(k_begin + lane16);
+      b_gap = ldb * 16;
+      comptime for j in 0..TN {
+        if (col0 + ty + 16 * j < n) { b_seen = b_seen | (1 << j); }
+      }
+    } else {
+      b_ptr = b + (int64)(k_begin + ty) * ldb + (int64)(col0 + lane16);
+      comptime for j in 0..TN {
+        if (col0 + lane16 + 16 * j < n) { b_seen = b_seen | (1 << j); }
+      }
+    }
+    var a_step: int64 = if ta == 0 { (int64)16 } else { lda * 16 };
+    var b_step: int64 = if tb != 0 { (int64)16 } else { ldb * 16 };
+    var a_k: int32 = if ta == 0 { lane16 } else { ty };
+    var b_k: int32 = if tb != 0 { lane16 } else { ty };
+    var acc: float32[64];
+    comptime for i in 0..64 { acc[i] = z32(); }
+    var ra: float32[8];
+    var rb: float32[8];
+    var av: float32[8];
+    var bv: float32[8];
+    comptime for i in 0..8 {
+      ra[i] = z32();
+      rb[i] = z32();
+    }
+    for step in 0..tiles + 1 {
+      var loading: bool = step < tiles;
+      if (loading) {
+        var k0: int32 = k_begin + step * 16;
+        var a_in: bool = k0 + a_k < k_end;
+        var b_in: bool = k0 + b_k < k_end;
+        comptime for i in 0..TM {
+          ra[i] = z32();
+          if (a_in && (a_seen & (1 << i)) != 0) { ra[i] = a_ptr[(int64)i * a_gap]; }
+        }
+        comptime for j in 0..TN {
+          rb[j] = z32();
+          if (b_in && (b_seen & (1 << j)) != 0) { rb[j] = b_ptr[(int64)j * b_gap]; }
+        }
+        a_ptr = a_ptr + a_step;
+        b_ptr = b_ptr + b_step;
+      }
+      if (step > 0) {
+        var cur: int32 = (step - 1) % 2;
+        var abuf: float32 shared align(16)* = (float32 shared align(16)*)&as[cur * 16 * SA + ty * 4];
+        var bbuf: float32 shared align(16)* = (float32 shared align(16)*)&bs[cur * 16 * SB + tx * 4];
+        comptime for kk in 0..16 {
+          comptime for i in 0..TM { av[i] = abuf[kk * SA + (i / 4) * 64 + i % 4]; }
+          comptime for j in 0..TN { bv[j] = bbuf[kk * SB + (j / 4) * 64 + j % 4]; }
+          comptime for i in 0..TM {
+            comptime for j in 0..TN {
+              acc[i * TN + j] = acc[i * TN + j] + av[i] * bv[j];
+            }
+          }
+        }
+      }
+      if (loading) {
+        var nb: int32 = step % 2;
+        var a_spot: int32 = if ta == 0 { nb * 16 * SA + lane16 * SA + ty } else { nb * 16 * SA + ty * SA + lane16 };
+        var b_spot: int32 = if tb != 0 { nb * 16 * SB + lane16 * SB + ty } else { nb * 16 * SB + ty * SB + lane16 };
+        comptime for i in 0..TM { as[a_spot + 16 * i] = ra[i]; }
+        comptime for j in 0..TN { bs[b_spot + 16 * j] = rb[j]; }
+      }
+      barrier(workgroup, acq_rel);
+    }
+    var alpha: float32 = g.alpha;
+    var accumulate: int32 = g.accumulate;
+    var bias: float32* = g.bias;
+    var has_bias: bool = bias != (float32*)0;
+    comptime for i in 0..TM {
+      var r: int32 = row0 + (i / 4) * 64 + ty * 4 + (i % 4);
+      if (r < m) {
+        var crow: float32* = c + (int64)r * ldc;
+        comptime for j in 0..TN {
+          var q: int32 = col0 + (j / 4) * 64 + tx * 4 + (j % 4);
+          if (q < n) {
+            var v: float32 = acc[i * TN + j] * alpha;
+            if (has_bias) { v = v + bias[q]; }
+            if (accumulate != 0) { v = v + crow[q]; }
+            crow[q] = v;
+          }
+        }
+      }
+    }
+  }
+}
+
+kernel(block = 256) k_gemm_gather(dst: float32*, ws: float32*, m: int32, n: int32, ldc: int64, splits: int32, sp: int64, accumulate: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var total: int64 = (int64)m * (int64)n;
+  while (id < total) {
+    var r: int64 = id / (int64)n;
+    var q: int64 = id - r * (int64)n;
+    var acc: float32 = z32();
+    for s in 0..splits { acc = acc + ws[(int64)s * sp + id]; }
+    var at: int64 = r * ldc + q;
+    if (accumulate != 0) { acc = acc + dst[at]; }
+    dst[at] = acc;
+    id = id + step;
+  }
+}
+
+struct TcForm {
+  name: string;
+  ta: int32;
+  tb: int32;
+  acc: int32;
+  bm: int32;
+  threads: int32;
+}
+
+const TC_FORMS: TcForm[14] = [
+  { name: "nt", ta: 0, tb: 1, acc: 0, bm: 128, threads: 256 },
+  { name: "nn", ta: 0, tb: 0, acc: 0, bm: 128, threads: 256 },
+  { name: "tn", ta: 1, tb: 0, acc: 0, bm: 128, threads: 256 },
+  { name: "nt_acc", ta: 0, tb: 1, acc: 1, bm: 128, threads: 256 },
+  { name: "nn_acc", ta: 0, tb: 0, acc: 1, bm: 128, threads: 256 },
+  { name: "tn_acc", ta: 1, tb: 0, acc: 1, bm: 128, threads: 256 },
+  { name: "nt_bias", ta: 0, tb: 1, acc: 2, bm: 128, threads: 256 },
+  { name: "nt_64", ta: 0, tb: 1, acc: 0, bm: 64, threads: 128 },
+  { name: "nn_64", ta: 0, tb: 0, acc: 0, bm: 64, threads: 128 },
+  { name: "tn_64", ta: 1, tb: 0, acc: 0, bm: 64, threads: 128 },
+  { name: "nt_acc_64", ta: 0, tb: 1, acc: 1, bm: 64, threads: 128 },
+  { name: "nn_acc_64", ta: 0, tb: 0, acc: 1, bm: 64, threads: 128 },
+  { name: "tn_acc_64", ta: 1, tb: 0, acc: 1, bm: 64, threads: 128 },
+  { name: "nt_bias_64", ta: 0, tb: 1, acc: 2, bm: 64, threads: 128 }
+];
+
+comptime for form in TC_FORMS.rows {
+  kernel(block = form.threads) ident("k_tc_", form.name)(pa: float32 global align(16)*, pb: float32 global align(16)*, pc: float32 global*, k: int32, lda4: int32, ldb4: int32, ldc: int32, sa4: int64, sb4: int64, sc: int64, splits: int32, chunk: int32, sp: int64, alpha: float32, bias: float32 global*, ldz: int32) {
+    const TA: int32 = form.ta;
+    const TB: int32 = form.tb;
+    const BM: int32 = form.bm;
+    const WM: int32 = form.bm / 2;
+    const WN: int32 = form.bm / 32;
+    const BUF: int32 = form.bm * 40;
+    const SH: int32 = form.bm * 80;
+    const LR: int32 = form.bm + 8;
+    const RUN: int32 = form.bm / 4;
+    const PASS: int32 = form.threads / 8;
+    workgroup var as: uint16[SH];
+    workgroup var bs: uint16[SH];
+    var t: int32 = thread.x;
+    var warp: int32 = thread.x >> 5;
+    var wm: int32 = warp / WN;
+    var wn: int32 = warp % WN;
+    var row0: int32 = block.y * BM;
+    var col0: int32 = block.x * BM;
+    var split: int32 = block.z % splits;
+    var bz: int64 = (int64)(block.z / splits);
+    var k0: int32 = split * chunk;
+    var k1: int32 = k0 + chunk;
+    if (k1 > k) { k1 = k; }
+    var tiles: int32 = (k1 - k0) / 32;
+    var lda: int64 = (int64)lda4;
+    var ldb: int64 = (int64)ldb4;
+    var a_major: int32 = if TA == 0 { t / 8 } else { t / RUN };
+    var a_minor: int32 = if TA == 0 { t % 8 } else { t % RUN };
+    var b_major: int32 = if TB != 0 { t / 8 } else { t / RUN };
+    var b_minor: int32 = if TB != 0 { t % 8 } else { t % RUN };
+    var a_src: int64 = bz * sa4;
+    var b_src: int64 = bz * sb4;
+    var a_jump: int64 = 0;
+    var b_jump: int64 = 0;
+    var a_next: int64 = 0;
+    var b_next: int64 = 0;
+    if (TA == 0) {
+      a_src = a_src + (int64)(row0 + a_major) * lda + (int64)(k0 / 4 + a_minor);
+      a_jump = lda * (int64)PASS;
+      a_next = 8;
+    } else {
+      a_src = a_src + (int64)(k0 + a_major) * lda + (int64)(row0 / 4 + a_minor);
+      a_jump = lda * 8;
+      a_next = lda * 32;
+    }
+    if (TB != 0) {
+      b_src = b_src + (int64)(col0 + b_major) * ldb + (int64)(k0 / 4 + b_minor);
+      b_jump = ldb * (int64)PASS;
+      b_next = 8;
+    } else {
+      b_src = b_src + (int64)(k0 + b_major) * ldb + (int64)(col0 / 4 + b_minor);
+      b_jump = ldb * 8;
+      b_next = ldb * 32;
+    }
+    var a_spot: int32 = if TA == 0 { a_major * 40 + a_minor * 4 } else { a_minor * 160 + a_major };
+    var a_gap: int32 = if TA == 0 { PASS * 40 } else { 8 };
+    var a_lane: int32 = if TA == 0 { 1 } else { 40 };
+    var b_spot: int32 = if TB != 0 { b_major * 40 + b_minor * 4 } else { b_major * LR + b_minor * 4 };
+    var b_gap: int32 = if TB != 0 { PASS * 40 } else { 8 * LR };
+    var ra: float32[16];
+    var rb: float32[16];
+    var dst: float32 global* = pc + bz * sc + (int64)split * sp + (int64)(row0 + wm * WM) * (int64)ldc + (int64)(col0 + wn * 32);
+    var a_off: int32 = wm * WM * 40;
+    var b_off: int32 = if TB != 0 { wn * 1280 } else { wn * 32 };
+    comptime for j in 0..4 {
+      var ap: float32 global align(16)* = (float32 global align(16)*)&pa[(a_src + (int64)j * a_jump) * 4];
+      var bp: float32 global align(16)* = (float32 global align(16)*)&pb[(b_src + (int64)j * b_jump) * 4];
+      comptime for q in 0..4 {
+        ra[4 * j + q] = ap[q];
+        rb[4 * j + q] = bp[q];
+      }
+    }
+    comptime for j in 0..4 {
+      comptime for q in 0..4 {
+        as[a_spot + j * a_gap + q * a_lane] = (uint16)f2bf(ra[4 * j + q] * alpha);
+        bs[b_spot + j * b_gap + q] = (uint16)f2bf(rb[4 * j + q]);
+      }
+    }
+    barrier(workgroup, acq_rel);
+    a_src = a_src + a_next;
+    b_src = b_src + b_next;
+    if (form.acc == 0) {
+      if (TB != 0) {
+        tensor_mma(&as[a_off], &bs[b_off], 0.0, dst, m: WM, n: 32, k: 32, a_type: bf16, b_type: bf16,
+                   accumulator_type: f32, result_type: f32, a_layout: row, b_layout: col, d_layout: row, lda: 40, ldb: 40, ldd: ldc);
+      } else {
+        tensor_mma(&as[a_off], &bs[b_off], 0.0, dst, m: WM, n: 32, k: 32, a_type: bf16, b_type: bf16,
+                   accumulator_type: f32, result_type: f32, a_layout: row, b_layout: row, d_layout: row, lda: 40, ldb: LR, ldd: ldc);
+      }
+    } else if (form.acc == 2) {
+      tensor_mma(&as[a_off], &bs[b_off], bias + (int64)(col0 + wn * 32), dst, m: WM, n: 32, k: 32, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, a_layout: row, b_layout: col, c_layout: row, d_layout: row, lda: 40, ldb: 40, ldc: ldz, ldd: ldc);
+    } else {
+      if (TB != 0) {
+        tensor_mma(&as[a_off], &bs[b_off], dst, dst, m: WM, n: 32, k: 32, a_type: bf16, b_type: bf16,
+                   accumulator_type: f32, result_type: f32, a_layout: row, b_layout: col, c_layout: row, d_layout: row, lda: 40, ldb: 40, ldc: ldc, ldd: ldc);
+      } else {
+        tensor_mma(&as[a_off], &bs[b_off], dst, dst, m: WM, n: 32, k: 32, a_type: bf16, b_type: bf16,
+                   accumulator_type: f32, result_type: f32, a_layout: row, b_layout: row, c_layout: row, d_layout: row, lda: 40, ldb: LR, ldc: ldc, ldd: ldc);
+      }
+    }
+    for step in 1..tiles {
+      comptime for j in 0..4 {
+        var ap: float32 global align(16)* = (float32 global align(16)*)&pa[(a_src + (int64)j * a_jump) * 4];
+        var bp: float32 global align(16)* = (float32 global align(16)*)&pb[(b_src + (int64)j * b_jump) * 4];
+        comptime for q in 0..4 {
+          ra[4 * j + q] = ap[q];
+          rb[4 * j + q] = bp[q];
+        }
+      }
+      a_src = a_src + a_next;
+      b_src = b_src + b_next;
+      var nb: int32 = (step % 2) * BUF;
+      comptime for j in 0..4 {
+        comptime for q in 0..4 {
+          as[nb + a_spot + j * a_gap + q * a_lane] = (uint16)f2bf(ra[4 * j + q] * alpha);
+          bs[nb + b_spot + j * b_gap + q] = (uint16)f2bf(rb[4 * j + q]);
+        }
+      }
+      barrier(workgroup, acq_rel);
+      if (TB != 0) {
+        tensor_mma(&as[nb + a_off], &bs[nb + b_off], dst, dst, m: WM, n: 32, k: 32, a_type: bf16, b_type: bf16,
+                   accumulator_type: f32, result_type: f32, a_layout: row, b_layout: col, c_layout: row, d_layout: row, lda: 40, ldb: 40, ldc: ldc, ldd: ldc);
+      } else {
+        tensor_mma(&as[nb + a_off], &bs[nb + b_off], dst, dst, m: WM, n: 32, k: 32, a_type: bf16, b_type: bf16,
+                   accumulator_type: f32, result_type: f32, a_layout: row, b_layout: row, c_layout: row, d_layout: row, lda: 40, ldb: LR, ldc: ldc, ldd: ldc);
+      }
+    }
+  }
+}
+
+kernel(block = 256) k_muon_mix(g: float32*, m: float32*, u: float32*, n: int64, beta: float32, factor: float32*) {
+  var f: float32 = if factor != (float32*)0 { factor[0] } else { one32() };
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    var gi: float32 = g[i] * f;
+    var mi: float32 = beta * m[i] + (one32() - beta) * gi;
+    m[i] = mi;
+    u[i] = gi + beta * (mi - gi);
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_muon_apply(w: float32*, u: float32*, n: int64, lr: float32, shrink: float32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    w[i] = w[i] * shrink - lr * u[i];
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_scaled(dst: float32*, src: float32*, alpha: float32, n: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    dst[i] = alpha * src[i];
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_poly(dst: float32*, src: float32*, alpha: float32, diag: float32, side: int64, total: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var square: int64 = side * side;
+  while (i < total) {
+    var at: int64 = i % square;
+    var r: int64 = at / side;
+    var v: float32 = alpha * src[i];
+    if (r * side + r == at) { v = v + diag; }
+    dst[i] = v;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_diag(dst: float32*, value: float32, side: int64, count: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  if (i >= side * count) { return; }
+  var z: int64 = i / side;
+  var d: int64 = i - z * side;
+  var at: int64 = z * side * side + d * side + d;
+  dst[at] = dst[at] + value;
+}
+
+kernel(block = 256) k_frob_partials(x: float32*, size: int64, parts: int32, partial: float32*) {
+  workgroup var lanes: float32[256];
+  var t: int32 = thread.x;
+  var z: int64 = (int64)block.y;
+  var chunk: int64 = (size + (int64)parts - 1) / (int64)parts;
+  var lo: int64 = (int64)block.x * chunk;
+  var hi: int64 = lo + chunk;
+  if (hi > size) { hi = size; }
+  var base: float32* = x + z * size;
+  var acc: float32 = z32();
+  var i: int64 = lo + (int64)t;
+  while (i < hi) {
+    acc = acc + base[i] * base[i];
+    i = i + 256;
+  }
+  lanes[t] = acc;
+  barrier(workgroup, acq_rel);
+  var width: int32 = 128;
+  while (width > 0) {
+    if (t < width) { lanes[t] = lanes[t] + lanes[t + width]; }
+    barrier(workgroup, acq_rel);
+    width = width / 2;
+  }
+  if (t == 0) { partial[z * (int64)parts + (int64)block.x] = lanes[0]; }
+}
+
+kernel(block = 256) k_frob_scale(x: float32*, size: int64, parts: int32, partial: float32*) {
+  var z: int64 = (int64)block.y;
+  var total: float32 = z32();
+  for p in 0..parts { total = total + partial[z * (int64)parts + (int64)p]; }
+  var inv: float32 = one32() / (sqrtf(total) + (float32)1.0e-7);
+  var chunk: int64 = (size + (int64)parts - 1) / (int64)parts;
+  var lo: int64 = (int64)block.x * chunk;
+  var hi: int64 = lo + chunk;
+  if (hi > size) { hi = size; }
+  var base: float32* = x + z * size;
+  var i: int64 = lo + (int64)thread.x;
+  while (i < hi) {
+    base[i] = base[i] * inv;
+    i = i + 256;
+  }
+}
+
+kernel(block = 256) k_normalize(x: float32*, size: int64) {
+  workgroup var lanes: float32[256];
+  var t: int32 = thread.x;
+  var base: float32* = x + (int64)block.x * size;
+  var acc: float32 = z32();
+  var i: int64 = (int64)t;
+  while (i < size) {
+    acc = acc + base[i] * base[i];
+    i = i + 256;
+  }
+  lanes[t] = acc;
+  barrier(workgroup, acq_rel);
+  var width: int32 = 128;
+  while (width > 0) {
+    if (t < width) { lanes[t] = lanes[t] + lanes[t + width]; }
+    barrier(workgroup, acq_rel);
+    width = width / 2;
+  }
+  var inv: float32 = one32() / (sqrtf(lanes[0]) + (float32)1.0e-7);
+  i = (int64)t;
+  while (i < size) {
+    base[i] = base[i] * inv;
+    i = i + 256;
+  }
+}
+
+kernel(block = 256) k_rope(y: float32*, x: float32*, rstd: float32*, table: float32*, rows: int64, time: int64, width: int32, heads: int32) {
+  var w: int64 = (int64)block.x * 8 + (int64)(thread.x / 32);
+  var lane: int32 = (int32)subgroup_local_id();
+  var segs: int64 = (int64)(3 * heads);
+  if (w >= rows * segs) { return; }
+  var r: int64 = w / segs;
+  var seg: int32 = (int32)(w - r * segs);
+  var hd: int32 = width / heads;
+  var half: int32 = hd / 2;
+  var at: int64 = r * (int64)(3 * width) + (int64)(seg * hd);
+  if (seg >= 2 * heads) {
+    var c: int32 = lane;
+    while (c < hd) {
+      y[at + (int64)c] = x[at + (int64)c];
+      c = c + 32;
+    }
+    return;
+  }
+  var sq: float32 = z32();
+  var i: int32 = lane;
+  while (i < half) {
+    var a: float32 = x[at + (int64)(2 * i)];
+    var b: float32 = x[at + (int64)(2 * i + 1)];
+    sq = sq + a * a + b * b;
+    i = i + 32;
+  }
+  var rs: float32 = rsqrtf(subgroup_reduce_add(sq) / (float32)hd + (float32)1.1920929e-7);
+  if (lane == 0) { rstd[r * (int64)(2 * heads) + (int64)seg] = rs; }
+  var tab: float32* = table + (r % time) * (int64)hd;
+  i = lane;
+  while (i < half) {
+    var co: float32 = tab[2 * i];
+    var si: float32 = tab[2 * i + 1];
+    var a: float32 = x[at + (int64)(2 * i)] * rs;
+    var b: float32 = x[at + (int64)(2 * i + 1)] * rs;
+    y[at + (int64)(2 * i)] = a * co - b * si;
+    y[at + (int64)(2 * i + 1)] = a * si + b * co;
+    i = i + 32;
+  }
+}
+
+kernel(block = 256) k_rope_back(dx: float32*, dy: float32*, x: float32*, rstd: float32*, table: float32*, rows: int64, time: int64, width: int32, heads: int32, fresh: int32) {
+  var w: int64 = (int64)block.x * 8 + (int64)(thread.x / 32);
+  var lane: int32 = (int32)subgroup_local_id();
+  var segs: int64 = (int64)(3 * heads);
+  if (w >= rows * segs) { return; }
+  var r: int64 = w / segs;
+  var seg: int32 = (int32)(w - r * segs);
+  var hd: int32 = width / heads;
+  var half: int32 = hd / 2;
+  var at: int64 = r * (int64)(3 * width) + (int64)(seg * hd);
+  if (seg >= 2 * heads) {
+    var c: int32 = lane;
+    while (c < hd) {
+      dx[at + (int64)c] = (if fresh != 0 { z32() } else { dx[at + (int64)c] }) + dy[at + (int64)c];
+      c = c + 32;
+    }
+    return;
+  }
+  var rs: float32 = rstd[r * (int64)(2 * heads) + (int64)seg];
+  var tab: float32* = table + (r % time) * (int64)hd;
+  var dot: float32 = z32();
+  var i: int32 = lane;
+  while (i < half) {
+    var co: float32 = tab[2 * i];
+    var si: float32 = tab[2 * i + 1];
+    var d0: float32 = dy[at + (int64)(2 * i)];
+    var d1: float32 = dy[at + (int64)(2 * i + 1)];
+    var g0: float32 = d0 * co + d1 * si;
+    var g1: float32 = d1 * co - d0 * si;
+    dot = dot + g0 * x[at + (int64)(2 * i)] * rs + g1 * x[at + (int64)(2 * i + 1)] * rs;
+    i = i + 32;
+  }
+  var mean: float32 = subgroup_reduce_add(dot) / (float32)hd;
+  i = lane;
+  while (i < half) {
+    var co: float32 = tab[2 * i];
+    var si: float32 = tab[2 * i + 1];
+    var d0: float32 = dy[at + (int64)(2 * i)];
+    var d1: float32 = dy[at + (int64)(2 * i + 1)];
+    var g0: float32 = d0 * co + d1 * si;
+    var g1: float32 = d1 * co - d0 * si;
+    var o0: int64 = at + (int64)(2 * i);
+    if (fresh != 0) {
+      dx[o0] = rs * (g0 - x[o0] * rs * mean);
+      dx[o0 + 1] = rs * (g1 - x[o0 + 1] * rs * mean);
+    } else {
+      dx[o0] = dx[o0] + rs * (g0 - x[o0] * rs * mean);
+      dx[o0 + 1] = dx[o0 + 1] + rs * (g1 - x[o0 + 1] * rs * mean);
+    }
+    i = i + 32;
+  }
+}
+
+kernel(block = 256) k_bias_rows(dst: float32*, bias: float32*, rows: int32, cols: int32, ldc: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var total: int64 = (int64)rows * (int64)cols;
+  while (id < total) {
+    var r: int64 = id / (int64)cols;
+    var q: int64 = id - r * (int64)cols;
+    dst[r * ldc + q] = bias[q];
+    id = id + step;
+  }
+}
+
+comptime for h in HEAD_SHAPES.rows {
+  kernel(block = 128) ident("k_flash_fwd_", h.name)(f: Flash) {
+    const HD: int32 = h.dim;
+    const P: int32 = h.parts;
+    const ROWS: int32 = 128 / h.parts;
+    const KT: int32 = 4096 / h.dim;
+    workgroup var ks: float32[4096];
+    workgroup var vs: float32[4096];
+    var t: int32 = thread.x;
+    var lane: int32 = (int32)subgroup_local_id();
+    var part: int32 = t % P;
+    var time: int32 = (int32)workgroup_uniform((uint32)f.time);
+    var causal: int32 = (int32)workgroup_uniform((uint32)f.causal);
+    var dropping: int32 = (int32)workgroup_uniform((uint32)f.dropping);
+    var width: int32 = f.width;
+    var heads: int32 = f.heads;
+    var bh: int32 = block.y;
+    var b: int32 = bh / heads;
+    var hh: int32 = bh - b * heads;
+    var q0: int32 = block.x * ROWS;
+    var row: int32 = q0 + t / P;
+    var live: bool = row < time;
+    var stride: int64 = (int64)(3 * width);
+    var head: float32* = f.qkv + (int64)b * (int64)time * stride + (int64)(hh * HD);
+    var scale: float32 = f.scale;
+    var key: uint64 = f.key;
+    var threshold: uint64 = f.threshold;
+    var keep: float32 = f.keep;
+    var q: float32[32];
+    var o: float32[32];
+    comptime for e in 0..32 {
+      q[e] = z32();
+      o[e] = z32();
+    }
+    if (live) {
+      var qrow: float32* = head + (int64)row * stride + (int64)(part * 32);
+      comptime for e in 0..32 { q[e] = qrow[e] * scale; }
+    }
+    var m: float32 = -3.0e38;
+    var l: float32 = z32();
+    var kend: int32 = time;
+    if (causal != 0) {
+      kend = q0 + ROWS;
+      if (kend > time) { kend = time; }
+    }
+    var tiles: int32 = (kend + KT - 1) / KT;
+    var drop_base: int64 = ((int64)bh * (int64)time + (int64)row) * (int64)time;
+    for tile in 0..tiles {
+      var j0: int32 = tile * KT;
+      comptime for i in 0..32 {
+        var idx: int32 = t + 128 * i;
+        var kr: int32 = idx / HD;
+        var d: int32 = idx - kr * HD;
+        var kv: float32 = z32();
+        var vv: float32 = z32();
+        if (j0 + kr < time) {
+          var src: float32* = head + (int64)(j0 + kr) * stride + (int64)d;
+          kv = src[width];
+          vv = src[2 * width];
+        }
+        ks[idx] = kv;
+        vs[idx] = vv;
+      }
+      barrier(workgroup, acq_rel);
+      for g8 in 0..KT / 8 {
+        var kgroup: float32 shared align(16)* = (float32 shared align(16)*)&ks[g8 * 8 * HD + part * 32];
+        var vgroup: float32 shared align(16)* = (float32 shared align(16)*)&vs[g8 * 8 * HD + part * 32];
+        var s: float32[8];
+        var gmax: float32 = -3.0e38;
+        comptime for u in 0..8 {
+          var jj: int32 = g8 * 8 + u;
+          var acc: float32 = z32();
+          comptime for e in 0..32 { acc = acc + q[e] * kgroup[u * HD + e]; }
+          if (P > 1) { acc = acc + subgroup_shuffle(acc, (uint32)(lane ^ 1)); }
+          if (P > 2) { acc = acc + subgroup_shuffle(acc, (uint32)(lane ^ 2)); }
+          var j: int32 = j0 + jj;
+          var seen: bool = j < time && (causal == 0 || j <= row);
+          s[u] = if seen { acc } else { (float32)-3.0e38 };
+          if (s[u] > gmax) { gmax = s[u]; }
+        }
+        if (gmax > m) {
+          var corr: float32 = expf(m - gmax);
+          l = l * corr;
+          comptime for e in 0..32 { o[e] = o[e] * corr; }
+          m = gmax;
+        }
+        comptime for u in 0..8 {
+          var jj: int32 = g8 * 8 + u;
+          var pv: float32 = z32();
+          if (s[u] > (float32)-1.0e38) { pv = expf(s[u] - m); }
+          l = l + pv;
+          if (dropping != 0) {
+            if (drop_bits(key, drop_base + (int64)(j0 + jj)) >= threshold) { pv = pv * keep; } else { pv = z32(); }
+          }
+          comptime for e in 0..32 { o[e] = o[e] + pv * vgroup[u * HD + e]; }
+        }
+      }
+      barrier(workgroup, acq_rel);
+    }
+    if (live) {
+      var inv: float32 = one32() / l;
+      var orow: float32* = f.out + ((int64)b * (int64)time + (int64)row) * (int64)width + (int64)(hh * HD + part * 32);
+      comptime for e in 0..32 { orow[e] = o[e] * inv; }
+      if (part == 0) { f.lse[(int64)bh * (int64)time + (int64)row] = m + logf(l); }
+    }
+  }
+
+  kernel(block = 128) ident("k_flash_dq_", h.name)(f: Flash) {
+    const HD: int32 = h.dim;
+    const P: int32 = h.parts;
+    const ROWS: int32 = 128 / h.parts;
+    const KT: int32 = 4096 / h.dim;
+    workgroup var ks: float32[4096];
+    workgroup var vs: float32[4096];
+    var t: int32 = thread.x;
+    var lane: int32 = (int32)subgroup_local_id();
+    var part: int32 = t % P;
+    var time: int32 = (int32)workgroup_uniform((uint32)f.time);
+    var causal: int32 = (int32)workgroup_uniform((uint32)f.causal);
+    var dropping: int32 = (int32)workgroup_uniform((uint32)f.dropping);
+    var width: int32 = f.width;
+    var heads: int32 = f.heads;
+    var bh: int32 = block.y;
+    var b: int32 = bh / heads;
+    var hh: int32 = bh - b * heads;
+    var q0: int32 = block.x * ROWS;
+    var row: int32 = q0 + t / P;
+    var live: bool = row < time;
+    var stride: int64 = (int64)(3 * width);
+    var head: float32* = f.qkv + (int64)b * (int64)time * stride + (int64)(hh * HD);
+    var scale: float32 = f.scale;
+    var key: uint64 = f.key;
+    var threshold: uint64 = f.threshold;
+    var keep: float32 = f.keep;
+    var q: float32[32];
+    var dob: float32[32];
+    var dq: float32[32];
+    comptime for e in 0..32 {
+      q[e] = z32();
+      dob[e] = z32();
+      dq[e] = z32();
+    }
+    var lse: float32 = z32();
+    var dsum: float32 = z32();
+    if (live) {
+      var qrow: float32* = head + (int64)row * stride + (int64)(part * 32);
+      var at: int64 = ((int64)b * (int64)time + (int64)row) * (int64)width + (int64)(hh * HD + part * 32);
+      var orow: float32* = f.out + at;
+      var drow: float32* = f.dout + at;
+      comptime for e in 0..32 {
+        q[e] = qrow[e];
+        dob[e] = drow[e];
+        dsum = dsum + drow[e] * orow[e];
+      }
+      lse = f.lse[(int64)bh * (int64)time + (int64)row];
+    }
+    if (P > 1) { dsum = dsum + subgroup_shuffle(dsum, (uint32)(lane ^ 1)); }
+    if (P > 2) { dsum = dsum + subgroup_shuffle(dsum, (uint32)(lane ^ 2)); }
+    if (live && part == 0) { f.delta[(int64)bh * (int64)time + (int64)row] = dsum; }
+    var kend: int32 = time;
+    if (causal != 0) {
+      kend = q0 + ROWS;
+      if (kend > time) { kend = time; }
+    }
+    var tiles: int32 = (kend + KT - 1) / KT;
+    var drop_base: int64 = ((int64)bh * (int64)time + (int64)row) * (int64)time;
+    for tile in 0..tiles {
+      var j0: int32 = tile * KT;
+      comptime for i in 0..32 {
+        var idx: int32 = t + 128 * i;
+        var kr: int32 = idx / HD;
+        var d: int32 = idx - kr * HD;
+        var kv: float32 = z32();
+        var vv: float32 = z32();
+        if (j0 + kr < time) {
+          var src: float32* = head + (int64)(j0 + kr) * stride + (int64)d;
+          kv = src[width];
+          vv = src[2 * width];
+        }
+        ks[idx] = kv;
+        vs[idx] = vv;
+      }
+      barrier(workgroup, acq_rel);
+      for jj in 0..KT {
+        var krow: float32 shared align(16)* = (float32 shared align(16)*)&ks[jj * HD + part * 32];
+        var vrow: float32 shared align(16)* = (float32 shared align(16)*)&vs[jj * HD + part * 32];
+        var sacc: float32 = z32();
+        var dacc: float32 = z32();
+        comptime for e in 0..32 {
+          sacc = sacc + q[e] * krow[e];
+          dacc = dacc + dob[e] * vrow[e];
+        }
+        if (P > 1) {
+          sacc = sacc + subgroup_shuffle(sacc, (uint32)(lane ^ 1));
+          dacc = dacc + subgroup_shuffle(dacc, (uint32)(lane ^ 1));
+        }
+        if (P > 2) {
+          sacc = sacc + subgroup_shuffle(sacc, (uint32)(lane ^ 2));
+          dacc = dacc + subgroup_shuffle(dacc, (uint32)(lane ^ 2));
+        }
+        var j: int32 = j0 + jj;
+        var seen: bool = j < time && (causal == 0 || j <= row);
+        if (seen) {
+          var pv: float32 = expf(sacc * scale - lse);
+          var mk: float32 = one32();
+          if (dropping != 0) {
+            mk = if drop_bits(key, drop_base + (int64)j) >= threshold { keep } else { z32() };
+          }
+          var ds: float32 = pv * (dacc * mk - dsum);
+          comptime for e in 0..32 { dq[e] = dq[e] + ds * krow[e]; }
+        }
+      }
+      barrier(workgroup, acq_rel);
+    }
+    if (live) {
+      var dqrow: float32* = f.dqkv + (int64)b * (int64)time * stride + (int64)row * stride + (int64)(hh * HD + part * 32);
+      comptime for e in 0..32 { dqrow[e] = dqrow[e] + dq[e] * scale; }
+    }
+  }
+
+  kernel(block = 128) ident("k_flash_dkv_", h.name)(f: Flash) {
+    const HD: int32 = h.dim;
+    const P: int32 = h.parts;
+    const KEYS: int32 = 128 / h.parts;
+    const QT: int32 = 4096 / h.dim;
+    workgroup var qs: float32[4096];
+    workgroup var dos: float32[4096];
+    workgroup var ls: float32[128];
+    workgroup var dl: float32[128];
+    var t: int32 = thread.x;
+    var lane: int32 = (int32)subgroup_local_id();
+    var part: int32 = t % P;
+    var time: int32 = (int32)workgroup_uniform((uint32)f.time);
+    var causal: int32 = (int32)workgroup_uniform((uint32)f.causal);
+    var dropping: int32 = (int32)workgroup_uniform((uint32)f.dropping);
+    var width: int32 = f.width;
+    var heads: int32 = f.heads;
+    var bh: int32 = block.y;
+    var b: int32 = bh / heads;
+    var hh: int32 = bh - b * heads;
+    var k0: int32 = block.x * KEYS;
+    var j: int32 = k0 + t / P;
+    var live: bool = j < time;
+    var stride: int64 = (int64)(3 * width);
+    var head: float32* = f.qkv + (int64)b * (int64)time * stride + (int64)(hh * HD);
+    var dout_head: float32* = f.dout + (int64)b * (int64)time * (int64)width + (int64)(hh * HD);
+    var scale: float32 = f.scale;
+    var key: uint64 = f.key;
+    var threshold: uint64 = f.threshold;
+    var keep: float32 = f.keep;
+    var kk: float32[32];
+    var vv: float32[32];
+    var dk: float32[32];
+    var dv: float32[32];
+    comptime for e in 0..32 {
+      kk[e] = z32();
+      vv[e] = z32();
+      dk[e] = z32();
+      dv[e] = z32();
+    }
+    if (live) {
+      var krow: float32* = head + (int64)j * stride + (int64)(width + part * 32);
+      comptime for e in 0..32 {
+        kk[e] = krow[e];
+        vv[e] = krow[width + e];
+      }
+    }
+    var qstart: int32 = 0;
+    if (causal != 0) { qstart = k0 / QT * QT; }
+    var tiles: int32 = (time - qstart + QT - 1) / QT;
+    var row_base: int64 = (int64)bh * (int64)time;
+    for tile in 0..tiles {
+      var i0: int32 = qstart + tile * QT;
+      comptime for i in 0..32 {
+        var idx: int32 = t + 128 * i;
+        var r: int32 = idx / HD;
+        var d: int32 = idx - r * HD;
+        var qv: float32 = z32();
+        var dv0: float32 = z32();
+        if (i0 + r < time) {
+          qv = head[(int64)(i0 + r) * stride + (int64)d];
+          dv0 = dout_head[(int64)(i0 + r) * (int64)width + (int64)d];
+        }
+        qs[idx] = qv;
+        dos[idx] = dv0;
+      }
+      if (t < QT) {
+        var lv: float32 = z32();
+        var dd: float32 = z32();
+        if (i0 + t < time) {
+          lv = f.lse[row_base + (int64)(i0 + t)];
+          dd = f.delta[row_base + (int64)(i0 + t)];
+        }
+        ls[t] = lv;
+        dl[t] = dd;
+      }
+      barrier(workgroup, acq_rel);
+      for ii in 0..QT {
+        var qrow: float32 shared align(16)* = (float32 shared align(16)*)&qs[ii * HD + part * 32];
+        var dorow: float32 shared align(16)* = (float32 shared align(16)*)&dos[ii * HD + part * 32];
+        var sacc: float32 = z32();
+        var dacc: float32 = z32();
+        comptime for e in 0..32 {
+          sacc = sacc + qrow[e] * kk[e];
+          dacc = dacc + dorow[e] * vv[e];
+        }
+        if (P > 1) {
+          sacc = sacc + subgroup_shuffle(sacc, (uint32)(lane ^ 1));
+          dacc = dacc + subgroup_shuffle(dacc, (uint32)(lane ^ 1));
+        }
+        if (P > 2) {
+          sacc = sacc + subgroup_shuffle(sacc, (uint32)(lane ^ 2));
+          dacc = dacc + subgroup_shuffle(dacc, (uint32)(lane ^ 2));
+        }
+        var i: int32 = i0 + ii;
+        var seen: bool = live && i < time && (causal == 0 || j <= i);
+        if (seen) {
+          var pv: float32 = expf(sacc * scale - ls[ii]);
+          var mk: float32 = one32();
+          if (dropping != 0) {
+            mk = if drop_bits(key, (row_base + (int64)i) * (int64)time + (int64)j) >= threshold { keep } else { z32() };
+          }
+          var pd: float32 = pv * mk;
+          var ds: float32 = pv * (dacc * mk - dl[ii]);
+          comptime for e in 0..32 {
+            dv[e] = dv[e] + pd * dorow[e];
+            dk[e] = dk[e] + ds * qrow[e];
+          }
+        }
+      }
+      barrier(workgroup, acq_rel);
+    }
+    if (live) {
+      var drow: float32* = f.dqkv + (int64)b * (int64)time * stride + (int64)j * stride + (int64)(width + hh * HD + part * 32);
+      comptime for e in 0..32 {
+        drow[e] = drow[e] + dk[e] * scale;
+        drow[width + e] = drow[width + e] + dv[e];
+      }
+    }
+  }
+}
+
+const TC_HEADS: HeadShape[2] = [
+  { name: "32", dim: 32, parts: 1 },
+  { name: "64", dim: 64, parts: 2 }
+];
+
+comptime for h in TC_HEADS.rows {
+  kernel(block = 128) ident("k_tflash_fwd_", h.name)(qkv: float32*, out: float32*, lse: float32*, time: int32, width: int32, heads: int32, causal: int32, scale: float32) {
+    const HD: int32 = h.dim;
+    const LD: int32 = h.dim + 8;
+    const PER: int32 = h.dim / 4;
+    const KV: int32 = h.dim * 32 + 256;
+    workgroup var ks: uint16[KV];
+    workgroup var vs: uint16[KV];
+    var t: int32 = thread.x;
+    var warp: int32 = thread.x >> 5;
+    var bh: int32 = block.y;
+    var b: int32 = bh / heads;
+    var hh: int32 = bh - b * heads;
+    var q0: int32 = block.x * 64;
+    var wq: int32 = q0 + warp * 16;
+    var stride: int64 = (int64)(3 * width);
+    var head: float32* = qkv + (int64)b * (int64)time * stride + (int64)(hh * HD);
+    var rows: int32 = time - wq;
+    if (rows > 16) { rows = 16; }
+    if (rows < 0) { rows = 0; }
+    var cap: int32 = if causal != 0 { 0 } else { 1 << 30 };
+    var qt: bfloat16[16, HD] layout fragment_a;
+    tile_load(qt, head + (int64)wq * stride, ld: stride, rows: rows);
+    var o: float32[16, HD] layout fragment_c = 0.0;
+    var m: float32[16] layout fragment_c = -1.0e30;
+    var l: float32[16] layout fragment_c = 0.0;
+    var kend: int32 = time;
+    if (causal != 0 && q0 + 64 < kend) { kend = q0 + 64; }
+    var chunks: int32 = (kend + 31) / 32;
+    for c in 0..chunks {
+      var j0: int32 = c * 32;
+      comptime for i in 0..PER {
+        var idx: int32 = t + 128 * i;
+        var kr: int32 = idx / HD;
+        var d: int32 = idx - kr * HD;
+        var kv: float32 = z32();
+        var vv: float32 = z32();
+        if (j0 + kr < time) {
+          var src: float32* = head + (int64)(j0 + kr) * stride + (int64)d;
+          kv = src[width];
+          vv = src[2 * width];
+        }
+        ks[kr * LD + d] = (uint16)f2bf(kv);
+        vs[kr * LD + d] = (uint16)f2bf(vv);
+      }
+      barrier(workgroup, acq_rel);
+      var s: float32[16, 32] layout fragment_c;
+      tensor_mma(qt, &ks[0], 0.0, s, m: 16, n: 32, k: HD, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: col, ldb: LD);
+      s = s * scale;
+      var seen: bool[16, 32] layout fragment_c = tile_col(s) + j0 < time && tile_col(s) + j0 <= tile_row(s) + wq + cap;
+      var mx: float32[16] layout fragment_c = row_max(select(seen, s, -1.0e30));
+      var mn: float32[16] layout fragment_c = max(m, mx);
+      var alpha: float32[16] layout fragment_c = expf(m - mn);
+      var p: float32[16, 32] layout fragment_c = select(seen, expf(s - mn), 0.0);
+      l = l * alpha + row_sum(p);
+      m = mn;
+      var pa: bfloat16[16, 32] layout fragment_a = (bfloat16[16, 32] layout fragment_a)p;
+      tensor_mma(pa, &vs[0], o, o, m: 16, n: HD, k: 32, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: row, ldb: LD,
+                 c_scale_mode: per_row, c_scale: alpha);
+      barrier(workgroup, acq_rel);
+    }
+    o = o / l;
+    tile_store(out + ((int64)b * (int64)time + (int64)wq) * (int64)width + (int64)(hh * HD), o, ld: width, rows: rows);
+    var ls: float32[16] layout fragment_c = m + logf(l);
+    tile_store(lse + (int64)bh * (int64)time + (int64)wq, ls, ld: 1, rows: rows);
+  }
+
+  kernel(block = 128) ident("k_tflash_dq_", h.name)(qkv: float32*, out: float32*, lse: float32*, dout: float32*, dqkv: float32*, delta: float32*, time: int32, width: int32, heads: int32, causal: int32, scale: float32, fresh: int32) {
+    const HD: int32 = h.dim;
+    const LD: int32 = h.dim + 8;
+    const PER: int32 = h.dim / 4;
+    const KV: int32 = h.dim * 32 + 256;
+    workgroup var ks: uint16[KV];
+    workgroup var vs: uint16[KV];
+    var t: int32 = thread.x;
+    var warp: int32 = thread.x >> 5;
+    var bh: int32 = block.y;
+    var b: int32 = bh / heads;
+    var hh: int32 = bh - b * heads;
+    var q0: int32 = block.x * 64;
+    var wq: int32 = q0 + warp * 16;
+    var stride: int64 = (int64)(3 * width);
+    var head: float32* = qkv + (int64)b * (int64)time * stride + (int64)(hh * HD);
+    var orow: int64 = ((int64)b * (int64)time + (int64)wq) * (int64)width + (int64)(hh * HD);
+    var rows: int32 = time - wq;
+    if (rows > 16) { rows = 16; }
+    if (rows < 0) { rows = 0; }
+    var cap: int32 = if causal != 0 { 0 } else { 1 << 30 };
+    var qt: bfloat16[16, HD] layout fragment_a;
+    tile_load(qt, head + (int64)wq * stride, ld: stride, rows: rows);
+    var dot: bfloat16[16, HD] layout fragment_a;
+    tile_load(dot, dout + orow, ld: width, rows: rows);
+    var oc: float32[16, HD] layout fragment_c;
+    tile_load(oc, out + orow, ld: width, rows: rows);
+    var dc: float32[16, HD] layout fragment_c;
+    tile_load(dc, dout + orow, ld: width, rows: rows);
+    var dsum: float32[16] layout fragment_c = row_sum(oc * dc);
+    tile_store(delta + (int64)bh * (int64)time + (int64)wq, dsum, ld: 1, rows: rows);
+    var lr: float32[16] layout fragment_c;
+    tile_load(lr, lse + (int64)bh * (int64)time + (int64)wq, ld: 1, rows: rows);
+    var dq: float32[16, HD] layout fragment_c = 0.0;
+    var kend: int32 = time;
+    if (causal != 0 && q0 + 64 < kend) { kend = q0 + 64; }
+    var chunks: int32 = (kend + 31) / 32;
+    for c in 0..chunks {
+      var j0: int32 = c * 32;
+      comptime for i in 0..PER {
+        var idx: int32 = t + 128 * i;
+        var kr: int32 = idx / HD;
+        var d: int32 = idx - kr * HD;
+        var kv: float32 = z32();
+        var vv: float32 = z32();
+        if (j0 + kr < time) {
+          var src: float32* = head + (int64)(j0 + kr) * stride + (int64)d;
+          kv = src[width];
+          vv = src[2 * width];
+        }
+        ks[kr * LD + d] = (uint16)f2bf(kv);
+        vs[kr * LD + d] = (uint16)f2bf(vv);
+      }
+      barrier(workgroup, acq_rel);
+      var s: float32[16, 32] layout fragment_c;
+      tensor_mma(qt, &ks[0], 0.0, s, m: 16, n: 32, k: HD, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: col, ldb: LD);
+      var seen: bool[16, 32] layout fragment_c = tile_col(s) + j0 < time && tile_col(s) + j0 <= tile_row(s) + wq + cap;
+      var p: float32[16, 32] layout fragment_c = select(seen, expf(s * scale - lr), 0.0);
+      var dp: float32[16, 32] layout fragment_c;
+      tensor_mma(dot, &vs[0], 0.0, dp, m: 16, n: 32, k: HD, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: col, ldb: LD);
+      var ds: float32[16, 32] layout fragment_c = p * (dp - dsum);
+      var dsa: bfloat16[16, 32] layout fragment_a = (bfloat16[16, 32] layout fragment_a)ds;
+      tensor_mma(dsa, &ks[0], dq, dq, m: 16, n: HD, k: 32, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: row, ldb: LD);
+      barrier(workgroup, acq_rel);
+    }
+    var dst: float32* = dqkv + (int64)b * (int64)time * stride + (int64)wq * stride + (int64)(hh * HD);
+    dq = dq * scale;
+    if (fresh == 0) {
+      var prev: float32[16, HD] layout fragment_c;
+      tile_load(prev, dst, ld: stride, rows: rows);
+      dq = dq + prev;
+    }
+    tile_store(dst, dq, ld: stride, rows: rows);
+  }
+
+  kernel(block = 128) ident("k_tflash_dkv_", h.name)(qkv: float32*, lse: float32*, dout: float32*, dqkv: float32*, delta: float32*, time: int32, width: int32, heads: int32, causal: int32, scale: float32, fresh: int32) {
+    const HD: int32 = h.dim;
+    const LD: int32 = h.dim + 8;
+    const PER: int32 = h.dim / 4;
+    const KV: int32 = h.dim * 32 + 256;
+    workgroup var qs: uint16[KV];
+    workgroup var dos: uint16[KV];
+    workgroup var ls: float32[32];
+    workgroup var dl: float32[32];
+    var t: int32 = thread.x;
+    var warp: int32 = thread.x >> 5;
+    var bh: int32 = block.y;
+    var b: int32 = bh / heads;
+    var hh: int32 = bh - b * heads;
+    var k0: int32 = block.x * 64;
+    var wk: int32 = k0 + warp * 16;
+    var stride: int64 = (int64)(3 * width);
+    var head: float32* = qkv + (int64)b * (int64)time * stride + (int64)(hh * HD);
+    var dhead: float32* = dout + (int64)b * (int64)time * (int64)width + (int64)(hh * HD);
+    var rows: int32 = time - wk;
+    if (rows > 16) { rows = 16; }
+    if (rows < 0) { rows = 0; }
+    var cap: int32 = if causal != 0 { 0 } else { 1 << 30 };
+    var kt: bfloat16[16, HD] layout fragment_a;
+    tile_load(kt, head + (int64)wk * stride + (int64)width, ld: stride, rows: rows);
+    var vt: bfloat16[16, HD] layout fragment_a;
+    tile_load(vt, head + (int64)wk * stride + (int64)(2 * width), ld: stride, rows: rows);
+    var dk: float32[16, HD] layout fragment_c = 0.0;
+    var dv: float32[16, HD] layout fragment_c = 0.0;
+    var qstart: int32 = 0;
+    if (causal != 0) { qstart = k0 / 32 * 32; }
+    var chunks: int32 = (time - qstart + 31) / 32;
+    var row_base: int64 = (int64)bh * (int64)time;
+    for c in 0..chunks {
+      var i0: int32 = qstart + c * 32;
+      comptime for i in 0..PER {
+        var idx: int32 = t + 128 * i;
+        var qr: int32 = idx / HD;
+        var d: int32 = idx - qr * HD;
+        var qv: float32 = z32();
+        var dv0: float32 = z32();
+        if (i0 + qr < time) {
+          qv = head[(int64)(i0 + qr) * stride + (int64)d];
+          dv0 = dhead[(int64)(i0 + qr) * (int64)width + (int64)d];
+        }
+        qs[qr * LD + d] = (uint16)f2bf(qv);
+        dos[qr * LD + d] = (uint16)f2bf(dv0);
+      }
+      if (t < 32) {
+        var lv: float32 = z32();
+        var dd: float32 = z32();
+        if (i0 + t < time) {
+          lv = lse[row_base + (int64)(i0 + t)];
+          dd = delta[row_base + (int64)(i0 + t)];
+        }
+        ls[t] = lv;
+        dl[t] = dd;
+      }
+      barrier(workgroup, acq_rel);
+      var st: float32[16, 32] layout fragment_c;
+      tensor_mma(kt, &qs[0], 0.0, st, m: 16, n: 32, k: HD, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: col, ldb: LD);
+      var lt: float32[16, 32] layout fragment_c;
+      tile_load(lt, &ls[0], ld: 0, rows: 16);
+      var seen: bool[16, 32] layout fragment_c = tile_col(st) + i0 < time && tile_row(st) + wk <= tile_col(st) + i0 + cap;
+      var pt: float32[16, 32] layout fragment_c = select(seen, expf(st * scale - lt), 0.0);
+      var pta: bfloat16[16, 32] layout fragment_a = (bfloat16[16, 32] layout fragment_a)pt;
+      tensor_mma(pta, &dos[0], dv, dv, m: 16, n: HD, k: 32, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: row, ldb: LD);
+      var dpt: float32[16, 32] layout fragment_c;
+      tensor_mma(vt, &dos[0], 0.0, dpt, m: 16, n: 32, k: HD, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: col, ldb: LD);
+      var dt: float32[16, 32] layout fragment_c;
+      tile_load(dt, &dl[0], ld: 0, rows: 16);
+      var dst: float32[16, 32] layout fragment_c = pt * (dpt - dt);
+      var dsa: bfloat16[16, 32] layout fragment_a = (bfloat16[16, 32] layout fragment_a)dst;
+      tensor_mma(dsa, &qs[0], dk, dk, m: 16, n: HD, k: 32, a_type: bf16, b_type: bf16,
+                 accumulator_type: f32, result_type: f32, b_layout: row, ldb: LD);
+      barrier(workgroup, acq_rel);
+    }
+    var kdst: float32* = dqkv + (int64)b * (int64)time * stride + (int64)wk * stride + (int64)(width + hh * HD);
+    dk = dk * scale;
+    if (fresh == 0) {
+      var prevk: float32[16, HD] layout fragment_c;
+      tile_load(prevk, kdst, ld: stride, rows: rows);
+      dk = dk + prevk;
+      var prevv: float32[16, HD] layout fragment_c;
+      tile_load(prevv, kdst + (int64)width, ld: stride, rows: rows);
+      dv = dv + prevv;
+    }
+    tile_store(kdst, dk, ld: stride, rows: rows);
+    tile_store(kdst + (int64)width, dv, ld: stride, rows: rows);
+  }
+}
+
+kernel(block = 128) k_decode(qkv: float32*, keys: float32*, values: float32*, out: float32*, scores: float32*, at: int32, width: int32, heads: int32, scale: float32) {
+  workgroup var lanes: float32[128];
+  var t: int32 = thread.x;
+  var h: int32 = block.x;
+  var hd: int32 = width / heads;
+  var col: int32 = h * hd;
+  var seen: int32 = at + 1;
+  var row: float32* = scores + (int64)h * (int64)seen;
+  var e: int32 = t;
+  while (e < hd) {
+    keys[(int64)at * (int64)width + (int64)(col + e)] = qkv[width + col + e];
+    values[(int64)at * (int64)width + (int64)(col + e)] = qkv[2 * width + col + e];
+    e = e + 128;
+  }
+  barrier(workgroup, global, acq_rel);
+  var best: float32 = (float32)-3.0e38;
+  var j: int32 = t;
+  while (j < seen) {
+    var key: float32* = keys + (int64)j * (int64)width + (int64)col;
+    var s: float32 = z32();
+    for d in 0..hd { s = s + qkv[col + d] * key[d]; }
+    s = s * scale;
+    row[j] = s;
+    if (s > best) { best = s; }
+    j = j + 128;
+  }
+  lanes[t] = best;
+  barrier(workgroup, global, acq_rel);
+  var width2: int32 = 64;
+  while (width2 > 0) {
+    if (t < width2 && lanes[t + width2] > lanes[t]) { lanes[t] = lanes[t + width2]; }
+    barrier(workgroup, acq_rel);
+    width2 = width2 / 2;
+  }
+  var top: float32 = lanes[0];
+  barrier(workgroup, acq_rel);
+  var total: float32 = z32();
+  j = t;
+  while (j < seen) {
+    var p: float32 = expf(row[j] - top);
+    row[j] = p;
+    total = total + p;
+    j = j + 128;
+  }
+  lanes[t] = total;
+  barrier(workgroup, global, acq_rel);
+  width2 = 64;
+  while (width2 > 0) {
+    if (t < width2) { lanes[t] = lanes[t] + lanes[t + width2]; }
+    barrier(workgroup, acq_rel);
+    width2 = width2 / 2;
+  }
+  var inv: float32 = one32() / lanes[0];
+  e = t;
+  while (e < hd) {
+    var acc: float32 = z32();
+    for u in 0..seen { acc = acc + row[u] * values[(int64)u * (int64)width + (int64)(col + e)]; }
+    out[col + e] = acc * inv;
+    e = e + 128;
+  }
+}
+
+kernel(block = 256) k_column_partials(src: float32*, x: float32*, mean: float32*, rstd: float32*, rows: int32, cols: int32, mode: int32, partial_a: float32*, partial_b: float32*) {
+  workgroup var lanes: float32[512];
+  var t: int32 = thread.x;
+  var c: int32 = block.x * 32 + t % 32;
+  var slab: int32 = block.y;
+  var r: int32 = slab * 256 + t / 32;
+  var live: bool = c < cols;
+  var acc_a: float32 = z32();
+  var acc_b: float32 = z32();
+  for i in 0..32 {
+    if (live && r < rows) {
+      var at: int64 = (int64)r * (int64)cols + (int64)c;
+      var d: float32 = src[at];
+      if (mode == 0) {
+        acc_a = acc_a + d;
+      } else {
+        var mu: float32 = z32();
+        if (mode == 1) { mu = mean[r]; }
+        acc_a = acc_a + d * (x[at] - mu) * rstd[r];
+        acc_b = acc_b + d;
+      }
+    }
+    r = r + 8;
+  }
+  lanes[t] = acc_a;
+  lanes[256 + t] = acc_b;
+  barrier(workgroup, acq_rel);
+  if (t < 32 && live) {
+    var sa: float32 = z32();
+    var sb: float32 = z32();
+    comptime for k in 0..8 {
+      sa = sa + lanes[t + 32 * k];
+      sb = sb + lanes[256 + t + 32 * k];
+    }
+    var at: int64 = (int64)slab * (int64)cols + (int64)c;
+    partial_a[at] = sa;
+    if (partial_b != (float32*)0) { partial_b[at] = sb; }
+  }
+}
+
+kernel(block = 256) k_column_total(partial: float32*, chunks: int32, cols: int32, dst: float32*, scale: float32) {
+  var c: int32 = block.x * 256 + thread.x;
+  if (c >= cols) { return; }
+  var acc: float32 = z32();
+  for k in 0..chunks { acc = acc + partial[(int64)k * (int64)cols + (int64)c]; }
+  dst[c] = dst[c] + acc * scale;
+}
+
+kernel(block = 256) k_softmax(kind: int32, y: float32*, x: float32*, rows: int32, cols: int32, q_len: int32, k_len: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var visible: int32 = cols;
+  if (kind == 2) {
+    var q: int32 = row % q_len;
+    visible = q + (k_len - q_len) + 1;
+    if (visible > cols) { visible = cols; }
+    if (visible < 0) { visible = 0; }
+  }
+  var best: float32 = (float32)-3.0e38;
+  var c: int32 = lane;
+  while (c < visible) {
+    var v: float32 = x[base + (int64)c];
+    if (v > best) { best = v; }
+    c = c + 32;
+  }
+  best = subgroup_reduce_max(best);
+  var total: float32 = z32();
+  c = lane;
+  while (c < visible) {
+    total = total + expf(x[base + (int64)c] - best);
+    c = c + 32;
+  }
+  total = subgroup_reduce_add(total);
+  var lse: float32 = best + logf(total);
+  var inv: float32 = one32() / total;
+  c = lane;
+  while (c < cols) {
+    var v: float32 = z32();
+    if (c < visible) {
+      if (kind == 1) { v = x[base + (int64)c] - lse; } else { v = expf(x[base + (int64)c] - best) * inv; }
+    }
+    y[base + (int64)c] = v;
+    c = c + 32;
+  }
+}
+
+kernel(block = 256) k_softmax_back(kind: int32, dx: float32*, dy: float32*, y: float32*, rows: int32, cols: int32, scale: float32, accumulate: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var s: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    if (kind == 1) { s = s + dy[base + (int64)c]; } else { s = s + dy[base + (int64)c] * y[base + (int64)c]; }
+    c = c + 32;
+  }
+  s = subgroup_reduce_add(s);
+  c = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    var g: float32 = z32();
+    if (kind == 1) { g = dy[at] - expf(y[at]) * s; } else { g = y[at] * (dy[at] - s); }
+    g = g * scale;
+    if (accumulate != 0) { dx[at] = dx[at] + g; } else { dx[at] = g; }
+    c = c + 32;
+  }
+}
+
+kernel(block = 256) k_xent(probs: float32*, losses: float32*, x: float32*, targets: int32*, rows: int32, cols: int32, smoothing: float32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var target: int32 = (int32)subgroup_broadcast((uint32)targets[row], (uint32)0);
+  var best: float32 = (float32)-3.0e38;
+  var sum_x: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    var v: float32 = x[base + (int64)c];
+    if (v > best) { best = v; }
+    sum_x = sum_x + v;
+    c = c + 32;
+  }
+  best = subgroup_reduce_max(best);
+  sum_x = subgroup_reduce_add(sum_x);
+  var total: float32 = z32();
+  c = lane;
+  while (c < cols) {
+    total = total + expf(x[base + (int64)c] - best);
+    c = c + 32;
+  }
+  total = subgroup_reduce_add(total);
+  var inv: float32 = one32() / total;
+  var skip: bool = target < 0;
+  c = lane;
+  while (c < cols) {
+    var p: float32 = z32();
+    if (!skip) { p = expf(x[base + (int64)c] - best) * inv; }
+    probs[base + (int64)c] = p;
+    c = c + 32;
+  }
+  if (lane == 0) {
+    var nll: float32 = z32();
+    if (!skip) {
+      var lse: float32 = best + logf(total);
+      nll = lse - x[base + (int64)target];
+      if (smoothing > z32()) {
+        nll = (one32() - smoothing) * nll + smoothing * (lse - sum_x / (float32)cols);
+      }
+    }
+    losses[row] = nll;
+  }
+}
+
+kernel(block = 256) k_xent_back(dx: float32*, probs: float32*, targets: int32*, dloss: float32*, rows: int32, cols: int32, count: int32, smoothing: float32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  if (id >= (int64)rows * (int64)cols) { return; }
+  var r: int32 = (int32)(id / (int64)cols);
+  var c: int32 = (int32)(id - (int64)r * (int64)cols);
+  var t: int32 = targets[r];
+  if (t < 0) { return; }
+  var scale: float32 = dloss[0] / (float32)count;
+  var off: float32 = smoothing / (float32)cols;
+  var g: float32 = scale * (probs[id] - off);
+  if (c == t) { g = g - scale * (one32() - smoothing); }
+  dx[id] = dx[id] + g;
+}
+
+kernel(block = 256) k_norm(rms: int32, y: float32*, x: float32*, gamma: float32*, beta: float32*, mean: float32*, rstd: float32*, rows: int32, cols: int32, eps: float32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var inv_n: float32 = one32() / (float32)cols;
+  var mu: float32 = z32();
+  if (rms == 0) {
+    var s: float32 = z32();
+    var c: int32 = lane;
+    while (c < cols) {
+      s = s + x[base + (int64)c];
+      c = c + 32;
+    }
+    mu = subgroup_reduce_add(s) * inv_n;
+  }
+  var q: float32 = z32();
+  var c2: int32 = lane;
+  while (c2 < cols) {
+    var d: float32 = x[base + (int64)c2] - mu;
+    q = q + d * d;
+    c2 = c2 + 32;
+  }
+  var rs: float32 = rsqrtf(subgroup_reduce_add(q) * inv_n + eps);
+  if (lane == 0) {
+    mean[row] = mu;
+    rstd[row] = rs;
+  }
+  var has_gamma: bool = gamma != (float32*)0;
+  var has_beta: bool = beta != (float32*)0;
+  var c3: int32 = lane;
+  while (c3 < cols) {
+    var v: float32 = (x[base + (int64)c3] - mu) * rs;
+    if (has_gamma) { v = v * gamma[c3]; }
+    if (has_beta) { v = v + beta[c3]; }
+    y[base + (int64)c3] = v;
+    c3 = c3 + 32;
+  }
+}
+
+kernel(block = 256) k_norm_back(rms: int32, dx: float32*, dy: float32*, x: float32*, gamma: float32*, mean: float32*, rstd: float32*, rows: int32, cols: int32, fresh: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var mu: float32 = z32();
+  if (rms == 0) { mu = mean[row]; }
+  var rs: float32 = rstd[row];
+  var has_gamma: bool = gamma != (float32*)0;
+  var sg: float32 = z32();
+  var sgx: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    var gi: float32 = dy[at];
+    if (has_gamma) { gi = gi * gamma[c]; }
+    var xh: float32 = (x[at] - mu) * rs;
+    sg = sg + gi;
+    sgx = sgx + gi * xh;
+    c = c + 32;
+  }
+  var inv_n: float32 = one32() / (float32)cols;
+  var mg: float32 = subgroup_reduce_add(sg) * inv_n;
+  var mgx: float32 = subgroup_reduce_add(sgx) * inv_n;
+  if (rms != 0) { mg = z32(); }
+  c = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    var gi: float32 = dy[at];
+    if (has_gamma) { gi = gi * gamma[c]; }
+    var xh: float32 = (x[at] - mu) * rs;
+    if (fresh != 0) {
+      dx[at] = rs * (gi - mg - xh * mgx);
+    } else {
+      dx[at] = dx[at] + rs * (gi - mg - xh * mgx);
+    }
+    c = c + 32;
+  }
+}
+
+kernel(block = 256) k_dropout(dst: float32*, src: float32*, n: int64, key: uint64, threshold: uint64, keep: float32, accumulate: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    var m: float32 = z32();
+    if (drop_bits(key, i) >= threshold) { m = keep; }
+    if (accumulate != 0) { dst[i] = dst[i] + src[i] * m; } else { dst[i] = src[i] * m; }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_gather(dst: float32*, table: float32*, ids: int32*, count: int64, width: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count * width) {
+    var r: int64 = id / width;
+    var d: int64 = id - r * width;
+    dst[id] = table[(int64)ids[r] * width + d];
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_scatter(dtable: float32*, dy: float32*, order: int32*, starts: int32*, vocab: int64, width: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < vocab * width) {
+    var v: int64 = id / width;
+    var d: int64 = id - v * width;
+    var s0: int32 = starts[v];
+    var s1: int32 = starts[v + 1];
+    if (s1 > s0) {
+      var acc: float32 = z32();
+      for k in s0..s1 { acc = acc + dy[(int64)order[k] * width + d]; }
+      dtable[id] = dtable[id] + acc;
+    }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_step(w: float32*, g: float32*, m: float32*, v: float32*, n: int64, p: Adam, factor: float32*) {
+  var f: float32 = one32();
+  if (factor != (float32*)0) { f = factor[0]; }
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var has_m: bool = m != (float32*)0;
+  while (i < n) {
+    var d: float32 = g[i] * f + p.decay * w[i];
+    if (p.kind == 0) {
+      if (has_m) {
+        var buf: float32 = d;
+        if (p.first == 0) { buf = p.momentum * m[i] + (one32() - p.dampening) * d; }
+        m[i] = buf;
+        if (p.nesterov != 0) { d = d + p.momentum * buf; } else { d = buf; }
+      }
+      w[i] = w[i] - p.lr * d;
+    } else {
+      var mi: float32 = p.beta1 * m[i] + (one32() - p.beta1) * d;
+      var vi: float32 = p.beta2 * v[i] + (one32() - p.beta2) * d * d;
+      m[i] = mi;
+      v[i] = vi;
+      w[i] = w[i] * p.shrink - p.lr * (mi * p.correct1) / (sqrtf(vi * p.correct2) + p.eps);
+    }
+    i = i + step;
+  }
+}
+
+kernel(block = 32) k_clip(total: float32*, max_norm: float32, factor: float32*) {
+  if (thread.x != 0) { return; }
+  var norm: float32 = sqrtf(total[0]);
+  var f: float32 = one32();
+  if (norm > max_norm && norm > z32()) { f = max_norm / (norm + (float32)0.000001); }
+  factor[0] = f;
+}
+
+kernel(block = 256) k_im2col(cols: float32*, x: float32*, q: Conv) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var p_count: int64 = (int64)q.oh * (int64)q.ow;
+  var np: int64 = (int64)q.n * p_count;
+  var total: int64 = (int64)q.c * (int64)q.kh * (int64)q.kw * np;
+  while (id < total) {
+    var r: int64 = id / np;
+    var col: int64 = id - r * np;
+    var img: int64 = col / p_count;
+    var pix: int64 = col - img * p_count;
+    var oy: int32 = (int32)(pix / (int64)q.ow);
+    var ox: int32 = (int32)(pix - (int64)oy * (int64)q.ow);
+    var kx: int32 = (int32)(r % (int64)q.kw);
+    var ky: int32 = (int32)((r / (int64)q.kw) % (int64)q.kh);
+    var ch: int64 = r / ((int64)q.kw * (int64)q.kh);
+    var iy: int32 = oy * q.stride - q.pad + ky * q.dilation;
+    var ix: int32 = ox * q.stride - q.pad + kx * q.dilation;
+    var v: float32 = z32();
+    if (iy >= 0 && iy < q.h && ix >= 0 && ix < q.w) {
+      v = x[((img * (int64)q.c + ch) * (int64)q.h + (int64)iy) * (int64)q.w + (int64)ix];
+    }
+    cols[id] = v;
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_col2im(dx: float32*, dcols: float32*, q: Conv) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var p_count: int64 = (int64)q.oh * (int64)q.ow;
+  var np: int64 = (int64)q.n * p_count;
+  var total: int64 = (int64)q.n * (int64)q.c * (int64)q.h * (int64)q.w;
+  while (id < total) {
+    var ix: int32 = (int32)(id % (int64)q.w);
+    var iy: int32 = (int32)((id / (int64)q.w) % (int64)q.h);
+    var ch: int64 = (id / ((int64)q.w * (int64)q.h)) % (int64)q.c;
+    var img: int64 = id / ((int64)q.w * (int64)q.h * (int64)q.c);
+    var acc: float32 = z32();
+    for ky in 0..q.kh {
+      var ty: int32 = iy + q.pad - ky * q.dilation;
+      if (ty < 0 || ty % q.stride != 0) { continue; }
+      var oy: int32 = ty / q.stride;
+      if (oy >= q.oh) { continue; }
+      for kx in 0..q.kw {
+        var tx: int32 = ix + q.pad - kx * q.dilation;
+        if (tx < 0 || tx % q.stride != 0) { continue; }
+        var ox: int32 = tx / q.stride;
+        if (ox >= q.ow) { continue; }
+        var r: int64 = (ch * (int64)q.kh + (int64)ky) * (int64)q.kw + (int64)kx;
+        acc = acc + dcols[r * np + img * p_count + (int64)oy * (int64)q.ow + (int64)ox];
+      }
+    }
+    dx[id] = dx[id] + acc;
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_channel_bias(out: float32*, bias: float32*, n: int64, c: int64, spatial: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < n * c * spatial) {
+    var ch: int64 = (id / spatial) % c;
+    out[id] = out[id] + bias[ch];
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_channel_sums(dst: float32*, src: float32*, x: float32*, mean: float32*, rstd: float32*, n: int32, c: int32, spatial: int32, mode: int32) {
+  workgroup var lanes: float32[256];
+  var t: int32 = thread.x;
+  var ch: int32 = block.x;
+  var total: int64 = (int64)n * (int64)spatial;
+  var mu: float32 = z32();
+  var rs: float32 = one32();
+  if (mode == 1) {
+    mu = mean[ch];
+    rs = rstd[ch];
+  }
+  var acc: float32 = z32();
+  var i: int64 = (int64)t;
+  while (i < total) {
+    var img: int64 = i / (int64)spatial;
+    var p: int64 = i - img * (int64)spatial;
+    var at: int64 = (img * (int64)c + (int64)ch) * (int64)spatial + p;
+    if (mode == 1) { acc = acc + src[at] * (x[at] - mu) * rs; } else { acc = acc + src[at]; }
+    i = i + 256;
+  }
+  lanes[t] = acc;
+  barrier(workgroup, acq_rel);
+  var width: int32 = 128;
+  while (width > 0) {
+    if (t < width) { lanes[t] = lanes[t] + lanes[t + width]; }
+    barrier(workgroup, acq_rel);
+    width = width / 2;
+  }
+  if (t == 0) { dst[ch] = dst[ch] + lanes[0]; }
+}
+
+kernel(block = 256) k_pool(y: float32*, arg: int32*, x: float32*, planes: int64, h: int32, w: int32, oh: int32, ow: int32, k: int32, stride: int32, pad: int32, use_max: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var out_plane: int64 = (int64)oh * (int64)ow;
+  var area: float32 = one32() / (float32)(k * k);
+  while (id < planes * out_plane) {
+    var plane: int64 = id / out_plane;
+    var pix: int32 = (int32)(id - plane * out_plane);
+    var oy: int32 = pix / ow;
+    var ox: int32 = pix - oy * ow;
+    var src: float32* = x + plane * (int64)h * (int64)w;
+    var y0: int32 = oy * stride - pad;
+    var x0: int32 = ox * stride - pad;
+    var best: float32 = z32();
+    var best_at: int32 = -1;
+    var total: float32 = z32();
+    for ky in 0..k {
+      var iy: int32 = y0 + ky;
+      if (iy < 0 || iy >= h) { continue; }
+      for kx in 0..k {
+        var ix: int32 = x0 + kx;
+        if (ix < 0 || ix >= w) { continue; }
+        var v: float32 = src[iy * w + ix];
+        total = total + v;
+        if (best_at < 0 || v > best) {
+          best = v;
+          best_at = iy * w + ix;
+        }
+      }
+    }
+    if (use_max != 0) {
+      y[id] = best;
+      arg[id] = best_at;
+    } else {
+      y[id] = total * area;
+    }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_pool_back(dx: float32*, dy: float32*, arg: int32*, planes: int64, h: int32, w: int32, oh: int32, ow: int32, k: int32, stride: int32, pad: int32, use_max: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var in_plane: int64 = (int64)h * (int64)w;
+  var out_plane: int64 = (int64)oh * (int64)ow;
+  var area: float32 = one32() / (float32)(k * k);
+  while (id < planes * in_plane) {
+    var plane: int64 = id / in_plane;
+    var pix: int32 = (int32)(id - plane * in_plane);
+    var iy: int32 = pix / w;
+    var ix: int32 = pix - iy * w;
+    var acc: float32 = z32();
+    for oy in 0..oh {
+      var y0: int32 = oy * stride - pad;
+      if (iy < y0 || iy >= y0 + k) { continue; }
+      for ox in 0..ow {
+        var x0: int32 = ox * stride - pad;
+        if (ix < x0 || ix >= x0 + k) { continue; }
+        var at: int64 = plane * out_plane + (int64)(oy * ow + ox);
+        if (use_max != 0) {
+          if (arg[at] == pix) { acc = acc + dy[at]; }
+        } else {
+          acc = acc + dy[at] * area;
+        }
+      }
+    }
+    dx[id] = dx[id] + acc;
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_batch_norm(y: float32*, x: float32*, gamma: float32*, beta: float32*, mean: float32*, rstd: float32*, run_mean: float32*, run_var: float32*, n: int32, c: int32, spatial: int32, eps: float32, momentum: float32, training: int32) {
+  workgroup var lanes: float32[256];
+  var t: int32 = thread.x;
+  var ch: int32 = block.x;
+  var total: int64 = (int64)n * (int64)spatial;
+  var mu: float32 = z32();
+  var rs: float32 = z32();
+  if (training != 0) {
+    var acc: float32 = z32();
+    var i: int64 = (int64)t;
+    while (i < total) {
+      var img: int64 = i / (int64)spatial;
+      acc = acc + x[(img * (int64)c + (int64)ch) * (int64)spatial + (i - img * (int64)spatial)];
+      i = i + 256;
+    }
+    lanes[t] = acc;
+    barrier(workgroup, acq_rel);
+    var width: int32 = 128;
+    while (width > 0) {
+      if (t < width) { lanes[t] = lanes[t] + lanes[t + width]; }
+      barrier(workgroup, acq_rel);
+      width = width / 2;
+    }
+    mu = lanes[0] / (float32)total;
+    barrier(workgroup, acq_rel);
+    var sq: float32 = z32();
+    i = (int64)t;
+    while (i < total) {
+      var img: int64 = i / (int64)spatial;
+      var d: float32 = x[(img * (int64)c + (int64)ch) * (int64)spatial + (i - img * (int64)spatial)] - mu;
+      sq = sq + d * d;
+      i = i + 256;
+    }
+    lanes[t] = sq;
+    barrier(workgroup, acq_rel);
+    width = 128;
+    while (width > 0) {
+      if (t < width) { lanes[t] = lanes[t] + lanes[t + width]; }
+      barrier(workgroup, acq_rel);
+      width = width / 2;
+    }
+    var variance: float32 = lanes[0] / (float32)total;
+    rs = rsqrtf(variance + eps);
+    if (t == 0 && run_mean != (float32*)0) {
+      var count: float32 = (float32)total;
+      var unbiased: float32 = variance;
+      if (total > 1) { unbiased = variance * count / (count - one32()); }
+      run_mean[ch] = (one32() - momentum) * run_mean[ch] + momentum * mu;
+      run_var[ch] = (one32() - momentum) * run_var[ch] + momentum * unbiased;
+    }
+  } else {
+    mu = run_mean[ch];
+    rs = rsqrtf(run_var[ch] + eps);
+  }
+  if (t == 0) {
+    mean[ch] = mu;
+    rstd[ch] = rs;
+  }
+  var gm: float32 = gamma[ch];
+  var bt: float32 = beta[ch];
+  var i2: int64 = (int64)t;
+  while (i2 < total) {
+    var img: int64 = i2 / (int64)spatial;
+    var at: int64 = (img * (int64)c + (int64)ch) * (int64)spatial + (i2 - img * (int64)spatial);
+    y[at] = (x[at] - mu) * rs * gm + bt;
+    i2 = i2 + 256;
+  }
+}
+
+kernel(block = 256) k_batch_norm_back(dx: float32*, dgamma: float32*, dbeta: float32*, dy: float32*, x: float32*, gamma: float32*, mean: float32*, rstd: float32*, n: int32, c: int32, spatial: int32, training: int32) {
+  workgroup var lanes: float32[256];
+  workgroup var lanes2: float32[256];
+  var t: int32 = thread.x;
+  var ch: int32 = block.x;
+  var total: int64 = (int64)n * (int64)spatial;
+  var mu: float32 = mean[ch];
+  var rs: float32 = rstd[ch];
+  var sd: float32 = z32();
+  var sdx: float32 = z32();
+  var i: int64 = (int64)t;
+  while (i < total) {
+    var img: int64 = i / (int64)spatial;
+    var at: int64 = (img * (int64)c + (int64)ch) * (int64)spatial + (i - img * (int64)spatial);
+    var d: float32 = dy[at];
+    sd = sd + d;
+    sdx = sdx + d * (x[at] - mu) * rs;
+    i = i + 256;
+  }
+  lanes[t] = sd;
+  lanes2[t] = sdx;
+  barrier(workgroup, acq_rel);
+  var width: int32 = 128;
+  while (width > 0) {
+    if (t < width) {
+      lanes[t] = lanes[t] + lanes[t + width];
+      lanes2[t] = lanes2[t] + lanes2[t + width];
+    }
+    barrier(workgroup, acq_rel);
+    width = width / 2;
+  }
+  var sum_dy: float32 = lanes[0];
+  var sum_dy_xh: float32 = lanes2[0];
+  if (t == 0) {
+    if (dgamma != (float32*)0) { dgamma[ch] = dgamma[ch] + sum_dy_xh; }
+    if (dbeta != (float32*)0) { dbeta[ch] = dbeta[ch] + sum_dy; }
+  }
+  if (dx == (float32*)0) { return; }
+  var gm: float32 = gamma[ch];
+  var mean_dy: float32 = sum_dy / (float32)total;
+  var mean_dy_xh: float32 = sum_dy_xh / (float32)total;
+  i = (int64)t;
+  while (i < total) {
+    var img: int64 = i / (int64)spatial;
+    var at: int64 = (img * (int64)c + (int64)ch) * (int64)spatial + (i - img * (int64)spatial);
+    if (training != 0) {
+      var xh: float32 = (x[at] - mu) * rs;
+      dx[at] = dx[at] + gm * rs * (dy[at] - mean_dy - xh * mean_dy_xh);
+    } else {
+      dx[at] = dx[at] + gm * rs * dy[at];
+    }
+    i = i + 256;
+  }
+}
+
+export const MATMUL_FP32 = 0;
+export const MATMUL_BF16 = 1;
+
+struct GpuState {
+  sms: int32;
+  partials: float32*;
+  matmul: int32;
+  dev: Device*;
+  scratch: Graph*;
+}
+
+export fn gpu_matmul(dev: Device*, mode: int32) {
+  state_of(dev->state)->matmul = mode;
+}
+
+fn state_of(p: rawptr) -> GpuState* {
+  return (GpuState*)p;
+}
+
+fn spread(s: GpuState*, n: int64) -> int32 {
+  var blocks: int64 = (n + 255) / 256;
+  var cap: int64 = (int64)s->sms * 16;
+  if (blocks > cap) { blocks = cap; }
+  if (blocks < 1) { blocks = 1; }
+  return (int32)blocks;
+}
+
+fn cover(n: int64) -> int32 {
+  var blocks: int64 = (n + 255) / 256;
+  if (blocks < 1) { blocks = 1; }
+  return (int32)blocks;
+}
+
+fn row_blocks(rows: int64) -> int32 {
+  var blocks: int64 = (rows + 7) / 8;
+  if (blocks < 1) { blocks = 1; }
+  return (int32)blocks;
+}
+
+fn gpu_persist(state: rawptr, bytes: int64) -> rawptr {
+  return (rawptr)gpu_malloc(bytes);
+}
+
+fn gpu_release(state: rawptr, p: rawptr) {
+  gpu_free((int64)p);
+}
+
+fn gpu_set(state: rawptr, p: float32*, value: float32, n: int64) {
+  gpu_memset_u32_async((int64)p, (uint32)f32_bits_of(value), n, 0);
+}
+
+fn gpu_upload(state: rawptr, dst: rawptr, src: rawptr, bytes: int64) {
+  gpu_to_device((int64)dst, (uint8*)src, bytes);
+}
+
+fn gpu_download(state: rawptr, dst: rawptr, src: rawptr, bytes: int64) {
+  gpu_to_host((uint8*)dst, (int64)src, bytes);
+}
+
+fn gpu_add(state: rawptr, dst: float32*, src: float32*, alpha: float32, n: int64) {
+  dispatch k_add[spread(state_of(state), n), 256](dst, src, alpha, n);
+}
+
+fn sum_into(s: GpuState*, out: float32*, x: float32*, y: float32*, mode: int32, n: int64, scale: float32, accumulate: bool) {
+  var blocks: int32 = spread(s, n);
+  if (blocks > 1024) { blocks = 1024; }
+  dispatch k_partials[blocks, 256](x, y, mode, n, s->partials);
+  dispatch k_total[1, 256](s->partials, blocks, out, scale, if accumulate { 1 } else { 0 });
+}
+
+fn gpu_squares(state: rawptr, out: float32*, x: float32*, n: int64) {
+  if (n <= 0) { return; }
+  sum_into(state_of(state), out, x, (float32*)0, 1, n, 1.0, true);
+}
+
+fn gpu_clip(state: rawptr, total: float32*, max_norm: float32, factor: float32*) {
+  dispatch k_clip[1, 32](total, max_norm, factor);
+}
+
+fn gpu_step(state: rawptr, w: float32*, g: float32*, m: float32*, v: float32*, n: int64, c: StepCall*, factor: float32*) {
+  var p: Adam;
+  p.lr = c->lr;
+  p.beta1 = c->beta1;
+  p.beta2 = c->beta2;
+  p.eps = c->eps;
+  p.decay = c->decay;
+  p.shrink = c->shrink;
+  p.correct1 = c->correct1;
+  p.correct2 = c->correct2;
+  p.momentum = c->momentum;
+  p.dampening = c->dampening;
+  p.nesterov = if c->nesterov { 1 } else { 0 };
+  p.first = if c->first { 1 } else { 0 };
+  p.kind = if c->kind == 0 { 0 } else { 1 };
+  dispatch k_step[spread(state_of(state), n), 256](w, g, m, v, n, p, factor);
+}
+
+fn gpu_wait(state: rawptr) {
+  gpu_sync();
+}
+
+fn gpu_muon(state: rawptr, c: MuonCall*) {
+  var s: GpuState* = state_of(state);
+  if (c->apply) {
+    dispatch k_muon_apply[spread(s, c->n), 256](c->w, c->u, c->n, c->lr, c->shrink);
+  } else {
+    dispatch k_muon_mix[spread(s, c->n), 256](c->g, c->m, c->u, c->n, c->beta, c->factor);
+  }
+}
+
+fn batched(a: float32*, b: float32*, c: float32*, m: int64, n: int64, k: int64, lda: int64, ldb: int64, ta: bool, tb: bool, accumulate: bool, count: int64, sa: int64, sb: int64, sc: int64) -> GemmShape {
+  var q: GemmShape = gemm_shape(a, b, c, m, n, k, lda, ldb, n, ta, tb, accumulate);
+  q.outer = count;
+  q.sa_outer = sa;
+  q.sb_outer = sb;
+  q.sc_outer = sc;
+  return q;
+}
+
+fn gpu_orth(state: rawptr, x: float32*, count: int64, rows: int64, cols: int64, steps: int32) {
+  var s: GpuState* = state_of(state);
+  if (s->scratch == 0) { s->scratch = graph_on(s->dev); }
+  var g: Graph* = s->scratch;
+  g->reset();
+  var tall: bool = rows > cols;
+  var small: int64 = if tall { cols } else { rows };
+  var rc: int64 = rows * cols;
+  var ss: int64 = small * small;
+  var all: int64 = rc * count;
+  var sq: float32* = g->floats(ss * count);
+  var tq: float32* = g->floats(ss * count);
+  var bq: float32* = g->floats(ss * count);
+  var other: float32* = g->floats(all);
+  var parts: int32 = 16;
+  var partial: float32* = g->floats(count * (int64)parts);
+  dispatch k_frob_partials[grid: (parts, (int32)count, 1), block: (256, 1, 1)](x, rc, parts, partial);
+  dispatch k_frob_scale[grid: (parts, (int32)count, 1), block: (256, 1, 1)](x, rc, parts, partial);
+  var cur: float32* = x;
+  var nxt: float32* = other;
+  var blocks: int32 = spread(s, ss * count);
+  for it in 0..steps {
+    if (tall) {
+      run_gemm(s, g, batched(cur, cur, sq, cols, cols, rows, cols, cols, true, false, false, count, rc, rc, ss));
+    } else {
+      run_gemm(s, g, batched(cur, cur, sq, rows, rows, cols, cols, cols, false, true, false, count, rc, rc, ss));
+    }
+    dispatch k_poly[blocks, 256](tq, sq, (float32)2.0315, (float32)-4.7750, small, ss * count);
+    run_gemm(s, g, batched(sq, tq, bq, small, small, small, small, small, false, false, false, count, ss, ss, ss));
+    dispatch k_diag[cover(small * count), 256](bq, (float32)3.4445, small, count);
+    if (tall) {
+      run_gemm(s, g, batched(cur, bq, nxt, rows, cols, cols, cols, cols, false, false, false, count, rc, ss, rc));
+    } else {
+      run_gemm(s, g, batched(bq, cur, nxt, rows, cols, rows, rows, cols, false, false, false, count, ss, rc, rc));
+    }
+    var keep: float32* = cur;
+    cur = nxt;
+    nxt = keep;
+  }
+  if (cur != x) { dispatch k_scaled[spread(s, all), 256](x, cur, one32(), all); }
+}
+
+export fn gpu_device() -> Device* {
+  if (gpu_init() == 0) { mmll_fail("no CUDA device answered; check that the NVIDIA driver is installed"); }
+  var s: GpuState* = new GpuState;
+  s->sms = gpu_sm_count(0);
+  s->partials = (float32*)gpu_malloc(4096 * 4);
+  var d: Device* = new Device;
+  d->state = (rawptr)s;
+  d->persist = &gpu_persist;
+  d->release = &gpu_release;
+  d->set = &gpu_set;
+  d->upload = &gpu_upload;
+  d->download = &gpu_download;
+  d->forward = &gpu_forward;
+  d->backward = &gpu_backward;
+  d->add = &gpu_add;
+  d->squares = &gpu_squares;
+  d->clip = &gpu_clip;
+  d->step = &gpu_step;
+  d->sync = &gpu_wait;
+  d->muon = &gpu_muon;
+  d->orth = &gpu_orth;
+  s->dev = d;
+  return d;
+}
+
+struct GemmShape {
+  a: float32*;
+  b: float32*;
+  c: float32*;
+  m: int64;
+  n: int64;
+  k: int64;
+  lda: int64;
+  ldb: int64;
+  ldc: int64;
+  ta: bool;
+  tb: bool;
+  accumulate: bool;
+  alpha: float32;
+  bias: float32*;
+  outer: int64;
+  inner: int64;
+  sa_outer: int64;
+  sa_inner: int64;
+  sb_outer: int64;
+  sb_inner: int64;
+  sc_outer: int64;
+  sc_inner: int64;
+}
+
+fn gemm_shape(a: float32*, b: float32*, c: float32*, m: int64, n: int64, k: int64, lda: int64, ldb: int64, ldc: int64, ta: bool, tb: bool, accumulate: bool) -> GemmShape {
+  var s: GemmShape;
+  s.a = a;
+  s.b = b;
+  s.c = c;
+  s.m = m;
+  s.n = n;
+  s.k = k;
+  s.lda = lda;
+  s.ldb = ldb;
+  s.ldc = ldc;
+  s.ta = ta;
+  s.tb = tb;
+  s.accumulate = accumulate;
+  s.alpha = 1.0;
+  s.bias = (float32*)0;
+  s.outer = 1;
+  s.inner = 1;
+  s.sa_outer = 0;
+  s.sa_inner = 0;
+  s.sb_outer = 0;
+  s.sb_inner = 0;
+  s.sc_outer = 0;
+  s.sc_inner = 0;
+  return s;
+}
+
+fn aligned16(p: float32*) -> bool {
+  return (int64)p % 16 == 0;
+}
+
+fn tensor_launch(form: int32, gx: int32, gy: int32, gz: int32, q: GemmShape, c: float32*, ldc: int64, sa: int64, sb: int64, sc: int64, splits: int64, chunk: int64, sp: int64) {
+  var a: int64 = (int64)q.a;
+  var b: int64 = (int64)q.b;
+  var d: int64 = (int64)c;
+  var k: int32 = (int32)q.k;
+  var la: int32 = (int32)(q.lda / 4);
+  var lb: int32 = (int32)(q.ldb / 4);
+  var lc: int32 = (int32)ldc;
+  var s4a: int64 = sa / 4;
+  var s4b: int64 = sb / 4;
+  var cut: int32 = (int32)splits;
+  var part: int32 = (int32)chunk;
+  var e: int64 = (int64)q.bias;
+  var z: int32 = 0;
+  if (form == 0) { dispatch k_tc_nt[grid: (gx, gy, gz), block: (256, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 1) { dispatch k_tc_nn[grid: (gx, gy, gz), block: (256, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 2) { dispatch k_tc_tn[grid: (gx, gy, gz), block: (256, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 3) { dispatch k_tc_nt_acc[grid: (gx, gy, gz), block: (256, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 4) { dispatch k_tc_nn_acc[grid: (gx, gy, gz), block: (256, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 5) { dispatch k_tc_tn_acc[grid: (gx, gy, gz), block: (256, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 6) { dispatch k_tc_nt_bias[grid: (gx, gy, gz), block: (256, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 7) { dispatch k_tc_nt_64[grid: (gx, gy, gz), block: (128, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 8) { dispatch k_tc_nn_64[grid: (gx, gy, gz), block: (128, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 9) { dispatch k_tc_tn_64[grid: (gx, gy, gz), block: (128, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 10) { dispatch k_tc_nt_acc_64[grid: (gx, gy, gz), block: (128, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 11) { dispatch k_tc_nn_acc_64[grid: (gx, gy, gz), block: (128, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 12) { dispatch k_tc_tn_acc_64[grid: (gx, gy, gz), block: (128, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+  if (form == 13) { dispatch k_tc_nt_bias_64[grid: (gx, gy, gz), block: (128, 1, 1)](a, b, d, k, la, lb, lc, s4a, s4b, sc, cut, part, sp, q.alpha, e, z); }
+}
+
+fn run_tensor(s: GpuState*, g: Graph*, q: GemmShape) -> bool {
+  if (s->matmul != MATMUL_BF16) { return false; }
+  if (q.m % 64 != 0 || q.n % 64 != 0 || q.k % 32 != 0 || q.k <= 0) { return false; }
+  var tile: int64 = if q.m % 128 == 0 && q.n % 128 == 0 { (int64)128 } else { (int64)64 };
+  var shift: int32 = if tile == 128 { 0 } else { 7 };
+  if (q.ta && q.tb) { return false; }
+  if (q.lda % 4 != 0 || q.ldb % 4 != 0 || !aligned16(q.a) || !aligned16(q.b)) { return false; }
+  if (q.outer > 1 && q.inner > 1) { return false; }
+  if (q.bias != 0 && q.accumulate) { return false; }
+  var batch: int64 = q.outer * q.inner;
+  var sa: int64 = if q.inner > 1 { q.sa_inner } else { q.sa_outer };
+  var sb: int64 = if q.inner > 1 { q.sb_inner } else { q.sb_outer };
+  var sc: int64 = if q.inner > 1 { q.sc_inner } else { q.sc_outer };
+  if (batch > 1 && (sa % 4 != 0 || sb % 4 != 0)) { return false; }
+  var base: int32 = if q.tb { 0 } else { if q.ta { 2 } else { 1 } };
+  var accumulate: bool = q.accumulate;
+  if (q.bias != 0 && (q.ta || !q.tb)) {
+    dispatch k_bias_rows[spread(s, q.m * q.n), 256](q.c, q.bias, (int32)q.m, (int32)q.n, q.ldc);
+    accumulate = true;
+  }
+  var gx: int32 = (int32)(q.n / tile);
+  var gy: int32 = (int32)(q.m / tile);
+  var blocks: int64 = (q.m / tile) * (q.n / tile) * batch;
+  var waves: int64 = (int64)s->sms * (if tile == 128 { (int64)2 } else { (int64)6 });
+  var splits: int64 = 1;
+  if (batch == 1 && q.bias == 0 && blocks < waves && q.k >= 1024) {
+    splits = (waves + blocks - 1) / blocks;
+    if (splits > q.k / 256) { splits = q.k / 256; }
+    if (splits > 16) { splits = 16; }
+  }
+  if (splits <= 1) {
+    var form: int32 = if q.bias != 0 && !accumulate { 6 } else { if accumulate { base + 3 } else { base } };
+    tensor_launch(form + shift, gx, gy, (int32)batch, q, q.c, q.ldc, sa, sb, sc, 1, q.k, 0);
+    return true;
+  }
+  var chunk: int64 = (q.k + splits - 1) / splits;
+  chunk = (chunk + 31) / 32 * 32;
+  splits = (q.k + chunk - 1) / chunk;
+  var plane: int64 = q.m * q.n;
+  var ws: float32* = g->floats(plane * splits);
+  tensor_launch(base + shift, gx, gy, (int32)splits, q, ws, q.n, 0, 0, 0, splits, chunk, plane);
+  dispatch k_gemm_gather[spread(s, plane), 256](q.c, ws, (int32)q.m, (int32)q.n, q.ldc, (int32)splits, plane, if accumulate { 1 } else { 0 });
+  return true;
+}
+
+fn run_gemm(s: GpuState*, g: Graph*, q: GemmShape) {
+  if (q.m <= 0 || q.n <= 0) { return; }
+  if (run_tensor(s, g, q)) { return; }
+  var p: Gemm;
+  p.a = q.a;
+  p.b = q.b;
+  p.bias = q.bias;
+  p.m = (int32)q.m;
+  p.n = (int32)q.n;
+  p.k = (int32)q.k;
+  p.lda = (int32)q.lda;
+  p.ldb = (int32)q.ldb;
+  p.ta = if q.ta { 1 } else { 0 };
+  p.tb = if q.tb { 1 } else { 0 };
+  p.alpha = q.alpha;
+  p.inner = (int32)q.inner;
+  p.sa_outer = q.sa_outer;
+  p.sa_inner = q.sa_inner;
+  p.sb_outer = q.sb_outer;
+  p.sb_inner = q.sb_inner;
+  var batch: int64 = q.outer * q.inner;
+  var waves: int64 = (int64)s->sms * 2;
+  var splittable: bool = batch == 1 && q.bias == 0 && q.k >= 512;
+  var choice: int32 = 0;
+  var best: float64 = -1.0;
+  var splits: int64 = 1;
+  for v in 0..3 {
+    var bm: int64 = if v == 2 { (int64)64 } else { (int64)128 };
+    var bn: int64 = if v == 0 { (int64)128 } else { (int64)64 };
+    var weight: float64 = if v == 0 { 1.0 } else { if v == 1 { 0.9 } else { 0.72 } };
+    var blocks: int64 = ((q.m + bm - 1) / bm) * ((q.n + bn - 1) / bn) * batch;
+    var cut: int64 = 1;
+    if (splittable && blocks < waves) {
+      cut = (waves + blocks - 1) / blocks;
+      if (cut > q.k / 256) { cut = q.k / 256; }
+      if (cut > 32) { cut = 32; }
+      if (cut < 1) { cut = 1; }
+    }
+    var useful: float64 = (float64)(q.m * q.n * batch) / (float64)(blocks * bm * bn);
+    var fill: float64 = (float64)(blocks * cut) / (float64)waves;
+    if (fill > 1.0) { fill = 1.0; }
+    var score: float64 = weight * useful * fill;
+    if (score > best) {
+      best = score;
+      choice = v;
+      splits = cut;
+    }
+  }
+  var bm: int64 = if choice == 2 { (int64)64 } else { (int64)128 };
+  var bn: int64 = if choice == 0 { (int64)128 } else { (int64)64 };
+  var gx: int32 = (int32)((q.n + bn - 1) / bn);
+  var gy: int32 = (int32)((q.m + bm - 1) / bm);
+  var gz: int32 = (int32)batch;
+  var ws: float32* = (float32*)0;
+  var plane: int64 = q.m * q.n;
+  if (splits == 1) {
+    p.c = q.c;
+    p.ldc = (int32)q.ldc;
+    p.accumulate = if q.accumulate { 1 } else { 0 };
+    p.sc_outer = q.sc_outer;
+    p.sc_inner = q.sc_inner;
+    p.splits = 1;
+    p.chunk = (int32)q.k;
+    p.sp = 0;
+  } else {
+    var chunk: int64 = (q.k + splits - 1) / splits;
+    chunk = (chunk + 15) / 16 * 16;
+    splits = (q.k + chunk - 1) / chunk;
+    ws = g->floats(plane * splits);
+    p.c = ws;
+    p.ldc = (int32)q.n;
+    p.accumulate = 0;
+    p.sc_outer = 0;
+    p.sc_inner = 0;
+    p.splits = (int32)splits;
+    p.chunk = (int32)chunk;
+    p.sp = plane;
+    gz = (int32)splits;
+  }
+  if (choice == 0) { dispatch k_gemm_128x128[grid: (gx, gy, gz), block: (256, 1, 1)](p); }
+  if (choice == 1) { dispatch k_gemm_128x64[grid: (gx, gy, gz), block: (256, 1, 1)](p); }
+  if (choice == 2) { dispatch k_gemm_64x64[grid: (gx, gy, gz), block: (256, 1, 1)](p); }
+  if (splits > 1) {
+    dispatch k_gemm_gather[spread(s, plane), 256](q.c, ws, (int32)q.m, (int32)q.n, q.ldc, (int32)splits, plane, if q.accumulate { 1 } else { 0 });
+  }
+}
+
+fn bcast_record(so: Shape, sa: Shape, sb: Shape, op: int32) -> Bcast {
+  var p: Bcast;
+  var stra: int64[6] = broadcast_strides(sa, so);
+  var strb: int64[6] = broadcast_strides(sb, so);
+  p.rank = so.rank;
+  p.count = (int32)so.size();
+  p.op = op;
+  for d in 0..so.rank {
+    p.dims[d] = (int32)so.dims[d];
+    p.sa[d] = (int32)stra[d];
+    p.sb[d] = (int32)strb[d];
+  }
+  return p;
+}
+
+fn fwd_binary(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var so: Shape = n->value.shape;
+  var sa: Shape = g->nodes[n->a].value.shape;
+  var sb: Shape = g->nodes[n->b].value.shape;
+  var size: int64 = so.size();
+  if (sa.equal(so) && sb.equal(so)) {
+    dispatch k_binary[spread(s, size), 256](n->op, n->value.data, g->data(n->a), g->data(n->b), size);
+    return;
+  }
+  var p: Bcast = bcast_record(so, sa, sb, n->op);
+  dispatch k_bcast[cover(size), 256](p, n->value.data, g->data(n->a), g->data(n->b));
+}
+
+fn trailing_slice(part: Shape, whole: Shape) -> bool {
+  var first: int32 = 0;
+  while (first < part.rank && part.dims[first] == 1) { first = first + 1; }
+  var kept: int32 = part.rank - first;
+  if (kept > whole.rank || part.size() < 1) { return false; }
+  for i in 0..kept {
+    if (part.dims[part.rank - 1 - i] != whole.dims[whole.rank - 1 - i]) { return false; }
+  }
+  return true;
+}
+
+fn back_binary(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var so: Shape = n->value.shape;
+  var sa: Shape = g->nodes[n->a].value.shape;
+  var sb: Shape = g->nodes[n->b].value.shape;
+  var size: int64 = so.size();
+  var pa: float32* = g->data(n->a);
+  var pb: float32* = g->data(n->b);
+  var dy: float32* = n->grad;
+  for which in 0..2 {
+    var target: int32 = if (which == 0) n->a else n->b;
+    if (!g->nodes[target].requires) { continue; }
+    var st: Shape = if (which == 0) sa else sb;
+    if (sa.equal(so) && sb.equal(so)) {
+      var slot: GradSlot = g->grad_take(target);
+      dispatch k_binary_back[spread(s, size), 256](n->op, which, slot.data, dy, pa, pb, size, if slot.fresh { 1 } else { 0 });
+      continue;
+    }
+    var dst: float32* = g->grad_of(target);
+    if (n->op == OP_ADD || n->op == OP_SUB) {
+      var sign: float32 = if n->op == OP_SUB && which == 1 { (float32)-1.0 } else { (float32)1.0 };
+      if (st.equal(so)) {
+        dispatch k_add[spread(s, size), 256](dst, dy, sign, size);
+        continue;
+      }
+      if (trailing_slice(st, so)) {
+        var cols: int64 = st.size();
+        column_sums(s, g, dst, (float32*)0, dy, (float32*)0, (float32*)0, (float32*)0, size / cols, cols, 0, sign);
+        continue;
+      }
+    }
+    var p: Bcast = bcast_record(so, sa, sb, n->op);
+    p.which = which;
+    var own: int64[6] = broadcast_strides(st, so);
+    var running: int64 = 1;
+    var d: int32 = so.rank - 1;
+    while (d >= 0) {
+      p.sd[d] = if own[d] == 0 { 0 } else { (int32)running };
+      if (own[d] != 0) { running = running * so.dims[d]; }
+      d = d - 1;
+    }
+    var count: int64 = st.size();
+    dispatch k_bcast_back[cover(count), 256](p, dst, (int32)count, dy, pa, pb);
+  }
+}
+
+fn fwd_unary(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var size: int64 = n->value.shape.size();
+  dispatch k_unary[spread(s, size), 256](n->op, n->value.data, g->data(n->a), n->f0, n->f1, size);
+}
+
+fn back_unary(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var size: int64 = n->value.shape.size();
+  var slot: GradSlot = g->grad_take(n->a);
+  dispatch k_unary_back[spread(s, size), 256](n->op, slot.data, n->grad, g->data(n->a), n->value.data, n->f0, n->f1, size, if slot.fresh { 1 } else { 0 });
+}
+
+fn fwd_reduce(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var total: int64 = xs.size();
+  if (n->op == OP_SUM_ALL || n->op == OP_MEAN_ALL) {
+    var scale: float32 = if n->op == OP_MEAN_ALL { (float32)(1.0 / (float64)(if (total < 1) 1 else total)) } else { (float32)1.0 };
+    if (total < 1) {
+      g->dev->fill(n->value.data, 0.0, 1);
+      return;
+    }
+    sum_into(s, n->value.data, g->data(n->a), (float32*)0, 0, total, scale, false);
+    return;
+  }
+  var outer: int64 = 0;
+  var len: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(xs, (int32)n->i0, &outer, &len, &inner);
+  var scale: float32 = if n->op == OP_MEAN { (float32)(1.0 / (float64)(if (len < 1) 1 else len)) } else { (float32)1.0 };
+  dispatch k_reduce_axis[cover(outer * inner), 256](n->op, n->value.data, n->ints, g->data(n->a), (int32)outer, (int32)len, (int32)inner, scale);
+}
+
+fn back_reduce(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var total: int64 = xs.size();
+  var dx: float32* = g->grad_of(n->a);
+  if (n->op == OP_SUM_ALL || n->op == OP_MEAN_ALL) {
+    var scale: float32 = if n->op == OP_MEAN_ALL { (float32)(1.0 / (float64)(if (total < 1) 1 else total)) } else { (float32)1.0 };
+    dispatch k_spread[spread(s, total), 256](dx, n->grad, scale, total);
+    return;
+  }
+  var outer: int64 = 0;
+  var len: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(xs, (int32)n->i0, &outer, &len, &inner);
+  var scale: float32 = if n->op == OP_MEAN { (float32)(1.0 / (float64)(if (len < 1) 1 else len)) } else { (float32)1.0 };
+  dispatch k_reduce_axis_back[cover(total), 256](n->op, dx, n->grad, n->ints, (int32)outer, (int32)len, (int32)inner, scale);
+}
+
+fn permute_record(s: Shape, a: int32, b: int32) -> Bcast {
+  var p: Bcast;
+  var in_strides: int64[6];
+  var running: int64 = 1;
+  var i: int32 = s.rank - 1;
+  while (i >= 0) {
+    in_strides[i] = running;
+    running = running * s.dims[i];
+    i = i - 1;
+  }
+  p.rank = s.rank;
+  p.count = (int32)s.size();
+  for d in 0..s.rank {
+    var from: int32 = if d == a { b } else { if d == b { a } else { d } };
+    p.dims[d] = (int32)s.dims[from];
+    p.sa[d] = (int32)in_strides[from];
+  }
+  return p;
+}
+
+fn fwd_transpose(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var p: Bcast = permute_record(xs, (int32)n->i0, (int32)n->i1);
+  dispatch k_permute[cover(xs.size()), 256](n->value.data, g->data(n->a), p, 0);
+}
+
+fn back_transpose(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var ys: Shape = n->value.shape;
+  var p: Bcast = permute_record(ys, (int32)n->i0, (int32)n->i1);
+  dispatch k_permute[cover(ys.size()), 256](g->grad_of(n->a), n->grad, p, 1);
+}
+
+fn fwd_slice(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var outer: int64 = 0;
+  var len: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(xs, (int32)n->i0, &outer, &len, &inner);
+  var width: int64 = n->i2 * inner;
+  dispatch k_blocks[spread(s, outer * width), 256](n->value.data, g->data(n->a) + n->i1 * inner, outer, width, width, len * inner, 0);
+}
+
+fn back_slice(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var outer: int64 = 0;
+  var len: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(xs, (int32)n->i0, &outer, &len, &inner);
+  var width: int64 = n->i2 * inner;
+  dispatch k_blocks[spread(s, outer * width), 256](g->grad_of(n->a) + n->i1 * inner, n->grad, outer, width, len * inner, width, 1);
+}
+
+fn fwd_concat(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sa: Shape = g->nodes[n->a].value.shape;
+  var outer: int64 = 0;
+  var la: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(sa, (int32)n->i0, &outer, &la, &inner);
+  var lb: int64 = g->nodes[n->b].value.shape.dims[(int32)n->i0];
+  var row: int64 = (la + lb) * inner;
+  dispatch k_blocks[spread(s, outer * la * inner), 256](n->value.data, g->data(n->a), outer, la * inner, row, la * inner, 0);
+  dispatch k_blocks[spread(s, outer * lb * inner), 256](n->value.data + la * inner, g->data(n->b), outer, lb * inner, row, lb * inner, 0);
+}
+
+fn back_concat(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sa: Shape = g->nodes[n->a].value.shape;
+  var outer: int64 = 0;
+  var la: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(sa, (int32)n->i0, &outer, &la, &inner);
+  var lb: int64 = g->nodes[n->b].value.shape.dims[(int32)n->i0];
+  var row: int64 = (la + lb) * inner;
+  if (g->nodes[n->a].requires) {
+    dispatch k_blocks[spread(s, outer * la * inner), 256](g->grad_of(n->a), n->grad, outer, la * inner, la * inner, row, 1);
+  }
+  if (g->nodes[n->b].requires) {
+    dispatch k_blocks[spread(s, outer * lb * inner), 256](g->grad_of(n->b), n->grad + la * inner, outer, lb * inner, lb * inner, row, 1);
+  }
+}
+
+fn fwd_matmul(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var trans_b: bool = n->op == OP_MATMUL_NT;
+  var sa: Shape = g->nodes[n->a].value.shape;
+  var sb: Shape = g->nodes[n->b].value.shape;
+  var m: int64 = sa.dims[sa.rank - 2];
+  var k: int64 = sa.dims[sa.rank - 1];
+  var cols: int64 = if trans_b { sb.dims[sb.rank - 2] } else { sb.dims[sb.rank - 1] };
+  var ldb: int64 = if trans_b { k } else { cols };
+  if (n->i0 == 0) {
+    var rows: int64 = sa.size() / (if (k < 1) 1 else k);
+    run_gemm(s, g, gemm_shape(g->data(n->a), g->data(n->b), n->value.data, rows, cols, k, k, ldb, cols, false, trans_b, false));
+    return;
+  }
+  var q: GemmShape = gemm_shape(g->data(n->a), g->data(n->b), n->value.data, m, cols, k, k, ldb, cols, false, trans_b, false);
+  q.inner = batch_of(sa);
+  q.sa_inner = m * k;
+  q.sb_inner = k * cols;
+  q.sc_inner = m * cols;
+  run_gemm(s, g, q);
+}
+
+fn back_matmul(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var trans_b: bool = n->op == OP_MATMUL_NT;
+  var sa: Shape = g->nodes[n->a].value.shape;
+  var sb: Shape = g->nodes[n->b].value.shape;
+  var m: int64 = sa.dims[sa.rank - 2];
+  var k: int64 = sa.dims[sa.rank - 1];
+  var cols: int64 = if trans_b { sb.dims[sb.rank - 2] } else { sb.dims[sb.rank - 1] };
+  var batched: bool = n->i0 == 1;
+  var rows: int64 = if batched { m } else { sa.size() / (if (k < 1) 1 else k) };
+  var z: int64 = if batched { batch_of(sa) } else { 1 };
+  var pa: float32* = g->data(n->a);
+  var pb: float32* = g->data(n->b);
+  var dc: float32* = n->grad;
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    var q: GemmShape = if trans_b {
+      gemm_shape(dc, pb, slot.data, rows, k, cols, cols, k, k, false, false, !slot.fresh)
+    } else {
+      gemm_shape(dc, pb, slot.data, rows, k, cols, cols, cols, k, false, true, !slot.fresh)
+    };
+    q.inner = z;
+    q.sa_inner = rows * cols;
+    q.sb_inner = k * cols;
+    q.sc_inner = rows * k;
+    run_gemm(s, g, q);
+  }
+  if (g->nodes[n->b].requires) {
+    var slot: GradSlot = g->grad_take(n->b);
+    var q: GemmShape = if trans_b {
+      gemm_shape(dc, pa, slot.data, cols, k, rows, cols, k, k, true, false, !slot.fresh)
+    } else {
+      gemm_shape(pa, dc, slot.data, k, cols, rows, k, cols, cols, true, false, !slot.fresh)
+    };
+    q.inner = z;
+    q.sa_inner = if trans_b { rows * cols } else { rows * k };
+    q.sb_inner = if trans_b { rows * k } else { rows * cols };
+    q.sc_inner = k * cols;
+    run_gemm(s, g, q);
+  }
+}
+
+fn fwd_linear(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sx: Shape = g->nodes[n->a].value.shape;
+  var k: int64 = sx.last();
+  var cols: int64 = g->nodes[n->b].value.shape.dims[0];
+  var rows: int64 = sx.size() / (if (k < 1) 1 else k);
+  var q: GemmShape = gemm_shape(g->data(n->a), g->data(n->b), n->value.data, rows, cols, k, k, k, cols, false, true, false);
+  if (n->c >= 0) { q.bias = g->data(n->c); }
+  run_gemm(s, g, q);
+}
+
+fn column_sums(s: GpuState*, g: Graph*, dst_a: float32*, dst_b: float32*, src: float32*, x: float32*, mean: float32*, rstd: float32*, rows: int64, cols: int64, mode: int32, scale: float32) {
+  var slabs: int64 = (rows + 255) / 256;
+  if (slabs < 1 || cols < 1) { return; }
+  var partial_a: float32* = g->floats(slabs * cols);
+  var partial_b: float32* = if dst_b != 0 { g->floats(slabs * cols) } else { (float32*)0 };
+  var gx: int32 = (int32)((cols + 31) / 32);
+  dispatch k_column_partials[grid: (gx, (int32)slabs, 1), block: (256, 1, 1)](src, x, mean, rstd, (int32)rows, (int32)cols, mode, partial_a, partial_b);
+  var tx: int32 = (int32)((cols + 255) / 256);
+  if (dst_a != 0) { dispatch k_column_total[tx, 256](partial_a, (int32)slabs, (int32)cols, dst_a, scale); }
+  if (dst_b != 0) { dispatch k_column_total[tx, 256](partial_b, (int32)slabs, (int32)cols, dst_b, scale); }
+}
+
+fn back_linear(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sx: Shape = g->nodes[n->a].value.shape;
+  var k: int64 = sx.last();
+  var cols: int64 = g->nodes[n->b].value.shape.dims[0];
+  var rows: int64 = sx.size() / (if (k < 1) 1 else k);
+  var dc: float32* = n->grad;
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    run_gemm(s, g, gemm_shape(dc, g->data(n->b), slot.data, rows, k, cols, cols, k, k, false, false, !slot.fresh));
+  }
+  if (g->nodes[n->b].requires) {
+    var wslot: GradSlot = g->grad_take(n->b);
+    run_gemm(s, g, gemm_shape(dc, g->data(n->a), wslot.data, cols, k, rows, cols, k, k, true, false, !wslot.fresh));
+  }
+  if (n->c >= 0 && g->nodes[n->c].requires) {
+    column_sums(s, g, g->grad_of(n->c), (float32*)0, dc, (float32*)0, (float32*)0, (float32*)0, rows, cols, 0, 1.0);
+  }
+}
+
+fn fwd_softmax(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var kind: int32 = if n->op == OP_LOG_SOFTMAX { 1 } else { if n->op == OP_CAUSAL_SOFTMAX { 2 } else { 0 } };
+  var q_len: int64 = if sh.rank >= 2 { sh.dims[sh.rank - 2] } else { 1 };
+  var rows: int64 = sh.rows();
+  dispatch k_softmax[row_blocks(rows), 256](kind, n->value.data, g->data(n->a), (int32)rows, (int32)sh.last(), (int32)q_len, (int32)sh.last());
+}
+
+fn back_softmax(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var sh: Shape = n->value.shape;
+  var kind: int32 = if n->op == OP_LOG_SOFTMAX { 1 } else { 0 };
+  var rows: int64 = sh.rows();
+  dispatch k_softmax_back[row_blocks(rows), 256](kind, g->grad_of(n->a), n->grad, n->value.data, (int32)rows, (int32)sh.last(), 1.0, 1);
+}
+
+fn fwd_cross_entropy(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = g->nodes[n->a].value.shape;
+  var rows: int64 = sh.rows();
+  var cols: int64 = sh.last();
+  dispatch k_xent[row_blocks(rows), 256](n->saved, n->saved2, g->data(n->a), n->ints, (int32)rows, (int32)cols, n->f0);
+  var counted: int64 = if n->i0 < 1 { 1 } else { n->i0 };
+  sum_into(s, n->value.data, n->saved2, (float32*)0, 0, rows, (float32)(1.0 / (float64)counted), false);
+}
+
+fn back_cross_entropy(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var sh: Shape = g->nodes[n->a].value.shape;
+  var rows: int64 = sh.rows();
+  var cols: int64 = sh.last();
+  var counted: int64 = if n->i0 < 1 { 1 } else { n->i0 };
+  dispatch k_xent_back[cover(rows * cols), 256](g->grad_of(n->a), n->saved, n->ints, n->grad, (int32)rows, (int32)cols, (int32)counted, n->f0);
+}
+
+fn fwd_pair_loss(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var size: int64 = g->nodes[n->a].value.shape.size();
+  var mode: int32 = if n->op == OP_MSE { 2 } else { 3 };
+  sum_into(s, n->value.data, g->data(n->a), g->data(n->b), mode, size, (float32)(1.0 / (float64)(if (size < 1) 1 else size)), false);
+}
+
+fn back_pair_loss(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var size: int64 = g->nodes[n->a].value.shape.size();
+  var scale: float32 = (float32)(1.0 / (float64)(if (size < 1) 1 else size));
+  var pa: float32* = g->data(n->a);
+  var pb: float32* = g->data(n->b);
+  var mode: int32 = if n->op == OP_MSE { 2 } else { 3 };
+  if (g->nodes[n->a].requires) {
+    dispatch k_pair_back[spread(s, size), 256](mode, g->grad_of(n->a), pa, pb, n->grad, scale, 1.0, size);
+  }
+  if (g->nodes[n->b].requires) {
+    dispatch k_pair_back[spread(s, size), 256](mode, g->grad_of(n->b), pa, pb, n->grad, scale, -1.0, size);
+  }
+}
+
+fn fwd_norm(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var rows: int64 = sh.rows();
+  var gamma: float32* = if n->b >= 0 { g->data(n->b) } else { (float32*)0 };
+  var beta: float32* = if n->c >= 0 { g->data(n->c) } else { (float32*)0 };
+  var rms: int32 = if n->op == OP_RMS_NORM { 1 } else { 0 };
+  dispatch k_norm[row_blocks(rows), 256](rms, n->value.data, g->data(n->a), gamma, beta, n->saved, n->saved2, (int32)rows, (int32)sh.last(), n->f0);
+}
+
+fn back_norm(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var rows: int64 = sh.rows();
+  var cols: int64 = sh.last();
+  var rms: int32 = if n->op == OP_RMS_NORM { 1 } else { 0 };
+  var gamma: float32* = if n->b >= 0 { g->data(n->b) } else { (float32*)0 };
+  var x: float32* = g->data(n->a);
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_norm_back[row_blocks(rows), 256](rms, slot.data, n->grad, x, gamma, n->saved, n->saved2, (int32)rows, (int32)cols, if slot.fresh { 1 } else { 0 });
+  }
+  var dgamma: float32* = if n->b >= 0 && g->nodes[n->b].requires { g->grad_of(n->b) } else { (float32*)0 };
+  var dbeta: float32* = if n->c >= 0 && g->nodes[n->c].requires { g->grad_of(n->c) } else { (float32*)0 };
+  if (dgamma != 0) {
+    column_sums(s, g, dgamma, dbeta, n->grad, x, n->saved, n->saved2, rows, cols, if rms == 1 { 2 } else { 1 }, 1.0);
+  } else if (dbeta != 0) {
+    column_sums(s, g, dbeta, (float32*)0, n->grad, x, n->saved, n->saved2, rows, cols, 0, 1.0);
+  }
+}
+
+fn drop_into(s: GpuState*, dst: float32*, src: float32*, n: int64, key: uint64, p: float32, accumulate: bool) {
+  var threshold: uint64 = drop_threshold((float64)p);
+  var keep: float32 = (float32)(1.0 / (1.0 - (float64)p));
+  dispatch k_dropout[spread(s, n), 256](dst, src, n, key, threshold, keep, if accumulate { 1 } else { 0 });
+}
+
+fn fwd_dropout(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  drop_into(s, n->value.data, g->data(n->a), n->value.shape.size(), (uint64)n->i0, n->f0, false);
+}
+
+fn back_dropout(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  drop_into(s, g->grad_of(n->a), n->grad, n->value.shape.size(), (uint64)n->i0, n->f0, true);
+}
+
+fn fwd_gather(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var width: int64 = n->value.shape.last();
+  var count: int64 = n->value.shape.rows();
+  dispatch k_gather[spread(s, count * width), 256](n->value.data, g->data(n->a), n->ints, count, width);
+}
+
+fn back_gather(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var width: int64 = n->value.shape.last();
+  var count: int64 = n->value.shape.rows();
+  var vocab: int64 = g->nodes[n->a].value.shape.dims[0];
+  var order: int32* = (int32*)n->ext;
+  dispatch k_scatter[spread(s, vocab * width), 256](g->grad_of(n->a), n->grad, order, order + count, vocab, width);
+}
+
+fn attn_gemm(a: float32*, lda: int64, sa_outer: int64, sa_inner: int64, ta: bool, b: float32*, ldb: int64, sb_outer: int64, sb_inner: int64, tb: bool, c: float32*, ldc: int64, sc_outer: int64, sc_inner: int64, m: int64, n: int64, k: int64, outer: int64, inner: int64, alpha: float32, accumulate: bool) -> GemmShape {
+  var q: GemmShape = gemm_shape(a, b, c, m, n, k, lda, ldb, ldc, ta, tb, accumulate);
+  q.alpha = alpha;
+  q.outer = outer;
+  q.inner = inner;
+  q.sa_outer = sa_outer;
+  q.sa_inner = sa_inner;
+  q.sb_outer = sb_outer;
+  q.sb_inner = sb_inner;
+  q.sc_outer = sc_outer;
+  q.sc_inner = sc_inner;
+  return q;
+}
+
+fn flash_parts(hd: int64) -> int64 {
+  if (hd == 32) { return 1; }
+  if (hd == 64) { return 2; }
+  if (hd == 128) { return 4; }
+  return 0;
+}
+
+fn flash_record(g: Graph*, n: Node*) -> Flash {
+  var sh: Shape = g->nodes[n->a].value.shape;
+  var width: int64 = sh.dims[2] / 3;
+  var f: Flash;
+  f.qkv = g->data(n->a);
+  f.out = n->value.data;
+  f.lse = n->saved;
+  f.dout = (float32*)0;
+  f.dqkv = (float32*)0;
+  f.delta = (float32*)0;
+  f.time = (int32)sh.dims[1];
+  f.width = (int32)width;
+  f.heads = (int32)n->i0;
+  f.causal = (int32)n->i1;
+  f.scale = (float32)(1.0 / sqrt((float64)(width / n->i0)));
+  f.dropping = (int32)n->i2;
+  f.key = (uint64)n->i3;
+  f.threshold = drop_threshold((float64)n->f0);
+  f.keep = (float32)(1.0 / (1.0 - (float64)n->f0));
+  return f;
+}
+
+fn fwd_attention(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = g->nodes[n->a].value.shape;
+  var batch: int64 = sh.dims[0];
+  var time: int64 = sh.dims[1];
+  var width: int64 = sh.dims[2] / 3;
+  var heads: int64 = n->i0;
+  var hd: int64 = width / heads;
+  var parts: int64 = flash_parts(hd);
+  var qkv: float32* = g->data(n->a);
+  if (s->matmul == MATMUL_BF16 && n->i2 == 0 && (hd == 32 || hd == 64)) {
+    n->saved = g->floats(batch * heads * time);
+    n->i4 = 2;
+    var gx: int32 = (int32)((time + 63) / 64);
+    var gy: int32 = (int32)(batch * heads);
+    var sc: float32 = (float32)(1.0 / sqrt((float64)hd));
+    if (hd == 32) { dispatch k_tflash_fwd_32[grid: (gx, gy, 1), block: (128, 1, 1)](qkv, n->value.data, n->saved, (int32)time, (int32)width, (int32)heads, (int32)n->i1, sc); }
+    if (hd == 64) { dispatch k_tflash_fwd_64[grid: (gx, gy, 1), block: (128, 1, 1)](qkv, n->value.data, n->saved, (int32)time, (int32)width, (int32)heads, (int32)n->i1, sc); }
+    return;
+  }
+  if (parts > 0) {
+    n->saved = g->floats(batch * heads * time);
+    n->i4 = 1;
+    var f: Flash = flash_record(g, n);
+    var gx: int32 = (int32)((time * parts + 127) / 128);
+    var gy: int32 = (int32)(batch * heads);
+    if (hd == 32) { dispatch k_flash_fwd_32[grid: (gx, gy, 1), block: (128, 1, 1)](f); }
+    if (hd == 64) { dispatch k_flash_fwd_64[grid: (gx, gy, 1), block: (128, 1, 1)](f); }
+    if (hd == 128) { dispatch k_flash_fwd_128[grid: (gx, gy, 1), block: (128, 1, 1)](f); }
+    return;
+  }
+  n->saved = g->floats(batch * heads * time * time);
+  n->i4 = 0;
+  var scale: float32 = (float32)(1.0 / sqrt((float64)hd));
+  var probs: float32* = n->saved;
+  var row: int64 = 3 * width;
+  var seq: int64 = time * row;
+  var square: int64 = time * time;
+  run_gemm(s, g, attn_gemm(qkv, row, seq, hd, false, qkv + width, row, seq, hd, true, probs, time, heads * square, square, time, time, hd, batch, heads, scale, false));
+  var kind: int32 = if n->i1 == 1 { 2 } else { 0 };
+  var rows: int64 = batch * heads * time;
+  dispatch k_softmax[row_blocks(rows), 256](kind, probs, probs, (int32)rows, (int32)time, (int32)time, (int32)time);
+  var used: float32* = probs;
+  if (n->i2 == 1) {
+    used = g->floats(rows * time);
+    drop_into(s, used, probs, rows * time, (uint64)n->i3, n->f0, false);
+  }
+  run_gemm(s, g, attn_gemm(used, time, heads * square, square, false, qkv + 2 * width, row, seq, hd, false, n->value.data, width, time * width, hd, time, hd, time, batch, heads, 1.0, false));
+}
+
+fn back_attention(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var sh: Shape = g->nodes[n->a].value.shape;
+  var batch: int64 = sh.dims[0];
+  var time: int64 = sh.dims[1];
+  var width: int64 = sh.dims[2] / 3;
+  var heads: int64 = n->i0;
+  var hd: int64 = width / heads;
+  if (n->i4 == 2) {
+    var delta: float32* = g->floats(batch * heads * time);
+    var gx: int32 = (int32)((time + 63) / 64);
+    var gy: int32 = (int32)(batch * heads);
+    var sc: float32 = (float32)(1.0 / sqrt((float64)hd));
+    var qkv: float32* = g->data(n->a);
+    var slot: GradSlot = g->grad_take(n->a);
+    var dqkv: float32* = slot.data;
+    var fresh: int32 = if slot.fresh { 1 } else { 0 };
+    if (hd == 32) {
+      dispatch k_tflash_dq_32[grid: (gx, gy, 1), block: (128, 1, 1)](qkv, n->value.data, n->saved, n->grad, dqkv, delta, (int32)time, (int32)width, (int32)heads, (int32)n->i1, sc, fresh);
+      dispatch k_tflash_dkv_32[grid: (gx, gy, 1), block: (128, 1, 1)](qkv, n->saved, n->grad, dqkv, delta, (int32)time, (int32)width, (int32)heads, (int32)n->i1, sc, fresh);
+    }
+    if (hd == 64) {
+      dispatch k_tflash_dq_64[grid: (gx, gy, 1), block: (128, 1, 1)](qkv, n->value.data, n->saved, n->grad, dqkv, delta, (int32)time, (int32)width, (int32)heads, (int32)n->i1, sc, fresh);
+      dispatch k_tflash_dkv_64[grid: (gx, gy, 1), block: (128, 1, 1)](qkv, n->saved, n->grad, dqkv, delta, (int32)time, (int32)width, (int32)heads, (int32)n->i1, sc, fresh);
+    }
+    return;
+  }
+  if (n->i4 == 1) {
+    var f: Flash = flash_record(g, n);
+    f.dout = n->grad;
+    f.dqkv = g->grad_of(n->a);
+    f.delta = g->floats(batch * heads * time);
+    var parts: int64 = flash_parts(hd);
+    var gx: int32 = (int32)((time * parts + 127) / 128);
+    var gy: int32 = (int32)(batch * heads);
+    if (hd == 32) {
+      dispatch k_flash_dq_32[grid: (gx, gy, 1), block: (128, 1, 1)](f);
+      dispatch k_flash_dkv_32[grid: (gx, gy, 1), block: (128, 1, 1)](f);
+    }
+    if (hd == 64) {
+      dispatch k_flash_dq_64[grid: (gx, gy, 1), block: (128, 1, 1)](f);
+      dispatch k_flash_dkv_64[grid: (gx, gy, 1), block: (128, 1, 1)](f);
+    }
+    if (hd == 128) {
+      dispatch k_flash_dq_128[grid: (gx, gy, 1), block: (128, 1, 1)](f);
+      dispatch k_flash_dkv_128[grid: (gx, gy, 1), block: (128, 1, 1)](f);
+    }
+    return;
+  }
+  var scale: float32 = (float32)(1.0 / sqrt((float64)hd));
+  var qkv: float32* = g->data(n->a);
+  var dqkv: float32* = g->grad_of(n->a);
+  var probs: float32* = n->saved;
+  var dout: float32* = n->grad;
+  var row: int64 = 3 * width;
+  var seq: int64 = time * row;
+  var square: int64 = time * time;
+  var rows: int64 = batch * heads * time;
+  var dp: float32* = g->floats(rows * time);
+  run_gemm(s, g, attn_gemm(dout, width, time * width, hd, false, qkv + 2 * width, row, seq, hd, true, dp, time, heads * square, square, time, time, hd, batch, heads, 1.0, false));
+  var used: float32* = probs;
+  if (n->i2 == 1) {
+    drop_into(s, dp, dp, rows * time, (uint64)n->i3, n->f0, false);
+    used = g->floats(rows * time);
+    drop_into(s, used, probs, rows * time, (uint64)n->i3, n->f0, false);
+  }
+  dispatch k_softmax_back[row_blocks(rows), 256](0, dp, dp, probs, (int32)rows, (int32)time, scale, 0);
+  run_gemm(s, g, attn_gemm(dp, time, heads * square, square, false, qkv + width, row, seq, hd, false, dqkv, row, seq, hd, time, hd, time, batch, heads, 1.0, true));
+  run_gemm(s, g, attn_gemm(dp, time, heads * square, square, true, qkv, row, seq, hd, false, dqkv + width, row, seq, hd, time, hd, time, batch, heads, 1.0, true));
+  run_gemm(s, g, attn_gemm(used, time, heads * square, square, true, dout, width, time * width, hd, false, dqkv + 2 * width, row, seq, hd, time, hd, time, batch, heads, 1.0, true));
+}
+
+fn fwd_cached_attention(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var width: int64 = n->value.shape.last();
+  var heads: int64 = n->i0;
+  var scale: float32 = (float32)(1.0 / sqrt((float64)(width / heads)));
+  dispatch k_decode[(int32)heads, 128](g->data(n->a), (float32*)n->ext, n->saved, n->value.data, n->saved2, (int32)n->i1, (int32)width, (int32)heads, scale);
+}
+
+fn conv_record(g: Graph*, n: Node*) -> Conv {
+  var sx: Shape = g->nodes[n->a].value.shape;
+  var sw: Shape = g->nodes[n->b].value.shape;
+  var q: Conv;
+  q.n = (int32)sx.dims[0];
+  q.c = (int32)sx.dims[1];
+  q.h = (int32)sx.dims[2];
+  q.w = (int32)sx.dims[3];
+  q.kh = (int32)sw.dims[2];
+  q.kw = (int32)sw.dims[3];
+  q.oh = (int32)n->value.shape.dims[2];
+  q.ow = (int32)n->value.shape.dims[3];
+  q.stride = (int32)n->i0;
+  q.pad = (int32)n->i1;
+  q.dilation = (int32)n->i2;
+  return q;
+}
+
+fn fwd_conv(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var q: Conv = conv_record(g, n);
+  var o: int64 = g->nodes[n->b].value.shape.dims[0];
+  var ckk: int64 = (int64)q.c * (int64)q.kh * (int64)q.kw;
+  var p_count: int64 = (int64)q.oh * (int64)q.ow;
+  var np: int64 = (int64)q.n * p_count;
+  dispatch k_im2col[spread(s, ckk * np), 256](n->saved, g->data(n->a), q);
+  var gs: GemmShape = gemm_shape(g->data(n->b), n->saved, n->value.data, o, p_count, ckk, ckk, np, p_count, false, false, false);
+  gs.inner = (int64)q.n;
+  gs.sb_inner = p_count;
+  gs.sc_inner = o * p_count;
+  run_gemm(s, g, gs);
+  if (n->c >= 0) {
+    dispatch k_channel_bias[spread(s, (int64)q.n * o * p_count), 256](n->value.data, g->data(n->c), (int64)q.n, o, p_count);
+  }
+}
+
+fn back_conv(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var q: Conv = conv_record(g, n);
+  var o: int64 = g->nodes[n->b].value.shape.dims[0];
+  var ckk: int64 = (int64)q.c * (int64)q.kh * (int64)q.kw;
+  var p_count: int64 = (int64)q.oh * (int64)q.ow;
+  var np: int64 = (int64)q.n * p_count;
+  var dout: float32* = n->grad;
+  var dout_t: float32* = g->floats(o * np);
+  var p: Bcast;
+  p.rank = 3;
+  p.count = (int32)(o * np);
+  p.dims[0] = (int32)o;
+  p.dims[1] = q.n;
+  p.dims[2] = (int32)p_count;
+  p.sa[0] = (int32)p_count;
+  p.sa[1] = (int32)(o * p_count);
+  p.sa[2] = 1;
+  dispatch k_permute[cover(o * np), 256](dout_t, dout, p, 0);
+  if (g->nodes[n->b].requires) {
+    run_gemm(s, g, gemm_shape(dout_t, n->saved, g->grad_of(n->b), o, ckk, np, np, np, ckk, false, true, true));
+  }
+  if (n->c >= 0 && g->nodes[n->c].requires) {
+    dispatch k_channel_sums[(int32)o, 256](g->grad_of(n->c), dout, (float32*)0, (float32*)0, (float32*)0, q.n, (int32)o, (int32)p_count, 0);
+  }
+  if (g->nodes[n->a].requires) {
+    var dcols: float32* = g->floats(ckk * np);
+    run_gemm(s, g, gemm_shape(g->data(n->b), dout_t, dcols, ckk, np, o, ckk, np, np, true, false, false));
+    dispatch k_col2im[spread(s, (int64)q.n * (int64)q.c * (int64)q.h * (int64)q.w), 256](g->grad_of(n->a), dcols, q);
+  }
+}
+
+fn fwd_pool(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var planes: int64 = xs.dims[0] * xs.dims[1];
+  var oh: int64 = n->value.shape.dims[2];
+  var ow: int64 = n->value.shape.dims[3];
+  var max: int32 = if n->op == OP_MAX_POOL2D { 1 } else { 0 };
+  dispatch k_pool[spread(s, planes * oh * ow), 256](n->value.data, n->ints, g->data(n->a), planes, (int32)xs.dims[2], (int32)xs.dims[3], (int32)oh, (int32)ow, (int32)n->i0, (int32)n->i1, (int32)n->i2, max);
+}
+
+fn back_pool(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var planes: int64 = xs.dims[0] * xs.dims[1];
+  var oh: int64 = n->value.shape.dims[2];
+  var ow: int64 = n->value.shape.dims[3];
+  var max: int32 = if n->op == OP_MAX_POOL2D { 1 } else { 0 };
+  dispatch k_pool_back[spread(s, planes * xs.dims[2] * xs.dims[3]), 256](g->grad_of(n->a), n->grad, n->ints, planes, (int32)xs.dims[2], (int32)xs.dims[3], (int32)oh, (int32)ow, (int32)n->i0, (int32)n->i1, (int32)n->i2, max);
+}
+
+fn fwd_batch_norm(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var c: int64 = sh.dims[1];
+  dispatch k_batch_norm[(int32)c, 256](n->value.data, g->data(n->a), g->data(n->b), g->data(n->c), n->saved, n->saved2, (float32*)n->i2, (float32*)n->i3, (int32)sh.dims[0], (int32)c, (int32)n->i1, n->f0, n->f1, (int32)n->i0);
+}
+
+fn back_batch_norm(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var c: int64 = sh.dims[1];
+  var dx: float32* = if g->nodes[n->a].requires { g->grad_of(n->a) } else { (float32*)0 };
+  var dgamma: float32* = if g->nodes[n->b].requires { g->grad_of(n->b) } else { (float32*)0 };
+  var dbeta: float32* = if g->nodes[n->c].requires { g->grad_of(n->c) } else { (float32*)0 };
+  dispatch k_batch_norm_back[(int32)c, 256](dx, dgamma, dbeta, n->grad, g->data(n->a), g->data(n->b), n->saved, n->saved2, (int32)sh.dims[0], (int32)c, (int32)n->i1, (int32)n->i0);
+}
+
+fn gpu_forward(state: rawptr, g: Graph*, id: int32) {
+  var s: GpuState* = state_of(state);
+  var op: int32 = g->nodes[id].op;
+  if (op >= OP_ADD && op <= OP_DIV) { fwd_binary(s, g, id); return; }
+  if (op >= OP_ADD_SCALAR && op <= OP_SQUARE) { fwd_unary(s, g, id); return; }
+  if (op >= OP_SUM_ALL && op <= OP_MAX) { fwd_reduce(s, g, id); return; }
+  if (op == OP_TRANSPOSE) { fwd_transpose(s, g, id); return; }
+  if (op == OP_SLICE) { fwd_slice(s, g, id); return; }
+  if (op == OP_CONCAT) { fwd_concat(s, g, id); return; }
+  if (op == OP_MATMUL || op == OP_MATMUL_NT) { fwd_matmul(s, g, id); return; }
+  if (op == OP_LINEAR) { fwd_linear(s, g, id); return; }
+  if (op >= OP_SOFTMAX && op <= OP_CAUSAL_SOFTMAX) { fwd_softmax(s, g, id); return; }
+  if (op == OP_CROSS_ENTROPY) { fwd_cross_entropy(s, g, id); return; }
+  if (op == OP_MSE || op == OP_BCE_LOGITS) { fwd_pair_loss(s, g, id); return; }
+  if (op == OP_LAYER_NORM || op == OP_RMS_NORM) { fwd_norm(s, g, id); return; }
+  if (op == OP_DROPOUT) { fwd_dropout(s, g, id); return; }
+  if (op == OP_GATHER_ROWS) { fwd_gather(s, g, id); return; }
+  if (op == OP_ATTENTION) { fwd_attention(s, g, id); return; }
+  if (op == OP_CACHED_ATTENTION) { fwd_cached_attention(s, g, id); return; }
+  if (op == OP_QK_ROPE) {
+    var n: Node* = g->node(id);
+    var sh: Shape = n->value.shape;
+    var rows: int64 = sh.rows();
+    var width: int32 = (int32)(sh.dims[sh.rank - 1] / 3);
+    dispatch k_rope[row_blocks(rows * 3 * n->i0), 256](n->value.data, g->data(n->a), n->saved, n->saved2, rows, n->i1, width, (int32)n->i0);
+    return;
+  }
+  if (op == OP_CONV2D) { fwd_conv(s, g, id); return; }
+  if (op == OP_MAX_POOL2D || op == OP_AVG_POOL2D) { fwd_pool(s, g, id); return; }
+  if (op == OP_BATCH_NORM) { fwd_batch_norm(s, g, id); return; }
+  mmll_fail("{op_name(op)} has no GPU kernel");
+}
+
+fn gpu_backward(state: rawptr, g: Graph*, id: int32) {
+  var s: GpuState* = state_of(state);
+  var op: int32 = g->nodes[id].op;
+  if (op == OP_LEAF || op == OP_RESHAPE) { return; }
+  if (op >= OP_ADD && op <= OP_DIV) { back_binary(s, g, id); return; }
+  if (op >= OP_ADD_SCALAR && op <= OP_SQUARE) { back_unary(s, g, id); return; }
+  if (op >= OP_SUM_ALL && op <= OP_MAX) { back_reduce(s, g, id); return; }
+  if (op == OP_TRANSPOSE) { back_transpose(s, g, id); return; }
+  if (op == OP_SLICE) { back_slice(s, g, id); return; }
+  if (op == OP_CONCAT) { back_concat(s, g, id); return; }
+  if (op == OP_MATMUL || op == OP_MATMUL_NT) { back_matmul(s, g, id); return; }
+  if (op == OP_LINEAR) { back_linear(s, g, id); return; }
+  if (op >= OP_SOFTMAX && op <= OP_CAUSAL_SOFTMAX) { back_softmax(s, g, id); return; }
+  if (op == OP_CROSS_ENTROPY) { back_cross_entropy(s, g, id); return; }
+  if (op == OP_MSE || op == OP_BCE_LOGITS) { back_pair_loss(s, g, id); return; }
+  if (op == OP_LAYER_NORM || op == OP_RMS_NORM) { back_norm(s, g, id); return; }
+  if (op == OP_DROPOUT) { back_dropout(s, g, id); return; }
+  if (op == OP_GATHER_ROWS) { back_gather(s, g, id); return; }
+  if (op == OP_ATTENTION) { back_attention(s, g, id); return; }
+  if (op == OP_QK_ROPE) {
+    var n: Node* = g->node(id);
+    if (!g->nodes[n->a].requires) { return; }
+    var sh: Shape = n->value.shape;
+    var rows: int64 = sh.rows();
+    var width: int32 = (int32)(sh.dims[sh.rank - 1] / 3);
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_rope_back[row_blocks(rows * 3 * n->i0), 256](slot.data, n->grad, g->data(n->a), n->saved, n->saved2, rows, n->i1, width, (int32)n->i0, if slot.fresh { 1 } else { 0 });
+    return;
+  }
+  if (op == OP_CONV2D) { back_conv(s, g, id); return; }
+  if (op == OP_MAX_POOL2D || op == OP_AVG_POOL2D) { back_pool(s, g, id); return; }
+  if (op == OP_BATCH_NORM) { back_batch_norm(s, g, id); return; }
+  mmll_fail("{op_name(op)} has no GPU gradient");
+}

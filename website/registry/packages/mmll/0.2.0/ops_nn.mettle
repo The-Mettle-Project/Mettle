@@ -1,0 +1,697 @@
+import "std/mem";
+import "./tensor";
+import "./kernels";
+import "./graph";
+
+const ROWS_PER_TASK = 16;
+
+const K_SOFTMAX = 0;
+const K_LOG_SOFTMAX = 1;
+const K_CAUSAL = 2;
+const K_SOFTMAX_BACK = 3;
+const K_LOG_SOFTMAX_BACK = 4;
+const K_XENT = 5;
+const K_LAYER_NORM = 6;
+const K_LAYER_NORM_BACK = 7;
+const K_RMS_NORM = 8;
+const K_RMS_NORM_BACK = 9;
+
+struct RowJob {
+  kind: int32;
+  rows: int64;
+  cols: int64;
+  x: float32*;
+  y: float32*;
+  dy: float32*;
+  dx: float32*;
+  gamma: float32*;
+  beta: float32*;
+  mean: float32*;
+  rstd: float32*;
+  loss: float32*;
+  targets: int32*;
+  eps: float32;
+  smoothing: float32;
+  q_len: int64;
+  k_len: int64;
+}
+
+fn row_max(x: float32*, n: int64) -> float32 {
+  var m: float32 = x[0];
+  for i: int64 in 1..n {
+    var v: float32 = x[i];
+    m = if v > m { v } else { m };
+  }
+  return m;
+}
+
+fn exp_shift_sum(y: float32*, x: float32*, shift: float32, n: int64) -> float32 {
+  var s: float32 = 0.0;
+  for i: int64 in 0..n {
+    var e: float32 = exp_f32(x[i] - shift);
+    y[i] = e;
+    s = s + e;
+  }
+  return s;
+}
+
+fn softmax_row(y: float32*, x: float32*, n: int64) {
+  if (n <= 0) { return; }
+  var m: float32 = row_max(x, n);
+  var s: float32 = exp_shift_sum(y, x, m, n);
+  var one: float32 = 1.0;
+  scale_f32(y, one / s, n);
+}
+
+fn log_softmax_row(y: float32*, x: float32*, n: int64) {
+  if (n <= 0) { return; }
+  var m: float32 = row_max(x, n);
+  var s: float32 = exp_shift_sum(y, x, m, n);
+  var lse: float32 = m + log_f32(s);
+  for i: int64 in 0..n { y[i] = x[i] - lse; }
+}
+
+fn layer_norm_row(j: RowJob*, r: int64) {
+  var n: int64 = j->cols;
+  var x: float32* = j->x + r * n;
+  var y: float32* = j->y + r * n;
+  var mean: float64 = (float64)sum_f32(x, n) / (float64)n;
+  var var_sum: float64 = 0.0;
+  for i: int64 in 0..n {
+    var d: float64 = (float64)x[i] - mean;
+    var_sum = var_sum + d * d;
+  }
+  var variance: float32 = (float32)(var_sum / (float64)n);
+  var rstd: float32 = rsqrt_f32(variance + j->eps);
+  var mu: float32 = (float32)mean;
+  j->mean[r] = mu;
+  j->rstd[r] = rstd;
+  if (j->gamma != 0 && j->beta != 0) {
+    var gm: float32* = j->gamma;
+    var bt: float32* = j->beta;
+    for i: int64 in 0..n { y[i] = (x[i] - mu) * rstd * gm[i] + bt[i]; }
+  } else if (j->gamma != 0) {
+    var gm: float32* = j->gamma;
+    for i: int64 in 0..n { y[i] = (x[i] - mu) * rstd * gm[i]; }
+  } else {
+    for i: int64 in 0..n { y[i] = (x[i] - mu) * rstd; }
+  }
+}
+
+fn layer_norm_back_row(j: RowJob*, r: int64) {
+  var n: int64 = j->cols;
+  var x: float32* = j->x + r * n;
+  var dy: float32* = j->dy + r * n;
+  var dx: float32* = j->dx + r * n;
+  var mu: float32 = j->mean[r];
+  var rstd: float32 = j->rstd[r];
+  var sum_g: float32 = 0.0;
+  var sum_gx: float32 = 0.0;
+  for i: int64 in 0..n {
+    var gi: float32 = if j->gamma == 0 { dy[i] } else { dy[i] * j->gamma[i] };
+    var xh: float32 = (x[i] - mu) * rstd;
+    sum_g = sum_g + gi;
+    sum_gx = sum_gx + gi * xh;
+  }
+  var inv_n: float32 = (float32)(1.0 / (float64)n);
+  var mg: float32 = sum_g * inv_n;
+  var mgx: float32 = sum_gx * inv_n;
+  for i: int64 in 0..n {
+    var gi: float32 = if j->gamma == 0 { dy[i] } else { dy[i] * j->gamma[i] };
+    var xh: float32 = (x[i] - mu) * rstd;
+    dx[i] = dx[i] + rstd * (gi - mg - xh * mgx);
+  }
+}
+
+fn rms_norm_row(j: RowJob*, r: int64) {
+  var n: int64 = j->cols;
+  var x: float32* = j->x + r * n;
+  var y: float32* = j->y + r * n;
+  var ms: float32 = dot_f32(x, x, n) * (float32)(1.0 / (float64)n);
+  var rstd: float32 = rsqrt_f32(ms + j->eps);
+  j->rstd[r] = rstd;
+  if (j->gamma != 0) {
+    var gm: float32* = j->gamma;
+    for i: int64 in 0..n { y[i] = x[i] * rstd * gm[i]; }
+  } else {
+    for i: int64 in 0..n { y[i] = x[i] * rstd; }
+  }
+}
+
+fn rms_norm_back_row(j: RowJob*, r: int64) {
+  var n: int64 = j->cols;
+  var x: float32* = j->x + r * n;
+  var dy: float32* = j->dy + r * n;
+  var dx: float32* = j->dx + r * n;
+  var rstd: float32 = j->rstd[r];
+  var sum_gx: float32 = 0.0;
+  for i: int64 in 0..n {
+    var gi: float32 = if j->gamma == 0 { dy[i] } else { dy[i] * j->gamma[i] };
+    sum_gx = sum_gx + gi * x[i] * rstd;
+  }
+  var mgx: float32 = sum_gx * (float32)(1.0 / (float64)n);
+  for i: int64 in 0..n {
+    var gi: float32 = if j->gamma == 0 { dy[i] } else { dy[i] * j->gamma[i] };
+    var xh: float32 = x[i] * rstd;
+    dx[i] = dx[i] + rstd * (gi - xh * mgx);
+  }
+}
+
+fn xent_row(j: RowJob*, r: int64) {
+  var n: int64 = j->cols;
+  var x: float32* = j->x + r * n;
+  var p: float32* = j->y + r * n;
+  var t: int32 = j->targets[r];
+  if (t < 0) {
+    zero_f32(p, n);
+    j->loss[r] = 0.0;
+    return;
+  }
+  if ((int64)t >= n) { mmll_fail("target {t} is outside {n} classes"); }
+  var m: float32 = row_max(x, n);
+  var s: float32 = exp_shift_sum(p, x, m, n);
+  var one: float32 = 1.0;
+  scale_f32(p, one / s, n);
+  var lse: float32 = m + log_f32(s);
+  var nll: float32 = lse - x[t];
+  if (j->smoothing > (float32)0.0) {
+    var mean_x: float32 = sum_f32(x, n) * (float32)(1.0 / (float64)n);
+    nll = (one - j->smoothing) * nll + j->smoothing * (lse - mean_x);
+  }
+  j->loss[r] = nll;
+}
+
+fn causal_row(j: RowJob*, r: int64) {
+  var n: int64 = j->cols;
+  var x: float32* = j->x + r * n;
+  var y: float32* = j->y + r * n;
+  var q: int64 = r % j->q_len;
+  var visible: int64 = q + (j->k_len - j->q_len) + 1;
+  if (visible > n) { visible = n; }
+  if (visible < 1) {
+    zero_f32(y, n);
+    return;
+  }
+  softmax_row(y, x, visible);
+  if (visible < n) { zero_f32(y + visible, n - visible); }
+}
+
+@noinline fn row_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RowJob* = (RowJob*)ctx;
+  for task: int64 in lo..hi {
+    var r0: int64 = task * ROWS_PER_TASK;
+    var r1: int64 = r0 + ROWS_PER_TASK;
+    if (r1 > j->rows) { r1 = j->rows; }
+    var n: int64 = j->cols;
+    for r: int64 in r0..r1 {
+      switch (j->kind) {
+        case 0: { softmax_row(j->y + r * n, j->x + r * n, n); }
+        case 1: { log_softmax_row(j->y + r * n, j->x + r * n, n); }
+        case 2: { causal_row(j, r); }
+        case 3: {
+          var y: float32* = j->y + r * n;
+          var dy: float32* = j->dy + r * n;
+          var dx: float32* = j->dx + r * n;
+          var s: float32 = dot_f32(dy, y, n);
+          for i: int64 in 0..n { dx[i] = dx[i] + y[i] * (dy[i] - s); }
+        }
+        case 4: {
+          var y: float32* = j->y + r * n;
+          var dy: float32* = j->dy + r * n;
+          var dx: float32* = j->dx + r * n;
+          var s: float32 = sum_f32(dy, n);
+          for i: int64 in 0..n { dx[i] = dx[i] + dy[i] - exp_f32(y[i]) * s; }
+        }
+        case 5: { xent_row(j, r); }
+        case 6: { layer_norm_row(j, r); }
+        case 7: { layer_norm_back_row(j, r); }
+        case 8: { rms_norm_row(j, r); }
+        case 9: { rms_norm_back_row(j, r); }
+        default: {}
+      }
+    }
+  }
+  return 0;
+}
+
+fn run_rows(j: RowJob*, cost_per_value: int64) {
+  var tasks: int64 = (j->rows + ROWS_PER_TASK - 1) / ROWS_PER_TASK;
+  run_parallel(&row_tasks, (rawptr)j, tasks, ROWS_PER_TASK * j->cols * cost_per_value);
+}
+
+fn softmax_kind(x: Var, op: int32, kind: int32) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  if (kind == K_CAUSAL && s.rank < 2) { mmll_fail("causal_softmax needs [..., queries, keys], got {s.text()}"); }
+  var id: int32 = g->push(op, x.id, -1, -1, s);
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var j: RowJob* = new RowJob;
+  j->kind = kind;
+  j->cols = s.last();
+  j->rows = s.rows();
+  j->x = g->data(x.id);
+  j->y = g->data(id);
+  if (kind == K_CAUSAL) {
+    j->q_len = s.dims[s.rank - 2];
+    j->k_len = s.dims[s.rank - 1];
+  }
+  run_rows(j, 16);
+  free((rawptr)j);
+  return { g: g, id: id };
+}
+
+export fn Var_softmax(x: Var) -> Var { return softmax_kind(x, OP_SOFTMAX, K_SOFTMAX); }
+export fn Var_log_softmax(x: Var) -> Var { return softmax_kind(x, OP_LOG_SOFTMAX, K_LOG_SOFTMAX); }
+export fn Var_causal_softmax(x: Var) -> Var { return softmax_kind(x, OP_CAUSAL_SOFTMAX, K_CAUSAL); }
+
+export fn backward_softmax(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var j: RowJob* = new RowJob;
+  j->kind = if (n->op == OP_LOG_SOFTMAX) K_LOG_SOFTMAX_BACK else K_SOFTMAX_BACK;
+  j->cols = n->value.shape.last();
+  j->rows = n->value.shape.rows();
+  j->y = n->value.data;
+  j->dy = n->grad;
+  j->dx = g->grad_of(n->a);
+  run_rows(j, 8);
+  free((rawptr)j);
+}
+
+export fn cross_entropy(logits: Var, targets: int32*, smoothing: float64) -> Var {
+  var g: Graph* = logits.g;
+  var s: Shape = logits.shape();
+  var rows: int64 = s.rows();
+  var cols: int64 = s.last();
+  var id: int32 = g->push(OP_CROSS_ENTROPY, logits.id, -1, -1, shape_scalar());
+  var counted: int64 = 0;
+  for r: int64 in 0..rows {
+    var t: int32 = targets[r];
+    if (t >= 0) { counted = counted + 1; }
+    if ((int64)t >= cols) { mmll_fail("target {t} is outside {cols} classes"); }
+  }
+  var tcopy: int32* = g->index_from(targets, rows);
+  var probs: float32* = g->floats(if (rows * cols < 1) 1 else rows * cols);
+  var losses: float32* = g->floats(if (rows < 1) 1 else rows);
+  var node: Node* = g->node(id);
+  node->saved = probs;
+  node->saved2 = losses;
+  node->ints = tcopy;
+  node->i0 = counted;
+  node->f0 = (float32)smoothing;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var j: RowJob* = new RowJob;
+  j->kind = K_XENT;
+  j->rows = rows;
+  j->cols = cols;
+  j->x = g->data(logits.id);
+  j->y = probs;
+  j->loss = losses;
+  j->targets = tcopy;
+  j->smoothing = (float32)smoothing;
+  run_rows(j, 16);
+  free((rawptr)j);
+  var total: float64 = 0.0;
+  for r: int64 in 0..rows { total = total + (float64)losses[r]; }
+  node = g->node(id);
+  node->value.data[0] = (float32)(total / (float64)(if (counted < 1) 1 else counted));
+  return { g: g, id: id };
+}
+
+export fn backward_cross_entropy(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var s: Shape = g->nodes[n->a].value.shape;
+  var rows: int64 = s.rows();
+  var cols: int64 = s.last();
+  var counted: int64 = if (n->i0 < 1) 1 else n->i0;
+  var scale: float32 = n->grad[0] * (float32)(1.0 / (float64)counted);
+  var eps: float32 = n->f0;
+  var one: float32 = 1.0;
+  var off: float32 = eps * (float32)(1.0 / (float64)cols);
+  var probs: float32* = n->saved;
+  var targets: int32* = n->ints;
+  var dx: float32* = g->grad_of(n->a);
+  for r: int64 in 0..rows {
+    var t: int32 = targets[r];
+    if (t < 0) { continue; }
+    var p: float32* = probs + r * cols;
+    var d: float32* = dx + r * cols;
+    for c: int64 in 0..cols { d[c] = d[c] + scale * (p[c] - off); }
+    d[t] = d[t] - scale * (one - eps);
+  }
+}
+
+export fn mse_loss(a: Var, b: Var) -> Var {
+  var g: Graph* = a.g;
+  if (!a.shape().equal(b.shape())) { mmll_fail("mse_loss of {a.shape().text()} and {b.shape().text()}"); }
+  var n: int64 = a.size();
+  var id: int32 = g->push(OP_MSE, a.id, b.id, -1, shape_scalar());
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var pa: float32* = g->data(a.id);
+  var pb: float32* = g->data(b.id);
+  var total: float64 = 0.0;
+  for i: int64 in 0..n {
+    var d: float64 = (float64)pa[i] - (float64)pb[i];
+    total = total + d * d;
+  }
+  g->nodes[id].value.data[0] = (float32)(total / (float64)(if (n < 1) 1 else n));
+  return { g: g, id: id };
+}
+
+export fn backward_mse(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var ia: int32 = node->a;
+  var ib: int32 = node->b;
+  var size: int64 = g->nodes[ia].value.shape.size();
+  var scale: float32 = node->grad[0] * (float32)(2.0 / (float64)(if (size < 1) 1 else size));
+  var pa: float32* = g->data(ia);
+  var pb: float32* = g->data(ib);
+  if (g->nodes[ia].requires) {
+    var da: float32* = g->grad_of(ia);
+    for i: int64 in 0..size { da[i] = da[i] + scale * (pa[i] - pb[i]); }
+  }
+  if (g->nodes[ib].requires) {
+    var db: float32* = g->grad_of(ib);
+    for i: int64 in 0..size { db[i] = db[i] - scale * (pa[i] - pb[i]); }
+  }
+}
+
+export fn bce_with_logits(logits: Var, targets: Var) -> Var {
+  var g: Graph* = logits.g;
+  if (!logits.shape().equal(targets.shape())) {
+    mmll_fail("bce_with_logits of {logits.shape().text()} and {targets.shape().text()}");
+  }
+  var n: int64 = logits.size();
+  var id: int32 = g->push(OP_BCE_LOGITS, logits.id, targets.id, -1, shape_scalar());
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var x: float32* = g->data(logits.id);
+  var y: float32* = g->data(targets.id);
+  var total: float64 = 0.0;
+  var zero: float32 = 0.0;
+  var one: float32 = 1.0;
+  for i: int64 in 0..n {
+    var v: float32 = x[i];
+    var a: float32 = if v < zero { -v } else { v };
+    var m: float32 = if v > zero { v } else { zero };
+    total = total + (float64)(m - v * y[i] + log_f32(one + exp_f32(-a)));
+  }
+  g->nodes[id].value.data[0] = (float32)(total / (float64)(if (n < 1) 1 else n));
+  return { g: g, id: id };
+}
+
+export fn backward_bce(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var ia: int32 = node->a;
+  var ib: int32 = node->b;
+  var size: int64 = g->nodes[ia].value.shape.size();
+  var scale: float32 = node->grad[0] * (float32)(1.0 / (float64)(if (size < 1) 1 else size));
+  var x: float32* = g->data(ia);
+  var y: float32* = g->data(ib);
+  if (g->nodes[ia].requires) {
+    var dx: float32* = g->grad_of(ia);
+    for i: int64 in 0..size { dx[i] = dx[i] + scale * (sigmoid_f32(x[i]) - y[i]); }
+  }
+  if (g->nodes[ib].requires) {
+    var dyt: float32* = g->grad_of(ib);
+    for i: int64 in 0..size { dyt[i] = dyt[i] - scale * x[i]; }
+  }
+}
+
+fn norm_any(x: Var, gamma_id: int32, beta_id: int32, eps: float64, rms: bool) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  var cols: int64 = s.last();
+  if (gamma_id >= 0 && g->nodes[gamma_id].value.shape.size() != cols) {
+    mmll_fail("a norm over {cols} features needs {cols} scales, got {g->nodes[gamma_id].value.shape.text()}");
+  }
+  if (beta_id >= 0 && g->nodes[beta_id].value.shape.size() != cols) {
+    mmll_fail("a norm over {cols} features needs {cols} shifts");
+  }
+  var op: int32 = if (rms) OP_RMS_NORM else OP_LAYER_NORM;
+  var id: int32 = g->push(op, x.id, gamma_id, beta_id, s);
+  var rows: int64 = s.rows();
+  var mean: float32* = g->floats(if (rows < 1) 1 else rows);
+  var rstd: float32* = g->floats(if (rows < 1) 1 else rows);
+  var node: Node* = g->node(id);
+  node->saved = mean;
+  node->saved2 = rstd;
+  node->f0 = (float32)eps;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var j: RowJob* = new RowJob;
+  j->kind = if (rms) K_RMS_NORM else K_LAYER_NORM;
+  j->rows = rows;
+  j->cols = cols;
+  j->x = g->data(x.id);
+  j->y = g->data(id);
+  j->gamma = if gamma_id >= 0 { g->data(gamma_id) } else { (float32*)0 };
+  j->beta = if beta_id >= 0 { g->data(beta_id) } else { (float32*)0 };
+  j->mean = mean;
+  j->rstd = rstd;
+  j->eps = (float32)eps;
+  run_rows(j, 6);
+  free((rawptr)j);
+  return { g: g, id: id };
+}
+
+export fn layer_norm(x: Var, gamma: Var, beta: Var, eps: float64) -> Var {
+  return norm_any(x, gamma.id, beta.id, eps, false);
+}
+
+export fn layer_norm_plain(x: Var, eps: float64) -> Var {
+  return norm_any(x, -1, -1, eps, false);
+}
+
+export fn rms_norm(x: Var, gamma: Var, eps: float64) -> Var {
+  return norm_any(x, gamma.id, -1, eps, true);
+}
+
+export fn rms_norm_plain(x: Var, eps: float64) -> Var {
+  return norm_any(x, -1, -1, eps, true);
+}
+
+struct AffineJob {
+  rows: int64;
+  cols: int64;
+  x: float32*;
+  dy: float32*;
+  mean: float32*;
+  rstd: float32*;
+  partial_g: float32*;
+  partial_b: float32*;
+}
+
+@noinline fn affine_partials(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: AffineJob* = (AffineJob*)ctx;
+  var n: int64 = j->cols;
+  for b: int64 in lo..hi {
+    var r0: int64 = b * 64;
+    var r1: int64 = r0 + 64;
+    if (r1 > j->rows) { r1 = j->rows; }
+    var pg: float32* = j->partial_g + b * n;
+    zero_f32(pg, n);
+    var pb: float32* = if j->partial_b == 0 { (float32*)0 } else { j->partial_b + b * n };
+    if (pb != 0) { zero_f32(pb, n); }
+    for r: int64 in r0..r1 {
+      var x: float32* = j->x + r * n;
+      var dy: float32* = j->dy + r * n;
+      var mu: float32 = if j->mean == 0 { (float32)0.0 } else { j->mean[r] };
+      var rs: float32 = j->rstd[r];
+      for i: int64 in 0..n { pg[i] = pg[i] + dy[i] * (x[i] - mu) * rs; }
+      if (pb != 0) { add_into_f32(pb, dy, n); }
+    }
+  }
+  return 0;
+}
+
+export fn backward_norm(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var rms: bool = node->op == OP_RMS_NORM;
+  var ix: int32 = node->a;
+  var ig: int32 = node->b;
+  var ib: int32 = node->c;
+  var s: Shape = node->value.shape;
+  var rows: int64 = s.rows();
+  var cols: int64 = s.last();
+  if (g->nodes[ix].requires) {
+    var j: RowJob* = new RowJob;
+    j->kind = if (rms) K_RMS_NORM_BACK else K_LAYER_NORM_BACK;
+    j->rows = rows;
+    j->cols = cols;
+    j->x = g->data(ix);
+    j->dy = node->grad;
+    j->dx = g->grad_of(ix);
+    j->gamma = if ig >= 0 { g->data(ig) } else { (float32*)0 };
+    j->mean = node->saved;
+    j->rstd = node->saved2;
+    run_rows(j, 10);
+    free((rawptr)j);
+  }
+  var want_g: bool = ig >= 0 && g->nodes[ig].requires;
+  var want_b: bool = ib >= 0 && g->nodes[ib].requires;
+  if (!want_g && !want_b) { return; }
+  var blocks: int64 = (rows + 63) / 64;
+  var a: AffineJob* = new AffineJob;
+  a->rows = rows;
+  a->cols = cols;
+  a->x = g->data(ix);
+  a->dy = node->grad;
+  a->mean = if rms { (float32*)0 } else { node->saved };
+  a->rstd = node->saved2;
+  a->partial_g = g->floats(blocks * cols);
+  a->partial_b = if want_b { g->floats(blocks * cols) } else { (float32*)0 };
+  run_parallel(&affine_partials, (rawptr)a, blocks, 64 * cols * 4);
+  if (want_g) {
+    var dg: float32* = g->grad_of(ig);
+    for b: int64 in 0..blocks { add_into_f32(dg, a->partial_g + b * cols, cols); }
+  }
+  if (want_b) {
+    var db: float32* = g->grad_of(ib);
+    for b: int64 in 0..blocks { add_into_f32(db, a->partial_b + b * cols, cols); }
+  }
+  free((rawptr)a);
+}
+
+export fn keep_hash(key: uint64, index: int64) -> uint64 {
+  var z: uint64 = key + (uint64)index * (uint64)0x9E3779B97F4A7C15;
+  z = (z ^ (z >> (uint64)30)) * (uint64)0xBF58476D1CE4E5B9;
+  z = (z ^ (z >> (uint64)27)) * (uint64)0x94D049BB133111EB;
+  return (z ^ (z >> (uint64)31)) >> (uint64)11;
+}
+
+export fn drop_threshold(p: float64) -> uint64 {
+  return (uint64)(int64)(p * 9007199254740992.0);
+}
+
+struct DropJob {
+  src: float32*;
+  dst: float32*;
+  n: int64;
+  key: uint64;
+  threshold: uint64;
+  keep: float32;
+  accumulate: bool;
+}
+
+const DROP_CHUNK = 16384;
+
+@noinline fn drop_chunks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: DropJob* = (DropJob*)ctx;
+  var zero: float32 = 0.0;
+  for c: int64 in lo..hi {
+    var s: int64 = c * DROP_CHUNK;
+    var e: int64 = s + DROP_CHUNK;
+    if (e > j->n) { e = j->n; }
+    if (j->accumulate) {
+      for i: int64 in s..e {
+        var m: float32 = if keep_hash(j->key, i) >= j->threshold { j->keep } else { zero };
+        j->dst[i] = j->dst[i] + j->src[i] * m;
+      }
+    } else {
+      for i: int64 in s..e {
+        var m: float32 = if keep_hash(j->key, i) >= j->threshold { j->keep } else { zero };
+        j->dst[i] = j->src[i] * m;
+      }
+    }
+  }
+  return 0;
+}
+
+fn run_drop(src: float32*, dst: float32*, n: int64, key: uint64, p: float32, accumulate: bool) {
+  var j: DropJob* = new DropJob;
+  j->src = src;
+  j->dst = dst;
+  j->n = n;
+  j->key = key;
+  j->threshold = drop_threshold((float64)p);
+  j->keep = (float32)(1.0 / (1.0 - (float64)p));
+  j->accumulate = accumulate;
+  run_parallel(&drop_chunks, (rawptr)j, (n + DROP_CHUNK - 1) / DROP_CHUNK, DROP_CHUNK * 4);
+  free((rawptr)j);
+}
+
+export fn dropout(x: Var, p: float64) -> Var {
+  var g: Graph* = x.g;
+  if (!g->training || p <= 0.0) { return x; }
+  if (p >= 1.0) { mmll_fail("dropout probability must be below 1, got {p}"); }
+  var s: Shape = x.shape();
+  var n: int64 = s.size();
+  var id: int32 = g->push(OP_DROPOUT, x.id, -1, -1, s);
+  var key: uint64 = (&g->rng)->next();
+  var node: Node* = g->node(id);
+  node->i0 = (int64)key;
+  node->f0 = (float32)p;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  run_drop(g->data(x.id), g->data(id), n, key, (float32)p, false);
+  return { g: g, id: id };
+}
+
+export fn backward_dropout(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  run_drop(n->grad, g->grad_of(n->a), n->value.shape.size(), (uint64)n->i0, n->f0, true);
+}
+
+export fn gather_rows(table: Var, ids: int32*, out: Shape) -> Var {
+  var g: Graph* = table.g;
+  var st: Shape = table.shape();
+  if (st.rank != 2) { mmll_fail("gather_rows needs a [rows, width] table, got {st.text()}"); }
+  var width: int64 = st.dims[1];
+  var vocab: int64 = st.dims[0];
+  if (out.last() != width) { mmll_fail("gather_rows into {out.text()}: the last dimension must be {width}"); }
+  var count: int64 = out.rows();
+  var id: int32 = g->push(OP_GATHER_ROWS, table.id, -1, -1, out);
+  for r: int64 in 0..count {
+    var at: int32 = ids[r];
+    if (at < 0 || (int64)at >= vocab) { mmll_fail("row {at} is outside a table of {vocab}"); }
+  }
+  g->nodes[id].ints = g->index_from(ids, count);
+  if (g->on_device()) {
+    if (g->nodes[id].requires) { g->nodes[id].ext = (rawptr)rows_by_id(g, ids, count, vocab); }
+    g->forward_on_device(id);
+    return { g: g, id: id };
+  }
+  var src: float32* = g->data(table.id);
+  var dst: float32* = g->data(id);
+  for r: int64 in 0..count {
+    copy_f32(dst + r * width, src + (int64)ids[r] * width, width);
+  }
+  return { g: g, id: id };
+}
+
+fn rows_by_id(g: Graph*, ids: int32*, count: int64, vocab: int64) -> int32* {
+  var host: int32* = g->ints(count + vocab + 1);
+  var starts: int32* = host + count;
+  for v: int64 in 0..vocab + 1 { starts[v] = 0; }
+  for r: int64 in 0..count { starts[(int64)ids[r] + 1] = starts[(int64)ids[r] + 1] + 1; }
+  for v: int64 in 0..vocab { starts[v + 1] = starts[v + 1] + starts[v]; }
+  var fill: int32* = g->ints(if (vocab < 1) 1 else vocab);
+  for v: int64 in 0..vocab { fill[v] = starts[v]; }
+  for r: int64 in 0..count {
+    var v: int64 = (int64)ids[r];
+    host[fill[v]] = (int32)r;
+    fill[v] = fill[v] + 1;
+  }
+  return g->index_from(host, count + vocab + 1);
+}
+
+export fn embedding(table: Var, ids: int32*, dims: int64[..]) -> Var {
+  var s: Shape;
+  s.rank = (int32)dims.length + 1;
+  for i in 0..dims.length { s.dims[i] = dims[i]; }
+  s.dims[dims.length] = table.shape().dims[1];
+  return gather_rows(table, ids, s);
+}
+
+export fn backward_gather_rows(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var width: int64 = n->value.shape.last();
+  var count: int64 = n->value.shape.rows();
+  var ids: int32* = n->ints;
+  var dy: float32* = n->grad;
+  var dt: float32* = g->grad_of(n->a);
+  for r: int64 in 0..count {
+    add_into_f32(dt + (int64)ids[r] * width, dy + r * width, width);
+  }
+}

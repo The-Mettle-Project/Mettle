@@ -1,0 +1,360 @@
+import "std/mem";
+import "./mmll";
+
+fn random_tensor(s: Shape, seed: uint64, lo: float64, hi: float64) -> Tensor {
+  var t: Tensor = tensor_new(s);
+  var r: Rng = rng_new(seed);
+  tensor_uniform(t, &r, lo, hi);
+  return t;
+}
+
+fn spread_out(t: Tensor, seed: uint64) {
+  var n: int64 = t.shape.size();
+  var r: Rng = rng_new(seed);
+  var rp: Rng* = &r;
+  for i: int64 in 0..n { t.data[i] = (float32)(-1.0 + 2.0 * (float64)i / (float64)n); }
+  var i: int64 = n - 1;
+  while (i > 0) {
+    var j: int64 = rp->below(i + 1);
+    var keep: float32 = t.data[i];
+    t.data[i] = t.data[j];
+    t.data[j] = keep;
+    i = i - 1;
+  }
+}
+
+fn check_spread(build: fn(Graph*, Var*) -> Var, a: Shape) -> int32 {
+  var ins: Tensor* = (Tensor*)malloc(sizeof(Tensor));
+  ins[0] = tensor_new(a);
+  spread_out(ins[0], 5);
+  var worst: float64 = gradcheck(build, ins, 1, 1.0e-3, 3.0e-3);
+  tensor_free(&ins[0]);
+  free((rawptr)ins);
+  if (worst > 3.0e-3) { return 1; }
+  return 0;
+}
+
+fn away_from_zero(t: Tensor) {
+  for i: int64 in 0..t.shape.size() {
+    var v: float32 = t.data[i];
+    if (v > (float32)-0.05 && v < (float32)0.05) { t.data[i] = if v < (float32)0.0 { (float32)-0.2 } else { (float32)0.2 }; }
+  }
+}
+
+fn check1(build: fn(Graph*, Var*) -> Var, a: Shape, lo: float64, hi: float64, eps: float64, tol: float64, kink: bool) -> int32 {
+  var ins: Tensor* = (Tensor*)malloc(sizeof(Tensor));
+  ins[0] = random_tensor(a, 11, lo, hi);
+  if (kink) { away_from_zero(ins[0]); }
+  var worst: float64 = gradcheck(build, ins, 1, eps, tol);
+  tensor_free(&ins[0]);
+  free((rawptr)ins);
+  if (worst > tol) {
+    println("gradient off by {worst}");
+    return 1;
+  }
+  return 0;
+}
+
+fn check2(build: fn(Graph*, Var*) -> Var, a: Shape, b: Shape, lo: float64, hi: float64, tol: float64) -> int32 {
+  var ins: Tensor* = (Tensor*)malloc(2 * sizeof(Tensor));
+  ins[0] = random_tensor(a, 11, lo, hi);
+  ins[1] = random_tensor(b, 23, lo, hi);
+  var worst: float64 = gradcheck(build, ins, 2, 1.0e-2, tol);
+  tensor_free(&ins[0]);
+  tensor_free(&ins[1]);
+  free((rawptr)ins);
+  if (worst > tol) {
+    println("gradient off by {worst}");
+    return 1;
+  }
+  return 0;
+}
+
+fn check3(build: fn(Graph*, Var*) -> Var, a: Shape, b: Shape, c: Shape, tol: float64) -> int32 {
+  var ins: Tensor* = (Tensor*)malloc(3 * sizeof(Tensor));
+  ins[0] = random_tensor(a, 11, -1.0, 1.0);
+  ins[1] = random_tensor(b, 23, -1.0, 1.0);
+  ins[2] = random_tensor(c, 37, -1.0, 1.0);
+  var worst: float64 = gradcheck(build, ins, 3, 1.0e-2, tol);
+  for i in 0..3 { tensor_free(&ins[i]); }
+  free((rawptr)ins);
+  if (worst > tol) {
+    println("gradient off by {worst}");
+    return 1;
+  }
+  return 0;
+}
+
+fn f_add(g: Graph*, v: Var*) -> Var { return v[0].add(v[1]); }
+fn f_sub(g: Graph*, v: Var*) -> Var { return v[0].sub(v[1]); }
+fn f_mul(g: Graph*, v: Var*) -> Var { return v[0].mul(v[1]); }
+fn f_div(g: Graph*, v: Var*) -> Var { return v[0].div(v[1].abs().shift(0.5)); }
+
+@test fn grad_binary_same_shape() -> int32 {
+  var s: Shape = shape(3, 4);
+  if (check2(&f_add, s, s, -1.0, 1.0, 3.0e-3) != 0) { return 1; }
+  if (check2(&f_sub, s, s, -1.0, 1.0, 3.0e-3) != 0) { return 2; }
+  if (check2(&f_mul, s, s, -1.0, 1.0, 3.0e-3) != 0) { return 3; }
+  if (check2(&f_div, s, s, -1.0, 1.0, 3.0e-3) != 0) { return 4; }
+  return 0;
+}
+
+@test fn grad_binary_broadcast() -> int32 {
+  if (check2(&f_add, shape(2, 3, 4), shape(4), -1.0, 1.0, 3.0e-3) != 0) { return 1; }
+  if (check2(&f_mul, shape(2, 1, 4), shape(3, 1), -1.0, 1.0, 3.0e-3) != 0) { return 2; }
+  if (check2(&f_sub, shape(1, 3), shape(2, 1, 1), -1.0, 1.0, 3.0e-3) != 0) { return 3; }
+  if (check2(&f_div, shape(2, 3), shape(1), -1.0, 1.0, 3.0e-3) != 0) { return 4; }
+  return 0;
+}
+
+fn f_neg(g: Graph*, v: Var*) -> Var { return v[0].neg(); }
+fn f_exp(g: Graph*, v: Var*) -> Var { return v[0].exp(); }
+fn f_log(g: Graph*, v: Var*) -> Var { return v[0].log(); }
+fn f_sqrt(g: Graph*, v: Var*) -> Var { return v[0].sqrt(); }
+fn f_tanh(g: Graph*, v: Var*) -> Var { return v[0].tanh(); }
+fn f_sigmoid(g: Graph*, v: Var*) -> Var { return v[0].sigmoid(); }
+fn f_relu(g: Graph*, v: Var*) -> Var { return v[0].relu(); }
+fn f_leaky(g: Graph*, v: Var*) -> Var { return v[0].leaky_relu(0.1); }
+fn f_gelu(g: Graph*, v: Var*) -> Var { return v[0].gelu(); }
+fn f_gelu_tanh(g: Graph*, v: Var*) -> Var { return v[0].gelu_tanh(); }
+fn f_silu(g: Graph*, v: Var*) -> Var { return v[0].silu(); }
+fn f_softplus(g: Graph*, v: Var*) -> Var { return v[0].softplus(); }
+fn f_abs(g: Graph*, v: Var*) -> Var { return v[0].abs(); }
+fn f_clamp(g: Graph*, v: Var*) -> Var { return v[0].clamp(-0.5, 0.6); }
+fn f_square(g: Graph*, v: Var*) -> Var { return v[0].square(); }
+fn f_shift(g: Graph*, v: Var*) -> Var { return v[0].shift(0.3).scale(-1.7); }
+fn f_pow(g: Graph*, v: Var*) -> Var { return v[0].pow(1.5); }
+
+@test fn grad_unary() -> int32 {
+  var s: Shape = shape(2, 5);
+  if (check1(&f_neg, s, -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 1; }
+  if (check1(&f_exp, s, -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 2; }
+  if (check1(&f_log, s, 0.5, 3.0, 1.0e-2, 3.0e-3, false) != 0) { return 3; }
+  if (check1(&f_sqrt, s, 0.5, 3.0, 1.0e-2, 3.0e-3, false) != 0) { return 4; }
+  if (check1(&f_tanh, s, -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 5; }
+  if (check1(&f_sigmoid, s, -3.0, 3.0, 1.0e-2, 3.0e-3, false) != 0) { return 6; }
+  if (check1(&f_relu, s, -2.0, 2.0, 1.0e-2, 3.0e-3, true) != 0) { return 7; }
+  if (check1(&f_leaky, s, -2.0, 2.0, 1.0e-2, 3.0e-3, true) != 0) { return 8; }
+  if (check1(&f_gelu, s, -3.0, 3.0, 1.0e-2, 3.0e-3, false) != 0) { return 9; }
+  if (check1(&f_gelu_tanh, s, -3.0, 3.0, 1.0e-2, 3.0e-3, false) != 0) { return 10; }
+  if (check1(&f_silu, s, -3.0, 3.0, 1.0e-2, 3.0e-3, false) != 0) { return 11; }
+  if (check1(&f_softplus, s, -3.0, 3.0, 1.0e-2, 3.0e-3, false) != 0) { return 12; }
+  if (check1(&f_abs, s, -2.0, 2.0, 1.0e-2, 3.0e-3, true) != 0) { return 13; }
+  if (check1(&f_clamp, s, -0.4, 0.5, 1.0e-2, 3.0e-3, false) != 0) { return 14; }
+  if (check1(&f_square, s, -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 15; }
+  if (check1(&f_shift, s, -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 16; }
+  if (check1(&f_pow, s, 0.5, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 17; }
+  return 0;
+}
+
+fn f_sum(g: Graph*, v: Var*) -> Var { return v[0].sum(); }
+fn f_mean(g: Graph*, v: Var*) -> Var { return v[0].mean(); }
+fn f_sum0(g: Graph*, v: Var*) -> Var { return v[0].sum_axis(0, false); }
+fn f_sum1k(g: Graph*, v: Var*) -> Var { return v[0].sum_axis(1, true); }
+fn f_mean2(g: Graph*, v: Var*) -> Var { return v[0].mean_axis(-1, false); }
+fn f_max1(g: Graph*, v: Var*) -> Var { return v[0].max_axis(1, false); }
+
+@test fn grad_reductions() -> int32 {
+  var s: Shape = shape(2, 3, 4);
+  if (check1(&f_sum, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 1; }
+  if (check1(&f_mean, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 2; }
+  if (check1(&f_sum0, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 3; }
+  if (check1(&f_sum1k, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 4; }
+  if (check1(&f_mean2, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 5; }
+  if (check_spread(&f_max1, s) != 0) { return 6; }
+  return 0;
+}
+
+fn f_reshape(g: Graph*, v: Var*) -> Var { return v[0].view(4, -1).mul(v[0].view(4, 6)); }
+fn f_t01(g: Graph*, v: Var*) -> Var { return v[0].transpose(0, 1); }
+fn f_t12(g: Graph*, v: Var*) -> Var { return v[0].transpose(1, 2); }
+fn f_t02(g: Graph*, v: Var*) -> Var { return v[0].transpose(0, 2); }
+fn f_slice(g: Graph*, v: Var*) -> Var { return v[0].slice(1, 1, 2); }
+fn f_concat(g: Graph*, v: Var*) -> Var { return concat(v[0], v[1], 1); }
+
+@test fn grad_shape_ops() -> int32 {
+  var s: Shape = shape(2, 3, 4);
+  if (check1(&f_reshape, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 1; }
+  if (check1(&f_t01, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 2; }
+  if (check1(&f_t12, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 3; }
+  if (check1(&f_t02, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 4; }
+  if (check1(&f_slice, s, -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 5; }
+  if (check2(&f_concat, s, shape(2, 2, 4), -1.0, 1.0, 3.0e-3) != 0) { return 6; }
+  return 0;
+}
+
+fn f_matmul(g: Graph*, v: Var*) -> Var { return v[0].matmul(v[1]); }
+fn f_matmul_t(g: Graph*, v: Var*) -> Var { return v[0].matmul_t(v[1]); }
+fn f_linear(g: Graph*, v: Var*) -> Var { return linear(v[0], v[1], v[2]); }
+
+@test fn grad_matmul() -> int32 {
+  if (check2(&f_matmul, shape(3, 4), shape(4, 5), -1.0, 1.0, 3.0e-3) != 0) { return 1; }
+  if (check2(&f_matmul, shape(2, 3, 4), shape(4, 2), -1.0, 1.0, 3.0e-3) != 0) { return 2; }
+  if (check2(&f_matmul, shape(2, 3, 4), shape(2, 4, 2), -1.0, 1.0, 3.0e-3) != 0) { return 3; }
+  if (check2(&f_matmul_t, shape(3, 4), shape(5, 4), -1.0, 1.0, 3.0e-3) != 0) { return 4; }
+  if (check2(&f_matmul_t, shape(2, 3, 4), shape(2, 5, 4), -1.0, 1.0, 3.0e-3) != 0) { return 5; }
+  if (check3(&f_linear, shape(2, 3, 4), shape(5, 4), shape(5), 3.0e-3) != 0) { return 6; }
+  return 0;
+}
+
+fn f_softmax(g: Graph*, v: Var*) -> Var { return v[0].softmax(); }
+fn f_log_softmax(g: Graph*, v: Var*) -> Var { return v[0].log_softmax(); }
+fn f_causal(g: Graph*, v: Var*) -> Var { return v[0].causal_softmax(); }
+
+fn f_xent(g: Graph*, v: Var*) -> Var {
+  var t: int32* = g->ints(4);
+  t[0] = 2;
+  t[1] = 0;
+  t[2] = -1;
+  t[3] = 4;
+  return cross_entropy(v[0], t, 0.0);
+}
+
+fn f_xent_smooth(g: Graph*, v: Var*) -> Var {
+  var t: int32* = g->ints(4);
+  t[0] = 1;
+  t[1] = 3;
+  t[2] = 0;
+  t[3] = 4;
+  return cross_entropy(v[0], t, 0.1);
+}
+
+fn f_mse(g: Graph*, v: Var*) -> Var { return mse_loss(v[0], v[1]); }
+fn f_bce(g: Graph*, v: Var*) -> Var { return bce_with_logits(v[0], v[1].sigmoid()); }
+
+@test fn grad_softmax_and_losses() -> int32 {
+  if (check1(&f_softmax, shape(3, 5), -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 1; }
+  if (check1(&f_log_softmax, shape(3, 5), -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 2; }
+  if (check1(&f_causal, shape(2, 4, 4), -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 3; }
+  if (check1(&f_causal, shape(2, 3, 5), -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 4; }
+  if (check1(&f_xent, shape(4, 5), -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 5; }
+  if (check1(&f_xent_smooth, shape(2, 2, 5), -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 6; }
+  if (check2(&f_mse, shape(3, 4), shape(3, 4), -1.0, 1.0, 3.0e-3) != 0) { return 7; }
+  if (check2(&f_bce, shape(3, 4), shape(3, 4), -2.0, 2.0, 3.0e-3) != 0) { return 8; }
+  return 0;
+}
+
+fn f_layer_norm(g: Graph*, v: Var*) -> Var { return layer_norm(v[0], v[1], v[2], 1.0e-5); }
+fn f_layer_norm_plain(g: Graph*, v: Var*) -> Var { return layer_norm_plain(v[0], 1.0e-5); }
+fn f_rms_norm(g: Graph*, v: Var*) -> Var { return rms_norm(v[0], v[1], 1.0e-6); }
+fn f_rms_plain(g: Graph*, v: Var*) -> Var { return rms_norm_plain(v[0], 1.0e-6); }
+
+@test fn grad_norms() -> int32 {
+  if (check3(&f_layer_norm, shape(3, 6), shape(6), shape(6), 3.0e-3) != 0) { return 1; }
+  if (check1(&f_layer_norm_plain, shape(2, 2, 5), -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 2; }
+  if (check2(&f_rms_norm, shape(3, 6), shape(6), -1.0, 1.0, 3.0e-3) != 0) { return 3; }
+  if (check1(&f_rms_plain, shape(4, 5), -2.0, 2.0, 1.0e-2, 3.0e-3, false) != 0) { return 4; }
+  return 0;
+}
+
+fn f_gather(g: Graph*, v: Var*) -> Var {
+  var ids: int32* = g->ints(5);
+  ids[0] = 3;
+  ids[1] = 0;
+  ids[2] = 3;
+  ids[3] = 1;
+  ids[4] = 2;
+  return embedding(v[0], ids, 5).square();
+}
+
+fn f_dropout(g: Graph*, v: Var*) -> Var { return dropout(v[0], 0.3); }
+
+@test fn grad_embedding_and_dropout() -> int32 {
+  if (check1(&f_gather, shape(4, 3), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 1; }
+  if (check1(&f_dropout, shape(4, 6), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 2; }
+  return 0;
+}
+
+fn f_conv(g: Graph*, v: Var*) -> Var { return conv2d(v[0], v[1], v[2], 1, 1); }
+fn f_conv_stride(g: Graph*, v: Var*) -> Var { return conv2d(v[0], v[1], v[2], 2, 1); }
+fn f_conv_dilated(g: Graph*, v: Var*) -> Var { return conv2d_dilated(v[0], v[1], v[2], 1, 2, 2); }
+fn f_max_pool(g: Graph*, v: Var*) -> Var { return max_pool2d(v[0], 2, 2, 0); }
+fn f_max_pool_pad(g: Graph*, v: Var*) -> Var { return max_pool2d(v[0], 3, 2, 1); }
+fn f_avg_pool(g: Graph*, v: Var*) -> Var { return avg_pool2d(v[0], 2, 1, 0); }
+fn f_global(g: Graph*, v: Var*) -> Var { return global_avg_pool(v[0]); }
+fn f_batch_norm(g: Graph*, v: Var*) -> Var { return batch_norm(v[0], v[1], v[2], (float32*)0, (float32*)0, 0.1, 1.0e-5); }
+
+@test fn grad_conv() -> int32 {
+  return check3(&f_conv, shape(1, 2, 4, 4), shape(2, 2, 3, 3), shape(2), 3.0e-3);
+}
+
+@test fn grad_conv_stride() -> int32 {
+  return check3(&f_conv_stride, shape(1, 1, 5, 5), shape(2, 1, 3, 3), shape(2), 3.0e-3);
+}
+
+@test fn grad_conv_dilated() -> int32 {
+  return check3(&f_conv_dilated, shape(1, 1, 5, 5), shape(1, 1, 3, 3), shape(1), 3.0e-3);
+}
+
+@test fn grad_pool_and_batch_norm() -> int32 {
+  if (check_spread(&f_max_pool, shape(2, 2, 4, 4)) != 0) { return 4; }
+  if (check_spread(&f_max_pool_pad, shape(1, 2, 5, 5)) != 0) { return 5; }
+  if (check1(&f_avg_pool, shape(1, 2, 3, 4), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 6; }
+  if (check1(&f_global, shape(2, 3, 2, 2), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 7; }
+  if (check3(&f_batch_norm, shape(3, 2, 2, 2), shape(2), shape(2), 3.0e-3) != 0) { return 8; }
+  if (check3(&f_batch_norm, shape(4, 3), shape(3), shape(3), 3.0e-3) != 0) { return 9; }
+  return 0;
+}
+
+fn f_attn_causal(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, true, 0.0); }
+fn f_attn_full(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 3, false, 0.0); }
+fn f_attn_drop(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, true, 0.25); }
+fn f_attn_unfused_drop(g: Graph*, v: Var*) -> Var { return attention_composed(v[0], 2, true, 0.0); }
+
+@test fn grad_self_attention() -> int32 {
+  if (check1(&f_attn_causal, shape(2, 4, 12), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 1; }
+  if (check1(&f_attn_full, shape(1, 3, 18), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 2; }
+  if (check1(&f_attn_drop, shape(1, 5, 12), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 3; }
+  return 0;
+}
+
+fn f_rope(g: Graph*, v: Var*) -> Var { return qk_norm_rope(v[0], 2, 100.0, 0).square(); }
+fn f_rope_offset(g: Graph*, v: Var*) -> Var { return qk_norm_rope(v[0], 1, 10.0, 3).mul(qk_norm_rope(v[0], 1, 10.0, 3)).tanh(); }
+
+@test fn grad_qk_norm_rope() -> int32 {
+  if (check1(&f_rope, shape(2, 3, 24), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 1; }
+  if (check1(&f_rope_offset, shape(4, 12), -1.0, 1.0, 1.0e-2, 3.0e-3, false) != 0) { return 2; }
+  return 0;
+}
+
+@test fn muon_orthogonalizes() -> int32 {
+  var rows: int64 = 8;
+  var cols: int64 = 24;
+  var x: Tensor = random_tensor(shape(2, rows, cols), 5, -1.0, 1.0);
+  orthogonalize_cpu(x.data, 2, rows, cols, 5);
+  var worst: float64 = 0.0;
+  for z: int64 in 0..2 {
+    var base: float32* = x.data + z * rows * cols;
+    for i: int64 in 0..rows {
+      for j: int64 in 0..rows {
+        var s: float64 = 0.0;
+        for c: int64 in 0..cols { s = s + (float64)base[i * cols + c] * (float64)base[j * cols + c]; }
+        var want: float64 = if i == j { 1.0 } else { 0.0 };
+        var d: float64 = s - want;
+        if (d < 0.0) { d = -d; }
+        if (d > worst) { worst = d; }
+      }
+    }
+  }
+  tensor_free(&x);
+  if (worst > 0.35) { return 1; }
+  return 0;
+}
+
+@test fn fused_attention_equals_composed() -> int32 {
+  var x: Tensor = random_tensor(shape(2, 5, 12), 3, -1.0, 1.0);
+  var g: Graph* = graph_new();
+  var v: Var = g->input(x);
+  var a: Var = self_attention(v, 2, true, 0.0);
+  var b: Var = attention_composed(v, 2, true, 0.0);
+  var worst: float32 = 0.0;
+  for i: int64 in 0..a.size() {
+    var d: float32 = a.data()[i] - b.data()[i];
+    if (d < (float32)0.0) { d = -d; }
+    if (d > worst) { worst = d; }
+  }
+  graph_free(g);
+  tensor_free(&x);
+  if (worst > (float32)1.0e-6) { return 1; }
+  return 0;
+}

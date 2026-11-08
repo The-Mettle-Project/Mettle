@@ -1,0 +1,295 @@
+import "std/io";
+import "std/mem";
+import "../mmll";
+import "../gpu";
+
+struct Case {
+  name: string;
+  build: fn(Graph*, Var*) -> Var;
+  shapes: Shape[4];
+  count: int32;
+  positive: bool;
+  tolerance: float64;
+}
+
+fn run_side(g: Graph*, c: Case, inputs: Tensor*, seed: Tensor*, out_value: Tensor*, grads: Tensor*) {
+  var vars: Var[4];
+  for i in 0..c.count { vars[i] = g->variable(inputs[i]); }
+  var out: Var = c.build(g, &vars[0]);
+  *out_value = out.fetch();
+  if (seed->data == 0) {
+    *seed = tensor_new(out.shape());
+    var rng: Rng = rng_new(7);
+    tensor_normal(*seed, &rng, 0.0, 1.0);
+  }
+  out.backward_with(*seed);
+  for i in 0..c.count { grads[i] = vars[i].fetch_grad(); }
+}
+
+fn worst(a: Tensor, b: Tensor) -> float64 {
+  var scale: float64 = 1.0e-3;
+  var n: int64 = a.shape.size();
+  for i: int64 in 0..n {
+    var v: float64 = (float64)a.data[i];
+    if (v < 0.0) { v = -v; }
+    if (v > scale) { scale = v; }
+  }
+  var err: float64 = 0.0;
+  for i: int64 in 0..n {
+    var d: float64 = (float64)a.data[i] - (float64)b.data[i];
+    if (d < 0.0) { d = -d; }
+    if (d > err) { err = d; }
+  }
+  return err / scale;
+}
+
+fn check(dev: Device*, c: Case) -> bool {
+  var rng: Rng = rng_new(11);
+  var inputs: Tensor[4];
+  for i in 0..c.count {
+    inputs[i] = tensor_new(c.shapes[i]);
+    tensor_normal(inputs[i], &rng, 0.0, 1.0);
+    if (c.positive) {
+      for k: int64 in 0..inputs[i].shape.size() {
+        var v: float32 = inputs[i].data[k];
+        inputs[i].data[k] = (if v < (float32)0.0 { -v } else { v }) + (float32)0.5;
+      }
+    }
+  }
+  var seed: Tensor;
+  seed.data = (float32*)0;
+  var cpu_out: Tensor;
+  var gpu_out: Tensor;
+  var cpu_grads: Tensor[4];
+  var gpu_grads: Tensor[4];
+  var cg: Graph* = graph_new();
+  run_side(cg, c, &inputs[0], &seed, &cpu_out, &cpu_grads[0]);
+  var gg: Graph* = graph_on(dev);
+  run_side(gg, c, &inputs[0], &seed, &gpu_out, &gpu_grads[0]);
+  var err: float64 = worst(cpu_out, gpu_out);
+  var gerr: float64 = 0.0;
+  for i in 0..c.count {
+    var e: float64 = worst(cpu_grads[i], gpu_grads[i]);
+    if (e > gerr) { gerr = e; }
+  }
+  var ok: bool = err < c.tolerance && gerr < c.tolerance;
+  var mark: string = if ok { "ok  " } else { "FAIL" };
+  println("{mark} {c.name}: value {err}, grad {gerr}");
+  graph_free(cg);
+  graph_free(gg);
+  return ok;
+}
+
+fn one(name: string, build: fn(Graph*, Var*) -> Var, a: Shape) -> Case {
+  var c: Case;
+  c.name = name;
+  c.build = build;
+  c.shapes[0] = a;
+  c.count = 1;
+  c.tolerance = 2.0e-5;
+  return c;
+}
+
+fn two(name: string, build: fn(Graph*, Var*) -> Var, a: Shape, b: Shape) -> Case {
+  var c: Case = one(name, build, a);
+  c.shapes[1] = b;
+  c.count = 2;
+  return c;
+}
+
+fn three(name: string, build: fn(Graph*, Var*) -> Var, a: Shape, b: Shape, d: Shape) -> Case {
+  var c: Case = two(name, build, a, b);
+  c.shapes[2] = d;
+  c.count = 3;
+  return c;
+}
+
+fn b_add(g: Graph*, v: Var*) -> Var { return v[0].add(v[1]); }
+fn b_sub(g: Graph*, v: Var*) -> Var { return v[0].sub(v[1]); }
+fn b_mul(g: Graph*, v: Var*) -> Var { return v[0].mul(v[1]); }
+fn b_div(g: Graph*, v: Var*) -> Var { return v[0].div(v[1].abs().shift(0.5)); }
+fn u_neg(g: Graph*, v: Var*) -> Var { return v[0].neg(); }
+fn u_exp(g: Graph*, v: Var*) -> Var { return v[0].exp(); }
+fn u_log(g: Graph*, v: Var*) -> Var { return v[0].log(); }
+fn u_sqrt(g: Graph*, v: Var*) -> Var { return v[0].sqrt(); }
+fn u_tanh(g: Graph*, v: Var*) -> Var { return v[0].tanh(); }
+fn u_sigmoid(g: Graph*, v: Var*) -> Var { return v[0].sigmoid(); }
+fn u_relu(g: Graph*, v: Var*) -> Var { return v[0].relu(); }
+fn u_leaky(g: Graph*, v: Var*) -> Var { return v[0].leaky_relu(0.1); }
+fn u_gelu(g: Graph*, v: Var*) -> Var { return v[0].gelu(); }
+fn u_gelu_tanh(g: Graph*, v: Var*) -> Var { return v[0].gelu_tanh(); }
+fn u_silu(g: Graph*, v: Var*) -> Var { return v[0].silu(); }
+fn u_softplus(g: Graph*, v: Var*) -> Var { return v[0].softplus(); }
+fn u_clamp(g: Graph*, v: Var*) -> Var { return v[0].clamp(-0.5, 0.7); }
+fn u_square(g: Graph*, v: Var*) -> Var { return v[0].square(); }
+fn u_shift_scale(g: Graph*, v: Var*) -> Var { return v[0].shift(0.25).scale(-3.0); }
+fn u_pow(g: Graph*, v: Var*) -> Var { return v[0].pow(1.7); }
+fn r_sum(g: Graph*, v: Var*) -> Var { return v[0].sum(); }
+fn r_mean(g: Graph*, v: Var*) -> Var { return v[0].mean(); }
+fn r_sum_axis(g: Graph*, v: Var*) -> Var { return v[0].sum_axis(1, false); }
+fn r_mean_axis(g: Graph*, v: Var*) -> Var { return v[0].mean_axis(-1, true); }
+fn r_max_axis(g: Graph*, v: Var*) -> Var { return v[0].max_axis(0, false); }
+fn s_transpose(g: Graph*, v: Var*) -> Var { return v[0].transpose(0, 2); }
+fn s_t(g: Graph*, v: Var*) -> Var { return v[0].t(); }
+fn s_slice(g: Graph*, v: Var*) -> Var { return v[0].slice(1, 2, 3); }
+fn s_concat(g: Graph*, v: Var*) -> Var { return concat(v[0], v[1], 1); }
+fn s_view(g: Graph*, v: Var*) -> Var { return v[0].view(6, -1).scale(2.0); }
+fn m_matmul(g: Graph*, v: Var*) -> Var { return v[0].matmul(v[1]); }
+fn m_matmul_t(g: Graph*, v: Var*) -> Var { return v[0].matmul_t(v[1]); }
+fn m_linear(g: Graph*, v: Var*) -> Var { return linear(v[0], v[1], v[2]); }
+fn m_linear_nobias(g: Graph*, v: Var*) -> Var { return linear_nobias(v[0], v[1]); }
+fn n_softmax(g: Graph*, v: Var*) -> Var { return v[0].softmax(); }
+fn n_log_softmax(g: Graph*, v: Var*) -> Var { return v[0].log_softmax(); }
+fn n_causal(g: Graph*, v: Var*) -> Var { return v[0].causal_softmax(); }
+fn n_layer_norm(g: Graph*, v: Var*) -> Var { return layer_norm(v[0], v[1], v[2], 1.0e-5); }
+fn n_rms_norm(g: Graph*, v: Var*) -> Var { return rms_norm(v[0], v[1], 1.0e-5); }
+fn n_layer_plain(g: Graph*, v: Var*) -> Var { return layer_norm_plain(v[0], 1.0e-5); }
+fn n_mse(g: Graph*, v: Var*) -> Var { return mse_loss(v[0], v[1]); }
+fn n_bce(g: Graph*, v: Var*) -> Var { return bce_with_logits(v[0], v[1].sigmoid()); }
+fn n_dropout(g: Graph*, v: Var*) -> Var { return dropout(v[0], 0.3); }
+
+fn n_xent(g: Graph*, v: Var*) -> Var {
+  var targets: int32* = g->ints(37);
+  for i in 0..37 { targets[i] = if i % 9 == 4 { -1 } else { (int32)((i * 7) % 13) }; }
+  return cross_entropy(v[0], targets, 0.1);
+}
+
+fn n_embed(g: Graph*, v: Var*) -> Var {
+  var ids: int32* = g->ints(24);
+  for i in 0..24 { ids[i] = (int32)((i * 5) % 11); }
+  return embedding(v[0], ids, 4, 6);
+}
+
+fn a_attention(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 4, true, 0.2); }
+fn a_attention_full(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, false, 0.0); }
+fn a_flash_causal(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, true, 0.2); }
+fn a_flash_full(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, false, 0.1); }
+fn a_flash_one(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 1, true, 0.0); }
+fn a_tc_causal(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, true, 0.0); }
+fn a_rope(g: Graph*, v: Var*) -> Var { return qk_norm_rope(v[0], 3, 10000.0, 0); }
+fn a_rope_offset(g: Graph*, v: Var*) -> Var { return qk_norm_rope(v[0], 2, 500.0, 7); }
+fn a_rope_attention(g: Graph*, v: Var*) -> Var { return self_attention(qk_norm_rope(v[0], 2, 10000.0, 0), 2, true, 0.0); }
+fn a_rope_32(g: Graph*, v: Var*) -> Var { return self_attention(qk_norm_rope(v[0], 4, 500.0, 0), 4, false, 0.0); }
+fn a_tc_full(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, false, 0.0); }
+fn c_conv(g: Graph*, v: Var*) -> Var { return conv2d(v[0], v[1], v[2], 2, 1); }
+fn c_conv_dilated(g: Graph*, v: Var*) -> Var { return conv2d_dilated(v[0], v[1], v[2], 1, 2, 2); }
+fn c_max_pool(g: Graph*, v: Var*) -> Var { return max_pool2d(v[0], 3, 2, 1); }
+fn c_avg_pool(g: Graph*, v: Var*) -> Var { return avg_pool2d(v[0], 2, 2, 0); }
+
+fn c_batch_norm(g: Graph*, v: Var*) -> Var {
+  return batch_norm(v[0], v[1], v[2], (float32*)0, (float32*)0, 0.1, 1.0e-5);
+}
+
+fn main() -> int32 {
+  var dev: Device* = gpu_device();
+  var cases: Case[96];
+  var n: int32 = 0;
+  cases[n] = two("add", &b_add, shape(4, 5, 6), shape(4, 5, 6)); n = n + 1;
+  cases[n] = two("sub broadcast", &b_sub, shape(4, 5, 6), shape(5, 6)); n = n + 1;
+  cases[n] = two("mul broadcast", &b_mul, shape(4, 5, 6), shape(1, 5, 1)); n = n + 1;
+  cases[n] = two("div broadcast", &b_div, shape(3, 1, 7), shape(5, 1)); n = n + 1;
+  cases[n] = two("add rows of a bias", &b_add, shape(700, 70), shape(70)); n = n + 1;
+  cases[n] = two("add one value", &b_add, shape(9, 13), shape(1)); n = n + 1;
+  cases[n] = two("sub positions", &b_sub, shape(6, 40, 24), shape(1, 40, 24)); n = n + 1;
+  cases[n] = one("neg", &u_neg, shape(300)); n = n + 1;
+  cases[n] = one("exp", &u_exp, shape(300)); n = n + 1;
+  cases[n] = one("tanh", &u_tanh, shape(300)); n = n + 1;
+  cases[n] = one("sigmoid", &u_sigmoid, shape(300)); n = n + 1;
+  cases[n] = one("relu", &u_relu, shape(300)); n = n + 1;
+  cases[n] = one("leaky_relu", &u_leaky, shape(300)); n = n + 1;
+  cases[n] = one("gelu", &u_gelu, shape(300)); n = n + 1;
+  cases[n] = one("gelu_tanh", &u_gelu_tanh, shape(300)); n = n + 1;
+  cases[n] = one("silu", &u_silu, shape(300)); n = n + 1;
+  cases[n] = one("softplus", &u_softplus, shape(300)); n = n + 1;
+  cases[n] = one("clamp", &u_clamp, shape(300)); n = n + 1;
+  cases[n] = one("square", &u_square, shape(300)); n = n + 1;
+  cases[n] = one("shift scale", &u_shift_scale, shape(300)); n = n + 1;
+  var c_log: Case = one("log", &u_log, shape(300));
+  c_log.positive = true;
+  cases[n] = c_log; n = n + 1;
+  var c_sqrt: Case = one("sqrt", &u_sqrt, shape(300));
+  c_sqrt.positive = true;
+  cases[n] = c_sqrt; n = n + 1;
+  var c_pow: Case = one("pow", &u_pow, shape(300));
+  c_pow.positive = true;
+  cases[n] = c_pow; n = n + 1;
+  var c_sum: Case = one("sum of 70000", &r_sum, shape(70000));
+  c_sum.tolerance = 1.0e-4;
+  cases[n] = c_sum; n = n + 1;
+  cases[n] = one("mean", &r_mean, shape(33, 17)); n = n + 1;
+  cases[n] = one("sum_axis", &r_sum_axis, shape(4, 9, 5)); n = n + 1;
+  cases[n] = one("mean_axis", &r_mean_axis, shape(4, 9, 5)); n = n + 1;
+  cases[n] = one("max_axis", &r_max_axis, shape(4, 9, 5)); n = n + 1;
+  cases[n] = one("transpose", &s_transpose, shape(3, 4, 5)); n = n + 1;
+  cases[n] = one("t", &s_t, shape(2, 7, 9)); n = n + 1;
+  cases[n] = one("slice", &s_slice, shape(3, 8, 4)); n = n + 1;
+  cases[n] = two("concat", &s_concat, shape(3, 2, 4), shape(3, 5, 4)); n = n + 1;
+  cases[n] = one("view", &s_view, shape(3, 4, 5)); n = n + 1;
+  cases[n] = two("matmul", &m_matmul, shape(37, 29), shape(29, 41)); n = n + 1;
+  cases[n] = two("matmul batched", &m_matmul, shape(3, 37, 29), shape(3, 29, 41)); n = n + 1;
+  cases[n] = two("matmul rows", &m_matmul, shape(3, 37, 29), shape(29, 41)); n = n + 1;
+  cases[n] = two("matmul_t", &m_matmul_t, shape(2, 33, 20), shape(2, 47, 20)); n = n + 1;
+  cases[n] = two("matmul large", &m_matmul, shape(300, 150), shape(150, 200)); n = n + 1;
+  cases[n] = two("matmul square", &m_matmul, shape(520, 260), shape(260, 530)); n = n + 1;
+  cases[n] = two("matmul_t wide", &m_matmul_t, shape(2, 140, 77), shape(2, 260, 77)); n = n + 1;
+  cases[n] = three("linear tall", &m_linear, shape(5000, 33), shape(300, 33), shape(300)); n = n + 1;
+  cases[n] = three("linear", &m_linear, shape(4, 50, 96), shape(130, 96), shape(130)); n = n + 1;
+  cases[n] = three("linear split", &m_linear, shape(2100, 64), shape(70, 64), shape(70)); n = n + 1;
+  cases[n] = two("linear nobias", &m_linear_nobias, shape(300, 129), shape(257, 129)); n = n + 1;
+  cases[n] = one("softmax", &n_softmax, shape(9, 70)); n = n + 1;
+  cases[n] = one("log_softmax", &n_log_softmax, shape(9, 70)); n = n + 1;
+  cases[n] = one("causal_softmax", &n_causal, shape(2, 11, 11)); n = n + 1;
+  cases[n] = one("cross_entropy", &n_xent, shape(37, 13)); n = n + 1;
+  cases[n] = two("mse", &n_mse, shape(5, 9), shape(5, 9)); n = n + 1;
+  cases[n] = two("bce", &n_bce, shape(5, 9), shape(5, 9)); n = n + 1;
+  cases[n] = three("layer_norm", &n_layer_norm, shape(13, 70), shape(70), shape(70)); n = n + 1;
+  cases[n] = two("rms_norm", &n_rms_norm, shape(13, 70), shape(70)); n = n + 1;
+  cases[n] = one("layer_norm plain", &n_layer_plain, shape(13, 70)); n = n + 1;
+  cases[n] = one("dropout", &n_dropout, shape(5000)); n = n + 1;
+  cases[n] = one("embedding", &n_embed, shape(11, 7)); n = n + 1;
+  cases[n] = one("attention causal dropout", &a_attention, shape(2, 9, 48)); n = n + 1;
+  cases[n] = one("attention full", &a_attention_full, shape(3, 33, 24)); n = n + 1;
+  cases[n] = one("flash 32 causal dropout", &a_flash_causal, shape(2, 37, 192)); n = n + 1;
+  cases[n] = one("flash 64 causal dropout", &a_flash_causal, shape(2, 150, 384)); n = n + 1;
+  cases[n] = one("flash 128 full dropout", &a_flash_full, shape(1, 45, 768)); n = n + 1;
+  cases[n] = one("flash 32 full long", &a_flash_full, shape(1, 300, 192)); n = n + 1;
+  cases[n] = one("flash 64 one head", &a_flash_one, shape(2, 130, 192)); n = n + 1;
+  cases[n] = one("qk_norm_rope", &a_rope, shape(2, 11, 144)); n = n + 1;
+  cases[n] = one("qk_norm_rope offset", &a_rope_offset, shape(5, 96)); n = n + 1;
+  cases[n] = one("qk_norm_rope attention", &a_rope_attention, shape(2, 70, 384)); n = n + 1;  cases[n] = three("conv2d", &c_conv, shape(2, 3, 9, 8), shape(5, 3, 3, 3), shape(5)); n = n + 1;
+  cases[n] = three("conv2d dilated", &c_conv_dilated, shape(2, 3, 9, 8), shape(4, 3, 3, 3), shape(4)); n = n + 1;
+  cases[n] = one("max_pool2d", &c_max_pool, shape(2, 3, 9, 8)); n = n + 1;
+  cases[n] = one("avg_pool2d", &c_avg_pool, shape(2, 3, 8, 8)); n = n + 1;
+  cases[n] = three("batch_norm", &c_batch_norm, shape(4, 3, 5, 5), shape(3), shape(3)); n = n + 1;
+  var failed: int32 = 0;
+  for i in 0..n {
+    if (!check(dev, cases[i])) { failed = failed + 1; }
+  }
+  println("{n - failed} of {n} ops agree");
+  var half: Case[16];
+  var h: int32 = 0;
+  half[h] = three("bf16 linear", &m_linear, shape(2, 128, 384), shape(256, 384), shape(256)); h = h + 1;
+  half[h] = two("bf16 linear nobias", &m_linear_nobias, shape(512, 256), shape(384, 256)); h = h + 1;
+  half[h] = two("bf16 linear split", &m_linear_nobias, shape(4096, 128), shape(128, 128)); h = h + 1;
+  half[h] = two("bf16 matmul batched", &m_matmul, shape(3, 128, 256), shape(3, 256, 128)); h = h + 1;
+  half[h] = two("bf16 matmul_t", &m_matmul_t, shape(2, 128, 64), shape(2, 256, 64)); h = h + 1;
+  half[h] = three("bf16 linear 64 tiles", &m_linear, shape(5, 64, 192), shape(576, 192), shape(576)); h = h + 1;
+  half[h] = two("bf16 linear 64 tiles nobias", &m_linear_nobias, shape(320, 768), shape(192, 768)); h = h + 1;
+  half[h] = two("bf16 matmul 64 tiles batched", &m_matmul, shape(3, 64, 96), shape(3, 96, 192)); h = h + 1;
+  half[h] = one("bf16 attention 64 causal", &a_flash_one, shape(2, 200, 192)); h = h + 1;
+  half[h] = one("bf16 attention 32 causal", &a_tc_causal, shape(2, 77, 192)); h = h + 1;
+  half[h] = one("bf16 attention 64 full", &a_tc_full, shape(1, 130, 384)); h = h + 1;
+  half[h] = one("bf16 attention 32 long", &a_tc_full, shape(1, 300, 192)); h = h + 1;
+  half[h] = one("bf16 attention rope 64", &a_rope_attention, shape(2, 150, 384)); h = h + 1;
+  half[h] = one("bf16 attention rope 32", &a_rope_32, shape(2, 77, 384)); h = h + 1;
+  gpu_matmul(dev, MATMUL_BF16);
+  var half_failed: int32 = 0;
+  for i in 0..h {
+    var c: Case = half[i];
+    c.tolerance = 2.0e-2;
+    if (!check(dev, c)) { half_failed = half_failed + 1; }
+  }
+  gpu_matmul(dev, MATMUL_FP32);
+  println("{h - half_failed} of {h} bf16 ops agree");
+  return failed + half_failed;
+}

@@ -1,0 +1,364 @@
+import "std/mem";
+import "./tensor";
+import "./kernels";
+import "./graph";
+
+export fn split_axis(s: Shape, axis: int32, outer: int64*, len: int64*, inner: int64*) {
+  var a: int32 = s.axis(axis);
+  var o: int64 = 1;
+  for i in 0..a { o = o * s.dims[i]; }
+  var n: int64 = 1;
+  for i in a + 1..s.rank { n = n * s.dims[i]; }
+  *outer = o;
+  *len = s.dims[a];
+  *inner = n;
+}
+
+fn sum_wide(p: float32*, n: int64) -> float64 {
+  var total: float64 = 0.0;
+  var at: int64 = 0;
+  while (at < n) {
+    var len: int64 = n - at;
+    if (len > 4096) { len = 4096; }
+    total = total + (float64)sum_f32(p + at, len);
+    at = at + len;
+  }
+  return total;
+}
+
+export fn Var_sum(x: Var) -> Var {
+  var g: Graph* = x.g;
+  var id: int32 = g->push(OP_SUM_ALL, x.id, -1, -1, shape_scalar());
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  g->nodes[id].value.data[0] = (float32)sum_wide(g->data(x.id), x.size());
+  return { g: g, id: id };
+}
+
+export fn Var_mean(x: Var) -> Var {
+  var g: Graph* = x.g;
+  var n: int64 = x.size();
+  var id: int32 = g->push(OP_MEAN_ALL, x.id, -1, -1, shape_scalar());
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  g->nodes[id].value.data[0] = (float32)(sum_wide(g->data(x.id), n) / (float64)(if (n < 1) 1 else n));
+  return { g: g, id: id };
+}
+
+fn reduced_shape(s: Shape, axis: int32, keep: bool) -> Shape {
+  if (keep) { return s.with(axis, 1); }
+  return s.without(axis);
+}
+
+fn reduce_axis(x: Var, axis: int32, keep: bool, op: int32) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  var outer: int64 = 0;
+  var len: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(s, axis, &outer, &len, &inner);
+  var id: int32 = g->push(op, x.id, -1, -1, reduced_shape(s, axis, keep));
+  g->nodes[id].i0 = (int64)s.axis(axis);
+  if (op == OP_MAX) { g->nodes[id].ints = g->index(outer * inner); }
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var out: float32* = g->data(id);
+  var src: float32* = g->data(x.id);
+  if (op == OP_MAX) {
+    var arg: int32* = g->nodes[id].ints;
+    for o: int64 in 0..outer {
+      for i: int64 in 0..inner {
+        var best: float32 = src[o * len * inner + i];
+        var at: int32 = 0;
+        for k: int64 in 1..len {
+          var v: float32 = src[(o * len + k) * inner + i];
+          if (v > best) {
+            best = v;
+            at = (int32)k;
+          }
+        }
+        out[o * inner + i] = best;
+        arg[o * inner + i] = at;
+      }
+    }
+    return { g: g, id: id };
+  }
+  var scale: float32 = if (op == OP_MEAN) (float32)(1.0 / (float64)(if (len < 1) 1 else len)) else (float32)1.0;
+  for o: int64 in 0..outer {
+    var dst: float32* = out + o * inner;
+    if (inner == 1) {
+      dst[0] = sum_f32(src + o * len, len) * scale;
+    } else {
+      zero_f32(dst, inner);
+      for k: int64 in 0..len { add_into_f32(dst, src + (o * len + k) * inner, inner); }
+      if (op == OP_MEAN) { scale_f32(dst, scale, inner); }
+    }
+  }
+  return { g: g, id: id };
+}
+
+export fn Var_sum_axis(x: Var, axis: int32, keep: bool) -> Var { return reduce_axis(x, axis, keep, OP_SUM); }
+export fn Var_mean_axis(x: Var, axis: int32, keep: bool) -> Var { return reduce_axis(x, axis, keep, OP_MEAN); }
+export fn Var_max_axis(x: Var, axis: int32, keep: bool) -> Var { return reduce_axis(x, axis, keep, OP_MAX); }
+
+export fn backward_reduce(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var op: int32 = n->op;
+  var dy: float32* = n->grad;
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var total: int64 = xs.size();
+  var dx: float32* = g->grad_of(n->a);
+  if (op == OP_SUM_ALL || op == OP_MEAN_ALL) {
+    var d: float32 = dy[0];
+    if (op == OP_MEAN_ALL) { d = d * (float32)(1.0 / (float64)(if (total < 1) 1 else total)); }
+    for i: int64 in 0..total { dx[i] = dx[i] + d; }
+    return;
+  }
+  var node: Node* = g->node(id);
+  var outer: int64 = 0;
+  var len: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(xs, (int32)node->i0, &outer, &len, &inner);
+  if (op == OP_MAX) {
+    var arg: int32* = node->ints;
+    for o: int64 in 0..outer {
+      for i: int64 in 0..inner {
+        var at: int64 = (int64)arg[o * inner + i];
+        var k: int64 = (o * len + at) * inner + i;
+        dx[k] = dx[k] + dy[o * inner + i];
+      }
+    }
+    return;
+  }
+  var scale: float32 = if (op == OP_MEAN) (float32)(1.0 / (float64)(if (len < 1) 1 else len)) else (float32)1.0;
+  for o: int64 in 0..outer {
+    var src: float32* = dy + o * inner;
+    for k: int64 in 0..len {
+      var dst: float32* = dx + (o * len + k) * inner;
+      if (inner == 1) {
+        dst[0] = dst[0] + src[0] * scale;
+      } else {
+        axpy_f32(dst, scale, src, inner);
+      }
+    }
+  }
+}
+
+export fn Var_reshape(x: Var, s: Shape) -> Var {
+  var g: Graph* = x.g;
+  var target: Shape = s;
+  var unknown: int32 = -1;
+  var known: int64 = 1;
+  for i in 0..target.rank {
+    if (target.dims[i] == 0 && unknown < 0) {
+      unknown = i;
+    } else {
+      known = known * target.dims[i];
+    }
+  }
+  if (unknown >= 0 && known > 0) { target.dims[unknown] = x.size() / known; }
+  if (target.size() != x.size()) {
+    mmll_fail("cannot reshape {x.shape().text()} to {s.text()}");
+  }
+  var id: int32 = g->push(OP_RESHAPE, x.id, -1, -1, target);
+  g->nodes[id].value.data = g->data(x.id);
+  return { g: g, id: id };
+}
+
+export fn Var_view(x: Var, dims: int64[..]) -> Var {
+  var s: Shape;
+  s.rank = (int32)dims.length;
+  for i in 0..dims.length { s.dims[i] = if (dims[i] < 0) 0 else dims[i]; }
+  return x.reshape(s);
+}
+
+export fn Var_flatten(x: Var, from: int32) -> Var {
+  var s: Shape = x.shape();
+  var a: int32 = s.axis(from);
+  var out: Shape;
+  out.rank = a + 1;
+  for i in 0..a { out.dims[i] = s.dims[i]; }
+  var rest: int64 = 1;
+  for i in a..s.rank { rest = rest * s.dims[i]; }
+  out.dims[a] = rest;
+  return x.reshape(out);
+}
+
+fn transposed_shape(s: Shape, a: int32, b: int32) -> Shape {
+  var out: Shape = s;
+  out.dims[a] = s.dims[b];
+  out.dims[b] = s.dims[a];
+  return out;
+}
+
+fn transpose_into(src: float32*, s: Shape, a: int32, b: int32, dst: float32*) {
+  var r: int32 = s.rank;
+  if (a == b) {
+    copy_f32(dst, src, s.size());
+    return;
+  }
+  var lo: int32 = if (a < b) a else b;
+  var hi: int32 = if (a < b) b else a;
+  if (lo == r - 2 && hi == r - 1) {
+    var rows: int64 = s.dims[r - 2];
+    var cols: int64 = s.dims[r - 1];
+    transpose_batched(s.size() / (if (rows * cols < 1) 1 else rows * cols), src, rows, cols, dst);
+    return;
+  }
+  var in_strides: int64[6];
+  var running: int64 = 1;
+  var i: int32 = r - 1;
+  while (i >= 0) {
+    in_strides[i] = running;
+    running = running * s.dims[i];
+    i = i - 1;
+  }
+  var out: Shape = transposed_shape(s, a, b);
+  var map: int64[6];
+  for k in 0..r { map[k] = in_strides[k]; }
+  map[a] = in_strides[b];
+  map[b] = in_strides[a];
+  var inner: int64 = out.dims[r - 1];
+  var inner_stride: int64 = map[r - 1];
+  var rows: int64 = out.size() / (if (inner < 1) 1 else inner);
+  var index: int64[6];
+  var off: int64 = 0;
+  for row: int64 in 0..rows {
+    var d: float32* = dst + row * inner;
+    if (inner_stride == 1) {
+      copy_f32(d, src + off, inner);
+    } else {
+      for j: int64 in 0..inner { d[j] = src[off + j * inner_stride]; }
+    }
+    var k: int32 = r - 2;
+    while (k >= 0) {
+      index[k] = index[k] + 1;
+      off = off + map[k];
+      if (index[k] < out.dims[k]) { break; }
+      off = off - map[k] * out.dims[k];
+      index[k] = 0;
+      k = k - 1;
+    }
+  }
+}
+
+export fn Var_transpose(x: Var, a: int32, b: int32) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  var ia: int32 = s.axis(a);
+  var ib: int32 = s.axis(b);
+  var id: int32 = g->push(OP_TRANSPOSE, x.id, -1, -1, transposed_shape(s, ia, ib));
+  g->nodes[id].i0 = (int64)ia;
+  g->nodes[id].i1 = (int64)ib;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  transpose_into(g->data(x.id), s, ia, ib, g->data(id));
+  return { g: g, id: id };
+}
+
+export fn Var_t(x: Var) -> Var {
+  return x.transpose(-2, -1);
+}
+
+export fn backward_transpose(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var ys: Shape = n->value.shape;
+  var ia: int32 = (int32)n->i0;
+  var ib: int32 = (int32)n->i1;
+  var dy: float32* = n->grad;
+  var size: int64 = ys.size();
+  var tmp: float32* = g->floats(if (size < 1) 1 else size);
+  transpose_into(dy, ys, ia, ib, tmp);
+  add_into_f32(g->grad_of(g->nodes[id].a), tmp, size);
+}
+
+export fn Var_slice(x: Var, axis: int32, start: int64, length: int64) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  var a: int32 = s.axis(axis);
+  if (start < 0 || length < 0 || start + length > s.dims[a]) {
+    mmll_fail("slice {start}..{start + length} is outside axis {a} of {s.text()}");
+  }
+  var outer: int64 = 0;
+  var len: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(s, a, &outer, &len, &inner);
+  var id: int32 = g->push(OP_SLICE, x.id, -1, -1, s.with(a, length));
+  g->nodes[id].i0 = (int64)a;
+  g->nodes[id].i1 = start;
+  g->nodes[id].i2 = length;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var src: float32* = g->data(x.id);
+  var dst: float32* = g->data(id);
+  var block: int64 = length * inner;
+  for o: int64 in 0..outer {
+    copy_f32(dst + o * block, src + (o * len + start) * inner, block);
+  }
+  return { g: g, id: id };
+}
+
+export fn backward_slice(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var xs: Shape = g->nodes[n->a].value.shape;
+  var outer: int64 = 0;
+  var len: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(xs, (int32)n->i0, &outer, &len, &inner);
+  var start: int64 = n->i1;
+  var block: int64 = n->i2 * inner;
+  var dy: float32* = n->grad;
+  var dx: float32* = g->grad_of(n->a);
+  for o: int64 in 0..outer {
+    add_into_f32(dx + (o * len + start) * inner, dy + o * block, block);
+  }
+}
+
+export fn concat(a: Var, b: Var, axis: int32) -> Var {
+  var g: Graph* = a.g;
+  var sa: Shape = a.shape();
+  var sb: Shape = b.shape();
+  var ax: int32 = sa.axis(axis);
+  if (sa.rank != sb.rank) { mmll_fail("cannot concatenate {sa.text()} and {sb.text()}"); }
+  for i in 0..sa.rank {
+    if (i != ax && sa.dims[i] != sb.dims[i]) { mmll_fail("cannot concatenate {sa.text()} and {sb.text()} on axis {ax}"); }
+  }
+  var outer: int64 = 0;
+  var la: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(sa, ax, &outer, &la, &inner);
+  var lb: int64 = sb.dims[ax];
+  var id: int32 = g->push(OP_CONCAT, a.id, b.id, -1, sa.with(ax, la + lb));
+  g->nodes[id].i0 = (int64)ax;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var dst: float32* = g->data(id);
+  var pa: float32* = g->data(a.id);
+  var pb: float32* = g->data(b.id);
+  var row: int64 = (la + lb) * inner;
+  for o: int64 in 0..outer {
+    copy_f32(dst + o * row, pa + o * la * inner, la * inner);
+    copy_f32(dst + o * row + la * inner, pb + o * lb * inner, lb * inner);
+  }
+  return { g: g, id: id };
+}
+
+export fn backward_concat(g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var ia: int32 = n->a;
+  var ib: int32 = n->b;
+  var ax: int32 = (int32)n->i0;
+  var dy: float32* = n->grad;
+  var sa: Shape = g->nodes[ia].value.shape;
+  var outer: int64 = 0;
+  var la: int64 = 0;
+  var inner: int64 = 0;
+  split_axis(sa, ax, &outer, &la, &inner);
+  var lb: int64 = g->nodes[ib].value.shape.dims[ax];
+  var row: int64 = (la + lb) * inner;
+  if (g->nodes[ia].requires) {
+    var da: float32* = g->grad_of(ia);
+    for o: int64 in 0..outer { add_into_f32(da + o * la * inner, dy + o * row, la * inner); }
+  }
+  if (g->nodes[ib].requires) {
+    var db: float32* = g->grad_of(ib);
+    for o: int64 in 0..outer { add_into_f32(db + o * lb * inner, dy + o * row + la * inner, lb * inner); }
+  }
+}

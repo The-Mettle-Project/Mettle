@@ -1,0 +1,182 @@
+import "std/io";
+import "std/mem";
+import "std/math";
+import "std/core";
+import "std/time";
+import "../mmll";
+
+const SIDE = 28;
+const CLASSES = 4;
+
+fn segment_distance(px: float64, py: float64, ax: float64, ay: float64, bx: float64, by: float64) -> float64 {
+  var dx: float64 = bx - ax;
+  var dy: float64 = by - ay;
+  var t: float64 = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
+  t = fclamp(t, 0.0, 1.0);
+  return hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+fn draw(img: float32*, kind: int64, rng: Rng*) {
+  var cx: float64 = 9.0 + rng->uniform() * 10.0;
+  var cy: float64 = 9.0 + rng->uniform() * 10.0;
+  var size: float64 = 4.5 + rng->uniform() * 4.0;
+  var turn: float64 = rng->uniform() * 6.283185307179586;
+  var ink: float64 = 0.6 + rng->uniform() * 0.4;
+  var c: float64 = cos(turn);
+  var s: float64 = sin(turn);
+  for y in 0..SIDE {
+    for x in 0..SIDE {
+      var px: float64 = (float64)x - cx;
+      var py: float64 = (float64)y - cy;
+      var u: float64 = c * px + s * py;
+      var v: float64 = -s * px + c * py;
+      var inside: float64 = 0.0;
+      if (kind == 0) {
+        var r: float64 = hypot(u, v);
+        inside = 1.0 - fclamp(fabs(r - size) - 0.8, 0.0, 1.0);
+      } else if (kind == 1) {
+        var d: float64 = fmax(fabs(u), fabs(v)) - size * 0.8;
+        inside = 1.0 - fclamp(d + 0.5, 0.0, 1.0);
+      } else if (kind == 2) {
+        var a0: float64 = -1.5707963267948966;
+        var d0: float64 = segment_distance(u, v, size * cos(a0), size * sin(a0), size * cos(a0 + 2.0943951023931953), size * sin(a0 + 2.0943951023931953));
+        var d1: float64 = segment_distance(u, v, size * cos(a0 + 2.0943951023931953), size * sin(a0 + 2.0943951023931953), size * cos(a0 + 4.1887902047863905), size * sin(a0 + 4.1887902047863905));
+        var d2: float64 = segment_distance(u, v, size * cos(a0 + 4.1887902047863905), size * sin(a0 + 4.1887902047863905), size * cos(a0), size * sin(a0));
+        inside = 1.0 - fclamp(fmin(d0, fmin(d1, d2)) - 0.7, 0.0, 1.0);
+      } else {
+        var d: float64 = fmin(segment_distance(u, v, -size, 0.0, size, 0.0), segment_distance(u, v, 0.0, -size, 0.0, size));
+        inside = 1.0 - fclamp(d - 0.7, 0.0, 1.0);
+      }
+      var noise: float64 = 0.15 * rng->normal();
+      img[y * SIDE + x] = (float32)fclamp(inside * ink + noise, 0.0, 1.0);
+    }
+  }
+}
+
+fn make_set(count: int64, rng: Rng*, images: Tensor*, labels: Labels*) {
+  *images = tensor_new(shape(count, 1, SIDE, SIDE));
+  labels->data = (int32*)malloc(count * 4);
+  labels->count = count;
+  for i: int64 in 0..count {
+    var kind: int64 = rng->below(CLASSES);
+    labels->data[i] = (int32)kind;
+    draw(images->data + i * SIDE * SIDE, kind, rng);
+  }
+}
+
+struct Net {
+  c1: Conv2d;
+  b1: BatchNorm;
+  c2: Conv2d;
+  b2: BatchNorm;
+  fc: Linear;
+  out: Linear;
+}
+
+fn make_net(ps: Params*, rng: Rng*) -> Net {
+  var n: Net;
+  n.c1 = make_conv2d(ps, "c1", 1, 16, 3, 1, 1, false, rng);
+  n.b1 = make_batch_norm(ps, "b1", 16);
+  n.c2 = make_conv2d(ps, "c2", 16, 32, 3, 1, 1, false, rng);
+  n.b2 = make_batch_norm(ps, "b2", 32);
+  n.fc = make_linear(ps, "fc", 32 * 7 * 7, 128, true, rng);
+  n.out = make_linear(ps, "out", 128, CLASSES, true, rng);
+  init_kaiming_normal(n.c1.weight, rng);
+  init_kaiming_normal(n.c2.weight, rng);
+  return n;
+}
+
+fn Net_forward(n: Net, x: Var) -> Var {
+  var h: Var = max_pool2d(n.b1.forward(n.c1.forward(x)).relu(), 2, 2, 0);
+  h = max_pool2d(n.b2.forward(n.c2.forward(h)).relu(), 2, 2, 0);
+  h = dropout(n.fc.forward(h.flatten(1)).relu(), 0.3);
+  return n.out.forward(h);
+}
+
+fn accuracy(n: Net, g: Graph*, images: Tensor, labels: Labels) -> float64 {
+  g->record = false;
+  g->training = false;
+  var hits: int64 = 0;
+  var at: int64 = 0;
+  var step: int64 = 500;
+  var plane: int64 = SIDE * SIDE;
+  while (at < labels.count) {
+    var count: int64 = labels.count - at;
+    if (count > step) { count = step; }
+    g->reset();
+    var view: Tensor = tensor_view(images.data + at * plane, shape(count, 1, SIDE, SIDE));
+    var logits: Var = n.forward(g->input(view));
+    hits = hits + count_correct(logits.value(), labels.data + at);
+    at = at + count;
+  }
+  g->record = true;
+  g->training = true;
+  return (float64)hits / (float64)labels.count;
+}
+
+fn main() -> int32 {
+  var rng: Rng = rng_new(42);
+  var train_x: Tensor;
+  var train_y: Labels;
+  var test_x: Tensor;
+  var test_y: Labels;
+  var t0: int64 = time_mono_ns();
+  make_set(12000, &rng, &train_x, &train_y);
+  make_set(2000, &rng, &test_x, &test_y);
+  println("rendered 14000 images in {(float64)(time_mono_ns() - t0) / 1.0e9} s");
+  var ps: Params* = params_new();
+  var net: Net = make_net(ps, &rng);
+  println("{ps->size()} parameters");
+  var opt: Optimizer* = sgd(ps, 0.05, 0.9, 5.0e-4, true);
+  var g: Graph* = graph_new();
+  var batch: int64 = 64;
+  var batches: Batches* = make_batches(train_y.count, batch, true, 7);
+  var bx: float32* = (float32*)malloc(batch * SIDE * SIDE * 4);
+  var by: int32* = (int32*)malloc(batch * 4);
+  var steps_per_epoch: int64 = (train_y.count + batch - 1) / batch;
+  var epochs: int64 = 4;
+  var step: int64 = 0;
+  for epoch in 0..epochs {
+    var started: int64 = time_mono_ns();
+    var total: float64 = 0.0;
+    var seen: int64 = 0;
+    var n: int64 = batches->next();
+    while (n > 0) {
+      batches->take_rows(train_x, bx);
+      batches->take_labels(train_y.data, by);
+      opt->set_lr(lr_cosine(step, 50, epochs * steps_per_epoch, 0.05, 0.0005));
+      g->reset();
+      var x: Var = g->input(tensor_view(bx, shape(n, 1, SIDE, SIDE)));
+      var loss: Var = cross_entropy(net.forward(x), by, 0.0);
+      loss.backward();
+      opt->step();
+      opt->zero_grad();
+      total = total + (float64)loss.item() * (float64)n;
+      seen = seen + n;
+      step = step + 1;
+      n = batches->next();
+    }
+    var secs: float64 = (float64)(time_mono_ns() - started) / 1.0e9;
+    println("epoch {epoch + 1}: loss {total / (float64)seen}, test accuracy {100.0 * accuracy(net, g, test_x, test_y)}%, {(float64)seen / secs} images/s");
+  }
+  var score: float64 = accuracy(net, g, test_x, test_y);
+  match (save_safetensors(ps, "shapes.safetensors")) {
+    case Ok(bytes): { println("saved shapes.safetensors, {bytes} bytes"); }
+    case Err(e): {
+      println("shapes: {e}");
+      return 1;
+    }
+  }
+  var fresh: Params* = params_new();
+  var again: Net = make_net(fresh, &rng);
+  match (load_safetensors(fresh, "shapes.safetensors", true)) {
+    case Ok(count): {}
+    case Err(e): {
+      println("shapes: {e}");
+      return 1;
+    }
+  }
+  var reloaded: float64 = accuracy(again, g, test_x, test_y);
+  println("reloaded checkpoint scores {100.0 * reloaded}% (trained model {100.0 * score}%)");
+  return if reloaded == score { 0 } else { 1 };
+}
