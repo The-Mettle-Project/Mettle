@@ -48,6 +48,7 @@
 #include "ir/ir_twins.h"
 #include "ir/ir_machine.h"
 #include "pkg.h"
+#include "run.h"
 #include "explain/explain_command.h"
 #include "tune.h"
 #include "ir/ir_trace.h"
@@ -716,6 +717,15 @@ static char *default_executable_filename(const char *input_filename) {
     }
     return stem;
   }
+}
+
+char *mettle_default_executable_filename(const char *input_filename) {
+  return default_executable_filename(input_filename);
+}
+
+char *mettle_object_filename_for(const char *executable_filename) {
+  return replace_extension(executable_filename,
+                           host_target_is_posix() ? ".o" : ".obj");
 }
 
 static const char *default_object_output_filename(void) {
@@ -3893,6 +3903,7 @@ static int report_gpu_info(const char *default_target, int isa_major,
 
 typedef struct {
   int build_executable;
+  int quiet_build;
   int linker_mode_explicit;
   int output_filename_explicit;
   int ptx_version_explicit;
@@ -4008,6 +4019,8 @@ static DriverFlagResult parse_flag_output(CompilerOptions *options,
     options->stdlib_directory = argv[++i];
   } else if (strcmp(argv[i], "--build") == 0) {
     flags->build_executable = 1;
+  } else if (strcmp(argv[i], "--quiet") == 0) {
+    flags->quiet_build = 1;
   } else if (strcmp(argv[i], "--emit-asm") == 0) {
     fprintf(stderr,
             "Error: --emit-asm has been removed; Mettle only emits native "
@@ -4843,6 +4856,12 @@ static int run_tool_subcommand(int argc, char **argv, int *exit_code) {
     *exit_code = mettle_live_main(argc, argv);
     return 1;
   }
+  if (strcmp(argv[1], "run") == 0) {
+    char *self_path = get_executable_path(argv[0]);
+    *exit_code = mettle_run_main(argc, argv, self_path ? self_path : argv[0]);
+    free(self_path);
+    return 1;
+  }
   return 0;
 }
 
@@ -5257,8 +5276,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    object_output_filename = replace_extension(
-        build_output_filename, elf_build ? ".o" : ".obj");
+    object_output_filename = mettle_object_filename_for(build_output_filename);
     if (!object_output_filename) {
       fprintf(stderr, "Error: Failed to determine object output path\n");
       free(build_output_filename);
@@ -5365,7 +5383,7 @@ int main(int argc, char *argv[]) {
         result = 1;
       }
     }
-    if (result == 0) {
+    if (result == 0 && !flags.quiet_build) {
       if (options.shared_output) {
         printf("Built shared library '%s'\n", build_output_filename);
       } else {
@@ -8501,6 +8519,10 @@ void print_usage(const char *program_name) {
   printf("       %s target <triple>            Print a built-in target's description as\n"
          "                           Mettle; `--target desc.mettle` builds for one\n",
          program_name);
+  printf("       %s run [--release] <file> [args...]\n"
+         "                           Compile, link, and run <file> with [args...],\n"
+         "                           exiting with the program's exit code\n",
+         program_name);
   printf("       %s test <file> [--filter=S]   Run @test functions in the compile-time\n"
          "                           interpreter (instant; no codegen or linking)\n",
          program_name);
@@ -8538,6 +8560,8 @@ void print_usage(const char *program_name) {
          "bundled stdlib, then ./stdlib)\n");
   printf("  --build             Compile and link to an executable (COFF/PE on "
          "Windows, ELF on Linux)\n");
+  printf("  --quiet             With --build, do not print the \"Built executable\"\n"
+         "                      line\n");
   printf("  --emit-obj          Emit a native object directly (default)\n");
   printf("  --target <triple>   Compile for another machine: x86_64-windows,\n"
          "                      x86_64-linux, x86_64-none, aarch64-linux,\n"
