@@ -19152,6 +19152,47 @@ catch {
   Write-CaseResult -Name "mettle_tune_family" -Passed $false -Reason $_.Exception.Message
 }
 
+# mettle run: the arguments after the file reach the program, its stdout is the
+# program's alone (no "Built executable" line), and its exit code is the
+# program's. echo_args prints each argument and exits with 40 + argc.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $runDir = Join-Path $tmpDir "mettle_run"
+  if (Test-Path $runDir) { Remove-Item -Recurse -Force $runDir }
+  New-Item -ItemType Directory -Force $runDir | Out-Null
+  Copy-Item tests/run/echo_args.mettle $runDir
+  $runCompiler = (Resolve-Path $CompilerPath).Path
+  Push-Location $runDir
+  try {
+    $runOut = @(& $runCompiler run echo_args.mettle one "two words" --flag)
+    $runExit = $LASTEXITCODE
+    $bareOut = @(& $runCompiler run --release echo_args.mettle)
+    $bareExit = $LASTEXITCODE
+    $flagOut = @(& $runCompiler run -I . -- echo_args.mettle x)
+    $flagExit = $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
+  $expected = @("arg 1: one", "arg 2: two words", "arg 3: --flag")
+  if (($runOut -join "`n") -ne ($expected -join "`n")) {
+    throw "mettle run printed something other than the program's output: $($runOut -join ' | ')"
+  }
+  if ($runExit -ne 44) { throw "mettle run exited $runExit, expected the program's 44" }
+  if ($bareOut.Count -ne 0) { throw "mettle run with no arguments printed: $($bareOut -join ' | ')" }
+  if ($bareExit -ne 41) { throw "mettle run --release exited $bareExit, expected the program's 41" }
+  if (($flagOut -join "`n") -ne "arg 1: x" -or $flagExit -ne 42) {
+    throw "mettle run did not pass -I . through to the build: $($flagOut -join ' | ') (exit $flagExit)"
+  }
+  $leftover = @(Get-ChildItem $runDir | Where-Object { $_.Name -ne "echo_args.mettle" })
+  if ($leftover.Count -ne 0) { throw "mettle run wrote next to the source: $($leftover.Name -join ', ')" }
+  Write-CaseResult -Name "mettle_run_args_and_exit_code" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "mettle_run_args_and_exit_code" -Passed $false -Reason $_.Exception.Message
+}
+
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }

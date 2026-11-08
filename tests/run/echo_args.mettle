@@ -1,0 +1,14 @@
+// `mettle run` hands the arguments after the file to the program and exits
+// with the program's own exit code. This echoes each argument on its own line
+// and exits with 40 + argc, so the test can check both.
+import "std/io";
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var i: int32 = 1;
+  while (i < argc) {
+    var arg: cstring = argv[i];
+    println("arg {i}: {arg}");
+    i = i + 1;
+  }
+  return 40 + argc;
+}

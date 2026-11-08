@@ -173,5 +173,15 @@ int compile_file(const char *input_filename, const char *output_filename,
                  CompilerOptions *options);
 void print_usage(const char *program_name);
 char *read_file(const char *filename);
+/* Output names `--build` picks for the host target; callers free the result. */
+char *mettle_default_executable_filename(const char *input_filename);
+char *mettle_object_filename_for(const char *executable_filename);
+
+enum {
+  METTLE_INPUT_MISSING = -1,
+  METTLE_INPUT_HELP = -2,
+  METTLE_INPUT_BAD_FLAG = -3
+};
+int mettle_input_argument_index(int argc, char **argv, int first);
 
 #endif
