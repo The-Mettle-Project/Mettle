@@ -1,0 +1,282 @@
+//! The frame context and its layout: text metrics for the target (px or terminal cells),
+//! tick labels, and the rectangles of title, legend, axis titles and plot, measured from
+//! the actual text. The plot rect is snapped to device pixels before any scale is built.
+//! On a cell target every band is a whole number of rows and the plot edges sit on row
+//! centres, so rules and labels land in their own rows. Uses chart/chart and core.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
+import "mistplot/core/format";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/scene/snap";
+import "mistplot/chart/chart";
+
+/// Most ticks on one axis.
+export const MP_TICK_MAX: int32 = 64;
+/// Title size, px (bold).
+export const MP_SIZE_TITLE: float64 = 15.0;
+/// Subtitle, axis title, legend and "No data" size, px.
+export const MP_SIZE_TEXT: float64 = 12.0;
+/// Tick label size, px (tabular digits).
+export const MP_SIZE_TICK: float64 = 11.0;
+
+/// The legend's measured extent, from mp_legend_size.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpLegendSize {
+  pos: int32;     /// effective MP_LEGEND_* (never AUTO)
+  rows: int32;    /// rows used (TOP, BOTTOM), or entries (RIGHT)
+  w: float64;     /// width, px
+  h: float64;     /// height, px
+}
+
+/// One frame being built: chart, target, scene, metrics, domains, ticks and layout.
+///
+/// @mem Borrows c, t and s for the duration of one build; holds no owned memory.
+export struct MpLayout {
+  c: MpChart*;              /// the chart (entered)
+  t: MpTarget*;             /// the target
+  s: MpScene*;              /// the scene being written
+  w: float64;               /// target width, px
+  h: float64;               /// target height, px
+  scale: float64;           /// device px per px
+  cells: bool;              /// terminal cell target
+  pad_x: float64;           /// outer pad left and right, px
+  pad_y: float64;           /// outer pad top and bottom, px
+  gap: float64;             /// gap between stacked bands, px
+  tick_gap: float64;        /// y tick labels to the plot, px
+  tick_pad: float64;        /// plot bottom to the x tick labels, px
+  top_gap: float64;         /// band above the plot for the top y label, px
+  xv: float64[64];          /// x tick values (band indices for bars)
+  nx: int32;                /// x ticks
+  yv: float64[64];          /// y tick values
+  ny: int32;                /// y ticks
+  band: bool;               /// the x axis is a band axis
+  bands: int32;             /// bands (bars)
+  x0: float64;              /// x domain start
+  x1: float64;              /// x domain end
+  y0: float64;              /// y domain start
+  y1: float64;              /// y domain end
+  xlog: bool;               /// log x
+  ylog: bool;               /// log y
+  xfmt: int32;              /// effective x label format
+  yfmt: int32;              /// effective y label format
+  any: bool;                /// there is data to draw
+  legend: MpLegendSize;     /// legend extent
+  legend_x: float64;        /// legend left, px
+  legend_y: float64;        /// legend top, px
+  title_y: float64;         /// title line top, px
+  sub_y: float64;           /// subtitle line top, px
+  ylab_y: float64;          /// y title line top, px
+  xlab_y: float64;          /// x title line top, px
+  xtick_y: float64;         /// x tick label line top, px
+  plot: MpRect;             /// plot rect, snapped
+  xs: MpScale;              /// final x scale
+  ys: MpScale;              /// final y scale
+}
+
+/// Sets the target metrics of a layout (pads and gaps in px, or whole cells).
+///
+/// @param l The layout. Valid: non-zero, with c, t and s set.
+/// @mem Writes l only.
+/// @thread Call with the chart entered.
+export fn mp_layout_init(l: MpLayout*) {
+  l->w = l->t->width;
+  l->h = l->t->height;
+  l->scale = l->t->scale;
+  l->cells = l->t->measure == MP_MEASURE_CELLS;
+  if (l->cells) {
+    l->pad_x = l->t->cell_w;
+    l->pad_y = 0.0;
+    l->gap = 0.0;
+    l->tick_gap = l->t->cell_w;
+    l->tick_pad = l->t->cell_h * 0.5;
+    l->top_gap = l->t->cell_h * 0.5;
+  } else {
+    l->pad_x = 12.0;
+    l->pad_y = 12.0;
+    l->gap = 4.0;
+    l->tick_gap = 8.0;
+    l->tick_pad = 6.0;
+    l->top_gap = mp_target_text_h(l->t, MP_SIZE_TICK) * 0.5 + 4.0;
+  }
+  l->nx = 0;
+  l->ny = 0;
+  l->any = false;
+}
+
+/// Label of tick i on the x axis (a category name or formatted band index on a band axis).
+///
+/// @param l The layout. Valid: non-zero, ticks computed.
+/// @param i Tick index. Valid: 0 .. l->nx-1.
+/// @param out Scratch for formatted numbers. Valid: >= 32 writable bytes.
+/// @param cap Size of out. Units: bytes. Valid: >= 32.
+/// @return The label: a view of out or of the chart's category copy.
+/// @mem The result is borrowed (out or the chart); never free it.
+/// @thread Call with the chart entered.
+export fn mp_layout_x_label(l: MpLayout*, i: int32, out: uint8*, cap: int64) -> string {
+  var v: float64 = l->xv[(int64)i];
+  if (l->band) {
+    var j: int32 = (int32)v;
+    if (j >= 0 && j < l->c->n_cats) { return l->c->cats[(int64)j]; }
+    return mp_fmt_value(v, MP_FMT_INT, out, cap);
+  }
+  return mp_fmt_value(v, l->xfmt, out, cap);
+}
+
+/// Label of tick i on the y axis.
+///
+/// @param l The layout. Valid: non-zero, ticks computed.
+/// @param i Tick index. Valid: 0 .. l->ny-1.
+/// @param out Destination bytes. Valid: >= 32 writable bytes.
+/// @param cap Size of out. Units: bytes. Valid: >= 32.
+/// @return The label, a view of out.
+/// @mem The result is a view of out.
+/// @thread Call with the chart entered.
+export fn mp_layout_y_label(l: MpLayout*, i: int32, out: uint8*, cap: int64) -> string {
+  return mp_fmt_value(l->yv[(int64)i], l->yfmt, out, cap);
+}
+
+fn layout_y_labels_w(l: MpLayout*) -> float64 {
+  var b: uint8[64];
+  var widest: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < l->ny) {
+    var s: string = mp_layout_y_label(l, i, &b[0], 64);
+    var w: float64 = mp_target_text_w(l->t, s, MP_SIZE_TICK);
+    if (w > widest) { widest = w; }
+    i = i + 1;
+  }
+  return widest;
+}
+
+fn layout_x_label_w(l: MpLayout*, i: int32) -> float64 {
+  if (i < 0 || i >= l->nx) { return 0.0; }
+  var b: uint8[64];
+  var s: string = mp_layout_x_label(l, i, &b[0], 64);
+  return mp_target_text_w(l->t, s, MP_SIZE_TICK);
+}
+
+fn layout_clamp_pair(avail: float64, a: float64*, b: float64*) {
+  if (!(*a >= 0.0)) { *a = 0.0; }
+  if (!(*b >= 0.0)) { *b = 0.0; }
+  var t: float64 = avail;
+  if (t < 0.0) { t = 0.0; }
+  var sum: float64 = *a + *b;
+  if (sum > t && sum > 0.0) {
+    *a = *a * (t / sum);
+    *b = *b * (t / sum);
+  }
+}
+
+// Bands above the plot; returns the plot top before the snap.
+fn layout_top(l: MpLayout*) -> float64 {
+  var c: MpChart* = l->c;
+  var y: float64 = l->pad_y;
+  l->title_y = y;
+  if ((int64)c->title.length > 0) { y = y + mp_target_text_h(l->t, MP_SIZE_TITLE); }
+  l->sub_y = y;
+  if ((int64)c->subtitle.length > 0) { y = y + mp_target_text_h(l->t, MP_SIZE_TEXT); }
+  if (y > l->pad_y) { y = y + l->gap; }
+  if (l->legend.pos == MP_LEGEND_TOP) {
+    l->legend_x = l->pad_x;
+    l->legend_y = y;
+    y = y + l->legend.h + l->gap;
+  }
+  l->ylab_y = y;
+  if ((int64)c->y_label.length > 0 && l->any) {
+    y = y + mp_target_text_h(l->t, MP_SIZE_TEXT) + l->gap;
+  }
+  return y + l->top_gap;
+}
+
+// Bands below the plot; returns the plot bottom before the snap.
+fn layout_bottom(l: MpLayout*) -> float64 {
+  var y: float64 = l->h - l->pad_y;
+  if (l->legend.pos == MP_LEGEND_BOTTOM) {
+    y = y - l->legend.h;
+    l->legend_x = l->pad_x;
+    l->legend_y = y;
+    y = y - l->gap;
+  }
+  if ((int64)l->c->x_label.length > 0 && l->any) {
+    y = y - mp_target_text_h(l->t, MP_SIZE_TEXT);
+    l->xlab_y = y;
+    y = y - l->gap;
+  }
+  if (l->any) {
+    y = y - mp_target_text_h(l->t, MP_SIZE_TICK);
+    l->xtick_y = y;
+    y = y - l->tick_pad;
+  }
+  return y;
+}
+
+fn layout_sides(l: MpLayout*, left: float64*, right: float64*) {
+  *left = l->pad_x;
+  *right = l->pad_x;
+  if (l->any) { *left = l->pad_x + layout_y_labels_w(l) + l->tick_gap; }
+  if (l->legend.pos == MP_LEGEND_RIGHT) { *right = l->pad_x + l->legend.w + l->tick_gap; }
+  if (!l->any) { return; }
+  var g0: float64 = layout_x_label_w(l, 0) * 0.5 + 2.0;
+  var g1: float64 = layout_x_label_w(l, l->nx - 1) * 0.5 + 2.0;
+  if (l->band) {
+    g0 = 0.0;
+    g1 = 0.0;
+  }
+  if (g0 > *left) { *left = g0; }
+  if (g1 > *right) { *right = g1; }
+}
+
+/// Lays out one frame: the bands above and below the plot, the plot rect from the measured
+/// tick labels and legend (or the chart's fixed margins), snapped to device pixels.
+///
+/// @param l The layout. Valid: non-zero, mp_layout_init done, ticks and legend size set.
+/// @return MP_OK, or MP_ERR_ARG for a target that is not finite and positive.
+/// @error MP_ERR_ARG the target size is not finite and > 0; l->plot is unset.
+/// @mem Writes l only.
+/// @thread Call with the chart entered.
+export fn mp_layout_compute(l: MpLayout*) -> int32 {
+  if (!(l->w > 0.0) || !(l->h > 0.0) || l->w >= 1e9 || l->h >= 1e9) { return MP_ERR_ARG; }
+  var top: float64 = layout_top(l);
+  var bottom: float64 = l->h - layout_bottom(l);
+  var left: float64 = 0.0;
+  var right: float64 = 0.0;
+  layout_sides(l, &left, &right);
+  if (!l->c->margins_auto) {
+    top = l->c->margins.top;
+    right = l->c->margins.right;
+    bottom = l->c->margins.bottom;
+    left = l->c->margins.left;
+  }
+  layout_clamp_pair(l->w - 2.0, &left, &right);
+  layout_clamp_pair(l->h - 2.0, &top, &bottom);
+  if (l->legend.pos == MP_LEGEND_RIGHT) { l->legend_x = l->w - l->pad_x - l->legend.w; }
+  var s: float64 = l->scale;
+  var x0: float64 = mp_snap_edge(left, s);
+  var y0: float64 = mp_snap_edge(top, s);
+  var x1: float64 = mp_snap_edge(l->w - right, s);
+  var y1: float64 = mp_snap_edge(l->h - bottom, s);
+  if (x1 - x0 < 1.0) { x1 = x0 + 1.0; }
+  if (y1 - y0 < 1.0) { y1 = y0 + 1.0; }
+  l->plot = mp_rect(x0, y0, x1 - x0, y1 - y0);
+  return MP_OK;
+}
+
+/// The colour series i is drawn in (its own colour or the theme palette's).
+///
+/// @param l The layout. Valid: non-zero.
+/// @param i Series index. Valid: 0 .. n_series-1.
+/// @return The colour.
+/// @mem Reads only.
+/// @thread Call with the chart entered.
+export fn mp_layout_color(l: MpLayout*, i: int32) -> MpColor {
+  var col: MpColor = l->c->series[(int64)i].color;
+  if (col.a == 0) { col = mp_theme_series(&l->c->theme, i); }
+  return col;
+}

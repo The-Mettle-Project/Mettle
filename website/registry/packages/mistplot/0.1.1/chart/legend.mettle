@@ -1,0 +1,187 @@
+//! The legend: measuring it for the layout and drawing it. Entries are a swatch and the
+//! series name; the swatch is a square for bars, a marker for scatter and a short line
+//! (with the series' marker, if any) otherwise. TOP and BOTTOM wrap into at most three
+//! rows and drop what does not fit; RIGHT is one column. Uses chart/layout and
+//! chart/axis.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/scene/snap";
+import "mistplot/chart/chart";
+import "mistplot/chart/layout";
+import "mistplot/chart/axis";
+
+const LEGEND_MAX_ROWS: int32 = 3;
+
+struct LegendMetrics {
+  sw: float64;      // swatch width
+  sw_gap: float64;  // swatch to label
+  item_gap: float64;
+  row_h: float64;
+}
+
+fn legend_metrics(t: MpTarget*) -> LegendMetrics {
+  var m: LegendMetrics;
+  if (t->measure == MP_MEASURE_CELLS) {
+    m.sw = t->cell_w * 2.0;
+    m.sw_gap = t->cell_w;
+    m.item_gap = t->cell_w * 2.0;
+    m.row_h = t->cell_h;
+  } else {
+    m.sw = 16.0;
+    m.sw_gap = 6.0;
+    m.item_gap = 16.0;
+    m.row_h = mp_target_text_h(t, MP_SIZE_TEXT) + 4.0;
+  }
+  return m;
+}
+
+/// The legend placement a chart actually uses (AUTO resolved).
+///
+/// @param c The chart. Valid: non-zero, entered.
+/// @return MP_LEGEND_NONE, TOP, RIGHT or BOTTOM.
+/// @mem Reads only.
+/// @thread Call with the chart entered.
+export fn mp_legend_pos(c: MpChart*) -> int32 {
+  if (c->n_series < 1) { return MP_LEGEND_NONE; }
+  if (c->legend == MP_LEGEND_AUTO) {
+    if (c->n_series >= 2) { return MP_LEGEND_TOP; }
+    return MP_LEGEND_NONE;
+  }
+  return c->legend;
+}
+
+fn legend_item_w(c: MpChart*, t: MpTarget*, m: LegendMetrics*, i: int32) -> float64 {
+  var nm: string = c->series[(int64)i].name;
+  if ((int64)nm.length == 0) { return m->sw; }
+  return m->sw + m->sw_gap + mp_target_text_w(t, nm, MP_SIZE_TEXT);
+}
+
+// Places entry i on a wrapping row; false when it falls past the last row.
+fn legend_flow(x: float64*, row: int32*, iw: float64, avail: float64) -> bool {
+  if (*x > 0.0 && *x + iw > avail) {
+    *x = 0.0;
+    *row = *row + 1;
+  }
+  return *row < LEGEND_MAX_ROWS;
+}
+
+/// Measures the legend for a target.
+///
+/// @param c The chart. Valid: non-zero, entered.
+/// @param t The target. Valid: non-zero.
+/// @param avail Width available to a TOP or BOTTOM legend. Units: px. Valid: > 0.
+/// @return The size (pos MP_LEGEND_NONE and zero size when there is no legend).
+/// @mem Reads only.
+/// @thread Call with the chart entered.
+export fn mp_legend_size(c: MpChart*, t: MpTarget*, avail: float64) -> MpLegendSize {
+  var r: MpLegendSize;
+  r.pos = mp_legend_pos(c);
+  r.rows = 0;
+  r.w = 0.0;
+  r.h = 0.0;
+  var m: LegendMetrics = legend_metrics(t);
+  var i: int32 = 0;
+  var x: float64 = 0.0;
+  var row: int32 = 0;
+  while (i < c->n_series && r.pos != MP_LEGEND_NONE) {
+    var iw: float64 = legend_item_w(c, t, &m, i);
+    if (r.pos == MP_LEGEND_RIGHT) {
+      if (iw > r.w) { r.w = iw; }
+      r.rows = r.rows + 1;
+    } else if (legend_flow(&x, &row, iw, avail)) {
+      x = x + iw + m.item_gap;
+      if (x - m.item_gap > r.w) { r.w = x - m.item_gap; }
+      r.rows = row + 1;
+    }
+    i = i + 1;
+  }
+  r.h = (float64)r.rows * m.row_h;
+  return r;
+}
+
+fn legend_marker(l: MpLayout*, i: int32, x: float64, y: float64, shape: int32) -> int32 {
+  var d: MpSeriesData* = &l->c->series[(int64)i];
+  var col: MpColor = mp_layout_color(l, i);
+  var r: float64 = d->marker_r;
+  if (r > 4.5) { r = 4.5; }
+  return mp_scene_marker(l->s, x, y, r, shape, mp_color_alpha(col, 204), l->c->theme.bg, 1.0,
+                         MP_CLS_LEGEND);
+}
+
+fn legend_swatch(l: MpLayout*, m: LegendMetrics*, i: int32, x: float64, cy: float64) -> int32 {
+  var c: MpChart* = l->c;
+  var d: MpSeriesData* = &c->series[(int64)i];
+  var col: MpColor = mp_layout_color(l, i);
+  var s: float64 = l->scale;
+  if (c->kind == MP_BAR) {
+    var side: float64 = 10.0;
+    if (l->cells) { side = l->t->cell_w; }
+    var x0: float64 = mp_snap_edge(x + (m->sw - side) * 0.5, s);
+    var y0: float64 = mp_snap_edge(cy - side * 0.5, s);
+    var r: MpRect = mp_rect(x0, y0, mp_snap_edge(x0 + side, s) - x0,
+                            mp_snap_edge(y0 + side, s) - y0);
+    return mp_scene_rect(l->s, r, col, mp_rgba(0, 0, 0, 0), 0.0, MP_CLS_LEGEND);
+  }
+  if (c->kind == MP_SCATTER) {
+    var shape: int32 = d->marker;
+    if (shape == MP_MARK_NONE) { shape = MP_MARK_CIRCLE; }
+    return legend_marker(l, i, x + m->sw * 0.5, cy, shape);
+  }
+  var w: float64 = d->width;
+  if (w > 3.0) { w = 3.0; }
+  var y: float64 = mp_snap_line(cy, w, s);
+  var rc: int32 = mp_scene_poly_begin(l->s, 2, col, mp_snap_width(w, s), d->dash, MP_NF_ROUND,
+                                      MP_CLS_LEGEND);
+  if (rc == MP_OK) { rc = mp_scene_poly_add(l->s, x, y); }
+  if (rc == MP_OK) { rc = mp_scene_poly_add(l->s, x + m->sw, y); }
+  if (rc == MP_OK) { rc = mp_scene_poly_end(l->s); }
+  if (rc == MP_OK && d->marker != MP_MARK_NONE) {
+    rc = legend_marker(l, i, x + m->sw * 0.5, cy, d->marker);
+  }
+  return rc;
+}
+
+fn legend_item(l: MpLayout*, m: LegendMetrics*, i: int32, x: float64, top: float64) -> int32 {
+  var rc: int32 = legend_swatch(l, m, i, x, top + m->row_h * 0.5);
+  if (rc != MP_OK) { return rc; }
+  var lh: float64 = mp_target_text_h(l->t, MP_SIZE_TEXT);
+  return mp_axis_text(l, x + m->sw + m->sw_gap, top + (m->row_h - lh) * 0.5,
+                      l->c->series[(int64)i].name, MP_SIZE_TEXT, l->c->theme.text,
+                      MP_ALIGN_START, 0, MP_CLS_LEGEND);
+}
+
+/// Draws the legend where the layout put it.
+///
+/// @param l The layout. Valid: non-zero, laid out.
+/// @return MP_OK, or the scene's error.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT the scene could not grow; the legend is partial.
+/// @mem Writes into l->s only.
+/// @thread Call with the chart entered.
+export fn mp_legend_draw(l: MpLayout*) -> int32 {
+  var pos: int32 = l->legend.pos;
+  if (pos == MP_LEGEND_NONE) { return MP_OK; }
+  var c: MpChart* = l->c;
+  var m: LegendMetrics = legend_metrics(l->t);
+  var avail: float64 = l->w - 2.0 * l->pad_x;
+  var x: float64 = 0.0;
+  var row: int32 = 0;
+  var rc: int32 = MP_OK;
+  var i: int32 = 0;
+  while (i < c->n_series && rc == MP_OK) {
+    var iw: float64 = legend_item_w(c, l->t, &m, i);
+    if (pos == MP_LEGEND_RIGHT) {
+      rc = legend_item(l, &m, i, l->legend_x, l->plot.y + (float64)i * m.row_h);
+    } else if (legend_flow(&x, &row, iw, avail)) {
+      rc = legend_item(l, &m, i, l->legend_x + x, l->legend_y + (float64)row * m.row_h);
+      x = x + iw + m.item_gap;
+    }
+    i = i + 1;
+  }
+  return rc;
+}

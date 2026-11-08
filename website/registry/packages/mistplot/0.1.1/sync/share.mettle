@@ -1,0 +1,56 @@
+//! Makes a chart safe to use from several threads: installs a recursive spin lock as the
+//! chart's lock hooks. The fast path is one compare-and-swap; the thread id (a system
+//! call) is read only by mp_chart_lock, to record the batch owner, and on a contended
+//! acquire, to recognise re-entry by that owner. The only module that imports std/thread.
+
+import "std/thread";
+import "mistplot/core/error";
+import "mistplot/chart/chart";
+
+fn share_lock(ctx: rawptr, batch: int32) {
+  var c: MpChart* = (MpChart*)ctx;
+  if (InterlockedCompareExchange(&c->sync_word, 1, 0) == 0) {
+    c->sync_depth = 0;
+    c->sync_owner = 0;
+    if (batch != 0) { c->sync_owner = GetCurrentThreadId(); }
+    return;
+  }
+  var me: uint32 = GetCurrentThreadId();
+  if (c->sync_owner == me) {
+    c->sync_depth = c->sync_depth + 1;
+    return;
+  }
+  while (InterlockedCompareExchange(&c->sync_word, 1, 0) != 0) { Sleep(0); }
+  c->sync_depth = 0;
+  c->sync_owner = 0;
+  if (batch != 0) { c->sync_owner = me; }
+}
+
+fn share_unlock(ctx: rawptr, batch: int32) {
+  var c: MpChart* = (MpChart*)ctx;
+  if (c->sync_depth > 0) {
+    c->sync_depth = c->sync_depth - 1;
+    return;
+  }
+  c->sync_owner = 0;
+  InterlockedExchange(&c->sync_word, 0);
+}
+
+/// Makes every mp_chart_* call on c take a recursive spin lock, so producers, renderers and
+/// integrations may use the chart from any thread. A thread holding mp_chart_lock may call
+/// any chart function (they nest); calling twice is harmless.
+///
+/// @param c The chart. Valid: non-zero, not yet reachable from another thread.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0; nothing changes.
+/// @mem The lock state lives in the chart; nothing is allocated.
+/// @thread Call before starting the threads that share c.
+/// @cost Afterwards about one compare-and-swap per call when uncontended.
+export fn mp_chart_share(c: MpChart*) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  if (c->lock_ctx == (rawptr)c) { return MP_OK; }
+  c->sync_word = 0;
+  c->sync_owner = 0;
+  c->sync_depth = 0;
+  return mp_chart_set_lock_hooks(c, &share_lock, &share_unlock, (rawptr)c);
+}

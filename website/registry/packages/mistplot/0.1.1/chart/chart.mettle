@@ -1,0 +1,576 @@
+//! MpChart, the one chart object for static and live charts: it owns copies of every
+//! string, a sample column per series, the style, the cached scene and SVG and all frame
+//! scratch. "Live" only means mp_chart_keep (a ring per series) and/or mp_chart_window.
+//! Every exported mp_chart_* takes the chart's lock hooks (no-ops until mp_chart_share)
+//! and records its first failure as the sticky error. seq grows by one on every change
+//! that can alter a frame, and never on a call that changes nothing. Uses core, data
+//! (col, summary) and scene; no std/thread, no I/O.
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/str";
+import "mistplot/core/format";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
+import "mistplot/data/col";
+import "mistplot/data/summary";
+import "mistplot/scene/scene";
+
+/// Chart kind: one line per series through its samples in x order.
+export const MP_LINE: int32 = 0;
+/// Chart kind: lines with a gradient fill down to the zero line (or the plot bottom).
+export const MP_AREA: int32 = 1;
+/// Chart kind: bars; sample i of every series sits in band i (see mp_chart_set_value).
+export const MP_BAR: int32 = 2;
+/// Chart kind: one marker per sample.
+export const MP_SCATTER: int32 = 3;
+
+/// Legend placement: none for one series, MP_LEGEND_TOP for two or more.
+export const MP_LEGEND_AUTO: int32 = 0;
+/// Legend placement: no legend.
+export const MP_LEGEND_NONE: int32 = 1;
+/// Legend placement: rows under the title, wrapping to at most three rows.
+export const MP_LEGEND_TOP: int32 = 2;
+/// Legend placement: one column right of the plot.
+export const MP_LEGEND_RIGHT: int32 = 3;
+/// Legend placement: rows under the x axis, wrapping to at most three rows.
+export const MP_LEGEND_BOTTOM: int32 = 4;
+
+/// Grid: horizontal lines at the y ticks (the default).
+export const MP_GRID_Y: int32 = 0;
+/// Grid: none.
+export const MP_GRID_NONE: int32 = 1;
+/// Grid: vertical lines at the x ticks.
+export const MP_GRID_X: int32 = 2;
+/// Grid: both.
+export const MP_GRID_XY: int32 = 3;
+
+/// Most series in one chart.
+export const MP_MAX_SERIES: int32 = 32;
+/// Most categories (bands) in one bar chart.
+export const MP_MAX_CATEGORIES: int32 = 65536;
+/// Longest accepted text (title, labels, names, categories). Units: bytes.
+export const MP_MAX_TEXT: int64 = 1024;
+
+const CHART_SERIES_MIN: int32 = 4;
+
+/// One series: its samples, its style and the view drawn by the last frame.
+/// Read it through mp_chart_* and mp_series_*; the frame pipeline reads it directly.
+///
+/// @mem Owned by its chart: name is an owned copy, col, sum and the view arrays are freed
+///   by mp_chart_free.
+/// @internal
+export struct MpSeriesData {
+  name: string;       /// owned legend name ("" = none)
+  col: MpCol;         /// samples
+  sum: MpSummary;     /// O(width) frame summary of col (large sorted series only)
+  color: MpColor;     /// explicit colour; alpha 0 = the theme palette
+  width: float64;     /// line width, px
+  dash: int32;        /// MP_DASH_*
+  marker: int32;      /// MP_MARK_*
+  marker_r: float64;  /// marker radius, px
+  smooth: bool;       /// monotone cubic smoothing (line and area)
+  fill: bool;         /// gradient fill under the line (line and area)
+  vx: float64*;       /// view x of the last frame, data units
+  vy: float64*;       /// view y of the last frame, data units
+  vn: int64;          /// view points
+  vcap: int64;        /// view capacity (grows only)
+}
+
+/// Counters for benchmarks and tests.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpChartStats {
+  scene_builds: int64;      /// scenes rebuilt (cache misses)
+  svg_renders: int64;       /// SVG documents serialized
+  pushes: int64;            /// samples pushed
+  summary_rebuilds: int64;  /// full O(n) summary rebuilds, all series
+}
+
+/// Geometry of the last frame, for hover and hit testing.
+///
+/// @mem Plain value; the scales are copies.
+export struct MpChartInfo {
+  valid: bool;      /// a plot with data was laid out
+  kind: int32;      /// MP_LINE .. MP_SCATTER
+  plot: MpRect;     /// plot rect, logical px from the chart's top-left
+  x: MpScale;       /// final x scale (a band scale for bars)
+  y: MpScale;       /// final y scale
+  x0: float64;      /// x domain start (bars: 0)
+  x1: float64;      /// x domain end (bars: band count)
+  y0: float64;      /// y domain start, after zero, nice and log fixups
+  y1: float64;      /// y domain end
+  n_bands: int32;   /// bars: band count, else 0
+  x_fmt: int32;     /// effective x label format (MP_FMT_TIME_TENTHS for sub-second steps)
+  y_fmt: int32;     /// effective y label format
+  width: float64;   /// target width, logical px
+  height: float64;  /// target height, logical px
+  scale: float64;   /// target device scale
+}
+
+/// The chart. Read and change it only through the mp_chart_* and mp_series_* functions;
+/// the fields are listed for the frame pipeline and the integrations.
+///
+/// @mem Heap object from mp_chart_new, released with mp_chart_free, which frees every
+///   field below. Borrows nothing.
+export struct MpChart {
+  kind: int32;                 /// MP_LINE .. MP_SCATTER
+  series: MpSeriesData*;       /// n_series used of cap_series
+  n_series: int32;             /// series count
+  cap_series: int32;           /// allocated series slots
+  cats: string*;               /// owned category names, first-seen order
+  n_cats: int32;               /// categories
+  cap_cats: int32;             /// allocated category slots
+  title: string;               /// owned
+  subtitle: string;            /// owned
+  x_label: string;             /// owned
+  y_label: string;             /// owned
+  font: string;                /// owned CSS font-family ("" = MP_FONT_STACK)
+  theme: MpTheme;              /// colours
+  theme_explicit: bool;        /// mp_chart_set_theme was called
+  legend: int32;               /// MP_LEGEND_*
+  grid: int32;                 /// MP_GRID_*
+  x_fmt: int32;                /// MP_FMT_*
+  y_fmt: int32;                /// MP_FMT_*
+  x_log: bool;                 /// log x axis
+  y_log: bool;                 /// log y axis
+  y_zero: bool;                /// auto y domain includes 0
+  hover: bool;                 /// hosts may show a hover readout
+  x_fixed: bool;               /// x domain is [x_lo, x_hi]
+  x_lo: float64;               /// fixed x start
+  x_hi: float64;               /// fixed x end
+  y_fixed: bool;               /// y domain is [y_lo, y_hi]
+  y_lo: float64;               /// fixed y start
+  y_hi: float64;               /// fixed y end
+  bar_gap: float64;            /// gap between bars, fraction of a band
+  margins: MpInsets;           /// explicit margins, px
+  margins_auto: bool;          /// margins come from the layout
+  keep: int64;                 /// ring size per series; 0 = unbounded
+  span: float64;               /// window span; 0 = everything
+  latest_x: float64;           /// largest finite x pushed to any series
+  has_latest: bool;            /// latest_x is set
+  has_now: bool;               /// mp_chart_set_now is in effect
+  now: float64;                /// the caller's current time, x units
+  y_ease: bool;                /// live charts ease an auto y domain (default on)
+  ease_ok: bool;               /// ease_lo, ease_hi and ease_t hold the last eased frame
+  ease_t: float64;             /// now of the last eased frame
+  ease_lo: float64;            /// eased y domain start
+  ease_hi: float64;            /// eased y domain end
+  seq: int64;                  /// change counter
+  generation: int64;           /// caller-chosen frame generation
+  err: int32;                  /// sticky first error
+  stats: MpChartStats;         /// counters
+  lock_cb: fn(rawptr, int32) -> void with alloc, syscall, asm;    /// lock hook (ctx, batch)
+  unlock_cb: fn(rawptr, int32) -> void with alloc, syscall, asm;  /// unlock hook
+  lock_ctx: rawptr;            /// passed to the hooks
+  sync_word: int32;            /// mp_chart_share: 0 free, 1 held
+  sync_owner: uint32;          /// mp_chart_share: thread holding a batch lock, or 0
+  sync_depth: int32;           /// mp_chart_share: nested acquisitions by the holder
+  scene: MpScene*;             /// cached scene
+  scene_seq: int64;            /// seq the scene was built at
+  scene_key: uint64;           /// mp_target_key of its target
+  scene_ok: bool;              /// the cached scene is usable
+  info: MpChartInfo;           /// geometry of the cached scene
+  svg: MpBuf*;                 /// cached SVG (mp_chart_svg_view)
+  svg_seq: int64;              /// seq of the cached SVG
+  svg_w: float64;              /// its width
+  svg_h: float64;              /// its height
+  svg_ok: bool;                /// the cached SVG is usable
+  scratch: uint8*;             /// frame scratch (grows only)
+  scratch_cap: int64;          /// scratch bytes
+}
+
+fn chart_nolock(ctx: rawptr, batch: int32) {
+}
+
+/// Takes the chart's lock hook for one exported call.
+///
+/// @param c The chart. Valid: non-zero.
+/// @mem Nothing is retained.
+/// @thread Pairs with mp_chart_leave on the same thread.
+/// @internal
+export fn mp_chart_enter(c: MpChart*) {
+  c->lock_cb(c->lock_ctx, 0);
+}
+
+/// Releases the lock taken by mp_chart_enter.
+///
+/// @param c The chart. Valid: non-zero, entered by this thread.
+/// @mem Nothing is retained.
+/// @thread The thread that called mp_chart_enter.
+/// @internal
+export fn mp_chart_leave(c: MpChart*) {
+  c->unlock_cb(c->lock_ctx, 0);
+}
+
+/// Records rc as the sticky error when none is recorded yet; returns rc.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param rc A result code. Valid: any; MP_OK records nothing.
+/// @return rc.
+/// @mem Nothing is retained.
+/// @thread Call with the chart entered.
+/// @internal
+export fn mp_chart_fail(c: MpChart*, rc: int32) -> int32 {
+  if (rc != MP_OK && c->err == MP_OK) { c->err = rc; }
+  return rc;
+}
+
+/// Marks a change that can alter the next frame.
+///
+/// @param c The chart. Valid: non-zero.
+/// @mem Nothing is retained.
+/// @thread Call with the chart entered.
+/// @internal
+export fn mp_chart_touch(c: MpChart*) {
+  c->seq = c->seq + 1;
+}
+
+fn chart_kind_ok(kind: int32) -> bool {
+  return kind >= MP_LINE && kind <= MP_SCATTER;
+}
+
+/// Creates an empty chart: light theme, auto legend, y grid, auto formats, y axis from
+/// zero, margins from the layout, bar gap 0.2, unbounded series, no window.
+///
+/// @param kind MP_LINE, MP_AREA, MP_BAR or MP_SCATTER. Valid: 0 .. 3; anything else gives 0.
+/// @return The chart, or 0 for an unknown kind or a failed allocation.
+/// @mem The caller owns the chart and releases it with mp_chart_free.
+/// @thread Safe from any thread.
+/// @cost One allocation for the chart and one for its scene.
+export fn mp_chart_new(kind: int32) -> MpChart* {
+  if (!chart_kind_ok(kind)) { return 0; }
+  var c: MpChart* = (MpChart*)mp_alloc_zero((int64)sizeof(MpChart));
+  if (c == 0) { return 0; }
+  c->scene = mp_scene_new();
+  if (c->scene == 0) {
+    mp_free((rawptr)c);
+    return 0;
+  }
+  c->kind = kind;
+  c->title = "";
+  c->subtitle = "";
+  c->x_label = "";
+  c->y_label = "";
+  c->font = "";
+  var th: MpTheme = mp_theme_light();
+  c->theme = th;
+  c->legend = MP_LEGEND_AUTO;
+  c->grid = MP_GRID_Y;
+  c->y_zero = true;
+  c->y_ease = true;
+  c->hover = true;
+  c->bar_gap = 0.2;
+  c->margins_auto = true;
+  c->err = MP_OK;
+  c->lock_cb = &chart_nolock;
+  c->unlock_cb = &chart_nolock;
+  c->lock_ctx = 0;
+  return c;
+}
+
+fn chart_series_free(d: MpSeriesData*) {
+  mp_str_free(d->name);
+  d->name = "";
+  mp_col_free(&d->col);
+  mp_summary_free(&d->sum);
+  if (d->vx != 0) { mp_free((rawptr)d->vx); }
+  if (d->vy != 0) { mp_free((rawptr)d->vy); }
+  d->vx = 0;
+  d->vy = 0;
+  d->vn = 0;
+  d->vcap = 0;
+}
+
+/// Releases a chart and everything it owns.
+///
+/// @param c The chart. Valid: a chart from mp_chart_new, or 0 (ignored).
+/// @mem c and every pointer obtained from it are invalid afterwards. Unregister the chart
+///   from integrations first.
+/// @thread No other thread may use c during or after the call.
+export fn mp_chart_free(c: MpChart*) {
+  if (c == 0) { return; }
+  var i: int32 = 0;
+  while (i < c->n_series) {
+    chart_series_free(&c->series[(int64)i]);
+    i = i + 1;
+  }
+  if (c->series != 0) { mp_free((rawptr)c->series); }
+  var j: int32 = 0;
+  while (j < c->n_cats) {
+    mp_str_free(c->cats[(int64)j]);
+    j = j + 1;
+  }
+  if (c->cats != 0) { mp_free((rawptr)c->cats); }
+  mp_str_free(c->title);
+  mp_str_free(c->subtitle);
+  mp_str_free(c->x_label);
+  mp_str_free(c->y_label);
+  mp_str_free(c->font);
+  mp_scene_free(c->scene);
+  if (c->svg != 0) { mp_buf_free(c->svg); }
+  if (c->scratch != 0) { mp_free((rawptr)c->scratch); }
+  mp_free((rawptr)c);
+}
+
+/// The chart's kind.
+///
+/// @param c The chart. Valid: non-zero; 0 gives -1.
+/// @return MP_LINE .. MP_SCATTER, or -1.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_kind(c: MpChart*) -> int32 {
+  if (c == 0) { return -1; }
+  return c->kind;
+}
+
+fn chart_grow_series(c: MpChart*) -> int32 {
+  if (c->n_series < c->cap_series) { return MP_OK; }
+  var cap: int32 = c->cap_series * 2;
+  if (cap < CHART_SERIES_MIN) { cap = CHART_SERIES_MIN; }
+  if (cap > MP_MAX_SERIES) { cap = MP_MAX_SERIES; }
+  var bytes: int64 = (int64)cap * (int64)sizeof(MpSeriesData);
+  var p: MpSeriesData* = (MpSeriesData*)mp_alloc_zero(bytes);
+  if (p == 0) { return MP_ERR_ALLOC; }
+  var i: int32 = 0;
+  while (i < c->n_series) {
+    p[(int64)i] = c->series[(int64)i];
+    i = i + 1;
+  }
+  if (c->series != 0) { mp_free((rawptr)c->series); }
+  c->series = p;
+  c->cap_series = cap;
+  return MP_OK;
+}
+
+fn chart_series_add(c: MpChart*, name: string) -> int32 {
+  if ((int64)name.length > MP_MAX_TEXT) { return -MP_ERR_LIMIT; }
+  if (c->n_series >= MP_MAX_SERIES) { return -MP_ERR_LIMIT; }
+  var rc: int32 = chart_grow_series(c);
+  if (rc != MP_OK) { return -rc; }
+  var copy: string = mp_str_dup(name);
+  if ((int64)copy.length == 0 && (int64)name.length > 0) { return -MP_ERR_ALLOC; }
+  var d: MpSeriesData* = &c->series[(int64)c->n_series];
+  d->name = copy;
+  mp_col_init(&d->col);
+  mp_col_set_keep(&d->col, c->keep);
+  mp_summary_init(&d->sum);
+  d->color = mp_rgba(0, 0, 0, 0);
+  d->width = 2.0;
+  d->dash = MP_DASH_SOLID;
+  d->marker = MP_MARK_NONE;
+  d->marker_r = 3.5;
+  d->smooth = false;
+  d->fill = c->kind == MP_AREA;
+  d->vx = 0;
+  d->vy = 0;
+  d->vn = 0;
+  d->vcap = 0;
+  var idx: int32 = c->n_series;
+  c->n_series = c->n_series + 1;
+  mp_chart_touch(c);
+  return idx;
+}
+
+/// Adds a series and returns its index.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param name Legend name. Valid: up to MP_MAX_TEXT bytes of UTF-8; "" draws no label.
+/// @return The new index (0, 1, ...), or -1.
+/// @error MP_ERR_ARG c is 0 (-1, nothing recorded).
+/// @error MP_ERR_LIMIT already MP_MAX_SERIES series, or name is too long; nothing changes.
+/// @error MP_ERR_ALLOC the series or the name copy could not be allocated; nothing changes.
+/// @mem name is copied.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_series(c: MpChart*, name: string) -> int32 {
+  if (c == 0) { return -1; }
+  mp_chart_enter(c);
+  var r: int32 = chart_series_add(c, name);
+  if (r < 0) {
+    mp_chart_fail(c, -r);
+    r = -1;
+  }
+  mp_chart_leave(c);
+  return r;
+}
+
+/// Number of series.
+///
+/// @param c The chart. Valid: non-zero; 0 gives 0.
+/// @return The series count.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_series_count(c: MpChart*) -> int32 {
+  if (c == 0) { return 0; }
+  mp_chart_enter(c);
+  var n: int32 = c->n_series;
+  mp_chart_leave(c);
+  return n;
+}
+
+/// The change counter: it grows by one on every call that can change the next frame
+/// (pushes, setters with a new value, clears) and stays put otherwise.
+///
+/// @param c The chart. Valid: non-zero; 0 gives 0.
+/// @return The counter, starting at 0 for a new chart.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_seq(c: MpChart*) -> int64 {
+  if (c == 0) { return 0; }
+  mp_chart_enter(c);
+  var v: int64 = c->seq;
+  mp_chart_leave(c);
+  return v;
+}
+
+/// The caller-chosen generation, so "generation-seq" names a frame across restarts.
+///
+/// @param c The chart. Valid: non-zero; 0 gives 0.
+/// @return The generation (0 until set).
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_generation(c: MpChart*) -> int64 {
+  if (c == 0) { return 0; }
+  mp_chart_enter(c);
+  var v: int64 = c->generation;
+  mp_chart_leave(c);
+  return v;
+}
+
+/// Sets the generation; seq does not move.
+///
+/// @param c The chart. Valid: non-zero; 0 is ignored.
+/// @param g The generation. Valid: any (e.g. the process start time in microseconds).
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_generation(c: MpChart*, g: int64) {
+  if (c == 0) { return; }
+  mp_chart_enter(c);
+  c->generation = g;
+  mp_chart_leave(c);
+}
+
+/// The first error recorded since creation or mp_chart_error_clear.
+///
+/// @param c The chart. Valid: non-zero; 0 gives MP_ERR_ARG.
+/// @return MP_OK, or the sticky error code (text from mp_error_str).
+/// @error MP_ERR_ARG c is 0 (returned, not recorded).
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_error(c: MpChart*) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var v: int32 = c->err;
+  mp_chart_leave(c);
+  return v;
+}
+
+/// Forgets the sticky error.
+///
+/// @param c The chart. Valid: non-zero; 0 is ignored.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_error_clear(c: MpChart*) {
+  if (c == 0) { return; }
+  mp_chart_enter(c);
+  c->err = MP_OK;
+  mp_chart_leave(c);
+}
+
+/// Copies the chart's counters.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param out Receives the counters. Valid: non-zero.
+/// @return MP_OK, or MP_ERR_ARG.
+/// @error MP_ERR_ARG c or out is 0; out is unchanged.
+/// @mem Writes *out only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_stats(c: MpChart*, out: MpChartStats*) -> int32 {
+  if (c == 0 || out == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var st: MpChartStats = c->stats;
+  var r: int64 = 0;
+  var i: int32 = 0;
+  while (i < c->n_series) {
+    r = r + c->series[(int64)i].sum.rebuilds;
+    i = i + 1;
+  }
+  st.summary_rebuilds = r;
+  *out = st;
+  mp_chart_leave(c);
+  return MP_OK;
+}
+
+/// Takes the chart's lock so several calls act as one (e.g. clear and refill without a
+/// half-drawn frame). Recursive on the same thread; a no-op until mp_chart_share(c).
+///
+/// @param c The chart. Valid: non-zero; 0 is ignored.
+/// @mem Pointers borrowed from the chart (mp_chart_scene, mp_chart_svg_view) stay valid
+///   until mp_chart_unlock.
+/// @thread Pair every call with mp_chart_unlock on the same thread.
+export fn mp_chart_lock(c: MpChart*) {
+  if (c == 0) { return; }
+  c->lock_cb(c->lock_ctx, 1);
+}
+
+/// Releases one mp_chart_lock.
+///
+/// @param c The chart. Valid: non-zero, locked by this thread; 0 is ignored.
+/// @mem Borrowed pointers may go stale once the lock is released.
+/// @thread The thread that called mp_chart_lock.
+export fn mp_chart_unlock(c: MpChart*) {
+  if (c == 0) { return; }
+  c->unlock_cb(c->lock_ctx, 1);
+}
+
+/// Installs lock hooks; called with batch = 1 for mp_chart_lock/unlock and 0 around every
+/// other exported call. mp_chart_share installs a recursive spin lock through this. The
+/// hook types are closed to alloc, syscall and asm, so callers whose own callback types
+/// carry effect clauses (MeoDB scans) can call chart functions.
+///
+/// @param c The chart. Valid: non-zero, not yet shared between threads.
+/// @param mp_chart_lock_cb Acquires; called as mp_chart_lock_cb(ctx, batch). Valid: must
+///   allow re-entry by the thread holding a batch lock.
+/// @param mp_chart_unlock_cb Releases; called as mp_chart_unlock_cb(ctx, batch).
+/// @param ctx Passed to both hooks. Valid: any; borrowed for the chart's lifetime.
+/// @return MP_OK, or MP_ERR_ARG.
+/// @error MP_ERR_ARG c is 0; nothing changes.
+/// @mem ctx is borrowed and must outlive the chart.
+/// @thread Call before any other thread can reach c.
+/// @internal
+export fn mp_chart_set_lock_hooks(c: MpChart*,
+                                  mp_chart_lock_cb: fn(rawptr, int32) -> void with alloc,
+                                    syscall, asm,
+                                  mp_chart_unlock_cb: fn(rawptr, int32) -> void with alloc,
+                                    syscall, asm,
+                                  ctx: rawptr) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  c->lock_cb = mp_chart_lock_cb;
+  c->unlock_cb = mp_chart_unlock_cb;
+  c->lock_ctx = ctx;
+  return MP_OK;
+}
+
+/// Chart-owned byte scratch of at least bytes bytes; grows only, so steady frames reuse it.
+///
+/// @param c The chart. Valid: non-zero, entered or locked.
+/// @param bytes Size wanted. Units: bytes. Valid: 0 .. MP_MAX_COUNT * 8.
+/// @return The scratch, or 0 when c is 0, bytes is out of range or the growth failed.
+/// @mem Owned by the chart; valid until the next call that may grow it or mp_chart_free.
+/// @thread Call with the chart entered or locked.
+/// @internal
+export fn mp_chart_scratch(c: MpChart*, bytes: int64) -> uint8* {
+  if (c == 0 || bytes < 0 || bytes > MP_MAX_COUNT * 8) { return 0; }
+  if (bytes <= c->scratch_cap && c->scratch != 0) { return c->scratch; }
+  var want: int64 = bytes;
+  if (want < 1024) { want = 1024; }
+  var p: uint8* = (uint8*)mp_alloc(want);
+  if (p == 0) { return 0; }
+  if (c->scratch != 0) { mp_free((rawptr)c->scratch); }
+  c->scratch = p;
+  c->scratch_cap = want;
+  return p;
+}

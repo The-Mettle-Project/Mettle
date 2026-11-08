@@ -1,0 +1,65 @@
+//! Pixel snapping for crisp hairlines and edges at any device scale. All values are in
+//! logical px; scale is device px per logical px (MpTarget.scale). Rounding is half-up
+//! (floor(v + 0.5)). A scale that is not a finite number > 0 counts as 1. Pure; depends
+//! only on std/math.
+
+import "std/math";
+
+fn snap_scale(scale: float64) -> float64 {
+  if (!(scale > 0.0) || scale > 1e6) { return 1.0; }
+  return scale;
+}
+
+fn snap_round(v: float64) -> float64 {
+  return floor(v + 0.5);
+}
+
+fn snap_device_w(w: float64, s: float64) -> float64 {
+  var dw: float64 = snap_round(w * s);
+  if (!(dw >= 1.0)) { dw = 1.0; }
+  return dw;
+}
+
+/// Stroke width rounded to whole device pixels, at least one device pixel.
+///
+/// @param w Stroke width. Units: px. Valid: any; non-finite or < 1 device px gives 1/scale.
+/// @param scale Device px per px. Valid: > 0.
+/// @return max(1, round(w * scale)) / scale.
+/// @thread Safe from any thread.
+export fn mp_snap_width(w: float64, scale: float64) -> float64 {
+  var s: float64 = snap_scale(scale);
+  return snap_device_w(w, s) / s;
+}
+
+/// Position of a horizontal or vertical line so its stroke covers whole device pixels.
+/// An odd device width centres the line on a pixel centre, an even one on a pixel edge.
+///
+/// @param v Line centre (y of a horizontal line, x of a vertical one). Units: px.
+///   Valid: finite.
+/// @param w Stroke width. Units: px. Valid: any; see mp_snap_width.
+/// @param scale Device px per px. Valid: > 0.
+/// @return The snapped centre in px.
+/// @thread Safe from any thread.
+export fn mp_snap_line(v: float64, w: float64, scale: float64) -> float64 {
+  var s: float64 = snap_scale(scale);
+  var dw: float64 = snap_device_w(w, s);
+  var c: float64 = v * s;
+  var odd: bool = dw - 2.0 * floor(dw / 2.0) == 1.0;
+  if (odd) {
+    c = floor(c) + 0.5;
+  } else {
+    c = snap_round(c);
+  }
+  return c / s;
+}
+
+/// Edge (of a bar or the plot rect) rounded to the nearest device pixel boundary.
+///
+/// @param v Edge position. Units: px. Valid: finite.
+/// @param scale Device px per px. Valid: > 0.
+/// @return round(v * scale) / scale.
+/// @thread Safe from any thread.
+export fn mp_snap_edge(v: float64, scale: float64) -> float64 {
+  var s: float64 = snap_scale(scale);
+  return snap_round(v * s) / s;
+}

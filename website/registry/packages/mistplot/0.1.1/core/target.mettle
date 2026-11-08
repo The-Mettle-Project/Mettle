@@ -1,0 +1,175 @@
+//! A render target: logical size, device scale and how text is measured. Passed to every
+//! render call, so one chart can serve an SVG, a terminal and a HiDPI window at once and
+//! no measurer is process-global. Flat value (no nested structs); uses core/str for
+//! code-point counts. Sizes are logical px; the device has scale device px per logical px.
+
+import "mistplot/core/str";
+
+/// Text measurement: width = code points * size * 0.58, height = size * 1.2.
+export const MP_MEASURE_HEURISTIC: int32 = 0;
+/// Text measurement for terminals: one cell per code point, one row per line.
+export const MP_MEASURE_CELLS: int32 = 1;
+/// Text measurement through the callback set by mp_target_set_measure.
+export const MP_MEASURE_CUSTOM: int32 = 2;
+
+/// Width of one terminal cell. Units: logical px.
+export const MP_CELL_W: float64 = 8.0;
+/// Height of one terminal cell (one text line). Units: logical px.
+export const MP_CELL_H: float64 = 16.0;
+
+/// Where and at what resolution a chart is rendered.
+/// Build it with mp_target, mp_target_hidpi or mp_target_cells, never field by field.
+///
+/// @mem Plain value. ctx is borrowed from the host and never freed here.
+export struct MpTarget {
+  width: float64;    /// logical width, px
+  height: float64;   /// logical height, px
+  scale: float64;    /// device px per logical px (1 for SVG and terminals)
+  measure: int32;    /// MP_MEASURE_HEURISTIC, MP_MEASURE_CELLS or MP_MEASURE_CUSTOM
+  cell_w: float64;   /// cell width for MP_MEASURE_CELLS, px
+  cell_h: float64;   /// cell height (line height) for MP_MEASURE_CELLS, px
+  key: uint64;       /// host key identifying the custom measurer (part of mp_target_key)
+  ctx: rawptr;       /// passed to width_cb; not part of mp_target_key
+  width_cb: fn(rawptr, string, float64) -> float64;   /// custom width measurer
+}
+
+fn target_heuristic_cb(ctx: rawptr, s: string, size: float64) -> float64 {
+  return (float64)mp_utf8_len(s) * size * 0.58;
+}
+
+/// A target of w x h logical px at scale 1 with heuristic text measurement.
+///
+/// @param w Width. Units: logical px. Valid: finite and > 0; other values are stored and
+///   rejected by the render call.
+/// @param h Height. Units: logical px. Valid: finite and > 0 (as w).
+/// @return The target.
+export fn mp_target(w: float64, h: float64) -> MpTarget {
+  var t: MpTarget;
+  t.width = w;
+  t.height = h;
+  t.scale = 1.0;
+  t.measure = MP_MEASURE_HEURISTIC;
+  t.cell_w = MP_CELL_W;
+  t.cell_h = MP_CELL_H;
+  t.key = (uint64)0;
+  t.ctx = 0;
+  t.width_cb = &target_heuristic_cb;
+  return t;
+}
+
+/// A target of w x h logical px drawn at scale device px per logical px.
+///
+/// @param w Width. Units: logical px. Valid: finite and > 0; other values are stored and
+///   rejected by the render call.
+/// @param h Height. Units: logical px. Valid: finite and > 0 (as w).
+/// @param scale Device px per logical px (e.g. 1, 1.25, 2). Valid: finite and > 0; other
+///   values are stored and rejected by the render call.
+/// @return The target, with heuristic text measurement.
+export fn mp_target_hidpi(w: float64, h: float64, scale: float64) -> MpTarget {
+  var t: MpTarget = mp_target(w, h);
+  t.scale = scale;
+  return t;
+}
+
+/// A terminal target of cols x rows cells.
+/// Each cell is MP_CELL_W x MP_CELL_H logical px, text takes one cell per code point and
+/// a line of text is one row.
+///
+/// @param cols Columns. Units: cells. Valid: >= 1; renderers enforce their own maximum.
+/// @param rows Rows. Units: cells. Valid: >= 1; renderers enforce their own maximum.
+/// @return The target: width cols * 8, height rows * 16, scale 1, MP_MEASURE_CELLS.
+export fn mp_target_cells(cols: int32, rows: int32) -> MpTarget {
+  var t: MpTarget = mp_target((float64)cols * MP_CELL_W, (float64)rows * MP_CELL_H);
+  t.measure = MP_MEASURE_CELLS;
+  return t;
+}
+
+/// Installs a custom text-width measurer; heights stay size * 1.2.
+///
+/// @param t The target. Valid: non-zero; 0 is ignored.
+/// @param mp_target_measure_cb Returns the width in logical px of a string at a font
+///   size in px; called as mp_target_measure_cb(ctx, text, size). Valid: a function
+///   that does not keep the string.
+/// @param ctx Passed to the callback. Valid: any; borrowed.
+/// @param key Identifies the measurer and its fonts in mp_target_key (e.g. a hash of the
+///   font pointer and scale). Valid: any; change it whenever measurements would change.
+/// @mem ctx is borrowed and must outlive every render with this target.
+/// @thread One thread at a time per target.
+export fn mp_target_set_measure(t: MpTarget*,
+                                mp_target_measure_cb: fn(rawptr, string, float64) -> float64,
+                                ctx: rawptr, key: uint64) {
+  if (t == 0) { return; }
+  t->measure = MP_MEASURE_CUSTOM;
+  t->width_cb = mp_target_measure_cb;
+  t->ctx = ctx;
+  t->key = key;
+}
+
+/// Width of a single line of text on a target.
+///
+/// @param t The target. Valid: non-zero; 0 gives 0.
+/// @param s The text. Valid: any UTF-8 (invalid bytes count as one code point each).
+/// @param size Font size. Units: logical px. Valid: > 0; ignored by MP_MEASURE_CELLS.
+/// @return The width in logical px.
+/// @mem s is only read (and passed to a custom measurer).
+/// @thread One thread at a time per target, plus whatever the custom measurer requires.
+/// @cost O(len(s)) for the built-in modes.
+export fn mp_target_text_w(t: MpTarget*, s: string, size: float64) -> float64 {
+  if (t == 0) { return 0.0; }
+  if (t->measure == MP_MEASURE_CELLS) { return (float64)mp_utf8_len(s) * t->cell_w; }
+  if (t->measure == MP_MEASURE_CUSTOM) { return t->width_cb(t->ctx, s, size); }
+  return target_heuristic_cb(t->ctx, s, size);
+}
+
+/// Line height of text on a target.
+///
+/// @param t The target. Valid: non-zero; 0 gives 0.
+/// @param size Font size. Units: logical px. Valid: > 0; ignored by MP_MEASURE_CELLS.
+/// @return The height in logical px: cell_h for MP_MEASURE_CELLS, else size * 1.2.
+/// @mem t is only read.
+/// @thread One thread at a time per target.
+export fn mp_target_text_h(t: MpTarget*, size: float64) -> float64 {
+  if (t == 0) { return 0.0; }
+  if (t->measure == MP_MEASURE_CELLS) { return t->cell_h; }
+  return size * 1.2;
+}
+
+fn target_mix(h: uint64, v: uint64) -> uint64 {
+  var r: uint64 = h;
+  var x: uint64 = v;
+  var i: int32 = 0;
+  while (i < 8) {
+    r = (r ^ (x & (uint64)0xFF)) * (uint64)1099511628211;
+    x = x >> 8;
+    i = i + 1;
+  }
+  return r;
+}
+
+fn target_bits(v: float64) -> uint64 {
+  var f: float64 = v;
+  if (f == 0.0) { f = 0.0; }
+  var p: uint64* = (uint64*)&f;
+  return *p;
+}
+
+/// A cache key over every field except ctx (the measurer is represented by key).
+/// Two targets with equal keys produce identical scenes for the same chart state.
+///
+/// @param t The target. Valid: non-zero; 0 gives 0.
+/// @return A 64-bit FNV-1a hash; -0 and +0 hash alike.
+/// @mem t is only read.
+/// @thread One thread at a time per target.
+/// @cost O(1).
+export fn mp_target_key(t: MpTarget*) -> uint64 {
+  if (t == 0) { return (uint64)0; }
+  var h: uint64 = (uint64)0xCBF29CE484222325;
+  h = target_mix(h, target_bits(t->width));
+  h = target_mix(h, target_bits(t->height));
+  h = target_mix(h, target_bits(t->scale));
+  h = target_mix(h, (uint64)t->measure);
+  h = target_mix(h, target_bits(t->cell_w));
+  h = target_mix(h, target_bits(t->cell_h));
+  h = target_mix(h, t->key);
+  return h;
+}

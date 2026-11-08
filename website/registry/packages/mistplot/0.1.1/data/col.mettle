@@ -1,0 +1,323 @@
+//! MpCol, the sample storage behind one series: a ring of (x, y) pairs that grows while
+//! keep == 0 and overwrites its oldest sample once it holds keep > 0 samples. Uses
+//! core/error and core/mem; storage is allocated at the first push and grows
+//! geometrically (up to keep), so a full ring pushes without allocating. Samples are
+//! stored as given, non-finite ones included. `sorted` says whether the finite x values
+//! have been nondecreasing since the last clear; `gen` and `pushes` let a cache built
+//! from the column (data/summary) notice every change.
+//! @internal
+
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+
+const COL_MIN_CAP: int64 = 16;
+
+/// A column of samples; initialise with mp_col_init and release with mp_col_free.
+/// Read the fields through the mp_col_* functions; data/summary also reads gen and pushes.
+///
+/// @mem Owns xs and ys (allocated through core/mem); the struct itself belongs to its
+///   container (usually embedded in a series).
+export struct MpCol {
+  xs: float64*;     /// x storage, cap slots; 0 before the first push
+  ys: float64*;     /// y storage, cap slots
+  cap: int64;       /// allocated slots
+  head: int64;      /// slot of the oldest sample
+  n: int64;         /// samples held
+  keep: int64;      /// ring size; 0 = unbounded
+  sorted: bool;     /// finite x nondecreasing since the last clear
+  has_last: bool;   /// a sample with finite x was pushed since the last clear
+  last_x: float64;  /// x of the newest push with a finite x (valid when has_last)
+  gen: int64;       /// bumped by every change other than a push (clear, keep, set)
+  pushes: int64;    /// pushes since mp_col_init; never decreases
+}
+
+/// Initialises an empty, unbounded column without allocating.
+///
+/// @param c The column. Valid: non-zero; any previous contents are forgotten, not freed.
+/// @mem Nothing is allocated; storage arrives with the first push.
+export fn mp_col_init(c: MpCol*) {
+  if (c == 0) { return; }
+  c->xs = 0;
+  c->ys = 0;
+  c->cap = 0;
+  c->head = 0;
+  c->n = 0;
+  c->keep = 0;
+  c->sorted = true;
+  c->has_last = false;
+  c->last_x = 0.0;
+  c->gen = 0;
+  c->pushes = 0;
+}
+
+/// Releases a column's storage and leaves it empty and unbounded (as after mp_col_init).
+///
+/// @param c The column. Valid: an initialised column, or 0 (ignored).
+/// @mem Frees xs and ys; the struct itself is not freed.
+export fn mp_col_free(c: MpCol*) {
+  if (c == 0) { return; }
+  if (c->xs != 0) { mp_free((rawptr)c->xs); }
+  if (c->ys != 0) { mp_free((rawptr)c->ys); }
+  mp_col_init(c);
+}
+
+// Logical index -> slot, for 0 <= i < cap.
+fn col_slot(c: MpCol*, i: int64) -> int64 {
+  var k: int64 = c->head + i;
+  if (k >= c->cap) { k = k - c->cap; }
+  return k;
+}
+
+// Moves the samples into fresh arrays of `cap` slots, oldest first, keeping the newest
+// `cap` samples when fewer slots than samples. On failure nothing changes.
+fn col_realloc(c: MpCol*, cap: int64) -> int32 {
+  if (cap <= 0 || cap > MP_MAX_COUNT) { return MP_ERR_LIMIT; }
+  var nx: float64* = (float64*)mp_alloc(cap * 8);
+  if (nx == 0) { return MP_ERR_ALLOC; }
+  var ny: float64* = (float64*)mp_alloc(cap * 8);
+  if (ny == 0) {
+    mp_free((rawptr)nx);
+    return MP_ERR_ALLOC;
+  }
+  var skip: int64 = 0;
+  if (c->n > cap) { skip = c->n - cap; }
+  var i: int64 = skip;
+  while (i < c->n) {
+    var k: int64 = col_slot(c, i);
+    nx[i - skip] = c->xs[k];
+    ny[i - skip] = c->ys[k];
+    i = i + 1;
+  }
+  if (c->xs != 0) { mp_free((rawptr)c->xs); }
+  if (c->ys != 0) { mp_free((rawptr)c->ys); }
+  c->xs = nx;
+  c->ys = ny;
+  c->cap = cap;
+  c->head = 0;
+  c->n = c->n - skip;
+  return MP_OK;
+}
+
+// Next capacity when a full, still growing column needs room.
+fn col_grow_cap(c: MpCol*) -> int64 {
+  var want: int64 = c->cap * 2;
+  if (want < COL_MIN_CAP) { want = COL_MIN_CAP; }
+  if (want > MP_MAX_COUNT) { want = MP_MAX_COUNT; }
+  if (c->keep > 0 && want > c->keep) { want = c->keep; }
+  return want;
+}
+
+/// Sets the ring size, keeping the newest samples.
+/// A smaller keep drops the oldest samples at once and shrinks the storage; 0 makes the
+/// column unbounded again (nothing is dropped).
+///
+/// @param c The column. Valid: an initialised column.
+/// @param keep Samples to keep. Units: samples. Valid: 0 .. MP_MAX_COUNT.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG c is 0 or keep is negative; nothing changes.
+/// @error MP_ERR_LIMIT keep is above MP_MAX_COUNT; nothing changes.
+/// @mem May replace xs and ys; a failed shrink keeps the larger storage (still correct).
+/// @cost O(n) when samples move; otherwise O(1).
+export fn mp_col_set_keep(c: MpCol*, keep: int64) -> int32 {
+  if (c == 0 || keep < 0) { return MP_ERR_ARG; }
+  if (keep > MP_MAX_COUNT) { return MP_ERR_LIMIT; }
+  if (keep == c->keep) { return MP_OK; }
+  c->keep = keep;
+  c->gen = c->gen + 1;
+  if (keep == 0) { return MP_OK; }
+  if (c->n > keep) {
+    var drop: int64 = c->n - keep;
+    c->head = col_slot(c, drop);
+    c->n = keep;
+  }
+  if (c->cap > keep) { col_realloc(c, keep); }
+  return MP_OK;
+}
+
+/// Appends one sample; a full ring (n == keep > 0) overwrites its oldest sample.
+///
+/// @param c The column. Valid: an initialised column.
+/// @param x Sample x. Units: data units. Valid: any; a finite x below the previous finite
+///   x clears sorted until the next clear.
+/// @param y Sample y. Units: data units. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG c is 0; nothing changes.
+/// @error MP_ERR_ALLOC the storage could not grow; the column is unchanged.
+/// @error MP_ERR_LIMIT an unbounded column already holds MP_MAX_COUNT samples; unchanged.
+/// @mem Allocates only while the column grows; never once a ring is full.
+/// @cost O(1) amortized.
+export fn mp_col_push(c: MpCol*, x: float64, y: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  if (c->keep > 0 && c->n >= c->keep) {
+    var t: int64 = col_slot(c, c->n);
+    c->xs[t] = x;
+    c->ys[t] = y;
+    c->head = col_slot(c, 1);
+  } else {
+    if (c->n == c->cap) {
+      if (c->n >= MP_MAX_COUNT) { return MP_ERR_LIMIT; }
+      var rc: int32 = col_realloc(c, col_grow_cap(c));
+      if (rc != MP_OK) { return rc; }
+    }
+    var s: int64 = col_slot(c, c->n);
+    c->xs[s] = x;
+    c->ys[s] = y;
+    c->n = c->n + 1;
+  }
+  if (is_finite(x) != 0) {
+    if (c->has_last && x < c->last_x) { c->sorted = false; }
+    c->last_x = x;
+    c->has_last = true;
+  }
+  c->pushes = c->pushes + 1;
+  return MP_OK;
+}
+
+// Whether the finite x at index i keeps order with its nearest finite neighbours.
+fn col_in_order(c: MpCol*, i: int64, x: float64) -> bool {
+  var j: int64 = i - 1;
+  while (j >= 0) {
+    var px: float64 = c->xs[col_slot(c, j)];
+    if (is_finite(px) != 0) {
+      if (px > x) { return false; }
+      break;
+    }
+    j = j - 1;
+  }
+  j = i + 1;
+  while (j < c->n) {
+    var nx: float64 = c->xs[col_slot(c, j)];
+    if (is_finite(nx) != 0) { return nx >= x; }
+    j = j + 1;
+  }
+  return true;
+}
+
+/// Replaces sample i.
+/// Clears sorted when the new finite x is out of order with its finite neighbours.
+///
+/// @param c The column. Valid: an initialised column.
+/// @param i Logical index (0 = oldest). Valid: 0 .. mp_col_len(c)-1.
+/// @param x New x. Units: data units. Valid: any.
+/// @param y New y. Units: data units. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG c is 0 or i is out of range; nothing changes.
+/// @mem Nothing is allocated.
+/// @cost O(1), plus the length of any non-finite run next to i.
+export fn mp_col_set(c: MpCol*, i: int64, x: float64, y: float64) -> int32 {
+  if (c == 0 || i < 0 || i >= c->n) { return MP_ERR_ARG; }
+  var k: int64 = col_slot(c, i);
+  c->xs[k] = x;
+  c->ys[k] = y;
+  if (c->sorted && is_finite(x) != 0 && !col_in_order(c, i, x)) { c->sorted = false; }
+  if (is_finite(x) != 0 && col_next_finite(c, i + 1, c->n) == c->n) {
+    c->last_x = x;
+    c->has_last = true;
+  }
+  c->gen = c->gen + 1;
+  return MP_OK;
+}
+
+/// Number of samples held.
+///
+/// @param c The column. Valid: any; 0 gives 0.
+/// @return The sample count.
+/// @mem Reads only.
+export fn mp_col_len(c: MpCol*) -> int64 {
+  if (c == 0) { return 0; }
+  return c->n;
+}
+
+/// The x of sample i (0 = oldest).
+///
+/// @param c The column. Valid: any; 0 gives NaN.
+/// @param i Logical index. Valid: 0 .. mp_col_len(c)-1; outside it gives NaN.
+/// @return The stored x, or NaN.
+/// @mem Reads only.
+export fn mp_col_x(c: MpCol*, i: int64) -> float64 {
+  if (c == 0 || i < 0 || i >= c->n) { return NAN(); }
+  return c->xs[col_slot(c, i)];
+}
+
+/// The y of sample i (0 = oldest).
+///
+/// @param c The column. Valid: any; 0 gives NaN.
+/// @param i Logical index. Valid: 0 .. mp_col_len(c)-1; outside it gives NaN.
+/// @return The stored y, or NaN.
+/// @mem Reads only.
+export fn mp_col_y(c: MpCol*, i: int64) -> float64 {
+  if (c == 0 || i < 0 || i >= c->n) { return NAN(); }
+  return c->ys[col_slot(c, i)];
+}
+
+/// Drops every sample and marks the column sorted; keep and the storage stay.
+///
+/// @param c The column. Valid: any; 0 is ignored.
+/// @mem Nothing is freed.
+export fn mp_col_clear(c: MpCol*) {
+  if (c == 0) { return; }
+  c->head = 0;
+  c->n = 0;
+  c->sorted = true;
+  c->has_last = false;
+  c->last_x = 0.0;
+  c->gen = c->gen + 1;
+}
+
+/// Whether the finite x values have been nondecreasing since the last clear.
+///
+/// @param c The column. Valid: any; 0 gives true (empty).
+/// @return true when sorted.
+/// @mem Reads only.
+export fn mp_col_sorted(c: MpCol*) -> bool {
+  if (c == 0) { return true; }
+  return c->sorted;
+}
+
+// First index >= i whose x is finite, or `end`.
+fn col_next_finite(c: MpCol*, i: int64, end: int64) -> int64 {
+  var j: int64 = i;
+  while (j < end) {
+    var x: float64 = c->xs[col_slot(c, j)];
+    if (is_finite(x) != 0) { return j; }
+    j = j + 1;
+  }
+  return end;
+}
+
+/// Index of the first sample with a finite x >= x (samples with a non-finite x are
+/// skipped), or mp_col_len(c) when there is none.
+///
+/// @param c The column. Valid: any; 0 gives 0.
+/// @param x The bound. Units: data units. Valid: any; NaN gives mp_col_len(c).
+/// @return A logical index in 0 .. mp_col_len(c).
+/// @mem Reads only.
+/// @cost O(log n) on a sorted column (plus the length of non-finite runs probed);
+///   O(n) on an unsorted one.
+export fn mp_col_lower_bound(c: MpCol*, x: float64) -> int64 {
+  if (c == 0) { return 0; }
+  if (x != x) { return c->n; }
+  if (!c->sorted) {
+    var i: int64 = 0;
+    while (i < c->n) {
+      var v: float64 = c->xs[col_slot(c, i)];
+      if (is_finite(v) != 0 && v >= x) { return i; }
+      i = i + 1;
+    }
+    return c->n;
+  }
+  // Invariant: finite samples before lo are < x; the first finite at or after hi is >= x.
+  var lo: int64 = 0;
+  var hi: int64 = c->n;
+  while (lo < hi) {
+    var mid: int64 = lo + (hi - lo) / 2;
+    var m: int64 = col_next_finite(c, mid, hi);
+    if (m == hi || c->xs[col_slot(c, m)] >= x) {
+      hi = mid;
+    } else {
+      lo = m + 1;
+    }
+  }
+  return col_next_finite(c, lo, c->n);
+}

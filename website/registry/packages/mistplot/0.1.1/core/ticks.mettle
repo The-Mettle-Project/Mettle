@@ -1,0 +1,284 @@
+//! Nice steps and tick values for linear, time and log axes. Uses std/math only; values go
+//! into a caller array (no allocation, no formatting). Steps follow the 1/2/5 x 10^k rule
+//! with raw = span/target, picking the multiple whose tick count is closest to target.
+//! Time axes (seconds) choose clock-shaped steps. Every value is snapped to the step's
+//! decimals, so 0.1 + 0.2 never shows up as 0.30000000000000004.
+
+import "std/math";
+
+// Decimal places implied by a step, for snapping tick values.
+fn ticks_step_decimals(step: float64) -> int32 {
+  if (!(step > 0.0)) { return 0; }
+  var e: int32 = (int32)floor(log10(step));
+  var d: int32 = 0 - e;
+  if (d < 0) { d = 0; }
+  if (d > 9) { d = 9; }
+  return d;
+}
+
+fn ticks_snap(v: float64, decimals: int32) -> float64 {
+  var p: float64 = 1.0;
+  var i: int32 = 0;
+  while (i < decimals) {
+    p = p * 10.0;
+    i = i + 1;
+  }
+  return round(v * p) / p;
+}
+
+/// A 1/2/5 x 10^k tick step giving about target ticks over [d0, d1].
+///
+/// @param d0 Domain start. Units: data units. Valid: finite, < d1; otherwise 0.
+/// @param d1 Domain end. Units: data units. Valid: finite, > d0; otherwise 0.
+/// @param target Wanted tick count. Valid: >= 2; 1 or less returns the whole span.
+/// @return The step in data units, or 0 for an empty or non-finite domain.
+export fn mp_tick_step(d0: float64, d1: float64, target: int32) -> float64 {
+  var span: float64 = d1 - d0;
+  if (!(span > 0.0)) { return 0.0; }
+  if (is_finite(span) == 0) { return 0.0; }
+  if (target <= 1) { return span; }
+  var raw: float64 = span / (float64)target;
+  // A subnormal spacing has too few bits for a 1/2/5 step to mean anything,
+  // so the whole span is the only usable step. Test it directly: pow and log10
+  // are exact enough to give subnormal results, so they do not underflow to 0.
+  if (!(raw >= 2.2250738585072014e-308) || is_finite(raw) == 0) { return span; }
+  var mag: float64 = pow(10.0, floor(log10(raw)));
+  // The magnitude itself can underflow for a subnormal span; same fallback.
+  if (!(mag > 0.0) || is_finite(mag) == 0) { return span; }
+  var best: float64 = 0.0;
+  var best_err: float64 = 0.0;
+  var ci: int32 = 0;
+  while (ci < 4) {
+    var fact: float64 = 1.0;
+    if (ci == 1) { fact = 2.0; }
+    if (ci == 2) { fact = 5.0; }
+    if (ci == 3) { fact = 10.0; }
+    var st: float64 = mag * fact;
+    // Ticks produced by this step, without needing the exact first tick yet.
+    var cnt: float64 = floor(span / st) + 1.0;
+    var err: float64 = cnt - (float64)target;
+    if (err < 0.0) { err = 0.0 - err; }
+    if (ci == 0 || err < best_err) {
+      best = st;
+      best_err = err;
+    }
+    ci = ci + 1;
+  }
+  return best;
+}
+
+/// The nearest 1/2/5 x 10^k number to v, keeping its sign.
+///
+/// @param v The value. Valid: any; 0 and non-finite values give 0.
+/// @param round_up true picks the next nice number at or above |v|, false the one at or
+///   below. Valid: any.
+/// @return The nice number.
+export fn mp_tick_nice(v: float64, round_up: bool) -> float64 {
+  if (v == 0.0) { return 0.0; }
+  if (is_finite(v) == 0) { return 0.0; }
+  var neg: bool = v < 0.0;
+  var a: float64 = fabs(v);
+  var mag: float64 = pow(10.0, floor(log10(a)));
+  var norm: float64 = a / mag;
+  var fact: float64 = 0.0;
+  if (round_up) {
+    if (norm <= 1.0) {
+      fact = 1.0;
+    } else if (norm <= 2.0) {
+      fact = 2.0;
+    } else if (norm <= 5.0) {
+      fact = 5.0;
+    } else {
+      fact = 10.0;
+    }
+  } else {
+    if (norm >= 5.0) {
+      fact = 5.0;
+    } else if (norm >= 2.0) {
+      fact = 2.0;
+    } else {
+      fact = 1.0;
+    }
+  }
+  var r: float64 = mag * fact;
+  if (neg) { return 0.0 - r; }
+  return r;
+}
+
+/// The multiples of step inside [d0, d1], snapped to the step's decimals and strictly
+/// increasing. An end that is an exact multiple is kept despite rounding.
+///
+/// @param d0 Domain start. Units: data units. Valid: < d1; otherwise 0 ticks.
+/// @param d1 Domain end. Units: data units. Valid: > d0; otherwise 0 ticks.
+/// @param step Tick spacing. Units: data units. Valid: finite, > 0; otherwise 0 ticks.
+/// @param out Destination array. Valid: non-zero with cap writable slots; 0 gives 0.
+/// @param cap Slots in out. Valid: >= 1; 0 or less gives 0.
+/// @return Number of ticks written, at most cap.
+/// @mem Writes out[0 .. n); nothing is retained.
+/// @thread Safe from any thread (with distinct arrays).
+/// @cost O(number of ticks).
+export fn mp_ticks_step(d0: float64, d1: float64, step: float64,
+                        out: float64*, cap: int32) -> int32 {
+  if (out == 0 || cap <= 0) { return 0; }
+  var span: float64 = d1 - d0;
+  if (!(span > 0.0)) { return 0; }
+  if (!(step > 0.0) || is_finite(step) == 0) { return 0; }
+  var dec: int32 = ticks_step_decimals(step);
+  // The epsilon makes an exact multiple land on itself rather than one step up.
+  var first: float64 = ceil(d0 / step - 1e-9) * step;
+  var k: int64 = 0;
+  var n: int32 = 0;
+  while (n < cap) {
+    var v: float64 = ticks_snap(first + (float64)k * step, dec);
+    if (v > d1 + step * 1e-9) { break; }
+    if (!(v < d0 - step * 1e-9)) {
+      // Strictly increasing: snap can collapse two neighbours for tiny steps.
+      if (n == 0) {
+        out[(int64)n] = v;
+        n = n + 1;
+      } else if (v > out[(int64)n - 1]) {
+        out[(int64)n] = v;
+        n = n + 1;
+      }
+    }
+    k = k + 1;
+    if (k > (int64)cap * 4 + 4096) { break; }
+  }
+  return n;
+}
+
+/// Ticks for a linear axis: mp_ticks_step with the step from mp_tick_step.
+///
+/// @param d0 Domain start. Units: data units. Valid: < d1; otherwise 0 ticks.
+/// @param d1 Domain end. Units: data units. Valid: > d0; otherwise 0 ticks.
+/// @param target Wanted tick count. Valid: >= 2 (the count lands within target +- 2).
+/// @param out Destination array. Valid: non-zero with cap writable slots; 0 gives 0.
+/// @param cap Slots in out. Valid: >= 1; 0 or less gives 0.
+/// @return Number of ticks written, at most cap.
+/// @mem Writes out[0 .. n); nothing is retained.
+/// @thread Safe from any thread (with distinct arrays).
+export fn mp_ticks_linear(d0: float64, d1: float64, target: int32,
+                          out: float64*, cap: int32) -> int32 {
+  if (out == 0 || cap <= 0) { return 0; }
+  var span: float64 = d1 - d0;
+  if (!(span > 0.0)) { return 0; }
+  var step: float64 = mp_tick_step(d0, d1, target);
+  return mp_ticks_step(d0, d1, step, out, cap);
+}
+
+// Clock-shaped candidate steps in seconds, ascending.
+const MP_TICKS_TIME_N: int32 = 20;
+const MP_TICKS_TIME: float64[20] = [
+  0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+  900.0, 1800.0, 3600.0, 7200.0, 10800.0, 21600.0, 43200.0
+];
+
+/// A clock-shaped tick step for a time axis in seconds.
+/// Candidates are 0.1/0.2/0.5 s, 1/2/5/10/15/30 s, 1/2/5/10/15/30 min and 1/2/3/6/12 h
+/// (closest tick count wins, the smaller on a tie); longer spans use whole days by the
+/// 1/2/5 rule.
+///
+/// @param d0 Domain start. Units: seconds. Valid: finite, < d1; otherwise 0.
+/// @param d1 Domain end. Units: seconds. Valid: finite, > d0; otherwise 0.
+/// @param target Wanted tick count. Valid: >= 1; smaller values count as 1.
+/// @return The step in seconds, or 0 for an empty or non-finite domain.
+export fn mp_tick_step_time(d0: float64, d1: float64,
+                            target: int32) -> float64 {
+  var span: float64 = d1 - d0;
+  if (!(span > 0.0) || is_finite(span) == 0) { return 0.0; }
+  var t: int32 = target;
+  if (t < 1) { t = 1; }
+  if (span / (float64)t > 43200.0 * 2.0) {
+    var days: float64 = mp_tick_step(d0 / 86400.0, d1 / 86400.0, t);
+    if (days < 1.0) { days = 1.0; }
+    return days * 86400.0;
+  }
+  var best: float64 = 0.0;
+  var best_err: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < MP_TICKS_TIME_N) {
+    var st: float64 = MP_TICKS_TIME[i];
+    var err: float64 = floor(span / st) + 1.0 - (float64)t;
+    if (err < 0.0) { err = 0.0 - err; }
+    if (i == 0 || err < best_err) {
+      best = st;
+      best_err = err;
+    }
+    i = i + 1;
+  }
+  return best;
+}
+
+/// Extends a domain outward to the nearest ticks of its own step, repeating while the
+/// wider domain changes the step (at most four rounds), so both ends carry a tick.
+///
+/// @param d0 Domain start, updated in place. Units: data units. Valid: non-zero; 0 does
+///   nothing.
+/// @param d1 Domain end, updated in place. Units: data units. Valid: non-zero, *d1 > *d0;
+///   an empty, non-finite or overflowing domain is left unchanged.
+/// @param target Wanted tick count. Valid: >= 2.
+/// @param time true uses mp_tick_step_time (seconds), false mp_tick_step. Valid: any.
+/// @mem Writes *d0 and *d1 only.
+/// @thread Safe from any thread (with distinct variables).
+export fn mp_ticks_nice(d0: float64*, d1: float64*, target: int32,
+                        time: bool) {
+  if (d0 == 0 || d1 == 0) { return; }
+  var rnd: int32 = 0;
+  while (rnd < 4) {
+    var a: float64 = *d0;
+    var b: float64 = *d1;
+    if (!(b > a) || is_finite(b - a) == 0) { return; }
+    var step: float64 = 0.0;
+    if (time) {
+      step = mp_tick_step_time(a, b, target);
+    } else {
+      step = mp_tick_step(a, b, target);
+    }
+    if (!(step > 0.0)) { return; }
+    var dec: int32 = ticks_step_decimals(step);
+    var na: float64 = ticks_snap(floor(a / step + 1e-9) * step, dec);
+    var nb: float64 = ticks_snap(ceil(b / step - 1e-9) * step, dec);
+    if (na > a) { na = a; }
+    if (nb < b) { nb = b; }
+    if (is_finite(na) == 0 || is_finite(nb) == 0 || is_finite(nb - na) == 0) {
+      return;
+    }
+    if (na == a && nb == b) { return; }
+    *d0 = na;
+    *d1 = nb;
+    rnd = rnd + 1;
+  }
+}
+
+/// Ticks for a log axis: the powers of ten inside [d0, d1].
+/// With fewer than two decades inside, falls back to mp_ticks_linear with target 5.
+///
+/// @param d0 Domain start. Units: data units. Valid: > 0 and < d1; otherwise 0 ticks.
+/// @param d1 Domain end. Units: data units. Valid: > d0; otherwise 0 ticks.
+/// @param out Destination array. Valid: non-zero with cap writable slots; 0 gives 0.
+/// @param cap Slots in out. Valid: >= 1; 0 or less gives 0.
+/// @return Number of ticks written, at most cap.
+/// @mem Writes out[0 .. n); nothing is retained.
+/// @thread Safe from any thread (with distinct arrays).
+export fn mp_ticks_log(d0: float64, d1: float64, out: float64*,
+                       cap: int32) -> int32 {
+  if (out == 0 || cap <= 0) { return 0; }
+  if (!(d0 > 0.0) || !(d1 > d0)) { return 0; }
+  var n: int32 = 0;
+  var k: int32 = (int32)floor(log10(d0));
+  var guard: int32 = 0;
+  while (n < cap && guard < 512) {
+    var p: float64 = pow(10.0, (float64)k);
+    if (p > d1 * (1.0 + 1e-12)) { break; }
+    if (p >= d0 * (1.0 - 1e-12)) {
+      out[(int64)n] = p;
+      n = n + 1;
+    }
+    k = k + 1;
+    guard = guard + 1;
+  }
+  if (n >= 2) { return n; }
+  // Fewer than two decades inside the domain: fall back to a linear axis over
+  // the positive domain (target 5, the default the chart layer also uses).
+  return mp_ticks_linear(d0, d1, 5, out, cap);
+}

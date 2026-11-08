@@ -1,0 +1,171 @@
+//! Hit testing and hover readouts over the last built frame: the sample of a series
+//! nearest to a pointer x, and the x and y readout texts (time axes as clocks, y with a
+//! fixed number of decimals per frame so a readout's rows line up). Uses chart/chart and
+//! core; reads the views and MpChartInfo the last frame left behind.
+
+import "std/conv";
+import "std/math";
+import "mistplot/core/error";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
+import "mistplot/core/format";
+import "mistplot/chart/chart";
+
+/// One sample of a series under the pointer, as drawn in the last frame.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpPickPoint {
+  x: float64;    /// sample x, data units (bars: the band index)
+  y: float64;    /// sample y, data units
+  px: float64;   /// sample x in scene px (logical, from the chart's top-left)
+  py: float64;   /// sample y in scene px, clamped into the plot rect
+}
+
+fn pick_ok(v: float64) -> bool {
+  return v - v == 0.0;
+}
+
+fn pick_bar(c: MpChart*, d: MpSeriesData*, px: float64, out: MpPickPoint*) -> bool {
+  var info: MpChartInfo* = &c->info;
+  var j: float64 = floor(mp_scale_invert(info->x, px));
+  if (!(j >= 0.0) || j >= (float64)d->vn) { return false; }
+  var y: float64 = d->vy[(int64)j];
+  if (!pick_ok(y)) { return false; }
+  var p: MpRect = info->plot;
+  out->x = j;
+  out->y = y;
+  out->px = mp_scale_band_center(info->x, (int32)j);
+  out->py = mp_clamp(mp_scale_map(info->y, y), p.y, p.y + p.h);
+  return true;
+}
+
+fn pick_near(c: MpChart*, d: MpSeriesData*, px: float64, out: MpPickPoint*) -> bool {
+  var info: MpChartInfo* = &c->info;
+  var xm: float64 = mp_scale_invert(info->x, px);
+  var found: bool = false;
+  var best: float64 = 0.0;
+  var i: int64 = 0;
+  while (i < d->vn) {
+    var x: float64 = d->vx[i];
+    var y: float64 = d->vy[i];
+    if (pick_ok(x) && pick_ok(y) && x >= info->x0 && x <= info->x1) {
+      var dist: float64 = fabs(x - xm);
+      if (!found || dist < best) {
+        best = dist;
+        out->x = x;
+        out->y = y;
+        found = true;
+      }
+    }
+    i = i + 1;
+  }
+  if (!found) { return false; }
+  var p: MpRect = info->plot;
+  out->px = mp_clamp(mp_scale_map(info->x, out->x), p.x, p.x + p.w);
+  out->py = mp_clamp(mp_scale_map(info->y, out->y), p.y, p.y + p.h);
+  return true;
+}
+
+/// The sample of series s nearest to pointer x px in the last built frame (bars: the
+/// series' value in the band under px).
+///
+/// @param c The chart. Valid: non-zero, with a frame built (mp_chart_scene or a render).
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param px Pointer x. Units: scene px (logical, from the chart's top-left). Valid: any.
+/// @param out Receives the sample. Valid: non-zero.
+/// @return true when a sample was found; false for a bad argument, no frame, or no
+///   finite sample inside the frame's x domain (out is then unchanged).
+/// @mem Writes *out only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(view points of s), at most about 4 per device pixel column.
+export fn mp_chart_pick(c: MpChart*, s: int32, px: float64, out: MpPickPoint*) -> bool {
+  if (c == 0 || out == 0) { return false; }
+  mp_chart_enter(c);
+  var r: bool = false;
+  if (c->info.valid && s >= 0 && s < c->n_series && pick_ok(px)) {
+    var tmp: MpPickPoint;
+    var d: MpSeriesData* = &c->series[(int64)s];
+    if (c->kind == MP_BAR) {
+      r = pick_bar(c, d, px, &tmp);
+    } else {
+      r = pick_near(c, d, px, &tmp);
+    }
+    if (r) { *out = tmp; }
+  }
+  mp_chart_leave(c);
+  return r;
+}
+
+// Copies at most cap - 1 bytes of s into out.
+fn pick_copy(s: string, out: uint8*, cap: int64) -> string {
+  var n: int64 = (int64)s.length;
+  if (n > cap - 1) { n = cap - 1; }
+  var i: int64 = 0;
+  while (i < n) {
+    out[i] = s.chars[i];
+    i = i + 1;
+  }
+  return str_from_bytes((cstring)out, n);
+}
+
+fn pick_x(c: MpChart*, v: float64, out: uint8*, cap: int64) -> string {
+  var info: MpChartInfo* = &c->info;
+  if (c->kind == MP_BAR && pick_ok(v)) {
+    var j: int64 = (int64)floor(v + 0.5);
+    if (j >= 0 && j < (int64)c->n_cats) { return pick_copy(c->cats[j], out, cap); }
+  }
+  var fmt: int32 = info->x_fmt;
+  if (!info->valid) { fmt = c->x_fmt; }
+  if (fmt == MP_FMT_TIME || fmt == MP_FMT_TIME_TENTHS) {
+    if (info->x1 - info->x0 < 60.0) { return mp_fmt_clock_tenths(v, out, cap); }
+    if (pick_ok(v) && fabs(v) < 1e15) { return mp_fmt_clock(round(v), out, cap); }
+    return mp_fmt_clock(v, out, cap);
+  }
+  return mp_fmt_value(v, fmt, out, cap);
+}
+
+/// Hover text for an x value of the last frame: a category name on bar charts, a clock
+/// (with tenths when the visible span is under a minute) on time axes, otherwise the axis
+/// label format.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param v The value. Units: data units (a band index on bar charts). Valid: any.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The text, a view of out; "" when c or out is 0 or cap < 32.
+/// @mem Writes into out and returns a view of it; nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_readout_x(c: MpChart*, v: float64, out: uint8*, cap: int64) -> string {
+  if (c == 0 || out == 0 || cap < 32) { return ""; }
+  mp_chart_enter(c);
+  var s: string = pick_x(c, v, out, cap);
+  var n: int64 = (int64)s.length;
+  mp_chart_leave(c);
+  return str_from_bytes((cstring)out, n);
+}
+
+/// Hover text for a y value of the last frame: fixed decimals one digit finer than the
+/// axis labels (2 - floor(log10(span / 5)), clamped to 0 .. 6), so every row of one readout
+/// lines up; mp_fmt_auto without a frame or for huge or non-finite values.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param v The value. Units: data units. Valid: any.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
+/// @return The text, a view of out; "" when c or out is 0 or cap < 32.
+/// @mem Writes into out and returns a view of it; nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_readout_y(c: MpChart*, v: float64, out: uint8*, cap: int64) -> string {
+  if (c == 0 || out == 0 || cap < 32) { return ""; }
+  mp_chart_enter(c);
+  var info: MpChartInfo = c->info;
+  mp_chart_leave(c);
+  var span: float64 = info.y1 - info.y0;
+  if (!info.valid || !pick_ok(span) || !(span > 0.0) || !pick_ok(v) || fabs(v) >= 1e15) {
+    return mp_fmt_auto(v, out, cap);
+  }
+  var d: float64 = 2.0 - floor(log10(span / 5.0));
+  if (d < 0.0) { d = 0.0; }
+  if (d > 6.0) { d = 6.0; }
+  return mp_fmt_fixed(v, (int32)d, out, cap);
+}

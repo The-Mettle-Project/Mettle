@@ -1,0 +1,795 @@
+//! The backend contract: a flat display list of primitives in painter's order, owned by
+//! the scene. Text bytes, points (x,y pairs) and path command bytes live in three scene
+//! arrays and nodes refer to them by int32 offset, so a scene outlives whatever built it.
+//! Depends on core/error, mem, buf, color and geom. Capacities only grow: clearing keeps
+//! them, so rebuilding a scene of the same size allocates nothing. A polyline or path is
+//! built in place between *_begin and *_end; while one is open every other add returns
+//! MP_ERR_STATE. Node and point pointers are borrowed and any add may move them.
+
+import "std/conv";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+
+/// Node kind: a rectangle (x, y, w, h), filled and optionally stroked.
+export const MP_NODE_RECT: int32 = 0;
+/// Node kind: one straight segment; both endpoints are in the point array.
+export const MP_NODE_LINE: int32 = 1;
+/// Node kind: one line of text; y is the baseline.
+export const MP_NODE_TEXT: int32 = 2;
+/// Node kind: an open polyline through its points.
+export const MP_NODE_POLY: int32 = 3;
+/// Node kind: a path of MP_PATH_* commands over its points.
+export const MP_NODE_PATH: int32 = 4;
+/// Node kind: a marker shape (MP_MARK_*) centred on (x, y) with radius r.
+export const MP_NODE_MARKER: int32 = 5;
+
+/// Text alignment: x is the left end of the text.
+export const MP_ALIGN_START: int32 = 0;
+/// Text alignment: x is the middle of the text.
+export const MP_ALIGN_CENTER: int32 = 1;
+/// Text alignment: x is the right end of the text.
+export const MP_ALIGN_END: int32 = 2;
+
+/// Node class: the chart background.
+export const MP_CLS_BG: int32 = 0;
+/// Node class: the plot area background or frame.
+export const MP_CLS_PLOT: int32 = 1;
+/// Node class: grid lines.
+export const MP_CLS_GRID: int32 = 2;
+/// Node class: axis lines and the baseline.
+export const MP_CLS_AXIS: int32 = 3;
+/// Node class: tick marks and tick labels.
+export const MP_CLS_TICK: int32 = 4;
+/// Node class: axis titles and other labels.
+export const MP_CLS_LABEL: int32 = 5;
+/// Node class: the chart title and subtitle.
+export const MP_CLS_TITLE: int32 = 6;
+/// Node class: legend text and frame.
+export const MP_CLS_LEGEND: int32 = 7;
+/// Node class of series 0; series i uses MP_CLS_SERIES + i.
+export const MP_CLS_SERIES: int32 = 8;
+
+/// Stroke dash: solid.
+export const MP_DASH_SOLID: int32 = 0;
+/// Stroke dash: dashes of 4 widths with gaps of 3 widths.
+export const MP_DASH_DASHED: int32 = 1;
+/// Stroke dash: round dots 2 widths apart.
+export const MP_DASH_DOTTED: int32 = 2;
+
+/// Marker shape: none.
+export const MP_MARK_NONE: int32 = 0;
+/// Marker shape: a circle of radius r.
+export const MP_MARK_CIRCLE: int32 = 1;
+/// Marker shape: an axis-aligned square of side 2r.
+export const MP_MARK_SQUARE: int32 = 2;
+/// Marker shape: a square of diagonal 2r standing on a corner.
+export const MP_MARK_DIAMOND: int32 = 3;
+
+/// Path command: start a subpath at one point.
+export const MP_PATH_MOVE: int32 = 1;
+/// Path command: straight segment to one point.
+export const MP_PATH_LINE: int32 = 2;
+/// Path command: cubic Bezier through two control points to an end point (3 points).
+export const MP_PATH_CUBIC: int32 = 3;
+/// Path command: close the subpath back to its start (no points).
+export const MP_PATH_CLOSE: int32 = 4;
+
+/// Node flag: round line joins and caps.
+export const MP_NF_ROUND: int32 = 1;
+/// Node flag: bold text.
+export const MP_NF_BOLD: int32 = 2;
+/// Node flag: tabular (fixed-width) digits.
+export const MP_NF_TABULAR: int32 = 4;
+/// Node flag: fill is a vertical gradient from fill (top) to fill2 (bottom).
+export const MP_NF_GRADIENT: int32 = 8;
+
+/// One display-list primitive. Fields a kind does not use are zero.
+///
+/// @mem Plain value; the point, command and text ranges index the owning scene's arrays.
+export struct MpNode {
+  kind: int32;       /// MP_NODE_*
+  cls: int32;        /// MP_CLS_*, or MP_CLS_SERIES + series index
+  align: int32;      /// MP_ALIGN_* (text only)
+  flags: int32;      /// MP_NF_* bits
+  dash: int32;       /// MP_DASH_* (line, poly, path)
+  marker: int32;     /// MP_MARK_* (marker only)
+  x: float64;        /// left (rect, bbox), anchor (text) or centre (marker); px
+  y: float64;        /// top (rect, bbox), baseline (text) or centre (marker); px
+  w: float64;        /// width (rect, bbox) or pre-measured text width; px
+  h: float64;        /// height (rect, bbox) or font size (text); px
+  size: float64;     /// font size (text); px
+  r: float64;        /// marker radius; px
+  stroke_w: float64; /// stroke width; px, 0 = no stroke
+  fill: MpColor;     /// fill colour (text colour for text); alpha 0 = no fill
+  fill2: MpColor;    /// bottom gradient colour when MP_NF_GRADIENT is set
+  stroke: MpColor;   /// stroke colour
+  pts_off: int32;    /// first float of the node's points in the scene's point array
+  pts_len: int32;    /// number of floats (2 per point)
+  cmd_off: int32;    /// first byte of the node's path commands
+  cmd_len: int32;    /// number of path commands
+  text_off: int32;   /// first byte of the node's text in the scene's text buffer
+  text_len: int32;   /// text length in bytes
+}
+
+/// A display list: nodes plus the point, command and text arrays they index.
+/// Read it through mp_scene_count, mp_scene_node and the mp_scene_node_* views.
+///
+/// @mem Owns nodes, pts, cmds and text; mp_scene_free releases them and the struct.
+export struct MpScene {
+  nodes: MpNode*;  /// node array
+  n: int64;        /// nodes in use
+  cap: int64;      /// node capacity
+  pts: float64*;   /// point array, x,y pairs
+  npts: int64;     /// floats in use
+  cappts: int64;   /// float capacity
+  cmds: uint8*;    /// path command bytes (MP_PATH_*)
+  ncmds: int64;    /// command bytes in use
+  capcmds: int64;  /// command capacity
+  text: MpBuf*;    /// text bytes of every text node
+  open: int64;     /// index of the polyline or path being built, or -1
+}
+
+const SCENE_MIN_NODES: int64 = 16;
+const SCENE_MIN_PTS: int64 = 64;
+const SCENE_MIN_CMDS: int64 = 32;
+const SCENE_MAX_OFF: int64 = 2147483647;
+
+/// Creates an empty scene.
+///
+/// @return The scene, or 0 when an allocation failed.
+/// @mem The caller owns the scene and releases it with mp_scene_free.
+/// @thread Safe from any thread; the scene itself is single-threaded.
+/// @cost Four small allocations.
+export fn mp_scene_new() -> MpScene* {
+  var s: MpScene* = (MpScene*)mp_alloc_zero(sizeof(MpScene));
+  if (s == 0) { return 0; }
+  s->open = -1;
+  s->nodes = (MpNode*)mp_alloc(SCENE_MIN_NODES * sizeof(MpNode));
+  s->pts = (float64*)mp_alloc(SCENE_MIN_PTS * 8);
+  s->cmds = (uint8*)mp_alloc(SCENE_MIN_CMDS);
+  s->text = mp_buf_new(256);
+  if (s->nodes == 0 || s->pts == 0 || s->cmds == 0 || s->text == 0) {
+    mp_scene_free(s);
+    return 0;
+  }
+  s->cap = SCENE_MIN_NODES;
+  s->cappts = SCENE_MIN_PTS;
+  s->capcmds = SCENE_MIN_CMDS;
+  return s;
+}
+
+/// Releases a scene and everything it owns.
+///
+/// @param s The scene. Valid: any; 0 does nothing.
+/// @mem Every pointer previously borrowed from s becomes invalid.
+/// @thread One thread at a time per scene.
+export fn mp_scene_free(s: MpScene*) {
+  if (s == 0) { return; }
+  if (s->nodes != 0) { mp_free((rawptr)s->nodes); }
+  if (s->pts != 0) { mp_free((rawptr)s->pts); }
+  if (s->cmds != 0) { mp_free((rawptr)s->cmds); }
+  if (s->text != 0) { mp_buf_free(s->text); }
+  mp_free((rawptr)s);
+}
+
+/// Removes every node, keeping the capacities, and abandons an open polyline or path.
+///
+/// @param s The scene. Valid: any; 0 does nothing.
+/// @mem Allocates nothing; borrowed node, point and text views become stale.
+/// @thread One thread at a time per scene.
+export fn mp_scene_clear(s: MpScene*) {
+  if (s == 0) { return; }
+  s->n = 0;
+  s->npts = 0;
+  s->ncmds = 0;
+  s->open = -1;
+  mp_buf_clear(s->text);
+}
+
+/// Number of nodes in the scene.
+///
+/// @param s The scene. Valid: any; 0 gives 0.
+/// @return The node count.
+/// @mem s is only read.
+/// @thread One thread at a time per scene.
+export fn mp_scene_count(s: MpScene*) -> int64 {
+  if (s == 0) { return 0; }
+  return s->n;
+}
+
+/// Borrowed pointer to node i.
+///
+/// @param s The scene. Valid: any; 0 gives 0.
+/// @param i Node index. Valid: 0 .. mp_scene_count(s)-1; anything else gives 0.
+/// @return The node, or 0.
+/// @mem Borrowed from the scene; valid until the next add, clear or free.
+/// @thread One thread at a time per scene.
+export fn mp_scene_node(s: MpScene*, i: int64) -> MpNode* {
+  if (s == 0) { return 0; }
+  if (i < 0 || i >= s->n) { return 0; }
+  return &s->nodes[i];
+}
+
+/// Text of a text node.
+///
+/// @param s The scene that holds the node. Valid: any; 0 gives "".
+/// @param nd The node. Valid: a node of s; 0, a non-text node or a bad range gives "".
+/// @return A view of the node's bytes in the scene's text buffer.
+/// @mem Borrowed from the scene; valid until the next add, clear or free. Not
+///   NUL-terminated.
+/// @thread One thread at a time per scene.
+export fn mp_scene_node_text(s: MpScene*, nd: MpNode*) -> string {
+  if (s == 0 || nd == 0) { return ""; }
+  if (nd->text_len <= 0 || s->text == 0 || s->text->data == 0) { return ""; }
+  var off: int64 = (int64)nd->text_off;
+  var n: int64 = (int64)nd->text_len;
+  if (off < 0 || off + n > s->text->len) { return ""; }
+  return str_from_bytes((cstring)(s->text->data + off), n);
+}
+
+/// Points of a node as x,y pairs (nd->pts_len floats).
+///
+/// @param s The scene that holds the node. Valid: any; 0 gives 0.
+/// @param nd The node. Valid: a node of s; 0, no points or a bad range gives 0.
+/// @return Pointer to the node's first float.
+/// @mem Borrowed from the scene; valid until the next add, clear or free.
+/// @thread One thread at a time per scene.
+export fn mp_scene_node_pts(s: MpScene*, nd: MpNode*) -> float64* {
+  if (s == 0 || nd == 0) { return 0; }
+  if (nd->pts_len <= 0 || s->pts == 0) { return 0; }
+  var off: int64 = (int64)nd->pts_off;
+  if (off < 0 || off + (int64)nd->pts_len > s->npts) { return 0; }
+  return s->pts + off;
+}
+
+/// Path commands of a path node (nd->cmd_len MP_PATH_* bytes).
+///
+/// @param s The scene that holds the node. Valid: any; 0 gives 0.
+/// @param nd The node. Valid: a node of s; 0, no commands or a bad range gives 0.
+/// @return Pointer to the node's first command byte.
+/// @mem Borrowed from the scene; valid until the next add, clear or free.
+/// @thread One thread at a time per scene.
+export fn mp_scene_node_cmds(s: MpScene*, nd: MpNode*) -> uint8* {
+  if (s == 0 || nd == 0) { return 0; }
+  if (nd->cmd_len <= 0 || s->cmds == 0) { return 0; }
+  var off: int64 = (int64)nd->cmd_off;
+  if (off < 0 || off + (int64)nd->cmd_len > s->ncmds) { return 0; }
+  return s->cmds + off;
+}
+
+fn scene_ready(s: MpScene*) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  if (s->open >= 0) { return MP_ERR_STATE; }
+  return MP_OK;
+}
+
+fn scene_grow(cap: int64, need: int64, min: int64) -> int64 {
+  var c: int64 = cap;
+  if (c < min) { c = min; }
+  while (c < need) { c = c * 2; }
+  return c;
+}
+
+fn scene_reserve_nodes(s: MpScene*, extra: int64) -> int32 {
+  if (extra > MP_MAX_COUNT - s->n) { return MP_ERR_LIMIT; }
+  if (s->n + extra <= s->cap) { return MP_OK; }
+  var c: int64 = scene_grow(s->cap, s->n + extra, SCENE_MIN_NODES);
+  var p: MpNode* = (MpNode*)mp_realloc((rawptr)s->nodes, c * sizeof(MpNode));
+  if (p == 0) { return MP_ERR_ALLOC; }
+  s->nodes = p;
+  s->cap = c;
+  return MP_OK;
+}
+
+// Offsets are int32, so a range past 2^31 is refused instead of wrapping.
+fn scene_reserve_pts(s: MpScene*, extra: int64) -> int32 {
+  if (extra < 0 || extra > SCENE_MAX_OFF - s->npts) { return MP_ERR_LIMIT; }
+  if (s->npts + extra <= s->cappts) { return MP_OK; }
+  var c: int64 = scene_grow(s->cappts, s->npts + extra, SCENE_MIN_PTS);
+  var p: float64* = (float64*)mp_realloc((rawptr)s->pts, c * 8);
+  if (p == 0) { return MP_ERR_ALLOC; }
+  s->pts = p;
+  s->cappts = c;
+  return MP_OK;
+}
+
+fn scene_reserve_cmds(s: MpScene*, extra: int64) -> int32 {
+  if (extra < 0 || extra > SCENE_MAX_OFF - s->ncmds) { return MP_ERR_LIMIT; }
+  if (s->ncmds + extra <= s->capcmds) { return MP_OK; }
+  var c: int64 = scene_grow(s->capcmds, s->ncmds + extra, SCENE_MIN_CMDS);
+  var p: uint8* = (uint8*)mp_realloc((rawptr)s->cmds, c);
+  if (p == 0) { return MP_ERR_ALLOC; }
+  s->cmds = p;
+  s->capcmds = c;
+  return MP_OK;
+}
+
+fn scene_blank(kind: int32, cls: int32) -> MpNode {
+  var nd: MpNode;
+  nd.kind = kind;
+  nd.cls = cls;
+  nd.align = MP_ALIGN_START;
+  nd.flags = 0;
+  nd.dash = MP_DASH_SOLID;
+  nd.marker = MP_MARK_NONE;
+  nd.x = 0.0;
+  nd.y = 0.0;
+  nd.w = 0.0;
+  nd.h = 0.0;
+  nd.size = 0.0;
+  nd.r = 0.0;
+  nd.stroke_w = 0.0;
+  nd.fill = mp_rgba(0, 0, 0, 0);
+  nd.fill2 = mp_rgba(0, 0, 0, 0);
+  nd.stroke = mp_rgba(0, 0, 0, 0);
+  nd.pts_off = (int32)0;
+  nd.pts_len = (int32)0;
+  nd.cmd_off = (int32)0;
+  nd.cmd_len = (int32)0;
+  nd.text_off = (int32)0;
+  nd.text_len = (int32)0;
+  return nd;
+}
+
+// The caller reserved one node.
+fn scene_push(s: MpScene*, nd: MpNode) {
+  s->nodes[s->n] = nd;
+  s->n = s->n + 1;
+}
+
+/// Appends a rectangle.
+///
+/// @param s The scene. Valid: non-zero, no polyline or path open.
+/// @param r The rectangle. Units: px. Valid: any; negative sizes are stored as given.
+/// @param fill Fill colour. Valid: any; alpha 0 means no fill.
+/// @param stroke Stroke colour. Valid: any.
+/// @param stroke_w Stroke width. Units: px. Valid: >= 0; 0 means no stroke.
+/// @param cls Node class (MP_CLS_*). Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0; nothing changes.
+/// @error MP_ERR_STATE a polyline or path is open; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT the node array could not grow; nothing changes.
+/// @mem s may reallocate its node array; borrowed node pointers become stale.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_rect(s: MpScene*, r: MpRect, fill: MpColor, stroke: MpColor,
+                        stroke_w: float64, cls: int32) -> int32 {
+  var rc: int32 = scene_ready(s);
+  if (rc != MP_OK) { return rc; }
+  rc = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  var nd: MpNode = scene_blank(MP_NODE_RECT, cls);
+  nd.x = r.x;
+  nd.y = r.y;
+  nd.w = r.w;
+  nd.h = r.h;
+  nd.fill = fill;
+  nd.stroke = stroke;
+  nd.stroke_w = stroke_w;
+  scene_push(s, nd);
+  return MP_OK;
+}
+
+/// Appends one straight segment from (x0, y0) to (x1, y1).
+/// The node's x, y, w, h hold the bounding box; the endpoints are its two points.
+///
+/// @param s The scene. Valid: non-zero, no polyline or path open.
+/// @param x0 Start x. Units: px. Valid: any.
+/// @param y0 Start y. Units: px. Valid: any.
+/// @param x1 End x. Units: px. Valid: any.
+/// @param y1 End y. Units: px. Valid: any.
+/// @param stroke Stroke colour. Valid: any.
+/// @param w Stroke width. Units: px. Valid: > 0.
+/// @param cls Node class (MP_CLS_*). Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0; nothing changes.
+/// @error MP_ERR_STATE a polyline or path is open; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT an array could not grow; nothing changes.
+/// @mem s may reallocate its arrays; borrowed pointers become stale.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_line(s: MpScene*, x0: float64, y0: float64, x1: float64, y1: float64,
+                        stroke: MpColor, w: float64, cls: int32) -> int32 {
+  var rc: int32 = scene_ready(s);
+  if (rc != MP_OK) { return rc; }
+  rc = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  rc = scene_reserve_pts(s, 4);
+  if (rc != MP_OK) { return rc; }
+  var off: int64 = s->npts;
+  s->pts[off] = x0;
+  s->pts[off + 1] = y0;
+  s->pts[off + 2] = x1;
+  s->pts[off + 3] = y1;
+  s->npts = off + 4;
+  var nd: MpNode = scene_blank(MP_NODE_LINE, cls);
+  nd.stroke = stroke;
+  nd.stroke_w = w;
+  nd.pts_off = (int32)off;
+  nd.pts_len = (int32)4;
+  scene_bbox(s, &nd);
+  scene_push(s, nd);
+  return MP_OK;
+}
+
+// Bounding box of the node's points into x, y, w, h (zero for no points).
+fn scene_bbox(s: MpScene*, nd: MpNode*) {
+  var i: int64 = (int64)nd->pts_off;
+  var end: int64 = i + (int64)nd->pts_len;
+  if (end - i < 2) { return; }
+  var x0: float64 = s->pts[i];
+  var y0: float64 = s->pts[i + 1];
+  var x1: float64 = x0;
+  var y1: float64 = y0;
+  while (i + 1 < end) {
+    var px: float64 = s->pts[i];
+    var py: float64 = s->pts[i + 1];
+    if (px < x0) { x0 = px; }
+    if (px > x1) { x1 = px; }
+    if (py < y0) { y0 = py; }
+    if (py > y1) { y1 = py; }
+    i = i + 2;
+  }
+  nd->x = x0;
+  nd->y = y0;
+  nd->w = x1 - x0;
+  nd->h = y1 - y0;
+}
+
+/// Appends one line of text with a width the caller already measured.
+/// The scene copies the bytes. x is the anchor named by align and y is the baseline.
+///
+/// @param s The scene. Valid: non-zero, no polyline or path open.
+/// @param x Anchor x. Units: px. Valid: any.
+/// @param y Baseline y. Units: px. Valid: any.
+/// @param label The text, UTF-8. Valid: any; "" adds a node with no text.
+/// @param size Font size. Units: px. Valid: > 0.
+/// @param color Text colour. Valid: any.
+/// @param align MP_ALIGN_*. Valid: 0 .. 2; anything else is MP_ERR_ARG.
+/// @param flags MP_NF_BOLD and/or MP_NF_TABULAR. Valid: any bits.
+/// @param cls Node class (MP_CLS_*). Valid: any.
+/// @param measured_w Width of the text as laid out. Units: px. Valid: >= 0.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0 or align is unknown; nothing changes.
+/// @error MP_ERR_STATE a polyline or path is open; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT the node array or text buffer could not grow;
+///   nothing changes.
+/// @mem label is copied; nothing is retained from it.
+/// @thread One thread at a time per scene.
+/// @cost O(len) amortized.
+export fn mp_scene_text(s: MpScene*, x: float64, y: float64, label: string, size: float64,
+                        color: MpColor, align: int32, flags: int32, cls: int32,
+                        measured_w: float64) -> int32 {
+  var rc: int32 = scene_ready(s);
+  if (rc != MP_OK) { return rc; }
+  if (align < MP_ALIGN_START || align > MP_ALIGN_END) { return MP_ERR_ARG; }
+  var off: int64 = mp_buf_len(s->text);
+  var tlen: int64 = (int64)label.length;
+  if (tlen > SCENE_MAX_OFF - off) { return MP_ERR_LIMIT; }
+  rc = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(s->text, label);
+  if (rc != MP_OK) { return rc; }
+  var nd: MpNode = scene_blank(MP_NODE_TEXT, cls);
+  nd.align = align;
+  nd.flags = flags;
+  nd.x = x;
+  nd.y = y;
+  nd.w = measured_w;
+  nd.h = size;
+  nd.size = size;
+  nd.fill = color;
+  nd.text_off = (int32)off;
+  nd.text_len = (int32)tlen;
+  scene_push(s, nd);
+  return MP_OK;
+}
+
+/// Appends a marker centred on (x, y).
+/// MP_MARK_NONE adds nothing and returns MP_OK, so callers need not test the shape.
+///
+/// @param s The scene. Valid: non-zero, no polyline or path open.
+/// @param x Centre x. Units: px. Valid: any.
+/// @param y Centre y. Units: px. Valid: any.
+/// @param r Radius (half the box side). Units: px. Valid: > 0.
+/// @param shape MP_MARK_*. Valid: 0 .. 3; anything else is MP_ERR_ARG.
+/// @param fill Fill colour. Valid: any; alpha 0 means no fill.
+/// @param stroke Ring colour. Valid: any.
+/// @param stroke_w Ring width. Units: px. Valid: >= 0; 0 means no ring.
+/// @param cls Node class (MP_CLS_*). Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0 or shape is unknown; nothing changes.
+/// @error MP_ERR_STATE a polyline or path is open; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT the node array could not grow; nothing changes.
+/// @mem s may reallocate its node array; borrowed node pointers become stale.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_marker(s: MpScene*, x: float64, y: float64, r: float64, shape: int32,
+                          fill: MpColor, stroke: MpColor, stroke_w: float64,
+                          cls: int32) -> int32 {
+  var rc: int32 = scene_ready(s);
+  if (rc != MP_OK) { return rc; }
+  if (shape < MP_MARK_NONE || shape > MP_MARK_DIAMOND) { return MP_ERR_ARG; }
+  if (shape == MP_MARK_NONE) { return MP_OK; }
+  rc = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  var nd: MpNode = scene_blank(MP_NODE_MARKER, cls);
+  nd.marker = shape;
+  nd.x = x;
+  nd.y = y;
+  nd.w = r * 2.0;
+  nd.h = r * 2.0;
+  nd.r = r;
+  nd.fill = fill;
+  nd.stroke = stroke;
+  nd.stroke_w = stroke_w;
+  scene_push(s, nd);
+  return MP_OK;
+}
+
+// Shared by poly_begin and path_begin: reserves and pushes the open node.
+fn scene_open(s: MpScene*, nd: MpNode, cap_pts: int64, cap_cmds: int64) -> int32 {
+  var rc: int32 = scene_ready(s);
+  if (rc != MP_OK) { return rc; }
+  if (cap_pts < 0 || cap_cmds < 0 || cap_pts > MP_MAX_COUNT) { return MP_ERR_ARG; }
+  rc = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  rc = scene_reserve_pts(s, cap_pts * 2);
+  if (rc != MP_OK) { return rc; }
+  rc = scene_reserve_cmds(s, cap_cmds);
+  if (rc != MP_OK) { return rc; }
+  nd.pts_off = (int32)s->npts;
+  nd.cmd_off = (int32)s->ncmds;
+  s->open = s->n;
+  scene_push(s, nd);
+  return MP_OK;
+}
+
+fn scene_open_kind(s: MpScene*, kind: int32) -> MpNode* {
+  if (s == 0 || s->open < 0) { return 0; }
+  var nd: MpNode* = &s->nodes[s->open];
+  if (nd->kind != kind) { return 0; }
+  return nd;
+}
+
+fn scene_add_pt(s: MpScene*, nd: MpNode*, x: float64, y: float64) {
+  s->pts[s->npts] = x;
+  s->pts[s->npts + 1] = y;
+  s->npts = s->npts + 2;
+  nd->pts_len = nd->pts_len + 2;
+}
+
+// Ends the open node of `kind`: bbox from its points, nothing open afterwards.
+fn scene_close(s: MpScene*, kind: int32) -> int32 {
+  var nd: MpNode* = scene_open_kind(s, kind);
+  if (nd == 0) {
+    if (s == 0) { return MP_ERR_ARG; }
+    return MP_ERR_STATE;
+  }
+  scene_bbox(s, nd);
+  s->open = -1;
+  return MP_OK;
+}
+
+/// Opens a polyline; add its points with mp_scene_poly_add and finish with
+/// mp_scene_poly_end.
+///
+/// @param s The scene. Valid: non-zero, nothing open.
+/// @param cap_pts Points to reserve now. Valid: 0 .. MP_MAX_COUNT; more may be added.
+/// @param stroke Stroke colour. Valid: any.
+/// @param w Stroke width. Units: px. Valid: > 0.
+/// @param dash MP_DASH_*. Valid: 0 .. 2.
+/// @param flags MP_NF_* bits (MP_NF_ROUND for series lines). Valid: any bits.
+/// @param cls Node class (MP_CLS_*). Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0 or cap_pts is out of range; nothing changes.
+/// @error MP_ERR_STATE a polyline or path is already open; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT an array could not grow; nothing changes.
+/// @mem s may reallocate its arrays; borrowed pointers become stale.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_poly_begin(s: MpScene*, cap_pts: int64, stroke: MpColor, w: float64,
+                              dash: int32, flags: int32, cls: int32) -> int32 {
+  var nd: MpNode = scene_blank(MP_NODE_POLY, cls);
+  nd.stroke = stroke;
+  nd.stroke_w = w;
+  nd.dash = dash;
+  nd.flags = flags;
+  return scene_open(s, nd, cap_pts, 0);
+}
+
+/// Appends one point to the open polyline.
+///
+/// @param s The scene. Valid: a polyline is open.
+/// @param x Point x. Units: px. Valid: any.
+/// @param y Point y. Units: px. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0; nothing changes.
+/// @error MP_ERR_STATE no polyline is open; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT the point array could not grow; the polyline keeps
+///   the points added so far and stays open.
+/// @mem s may reallocate its point array.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized; no allocation within the reserved capacity.
+export fn mp_scene_poly_add(s: MpScene*, x: float64, y: float64) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  var nd: MpNode* = scene_open_kind(s, MP_NODE_POLY);
+  if (nd == 0) { return MP_ERR_STATE; }
+  var rc: int32 = scene_reserve_pts(s, 2);
+  if (rc != MP_OK) { return rc; }
+  nd = &s->nodes[s->open];
+  scene_add_pt(s, nd, x, y);
+  return MP_OK;
+}
+
+/// Finishes the open polyline and computes its bounding box.
+///
+/// @param s The scene. Valid: a polyline is open.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0.
+/// @error MP_ERR_STATE no polyline is open; nothing changes.
+/// @mem Allocates nothing.
+/// @thread One thread at a time per scene.
+/// @cost O(points of the polyline).
+export fn mp_scene_poly_end(s: MpScene*) -> int32 {
+  return scene_close(s, MP_NODE_POLY);
+}
+
+/// Opens a path; add commands with mp_scene_path_move / line / cubic / close and
+/// finish with mp_scene_path_end. The first command must be a move.
+///
+/// @param s The scene. Valid: non-zero, nothing open.
+/// @param cap_pts Points to reserve now. Valid: 0 .. MP_MAX_COUNT; more may be added.
+/// @param cap_cmds Commands to reserve now. Valid: >= 0; more may be added.
+/// @param fill Fill colour (gradient top with MP_NF_GRADIENT). Valid: any; alpha 0 and no
+///   gradient means no fill.
+/// @param fill2 Gradient bottom colour. Valid: any; used only with MP_NF_GRADIENT.
+/// @param stroke Stroke colour. Valid: any.
+/// @param w Stroke width. Units: px. Valid: >= 0; 0 means no stroke.
+/// @param dash MP_DASH_*. Valid: 0 .. 2.
+/// @param flags MP_NF_* bits. Valid: any bits.
+/// @param cls Node class (MP_CLS_*). Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0 or a capacity is out of range; nothing changes.
+/// @error MP_ERR_STATE a polyline or path is already open; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT an array could not grow; nothing changes.
+/// @mem s may reallocate its arrays; borrowed pointers become stale.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_path_begin(s: MpScene*, cap_pts: int64, cap_cmds: int64, fill: MpColor,
+                              fill2: MpColor, stroke: MpColor, w: float64, dash: int32,
+                              flags: int32, cls: int32) -> int32 {
+  var nd: MpNode = scene_blank(MP_NODE_PATH, cls);
+  nd.fill = fill;
+  nd.fill2 = fill2;
+  nd.stroke = stroke;
+  nd.stroke_w = w;
+  nd.dash = dash;
+  nd.flags = flags;
+  return scene_open(s, nd, cap_pts, cap_cmds);
+}
+
+// One command with npt points (given in xs/ys order) on the open path.
+fn scene_path_cmd(s: MpScene*, cmd: int32, npt: int64, p: float64*) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  var nd: MpNode* = scene_open_kind(s, MP_NODE_PATH);
+  if (nd == 0) { return MP_ERR_STATE; }
+  if (cmd != MP_PATH_MOVE && nd->cmd_len == 0) { return MP_ERR_STATE; }
+  var rc: int32 = scene_reserve_cmds(s, 1);
+  if (rc != MP_OK) { return rc; }
+  rc = scene_reserve_pts(s, npt * 2);
+  if (rc != MP_OK) { return rc; }
+  nd = &s->nodes[s->open];
+  var i: int64 = 0;
+  while (i < npt) {
+    scene_add_pt(s, nd, p[i * 2], p[i * 2 + 1]);
+    i = i + 1;
+  }
+  s->cmds[s->ncmds] = (uint8)cmd;
+  s->ncmds = s->ncmds + 1;
+  nd->cmd_len = nd->cmd_len + 1;
+  return MP_OK;
+}
+
+/// Starts a new subpath at (x, y) on the open path.
+///
+/// @param s The scene. Valid: a path is open.
+/// @param x Point x. Units: px. Valid: any.
+/// @param y Point y. Units: px. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0; nothing changes.
+/// @error MP_ERR_STATE no path is open; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT an array could not grow; the path is unchanged and
+///   stays open.
+/// @mem s may reallocate its arrays.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_path_move(s: MpScene*, x: float64, y: float64) -> int32 {
+  var p: float64[2];
+  p[0] = x;
+  p[1] = y;
+  return scene_path_cmd(s, MP_PATH_MOVE, 1, &p[0]);
+}
+
+/// Adds a straight segment to (x, y) on the open path.
+///
+/// @param s The scene. Valid: a path is open and has a move.
+/// @param x Point x. Units: px. Valid: any.
+/// @param y Point y. Units: px. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0; nothing changes.
+/// @error MP_ERR_STATE no path is open, or it has no move yet; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT an array could not grow; the path is unchanged and
+///   stays open.
+/// @mem s may reallocate its arrays.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_path_line(s: MpScene*, x: float64, y: float64) -> int32 {
+  var p: float64[2];
+  p[0] = x;
+  p[1] = y;
+  return scene_path_cmd(s, MP_PATH_LINE, 1, &p[0]);
+}
+
+/// Adds a cubic Bezier segment to (x, y) on the open path.
+///
+/// @param s The scene. Valid: a path is open and has a move.
+/// @param c1x First control point x. Units: px. Valid: any.
+/// @param c1y First control point y. Units: px. Valid: any.
+/// @param c2x Second control point x. Units: px. Valid: any.
+/// @param c2y Second control point y. Units: px. Valid: any.
+/// @param x End point x. Units: px. Valid: any.
+/// @param y End point y. Units: px. Valid: any.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0; nothing changes.
+/// @error MP_ERR_STATE no path is open, or it has no move yet; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT an array could not grow; the path is unchanged and
+///   stays open.
+/// @mem s may reallocate its arrays.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_path_cubic(s: MpScene*, c1x: float64, c1y: float64, c2x: float64,
+                              c2y: float64, x: float64, y: float64) -> int32 {
+  var p: float64[6];
+  p[0] = c1x;
+  p[1] = c1y;
+  p[2] = c2x;
+  p[3] = c2y;
+  p[4] = x;
+  p[5] = y;
+  return scene_path_cmd(s, MP_PATH_CUBIC, 3, &p[0]);
+}
+
+/// Closes the current subpath of the open path back to its start.
+///
+/// @param s The scene. Valid: a path is open and has a move.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0; nothing changes.
+/// @error MP_ERR_STATE no path is open, or it has no move yet; nothing changes.
+/// @error MP_ERR_ALLOC or MP_ERR_LIMIT the command array could not grow; the path is
+///   unchanged and stays open.
+/// @mem s may reallocate its command array.
+/// @thread One thread at a time per scene.
+/// @cost O(1) amortized.
+export fn mp_scene_path_close(s: MpScene*) -> int32 {
+  var p: float64[2];
+  p[0] = 0.0;
+  p[1] = 0.0;
+  return scene_path_cmd(s, MP_PATH_CLOSE, 0, &p[0]);
+}
+
+/// Finishes the open path and computes its bounding box (over control points too).
+///
+/// @param s The scene. Valid: a path is open.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG s is 0.
+/// @error MP_ERR_STATE no path is open; nothing changes.
+/// @mem Allocates nothing.
+/// @thread One thread at a time per scene.
+/// @cost O(points of the path).
+export fn mp_scene_path_end(s: MpScene*) -> int32 {
+  return scene_close(s, MP_NODE_PATH);
+}

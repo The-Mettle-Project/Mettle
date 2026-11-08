@@ -1,0 +1,419 @@
+// The terminal renderer on small hand-built scenes: exact text for every mode, Braille
+// dot placement, block eighths, half-blocks, text layering and UTF-8 clipping, colour
+// sequences, MP_TERM_HOME framing, plain output, limits, argument errors and leaks.
+
+import "mistplot/test/harness";
+import "mistplot/core/error";
+import "mistplot/core/mem";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/render/term";
+
+fn wp(b: MpBuf*, s: string) {
+  if (mp_buf_puts(b, s) != MP_OK) { mp_expect("expected text append", false); }
+}
+
+// ESC followed by s.
+fn we(b: MpBuf*, s: string) {
+  mp_buf_putc(b, 27);
+  wp(b, s);
+}
+
+fn none() -> MpColor { return mp_rgba(0, 0, 0, 0); }
+fn blue() -> MpColor { return mp_rgba(66, 105, 208, 255); }
+fn red() -> MpColor { return mp_rgba(255, 0, 0, 255); }
+fn navy() -> MpColor { return mp_rgba(0, 0, 255, 255); }
+fn grey() -> MpColor { return mp_rgba(229, 231, 235, 255); }
+fn axis() -> MpColor { return mp_rgba(156, 163, 175, 255); }
+
+fn has_esc(b: MpBuf*) -> bool {
+  var i: int64 = 0;
+  while (i < b->len) {
+    if (b->data[i] == (uint8)27) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn seg(s: MpScene*, x0: float64, y0: float64, x1: float64, y1: float64, c: MpColor,
+       cls: int32) {
+  mp_scene_poly_begin(s, 2, c, 2.0, MP_DASH_SOLID, MP_NF_ROUND, cls);
+  mp_scene_poly_add(s, x0, y0);
+  mp_scene_poly_add(s, x1, y1);
+  mp_scene_poly_end(s);
+}
+
+fn text(s: MpScene*, x: float64, label: string, align: int32, cls: int32) {
+  mp_scene_text(s, x, 12.0, label, 12.0, mp_rgba(17, 24, 39, 255), align, 0, cls, 0.0);
+}
+
+fn bar(s: MpScene*, x: float64, y: float64, w: float64, h: float64) {
+  mp_scene_rect(s, mp_rect(x, y, w, h), blue(), none(), 0.0, MP_CLS_SERIES);
+}
+
+// Renders s on cols x rows cells and compares with want (then clears want).
+fn expect_term(name: string, s: MpScene*, cols: int32, rows: int32, mode: int32,
+               want: MpBuf*) {
+  var out: MpBuf* = mp_buf_new(64);
+  if (out == 0) { return; }
+  var t: MpTarget = mp_target_cells(cols, rows);
+  mp_expect_i64(name, (int64)mp_term_scene(s, &t, mode, out), (int64)MP_OK);
+  mp_expect_str(name, mp_buf_str(out), mp_buf_str(want));
+  mp_buf_free(out);
+  mp_buf_clear(want);
+}
+
+// A diagonal across two cells: dots (0,0) (1,1) | (2,2) (3,3).
+fn check_braille_line() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  seg(s, 2.0, 2.0, 14.0, 14.0, blue(), MP_CLS_SERIES);
+  wp(w, "⠑⢄\n");
+  expect_term("braille diagonal plain", s, 2, 1, MP_TERM_BRAILLE | MP_TERM_PLAIN, w);
+  we(w, "[38;2;66;105;208m⠑⢄");
+  we(w, "[0m\n");
+  expect_term("braille diagonal colour", s, 2, 1, MP_TERM_BRAILLE, w);
+  we(w, "[38;2;66;105;208m⠑⢄");
+  we(w, "[0m\n");
+  expect_term("auto is braille for lines", s, 2, 1, MP_TERM_AUTO, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+// A 3.5 px circle covers the 2 x 2 dots around its centre; a tiny one still sets the dot
+// under its centre.
+fn check_braille_marker() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  mp_scene_marker(s, 12.0, 24.0, 3.5, MP_MARK_CIRCLE, mp_rgba(66, 105, 208, 204),
+                  mp_rgba(255, 255, 255, 255), 1.0, MP_CLS_SERIES);
+  mp_scene_marker(s, 1.0, 1.0, 1.0, MP_MARK_DIAMOND, blue(), none(), 0.0, MP_CLS_SERIES);
+  wp(w, "⠁\n ⠶\n");
+  expect_term("braille markers", s, 3, 2, MP_TERM_BRAILLE | MP_TERM_PLAIN, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+// Grid only in empty cells (dim), dots replace it, the axis rule in its own colour.
+fn check_braille_rules() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  mp_scene_marker(s, 12.0, 8.0, 1.0, MP_MARK_CIRCLE, blue(), none(), 0.0, MP_CLS_SERIES);
+  mp_scene_line(s, 0.0, 8.0, 32.0, 8.0, grey(), 1.0, MP_CLS_GRID);
+  mp_scene_line(s, 0.0, 24.0, 32.0, 24.0, axis(), 1.0, MP_CLS_AXIS);
+  wp(w, "─⠠──\n────\n");
+  expect_term("rules plain", s, 4, 2, MP_TERM_BRAILLE | MP_TERM_PLAIN, w);
+  we(w, "[2m─");
+  we(w, "[0m");
+  we(w, "[38;2;66;105;208m⠠");
+  we(w, "[0m");
+  we(w, "[2m──");
+  we(w, "[0m\n");
+  we(w, "[38;2;156;163;175m────");
+  we(w, "[0m\n");
+  expect_term("rules colour", s, 4, 2, MP_TERM_BRAILLE, w);
+  we(w, "[38;2;229;231;235m─");
+  we(w, "[38;2;66;105;208m⠠");
+  we(w, "[38;2;229;231;235m──");
+  we(w, "[0m\n");
+  we(w, "[38;2;156;163;175m────");
+  we(w, "[0m\n");
+  expect_term("rules themed", s, 4, 2, MP_TERM_BRAILLE | MP_TERM_THEME, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+// Bars of 32, 20 and 6 px on 16 px rows: full, then 4/16 = ▂ above; 6/16 = ▃.
+fn check_blocks_bars() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  bar(s, 0.0, 0.0, 8.0, 32.0);
+  bar(s, 8.0, 12.0, 8.0, 20.0);
+  bar(s, 16.0, 26.0, 8.0, 6.0);
+  wp(w, "█▂\n██▃\n");
+  expect_term("bar eighths", s, 3, 2, MP_TERM_BLOCKS | MP_TERM_PLAIN, w);
+  wp(w, "█▂\n██▃\n");
+  expect_term("auto is blocks for bars", s, 3, 2, MP_TERM_AUTO | MP_TERM_PLAIN, w);
+  we(w, "[38;2;66;105;208m█▂");
+  we(w, "[0m\n");
+  we(w, "[38;2;66;105;208m██▃");
+  we(w, "[0m\n");
+  expect_term("bar colour", s, 3, 2, MP_TERM_BLOCKS, w);
+  mp_scene_clear(s);
+  bar(s, 0.0, 0.0, 8.0, 8.0);
+  bar(s, 8.0, 0.0, 8.0, 2.0);
+  bar(s, 16.0, 4.0, 8.0, 4.0);
+  wp(w, "▀▔▂\n");
+  expect_term("hanging and floating bars", s, 3, 1, MP_TERM_BLOCKS | MP_TERM_PLAIN, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+// Two series in one cell: ▀ with the top colour as foreground, the bottom as background.
+fn check_blocks_lines() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  seg(s, 0.0, 4.0, 15.0, 4.0, red(), MP_CLS_SERIES);
+  seg(s, 0.0, 12.0, 7.0, 12.0, navy(), MP_CLS_SERIES + 1);
+  wp(w, "█▀\n");
+  expect_term("half blocks plain", s, 2, 1, MP_TERM_BLOCKS | MP_TERM_PLAIN, w);
+  we(w, "[38;2;255;0;0m");
+  we(w, "[48;2;0;0;255m▀");
+  we(w, "[0m");
+  we(w, "[38;2;255;0;0m▀");
+  we(w, "[0m\n");
+  expect_term("half blocks colour", s, 2, 1, MP_TERM_BLOCKS, w);
+  mp_scene_clear(s);
+  seg(s, 0.0, 12.0, 15.0, 12.0, red(), MP_CLS_SERIES);
+  mp_scene_marker(s, 4.0, 4.0, 3.5, MP_MARK_SQUARE, navy(), none(), 0.0, MP_CLS_SERIES);
+  wp(w, "█▄\n");
+  expect_term("half block marker", s, 2, 1, MP_TERM_BLOCKS | MP_TERM_PLAIN, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+// Text overwrites dots; code points are never split at either edge.
+fn check_text() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  var bad: MpBuf* = mp_buf_new(8);
+  if (s == 0 || w == 0 || bad == 0) { return; }
+  seg(s, 0.0, 2.0, 31.0, 2.0, blue(), MP_CLS_SERIES);
+  text(s, 0.0, "a·b", MP_ALIGN_START, MP_CLS_LABEL);
+  wp(w, "a·b⠉\n");
+  expect_term("text over dots", s, 4, 1, MP_TERM_BRAILLE | MP_TERM_PLAIN, w);
+  mp_scene_clear(s);
+  text(s, 32.0, "⠀", MP_ALIGN_END, MP_CLS_LABEL);
+  wp(w, "   ⠀\n");
+  expect_term("braille blank is text", s, 4, 1, MP_TERM_PLAIN, w);
+  mp_scene_clear(s);
+  text(s, 16.0, "a··", MP_ALIGN_START, MP_CLS_LABEL);
+  wp(w, "  a·\n");
+  expect_term("clip at the right edge", s, 4, 1, MP_TERM_PLAIN, w);
+  mp_scene_clear(s);
+  text(s, 24.0, "😀😀", MP_ALIGN_START, MP_CLS_LABEL);
+  wp(w, "   😀\n");
+  expect_term("four-byte code point at the edge", s, 4, 1, MP_TERM_PLAIN, w);
+  mp_scene_clear(s);
+  text(s, 8.0, "a·c", MP_ALIGN_END, MP_CLS_LABEL);
+  text(s, 16.0, "xyz", MP_ALIGN_CENTER, MP_CLS_LABEL);
+  wp(w, "cxyz\n");
+  expect_term("left clip and centre", s, 4, 1, MP_TERM_PLAIN, w);
+  mp_scene_clear(s);
+  mp_buf_putc(bad, 65);
+  mp_buf_putc(bad, 255);
+  mp_buf_putc(bad, 9);
+  text(s, 0.0, mp_buf_str(bad), MP_ALIGN_START, MP_CLS_LABEL);
+  wp(w, "A??\n");
+  expect_term("invalid and control bytes", s, 4, 1, MP_TERM_PLAIN, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+  mp_buf_free(bad);
+}
+
+// No theme: titles in the terminal's colour, ticks dim. Theme: scene colours and the
+// background rect.
+fn check_colours() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  mp_scene_rect(s, mp_rect(0.0, 0.0, 48.0, 16.0), mp_rgba(255, 255, 255, 255), none(),
+                0.0, MP_CLS_BG);
+  text(s, 0.0, "Hi", MP_ALIGN_START, MP_CLS_TITLE);
+  mp_scene_text(s, 24.0, 12.0, "5", 11.0, mp_rgba(107, 114, 128, 255), MP_ALIGN_START,
+                MP_NF_TABULAR, MP_CLS_TICK, 8.0);
+  wp(w, "Hi ");
+  we(w, "[2m5");
+  we(w, "[0m\n");
+  expect_term("default colours", s, 6, 1, MP_TERM_BRAILLE, w);
+  we(w, "[38;2;17;24;39m");
+  we(w, "[48;2;255;255;255mHi ");
+  we(w, "[38;2;107;114;128m5  ");
+  we(w, "[0m\n");
+  expect_term("theme colours", s, 6, 1, MP_TERM_BRAILLE | MP_TERM_THEME, w);
+  wp(w, "Hi 5\n");
+  expect_term("theme plain", s, 6, 1, MP_TERM_BLOCKS | MP_TERM_THEME | MP_TERM_PLAIN, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+fn check_home() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  text(s, 0.0, "ok", MP_ALIGN_START, MP_CLS_TITLE);
+  we(w, "[Hok");
+  we(w, "[K\n");
+  we(w, "[K\n");
+  expect_term("home framing", s, 3, 2, MP_TERM_BRAILLE | MP_TERM_HOME, w);
+  wp(w, "ok\n\n");
+  expect_term("plain wins over home", s, 3, 2, MP_TERM_HOME | MP_TERM_PLAIN, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+// ASCII keeps the old look: direction glyphs, + where strokes cross, @ markers.
+fn check_ascii() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  mp_scene_line(s, 0.0, 24.0, 39.0, 24.0, grey(), 1.0, MP_CLS_GRID);
+  seg(s, 4.0, 8.0, 36.0, 40.0, blue(), MP_CLS_SERIES);
+  mp_scene_marker(s, 4.0, 40.0, 3.0, MP_MARK_CIRCLE, blue(), none(), 0.0, MP_CLS_SERIES);
+  text(s, 24.0, "ok", MP_ALIGN_START, MP_CLS_LABEL);
+  wp(w, "\\  ok\n--+--\n@  --\n");
+  expect_term("ascii strokes", s, 5, 3, MP_TERM_ASCII | MP_TERM_PLAIN, w);
+  mp_scene_clear(s);
+  bar(s, 0.0, 0.0, 16.0, 16.0);
+  wp(w, "##\n");
+  expect_term("ascii plain bar", s, 2, 1, MP_TERM_ASCII | MP_TERM_PLAIN, w);
+  we(w, "[48;2;66;105;208m  ");
+  we(w, "[0m\n");
+  expect_term("ascii colour bar", s, 2, 1, MP_TERM_ASCII, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+// Every node kind in one scene, for the plain and determinism checks.
+fn build_rich(s: MpScene*) {
+  mp_scene_rect(s, mp_rect(0.0, 0.0, 80.0, 64.0), mp_rgba(255, 255, 255, 255), none(),
+                0.0, MP_CLS_BG);
+  mp_scene_line(s, 8.0, 20.5, 72.0, 20.5, grey(), 1.0, MP_CLS_GRID);
+  mp_scene_line(s, 8.0, 48.5, 72.0, 48.5, axis(), 1.0, MP_CLS_AXIS);
+  bar(s, 10.0, 30.0, 6.0, 18.0);
+  mp_scene_path_begin(s, 4, 4, none(), none(), red(), 2.0, MP_DASH_DASHED, MP_NF_ROUND,
+                      MP_CLS_SERIES + 1);
+  mp_scene_path_move(s, 8.0, 44.0);
+  mp_scene_path_cubic(s, 24.0, 4.0, 48.0, 4.0, 72.0, 40.0);
+  mp_scene_path_end(s);
+  seg(s, 8.0, 40.0, 72.0, 24.0, navy(), MP_CLS_SERIES + 2);
+  mp_scene_marker(s, 40.0, 30.0, 3.5, MP_MARK_CIRCLE, blue(), none(), 0.0, MP_CLS_SERIES);
+  mp_scene_text(s, 4.0, 12.0, "Title·x", 15.0, mp_rgba(17, 24, 39, 255), MP_ALIGN_START,
+                MP_NF_BOLD, MP_CLS_TITLE, 56.0);
+  mp_scene_text(s, 40.0, 60.0, "1.5k", 11.0, mp_rgba(107, 114, 128, 255), MP_ALIGN_CENTER,
+                MP_NF_TABULAR, MP_CLS_TICK, 32.0);
+}
+
+fn check_plain_and_determinism() {
+  var s: MpScene* = mp_scene_new();
+  var a: MpBuf* = mp_buf_new(64);
+  var b: MpBuf* = mp_buf_new(64);
+  if (s == 0 || a == 0 || b == 0) { return; }
+  build_rich(s);
+  var t: MpTarget = mp_target_cells(10, 4);
+  var mode: int32 = 0;
+  while (mode <= MP_TERM_ASCII) {
+    mp_term_scene(s, &t, mode | MP_TERM_PLAIN | MP_TERM_HOME | MP_TERM_THEME, a);
+    mp_expect("plain has no ESC", !has_esc(a) && mp_buf_len(a) > 0);
+    mp_term_scene(s, &t, mode | MP_TERM_THEME, a);
+    mp_expect("colour has ESC", has_esc(a));
+    mp_term_scene(s, &t, mode | MP_TERM_HOME, a);
+    mp_term_scene(s, &t, mode | MP_TERM_HOME, b);
+    mp_expect_str("deterministic", mp_buf_str(a), mp_buf_str(b));
+    mode = mode + 1;
+  }
+  mp_scene_clear(s);
+  build_rich(s);
+  mp_term_scene(s, &t, MP_TERM_BRAILLE | MP_TERM_HOME, b);
+  mp_term_scene(s, &t, MP_TERM_AUTO | MP_TERM_HOME, a);
+  mp_expect_str("rebuilt scene, same bytes", mp_buf_str(a), mp_buf_str(b));
+  mp_scene_free(s);
+  mp_buf_free(a);
+  mp_buf_free(b);
+}
+
+// A fill-only path (an area) draws nothing; a stroked cubic draws dots.
+fn check_paths() {
+  var s: MpScene* = mp_scene_new();
+  var w: MpBuf* = mp_buf_new(64);
+  if (s == 0 || w == 0) { return; }
+  mp_scene_path_begin(s, 4, 4, blue(), none(), none(), 0.0, 0, 0, MP_CLS_SERIES);
+  mp_scene_path_move(s, 0.0, 0.0);
+  mp_scene_path_line(s, 16.0, 16.0);
+  mp_scene_path_line(s, 0.0, 16.0);
+  mp_scene_path_close(s);
+  mp_scene_path_end(s);
+  wp(w, "\n");
+  expect_term("area fill not drawn", s, 2, 1, MP_TERM_BRAILLE | MP_TERM_PLAIN, w);
+  mp_scene_clear(s);
+  mp_scene_path_begin(s, 4, 4, none(), none(), blue(), 1.0, 0, 0, MP_CLS_SERIES);
+  mp_scene_path_move(s, 2.0, 2.0);
+  mp_scene_path_line(s, 14.0, 14.0);
+  mp_scene_path_end(s);
+  wp(w, "⠑⢄\n");
+  expect_term("stroked path", s, 2, 1, MP_TERM_BRAILLE | MP_TERM_PLAIN, w);
+  mp_scene_free(s);
+  mp_buf_free(w);
+}
+
+fn check_errors() {
+  var s: MpScene* = mp_scene_new();
+  var out: MpBuf* = mp_buf_new(64);
+  if (s == 0 || out == 0) { return; }
+  var t: MpTarget = mp_target_cells(4, 2);
+  mp_expect_i64("out 0", (int64)mp_term_scene(s, &t, 0, 0), (int64)MP_ERR_ARG);
+  wp(out, "junk");
+  mp_expect_i64("scene 0", (int64)mp_term_scene(0, &t, 0, out), (int64)MP_ERR_ARG);
+  mp_expect_i64("error clears out", mp_buf_len(out), 0);
+  mp_expect_i64("target 0", (int64)mp_term_scene(s, 0, 0, out), (int64)MP_ERR_ARG);
+  mp_expect_i64("mode 4", (int64)mp_term_scene(s, &t, 4, out), (int64)MP_ERR_ARG);
+  mp_expect_i64("unknown flag", (int64)mp_term_scene(s, &t, 128, out), (int64)MP_ERR_ARG);
+  mp_expect_i64("negative mode", (int64)mp_term_scene(s, &t, -1, out), (int64)MP_ERR_ARG);
+  var bad: MpTarget = mp_target_cells(0, 2);
+  mp_expect_i64("zero cols", (int64)mp_term_scene(s, &bad, 0, out), (int64)MP_ERR_ARG);
+  var zero: float64 = 0.0;
+  bad = mp_target(32.0, zero / zero);
+  mp_expect_i64("NaN height", (int64)mp_term_scene(s, &bad, 0, out), (int64)MP_ERR_ARG);
+  bad = mp_target(1.0 / zero, 16.0);
+  mp_expect_i64("infinite width", (int64)mp_term_scene(s, &bad, 0, out), (int64)MP_ERR_ARG);
+  bad = mp_target_cells(MP_TERM_MAX_COLS + 1, 1);
+  wp(out, "junk");
+  mp_expect_i64("too many cols", (int64)mp_term_scene(s, &bad, 0, out), (int64)MP_ERR_LIMIT);
+  mp_expect_i64("limit clears out", mp_buf_len(out), 0);
+  bad = mp_target_cells(1, MP_TERM_MAX_ROWS + 1);
+  mp_expect_i64("too many rows", (int64)mp_term_scene(s, &bad, 0, out), (int64)MP_ERR_LIMIT);
+  bad = mp_target_cells(MP_TERM_MAX_COLS, 1);
+  mp_expect_i64("max cols", (int64)mp_term_scene(s, &bad, MP_TERM_PLAIN, out),
+                (int64)MP_OK);
+  mp_scene_poly_begin(s, 1, blue(), 1.0, 0, 0, 0);
+  mp_expect_i64("open poly", (int64)mp_term_scene(s, &t, 0, out), (int64)MP_ERR_STATE);
+  mp_expect_i64("state error clears out", mp_buf_len(out), 0);
+  mp_scene_free(s);
+  mp_buf_free(out);
+}
+
+fn run_all() {
+  var live0: int64 = mp_alloc_live();
+  check_braille_line();
+  check_braille_marker();
+  check_braille_rules();
+  check_blocks_bars();
+  check_blocks_lines();
+  check_text();
+  check_colours();
+  check_home();
+  check_ascii();
+  check_plain_and_determinism();
+  check_paths();
+  check_errors();
+  mp_expect_i64("no leaks", mp_alloc_live(), live0);
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_term_scene() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
