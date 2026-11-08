@@ -2793,6 +2793,15 @@ static int generates_declarations(const ASTNode *decl) {
   return decl && decl->type == AST_COMPTIME_FOR;
 }
 
+static void include_generating_declarations(const Program *program,
+                                            int *include_flags) {
+  for (size_t j = 0; j < program->declaration_count; j++) {
+    if (generates_declarations(program->declarations[j])) {
+      include_flags[j] = 1;
+    }
+  }
+}
+
 static int is_declaration_exported(ASTNode *decl) {
   if (!decl || !decl->data)
     return 0;
@@ -2992,6 +3001,28 @@ static void collect_assembly_identifiers(const char *assembly, char ***names,
 }
 
 static void collect_dependency_names(ASTNode *node, char ***names,
+                                     size_t *count, size_t *capacity);
+
+static void collect_call_dependency_names(CallExpression *call, char ***names,
+                                          size_t *count, size_t *capacity) {
+  if (!call) {
+    return;
+  }
+  if (call->function_name && call->function_name[0] != '\0') {
+    (void)path_set_add(names, count, capacity, call->function_name);
+  }
+  for (size_t i = 0; i < call->type_arg_count; i++) {
+    collect_type_name_dependencies(call->type_args[i], names, count, capacity);
+  }
+  if (call->object) {
+    collect_dependency_names(call->object, names, count, capacity);
+  }
+  for (size_t i = 0; i < call->argument_count; i++) {
+    collect_dependency_names(call->arguments[i], names, count, capacity);
+  }
+}
+
+static void collect_dependency_names(ASTNode *node, char ***names,
                                      size_t *count, size_t *capacity) {
   if (!node || !names || !count || !capacity) {
     return;
@@ -3049,26 +3080,10 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     }
     return;
   }
-  case AST_FUNCTION_CALL: {
-    CallExpression *call = (CallExpression *)node->data;
-    if (!call) {
-      return;
-    }
-    if (call->function_name && call->function_name[0] != '\0') {
-      (void)path_set_add(names, count, capacity, call->function_name);
-    }
-    for (size_t i = 0; i < call->type_arg_count; i++) {
-      collect_type_name_dependencies(call->type_args[i], names, count,
-                                     capacity);
-    }
-    if (call->object) {
-      collect_dependency_names(call->object, names, count, capacity);
-    }
-    for (size_t i = 0; i < call->argument_count; i++) {
-      collect_dependency_names(call->arguments[i], names, count, capacity);
-    }
+  case AST_FUNCTION_CALL:
+    collect_call_dependency_names((CallExpression *)node->data, names, count,
+                                  capacity);
     return;
-  }
   case AST_FUNC_PTR_CALL: {
     FuncPtrCall *call = (FuncPtrCall *)node->data;
     if (!call) {
@@ -3611,6 +3626,64 @@ static char *format_import_chain(ImportContext *ctx) {
   return chain_str;
 }
 
+static void embed_import_str(ImportContext *ctx, ASTNode *node,
+                             const char *current_file_path, int *had_error) {
+  ImportStrExpression *import_str = (ImportStrExpression *)node->data;
+  char *full_path =
+      resolve_import_path(ctx, current_file_path, import_str->file_path);
+
+  if (!full_path) {
+    if (ctx->reporter) {
+      char *chain = format_import_chain(ctx);
+      char error_msg[1024];
+      snprintf(error_msg, sizeof(error_msg),
+               "Could not resolve embedded file '%s' (import chain: %s)",
+               import_str->file_path, chain);
+      error_reporter_add_error(ctx->reporter, ERROR_IO, node->location,
+                               error_msg);
+      free(chain);
+    }
+    *had_error = 1;
+    return;
+  }
+
+  size_t source_length = 0;
+  char *source = read_file_content(full_path, &source_length);
+  if (!source) {
+    if (ctx->reporter) {
+      char *chain = format_import_chain(ctx);
+      char error_msg[1024];
+      snprintf(error_msg, sizeof(error_msg),
+               "Could not read embedded file '%s' (import chain: %s)",
+               import_str->file_path, chain);
+      error_reporter_add_error(ctx->reporter, ERROR_IO, node->location,
+                               error_msg);
+      free(chain);
+    }
+    free(full_path);
+    *had_error = 1;
+    return;
+  }
+
+  free(full_path);
+
+  StringLiteral *string_literal = calloc(1, sizeof(StringLiteral));
+  if (!string_literal) {
+    free(source);
+    *had_error = 1;
+    return;
+  }
+
+  free(import_str->file_path);
+  free(import_str);
+
+  string_literal->value = source;
+  string_literal->length = source_length;
+
+  node->type = AST_STRING_LITERAL;
+  node->data = string_literal;
+}
+
 static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
                                         const char *current_file_path,
                                         int *had_error) {
@@ -3618,60 +3691,7 @@ static void process_import_strs_in_node(ImportContext *ctx, ASTNode *node,
     return;
 
   if (node->type == AST_IMPORT_STR) {
-    ImportStrExpression *import_str = (ImportStrExpression *)node->data;
-    char *full_path =
-        resolve_import_path(ctx, current_file_path, import_str->file_path);
-
-    if (!full_path) {
-      if (ctx->reporter) {
-        char *chain = format_import_chain(ctx);
-        char error_msg[1024];
-        snprintf(error_msg, sizeof(error_msg),
-                 "Could not resolve embedded file '%s' (import chain: %s)",
-                 import_str->file_path, chain);
-        error_reporter_add_error(ctx->reporter, ERROR_IO, node->location,
-                                 error_msg);
-        free(chain);
-      }
-      *had_error = 1;
-      return;
-    }
-
-    size_t source_length = 0;
-    char *source = read_file_content(full_path, &source_length);
-    if (!source) {
-      if (ctx->reporter) {
-        char *chain = format_import_chain(ctx);
-        char error_msg[1024];
-        snprintf(error_msg, sizeof(error_msg),
-                 "Could not read embedded file '%s' (import chain: %s)",
-                 import_str->file_path, chain);
-        error_reporter_add_error(ctx->reporter, ERROR_IO, node->location,
-                                 error_msg);
-        free(chain);
-      }
-      free(full_path);
-      *had_error = 1;
-      return;
-    }
-
-    free(full_path);
-
-    StringLiteral *string_literal = calloc(1, sizeof(StringLiteral));
-    if (!string_literal) {
-      free(source);
-      *had_error = 1;
-      return;
-    }
-
-    free(import_str->file_path);
-    free(import_str);
-
-    string_literal->value = source;
-    string_literal->length = source_length;
-
-    node->type = AST_STRING_LITERAL;
-    node->data = string_literal;
+    embed_import_str(ctx, node, current_file_path, had_error);
     return;
   }
 
@@ -4290,12 +4310,8 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
                 include_flags[selected_index] = 1;
               }
 
-              for (size_t j = 0; j < imported_prog_data->declaration_count;
-                   j++) {
-                if (generates_declarations(imported_prog_data->declarations[j])) {
-                  include_flags[j] = 1;
-                }
-              }
+              include_generating_declarations(imported_prog_data,
+                                              include_flags);
 
               if (import_succeeded &&
                   !expand_import_dependency_closure(
@@ -4325,11 +4341,11 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
               } else {
                 for (size_t j = 0; j < imported_prog_data->declaration_count;
                      j++) {
-                  include_flags[j] =
-                      is_declaration_exported(
-                          imported_prog_data->declarations[j]) ||
-                      generates_declarations(imported_prog_data->declarations[j]);
+                  include_flags[j] = is_declaration_exported(
+                      imported_prog_data->declarations[j]);
                 }
+                include_generating_declarations(imported_prog_data,
+                                                include_flags);
                 if (!expand_import_dependency_closure(
                         imported_prog_data, include_flags, &required_names,
                         &required_count, &required_capacity)) {

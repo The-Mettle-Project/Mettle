@@ -9037,6 +9037,71 @@ static void ptx_emit_arith(IRProgram *program, IRFunction *func, PtxFn *fn,
   }
 }
 
+static void ptx_call_store_argument(PtxFn *fn, const IRInstruction *in,
+                                    size_t a, const MtlcType *argument_type,
+                                    const char *parameter,
+                                    const char *callee) {
+  if (ptx_type_is_aggregate(argument_type)) {
+    PtxBinding *record = named_binding(fn, &in->arguments[a]);
+    if (!record || !record->val.mem_aggregate) {
+      fn_error(fn, "PTX: argument %zu of '%s' is a record with no storage", a,
+               callee);
+      return;
+    }
+    size_t size = mtlc_type_size(argument_type);
+    size_t alignment = mtlc_type_alignment(argument_type);
+    if (!alignment) {
+      alignment = 1;
+    }
+    char source[24];
+    reg_name(PC_B64, record->val.mem_addr, source);
+    sb_printf(&fn->declarations, "\t.param .align %zu .b8 %s[%zu];\n",
+              alignment, parameter, size);
+    ptx_block_copy(fn, ".param", parameter, ".local", source, size, alignment);
+    return;
+  }
+  PtxVal argument_desc = descriptor_from_type(argument_type);
+  char value[24];
+  use_as(fn, &in->arguments[a], argument_desc.cls, value);
+  PtxVal passed = operand_desc(fn, &in->arguments[a]);
+  if (passed.is_ptr && argument_desc.is_ptr &&
+      ptx_space_is_plain(argument_type, NULL)) {
+    ptx_convert_space(fn, passed.address_space, MTLC_ADDRESS_SPACE_GENERIC,
+                      value);
+  } else {
+    ptx_generic_address(fn, &in->arguments[a], value);
+  }
+  sb_printf(&fn->declarations, "\t.param .%s %s;\n",
+            device_param_storage_type(argument_desc), parameter);
+  sb_printf(&fn->body, "\tst.param.%s [%s], %s;\n",
+            device_param_storage_type(argument_desc), parameter, value);
+}
+
+static void ptx_call_bind_record_result(PtxFn *fn, const IRInstruction *in,
+                                        PtxVal result_desc,
+                                        const char *return_parameter,
+                                        const char *result_storage) {
+  char pointer[24];
+  PtxBinding *home = in->dest.kind == IR_OPERAND_SYMBOL
+                         ? named_binding(fn, &in->dest)
+                         : NULL;
+  if (home && home->val.mem_local && home->val.mem_aggregate &&
+      home->val.mem_size == result_desc.mem_size) {
+    reg_name(PC_B64, home->val.mem_addr, pointer);
+    ptx_block_copy(fn, ".local", pointer, ".param", return_parameter,
+                   result_desc.mem_size, result_desc.mem_align);
+    return;
+  }
+  result_desc.mem_addr = new_reg(fn, PC_B64);
+  reg_name(PC_B64, result_desc.mem_addr, pointer);
+  sb_printf(&fn->body, "\tmov.u64 %s, %s;\n", pointer, result_storage);
+  ptx_block_copy(fn, ".local", pointer, ".param", return_parameter,
+                 result_desc.mem_size, result_desc.mem_align);
+  if (in->dest.name) {
+    bind_value(fn, in->dest.name, result_desc);
+  }
+}
+
 static void ptx_emit_general_call(IRProgram *program, IRFunction *func,
                                   PtxFn *fn, const IRInstruction *in,
                                   char **error, const char *ename) {
@@ -9077,7 +9142,6 @@ static void ptx_emit_general_call(IRProgram *program, IRFunction *func,
         return;
       }
       for (size_t a = 0; a < in->argument_count && !fn->error; a++) {
-        const MtlcType *argument_type = callee_symbol->param_types[a];
         char parameter[320];
         snprintf(parameter, sizeof(parameter), "__mtlc_call_%zu_arg_%zu",
                  call_id, a);
@@ -9087,42 +9151,8 @@ static void ptx_emit_general_call(IRProgram *program, IRFunction *func,
                    callee);
           break;
         }
-        if (ptx_type_is_aggregate(argument_type)) {
-          PtxBinding *record = named_binding(fn, &in->arguments[a]);
-          if (!record || !record->val.mem_aggregate) {
-            fn_error(fn,
-                     "PTX: argument %zu of '%s' is a record with no storage",
-                     a, callee);
-            break;
-          }
-          size_t size = mtlc_type_size(argument_type);
-          size_t alignment = mtlc_type_alignment(argument_type);
-          if (!alignment) {
-            alignment = 1;
-          }
-          char source[24];
-          reg_name(PC_B64, record->val.mem_addr, source);
-          sb_printf(&fn->declarations, "\t.param .align %zu .b8 %s[%zu];\n",
-                    alignment, parameter, size);
-          ptx_block_copy(fn, ".param", parameter, ".local", source, size,
-                         alignment);
-          continue;
-        }
-        PtxVal argument_desc = descriptor_from_type(argument_type);
-        char value[24];
-        use_as(fn, &in->arguments[a], argument_desc.cls, value);
-        PtxVal passed = operand_desc(fn, &in->arguments[a]);
-        if (passed.is_ptr && argument_desc.is_ptr &&
-            ptx_space_is_plain(argument_type, NULL)) {
-          ptx_convert_space(fn, passed.address_space,
-                            MTLC_ADDRESS_SPACE_GENERIC, value);
-        } else {
-          ptx_generic_address(fn, &in->arguments[a], value);
-        }
-        sb_printf(&fn->declarations, "\t.param .%s %s;\n",
-                  device_param_storage_type(argument_desc), parameter);
-        sb_printf(&fn->body, "\tst.param.%s [%s], %s;\n",
-                  device_param_storage_type(argument_desc), parameter, value);
+        ptx_call_store_argument(fn, in, a, callee_symbol->param_types[a],
+                                parameter, callee);
       }
 
       const MtlcType *callee_return_type = ptx_function_return_type(
@@ -9182,26 +9212,8 @@ static void ptx_emit_general_call(IRProgram *program, IRFunction *func,
             fn_error(fn, "PTX: void device call '%s' has a result", callee);
           }
         } else if (result_is_record) {
-          char pointer[24];
-          PtxBinding *home = in->dest.kind == IR_OPERAND_SYMBOL
-                                 ? named_binding(fn, &in->dest)
-                                 : NULL;
-          if (home && home->val.mem_local && home->val.mem_aggregate &&
-              home->val.mem_size == result_desc.mem_size) {
-            reg_name(PC_B64, home->val.mem_addr, pointer);
-            ptx_block_copy(fn, ".local", pointer, ".param", return_parameter,
-                           result_desc.mem_size, result_desc.mem_align);
-          } else {
-            result_desc.mem_addr = new_reg(fn, PC_B64);
-            reg_name(PC_B64, result_desc.mem_addr, pointer);
-            sb_printf(&fn->body, "\tmov.u64 %s, %s;\n", pointer,
-                      result_storage);
-            ptx_block_copy(fn, ".local", pointer, ".param", return_parameter,
-                           result_desc.mem_size, result_desc.mem_align);
-            if (in->dest.name) {
-              bind_value(fn, in->dest.name, result_desc);
-            }
-          }
+          ptx_call_bind_record_result(fn, in, result_desc, return_parameter,
+                                      result_storage);
         } else if (in->dest.name) {
           result_desc = destination_value(fn, &in->dest, result_desc);
           char result[24];
