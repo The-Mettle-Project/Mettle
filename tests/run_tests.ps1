@@ -19117,6 +19117,8 @@ try {
     $runExit = $LASTEXITCODE
     $bareOut = @(& $runCompiler run --release echo_args.mettle)
     $bareExit = $LASTEXITCODE
+    $flagOut = @(& $runCompiler run -I . -- echo_args.mettle x)
+    $flagExit = $LASTEXITCODE
   } finally {
     Pop-Location
   }
@@ -19127,8 +19129,11 @@ try {
   if ($runExit -ne 44) { throw "mettle run exited $runExit, expected the program's 44" }
   if ($bareOut.Count -ne 0) { throw "mettle run with no arguments printed: $($bareOut -join ' | ')" }
   if ($bareExit -ne 41) { throw "mettle run --release exited $bareExit, expected the program's 41" }
-  $leftover = @(Get-ChildItem $runDir -Filter "echo_args.o*")
-  if ($leftover.Count -ne 0) { throw "mettle run left its object behind: $($leftover.Name -join ', ')" }
+  if (($flagOut -join "`n") -ne "arg 1: x" -or $flagExit -ne 42) {
+    throw "mettle run did not pass -I . through to the build: $($flagOut -join ' | ') (exit $flagExit)"
+  }
+  $leftover = @(Get-ChildItem $runDir | Where-Object { $_.Name -ne "echo_args.mettle" })
+  if ($leftover.Count -ne 0) { throw "mettle run wrote next to the source: $($leftover.Name -join ', ')" }
   Write-CaseResult -Name "mettle_run_args_and_exit_code" -Passed $true
 }
 catch {

@@ -177,4 +177,11 @@ char *read_file(const char *filename);
 char *mettle_default_executable_filename(const char *input_filename);
 char *mettle_object_filename_for(const char *executable_filename);
 
+enum {
+  METTLE_INPUT_MISSING = -1,
+  METTLE_INPUT_HELP = -2,
+  METTLE_INPUT_BAD_FLAG = -3
+};
+int mettle_input_argument_index(int argc, char **argv, int first);
+
 #endif

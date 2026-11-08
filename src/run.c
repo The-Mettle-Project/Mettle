@@ -10,118 +10,198 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define RUN_SEPARATOR '\\'
+#else
+#define RUN_SEPARATOR '/'
+#endif
+
+#define RUN_DIR_ATTEMPTS 4096
+#define RUN_LISTING_BYTES 65536
+
 static void run_usage(FILE *stream) {
-  fprintf(stream, "usage: mettle run [--release] <file.mettle> [args...]\n");
+  fprintf(stream,
+          "usage: mettle run [build flags] [--] <file.mettle> [args...]\n");
 }
 
-static char *run_launch_path(const char *executable_path) {
-  size_t len;
-  char *launch;
-
-  if (strchr(executable_path, '/') || strchr(executable_path, '\\')) {
-    return strdup(executable_path);
+static const char *run_temp_base(void) {
+#ifdef _WIN32
+  static const char *const variables[] = {"TEMP", "TMP"};
+#else
+  static const char *const variables[] = {"TMPDIR"};
+#endif
+  for (size_t i = 0; i < sizeof(variables) / sizeof(variables[0]); i++) {
+    const char *value = getenv(variables[i]);
+    if (value && value[0]) {
+      return value;
+    }
   }
-  len = strlen(executable_path);
-  launch = (char *)malloc(len + 3u);
-  if (!launch) {
+#ifdef _WIN32
+  return ".";
+#else
+  return "/tmp";
+#endif
+}
+
+static char *run_join(const char *directory, const char *name) {
+  size_t directory_length = strlen(directory);
+  size_t name_length = strlen(name);
+  char *path = (char *)malloc(directory_length + name_length + 2u);
+  if (!path) {
     return NULL;
   }
-  launch[0] = '.';
-#ifdef _WIN32
-  launch[1] = '\\';
-#else
-  launch[1] = '/';
-#endif
-  memcpy(launch + 2, executable_path, len + 1u);
-  return launch;
+  memcpy(path, directory, directory_length);
+  path[directory_length] = RUN_SEPARATOR;
+  memcpy(path + directory_length + 1u, name, name_length + 1u);
+  return path;
 }
 
-int mettle_run_main(int argc, char **argv, const char *self_path) {
-  const char *input_path = NULL;
-  int release = 0;
-  char *executable_path = NULL;
-  char *object_path = NULL;
-  char *launch_path = NULL;
-  const char *build_argv[8];
-  const char **exec_argv;
-  int program_argc = 0;
+static char *run_claim_directory(void) {
+  const char *base = run_temp_base();
+  char name[32];
+  for (unsigned attempt = 0; attempt < RUN_DIR_ATTEMPTS; attempt++) {
+    char *directory;
+    snprintf(name, sizeof(name), "mettle-run-%u", attempt);
+    directory = run_join(base, name);
+    if (!directory || mettle_make_directory(directory) == 0) {
+      return directory;
+    }
+    free(directory);
+  }
+  return NULL;
+}
+
+static void run_remove_directory(const char *directory) {
+  char *listing = (char *)malloc(RUN_LISTING_BYTES);
+  int count = listing ? mettle_dir_list(directory, listing, RUN_LISTING_BYTES)
+                      : -1;
+  const char *entry = listing;
+  for (int i = 0; i < count; i++) {
+    size_t length = strlen(entry + 1);
+    if (entry[0] == 'f') {
+      char *path = run_join(directory, entry + 1);
+      if (path) {
+        (void)remove(path);
+        free(path);
+      }
+    }
+    entry += length + 2u;
+  }
+  free(listing);
+  (void)mettle_remove_directory(directory);
+}
+
+static const char *run_base_name(const char *path) {
+  const char *name = path;
+  for (const char *p = path; *p; p++) {
+    if (*p == '/' || *p == '\\') {
+      name = p + 1;
+    }
+  }
+  return name;
+}
+
+static char *run_executable_in(const char *directory, const char *input_path) {
+  char *default_path = mettle_default_executable_filename(input_path);
+  char *executable;
+  if (!default_path) {
+    return NULL;
+  }
+  executable = run_join(directory, run_base_name(default_path));
+  free(default_path);
+  return executable;
+}
+
+static int run_build(const char *self_path, int argc, char **argv, int input,
+                     const char *executable) {
+  const char **build_argv =
+      (const char **)malloc(sizeof(*build_argv) * ((size_t)argc + 6u));
   int used = 0;
   int status;
-  int i;
-
-  /* Run options come before the file; everything after it is the program's. */
-  for (i = 2; i < argc && !input_path; i++) {
-    if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-      run_usage(stdout);
-      return 0;
-    }
-    if (strcmp(argv[i], "--release") == 0 || strcmp(argv[i], "-r") == 0) {
-      release = 1;
-      continue;
-    }
-    if (argv[i][0] != '-') {
-      input_path = argv[i];
-      program_argc = argc - (i + 1);
-      continue;
-    }
-    run_usage(stderr);
+  if (!build_argv) {
+    fprintf(stderr, "Error: Out of memory\n");
     return 1;
   }
-  if (!input_path) {
-    run_usage(stderr);
-    return 1;
-  }
-  executable_path = mettle_default_executable_filename(input_path);
-  object_path = mettle_object_filename_for(executable_path);
-  if (!executable_path || !object_path) {
-    fprintf(stderr, "Error: Could not determine output name for '%s'\n",
-            input_path);
-    free(executable_path);
-    free(object_path);
-    return 1;
-  }
-
   build_argv[used++] = self_path;
   build_argv[used++] = "--build";
   build_argv[used++] = "--quiet";
-  if (release) {
-    build_argv[used++] = "--release";
+  for (int i = 2; i < input; i++) {
+    if (strcmp(argv[i], "--") != 0) {
+      build_argv[used++] = argv[i];
+    }
   }
-  build_argv[used++] = input_path;
+  build_argv[used++] = argv[input];
   build_argv[used++] = "-o";
-  build_argv[used++] = executable_path;
+  build_argv[used++] = executable;
   build_argv[used] = NULL;
-
   status = mettle_run_process(self_path, build_argv);
-  (void)remove(object_path);
-  free(object_path);
+  free(build_argv);
+  return status;
+}
 
-  if (status != 0) {
-    free(executable_path);
-    return status;
-  }
-
-  launch_path = run_launch_path(executable_path);
-  free(executable_path);
-  exec_argv = (const char **)malloc(sizeof(*exec_argv) *
-                                    ((size_t)program_argc + 2u));
-  if (!launch_path || !exec_argv) {
+static int run_program(const char *executable, int argc, char **argv,
+                       int input) {
+  int program_argc = argc - (input + 1);
+  const char **exec_argv = (const char **)malloc(
+      sizeof(*exec_argv) * ((size_t)program_argc + 2u));
+  int status;
+  if (!exec_argv) {
     fprintf(stderr, "Error: Out of memory\n");
-    free(launch_path);
-    free(exec_argv);
     return 1;
   }
-  exec_argv[0] = launch_path;
-  for (i = 0; i < program_argc; i++) {
-    exec_argv[i + 1] = argv[argc - program_argc + i];
+  exec_argv[0] = executable;
+  for (int i = 0; i < program_argc; i++) {
+    exec_argv[i + 1] = argv[input + 1 + i];
   }
   exec_argv[program_argc + 1] = NULL;
   fflush(stdout);
   fflush(stderr);
-  /* The program's exit code becomes ours, so `mettle run` is transparent to
-     scripts and test harnesses. */
-  status = mettle_run_process(launch_path, exec_argv);
+  status = mettle_run_process(executable, exec_argv);
   free(exec_argv);
-  free(launch_path);
+  return status;
+}
+
+int mettle_run_main(int argc, char **argv, const char *self_path) {
+  int input = mettle_input_argument_index(argc, argv, 2);
+  char *directory;
+  char *executable;
+  int status;
+
+  if (input == METTLE_INPUT_HELP) {
+    run_usage(stdout);
+    return 0;
+  }
+  if (input < 0) {
+    run_usage(stderr);
+    return 1;
+  }
+  directory = run_claim_directory();
+  if (!directory) {
+    fprintf(stderr, "Error: Could not create a build directory in '%s'\n",
+            run_temp_base());
+    return 1;
+  }
+  executable = run_executable_in(directory, argv[input]);
+  if (!executable) {
+    fprintf(stderr, "Error: Could not determine output name for '%s'\n",
+            argv[input]);
+    run_remove_directory(directory);
+    free(directory);
+    return 1;
+  }
+
+  status = run_build(self_path, argc, argv, input, executable);
+  if (status == 0 && !mettle_path_exists(executable)) {
+    fprintf(stderr, "Error: The build reported success but wrote no '%s'\n",
+            executable);
+    status = 1;
+  }
+  if (status == 0) {
+    status = run_program(executable, argc, argv, input);
+  }
+
+  run_remove_directory(directory);
+  free(executable);
+  free(directory);
   return status;
 }

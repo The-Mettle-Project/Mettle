@@ -4699,6 +4699,37 @@ static int parse_arguments(CompilerOptions *options, DriverFlags *flags,
   return -1;
 }
 
+int mettle_input_argument_index(int argc, char **argv, int first) {
+  CompilerOptions options = {0};
+  DriverFlags flags = {0};
+  for (int i = first; i < argc; i++) {
+    DriverFlagResult taken = DRIVER_FLAG_UNMATCHED;
+    if (strcmp(argv[i], "--") == 0) {
+      return i + 1 < argc ? i + 1 : METTLE_INPUT_MISSING;
+    }
+    if (argv[i][0] != '-') {
+      return i;
+    }
+    if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+      return METTLE_INPUT_HELP;
+    }
+    for (size_t group = 0;
+         group < sizeof(DRIVER_FLAG_PARSERS) / sizeof(DRIVER_FLAG_PARSERS[0]) &&
+         taken == DRIVER_FLAG_UNMATCHED;
+         group++) {
+      taken = DRIVER_FLAG_PARSERS[group](&options, &flags, argc, argv, &i);
+    }
+    if (taken == DRIVER_FLAG_FAILED) {
+      return METTLE_INPUT_BAD_FLAG;
+    }
+    if (taken == DRIVER_FLAG_UNMATCHED) {
+      fprintf(stderr, "Error: Unknown argument '%s'\n", argv[i]);
+      return METTLE_INPUT_BAD_FLAG;
+    }
+  }
+  return METTLE_INPUT_MISSING;
+}
+
 static int mettle_check_target_options(CompilerOptions *options,
                                        DriverFlags *flags) {
   if (options->flat_output && flags->build_executable) {
@@ -8519,9 +8550,10 @@ void print_usage(const char *program_name) {
   printf("       %s target <triple>            Print a built-in target's description as\n"
          "                           Mettle; `--target desc.mettle` builds for one\n",
          program_name);
-  printf("       %s run [--release] <file> [args...]\n"
-         "                           Compile, link, and run <file> with [args...],\n"
-         "                           exiting with the program's exit code\n",
+  printf("       %s run [flags] <file> [args...]\n"
+         "                           Build <file> with [flags] in a temporary\n"
+         "                           directory, run it with [args...], and exit\n"
+         "                           with the program's exit code\n",
          program_name);
   printf("       %s test <file> [--filter=S]   Run @test functions in the compile-time\n"
          "                           interpreter (instant; no codegen or linking)\n",
