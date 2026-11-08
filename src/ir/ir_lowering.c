@@ -1,5 +1,7 @@
 #include "ir_lowering_internal.h"
 #include "frontend/mtlc_lower_module.h"
+#include "frontend/mtlc_frontend.h"
+#include "optimizer/ir_optimize_internal.h"
 #include "string_intern.h"
 
 static void ir_lowering_free_control_stack(IRLoweringContext *context) {
@@ -28,6 +30,142 @@ static IRProgram *ir_lowering_fail(IRProgram *ir_program,
     free(context->error_message);
   }
   return NULL;
+}
+
+static void ir_declare_host_intrinsic_externs(IRProgram *program,
+                                              TypeChecker *type_checker,
+                                              SymbolTable *symbol_table) {
+  if (!program || !type_checker || !symbol_table ||
+      type_checker->device_module) {
+    return;
+  }
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    for (size_t i = 0; function && i < function->instruction_count; i++) {
+      IRInstruction *instruction = &function->instructions[i];
+      if (instruction->op != IR_OP_CALL || !instruction->text ||
+          instruction->intrinsic == MTLC_INTRINSIC_NONE ||
+          ir_program_lookup_symbol(program, instruction->text)) {
+        continue;
+      }
+      Symbol *symbol =
+          symbol_table_lookup_global(symbol_table, instruction->text);
+      if (!symbol || symbol->kind != SYMBOL_FUNCTION || !symbol->is_extern) {
+        continue;
+      }
+      size_t count = symbol->data.function.parameter_count;
+      MtlcType **params = count ? calloc(count, sizeof(*params)) : NULL;
+      if (count && !params) {
+        return;
+      }
+      for (size_t p = 0; p < count; p++) {
+        params[p] =
+            mtlc_type_from_frontend(symbol->data.function.parameter_types[p]);
+      }
+      IRModuleSymbol entry;
+      memset(&entry, 0, sizeof(entry));
+      entry.name = instruction->text;
+      entry.kind = IR_MODSYM_FUNCTION;
+      entry.is_extern = 1;
+      entry.type = mtlc_type_from_frontend(symbol->data.function.return_type);
+      entry.return_type = entry.type;
+      entry.param_types = params;
+      entry.param_count = count;
+      ir_program_add_symbol(program, &entry);
+      free(params);
+    }
+  }
+}
+
+static int ir_twin_index(IRProgram *program, const char *name) {
+  IRFunction *function = ir_program_find_function(program, name);
+  if (!function) {
+    return -1;
+  }
+  for (size_t i = 0; i < program->function_count; i++) {
+    if (program->functions[i] == function) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+static int ir_twin_push_callees(IRProgram *program, size_t from, char *mark,
+                                const char *within, size_t *stack,
+                                size_t *top) {
+  IRFunction *function = program->functions[from];
+  for (size_t i = 0; function && i < function->instruction_count; i++) {
+    const IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op != IR_OP_CALL || !instruction->text) {
+      continue;
+    }
+    int callee = ir_twin_index(program, instruction->text);
+    if (callee < 0 || mark[callee] || (within && !within[callee])) {
+      continue;
+    }
+    mark[callee] = 1;
+    stack[(*top)++] = (size_t)callee;
+  }
+  return 1;
+}
+
+static void ir_mark_host_twins(IRProgram *program) {
+  size_t count = program ? program->function_count : 0;
+  int any_kernel = 0;
+  for (size_t i = 0; i < count; i++) {
+    any_kernel |= program->functions[i] && program->functions[i]->is_kernel;
+  }
+  if (!any_kernel) {
+    return;
+  }
+  char *device = calloc(count, 1);
+  char *twin = calloc(count, 1);
+  size_t *stack = calloc(count, sizeof(*stack));
+  size_t top = 0;
+  if (!device || !twin || !stack) {
+    free(device);
+    free(twin);
+    free(stack);
+    return;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (program->functions[i] && program->functions[i]->is_kernel) {
+      device[i] = 1;
+      stack[top++] = i;
+    }
+  }
+  while (top > 0) {
+    ir_twin_push_callees(program, stack[--top], device, NULL, stack, &top);
+  }
+  for (size_t i = 0; i < count; i++) {
+    IRFunction *function = program->functions[i];
+    if (!function || device[i]) {
+      continue;
+    }
+    for (size_t k = 0; k < function->instruction_count; k++) {
+      const IRInstruction *instruction = &function->instructions[k];
+      if (instruction->op != IR_OP_CALL || !instruction->text) {
+        continue;
+      }
+      int callee = ir_twin_index(program, instruction->text);
+      if (callee >= 0 && device[callee] && !twin[callee] &&
+          !program->functions[callee]->is_kernel) {
+        twin[callee] = 1;
+        stack[top++] = (size_t)callee;
+      }
+    }
+  }
+  while (top > 0) {
+    ir_twin_push_callees(program, stack[--top], twin, device, stack, &top);
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (twin[i]) {
+      program->functions[i]->is_host_twin = 1;
+    }
+  }
+  free(device);
+  free(twin);
+  free(stack);
 }
 
 static int ir_symbol_is_volatile_global(const IRProgram *program,
@@ -159,6 +297,8 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   }
 
   mtlc_lower_populate_module(ir_program, program, type_checker, symbol_table);
+  ir_declare_host_intrinsic_externs(ir_program, type_checker, symbol_table);
+  ir_mark_host_twins(ir_program);
   ir_lower_live_register_symbols(&context, ir_program);
   ir_mark_volatile_global_accesses(ir_program);
   if (context.emitted_task_check &&

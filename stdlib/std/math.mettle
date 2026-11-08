@@ -119,15 +119,23 @@ export fn ldexp(x: float64, n: int32) -> float64 {
 
   var r: float64 = x;
   var e: int32 = n;
-  while (e > 1000) {
+  if (e > 2200) { e = 2200; }
+  if (e < -2200) { e = -2200; }
+  if (e > 1000) {
     r = r * f64_from_bits((int64)(1023 + 1000) << 52);
     e = e - 1000;
-    if (is_finite(r) == 0) { return r; }
+    if (e > 1000) {
+      r = r * f64_from_bits((int64)(1023 + 1000) << 52);
+      e = e - 1000;
+    }
   }
-  while (e < -1000) {
+  if (e < -1000) {
     r = r * f64_from_bits((int64)(1023 - 1000) << 52);
     e = e + 1000;
-    if (r == 0.0) { return r; }
+    if (e < -1000) {
+      r = r * f64_from_bits((int64)(1023 - 1000) << 52);
+      e = e + 1000;
+    }
   }
   return r * f64_from_bits((int64)(1023 + e) << 52);
 }

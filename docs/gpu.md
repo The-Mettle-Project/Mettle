@@ -1896,7 +1896,10 @@ The build runs a device pass over the same source, compiles every kernel it
 reaches for the GPU, and builds the module into the executable. The first
 dispatch of one of those kernels loads it. Kernel bodies and helpers that only
 kernels call never reach the host code; a helper both sides call is compiled
-for both. A kernel the device pass refuses fails the build with that pass's
+for both, and gives the same bits on both. Its `f32` and `f64` `add`, `sub` and
+`mul` are emitted with `.rn`, so ptxas cannot fuse them into an FMA the host
+never runs, and a kernel that inlines it takes the same rounding. A kernel
+with no such helper keeps the plain forms. A kernel the device pass refuses fails the build with that pass's
 error. `mettle test` runs the same kernels on the CPU grid runner.
 
 The module targets what `--gpu-arch` selects, the local GPU when no flag is

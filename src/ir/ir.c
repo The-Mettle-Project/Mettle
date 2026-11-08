@@ -1373,6 +1373,7 @@ IRFunction *ir_function_create(const char *name) {
   function->is_noalloc = 0;
   function->is_test = 0;
   function->numerics_contract = NULL;
+  function->is_host_twin = 0;
   function->is_swappable = 0;
   function->is_naked = 0;
   function->is_interrupt = 0;

@@ -329,6 +329,7 @@ typedef struct {
   int is_noalloc;
   int is_test;
   const char *numerics_contract;
+  int is_host_twin;
   int is_swappable;
   int is_naked;
   int is_interrupt;

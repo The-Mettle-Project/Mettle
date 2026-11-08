@@ -1,0 +1,38 @@
+import "std/io"
+
+fn twin_length(x: float32, y: float32) -> float32 {
+  return sqrtf(x * x + y * y) - 1.0;
+}
+
+fn device_only_scale(x: float32, y: float32) -> float32 {
+  return x * y + 3.0;
+}
+
+kernel(block = 64) twin_kernel(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    out[i] = twin_length((float32)i, 2.0);
+  }
+}
+
+kernel(block = 64) device_only_kernel(out: float32*, n: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i < n) {
+    out[i] = device_only_scale((float32)i, out[i]);
+  }
+}
+
+fn main() -> int32 {
+  var root: float32 = twin_length(3.0, 4.0);
+  if (root != 4.0) {
+    println("host twin_length(3, 4) = {root}");
+    return 1;
+  }
+  var r: float32 = sqrtf(2.0);
+  if (r * r < 1.9999 || r * r > 2.0001) {
+    println("host sqrtf(2) = {r}");
+    return 1;
+  }
+  println("host twin ok");
+  return 0;
+}

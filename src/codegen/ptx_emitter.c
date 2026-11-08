@@ -11222,7 +11222,7 @@ static void ptx_count_definitions(PtxFn *fn, const IRFunction *func) {
 
 static int ptx_rounded_arithmetic(const IRProgram *program,
                                   const IRFunction *function) {
-  if (function->numerics_contract) {
+  if (function->numerics_contract || function->is_host_twin) {
     return 1;
   }
   if (function->is_kernel) {

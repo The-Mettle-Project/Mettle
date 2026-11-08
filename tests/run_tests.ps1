@@ -2819,6 +2819,8 @@ $cases = @(
      Args = @("-O", "--emit-ptx", "--gpu-arch=gb10", "--explain")
      SkipBinaryCheck = $true
      OutputMustMatch = @("numerics contract Q4_TILES: proven for q4_whole, q4_halves", "numerics contract SOFT_ROWS: proven for soft_lane_major, soft_two_rows") },
+  @{ Name = "gpu_host_twin_runs_on_host"; Path = "tests/gpu/host_twin.mettle"; ShouldSucceed = $true },
+  @{ Name = "deadline_exp_is_bounded"; Path = "tests/deadline_exp_bounded.mettle"; ShouldSucceed = $true },
   @{ Name = "gpu_numerics_int32_copies"; Path = "tests/gpu/numerics_int32_copies.mettle"; ShouldSucceed = $true
      Args = @("-O", "--emit-ptx", "--gpu-arch=gb10", "--explain")
      SkipBinaryCheck = $true
@@ -17082,7 +17084,8 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
                    "tests/gpu/tensor_pipeline_no_residency.mettle",
                    "tests/gpu/tensor_epilogue_portable.mettle",
                    "examples/gpu_inference/decode_kernels.mettle",
-                   "examples/gpu_vadd/vadd_kernel.mettle")) {
+                   "examples/gpu_vadd/vadd_kernel.mettle",
+                   "tests/gpu/host_twin.mettle")) {
   $total++
   $name = "ptx_emit_" + [System.IO.Path]::GetFileNameWithoutExtension($src)
   try {
@@ -17097,6 +17100,15 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
     if ($ptxText -notmatch "(?m)^\.target compute_75\r?$") { throw "portable PTX target is not compute_75" }
     if ($ptxText -match "ordinary_function_not_entry") {
       throw "unreachable ordinary function entered the PTX module"
+    }
+    if ($src -like "*host_twin.mettle") {
+      foreach ($rounded in @("mul\.rn\.f32", "add\.rn\.f32", "sub\.rn\.f32")) {
+        if ($ptxText -notmatch $rounded) { throw "a helper the host also runs lost $rounded" }
+      }
+      $deviceOnly = [regex]::Match($ptxText, "(?s)\.entry device_only_kernel.*?\n}").Value
+      if ($deviceOnly -notmatch "mul\.f32" -or $deviceOnly -match "(mul|add|sub)\.rn\.f32") {
+        throw "a device-only kernel took the host twin's rounding"
+      }
     }
     if ($src -like "*record_kernels.mettle") {
       # A record parameter crosses the launch boundary as its own bytes, the

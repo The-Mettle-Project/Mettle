@@ -1129,6 +1129,7 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
           free(in_loop);
           return 0;
         }
+        function->is_host_twin |= callee->is_host_twin;
         local_changed = 1;
         continue;
       }
