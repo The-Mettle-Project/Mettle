@@ -795,6 +795,53 @@ static int ptx_operand_is_stable(PtxFn *fn, const IROperand *operand) {
   return operand->name && !ptx_name_is_redefined(fn, operand->name);
 }
 
+static int ptx_ends_straight_line(const IRInstruction *in) {
+  return in->op == IR_OP_LABEL || in->op == IR_OP_JUMP ||
+         in->op == IR_OP_BRANCH_ZERO || in->op == IR_OP_BRANCH_EQ ||
+         in->op == IR_OP_RETURN || in->op == IR_OP_CALL ||
+         in->op == IR_OP_CALL_INDIRECT || in->op == IR_OP_INLINE_ASM ||
+         in->op == IR_OP_PHI;
+}
+
+static int ptx_name_settled(const IRFunction *func, const char *name,
+                            size_t from, size_t to) {
+  for (size_t k = from; k < to; k++) {
+    const IRInstruction *in = &func->instructions[k];
+    if (ptx_ends_straight_line(in)) return 0;
+    if (in->dest.name && strcmp(in->dest.name, name) == 0) return 0;
+  }
+  return 1;
+}
+
+static int ptx_redefines(const IRInstruction *in, const IROperand *operand) {
+  return operand && operand->name && in->dest.name &&
+         strcmp(in->dest.name, operand->name) == 0;
+}
+
+static int ptx_operand_names(const IROperand *operand, const char *name) {
+  return operand->name && strcmp(operand->name, name) == 0;
+}
+
+static int ptx_touches_name(const IRInstruction *in, const char *name) {
+  if (ptx_operand_names(&in->lhs, name) || ptx_operand_names(&in->rhs, name) ||
+      (in->dest.name && strcmp(in->dest.name, name) == 0))
+    return 1;
+  for (size_t a = 0; a < in->argument_count; a++) {
+    if (ptx_operand_names(&in->arguments[a], name)) return 1;
+  }
+  return 0;
+}
+
+static int ptx_member_can_move(const IRFunction *func, size_t head,
+                               size_t member) {
+  const char *name = func->instructions[member].dest.name;
+  if (!name) return 1;
+  for (size_t k = head + 1; k < member; k++) {
+    if (ptx_touches_name(&func->instructions[k], name)) return 0;
+  }
+  return 1;
+}
+
 static void ptx_address_parts(PtxFn *fn, const IRFunction *func, size_t index,
                               const IROperand *address,
                               const IROperand **base, long long *offset) {
@@ -803,26 +850,31 @@ static void ptx_address_parts(PtxFn *fn, const IRFunction *func, size_t index,
   if (!func || !address || !address->name ||
       (address->kind != IR_OPERAND_TEMP && address->kind != IR_OPERAND_SYMBOL))
     return;
-  if (!ptx_operand_is_stable(fn, address)) {
-    *base = NULL;
-    return;
-  }
+  int stable = ptx_operand_is_stable(fn, address);
   for (size_t i = index; i > 0; i--) {
     const IRInstruction *producer = &func->instructions[i - 1];
     long long constant = 0;
     if (!producer->dest.name ||
-        strcmp(producer->dest.name, address->name) != 0)
+        strcmp(producer->dest.name, address->name) != 0) {
+      if (!stable && ptx_ends_straight_line(producer)) {
+        *base = NULL;
+        return;
+      }
       continue;
+    }
     if (producer->op != IR_OP_BINARY || !producer->text ||
         strcmp(producer->text, "+") != 0)
       return;
-    if (ptx_operand_is_stable(fn, &producer->lhs) &&
+    if ((ptx_operand_is_stable(fn, &producer->lhs) ||
+         (producer->lhs.name &&
+          ptx_name_settled(func, producer->lhs.name, i, index))) &&
         ptx_fold_constant(fn, func, i - 1, &producer->rhs, &constant, 0)) {
       *base = &producer->lhs;
       *offset = constant;
     }
     return;
   }
+  if (!stable) *base = NULL;
 }
 
 static int ptx_vector_gap_is_safe(const IRInstruction *in) {
@@ -849,9 +901,22 @@ static int ptx_vector_element_ok(MtlcTypeKind elem) {
 
 static const MtlcType *ptx_load_pointer_type(const IRProgram *program,
                                              const IRFunction *func,
-                                             const IROperand *base) {
+                                             const IROperand *base,
+                                             size_t index) {
   const IRModuleSymbol *symbol = NULL;
   if (!func || !base || !base->name) return NULL;
+  for (size_t i = index < func->instruction_count ? index : func->instruction_count;
+       i > 0; i--) {
+    const IRInstruction *producer = &func->instructions[i - 1];
+    if (ptx_ends_straight_line(producer)) break;
+    if (!producer->dest.name || strcmp(producer->dest.name, base->name) != 0)
+      continue;
+    if (producer->op == IR_OP_CAST && producer->value_type &&
+        producer->value_type->kind == MTLC_TYPE_POINTER &&
+        producer->value_type->pointee_align)
+      return producer->value_type;
+    break;
+  }
   symbol = program ? ir_program_lookup_symbol(program, func->name) : NULL;
   if (base->kind == IR_OPERAND_SYMBOL && symbol &&
       symbol->kind == IR_MODSYM_FUNCTION) {
@@ -896,7 +961,7 @@ static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
     size_t found = 1;
     if (head->op != IR_OP_LOAD || plan[i].absorbed) continue;
     ptx_address_parts(fn, func, i, &head->lhs, &base, &offset);
-    pointer_type = ptx_load_pointer_type(program, func, base);
+    pointer_type = ptx_load_pointer_type(program, func, base, i);
     if (!pointer_type || pointer_type->kind != MTLC_TYPE_POINTER ||
         !pointer_type->base_type || !pointer_type->pointee_align ||
         !ptx_vector_element_ok(pointer_type->base_type->kind))
@@ -918,11 +983,14 @@ static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
             next_base->kind == base->kind &&
             strcmp(next_base->name, base->name) == 0 &&
             next_offset == offset + (long long)(stride * found)) {
+          if (!ptx_member_can_move(func, i, j)) break;
           members[found++] = j;
+          if (ptx_redefines(next, base)) break;
           continue;
         }
       }
       if (!ptx_vector_gap_is_safe(next)) break;
+      if (ptx_redefines(next, base)) break;
     }
     if (found >= 4 && pointer_type->pointee_align >= stride * 4 &&
         (size_t)offset % (stride * 4) == 0) {
@@ -9622,6 +9690,44 @@ static void ptx_emit_wide_intrinsic(IRProgram *program, IRFunction *func,
     }
 }
 
+static void ptx_emit_f2bf(PtxFn *fn, const IRInstruction *in) {
+  char a[24];
+  char dn[24];
+  use_as(fn, &in->arguments[0], PC_F32, a);
+  if (fn->target_arch >= 80 && ptx_version_at_least(fn, 7, 0)) {
+    int hidx = new_reg(fn, PC_B16);
+    char hn[24];
+    reg_name(PC_B16, hidx, hn);
+    sb_printf(&fn->body, "\tcvt.rn.bf16.f32 %s, %s;\n", hn, a);
+    PtxVal dv = {.cls = PC_B32, .is_unsigned = 1};
+    dv = destination_value(fn, &in->dest, dv);
+    reg_name(PC_B32, dv.idx, dn);
+    sb_printf(&fn->body, "\tcvt.u32.u16 %s, %s;\n", dn, hn);
+    if (in->dest.name) bind_value(fn, in->dest.name, dv);
+    return;
+  }
+  int bits = new_reg(fn, PC_B32);
+  int carry = new_reg(fn, PC_B32);
+  int rounded = new_reg(fn, PC_B32);
+  char bits_name[24];
+  char carry_name[24];
+  char rounded_name[24];
+  reg_name(PC_B32, bits, bits_name);
+  reg_name(PC_B32, carry, carry_name);
+  reg_name(PC_B32, rounded, rounded_name);
+  sb_printf(&fn->body, "\tmov.b32 %s, %s;\n", bits_name, a);
+  sb_printf(&fn->body, "\tshr.u32 %s, %s, 16;\n", carry_name, bits_name);
+  sb_printf(&fn->body, "\tand.b32 %s, %s, 1;\n", carry_name, carry_name);
+  sb_printf(&fn->body, "\tadd.u32 %s, %s, 32767;\n", rounded_name, carry_name);
+  sb_printf(&fn->body, "\tadd.u32 %s, %s, %s;\n", rounded_name, rounded_name,
+            bits_name);
+  PtxVal dv = {.cls = PC_B32, .is_unsigned = 1};
+  dv = destination_value(fn, &in->dest, dv);
+  reg_name(PC_B32, dv.idx, dn);
+  sb_printf(&fn->body, "\tshr.u32 %s, %s, 16;\n", dn, rounded_name);
+  if (in->dest.name) bind_value(fn, in->dest.name, dv);
+}
+
 static void ptx_emit_numeric_intrinsic(IRProgram *program, IRFunction *func,
                                        PtxFn *fn, const IRInstruction *in,
                                        char **error, const char *ename,
@@ -9804,31 +9910,7 @@ static void ptx_emit_numeric_intrinsic(IRProgram *program, IRFunction *func,
         bind_value(fn, in->dest.name, dv);
     } else if (intrinsic == MTLC_INTRINSIC_GPU_F2BF &&
                in->argument_count >= 1) {
-      char a[24];
-      use_as(fn, &in->arguments[0], PC_F32, a);
-      int bits = new_reg(fn, PC_B32);
-      int carry = new_reg(fn, PC_B32);
-      int rounded = new_reg(fn, PC_B32);
-      char bits_name[24];
-      char carry_name[24];
-      char rounded_name[24];
-      reg_name(PC_B32, bits, bits_name);
-      reg_name(PC_B32, carry, carry_name);
-      reg_name(PC_B32, rounded, rounded_name);
-      sb_printf(&fn->body, "\tmov.b32 %s, %s;\n", bits_name, a);
-      sb_printf(&fn->body, "\tshr.u32 %s, %s, 16;\n", carry_name, bits_name);
-      sb_printf(&fn->body, "\tand.b32 %s, %s, 1;\n", carry_name, carry_name);
-      sb_printf(&fn->body, "\tadd.u32 %s, %s, 32767;\n", rounded_name,
-                carry_name);
-      sb_printf(&fn->body, "\tadd.u32 %s, %s, %s;\n", rounded_name,
-                rounded_name, bits_name);
-      PtxVal dv = {.cls = PC_B32, .is_unsigned = 1};
-      dv = destination_value(fn, &in->dest, dv);
-      char dn[24];
-      reg_name(PC_B32, dv.idx, dn);
-      sb_printf(&fn->body, "\tshr.u32 %s, %s, 16;\n", dn, rounded_name);
-      if (in->dest.name)
-        bind_value(fn, in->dest.name, dv);
+      ptx_emit_f2bf(fn, in);
     } else if (intrinsic == MTLC_INTRINSIC_GPU_ASSERT &&
                in->argument_count >= 1) {
       if (g_ptx_emit_checks) {
@@ -10997,7 +11079,7 @@ static void ptx_emit_vector_load(PtxEmit *e, size_t ii,
   const char *space;
 
   ptx_address_parts(&e->fn, func, ii, &in->lhs, &base, &offset);
-  pointer_type = ptx_load_pointer_type(e->program, func, base);
+  pointer_type = ptx_load_pointer_type(e->program, func, base, ii);
   elem = pointer_type && pointer_type->base_type ? pointer_type->base_type->kind
                                                  : MTLC_TYPE_VOID;
   cls = elem_class(elem, &is_unsigned);

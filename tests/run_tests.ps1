@@ -18066,6 +18066,58 @@ catch {
   Write-CaseResult -Name "gpu_vector_runtime_index" -Passed $false -Reason $_.Exception.Message
 }
 
+# A pointer declared inside a comptime for is one name defined once per
+# iteration. Each definition still widens its own aligned run, a base that
+# moves between two loads splits them, and a member whose old value is read
+# between the head and itself stays a separate load. On sm_80 and newer f2bf
+# is one hardware conversion; the portable profile keeps the integer rounding.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $unrolledPtx = Join-Path $tmpDir "gpu_vector_loads_unrolled.ptx"
+  $unrolledOut = & $CompilerPath -O --emit-ptx --gpu-arch=portable --report-gpu-types `
+    tests/gpu/vector_loads_unrolled.mettle -o $unrolledPtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "emit failed: $unrolledOut" }
+  if ($unrolledOut -notmatch "4 vector groups formed from a declared alignment, 12 separate loads removed") {
+    throw "expected one vector group per unrolled row and nothing else: $unrolledOut"
+  }
+  $unrolledText = (Get-Content -Raw $unrolledPtx) -replace "`r`n", "`n"
+  $rowsBody = [regex]::Match($unrolledText, "(?s)\.entry unrolled_rows.*?\n}").Value
+  $movedBody = [regex]::Match($unrolledText, "(?s)\.entry moved_base.*?\n}").Value
+  $readBody = [regex]::Match($unrolledText, "(?s)\.entry read_before_member.*?\n}").Value
+  $packBody = [regex]::Match($unrolledText, "(?s)\.entry packed_bf16.*?\n}").Value
+  if (-not $rowsBody -or -not $movedBody -or -not $readBody -or -not $packBody) {
+    throw "a kernel is missing from the module"
+  }
+  if (([regex]::Matches($rowsBody, "ld\.global\.v4\.f32")).Count -ne 4) {
+    throw "the unrolled rows lost their vector loads"
+  }
+  if ($movedBody -match "ld\.global\.v[24]" -or $readBody -match "ld\.global\.v[24]") {
+    throw "a load was widened across a moved base or a read of its old value"
+  }
+  if ($packBody -match "cvt\.rn\.bf16") { throw "the portable profile used a conversion it may not have" }
+  $nativePtx = Join-Path $tmpDir "gpu_vector_loads_unrolled_sm80.ptx"
+  $nativeOut = & $CompilerPath -O --emit-ptx --gpu-arch=sm_80 `
+    tests/gpu/vector_loads_unrolled.mettle -o $nativePtx 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "sm_80 emit failed: $nativeOut" }
+  $nativeText = (Get-Content -Raw $nativePtx) -replace "`r`n", "`n"
+  $nativePack = [regex]::Match($nativeText, "(?s)\.entry packed_bf16.*?\n}").Value
+  if ($nativePack -notmatch "cvt\.rn\.bf16\.f32") { throw "f2bf on sm_80 is not one conversion" }
+  if ($ptxas) {
+    $unrolledCubin = Join-Path $tmpDir "gpu_vector_loads_unrolled.cubin"
+    $asmOut = & $ptxas.Source -arch=compute_75 $unrolledPtx -o $unrolledCubin 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "ptxas rejected the module: $asmOut" }
+    $nativeCubin = Join-Path $tmpDir "gpu_vector_loads_unrolled_sm80.cubin"
+    $asmOut = & $ptxas.Source -arch=sm_80 $nativePtx -o $nativeCubin 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "ptxas rejected the sm_80 module: $asmOut" }
+  }
+  Write-CaseResult -Name "gpu_vector_loads_unrolled" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "gpu_vector_loads_unrolled" -Passed $false -Reason $_.Exception.Message
+}
+
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }

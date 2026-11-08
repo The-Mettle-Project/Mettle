@@ -1,0 +1,35 @@
+kernel(block = 64) unrolled_rows(rows: float32 global align(16)*, out: float32 global*) {
+  var t: int32 = thread.x;
+  var acc: float32 = 0.0;
+  comptime for j in 0..4 {
+    var row: float32 global align(16)* = (float32 global align(16)*)&rows[(t + j * 64) * 4];
+    acc = acc + row[0] * row[1] + row[2] * row[3];
+  }
+  out[t] = acc;
+}
+
+kernel(block = 64) moved_base(rows: float32 global align(16)*, out: float32 global*) {
+  var t: int32 = thread.x;
+  var row: float32 global align(16)* = (float32 global align(16)*)&rows[t * 8];
+  var a: float32 = row[0];
+  var b: float32 = row[1];
+  row = (float32 global align(16)*)&rows[t * 8 + 4];
+  var c: float32 = row[2];
+  var d: float32 = row[3];
+  out[t] = a * 1000.0 + b * 100.0 + c * 10.0 + d;
+}
+
+kernel(block = 64) read_before_member(rows: float32 global align(16)*, out: float32 global*) {
+  var t: int32 = thread.x;
+  var row: float32 global align(16)* = (float32 global align(16)*)&rows[t * 4];
+  var b: float32 = 7.0;
+  var a: float32 = row[0];
+  out[t] = b;
+  b = row[1];
+  out[t + 64] = a + b;
+}
+
+kernel(block = 32) packed_bf16(x: float32 global*, out: uint32 global*) {
+  var t: int32 = thread.x;
+  out[t] = f2bf(x[t]);
+}
