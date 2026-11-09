@@ -1881,6 +1881,8 @@ $cases = @(
   # A view is a record at the launch boundary, and a row inside a kernel is a
   # 16-byte local copied whole through the emitter's widened aggregate store.
   @{ Name = "gpu_view_param"; Path = "tests/test_gpu_view_param.mettle"; ShouldSucceed = $true; Args = @("--emit-ptx") },
+  @{ Name = "asm_brace_group"; Path = "tests/test_asm_brace_group.mettle"; ShouldSucceed = $true; Args = @("--emit-ptx") },
+  @{ Name = "err_asm_brace_group"; Path = "tests/err_asm_brace_group.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "no variable 'missing' is in scope" },
   @{ Name = "gpu_narrowing_cast_kept_O"; Path = "tests/test_gpu_narrowing_cast_kept.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },
   @{ Name = "gpu_narrowing_cast_kept_release"; Path = "tests/test_gpu_narrowing_cast_kept.mettle"; ShouldSucceed = $true; Args = @("--release", "--emit-ptx") },
   @{ Name = "gpu_uint32_high_constant_O"; Path = "tests/test_gpu_uint32_high_constant.mettle"; ShouldSucceed = $true; Args = @("-O", "--emit-ptx") },

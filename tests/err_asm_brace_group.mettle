@@ -1,0 +1,17 @@
+@inline fn load_pair(packed: uint32*, c: int32) -> uint32 {
+  var addr: int64 = (int64)&packed[2 * c];
+  var a: uint32 = (uint32)0;
+  asm {
+    ld.global.v2.u32 { {a}, {missing} }, [{addr}];
+  }
+  return a;
+}
+
+kernel(block = 64) k_pairs(packed: uint32*, out: uint32*) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  out[id] = load_pair(packed, id);
+}
+
+fn main() -> int32 {
+  return 0;
+}

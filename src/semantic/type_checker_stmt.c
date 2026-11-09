@@ -1238,8 +1238,11 @@ static int type_checker_check_asm_bindings(TypeChecker *checker,
     while (*start == ' ' || *start == '\t') {
       start++;
     }
+    if (*start == '{') {
+      continue;
+    }
     end = start;
-    while (*end && *end != '}' && *end != ' ' && *end != '\t') {
+    while (*end && *end != '}' && *end != '{' && *end != ' ' && *end != '\t') {
       end++;
     }
     length = (size_t)(end - start);
