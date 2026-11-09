@@ -120,7 +120,8 @@ FRONTEND_SOURCES = $(LEXER_SOURCES) $(PARSER_SOURCES) $(SEMANTIC_SOURCES) $(LOWE
 
 BACKEND_OBJECTS = $(BACKEND_SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 FRONTEND_OBJECTS = $(FRONTEND_SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
-DEPFILES = $(BACKEND_OBJECTS:.o=.d) $(FRONTEND_OBJECTS:.o=.d)
+DEPFILES = $(BACKEND_OBJECTS:.o=.d) $(FRONTEND_OBJECTS:.o=.d) \
+	$(wildcard $(OBJDIR)/runtime/*.d)
 HOST_RUNTIME_OBJECT = $(OBJDIR)/runtime/host_runtime.o
 HOST_STARTUP_OBJECT = $(OBJDIR)/runtime/host_startup.o
 
@@ -172,9 +173,14 @@ $(TARGET): $(HOST_STARTUP_OBJECT) $(FRONTEND_OBJECTS) $(LIBMTLC) | $(BINDIR)
 		echo "error: $@ contains unresolved symbols"; $(NM) -u $@; exit 1; fi
 endif
 
-bundle-stdlib: | $(BINDIR)
-	rm -rf $(BINDIR)/stdlib
-	cp -r $(STDLIBDIR) $(BINDIR)/stdlib
+STDLIB_FILES = $(wildcard $(STDLIBDIR)/*.c $(STDLIBDIR)/*.mettle $(STDLIBDIR)/std/*.mettle)
+BUNDLED_STDLIB_FILES = $(STDLIB_FILES:$(STDLIBDIR)/%=$(BINDIR)/stdlib/%)
+
+bundle-stdlib: $(BUNDLED_STDLIB_FILES)
+
+$(BUNDLED_STDLIB_FILES): $(BINDIR)/stdlib/%: $(STDLIBDIR)/% | $(BINDIR)
+	@mkdir -p $(dir $@)
+	cp $< $@
 
 # Runtime objects are linked into every user program, so build them lean:
 # no debug info (-g0 overrides the -g in CFLAGS) and one section per
@@ -204,78 +210,203 @@ $(FRONTEND_OBJECTS): CFLAGS += $(HOST_BACKEND_CFLAGS)
 
 $(HOST_RUNTIME_OBJECT): $(RUNTIMEDIR)/freestanding.c \
 		$(RUNTIMEDIR)/host_prefix.h | $(OBJDIR)
-	$(CC) $(FREESTANDING_CFLAGS) -include $(RUNTIMEDIR)/host_prefix.h \
+	@mkdir -p $(dir $@)
+	$(CC) $(FREESTANDING_CFLAGS) -MMD -MP -include $(RUNTIMEDIR)/host_prefix.h \
 		-c $(RUNTIMEDIR)/freestanding.c -o $@
 
 $(HOST_STARTUP_OBJECT): $(RUNTIMEDIR)/host_startup.c | $(OBJDIR)
-	$(CC) $(FREESTANDING_CFLAGS) -c $< -o $@
+	@mkdir -p $(dir $@)
+	$(CC) $(FREESTANDING_CFLAGS) -MMD -MP -c $< -o $@
 
-ifeq ($(HOSTED),1)
-bundle-runtime: $(TARGET) | $(BINDIR)
-	rm -rf $(BINDIR)/runtime
-	cp -r $(RUNTIMEDIR) $(BINDIR)/runtime
-	$(CC) $(FREESTANDING_CFLAGS) -Os -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding_core.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -Os -c $(RUNTIMEDIR)/hosted_posix.c -o $(OBJDIR)/runtime/hosted_posix_rt.o
-	$(LD_RELOCATABLE) $(OBJDIR)/runtime/freestanding_core.o $(OBJDIR)/runtime/hosted_posix_rt.o -o $(BINDIR)/runtime/freestanding.o
-	$(CC) $(FREESTANDING_CFLAGS) -Os -fPIC -DMT_SHARED_RUNTIME -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding_shared_core.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -Os -fPIC -c $(RUNTIMEDIR)/hosted_posix.c -o $(OBJDIR)/runtime/hosted_posix_shared.o
-	$(LD_RELOCATABLE) $(OBJDIR)/runtime/freestanding_shared_core.o $(OBJDIR)/runtime/hosted_posix_shared.o -o $(BINDIR)/runtime/freestanding_shared.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(STDLIBDIR)/tracy_helpers.c -o $(BINDIR)/runtime/tracy_helpers.o
-	cp $(BINDIR)/runtime/tracy_helpers.o $(BINDIR)/runtime/tracy_helpers.obj
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -DMETTLE_ATOMICS_IN_FREESTANDING \
-		-c $(RUNTIMEDIR)/atomics.c -o $(BINDIR)/runtime/atomics.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(BINDIR)/runtime/crash_handler.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/safety.c -o $(BINDIR)/runtime/safety.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -fPIC -DMT_SHARED_RUNTIME -c $(RUNTIMEDIR)/safety.c -o $(BINDIR)/runtime/safety_shared.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/debug.c -o $(BINDIR)/runtime/debug.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/profile.c -o $(BINDIR)/runtime/profile.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/parallel.c -o $(BINDIR)/runtime/parallel.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/trace.c -o $(BINDIR)/runtime/trace.o
-	cp $(BINDIR)/runtime/trace.o $(BINDIR)/runtime/trace.obj
-ifeq ($(UNAME_S),Darwin)
-	$(CC) -std=c99 -O2 -fno-ident -fvisibility=hidden -c $(RUNTIMEDIR)/metal_runtime.c -o $(BINDIR)/runtime/metal_runtime.o
-	$(CC) -std=c99 -O2 -fno-ident -fvisibility=hidden -c $(RUNTIMEDIR)/metal_provider.c -o $(BINDIR)/runtime/metal_provider.o
-endif
-	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
-	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/string.mettle -o $(BINDIR)/runtime/string.o
+RUNTIME_SOURCE_FILES = $(wildcard $(RUNTIMEDIR)/*.c $(RUNTIMEDIR)/*.h $(RUNTIMEDIR)/*.inc $(RUNTIMEDIR)/*.mettle)
+BUNDLED_RUNTIME_SOURCES = $(RUNTIME_SOURCE_FILES:$(RUNTIMEDIR)/%=$(BINDIR)/runtime/%)
+
+$(BUNDLED_RUNTIME_SOURCES): $(BINDIR)/runtime/%: $(RUNTIMEDIR)/% | $(BINDIR)
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+BUNDLED_RUNTIME_OBJECTS = \
+	$(BINDIR)/runtime/freestanding.o \
+	$(BINDIR)/runtime/freestanding_shared.o \
+	$(BINDIR)/runtime/tracy_helpers.o \
+	$(BINDIR)/runtime/tracy_helpers.obj \
+	$(BINDIR)/runtime/atomics.o \
+	$(BINDIR)/runtime/crash_handler.o \
+	$(BINDIR)/runtime/safety.o \
+	$(BINDIR)/runtime/safety_shared.o \
+	$(BINDIR)/runtime/debug.o \
+	$(BINDIR)/runtime/profile.o \
+	$(BINDIR)/runtime/parallel.o \
+	$(BINDIR)/runtime/trace.o \
+	$(BINDIR)/runtime/trace.obj \
+	$(BINDIR)/runtime/swap.o \
+	$(BINDIR)/runtime/string.o
 ifeq ($(HOST_IS_AARCH64),)
-	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/live.mettle -o $(BINDIR)/runtime/live.o
+BUNDLED_RUNTIME_OBJECTS += $(BINDIR)/runtime/live.o
+endif
+ifeq ($(HOSTED),1)
+ifeq ($(UNAME_S),Darwin)
+BUNDLED_RUNTIME_OBJECTS += \
+	$(BINDIR)/runtime/metal_runtime.o \
+	$(BINDIR)/runtime/metal_provider.o
 endif
 else
-bundle-runtime: $(HOST_STARTUP_OBJECT) $(TARGET) | $(BINDIR)
-	rm -rf $(BINDIR)/runtime
-	cp -r $(RUNTIMEDIR) $(BINDIR)/runtime
-	$(CC) $(FREESTANDING_CFLAGS) -Os -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding.o
-	cp $(OBJDIR)/runtime/freestanding.o $(BINDIR)/runtime/freestanding.o
-	$(CC) $(FREESTANDING_CFLAGS) -Os -DMT_SHARED_RUNTIME -c $(RUNTIMEDIR)/freestanding.c -o $(OBJDIR)/runtime/freestanding_shared.o
-	cp $(OBJDIR)/runtime/freestanding_shared.o $(BINDIR)/runtime/freestanding_shared.o
-	cp $(HOST_STARTUP_OBJECT) $(BINDIR)/runtime/host_startup.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(STDLIBDIR)/tracy_helpers.c -o $(OBJDIR)/runtime/tracy_helpers.o
-	cp $(OBJDIR)/runtime/tracy_helpers.o $(BINDIR)/runtime/tracy_helpers.o
-	cp $(OBJDIR)/runtime/tracy_helpers.o $(BINDIR)/runtime/tracy_helpers.obj
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -DMETTLE_ATOMICS_IN_FREESTANDING \
-		-c $(RUNTIMEDIR)/atomics.c -o $(OBJDIR)/runtime/atomics.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/crash_handler.c -o $(OBJDIR)/runtime/crash_handler.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/safety.c        -o $(OBJDIR)/runtime/safety.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -DMT_SHARED_RUNTIME -c $(RUNTIMEDIR)/safety.c -o $(OBJDIR)/runtime/safety_shared.o
-	cp $(OBJDIR)/runtime/safety_shared.o $(BINDIR)/runtime/safety_shared.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/debug.c         -o $(OBJDIR)/runtime/debug.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/profile.c       -o $(OBJDIR)/runtime/profile.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/parallel.c      -o $(OBJDIR)/runtime/parallel.o
-	$(CC) $(RUNTIME_OBJ_CFLAGS) -c $(RUNTIMEDIR)/trace.c         -o $(OBJDIR)/runtime/trace.o
-	cp $(OBJDIR)/runtime/atomics.o       $(BINDIR)/runtime/atomics.o
-	cp $(OBJDIR)/runtime/crash_handler.o $(BINDIR)/runtime/crash_handler.o
-	cp $(OBJDIR)/runtime/safety.o        $(BINDIR)/runtime/safety.o
-	cp $(OBJDIR)/runtime/debug.o         $(BINDIR)/runtime/debug.o
-	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/swap.mettle -o $(BINDIR)/runtime/swap.o
-	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/string.mettle -o $(BINDIR)/runtime/string.o
-ifeq ($(HOST_IS_AARCH64),)
-	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/live.mettle -o $(BINDIR)/runtime/live.o
+BUNDLED_RUNTIME_OBJECTS += $(BINDIR)/runtime/host_startup.o
 endif
-	cp $(OBJDIR)/runtime/profile.o       $(BINDIR)/runtime/profile.o
-	cp $(OBJDIR)/runtime/parallel.o      $(BINDIR)/runtime/parallel.o
-	cp $(OBJDIR)/runtime/trace.o         $(BINDIR)/runtime/trace.o
-	cp $(OBJDIR)/runtime/trace.o         $(BINDIR)/runtime/trace.obj
+
+bundle-runtime: $(BUNDLED_RUNTIME_SOURCES) $(BUNDLED_RUNTIME_OBJECTS)
+
+$(BINDIR)/runtime/tracy_helpers.obj: $(BINDIR)/runtime/tracy_helpers.o
+	cp $< $@
+
+$(BINDIR)/runtime/trace.obj: $(BINDIR)/runtime/trace.o
+	cp $< $@
+
+$(BINDIR)/runtime/swap.o: $(RUNTIMEDIR)/swap.mettle $(TARGET) | $(BINDIR)
+	@mkdir -p $(dir $@)
+	$(TARGET) --release --emit-obj $< -o $@
+
+$(BINDIR)/runtime/string.o: $(RUNTIMEDIR)/string.mettle $(TARGET) | $(BINDIR)
+	@mkdir -p $(dir $@)
+	$(TARGET) --release --emit-obj $< -o $@
+
+$(BINDIR)/runtime/live.o: $(RUNTIMEDIR)/live.mettle $(RUNTIMEDIR)/live_os_linux.mettle $(RUNTIMEDIR)/live_os_windows.mettle $(TARGET) | $(BINDIR)
+	@mkdir -p $(dir $@)
+	$(TARGET) --release --emit-obj $(RUNTIMEDIR)/live.mettle -o $@
+
+ifeq ($(HOSTED),1)
+$(OBJDIR)/runtime/freestanding_core.o: $(RUNTIMEDIR)/freestanding.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(FREESTANDING_CFLAGS) -MMD -MP -Os -c $< -o $@
+
+$(OBJDIR)/runtime/hosted_posix_rt.o: $(RUNTIMEDIR)/hosted_posix.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -Os -c $< -o $@
+
+$(BINDIR)/runtime/freestanding.o: $(OBJDIR)/runtime/freestanding_core.o $(OBJDIR)/runtime/hosted_posix_rt.o | $(BINDIR)
+	@mkdir -p $(dir $@)
+	$(LD_RELOCATABLE) $(OBJDIR)/runtime/freestanding_core.o $(OBJDIR)/runtime/hosted_posix_rt.o -o $@
+
+$(OBJDIR)/runtime/freestanding_shared_core.o: $(RUNTIMEDIR)/freestanding.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(FREESTANDING_CFLAGS) -MMD -MP -Os -fPIC -DMT_SHARED_RUNTIME -c $< -o $@
+
+$(OBJDIR)/runtime/hosted_posix_shared.o: $(RUNTIMEDIR)/hosted_posix.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -Os -fPIC -c $< -o $@
+
+$(BINDIR)/runtime/freestanding_shared.o: $(OBJDIR)/runtime/freestanding_shared_core.o $(OBJDIR)/runtime/hosted_posix_shared.o | $(BINDIR)
+	@mkdir -p $(dir $@)
+	$(LD_RELOCATABLE) $(OBJDIR)/runtime/freestanding_shared_core.o $(OBJDIR)/runtime/hosted_posix_shared.o -o $@
+
+$(BINDIR)/runtime/tracy_helpers.o: $(STDLIBDIR)/tracy_helpers.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/tracy_helpers.d -c $< -o $@
+
+$(BINDIR)/runtime/atomics.o: $(RUNTIMEDIR)/atomics.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/atomics.d -DMETTLE_ATOMICS_IN_FREESTANDING -c $< -o $@
+
+$(BINDIR)/runtime/crash_handler.o: $(RUNTIMEDIR)/crash_handler.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/crash_handler.d -c $< -o $@
+
+$(BINDIR)/runtime/safety.o: $(RUNTIMEDIR)/safety.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/safety.d -c $< -o $@
+
+$(BINDIR)/runtime/safety_shared.o: $(RUNTIMEDIR)/safety.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/safety_shared.d -fPIC -DMT_SHARED_RUNTIME -c $< -o $@
+
+$(BINDIR)/runtime/debug.o: $(RUNTIMEDIR)/debug.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/debug.d -c $< -o $@
+
+$(BINDIR)/runtime/profile.o: $(RUNTIMEDIR)/profile.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/profile.d -c $< -o $@
+
+$(BINDIR)/runtime/parallel.o: $(RUNTIMEDIR)/parallel.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/parallel.d -c $< -o $@
+
+$(BINDIR)/runtime/trace.o: $(RUNTIMEDIR)/trace.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -MF $(OBJDIR)/runtime/trace.d -c $< -o $@
+
+ifeq ($(UNAME_S),Darwin)
+$(BINDIR)/runtime/metal_runtime.o: $(RUNTIMEDIR)/metal_runtime.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) -std=c99 -O2 -fno-ident -fvisibility=hidden -MMD -MP -MF $(OBJDIR)/runtime/metal_runtime.d -c $< -o $@
+
+$(BINDIR)/runtime/metal_provider.o: $(RUNTIMEDIR)/metal_provider.c | $(BINDIR) $(OBJDIR)
+	@mkdir -p $(dir $@) $(OBJDIR)/runtime
+	$(CC) -std=c99 -O2 -fno-ident -fvisibility=hidden -MMD -MP -MF $(OBJDIR)/runtime/metal_provider.d -c $< -o $@
+endif
+else
+RUNTIME_C_OBJ_NAMES = \
+	freestanding.o \
+	freestanding_shared.o \
+	tracy_helpers.o \
+	atomics.o \
+	crash_handler.o \
+	safety.o \
+	safety_shared.o \
+	debug.o \
+	profile.o \
+	parallel.o \
+	trace.o \
+	host_startup.o
+BUNDLED_RUNTIME_C_OBJECTS = $(addprefix $(BINDIR)/runtime/,$(RUNTIME_C_OBJ_NAMES))
+
+$(OBJDIR)/runtime/freestanding.o: $(RUNTIMEDIR)/freestanding.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(FREESTANDING_CFLAGS) -MMD -MP -Os -c $< -o $@
+
+$(OBJDIR)/runtime/freestanding_shared.o: $(RUNTIMEDIR)/freestanding.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(FREESTANDING_CFLAGS) -MMD -MP -Os -DMT_SHARED_RUNTIME -c $< -o $@
+
+$(OBJDIR)/runtime/tracy_helpers.o: $(STDLIBDIR)/tracy_helpers.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJDIR)/runtime/atomics.o: $(RUNTIMEDIR)/atomics.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -DMETTLE_ATOMICS_IN_FREESTANDING -c $< -o $@
+
+$(OBJDIR)/runtime/crash_handler.o: $(RUNTIMEDIR)/crash_handler.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJDIR)/runtime/safety.o: $(RUNTIMEDIR)/safety.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJDIR)/runtime/safety_shared.o: $(RUNTIMEDIR)/safety.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -DMT_SHARED_RUNTIME -c $< -o $@
+
+$(OBJDIR)/runtime/debug.o: $(RUNTIMEDIR)/debug.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJDIR)/runtime/profile.o: $(RUNTIMEDIR)/profile.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJDIR)/runtime/parallel.o: $(RUNTIMEDIR)/parallel.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJDIR)/runtime/trace.o: $(RUNTIMEDIR)/trace.c | $(OBJDIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(RUNTIME_OBJ_CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUNDLED_RUNTIME_C_OBJECTS): $(BINDIR)/runtime/%.o: $(OBJDIR)/runtime/%.o | $(BINDIR)
+	@mkdir -p $(dir $@)
+	cp $< $@
 endif
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
