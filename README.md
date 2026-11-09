@@ -1,48 +1,6 @@
 <a href="https://the-mettle-project.github.io/Mettle/"><img src="website/media/readme-banner.jpg" alt="This is your language." width="100%"></a>
 
-**Mettle is a systems language with its own optimizer, linker, runtime and debugger.** It compiles to native code for x86-64 and ARM64, and to PTX, SPIR-V and Metal for GPUs.
-
-<img src="website/media/readme/power.jpg" width="100%" alt="Faster than llama.cpp, on the same card. Systm's Potentia runs LLMs on Mettle. Its GPU kernels are Mettle, compiled straight to PTX with no nvcc, C++ or Python in the pipeline, and the build fails unless the GPU matches an independent CPU reference, logit for logit. 1.7 to 2.4 times faster to the first token: 2.4 on a 128-token prompt, 1.9 on 512 tokens, 1.8 on 2,048 and 1.7 on 8,192. 1.07 to 1.41 times faster generating a reply: 1.41 on code with a drafter, 1.18 on prose with a drafter, 1.07 with no drafter. 8.5 to 23.5 times less RAM on the 26B model: 23.5 idle, 12.1 after four users, 8.5 two minutes on. 19 to 38 percent less energy per token: 38 at eight requests, 27 at four, 21 at two, 19 at one.">
-
-<sub>[Systm](https://systm.co.za/)'s Potentia against llama.cpp from LM Studio, on Gemma 4 12B and 26B-A4B, QAT Q4_0, on one RTX 5060 Ti, with every layer on the GPU and one engine in VRAM at a time. Energy is board joules per token. At 16 requests, throughput is 473 against 446 tokens a second.</sub>
-
-<img src="website/media/readme/close.jpg" width="100%" alt="Everything else stays close to C. Every whole program in the benchmark suite. 1.04× the run time of clang -O3 on average, with the same answers on all 16. 1.09× the run time of clang -O3 -march=native, which leads on 15 of 16. 1.7 times faster to build a generated 90,000-line file, 6.8 seconds against 11.7. A chart shows all 16 programs; the table below lists them.">
-
-<details>
-<summary>All 16 programs</summary>
-
-| Program | Against `-O3` | Against `-march=native` |
-|---|---:|---:|
-| `bytecode_vm` | 0.42× | 0.65× |
-| `sudoku_solve` | 0.76× | 1.12× |
-| `regex_match` | 0.98× | 1.01× |
-| `huffman` | 1.02× | 1.04× |
-| `csv_query` | 1.04× | 1.06× |
-| `voxel_trace` | 1.09× | 1.12× |
-| `word_freq` | 1.10× | 1.09× |
-| `lz77` | 1.11× | 1.09× |
-| `mark_sweep` | 1.13× | 1.13× |
-| `btree_index` | 1.13× | 1.14× |
-| `astar_grid` | 1.14× | 1.14× |
-| `json_parse` | 1.16× | 1.17× |
-| `link_resolve` | 1.22× | 1.23× |
-| `interp_ast` | 1.22× | 1.05× |
-| `physics_grid` | 1.28× | 1.29× |
-| `diff_lcs` | 1.29× | 1.32× |
-
-</details>
-
-<sub>clang 22.1.6 on Windows, on an i7-12700K, best of 15 pinned runs. Under `-march=native`, clang's physics_grid returns a different checksum. Run them with `tools/benchmark/suite3_exhibit.ps1`.</sub>
-
-<img src="website/media/readme/powers.jpg" width="100%" alt="What you can do.">
-
-- **Change it while it runs.** Save a file and the running program takes the new code, even after a crash. [Live programs](docs/live.md)
-- **Program the GPU directly.** A kernel is a Mettle function, compiled straight to PTX or Metal. [GPU offload](docs/gpu.md)
-- **Make the compiler obey.** Put `@simd!` on a loop and it vectorizes, or the build stops and tells you why.
-- **Make it explain itself.** `--explain` names what it did with every loop and call, and what it took on trust. [Compilation](docs/compilation.md)
-- **Write your own laws.** A rule is a function you write that runs in the compiler and can stop the build. [Rules](docs/rules.md)
-- **Never write a lifetime.** It reads the whole program and tells you what it can prove. [Memory analyser](docs/borrow-checker.md)
-- **Redefine the machine.** Print a target as Mettle, change it and build for it, or invent an instruction set and run on it. [Bare metal](docs/bare-metal.md)
+Mettle is a systems language with its own optimizer, assembler, linker, runtime and debugger. It compiles to native code for x86-64 and ARM64, and to PTX, SPIR-V and Metal for GPUs.
 
 ```mettle
 @simd! fn checksum(data: uint8*, n: int64) -> int64 {
@@ -55,10 +13,30 @@
 ```
 
 ```text
-checksum (loop @ line 6): vectorized -> vpsadbw, 32-wide byte sum (AVX2)
+checksum (loop @ line 3): vectorized -> vpsadbw, 32-wide byte sum (AVX2)
 ```
 
-<img src="website/media/readme/try.jpg" width="100%" alt="Try it.">
+`@simd!` is a contract. If the loop cannot vectorize, the build stops and says why.
+
+## What it does
+
+- [Live programs](docs/live.md). Save a file and the running program takes the new code, even after a crash.
+- [GPU kernels](docs/gpu.md). A kernel is a Mettle function, compiled to PTX, SPIR-V or Metal.
+- [Explain](docs/explain.md). `--explain` reports what the compiler did with every loop and call, and what it took on trust.
+- [Rules](docs/rules.md). A rule is a function you write that runs in the compiler and can stop the build.
+- [Inferred lifetimes](docs/borrow-checker.md). The compiler works out ownership from the whole program. You write no annotations.
+- [Metaprogramming](docs/metaprogramming.md). Layouts, optimizer passes and register allocators are Mettle functions.
+- [Bare metal](docs/bare-metal.md). A target is described in Mettle, down to a boot sector or an instruction set you made up.
+
+[Ideology](docs/ideology.md) explains why it is built this way.
+
+## Speed
+
+Over 16 whole programs Mettle runs in 1.04× the time of `clang -O3`, with the same answers on all 16. Run them with `tools/benchmark/suite3_exhibit.ps1`, or read the [benchmarks](docs/benchmarks/README.md).
+
+[Potentia](https://systm.co.za/), an LLM engine written in Mettle, reaches the first token 1.7 to 2.4 times sooner than llama.cpp on the same card.
+
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/The-Mettle-Project/Mettle/master/install.sh | sh
@@ -72,4 +50,4 @@ These install v0.18.0. To build from source, run `make -j"$(nproc)"` on Linux or
 
 [Getting started](docs/getting-started.md) | [Documentation](docs/README.md) | [What does not work yet](docs/known-limitations.md) | [Contributing](.github/CONTRIBUTING.md)
 
-<sub>Apache 2.0. Photos by Ryan Shroyer, Raul Ling, Susanne Jutzeler and Julia Volk on Pexels.</sub>
+<sub>Apache 2.0.</sub>

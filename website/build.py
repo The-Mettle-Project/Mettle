@@ -136,11 +136,7 @@ def main():
     c_o3 = suite3["c_o3"]
     c_native = suite3["c_native"]
     readme = read(os.path.join(REPO, "README.md"))
-    require(c_o3 + "\u00d7 the run time of clang -O3" in readme and c_native + "\u00d7 the run time of clang -O3 -march=native" in readme, "the README to carry the same averages")
-    require("-march=native, which leads on " + suite3["native_leads"] + "." in readme, "the README to say clang leads on " + suite3["native_leads"])
-    require("%s times faster to build a generated 90,000-line file, %s seconds against %s." % (suite3["build_ratio"], suite3["build_m"], suite3["build_c"]) in readme, "the README to carry the same build times")
-    for r in suite3["rows"]:
-        require("| `%s` | %.2f\u00d7 | %.2f\u00d7 |" % (r["name"], r["m"] / r["o3"], r["m"] / r["native"]) in readme, "the README table to list " + r["name"])
+    require("Over %d whole programs Mettle runs in %s\u00d7 the time of `clang -O3`" % (len(suite3["rows"]), c_o3) in readme, "the README to carry the same average")
 
     built, code, cwd = compile_in("reflect", "reflect.mettle", ["--build"], "reflect.mettle")
     require(code == 0, "reflect.mettle to build")
