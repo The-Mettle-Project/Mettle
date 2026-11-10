@@ -1050,7 +1050,9 @@ and floats, between `char` and integers, and between pointer types.
 `typeof(T)` yields a `Type`, a value the compiler can ask questions of while
 compiling. `Type` has `.fields`, and each `Field` has `.name`, `.type`,
 `.offset`, and `.index`. `.type` is itself a `Type`, so `f.type.size` is the
-field's size. `.owns` is 1 when values of the type own a resource and are
+field's size. `.id` is a positive `int64` made from the type's qualified name,
+so it is the same in every build and every module, and a struct can keep it to
+say at run time which type it holds. `.owns` is 1 when values of the type own a resource and are
 dropped at the end of their scope, and 0 otherwise; see
 [Ownership](ownership.md).
 

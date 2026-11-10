@@ -234,7 +234,16 @@ int type_checker_type_member_exists(const char *member) {
           strcmp(member, "size") == 0 || strcmp(member, "align") == 0 ||
           strcmp(member, "fields") == 0 || strcmp(member, "pointee") == 0 ||
           strcmp(member, "element") == 0 || strcmp(member, "len") == 0 ||
-          strcmp(member, "owns") == 0);
+          strcmp(member, "owns") == 0 || strcmp(member, "id") == 0);
+}
+
+static long long type_stable_id(const char *name) {
+  unsigned long long hash = 14695981039346656037ULL;
+  for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+    hash = (hash ^ *p) * 1099511628211ULL;
+  }
+  hash &= 0x7fffffffffffffffULL;
+  return (long long)(hash ? hash : 1);
 }
 
 int type_checker_eval_type_member(TypeChecker *checker, ComptimeValue type_value,
@@ -265,6 +274,14 @@ int type_checker_eval_type_member(TypeChecker *checker, ComptimeValue type_value
     }
     *out_value = comptime_string(string_intern(name));
     return out_value->as.string.value != NULL;
+  }
+  if (strcmp(member, "id") == 0) {
+    const char *name = type_reflected_name(type);
+    if (!name) {
+      return 0;
+    }
+    *out_value = comptime_int(type_stable_id(name));
+    return 1;
   }
   if (strcmp(member, "size") == 0) {
     *out_value = comptime_int((long long)type->size);

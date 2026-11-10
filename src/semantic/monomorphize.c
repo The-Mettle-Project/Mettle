@@ -1051,6 +1051,12 @@ static void substitute_lambda_signature(FunctionDeclaration *lambda,
   }
 }
 
+static int mono_walks_children(ASTNodeType type) {
+  return type == AST_AGGREGATE_LITERAL || type == AST_FUNC_PTR_CALL ||
+         type == AST_GPU_LAUNCH || type == AST_VALUE_SCOPE ||
+         type == AST_YIELD_STATEMENT;
+}
+
 static void substitute_types_in_ast(ASTNode *node, char **param_names,
                                     char **arg_names, size_t count,
                                     MonoContext *ctx) {
@@ -1276,15 +1282,6 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
       substitute_types_in_ast(ds->statement, param_names, arg_names, count, ctx);
     break;
   }
-  case AST_FUNC_PTR_CALL:
-  case AST_GPU_LAUNCH:
-  case AST_VALUE_SCOPE:
-  case AST_YIELD_STATEMENT:
-    for (size_t i = 0; i < node->child_count; i++) {
-      substitute_types_in_ast(node->children[i], param_names, arg_names, count,
-                              ctx);
-    }
-    break;
   case AST_LAMBDA_EXPRESSION: {
     substitute_lambda_signature((FunctionDeclaration *)node->data, param_names,
                                 arg_names, count, ctx);
@@ -1295,6 +1292,11 @@ static void substitute_types_in_ast(ASTNode *node, char **param_names,
     break;
   }
   default:
+    for (size_t i = 0; mono_walks_children(node->type) && i < node->child_count;
+         i++) {
+      substitute_types_in_ast(node->children[i], param_names, arg_names, count,
+                              ctx);
+    }
     break;
   }
 }
@@ -1619,15 +1621,11 @@ static void collect_type_instantiations(ASTNode *node, MonoContext *ctx) {
       collect_type_instantiations(ds->statement, ctx);
     break;
   }
-  case AST_FUNC_PTR_CALL:
-  case AST_GPU_LAUNCH:
-  case AST_VALUE_SCOPE:
-  case AST_YIELD_STATEMENT:
-    for (size_t i = 0; i < node->child_count; i++) {
+  default:
+    for (size_t i = 0; mono_walks_children(node->type) && i < node->child_count;
+         i++) {
       collect_type_instantiations(node->children[i], ctx);
     }
-    break;
-  default:
     break;
   }
 }
@@ -1962,15 +1960,11 @@ static void rewrite_generic_references(ASTNode *node, MonoContext *ctx) {
       rewrite_generic_references(ds->statement, ctx);
     break;
   }
-  case AST_FUNC_PTR_CALL:
-  case AST_GPU_LAUNCH:
-  case AST_VALUE_SCOPE:
-  case AST_YIELD_STATEMENT:
-    for (size_t i = 0; i < node->child_count; i++) {
+  default:
+    for (size_t i = 0; mono_walks_children(node->type) && i < node->child_count;
+         i++) {
       rewrite_generic_references(node->children[i], ctx);
     }
-    break;
-  default:
     break;
   }
 }

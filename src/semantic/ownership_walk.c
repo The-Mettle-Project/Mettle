@@ -1373,6 +1373,9 @@ static void own_drop_call(OwnWalker *w, ASTNode *node, CallExpression *call,
     own_use(w, place, arg, 0, "drop");
     return;
   }
+  if (!forget && arg->resolved_type) {
+    own_require_glue(w->checker, arg->resolved_type, arg->location);
+  }
   if (arg->type == AST_UNARY_EXPRESSION || arg->type == AST_INDEX_EXPRESSION ||
       arg->type == AST_MEMBER_ACCESS || arg->type == AST_IDENTIFIER) {
     own_expr(w, arg, OWN_CTX_ADDRESS);

@@ -1,0 +1,27 @@
+import "std/io";
+
+struct Position { x: float32; y: float32; }
+struct Velocity { x: float32; y: float32; }
+
+struct Tagged {
+  kind: int64;
+}
+
+fn id_of<T>() -> int64 {
+  return typeof(T).id;
+}
+
+fn is<T>(t: Tagged*) -> bool {
+  return t->kind == typeof(T).id;
+}
+
+fn main() -> int32 {
+  var t: Tagged = { kind: id_of<Velocity>() };
+  var same: bool = id_of<Position>() == typeof(Position).id;
+  var apart: bool = id_of<Position>() != id_of<Velocity>();
+  var scalars: bool = typeof(int32).id != typeof(float32).id;
+  var pointers: bool = typeof(Position*).id != typeof(Position).id;
+  var positive: bool = id_of<Position>() > 0;
+  println("type_id: {same} {apart} {scalars} {pointers} {positive} {is<Velocity>(&t)} {is<Position>(&t)}");
+  return 0;
+}

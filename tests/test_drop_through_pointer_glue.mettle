@@ -1,0 +1,41 @@
+import "std/io";
+import "std/mem";
+import "std/collections";
+
+var g_freed: int32 = 0;
+
+struct Holder {
+  items: List<int32>;
+  method drop() {
+    g_freed = g_freed + (int32)this.items.length;
+    list_free(&this.items);
+  }
+}
+
+struct Pair {
+  left: Holder;
+  right: Holder;
+}
+
+fn main() -> int32 {
+  var h = new Holder;
+  list_push(&h->items, 3);
+  list_push(&h->items, 4);
+  drop(*h);
+  free(h);
+
+  var p = new Pair;
+  list_push(&p->left.items, 1);
+  list_push(&p->right.items, 2);
+  list_push(&p->right.items, 5);
+  drop(*p);
+  free(p);
+
+  var many: Holder[] = new Holder[2];
+  list_push(&many[1].items, 9);
+  drop(many[1]);
+  free(many.data);
+
+  println("drop_glue: {g_freed}");
+  return 0;
+}
