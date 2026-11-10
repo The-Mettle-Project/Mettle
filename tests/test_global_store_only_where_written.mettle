@@ -1,0 +1,116 @@
+import "std/io";
+import "std/thread";
+import "std/mem";
+
+const ROUNDS: int64 = 2000000;
+
+var g_counter: int64 = 1;
+var g_id: int64 = 0;
+var g_cursor: int64*;
+var g_total: int64 = 0;
+var g_ticks: int64 = 0;
+var g_stop: int32 = 0;
+var g_started: int32 = 0;
+
+@noinline fn component_id() -> int64 {
+  if (g_id <= 0) {
+    g_id = g_counter;
+    g_counter = g_counter + 1;
+  }
+  return g_id;
+}
+
+@noinline fn poke() {
+  *g_cursor = 7;
+}
+
+@noinline fn bump_counter() {
+  g_counter = g_counter + 1;
+}
+
+@noinline fn bump_cursor() {
+  g_cursor = (int64*)((int64)g_cursor + 8);
+}
+
+@noinline fn tick() {
+  g_ticks = g_ticks + 1;
+}
+
+@noinline fn accumulate(n: int64) {
+  for i: int64 in 0..n {
+    g_total = g_total + i;
+  }
+}
+
+@noinline fn drain(n: int64) {
+  for i: int64 in 0..n {
+    g_total = g_total + i;
+  }
+  tick();
+  for i: int64 in 0..n {
+    g_total = g_total - i;
+  }
+}
+
+@noinline fn bump_total() {
+  g_total = g_total + 1;
+}
+
+fn flag(target: int32*) -> int32 {
+  return atomic_compare_exchange_i32(target, 0, 0);
+}
+
+fn reader(arg: cstring) -> uint32 {
+  atomic_inc_i32(&g_started);
+  while (flag(&g_stop) == 0) {
+    for k: int32 in 0..256 {
+      component_id();
+      poke();
+      accumulate(0);
+      drain(0);
+    }
+  }
+  return (uint32)0;
+}
+
+fn main() -> int32 {
+  var tid: uint32 = 0;
+  var base: int64* = (int64*)malloc(8 * (ROUNDS + 2));
+  var failed: int32 = 0;
+
+  g_cursor = base;
+  component_id();
+  var h: int64 = CreateThread((cstring)0, (uint64)0, &reader, (cstring)0, (uint32)0, &tid);
+  while (flag(&g_started) == 0) {
+  }
+  for i: int64 in 0..ROUNDS {
+    bump_counter();
+    bump_cursor();
+    bump_total();
+  }
+  atomic_exchange_i32(&g_stop, 1);
+  thread_join_infinite(h);
+
+  if (g_counter != ROUNDS + 2) {
+    println("global_store: the counter lost {ROUNDS + 2 - g_counter} of {ROUNDS} increments to a reader that never writes it");
+    failed = 1;
+  }
+  if ((int64)g_cursor != (int64)base + 8 * ROUNDS) {
+    println("global_store: the cursor lost {((int64)base + 8 * ROUNDS - (int64)g_cursor) / 8} of {ROUNDS} steps to a function that only stores through it");
+    failed = 1;
+  }
+  if (g_total != ROUNDS) {
+    println("global_store: the total lost {ROUNDS - g_total} of {ROUNDS} increments to loops that ran zero times");
+    failed = 1;
+  }
+  accumulate(5);
+  drain(4);
+  if (g_total != ROUNDS + 10) {
+    println("global_store: the loops left the total at {g_total}, expected {ROUNDS + 10}");
+    failed = 1;
+  }
+  if (failed == 0) {
+    println("global_store: ok");
+  }
+  return failed;
+}

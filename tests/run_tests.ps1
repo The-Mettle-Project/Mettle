@@ -22206,6 +22206,8 @@ $issueRegressions = @(
   @{ Name = "dyn_method_returning_aggregate_release"; Entry = "tests/issues/dyn_returns_aggregate.mettle"; Args = @("--release"); Expect = @("cat3", "dogrex") },
   @{ Name = "float_literal_as_condition"; Entry = "tests/issues/float_condition.mettle"; Args = @(); Expect = @("101001 3 7 false true true false") },
   @{ Name = "float_literal_as_condition_release"; Entry = "tests/issues/float_condition.mettle"; Args = @("--release"); Expect = @("101001 3 7 false true true false") },
+  @{ Name = "global_store_only_where_written"; Entry = "tests/test_global_store_only_where_written.mettle"; Args = @(); Expect = @("global_store: ok") },
+  @{ Name = "global_store_only_where_written_release"; Entry = "tests/test_global_store_only_where_written.mettle"; Args = @("--release"); Expect = @("global_store: ok") },
   @{ Name = "aggregate_equality_is_an_error"; Command = @("--build", "tests/issues/err_compare_struct.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("compare the fields") },
   @{ Name = "string_order_is_an_error"; Command = @("--build", "tests/issues/err_compare_string_order.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("str_compare") },
   @{ Name = "asm_binding_must_name_a_variable"; Command = @("--build", "tests/issues/err_asm_binding.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("no variable 'nothing_here' is in scope") },

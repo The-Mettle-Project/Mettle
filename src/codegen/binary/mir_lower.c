@@ -310,6 +310,11 @@ typedef struct {
   const char **at;
   size_t at_count;
   const unsigned long long *dirty;
+  const unsigned long long *dirty_always;
+  unsigned long long through;
+  int through_all;
+  unsigned long long shadowed;
+  MirVregId shadow[64];
   const char **uncached;
   size_t uncached_mask;
 } MirGlobalWriteback;
@@ -3358,24 +3363,114 @@ static int mir_emit_global_reload_names(MirFunction *fn, CodeGenerator *g,
   return 1;
 }
 
+static int mir_global_writes_through(const MirGlobalWriteback *wb, size_t j) {
+  return wb->through_all || (j < 64 && ((wb->through >> j) & 1ull));
+}
+
+static int mir_global_is_pending(const MirFunction *fn,
+                                 const MirGlobalWriteback *wb, size_t j) {
+  if (mir_global_writes_through(wb, j)) {
+    return 0;
+  }
+  if (!wb->dirty || fn->cur_ir_index < 0 || j >= 64) {
+    return 1;
+  }
+  return (int)((wb->dirty[fn->cur_ir_index] >> j) & 1ull);
+}
+
+static const char *mir_new_copy_label(MirFunction *fn);
+
+static int mir_global_is_shadowed(const MirGlobalWriteback *wb, size_t j) {
+  return j < 64 && ((wb->shadowed >> j) & 1ull);
+}
+
+static int mir_emit_global_shadow_sync(MirFunction *fn, MirNameMap *map,
+                                       const MirGlobalWriteback *wb,
+                                       const char *name) {
+  for (size_t j = 0; wb->shadowed && j < wb->count && j < 64; j++) {
+    if (mir_global_is_shadowed(wb, j) && strcmp(wb->names[j], name) == 0) {
+      MirVregId v = mir_name_map_get_or_add(map, fn, name, 0, MIR_RC_GP, 8);
+      return v != MIR_VREG_NONE &&
+             mir_emit1(fn, MIR_MOV, mir_op_vreg(wb->shadow[j]), mir_op_vreg(v),
+                       mir_op_none(), 8, 0, 0);
+    }
+  }
+  return 1;
+}
+
+static int mir_emit_global_shadow_resync(MirFunction *fn, MirNameMap *map,
+                                         const MirGlobalWriteback *wb,
+                                         const char *name) {
+  const IRFunction *irf = fn->ir_function;
+
+  if (irf && fn->cur_ir_index >= 0 &&
+      irf->instructions[fn->cur_ir_index].op == IR_OP_RETURN) {
+    return 1;
+  }
+  return mir_emit_global_shadow_sync(fn, map, wb, name);
+}
+
+static int mir_emit_global_pending_store(MirFunction *fn, CodeGenerator *g,
+                                         MirNameMap *map,
+                                         const MirGlobalWriteback *wb,
+                                         size_t j) {
+  const char *name = wb->names[j];
+  const char *unchanged;
+  MirVregId v;
+
+  if (!mir_global_is_shadowed(wb, j)) {
+    return mir_emit_global_flush_names(fn, g, map, &name, 1);
+  }
+  if (wb->dirty_always && fn->cur_ir_index >= 0 &&
+      ((wb->dirty_always[fn->cur_ir_index] >> j) & 1ull)) {
+    return mir_emit_global_flush_names(fn, g, map, &name, 1) &&
+           mir_emit_global_shadow_resync(fn, map, wb, name);
+  }
+  v = mir_name_map_get_or_add(map, fn, name, 0, MIR_RC_GP, 8);
+  unchanged = mir_new_copy_label(fn);
+  return v != MIR_VREG_NONE && unchanged &&
+         mir_emit1(fn, MIR_CMPBR, mir_op_label(unchanged), mir_op_vreg(v),
+                   mir_op_vreg(wb->shadow[j]), 8, 1, 0x84) &&
+         mir_emit_global_flush_names(fn, g, map, &name, 1) &&
+         mir_emit1(fn, MIR_LABEL, mir_op_label(unchanged), mir_op_none(),
+                   mir_op_none(), 8, 0, 0) &&
+         mir_emit_global_shadow_resync(fn, map, wb, name);
+}
+
 static int mir_emit_global_writebacks(MirFunction *fn, CodeGenerator *g,
                                       MirNameMap *map,
                                       const MirGlobalWriteback *wb) {
   if (!wb) {
     return 1;
   }
-  if (wb->dirty && fn->cur_ir_index >= 0) {
-    unsigned long long m = wb->dirty[fn->cur_ir_index];
-    for (size_t j = 0; j < wb->count && j < 64; j++) {
-      if ((m >> j) & 1ull) {
-        if (!mir_emit_global_flush_names(fn, g, map, &wb->names[j], 1)) {
-          return 0;
-        }
-      }
+  for (size_t j = 0; j < wb->count; j++) {
+    if (mir_global_is_pending(fn, wb, j) &&
+        !mir_emit_global_pending_store(fn, g, map, wb, j)) {
+      return 0;
     }
+  }
+  return 1;
+}
+
+static int mir_instruction_assigns_symbol(const IRInstruction *in) {
+  return ir_operand_is_symbol(&in->dest) && in->op != IR_OP_DECLARE_LOCAL &&
+         in->op != IR_OP_STORE;
+}
+
+static int mir_emit_global_write_through(MirFunction *fn, CodeGenerator *g,
+                                         MirNameMap *map,
+                                         const MirGlobalWriteback *wb,
+                                         const IRInstruction *in) {
+  if (!mir_instruction_assigns_symbol(in)) {
     return 1;
   }
-  return mir_emit_global_flush_names(fn, g, map, wb->names, wb->count);
+  for (size_t j = 0; j < wb->count; j++) {
+    if (strcmp(wb->names[j], in->dest.name) == 0) {
+      return !mir_global_writes_through(wb, j) ||
+             mir_emit_global_flush_names(fn, g, map, &wb->names[j], 1);
+    }
+  }
+  return 1;
 }
 
 static int mir_emit_global_alias_flush(MirFunction *fn, CodeGenerator *g,
@@ -3395,29 +3490,20 @@ static int mir_emit_global_alias_flush(MirFunction *fn, CodeGenerator *g,
     if (written == wb->count) {
       continue;
     }
-    if (wb->dirty && fn->cur_ir_index >= 0 && written < 64 &&
-        !((wb->dirty[fn->cur_ir_index] >> written) & 1ull)) {
+    if (!mir_global_is_pending(fn, wb, written)) {
       continue;
     }
-    if (!mir_emit_global_flush_names(fn, g, map, &wb->at[i], 1)) {
+    if (!mir_emit_global_pending_store(fn, g, map, wb, written)) {
       return 0;
     }
   }
   return 1;
 }
 
-static unsigned long long *mir_compute_global_dirty_masks(
-    const IRFunction *irf, const char **names, size_t count) {
+static int *mir_global_branch_targets(const IRFunction *irf) {
   size_t n = irf->instruction_count;
-  if (n == 0 || count == 0 || count > 64) {
-    return NULL;
-  }
-  unsigned long long *mask =
-      (unsigned long long *)calloc(n, sizeof(*mask));
   int *target = (int *)malloc(n * sizeof(*target));
-  if (!mask || !target) {
-    free(mask);
-    free(target);
+  if (!target) {
     return NULL;
   }
   for (size_t i = 0; i < n; i++) {
@@ -3435,52 +3521,110 @@ static unsigned long long *mir_compute_global_dirty_masks(
         }
       }
       if (target[i] < 0) {
-        free(mask);
         free(target);
         return NULL;
       }
     }
   }
+  return target;
+}
+
+static unsigned long long mir_global_dirty_after(const IRInstruction *in,
+                                                 const char **names,
+                                                 size_t count,
+                                                 unsigned long long s) {
+  if (in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT ||
+      in->op == IR_OP_INLINE_ASM) {
+    s = 0;
+  }
+  if (mir_instruction_assigns_symbol(in)) {
+    for (size_t j = 0; j < count; j++) {
+      if (strcmp(names[j], in->dest.name) == 0) {
+        return s | (1ull << j);
+      }
+    }
+  }
+  return s;
+}
+
+static int mir_global_dirty_meet(unsigned long long *slot,
+                                 unsigned long long s, int on_every_path) {
+  unsigned long long merged = on_every_path ? (*slot & s) : (*slot | s);
+  if (merged == *slot) {
+    return 0;
+  }
+  *slot = merged;
+  return 1;
+}
+
+static unsigned long long *mir_global_dirty_states(const IRFunction *irf,
+                                                   const int *target,
+                                                   const char **names,
+                                                   size_t count,
+                                                   int on_every_path) {
+  size_t n = irf->instruction_count;
+  unsigned long long *mask = (unsigned long long *)calloc(n, sizeof(*mask));
   int changed = 1;
+
+  if (!mask) {
+    return NULL;
+  }
+  for (size_t i = 1; on_every_path && i < n; i++) {
+    mask[i] = ~0ull;
+  }
   while (changed) {
     changed = 0;
     for (size_t i = 0; i < n; i++) {
       const IRInstruction *in = &irf->instructions[i];
-      unsigned long long s = mask[i];
-      if (in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT ||
-          in->op == IR_OP_INLINE_ASM) {
-        s = 0;
-      }
-      if (ir_operand_is_symbol(&in->dest) &&
-          in->op != IR_OP_DECLARE_LOCAL) {
-        for (size_t j = 0; j < count; j++) {
-          if (strcmp(names[j], in->dest.name) == 0) {
-            s |= 1ull << j;
-            break;
-          }
-        }
-      }
+      unsigned long long s = mir_global_dirty_after(in, names, count, mask[i]);
       if (in->op == IR_OP_RETURN) {
         continue;
       }
       if (target[i] >= 0) {
-        size_t t = (size_t)target[i];
-        if ((mask[t] | s) != mask[t]) {
-          mask[t] |= s;
-          changed = 1;
-        }
+        changed |= mir_global_dirty_meet(&mask[target[i]], s, on_every_path);
         if (in->op == IR_OP_JUMP) {
           continue;
         }
       }
-      if (i + 1 < n && (mask[i + 1] | s) != mask[i + 1]) {
-        mask[i + 1] |= s;
-        changed = 1;
+      if (i + 1 < n) {
+        changed |= mir_global_dirty_meet(&mask[i + 1], s, on_every_path);
       }
     }
   }
-  free(target);
   return mask;
+}
+
+static unsigned long long *mir_compute_global_dirty_masks(
+    const IRFunction *irf, MirGlobalWriteback *wb) {
+  size_t n = irf->instruction_count;
+  int *target;
+  unsigned long long *may;
+  unsigned long long *must;
+
+  if (wb->count == 0) {
+    return NULL;
+  }
+  wb->through_all = 1;
+  if (n == 0 || wb->count > 64) {
+    return NULL;
+  }
+  target = mir_global_branch_targets(irf);
+  may = target ? mir_global_dirty_states(irf, target, wb->names, wb->count, 0)
+               : NULL;
+  must = may ? mir_global_dirty_states(irf, target, wb->names, wb->count, 1)
+             : NULL;
+  if (must) {
+    wb->through_all = 0;
+    wb->dirty_always = must;
+    for (size_t i = 0; i < n; i++) {
+      wb->through |= may[i] & ~must[i];
+    }
+  } else {
+    free(may);
+    may = NULL;
+  }
+  free(target);
+  return may;
 }
 
 static int mir_emit_global_reloads_except(MirFunction *fn, CodeGenerator *g,
@@ -3494,7 +3638,20 @@ static int mir_emit_global_reloads_except(MirFunction *fn, CodeGenerator *g,
     if (except && wb->all[i] && strcmp(wb->all[i], except) == 0) {
       continue;
     }
-    if (!mir_emit_global_reload_names(fn, g, map, &wb->all[i], 1)) {
+    if (!mir_emit_global_reload_names(fn, g, map, &wb->all[i], 1) ||
+        !mir_emit_global_shadow_sync(fn, map, wb, wb->all[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int mir_emit_global_alias_reloads(MirFunction *fn, CodeGenerator *g,
+                                         MirNameMap *map,
+                                         const MirGlobalWriteback *wb) {
+  for (size_t i = 0; i < wb->at_count; i++) {
+    if (!mir_emit_global_reload_names(fn, g, map, &wb->at[i], 1) ||
+        !mir_emit_global_shadow_sync(fn, map, wb, wb->at[i])) {
       return 0;
     }
   }
@@ -12803,7 +12960,7 @@ static int mir_cache_globals(MirFunction *fn, CodeGenerator *generator,
   for (size_t i = 0; i < ir_function->instruction_count; i++) {
     const IRInstruction *in = &ir_function->instructions[i];
 
-    if (ir_operand_is_symbol(&in->dest) &&
+    if (mir_instruction_assigns_symbol(in) &&
         !mir_global_is_uncached(wb, in->dest.name) &&
         mir_name_is_global_scalar(generator, in->dest.name) &&
         !mir_name_list_has(wb->names, wb->count, in->dest.name) &&
@@ -12985,6 +13142,68 @@ static int mir_choose_uncached_globals(CodeGenerator *generator,
   }
   wb->uncached = set;
   wb->uncached_mask = capacity - 1;
+  return 1;
+}
+
+#define MIR_GLOBAL_SHADOW_MAX 4
+
+static unsigned long long mir_globals_assigned_in_loops(
+    const IRFunction *ir_function, const MirGlobalWriteback *wb,
+    const unsigned long long *weights) {
+  unsigned long long in_loop = 0;
+
+  for (size_t i = 0; i < ir_function->instruction_count; i++) {
+    const IRInstruction *in = &ir_function->instructions[i];
+    if (weights[i] <= 1 || !mir_instruction_assigns_symbol(in)) {
+      continue;
+    }
+    for (size_t j = 0; j < wb->count && j < 64; j++) {
+      if (strcmp(wb->names[j], in->dest.name) == 0) {
+        in_loop |= 1ull << j;
+        break;
+      }
+    }
+  }
+  return in_loop;
+}
+
+static int mir_shadow_loop_assigned_globals(MirFunction *fn,
+                                            CodeGenerator *generator,
+                                            const IRFunction *ir_function,
+                                            MirNameMap *map,
+                                            MirGlobalWriteback *wb) {
+  unsigned long long *weights;
+  unsigned long long wanted;
+  int chosen = 0;
+
+  if (!wb->through || wb->through_all) {
+    return 1;
+  }
+  weights = mir_instruction_loop_weights(ir_function);
+  if (!weights) {
+    return 0;
+  }
+  wanted = wb->through & mir_globals_assigned_in_loops(ir_function, wb, weights);
+  free(weights);
+  for (size_t j = 0; j < wb->count && j < 64; j++) {
+    const CgSym *s = code_generator_lookup_symbol(generator, wb->names[j]);
+    MirVregId v;
+
+    if (chosen >= MIR_GLOBAL_SHADOW_MAX || !((wanted >> j) & 1ull) || !s ||
+        code_generator_binary_resolved_type_float_bits(s->type)) {
+      continue;
+    }
+    v = mir_name_map_get_or_add(map, fn, wb->names[j], 0, MIR_RC_GP, 8);
+    wb->shadow[j] = mir_new_vreg(fn, MIR_RC_GP, 8);
+    if (v == MIR_VREG_NONE || wb->shadow[j] == MIR_VREG_NONE ||
+        !mir_emit1(fn, MIR_MOV, mir_op_vreg(wb->shadow[j]), mir_op_vreg(v),
+                   mir_op_none(), 8, 0, 0)) {
+      return 0;
+    }
+    wb->through &= ~(1ull << j);
+    wb->shadowed |= 1ull << j;
+    chosen++;
+  }
   return 1;
 }
 
@@ -13380,6 +13599,7 @@ static int mir_lower_instructions(MirFunction *fn, CodeGenerator *generator,
         mir_ir_kernel_index_for_op(op) >= 0 || op == IR_OP_INLINE_ASM;
     int mem_op = op == IR_OP_LOAD || op == IR_OP_STORE || kernel_op;
     int store_op = op == IR_OP_STORE || kernel_op;
+    size_t first = i;
 
     fn->cur_ir_index = (int)i;
     if (fold_skip[i]) {
@@ -13394,9 +13614,10 @@ static int mir_lower_instructions(MirFunction *fn, CodeGenerator *generator,
       ok = ok && mir_lower_at(fn, generator, context, map, ir_function, &i,
                               folds, wb, vr_oracle);
     }
+    ok = ok && mir_emit_global_write_through(
+                   fn, generator, map, wb, &ir_function->instructions[first]);
     if (ok && store_op && wb->at_count > 0) {
-      ok = mir_emit_global_reload_names(fn, generator, map, wb->at,
-                                       wb->at_count);
+      ok = mir_emit_global_alias_reloads(fn, generator, map, wb);
     }
     if (fn->has_error) {
       ok = 0;
@@ -13612,8 +13833,12 @@ int code_generator_binary_emit_function_via_mir(
     goto oom;
   }
 
-  dirty_masks = mir_compute_global_dirty_masks(ir_function, wb.names, wb.count);
+  dirty_masks = mir_compute_global_dirty_masks(ir_function, &wb);
   wb.dirty = dirty_masks;
+  if (!mir_shadow_loop_assigned_globals(&fn, generator, ir_function, &map,
+                                        &wb)) {
+    goto oom;
+  }
 
   if (!mir_build_const_pool(&fn, generator, context, ir_function)) {
     goto oom;
@@ -13682,6 +13907,7 @@ int code_generator_binary_emit_function_via_mir(
                           mir_encode_last_spills);
   }
   free(dirty_masks);
+  free((void *)wb.dirty_always);
   free(wb.names);
   free(wb.all);
   free(wb.at);
@@ -13706,6 +13932,7 @@ oom:
                              ir_function->name ? ir_function->name : "?");
   }
   free(dirty_masks);
+  free((void *)wb.dirty_always);
   free(wb.names);
   free(wb.all);
   free(wb.at);
