@@ -27,8 +27,6 @@
 #define DIAG_COLUMNS_FALLBACK 90u
 
 #ifdef _WIN32
-static UINT g_saved_output_cp = 0;
-static int g_output_depth = 0;
 
 static int diag_stderr_is_console(void) {
   HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
@@ -53,24 +51,9 @@ static void diag_enable_vt(void) {
 }
 #endif
 
-void diag_style_output_begin(void) {
-#ifdef _WIN32
-  g_output_depth++;
-#endif
-}
+void diag_style_output_begin(void) {}
 
-void diag_style_output_end(void) {
-#ifdef _WIN32
-  if (g_output_depth > 0 && --g_output_depth > 0) {
-    return;
-  }
-  if (g_saved_output_cp) {
-    fflush(stderr);
-    SetConsoleOutputCP(g_saved_output_cp);
-    g_saved_output_cp = 0;
-  }
-#endif
-}
+void diag_style_output_end(void) {}
 
 static int diag_stderr_is_tty(void) {
   int fd = fileno(DIAG_STREAM);
@@ -154,10 +137,8 @@ int diag_style_unicode(void) {
   if (GetConsoleOutputCP() == CP_UTF8) {
     cached = 1;
   } else if (diag_stderr_is_console()) {
-    UINT previous = GetConsoleOutputCP();
     fflush(stderr);
     if (SetConsoleOutputCP(CP_UTF8)) {
-      g_saved_output_cp = previous;
       cached = 1;
     } else {
       cached = 0;
