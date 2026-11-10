@@ -25,5 +25,6 @@ fn main() -> int32 {
   var hi = 0xF0 & byte;
   var short: int16 = 300;
   println("{low} {hi} {show((short - 100) * (f * byte))} {show((short - 100) * wide)} {show(0xF0 & byte)}");
+  println("{show(-(7 + short))} {show(~(short * short))} {show(-(f * short))}");
   return 0;
 }

@@ -3679,6 +3679,14 @@ static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
 static char *mono_argument_type_of(MonoContext *ctx, ASTNode *expr,
                                    MonoVarEnv *env) {
   char *type = mono_static_type_of(ctx, expr, env);
+  if (!type && expr && expr->type == AST_UNARY_EXPRESSION && expr->data) {
+    UnaryExpression *un = (UnaryExpression *)expr->data;
+    if (un->operator && un->operand &&
+        (strcmp(un->operator, "-") == 0 || strcmp(un->operator, "~") == 0 ||
+         strcmp(un->operator, "+") == 0)) {
+      return mono_argument_type_of(ctx, un->operand, env);
+    }
+  }
   BinaryExpression *bin = !type && expr && expr->type == AST_BINARY_EXPRESSION
                               ? (BinaryExpression *)expr->data
                               : NULL;
