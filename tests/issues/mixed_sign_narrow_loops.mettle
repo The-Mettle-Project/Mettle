@@ -1,0 +1,21 @@
+import "std/io";
+@noinline fn k1(a: uint8*, b: int8*, out: int32*, n: int64) { for i: int64 in 0..n { out[i] = a[i] ^ b[i]; } }
+@noinline fn k2(a: uint16*, b: int16*, out: int32*, n: int64) { for i: int64 in 0..n { out[i] = (int32)(a[i] | b[i]); } }
+@noinline fn k3(a: uint8*, b: int8*, n: int64) -> int32 { var s: int32 = 0; for i: int64 in 0..n { s = s + (a[i] & b[i]); } return s; }
+@noinline fn k4(a: uint8*, b: int8*, n: int64) -> int32 { var c: int32 = 0; for i: int64 in 0..n { if (a[i] == b[i]) { c = c + 1; } } return c; }
+@noinline fn k5(a: int16*, sh: uint8, out: int16*, n: int64) { for i: int64 in 0..n { out[i] = a[i] >> sh; } }
+@noinline fn k6(a: uint8*, b: int8*, n: int64) -> int32 { var c: int32 = 0; for i: int64 in 0..n { if (a[i] >= b[i]) { c = c + 1; } } return c; }
+fn main() -> int32 {
+  var a: uint8[100]; var b: int8[100]; var a2: uint16[100]; var b2: int16[100]; var o: int32[100]; var o16: int16[100];
+  for i: int64 in 0..100 { a[i] = (uint8)(i * 37 + 11); b[i] = (int8)(i * 53 - 90); a2[i] = (uint16)(i * 7919 + 5); b2[i] = (int16)(i * 3001 - 20000); }
+  b[3] = -1; a[3] = 255;
+  k1(&a[0], &b[0], &o[0], 100);
+  var h: int64 = 0;
+  for i: int64 in 0..100 { h = h * 31 + (int64)o[i]; }
+  k2(&a2[0], &b2[0], &o[0], 100);
+  for i: int64 in 0..100 { h = h * 31 + (int64)o[i]; }
+  k5(&b2[0], (uint8)3, &o16[0], 100);
+  for i: int64 in 0..100 { h = h * 31 + (int64)o16[i]; }
+  println("{h} {k3(&a[0], &b[0], 100)} {k4(&a[0], &b[0], 100)} {k6(&a[0], &b[0], 100)}");
+  return 0;
+}

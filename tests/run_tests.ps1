@@ -22445,6 +22445,8 @@ $issueRegressions = @(
   @{ Name = "mixed_sign_narrow_compare"; Entry = "tests/issues/mixed_sign_narrow_compare.mettle"; Args = @(); Expect = @("narrow compare bad 0") },
   @{ Name = "mixed_sign_narrow_compare_release"; Entry = "tests/issues/mixed_sign_narrow_compare.mettle"; Args = @("--release"); Expect = @("narrow compare bad 0") },
   @{ Name = "mixed_sign_narrow_compare_interp"; Command = @("test", "tests/issues/mixed_sign_narrow_compare.mettle"); Refuse = @("failed"); Expect = @("1 passed") },
+  @{ Name = "mixed_sign_narrow_loops"; Entry = "tests/issues/mixed_sign_narrow_loops.mettle"; Args = @(); Expect = @("-424593443726127145 6177 1 51") },
+  @{ Name = "mixed_sign_narrow_loops_release"; Entry = "tests/issues/mixed_sign_narrow_loops.mettle"; Args = @("--release"); Expect = @("-424593443726127145 6177 1 51") },
   @{ Name = "signed_shift_unsigned_count"; Entry = "tests/issues/signed_shift_unsigned_count.mettle"; Args = @(); Expect = @("shift bad 0") },
   @{ Name = "signed_shift_unsigned_count_release"; Entry = "tests/issues/signed_shift_unsigned_count.mettle"; Args = @("--release"); Expect = @("shift bad 0") },
   @{ Name = "signed_shift_unsigned_count_interp"; Command = @("test", "tests/issues/signed_shift_unsigned_count.mettle"); Refuse = @("failed"); Expect = @("1 passed") },
