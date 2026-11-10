@@ -2765,6 +2765,18 @@ static int ir_binary_operation_is_unsigned(IRLoweringContext *context,
          (right->kind == IR_OPERAND_INT && right->int_value >= 0);
 }
 
+static int ir_narrow_name_bits(const char *name) {
+  return atoi(name + (name[0] == 'u' ? 4 : 3));
+}
+
+static int ir_side_leaves_result_range(const char *side, const char *result) {
+  if (!side || (side[0] == 'u') == (result[0] == 'u')) {
+    return 0;
+  }
+  return side[0] != 'u' ||
+         ir_narrow_name_bits(side) >= ir_narrow_name_bits(result);
+}
+
 static int ir_mixed_sign_divide_operands(IRLoweringContext *context,
                                          IRFunction *function,
                                          ASTNode *expression,
@@ -2782,14 +2794,24 @@ static int ir_mixed_sign_divide_operands(IRLoweringContext *context,
     return 1;
   }
   int unsigned_result = name[0] == 'u';
-  int bits = atoi(name + (unsigned_result ? 4 : 3));
+  int bits = ir_narrow_name_bits(name);
   ASTNode *sides[2] = {binary->left, binary->right};
   IROperand *operands[2] = {left, right};
   int differs[2] = {0, 0};
+  int unsigned_side[2] = {0, 0};
+  int maybe_negative = 0;
   for (int i = 0; i < 2; i++) {
     const char *side = ir_narrow_integer_result_type(
         ir_infer_expression_type(context, sides[i]), "+");
-    differs[i] = side && (side[0] == 'u') != unsigned_result;
+    differs[i] = ir_side_leaves_result_range(side, name);
+    unsigned_side[i] = side && side[0] == 'u';
+    maybe_negative = maybe_negative ||
+                     (side && side[0] != 'u' &&
+                      (operands[i]->kind != IR_OPERAND_INT ||
+                       operands[i]->int_value < 0));
+  }
+  for (int i = 0; i < 2 && !unsigned_result && maybe_negative; i++) {
+    differs[i] = differs[i] || unsigned_side[i];
   }
   if (!differs[0] && !differs[1]) {
     return 1;
@@ -2849,9 +2871,10 @@ static const char *ir_mixed_sign_bits_narrow(IRLoweringContext *context,
     if (!sides[i] || sides[i]->type == AST_NUMBER_LITERAL) {
       continue;
     }
-    const char *side = ir_narrow_integer_result_type(
-        ir_infer_expression_type(context, sides[i]), "+");
-    if (side && (side[0] == 'u') != (narrow[0] == 'u')) {
+    if (ir_side_leaves_result_range(
+            ir_narrow_integer_result_type(
+                ir_infer_expression_type(context, sides[i]), "+"),
+            narrow)) {
       return narrow;
     }
   }

@@ -21,6 +21,10 @@ fn check() -> int32 {
   if (ui / si != 0 || ui % si != 4000000000 || si / ui != 0 || si % ui != -7) { bad = bad | 32; }
   var low: int16 = -32768;
   if (low / big != -32768) { bad = bad | 64; }
+  var small: uint8 = 9;
+  var minus: int32 = -3;
+  var seven: int16 = -7;
+  if (a / minus != -66 || a % minus != 2 || small / seven != -1 || seven / small != 0) { bad = bad | 128; }
   return bad;
 }
 
