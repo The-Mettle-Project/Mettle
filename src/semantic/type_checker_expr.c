@@ -5045,6 +5045,21 @@ static int binary_literal_follows(TypeChecker *checker, ASTNode *literal,
                                          value);
 }
 
+static Type *binary_bits_type(TypeChecker *checker, BinaryExpression *binop,
+                              Type *left_type, Type *right_type) {
+  const char *op = binop->operator;
+  if (op[0] != '<' && op[0] != '>' && !left_type->refined_base &&
+      !right_type->refined_base) {
+    if (binary_literal_follows(checker, binop->right, left_type)) {
+      return left_type;
+    }
+    if (binary_literal_follows(checker, binop->left, right_type)) {
+      return right_type;
+    }
+  }
+  return type_checker_promote_types(checker, left_type, right_type, op);
+}
+
 static int binary_operand_types(TypeChecker *checker, BinaryExpression *binop,
                                 Type **left_type, Type **right_type) {
   *left_type = type_checker_infer_type(checker, binop->left);
@@ -5193,16 +5208,7 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
                                         "integer type", right_type->name);
       return NULL;
     }
-    if (op[0] != '<' && op[0] != '>' && !left_type->refined_base &&
-        !right_type->refined_base) {
-      if (binary_literal_follows(checker, binop->right, left_type)) {
-        return left_type;
-      }
-      if (binary_literal_follows(checker, binop->left, right_type)) {
-        return right_type;
-      }
-    }
-    return type_checker_promote_types(checker, left_type, right_type, op);
+    return binary_bits_type(checker, binop, left_type, right_type);
   }
 
   if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0 || strcmp(op, "<") == 0 ||
