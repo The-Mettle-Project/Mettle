@@ -22449,6 +22449,7 @@ $issueRegressions = @(
   @{ Name = "mixed_sign_narrow_loops_release"; Entry = "tests/issues/mixed_sign_narrow_loops.mettle"; Args = @("--release"); Expect = @("-424593443726127145 6177 1 51") },
   @{ Name = "inclusive_range_at_type_max"; Entry = "tests/issues/inclusive_range_at_type_max.mettle"; Args = @(); Expect = @("inclusive 256 8 8 52 0 256 10 1263") },
   @{ Name = "inclusive_range_at_type_max_release"; Entry = "tests/issues/inclusive_range_at_type_max.mettle"; Args = @("--release"); Expect = @("inclusive 256 8 8 52 0 256 10 1263") },
+  @{ Name = "err_range_end_past_type"; Command = @("--build", "tests/issues/err_range_end_past_type.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Integer 300 is out of range for 'uint8'") },
   @{ Name = "match_arm_widths"; Entry = "tests/issues/match_arm_widths.mettle"; Args = @(); Expect = @("-5 7 5000000000") },
   @{ Name = "err_match_arm_mixed"; Command = @("--build", "tests/issues/err_match_arm_mixed.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("match arms have incompatible types: 'int16' vs 'uint16'") },
   @{ Name = "err_match_arm_narrowing"; Command = @("--build", "tests/issues/err_match_arm_narrowing.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Narrowing conversion from 'int64' to 'int16' needs a cast") },

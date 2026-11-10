@@ -1,0 +1,6 @@
+import "std/io";
+fn main() -> int32 {
+  var c: int32 = 0;
+  for i: uint8 in 0..300 { c = c + 1; if (c > 1000) { break; } }
+  return c;
+}

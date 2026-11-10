@@ -664,6 +664,41 @@ static int type_checker_check_loop_uniformity(TypeChecker *checker,
   return 1;
 }
 
+static int type_checker_range_end_fits(TypeChecker *checker,
+                                       ForStatement *for_stmt) {
+  ASTNode *condition = for_stmt->condition;
+  BinaryExpression *range = condition &&
+                                    condition->type == AST_BINARY_EXPRESSION
+                                ? (BinaryExpression *)condition->data
+                                : NULL;
+  long long value = 0;
+  long long low = 0;
+  unsigned long long high = 0;
+  if (!range || !range->operator || !range->left || !range->right ||
+      (strcmp(range->operator, "<") != 0 &&
+       strcmp(range->operator, "<=") != 0) ||
+      range->left->type != AST_IDENTIFIER || !for_stmt->initializer ||
+      for_stmt->initializer->type != AST_VAR_DECLARATION ||
+      strcmp(((Identifier *)range->left->data)->name,
+             ((VarDeclaration *)for_stmt->initializer->data)->name) != 0) {
+    return 1;
+  }
+  Type *counter = type_checker_infer_type(checker, range->left);
+  if (!counter || !type_checker_is_integer_type(counter) ||
+      counter->kind == TYPE_ENUM ||
+      !type_checker_integer_bounds(counter, &low, &high) ||
+      !type_checker_eval_integer_constant_with_checker(checker, range->right,
+                                                       &value) ||
+      value < 0 || (unsigned long long)value <= high) {
+    return 1;
+  }
+  type_checker_report_assign_mismatch(checker, range->right,
+                                      range->right->location, counter,
+                                      type_checker_infer_type(checker,
+                                                              range->right));
+  return 0;
+}
+
 static int type_checker_narrow_loop_step(TypeChecker *checker,
                                          ForStatement *for_stmt) {
   VarDeclaration *counter_decl;
@@ -791,7 +826,8 @@ int type_checker_check_for_statement(TypeChecker *checker,
     }
   }
 
-  if (!type_checker_narrow_loop_step(checker, for_stmt)) {
+  if (!type_checker_narrow_loop_step(checker, for_stmt) ||
+      !type_checker_range_end_fits(checker, for_stmt)) {
     free(post_init_snapshot);
     type_checker_init_tracker_exit_scope(checker);
     symbol_table_exit_scope(checker->symbol_table);
