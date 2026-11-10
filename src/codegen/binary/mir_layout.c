@@ -9,6 +9,7 @@
 #define MIR_LAYOUT_FREQ_SWEEPS 24
 #define MIR_LAYOUT_FREQ_CAP 1e12
 #define MIR_LAYOUT_COLD_RATIO 0.002
+#define MIR_LAYOUT_HOT_FALL_SHARE 0.75
 
 typedef struct {
   int from;
@@ -31,6 +32,7 @@ typedef struct {
   int *other_end;
   int *order;
   const char **labels;
+  unsigned char *hot_fall;
 } MirLayout;
 
 static const MirInst *mir_block_last(const MirCfg *cfg, int b) {
@@ -395,6 +397,7 @@ static int mir_layout_emit_block(MirLayout *l, MirFunction *fn, int b, int next,
     label.dst = mir_op_label(l->labels[b]);
     label.width = 8;
     label.ir_index = fn->insns[blk->start].ir_index;
+    label.hot_fall = l->hot_fall[b];
     if (!mir_emit_inst(out, count, capacity, &label)) {
       return 0;
     }
@@ -475,8 +478,10 @@ static int mir_layout_allocate(MirLayout *l, size_t n) {
   l->other_end = (int *)malloc(n * sizeof(int));
   l->order = (int *)malloc(n * sizeof(int));
   l->labels = (const char **)calloc(n, sizeof(const char *));
+  l->hot_fall = (unsigned char *)calloc(n, 1);
   return l->freq && l->taken && l->cold && l->returns && l->calls &&
-         l->chain_next && l->chain_prev && l->other_end && l->order && l->labels;
+         l->chain_next && l->chain_prev && l->other_end && l->order &&
+         l->labels && l->hot_fall;
 }
 
 static void mir_layout_free(MirLayout *l) {
@@ -491,6 +496,34 @@ static void mir_layout_free(MirLayout *l) {
   free(l->other_end);
   free(l->order);
   free((void *)l->labels);
+  free(l->hot_fall);
+}
+
+static double mir_layout_fall_weight(const MirLayout *l, int from, int to) {
+  const MirCfg *cfg = l->cfg;
+  int n = mir_succ_edges(cfg, from);
+  if (mir_block_last(cfg, from)->op == MIR_JMP_TABLE) {
+    return 0.0;
+  }
+  for (int e = cfg->blocks[from].succ_head; e >= 0; e = cfg->edge_next[e]) {
+    if (cfg->edge_to[e] == to) {
+      return l->freq[from] * mir_edge_probability(l, from, to, n);
+    }
+  }
+  return 0.0;
+}
+
+static void mir_layout_mark_hot_falls(MirLayout *l, MirFunction *fn) {
+  const MirCfg *cfg = l->cfg;
+  for (size_t k = 1; k < cfg->block_count; k++) {
+    int b = l->order[k];
+    MirInst *first = &fn->insns[cfg->blocks[b].start];
+    double into = mir_layout_fall_weight(l, l->order[k - 1], b);
+    l->hot_fall[b] = into > l->freq[b] * MIR_LAYOUT_HOT_FALL_SHARE;
+    if (first->op == MIR_LABEL) {
+      first->hot_fall = l->hot_fall[b];
+    }
+  }
 }
 
 static int mir_layout_may_move(const MirFunction *fn) {
@@ -530,6 +563,9 @@ void mir_place_blocks(MirFunction *fn) {
   if (ok) {
     mir_layout_build_chains(&l);
     ok = mir_layout_order_chains(&l);
+  }
+  if (ok) {
+    mir_layout_mark_hot_falls(&l, fn);
   }
   if (ok && !mir_layout_order_is_identity(&l)) {
     ok = mir_layout_rewrite(&l, fn);

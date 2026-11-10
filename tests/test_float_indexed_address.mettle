@@ -1,0 +1,104 @@
+import "std/io";
+import "std/mem";
+
+struct Point {
+  x: float32;
+  y: float32;
+}
+
+@noinline fn gather(values: float32*, ids: int64*, n: int64) -> float32 {
+  var total: float32 = 0.0;
+  for i: int64 in 0..n {
+    total = total + values[ids[i]];
+  }
+  return total;
+}
+
+@noinline fn gather_wide(values: float64*, ids: int64*, n: int64) -> float64 {
+  var total: float64 = 0.0;
+  for i: int64 in 0..n {
+    total = total + values[ids[i]];
+  }
+  return total;
+}
+
+@noinline fn scatter(values: float32*, ids: int64*, n: int64, step: float32) {
+  for i: int64 in 0..n {
+    values[ids[i]] = (float32)i * step;
+  }
+}
+
+@noinline fn scatter_wide(values: float64*, ids: int64*, n: int64, step: float64) {
+  for i: int64 in 0..n {
+    values[ids[i]] = (float64)i * step;
+  }
+}
+
+@noinline fn nearest(points: Point*, ids: int64*, n: int64, at: Point*) -> int64 {
+  var best: int64 = -1;
+  var best_distance: float32 = 1000000.0;
+  for i: int64 in 0..n {
+    var p: Point* = &points[ids[i]];
+    var dx: float32 = at->x - p->x;
+    var dy: float32 = at->y - p->y;
+    var d: float32 = dx * dx + dy * dy;
+    if (d < best_distance) {
+      best_distance = d;
+      best = ids[i];
+    }
+  }
+  return best;
+}
+
+@noinline fn many_live(values: float32*, ids: int64*, n: int64, a: int64, b: int64,
+                       c: int64, d: int64, e: int64, f: int64) -> float32 {
+  var total: float32 = 0.0;
+  var g: int64 = a + b;
+  var h: int64 = c + d;
+  var k: int64 = e + f;
+  var m: int64 = a * c;
+  var p: int64 = b * d;
+  var q: int64 = e * a;
+  for i: int64 in 0..n {
+    total = total + values[ids[i]];
+    g = g + h + i;
+    h = h ^ k;
+    k = k + m;
+    m = m + p;
+    p = p ^ q;
+    q = q + g + a + b + c + d + e + f;
+  }
+  return total + (float32)((g + h + k + m + p + q) & 15);
+}
+
+fn main() -> int32 {
+  var n: int64 = 64;
+  var singles: float32[] = new float32[n];
+  var doubles: float64[] = new float64[n];
+  var points: Point[] = new Point[n];
+  var ids: int64[] = new int64[n];
+  for i: int64 in 0..n {
+    ids[i] = (i * 37 + 11) % n;
+    singles[i] = (float32)i * 0.5;
+    doubles[i] = (float64)i * 0.25;
+    points[i].x = (float32)(i % 8);
+    points[i].y = (float32)(i / 8);
+  }
+
+  var a: float32 = gather(singles.data, ids.data, n);
+  var b: float64 = gather_wide(doubles.data, ids.data, n);
+  scatter(singles.data, ids.data, n, 2.0);
+  scatter_wide(doubles.data, ids.data, n, 3.0);
+  var c: float32 = singles[ids[5]];
+  var d: float64 = doubles[ids[7]];
+  var at: Point = { x: 5.2, y: 3.9 };
+  var e: int64 = nearest(points.data, ids.data, n, &at);
+  var f: float32 = many_live(singles.data, ids.data, n, 1, 2, 3, 4, 5, 6);
+
+  println("float_indexed: {a} {b} {c} {d} {e} {f}");
+  free(singles.data);
+  free(doubles.data);
+  free(points.data);
+  free(ids.data);
+  return 0;
+}

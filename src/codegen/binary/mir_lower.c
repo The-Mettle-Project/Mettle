@@ -9997,6 +9997,163 @@ static int mir_scale_every_index_use(MirFunction *fn, MirVregId idx, int uses,
   return 1;
 }
 
+static MirOperand *mir_inst_mem_based_on(MirInst *in, MirVregId addr) {
+  MirOperand *ops[3] = {&in->a, &in->b, &in->dst};
+  for (int k = 0; k < 3; k++) {
+    if (ops[k]->kind == MIR_OPK_MEM && ops[k]->mem.base == addr) {
+      return ops[k];
+    }
+  }
+  return NULL;
+}
+
+static int mir_inst_takes_indexed_mem(MirInst *in, MirVregId addr) {
+  MirOperand *mem = mir_inst_mem_based_on(in, addr);
+  return mem && (in->op == MIR_MOV || in->op == MIR_LEA) &&
+         mir_inst_read_count(in, addr) == 1 &&
+         mem->mem.index == MIR_VREG_NONE && !mem->mem.phys_base_valid &&
+         !mem->mem.frame_home_valid;
+}
+
+static int mir_inst_ends_straight_line(const MirInst *in) {
+  return in->op == MIR_LABEL || in->op == MIR_RET || in->op == MIR_JMP_TABLE ||
+         in->op == MIR_INLINE_ASM || mir_op_has(in->op, MIR_OPF_LABEL_BRANCH);
+}
+
+static int mir_inst_writes_vreg(const MirInst *in, MirVregId v) {
+  return in->dst.kind == MIR_OPK_VREG && in->dst.vreg == v;
+}
+
+static size_t mir_scaled_term_def(const MirFunction *fn, size_t add_at,
+                                  MirVregId term) {
+  for (size_t i = add_at; i > 0; i--) {
+    const MirInst *in = &fn->insns[i - 1];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    if (mir_inst_ends_straight_line(in)) {
+      break;
+    }
+    if (!mir_inst_writes_vreg(in, term)) {
+      continue;
+    }
+    if (in->op == MIR_SHL && in->width == 8 && in->a.kind == MIR_OPK_VREG &&
+        in->a.vreg != term && in->b.kind == MIR_OPK_IMM && in->b.imm >= 1 &&
+        in->b.imm <= 3) {
+      return i - 1;
+    }
+    break;
+  }
+  return (size_t)-1;
+}
+
+static int mir_vreg_written_between(const MirFunction *fn, size_t from,
+                                    size_t to, MirVregId v) {
+  for (size_t i = from; i < to; i++) {
+    if (fn->insns[i].op != MIR_NOP && mir_inst_writes_vreg(&fn->insns[i], v)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static size_t mir_indexed_address_last_use(MirFunction *fn, size_t add_at,
+                                           MirVregId base, MirVregId index,
+                                           int uses) {
+  MirVregId addr = fn->insns[add_at].dst.vreg;
+  int found = 0;
+  for (size_t i = add_at + 1; i < fn->insn_count; i++) {
+    MirInst *in = &fn->insns[i];
+    if (in->op == MIR_NOP) {
+      continue;
+    }
+    if (mir_inst_ends_straight_line(in)) {
+      break;
+    }
+    if (mir_inst_reads_vreg(in, addr)) {
+      if (!mir_inst_takes_indexed_mem(in, addr)) {
+        break;
+      }
+      if (++found == uses) {
+        return i;
+      }
+    }
+    if (mir_inst_writes_vreg(in, base) || mir_inst_writes_vreg(in, index)) {
+      break;
+    }
+  }
+  return (size_t)-1;
+}
+
+static void mir_index_every_use(MirFunction *fn, size_t add_at, size_t last,
+                                MirVregId base, MirVregId index, int scale) {
+  MirVregId addr = fn->insns[add_at].dst.vreg;
+  for (size_t i = add_at + 1; i <= last; i++) {
+    MirOperand *mem =
+        fn->insns[i].op == MIR_NOP ? NULL : mir_inst_mem_based_on(&fn->insns[i], addr);
+    if (mem) {
+      mem->mem.base = base;
+      mem->mem.index = index;
+      mem->mem.scale = scale;
+    }
+  }
+}
+
+static void mir_fold_indexed_address_at(MirFunction *fn, size_t at,
+                                        const int *uses, const int *defs) {
+  MirInst *add = &fn->insns[at];
+  if (add->op != MIR_ADD || add->is_float || add->width != 8 ||
+      add->dst.kind != MIR_OPK_VREG || add->a.kind != MIR_OPK_VREG ||
+      add->b.kind != MIR_OPK_VREG || defs[add->dst.vreg] != 1 ||
+      uses[add->dst.vreg] < 1 || fn->vregs[add->dst.vreg].address_taken ||
+      add->dst.vreg == add->a.vreg || add->dst.vreg == add->b.vreg) {
+    return;
+  }
+  for (int side = 0; side < 2; side++) {
+    MirVregId term = side ? add->a.vreg : add->b.vreg;
+    MirVregId base = side ? add->b.vreg : add->a.vreg;
+    size_t shl_at;
+    size_t last;
+    MirVregId index;
+    if (term == base || defs[term] != 1 || uses[term] != 1) {
+      continue;
+    }
+    shl_at = mir_scaled_term_def(fn, at, term);
+    if (shl_at == (size_t)-1) {
+      continue;
+    }
+    index = fn->insns[shl_at].a.vreg;
+    if (index == add->dst.vreg ||
+        mir_vreg_written_between(fn, shl_at + 1, at, index)) {
+      continue;
+    }
+    last = mir_indexed_address_last_use(fn, at, base, index,
+                                        uses[add->dst.vreg]);
+    if (last == (size_t)-1) {
+      continue;
+    }
+    mir_index_every_use(fn, at, last, base, index,
+                        1 << (int)fn->insns[shl_at].b.imm);
+    fn->insns[shl_at].op = MIR_NOP;
+    add->op = MIR_NOP;
+    return;
+  }
+}
+
+static void mir_fold_indexed_address(MirFunction *fn) {
+  int *uses = NULL;
+  int *defs = NULL;
+  if (!fn || fn->insn_count < 3 || fn->vreg_count == 0 ||
+      !mir_count_vreg_uses_defs(fn, &uses, &defs)) {
+    return;
+  }
+  for (size_t i = 1; i < fn->insn_count; i++) {
+    mir_fold_indexed_address_at(fn, i, uses, defs);
+  }
+  free(uses);
+  free(defs);
+}
+
 static void mir_fold_index_scale(MirFunction *fn) {
   int *uses = NULL;
   int *defs = NULL;
@@ -13694,6 +13851,7 @@ static const MirPass MIR_PASSES[] = {
     {"mir_fold_address_offsets", 1, mir_fold_address_offsets},
     {"mir_fold_shared_address", 1, mir_fold_shared_address},
     {"mir_fold_index_scale", 1, mir_fold_index_scale},
+    {"mir_fold_indexed_address", 1, mir_fold_indexed_address},
     {"mir_cse_loads", 1, mir_cse_loads},
     {"mir_slp_pair_f64", 1, mir_slp_pair_f64},
     {"mir_build_jump_tables", 1, mir_build_jump_tables},

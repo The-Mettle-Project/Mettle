@@ -1392,16 +1392,77 @@ static int mir_emit_store_sib(BinaryCodeBuffer *code, int width,
 }
 
 
+static int mir_indexed_mem_regs(MirFunction *fn, const MirInst *in,
+                                const MirMem *mem, BinaryGpRegister *base,
+                                BinaryGpRegister *index, int *disp) {
+  MirOperand iop = mir_op_vreg(mem->index);
+  BinaryGpRegister taken[4];
+  BinaryGpRegister base_scratch;
+  BinaryGpRegister index_scratch;
+  size_t at = (size_t)(in - fn->insns);
+  int tn = 0;
+  int ok = 0;
+  mir_note_mem_base(fn, mem, taken, &tn);
+  mir_note_fixed_reg(fn, &iop, taken, &tn);
+  if (!mir_pick_scratch(fn, at, SCRATCH_B, taken, tn, NULL, 0, &base_scratch)) {
+    return enc_err(fn, "no free scratch register for an indexed float base");
+  }
+  *base = mir_mem_base_reg(fn, mem, base_scratch, disp, &ok);
+  if (!ok) {
+    return 0;
+  }
+  taken[tn++] = *base;
+  if (!mir_pick_scratch(fn, at, BINARY_GP_RDX, taken, tn, NULL, 0,
+                        &index_scratch)) {
+    return enc_err(fn, "no free scratch register for an indexed float index");
+  }
+  *index = value_reg(fn, &iop, index_scratch, &ok);
+  return ok;
+}
+
+static int encode_mov_float_indexed(MirFunction *fn, const MirInst *in,
+                                    unsigned char prefix) {
+  BinaryFunctionContext *ctx = fn->context;
+  int load = in->a.kind == MIR_OPK_MEM;
+  const MirMem *mem = load ? &in->a.mem : &in->dst.mem;
+  BinaryGpRegister base;
+  BinaryGpRegister index;
+  BinaryXmmRegister x = FSCRATCH_A;
+  int disp = 0;
+  int direct = 1;
+  int ok = 1;
+  if (!mir_indexed_mem_regs(fn, in, mem, &base, &index, &disp)) {
+    return 0;
+  }
+  if (load) {
+    direct = dst_is_xmm_reg(fn, &in->dst, &x);
+    x = direct ? x : FSCRATCH_A;
+  } else {
+    x = xmm_value(fn, &in->a, FSCRATCH_A, in->width, &ok);
+  }
+  if (!ok) {
+    return 0;
+  }
+  if (!binary_code_buffer_append_u8(&ctx->code, prefix) ||
+      !binary_emit_memory_access_sib(&ctx->code, 0, 0, 0x0F, 1,
+                                     load ? 0x10 : 0x11, (BinaryGpRegister)x,
+                                     base, index, mem->scale, disp)) {
+    return enc_err(fn, "out of memory in an indexed float move");
+  }
+  return load && !direct ? xmm_store(fn, &in->dst, FSCRATCH_A, in->width) : 1;
+}
+
 static int encode_mov_float(MirFunction *fn, const MirInst *in) {
   BinaryFunctionContext *ctx = fn->context;
 
   int ok;
   int w = in->width;
   unsigned char prefix = (w == 16) ? 0x66 : ((w == 4) ? 0xF3 : 0xF2);
+  if ((in->a.kind == MIR_OPK_MEM && in->a.mem.index != MIR_VREG_NONE) ||
+      (in->dst.kind == MIR_OPK_MEM && in->dst.mem.index != MIR_VREG_NONE)) {
+    return encode_mov_float_indexed(fn, in, prefix);
+  }
   if (in->a.kind == MIR_OPK_MEM) {
-    if (in->a.mem.index != MIR_VREG_NONE) {
-      return enc_err(fn, "scaled index in a float load");
-    }
     int base_disp;
     BinaryGpRegister addr =
         mir_mem_base_reg(fn, &in->a.mem, SCRATCH_B, &base_disp, &ok);
@@ -1420,9 +1481,6 @@ static int encode_mov_float(MirFunction *fn, const MirInst *in) {
     return direct ? 1 : xmm_store(fn, &in->dst, FSCRATCH_A, w);
   }
   if (in->dst.kind == MIR_OPK_MEM) {
-    if (in->dst.mem.index != MIR_VREG_NONE) {
-      return enc_err(fn, "scaled index in a float store");
-    }
     int base_disp;
     BinaryGpRegister addr =
         mir_mem_base_reg(fn, &in->dst.mem, SCRATCH_B, &base_disp, &ok);
@@ -4595,6 +4653,10 @@ static char *mir_scan_loop_alignment(const MirFunction *fn) {
   }
   for (size_t i = 0; i < fn->insn_count; i++) {
     size_t prev;
+    if (fn->insns[i].op == MIR_LABEL && fn->insns[i].hot_fall) {
+      align_label[i] = 0;
+      continue;
+    }
     if (fn->insns[i].op != MIR_LABEL || align_label[i]) {
       continue;
     }

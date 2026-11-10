@@ -197,6 +197,7 @@ typedef struct {
   int is_float;
   int is_unsigned;
   unsigned char cc;
+  unsigned char hot_fall;
   int ir_index;
   const void *aux;
   int preserves_rax;
