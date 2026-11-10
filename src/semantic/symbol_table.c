@@ -364,6 +364,18 @@ int symbol_table_declare(SymbolTable *table, Symbol *symbol) {
   return 1;
 }
 
+Symbol *symbol_table_peek(SymbolTable *table, const char *name) {
+  Scope *scope = table && name ? table->current_scope : NULL;
+  while (scope) {
+    Symbol *found = scope_lookup_symbol(scope, name);
+    if (found) {
+      return found;
+    }
+    scope = scope->parent;
+  }
+  return NULL;
+}
+
 Symbol *symbol_table_lookup(SymbolTable *table, const char *name) {
   if (!table || !name) {
     return NULL;

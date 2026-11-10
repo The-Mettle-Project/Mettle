@@ -1,0 +1,62 @@
+import "std/io";
+import "std/process";
+
+struct Span {
+  lo: int32;
+  hi: int32;
+}
+
+struct Node {
+  len: int32;
+  next: Node*;
+}
+
+type Percent = int32 where value >= 0 && value <= 100;
+type Ordered = Span where value.lo <= value.hi;
+type Live = Node* where value != 0;
+
+fn is_percent(n: int32) -> bool { return n >= 0 && n <= 100; }
+
+fn Span_ordered(s: Span) -> bool { return s.lo <= s.hi; }
+fn Node_live__ptr(p: Node*) -> bool { return p != 0; }
+
+fn width(o: Ordered) -> int32 { return o.hi - o.lo; }
+fn length_of(p: Live) -> int32 { return p->len; }
+
+fn by_expression(a: int32, b: int32) -> int32 {
+  if (is_percent(a + b)) {
+    var p: Percent = a + b;
+    return p;
+  }
+  return -1;
+}
+
+fn by_field(s: Span) -> int32 {
+  if (is_percent(s.lo)) {
+    var p: Percent = s.lo;
+    return p;
+  }
+  return -1;
+}
+
+fn by_method(s: Span) -> int32 {
+  if (s.ordered()) {
+    return width((Ordered)s);
+  }
+  return -1;
+}
+
+fn by_pointer_method(p: Node*) -> int32 {
+  if (p->live()) {
+    return length_of((Live)p);
+  }
+  return -1;
+}
+
+fn main() -> int32 {
+  var s: Span = { lo: 20, hi: 31 };
+  var node = new Node;
+  node->len = 6;
+  println("{by_expression(30, 12)} {by_expression(90, 90)} {by_field(s)} {by_method(s)} {by_pointer_method(node)}");
+  return 0;
+}

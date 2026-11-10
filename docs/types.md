@@ -824,6 +824,43 @@ declared after the caller, and it may itself rest on a verdict from a third
 function. A parameter the callee writes, or takes the address of, exports
 nothing.
 
+The same export carries the tests themselves, for any parameter type. Each
+returning path keeps the comparisons and calls that were still true when it
+returned, and the caller reads them with its arguments standing for the
+parameters:
+
+```mettle
+type Live = Node* where value != 0;
+type Long = Node* where value != 0 && value->len > 4;
+type Ordered = Span where value.lo <= value.hi;
+type Index = int64 where value >= 0 && value < buf.length;
+
+fn is_long(p: Node*) -> bool { return p != 0 && p->len > 4; }
+fn Span_ordered(s: Span) -> bool { return s.lo <= s.hi; }
+fn in_bounds(buf: int32[], i: int64) -> bool {
+  if (i < 0) { return false; }
+  return i < buf.length;
+}
+fn between(n: int32, lo: int32, hi: int32) -> bool { return n >= lo && n <= hi; }
+```
+
+`if (is_long(p))` proves `(Long)p`, `if (s.ordered())` proves `(Ordered)s`,
+and `if (in_bounds(buf, i))` proves `(Index)i`, which is what removes the
+bounds check on `buf[i]`. `if (between(k, 0, 9))` bounds `k` by the arguments
+of that call, so `k` is a `Digit`. An argument may be any expression that
+calls nothing which writes: `if (is_percent(a + b))` proves `a + b`.
+
+A test that read memory, such as `p->len > 4`, is exported only where no store
+or call came between the test and the `return`. In the caller it ends at the
+next store through a pointer or call that may write. A function with a
+`defer` exports no tests, since the deferred code runs after the value is
+computed. A function that holds a value with a destructor exports no test
+that read memory, for the same reason.
+
+**What a switch arm knows.** Inside `case 4:` the value switched on is 4, and
+inside `case 20..90:` it is between those bounds. An arm that the arm above
+can fall into, by `fallthrough` or by having no body, knows nothing.
+
 **What a write ends.** A test proves a value for as long as nothing writes it.
 An assignment, a new declaration of the name, or `&name` ends every earlier
 test of that name. So does a write later in a loop the use sits in, since the

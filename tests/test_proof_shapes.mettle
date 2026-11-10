@@ -1,0 +1,131 @@
+import "std/io";
+import "std/mem";
+import "std/process";
+
+struct Node {
+  len: int32;
+  next: Node*;
+}
+
+struct Span {
+  lo: int32;
+  hi: int32;
+}
+
+type Live = Node* where value != 0;
+type Ordered = Span where value.lo <= value.hi;
+type Index = int64 where value >= 0 && value < buf.length;
+
+fn is_live(p: Node*) -> bool { return p != 0; }
+
+fn must_live(p: Node*) {
+  if (p == 0) { exit(5); }
+}
+
+fn live_and_long(p: Node*) -> bool { return is_live(p) && p->len > 4; }
+
+fn must_be_long(p: Node*) {
+  must_live(p);
+  if (p->len <= 4) { exit(7); }
+}
+
+fn is_ordered(s: Span) -> bool { return s.lo <= s.hi; }
+
+fn must_be_ordered(s: Span) {
+  if (s.lo > s.hi) { exit(6); }
+}
+
+fn in_bounds(buf: int32[], i: int64) -> bool {
+  if (i < 0) { return false; }
+  return i < buf.length;
+}
+
+type Long = Node* where value != 0 && value->len > 4;
+
+fn is_long(p: Node*) -> bool { return p != 0 && p->len > 4; }
+
+fn half_length(p: Long) -> int32 { return p->len / 2; }
+
+fn by_memory(p: Node*) -> int32 {
+  if (is_long(p)) {
+    return half_length((Long)p);
+  }
+  return -1;
+}
+
+fn by_memory_past_a_quiet_call(p: Node*, s: Span) -> int32 {
+  if (is_long(p)) {
+    if (is_ordered(s)) {
+      return half_length((Long)p);
+    }
+  }
+  return -1;
+}
+
+fn length_of(p: Live) -> int32 { return p->len; }
+fn width(o: Ordered) -> int32 { return o.hi - o.lo; }
+
+fn by_pointer(p: Node*) -> int32 {
+  if (is_live(p)) {
+    return length_of((Live)p);
+  }
+  return -1;
+}
+
+fn by_pointer_negated(p: Node*) -> int32 {
+  if (!is_live(p)) { return -1; }
+  return length_of((Live)p);
+}
+
+fn by_pointer_demand(p: Node*) -> int32 {
+  must_live(p);
+  return length_of((Live)p);
+}
+
+fn by_chain(p: Node*) -> int32 {
+  if (live_and_long(p)) {
+    return length_of((Live)p);
+  }
+  return -1;
+}
+
+fn by_chained_demand(p: Node*) -> int32 {
+  must_be_long(p);
+  return length_of((Live)p);
+}
+
+fn by_struct(s: Span) -> int32 {
+  if (is_ordered(s)) {
+    return width((Ordered)s);
+  }
+  return -1;
+}
+
+fn by_struct_demand(s: Span) -> int32 {
+  must_be_ordered(s);
+  return width((Ordered)s);
+}
+
+fn by_slice(buf: int32[], i: int64) -> int32 {
+  if (in_bounds(buf, i)) {
+    var at: Index = (Index)i;
+    return buf[(int64)at];
+  }
+  return -1;
+}
+
+fn main() -> int32 {
+  var node = new Node;
+  node->len = 9;
+  var none: Node* = 0;
+  var good: Span = { lo: 3, hi: 11 };
+  var bad: Span = { lo: 8, hi: 2 };
+  var values: int32[] = new int32[4];
+  values[2] = 42;
+  println("{by_pointer(node)} {by_pointer(none)} {by_pointer_negated(node)} {by_pointer_demand(node)} {by_chain(node)} {by_chained_demand(node)}");
+  println("{by_struct(good)} {by_struct(bad)} {by_struct_demand(good)} {by_slice(values, 2)} {by_slice(values, 9)}");
+  println("{by_memory(node)} {by_memory(none)} {by_memory_past_a_quiet_call(node, good)}");
+  free(values.data);
+  free(node);
+  return 0;
+}

@@ -186,19 +186,21 @@ conditions, including the negated condition after an `if` that returns. A
 predicate that is not a comparison, such as `is_valid(value)`, is proven only
 by a guard that repeats it on the same expression.
 
-A function that tests its argument proves the caller's value for integer and
-float parameters. A pointer, slice or struct parameter exports nothing, and
-neither does a parameter the callee writes, a method called through an object,
-a call through a function value, or a function with no body in this program.
-The fact reaches an argument that is a plain name; `is_percent(a + b)` proves
-nothing about `a + b`.
+A function that tests its argument proves the caller's value. A parameter the
+callee writes exports nothing, and neither does a call through a function
+value or a function with no body in this program. A function with a `defer`
+exports ranges for its integer and float parameters and no other test. Each
+returning path exports at most 24 tests, and a test reached through more than
+three calls is not read.
+
+A range reaches an argument that is a plain name. A conversion of an
+expression, as in `if (is_percent(a + b)) { var p: Percent = a + b; }`, is
+proven where the expression is written the same way both times.
 
 What a call returns is bounded by that call's arguments for integer results
 only. A float result has the one range the function proved for it, and so does
-a function with more than 16 `return` statements. A result that leaves a
-`switch` or `match` is read without the test that chose the arm, so its range
-is wider than the truth and never narrower. Calls nest three deep before the
-one range is used.
+a function with more than 16 `return` statements. Calls nest three deep before
+the one range is used. A `match` arm carries no test of the value matched.
 
 A test stops proving a value at the first write to it, and the compiler takes
 the wide view of what a write is. Any call whose callee it cannot show to be

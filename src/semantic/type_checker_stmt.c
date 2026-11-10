@@ -918,6 +918,37 @@ static const ASTNode *type_checker_find_fallthrough(const ASTNode *node) {
   return NULL;
 }
 
+static void type_checker_push_case_guard(TypeChecker *checker,
+                                         const SwitchStatement *chosen,
+                                         size_t at) {
+  const CaseClause *arm = (const CaseClause *)chosen->cases[at]->data;
+  long long low = 0;
+  long long high = 0;
+  if (arm->is_default || !arm->value || !chosen->expression ||
+      chosen->expression->type != AST_IDENTIFIER || !chosen->expression->data) {
+    return;
+  }
+  if (at > 0) {
+    const CaseClause *above = (const CaseClause *)chosen->cases[at - 1]->data;
+    if (!above || !above->body || above->body->child_count == 0 ||
+        type_checker_find_fallthrough(above->body)) {
+      return;
+    }
+  }
+  if (!type_checker_eval_integer_constant_with_checker(checker, arm->value,
+                                                       &low)) {
+    return;
+  }
+  high = low;
+  if (arm->value_high && !type_checker_eval_integer_constant_with_checker(
+                             checker, arm->value_high, &high)) {
+    return;
+  }
+  type_checker_push_range_guard(
+      checker, ((const Identifier *)chosen->expression->data)->name, 1, low, 1,
+      high);
+}
+
 static int type_checker_check_switch_exhaustive(
     TypeChecker *checker, ASTNode *statement, Type *switch_type,
     int seen_default, const long long *case_values,
@@ -1204,11 +1235,18 @@ int type_checker_check_switch_statement(TypeChecker *checker,
       return 0;
     }
 
-    if (!type_checker_check_statement(checker, case_clause->body)) {
-      checker->switch_depth--;
-      free(init_snapshot);
-      free(case_values);
-      return 0;
+    {
+      size_t arm_depth = type_checker_guard_depth(checker);
+      int arm_ok;
+      type_checker_push_case_guard(checker, switch_stmt, i);
+      arm_ok = type_checker_check_statement(checker, case_clause->body);
+      type_checker_pop_guards(checker, arm_depth);
+      if (!arm_ok) {
+        checker->switch_depth--;
+        free(init_snapshot);
+        free(case_values);
+        return 0;
+      }
     }
     if (i + 1 == switch_stmt->case_count) {
       const ASTNode *stray = type_checker_find_fallthrough(case_clause->body);
@@ -1277,6 +1315,24 @@ static int type_checker_never_falls_through(TypeChecker *checker,
       }
     }
     return type_checker_never_falls_through(checker, branch->else_branch);
+  }
+  return 0;
+}
+
+static int type_checker_holds_jump(const ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_BREAK_STATEMENT ||
+      node->type == AST_CONTINUE_STATEMENT ||
+      node->type == AST_YIELD_STATEMENT ||
+      node->type == AST_FALLTHROUGH_STATEMENT) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (type_checker_holds_jump(node->children[i])) {
+      return 1;
+    }
   }
   return 0;
 }
@@ -1401,6 +1457,7 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
           type_checker_declare_expansion_binding(checker, statement);
       int reached_terminator = 0;
       int ends_here = 0;
+      size_t block_effects = checker->kill_count;
       size_t block_guard_depth = type_checker_guard_depth(checker);
       for (size_t i = 0; i < statement->child_count; i++) {
         ASTNode *child = statement->children[i];
@@ -1444,6 +1501,9 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
           ((const FunctionDeclaration *)checker->current_function_decl->data)
                   ->body == statement) {
         type_checker_note_return_facts(checker, NULL);
+      }
+      if (ends_here && !type_checker_holds_jump(statement)) {
+        type_checker_forget_effects_since(checker, block_effects);
       }
       type_checker_pop_guards(checker, block_guard_depth);
 

@@ -253,6 +253,7 @@ int symbol_table_enter_scope(SymbolTable *table, ScopeType type);
 void symbol_table_exit_scope(SymbolTable *table);
 int symbol_table_declare(SymbolTable *table, Symbol *symbol);
 Symbol *symbol_table_lookup(SymbolTable *table, const char *name);
+Symbol *symbol_table_peek(SymbolTable *table, const char *name);
 Symbol *symbol_table_lookup_current_scope(SymbolTable *table, const char *name);
 Symbol *symbol_table_lookup_global(SymbolTable *table, const char *name);
 void type_checker_summary_free(void *summary);

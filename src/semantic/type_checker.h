@@ -254,6 +254,7 @@ size_t type_checker_guard_depth(const TypeChecker *checker);
 void type_checker_pop_guards(TypeChecker *checker, size_t depth);
 void type_checker_note_effects(TypeChecker *checker, struct ASTNode *node);
 void type_checker_facts_reset(TypeChecker *checker);
+void type_checker_forget_effects_since(TypeChecker *checker, size_t count);
 void type_checker_summary_begin(TypeChecker *checker);
 void type_checker_summary_end(TypeChecker *checker);
 void type_checker_note_return_facts(TypeChecker *checker,

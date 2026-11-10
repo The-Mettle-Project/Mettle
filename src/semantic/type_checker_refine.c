@@ -1,4 +1,5 @@
 #include "type_checker_internal.h"
+#include "ownership.h"
 #include "../ir/ir_explain_ledger.h"
 #include <string.h>
 
@@ -12,6 +13,7 @@ struct TypeCheckerGuard {
   long long max;
   unsigned char skip_all;
   unsigned char skip_memory;
+  unsigned char demand;
   unsigned char is_float;
   double float_min;
   double float_max;
@@ -358,11 +360,31 @@ typedef struct {
 } ReturnCase;
 
 typedef struct {
+  ASTNode *node;
+  int negated;
+  int memory_lost;
+} FactAtom;
+
+typedef struct {
+  FactAtom *items;
+  size_t count;
+  int seen;
+} AtomSet;
+
+#define SUMMARY_MAX_ATOMS 24
+#define SUMMARY_MAX_REPLAYS 3
+
+typedef struct {
   int final;
   int writes;
   int reads;
   int may_return;
   int cases_open;
+  int atoms_closed;
+  int drops;
+  AtomSet atoms_true;
+  AtomSet atoms_false;
+  AtomSet atoms_returns;
   size_t count;
   size_t case_count;
   unsigned char *stable;
@@ -379,9 +401,25 @@ typedef struct {
 
 #define SUMMARY_MAX_CASES 16
 #define SUMMARY_MAX_FRAMES 3
+#define FACT_DEMANDED 2
+
+typedef struct Replay {
+  const Symbol *callee;
+  const FunctionSummary *summary;
+  const CallExpression *call;
+  const struct Replay *outer;
+  unsigned long long usable;
+  int depth;
+} Replay;
+
+static int nodes_equal(const ASTNode *a, const ASTNode *b, const char *hole,
+                       const ASTNode *filler, const Replay *swap, int depth);
+static int nodes_equal_kind(const ASTNode *a, const ASTNode *b,
+                            const char *hole, const ASTNode *filler,
+                            const Replay *swap, int depth);
 
 typedef struct {
-  Symbol *callee;
+  const Symbol *callee;
   const FunctionSummary *summary;
   const ReturnCase *at;
   Range *ranges;
@@ -401,7 +439,7 @@ static const FunctionSummary *summary_of_call(TypeChecker *checker,
   if (!call->function_name || call->object) {
     return NULL;
   }
-  callee = symbol_table_lookup(checker->symbol_table, call->function_name);
+  callee = symbol_table_peek(checker->symbol_table, call->function_name);
   if (!callee || callee->kind != SYMBOL_FUNCTION) {
     return NULL;
   }
@@ -475,6 +513,12 @@ static void expose_name(TypeChecker *checker, const char *name) {
   checker->exposed[checker->exposed_count++] = name;
 }
 
+void type_checker_forget_effects_since(TypeChecker *checker, size_t count) {
+  if (checker && count < checker->kill_count) {
+    checker->kill_count = count;
+  }
+}
+
 void type_checker_facts_reset(TypeChecker *checker) {
   if (checker) {
     checker->kill_count = 0;
@@ -487,7 +531,7 @@ static int name_is_shared(TypeChecker *checker, const char *name) {
   if (name_is_exposed(checker, name)) {
     return 1;
   }
-  symbol = symbol_table_lookup(checker->symbol_table, name);
+  symbol = symbol_table_peek(checker->symbol_table, name);
   return symbol && symbol->kind == SYMBOL_VARIABLE && symbol->scope &&
          symbol->scope->type == SCOPE_GLOBAL;
 }
@@ -720,6 +764,22 @@ static void effect_of_call(TypeChecker *checker, const ASTNode *node) {
   }
 }
 
+static void effect_of_declaration(TypeChecker *checker,
+                                  const VarDeclaration *decl) {
+  Symbol *fn = checker->current_function;
+  Symbol *made = decl->name
+                     ? symbol_table_peek(checker->symbol_table, decl->name)
+                     : NULL;
+  if (!decl->name) {
+    return;
+  }
+  kill_add(checker, KILL_NAME, decl->name, MOVED_ANY);
+  if (fn && fn->kind == SYMBOL_FUNCTION && fn->summary && made && made->type &&
+      ownership_type_owns(checker, made->type)) {
+    ((FunctionSummary *)fn->summary)->drops = 1;
+  }
+}
+
 void type_checker_note_effects(TypeChecker *checker, ASTNode *node) {
   const char *op = NULL;
   ASTNode *operand = NULL;
@@ -729,8 +789,7 @@ void type_checker_note_effects(TypeChecker *checker, ASTNode *node) {
   if (node->type == AST_ASSIGNMENT) {
     effect_of_assignment(checker, node);
   } else if (node->type == AST_VAR_DECLARATION && node->data) {
-    kill_add(checker, KILL_NAME, ((const VarDeclaration *)node->data)->name,
-             MOVED_ANY);
+    effect_of_declaration(checker, (const VarDeclaration *)node->data);
   } else if (node->type == AST_FUNCTION_CALL) {
     effect_of_call(checker, node);
   } else if (node->type == AST_FUNC_PTR_CALL || node->type == AST_GPU_LAUNCH) {
@@ -807,11 +866,12 @@ static void narrow_by_verdict(NarrowContext *ctx, ASTNode *node, int negated) {
     return;
   }
   if (ctx->tracked
-          ? name_moved(ctx->checker, ctx->guard, ctx->name) != MOVED_NOT
+          ? ctx->checker->guards[ctx->guard].demand ||
+                name_moved(ctx->checker, ctx->guard, ctx->name) != MOVED_NOT
           : !ctx->checker->proof_frame) {
     return;
   }
-  callee = symbol_table_lookup(ctx->checker->symbol_table, call->function_name);
+  callee = symbol_table_peek(ctx->checker->symbol_table, call->function_name);
   for (size_t i = 0; i < call->argument_count && i < summary->count; i++) {
     const FactRange *fact = negated ? &summary->when_false[i]
                                     : &summary->when_true[i];
@@ -830,6 +890,8 @@ static void narrow_by_verdict(NarrowContext *ctx, ASTNode *node, int negated) {
     range_meet(ctx->range, &r);
   }
 }
+
+static void narrow_by_replay(NarrowContext *ctx, ASTNode *node, int negated);
 
 static void narrow_by_comparison(NarrowContext *ctx, const char *op,
                                  ASTNode *other) {
@@ -883,6 +945,7 @@ static void narrow_visit(void *raw, ASTNode *node, int negated) {
   int moved = MOVED_NOT;
   if (node->type == AST_FUNCTION_CALL) {
     narrow_by_verdict(ctx, node, negated);
+    narrow_by_replay(ctx, node, negated);
     return;
   }
   if (!binary_parts(node, &op, &left, &right) || !is_comparison(op)) {
@@ -1036,7 +1099,7 @@ static int range_of_call(TypeChecker *checker, ASTNode *expr, Range *out,
       }
     }
     if (checker && call && call->function_name && !call->object) {
-      callee = symbol_table_lookup(checker->symbol_table, call->function_name);
+      callee = symbol_table_peek(checker->symbol_table, call->function_name);
     }
     if (callee && callee->kind == SYMBOL_FUNCTION && callee->post_state == 2 &&
         callee->post_has_min && callee->post_has_max) {
@@ -1410,6 +1473,9 @@ static int range_of(TypeChecker *checker, ASTNode *expr, Range *out,
 }
 
 static int parameter_is_stable(TypeChecker *checker, const char *name);
+static int name_is_never_written(TypeChecker *checker, const char *name,
+                                 const Type *type);
+static int node_holds_defer(const ASTNode *node);
 
 static int relation_is_stable(TypeChecker *checker, const ASTNode *node,
                               const char *binding) {
@@ -2123,12 +2189,22 @@ void type_checker_summary_begin(TypeChecker *checker) {
       fn->data.function.return_type &&
       fn->data.function.return_type->kind != TYPE_ENUM &&
       type_checker_is_integer_type(fn->data.function.return_type);
+  summary->atoms_closed =
+      checker->current_function_decl &&
+      checker->current_function_decl->type == AST_FUNCTION_DECLARATION &&
+      checker->current_function_decl->data &&
+      node_holds_defer(((const FunctionDeclaration *)
+                            checker->current_function_decl->data)
+                           ->body);
   for (size_t i = 0; i < count && fn->data.function.parameter_types &&
                      fn->data.function.parameter_names;
        i++) {
     Type *type = fn->data.function.parameter_types[i];
     const char *name = fn->data.function.parameter_names[i];
-    summary->stable[i] = name && parameter_is_stable(checker, name);
+    if (type && ownership_type_owns(checker, type)) {
+      summary->drops = 1;
+    }
+    summary->stable[i] = name && name_is_never_written(checker, name, type);
     summary->usable[i] = summary->stable[i] && type &&
                          type->kind != TYPE_ENUM &&
                          type_checker_is_integer_type(type);
@@ -2137,20 +2213,86 @@ void type_checker_summary_begin(TypeChecker *checker) {
   }
 }
 
-static int parameter_is_stable(TypeChecker *checker, const char *name) {
+static int target_is_rooted_at(const ASTNode *target, const char *name) {
+  int indirect = 0;
+  const char *root = target ? written_root(target, &indirect) : NULL;
+  return root && strcmp(root, name) == 0;
+}
+
+static int node_writes_into(const ASTNode *node, const char *name,
+                            int holds_its_value) {
+  const char *op = NULL;
+  ASTNode *operand = NULL;
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_ASSIGNMENT && node->data && holds_its_value) {
+    const Assignment *assign = (const Assignment *)node->data;
+    if (target_is_rooted_at(assign->target, name)) {
+      return 1;
+    }
+    for (size_t i = 0; i < assign->target_count; i++) {
+      if (target_is_rooted_at(assign->targets[i], name)) {
+        return 1;
+      }
+    }
+  } else if (unary_parts(node, &op, &operand) && strcmp(op, "&") == 0 &&
+             target_is_rooted_at(operand, name)) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node_writes_into(node->children[i], name, holds_its_value)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int type_holds_its_value(const Type *type) {
+  while (type && type->refined_base) {
+    type = type->refined_base;
+  }
+  return !type || (type->kind != TYPE_POINTER && type->kind != TYPE_SLICE);
+}
+
+static int node_holds_defer(const ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_DEFER_STATEMENT ||
+      node->type == AST_ERRDEFER_STATEMENT) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node_holds_defer(node->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int name_is_never_written(TypeChecker *checker, const char *name,
+                                 const Type *type) {
   const ASTNode *decl = checker->current_function_decl;
+  const ASTNode *body;
   const MovementIndex *index;
   MovementSlot *slot;
   if (!decl || decl->type != AST_FUNCTION_DECLARATION || !decl->data) {
     return 0;
   }
-  index = movement_index_for(
-      checker, ((const FunctionDeclaration *)decl->data)->body);
+  body = ((const FunctionDeclaration *)decl->data)->body;
+  index = movement_index_for(checker, (ASTNode *)body);
   if (!index) {
     return 0;
   }
   slot = movement_slot((MovementIndex *)index, name, 0);
-  return !slot || slot->count == 0;
+  return (!slot || slot->count == 0) &&
+         !node_writes_into(body, name, type_holds_its_value(type));
+}
+
+static int parameter_is_stable(TypeChecker *checker, const char *name) {
+  Symbol *symbol = symbol_table_peek(checker->symbol_table, name);
+  return name_is_never_written(checker, name, symbol ? symbol->type : NULL);
 }
 
 static void range_of_parameter(TypeChecker *checker, const char *name,
@@ -2294,7 +2436,7 @@ static int case_is_portable(TypeChecker *checker, const Symbol *fn,
     if (at != -1) {
       return at >= 0;
     }
-    symbol = symbol_table_lookup(checker->symbol_table, name);
+    symbol = symbol_table_peek(checker->symbol_table, name);
     return !type_checker_lookup_expansion_binding(checker, name) && symbol &&
            symbol->scope && symbol->scope->type == SCOPE_GLOBAL;
   }
@@ -2304,6 +2446,115 @@ static int case_is_portable(TypeChecker *checker, const Symbol *fn,
     }
   }
   return 1;
+}
+
+typedef struct {
+  TypeChecker *checker;
+  const Symbol *fn;
+  const FunctionSummary *summary;
+  size_t guard;
+  int tracked;
+  FactAtom *out;
+  size_t count;
+} AtomGather;
+
+static void atom_gather_visit(void *raw, ASTNode *node, int negated) {
+  AtomGather *gather = (AtomGather *)raw;
+  int is_verdict = summary_of_call(gather->checker, node) != NULL;
+  int lost = gather->tracked &&
+             guard_lost_memory(gather->checker, gather->guard);
+  if (gather->count >= SUMMARY_MAX_ATOMS ||
+      !case_is_portable(gather->checker, gather->fn, gather->summary, node)) {
+    return;
+  }
+  if (gather->tracked &&
+      (gather->checker->guards[gather->guard].skip_all ||
+       expr_killed_in(gather->checker, gather->guard, node,
+                      lost && !is_verdict))) {
+    return;
+  }
+  gather->out[gather->count].node = node;
+  gather->out[gather->count].negated = negated;
+  gather->out[gather->count].memory_lost = lost && is_verdict;
+  gather->count++;
+}
+
+static size_t atoms_on_this_path(TypeChecker *checker, const Symbol *fn,
+                                 const FunctionSummary *summary,
+                                 ASTNode *value, int value_negated,
+                                 FactAtom *out) {
+  AtomGather gather;
+  gather.checker = checker;
+  gather.fn = fn;
+  gather.summary = summary;
+  gather.out = out;
+  gather.count = 0;
+  gather.tracked = 1;
+  for (size_t i = 0; i < checker->guard_count; i++) {
+    const struct TypeCheckerGuard *guard = &checker->guards[i];
+    gather.guard = i;
+    if (!guard->condition || guard->skip_all) {
+      continue;
+    }
+    if (guard->demand) {
+      atom_gather_visit(&gather, guard->condition, FACT_DEMANDED);
+      continue;
+    }
+    visit_atoms(guard->condition, guard->negated, atom_gather_visit, &gather,
+                0);
+  }
+  if (value) {
+    gather.tracked = 0;
+    visit_atoms(value, value_negated, atom_gather_visit, &gather, 0);
+  }
+  return gather.count;
+}
+
+static void atom_set_join(AtomSet *set, const FactAtom *path, size_t count) {
+  size_t kept = 0;
+  if (!set->seen) {
+    set->seen = 1;
+    set->items = calloc(count + 1, sizeof(FactAtom));
+    if (set->items) {
+      memcpy(set->items, path, count * sizeof(FactAtom));
+      set->count = count;
+    }
+    return;
+  }
+  for (size_t i = 0; i < set->count; i++) {
+    for (size_t j = 0; j < count; j++) {
+      if (set->items[i].negated == path[j].negated &&
+          nodes_equal(set->items[i].node, path[j].node, NULL, NULL, NULL, 0)) {
+        set->items[i].memory_lost |= path[j].memory_lost;
+        set->items[kept++] = set->items[i];
+        break;
+      }
+    }
+  }
+  set->count = kept;
+}
+
+static void summary_join_atoms(TypeChecker *checker, FunctionSummary *summary,
+                               const Symbol *fn, ASTNode *value, int splits,
+                               int to_true, int to_false) {
+  FactAtom path[SUMMARY_MAX_ATOMS];
+  size_t count = summary->atoms_closed
+                     ? 0
+                     : atoms_on_this_path(checker, fn, summary, NULL, 0, path);
+  atom_set_join(&summary->atoms_returns, path, count);
+  if (splits && !summary->atoms_closed) {
+    count = atoms_on_this_path(checker, fn, summary, value, 0, path);
+    atom_set_join(&summary->atoms_true, path, count);
+    count = atoms_on_this_path(checker, fn, summary, value, 1, path);
+    atom_set_join(&summary->atoms_false, path, count);
+    return;
+  }
+  if (to_true) {
+    atom_set_join(&summary->atoms_true, path, count);
+  }
+  if (to_false) {
+    atom_set_join(&summary->atoms_false, path, count);
+  }
 }
 
 static void summary_close_cases(FunctionSummary *summary) {
@@ -2316,10 +2567,27 @@ static void summary_close_cases(FunctionSummary *summary) {
   summary->cases_open = 0;
 }
 
+static void atom_set_empty(AtomSet *set) {
+  free(set->items);
+  set->items = NULL;
+  set->count = 0;
+  set->seen = 1;
+}
+
+static void summary_forget(FunctionSummary *summary) {
+  memset(summary->stable, 0, summary->count);
+  memset(summary->usable, 0, summary->count);
+  memset(summary->floats, 0, summary->count);
+  summary_close_cases(summary);
+  atom_set_empty(&summary->atoms_true);
+  atom_set_empty(&summary->atoms_false);
+  atom_set_empty(&summary->atoms_returns);
+}
+
 void type_checker_summary_free(void *raw) {
   FunctionSummary *summary = (FunctionSummary *)raw;
   if (summary) {
-    summary_close_cases(summary);
+    summary_forget(summary);
     free(summary);
   }
 }
@@ -2331,7 +2599,7 @@ static void case_keep_guards(TypeChecker *checker, const Symbol *fn,
                         sizeof(struct TypeCheckerGuard));
   for (size_t i = 0; kept->guards && i < checker->guard_count; i++) {
     const struct TypeCheckerGuard *guard = &checker->guards[i];
-    if (guard->condition && !guard->skip_all &&
+    if (guard->condition && !guard->skip_all && !guard->demand &&
         case_is_portable(checker, fn, summary, guard->condition)) {
       kept->guards[kept->guard_count++] = *guard;
     }
@@ -2537,7 +2805,7 @@ void type_checker_note_return_facts(TypeChecker *checker, ASTNode *value) {
   if (summary->count != fn->data.function.parameter_count ||
       !fn->data.function.parameter_names ||
       !fn->data.function.parameter_types) {
-    memset(summary->usable, 0, summary->count);
+    summary_forget(summary);
     return;
   }
   is_constant = value && type_checker_eval_integer_constant_with_checker(
@@ -2579,6 +2847,9 @@ void type_checker_note_return_facts(TypeChecker *checker, ASTNode *value) {
     }
   }
   summary_add_case(checker, summary, fn, value);
+  summary_join_atoms(checker, summary, fn, value, splits,
+                     !value || !is_constant || constant != 0,
+                     !value || !is_constant || constant == 0);
 }
 
 static void summary_scan(TypeChecker *checker, const ASTNode *node,
@@ -2621,6 +2892,36 @@ static void summary_scan(TypeChecker *checker, const ASTNode *node,
   }
 }
 
+static int node_reads_memory_anywhere(TypeChecker *checker,
+                                      const ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node_reads_memory(checker, node)) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node_reads_memory_anywhere(checker, node->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void atom_set_after_drops(TypeChecker *checker, AtomSet *set) {
+  size_t kept = 0;
+  for (size_t i = 0; i < set->count; i++) {
+    FactAtom *fact = &set->items[i];
+    if (summary_of_call(checker, fact->node)) {
+      fact->memory_lost = 1;
+    } else if (node_reads_memory_anywhere(checker, fact->node)) {
+      continue;
+    }
+    set->items[kept++] = *fact;
+  }
+  set->count = kept;
+}
+
 void type_checker_summary_end(TypeChecker *checker) {
   Symbol *fn = checker ? checker->current_function : NULL;
   FunctionSummary *summary = fn && fn->kind == SYMBOL_FUNCTION
@@ -2633,6 +2934,11 @@ void type_checker_summary_end(TypeChecker *checker) {
   }
   summary_scan(checker, ((const FunctionDeclaration *)decl->data)->body,
                summary);
+  if (summary->drops) {
+    atom_set_after_drops(checker, &summary->atoms_true);
+    atom_set_after_drops(checker, &summary->atoms_false);
+    atom_set_after_drops(checker, &summary->atoms_returns);
+  }
   summary->final = 1;
 }
 
@@ -2648,7 +2954,7 @@ int type_checker_call_never_returns(TypeChecker *checker,
   if (!call->function_name || call->object) {
     return 0;
   }
-  callee = symbol_table_lookup(checker->symbol_table, call->function_name);
+  callee = symbol_table_peek(checker->symbol_table, call->function_name);
   return callee && callee->kind == SYMBOL_FUNCTION &&
          (callee->is_noreturn || (summary && !summary->may_return));
 }
@@ -2668,6 +2974,23 @@ static int call_takes_address_of(const ASTNode *node, const char *name) {
   }
   for (size_t i = 0; i < node->child_count; i++) {
     if (call_takes_address_of(node->children[i], name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int node_mentions(const ASTNode *node, const char *name) {
+  const char *own;
+  if (!node) {
+    return 0;
+  }
+  own = identifier_name(node);
+  if (own && strcmp(own, name) == 0) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node_mentions(node->children[i], name)) {
       return 1;
     }
   }
@@ -2708,7 +3031,7 @@ void type_checker_push_call_facts(TypeChecker *checker, ASTNode *statement) {
     return;
   }
   call = (const CallExpression *)node->data;
-  callee = symbol_table_lookup(checker->symbol_table, call->function_name);
+  callee = symbol_table_peek(checker->symbol_table, call->function_name);
   for (size_t i = 0; i < call->argument_count && i < summary->count; i++) {
     const FactRange *fact = &summary->returns[i];
     const FloatFact *real = &summary->float_returns[i];
@@ -2735,6 +3058,16 @@ void type_checker_push_call_facts(TypeChecker *checker, ASTNode *statement) {
       guard->has_max = real->has_max;
       guard->float_min = real->min;
       guard->float_max = real->max;
+      checker->guard_pushes++;
+    }
+  }
+  if (summary->atoms_returns.count > 0 &&
+      condition_taint(checker, node) != 2 &&
+      !(written && node_mentions(node, written))) {
+    size_t at = checker->guard_count;
+    guard_push_plain(checker, node, 0);
+    if (checker->guard_count > at) {
+      checker->guards[at].demand = 1;
       checker->guard_pushes++;
     }
   }
@@ -2805,11 +3138,11 @@ static void fnarrow_by_verdict(FNarrowContext *ctx, ASTNode *node,
   const FunctionSummary *summary = summary_of_call(ctx->checker, node);
   const CallExpression *call = (const CallExpression *)node->data;
   Symbol *callee;
-  if (!summary || !ctx->tracked ||
+  if (!summary || !ctx->tracked || ctx->checker->guards[ctx->guard].demand ||
       name_moved(ctx->checker, ctx->guard, ctx->name) != MOVED_NOT) {
     return;
   }
-  callee = symbol_table_lookup(ctx->checker->symbol_table, call->function_name);
+  callee = symbol_table_peek(ctx->checker->symbol_table, call->function_name);
   for (size_t i = 0; i < call->argument_count && i < summary->count; i++) {
     const FloatFact *fact = negated ? &summary->float_when_false[i]
                                     : &summary->float_when_true[i];
@@ -3255,17 +3588,14 @@ void type_checker_pop_guards(TypeChecker *checker, size_t depth) {
   }
 }
 
-static int nodes_equal(const ASTNode *a, const ASTNode *b, const char *hole,
-                       const ASTNode *filler, int depth);
-
 static int nodes_equal_children(const ASTNode *a, const ASTNode *b,
                                 const char *hole, const ASTNode *filler,
-                                int depth) {
+                                const Replay *swap, int depth) {
   if (a->child_count != b->child_count) {
     return 0;
   }
   for (size_t i = 0; i < a->child_count; i++) {
-    if (!nodes_equal(a->children[i], b->children[i], hole, filler,
+    if (!nodes_equal(a->children[i], b->children[i], hole, filler, swap,
                      depth + 1)) {
       return 0;
     }
@@ -3274,7 +3604,7 @@ static int nodes_equal_children(const ASTNode *a, const ASTNode *b,
 }
 
 static int nodes_equal_call(const ASTNode *a, const ASTNode *b, const char *hole,
-                       const ASTNode *filler, int depth) {
+                       const ASTNode *filler, const Replay *swap, int depth) {
     const CallExpression *ca = (const CallExpression *)a->data;
     const CallExpression *cb = (const CallExpression *)b->data;
     if (!ca || !cb || !ca->function_name || !cb->function_name ||
@@ -3283,12 +3613,12 @@ static int nodes_equal_call(const ASTNode *a, const ASTNode *b, const char *hole
         (ca->object == NULL) != (cb->object == NULL)) {
       return 0;
     }
-    if (ca->object && !nodes_equal(ca->object, cb->object, hole, filler,
+    if (ca->object && !nodes_equal(ca->object, cb->object, hole, filler, swap,
                                    depth + 1)) {
       return 0;
     }
     for (size_t i = 0; i < ca->argument_count; i++) {
-      if (!nodes_equal(ca->arguments[i], cb->arguments[i], hole, filler,
+      if (!nodes_equal(ca->arguments[i], cb->arguments[i], hole, filler, swap,
                        depth + 1)) {
         return 0;
       }
@@ -3296,17 +3626,43 @@ static int nodes_equal_call(const ASTNode *a, const ASTNode *b, const char *hole
     return 1;
 }
 
+static int nodes_equal_swapped(const ASTNode *a, const ASTNode *b,
+                               const char *hole, const ASTNode *filler,
+                               const Replay *swap, int depth, int *handled) {
+  const char *name = identifier_name(b);
+  int at = name ? summary_parameter(swap->callee, swap->summary, name) : -1;
+  *handled = at != -1;
+  if (at < 0 || !((swap->usable >> at) & 1ull)) {
+    return 0;
+  }
+  return nodes_equal(a, swap->call->arguments[at], hole, filler, swap->outer,
+                     depth + 1);
+}
+
 static int nodes_equal(const ASTNode *a, const ASTNode *b, const char *hole,
-                       const ASTNode *filler, int depth) {
+                       const ASTNode *filler, const Replay *swap, int depth) {
   if (!a || !b || depth > 32) {
     return a == b;
   }
   if (hole && a->type == AST_IDENTIFIER) {
     const char *name = identifier_name(a);
     if (name && strcmp(name, hole) == 0) {
-      return nodes_equal(filler, b, NULL, NULL, depth + 1);
+      return nodes_equal(filler, b, NULL, NULL, swap, depth + 1);
     }
   }
+  if (swap && b->type == AST_IDENTIFIER) {
+    int handled = 0;
+    int same = nodes_equal_swapped(a, b, hole, filler, swap, depth, &handled);
+    if (handled) {
+      return same;
+    }
+  }
+  return nodes_equal_kind(a, b, hole, filler, swap, depth);
+}
+
+static int nodes_equal_kind(const ASTNode *a, const ASTNode *b,
+                            const char *hole, const ASTNode *filler,
+                            const Replay *swap, int depth) {
   if (a->type != b->type) {
     return 0;
   }
@@ -3342,8 +3698,8 @@ static int nodes_equal(const ASTNode *a, const ASTNode *b, const char *hole,
         strcmp(oa, ob) != 0) {
       return 0;
     }
-    return nodes_equal(la, lb, hole, filler, depth + 1) &&
-           nodes_equal(ra, rb, hole, filler, depth + 1);
+    return nodes_equal(la, lb, hole, filler, swap, depth + 1) &&
+           nodes_equal(ra, rb, hole, filler, swap, depth + 1);
   }
   case AST_UNARY_EXPRESSION: {
     const char *oa = NULL;
@@ -3354,7 +3710,7 @@ static int nodes_equal(const ASTNode *a, const ASTNode *b, const char *hole,
         strcmp(oa, ob) != 0) {
       return 0;
     }
-    return nodes_equal(pa, pb, hole, filler, depth + 1);
+    return nodes_equal(pa, pb, hole, filler, swap, depth + 1);
   }
   case AST_MEMBER_ACCESS: {
     const MemberAccess *ma = (const MemberAccess *)a->data;
@@ -3363,14 +3719,14 @@ static int nodes_equal(const ASTNode *a, const ASTNode *b, const char *hole,
         strcmp(ma->member, mb->member) != 0) {
       return 0;
     }
-    return nodes_equal(ma->object, mb->object, hole, filler, depth + 1);
+    return nodes_equal(ma->object, mb->object, hole, filler, swap, depth + 1);
   }
   case AST_FUNCTION_CALL:
-    return nodes_equal_call(a, b, hole, filler, depth);
+    return nodes_equal_call(a, b, hole, filler, swap, depth);
 
   case AST_INDEX_EXPRESSION:
   case AST_CAST_EXPRESSION:
-    return nodes_equal_children(a, b, hole, filler, depth);
+    return nodes_equal_children(a, b, hole, filler, swap, depth);
   default:
     return 0;
   }
@@ -3382,36 +3738,255 @@ typedef struct {
   const ASTNode *filler;
   const char *binding;
   int found;
+  int demand;
   TypeChecker *checker;
   size_t guard;
 } MatchContext;
 
-static void match_visit(void *raw, ASTNode *node, int negated) {
-  MatchContext *ctx = (MatchContext *)raw;
+static int atom_matches(const MatchContext *ctx, const ASTNode *node,
+                        int negated, const Replay *swap) {
+  const char *op = NULL;
+  const char *pop = NULL;
+  const char *flipped;
+  ASTNode *left = NULL;
+  ASTNode *right = NULL;
+  ASTNode *pleft = NULL;
+  ASTNode *pright = NULL;
+  if (negated == ctx->pattern_negated) {
+    return nodes_equal(ctx->pattern, node, ctx->binding, ctx->filler, swap, 0);
+  }
+  if (negated == FACT_DEMANDED || !binary_parts(node, &op, &left, &right) ||
+      !is_comparison(op)) {
+    return 0;
+  }
+  flipped = negate_operator(op);
+  return flipped && binary_parts(ctx->pattern, &pop, &pleft, &pright) &&
+         strcmp(pop, flipped) == 0 &&
+         nodes_equal(pleft, left, ctx->binding, ctx->filler, swap, 0) &&
+         nodes_equal(pright, right, ctx->binding, ctx->filler, swap, 0);
+}
+
+static int replay_type_fits(const Type *from, const Type *to) {
+  if (!from || !to) {
+    return 0;
+  }
+  if (fact_fits(from, to) || float_fact_fits(from, to)) {
+    return 1;
+  }
+  while (from->refined_base) {
+    from = from->refined_base;
+  }
+  while (to->refined_base) {
+    to = to->refined_base;
+  }
+  return type_checker_types_equal((Type *)from, (Type *)to);
+}
+
+static int replay_begin(TypeChecker *checker, const ASTNode *node,
+                        const Replay *outer, Replay *swap) {
+  const FunctionSummary *summary = summary_of_call(checker, node);
+  const CallExpression *call = (const CallExpression *)node->data;
+  if (!summary || call->argument_count != summary->count ||
+      summary->count > 64 || (outer && outer->depth >= SUMMARY_MAX_REPLAYS)) {
+    return 0;
+  }
+  swap->callee = symbol_table_peek(checker->symbol_table, call->function_name);
+  swap->summary = summary;
+  swap->call = call;
+  swap->outer = outer;
+  swap->depth = outer ? outer->depth + 1 : 0;
+  swap->usable = 0;
+  if (!swap->callee->data.function.parameter_names) {
+    return 0;
+  }
+  for (size_t i = 0; i < summary->count; i++) {
+    const ASTNode *given = call->arguments[i];
+    if (summary->stable[i] && given &&
+        condition_taint(checker, given) == 0 &&
+        replay_type_fits(given->resolved_type,
+                         swap->callee->data.function.parameter_types[i])) {
+      swap->usable |= 1ull << i;
+    }
+  }
+  return 1;
+}
+
+static int replay_killed(TypeChecker *checker, size_t guard,
+                         const ASTNode *node, const Replay *swap,
+                         int memory) {
+  const char *name;
+  if (!node) {
+    return 0;
+  }
+  if (!swap) {
+    return expr_killed_in(checker, guard, node, memory);
+  }
+  name = identifier_name(node);
+  if (name) {
+    int at = summary_parameter(swap->callee, swap->summary, name);
+    Symbol *symbol;
+    if (at >= 0) {
+      return !((swap->usable >> at) & 1ull) ||
+             replay_killed(checker, guard, swap->call->arguments[at],
+                           swap->outer, memory);
+    }
+    symbol = symbol_table_peek(checker->symbol_table, name);
+    return at == -2 || !symbol || !symbol->scope ||
+           symbol->scope->type != SCOPE_GLOBAL ||
+           kill_of_name(checker, guard, name) != MOVED_NOT ||
+           (memory && name_is_shared(checker, name));
+  }
+  if (memory && node_reads_memory(checker, node)) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (replay_killed(checker, guard, node->children[i], swap, memory)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int replay_names_side(const Replay *swap, const ASTNode *side,
+                             const char *name) {
+  const char *own = identifier_name(side);
+  const ASTNode *given;
+  const char *passed;
+  int at = own ? summary_parameter(swap->callee, swap->summary, own) : -1;
+  if (at < 0 || !((swap->usable >> at) & 1ull) || !swap->summary->usable[at]) {
+    return 0;
+  }
+  given = swap->call->arguments[at];
+  passed = identifier_name(given);
+  return passed && strcmp(passed, name) == 0 &&
+         fact_fits(given->resolved_type,
+                   swap->callee->data.function.parameter_types[at]);
+}
+
+static void narrow_by_fact(NarrowContext *ctx, const Replay *swap,
+                           ProofFrame *frame, const FactAtom *fact,
+                           int memory) {
+  TypeChecker *checker = ctx->checker;
+  void *outer = checker->proof_frame;
+  size_t entered = checker->narrowing_count;
   const char *op = NULL;
   ASTNode *left = NULL;
   ASTNode *right = NULL;
-  if (ctx->found || expr_killed(ctx->checker, ctx->guard, node)) {
+  ASTNode *other = NULL;
+  if (fact->negated == FACT_DEMANDED ||
+      !binary_parts(fact->node, &op, &left, &right) || !is_comparison(op)) {
     return;
   }
-  if (negated == ctx->pattern_negated &&
-      nodes_equal(ctx->pattern, node, ctx->binding, ctx->filler, 0)) {
-    ctx->found = 1;
+  if (fact->negated) {
+    op = negate_operator(op);
+  }
+  if (op && replay_names_side(swap, left, ctx->name)) {
+    other = right;
+  } else if (op && replay_names_side(swap, right, ctx->name)) {
+    other = left;
+    op = flip_operator(op);
+  }
+  if (!other ||
+      replay_killed(checker, ctx->guard, fact->node, swap, memory)) {
     return;
   }
-  if (negated != ctx->pattern_negated && binary_parts(node, &op, &left, &right) &&
-      is_comparison(op)) {
-    const char *pop = NULL;
-    ASTNode *pleft = NULL;
-    ASTNode *pright = NULL;
-    const char *flipped = negate_operator(op);
-    if (flipped && binary_parts(ctx->pattern, &pop, &pleft, &pright) &&
-        strcmp(pop, flipped) == 0 &&
-        nodes_equal(pleft, left, ctx->binding, ctx->filler, 0) &&
-        nodes_equal(pright, right, ctx->binding, ctx->filler, 0)) {
-      ctx->found = 1;
+  checker->proof_frame = frame;
+  checker->proof_frame_depth++;
+  checker->narrowing_count = 0;
+  narrow_by_comparison(ctx, op, other);
+  checker->narrowing_count = entered;
+  checker->proof_frame_depth--;
+  checker->proof_frame = outer;
+}
+
+static int replay_passes_name(const Replay *swap, const char *name) {
+  for (size_t i = 0; i < swap->summary->count; i++) {
+    const char *passed = identifier_name(swap->call->arguments[i]);
+    if (passed && strcmp(passed, name) == 0 && swap->summary->usable[i]) {
+      return 1;
     }
   }
+  return 0;
+}
+
+static void narrow_by_replay(NarrowContext *ctx, ASTNode *node, int negated) {
+  TypeChecker *checker = ctx->checker;
+  Range ranges[8];
+  Replay swap;
+  ProofFrame frame;
+  const AtomSet *set;
+  int polarity;
+  if (!ctx->tracked || checker->proof_frame ||
+      !node_mentions(node, ctx->name) ||
+      checker->guards[ctx->guard].skip_all ||
+      name_moved(checker, ctx->guard, ctx->name) != MOVED_NOT ||
+      !replay_begin(checker, node, NULL, &swap)) {
+    return;
+  }
+  polarity = checker->guards[ctx->guard].demand ? FACT_DEMANDED : negated;
+  set = polarity == FACT_DEMANDED ? &swap.summary->atoms_returns
+        : polarity               ? &swap.summary->atoms_false
+                                 : &swap.summary->atoms_true;
+  if (set->count == 0 || swap.summary->count > 8 ||
+      !replay_passes_name(&swap, ctx->name)) {
+    return;
+  }
+  frame.callee = swap.callee;
+  frame.summary = swap.summary;
+  frame.at = NULL;
+  frame.ranges = ranges;
+  for (size_t i = 0; i < swap.summary->count; i++) {
+    frame_bind_argument(checker, &frame, i, swap.call->arguments[i],
+                        ctx->depth);
+  }
+  for (size_t i = 0; i < set->count; i++) {
+    narrow_by_fact(ctx, &swap, &frame, &set->items[i],
+                   guard_lost_memory(checker, ctx->guard));
+  }
+}
+
+static void match_replay(MatchContext *ctx, const ASTNode *node, int negated,
+                         const Replay *outer, int memory) {
+  Replay swap;
+  const AtomSet *set;
+  if (!replay_begin(ctx->checker, node, outer, &swap)) {
+    return;
+  }
+  set = negated == FACT_DEMANDED ? &swap.summary->atoms_returns
+        : negated               ? &swap.summary->atoms_false
+                                : &swap.summary->atoms_true;
+  for (size_t i = 0; i < set->count && !ctx->found; i++) {
+    const FactAtom *fact = &set->items[i];
+    int is_verdict = summary_of_call(ctx->checker, fact->node) != NULL;
+    if (replay_killed(ctx->checker, ctx->guard, fact->node, &swap,
+                      memory && !is_verdict)) {
+      continue;
+    }
+    if (is_verdict) {
+      match_replay(ctx, fact->node, fact->negated, &swap,
+                   memory || fact->memory_lost);
+    }
+    if (!ctx->found &&
+        !(memory && node_reads_memory(ctx->checker, fact->node))) {
+      ctx->found = atom_matches(ctx, fact->node, fact->negated, &swap);
+    }
+  }
+}
+
+static void match_visit(void *raw, ASTNode *node, int negated) {
+  MatchContext *ctx = (MatchContext *)raw;
+  if (ctx->found || ctx->checker->guards[ctx->guard].skip_all) {
+    return;
+  }
+  if (node->type == AST_FUNCTION_CALL) {
+    match_replay(ctx, node, ctx->demand ? FACT_DEMANDED : negated, NULL,
+                 guard_lost_memory(ctx->checker, ctx->guard));
+  }
+  if (ctx->found || ctx->demand ||
+      expr_killed(ctx->checker, ctx->guard, node)) {
+    return;
+  }
+  ctx->found = atom_matches(ctx, node, negated, NULL);
 }
 
 static int guards_prove_atom(TypeChecker *checker, ASTNode *atom,
@@ -3427,7 +4002,10 @@ static int guards_prove_atom(TypeChecker *checker, ASTNode *atom,
   for (size_t i = 0; i < checker->guard_count && !ctx.found; i++) {
     struct TypeCheckerGuard *guard = &checker->guards[i];
     ctx.guard = i;
-    if (guard->condition) {
+    ctx.demand = guard->demand;
+    if (guard->condition && guard->demand) {
+      match_visit(&ctx, guard->condition, 0);
+    } else if (guard->condition) {
       visit_atoms(guard->condition, guard->negated, match_visit, &ctx, 0);
     }
   }

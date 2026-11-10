@@ -39,6 +39,37 @@ type High = uint8 where value >= 200;
 
 fn raised(a: uint8) -> uint8 { return a + 200; }
 
+struct Node { len: int32; next: Node*; }
+struct Span { lo: int32; hi: int32; }
+
+type Live = Node* where value != 0;
+type Long = Node* where value != 0 && value->len > 4;
+type Ordered = Span where value.lo <= value.hi;
+type Index = int64 where value >= 0 && value < buf.length;
+
+fn is_live(p: Node*) -> bool { return p != 0; }
+fn must_live(p: Node*) { if (p == 0) { exit(5); } }
+fn is_long(p: Node*) -> bool { return p != 0 && p->len > 4; }
+fn is_ordered(s: Span) -> bool { return s.lo <= s.hi; }
+fn in_bounds(buf: int32[], i: int64) -> bool { if (i < 0) { return false; } return i < buf.length; }
+fn shrink(p: Node*) { p->len = 0; }
+fn first_live(a: Node*, b: Node*) -> bool { return a != 0; }
+fn clears_then_agrees(p: Node*) -> bool { if (p == 0) { return false; } if (p->len <= 4) { return false; } p->len = 0; return true; }
+fn moves_pointer(p: Node*) -> bool { p = p->next; return p != 0; }
+fn loose_live(p: Node*, force: bool) -> bool { if (force) { return true; } return p != 0; }
+fn first_ordered(a: Span, b: Span) -> bool { return a.lo <= a.hi; }
+fn rewrites_then_agrees(s: Span) -> bool { s.lo = 0; s.hi = 1; return s.lo <= s.hi; }
+fn defers_a_clear(p: Node*) -> bool { if (p == 0) { return false; } defer shrink(p); return p->len > 4; }
+
+struct Clearer {
+  target: Node*;
+  method drop() { this.target->len = 0; }
+}
+
+fn drops_a_clear(p: Node*) -> bool { if (p == 0) { return false; } var c: Clearer = { target: p }; return p->len > 4; }
+fn between(n: int32, lo: int32, hi: int32) -> bool { return n >= lo && n <= hi; }
+fn Span_ordered(s: Span) -> bool { return s.lo <= s.hi; }
+
 fn reassign_after_verdict(n: int32) -> int32 {
   if (is_percent(n)) { n = n + 500; var p: Percent = n; return p; } return 0; }
 
@@ -146,6 +177,84 @@ fn narrowing_store_wraps(x: uint8) -> int32 {
 
 fn narrowing_return_wraps(x: uint8) -> int32 {
   var h: High = raised(x); return (int32)h; }
+
+fn pointer_reassigned(p: Node*, q: Node*) -> int32 {
+  if (is_live(p)) { p = q; var x: Live = (Live)p; return x->len; } return 0; }
+
+fn pointer_other_argument(p: Node*, q: Node*) -> int32 {
+  if (first_live(p, q)) { var x: Live = (Live)q; return x->len; } return 0; }
+
+fn pointer_wrong_branch(p: Node*) -> int32 {
+  if (!is_live(p)) { var x: Live = (Live)p; return x->len; } return 0; }
+
+fn pointer_callee_moves_param(p: Node*) -> int32 {
+  if (moves_pointer(p)) { var x: Live = (Live)p; return x->len; } return 0; }
+
+fn pointer_two_true_paths(p: Node*) -> int32 {
+  if (loose_live(p, true)) { var x: Live = (Live)p; return x->len; } return 0; }
+
+fn pointer_reassigned_after_demand(p: Node*, q: Node*) -> int32 {
+  must_live(p); p = q; var x: Live = (Live)p; return x->len; }
+
+fn memory_fact_after_store(p: Node*) -> int32 {
+  if (is_long(p)) { p->len = 0; var x: Long = (Long)p; return x->len; } return 0; }
+
+fn memory_fact_after_call(p: Node*) -> int32 {
+  if (is_long(p)) { shrink(p); var x: Long = (Long)p; return x->len; } return 0; }
+
+fn memory_fact_cleared_in_callee(p: Node*) -> int32 {
+  if (clears_then_agrees(p)) { var x: Long = (Long)p; return x->len; } return 0; }
+
+fn struct_field_written(s: Span) -> int32 {
+  if (is_ordered(s)) { s.hi = s.lo - 5; var o: Ordered = (Ordered)s; return o.hi; } return 0; }
+
+fn struct_other_argument(a: Span, b: Span) -> int32 {
+  if (first_ordered(a, b)) { var o: Ordered = (Ordered)b; return o.hi; } return 0; }
+
+fn slice_other_argument(buf: int32[], other: int32[], i: int64) -> int32 {
+  if (in_bounds(other, i)) { var at: Index = (Index)i; return buf[(int64)at]; } return 0; }
+
+fn slice_index_moved(buf: int32[], i: int64) -> int32 {
+  if (in_bounds(buf, i)) { i = i + 100; var at: Index = (Index)i; return buf[(int64)at]; } return 0; }
+
+fn struct_field_written_in_callee(s: Span) -> int32 {
+  if (rewrites_then_agrees(s)) { var o: Ordered = (Ordered)s; return o.hi; } return 0; }
+
+fn memory_fact_cleared_by_defer(p: Node*) -> int32 {
+  if (defers_a_clear(p)) { var x: Long = (Long)p; return x->len; } return 0; }
+
+fn memory_fact_cleared_by_drop(p: Node*) -> int32 {
+  if (drops_a_clear(p)) { var x: Long = (Long)p; return x->len; } return 0; }
+
+fn between_unbounded_limit(k: int32, top: int32) -> int32 {
+  if (between(k, 0, top)) { var p: Percent = k; return p; } return 0; }
+
+fn between_limit_lowered(k: int32) -> int32 {
+  var hi: int32 = 100; if (between(k, 0, hi)) { hi = 5; var d: Digit = k; return d + hi; } return 0; }
+
+fn between_arguments_swapped(k: int32) -> int32 {
+  if (between(0, k, 9)) { var d: Digit = k; return d; } return 0; }
+
+fn switch_arm_reached_by_fallthrough(n: int32) -> int32 {
+  switch (n) { case 500: { fallthrough; } case 4: { var d: Digit = n; return d; } default: { return 0; } } }
+
+fn switch_arm_below_an_empty_arm(n: int32) -> int32 {
+  switch (n) { case 500: case 4: { var d: Digit = n; return d; } default: { return 0; } } }
+
+fn switch_arm_writes_the_value(n: int32) -> int32 {
+  switch (n) { case 4: { n = n + 50; var d: Digit = n; return d; } default: { return 0; } } }
+
+fn switch_default_arm(n: int32) -> int32 {
+  switch (n) { case 4: { return 4; } default: { var d: Digit = n; return d; } } }
+
+fn expression_argument_differs(a: int32, b: int32) -> int32 {
+  if (is_percent(a + b)) { var p: Percent = a - b; return p; } return 0; }
+
+fn expression_argument_written(a: int32, b: int32) -> int32 {
+  if (is_percent(a + b)) { a = a + 500; var p: Percent = a + b; return p; } return 0; }
+
+fn method_on_another_object(s: Span, t: Span) -> int32 {
+  if (s.ordered()) { var o: Ordered = (Ordered)t; return o.hi; } return 0; }
 
 fn narrowing_under_a_repeated_test(x: uint8) -> int32 {
   if (x + 200 >= 200) { var h: High = x + 200; return (int32)h; } return 0; }

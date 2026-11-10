@@ -1,0 +1,65 @@
+import "std/io";
+import "std/process";
+
+type Digit = int32 where value >= 0 && value < 10;
+type Percent = int32 where value >= 0 && value <= 100;
+
+fn between(n: int32, lo: int32, hi: int32) -> bool { return n >= lo && n <= hi; }
+
+fn must_be_between(n: int32, lo: int32, hi: int32) {
+  if (n < lo || n > hi) { exit(8); }
+}
+
+fn graded(n: int32) -> int32 {
+  switch (n) {
+    case 1: { return 9; }
+    case 2..5: { return n; }
+    default: { return 0; }
+  }
+}
+
+fn by_between(k: int32) -> int32 {
+  if (between(k, 0, 9)) {
+    var d: Digit = k;
+    return d;
+  }
+  return -1;
+}
+
+fn by_between_bounds(k: int32, top: Percent) -> int32 {
+  if (between(k, 0, top)) {
+    var p: Percent = k;
+    return p;
+  }
+  return -1;
+}
+
+fn by_between_demand(k: int32) -> int32 {
+  must_be_between(k, 3, 7);
+  var d: Digit = k;
+  return d;
+}
+
+fn by_switch_arm(n: int32) -> int32 {
+  switch (n) {
+    case 4: {
+      var d: Digit = n;
+      return d;
+    }
+    case 20..90: {
+      var p: Percent = n;
+      return p;
+    }
+    default: { return -1; }
+  }
+}
+
+fn by_switch_result(n: int32) -> int32 {
+  var d: Digit = graded(n);
+  return d;
+}
+
+fn main() -> int32 {
+  println("{by_between(6)} {by_between(60)} {by_between_bounds(40, (Percent)50)} {by_between_demand(5)} {by_switch_arm(4)} {by_switch_arm(33)} {by_switch_arm(7)} {by_switch_result(3)}");
+  return 0;
+}
