@@ -373,6 +373,35 @@ static int type_checker_eval_string_equality(TypeChecker *checker,
   return 1;
 }
 
+static void type_checker_fold_in_operation_type(TypeChecker *checker,
+                                                BinaryExpression *binary,
+                                                TypeCheckerIntFold *fold) {
+  const char *op = binary->operator;
+  int left_bits = 0, left_signed = 0, right_bits = 0, right_signed = 0;
+  if (fold->shaped && fold->bits < 64 &&
+      (strcmp(op, "/") == 0 || strcmp(op, "%") == 0)) {
+    fold->left = type_checker_wrap_integer(fold->left, fold->bits,
+                                           fold->is_signed);
+    fold->right = type_checker_wrap_integer(fold->right, fold->bits,
+                                            fold->is_signed);
+    return;
+  }
+  if (!fold->compare_unsigned || type_checker_compare_kind(op) == TC_CMP_NONE ||
+      !type_checker_integer_type_shape(
+          type_checker_infer_type(checker, binary->left), &left_bits,
+          &left_signed) ||
+      !type_checker_integer_type_shape(
+          type_checker_infer_type(checker, binary->right), &right_bits,
+          &right_signed)) {
+    return;
+  }
+  int width = left_bits > right_bits ? left_bits : right_bits;
+  if (width < 64) {
+    fold->left = type_checker_wrap_integer(fold->left, width, 0);
+    fold->right = type_checker_wrap_integer(fold->right, width, 0);
+  }
+}
+
 static int type_checker_eval_binary(TypeChecker *checker, ASTNode *expression,
                                     TypeCheckerConstant *out_value) {
   BinaryExpression *binary_expr = (BinaryExpression *)expression->data;
@@ -408,6 +437,7 @@ static int type_checker_eval_binary(TypeChecker *checker, ASTNode *expression,
     fold.compare_unsigned = type_checker_compare_is_unsigned(
         type_checker_infer_type(checker, binary_expr->left),
         type_checker_infer_type(checker, binary_expr->right));
+    type_checker_fold_in_operation_type(checker, binary_expr, &fold);
   }
   return type_checker_fold_int_binary(binary_expr->operator, &fold, out_value);
 }
