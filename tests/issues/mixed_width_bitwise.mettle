@@ -1,0 +1,19 @@
+import "std/io";
+
+var narrow: int32 = 5;
+
+fn show<T>(v: T) -> T { return v; }
+
+fn main() -> int32 {
+  var wide: int64 = 4294967296;
+  var f: float32 = 0.5;
+  var a: int64 = show(narrow ^ wide);
+  var b: int64 = show(narrow + wide);
+  var c: float32 = show(f + 0.25);
+  var d: float64 = show(narrow * 0.5);
+  var e: float32 = show(narrow * f);
+  var h: int32 = show(narrow | 3);
+  var k: int32 = (int32)(if (wide > 0) wide else (narrow | wide));
+  println("{a} {b} {c} {d} {e} {h} {k}");
+  return 0;
+}

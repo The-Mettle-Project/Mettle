@@ -1935,6 +1935,11 @@ static Type *type_checker_promote_base_types(TypeChecker *checker, Type *left,
     if (right->kind == TYPE_BOOL) {
       right = checker->builtin_int32;
     }
+    if (strcmp(operator, "<<") != 0 && strcmp(operator, ">>") != 0 &&
+        type_checker_is_integer_type(left) &&
+        type_checker_is_integer_type(right)) {
+      return type_checker_get_larger_type(checker, left, right);
+    }
   }
 
   if (strcmp(operator, "+") == 0 || strcmp(operator, "-") == 0 ||

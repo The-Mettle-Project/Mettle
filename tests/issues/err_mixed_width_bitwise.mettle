@@ -1,0 +1,9 @@
+import "std/io";
+
+fn main() -> int32 {
+  var narrow: int32 = 5;
+  var wide: int64 = 4294967296;
+  var n: int32 = narrow | wide;
+  println("{n}");
+  return 0;
+}

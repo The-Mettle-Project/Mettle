@@ -3365,6 +3365,48 @@ static int mono_is_integer_text(const char *type) {
   return mono_is_number_type(type) && strncmp(type, "float", 5) != 0;
 }
 
+static int mono_is_float_literal(const ASTNode *node) {
+  if (node && node->type == AST_UNARY_EXPRESSION && node->data) {
+    const UnaryExpression *unary = (const UnaryExpression *)node->data;
+    if (unary->operator && strcmp(unary->operator, "-") == 0) {
+      node = unary->operand;
+    }
+  }
+  const NumberLiteral *literal = node && node->type == AST_NUMBER_LITERAL
+                                     ? (const NumberLiteral *)node->data
+                                     : NULL;
+  return literal && literal->is_float;
+}
+
+static int mono_number_rank(const char *type) {
+  if (strncmp(type, "float", 5) == 0) {
+    return strcmp(type, "float64") == 0 ? 6 : 5;
+  }
+  const char *digits = type[0] == 'u' ? type + 4 : type + 3;
+  int bits = atoi(digits);
+  return bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 3 : 4;
+}
+
+static char *mono_promoted_number(const BinaryExpression *bin, char *left,
+                                  char *right, int is_bits) {
+  int left_float = !mono_is_integer_text(left);
+  int right_float = !mono_is_integer_text(right);
+  if (is_bits && (left_float || right_float)) {
+    return NULL;
+  }
+  if (left_float && right_float) {
+    if (mono_is_float_literal(bin->right)) {
+      return left;
+    }
+    if (mono_is_float_literal(bin->left)) {
+      return right;
+    }
+  } else if (left_float != right_float) {
+    return left_float ? left : right;
+  }
+  return mono_number_rank(left) >= mono_number_rank(right) ? left : right;
+}
+
 static char *mono_exact_binary_type(MonoContext *ctx, BinaryExpression *bin,
                                     MonoVarEnv *env) {
   const char *op = bin->operator;
@@ -3403,6 +3445,8 @@ static char *mono_exact_binary_type(MonoContext *ctx, BinaryExpression *bin,
                    : NULL;
     } else if (mono_is_int32_literal(bin->left)) {
       result = !is_bits && mono_outranks_int32(right) ? right : NULL;
+    } else if (mono_is_number_type(left) && mono_is_number_type(right)) {
+      result = mono_promoted_number(bin, left, right, is_bits);
     }
   }
   if (result != left) {
