@@ -345,12 +345,12 @@ static int value_unify_without_target(TypeChecker *checker, ASTNode *value,
        type_checker_is_assignable_from(checker, frame->result, found, value))) {
     return 1;
   }
-  if (frame->kind == VALUE_SCOPE_MATCH &&
+  int both_numeric = type_checker_is_numeric_type(frame->result) &&
+                     type_checker_is_numeric_type(found);
+  if (frame->kind == VALUE_SCOPE_MATCH && !both_numeric &&
       type_checker_are_compatible(frame->result, found)) {
     return 1;
   }
-  int both_numeric = type_checker_is_numeric_type(frame->result) &&
-                     type_checker_is_numeric_type(found);
   if (!both_numeric && type_checker_is_assignable_from(checker, frame->result,
                                                        found, value)) {
     return 1;
@@ -405,6 +405,8 @@ int type_checker_check_yield(TypeChecker *checker, ASTNode *statement) {
     return 1;
   }
   if (frame->kind == VALUE_SCOPE_MATCH &&
+      !(type_checker_is_numeric_type(frame->target) &&
+        type_checker_is_numeric_type(found)) &&
       type_checker_are_compatible(frame->target, found)) {
     return 1;
   }

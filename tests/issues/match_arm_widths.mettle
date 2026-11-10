@@ -1,0 +1,14 @@
+import "std/io";
+enum K { A(int32), B(int32), C }
+fn pick(k: K, s: int16, w: int64) -> int64 {
+  var r: int64 = match (k) {
+    case A(v): s,
+    case B(v): v,
+    default: w
+  };
+  return r;
+}
+fn main() -> int32 {
+  println("{pick(A(1), -5, 5000000000)} {pick(B(7), -5, 5000000000)} {pick(C, -5, 5000000000)}");
+  return 0;
+}

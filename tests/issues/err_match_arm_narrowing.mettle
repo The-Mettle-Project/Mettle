@@ -1,0 +1,16 @@
+import "std/io";
+
+enum K { A(int32), C }
+
+fn small(k: K, w: int64) -> int16 {
+  var r: int16 = match (k) {
+    case A(v): 3,
+    default: w
+  };
+  return r;
+}
+
+fn main() -> int32 {
+  println("{small(C, 5000000000)}");
+  return 0;
+}
