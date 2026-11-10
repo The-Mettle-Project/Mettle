@@ -2219,8 +2219,11 @@ static int type_checker_expression_is_destination_width(TypeChecker *checker,
 
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *binary = (BinaryExpression *)expression->data;
-    if (!binary || !type_checker_op_keeps_low_bits(binary->operator)) {
+    if (!binary) {
       return 0;
+    }
+    if (!type_checker_op_keeps_low_bits(binary->operator)) {
+      break;
     }
     return type_checker_expression_is_destination_width(checker, dest_type,
                                                         binary->left,

@@ -15,5 +15,10 @@ fn main() -> int32 {
   var h: int32 = show(narrow | 3);
   var k: int32 = (int32)(if (wide > 0) wide else (narrow | wide));
   println("{a} {b} {c} {d} {e} {h} {k}");
+  var crc: uint32 = 77;
+  var mask: uint32 = 5;
+  crc = (crc >> 1) + (3988292384 + mask);
+  var x: uint32 = (crc >> 1) ^ (3988292384 & mask);
+  println("{crc} {x}");
   return 0;
 }
