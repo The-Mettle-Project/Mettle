@@ -32,7 +32,9 @@ fn next(k: int32) -> int32 { return k + 1; }
 fn leaky_clamp(x: int32, lo: int32, hi: int32) -> int32 { if (x < lo) { return lo; } if (x > hi) { return hi; } if (x == 7) { return 7000; } return x; }
 fn in_unit(x: float64) -> bool { return x >= 0.0 && x <= 1.0; }
 fn first_in_unit(a: float64, b: float64) -> bool { return a >= 0.0 && a <= 1.0; }
-fn must_be_unit(x: float64) { if (x < 0.0 || x > 1.0) { exit(4); } }
+fn must_be_unit(x: float64) { if (!(x >= 0.0 && x <= 1.0)) { exit(4); } }
+fn must_not_be_outside(x: float64) { if (x < 0.0 || x > 1.0) { exit(4); } }
+fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c; }
 fn moved_unit(x: float64) -> bool { x = x - 10.0; return x >= 0.0 && x <= 1.0; }
 
 type High = uint8 where value >= 200;
@@ -255,6 +257,21 @@ fn expression_argument_written(a: int32, b: int32) -> int32 {
 
 fn method_on_another_object(s: Span, t: Span) -> int32 {
   if (s.ordered()) { var o: Ordered = (Ordered)t; return o.hi; } return 0; }
+
+fn float_nan_passes_an_early_exit(x: float64) -> float64 {
+  if (x < 0.0 || x > 1.0) { return 0.0; } var u: Unit = (Unit)x; return (float64)u; }
+
+fn float_nan_passes_negated_tests(x: float64) -> float64 {
+  if (!(x < 0.0)) { if (!(x > 1.0)) { var u: Unit = (Unit)x; return (float64)u; } } return 0.0; }
+
+fn float_nan_passes_a_demand(x: float64) -> float64 {
+  must_not_be_outside(x); var u: Unit = (Unit)x; return (float64)u; }
+
+fn destructor_at_the_end_of_a_scope(p: Node*) -> int32 {
+  if (is_long(p)) { { var c: Clearer = { target: p }; } var x: Long = (Long)p; return x->len; } return 0; }
+
+fn destructor_on_reassignment(p: Node*, q: Node*) -> int32 {
+  var c: Clearer = { target: p }; if (is_long(p)) { c = make_clearer(q); var x: Long = (Long)p; return x->len; } return 0; }
 
 fn narrowing_under_a_repeated_test(x: uint8) -> int32 {
   if (x + 200 >= 200) { var h: High = x + 200; return (int32)h; } return 0; }

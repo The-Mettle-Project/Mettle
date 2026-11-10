@@ -4958,9 +4958,10 @@ catch {
 # slices, through a method, with an expression for an argument, and with a
 # bound taken from another argument; a clamp, a halving and a nested call
 # bound their results by what they were given; a switch arm knows the value
-# that chose it; the run-time check agrees; and 63 programs that write the
+# that chose it; the run-time check agrees; and 68 programs that write the
 # value after the test, read a result wider than its call allows, narrow a
-# value that wraps, or rest on a test the callee undid are each refused.
+# value that wraps, rest on a test the callee undid, let a NaN past a negated
+# comparison, or keep a test across a destructor are each refused.
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
@@ -4983,7 +4984,7 @@ try {
   $out = & $CompilerPath --build "tests/err_proof_stale.mettle" -o (Join-Path $tmpDir "proof_stale.exe") 2>&1 | Out-String
   if ($LASTEXITCODE -eq 0) { throw "a value written after its test was proven anyway" }
   $refused = ([regex]::Matches($out, "error\[P0001\]")).Count
-  if ($refused -ne 63) { throw "expected 63 refusals and got ${refused}: $out" }
+  if ($refused -ne 68) { throw "expected 68 refusals and got ${refused}: $out" }
   Write-CaseResult -Name "proofs_cross_calls_and_end_at_writes" -Passed $true
 }
 catch {

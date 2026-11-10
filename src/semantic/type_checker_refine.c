@@ -641,6 +641,8 @@ static int name_moved(TypeChecker *checker, size_t guard, const char *name) {
   return kill_of_name(checker, guard, name);
 }
 
+static int type_runs_a_destructor(TypeChecker *checker, const Type *type);
+
 static int condition_taint(TypeChecker *checker, const ASTNode *node) {
   const char *op = NULL;
   ASTNode *operand = NULL;
@@ -660,7 +662,8 @@ static int condition_taint(TypeChecker *checker, const ASTNode *node) {
     if (call && call->object) {
       return 2;
     }
-    taint = !summary || summary->writes;
+    taint = !summary || summary->writes ||
+            type_runs_a_destructor(checker, node->resolved_type);
   }
   for (size_t i = 0; i < node->child_count && taint < 2; i++) {
     int inner = condition_taint(checker, node->children[i]);
@@ -726,10 +729,28 @@ static void effect_of_write(TypeChecker *checker, const ASTNode *target) {
   }
 }
 
+static int type_runs_a_destructor(TypeChecker *checker, const Type *type) {
+  return type && ownership_type_owns(checker, (Type *)type);
+}
+
+static void effect_of_drop(TypeChecker *checker, const Type *type) {
+  Symbol *fn = checker->current_function;
+  if (!type_runs_a_destructor(checker, type)) {
+    return;
+  }
+  kill_add(checker, KILL_MEMORY, NULL, MOVED_ANY);
+  if (fn && fn->kind == SYMBOL_FUNCTION && fn->summary) {
+    ((FunctionSummary *)fn->summary)->drops = 1;
+  }
+}
+
 static void effect_of_assignment(TypeChecker *checker, const ASTNode *node) {
   const Assignment *assign = (const Assignment *)node->data;
   if (!assign) {
     return;
+  }
+  if (assign->value) {
+    effect_of_drop(checker, assign->value->resolved_type);
   }
   if (assign->target) {
     effect_of_write(checker, assign->target);
@@ -762,11 +783,11 @@ static void effect_of_call(TypeChecker *checker, const ASTNode *node) {
   if (!summary || summary->writes) {
     kill_add(checker, KILL_MEMORY, NULL, MOVED_ANY);
   }
+  effect_of_drop(checker, node->resolved_type);
 }
 
 static void effect_of_declaration(TypeChecker *checker,
                                   const VarDeclaration *decl) {
-  Symbol *fn = checker->current_function;
   Symbol *made = decl->name
                      ? symbol_table_peek(checker->symbol_table, decl->name)
                      : NULL;
@@ -774,10 +795,7 @@ static void effect_of_declaration(TypeChecker *checker,
     return;
   }
   kill_add(checker, KILL_NAME, decl->name, MOVED_ANY);
-  if (fn && fn->kind == SYMBOL_FUNCTION && fn->summary && made && made->type &&
-      ownership_type_owns(checker, made->type)) {
-    ((FunctionSummary *)fn->summary)->drops = 1;
-  }
+  effect_of_drop(checker, made ? made->type : NULL);
 }
 
 void type_checker_note_effects(TypeChecker *checker, ASTNode *node) {
@@ -2935,6 +2953,8 @@ void type_checker_summary_end(TypeChecker *checker) {
   summary_scan(checker, ((const FunctionDeclaration *)decl->data)->body,
                summary);
   if (summary->drops) {
+    summary->writes = 1;
+    summary->reads = 1;
     atom_set_after_drops(checker, &summary->atoms_true);
     atom_set_after_drops(checker, &summary->atoms_false);
     atom_set_after_drops(checker, &summary->atoms_returns);
@@ -3174,14 +3194,9 @@ static void fnarrow_visit(void *raw, ASTNode *node, int negated) {
     fnarrow_by_verdict(ctx, node, negated);
     return;
   }
-  if (!binary_parts(node, &op, &left, &right) || !is_comparison(op)) {
+  if (negated || !binary_parts(node, &op, &left, &right) ||
+      !is_comparison(op)) {
     return;
-  }
-  if (negated) {
-    op = negate_operator(op);
-    if (!op) {
-      return;
-    }
   }
   left_name = identifier_name(left);
   right_name = identifier_name(right);
@@ -3739,9 +3754,17 @@ typedef struct {
   const char *binding;
   int found;
   int demand;
+  const char *via;
   TypeChecker *checker;
   size_t guard;
 } MatchContext;
+
+static int comparison_may_see_nan(const ASTNode *left, const ASTNode *right) {
+  return (left && left->resolved_type &&
+          type_checker_is_float_base(left->resolved_type)) ||
+         (right && right->resolved_type &&
+          type_checker_is_float_base(right->resolved_type));
+}
 
 static int atom_matches(const MatchContext *ctx, const ASTNode *node,
                         int negated, const Replay *swap) {
@@ -3756,7 +3779,7 @@ static int atom_matches(const MatchContext *ctx, const ASTNode *node,
     return nodes_equal(ctx->pattern, node, ctx->binding, ctx->filler, swap, 0);
   }
   if (negated == FACT_DEMANDED || !binary_parts(node, &op, &left, &right) ||
-      !is_comparison(op)) {
+      !is_comparison(op) || comparison_may_see_nan(left, right)) {
     return 0;
   }
   flipped = negate_operator(op);
@@ -3979,8 +4002,12 @@ static void match_visit(void *raw, ASTNode *node, int negated) {
     return;
   }
   if (node->type == AST_FUNCTION_CALL) {
+    const CallExpression *call = (const CallExpression *)node->data;
     match_replay(ctx, node, ctx->demand ? FACT_DEMANDED : negated, NULL,
                  guard_lost_memory(ctx->checker, ctx->guard));
+    if (ctx->found && call) {
+      ctx->via = call->written_name ? call->written_name : call->function_name;
+    }
   }
   if (ctx->found || ctx->demand ||
       expr_killed(ctx->checker, ctx->guard, node)) {
@@ -3991,13 +4018,14 @@ static void match_visit(void *raw, ASTNode *node, int negated) {
 
 static int guards_prove_atom(TypeChecker *checker, ASTNode *atom,
                              int atom_negated, ASTNode *filler,
-                             const char *binding) {
+                             const char *binding, const char **via) {
   MatchContext ctx;
   ctx.pattern = atom;
   ctx.pattern_negated = atom_negated;
   ctx.filler = filler;
   ctx.binding = binding;
   ctx.found = 0;
+  ctx.via = NULL;
   ctx.checker = checker;
   for (size_t i = 0; i < checker->guard_count && !ctx.found; i++) {
     struct TypeCheckerGuard *guard = &checker->guards[i];
@@ -4008,6 +4036,9 @@ static int guards_prove_atom(TypeChecker *checker, ASTNode *atom,
     } else if (guard->condition) {
       visit_atoms(guard->condition, guard->negated, match_visit, &ctx, 0);
     }
+  }
+  if (via) {
+    *via = ctx.via;
   }
   return ctx.found;
 }
@@ -4095,7 +4126,12 @@ static void describe(const ASTNode *node, char *out, size_t capacity,
     return;
   case AST_MEMBER_ACCESS: {
     const MemberAccess *member = (const MemberAccess *)node->data;
-    if (member) {
+    if (member && unary_parts(member->object, &op, &operand) &&
+        strcmp(op, "*") == 0) {
+      describe(operand, out, capacity, depth + 1);
+      describe_append(out, capacity, "->");
+      describe_append(out, capacity, member->member ? member->member : "?");
+    } else if (member) {
       describe(member->object, out, capacity, depth + 1);
       describe_append(out, capacity, ".");
       describe_append(out, capacity, member->member ? member->member : "?");
@@ -4207,9 +4243,20 @@ static int fcomparison_holds(const char *op, const FRange *value,
   return 0;
 }
 
+static void prove_route_of_test(ProveContext *ctx, const char *via) {
+  if (via) {
+    snprintf(ctx->route, sizeof(ctx->route),
+             "the call to '%s' in scope tested the predicate", via);
+    return;
+  }
+  snprintf(ctx->route, sizeof(ctx->route),
+           "a dominating test in scope repeats the predicate");
+}
+
 static void prove_visit(void *raw, ASTNode *atom, int negated) {
   ProveContext *ctx = (ProveContext *)raw;
   const char *op = NULL;
+  const char *via = NULL;
   ASTNode *left = NULL;
   ASTNode *right = NULL;
   if (ctx->failed) {
@@ -4282,9 +4329,8 @@ static void prove_visit(void *raw, ASTNode *atom, int negated) {
     }
   }
   if (!ctx->narrows && guards_prove_atom(ctx->checker, atom, negated, ctx->expr,
-                                         ctx->binding)) {
-    snprintf(ctx->route, sizeof(ctx->route),
-             "a dominating test in scope repeats the predicate");
+                                         ctx->binding, &via)) {
+    prove_route_of_test(ctx, via);
     return;
   }
   ctx->failed = 1;
@@ -4574,7 +4620,7 @@ static void holds_visit(void *raw, ASTNode *atom, int negated) {
   if (ctx->failed) {
     return;
   }
-  if (guards_prove_atom(ctx->checker, atom, negated, NULL, NULL)) {
+  if (guards_prove_atom(ctx->checker, atom, negated, NULL, NULL, NULL)) {
     return;
   }
   if (binary_parts(atom, &op, &left, &right) && is_comparison(op)) {

@@ -37,7 +37,7 @@ fn down(n: int32) -> int32 {
 fn in_unit(x: float64) -> bool { return x >= 0.0 && x <= 1.0; }
 
 fn must_be_unit(x: float64) {
-  if (x < 0.0 || x > 1.0) { exit(4); }
+  if (!(x >= 0.0 && x <= 1.0)) { exit(4); }
 }
 
 fn halved(p: Percent) -> int32 {
