@@ -2736,12 +2736,16 @@ static int ir_unsigned_compare_reads_narrow(IRLoweringContext *context,
   Type *type = ir_infer_expression_type(context, node);
   Type *other_type = ir_infer_expression_type(context, other);
   if (!type || !other_type ||
-      (type->kind != TYPE_INT8 && type->kind != TYPE_INT16) ||
-      (other_type->kind != TYPE_UINT8 && other_type->kind != TYPE_UINT16) ||
+      (type->kind != TYPE_INT8 && type->kind != TYPE_INT16 &&
+       type->kind != TYPE_INT32) ||
+      (other_type->kind != TYPE_UINT8 && other_type->kind != TYPE_UINT16 &&
+       other_type->kind != TYPE_UINT32) ||
       !type_checker_compare_is_unsigned(other_type, type)) {
     return 1;
   }
-  unsigned long long mask = other_type->kind == TYPE_UINT8 ? 0xFFULL : 0xFFFFULL;
+  unsigned long long mask = other_type->kind == TYPE_UINT8    ? 0xFFULL
+                            : other_type->kind == TYPE_UINT16 ? 0xFFFFULL
+                                                              : 0xFFFFFFFFULL;
   if (value->kind == IR_OPERAND_INT) {
     value->int_value = (long long)((unsigned long long)value->int_value & mask);
     return 1;

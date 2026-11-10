@@ -14,6 +14,9 @@ fn check() -> int32 {
   if (n != 3) { bad = bad | 16; }
   var t: bool = (s8v < x);
   if (t) { bad = bad | 32; }
+  var wide: uint32 = 4294967293;
+  var s32v: int32 = 3;
+  if (wide != (s32v ^ s16v) || (s16v ^ s32v) < wide || wide == s8v) { bad = bad | 64; }
   return bad;
 }
 @test fn cmp_narrow() -> int32 { return check(); }
