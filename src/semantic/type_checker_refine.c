@@ -10,6 +10,12 @@ struct TypeCheckerGuard {
   int has_max;
   long long min;
   long long max;
+  unsigned char skip_all;
+  unsigned char skip_memory;
+  unsigned char is_float;
+  double float_min;
+  double float_max;
+  double float_err;
 };
 
 typedef struct {
@@ -314,6 +320,431 @@ static int unary_parts(const ASTNode *node, const char **op,
   return *op != NULL && *operand != NULL;
 }
 
+enum { KILL_NAME, KILL_MEMORY, KILL_ALL };
+enum { MOVED_NOT, MOVED_UP, MOVED_DOWN, MOVED_ANY };
+
+struct TypeCheckerKill {
+  const char *name;
+  size_t limit;
+  unsigned char kind;
+  unsigned char moved;
+};
+
+typedef struct {
+  int seen;
+  int has_min;
+  int has_max;
+  long long min;
+  long long max;
+} FactRange;
+
+typedef struct {
+  int seen;
+  int has_min;
+  int has_max;
+  double min;
+  double max;
+  double err;
+} FloatFact;
+
+typedef struct {
+  ASTNode *value;
+  int has_min;
+  int has_max;
+  long long min;
+  long long max;
+  struct TypeCheckerGuard *guards;
+  size_t guard_count;
+} ReturnCase;
+
+typedef struct {
+  int final;
+  int writes;
+  int reads;
+  int may_return;
+  int cases_open;
+  size_t count;
+  size_t case_count;
+  unsigned char *stable;
+  unsigned char *usable;
+  unsigned char *floats;
+  FactRange *returns;
+  FactRange *when_true;
+  FactRange *when_false;
+  FloatFact *float_returns;
+  FloatFact *float_when_true;
+  FloatFact *float_when_false;
+  ReturnCase *cases;
+} FunctionSummary;
+
+#define SUMMARY_MAX_CASES 16
+#define SUMMARY_MAX_FRAMES 3
+
+typedef struct {
+  Symbol *callee;
+  const FunctionSummary *summary;
+  const ReturnCase *at;
+  Range *ranges;
+} ProofFrame;
+
+static Symbol *movement_of(TypeChecker *checker, const char *name);
+
+static const FunctionSummary *summary_of_call(TypeChecker *checker,
+                                              const ASTNode *node) {
+  const CallExpression *call;
+  Symbol *callee;
+  const FunctionSummary *summary;
+  if (!checker || !node || node->type != AST_FUNCTION_CALL || !node->data) {
+    return NULL;
+  }
+  call = (const CallExpression *)node->data;
+  if (!call->function_name || call->object) {
+    return NULL;
+  }
+  callee = symbol_table_lookup(checker->symbol_table, call->function_name);
+  if (!callee || callee->kind != SYMBOL_FUNCTION) {
+    return NULL;
+  }
+  summary = (const FunctionSummary *)callee->summary;
+  return summary && summary->final &&
+                 summary->count == callee->data.function.parameter_count &&
+                 (summary->count == 0 || callee->data.function.parameter_types)
+             ? summary
+             : NULL;
+}
+
+static void kill_add(TypeChecker *checker, int kind, const char *name,
+                     int moved) {
+  struct TypeCheckerKill *kill;
+  if (!checker || checker->guard_count == 0) {
+    return;
+  }
+  if (checker->kill_count >= checker->kill_capacity) {
+    size_t next = checker->kill_capacity ? checker->kill_capacity * 2 : 16;
+    struct TypeCheckerKill *grown =
+        realloc(checker->kills, next * sizeof(struct TypeCheckerKill));
+    if (!grown) {
+      checker->guard_count = 0;
+      return;
+    }
+    checker->kills = grown;
+    checker->kill_capacity = next;
+  }
+  kill = &checker->kills[checker->kill_count++];
+  kill->name = name;
+  kill->limit = checker->guard_count;
+  kill->kind = (unsigned char)kind;
+  kill->moved = (unsigned char)moved;
+}
+
+static void kills_trim(TypeChecker *checker, size_t depth) {
+  for (size_t i = 0; i < checker->kill_count; i++) {
+    if (checker->kills[i].limit > depth) {
+      checker->kills[i].limit = depth;
+    }
+  }
+  while (checker->kill_count > 0 &&
+         checker->kills[checker->kill_count - 1].limit == 0) {
+    checker->kill_count--;
+  }
+}
+
+static int name_is_exposed(const TypeChecker *checker, const char *name) {
+  for (size_t i = 0; i < checker->exposed_count; i++) {
+    if (strcmp(checker->exposed[i], name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void expose_name(TypeChecker *checker, const char *name) {
+  if (name_is_exposed(checker, name)) {
+    return;
+  }
+  if (checker->exposed_count >= checker->exposed_capacity) {
+    size_t next = checker->exposed_capacity ? checker->exposed_capacity * 2 : 8;
+    const char **grown =
+        realloc((void *)checker->exposed, next * sizeof(const char *));
+    if (!grown) {
+      return;
+    }
+    checker->exposed = grown;
+    checker->exposed_capacity = next;
+  }
+  checker->exposed[checker->exposed_count++] = name;
+}
+
+void type_checker_facts_reset(TypeChecker *checker) {
+  if (checker) {
+    checker->kill_count = 0;
+    checker->exposed_count = 0;
+  }
+}
+
+static int name_is_shared(TypeChecker *checker, const char *name) {
+  Symbol *symbol;
+  if (name_is_exposed(checker, name)) {
+    return 1;
+  }
+  symbol = symbol_table_lookup(checker->symbol_table, name);
+  return symbol && symbol->kind == SYMBOL_VARIABLE && symbol->scope &&
+         symbol->scope->type == SCOPE_GLOBAL;
+}
+
+static int kill_of_name(const TypeChecker *checker, size_t guard,
+                        const char *name) {
+  int moved = MOVED_NOT;
+  for (size_t i = 0; i < checker->kill_count; i++) {
+    const struct TypeCheckerKill *kill = &checker->kills[i];
+    if (kill->limit <= guard) {
+      continue;
+    }
+    if (kill->kind == KILL_ALL) {
+      return MOVED_ANY;
+    }
+    if (kill->kind != KILL_NAME || strcmp(kill->name, name) != 0) {
+      continue;
+    }
+    if (kill->moved == MOVED_ANY || (moved != MOVED_NOT && moved != kill->moved)) {
+      return MOVED_ANY;
+    }
+    moved = kill->moved;
+  }
+  return moved;
+}
+
+static int memory_killed(const TypeChecker *checker, size_t guard) {
+  for (size_t i = 0; i < checker->kill_count; i++) {
+    const struct TypeCheckerKill *kill = &checker->kills[i];
+    if (kill->limit > guard && kill->kind != KILL_NAME) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int node_reads_memory(TypeChecker *checker, const ASTNode *node) {
+  const char *op = NULL;
+  ASTNode *operand = NULL;
+  const char *name = identifier_name(node);
+  if (name) {
+    return name_is_shared(checker, name);
+  }
+  if (node->type == AST_INDEX_EXPRESSION || node->type == AST_FUNC_PTR_CALL) {
+    return 1;
+  }
+  if (node->type == AST_MEMBER_ACCESS && node->data) {
+    const MemberAccess *member = (const MemberAccess *)node->data;
+    return member->object && member->object->resolved_type &&
+           member->object->resolved_type->kind == TYPE_POINTER;
+  }
+  if (node->type == AST_FUNCTION_CALL) {
+    const FunctionSummary *summary = summary_of_call(checker, node);
+    return !summary || summary->reads || summary->writes;
+  }
+  return unary_parts(node, &op, &operand) && strcmp(op, "*") == 0;
+}
+
+static int expr_killed_in(TypeChecker *checker, size_t guard,
+                          const ASTNode *node, int memory) {
+  const char *name;
+  if (!node) {
+    return 0;
+  }
+  name = identifier_name(node);
+  if (name && kill_of_name(checker, guard, name) != MOVED_NOT) {
+    return 1;
+  }
+  if (memory && node_reads_memory(checker, node)) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (expr_killed_in(checker, guard, node->children[i], memory)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int guard_lost_memory(const TypeChecker *checker, size_t guard) {
+  return checker->guards[guard].skip_memory || memory_killed(checker, guard);
+}
+
+static int guard_is_clean(const TypeChecker *checker, size_t guard) {
+  return checker->kill_count == 0 && !checker->guards[guard].skip_memory &&
+         !checker->guards[guard].skip_all;
+}
+
+static int expr_killed(TypeChecker *checker, size_t guard,
+                       const ASTNode *node) {
+  if (guard_is_clean(checker, guard)) {
+    return 0;
+  }
+  return checker->guards[guard].skip_all ||
+         expr_killed_in(checker, guard, node,
+                        guard_lost_memory(checker, guard));
+}
+
+static int name_moved(TypeChecker *checker, size_t guard, const char *name) {
+  if (guard_is_clean(checker, guard)) {
+    return MOVED_NOT;
+  }
+  if (checker->guards[guard].skip_all ||
+      (guard_lost_memory(checker, guard) && name_is_shared(checker, name))) {
+    return MOVED_ANY;
+  }
+  return kill_of_name(checker, guard, name);
+}
+
+static int condition_taint(TypeChecker *checker, const ASTNode *node) {
+  const char *op = NULL;
+  ASTNode *operand = NULL;
+  int taint = 0;
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_ASSIGNMENT || node->type == AST_INLINE_ASM ||
+      (unary_parts(node, &op, &operand) && strcmp(op, "&") == 0)) {
+    return 2;
+  }
+  if (node->type == AST_FUNC_PTR_CALL || node->type == AST_GPU_LAUNCH) {
+    taint = 1;
+  } else if (node->type == AST_FUNCTION_CALL) {
+    const FunctionSummary *summary = summary_of_call(checker, node);
+    const CallExpression *call = (const CallExpression *)node->data;
+    if (call && call->object) {
+      return 2;
+    }
+    taint = !summary || summary->writes;
+  }
+  for (size_t i = 0; i < node->child_count && taint < 2; i++) {
+    int inner = condition_taint(checker, node->children[i]);
+    taint = inner > taint ? inner : taint;
+  }
+  return taint;
+}
+
+static int moved_keeps(int moved, const char *op) {
+  if (moved == MOVED_NOT) {
+    return 1;
+  }
+  if (moved == MOVED_UP) {
+    return strcmp(op, ">") == 0 || strcmp(op, ">=") == 0;
+  }
+  if (moved == MOVED_DOWN) {
+    return strcmp(op, "<") == 0 || strcmp(op, "<=") == 0;
+  }
+  return 0;
+}
+
+static const char *written_root(const ASTNode *target, int *indirect) {
+  const char *op = NULL;
+  ASTNode *operand = NULL;
+  while (target) {
+    const char *name = identifier_name(target);
+    if (name) {
+      return name;
+    }
+    if (target->type == AST_INDEX_EXPRESSION && target->data) {
+      const ArrayIndexExpression *index =
+          (const ArrayIndexExpression *)target->data;
+      if (!index->array || !index->array->resolved_type ||
+          index->array->resolved_type->kind != TYPE_ARRAY) {
+        *indirect = 1;
+      }
+      target = index->array;
+    } else if (target->type == AST_MEMBER_ACCESS && target->data) {
+      const MemberAccess *member = (const MemberAccess *)target->data;
+      if (!member->object || !member->object->resolved_type ||
+          member->object->resolved_type->kind == TYPE_POINTER) {
+        *indirect = 1;
+      }
+      target = member->object;
+    } else if (unary_parts(target, &op, &operand)) {
+      *indirect = 1;
+      target = operand;
+    } else {
+      break;
+    }
+  }
+  *indirect = 1;
+  return NULL;
+}
+
+static void effect_of_write(TypeChecker *checker, const ASTNode *target) {
+  int indirect = 0;
+  const char *root = written_root(target, &indirect);
+  if (indirect || !root) {
+    kill_add(checker, KILL_MEMORY, NULL, MOVED_ANY);
+  } else {
+    kill_add(checker, KILL_NAME, root, MOVED_ANY);
+  }
+}
+
+static void effect_of_assignment(TypeChecker *checker, const ASTNode *node) {
+  const Assignment *assign = (const Assignment *)node->data;
+  if (!assign) {
+    return;
+  }
+  if (assign->target) {
+    effect_of_write(checker, assign->target);
+  } else if (assign->variable_name) {
+    Symbol *moves = movement_of(checker, assign->variable_name);
+    int direction = moves ? moves->move_direction : 0;
+    kill_add(checker, KILL_NAME, assign->variable_name,
+             direction > 0 ? MOVED_UP : direction < 0 ? MOVED_DOWN : MOVED_ANY);
+  }
+  for (size_t i = 0; i < assign->target_count; i++) {
+    effect_of_write(checker, assign->targets[i]);
+  }
+}
+
+static void effect_of_address(TypeChecker *checker, const ASTNode *operand) {
+  int indirect = 0;
+  const char *root = written_root(operand, &indirect);
+  if (root) {
+    expose_name(checker, root);
+    kill_add(checker, KILL_NAME, root, MOVED_ANY);
+  }
+}
+
+static void effect_of_call(TypeChecker *checker, const ASTNode *node) {
+  const CallExpression *call = (const CallExpression *)node->data;
+  const FunctionSummary *summary = summary_of_call(checker, node);
+  if (call && call->object) {
+    effect_of_address(checker, call->object);
+  }
+  if (!summary || summary->writes) {
+    kill_add(checker, KILL_MEMORY, NULL, MOVED_ANY);
+  }
+}
+
+void type_checker_note_effects(TypeChecker *checker, ASTNode *node) {
+  const char *op = NULL;
+  ASTNode *operand = NULL;
+  if (!checker || !node) {
+    return;
+  }
+  if (node->type == AST_ASSIGNMENT) {
+    effect_of_assignment(checker, node);
+  } else if (node->type == AST_VAR_DECLARATION && node->data) {
+    kill_add(checker, KILL_NAME, ((const VarDeclaration *)node->data)->name,
+             MOVED_ANY);
+  } else if (node->type == AST_FUNCTION_CALL) {
+    effect_of_call(checker, node);
+  } else if (node->type == AST_FUNC_PTR_CALL || node->type == AST_GPU_LAUNCH) {
+    kill_add(checker, KILL_MEMORY, NULL, MOVED_ANY);
+  } else if (node->type == AST_INLINE_ASM) {
+    kill_add(checker, KILL_ALL, NULL, MOVED_ANY);
+  } else if (unary_parts(node, &op, &operand) && strcmp(op, "&") == 0) {
+    effect_of_address(checker, operand);
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    type_checker_note_effects(checker, node->children[i]);
+  }
+}
+
 typedef struct {
   ASTNode *node;
   int negated;
@@ -357,7 +788,48 @@ typedef struct {
   const char *name;
   Range *range;
   int depth;
+  int tracked;
+  size_t guard;
 } NarrowContext;
+
+static int fact_fits(const Type *from, const Type *to);
+static int float_fact_fits(const Type *from, const Type *to);
+static int type_checker_is_float_base(const Type *type);
+static FRange frange_of_type(const Type *type);
+static void fnarrow_by_guards(TypeChecker *checker, const char *name,
+                              FRange *range, int depth);
+
+static void narrow_by_verdict(NarrowContext *ctx, ASTNode *node, int negated) {
+  const FunctionSummary *summary = summary_of_call(ctx->checker, node);
+  const CallExpression *call = (const CallExpression *)node->data;
+  Symbol *callee;
+  if (!summary) {
+    return;
+  }
+  if (ctx->tracked
+          ? name_moved(ctx->checker, ctx->guard, ctx->name) != MOVED_NOT
+          : !ctx->checker->proof_frame) {
+    return;
+  }
+  callee = symbol_table_lookup(ctx->checker->symbol_table, call->function_name);
+  for (size_t i = 0; i < call->argument_count && i < summary->count; i++) {
+    const FactRange *fact = negated ? &summary->when_false[i]
+                                    : &summary->when_true[i];
+    const char *name = identifier_name(call->arguments[i]);
+    Range r;
+    if (!name || strcmp(name, ctx->name) != 0 || !summary->usable[i] ||
+        !fact->seen ||
+        !fact_fits(call->arguments[i]->resolved_type,
+                   callee->data.function.parameter_types[i])) {
+      continue;
+    }
+    r.has_min = fact->has_min;
+    r.min = fact->min;
+    r.has_max = fact->has_max;
+    r.max = fact->max;
+    range_meet(ctx->range, &r);
+  }
+}
 
 static void narrow_by_comparison(NarrowContext *ctx, const char *op,
                                  ASTNode *other) {
@@ -407,6 +879,12 @@ static void narrow_visit(void *raw, ASTNode *node, int negated) {
   ASTNode *right = NULL;
   const char *left_name;
   const char *right_name;
+  ASTNode *other = NULL;
+  int moved = MOVED_NOT;
+  if (node->type == AST_FUNCTION_CALL) {
+    narrow_by_verdict(ctx, node, negated);
+    return;
+  }
   if (!binary_parts(node, &op, &left, &right) || !is_comparison(op)) {
     return;
   }
@@ -419,10 +897,22 @@ static void narrow_visit(void *raw, ASTNode *node, int negated) {
   left_name = identifier_name(left);
   right_name = identifier_name(right);
   if (left_name && strcmp(left_name, ctx->name) == 0) {
-    narrow_by_comparison(ctx, op, right);
+    other = right;
   } else if (right_name && strcmp(right_name, ctx->name) == 0) {
-    narrow_by_comparison(ctx, flip_operator(op), left);
+    other = left;
+    op = flip_operator(op);
   }
+  if (!other) {
+    return;
+  }
+  if (ctx->tracked) {
+    moved = name_moved(ctx->checker, ctx->guard, ctx->name);
+    if (!moved_keeps(moved, op) ||
+        expr_killed(ctx->checker, ctx->guard, other)) {
+      return;
+    }
+  }
+  narrow_by_comparison(ctx, op, other);
 }
 
 static int narrowing_enter(TypeChecker *checker, const char *name) {
@@ -456,15 +946,19 @@ static void narrow_by_guards(TypeChecker *checker, const char *name,
   ctx.name = name;
   ctx.range = range;
   ctx.depth = depth;
+  ctx.tracked = 1;
   for (size_t i = 0; i < checker->guard_count; i++) {
     struct TypeCheckerGuard *guard = &checker->guards[i];
+    ctx.guard = i;
     if (guard->condition) {
       visit_atoms(guard->condition, guard->negated, narrow_visit, &ctx, 0);
-    } else if (guard->name && strcmp(guard->name, name) == 0) {
+    } else if (guard->name && !guard->is_float &&
+               strcmp(guard->name, name) == 0) {
+      int moved = name_moved(checker, i, name);
       Range r = range_unknown();
-      r.has_min = guard->has_min;
+      r.has_min = guard->has_min && moved_keeps(moved, ">=");
       r.min = guard->min;
-      r.has_max = guard->has_max;
+      r.has_max = guard->has_max && moved_keeps(moved, "<=");
       r.max = guard->max;
       range_meet(range, &r);
     }
@@ -488,9 +982,13 @@ static void narrow_by_monotone(TypeChecker *checker, const char *name,
 static void narrow_by_relation(TypeChecker *checker, const Type *declared,
                                Range *out, int depth);
 
+static int range_of_call_cases(TypeChecker *checker, ASTNode *expr,
+                               Symbol *callee, Range *out, int depth);
+static int frame_range_of_identifier(TypeChecker *checker, ASTNode *expr,
+                                     Range *out, int depth);
+
 static int range_of_call(TypeChecker *checker, ASTNode *expr, Range *out,
                     int depth) {
-  (void)depth;
 
   *out = range_unknown();
     CallExpression *call = (CallExpression *)expr->data;
@@ -549,6 +1047,12 @@ static int range_of_call(TypeChecker *checker, ASTNode *expr, Range *out,
       post.max = callee->post_max;
       range_meet(out, &post);
     }
+    if (callee && callee->kind == SYMBOL_FUNCTION) {
+      Range own;
+      if (range_of_call_cases(checker, expr, callee, &own, depth)) {
+        range_meet(out, &own);
+      }
+    }
     return out->has_min || out->has_max;
 }
 
@@ -596,6 +1100,24 @@ static int range_of_cast(TypeChecker *checker, ASTNode *expr, Range *out,
     return out->has_min || out->has_max;
 }
 
+static void range_as_computed(const Type *type, Range *out) {
+  const Type *base = type;
+  long long min = 0;
+  unsigned long long max = 0;
+  while (base && base->refined_base) {
+    base = base->refined_base;
+  }
+  if (!base || base->kind == TYPE_ENUM ||
+      !type_checker_integer_bounds(base, &min, &max)) {
+    return;
+  }
+  if (out->has_min && out->has_max && out->min >= min &&
+      (out->max < 0 || (unsigned long long)out->max <= max)) {
+    return;
+  }
+  *out = range_of_type(base);
+}
+
 static int range_of_unary(TypeChecker *checker, ASTNode *expr, Range *out,
                     int depth) {
   const char *op = NULL;
@@ -616,6 +1138,7 @@ static int range_of_unary(TypeChecker *checker, ASTNode *expr, Range *out,
           out->has_max = 1;
           out->max = -inner.min;
         }
+        range_as_computed(expr->resolved_type, out);
       }
       return out->has_min || out->has_max;
     }
@@ -792,6 +1315,9 @@ static int range_of_binary(TypeChecker *checker, ASTNode *expr, Range *out,
   range_binary_operator(op, &l, &r, have_l, have_r, out);
   if (!out->has_min && !out->has_max) {
     *out = range_of_type(expr->resolved_type);
+  } else if (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
+             strcmp(op, "*") == 0) {
+    range_as_computed(expr->resolved_type, out);
   }
   return out->has_min || out->has_max;
 }
@@ -800,6 +1326,9 @@ static int range_of_identifier(TypeChecker *checker, ASTNode *expr, Range *out,
                     int depth) {
 
   *out = range_unknown();
+    if (checker && checker->proof_frame) {
+      return frame_range_of_identifier(checker, expr, out, depth);
+    }
     Identifier *identifier = (Identifier *)expr->data;
     Symbol *symbol = identifier
                          ? type_checker_resolve_identifier(checker, identifier)
@@ -880,6 +1409,27 @@ static int range_of(TypeChecker *checker, ASTNode *expr, Range *out,
   }
 }
 
+static int parameter_is_stable(TypeChecker *checker, const char *name);
+
+static int relation_is_stable(TypeChecker *checker, const ASTNode *node,
+                              const char *binding) {
+  const char *name;
+  if (!node) {
+    return 1;
+  }
+  name = identifier_name(node);
+  if (name && strcmp(name, binding) != 0 &&
+      (name_is_shared(checker, name) || !parameter_is_stable(checker, name))) {
+    return 0;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (!relation_is_stable(checker, node->children[i], binding)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 static void narrow_by_relation(TypeChecker *checker, const Type *declared,
                                Range *out, int depth) {
   const Type *layer;
@@ -889,13 +1439,18 @@ static void narrow_by_relation(TypeChecker *checker, const Type *declared,
   for (layer = declared; layer && layer->refined_base;
        layer = layer->refined_base) {
     NarrowContext ctx;
-    if (!layer->refine_relational || !layer->refinement) {
+    if (!layer->refine_relational || !layer->refinement ||
+        !relation_is_stable(checker, layer->refinement,
+                            layer->refine_binding ? layer->refine_binding
+                                                  : "value")) {
       continue;
     }
     ctx.checker = checker;
     ctx.name = layer->refine_binding ? layer->refine_binding : "value";
     ctx.range = out;
     ctx.depth = depth;
+    ctx.tracked = 0;
+    ctx.guard = 0;
     visit_atoms(layer->refinement, 0, narrow_visit, &ctx, 0);
   }
 }
@@ -1504,7 +2059,12 @@ void type_checker_note_return_range(TypeChecker *checker, ASTNode *value) {
   if (!fn || fn->kind != SYMBOL_FUNCTION || fn->post_state == 3) {
     return;
   }
-  if (!value || !range_of(checker, value, &r, 0) || !r.has_min || !r.has_max) {
+  if (value && range_of(checker, value, &r, 0)) {
+    range_as_computed(fn->data.function.return_type, &r);
+  } else {
+    r = range_unknown();
+  }
+  if (!value || !r.has_min || !r.has_max) {
     fn->post_state = 3;
     fn->post_has_min = 0;
     fn->post_has_max = 0;
@@ -1523,6 +2083,660 @@ void type_checker_note_return_range(TypeChecker *checker, ASTNode *value) {
   }
   if (r.max > fn->post_max) {
     fn->post_max = r.max;
+  }
+}
+
+static int fact_fits(const Type *from, const Type *to) {
+  Range a = range_of_type(from);
+  Range b = range_of_type(to);
+  return from && to && a.has_min && a.has_max && b.has_min && b.has_max &&
+         a.min >= b.min && a.max <= b.max;
+}
+
+void type_checker_summary_begin(TypeChecker *checker) {
+  Symbol *fn = checker ? checker->current_function : NULL;
+  FunctionSummary *summary;
+  size_t count;
+  if (!fn || fn->kind != SYMBOL_FUNCTION) {
+    return;
+  }
+  count = fn->data.function.parameter_count;
+  type_checker_summary_free(fn->summary);
+  fn->summary = calloc(1, sizeof(FunctionSummary) +
+                              (count + 1) * 3 *
+                                  (sizeof(FactRange) + sizeof(FloatFact) + 1));
+  summary = (FunctionSummary *)fn->summary;
+  if (!summary) {
+    return;
+  }
+  summary->count = count;
+  summary->returns = (FactRange *)(summary + 1);
+  summary->when_true = summary->returns + count;
+  summary->when_false = summary->when_true + count;
+  summary->float_returns = (FloatFact *)(summary->when_false + count);
+  summary->float_when_true = summary->float_returns + count;
+  summary->float_when_false = summary->float_when_true + count;
+  summary->stable = (unsigned char *)(summary->float_when_false + count);
+  summary->usable = summary->stable + count;
+  summary->floats = summary->usable + count;
+  summary->cases_open =
+      fn->data.function.return_type &&
+      fn->data.function.return_type->kind != TYPE_ENUM &&
+      type_checker_is_integer_type(fn->data.function.return_type);
+  for (size_t i = 0; i < count && fn->data.function.parameter_types &&
+                     fn->data.function.parameter_names;
+       i++) {
+    Type *type = fn->data.function.parameter_types[i];
+    const char *name = fn->data.function.parameter_names[i];
+    summary->stable[i] = name && parameter_is_stable(checker, name);
+    summary->usable[i] = summary->stable[i] && type &&
+                         type->kind != TYPE_ENUM &&
+                         type_checker_is_integer_type(type);
+    summary->floats[i] =
+        summary->stable[i] && type && type_checker_is_float_base(type);
+  }
+}
+
+static int parameter_is_stable(TypeChecker *checker, const char *name) {
+  const ASTNode *decl = checker->current_function_decl;
+  const MovementIndex *index;
+  MovementSlot *slot;
+  if (!decl || decl->type != AST_FUNCTION_DECLARATION || !decl->data) {
+    return 0;
+  }
+  index = movement_index_for(
+      checker, ((const FunctionDeclaration *)decl->data)->body);
+  if (!index) {
+    return 0;
+  }
+  slot = movement_slot((MovementIndex *)index, name, 0);
+  return !slot || slot->count == 0;
+}
+
+static void range_of_parameter(TypeChecker *checker, const char *name,
+                               const Type *type, Range *out) {
+  *out = range_of_type(type);
+  if (narrowing_enter(checker, name)) {
+    narrow_by_guards(checker, name, out, 0);
+    narrow_by_relation(checker, type, out, 0);
+    narrowing_leave(checker);
+  }
+}
+
+static void fact_join(FactRange *fact, const Range *r) {
+  if (r->has_min && r->has_max && r->min > r->max) {
+    return;
+  }
+  if (!fact->seen) {
+    fact->seen = 1;
+    fact->has_min = r->has_min;
+    fact->has_max = r->has_max;
+    fact->min = r->min;
+    fact->max = r->max;
+    return;
+  }
+  fact->has_min = fact->has_min && r->has_min;
+  fact->has_max = fact->has_max && r->has_max;
+  if (r->has_min && r->min < fact->min) {
+    fact->min = r->min;
+  }
+  if (r->has_max && r->max > fact->max) {
+    fact->max = r->max;
+  }
+}
+
+static int guard_grow(TypeChecker *checker);
+
+static void guard_push_plain(TypeChecker *checker, ASTNode *condition,
+                             int negated) {
+  if (!guard_grow(checker)) {
+    return;
+  }
+  memset(&checker->guards[checker->guard_count], 0,
+         sizeof(struct TypeCheckerGuard));
+  checker->guards[checker->guard_count].condition = condition;
+  checker->guards[checker->guard_count].negated = negated;
+  checker->guard_count++;
+}
+
+static void fact_join_verdict(TypeChecker *checker, FunctionSummary *summary,
+                              size_t at, const char *name, const Type *type,
+                              ASTNode *value) {
+  size_t depth = checker->guard_count;
+  Range r;
+  guard_push_plain(checker, value, 0);
+  range_of_parameter(checker, name, type, &r);
+  fact_join(&summary->when_true[at], &r);
+  checker->guard_count = depth;
+  guard_push_plain(checker, value, 1);
+  range_of_parameter(checker, name, type, &r);
+  fact_join(&summary->when_false[at], &r);
+  checker->guard_count = depth;
+}
+
+static void frange_of_parameter(TypeChecker *checker, const char *name,
+                                const Type *type, FRange *out) {
+  *out = frange_of_type(type);
+  if (narrowing_enter(checker, name)) {
+    fnarrow_by_guards(checker, name, out, 0);
+    narrowing_leave(checker);
+  }
+}
+
+static void float_fact_join(FloatFact *fact, const FRange *r) {
+  if (r->has_min && r->has_max && r->min > r->max) {
+    return;
+  }
+  if (!fact->seen) {
+    fact->seen = 1;
+    fact->has_min = r->has_min;
+    fact->has_max = r->has_max;
+    fact->min = r->min;
+    fact->max = r->max;
+    fact->err = r->err;
+    return;
+  }
+  fact->has_min = fact->has_min && r->has_min;
+  fact->has_max = fact->has_max && r->has_max;
+  if (r->has_min && r->min < fact->min) {
+    fact->min = r->min;
+  }
+  if (r->has_max && r->max > fact->max) {
+    fact->max = r->max;
+  }
+  if (r->err > fact->err) {
+    fact->err = r->err;
+  }
+}
+
+static void float_fact_join_verdict(TypeChecker *checker,
+                                    FunctionSummary *summary, size_t at,
+                                    const char *name, const Type *type,
+                                    ASTNode *value) {
+  size_t depth = checker->guard_count;
+  FRange r;
+  guard_push_plain(checker, value, 0);
+  frange_of_parameter(checker, name, type, &r);
+  float_fact_join(&summary->float_when_true[at], &r);
+  checker->guard_count = depth;
+  guard_push_plain(checker, value, 1);
+  frange_of_parameter(checker, name, type, &r);
+  float_fact_join(&summary->float_when_false[at], &r);
+  checker->guard_count = depth;
+}
+
+static int summary_parameter(const Symbol *fn, const FunctionSummary *summary,
+                             const char *name) {
+  for (size_t i = 0; i < summary->count; i++) {
+    const char *own = fn->data.function.parameter_names[i];
+    if (own && strcmp(own, name) == 0) {
+      return summary->stable[i] ? (int)i : -2;
+    }
+  }
+  return -1;
+}
+
+static int case_is_portable(TypeChecker *checker, const Symbol *fn,
+                            const FunctionSummary *summary,
+                            const ASTNode *node) {
+  const char *name;
+  if (!node) {
+    return 1;
+  }
+  if (node->type == AST_LAMBDA_EXPRESSION || node->type == AST_ASSIGNMENT ||
+      node->type == AST_VALUE_SCOPE) {
+    return 0;
+  }
+  name = identifier_name(node);
+  if (name) {
+    int at = summary_parameter(fn, summary, name);
+    Symbol *symbol;
+    if (at != -1) {
+      return at >= 0;
+    }
+    symbol = symbol_table_lookup(checker->symbol_table, name);
+    return !type_checker_lookup_expansion_binding(checker, name) && symbol &&
+           symbol->scope && symbol->scope->type == SCOPE_GLOBAL;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (!case_is_portable(checker, fn, summary, node->children[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void summary_close_cases(FunctionSummary *summary) {
+  for (size_t i = 0; i < summary->case_count; i++) {
+    free(summary->cases[i].guards);
+  }
+  free(summary->cases);
+  summary->cases = NULL;
+  summary->case_count = 0;
+  summary->cases_open = 0;
+}
+
+void type_checker_summary_free(void *raw) {
+  FunctionSummary *summary = (FunctionSummary *)raw;
+  if (summary) {
+    summary_close_cases(summary);
+    free(summary);
+  }
+}
+
+static void case_keep_guards(TypeChecker *checker, const Symbol *fn,
+                             const FunctionSummary *summary,
+                             ReturnCase *kept) {
+  kept->guards = calloc(checker->guard_count + 1,
+                        sizeof(struct TypeCheckerGuard));
+  for (size_t i = 0; kept->guards && i < checker->guard_count; i++) {
+    const struct TypeCheckerGuard *guard = &checker->guards[i];
+    if (guard->condition && !guard->skip_all &&
+        case_is_portable(checker, fn, summary, guard->condition)) {
+      kept->guards[kept->guard_count++] = *guard;
+    }
+  }
+}
+
+static void summary_add_case(TypeChecker *checker, FunctionSummary *summary,
+                             const Symbol *fn, ASTNode *value) {
+  ReturnCase *kept;
+  Range now;
+  if (!summary->cases_open || !value) {
+    return;
+  }
+  if (summary->case_count >= SUMMARY_MAX_CASES) {
+    summary_close_cases(summary);
+    return;
+  }
+  if (!summary->cases) {
+    summary->cases = calloc(SUMMARY_MAX_CASES, sizeof(ReturnCase));
+    if (!summary->cases) {
+      summary->cases_open = 0;
+      return;
+    }
+  }
+  kept = &summary->cases[summary->case_count];
+  memset(kept, 0, sizeof(*kept));
+  if (case_is_portable(checker, fn, summary, value)) {
+    kept->value = value;
+  } else if (range_of(checker, value, &now, 0) && now.has_min && now.has_max) {
+    kept->has_min = 1;
+    kept->has_max = 1;
+    kept->min = now.min;
+    kept->max = now.max;
+  } else {
+    summary_close_cases(summary);
+    return;
+  }
+  summary->case_count++;
+  case_keep_guards(checker, fn, summary, kept);
+}
+
+static int frame_parameter_range(TypeChecker *checker, const ProofFrame *frame,
+                                 size_t at, const char *name, Range *out,
+                                 int depth) {
+  *out = frame->ranges[at];
+  if (frame->at && narrowing_enter(checker, name)) {
+    NarrowContext ctx;
+    ctx.checker = checker;
+    ctx.name = name;
+    ctx.range = out;
+    ctx.depth = depth;
+    ctx.tracked = 0;
+    ctx.guard = 0;
+    for (size_t i = 0; i < frame->at->guard_count; i++) {
+      visit_atoms(frame->at->guards[i].condition, frame->at->guards[i].negated,
+                  narrow_visit, &ctx, 0);
+    }
+    narrowing_leave(checker);
+  }
+  return out->has_min || out->has_max;
+}
+
+static int frame_range_of_identifier(TypeChecker *checker, ASTNode *expr,
+                                     Range *out, int depth) {
+  const ProofFrame *frame = (const ProofFrame *)checker->proof_frame;
+  const char *name = identifier_name(expr);
+  int at = name ? summary_parameter(frame->callee, frame->summary, name) : -2;
+  *out = range_unknown();
+  if (at >= 0) {
+    return frame_parameter_range(checker, frame, (size_t)at, name, out, depth);
+  }
+  if (at == -1) {
+    Symbol *symbol = symbol_table_lookup_global(checker->symbol_table, name);
+    if (symbol && symbol->kind == SYMBOL_CONSTANT) {
+      *out = range_exact(symbol->data.constant.value);
+      return 1;
+    }
+  }
+  if (expr->resolved_type && expr->resolved_type->kind != TYPE_ENUM &&
+      type_checker_is_integer_type(expr->resolved_type)) {
+    *out = range_of_type(expr->resolved_type);
+  }
+  return out->has_min || out->has_max;
+}
+
+static void frame_bind_argument(TypeChecker *checker, ProofFrame *frame,
+                                size_t at, ASTNode *argument, int depth) {
+  const Type *type = frame->callee->data.function.parameter_types[at];
+  Range own = range_of_type(type);
+  Range given;
+  frame->ranges[at] = range_unknown();
+  if (!frame->summary->usable[at]) {
+    return;
+  }
+  frame->ranges[at] = own;
+  if (!argument || !range_of(checker, argument, &given, depth + 1)) {
+    return;
+  }
+  if (given.has_min && given.has_max && own.has_min && own.has_max &&
+      given.min >= own.min && given.max <= own.max) {
+    frame->ranges[at] = given;
+  } else if (fact_fits(argument->resolved_type, type)) {
+    range_meet(&frame->ranges[at], &given);
+  }
+}
+
+static int frame_case_is_reachable(TypeChecker *checker,
+                                   const ProofFrame *frame, int depth) {
+  for (size_t i = 0; i < frame->summary->count; i++) {
+    Range r;
+    if (frame->summary->usable[i] &&
+        frame_parameter_range(checker, frame, i,
+                              frame->callee->data.function.parameter_names[i],
+                              &r, depth) &&
+        r.has_min && r.has_max && r.min > r.max) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void frame_join_cases(TypeChecker *checker, ProofFrame *frame,
+                             FactRange *hull, int depth) {
+  for (size_t i = 0; i < frame->summary->case_count; i++) {
+    const ReturnCase *at = &frame->summary->cases[i];
+    Range r = range_unknown();
+    frame->at = at;
+    if (!frame_case_is_reachable(checker, frame, depth)) {
+      continue;
+    }
+    if (!at->value) {
+      r.has_min = at->has_min;
+      r.has_max = at->has_max;
+      r.min = at->min;
+      r.max = at->max;
+    } else if (!range_of(checker, at->value, &r, depth + 1)) {
+      r = range_unknown();
+    }
+    range_as_computed(frame->callee->data.function.return_type, &r);
+    fact_join(hull, &r);
+    if (hull->seen && !hull->has_min && !hull->has_max) {
+      return;
+    }
+  }
+}
+
+static int range_of_call_cases(TypeChecker *checker, ASTNode *expr,
+                               Symbol *callee, Range *out, int depth) {
+  const FunctionSummary *summary = summary_of_call(checker, expr);
+  const CallExpression *call = (const CallExpression *)expr->data;
+  void *outer = checker->proof_frame;
+  size_t entered = checker->narrowing_count;
+  ProofFrame frame;
+  FactRange hull;
+  *out = range_unknown();
+  if (!summary || !summary->cases_open || summary->case_count == 0 ||
+      checker->proof_frame_depth >= SUMMARY_MAX_FRAMES ||
+      call->argument_count != summary->count ||
+      !callee->data.function.parameter_names) {
+    return 0;
+  }
+  memset(&hull, 0, sizeof(hull));
+  frame.callee = callee;
+  frame.summary = summary;
+  frame.at = NULL;
+  frame.ranges = calloc(summary->count + 1, sizeof(Range));
+  if (!frame.ranges) {
+    return 0;
+  }
+  for (size_t i = 0; i < summary->count; i++) {
+    frame_bind_argument(checker, &frame, i, call->arguments[i], depth);
+  }
+  checker->proof_frame = &frame;
+  checker->proof_frame_depth++;
+  checker->narrowing_count = 0;
+  frame_join_cases(checker, &frame, &hull, depth);
+  checker->narrowing_count = entered;
+  checker->proof_frame_depth--;
+  checker->proof_frame = outer;
+  free(frame.ranges);
+  if (!hull.seen) {
+    return 0;
+  }
+  out->has_min = hull.has_min;
+  out->has_max = hull.has_max;
+  out->min = hull.min;
+  out->max = hull.max;
+  return out->has_min || out->has_max;
+}
+
+void type_checker_note_return_facts(TypeChecker *checker, ASTNode *value) {
+  Symbol *fn = checker ? checker->current_function : NULL;
+  FunctionSummary *summary = fn && fn->kind == SYMBOL_FUNCTION
+                                 ? (FunctionSummary *)fn->summary
+                                 : NULL;
+  long long constant = 0;
+  int is_constant;
+  int splits;
+  if (!summary || summary->final) {
+    return;
+  }
+  summary->may_return = 1;
+  if (summary->count != fn->data.function.parameter_count ||
+      !fn->data.function.parameter_names ||
+      !fn->data.function.parameter_types) {
+    memset(summary->usable, 0, summary->count);
+    return;
+  }
+  is_constant = value && type_checker_eval_integer_constant_with_checker(
+                             checker, value, &constant);
+  splits = value && !is_constant && condition_taint(checker, value) == 0;
+  for (size_t i = 0; i < summary->count; i++) {
+    const char *name = fn->data.function.parameter_names[i];
+    const Type *type = fn->data.function.parameter_types[i];
+    int to_true = !value || !is_constant || constant != 0;
+    int to_false = !value || !is_constant || constant == 0;
+    if (summary->usable[i]) {
+      Range base;
+      range_of_parameter(checker, name, type, &base);
+      fact_join(&summary->returns[i], &base);
+      if (splits) {
+        fact_join_verdict(checker, summary, i, name, type, value);
+        continue;
+      }
+      if (to_true) {
+        fact_join(&summary->when_true[i], &base);
+      }
+      if (to_false) {
+        fact_join(&summary->when_false[i], &base);
+      }
+    } else if (summary->floats[i]) {
+      FRange base;
+      frange_of_parameter(checker, name, type, &base);
+      float_fact_join(&summary->float_returns[i], &base);
+      if (splits) {
+        float_fact_join_verdict(checker, summary, i, name, type, value);
+        continue;
+      }
+      if (to_true) {
+        float_fact_join(&summary->float_when_true[i], &base);
+      }
+      if (to_false) {
+        float_fact_join(&summary->float_when_false[i], &base);
+      }
+    }
+  }
+  summary_add_case(checker, summary, fn, value);
+}
+
+static void summary_scan(TypeChecker *checker, const ASTNode *node,
+                         FunctionSummary *summary) {
+  const char *op = NULL;
+  ASTNode *operand = NULL;
+  if (!node || (summary->writes && summary->reads)) {
+    return;
+  }
+  if (node->type == AST_ASSIGNMENT && node->data) {
+    const Assignment *assign = (const Assignment *)node->data;
+    int indirect = 0;
+    const char *root = assign->target ? written_root(assign->target, &indirect)
+                                      : assign->variable_name;
+    if (indirect || !root || assign->target_count > 0 ||
+        name_is_shared(checker, root)) {
+      summary->writes = 1;
+    }
+  } else if (node->type == AST_FUNCTION_CALL) {
+    const FunctionSummary *callee = summary_of_call(checker, node);
+    const CallExpression *call = (const CallExpression *)node->data;
+    if (!callee || callee->writes || (call && call->object)) {
+      summary->writes = 1;
+    }
+    if (!callee || callee->reads) {
+      summary->reads = 1;
+    }
+  } else if (node->type == AST_FUNC_PTR_CALL || node->type == AST_GPU_LAUNCH ||
+             node->type == AST_INLINE_ASM || node->type == AST_NEW_EXPRESSION) {
+    summary->writes = 1;
+    summary->reads = 1;
+  } else if (unary_parts(node, &op, &operand) && strcmp(op, "&") == 0) {
+    summary->writes = 1;
+  }
+  if (node_reads_memory(checker, node) && node->type != AST_FUNCTION_CALL) {
+    summary->reads = 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    summary_scan(checker, node->children[i], summary);
+  }
+}
+
+void type_checker_summary_end(TypeChecker *checker) {
+  Symbol *fn = checker ? checker->current_function : NULL;
+  FunctionSummary *summary = fn && fn->kind == SYMBOL_FUNCTION
+                                 ? (FunctionSummary *)fn->summary
+                                 : NULL;
+  const ASTNode *decl = checker ? checker->current_function_decl : NULL;
+  if (!summary || !decl || decl->type != AST_FUNCTION_DECLARATION ||
+      !decl->data) {
+    return;
+  }
+  summary_scan(checker, ((const FunctionDeclaration *)decl->data)->body,
+               summary);
+  summary->final = 1;
+}
+
+int type_checker_call_never_returns(TypeChecker *checker,
+                                    const ASTNode *node) {
+  const CallExpression *call;
+  const FunctionSummary *summary = summary_of_call(checker, node);
+  Symbol *callee;
+  if (!checker || !node || node->type != AST_FUNCTION_CALL || !node->data) {
+    return 0;
+  }
+  call = (const CallExpression *)node->data;
+  if (!call->function_name || call->object) {
+    return 0;
+  }
+  callee = symbol_table_lookup(checker->symbol_table, call->function_name);
+  return callee && callee->kind == SYMBOL_FUNCTION &&
+         (callee->is_noreturn || (summary && !summary->may_return));
+}
+
+static int call_takes_address_of(const ASTNode *node, const char *name) {
+  const char *op = NULL;
+  ASTNode *operand = NULL;
+  int indirect = 0;
+  if (!node) {
+    return 0;
+  }
+  if (unary_parts(node, &op, &operand) && strcmp(op, "&") == 0) {
+    const char *root = written_root(operand, &indirect);
+    if (root && strcmp(root, name) == 0) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (call_takes_address_of(node->children[i], name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static ASTNode *statement_call(ASTNode *statement, const char **written) {
+  *written = NULL;
+  if (!statement || !statement->data) {
+    return NULL;
+  }
+  if (statement->type == AST_FUNCTION_CALL) {
+    return statement;
+  }
+  if (statement->type == AST_VAR_DECLARATION) {
+    const VarDeclaration *decl = (const VarDeclaration *)statement->data;
+    *written = decl->name;
+    return decl->initializer;
+  }
+  if (statement->type == AST_ASSIGNMENT) {
+    const Assignment *assign = (const Assignment *)statement->data;
+    if (assign->target || assign->target_count > 0) {
+      return NULL;
+    }
+    *written = assign->variable_name;
+    return assign->value;
+  }
+  return NULL;
+}
+
+void type_checker_push_call_facts(TypeChecker *checker, ASTNode *statement) {
+  const char *written = NULL;
+  ASTNode *node = checker ? statement_call(statement, &written) : NULL;
+  const FunctionSummary *summary = summary_of_call(checker, node);
+  const CallExpression *call;
+  Symbol *callee;
+  if (!summary) {
+    return;
+  }
+  call = (const CallExpression *)node->data;
+  callee = symbol_table_lookup(checker->symbol_table, call->function_name);
+  for (size_t i = 0; i < call->argument_count && i < summary->count; i++) {
+    const FactRange *fact = &summary->returns[i];
+    const FloatFact *real = &summary->float_returns[i];
+    const char *name = identifier_name(call->arguments[i]);
+    const Type *given = call->arguments[i] ? call->arguments[i]->resolved_type
+                                           : NULL;
+    const Type *wanted = callee->data.function.parameter_types[i];
+    if (!name || (written && strcmp(written, name) == 0) ||
+        name_is_shared(checker, name) || call_takes_address_of(node, name)) {
+      continue;
+    }
+    if (summary->usable[i] && fact->seen && (fact->has_min || fact->has_max) &&
+        fact_fits(given, wanted)) {
+      type_checker_push_range_guard(checker, name, fact->has_min, fact->min,
+                                    fact->has_max, fact->max);
+    } else if (summary->floats[i] && real->seen &&
+               (real->has_min || real->has_max) &&
+               float_fact_fits(given, wanted) && guard_grow(checker)) {
+      struct TypeCheckerGuard *guard = &checker->guards[checker->guard_count++];
+      memset(guard, 0, sizeof(*guard));
+      guard->name = name;
+      guard->is_float = 1;
+      guard->has_min = real->has_min;
+      guard->has_max = real->has_max;
+      guard->float_min = real->min;
+      guard->float_max = real->max;
+      checker->guard_pushes++;
+    }
   }
 }
 
@@ -1555,6 +2769,8 @@ typedef struct {
   const char *name;
   FRange *range;
   int depth;
+  int tracked;
+  size_t guard;
 } FNarrowContext;
 
 static void fnarrow_by_comparison(FNarrowContext *ctx, const char *op,
@@ -1579,13 +2795,52 @@ static void fnarrow_by_comparison(FNarrowContext *ctx, const char *op,
   }
 }
 
+static int float_fact_fits(const Type *from, const Type *to) {
+  return from && to && type_checker_is_float_base(from) &&
+         type_checker_is_float_base(to) && from->size <= to->size;
+}
+
+static void fnarrow_by_verdict(FNarrowContext *ctx, ASTNode *node,
+                               int negated) {
+  const FunctionSummary *summary = summary_of_call(ctx->checker, node);
+  const CallExpression *call = (const CallExpression *)node->data;
+  Symbol *callee;
+  if (!summary || !ctx->tracked ||
+      name_moved(ctx->checker, ctx->guard, ctx->name) != MOVED_NOT) {
+    return;
+  }
+  callee = symbol_table_lookup(ctx->checker->symbol_table, call->function_name);
+  for (size_t i = 0; i < call->argument_count && i < summary->count; i++) {
+    const FloatFact *fact = negated ? &summary->float_when_false[i]
+                                    : &summary->float_when_true[i];
+    const char *name = identifier_name(call->arguments[i]);
+    FRange r = frange_unknown();
+    if (!name || strcmp(name, ctx->name) != 0 || !summary->floats[i] ||
+        !fact->seen ||
+        !float_fact_fits(call->arguments[i]->resolved_type,
+                         callee->data.function.parameter_types[i])) {
+      continue;
+    }
+    r.has_min = fact->has_min;
+    r.min = fact->min;
+    r.has_max = fact->has_max;
+    r.max = fact->max;
+    frange_meet(ctx->range, &r);
+  }
+}
+
 static void fnarrow_visit(void *raw, ASTNode *node, int negated) {
   FNarrowContext *ctx = (FNarrowContext *)raw;
   const char *op = NULL;
   ASTNode *left = NULL;
   ASTNode *right = NULL;
+  ASTNode *other = NULL;
   const char *left_name;
   const char *right_name;
+  if (node->type == AST_FUNCTION_CALL) {
+    fnarrow_by_verdict(ctx, node, negated);
+    return;
+  }
   if (!binary_parts(node, &op, &left, &right) || !is_comparison(op)) {
     return;
   }
@@ -1598,10 +2853,20 @@ static void fnarrow_visit(void *raw, ASTNode *node, int negated) {
   left_name = identifier_name(left);
   right_name = identifier_name(right);
   if (left_name && strcmp(left_name, ctx->name) == 0) {
-    fnarrow_by_comparison(ctx, op, right);
+    other = right;
   } else if (right_name && strcmp(right_name, ctx->name) == 0) {
-    fnarrow_by_comparison(ctx, flip_operator(op), left);
+    other = left;
+    op = flip_operator(op);
   }
+  if (!other) {
+    return;
+  }
+  if (ctx->tracked &&
+      (name_moved(ctx->checker, ctx->guard, ctx->name) != MOVED_NOT ||
+       expr_killed(ctx->checker, ctx->guard, other))) {
+    return;
+  }
+  fnarrow_by_comparison(ctx, op, other);
 }
 
 static void fnarrow_by_guards(TypeChecker *checker, const char *name,
@@ -1611,10 +2876,21 @@ static void fnarrow_by_guards(TypeChecker *checker, const char *name,
   ctx.name = name;
   ctx.range = range;
   ctx.depth = depth;
+  ctx.tracked = 1;
   for (size_t i = 0; i < checker->guard_count; i++) {
     struct TypeCheckerGuard *guard = &checker->guards[i];
+    ctx.guard = i;
     if (guard->condition) {
       visit_atoms(guard->condition, guard->negated, fnarrow_visit, &ctx, 0);
+    } else if (guard->name && guard->is_float &&
+               strcmp(guard->name, name) == 0 &&
+               name_moved(checker, i, name) == MOVED_NOT) {
+      FRange r = frange_unknown();
+      r.has_min = guard->has_min;
+      r.min = guard->float_min;
+      r.has_max = guard->has_max;
+      r.max = guard->float_max;
+      frange_meet(range, &r);
     }
   }
 }
@@ -1685,6 +2961,10 @@ static int frange_of_identifier(TypeChecker *checker, ASTNode *expr, FRange *out
                      int depth) {
 
   *out = frange_unknown();
+    if (checker && checker->proof_frame) {
+      *out = frange_of_type(expr->resolved_type);
+      return out->has_min || out->has_max;
+    }
     Identifier *identifier = (Identifier *)expr->data;
     Symbol *symbol = identifier
                          ? type_checker_resolve_identifier(checker, identifier)
@@ -1929,13 +3209,18 @@ static int guard_grow(TypeChecker *checker) {
 
 int type_checker_push_guard(TypeChecker *checker, ASTNode *condition,
                             int negated) {
+  int taint;
   if (!checker || !condition || !guard_grow(checker)) {
     return 0;
   }
+  type_checker_note_effects(checker, condition);
+  taint = condition_taint(checker, condition);
   memset(&checker->guards[checker->guard_count], 0,
          sizeof(struct TypeCheckerGuard));
   checker->guards[checker->guard_count].condition = condition;
   checker->guards[checker->guard_count].negated = negated;
+  checker->guards[checker->guard_count].skip_all = taint == 2;
+  checker->guards[checker->guard_count].skip_memory = taint == 1;
   checker->guard_count++;
   checker->guard_pushes++;
   return 1;
@@ -1966,6 +3251,7 @@ size_t type_checker_guard_depth(const TypeChecker *checker) {
 void type_checker_pop_guards(TypeChecker *checker, size_t depth) {
   if (checker && depth <= checker->guard_count) {
     checker->guard_count = depth;
+    kills_trim(checker, depth);
   }
 }
 
@@ -2096,6 +3382,8 @@ typedef struct {
   const ASTNode *filler;
   const char *binding;
   int found;
+  TypeChecker *checker;
+  size_t guard;
 } MatchContext;
 
 static void match_visit(void *raw, ASTNode *node, int negated) {
@@ -2103,7 +3391,7 @@ static void match_visit(void *raw, ASTNode *node, int negated) {
   const char *op = NULL;
   ASTNode *left = NULL;
   ASTNode *right = NULL;
-  if (ctx->found) {
+  if (ctx->found || expr_killed(ctx->checker, ctx->guard, node)) {
     return;
   }
   if (negated == ctx->pattern_negated &&
@@ -2135,8 +3423,10 @@ static int guards_prove_atom(TypeChecker *checker, ASTNode *atom,
   ctx.filler = filler;
   ctx.binding = binding;
   ctx.found = 0;
+  ctx.checker = checker;
   for (size_t i = 0; i < checker->guard_count && !ctx.found; i++) {
     struct TypeCheckerGuard *guard = &checker->guards[i];
+    ctx.guard = i;
     if (guard->condition) {
       visit_atoms(guard->condition, guard->negated, match_visit, &ctx, 0);
     }
@@ -2291,9 +3581,22 @@ typedef struct {
   long long steps;
   char route[192];
   int is_float;
+  int narrows;
   FRange fvalue;
   int have_frange;
 } ProveContext;
+
+static int range_narrows_into(const Type *type, ProveContext *ctx) {
+  Range *value = &ctx->value_range;
+  Range wide = *value;
+  if (!ctx->have_range || ctx->is_float) {
+    return 0;
+  }
+  range_as_computed(type, value);
+  return wide.has_min != value->has_min || wide.has_max != value->has_max ||
+         (wide.has_min && wide.min != value->min) ||
+         (wide.has_max && wide.max != value->max);
+}
 
 static int fcomparison_holds(const char *op, const FRange *value,
                              const FRange *bound) {
@@ -2400,8 +3703,8 @@ static void prove_visit(void *raw, ASTNode *atom, int negated) {
       }
     }
   }
-  if (guards_prove_atom(ctx->checker, atom, negated, ctx->expr,
-                        ctx->binding)) {
+  if (!ctx->narrows && guards_prove_atom(ctx->checker, atom, negated, ctx->expr,
+                                         ctx->binding)) {
     snprintf(ctx->route, sizeof(ctx->route),
              "a dominating test in scope repeats the predicate");
     return;
@@ -2587,6 +3890,7 @@ int type_checker_prove_refinement(TypeChecker *checker, Type *refined,
     ctx.have_frange = frange_of(checker, expr, &ctx.fvalue, 0);
   }
   ctx.have_range = range_of(checker, expr, &ctx.value_range, 0);
+  ctx.narrows = range_narrows_into(refined, &ctx);
   for (layer = refined; layer && layer->refined_base; layer = layer->refined_base) {
     if (expr->resolved_type &&
         type_checker_types_equal(expr->resolved_type, layer)) {
@@ -2892,6 +4196,8 @@ void type_checker_compute_refinement_range(TypeChecker *checker,
     fctx.name = refined->refine_binding ? refined->refine_binding : "value";
     fctx.range = &fr;
     fctx.depth = 0;
+    fctx.tracked = 0;
+    fctx.guard = 0;
     visit_atoms(refined->refinement, 0, fnarrow_visit, &fctx, 0);
     if (fr.has_min && fr.has_max) {
       refined->refine_has_frange = 1;
@@ -2910,6 +4216,8 @@ void type_checker_compute_refinement_range(TypeChecker *checker,
     ctx.name = refined->refine_binding ? refined->refine_binding : "value";
     ctx.range = &r;
     ctx.depth = 0;
+    ctx.tracked = 0;
+    ctx.guard = 0;
     visit_atoms(refined->refinement, 0, narrow_visit, &ctx, 0);
   }
   if (r.has_min && r.has_max) {

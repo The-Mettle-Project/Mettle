@@ -695,6 +695,7 @@ void symbol_destroy(Symbol *symbol) {
 
   mettle_free_string(symbol->name);
   mettle_free_string(symbol->link_name);
+  type_checker_summary_free(symbol->summary);
 
   if (symbol->kind == SYMBOL_FUNCTION) {
     for (size_t i = 0; i < symbol->data.function.parameter_count; i++) {

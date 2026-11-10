@@ -1,0 +1,153 @@
+import "std/io";
+import "std/process";
+
+type Percent = int32 where value >= 0 && value <= 100;
+type Digit = int32 where value >= 0 && value < 10;
+
+var g_level: int32 = 5;
+
+fn is_percent(n: int32) -> bool { return n >= 0 && n <= 100; }
+fn one_digit(n: int32) -> bool { return n >= 0 && n <= 9; }
+fn must_be_digit(n: int32) { if (n < 0 || n > 9) { exit(3); } }
+fn touch() { g_level = 500; }
+fn bump(p: int32*) { *p = *p + 500; }
+fn sneaky(n: int32) -> bool { n = n - 1000; return n >= 0 && n <= 100; }
+fn loose(n: int32) -> bool { if (n == 777) { return true; } return n >= 0 && n <= 100; }
+fn maybe_check(n: int32, strict: bool) { if (strict) { if (n < 0 || n > 9) { exit(3); } } }
+fn first_ok(a: int32, b: int32) -> bool { return a >= 0 && a <= 100; }
+fn fill(n: int32, out: int32*) { if (n < 0 || n > 9) { exit(3); } *out = 99; }
+fn bump_checked(n: int32) -> int32 { if (n < 0 || n > 9) { exit(3); } return n + 1000; }
+fn always(n: int32) -> bool { return true; }
+fn inverted(n: int32) -> bool { return !(n >= 0 && n <= 100); }
+
+type Half = int32 where value >= 0 && value <= 50;
+type Unit = float64 where value >= 0.0 && value <= 1.0;
+
+fn half(n: int32) -> int32 { return n / 2; }
+fn clamp(x: int32, lo: int32, hi: int32) -> int32 { if (x < lo) { return lo; } if (x > hi) { return hi; } return x; }
+fn moved_half(n: int32) -> int32 { n = n + 1000; return n / 2; }
+fn plus_level(n: int32) -> int32 { return n + g_level; }
+fn through_local(n: int32) -> int32 { var m: int32 = n + 1000; return m; }
+fn next(k: int32) -> int32 { return k + 1; }
+fn leaky_clamp(x: int32, lo: int32, hi: int32) -> int32 { if (x < lo) { return lo; } if (x > hi) { return hi; } if (x == 7) { return 7000; } return x; }
+fn in_unit(x: float64) -> bool { return x >= 0.0 && x <= 1.0; }
+fn first_in_unit(a: float64, b: float64) -> bool { return a >= 0.0 && a <= 1.0; }
+fn must_be_unit(x: float64) { if (x < 0.0 || x > 1.0) { exit(4); } }
+fn moved_unit(x: float64) -> bool { x = x - 10.0; return x >= 0.0 && x <= 1.0; }
+
+type High = uint8 where value >= 200;
+
+fn raised(a: uint8) -> uint8 { return a + 200; }
+
+fn reassign_after_verdict(n: int32) -> int32 {
+  if (is_percent(n)) { n = n + 500; var p: Percent = n; return p; } return 0; }
+
+fn callee_moves_param(n: int32) -> int32 {
+  if (sneaky(n)) { var p: Percent = n; return p; } return 0; }
+
+fn two_true_paths(n: int32) -> int32 {
+  if (loose(n)) { var p: Percent = n; return p; } return 0; }
+
+fn check_on_one_path(n: int32) -> int32 {
+  maybe_check(n, false); var d: Digit = n; return d; }
+
+fn global_then_call() -> int32 {
+  if (g_level >= 0 && g_level <= 100) { touch(); var p: Percent = g_level; return p; } return 0; }
+
+fn store_through_pointer(n: int32) -> int32 {
+  var at: int32* = &n; if (n >= 0 && n <= 100) { *at = 500; var p: Percent = n; return p; } return 0; }
+
+fn write_later_in_loop(n: int32) -> int32 {
+  var t: int32 = 0; if (n >= 0 && n <= 100) { var i: int32 = 0; while (i < 3) { var p: Percent = n; t = t + p; n = n + 60; i = i + 1; } } return t; }
+
+fn other_argument(x: int32, y: int32) -> int32 {
+  if (first_ok(x, y)) { var p: Percent = y; return p; } return 0; }
+
+fn address_in_same_call(n: int32) -> int32 {
+  fill(n, &n); var d: Digit = n; return d; }
+
+fn write_in_loop_before_use(n: int32) -> int32 {
+  var k: int32 = n; var t: int32 = 0; while (one_digit(k)) { k = k + 4; var d: Digit = k; t = t + d; } return t; }
+
+fn reassign_after_demand(n: int32) -> int32 {
+  must_be_digit(n); n = n * 3; var d: Digit = n; return d; }
+
+fn assigned_from_the_call(n: int32) -> int32 {
+  n = bump_checked(n); var d: Digit = n; return d; }
+
+fn pointer_argument(n: int32) -> int32 {
+  if (n >= 0 && n <= 100) { bump(&n); var p: Percent = n; return p; } return 0; }
+
+fn verdict_says_nothing(n: int32) -> int32 {
+  if (always(n)) { var p: Percent = n; return p; } return 0; }
+
+fn wrong_branch(n: int32) -> int32 {
+  if (inverted(n)) { var p: Percent = n; return p; } return 0; }
+
+fn negated_wrong_branch(n: int32) -> int32 {
+  if (!is_percent(n)) { var p: Percent = n; return p; } return 0; }
+
+fn plain_reassign(n: int32) -> int32 {
+  if (n >= 0 && n <= 100) { n = n + 500; var p: Percent = n; return p; } return 0; }
+
+fn falling_counter(n: int32) -> int32 {
+  var t: int32 = 0; if (n >= 0 && n <= 100) { var i: int32 = 0; while (i < 3) { var p: Percent = n; t = t + p; n = n - 60; i = i + 1; } } return t; }
+
+fn verdict_on_global() -> int32 {
+  if (is_percent(g_level)) { touch(); var p: Percent = g_level; return p; } return 0; }
+
+fn demand_on_global() -> int32 {
+  must_be_digit(g_level); touch(); var d: Digit = g_level; return d; }
+
+fn call_range_unbounded_argument(n: int32) -> int32 {
+  var h: Half = half(n); return h; }
+
+fn call_range_wide_bounds(n: int32) -> int32 {
+  var p: Percent = clamp(n, 0, 200); return p; }
+
+fn call_range_callee_moves_param(p: Percent) -> int32 {
+  var h: Half = moved_half(p); return h; }
+
+fn call_range_reads_global(p: Percent) -> int32 {
+  var q: Percent = plus_level(p) - plus_level(p); return q; }
+
+fn call_range_through_local(p: Percent) -> int32 {
+  var q: Percent = through_local(p); return q; }
+
+fn call_range_same_name_in_caller(big: Percent) -> int32 {
+  var k: Digit = (Digit)3; var x: Digit = next(big); return x + k; }
+
+fn call_range_extra_path(n: int32) -> int32 {
+  var p: Percent = leaky_clamp(n, 0, 100); return p; }
+
+fn call_range_swapped_bounds(n: int32) -> int32 {
+  var d: Digit = clamp(n, 2, 70); return d; }
+
+fn float_reassign_after_verdict(x: float64) -> float64 {
+  if (in_unit(x)) { x = x + 5.0; var u: Unit = (Unit)x; return (float64)u; } return 0.0; }
+
+fn float_other_argument(x: float64, y: float64) -> float64 {
+  if (first_in_unit(x, y)) { var u: Unit = (Unit)y; return (float64)u; } return 0.0; }
+
+fn float_wrong_branch(x: float64) -> float64 {
+  if (!in_unit(x)) { var u: Unit = (Unit)x; return (float64)u; } return 0.0; }
+
+fn float_callee_moves_param(x: float64) -> float64 {
+  if (moved_unit(x)) { var u: Unit = (Unit)x; return (float64)u; } return 0.0; }
+
+fn float_reassign_after_demand(x: float64) -> float64 {
+  must_be_unit(x); x = x * 3.0; var u: Unit = (Unit)x; return (float64)u; }
+
+fn float_no_test(x: float64) -> float64 {
+  var u: Unit = (Unit)x; return (float64)u; }
+
+fn narrowing_store_wraps(x: uint8) -> int32 {
+  var h: High = x + 200; return (int32)h; }
+
+fn narrowing_return_wraps(x: uint8) -> int32 {
+  var h: High = raised(x); return (int32)h; }
+
+fn narrowing_under_a_repeated_test(x: uint8) -> int32 {
+  if (x + 200 >= 200) { var h: High = x + 200; return (int32)h; } return 0; }
+
+fn main() -> int32 { return 0; }

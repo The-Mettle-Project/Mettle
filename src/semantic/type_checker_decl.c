@@ -2852,6 +2852,8 @@ static int type_checker_process_function(TypeChecker *checker,
     checker->current_function_decl = declaration;
     checker->errdefer_scan_decl = NULL;
     type_checker_movement_index_drop(checker);
+    type_checker_facts_reset(checker);
+    type_checker_summary_begin(checker);
 
     if (!symbol_table_enter_scope(checker->symbol_table, SCOPE_FUNCTION)) {
       type_checker_set_error_at_location(
@@ -2875,6 +2877,7 @@ static int type_checker_process_function(TypeChecker *checker,
     if (func_symbol && func_symbol->post_state == 1) {
       func_symbol->post_state = 2;
     }
+    type_checker_summary_end(checker);
 
     type_checker_init_tracker_exit_scope(checker);
     type_checker_init_tracker_reset(checker);

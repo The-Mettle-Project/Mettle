@@ -201,6 +201,8 @@ typedef struct {
   int is_explicit;
   int ownership_role;
   int is_generic_instance;
+  unsigned char body_checked;
+  unsigned char body_visiting;
 } FunctionDeclaration;
 
 typedef struct {

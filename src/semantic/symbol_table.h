@@ -201,6 +201,7 @@ typedef struct Symbol {
   int constant_is_float;
   long long constant_integer_value;
   double constant_float_value;
+  void *summary;
   int post_state;
   int post_has_min;
   int post_has_max;
@@ -254,6 +255,7 @@ int symbol_table_declare(SymbolTable *table, Symbol *symbol);
 Symbol *symbol_table_lookup(SymbolTable *table, const char *name);
 Symbol *symbol_table_lookup_current_scope(SymbolTable *table, const char *name);
 Symbol *symbol_table_lookup_global(SymbolTable *table, const char *name);
+void type_checker_summary_free(void *summary);
 void symbol_table_insert(SymbolTable *table, Symbol *symbol);
 int symbol_table_declare_forward(SymbolTable *table, Symbol *symbol);
 int symbol_table_resolve_forward_declaration(SymbolTable *table,

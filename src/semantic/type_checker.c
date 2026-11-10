@@ -202,6 +202,8 @@ void type_checker_destroy(TypeChecker *checker) {
   if (checker) {
     free(checker->value_frames);
     free(checker->guards);
+    free(checker->kills);
+    free((void *)checker->exposed);
     free(checker->refine_failure);
     free(checker->effect_failure);
     free(checker->effects);
@@ -809,6 +811,121 @@ int type_checker_prepare_directives(TypeChecker *checker, ASTNode *program) {
   return ok;
 }
 
+typedef struct {
+  TypeChecker *checker;
+  ASTNode **decls;
+  size_t count;
+  size_t *slots;
+  size_t mask;
+  int ok;
+} CalleeOrder;
+
+static int type_checker_check_function_now(TypeChecker *checker,
+                                           ASTNode *decl) {
+  ComptimeDeclScope expansion;
+  int ok;
+  ((FunctionDeclaration *)decl->data)->body_checked = 1;
+  type_checker_enter_expansion_decl(checker, decl, &expansion);
+  ok = type_checker_process_declaration(checker, decl);
+  type_checker_leave_expansion_decl(checker, &expansion);
+  return ok;
+}
+
+static size_t callee_order_slot(const CalleeOrder *order, const char *name) {
+  size_t h = mettle_fnv1a_hash(name) & order->mask;
+  while (order->slots[h]) {
+    const FunctionDeclaration *fn =
+        (const FunctionDeclaration *)order->decls[order->slots[h] - 1]->data;
+    if (strcmp(fn->name, name) == 0) {
+      break;
+    }
+    h = (h + 1u) & order->mask;
+  }
+  return h;
+}
+
+static void callee_order_visit(CalleeOrder *order, ASTNode *decl, int depth);
+
+static void callee_order_calls(CalleeOrder *order, const ASTNode *node,
+                               int depth) {
+  if (!node) {
+    return;
+  }
+  if (node->type == AST_FUNCTION_CALL && node->data) {
+    const CallExpression *call = (const CallExpression *)node->data;
+    if (call->function_name && !call->object) {
+      size_t at = order->slots[callee_order_slot(order, call->function_name)];
+      if (at) {
+        callee_order_visit(order, order->decls[at - 1], depth + 1);
+      }
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    callee_order_calls(order, node->children[i], depth);
+  }
+}
+
+static void callee_order_visit(CalleeOrder *order, ASTNode *decl, int depth) {
+  FunctionDeclaration *fn = (FunctionDeclaration *)decl->data;
+  if (fn->body_checked || fn->body_visiting) {
+    return;
+  }
+  fn->body_visiting = 1;
+  if (depth < 200) {
+    callee_order_calls(order, fn->body, depth);
+  }
+  fn->body_visiting = 0;
+  if (!fn->body_checked &&
+      !type_checker_check_function_now(order->checker, decl)) {
+    order->ok = 0;
+  }
+}
+
+static int type_checker_check_functions_callees_first(TypeChecker *checker,
+                                                      Program *prog) {
+  CalleeOrder order;
+  size_t capacity = 16;
+  memset(&order, 0, sizeof(order));
+  order.checker = checker;
+  order.count = prog->declaration_count;
+  order.ok = 1;
+  while (capacity < order.count * 2) {
+    capacity *= 2;
+  }
+  order.decls = malloc((order.count + 1) * sizeof(ASTNode *));
+  order.slots = calloc(capacity, sizeof(size_t));
+  order.mask = capacity - 1;
+  if (!order.decls || !order.slots) {
+    free(order.decls);
+    free(order.slots);
+    return 1;
+  }
+  memcpy(order.decls, prog->declarations, order.count * sizeof(ASTNode *));
+  for (size_t i = 0; i < order.count; i++) {
+    ASTNode *decl = order.decls[i];
+    if (decl && decl->type == AST_FUNCTION_DECLARATION && decl->data) {
+      FunctionDeclaration *fn = (FunctionDeclaration *)decl->data;
+      fn->body_checked = 0;
+      fn->body_visiting = 0;
+      if (fn->name) {
+        size_t h = callee_order_slot(&order, fn->name);
+        if (!order.slots[h]) {
+          order.slots[h] = i + 1;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < order.count; i++) {
+    ASTNode *decl = order.decls[i];
+    if (decl && decl->type == AST_FUNCTION_DECLARATION && decl->data) {
+      callee_order_visit(&order, decl, 0);
+    }
+  }
+  free(order.decls);
+  free(order.slots);
+  return order.ok;
+}
+
 int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   if (!checker || !program || program->type != AST_PROGRAM) {
     return 0;
@@ -855,23 +972,30 @@ int type_checker_check_program(TypeChecker *checker, ASTNode *program) {
   if (!ok)
     return 0;
 
-  for (int functions_now = 0; functions_now <= 1; functions_now++) {
-    for (size_t i = 0; i < prog->declaration_count; i++) {
-      ASTNode *decl = prog->declarations[i];
-      ComptimeDeclScope expansion;
-      if (!decl || decl->type == AST_STRUCT_DECLARATION ||
-          decl->type == AST_ENUM_DECLARATION ||
-          decl->type == AST_TYPE_DECLARATION) {
-        continue;
-      }
-      if ((decl->type == AST_FUNCTION_DECLARATION) != functions_now) {
-        continue;
-      }
-      type_checker_enter_expansion_decl(checker, decl, &expansion);
-      if (!type_checker_process_declaration(checker, decl)) {
-        ok = 0;
-      }
-      type_checker_leave_expansion_decl(checker, &expansion);
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    ComptimeDeclScope expansion;
+    if (!decl || decl->type == AST_STRUCT_DECLARATION ||
+        decl->type == AST_ENUM_DECLARATION ||
+        decl->type == AST_TYPE_DECLARATION ||
+        decl->type == AST_FUNCTION_DECLARATION) {
+      continue;
+    }
+    type_checker_enter_expansion_decl(checker, decl, &expansion);
+    if (!type_checker_process_declaration(checker, decl)) {
+      ok = 0;
+    }
+    type_checker_leave_expansion_decl(checker, &expansion);
+  }
+  if (!type_checker_check_functions_callees_first(checker, prog)) {
+    ok = 0;
+  }
+  for (size_t i = 0; i < prog->declaration_count; i++) {
+    ASTNode *decl = prog->declarations[i];
+    if (decl && decl->type == AST_FUNCTION_DECLARATION && decl->data &&
+        !((FunctionDeclaration *)decl->data)->body_checked &&
+        !type_checker_check_function_now(checker, decl)) {
+      ok = 0;
     }
   }
 

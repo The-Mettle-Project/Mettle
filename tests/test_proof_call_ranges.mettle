@@ -1,0 +1,105 @@
+import "std/io";
+import "std/process";
+
+type Percent = int32 where value >= 0 && value <= 100;
+type Half = int32 where value >= 0 && value <= 50;
+type Digit = int32 where value >= 0 && value < 10;
+type Unit = float64 where value >= 0.0 && value <= 1.0;
+
+const TOP: int32 = 100;
+
+fn half(n: int32) -> int32 { return n / 2; }
+
+fn clamp(x: int32, lo: int32, hi: int32) -> int32 {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+
+fn smaller(a: int32, b: int32) -> int32 {
+  if (a < b) { return a; }
+  return b;
+}
+
+fn two_halves(n: int32) -> int32 { return half(n) + half(n); }
+
+fn capped(n: int32) -> int32 {
+  if (n > TOP) { return TOP; }
+  if (n < 0) { return 0; }
+  return n;
+}
+
+fn down(n: int32) -> int32 {
+  if (n <= 0) { return 0; }
+  return down(n - 1);
+}
+
+fn in_unit(x: float64) -> bool { return x >= 0.0 && x <= 1.0; }
+
+fn must_be_unit(x: float64) {
+  if (x < 0.0 || x > 1.0) { exit(4); }
+}
+
+fn halved(p: Percent) -> int32 {
+  var h: Half = half(p);
+  return h;
+}
+
+fn clamped(n: int32) -> int32 {
+  var p: Percent = clamp(n, 0, 100);
+  return p;
+}
+
+fn clamped_narrow(n: int32) -> int32 {
+  var d: Digit = clamp(n, 2, 7);
+  return d;
+}
+
+fn lesser(p: Percent, q: Percent) -> int32 {
+  var r: Percent = smaller(p, q);
+  return r;
+}
+
+fn nested(p: Percent) -> int32 {
+  var r: Percent = two_halves(p);
+  return r;
+}
+
+fn by_constant(n: int32) -> int32 {
+  var p: Percent = capped(n);
+  return p;
+}
+
+fn same_name(n: int32) -> int32 {
+  if (n >= 0 && n <= 100) {
+    var h: Half = half(n);
+    return h;
+  }
+  return -1;
+}
+
+fn float_verdict(x: float64) -> float64 {
+  if (in_unit(x)) {
+    var u: Unit = (Unit)x;
+    return (float64)u;
+  }
+  return -1.0;
+}
+
+fn float_negated(x: float64) -> float64 {
+  if (!in_unit(x)) { return -1.0; }
+  var u: Unit = (Unit)x;
+  return (float64)u;
+}
+
+fn float_demand(x: float64) -> float64 {
+  must_be_unit(x);
+  var u: Unit = (Unit)x;
+  return (float64)u;
+}
+
+fn main() -> int32 {
+  println("{halved((Percent)90)} {clamped(4000)} {clamped(-3)} {clamped_narrow(99)} {lesser((Percent)30, (Percent)70)} {nested((Percent)81)} {by_constant(555)} {same_name(64)} {down(5)}");
+  println("{float_verdict(0.25)} {float_verdict(2.5)} {float_negated(0.5)} {float_demand(0.75)}");
+  return 0;
+}

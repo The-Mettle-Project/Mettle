@@ -749,6 +749,98 @@ exports 0..100, and `(Percent)clamp(n)` is proven at the call site with no
 guard there at all. A return the interval engine cannot bound defeats the
 export, because a fact has to hold on every path or it is not one.
 
+The export is read again at each call, with that call's arguments standing for
+the parameters. Every `return` keeps its expression and the tests that reach
+it, so a return the arguments rule out drops away and the rest are bounded by
+what was passed:
+
+```mettle
+fn half(n: int32) -> int32 { return n / 2; }
+
+fn clamp(x: int32, lo: int32, hi: int32) -> int32 {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+
+fn halved(p: Percent) -> int32 {
+  var h: Half = half(p);
+  return h;
+}
+
+fn clamped(n: int32) -> int32 {
+  var d: Digit = clamp(n, 2, 7);
+  return d;
+}
+```
+
+`half` exports the whole of `int32`, and `half(p)` is 0..50 because `p` is
+0..100. `clamp(n, 2, 7)` is 2..7 for any `n`. This reaches through a call
+inside the returned expression, three calls deep, and through a global
+constant. A return that reads a local, a global variable or a parameter the
+function writes falls back to the range the function proved for it once.
+
+**What a narrower type holds.** A value computed at one width and stored at a
+narrower one keeps its range only where every value fits. `x + 200` on a
+`uint8` is computed as an `int32`, 200..455, and a `uint8` holds the low byte
+of it, so nothing above the type's own 0..255 is claimed for the stored value.
+The same rule covers a `return` into a narrower return type, and the result of
+`+`, `-` and `*` that can leave the type they are computed in.
+
+**What a call tested.** A function's body also exports what it proved about
+its own integer and float parameters, gathered the same way at every `return`. There are
+three facts for each parameter: its range on every path that returns a true
+value, on every path that returns a false one, and on every path that returns
+at all.
+
+```mettle
+fn is_percent(n: int32) -> bool { return n >= 0 && n <= 100; }
+
+fn must_be_digit(n: int32) {
+  if (n < 0 || n > 9) { exit(3); }
+}
+
+fn from_verdict(n: int32) -> int32 {
+  if (is_percent(n)) {
+    var p: Percent = n;
+    return p;
+  }
+  return -1;
+}
+
+fn from_demand(n: int32) -> int32 {
+  must_be_digit(n);
+  var d: Digit = n;
+  return d;
+}
+```
+
+`is_percent(n)` in an `if`, a `while`, a negation or one side of an `&&` is a
+test of `n` like any comparison, so the early exit `if (!is_percent(n)) {
+return -1; }` proves the rest of the block. A call that stands as a statement
+proves what every returning path of the callee established, and a path that
+ends in a function that never returns is no such path. The callee may be
+declared after the caller, and it may itself rest on a verdict from a third
+function. A parameter the callee writes, or takes the address of, exports
+nothing.
+
+**What a write ends.** A test proves a value for as long as nothing writes it.
+An assignment, a new declaration of the name, or `&name` ends every earlier
+test of that name. So does a write later in a loop the use sits in, since the
+next turn of the loop reads the value that write left. A counter the function
+only ever raises keeps its lower bounds and loses its upper ones, and one it
+only lowers keeps the upper. A call or a store through a pointer ends every
+test of a global, of a local whose address was taken, and of anything read
+through a pointer, unless the callee's body shows it writes no memory the
+caller can see.
+
+```text
+error[P0001]: cannot prove `value <= 100` for `n`, which 'Percent' requires
+(its range here is 0..2147483647)
+```
+
+That is `n = n + 500;` between the test and the conversion.
+
 **What a loop carries.** A counter that only ever rises keeps the bound its
 initialiser gave it, so a `while (k < 100)` bounds `k` above and `var k: int32
 = 5;` bounds it below, and `k` is a `Small` inside the body even though it is
@@ -788,7 +880,9 @@ fn get(buf: int32[], i: int64) -> int32 {
 ```
 
 `Index` says nothing until there is a `buf`. Every fact it carries is read at
-the site, in that scope, and refused there when the name is not in it. A
+the site, in that scope, and refused there when the name is not in it. It is
+also read only where the function never writes `buf`: once `buf` can name a
+different slice, an `Index` made against the old one keeps its bounds check. A
 relational type has no interval of its own, so `--check-proofs` re-checks it by
 evaluating the predicate itself at the site, with the binding standing for the
 value that was proven.

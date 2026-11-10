@@ -54,6 +54,14 @@ typedef struct {
   size_t guard_count;
   size_t guard_capacity;
   size_t guard_pushes;
+  struct TypeCheckerKill *kills;
+  size_t kill_count;
+  size_t kill_capacity;
+  const char **exposed;
+  size_t exposed_count;
+  size_t exposed_capacity;
+  void *proof_frame;
+  int proof_frame_depth;
   char *refine_failure;
   char *effect_failure;
   TypeCheckerEffect *effects;
@@ -244,6 +252,16 @@ int type_checker_push_range_guard(TypeChecker *checker, const char *name,
                                   long long max);
 size_t type_checker_guard_depth(const TypeChecker *checker);
 void type_checker_pop_guards(TypeChecker *checker, size_t depth);
+void type_checker_note_effects(TypeChecker *checker, struct ASTNode *node);
+void type_checker_facts_reset(TypeChecker *checker);
+void type_checker_summary_begin(TypeChecker *checker);
+void type_checker_summary_end(TypeChecker *checker);
+void type_checker_note_return_facts(TypeChecker *checker,
+                                    struct ASTNode *value);
+void type_checker_push_call_facts(TypeChecker *checker,
+                                  struct ASTNode *statement);
+int type_checker_call_never_returns(TypeChecker *checker,
+                                    const struct ASTNode *node);
 void type_checker_movement_index_drop(TypeChecker *checker);
 int type_checker_compare_is_unsigned(const Type *left, const Type *right);
 int type_checker_expression_range(TypeChecker *checker, ASTNode *expr,

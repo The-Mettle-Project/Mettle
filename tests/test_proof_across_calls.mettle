@@ -1,0 +1,94 @@
+import "std/io";
+import "std/process";
+
+type Percent = int32 where value >= 0 && value <= 100;
+type Digit = int32 where value >= 0 && value < 10;
+
+fn main() -> int32 {
+  println("{by_verdict(40)} {by_verdict(400)} {by_negated(7)} {by_negated(70)} {by_chain(55)} {by_demand(9)} {by_loop(3)} {by_later(88)} {by_else(5)} {by_else(500)}");
+  return 0;
+}
+
+fn is_percent(n: int32) -> bool {
+  return n >= 0 && n <= 100;
+}
+
+fn one_digit(n: int32) -> bool {
+  if (n < 0) { return false; }
+  if (n > 9) { return false; }
+  return true;
+}
+
+fn checked(n: int32) -> bool {
+  return is_percent(n) && n != 50;
+}
+
+fn must_be_digit(n: int32) {
+  if (n < 0 || n > 9) {
+    exit(3);
+  }
+}
+
+fn by_verdict(n: int32) -> int32 {
+  if (is_percent(n)) {
+    var p: Percent = n;
+    return p;
+  }
+  return -1;
+}
+
+fn by_negated(n: int32) -> int32 {
+  if (!one_digit(n)) {
+    return -1;
+  }
+  var d: Digit = n;
+  return d;
+}
+
+fn by_chain(n: int32) -> int32 {
+  if (checked(n)) {
+    var p: Percent = n;
+    return p;
+  }
+  return -1;
+}
+
+fn by_demand(n: int32) -> int32 {
+  must_be_digit(n);
+  var d: Digit = n;
+  return d;
+}
+
+fn by_loop(n: int32) -> int32 {
+  var total: int32 = 0;
+  var k: int32 = n;
+  while (one_digit(k)) {
+    var d: Digit = k;
+    total = total + d;
+    k = k + 4;
+  }
+  return total;
+}
+
+fn by_later(n: int32) -> int32 {
+  if (later_check(n)) {
+    var p: Percent = n;
+    return p;
+  }
+  return -1;
+}
+
+fn later_check(n: int32) -> bool {
+  return n <= 100 && n >= 0;
+}
+
+fn by_else(n: int32) -> int32 {
+  if (is_percent(n)) {
+    return 1;
+  } else {
+    if (n > 100) { return 2; }
+    var low: int32 = n;
+    if (low < 0) { return 3; }
+    return 4;
+  }
+}

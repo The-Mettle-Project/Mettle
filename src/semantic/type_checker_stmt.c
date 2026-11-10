@@ -1247,11 +1247,73 @@ static int type_checker_check_defer_statement(TypeChecker *checker,
 static int type_checker_check_statement_body(TypeChecker *checker,
                                              ASTNode *statement);
 
+static int type_checker_never_falls_through(TypeChecker *checker,
+                                            ASTNode *statement) {
+  if (!statement) {
+    return 0;
+  }
+  if (type_checker_statement_guarantees_termination(statement) ||
+      type_checker_call_never_returns(checker, statement)) {
+    return 1;
+  }
+  if (statement->type == AST_PROGRAM) {
+    for (size_t i = 0; i < statement->child_count; i++) {
+      if (type_checker_never_falls_through(checker, statement->children[i])) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (statement->type == AST_IF_STATEMENT && statement->data) {
+    IfStatement *branch = (IfStatement *)statement->data;
+    if (!branch->else_branch ||
+        !type_checker_never_falls_through(checker, branch->then_branch)) {
+      return 0;
+    }
+    for (size_t i = 0; i < branch->else_if_count; i++) {
+      if (!type_checker_never_falls_through(checker,
+                                            branch->else_ifs[i].body)) {
+        return 0;
+      }
+    }
+    return type_checker_never_falls_through(checker, branch->else_branch);
+  }
+  return 0;
+}
+
+static int type_checker_statement_repeats(const ASTNode *statement) {
+  return statement->type == AST_WHILE_STATEMENT ||
+         statement->type == AST_FOR_STATEMENT ||
+         statement->type == AST_SWITCH_STATEMENT ||
+         statement->type == AST_MATCH_STATEMENT;
+}
+
+static int type_checker_statement_holds_statements(const ASTNode *statement) {
+  return type_checker_statement_repeats(statement) ||
+         statement->type == AST_IF_STATEMENT ||
+         statement->type == AST_PROGRAM ||
+         statement->type == AST_CASE_CLAUSE ||
+         statement->type == AST_COMPTIME_FOR ||
+         statement->type == AST_VALUE_SCOPE ||
+         statement->type == AST_FUNCTION_DECLARATION;
+}
+
 int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
   if (!checker || !statement)
     return 0;
+  if (type_checker_statement_repeats(statement)) {
+    type_checker_note_effects(checker, statement);
+  }
   if (!type_checker_check_statement_body(checker, statement)) {
     return 0;
+  }
+  if (statement->type == AST_RETURN_STATEMENT && statement->data) {
+    const ReturnStatement *ret = (const ReturnStatement *)statement->data;
+    type_checker_note_return_facts(checker,
+                                   ret->value_count > 1 ? NULL : ret->value);
+  }
+  if (!type_checker_statement_holds_statements(statement)) {
+    type_checker_note_effects(checker, statement);
   }
   return type_checker_check_conflict_free(checker, statement);
 }
@@ -1338,6 +1400,7 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
       int block_ok =
           type_checker_declare_expansion_binding(checker, statement);
       int reached_terminator = 0;
+      int ends_here = 0;
       size_t block_guard_depth = type_checker_guard_depth(checker);
       for (size_t i = 0; i < statement->child_count; i++) {
         ASTNode *child = statement->children[i];
@@ -1362,15 +1425,25 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
         if (type_checker_statement_guarantees_termination(child)) {
           reached_terminator = 1;
         }
+        if (type_checker_never_falls_through(checker, child)) {
+          ends_here = 1;
+        }
         if (child && child->type == AST_IF_STATEMENT && child->data) {
           IfStatement *early = (IfStatement *)child->data;
           if (early->condition && !early->else_branch &&
               early->else_if_count == 0 && early->then_branch &&
-              type_checker_statement_guarantees_termination(
-                  early->then_branch)) {
+              type_checker_never_falls_through(checker, early->then_branch)) {
             type_checker_push_guard(checker, early->condition, 1);
           }
         }
+        type_checker_push_call_facts(checker, child);
+      }
+      if (!ends_here && checker->current_function_decl &&
+          checker->current_function_decl->type == AST_FUNCTION_DECLARATION &&
+          checker->current_function_decl->data &&
+          ((const FunctionDeclaration *)checker->current_function_decl->data)
+                  ->body == statement) {
+        type_checker_note_return_facts(checker, NULL);
       }
       type_checker_pop_guards(checker, block_guard_depth);
 

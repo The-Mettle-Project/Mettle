@@ -184,10 +184,27 @@ It follows integer ranges through constants, narrower types, `+`, `-`, `*`,
 constant, `for` ranges, and the comparisons in dominating `if` and `while`
 conditions, including the negated condition after an `if` that returns. A
 predicate that is not a comparison, such as `is_valid(value)`, is proven only
-by a guard that repeats it on the same expression. Float predicates are proven
-by constants and by guards, never by arithmetic. Nothing is proven across a
-call: a function that checks its argument does not make the caller's value
-proven.
+by a guard that repeats it on the same expression.
+
+A function that tests its argument proves the caller's value for integer and
+float parameters. A pointer, slice or struct parameter exports nothing, and
+neither does a parameter the callee writes, a method called through an object,
+a call through a function value, or a function with no body in this program.
+The fact reaches an argument that is a plain name; `is_percent(a + b)` proves
+nothing about `a + b`.
+
+What a call returns is bounded by that call's arguments for integer results
+only. A float result has the one range the function proved for it, and so does
+a function with more than 16 `return` statements. A result that leaves a
+`switch` or `match` is read without the test that chose the arm, so its range
+is wider than the truth and never narrower. Calls nest three deep before the
+one range is used.
+
+A test stops proving a value at the first write to it, and the compiler takes
+the wide view of what a write is. Any call whose callee it cannot show to be
+free of writes ends every test of a global and of a local whose address was
+ever taken, which includes every `extern` and every call through a function
+value.
 
 A declared type refines a number, a bool, a char, a string, a pointer or a
 slice. A struct, an enum or an array cannot be the base.

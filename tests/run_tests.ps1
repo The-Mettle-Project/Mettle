@@ -4950,6 +4950,41 @@ catch {
   Write-CaseResult -Name "float_predicates_bound_reassociation" -Passed $false -Reason $_.Exception.Message
 }
 
+# A function that tests its argument proves the caller's value, a call's
+# result is bounded by the arguments of that call, and a write ends what a
+# test established. Enforce: a verdict, its negation, a chain of verdicts, a
+# function that only returns for good values, a loop condition and a callee
+# declared later all prove, for integers and floats; a clamp, a halving and a
+# nested call bound their results by what they were given; the run-time check
+# agrees; and 37 programs that write the value after the test, read a result
+# wider than its call allows, or narrow a value that wraps are each refused.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $proven = @(
+    @{ Source = "tests/test_proof_across_calls.mettle"; Want = "40 -1 7 -1 55 9 10 88 1 2" },
+    @{ Source = "tests/test_proof_call_ranges.mettle"; Want = "45 100 0 7 30 80 100 32 0\s+0\.25 -1\.0 0\.5 0\.75" }
+  )
+  foreach ($case in $proven) {
+    foreach ($flags in @(@(), @("--release"), @("--check-proofs"), @("--check-proofs", "--release"))) {
+      $exe = Join-Path $tmpDir "proof_across_calls.exe"
+      $out = & $CompilerPath @flags --build $case.Source -o $exe 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) { throw "a proof in $($case.Source) was refused with '$flags': $out" }
+      $run = & $exe 2>&1 | Out-String
+      if ($run -notmatch $case.Want) { throw "$($case.Source) printed the wrong answer with '$flags': $run" }
+    }
+  }
+  $out = & $CompilerPath --build "tests/err_proof_stale.mettle" -o (Join-Path $tmpDir "proof_stale.exe") 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "a value written after its test was proven anyway" }
+  $refused = ([regex]::Matches($out, "error\[P0001\]")).Count
+  if ($refused -ne 37) { throw "expected 37 refusals and got ${refused}: $out" }
+  Write-CaseResult -Name "proofs_cross_calls_and_end_at_writes" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "proofs_cross_calls_and_end_at_writes" -Passed $false -Reason $_.Exception.Message
+}
+
 # A property the program declared and the compiler proved earns what one the
 # compiler discovered earns. Enforce: a pointer whose type rules out zero gets
 # no null check, a divisor whose type rules out zero lets an invariant divide
@@ -22214,6 +22249,7 @@ $issueRegressions = @(
   @{ Name = "type_id_release"; Entry = "tests/test_type_id.mettle"; Args = @("--release"); Expect = @("type_id: true true true true true true false") },
   @{ Name = "generic_call_in_literal"; Entry = "tests/test_generic_call_in_literal.mettle"; Args = @(); Expect = @("generic_literal: 42 0 8 0") },
   @{ Name = "generic_call_in_literal_release"; Entry = "tests/test_generic_call_in_literal.mettle"; Args = @("--release"); Expect = @("generic_literal: 42 0 8 0") },
+  @{ Name = "relation_ends_when_its_other_name_is_written"; Entry = "tests/test_proof_relation_stale.mettle"; Args = @(); Expect = @("Slice index out of bounds") },
   @{ Name = "float_indexed_address"; Entry = "tests/test_float_indexed_address.mettle"; Args = @(); Expect = @("float_indexed: 1008.0 504.0 10.0 21.0 37 4035.0") },
   @{ Name = "float_indexed_address_release"; Entry = "tests/test_float_indexed_address.mettle"; Args = @("--release"); Expect = @("float_indexed: 1008.0 504.0 10.0 21.0 37 4035.0") },
   @{ Name = "float_indexed_address_folds_load"; Command = @("--release", "--annotate-asm", "--asm-syntax=intel", "--annotate-fn=gather", "--build", "tests/test_float_indexed_address.mettle", "-o", ".tmp/float_indexed_shape.exe"); Expect = @("*4]") },
