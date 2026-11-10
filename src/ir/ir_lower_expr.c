@@ -2729,6 +2729,41 @@ static int ir_mixed_sign_divide_operands(IRLoweringContext *context,
                                          IROperand *left, IROperand *right,
                                          int *is_unsigned);
 
+static int ir_unsigned_compare_reads_narrow(IRLoweringContext *context,
+                                            IRFunction *function,
+                                            ASTNode *expression, ASTNode *node,
+                                            ASTNode *other, IROperand *value) {
+  Type *type = ir_infer_expression_type(context, node);
+  Type *other_type = ir_infer_expression_type(context, other);
+  if (!type || !other_type ||
+      (type->kind != TYPE_INT8 && type->kind != TYPE_INT16) ||
+      (other_type->kind != TYPE_UINT8 && other_type->kind != TYPE_UINT16) ||
+      !type_checker_compare_is_unsigned(other_type, type)) {
+    return 1;
+  }
+  unsigned long long mask = other_type->kind == TYPE_UINT8 ? 0xFFULL : 0xFFFFULL;
+  if (value->kind == IR_OPERAND_INT) {
+    value->int_value = (long long)((unsigned long long)value->int_value & mask);
+    return 1;
+  }
+  IROperand narrowed = ir_operand_none();
+  IRInstruction cast = {0};
+  if (!ir_make_temp_operand(context, &narrowed)) {
+    return 0;
+  }
+  cast.op = IR_OP_CAST;
+  cast.location = expression->location;
+  cast.dest = narrowed;
+  cast.lhs = *value;
+  cast.text = (char *)ir_backend_type_name(other_type->name);
+  cast.value_type = mtlc_type_from_frontend(other_type);
+  cast.is_unsigned = 1;
+  int emitted = ir_emit(context, function, &cast);
+  ir_operand_destroy(value);
+  *value = narrowed;
+  return emitted;
+}
+
 static int ir_widen_compare_operands(IRLoweringContext *context,
                                      IRFunction *function, ASTNode *expression,
                                      BinaryExpression *binary, IROperand *left,
@@ -2742,7 +2777,11 @@ static int ir_widen_compare_operands(IRLoweringContext *context,
                                            right) &&
          ir_widen_unsigned_compare_operand(context, function, expression,
                                            binary->right, binary->left, right,
-                                           left);
+                                           left) &&
+         ir_unsigned_compare_reads_narrow(context, function, expression,
+                                          binary->left, binary->right, left) &&
+         ir_unsigned_compare_reads_narrow(context, function, expression,
+                                          binary->right, binary->left, right);
 }
 
 static int ir_binary_operation_is_unsigned(IRLoweringContext *context,

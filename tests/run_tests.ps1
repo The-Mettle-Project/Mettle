@@ -22442,6 +22442,9 @@ $issueRegressions = @(
   @{ Name = "mixed_sign_narrow_ops"; Entry = "tests/issues/mixed_sign_narrow_ops.mettle"; Args = @(); Expect = @("44184 0") },
   @{ Name = "mixed_sign_narrow_ops_release"; Entry = "tests/issues/mixed_sign_narrow_ops.mettle"; Args = @("--release"); Expect = @("44184 0") },
   @{ Name = "mixed_sign_narrow_ops_interp"; Command = @("test", "tests/issues/mixed_sign_narrow_ops.mettle"); Refuse = @("failed"); Expect = @("1 passed") },
+  @{ Name = "mixed_sign_narrow_compare"; Entry = "tests/issues/mixed_sign_narrow_compare.mettle"; Args = @(); Expect = @("narrow compare bad 0") },
+  @{ Name = "mixed_sign_narrow_compare_release"; Entry = "tests/issues/mixed_sign_narrow_compare.mettle"; Args = @("--release"); Expect = @("narrow compare bad 0") },
+  @{ Name = "mixed_sign_narrow_compare_interp"; Command = @("test", "tests/issues/mixed_sign_narrow_compare.mettle"); Refuse = @("failed"); Expect = @("1 passed") },
   @{ Name = "err_mixed_width_bitwise"; Command = @("--build", "tests/issues/err_mixed_width_bitwise.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Narrowing conversion from 'int64' to 'int32' needs a cast") }
 )
 foreach ($case in $issueRegressions) {

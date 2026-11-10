@@ -1,0 +1,20 @@
+import "std/io";
+fn check() -> int32 {
+  var s8v: int8 = -1;
+  var x: uint8 = 255;
+  var s16v: int16 = -2;
+  var y: uint16 = 65534;
+  var bad: int32 = 0;
+  if (x == s8v) { } else { bad = bad | 1; }
+  if (x >= s8v) { } else { bad = bad | 2; }
+  if (s8v != x) { bad = bad | 4; }
+  if (y == s16v && s16v <= y) { } else { bad = bad | 8; }
+  var n: int32 = 0;
+  while (n < 3 && x == s8v) { n = n + 1; }
+  if (n != 3) { bad = bad | 16; }
+  var t: bool = (s8v < x);
+  if (t) { bad = bad | 32; }
+  return bad;
+}
+@test fn cmp_narrow() -> int32 { return check(); }
+fn main() -> int32 { println("narrow compare bad {check()}"); return 0; }
