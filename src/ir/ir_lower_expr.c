@@ -2797,6 +2797,10 @@ static int ir_binary_operation_is_unsigned(IRLoweringContext *context,
     return forced;
   }
   Type *left_type = ir_infer_expression_type(context, binary->left);
+  if (strcmp(binary->operator, "<<") == 0 ||
+      strcmp(binary->operator, ">>") == 0) {
+    return ir_type_is_unsigned_integer(left_type);
+  }
   Type *right_type = ir_infer_expression_type(context, binary->right);
   if (!ir_type_is_unsigned_integer(left_type) &&
       !ir_type_is_unsigned_integer(right_type)) {

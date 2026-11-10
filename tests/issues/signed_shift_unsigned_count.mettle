@@ -1,0 +1,19 @@
+import "std/io";
+fn check() -> int32 {
+  var s: int16 = -20000;
+  var b: uint8 = 3;
+  var i: int32 = -64;
+  var c: uint32 = 2;
+  var l: int64 = -1024;
+  var q: uint64 = 4;
+  var bad: int32 = 0;
+  if ((s >> b) != -2500) { bad = bad | 1; }
+  if ((i >> c) != -16) { bad = bad | 2; }
+  if ((l >> q) != -64) { bad = bad | 4; }
+  var t: int16 = s;
+  t >>= b;
+  if (t != -2500) { bad = bad | 8; }
+  return bad;
+}
+@test fn signed_shift_unsigned_count() -> int32 { return check(); }
+fn main() -> int32 { println("shift bad {check()}"); return 0; }
