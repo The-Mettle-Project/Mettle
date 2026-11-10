@@ -3365,6 +3365,19 @@ static int mono_is_integer_text(const char *type) {
   return mono_is_number_type(type) && strncmp(type, "float", 5) != 0;
 }
 
+static int mono_is_int_literal(const ASTNode *node) {
+  if (node && node->type == AST_UNARY_EXPRESSION && node->data) {
+    const UnaryExpression *unary = (const UnaryExpression *)node->data;
+    if (unary->operator && strcmp(unary->operator, "-") == 0) {
+      node = unary->operand;
+    }
+  }
+  const NumberLiteral *literal = node && node->type == AST_NUMBER_LITERAL
+                                     ? (const NumberLiteral *)node->data
+                                     : NULL;
+  return literal && !literal->is_float && !literal->is_char;
+}
+
 static int mono_is_float_literal(const ASTNode *node) {
   if (node && node->type == AST_UNARY_EXPRESSION && node->data) {
     const UnaryExpression *unary = (const UnaryExpression *)node->data;
@@ -3666,12 +3679,38 @@ static char *mono_static_type_of(MonoContext *ctx, ASTNode *expr,
 static char *mono_argument_type_of(MonoContext *ctx, ASTNode *expr,
                                    MonoVarEnv *env) {
   char *type = mono_static_type_of(ctx, expr, env);
-  if (!type && expr && expr->type == AST_BINARY_EXPRESSION) {
-    BinaryExpression *bin = (BinaryExpression *)expr->data;
-    type = bin ? mono_argument_type_of(ctx, bin->left, env) : NULL;
-    if (!type && bin) {
-      type = mono_argument_type_of(ctx, bin->right, env);
-    }
+  BinaryExpression *bin = !type && expr && expr->type == AST_BINARY_EXPRESSION
+                              ? (BinaryExpression *)expr->data
+                              : NULL;
+  if (!bin) {
+    return type;
+  }
+  char *left = mono_argument_type_of(ctx, bin->left, env);
+  char *right = mono_argument_type_of(ctx, bin->right, env);
+  const char *op = bin->operator ? bin->operator : "";
+  int is_bits =
+      strcmp(op, "&") == 0 || strcmp(op, "|") == 0 || strcmp(op, "^") == 0;
+  int mixes = is_bits || strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
+              strcmp(op, "*") == 0 || strcmp(op, "/") == 0 ||
+              strcmp(op, "%") == 0;
+  int left_literal = mono_is_int_literal(bin->left);
+  int right_literal = mono_is_int_literal(bin->right);
+  if (left && right && is_bits && left_literal != right_literal &&
+      mono_is_integer_text(left) && mono_is_integer_text(right)) {
+    type = left_literal ? right : left;
+  } else if (left && right && mixes && mono_is_number_type(left) &&
+             mono_is_number_type(right) && !mono_is_int32_literal(bin->left) &&
+             !mono_is_int32_literal(bin->right)) {
+    type = mono_promoted_number(bin, left, right, is_bits);
+  }
+  if (!type) {
+    type = left ? left : right;
+  }
+  if (left != type) {
+    free(left);
+  }
+  if (right != type) {
+    free(right);
   }
   return type;
 }

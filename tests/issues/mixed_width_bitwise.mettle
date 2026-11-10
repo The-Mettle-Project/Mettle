@@ -20,5 +20,10 @@ fn main() -> int32 {
   crc = (crc >> 1) + (3988292384 + mask);
   var x: uint32 = (crc >> 1) ^ (3988292384 & mask);
   println("{crc} {x}");
+  var byte: uint8 = 0xAB;
+  var low = byte & 0x0F;
+  var hi = 0xF0 & byte;
+  var h: int16 = 300;
+  println("{low} {hi} {show((h - 100) * (f * byte))} {show((h - 100) * wide)} {show(0xF0 & byte)}");
   return 0;
 }

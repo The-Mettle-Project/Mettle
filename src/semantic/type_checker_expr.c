@@ -5022,6 +5022,29 @@ int type_checker_adopt_float_literal(TypeChecker *checker, ASTNode *literal,
   return 1;
 }
 
+static int binary_literal_follows(TypeChecker *checker, ASTNode *literal,
+                                  Type *partner) {
+  ASTNode *node = literal;
+  long long value = 0;
+  if (node && node->type == AST_UNARY_EXPRESSION && node->data) {
+    UnaryExpression *unary = (UnaryExpression *)node->data;
+    node = unary->operator && strcmp(unary->operator, "-") == 0
+               ? unary->operand
+               : NULL;
+  }
+  NumberLiteral *number = node && node->type == AST_NUMBER_LITERAL
+                              ? (NumberLiteral *)node->data
+                              : NULL;
+  if (!number || number->is_float || number->is_char ||
+      !type_checker_is_integer_type(partner) || partner->kind == TYPE_ENUM ||
+      !type_checker_eval_integer_constant_with_checker(checker, literal,
+                                                       &value)) {
+    return 0;
+  }
+  return type_checker_constant_fits_type(partner, literal->resolved_type,
+                                         value);
+}
+
 static int binary_operand_types(TypeChecker *checker, BinaryExpression *binop,
                                 Type **left_type, Type **right_type) {
   *left_type = type_checker_infer_type(checker, binop->left);
@@ -5169,6 +5192,15 @@ Type *type_checker_check_binary_expression(TypeChecker *checker,
       type_checker_report_type_mismatch(checker, binop->right->location,
                                         "integer type", right_type->name);
       return NULL;
+    }
+    if (op[0] != '<' && op[0] != '>' && !left_type->refined_base &&
+        !right_type->refined_base) {
+      if (binary_literal_follows(checker, binop->right, left_type)) {
+        return left_type;
+      }
+      if (binary_literal_follows(checker, binop->left, right_type)) {
+        return right_type;
+      }
     }
     return type_checker_promote_types(checker, left_type, right_type, op);
   }
