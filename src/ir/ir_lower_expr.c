@@ -2722,12 +2722,20 @@ static int ir_widen_unsigned_compare_operand(IRLoweringContext *context,
   return emitted;
 }
 
+static int ir_mixed_sign_divide_operands(IRLoweringContext *context,
+                                         IRFunction *function,
+                                         ASTNode *expression,
+                                         BinaryExpression *binary,
+                                         IROperand *left, IROperand *right,
+                                         int *is_unsigned);
+
 static int ir_widen_compare_operands(IRLoweringContext *context,
                                      IRFunction *function, ASTNode *expression,
                                      BinaryExpression *binary, IROperand *left,
-                                     IROperand *right) {
+                                     IROperand *right, int *divide_unsigned) {
   if (!ir_binary_operator_is_comparison(binary->operator)) {
-    return 1;
+    return ir_mixed_sign_divide_operands(context, function, expression, binary,
+                                         left, right, divide_unsigned);
   }
   return ir_widen_unsigned_compare_operand(context, function, expression,
                                            binary->left, binary->right, left,
@@ -2740,7 +2748,11 @@ static int ir_widen_compare_operands(IRLoweringContext *context,
 static int ir_binary_operation_is_unsigned(IRLoweringContext *context,
                                            BinaryExpression *binary,
                                            const IROperand *left,
-                                           const IROperand *right) {
+                                           const IROperand *right,
+                                           int forced) {
+  if (forced >= 0) {
+    return forced;
+  }
   Type *left_type = ir_infer_expression_type(context, binary->left);
   Type *right_type = ir_infer_expression_type(context, binary->right);
   if (!ir_type_is_unsigned_integer(left_type) &&
@@ -2751,6 +2763,99 @@ static int ir_binary_operation_is_unsigned(IRLoweringContext *context,
          type_checker_compare_is_unsigned(left_type, right_type) ||
          (left->kind == IR_OPERAND_INT && left->int_value >= 0) ||
          (right->kind == IR_OPERAND_INT && right->int_value >= 0);
+}
+
+static int ir_mixed_sign_divide_operands(IRLoweringContext *context,
+                                         IRFunction *function,
+                                         ASTNode *expression,
+                                         BinaryExpression *binary,
+                                         IROperand *left, IROperand *right,
+                                         int *is_unsigned) {
+  const char *op = binary->operator;
+  *is_unsigned = -1;
+  if (!op || (strcmp(op, "/") != 0 && strcmp(op, "%") != 0)) {
+    return 1;
+  }
+  const char *name = ir_narrow_integer_result_type(
+      ir_infer_expression_type(context, expression), "+");
+  if (!name) {
+    return 1;
+  }
+  int unsigned_result = name[0] == 'u';
+  int bits = atoi(name + (unsigned_result ? 4 : 3));
+  ASTNode *sides[2] = {binary->left, binary->right};
+  IROperand *operands[2] = {left, right};
+  int differs[2] = {0, 0};
+  for (int i = 0; i < 2; i++) {
+    const char *side = ir_narrow_integer_result_type(
+        ir_infer_expression_type(context, sides[i]), "+");
+    differs[i] = side && (side[0] == 'u') != unsigned_result;
+  }
+  if (!differs[0] && !differs[1]) {
+    return 1;
+  }
+  for (int i = 0; i < 2; i++) {
+    if (!differs[i]) {
+      continue;
+    }
+    if (operands[i]->kind == IR_OPERAND_INT) {
+      unsigned long long mask = (1ULL << bits) - 1ULL;
+      unsigned long long low = (unsigned long long)operands[i]->int_value & mask;
+      long long value = (long long)low;
+      if (!unsigned_result && (low >> (bits - 1)) != 0) {
+        value = (long long)(low | ~mask);
+      }
+      operands[i]->int_value = value;
+      continue;
+    }
+    IROperand converted = ir_operand_none();
+    if (!ir_make_temp_operand(context, &converted)) {
+      return 0;
+    }
+    IRInstruction cast = {0};
+    cast.op = IR_OP_CAST;
+    cast.location = expression->location;
+    cast.dest = converted;
+    cast.lhs = *operands[i];
+    cast.text = (char *)name;
+    if (!ir_emit(context, function, &cast)) {
+      ir_operand_destroy(&converted);
+      return 0;
+    }
+    ir_operand_destroy(operands[i]);
+    *operands[i] = converted;
+  }
+  *is_unsigned = unsigned_result;
+  return 1;
+}
+
+static const char *ir_mixed_sign_bits_narrow(IRLoweringContext *context,
+                                             ASTNode *expression,
+                                             BinaryExpression *binary,
+                                             const char *already,
+                                             int is_float) {
+  const char *op = binary->operator;
+  if (already || is_float || context->address_width_depth > 0 || !op ||
+      (strcmp(op, "&") != 0 && strcmp(op, "|") != 0 && strcmp(op, "^") != 0)) {
+    return already;
+  }
+  const char *narrow = ir_narrow_integer_result_type(
+      ir_infer_expression_type(context, expression), "+");
+  if (!narrow) {
+    return NULL;
+  }
+  ASTNode *sides[2] = {binary->left, binary->right};
+  for (int i = 0; i < 2; i++) {
+    if (!sides[i] || sides[i]->type == AST_NUMBER_LITERAL) {
+      continue;
+    }
+    const char *side = ir_narrow_integer_result_type(
+        ir_infer_expression_type(context, sides[i]), "+");
+    if (side && (side[0] == 'u') != (narrow[0] == 'u')) {
+      return narrow;
+    }
+  }
+  return NULL;
 }
 
 static int ir_lower_binary_expression(IRLoweringContext *context,
@@ -2837,8 +2942,9 @@ static int ir_lower_binary_expression(IRLoweringContext *context,
     }
   }
 
+  int divide_unsigned = -1;
   if (!ir_widen_compare_operands(context, function, expression, binary, &left,
-                                 &right)) {
+                                 &right, &divide_unsigned)) {
     ir_operand_destroy(&left);
     ir_operand_destroy(&right);
     return 0;
@@ -2858,8 +2964,8 @@ static int ir_lower_binary_expression(IRLoweringContext *context,
   instruction.lhs = left;
   instruction.rhs = right;
   instruction.text = binary->operator;
-  instruction.is_unsigned =
-      ir_binary_operation_is_unsigned(context, binary, &left, &right);
+  instruction.is_unsigned = ir_binary_operation_is_unsigned(
+      context, binary, &left, &right, divide_unsigned);
   int operation_float_bits = ir_binary_expression_operation_float_bits(
       context, expression, binary);
   instruction.is_float = operation_float_bits != 0;
@@ -2894,6 +3000,8 @@ static int ir_lower_binary_expression(IRLoweringContext *context,
     if (context->assume_no_signed_overflow && ir_narrow_type_is_signed(narrow)) {
       narrow = NULL;
     }
+    narrow = ir_mixed_sign_bits_narrow(context, expression, binary, narrow,
+                                       instruction.is_float);
     if (narrow && binary->operator && binary->operator[0] == '/' &&
         binary->operator[1] == '\0' && right.kind == IR_OPERAND_INT &&
         right.int_value != -1) {

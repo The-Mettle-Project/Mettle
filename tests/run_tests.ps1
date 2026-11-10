@@ -22439,6 +22439,9 @@ $issueRegressions = @(
   @{ Name = "lane_vectorizer_verify"; Command = @("--verify", "--release", "--build", "tests/issues/lane_vectorizer.mettle", "-o", ".tmp/issue_lanes_v.exe"); Refuse = @("MISCOMPILE"); Expect = @("Built executable") },
   @{ Name = "lane_remarks"; Command = @("--release", "--explain", "tests/issues/lane_remarks.mettle", "-o", ".tmp/issue_lanes_r.obj"); Refuse = @("store under", "dot-shape-address", "serial-recurrence"); Expect = @("divides integers", "through ``*``", "condition held", "sum in int64", "select_only (loop @ line 24): vectorized", "[strided-access]") },
   @{ Name = "mixed_width_bitwise"; Entry = "tests/issues/mixed_width_bitwise.mettle"; Args = @(); Expect = @("4294967301 4294967301 0.75 2.5 2.5 7 0", "3988292427 1994146213", "11 160 17100.0 858993459200 160") },
+  @{ Name = "mixed_sign_narrow_ops"; Entry = "tests/issues/mixed_sign_narrow_ops.mettle"; Args = @(); Expect = @("44184 0") },
+  @{ Name = "mixed_sign_narrow_ops_release"; Entry = "tests/issues/mixed_sign_narrow_ops.mettle"; Args = @("--release"); Expect = @("44184 0") },
+  @{ Name = "mixed_sign_narrow_ops_interp"; Command = @("test", "tests/issues/mixed_sign_narrow_ops.mettle"); Refuse = @("failed"); Expect = @("1 passed") },
   @{ Name = "err_mixed_width_bitwise"; Command = @("--build", "tests/issues/err_mixed_width_bitwise.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Narrowing conversion from 'int64' to 'int32' needs a cast") }
 )
 foreach ($case in $issueRegressions) {
