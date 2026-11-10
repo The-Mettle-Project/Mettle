@@ -8681,8 +8681,12 @@ static ASTNode *parser_parse_range_for(Parser *parser, SourceLocation location) 
     return NULL;
   }
 
-  return ast_create_for_statement(initializer, condition, increment, body,
-                                  location);
+  ASTNode *loop = ast_create_for_statement(initializer, condition, increment,
+                                           body, location);
+  if (loop && loop->data) {
+    ((ForStatement *)loop->data)->range_inclusive = inclusive;
+  }
+  return loop;
 }
 
 typedef struct {

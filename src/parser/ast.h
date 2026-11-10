@@ -564,6 +564,7 @@ typedef struct {
   int uniform_mode;
   int warp_uniform;
   int parallel_mode;
+  int range_inclusive;
 } ForStatement;
 
 typedef struct {

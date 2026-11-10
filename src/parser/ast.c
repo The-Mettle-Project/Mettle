@@ -954,6 +954,7 @@ static ASTNode *ast_clone_for_statement(ASTNode *clone, const ASTNode *node) {
   dst->uniform_mode = src->uniform_mode;
   dst->warp_uniform = src->warp_uniform;
   dst->parallel_mode = src->parallel_mode;
+  dst->range_inclusive = src->range_inclusive;
   if (dst->initializer)
     ast_add_child(clone, dst->initializer);
   if (dst->condition)
@@ -3134,6 +3135,7 @@ ASTNode *ast_create_for_statement(ASTNode *initializer, ASTNode *condition,
   for_stmt->uniform_mode = 0;
   for_stmt->warp_uniform = 0;
   for_stmt->parallel_mode = 0;
+  for_stmt->range_inclusive = 0;
   node->data = for_stmt;
 
   if (initializer)

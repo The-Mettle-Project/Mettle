@@ -1,0 +1,18 @@
+import "std/io";
+fn count(n: uint8) -> int32 { var c: int32 = 0; for i: uint8 in 0..=n { c = c + 1; if (c > 1000) { break; } } return c; }
+fn main() -> int32 {
+  var c: int32 = 0;
+  for i: uint8 in 0..=255 { c = c + 1; if (c > 1000) { break; } }
+  var d: int32 = 0;
+  for j: int8 in 120..=127 { d = d + 1; if (d > 1000) { break; } }
+  var e: int64 = 0;
+  for k: int32 in 2147483640..=2147483647 { e = e + 1; if (e > 1000) { break; } }
+  var f: int32 = 0;
+  for k in 0..=10 { if (k == 3) { continue; } f = f + k; }
+  var g: int32 = 0;
+  for k in 5..=4 { g = g + 1; }
+  var h: int32 = 0;
+  for k: uint8 in 250..=255 { if (k == 252) { continue; } h = h + (int32)k; }
+  println("inclusive {c} {d} {e} {f} {g} {count(255)} {count(9)} {h}");
+  return 0;
+}

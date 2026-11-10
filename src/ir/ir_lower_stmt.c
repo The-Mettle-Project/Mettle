@@ -1084,6 +1084,85 @@ static int ir_lower_assignment(IRLoweringContext *context, IRFunction *function,
   return 1;
 }
 
+static int ir_range_end_is_plain(const ASTNode *node, int depth) {
+  if (!node || depth > 16) {
+    return 0;
+  }
+  switch (node->type) {
+  case AST_IDENTIFIER:
+  case AST_NUMBER_LITERAL:
+    return 1;
+  case AST_MEMBER_ACCESS:
+    return ir_range_end_is_plain(((MemberAccess *)node->data)->object,
+                                 depth + 1);
+  case AST_CAST_EXPRESSION:
+    return ir_range_end_is_plain(((CastExpression *)node->data)->operand,
+                                 depth + 1);
+  case AST_UNARY_EXPRESSION:
+    return ir_range_end_is_plain(((UnaryExpression *)node->data)->operand,
+                                 depth + 1);
+  case AST_BINARY_EXPRESSION: {
+    BinaryExpression *binary = (BinaryExpression *)node->data;
+    return ir_range_end_is_plain(binary->left, depth + 1) &&
+           ir_range_end_is_plain(binary->right, depth + 1);
+  }
+  case AST_INDEX_EXPRESSION: {
+    ArrayIndexExpression *index = (ArrayIndexExpression *)node->data;
+    return ir_range_end_is_plain(index->array, depth + 1) &&
+           ir_range_end_is_plain(index->index, depth + 1);
+  }
+  default:
+    return 0;
+  }
+}
+
+static int ir_range_end_below_max(Type *counter, const ASTNode *end) {
+  long long low = 0;
+  unsigned long long high = 0;
+  const ASTNode *node = end;
+  int negative = 0;
+  if (node->type == AST_UNARY_EXPRESSION &&
+      ((UnaryExpression *)node->data)->operator &&
+      strcmp(((UnaryExpression *)node->data)->operator, "-") == 0) {
+    node = ((UnaryExpression *)node->data)->operand;
+    negative = 1;
+  }
+  if (!node || node->type != AST_NUMBER_LITERAL || !counter ||
+      ((NumberLiteral *)node->data)->is_float ||
+      !type_checker_integer_bounds(counter, &low, &high)) {
+    return 0;
+  }
+  long long value = ((NumberLiteral *)node->data)->int_value;
+  return negative || (unsigned long long)value < high;
+}
+
+static int ir_lower_inclusive_range_exit(IRLoweringContext *context,
+                                         IRFunction *function,
+                                         ForStatement *for_data,
+                                         const char *end_label) {
+  ASTNode *condition = for_data->condition;
+  BinaryExpression *range = condition &&
+                                    condition->type == AST_BINARY_EXPRESSION
+                                ? (BinaryExpression *)condition->data
+                                : NULL;
+  if (!for_data->range_inclusive || !range || !range->operator ||
+      strcmp(range->operator, "<=") != 0 ||
+      !ir_range_end_is_plain(range->right, 0) ||
+      ir_range_end_below_max(ir_infer_expression_type(context, range->left),
+                             range->right)) {
+    return 1;
+  }
+  BinaryExpression last = *range;
+  last.operator = (char *)"!=";
+  ASTNode test = *condition;
+  test.data = &last;
+  test.children = NULL;
+  test.child_count = 0;
+  test.child_capacity = 0;
+  test.child_capacity_owner = NULL;
+  return ir_emit_condition_false_branch(context, function, &test, end_label);
+}
+
 static int ir_lower_for_statement(IRLoweringContext *context, IRFunction *function,
                                    ASTNode *statement, IRDeferScope *defers) {
   ForStatement *for_data = (ForStatement *)statement->data;
@@ -1212,7 +1291,8 @@ static int ir_lower_for_statement(IRLoweringContext *context, IRFunction *functi
     return 0;
   }
 
-  if (!ir_lower_statement_or_expression(context, function,
+  if (!ir_lower_inclusive_range_exit(context, function, for_data, end_label) ||
+      !ir_lower_statement_or_expression(context, function,
                                         for_data->increment)) {
     ir_local_scope_leave(context);
     free(condition_label);
