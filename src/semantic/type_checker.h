@@ -148,6 +148,7 @@ typedef struct {
   const struct ASTNode *joinable;
   void *join;
   void *arms_join;
+  size_t block_floor;
   void *movement_index;
   struct {
     struct ASTNode *body;

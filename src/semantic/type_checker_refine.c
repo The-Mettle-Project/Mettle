@@ -15,6 +15,7 @@ struct TypeCheckerGuard {
   unsigned char skip_memory;
   unsigned char demand;
   unsigned char is_float;
+  unsigned char retired;
   double float_min;
   double float_max;
   double float_err;
@@ -1194,7 +1195,7 @@ static void narrow_by_guards(TypeChecker *checker, const char *name,
     ctx.guard = i;
     if (guard->condition) {
       visit_atoms(guard->condition, guard->negated, narrow_visit, &ctx, 0);
-    } else if (guard->name && !guard->is_float &&
+    } else if (guard->name && !guard->is_float && !guard->retired &&
                strcmp(guard->name, name) == 0) {
       int moved = name_moved(checker, i, name);
       Range r = range_unknown();
@@ -2041,6 +2042,7 @@ typedef struct {
 
 typedef struct {
   const ASTNode *decl;
+  int binds;
   MovementSlot *slots;
   size_t mask;
 } MovementIndex;
@@ -2099,6 +2101,14 @@ static int movement_fill(MovementIndex *index, ASTNode *node) {
   const char *key;
   if (!node) {
     return 1;
+  }
+  if (node->type == AST_MATCH_STATEMENT && node->data) {
+    const MatchStatement *match = (const MatchStatement *)node->data;
+    for (size_t i = 0; i < match->arm_count; i++) {
+      if (match->arms[i].binding_name) {
+        index->binds = 1;
+      }
+    }
   }
   key = movement_key(node);
   if (key) {
@@ -3001,7 +3011,7 @@ static int name_is_never_written(TypeChecker *checker, const char *name,
   slot = movement_slot((MovementIndex *)index, name, 0);
   return (!slot || slot->count == 0) &&
          !node_writes_into(body, name, type_holds_its_value(type)) &&
-         !arm_binds_name(body, name);
+         !(index->binds && arm_binds_name(body, name));
 }
 
 static int parameter_is_stable(TypeChecker *checker, const char *name) {
@@ -4040,7 +4050,7 @@ static void fnarrow_by_guards(TypeChecker *checker, const char *name,
     ctx.guard = i;
     if (guard->condition) {
       visit_atoms(guard->condition, guard->negated, fnarrow_visit, &ctx, 0);
-    } else if (guard->name && guard->is_float &&
+    } else if (guard->name && guard->is_float && !guard->retired &&
                strcmp(guard->name, name) == 0 &&
                name_moved(checker, i, name) == MOVED_NOT) {
       FRange r = frange_unknown();
@@ -4614,24 +4624,49 @@ static int fresh_range(TypeChecker *checker, const Type *held, ASTNode *value,
   return 0;
 }
 
+static void retire_older_facts(TypeChecker *checker, const char *name,
+                               size_t kills_before, size_t guards_before) {
+  int wiped = checker->guard_count > guards_before;
+  for (size_t i = kills_before; i < checker->kill_count && !wiped; i++) {
+    const struct TypeCheckerKill *kill = &checker->kills[i];
+    wiped = kill->kind == KILL_NAME && kill->moved == MOVED_ANY &&
+            kill->name && strcmp(kill->name, name) == 0;
+  }
+  for (size_t i = guards_before; wiped && i > checker->block_floor; i--) {
+    struct TypeCheckerGuard *guard = &checker->guards[i - 1];
+    if (guard->condition || !guard->name || strcmp(guard->name, name) != 0) {
+      continue;
+    }
+    if (guard->retired) {
+      break;
+    }
+    guard->retired = 1;
+  }
+}
+
+static int name_range_kind(TypeChecker *checker, const char *name);
+
 void type_checker_note_written_value(TypeChecker *checker, ASTNode *statement) {
   const char *name = NULL;
   ASTNode *value = NULL;
   Range whole = range_unknown();
   FRange real = frange_unknown();
   int kind = 0;
+  int plain;
+  size_t kills_before;
+  size_t guards_before;
   if (!checker || !statement) {
     return;
   }
-  if (checker->current_function && checker->symbol_table &&
-      fresh_target(statement, &name, &value) &&
+  plain = checker->current_function && checker->symbol_table &&
+          fresh_target(statement, &name, &value);
+  kills_before = checker->kill_count;
+  guards_before = checker->guard_count;
+  if (plain && name_range_kind(checker, name) &&
       condition_taint(checker, value) == 0) {
     const Symbol *symbol = symbol_table_peek(checker->symbol_table, name);
     long long steps = checker->proof_steps;
-    if (symbol && symbol->type &&
-        (symbol->kind == SYMBOL_VARIABLE || symbol->kind == SYMBOL_PARAMETER)) {
-      kind = fresh_range(checker, symbol->type, value, &whole, &real);
-    }
+    kind = fresh_range(checker, symbol->type, value, &whole, &real);
     checker->proof_steps = steps;
   }
   type_checker_note_effects(checker, statement);
@@ -4652,6 +4687,9 @@ void type_checker_note_written_value(TypeChecker *checker, ASTNode *statement) {
     guard->float_max = real.max;
     guard->stored_line = statement->location.line;
     checker->guard_pushes++;
+  }
+  if (plain && guards_before <= checker->guard_count) {
+    retire_older_facts(checker, name, kills_before, guards_before);
   }
 }
 
@@ -4809,8 +4847,7 @@ static int join_shape(TypeChecker *checker, const ASTNode *statement,
   return 0;
 }
 
-static int join_kind_of(TypeChecker *checker, const ASTNode *statement,
-                        const char *name) {
+static int name_range_kind(TypeChecker *checker, const char *name) {
   const Symbol *symbol = symbol_table_peek(checker->symbol_table, name);
   const Type *base = symbol ? symbol->type : NULL;
   if (!symbol || (symbol->kind != SYMBOL_VARIABLE &&
@@ -4820,8 +4857,7 @@ static int join_kind_of(TypeChecker *checker, const ASTNode *statement,
   while (base && base->refined_base) {
     base = base->refined_base;
   }
-  if (!base || base->is_volatile || symbol->type->is_volatile ||
-      node_declares(statement, name) || arm_binds_name(statement, name)) {
+  if (!base || base->is_volatile || symbol->type->is_volatile) {
     return 0;
   }
   if (base->kind != TYPE_ENUM && type_checker_is_integer_type((Type *)base)) {
@@ -4830,8 +4866,21 @@ static int join_kind_of(TypeChecker *checker, const ASTNode *statement,
   return type_checker_is_float_base((Type *)base) && base->size == 8 ? 2 : 0;
 }
 
-static void join_names(TypeChecker *checker, const ASTNode *statement,
-                       const ASTNode *node, Join *join) {
+static void join_drop_inner_names(const ASTNode *statement, Join *join) {
+  size_t kept = 0;
+  for (size_t i = 0; i < join->count; i++) {
+    if (node_declares(statement, join->names[i]) ||
+        arm_binds_name(statement, join->names[i])) {
+      continue;
+    }
+    join->names[kept] = join->names[i];
+    join->is_float[kept] = join->is_float[i];
+    kept++;
+  }
+  join->count = kept;
+}
+
+static void join_names(TypeChecker *checker, const ASTNode *node, Join *join) {
   if (!node) {
     return;
   }
@@ -4845,7 +4894,7 @@ static void join_names(TypeChecker *checker, const ASTNode *statement,
     }
     if (name && !assign->target && assign->target_count == 0 &&
         at == join->count && join->count < JOIN_NAMES) {
-      kind = join_kind_of(checker, statement, name);
+      kind = name_range_kind(checker, name);
     }
     if (kind) {
       join->names[join->count] = name;
@@ -4856,11 +4905,11 @@ static void join_names(TypeChecker *checker, const ASTNode *statement,
   if (node->type == AST_MATCH_STATEMENT && node->data) {
     const MatchStatement *match = (const MatchStatement *)node->data;
     for (size_t i = 0; i < match->arm_count; i++) {
-      join_names(checker, statement, match->arms[i].body, join);
+      join_names(checker, match->arms[i].body, join);
     }
   }
   for (size_t i = 0; i < node->child_count; i++) {
-    join_names(checker, statement, node->children[i], join);
+    join_names(checker, node->children[i], join);
   }
 }
 
@@ -4946,7 +4995,8 @@ void *type_checker_join_begin(TypeChecker *checker, ASTNode *statement) {
   if (!join) {
     return NULL;
   }
-  join_names(checker, statement, statement, join);
+  join_names(checker, statement, join);
+  join_drop_inner_names(statement, join);
   if (join->count == 0) {
     free(join);
     return NULL;

@@ -1489,6 +1489,8 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
       int ends_here = 0;
       size_t block_effects = checker->kill_count;
       size_t block_guard_depth = type_checker_guard_depth(checker);
+      size_t outer_floor = checker->block_floor;
+      checker->block_floor = block_guard_depth;
       for (size_t i = 0; i < statement->child_count; i++) {
         ASTNode *child = statement->children[i];
         while (child && child->type == AST_COMPTIME_FOR) {
@@ -1538,6 +1540,7 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
         type_checker_forget_effects_since(checker, block_effects);
       }
       type_checker_pop_guards(checker, block_guard_depth);
+      checker->block_floor = outer_floor;
 
       if (block_ok)
         type_checker_warn_unused_locals(checker);
