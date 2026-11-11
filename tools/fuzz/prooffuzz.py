@@ -21,6 +21,8 @@ class Gen:
         self.claim_lines = {}
         self.focus = None
         self.loops = 0
+        self.signs = False
+        self.shape_locals = False
         self.with_demands = self.r.random() < 0.3
         self.inputs = list(INPUTS)
         self.r.shuffle(self.inputs)
@@ -42,7 +44,11 @@ class Gen:
             if lo >= 0 and hi <= 255 and self.r.random() < 0.3:
                 base = "uint8"
             name = "T%d" % k
-            self.emit("type %s = %s where value >= %d && value <= %d;" % (name, base, lo, hi))
+            if base == "int32" and self.r.random() < 0.25:
+                hi = 2147483647
+                self.emit("type %s = %s where value >= %d;" % (name, base, lo))
+            else:
+                self.emit("type %s = %s where value >= %d && value <= %d;" % (name, base, lo, hi))
             self.types.append((name, base, lo, hi))
         self.emit()
 
@@ -100,6 +106,29 @@ class Gen:
             self.emit("}")
             if self.with_demands:
                 self.emit("fn must_%s(n: int32) { if (n < %d || n > %d) { bail(); } }" % (name, lo, hi))
+            self.emit("fn deep_%s(n: int32, d: int32) -> bool {" % name)
+            self.emit("  if (n < %d || n > %d) { return false; }" % (lo, hi))
+            self.emit("  if (d > 0) { return deep_%s(n, d - 1); }" % name)
+            self.emit("  return true;")
+            self.emit("}")
+            self.emit("fn ping_%s(n: int32, d: int32) -> bool {" % name)
+            self.emit("  if (n < %d) { return false; }" % lo)
+            self.emit("  if (d <= 0) { return n <= %d; }" % hi)
+            self.emit("  return pong_%s(n, d - 1);" % name)
+            self.emit("}")
+            self.emit("fn pong_%s(n: int32, d: int32) -> bool {" % name)
+            self.emit("  if (n > %d) { return false; }" % hi)
+            self.emit("  if (d <= 0) { return n >= %d; }" % lo)
+            self.emit("  return ping_%s(n, d - 1);" % name)
+            self.emit("}")
+            self.emit("fn opt_%s(n: int32) -> Option<int32> {" % name)
+            if self.r.random() < 0.2:
+                self.emit("  if (n == %d) { return Some(n); }" % self.bound())
+            self.emit("  if (n < %d || n > %d) { return None; }" % (lo, hi))
+            if self.r.random() < 0.15:
+                self.emit("  n = n + %d;" % self.r.choice([1, 500]))
+            self.emit("  return Some(%s);" % self.r.choice(["n", "n", "n", "n / 2", "n + 1"]))
+            self.emit("}")
             self.emit()
         self.emit("fn between(n: int32, lo: int32, hi: int32) -> bool { return n >= lo && n <= hi; }")
         self.emit()
@@ -131,6 +160,8 @@ class Gen:
         elif shape == 7:
             self.emit("%s%s = clamp_%s(%s);" % (indent, v, name, r.choice(names)))
             opened = False
+        elif r.random() < 0.5:
+            self.emit("%sif (%s_%s(%s, %d)) {" % (indent, r.choice(["deep", "ping", "pong"]), name, v, r.randint(0, 3)))
         else:
             self.emit("%sif (%d <= %s && is_%s(%s)) {" % (indent, lo, v, name, v))
         inner = indent + "  " if opened else indent
@@ -210,10 +241,27 @@ class Gen:
         self.emit("}")
         self.emit()
 
+    def sign_cond(self, names):
+        r = self.r
+        v = r.choice(names)
+        form = r.randrange(5)
+        op = r.choice(["<", "<=", ">", ">=", "==", "!="])
+        if form == 0:
+            return "w %s %s" % (op, v)
+        if form == 1:
+            return "%s %s w" % (v, op)
+        if form == 2:
+            return "w %s %d" % (op, r.choice([0, 1, 50, 100, 255]))
+        if form == 3:
+            return "g_reg %s %d" % (op, self.bound())
+        return "(int32)w %s %d" % (op, self.bound())
+
     def cond(self, names, depth=0):
         r = self.r
         kind = r.randrange(10)
         v = r.choice(names)
+        if self.signs and r.random() < 0.12:
+            return self.sign_cond(names)
         if kind < 3:
             return "%s %s %d" % (v, r.choice(["<", "<=", ">", ">=", "==", "!="]), self.bound())
         if kind == 3:
@@ -250,6 +298,8 @@ class Gen:
         r = self.r
         kind = r.randrange(9)
         v = r.choice(names)
+        if self.signs and r.random() < 0.08:
+            return r.choice(["(int32)w", "g_reg", "(int32)(w & 255)", "(int32)(w / 2)"])
         if kind < 3:
             return v
         if kind == 3:
@@ -308,11 +358,81 @@ class Gen:
         else:
             self.emit("%sg_level = %s;" % (indent, self.value(names)))
 
+    def fresh(self, names, indent):
+        r = self.r
+        name, base, lo, hi = r.choice(self.types)
+        v = r.choice(names)
+        k = r.choice([lo, hi, lo - 1, hi + 1, (lo + hi) // 2, self.bound()])
+        k = max(-2000000000, min(2000000000, k))
+        form = r.randrange(6)
+        if form == 0:
+            self.emit("%s%s = %d;" % (indent, v, k))
+        elif form == 1:
+            self.emit("%s%s = %s;" % (indent, v, self.value(names)))
+        elif form == 2:
+            self.emit("%s%s = %d;" % (indent, v, k))
+            self.emit("%s%s = %s %s %d;" % (indent, v, v, r.choice(["+", "-"]), r.choice([1, 3, 500])))
+        elif form == 3:
+            self.emit("%sdefer %s = %d;" % (indent, v, k))
+        elif form == 4:
+            held = "f%d" % len(self.lines)
+            self.emit("%svar %s: int32 = %s;" % (indent, held, r.choice([str(k), self.value(names)])))
+            names = names + [held]
+            v = held
+        else:
+            self.emit("%s%s = %d;" % (indent, v, k))
+            self.emit("%sif (%s) { %s = %s; }" % (indent, self.cond(names), v, self.value(names)))
+        if r.random() < 0.3:
+            self.write(names, indent)
+        self.focus = (name, v)
+        self.claim(names, indent)
+        self.focus = None
+
+    def shadow(self, names, depth, indent):
+        v = self.r.choice(["x", "y", "g_level", "CEIL"])
+        self.emit("%s{" % indent)
+        self.emit("%s  var %s: int32 = %s;" % (indent, v, self.value(names)))
+        self.block(names, depth + 1, indent + "  ")
+        self.emit("%s}" % indent)
+
+    def rising(self, names, depth, indent):
+        r = self.r
+        k = "k%d" % len(self.lines)
+        n = "n%d" % len(self.lines)
+        step = r.choice([1, 1, 3, 1000000000, 2000000000])
+        sign = r.choice(["+", "+", "+", "-"])
+        limit = r.choice([str(self.bound()), r.choice(names), "CEIL", "%s + 3" % r.choice(names)])
+        test = "%s %s %s" % (k, "<" if sign == "+" else ">", limit)
+        self.emit("%svar %s: int32 = %d;" % (indent, k, self.bound()))
+        self.emit("%svar %s: int32 = 0;" % (indent, n))
+        if r.random() < 0.3:
+            self.emit("%s%s = %s %s %d;" % (indent, k, k, sign, step))
+        self.emit("%swhile (%s) {" % (indent, r.choice([test, test, "%s < 4" % n, "%s || %s < 2" % (test, n)])))
+        held = self.loops
+        self.loops = 0
+        if r.random() < 0.5:
+            self.block(names + [k], depth + 2, indent + "  ")
+        self.loops = held
+        self.emit("%s  %s = %s %s %d;" % (indent, k, k, sign, step))
+        self.emit("%s  %s = %s + 1;" % (indent, n, n))
+        self.emit("%s  if (%s > 3) { break; }" % (indent, n))
+        self.emit("%s}" % indent)
+        name = r.choice(self.types)[0]
+        self.focus = (name, k)
+        self.claim(names + [k], indent)
+        self.focus = None
+
     def block(self, names, depth, indent):
         r = self.r
         for _ in range(r.randint(1, 4)):
             kind = r.randrange(12)
-            if depth < 3 and r.random() < 0.35:
+            if r.random() < 0.08:
+                self.fresh(names, indent)
+            elif depth < 3 and r.random() < 0.05:
+                self.shadow(names, depth, indent)
+            elif depth < 2 and r.random() < 0.05:
+                self.rising(names, depth, indent)
+            elif depth < 3 and r.random() < 0.35:
                 self.matched(names, depth, indent)
             elif kind < 3:
                 self.claim(names, indent)
@@ -345,7 +465,10 @@ class Gen:
                 counter = "i%d" % len(self.lines)
                 self.emit("%svar %s: int32 = 0;" % (indent, counter))
                 self.emit("%swhile (%s < %d) {" % (indent, counter, r.randint(1, 3)))
+                held = self.loops
+                self.loops = 0
                 self.block(names, depth + 2, indent + "  ")
+                self.loops = held
                 self.emit("%s  %s = %s + 1;" % (indent, counter, counter))
                 self.emit("%s}" % indent)
             elif kind == 10 and depth < 2:
@@ -369,6 +492,23 @@ class Gen:
                 self.block(names, depth + 2, indent + "    ")
                 self.emit("%s  }" % indent)
                 self.emit("%s}" % indent)
+            elif depth < 2 and r.random() < 0.6:
+                name = r.choice(self.types)[0]
+                held = "w%d" % len(self.lines)
+                if r.random() < 0.25:
+                    held = r.choice(["x", "y", "g_level"])
+                self.emit("%smatch (opt_%s(%s)) {" % (indent, name, self.arg(names)))
+                self.emit("%s  case Some(%s): {" % (indent, held))
+                self.focus = (name, held)
+                for _ in range(r.randint(1, 3)):
+                    if r.random() < 0.7:
+                        self.claim(names + [held], indent + "    ")
+                    else:
+                        self.write(names + [held], indent + "    ")
+                self.focus = None
+                self.emit("%s  }" % indent)
+                self.emit("%s  case None: { }" % indent)
+                self.emit("%s}" % indent)
             elif self.demands:
                 name, arity = r.choice(self.demands)
                 self.emit("%s%s(%s);" % (indent, name, ", ".join(self.arg(names) for _ in range(arity))))
@@ -379,7 +519,10 @@ class Gen:
         self.emit("  var y: int32 = b - a;")
         target = self.r.choice(["a", "x", "y"])
         self.emit("  var at: int32* = &%s;" % target if self.r.random() < 0.5 else "  var at: int32* = &g_spare;")
+        self.emit("  var w: uint32 = (uint32)b;")
+        self.signs = True
         self.block(["a", "b", "x", "y", "g_level"], 0, "  ")
+        self.signs = False
         self.emit("}")
         self.emit()
 
@@ -402,7 +545,12 @@ type Live = Node* where value != 0;
 type Long = Node* where value != 0 && value->len > 4;
 type Ordered = Span where value.lo <= value.hi;
 type Unit = float64 where value >= 0.0 && value <= 1.0;
+type Index = int64 where value >= 0 && value < buf.length;
 
+fn in_bounds(buf: int32[], i: int64) -> bool {
+  if (i < 0) { return false; }
+  return i < buf.length;
+}
 fn is_live(p: Node*) -> bool { return p != 0; }
 fn is_long(p: Node*) -> bool { return p != 0 && p->len > 4; }
 fn is_ordered(s: Span) -> bool { return s.lo <= s.hi; }
@@ -412,6 +560,18 @@ fn shrink(p: Node*) { if (p != 0) { p->len = 0; } }
 fn grow(p: Node*) { if (p != 0) { p->len = 9; } }
 fn peek(p: Node*) -> int32 { if (p == 0) { return 0; } return p->len; }
 fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c; }
+fn halve(x: float64) -> float64 { return x * 0.5; }
+fn twice(x: float64) -> float64 { return x * 2.0; }
+fn clamp_unit(x: float64) -> float64 {
+  if (!(x >= 0.0)) { return 0.0; }
+  if (!(x <= 1.0)) { return 1.0; }
+  return x;
+}
+fn loose_unit(x: float64) -> float64 {
+  if (x < 0.0) { return 0.0; }
+  if (x > 1.0) { return 1.0; }
+  return x;
+}
 '''
 
     def shape_atom(self, who):
@@ -472,17 +632,53 @@ fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c;
             return "%s && %s" % (self.shape_cond(), self.shape_cond())
         if kind == 9:
             return "peek(%s) > 4" % p
+        if r.random() < 0.6:
+            return r.choice(["in_bounds(buf, i)", "i >= 0 && i < buf.length", "in_bounds(other, i)",
+                             "!in_bounds(buf, i)", "i < buf.length", "i >= 0"])
         return "%s == %s" % (p, r.choice(["p", "q", "0"]))
 
-    def shape_claim(self, indent):
+    def shape_fresh(self, indent):
+        r = self.r
+        form = r.randrange(4)
+        if form == 0:
+            self.emit("%sx = %s;" % (indent, r.choice(["0.0", "0.25", "1.0", "1.5", "-0.5", "x * 0.5",
+                                                        "clamp_unit(x)", "twice(x)"])))
+        elif form == 1:
+            self.emit("%sx = %s;" % (indent, r.choice(["0.25", "0.5"])))
+            self.emit("%sx = x %s;" % (indent, r.choice(["* 2.0", "+ 0.5", "* 0.5", "- 0.5"])))
+        elif form == 2:
+            self.emit("%sdefer x = 0.5;" % indent)
+        else:
+            self.emit("%sx = 0.5;" % indent)
+            self.emit("%sif (%s) { x = %s; }" % (indent, self.shape_cond(), r.choice(["2.0", "x + 1.0", "0.75"])))
+        self.shape_claim(indent, 4)
+
+    def shape_shadow(self, depth, indent):
+        r = self.r
+        self.emit("%s{" % indent)
+        self.emit(indent + "  " + r.choice([
+            "var buf: int32[] = other;", "var i: int64 = %d;" % r.choice([-1, 0, 1, 3]),
+            "var x: float64 = %s;" % r.choice(["2.5", "0.5", "x + 1.0"]),
+            "var p: Node* = q;", "var q: Node* = 0;",
+            "var s: Span = { lo: 9, hi: 1 };",
+        ]))
+        self.shape_block(depth + 1, indent + "  ")
+        self.emit("%s}" % indent)
+
+    def shape_claim(self, indent, kind=None):
         r = self.r
         cid = self.claims
         self.claims += 1
-        kind = r.randrange(5)
+        if kind is None:
+            kind = r.randrange(7)
         p = r.choice(["p", "q"])
         self.claim_lines[len(self.lines) + 1] = cid
         fail = "{ g_bad = g_bad + 1; g_first = %d; }" % cid
-        if kind == 0:
+        if kind >= 5:
+            value = r.choice(["i", "i", "i", "i + 1", "i - 1"])
+            self.emit("%svar c%d: Index = (Index)(%s);" % (indent, cid, value))
+            self.emit("%sif ((int64)c%d < 0 || (int64)c%d >= buf.length) %s" % (indent, cid, cid, fail))
+        elif kind == 0:
             self.emit("%svar c%d: Live = (Live)%s;" % (indent, cid, p))
             self.emit("%sif ((Node*)c%d == 0) %s" % (indent, cid, fail))
         elif kind == 1 or kind == 2:
@@ -492,7 +688,9 @@ fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c;
             self.emit("%svar c%d: Ordered = (Ordered)s;" % (indent, cid))
             self.emit("%sif (c%d.lo > c%d.hi) %s" % (indent, cid, cid, fail))
         else:
-            self.emit("%svar c%d: Unit = (Unit)x;" % (indent, cid))
+            value = r.choice(["x", "x", "halve(x)", "twice(x)", "clamp_unit(x)", "loose_unit(x)",
+                              "halve(clamp_unit(x))", "x * 0.5", "clamp_unit(twice(x))"])
+            self.emit("%svar c%d: Unit = (Unit)(%s);" % (indent, cid, value))
             self.emit("%sif (!((float64)c%d >= 0.0 && (float64)c%d <= 1.0)) %s" % (indent, cid, cid, fail))
 
     def shape_write(self, indent):
@@ -504,6 +702,7 @@ fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c;
             "%s = %s;" % (p, r.choice(["p", "q"])),
             "s.lo = %d;" % r.choice([0, 50]), "s.hi = s.lo - 1;", "s.hi = s.hi + 1;",
             "x = x + 0.75;", "x = x * 0.5;", "x = 0.25;",
+            "i = i + 1;", "i = i - 1;", "i = 0;", "buf = other;", "i = i + 1;",
             "{ var c: Clearer = { target: %s }; }" % p,
             "var k%d: Clearer = make_clearer(%s);" % (len(self.lines), p),
             "if (%s != 0) { %s = %s->next; }" % (p, p, p),
@@ -515,7 +714,11 @@ fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c;
         r = self.r
         for _ in range(r.randint(1, 4)):
             kind = r.randrange(10)
-            if kind < 4:
+            if r.random() < 0.06:
+                self.shape_fresh(indent)
+            elif self.shape_locals and depth < 3 and r.random() < 0.08:
+                self.shape_shadow(depth, indent)
+            elif kind < 4:
                 self.shape_claim(indent)
             elif kind < 6:
                 self.shape_write(indent)
@@ -551,7 +754,17 @@ fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c;
                 self.emit("%s}" % indent)
 
     def make_shape_test(self, k):
-        self.emit("fn u%d(p: Node*, q: Node*, s: Span, x: float64) {" % k)
+        self.shape_locals = self.r.random() < 0.5
+        if self.shape_locals:
+            self.emit("fn u%d(p0: Node*, q0: Node*, s0: Span, x0: float64, buf0: int32[], other: int32[], i0: int64) {" % k)
+            self.emit("  var p: Node* = p0;")
+            self.emit("  var q: Node* = q0;")
+            self.emit("  var s: Span = s0;")
+            self.emit("  var x: float64 = x0;")
+            self.emit("  var buf: int32[] = buf0;")
+            self.emit("  var i: int64 = i0;")
+        else:
+            self.emit("fn u%d(p: Node*, q: Node*, s: Span, x: float64, buf: int32[], other: int32[], i: int64) {" % k)
         self.shape_block(0, "  ")
         self.emit("}")
         self.emit()
@@ -559,12 +772,15 @@ fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c;
     def program(self, tests):
         self.emit('import "std/io";')
         self.emit('import "std/process";')
+        self.emit('import "std/core";')
         self.emit()
         self.emit("var g_level: int32 = 5;")
         self.emit("var g_spare: int32 = 0;")
         self.emit("var g_bad: int64 = 0;")
         self.emit("var g_first: int64 = -1;")
         self.emit("var g_calls: int64 = 0;")
+        self.emit("const CEIL: int32 = 100;")
+        self.emit("var g_reg: volatile int32 = 7;")
         self.emit()
         self.emit("fn bail() {")
         self.emit('  println("calls {g_calls} bad {g_bad} first {g_first}");')
@@ -618,10 +834,14 @@ fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c;
         self.emit("  var zero: float64 = 0.0;")
         self.emit("  var xs: float64[5] = [-1.0, 0.0, 0.5, 1.0, 2.5];")
         self.emit("  xs[4] = zero / zero;")
+        self.emit("  var wide: int32[] = new int32[4];")
+        self.emit("  var thin: int32[] = new int32[2];")
+        self.emit("  var at: int64[5] = [-1, 0, 1, 3, 4];")
         self.emit("  for a in 0..4 {")
         self.emit("    for b in 0..4 {")
         self.emit("      for c in 0..3 {")
         self.emit("        for d in 0..5 {")
+        self.emit("         for e in 0..5 {")
         for k in range(tests):
             self.emit("          n0->len = 0;")
             self.emit("          n0->next = n1;")
@@ -632,7 +852,9 @@ fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c;
             self.emit("          g_level = 5;")
             self.emit("          g_calls = g_calls + 1;")
             self.emit("          var s%d: Span = { lo: los[c], hi: his[c] };" % k)
-            self.emit("          u%d(pick_node(a, n0, n1, n2), pick_node(b, n0, n1, n2), s%d, xs[d]);" % (k, k))
+            self.emit("          u%d(pick_node(a, n0, n1, n2), pick_node(b, n0, n1, n2), s%d, xs[d], %s, at[e]);" % (
+                k, k, self.r.choice(["wide, thin", "thin, wide"])))
+        self.emit("         }")
         self.emit("        }")
         self.emit("      }")
         self.emit("    }")
@@ -656,7 +878,7 @@ def compile_program(compiler, extra, source, exe):
     return run.returncode, run.stdout + run.stderr
 
 
-def one(seed, compiler, extra, work, tests):
+def one(seed, compiler, extra, work, tests, modes=()):
     gen = Gen(seed)
     lines = gen.program(tests)
     source = os.path.join(work, "p%d.mettle" % seed)
@@ -697,6 +919,18 @@ def one(seed, compiler, extra, work, tests):
         return ("crash", seed, (run.stdout + run.stderr).splitlines()[-2:])
     if int(m.group(2)) > 0:
         return ("FALSE PROOF", seed, ["claim c%s, %s violations" % (m.group(3), m.group(2))])
+    for mode in modes:
+        other = os.path.join(work, "p%d_%s.exe" % (seed, mode.strip("-").replace("-", "_")))
+        code, text = compile_program(compiler, extra + [mode], source, other)
+        if code != 0 or not os.path.exists(other):
+            return ("mode build", seed, [mode] + text.splitlines()[-2:])
+        try:
+            again = subprocess.run([other], capture_output=True, text=True, timeout=60, errors="replace")
+        except subprocess.TimeoutExpired:
+            return ("mode timeout", seed, [mode])
+        os.remove(other)
+        if again.stdout != run.stdout:
+            return ("MODE DIFFERS", seed, [mode, run.stdout.strip()[-60:], (again.stdout + again.stderr).strip()[-120:]])
     return ("ok", seed, [gen.claims - refused, refused])
 
 
@@ -707,18 +941,20 @@ def main():
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--tests", type=int, default=6)
     ap.add_argument("--work", default=".tmp/prooffuzz")
+    ap.add_argument("--mode", action="append", default=[],
+                    help="also build with this flag and compare what the program prints")
     ap.add_argument("extra", nargs="*")
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
     proven = refused = 0
     counts = {}
     for seed in range(args.start, args.start + args.seeds):
-        kind, seed, detail = one(seed, args.compiler, args.extra, args.work, args.tests)
+        kind, seed, detail = one(seed, args.compiler, args.extra, args.work, args.tests, args.mode)
         counts[kind] = counts.get(kind, 0) + 1
         if kind == "ok":
             proven += detail[0]
             refused += detail[1]
-            for ext in (".mettle", ".exe"):
+            for ext in (".mettle", ".exe", ".obj"):
                 path = os.path.join(args.work, "p%d%s" % (seed, ext))
                 if os.path.exists(path):
                     os.remove(path)

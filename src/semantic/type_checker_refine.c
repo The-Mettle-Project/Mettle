@@ -328,6 +328,7 @@ enum { MOVED_NOT, MOVED_UP, MOVED_DOWN, MOVED_ANY };
 struct TypeCheckerKill {
   const char *name;
   size_t limit;
+  size_t line;
   unsigned char kind;
   unsigned char moved;
 };
@@ -355,6 +356,10 @@ typedef struct {
   int has_max;
   long long min;
   long long max;
+  double float_min;
+  double float_max;
+  double float_err;
+  int tag;
   struct TypeCheckerGuard *guards;
   size_t guard_count;
 } ReturnCase;
@@ -380,6 +385,8 @@ typedef struct {
   int reads;
   int may_return;
   int cases_open;
+  int returns_float;
+  int returns_variant;
   int atoms_closed;
   int drops;
   AtomSet atoms_true;
@@ -423,6 +430,9 @@ typedef struct {
   const FunctionSummary *summary;
   const ReturnCase *at;
   Range *ranges;
+  FRange *float_ranges;
+  const Type *result;
+  int tag;
 } ProofFrame;
 
 static Symbol *movement_of(TypeChecker *checker, const char *name);
@@ -470,6 +480,7 @@ static void kill_add(TypeChecker *checker, int kind, const char *name,
   }
   kill = &checker->kills[checker->kill_count++];
   kill->name = name;
+  kill->line = checker->effect_line;
   kill->limit = checker->guard_count;
   kill->kind = (unsigned char)kind;
   kill->moved = (unsigned char)moved;
@@ -568,6 +579,9 @@ static int memory_killed(const TypeChecker *checker, size_t guard) {
   return 0;
 }
 
+static const Type *type_before_checking(TypeChecker *checker,
+                                        const ASTNode *node);
+
 static int node_reads_memory(TypeChecker *checker, const ASTNode *node) {
   const char *op = NULL;
   ASTNode *operand = NULL;
@@ -580,8 +594,11 @@ static int node_reads_memory(TypeChecker *checker, const ASTNode *node) {
   }
   if (node->type == AST_MEMBER_ACCESS && node->data) {
     const MemberAccess *member = (const MemberAccess *)node->data;
-    return member->object && member->object->resolved_type &&
-           member->object->resolved_type->kind == TYPE_POINTER;
+    const Type *held = type_before_checking(checker, member->object);
+    while (held && held->refined_base) {
+      held = held->refined_base;
+    }
+    return held && held->kind == TYPE_POINTER;
   }
   if (node->type == AST_FUNCTION_CALL) {
     const FunctionSummary *summary = summary_of_call(checker, node);
@@ -719,18 +736,81 @@ static const char *written_root(const ASTNode *target, int *indirect) {
   return NULL;
 }
 
+static int place_is_a_pointer(TypeChecker *checker, const ASTNode *node,
+                              int array_counts) {
+  const Type *type = type_before_checking(checker, node);
+  while (type && type->refined_base) {
+    type = type->refined_base;
+  }
+  if (!type) {
+    return 0;
+  }
+  return type->kind == TYPE_POINTER ||
+         (array_counts && type->kind != TYPE_ARRAY);
+}
+
+static int write_leaves_its_root(TypeChecker *checker, const ASTNode *target) {
+  while (target && !identifier_name(target)) {
+    if (target->type == AST_INDEX_EXPRESSION && target->data) {
+      const ArrayIndexExpression *index =
+          (const ArrayIndexExpression *)target->data;
+      if (place_is_a_pointer(checker, index->array, 1)) {
+        return 1;
+      }
+      target = index->array;
+    } else if (target->type == AST_MEMBER_ACCESS && target->data) {
+      const MemberAccess *member = (const MemberAccess *)target->data;
+      if (place_is_a_pointer(checker, member->object, 0)) {
+        return 1;
+      }
+      target = member->object;
+    } else {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void effect_of_write(TypeChecker *checker, const ASTNode *target) {
   int indirect = 0;
   const char *root = written_root(target, &indirect);
   if (indirect || !root) {
     kill_add(checker, KILL_MEMORY, NULL, MOVED_ANY);
-  } else {
+  }
+  if (root && (!indirect || !write_leaves_its_root(checker, target))) {
     kill_add(checker, KILL_NAME, root, MOVED_ANY);
   }
 }
 
 static int type_runs_a_destructor(TypeChecker *checker, const Type *type) {
   return type && ownership_type_owns(checker, (Type *)type);
+}
+
+static const Type *type_before_checking(TypeChecker *checker,
+                                        const ASTNode *node) {
+  const char *name;
+  if (!node) {
+    return NULL;
+  }
+  if (node->resolved_type) {
+    return node->resolved_type;
+  }
+  if (node->type == AST_FUNCTION_CALL && node->data) {
+    const CallExpression *call = (const CallExpression *)node->data;
+    Symbol *callee = call->function_name && !call->object
+                         ? symbol_table_peek(checker->symbol_table,
+                                             call->function_name)
+                         : NULL;
+    return callee && callee->kind == SYMBOL_FUNCTION
+               ? callee->data.function.return_type
+               : NULL;
+  }
+  name = identifier_name(node);
+  if (name) {
+    Symbol *symbol = symbol_table_peek(checker->symbol_table, name);
+    return symbol ? symbol->type : NULL;
+  }
+  return NULL;
 }
 
 static void effect_of_drop(TypeChecker *checker, const Type *type) {
@@ -750,13 +830,18 @@ static void effect_of_assignment(TypeChecker *checker, const ASTNode *node) {
     return;
   }
   if (assign->value) {
-    effect_of_drop(checker, assign->value->resolved_type);
+    const Type *held = type_before_checking(checker, assign->value);
+    Symbol *target = !held && assign->variable_name
+                         ? symbol_table_peek(checker->symbol_table,
+                                             assign->variable_name)
+                         : NULL;
+    effect_of_drop(checker, target ? target->type : held);
   }
   if (assign->target) {
     effect_of_write(checker, assign->target);
   } else if (assign->variable_name) {
     Symbol *moves = movement_of(checker, assign->variable_name);
-    int direction = moves ? moves->move_direction : 0;
+    int direction = moves && moves->move_safe ? moves->move_direction : 0;
     kill_add(checker, KILL_NAME, assign->variable_name,
              direction > 0 ? MOVED_UP : direction < 0 ? MOVED_DOWN : MOVED_ANY);
   }
@@ -783,11 +868,12 @@ static void effect_of_call(TypeChecker *checker, const ASTNode *node) {
   if (!summary || summary->writes) {
     kill_add(checker, KILL_MEMORY, NULL, MOVED_ANY);
   }
-  effect_of_drop(checker, node->resolved_type);
+  effect_of_drop(checker, type_before_checking(checker, node));
 }
 
 static void effect_of_declaration(TypeChecker *checker,
                                   const VarDeclaration *decl) {
+  const Type *held = NULL;
   Symbol *made = decl->name
                      ? symbol_table_peek(checker->symbol_table, decl->name)
                      : NULL;
@@ -795,7 +881,13 @@ static void effect_of_declaration(TypeChecker *checker,
     return;
   }
   kill_add(checker, KILL_NAME, decl->name, MOVED_ANY);
-  effect_of_drop(checker, made ? made->type : NULL);
+  if (decl->type_name) {
+    held = type_checker_get_type_by_name(checker, decl->type_name);
+  }
+  if (!held) {
+    held = type_before_checking(checker, decl->initializer);
+  }
+  effect_of_drop(checker, held ? held : (made ? made->type : NULL));
 }
 
 void type_checker_note_effects(TypeChecker *checker, ASTNode *node) {
@@ -803,6 +895,9 @@ void type_checker_note_effects(TypeChecker *checker, ASTNode *node) {
   ASTNode *operand = NULL;
   if (!checker || !node) {
     return;
+  }
+  if (node->location.line) {
+    checker->effect_line = node->location.line;
   }
   if (node->type == AST_ASSIGNMENT) {
     effect_of_assignment(checker, node);
@@ -873,6 +968,8 @@ static int fact_fits(const Type *from, const Type *to);
 static int float_fact_fits(const Type *from, const Type *to);
 static int type_checker_is_float_base(const Type *type);
 static FRange frange_of_type(const Type *type);
+static int frange_of(TypeChecker *checker, ASTNode *expr, FRange *out,
+                     int depth);
 static void fnarrow_by_guards(TypeChecker *checker, const char *name,
                               FRange *range, int depth);
 
@@ -952,6 +1049,64 @@ static void narrow_by_comparison(NarrowContext *ctx, const char *op,
   }
 }
 
+static int constant_range(TypeChecker *checker, const ASTNode *expr, Range *out,
+                          int depth);
+
+static int type_signedness(const Type *type, int *is_signed) {
+  long long low = 0;
+  unsigned long long high = 0;
+  while (type && type->refined_base) {
+    type = type->refined_base;
+  }
+  if (!type || type->kind == TYPE_ENUM ||
+      !type_checker_integer_bounds(type, &low, &high)) {
+    return 0;
+  }
+  *is_signed = low < 0;
+  return 1;
+}
+
+static int comparison_misreads_a_sign(TypeChecker *checker,
+                                      const ASTNode *left,
+                                      const ASTNode *right,
+                                      int *left_signed) {
+  int right_signed = 0;
+  const ASTNode *signed_side;
+  Range own;
+  Range fixed;
+  if (!left || !right || !left->resolved_type || !right->resolved_type ||
+      !type_signedness(left->resolved_type, left_signed) ||
+      !type_signedness(right->resolved_type, &right_signed) ||
+      *left_signed == right_signed ||
+      !type_checker_compare_is_unsigned(left->resolved_type,
+                                        right->resolved_type)) {
+    return 0;
+  }
+  signed_side = *left_signed ? left : right;
+  own = range_of_type(signed_side->resolved_type);
+  if (own.has_min && own.min >= 0) {
+    return 0;
+  }
+  return !(constant_range(checker, signed_side, &fixed, 0) && fixed.has_min &&
+           fixed.min >= 0);
+}
+
+static int sign_keeps_the_bound(TypeChecker *checker, const ASTNode *self,
+                                const ASTNode *other, const char **op) {
+  int self_signed = 0;
+  if (!comparison_misreads_a_sign(checker, self, other, &self_signed)) {
+    return 1;
+  }
+  if (!self_signed) {
+    return 0;
+  }
+  if (strcmp(*op, "==") == 0) {
+    *op = "<=";
+    return 1;
+  }
+  return strcmp(*op, "<") == 0 || strcmp(*op, "<=") == 0;
+}
+
 static void narrow_visit(void *raw, ASTNode *node, int negated) {
   NarrowContext *ctx = (NarrowContext *)raw;
   const char *op = NULL;
@@ -983,7 +1138,9 @@ static void narrow_visit(void *raw, ASTNode *node, int negated) {
     other = left;
     op = flip_operator(op);
   }
-  if (!other) {
+  if (!other || !op ||
+      !sign_keeps_the_bound(ctx->checker, other == right ? left : right, other,
+                            &op)) {
     return;
   }
   if (ctx->tracked) {
@@ -1403,6 +1560,80 @@ static int range_of_binary(TypeChecker *checker, ASTNode *expr, Range *out,
   return out->has_min || out->has_max;
 }
 
+static Symbol *symbol_in_scope(TypeChecker *checker,
+                               const Identifier *identifier) {
+  Symbol *symbol;
+  if (!checker || !checker->symbol_table || !identifier || !identifier->name) {
+    return NULL;
+  }
+  symbol = type_checker_lookup_expansion_binding(checker, identifier->name);
+  return symbol ? symbol
+                : symbol_table_peek(checker->symbol_table, identifier->name);
+}
+
+static Symbol *symbol_where_written(TypeChecker *checker,
+                                    const ASTNode *node) {
+  const Identifier *identifier = node && node->type == AST_IDENTIFIER
+                                     ? (const Identifier *)node->data
+                                     : NULL;
+  Symbol *symbol = NULL;
+  if (!checker || !checker->symbol_table || !identifier || !identifier->name) {
+    return NULL;
+  }
+  if (identifier->scope_id == 0) {
+    symbol = symbol_table_lookup_global(checker->symbol_table,
+                                        identifier->name);
+  } else if (identifier->scope_id != AST_SCOPE_ID_UNRESOLVED) {
+    symbol = symbol_table_peek(checker->symbol_table, identifier->name);
+    if (symbol &&
+        (!symbol->scope || symbol->scope->scope_id != identifier->scope_id)) {
+      symbol = NULL;
+    }
+  }
+  if (!symbol) {
+    checker->movement_unsettled = 1;
+  }
+  return symbol;
+}
+
+static const char *predicate_hidden_name(TypeChecker *checker,
+                                         const ASTNode *node,
+                                         const char *binding) {
+  const char *name = NULL;
+  if (!node) {
+    return NULL;
+  }
+  if (node->type == AST_IDENTIFIER) {
+    name = identifier_name(node);
+  } else if (node->type == AST_FUNCTION_CALL && node->data) {
+    const CallExpression *call = (const CallExpression *)node->data;
+    name = call->object ? NULL : call->function_name;
+    for (size_t i = 0; i < call->argument_count; i++) {
+      const char *inner =
+          predicate_hidden_name(checker, call->arguments[i], binding);
+      if (inner) {
+        return inner;
+      }
+    }
+  }
+  if (name && strcmp(name, binding) != 0) {
+    Symbol *global = symbol_table_lookup_global(checker->symbol_table, name);
+    if (global &&
+        (type_checker_lookup_expansion_binding(checker, name) ||
+         symbol_table_peek(checker->symbol_table, name) != global)) {
+      return name;
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    const char *inner =
+        predicate_hidden_name(checker, node->children[i], binding);
+    if (inner) {
+      return inner;
+    }
+  }
+  return NULL;
+}
+
 static int range_of_identifier(TypeChecker *checker, ASTNode *expr, Range *out,
                     int depth) {
 
@@ -1411,9 +1642,7 @@ static int range_of_identifier(TypeChecker *checker, ASTNode *expr, Range *out,
       return frame_range_of_identifier(checker, expr, out, depth);
     }
     Identifier *identifier = (Identifier *)expr->data;
-    Symbol *symbol = identifier
-                         ? type_checker_resolve_identifier(checker, identifier)
-                         : NULL;
+    Symbol *symbol = symbol_in_scope(checker, identifier);
     if (symbol && symbol->kind == SYMBOL_CONSTANT) {
       *out = range_exact(symbol->data.constant.value);
       return 1;
@@ -1456,6 +1685,14 @@ static int range_of(TypeChecker *checker, ASTNode *expr, Range *out,
   *out = range_unknown();
   if (!expr || depth > 32) {
     return 0;
+  }
+  if (expr->resolved_type && expr->resolved_type->is_volatile) {
+    if (expr->resolved_type->kind == TYPE_ENUM ||
+        !type_checker_is_integer_type(expr->resolved_type)) {
+      return 0;
+    }
+    *out = range_of_type(expr->resolved_type);
+    return out->has_min || out->has_max;
   }
   switch (expr->type) {
   case AST_NUMBER_LITERAL: {
@@ -1526,7 +1763,10 @@ static void narrow_by_relation(TypeChecker *checker, const Type *declared,
     if (!layer->refine_relational || !layer->refinement ||
         !relation_is_stable(checker, layer->refinement,
                             layer->refine_binding ? layer->refine_binding
-                                                  : "value")) {
+                                                  : "value") ||
+        predicate_hidden_name(checker, layer->refinement,
+                              layer->refine_binding ? layer->refine_binding
+                                                    : "value")) {
       continue;
     }
     ctx.checker = checker;
@@ -1750,10 +1990,7 @@ static int constant_range(TypeChecker *checker, const ASTNode *expr, Range *out,
     return 1;
   }
   case AST_IDENTIFIER: {
-    Identifier *identifier = (Identifier *)expr->data;
-    Symbol *symbol = identifier
-                         ? type_checker_resolve_identifier(checker, identifier)
-                         : NULL;
+    Symbol *symbol = symbol_where_written(checker, expr);
     if (symbol && symbol->kind == SYMBOL_CONSTANT) {
       *out = range_exact(symbol->data.constant.value);
       return 1;
@@ -1970,6 +2207,290 @@ static void movement_from_index(const MovementIndex *index, const char *name,
   symbol->move_addend = ok ? addend : NULL;
 }
 
+typedef struct {
+  TypeChecker *checker;
+  const char *name;
+  int direction;
+  long long total;
+  long long reach;
+  int has_reach;
+  int outside_a_loop;
+  int ok;
+  long long low;
+  long long high;
+  Range found;
+  int found_any;
+} WrapScan;
+
+static int wrap_limit(WrapScan *scan, const ASTNode *other, Range *bound) {
+  const Type *type = NULL;
+  long long low = 0;
+  unsigned long long high = 0;
+  if (constant_range(scan->checker, other, bound, 0)) {
+    return 1;
+  }
+  if (other->type == AST_IDENTIFIER) {
+    Symbol *symbol = symbol_where_written(scan->checker, other);
+    type = symbol ? symbol->type : NULL;
+  } else {
+    type = other->resolved_type;
+    if (!type) {
+      scan->checker->movement_unsettled = 1;
+    }
+  }
+  while (type && type->refined_base) {
+    type = type->refined_base;
+  }
+  if (!type || type->kind == TYPE_ENUM ||
+      !type_checker_integer_bounds(type, &low, &high) ||
+      high > (unsigned long long)LLONG_MAX) {
+    return 0;
+  }
+  *bound = range_unknown();
+  bound->has_min = 1;
+  bound->has_max = 1;
+  bound->min = low;
+  bound->max = (long long)high;
+  return 1;
+}
+
+static void wrap_bound_visit(void *raw, ASTNode *node, int negated) {
+  WrapScan *scan = (WrapScan *)raw;
+  const char *op = NULL;
+  ASTNode *left = NULL;
+  ASTNode *right = NULL;
+  ASTNode *other = NULL;
+  Range bound;
+  if (!binary_parts(node, &op, &left, &right) || !is_comparison(op)) {
+    return;
+  }
+  if (negated) {
+    op = negate_operator(op);
+  }
+  if (op && identifier_name(left) &&
+      strcmp(identifier_name(left), scan->name) == 0) {
+    other = right;
+  } else if (op && identifier_name(right) &&
+             strcmp(identifier_name(right), scan->name) == 0) {
+    other = left;
+    op = flip_operator(op);
+  }
+  if (!other || !op || !wrap_limit(scan, other, &bound) || !bound.has_min ||
+      !bound.has_max || bound.min < scan->low || bound.max > scan->high) {
+    return;
+  }
+  if (scan->direction > 0 && bound.has_max &&
+      (strcmp(op, "<") == 0 || strcmp(op, "<=") == 0)) {
+    long long top = strcmp(op, "<") == 0 ? bound.max - 1 : bound.max;
+    if (!scan->found_any || top < scan->found.max) {
+      scan->found.max = top;
+    }
+    scan->found_any = 1;
+  } else if (scan->direction < 0 && bound.has_min &&
+             (strcmp(op, ">") == 0 || strcmp(op, ">=") == 0)) {
+    long long low = strcmp(op, ">") == 0 ? bound.min + 1 : bound.min;
+    if (!scan->found_any || low > scan->found.min) {
+      scan->found.min = low;
+    }
+    scan->found_any = 1;
+  }
+}
+
+static void wrap_scan_write(WrapScan *scan, const ASTNode *node,
+                            ASTNode *loop_test, int looped) {
+  const Assignment *assign = (const Assignment *)node->data;
+  long long step = 0;
+  long long edge;
+  if (!assign || assign->target || !assign->variable_name ||
+      strcmp(assign->variable_name, scan->name) != 0) {
+    return;
+  }
+  if (!monotone_step_node(node, scan->name, &step) || step == 0 ||
+      !add_checked(scan->total, step < 0 ? -step : step, &scan->total)) {
+    scan->ok = 0;
+    return;
+  }
+  if (!looped) {
+    scan->outside_a_loop = 1;
+    return;
+  }
+  if (!loop_test) {
+    scan->ok = 0;
+    return;
+  }
+  scan->found_any = 0;
+  visit_atoms(loop_test, 0, wrap_bound_visit, scan, 0);
+  if (!scan->found_any) {
+    scan->ok = 0;
+    return;
+  }
+  edge = scan->direction > 0 ? scan->found.max : scan->found.min;
+  if (!scan->has_reach || (scan->direction > 0 ? edge > scan->reach
+                                               : edge < scan->reach)) {
+    scan->reach = edge;
+  }
+  scan->has_reach = 1;
+}
+
+static void wrap_scan(WrapScan *scan, const ASTNode *node, ASTNode *loop_test,
+                      int looped) {
+  const ASTNode *once = NULL;
+  ASTNode *inner_test = loop_test;
+  int inner_looped = looped;
+  if (!node || !scan->ok) {
+    return;
+  }
+  if (node->type == AST_WHILE_STATEMENT && node->data) {
+    inner_test = ((const WhileStatement *)node->data)->condition;
+    inner_looped = 1;
+  } else if (node->type == AST_FOR_STATEMENT && node->data) {
+    once = ((const ForStatement *)node->data)->initializer;
+    inner_test = ((const ForStatement *)node->data)->condition;
+    inner_looped = 1;
+  } else if (node->type == AST_COMPTIME_FOR ||
+             node->type == AST_LAMBDA_EXPRESSION ||
+             node->type == AST_FUNCTION_DECLARATION) {
+    inner_test = NULL;
+    inner_looped = 1;
+  } else if (node->type == AST_ASSIGNMENT) {
+    wrap_scan_write(scan, node, loop_test, looped);
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node->children[i] == once) {
+      wrap_scan(scan, node->children[i], loop_test, looped);
+    } else {
+      wrap_scan(scan, node->children[i], inner_test, inner_looped);
+    }
+  }
+}
+
+static int movement_cannot_wrap(TypeChecker *checker, const ASTNode *body,
+                                const char *name, const Symbol *symbol) {
+  const Type *type = symbol->type;
+  const VarDeclaration *decl =
+      symbol->move_declaration
+          ? (const VarDeclaration *)symbol->move_declaration->data
+          : NULL;
+  WrapScan scan;
+  Range start;
+  long long low = 0;
+  unsigned long long high = 0;
+  long long end;
+  while (type && type->refined_base) {
+    type = type->refined_base;
+  }
+  if (!symbol->move_direction || !type || type->kind == TYPE_ENUM ||
+      !type_checker_integer_bounds(type, &low, &high) ||
+      high > (unsigned long long)LLONG_MAX) {
+    return 0;
+  }
+  memset(&scan, 0, sizeof(scan));
+  scan.checker = checker;
+  scan.name = name;
+  scan.direction = symbol->move_direction;
+  scan.ok = 1;
+  scan.low = low;
+  scan.high = (long long)high;
+  wrap_scan(&scan, body, NULL, 0);
+  if (!scan.ok) {
+    return 0;
+  }
+  if (scan.outside_a_loop) {
+    if (!decl || !constant_range(checker, decl->initializer, &start, 0) ||
+        !start.has_min || !start.has_max) {
+      return 0;
+    }
+    end = scan.direction > 0 ? start.max : start.min;
+    if (!scan.has_reach || (scan.direction > 0 ? end > scan.reach
+                                               : end < scan.reach)) {
+      scan.reach = end;
+    }
+    scan.has_reach = 1;
+  }
+  if (!scan.has_reach) {
+    return 0;
+  }
+  if (scan.direction > 0) {
+    return add_checked(scan.reach, scan.total, &end) && end <= (long long)high;
+  }
+  return sub_checked(scan.reach, scan.total, &end) && end >= low;
+}
+
+typedef struct {
+  TypeChecker *checker;
+  const char *skip;
+} SettleContext;
+
+static void settle_name(SettleContext *ctx, ASTNode *node) {
+  Identifier *identifier = node && node->type == AST_IDENTIFIER
+                               ? (Identifier *)node->data
+                               : NULL;
+  Symbol *symbol;
+  if (!identifier || !identifier->name ||
+      (ctx->skip && strcmp(ctx->skip, identifier->name) == 0) ||
+      type_checker_lookup_expansion_binding(ctx->checker, identifier->name)) {
+    return;
+  }
+  symbol = symbol_table_peek(ctx->checker->symbol_table, identifier->name);
+  if (symbol && symbol->scope) {
+    identifier->scope_id = symbol->scope->scope_id;
+  }
+}
+
+static void settle_visit(void *raw, ASTNode *node, int negated) {
+  const char *op = NULL;
+  ASTNode *left = NULL;
+  ASTNode *right = NULL;
+  (void)negated;
+  if (binary_parts(node, &op, &left, &right) && is_comparison(op)) {
+    settle_name((SettleContext *)raw, left);
+    settle_name((SettleContext *)raw, right);
+  }
+}
+
+void type_checker_settle_loop_test(TypeChecker *checker, ASTNode *statement) {
+  SettleContext ctx;
+  ASTNode *test = NULL;
+  if (!checker || !checker->symbol_table || !statement || !statement->data) {
+    return;
+  }
+  ctx.checker = checker;
+  ctx.skip = NULL;
+  if (statement->type == AST_WHILE_STATEMENT) {
+    test = ((WhileStatement *)statement->data)->condition;
+  } else if (statement->type == AST_FOR_STATEMENT) {
+    const ForStatement *loop = (const ForStatement *)statement->data;
+    test = loop->condition;
+    if (loop->initializer && loop->initializer->type != AST_VAR_DECLARATION) {
+      return;
+    }
+    if (loop->initializer && loop->initializer->data) {
+      ctx.skip = ((const VarDeclaration *)loop->initializer->data)->name;
+    }
+  }
+  if (test) {
+    visit_atoms(test, 0, settle_visit, &ctx, 0);
+  }
+}
+
+static void movement_settle(TypeChecker *checker, const ASTNode *body,
+                            const char *name, Symbol *symbol) {
+  const ASTNode *made = symbol->move_declaration;
+  if (made && (made->location.line != symbol->decl_line ||
+               made->location.column != symbol->decl_column)) {
+    symbol->move_declaration = NULL;
+    symbol->move_addend = NULL;
+    symbol->move_direction = 0;
+  }
+  checker->movement_unsettled = 0;
+  symbol->move_safe = movement_cannot_wrap(checker, body, name, symbol);
+  if (!symbol->move_safe && checker->movement_unsettled &&
+      symbol->move_tries < 8) {
+    symbol->move_tries++;
+    symbol->move_computed = 0;
+  }
+}
+
 static Symbol *movement_of(TypeChecker *checker, const char *name) {
   Symbol *symbol;
   const ASTNode *body;
@@ -1985,11 +2506,13 @@ static Symbol *movement_of(TypeChecker *checker, const char *name) {
   }
   symbol->move_computed = 1;
   symbol->move_direction = 0;
+  symbol->move_safe = 0;
   symbol->move_step = 0;
   symbol->move_declaration = NULL;
   symbol->move_addend = NULL;
   body = checker->current_function_decl;
-  if (!body || body->type != AST_FUNCTION_DECLARATION || !body->data) {
+  if (!body || body->type != AST_FUNCTION_DECLARATION || !body->data ||
+      (symbol->scope && symbol->scope->type == SCOPE_GLOBAL)) {
     return symbol;
   }
   body = ((const FunctionDeclaration *)body->data)->body;
@@ -1997,6 +2520,7 @@ static Symbol *movement_of(TypeChecker *checker, const char *name) {
     const MovementIndex *index = movement_index_for(checker, (ASTNode *)body);
     if (index) {
       movement_from_index(index, name, symbol);
+      movement_settle(checker, body, name, symbol);
       return symbol;
     }
   }
@@ -2012,6 +2536,7 @@ static Symbol *movement_of(TypeChecker *checker, const char *name) {
     ASTNode *addend = accumulator_addend((ASTNode *)body, name, &ok);
     symbol->move_addend = ok ? addend : NULL;
   }
+  movement_settle(checker, body, name, symbol);
   return symbol;
 }
 
@@ -2030,7 +2555,7 @@ static void narrow_by_monotone(TypeChecker *checker, const char *name,
     return;
   }
   declaration = movement->move_declaration;
-  direction = movement->move_direction;
+  direction = movement->move_safe ? movement->move_direction : 0;
   if (!declaration) {
     return;
   }
@@ -2064,6 +2589,137 @@ void type_checker_pop_loop_trip(TypeChecker *checker, size_t depth) {
   }
 }
 
+static int node_repeats_or_defers(const ASTNode *node) {
+  return node->type == AST_WHILE_STATEMENT ||
+         node->type == AST_FOR_STATEMENT || node->type == AST_COMPTIME_FOR ||
+         node->type == AST_LAMBDA_EXPRESSION ||
+         node->type == AST_FUNCTION_DECLARATION;
+}
+
+static int node_holds_continue(const ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_CONTINUE_STATEMENT) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node_holds_continue(node->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int statement_writes_name(const ASTNode *node, const char *name) {
+  const Assignment *assign = node && node->type == AST_ASSIGNMENT
+                                 ? (const Assignment *)node->data
+                                 : NULL;
+  return assign && !assign->target && assign->target_count == 0 &&
+         assign->variable_name && strcmp(assign->variable_name, name) == 0;
+}
+
+static int loop_steps_every_time(const ASTNode *body, const char *counter) {
+  if (node_holds_continue(body)) {
+    return 0;
+  }
+  if (body->type != AST_PROGRAM) {
+    return statement_writes_name(body, counter);
+  }
+  for (size_t i = 0; i < body->child_count; i++) {
+    if (statement_writes_name(body->children[i], counter)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static size_t writes_once_per_trip(const ASTNode *node, const char *name) {
+  size_t found = 0;
+  if (!node || node_repeats_or_defers(node)) {
+    return 0;
+  }
+  if (statement_writes_name(node, name)) {
+    found++;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    found += writes_once_per_trip(node->children[i], name);
+  }
+  return found;
+}
+
+static const ASTNode *block_holding(const ASTNode *node, const ASTNode *child) {
+  if (!node) {
+    return NULL;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    const ASTNode *deeper;
+    if (node->children[i] == child) {
+      return node;
+    }
+    deeper = block_holding(node->children[i], child);
+    if (deeper) {
+      return deeper;
+    }
+  }
+  return NULL;
+}
+
+static int runs_loop_once(const ASTNode *node, const ASTNode *loop_body) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_WHILE_STATEMENT && node->data) {
+    return ((const WhileStatement *)node->data)->body == loop_body;
+  }
+  if (node_repeats_or_defers(node)) {
+    return 0;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (runs_loop_once(node->children[i], loop_body)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int names_resolve_here(TypeChecker *checker, const ASTNode *node) {
+  if (!node) {
+    return 1;
+  }
+  if (node->type == AST_IDENTIFIER && !symbol_where_written(checker, node)) {
+    return 0;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (!names_resolve_here(checker, node->children[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int sum_runs_once_per_trip(TypeChecker *checker, const char *name,
+                                  const ASTNode *declaration,
+                                  const ASTNode *loop_body) {
+  const ASTNode *fn = checker->current_function_decl;
+  const ASTNode *block;
+  if (!fn || fn->type != AST_FUNCTION_DECLARATION || !fn->data ||
+      writes_once_per_trip(loop_body, name) != 1) {
+    return 0;
+  }
+  block = block_holding(((const FunctionDeclaration *)fn->data)->body,
+                        declaration);
+  if (!block || block->type != AST_PROGRAM) {
+    return 0;
+  }
+  for (size_t i = 0; i < block->child_count; i++) {
+    if (runs_loop_once(block->children[i], loop_body)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int type_checker_push_loop_trip(TypeChecker *checker, ASTNode *condition,
                                 ASTNode *body) {
   const char *counter;
@@ -2089,14 +2745,14 @@ int type_checker_push_loop_trip(TypeChecker *checker, ASTNode *condition,
   }
   {
     Symbol *movement = movement_of(checker, counter);
-    if (!movement || !movement->move_declaration) {
+    if (!movement || !movement->move_declaration || !movement->move_safe) {
       return 0;
     }
     declaration = movement->move_declaration;
     direction = movement->move_direction;
     step = movement->move_step;
   }
-  if (direction <= 0 || step <= 0) {
+  if (direction <= 0 || step <= 0 || !loop_steps_every_time(body, counter)) {
     return 0;
   }
   if (!constant_range(checker, right, &limit, 0) || !limit.has_max) {
@@ -2109,11 +2765,14 @@ int type_checker_push_loop_trip(TypeChecker *checker, ASTNode *condition,
       !initial.has_min) {
     return 0;
   }
-  trips = limit.max - initial.min;
+  if (!sub_checked(limit.max, initial.min, &trips) ||
+      !add_checked(trips, step - 1, &trips)) {
+    return 0;
+  }
   if (trips < 0) {
     trips = 0;
   }
-  trips = (trips + step - 1) / step;
+  trips = trips / step;
   if (strcmp(op, "<=") == 0) {
     trips++;
   }
@@ -2203,10 +2862,18 @@ void type_checker_summary_begin(TypeChecker *checker) {
   summary->stable = (unsigned char *)(summary->float_when_false + count);
   summary->usable = summary->stable + count;
   summary->floats = summary->usable + count;
-  summary->cases_open =
+  summary->returns_float =
       fn->data.function.return_type &&
-      fn->data.function.return_type->kind != TYPE_ENUM &&
-      type_checker_is_integer_type(fn->data.function.return_type);
+      fn->data.function.return_type->size == 8 &&
+      type_checker_is_float_base(fn->data.function.return_type);
+  summary->returns_variant =
+      fn->data.function.return_type &&
+      fn->data.function.return_type->kind == TYPE_TAGGED_ENUM;
+  summary->cases_open =
+      summary->returns_float || summary->returns_variant ||
+      (fn->data.function.return_type &&
+       fn->data.function.return_type->kind != TYPE_ENUM &&
+       type_checker_is_integer_type(fn->data.function.return_type));
   summary->atoms_closed =
       checker->current_function_decl &&
       checker->current_function_decl->type == AST_FUNCTION_DECLARATION &&
@@ -2289,6 +2956,30 @@ static int node_holds_defer(const ASTNode *node) {
   return 0;
 }
 
+static int arm_binds_name(const ASTNode *node, const char *name) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_MATCH_STATEMENT && node->data) {
+    const MatchStatement *match = (const MatchStatement *)node->data;
+    for (size_t i = 0; i < match->arm_count; i++) {
+      if (match->arms[i].binding_name &&
+          strcmp(match->arms[i].binding_name, name) == 0) {
+        return 1;
+      }
+      if (arm_binds_name(match->arms[i].body, name)) {
+        return 1;
+      }
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (arm_binds_name(node->children[i], name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int name_is_never_written(TypeChecker *checker, const char *name,
                                  const Type *type) {
   const ASTNode *decl = checker->current_function_decl;
@@ -2305,7 +2996,8 @@ static int name_is_never_written(TypeChecker *checker, const char *name,
   }
   slot = movement_slot((MovementIndex *)index, name, 0);
   return (!slot || slot->count == 0) &&
-         !node_writes_into(body, name, type_holds_its_value(type));
+         !node_writes_into(body, name, type_holds_its_value(type)) &&
+         !arm_binds_name(body, name);
 }
 
 static int parameter_is_stable(TypeChecker *checker, const char *name) {
@@ -2624,10 +3316,80 @@ static void case_keep_guards(TypeChecker *checker, const Symbol *fn,
   }
 }
 
+static int case_keep_fixed(TypeChecker *checker,
+                           const FunctionSummary *summary, ASTNode *value,
+                           ReturnCase *kept) {
+  Range now;
+  FRange real;
+  if (summary->returns_float) {
+    if (!frange_of(checker, value, &real, 0) || !real.has_min ||
+        !real.has_max) {
+      return 0;
+    }
+    kept->has_min = 1;
+    kept->has_max = 1;
+    kept->float_min = real.min;
+    kept->float_max = real.max;
+    kept->float_err = real.err;
+    return 1;
+  }
+  if (!range_of(checker, value, &now, 0) || !now.has_min || !now.has_max) {
+    return 0;
+  }
+  kept->has_min = 1;
+  kept->has_max = 1;
+  kept->min = now.min;
+  kept->max = now.max;
+  return 1;
+}
+
+static int case_keep_variant(TypeChecker *checker,
+                             const FunctionSummary *summary, const Symbol *fn,
+                             ASTNode *value, ReturnCase *kept) {
+  const CallExpression *made;
+  Symbol *maker;
+  ASTNode *payload;
+  Range now;
+  if (identifier_name(value)) {
+    maker = symbol_table_peek(checker->symbol_table, identifier_name(value));
+    if (!maker || maker->kind != SYMBOL_TAGGED_ENUM_CONSTRUCTOR) {
+      return 0;
+    }
+    kept->tag = maker->data.constructor.tag_value;
+    return 1;
+  }
+  if (value->type != AST_FUNCTION_CALL || !value->data) {
+    return 0;
+  }
+  made = (const CallExpression *)value->data;
+  maker = made->function_name && !made->object
+              ? symbol_table_peek(checker->symbol_table, made->function_name)
+              : NULL;
+  if (!maker || maker->kind != SYMBOL_TAGGED_ENUM_CONSTRUCTOR ||
+      made->argument_count > 1) {
+    return 0;
+  }
+  kept->tag = maker->data.constructor.tag_value;
+  payload = made->argument_count == 1 ? made->arguments[0] : NULL;
+  if (!payload || !payload->resolved_type ||
+      payload->resolved_type->kind == TYPE_ENUM ||
+      !type_checker_is_integer_type(payload->resolved_type)) {
+    return 1;
+  }
+  if (case_is_portable(checker, fn, summary, payload)) {
+    kept->value = payload;
+  } else if (range_of(checker, payload, &now, 0)) {
+    kept->has_min = now.has_min;
+    kept->has_max = now.has_max;
+    kept->min = now.min;
+    kept->max = now.max;
+  }
+  return 1;
+}
+
 static void summary_add_case(TypeChecker *checker, FunctionSummary *summary,
                              const Symbol *fn, ASTNode *value) {
   ReturnCase *kept;
-  Range now;
   if (!summary->cases_open || !value) {
     return;
   }
@@ -2644,14 +3406,15 @@ static void summary_add_case(TypeChecker *checker, FunctionSummary *summary,
   }
   kept = &summary->cases[summary->case_count];
   memset(kept, 0, sizeof(*kept));
-  if (case_is_portable(checker, fn, summary, value)) {
+  kept->tag = -1;
+  if (summary->returns_variant) {
+    if (!case_keep_variant(checker, summary, fn, value, kept)) {
+      summary_close_cases(summary);
+      return;
+    }
+  } else if (case_is_portable(checker, fn, summary, value)) {
     kept->value = value;
-  } else if (range_of(checker, value, &now, 0) && now.has_min && now.has_max) {
-    kept->has_min = 1;
-    kept->has_max = 1;
-    kept->min = now.min;
-    kept->max = now.max;
-  } else {
+  } else if (!case_keep_fixed(checker, summary, value, kept)) {
     summary_close_cases(summary);
     return;
   }
@@ -2745,7 +3508,8 @@ static void frame_join_cases(TypeChecker *checker, ProofFrame *frame,
     const ReturnCase *at = &frame->summary->cases[i];
     Range r = range_unknown();
     frame->at = at;
-    if (!frame_case_is_reachable(checker, frame, depth)) {
+    if ((frame->tag >= 0 && at->tag != frame->tag) ||
+        !frame_case_is_reachable(checker, frame, depth)) {
       continue;
     }
     if (!at->value) {
@@ -2756,7 +3520,7 @@ static void frame_join_cases(TypeChecker *checker, ProofFrame *frame,
     } else if (!range_of(checker, at->value, &r, depth + 1)) {
       r = range_unknown();
     }
-    range_as_computed(frame->callee->data.function.return_type, &r);
+    range_as_computed(frame->result, &r);
     fact_join(hull, &r);
     if (hull->seen && !hull->has_min && !hull->has_max) {
       return;
@@ -2764,8 +3528,47 @@ static void frame_join_cases(TypeChecker *checker, ProofFrame *frame,
   }
 }
 
+static int range_of_cases(TypeChecker *checker, ASTNode *expr,
+                          const Symbol *callee, int tag, const Type *result,
+                          Range *out, int depth);
+
 static int range_of_call_cases(TypeChecker *checker, ASTNode *expr,
                                Symbol *callee, Range *out, int depth) {
+  const FunctionSummary *summary = summary_of_call(checker, expr);
+  *out = range_unknown();
+  if (!summary || summary->returns_float || summary->returns_variant) {
+    return 0;
+  }
+  return range_of_cases(checker, expr, callee, -1,
+                        callee->data.function.return_type, out, depth);
+}
+
+void type_checker_push_payload_facts(TypeChecker *checker, ASTNode *subject,
+                                     int tag, const char *binding,
+                                     const struct Type *payload) {
+  const FunctionSummary *summary = summary_of_call(checker, subject);
+  const CallExpression *call;
+  Symbol *callee;
+  Range r;
+  if (checker && binding) {
+    kill_add(checker, KILL_NAME, binding, MOVED_ANY);
+  }
+  if (!summary || !summary->returns_variant || !binding || !payload ||
+      payload->kind == TYPE_ENUM ||
+      !type_checker_is_integer_type((Type *)payload)) {
+    return;
+  }
+  call = (const CallExpression *)subject->data;
+  callee = symbol_table_peek(checker->symbol_table, call->function_name);
+  if (range_of_cases(checker, subject, callee, tag, payload, &r, 0)) {
+    type_checker_push_range_guard(checker, binding, r.has_min, r.min,
+                                  r.has_max, r.max);
+  }
+}
+
+static int range_of_cases(TypeChecker *checker, ASTNode *expr,
+                          const Symbol *callee, int tag, const Type *result,
+                          Range *out, int depth) {
   const FunctionSummary *summary = summary_of_call(checker, expr);
   const CallExpression *call = (const CallExpression *)expr->data;
   void *outer = checker->proof_frame;
@@ -2783,6 +3586,9 @@ static int range_of_call_cases(TypeChecker *checker, ASTNode *expr,
   frame.callee = callee;
   frame.summary = summary;
   frame.at = NULL;
+  frame.float_ranges = NULL;
+  frame.result = result;
+  frame.tag = tag;
   frame.ranges = calloc(summary->count + 1, sizeof(Range));
   if (!frame.ranges) {
     return 0;
@@ -3305,18 +4111,154 @@ static int frange_of_binary(TypeChecker *checker, ASTNode *expr, FRange *out,
     return 0;
 }
 
+static int frame_float_parameter(TypeChecker *checker, const ProofFrame *frame,
+                                 size_t at, const char *name, FRange *out,
+                                 int depth) {
+  *out = frame->float_ranges[at];
+  if (frame->at && narrowing_enter(checker, name)) {
+    FNarrowContext ctx;
+    ctx.checker = checker;
+    ctx.name = name;
+    ctx.range = out;
+    ctx.depth = depth;
+    ctx.tracked = 0;
+    ctx.guard = 0;
+    for (size_t i = 0; i < frame->at->guard_count; i++) {
+      visit_atoms(frame->at->guards[i].condition, frame->at->guards[i].negated,
+                  fnarrow_visit, &ctx, 0);
+    }
+    narrowing_leave(checker);
+  }
+  return out->has_min || out->has_max;
+}
+
+static int frame_frange_of_identifier(TypeChecker *checker, ASTNode *expr,
+                                      FRange *out, int depth) {
+  const ProofFrame *frame = (const ProofFrame *)checker->proof_frame;
+  const char *name = identifier_name(expr);
+  int at = name ? summary_parameter(frame->callee, frame->summary, name) : -2;
+  *out = frange_of_type(expr->resolved_type);
+  if (at >= 0 && frame->float_ranges && frame->summary->floats[at]) {
+    return frame_float_parameter(checker, frame, (size_t)at, name, out, depth);
+  }
+  return out->has_min || out->has_max;
+}
+
+static void frame_bind_float(TypeChecker *checker, ProofFrame *frame,
+                             size_t at, ASTNode *argument, int depth) {
+  const Type *type = frame->callee->data.function.parameter_types[at];
+  FRange given;
+  frame->float_ranges[at] = frange_unknown();
+  if (!frame->summary->floats[at]) {
+    return;
+  }
+  frame->float_ranges[at] = frange_of_type(type);
+  if (argument && float_fact_fits(argument->resolved_type, type) &&
+      frange_of(checker, argument, &given, depth + 1)) {
+    frange_meet(&frame->float_ranges[at], &given);
+  }
+}
+
+static int frame_float_case_is_reachable(TypeChecker *checker,
+                                         const ProofFrame *frame, int depth) {
+  for (size_t i = 0; i < frame->summary->count; i++) {
+    FRange r;
+    if (frame->summary->floats[i] &&
+        frame_float_parameter(checker, frame, i,
+                              frame->callee->data.function.parameter_names[i],
+                              &r, depth) &&
+        r.has_min && r.has_max && r.min > r.max) {
+      return 0;
+    }
+  }
+  return frame_case_is_reachable(checker, frame, depth);
+}
+
+static void frame_join_float_cases(TypeChecker *checker, ProofFrame *frame,
+                                   FloatFact *hull, int depth) {
+  for (size_t i = 0; i < frame->summary->case_count; i++) {
+    const ReturnCase *at = &frame->summary->cases[i];
+    FRange r = frange_unknown();
+    frame->at = at;
+    if (!frame_float_case_is_reachable(checker, frame, depth)) {
+      continue;
+    }
+    if (!at->value) {
+      r.has_min = 1;
+      r.has_max = 1;
+      r.min = at->float_min;
+      r.max = at->float_max;
+      r.err = at->float_err;
+    } else if (!frange_of(checker, at->value, &r, depth + 1)) {
+      r = frange_unknown();
+    }
+    float_fact_join(hull, &r);
+    if (hull->seen && !hull->has_min && !hull->has_max) {
+      return;
+    }
+  }
+}
+
+static int frange_of_call(TypeChecker *checker, ASTNode *expr, FRange *out,
+                          int depth) {
+  const FunctionSummary *summary = summary_of_call(checker, expr);
+  const CallExpression *call = (const CallExpression *)expr->data;
+  void *outer = checker->proof_frame;
+  size_t entered = checker->narrowing_count;
+  Range ranges[8];
+  FRange float_ranges[8];
+  ProofFrame frame;
+  FloatFact hull;
+  FRange own = frange_unknown();
+  *out = frange_of_type(expr->resolved_type);
+  if (!summary || !summary->returns_float || !summary->cases_open ||
+      summary->case_count == 0 || summary->count > 8 ||
+      checker->proof_frame_depth >= SUMMARY_MAX_FRAMES ||
+      call->argument_count != summary->count) {
+    return out->has_min || out->has_max;
+  }
+  memset(&hull, 0, sizeof(hull));
+  frame.callee = symbol_table_peek(checker->symbol_table, call->function_name);
+  frame.summary = summary;
+  frame.at = NULL;
+  frame.result = NULL;
+  frame.tag = -1;
+  frame.ranges = ranges;
+  frame.float_ranges = float_ranges;
+  if (!frame.callee->data.function.parameter_names) {
+    return out->has_min || out->has_max;
+  }
+  for (size_t i = 0; i < summary->count; i++) {
+    frame_bind_argument(checker, &frame, i, call->arguments[i], depth);
+    frame_bind_float(checker, &frame, i, call->arguments[i], depth);
+  }
+  checker->proof_frame = &frame;
+  checker->proof_frame_depth++;
+  checker->narrowing_count = 0;
+  frame_join_float_cases(checker, &frame, &hull, depth);
+  checker->narrowing_count = entered;
+  checker->proof_frame_depth--;
+  checker->proof_frame = outer;
+  if (hull.seen) {
+    own.has_min = hull.has_min;
+    own.has_max = hull.has_max;
+    own.min = hull.min;
+    own.max = hull.max;
+    own.err = hull.err;
+    frange_meet(out, &own);
+  }
+  return out->has_min || out->has_max;
+}
+
 static int frange_of_identifier(TypeChecker *checker, ASTNode *expr, FRange *out,
                      int depth) {
 
   *out = frange_unknown();
     if (checker && checker->proof_frame) {
-      *out = frange_of_type(expr->resolved_type);
-      return out->has_min || out->has_max;
+      return frame_frange_of_identifier(checker, expr, out, depth);
     }
     Identifier *identifier = (Identifier *)expr->data;
-    Symbol *symbol = identifier
-                         ? type_checker_resolve_identifier(checker, identifier)
-                         : NULL;
+    Symbol *symbol = symbol_in_scope(checker, identifier);
     Type *type = expr->resolved_type ? expr->resolved_type
                                      : (symbol ? symbol->type : NULL);
     if (symbol && symbol->has_constant_value && symbol->constant_is_float) {
@@ -3348,6 +4290,10 @@ static int frange_of(TypeChecker *checker, ASTNode *expr, FRange *out,
   *out = frange_unknown();
   if (!expr || depth > 32) {
     return 0;
+  }
+  if (expr->resolved_type && expr->resolved_type->is_volatile) {
+    *out = frange_of_type(expr->resolved_type);
+    return out->has_min || out->has_max;
   }
   switch (expr->type) {
   case AST_NUMBER_LITERAL: {
@@ -3381,6 +4327,9 @@ static int frange_of(TypeChecker *checker, ASTNode *expr, FRange *out,
     out->err = inner.err;
     return 1;
   }
+  case AST_FUNCTION_CALL:
+    return frange_of_call(checker, expr, out, depth);
+
   case AST_CAST_EXPRESSION: {
     CastExpression *cast = (CastExpression *)expr->data;
     if (cast && cast->operand &&
@@ -3423,14 +4372,30 @@ static void fnarrow_by_accumulator(TypeChecker *checker, const char *name,
   if (!declaration || !addend) {
     return;
   }
-  checker->monotone_busy = 1;
-  if (!frange_of(checker, ((const VarDeclaration *)declaration->data)->initializer,
-                 &initial, depth + 1) ||
-      !frange_of(checker, addend, &step, depth + 1)) {
+  {
+    ASTNode *start = ((const VarDeclaration *)declaration->data)->initializer;
+    const ASTNode *fn = checker->current_function_decl;
+    size_t hidden = checker->guard_count;
+    int known;
+    if (!sum_runs_once_per_trip(
+            checker, name, declaration,
+            checker->loop_trips[checker->loop_trip_count - 1].body) ||
+        call_takes_address_of(((const FunctionDeclaration *)fn->data)->body,
+                              name) ||
+        !names_resolve_here(checker, addend) ||
+        !names_resolve_here(checker, start)) {
+      return;
+    }
+    checker->monotone_busy = 1;
+    checker->guard_count = 0;
+    known = frange_of(checker, start, &initial, depth + 1) &&
+            frange_of(checker, addend, &step, depth + 1);
+    checker->guard_count = hidden;
     checker->monotone_busy = 0;
-    return;
+    if (!known) {
+      return;
+    }
   }
-  checker->monotone_busy = 0;
   if (!initial.has_min || !initial.has_max || !step.has_min ||
       !step.has_max || step.err >= FRANGE_NO_BOUND ||
       initial.err >= FRANGE_NO_BOUND) {
@@ -3590,6 +4555,94 @@ int type_checker_push_range_guard(TypeChecker *checker, const char *name,
   checker->guard_count++;
   checker->guard_pushes++;
   return 1;
+}
+
+static int fresh_target(const ASTNode *statement, const char **name,
+                        ASTNode **value) {
+  if (statement->type == AST_VAR_DECLARATION && statement->data) {
+    const VarDeclaration *decl = (const VarDeclaration *)statement->data;
+    *name = decl->name;
+    *value = decl->initializer;
+    return decl->name && decl->initializer && !decl->is_extern &&
+           !node_mentions(decl->initializer, decl->name);
+  }
+  if (statement->type == AST_ASSIGNMENT && statement->data) {
+    const Assignment *assign = (const Assignment *)statement->data;
+    *name = assign->variable_name;
+    *value = assign->value;
+    return assign->variable_name && assign->value && !assign->target &&
+           assign->target_count == 0;
+  }
+  return 0;
+}
+
+static int fresh_range(TypeChecker *checker, const Type *held, ASTNode *value,
+                       Range *whole, FRange *real) {
+  const Type *base = held;
+  const Type *given = value->resolved_type;
+  while (base && base->refined_base) {
+    base = base->refined_base;
+  }
+  while (given && given->refined_base) {
+    given = given->refined_base;
+  }
+  if (!base || !given || base->is_volatile) {
+    return 0;
+  }
+  if (base->kind != TYPE_ENUM && type_checker_is_integer_type((Type *)base)) {
+    Range all = range_of_type(base);
+    if (given->kind == TYPE_ENUM ||
+        !type_checker_is_integer_type((Type *)given) ||
+        !range_of(checker, value, whole, 0)) {
+      return 0;
+    }
+    range_as_computed(base, whole);
+    return (whole->has_min && (!all.has_min || whole->min > all.min)) ||
+           (whole->has_max && (!all.has_max || whole->max < all.max));
+  }
+  if (type_checker_is_float_base((Type *)base) && base->size == 8 &&
+      type_checker_is_float_base((Type *)given)) {
+    return frange_of(checker, value, real, 0) && real->has_min &&
+                   real->has_max && real->err < FRANGE_NO_BOUND
+               ? 2
+               : 0;
+  }
+  return 0;
+}
+
+void type_checker_note_written_value(TypeChecker *checker, ASTNode *statement) {
+  const char *name = NULL;
+  ASTNode *value = NULL;
+  Range whole = range_unknown();
+  FRange real = frange_unknown();
+  int kind = 0;
+  if (!checker || !statement) {
+    return;
+  }
+  if (checker->current_function && checker->symbol_table &&
+      fresh_target(statement, &name, &value) &&
+      condition_taint(checker, value) == 0) {
+    const Symbol *symbol = symbol_table_peek(checker->symbol_table, name);
+    if (symbol && symbol->type &&
+        (symbol->kind == SYMBOL_VARIABLE || symbol->kind == SYMBOL_PARAMETER)) {
+      kind = fresh_range(checker, symbol->type, value, &whole, &real);
+    }
+  }
+  type_checker_note_effects(checker, statement);
+  if (kind == 1) {
+    type_checker_push_range_guard(checker, name, whole.has_min, whole.min,
+                                  whole.has_max, whole.max);
+  } else if (kind == 2 && guard_grow(checker)) {
+    struct TypeCheckerGuard *guard = &checker->guards[checker->guard_count++];
+    memset(guard, 0, sizeof(*guard));
+    guard->name = name;
+    guard->is_float = 1;
+    guard->has_min = 1;
+    guard->has_max = 1;
+    guard->float_min = real.min;
+    guard->float_max = real.max;
+    checker->guard_pushes++;
+  }
 }
 
 size_t type_checker_guard_depth(const TypeChecker *checker) {
@@ -3754,10 +4807,49 @@ typedef struct {
   const char *binding;
   int found;
   int demand;
+  int same_type;
   const char *via;
   TypeChecker *checker;
   size_t guard;
 } MatchContext;
+
+static const Type *type_of_name_in(const ASTNode *node, const char *name) {
+  const char *own;
+  if (!node) {
+    return NULL;
+  }
+  own = identifier_name(node);
+  if (own && strcmp(own, name) == 0 && node->resolved_type) {
+    return node->resolved_type;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    const Type *found = type_of_name_in(node->children[i], name);
+    if (found) {
+      return found;
+    }
+  }
+  return NULL;
+}
+
+static int filler_has_the_bound_type(const ASTNode *pattern,
+                                     const ASTNode *filler,
+                                     const char *binding) {
+  const Type *wanted;
+  const Type *given;
+  if (!filler || !binding) {
+    return 1;
+  }
+  wanted = type_of_name_in(pattern, binding);
+  given = filler->resolved_type;
+  while (wanted && wanted->refined_base) {
+    wanted = wanted->refined_base;
+  }
+  while (given && given->refined_base) {
+    given = given->refined_base;
+  }
+  return wanted && given &&
+         type_checker_types_equal((Type *)wanted, (Type *)given);
+}
 
 static int comparison_may_see_nan(const ASTNode *left, const ASTNode *right) {
   return (left && left->resolved_type &&
@@ -3775,6 +4867,12 @@ static int atom_matches(const MatchContext *ctx, const ASTNode *node,
   ASTNode *right = NULL;
   ASTNode *pleft = NULL;
   ASTNode *pright = NULL;
+  int left_signed = 0;
+  if (!ctx->same_type && binary_parts((ASTNode *)node, &op, &left, &right) &&
+      is_comparison(op) &&
+      comparison_misreads_a_sign(ctx->checker, left, right, &left_signed)) {
+    return 0;
+  }
   if (negated == ctx->pattern_negated) {
     return nodes_equal(ctx->pattern, node, ctx->binding, ctx->filler, swap, 0);
   }
@@ -3826,6 +4924,7 @@ static int replay_begin(TypeChecker *checker, const ASTNode *node,
     const ASTNode *given = call->arguments[i];
     if (summary->stable[i] && given &&
         condition_taint(checker, given) == 0 &&
+        !(summary->writes && node_reads_memory_anywhere(checker, given)) &&
         replay_type_fits(given->resolved_type,
                          swap->callee->data.function.parameter_types[i])) {
       swap->usable |= 1ull << i;
@@ -3957,6 +5056,9 @@ static void narrow_by_replay(NarrowContext *ctx, ASTNode *node, int negated) {
   frame.callee = swap.callee;
   frame.summary = swap.summary;
   frame.at = NULL;
+  frame.float_ranges = NULL;
+  frame.result = NULL;
+  frame.tag = -1;
   frame.ranges = ranges;
   for (size_t i = 0; i < swap.summary->count; i++) {
     frame_bind_argument(checker, &frame, i, swap.call->arguments[i],
@@ -4027,6 +5129,7 @@ static int guards_prove_atom(TypeChecker *checker, ASTNode *atom,
   ctx.found = 0;
   ctx.via = NULL;
   ctx.checker = checker;
+  ctx.same_type = filler_has_the_bound_type(atom, filler, binding);
   for (size_t i = 0; i < checker->guard_count && !ctx.found; i++) {
     struct TypeCheckerGuard *guard = &checker->guards[i];
     ctx.guard = i;
@@ -4253,6 +5356,27 @@ static void prove_route_of_test(ProveContext *ctx, const char *via) {
            "a dominating test in scope repeats the predicate");
 }
 
+static int prove_by_range(ProveContext *ctx, const ASTNode *left,
+                          const ASTNode *right, ASTNode *other,
+                          const char *use) {
+  Range bound;
+  int left_signed = 0;
+  if (comparison_misreads_a_sign(ctx->checker, left, right, &left_signed) ||
+      !range_of(ctx->checker, other, &bound, 0) ||
+      !comparison_holds(use, &ctx->value_range, &bound)) {
+    return 0;
+  }
+  if (ctx->value_range.has_min && ctx->value_range.has_max) {
+    snprintf(ctx->route, sizeof(ctx->route),
+             "the value's range %lld..%lld settles the comparison",
+             ctx->value_range.min, ctx->value_range.max);
+  } else {
+    snprintf(ctx->route, sizeof(ctx->route),
+             "the value's range settles the comparison");
+  }
+  return 1;
+}
+
 static void prove_visit(void *raw, ASTNode *atom, int negated) {
   ProveContext *ctx = (ProveContext *)raw;
   const char *op = NULL;
@@ -4286,20 +5410,9 @@ static void prove_visit(void *raw, ASTNode *atom, int negated) {
         return;
       }
     }
-    if (other && use && ctx->have_range) {
-      Range bound;
-      if (range_of(ctx->checker, other, &bound, 0) &&
-          comparison_holds(use, &ctx->value_range, &bound)) {
-        if (ctx->value_range.has_min && ctx->value_range.has_max) {
-          snprintf(ctx->route, sizeof(ctx->route),
-                   "the value's range %lld..%lld settles the comparison",
-                   ctx->value_range.min, ctx->value_range.max);
-        } else {
-          snprintf(ctx->route, sizeof(ctx->route),
-                   "the value's range settles the comparison");
-        }
-        return;
-      }
+    if (other && use && ctx->have_range &&
+        prove_by_range(ctx, left, right, other, use)) {
+      return;
     }
   }
   if (!negated && binary_parts(atom, &op, &left, &right) && op &&
@@ -4463,8 +5576,63 @@ void type_checker_report_proofs(const TypeChecker *checker, FILE *out) {
           checker->proofs_refused, checker->proof_steps);
 }
 
+static int refuse_hidden_name(TypeChecker *checker, Type *layer, ASTNode *expr,
+                              const ProveContext *ctx) {
+  const char *hidden =
+      predicate_hidden_name(checker, layer->refinement, ctx->binding);
+  char expr_text[160] = "";
+  char message[640];
+  if (!hidden) {
+    return 0;
+  }
+  describe(expr, expr_text, sizeof(expr_text), 0);
+  snprintf(message, sizeof(message),
+           "cannot prove `%s` is a '%s' here: the type's predicate names the "
+           "global `%s`, and a local `%s` hides it at this conversion",
+           expr_text, layer->name ? layer->name : "?", hidden, hidden);
+  set_failure(checker, message);
+  checker->proofs_refused++;
+  proof_log(checker, layer, expr, message, 0,
+            checker->proof_steps - ctx->steps, "");
+  return 1;
+}
+
+static int node_reads_volatile(const ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node->resolved_type && node->resolved_type->is_volatile) {
+    return 1;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node_reads_volatile(node->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int prove_refinement_now(TypeChecker *checker, Type *refined,
+                                ASTNode *expr);
+
 int type_checker_prove_refinement(TypeChecker *checker, Type *refined,
                                   ASTNode *expr) {
+  size_t held;
+  int proven;
+  if (!checker) {
+    return 0;
+  }
+  held = checker->guard_count;
+  if (node_reads_volatile(expr)) {
+    checker->guard_count = 0;
+  }
+  proven = prove_refinement_now(checker, refined, expr);
+  checker->guard_count = held;
+  return proven;
+}
+
+static int prove_refinement_now(TypeChecker *checker, Type *refined,
+                                ASTNode *expr) {
   ProveContext ctx;
   Type *layer;
   if (!checker || !refined || !expr) {
@@ -4524,6 +5692,9 @@ int type_checker_prove_refinement(TypeChecker *checker, Type *refined,
       continue;
     }
     ctx.binding = layer->refine_binding ? layer->refine_binding : "value";
+    if (refuse_hidden_name(checker, layer, expr, &ctx)) {
+      return 0;
+    }
     visit_atoms(layer->refinement, 0, prove_visit, &ctx, 0);
     if (ctx.failed) {
       char atom_text[160] = "";
@@ -4627,7 +5798,10 @@ static void holds_visit(void *raw, ASTNode *atom, int negated) {
     const char *effective = negated ? negate_operator(op) : op;
     Range l;
     Range r;
-    if (effective && range_of(ctx->checker, left, &l, 0) &&
+    int left_signed = 0;
+    if (effective &&
+        !comparison_misreads_a_sign(ctx->checker, left, right, &left_signed) &&
+        range_of(ctx->checker, left, &l, 0) &&
         range_of(ctx->checker, right, &r, 0) &&
         comparison_holds(effective, &l, &r)) {
       return;
@@ -4860,10 +6034,112 @@ int type_checker_refined_index_fits(const Type *index_type, size_t length) {
          (unsigned long long)index_type->refine_max < (unsigned long long)length;
 }
 
+static const char *first_name_in(const ASTNode *node) {
+  const char *name;
+  if (!node) {
+    return NULL;
+  }
+  name = identifier_name(node);
+  if (name) {
+    return name;
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    name = first_name_in(node->children[i]);
+    if (name) {
+      return name;
+    }
+  }
+  return NULL;
+}
+
+static int node_negates_a_float_test(const ASTNode *node, int negated) {
+  const char *op = NULL;
+  ASTNode *left = NULL;
+  ASTNode *right = NULL;
+  ASTNode *operand = NULL;
+  if (!node) {
+    return 0;
+  }
+  if (unary_parts(node, &op, &operand) && strcmp(op, "!") == 0) {
+    return node_negates_a_float_test(operand, !negated);
+  }
+  if (!binary_parts(node, &op, &left, &right)) {
+    return 0;
+  }
+  if (is_comparison(op)) {
+    return negated && comparison_may_see_nan(left, right);
+  }
+  return node_negates_a_float_test(left, negated) ||
+         node_negates_a_float_test(right, negated);
+}
+
+static const struct TypeCheckerKill *kill_that_ended(const TypeChecker *checker,
+                                                     size_t guard,
+                                                     const char *name) {
+  const struct TypeCheckerKill *memory = NULL;
+  for (size_t i = checker->kill_count; i > 0; i--) {
+    const struct TypeCheckerKill *kill = &checker->kills[i - 1];
+    if (kill->limit <= guard) {
+      continue;
+    }
+    if (kill->kind == KILL_NAME && strcmp(kill->name, name) == 0) {
+      return kill;
+    }
+    if (kill->kind != KILL_NAME && !memory) {
+      memory = kill;
+    }
+  }
+  return memory;
+}
+
+static int refusal_hint(TypeChecker *checker, const ASTNode *expr, char *out,
+                        size_t size) {
+  const char *name = first_name_in(expr);
+  if (!name) {
+    return 0;
+  }
+  for (size_t i = checker->guard_count; i > 0; i--) {
+    const struct TypeCheckerGuard *guard = &checker->guards[i - 1];
+    const struct TypeCheckerKill *kill;
+    size_t tested;
+    if (!guard->condition || !node_mentions(guard->condition, name)) {
+      continue;
+    }
+    tested = guard->condition->location.line;
+    kill = kill_that_ended(checker, i - 1, name);
+    if (kill && kill->kind == KILL_NAME) {
+      snprintf(out, size,
+               "`%s` was tested on line %zu and written on line %zu, and a "
+               "write ends the test; test it again after the write, or "
+               "convert it before",
+               name, tested, kill->line);
+      return 1;
+    }
+    if (kill && (name_is_shared(checker, name) ||
+                 node_reads_memory_anywhere(checker, guard->condition))) {
+      snprintf(out, size,
+               "the test on line %zu read memory that line %zu may write, "
+               "through a call, a store through a pointer or a destructor; "
+               "test it again after that line, or convert it before",
+               tested, kill->line);
+      return 1;
+    }
+    if (node_negates_a_float_test(guard->condition, guard->negated)) {
+      snprintf(out, size,
+               "the test on line %zu is a negated float comparison, which a "
+               "NaN passes; write it as the comparison that must hold, for "
+               "example `if (!(x >= 0.0 && x <= 1.0)) { return; }`",
+               tested);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 void type_checker_report_refinement_failure(TypeChecker *checker,
                                             const ASTNode *expr,
                                             SourceLocation location) {
-  char help[256];
+  char help[320];
   if (!checker || !checker->refine_failure) {
     return;
   }
@@ -4880,12 +6156,12 @@ void type_checker_report_refinement_failure(TypeChecker *checker,
                "own arguments; a work-item index, a subgroup lane and a load "
                "from memory each differ between work items, so nothing built "
                "from one is the same in all of them");
-    } else {
+    } else if (!refusal_hint(checker, expr, help, sizeof(help))) {
       snprintf(help, sizeof(help),
                "guard the value where it is converted, for example `if (x >= 0 "
                "&& x <= 100) { ... }`; the compiler proves what a dominating "
-               "test, a constant, or a narrower type establishes, and refuses "
-               "to guess past that");
+               "test, a call to a function that makes the test, a constant, or "
+               "a narrower type establishes, and refuses to guess past that");
     }
     error_reporter_add_error_with_span_and_suggestion(
         checker->error_reporter, ERROR_TYPE, span, checker->refine_failure,

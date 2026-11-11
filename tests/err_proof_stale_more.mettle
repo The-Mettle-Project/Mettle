@@ -1,0 +1,281 @@
+import "std/io";
+import "std/process";
+import "std/core";
+
+enum Parsed {
+  Good(int32),
+  Bad(int32),
+  Empty
+}
+
+fn parse(n: int32) -> Parsed {
+  if (n == 0) { return Empty; }
+  if (n >= 1 && n <= 9) { return Good(n); }
+  return Bad(n);
+}
+
+fn checked_percent(n: int32) -> Option<int32> {
+  if (n < 0 || n > 100) { return None; }
+  return Some(n);
+}
+
+fn loose_percent(n: int32) -> Option<int32> {
+  if (n == 777) { return Some(n); }
+  if (n < 0 || n > 100) { return None; }
+  return Some(n);
+}
+
+fn moved_percent(n: int32) -> Option<int32> {
+  if (n < 0 || n > 100) { return None; }
+  n = n + 1000;
+  return Some(n);
+}
+
+type NonNeg = int32 where value >= 0;
+type AtLeast5 = int32 where value >= 5;
+
+fn checks_then_touches(n: int32) {
+  if (n < 5 || n > 50) { exit(3); }
+  touch();
+}
+
+fn halve(x: float64) -> float64 { return x * 0.5; }
+fn twice(x: float64) -> float64 { return x * 2.0; }
+
+fn loose_unit(x: float64) -> float64 {
+  if (x < 0.0) { return 0.0; }
+  if (x > 1.0) { return 1.0; }
+  return x;
+}
+
+type Percent = int32 where value >= 0 && value <= 100;
+type Digit = int32 where value >= 0 && value < 10;
+
+var g_level: int32 = 5;
+
+fn is_percent(n: int32) -> bool { return n >= 0 && n <= 100; }
+fn one_digit(n: int32) -> bool { return n >= 0 && n <= 9; }
+fn must_be_digit(n: int32) { if (n < 0 || n > 9) { exit(3); } }
+fn touch() { g_level = 500; }
+fn bump(p: int32*) { *p = *p + 500; }
+fn sneaky(n: int32) -> bool { n = n - 1000; return n >= 0 && n <= 100; }
+fn loose(n: int32) -> bool { if (n == 777) { return true; } return n >= 0 && n <= 100; }
+fn maybe_check(n: int32, strict: bool) { if (strict) { if (n < 0 || n > 9) { exit(3); } } }
+fn first_ok(a: int32, b: int32) -> bool { return a >= 0 && a <= 100; }
+fn fill(n: int32, out: int32*) { if (n < 0 || n > 9) { exit(3); } *out = 99; }
+fn bump_checked(n: int32) -> int32 { if (n < 0 || n > 9) { exit(3); } return n + 1000; }
+fn always(n: int32) -> bool { return true; }
+fn inverted(n: int32) -> bool { return !(n >= 0 && n <= 100); }
+
+type Half = int32 where value >= 0 && value <= 50;
+type Unit = float64 where value >= 0.0 && value <= 1.0;
+
+fn half(n: int32) -> int32 { return n / 2; }
+fn clamp(x: int32, lo: int32, hi: int32) -> int32 { if (x < lo) { return lo; } if (x > hi) { return hi; } return x; }
+fn moved_half(n: int32) -> int32 { n = n + 1000; return n / 2; }
+fn plus_level(n: int32) -> int32 { return n + g_level; }
+fn through_local(n: int32) -> int32 { var m: int32 = n + 1000; return m; }
+fn next(k: int32) -> int32 { return k + 1; }
+fn leaky_clamp(x: int32, lo: int32, hi: int32) -> int32 { if (x < lo) { return lo; } if (x > hi) { return hi; } if (x == 7) { return 7000; } return x; }
+fn in_unit(x: float64) -> bool { return x >= 0.0 && x <= 1.0; }
+fn first_in_unit(a: float64, b: float64) -> bool { return a >= 0.0 && a <= 1.0; }
+fn must_be_unit(x: float64) { if (!(x >= 0.0 && x <= 1.0)) { exit(4); } }
+fn must_not_be_outside(x: float64) { if (x < 0.0 || x > 1.0) { exit(4); } }
+fn make_clearer(p: Node*) -> Clearer { var c: Clearer = { target: p }; return c; }
+fn moved_unit(x: float64) -> bool { x = x - 10.0; return x >= 0.0 && x <= 1.0; }
+
+type High = uint8 where value >= 200;
+
+fn raised(a: uint8) -> uint8 { return a + 200; }
+
+struct Node { len: int32; next: Node*; }
+struct Span { lo: int32; hi: int32; }
+
+type Live = Node* where value != 0;
+type Long = Node* where value != 0 && value->len > 4;
+type Ordered = Span where value.lo <= value.hi;
+type Index = int64 where value >= 0 && value < buf.length;
+
+fn is_live(p: Node*) -> bool { return p != 0; }
+fn must_live(p: Node*) { if (p == 0) { exit(5); } }
+fn is_long(p: Node*) -> bool { return p != 0 && p->len > 4; }
+fn is_ordered(s: Span) -> bool { return s.lo <= s.hi; }
+fn in_bounds(buf: int32[], i: int64) -> bool { if (i < 0) { return false; } return i < buf.length; }
+fn shrink(p: Node*) { p->len = 0; }
+fn first_live(a: Node*, b: Node*) -> bool { return a != 0; }
+fn clears_then_agrees(p: Node*) -> bool { if (p == 0) { return false; } if (p->len <= 4) { return false; } p->len = 0; return true; }
+fn moves_pointer(p: Node*) -> bool { p = p->next; return p != 0; }
+fn loose_live(p: Node*, force: bool) -> bool { if (force) { return true; } return p != 0; }
+fn first_ordered(a: Span, b: Span) -> bool { return a.lo <= a.hi; }
+fn rewrites_then_agrees(s: Span) -> bool { s.lo = 0; s.hi = 1; return s.lo <= s.hi; }
+fn defers_a_clear(p: Node*) -> bool { if (p == 0) { return false; } defer shrink(p); return p->len > 4; }
+
+struct Clearer {
+  target: Node*;
+  method drop() { this.target->len = 0; }
+}
+
+fn drops_a_clear(p: Node*) -> bool { if (p == 0) { return false; } var c: Clearer = { target: p }; return p->len > 4; }
+fn between(n: int32, lo: int32, hi: int32) -> bool { return n >= lo && n <= hi; }
+fn Span_ordered(s: Span) -> bool { return s.lo <= s.hi; }
+
+const CEILING: int32 = 100;
+fn payload_named_like_a_parameter(n: int32, o: Option<int32>) -> int32 { match (o) { case Some(n): { return n; } case None: { return 0; } } }
+type Tiny = uint32 where value <= 100;
+fn pick_sign(u: uint32, i: int32) -> int32 { if (u < i) { return 500; } return 7; }
+type UnderCeiling = int32 where value <= CEILING;
+var g_register: volatile int32 = 0;
+type Total = float64 where value >= 0.0 && value <= 65.0;
+type Count = int64 where value >= 0 && value <= 64;
+
+fn expression_argument_written(a: int32, b: int32) -> int32 {
+  if (is_percent(a + b)) { a = a + 500; var p: Percent = a + b; return p; } return 0; }
+
+fn method_on_another_object(s: Span, t: Span) -> int32 {
+  if (s.ordered()) { var o: Ordered = (Ordered)t; return o.hi; } return 0; }
+
+fn float_nan_passes_an_early_exit(x: float64) -> float64 {
+  if (x < 0.0 || x > 1.0) { return 0.0; } var u: Unit = (Unit)x; return (float64)u; }
+
+fn float_nan_passes_negated_tests(x: float64) -> float64 {
+  if (!(x < 0.0)) { if (!(x > 1.0)) { var u: Unit = (Unit)x; return (float64)u; } } return 0.0; }
+
+fn float_nan_passes_a_demand(x: float64) -> float64 {
+  must_not_be_outside(x); var u: Unit = (Unit)x; return (float64)u; }
+
+fn destructor_at_the_end_of_a_scope(p: Node*) -> int32 {
+  if (is_long(p)) { { var c: Clearer = { target: p }; } var x: Long = (Long)p; return x->len; } return 0; }
+
+fn destructor_on_reassignment(p: Node*, q: Node*) -> int32 {
+  var c: Clearer = { target: p }; if (is_long(p)) { c = make_clearer(q); var x: Long = (Long)p; return x->len; } return 0; }
+
+fn destructor_later_in_a_loop(q: Node*) -> int32 {
+  var t: int32 = 0; if (q != 0 && q->len > 4) { var i: int32 = 0; while (i < 2) { var x: Long = (Long)q; t = t + x->len; { var k: Clearer = { target: q }; } i = i + 1; } } return t; }
+
+fn destructor_of_a_call_result_later_in_a_loop(q: Node*) -> int32 {
+  var t: int32 = 0; if (is_long(q)) { for i in 0..2 { var x: Long = (Long)q; t = t + x->len; var k: Clearer = make_clearer(q); } } return t; }
+
+fn float_result_of_an_unbounded_argument(x: float64) -> float64 {
+  var u: Unit = (Unit)halve(x); return (float64)u; }
+
+fn float_result_lets_a_nan_through(x: float64) -> float64 {
+  var u: Unit = (Unit)loose_unit(x); return (float64)u; }
+
+fn float_result_too_wide(a: Unit) -> float64 {
+  var u: Unit = (Unit)twice((float64)a); return (float64)u; }
+
+fn payload_of_another_variant(n: int32) -> int32 {
+  match (parse(n)) { case Bad(v): { var d: Digit = v; return d; } case Good(v): { return v; } case Empty: { return 0; } } }
+
+fn payload_with_an_extra_path(n: int32) -> int32 {
+  match (loose_percent(n)) { case Some(v): { var p: Percent = v; return p; } case None: { return 0; } } }
+
+fn payload_after_the_callee_moved_it(n: int32) -> int32 {
+  match (moved_percent(n)) { case Some(v): { var p: Percent = v; return p; } case None: { return 0; } } }
+
+fn payload_written_in_the_arm(n: int32) -> int32 {
+  match (checked_percent(n)) { case Some(v): { v = v + 500; var p: Percent = v; return p; } case None: { return 0; } } }
+
+fn rising_value_can_wrap(n: int32) -> int32 {
+  if (n >= 0) { n = n + 500; var p: NonNeg = n; return p; } return 0; }
+
+fn rising_counter_can_wrap(n: int32) -> int32 {
+  var k: int32 = 5; var i: int32 = 0; while (i < n) { k = k + 1000000000; i = i + 1; } var p: AtLeast5 = k; return p; }
+
+fn demand_on_a_global_the_callee_writes() -> int32 {
+  checks_then_touches(g_level); var p: Percent = g_level; return p; }
+
+fn field_written_later_in_a_loop(s: Span) -> int32 {
+  var t: int32 = 0; if (s.lo <= s.hi) { var j: int32 = 0; while (j < 2) { var c: Ordered = (Ordered)s; t = t + c.hi; s.hi = s.lo - 1; j = j + 1; } } return t; }
+
+fn field_written_later_in_a_range_loop(s: Span) -> int32 {
+  var t: int32 = 0; if (s.lo <= s.hi) { for j in 0..2 { var c: Ordered = (Ordered)s; t = t + c.hi; s.hi = s.lo - 1; } } return t; }
+
+fn loop_limit_shadowed(n: int32) -> int32 {
+  var k: int32 = 5; { var CEILING: int32 = n; while (k < CEILING) { k = k + 2000000000; } } var p: AtLeast5 = k; return p; }
+
+fn rising_past_a_wider_limit(n: int64) -> int32 {
+  var i: int32 = 0; while (i < n) { i = i + 1; } var p: NonNeg = i; return p; }
+
+fn binding_takes_a_tested_name(o: Option<int32>, v: int32) -> int32 {
+  var w: int32 = v; if (w >= 0 && w <= 100) { match (o) { case Some(w): { var p: Percent = w; return p; } case None: { return 0; } } } return 0; }
+
+fn binding_takes_a_fresh_name(o: Option<int32>) -> int32 {
+  var v: int32 = 50; match (o) { case Some(v): { var p: Percent = v; return p; } case None: { return v; } } }
+
+fn fresh_value_deferred(n: int32) -> int32 {
+  var x: int32 = n; defer x = 50; var p: Percent = x; return p; }
+
+fn fresh_value_poked() -> int32 {
+  var x: int32 = 50; bump(&x); var p: Percent = x; return p; }
+
+fn fresh_value_through_a_pointer() -> int32 {
+  var x: int32 = 0; var q: int32* = &x; x = 50; *q = 900; var p: Percent = x; return p; }
+
+fn fresh_global_then_call() -> int32 {
+  g_level = 50; touch(); var p: Percent = g_level; return p; }
+
+fn fresh_value_one_branch_writes(n: int32) -> int32 {
+  var x: int32 = 50; if (n > 3) { x = 500; } var p: Percent = x; return p; }
+
+fn fresh_value_written_later_in_a_loop() -> int32 {
+  var x: int32 = 50; var t: int32 = 0; var i: int32 = 0; while (i < 3) { var p: Percent = x; t = t + p; x = x + 500; i = i + 1; } return t; }
+
+fn fresh_value_hidden_by_a_declaration(n: int32) -> int32 {
+  var x: int32 = 50; { var x: int32 = n; var p: Percent = x; return p; } }
+
+fn fresh_value_from_an_inner_scope(n: int32) -> int32 {
+  var x: int32 = n; { var x: int32 = 50; g_level = x; } var p: Percent = x; return p; }
+
+fn fresh_value_past_the_bound() -> int32 {
+  var x: int32 = 50; x = x + 60; var p: Percent = x; return p; }
+
+fn sum_in_a_repeated_loop(a: Unit*, n: Count, m: int64) -> float64 {
+  var s: Total = (Total)0.0; var j: int64 = 0; while (j < m) { var i: int64 = 0; while (i < n) { s = s + a[i]; i = i + 1; } j = j + 1; } return (float64)s; }
+
+fn sum_in_an_inner_loop(a: Unit*, n: Count, m: int64) -> float64 {
+  var s: Total = (Total)0.0; var i: int64 = 0; while (i < n) { var j: int64 = 0; while (j < m) { s = s + a[i]; j = j + 1; } i = i + 1; } return (float64)s; }
+
+fn sum_with_a_step_under_a_test(a: Unit*, n: Count, m: int64) -> float64 {
+  var s: Total = (Total)0.0; var i: int64 = 0; var k: int64 = 0; while (i < n) { s = s + a[i]; k = k + 1; if (k > m) { i = i + 1; } } return (float64)s; }
+
+fn sum_with_a_step_after_continue(a: Unit*, n: Count, m: int64) -> float64 {
+  var s: Total = (Total)0.0; var i: int64 = 0; var k: int64 = 0; while (i < n) { s = s + a[i]; k = k + 1; if (k < m) { continue; } i = i + 1; } return (float64)s; }
+
+fn sum_with_a_counter_that_wraps(a: Unit*) -> float64 {
+  var s: Total = (Total)0.0; var i: int8 = 0; while (i < 127) { s = s + a[0]; i = i + 2; } return (float64)s; }
+
+fn predicate_name_hidden_by_a_constant(n: int32) -> int32 {
+  const CEILING: int32 = 1000; if (n <= 500) { var s: UnderCeiling = n; return s; } return 0; }
+
+fn predicate_name_hidden_by_a_variable(n: int32) -> int32 {
+  var CEILING: int32 = 1000; if (n <= CEILING) { var s: UnderCeiling = n; return s; } return 0; }
+
+fn volatile_after_a_test() -> int32 {
+  if (g_register >= 0 && g_register <= 100) { var p: Percent = g_register; return p; } return 0; }
+
+fn volatile_through_a_pointer(status: volatile int32*) -> int32 {
+  if (*status >= 0 && *status <= 100) { var p: Percent = *status; return p; } return 0; }
+
+fn volatile_after_a_verdict() -> int32 {
+  if (is_percent(g_register)) { var p: Percent = g_register; return p; } return 0; }
+
+fn volatile_copied_under_a_test() -> int32 {
+  if (g_register >= 0 && g_register <= 100) { var seen: int32 = g_register; var p: Percent = seen; return p; } return 0; }
+
+fn unsigned_below_a_negative(u: uint32, i: int32) -> int32 {
+  if (i >= -5 && i <= -1) { if (u < i) { var p: Tiny = u; return (int32)p; } } return 0; }
+
+fn unsigned_equal_to_a_negative(u: uint32, i: int32) -> int32 {
+  if (i >= -5 && i <= -1) { if (u == i) { var p: Tiny = u; return (int32)p; } } return 0; }
+
+fn result_of_an_unsigned_test() -> int32 {
+  var d: Digit = pick_sign(5, -3); return d; }
+
+fn result_reads_a_binding_as_the_parameter() -> int32 {
+  var d: Digit = payload_named_like_a_parameter(5, Some(900)); return d; }
+
+fn narrowing_under_a_repeated_test(x: uint8) -> int32 {
+  if (x + 200 >= 200) { var h: High = x + 200; return (int32)h; } return 0; }
+
+fn main() -> int32 { return 0; }

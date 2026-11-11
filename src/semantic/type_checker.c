@@ -13,6 +13,7 @@ Symbol *type_checker_resolve_identifier(TypeChecker *checker,
   Symbol *symbol =
       type_checker_lookup_expansion_binding(checker, identifier->name);
   if (symbol) {
+    identifier->scope_id = AST_SCOPE_ID_UNRESOLVED;
     return symbol;
   }
   symbol = symbol_table_lookup(checker->symbol_table, identifier->name);

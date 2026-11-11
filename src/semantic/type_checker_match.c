@@ -89,8 +89,13 @@ int type_checker_check_match_statement(TypeChecker *checker,
           binding->is_initialized = 1;
           symbol_table_declare(checker->symbol_table, binding);
         }
+        size_t arm_depth = type_checker_guard_depth(checker);
+        type_checker_push_payload_facts(checker, match->expression,
+                                        variant_idx, arm->binding_name,
+                                        payload);
         int ok = arm->body ? type_checker_check_statement(checker, arm->body)
                            : 1;
+        type_checker_pop_guards(checker, arm_depth);
         symbol_table_exit_scope(checker->symbol_table);
         if (!ok) {
           free(covered);

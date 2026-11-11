@@ -209,6 +209,8 @@ typedef struct Symbol {
   long long post_max;
   int move_computed;
   int move_direction;
+  int move_safe;
+  int move_tries;
   long long move_step;
   struct ASTNode *move_declaration;
   struct ASTNode *move_addend;

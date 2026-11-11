@@ -197,16 +197,33 @@ A range reaches an argument that is a plain name. A conversion of an
 expression, as in `if (is_percent(a + b)) { var p: Percent = a + b; }`, is
 proven where the expression is written the same way both times.
 
-What a call returns is bounded by that call's arguments for integer results
-only. A float result has the one range the function proved for it, and so does
-a function with more than 16 `return` statements. Calls nest three deep before
-the one range is used. A `match` arm carries no test of the value matched.
+What a call returns is bounded by that call's arguments for integer and
+`float64` results. A `float32` result has its type's range, because the
+conversion on return rounds. A function with more than 16 `return` statements
+has one range for every call, and calls nest three deep before that one range
+is used.
+
+A `match` arm knows the range of an integer payload where the match is on the
+call itself and every `return` in the callee builds a variant directly. A
+payload of any other type, a result held in a variable first, and a callee
+that returns a value it did not build carry nothing into the arm.
 
 A test stops proving a value at the first write to it, and the compiler takes
 the wide view of what a write is. Any call whose callee it cannot show to be
 free of writes ends every test of a global and of a local whose address was
 ever taken, which includes every `extern` and every call through a function
 value.
+
+An assignment proves the range of what it stored for a statement that stands
+directly in a block. Two branches that each assign the name leave nothing
+after the `if`, and a value built by an `if` or `match` expression carries
+its type's range.
+
+A rising counter keeps its lower bound only where every step is a constant
+under a loop test the compiler can read. A test against an expression, as in
+`i < n - 1`, bounds the counter by the type of that expression, so only a step
+of 1 passes. A float sum is widened only inside a `while` whose counter is
+stepped once in the loop body and whose body has no `continue`.
 
 A declared type refines a number, a bool, a char, a string, a pointer or a
 slice. A struct, an enum or an array cannot be the base.

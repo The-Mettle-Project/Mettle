@@ -861,32 +861,119 @@ that read memory, for the same reason.
 inside `case 20..90:` it is between those bounds. An arm that the arm above
 can fall into, by `fallthrough` or by having no body, knows nothing.
 
+**What a match arm knows.** A function that returns a tagged enum exports the
+range of the integer each variant carries, read at the call the same way a
+result is:
+
+```mettle
+fn checked_percent(n: int32) -> Option<int32> {
+  if (n < 0 || n > 100) { return None; }
+  return Some(n);
+}
+
+fn grade(n: int32) -> int32 {
+  match (checked_percent(n)) {
+    case Some(v): {
+      var p: Percent = v;
+      return p;
+    }
+    case None: { return -1; }
+  }
+}
+```
+
+`v` is 0..100 inside the `Some` arm, because that is the only range for which
+`checked_percent` builds a `Some`. The match has to be on the call itself; a
+result stored in a variable first carries nothing into the arm.
+
+**What a float result holds.** A function that returns a float exports its
+result the way an integer function does, and the call reads it with its own
+arguments. `halve(u)` on a `Unit` is 0..0.5, and a clamp written with tests
+that a NaN fails, `if (!(x >= 0.0)) { return 0.0; }`, returns 0..1 for any
+argument.
+
+**What an assignment carries.** A declaration with an initialiser and an
+assignment to a name both prove the range of the value they stored, and the
+name keeps that range until the next write to it.
+
+```mettle
+fn pick(n: int32) -> int32 {
+  var x: int32 = n;
+  x = 50;
+  var p: Percent = x;
+  x = n;
+  return p;
+}
+```
+
+`x` is 50 at the conversion, and the `x = n;` after it changes nothing there.
+The range is the one the stored expression had at the assignment. `var x:
+int32 = n;` under `if (n >= 0 && n <= 100)` makes `x` 0..100, and `x = x + 9;`
+after `x = 40;` makes it 49. A `float64` keeps its interval the same way.
+Everything in *What a write ends* ends this range too. An expression that
+calls a function which writes memory proves nothing this way, and neither does
+a statement under `defer`, which runs later.
+
 **What a write ends.** A test proves a value for as long as nothing writes it.
 An assignment, a new declaration of the name, or `&name` ends every earlier
-test of that name. So does a write later in a loop the use sits in, since the
-next turn of the loop reads the value that write left. A counter the function
-only ever raises keeps its lower bounds and loses its upper ones, and one it
-only lowers keeps the upper. A call or a store through a pointer ends every
-test of a global, of a local whose address was taken, and of anything read
-through a pointer, unless the callee's body shows it writes no memory the
-caller can see.
+test of that name. A write to one field of a struct held by value ends every
+test of the struct. A `match` arm that binds a name ends every test of an
+outer variable with that name. So does a write later in a loop the use sits
+in, since the next turn of the loop reads the value that write left. A counter
+the function only ever raises keeps its lower bounds and loses its upper ones,
+and one it only lowers keeps the upper, where the compiler can show the
+counter never wraps. A call or a store through a pointer ends every test of a
+global, of a local whose address was taken, and of anything read through a
+pointer, unless the callee's body shows it writes no memory the caller can
+see. A destructor is such a write: a declaration, an assignment or a call that
+produces a value with a `drop` ends the same tests.
+
+A negated float comparison proves nothing about the value, because a NaN fails
+every comparison. `if (x < 0.0 || x > 1.0) { return; }` lets a NaN through, so
+`x` is not a `Unit` after it. `if (!(x >= 0.0 && x <= 1.0)) { return; }` stops
+the NaN, and `x` is one.
 
 ```text
 error[P0001]: cannot prove `value <= 100` for `n`, which 'Percent' requires
 (its range here is 0..2147483647)
 ```
 
-That is `n = n + 500;` between the test and the conversion.
+That is `n = n + 500;` between the test and the conversion. The refusal names
+the write when one ended the test:
+
+```text
+help: `n` was tested on line 6 and written on line 7, and a write ends the
+test; test it again after the write, or convert it before
+```
+
+**What a test does not prove.** A comparison of a signed value with an
+unsigned one of the same width or wider is made unsigned, so a negative value
+reads as a huge one. Such a test bounds the signed side from above and proves
+nothing else, unless the signed side is a constant or has a type that cannot
+be negative. A test of a `volatile` value proves nothing, because the next
+read can differ; copy the value to a local and test the copy. A conversion is
+refused where a local hides a global that the type's predicate names, since
+the predicate would read the local there.
 
 **What a loop carries.** A counter that only ever rises keeps the bound its
-initialiser gave it, so a `while (k < 100)` bounds `k` above and `var k: int32
-= 5;` bounds it below, and `k` is a `Small` inside the body even though it is
-never 5 again. A write anywhere in the function that moves the counter the
-other way, or by an amount the compiler cannot bound, ends it. A float
-accumulator inside a loop whose trip count the compiler bounded gets the same
-treatment, widened over the whole run and not to the value it ends with. The
-trip count does not have to come from a literal: a loop over a length whose
-declared type carries a maximum runs at most that many times, so
+initialiser gave it. `var k: int32 = 5;` bounds `k` below for the whole
+function, and `while (k < 100)` bounds it above inside the body. A write
+anywhere in the function that moves the counter the other way, or by an amount
+that is not a constant, ends it.
+
+The bound holds only where the counter cannot wrap. Every step inside a loop
+has to sit under a loop test that bounds the counter, such as `k < 100` or `i
+< n`. The compiler adds every step in the function to the highest value those
+tests allow and checks the sum against the counter's type. `i < n` with `i = i
++ 1` passes when `n` has the type of `i` or a narrower one, because `i` is
+then below the type's maximum before the step. A step of 2 under the same test
+is refused, and so is an `int32` counter tested against an `int64`. A step
+outside every loop needs an initialiser the compiler can bound.
+
+A `float64` sum inside a loop whose trip count the compiler bounded is widened
+over the whole run. The count comes from the counter's first value, its step
+and the limit in the loop test. The limit can be a literal, a constant, or a
+value whose declared type carries a maximum, so
 
 ```mettle
 type Count = int64 where value >= 0 && value <= 64;
@@ -899,7 +986,11 @@ fn total(a: Unit*, n: Count) -> float64 {
 }
 ```
 
-proves, and the same function over a plain `int64` length does not.
+proves, and the same function over a plain `int64` length does not. The count
+is good only for a loop that steps its counter on every turn, so the step has
+to be a statement of the loop body itself and the body can hold no `continue`.
+The sum has to be added to in one place, inside that loop and outside any loop
+nested in it, and declared in a block that runs the loop once.
 
 **A relation to another value.** A predicate may name a binding that is not in
 scope where the type is declared:

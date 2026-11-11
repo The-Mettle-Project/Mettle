@@ -62,6 +62,7 @@ typedef struct {
   size_t exposed_capacity;
   void *proof_frame;
   int proof_frame_depth;
+  size_t effect_line;
   char *refine_failure;
   char *effect_failure;
   TypeCheckerEffect *effects;
@@ -142,6 +143,8 @@ typedef struct {
   size_t struct_placeholder_count;
   size_t struct_placeholder_capacity;
   int monotone_busy;
+  int movement_unsettled;
+  const struct ASTNode *block_statement;
   void *movement_index;
   struct {
     struct ASTNode *body;
@@ -253,6 +256,10 @@ int type_checker_push_range_guard(TypeChecker *checker, const char *name,
 size_t type_checker_guard_depth(const TypeChecker *checker);
 void type_checker_pop_guards(TypeChecker *checker, size_t depth);
 void type_checker_note_effects(TypeChecker *checker, struct ASTNode *node);
+void type_checker_settle_loop_test(TypeChecker *checker,
+                                   struct ASTNode *statement);
+void type_checker_note_written_value(TypeChecker *checker,
+                                     struct ASTNode *statement);
 void type_checker_facts_reset(TypeChecker *checker);
 void type_checker_forget_effects_since(TypeChecker *checker, size_t count);
 void type_checker_summary_begin(TypeChecker *checker);
@@ -263,6 +270,10 @@ void type_checker_push_call_facts(TypeChecker *checker,
                                   struct ASTNode *statement);
 int type_checker_call_never_returns(TypeChecker *checker,
                                     const struct ASTNode *node);
+void type_checker_push_payload_facts(TypeChecker *checker,
+                                     struct ASTNode *subject, int tag,
+                                     const char *binding,
+                                     const struct Type *payload);
 void type_checker_movement_index_drop(TypeChecker *checker);
 int type_checker_compare_is_unsigned(const Type *left, const Type *right);
 int type_checker_expression_range(TypeChecker *checker, ASTNode *expr,

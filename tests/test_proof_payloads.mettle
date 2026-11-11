@@ -1,0 +1,64 @@
+import "std/io";
+import "std/core";
+
+type Percent = int32 where value >= 0 && value <= 100;
+type Digit = int32 where value >= 0 && value < 10;
+
+enum Parsed {
+  Good(int32),
+  Bad(int32),
+  Empty
+}
+
+fn checked_percent(n: int32) -> Option<int32> {
+  if (n < 0 || n > 100) { return None; }
+  return Some(n);
+}
+
+fn half_percent(n: int32) -> Result<int32, string> {
+  if (n < 0) { return Err("negative"); }
+  if (n > 100) { return Err("too large"); }
+  return Ok(n / 2);
+}
+
+fn parse(n: int32) -> Parsed {
+  if (n == 0) { return Empty; }
+  if (n >= 1 && n <= 9) { return Good(n); }
+  return Bad(n);
+}
+
+fn by_option(n: int32) -> int32 {
+  match (checked_percent(n)) {
+    case Some(v): {
+      var p: Percent = v;
+      return p;
+    }
+    case None: { return -1; }
+  }
+}
+
+fn by_result(n: int32) -> int32 {
+  match (half_percent(n)) {
+    case Ok(v): {
+      var p: Percent = v;
+      return p;
+    }
+    case Err(e): { return -1; }
+  }
+}
+
+fn by_enum(n: int32) -> int32 {
+  match (parse(n)) {
+    case Good(v): {
+      var d: Digit = v;
+      return d;
+    }
+    case Bad(v): { return -2; }
+    case Empty: { return -3; }
+  }
+}
+
+fn main() -> int32 {
+  println("{by_option(64)} {by_option(640)} {by_result(90)} {by_result(-4)} {by_enum(7)} {by_enum(70)} {by_enum(0)}");
+  return 0;
+}

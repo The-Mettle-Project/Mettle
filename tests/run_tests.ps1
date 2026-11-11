@@ -4958,10 +4958,11 @@ catch {
 # slices, through a method, with an expression for an argument, and with a
 # bound taken from another argument; a clamp, a halving and a nested call
 # bound their results by what they were given; a switch arm knows the value
-# that chose it; the run-time check agrees; and 68 programs that write the
-# value after the test, read a result wider than its call allows, narrow a
-# value that wraps, rest on a test the callee undid, let a NaN past a negated
-# comparison, or keep a test across a destructor are each refused.
+# that chose it, and a match arm the range of its payload; a float result is
+# bounded the same way; the run-time check agrees; and 77 programs that write
+# the value after the test, read a result wider than its call allows, narrow
+# a value that wraps, rest on a test the callee undid, let a NaN past a
+# negated comparison, or keep a test across a destructor are each refused.
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
@@ -4970,7 +4971,10 @@ try {
     @{ Source = "tests/test_proof_call_ranges.mettle"; Want = "45 100 0 7 30 80 100 32 0\s+0\.25 -1\.0 0\.5 0\.75" },
     @{ Source = "tests/test_proof_shapes.mettle"; Want = "9 -1 9 9 9 9\s+8 -1 8 42 -1\s+4 -1 4" },
     @{ Source = "tests/test_proof_arguments.mettle"; Want = "42 -1 20 11 6" },
-    @{ Source = "tests/test_proof_bounds.mettle"; Want = "6 -1 40 5 4 33 -1 3" }
+    @{ Source = "tests/test_proof_bounds.mettle"; Want = "6 -1 40 5 4 33 -1 3" },
+    @{ Source = "tests/test_proof_float_results.mettle"; Want = "0\.375 1\.0 0\.0 0\.0 0\.25" },
+    @{ Source = "tests/test_proof_payloads.mettle"; Want = "64 -1 45 -1 7 -2 -3" },
+    @{ Source = "tests/test_proof_fresh_values.mettle"; Want = "10 53 49 16 580\s+0\.75 10 7 6 103\s+90 1\.75" }
   )
   foreach ($case in $proven) {
     foreach ($flags in @(@(), @("--release"), @("--check-proofs"), @("--check-proofs", "--release"))) {
@@ -4981,10 +4985,12 @@ try {
       if ($run -notmatch $case.Want) { throw "$($case.Source) printed the wrong answer with '$flags': $run" }
     }
   }
-  $out = & $CompilerPath --build "tests/err_proof_stale.mettle" -o (Join-Path $tmpDir "proof_stale.exe") 2>&1 | Out-String
-  if ($LASTEXITCODE -eq 0) { throw "a value written after its test was proven anyway" }
-  $refused = ([regex]::Matches($out, "error\[P0001\]")).Count
-  if ($refused -ne 68) { throw "expected 68 refusals and got ${refused}: $out" }
+  foreach ($stale in @(@{ Source = "tests/err_proof_stale.mettle"; Want = 60 }, @{ Source = "tests/err_proof_stale_more.mettle"; Want = 50 })) {
+    $out = & $CompilerPath --build $stale.Source -o (Join-Path $tmpDir "proof_stale.exe") 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) { throw "$($stale.Source) was proven anyway" }
+    $refused = ([regex]::Matches($out, "error\[P0001\]")).Count
+    if ($refused -ne $stale.Want) { throw "expected $($stale.Want) refusals in $($stale.Source) and got ${refused}: $out" }
+  }
   Write-CaseResult -Name "proofs_cross_calls_and_end_at_writes" -Passed $true
 }
 catch {
@@ -6496,7 +6502,7 @@ $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $out = & $CompilerPath test "tests/test_refine_verify.mettle" 2>&1 | Out-String
-  if ($LASTEXITCODE -eq 0 -or $out -notmatch "error\[P0001\]: cannot prove ``value >= 0`` for ``x``") { throw "the honest prover accepted the lie: $out" }
+  if ($LASTEXITCODE -eq 0 -or $out -notmatch "error\[P0001\]: cannot prove ``value < 10`` for ``x``") { throw "the honest prover accepted the lie: $out" }
   $env:METTLE_TRUST_REFINEMENTS = "1"
   try {
     $out = & $CompilerPath test "tests/test_refine_verify.mettle" 2>&1 | Out-String
@@ -6725,7 +6731,7 @@ $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
   $out = & $CompilerPath --build "tests/test_refine_proofs.mettle" -o (Join-Path $tmpDir "refine_proofs.exe") 2>&1 | Out-String
-  if ($LASTEXITCODE -eq 0 -or $out -notmatch "cannot prove ``value >= 0`` for ``x``") { throw "the honest prover accepted the conversion: $out" }
+  if ($LASTEXITCODE -eq 0 -or $out -notmatch "cannot prove ``value < 10`` for ``x``") { throw "the honest prover accepted the conversion: $out" }
   $env:METTLE_TRUST_REFINEMENTS = "1"
   try {
     foreach ($mode in @("debug", "release")) {

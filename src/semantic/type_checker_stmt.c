@@ -1357,7 +1357,10 @@ static int type_checker_statement_holds_statements(const ASTNode *statement) {
 int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
   if (!checker || !statement)
     return 0;
+  int in_block = checker->block_statement == statement;
+  checker->block_statement = NULL;
   if (type_checker_statement_repeats(statement)) {
+    type_checker_settle_loop_test(checker, statement);
     type_checker_note_effects(checker, statement);
   }
   if (!type_checker_check_statement_body(checker, statement)) {
@@ -1369,7 +1372,11 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
                                    ret->value_count > 1 ? NULL : ret->value);
   }
   if (!type_checker_statement_holds_statements(statement)) {
-    type_checker_note_effects(checker, statement);
+    if (in_block) {
+      type_checker_note_written_value(checker, statement);
+    } else {
+      type_checker_note_effects(checker, statement);
+    }
   }
   return type_checker_check_conflict_free(checker, statement);
 }
@@ -1476,6 +1483,7 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
               checker->error_reporter, ERROR_SEMANTIC, child->location,
               "Unreachable code: statement will never execute");
         }
+        checker->block_statement = statement->children[i];
         if (!type_checker_check_statement(checker, statement->children[i])) {
           block_ok = 0;
         }

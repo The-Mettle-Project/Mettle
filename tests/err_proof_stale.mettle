@@ -1,5 +1,52 @@
 import "std/io";
 import "std/process";
+import "std/core";
+
+enum Parsed {
+  Good(int32),
+  Bad(int32),
+  Empty
+}
+
+fn parse(n: int32) -> Parsed {
+  if (n == 0) { return Empty; }
+  if (n >= 1 && n <= 9) { return Good(n); }
+  return Bad(n);
+}
+
+fn checked_percent(n: int32) -> Option<int32> {
+  if (n < 0 || n > 100) { return None; }
+  return Some(n);
+}
+
+fn loose_percent(n: int32) -> Option<int32> {
+  if (n == 777) { return Some(n); }
+  if (n < 0 || n > 100) { return None; }
+  return Some(n);
+}
+
+fn moved_percent(n: int32) -> Option<int32> {
+  if (n < 0 || n > 100) { return None; }
+  n = n + 1000;
+  return Some(n);
+}
+
+type NonNeg = int32 where value >= 0;
+type AtLeast5 = int32 where value >= 5;
+
+fn checks_then_touches(n: int32) {
+  if (n < 5 || n > 50) { exit(3); }
+  touch();
+}
+
+fn halve(x: float64) -> float64 { return x * 0.5; }
+fn twice(x: float64) -> float64 { return x * 2.0; }
+
+fn loose_unit(x: float64) -> float64 {
+  if (x < 0.0) { return 0.0; }
+  if (x > 1.0) { return 1.0; }
+  return x;
+}
 
 type Percent = int32 where value >= 0 && value <= 100;
 type Digit = int32 where value >= 0 && value < 10;
@@ -71,6 +118,15 @@ struct Clearer {
 fn drops_a_clear(p: Node*) -> bool { if (p == 0) { return false; } var c: Clearer = { target: p }; return p->len > 4; }
 fn between(n: int32, lo: int32, hi: int32) -> bool { return n >= lo && n <= hi; }
 fn Span_ordered(s: Span) -> bool { return s.lo <= s.hi; }
+
+const CEILING: int32 = 100;
+fn payload_named_like_a_parameter(n: int32, o: Option<int32>) -> int32 { match (o) { case Some(n): { return n; } case None: { return 0; } } }
+type Tiny = uint32 where value <= 100;
+fn pick_sign(u: uint32, i: int32) -> int32 { if (u < i) { return 500; } return 7; }
+type UnderCeiling = int32 where value <= CEILING;
+var g_register: volatile int32 = 0;
+type Total = float64 where value >= 0.0 && value <= 65.0;
+type Count = int64 where value >= 0 && value <= 64;
 
 fn reassign_after_verdict(n: int32) -> int32 {
   if (is_percent(n)) { n = n + 500; var p: Percent = n; return p; } return 0; }
@@ -251,29 +307,5 @@ fn switch_default_arm(n: int32) -> int32 {
 
 fn expression_argument_differs(a: int32, b: int32) -> int32 {
   if (is_percent(a + b)) { var p: Percent = a - b; return p; } return 0; }
-
-fn expression_argument_written(a: int32, b: int32) -> int32 {
-  if (is_percent(a + b)) { a = a + 500; var p: Percent = a + b; return p; } return 0; }
-
-fn method_on_another_object(s: Span, t: Span) -> int32 {
-  if (s.ordered()) { var o: Ordered = (Ordered)t; return o.hi; } return 0; }
-
-fn float_nan_passes_an_early_exit(x: float64) -> float64 {
-  if (x < 0.0 || x > 1.0) { return 0.0; } var u: Unit = (Unit)x; return (float64)u; }
-
-fn float_nan_passes_negated_tests(x: float64) -> float64 {
-  if (!(x < 0.0)) { if (!(x > 1.0)) { var u: Unit = (Unit)x; return (float64)u; } } return 0.0; }
-
-fn float_nan_passes_a_demand(x: float64) -> float64 {
-  must_not_be_outside(x); var u: Unit = (Unit)x; return (float64)u; }
-
-fn destructor_at_the_end_of_a_scope(p: Node*) -> int32 {
-  if (is_long(p)) { { var c: Clearer = { target: p }; } var x: Long = (Long)p; return x->len; } return 0; }
-
-fn destructor_on_reassignment(p: Node*, q: Node*) -> int32 {
-  var c: Clearer = { target: p }; if (is_long(p)) { c = make_clearer(q); var x: Long = (Long)p; return x->len; } return 0; }
-
-fn narrowing_under_a_repeated_test(x: uint8) -> int32 {
-  if (x + 200 >= 200) { var h: High = x + 200; return (int32)h; } return 0; }
 
 fn main() -> int32 { return 0; }

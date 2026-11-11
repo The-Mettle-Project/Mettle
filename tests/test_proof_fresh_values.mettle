@@ -1,0 +1,119 @@
+import "std/io";
+import "std/process";
+import "std/core";
+
+type AtLeast5 = int32 where value >= 5;
+type NonNeg = int32 where value >= 0;
+type NonNeg64 = int64 where value >= 0;
+type Percent = int32 where value >= 0 && value <= 100;
+type Unit = float64 where value >= 0.0 && value <= 1.0;
+type Total = float64 where value >= 0.0 && value <= 65.0;
+type Count = int64 where value >= 0 && value <= 64;
+
+const CEILING: int32 = 100;
+
+fn declared_then_written(n: int32) -> int32 {
+  var x: int32 = 7;
+  var p: AtLeast5 = x;
+  x = n;
+  return p + x;
+}
+
+fn assigned_then_used(n: int32) -> int32 {
+  var x: int32 = n;
+  x = 50;
+  var p: Percent = x;
+  x = n;
+  return p + x;
+}
+
+fn stepped_after_assignment(n: int32) -> int32 {
+  var x: int32 = n;
+  x = 40;
+  x = x + 9;
+  var p: Percent = x;
+  return p;
+}
+
+fn before_its_loop(n: int32) -> int32 {
+  var i: int32 = 5;
+  var p: AtLeast5 = i;
+  while (i < n) { i = i + 3; }
+  return p + i;
+}
+
+fn copy_of_a_tested_value(n: int32) -> int32 {
+  if (n >= 0 && n <= 100) {
+    var x: int32 = n;
+    var p: Percent = x;
+    x = x + 500;
+    return p + x;
+  }
+  return 0;
+}
+
+fn float_declared(n: float64) -> float64 {
+  var x: float64 = 0.25;
+  var u: Unit = (Unit)x;
+  x = n;
+  return (float64)u + x;
+}
+
+fn plain_counter(n: int32) -> int32 {
+  var t: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) { var p: NonNeg = i; t = t + p; i = i + 1; }
+  return t;
+}
+
+fn counter_after_its_loop(n: int32) -> int32 {
+  var i: int32 = 0;
+  while (i < n) { i = i + 1; }
+  var p: NonNeg = i;
+  return p;
+}
+
+fn counter_to_a_length(xs: int32[]) -> int64 {
+  var t: int64 = 0;
+  var i: int64 = 0;
+  while (i < xs.length) { var p: NonNeg64 = i; t = t + p; i = i + 1; }
+  return t;
+}
+
+fn counter_to_a_constant() -> int32 {
+  var k: int32 = 5;
+  while (k < CEILING) { k = k + 7; }
+  var p: AtLeast5 = k;
+  return p;
+}
+
+fn pointer_test_survives_a_field_write(p: int32*, n: int32) -> int32 {
+  var t: int32 = 0;
+  if (n >= 0 && n <= 100) {
+    var i: int32 = 0;
+    while (i < 3) {
+      *p = *p + 1;
+      var c: Percent = n;
+      t = t + c;
+      i = i + 1;
+    }
+  }
+  return t;
+}
+
+fn sum_of_units(a: Unit*, n: Count) -> float64 {
+  var s: Total = (Total)0.0;
+  var i: int64 = 0;
+  while (i < n) { s = s + a[i]; i = i + 1; }
+  return (float64)s;
+}
+
+fn main() -> int32 {
+  var xs: int32[] = new int32[4];
+  var units: Unit[3] = [(Unit)0.5, (Unit)0.25, (Unit)1.0];
+  var cell: int32 = 0;
+  println("{declared_then_written(3)} {assigned_then_used(3)} {stepped_after_assignment(3)} {before_its_loop(9)} {copy_of_a_tested_value(40)}");
+  println("{float_declared(0.5)} {plain_counter(5)} {counter_after_its_loop(7)} {counter_to_a_length(xs)} {counter_to_a_constant()}");
+  println("{pointer_test_survives_a_field_write(&cell, 30)} {sum_of_units(&units[0], 3)}");
+  return 0;
+}

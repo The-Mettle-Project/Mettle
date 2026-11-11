@@ -434,6 +434,46 @@ var m: int32 = add_one(41);
 The call site may name the type arguments, and does not have to when the
 arguments already say what they are.
 
+## Declared types
+
+```mettle
+type Percent = int32 where value >= 0 && value <= 100;
+type Live = Node* where value != 0;
+type Index = int64 where value >= 0 && value < buf.length;
+
+fn is_percent(n: int32) -> bool { return n >= 0 && n <= 100; }
+
+fn in_bounds(buf: int32[], i: int64) -> bool {
+  if (i < 0) { return false; }
+  return i < buf.length;
+}
+```
+
+```mettle
+fn grade(n: int32) -> int32 {
+  if (is_percent(n)) {
+    var p: Percent = n;
+    return p;
+  }
+  return -1;
+}
+
+fn read(buf: int32[], i: int64) -> int32 {
+  if (in_bounds(buf, i)) {
+    var at: Index = (Index)i;
+    return buf[(int64)at];
+  }
+  return 0;
+}
+```
+
+A value becomes the type only where the compiler can prove the predicate. A
+comparison in scope proves it, and so does a call to a function whose body
+makes that comparison. An assignment proves the range of what it stored, so
+`x = 50;` makes `x` a `Percent` until the next write. A write to the value
+ends the proof. The read through `at` carries no bounds check. See
+[Types](types.md).
+
 ## Gathered parameters
 
 ```mettle
