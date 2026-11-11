@@ -3,6 +3,8 @@
 int type_checker_check_match_statement(TypeChecker *checker,
                                                ASTNode *statement) {
   MatchStatement *match = (MatchStatement *)statement->data;
+  void *arms_join = checker->arms_join;
+  checker->arms_join = NULL;
   if (!match || !match->expression) {
     type_checker_set_error_at_location(checker, statement->location,
                                        "Invalid match statement");
@@ -93,6 +95,7 @@ int type_checker_check_match_statement(TypeChecker *checker,
         type_checker_push_payload_facts(checker, match->expression,
                                         variant_idx, arm->binding_name,
                                         payload);
+        type_checker_join_arm(checker, arms_join, arm->body);
         int ok = arm->body ? type_checker_check_statement(checker, arm->body)
                            : 1;
         type_checker_pop_guards(checker, arm_depth);
@@ -105,6 +108,7 @@ int type_checker_check_match_statement(TypeChecker *checker,
       }
     }
 
+    type_checker_join_arm(checker, arms_join, arm->body);
     if (arm->body && !type_checker_check_statement(checker, arm->body)) {
       free(covered);
       return 0;

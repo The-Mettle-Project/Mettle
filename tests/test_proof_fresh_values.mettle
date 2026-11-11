@@ -108,6 +108,145 @@ fn sum_of_units(a: Unit*, n: Count) -> float64 {
   return (float64)s;
 }
 
+fn clamp_by_hand(n: int32) -> int32 {
+  var v: int32 = n;
+  if (v < 0) { v = 0; }
+  if (v > 100) { v = 100; }
+  var p: Percent = v;
+  return p;
+}
+
+fn two_branches(n: int32) -> int32 {
+  var x: int32 = 0;
+  if (n > 3) { x = 5; } else { x = 7; }
+  var p: AtLeast5 = x;
+  return p;
+}
+
+fn three_branches(n: int32) -> int32 {
+  var x: int32 = 0;
+  if (n > 30) { x = 10; } else if (n > 20) { x = 20; } else if (n > 10) { x = 30; } else { x = 40; }
+  var p: AtLeast5 = x;
+  return p;
+}
+
+fn one_branch_returns(n: int32) -> int32 {
+  var x: int32 = 50;
+  if (n > 3) { x = 900; return x; } else { x = 60; }
+  var p: Percent = x;
+  return p;
+}
+
+fn nested_branches(n: int32, m: int32) -> int32 {
+  var x: int32 = 0;
+  if (n > 3) {
+    if (m > 3) { x = 51; } else { x = 52; }
+  } else {
+    x = 59;
+  }
+  var p: Percent = x;
+  return p;
+}
+
+fn float_clamp(a: float64) -> float64 {
+  var x: float64 = a;
+  if (!(x >= 0.0)) { x = 0.0; }
+  if (!(x <= 1.0)) { x = 1.0; }
+  var u: Unit = (Unit)x;
+  return (float64)u;
+}
+
+fn clamp_on_every_turn(n: int32) -> int32 {
+  var v: int32 = n;
+  var t: int32 = 0;
+  var i: int32 = 0;
+  while (i < 3) {
+    if (v < 0) { v = 0; }
+    if (v > 100) { v = 100; }
+    var p: Percent = v;
+    t = t + p;
+    v = v + 500;
+    i = i + 1;
+  }
+  return t;
+}
+
+fn is_percent(n: int32) -> bool { return n >= 0 && n <= 100; }
+
+fn clamp_raw(n: int32) -> int32 {
+  var v: int32 = n;
+  if (v < 0) { v = 0; }
+  if (v > 100) { v = 100; }
+  return v;
+}
+
+fn clamp_through_a_call(x: int32) -> int32 {
+  var p: Percent = clamp_raw(x);
+  return p;
+}
+
+fn reset_unless_a_percent(n: int32) -> int32 {
+  var x: int32 = n;
+  if (!is_percent(x)) { x = 0; }
+  var p: Percent = x;
+  return p;
+}
+
+fn absolute(n: int32) -> int32 {
+  var x: int32 = n;
+  if (x < 0) {
+    if (x < -100) { x = -100; }
+    x = 0 - x;
+  }
+  if (x > 100) { x = 100; }
+  var p: Percent = x;
+  return p;
+}
+
+enum Shape { Dot, Line(int32), Box(int32) }
+
+fn by_switch(n: int32) -> int32 {
+  var k: int32 = 0;
+  switch (n) {
+    case 0: { k = 10; }
+    case 1: { k = 20; }
+    default: { k = 30; }
+  }
+  var p: AtLeast5 = k;
+  return p;
+}
+
+fn by_switch_without_default(n: int32) -> int32 {
+  var k: int32 = 40;
+  switch (n) {
+    case 0: { k = 10; }
+    case 1: { k = 20; }
+  }
+  var p: AtLeast5 = k;
+  return p;
+}
+
+fn by_match(s: Shape) -> int32 {
+  var k: int32 = 0;
+  match (s) {
+    case Dot: { k = 10; }
+    case Line(n): { k = 20; }
+    case Box(n): { k = 30; }
+  }
+  var p: AtLeast5 = k;
+  return p;
+}
+
+fn switch_with_a_return(n: int32) -> int32 {
+  var k: int32 = 0;
+  switch (n) {
+    case 0: { k = 900; return k; }
+    default: { k = 30; }
+  }
+  var p: Percent = k;
+  return p;
+}
+
 fn main() -> int32 {
   var xs: int32[] = new int32[4];
   var units: Unit[3] = [(Unit)0.5, (Unit)0.25, (Unit)1.0];
@@ -115,5 +254,9 @@ fn main() -> int32 {
   println("{declared_then_written(3)} {assigned_then_used(3)} {stepped_after_assignment(3)} {before_its_loop(9)} {copy_of_a_tested_value(40)}");
   println("{float_declared(0.5)} {plain_counter(5)} {counter_after_its_loop(7)} {counter_to_a_length(xs)} {counter_to_a_constant()}");
   println("{pointer_test_survives_a_field_write(&cell, 30)} {sum_of_units(&units[0], 3)}");
+  println("{clamp_by_hand(-5)} {clamp_by_hand(500)} {clamp_by_hand(42)} {two_branches(1)} {three_branches(25)} {one_branch_returns(1)} {nested_branches(9, 1)}");
+  println("{float_clamp(-3.0)} {float_clamp(0.5)} {float_clamp(7.0)} {clamp_on_every_turn(-9)}");
+  println("{by_switch(0)} {by_switch(9)} {by_switch_without_default(7)} {by_match(Line(4))} {switch_with_a_return(5)}");
+  println("{clamp_through_a_call(-7)} {clamp_through_a_call(700)} {reset_unless_a_percent(444)} {reset_unless_a_percent(44)} {absolute(-30)} {absolute(-3000)}");
   return 0;
 }

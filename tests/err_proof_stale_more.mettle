@@ -120,6 +120,7 @@ fn between(n: int32, lo: int32, hi: int32) -> bool { return n >= lo && n <= hi; 
 fn Span_ordered(s: Span) -> bool { return s.lo <= s.hi; }
 
 const CEILING: int32 = 100;
+enum Shape { Dot, Line(int32), Box(int32) }
 fn payload_named_like_a_parameter(n: int32, o: Option<int32>) -> int32 { match (o) { case Some(n): { return n; } case None: { return 0; } } }
 type Tiny = uint32 where value <= 100;
 fn pick_sign(u: uint32, i: int32) -> int32 { if (u < i) { return 500; } return 7; }
@@ -271,6 +272,84 @@ fn unsigned_equal_to_a_negative(u: uint32, i: int32) -> int32 {
 
 fn result_of_an_unsigned_test() -> int32 {
   var d: Digit = pick_sign(5, -3); return d; }
+
+fn join_bounds_one_side_only(n: int32) -> int32 {
+  var v: int32 = n; if (v < 0) { v = 0; } var p: Percent = v; return p; }
+
+fn join_with_a_branch_too_wide(n: int32) -> int32 {
+  var x: int32 = 0; if (n > 3) { x = 5; } else { x = 70; } var d: Digit = x; return d; }
+
+fn join_with_a_branch_poked(n: int32) -> int32 {
+  var x: int32 = 0; if (n > 3) { x = 5; bump(&x); } else { x = 7; } var d: Digit = x; return d; }
+
+fn join_with_a_branch_unknown(n: int32) -> int32 {
+  var x: int32 = 0; if (n > 30) { x = 1; } else if (n > 20) { x = n; } else { x = 4; } var d: Digit = x; return d; }
+
+fn join_without_a_last_else(n: int32) -> int32 {
+  var x: int32 = 900; if (n > 30) { x = 1; } else if (n > 20) { x = 2; } var d: Digit = x; return d; }
+
+fn join_over_an_inner_declaration(n: int32) -> int32 {
+  var x: int32 = 900; if (n > 3) { var x: int32 = 5; x = 6; g_level = x; } else { x = 7; } var d: Digit = x; return d; }
+
+fn join_over_a_binding(n: int32, o: Option<int32>) -> int32 {
+  var x: int32 = 900; if (n > 3) { match (o) { case Some(x): { x = 5; g_level = x; } case None: { } } } else { x = 7; } var d: Digit = x; return d; }
+
+fn join_of_a_global_then_a_call(n: int32) -> int32 {
+  if (n > 3) { g_level = 5; } else { g_level = 7; } touch(); var d: Digit = g_level; return d; }
+
+fn join_of_floats_through_a_nan(a: float64) -> float64 {
+  var x: float64 = a; if (x < 0.0) { x = 0.0; } if (x > 1.0) { x = 1.0; } var u: Unit = (Unit)x; return (float64)u; }
+
+fn join_then_a_write(n: int32) -> int32 {
+  var x: int32 = 0; if (n > 3) { x = 5; } else { x = 7; } x = x + n; var d: Digit = x; return d; }
+
+fn join_read_on_the_next_turn(n: int32) -> int32 {
+  var x: int32 = 0; var t: int32 = 0; var i: int32 = 0; while (i < 3) { var d: Digit = x; t = t + d; if (n > 3) { x = 5; } else { x = 7; } x = x + 500; i = i + 1; } return t; }
+
+fn join_left_by_a_break(n: int32) -> int32 {
+  var x: int32 = 900; var i: int32 = 0; while (i < 3) { if (n > 3) { x = 5; break; } else { x = 7; } i = i + 1; } var d: Digit = x; return d; }
+
+fn switch_join_with_an_arm_too_wide(n: int32) -> int32 {
+  var k: int32 = 0; switch (n) { case 0: { k = 1; } case 1: { k = 200; } default: { k = 3; } } var d: Digit = k; return d; }
+
+fn switch_join_keeps_the_old_value(n: int32) -> int32 {
+  var k: int32 = 900; switch (n) { case 0: { k = 1; } case 1: { k = 2; } } var d: Digit = k; return d; }
+
+fn switch_join_with_a_break(n: int32) -> int32 {
+  var k: int32 = 0; var i: int32 = 0; while (i < 3) { switch (n) { case 0: { k = 900; break; } default: { k = 3; } } var d: Digit = k; g_level = d; i = i + 1; } return k; }
+
+fn switch_join_with_a_fallthrough(n: int32) -> int32 {
+  var k: int32 = 0; switch (n) { case 0: { k = 900; fallthrough; } case 1: { g_level = k; } default: { k = 3; } } var d: Digit = k; return d; }
+
+fn match_join_takes_a_payload(s: Shape) -> int32 {
+  var k: int32 = 0; match (s) { case Dot: { k = 1; } case Line(n): { k = n; } case Box(n): { k = 3; } } var d: Digit = k; return d; }
+
+fn match_join_over_a_binding(s: Shape) -> int32 {
+  var k: int32 = 900; match (s) { case Dot: { k = 1; } case Line(k): { k = 2; g_level = k; } case Box(n): { k = 3; } } var d: Digit = k; return d; }
+
+fn match_join_over_a_declaration(s: Shape) -> int32 {
+  var k: int32 = 900; match (s) { case Dot: { var k: int32 = 1; k = 2; g_level = k; } case Line(n): { k = 2; } case Box(n): { k = 3; } } var d: Digit = k; return d; }
+
+fn switch_join_then_a_write(n: int32) -> int32 {
+  var k: int32 = 0; switch (n) { case 0: { k = 1; } default: { k = 3; } } k = k + n; var d: Digit = k; return d; }
+
+fn deferred_after_a_test(n: int32) -> int32 {
+  var x: int32 = n; if (x >= 0 && x <= 100) { defer { var p: Percent = x; g_level = p; } x = 900; } return x; }
+
+fn deferred_after_an_assignment(n: int32) -> int32 {
+  var x: int32 = 50; defer { var p: Percent = x; g_level = p; } x = n; return x; }
+
+fn deferred_after_a_verdict(n: int32) -> int32 {
+  var x: int32 = n; if (is_percent(x)) { defer { var p: Percent = x; g_level = p; } x = 900; } return x; }
+
+fn deferred_after_a_demand(n: int32) -> int32 {
+  var x: int32 = n; must_be_digit(x); defer { var d: Digit = x; g_level = d; } x = 900; return x; }
+
+fn deferred_in_an_arm(n: int32) -> int32 {
+  match (checked_percent(n)) { case Some(v): { defer { var p: Percent = v; g_level = p; } v = 900; return v; } case None: { return 0; } } }
+
+fn deferred_pointer_test(p: Node*) -> int32 {
+  if (p != 0) { defer { var l: Live = (Live)p; g_level = l->len; } p = 0; } return 0; }
 
 fn result_reads_a_binding_as_the_parameter() -> int32 {
   var d: Digit = payload_named_like_a_parameter(5, Some(900)); return d; }

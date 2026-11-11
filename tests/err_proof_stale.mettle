@@ -120,6 +120,7 @@ fn between(n: int32, lo: int32, hi: int32) -> bool { return n >= lo && n <= hi; 
 fn Span_ordered(s: Span) -> bool { return s.lo <= s.hi; }
 
 const CEILING: int32 = 100;
+enum Shape { Dot, Line(int32), Box(int32) }
 fn payload_named_like_a_parameter(n: int32, o: Option<int32>) -> int32 { match (o) { case Some(n): { return n; } case None: { return 0; } } }
 type Tiny = uint32 where value <= 100;
 fn pick_sign(u: uint32, i: int32) -> int32 { if (u < i) { return 500; } return 7; }

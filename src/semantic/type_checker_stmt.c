@@ -489,10 +489,14 @@ int type_checker_check_if_statement(TypeChecker *checker,
     }
   }
 
+  void *join = checker->joinable == statement
+                   ? type_checker_join_begin(checker, statement)
+                   : NULL;
   {
     size_t guard_depth = type_checker_guard_depth(checker);
     int then_ok = 1;
     type_checker_push_guard(checker, if_stmt->condition, 0);
+    type_checker_join_arm(checker, join, if_stmt->then_branch);
     if (if_stmt->then_branch &&
         !type_checker_check_statement(checker, if_stmt->then_branch)) {
       then_ok = 0;
@@ -544,6 +548,7 @@ int type_checker_check_if_statement(TypeChecker *checker,
       }
       size_t arm_depth = type_checker_guard_depth(checker);
       type_checker_push_guard(checker, if_stmt->else_ifs[i].condition, 0);
+      type_checker_join_arm(checker, join, if_stmt->else_ifs[i].body);
       if (!type_checker_check_statement(checker, if_stmt->else_ifs[i].body)) {
         elif_ok = 0;
       }
@@ -555,6 +560,8 @@ int type_checker_check_if_statement(TypeChecker *checker,
       prefix_pushes = checker->guard_pushes;
       prefix_valid = prefix_end == arm_depth + 1;
       type_checker_pop_guards(checker, guard_depth);
+    } else {
+      type_checker_join_arm(checker, join, NULL);
     }
     if (!elif_ok) {
       free(joined);
@@ -575,6 +582,7 @@ int type_checker_check_if_statement(TypeChecker *checker,
       type_checker_push_guard(checker, if_stmt->else_ifs[earlier].condition,
                               1);
     }
+    type_checker_join_arm(checker, join, if_stmt->else_branch);
     else_ok = type_checker_check_statement(checker, if_stmt->else_branch);
     type_checker_pop_guards(checker, guard_depth);
     if (!else_ok) {
@@ -593,6 +601,7 @@ int type_checker_check_if_statement(TypeChecker *checker,
 
   free(joined);
   free(init_snapshot);
+  type_checker_join_end(checker, join);
 
   return 1;
 }
@@ -998,6 +1007,8 @@ static int type_checker_check_switch_exhaustive(
 int type_checker_check_switch_statement(TypeChecker *checker,
                                                ASTNode *statement) {
   SwitchStatement *switch_stmt = (SwitchStatement *)statement->data;
+  void *arms_join = checker->arms_join;
+  checker->arms_join = NULL;
   if (!switch_stmt || !switch_stmt->expression) {
     type_checker_set_error_at_location(checker, statement->location,
                                        "Invalid switch statement");
@@ -1239,6 +1250,7 @@ int type_checker_check_switch_statement(TypeChecker *checker,
       size_t arm_depth = type_checker_guard_depth(checker);
       int arm_ok;
       type_checker_push_case_guard(checker, switch_stmt, i);
+      type_checker_join_case(checker, arms_join, case_clause->body);
       arm_ok = type_checker_check_statement(checker, case_clause->body);
       type_checker_pop_guards(checker, arm_depth);
       if (!arm_ok) {
@@ -1359,13 +1371,24 @@ int type_checker_check_statement(TypeChecker *checker, ASTNode *statement) {
     return 0;
   int in_block = checker->block_statement == statement;
   checker->block_statement = NULL;
+  if (in_block) {
+    checker->joinable = statement;
+  }
+  void *arms = NULL;
+  if (in_block && (statement->type == AST_SWITCH_STATEMENT ||
+                   statement->type == AST_MATCH_STATEMENT)) {
+    arms = type_checker_join_begin(checker, statement);
+  }
   if (type_checker_statement_repeats(statement)) {
     type_checker_settle_loop_test(checker, statement);
     type_checker_note_effects(checker, statement);
   }
+  checker->arms_join = arms;
   if (!type_checker_check_statement_body(checker, statement)) {
+    type_checker_join_abandon(checker, arms);
     return 0;
   }
+  type_checker_join_end(checker, arms);
   if (statement->type == AST_RETURN_STATEMENT && statement->data) {
     const ReturnStatement *ret = (const ReturnStatement *)statement->data;
     type_checker_note_return_facts(checker,
@@ -1510,6 +1533,7 @@ static int type_checker_check_block(TypeChecker *checker, ASTNode *statement) {
                   ->body == statement) {
         type_checker_note_return_facts(checker, NULL);
       }
+      type_checker_join_capture(checker, statement, ends_here);
       if (ends_here && !type_checker_holds_jump(statement)) {
         type_checker_forget_effects_since(checker, block_effects);
       }
@@ -1877,11 +1901,19 @@ static int type_checker_check_continue(TypeChecker *checker, ASTNode *statement)
 static int type_checker_check_statement_body(TypeChecker *checker,
                                              ASTNode *statement) {
   switch (statement->type) {
-  case AST_DEFER_STATEMENT:
-    return type_checker_check_defer_statement(checker, statement);
+  case AST_DEFER_STATEMENT: {
+    void *kept = type_checker_facts_suspend(checker);
+    int ok = type_checker_check_defer_statement(checker, statement);
+    type_checker_facts_resume(checker, kept);
+    return ok;
+  }
 
-  case AST_ERRDEFER_STATEMENT:
-    return type_checker_check_errdefer(checker, statement);
+  case AST_ERRDEFER_STATEMENT: {
+    void *kept = type_checker_facts_suspend(checker);
+    int ok = type_checker_check_errdefer(checker, statement);
+    type_checker_facts_resume(checker, kept);
+    return ok;
+  }
 
   case AST_VAR_DECLARATION:
   case AST_FUNCTION_DECLARATION:

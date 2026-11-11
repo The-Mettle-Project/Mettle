@@ -4974,7 +4974,7 @@ try {
     @{ Source = "tests/test_proof_bounds.mettle"; Want = "6 -1 40 5 4 33 -1 3" },
     @{ Source = "tests/test_proof_float_results.mettle"; Want = "0\.375 1\.0 0\.0 0\.0 0\.25" },
     @{ Source = "tests/test_proof_payloads.mettle"; Want = "64 -1 45 -1 7 -2 -3" },
-    @{ Source = "tests/test_proof_fresh_values.mettle"; Want = "10 53 49 16 580\s+0\.75 10 7 6 103\s+90 1\.75" }
+    @{ Source = "tests/test_proof_fresh_values.mettle"; Want = "10 53 49 16 580\s+0\.75 10 7 6 103\s+90 1\.75\s+0 100 42 7 20 60 52\s+0\.0 0\.5 1\.0 200\s+10 30 40 20 30\s+0 100 0 44 30 100" }
   )
   foreach ($case in $proven) {
     foreach ($flags in @(@(), @("--release"), @("--check-proofs"), @("--check-proofs", "--release"))) {
@@ -4985,7 +4985,7 @@ try {
       if ($run -notmatch $case.Want) { throw "$($case.Source) printed the wrong answer with '$flags': $run" }
     }
   }
-  foreach ($stale in @(@{ Source = "tests/err_proof_stale.mettle"; Want = 60 }, @{ Source = "tests/err_proof_stale_more.mettle"; Want = 50 })) {
+  foreach ($stale in @(@{ Source = "tests/err_proof_stale.mettle"; Want = 60 }, @{ Source = "tests/err_proof_stale_more.mettle"; Want = 76 })) {
     $out = & $CompilerPath --build $stale.Source -o (Join-Path $tmpDir "proof_stale.exe") 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0) { throw "$($stale.Source) was proven anyway" }
     $refused = ([regex]::Matches($out, "error\[P0001\]")).Count

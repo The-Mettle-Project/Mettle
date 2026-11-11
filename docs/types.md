@@ -914,6 +914,27 @@ Everything in *What a write ends* ends this range too. An expression that
 calls a function which writes memory proves nothing this way, and neither does
 a statement under `defer`, which runs later.
 
+An `if` joins what its branches stored, which is what a clamp written by hand
+needs:
+
+```mettle
+fn clamp_percent(n: int32) -> Percent {
+  var v: int32 = n;
+  if (v < 0) { v = 0; }
+  if (v > 100) { v = 100; }
+  return (Percent)v;
+}
+```
+
+After the first `if`, `v` is at least 0: it is 0 where the branch ran, and
+the test failed where it did not. After the second it is 0..100. An `if` with
+an `else` covers every branch that reaches the code after it, and a branch
+that returns is left out. Each branch has to be a block and the conditions
+must write nothing. A float joins the same way when the tests are ones a NaN
+fails, `if (!(x >= 0.0)) { x = 0.0; }`. A `switch` and a `match` join their
+arms the same way, and a `switch` with no `default` adds the range the name
+had before it.
+
 **What a write ends.** A test proves a value for as long as nothing writes it.
 An assignment, a new declaration of the name, or `&name` ends every earlier
 test of that name. A write to one field of a struct held by value ends every
@@ -954,6 +975,11 @@ be negative. A test of a `volatile` value proves nothing, because the next
 read can differ; copy the value to a local and test the copy. A conversion is
 refused where a local hides a global that the type's predicate names, since
 the predicate would read the local there.
+
+Code under `defer` or `errdefer` runs when the scope ends, after every
+statement written below it. Nothing tested or assigned outside the deferred
+code proves a value inside it. A test written inside the deferred code proves
+what it tests.
 
 **What a loop carries.** A counter that only ever rises keeps the bound its
 initialiser gave it. `var k: int32 = 5;` bounds `k` below for the whole

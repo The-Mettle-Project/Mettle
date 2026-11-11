@@ -18,6 +18,7 @@ struct TypeCheckerGuard {
   double float_min;
   double float_max;
   double float_err;
+  size_t stored_line;
 };
 
 typedef struct {
@@ -534,6 +535,9 @@ void type_checker_facts_reset(TypeChecker *checker) {
   if (checker) {
     checker->kill_count = 0;
     checker->exposed_count = 0;
+    checker->join = NULL;
+    checker->joinable = NULL;
+    checker->arms_join = NULL;
   }
 }
 
@@ -4623,15 +4627,20 @@ void type_checker_note_written_value(TypeChecker *checker, ASTNode *statement) {
       fresh_target(statement, &name, &value) &&
       condition_taint(checker, value) == 0) {
     const Symbol *symbol = symbol_table_peek(checker->symbol_table, name);
+    long long steps = checker->proof_steps;
     if (symbol && symbol->type &&
         (symbol->kind == SYMBOL_VARIABLE || symbol->kind == SYMBOL_PARAMETER)) {
       kind = fresh_range(checker, symbol->type, value, &whole, &real);
     }
+    checker->proof_steps = steps;
   }
   type_checker_note_effects(checker, statement);
   if (kind == 1) {
-    type_checker_push_range_guard(checker, name, whole.has_min, whole.min,
-                                  whole.has_max, whole.max);
+    if (type_checker_push_range_guard(checker, name, whole.has_min, whole.min,
+                                      whole.has_max, whole.max)) {
+      checker->guards[checker->guard_count - 1].stored_line =
+          statement->location.line;
+    }
   } else if (kind == 2 && guard_grow(checker)) {
     struct TypeCheckerGuard *guard = &checker->guards[checker->guard_count++];
     memset(guard, 0, sizeof(*guard));
@@ -4641,8 +4650,407 @@ void type_checker_note_written_value(TypeChecker *checker, ASTNode *statement) {
     guard->has_max = 1;
     guard->float_min = real.min;
     guard->float_max = real.max;
+    guard->stored_line = statement->location.line;
     checker->guard_pushes++;
   }
+}
+
+typedef struct {
+  size_t count;
+  unsigned char held[];
+} SuspendedFacts;
+
+void *type_checker_facts_suspend(TypeChecker *checker) {
+  SuspendedFacts *kept;
+  if (!checker) {
+    return NULL;
+  }
+  kept = (SuspendedFacts *)malloc(sizeof(SuspendedFacts) +
+                                  checker->guard_count);
+  if (!kept) {
+    checker->guard_count = 0;
+    return NULL;
+  }
+  kept->count = checker->guard_count;
+  for (size_t i = 0; i < kept->count; i++) {
+    kept->held[i] = checker->guards[i].skip_all;
+    checker->guards[i].skip_all = 1;
+  }
+  return kept;
+}
+
+void type_checker_facts_resume(TypeChecker *checker, void *raw) {
+  SuspendedFacts *kept = (SuspendedFacts *)raw;
+  if (!checker || !kept) {
+    return;
+  }
+  for (size_t i = 0; i < kept->count && i < checker->guard_count; i++) {
+    checker->guards[i].skip_all = kept->held[i];
+  }
+  free(kept);
+}
+
+#define JOIN_NAMES 4
+
+typedef struct Join {
+  struct Join *outer;
+  const ASTNode *arm;
+  const char *names[JOIN_NAMES];
+  unsigned char is_float[JOIN_NAMES];
+  unsigned char any[JOIN_NAMES];
+  Range whole[JOIN_NAMES];
+  FRange real[JOIN_NAMES];
+  size_t count;
+  size_t expected;
+  size_t arms;
+  int reaches;
+  int broken;
+} Join;
+
+static int node_declares(const ASTNode *node, const char *name) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_VAR_DECLARATION && node->data) {
+    const VarDeclaration *decl = (const VarDeclaration *)node->data;
+    if (decl->name && strcmp(decl->name, name) == 0) {
+      return 1;
+    }
+  }
+  if (node->type == AST_MATCH_STATEMENT && node->data) {
+    const MatchStatement *match = (const MatchStatement *)node->data;
+    for (size_t i = 0; i < match->arm_count; i++) {
+      if (node_declares(match->arms[i].body, name)) {
+        return 1;
+      }
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node_declares(node->children[i], name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int node_holds_break(const ASTNode *node) {
+  if (!node) {
+    return 0;
+  }
+  if (node->type == AST_BREAK_STATEMENT) {
+    return 1;
+  }
+  if (node->type == AST_MATCH_STATEMENT && node->data) {
+    const MatchStatement *match = (const MatchStatement *)node->data;
+    for (size_t i = 0; i < match->arm_count; i++) {
+      if (node_holds_break(match->arms[i].body)) {
+        return 1;
+      }
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    if (node_holds_break(node->children[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int join_shape(TypeChecker *checker, const ASTNode *statement,
+                      size_t *expected, int *open, ASTNode **skip_test) {
+  if (statement->type == AST_IF_STATEMENT) {
+    const IfStatement *branch = (const IfStatement *)statement->data;
+    if (!branch->condition ||
+        (!branch->else_branch && branch->else_if_count > 0) ||
+        condition_taint(checker, branch->condition) != 0) {
+      return 0;
+    }
+    for (size_t i = 0; i < branch->else_if_count; i++) {
+      if (condition_taint(checker, branch->else_ifs[i].condition) != 0) {
+        return 0;
+      }
+    }
+    *expected = 1 + branch->else_if_count + (branch->else_branch ? 1 : 0);
+    *open = !branch->else_branch;
+    *skip_test = branch->condition;
+    return 1;
+  }
+  if (statement->type == AST_SWITCH_STATEMENT) {
+    const SwitchStatement *choice = (const SwitchStatement *)statement->data;
+    int has_default = 0;
+    if (!choice->expression ||
+        condition_taint(checker, choice->expression) != 0 ||
+        node_holds_break(statement)) {
+      return 0;
+    }
+    for (size_t i = 0; i < choice->case_count; i++) {
+      const CaseClause *arm = choice->cases[i]
+                                  ? (const CaseClause *)choice->cases[i]->data
+                                  : NULL;
+      if (arm && arm->is_default) {
+        has_default = 1;
+      }
+    }
+    *expected = choice->case_count;
+    *open = !has_default;
+    return 1;
+  }
+  if (statement->type == AST_MATCH_STATEMENT) {
+    const MatchStatement *match = (const MatchStatement *)statement->data;
+    if (!match->expression ||
+        condition_taint(checker, match->expression) != 0 ||
+        node_holds_break(statement)) {
+      return 0;
+    }
+    *expected = match->arm_count;
+    *open = 0;
+    return 1;
+  }
+  return 0;
+}
+
+static int join_kind_of(TypeChecker *checker, const ASTNode *statement,
+                        const char *name) {
+  const Symbol *symbol = symbol_table_peek(checker->symbol_table, name);
+  const Type *base = symbol ? symbol->type : NULL;
+  if (!symbol || (symbol->kind != SYMBOL_VARIABLE &&
+                  symbol->kind != SYMBOL_PARAMETER)) {
+    return 0;
+  }
+  while (base && base->refined_base) {
+    base = base->refined_base;
+  }
+  if (!base || base->is_volatile || symbol->type->is_volatile ||
+      node_declares(statement, name) || arm_binds_name(statement, name)) {
+    return 0;
+  }
+  if (base->kind != TYPE_ENUM && type_checker_is_integer_type((Type *)base)) {
+    return 1;
+  }
+  return type_checker_is_float_base((Type *)base) && base->size == 8 ? 2 : 0;
+}
+
+static void join_names(TypeChecker *checker, const ASTNode *statement,
+                       const ASTNode *node, Join *join) {
+  if (!node) {
+    return;
+  }
+  if (node->type == AST_ASSIGNMENT && node->data) {
+    const Assignment *assign = (const Assignment *)node->data;
+    const char *name = assign->variable_name;
+    size_t at = 0;
+    int kind = 0;
+    while (name && at < join->count && strcmp(join->names[at], name) != 0) {
+      at++;
+    }
+    if (name && !assign->target && assign->target_count == 0 &&
+        at == join->count && join->count < JOIN_NAMES) {
+      kind = join_kind_of(checker, statement, name);
+    }
+    if (kind) {
+      join->names[join->count] = name;
+      join->is_float[join->count] = kind == 2;
+      join->count++;
+    }
+  }
+  if (node->type == AST_MATCH_STATEMENT && node->data) {
+    const MatchStatement *match = (const MatchStatement *)node->data;
+    for (size_t i = 0; i < match->arm_count; i++) {
+      join_names(checker, statement, match->arms[i].body, join);
+    }
+  }
+  for (size_t i = 0; i < node->child_count; i++) {
+    join_names(checker, statement, node->children[i], join);
+  }
+}
+
+static void join_take_whole(TypeChecker *checker, Join *join, size_t at) {
+  const Symbol *symbol = symbol_table_peek(checker->symbol_table,
+                                           join->names[at]);
+  Range now = symbol ? range_of_type(symbol->type) : range_unknown();
+  Range *hull = &join->whole[at];
+  if (symbol && narrowing_enter(checker, join->names[at])) {
+    narrow_by_guards(checker, join->names[at], &now, 0);
+    narrow_by_monotone(checker, join->names[at], &now, 0);
+    narrowing_leave(checker);
+  }
+  if (now.has_min && now.has_max && now.min > now.max) {
+    return;
+  }
+  if (!join->any[at]) {
+    join->any[at] = 1;
+    *hull = now;
+    return;
+  }
+  hull->has_min = hull->has_min && now.has_min;
+  hull->has_max = hull->has_max && now.has_max;
+  if (now.has_min && now.min < hull->min) {
+    hull->min = now.min;
+  }
+  if (now.has_max && now.max > hull->max) {
+    hull->max = now.max;
+  }
+}
+
+static void join_take_real(TypeChecker *checker, Join *join, size_t at) {
+  const Symbol *symbol = symbol_table_peek(checker->symbol_table,
+                                           join->names[at]);
+  FRange now = symbol ? frange_of_type(symbol->type) : frange_unknown();
+  FRange *hull = &join->real[at];
+  if (symbol && narrowing_enter(checker, join->names[at])) {
+    fnarrow_by_guards(checker, join->names[at], &now, 0);
+    narrowing_leave(checker);
+  }
+  if (now.err >= FRANGE_NO_BOUND) {
+    now.has_min = 0;
+    now.has_max = 0;
+  }
+  if (!join->any[at]) {
+    join->any[at] = 1;
+    *hull = now;
+    return;
+  }
+  hull->has_min = hull->has_min && now.has_min;
+  hull->has_max = hull->has_max && now.has_max;
+  if (now.has_min && now.min < hull->min) {
+    hull->min = now.min;
+  }
+  if (now.has_max && now.max > hull->max) {
+    hull->max = now.max;
+  }
+}
+
+static void join_take(TypeChecker *checker, Join *join) {
+  long long steps = checker->proof_steps;
+  for (size_t i = 0; i < join->count; i++) {
+    if (join->is_float[i]) {
+      join_take_real(checker, join, i);
+    } else {
+      join_take_whole(checker, join, i);
+    }
+  }
+  checker->proof_steps = steps;
+  join->reaches++;
+}
+
+void *type_checker_join_begin(TypeChecker *checker, ASTNode *statement) {
+  Join *join;
+  size_t expected = 0;
+  int open = 0;
+  ASTNode *skip_test = NULL;
+  if (!checker || !checker->symbol_table || !statement || !statement->data ||
+      !join_shape(checker, statement, &expected, &open, &skip_test)) {
+    return NULL;
+  }
+  join = (Join *)calloc(1, sizeof(Join));
+  if (!join) {
+    return NULL;
+  }
+  join_names(checker, statement, statement, join);
+  if (join->count == 0) {
+    free(join);
+    return NULL;
+  }
+  join->expected = expected;
+  join->outer = (Join *)checker->join;
+  checker->join = join;
+  if (open) {
+    size_t depth = checker->guard_count;
+    if (skip_test) {
+      type_checker_push_guard(checker, skip_test, 1);
+    }
+    join_take(checker, join);
+    type_checker_pop_guards(checker, depth);
+  }
+  return join;
+}
+
+void type_checker_join_arm(TypeChecker *checker, void *raw,
+                           const ASTNode *arm) {
+  Join *join = (Join *)raw;
+  (void)checker;
+  if (!join) {
+    return;
+  }
+  join->arms++;
+  if (join->arm || !arm || arm->type != AST_PROGRAM) {
+    join->broken = 1;
+    join->arm = NULL;
+    return;
+  }
+  join->arm = arm;
+}
+
+void type_checker_join_case(TypeChecker *checker, void *raw,
+                            const ASTNode *body) {
+  if (body && body->type == AST_PROGRAM && body->child_count == 1 &&
+      body->children[0] && body->children[0]->type == AST_PROGRAM) {
+    body = body->children[0];
+  }
+  type_checker_join_arm(checker, raw, body);
+}
+
+void type_checker_join_capture(TypeChecker *checker, const ASTNode *block,
+                               int ends_here) {
+  Join *join = checker ? (Join *)checker->join : NULL;
+  if (!join || join->arm != block) {
+    return;
+  }
+  join->arm = NULL;
+  if (!ends_here) {
+    join_take(checker, join);
+  }
+}
+
+void type_checker_join_end(TypeChecker *checker, void *raw);
+
+void type_checker_join_abandon(TypeChecker *checker, void *raw) {
+  if (raw) {
+    ((Join *)raw)->broken = 1;
+    type_checker_join_end(checker, raw);
+  }
+}
+
+void type_checker_join_end(TypeChecker *checker, void *raw) {
+  Join *join = (Join *)raw;
+  if (!checker || !join) {
+    return;
+  }
+  checker->join = join->outer;
+  if (join->arms != join->expected) {
+    join->broken = 1;
+  }
+  for (size_t i = 0;
+       i < join->count && !join->broken && !join->arm && join->reaches > 0;
+       i++) {
+    if (!join->any[i]) {
+      continue;
+    }
+    if (!join->is_float[i]) {
+      const Symbol *symbol = symbol_table_peek(checker->symbol_table,
+                                               join->names[i]);
+      Range all = symbol ? range_of_type(symbol->type) : range_unknown();
+      const Range *hull = &join->whole[i];
+      if ((hull->has_min && (!all.has_min || hull->min > all.min)) ||
+          (hull->has_max && (!all.has_max || hull->max < all.max))) {
+        type_checker_push_range_guard(checker, join->names[i], hull->has_min,
+                                      hull->min, hull->has_max, hull->max);
+      }
+    } else if ((join->real[i].has_min || join->real[i].has_max) &&
+               guard_grow(checker)) {
+      struct TypeCheckerGuard *guard =
+          &checker->guards[checker->guard_count++];
+      memset(guard, 0, sizeof(*guard));
+      guard->name = join->names[i];
+      guard->is_float = 1;
+      guard->has_min = join->real[i].has_min;
+      guard->has_max = join->real[i].has_max;
+      guard->float_min = join->real[i].min;
+      guard->float_max = join->real[i].max;
+      checker->guard_pushes++;
+    }
+  }
+  free(join);
 }
 
 size_t type_checker_guard_depth(const TypeChecker *checker) {
@@ -6092,6 +6500,33 @@ static const struct TypeCheckerKill *kill_that_ended(const TypeChecker *checker,
   return memory;
 }
 
+static int stored_value_hint(TypeChecker *checker, size_t at, const char *name,
+                             char *out, size_t size) {
+  const struct TypeCheckerGuard *guard = &checker->guards[at];
+  const struct TypeCheckerKill *kill;
+  if (!guard->name || !guard->stored_line || strcmp(guard->name, name) != 0) {
+    return 0;
+  }
+  kill = kill_that_ended(checker, at, name);
+  if (kill && kill->kind == KILL_NAME) {
+    snprintf(out, size,
+             "`%s` was assigned on line %zu and written again on line %zu, "
+             "which ends what the assignment proved; convert it before that "
+             "write, or test it after",
+             name, guard->stored_line, kill->line);
+    return 1;
+  }
+  if (kill && name_is_shared(checker, name)) {
+    snprintf(out, size,
+             "`%s` was assigned on line %zu, and line %zu may write it through "
+             "a call or a pointer; convert it before that line, or test it "
+             "after",
+             name, guard->stored_line, kill->line);
+    return 1;
+  }
+  return 0;
+}
+
 static int refusal_hint(TypeChecker *checker, const ASTNode *expr, char *out,
                         size_t size) {
   const char *name = first_name_in(expr);
@@ -6102,6 +6537,9 @@ static int refusal_hint(TypeChecker *checker, const ASTNode *expr, char *out,
     const struct TypeCheckerGuard *guard = &checker->guards[i - 1];
     const struct TypeCheckerKill *kill;
     size_t tested;
+    if (!guard->condition && stored_value_hint(checker, i - 1, name, out, size)) {
+      return 1;
+    }
     if (!guard->condition || !node_mentions(guard->condition, name)) {
       continue;
     }
@@ -6156,6 +6594,10 @@ void type_checker_report_refinement_failure(TypeChecker *checker,
                "own arguments; a work-item index, a subgroup lane and a load "
                "from memory each differ between work items, so nothing built "
                "from one is the same in all of them");
+    } else if (strstr(checker->refine_failure, "hides it at this conversion")) {
+      snprintf(help, sizeof(help),
+               "give the local another name, or convert the value where the "
+               "global is the name in scope");
     } else if (!refusal_hint(checker, expr, help, sizeof(help))) {
       snprintf(help, sizeof(help),
                "guard the value where it is converted, for example `if (x >= 0 "

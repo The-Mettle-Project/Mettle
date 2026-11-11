@@ -364,8 +364,56 @@ class Gen:
         v = r.choice(names)
         k = r.choice([lo, hi, lo - 1, hi + 1, (lo + hi) // 2, self.bound()])
         k = max(-2000000000, min(2000000000, k))
-        form = r.randrange(6)
-        if form == 0:
+        form = r.randrange(11)
+        if form == 9:
+            has_default = r.random() < 0.7
+            self.emit("%sswitch (%s) {" % (indent, r.choice(names)))
+            seen = set()
+            for _ in range(r.randint(1, 3)):
+                c = self.bound()
+                if c in seen:
+                    continue
+                seen.add(c)
+                extra = r.choice(["", "", "", " return;", " %s = %s + 1;" % (v, v),
+                                  " fallthrough;" if has_default else ""])
+                self.emit("%s  case %d: { %s = %d;%s }" % (indent, c, v, r.choice([lo, hi, k]), extra))
+            if has_default:
+                self.emit("%s  default: { %s = %d; }" % (indent, v, (lo + hi) // 2))
+            self.emit("%s}" % indent)
+        elif form == 10:
+            tname = r.choice(self.types)[0]
+            held = "m%d" % len(self.lines)
+            self.emit("%smatch (opt_%s(%s)) {" % (indent, tname, self.arg(names)))
+            self.emit("%s  case Some(%s): { %s = %s; }" % (indent, held, v, r.choice([str(k), held, str(lo)])))
+            self.emit("%s  case None: { %s = %d; }" % (indent, v, hi if hi < 2000000000 else lo))
+            self.emit("%s}" % indent)
+        elif form == 6:
+            a, b = (lo, hi) if r.random() < 0.8 else (lo - 1, min(hi + 1, 2000000000))
+            first = "%sif (%s < %d) { %s = %d; }" % (indent, v, lo, v, a)
+            second = "%sif (%s > %d) { %s = %d; }" % (indent, v, hi, v, b)
+            if r.random() < 0.8:
+                self.emit(first)
+            if r.random() < 0.2:
+                self.write(names, indent)
+            if r.random() < 0.8:
+                self.emit(second)
+        elif form == 7:
+            other = r.choice([lo, hi, hi + 1, (lo + hi) // 2, self.bound()])
+            other = max(-2000000000, min(2000000000, other))
+            self.emit("%sif (%s) { %s = %d; } else { %s = %d; }" % (indent, self.cond(names), v, k, v, other))
+        elif form == 8:
+            self.emit("%sif (%s) {" % (indent, self.cond(names)))
+            self.emit("%s  %s = %d;" % (indent, v, k))
+            if r.random() < 0.4:
+                self.emit("%s  %s" % (indent, r.choice(["return;", "poke(&%s);" % v if v != "g_level" else "touch();",
+                                                         "%s = %s + 1;" % (v, v)])))
+            self.emit("%s} else if (%s) {" % (indent, self.cond(names)))
+            self.emit("%s  %s = %s;" % (indent, v, r.choice([str(lo), str(hi), self.value(names)])))
+            if r.random() < 0.7:
+                self.emit("%s} else {" % indent)
+                self.emit("%s  %s = %d;" % (indent, v, (lo + hi) // 2))
+            self.emit("%s}" % indent)
+        elif form == 0:
             self.emit("%s%s = %d;" % (indent, v, k))
         elif form == 1:
             self.emit("%s%s = %s;" % (indent, v, self.value(names)))
@@ -428,6 +476,16 @@ class Gen:
             kind = r.randrange(12)
             if r.random() < 0.08:
                 self.fresh(names, indent)
+            elif r.random() < 0.03:
+                self.emit("%sdefer {" % indent)
+                if r.random() < 0.3:
+                    self.emit("%s  if (%s) {" % (indent, self.cond(names)))
+                    self.claim(names, indent + "    ")
+                    self.emit("%s  }" % indent)
+                else:
+                    self.claim(names, indent + "  ")
+                self.emit("%s}" % indent)
+                self.write(names, indent)
             elif depth < 3 and r.random() < 0.05:
                 self.shadow(names, depth, indent)
             elif depth < 2 and r.random() < 0.05:
@@ -884,7 +942,7 @@ def one(seed, compiler, extra, work, tests, modes=()):
     source = os.path.join(work, "p%d.mettle" % seed)
     exe = os.path.join(work, "p%d.exe" % seed)
     refused = 0
-    for _ in range(6):
+    for _ in range(14):
         with open(source, "w", newline="\n") as out:
             out.write("\n".join(lines) + "\n")
         if os.path.exists(exe):

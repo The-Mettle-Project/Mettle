@@ -215,9 +215,11 @@ ever taken, which includes every `extern` and every call through a function
 value.
 
 An assignment proves the range of what it stored for a statement that stands
-directly in a block. Two branches that each assign the name leave nothing
-after the `if`, and a value built by an `if` or `match` expression carries
-its type's range.
+directly in a block. An `if`, a `switch` or a `match` joins the ranges its
+branches stored for at most four names. An `else if` chain with no final
+`else` joins nothing, and neither does a `switch` or a `match` with a `break`
+inside it. A value built by an `if` or `match` expression carries its type's
+range.
 
 A rising counter keeps its lower bound only where every step is a constant
 under a loop test the compiler can read. A test against an expression, as in

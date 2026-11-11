@@ -145,6 +145,9 @@ typedef struct {
   int monotone_busy;
   int movement_unsettled;
   const struct ASTNode *block_statement;
+  const struct ASTNode *joinable;
+  void *join;
+  void *arms_join;
   void *movement_index;
   struct {
     struct ASTNode *body;
@@ -260,6 +263,17 @@ void type_checker_settle_loop_test(TypeChecker *checker,
                                    struct ASTNode *statement);
 void type_checker_note_written_value(TypeChecker *checker,
                                      struct ASTNode *statement);
+void *type_checker_join_begin(TypeChecker *checker, struct ASTNode *statement);
+void type_checker_join_arm(TypeChecker *checker, void *join,
+                           const struct ASTNode *arm);
+void type_checker_join_case(TypeChecker *checker, void *join,
+                            const struct ASTNode *body);
+void type_checker_join_capture(TypeChecker *checker,
+                               const struct ASTNode *block, int ends_here);
+void type_checker_join_end(TypeChecker *checker, void *join);
+void type_checker_join_abandon(TypeChecker *checker, void *join);
+void *type_checker_facts_suspend(TypeChecker *checker);
+void type_checker_facts_resume(TypeChecker *checker, void *kept);
 void type_checker_facts_reset(TypeChecker *checker);
 void type_checker_forget_effects_since(TypeChecker *checker, size_t count);
 void type_checker_summary_begin(TypeChecker *checker);
