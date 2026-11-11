@@ -9,6 +9,8 @@ extern "C" {
 #endif
 
 #define METTLE_SAFETY_GRANULE 16u
+#define METTLE_SAFETY_REGISTER_ARGUMENTS 16u
+#define METTLE_SAFETY_SHADOW_PARTIAL UINT64_C(1)
 
 typedef enum {
   METTLE_SAFETY_ACCESS_READ = 0,
@@ -51,6 +53,9 @@ void mettle_safety_value_store(void *slot, uint64_t value, uint64_t identity,
                                uint64_t size);
 void mettle_safety_value_copy(void *destination, const void *source, uint64_t size);
 void mettle_safety_value_clear(void *destination, uint64_t size);
+const uint64_t *mettle_safety_shadow_slot(const void *slot);
+void mettle_safety_cache_fill(uint64_t *cache, uint64_t identity, int64_t size);
+void *mettle_safety_thread(void);
 void mettle_safety_free_identity(void *pointer, uint64_t identity);
 void mettle_safety_entry_arguments(void *vector);
 void mettle_safety_region_begin(void *pointer, int64_t size);

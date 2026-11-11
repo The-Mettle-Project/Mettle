@@ -55,9 +55,8 @@ static uint32_t g_safety_region_free;
 static volatile long g_safety_lock;
 static volatile uint64_t g_safety_live_regions;
 static uint64_t g_safety_generation;
-static void safety_values_clear_locked(uintptr_t address, uint64_t size);
-static void safety_values_reown(void *pointer, uint64_t size, uint64_t old_identity);
-static void safety_values_reset_locked(void);
+static void safety_values_clear(uintptr_t address, uint64_t size);
+static void safety_values_reset(void);
 
 static void safety_internal_failure(const char *message) {
   mettle_crash_trap_ex(METTLE_CRASH_TRAP_UNKNOWN, message,
@@ -118,24 +117,30 @@ static SafetyRegion *safety_region(uint32_t id) {
   return entries ? &entries[id & (SAFETY_BLOCK_SIZE - 1)] : NULL;
 }
 
-static uint32_t safety_region_acquire(uintptr_t start, uint64_t size) {
+static void safety_region_publish(SafetyRegion *region, uint32_t id,
+                                  uintptr_t start, uint64_t size, uint32_t heap) {
+  uint64_t generation = ++g_safety_generation;
+  __atomic_store_n(&region->identity, UINT64_C(0), __ATOMIC_RELEASE);
+  region->start = start;
+  region->size = size;
+  region->granules = 0;
+  region->next_free = 0;
+  region->heap = heap;
+  region->foreign = 0;
+  __atomic_store_n(&region->identity, (generation << 24) | id, __ATOMIC_RELEASE);
+  __atomic_store_n(&region->state, (uint32_t)SAFETY_STATE_LIVE, __ATOMIC_RELEASE);
+}
+
+static uint32_t safety_region_acquire(uintptr_t start, uint64_t size,
+                                      uint32_t heap) {
   if (g_safety_generation == ((UINT64_C(1) << 40) - 1)) {
     return 0;
   }
-  uint64_t generation = ++g_safety_generation;
   uint32_t id = g_safety_region_free;
   if (id != 0) {
     SafetyRegion *reused = safety_region(id);
     g_safety_region_free = reused->next_free;
-    reused->start = start;
-    reused->size = size;
-    reused->granules = 0;
-    reused->next_free = 0;
-    reused->identity = (generation << 24) | id;
-    reused->heap = 1;
-    reused->foreign = 0;
-    __atomic_store_n(&reused->state, (uint32_t)SAFETY_STATE_LIVE,
-                     __ATOMIC_RELEASE);
+    safety_region_publish(reused, id, start, size, heap);
     return id;
   }
 
@@ -153,18 +158,25 @@ static uint32_t safety_region_acquire(uintptr_t start, uint64_t size) {
     __atomic_store_n(&g_safety_blocks[block], entries, __ATOMIC_RELEASE);
   }
   g_safety_region_next = id + 1;
-
-  SafetyRegion *fresh = safety_region(id);
-  fresh->start = start;
-  fresh->size = size;
-  fresh->granules = 0;
-  fresh->next_free = 0;
-  fresh->identity = (generation << 24) | id;
-  fresh->heap = 1;
-  fresh->foreign = 0;
-  __atomic_store_n(&fresh->state, (uint32_t)SAFETY_STATE_LIVE,
-                   __ATOMIC_RELEASE);
+  safety_region_publish(safety_region(id), id, start, size, heap);
   return id;
+}
+
+static int safety_region_read(const SafetyRegion *region, uint64_t identity,
+                              SafetyRegion *out) {
+  if (!region ||
+      __atomic_load_n(&region->identity, __ATOMIC_ACQUIRE) != identity) {
+    return 0;
+  }
+  out->state = __atomic_load_n(&region->state, __ATOMIC_ACQUIRE);
+  out->start = region->start;
+  out->size = region->size;
+  out->heap = region->heap;
+  out->foreign = region->foreign;
+  out->identity = identity;
+  out->granules = 0;
+  out->next_free = 0;
+  return __atomic_load_n(&region->identity, __ATOMIC_ACQUIRE) == identity;
 }
 
 static void safety_region_recycle(uint32_t id, SafetyRegion *region) {
@@ -250,11 +262,16 @@ static int safety_claim_granules(uintptr_t start, uint64_t size, uint32_t id) {
   uintptr_t first = start / METTLE_SAFETY_GRANULE;
   uintptr_t last = (start + size - 1) / METTLE_SAFETY_GRANULE;
 
+  uint32_t *run = NULL;
   for (uintptr_t granule = first; granule <= last; granule++) {
-    uint32_t *slot = safety_slot(granule * METTLE_SAFETY_GRANULE, 1);
-    if (!slot) {
-      return 0;
+    size_t within = (size_t)granule & (SAFETY_L3_SIZE - 1);
+    if (!run || within == 0) {
+      run = safety_slot((granule - within) * METTLE_SAFETY_GRANULE, 1);
+      if (!run) {
+        return 0;
+      }
     }
+    uint32_t *slot = &run[within];
     uint32_t current = __atomic_load_n(slot, __ATOMIC_RELAXED);
     if (current == id) {
       continue;
@@ -298,7 +315,8 @@ int64_t mettle_safety_loop_length(int64_t bound, int64_t first_bound,
   return (int64_t)(rounds * (uint64_t)byte_step + (uint64_t)access_size);
 }
 
-static void safety_register_region(void *pointer, uint64_t size, uint32_t heap) {
+static void safety_register_region(void *pointer, uint64_t size, uint32_t heap,
+                                   int keep_values) {
   if (!pointer || size == 0) {
     return;
   }
@@ -322,23 +340,33 @@ static void safety_register_region(void *pointer, uint64_t size, uint32_t heap) 
     }
   }
 
-  uint32_t id = safety_region_acquire(start, size);
+  uint32_t id = safety_region_acquire(start, size, heap);
   if (id == 0 || !safety_claim_granules(start, size, id)) {
     safety_unlock();
     safety_internal_failure("Fatal error: unable to allocate memory safety metadata");
   }
-  safety_region(id)->heap = heap;
-  safety_region(id)->foreign = 0;
   __atomic_add_fetch(&g_safety_live_regions, 1, __ATOMIC_RELAXED);
   safety_unlock();
+  if (!keep_values) {
+    safety_values_clear(start, size);
+  }
 }
 
 void mettle_safety_register(void *pointer, uint64_t size) {
-  safety_register_region(pointer, size, 1);
+  safety_register_region(pointer, size, 1, 0);
 }
 
 void mettle_safety_register_static(void *pointer, uint64_t size) {
-  safety_register_region(pointer, size, 0);
+  safety_register_region(pointer, size, 0, 0);
+}
+
+static void safety_region_retire_locked(uint32_t id, SafetyRegion *region,
+                                        uintptr_t *start, uint64_t *size) {
+  __atomic_store_n(&region->state, (uint32_t)SAFETY_STATE_DEAD, __ATOMIC_RELEASE);
+  *start = region->start;
+  *size = region->size;
+  __atomic_sub_fetch(&g_safety_live_regions, 1, __ATOMIC_RELAXED);
+  if (region->granules == 0) safety_region_recycle(id, region);
 }
 
 void mettle_safety_unregister(void *pointer) {
@@ -346,6 +374,8 @@ void mettle_safety_unregister(void *pointer) {
     return;
   }
   uintptr_t start = (uintptr_t)pointer;
+  uintptr_t retired_start = 0;
+  uint64_t retired_size = 0;
 
   safety_lock();
   uint32_t id = safety_lookup(start);
@@ -354,48 +384,41 @@ void mettle_safety_unregister(void *pointer) {
     if (region && region->start == start &&
         __atomic_load_n(&region->state, __ATOMIC_RELAXED) ==
             (uint32_t)SAFETY_STATE_LIVE) {
-      __atomic_store_n(&region->state, (uint32_t)SAFETY_STATE_DEAD,
-                       __ATOMIC_RELEASE);
-      safety_values_clear_locked(region->start, region->size);
-      __atomic_sub_fetch(&g_safety_live_regions, 1, __ATOMIC_RELAXED);
-      if (region->granules == 0) safety_region_recycle(id, region);
+      safety_region_retire_locked(id, region, &retired_start, &retired_size);
     }
   }
   safety_unlock();
+  safety_values_clear(retired_start, retired_size);
 }
 
 static void safety_retire_identity(uint64_t identity) {
   if (!identity) {
     return;
   }
+  uintptr_t retired_start = 0;
+  uint64_t retired_size = 0;
   safety_lock();
   uint32_t id = (uint32_t)(identity & 0xffffffu);
   SafetyRegion *region = safety_region(id);
   if (region && region->identity == identity &&
       __atomic_load_n(&region->state, __ATOMIC_RELAXED) ==
           (uint32_t)SAFETY_STATE_LIVE) {
-    __atomic_store_n(&region->state, (uint32_t)SAFETY_STATE_DEAD,
-                     __ATOMIC_RELEASE);
-    safety_values_clear_locked(region->start, region->size);
-    __atomic_sub_fetch(&g_safety_live_regions, 1, __ATOMIC_RELAXED);
-    if (region->granules == 0) safety_region_recycle(id, region);
+    safety_region_retire_locked(id, region, &retired_start, &retired_size);
   }
   safety_unlock();
+  safety_values_clear(retired_start, retired_size);
 }
 
 static uint64_t safety_identity_span(const void *pointer, uint64_t identity) {
-  uint64_t span = 0;
-  safety_lock();
-  const SafetyRegion *region = safety_region((uint32_t)(identity & 0xffffffu));
-  if (region && region->identity == identity &&
-      __atomic_load_n(&region->state, __ATOMIC_RELAXED) ==
-          (uint32_t)SAFETY_STATE_LIVE &&
-      (uintptr_t)pointer >= region->start &&
-      (uintptr_t)pointer - region->start < region->size) {
-    span = region->size - ((uintptr_t)pointer - region->start);
+  SafetyRegion region;
+  if (!safety_region_read(safety_region((uint32_t)(identity & 0xffffffu)),
+                          identity, &region) ||
+      region.state != SAFETY_STATE_LIVE ||
+      (uintptr_t)pointer < region.start ||
+      (uintptr_t)pointer - region.start >= region.size) {
+    return 0;
   }
-  safety_unlock();
-  return span;
+  return region.size - ((uintptr_t)pointer - region.start);
 }
 
 /* A realloc that moves has already handed the old block back, so another thread
@@ -407,9 +430,12 @@ void mettle_safety_reregister_held(void *old_pointer, void *new_pointer,
     return;
   }
   uint64_t old_size = old_identity ? safety_identity_span(old_pointer, old_identity) : 0;
-  mettle_safety_register(new_pointer, size);
-  if (old_pointer == new_pointer && new_pointer) {
-    safety_values_reown(new_pointer, size, old_identity);
+  int in_place = old_pointer == new_pointer && new_pointer;
+  safety_register_region(new_pointer, size, 1, in_place);
+  if (in_place) {
+    if (old_size > size) {
+      safety_values_clear((uintptr_t)new_pointer + (uintptr_t)size, old_size - size);
+    }
   } else if (old_pointer && new_pointer && old_size > 0) {
     uint64_t copy_size = old_size < size ? old_size : size;
     mettle_safety_value_copy(new_pointer, old_pointer, copy_size);
@@ -425,57 +451,94 @@ void mettle_safety_reregister(void *old_pointer, void *new_pointer,
                                 mettle_safety_identity(old_pointer));
 }
 
-#if defined(_WIN32)
-static DWORD g_safety_allocator_slot = FLS_OUT_OF_INDEXES;
+struct SafetyCall;
+struct SafetyPacket;
 
-static DWORD safety_allocator_slot(void) {
-  DWORD slot = __atomic_load_n(&g_safety_allocator_slot, __ATOMIC_ACQUIRE);
-  if (slot != FLS_OUT_OF_INDEXES) {
-    return slot;
-  }
+typedef struct {
+  void *callee;
+  uint64_t result;
+  uint64_t arguments[METTLE_SAFETY_REGISTER_ARGUMENTS];
+  uintptr_t allocator_depth;
+  struct SafetyCall *current;
+  struct SafetyCall *spare;
+  struct SafetyPacket *spare_packets;
+} SafetyThread;
+
+#if defined(_WIN32)
+static void safety_thread_release(SafetyThread *thread);
+
+#define SAFETY_TEB_TLS_SLOTS 0x1480
+#define SAFETY_TEB_TLS_COUNT 64u
+
+static DWORD g_safety_thread_slot = TLS_OUT_OF_INDEXES;
+static DWORD g_safety_thread_exit = FLS_OUT_OF_INDEXES;
+
+static void NTAPI safety_thread_destroy(void *value) {
+  SafetyThread *thread = (SafetyThread *)value;
+  if (!thread) return;
+  TlsSetValue(g_safety_thread_slot, NULL);
+  safety_thread_release(thread);
+  safety_unmap(thread, sizeof(*thread));
+}
+
+SAFETY_COLD static SafetyThread *safety_thread_create(void) {
+  DWORD last_error = GetLastError();
   safety_lock();
-  slot = g_safety_allocator_slot;
-  if (slot == FLS_OUT_OF_INDEXES) {
-    slot = FlsAlloc(NULL);
-    __atomic_store_n(&g_safety_allocator_slot, slot, __ATOMIC_RELEASE);
+  if (g_safety_thread_slot == TLS_OUT_OF_INDEXES) {
+    g_safety_thread_exit = FlsAlloc(safety_thread_destroy);
+    __atomic_store_n(&g_safety_thread_slot, TlsAlloc(), __ATOMIC_RELEASE);
   }
+  DWORD slot = g_safety_thread_slot;
+  DWORD exit_slot = g_safety_thread_exit;
   safety_unlock();
-  if (slot == FLS_OUT_OF_INDEXES) {
+  if (slot == TLS_OUT_OF_INDEXES || exit_slot == FLS_OUT_OF_INDEXES) {
     safety_internal_failure("Fatal error: unable to create memory safety thread state");
   }
-  return slot;
-}
-
-static uintptr_t safety_allocator_depth(void) {
-  DWORD slot = __atomic_load_n(&g_safety_allocator_slot, __ATOMIC_ACQUIRE);
-  return slot == FLS_OUT_OF_INDEXES ? 0 : (uintptr_t)FlsGetValue(slot);
-}
-
-static void safety_set_allocator_depth(uintptr_t depth) {
-  if (!FlsSetValue(safety_allocator_slot(), (void *)depth)) {
-    safety_internal_failure("Fatal error: unable to save memory safety thread state");
+  SafetyThread *thread = (SafetyThread *)TlsGetValue(slot);
+  if (!thread) {
+    thread = (SafetyThread *)safety_map(sizeof(*thread));
+    if (!thread || !TlsSetValue(slot, thread) || !FlsSetValue(exit_slot, thread)) {
+      safety_internal_failure("Fatal error: unable to allocate memory safety thread state");
+    }
   }
+  SetLastError(last_error);
+  return thread;
+}
+
+static SafetyThread *safety_thread(void) {
+#if defined(_WIN64)
+  DWORD slot = __atomic_load_n(&g_safety_thread_slot, __ATOMIC_ACQUIRE);
+  if (slot < SAFETY_TEB_TLS_COUNT) {
+    SafetyThread *thread =
+        ((SafetyThread **)((char *)NtCurrentTeb() + SAFETY_TEB_TLS_SLOTS))[slot];
+    if (thread) return thread;
+  }
+#endif
+  return safety_thread_create();
 }
 #else
-static __thread uintptr_t g_safety_allocator_depth;
-static uintptr_t safety_allocator_depth(void) { return g_safety_allocator_depth; }
-static void safety_set_allocator_depth(uintptr_t depth) {
-  g_safety_allocator_depth = depth;
-}
+static __thread SafetyThread g_safety_thread;
+static SafetyThread *safety_thread(void) { return &g_safety_thread; }
 #endif
 
+void *mettle_safety_thread(void) { return safety_thread(); }
+
+static uintptr_t safety_allocator_depth(void) {
+  return safety_thread()->allocator_depth;
+}
+
 void mettle_safety_enter_allocator(void) {
-  uintptr_t depth = safety_allocator_depth();
-  if (depth == UINTPTR_MAX) {
+  SafetyThread *thread = safety_thread();
+  if (thread->allocator_depth == UINTPTR_MAX) {
     safety_internal_failure("Fatal error: memory safety allocator nesting overflow");
   }
-  safety_set_allocator_depth(depth + 1);
+  thread->allocator_depth++;
 }
 
 void mettle_safety_leave_allocator(void) {
-  uintptr_t depth = safety_allocator_depth();
-  if (depth > 0) {
-    safety_set_allocator_depth(depth - 1);
+  SafetyThread *thread = safety_thread();
+  if (thread->allocator_depth > 0) {
+    thread->allocator_depth--;
   }
 }
 
@@ -552,7 +615,27 @@ static void safety_report_and_trap(const SafetyFailure *failure,
                        program_counter, frame_pointer, 0, 0);
 }
 
+static int safety_snapshot_live(uintptr_t address, SafetyRegion *out) {
+  uint32_t *slot = safety_slot(address, 0);
+  uint32_t id = slot ? __atomic_load_n(slot, __ATOMIC_RELAXED) : SAFETY_ID_UNOWNED;
+  if (id < SAFETY_ID_FIRST) {
+    return 0;
+  }
+  const SafetyRegion *region = safety_region(id);
+  if (!region) {
+    return 0;
+  }
+  uint64_t identity = __atomic_load_n(&region->identity, __ATOMIC_ACQUIRE);
+  return identity != 0 && safety_region_read(region, identity, out) &&
+         out->state == SAFETY_STATE_LIVE && address >= out->start &&
+         address - out->start < out->size;
+}
+
 static SafetyRegion safety_snapshot(uintptr_t address) {
+  SafetyRegion live;
+  if (safety_snapshot_live(address, &live)) {
+    return live;
+  }
   SafetyRegion snapshot = {0};
   safety_lock();
   uint32_t id = safety_lookup(address);
@@ -724,9 +807,9 @@ void mettle_safety_reset(void) {
   }
   g_safety_region_next = SAFETY_ID_FIRST;
   g_safety_region_free = 0;
-  safety_values_reset_locked();
   __atomic_store_n(&g_safety_live_regions, 0, __ATOMIC_RELAXED);
   safety_unlock();
+  safety_values_reset();
 }
 
 #define SAFETY_TASK_STACK_SPAN (8u * 1024u * 1024u)
