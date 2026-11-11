@@ -439,7 +439,10 @@ class Gen:
     def shadow(self, names, depth, indent):
         v = self.r.choice(["x", "y", "g_level", "CEIL"])
         self.emit("%s{" % indent)
-        self.emit("%s  var %s: int32 = %s;" % (indent, v, self.value(names)))
+        held = self.signs
+        self.signs = False
+        self.emit("%s  var %s: int32 = %s;" % (indent, v, self.value([n for n in names if n != v])))
+        self.signs = held
         self.block(names, depth + 1, indent + "  ")
         self.emit("%s}" % indent)
 
@@ -716,7 +719,7 @@ fn loose_unit(x: float64) -> float64 {
         self.emit("%s{" % indent)
         self.emit(indent + "  " + r.choice([
             "var buf: int32[] = other;", "var i: int64 = %d;" % r.choice([-1, 0, 1, 3]),
-            "var x: float64 = %s;" % r.choice(["2.5", "0.5", "x + 1.0"]),
+            "var x: float64 = %s;" % r.choice(["2.5", "0.5", "1.5"]),
             "var p: Node* = q;", "var q: Node* = 0;",
             "var s: Span = { lo: 9, hi: 1 };",
         ]))

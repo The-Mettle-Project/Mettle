@@ -3990,6 +3990,66 @@ static int ir_binary_keeps_address_width(const ASTNode *expression) {
                 strcmp(op, "*") == 0 || strcmp(op, "<<") == 0);
 }
 
+static int ir_widen_for_refinement(IRLoweringContext *context,
+                                   IRFunction *function, ASTNode *expression,
+                                   const IROperand *value,
+                                   IROperand *widened) {
+  const Type *held = expression->resolved_type;
+  const Type *base = expression->proven_refinement;
+  IRInstruction cast = {0};
+  *widened = ir_operand_none();
+  while (held && held->refined_base) {
+    held = held->refined_base;
+  }
+  while (base && base->refined_base) {
+    base = base->refined_base;
+  }
+  if (!held || !base || !base->name || value->kind == IR_OPERAND_INT ||
+      held->kind == TYPE_ENUM || base->kind == TYPE_ENUM ||
+      !type_checker_is_integer_type((Type *)held) ||
+      !type_checker_is_integer_type((Type *)base) ||
+      held->kind == base->kind) {
+    return 1;
+  }
+  if (!ir_make_temp_operand(context, widened)) {
+    return 0;
+  }
+  cast.op = IR_OP_CAST;
+  cast.location = expression->location;
+  cast.dest = *widened;
+  cast.lhs = *value;
+  cast.text = (char *)ir_backend_type_name(base->name);
+  cast.value_type = mtlc_type_from_frontend((Type *)base);
+  cast.is_unsigned = ir_type_is_unsigned_integer((Type *)held);
+  return ir_emit(context, function, &cast);
+}
+
+static int ir_emit_proven_check(IRLoweringContext *context,
+                                IRFunction *function, ASTNode *expression,
+                                const IROperand *value) {
+  IROperand widened = ir_operand_none();
+  const IROperand *checked = value;
+  int ok = 1;
+  if (!ir_widen_for_refinement(context, function, expression, value,
+                               &widened)) {
+    return 0;
+  }
+  if (widened.kind != IR_OPERAND_NONE) {
+    checked = &widened;
+  }
+  if (expression->proven_predicate) {
+    ok = ir_emit_refinement_predicate(context, function, expression->location,
+                                      checked, expression->proven_refinement,
+                                      expression->proven_predicate,
+                                      expression->proven_binding);
+  } else if (expression->proven_refinement->refine_has_range) {
+    ok = ir_emit_refinement_check(context, function, expression->location,
+                                  checked, expression->proven_refinement);
+  }
+  ir_operand_destroy(&widened);
+  return ok;
+}
+
 int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
                         ASTNode *expression, IROperand *out_value) {
   int saved_depth = context ? context->address_width_depth : 0;
@@ -4015,20 +4075,7 @@ int ir_lower_expression(IRLoweringContext *context, IRFunction *function,
   }
   if (context && context->emit_refinement_checks && expression &&
       expression->proven_refinement) {
-    if (expression->proven_predicate) {
-      if (!ir_emit_refinement_predicate(context, function,
-                                        expression->location, out_value,
-                                        expression->proven_refinement,
-                                        expression->proven_predicate,
-                                        expression->proven_binding)) {
-        return 0;
-      }
-    } else if (expression->proven_refinement->refine_has_range &&
-               !ir_emit_refinement_check(context, function,
-                                         expression->location, out_value,
-                                         expression->proven_refinement)) {
-      return 0;
-    }
+    return ir_emit_proven_check(context, function, expression, out_value);
   }
   return 1;
 }

@@ -1,0 +1,31 @@
+import "std/io";
+
+type FromMinusOne = int32 where value >= -1;
+type Wide = int64 where value >= -5 && value <= 300;
+type UpTo200 = int32 where value <= 200;
+type Signed = int64 where value >= -200 && value <= 200;
+type Byte = uint8 where value >= 0 && value <= 255;
+type LowByte = uint8 where value <= 100;
+
+fn lower(p0: uint8) -> uint8 { return p0 - 3; }
+
+fn main() -> int32 {
+  var a: FromMinusOne = lower(7);
+  var byte: uint8 = 200;
+  var b: FromMinusOne = byte;
+  var c: Wide = byte;
+  var word: uint32 = 250;
+  var d: Wide = word;
+  var small: int8 = 100;
+  var e: UpTo200 = small;
+  var low: int8 = -100;
+  var f: Signed = low;
+  var short: int16 = -150;
+  var g: Signed = short;
+  var below: int32 = -495;
+  var h: Byte = (Byte)below;
+  var big: int64 = 4294967346;
+  var i: LowByte = (LowByte)(big & 63);
+  println("{a} {b} {c} {d} {e} {f} {g} {h} {i}");
+  return 0;
+}
