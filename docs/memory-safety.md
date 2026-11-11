@@ -130,6 +130,9 @@ byte metadata through a separate call frame. Return metadata is saved before
 stack records are retired. Static pointer initializers and string literals
 receive metadata too.
 
+A floating value carries no identity. Loading one reads no metadata, and
+storing one leaves the identity of the bytes it overwrites in place.
+
 Known allocator calls register new regions and retire freed regions. Taking a
 known allocator's address selects a checked wrapper with the same signature.
 The checks reject double free, interior free and free of stack or global memory.
@@ -145,8 +148,10 @@ check reports the access and exits with status 1.
 
 ### What survives, and what it costs
 
-A check that cannot fail is deleted. What is left is resolved into one of
-three shapes, cheapest first.
+A check that cannot fail is deleted. So is a check on bytes that an earlier
+check in the same straight run of code already validated for the same origin,
+when nothing between the two can free memory. What is left is resolved into
+one of four shapes, cheapest first.
 
 - A comparison against an extent the program already states.
 - One check in front of a loop, covering the whole range the loop walks.
@@ -159,6 +164,15 @@ three shapes, cheapest first.
   back empty when the origin names nothing live, and that case is sent to
   the full check: reading it as a limit would let every access in the loop
   through, which is where an escape costs the most.
+- One record in front of a loop that reloads its pointer on every pass and
+  frees nothing. The record holds an identity, the start of its allocation
+  and the last offset an access of that size may take. Each access compares
+  the pointer's identity and address against the record. A mismatch runs the
+  full check and refills the record.
+
+A pointer loaded from a fixed address inside a loop reads its identity
+straight from the metadata word for that address, which is found once in
+front of the loop.
 
 Everything else asks the runtime which allocation the pointer came from.
 `--explain` reports the split for a build, and names the reason each
@@ -202,7 +216,7 @@ These checks do not yet establish complete memory safety for every program.
 
 | Case | Current limit |
 |------|---------------|
-| Concurrent access and free | Locks protect the registry and byte metadata. They do not hold the allocation live between the check and the machine access. The program must synchronize its accesses and lifetimes. |
+| Concurrent access and free | Registry writes take a lock. Reads take none and retry on a record that changed under them. Nothing holds the allocation live between the check and the machine access. The program must synchronize its accesses and lifetimes. |
 | Concurrent value and metadata writes | The machine store and its metadata update are separate operations. Data races can make them disagree. |
 | Foreign code, assembly and callbacks | Their accesses and lifetime changes need a trusted contract. A function entered from unchecked code, a thread entry point for one, resolves each pointer argument by address: one inside a live tracked allocation gets that allocation's identity, and any other has none. |
 | Foreign pointer reconstruction | C can transform or copy a pointer without supplying its origin. A later checked dereference rejects the unknown result. |

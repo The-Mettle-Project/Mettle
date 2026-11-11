@@ -495,6 +495,12 @@ static void safety_plain_count_reads(SafetyPlainCount *table, size_t mask,
   }
 }
 
+static int safety_name_is_origin_scaffold(const char *name) {
+  return name && (strncmp(name, ".safe", 5) == 0 ||
+                  strstr(name, "_local_.safe_identity_") != NULL ||
+                  strstr(name, "_tmp_.safe_origin_") != NULL);
+}
+
 static int safety_plain_drop_dead_origins(IRFunction *fn) {
   size_t size = 16;
   while (size < (fn->instruction_count + 1) * 8) size *= 2;
@@ -516,7 +522,7 @@ static int safety_plain_drop_dead_origins(IRFunction *fn) {
     for (size_t i = 0; i < fn->instruction_count; i++) {
       IRInstruction *in = &fn->instructions[i];
       SafetyPlainCount *slot;
-      if (!in->dest.name || strncmp(in->dest.name, ".safe", 5)) continue;
+      if (!safety_name_is_origin_scaffold(in->dest.name)) continue;
       if (in->op != IR_OP_ASSIGN && in->op != IR_OP_DECLARE_LOCAL &&
           !safety_plain_read_intrinsic(in)) continue;
       slot = safety_plain_count_slot(table, mask, &in->dest);

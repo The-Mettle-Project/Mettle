@@ -6561,6 +6561,7 @@ static void mir_call_mark_preserved(MirFunction *fn, const IRInstruction *in,
                                     MirOpcode call_op) {
   MirInst *call = &fn->insns[fn->insn_count - 1];
 
+  call->cold_path = in->cold_path;
   if (call_op != MIR_CALL || !in->text) {
     return;
   }

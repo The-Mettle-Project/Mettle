@@ -33,6 +33,17 @@ static int origin_callee_is_naked(const SafetyOrigins *origins, const char *name
   return 0;
 }
 
+static int origin_access_is_floating(const IRInstruction *in) {
+  return in->is_float || in->alias_class == IR_ALIAS_CLASS_F32 ||
+         in->alias_class == IR_ALIAS_CLASS_F64 ||
+         in->alias_class == IR_ALIAS_CLASS_F16 ||
+         in->alias_class == IR_ALIAS_CLASS_BF16;
+}
+
+static int origin_operand_is_nothing(const IROperand *identity) {
+  return identity->kind == IR_OPERAND_INT && identity->int_value == 0;
+}
+
 static IROperand origin_fresh(void) {
   char name[64];
   snprintf(name, sizeof(name), ".safe_origin_%u", g_safety_next_id++);
@@ -164,7 +175,7 @@ static int origin_add(SafetyOrigins *origins, const IROperand *value) {
   if (value->kind == IR_OPERAND_SYMBOL) {
     MtlcType *type = origin_symbol_type(origins, value->name);
     origin->type = type;
-    if (type && type->size > 0 && type->size <= 8 &&
+    if (type && type->size > 0 && type->size <= 8 && !mtlc_type_is_float(type) &&
         type->kind != MTLC_TYPE_ARRAY && type->kind != MTLC_TYPE_STRUCT &&
         type->kind != MTLC_TYPE_STRING && type->kind != MTLC_TYPE_TAGGED_ENUM) {
       origin->memory_size = type->size;
@@ -340,7 +351,8 @@ static int origin_return(SafetyOrigins *origins, SourceLocation location,
   } else {
     if (!origin_get(origins, location, value, &metadata)) return 0;
     IROperand args[2] = {*entry, metadata};
-    ok = origin_call(origins, location, "mettle_safety_call_return", args, 2, NULL);
+    ok = origin_operand_is_nothing(&metadata) ||
+         origin_call(origins, location, "mettle_safety_call_return", args, 2, NULL);
   }
   ir_operand_destroy(&metadata);
   return ok;
@@ -505,7 +517,8 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
       IROperand token = ir_operand_none();
       if (!origin_get(origins, location, &in->arguments[a], &token)) goto done;
       IROperand arg[3] = {frame, ir_operand_int((long long)slot_index), token};
-      int passed = origin_call(origins, location, "mettle_safety_call_arg", arg, 3, NULL);
+      int passed = origin_operand_is_nothing(&token) ||
+          origin_call(origins, location, "mettle_safety_call_arg", arg, 3, NULL);
       ir_operand_destroy(&token);
       if (!passed) goto done;
     }
@@ -553,6 +566,7 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
 
   IROpcode op = in->op;
   int is_float = in->is_float;
+  int floating_access = origin_access_is_floating(in);
   int fresh_string = origin_makes_runtime_string(origins, in);
   int c_string_result = origin_returns_c_string(origins, in);
   int os_mapping = call && in->text && in->argument_count == 1 &&
@@ -656,8 +670,11 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
       IROperand args[2] = {dest, ir_operand_int((long long)ir_operand_string_length(&lhs) + 1)};
       if (!origin_call(origins, location, "mettle_safety_literal_identity", args, 2,
                        &output->identity)) goto done;
+    } else if (floating_access) {
+      IROperand zero = ir_operand_int(0);
+      if (!origin_assign(origins, location, &output->identity, &zero)) goto done;
     } else {
-      IROperand args[3] = {lhs, is_float ? ir_operand_int(0) : dest, rhs};
+      IROperand args[3] = {lhs, dest, rhs};
       if (!origin_call(origins, location, "mettle_safety_value_load", args, 3,
                        &output->identity)) goto done;
     }
@@ -666,9 +683,9 @@ static int origin_instruction(SafetyOrigins *origins, IRInstruction *in,
     IROperand zero = ir_operand_int(0);
     if (!origin_assign(origins, location, &output->identity, &zero)) goto done;
   }
-  if (op == IR_OP_STORE && rhs.kind == IR_OPERAND_INT && rhs.int_value <= 8) {
-    IROperand zero = ir_operand_int(0);
-    IROperand args[4] = {dest, is_float ? zero : lhs, left, rhs};
+  if (op == IR_OP_STORE && rhs.kind == IR_OPERAND_INT && rhs.int_value <= 8 &&
+      !floating_access) {
+    IROperand args[4] = {dest, lhs, left, rhs};
     if (!origin_call(origins, location, "mettle_safety_value_store", args, 4, NULL)) goto done;
   }
   if (aggregate_size && op == IR_OP_ASSIGN &&
@@ -863,7 +880,8 @@ static int safety_origins_function(IRProgram *program, IRFunction *function) {
     IROperand parameter = ir_operand_symbol(function->parameter_names[p]);
     SafetyOrigin *origin = origin_find(&origins, &parameter);
     MtlcType *type = origin_symbol_type(&origins, parameter.name);
-    if (origin && type && type->size > 0 && type->size <= 8) origin->active = 1;
+    if (origin && type && type->size > 0 && type->size <= 8 &&
+        !mtlc_type_is_float(type)) origin->active = 1;
     ir_operand_destroy(&parameter);
   }
   for (size_t i = 0; i < origins.count; i++)
@@ -884,6 +902,8 @@ static int safety_origins_function(IRProgram *program, IRFunction *function) {
       const IRInstruction *in = &function->instructions[i];
       SafetyOrigin *dest = origin_find(&origins, &in->dest);
       if (!dest || dest->active || in->op == IR_OP_STORE) continue;
+      if (origin_access_is_floating(in) ||
+          (dest->type && mtlc_type_is_float(dest->type))) continue;
       SafetyOrigin *left = origin_find(&origins, &in->lhs);
       SafetyOrigin *right = origin_find(&origins, &in->rhs);
       int root = in->op == IR_OP_ADDRESS_OF || in->op == IR_OP_NEW ||
@@ -893,7 +913,7 @@ static int safety_origins_function(IRProgram *program, IRFunction *function) {
       if (in->op == IR_OP_CALL || in->op == IR_OP_CALL_INDIRECT) {
         const IRModuleSymbol *callee = in->text ? ir_program_lookup_symbol(program, in->text) : NULL;
         const MtlcType *type = callee ? callee->return_type : in->value_type;
-        root = !type || (type->size > 0 && type->size <= 8);
+        root = !type || (type->size > 0 && type->size <= 8 && !mtlc_type_is_float(type));
       }
       int copy = in->op == IR_OP_ASSIGN || in->op == IR_OP_CAST || in->op == IR_OP_UNARY ||
           (in->op == IR_OP_BINARY && in->text && strcmp(in->text, "==") &&

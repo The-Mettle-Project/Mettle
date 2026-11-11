@@ -753,7 +753,8 @@ int ir_instruction_is_safety_scaffolding(const IRInstruction *instruction) {
       strncmp(instruction->text, "mettle_safety_", 14) == 0) {
     return 1;
   }
-  return ir_operand_is_temp(&instruction->dest) &&
+  return (ir_operand_is_temp(&instruction->dest) ||
+          ir_operand_is_symbol(&instruction->dest)) &&
          strncmp(instruction->dest.name, IR_SAFETY_TEMP_PREFIX,
                  sizeof(IR_SAFETY_TEMP_PREFIX) - 1) == 0;
 }

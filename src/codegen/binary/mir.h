@@ -198,6 +198,7 @@ typedef struct {
   int is_unsigned;
   unsigned char cc;
   unsigned char hot_fall;
+  unsigned char cold_path;
   int ir_index;
   const void *aux;
   int preserves_rax;

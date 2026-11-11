@@ -25,6 +25,8 @@ IRSafetyIntrinsic ir_safety_intrinsic(const IRInstruction *instruction);
 
 int ir_safety_analyze_origins(IRProgram *program);
 
+int ir_safety_elide_inlined_frames(IRProgram *program);
+
 int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats);
 
 int ir_safety_register_allocations(IRProgram *program);

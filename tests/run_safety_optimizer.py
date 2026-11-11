@@ -121,14 +121,17 @@ def main():
         if not dumps:
             failures.append("crc32 --dump-ir wrote no sidecar")
         else:
-            body = re.search(r"(?ms)^function crc32 \{.*?^\}", dumps[0].read_text())
+            text = dumps[0].read_text()
+            body = (re.search(r"(?ms)^function crc32 \{.*?^\}", text) or
+                    re.search(r"(?ms)^function main \{.*?^\}", text))
             if not body:
-                failures.append("the crc32 IR has no 'crc32'")
+                failures.append("the crc32 IR has neither 'crc32' nor 'main'")
             else:
-                asked = [name for name in ("mettle_safety_value_load",
-                                           "mettle_safety_value_store",
-                                           "mettle_safety_merge_identity")
-                         if name in body.group(0)]
+                asked = sorted(set(re.findall(
+                    r"mettle_safety_value_(?:load|store)(?=\([^)\n]*, 1\))|"
+                    r"mettle_safety_merge_identity", body.group(0))))
+                if "mettle_safety_loop_length" not in body.group(0):
+                    failures.append("the crc32 kernel lost its whole-loop check")
                 if asked:
                     failures.append("crc32 asks the runtime for an origin per byte again: " +
                                     ", ".join(asked))

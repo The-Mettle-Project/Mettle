@@ -7901,6 +7901,8 @@ static int compile_stage_comptime(CompileContext *ctx) {
                               ctx->source);
 }
 
+static int compile_sweep_dead_functions(CompileContext *ctx);
+
 static int compile_stage_safety(CompileContext *ctx) {
   IRSafetyStats safety_stats = {0};
   if (ctx->options->native_heap &&
@@ -7910,6 +7912,9 @@ static int compile_stage_safety(CompileContext *ctx) {
   }
   if (!ctx->emit_safety_checks) {
     return COMPILE_CONTINUE;
+  }
+  if (ctx->options->optimize && !compile_sweep_dead_functions(ctx)) {
+    return 1;
   }
   if (!ir_safety_register_allocations(ctx->ir_program)) {
     fprintf(stderr, "Error: Failed to instrument allocations for --safe\n");
@@ -8133,7 +8138,8 @@ static int compile_sweep_dead_functions(CompileContext *ctx) {
 
 static int compile_stage_optimize(CompileContext *ctx) {
   size_t i = 0;
-  if (!compile_sweep_dead_functions(ctx)) {
+  if (!ctx->ir_program->dead_functions_eliminated &&
+      !compile_sweep_dead_functions(ctx)) {
     return 1;
   }
   if (ctx->options->optimize) {

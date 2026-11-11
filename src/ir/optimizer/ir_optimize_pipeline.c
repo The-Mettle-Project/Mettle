@@ -1,6 +1,7 @@
 #include "ir_optimize_internal.h"
 #include "../ir_verify.h"
 #include "../ir_explain_ownership.h"
+#include "../ir_safety.h"
 
 typedef struct {
   IROptPassId id;
@@ -916,6 +917,9 @@ static int ir_safety_analysis_function(IRFunction *function) {
       {"safety_copy_constants", ir_copy_and_constant_propagation_pass, {0, 0}},
       {"safety_coalesce", ir_coalesce_single_use_temp_assign_pass, {0, 0}},
       {"safety_branches", ir_constant_and_branch_simplify_pass, {0, 0}},
+      {"safety_unreachable", ir_eliminate_unreachable_straightline_pass, {0, 0}},
+      {"safety_redundant_jumps", ir_remove_redundant_jumps_pass, {0, 0}},
+      {"safety_unused_labels", ir_remove_unused_labels_pass, {0, 0}},
       {"safety_dead_temps", ir_eliminate_dead_temp_writes_pass, {0, 0}},
   };
   if (function->is_rule) {
@@ -938,6 +942,7 @@ int ir_optimize_safety_analysis(IRProgram *program, int preserve_boundaries) {
     int changed = 0;
     ok = ir_inline_small_functions_pass(program, &changed);
   }
+  if (ok) ok = ir_safety_elide_inlined_frames(program);
   if (ok) ok = ir_run_program_stage_for_each_function(program,
                                                       ir_safety_analysis_function);
   ir_verify_end_program();

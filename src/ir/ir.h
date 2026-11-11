@@ -213,6 +213,7 @@ typedef struct {
   int is_volatile;
   int allocates;
   unsigned char asm_operands;
+  unsigned char cold_path;
   unsigned char uniform_condition;
   unsigned char gpu_launch_indirect;
   void *ast_ref;

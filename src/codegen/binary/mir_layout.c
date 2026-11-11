@@ -53,7 +53,7 @@ static void mir_layout_classify_blocks(MirLayout *l) {
   for (size_t b = 0; b < cfg->block_count; b++) {
     for (int i = cfg->blocks[b].start; i < cfg->blocks[b].end; i++) {
       const MirInst *in = &cfg->fn->insns[i];
-      if (in->op == MIR_TRAP) {
+      if (in->op == MIR_TRAP || in->cold_path) {
         l->cold[b] = 1;
       }
       if (in->op == MIR_LABEL && in->dst.sym &&

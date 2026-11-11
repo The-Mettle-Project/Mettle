@@ -194,6 +194,11 @@ static int safety_emit_call(IRInstructionVector *out, SourceLocation location,
   return 1;
 }
 
+static int safety_mark_cold(IRInstructionVector *out) {
+  out->items[out->count - 1].cold_path = 1;
+  return 1;
+}
+
 typedef struct {
   size_t header_index;
   IRWhileLoopBounds bounds;
@@ -1936,13 +1941,13 @@ static int safety_emit_span_check(IRInstructionVector *out,
   char total[64];
   char bad[64];
   char short_span[64];
-  char both[64];
+  char slow_label[64];
   char ok_label[64];
   snprintf(limit, sizeof(limit), SAFETY_TEMP_PREFIX "sl%u", id);
   snprintf(total, sizeof(total), SAFETY_TEMP_PREFIX "st%u", id);
   snprintf(bad, sizeof(bad), SAFETY_TEMP_PREFIX "sb%u", id);
   snprintf(short_span, sizeof(short_span), SAFETY_TEMP_PREFIX "ss%u", id);
-  snprintf(both, sizeof(both), SAFETY_TEMP_PREFIX "sx%u", id);
+  snprintf(slow_label, sizeof(slow_label), "ir_safe_out_%u", id);
   snprintf(ok_label, sizeof(ok_label), "ir_safe_in_%u", id);
 
   IROperand span_operand = ir_operand_temp(span_temp);
@@ -1974,32 +1979,26 @@ static int safety_emit_span_check(IRInstructionVector *out,
     measured = &total_operand;
   }
 
-  if (!safety_emit_binary(out, access->location, ">", bad, measured,
-                          &limit_operand, 1)) {
-    goto done;
+  IROperand zero = ir_operand_int(0);
+  int settled = 0;
+  if (!access->identity) {
+    settled = safety_emit_binary(out, access->location, ">", bad, measured,
+                                 &limit_operand, 1) &&
+              safety_emit_branch_zero(out, access->location, bad, ok_label);
+  } else if (measured->kind == IR_OPERAND_INT && measured->int_value >= 0) {
+    settled = safety_emit_binary(out, access->location, "<", short_span,
+                                 &limit_operand, measured, 0) &&
+              safety_emit_branch_zero(out, access->location, short_span, ok_label);
+  } else {
+    settled = safety_emit_binary(out, access->location, "<=", bad, measured,
+                                 &limit_operand, 1) &&
+              safety_emit_branch_zero(out, access->location, bad, slow_label) &&
+              safety_emit_binary(out, access->location, "<", short_span,
+                                 &limit_operand, &zero, 0) &&
+              safety_emit_branch_zero(out, access->location, short_span, ok_label) &&
+              safety_emit_label(out, access->location, slow_label);
   }
-
-  const char *condition = bad;
-  if (access->identity) {
-    IROperand bad_operand = ir_operand_temp(bad);
-    IROperand short_operand = ir_operand_temp(short_span);
-    IROperand zero = ir_operand_int(0);
-    int guarded = bad_operand.name && short_operand.name &&
-        safety_emit_binary(out, access->location, "<", short_span,
-                           &limit_operand, &zero, 0) &&
-        safety_emit_binary(out, access->location, "|", both, &bad_operand,
-                           &short_operand, 0);
-    ir_operand_destroy(&bad_operand);
-    ir_operand_destroy(&short_operand);
-    if (!guarded) {
-      goto done;
-    }
-    condition = both;
-  }
-  if (!safety_emit_branch_zero(out, access->location, condition, ok_label)) {
-    goto done;
-  }
-  ok = safety_expand_region(out, access) &&
+  ok = settled && safety_expand_region(out, access) && safety_mark_cold(out) &&
        safety_emit_label(out, access->location, ok_label);
 
 done:
@@ -2156,6 +2155,204 @@ static int safety_strip_function(IRFunction *function, IRSafetyStats *stats) {
   return 1;
 }
 
+#include "ir_safety_cover.inc"
+#include "ir_safety_cache.inc"
+
+enum {
+  SAFETY_KEEP = 0,
+  SAFETY_PROVED = 1,
+  SAFETY_HOISTED = 2,
+  SAFETY_SPANNED = 3,
+  SAFETY_COVERED = 4,
+  SAFETY_CACHED = 5
+};
+
+typedef struct {
+  SafetySpan *spans;
+  size_t count;
+  size_t *span_of;
+  const IROperand **span_delta;
+} SafetySpans;
+
+typedef struct {
+  unsigned char outcome;
+  const char *span_temp;
+  const IROperand *span_delta;
+  unsigned cache_id;
+} SafetyVerdict;
+
+static void safety_hoists_release(SafetyHoist *hoists, size_t count) {
+  for (size_t h = 0; h < count; h++) {
+    ir_operand_destroy(&hoists[h].base);
+    ir_operand_destroy(&hoists[h].bound);
+    if (hoists[h].has_invariant) {
+      ir_operand_destroy(&hoists[h].invariant);
+    }
+    if (hoists[h].has_index_start) {
+      ir_operand_destroy(&hoists[h].index_start_value);
+    }
+  }
+  free(hoists);
+}
+
+static void safety_spans_release(SafetySpans *held) {
+  for (size_t s = 0; s < held->count; s++) {
+    ir_operand_destroy(&held->spans[s].base);
+  }
+  free(held->spans);
+  free(held->span_of);
+  free(held->span_delta);
+}
+
+static const char *safety_span_refusal(const IRFunction *function,
+                                       const SafetyLoopForm *loop, size_t index,
+                                       const SafetyAccess *access,
+                                       const IROperand *identity_root,
+                                       const IROperand *root,
+                                       const IROperand *delta, size_t delta_from) {
+  if (identity_root && !safety_operand_invariant_in(function, loop->header_index,
+          loop->bounds.jump_index, identity_root)) {
+    return "the pointer origin is re-read inside the loop, so one resolution "
+           "would not describe every iteration";
+  }
+  if (!safety_body_has_no_calls(function, &loop->bounds)) {
+    return "the loop calls something that could free what it walks";
+  }
+  if (safety_body_calls_out(function, &loop->bounds) &&
+      safety_operand_escapes(function, access->base)) {
+    return "the loop hands out the address of the pointer it walks, so a call "
+           "in the body could move it";
+  }
+  if (!safety_operand_invariant_in(function, loop->header_index,
+                                   loop->bounds.jump_index, root)) {
+    return "the pointer moves inside the loop and is not a fixed one displaced, "
+           "so one resolution would not describe it";
+  }
+  if (delta && !safety_operand_invariant_in(function, delta_from + 1, index,
+                                            delta)) {
+    return "the displacement changes between forming the pointer and using it";
+  }
+  return NULL;
+}
+
+static int safety_plan_span(const IRFunction *function,
+                            const SafetyLoopList *loops, size_t index,
+                            const SafetyAccess *access, SafetySpans *held) {
+  const SafetyLoopForm *loop = safety_enclosing_loop(loops, index);
+  if (!loop) {
+    safety_trace("not in any loop, so there is nothing to resolve against",
+                 access->location.line);
+    return 0;
+  }
+  const IROperand *identity_root =
+      safety_identity_root(function, access->identity, index, 0);
+  const IROperand *delta = NULL;
+  size_t delta_from = 0;
+  const IROperand *root =
+      safety_base_root(function, index, access->base, &delta, &delta_from, 0);
+  const char *refusal = safety_span_refusal(function, loop, index, access,
+                                            identity_root, root, delta, delta_from);
+  if (refusal) {
+    safety_trace(refusal, access->location.line);
+    return 0;
+  }
+
+  size_t found = held->count;
+  for (size_t s = 0; s < held->count; s++) {
+    const SafetySpan *span = &held->spans[s];
+    if (span->header_index == loop->header_index &&
+        safety_operand_same(&span->base, root) &&
+        ((!span->identity && !identity_root) ||
+         (span->identity && identity_root &&
+          safety_operand_same(span->identity, identity_root)))) {
+      found = s;
+      break;
+    }
+  }
+  if (found == held->count) {
+    SafetySpan *fresh = &held->spans[held->count];
+    fresh->header_index = loop->header_index;
+    fresh->identity = identity_root;
+    fresh->location = access->location;
+    snprintf(fresh->temp, sizeof(fresh->temp), SAFETY_TEMP_PREFIX "sp%u",
+             g_safety_next_id++);
+    if (!ir_operand_clone(root, &fresh->base)) {
+      return -1;
+    }
+    held->count++;
+  }
+  held->span_of[index] = found;
+  held->span_delta[index] = delta;
+  return 1;
+}
+
+static int safety_emit_verdict(IRInstructionVector *out, const IRFunction *function,
+                               const SafetyAccess *access,
+                               const SafetyVerdict *verdict, IRSafetyStats *stats) {
+  IRSafetyStats unused = {0};
+  const char *file = access->location.filename;
+  size_t line = access->location.line;
+  if (!stats) {
+    stats = &unused;
+  }
+  stats->emitted++;
+  switch (verdict->outcome) {
+  case SAFETY_PROVED:
+  case SAFETY_COVERED:
+    stats->proved++;
+    ir_explain_safety_settled(file, IR_SAFETY_SETTLED_PROVED);
+    return 1;
+  case SAFETY_HOISTED:
+    stats->hoisted++;
+    ir_explain_safety_settled(file, IR_SAFETY_SETTLED_HOISTED);
+    return 1;
+  case SAFETY_SPANNED:
+    stats->spanned++;
+    ir_explain_safety_note(file, line, function->name, IR_SAFETY_SURVIVOR_SPAN);
+    return safety_emit_span_check(out, access, verdict->span_temp,
+                                  verdict->span_delta);
+  case SAFETY_CACHED:
+    stats->spanned++;
+    ir_explain_safety_note(file, line, function->name, IR_SAFETY_SURVIVOR_SPAN);
+    return safety_emit_cache_check(out, access, verdict->cache_id);
+  default:
+    break;
+  }
+  if (access->extent == IR_SAFETY_EXTENT_UNKNOWN) {
+    stats->region_calls++;
+    ir_explain_safety_note(file, line, function->name, IR_SAFETY_SURVIVOR_REGION);
+    return safety_expand_region(out, access);
+  }
+  stats->extent_tests++;
+  ir_explain_safety_note(file, line, function->name, IR_SAFETY_SURVIVOR_EXTENT);
+  return safety_expand_extent(out, access);
+}
+
+static int safety_plan_inline(const IRFunction *function,
+                              const SafetyLoopList *loops,
+                              unsigned char *outcome, unsigned char cached,
+                              SafetyInline *plan) {
+  if (!safety_inline_prepare(plan, function, loops)) {
+    return 0;
+  }
+  for (size_t i = 0; loops->count && i < function->instruction_count; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (in->op == IR_OP_CALL) {
+      if (!safety_plan_shadow(function, loops, i, plan)) return 0;
+      continue;
+    }
+    if (in->op != IR_OP_SAFETY_CHECK || outcome[i] != 0) {
+      continue;
+    }
+    SafetyAccess access;
+    if (!safety_read(in, &access)) return 0;
+    if (access.extent != IR_SAFETY_EXTENT_UNKNOWN) continue;
+    if (!safety_plan_cache(function, loops, i, &access, plan)) return 0;
+    if (plan->cache_of[i]) outcome[i] = cached;
+  }
+  return 1;
+}
+
 static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   size_t check_count = 0;
   for (size_t i = 0; i < function->instruction_count; i++) {
@@ -2167,41 +2364,24 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     return 1;
   }
 
-  enum {
-    SAFETY_KEEP = 0,
-    SAFETY_PROVED = 1,
-    SAFETY_HOISTED = 2,
-    SAFETY_SPANNED = 3
-  };
+  SafetyInline plan = {0};
+  SafetySpans held = {0};
   unsigned char *outcome = calloc(function->instruction_count, 1);
   SafetyHoist *hoists = calloc(check_count, sizeof(SafetyHoist));
-  SafetySpan *spans = calloc(check_count, sizeof(SafetySpan));
-  size_t *span_of = calloc(function->instruction_count, sizeof(size_t));
-  const IROperand **span_delta =
-      calloc(function->instruction_count, sizeof(const IROperand *));
   size_t hoist_count = 0;
-  size_t span_count = 0;
   SafetyLoopList loops = {0};
-  if (!outcome || !hoists || !spans || !span_of || !span_delta) {
-    free(outcome);
-    free(hoists);
-    free(spans);
-    free(span_of);
-    free(span_delta);
-    return 0;
-  }
-  if (!safety_loop_list_build(function, &loops)) {
-    free(outcome);
-    free(hoists);
-    free(spans);
-    free(span_of);
-    free(span_delta);
-    return 0;
+  held.spans = calloc(check_count, sizeof(SafetySpan));
+  held.span_of = calloc(function->instruction_count, sizeof(size_t));
+  held.span_delta = calloc(function->instruction_count, sizeof(const IROperand *));
+  if (!outcome || !hoists || !held.spans || !held.span_of || !held.span_delta ||
+      !safety_loop_list_build(function, &loops) ||
+      !safety_mark_covered(function, outcome, SAFETY_COVERED)) {
+    goto fail;
   }
 
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
-    if (instruction->op != IR_OP_SAFETY_CHECK) {
+    if (instruction->op != IR_OP_SAFETY_CHECK || outcome[i] == SAFETY_COVERED) {
       continue;
     }
     SafetyAccess access;
@@ -2218,78 +2398,16 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
       continue;
     }
 
-    const SafetyLoopForm *loop = safety_enclosing_loop(&loops, i);
-    if (!loop) {
-      safety_trace("not in any loop, so there is nothing to resolve against",
-                   access.location.line);
-      continue;
+    int spanned = safety_plan_span(function, &loops, i, &access, &held);
+    if (spanned < 0) {
+      goto fail;
     }
-    const IROperand *identity_root =
-        safety_identity_root(function, access.identity, i, 0);
-    if (identity_root && !safety_operand_invariant_in(function,
-        loop->header_index, loop->bounds.jump_index, identity_root)) {
-      safety_trace("the pointer origin is re-read inside the loop, so one "
-                   "resolution would not describe every iteration",
-                   access.location.line);
-      continue;
+    if (spanned) {
+      outcome[i] = SAFETY_SPANNED;
     }
-    if (!safety_body_has_no_calls(function, &loop->bounds)) {
-      safety_trace("the loop calls something that could free what it walks",
-                   access.location.line);
-      continue;
-    }
-    if (safety_body_calls_out(function, &loop->bounds) &&
-        safety_operand_escapes(function, access.base)) {
-      safety_trace("the loop hands out the address of the pointer it walks, so "
-                   "a call in the body could move it",
-                   access.location.line);
-      continue;
-    }
-    const IROperand *delta = NULL;
-    size_t delta_from = 0;
-    const IROperand *root =
-        safety_base_root(function, i, access.base, &delta, &delta_from, 0);
-    if (!safety_operand_invariant_in(function, loop->header_index,
-                                     loop->bounds.jump_index, root)) {
-      safety_trace("the pointer moves inside the loop and is not a fixed one "
-                   "displaced, so one resolution would not describe it",
-                   access.location.line);
-      continue;
-    }
-    if (delta && !safety_operand_invariant_in(function, delta_from + 1, i,
-                                              delta)) {
-      safety_trace("the displacement changes between forming the pointer and "
-                   "using it",
-                   access.location.line);
-      continue;
-    }
-
-    size_t found = span_count;
-    for (size_t s = 0; s < span_count; s++) {
-      if (spans[s].header_index == loop->header_index &&
-          safety_operand_same(&spans[s].base, root) &&
-          ((!spans[s].identity && !identity_root) ||
-           (spans[s].identity && identity_root &&
-            safety_operand_same(spans[s].identity, identity_root)))) {
-        found = s;
-        break;
-      }
-    }
-    if (found == span_count) {
-      SafetySpan *fresh = &spans[span_count];
-      fresh->header_index = loop->header_index;
-      fresh->identity = identity_root;
-      fresh->location = access.location;
-      snprintf(fresh->temp, sizeof(fresh->temp), SAFETY_TEMP_PREFIX "sp%u",
-               g_safety_next_id++);
-      if (!ir_operand_clone(root, &fresh->base)) {
-        goto fail;
-      }
-      span_count++;
-    }
-    span_of[i] = found;
-    span_delta[i] = delta;
-    outcome[i] = SAFETY_SPANNED;
+  }
+  if (!safety_plan_inline(function, &loops, outcome, SAFETY_CACHED, &plan)) {
+    goto fail;
   }
   safety_loop_list_destroy(&loops);
 
@@ -2301,6 +2419,10 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
 
+    if (!safety_emit_inline_setup(&out, &plan, i, instruction->location)) {
+      ir_instruction_vector_destroy(&out);
+      goto fail;
+    }
     for (size_t h = 0; h < hoist_count; h++) {
       if (hoists[h].header_index == i &&
           !safety_emit_hoisted(&out, &hoists[h])) {
@@ -2308,16 +2430,20 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
         goto fail;
       }
     }
-    for (size_t s = 0; s < span_count; s++) {
-      if (spans[s].header_index == i &&
-          !safety_emit_span_resolve(&out, &spans[s])) {
+    for (size_t s = 0; s < held.count; s++) {
+      if (held.spans[s].header_index == i &&
+          !safety_emit_span_resolve(&out, &held.spans[s])) {
         ir_instruction_vector_destroy(&out);
         goto fail;
       }
     }
 
     if (instruction->op != IR_OP_SAFETY_CHECK) {
-      if (!ir_instruction_vector_append_move(&out, instruction)) {
+      int moved = plan.slot_of[i]
+          ? safety_emit_shadow_load(&out, instruction,
+                                    &plan.slots[plan.slot_of[i] - 1])
+          : ir_instruction_vector_append_move(&out, instruction);
+      if (!moved) {
         ir_instruction_vector_destroy(&out);
         goto fail;
       }
@@ -2325,88 +2451,25 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
     }
 
     SafetyAccess access;
-    if (!safety_read(instruction, &access)) {
-      ir_instruction_vector_destroy(&out);
-      goto fail;
-    }
-    if (stats) {
-      stats->emitted++;
-    }
-
-    if (outcome[i] == SAFETY_PROVED) {
-      if (stats) {
-        stats->proved++;
-      }
-      ir_explain_safety_settled(access.location.filename,
-                                IR_SAFETY_SETTLED_PROVED);
-      continue;
-    }
-    if (outcome[i] == SAFETY_HOISTED) {
-      if (stats) {
-        stats->hoisted++;
-      }
-      ir_explain_safety_settled(access.location.filename,
-                                IR_SAFETY_SETTLED_HOISTED);
-      continue;
-    }
+    SafetyVerdict verdict = {outcome[i], NULL, NULL, 0};
     if (outcome[i] == SAFETY_SPANNED) {
-      if (!safety_emit_span_check(&out, &access, spans[span_of[i]].temp,
-                                  span_delta[i])) {
-        ir_instruction_vector_destroy(&out);
-        goto fail;
-      }
-      if (stats) {
-        stats->spanned++;
-      }
-      ir_explain_safety_note(access.location.filename, access.location.line,
-                             function->name, IR_SAFETY_SURVIVOR_SPAN);
-      continue;
+      verdict.span_temp = held.spans[held.span_of[i]].temp;
+      verdict.span_delta = held.span_delta[i];
     }
-
-    int expanded;
-    if (access.extent == IR_SAFETY_EXTENT_UNKNOWN) {
-      expanded = safety_expand_region(&out, &access);
-      if (expanded) {
-        if (stats) {
-          stats->region_calls++;
-        }
-        ir_explain_safety_note(access.location.filename, access.location.line,
-                               function->name, IR_SAFETY_SURVIVOR_REGION);
-      }
-    } else {
-      expanded = safety_expand_extent(&out, &access);
-      if (expanded) {
-        if (stats) {
-          stats->extent_tests++;
-        }
-        ir_explain_safety_note(access.location.filename, access.location.line,
-                               function->name, IR_SAFETY_SURVIVOR_EXTENT);
-      }
+    if (outcome[i] == SAFETY_CACHED) {
+      verdict.cache_id = plan.caches[plan.cache_of[i] - 1].id;
     }
-    if (!expanded) {
+    if (!safety_read(instruction, &access) ||
+        !safety_emit_verdict(&out, function, &access, &verdict, stats)) {
       ir_instruction_vector_destroy(&out);
       goto fail;
     }
   }
 
-  for (size_t h = 0; h < hoist_count; h++) {
-    ir_operand_destroy(&hoists[h].base);
-    ir_operand_destroy(&hoists[h].bound);
-    if (hoists[h].has_invariant) {
-      ir_operand_destroy(&hoists[h].invariant);
-    }
-    if (hoists[h].has_index_start) {
-      ir_operand_destroy(&hoists[h].index_start_value);
-    }
-  }
-  for (size_t s = 0; s < span_count; s++) {
-    ir_operand_destroy(&spans[s].base);
-  }
-  free(spans);
-  free(span_of);
-  free(span_delta);
-  free(hoists);
+  safety_hoists_release(hoists, hoist_count);
+  safety_spans_release(&held);
   free(outcome);
+  safety_inline_release(&plan);
   if (!ir_function_replace_instructions(function, &out)) {
     ir_instruction_vector_destroy(&out);
     return 0;
@@ -2414,24 +2477,10 @@ static int safety_resolve_function(IRFunction *function, IRSafetyStats *stats) {
   return 1;
 
 fail:
+  safety_inline_release(&plan);
   safety_loop_list_destroy(&loops);
-  for (size_t h = 0; h < hoist_count; h++) {
-    ir_operand_destroy(&hoists[h].base);
-    ir_operand_destroy(&hoists[h].bound);
-    if (hoists[h].has_invariant) {
-      ir_operand_destroy(&hoists[h].invariant);
-    }
-    if (hoists[h].has_index_start) {
-      ir_operand_destroy(&hoists[h].index_start_value);
-    }
-  }
-  for (size_t s = 0; s < span_count; s++) {
-    ir_operand_destroy(&spans[s].base);
-  }
-  free(spans);
-  free(span_of);
-  free(span_delta);
-  free(hoists);
+  safety_hoists_release(hoists, hoist_count);
+  safety_spans_release(&held);
   free(outcome);
   return 0;
 }
@@ -2514,6 +2563,9 @@ static int safety_declare_runtime(IRProgram *program) {
       {"mettle_safety_c_string_identity", u64, span_params, 1},
       {"mettle_safety_mapping_identity", u64, pointer_u64, 2},
       {"mettle_safety_global_pointer", nothing, call_arg_params, 3},
+      {"mettle_safety_shadow_slot", pointer, span_params, 1},
+      {"mettle_safety_cache_fill", nothing, call_arg_params, 3},
+      {"mettle_safety_thread", pointer, NULL, 0},
   };
 
   for (size_t e = 0; e < sizeof(entries) / sizeof(entries[0]); e++) {
@@ -2688,7 +2740,7 @@ int ir_safety_resolve_program(IRProgram *program, IRSafetyStats *stats) {
     return 1;
   }
   clock_t started = safety_time_enabled() ? clock() : 0;
-  if (!safety_declare_runtime(program)) {
+  if (!safety_declare_runtime(program) || !safety_register_cache_type(program)) {
     return 0;
   }
   g_safety_program = program;
@@ -3111,7 +3163,9 @@ static int safety_local_address_escapes(const IRFunction *function,
     case IR_OP_LOAD:
       break;
     case IR_OP_STORE:
-      if (safety_temp_set_has(&addresses, &instruction->lhs)) {
+      if (safety_temp_set_has(&addresses, &instruction->lhs) &&
+          !(instruction->rhs.kind == IR_OPERAND_INT &&
+            instruction->rhs.int_value > 8)) {
         return 1;
       }
       break;
@@ -3559,6 +3613,7 @@ int ir_safety_retire_dangling_notes(IRProgram *program) {
 }
 
 #include "ir_safety_provenance.inc"
+#include "ir_safety_frames.inc"
 
 static void safety_rename_operand(IROperand *operand, const char *from,
                                   const char *to) {
