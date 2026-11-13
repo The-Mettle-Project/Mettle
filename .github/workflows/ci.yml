@@ -530,6 +530,15 @@ jobs:
       - name: Build compiler
         run: make -k -j"$(sysctl -n hw.ncpu)"
 
+      - name: Host target reporting on a Mach-O host
+        run: |
+          ./bin/mettle --version | tee /tmp/mettle-version.txt
+          grep -q 'host: aarch64' /tmp/mettle-version.txt
+          grep -q 'target: aarch64-macos (Mach-O)' /tmp/mettle-version.txt
+          if grep -qi 'windows\|COFF\|ELF' /tmp/mettle-version.txt; then
+            echo "a Mach-O host reported a COFF or ELF target"; exit 1
+          fi
+
       - name: Package registry
         run: python3 website/registry.py check --compiler ./bin/mettle
 

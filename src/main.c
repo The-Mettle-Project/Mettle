@@ -700,6 +700,27 @@ static int host_target_is_posix(void) {
   return host_target_is_elf() || host_target_is_macho();
 }
 
+static const char *host_arch_name(void) {
+  return mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64 ? "aarch64"
+                                                         : "x86_64";
+}
+
+static const char *host_target_summary(void) {
+  switch (mtlc_target()->format) {
+  case BINARY_TARGET_FORMAT_ELF_ARM64:
+    return "aarch64-linux (ELF relocatable object)";
+  case BINARY_TARGET_FORMAT_MACHO_ARM64:
+    return "aarch64-macos (Mach-O)";
+  case BINARY_TARGET_FORMAT_MACHO_X64:
+    return "x86_64-macos (Mach-O)";
+  case BINARY_TARGET_FORMAT_ELF_X64:
+    return "x86_64-linux (ELF)";
+  case BINARY_TARGET_FORMAT_COFF_WIN64:
+  default:
+    return "x86_64-windows (COFF)";
+  }
+}
+
 static char *default_executable_filename(const char *input_filename) {
   if (!input_filename || input_filename[0] == '\0') {
     return NULL;
@@ -4950,17 +4971,9 @@ int main(int argc, char *argv[]) {
   if (argc >= 2) {
     if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0 ||
         strcmp(argv[1], "version") == 0) {
-#if defined(__aarch64__) && defined(__linux__)
-      const char *host = "aarch64";
-      const char *target = "aarch64-linux (ELF relocatable object)";
-#else
-      const char *host = "x86_64";
-      const char *target =
-          host_target_is_elf() ? "x86_64-linux (ELF)" : "x86_64-windows (COFF)";
-#endif
       printf("mettle %s\n", METTLE_VERSION);
-      printf("host: %s\n", host);
-      printf("target: %s\n", target);
+      printf("host: %s\n", host_arch_name());
+      printf("target: %s\n", host_target_summary());
       return 0;
     }
     if (strcmp(argv[1], "--gpu-info") == 0 || strcmp(argv[1], "gpu") == 0) {
