@@ -498,13 +498,15 @@ target-neutral optimizer (inlining, invariant code motion, the SSA passes and
 constant-divisor strength reduction) and skips the passes that build x86
 vector kernels.
 
-Values live in registers: a linear pass over live ranges gives scalar temps
-and locals x19 to x28, plus x3 to x7 for values that cross no call. Each
-operation still moves its operands through scratch registers before it runs,
-and float values travel between instructions in general registers with an
-`fmov` on each side. Both cost instructions a register-to-register backend
-would not spend. Aggregates, values whose address is taken and `float16`
-locals stay in stack slots.
+Scalar temps and locals get registers over their live ranges, hottest loop
+first: x19 to x28 and d8 to d15 for any value, and x3 to x7 and v16 to v23 for
+values that cross no call. Aggregates, values whose address is taken and
+`float16` locals stay in stack slots. A narrow integer is sign- or
+zero-extended each time it is written, a float that meets integer code
+crosses with an `fmov`, and there is no register-offset addressing, so a
+loop still runs more instructions than the same loop from clang `-O2`.
+Signed division by a constant does not use range facts, so `i / 8` on a
+counter that never goes negative still costs four instructions.
 
 The backend report lists each function and whether its values got registers.
 It has no per-loop machine cost, because the AArch64 backend has no cycle
