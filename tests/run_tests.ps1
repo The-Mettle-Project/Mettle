@@ -10262,7 +10262,7 @@ try {
     throw "De-inlined scale must report a loop regression. Output: $($run3.Substring(0, [Math]::Min(600, $run3.Length)))"
   }
   $json = Get-Content (Join-Path $exDir "demo.explain.json") -Raw | ConvertFrom-Json
-  if ($json.schema -ne 2) { throw "JSON schema field wrong" }
+  if ($json.schema -ne 3) { throw "JSON schema field wrong" }
   if ($json.stats.changesRegressed -lt 1) { throw "JSON regression count missing" }
   if (@($json.remarks).Count -lt 10) { throw "JSON remarks too few: $(@($json.remarks).Count)" }
   $regLoop = @($json.changes.entries | Where-Object { $_.direction -eq 'regressed' -and $_.kind -eq 'loop' })
@@ -13423,6 +13423,152 @@ catch {
   $failed++
   $env:METTLE_CACHE = $savedCache
   Write-CaseResult -Name "explain_tui" -Passed $false -Reason $_.Exception.Message
+}
+
+# The device report says what each kernel became on PTX and on Metal.
+# tests/gpu/explain_device.mettle holds one kernel per decision, so every
+# remark is checked where it fires and where it declines. Two checks hold the
+# report to the emitted module: every reported code line is a line of the
+# file the emitter wrote, and a kernel the report calls register only has no
+# ptxas stack frame.
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $savedCache = $env:METTLE_CACHE
+  $env:METTLE_CACHE = Join-Path $tmpDir "explain-gpu-cache"
+  Remove-Item -Recurse -Force $env:METTLE_CACHE -ErrorAction SilentlyContinue
+  function Assert-Report([string]$Text, [string[]]$Expected, [string]$What) {
+    foreach ($e in $Expected) {
+      if ($Text -notmatch [regex]::Escape($e)) { throw "${What}: missing '$e' in:`n$Text" }
+    }
+  }
+  $kernels = "tests/gpu/explain_device.mettle"
+  $ptxOut = Join-Path $tmpDir "explain_device.ptx"
+  $ptx = (& $CompilerPath -O --explain --emit-ptx --gpu-arch=gb10 $kernels -o $ptxOut 2>&1 | Out-String -Width 4096)
+  if ($LASTEXITCODE -ne 0) { throw "--emit-ptx --explain failed: $ptx" }
+  Assert-Report $ptx @(
+      "device report, PTX 8.8 for sm_121a",
+      "window_sum (kernel @ line 5, block 64)",
+      "lines 9 and 11 index it with values that are not constants",
+      "1 vector load replaced 4 separate loads",
+      "quad_sum (4 adjacent loads from ``rows`` @ line 19): one ld.global.v4.f32",
+      "pair_sum (2 adjacent loads from ``rows`` @ line 23): kept as separate loads  [vector-load-alignment]",
+      "fix: declare ``align(8)`` in the pointer's type",
+      "pick (device function @ line 1)",
+      "pick (accesses through ``p`` @ line 2): generic address space  [generic-access]",
+      "calls: 2 kept as device calls",
+      "staged (promoted copy into workgroup memory @ line 36): cp.async, 4 bytes in transactions of 4",
+      "staged_acquire_only (GPU workgroup staging @ line 44): NOT promoted to asynchronous staging  [staging-barrier-order]",
+      "fix: write ``barrier(workgroup, acq_rel)`` at line 45",
+      "verified: with that change the 1 copy becomes asynchronous",
+      "accumulate (tensor MMA loop @ line 60): NOT resident: every pass loads and stores the accumulator  [tensor-observable]",
+      "fix: move line 64 out of the loop",
+      "verified: without that line the accumulator stays in registers across the loop",
+      "accumulate (tensor_mma m16n16k16 @ line 54): wmma.mma m16n16k16 f16") "PTX device report"
+  foreach ($storage in @('values: 7 in registers, 2 (in|emitted as) local memory \(52 bytes\)',
+                         'window_sum \(array `window` @ line 8\): (in|emitted as) local memory, 36 bytes  \[local-memory\]',
+                         'window_sum \(private array `scratch` @ line 12\): (in|emitted as) local memory, 16 bytes')) {
+    if ($ptx -notmatch $storage) { throw "PTX device report: nothing matches '$storage' in:`n$ptx" }
+  }
+  if ($ptx -match "backend report") { throw "the PTX report still prints a backend section:`n$ptx" }
+  if ($ptx -match "beliefs|gpu_tid_x") { throw "the PTX report lists index built-ins as beliefs:`n$ptx" }
+
+  $metalOut = Join-Path $tmpDir "explain_device.metal"
+  $metal = (& $CompilerPath -O --explain --emit-metal $kernels -o $metalOut 2>&1 | Out-String -Width 4096)
+  if ($LASTEXITCODE -ne 0) { throw "--emit-metal --explain failed: $metal" }
+  Assert-Report $metal @(
+      "device report, Metal 3.2",
+      "values: 7 scalars, 2 arrays or records kept whole (52 bytes)",
+      "window_sum (array ``window`` @ line 8): kept as one array, 36 bytes  [local-memory]",
+      "so it is not split into scalars",
+      "staged (promoted copy into workgroup memory @ line 36): 4 bytes copied with ordinary assignments",
+      "reason: Metal has no asynchronous copy",
+      "simdgroup_matrix 8x8 tiles",
+      "pick (helper @ line 1): compiled 2 times, once for each address space it is called with",
+      "accumulate (tensor MMA loop @ line 60): NOT resident") "Metal device report"
+
+  foreach ($target in @(@{ Flag = "--emit-ptx"; Out = $ptxOut; Extra = @("--gpu-arch=gb10") },
+                        @{ Flag = "--emit-metal"; Out = $metalOut; Extra = @() })) {
+    $jsonArgs = @("-O", "--explain-json", $target.Flag) + $target.Extra + @($kernels, "-o", $target.Out)
+    & $CompilerPath @jsonArgs 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "$($target.Flag) --explain-json failed" }
+    $report = Get-Content ([IO.Path]::ChangeExtension($target.Out, ".explain.json")) -Raw | ConvertFrom-Json
+    if ($report.schema -ne 3) { throw "$($target.Flag): schema is $($report.schema)" }
+    $emitted = @{}
+    foreach ($line in (Get-Content $target.Out)) { $emitted[$line.Trim()] = 1 }
+    $sourceLines = @(Get-Content $kernels).Count
+    foreach ($kernel in $report.device.kernels) {
+      if (@($kernel.code).Count -eq 0) { throw "$($target.Flag): $($kernel.fn) has no code lines" }
+      foreach ($row in $kernel.code) {
+        if ($row[0] -lt 0 -or $row[0] -gt $sourceLines) { throw "$($target.Flag): $($kernel.fn) maps '$($row[1])' to line $($row[0])" }
+        if (-not $emitted.ContainsKey($row[1])) { throw "$($target.Flag): $($kernel.fn) reports a line the emitter did not write: '$($row[1])'" }
+      }
+    }
+  }
+
+  if (Get-Command ptxas -ErrorAction SilentlyContinue) {
+    foreach ($file in @($kernels, "tests/gpu/hardware_kernels.mettle", "tests/gpu/record_kernels.mettle")) {
+      $framePtx = Join-Path $tmpDir "explain_device_frame.ptx"
+      & $CompilerPath -O --explain-json --emit-ptx --gpu-arch=gb10 $file -o $framePtx 2>&1 | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "--emit-ptx --explain-json failed on $file" }
+      $device = (Get-Content ([IO.Path]::ChangeExtension($framePtx, ".explain.json")) -Raw | ConvertFrom-Json).device
+      if (-not $device.measuredBy) { continue }
+      foreach ($kernel in ($device.kernels | Where-Object { $_.kernel })) {
+        $frame = [int]$kernel.counters.stackFrame
+        $inMemory = [int]$kernel.counters.valuesInMemory
+        $missBytes = 0
+        foreach ($note in ($device.notes | Where-Object { $_.fn -eq $kernel.fn -and $_.kind -eq "storage" })) {
+          if ($note.headline -match '^in local memory' -and $frame -eq 0) {
+            throw "${file}: $($kernel.fn) reports '$($note.headline)' and ptxas gave it no stack frame"
+          }
+          if ($note.verdict -eq "miss") { $missBytes += [int]$note.quantities.bytes }
+        }
+        if ($inMemory -eq 0 -and $null -eq $kernel.counters.callsKept -and $frame -ne 0) {
+          throw "${file}: $($kernel.fn) is reported register only and ptxas gave it a $frame byte stack frame"
+        }
+        if ($frame -lt $missBytes) {
+          throw "${file}: $($kernel.fn) reports $missBytes bytes it cannot keep in registers and ptxas gave it a $frame byte stack frame"
+        }
+      }
+    }
+  }
+
+  $merged = (& $CompilerPath explain tests/gpu/single_build.mettle 2>$null | Out-String -Width 4096)
+  Assert-Report $merged @(
+      "main (dispatch ``saxpy_offset`` @ line 56): work items counted at run time, in blocks of 64 threads",
+      "optimization report, kernels on PTX",
+      "device report, PTX",
+      "device report, Metal 3.2",
+      "saxpy_offset (kernel @ line 13, block 64)") "host report with kernels"
+  if ($merged -match "mtlc_gpu_launch|mtlc_gpu_kernel_handle") { throw "the host report names launch plumbing:`n$merged" }
+  $hostPart = $merged.Substring(0, $merged.IndexOf("optimization report, kernels on"))
+  if ($hostPart -match "saxpy_offset \(call to") { throw "the host report still lists the kernel as host code:`n$hostPart" }
+  $refused = (& $CompilerPath explain tests/gpu/hardware_kernels.mettle 2>$null | Out-String -Width 4096)
+  Assert-Report $refused @(
+      "device report, PTX",
+      "the kernels in this file do not build for Metal",
+      "reason: Metal has no 64-bit atomic read-modify-write") "a target that refuses the file"
+
+  function Invoke-GpuScreen([string]$File, [string]$Keys, [string]$Screen = "150x46") {
+    $text = (& $CompilerPath explain $File "--screen=$Screen" "--keys=$Keys" 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "mettle explain $File --keys=$Keys failed: $text" }
+    return $text
+  }
+  Assert-Report (Invoke-GpuScreen $kernels "8") @(
+      "8 Kernels", "Line  Kernel", "PTX 8.8 for", "Metal 3.2", "window_sum",
+      "7 in registers, 2 in local memory", "Device code  window_sum [PTX") "kernels tab"
+  Assert-Report (Invoke-GpuScreen $kernels "2 / text:staged_acquire enter") @(
+      "NOT promoted to asynchronous staging", "Verified", "barrier(workgroup, acquire);") "kernel remark in optimizer"
+  Assert-Report (Invoke-GpuScreen $kernels "1") @("Kernels    7 on PTX", "Kernels    7 on Metal 3.2", "Start here", "accumulate:60") "kernels in overview"
+  Assert-Report (Invoke-GpuScreen $kernels "8 d") @("d back to the detail", "ld.param") "device code view"
+  Assert-Report (Invoke-GpuScreen "tests/explain_demo.mettle" "8" "140x30") @("No kernels in this file.") "empty kernels tab"
+  $env:METTLE_CACHE = $savedCache
+  Write-CaseResult -Name "explain_gpu_device_report" -Passed $true
+}
+catch {
+  $failed++
+  $env:METTLE_CACHE = $savedCache
+  Write-CaseResult -Name "explain_gpu_device_report" -Passed $false -Reason $_.Exception.Message
 }
 
 foreach ($escapeMode in @("debug", "release", "safe")) {
@@ -17482,7 +17628,8 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
         --gpu-arch=portable $src -o $explained 2>&1 | Out-String
       if ($LASTEXITCODE -ne 0 -or
           $explainOut -notmatch "fused 4 tensor tiles into one accumulator-resident chain" -or
-          $explainOut -notmatch "target-neutral optimized IR emitted through the PTX backend") {
+          $explainOut -notmatch "device report, PTX" -or
+          $explainOut -notmatch "the accumulator stays in registers across the chain") {
         throw "PTX --explain omitted the neutral tensor decision or backend boundary: $explainOut"
       }
       $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")
@@ -17546,7 +17693,8 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
         --gpu-arch=portable $src -o $explained 2>&1 | Out-String
       if ($LASTEXITCODE -ne 0 -or
           $explainOut -notmatch "formed a loop-carried tensor accumulator residency region" -or
-          $explainOut -notmatch "target-neutral optimized IR emitted through the PTX backend") {
+          $explainOut -notmatch "device report, PTX" -or
+          $explainOut -notmatch "the accumulator stays in registers across the loop") {
         throw "PTX --explain omitted the neutral tensor-loop decision or backend boundary: $explainOut"
       }
       $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")
@@ -17622,7 +17770,7 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
         --gpu-arch=portable $src -o $explained 2>&1 | Out-String
       if ($LASTEXITCODE -ne 0 -or
           $explainOut -notmatch "formed an asynchronously staged tensor accumulator pipeline" -or
-          $explainOut -notmatch "target-neutral optimized IR emitted through the PTX backend") {
+          $explainOut -notmatch "device report, PTX") {
         throw "PTX --explain omitted the neutral staged-tensor decision: $explainOut"
       }
       $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")
@@ -17739,7 +17887,8 @@ foreach ($src in @("tests/gpu/compute_kernels.mettle",
         --gpu-arch=portable $src -o $explained 2>&1 | Out-String
       if ($LASTEXITCODE -ne 0 -or
           $explainOut -notmatch "promoted 1 typed global-to-workgroup copy to asynchronous staging" -or
-          $explainOut -notmatch "target-neutral optimized IR emitted through the PTX backend") {
+          $explainOut -notmatch "device report, PTX" -or
+          $explainOut -notmatch "promoted copy into workgroup memory") {
         throw "PTX --explain omitted automatic neutral staging: $explainOut"
       }
       $dumped = Join-Path $tmpDir ($name + "_dumped.ptx")

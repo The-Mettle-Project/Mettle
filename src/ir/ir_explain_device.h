@@ -53,6 +53,7 @@ void ir_explain_device_add(const char *function, IRDeviceCounter counter,
 void ir_explain_device_set(const char *function, IRDeviceCounter counter,
                            long long value);
 void ir_explain_device_limiter(const char *function, const char *limiter);
+void ir_explain_device_resolve_storage(const char *function);
 void ir_explain_device_code(const char *function, size_t line,
                             const char *text);
 void ir_explain_device_measured_by(const char *tool);

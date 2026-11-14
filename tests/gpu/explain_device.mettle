@@ -1,0 +1,67 @@
+@noinline fn pick(p: float32*, k: int32) -> float32 {
+  return p[k];
+}
+
+kernel(block = 64) window_sum(src: float32 global*, out: float32 global*,
+                              n: int32, taps: int32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  var window: float32[9];
+  for k in 0..9 { window[k] = src[i + k]; }
+  var total: float32 = 0.0;
+  for k in 0..taps { total = total + window[k]; }
+  private var scratch: float32[4];
+  scratch[thread.x & 3] = total;
+  if (i < n) { out[i] = scratch[0] + total; }
+}
+
+kernel(block = 32) quad_sum(rows: float32 global align(16)*,
+                            out: float32 global*) {
+  out[thread.x] = rows[0] + rows[1] + rows[2] + rows[3];
+}
+
+kernel(block = 32) pair_sum(rows: float32 global*, out: float32 global*) {
+  out[thread.x] = rows[0] + rows[1];
+}
+
+kernel(block = 32) mixed_spaces(src: float32 global*, out: float32 global*) {
+  workgroup var tile: float32[32];
+  tile[thread.x] = src[thread.x];
+  barrier(workgroup, acq_rel);
+  out[thread.x] = pick(&tile[0], 0) + pick(src, 1);
+}
+
+kernel staged(src: uint32*, out: uint32*) {
+  workgroup var tile: uint32[32];
+  var lane: int32 = thread.x;
+  tile[lane] = src[lane];
+  barrier(workgroup, acq_rel);
+  out[lane] = tile[lane];
+}
+
+kernel staged_acquire_only(src: uint32*, out: uint32*) {
+  workgroup var tile: uint32[32];
+  var lane: int32 = thread.x;
+  tile[lane] = src[lane];
+  barrier(workgroup, acquire);
+  out[lane] = tile[lane];
+}
+
+kernel accumulate(a: uint16*, b: uint16*, c: float32*, d: float32*,
+                  marker: uint32*, k: int32, lda: int32, ldb: int32,
+                  ldc: int32, ldd: int32) {
+  var zero: uint64 = 0;
+  var one: uint32 = 1;
+  tensor_mma(a, b, c, d,
+             shape: m16n16k16, input_type: f16, output_type: f32,
+             a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+             lda: lda, ldb: ldb, ldc: ldc, ldd: ldd);
+  var inner: int32 = 16;
+  while (inner < k) {
+    tensor_mma(a + inner, b + inner, d, d,
+               shape: m16n16k16, input_type: f16, output_type: f32,
+               a_layout: row, b_layout: col, c_layout: row, d_layout: row,
+               lda: lda, ldb: ldb, ldc: ldd, ldd: ldd);
+    atomic_store(marker, zero, one, order: relaxed, scope: device);
+    inner = inner + 16;
+  }
+}

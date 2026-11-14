@@ -11153,7 +11153,8 @@ static void ptx_report_memory_value(PtxEmit *e, const IRInstruction *in,
   if (!e->fn.reported) return;
   ir_display_name(in->dest.name, shown, sizeof(shown));
   snprintf(subject, sizeof(subject), "%s `%s`", what, shown);
-  snprintf(headline, sizeof(headline), "in local memory, %zu bytes", bytes);
+  snprintf(headline, sizeof(headline), "emitted as local memory, %zu bytes",
+           bytes);
   has_reason = ir_device_report_storage_reason(e->func, in->dest.name,
                                                aggregate, cause, sizeof(cause));
   snprintf(reason, sizeof(reason), "%s, so %s", cause,
@@ -11165,6 +11166,7 @@ static void ptx_report_memory_value(PtxEmit *e, const IRInstruction *in,
   ir_explain_device_note(e->func->name, in->location.line, "storage", subject,
                          has_reason ? IR_DEVICE_MISS : IR_DEVICE_FACT, headline,
                          has_reason ? reason : NULL, NULL, "local-memory");
+  ir_explain_device_note_quantity("bytes", (long long)bytes);
 }
 
 static void ptx_report_allocation(PtxEmit *e, const IRInstruction *in,

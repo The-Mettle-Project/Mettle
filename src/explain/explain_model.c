@@ -2765,7 +2765,9 @@ static void ex_device_overview(ExReport *report, const ExJson *root,
   ExTab *overview = &report->tabs[EX_TAB_OVERVIEW];
   const ExJson *device = ex_json_get(child, "device");
   const ExJson *notes = ex_json_get(device, "notes");
+  const ExJson *kernels = ex_json_get(device, "kernels");
   size_t missed = 0;
+  size_t count = 0;
   if (ex_json_text(device, "error")) {
     ex_summary(overview, ex_fmt("Kernels    do not build for %s", label));
     return;
@@ -2774,10 +2776,12 @@ static void ex_device_overview(ExReport *report, const ExJson *root,
     const char *verdict = ex_json_text(ex_json_at(notes, i), "verdict");
     missed += verdict && strcmp(verdict, "miss") == 0;
   }
-  ex_summary(overview,
-             ex_fmt("Kernels    %zu on %s, %zu %s to look at",
-                    ex_json_count(ex_json_get(device, "kernels")), label,
-                    missed, missed == 1 ? "decision" : "decisions"));
+  for (size_t i = 0; i < ex_json_count(kernels); i++) {
+    count += ex_json_flag(ex_json_at(kernels, i), "kernel") ? 1 : 0;
+  }
+  ex_summary(overview, ex_fmt("Kernels    %zu on %s, %zu %s to look at", count,
+                              label, missed,
+                              missed == 1 ? "decision" : "decisions"));
   if (child != root) {
     ex_device_start_here(report, child, label);
   }

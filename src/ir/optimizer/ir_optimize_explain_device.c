@@ -316,6 +316,52 @@ void ir_explain_device_set(const char *function, IRDeviceCounter counter,
   entry->known[counter] = 1;
 }
 
+static long long device_note_bytes(const IRDeviceNote *note) {
+  for (size_t q = 0; q < note->quantity_count; q++) {
+    if (strcmp(note->quantities[q].name, "bytes") == 0) {
+      return note->quantities[q].value;
+    }
+  }
+  return 0;
+}
+
+void ir_explain_device_resolve_storage(const char *function) {
+  size_t index = 0;
+  IRDeviceFunction *entry = device_find(function, &index);
+  long long frame;
+  long long emitted;
+  if (!entry || !entry->known[IR_DEVICE_MEASURED_STACK_FRAME] ||
+      !entry->known[IR_DEVICE_MEMORY_BYTES]) {
+    return;
+  }
+  frame = entry->counters[IR_DEVICE_MEASURED_STACK_FRAME];
+  emitted = entry->counters[IR_DEVICE_MEMORY_BYTES];
+  if (frame != 0 && frame < emitted) {
+    return;
+  }
+  for (size_t i = 0; i < g_device.note_count; i++) {
+    IRDeviceNote *note = &g_device.notes[i];
+    char headline[160];
+    if (note->function != index || strcmp(note->kind, "storage") != 0) {
+      continue;
+    }
+    if (frame == 0) {
+      snprintf(headline, sizeof(headline),
+               "emitted as local memory, %lld bytes, and kept in registers by "
+               "the assembler",
+               device_note_bytes(note));
+      note->verdict = IR_DEVICE_GOOD;
+      free(note->reason);
+      note->reason = NULL;
+    } else {
+      snprintf(headline, sizeof(headline), "in local memory, %lld bytes",
+               device_note_bytes(note));
+    }
+    free(note->headline);
+    note->headline = device_dup(headline);
+  }
+}
+
 void ir_explain_device_limiter(const char *function, const char *limiter) {
   IRDeviceFunction *entry = device_find(function, NULL);
   if (!entry) {
@@ -409,7 +455,10 @@ static void device_values_row(const IRDeviceFunction *entry) {
   long long registers = device_value(entry, IR_DEVICE_VALUES_IN_REGISTERS);
   long long memory = device_value(entry, IR_DEVICE_VALUES_IN_MEMORY);
   long long bytes = device_value(entry, IR_DEVICE_MEMORY_BYTES);
-  const char *where = "local memory";
+  long long frame = device_value(entry, IR_DEVICE_MEASURED_STACK_FRAME);
+  int measured = entry->known[IR_DEVICE_MEASURED_STACK_FRAME];
+  const char *where = measured && frame >= bytes ? "in local memory"
+                                                 : "emitted as local memory";
   if (registers == 0 && memory == 0) {
     return;
   }
@@ -423,11 +472,11 @@ static void device_values_row(const IRDeviceFunction *entry) {
   } else if (memory == 0) {
     snprintf(row, sizeof(row), "values: %lld in registers", registers);
   } else if (registers == 0) {
-    snprintf(row, sizeof(row), "values: %lld in %s (%lld bytes)", memory, where,
+    snprintf(row, sizeof(row), "values: %lld %s (%lld bytes)", memory, where,
              bytes);
   } else {
     snprintf(row, sizeof(row),
-             "values: %lld in registers, %lld in %s (%lld bytes)", registers,
+             "values: %lld in registers, %lld %s (%lld bytes)", registers,
              memory, where, bytes);
   }
   device_row(row);
@@ -521,6 +570,9 @@ static void device_measured_ptx(const IRDeviceFunction *entry, char *row,
   if (frame > 0) {
     used += (size_t)snprintf(row + used, used < size ? size - used : 0,
                              ", a %lld byte stack frame", frame);
+  } else if (device_value(entry, IR_DEVICE_MEMORY_BYTES) > 0) {
+    used += (size_t)snprintf(row + used, used < size ? size - used : 0,
+                             ", no stack frame");
   }
   if (shared > 0 && used < size) {
     snprintf(row + used, size - used, ", %lld bytes of shared memory a block",

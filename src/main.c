@@ -3796,6 +3796,7 @@ static void explain_ptx_measures(const IRProgram *program,
         ir_explain_device_limiter(name, LIMITERS[l].words);
       }
     }
+    ir_explain_device_resolve_storage(name);
   }
   free(kernels);
 }
