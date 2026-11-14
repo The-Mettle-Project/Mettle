@@ -1,0 +1,25 @@
+import "std/io";
+
+extern fn memset(p: uint8*, v: int32, n: uint64) -> uint8*;
+
+fn after_print(a: int64) -> int64 {
+    var x: int64 = a;
+    println("value {a}");
+    prove(x == a);
+    return x;
+}
+
+fn untouched_local() -> int64 {
+    var kept: uint8[8];
+    var cleared: uint8[8];
+    kept[0] = 1;
+    memset(&cleared[0], 0, 8);
+    prove(kept[0] == 1);
+    return (int64)kept[0] + (int64)cleared[0];
+}
+
+fn main() -> int32 {
+    if (after_print(4) != 4) { return 1; }
+    if (untouched_local() != 1) { return 2; }
+    return 0;
+}

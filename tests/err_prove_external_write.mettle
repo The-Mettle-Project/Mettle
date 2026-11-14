@@ -1,0 +1,11 @@
+extern fn memset(p: uint8*, v: int32, n: uint64) -> uint8*;
+
+fn cleared() -> int64 {
+    var buf: uint8[8];
+    buf[0] = 1;
+    memset(&buf[0], 0, 8);
+    prove(buf[0] == 1);
+    return (int64)buf[0];
+}
+
+fn main() -> int32 { return (int32)cleared(); }

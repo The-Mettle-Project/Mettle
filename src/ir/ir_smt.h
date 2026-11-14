@@ -9,6 +9,7 @@ typedef struct {
   SmtTerm trap;
   SmtTerm returned;
   SmtTerm memory;
+  SmtTerm events;
   char why[192];
 } IRSmtOutcome;
 
@@ -83,7 +84,23 @@ typedef struct {
   struct IRSmtLoopVisit *visits;
   size_t visit_count;
   size_t visit_cap;
+  struct IRSmtEvent *events;
+  size_t event_count;
+  size_t event_cap;
+  const char **literal_text;
+  size_t *literal_length;
+  size_t literal_count;
 } IRSmtFrame;
+
+typedef struct IRSmtEvent {
+  unsigned side;
+  uint64_t index;
+  const char *callee;
+  size_t arg_count;
+  SmtTerm args[16];
+  SmtTerm reach;
+  SmtTerm memory;
+} IRSmtEvent;
 
 typedef struct IRSmtLoop {
   const char *label;

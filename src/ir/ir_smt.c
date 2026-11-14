@@ -61,6 +61,9 @@ typedef struct {
   unsigned side;
   SmtTerm mem_in;
   SmtTerm mem_out;
+  size_t ev_id;
+  SmtTerm ev_in;
+  SmtTerm ev_out;
   int failed;
   char why[192];
 } IrsEnc;
@@ -69,6 +72,9 @@ static SmtTerm irs_eval_invariant(IrsEnc *e, size_t header);
 static void irs_trap(IrsEnc *e, SmtTerm cond);
 static void irs_note_access(IrsEnc *e, SmtTerm addr, int size);
 static int irs_is_foreign(const IRSmtFrame *f, SmtTerm t);
+static SmtTerm irs_shared_global(IrsEnc *e, const char *kind, const char *name,
+                                 SmtSort sort);
+static SmtTerm irs_event_obligations(IRSmtFrame *f);
 static size_t irs_lockstep_find(IrsEnc *e, const char *label);
 static void irs_apply_phis(IrsEnc *e, size_t target, const char *from,
                            SmtTerm *env);
@@ -873,9 +879,29 @@ static SmtTerm irs_read(IrsEnc *e, const IROperand *op) {
   case IR_OPERAND_FLOAT:
     return irs_float_constant(ctx, op->float_value,
                               op->float_bits == 32 ? 32 : 64);
-  case IR_OPERAND_STRING:
-    irs_fail(e, "it uses a string", NULL);
-    break;
+  case IR_OPERAND_STRING: {
+    IRSmtFrame *f = e->frame;
+    size_t len = ir_operand_string_length(op);
+    const char *text = op->name ? op->name : "";
+    size_t index = 0;
+    while (index < f->literal_count &&
+           !(f->literal_length[index] == len &&
+             memcmp(f->literal_text[index], text, len) == 0)) {
+      index++;
+    }
+    if (index == f->literal_count) {
+      f->literal_text = realloc(f->literal_text,
+                                (f->literal_count + 1u) * sizeof(char *));
+      f->literal_length = realloc(f->literal_length,
+                                  (f->literal_count + 1u) * sizeof(size_t));
+      f->literal_text[index] = text;
+      f->literal_length[index] = len;
+      f->literal_count++;
+    }
+    char name[32];
+    snprintf(name, sizeof(name), "%zu", index);
+    return irs_shared_global(e, "string", name, irs_word(ctx));
+  }
   default:
     irs_fail(e, "it uses an operand the encoder does not model", NULL);
     break;
@@ -1308,13 +1334,9 @@ static int irs_callee_keeps_memory(const IRFunction *callee) {
   return 1;
 }
 
-static void irs_after_call_memory(IrsEnc *e, const IRFunction *callee) {
-  if (irs_callee_keeps_memory(callee)) {
-    return;
-  }
+static void irs_keep_private(IrsEnc *e, SmtTerm mem) {
   SmtCtx *ctx = e->ctx;
   SmtTerm old = e->env[e->mem_id];
-  SmtTerm mem = smt_fresh(ctx, "memory@call", irs_memory_sort(ctx));
   for (size_t i = 0; i < e->nvars; i++) {
     IrsVar *v = &e->vars[i];
     if (!v->addr || v->escaped || v->region_size > 256u) {
@@ -1326,6 +1348,117 @@ static void irs_after_call_memory(IrsEnc *e, const IRFunction *callee) {
     }
   }
   e->env[e->mem_id] = mem;
+}
+
+static void irs_after_call_memory(IrsEnc *e, const IRFunction *callee) {
+  if (callee && callee->instruction_count && irs_callee_keeps_memory(callee)) {
+    return;
+  }
+  irs_keep_private(e, smt_fresh(e->ctx, "memory@call", irs_memory_sort(e->ctx)));
+}
+
+static SmtTerm irs_shared_global(IrsEnc *e, const char *kind, const char *name,
+                                 SmtSort sort) {
+  const char *saved = e->prefix;
+  e->prefix = NULL;
+  SmtTerm t = irs_shared_sorted(e, kind, name, sort);
+  e->prefix = saved;
+  return t;
+}
+
+static int irs_count_cases(SmtCtx *ctx, SmtTerm count, SmtTerm cond,
+                           SmtTerm *conds, uint64_t *indices, size_t *n,
+                           size_t cap) {
+  uint64_t w[4];
+  if (smt_term_is_const(ctx, count) && smt_term_const_words(ctx, count, w)) {
+    for (size_t i = 0; i < *n; i++) {
+      if (indices[i] == w[0]) {
+        conds[i] = smt_or(ctx, conds[i], cond);
+        return 1;
+      }
+    }
+    if (*n == cap) {
+      return 0;
+    }
+    conds[*n] = cond;
+    indices[*n] = w[0];
+    (*n)++;
+    return 1;
+  }
+  if (smt_term_kind(ctx, count) != SMT_K_ITE) {
+    return 0;
+  }
+  SmtTerm c = smt_term_arg(ctx, count, 0);
+  return irs_count_cases(ctx, smt_term_arg(ctx, count, 1),
+                         smt_and(ctx, cond, c), conds, indices, n, cap) &&
+         irs_count_cases(ctx, smt_term_arg(ctx, count, 2),
+                         smt_and(ctx, cond, smt_not(ctx, c)), conds, indices,
+                         n, cap);
+}
+
+static void irs_call_external(IrsEnc *e, const IRInstruction *insn) {
+  SmtCtx *ctx = e->ctx;
+  IRSmtFrame *f = e->frame;
+  if (!insn->text || insn->argument_count > 16u) {
+    irs_fail(e, "it calls", insn->text ? insn->text : "an unknown function");
+    return;
+  }
+  SmtTerm args[16];
+  for (size_t i = 0; i < insn->argument_count; i++) {
+    args[i] = irs_read(e, &insn->arguments[i]);
+  }
+  if (e->failed) {
+    return;
+  }
+  if (f->uf_calls) {
+    char prefix[200];
+    snprintf(prefix, sizeof(prefix), "%s@call", insn->text);
+    irs_trap(e, smt_fresh(ctx, prefix, smt_bool_sort(ctx)));
+    irs_keep_private(e, smt_fresh(ctx, "memory@call", irs_memory_sort(ctx)));
+    irs_write(e, &insn->dest, smt_fresh(ctx, prefix, irs_word(ctx)));
+    e->global_epoch++;
+    return;
+  }
+  SmtTerm conds[8];
+  uint64_t indices[8];
+  size_t ways = 0;
+  if (!irs_count_cases(ctx, e->env[e->ev_id], smt_true(ctx), conds, indices,
+                       &ways, 8)) {
+    irs_fail(e, "external calls happen in an order that depends on the path",
+             NULL);
+    return;
+  }
+  SmtTerm reach = smt_and(ctx, e->reach, smt_not(ctx, e->trap));
+  SmtTerm trap = smt_false(ctx), memory = 0, result = 0, next = 0;
+  for (size_t w = 0; w < ways; w++) {
+    char slot[48];
+    snprintf(slot, sizeof(slot), "%llu", (unsigned long long)indices[w]);
+    if (f->event_count == f->event_cap) {
+      f->event_cap = f->event_cap ? f->event_cap * 2u : 16u;
+      f->events = realloc(f->events, f->event_cap * sizeof(IRSmtEvent));
+    }
+    IRSmtEvent *ev = &f->events[f->event_count++];
+    ev->side = e->side;
+    ev->index = indices[w];
+    ev->callee = insn->text;
+    ev->arg_count = insn->argument_count;
+    memcpy(ev->args, args, insn->argument_count * sizeof(SmtTerm));
+    ev->reach = smt_and(ctx, reach, conds[w]);
+    ev->memory = e->env[e->mem_id];
+    SmtTerm t = irs_shared_global(e, "external.trap", slot, smt_bool_sort(ctx));
+    SmtTerm m =
+        irs_shared_global(e, "external.memory", slot, irs_memory_sort(ctx));
+    SmtTerm r = irs_shared_global(e, "external.result", slot, irs_word(ctx));
+    SmtTerm n = smt_bv_u64(ctx, 64, indices[w] + 1u);
+    trap = smt_or(ctx, trap, smt_and(ctx, conds[w], t));
+    memory = memory ? smt_ite(ctx, conds[w], m, memory) : m;
+    result = result ? smt_ite(ctx, conds[w], r, result) : r;
+    next = next ? smt_ite(ctx, conds[w], n, next) : n;
+  }
+  irs_trap(e, trap);
+  irs_keep_private(e, memory);
+  irs_write(e, &insn->dest, result);
+  e->env[e->ev_id] = next;
 }
 
 static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
@@ -1340,7 +1473,7 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
   }
   const IRFunction *callee = irs_find_function(e->frame->program, insn->text);
   if (!callee) {
-    irs_fail(e, "it calls", insn->text);
+    irs_call_external(e, insn);
     return;
   }
   SmtTerm args[16];
@@ -1511,7 +1644,7 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   }
   const IRFunction *callee = irs_find_function(e->frame->program, insn->text);
   if (!callee || callee->instruction_count == 0) {
-    irs_fail(e, "it calls", insn->text ? insn->text : "an unknown function");
+    irs_call_external(e, insn);
     return;
   }
   if (e->frame->inline_depth >= IRS_MAX_INLINE_DEPTH) {
@@ -1539,9 +1672,16 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   sub.count = callee->instruction_count;
   sub.params = args;
   sub.mem_in = e->env[e->mem_id];
+  sub.ev_in = e->env[e->ev_id];
+  sub.side = e->side;
+  size_t ordinal = 0;
+  for (const IRInstruction *at = e->insns; at < insn; at++) {
+    ordinal += at->op == IR_OP_CALL && at->text &&
+               strcmp(at->text, insn->text) == 0;
+  }
   char prefix[160];
-  snprintf(prefix, sizeof(prefix), "%s%s@%zu/", e->prefix ? e->prefix : "",
-           callee->name, (size_t)(insn - e->insns));
+  snprintf(prefix, sizeof(prefix), "%s%s#%zu/", e->prefix ? e->prefix : "",
+           callee->name, ordinal);
   sub.prefix = prefix;
   e->frame->inline_depth++;
   int ok = irs_run(&sub);
@@ -1555,6 +1695,7 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
       irs_mark_aggregate(e, &insn->dest);
     }
     e->env[e->mem_id] = sub.mem_out;
+    e->env[e->ev_id] = sub.ev_out;
   }
   free(sub.vars);
   free(sub.buckets);
@@ -1656,6 +1797,7 @@ static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
   }
   if (calls) {
     e->global_epoch++;
+    e->env[e->ev_id] = smt_fresh(ctx, "loop:calls", irs_word(ctx));
   }
   if (calls || stores) {
     e->env[e->mem_id] = smt_fresh(ctx, "loop:memory", irs_memory_sort(ctx));
@@ -1991,6 +2133,7 @@ static void irs_step(IrsEnc *e, size_t pc) {
                                                   : irs_read(e, &insn->lhs);
     e->result = smt_ite(ctx, e->reach, v, e->result);
     e->mem_out = smt_ite(ctx, e->reach, e->env[e->mem_id], e->mem_out);
+    e->ev_out = smt_ite(ctx, e->reach, e->env[e->ev_id], e->ev_out);
     e->returned = smt_or(ctx, e->returned, e->reach);
     e->reach = smt_false(ctx);
     return;
@@ -2298,6 +2441,8 @@ static int irs_run(IrsEnc *e) {
   irs_find_escapes(e);
   e->mem_id = irs_var_lookup(e, "\x01memory", 1);
   e->vars[e->mem_id].declared = 1;
+  e->ev_id = irs_var_lookup(e, "\x01events", 1);
+  e->vars[e->ev_id].declared = 1;
   e->env = calloc(e->nvars ? e->nvars : 1u, sizeof(SmtTerm));
   e->block_label = calloc(e->count ? e->count : 1u, sizeof(char *));
   const char *current_label = NULL;
@@ -2317,6 +2462,8 @@ static int irs_run(IrsEnc *e) {
       e->mem_in ? e->mem_in
                 : irs_shared_sorted(e, "memory", "", irs_memory_sort(ctx));
   e->mem_out = e->env[e->mem_id];
+  e->env[e->ev_id] = e->ev_in ? e->ev_in : smt_bv_u64(ctx, 64, 0);
+  e->ev_out = e->env[e->ev_id];
   if (e->frame->havoc_loops && !e->prefix) {
     e->loop_end = calloc(e->count ? e->count : 1u, sizeof(size_t));
     for (size_t pc = 0; pc < e->count; pc++) {
@@ -2365,6 +2512,7 @@ static int irs_run(IrsEnc *e) {
   }
   if (!e->failed) {
     e->mem_out = smt_ite(ctx, e->reach, e->env[e->mem_id], e->mem_out);
+    e->ev_out = smt_ite(ctx, e->reach, e->env[e->ev_id], e->ev_out);
     e->returned = smt_or(ctx, e->returned, e->reach);
   }
   return !e->failed;
@@ -2410,6 +2558,9 @@ void ir_smt_frame_free(IRSmtFrame *frame) {
     free(frame->visits[i].values);
   }
   free(frame->visits);
+  free(frame->events);
+  free(frame->literal_text);
+  free(frame->literal_length);
   memset(frame, 0, sizeof(*frame));
 }
 
@@ -2429,6 +2580,7 @@ int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
   out->trap = e.trap;
   out->returned = e.returned;
   out->memory = e.mem_out;
+  out->events = e.ev_out;
   snprintf(out->why, sizeof(out->why), "%s", e.why);
   free(e.vars);
   free(e.buckets);
@@ -2611,6 +2763,105 @@ static SmtTerm irs_lockstep_obligations(IRSmtFrame *f) {
       free(vals[0]);
       free(vals[1]);
     }
+  }
+  return all;
+}
+
+static SmtTerm irs_outside_private(IRSmtFrame *f, SmtTerm k) {
+  SmtCtx *ctx = f->ctx;
+  SmtTerm outside = smt_true(ctx);
+  for (size_t i = 0; i < f->region_count; i++) {
+    if (!f->region_private[i]) {
+      continue;
+    }
+    SmtTerm base = f->region_base[i];
+    SmtTerm last = smt_mk2(ctx, SMT_K_BVADD, base,
+                           smt_bv_u64(ctx, 64, f->region_size[i] - 1u));
+    outside = smt_and(ctx, outside,
+                      smt_or(ctx, smt_mk2(ctx, SMT_K_BVULT, k, base),
+                             smt_mk2(ctx, SMT_K_BVULT, last, k)));
+  }
+  return outside;
+}
+
+static SmtTerm irs_event_obligations(IRSmtFrame *f) {
+  SmtCtx *ctx = f->ctx;
+  SmtTerm all = smt_true(ctx);
+  uint64_t top = 0;
+  for (size_t i = 0; i < f->event_count; i++) {
+    if (f->events[i].index + 1u > top) {
+      top = f->events[i].index + 1u;
+    }
+  }
+  const char *names[64];
+  size_t name_count = 0;
+  for (size_t i = 0; i < f->event_count; i++) {
+    size_t n = 0;
+    while (n < name_count && strcmp(names[n], f->events[i].callee) != 0) {
+      n++;
+    }
+    if (n == name_count) {
+      if (name_count == 64) {
+        return smt_false(ctx);
+      }
+      names[name_count++] = f->events[i].callee;
+    }
+  }
+  for (uint64_t index = 0; index < top; index++) {
+    SmtTerm reach[2], mem[2], who[2], args[2][17];
+    int seen[2] = {0, 0};
+    for (unsigned s = 0; s < 2; s++) {
+      reach[s] = smt_false(ctx);
+      mem[s] = 0;
+    }
+    for (size_t i = 0; i < f->event_count; i++) {
+      const IRSmtEvent *ev = &f->events[i];
+      if (ev->index != index || ev->side > 1u) {
+        continue;
+      }
+      size_t n = 0;
+      while (strcmp(names[n], ev->callee) != 0) {
+        n++;
+      }
+      SmtTerm id = smt_bv_u64(ctx, 16, n * 32u + ev->arg_count);
+      SmtTerm padded[17];
+      for (size_t a = 0; a < 17; a++) {
+        padded[a] = a < ev->arg_count ? ev->args[a] : smt_bv_u64(ctx, 64, 0);
+      }
+      unsigned s = ev->side;
+      if (!seen[s]) {
+        mem[s] = ev->memory;
+        who[s] = id;
+        memcpy(args[s], padded, sizeof(padded));
+        seen[s] = 1;
+      } else {
+        mem[s] = smt_ite(ctx, ev->reach, ev->memory, mem[s]);
+        who[s] = smt_ite(ctx, ev->reach, id, who[s]);
+        for (size_t a = 0; a < 17; a++) {
+          args[s][a] = smt_ite(ctx, ev->reach, padded[a], args[s][a]);
+        }
+      }
+      reach[s] = smt_or(ctx, reach[s], ev->reach);
+    }
+    if (!seen[0] || !seen[1]) {
+      all = smt_and(ctx, all,
+                    smt_not(ctx, seen[0] ? reach[0] : reach[1]));
+      continue;
+    }
+    SmtTerm same = smt_eq(ctx, who[0], who[1]);
+    for (size_t a = 0; a < 17; a++) {
+      same = smt_and(ctx, same, smt_eq(ctx, args[0][a], args[1][a]));
+    }
+    if (mem[0] != mem[1]) {
+      SmtTerm k = smt_fresh(ctx, "address", smt_bv_sort(ctx, 64));
+      same = smt_and(ctx, same,
+                     smt_implies(ctx, irs_outside_private(f, k),
+                                 smt_eq(ctx, smt_select(ctx, mem[0], k),
+                                        smt_select(ctx, mem[1], k))));
+    }
+    all = smt_and(ctx, all,
+                  smt_and(ctx, smt_iff(ctx, reach[0], reach[1]),
+                          smt_implies(ctx, reach[0], same)));
   }
   return all;
 }
@@ -2943,6 +3194,12 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
   SmtTerm claim = smt_and(ctx, same_trap, same_value);
   if (frame.lockstep) {
     claim = smt_and(ctx, claim, irs_lockstep_obligations(&frame));
+  }
+  if (frame.event_count || oa.events != ob.events) {
+    claim = smt_and(ctx, claim, irs_event_obligations(&frame));
+    claim = smt_and(ctx, claim,
+                    smt_implies(ctx, smt_not(ctx, oa.trap),
+                                smt_eq(ctx, oa.events, ob.events)));
   }
   claim = smt_implies(ctx, assume, claim);
   SmtSolver *solver = NULL;

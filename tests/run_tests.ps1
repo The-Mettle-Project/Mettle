@@ -1150,6 +1150,19 @@ $cases = @(
     Args          = @()
   },
   @{
+    Name          = "prove_external_calls"
+    Path          = "tests/prove_external_calls.mettle"
+    ShouldSucceed = $true
+    Args          = @()
+  },
+  @{
+    Name          = "err_prove_external_write"
+    Path          = "tests/err_prove_external_write.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'prove in `cleared` does not hold'
+  },
+  @{
     Name          = "prove_inferred_invariants"
     Path          = "tests/prove_inferred_invariants.mettle"
     ShouldSucceed = $true

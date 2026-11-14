@@ -42,11 +42,19 @@ shared state. By induction on the iteration count the two runs stay equal.
 A pass that changes a loop's shape, such as unrolling or vectorizing it,
 leaves the two sides out of step, and the application goes to the input sets.
 
+A call to a function without a body, such as a print or `malloc`, is an event.
+The k-th event on both sides returns the same unknown result, may trap the
+same way, and leaves the same unknown memory, except for locals whose address
+never reached a call. The solver proves that both sides make the same k-th
+call, under the same condition, with the same arguments and the same memory
+outside those locals, and the same number of calls in all. A function whose
+number of calls before some point depends on the path taken is not proved.
+A string literal is a fixed unknown address.
+
 When the solver finds a disagreement in loop-free code, the interpreter runs
 the solver's input first, so a real miscompile is reported with a concrete
-run. Code with string literals, calls to functions without a body, or block
-copies larger than 256 bytes goes straight to the input sets. See
-[Proofs](proofs.md).
+run. Code with indirect calls, vector instructions or block copies larger than
+256 bytes goes straight to the input sets. See [Proofs](proofs.md).
 
 ## Reference twins
 

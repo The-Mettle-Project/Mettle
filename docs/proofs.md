@@ -215,7 +215,10 @@ Each global variable has its own stretch of memory, apart from the locals and
 the other globals. Reading or writing it, or taking its address, is a load or
 a store there. A call to a function that writes a global, or that the prover
 cannot see into, leaves globals unknown afterward, and a pointer parameter may
-point at a global.
+point at a global. A call to a function without a body, such as `println`,
+returns an unknown value, may trap, and leaves every byte unknown except the
+locals whose address never reached a call. A string literal is a fixed unknown
+address.
 
 ## How the prover sees a function
 
@@ -226,7 +229,7 @@ unfolded when the prover can give it a definition:
 ```mermaid
 flowchart TD
   F[function] --> E{body encodes?}
-  E -- loops, string literals, large block copies --> O[opaque]
+  E -- loops, indirect calls, large block copies --> O[opaque]
   E -- yes --> R{reads only its parameters?}
   R -- globals, memory, uninitialized locals --> O
   R -- yes --> C{recursive?}
@@ -472,7 +475,7 @@ and subtract equals the multiplication, signed and unsigned.
 
 [Rewrite rules](rewrite-rules.md) are proved for every input before the
 compiler applies them, and fall back to generated inputs only when the solver
-cannot model a side, such as one that uses a string literal. A rule can also
+cannot model a side, such as one that makes an indirect call. A rule can also
 carry a `proof` block of tactics, which makes the optimizer apply an
 identity that only an induction establishes.
 [Translation validation](translation-validation.md) proves each pass
