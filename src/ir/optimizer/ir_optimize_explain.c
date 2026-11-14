@@ -4885,6 +4885,8 @@ static const char *const IR_KERNEL_DESC[IR_OP_KIND_COUNT] = {
     [IR_OP_SIMD_COPY] = "32-byte AVX2 element copy (scalar when the regions overlap)",
     [IR_OP_SIMD_SUM_I32] = "vpmovsxdq + vpaddq, 8-wide int32 sum into int64 (AVX2)",
     [IR_OP_SIMD_SUM_U8] = "vpsadbw, 32-wide byte sum (AVX2)",
+    [IR_OP_SIMD_LCG_U32] = "vpmulld jump-ahead, 8 generator states a step "
+                           "apart, masked sum into int64 (AVX2)",
     [IR_OP_SIMD_BYTE_MAP] = "32-wide byte map (AVX2)",
     [IR_OP_SIMD_FILL] = "16-byte splat stores (vectorized fill)",
     [IR_OP_SIMD_DOT_I32] = "vpmuldq + vpaddq, 8-wide int32 dot product into int64 (AVX2)",

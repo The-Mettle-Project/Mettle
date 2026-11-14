@@ -104,7 +104,6 @@
     "src/ir/optimizer/ir_optimize_explain.c::ir_explain_flush": 56,
     "src/ir/optimizer/ir_optimize_if_convert.c::ir_ifconv_try_at": 68,
     "src/ir/optimizer/ir_optimize_induction_cleanup.c::ir_eliminate_congruent_ivs_pass": 68,
-    "src/ir/optimizer/ir_optimize_inline.c::ir_inline_calls_in_function": 46,
     "src/ir/optimizer/ir_optimize_load_copy_cleanup.c::ir_eliminate_load_symbol_copy_pass": 55,
     "src/ir/optimizer/ir_optimize_load_copy_cleanup.c::ir_normalize_scan_at": 50,
     "src/ir/optimizer/ir_optimize_loop_unroll.c::ir_try_parse_counted_while_loop": 63,

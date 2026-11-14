@@ -1091,19 +1091,18 @@ static const DecisionDoc DECISIONS[] = {
      "Fix: move the asm out of the loop, or accept the scalar loop. Hand-written\n"
      "asm in a hot loop is usually already the vector code you wanted.\n"},
     {"control-flow", DECISION_VECTOR_REFUSAL,
-     "The loop body branches",
-     "The body has a nested loop or a data-dependent `if`. Lanes execute in\n"
-     "lockstep, so a branch that goes one way for lane 3 and the other way for\n"
-     "lane 4 has no single instruction to be.\n"
+     "The loop body branches on data",
+     "The body has a data-dependent `if`. The lane vectorizer runs an\n"
+     "if/else as masks: both arms compute in every lane and a select keeps\n"
+     "the right one. It takes that shape only inside a loop it can run at\n"
+     "all, and the remark says where it stopped:\n"
      "\n"
-     "Note the compiler already if-converts short branches into masked\n"
-     "arithmetic where it can (see `if-converted`). This code fires when the\n"
-     "branch was too big or too effectful for that.\n"
+     "  - the loop test is not a signed `counter < bound`\n"
+     "  - the counter does not step by one as the last statement\n"
+     "  - an element is not 32 bits wide\n"
+     "  - an address is not `base[i]` with the counter as the index\n"
      "\n"
-     "Fixes:\n"
-     "  - hoist the condition out when it does not depend on the index\n"
-     "  - replace a small `if` with arithmetic: `x = c * a + (1 - c) * b`\n"
-     "  - split one loop into two, each with a straight-line body\n"},
+     "The fix line under the remark is the fix for that stop.\n"},
     {"early-exit", DECISION_VECTOR_REFUSAL,
      "The loop can leave before its trip count",
      "A `break` or an early `return` means the number of iterations is not\n"
@@ -1243,12 +1242,18 @@ static const DecisionDoc DECISIONS[] = {
      "remark names by line:\n"
      "\n"
      "  - Arithmetic in float64. Lanes are 32 bits wide.\n"
-     "  - Integer division or remainder. AVX2 has no integer divide.\n"
+     "  - Integer division or remainder. AVX2 has no integer divide and no\n"
+     "    multiply-high to build a constant divide from.\n"
      "  - A value whose full 64 bits matter, such as an int64 compared or\n"
      "    shifted right. Lanes keep the low 32 bits.\n"
+     "  - A shift by more than 31, or by a count that may be negative.\n"
+     "  - A constant or a variable with no 32-bit lane form.\n"
+     "  - Pointer arithmetic other than `base[i]`, such as a struct field\n"
+     "    `b[i].x` or an address taken with `&a[i]`.\n"
      "\n"
-     "Fix: keep the arithmetic in float32 or 32-bit integers when the range\n"
-     "fits, and widen once after the loop.\n"},
+     "Adding, subtracting and multiplying int64 values is not on the list:\n"
+     "the lanes compute the low 32 bits exactly, and a store into a 32-bit\n"
+     "element keeps only those.\n"},
     {"scalar-target", DECISION_VECTOR_REFUSAL,
      "A target this compiler emits no vector code for",
      "The build targets AArch64. Mettle's loop vectorizers write x86-64 SSE\n"
@@ -1273,7 +1278,13 @@ static const DecisionDoc DECISIONS[] = {
      "  - As the value from the last iteration whose condition held. Find\n"
      "    that index in a loop of its own.\n"
      "  - As a sum wider than 32 bits. Accumulate in int32 or float32 and\n"
-     "    widen after the loop.\n"},
+     "    widen after the loop.\n"
+     "  - As a value the next iteration reads before writing, with no running\n"
+     "    sum to regroup: a pointer chase `i = next[i]`, or Fibonacci's\n"
+     "    `a, b = b, a + b`. That chain is the algorithm.\n"
+     "\n"
+     "A conditional sum, where each arm of an `if` adds to the total, is a\n"
+     "running sum and vectorizes.\n"},
     {"lane-budget", DECISION_VECTOR_REFUSAL,
      "More operands than the lane kernel stages",
      "The lane kernel takes its arrays, loop-invariant values, sums and loop\n"
@@ -1458,9 +1469,12 @@ static const DecisionDoc DECISIONS[] = {
      "the distances are few and known.\n"},
     {"unrecognized-shape", DECISION_VECTOR_REFUSAL,
      "No recognizer claimed this loop",
-     "The honest fallback. The compiler ruled out every disqualifier it can\n"
-     "detect and still found no kernel for the loop, so it says that rather\n"
-     "than guessing at a cause.\n"
+     "No kernel matched the loop, and the lane vectorizer, which takes most\n"
+     "counted loops, stopped on the loop itself: its test is not a signed\n"
+     "`counter < bound`, or its counter does not step by one as the last\n"
+     "statement. The remark names which. When the lane vectorizer left no\n"
+     "verdict and the report finds no call, branch, recurrence, carried\n"
+     "value or element width to blame, the remark says so.\n"
      "\n"
      "What does vectorize, as a checklist:\n"
      "  - unit-stride accesses, `a[i]` and not `a[i * k]`\n"
@@ -1539,11 +1553,12 @@ static const DecisionDoc DECISIONS[] = {
      "\n"
      "A structural guard: @inline does not override it.\n"},
     {"callee-has-loop", DECISION_INLINE_REFUSAL,
-     "The callee's loop body is over the inline size budget",
-     "A small loop-bearing callee inlines, because that is what exposes its\n"
-     "loop to values the caller already holds in registers. Past the budget\n"
-     "the call is noise next to the loop it reaches, and the caller growth\n"
-     "is not repaid. The budget doubles at sites two or more loops deep.\n"
+     "The callee has a loop and is over the size budget for one",
+     "A small callee with a loop inlines, because that is what exposes its\n"
+     "loop to values the caller already holds in registers. The budget\n"
+     "counts the whole callee, 80 instructions, and doubles at sites two or\n"
+     "more loops deep. Past it the call is noise next to the loop it\n"
+     "reaches, and the caller growth is not repaid.\n"
      "\n"
      "@inline inlines it anyway. Where the loop is hot, look at its own\n"
      "remark first: that is usually where the time goes.\n"},
@@ -1555,13 +1570,14 @@ static const DecisionDoc DECISIONS[] = {
      "\n"
      "A structural guard: @inline does not override it.\n"},
     {"callee-has-kernel", DECISION_INLINE_REFUSAL,
-     "The callee's loops became SIMD kernels",
-     "Not a refusal to worry about. The callee's loops vectorized, which\n"
-     "happens after inlining runs, so the call survives to the end of the\n"
-     "pipeline and gets reported here.\n"
+     "The callee was kept as a call and its loop became a SIMD kernel",
+     "The inliner refused this call for the reason the remark gives first.\n"
+     "Vectorization runs after inlining, and it later turned the callee's\n"
+     "loop into a kernel.\n"
      "\n"
      "The kernel runs at the same speed either way. One call to reach it is\n"
-     "not measurable against the loop it contains.\n"},
+     "not measurable against the loop it contains, so the refusal costs\n"
+     "nothing here.\n"},
     {"recursive", DECISION_INLINE_REFUSAL,
      "The call is directly recursive",
      "A function calling itself cannot be inlined without bound. Mettle\n"
@@ -1591,12 +1607,20 @@ static const DecisionDoc DECISIONS[] = {
      "A structural guard: @inline does not override it.\n"},
     {"rounds-exhausted", DECISION_INLINE_REFUSAL,
      "Inlining rounds ran out before this call was revisited",
-     "The callee passes every check. The call site only appeared late, exposed\n"
-     "by an earlier round of inlining, and the round limit was reached before\n"
-     "the inliner came back to it.\n"
+     "The inliner runs four rounds over the program. This call site appeared\n"
+     "in the last of them, copied in with the body of another callee, and\n"
+     "the inliner stopped before it came back to look at it.\n"
      "\n"
-     "Fix: mark the callee @inline, which raises its priority. Deep call\n"
-     "chains hit this most: each level of nesting costs a round.\n"},
+     "Deep call chains hit this: each level of nesting costs a round. No\n"
+     "decorator changes the round count. Flattening the chain by one level,\n"
+     "or calling the inner function directly, brings the site into reach.\n"},
+    {"call-after-inlining", DECISION_INLINE_REFUSAL,
+     "A pass after the inliner created this call",
+     "The inliner never saw this call site. A pass that runs after it, such\n"
+     "as one that moves a call out of a loop or turns a loop into a call to\n"
+     "a helper, put the call where it is now.\n"
+     "\n"
+     "Nothing in the source decides this, so there is no fix to apply.\n"},
 
     {"vectorized", DECISION_APPLIED,
      "The loop became a SIMD kernel",

@@ -98,6 +98,92 @@ static int ir_function_name_is_inline_denylisted(const char *name) {
 
 static MTLC_THREAD_LOCAL const char *g_inline_refusal_code = NULL;
 static MTLC_THREAD_LOCAL char g_inline_why[256];
+
+typedef struct {
+  char *caller;
+  char *callee;
+  size_t line;
+  size_t column;
+  const char *code;
+  char *reason;
+  const char *fix;
+} IRInlineRefusal;
+
+static MTLC_THREAD_LOCAL IRInlineRefusal *g_inline_refusals = NULL;
+static MTLC_THREAD_LOCAL size_t g_inline_refusal_count = 0;
+static MTLC_THREAD_LOCAL size_t g_inline_refusal_capacity = 0;
+static MTLC_THREAD_LOCAL char g_inline_kernel_why[640];
+
+static IRInlineRefusal *ir_inline_refusal_find(const char *caller,
+                                               const char *callee,
+                                               SourceLocation location) {
+  for (size_t i = g_inline_refusal_count; i-- > 0;) {
+    IRInlineRefusal *r = &g_inline_refusals[i];
+    if (r->line == location.line && r->column == location.column &&
+        strcmp(r->callee, callee) == 0 && strcmp(r->caller, caller) == 0) {
+      return r;
+    }
+  }
+  return NULL;
+}
+
+static void ir_inline_refusal_note(const IRFunction *caller,
+                                   const IRInstruction *instruction,
+                                   const char *code, const char *reason,
+                                   const char *fix) {
+  if (!caller->name || !instruction->text || !reason) {
+    return;
+  }
+  IRInlineRefusal *r =
+      ir_inline_refusal_find(caller->name, instruction->text,
+                             instruction->location);
+  if (!r) {
+    if (g_inline_refusal_count == g_inline_refusal_capacity) {
+      size_t grown = g_inline_refusal_capacity ? 2 * g_inline_refusal_capacity
+                                               : 64;
+      IRInlineRefusal *more =
+          realloc(g_inline_refusals, grown * sizeof(IRInlineRefusal));
+      if (!more) {
+        return;
+      }
+      g_inline_refusals = more;
+      g_inline_refusal_capacity = grown;
+    }
+    char *caller_name = mettle_strdup(caller->name);
+    char *callee_name = mettle_strdup(instruction->text);
+    if (!caller_name || !callee_name) {
+      free(caller_name);
+      free(callee_name);
+      return;
+    }
+    r = &g_inline_refusals[g_inline_refusal_count++];
+    r->caller = caller_name;
+    r->callee = callee_name;
+    r->line = instruction->location.line;
+    r->column = instruction->location.column;
+    r->reason = NULL;
+  }
+  char *text = mettle_strdup(reason);
+  if (!text) {
+    return;
+  }
+  free(r->reason);
+  r->reason = text;
+  r->code = code;
+  r->fix = fix;
+}
+
+static void ir_inline_refusals_clear(void) {
+  for (size_t i = 0; i < g_inline_refusal_count; i++) {
+    free(g_inline_refusals[i].caller);
+    free(g_inline_refusals[i].callee);
+    free(g_inline_refusals[i].reason);
+  }
+  free(g_inline_refusals);
+  g_inline_refusals = NULL;
+  g_inline_refusal_count = 0;
+  g_inline_refusal_capacity = 0;
+}
 static size_t ir_function_non_nop_instruction_count(const IRFunction *function);
 
 static int ir_inline_call_counts(const IRInstruction *instruction) {
@@ -286,10 +372,15 @@ static int ir_inline_loop_body_rejects(const IRFunction *function, int forced,
   if (scan->non_nop_count <= budget || scan->cleaned_count <= budget) {
     return 0;
   }
-  IR_INLINE_WHY(why_not, "callee-has-loop",
-                "the callee's loop body is over the inline size budget for "
-                "a loop-bearing callee (the call itself costs little next "
-                "to the loop inside it)");
+  char shown[128];
+  ir_display_name(function->name, shown, sizeof(shown));
+  snprintf(g_inline_why, sizeof(g_inline_why),
+           "`%s` has a loop and is %zu instructions, and a callee with a "
+           "loop may be at most %zu at a site %s",
+           shown, scan->cleaned_count, budget,
+           site_loop_depth >= 2 ? "two or more loops deep"
+                                : "less than two loops deep");
+  IR_INLINE_WHY(why_not, "callee-has-loop", g_inline_why);
   *fix = "mark the callee @inline to inline it anyway";
   return 1;
 }
@@ -1055,33 +1146,155 @@ static int ir_function_is_tiny_leaf(const IRFunction *callee) {
   return 1;
 }
 
+static MTLC_THREAD_LOCAL int g_inline_recording = 0;
+
+static const char *ir_inline_argument_count_why(const IRInstruction *instruction,
+                                                const IRFunction *callee) {
+  char shown[128];
+  ir_display_name(callee->name, shown, sizeof(shown));
+  if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS) {
+    snprintf(g_inline_why, sizeof(g_inline_why),
+             "the call passes %zu arguments, and the inliner binds at most %d",
+             instruction->argument_count, IR_INLINE_MAX_PARAMETERS);
+  } else {
+    snprintf(g_inline_why, sizeof(g_inline_why),
+             "the call passes %zu argument%s, and `%s` declares %zu",
+             instruction->argument_count,
+             instruction->argument_count == 1 ? "" : "s", shown,
+             callee->parameter_count);
+  }
+  return g_inline_why;
+}
+
+static const char *ir_inline_caller_budget_why(const IRFunction *caller,
+                                               size_t caller_size) {
+  char shown[128];
+  ir_display_name(caller->name, shown, sizeof(shown));
+  snprintf(g_inline_why, sizeof(g_inline_why),
+           "`%s` is already %zu instructions against a budget of %zu, and "
+           "this call sits outside every loop, so it runs once per call of "
+           "`%s`",
+           shown, caller_size, (size_t)ir_opt_inline_caller_budget(caller),
+           shown);
+  return g_inline_why;
+}
+
+static int ir_inline_refusal_is_absolute(const char *code) {
+  static const char *const absolute[] = {
+      "callee-no-body",      "callee-noinline",        "callee-denylisted",
+      "too-many-parameters", "callee-parameter-names", "callee-inline-asm",
+      "callee-no-return"};
+  for (size_t i = 0; code && i < sizeof(absolute) / sizeof(absolute[0]); i++) {
+    if (strcmp(code, absolute[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_inline_site_exempt_from_caller_budget(
+    IRFunction *caller, const IRInstruction *instruction,
+    const IRFunction *callee, int site_loop_depth) {
+  return callee->is_inline || ir_function_is_tiny_leaf(callee) ||
+         ir_opt_function_is_hot(callee) ||
+         ir_opt_site_is_hot(caller, instruction->location) ||
+         site_loop_depth > 0;
+}
+
+static IRFunction *ir_inline_site_decision(IRProgram *program,
+                                           IRFunction *function,
+                                           const IRInstruction *instruction,
+                                           int site_loop_depth,
+                                           size_t caller_size,
+                                           int caller_over_budget) {
+  if (instruction->op != IR_OP_CALL || !instruction->text) {
+    return NULL;
+  }
+  IRFunction *callee = ir_program_find_function(program, instruction->text);
+  if (!callee || callee == function) {
+    return NULL;
+  }
+  int record = g_inline_recording &&
+               (ir_explain_enabled() || callee->is_inline_contract);
+  const char *reason = NULL;
+  const char *fix = NULL;
+  g_inline_refusal_code = NULL;
+  if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
+      instruction->argument_count != callee->parameter_count) {
+    IR_INLINE_WHY(&reason, "argument-count",
+                  record ? ir_inline_argument_count_why(instruction, callee)
+                         : NULL);
+  } else if (caller_over_budget &&
+             !ir_inline_site_exempt_from_caller_budget(
+                 function, instruction, callee, site_loop_depth)) {
+    if (!record) {
+      return NULL;
+    }
+    if (ir_function_is_inline_candidate_at(callee, site_loop_depth, &reason,
+                                           &fix) ||
+        !ir_inline_refusal_is_absolute(g_inline_refusal_code)) {
+      fix = NULL;
+      IR_INLINE_WHY(&reason, "caller-over-budget",
+                    ir_inline_caller_budget_why(function, caller_size));
+    }
+  } else if (ir_function_is_inline_candidate_at(callee, site_loop_depth,
+                                                &reason, &fix)) {
+    return callee;
+  }
+  if (record) {
+    ir_inline_refusal_note(function, instruction, g_inline_refusal_code,
+                           reason, fix);
+  }
+  return NULL;
+}
+
+static void ir_inline_note_unvisited_calls(IRProgram *program) {
+  for (size_t f = 0; f < program->function_count; f++) {
+    IRFunction *function = program->functions[f];
+    if (!function || !function->name || function->rewrite_role) {
+      continue;
+    }
+    for (size_t i = 0; i < function->instruction_count; i++) {
+      const IRInstruction *instruction = &function->instructions[i];
+      if (instruction->op != IR_OP_CALL || !instruction->text) {
+        continue;
+      }
+      IRFunction *callee = ir_program_find_function(program, instruction->text);
+      if (!callee || callee == function ||
+          (!ir_explain_enabled() && !callee->is_inline_contract) ||
+          ir_inline_refusal_find(function->name, instruction->text,
+                                 instruction->location)) {
+        continue;
+      }
+      ir_inline_refusal_note(
+          function, instruction, "rounds-exhausted",
+          "an earlier round of inlining exposed this call, and the inliner "
+          "stopped after its last round before coming back to it",
+          NULL);
+    }
+  }
+}
+
 static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
                                        size_t *inline_counter, int *changed) {
   if (!program || !function || !inline_counter) {
     return 0;
   }
 
-  int caller_over_budget = ir_function_non_nop_instruction_count(function) >
-                           ir_opt_inline_caller_budget(function);
+  size_t caller_size = ir_function_non_nop_instruction_count(function);
+  int caller_over_budget = caller_size > ir_opt_inline_caller_budget(function);
   char *in_loop = ir_build_in_loop_bitmap(function);
 
   size_t first_inline = function->instruction_count;
+  IRFunction *first_callee = NULL;
   for (size_t i = 0; i < function->instruction_count; i++) {
-    const IRInstruction *instruction = &function->instructions[i];
-    if (instruction->op == IR_OP_CALL && instruction->text &&
-        instruction->argument_count <= IR_INLINE_MAX_PARAMETERS) {
-      IRFunction *callee = ir_program_find_function(program, instruction->text);
-      if (callee && callee != function &&
-          instruction->argument_count == callee->parameter_count &&
-          (!caller_over_budget || callee->is_inline ||
-           ir_function_is_tiny_leaf(callee) || ir_opt_function_is_hot(callee) ||
-           ir_opt_site_is_hot(function, instruction->location) ||
-           (in_loop && in_loop[i])) &&
-          ir_function_is_inline_candidate_at(callee, in_loop ? in_loop[i] : 0,
-                                             NULL, NULL)) {
-        first_inline = i;
-        break;
-      }
+    first_callee = ir_inline_site_decision(
+        program, function, &function->instructions[i],
+        in_loop ? (unsigned char)in_loop[i] : 0, caller_size,
+        caller_over_budget);
+    if (first_callee) {
+      first_inline = i;
+      break;
     }
   }
   if (first_inline == function->instruction_count) {
@@ -1099,18 +1312,14 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
   for (size_t i = 0; i < function->instruction_count; i++) {
     IRInstruction *instruction = &function->instructions[i];
 
-    if (i >= first_inline && instruction->op == IR_OP_CALL &&
-        instruction->text &&
-        instruction->argument_count <= IR_INLINE_MAX_PARAMETERS) {
-      IRFunction *callee = ir_program_find_function(program, instruction->text);
-      if (callee && callee != function &&
-          instruction->argument_count == callee->parameter_count &&
-          (!caller_over_budget || callee->is_inline ||
-           ir_function_is_tiny_leaf(callee) || ir_opt_function_is_hot(callee) ||
-           ir_opt_site_is_hot(function, instruction->location) ||
-           (in_loop && in_loop[i])) &&
-          ir_function_is_inline_candidate_at(callee, in_loop ? in_loop[i] : 0,
-                                             NULL, NULL)) {
+    if (i >= first_inline) {
+      IRFunction *callee =
+          i == first_inline
+              ? first_callee
+              : ir_inline_site_decision(program, function, instruction,
+                                        in_loop ? (unsigned char)in_loop[i] : 0,
+                                        caller_size, caller_over_budget);
+      if (callee) {
         if (ir_explain_enabled()) {
           char entity[160];
           size_t weight = ir_function_non_nop_instruction_count(callee);
@@ -1310,28 +1519,12 @@ int ir_inline_self_recursion_pass(IRProgram *program, int *changed) {
 static int ir_function_contains_simd_kernel(const IRFunction *function) {
   for (size_t i = 0; i < function->instruction_count; i++) {
     IROpcode op = function->instructions[i].op;
-    if (op >= IR_OP_COUNT_WORD_STARTS && op <= IR_OP_SIMD_OUTER_LANE_F64) {
+    if ((op >= IR_OP_COUNT_WORD_STARTS && op <= IR_OP_SIMD_OUTER_LANE_F64) ||
+        op == IR_OP_SIMD_LCG_U32 || op == IR_OP_SIMD_LANES) {
       return 1;
     }
   }
   return 0;
-}
-
-static int ir_inline_site_loop_depth(IRFunction *caller,
-                                     const IRInstruction *instruction) {
-  char *depths;
-  int depth = 0;
-  if (!caller || instruction < caller->instructions ||
-      (size_t)(instruction - caller->instructions) >=
-          caller->instruction_count) {
-    return 0;
-  }
-  depths = ir_build_in_loop_bitmap(caller);
-  if (depths) {
-    depth = (unsigned char)depths[instruction - caller->instructions];
-    free(depths);
-  }
-  return depth;
 }
 
 static void ir_inline_site_reason(IRFunction *caller,
@@ -1341,46 +1534,33 @@ static void ir_inline_site_reason(IRFunction *caller,
   *reason = NULL;
   *fix = NULL;
   g_inline_refusal_code = NULL;
-  if (callee != caller && ir_function_contains_simd_kernel(callee)) {
-    IR_INLINE_WHY(reason, "callee-has-kernel",
-                  "the callee's loops were vectorized into SIMD kernels after "
-                  "inlining ran; it stays a real call (the kernel runs the same "
-                  "either way)");
-    return;
-  }
   if (callee == caller) {
     IR_INLINE_WHY(reason, "recursive",
                   "the call is directly recursive");
     *fix = "bounded self-recursion expansion applies automatically; rewrite "
            "as a loop for full control";
-  } else if (ir_function_non_nop_instruction_count(caller) >
-                 ir_opt_inline_caller_budget(caller) &&
-             !callee->is_inline && !ir_function_is_tiny_leaf(callee) &&
-             !ir_opt_function_is_hot(callee) &&
-             instruction >= caller->instructions &&
-             !ir_opt_site_is_hot(caller, instruction->location) &&
-             !ir_call_site_is_in_loop(
-                 caller, (size_t)(instruction - caller->instructions))) {
-    char shown[128];
-    ir_display_name(caller->name, shown, sizeof(shown));
-    snprintf(g_inline_why, sizeof(g_inline_why),
-             "`%s` is already %zu instructions against a budget of %zu, and "
-             "this call sits outside every loop, so it runs once per call of "
-             "`%s`",
-             shown, ir_function_non_nop_instruction_count(caller),
-             (size_t)ir_opt_inline_caller_budget(caller), shown);
-    IR_INLINE_WHY(reason, "caller-over-budget", g_inline_why);
-  } else if (instruction->argument_count > IR_INLINE_MAX_PARAMETERS ||
-             instruction->argument_count != callee->parameter_count) {
-    IR_INLINE_WHY(reason, "argument-count",
-                  "the call's argument count doesn't match what the inliner "
-                  "handles for this callee");
-  } else if (ir_function_is_inline_candidate_at(
-                 callee, ir_inline_site_loop_depth(caller, instruction), reason,
-                 fix)) {
-    IR_INLINE_WHY(reason, "rounds-exhausted",
-                  "inlining rounds reached their limit before this call could "
-                  "be revisited");
+    return;
+  }
+  const IRInlineRefusal *logged =
+      caller->name ? ir_inline_refusal_find(caller->name, instruction->text,
+                                            instruction->location)
+                   : NULL;
+  if (logged) {
+    *reason = logged->reason;
+    *fix = logged->fix;
+    g_inline_refusal_code = logged->code;
+  } else {
+    IR_INLINE_WHY(reason, "call-after-inlining",
+                  "a pass after the inliner put this call here, so the "
+                  "inliner never saw it");
+  }
+  if (*reason && ir_function_contains_simd_kernel(callee)) {
+    snprintf(g_inline_kernel_why, sizeof(g_inline_kernel_why),
+             "%s. The callee's loop became a SIMD kernel after that, and one "
+             "call to reach the kernel costs nothing next to it",
+             *reason);
+    *reason = g_inline_kernel_why;
+    g_inline_refusal_code = "callee-has-kernel";
   }
 }
 
@@ -1617,6 +1797,9 @@ int ir_inline_small_functions_pass(IRProgram *program, int *changed) {
     return 0;
   }
 
+  ir_inline_refusals_clear();
+  g_inline_recording = 1;
+  int ran_out = 1;
   for (int round = 0; round < IR_INLINE_MAX_ROUNDS; round++) {
     int round_changed = 0;
 
@@ -1627,6 +1810,7 @@ int ir_inline_small_functions_pass(IRProgram *program, int *changed) {
       if (!ir_inline_calls_in_function(program, program->functions[i],
                                        &program->next_inline_id,
                                        &round_changed)) {
+        g_inline_recording = 0;
         return 0;
       }
     }
@@ -1635,8 +1819,13 @@ int ir_inline_small_functions_pass(IRProgram *program, int *changed) {
       *changed = 1;
     }
     if (!round_changed) {
+      ran_out = 0;
       break;
     }
+  }
+  g_inline_recording = 0;
+  if (ran_out) {
+    ir_inline_note_unvisited_calls(program);
   }
 
   return 1;

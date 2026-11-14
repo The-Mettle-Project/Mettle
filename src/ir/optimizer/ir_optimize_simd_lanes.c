@@ -115,9 +115,11 @@ static void lane_record_verdict(const LaneBuild *B, size_t header) {
   if (!fn->name) {
     return;
   }
+  size_t before = g_lane_verdict_count;
   LaneVerdict *v =
       lane_verdict_slot(fn->name, fn->instructions[header].location.line);
-  if (!v) {
+  if (!v || (g_lane_verdict_count == before && B->why == LANE_WHY_FRAME &&
+             v->why != LANE_WHY_FRAME)) {
     return;
   }
   v->why = B->why;
@@ -867,14 +869,30 @@ static void lane_refuse_width(LaneBuild *B, const IRInstruction *ins,
            (size_t)ins->location.line, verb, ins->rhs.int_value);
   lane_why(B, LANE_WHY_WIDTH, reason,
            "store the elements as float32, int32 or uint32 when their range "
-           "fits");
+           "fits; with 64-bit elements there is nothing to change here");
+}
+
+static void lane_refuse_address(LaneBuild *B, const IRInstruction *ins,
+                                const char *verb) {
+  char reason[320];
+  snprintf(reason, sizeof(reason),
+           "line %zu %s memory at an address other than `base[i]`; the lanes "
+           "read and write only 4-byte elements indexed by the loop counter, "
+           "through a pointer the loop does not change",
+           (size_t)ins->location.line, verb);
+  lane_why(B, LANE_WHY_ADDRESS, reason,
+           "index each array by the counter alone, and bind any row, field or "
+           "offset to a pointer before the loop");
 }
 
 static int lane_load(LaneBuild *B, const IRInstruction *ins, size_t at) {
   const char *base = NULL;
   lane_refuse_width(B, ins, "reads");
-  if (ins->rhs.kind != IR_OPERAND_INT || ins->rhs.int_value != 4 ||
-      !lane_decode_address(B, at, &ins->lhs, &base)) {
+  if (ins->rhs.kind != IR_OPERAND_INT || ins->rhs.int_value != 4) {
+    return -1;
+  }
+  if (!lane_decode_address(B, at, &ins->lhs, &base)) {
+    lane_refuse_address(B, ins, "reads");
     return -1;
   }
   int bi = lane_base_index(B, base);
@@ -901,8 +919,11 @@ static int lane_store(LaneBuild *B, const LaneEnv *env,
   const char *base = NULL;
   lane_refuse_width(B, ins, "writes");
   if ((B->depth && B->path < 0) || ins->rhs.kind != IR_OPERAND_INT ||
-      ins->rhs.int_value != 4 ||
-      !lane_decode_address(B, at, &ins->dest, &base)) {
+      ins->rhs.int_value != 4) {
+    return 0;
+  }
+  if (!lane_decode_address(B, at, &ins->dest, &base)) {
+    lane_refuse_address(B, ins, "writes");
     return 0;
   }
   int value = lane_value(B, env, &ins->lhs);
@@ -1203,40 +1224,201 @@ static int lane_refuse_carried_op(LaneBuild *B, const LaneEnv *env,
   return 1;
 }
 
+static const char *lane_pointer_source(const IRFunction *fn, size_t before,
+                                       const IROperand *op, int depth) {
+  if (depth > 8 || !op->name ||
+      (op->kind != IR_OPERAND_SYMBOL && op->kind != IR_OPERAND_TEMP)) {
+    return NULL;
+  }
+  if (op->kind == IR_OPERAND_SYMBOL) {
+    const char *type = lane_symbol_type(fn, op->name);
+    size_t len = type ? strlen(type) : 0;
+    return len && type[len - 1] == '*' ? op->name : NULL;
+  }
+  const IRInstruction *def = lane_temp_def(fn, before, op->name);
+  if (!def) {
+    return NULL;
+  }
+  size_t at = (size_t)(def - fn->instructions);
+  if (def->op == IR_OP_ADDRESS_OF) {
+    return def->lhs.name ? def->lhs.name : op->name;
+  }
+  if (def->op != IR_OP_BINARY && def->op != IR_OP_ASSIGN &&
+      def->op != IR_OP_CAST) {
+    return NULL;
+  }
+  const char *left = lane_pointer_source(fn, at, &def->lhs, depth + 1);
+  return left || def->op != IR_OP_BINARY
+             ? left
+             : lane_pointer_source(fn, at, &def->rhs, depth + 1);
+}
+
+static int lane_refuse_operand(LaneBuild *B, const LaneEnv *env,
+                               const IRInstruction *ins, const IROperand *op) {
+  if (op->kind == IR_OPERAND_NONE || lane_value(B, env, op) >= 0) {
+    return 0;
+  }
+  char reason[320];
+  char name[96];
+  size_t line = ins->location.line;
+  size_t at = (size_t)(ins - B->fn->instructions);
+  if (op->kind == IR_OPERAND_INT) {
+    snprintf(reason, sizeof(reason),
+             "line %zu uses the constant %lld, which does not fit in a 32-bit "
+             "lane",
+             line, op->int_value);
+    lane_why(B, LANE_WHY_WIDTH, reason,
+             "keep the constant and the values it meets inside 32 bits");
+    return 1;
+  }
+  const char *pointer = lane_pointer_source(B->fn, at, op, 0);
+  if (pointer) {
+    lane_source_name(pointer, name, sizeof(name));
+    snprintf(reason, sizeof(reason),
+             "line %zu computes an address from `%s` other than `base[i]`; "
+             "the lanes read and write only 4-byte elements indexed by the "
+             "loop counter",
+             line, name);
+    lane_why(B, LANE_WHY_ADDRESS, reason,
+             "index each array by the counter alone, and bind any row, field "
+             "or offset to a pointer before the loop");
+    return 1;
+  }
+  if (op->kind == IR_OPERAND_SYMBOL && op->name) {
+    const char *type = lane_symbol_type(B->fn, op->name);
+    lane_source_name(op->name, name, sizeof(name));
+    snprintf(reason, sizeof(reason),
+             "line %zu reads `%s`, a %s, and a 32-bit lane holds only "
+             "float32 and integers of 32 bits or fewer",
+             line, name, type ? type : "value of unknown type");
+    lane_why(B, LANE_WHY_WIDTH, reason,
+             "keep the values the loop computes with in float32 or 32-bit "
+             "integers");
+    return 1;
+  }
+  return 0;
+}
+
+static int lane_wide_operand(LaneBuild *B, const LaneEnv *env,
+                             const IROperand *op, char *name, size_t cap) {
+  int node = lane_as_int(B, lane_value(B, env, op));
+  if (node < 0 || B->nodes[node].ext != 0) {
+    return 0;
+  }
+  if (op->kind == IR_OPERAND_SYMBOL && op->name) {
+    char shown[96];
+    const char *type = lane_symbol_type(B->fn, op->name);
+    lane_source_name(op->name, shown, sizeof(shown));
+    snprintf(name, cap, "`%s` (%s), which may hold", shown,
+             type ? type : "no declared type");
+  } else {
+    snprintf(name, cap, "a value that may hold");
+  }
+  return 1;
+}
+
+static int lane_refuse_int_op(LaneBuild *B, const LaneEnv *env,
+                              const IRInstruction *ins, char *reason,
+                              size_t reason_cap, char *fix, size_t fix_cap) {
+  if (ins->op != IR_OP_BINARY || ins->is_float || !ins->text) {
+    return 0;
+  }
+  const char *op = ins->text;
+  size_t line = ins->location.line;
+  int shift = strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0;
+  int count = lane_as_int(B, lane_value(B, env, &ins->rhs));
+  char wide[160];
+  if (shift && count >= 0 && B->nodes[count].op == LANE_CONST &&
+      B->consts[B->nodes[count].a] > 31) {
+    snprintf(reason, reason_cap,
+             "line %zu shifts by %u bits, and a 32-bit lane shifts by at most "
+             "31",
+             line, (unsigned)B->consts[B->nodes[count].a]);
+    snprintf(fix, fix_cap, "keep the shifted values inside 32 bits");
+    return 1;
+  }
+  if (shift && count >= 0 && B->nodes[count].op != LANE_CONST &&
+      (B->nodes[count].ext & LX_U) == 0) {
+    snprintf(reason, reason_cap,
+             "line %zu shifts by a count that may be negative or wider than "
+             "32 bits",
+             line);
+    snprintf(fix, fix_cap, "declare the shift count uint32, or mask it with "
+                           "`& 31`");
+    return 1;
+  }
+  if (lane_wide_operand(B, env, &ins->lhs, wide, sizeof(wide)) ||
+      (!shift && lane_wide_operand(B, env, &ins->rhs, wide, sizeof(wide)))) {
+    snprintf(reason, reason_cap,
+             "line %zu needs `%s` on %s more than 32 bits, and `%s` reads "
+             "the bits a 32-bit lane drops",
+             line, op, wide, op);
+    snprintf(fix, fix_cap,
+             "declare the values int32 or uint32 when their range fits");
+    return 1;
+  }
+  if (lane_is_comparison(op) && ins->is_unsigned) {
+    snprintf(reason, reason_cap,
+             "line %zu compares as unsigned a value that may be negative",
+             line);
+    snprintf(fix, fix_cap, "compare values of one signedness");
+    return 1;
+  }
+  return 0;
+}
+
 static void lane_refuse_op(LaneBuild *B, const LaneEnv *env,
                            const IRInstruction *ins) {
   char reason[320];
   char fix[240];
   size_t line = ins->location.line;
   const char *text = ins->text ? ins->text : ir_opcode_name(ins->op);
+  if (B->n >= LANES_MAX_OPS) {
+    snprintf(reason, sizeof(reason),
+             "the body needs more than %d lane operations, and the lane "
+             "kernel holds at most %d",
+             LANES_MAX_OPS, LANES_MAX_OPS);
+    lane_why(B, LANE_WHY_BUDGET, reason,
+             "split the body into two loops over the same range");
+    return;
+  }
   if (lane_refuse_carried_op(B, env, ins)) {
     return;
+  }
+  if (lane_refuse_operand(B, env, ins, &ins->lhs) ||
+      lane_refuse_operand(B, env, ins, &ins->rhs)) {
+    return;
+  }
+  for (size_t a = 0; a < ins->argument_count; a++) {
+    if (lane_refuse_operand(B, env, ins, &ins->arguments[a])) {
+      return;
+    }
   }
   int divides = ins->op == IR_OP_BINARY && !ins->is_float && ins->text &&
                 (strcmp(ins->text, "/") == 0 || strcmp(ins->text, "%") == 0);
   if (ins->is_float && ins->float_bits == 64) {
     snprintf(reason, sizeof(reason),
              "line %zu computes `%s` in float64, and the lane vectorizer runs "
-             "eight 32-bit lanes",
+             "eight 32-bit lanes; the float64 kernels take a sum, a dot "
+             "product or an elementwise map, and none of them matched",
              line, text);
     snprintf(fix, sizeof(fix),
-             "keep the arithmetic in float32; a float64 sum of float32 "
-             "products is the one float64 shape with a kernel of its own");
+             "keep the arithmetic in float32 where the precision allows");
   } else if (divides) {
     snprintf(reason, sizeof(reason),
-             "line %zu divides integers, and AVX2 has no integer divide",
+             "line %zu divides integers, and the lanes have no integer divide "
+             "and no multiply-high to build one from",
              line);
     snprintf(fix, sizeof(fix),
-             "divide by a power of two with a shift, or move the division "
-             "out of the loop");
+             "where the divisor can be a power of two, write the shift or the "
+             "mask; any other divisor keeps the loop scalar");
   } else if (ins->op == IR_OP_CAST && strcmp(text, "float64") == 0) {
     snprintf(reason, sizeof(reason),
              "line %zu widens a value to float64, and the lanes are 32 bits "
              "wide",
              line);
     snprintf(fix, sizeof(fix),
-             "keep the arithmetic in float32; a float64 sum of float32 "
-             "products is the one float64 shape with a kernel of its own");
+             "keep the arithmetic in float32 where the precision allows");
   } else if (ins->op == IR_OP_CAST) {
     snprintf(reason, sizeof(reason),
              "line %zu converts to `%s`, and the 32-bit lanes cannot hold "
@@ -1245,14 +1427,12 @@ static void lane_refuse_op(LaneBuild *B, const LaneEnv *env,
     snprintf(fix, sizeof(fix),
              "convert between float32 and 32-bit integers inside the loop, "
              "and widen after it");
-  } else {
+  } else if (!lane_refuse_int_op(B, env, ins, reason, sizeof(reason), fix,
+                                 sizeof(fix))) {
     snprintf(reason, sizeof(reason),
-             "line %zu needs `%s` on values wider than the 32-bit lanes hold "
-             "exactly",
+             "line %zu uses `%s` in a form the lanes have no instruction for",
              line, text);
-    snprintf(fix, sizeof(fix),
-             "declare the values int32, uint32 or float32 when their range "
-             "fits");
+    fix[0] = '\0';
   }
   lane_why(B, LANE_WHY_OP, reason, fix);
 }
@@ -1352,6 +1532,21 @@ static int lane_collect_names(LaneBuild *B) {
         !lane_names_contain(B->written, B->written_count, ins->dest.name)) {
       if (strcmp(ins->dest.name, B->iv) == 0 ||
           ir_symbol_address_taken(B->fn, ins->dest.name)) {
+        char name[96];
+        char reason[320];
+        lane_source_name(ins->dest.name, name, sizeof(name));
+        snprintf(reason, sizeof(reason),
+                 strcmp(ins->dest.name, B->iv) == 0
+                     ? "line %zu assigns the counter `%s` inside the body, "
+                       "so iterations do not map to lanes one to one"
+                     : "line %zu writes `%s`, whose address the program "
+                       "takes, so a store through a pointer could read or "
+                       "change it",
+                 (size_t)ins->location.line, name);
+        lane_why(B, LANE_WHY_FRAME, reason,
+                 strcmp(ins->dest.name, B->iv) == 0
+                     ? "step the counter once, at the end of the body"
+                     : "work on a local copy whose address is never taken");
         return 0;
       }
       B->written[B->written_count++] = ins->dest.name;
@@ -1522,7 +1717,7 @@ static const char *lane_op_name(int op) {
 }
 
 enum { LANE_CARRY_CHAIN, LANE_CARRY_WIDE_SUM, LANE_CARRY_LAST_MATCH,
-       LANE_CARRY_PREVIOUS };
+       LANE_CARRY_PREVIOUS, LANE_CARRY_FLAG, LANE_CARRY_EXTREMUM };
 
 static int lane_depends_on(const LaneBuild *B, int node, int target);
 
@@ -1546,6 +1741,18 @@ static void lane_refuse_carried(LaneBuild *B, int r, int final, int shape,
   char name[96];
   lane_source_name(B->carried[r], name, sizeof(name));
   int op = final >= 0 ? B->nodes[final].op : 0;
+  if (shape == LANE_CARRY_CHAIN) {
+    int carry = -1;
+    for (int i = 0; i < B->n; i++) {
+      carry = B->nodes[i].op == LANE_CARRY && B->nodes[i].a == r ? i : carry;
+    }
+    int chain = lane_chain_op(B, final, carry);
+    op = chain ? chain : op;
+    if (op == LANE_FMIN || op == LANE_FMAX || op == LANE_IMIN ||
+        op == LANE_IMAX || op == LANE_UMIN || op == LANE_UMAX) {
+      shape = LANE_CARRY_EXTREMUM;
+    }
+  }
   if (shape == LANE_CARRY_WIDE_SUM) {
     snprintf(reason, sizeof(reason),
              "`%s` is a running sum in %s, and the lanes add 32-bit values",
@@ -1553,6 +1760,22 @@ static void lane_refuse_carried(LaneBuild *B, int r, int final, int shape,
     snprintf(fix, sizeof(fix),
              "accumulate in float32 or int32 when the total fits, and widen "
              "once after the loop");
+  } else if (shape == LANE_CARRY_FLAG) {
+    snprintf(reason, sizeof(reason),
+             "`%s` is set to one constant when the condition holds, an "
+             "any-of test, and the lane vectorizer reduces only sums",
+             name);
+    snprintf(fix, sizeof(fix),
+             "count the matches (`if (...) { bad = bad + 1; }`), which runs "
+             "as a masked add, and test the count after the loop");
+  } else if (shape == LANE_CARRY_EXTREMUM) {
+    snprintf(reason, sizeof(reason),
+             "`%s` is a running minimum or maximum, since the condition that "
+             "replaces it reads it, and the lane vectorizer reduces only sums",
+             name);
+    snprintf(fix, sizeof(fix),
+             "a loop that finds only the extreme value over `a[i]` runs on "
+             "the min and max kernels; find its index in a second loop");
   } else if (shape == LANE_CARRY_LAST_MATCH) {
     snprintf(reason, sizeof(reason),
              "`%s` keeps the value from the last iteration whose condition "
@@ -1570,15 +1793,10 @@ static void lane_refuse_carried(LaneBuild *B, int r, int final, int shape,
              "read the earlier element straight from its array (`x[i - 1]`) "
              "so each iteration stands alone");
   } else {
-    int carry = -1;
-    for (int i = 0; i < B->n; i++) {
-      carry = B->nodes[i].op == LANE_CARRY && B->nodes[i].a == r ? i : carry;
-    }
-    int chain = lane_chain_op(B, final, carry);
     snprintf(reason, sizeof(reason),
              "`%s` carries its value from one iteration into the next "
              "through `%s`, and only a running sum regroups into lanes",
-             name, lane_op_name(chain ? chain : op));
+             name, lane_op_name(op));
     snprintf(fix, sizeof(fix),
              "when this chain is the algorithm, as in a hash or a filter, "
              "the loop is already at its scalar floor");
@@ -1610,6 +1828,8 @@ static int lane_reduction(LaneBuild *B, int r, int final, int *kind_out) {
       value = lane_select(B, s.a, on, identity);
     } else if (off >= 0 && s.b == carry) {
       value = lane_select(B, s.a, identity, off);
+    } else if (on >= 0 && off >= 0) {
+      value = lane_select(B, s.a, on, off);
     }
   }
   const char *type = lane_symbol_type(B->fn, B->carried[r]);
@@ -1618,11 +1838,16 @@ static int lane_reduction(LaneBuild *B, int r, int final, int *kind_out) {
              (strcmp(type, "int32") == 0 || strcmp(type, "uint32") == 0);
   if (value < 0 || (!fsum && !isum) || lane_depends_on(B, value, carry)) {
     const LaneNode *f = &B->nodes[final];
+    int picks = f->op == LANE_SELECT && (f->b == carry || f->c == carry);
+    int other = picks ? (f->b == carry ? f->c : f->b) : -1;
     int shape = value >= 0 && !lane_depends_on(B, value, carry)
                     ? LANE_CARRY_WIDE_SUM
-                : f->op == LANE_SELECT && (f->b == carry || f->c == carry)
-                    ? LANE_CARRY_LAST_MATCH
-                    : LANE_CARRY_CHAIN;
+                : picks && lane_depends_on(B, f->a, carry)
+                    ? LANE_CARRY_EXTREMUM
+                : picks && other >= 0 && B->nodes[other].op == LANE_CONST
+                    ? LANE_CARRY_FLAG
+                : picks ? LANE_CARRY_LAST_MATCH
+                        : LANE_CARRY_CHAIN;
     lane_refuse_carried(B, r, final, shape, type);
     return -1;
   }
@@ -2050,12 +2275,23 @@ static int lane_frame(LaneBuild *B, size_t header, IROperand *bound) {
   IRFunction *fn = B->fn;
   size_t cmp_at = 0;
   size_t br_at = 0;
+  char reason[320];
+  char iv_name[96];
   if (!lane_match_compare(fn, header, &cmp_at, &br_at)) {
+    const char *label = fn->instructions[header].text;
+    if (label && strstr(label, "while_end_")) {
+      return 0;
+    }
+    lane_why(B, LANE_WHY_FRAME,
+             "the loop test is not a signed `counter < bound`, the only test "
+             "the lane vectorizer takes",
+             "count with `for i in 0..n`");
     return 0;
   }
   const IRInstruction *head = &fn->instructions[header];
   const IRInstruction *br = &fn->instructions[br_at];
   const IRInstruction *cmp = &fn->instructions[cmp_at];
+  lane_source_name(cmp->lhs.name, iv_name, sizeof(iv_name));
   size_t jump_at = (size_t)-1;
   for (size_t i = br_at + 1; i < fn->instruction_count; i++) {
     const IRInstruction *ins = &fn->instructions[i];
@@ -2067,6 +2303,10 @@ static int lane_frame(LaneBuild *B, size_t header, IROperand *bound) {
   }
   if (jump_at == (size_t)-1 ||
       !ir_fused_loop_exit_is_adjacent(fn, jump_at, br->text)) {
+    lane_why(B, LANE_WHY_FRAME,
+             "the loop does not end in one jump back to its test, so the "
+             "lane vectorizer finds no single body to run",
+             "move a `continue` or an early exit into a loop of its own");
     return 0;
   }
   size_t inc_at = jump_at;
@@ -2075,6 +2315,29 @@ static int lane_frame(LaneBuild *B, size_t header, IROperand *bound) {
   }
   if (inc_at <= br_at + 1 ||
       !lane_is_increment(fn, br_at + 1, inc_at - 1, cmp->lhs.name)) {
+    const IRInstruction *last =
+        inc_at > br_at + 1 ? &fn->instructions[inc_at - 1] : NULL;
+    char other[96];
+    other[0] = '\0';
+    if (last && ir_instruction_writes_destination(last) &&
+        last->dest.kind == IR_OPERAND_SYMBOL && last->dest.name) {
+      lane_source_name(last->dest.name, other, sizeof(other));
+    }
+    if (other[0] && strcmp(other, iv_name) != 0) {
+      snprintf(reason, sizeof(reason),
+               "the body updates `%s` after the counter `%s`, and the lane "
+               "vectorizer takes one counter, stepped by one as the last "
+               "statement, indexing every array",
+               other, iv_name);
+    } else {
+      snprintf(reason, sizeof(reason),
+               "the body does not step `%s` up by one, and the lane "
+               "vectorizer takes only a counter that does",
+               iv_name);
+    }
+    lane_why(B, LANE_WHY_FRAME, reason,
+             "count with `for i in 0..n`, and step any other index from the "
+             "counter");
     return 0;
   }
   B->iv = cmp->lhs.name;
@@ -2086,10 +2349,29 @@ static int lane_frame(LaneBuild *B, size_t header, IROperand *bound) {
   B->exit_index = jump_at + 1;
   const char *iv_type = lane_symbol_type(fn, B->iv);
   if (!iv_type ||
-      (strcmp(iv_type, "int64") != 0 && strcmp(iv_type, "int32") != 0) ||
-      ir_symbol_address_taken(fn, B->iv) ||
-      !lane_prefix_is_invariant(B, jump_at) ||
+      (strcmp(iv_type, "int64") != 0 && strcmp(iv_type, "int32") != 0)) {
+    snprintf(reason, sizeof(reason),
+             "the counter `%s` is %s, and the lane vectorizer takes an int32 "
+             "or int64 counter",
+             iv_name, iv_type ? iv_type : "of no declared type");
+    lane_why(B, LANE_WHY_FRAME, reason, "declare the counter int32 or int64");
+    return 0;
+  }
+  if (ir_symbol_address_taken(fn, B->iv)) {
+    snprintf(reason, sizeof(reason),
+             "the program takes the address of the counter `%s`, so a store "
+             "through a pointer could change it",
+             iv_name);
+    lane_why(B, LANE_WHY_FRAME, reason,
+             "copy the counter into a local whose address is never taken");
+    return 0;
+  }
+  if (!lane_prefix_is_invariant(B, jump_at) ||
       !lane_bound_is_invariant(B, &cmp->rhs)) {
+    lane_why(B, LANE_WHY_FRAME,
+             "the body changes a value the loop test reads, so the trip "
+             "count is not fixed when the loop starts",
+             "compute the bound into a local before the loop");
     return 0;
   }
   for (size_t i = header; i-- > 0;) {
@@ -2156,7 +2438,7 @@ static int lane_try_at(IRFunction *fn, size_t header, int install,
   }
   B->fn = fn;
   int planned = lane_plan_loop(B, &env, &plan, header, &bound);
-  if ((install && planned) || (!planned && B->why != LANE_WHY_NONE)) {
+  if (B->why != LANE_WHY_NONE) {
     lane_record_verdict(B, header);
   }
   if (planned && install) {

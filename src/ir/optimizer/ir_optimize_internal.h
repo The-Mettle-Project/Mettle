@@ -853,8 +853,13 @@ enum {
   LANE_WHY_CARRIED,
   LANE_WHY_BUDGET,
   LANE_WHY_SHAPE,
-  LANE_WHY_WIDTH
+  LANE_WHY_WIDTH,
+  LANE_WHY_ADDRESS,
+  LANE_WHY_FRAME
 };
+#define LANE_WHY_IS_WEAK(why)                                                  \
+  ((why) == LANE_WHY_NONE || (why) == LANE_WHY_WIDTH ||                        \
+   (why) == LANE_WHY_ADDRESS || (why) == LANE_WHY_FRAME)
 int ir_simd_lanes_verdict(const char *fn, size_t line, char *reason,
                           size_t reason_cap, char *fix, size_t fix_cap);
 int ir_simd_insertion_sort_i32_pass(IRFunction *function, int *changed);
