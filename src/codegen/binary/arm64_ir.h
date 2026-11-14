@@ -6,6 +6,8 @@
 
 int arm64_ir_encode_function(Arm64Emit *e, const IRFunction *fn);
 
+int arm64_ir_function_is_intercepted(const char *name);
+
 int arm64_ir_encode_program(Arm64Emit *e, const IRProgram *prog,
                             const char *entry, unsigned char **data_out,
                             size_t *data_len_out);

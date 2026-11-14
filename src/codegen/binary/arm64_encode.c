@@ -120,6 +120,90 @@ uint32_t arm64_smulh(Arm64Reg rd, Arm64Reg rn, Arm64Reg rm) {
 uint32_t arm64_umulh(Arm64Reg rd, Arm64Reg rn, Arm64Reg rm) {
   return 0x9BC07C00u | (R5(rm) << 16) | (R5(rn) << 5) | R5(rd);
 }
+
+static int arm64_is_shifted_mask(uint64_t v) {
+  if (v == 0) {
+    return 0;
+  }
+  uint64_t filled = (v - 1) | v;
+  return ((filled + 1) & filled) == 0;
+}
+
+static int arm64_trailing_ones(uint64_t v) {
+  int n = 0;
+  while (v & 1u) {
+    n++;
+    v >>= 1;
+  }
+  return n;
+}
+
+static int arm64_leading_ones(uint64_t v) {
+  int n = 0;
+  while (v & 0x8000000000000000ull) {
+    n++;
+    v <<= 1;
+  }
+  return n;
+}
+
+int arm64_logical_imm(uint64_t value, uint32_t *fields) {
+  if (value == 0 || value == ~0ull) {
+    return 0;
+  }
+  int size = 64;
+  while (size > 2) {
+    int half = size / 2;
+    uint64_t mask = (1ull << half) - 1;
+    if ((value & mask) != ((value >> half) & mask)) {
+      break;
+    }
+    size = half;
+  }
+  uint64_t mask = size == 64 ? ~0ull : (1ull << size) - 1;
+  value &= mask;
+  int rotate;
+  int ones;
+  if (arm64_is_shifted_mask(value)) {
+    rotate = 0;
+    while (((value >> rotate) & 1u) == 0) {
+      rotate++;
+    }
+    ones = arm64_trailing_ones(value >> rotate);
+  } else {
+    value |= ~mask;
+    if (!arm64_is_shifted_mask(~value)) {
+      return 0;
+    }
+    int leading = arm64_leading_ones(value);
+    rotate = 64 - leading;
+    ones = leading + arm64_trailing_ones(value) - (64 - size);
+  }
+  uint32_t immr = (uint32_t)((size - rotate) & (size - 1));
+  uint32_t nimms = (uint32_t)(~(size - 1) << 1);
+  nimms |= (uint32_t)(ones - 1);
+  uint32_t n = ((nimms >> 6) & 1u) ^ 1u;
+  *fields = (n << 12) | (immr << 6) | (nimms & 0x3Fu);
+  return 1;
+}
+
+static uint32_t arm64_logical_imm_word(uint32_t base, Arm64Reg rd, Arm64Reg rn,
+                                       uint32_t fields) {
+  return base | (((fields >> 12) & 1u) << 22) | (((fields >> 6) & 0x3Fu) << 16) |
+         ((fields & 0x3Fu) << 10) | (R5(rn) << 5) | R5(rd);
+}
+
+uint32_t arm64_and_imm(Arm64Reg rd, Arm64Reg rn, uint32_t fields) {
+  return arm64_logical_imm_word(0x92000000u, rd, rn, fields);
+}
+
+uint32_t arm64_orr_imm(Arm64Reg rd, Arm64Reg rn, uint32_t fields) {
+  return arm64_logical_imm_word(0xB2000000u, rd, rn, fields);
+}
+
+uint32_t arm64_eor_imm(Arm64Reg rd, Arm64Reg rn, uint32_t fields) {
+  return arm64_logical_imm_word(0xD2000000u, rd, rn, fields);
+}
 uint32_t arm64_sdiv(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm) {
   uint32_t base = is64 ? 0x9AC00C00u : 0x1AC00C00u;
   return base | (R5(rm) << 16) | (R5(rn) << 5) | R5(rd);

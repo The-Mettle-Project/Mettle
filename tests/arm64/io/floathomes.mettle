@@ -1,0 +1,62 @@
+import "std/io";
+
+@noinline fn nan64() -> float64 { var z: float64 = 0.0; return z / z; }
+
+fn mixed(n: int32, step: float32) -> float64 {
+  var a: float32 = (float32)0.0;
+  var b: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < n) {
+    a = a + step;
+    b = b + (float64)a * 0.5;
+    i = i + 1;
+  }
+  return b + (float64)a;
+}
+
+fn count_below(limit: float64) -> int32 {
+  var x: float64 = 0.25;
+  var hits: int32 = 0;
+  while (x < limit) {
+    if (x >= 1.0) { hits = hits + 1; }
+    x = x * 2.0;
+  }
+  return hits;
+}
+
+fn nan_branches(v: float64) -> int32 {
+  var taken: int32 = 0;
+  if (v < 1.0) { taken = taken + 1; }
+  if (v > 1.0) { taken = taken + 2; }
+  if (v == v) { taken = taken + 4; }
+  if (v != v) { taken = taken + 8; }
+  if (v <= 1.0) { taken = taken + 16; }
+  if (v >= 1.0) { taken = taken + 32; }
+  return taken;
+}
+
+fn dot(xs: float32*, ys: float32*, n: int32) -> float32 {
+  var acc: float32 = (float32)0.0;
+  var i: int32 = 0;
+  while (i < n) {
+    acc = acc + xs[i] * ys[i];
+    i = i + 1;
+  }
+  return acc;
+}
+
+fn main() -> int32 {
+  var xs: float32[8];
+  var ys: float32[8];
+  var i: int32 = 0;
+  while (i < 8) {
+    xs[i] = (float32)i * (float32)0.5;
+    ys[i] = (float32)(8 - i) * (float32)0.25;
+    i = i + 1;
+  }
+  println("mixed {(int64)(mixed(16, (float32)0.125) * 1000.0)}");
+  println("below {count_below(100.0)}");
+  println("nan {nan_branches(nan64())} one {nan_branches(1.0)} two {nan_branches(2.0)}");
+  println("dot {(int64)((float64)dot(&xs[0], &ys[0], 8) * 1000.0)}");
+  return 0;
+}

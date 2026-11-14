@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#define IR_SIMD_SCALAR_TARGET_REASON                                           \
+  "the target is AArch64, and this compiler emits no AArch64 vector code; "   \
+  "the loop runs as scalar code"
+
 static int g_simd_contract_user_error = 0;
 static int g_simd_report = 0;
 
@@ -3021,6 +3025,12 @@ char headline[192], reason[320], fix[320];
     ir_explain_remark_code("eliminated");
     ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
   }
+  } else if (ir_optimize_scalar_target()) {
+  ir_explain_remark(function->name, "loop", L->location, 0, "NOT vectorized",
+                    IR_SIMD_SCALAR_TARGET_REASON, NULL, NULL);
+  ir_explain_remark_code("scalar-target");
+  ir_explain_remark_advisory();
+  ir_explain_remark_extent(ir_simd_loop_end_line(function, L));
   } else {
   int diagnosis = IR_SIMD_BAIL_NONE;
   int advisory = 0;
@@ -3204,7 +3214,9 @@ int ir_verify_simd_contracts(IRFunction *function) {
       continue;
     }
 
-    const char *reason = ir_simd_bail_reason(function, begin_index, i);
+    const char *reason = ir_optimize_scalar_target()
+                             ? IR_SIMD_SCALAR_TARGET_REASON
+                             : ir_simd_bail_reason(function, begin_index, i);
     if (loop_mode == SIMD_ATTR_CONTRACT &&
         ir_program_lookup_symbol(ir_optimize_get_program(),
                                  "mettle_safety_call_enter")) {

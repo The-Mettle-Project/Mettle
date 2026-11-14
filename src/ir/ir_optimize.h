@@ -20,6 +20,7 @@ typedef struct {
   int whole_program;
   int target_neutral_only;
   int gpu_device_only;
+  int scalar_target;
 } IROptimizeOptions;
 
 int ir_optimize_safety_analysis(IRProgram *program, int preserve_boundaries);

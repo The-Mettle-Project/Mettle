@@ -70,6 +70,41 @@ static void test_known_good(void) {
              arm64_smulh(ARM64_X0, ARM64_X1, ARM64_X2), 0x9B427C20u);
   check_word("umulh x0, x1, x2",
              arm64_umulh(ARM64_X0, ARM64_X1, ARM64_X2), 0x9BC27C20u);
+  {
+    struct {
+      const char *text;
+      uint64_t value;
+      int kind;
+      uint32_t word;
+    } logical[] = {
+        {"and x0, x1, #0x7", 0x7ull, 0, 0x92400820u},
+        {"and x0, x1, #0xf", 0xFull, 0, 0x92400C20u},
+        {"and x0, x1, #0xff00", 0xFF00ull, 0, 0x92781C20u},
+        {"and x0, x1, #0x5555555555555555", 0x5555555555555555ull, 0,
+         0x9200F020u},
+        {"orr x0, x1, #0xffffffff", 0xFFFFFFFFull, 1, 0xB2407C20u},
+        {"eor x0, x1, #0x8000000000000000", 0x8000000000000000ull, 2,
+         0xD2410020u},
+    };
+    for (size_t i = 0; i < sizeof(logical) / sizeof(logical[0]); i++) {
+      uint32_t fields = 0;
+      if (!arm64_logical_imm(logical[i].value, &fields)) {
+        check_word(logical[i].text, 0u, logical[i].word);
+        continue;
+      }
+      uint32_t word = logical[i].kind == 0
+                          ? arm64_and_imm(ARM64_X0, ARM64_X1, fields)
+                      : logical[i].kind == 1
+                          ? arm64_orr_imm(ARM64_X0, ARM64_X1, fields)
+                          : arm64_eor_imm(ARM64_X0, ARM64_X1, fields);
+      check_word(logical[i].text, word, logical[i].word);
+    }
+    uint32_t unused = 0;
+    check_word("0x5 has no logical immediate",
+               (uint32_t)arm64_logical_imm(0x5ull, &unused), 0u);
+    check_word("0 has no logical immediate",
+               (uint32_t)arm64_logical_imm(0ull, &unused), 0u);
+  }
   check_word("msub x0,x1,x2,x3",
              arm64_msub(1, ARM64_X0, ARM64_X1, ARM64_X2, ARM64_X3),
              0x9B028C20u);

@@ -687,6 +687,8 @@ int ir_user_rewrite_begin(IRProgram *program);
 int ir_user_rewrite_pass(IRFunction *function, int *changed);
 int ir_user_rewrite_end(IRProgram *program);
 void ir_optimize_set_simd_report(int enabled);
+void ir_optimize_set_scalar_target(int enabled);
+int ir_optimize_scalar_target(void);
 void ir_optimize_set_explain(int enabled, const char *focus_file);
 void ir_explain_set_quiet(int quiet);
 int ir_explain_enabled(void);

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scalar-target: A target this compiler emits no vector code for | Mettle</title>
+<meta name="description" content="scalar-target: A target this compiler emits no vector code for" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><img src="../assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<h1><span class="code">scalar-target</span>A target this compiler emits no vector code for</h1>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
+<pre><code>mettle explain scalar-target</code></pre>
+
+<p>The build targets AArch64. Mettle&#x27;s loop vectorizers write x86-64 SSE and AVX2, and the AArch64 backend has no NEON code generation, so every loop runs as scalar AArch64 code. The target-neutral optimizer still runs: inlining, invariant code motion, strength reduction and the SSA passes.</p>
+<p>An @simd! loop fails the build on this target for the same reason. Build the same file for x86_64 with --explain to see whether its vectorizers take the loop.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></footer>
+</body>
+</html>

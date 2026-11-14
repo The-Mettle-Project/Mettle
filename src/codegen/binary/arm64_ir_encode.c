@@ -3,6 +3,7 @@
 #include "codegen/binary_emitter.h"
 #include "codegen/binary_emitter_internal.h"
 #include "codegen/target.h"
+#include "ir/ir_optimize.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -69,13 +70,17 @@ typedef struct {
   Arm64Reg *home_regs;
   int home_count;
   unsigned home_used;
+  unsigned fp_home_used;
+  int home_ran;
+  int home_blocker;
 } SlotMap;
 
 #define HOME_FIRST ARM64_X19
 #define HOME_COUNT 10
+#define HOME_FP_CODE 32
 static void homes_restore(Arm64Emit *e, SlotMap *slots);
 
-static int home_of(const SlotMap *s, const char *name) {
+static int home_code(const SlotMap *s, const char *name) {
   if (!s || !name) {
     return -1;
   }
@@ -85,6 +90,16 @@ static int home_of(const SlotMap *s, const char *name) {
     }
   }
   return -1;
+}
+
+static int home_of(const SlotMap *s, const char *name) {
+  int code = home_code(s, name);
+  return code >= 0 && code < HOME_FP_CODE ? code : -1;
+}
+
+static int fp_home_of(const SlotMap *s, const char *name) {
+  int code = home_code(s, name);
+  return code >= HOME_FP_CODE ? code - HOME_FP_CODE : -1;
 }
 
 static const IRModuleSymbol *module_variable(const SlotMap *slots,
@@ -1092,6 +1107,11 @@ static Arm64Reg load_into(Arm64Emit *e, SlotMap *s, const IROperand *op,
       }
       return dest;
     }
+    int fp_home = fp_home_of(s, op->name);
+    if (fp_home >= 0) {
+      arm64_emit_word(e, arm64_fmov_to_gp(1, dest, fp_home));
+      return dest;
+    }
     int off = slot_find(s, op->name);
     const IRModuleSymbol *global =
         off < 0 && op->kind == IR_OPERAND_SYMBOL ? module_variable(s, op->name)
@@ -1168,6 +1188,11 @@ static void store_dest(Arm64Emit *e, SlotMap *s, const IROperand *dst,
     home_write(e, s, dst->name, (Arm64Reg)home, src);
     return;
   }
+  int fp_home = dst && dst->name ? fp_home_of(s, dst->name) : -1;
+  if (fp_home >= 0) {
+    arm64_emit_word(e, arm64_fmov_gp(1, fp_home, src));
+    return;
+  }
   int off = dst && dst->name ? slot_find(s, dst->name) : -1;
   const IRModuleSymbol *global =
       off < 0 && dst && dst->kind == IR_OPERAND_SYMBOL
@@ -1192,6 +1217,37 @@ static void store_dest(Arm64Emit *e, SlotMap *s, const IROperand *dst,
     return;
   }
   emit_slot_str(e, src, off);
+}
+
+static Arm64Reg operand_reg(Arm64Emit *e, SlotMap *s, const IROperand *op,
+                            Arm64Reg scratch) {
+  if (op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL) {
+    int home = home_of(s, op->name);
+    if (home >= 0) {
+      return (Arm64Reg)home;
+    }
+  }
+  return load_into(e, s, op, scratch);
+}
+
+static Arm64Reg dest_reg(const SlotMap *s, const IROperand *dst,
+                         Arm64Reg scratch) {
+  if (!dst || (dst->kind != IR_OPERAND_TEMP && dst->kind != IR_OPERAND_SYMBOL)) {
+    return scratch;
+  }
+  int home = home_of(s, dst->name);
+  if (home < 0 || narrow_size_of(s->narrow, dst->name, NULL) != 0) {
+    return scratch;
+  }
+  return (Arm64Reg)home;
+}
+
+static void finish_dest(Arm64Emit *e, SlotMap *s, const IROperand *dst,
+                        Arm64Reg reg) {
+  if (dst && dst->name && home_of(s, dst->name) == (int)reg) {
+    return;
+  }
+  store_dest(e, s, dst, reg);
 }
 
 static void emit_lea_local(Arm64Emit *e, Arm64Reg rd, int off) {
@@ -1282,7 +1338,19 @@ static void load_float_operand(Arm64Emit *e, SlotMap *s, const StrSet *fs,
     arm64_emit_word(e, arm64_fmov_gp(d, fd, scratch));
     return;
   }
-  Arm64Reg bits = load_into(e, s, op, scratch);
+  int fp_home = (op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL)
+                    ? fp_home_of(s, op->name)
+                    : -1;
+  if (fp_home >= 0 && operand_is_float(fs, op)) {
+    int src_d = operand_float_bits(fs, op) != 32;
+    if (src_d != d) {
+      arm64_emit_word(e, arm64_fcvt(d, fd, fp_home));
+    } else if (fp_home != fd) {
+      arm64_emit_word(e, arm64_fmov_reg(d, fd, fp_home));
+    }
+    return;
+  }
+  Arm64Reg bits = operand_reg(e, s, op, scratch);
   if (operand_is_float(fs, op)) {
     int src_d = operand_float_bits(fs, op) != 32;
     arm64_emit_word(e, arm64_fmov_gp(src_d, fd, bits));
@@ -1364,6 +1432,20 @@ static void emit_const_quotient(Arm64Emit *e, Arm64Reg q, Arm64Reg a,
   arm64_emit_word(e, arm64_add_reg(1, q, q, R_AUX));
 }
 
+static int float_operand_fp(Arm64Emit *e, SlotMap *s, const StrSet *fs,
+                            const IROperand *op, int d, int fd,
+                            Arm64Reg scratch) {
+  if ((op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL) &&
+      operand_is_float(fs, op) && (operand_float_bits(fs, op) != 32) == d) {
+    int home = fp_home_of(s, op->name);
+    if (home >= 0) {
+      return home;
+    }
+  }
+  load_float_operand(e, s, fs, op, d, fd, scratch);
+  return fd;
+}
+
 static void lower_binary(Arm64Emit *e, SlotMap *s, const StrSet *fs,
                          const StrSet *us, const IRInstruction *in) {
   const char *op = in->text;
@@ -1371,60 +1453,79 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const StrSet *fs,
   if (in->is_float) {
     int fcc = cmp_cond(op) < 0 ? -1 : cmp_cond_float(op);
     int d = float_op_bits(fs, &in->lhs, &in->rhs, in->float_bits) != 32;
-    load_float_operand(e, s, fs, &in->lhs, d, 0, R_LHS);
-    load_float_operand(e, s, fs, &in->rhs, d, 1, R_RHS);
+    int fa = float_operand_fp(e, s, fs, &in->lhs, d, 0, R_LHS);
+    int fb = float_operand_fp(e, s, fs, &in->rhs, d, 1, R_RHS);
+    int fr = 0;
+    if (fcc < 0 && in->dest.name &&
+        (in->dest.kind == IR_OPERAND_TEMP || in->dest.kind == IR_OPERAND_SYMBOL) &&
+        set_bits(fs, in->dest.name) == (d ? 64 : 32) &&
+        fp_home_of(s, in->dest.name) >= 0) {
+      fr = fp_home_of(s, in->dest.name);
+    }
     if (fcc >= 0) {
-      arm64_emit_word(e, arm64_fcmp(d, 0, 1));
-      arm64_emit_word(e, arm64_cset(1, R_RES, (Arm64Cond)fcc));
+      arm64_emit_word(e, arm64_fcmp(d, fa, fb));
     } else if (strcmp(op, "+") == 0) {
-      arm64_emit_word(e, arm64_fadd(d, 0, 0, 1));
+      arm64_emit_word(e, arm64_fadd(d, fr, fa, fb));
     } else if (strcmp(op, "-") == 0) {
-      arm64_emit_word(e, arm64_fsub(d, 0, 0, 1));
+      arm64_emit_word(e, arm64_fsub(d, fr, fa, fb));
     } else if (strcmp(op, "*") == 0) {
-      arm64_emit_word(e, arm64_fmul(d, 0, 0, 1));
+      arm64_emit_word(e, arm64_fmul(d, fr, fa, fb));
     } else if (strcmp(op, "/") == 0) {
-      arm64_emit_word(e, arm64_fdiv(d, 0, 0, 1));
+      arm64_emit_word(e, arm64_fdiv(d, fr, fa, fb));
     } else {
       arm64_fail(e, "float binary operator '%s' has no AArch64 lowering", op);
       return;
     }
-    if (fcc < 0) {
-      arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
+    if (fr != 0) {
+      return;
     }
-    store_dest(e, s, &in->dest, R_RES);
+    Arm64Reg frd = dest_reg(s, &in->dest, R_RES);
+    if (fcc >= 0) {
+      arm64_emit_word(e, arm64_cset(1, frd, (Arm64Cond)fcc));
+    } else {
+      arm64_emit_word(e, arm64_fmov_to_gp(d, frd, 0));
+    }
+    finish_dest(e, s, &in->dest, frd);
     return;
   }
 
   int uns = binary_is_unsigned(us, in);
-  Arm64Reg a = load_into(e, s, &in->lhs, R_LHS);
+  Arm64Reg a = operand_reg(e, s, &in->lhs, R_LHS);
+  Arm64Reg rd = dest_reg(s, &in->dest, R_RES);
 
   if (in->rhs.kind == IR_OPERAND_INT && op[0] != '\0' && op[1] == '\0') {
     CgStrengthRewrite rw;
     if (cg_strength_classify(op[0], in->rhs.int_value, uns, &rw)) {
       switch (rw.kind) {
       case CG_SR_MUL_SHL:
-        arm64_emit_word(e, arm64_lsl_imm(1, R_RES, a, rw.shift));
-        store_dest(e, s, &in->dest, R_RES);
+        arm64_emit_word(e, arm64_lsl_imm(1, rd, a, rw.shift));
+        finish_dest(e, s, &in->dest, rd);
         return;
       case CG_SR_MUL_SHL_ADD:
         arm64_emit_word(e, arm64_lsl_imm(1, R_AUX, a, rw.shift));
-        arm64_emit_word(e, arm64_add_reg(1, R_RES, R_AUX, a));
-        store_dest(e, s, &in->dest, R_RES);
+        arm64_emit_word(e, arm64_add_reg(1, rd, R_AUX, a));
+        finish_dest(e, s, &in->dest, rd);
         return;
       case CG_SR_MUL_SHL_SUB:
         arm64_emit_word(e, arm64_lsl_imm(1, R_AUX, a, rw.shift));
-        arm64_emit_word(e, arm64_sub_reg(1, R_RES, R_AUX, a));
-        store_dest(e, s, &in->dest, R_RES);
+        arm64_emit_word(e, arm64_sub_reg(1, rd, R_AUX, a));
+        finish_dest(e, s, &in->dest, rd);
         return;
       case CG_SR_UDIV_SHR:
-        arm64_emit_word(e, arm64_lsr_imm(1, R_RES, a, rw.shift));
-        store_dest(e, s, &in->dest, R_RES);
+        arm64_emit_word(e, arm64_lsr_imm(1, rd, a, rw.shift));
+        finish_dest(e, s, &in->dest, rd);
         return;
-      case CG_SR_UREM_AND:
-        emit_imm(e, R_AUX, (uint64_t)rw.mask);
-        arm64_emit_word(e, arm64_and_reg(1, R_RES, a, R_AUX));
-        store_dest(e, s, &in->dest, R_RES);
+      case CG_SR_UREM_AND: {
+        uint32_t fields = 0;
+        if (arm64_logical_imm((uint64_t)rw.mask, &fields)) {
+          arm64_emit_word(e, arm64_and_imm(rd, a, fields));
+        } else {
+          emit_imm(e, R_AUX, (uint64_t)rw.mask);
+          arm64_emit_word(e, arm64_and_reg(1, rd, a, R_AUX));
+        }
+        finish_dest(e, s, &in->dest, rd);
         return;
+      }
       case CG_SR_SDIV_POW2:
       case CG_SR_DIV_MAGIC:
         emit_const_quotient(e, R_RES, a, in->rhs.int_value, uns);
@@ -1444,40 +1545,77 @@ static void lower_binary(Arm64Emit *e, SlotMap *s, const StrSet *fs,
     }
   }
 
-  Arm64Reg b = load_into(e, s, &in->rhs, R_RHS);
   int cc = cmp_cond(op) < 0 ? -1 : (uns ? cmp_cond_unsigned(op) : cmp_cond(op));
+  if (in->rhs.kind == IR_OPERAND_INT) {
+    long long v = in->rhs.int_value;
+    int add = strcmp(op, "+") == 0;
+    int sub = strcmp(op, "-") == 0;
+    if ((add || sub) && v >= -4095 && v <= 4095) {
+      int subtract = (sub && v >= 0) || (add && v < 0);
+      uint32_t imm = (uint32_t)(v < 0 ? -v : v);
+      arm64_emit_word(e, subtract ? arm64_sub_imm(1, rd, a, imm, 0)
+                                  : arm64_add_imm(1, rd, a, imm, 0));
+      finish_dest(e, s, &in->dest, rd);
+      return;
+    }
+    if (cc >= 0 && v >= 0 && v <= 4095) {
+      arm64_emit_word(e, arm64_cmp_imm(1, a, (uint32_t)v, 0));
+      arm64_emit_word(e, arm64_cset(1, rd, (Arm64Cond)cc));
+      finish_dest(e, s, &in->dest, rd);
+      return;
+    }
+    uint32_t fields = 0;
+    if ((strcmp(op, "&") == 0 || strcmp(op, "|") == 0 || strcmp(op, "^") == 0) &&
+        arm64_logical_imm((uint64_t)v, &fields)) {
+      arm64_emit_word(e, op[0] == '&'   ? arm64_and_imm(rd, a, fields)
+                         : op[0] == '|' ? arm64_orr_imm(rd, a, fields)
+                                        : arm64_eor_imm(rd, a, fields));
+      finish_dest(e, s, &in->dest, rd);
+      return;
+    }
+    if (v >= 1 && v <= 63 && (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0)) {
+      int k = (int)v;
+      arm64_emit_word(e, op[0] == '<' ? arm64_lsl_imm(1, rd, a, k)
+                         : uns        ? arm64_lsr_imm(1, rd, a, k)
+                                      : arm64_asr_imm(1, rd, a, k));
+      finish_dest(e, s, &in->dest, rd);
+      return;
+    }
+  }
+
+  Arm64Reg b = operand_reg(e, s, &in->rhs, R_RHS);
   if (cc >= 0) {
     arm64_emit_word(e, arm64_cmp_reg(1, a, b));
-    arm64_emit_word(e, arm64_cset(1, R_RES, (Arm64Cond)cc));
+    arm64_emit_word(e, arm64_cset(1, rd, (Arm64Cond)cc));
   } else if (strcmp(op, "+") == 0) {
-    arm64_emit_word(e, arm64_add_reg(1, R_RES, a, b));
+    arm64_emit_word(e, arm64_add_reg(1, rd, a, b));
   } else if (strcmp(op, "-") == 0) {
-    arm64_emit_word(e, arm64_sub_reg(1, R_RES, a, b));
+    arm64_emit_word(e, arm64_sub_reg(1, rd, a, b));
   } else if (strcmp(op, "*") == 0) {
-    arm64_emit_word(e, arm64_mul(1, R_RES, a, b));
+    arm64_emit_word(e, arm64_mul(1, rd, a, b));
   } else if (strcmp(op, "/") == 0) {
-    arm64_emit_word(e, uns ? arm64_udiv(1, R_RES, a, b)
-                           : arm64_sdiv(1, R_RES, a, b));
+    arm64_emit_word(e, uns ? arm64_udiv(1, rd, a, b)
+                           : arm64_sdiv(1, rd, a, b));
   } else if (strcmp(op, "%") == 0) {
     arm64_emit_word(e, uns ? arm64_udiv(1, R_AUX, a, b)
                            : arm64_sdiv(1, R_AUX, a, b));
-    arm64_emit_word(e, arm64_msub(1, R_RES, R_AUX, b, a));
+    arm64_emit_word(e, arm64_msub(1, rd, R_AUX, b, a));
   } else if (strcmp(op, "&") == 0) {
-    arm64_emit_word(e, arm64_and_reg(1, R_RES, a, b));
+    arm64_emit_word(e, arm64_and_reg(1, rd, a, b));
   } else if (strcmp(op, "|") == 0) {
-    arm64_emit_word(e, arm64_orr_reg(1, R_RES, a, b));
+    arm64_emit_word(e, arm64_orr_reg(1, rd, a, b));
   } else if (strcmp(op, "^") == 0) {
-    arm64_emit_word(e, arm64_eor_reg(1, R_RES, a, b));
+    arm64_emit_word(e, arm64_eor_reg(1, rd, a, b));
   } else if (strcmp(op, "<<") == 0) {
-    arm64_emit_word(e, arm64_lslv(1, R_RES, a, b));
+    arm64_emit_word(e, arm64_lslv(1, rd, a, b));
   } else if (strcmp(op, ">>") == 0) {
-    arm64_emit_word(e, uns ? arm64_lsrv(1, R_RES, a, b)
-                           : arm64_asrv(1, R_RES, a, b));
+    arm64_emit_word(e, uns ? arm64_lsrv(1, rd, a, b)
+                           : arm64_asrv(1, rd, a, b));
   } else {
     arm64_fail(e, "binary operator '%s' has no AArch64 lowering", op);
     return;
   }
-  store_dest(e, s, &in->dest, R_RES);
+  finish_dest(e, s, &in->dest, rd);
 }
 
 static void lower_unary(Arm64Emit *e, SlotMap *s, const StrSet *fs,
@@ -1707,7 +1845,7 @@ static Arm64Reg address_operand(Arm64Emit *e, SlotMap *s, const AggMap *ag,
       return dest;
     }
   }
-  return load_into(e, s, op, dest);
+  return operand_reg(e, s, op, dest);
 }
 
 #define ARM64_COPY_UNROLL_MAX 128
@@ -2053,12 +2191,18 @@ static int encode_control_instruction(const Arm64Scope *scope,
     arm64_emit_b(e, label_for(e, labels, in->text));
     break;
   case IR_OP_BRANCH_ZERO:
-    arm64_emit_cbz(e, 1, load_into(e, slots, &in->lhs, R_LHS),
+    arm64_emit_cbz(e, 1, operand_reg(e, slots, &in->lhs, R_LHS),
                    label_for(e, labels, in->text));
     break;
   case IR_OP_BRANCH_EQ: {
-    Arm64Reg a = load_into(e, slots, &in->lhs, R_LHS);
-    Arm64Reg b = load_into(e, slots, &in->rhs, R_RHS);
+    Arm64Reg a = operand_reg(e, slots, &in->lhs, R_LHS);
+    if (in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value >= 0 &&
+        in->rhs.int_value <= 4095) {
+      arm64_emit_word(e, arm64_cmp_imm(1, a, (uint32_t)in->rhs.int_value, 0));
+      arm64_emit_bcond(e, ARM64_EQ, label_for(e, labels, in->text));
+      break;
+    }
+    Arm64Reg b = operand_reg(e, slots, &in->rhs, R_RHS);
     arm64_emit_word(e, arm64_cmp_reg(1, a, b));
     arm64_emit_bcond(e, ARM64_EQ, label_for(e, labels, in->text));
     break;
@@ -2143,6 +2287,12 @@ static int encode_assign_instruction(const Arm64Scope *scope,
                  in->dest.kind == IR_OPERAND_TEMP) {
         dst_bits = set_bits(fs, in->dest.name);
       }
+      if (dst_bits && in->lhs.kind != IR_OPERAND_FLOAT &&
+          operand_float_bits(fs, &in->lhs) == dst_bits) {
+        store_dest(e, slots, &in->dest,
+                   operand_reg(e, slots, &in->lhs, R_LHS));
+        break;
+      }
       if (dst_bits) {
         int d = dst_bits != 32;
         load_float_operand(e, slots, fs, &in->lhs, d, 0, R_LHS);
@@ -2151,7 +2301,7 @@ static int encode_assign_instruction(const Arm64Scope *scope,
         break;
       }
     }
-    store_dest(e, slots, &in->dest, load_into(e, slots, &in->lhs, R_LHS));
+    store_dest(e, slots, &in->dest, operand_reg(e, slots, &in->lhs, R_LHS));
     break;
   }
   default:
@@ -2203,14 +2353,14 @@ static int encode_cast_instruction(const Arm64Scope *scope,
     if (srcf && !dstf) {
       int d = operand_float_bits(fs, &in->lhs) != 32;
       int to_u64 = in->text && strcmp(in->text, "uint64") == 0;
-      arm64_emit_word(e, arm64_fmov_gp(d, 0, load_into(e, slots, &in->lhs,
-                                                       R_LHS)));
+      arm64_emit_word(e, arm64_fmov_gp(d, 0, operand_reg(e, slots, &in->lhs,
+                                                         R_LHS)));
       arm64_emit_word(e, to_u64 ? arm64_fcvtzu(d, R_RES, 0)
                                 : arm64_fcvtzs(d, R_RES, 0));
       store_dest(e, slots, &in->dest, R_RES);
     } else if (!srcf && dstf) {
       int d = dst_bits != 32;
-      Arm64Reg src = load_into(e, slots, &in->lhs, R_LHS);
+      Arm64Reg src = operand_reg(e, slots, &in->lhs, R_LHS);
       arm64_emit_word(e, in->is_unsigned ? arm64_ucvtf(d, 0, src)
                                          : arm64_scvtf(d, 0, src));
       arm64_emit_word(e, arm64_fmov_to_gp(d, R_RES, 0));
@@ -2241,7 +2391,8 @@ static int encode_cast_instruction(const Arm64Scope *scope,
       }
       store_dest(e, slots, &in->dest, R_RES);
     } else {
-      Arm64Reg src = load_into(e, slots, &in->lhs, R_LHS);
+      Arm64Reg src = operand_reg(e, slots, &in->lhs, R_LHS);
+      Arm64Reg rd = dest_reg(slots, &in->dest, R_RES);
       const MtlcType *tt =
           prog && in->text && !strchr(in->text, '[') && !strchr(in->text, '*')
               ? ir_program_lookup_type(prog, in->text)
@@ -2256,12 +2407,12 @@ static int encode_cast_instruction(const Arm64Scope *scope,
       }
       if (tw == 1 || tw == 2 || tw == 4) {
         arm64_emit_word(
-            e, tw == 1 ? (tu ? arm64_uxtb(R_RES, src) : arm64_sxtb(R_RES, src))
+            e, tw == 1 ? (tu ? arm64_uxtb(rd, src) : arm64_sxtb(rd, src))
                : tw == 2
-                   ? (tu ? arm64_uxth(R_RES, src) : arm64_sxth(R_RES, src))
-                   : (tu ? arm64_mov_reg(0, R_RES, src)
-                         : arm64_sxtw(R_RES, src)));
-        store_dest(e, slots, &in->dest, R_RES);
+                   ? (tu ? arm64_uxth(rd, src) : arm64_sxth(rd, src))
+                   : (tu ? arm64_mov_reg(0, rd, src)
+                         : arm64_sxtw(rd, src)));
+        finish_dest(e, slots, &in->dest, rd);
       } else {
         store_dest(e, slots, &in->dest, src);
       }
@@ -2343,14 +2494,27 @@ static int encode_memory_instruction(const Arm64Scope *scope,
       }
       break;
     }
-    emit_load_sized(e, R_RES, addr, size,
-                    !in->is_unsigned && !in->is_float);
+    int small_float = size == 2 && in->is_float && small_float_class(in) != 0;
+    Arm64Reg rd = small_float ? R_RES : dest_reg(slots, &in->dest, R_RES);
+    emit_load_sized(e, rd, addr, size, !in->is_unsigned && !in->is_float);
     if (size == 2 && in->is_float && small_float_class(in) == 16) {
       emit_f16_widen(e, R_RES);
     } else if (size == 2 && in->is_float && small_float_class(in) == 8) {
       emit_bf16_widen(e, R_RES);
     }
-    store_dest(e, slots, &in->dest, R_RES);
+    finish_dest(e, slots, &in->dest, rd);
+    break;
+  }
+  case IR_OP_MEMCPY_INLINE: {
+    if (in->rhs.kind != IR_OPERAND_INT || in->rhs.int_value < 0 ||
+        in->rhs.int_value > INT_MAX) {
+      arm64_fail(e, "'%s' copies a byte count that is not a constant",
+                 scope->fn->name);
+      break;
+    }
+    Arm64Reg to = address_operand(e, slots, ag, &in->dest, R_LHS);
+    Arm64Reg from = address_operand(e, slots, ag, &in->lhs, R_RHS);
+    emit_fixed_copy(e, to, from, (int)in->rhs.int_value);
     break;
   }
   case IR_OP_STORE: {
@@ -2381,12 +2545,17 @@ static int encode_memory_instruction(const Arm64Scope *scope,
     }
     if ((size == 4 || size == 8) && operand_is_float(fs, &in->lhs)) {
       int d = size == 8;
+      if (in->lhs.kind != IR_OPERAND_FLOAT &&
+          operand_float_bits(fs, &in->lhs) == size * 8) {
+        emit_store_sized(e, operand_reg(e, slots, &in->lhs, R_RHS), addr, size);
+        break;
+      }
       load_float_operand(e, slots, fs, &in->lhs, d, 0, R_RHS);
       arm64_emit_word(e, arm64_fmov_to_gp(d, R_RHS, 0));
       emit_store_sized(e, R_RHS, addr, size);
       break;
     }
-    Arm64Reg val = load_into(e, slots, &in->lhs, R_RHS);
+    Arm64Reg val = operand_reg(e, slots, &in->lhs, R_RHS);
     emit_store_sized(e, val, addr, size);
     break;
   }
@@ -2771,20 +2940,33 @@ static const char *const HOME_SAVE_NAMES[HOME_COUNT] = {
     ".home.x19", ".home.x20", ".home.x21", ".home.x22", ".home.x23",
     ".home.x24", ".home.x25", ".home.x26", ".home.x27", ".home.x28"};
 
+static const char *const HOME_FP_SAVE_NAMES[8] = {
+    ".home.d8",  ".home.d9",  ".home.d10", ".home.d11",
+    ".home.d12", ".home.d13", ".home.d14", ".home.d15"};
+
 #define HOME_SCRATCH_FIRST ARM64_X3
 #define HOME_SCRATCH_COUNT 5
 #define HOME_POOL (HOME_COUNT + HOME_SCRATCH_COUNT)
 
+#define HOME_FP_COUNT 8
+#define HOME_FP_POOL 16
+
 typedef struct {
   const char *name;
-  int start;
-  int end;
   double weight;
   int excluded;
   int reg;
-  int crosses_call;
+  int touches_call;
   int is_param;
+  int is_float;
+  int hint[2];
+  int *runs;
+  int run_count;
 } HomeCandidate;
+
+static int home_fp_pool_reg(int slot) {
+  return slot < HOME_FP_COUNT ? 8 + slot : 16 + (slot - HOME_FP_COUNT);
+}
 
 static Arm64Reg home_pool_reg(int slot) {
   return slot < HOME_COUNT ? (Arm64Reg)(HOME_FIRST + slot)
@@ -2869,6 +3051,7 @@ static int home_op_known(IROpcode op) {
   case IR_OP_CALL_INDIRECT:
   case IR_OP_RETURN:
   case IR_OP_NEW:
+  case IR_OP_MEMCPY_INLINE:
     return 1;
   default:
     return 0;
@@ -2967,7 +3150,8 @@ static void home_note(const NameIndex *ix, const IROperand *op,
 }
 
 static int home_instruction_defines(const IRInstruction *in) {
-  return ir_instruction_writes_destination(in) &&
+  return in->op != IR_OP_MEMCPY_INLINE &&
+         ir_instruction_writes_destination(in) &&
          (in->dest.kind == IR_OPERAND_TEMP || in->dest.kind == IR_OPERAND_SYMBOL);
 }
 
@@ -2983,14 +3167,57 @@ static void home_reads(const NameIndex *ix, const IRInstruction *in,
   }
 }
 
-static void home_cover(HomeCandidate *c, int k, int at, double weight) {
-  if (c[k].start < 0 || at < c[k].start) {
-    c[k].start = at;
+typedef struct {
+  unsigned long long *items;
+  size_t count;
+  size_t cap;
+  int failed;
+} HomePoints;
+
+static void home_occupy(HomePoints *p, int k, size_t point) {
+  if (p->failed) {
+    return;
   }
-  if (at > c[k].end) {
-    c[k].end = at;
+  if (p->count == p->cap) {
+    size_t cap = p->cap ? p->cap * 2 : 1024;
+    unsigned long long *grown = realloc(p->items, cap * sizeof(*grown));
+    if (!grown) {
+      p->failed = 1;
+      return;
+    }
+    p->items = grown;
+    p->cap = cap;
   }
-  c[k].weight += weight;
+  p->items[p->count++] = ((unsigned long long)(unsigned)k << 32) | point;
+}
+
+static void home_occupy_set(HomePoints *p, HomeCandidate *c,
+                            const unsigned long long *set, size_t words,
+                            size_t point, int at_call) {
+  for (size_t w = 0; w < words; w++) {
+    for (unsigned long long bits = set[w]; bits; bits &= bits - 1) {
+      int k = (int)(w * 64 + (size_t)__builtin_ctzll(bits));
+      home_occupy(p, k, point);
+      if (at_call) {
+        c[k].touches_call = 1;
+      }
+    }
+  }
+}
+
+static void home_hint(HomeCandidate *c, int a, int b) {
+  if (a < 0 || b < 0 || a == b) {
+    return;
+  }
+  for (int s = 0; s < 2; s++) {
+    if (c[a].hint[s] == b) {
+      break;
+    }
+    if (c[a].hint[s] < 0) {
+      c[a].hint[s] = b;
+      break;
+    }
+  }
 }
 
 static int home_build_blocks(const IRFunction *fn, HomeBlock **out_blocks,
@@ -3099,7 +3326,7 @@ static double *home_loop_weights(const IRFunction *fn) {
 }
 
 static int home_liveness(const IRFunction *fn, const NameIndex *ix,
-                         HomeCandidate *c, int count) {
+                         HomeCandidate *c, int count, HomePoints *points) {
   HomeBlock *blocks = NULL;
   size_t block_count = 0;
   size_t words = ((size_t)count + 63) / 64;
@@ -3154,97 +3381,181 @@ static int home_liveness(const IRFunction *fn, const NameIndex *ix,
     memcpy(live, blocks[b].out, words * sizeof(*live));
     for (size_t i = blocks[b].last + 1; i > blocks[b].first; i--) {
       const IRInstruction *in = &fn->instructions[i - 1];
-      int at = (int)(i - 1);
-      for (size_t w = 0; w < words; w++) {
-        for (unsigned long long bits = live[w]; bits; bits &= bits - 1) {
-          home_cover(c, (int)(w * 64 + (size_t)__builtin_ctzll(bits)), at, 0.0);
+      size_t at = i - 1;
+      int calls = home_instruction_calls(in);
+      int def = home_instruction_defines(in) ? home_operand_index(ix, &in->dest)
+                                             : -1;
+      home_occupy_set(points, c, live, words, 2 * at + 1, calls);
+      if (def >= 0) {
+        home_occupy(points, def, 2 * at + 1);
+        c[def].weight += weights[at];
+        live[def >> 6] &= ~(1ull << (def & 63));
+        if (in->op == IR_OP_ASSIGN) {
+          int src = home_operand_index(ix, &in->lhs);
+          home_hint(c, def, src);
+          home_hint(c, src, def);
         }
       }
       memset(reads, 0, words * sizeof(*reads));
       home_reads(ix, in, reads, NULL);
-      if (home_instruction_defines(in)) {
-        int k = home_operand_index(ix, &in->dest);
-        if (k >= 0) {
-          home_cover(c, k, at, weights[at]);
-          live[k >> 6] &= ~(1ull << (k & 63));
-        }
-      }
       for (size_t w = 0; w < words; w++) {
         for (unsigned long long bits = reads[w]; bits; bits &= bits - 1) {
-          home_cover(c, (int)(w * 64 + (size_t)__builtin_ctzll(bits)), at,
-                     weights[at]);
+          c[w * 64 + (size_t)__builtin_ctzll(bits)].weight += weights[at];
         }
         live[w] |= reads[w];
       }
+      home_occupy_set(points, c, live, words, 2 * at, calls);
     }
   }
   free(pool);
   free(blocks);
   free(weights);
+  return !points->failed;
+}
+
+static int home_point_order(const void *a, const void *b) {
+  unsigned long long x = *(const unsigned long long *)a;
+  unsigned long long y = *(const unsigned long long *)b;
+  return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static int home_build_runs(HomeCandidate *c, HomePoints *points) {
+  size_t i = 0;
+  qsort(points->items, points->count, sizeof(*points->items),
+        home_point_order);
+  while (i < points->count) {
+    int k = (int)(points->items[i] >> 32);
+    size_t j = i;
+    int runs = 0;
+    long long last = -2;
+    while (j < points->count && (int)(points->items[j] >> 32) == k) {
+      long long p = (long long)(points->items[j] & 0xFFFFFFFFull);
+      if (p > last + 1) {
+        runs++;
+      }
+      last = p;
+      j++;
+    }
+    c[k].runs = malloc((size_t)runs * 2 * sizeof(int));
+    if (!c[k].runs) {
+      return 0;
+    }
+    last = -2;
+    for (size_t m = i; m < j; m++) {
+      long long p = (long long)(points->items[m] & 0xFFFFFFFFull);
+      if (p > last + 1) {
+        c[k].runs[2 * c[k].run_count] = (int)p;
+        c[k].run_count++;
+      }
+      c[k].runs[2 * c[k].run_count - 1] = (int)p;
+      last = p;
+    }
+    i = j;
+  }
   return 1;
 }
 
-static int home_by_start(const void *a, const void *b) {
-  const HomeCandidate *x = *(const HomeCandidate *const *)a;
-  const HomeCandidate *y = *(const HomeCandidate *const *)b;
-  if (x->start != y->start) {
-    return x->start < y->start ? -1 : 1;
+static int home_range_busy(const unsigned long long *map, int lo, int hi) {
+  for (int p = lo; p <= hi;) {
+    if ((p & 63) == 0 && p + 63 <= hi) {
+      if (map[p >> 6]) {
+        return 1;
+      }
+      p += 64;
+      continue;
+    }
+    if ((map[p >> 6] >> (p & 63)) & 1ull) {
+      return 1;
+    }
+    p++;
   }
-  return x->end < y->end ? -1 : (x->end > y->end ? 1 : 0);
+  return 0;
 }
 
-static void home_scan(HomeCandidate *c, int count) {
+static void home_range_take(unsigned long long *map, int lo, int hi) {
+  for (int p = lo; p <= hi; p++) {
+    map[p >> 6] |= 1ull << (p & 63);
+  }
+}
+
+static int home_reg_fits(const HomeCandidate *cand, const unsigned long long *map) {
+  for (int r = 0; r < cand->run_count; r++) {
+    if (home_range_busy(map, cand->runs[2 * r], cand->runs[2 * r + 1])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int home_by_weight(const void *a, const void *b) {
+  const HomeCandidate *x = *(const HomeCandidate *const *)a;
+  const HomeCandidate *y = *(const HomeCandidate *const *)b;
+  if (x->weight != y->weight) {
+    return x->weight > y->weight ? -1 : 1;
+  }
+  return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static void home_assign(HomeCandidate *c, int count, size_t points) {
+  size_t words = (points + 63) / 64;
+  unsigned long long *maps =
+      calloc((HOME_POOL + HOME_FP_POOL) * words, sizeof(*maps));
   HomeCandidate **order = malloc((size_t)(count ? count : 1) * sizeof(*order));
-  HomeCandidate *holder[HOME_POOL] = {0};
   int n = 0;
-  if (!order) {
+  if (!maps || !order) {
+    free(maps);
+    free(order);
     return;
   }
   for (int k = 0; k < count; k++) {
-    if (!c[k].excluded && c[k].start >= 0 && c[k].weight > 0.0) {
+    if (!c[k].excluded && c[k].run_count > 0 && c[k].weight > 0.0) {
       order[n++] = &c[k];
     }
   }
-  qsort(order, (size_t)n, sizeof(*order), home_by_start);
+  qsort(order, (size_t)n, sizeof(*order), home_by_weight);
   for (int i = 0; i < n; i++) {
     HomeCandidate *cur = order[i];
-    int scratch_ok = !cur->crosses_call && !cur->is_param;
-    int free_reg = -1;
-    int victim = -1;
-    for (int pass = 0; pass < 2; pass++) {
-      int lo = pass == 0 ? HOME_COUNT : 0;
-      int hi = pass == 0 ? HOME_POOL : HOME_COUNT;
-      if (pass == 0 && !scratch_ok) {
-        continue;
-      }
-      for (int r = lo; r < hi; r++) {
-        if (holder[r] && holder[r]->end < cur->start) {
-          holder[r] = NULL;
-        }
-        if (!holder[r]) {
-          if (free_reg < 0) {
-            free_reg = r;
-          }
-        } else if (victim < 0 || holder[r]->weight < holder[victim]->weight) {
-          victim = r;
-        }
+    int scratch_ok = !cur->touches_call && !cur->is_param;
+    int callee = cur->is_float ? HOME_FP_COUNT : HOME_COUNT;
+    int pool = cur->is_float ? HOME_FP_POOL : HOME_POOL;
+    unsigned long long *base =
+        maps + (cur->is_float ? (size_t)HOME_POOL * words : 0);
+    int choice = -1;
+    for (int h = 0; h < 2 && choice < 0; h++) {
+      int partner = cur->hint[h];
+      int r = partner >= 0 && c[partner].is_float == cur->is_float
+                  ? c[partner].reg
+                  : -1;
+      if (r >= 0 && (r < callee || scratch_ok) &&
+          home_reg_fits(cur, base + (size_t)r * words)) {
+        choice = r;
       }
     }
-    if (free_reg < 0 && victim >= 0 && holder[victim]->weight < cur->weight) {
-      holder[victim]->reg = -1;
-      free_reg = victim;
+    for (int r = callee; choice < 0 && scratch_ok && r < pool; r++) {
+      if (home_reg_fits(cur, base + (size_t)r * words)) {
+        choice = r;
+      }
     }
-    if (free_reg >= 0) {
-      holder[free_reg] = cur;
-      cur->reg = free_reg;
+    for (int r = 0; choice < 0 && r < callee; r++) {
+      if (home_reg_fits(cur, base + (size_t)r * words)) {
+        choice = r;
+      }
+    }
+    if (choice >= 0) {
+      cur->reg = choice;
+      for (int r = 0; r < cur->run_count; r++) {
+        home_range_take(base + (size_t)choice * words, cur->runs[2 * r],
+                        cur->runs[2 * r + 1]);
+      }
     }
   }
+  free(maps);
   free(order);
 }
 
 static void assign_homes(const IRFunction *fn, const IRProgram *prog,
                          SlotMap *slots, const AggMap *ag,
-                         const StrSet *wide_params) {
+                         const StrSet *wide_params, const StrSet *fs) {
   static int disabled = -1;
   int count = slots->count;
   NameIndex ix = {0};
@@ -3252,14 +3563,20 @@ static void assign_homes(const IRFunction *fn, const IRProgram *prog,
   if (disabled < 0) {
     disabled = getenv("METTLE_ARM64_NO_HOMES") ? 1 : 0;
   }
-  if (disabled || !prog || count == 0) {
+  if (disabled || !prog) {
+    return;
+  }
+  if (count == 0) {
+    slots->home_ran = 1;
     return;
   }
   for (size_t i = 0; i < fn->instruction_count; i++) {
     if (!home_op_known(fn->instructions[i].op)) {
+      slots->home_blocker = (int)fn->instructions[i].op + 1;
       return;
     }
   }
+  slots->home_ran = 1;
   c = calloc((size_t)count, sizeof(*c));
   if (!c || !name_index_init(&ix, (size_t)count)) {
     free(c);
@@ -3268,32 +3585,24 @@ static void assign_homes(const IRFunction *fn, const IRProgram *prog,
   }
   for (int k = 0; k < count; k++) {
     c[k].name = slots->names[k];
-    c[k].start = -1;
-    c[k].end = -1;
     c[k].reg = -1;
+    c[k].is_float = set_bits(fs, c[k].name) != 0;
+    c[k].hint[0] = -1;
+    c[k].hint[1] = -1;
     name_index_put(&ix, c[k].name, k);
   }
   home_mark_exclusions(fn, prog, ag, wide_params, c, count, &ix);
-  if (home_liveness(fn, &ix, c, count)) {
-    int *calls = calloc(fn->instruction_count + 1, sizeof(*calls));
-    for (size_t i = 0; i < fn->parameter_count; i++) {
-      int k = name_index_get(&ix, fn->parameter_names[i]);
-      if (k >= 0) {
-        c[k].is_param = 1;
-        if (c[k].start >= 0) {
-          c[k].start = 0;
-        }
-      }
+  HomePoints points = {0};
+  int live_ok = home_liveness(fn, &ix, c, count, &points);
+  for (size_t i = 0; live_ok && i < fn->parameter_count; i++) {
+    int k = name_index_get(&ix, fn->parameter_names[i]);
+    if (k >= 0) {
+      c[k].is_param = 1;
+      home_occupy(&points, k, 0);
     }
-    for (size_t i = 0; calls && i < fn->instruction_count; i++) {
-      calls[i + 1] = calls[i] + home_instruction_calls(&fn->instructions[i]);
-    }
-    for (int k = 0; k < count; k++) {
-      c[k].crosses_call =
-          !calls || (c[k].start >= 0 && calls[c[k].end + 1] - calls[c[k].start] > 0);
-    }
-    free(calls);
-    home_scan(c, count);
+  }
+  if (live_ok && !points.failed && home_build_runs(c, &points)) {
+    home_assign(c, count, 2 * fn->instruction_count + 2);
     for (int k = 0; k < count; k++) {
       if (c[k].reg >= 0) {
         slots->home_count++;
@@ -3315,9 +3624,17 @@ static void assign_homes(const IRFunction *fn, const IRProgram *prog,
         for (int k = 0; k < count; k++) {
           if (c[k].reg >= 0) {
             slots->home_names[at] = c[k].name;
-            slots->home_regs[at] = home_pool_reg(c[k].reg);
-            if (c[k].reg < HOME_COUNT) {
-              slots->home_used |= 1u << (unsigned)c[k].reg;
+            if (c[k].is_float) {
+              slots->home_regs[at] =
+                  (Arm64Reg)(HOME_FP_CODE + home_fp_pool_reg(c[k].reg));
+              if (c[k].reg < HOME_FP_COUNT) {
+                slots->fp_home_used |= 1u << (unsigned)c[k].reg;
+              }
+            } else {
+              slots->home_regs[at] = home_pool_reg(c[k].reg);
+              if (c[k].reg < HOME_COUNT) {
+                slots->home_used |= 1u << (unsigned)c[k].reg;
+              }
             }
             at++;
           }
@@ -3325,8 +3642,93 @@ static void assign_homes(const IRFunction *fn, const IRProgram *prog,
       }
     }
   }
+  free(points.items);
+  for (int k = 0; k < count; k++) {
+    free(c[k].runs);
+  }
   name_index_free(&ix);
   free(c);
+}
+
+static int *count_temp_reads(const IRFunction *fn, NameIndex *ix) {
+  int *reads = calloc(fn->instruction_count + 1, sizeof(*reads));
+  int names = 0;
+  if (!reads || !name_index_init(ix, fn->instruction_count + 1)) {
+    free(reads);
+    name_index_free(ix);
+    return NULL;
+  }
+  for (size_t i = 0; i < fn->instruction_count; i++) {
+    const IRInstruction *in = &fn->instructions[i];
+    const IROperand *ops[3] = {&in->lhs, &in->rhs,
+                               home_instruction_defines(in) ? NULL : &in->dest};
+    for (size_t k = 0; k < 3 + in->argument_count; k++) {
+      const IROperand *op = k < 3 ? ops[k] : &in->arguments[k - 3];
+      if (!op || op->kind != IR_OPERAND_TEMP || !op->name) {
+        continue;
+      }
+      int at = name_index_get(ix, op->name);
+      if (at < 0 && names <= (int)fn->instruction_count) {
+        at = names++;
+        name_index_put(ix, op->name, at);
+      }
+      if (at >= 0) {
+        reads[at]++;
+      }
+    }
+  }
+  return reads;
+}
+
+static int fuse_compare_branch(const Arm64Scope *scope, const IRInstruction *in,
+                               const IRInstruction *next, const NameIndex *ix,
+                               const int *reads) {
+  Arm64Emit *e = scope->e;
+  SlotMap *s = scope->slots;
+  int cc;
+  if (!reads || in->op != IR_OP_BINARY || !in->text || cmp_cond(in->text) < 0 ||
+      in->dest.kind != IR_OPERAND_TEMP || !in->dest.name ||
+      next->op != IR_OP_BRANCH_ZERO || next->lhs.kind != IR_OPERAND_TEMP ||
+      !next->lhs.name || !next->text ||
+      strcmp(next->lhs.name, in->dest.name) != 0) {
+    return 0;
+  }
+  int k = name_index_get(ix, in->dest.name);
+  if (k < 0 || reads[k] != 1) {
+    return 0;
+  }
+  int uns = !in->is_float && binary_is_unsigned(scope->us, in);
+  cc = in->is_float ? cmp_cond_float(in->text)
+       : uns        ? cmp_cond_unsigned(in->text)
+                    : cmp_cond(in->text);
+  if (cc < 0) {
+    return 0;
+  }
+  if (in->is_float) {
+    int d = float_op_bits(scope->fs, &in->lhs, &in->rhs, in->float_bits) != 32;
+    int fa = float_operand_fp(e, s, scope->fs, &in->lhs, d, 0, R_LHS);
+    int fb = float_operand_fp(e, s, scope->fs, &in->rhs, d, 1, R_RHS);
+    arm64_emit_word(e, arm64_fcmp(d, fa, fb));
+  } else {
+    Arm64Reg a = operand_reg(e, s, &in->lhs, R_LHS);
+    if (in->rhs.kind == IR_OPERAND_INT && in->rhs.int_value >= 0 &&
+        in->rhs.int_value <= 4095) {
+      arm64_emit_word(e, arm64_cmp_imm(1, a, (uint32_t)in->rhs.int_value, 0));
+    } else {
+      arm64_emit_word(e, arm64_cmp_reg(1, a, operand_reg(e, s, &in->rhs, R_RHS)));
+    }
+  }
+  arm64_emit_bcond(e, (Arm64Cond)(cc ^ 1), label_for(e, scope->labels, next->text));
+  return 1;
+}
+
+static void emit_slot_ldr_fp(Arm64Emit *e, int ft, int off) {
+  if (off >= 0 && off <= 32760) {
+    arm64_emit_word(e, arm64_ldr_fp(1, ft, ARM64_SP, off));
+    return;
+  }
+  emit_lea_local(e, ARM64_X16, off);
+  arm64_emit_word(e, arm64_ldr_fp(1, ft, ARM64_X16, 0));
 }
 
 static void homes_save(Arm64Emit *e, SlotMap *slots) {
@@ -3336,6 +3738,11 @@ static void homes_save(Arm64Emit *e, SlotMap *slots) {
                     slot_off(slots, HOME_SAVE_NAMES[r]));
     }
   }
+  for (int r = 0; r < HOME_FP_COUNT; r++) {
+    if (slots->fp_home_used & (1u << (unsigned)r)) {
+      emit_slot_str_fp(e, 1, 8 + r, slot_off(slots, HOME_FP_SAVE_NAMES[r]));
+    }
+  }
 }
 
 static void homes_restore(Arm64Emit *e, SlotMap *slots) {
@@ -3343,6 +3750,11 @@ static void homes_restore(Arm64Emit *e, SlotMap *slots) {
     if (slots->home_used & (1u << (unsigned)r)) {
       emit_slot_ldr(e, (Arm64Reg)(HOME_FIRST + r),
                     slot_off(slots, HOME_SAVE_NAMES[r]));
+    }
+  }
+  for (int r = 0; r < HOME_FP_COUNT; r++) {
+    if (slots->fp_home_used & (1u << (unsigned)r)) {
+      emit_slot_ldr_fp(e, 8 + r, slot_off(slots, HOME_FP_SAVE_NAMES[r]));
     }
   }
 }
@@ -3368,8 +3780,26 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
   slots.narrow = &nm;
   slots.frame = max_outgoing_stack(e, fn, prog, &fs);
 
-  for (size_t i = 0; i < fn->parameter_count; i++) {
-    slot_alloc(&slots, fn->parameter_names[i], 8);
+  int *param_copy = calloc(fn->parameter_count + 1, sizeof(*param_copy));
+  if (!param_copy) {
+    arm64_fail(e, "out of memory laying out the parameters of '%s'", fn->name);
+    return 0;
+  }
+  {
+    const IRModuleSymbol *self = prog ? module_function(prog, fn->name) : NULL;
+    for (size_t i = 0; i < fn->parameter_count; i++) {
+      int size = 0;
+      if (self && i < self->param_count && self->param_types &&
+          type_is_aggregate(self->param_types[i]) &&
+          mtlc_type_size(self->param_types[i]) > 8) {
+        size = (int)mtlc_type_size(self->param_types[i]);
+      }
+      param_copy[i] = size;
+      slot_alloc(&slots, fn->parameter_names[i], size ? size : 8);
+      if (size) {
+        agg_add(&ag, fn->parameter_names[i], size);
+      }
+    }
   }
   for (size_t i = 0; i < fn->instruction_count; i++) {
     const IRInstruction *in = &fn->instructions[i];
@@ -3394,21 +3824,16 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
   }
 
   StrSet wide_params = {0};
-  {
-    const IRModuleSymbol *self = module_function(prog, fn->name);
-    for (size_t i = 0; self && i < fn->parameter_count; i++) {
-      if (i < self->param_count && self->param_types &&
-          type_is_aggregate(self->param_types[i]) &&
-          mtlc_type_size(self->param_types[i]) > 8) {
-        set_add(&wide_params, fn->parameter_names[i]);
-      }
-    }
-  }
 
-  assign_homes(fn, prog, &slots, &ag, &wide_params);
+  assign_homes(fn, prog, &slots, &ag, &wide_params, &fs);
   for (int r = 0; r < HOME_COUNT; r++) {
     if (slots.home_used & (1u << (unsigned)r)) {
       slot_alloc(&slots, HOME_SAVE_NAMES[r], 8);
+    }
+  }
+  for (int r = 0; r < HOME_FP_COUNT; r++) {
+    if (slots.fp_home_used & (1u << (unsigned)r)) {
+      slot_alloc(&slots, HOME_FP_SAVE_NAMES[r], 8);
     }
   }
 
@@ -3477,19 +3902,28 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     for (int i = 0; i < count && !e->error; i++) {
       int off = slot_off(&slots, fn->parameter_names[i]);
       int home = home_of(&slots, fn->parameter_names[i]);
+      int fp_home = fp_home_of(&slots, fn->parameter_names[i]);
       Arm64ArgLocation location = locations[i];
       if (location.kind == ARM64_ARG_IN_VEC_REGISTER) {
         const char *type =
             fn->parameter_types ? fn->parameter_types[i] : NULL;
         int is_double = type_text_float_bits(type) == 64;
-        if (home >= 0) {
+        if (fp_home >= 0) {
+          arm64_emit_word(e, arm64_fmov_reg(is_double, fp_home,
+                                            (int)location.reg));
+        } else if (home >= 0) {
           arm64_emit_word(e, arm64_fmov_to_gp(is_double, (Arm64Reg)home,
                                               (int)location.reg));
         } else {
           emit_slot_str_fp(e, is_double, (int)location.reg, off);
         }
       } else if (location.kind == ARM64_ARG_IN_GP_REGISTER) {
-        if (home >= 0) {
+        if (param_copy[i]) {
+          emit_lea_local(e, R_RHS, off);
+          emit_fixed_copy(e, R_RHS, location.reg, param_copy[i]);
+        } else if (fp_home >= 0) {
+          arm64_emit_word(e, arm64_fmov_gp(1, fp_home, location.reg));
+        } else if (home >= 0) {
           home_write(e, &slots, fn->parameter_names[i], (Arm64Reg)home,
                      location.reg);
         } else {
@@ -3522,7 +3956,12 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
           arm64_emit_word(e, arm64_ldr_imm(1, R_LHS, ARM64_X29, from));
           break;
         }
-        if (home >= 0) {
+        if (param_copy[i]) {
+          emit_lea_local(e, R_RHS, off);
+          emit_fixed_copy(e, R_RHS, R_LHS, param_copy[i]);
+        } else if (fp_home >= 0) {
+          arm64_emit_word(e, arm64_fmov_gp(1, fp_home, R_LHS));
+        } else if (home >= 0) {
           home_write(e, &slots, fn->parameter_names[i], (Arm64Reg)home,
                      R_LHS);
         } else {
@@ -3553,9 +3992,33 @@ static int encode_function(Arm64Emit *e, const IRFunction *fn, LblMap *fns,
     scope.wide_params = &wide_params;
     scope.frame = frame;
     scope.sret_size = sret_size;
+    NameIndex read_index = {0};
+    int *reads = prog ? count_temp_reads(fn, &read_index) : NULL;
     for (size_t i = 0; i < fn->instruction_count && !e->error; i++) {
+      if (i + 1 < fn->instruction_count &&
+          fuse_compare_branch(&scope, &fn->instructions[i],
+                              &fn->instructions[i + 1], &read_index, reads)) {
+        i++;
+        continue;
+      }
       encode_instruction(&scope, &fn->instructions[i]);
     }
+    free(reads);
+    if (reads) {
+      name_index_free(&read_index);
+    }
+  }
+  if (!e->error && prog && fn->name && ir_explain_enabled()) {
+    size_t lowered = 0;
+    char detail[32];
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      IROpcode op = fn->instructions[i].op;
+      lowered += op != IR_OP_NOP && op != IR_OP_DECLARE_LOCAL;
+    }
+    snprintf(detail, sizeof(detail), "op:%d", slots.home_blocker - 1);
+    ir_explain_backend_function(fn->name, fn->location.filename,
+                                slots.home_ran,
+                                slots.home_blocker ? detail : NULL, lowered);
   }
 
 done:
@@ -3563,6 +4026,7 @@ done:
   free(slots.offs);
   free(slots.home_names);
   free(slots.home_regs);
+  free(param_copy);
   free(labels.names);
   free(labels.ids);
   free(fs.names);
@@ -3604,6 +4068,10 @@ static int io_stub_intrinsic(const char *name, int *with_newline,
 static int io_leaf(const char *name) {
   return io_stub_intrinsic(name, NULL, NULL) ||
          (name && strcmp(name, "cstr") == 0);
+}
+
+int arm64_ir_function_is_intercepted(const char *name) {
+  return io_leaf(name);
 }
 
 static void emit_str_print(Arm64Emit *e, int with_newline, int zero_result) {

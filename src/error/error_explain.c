@@ -1249,6 +1249,17 @@ static const DecisionDoc DECISIONS[] = {
      "\n"
      "Fix: keep the arithmetic in float32 or 32-bit integers when the range\n"
      "fits, and widen once after the loop.\n"},
+    {"scalar-target", DECISION_VECTOR_REFUSAL,
+     "A target this compiler emits no vector code for",
+     "The build targets AArch64. Mettle's loop vectorizers write x86-64 SSE\n"
+     "and AVX2, and the AArch64 backend has no NEON code generation, so every\n"
+     "loop runs as scalar AArch64 code. The target-neutral optimizer still\n"
+     "runs: inlining, invariant code motion, strength reduction and the SSA\n"
+     "passes.\n"
+     "\n"
+     "An @simd! loop fails the build on this target for the same reason.\n"
+     "Build the same file for x86_64 with --explain to see whether its\n"
+     "vectorizers take the loop.\n"},
     {"carried-value", DECISION_VECTOR_REFUSAL,
      "A value carried from one iteration into the next",
      "Lanes run eight iterations side by side, so no iteration may read what\n"

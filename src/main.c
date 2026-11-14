@@ -6286,9 +6286,21 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   ir_optimize_options.global_int_consts = global_consts;
   ir_optimize_options.global_int_const_count = global_const_count;
   ir_optimize_options.whole_program = options->building_executable;
-  ir_optimize_options.target_neutral_only = target_neutral;
   ir_optimize_options.gpu_device_only =
       options->emit_ptx || options->emit_spirv || options->emit_metal;
+  ir_optimize_options.scalar_target =
+      !ir_optimize_options.gpu_device_only &&
+      (options->emit_arm64 || compile_targets_arm64_object(options));
+  ir_optimize_options.target_neutral_only =
+      target_neutral && !ir_optimize_options.scalar_target;
+  if (options->emit_arm64) {
+    for (size_t i = 0; i < ir_program->function_count; i++) {
+      IRFunction *function = ir_program->functions[i];
+      if (function && arm64_ir_function_is_intercepted(function->name)) {
+        function->is_noinline = 1;
+      }
+    }
+  }
   int opt_ok = ir_optimize_program(ir_program, &ir_optimize_options);
   free(global_consts);
   if (opt_ok) {
@@ -6760,6 +6772,9 @@ static int compile_emit_arm64(IRProgram *ir_program, ASTNode *program,
   ok = arm64_ir_encode_program(&ae, ir_program, "main", &arm64_data,
                                &arm64_data_len) &&
        arm64_emit_finalize(&ae);
+  if (options->explain && options->optimize) {
+    ir_explain_backend_flush();
+  }
   if (ok) {
     ok = arm64_write_elf(output_filename, ae.code.data, ae.code.len,
                          arm64_data, arm64_data_len);
@@ -8264,7 +8279,8 @@ static int compile_stage_codegen(CompileContext *ctx) {
       (ctx->options->explain_json && mir_annotate_enabled())) {
     mir_annotate_flush();
   }
-  if (ctx->options->explain && ctx->options->optimize) {
+  if (ctx->options->explain && ctx->options->optimize &&
+      !ctx->arm64_object_output) {
     ir_explain_backend_flush();
   }
   return COMPILE_CONTINUE;
@@ -8376,6 +8392,9 @@ static int compile_stage_write_output(CompileContext *ctx) {
   ctx->phase_start = compiler_profile_begin(&ctx->profile);
   if (ctx->arm64_object_output) {
     written = compile_write_arm64_object(ctx);
+    if (ctx->options->explain && ctx->options->optimize) {
+      ir_explain_backend_flush();
+    }
   } else if (ctx->options->flat_output) {
     written = compile_write_flat_image(ctx);
   } else {

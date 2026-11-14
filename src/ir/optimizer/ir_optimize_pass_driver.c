@@ -240,7 +240,42 @@ static int ir_skip_spec_matches(const char *id_text, const char *pass_name) {
   return 0;
 }
 
+static MTLC_THREAD_LOCAL int g_scalar_target = 0;
+
+void ir_optimize_set_scalar_target(int enabled) { g_scalar_target = enabled; }
+
+int ir_optimize_scalar_target(void) { return g_scalar_target; }
+
+static int ir_pass_needs_vector_target(const char *name) {
+  static const char *const VECTOR_PASSES[] = {
+      "prefix_sum_i32",          "lower_bound_i32",
+      "detect_shift_loops",      "induction_pointer",
+      "fuse_rotate_add",         "strength_reduce_rotate_loops",
+      "fold_popcount_byte_loop", "fuse_popcount_buffer_loop",
+      "fold_kernighan_popcount", "count_word_starts",
+      "memcmp_byte_loop",        "prefetch_indirect",
+      "if_convert",              "if_convert_accumulate",
+      "parallelize_marked_loops",
+  };
+  if (!name) {
+    return 0;
+  }
+  if (strncmp(name, "simd_", 5) == 0 || strncmp(name, "auto_vectorize", 14) == 0 ||
+      strncmp(name, "outer_vectorize", 15) == 0) {
+    return 1;
+  }
+  for (size_t i = 0; i < sizeof(VECTOR_PASSES) / sizeof(VECTOR_PASSES[0]); i++) {
+    if (strcmp(name, VECTOR_PASSES[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int ir_pass_name_is_skipped(const char *pass_name) {
+  if (g_scalar_target && ir_pass_needs_vector_target(pass_name)) {
+    return 1;
+  }
   return ir_skip_spec_matches(NULL, pass_name);
 }
 
@@ -253,6 +288,9 @@ int ir_pass_is_skipped(IROptPassId pass_id) {
   int id_len = snprintf(id_text, sizeof(id_text), "%d", (int)pass_id);
   if (id_len <= 0) {
     return 0;
+  }
+  if (g_scalar_target && ir_pass_needs_vector_target(ir_opt_pass_name(pass_id))) {
+    return 1;
   }
 
   return ir_skip_spec_matches(id_text, ir_opt_pass_name(pass_id));

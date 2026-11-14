@@ -676,7 +676,7 @@ int ir_optimize_function_pipeline(IRFunction *function) {
 
   ir_explain_function_before(function);
 
-  {
+  if (!ir_pass_name_is_skipped("fuse_rotate_add")) {
     int pre_changed = 0;
     if (!ir_fuse_rotate_add_pass(function, &pre_changed)) {
       return 0;
@@ -996,7 +996,8 @@ static void ir_run_program_pass(IRProgram *program,
   if (pass->needs_whole_program && (!options || !options->whole_program)) {
     return;
   }
-  if (!pass->unskippable && ir_pass_name_is_skipped(pass->name)) {
+  if ((!pass->unskippable || ir_optimize_scalar_target()) &&
+      ir_pass_name_is_skipped(pass->name)) {
     return;
   }
   mettle_compiler_ctx_set_pass_name(pass->name);
@@ -1055,6 +1056,7 @@ int ir_optimize_program_pipeline(IRProgram *program,
   }
   ir_optimize_set_program(program);
   ir_devirtualize_set_program(program);
+  ir_optimize_set_scalar_target(options && options->scalar_target);
   if (options && options->target_neutral_only) {
     return ir_optimize_portable_program_pipeline(program, options);
   }

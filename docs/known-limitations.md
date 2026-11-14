@@ -487,6 +487,29 @@ expression, and a deeper one falls back.
 `--explain` names the reason for every loop it leaves alone, and
 `mettle explain <code>` expands any of them.
 
+The vectorizers emit SSE and AVX2 only. An AArch64 build keeps every loop
+scalar, `--explain` reports each one as `scalar-target`, and an `@simd!` loop
+fails the build there.
+
+## The AArch64 backend
+
+The AArch64 backend lowers IR straight to machine code. It runs the
+target-neutral optimizer (inlining, invariant code motion, the SSA passes and
+constant-divisor strength reduction) and skips the passes that build x86
+vector kernels.
+
+Values live in registers: a linear pass over live ranges gives scalar temps
+and locals x19 to x28, plus x3 to x7 for values that cross no call. Each
+operation still moves its operands through scratch registers before it runs,
+and float values travel between instructions in general registers with an
+`fmov` on each side. Both cost instructions a register-to-register backend
+would not spend. Aggregates, values whose address is taken and `float16`
+locals stay in stack slots.
+
+The backend report lists each function and whether its values got registers.
+It has no per-loop machine cost, because the AArch64 backend has no cycle
+model; the x86-64 report has one.
+
 ## Struct ABI
 
 Struct-by-value arguments and returns work in both directions on both
