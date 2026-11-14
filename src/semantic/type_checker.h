@@ -57,6 +57,7 @@ typedef struct {
   struct TypeCheckerKill *kills;
   size_t kill_count;
   size_t kill_capacity;
+  size_t kills_merged;
   const char **exposed;
   size_t exposed_count;
   size_t exposed_capacity;

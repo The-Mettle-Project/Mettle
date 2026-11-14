@@ -488,16 +488,54 @@ static void kill_add(TypeChecker *checker, int kind, const char *name,
   kill->moved = (unsigned char)moved;
 }
 
-static void kills_trim(TypeChecker *checker, size_t depth) {
-  for (size_t i = 0; i < checker->kill_count; i++) {
-    if (checker->kills[i].limit > depth) {
-      checker->kills[i].limit = depth;
-    }
+static int kill_shares_slot(const struct TypeCheckerKill *a,
+                            const struct TypeCheckerKill *b) {
+  if ((a->kind == KILL_NAME) != (b->kind == KILL_NAME)) {
+    return 0;
   }
+  if (a->kind != KILL_NAME) {
+    return 1;
+  }
+  return a->name && b->name && strcmp(a->name, b->name) == 0;
+}
+
+static int kill_merges_into(struct TypeCheckerKill *kept, size_t count,
+                            const struct TypeCheckerKill *kill) {
+  for (size_t j = count; j > 0; j--) {
+    struct TypeCheckerKill *earlier = &kept[j - 1];
+    if (!kill_shares_slot(earlier, kill)) {
+      continue;
+    }
+    if (earlier->limit != kill->limit || earlier->kind != kill->kind ||
+        earlier->moved != kill->moved) {
+      return 0;
+    }
+    earlier->line = kill->line;
+    return 1;
+  }
+  return 0;
+}
+
+static void kills_trim(TypeChecker *checker, size_t depth) {
+  size_t write = 0;
+  for (size_t i = 0; i < checker->kill_count; i++) {
+    struct TypeCheckerKill kill = checker->kills[i];
+    int fresh = i >= checker->kills_merged;
+    if (kill.limit > depth) {
+      kill.limit = depth;
+      fresh = 1;
+    }
+    if (fresh && kill_merges_into(checker->kills, write, &kill)) {
+      continue;
+    }
+    checker->kills[write++] = kill;
+  }
+  checker->kill_count = write;
   while (checker->kill_count > 0 &&
          checker->kills[checker->kill_count - 1].limit == 0) {
     checker->kill_count--;
   }
+  checker->kills_merged = checker->kill_count;
 }
 
 static int name_is_exposed(const TypeChecker *checker, const char *name) {
@@ -529,12 +567,16 @@ static void expose_name(TypeChecker *checker, const char *name) {
 void type_checker_forget_effects_since(TypeChecker *checker, size_t count) {
   if (checker && count < checker->kill_count) {
     checker->kill_count = count;
+    if (checker->kills_merged > count) {
+      checker->kills_merged = count;
+    }
   }
 }
 
 void type_checker_facts_reset(TypeChecker *checker) {
   if (checker) {
     checker->kill_count = 0;
+    checker->kills_merged = 0;
     checker->exposed_count = 0;
     checker->join = NULL;
     checker->joinable = NULL;
