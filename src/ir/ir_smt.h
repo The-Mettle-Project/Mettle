@@ -63,9 +63,19 @@ typedef struct {
   SmtTerm assume;
   SmtTerm *region_base;
   uint64_t *region_size;
+  unsigned char *region_private;
   size_t region_count;
   size_t region_cap;
+  SmtTerm *access_addr;
+  uint64_t *access_size;
+  size_t access_count;
+  size_t access_cap;
+  SmtTerm *foreign;
+  size_t foreign_count;
+  size_t foreign_cap;
 } IRSmtFrame;
+
+SmtTerm ir_smt_frame_assumption(IRSmtFrame *frame);
 
 #define IR_SMT_PROVE_CALL "__mettle_prove"
 

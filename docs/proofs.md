@@ -169,8 +169,18 @@ fn clear_tail(a: int64*, n: int64) -> int64 {
 ```
 
 Without the bound on `n`, `a + 8 * i` wraps around to `a` at `i = 2^61` and the
-claim is false. The address of a local and block copies are not modeled yet; a
-function that uses them cannot be checked.
+claim is false.
+
+A local whose address is taken, and every array or struct local, lives in its
+own stretch of that memory. Locals never overlap each other or address zero,
+and an access at a fixed offset inside one never traps. A call keeps the bytes
+of a local whose address the function only loads, stores, offsets and
+compares; passing the address to a call, storing it, returning it or doing
+other arithmetic with it lets any call change the local. A pointer parameter
+may still hold an address inside a local, so a fact about a local that has to
+survive a store through a parameter does not follow. Block copies, as in
+assigning one struct to another, are not modeled; a function that makes one
+cannot be checked.
 
 ## How the prover sees a function
 
@@ -181,7 +191,7 @@ unfolded when the prover can give it a definition:
 ```mermaid
 flowchart TD
   F[function] --> E{body encodes?}
-  E -- loops, floats, local addresses --> O[opaque]
+  E -- loops, floats, block copies --> O[opaque]
   E -- yes --> R{reads only its parameters?}
   R -- globals, memory, uninitialized locals --> O
   R -- yes --> C{recursive?}

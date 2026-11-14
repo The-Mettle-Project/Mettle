@@ -917,6 +917,11 @@ static SmtTerm instantiate(Prover *p, SmtTerm forall, const TermList *ground,
   return out;
 }
 
+static int goal_conjuncts(SmtCtx *ctx, SmtTerm t, SmtTerm *out, size_t *n,
+                          size_t cap);
+static void goal_solve(Prover *p, SmtTerm claim, uint64_t limit,
+                       SmtAttempt *attempt);
+
 static void goal_smt(Prover *p, const ThmGoal *g, uint64_t limit,
                      SmtAttempt *attempt) {
   SmtCtx *ctx = p->ctx;
@@ -935,8 +940,69 @@ static void goal_smt(Prover *p, const ThmGoal *g, uint64_t limit,
   }
   free(cands.items);
   free(ground.items);
+  SmtTerm parts[32];
+  size_t nparts = 0;
+  if (goal_conjuncts(ctx, g->concl, parts, &nparts, 32) && nparts > 1) {
+    for (size_t i = 0; i < nparts; i++) {
+      goal_solve(p, smt_implies(ctx, premise, parts[i]), limit, attempt);
+      if (attempt->result != SMT_UNSAT) {
+        return;
+      }
+    }
+    return;
+  }
+  goal_solve(p, smt_implies(ctx, premise, g->concl), limit, attempt);
+}
+
+static int goal_conjuncts(SmtCtx *ctx, SmtTerm t, SmtTerm *out, size_t *n,
+                          size_t cap) {
+  if (smt_term_kind(ctx, t) == SMT_K_AND) {
+    unsigned nargs = smt_term_nargs(ctx, t);
+    for (unsigned i = 0; i < nargs; i++) {
+      if (!goal_conjuncts(ctx, smt_term_arg(ctx, t, i), out, n, cap)) {
+        return 0;
+      }
+    }
+    return 1;
+  }
+  if (smt_term_kind(ctx, t) == SMT_K_ITE &&
+      smt_sort_is_bool(ctx, smt_term_sort(ctx, t))) {
+    SmtTerm c = smt_term_arg(ctx, t, 0);
+    SmtTerm a = smt_term_arg(ctx, t, 1);
+    SmtTerm b = smt_term_arg(ctx, t, 2);
+    if (b == smt_false(ctx)) {
+      return goal_conjuncts(ctx, c, out, n, cap) &&
+             goal_conjuncts(ctx, a, out, n, cap);
+    }
+    if (a == smt_false(ctx)) {
+      return goal_conjuncts(ctx, smt_not(ctx, c), out, n, cap) &&
+             goal_conjuncts(ctx, b, out, n, cap);
+    }
+  }
+  if (smt_term_kind(ctx, t) == SMT_K_NOT) {
+    SmtTerm inner = smt_term_arg(ctx, t, 0);
+    if (smt_term_kind(ctx, inner) == SMT_K_OR) {
+      unsigned nargs = smt_term_nargs(ctx, inner);
+      for (unsigned i = 0; i < nargs; i++) {
+        if (!goal_conjuncts(ctx, smt_not(ctx, smt_term_arg(ctx, inner, i)),
+                            out, n, cap)) {
+          return 0;
+        }
+      }
+      return 1;
+    }
+  }
+  if (*n == cap) {
+    return 0;
+  }
+  out[(*n)++] = t;
+  return 1;
+}
+
+static void goal_solve(Prover *p, SmtTerm claim, uint64_t limit,
+                       SmtAttempt *attempt) {
+  SmtCtx *ctx = p->ctx;
   SmtSolver *solver = NULL;
-  SmtTerm claim = smt_implies(ctx, premise, g->concl);
   attempt->result = smt_prove(ctx, claim, 1, limit, &solver);
   p->smt_calls++;
   SmtStats st;
@@ -1642,7 +1708,9 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
   for (size_t s = 0; s < frame.prove_count; s++) {
     IRSmtProveSite *site = &frame.proves[s];
     (*checked)++;
-    SmtTerm premise = smt_and(ctx, site->reach, smt_not(ctx, site->trap));
+    SmtTerm premise = smt_and(
+        ctx, ir_smt_frame_assumption(&frame),
+        smt_and(ctx, site->reach, smt_not(ctx, site->trap)));
     for (size_t i = 0; i < p->ngoals; i++) {
       goal_free(&p->goals[i]);
     }
@@ -1672,8 +1740,8 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
     char fmt[200];
     if (p->last_result == SMT_SAT && !p->last_detail[0]) {
       snprintf(fmt, sizeof(fmt),
-               "does not hold%s; it fails for some value of a global it "
-               "reads or a call it makes%%s",
+               "does not hold%s; it fails for some contents of memory, "
+               "value of a global, or result of a call%%s",
                kind);
     } else if (p->last_result == SMT_SAT) {
       snprintf(fmt, sizeof(fmt), "does not hold%s; it fails at %%s", kind);

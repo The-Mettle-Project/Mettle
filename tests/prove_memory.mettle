@@ -63,7 +63,64 @@ fn clear_tail(a: int64*, n: int64) -> int64 {
     return a[0];
 }
 
+fn store_to(p: int64*, v: int64) -> int64 {
+    *p = v;
+    return 0;
+}
+
+fn locals_apart(a: int64) -> int64 {
+    var x: int64 = a;
+    var y: int64 = 0;
+    store_to(&y, 5);
+    var cells: int32[4];
+    cells[0] = 1;
+    cells[3] = 4;
+    var px: int64* = &x;
+    *px = *px + 1;
+    prove(x == a + 1 && cells[0] + cells[3] == 5);
+    return x + y;
+}
+
+fn doubled_in_place(n: int64) -> int64 {
+    var q: int64* = &n;
+    *q = *q * 2;
+    prove(n % 2 == 0);
+    return n;
+}
+
+struct Pair32 {
+    a: int32;
+    b: int32;
+}
+
+struct Triple {
+    a: int64;
+    b: int64;
+    c: int64;
+}
+
+fn copies_are_values(dst: Pair32*) -> int64 {
+    var s: Pair32;
+    s.a = 1;
+    s.b = 2;
+    var t: Pair32 = s;
+    t.a = 5;
+    *dst = t;
+    var g: Triple;
+    g.a = 1;
+    g.b = 2;
+    g.c = 3;
+    var h: Triple = g;
+    g.c = 9;
+    prove(s.a == 1 && dst.a == 5 && dst.b == 2 && h.c == 3 && g.c == 9);
+    return h.c;
+}
+
 fn main() -> int32 {
+    var out: Pair32;
+    if (copies_are_values(&out) != 3 || out.a != 5) { return 10; }
+    if (locals_apart(1) != 7) { return 8; }
+    if (doubled_in_place(5) != 10) { return 9; }
     var ints: int32[4];
     if (set_and_read(&ints[0], 2) != 7) { return 1; }
     var bytes: uint8[2];

@@ -1163,6 +1163,13 @@ $cases = @(
     Pattern       = 'prove in `overwrite` does not hold; it fails at p = \d+, q = \d+'
   },
   @{
+    Name          = "err_prove_escaped_local"
+    Path          = "tests/err_prove_escaped_local.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'prove in `hidden_write` does not hold; it fails for some contents of memory'
+  },
+  @{
     Name          = "err_loop_invariant"
     Path          = "tests/err_loop_invariant.mettle"
     ShouldSucceed = $false

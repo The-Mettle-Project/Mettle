@@ -1,0 +1,16 @@
+fn put_through(pp: int64**) -> int64 {
+    var p: int64* = *pp;
+    *p = 9;
+    return 0;
+}
+
+fn hidden_write() -> int64 {
+    var x: int64 = 1;
+    var holder: int64*[1];
+    holder[0] = &x;
+    put_through(&holder[0]);
+    prove(x == 1);
+    return x;
+}
+
+fn main() -> int32 { return (int32)hidden_write() - 9; }

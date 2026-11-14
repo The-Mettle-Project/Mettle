@@ -16,6 +16,10 @@ typedef struct {
   int addressed;
   int slot;
   SmtTerm addr;
+  uint64_t region_size;
+  size_t origin;
+  int escaped;
+  int aggregate;
 } IrsVar;
 
 typedef struct {
@@ -57,6 +61,9 @@ typedef struct {
 } IrsEnc;
 
 static SmtTerm irs_eval_invariant(IrsEnc *e, size_t header);
+static void irs_trap(IrsEnc *e, SmtTerm cond);
+static void irs_note_access(IrsEnc *e, SmtTerm addr, int size);
+static int irs_is_foreign(const IRSmtFrame *f, SmtTerm t);
 static void irs_record_site(IrsEnc *e, SmtTerm reach, SmtTerm cond,
                             const SourceLocation *at, int kind);
 
@@ -305,8 +312,112 @@ static SmtTerm irs_address(SmtCtx *ctx, SmtTerm base, unsigned offset) {
   return smt_mk2(ctx, SMT_K_BVADD, base, smt_bv_u64(ctx, 64, offset));
 }
 
+static size_t irs_region_of(const IRSmtFrame *f, SmtCtx *ctx, SmtTerm addr,
+                            int size);
+
+static SmtTerm irs_skip_other_regions(const IRSmtFrame *f, SmtCtx *ctx,
+                                      SmtTerm mem, SmtTerm addr) {
+  size_t mine = irs_region_of(f, ctx, addr, 1);
+  int mine_private = mine != (size_t)-1 && f->region_private[mine];
+  int mine_foreign = mine == (size_t)-1 && irs_is_foreign(f, addr);
+  if (mine == (size_t)-1 && !mine_foreign) {
+    return mem;
+  }
+  while (smt_term_kind(ctx, mem) == SMT_K_STORE) {
+    SmtTerm at = smt_term_arg(ctx, mem, 1);
+    size_t theirs = irs_region_of(f, ctx, at, 1);
+    int apart = 0;
+    if (mine != (size_t)-1) {
+      apart = theirs != (size_t)-1 ? theirs != mine
+                                   : mine_private && irs_is_foreign(f, at);
+    } else {
+      apart = theirs != (size_t)-1 && f->region_private[theirs];
+    }
+    if (!apart) {
+      break;
+    }
+    mem = smt_term_arg(ctx, mem, 0);
+  }
+  return mem;
+}
+
+static int irs_frame_inside_region(const IRSmtFrame *f, SmtCtx *ctx,
+                                   SmtTerm addr, int size) {
+  return irs_region_of(f, ctx, addr, size) != (size_t)-1;
+}
+
+static size_t irs_region_of(const IRSmtFrame *f, SmtCtx *ctx, SmtTerm addr,
+                            int size) {
+  SmtTerm base = addr;
+  uint64_t offset = 0;
+  if (smt_term_kind(ctx, addr) == SMT_K_BVADD && smt_term_nargs(ctx, addr) == 2) {
+    SmtTerm x = smt_term_arg(ctx, addr, 0), y = smt_term_arg(ctx, addr, 1);
+    uint64_t w[4];
+    if (smt_term_is_const(ctx, y) && smt_term_const_words(ctx, y, w)) {
+      base = x;
+      offset = w[0];
+    } else if (smt_term_is_const(ctx, x) && smt_term_const_words(ctx, x, w)) {
+      base = y;
+      offset = w[0];
+    }
+  }
+  for (size_t i = 0; i < f->region_count; i++) {
+    if (f->region_base[i] == base) {
+      return offset < f->region_size[i] &&
+                     (uint64_t)size <= f->region_size[i] - offset
+                 ? i
+                 : (size_t)-1;
+    }
+  }
+  return (size_t)-1;
+}
+
+typedef struct {
+  SmtTerm *from;
+  SmtTerm *to;
+  size_t count;
+  size_t cap;
+} IrsMemo;
+
+static SmtTerm irs_strip_dead_stores(const IRSmtFrame *f, SmtCtx *ctx,
+                                     SmtTerm mem, IrsMemo *memo) {
+  for (size_t i = 0; i < memo->count; i++) {
+    if (memo->from[i] == mem) {
+      return memo->to[i];
+    }
+  }
+  SmtTerm out = mem;
+  SmtKind kind = smt_term_kind(ctx, mem);
+  if (kind == SMT_K_STORE) {
+    SmtTerm inner =
+        irs_strip_dead_stores(f, ctx, smt_term_arg(ctx, mem, 0), memo);
+    SmtTerm addr = smt_term_arg(ctx, mem, 1);
+    out = irs_frame_inside_region(f, ctx, addr, 1)
+              ? inner
+              : smt_store(ctx, inner, addr, smt_term_arg(ctx, mem, 2));
+  } else if (kind == SMT_K_ITE) {
+    out = smt_ite(
+        ctx, smt_term_arg(ctx, mem, 0),
+        irs_strip_dead_stores(f, ctx, smt_term_arg(ctx, mem, 1), memo),
+        irs_strip_dead_stores(f, ctx, smt_term_arg(ctx, mem, 2), memo));
+  }
+  if (memo->count == memo->cap) {
+    memo->cap = memo->cap ? memo->cap * 2u : 64u;
+    memo->from = realloc(memo->from, memo->cap * sizeof(SmtTerm));
+    memo->to = realloc(memo->to, memo->cap * sizeof(SmtTerm));
+  }
+  memo->from[memo->count] = mem;
+  memo->to[memo->count] = out;
+  memo->count++;
+  return out;
+}
+
 static SmtTerm irs_access_trap(IrsEnc *e, SmtTerm addr, int size) {
   SmtCtx *ctx = e->ctx;
+  if (irs_frame_inside_region(e->frame, ctx, addr, size)) {
+    return smt_false(ctx);
+  }
+  irs_note_access(e, addr, size);
   char name[48];
   snprintf(name, sizeof(name), "invalid_address_%d", size);
   SmtSort domain = irs_word(ctx);
@@ -329,6 +440,288 @@ static int irs_access_size(IrsEnc *e, const IRInstruction *insn) {
   return (int)insn->rhs.int_value;
 }
 
+static SmtTerm irs_load_bytes(IrsEnc *e, SmtTerm addr, int size,
+                               int is_unsigned) {
+  SmtCtx *ctx = e->ctx;
+  SmtTerm mem = e->env[e->mem_id];
+  SmtTerm v = 0;
+  for (int i = 0; i < size; i++) {
+    SmtTerm at = irs_address(ctx, addr, (unsigned)i);
+    SmtTerm byte =
+        smt_select(ctx, irs_skip_other_regions(e->frame, ctx, mem, at), at);
+    v = v ? smt_mk2(ctx, SMT_K_CONCAT, byte, v) : byte;
+  }
+  unsigned extra = 64u - (unsigned)size * 8u;
+  if (extra) {
+    v = is_unsigned ? smt_zext(ctx, v, extra) : smt_sext(ctx, v, extra);
+  }
+  return v;
+}
+
+static void irs_store_bytes(IrsEnc *e, SmtTerm addr, int size, SmtTerm value) {
+  SmtCtx *ctx = e->ctx;
+  SmtTerm mem = e->env[e->mem_id];
+  for (int i = 0; i < size; i++) {
+    SmtTerm byte =
+        smt_extract(ctx, value, (unsigned)i * 8u + 7u, (unsigned)i * 8u);
+    mem = smt_store(ctx, mem, irs_address(ctx, addr, (unsigned)i), byte);
+  }
+  e->env[e->mem_id] = mem;
+}
+
+static uint64_t irs_aggregate_size(const IRInstruction *insn) {
+  const MtlcType *vt = insn->value_type;
+  if (vt && (vt->kind == MTLC_TYPE_STRUCT || vt->kind == MTLC_TYPE_ARRAY) &&
+      vt->size > 0) {
+    return (uint64_t)vt->size;
+  }
+  const char *type = insn->text;
+  if (!type) {
+    return 0;
+  }
+  const char *open = strchr(type, '[');
+  if (!open || open == type) {
+    return 0;
+  }
+  char elem[64];
+  size_t len = (size_t)(open - type);
+  if (len >= sizeof(elem)) {
+    return 0;
+  }
+  memcpy(elem, type, len);
+  elem[len] = '\0';
+  int size = 0, is_unsigned = 0;
+  if (strcmp(elem, "float64") == 0) {
+    size = 8;
+  } else if (strcmp(elem, "float32") == 0) {
+    size = 4;
+  } else if (!irs_parse_scalar(elem, &size, &is_unsigned)) {
+    return 0;
+  }
+  uint64_t total = (uint64_t)size;
+  const char *at = open;
+  while (*at == '[') {
+    char *end = NULL;
+    unsigned long long n = strtoull(at + 1, &end, 10);
+    if (!end || *end != ']' || n == 0 || n > (1ull << 32)) {
+      return 0;
+    }
+    total *= n;
+    at = end + 1;
+  }
+  return *at == '\0' ? total : 0;
+}
+
+static SmtTerm irs_region(IrsEnc *e, const char *name, uint64_t size,
+                          int private_region) {
+  SmtCtx *ctx = e->ctx;
+  IRSmtFrame *f = e->frame;
+  SmtTerm base = irs_shared(e, "frame", name);
+  for (size_t i = 0; i < f->region_count; i++) {
+    if (f->region_base[i] == base) {
+      f->region_private[i] &= (unsigned char)(private_region != 0);
+      return base;
+    }
+  }
+  if (size == 0) {
+    size = 1;
+  }
+  SmtTerm last = irs_address(ctx, base, 0);
+  if (size > 1) {
+    last = smt_mk2(ctx, SMT_K_BVADD, base, smt_bv_u64(ctx, 64, size - 1u));
+  }
+  SmtTerm fact = smt_and(ctx, smt_not(ctx, smt_eq(ctx, base, smt_bv_u64(ctx, 64, 0))),
+                         smt_mk2(ctx, SMT_K_BVULE, base, last));
+  for (size_t i = 0; i < f->region_count; i++) {
+    SmtTerm other = f->region_base[i];
+    SmtTerm other_last = smt_mk2(ctx, SMT_K_BVADD, other,
+                                 smt_bv_u64(ctx, 64, f->region_size[i] - 1u));
+    fact = smt_and(ctx, fact,
+                   smt_or(ctx, smt_mk2(ctx, SMT_K_BVULT, last, other),
+                          smt_mk2(ctx, SMT_K_BVULT, other_last, base)));
+  }
+  f->assume = smt_and(ctx, f->assume ? f->assume : smt_true(ctx), fact);
+  if (f->region_count == f->region_cap) {
+    f->region_cap = f->region_cap ? f->region_cap * 2u : 16u;
+    f->region_base = realloc(f->region_base, f->region_cap * sizeof(SmtTerm));
+    f->region_size = realloc(f->region_size, f->region_cap * sizeof(uint64_t));
+    f->region_private = realloc(f->region_private, f->region_cap);
+  }
+  f->region_base[f->region_count] = base;
+  f->region_size[f->region_count] = size;
+  f->region_private[f->region_count] = (unsigned char)(private_region != 0);
+  f->region_count++;
+  return base;
+}
+
+static int irs_mentions_region(const IRSmtFrame *f, SmtCtx *ctx, SmtTerm t,
+                               SmtTerm *seen, size_t *nseen, size_t cap) {
+  for (size_t i = 0; i < *nseen; i++) {
+    if (seen[i] == t) {
+      return 0;
+    }
+  }
+  if (*nseen == cap) {
+    return 1;
+  }
+  seen[(*nseen)++] = t;
+  unsigned n = smt_term_nargs(ctx, t);
+  if (n == 0) {
+    for (size_t i = 0; i < f->region_count; i++) {
+      if (f->region_base[i] == t) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+  for (unsigned i = 0; i < n; i++) {
+    if (irs_mentions_region(f, ctx, smt_term_arg(ctx, t, i), seen, nseen,
+                            cap)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int irs_is_foreign(const IRSmtFrame *f, SmtTerm t) {
+  if (!f->foreign_cap) {
+    return 0;
+  }
+  size_t slot = (t * 2654435761u) & (f->foreign_cap - 1u);
+  while (f->foreign[slot]) {
+    if (f->foreign[slot] == t) {
+      return 1;
+    }
+    slot = (slot + 1u) & (f->foreign_cap - 1u);
+  }
+  return 0;
+}
+
+static void irs_add_foreign(IRSmtFrame *f, SmtTerm t) {
+  if (irs_is_foreign(f, t)) {
+    return;
+  }
+  if ((f->foreign_count + 1u) * 2u > f->foreign_cap) {
+    size_t cap = f->foreign_cap ? f->foreign_cap * 2u : 64u;
+    SmtTerm *table = calloc(cap, sizeof(SmtTerm));
+    for (size_t i = 0; i < f->foreign_cap; i++) {
+      if (f->foreign[i]) {
+        size_t slot = (f->foreign[i] * 2654435761u) & (cap - 1u);
+        while (table[slot]) {
+          slot = (slot + 1u) & (cap - 1u);
+        }
+        table[slot] = f->foreign[i];
+      }
+    }
+    free(f->foreign);
+    f->foreign = table;
+    f->foreign_cap = cap;
+  }
+  size_t slot = (t * 2654435761u) & (f->foreign_cap - 1u);
+  while (f->foreign[slot]) {
+    slot = (slot + 1u) & (f->foreign_cap - 1u);
+  }
+  f->foreign[slot] = t;
+  f->foreign_count++;
+}
+
+static void irs_note_access(IrsEnc *e, SmtTerm addr, int size) {
+  IRSmtFrame *f = e->frame;
+  SmtTerm seen[512];
+  size_t nseen = 0;
+  if (f->access_count >= 512u ||
+      irs_mentions_region(f, e->ctx, addr, seen, &nseen, 512u)) {
+    return;
+  }
+  for (size_t i = 0; i < f->access_count; i++) {
+    if (f->access_addr[i] == addr && f->access_size[i] == (uint64_t)size) {
+      return;
+    }
+  }
+  if (f->access_count == f->access_cap) {
+    f->access_cap = f->access_cap ? f->access_cap * 2u : 32u;
+    f->access_addr = realloc(f->access_addr, f->access_cap * sizeof(SmtTerm));
+    f->access_size = realloc(f->access_size, f->access_cap * sizeof(uint64_t));
+  }
+  f->access_addr[f->access_count] = addr;
+  f->access_size[f->access_count] = (uint64_t)size;
+  f->access_count++;
+  for (int i = 0; i < size; i++) {
+    irs_add_foreign(f, irs_address(e->ctx, addr, (unsigned)i));
+  }
+}
+
+SmtTerm ir_smt_frame_assumption(IRSmtFrame *f) {
+  SmtCtx *ctx = f->ctx;
+  SmtTerm out = f->assume ? f->assume : smt_true(ctx);
+  for (size_t a = 0; a < f->access_count; a++) {
+    SmtTerm lo = f->access_addr[a];
+    SmtTerm hi = smt_mk2(ctx, SMT_K_BVADD, lo,
+                         smt_bv_u64(ctx, 64, f->access_size[a] - 1u));
+    int any = 0;
+    for (size_t r = 0; r < f->region_count; r++) {
+      if (!f->region_private[r]) {
+        continue;
+      }
+      SmtTerm base = f->region_base[r];
+      SmtTerm last = smt_mk2(ctx, SMT_K_BVADD, base,
+                             smt_bv_u64(ctx, 64, f->region_size[r] - 1u));
+      out = smt_and(ctx, out,
+                    smt_or(ctx, smt_mk2(ctx, SMT_K_BVULT, hi, base),
+                           smt_mk2(ctx, SMT_K_BVULT, last, lo)));
+      any = 1;
+    }
+    if (any) {
+      out = smt_and(ctx, out, smt_mk2(ctx, SMT_K_BVULE, lo, hi));
+    }
+  }
+  return out;
+}
+
+static int irs_holds_aggregate(IrsEnc *e, const IROperand *op) {
+  if ((op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL) ||
+      !op->name) {
+    return 0;
+  }
+  IrsVar *v = &e->vars[irs_var_lookup(e, op->name, 1)];
+  return v->aggregate || (v->addr && !v->slot);
+}
+
+static void irs_copy_bytes(IrsEnc *e, SmtTerm dst, SmtTerm src,
+                           long long size) {
+  SmtCtx *ctx = e->ctx;
+  if (size <= 0 || size > 256) {
+    irs_fail(e, "it copies a block of memory larger than 256 bytes", NULL);
+    return;
+  }
+  int n = (int)size;
+  irs_trap(e, irs_access_trap(e, src, n));
+  irs_trap(e, irs_access_trap(e, dst, n));
+  SmtTerm before = e->env[e->mem_id];
+  SmtTerm mem = before;
+  for (int i = 0; i < n; i++) {
+    SmtTerm from = irs_address(ctx, src, (unsigned)i);
+    SmtTerm byte = smt_select(
+        ctx, irs_skip_other_regions(e->frame, ctx, before, from), from);
+    mem = smt_store(ctx, mem, irs_address(ctx, dst, (unsigned)i), byte);
+  }
+  e->env[e->mem_id] = mem;
+}
+
+static int irs_returns_aggregate(const IRFunction *fn) {
+  const char *type = fn ? fn->return_type_name : NULL;
+  int size, is_unsigned;
+  return type && strcmp(type, "void") != 0 &&
+         !irs_parse_scalar(type, &size, &is_unsigned);
+}
+
+static void irs_mark_aggregate(IrsEnc *e, const IROperand *dest) {
+  if ((dest->kind == IR_OPERAND_TEMP || dest->kind == IR_OPERAND_SYMBOL) &&
+      dest->name) {
+    e->vars[irs_var_lookup(e, dest->name, 1)].aggregate = 1;
+  }
+}
+
 static SmtTerm irs_read(IrsEnc *e, const IROperand *op) {
   SmtCtx *ctx = e->ctx;
   switch (op->kind) {
@@ -341,6 +734,10 @@ static SmtTerm irs_read(IrsEnc *e, const IROperand *op) {
       return smt_bv_u64(ctx, 64, 0);
     }
     size_t id = irs_var_lookup(e, op->name, 1);
+    if (e->vars[id].slot) {
+      return irs_load_bytes(e, e->vars[id].addr, e->vars[id].size,
+                            e->vars[id].is_unsigned);
+    }
     if (e->env[id]) {
       return e->env[id];
     }
@@ -381,6 +778,10 @@ static void irs_write(IrsEnc *e, const IROperand *dest, SmtTerm value) {
   IrsVar *v = &e->vars[id];
   if (dest->kind == IR_OPERAND_SYMBOL && !v->declared && !v->param) {
     irs_fail(e, "it writes the global", dest->name);
+    return;
+  }
+  if (v->slot) {
+    irs_store_bytes(e, v->addr, v->size, value);
     return;
   }
   if (v->size > 0 && v->size < 8) {
@@ -567,10 +968,23 @@ static int irs_callee_keeps_memory(const IRFunction *callee) {
 }
 
 static void irs_after_call_memory(IrsEnc *e, const IRFunction *callee) {
-  if (!irs_callee_keeps_memory(callee)) {
-    e->env[e->mem_id] =
-        smt_fresh(e->ctx, "memory@call", irs_memory_sort(e->ctx));
+  if (irs_callee_keeps_memory(callee)) {
+    return;
   }
+  SmtCtx *ctx = e->ctx;
+  SmtTerm old = e->env[e->mem_id];
+  SmtTerm mem = smt_fresh(ctx, "memory@call", irs_memory_sort(ctx));
+  for (size_t i = 0; i < e->nvars; i++) {
+    IrsVar *v = &e->vars[i];
+    if (!v->addr || v->escaped || v->region_size > 256u) {
+      continue;
+    }
+    for (uint64_t k = 0; k < v->region_size; k++) {
+      SmtTerm at = irs_address(ctx, v->addr, (unsigned)k);
+      mem = smt_store(ctx, mem, at, smt_select(ctx, old, at));
+    }
+  }
+  e->env[e->mem_id] = mem;
 }
 
 static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
@@ -607,6 +1021,9 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
     trap = smt_fresh(ctx, prefix, smt_bool_sort(ctx));
     irs_trap(e, trap);
     irs_write(e, &insn->dest, value);
+    if (irs_returns_aggregate(callee)) {
+      irs_mark_aggregate(e, &insn->dest);
+    }
     e->global_epoch++;
     irs_after_call_memory(e, callee);
     return;
@@ -626,6 +1043,9 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
   site->reach = e->reach;
   irs_trap(e, trap);
   irs_write(e, &insn->dest, value);
+  if (irs_returns_aggregate(callee)) {
+    irs_mark_aggregate(e, &insn->dest);
+  }
   e->global_epoch++;
   irs_after_call_memory(e, callee);
 }
@@ -790,6 +1210,9 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   } else {
     irs_trap(e, sub.trap);
     irs_write(e, &insn->dest, sub.result);
+    if (irs_returns_aggregate(callee)) {
+      irs_mark_aggregate(e, &insn->dest);
+    }
     e->env[e->mem_id] = sub.mem_out;
   }
   free(sub.vars);
@@ -813,6 +1236,11 @@ static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
       calls = 1;
     }
     stores |= e->insns[i].op == IR_OP_STORE;
+    const IROperand *d = &e->insns[i].dest;
+    if ((d->kind == IR_OPERAND_TEMP || d->kind == IR_OPERAND_SYMBOL) &&
+        d->name) {
+      stores |= e->vars[irs_var_lookup(e, d->name, 1)].addressed;
+    }
   }
   if (calls) {
     e->global_epoch++;
@@ -895,17 +1323,54 @@ static void irs_step(IrsEnc *e, size_t pc) {
     size_t id = irs_var_lookup(e, insn->dest.name, 1);
     int size, is_unsigned;
     if (!irs_parse_scalar(insn->text, &size, &is_unsigned)) {
-      irs_fail(e, "it declares a local of type", insn->text);
+      uint64_t bytes = irs_aggregate_size(insn);
+      if (!bytes) {
+        irs_fail(e, "it declares a local of type", insn->text);
+        return;
+      }
+      SmtTerm base =
+          irs_region(e, insn->dest.name, bytes, !e->vars[id].escaped);
+      e->vars[id].addr = base;
+      e->vars[id].region_size = bytes;
+      e->vars[id].size = 8;
+      e->vars[id].is_unsigned = 1;
+      e->env[id] = base;
       return;
     }
     e->vars[id].size = size;
     e->vars[id].is_unsigned = is_unsigned;
+    if (e->vars[id].addressed) {
+      e->vars[id].addr = irs_region(e, insn->dest.name, (uint64_t)size,
+                                    !e->vars[id].escaped);
+      e->vars[id].region_size = (uint64_t)size;
+      e->vars[id].slot = 1;
+      return;
+    }
     e->env[id] = irs_shared(e, "undefined", insn->dest.name);
     return;
   }
-  case IR_OP_ASSIGN:
+  case IR_OP_ASSIGN: {
+    IrsVar *d = (insn->dest.kind == IR_OPERAND_TEMP ||
+                 insn->dest.kind == IR_OPERAND_SYMBOL) &&
+                        insn->dest.name
+                    ? &e->vars[irs_var_lookup(e, insn->dest.name, 1)]
+                    : NULL;
+    if (d && d->addr && !d->slot) {
+      SmtTerm base = d->addr;
+      SmtTerm source = irs_read(e, &insn->lhs);
+      if (irs_holds_aggregate(e, &insn->lhs) || d->region_size > 8u) {
+        irs_copy_bytes(e, base, source, (long long)d->region_size);
+      } else {
+        irs_store_bytes(e, base, (int)d->region_size, source);
+      }
+      return;
+    }
+    if (d && irs_holds_aggregate(e, &insn->lhs)) {
+      d->aggregate = 1;
+    }
     irs_write(e, &insn->dest, irs_read(e, &insn->lhs));
     return;
+  }
   case IR_OP_BINARY: {
     if (insn->is_float || !insn->text) {
       irs_fail(e, "it computes with floats", NULL);
@@ -1015,21 +1480,21 @@ static void irs_step(IrsEnc *e, size_t pc) {
       return;
     }
     SmtTerm addr = irs_read(e, &insn->lhs);
-    SmtTerm mem = e->env[e->mem_id];
     irs_trap(e, irs_access_trap(e, addr, size));
-    SmtTerm v = smt_select(ctx, mem, addr);
-    for (int i = 1; i < size; i++) {
-      SmtTerm byte = smt_select(ctx, mem, irs_address(ctx, addr, (unsigned)i));
-      v = smt_mk2(ctx, SMT_K_CONCAT, byte, v);
-    }
-    unsigned extra = 64u - (unsigned)size * 8u;
-    if (extra) {
-      v = insn->is_unsigned ? smt_zext(ctx, v, extra) : smt_sext(ctx, v, extra);
-    }
-    irs_write(e, &insn->dest, v);
+    irs_write(e, &insn->dest,
+              irs_load_bytes(e, addr, size, insn->is_unsigned));
     return;
   }
   case IR_OP_STORE: {
+    if (insn->rhs.kind == IR_OPERAND_INT && !insn->is_float &&
+        (irs_holds_aggregate(e, &insn->lhs) ||
+         (insn->rhs.int_value != 1 && insn->rhs.int_value != 2 &&
+          insn->rhs.int_value != 4 && insn->rhs.int_value != 8))) {
+      SmtTerm dst = irs_read(e, &insn->dest);
+      SmtTerm src = irs_read(e, &insn->lhs);
+      irs_copy_bytes(e, dst, src, insn->rhs.int_value);
+      return;
+    }
     int size = irs_access_size(e, insn);
     if (!size) {
       return;
@@ -1037,18 +1502,186 @@ static void irs_step(IrsEnc *e, size_t pc) {
     SmtTerm addr = irs_read(e, &insn->dest);
     SmtTerm value = irs_read(e, &insn->lhs);
     irs_trap(e, irs_access_trap(e, addr, size));
-    SmtTerm mem = e->env[e->mem_id];
-    for (int i = 0; i < size; i++) {
-      SmtTerm byte = smt_extract(ctx, value, (unsigned)i * 8u + 7u,
-                                 (unsigned)i * 8u);
-      mem = smt_store(ctx, mem, irs_address(ctx, addr, (unsigned)i), byte);
+    irs_store_bytes(e, addr, size, value);
+    return;
+  }
+  case IR_OP_ADDRESS_OF: {
+    if (insn->lhs.kind != IR_OPERAND_SYMBOL || !insn->lhs.name) {
+      irs_fail(e, "it takes an address the encoder does not model", NULL);
+      return;
     }
-    e->env[e->mem_id] = mem;
+    size_t id = irs_var_lookup(e, insn->lhs.name, 1);
+    IrsVar *v = &e->vars[id];
+    if (v->slot) {
+      irs_write(e, &insn->dest, v->addr);
+      return;
+    }
+    if (v->addr && e->env[id]) {
+      irs_write(e, &insn->dest, e->env[id]);
+      return;
+    }
+    irs_fail(e, "it takes the address of", insn->lhs.name);
     return;
   }
   default:
     irs_fail(e, "it uses the instruction", ir_opcode_name(insn->op));
     return;
+  }
+}
+
+static size_t irs_origin(IrsEnc *e, const IROperand *op) {
+  if ((op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL) ||
+      !op->name) {
+    return 0;
+  }
+  return e->vars[irs_var_lookup(e, op->name, 1)].origin;
+}
+
+static int irs_is_region_decl(IrsEnc *e, const IROperand *op) {
+  if ((op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL) ||
+      !op->name) {
+    return 0;
+  }
+  size_t id = irs_var_lookup(e, op->name, 1);
+  return e->vars[id].origin == id + 1u;
+}
+
+static void irs_escape(IrsEnc *e, size_t origin) {
+  if (origin) {
+    e->vars[origin - 1u].escaped = 1;
+  }
+}
+
+static int irs_flow(IrsEnc *e, const IROperand *dest, size_t origin) {
+  if (!origin || (dest->kind != IR_OPERAND_TEMP &&
+                  dest->kind != IR_OPERAND_SYMBOL) ||
+      !dest->name) {
+    return 0;
+  }
+  IrsVar *d = &e->vars[irs_var_lookup(e, dest->name, 1)];
+  if (d->origin == origin) {
+    return 0;
+  }
+  if (d->origin) {
+    irs_escape(e, d->origin);
+    irs_escape(e, origin);
+    return 0;
+  }
+  d->origin = origin;
+  return 1;
+}
+
+static int irs_is_compare(const char *op) {
+  static const char *const ops[] = {"==", "!=", "<", "<=", ">", ">="};
+  for (size_t i = 0; op && i < sizeof(ops) / sizeof(ops[0]); i++) {
+    if (strcmp(op, ops[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void irs_find_escapes(IrsEnc *e) {
+  for (size_t i = 0; i < e->count; i++) {
+    const IRInstruction *insn = &e->insns[i];
+    int size, is_unsigned;
+    if (insn->op == IR_OP_ADDRESS_OF && insn->lhs.kind == IR_OPERAND_SYMBOL &&
+        insn->lhs.name) {
+      size_t id = irs_var_lookup(e, insn->lhs.name, 1);
+      irs_flow(e, &insn->dest, id + 1u);
+    } else if (insn->op == IR_OP_DECLARE_LOCAL && insn->dest.name &&
+               !irs_parse_scalar(insn->text, &size, &is_unsigned)) {
+      size_t id = irs_var_lookup(e, insn->dest.name, 1);
+      e->vars[id].origin = id + 1u;
+    }
+  }
+  int changed = 1;
+  for (int round = 0; changed && round < 8; round++) {
+    changed = 0;
+    for (size_t i = 0; i < e->count; i++) {
+      const IRInstruction *insn = &e->insns[i];
+      switch (insn->op) {
+      case IR_OP_ASSIGN:
+      case IR_OP_CAST:
+        if (irs_is_region_decl(e, &insn->dest)) {
+          break;
+        }
+        changed |= irs_flow(e, &insn->dest, irs_origin(e, &insn->lhs));
+        break;
+      case IR_OP_BINARY:
+        if (insn->text && (strcmp(insn->text, "+") == 0 ||
+                           strcmp(insn->text, "-") == 0)) {
+          size_t a = irs_origin(e, &insn->lhs), b = irs_origin(e, &insn->rhs);
+          if (a && b) {
+            irs_escape(e, a);
+            irs_escape(e, b);
+          }
+          changed |= irs_flow(e, &insn->dest, a ? a : b);
+        }
+        break;
+      case IR_OP_SELECT:
+        changed |= irs_flow(e, &insn->dest, irs_origin(e, &insn->rhs));
+        if (insn->argument_count) {
+          changed |=
+              irs_flow(e, &insn->dest, irs_origin(e, &insn->arguments[0]));
+        }
+        break;
+      default:
+        break;
+      }
+    }
+  }
+  for (size_t i = 0; i < e->count; i++) {
+    const IRInstruction *insn = &e->insns[i];
+    switch (insn->op) {
+    case IR_OP_LOAD:
+    case IR_OP_ADDRESS_OF:
+    case IR_OP_DECLARE_LOCAL:
+    case IR_OP_ASSIGN:
+    case IR_OP_CAST:
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+    case IR_OP_LABEL:
+    case IR_OP_JUMP:
+    case IR_OP_NOP:
+      break;
+    case IR_OP_STORE:
+      if (insn->rhs.kind == IR_OPERAND_INT &&
+          (irs_is_region_decl(e, &insn->lhs) ||
+           (insn->rhs.int_value != 1 && insn->rhs.int_value != 2 &&
+            insn->rhs.int_value != 4 && insn->rhs.int_value != 8))) {
+        break;
+      }
+      irs_escape(e, irs_origin(e, &insn->lhs));
+      break;
+    case IR_OP_BINARY:
+      if (!insn->text || (strcmp(insn->text, "+") != 0 &&
+                          strcmp(insn->text, "-") != 0 &&
+                          !irs_is_compare(insn->text))) {
+        irs_escape(e, irs_origin(e, &insn->lhs));
+        irs_escape(e, irs_origin(e, &insn->rhs));
+      }
+      break;
+    case IR_OP_SELECT:
+      break;
+    case IR_OP_CALL:
+      if (insn->text && (strcmp(insn->text, IR_SMT_PROVE_CALL) == 0 ||
+                         strcmp(insn->text, IR_SMT_INVARIANT_CALL) == 0)) {
+        break;
+      }
+      for (size_t a = 0; a < insn->argument_count; a++) {
+        irs_escape(e, irs_origin(e, &insn->arguments[a]));
+      }
+      break;
+    default:
+      irs_escape(e, irs_origin(e, &insn->dest));
+      irs_escape(e, irs_origin(e, &insn->lhs));
+      irs_escape(e, irs_origin(e, &insn->rhs));
+      for (size_t a = 0; a < insn->argument_count; a++) {
+        irs_escape(e, irs_origin(e, &insn->arguments[a]));
+      }
+      break;
+    }
   }
 }
 
@@ -1082,7 +1715,15 @@ static int irs_run(IrsEnc *e) {
     if (insn->op == IR_OP_DECLARE_LOCAL && insn->dest.name) {
       e->vars[irs_var_lookup(e, insn->dest.name, 1)].declared = 1;
     }
+    if (insn->op == IR_OP_ADDRESS_OF && insn->lhs.kind == IR_OPERAND_SYMBOL &&
+        insn->lhs.name) {
+      e->vars[irs_var_lookup(e, insn->lhs.name, 1)].addressed = 1;
+    }
   }
+  if (!e->frame->assume) {
+    e->frame->assume = smt_true(ctx);
+  }
+  irs_find_escapes(e);
   e->mem_id = irs_var_lookup(e, "\x01memory", 1);
   e->vars[e->mem_id].declared = 1;
   e->env = calloc(e->nvars ? e->nvars : 1u, sizeof(SmtTerm));
@@ -1112,6 +1753,15 @@ static int irs_run(IrsEnc *e) {
     size_t id = irs_var_lookup(e, fn->parameter_names[i], 0);
     e->env[id] = ir_smt_narrow(ctx, e->params[i], e->vars[id].size,
                                e->vars[id].is_unsigned);
+    if (e->vars[id].addressed) {
+      e->vars[id].addr =
+          irs_region(e, fn->parameter_names[i], (uint64_t)e->vars[id].size,
+                     !e->vars[id].escaped);
+      e->vars[id].region_size = (uint64_t)e->vars[id].size;
+      irs_store_bytes(e, e->vars[id].addr, e->vars[id].size, e->env[id]);
+      e->vars[id].slot = 1;
+      e->env[id] = 0;
+    }
   }
   e->reach = smt_true(ctx);
   e->result = smt_bv_u64(ctx, 64, 0);
@@ -1160,6 +1810,10 @@ void ir_smt_frame_free(IRSmtFrame *frame) {
   free(frame->proves);
   free(frame->region_base);
   free(frame->region_size);
+  free(frame->region_private);
+  free(frame->access_addr);
+  free(frame->access_size);
+  free(frame->foreign);
   memset(frame, 0, sizeof(*frame));
 }
 
@@ -1229,13 +1883,34 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
     assume = smt_and(ctx, smt_not(ctx, og.trap),
                      irs_nonzero(ctx, og.result));
   }
+  assume = smt_and(ctx, assume, ir_smt_frame_assumption(&frame));
   SmtTerm same_trap = smt_iff(ctx, oa.trap, ob.trap);
   SmtTerm same_result = smt_eq(ctx, oa.result, ob.result);
+  int frames_dead = !irs_returns_aggregate(a) && !irs_returns_aggregate(b);
+  if (oa.memory != ob.memory && frame.region_count && frames_dead) {
+    IrsMemo memo;
+    memset(&memo, 0, sizeof(memo));
+    oa.memory = irs_strip_dead_stores(&frame, ctx, oa.memory, &memo);
+    ob.memory = irs_strip_dead_stores(&frame, ctx, ob.memory, &memo);
+    free(memo.from);
+    free(memo.to);
+  }
   if (oa.memory != ob.memory) {
     SmtTerm k = smt_fresh(ctx, "address", smt_bv_sort(ctx, 64));
-    same_result = smt_and(ctx, same_result,
-                          smt_eq(ctx, smt_select(ctx, oa.memory, k),
-                                 smt_select(ctx, ob.memory, k)));
+    SmtTerm live = smt_true(ctx);
+    for (size_t i = 0; frames_dead && i < frame.region_count; i++) {
+      SmtTerm base = frame.region_base[i];
+      SmtTerm last = smt_mk2(ctx, SMT_K_BVADD, base,
+                             smt_bv_u64(ctx, 64, frame.region_size[i] - 1u));
+      live = smt_and(ctx, live,
+                     smt_or(ctx, smt_mk2(ctx, SMT_K_BVULT, k, base),
+                            smt_mk2(ctx, SMT_K_BVULT, last, k)));
+    }
+    same_result = smt_and(
+        ctx, same_result,
+        smt_implies(ctx, live,
+                    smt_eq(ctx, smt_select(ctx, oa.memory, k),
+                           smt_select(ctx, ob.memory, k))));
   }
   SmtTerm same_value = smt_implies(ctx, smt_not(ctx, oa.trap), same_result);
   SmtTerm claim = smt_implies(ctx, assume, smt_and(ctx, same_trap, same_value));

@@ -1686,6 +1686,10 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
                                     NULL, NULL);
     if (outcome != IRV_CHECK_DIVERGED) {
       g_apps_smt_unconfirmed++;
+      if (irv_stats_enabled()) {
+        fprintf(stderr, "  smt refuted %s in %s, not reproduced\n", pass_name,
+                function->name ? function->name : "?");
+      }
       outcome = irv_check_function(g_program, function, snapshot, &result,
                                    irv_pass_elem_bytes(pass_name));
     }

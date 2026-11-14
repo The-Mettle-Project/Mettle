@@ -898,6 +898,19 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
     if (smt_const_is_zero(ctx, b)) {
       return a;
     }
+    if (smt_is_bvconst(ctx, a) != smt_is_bvconst(ctx, b)) {
+      SmtTerm k = smt_is_bvconst(ctx, a) ? a : b;
+      SmtTerm sum = smt_is_bvconst(ctx, a) ? b : a;
+      if (ctx->nodes[sum].kind == SMT_K_BVADD && ctx->nodes[sum].nargs == 2) {
+        SmtTerm x = smt_arg(ctx, sum, 0), y = smt_arg(ctx, sum, 1);
+        if (smt_is_bvconst(ctx, y) && !smt_is_bvconst(ctx, x)) {
+          return smt_mk2(ctx, SMT_K_BVADD, x, smt_mk2(ctx, SMT_K_BVADD, y, k));
+        }
+        if (smt_is_bvconst(ctx, x) && !smt_is_bvconst(ctx, y)) {
+          return smt_mk2(ctx, SMT_K_BVADD, y, smt_mk2(ctx, SMT_K_BVADD, x, k));
+        }
+      }
+    }
     return 0;
   case SMT_K_BVSUB:
     if (a == b) {
@@ -1025,6 +1038,26 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       }
       if (p1 >= lw) {
         return smt_extract(ctx, hi, p0 - lw, p1 - lw);
+      }
+    }
+    return 0;
+  case SMT_K_CONCAT:
+    if (ctx->nodes[a].kind == SMT_K_EXTRACT) {
+      SmtTerm x = smt_arg(ctx, a, 0);
+      if (ctx->nodes[b].kind == SMT_K_EXTRACT && smt_arg(ctx, b, 0) == x &&
+          ctx->nodes[a].p1 == ctx->nodes[b].p0 + 1u) {
+        return smt_extract(ctx, x, ctx->nodes[a].p0, ctx->nodes[b].p1);
+      }
+      if (ctx->nodes[b].kind == SMT_K_CONCAT) {
+        SmtTerm mid = smt_arg(ctx, b, 0);
+        if (ctx->nodes[mid].kind == SMT_K_EXTRACT &&
+            smt_arg(ctx, mid, 0) == x &&
+            ctx->nodes[a].p1 == ctx->nodes[mid].p0 + 1u) {
+          return smt_mk2(ctx, SMT_K_CONCAT,
+                         smt_extract(ctx, x, ctx->nodes[a].p0,
+                                     ctx->nodes[mid].p1),
+                         smt_arg(ctx, b, 1));
+        }
       }
     }
     return 0;
