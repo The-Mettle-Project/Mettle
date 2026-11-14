@@ -1150,6 +1150,12 @@ $cases = @(
     Args          = @()
   },
   @{
+    Name          = "prove_inferred_invariants"
+    Path          = "tests/prove_inferred_invariants.mettle"
+    ShouldSucceed = $true
+    Args          = @()
+  },
+  @{
     Name          = "prove_memory"
     Path          = "tests/prove_memory.mettle"
     ShouldSucceed = $true

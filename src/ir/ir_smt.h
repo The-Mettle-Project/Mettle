@@ -64,6 +64,7 @@ typedef struct {
   SmtTerm *region_base;
   uint64_t *region_size;
   unsigned char *region_private;
+  unsigned char *region_global;
   size_t region_count;
   size_t region_cap;
   SmtTerm *access_addr;
@@ -74,6 +75,7 @@ typedef struct {
   size_t foreign_count;
   size_t foreign_cap;
   int lockstep;
+  int infer;
   int chose_nan;
   unsigned encode_index;
   struct IRSmtLoop *loops;
@@ -88,6 +90,7 @@ typedef struct IRSmtLoop {
   const char **names;
   size_t name_count;
   int memory;
+  SmtTerm *head;
 } IRSmtLoop;
 
 typedef struct IRSmtLoopVisit {
@@ -100,6 +103,9 @@ typedef struct IRSmtLoopVisit {
 } IRSmtLoopVisit;
 
 SmtTerm ir_smt_frame_assumption(IRSmtFrame *frame);
+void ir_smt_prepare_inference(IRSmtFrame *frame, const IRFunction *fn);
+SmtTerm ir_smt_inferred_invariants(IRSmtFrame *frame, const IRFunction *fn,
+                                   size_t *kept);
 
 #define IR_SMT_PROVE_CALL "__mettle_prove"
 

@@ -1751,6 +1751,7 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
   frame.param_count = temp.nvars;
   frame.params = calloc(temp.nvars ? temp.nvars : 1, sizeof(SmtTerm));
   memcpy(frame.params, temp.vars, temp.nvars * sizeof(SmtTerm));
+  ir_smt_prepare_inference(&frame, f);
   IRSmtOutcome out;
   if (f->parameter_count > THM_MAX_VARS ||
       !ir_smt_encode(&frame, f, f->instructions, f->instruction_count, &out)) {
@@ -1769,13 +1770,15 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
     return 0;
   }
   int loops = function_has_loop(f);
+  size_t inferred_count = 0;
+  SmtTerm inferred = ir_smt_inferred_invariants(&frame, f, &inferred_count);
   ThmEntry *saved = p->current;
   p->current = &temp;
   for (size_t s = 0; s < frame.prove_count; s++) {
     IRSmtProveSite *site = &frame.proves[s];
     (*checked)++;
     SmtTerm premise =
-        smt_and(ctx, ir_smt_frame_assumption(&frame),
+        smt_and(ctx, smt_and(ctx, ir_smt_frame_assumption(&frame), inferred),
                 smt_and(ctx, site->reach, smt_not(ctx, site->trap)));
     for (size_t i = 0; i < p->ngoals; i++) {
       goal_free(&p->goals[i]);
@@ -1820,9 +1823,10 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
     if (loops) {
       fprintf(stderr,
               "  note: the prover reads every loop in `%s` as "
-              "running any number of times from any state, so a "
-              "fact a loop keeps has to follow from its own test\n",
-              f->name);
+              "running any number of times from any state, knowing only "
+              "its test, its `invariant` and the %zu comparisons it found "
+              "that every iteration keeps\n",
+              f->name, inferred_count);
     }
   }
   for (size_t i = 0; i < p->ngoals; i++) {

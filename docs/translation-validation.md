@@ -44,8 +44,9 @@ leaves the two sides out of step, and the application goes to the input sets.
 
 When the solver finds a disagreement in loop-free code, the interpreter runs
 the solver's input first, so a real miscompile is reported with a concrete
-run. Code with square roots, strings or block copies larger than 256 bytes
-goes straight to the input sets. See [Proofs](proofs.md).
+run. Code with string literals, calls to functions without a body, or block
+copies larger than 256 bytes goes straight to the input sets. See
+[Proofs](proofs.md).
 
 ## Reference twins
 

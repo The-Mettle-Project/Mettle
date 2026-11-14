@@ -1,0 +1,50 @@
+fn count_up(n: int64) -> int64 {
+    if (n < 0) { return 0; }
+    var i: int64 = 0;
+    while (i < n) {
+        i = i + 1;
+    }
+    prove(i == n);
+    return i;
+}
+
+fn keep_sign(n: int64) -> int64 {
+    var total: int64 = 0;
+    var i: int64 = 0;
+    while (i < n) {
+        total = total + 2;
+        i = i + 1;
+        if (total > 1000) { total = 1000; }
+    }
+    prove(total >= 0 && total <= 1000);
+    return total;
+}
+
+fn untouched(a: int64, n: int64) -> int64 {
+    var limit: int64 = a;
+    var i: int64 = 0;
+    var steps: int64 = 0;
+    while (i < n) {
+        steps = steps + 1;
+        i = i + 1;
+    }
+    prove(limit == a && steps == i);
+    return steps;
+}
+
+fn count_unsigned(n: uint64) -> uint64 {
+    var i: uint64 = 0;
+    while (i < n) {
+        i = i + 1;
+    }
+    prove(i == n);
+    return i;
+}
+
+fn main() -> int32 {
+    if (count_unsigned(7) != 7) { return 4; }
+    if (count_up(5) != 5) { return 1; }
+    if (keep_sign(3) != 6) { return 2; }
+    if (untouched(9, 4) != 4) { return 3; }
+    return 0;
+}

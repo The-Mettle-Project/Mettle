@@ -403,7 +403,8 @@ static SmtTerm irs_strip_dead_stores(const IRSmtFrame *f, SmtCtx *ctx,
     SmtTerm inner =
         irs_strip_dead_stores(f, ctx, smt_term_arg(ctx, mem, 0), memo);
     SmtTerm addr = smt_term_arg(ctx, mem, 1);
-    out = irs_frame_inside_region(f, ctx, addr, 1)
+    size_t region = irs_region_of(f, ctx, addr, 1);
+    out = region != (size_t)-1 && !f->region_global[region]
               ? inner
               : smt_store(ctx, inner, addr, smt_term_arg(ctx, mem, 2));
   } else if (kind == SMT_K_ITE) {
@@ -507,6 +508,9 @@ static void irs_store_bytes(IrsEnc *e, SmtTerm addr, int size, SmtTerm value) {
 }
 
 static uint64_t irs_aggregate_size(const IRInstruction *insn) {
+  if (insn->text && strcmp(insn->text, "string") == 0) {
+    return 16;
+  }
   const MtlcType *vt = insn->value_type;
   if (vt && (vt->kind == MTLC_TYPE_STRUCT || vt->kind == MTLC_TYPE_ARRAY) &&
       vt->size > 0) {
@@ -584,10 +588,12 @@ static SmtTerm irs_region(IrsEnc *e, const char *name, uint64_t size,
     f->region_base = realloc(f->region_base, f->region_cap * sizeof(SmtTerm));
     f->region_size = realloc(f->region_size, f->region_cap * sizeof(uint64_t));
     f->region_private = realloc(f->region_private, f->region_cap);
+    f->region_global = realloc(f->region_global, f->region_cap);
   }
   f->region_base[f->region_count] = base;
   f->region_size[f->region_count] = size;
   f->region_private[f->region_count] = (unsigned char)(private_region != 0);
+  f->region_global[f->region_count] = 0;
   f->region_count++;
   return base;
 }
@@ -716,6 +722,68 @@ SmtTerm ir_smt_frame_assumption(IRSmtFrame *f) {
   return out;
 }
 
+static int irs_global_shape(IrsEnc *e, const char *name, int *size,
+                            int *is_unsigned, int *fp, uint64_t *bytes) {
+  const IRModuleSymbol *sym =
+      e->frame->program ? ir_program_lookup_symbol(e->frame->program, name)
+                        : NULL;
+  if (!sym || sym->kind != IR_MODSYM_VARIABLE || !sym->type ||
+      sym->type->size == 0) {
+    return 0;
+  }
+  const MtlcType *t = sym->type;
+  *fp = 0;
+  *bytes = (uint64_t)t->size;
+  switch (t->kind) {
+  case MTLC_TYPE_INT8:
+  case MTLC_TYPE_INT16:
+  case MTLC_TYPE_INT32:
+  case MTLC_TYPE_INT64:
+    *size = (int)t->size;
+    *is_unsigned = 0;
+    return 1;
+  case MTLC_TYPE_UINT8:
+  case MTLC_TYPE_UINT16:
+  case MTLC_TYPE_UINT32:
+  case MTLC_TYPE_UINT64:
+  case MTLC_TYPE_BOOL:
+  case MTLC_TYPE_POINTER:
+  case MTLC_TYPE_ENUM:
+    *size = (int)t->size;
+    *is_unsigned = t->kind != MTLC_TYPE_ENUM;
+    return 1;
+  case MTLC_TYPE_FLOAT32:
+  case MTLC_TYPE_FLOAT64:
+    *size = (int)t->size;
+    *is_unsigned = 1;
+    *fp = (int)t->size * 8;
+    return 1;
+  case MTLC_TYPE_STRUCT:
+  case MTLC_TYPE_ARRAY:
+    *size = 0;
+    *is_unsigned = 1;
+    return 2;
+  default:
+    return 0;
+  }
+}
+
+static SmtTerm irs_global_base(IrsEnc *e, const char *name, uint64_t bytes) {
+  const char *saved = e->prefix;
+  char key[200];
+  snprintf(key, sizeof(key), "global@%s", name);
+  e->prefix = NULL;
+  SmtTerm base = irs_region(e, key, bytes, 0);
+  e->prefix = saved;
+  IRSmtFrame *f = e->frame;
+  for (size_t i = 0; i < f->region_count; i++) {
+    if (f->region_base[i] == base) {
+      f->region_global[i] = 1;
+    }
+  }
+  return base;
+}
+
 static int irs_holds_aggregate(IrsEnc *e, const IROperand *op) {
   if ((op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL) ||
       !op->name) {
@@ -781,6 +849,18 @@ static SmtTerm irs_read(IrsEnc *e, const IROperand *op) {
     }
     IrsVar *v = &e->vars[id];
     if (op->kind == IR_OPERAND_SYMBOL && !v->declared && !v->param) {
+      int size, is_unsigned, fp;
+      uint64_t bytes;
+      int shape = irs_global_shape(e, op->name, &size, &is_unsigned, &fp, &bytes);
+      if (shape) {
+        SmtTerm base = irs_global_base(e, op->name, bytes);
+        if (shape == 2) {
+          v->aggregate = 1;
+          return base;
+        }
+        v->fp = fp;
+        return irs_load_bytes(e, base, size, is_unsigned);
+      }
       if (e->frame->uf_calls && e->global_epoch) {
         char kind[32];
         snprintf(kind, sizeof(kind), "global@%u", e->global_epoch);
@@ -815,7 +895,20 @@ static void irs_write(IrsEnc *e, const IROperand *dest, SmtTerm value) {
   size_t id = irs_var_lookup(e, dest->name, 1);
   IrsVar *v = &e->vars[id];
   if (dest->kind == IR_OPERAND_SYMBOL && !v->declared && !v->param) {
-    irs_fail(e, "it writes the global", dest->name);
+    int size, is_unsigned, fp;
+    uint64_t bytes;
+    int shape =
+        irs_global_shape(e, dest->name, &size, &is_unsigned, &fp, &bytes);
+    if (!shape) {
+      irs_fail(e, "it writes the global", dest->name);
+      return;
+    }
+    SmtTerm base = irs_global_base(e, dest->name, bytes);
+    if (shape == 2) {
+      irs_copy_bytes(e, base, value, (long long)bytes);
+    } else {
+      irs_store_bytes(e, base, size, value);
+    }
     return;
   }
   if (v->slot) {
@@ -1161,9 +1254,31 @@ static int irs_is_trap_call(const char *name) {
                   strcmp(name, "mettle_crash_panic") == 0);
 }
 
+static int irs_callee_owns(const IRFunction *callee, const char *name) {
+  for (size_t p = 0; p < callee->parameter_count; p++) {
+    if (callee->parameter_names[p] &&
+        strcmp(callee->parameter_names[p], name) == 0) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < callee->instruction_count; i++) {
+    const IRInstruction *insn = &callee->instructions[i];
+    if (insn->op == IR_OP_DECLARE_LOCAL && insn->dest.name &&
+        strcmp(insn->dest.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int irs_callee_keeps_memory(const IRFunction *callee) {
   for (size_t i = 0; i < callee->instruction_count; i++) {
     const IRInstruction *insn = &callee->instructions[i];
+    if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name &&
+        insn->op != IR_OP_DECLARE_LOCAL &&
+        !irs_callee_owns(callee, insn->dest.name)) {
+      return 0;
+    }
     switch (insn->op) {
     case IR_OP_NOP:
     case IR_OP_LABEL:
@@ -1454,7 +1569,7 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
 
 static size_t irs_lockstep_find(IrsEnc *e, const char *label) {
   IRSmtFrame *f = e->frame;
-  if (!f->lockstep || e->prefix || !label) {
+  if ((!f->lockstep && !f->infer) || e->prefix || !label) {
     return (size_t)-1;
   }
   for (size_t i = 0; i < f->loop_count; i++) {
@@ -1491,7 +1606,7 @@ static void irs_lockstep_visit(IrsEnc *e, size_t loop, int back,
 
 static void irs_lockstep_havoc(IrsEnc *e, size_t loop) {
   SmtCtx *ctx = e->ctx;
-  const IRSmtLoop *l = &e->frame->loops[loop];
+  IRSmtLoop *l = &e->frame->loops[loop];
   char kind[200];
   snprintf(kind, sizeof(kind), "loop@%s", l->label);
   if (l->memory) {
@@ -1505,13 +1620,18 @@ static void irs_lockstep_havoc(IrsEnc *e, size_t loop) {
     }
     IrsVar *v = &e->vars[id];
     if (!v->declared && !v->param && !v->temp) {
-      irs_fail(e, "a loop writes the global", l->names[i]);
-      return;
+      continue;
     }
     SmtTerm shared = irs_shared(e, kind, l->names[i]);
     e->env[id] = v->size > 0 && v->size < 8
                      ? ir_smt_narrow(ctx, shared, v->size, v->is_unsigned)
                      : shared;
+    if (e->frame->infer) {
+      if (!l->head) {
+        l->head = calloc(l->name_count ? l->name_count : 1u, sizeof(SmtTerm));
+      }
+      l->head[i] = e->env[id];
+    }
   }
 }
 
@@ -1529,7 +1649,9 @@ static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
     const IROperand *d = &e->insns[i].dest;
     if ((d->kind == IR_OPERAND_TEMP || d->kind == IR_OPERAND_SYMBOL) &&
         d->name) {
-      stores |= e->vars[irs_var_lookup(e, d->name, 1)].addressed;
+      IrsVar *dv = &e->vars[irs_var_lookup(e, d->name, 1)];
+      stores |= dv->addressed ||
+                (d->kind == IR_OPERAND_SYMBOL && !dv->declared && !dv->param);
     }
   }
   if (calls) {
@@ -1550,8 +1672,7 @@ static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
     size_t id = irs_var_lookup(e, dest->name, 1);
     IrsVar *v = &e->vars[id];
     if (dest->kind == IR_OPERAND_SYMBOL && !v->declared && !v->param) {
-      irs_fail(e, "a loop writes the global", dest->name);
-      return;
+      continue;
     }
     char prefix[160];
     snprintf(prefix, sizeof(prefix), "loop:%s", dest->name);
@@ -1927,6 +2048,15 @@ static void irs_step(IrsEnc *e, size_t pc) {
       irs_write(e, &insn->dest, e->env[id]);
       return;
     }
+    if (!v->declared && !v->param) {
+      int size, is_unsigned, fp;
+      uint64_t bytes;
+      if (irs_global_shape(e, insn->lhs.name, &size, &is_unsigned, &fp,
+                           &bytes)) {
+        irs_write(e, &insn->dest, irs_global_base(e, insn->lhs.name, bytes));
+        return;
+      }
+    }
     irs_fail(e, "it takes the address of", insn->lhs.name);
     return;
   }
@@ -2040,6 +2170,17 @@ static void irs_find_escapes(IrsEnc *e) {
   }
   for (size_t i = 0; i < e->count; i++) {
     const IRInstruction *insn = &e->insns[i];
+    if (insn->dest.kind == IR_OPERAND_SYMBOL && insn->dest.name &&
+        insn->op != IR_OP_STORE && insn->op != IR_OP_DECLARE_LOCAL) {
+      IrsVar *d = &e->vars[irs_var_lookup(e, insn->dest.name, 1)];
+      if (!d->declared && !d->param) {
+        irs_escape(e, irs_origin(e, &insn->lhs));
+        irs_escape(e, irs_origin(e, &insn->rhs));
+        for (size_t a = 0; a < insn->argument_count; a++) {
+          irs_escape(e, irs_origin(e, &insn->arguments[a]));
+        }
+      }
+    }
     switch (insn->op) {
     case IR_OP_ADDRESS_OF: {
       size_t held = irs_origin(e, &insn->lhs);
@@ -2118,16 +2259,18 @@ static int irs_run(IrsEnc *e) {
       const MtlcType *pt = e->frame->program
                                ? ir_program_lookup_type(e->frame->program, type)
                                : NULL;
-      if (!pt || pt->size == 0 ||
-          (pt->kind != MTLC_TYPE_STRUCT && pt->kind != MTLC_TYPE_ARRAY &&
-           pt->kind != MTLC_TYPE_TAGGED_ENUM)) {
+      int is_string = strcmp(type, "string") == 0;
+      if (!is_string &&
+          (!pt || pt->size == 0 ||
+           (pt->kind != MTLC_TYPE_STRUCT && pt->kind != MTLC_TYPE_ARRAY &&
+            pt->kind != MTLC_TYPE_TAGGED_ENUM))) {
         irs_fail(e, "a parameter has type", type);
         return 0;
       }
       size = 8;
       is_unsigned = 1;
       e->vars[id].aggregate = 1;
-      e->vars[id].region_size = (uint64_t)pt->size;
+      e->vars[id].region_size = is_string ? 16u : (uint64_t)pt->size;
     }
     e->vars[id].param = 1;
     e->vars[id].size = size;
@@ -2254,11 +2397,13 @@ void ir_smt_frame_free(IRSmtFrame *frame) {
   free(frame->region_base);
   free(frame->region_size);
   free(frame->region_private);
+  free(frame->region_global);
   free(frame->access_addr);
   free(frame->access_size);
   free(frame->foreign);
   for (size_t i = 0; i < frame->loop_count; i++) {
     free(frame->loops[i].names);
+    free(frame->loops[i].head);
   }
   free(frame->loops);
   for (size_t i = 0; i < frame->visit_count; i++) {
@@ -2391,11 +2536,17 @@ static int irs_collect_loops(IRSmtFrame *f, const IRInstruction *insns,
           !d->name) {
         continue;
       }
+      int declared = d->kind == IR_OPERAND_TEMP;
       for (size_t k = 0; k < count; k++) {
         if (insns[k].op == IR_OP_ADDRESS_OF &&
             irs_names_operand(&insns[k].lhs, d->name)) {
           l->memory = 1;
         }
+        declared |= insns[k].op == IR_OP_DECLARE_LOCAL &&
+                    irs_names_operand(&insns[k].dest, d->name);
+      }
+      if (!declared) {
+        l->memory = 1;
       }
       int live = 0;
       for (size_t k = header; k <= i && !live; k++) {
@@ -2460,6 +2611,245 @@ static SmtTerm irs_lockstep_obligations(IRSmtFrame *f) {
       free(vals[0]);
       free(vals[1]);
     }
+  }
+  return all;
+}
+
+void ir_smt_prepare_inference(IRSmtFrame *frame, const IRFunction *fn) {
+  if (irs_collect_loops(frame, fn->instructions, fn->instruction_count)) {
+    frame->infer = 1;
+  }
+}
+
+typedef struct {
+  int op;
+  size_t lhs;
+  size_t rhs_name;
+  SmtTerm rhs;
+} IrsCandidate;
+
+static SmtTerm irs_candidate_term(SmtCtx *ctx, const IrsCandidate *c,
+                                  const SmtTerm *values) {
+  SmtTerm a = values[c->lhs];
+  SmtTerm b = c->rhs ? c->rhs : values[c->rhs_name];
+  if (!a || !b) {
+    return 0;
+  }
+  switch (c->op) {
+  case 0:
+    return smt_eq(ctx, a, b);
+  case 1:
+    return smt_mk2(ctx, SMT_K_BVSLE, a, b);
+  case 2:
+    return smt_mk2(ctx, SMT_K_BVSLE, b, a);
+  case 3:
+    return smt_mk2(ctx, SMT_K_BVULE, a, b);
+  default:
+    return smt_mk2(ctx, SMT_K_BVULE, b, a);
+  }
+}
+
+static void irs_loop_constants(const IRFunction *fn, const char *label,
+                               SmtCtx *ctx, SmtTerm *out, size_t *n,
+                               size_t cap) {
+  const IRInstruction *insns = fn->instructions;
+  size_t count = fn->instruction_count;
+  size_t header = irs_label_in(insns, count, label);
+  if (header == (size_t)-1) {
+    return;
+  }
+  size_t end = header;
+  for (size_t pc = header; pc < count; pc++) {
+    const IRInstruction *insn = &insns[pc];
+    if ((insn->op == IR_OP_JUMP || insn->op == IR_OP_BRANCH_ZERO ||
+         insn->op == IR_OP_BRANCH_EQ) &&
+        insn->text && strcmp(insn->text, label) == 0) {
+      end = pc;
+    }
+  }
+  for (size_t pc = header; pc <= end && *n < cap; pc++) {
+    const IROperand *ops[2] = {&insns[pc].lhs, &insns[pc].rhs};
+    for (int k = 0; k < 2 && *n < cap; k++) {
+      if (ops[k]->kind != IR_OPERAND_INT) {
+        continue;
+      }
+      SmtTerm t = smt_bv_i64(ctx, 64, ops[k]->int_value);
+      int seen = 0;
+      for (size_t i = 0; i < *n; i++) {
+        seen |= out[i] == t;
+      }
+      if (!seen) {
+        out[(*n)++] = t;
+      }
+    }
+  }
+}
+
+static int irs_houdini_round(SmtCtx *ctx, SmtTerm premise, SmtTerm claim,
+                             SmtSolver **solver) {
+  SmtResult r = smt_prove(ctx, smt_implies(ctx, premise, claim), 1, 20000,
+                          solver);
+  return r == SMT_UNSAT ? 1 : r == SMT_SAT ? 0 : -1;
+}
+
+static int irs_model_true(SmtSolver *solver, SmtTerm t) {
+  uint64_t w[4] = {0};
+  return smt_solver_value(solver, t, w) && (w[0] & 1u);
+}
+
+SmtTerm ir_smt_inferred_invariants(IRSmtFrame *frame, const IRFunction *fn,
+                                   size_t *kept) {
+  SmtCtx *ctx = frame->ctx;
+  SmtTerm all = smt_true(ctx);
+  SmtTerm assume = ir_smt_frame_assumption(frame);
+  *kept = 0;
+  for (size_t li = 0; li < frame->loop_count; li++) {
+    const IRSmtLoop *l = &frame->loops[li];
+    if (!l->head || !l->name_count) {
+      continue;
+    }
+    const IRSmtLoopVisit *entry = NULL;
+    int entries = 0;
+    for (size_t k = 0; k < frame->visit_count; k++) {
+      if (frame->visits[k].loop == li && !frame->visits[k].back) {
+        entry = &frame->visits[k];
+        entries++;
+      }
+    }
+    if (entries != 1) {
+      continue;
+    }
+    SmtTerm outer[48];
+    size_t nouter = 0;
+    outer[nouter++] = smt_bv_u64(ctx, 64, 0);
+    outer[nouter++] = smt_bv_u64(ctx, 64, 1);
+    for (size_t i = 0; i < frame->param_count && nouter < 24; i++) {
+      int size = 8, is_unsigned = 0;
+      if (fn->parameter_types && fn->parameter_types[i] &&
+          !ir_smt_parse_scalar(fn->parameter_types[i], &size, &is_unsigned)) {
+        continue;
+      }
+      outer[nouter++] =
+          ir_smt_narrow(ctx, frame->params[i], size, is_unsigned);
+    }
+    irs_loop_constants(fn, l->label, ctx, outer, &nouter, 32);
+    for (size_t i = 0; i < l->name_count && nouter < 48; i++) {
+      if (entry->values[i]) {
+        outer[nouter++] = entry->values[i];
+      }
+    }
+    size_t cap = 4096, n = 0;
+    IrsCandidate *cands = malloc(cap * sizeof(IrsCandidate));
+    for (size_t v = 0; v < l->name_count; v++) {
+      if (!l->head[v] || !entry->values[v]) {
+        continue;
+      }
+      for (int op = 0; op < 5; op++) {
+        for (size_t o = 0; o < nouter && n < cap; o++) {
+          cands[n++] = (IrsCandidate){op, v, 0, outer[o]};
+        }
+        for (size_t w = v + 1u; w < l->name_count && n < cap; w++) {
+          if (l->head[w] && entry->values[w]) {
+            cands[n++] = (IrsCandidate){op, v, w, 0};
+          }
+        }
+      }
+    }
+    unsigned char *alive = calloc(n ? n : 1u, 1);
+    memset(alive, 1, n);
+    int failed = 0, settled = 0;
+    for (int round = 0; round < 40 && !failed; round++) {
+      SmtTerm claim = smt_true(ctx);
+      for (size_t c = 0; c < n; c++) {
+        if (alive[c]) {
+          claim = smt_and(ctx, claim,
+                          irs_candidate_term(ctx, &cands[c], entry->values));
+        }
+      }
+      SmtSolver *solver = NULL;
+      int r = irs_houdini_round(ctx, smt_and(ctx, assume, entry->reach), claim,
+                                &solver);
+      if (r == 1) {
+        settled++;
+        smt_solver_free(solver);
+        break;
+      }
+      int dropped = 0;
+      for (size_t c = 0; r == 0 && c < n; c++) {
+        if (alive[c] &&
+            !irs_model_true(solver,
+                            irs_candidate_term(ctx, &cands[c], entry->values))) {
+          alive[c] = 0;
+          dropped = 1;
+        }
+      }
+      smt_solver_free(solver);
+      failed = !dropped;
+    }
+    for (int round = 0; round < 60 && !failed; round++) {
+      SmtTerm head = smt_true(ctx);
+      for (size_t c = 0; c < n; c++) {
+        if (alive[c]) {
+          head = smt_and(ctx, head, irs_candidate_term(ctx, &cands[c], l->head));
+        }
+      }
+      SmtTerm claim = smt_true(ctx);
+      for (size_t k = 0; k < frame->visit_count; k++) {
+        const IRSmtLoopVisit *b = &frame->visits[k];
+        if (b->loop != li || !b->back) {
+          continue;
+        }
+        SmtTerm keep = smt_true(ctx);
+        for (size_t c = 0; c < n; c++) {
+          if (!alive[c]) {
+            continue;
+          }
+          SmtTerm t = irs_candidate_term(ctx, &cands[c], b->values);
+          keep = smt_and(ctx, keep, t ? t : smt_false(ctx));
+        }
+        claim = smt_and(ctx, claim, smt_implies(ctx, b->reach, keep));
+      }
+      SmtSolver *solver = NULL;
+      int r = irs_houdini_round(ctx, smt_and(ctx, assume, head), claim, &solver);
+      if (r == 1) {
+        settled++;
+        smt_solver_free(solver);
+        break;
+      }
+      int dropped = 0;
+      for (size_t k = 0; r == 0 && k < frame->visit_count; k++) {
+        const IRSmtLoopVisit *b = &frame->visits[k];
+        if (b->loop != li || !b->back || !irs_model_true(solver, b->reach)) {
+          continue;
+        }
+        for (size_t c = 0; c < n; c++) {
+          SmtTerm t = alive[c] ? irs_candidate_term(ctx, &cands[c], b->values)
+                               : 0;
+          if (alive[c] && (!t || !irs_model_true(solver, t))) {
+            alive[c] = 0;
+            dropped = 1;
+          }
+        }
+      }
+      smt_solver_free(solver);
+      failed = !dropped;
+    }
+    failed |= settled != 2;
+    SmtTerm invariant = smt_true(ctx);
+    size_t count = 0;
+    for (size_t c = 0; c < n && !failed; c++) {
+      if (alive[c]) {
+        invariant =
+            smt_and(ctx, invariant, irs_candidate_term(ctx, &cands[c], l->head));
+        count++;
+      }
+    }
+    if (!failed && count) {
+      all = smt_and(ctx, all, smt_or(ctx, smt_not(ctx, entry->reach), invariant));
+      *kept += count;
+    }
+    free(alive);
+    free(cands);
   }
   return all;
 }
@@ -2534,6 +2924,9 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
     SmtTerm k = smt_fresh(ctx, "address", smt_bv_sort(ctx, 64));
     SmtTerm live = smt_true(ctx);
     for (size_t i = 0; frames_dead && i < frame.region_count; i++) {
+      if (frame.region_global[i]) {
+        continue;
+      }
       SmtTerm base = frame.region_base[i];
       SmtTerm last = smt_mk2(ctx, SMT_K_BVADD, base,
                              smt_bv_u64(ctx, 64, frame.region_size[i] - 1u));

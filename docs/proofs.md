@@ -85,9 +85,10 @@ halve.mettle:3:10: error: prove in `halve` does not hold; it fails at x = 3
 Each site is closed by `auto`, so calls are unfolded and induction is tried
 the same way. A loop is read as running any number of times from any state:
 on entry to a loop, every variable the loop writes may hold any value. A
-`prove` inside or after a loop can rely on the loop's own test and on what the
-loop leaves alone. That reading covers every run the program can make, so a
-proof under it holds for the program.
+`prove` inside or after a loop can rely on the loop's own test, on what the
+loop leaves alone, and on the loop invariants it is given or finds. That
+reading covers every run the program can make, so a proof under it holds for
+the program.
 
 ## Loop invariants
 
@@ -118,6 +119,31 @@ invariant that the body breaks is reported with the values that break it:
 ```text
 loop.mettle:5:18: error: invariant in `double_up` does not hold (the invariant after an iteration); it fails at n = 4294967294
 ```
+
+Simple invariants are found without being written. For every variable the
+loop writes, the prover tries comparisons with `==`, and with signed and
+unsigned `<=` and `>=`, against
+zero, one, the parameters, the constants in the loop, each variable's value
+on entry, and the other variables the loop writes. It drops every comparison
+that fails on entry, then every one that some iteration breaks while the rest
+hold, using each counterexample to drop several at once, until the remaining
+set holds on entry and survives an iteration. That set is assumed at the
+loop's test. Here it finds `i <= n`, and the exit test gives `i == n`:
+
+```mettle
+fn count_up(n: int64) -> int64 {
+    if (n < 0) { return 0; }
+    var i: int64 = 0;
+    while (i < n) {
+        i = i + 1;
+    }
+    prove(i == n);
+    return i;
+}
+```
+
+An invariant with arithmetic, such as `2 * total == i * (i - 1)`, still has
+to be written.
 
 ## Memory
 
@@ -182,7 +208,14 @@ local's address, so a store through a parameter leaves it alone; a program
 that reaches a local through any other pointer has a memory error.
 
 Assigning one struct to another copies its bytes, up to 256 bytes. A struct
-parameter is the address of the caller's copy.
+or `string` parameter is the address of the caller's copy; a `string` is its
+16-byte record of data pointer and length.
+
+Each global variable has its own stretch of memory, apart from the locals and
+the other globals. Reading or writing it, or taking its address, is a load or
+a store there. A call to a function that writes a global, or that the prover
+cannot see into, leaves globals unknown afterward, and a pointer parameter may
+point at a global.
 
 ## How the prover sees a function
 
@@ -193,7 +226,7 @@ unfolded when the prover can give it a definition:
 ```mermaid
 flowchart TD
   F[function] --> E{body encodes?}
-  E -- loops, square roots, large block copies --> O[opaque]
+  E -- loops, string literals, large block copies --> O[opaque]
   E -- yes --> R{reads only its parameters?}
   R -- globals, memory, uninitialized locals --> O
   R -- yes --> C{recursive?}
@@ -334,7 +367,8 @@ and a `sat` answer on a formula that contained one is reported as `unknown`.
 ## Floating point
 
 `float32` and `float64` values are their IEEE 754 bits. Addition,
-subtraction, multiplication, division, comparison, negation and the
+subtraction, multiplication, division, square root, comparison, negation and
+the
 conversions to and from integers and between the two widths are built as
 bit-vector circuits in `src/proof/smt_fp.c` and round to nearest, ties to
 even. Subnormals, signed zeros and infinities follow the standard, and a
@@ -353,8 +387,9 @@ float.mettle:4:10: error: prove in `trunc_in_range` does not hold; it fails at x
 ```
 
 The guard `x < 0.0 || x > 100.0` is false for NaN, so NaN reaches the
-conversion and becomes `INT64_MIN`. Square roots and half-precision values
-are not modeled yet.
+conversion and becomes `INT64_MIN`. Half-precision values are not modeled.
+Claims that combine a square root with a product, such as
+`sqrt(x * x) == x`, exceed the solver's search limit.
 
 ## mettle smt
 
@@ -437,7 +472,7 @@ and subtract equals the multiplication, signed and unsigned.
 
 [Rewrite rules](rewrite-rules.md) are proved for every input before the
 compiler applies them, and fall back to generated inputs only when the solver
-cannot model a side, such as one that takes a square root. A rule can also
+cannot model a side, such as one that uses a string literal. A rule can also
 carry a `proof` block of tactics, which makes the optimizer apply an
 identity that only an induction establishes.
 [Translation validation](translation-validation.md) proves each pass
