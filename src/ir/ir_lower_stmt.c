@@ -853,8 +853,9 @@ static int ir_lower_named_assignment(IRLoweringContext *context,
     ir_operand_destroy(value);
     return 0;
   }
-  if (ir_should_coerce_string_to_cstring(context, assign_type,
-                                         assignment->value) &&
+  if (ir_should_coerce_string_to_cstring(
+          context, decay_target ? decay_target : assign_type,
+          assignment->value) &&
       !ir_coerce_string_operand_to_cstring(
           context, function, value, assignment->value->location)) {
     ir_operand_destroy(value);

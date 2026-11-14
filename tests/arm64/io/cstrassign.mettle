@@ -1,0 +1,30 @@
+import "std/io";
+import "std/conv";
+
+fn pick(n: int32) -> cstring {
+  if (n == 0) { return "returned"; }
+  return "other";
+}
+
+fn kind_of(status: int32) -> cstring {
+  var kind: cstring = "invalid_request_error";
+  if (status == 404) { kind = "not_found_error"; }
+  return kind;
+}
+
+fn main() -> int32 {
+  var a: cstring = "initialized";
+  println(str_from_cstr(a));
+  var b: cstring = "one";
+  b = "assigned";
+  println(str_from_cstr(b));
+  var c: cstring = 0;
+  c = pick(0);
+  println(str_from_cstr(c));
+  println(str_from_cstr(kind_of(404)));
+  println(str_from_cstr(kind_of(400)));
+  var r: rawptr = (rawptr)0;
+  r = "raw";
+  println(str_from_cstr((cstring)r));
+  return 0;
+}
