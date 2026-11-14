@@ -114,6 +114,12 @@ uint32_t arm64_msub(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm,
 uint32_t arm64_mul(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm) {
   return arm64_madd(is64, rd, rn, rm, ARM64_XZR);
 }
+uint32_t arm64_smulh(Arm64Reg rd, Arm64Reg rn, Arm64Reg rm) {
+  return 0x9B407C00u | (R5(rm) << 16) | (R5(rn) << 5) | R5(rd);
+}
+uint32_t arm64_umulh(Arm64Reg rd, Arm64Reg rn, Arm64Reg rm) {
+  return 0x9BC07C00u | (R5(rm) << 16) | (R5(rn) << 5) | R5(rd);
+}
 uint32_t arm64_sdiv(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm) {
   uint32_t base = is64 ? 0x9AC00C00u : 0x1AC00C00u;
   return base | (R5(rm) << 16) | (R5(rn) << 5) | R5(rd);

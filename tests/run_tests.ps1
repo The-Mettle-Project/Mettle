@@ -16749,6 +16749,22 @@ try {
     $code = $LASTEXITCODE
     if ($code -eq 0) {
       Write-Host ($runOut.Trim())
+      $relIoDir = Join-Path $tmpDir "arm64relio"
+      New-Item -ItemType Directory -Force -Path $relIoDir | Out-Null
+      Get-ChildItem tests/arm64\io\*.mettle | ForEach-Object {
+        $ioElf = Join-Path $relIoDir ($_.BaseName + ".elf")
+        & $CompilerPath --emit-arm64 --release $_.FullName -o $ioElf 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ioElf)) {
+          throw "mettle --emit-arm64 --release failed on io/$($_.Name)"
+        }
+        Copy-Item (Join-Path "tests/arm64/io" ($_.BaseName + ".out")) `
+          (Join-Path $relIoDir ($_.BaseName + ".out")) -Force
+      }
+      $ioScript = & $toWsl (Resolve-Path (Join-Path $PSScriptRoot "arm64_io_run.sh")).Path
+      $ioOut = & wsl bash $ioScript (& $toWsl $relIoDir) 2>&1 | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        throw "AArch64 --release I/O program(s) printed the wrong output under qemu:`n$ioOut"
+      }
     }
     elseif ($code -eq 64) {
       Write-Host "[SKIP] arm64_source_release execution (qemu-aarch64 not found; all fixtures lowered)"

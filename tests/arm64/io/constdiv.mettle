@@ -1,0 +1,70 @@
+import "std/io";
+
+@noinline fn hide64(x: int64) -> int64 { return x; }
+@noinline fn hideu64(x: uint64) -> uint64 { return x; }
+@noinline fn hide32(x: int32) -> int32 { return x; }
+@noinline fn hideu32(x: uint32) -> uint32 { return x; }
+
+fn check64(x: int64) -> int32 {
+  var bad: int32 = 0;
+  if (x / 2 != x / hide64(2) || x % 2 != x % hide64(2)) { bad = bad + 1; }
+  if (x / 8 != x / hide64(8) || x % 8 != x % hide64(8)) { bad = bad + 1; }
+  if (x / 64 != x / hide64(64) || x % 64 != x % hide64(64)) { bad = bad + 1; }
+  if (x / -8 != x / hide64(-8) || x % -8 != x % hide64(-8)) { bad = bad + 1; }
+  if (x / 3 != x / hide64(3) || x % 3 != x % hide64(3)) { bad = bad + 1; }
+  if (x / 7 != x / hide64(7) || x % 7 != x % hide64(7)) { bad = bad + 1; }
+  if (x / -7 != x / hide64(-7) || x % -7 != x % hide64(-7)) { bad = bad + 1; }
+  if (x / 1000 != x / hide64(1000) || x % 1000 != x % hide64(1000)) { bad = bad + 1; }
+  if (x / 12345 != x / hide64(12345) || x % 12345 != x % hide64(12345)) { bad = bad + 1; }
+  return bad;
+}
+
+fn checku64(x: uint64) -> int32 {
+  var bad: int32 = 0;
+  if (x / (uint64)8 != x / hideu64((uint64)8) || x % (uint64)8 != x % hideu64((uint64)8)) { bad = bad + 1; }
+  if (x / (uint64)3 != x / hideu64((uint64)3) || x % (uint64)3 != x % hideu64((uint64)3)) { bad = bad + 1; }
+  if (x / (uint64)7 != x / hideu64((uint64)7) || x % (uint64)7 != x % hideu64((uint64)7)) { bad = bad + 1; }
+  if (x / (uint64)10 != x / hideu64((uint64)10) || x % (uint64)10 != x % hideu64((uint64)10)) { bad = bad + 1; }
+  if (x / (uint64)641 != x / hideu64((uint64)641) || x % (uint64)641 != x % hideu64((uint64)641)) { bad = bad + 1; }
+  return bad;
+}
+
+fn check32(x: int32, u: uint32) -> int32 {
+  var bad: int32 = 0;
+  if (x / 8 != x / hide32(8) || x % 8 != x % hide32(8)) { bad = bad + 1; }
+  if (x / 7 != x / hide32(7) || x % 7 != x % hide32(7)) { bad = bad + 1; }
+  if (x / -3 != x / hide32(-3) || x % -3 != x % hide32(-3)) { bad = bad + 1; }
+  if (u / (uint32)7 != u / hideu32((uint32)7) || u % (uint32)7 != u % hideu32((uint32)7)) { bad = bad + 1; }
+  if (u / (uint32)16 != u / hideu32((uint32)16) || u % (uint32)16 != u % hideu32((uint32)16)) { bad = bad + 1; }
+  return bad;
+}
+
+fn main() -> int32 {
+  var bad: int32 = 0;
+  var seed: uint64 = (uint64)88172645463325252;
+  var n: int32 = 0;
+  while (n < 4000) {
+    seed = seed ^ (seed << (uint64)13);
+    seed = seed ^ (seed >> (uint64)7);
+    seed = seed ^ (seed << (uint64)17);
+    var x: int64 = (int64)seed;
+    var small: int64 = x >> (int64)40;
+    bad = bad + check64(x) + check64(small) + check64(-small) + checku64(seed);
+    bad = bad + check32((int32)small, (uint32)seed);
+    n = n + 1;
+  }
+  var edges: int64[6];
+  edges[0] = (int64)-9223372036854775807 - (int64)1;
+  edges[1] = (int64)9223372036854775807;
+  edges[2] = (int64)-1;
+  edges[3] = (int64)0;
+  edges[4] = (int64)1;
+  edges[5] = (int64)-63;
+  var k: int32 = 0;
+  while (k < 6) {
+    bad = bad + check64(edges[k]) + checku64((uint64)edges[k]);
+    k = k + 1;
+  }
+  println("constdiv bad {bad}");
+  return 0;
+}

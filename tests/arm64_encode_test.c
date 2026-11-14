@@ -66,6 +66,10 @@ static void test_known_good(void) {
 
   check_word("mul x0, x1, x2",
              arm64_mul(1, ARM64_X0, ARM64_X1, ARM64_X2), 0x9B027C20u);
+  check_word("smulh x0, x1, x2",
+             arm64_smulh(ARM64_X0, ARM64_X1, ARM64_X2), 0x9B427C20u);
+  check_word("umulh x0, x1, x2",
+             arm64_umulh(ARM64_X0, ARM64_X1, ARM64_X2), 0x9BC27C20u);
   check_word("msub x0,x1,x2,x3",
              arm64_msub(1, ARM64_X0, ARM64_X1, ARM64_X2, ARM64_X3),
              0x9B028C20u);

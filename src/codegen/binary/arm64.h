@@ -59,6 +59,8 @@ uint32_t arm64_madd(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm,
 uint32_t arm64_msub(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm,
                     Arm64Reg ra);
 uint32_t arm64_mul(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm);
+uint32_t arm64_smulh(Arm64Reg rd, Arm64Reg rn, Arm64Reg rm);
+uint32_t arm64_umulh(Arm64Reg rd, Arm64Reg rn, Arm64Reg rm);
 uint32_t arm64_sdiv(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm);
 uint32_t arm64_udiv(int is64, Arm64Reg rd, Arm64Reg rn, Arm64Reg rm);
 
