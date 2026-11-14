@@ -485,8 +485,8 @@ static void ex_insn_row(ExUi *ui, const ExInsn *insn, int marked) {
     ex_line_seg(line, 8, text, strlen(text), EXA_QUIET);
     return;
   }
-  snprintf(where, sizeof(where), "%s%5llx", marked ? ui->g->range : " ",
-           (unsigned long long)insn->offset);
+  snprintf(where, sizeof(where), insn->device ? "%s%5llu" : "%s%5llx",
+           marked ? ui->g->range : " ", (unsigned long long)insn->offset);
   if (insn->cost > 0) {
     char cycles[16];
     if (insn->cost % 100 == 0) {
@@ -502,7 +502,7 @@ static void ex_insn_row(ExUi *ui, const ExInsn *insn, int marked) {
   }
   ex_line_seg(line, 0, where, strlen(where), marked ? EXA_ACCENT : EXA_QUIET);
   ex_line_seg(line, 8, cost, strlen(cost), EXA_QUIET);
-  ex_line_seg(line, 22, insn->text ? insn->text : "",
+  ex_line_seg(line, insn->device ? 8 : 22, insn->text ? insn->text : "",
               insn->text ? strlen(insn->text) : 0,
               insn->kernel ? EXA_ACCENT : marked ? 0 : EXA_DIM);
 }
@@ -612,16 +612,19 @@ static void ex_machine_section(ExUi *ui, const ExEntry *entry) {
     return;
   }
   ex_line_new(&ui->detail);
-  if (from == 0) {
-    snprintf(head, sizeof(head), "Machine code  %s: %d instructions", code->name,
-             rows);
-  } else if (from == to) {
-    snprintf(head, sizeof(head), "Machine code  %s, line %d: %d instructions",
-             code->name, from, rows);
-  } else {
-    snprintf(head, sizeof(head),
-             "Machine code  %s, lines %d to %d: %d instructions", code->name,
-             from, to, rows);
+  {
+    const char *what = code->device ? "Device code" : "Machine code";
+    const char *unit = code->device ? "lines" : "instructions";
+    if (from == 0) {
+      snprintf(head, sizeof(head), "%s  %s: %d %s", what, code->name, rows,
+               unit);
+    } else if (from == to) {
+      snprintf(head, sizeof(head), "%s  %s, line %d: %d %s", what, code->name,
+               from, rows, unit);
+    } else {
+      snprintf(head, sizeof(head), "%s  %s, lines %d to %d: %d %s", what,
+               code->name, from, to, rows, unit);
+    }
   }
   if (kernel) {
     size_t n = strlen(head);
@@ -1273,7 +1276,7 @@ static void ex_draw_footer(ExUi *ui, ExScreen *s) {
 static void ex_draw_help(ExUi *ui, ExScreen *s) {
   static const char *const rows[][2] = {
       {"left right  tab", "switch tabs"},
-      {"1 to 7", "jump to a tab"},
+      {"1 to 8", "jump to a tab"},
       {"up down  j k", "move, or scroll the detail"},
       {"pgup pgdn  home end", "page, first, last"},
       {"enter", "open the detail, or follow a link"},

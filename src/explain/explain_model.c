@@ -696,17 +696,12 @@ static void ex_loop_cost_field(ExEntry *entry, const ExJson *root,
   }
 }
 
-static void ex_build_optimizer(ExReport *report, const ExJson *root) {
-  ExTab *tab = &report->tabs[EX_TAB_OPTIMIZER];
-  const ExJson *remarks = ex_json_get(root, "remarks");
-  tab->name = "Optimizer";
-  tab->columns[0] = "Line";
-  tab->columns[1] = "What";
-  tab->columns[2] = "Verdict";
-  tab->column_count = 3;
-  tab->empty = "No loops or calls in this file to report.";
-  for (size_t i = 0; i < ex_json_count(remarks); i++) {
-    const ExJson *r = ex_json_at(remarks, i);
+static void ex_devices_optimizer(ExReport *report, const ExJson *root);
+static void ex_devices_overview(ExReport *report, const ExJson *root);
+
+static void ex_remark_entry(ExReport *report, ExTab *tab, const ExJson *root,
+                            const ExJson *r, const char *device) {
+  {
     const char *fn = ex_json_text(r, "fn");
     const char *kind = ex_json_text(r, "kind");
     const char *entity = ex_json_text(r, "entity");
@@ -722,12 +717,18 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
     const char *host = ex_json_text(r, "inlinedInto");
     char fn_shown[160];
     char host_shown[160];
-    ExEntry *entry = ex_add(tab, fn ? fn : "?");
+    char *group = device ? ex_fmt("%s, %s",
+                                  ex_shown(fn, fn_shown, sizeof(fn_shown)),
+                                  device)
+                         : ex_strdup(fn ? fn : "?");
+    ExEntry *entry = ex_add(tab, group);
+    free(group);
     if (!entry) {
       return;
     }
     ex_shown(fn, fn_shown, sizeof(fn_shown));
-    entry->function = ex_strdup(fn);
+    entry->function = device ? ex_fmt("%s [%s]", fn ? fn : "?", device)
+                             : ex_strdup(fn);
     if (kind && strcmp(kind, "calls-folded") == 0) {
       long long last = ex_json_int(r, "lineEnd", line);
       entry->cells[0] = ex_fmt("%lld-%lld", line, last);
@@ -772,7 +773,7 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
     ex_field(entry, "Still blocked", ex_json_text(r, "stillBlocked"),
              EX_TONE_MISSED);
     ex_field(entry, "Calls", ex_json_text(r, "calls"), EX_TONE_PLAIN);
-    if (kind && strcmp(kind, "loop") == 0) {
+    if (!device && kind && strcmp(kind, "loop") == 0) {
       ex_loop_cost_field(entry, root, fn, line);
       if (positive) {
         ex_vector_body(entry, report, fn, (int)line,
@@ -793,6 +794,21 @@ static void ex_build_optimizer(ExReport *report, const ExJson *root) {
     }
     ex_finish(entry);
   }
+}
+
+static void ex_build_optimizer(ExReport *report, const ExJson *root) {
+  ExTab *tab = &report->tabs[EX_TAB_OPTIMIZER];
+  const ExJson *remarks = ex_json_get(root, "remarks");
+  tab->name = "Optimizer";
+  tab->columns[0] = "Line";
+  tab->columns[1] = "What";
+  tab->columns[2] = "Verdict";
+  tab->column_count = 3;
+  tab->empty = "No loops or calls in this file to report.";
+  for (size_t i = 0; i < ex_json_count(remarks); i++) {
+    ex_remark_entry(report, tab, root, ex_json_at(remarks, i), NULL);
+  }
+  ex_devices_optimizer(report, root);
   ex_order_groups(tab, root, NULL);
 }
 
@@ -1092,6 +1108,7 @@ static void ex_build_overview(ExReport *report, const ExJson *root) {
         ex_find_remark(optimizer, fn, line, ex_json_text(s, "code"));
     ex_finish(entry);
   }
+  ex_devices_overview(report, root);
   ex_hot_loops(tab, optimizer, root);
   for (size_t i = 0; i < ex_json_count(entries); i++) {
     const ExJson *c = ex_json_at(entries, i);
@@ -2434,6 +2451,373 @@ static void ex_build_machine(ExReport *report, const ExJson *root) {
   }
 }
 
+static char *ex_device_label(const ExJson *device) {
+  const char *target = ex_json_text(device, "target");
+  const char *profile = ex_json_text(device, "profile");
+  if (target && strcmp(target, "ptx") == 0) {
+    return ex_fmt("PTX %s", profile ? profile : "");
+  }
+  if (target && strcmp(target, "metal") == 0) {
+    return ex_fmt("Metal %s", profile ? profile : "");
+  }
+  return ex_strdup(target ? target : "device");
+}
+
+static void ex_device_machine(ExReport *report, const char *key,
+                              const ExJson *code) {
+  size_t count = ex_json_count(code);
+  ExMachineFn *grown;
+  ExMachineFn *fn;
+  if (count == 0) {
+    return;
+  }
+  grown = realloc(report->machine,
+                  (report->machine_count + 1) * sizeof(ExMachineFn));
+  if (!grown) {
+    return;
+  }
+  report->machine = grown;
+  fn = &grown[report->machine_count];
+  memset(fn, 0, sizeof(*fn));
+  fn->insns = calloc(count, sizeof(ExInsn));
+  if (!fn->insns) {
+    return;
+  }
+  fn->name = ex_strdup(key);
+  fn->device = 1;
+  report->machine_count++;
+  report->machine_total += (long long)count;
+  for (size_t k = 0; k < count; k++) {
+    const ExJson *row = ex_json_at(code, k);
+    ExInsn *insn = &fn->insns[fn->count++];
+    size_t length;
+    insn->line = (int)ex_item_int(row, 0);
+    insn->text = ex_item_text(row, 1);
+    insn->device = 1;
+    insn->offset = (long long)k + 1;
+    length = insn->text ? strlen(insn->text) : 0;
+    if (length > 1 && insn->text[length - 1] == ':' &&
+        !strchr(insn->text, ' ')) {
+      insn->text[length - 1] = '\0';
+      insn->label = 1;
+    }
+  }
+}
+
+static int ex_device_tone(const char *verdict, unsigned *flags, int has_fix) {
+  if (verdict && strcmp(verdict, "good") == 0) {
+    return EX_TONE_DONE;
+  }
+  if (verdict && (strcmp(verdict, "miss") == 0 ||
+                  strcmp(verdict, "refused") == 0)) {
+    *flags |= EXF_MISSED | (has_fix ? EXF_FIXABLE : 0);
+    return has_fix ? EX_TONE_FIXABLE : EX_TONE_MISSED;
+  }
+  return EX_TONE_PLAIN;
+}
+
+static char *ex_device_note_subject(const ExJson *note) {
+  const char *subject = ex_json_text(note, "subject");
+  long long sites = ex_json_int(note, "sites", 1);
+  if (sites > 1) {
+    return ex_fmt("%s, %lld sites", subject ? subject : "?", sites);
+  }
+  return ex_strdup(subject ? subject : ex_json_text(note, "kind"));
+}
+
+static void ex_device_note_entry(ExTab *tab, const ExJson *note,
+                                 const char *label) {
+  const char *fn = ex_json_text(note, "fn");
+  const char *headline = ex_json_text(note, "headline");
+  const char *fix = ex_json_text(note, "fix");
+  long long line = ex_json_int(note, "line", 0);
+  char shown[160];
+  char *group = ex_fmt("%s, %s", ex_shown(fn, shown, sizeof(shown)), label);
+  ExEntry *entry = ex_add(tab, group);
+  free(group);
+  if (!entry) {
+    return;
+  }
+  entry->function = ex_fmt("%s [%s]", fn ? fn : "?", label);
+  entry->cells[0] = ex_fmt("%lld", line);
+  entry->cells[1] = ex_device_note_subject(note);
+  entry->cells[2] = ex_strdup(headline);
+  entry->title = ex_fmt("%s on %s, %s at line %lld", shown, label,
+                        entry->cells[1] ? entry->cells[1] : "?", line);
+  entry->line = (int)line;
+  entry->code = ex_strdup(ex_json_text(note, "code"));
+  entry->tone = ex_device_tone(ex_json_text(note, "verdict"), &entry->flags,
+                               fix != NULL);
+  ex_field(entry, "Verdict", headline, entry->tone);
+  ex_field(entry, "Reason", ex_json_text(note, "reason"), EX_TONE_PLAIN);
+  ex_field(entry, "Fix", fix, EX_TONE_PLAIN);
+  ex_finish(entry);
+}
+
+static void ex_kernel_note_field(ExEntry *entry, const ExJson *note) {
+  const char *reason = ex_json_text(note, "reason");
+  const char *fix = ex_json_text(note, "fix");
+  unsigned flags = 0;
+  char *subject = ex_device_note_subject(note);
+  char *label = ex_fmt("Line %lld", ex_json_int(note, "line", 0));
+  char *text = ex_fmt("%s: %s%s%s%s%s", subject ? subject : "?",
+                      ex_json_text(note, "headline"), reason ? ". " : "",
+                      reason ? reason : "", fix ? ". Fix: " : "",
+                      fix ? fix : "");
+  int tone = ex_device_tone(ex_json_text(note, "verdict"), &flags, fix != NULL);
+  entry->flags |= flags;
+  if (tone == EX_TONE_MISSED || tone == EX_TONE_FIXABLE) {
+    entry->tone = entry->tone == EX_TONE_FIXABLE ? EX_TONE_FIXABLE : tone;
+  }
+  ex_field(entry, label, text, tone);
+  free(subject);
+  free(label);
+  free(text);
+}
+
+static char *ex_kernel_measured(const ExJson *counters) {
+  long long registers = ex_json_int(counters, "registers", -1);
+  long long warps = ex_json_int(counters, "warps", -1);
+  long long width = ex_json_int(counters, "threadWidth", -1);
+  if (registers >= 0 && warps >= 0) {
+    return ex_fmt("%lld registers, %lld of %lld warps", registers, warps,
+                  ex_json_int(counters, "warpLimit", 48));
+  }
+  if (registers >= 0) {
+    return ex_fmt("%lld registers", registers);
+  }
+  if (width >= 0) {
+    return ex_fmt("%lld threads a SIMD group", width);
+  }
+  return ex_strdup("not measured");
+}
+
+static char *ex_kernel_values(const ExJson *rows) {
+  for (size_t i = 0; i < ex_json_count(rows); i++) {
+    const ExJson *row = ex_json_at(rows, i);
+    if (row && row->kind == EXJ_STRING &&
+        strncmp(row->string, "values: ", 8) == 0) {
+      return ex_strdup(row->string + 8);
+    }
+  }
+  return NULL;
+}
+
+static void ex_kernel_entry(ExReport *report, ExTab *tab, const ExJson *device,
+                            const ExJson *kernel, const char *label) {
+  const ExJson *rows = ex_json_get(kernel, "rows");
+  const ExJson *notes = ex_json_get(device, "notes");
+  const char *fn = ex_json_text(kernel, "fn");
+  long long line = ex_json_int(kernel, "line", 0);
+  char shown[160];
+  char *key = ex_fmt("%s [%s]", fn ? fn : "?", label);
+  ExEntry *entry = ex_add(tab, label);
+  if (!entry || !key) {
+    free(key);
+    return;
+  }
+  ex_shown(fn, shown, sizeof(shown));
+  ex_device_machine(report, key, ex_json_get(kernel, "code"));
+  entry->function = key;
+  entry->cells[0] = ex_fmt("%lld", line);
+  entry->cells[1] = ex_json_flag(kernel, "kernel")
+                        ? ex_strdup(shown)
+                        : ex_fmt("%s, device function", shown);
+  entry->cells[2] = ex_kernel_values(rows);
+  entry->cells[3] = ex_kernel_measured(ex_json_get(kernel, "counters"));
+  entry->title = ex_fmt("%s on %s", shown, label);
+  entry->line = (int)line;
+  entry->tone = EX_TONE_PLAIN;
+  for (size_t i = 0; i < ex_json_count(rows); i++) {
+    char *row = ex_item_text(rows, i);
+    char *colon = row ? strchr(row, ':') : NULL;
+    if (colon) {
+      *colon = '\0';
+      row[0] = (char)toupper((unsigned char)row[0]);
+      ex_field(entry, row, colon + 2, EX_TONE_PLAIN);
+    }
+    free(row);
+  }
+  for (size_t i = 0; i < ex_json_count(notes); i++) {
+    const ExJson *note = ex_json_at(notes, i);
+    if (ex_same_text(ex_json_text(note, "fn"), fn)) {
+      ex_kernel_note_field(entry, note);
+    }
+  }
+  ex_finish(entry);
+}
+
+static void ex_device_failed(ExTab *tab, const ExJson *device,
+                             const char *label) {
+  ExEntry *entry = ex_add(tab, label);
+  if (!entry) {
+    return;
+  }
+  entry->cells[1] = ex_strdup("every kernel");
+  entry->cells[2] = ex_fmt("does not build for %s", label);
+  entry->title = ex_fmt("The kernels in this file do not build for %s", label);
+  entry->tone = EX_TONE_MISSED;
+  entry->flags = EXF_MISSED;
+  ex_field(entry, "Reason", ex_json_text(device, "error"), EX_TONE_MISSED);
+  ex_finish(entry);
+}
+
+static int ex_device_remark_index(const ExTab *optimizer, const char *key,
+                                  long long line, const char *code) {
+  for (size_t i = 0; i < optimizer->count; i++) {
+    const ExEntry *e = &optimizer->entries[i];
+    if (e->line == (int)line && ex_same_text(e->function, key) &&
+        (!code || ex_same_text(e->code, code))) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+static int ex_start_listed(const ExTab *overview, const char *where,
+                           const char *fix) {
+  for (size_t i = 0; i < overview->count; i++) {
+    const ExEntry *e = &overview->entries[i];
+    if (ex_same_text(e->group, "Start here") &&
+        ex_same_text(e->cells[1], where) && ex_same_text(e->cells[2], fix)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void ex_device_start_here(ExReport *report, const ExJson *child,
+                                 const char *label) {
+  ExTab *overview = &report->tabs[EX_TAB_OVERVIEW];
+  const ExJson *start = ex_json_get(child, "startHere");
+  for (size_t i = 0; i < ex_json_count(start); i++) {
+    const ExJson *s = ex_json_at(start, i);
+    const char *fn = ex_json_text(s, "fn");
+    const char *fix = ex_json_text(s, "fix");
+    long long line = ex_json_int(s, "line", 0);
+    int proven = ex_json_flag(s, "proven");
+    char *where = ex_fmt("%s:%lld", fn ? fn : "?", line);
+    ExEntry *entry;
+    if (!where || ex_start_listed(overview, where, fix)) {
+      free(where);
+      continue;
+    }
+    entry = ex_add(overview, "Start here");
+    if (!entry) {
+      free(where);
+      return;
+    }
+    entry->function = ex_fmt("%s [%s]", fn ? fn : "?", label);
+    entry->cells[0] = ex_fmt("%zu", overview->count);
+    entry->cells[1] = where;
+    entry->cells[2] = ex_strdup(fix);
+    entry->title = ex_fmt("%s, line %lld, in a kernel", fn ? fn : "?", line);
+    entry->line = (int)line;
+    entry->code = ex_strdup(ex_json_text(s, "code"));
+    entry->tone = proven ? EX_TONE_FIXABLE : EX_TONE_MISSED;
+    entry->flags = EXF_MISSED | EXF_FIXABLE;
+    ex_field(entry, "Fix", fix, EX_TONE_PLAIN);
+    ex_field(entry, "Proven",
+             proven ? "applied to a copy of the kernel and re-checked: the "
+                      "optimization then happens"
+                    : NULL,
+             EX_TONE_FIXABLE);
+    entry->link_tab = EX_TAB_OPTIMIZER;
+    entry->link_entry =
+        ex_device_remark_index(&report->tabs[EX_TAB_OPTIMIZER],
+                               entry->function, line, entry->code);
+    ex_finish(entry);
+  }
+}
+
+typedef void (*ExDeviceVisit)(ExReport *report, const ExJson *root,
+                              const ExJson *child, const char *label);
+
+static void ex_each_device(ExReport *report, const ExJson *root,
+                           ExDeviceVisit visit) {
+  const ExJson *devices = ex_json_get(root, "devices");
+  for (size_t i = 0; i <= ex_json_count(devices); i++) {
+    const ExJson *child = i == 0 ? root : ex_json_at(devices, i - 1);
+    const ExJson *device = ex_json_get(child, "device");
+    char *label = device ? ex_device_label(device) : NULL;
+    if (label) {
+      visit(report, root, child, label);
+    }
+    free(label);
+  }
+}
+
+static void ex_device_optimizer(ExReport *report, const ExJson *root,
+                                const ExJson *child, const char *label) {
+  ExTab *optimizer = &report->tabs[EX_TAB_OPTIMIZER];
+  const ExJson *notes = ex_json_get(ex_json_get(child, "device"), "notes");
+  const ExJson *remarks = ex_json_get(child, "remarks");
+  for (size_t i = 0; i < ex_json_count(notes); i++) {
+    ex_device_note_entry(optimizer, ex_json_at(notes, i), label);
+  }
+  for (size_t i = 0; child != root && i < ex_json_count(remarks); i++) {
+    ex_remark_entry(report, optimizer, child, ex_json_at(remarks, i), label);
+  }
+}
+
+static void ex_device_overview(ExReport *report, const ExJson *root,
+                               const ExJson *child, const char *label) {
+  ExTab *overview = &report->tabs[EX_TAB_OVERVIEW];
+  const ExJson *device = ex_json_get(child, "device");
+  const ExJson *notes = ex_json_get(device, "notes");
+  size_t missed = 0;
+  if (ex_json_text(device, "error")) {
+    ex_summary(overview, ex_fmt("Kernels    do not build for %s", label));
+    return;
+  }
+  for (size_t i = 0; i < ex_json_count(notes); i++) {
+    const char *verdict = ex_json_text(ex_json_at(notes, i), "verdict");
+    missed += verdict && strcmp(verdict, "miss") == 0;
+  }
+  ex_summary(overview,
+             ex_fmt("Kernels    %zu on %s, %zu %s to look at",
+                    ex_json_count(ex_json_get(device, "kernels")), label,
+                    missed, missed == 1 ? "decision" : "decisions"));
+  if (child != root) {
+    ex_device_start_here(report, child, label);
+  }
+}
+
+static void ex_device_kernels(ExReport *report, const ExJson *root,
+                              const ExJson *child, const char *label) {
+  ExTab *tab = &report->tabs[EX_TAB_KERNELS];
+  const ExJson *device = ex_json_get(child, "device");
+  const ExJson *kernels = ex_json_get(device, "kernels");
+  (void)root;
+  if (ex_json_text(device, "error")) {
+    ex_device_failed(tab, device, label);
+    return;
+  }
+  for (size_t i = 0; i < ex_json_count(kernels); i++) {
+    ex_kernel_entry(report, tab, device, ex_json_at(kernels, i), label);
+  }
+}
+
+static void ex_devices_optimizer(ExReport *report, const ExJson *root) {
+  ex_each_device(report, root, ex_device_optimizer);
+}
+
+static void ex_devices_overview(ExReport *report, const ExJson *root) {
+  ex_each_device(report, root, ex_device_overview);
+}
+
+static void ex_build_kernels(ExReport *report, const ExJson *root) {
+  ExTab *tab = &report->tabs[EX_TAB_KERNELS];
+  tab->name = "Kernels";
+  tab->columns[0] = "Line";
+  tab->columns[1] = "Kernel";
+  tab->columns[2] = "Values";
+  tab->columns[3] = "Measured";
+  tab->column_count = 4;
+  tab->empty = "No kernels in this file.";
+  ex_each_device(report, root, ex_device_kernels);
+}
+
 const ExExpandFn *ex_report_expanded(const ExReport *report,
                                      const char *function) {
   if (!report || !function) {
@@ -2485,6 +2869,7 @@ ExReport *ex_report_build(const ExJson *root, const char *source_path) {
   ex_build_functions(report, root);
   ex_build_proofs(report, root);
   ex_build_passes(report, root);
+  ex_build_kernels(report, root);
   return report;
 }
 

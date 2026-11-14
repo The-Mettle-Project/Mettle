@@ -7607,7 +7607,7 @@ static int compile_stage_type_reports(CompileContext *ctx) {
   if (options->report_proofs) {
     type_checker_report_proofs(ctx->type_checker, stdout);
   }
-  if (options->explain_view) {
+  if (options->explain_view || options->explain_fragment) {
     size_t line = 0;
     const char *owner = NULL;
     const char *detail = NULL;

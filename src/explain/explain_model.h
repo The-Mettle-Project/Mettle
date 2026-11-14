@@ -13,6 +13,7 @@ enum {
   EX_TAB_FUNCTIONS,
   EX_TAB_PROOFS,
   EX_TAB_PASSES,
+  EX_TAB_KERNELS,
   EX_TAB_COUNT
 };
 
@@ -57,6 +58,7 @@ typedef struct {
   int kernel;
   int depth;
   int label;
+  int device;
   long long offset;
 } ExInsn;
 
@@ -64,6 +66,7 @@ typedef struct {
   char *name;
   ExInsn *insns;
   size_t count;
+  int device;
 } ExMachineFn;
 
 typedef struct {

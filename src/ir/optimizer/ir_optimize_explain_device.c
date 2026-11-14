@@ -386,10 +386,17 @@ static void device_target_label(char *out, size_t size) {
   }
 }
 
+#define IR_DEVICE_ROWS 8
+#define IR_DEVICE_ROW_SIZE 440
+
+static MTLC_THREAD_LOCAL char g_device_rows[IR_DEVICE_ROWS][IR_DEVICE_ROW_SIZE];
+static MTLC_THREAD_LOCAL size_t g_device_row_count = 0;
+
 static void device_row(const char *text) {
-  ir_explain_emit("      %s%s %s%s\n", ir_explain_style(IR_EXPLAIN_STYLE_DIM),
-                  diag_glyphs()->elbow, text,
-                  ir_explain_style(IR_EXPLAIN_STYLE_RESET));
+  if (g_device_row_count < IR_DEVICE_ROWS) {
+    snprintf(g_device_rows[g_device_row_count++], IR_DEVICE_ROW_SIZE, "%s",
+             text);
+  }
 }
 
 static long long device_value(const IRDeviceFunction *entry,
@@ -568,6 +575,15 @@ static void device_measured_row(const IRDeviceFunction *entry) {
   device_occupancy_row(entry);
 }
 
+static void device_collect_rows(const IRDeviceFunction *entry) {
+  g_device_row_count = 0;
+  device_values_row(entry);
+  device_memory_row(entry);
+  device_workgroup_row(entry);
+  device_calls_row(entry);
+  device_measured_row(entry);
+}
+
 static void device_function_head(const IRDeviceFunction *entry) {
   char block[64] = "";
   if (entry->is_kernel && entry->block[0] > 0) {
@@ -585,11 +601,12 @@ static void device_function_head(const IRDeviceFunction *entry) {
                   ir_explain_style(IR_EXPLAIN_STYLE_RESET),
                   entry->is_kernel ? "kernel" : "device function", entry->line,
                   block);
-  device_values_row(entry);
-  device_memory_row(entry);
-  device_workgroup_row(entry);
-  device_calls_row(entry);
-  device_measured_row(entry);
+  device_collect_rows(entry);
+  for (size_t i = 0; i < g_device_row_count; i++) {
+    ir_explain_emit("      %s%s %s%s\n", ir_explain_style(IR_EXPLAIN_STYLE_DIM),
+                    diag_glyphs()->elbow, g_device_rows[i],
+                    ir_explain_style(IR_EXPLAIN_STYLE_RESET));
+  }
 }
 
 static IRExplainStyle device_verdict_style(IRDeviceVerdict verdict) {
@@ -693,7 +710,13 @@ static void device_function_json(size_t index) {
   }
   ir_explain_json_raw("},\"limiter\":");
   ir_explain_json_str(entry->limiter);
-  ir_explain_json_raw(",\"code\":[");
+  ir_explain_json_raw(",\"rows\":[");
+  device_collect_rows(entry);
+  for (size_t i = 0; i < g_device_row_count; i++) {
+    ir_explain_json_raw("%s", i ? "," : "");
+    ir_explain_json_str(g_device_rows[i]);
+  }
+  ir_explain_json_raw("],\"code\":[");
   emitted = 0;
   for (size_t i = 0; i < g_device.code_count; i++) {
     if (g_device.code[i].function != index) {
