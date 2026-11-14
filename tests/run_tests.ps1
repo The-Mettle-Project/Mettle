@@ -1127,6 +1127,17 @@ $cases = @(
     Args          = @()
   },
   @{
+    Name          = "rewrite_proved_by_theorem"
+    Path          = "tests/rewrite_proved_by_theorem.mettle"
+    ShouldSucceed = $true
+    Args          = @("--release", "--explain")
+    Env           = @{ METTLE_EXPLAIN_REPORT_LINES = "0" }
+    OutputMustMatch = @(
+      "shifts_to_multiply \(rewrite rule @ line \d+\): applied \d+ times?",
+      "rewritten by rule ``shifts_to_multiply``"
+    )
+  },
+  @{
     Name          = "prove_statements"
     Path          = "tests/prove_statements.mettle"
     ShouldSucceed = $true

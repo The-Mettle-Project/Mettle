@@ -51,6 +51,7 @@ typedef struct {
   const char *undecided_param;
   SourceLocation location;
   int proved;
+  int proved_by_theorem;
   IRSmtReport smt;
 } RwRule;
 
@@ -376,6 +377,18 @@ static int rw_self_check(RwRule *rule) {
   char why[192];
   char cex[288];
   char skip[160];
+  char theorem[256];
+  snprintf(theorem, sizeof(theorem), "%srewrite_%s", IR_THEOREM_CLAIM_PREFIX,
+           rule->name);
+  for (size_t i = 0; i < g_program->function_count; i++) {
+    const IRFunction *f = g_program->functions[i];
+    if (f && f->rewrite_role == IR_THEOREM_ROLE_CLAIM && f->name &&
+        strcmp(f->name, theorem) == 0) {
+      rule->proved = 1;
+      rule->proved_by_theorem = 1;
+      return 1;
+    }
+  }
   ir_smt_check_equivalence(g_program, from, from->instructions,
                            from->instruction_count, to, to->instructions,
                            to->instruction_count, rule->where, &rule->smt);
@@ -539,7 +552,12 @@ int ir_user_rewrite_begin(IRProgram *program) {
     }
     if (ir_explain_enabled()) {
       char verified[192];
-      if (rule->proved) {
+      if (rule->proved_by_theorem) {
+        snprintf(verified, sizeof(verified),
+                 "`from` and `to` agree on every input%s: the rule's proof "
+                 "block proves it on every build",
+                 rule->where ? " that satisfies `where`" : "");
+      } else if (rule->proved) {
         snprintf(verified, sizeof(verified),
                  "`from` and `to` agree on every input%s: the SMT solver "
                  "refuted every disagreement (%llu clauses, %llu lemmas "

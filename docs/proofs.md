@@ -312,6 +312,8 @@ and subtract equals the multiplication, signed and unsigned.
 
 [Rewrite rules](rewrite-rules.md) are proved for every input before the
 compiler applies them, and fall back to generated inputs only when the solver
-cannot model a side, such as one that computes with floats.
+cannot model a side, such as one that computes with floats. A rule can also
+carry a `proof` block of tactics, which makes the optimizer apply an
+identity that only an induction establishes.
 [Translation validation](translation-validation.md) proves each pass
 application on a loop-free integer function before it runs inputs.

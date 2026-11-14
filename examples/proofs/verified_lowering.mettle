@@ -1,0 +1,49 @@
+import "std/io";
+
+fn mul_by_shifts(x: uint64, c: uint64) -> uint64 {
+    if (c == 0) { return 0; }
+    var rest: uint64 = mul_by_shifts(x << 1, c >> 1);
+    if ((c & 1) == 1) { return rest + x; }
+    return rest;
+}
+
+theorem mul_splits_low_bit(x: uint64, c: uint64) {
+    x * c == (x << 1) * (c >> 1) + x * (c & 1)
+} by smt;
+
+rewrite shifts_to_multiply(x: uint64, c: uint64) -> uint64 {
+    from mul_by_shifts(x, c);
+    to x * c;
+} proof {
+    induction c;
+    use mul_splits_low_bit(x, c);
+    auto;
+}
+
+fn abs_branchless(x: int32) -> int32 {
+    var mask: int32 = x >> 31;
+    return (x ^ mask) - mask;
+}
+
+fn abs_branchy(x: int32) -> int32 {
+    if (x < 0) { return -x; }
+    return x;
+}
+
+theorem abs_lowering(x: int32) {
+    abs_branchless(x) == abs_branchy(x)
+} by auto;
+
+fn bucket(hash: uint64, buckets: uint64) -> uint64 {
+    if (buckets == 0) { return 0; }
+    var b: uint64 = hash % buckets;
+    prove(b < buckets);
+    return b;
+}
+
+fn main() -> int32 {
+    println("6 * 7 by shifts: {mul_by_shifts(6, 7)}");
+    println("abs(-5): {abs_branchless(-5)}");
+    println("bucket of 1000003 in 64: {bucket(1000003, 64)}");
+    return 0;
+}

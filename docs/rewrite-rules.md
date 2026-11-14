@@ -80,6 +80,28 @@ the same kind of generated inputs. A difference undoes the rewrite and fails
 the build. With `--verify` on, the pass driver checks the same function a
 second time, alongside every other pass.
 
+## Rules with a proof
+
+A rule the solver cannot decide can carry its own proof, written with the
+tactics of a [theorem](proofs.md). The proof is checked on every build, and a
+proved rule is applied without any generated inputs:
+
+```mettle
+rewrite shifts_to_multiply(x: uint64, c: uint64) -> uint64 {
+    from mul_by_shifts(x, c);
+    to x * c;
+} proof {
+    induction c;
+    use mul_splits_low_bit(x, c);
+    auto;
+}
+```
+
+`mul_by_shifts` recurses, so no finite unfolding shows the two sides agree;
+the induction does. The rule's proof is a theorem named `rewrite_` followed by
+the rule's name, with `from == to` as its claim and the rule's `where` clause
+as its own.
+
 ## Guards
 
 `where` is evaluated at compile time, on the constants bound at the match

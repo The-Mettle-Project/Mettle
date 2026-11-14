@@ -1781,6 +1781,13 @@ static int parser_parse_rewrite_clause(Parser *parser, ASTNode **from_expr,
   return 1;
 }
 
+static int parser_rewrite_proof(Parser *parser, const char *rule_name,
+                                char **param_names, char **param_types,
+                                size_t param_count, ASTNode *from_expr,
+                                ASTNode *to_expr, ASTNode *where_expr,
+                                SourceLocation location, ASTNode **out,
+                                size_t *count);
+
 static ASTNode *parser_parse_rewrite_declaration(Parser *parser) {
   SourceLocation location = parser_current_location(parser);
   parser_advance(parser);
@@ -1875,6 +1882,20 @@ static ASTNode *parser_parse_rewrite_declaration(Parser *parser) {
                               where_expr);
     return NULL;
   }
+  ASTNode *proof_decls[64];
+  size_t proof_count = 0;
+  if ((parser_is_identifier_like(parser->current_token.type) &&
+       parser->current_token.value &&
+       (strcmp(parser->current_token.value, "by") == 0 ||
+        strcmp(parser->current_token.value, "proof") == 0)) &&
+      !parser_rewrite_proof(parser, rule_name, param_names, param_types,
+                            param_count, from_expr, to_expr, where_expr,
+                            location, proof_decls, &proof_count)) {
+    parser_free_rewrite_parts(param_names, param_types, param_count,
+                              return_type, rule_name, from_expr, to_expr,
+                              where_expr);
+    return NULL;
+  }
 
   ASTNode *from_decl = parser_make_rewrite_side(
       IR_REWRITE_FROM_PREFIX, rule_name, param_names, param_types,
@@ -1899,6 +1920,9 @@ static ASTNode *parser_parse_rewrite_declaration(Parser *parser) {
     ast_destroy_node(from_decl);
     ast_destroy_node(to_decl);
     ast_destroy_node(where_decl);
+    for (size_t i = 0; i < proof_count; i++) {
+      ast_destroy_node(proof_decls[i]);
+    }
     parser_set_error(parser, "Out of memory while building a 'rewrite' rule");
     return NULL;
   }
@@ -1907,6 +1931,10 @@ static ASTNode *parser_parse_rewrite_declaration(Parser *parser) {
   if (where_decl) {
     parser->extra_declarations[1] = where_decl;
     parser->extra_declaration_count = 2;
+  }
+  for (size_t i = 0; i < proof_count; i++) {
+    parser->extra_declarations[parser->extra_declaration_count++] =
+        proof_decls[i];
   }
   return from_decl;
 }
@@ -2117,6 +2145,101 @@ static int parser_parse_tactic(Parser *parser, ParserTheorem *thm) {
   return ok;
 }
 
+static int parser_parse_proof_script(Parser *parser, ParserTheorem *thm,
+                                     SourceLocation location) {
+  int ok = 1;
+  if (parser_tactic_word(parser, "by")) {
+    parser_advance(parser);
+    ok = parser_parse_tactic(parser, thm);
+    if (ok && parser->current_token.type == TOKEN_SEMICOLON) {
+      parser_advance(parser);
+    }
+  } else if (parser_tactic_word(parser, "proof")) {
+    parser_advance(parser);
+    ok = parser_expect(parser, TOKEN_LBRACE);
+    while (ok && parser->current_token.type != TOKEN_RBRACE &&
+           parser->current_token.type != TOKEN_EOF) {
+      if (parser->current_token.type == TOKEN_SEMICOLON ||
+          parser->current_token.type == TOKEN_NEWLINE) {
+        parser_advance(parser);
+        continue;
+      }
+      ok = parser_parse_tactic(parser, thm);
+    }
+    if (ok) {
+      ok = parser_expect(parser, TOKEN_RBRACE);
+    }
+  } else {
+    char line[64];
+    snprintf(line, sizeof(line), "%zu:%zu auto\n", location.line,
+             location.column);
+    parser_script_append(&thm->script, line);
+  }
+  return ok;
+}
+
+static int parser_rewrite_proof(Parser *parser, const char *rule_name,
+                                char **param_names, char **param_types,
+                                size_t param_count, ASTNode *from_expr,
+                                ASTNode *to_expr, ASTNode *where_expr,
+                                SourceLocation location, ASTNode **out,
+                                size_t *count) {
+  char name[256];
+  snprintf(name, sizeof(name), "rewrite_%s", rule_name);
+  ParserTheorem thm;
+  memset(&thm, 0, sizeof(thm));
+  thm.theorem = name;
+  thm.param_names = param_names;
+  thm.param_types = param_types;
+  thm.param_count = param_count;
+  *count = 0;
+  int ok = parser_parse_proof_script(parser, &thm, location);
+  ASTNode *claim_decl = NULL, *where_decl = NULL;
+  if (ok) {
+    ASTNode *claim = ast_create_binary_expression(
+        ast_clone_node(from_expr), "==", ast_clone_node(to_expr), location);
+    claim_decl = claim ? parser_make_rewrite_side(
+                             IR_THEOREM_CLAIM_PREFIX, name, param_names,
+                             param_types, param_count, "bool", claim,
+                             location, IR_THEOREM_ROLE_CLAIM)
+                       : NULL;
+    if (where_expr && claim_decl) {
+      where_decl = parser_make_rewrite_side(
+          IR_THEOREM_WHERE_PREFIX, name, param_names, param_types,
+          param_count, "bool", ast_clone_node(where_expr), location,
+          IR_THEOREM_ROLE_WHERE);
+    }
+    ok = claim_decl && (where_decl || !where_expr) &&
+         thm.term_count + 4 <= 60;
+  }
+  if (ok) {
+    ((FunctionDeclaration *)claim_decl->data)->theorem_script =
+        thm.script.text;
+    thm.script.text = NULL;
+    out[(*count)++] = claim_decl;
+    if (where_decl) {
+      out[(*count)++] = where_decl;
+    }
+    for (size_t i = 0; i < thm.term_count; i++) {
+      out[(*count)++] = thm.terms[i];
+      thm.terms[i] = NULL;
+    }
+    parser_remember_theorem(name, param_types, param_count);
+  } else {
+    ast_destroy_node(claim_decl);
+    ast_destroy_node(where_decl);
+    if (!parser->has_error) {
+      parser_set_error(parser, "The rule's proof could not be built");
+    }
+  }
+  for (size_t i = 0; i < thm.term_count; i++) {
+    ast_destroy_node(thm.terms[i]);
+  }
+  free(thm.terms);
+  free(thm.script.text);
+  return ok;
+}
+
 static ASTNode *parser_parse_theorem_declaration(Parser *parser) {
   SourceLocation location = parser_current_location(parser);
   parser_advance(parser);
@@ -2178,32 +2301,8 @@ static ASTNode *parser_parse_theorem_declaration(Parser *parser) {
   if (ok) {
     parser_remember_theorem(name, thm.param_types, thm.param_count);
   }
-  if (ok && parser_tactic_word(parser, "by")) {
-    parser_advance(parser);
-    ok = parser_parse_tactic(parser, &thm);
-    if (ok && parser->current_token.type == TOKEN_SEMICOLON) {
-      parser_advance(parser);
-    }
-  } else if (ok && parser_tactic_word(parser, "proof")) {
-    parser_advance(parser);
-    ok = parser_expect(parser, TOKEN_LBRACE);
-    while (ok && parser->current_token.type != TOKEN_RBRACE &&
-           parser->current_token.type != TOKEN_EOF) {
-      if (parser->current_token.type == TOKEN_SEMICOLON ||
-          parser->current_token.type == TOKEN_NEWLINE) {
-        parser_advance(parser);
-        continue;
-      }
-      ok = parser_parse_tactic(parser, &thm);
-    }
-    if (ok) {
-      ok = parser_expect(parser, TOKEN_RBRACE);
-    }
-  } else if (ok) {
-    char line[64];
-    snprintf(line, sizeof(line), "%zu:%zu auto\n", location.line,
-             location.column);
-    parser_script_append(&thm.script, line);
+  if (ok) {
+    ok = parser_parse_proof_script(parser, &thm, location);
   }
   if (ok) {
     claim_decl = parser_make_rewrite_side(

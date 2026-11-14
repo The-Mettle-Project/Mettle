@@ -1,0 +1,29 @@
+fn mul_by_shifts(x: uint64, c: uint64) -> uint64 {
+    if (c == 0) { return 0; }
+    var rest: uint64 = mul_by_shifts(x << 1, c >> 1);
+    if ((c & 1) == 1) { return rest + x; }
+    return rest;
+}
+
+theorem mul_splits_low_bit(x: uint64, c: uint64) {
+    x * c == (x << 1) * (c >> 1) + x * (c & 1)
+} by smt;
+
+rewrite shifts_to_multiply(x: uint64, c: uint64) -> uint64 {
+    from mul_by_shifts(x, c);
+    to x * c;
+} proof {
+    induction c;
+    use mul_splits_low_bit(x, c);
+    auto;
+}
+
+@noinline fn scale(v: uint64, k: uint64) -> uint64 {
+    return mul_by_shifts(v, k);
+}
+
+fn main() -> int32 {
+    if (scale(7, 6) != 42) { return 1; }
+    if (scale(123456789, 1000) != 123456789000) { return 2; }
+    return 0;
+}

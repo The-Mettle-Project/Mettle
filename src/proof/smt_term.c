@@ -964,6 +964,12 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
     if (a == b || smt_const_is_zero(ctx, b) || smt_const_is_ones(ctx, a)) {
       return ctx->bool_false;
     }
+    if (ctx->nodes[a].kind == SMT_K_BVUREM && smt_arg(ctx, a, 1) == b) {
+      return smt_not(ctx, smt_eq(ctx, b,
+                                 smt_bv_u64(ctx, ctx->sorts[ctx->nodes[b].sort]
+                                                     .width,
+                                            0)));
+    }
     return 0;
   case SMT_K_BVULE:
     if (a == b || smt_const_is_zero(ctx, a) || smt_const_is_ones(ctx, b)) {
