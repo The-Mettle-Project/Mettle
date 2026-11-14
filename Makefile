@@ -81,7 +81,7 @@ LOWERING_SOURCES = \
 	$(SRCDIR)/ir/ir_lower_live.c \
 	$(SRCDIR)/ir/ir_lower_ownership.c
 # Backend IR core (everything in src/ir except the lowering TUs) + optimizer.
-IR_CORE_SOURCES = $(filter-out $(LOWERING_SOURCES),$(wildcard $(SRCDIR)/ir/*.c)) $(wildcard $(SRCDIR)/ir/optimizer/*.c)
+IR_CORE_SOURCES = $(filter-out $(LOWERING_SOURCES),$(wildcard $(SRCDIR)/ir/*.c)) $(wildcard $(SRCDIR)/ir/optimizer/*.c) $(wildcard $(SRCDIR)/proof/*.c)
 # Public libmtlc API surface, and the frontend-side type-translation adapter.
 API_SOURCES = $(SRCDIR)/mtlc_api.c $(SRCDIR)/mtlc_build.c \
 	$(SRCDIR)/mtlc_lib_fallbacks.c $(SRCDIR)/mtlc_crash_fallback.c \
@@ -283,7 +283,7 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJDIR):
-	mkdir -p $(OBJDIR)/lexer $(OBJDIR)/parser $(OBJDIR)/semantic $(OBJDIR)/ir $(OBJDIR)/ir/optimizer $(OBJDIR)/codegen $(OBJDIR)/codegen/binary $(OBJDIR)/linker $(OBJDIR)/error $(OBJDIR)/debug $(OBJDIR)/compiler $(OBJDIR)/runtime $(OBJDIR)/frontend
+	mkdir -p $(OBJDIR)/lexer $(OBJDIR)/parser $(OBJDIR)/semantic $(OBJDIR)/ir $(OBJDIR)/ir/optimizer $(OBJDIR)/proof $(OBJDIR)/codegen $(OBJDIR)/codegen/binary $(OBJDIR)/linker $(OBJDIR)/error $(OBJDIR)/debug $(OBJDIR)/compiler $(OBJDIR)/runtime $(OBJDIR)/frontend
 
 $(BINDIR):
 	mkdir -p $(BINDIR)

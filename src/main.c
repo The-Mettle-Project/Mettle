@@ -60,6 +60,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "proof/smt.h"
 #if !defined(_WIN32) || defined(__MINGW32__)
 #include <sys/time.h>
 #endif
@@ -5056,6 +5057,9 @@ int main(int argc, char *argv[]) {
                 "that machine's encoding, decodes it back, and runs it\n");
         return 1;
       }
+    }
+    if (strcmp(argv[1], "smt") == 0) {
+      return smtlib_main(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "why") == 0) {
       if (argc < 5) {

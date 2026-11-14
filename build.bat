@@ -157,6 +157,7 @@ if not exist obj\parser mkdir obj\parser
 if not exist obj\semantic mkdir obj\semantic
 if not exist obj\ir mkdir obj\ir
 if not exist obj\ir\optimizer mkdir obj\ir\optimizer
+if not exist obj\proof mkdir obj\proof
 if not exist obj\codegen mkdir obj\codegen
 if not exist obj\codegen\binary mkdir obj\codegen\binary
 if not exist obj\codegen\asm mkdir obj\codegen\asm
@@ -227,6 +228,7 @@ call :cc src\semantic\ownership_string.c obj\semantic\ownership_string.o
 :plan_ir
 for %%f in (src\ir\*.c) do call :cc "%%f" "obj\ir\%%~nf.o"
 for %%f in (src\ir\optimizer\*.c) do call :cc "%%f" "obj\ir\optimizer\%%~nf.o"
+for %%f in (src\proof\*.c) do call :cc "%%f" "obj\proof\%%~nf.o"
 
 for %%f in (src\codegen\binary_emitter.c src\codegen\code_generator.c src\codegen\elf_emitter.c src\codegen\macho_emitter.c src\codegen\gpu_detect.c src\codegen\ptx_emitter.c src\codegen\spirv_emitter.c src\codegen\msl_emitter.c src\codegen\gpu_structure.c src\codegen\target.c src\codegen\flat_emitter.c) do call :cc "%%f" "obj\codegen\%%~nf.o"
 for %%f in (src\codegen\asm\*.c) do call :cc "%%f" "obj\codegen\asm\%%~nf.o"
@@ -370,6 +372,7 @@ if errorlevel 1 exit /b 1
 
 set "AROBJS="
 for %%o in (obj\ir\optimizer\*.o) do call set "AROBJS=%%AROBJS%% %%o"
+for %%o in (obj\proof\*.o) do call set "AROBJS=%%AROBJS%% %%o"
 %AR% rcs bin\mtlc.lib %AROBJS%
 if errorlevel 1 exit /b 1
 
