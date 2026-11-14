@@ -42,7 +42,9 @@ shared state. By induction on the iteration count the two runs stay equal.
 A pass that changes a loop's shape, such as unrolling or vectorizing it,
 leaves the two sides out of step, and the application goes to the input sets.
 
-A call to a function without a body, such as a print or `malloc`, is an event.
+A call to a function without a body, such as a print or `malloc`, is an event,
+and so is a call to a function with a loop, which the validator does not
+inline.
 The k-th event on both sides returns the same unknown result, may trap the
 same way, and leaves the same unknown memory, except for locals whose address
 never reached a call. The solver proves that both sides make the same k-th

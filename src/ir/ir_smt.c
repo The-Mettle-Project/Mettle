@@ -1621,6 +1621,25 @@ static void irs_find_invariants(IrsEnc *e) {
   }
 }
 
+static int irs_function_has_loop(const IRFunction *fn) {
+  for (size_t pc = 0; pc < fn->instruction_count; pc++) {
+    const IRInstruction *jump = &fn->instructions[pc];
+    if ((jump->op != IR_OP_JUMP && jump->op != IR_OP_BRANCH_ZERO &&
+         jump->op != IR_OP_BRANCH_EQ) ||
+        !jump->text) {
+      continue;
+    }
+    for (size_t at = 0; at <= pc; at++) {
+      if (fn->instructions[at].op == IR_OP_LABEL &&
+          fn->instructions[at].text &&
+          strcmp(fn->instructions[at].text, jump->text) == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   SmtCtx *ctx = e->ctx;
   if (insn->text && strcmp(insn->text, IR_SMT_INVARIANT_CALL) == 0) {
@@ -1647,8 +1666,9 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
     irs_call_external(e, insn);
     return;
   }
-  if (e->frame->inline_depth >= IRS_MAX_INLINE_DEPTH) {
-    irs_fail(e, "calls nest deeper than the encoder inlines at", insn->text);
+  if (e->frame->inline_depth >= IRS_MAX_INLINE_DEPTH ||
+      irs_function_has_loop(callee)) {
+    irs_call_external(e, insn);
     return;
   }
   if (callee->parameter_count != insn->argument_count) {
