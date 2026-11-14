@@ -45,6 +45,7 @@ typedef struct {
   size_t *loop_end;
   size_t *inv_marker;
   size_t *inv_start;
+  unsigned global_epoch;
   int failed;
   char why[192];
 } IrsEnc;
@@ -299,6 +300,11 @@ static SmtTerm irs_read(IrsEnc *e, const IROperand *op) {
     }
     IrsVar *v = &e->vars[id];
     if (op->kind == IR_OPERAND_SYMBOL && !v->declared && !v->param) {
+      if (e->frame->uf_calls && e->global_epoch) {
+        char kind[32];
+        snprintf(kind, sizeof(kind), "global@%u", e->global_epoch);
+        return irs_shared(e, kind, op->name);
+      }
       return irs_shared(e, "global", op->name);
     }
     return irs_shared(e, "undefined", op->name);
@@ -500,11 +506,23 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
       args[i] = ir_smt_narrow(ctx, args[i], size, is_unsigned);
     }
   }
+  IRSmtFrame *f = e->frame;
+  SmtTerm value, trap;
+  if (f->deterministic &&
+      !f->deterministic(f->deterministic_context, insn->text)) {
+    char prefix[200];
+    snprintf(prefix, sizeof(prefix), "%s@call", insn->text);
+    value = smt_fresh(ctx, prefix, irs_word(ctx));
+    trap = smt_fresh(ctx, prefix, smt_bool_sort(ctx));
+    irs_trap(e, trap);
+    irs_write(e, &insn->dest, value);
+    e->global_epoch++;
+    return;
+  }
   SmtFunc vf = ir_smt_value_func(ctx, insn->text, insn->argument_count);
   SmtFunc tf = ir_smt_trap_func(ctx, insn->text, insn->argument_count);
-  SmtTerm value = smt_apply(ctx, vf, (unsigned)insn->argument_count, args);
-  SmtTerm trap = smt_apply(ctx, tf, (unsigned)insn->argument_count, args);
-  IRSmtFrame *f = e->frame;
+  value = smt_apply(ctx, vf, (unsigned)insn->argument_count, args);
+  trap = smt_apply(ctx, tf, (unsigned)insn->argument_count, args);
   if (f->call_count == f->call_cap) {
     f->call_cap = f->call_cap ? f->call_cap * 2u : 16u;
     f->calls = realloc(f->calls, f->call_cap * sizeof(IRSmtCallSite));
@@ -516,6 +534,7 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
   site->reach = e->reach;
   irs_trap(e, trap);
   irs_write(e, &insn->dest, value);
+  e->global_epoch++;
 }
 
 static void irs_record_site(IrsEnc *e, SmtTerm reach, SmtTerm cond,
@@ -541,6 +560,7 @@ static SmtTerm irs_eval_invariant(IrsEnc *e, size_t header) {
   SmtTerm *saved_env = malloc((e->nvars ? e->nvars : 1u) * sizeof(SmtTerm));
   memcpy(saved_env, e->env, e->nvars * sizeof(SmtTerm));
   SmtTerm saved_reach = e->reach, saved_trap = e->trap;
+  unsigned saved_epoch = e->global_epoch;
   IrsEdge *saved_edges = e->edges;
   size_t saved_count = e->nedges, saved_cap = e->edge_cap;
   e->edges = NULL;
@@ -562,6 +582,7 @@ static SmtTerm irs_eval_invariant(IrsEnc *e, size_t header) {
   free(saved_env);
   e->reach = saved_reach;
   e->trap = saved_trap;
+  e->global_epoch = saved_epoch;
   return value;
 }
 
@@ -683,6 +704,14 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
 
 static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
   SmtCtx *ctx = e->ctx;
+  for (size_t i = header; i <= end && i < e->count; i++) {
+    if (e->insns[i].op == IR_OP_CALL && e->insns[i].text &&
+        strcmp(e->insns[i].text, IR_SMT_PROVE_CALL) != 0 &&
+        strcmp(e->insns[i].text, IR_SMT_INVARIANT_CALL) != 0) {
+      e->global_epoch++;
+      break;
+    }
+  }
   for (size_t i = header; i <= end && i < e->count; i++) {
     const IROperand *dest = &e->insns[i].dest;
     if ((dest->kind != IR_OPERAND_TEMP && dest->kind != IR_OPERAND_SYMBOL) ||

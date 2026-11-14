@@ -1,0 +1,15 @@
+var counter: int64 = 0;
+
+fn bump() -> int64 {
+    counter = counter + 1;
+    return counter;
+}
+
+fn observe() -> int64 {
+    var before: int64 = counter;
+    bump();
+    prove(counter == before);
+    return before;
+}
+
+fn main() -> int32 { return (int32)observe(); }

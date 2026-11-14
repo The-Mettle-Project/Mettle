@@ -1,0 +1,15 @@
+var ticks: int64 = 0;
+
+fn next_tick() -> int64 {
+    ticks = ticks + 1;
+    return ticks;
+}
+
+fn twice() -> int64 {
+    var a: int64 = next_tick();
+    var b: int64 = next_tick();
+    prove(a == b);
+    return a + b;
+}
+
+fn main() -> int32 { return (int32)twice(); }

@@ -54,6 +54,8 @@ typedef struct {
   size_t call_cap;
   int havoc_loops;
   int record_proves;
+  int (*deterministic)(void *context, const char *function);
+  void *deterministic_context;
   IRSmtProveSite *proves;
   size_t prove_count;
   size_t prove_cap;

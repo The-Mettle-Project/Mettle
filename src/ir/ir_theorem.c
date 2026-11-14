@@ -23,6 +23,7 @@ typedef struct {
   SmtTerm trap;
   int recursive;
   int measure;
+  int deterministic;
   char **callees;
   size_t ncallees;
   char why[200];
@@ -70,7 +71,11 @@ typedef struct {
   uint64_t lemmas;
   SmtResult last_result;
   char last_detail[400];
+  const char *building[64];
+  size_t building_depth;
 } Prover;
+
+static int thm_deterministic(void *context, const char *name);
 
 static IRTheoremOptions g_options;
 
@@ -540,6 +545,8 @@ static void def_build(Prover *p, ThmDef *d) {
   frame.ctx = ctx;
   frame.program = p->program;
   frame.uf_calls = 1;
+  frame.deterministic = thm_deterministic;
+  frame.deterministic_context = p;
   frame.param_count = d->arity;
   frame.params = calloc(d->arity ? d->arity : 1, sizeof(SmtTerm));
   for (size_t i = 0; i < d->arity; i++) {
@@ -550,8 +557,16 @@ static void def_build(Prover *p, ThmDef *d) {
     d->params[i] = frame.params[i];
   }
   IRSmtOutcome out;
-  if (!ir_smt_encode(&frame, fn, fn->instructions, fn->instruction_count,
-                     &out)) {
+  if (p->building_depth >= 64) {
+    def_opaque(d, "calls nest too deeply", NULL);
+    ir_smt_frame_free(&frame);
+    return;
+  }
+  p->building[p->building_depth++] = d->name;
+  int encoded = ir_smt_encode(&frame, fn, fn->instructions,
+                              fn->instruction_count, &out);
+  p->building_depth--;
+  if (!encoded) {
     def_opaque(d, "its body cannot be encoded:", out.why);
     ir_smt_frame_free(&frame);
     return;
@@ -575,6 +590,7 @@ static void def_build(Prover *p, ThmDef *d) {
   }
   d->value = out.result;
   d->trap = out.trap;
+  d->deterministic = 1;
   for (size_t i = 0; i < frame.call_count; i++) {
     const char *callee = frame.calls[i].callee;
     int seen = 0;
@@ -634,6 +650,21 @@ static void def_build(Prover *p, ThmDef *d) {
     }
   }
   d->state = DEF_DEFINED;
+}
+
+static int thm_deterministic(void *context, const char *name) {
+  Prover *p = (Prover *)context;
+  if (p->building_depth &&
+      strcmp(p->building[p->building_depth - 1], name) == 0) {
+    return 1;
+  }
+  for (size_t i = 0; i < p->building_depth; i++) {
+    if (strcmp(p->building[i], name) == 0) {
+      return 0;
+    }
+  }
+  ThmDef *d = def_get(p, name);
+  return d->deterministic;
 }
 
 static ThmDef *def_get(Prover *p, const char *name) {
@@ -971,6 +1002,8 @@ static int encode_term_function(Prover *p, const char *fname,
   frame.ctx = p->ctx;
   frame.program = p->program;
   frame.uf_calls = 1;
+  frame.deterministic = thm_deterministic;
+  frame.deterministic_context = p;
   frame.param_count = p->current->nvars;
   frame.params = calloc(frame.param_count ? frame.param_count : 1,
                         sizeof(SmtTerm));
@@ -1579,6 +1612,8 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
   frame.uf_calls = 1;
   frame.havoc_loops = 1;
   frame.record_proves = 1;
+  frame.deterministic = thm_deterministic;
+  frame.deterministic_context = p;
   frame.param_count = temp.nvars;
   frame.params = calloc(temp.nvars ? temp.nvars : 1, sizeof(SmtTerm));
   memcpy(frame.params, temp.vars, temp.nvars * sizeof(SmtTerm));
@@ -1635,7 +1670,12 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
     }
     ok = 0;
     char fmt[200];
-    if (p->last_result == SMT_SAT) {
+    if (p->last_result == SMT_SAT && !p->last_detail[0]) {
+      snprintf(fmt, sizeof(fmt),
+               "does not hold%s; it fails for some value of a global it "
+               "reads or a call it makes%%s",
+               kind);
+    } else if (p->last_result == SMT_SAT) {
       snprintf(fmt, sizeof(fmt), "does not hold%s; it fails at %%s", kind);
     } else {
       snprintf(fmt, sizeof(fmt), "could not be proved%s: %%s", kind);

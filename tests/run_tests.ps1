@@ -1157,6 +1157,20 @@ $cases = @(
     Pattern       = 'invariant in `double_up` does not hold \(the invariant after an iteration\); it fails at'
   },
   @{
+    Name          = "err_prove_global_call"
+    Path          = "tests/err_prove_global_call.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'prove in `observe` does not hold'
+  },
+  @{
+    Name          = "err_prove_impure_call"
+    Path          = "tests/err_prove_impure_call.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'prove in `twice` does not hold'
+  },
+  @{
     Name          = "err_prove_statement"
     Path          = "tests/err_prove_statement.mettle"
     ShouldSucceed = $false
