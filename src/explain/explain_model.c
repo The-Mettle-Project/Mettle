@@ -701,99 +701,94 @@ static void ex_devices_overview(ExReport *report, const ExJson *root);
 
 static void ex_remark_entry(ExReport *report, ExTab *tab, const ExJson *root,
                             const ExJson *r, const char *device) {
-  {
-    const char *fn = ex_json_text(r, "fn");
-    const char *kind = ex_json_text(r, "kind");
-    const char *entity = ex_json_text(r, "entity");
-    const char *headline = ex_json_text(r, "headline");
-    const char *fix = ex_json_text(r, "fix");
-    const char *verified = ex_json_text(r, "verified");
-    long long line = ex_json_int(r, "line", 0);
-    long long end_line = ex_json_int(r, "endLine", 0);
-    long long count = ex_json_int(r, "count", 1);
-    int positive = ex_json_flag(r, "positive");
-    int advisory = ex_json_flag(r, "advisory");
-    int declined = ex_json_flag(r, "declined");
-    const char *host = ex_json_text(r, "inlinedInto");
-    char fn_shown[160];
-    char host_shown[160];
-    char *group = device ? ex_fmt("%s, %s",
-                                  ex_shown(fn, fn_shown, sizeof(fn_shown)),
-                                  device)
-                         : ex_strdup(fn ? fn : "?");
-    ExEntry *entry = ex_add(tab, group);
-    free(group);
-    if (!entry) {
-      return;
-    }
-    ex_shown(fn, fn_shown, sizeof(fn_shown));
-    entry->function = device ? ex_fmt("%s [%s]", fn ? fn : "?", device)
-                             : ex_strdup(fn);
-    if (kind && strcmp(kind, "calls-folded") == 0) {
-      long long last = ex_json_int(r, "lineEnd", line);
-      entry->cells[0] = ex_fmt("%lld-%lld", line, last);
-      entry->cells[1] = ex_fmt("%lld calls", count);
-      entry->end_line = (int)last;
-      entry->title = ex_fmt("%s, %lld calls on lines %lld to %lld", fn_shown,
-                            count, line, last);
-    } else {
-      char *shown_entity = ex_shown_entity(entity ? entity : kind);
-      entry->cells[0] = ex_fmt("%lld", line);
-      entry->cells[1] = shown_entity;
-      entry->end_line = (int)end_line;
-      entry->title = ex_fmt("%s, %s at line %lld", fn_shown,
-                            shown_entity ? shown_entity : "?", line);
-    }
-    entry->cells[2] = ex_strdup(headline);
-    entry->line = (int)line;
-    entry->code = ex_strdup(ex_json_text(r, "code"));
-    if (positive || ex_json_flag(r, "trivial")) {
-      entry->tone = EX_TONE_DONE;
-    } else if (declined) {
-      entry->tone = EX_TONE_PLAIN;
-    } else {
-      entry->tone = verified ? EX_TONE_FIXABLE : EX_TONE_MISSED;
-      entry->flags |= EXF_MISSED;
-    }
-    if (!positive && fix && !advisory) {
-      entry->flags |= EXF_FIXABLE;
-    }
-    ex_field(entry, "Verdict", headline,
-             positive   ? EX_TONE_DONE
-             : declined ? EX_TONE_PLAIN
-                        : EX_TONE_MISSED);
-    if (host) {
-      ex_field(entry, "Inlined into", ex_shown(host, host_shown,
-                                               sizeof(host_shown)),
-               EX_TONE_PLAIN);
-    }
-    ex_field(entry, "Reason", ex_json_text(r, "reason"), EX_TONE_PLAIN);
-    ex_field(entry, advisory ? "Note" : "Fix", fix, EX_TONE_PLAIN);
-    ex_field(entry, "Verified", verified, EX_TONE_FIXABLE);
-    ex_field(entry, "Still blocked", ex_json_text(r, "stillBlocked"),
-             EX_TONE_MISSED);
-    ex_field(entry, "Calls", ex_json_text(r, "calls"), EX_TONE_PLAIN);
-    if (!device && kind && strcmp(kind, "loop") == 0) {
-      ex_loop_cost_field(entry, root, fn, line);
-      if (positive) {
-        ex_vector_body(entry, report, fn, (int)line,
-                       end_line > line ? (int)end_line : (int)line, headline);
-      }
-    }
-    {
-      const ExJson *quantities = ex_json_get(r, "quantities");
-      for (size_t q = 0; quantities && quantities->kind == EXJ_OBJECT &&
-                         q < quantities->count;
-           q++) {
-        char *label = ex_words(quantities->keys[q]);
-        char *value = ex_fmt("%lld", (long long)quantities->items[q]->number);
-        ex_field(entry, label, value, EX_TONE_PLAIN);
-        free(label);
-        free(value);
-      }
-    }
-    ex_finish(entry);
+  const char *fn = ex_json_text(r, "fn");
+  const char *kind = ex_json_text(r, "kind");
+  const char *entity = ex_json_text(r, "entity");
+  const char *headline = ex_json_text(r, "headline");
+  const char *fix = ex_json_text(r, "fix");
+  const char *verified = ex_json_text(r, "verified");
+  const ExJson *quantities = ex_json_get(r, "quantities");
+  long long line = ex_json_int(r, "line", 0);
+  long long end_line = ex_json_int(r, "endLine", 0);
+  long long count = ex_json_int(r, "count", 1);
+  int positive = ex_json_flag(r, "positive");
+  int advisory = ex_json_flag(r, "advisory");
+  int declined = ex_json_flag(r, "declined");
+  const char *host = ex_json_text(r, "inlinedInto");
+  char fn_shown[160];
+  char host_shown[160];
+  char *group = device ? ex_fmt("%s, %s",
+                                ex_shown(fn, fn_shown, sizeof(fn_shown)),
+                                device)
+                       : ex_strdup(fn ? fn : "?");
+  ExEntry *entry = ex_add(tab, group);
+  free(group);
+  if (!entry) {
+    return;
   }
+  ex_shown(fn, fn_shown, sizeof(fn_shown));
+  entry->function = device ? ex_fmt("%s [%s]", fn ? fn : "?", device)
+                           : ex_strdup(fn);
+  if (kind && strcmp(kind, "calls-folded") == 0) {
+    long long last = ex_json_int(r, "lineEnd", line);
+    entry->cells[0] = ex_fmt("%lld-%lld", line, last);
+    entry->cells[1] = ex_fmt("%lld calls", count);
+    entry->end_line = (int)last;
+    entry->title = ex_fmt("%s, %lld calls on lines %lld to %lld", fn_shown,
+                          count, line, last);
+  } else {
+    char *shown_entity = ex_shown_entity(entity ? entity : kind);
+    entry->cells[0] = ex_fmt("%lld", line);
+    entry->cells[1] = shown_entity;
+    entry->end_line = (int)end_line;
+    entry->title = ex_fmt("%s, %s at line %lld", fn_shown,
+                          shown_entity ? shown_entity : "?", line);
+  }
+  entry->cells[2] = ex_strdup(headline);
+  entry->line = (int)line;
+  entry->code = ex_strdup(ex_json_text(r, "code"));
+  if (positive || ex_json_flag(r, "trivial")) {
+    entry->tone = EX_TONE_DONE;
+  } else if (declined) {
+    entry->tone = EX_TONE_PLAIN;
+  } else {
+    entry->tone = verified ? EX_TONE_FIXABLE : EX_TONE_MISSED;
+    entry->flags |= EXF_MISSED;
+  }
+  if (!positive && fix && !advisory) {
+    entry->flags |= EXF_FIXABLE;
+  }
+  ex_field(entry, "Verdict", headline,
+           positive   ? EX_TONE_DONE
+           : declined ? EX_TONE_PLAIN
+                      : EX_TONE_MISSED);
+  if (host) {
+    ex_field(entry, "Inlined into",
+             ex_shown(host, host_shown, sizeof(host_shown)), EX_TONE_PLAIN);
+  }
+  ex_field(entry, "Reason", ex_json_text(r, "reason"), EX_TONE_PLAIN);
+  ex_field(entry, advisory ? "Note" : "Fix", fix, EX_TONE_PLAIN);
+  ex_field(entry, "Verified", verified, EX_TONE_FIXABLE);
+  ex_field(entry, "Still blocked", ex_json_text(r, "stillBlocked"),
+           EX_TONE_MISSED);
+  ex_field(entry, "Calls", ex_json_text(r, "calls"), EX_TONE_PLAIN);
+  if (!device && kind && strcmp(kind, "loop") == 0) {
+    ex_loop_cost_field(entry, root, fn, line);
+    if (positive) {
+      ex_vector_body(entry, report, fn, (int)line,
+                     end_line > line ? (int)end_line : (int)line, headline);
+    }
+  }
+  for (size_t q = 0;
+       quantities && quantities->kind == EXJ_OBJECT && q < quantities->count;
+       q++) {
+    char *label = ex_words(quantities->keys[q]);
+    char *value = ex_fmt("%lld", (long long)quantities->items[q]->number);
+    ex_field(entry, label, value, EX_TONE_PLAIN);
+    free(label);
+    free(value);
+  }
+  ex_finish(entry);
 }
 
 static void ex_build_optimizer(ExReport *report, const ExJson *root) {
