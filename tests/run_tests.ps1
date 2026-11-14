@@ -3198,6 +3198,16 @@ $cases = @(
      Env = @{ METTLE_VERIFY_BREAK = "constant_and_branch_simplify:dot" }
      SkipDeterminism = $true
      OutputMustMatch = @("MISCOMPILE CAUGHT", "quarantined", "pre-pass IR restored") },
+  @{ Name = "verify_loops_proved"; Path = "tests/verify_loops.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     OutputMustMatch = @("translation validation: OK", "proved: \d+ of the validated applications")
+     OutputMustNotMatch = @("MISCOMPILE") },
+  @{ Name = "verify_loop_sabotage_caught"; Path = "tests/verify_loops.mettle"; ShouldSucceed = $true
+     Args = @("--verify")
+     Env = @{ METTLE_VERIFY_BREAK = "constant_and_branch_simplify:fill" }
+     SkipDeterminism = $true
+     OutputMustMatch = @("MISCOMPILE CAUGHT")
+     OutputMustNotMatch = @("SMT solver proved the application") },
   # The register allocation verifier recomputes liveness on its own and
   # rejects two live values in one register. A sabotaged colouring proves
   # the checker sees what it claims to see.

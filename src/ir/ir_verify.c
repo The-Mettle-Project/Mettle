@@ -87,6 +87,7 @@ static size_t g_quarantine_count = 0;
 static IRVSkipNote g_skip_notes[IRV_MAX_SKIP_NOTES];
 static size_t g_skip_note_count = 0;
 static int g_sabotage_fired = 0;
+static int g_sabotage_pending = 0;
 
 void ir_verify_set_enabled(int enabled) { g_enabled = enabled; }
 int ir_verify_enabled(void) { return g_enabled; }
@@ -122,6 +123,7 @@ void ir_verify_begin_program(IRProgram *program) {
   g_apps_smt_unconfirmed = 0;
   g_divergences = 0;
   g_sabotage_fired = 0;
+  g_sabotage_pending = 0;
   for (size_t i = 0; i < g_quarantine_count; i++) {
     free(g_quarantine[i].function_name);
     free(g_quarantine[i].pass_name);
@@ -1154,6 +1156,7 @@ void ir_verify_maybe_sabotage(IRFunction *function, const char *pass_name,
         insn->rhs.kind == IR_OPERAND_INT) {
       insn->rhs.int_value += 1;
       g_sabotage_fired = 1;
+      g_sabotage_pending = 1;
       if (changed) {
         *changed = 1;
       }
@@ -1649,7 +1652,15 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
                            snapshot->instruction_count, function,
                            function->instructions,
                            function->instruction_count, NULL, &smt);
+  int sabotaged = g_sabotage_pending;
+  g_sabotage_pending = 0;
   if (smt.verdict == IR_SMT_PROVED) {
+    if (sabotaged) {
+      fprintf(stderr,
+              "verify: the SMT solver proved the application that "
+              "METTLE_VERIFY_BREAK altered in '%s' after '%s'\n",
+              function->name ? function->name : "?", pass_name);
+    }
     g_apps_validated++;
     g_apps_proved++;
     return 1;

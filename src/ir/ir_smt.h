@@ -73,7 +73,30 @@ typedef struct {
   SmtTerm *foreign;
   size_t foreign_count;
   size_t foreign_cap;
+  int lockstep;
+  unsigned encode_index;
+  struct IRSmtLoop *loops;
+  size_t loop_count;
+  struct IRSmtLoopVisit *visits;
+  size_t visit_count;
+  size_t visit_cap;
 } IRSmtFrame;
+
+typedef struct IRSmtLoop {
+  const char *label;
+  const char **names;
+  size_t name_count;
+  int memory;
+} IRSmtLoop;
+
+typedef struct IRSmtLoopVisit {
+  unsigned side;
+  size_t loop;
+  int back;
+  SmtTerm reach;
+  SmtTerm memory;
+  SmtTerm *values;
+} IRSmtLoopVisit;
 
 SmtTerm ir_smt_frame_assumption(IRSmtFrame *frame);
 

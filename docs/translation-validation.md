@@ -21,23 +21,31 @@ miscompile, caught at the moment it is introduced.
 The claim "this optimization is correct" is not accepted from the optimizer on
 its own authority.
 
-A changed function whose IR is loop-free integer code is first handed to the
-SMT solver, which proves the code before and after the pass agree on every
-input and every starting memory: the same traps, the same return value, and
-the same bytes at every address outside the function's own locals when it
-returns. A proof validates the
-application without running anything, and the summary counts proofs apart
-from runs:
+A changed function whose IR is integer code is first handed to the SMT
+solver, which proves the code before and after the pass agree on every input
+and every starting memory: the same traps, the same return value, and the
+same bytes at every address outside the function's own locals when it
+returns. A proof validates the application without running anything, and the
+summary counts proofs apart from runs:
 
 ```text
-translation validation: OK - 91 pass applications validated on 6 input sets each; 7 skipped
-  proved: 9 of the validated applications hold for every input, by SMT proof with a checked refutation
+translation validation: OK - 53 pass applications validated on 6 input sets each; 7 skipped
+  proved: 49 of the validated applications hold for every input, by SMT proof with a checked refutation
 ```
 
-When the solver finds a disagreement, the interpreter runs the solver's input
-first, so a real miscompile is reported with a concrete run. Code with loops,
-floats or block copies goes straight to the input sets. See
-[Proofs](proofs.md).
+Loops are proved in step. At each loop header, every variable that either
+side writes in the loop and reads again takes one unknown value shared by
+both sides, and memory takes one unknown array. The solver proves that both
+sides reach the header together on entry and on every back edge, with equal
+values and equal memory, and that the code after the loop agrees from that
+shared state. By induction on the iteration count the two runs stay equal.
+A pass that changes a loop's shape, such as unrolling or vectorizing it,
+leaves the two sides out of step, and the application goes to the input sets.
+
+When the solver finds a disagreement in loop-free code, the interpreter runs
+the solver's input first, so a real miscompile is reported with a concrete
+run. Code with floats or block copies larger than 256 bytes goes straight to
+the input sets. See [Proofs](proofs.md).
 
 ## Reference twins
 

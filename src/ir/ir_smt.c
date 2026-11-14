@@ -20,6 +20,8 @@ typedef struct {
   size_t origin;
   int escaped;
   int aggregate;
+  int temp;
+  int mentioned;
 } IrsVar;
 
 typedef struct {
@@ -50,10 +52,12 @@ typedef struct {
   SmtTerm returned;
   const char *prefix;
   size_t *loop_end;
+  const char **block_label;
   size_t *inv_marker;
   size_t *inv_start;
   unsigned global_epoch;
   size_t mem_id;
+  unsigned side;
   SmtTerm mem_in;
   SmtTerm mem_out;
   int failed;
@@ -64,6 +68,11 @@ static SmtTerm irs_eval_invariant(IrsEnc *e, size_t header);
 static void irs_trap(IrsEnc *e, SmtTerm cond);
 static void irs_note_access(IrsEnc *e, SmtTerm addr, int size);
 static int irs_is_foreign(const IRSmtFrame *f, SmtTerm t);
+static size_t irs_lockstep_find(IrsEnc *e, const char *label);
+static void irs_apply_phis(IrsEnc *e, size_t target, const char *from,
+                           SmtTerm *env);
+static void irs_lockstep_visit(IrsEnc *e, size_t loop, int back,
+                               SmtTerm reach);
 static void irs_record_site(IrsEnc *e, SmtTerm reach, SmtTerm cond,
                             const SourceLocation *at, int kind);
 
@@ -271,7 +280,9 @@ static size_t irs_var_lookup(IrsEnc *e, const char *name, int create) {
 static void irs_note_operand(IrsEnc *e, const IROperand *op) {
   if ((op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL) &&
       op->name) {
-    irs_var_lookup(e, op->name, 1);
+    size_t id = irs_var_lookup(e, op->name, 1);
+    e->vars[id].temp |= op->kind == IR_OPERAND_TEMP;
+    e->vars[id].mentioned = 1;
   }
 }
 
@@ -815,6 +826,17 @@ static void irs_edge(IrsEnc *e, size_t at, const char *label, SmtTerm cond) {
       irs_fail(e, "it has a loop", NULL);
       return;
     }
+    size_t loop = irs_lockstep_find(e, label);
+    if (loop != (size_t)-1) {
+      SmtTerm *saved_env = e->env;
+      SmtTerm *copy = malloc((e->nvars ? e->nvars : 1u) * sizeof(SmtTerm));
+      memcpy(copy, e->env, e->nvars * sizeof(SmtTerm));
+      irs_apply_phis(e, target, e->block_label[at], copy);
+      e->env = copy;
+      irs_lockstep_visit(e, loop, 1, smt_and(e->ctx, e->reach, cond));
+      e->env = saved_env;
+      free(copy);
+    }
     if (e->inv_marker && e->inv_marker[target]) {
       SmtTerm reach = smt_and(e->ctx, e->reach, cond);
       if (reach != smt_false(e->ctx)) {
@@ -842,6 +864,7 @@ static void irs_edge(IrsEnc *e, size_t at, const char *label, SmtTerm cond) {
   edge->reach = reach;
   edge->env = malloc((e->nvars ? e->nvars : 1u) * sizeof(SmtTerm));
   memcpy(edge->env, e->env, e->nvars * sizeof(SmtTerm));
+  irs_apply_phis(e, target, e->block_label[at], edge->env);
 }
 
 static SmtTerm irs_materialize(IrsEnc *e, size_t id, SmtTerm v) {
@@ -860,9 +883,52 @@ static SmtTerm irs_materialize(IrsEnc *e, size_t id, SmtTerm v) {
   return out;
 }
 
+static void irs_apply_phis(IrsEnc *e, size_t target, const char *from,
+                           SmtTerm *env) {
+  size_t first = target + 1u, last = first;
+  while (last < e->count && e->insns[last].op == IR_OP_PHI) {
+    last++;
+  }
+  if (first == last) {
+    return;
+  }
+  size_t n = last - first;
+  SmtTerm *values = calloc(n, sizeof(SmtTerm));
+  SmtTerm *saved = e->env;
+  e->env = env;
+  for (size_t k = 0; k < n && !e->failed; k++) {
+    const IRInstruction *phi = &e->insns[first + k];
+    const IROperand *pick = NULL;
+    int matches = 0;
+    for (size_t a = 0; a + 1u < phi->argument_count; a += 2u) {
+      const IROperand *label = &phi->arguments[a + 1u];
+      int same = from ? label->kind == IR_OPERAND_LABEL && label->name &&
+                            strcmp(label->name, from) == 0
+                      : label->kind == IR_OPERAND_NONE;
+      if (same) {
+        pick = &phi->arguments[a];
+        matches++;
+      }
+    }
+    if (matches != 1) {
+      irs_fail(e, "a phi has no single value for an incoming edge", NULL);
+      break;
+    }
+    values[k] = irs_read(e, pick);
+  }
+  for (size_t k = 0; k < n && !e->failed; k++) {
+    irs_write(e, &e->insns[first + k].dest, values[k]);
+  }
+  e->env = saved;
+  free(values);
+}
+
 static void irs_merge(IrsEnc *e, size_t at) {
   SmtCtx *ctx = e->ctx;
   int any = e->reach != smt_false(ctx);
+  if (any && at > 0) {
+    irs_apply_phis(e, at, e->block_label[at - 1u], e->env);
+  }
   for (size_t k = 0; k < e->nedges; k++) {
     IrsEdge *edge = &e->edges[k];
     if (edge->target != at) {
@@ -1219,10 +1285,74 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   free(sub.buckets);
   free(sub.env);
   free(sub.loop_end);
+  free(sub.block_label);
   for (size_t k = 0; k < sub.nedges; k++) {
     free(sub.edges[k].env);
   }
   free(sub.edges);
+}
+
+static size_t irs_lockstep_find(IrsEnc *e, const char *label) {
+  IRSmtFrame *f = e->frame;
+  if (!f->lockstep || e->prefix || !label) {
+    return (size_t)-1;
+  }
+  for (size_t i = 0; i < f->loop_count; i++) {
+    if (strcmp(f->loops[i].label, label) == 0) {
+      return i;
+    }
+  }
+  return (size_t)-1;
+}
+
+static void irs_lockstep_visit(IrsEnc *e, size_t loop, int back,
+                               SmtTerm reach) {
+  IRSmtFrame *f = e->frame;
+  const IRSmtLoop *l = &f->loops[loop];
+  if (f->visit_count == f->visit_cap) {
+    f->visit_cap = f->visit_cap ? f->visit_cap * 2u : 16u;
+    f->visits = realloc(f->visits, f->visit_cap * sizeof(IRSmtLoopVisit));
+  }
+  IRSmtLoopVisit *v = &f->visits[f->visit_count++];
+  v->side = e->side;
+  v->loop = loop;
+  v->back = back;
+  v->reach = smt_and(e->ctx, reach, smt_not(e->ctx, e->trap));
+  v->memory = e->env[e->mem_id];
+  v->values = calloc(l->name_count ? l->name_count : 1u, sizeof(SmtTerm));
+  for (size_t i = 0; i < l->name_count; i++) {
+    size_t id = irs_var_lookup(e, l->names[i], 0);
+    if (id == (size_t)-1 || e->vars[id].slot || !e->vars[id].mentioned) {
+      continue;
+    }
+    v->values[i] = irs_materialize(e, id, e->env[id]);
+  }
+}
+
+static void irs_lockstep_havoc(IrsEnc *e, size_t loop) {
+  SmtCtx *ctx = e->ctx;
+  const IRSmtLoop *l = &e->frame->loops[loop];
+  char kind[200];
+  snprintf(kind, sizeof(kind), "loop@%s", l->label);
+  if (l->memory) {
+    e->env[e->mem_id] =
+        irs_shared_sorted(e, kind, "\x01memory", irs_memory_sort(ctx));
+  }
+  for (size_t i = 0; i < l->name_count; i++) {
+    size_t id = irs_var_lookup(e, l->names[i], 0);
+    if (id == (size_t)-1 || e->vars[id].slot || !e->vars[id].mentioned) {
+      continue;
+    }
+    IrsVar *v = &e->vars[id];
+    if (!v->declared && !v->param && !v->temp) {
+      irs_fail(e, "a loop writes the global", l->names[i]);
+      return;
+    }
+    SmtTerm shared = irs_shared(e, kind, l->names[i]);
+    e->env[id] = v->size > 0 && v->size < 8
+                     ? ir_smt_narrow(ctx, shared, v->size, v->is_unsigned)
+                     : shared;
+  }
 }
 
 static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
@@ -1285,7 +1415,14 @@ static void irs_step(IrsEnc *e, size_t pc) {
         irs_record_site(e, e->reach, entry, &e->insns[marker].location,
                         IR_SMT_SITE_INVARIANT_ENTRY);
       }
+      size_t loop = irs_lockstep_find(e, insn->text);
+      if (loop != (size_t)-1) {
+        irs_lockstep_visit(e, loop, 0, e->reach);
+      }
       irs_havoc_loop(e, pc, e->loop_end[pc]);
+      if (loop != (size_t)-1) {
+        irs_lockstep_havoc(e, loop);
+      }
       if (marker) {
         e->reach = smt_and(ctx, e->reach, irs_eval_invariant(e, pc));
       }
@@ -1297,6 +1434,7 @@ static void irs_step(IrsEnc *e, size_t pc) {
   }
   switch (insn->op) {
   case IR_OP_NOP:
+  case IR_OP_PHI:
     return;
   case IR_OP_JUMP:
     irs_edge(e, pc, insn->text, smt_true(ctx));
@@ -1739,6 +1877,20 @@ static int irs_run(IrsEnc *e) {
   e->mem_id = irs_var_lookup(e, "\x01memory", 1);
   e->vars[e->mem_id].declared = 1;
   e->env = calloc(e->nvars ? e->nvars : 1u, sizeof(SmtTerm));
+  e->block_label = calloc(e->count ? e->count : 1u, sizeof(char *));
+  const char *current_label = NULL;
+  for (size_t i = 0; i < e->count; i++) {
+    const IRInstruction *insn = &e->insns[i];
+    if (insn->op == IR_OP_LABEL) {
+      current_label = insn->text;
+    } else if (i > 0 && (e->insns[i - 1u].op == IR_OP_JUMP ||
+                         e->insns[i - 1u].op == IR_OP_BRANCH_ZERO ||
+                         e->insns[i - 1u].op == IR_OP_BRANCH_EQ ||
+                         e->insns[i - 1u].op == IR_OP_RETURN)) {
+      current_label = NULL;
+    }
+    e->block_label[i] = current_label;
+  }
   e->env[e->mem_id] =
       e->mem_in ? e->mem_in
                 : irs_shared_sorted(e, "memory", "", irs_memory_sort(ctx));
@@ -1826,6 +1978,14 @@ void ir_smt_frame_free(IRSmtFrame *frame) {
   free(frame->access_addr);
   free(frame->access_size);
   free(frame->foreign);
+  for (size_t i = 0; i < frame->loop_count; i++) {
+    free(frame->loops[i].names);
+  }
+  free(frame->loops);
+  for (size_t i = 0; i < frame->visit_count; i++) {
+    free(frame->visits[i].values);
+  }
+  free(frame->visits);
   memset(frame, 0, sizeof(*frame));
 }
 
@@ -1840,6 +2000,7 @@ int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
   e.insns = insns;
   e.count = count;
   e.params = frame->params;
+  e.side = frame->encode_index++;
   int ok = irs_run(&e);
   out->result = e.result;
   out->trap = e.trap;
@@ -1850,6 +2011,7 @@ int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
   free(e.buckets);
   free(e.env);
   free(e.loop_end);
+  free(e.block_label);
   free(e.inv_marker);
   free(e.inv_start);
   for (size_t k = 0; k < e.nedges; k++) {
@@ -1857,6 +2019,171 @@ int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
   }
   free(e.edges);
   return ok;
+}
+
+static size_t irs_label_in(const IRInstruction *insns, size_t count,
+                           const char *name) {
+  for (size_t i = 0; name && i < count; i++) {
+    if (insns[i].op == IR_OP_LABEL && insns[i].text &&
+        strcmp(insns[i].text, name) == 0) {
+      return i;
+    }
+  }
+  return (size_t)-1;
+}
+
+static int irs_names_operand(const IROperand *op, const char *name) {
+  return (op->kind == IR_OPERAND_TEMP || op->kind == IR_OPERAND_SYMBOL) &&
+         op->name && strcmp(op->name, name) == 0;
+}
+
+static int irs_insn_reads(const IRInstruction *insn, const char *name) {
+  if (irs_names_operand(&insn->lhs, name) ||
+      irs_names_operand(&insn->rhs, name)) {
+    return 1;
+  }
+  if (insn->op == IR_OP_STORE && irs_names_operand(&insn->dest, name)) {
+    return 1;
+  }
+  for (size_t a = 0; a < insn->argument_count; a++) {
+    if (irs_names_operand(&insn->arguments[a], name)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void irs_loop_add_name(IRSmtLoop *l, const char *name) {
+  for (size_t i = 0; i < l->name_count; i++) {
+    if (strcmp(l->names[i], name) == 0) {
+      return;
+    }
+  }
+  l->names = realloc(l->names, (l->name_count + 1u) * sizeof(char *));
+  l->names[l->name_count++] = name;
+}
+
+static int irs_collect_loops(IRSmtFrame *f, const IRInstruction *insns,
+                             size_t count) {
+  int any = 0;
+  for (size_t pc = 0; pc < count; pc++) {
+    const IRInstruction *jump = &insns[pc];
+    if ((jump->op != IR_OP_JUMP && jump->op != IR_OP_BRANCH_ZERO &&
+         jump->op != IR_OP_BRANCH_EQ) ||
+        !jump->text) {
+      continue;
+    }
+    size_t header = irs_label_in(insns, count, jump->text);
+    if (header == (size_t)-1 || header > pc) {
+      continue;
+    }
+    any = 1;
+    size_t end = pc;
+    for (size_t k = pc + 1u; k < count; k++) {
+      const IRInstruction *later = &insns[k];
+      if ((later->op == IR_OP_JUMP || later->op == IR_OP_BRANCH_ZERO ||
+           later->op == IR_OP_BRANCH_EQ) &&
+          later->text && strcmp(later->text, jump->text) == 0) {
+        end = k;
+      }
+    }
+    size_t li = 0;
+    while (li < f->loop_count && strcmp(f->loops[li].label, jump->text) != 0) {
+      li++;
+    }
+    if (li == f->loop_count) {
+      f->loops = realloc(f->loops, (f->loop_count + 1u) * sizeof(IRSmtLoop));
+      memset(&f->loops[li], 0, sizeof(IRSmtLoop));
+      f->loops[li].label = jump->text;
+      f->loop_count++;
+    }
+    IRSmtLoop *l = &f->loops[li];
+    for (size_t i = header; i <= end; i++) {
+      const IRInstruction *insn = &insns[i];
+      if (insn->op == IR_OP_STORE ||
+          (insn->op == IR_OP_CALL && insn->text &&
+           strcmp(insn->text, IR_SMT_PROVE_CALL) != 0 &&
+           strcmp(insn->text, IR_SMT_INVARIANT_CALL) != 0 &&
+           !irs_is_trap_call(insn->text))) {
+        l->memory = 1;
+      }
+      const IROperand *d = &insn->dest;
+      if (insn->op == IR_OP_STORE ||
+          (d->kind != IR_OPERAND_TEMP && d->kind != IR_OPERAND_SYMBOL) ||
+          !d->name) {
+        continue;
+      }
+      for (size_t k = 0; k < count; k++) {
+        if (insns[k].op == IR_OP_ADDRESS_OF &&
+            irs_names_operand(&insns[k].lhs, d->name)) {
+          l->memory = 1;
+        }
+      }
+      int live = 0;
+      for (size_t k = header; k <= i && !live; k++) {
+        live = irs_insn_reads(&insns[k], d->name);
+      }
+      for (size_t k = end + 1u; k < count && !live; k++) {
+        live = irs_insn_reads(&insns[k], d->name);
+      }
+      if (live) {
+        irs_loop_add_name(l, d->name);
+      }
+    }
+  }
+  return any;
+}
+
+static SmtTerm irs_lockstep_obligations(IRSmtFrame *f) {
+  SmtCtx *ctx = f->ctx;
+  SmtTerm all = smt_true(ctx);
+  for (size_t li = 0; li < f->loop_count; li++) {
+    const IRSmtLoop *l = &f->loops[li];
+    for (int back = 0; back < 2; back++) {
+      SmtTerm reach[2], mem[2];
+      SmtTerm *vals[2];
+      for (unsigned s = 0; s < 2; s++) {
+        reach[s] = smt_false(ctx);
+        mem[s] = 0;
+        vals[s] = calloc(l->name_count ? l->name_count : 1u, sizeof(SmtTerm));
+        for (size_t k = 0; k < f->visit_count; k++) {
+          const IRSmtLoopVisit *v = &f->visits[k];
+          if (v->side != s || v->loop != li || v->back != back) {
+            continue;
+          }
+          mem[s] = mem[s] ? smt_ite(ctx, v->reach, v->memory, mem[s])
+                          : v->memory;
+          for (size_t i = 0; i < l->name_count; i++) {
+            if (!v->values[i]) {
+              continue;
+            }
+            vals[s][i] = vals[s][i]
+                             ? smt_ite(ctx, v->reach, v->values[i], vals[s][i])
+                             : v->values[i];
+          }
+          reach[s] = smt_or(ctx, reach[s], v->reach);
+        }
+      }
+      SmtTerm same = smt_true(ctx);
+      for (size_t i = 0; i < l->name_count; i++) {
+        if (vals[0][i] && vals[1][i]) {
+          same = smt_and(ctx, same, smt_eq(ctx, vals[0][i], vals[1][i]));
+        }
+      }
+      if (mem[0] && mem[1] && mem[0] != mem[1]) {
+        SmtTerm k = smt_fresh(ctx, "address", smt_bv_sort(ctx, 64));
+        same = smt_and(ctx, same,
+                       smt_eq(ctx, smt_select(ctx, mem[0], k),
+                              smt_select(ctx, mem[1], k)));
+      }
+      all = smt_and(ctx, all,
+                    smt_and(ctx, smt_iff(ctx, reach[0], reach[1]),
+                            smt_implies(ctx, reach[0], same)));
+      free(vals[0]);
+      free(vals[1]);
+    }
+  }
+  return all;
 }
 
 void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
@@ -1876,6 +2203,12 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
   SmtCtx *ctx = smt_ctx_new();
   IRSmtFrame frame;
   ir_smt_frame_init(&frame, ctx, a, program);
+  int loops = irs_collect_loops(&frame, a_insns, a_count);
+  loops |= irs_collect_loops(&frame, b_insns, b_count);
+  if (loops) {
+    frame.lockstep = 1;
+    frame.havoc_loops = 1;
+  }
   IRSmtOutcome oa, ob, og;
   if (!ir_smt_encode(&frame, a, a_insns, a_count, &oa)) {
     snprintf(report->why, sizeof(report->why), "%s", oa.why);
@@ -1925,7 +2258,11 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
                            smt_select(ctx, ob.memory, k))));
   }
   SmtTerm same_value = smt_implies(ctx, smt_not(ctx, oa.trap), same_result);
-  SmtTerm claim = smt_implies(ctx, assume, smt_and(ctx, same_trap, same_value));
+  SmtTerm claim = smt_and(ctx, same_trap, same_value);
+  if (frame.lockstep) {
+    claim = smt_and(ctx, claim, irs_lockstep_obligations(&frame));
+  }
+  claim = smt_implies(ctx, assume, claim);
   SmtSolver *solver = NULL;
   SmtResult r = smt_prove(ctx, claim, 1, 10000, &solver);
   SmtStats st;
@@ -1935,6 +2272,9 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
   report->lemmas = st.lemmas_checked;
   if (r == SMT_UNSAT) {
     report->verdict = IR_SMT_PROVED;
+  } else if (r == SMT_SAT && frame.lockstep) {
+    snprintf(report->why, sizeof(report->why),
+             "the loops do not stay in step");
   } else if (r == SMT_SAT) {
     report->verdict = IR_SMT_REFUTED;
     report->input_count = frame.param_count < 16u ? frame.param_count : 16u;
