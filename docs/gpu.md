@@ -1294,9 +1294,11 @@ PTX applies the same tuple budget and emits `mtlc.tensor_loop resident ...` or
 `replay ...`; replay executes the original load/MMA/store semantics, while the
 resident path loads C once and delays D until the commit. A libmtlc frontend
 gets this result from ordinary builder control flow and tensor descriptors, with no
-Mettle-frontend marker exists. `--dump-ir` exposes the neutral residency roles,
-and `--explain` reports the legality decision plus the actual PTX/SPIR-V backend
-boundary.
+Mettle-frontend marker exists. `--dump-ir` exposes the neutral residency roles.
+`--explain` reports the legality decision, and its device report names the
+instruction each step became and whether the accumulator stayed in registers.
+Where an operation between two steps kept the accumulator in memory, the
+report names its line and the fix it proved on a copy of the kernel.
 
 The optimizer also recognizes a finite straight-line staged composition:
 two or more connected tensor MMAs, with every pair separated by neutral async
@@ -2123,9 +2125,17 @@ run time the driver JITs the PTX to SASS for the installed GPU.
 | `--report-occupancy` | With `--emit-ptx`, runs `ptxas -v` on the emitted module and prints each kernel's registers per thread and the occupancy ceiling they imply |
 | `--sms=N` | SM count used for the whole-card fill thresholds in that report. Defaults to asking the local driver, and the thresholds are omitted when no driver answers |
 | `--gpu-checks` | Emits the trap for each kernel-side `gpu_assert`. Without it those assertions cost nothing |
+| `--explain` | With `--emit-ptx` or `--emit-metal`, prints the device report: where each kernel's values live, what its accesses, tensor operations and staged copies became, and on PTX the registers, stack frame and occupancy `ptxas -v` measured |
 
 `--report-occupancy` needs `ptxas` on `PATH`, since it reads that tool's own
-register and spill accounting.
+register and spill accounting. The device report reads the same figures
+through the same code when `ptxas` is there and leaves the measured rows out
+when it is not.
+
+`mettle explain file.mettle` builds the kernels of a file for PTX and for
+Metal and shows both beside the host report, so a kernel that keeps a value in
+memory on one target, or that one target refuses, shows before either is
+built. [mettle explain](explain.md#gpu-programs) has the walk through.
 
 GPU `-O` is intentionally backend-agnostic. It runs shared scalar/CFG
 transformations only over kernel-reachable device functions and retains

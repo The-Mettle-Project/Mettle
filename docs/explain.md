@@ -55,6 +55,10 @@ flowchart LR
    earned, conversions proven, effects checked, rules run, layout facts, and
    every belief the build did not check.
 7. **Passes**: what each optimizer pass removed and where.
+8. **Kernels**: one entry per kernel and target, with where its values live,
+   what its accesses became, its workgroup memory, the device calls it kept,
+   and the figures the target's own compiler measured. [GPU programs](#gpu-programs)
+   has the detail.
 
 The detail pane shows the selected entry, the source lines it is about, the
 machine code those lines became, and the long explanation for its code, the
@@ -102,9 +106,106 @@ planted constant overflow:
 mettle explain examples/raii_demo/raii_demo.mettle --safe
 ```
 
+## GPU programs
+
+A file that defines kernels is compiled for the GPU as well, and the report
+covers both halves. The host half is the program without its kernels: a
+`dispatch` shows as its own entry with the work items and blocks the compiler
+could fold, and the runtime's launch calls do not appear. The device half is
+compiled once for PTX and once for Metal, since both emitters run on any
+machine, and each kernel gets an entry per target.
+
+```mermaid
+flowchart LR
+  F[app.mettle] --> H[host build]
+  H -->|file defines kernels| P[PTX build of the kernels]
+  H -->|file defines kernels| M[Metal build of the kernels]
+  P --> X[ptxas -v, when on PATH]
+  H --> R[host report]
+  P --> R
+  X --> R
+  M --> R
+```
+
+`--gpu-provider=cuda` or `--gpu-provider=metal` keeps one target. A file with
+kernels and no `main` has no host half, and the report is the two device
+reports.
+
+```bash
+mettle explain tests/gpu/explain_device.mettle
+```
+
+```text
+-- device report, PTX 8.8 for sm_121a: explain_device.mettle -------------------
+  window_sum (kernel @ line 5, block 64)
+      \_ values: 7 in registers, 2 in local memory (52 bytes)
+      \_ memory: 6 accesses, each in a named space
+      \_ ptxas 12.9: 12 registers a thread, no spills, a 56 byte stack frame
+      \_ occupancy: all 48 warps fit on a multiprocessor
+  window_sum (array `window` @ line 8): in local memory, 36 bytes  [local-memory]
+       8 | var window: float32[9];
+      \_ reason: lines 9 and 11 index it with values that are not constants, so its elements cannot each take a register
+  pair_sum (2 adjacent loads from `rows` @ line 23): kept as separate loads  [vector-load-alignment]
+      23 | out[thread.x] = rows[0] + rows[1];
+      \_ reason: the pointer's type declares no alignment, and one load of 2 elements needs 8 bytes
+      \_ fix: declare `align(8)` in the pointer's type
+```
+
+What a kernel entry holds:
+
+- **Values**: how many locals and parameters are in registers, and which arrays
+  and records were emitted as memory, each with the lines that kept it there.
+- **Memory**: how many loads and stores name their address space and how many go
+  through the generic path, and the vector loads a declared alignment formed.
+- **Workgroup memory**: the bytes a block holds, or an arena sized at launch.
+- **Calls**: the helpers that stayed device calls.
+- **Tensor operations**: the instruction each became, `mma.sync` or `wmma.mma`
+  on PTX and `simdgroup_matrix` tiles on Metal, and whether the accumulator
+  stays in registers across a chain, a loop or a region.
+- **Staging**: whether copies into workgroup memory became `cp.async`.
+- **Measured**: on PTX, the registers a thread, spill bytes, stack frame and
+  shared memory `ptxas -v` reports, and the warps that fit on a multiprocessor.
+  The storage lines are held to the stack frame: a value the report calls local
+  memory that ptxas gave no frame is reported as kept in registers by the
+  assembler.
+
+A decision the optimizer declined is listed with the reason and a fix. The fix
+is printed only when applying it to a copy of the kernel makes the optimization
+happen:
+
+```text
+  accumulate (tensor MMA loop @ line 60): NOT resident: every pass loads and stores the accumulator  [tensor-observable]
+      60 | tensor_mma(a + inner, b + inner, d, d,
+      \_ reason: line 64 calls `atomic_store_u32`, which could read or write the accumulator
+      \_ fix: move line 64 out of the loop
+      \_ verified: without that line the accumulator stays in registers across the loop
+```
+
+A construct one target refuses does not stop the report. The other target's
+kernels are reported, and the refusing target shows the reason:
+
+```text
+-- device report, Metal: hardware_kernels.mettle -------------------------------
+  the kernels in this file do not build for Metal
+      \_ reason: Metal has no 64-bit atomic read-modify-write that returns a value: 'atomic_litmus' calls atomic_add_u64; ...
+```
+
+The detail of a kernel entry shows the code the emitter wrote for the selected
+line, PTX or Metal Shading Language, and `d` opens the whole kernel with each
+source line above the device code it became. Device code carries no cycle
+cost: the driver compiles it again, so the measured figures are the ones the
+target's compiler reports.
+
+The same report prints during a device build:
+
+```bash
+mettle --release --explain --emit-ptx kernels.mettle -o kernels.ptx
+mettle --release --explain --emit-metal kernels.mettle -o kernels.metal
+```
+
 ## Keys
 
-- left and right, Tab and Shift+Tab, or 1 to 7: switch tabs
+- left and right, Tab and Shift+Tab, or 1 to 8: switch tabs
 - up and down or j and k: move, or scroll the detail
 - PgUp, PgDn, Home, End: page, first, last
 - Enter: open the detail, or follow a link

@@ -9,14 +9,16 @@ or `--release`.
 mettle --release --explain-json --build program.mettle -o program.exe
 ```
 
-The current schema is version 2. A reader should check `schema` and refuse a
-number it does not know.
+The current schema is version 3. A reader should check `schema` and refuse a
+number it does not know. Version 3 added `target`, `device`, `devices` and the
+`dispatch` remark kind.
 
 ## Top level
 
 | Field | Type | Contents |
 |-------|------|----------|
-| `schema` | number | Schema version, currently 2 |
+| `schema` | number | Schema version, currently 3 |
+| `target` | string | What the report was built for: a triple such as `x86_64-windows`, or `ptx` or `metal` for a device build |
 | `source` | string | The entry file's name |
 | `path` | string | The entry file's absolute path |
 | `changes` | object | What moved since the last build |
@@ -35,6 +37,8 @@ number it does not know.
 | `callGraph` | array | Caller and callee pairs with inlining outcomes |
 | `hotspots` | array | The costliest sites |
 | `passes` | array | What each optimizer pass did |
+| `device` | object | In a device build (`--emit-ptx`, `--emit-metal`): what each kernel became |
+| `devices` | array | In a host build of a file with kernels: one whole device report per target |
 | `stats` | object | Whole-run counters |
 
 ## remarks
@@ -43,7 +47,7 @@ One entry per decision. This is the same material `--explain` prints.
 
 | Field | Type | Contents |
 |-------|------|----------|
-| `kind` | string | `loop` or `call` |
+| `kind` | string | `loop`, `call`, `dispatch` for a kernel launch, or `other` |
 | `fn` | string | The function holding the site |
 | `entity` | string | What the decision was about, such as ``call to `scale` `` |
 | `line`, `column`, `endLine` | number | Where it is |
@@ -145,6 +149,64 @@ array:
 - `offset`: the byte offset in the function.
 
 `machineTotal` counts every instruction seen; `machine` stops at 60000.
+
+## device and devices
+
+A device build writes one `device` object. A host build of a file that defines
+kernels writes `devices`, an array with one element per target, and each
+element is the whole report of that device build: its own `schema`, `target`,
+`remarks`, `startHere`, `passes` and `device`. A target that refuses the file
+contributes `{"schema": 3, "device": {"target": "Metal", "error": "..."}}`.
+
+| Field | Contents |
+|-------|----------|
+| `target`, `profile` | `ptx` with a profile such as `8.8 for sm_121a`, or `metal` with a version such as `3.2` |
+| `measuredBy` | The tool the measured counters came from, such as `ptxas 12.9`, or null |
+| `kernels` | One entry per kernel and per helper that stayed a device function |
+| `notes` | One entry per decision |
+| `codeTotal` | Every emitted line seen |
+
+Each element of `kernels` has `fn`, `line`, `kernel` (false for a helper),
+`block`, `limiter`, `rows` (the summary sentences the plain report prints),
+`code` and `counters`:
+
+| Counter | Contents |
+|---------|----------|
+| `valuesInRegisters`, `valuesInMemory`, `memoryBytes` | Locals and parameters by where they were emitted |
+| `workgroupBytes`, `workgroupAtLaunch` | Static workgroup memory a block holds, and 1 when an arena is sized at launch |
+| `accessesNamed`, `accessesGeneric` | Loads and stores by address space |
+| `vectorGroups`, `loadsSaved` | Vector loads formed and the separate loads they replaced |
+| `callsKept` | Calls that stayed device calls |
+| `registers`, `spillStoreBytes`, `spillLoadBytes`, `stackFrame`, `sharedBytes` | What `ptxas -v` reported for the kernel |
+| `warps`, `warpLimit` | Warps that fit on a multiprocessor, and the ceiling |
+| `threadWidth`, `maxThreads` | On Metal, what the compute pipeline reported |
+
+A counter is present only when it was counted or measured.
+
+`code` is the text the emitter wrote for the function, one `[line, text]` pair
+per emitted line. `line` is the source line it came from, or 0 for code inlined
+from another file.
+
+Each element of `notes` has `fn`, `line`, `kind` (`storage`, `access`,
+`vector`, `tensor`, `staging`, `tiles`, `atomic`, `control`, `numeric` or
+`specialization`), `subject`, `verdict` (`good`, `miss`, `fact` or `refused`),
+`headline`, `reason`, `fix`, `code`, `sites` and `quantities`.
+
+```json
+{
+  "fn": "window_sum",
+  "line": 8,
+  "kind": "storage",
+  "subject": "array `window`",
+  "verdict": "miss",
+  "headline": "in local memory, 36 bytes",
+  "reason": "lines 9 and 11 index it with values that are not constants, so its elements cannot each take a register",
+  "fix": null,
+  "code": "local-memory",
+  "sites": 1,
+  "quantities": {"bytes": 36}
+}
+```
 
 ## backend
 

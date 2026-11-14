@@ -1028,7 +1028,8 @@ static const ErrorCodeDoc DOCS[] = {
 typedef enum {
   DECISION_VECTOR_REFUSAL,
   DECISION_INLINE_REFUSAL,
-  DECISION_APPLIED
+  DECISION_APPLIED,
+  DECISION_DEVICE
 } DecisionGroup;
 
 typedef struct {
@@ -1723,6 +1724,173 @@ static const DecisionDoc DECISIONS[] = {
      "The function is marked @noalloc, and the compiler walked everything it\n"
      "can reach and found no allocation on any path. The contract is proved;\n"
      "a violation would have stopped the build with an error.\n"},
+    {"local-memory", DECISION_DEVICE,
+     "A kernel's local was emitted as memory",
+     "A scalar local of a kernel lives in a register. An array or a record\n"
+     "lives in registers too when every use names one element with a constant\n"
+     "index, because each element can then take a register of its own. A\n"
+     "use that indexes with a run-time value, passes the address to a helper\n"
+     "or stores the address keeps the whole value in the work item's own\n"
+     "memory, and every access to it becomes a load or a store.\n"
+     "\n"
+     "On PTX that memory is `.local`. Where ptxas is on PATH the report reads\n"
+     "its stack frame for the kernel: a frame at least as large as the value\n"
+     "confirms it, and a frame of zero means the assembler kept the value in\n"
+     "registers after all, which the report then says.\n"
+     "\n"
+     "On Metal the value stays one array or record in the emitted source,\n"
+     "and Apple's compiler decides where it lives.\n"
+     "\n"
+     "Fix: index it with constants, which `comptime for` gives a loop with a\n"
+     "constant count, or keep the running values in scalar locals.\n"},
+    {"generic-access", DECISION_DEVICE,
+     "A load or store goes through the generic address space",
+     "A device pointer whose type names its space loads with `ld.global`,\n"
+     "`ld.shared` or `ld.local`. A plain `T*` that can hold a workgroup or a\n"
+     "private address is a generic pointer: the address is converted where\n"
+     "it becomes one, and every access through it resolves the space at run\n"
+     "time. A kernel's own plain pointer parameters only ever hold global\n"
+     "addresses, so they still load `.global`; this remark is about helpers\n"
+     "called with more than one kind of address.\n"
+     "\n"
+     "Metal has no generic space. The same helper is compiled once for each\n"
+     "space it is called with, and the report says how many copies it made.\n"
+     "\n"
+     "Fix: name the space in the helper's parameter type, `T global*`,\n"
+     "`T shared*` or `T local*`.\n"},
+    {"vector-load", DECISION_DEVICE,
+     "Adjacent loads became one vector load",
+     "Two or four loads at consecutive offsets from one pointer became a\n"
+     "single `ld.v2` or `ld.v4`. The pointer's type declares the alignment\n"
+     "the wider load needs, which is what licenses it.\n"},
+    {"vector-load-alignment", DECISION_DEVICE,
+     "Adjacent loads stayed separate for want of a declared alignment",
+     "The kernel loads two or four adjacent elements from one pointer, which\n"
+     "is the shape of a vector load. A vector load of N elements needs the\n"
+     "address aligned to N elements, and the pointer's type declares less\n"
+     "than that or nothing, so each element is loaded on its own.\n"
+     "\n"
+     "Fix: declare the alignment in the pointer's type, such as\n"
+     "`float32 global align(16)*`. On a kernel parameter the launch is then\n"
+     "held to it. On a computed address the cast to the aligned type is\n"
+     "accepted where the compiler can prove the offset is a multiple of the\n"
+     "alignment, which a declared type on the offset gives it.\n"},
+    {"tensor-instruction", DECISION_DEVICE,
+     "The instruction a tensor operation became",
+     "A `tensor_mma` or `tensor_matmul` names a product of tiles, and each\n"
+     "target has its own way to run one. On PTX it is `mma.sync` where the\n"
+     "element types have a native form, or `wmma.mma`; a logical tile larger\n"
+     "than the hardware tile runs as several hardware tiles a step. On Metal\n"
+     "it is `simdgroup_matrix` 8 by 8 tiles for f16, bf16 and f32 inputs.\n"
+     "The report names the form, the shape and the element type that were\n"
+     "chosen.\n"},
+    {"tensor-resident", DECISION_DEVICE,
+     "A tensor accumulator stays in registers across its steps",
+     "Steps that accumulate into the same output would each load the\n"
+     "accumulator from memory and store it back. Where nothing between the\n"
+     "steps can observe the output, it is loaded once, kept in the tensor\n"
+     "registers across the chain, the loop or the region, and stored once at\n"
+     "the end. The report gives the registers that takes against the budget.\n"},
+    {"tensor-register-budget", DECISION_DEVICE,
+     "A tensor accumulator went back to memory because of the register budget",
+     "Keeping an accumulator in registers across its steps takes the\n"
+     "accumulator's registers plus one step's operands. That count is over\n"
+     "the tensor register budget, so every step loads the accumulator and\n"
+     "stores it again.\n"
+     "\n"
+     "Fix: raise the budget with `--gpu-tensor-tuple-budget=N`. The report\n"
+     "names the N that fits. A larger budget leaves fewer registers for the\n"
+     "rest of the kernel, and the occupancy row says what that costs.\n"},
+    {"tensor-scalar-replay", DECISION_DEVICE,
+     "A tensor_matmul runs one element at a time",
+     "No tensor instruction on this target fits the operation, or the one\n"
+     "that fits needs more registers than the budget allows. The whole warp\n"
+     "then computes the product element by element in the order the\n"
+     "numerics contract fixes, so the result is the same and the speed is\n"
+     "that of scalar code.\n"
+     "\n"
+     "Fix: where the reason is the budget, raise it with\n"
+     "`--gpu-tensor-tuple-budget=N`. Otherwise pick element types and a shape\n"
+     "the target has an instruction for.\n"},
+    {"tensor-scalar", DECISION_DEVICE,
+     "A block-scaled integer tensor product runs in scalar code on Metal",
+     "Apple GPUs have no integer matrix unit. A block-scaled int8 product is\n"
+     "computed as exact integer dot products in scalar code, in the rounding\n"
+     "sequence the CPU grid runner uses, so it gives the bits the PTX path\n"
+     "gives.\n"},
+    {"tensor-observable", DECISION_DEVICE,
+     "Something between two tensor steps could observe the accumulator",
+     "Two steps accumulate into the same output, and an operation sits\n"
+     "between them that could read or write that output: a call, an atomic,\n"
+     "a load, a store or a barrier. The output therefore has to be in memory\n"
+     "at that point, so the step before stores it and the step after loads\n"
+     "it again.\n"
+     "\n"
+     "Fix: move the operation before the first step or after the last, or\n"
+     "out of the loop. The report applies that to a copy of the kernel and\n"
+     "prints the fix only when the accumulator then stays in registers.\n"},
+    {"staging-barrier-order", DECISION_DEVICE,
+     "Copies into workgroup memory were not staged asynchronously",
+     "A run of copies from global to workgroup memory followed by a\n"
+     "workgroup barrier is the shape asynchronous staging takes: the copies\n"
+     "are issued, and the barrier waits for them. That is only valid when\n"
+     "the barrier publishes what was copied, which takes one that both\n"
+     "acquires and releases. This one does less, so the copies stay\n"
+     "ordinary loads and stores.\n"
+     "\n"
+     "Fix: write `barrier(workgroup, acq_rel)`.\n"},
+    {"staging-interrupted", DECISION_DEVICE,
+     "An operation sits between the staged copies and their barrier",
+     "Copies from global to workgroup memory can be issued asynchronously\n"
+     "when nothing but register arithmetic runs between them and the\n"
+     "barrier that publishes them. A load, a store or a call in that\n"
+     "stretch could see workgroup memory before the copies land.\n"
+     "\n"
+     "Fix: move it after the barrier.\n"},
+    {"async-copy", DECISION_DEVICE,
+     "What a staged copy became",
+     "On PTX for sm_80 and later at PTX 7.0 a staged copy is `cp.async`, and\n"
+     "the barrier that follows waits for it. On an older target it is an\n"
+     "ordinary load and store. Metal has no asynchronous copy, so there it\n"
+     "is an assignment, in order.\n"},
+    {"register-tiles", DECISION_DEVICE,
+     "The registers a kernel's tiles hold",
+     "A local whose type is a fragment layout is a register tile: one work\n"
+     "item's share of an MMA tile, held in registers. The report lists each\n"
+     "tile with the registers it takes and the lines it is live across, and\n"
+     "the peak for the kernel against the budget of 255 a work item. An\n"
+     "intermediate tile used once is computed one element at a time and\n"
+     "holds none.\n"},
+    {"atomic-fence", DECISION_DEVICE,
+     "An ordered atomic became a relaxed one beside a fence",
+     "Metal 3.2 atomics take no memory order. An ordered load, store or\n"
+     "exchange is emitted as the relaxed form with `atomic_thread_fence`\n"
+     "before it, after it, or both, which gives the order asked for. Metal\n"
+     "4.1 has the orders natively, and `--metal-version=4.1` emits them.\n"},
+    {"structured-exit", DECISION_DEVICE,
+     "A kernel's control flow was rebuilt with an exit variable",
+     "Metal has no `goto`, so the compiler rebuilds `if`, `while` and\n"
+     "`switch` from the kernel's control flow. A branch that leaves more\n"
+     "than one enclosing loop or block at once has no structured form, so it\n"
+     "sets a variable and breaks, and each enclosing construct tests the\n"
+     "variable on the way out.\n"},
+    {"helper-specialized", DECISION_DEVICE,
+     "A helper was compiled once for each address space",
+     "Metal has no generic address space. A helper that takes a plain `T*`\n"
+     "and is called with a workgroup address at one site and a device\n"
+     "address at another is emitted twice, once for each.\n"},
+    {"float64-narrowed", DECISION_DEVICE,
+     "A float64 computation runs in float32 on Metal",
+     "Apple GPUs have no double. Where every operand is a float32 value or\n"
+     "a literal that float32 holds exactly, and the result is only rounded\n"
+     "back to float32, the computation gives the same bits in float32, and\n"
+     "that is what is emitted. Anything else in float64 is refused.\n"},
+    {"dispatch", DECISION_DEVICE,
+     "A kernel launch",
+     "A `dispatch` statement launches a kernel. The report gives what the\n"
+     "compiler could fold at the site: the work items and the blocks they\n"
+     "make where the count is a constant, or the block size alone where the\n"
+     "count is read at run time.\n"},
 };
 
 #define DOCS_COUNT (sizeof(DOCS) / sizeof(DOCS[0]))
@@ -1736,6 +1904,8 @@ static const char *decision_group_title(DecisionGroup group) {
     return "Why a call was not inlined";
   case DECISION_APPLIED:
     return "What the optimizer applied";
+  case DECISION_DEVICE:
+    return "What a kernel became on the GPU";
   }
   return "Optimizer decisions";
 }
@@ -1778,6 +1948,8 @@ static const char *decision_group_slug(DecisionGroup group) {
     return "inline-refusal";
   case DECISION_APPLIED:
     return "applied";
+  case DECISION_DEVICE:
+    return "device";
   }
   return "other";
 }
@@ -1818,7 +1990,8 @@ static void print_code_list(void) {
   }
 
   const DecisionGroup groups[] = {DECISION_VECTOR_REFUSAL,
-                                  DECISION_INLINE_REFUSAL, DECISION_APPLIED};
+                                  DECISION_INLINE_REFUSAL, DECISION_APPLIED,
+                                  DECISION_DEVICE};
   for (size_t g = 0; g < sizeof(groups) / sizeof(groups[0]); g++) {
     printf("\n%s (--explain decision codes):\n",
            decision_group_title(groups[g]));

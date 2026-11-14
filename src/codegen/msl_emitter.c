@@ -4843,9 +4843,9 @@ static void emit_body(MslFn *fn) {
   if (structure.uses_exit) {
     line(fn, "int mtl_exit = 0;");
     report_note(fn, NULL, "control", "control flow", IR_DEVICE_FACT,
-                "rebuilt with an exit variable tested after each loop",
-                "a branch leaves more than one loop at once, and Metal has no "
-                "goto",
+                "rebuilt with an exit variable tested after each loop or block",
+                "a branch leaves more than one enclosing loop or block at "
+                "once, and Metal has no goto",
                 "structured-exit");
   }
   declare_locals(fn);
