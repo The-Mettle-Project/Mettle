@@ -24,7 +24,11 @@ typedef struct {
   uint64_t minimized_literals;
   uint64_t reductions;
   uint64_t original_clauses;
+  uint64_t eliminated;
 } SatStats;
+
+void sat_freeze(SatSolver *s, uint32_t var);
+void sat_set_preprocess(SatSolver *s, int enabled);
 
 SatSolver *sat_new(void);
 void sat_free(SatSolver *s);

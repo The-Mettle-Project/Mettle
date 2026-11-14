@@ -760,6 +760,10 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
         continue;
       }
       SmtTerm t1 = smt_arg(ctx, it, 1), t2 = smt_arg(ctx, it, 2);
+      if (smt_is_bvconst(ctx, t1) != smt_is_bvconst(ctx, t2)) {
+        return smt_ite(ctx, smt_arg(ctx, it, 0), smt_eq(ctx, t1, k),
+                       smt_eq(ctx, t2, k));
+      }
       if (!smt_is_bvconst(ctx, t1) || !smt_is_bvconst(ctx, t2)) {
         continue;
       }

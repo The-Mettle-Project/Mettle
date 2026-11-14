@@ -122,7 +122,7 @@ static int factor_cmp(const void *a, const void *b) {
 
 static void poly_mul(Poly *out, const Poly *a, const Poly *b) {
   poly_init(out, a->w);
-  if (!a->ok || !b->ok || (a->n != 1u && b->n != 1u) || a->n * b->n > 4u) {
+  if (!a->ok || !b->ok || a->n * b->n > 4u) {
     out->ok = 0;
     return;
   }

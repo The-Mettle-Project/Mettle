@@ -1,4 +1,5 @@
 #include "smt_internal.h"
+#include "smt_sat.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +55,8 @@ typedef struct {
   char error[512];
   int failed;
 } SmtLib;
+
+static int g_smtlib_normalize = 1;
 
 static void sx_free(Sx *s) {
   if (!s) {
@@ -802,6 +805,7 @@ static int run_command(SmtLib *lib, const Sx *s) {
     smt_solver_free(lib->last);
     SmtSolver *solver = smt_solver_new(ctx);
     smt_solver_set_certify(solver, lib->certify);
+    smt_solver_set_normalize(solver, g_smtlib_normalize);
     for (unsigned i = 0; i < lib->assert_count; i++) {
       smt_solver_assert(solver, lib->asserts[i]);
     }
@@ -882,13 +886,142 @@ static char *read_all(FILE *f) {
   return buf;
 }
 
+static int dimacs_run(const char *src, const char *path, int certify,
+                      int stats) {
+  SatSolver *sat = sat_new();
+  if (certify) {
+    sat_enable_proof(sat);
+  }
+  const char *p = src;
+  uint32_t vars = 0;
+  SatLit *clause = NULL;
+  size_t len = 0, cap = 0;
+  uint32_t *original = NULL;
+  size_t olen = 0, ocap = 0;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+      p++;
+    }
+    if (*p == 'c' || *p == '%') {
+      while (*p && *p != '\n') {
+        p++;
+      }
+      continue;
+    }
+    if (*p == 'p') {
+      while (*p && !isdigit((unsigned char)*p)) {
+        p++;
+      }
+      vars = (uint32_t)strtoull(p, (char **)&p, 10);
+      while (sat_var_count(sat) < vars) {
+        sat_new_var(sat);
+      }
+      while (*p && *p != '\n') {
+        p++;
+      }
+      continue;
+    }
+    if (!*p) {
+      break;
+    }
+    int neg = 0;
+    if (*p == '-') {
+      neg = 1;
+      p++;
+    }
+    if (!isdigit((unsigned char)*p)) {
+      fprintf(stderr, "%s: malformed DIMACS\n", path);
+      sat_free(sat);
+      free(clause);
+      free(original);
+      return 1;
+    }
+    uint64_t v = strtoull(p, (char **)&p, 10);
+    if (v == 0) {
+      sat_add_clause(sat, clause, (unsigned)len);
+      if (olen + len + 1 > ocap) {
+        ocap = (olen + len + 1) * 2;
+        original = realloc(original, ocap * sizeof(uint32_t));
+      }
+      original[olen++] = (uint32_t)len;
+      memcpy(original + olen, clause, len * sizeof(SatLit));
+      olen += len;
+      len = 0;
+      continue;
+    }
+    while (sat_var_count(sat) < v) {
+      sat_new_var(sat);
+    }
+    if (len == cap) {
+      cap = cap ? cap * 2 : 16;
+      clause = realloc(clause, cap * sizeof(SatLit));
+    }
+    clause[len++] = SAT_LIT((uint32_t)(v - 1), neg);
+  }
+  double t0 = smt_now_seconds();
+  int r = sat_solve(sat, 0);
+  double t1 = smt_now_seconds();
+  int status = 0;
+  if (r == SAT_RESULT_SAT) {
+    size_t i = 0;
+    int ok = 1;
+    while (i < olen && ok) {
+      uint32_t n = original[i++];
+      int sat_clause = 0;
+      for (uint32_t k = 0; k < n; k++) {
+        SatLit l = original[i + k];
+        sat_clause |= sat_value(sat, SAT_VAR(l)) != (int)SAT_SIGN(l);
+      }
+      ok = sat_clause;
+      i += n;
+    }
+    printf(ok ? "s SATISFIABLE\n" : "s UNKNOWN\nc model check failed\n");
+  } else if (r == SAT_RESULT_UNSAT) {
+    int ok = 1;
+    uint64_t checked = 0;
+    if (certify) {
+      SatProofView view;
+      sat_proof_view(sat, &view);
+      ok = sat_drup_check(&view, &checked);
+    }
+    printf(ok ? "s UNSATISFIABLE\n" : "s UNKNOWN\nc refutation check failed\n");
+    if (stats) {
+      fprintf(stderr, "c lemmas checked %llu in %.3f s\n",
+              (unsigned long long)checked, smt_now_seconds() - t1);
+    }
+  } else {
+    printf("s UNKNOWN\n");
+    status = 1;
+  }
+  if (stats) {
+    SatStats st;
+    sat_get_stats(sat, &st);
+    fprintf(stderr,
+            "c vars %u clauses %llu conflicts %llu decisions %llu "
+            "propagations %llu restarts %llu search %.3f s\n",
+            sat_var_count(sat), (unsigned long long)st.original_clauses,
+            (unsigned long long)st.conflicts,
+            (unsigned long long)st.decisions,
+            (unsigned long long)st.propagations,
+            (unsigned long long)st.restarts, t1 - t0);
+  }
+  sat_free(sat);
+  free(clause);
+  free(original);
+  return status;
+}
+
 int smtlib_main(int argc, char **argv) {
-  int certify = 1, stats = 0, status = 0, files = 0;
+  int certify = 1, stats = 0, status = 0, files = 0, dimacs = 0;
   for (int i = 0; i < argc; i++) {
     if (strcmp(argv[i], "--no-certify") == 0) {
       certify = 0;
     } else if (strcmp(argv[i], "--stats") == 0) {
       stats = 1;
+    } else if (strcmp(argv[i], "--dimacs") == 0) {
+      dimacs = 1;
+    } else if (strcmp(argv[i], "--no-normalize") == 0) {
+      g_smtlib_normalize = 0;
     }
   }
   for (int i = 0; i < argc; i++) {
@@ -905,6 +1038,12 @@ int smtlib_main(int argc, char **argv) {
     char *src = read_all(f);
     if (f != stdin) {
       fclose(f);
+    }
+    size_t plen = strlen(argv[i]);
+    if (dimacs || (plen > 4 && strcmp(argv[i] + plen - 4, ".cnf") == 0)) {
+      status |= dimacs_run(src, argv[i], certify, stats);
+      free(src);
+      continue;
     }
     status |= smtlib_run(src, argv[i], stdout, certify, stats);
     free(src);
