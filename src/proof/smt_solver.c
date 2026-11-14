@@ -38,6 +38,7 @@ struct SmtSolver {
   uint32_t count;
   uint32_t cap;
   int certify;
+  int normalize;
   uint64_t conflict_limit;
   const char *reason;
   SmtModel model;
@@ -234,8 +235,13 @@ SmtSolver *smt_solver_new(SmtCtx *ctx) {
   SmtSolver *s = calloc(1, sizeof(SmtSolver));
   s->ctx = ctx;
   s->certify = 1;
+  s->normalize = 1;
   smt_model_init(&s->model);
   return s;
+}
+
+void smt_solver_set_normalize(SmtSolver *s, int enabled) {
+  s->normalize = enabled;
 }
 
 void smt_solver_free(SmtSolver *s) {
@@ -400,6 +406,10 @@ SmtResult smt_solver_check(SmtSolver *s) {
   }
   Blaster b;
   blast_init(&b, ctx, sat);
+  if (s->normalize) {
+    lowered = smt_normalize(ctx, lowered);
+    constraints = smt_normalize(ctx, constraints);
+  }
   blast_assert(&b, lowered);
   blast_assert(&b, constraints);
   double t1 = smt_now_seconds();

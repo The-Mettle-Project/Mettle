@@ -156,6 +156,8 @@ void smt_solver_free(SmtSolver *solver);
 void smt_solver_assert(SmtSolver *solver, SmtTerm formula);
 void smt_solver_set_certify(SmtSolver *solver, int enabled);
 void smt_solver_set_conflict_limit(SmtSolver *solver, uint64_t limit);
+void smt_solver_set_normalize(SmtSolver *solver, int enabled);
+SmtTerm smt_normalize(SmtCtx *ctx, SmtTerm t);
 SmtResult smt_solver_check(SmtSolver *solver);
 const char *smt_solver_reason(const SmtSolver *solver);
 int smt_solver_value(SmtSolver *solver, SmtTerm t, uint64_t *words);
