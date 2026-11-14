@@ -338,6 +338,7 @@ typedef struct {
   int is_test;
   const char *numerics_contract;
   int is_host_twin;
+  int is_device_only;
   int is_swappable;
   int is_naked;
   int is_interrupt;

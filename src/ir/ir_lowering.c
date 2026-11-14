@@ -119,12 +119,12 @@ static void ir_mark_host_twins(IRProgram *program) {
     return;
   }
   char *device = calloc(count, 1);
-  char *twin = calloc(count, 1);
+  char *host = calloc(count, 1);
   size_t *stack = calloc(count, sizeof(*stack));
   size_t top = 0;
-  if (!device || !twin || !stack) {
+  if (!device || !host || !stack) {
     free(device);
-    free(twin);
+    free(host);
     free(stack);
     return;
   }
@@ -139,32 +139,45 @@ static void ir_mark_host_twins(IRProgram *program) {
   }
   for (size_t i = 0; i < count; i++) {
     IRFunction *function = program->functions[i];
-    if (!function || device[i]) {
-      continue;
-    }
-    for (size_t k = 0; k < function->instruction_count; k++) {
-      const IRInstruction *instruction = &function->instructions[k];
-      if (instruction->op != IR_OP_CALL || !instruction->text) {
-        continue;
-      }
-      int callee = ir_twin_index(program, instruction->text);
-      if (callee >= 0 && device[callee] && !twin[callee] &&
-          !program->functions[callee]->is_kernel) {
-        twin[callee] = 1;
-        stack[top++] = (size_t)callee;
-      }
+    if (function && !device[i] && !function->is_inline) {
+      host[i] = 1;
+      stack[top++] = i;
     }
   }
   while (top > 0) {
-    ir_twin_push_callees(program, stack[--top], twin, device, stack, &top);
+    ir_twin_push_callees(program, stack[--top], host, NULL, stack, &top);
   }
   for (size_t i = 0; i < count; i++) {
-    if (twin[i]) {
-      program->functions[i]->is_host_twin = 1;
+    IRFunction *function = program->functions[i];
+    if (!function || function->is_kernel || !device[i]) {
+      continue;
+    }
+    function->is_host_twin = host[i];
+    function->is_device_only = !host[i];
+  }
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    for (size_t i = 0; i < count; i++) {
+      IRFunction *function = program->functions[i];
+      if (!function || device[i] || host[i] || function->is_device_only) {
+        continue;
+      }
+      for (size_t k = 0; k < function->instruction_count; k++) {
+        const IRInstruction *instruction = &function->instructions[k];
+        int callee = instruction->op == IR_OP_CALL && instruction->text
+                         ? ir_twin_index(program, instruction->text)
+                         : -1;
+        if (callee >= 0 && program->functions[callee]->is_device_only) {
+          function->is_device_only = 1;
+          changed = 1;
+          break;
+        }
+      }
     }
   }
   free(device);
-  free(twin);
+  free(host);
   free(stack);
 }
 

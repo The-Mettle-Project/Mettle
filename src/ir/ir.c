@@ -1379,6 +1379,7 @@ IRFunction *ir_function_create(const char *name) {
   function->is_test = 0;
   function->numerics_contract = NULL;
   function->is_host_twin = 0;
+  function->is_device_only = 0;
   function->is_swappable = 0;
   function->is_naked = 0;
   function->is_interrupt = 0;
@@ -7121,7 +7122,8 @@ int ir_program_embed_device_image(IRProgram *program, const char *image,
   }
   for (size_t i = 0; i < program->function_count; i++) {
     IRFunction *fn = program->functions[i];
-    if (fn && fn->is_kernel && fn->instruction_count > 0) {
+    if (fn && ((fn->is_kernel && fn->instruction_count > 0) ||
+               fn->is_device_only)) {
       continue;
     }
     program->functions[kept++] = fn;
