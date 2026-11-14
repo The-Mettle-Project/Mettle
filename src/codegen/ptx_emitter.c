@@ -998,6 +998,44 @@ static void ptx_report_vector_decline(const IRFunction *func,
                               "vector-load-alignment");
 }
 
+static size_t ptx_vector_members(PtxFn *fn, const IRFunction *func,
+                                 const PtxVectorPlan *plan, size_t head,
+                                 const IROperand *base, long long offset,
+                                 size_t stride, size_t *members) {
+  size_t found = 1;
+  members[0] = head;
+  for (size_t j = head + 1; j < func->instruction_count && found < 4; j++) {
+    const IRInstruction *next = &func->instructions[j];
+    const IROperand *next_base = NULL;
+    long long next_offset = 0;
+    if (next->op == IR_OP_LOAD && !plan[j].absorbed) {
+      ptx_address_parts(fn, func, j, &next->lhs, &next_base, &next_offset);
+      if (next_base && base && next_base->name && base->name &&
+          next_base->kind == base->kind &&
+          strcmp(next_base->name, base->name) == 0 &&
+          next_offset == offset + (long long)(stride * found)) {
+        if (!ptx_member_can_move(func, head, j)) break;
+        members[found++] = j;
+        if (ptx_redefines(next, base)) break;
+        continue;
+      }
+    }
+    if (!ptx_vector_gap_is_safe(next)) break;
+    if (ptx_redefines(next, base)) break;
+  }
+  return found;
+}
+
+static void ptx_vector_declined(const IRFunction *func, size_t head,
+                                const IROperand *base,
+                                const MtlcType *pointer_type, size_t stride,
+                                size_t found, const size_t *members,
+                                unsigned char *declined) {
+  if (!declined || found < 2) return;
+  ptx_report_vector_decline(func, head, base, pointer_type, stride, found);
+  for (size_t k = 1; k < found; k++) declined[members[k]] = 1;
+}
+
 static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
                                             const IRProgram *program,
                                             const IRFunction *func) {
@@ -1030,36 +1068,15 @@ static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
       continue;
     stride = pointer_type->base_type->size;
     if (!stride || (size_t)offset % (stride * 2) != 0) continue;
-    members[0] = i;
-    for (size_t j = i + 1; j < func->instruction_count && found < 4; j++) {
-      const IRInstruction *next = &func->instructions[j];
-      const IROperand *next_base = NULL;
-      long long next_offset = 0;
-      if (next->op == IR_OP_LOAD && !plan[j].absorbed) {
-        ptx_address_parts(fn, func, j, &next->lhs, &next_base, &next_offset);
-        if (next_base && base && next_base->name && base->name &&
-            next_base->kind == base->kind &&
-            strcmp(next_base->name, base->name) == 0 &&
-            next_offset == offset + (long long)(stride * found)) {
-          if (!ptx_member_can_move(func, i, j)) break;
-          members[found++] = j;
-          if (ptx_redefines(next, base)) break;
-          continue;
-        }
-      }
-      if (!ptx_vector_gap_is_safe(next)) break;
-      if (ptx_redefines(next, base)) break;
-    }
+    found = ptx_vector_members(fn, func, plan, i, base, offset, stride, members);
     if (found >= 4 && pointer_type->pointee_align >= stride * 4 &&
         (size_t)offset % (stride * 4) == 0) {
       plan[i].width = 4;
     } else if (found >= 2 && pointer_type->pointee_align >= stride * 2) {
       plan[i].width = 2;
     } else {
-      if (declined && found >= 2) {
-        ptx_report_vector_decline(func, i, base, pointer_type, stride, found);
-        for (size_t k = 1; k < found; k++) declined[members[k]] = 1;
-      }
+      ptx_vector_declined(func, i, base, pointer_type, stride, found, members,
+                          declined);
       continue;
     }
     for (size_t k = 1; k < plan[i].width; k++) {
@@ -5503,6 +5520,40 @@ static void ptx_report_tensor_replay(PtxFn *fn, const IRInstruction *in,
                     "tensor-register-budget");
 }
 
+static void ptx_report_tensor_matmul(PtxFn *fn, const IRInstruction *in,
+                                     int have_native, int direct,
+                                     const PtxWmmaProfile *wmma,
+                                     const PtxMmaProfile *mma, int native_peak,
+                                     const char *native_reason) {
+  char headline[200], reason[320], fix[120];
+  int budget = ptx_tensor_tuple_budget(fn);
+  if (!fn->reported) return;
+  if (have_native) {
+    snprintf(headline, sizeof(headline),
+             "full tiles through %s %s %s, edge tiles one element at a time",
+             direct ? "mma.sync" : "wmma.mma",
+             direct ? mma->shape : wmma->shape,
+             direct ? ptx_mma_kind_name(mma) : wmma->a_type);
+    ptx_report_tensor(fn, in, IR_DEVICE_GOOD, headline, NULL, NULL,
+                      "tensor-instruction");
+    return;
+  }
+  if (native_peak > budget) {
+    snprintf(reason, sizeof(reason),
+             "the tensor instruction's accumulator takes %d registers, and "
+             "the tensor register budget is %d",
+             native_peak, budget);
+    snprintf(fix, sizeof(fix),
+             "raise the budget with --gpu-tensor-tuple-budget=%d", native_peak);
+  } else {
+    snprintf(reason, sizeof(reason), "no tensor instruction fits: %s",
+             native_reason);
+  }
+  ptx_report_tensor(fn, in, IR_DEVICE_MISS,
+                    "computed one element at a time by the whole warp", reason,
+                    native_peak > budget ? fix : NULL, "tensor-scalar-replay");
+}
+
 static const char *ptx_residency_scope_words(const IRInstruction *in) {
   const char *name = ptx_tensor_residency_name(in->tensor_residency_scope);
   if (name && strstr(name, "loop")) return "the loop";
@@ -7946,35 +7997,8 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
                   profile.c_registers;
     if (native_peak > ptx_tensor_tuple_budget(fn)) have_native = 0;
   }
-  if (!have_native && fn->reported) {
-    char reason[320], fix[120];
-    int over_budget = native_peak > ptx_tensor_tuple_budget(fn);
-    if (over_budget) {
-      snprintf(reason, sizeof(reason),
-               "the tensor instruction's accumulator takes %d registers, and "
-               "the tensor register budget is %d",
-               native_peak, ptx_tensor_tuple_budget(fn));
-      snprintf(fix, sizeof(fix),
-               "raise the budget with --gpu-tensor-tuple-budget=%d",
-               native_peak);
-    } else {
-      snprintf(reason, sizeof(reason), "no tensor instruction fits: %s",
-               native_reason);
-    }
-    ptx_report_tensor(fn, in, IR_DEVICE_MISS,
-                      "computed one element at a time by the whole warp",
-                      reason, over_budget ? fix : NULL, "tensor-scalar-replay");
-  } else if (fn->reported) {
-    char headline[200];
-    snprintf(headline, sizeof(headline),
-             "full tiles through %s %s %s, edge tiles one element at a time",
-             use_direct_mma ? "mma.sync" : "wmma.mma",
-             use_direct_mma ? direct_profile.shape : profile.shape,
-             use_direct_mma ? ptx_mma_kind_name(&direct_profile)
-                            : profile.a_type);
-    ptx_report_tensor(fn, in, IR_DEVICE_GOOD, headline, NULL, NULL,
-                      "tensor-instruction");
-  }
+  ptx_report_tensor_matmul(fn, in, have_native, use_direct_mma, &profile,
+                           &direct_profile, native_peak, native_reason);
   if (!have_native) {
     sb_printf(&fn->body,
               "\t// mtlc.tensor_matmul cooperative-only: %s\n",

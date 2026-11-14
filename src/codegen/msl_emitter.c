@@ -5143,6 +5143,39 @@ static void free_module(MslMod *m) {
   ir_gpu_call_graph_destroy(&m->graph);
 }
 
+static void report_begin(const MslMod *m) {
+  char profile[32];
+  snprintf(profile, sizeof(profile), "%d.%d", m->options.version_major,
+           m->options.version_minor);
+  ir_explain_device_begin("metal", profile);
+}
+
+static void report_specializations(const MslMod *m) {
+  for (size_t s = 0; s < m->nspecs && !m->error; s++) {
+    const IRFunction *func = m->specs[s].fn->func;
+    size_t copies = 0;
+    size_t first = s;
+    char headline[120];
+    for (size_t o = 0; o < m->nspecs; o++) {
+      if (m->specs[o].function_index == m->specs[s].function_index) {
+        copies++;
+        first = o < first ? o : first;
+      }
+    }
+    if (copies < 2 || first != s) {
+      continue;
+    }
+    snprintf(headline, sizeof(headline),
+             "compiled %zu times, once for each address space it is called "
+             "with",
+             copies);
+    ir_explain_device_note(func->name, func->location.line, "specialization",
+                           "helper", IR_DEVICE_FACT, headline,
+                           "Metal has no generic address space", NULL,
+                           "helper-specialized");
+  }
+}
+
 int msl_emit_program(IRProgram *program, FILE *out,
                      const MslEmitOptions *options, char **error) {
   MslMod m;
@@ -5200,10 +5233,7 @@ int msl_emit_program(IRProgram *program, FILE *out,
   }
   free(coherence);
   if (!m.error) {
-    char profile[32];
-    snprintf(profile, sizeof(profile), "%d.%d", m.options.version_major,
-             m.options.version_minor);
-    ir_explain_device_begin("metal", profile);
+    report_begin(&m);
     analyze_all(&m);
   }
   for (size_t s = 0; s < m.nspecs && !m.error; s++) {
@@ -5227,29 +5257,7 @@ int msl_emit_program(IRProgram *program, FILE *out,
       emit_helper(&m, spec, &helpers);
     }
   }
-  for (size_t s = 0; s < m.nspecs && !m.error; s++) {
-    const IRFunction *func = m.specs[s].fn->func;
-    size_t copies = 0;
-    size_t first = s;
-    char headline[120];
-    for (size_t o = 0; o < m.nspecs; o++) {
-      if (m.specs[o].function_index == m.specs[s].function_index) {
-        copies++;
-        first = o < first ? o : first;
-      }
-    }
-    if (copies < 2 || first != s) {
-      continue;
-    }
-    snprintf(headline, sizeof(headline),
-             "compiled %zu times, once for each address space it is called "
-             "with",
-             copies);
-    ir_explain_device_note(func->name, func->location.line, "specialization",
-                           "helper", IR_DEVICE_FACT, headline,
-                           "Metal has no generic address space", NULL,
-                           "helper-specialized");
-  }
+  report_specializations(&m);
   if (!m.error) {
     emit_prelude(&m, &prelude);
     fprintf(out, "#include <metal_stdlib>\n");

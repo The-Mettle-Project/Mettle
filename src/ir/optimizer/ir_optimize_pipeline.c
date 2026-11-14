@@ -814,6 +814,22 @@ static int ir_run_program_stage_for_each_function(
   return 1;
 }
 
+static void ir_explain_device_pipeline_end(const IRProgram *program,
+                                           const IRGpuCallGraph *graph,
+                                           int gpu_only, int ok) {
+  if (!gpu_only) {
+    ir_explain_set_device_functions(NULL, NULL);
+    return;
+  }
+  for (size_t i = 0; ok && graph->reachable && i < program->function_count;
+       i++) {
+    if (!graph->reachable[i]) continue;
+    ir_tensor_explain_declines(program->functions[i]);
+    ir_gpu_staging_explain_declines(program->functions[i]);
+  }
+  ir_explain_set_device_functions(program, graph->reachable);
+}
+
 static int ir_optimize_portable_program_pipeline(
     IRProgram *program, const IROptimizeOptions *options) {
   IRGpuCallGraph graph = {0};
@@ -901,13 +917,7 @@ static int ir_optimize_portable_program_pipeline(
     ok = 0;
   }
 
-  for (size_t i = 0; ok && gpu_only && i < program->function_count; i++) {
-    if (!graph.reachable || !graph.reachable[i]) continue;
-    ir_tensor_explain_declines(program->functions[i]);
-    ir_gpu_staging_explain_declines(program->functions[i]);
-  }
-  ir_explain_set_device_functions(gpu_only ? program : NULL,
-                                  gpu_only ? graph.reachable : NULL);
+  ir_explain_device_pipeline_end(program, &graph, gpu_only, ok);
 
   ir_explain_set_program(NULL);
   ir_gpu_call_graph_destroy(&graph);

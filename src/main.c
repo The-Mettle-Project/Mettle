@@ -6445,6 +6445,18 @@ static int compile_check_numerics(IRProgram *ir_program,
   return 1;
 }
 
+static void compile_explain_target(const CompilerOptions *options) {
+  ir_explain_set_target_name(options->emit_metal   ? "metal"
+                             : options->emit_ptx   ? "ptx"
+                             : options->emit_spirv ? "spirv"
+                                                   : mtlc_target()->triple);
+  if (options->explain_fragment) {
+    ir_explain_set_fragment(options->explain_fragment,
+                            options->emit_metal ? "kernels on Metal"
+                                                : "kernels on PTX");
+  }
+}
+
 static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
                                const CompilerOptions *options) {
   IROptimizeOptions ir_optimize_options = {0};
@@ -6471,15 +6483,7 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   ir_explain_set_output_path(options->output_filename);
   ir_explain_set_json(options->explain_json ? 1 : 0);
   ir_explain_set_text(options->explain_view ? 0 : 1);
-  ir_explain_set_target_name(options->emit_metal   ? "metal"
-                             : options->emit_ptx   ? "ptx"
-                             : options->emit_spirv ? "spirv"
-                                                   : mtlc_target()->triple);
-  if (options->explain_fragment) {
-    ir_explain_set_fragment(options->explain_fragment,
-                            options->emit_metal ? "kernels on Metal"
-                                                : "kernels on PTX");
-  }
+  compile_explain_target(options);
   {
     static char *source_path = NULL;
     free(source_path);

@@ -3895,6 +3895,50 @@ static void ir_explain_drop_launch_calls(size_t line) {
   g_remark_count = kept;
 }
 
+static void ir_explain_hide_empty_host(size_t start) {
+  if (g_explain_host_empty) {
+    g_report_len = start;
+  }
+}
+
+static void ir_explain_fragment_trim(size_t end) {
+  if (g_explain_fragment) {
+    g_report_len = end;
+  }
+}
+
+static void ir_explain_no_remarks(size_t start) {
+  if (ir_explain_skips_empty_sections()) {
+    g_report_len = start;
+    g_plan_pending = 0;
+  } else {
+    ir_explain_emit("  (no loops or calls to report)\n\n");
+  }
+}
+
+static void ir_explain_drop_host_remarks(void) {
+  size_t kept = 0;
+  if (!g_device_filter) {
+    return;
+  }
+  for (size_t i = 0; i < g_remark_count; i++) {
+    if (!ir_explain_function_on_device(g_remarks[i].function_name)) {
+      ir_explain_remark_free_one(&g_remarks[i]);
+      continue;
+    }
+    g_remarks[kept++] = g_remarks[i];
+  }
+  g_remark_count = kept;
+}
+
+static const char *ir_explain_plain_kind(const IRExplainRemark *r) {
+  if (r->entity && strncmp(r->entity, "dispatch ", 9) == 0) {
+    return "dispatch";
+  }
+  return r->entity && strcmp(r->entity, "function") == 0 ? "function"
+                                                          : "other";
+}
+
 static void ir_explain_dispatch_remarks(void) {
   for (size_t i = 0; i < g_dispatch_count; i++) {
     IRExplainDispatch *note = &g_dispatches[i];
@@ -3961,17 +4005,7 @@ void ir_explain_flush(void) {
     return;
   }
 
-  if (g_device_filter) {
-    size_t kept = 0;
-    for (size_t i = 0; i < g_remark_count; i++) {
-      if (!ir_explain_function_on_device(g_remarks[i].function_name)) {
-        ir_explain_remark_free_one(&g_remarks[i]);
-        continue;
-      }
-      g_remarks[kept++] = g_remarks[i];
-    }
-    g_remark_count = kept;
-  }
+  ir_explain_drop_host_remarks();
   ir_explain_dispatch_remarks();
 
   size_t section_start = g_report_len;
@@ -3989,11 +4023,8 @@ void ir_explain_flush(void) {
   ir_explain_json_raw("\"remarks\":[");
 
   size_t shown_remarks = 0;
-  if (g_remark_count == 0 && ir_explain_skips_empty_sections()) {
-    g_report_len = section_start;
-    g_plan_pending = 0;
-  } else if (g_remark_count == 0) {
-    ir_explain_emit("  (no loops or calls to report)\n\n");
+  if (g_remark_count == 0) {
+    ir_explain_no_remarks(section_start);
   } else {
     char *suppressed = calloc(g_remark_count, 1);
     for (size_t i = 0; i < g_remark_count; i++) {
@@ -4091,14 +4122,9 @@ void ir_explain_flush(void) {
         ir_explain_entity_callee(r->entity, callee, sizeof(callee));
         ir_explain_json_remark(r, "call", callee, 1, 0, NULL,
                                &json_remark_count);
-      } else if (r->entity && strncmp(r->entity, "dispatch ", 9) == 0) {
-        ir_explain_json_remark(r, "dispatch", NULL, 1, 0, NULL,
-                               &json_remark_count);
       } else {
-        ir_explain_json_remark(
-            r, r->entity && strcmp(r->entity, "function") == 0 ? "function"
-                                                               : "other",
-            NULL, 1, 0, NULL, &json_remark_count);
+        ir_explain_json_remark(r, ir_explain_plain_kind(r), NULL, 1, 0, NULL,
+                               &json_remark_count);
       }
     }
     free(suppressed);
@@ -4147,9 +4173,7 @@ void ir_explain_flush(void) {
   ir_explain_memory_flush();
   ir_explain_ownership_flush();
   ir_explain_ledger_flush();
-  if (g_explain_fragment) {
-    g_report_len = remarks_end;
-  }
+  ir_explain_fragment_trim(remarks_end);
 }
 
 static void ir_explain_release_remarks(void) {
@@ -4444,6 +4468,44 @@ static int ir_explain_write_fragment_text(void) {
   return out != NULL;
 }
 
+static void ir_explain_write_json(void) {
+  char *json_path;
+  FILE *out;
+  if (!g_explain_json || !g_json_buf) {
+    return;
+  }
+  json_path = g_explain_fragment
+                  ? ir_explain_fragment_path(g_explain_fragment, ".json")
+                  : ir_explain_derived_path(".explain.json");
+  out = json_path ? fopen(json_path, "wb") : NULL;
+  if (out) {
+    const char *source = g_explain_focus_file
+                             ? ir_explain_path_basename(g_explain_focus_file)
+                             : "";
+    fputs("{\"schema\":3,\"target\":", out);
+    ir_explain_json_file_str(out, g_explain_target);
+    fputs(",\"source\":", out);
+    ir_explain_json_file_str(out, source);
+    fputs(",\"path\":", out);
+    ir_explain_json_file_str(out, g_explain_source_path ? g_explain_source_path
+                                                        : g_explain_focus_file);
+    fputc(',', out);
+    fwrite(g_json_buf, 1, g_json_len, out);
+    fprintf(out,
+            "\"stats\":{\"loopsVectorized\":%zu,\"loopsScalar\":%zu,"
+            "\"fixesVerified\":%zu,\"callsInlined\":%zu,"
+            "\"callsRefused\":%zu,\"changesImproved\":%zu,"
+            "\"changesRegressed\":%zu,\"hadBaseline\":%s}}\n",
+            g_digest.loops_vectorized, g_digest.loops_scalar,
+            g_digest.fixes_verified, g_digest.calls_inlined,
+            g_digest.calls_refused, g_digest.changes_improved,
+            g_digest.changes_regressed,
+            g_digest.had_baseline ? "true" : "false");
+    fclose(out);
+  }
+  free(json_path);
+}
+
 void ir_explain_finalize(int force_stderr) {
   if (g_explain_quiet) {
     g_report_len = 0;
@@ -4475,41 +4537,7 @@ void ir_explain_finalize(int force_stderr) {
     }
   }
 
-  if (g_explain_json && g_json_buf) {
-    char *json_path = g_explain_fragment
-                          ? ir_explain_fragment_path(g_explain_fragment, ".json")
-                          : ir_explain_derived_path(".explain.json");
-    if (json_path) {
-      FILE *out = fopen(json_path, "wb");
-      if (out) {
-        const char *source = g_explain_focus_file
-                                 ? ir_explain_path_basename(g_explain_focus_file)
-                                 : "";
-        fputs("{\"schema\":3,\"target\":", out);
-        ir_explain_json_file_str(out, g_explain_target);
-        fputs(",\"source\":", out);
-        ir_explain_json_file_str(out, source);
-        fputs(",\"path\":", out);
-        ir_explain_json_file_str(out, g_explain_source_path
-                                          ? g_explain_source_path
-                                          : g_explain_focus_file);
-        fputc(',', out);
-        fwrite(g_json_buf, 1, g_json_len, out);
-        fprintf(out,
-                "\"stats\":{\"loopsVectorized\":%zu,\"loopsScalar\":%zu,"
-                "\"fixesVerified\":%zu,\"callsInlined\":%zu,"
-                "\"callsRefused\":%zu,\"changesImproved\":%zu,"
-                "\"changesRegressed\":%zu,\"hadBaseline\":%s}}\n",
-                g_digest.loops_vectorized, g_digest.loops_scalar,
-                g_digest.fixes_verified, g_digest.calls_inlined,
-                g_digest.calls_refused, g_digest.changes_improved,
-                g_digest.changes_regressed,
-                g_digest.had_baseline ? "true" : "false");
-        fclose(out);
-      }
-      free(json_path);
-    }
-  }
+  ir_explain_write_json();
   free(g_json_buf);
   g_json_buf = NULL;
   g_json_len = 0;
@@ -4942,13 +4970,12 @@ void ir_explain_backend_flush(void) {
       ok_count, g_backend_count, total_instructions, ok_instructions);
   size_t json_group_count = 0;
 
-  int show_backend = g_backend_count > 0 || !g_explain_host_empty;
-  if (show_backend) {
-    ir_explain_print_header("backend report");
-  }
-  if (show_backend && g_backend_count == 0) {
+  size_t backend_start = g_report_len;
+  ir_explain_print_header("backend report");
+  if (g_backend_count == 0) {
     ir_explain_emit("  (no functions reached native codegen)\n\n");
-  } else if (show_backend) {
+    ir_explain_hide_empty_host(backend_start);
+  } else {
     ir_explain_emit(
         "  %zu/%zu functions reaching codegen (after inlining) compiled with "
         "the register-allocating backend\n",
