@@ -849,10 +849,60 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
     }
     return 0;
   case SMT_K_BVUDIV:
-    if (smt_const_is_one(ctx, b)) {
-      return a;
+  case SMT_K_BVUREM: {
+    unsigned w = ctx->sorts[sort].width;
+    if (!smt_is_bvconst(ctx, b)) {
+      return 0;
     }
-    return 0;
+    const SmtBits *c = smt_bits_of(ctx, b);
+    unsigned ones = 0, at = 0;
+    for (unsigned i = 0; i < w; i++) {
+      if (smt_bits_get(c, i)) {
+        ones++;
+        at = i;
+      }
+    }
+    if (ones != 1u) {
+      return 0;
+    }
+    if (kind == SMT_K_BVUDIV) {
+      return at == 0 ? a : smt_mk2(ctx, SMT_K_BVLSHR, a, smt_bv_u64(ctx, w, at));
+    }
+    if (at == 0) {
+      return smt_bv_u64(ctx, w, 0);
+    }
+    SmtBits mask;
+    smt_bits_sub(&mask, c, &(SmtBits){{1, 0, 0, 0}}, w);
+    return smt_mk2(ctx, SMT_K_BVAND, a, smt_bv_words(ctx, w, mask.w));
+  }
+  case SMT_K_BVSDIV:
+  case SMT_K_BVSREM: {
+    unsigned w = ctx->sorts[sort].width;
+    if (!smt_is_bvconst(ctx, b)) {
+      return 0;
+    }
+    const SmtBits *c = smt_bits_of(ctx, b);
+    int negative = smt_bits_get(c, w - 1u);
+    SmtBits mag = *c;
+    if (negative) {
+      smt_bits_neg(&mag, c, w);
+    }
+    SmtTerm m = smt_bv_words(ctx, w, mag.w);
+    SmtTerm zero = smt_bv_u64(ctx, w, 0);
+    SmtTerm a_neg = smt_mk2(ctx, SMT_K_BVSLT, a, zero);
+    SmtTerm abs_a = smt_mk1(ctx, SMT_K_BVNEG, a);
+    if (kind == SMT_K_BVSREM) {
+      SmtTerm on_neg = smt_mk1(ctx, SMT_K_BVNEG,
+                               smt_mk2(ctx, SMT_K_BVUREM, abs_a, m));
+      return smt_ite(ctx, a_neg, on_neg, smt_mk2(ctx, SMT_K_BVUREM, a, m));
+    }
+    SmtTerm q_neg = smt_mk2(ctx, SMT_K_BVUDIV, abs_a, m);
+    SmtTerm q_pos = smt_mk2(ctx, SMT_K_BVUDIV, a, m);
+    if (negative) {
+      return smt_ite(ctx, a_neg, q_neg, smt_mk1(ctx, SMT_K_BVNEG, q_pos));
+    }
+    return smt_ite(ctx, a_neg, smt_mk1(ctx, SMT_K_BVNEG, q_neg), q_pos);
+  }
   case SMT_K_BVSHL:
   case SMT_K_BVLSHR:
   case SMT_K_BVASHR:

@@ -1,5 +1,6 @@
 #include "ir_optimize_internal.h"
 #include "../../common.h"
+#include "../ir_smt.h"
 
 typedef enum {
   RWP_VAR,
@@ -95,6 +96,22 @@ static const IRBinaryIdentity g_binary_identities[] = {
     {"&&", P_ANY, P_INT(0), 1, A_INT(0)},
     {"||", P_ANY, P_NZ, 1, A_INT(1)},
 };
+
+size_t ir_rewrite_identity_count(void) {
+  return IR_ARRAY_COUNT(g_binary_identities);
+}
+
+void ir_rewrite_identity_row(size_t k, IRIdentityRow *row) {
+  const IRBinaryIdentity *rule = &g_binary_identities[k];
+  row->op = rule->op;
+  row->a_kind = (int)rule->a.kind;
+  row->a_value = rule->a.value;
+  row->b_kind = (int)rule->b.kind;
+  row->b_value = rule->b.value;
+  row->commutative = rule->commutative;
+  row->act_kind = (int)rule->act.kind;
+  row->act_value = rule->act.value;
+}
 
 static int rw_pow2_shift(long long value, long long *shift) {
   if (value <= 0) {

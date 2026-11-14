@@ -60,6 +60,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ir/ir_smt.h"
 #include "proof/smt.h"
 #if !defined(_WIN32) || defined(__MINGW32__)
 #include <sys/time.h>
@@ -5060,6 +5061,15 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "smt") == 0) {
       return smtlib_main(argc - 2, argv + 2);
+    }
+    if (strcmp(argv[1], "prove-compiler") == 0) {
+      int verbose = argc > 2 && strcmp(argv[2], "--quiet") != 0;
+      if (argc <= 2) {
+        verbose = 1;
+      }
+      printf("Peephole identities in src/ir/optimizer/ir_optimize_rewrite.c, "
+             "proved against the IR semantics of src/ir/ir_interp.c:\n");
+      return ir_smt_prove_identity_table(stdout, verbose) ? 0 : 1;
     }
     if (strcmp(argv[1], "why") == 0) {
       if (argc < 5) {
