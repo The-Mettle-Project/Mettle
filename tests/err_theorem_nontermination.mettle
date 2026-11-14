@@ -1,0 +1,9 @@
+fn spin(n: int64) -> int64 {
+    return spin(n) + 1;
+}
+
+theorem false_from_a_loop(n: int64) {
+    spin(n) == spin(n) + 1
+} by auto;
+
+fn main() -> int32 { return 0; }

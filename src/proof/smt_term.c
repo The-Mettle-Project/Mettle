@@ -702,6 +702,14 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
     if (smt_is_not_of(ctx, a, b)) {
       return ctx->bool_true;
     }
+    for (int side = 0; side < 2; side++) {
+      SmtTerm x = side ? b : a, y = side ? a : b;
+      if (ctx->nodes[y].kind == SMT_K_OR &&
+          (smt_is_not_of(ctx, x, smt_arg(ctx, y, 0)) ||
+           smt_is_not_of(ctx, x, smt_arg(ctx, y, 1)))) {
+        return ctx->bool_true;
+      }
+    }
     if (ctx->nodes[a].kind == SMT_K_AND && ctx->nodes[b].kind == SMT_K_AND) {
       SmtTerm a0 = smt_arg(ctx, a, 0), a1 = smt_arg(ctx, a, 1);
       SmtTerm b0 = smt_arg(ctx, b, 0), b1 = smt_arg(ctx, b, 1);

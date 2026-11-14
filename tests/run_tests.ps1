@@ -1121,6 +1121,34 @@ $cases = @(
     Pattern       = 'its `from` side must apply an operator, a cast or a call'
   },
   @{
+    Name          = "theorem_proofs"
+    Path          = "tests/theorem_proofs.mettle"
+    ShouldSucceed = $true
+    Args          = @()
+  },
+  @{
+    Name          = "err_theorem_counterexample"
+    Path          = "tests/err_theorem_counterexample.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'theorem `abs_is_nonnegative`: auto could not close the goal; .*fails at x = -2147483648'
+  },
+  @{
+    Name          = "err_theorem_nontermination"
+    Path          = "tests/err_theorem_nontermination.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = '`spin` has no definition the prover can use: no parameter decreases at every recursive call'
+  },
+  @{
+    Name          = "err_theorem_unproved"
+    Path          = "tests/err_theorem_unproved.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = '`twice_is_odd` is not proved, so it cannot be used'
+    OutputMustMatch = @('theorem `stops_early`: the proof ends with 1 goal left')
+  },
+  @{
     # Without -O the rules are parsed, type-checked and dropped.
     Name          = "rewrite_rules_debug_build"
     Path          = "tests/rewrite_rules.mettle"
@@ -4760,6 +4788,29 @@ try {
 catch {
   $failed++
   Write-CaseResult -Name "why_explains_a_fact_that_held" -Passed $false -Reason $_.Exception.Message
+}
+
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  $out = & $CompilerPath prove "tests/theorem_proofs.mettle" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "mettle prove failed: $out" }
+  if ($out -notmatch "theorem gauss: proved") { throw "no report for gauss: $out" }
+  if ($out -notmatch "11 of 11 theorems proved") { throw "not every theorem proved: $out" }
+  $out = "unfold sum_to`nsmt`n" | & $CompilerPath prove "tests/theorem_proofs.mettle" --interactive gauss 2>&1 | Out-String
+  if ($out -notmatch "theorem gauss, interactive") { throw "interactive mode did not start: $out" }
+  $out = & $CompilerPath prove-compiler --quiet 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "a peephole identity was refuted: $out" }
+  if ($out -notmatch "30 identities, 570 obligations .* 0 refuted") { throw "identity proof summary changed: $out" }
+  $out = & $CompilerPath smt "tests/smt_bitvector.smt2" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "mettle smt failed: $out" }
+  $expected = "strength reduction\s+unsat\s+magic division without the fixup\s+sat\s+\(\(x #x6fffffff\)\)\s+read over write\s+unsat\s+uninterpreted function congruence\s+unsat\s+a satisfiable store\s+sat"
+  if ($out -notmatch $expected) { throw "mettle smt answers changed: $out" }
+  Write-CaseResult -Name "prove_and_smt_commands" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "prove_and_smt_commands" -Passed $false -Reason $_.Exception.Message
 }
 
 # A reference twin is a claim the build checks by running both. Enforce: a pair

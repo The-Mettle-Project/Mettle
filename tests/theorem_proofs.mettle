@@ -1,0 +1,120 @@
+fn abs_branchy(x: int32) -> int32 {
+    if (x < 0) { return -x; }
+    return x;
+}
+
+fn abs_branchless(x: int32) -> int32 {
+    var mask: int32 = x >> 31;
+    return (x ^ mask) - mask;
+}
+
+theorem abs_lowering(x: int32) {
+    abs_branchless(x) == abs_branchy(x)
+} by auto;
+
+fn min_branchy(x: int64, y: int64) -> int64 {
+    if (x < y) { return x; }
+    return y;
+}
+
+fn min_branchless(x: int64, y: int64) -> int64 {
+    var less: int64 = 0;
+    if (x < y) { less = 1; }
+    return y ^ ((x ^ y) & -less);
+}
+
+theorem min_lowering(x: int64, y: int64) {
+    min_branchless(x, y) == min_branchy(x, y)
+} by auto;
+
+theorem multiply_by_nine(x: int64) {
+    x * 9 == (x << 3) + x
+} by smt;
+
+theorem unsigned_remainder_by_eight(x: uint64) {
+    x % 8 == (x & 7)
+} by smt;
+
+theorem signed_half_rounds_toward_zero(x: int64) where x >= 0 {
+    x / 2 == x >> 1
+} by smt;
+
+fn rot1(x: uint32) -> uint32 {
+    return (x << 1) | (x >> 31);
+}
+
+fn rotl_steps(x: uint32, k: uint32) -> uint32 {
+    if (k == 0) { return x; }
+    return rotl_steps(rot1(x), k - 1);
+}
+
+theorem rotate_by_steps_is_rotate(x: uint32, k: uint32) where k > 0 && k < 32 {
+    rotl_steps(x, k) == ((x << k) | (x >> (32 - k)))
+} proof {
+    induction k;
+    cases k == 1;
+    unfold rotl_steps;
+    unfold rotl_steps;
+    auto;
+    auto;
+}
+
+fn mul_by_shifts(x: uint64, c: uint64) -> uint64 {
+    if (c == 0) { return 0; }
+    var rest: uint64 = mul_by_shifts(x << 1, c >> 1);
+    if ((c & 1) == 1) { return rest + x; }
+    return rest;
+}
+
+theorem mul_splits_low_bit(x: uint64, c: uint64) {
+    x * c == (x << 1) * (c >> 1) + x * (c & 1)
+} by smt;
+
+theorem mul_by_shifts_is_mul(x: uint64, c: uint64) {
+    mul_by_shifts(x, c) == x * c
+} proof {
+    induction c;
+    use mul_splits_low_bit(x, c);
+    auto;
+}
+
+fn sum_to(n: uint64) -> uint64 {
+    if (n == 0) { return 0; }
+    return n + sum_to(n - 1);
+}
+
+theorem gauss(n: uint64) {
+    2 * sum_to(n) == n * (n + 1)
+} proof {
+    induction n;
+    auto;
+}
+
+fn popcount_loop_free(x: uint32) -> uint32 {
+    var a: uint32 = x - ((x >> 1) & 1431655765);
+    var b: uint32 = (a & 858993459) + ((a >> 2) & 858993459);
+    var c: uint32 = (b + (b >> 4)) & 252645135;
+    return (c * 16843009) >> 24;
+}
+
+fn popcount_rec(x: uint32) -> uint32 {
+    if (x == 0) { return 0; }
+    return (x & 1) + popcount_rec(x >> 1);
+}
+
+theorem popcount_of_zero_and_one() {
+    popcount_loop_free(0) == 0 && popcount_loop_free(1) == 1
+} by auto;
+
+theorem popcount_stays_small(x: uint32) {
+    popcount_loop_free(x) <= 32
+} by auto;
+
+fn main() -> int32 {
+    if (abs_branchless(-5) != 5) { return 1; }
+    if (mul_by_shifts(6, 7) != 42) { return 2; }
+    if (sum_to(10) != 55) { return 3; }
+    if (rotl_steps(1, 3) != 8) { return 4; }
+    if (popcount_loop_free(255) != 8) { return 5; }
+    return 0;
+}

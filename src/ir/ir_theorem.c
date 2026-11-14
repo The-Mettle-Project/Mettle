@@ -1282,7 +1282,7 @@ static int prove_theorem(Prover *p, ThmEntry *t, const char *script) {
       char line[600];
       snprintf(line, sizeof(line), "%zu:%zu %s", p->line, p->column, buf);
       p->failed = 0;
-      if (run_tactic(p, line)) {
+      if (run_tactic(p, line) && strncmp(buf, "show", 4) != 0) {
         prover_print_goals(p, stdout);
       }
       ok = 1;

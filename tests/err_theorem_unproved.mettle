@@ -1,0 +1,20 @@
+fn twice(x: int64) -> int64 { return x + x; }
+
+theorem twice_is_odd(x: int64) {
+    twice(x) % 2 == 1
+} by auto;
+
+theorem leans_on_a_false_lemma(x: int64) {
+    twice(x) != 4
+} proof {
+    use twice_is_odd(x);
+    auto;
+}
+
+theorem stops_early(n: uint64) {
+    twice((int64)n) >= 0
+} proof {
+    induction n;
+}
+
+fn main() -> int32 { return 0; }

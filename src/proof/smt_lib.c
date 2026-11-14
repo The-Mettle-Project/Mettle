@@ -851,7 +851,13 @@ static int run_command(SmtLib *lib, const Sx *s) {
     return 1;
   }
   if (strcmp(cmd, "echo") == 0 && s->count == 2) {
-    fprintf(lib->out, "%s\n", s->items[1]->atom ? s->items[1]->atom : "");
+    const char *text = s->items[1]->atom ? s->items[1]->atom : "";
+    size_t len = strlen(text);
+    if (len >= 2 && text[0] == '"' && text[len - 1] == '"') {
+      fprintf(lib->out, "%.*s\n", (int)(len - 2), text + 1);
+    } else {
+      fprintf(lib->out, "%s\n", text);
+    }
     return 1;
   }
   lib_error(lib, s, "unsupported command %s", cmd);

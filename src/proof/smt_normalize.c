@@ -122,7 +122,7 @@ static int factor_cmp(const void *a, const void *b) {
 
 static void poly_mul(Poly *out, const Poly *a, const Poly *b) {
   poly_init(out, a->w);
-  if (!a->ok || !b->ok || a->n != 1u || b->n != 1u) {
+  if (!a->ok || !b->ok || (a->n != 1u && b->n != 1u) || a->n * b->n > 4u) {
     out->ok = 0;
     return;
   }
@@ -435,6 +435,38 @@ static int split_variable(SmtCtx *ctx, Poly *p) {
   return ok;
 }
 
+static SmtTerm normalize_eq(Norm *nm, SmtTerm a, SmtTerm b, int split);
+
+static SmtTerm lift_ite(Norm *nm, const Poly *p, SmtTerm a, SmtTerm b,
+                        int split) {
+  SmtCtx *ctx = nm->ctx;
+  if (nm->depth >= 3) {
+    return 0;
+  }
+  for (unsigned i = 0; i < p->n; i++) {
+    for (uint32_t f = 0; f < p->m[i].nf; f++) {
+      SmtTerm it = p->m[i].f[f];
+      if (smt_term_kind(ctx, it) != SMT_K_ITE ||
+          !smt_sort_is_bv(ctx, smt_term_sort(ctx, it))) {
+        continue;
+      }
+      SmtTerm c = smt_term_arg(ctx, it, 0);
+      SmtTerm t = smt_term_arg(ctx, it, 1);
+      SmtTerm e = smt_term_arg(ctx, it, 2);
+      nm->depth++;
+      SmtTerm at = smt_replace(ctx, a, 1, &it, &t);
+      SmtTerm bt = smt_replace(ctx, b, 1, &it, &t);
+      SmtTerm ae = smt_replace(ctx, a, 1, &it, &e);
+      SmtTerm be = smt_replace(ctx, b, 1, &it, &e);
+      SmtTerm yes = normalize_eq(nm, at, bt, split);
+      SmtTerm no = normalize_eq(nm, ae, be, split);
+      nm->depth--;
+      return smt_ite(ctx, c, yes, no);
+    }
+  }
+  return 0;
+}
+
 static SmtTerm normalize_eq(Norm *nm, SmtTerm a, SmtTerm b, int split) {
   SmtCtx *ctx = nm->ctx;
   unsigned w = smt_width(ctx, a);
@@ -447,6 +479,14 @@ static SmtTerm normalize_eq(Norm *nm, SmtTerm a, SmtTerm b, int split) {
   poly_scale(q, &minus);
   poly_add(p, q);
   SmtTerm out = 0;
+  if (p->ok) {
+    SmtTerm lifted = lift_ite(nm, p, a, b, split);
+    if (lifted) {
+      free(p);
+      free(q);
+      return lifted;
+    }
+  }
   if (p->ok && split) {
     Poly *saved = malloc(sizeof(Poly));
     *saved = *p;

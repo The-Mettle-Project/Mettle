@@ -1,0 +1,10 @@
+fn abs_value(x: int32) -> int32 {
+    if (x < 0) { return -x; }
+    return x;
+}
+
+theorem abs_is_nonnegative(x: int32) {
+    abs_value(x) >= 0
+} by auto;
+
+fn main() -> int32 { return abs_value(-3); }
