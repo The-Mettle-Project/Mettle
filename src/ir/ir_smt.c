@@ -1355,8 +1355,9 @@ static void irs_step(IrsEnc *e, size_t pc) {
                         insn->dest.name
                     ? &e->vars[irs_var_lookup(e, insn->dest.name, 1)]
                     : NULL;
-    if (d && d->addr && !d->slot) {
-      SmtTerm base = d->addr;
+    if (d && ((d->addr && !d->slot) || (d->param && d->aggregate))) {
+      SmtTerm base =
+          d->addr ? d->addr : e->env[irs_var_lookup(e, insn->dest.name, 1)];
       SmtTerm source = irs_read(e, &insn->lhs);
       if (irs_holds_aggregate(e, &insn->lhs) || d->region_size > 8u) {
         irs_copy_bytes(e, base, source, (long long)d->region_size);
@@ -1516,7 +1517,7 @@ static void irs_step(IrsEnc *e, size_t pc) {
       irs_write(e, &insn->dest, v->addr);
       return;
     }
-    if (v->addr && e->env[id]) {
+    if ((v->addr || (v->aggregate && v->param)) && e->env[id]) {
       irs_write(e, &insn->dest, e->env[id]);
       return;
     }
@@ -1697,8 +1698,19 @@ static int irs_run(IrsEnc *e) {
     int size = 8, is_unsigned = 0;
     const char *type = fn->parameter_types ? fn->parameter_types[i] : NULL;
     if (type && !irs_parse_scalar(type, &size, &is_unsigned)) {
-      irs_fail(e, "a parameter has type", type);
-      return 0;
+      const MtlcType *pt =
+          e->frame->program ? ir_program_lookup_type(e->frame->program, type)
+                            : NULL;
+      if (!pt || pt->size == 0 ||
+          (pt->kind != MTLC_TYPE_STRUCT && pt->kind != MTLC_TYPE_ARRAY &&
+           pt->kind != MTLC_TYPE_TAGGED_ENUM)) {
+        irs_fail(e, "a parameter has type", type);
+        return 0;
+      }
+      size = 8;
+      is_unsigned = 1;
+      e->vars[id].aggregate = 1;
+      e->vars[id].region_size = (uint64_t)pt->size;
     }
     e->vars[id].param = 1;
     e->vars[id].size = size;
@@ -1753,7 +1765,7 @@ static int irs_run(IrsEnc *e) {
     size_t id = irs_var_lookup(e, fn->parameter_names[i], 0);
     e->env[id] = ir_smt_narrow(ctx, e->params[i], e->vars[id].size,
                                e->vars[id].is_unsigned);
-    if (e->vars[id].addressed) {
+    if (e->vars[id].addressed && !e->vars[id].aggregate) {
       e->vars[id].addr =
           irs_region(e, fn->parameter_names[i], (uint64_t)e->vars[id].size,
                      !e->vars[id].escaped);
