@@ -1,0 +1,997 @@
+import "std/io";
+import "std/mem";
+import "std/math";
+import "std/gpu";
+import "std/ui";
+import "fire_sim";
+import "fire_render";
+
+struct Bitmap {
+  size: uint32;
+  width: int32;
+  height: int32;
+  planes: uint16;
+  bits: uint16;
+  compression: uint32;
+  image_size: uint32;
+  xppm: int32;
+  yppm: int32;
+  used: uint32;
+  important: uint32;
+}
+
+struct Monitor {
+  size: uint32;
+  monitor: UiRect;
+  work: UiRect;
+  flags: uint32;
+}
+
+struct Level {
+  x: float32*;
+  b: float32*;
+  r: float32*;
+  flags: uint8*;
+  nx: int32;
+  ny: int32;
+  nz: int32;
+}
+
+extern fn W_StretchDIBits(hdc: int64, xd: int32, yd: int32, wd: int32, hd: int32, xs: int32, ys: int32,
+                          ws: int32, hs: int32, bits: rawptr, info: Bitmap*, usage: uint32, rop: uint32) -> int32 = "StretchDIBits";
+extern fn W_QueryPerformanceCounter(counter: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn W_QueryPerformanceFrequency(frequency: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn W_AttachConsole(process: uint32) -> int32 = "AttachConsole";
+extern fn W_SetCapture(hwnd: int64) -> int64 = "SetCapture";
+extern fn W_ReleaseCapture() -> int32 = "ReleaseCapture";
+extern fn W_GetWindowLongPtrA(hwnd: int64, index: int32) -> int64 = "GetWindowLongPtrA";
+extern fn W_SetWindowLongPtrA(hwnd: int64, index: int32, value: int64) -> int64 = "SetWindowLongPtrA";
+extern fn W_MonitorFromWindow(hwnd: int64, flags: uint32) -> int64 = "MonitorFromWindow";
+extern fn W_GetMonitorInfoA(monitor: int64, info: Monitor*) -> int32 = "GetMonitorInfoA";
+extern fn W_AdjustWindowRect(rect: UiRect*, style: uint32, menu: int32) -> int32 = "AdjustWindowRect";
+extern fn W_GetSystemMetrics(index: int32) -> int32 = "GetSystemMetrics";
+extern fn W_Sleep(ms: uint32) = "Sleep";
+extern fn C_fopen(path: cstring, mode: cstring) -> int64 = "fopen";
+extern fn C_fwrite(data: uint8*, size: int64, count: int64, stream: int64) -> int64 = "fwrite";
+extern fn C_fclose(stream: int64) -> int32 = "fclose";
+
+const BLOOM_LEVELS: int32 = 6;
+const STYLE: uint32 = 0x10CF0000;
+
+var lv_x: float32*[6];
+var lv_b: float32*[6];
+var lv_r: float32*[6];
+var lv_nx: int32[6];
+var lv_ny: int32[6];
+var lv_nz: int32[6];
+
+var u0: float32*;
+var v0: float32*;
+var w0: float32*;
+var uh: float32*;
+var vh: float32*;
+var wh: float32*;
+var u1: float32*;
+var v1: float32*;
+var w1: float32*;
+var t0: float32*;
+var f0: float32*;
+var s0: float32*;
+var g0: float32*;
+var gh: float32*;
+var glo: float32*;
+var ghi: float32*;
+var range: float32*;
+var expand: float32*;
+var curl: float32*;
+var vc: float32*;
+var force: float32*;
+var now: float32*;
+var emit: float32*;
+
+var packed: uint32*;
+var bricks: uint8*;
+var ext: float32*;
+var lights: float32*;
+var lvol: uint32*;
+var lut: float32*;
+var ember_pos: float32*;
+var ember_vel: float32*;
+var ember_prev: float32*;
+
+var hdr: float32*;
+var accum: uint32*;
+var bloom: float32*[6];
+var bloom_w: int32[6];
+var bloom_h: int32[6];
+var out_host: uint8*[2];
+var out_dev: int64[2];
+var done: int64[2];
+var width: int32 = 0;
+var height: int32 = 0;
+
+var g_running: int32 = 1;
+var g_paused: int32 = 0;
+var g_reset: int32 = 0;
+var g_client_w: int32 = 1600;
+var g_client_h: int32 = 900;
+var g_dragging: int32 = 0;
+var g_last_x: int32 = 0;
+var g_last_y: int32 = 0;
+var g_yaw: float64 = 0.62;
+var g_pitch: float64 = -0.1;
+var g_dist: float64 = 9.5;
+var g_yaw_aim: float64 = 0.62;
+var g_pitch_aim: float64 = -0.1;
+var g_dist_aim: float64 = 9.5;
+var g_idle: float64 = 100.0;
+var g_fullscreen: int32 = 0;
+var g_saved: UiRect;
+var g_hwnd: int64 = 0;
+
+fn cells_grid(count: int32, block: int32) -> int32 { return (count + block - 1) / block; }
+
+fn alloc_f(count: int64) -> float32* {
+  var p: int64 = gpu_malloc(count * 4);
+  if (p == 0) {
+    println("fire: out of GPU memory");
+    return (float32*)0;
+  }
+  gpu_memset(p, (uint8)0, count * 4);
+  return (float32*)p;
+}
+
+fn alloc_u8(count: int64) -> uint8* {
+  var p: int64 = gpu_malloc(count);
+  gpu_memset(p, (uint8)0, count);
+  return (uint8*)p;
+}
+
+fn allocate_sim() {
+  var faces: int64 = (int64)FACES;
+  var cells: int64 = (int64)CELLS;
+  u0 = alloc_f(faces); v0 = alloc_f(faces); w0 = alloc_f(faces);
+  uh = alloc_f(faces); vh = alloc_f(faces); wh = alloc_f(faces);
+  u1 = alloc_f(faces); v1 = alloc_f(faces); w1 = alloc_f(faces);
+  t0 = alloc_f(cells); f0 = alloc_f(cells); s0 = alloc_f(cells);
+  g0 = alloc_f(cells * 4); gh = alloc_f(cells * 4);
+  glo = alloc_f(cells * 4); ghi = alloc_f(cells * 4);
+  range = alloc_f(faces * 6);
+  expand = alloc_f(cells);
+  curl = alloc_f(cells * 4);
+  vc = alloc_f(cells * 4);
+  force = alloc_f(cells * 4);
+  now = alloc_f(cells);
+  emit = alloc_f(cells * 4);
+  var nx: int32 = NX;
+  var ny: int32 = NY;
+  var nz: int32 = NZ;
+  for l in 0..LEVELS {
+    var n: int64 = (int64)nx * (int64)ny * (int64)nz;
+    lv_x[l] = alloc_f(n);
+    lv_b[l] = alloc_f(n);
+    lv_r[l] = alloc_f(n);
+    lv_nx[l] = nx;
+    lv_ny[l] = ny;
+    lv_nz[l] = nz;
+    nx = nx / 2;
+    ny = ny / 2;
+    nz = nz / 2;
+  }
+  packed = (uint32*)alloc_f(cells * 2);
+  bricks = alloc_u8((int64)BRICKS);
+  ext = alloc_f((int64)LCELLS);
+  lights = alloc_f((int64)(LIGHTS * LIGHT_FLOATS));
+  lvol = (uint32*)alloc_f((int64)LCELLS * 2);
+  lut = alloc_f((int64)LUT_SIZE * 4);
+  ember_pos = alloc_f((int64)EMBERS * 4);
+  ember_vel = alloc_f((int64)EMBERS * 4);
+  ember_prev = alloc_f((int64)EMBERS * 4);
+}
+
+fn reset_sim() {
+  var cells: int64 = (int64)CELLS;
+  var faces: int64 = (int64)FACES;
+  gpu_memset((int64)u0, (uint8)0, faces * 4);
+  gpu_memset((int64)v0, (uint8)0, faces * 4);
+  gpu_memset((int64)w0, (uint8)0, faces * 4);
+  gpu_memset((int64)lv_x[0], (uint8)0, cells * 4);
+  gpu_memset((int64)ember_vel, (uint8)0, (int64)EMBERS * 16);
+  dispatch k_fill_gas[cells_grid(CELLS, 256), 256](g0, t0, f0, s0);
+}
+
+fn prepare_scene() {
+  dispatch k_blackbody[cells_grid(LUT_SIZE, 256), 256](lut);
+  dispatch k_source[cells_grid(CELLS, 256), 256](emit);
+  reset_sim();
+  gpu_sync();
+}
+
+fn edge_weight(l: int32) -> float32 {
+  var h: float32 = (float32)(1 << l);
+  return 2.0 * h / (h + 1.0);
+}
+
+fn vcycle(l: int32) {
+  var nx: int32 = lv_nx[l];
+  var ny: int32 = lv_ny[l];
+  var nz: int32 = lv_nz[l];
+  var n: int32 = nx * ny * nz;
+  var grid: int32 = cells_grid(n, 256);
+  var edge: float32 = edge_weight(l);
+  if (l == LEVELS - 1) {
+    dispatch k_coarse[1, 128](lv_x[l], lv_b[l], nx, ny, nz, edge, 48);
+    return;
+  }
+  var half: int32 = cells_grid(n / 2, 256);
+  for s in 0..2 {
+    dispatch k_smooth[half, 256](lv_x[l], lv_b[l], nx, ny, nz, edge, 0);
+    dispatch k_smooth[half, 256](lv_x[l], lv_b[l], nx, ny, nz, edge, 1);
+  }
+  dispatch k_residual[grid, 256](lv_x[l], lv_b[l], lv_r[l], nx, ny, nz, edge);
+  var cn: int32 = lv_nx[l + 1] * lv_ny[l + 1] * lv_nz[l + 1];
+  dispatch k_restrict[cells_grid(cn, 256), 256](lv_r[l], lv_b[l + 1], lv_x[l + 1],
+                                                 lv_nx[l + 1], lv_ny[l + 1], lv_nz[l + 1]);
+  vcycle(l + 1);
+  dispatch k_prolong[grid, 256](lv_x[l + 1], lv_x[l], nx, ny, nz, edge_weight(l + 1));
+  for s in 0..2 {
+    dispatch k_smooth[half, 256](lv_x[l], lv_b[l], nx, ny, nz, edge, 0);
+    dispatch k_smooth[half, 256](lv_x[l], lv_b[l], nx, ny, nz, edge, 1);
+  }
+}
+
+var g_probe: int64[12];
+var g_probing: int32 = 0;
+
+fn mark(n: int32) {
+  if (g_probing != 0) { gpu_event_record(g_probe[n], 0); }
+}
+
+fn step(dt: float32, time: float32, frame: int32) {
+  mark(0);
+  var fg: int32 = cells_grid(FACES, 256);
+  var cg: int32 = cells_grid(CELLS, 256);
+  var st: Step;
+  st.dt = dt;
+  st.time = time;
+  st.frame = frame;
+  dispatch k_center[cg, 256](u0, v0, w0, vc);
+  dispatch k_advect_vel[fg, 256](vc, u0, v0, w0, uh, vh, wh, range, dt);
+  dispatch k_correct_vel[fg, 256](vc, u0, v0, w0, uh, vh, wh, range, u1, v1, w1, dt);
+  mark(1);
+  dispatch k_advect_scalars[cg, 256](vc, g0, gh, glo, ghi, dt);
+  dispatch k_correct_scalars[cg, 256](vc, g0, gh, glo, ghi, t0, f0, s0, dt);
+  mark(2);
+  dispatch k_combust[cg, 256](t0, f0, s0, emit, now, expand, g0, st);
+  mark(3);
+  dispatch k_curl[cg, 256](u1, v1, w1, curl);
+  dispatch k_confine[cg, 256](curl, t0, s0, force);
+  dispatch k_forces[fg, 256](u1, v1, w1, t0, s0, force, emit, now, st);
+  dispatch k_divergence[cg, 256](u1, v1, w1, expand, lv_b[0]);
+  mark(4);
+  vcycle(0);
+  vcycle(0);
+  mark(5);
+  dispatch k_project[fg, 256](u1, v1, w1, lv_x[0]);
+  dispatch k_embers[cells_grid(EMBERS, 256), 256](ember_pos, ember_vel, ember_prev, u1, v1, w1, t0, st);
+  mark(6);
+  var a: float32* = u0; u0 = u1; u1 = a;
+  a = v0; v0 = v1; v1 = a;
+  a = w0; w0 = w1; w1 = a;
+}
+
+fn release_frame() {
+  if (width == 0) { return; }
+  gpu_sync();
+  gpu_free((int64)hdr);
+  gpu_free((int64)accum);
+  for l in 0..BLOOM_LEVELS { gpu_free((int64)bloom[l]); }
+  for b in 0..2 { gpu_host_free(out_host[b]); }
+  width = 0;
+}
+
+fn allocate_frame(w: int32, h: int32) {
+  release_frame();
+  width = w;
+  height = h;
+  var pixels: int64 = (int64)w * (int64)h;
+  hdr = alloc_f(pixels * 4);
+  accum = (uint32*)alloc_f(pixels * 3);
+  var bw: int32 = w;
+  var bh: int32 = h;
+  for l in 0..BLOOM_LEVELS {
+    bw = bw / 2;
+    bh = bh / 2;
+    if (bw < 1) { bw = 1; }
+    if (bh < 1) { bh = 1; }
+    bloom_w[l] = bw;
+    bloom_h[l] = bh;
+    bloom[l] = alloc_f((int64)bw * (int64)bh * 4);
+  }
+  for b in 0..2 {
+    var dev: int64 = 0;
+    out_host[b] = gpu_host_mapped_malloc(pixels * 4, &dev);
+    out_dev[b] = dev;
+  }
+}
+
+fn make_view(time: float32, frame: int32, dt: float32) -> View {
+  var tx: float64 = 0.0;
+  var ty: float64 = 2.6;
+  var tz: float64 = 0.0;
+  var cp: float64 = cos(g_pitch);
+  var ox: float64 = tx + g_dist * cp * sin(g_yaw);
+  var oy: float64 = ty + g_dist * sin(g_pitch);
+  var oz: float64 = tz + g_dist * cp * cos(g_yaw);
+  if (oy < 0.35) { oy = 0.35; }
+  var fx: float64 = tx - ox;
+  var fy: float64 = ty - oy;
+  var fz: float64 = tz - oz;
+  var fl: float64 = sqrt(fx * fx + fy * fy + fz * fz);
+  fx = fx / fl; fy = fy / fl; fz = fz / fl;
+  var rx: float64 = -fz;
+  var rz: float64 = fx;
+  var rl: float64 = sqrt(rx * rx + rz * rz);
+  rx = rx / rl; rz = rz / rl;
+  var ux: float64 = -rz * fy;
+  var uy: float64 = rz * fx - rx * fz;
+  var uz: float64 = rx * fy;
+  var roll: float64 = -0.085 + 0.012 * sin((float64)time * 0.11);
+  var cr: float64 = cos(roll);
+  var sr: float64 = sin(roll);
+  var v: View;
+  v.ox = (float32)ox; v.oy = (float32)oy; v.oz = (float32)oz;
+  v.rx = (float32)(rx * cr + ux * sr);
+  v.ry = (float32)(uy * sr);
+  v.rz = (float32)(rz * cr + uz * sr);
+  v.ux = (float32)(ux * cr - rx * sr);
+  v.uy = (float32)(uy * cr);
+  v.uz = (float32)(uz * cr - rz * sr);
+  v.fx = (float32)fx; v.fy = (float32)fy; v.fz = (float32)fz;
+  v.tan_half = (float32)tan(0.40);
+  v.aspect = (float32)width / (float32)height;
+  v.width = width;
+  v.height = height;
+  v.time = time;
+  v.frame = frame;
+  v.exposure = 0.085;
+  v.dt = dt;
+  return v;
+}
+
+fn render_light() {
+  dispatch k_pack[cells_grid(CELLS, 256), 256](t0, s0, lut, packed);
+  dispatch k_bricks[cells_grid(BRICKS, 128), 128](t0, s0, bricks);
+  dispatch k_extinction[cells_grid(LCELLS, 128), 128](s0, ext);
+  dispatch k_lights[LIGHTS, 256](t0, s0, lut, lights);
+  dispatch k_light_volume[cells_grid(LCELLS, 128), 128](lights, ext, lvol);
+}
+
+fn render(view: View, slot: int32) {
+  render_light();
+  render_image(view, slot);
+}
+
+fn render_image(view: View, slot: int32) {
+  var pixels: int32 = width * height;
+  dispatch k_render[cells_grid(pixels, 128), 128](packed, bricks, lvol, hdr, view);
+  dispatch k_splat[cells_grid(EMBERS, 128), 128](ember_pos, ember_vel, ember_prev, ext, lut, accum, view);
+  dispatch k_compose[cells_grid(pixels, 256), 256](hdr, accum, pixels);
+  var sw: int32 = width;
+  var shh: int32 = height;
+  var src: float32* = hdr;
+  for l in 0..BLOOM_LEVELS {
+    var first: int32 = 0;
+    if (l == 0) { first = 1; }
+    var n: int32 = bloom_w[l] * bloom_h[l];
+    dispatch k_down[cells_grid(n, 256), 256](src, sw, shh, bloom[l], bloom_w[l], bloom_h[l], first);
+    src = bloom[l];
+    sw = bloom_w[l];
+    shh = bloom_h[l];
+  }
+  var l: int32 = BLOOM_LEVELS - 1;
+  while (l > 0) {
+    var n: int32 = bloom_w[l - 1] * bloom_h[l - 1];
+    dispatch k_up[cells_grid(n, 256), 256](bloom[l], bloom_w[l], bloom_h[l], bloom[l - 1], bloom_w[l - 1], bloom_h[l - 1]);
+    l = l - 1;
+  }
+  dispatch k_tonemap[cells_grid(pixels, 256), 256](hdr, bloom[0], bloom_w[0], bloom_h[0], (uint32*)out_dev[slot],
+                                                   view, (float32)0.045, BLOOM_LEVELS);
+  gpu_event_record(done[slot], 0);
+}
+
+fn present(hdc: int64, slot: int32) {
+  var info: Bitmap;
+  memset((uint8*)&info, 0, sizeof(Bitmap));
+  info.size = (uint32)sizeof(Bitmap);
+  info.width = width;
+  info.height = -height;
+  info.planes = (uint16)1;
+  info.bits = (uint16)32;
+  W_StretchDIBits(hdc, 0, 0, width, height, 0, 0, width, height, (rawptr)out_host[slot], &info, 0, (uint32)0x00CC0020);
+}
+
+var crc_table: uint32[256];
+
+fn crc_init() {
+  for n in 0..256 {
+    var c: uint32 = (uint32)n;
+    for k in 0..8 {
+      if ((c & (uint32)1) != (uint32)0) { c = (uint32)3988292384 ^ (c >> 1); } else { c = c >> 1; }
+    }
+    crc_table[n] = c;
+  }
+}
+
+fn crc_update(crc: uint32, data: uint8*, count: int64) -> uint32 {
+  var c: uint32 = crc;
+  var i: int64 = 0;
+  while (i < count) {
+    c = crc_table[(int32)((c ^ (uint32)data[i]) & (uint32)255)] ^ (c >> 8);
+    i = i + 1;
+  }
+  return c;
+}
+
+fn put32(p: uint8*, v: uint32) {
+  p[0] = (uint8)(v >> 24);
+  p[1] = (uint8)(v >> 16);
+  p[2] = (uint8)(v >> 8);
+  p[3] = (uint8)v;
+}
+
+fn chunk(file: int64, kind: cstring, data: uint8*, count: int64) {
+  var head: uint8[8];
+  put32(&head[0], (uint32)count);
+  var name: uint8* = (uint8*)kind;
+  for i in 0..4 { head[4 + i] = name[i]; }
+  C_fwrite(&head[0], 1, 8, file);
+  if (count > 0) { C_fwrite(data, 1, count, file); }
+  var crc: uint32 = crc_update((uint32)4294967295, &head[4], 4);
+  crc = crc_update(crc, data, count);
+  var tail: uint8[4];
+  put32(&tail[0], crc ^ (uint32)4294967295);
+  C_fwrite(&tail[0], 1, 4, file);
+}
+
+fn write_png(path: cstring, pixels: uint8*, w: int32, h: int32) -> int32 {
+  crc_init();
+  var row: int64 = (int64)w * 3 + 1;
+  var raw: int64 = row * (int64)h;
+  var blocks: int64 = (raw + 65534) / 65535;
+  var zsize: int64 = 2 + raw + blocks * 5 + 4;
+  var z: uint8* = malloc(zsize);
+  var image: uint8* = malloc(raw);
+  for y in 0..h {
+    var o: int64 = (int64)y * row;
+    image[o] = (uint8)0;
+    for x in 0..w {
+      var s: int64 = ((int64)y * (int64)w + (int64)x) * 4;
+      image[o + 1 + (int64)x * 3] = pixels[s + 2];
+      image[o + 2 + (int64)x * 3] = pixels[s + 1];
+      image[o + 3 + (int64)x * 3] = pixels[s];
+    }
+  }
+  z[0] = (uint8)120;
+  z[1] = (uint8)1;
+  var at: int64 = 2;
+  var left: int64 = raw;
+  var from: int64 = 0;
+  while (left > 0) {
+    var n: int64 = left;
+    if (n > 65535) { n = 65535; }
+    if (n == left) { z[at] = (uint8)1; } else { z[at] = (uint8)0; }
+    z[at + 1] = (uint8)(n & 255);
+    z[at + 2] = (uint8)(n >> 8);
+    z[at + 3] = (uint8)((n ^ 65535) & 255);
+    z[at + 4] = (uint8)((n ^ 65535) >> 8);
+    memcpy(&z[at + 5], &image[from], n);
+    at = at + 5 + n;
+    from = from + n;
+    left = left - n;
+  }
+  var a: uint32 = (uint32)1;
+  var b: uint32 = (uint32)0;
+  var i: int64 = 0;
+  while (i < raw) {
+    a = (a + (uint32)image[i]) % (uint32)65521;
+    b = (b + a) % (uint32)65521;
+    i = i + 1;
+  }
+  put32(&z[at], (b << 16) | a);
+  at = at + 4;
+  var file: int64 = C_fopen(path, "wb");
+  if (file == 0) { return 0; }
+  var sig: uint8[8];
+  sig[0] = (uint8)137; sig[1] = (uint8)80; sig[2] = (uint8)78; sig[3] = (uint8)71;
+  sig[4] = (uint8)13; sig[5] = (uint8)10; sig[6] = (uint8)26; sig[7] = (uint8)10;
+  C_fwrite(&sig[0], 1, 8, file);
+  var ihdr: uint8[13];
+  put32(&ihdr[0], (uint32)w);
+  put32(&ihdr[4], (uint32)h);
+  ihdr[8] = (uint8)8;
+  ihdr[9] = (uint8)2;
+  ihdr[10] = (uint8)0;
+  ihdr[11] = (uint8)0;
+  ihdr[12] = (uint8)0;
+  chunk(file, "IHDR", &ihdr[0], 13);
+  chunk(file, "IDAT", z, at);
+  chunk(file, "IEND", z, 0);
+  C_fclose(file);
+  free(z);
+  free(image);
+  return 1;
+}
+
+fn seconds_since(start: int64, frequency: int64) -> float64 {
+  var t: int64 = 0;
+  W_QueryPerformanceCounter(&t);
+  return (float64)(t - start) / (float64)frequency;
+}
+
+fn parse_int(text: cstring) -> int32 {
+  var p: uint8* = (uint8*)text;
+  var v: int32 = 0;
+  var i: int32 = 0;
+  while (p[i] >= (uint8)48 && p[i] <= (uint8)57) {
+    v = v * 10 + (int32)p[i] - 48;
+    i = i + 1;
+  }
+  return v;
+}
+
+fn same(a: cstring, b: cstring) -> bool {
+  var x: uint8* = (uint8*)a;
+  var y: uint8* = (uint8*)b;
+  var i: int32 = 0;
+  while (x[i] == y[i]) {
+    if (x[i] == (uint8)0) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn time_stages(frames: int32) {
+  var e: int64[4];
+  for i in 0..4 { e[i] = gpu_event_create(); }
+  var sim_ms: float32 = 0.0;
+  var light_ms: float32 = 0.0;
+  var draw_ms: float32 = 0.0;
+  for f in 0..60 {
+    step((float32)(1.0 / 60.0), 90.0 + (float32)f / 60.0, f);
+    render(make_view(90.0, f, (float32)(1.0 / 60.0)), 0);
+  }
+  for f in 0..frames {
+    var view: View = make_view(100.0 + (float32)f / 60.0, f, (float32)(1.0 / 60.0));
+    gpu_event_record(e[0], 0);
+    step((float32)(1.0 / 60.0), 100.0 + (float32)f / 60.0, f);
+    gpu_event_record(e[1], 0);
+    render_light();
+    gpu_event_record(e[2], 0);
+    render_image(view, 0);
+    gpu_event_record(e[3], 0);
+    gpu_event_sync(e[3]);
+    var a: float32 = 0.0;
+    var b: float32 = 0.0;
+    var c: float32 = 0.0;
+    gpu_event_elapsed_ms(e[0], e[1], &a);
+    gpu_event_elapsed_ms(e[1], e[2], &b);
+    gpu_event_elapsed_ms(e[2], e[3], &c);
+    sim_ms = sim_ms + a;
+    light_ms = light_ms + b;
+    draw_ms = draw_ms + c;
+  }
+  var n: float32 = (float32)frames;
+  println("sim {sim_ms / n} ms, light {light_ms / n} ms, image {draw_ms / n} ms at {width}x{height}");
+  for i in 0..7 { g_probe[i] = gpu_event_create(); }
+  g_probing = 1;
+  var parts: float32[6];
+  for i in 0..6 { parts[i] = 0.0; }
+  for f in 0..60 {
+    step((float32)(1.0 / 60.0), 200.0 + (float32)f / 60.0, f);
+    gpu_event_sync(g_probe[6]);
+    for i in 0..6 {
+      var ms: float32 = 0.0;
+      gpu_event_elapsed_ms(g_probe[i], g_probe[i + 1], &ms);
+      parts[i] = parts[i] + ms / 60.0;
+    }
+  }
+  g_probing = 0;
+  println("velocity advect {parts[0]}, scalar advect {parts[1]}, combust {parts[2]}, forces {parts[3]}, pressure {parts[4]}, project+embers {parts[5]}");
+}
+
+fn report(name: string, f: float32*, count: int32) {
+  var bytes: int64 = (int64)count * 4;
+  var host: float32* = (float32*)malloc(bytes);
+  gpu_sync();
+  gpu_to_host((uint8*)host, (int64)f, bytes);
+  var top: float32 = -1000000000.0;
+  var low: float32 = 1000000000.0;
+  var sum: float64 = 0.0;
+  var nonzero: int32 = 0;
+  for i in 0..count {
+    var x: float32 = host[i];
+    if (x > top) { top = x; }
+    if (x < low) { low = x; }
+    sum = sum + (float64)x;
+    if (x != 0.0) { nonzero = nonzero + 1; }
+  }
+  var at: int32 = 0;
+  for i in 0..count { if (host[i] == low) { at = i; } }
+  println("{name}: min {low} at {at % FX} {(at / FX) % FY} {at / (FX * FY)} max {top} mean {sum / (float64)count} nonzero {nonzero}");
+  free((uint8*)host);
+}
+
+fn report_profile() {
+  var bytes: int64 = (int64)CELLS * 4;
+  var ht: float32* = (float32*)malloc(bytes);
+  var hf: float32* = (float32*)malloc(bytes);
+  var hs: float32* = (float32*)malloc(bytes);
+  var hv: float32* = (float32*)malloc((int64)FACES * 4);
+  gpu_sync();
+  gpu_to_host((uint8*)ht, (int64)t0, bytes);
+  gpu_to_host((uint8*)hf, (int64)f0, bytes);
+  gpu_to_host((uint8*)hs, (int64)s0, bytes);
+  gpu_to_host((uint8*)hv, (int64)v0, (int64)FACES * 4);
+  var band: int32 = 0;
+  while (band < NY) {
+    var tmax: float32 = 0.0;
+    var hot: int32 = 0;
+    var fuel: float64 = 0.0;
+    var smoke: float64 = 0.0;
+    var vmax: float32 = 0.0;
+    for j in band..band + 8 {
+      for k in 0..NZ {
+        for i in 0..NX {
+          var c: int32 = (k * NY + j) * NX + i;
+          if (ht[c] > tmax) { tmax = ht[c]; }
+          if (ht[c] > 1200.0) { hot = hot + 1; }
+          fuel = fuel + (float64)hf[c];
+          smoke = smoke + (float64)hs[c];
+          var fv: float32 = hv[(k * FY + j) * FX + i];
+          if (fv > vmax) { vmax = fv; }
+        }
+      }
+    }
+    println("y {(float32)band * CELL_SIZE} m: Tmax {tmax} hot {hot} fuel {fuel} smoke {smoke} vmax {vmax * CELL_SIZE} m/s");
+    band = band + 8;
+  }
+  free((uint8*)ht);
+  free((uint8*)hf);
+  free((uint8*)hs);
+  free((uint8*)hv);
+}
+
+fn divergence_error() {
+  dispatch k_divergence[cells_grid(CELLS, 256), 256](u0, v0, w0, expand, lv_r[0]);
+  var host: float32* = (float32*)malloc((int64)CELLS * 4);
+  var ex: float32* = (float32*)malloc((int64)CELLS * 4);
+  gpu_sync();
+  gpu_to_host((uint8*)host, (int64)lv_r[0], (int64)CELLS * 4);
+  gpu_to_host((uint8*)ex, (int64)expand, (int64)CELLS * 4);
+  var top: float32 = 0.0;
+  var sum: float64 = 0.0;
+  var scale: float64 = 0.0;
+  for i in 0..CELLS {
+    var x: float32 = host[i];
+    if (x < 0.0) { x = -x; }
+    if (x > top) { top = x; }
+    sum = sum + (float64)x;
+    var e: float32 = ex[i];
+    if (e < 0.0) { e = -e; }
+    scale = scale + (float64)e;
+  }
+  println("divergence error: max {top} 1/s, mean {sum / (float64)CELLS}, mean expansion {scale / (float64)CELLS}");
+  free((uint8*)host);
+  free((uint8*)ex);
+}
+
+fn residual_max() -> float32 {
+  dispatch k_residual[cells_grid(CELLS, 256), 256](lv_x[0], lv_b[0], lv_r[0], NX, NY, NZ, (float32)1.0);
+  var host: float32* = (float32*)malloc((int64)CELLS * 4);
+  gpu_sync();
+  gpu_to_host((uint8*)host, (int64)lv_r[0], (int64)CELLS * 4);
+  var top: float32 = 0.0;
+  for i in 0..CELLS {
+    var x: float32 = host[i];
+    if (x < 0.0) { x = -x; }
+    if (x > top) { top = x; }
+  }
+  free((uint8*)host);
+  return top;
+}
+
+fn mg_test() {
+  var host: float32* = (float32*)malloc((int64)CELLS * 4);
+  for i in 0..CELLS { host[i] = 0.0; }
+  host[(40 * NY + 30) * NX + 64] = 50.0;
+  host[(70 * NY + 120) * NX + 60] = -20.0;
+  gpu_to_device((int64)lv_b[0], (uint8*)host, (int64)CELLS * 4);
+  gpu_memset((int64)lv_x[0], (uint8)0, (int64)CELLS * 4);
+  println("start residual {residual_max()}");
+  for c in 0..8 {
+    vcycle(0);
+    println("cycle {c}: residual {residual_max()}");
+  }
+  free((uint8*)host);
+}
+
+fn bench(w: int32, h: int32) -> int32 {
+  allocate_frame(w, h);
+  var dt: float32 = (float32)(1.0 / 60.0);
+  for f in 0..240 { step(dt, (float32)f * dt, f); }
+  var frequency: int64 = 0;
+  W_QueryPerformanceFrequency(&frequency);
+  var start: int64 = 0;
+  W_QueryPerformanceCounter(&start);
+  var frames: int32 = 3600;
+  var pending: int32 = -1;
+  var window: int64 = start;
+  var worst: float64 = 0.0;
+  var last: int64 = start;
+  for f in 0..frames {
+    var slot: int32 = f & 1;
+    var t: float32 = (float32)(240 + f) * dt;
+    step(dt, t, 240 + f);
+    render(make_view(t, f, dt), slot);
+    if (pending >= 0) { gpu_event_sync(done[pending]); }
+    pending = slot;
+    var now_t: int64 = 0;
+    W_QueryPerformanceCounter(&now_t);
+    var ms: float64 = (float64)(now_t - last) * 1000.0 / (float64)frequency;
+    if (ms > worst) { worst = ms; }
+    last = now_t;
+    if ((f + 1) % 300 == 0) {
+      var span: float64 = (float64)(now_t - window) / (float64)frequency;
+      println("frames {f - 298}..{f + 1}: {300.0 / span} fps, worst frame {worst} ms");
+      window = now_t;
+      worst = 0.0;
+    }
+  }
+  gpu_sync();
+  var seconds: float64 = seconds_since(start, frequency);
+  println("pipelined: {(float64)frames / seconds} fps, {seconds * 1000.0 / (float64)frames} ms per frame at {w}x{h}");
+  return 0;
+}
+
+fn shot(frames: int32, path: cstring, w: int32, h: int32, timing: int32) -> int32 {
+  if (frames == 0) {
+    mg_test();
+    return 0;
+  }
+  if (frames == 1) { return bench(w, h); }
+  allocate_frame(w, h);
+  var dt: float32 = (float32)(1.0 / 60.0);
+  for f in 0..frames {
+    step(dt, (float32)f * dt, f);
+  }
+  var view: View = make_view((float32)frames * dt, frames, dt);
+  render(view, 0);
+  gpu_event_sync(done[0]);
+  if (write_png(path, out_host[0], w, h) == 0) {
+    println("fire: could not write {path}");
+    return 1;
+  }
+  println("fire: wrote {path} after {frames} steps");
+  if (timing != 0) {
+    report("temp", t0, CELLS);
+    report("fuel", f0, CELLS);
+    report("smoke", s0, CELLS);
+    report("emit now", now, CELLS);
+    report("expand", expand, CELLS);
+    report("v", v0, FACES);
+    report("pressure", lv_x[0], CELLS);
+    report("rhs", lv_b[0], CELLS);
+    for l in 1..LEVELS {
+      report("level b", lv_b[l], lv_nx[l] * lv_ny[l] * lv_nz[l]);
+      report("level x", lv_x[l], lv_nx[l] * lv_ny[l] * lv_nz[l]);
+    }
+    report("u hat", uh, FACES);
+    report("force", force, CELLS * 4);
+    report("curl", curl, CELLS * 4);
+    report("lights", lights, LIGHTS * LIGHT_FLOATS);
+    report_profile();
+    divergence_error();
+    time_stages(120);
+  }
+  return 0;
+}
+
+fn window_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (msg == UI_WM_CLOSE() || msg == UI_WM_DESTROY()) {
+    g_running = 0;
+    Ui_PostQuitMessage(0);
+    return 0;
+  }
+  if (msg == UI_WM_ERASEBKGND()) { return 1; }
+  if (msg == UI_WM_SIZE()) {
+    var w: int32 = (int32)(lparam & 65535);
+    var h: int32 = (int32)((lparam >> 16) & 65535);
+    if (w > 0 && h > 0) {
+      g_client_w = w;
+      g_client_h = h;
+    }
+    return 0;
+  }
+  if (msg == UI_WM_KEYDOWN()) {
+    if (wparam == 27) { g_running = 0; Ui_PostQuitMessage(0); }
+    if (wparam == 32) { g_paused = 1 - g_paused; }
+    if (wparam == 82) { g_reset = 1; }
+    if (wparam == 122) { toggle_fullscreen(hwnd); }
+    return 0;
+  }
+  if (msg == UI_WM_LBUTTONDOWN()) {
+    g_dragging = 1;
+    g_last_x = (int32)(int16)(lparam & 65535);
+    g_last_y = (int32)(int16)((lparam >> 16) & 65535);
+    W_SetCapture(hwnd);
+    return 0;
+  }
+  if (msg == UI_WM_LBUTTONUP()) {
+    g_dragging = 0;
+    W_ReleaseCapture();
+    return 0;
+  }
+  if (msg == UI_WM_MOUSEMOVE()) {
+    if (g_dragging != 0) {
+      var x: int32 = (int32)(int16)(lparam & 65535);
+      var y: int32 = (int32)(int16)((lparam >> 16) & 65535);
+      g_yaw_aim = g_yaw_aim - (float64)(x - g_last_x) * 0.005;
+      g_pitch_aim = g_pitch_aim - (float64)(y - g_last_y) * 0.004;
+      if (g_pitch_aim < -0.24) { g_pitch_aim = -0.24; }
+      if (g_pitch_aim > 0.9) { g_pitch_aim = 0.9; }
+      g_last_x = x;
+      g_last_y = y;
+      g_idle = 0.0;
+    }
+    return 0;
+  }
+  if (msg == UI_WM_MOUSEWHEEL()) {
+    var delta: int32 = (int32)(int16)((wparam >> 16) & 65535);
+    g_dist_aim = g_dist_aim * exp(-(float64)delta / 120.0 * 0.08);
+    if (g_dist_aim < 5.5) { g_dist_aim = 5.5; }
+    if (g_dist_aim > 24.0) { g_dist_aim = 24.0; }
+    g_idle = 0.0;
+    return 0;
+  }
+  return Ui_DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+fn toggle_fullscreen(hwnd: int64) {
+  if (g_fullscreen == 0) {
+    Ui_GetWindowRect(hwnd, &g_saved);
+    var info: Monitor;
+    memset((uint8*)&info, 0, sizeof(Monitor));
+    info.size = (uint32)sizeof(Monitor);
+    W_GetMonitorInfoA(W_MonitorFromWindow(hwnd, 2), &info);
+    W_SetWindowLongPtrA(hwnd, -16, (int64)0x90000000);
+    Ui_SetWindowPos(hwnd, 0, info.monitor.left, info.monitor.top, info.monitor.right - info.monitor.left,
+                    info.monitor.bottom - info.monitor.top, (uint32)0x0020);
+    g_fullscreen = 1;
+  } else {
+    W_SetWindowLongPtrA(hwnd, -16, (int64)STYLE);
+    Ui_SetWindowPos(hwnd, 0, g_saved.left, g_saved.top, g_saved.right - g_saved.left,
+                    g_saved.bottom - g_saved.top, (uint32)0x0020);
+    g_fullscreen = 0;
+  }
+}
+
+fn ease(current: float64, aim: float64, rate: float64, dt: float64) -> float64 {
+  return aim + (current - aim) * exp(-rate * dt);
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  W_AttachConsole((uint32)4294967295);
+  if (gpu_init() == 0) {
+    println("fire: no CUDA device answered");
+    return 1;
+  }
+  allocate_sim();
+  for b in 0..2 { done[b] = gpu_event_create(); }
+  prepare_scene();
+
+  if (argc >= 4 && same(argv[1], "--shot")) {
+    var w: int32 = 1280;
+    var h: int32 = 720;
+    var timing: int32 = 0;
+    if (argc >= 6) {
+      w = parse_int(argv[4]);
+      h = parse_int(argv[5]);
+    }
+    if (argc >= 7) { timing = 1; }
+    return shot(parse_int(argv[2]), argv[3], w, h, timing);
+  }
+
+  var instance: int64 = Ui_GetModuleHandleA(0);
+  var wc: UiWndClassEx;
+  memset((uint8*)&wc, 0, sizeof(UiWndClassEx));
+  wc.cb_size = (uint32)sizeof(UiWndClassEx);
+  wc.style = (uint32)0x0020 | UI_CS_HREDRAW() | UI_CS_VREDRAW();
+  wc.wnd_proc = &window_proc;
+  wc.instance = instance;
+  wc.cursor = Ui_LoadCursorA(0, (cstring)(rawptr)32512);
+  wc.class_name = "MettleFire";
+  Ui_RegisterClassExA(&wc);
+  var rect: UiRect;
+  rect.left = 0;
+  rect.top = 0;
+  rect.right = g_client_w;
+  rect.bottom = g_client_h;
+  W_AdjustWindowRect(&rect, STYLE, 0);
+  var ww: int32 = rect.right - rect.left;
+  var wh_: int32 = rect.bottom - rect.top;
+  var x: int32 = (W_GetSystemMetrics(0) - ww) / 2;
+  var y: int32 = (W_GetSystemMetrics(1) - wh_) / 2;
+  g_hwnd = Ui_CreateWindowExA(0, "MettleFire", "Fire", STYLE, x, y, ww, wh_, 0, 0, instance, 0);
+  var hdc: int64 = Ui_GetDC(g_hwnd);
+
+  var frequency: int64 = 0;
+  W_QueryPerformanceFrequency(&frequency);
+  var start: int64 = 0;
+  W_QueryPerformanceCounter(&start);
+  var last: float64 = 0.0;
+  var sim_time: float64 = 0.0;
+  var title_time: float64 = 0.0;
+  var title_frames: int32 = 0;
+  var frame: int32 = 0;
+  var steps: int32 = 0;
+  var pending: int32 = -1;
+  var message: UiMsg;
+  while (g_running != 0) {
+    while (Ui_PeekMessageA(&message, 0, 0, 0, UI_PM_REMOVE()) != 0) {
+      Ui_TranslateMessage(&message);
+      Ui_DispatchMessageA(&message);
+    }
+    if (g_running == 0) { break; }
+    if (g_client_w != width || g_client_h != height) {
+      allocate_frame(g_client_w, g_client_h);
+      pending = -1;
+    }
+    if (g_reset != 0) {
+      gpu_sync();
+      reset_sim();
+      g_reset = 0;
+    }
+    var clock: float64 = seconds_since(start, frequency);
+    var dt: float64 = clock - last;
+    last = clock;
+    if (dt > 1.0 / 30.0) { dt = 1.0 / 30.0; }
+    g_idle = g_idle + dt;
+    if (g_dragging == 0 && g_idle > 6.0) { g_yaw_aim = g_yaw_aim + 0.022 * dt; }
+    g_yaw = ease(g_yaw, g_yaw_aim, 5.0, dt);
+    g_pitch = ease(g_pitch, g_pitch_aim, 5.0, dt);
+    g_dist = ease(g_dist, g_dist_aim, 4.0, dt);
+    if (g_paused == 0) {
+      sim_time = sim_time + dt;
+      step((float32)dt, (float32)sim_time, steps);
+      steps = steps + 1;
+    }
+    var slot: int32 = frame & 1;
+    var view: View = make_view((float32)sim_time, frame, (float32)dt);
+    render(view, slot);
+    if (pending >= 0) {
+      gpu_event_sync(done[pending]);
+      present(hdc, pending);
+    }
+    pending = slot;
+    frame = frame + 1;
+    title_frames = title_frames + 1;
+    if (clock - title_time > 1.0) {
+      var fps: float64 = (float64)title_frames / (clock - title_time);
+      var text: uint8[96];
+      var s: string = "Fire  {width}x{height}  {(int32)(fps + 0.5)} fps";
+      var n: int32 = 0;
+      var bytes: uint8* = (uint8*)s.chars;
+      while (n < (int32)s.length && n < 95) {
+        text[n] = bytes[n];
+        n = n + 1;
+      }
+      text[n] = (uint8)0;
+      Ui_SetWindowTextA(g_hwnd, (cstring)&text[0]);
+      title_time = clock;
+      title_frames = 0;
+    }
+  }
+  gpu_sync();
+  return 0;
+}

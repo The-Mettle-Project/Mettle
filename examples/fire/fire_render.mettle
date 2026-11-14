@@ -1,0 +1,717 @@
+import "fire_sim";
+
+const LX: int32 = 32;
+const LY: int32 = 64;
+const LZ: int32 = 32;
+const LCELLS: int32 = 65536;
+const LSIZE: float32 = 0.25;
+const BX: int32 = 16;
+const BY: int32 = 32;
+const BZ: int32 = 16;
+const BRICKS: int32 = 8192;
+const LIGHTS: int32 = 64;
+const LIGHT_FLOATS: int32 = 8;
+const KEXT: float32 = 5.5;
+const ALBEDO: float32 = 0.42;
+const LUT_SIZE: int32 = 1024;
+const LUT_TMAX: float32 = 4000.0;
+const EMBERS: int32 = 32768;
+const EMBER_SCALE: float32 = 4096.0;
+const PIF: float32 = 3.14159265;
+
+struct View {
+  ox: float32;
+  oy: float32;
+  oz: float32;
+  rx: float32;
+  ry: float32;
+  rz: float32;
+  ux: float32;
+  uy: float32;
+  uz: float32;
+  fx: float32;
+  fy: float32;
+  fz: float32;
+  tan_half: float32;
+  aspect: float32;
+  width: int32;
+  height: int32;
+  time: float32;
+  frame: int32;
+  exposure: float32;
+  dt: float32;
+}
+
+struct Gas {
+  r: float32;
+  g: float32;
+  b: float32;
+  smoke: float32;
+}
+
+@inline fn lobe(x: float32, mu: float32, s1: float32, s2: float32) -> float32 {
+  var s: float32 = s2;
+  if (x < mu) { s = s1; }
+  var t: float32 = (x - mu) / s;
+  return expf(-0.5 * t * t);
+}
+
+kernel(block = 256) k_blackbody(lut: float32*) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= LUT_SIZE) { return; }
+  var t: float32 = (float32)id * LUT_TMAX / (float32)(LUT_SIZE - 1);
+  var x: float32 = 0.0;
+  var y: float32 = 0.0;
+  var z: float32 = 0.0;
+  if (t > 300.0) {
+    for n in 0..81 {
+      var nm: float32 = 380.0 + 5.0 * (float32)n;
+      var um: float32 = nm * 0.001;
+      var arg: float32 = 14387.77 / (um * t);
+      if (arg < 80.0) {
+        var u5: float32 = um * um * um * um * um;
+        var b: float32 = 1.191042e8 / u5 / (expf(arg) - 1.0) * 0.005;
+        var xb: float32 = 1.056 * lobe(nm, 599.8, 37.9, 31.0) + 0.362 * lobe(nm, 442.0, 16.0, 26.7) - 0.065 * lobe(nm, 501.1, 20.4, 26.2);
+        var yb: float32 = 0.821 * lobe(nm, 568.8, 46.9, 40.5) + 0.286 * lobe(nm, 530.9, 16.3, 31.1);
+        var zb: float32 = 1.217 * lobe(nm, 437.0, 11.8, 36.0) + 0.681 * lobe(nm, 459.0, 26.0, 13.8);
+        x = x + b * xb;
+        y = y + b * yb;
+        z = z + b * zb;
+      }
+    }
+  }
+  lut[4 * id] = hi(3.2406 * x - 1.5372 * y - 0.4986 * z, 0.0);
+  lut[4 * id + 1] = hi(-0.9689 * x + 1.8758 * y + 0.0415 * z, 0.0);
+  lut[4 * id + 2] = hi(0.0557 * x - 0.2040 * y + 1.0570 * z, 0.0);
+  lut[4 * id + 3] = y;
+}
+
+@inline fn blackbody(lut: float32*, t: float32) -> V3 {
+  var x: float32 = clampf(t * (float32)(LUT_SIZE - 1) / LUT_TMAX, 0.0, (float32)LUT_SIZE - 1.001);
+  var i: int32 = (int32)x;
+  var f: float32 = x - (float32)i;
+  var b: int32 = 4 * i;
+  return v3(mixf(lut[b], lut[b + 4], f), mixf(lut[b + 1], lut[b + 5], f), mixf(lut[b + 2], lut[b + 6], f));
+}
+
+@inline fn sigma_emit(smoke: float32, temp: float32) -> float32 {
+  return KEXT * smoke * (1.0 - ALBEDO) + 3.0 * smooth01(900.0, 1400.0, temp);
+}
+
+@inline fn luma(c: V3) -> float32 { return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z; }
+
+kernel(block = 256) k_pack(temp: float32*, smoke: float32*, lut: float32*, packed: uint32*) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= CELLS) { return; }
+  var t: float32 = temp[id];
+  var s: float32 = hi(smoke[id], 0.0);
+  var e: V3 = v3(0.0, 0.0, 0.0);
+  if (t > 700.0) { e = mul3(blackbody(lut, t), sigma_emit(s, t)); }
+  packed[2 * id] = f2h2(lo(e.x, 60000.0), lo(e.y, 60000.0));
+  packed[2 * id + 1] = f2h2(lo(e.z, 60000.0), lo(s, 60000.0));
+}
+
+kernel(block = 128) k_bricks(temp: float32*, smoke: float32*, bricks: uint8*) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= BRICKS) { return; }
+  var bi: int32 = id % BX;
+  var bj: int32 = (id / BX) % BY;
+  var bk: int32 = id / (BX * BY);
+  var live: int32 = 0;
+  var k: int32 = bk * 8 - 1;
+  while (k <= bk * 8 + 8 && live == 0) {
+    var kc: int32 = clampi(k, 0, NZ - 1);
+    var j: int32 = bj * 8 - 1;
+    while (j <= bj * 8 + 8 && live == 0) {
+      var jc: int32 = clampi(j, 0, NY - 1);
+      var i: int32 = bi * 8 - 1;
+      while (i <= bi * 8 + 8) {
+        var c: int32 = cell_id(clampi(i, 0, NX - 1), jc, kc);
+        if (smoke[c] > 0.002 || temp[c] > 780.0) { live = 1; }
+        i += 1;
+      }
+      j += 1;
+    }
+    k += 1;
+  }
+  bricks[id] = (uint8)live;
+}
+
+kernel(block = 128) k_extinction(smoke: float32*, ext: float32*) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= LCELLS) { return; }
+  var i: int32 = id % LX;
+  var j: int32 = (id / LX) % LY;
+  var k: int32 = id / (LX * LY);
+  var sum: float32 = 0.0;
+  for s in 0..64 {
+    sum = sum + smoke[cell_id(i * 4 + s % 4, j * 4 + (s / 4) % 4, k * 4 + s / 16)];
+  }
+  ext[id] = KEXT * sum / 64.0;
+}
+
+kernel(block = 256) k_lights(temp: float32*, smoke: float32*, lut: float32*, lights: float32*) {
+  workgroup var acc: float32[1792];
+  var l: int32 = block.x;
+  var lane: int32 = thread.x;
+  var q: int32 = l & 3;
+  var slab: int32 = l >> 2;
+  var x0: int32 = (q & 1) * 64;
+  var z0: int32 = (q >> 1) * 64;
+  var y0: int32 = slab * 16;
+  var r: float32 = 0.0;
+  var g: float32 = 0.0;
+  var b: float32 = 0.0;
+  var wl: float32 = 0.0;
+  var px: float32 = 0.0;
+  var py: float32 = 0.0;
+  var pz: float32 = 0.0;
+  for n in 0..256 {
+    var idx: int32 = n * 256 + lane;
+    var i: int32 = x0 + (idx & 63);
+    var j: int32 = y0 + ((idx >> 6) & 15);
+    var k: int32 = z0 + (idx >> 10);
+    var c: int32 = cell_id(i, j, k);
+    var t: float32 = temp[c];
+    if (t > 820.0) {
+      var e: V3 = mul3(blackbody(lut, t), sigma_emit(smoke[c], t));
+      var y: float32 = luma(e);
+      r = r + e.x;
+      g = g + e.y;
+      b = b + e.z;
+      wl = wl + y;
+      px = px + y * (float32)i;
+      py = py + y * (float32)j;
+      pz = pz + y * (float32)k;
+    }
+  }
+  acc[lane * 7] = r;
+  acc[lane * 7 + 1] = g;
+  acc[lane * 7 + 2] = b;
+  acc[lane * 7 + 3] = wl;
+  acc[lane * 7 + 4] = px;
+  acc[lane * 7 + 5] = py;
+  acc[lane * 7 + 6] = pz;
+  barrier(workgroup, acq_rel);
+  var stride: int32 = 128;
+  while (stride > 0) {
+    if (lane < stride) {
+      for c in 0..7 {
+        acc[lane * 7 + c] = acc[lane * 7 + c] + acc[(lane + stride) * 7 + c];
+      }
+    }
+    barrier(workgroup, acq_rel);
+    stride = stride >> 1;
+  }
+  if (lane == 0) {
+    var volume: float32 = CELL_SIZE * CELL_SIZE * CELL_SIZE;
+    var w: float32 = acc[3];
+    var base: int32 = l * LIGHT_FLOATS;
+    lights[base] = acc[0] * volume;
+    lights[base + 1] = acc[1] * volume;
+    lights[base + 2] = acc[2] * volume;
+    if (w > 0.0) {
+      var p: V3 = world_of(v3(acc[4] / w + 0.5, acc[5] / w + 0.5, acc[6] / w + 0.5));
+      lights[base + 3] = p.x;
+      lights[base + 4] = p.y;
+      lights[base + 5] = p.z;
+    } else {
+      lights[base + 3] = 0.0;
+      lights[base + 4] = -100.0;
+      lights[base + 5] = 0.0;
+    }
+    lights[base + 6] = w * volume;
+    lights[base + 7] = 0.0;
+  }
+}
+
+@inline fn ext_at(ext: float32*, p: V3) -> float32 {
+  var i: int32 = (int32)((p.x - ORIGIN_X) / LSIZE);
+  var j: int32 = (int32)(p.y / LSIZE);
+  var k: int32 = (int32)((p.z - ORIGIN_Z) / LSIZE);
+  if (i < 0 || j < 0 || k < 0 || i >= LX || j >= LY || k >= LZ) { return 0.0; }
+  return ext[(k * LY + j) * LX + i];
+}
+
+kernel(block = 128) k_light_volume(lights: float32*, ext: float32*, lv: uint32*) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= LCELLS) { return; }
+  var i: int32 = id % LX;
+  var j: int32 = (id / LX) % LY;
+  var k: int32 = id / (LX * LY);
+  var p: V3 = v3(ORIGIN_X + ((float32)i + 0.5) * LSIZE, ((float32)j + 0.5) * LSIZE, ORIGIN_Z + ((float32)k + 0.5) * LSIZE);
+  var total: float32 = 0.0;
+  for l in 0..LIGHTS { total = total + lights[l * LIGHT_FLOATS + 6]; }
+  var cut: float32 = total * 0.002;
+  var r: float32 = 0.0;
+  var g: float32 = 0.0;
+  var b: float32 = 0.0;
+  for l in 0..LIGHTS {
+    var base: int32 = l * LIGHT_FLOATS;
+    if (lights[base + 6] > cut) {
+      var d: V3 = sub3(v3(lights[base + 3], lights[base + 4], lights[base + 5]), p);
+      var dist: float32 = len3(d);
+      var reach_len: float32 = hi(dist - 0.55, 0.0);
+      var steps: int32 = clampi((int32)(reach_len / LSIZE) + 1, 1, 48);
+      var stride: V3 = mul3(d, reach_len / (dist * (float32)steps));
+      var seg: float32 = reach_len / (float32)steps;
+      var q: V3 = mad3(p, stride, 0.5);
+      var tau: float32 = 0.0;
+      for s in 0..steps {
+        tau = tau + ext_at(ext, q) * seg;
+        q = add3(q, stride);
+      }
+      var reach: float32 = expf(-tau) / (dist * dist + 0.15);
+      r = r + lights[base] * reach;
+      g = g + lights[base + 1] * reach;
+      b = b + lights[base + 2] * reach;
+    }
+  }
+  lv[2 * id] = f2h2(lo(r, 60000.0), lo(g, 60000.0));
+  lv[2 * id + 1] = f2h2(lo(b, 60000.0), 0.0);
+}
+
+@inline fn sample_light(lv: uint32*, p: V3) -> V3 {
+  var gx: float32 = clampf((p.x - ORIGIN_X) / LSIZE - 0.5, 0.0, (float32)LX - 1.001);
+  var gy: float32 = clampf(p.y / LSIZE - 0.5, 0.0, (float32)LY - 1.001);
+  var gz: float32 = clampf((p.z - ORIGIN_Z) / LSIZE - 0.5, 0.0, (float32)LZ - 1.001);
+  var i: int32 = (int32)gx;
+  var j: int32 = (int32)gy;
+  var k: int32 = (int32)gz;
+  var tx: float32 = gx - (float32)i;
+  var ty: float32 = gy - (float32)j;
+  var tz: float32 = gz - (float32)k;
+  var out: V3 = v3(0.0, 0.0, 0.0);
+  for c in 0..8 {
+    var wx: float32 = tx;
+    if ((c & 1) == 0) { wx = 1.0 - tx; }
+    var wy: float32 = ty;
+    if (((c >> 1) & 1) == 0) { wy = 1.0 - ty; }
+    var wz: float32 = tz;
+    if ((c >> 2) == 0) { wz = 1.0 - tz; }
+    var w: float32 = wx * wy * wz;
+    var cell: int32 = 2 * (((k + (c >> 2)) * LY + j + ((c >> 1) & 1)) * LX + i + (c & 1));
+    var a: uint32 = lv[cell];
+    var bm: uint32 = lv[cell + 1];
+    out = mad3(out, v3(h2f_lo(a), h2f_hi(a), h2f_lo(bm)), w);
+  }
+  return out;
+}
+
+@inline fn sample_gas(packed: uint32*, g: V3) -> Gas {
+  var x: float32 = clampf(g.x - 0.5, 0.0, (float32)NX - 1.001);
+  var y: float32 = clampf(g.y - 0.5, 0.0, (float32)NY - 1.001);
+  var z: float32 = clampf(g.z - 0.5, 0.0, (float32)NZ - 1.001);
+  var i: int32 = (int32)x;
+  var j: int32 = (int32)y;
+  var k: int32 = (int32)z;
+  var tx: float32 = x - (float32)i;
+  var ty: float32 = y - (float32)j;
+  var tz: float32 = z - (float32)k;
+  var b: int32 = (k * NY + j) * NX + i;
+  var g0: Gas = gas_at(packed, b);
+  var g1: Gas = gas_at(packed, b + 1);
+  var g2: Gas = gas_at(packed, b + NX);
+  var g3: Gas = gas_at(packed, b + NX + 1);
+  var g4: Gas = gas_at(packed, b + NX * NY);
+  var g5: Gas = gas_at(packed, b + NX * NY + 1);
+  var g6: Gas = gas_at(packed, b + NX * NY + NX);
+  var g7: Gas = gas_at(packed, b + NX * NY + NX + 1);
+  return gas_mix(gas_mix(gas_mix(g0, g1, tx), gas_mix(g2, g3, tx), ty),
+                 gas_mix(gas_mix(g4, g5, tx), gas_mix(g6, g7, tx), ty), tz);
+}
+
+@inline fn gas_at(packed: uint32*, c: int32) -> Gas {
+  var addr: int64 = (int64)&packed[2 * c];
+  var a: uint32 = (uint32)0;
+  var e: uint32 = (uint32)0;
+  asm {
+    ld.global.v2.u32 { {a}, {e} }, [{addr}];
+  }
+  var r: Gas;
+  r.r = h2f_lo(a);
+  r.g = h2f_hi(a);
+  r.b = h2f_lo(e);
+  r.smoke = h2f_hi(e);
+  return r;
+}
+
+@inline fn gas_mix(a: Gas, b: Gas, t: float32) -> Gas {
+  var r: Gas;
+  r.r = a.r + (b.r - a.r) * t;
+  r.g = a.g + (b.g - a.g) * t;
+  r.b = a.b + (b.b - a.b) * t;
+  r.smoke = a.smoke + (b.smoke - a.smoke) * t;
+  return r;
+}
+
+@inline fn in_domain(p: V3) -> bool {
+  return p.x > ORIGIN_X && p.z > ORIGIN_Z && p.x < -ORIGIN_X && p.z < -ORIGIN_Z && p.y >= 0.0 &&
+         p.y < (float32)NY * CELL_SIZE;
+}
+
+kernel(block = 128) k_render(packed: uint32*, bricks: uint8*, lv: uint32*, hdr: float32*, view: View) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= view.width * view.height) { return; }
+  var px: int32 = id % view.width;
+  var py: int32 = id / view.width;
+  var sx: float32 = (((float32)px + 0.5) / (float32)view.width * 2.0 - 1.0) * view.tan_half * view.aspect;
+  var sy: float32 = (1.0 - ((float32)py + 0.5) / (float32)view.height * 2.0) * view.tan_half;
+  var o: V3 = v3(view.ox, view.oy, view.oz);
+  var d: V3 = norm3(v3(view.fx + view.rx * sx + view.ux * sy,
+                       view.fy + view.ry * sx + view.uy * sy,
+                       view.fz + view.rz * sx + view.uz * sy));
+  var inv: V3 = v3(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
+  var l: V3 = v3(0.0, 0.0, 0.0);
+  var tr: float32 = 1.0;
+  var lox: float32 = (ORIGIN_X - o.x) * inv.x;
+  var hix: float32 = (-ORIGIN_X - o.x) * inv.x;
+  var loy: float32 = (0.0 - o.y) * inv.y;
+  var hiy: float32 = ((float32)NY * CELL_SIZE - o.y) * inv.y;
+  var loz: float32 = (ORIGIN_Z - o.z) * inv.z;
+  var hiz: float32 = (-ORIGIN_Z - o.z) * inv.z;
+  var t0: float32 = hi(hi(lo(lox, hix), lo(loy, hiy)), hi(lo(loz, hiz), 0.0));
+  var t1: float32 = lo(lo(hi(lox, hix), hi(loy, hiy)), hi(loz, hiz));
+  if (t0 < t1) {
+    var step: float32 = 0.5 * CELL_SIZE;
+    var jitter: float32 = unit(hash1((uint32)id * (uint32)2654435761 + (uint32)view.frame * (uint32)40503));
+    var t: float32 = t0 + step * jitter;
+    var iter: int32 = 0;
+    while (t < t1 && tr > 0.003 && iter < 3000) {
+      iter = iter + 1;
+      var p: V3 = mad3(o, d, t);
+      var g: V3 = grid_of(p);
+      var bi: int32 = clampi((int32)(g.x * 0.125), 0, BX - 1);
+      var bj: int32 = clampi((int32)(g.y * 0.125), 0, BY - 1);
+      var bk: int32 = clampi((int32)(g.z * 0.125), 0, BZ - 1);
+      if (bricks[(bk * BY + bj) * BX + bi] == (uint8)0) {
+        var span: float32 = 8.0 * CELL_SIZE;
+        var ex: float32 = 100000.0;
+        var ey: float32 = 100000.0;
+        var ez: float32 = 100000.0;
+        if (d.x > 0.00001) { ex = (ORIGIN_X + (float32)(bi + 1) * span - o.x) * inv.x; }
+        if (d.x < -0.00001) { ex = (ORIGIN_X + (float32)bi * span - o.x) * inv.x; }
+        if (d.y > 0.00001) { ey = ((float32)(bj + 1) * span - o.y) * inv.y; }
+        if (d.y < -0.00001) { ey = ((float32)bj * span - o.y) * inv.y; }
+        if (d.z > 0.00001) { ez = (ORIGIN_Z + (float32)(bk + 1) * span - o.z) * inv.z; }
+        if (d.z < -0.00001) { ez = (ORIGIN_Z + (float32)bk * span - o.z) * inv.z; }
+        var exit: float32 = lo(ex, lo(ey, ez));
+        t = hi(t + step * 0.25, t0 + step * (gfloor((exit - t0) / step) + 1.0 + jitter));
+      } else {
+        var gas: Gas = sample_gas(packed, g);
+        var sig_t: float32 = KEXT * hi(gas.smoke, 0.0);
+        var src: V3 = v3(gas.r, gas.g, gas.b);
+        var bright: float32 = luma(src);
+        var ds: float32 = step;
+        if (bright > 0.5) { ds = step * 0.5; }
+        if (sig_t + bright > 0.0001) {
+          if (sig_t > 0.003) {
+            src = mad3(src, sample_light(lv, p), sig_t * ALBEDO / (4.0 * PIF));
+          }
+          if (sig_t > 0.00001) {
+            var att: float32 = expf(-sig_t * ds);
+            l = mad3(l, src, tr * (1.0 - att) / sig_t);
+            tr = tr * att;
+          } else {
+            l = mad3(l, src, tr * ds);
+          }
+        }
+        t = t + ds;
+      }
+    }
+  }
+  hdr[4 * id] = l.x;
+  hdr[4 * id + 1] = l.y;
+  hdr[4 * id + 2] = l.z;
+  hdr[4 * id + 3] = 0.0;
+}
+
+kernel(block = 256) k_embers(pos: float32*, vel: float32*, prev: float32*, u: float32*, v: float32*, w: float32*,
+                             temp: float32*, s: Step) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= EMBERS) { return; }
+  var dt: float32 = s.dt;
+  var p: V3 = v3(pos[4 * id], pos[4 * id + 1], pos[4 * id + 2]);
+  var heat: float32 = pos[4 * id + 3];
+  var vl: V3 = v3(vel[4 * id], vel[4 * id + 1], vel[4 * id + 2]);
+  var life: float32 = vel[4 * id + 3];
+  var size: float32 = prev[4 * id + 3];
+  prev[4 * id] = p.x;
+  prev[4 * id + 1] = p.y;
+  prev[4 * id + 2] = p.z;
+  if (life == 0.0) {
+    var h: uint32 = hash1((uint32)id * (uint32)9781 + (uint32)s.frame * (uint32)6271);
+    if (unit(h) > 0.007) { return; }
+    var angle: float32 = 6.2831853 * unit(hash1(h + (uint32)1));
+    var radius: float32 = 1.9 * sqrtf(unit(hash1(h + (uint32)2)));
+    var height: float32 = 0.1 + 2.6 * powf_(unit(hash1(h + (uint32)3)), 1.6);
+    var q: V3 = v3(cosf(angle) * radius, height, sinf(angle) * radius);
+    var g: V3 = grid_of(q);
+    var tg: float32 = sample_cell(temp, g);
+    if (tg < 1050.0) { return; }
+    var kick: V3 = v3(unit(hash1(h + (uint32)4)) - 0.5, unit(hash1(h + (uint32)5)) * 0.8, unit(hash1(h + (uint32)6)) - 0.5);
+    var fl: V3 = mul3(velocity(u, v, w, g), CELL_SIZE);
+    var start: V3 = mad3(fl, kick, 3.2);
+    var r: float32 = unit(hash1(h + (uint32)8));
+    pos[4 * id] = q.x;
+    pos[4 * id + 1] = q.y;
+    pos[4 * id + 2] = q.z;
+    pos[4 * id + 3] = lo(tg, 1500.0) * (0.82 + 0.18 * unit(hash1(h + (uint32)9)));
+    vel[4 * id] = start.x;
+    vel[4 * id + 1] = start.y;
+    vel[4 * id + 2] = start.z;
+    vel[4 * id + 3] = 0.6 + 3.4 * unit(hash1(h + (uint32)10));
+    prev[4 * id] = q.x;
+    prev[4 * id + 1] = q.y;
+    prev[4 * id + 2] = q.z;
+    prev[4 * id + 3] = 0.0009 + 0.003 * r * r;
+    return;
+  }
+  var g: V3 = grid_of(p);
+  var fl: V3 = v3(0.0, 0.0, 0.0);
+  var gas: float32 = AMBIENT;
+  if (in_domain(p)) {
+    fl = mul3(velocity(u, v, w, g), CELL_SIZE);
+    gas = sample_cell(temp, g);
+  }
+  var tau: float32 = 0.1 + size * 190.0;
+  var follow: float32 = 1.0 - expf(-dt / tau);
+  var ts: float32 = s.time * 0.9;
+  var turb: V3 = v3(noise3(p.x * 2.7 + ts, p.y * 2.7, p.z * 2.7 + (float32)id * 0.37),
+                    noise3(p.x * 2.7 + 31.0, p.y * 2.7 - ts, p.z * 2.7),
+                    noise3(p.x * 2.7, p.y * 2.7 + 57.0, p.z * 2.7 - ts));
+  vl = add3(vl, mul3(sub3(fl, vl), follow));
+  vl = mad3(vl, turb, 6.0 * dt);
+  vl.y = vl.y - 9.81 * 0.3 * dt;
+  p = mad3(p, vl, dt);
+  if (life > 0.0) {
+    var burn: float32 = 1420.0 + 220.0 * unit(hash1((uint32)id * (uint32)31 + (uint32)7));
+    heat = heat + (burn - heat) * (1.0 - expf(-dt * 3.0));
+  } else {
+    var t2: float32 = heat * heat;
+    heat = heat - dt * 1.4e-13 * (t2 * t2 - 7.07e9) / size;
+  }
+  if (gas > heat) { heat = heat + (gas - heat) * (1.0 - expf(-dt / 0.8)); }
+  life = life - dt;
+  if (life == 0.0) { life = -0.0001; }
+  if (p.y < 0.004) {
+    p.y = 0.004;
+    vl = mul3(vl, 0.15);
+    vl.y = 0.0;
+  }
+  if (heat < 760.0 || p.y > 15.5 || fabsf(p.x) > 3.9 || fabsf(p.z) > 3.9) {
+    life = 0.0;
+  }
+  pos[4 * id] = p.x;
+  pos[4 * id + 1] = p.y;
+  pos[4 * id + 2] = p.z;
+  pos[4 * id + 3] = heat;
+  vel[4 * id] = vl.x;
+  vel[4 * id + 1] = vl.y;
+  vel[4 * id + 2] = vl.z;
+  vel[4 * id + 3] = life;
+}
+
+@inline fn project(view: View, p: V3) -> V3 {
+  var rel: V3 = sub3(p, v3(view.ox, view.oy, view.oz));
+  var z: float32 = rel.x * view.fx + rel.y * view.fy + rel.z * view.fz;
+  var x: float32 = rel.x * view.rx + rel.y * view.ry + rel.z * view.rz;
+  var y: float32 = rel.x * view.ux + rel.y * view.uy + rel.z * view.uz;
+  var sx: float32 = x / (z * view.tan_half * view.aspect);
+  var sy: float32 = y / (z * view.tan_half);
+  return v3((sx + 1.0) * 0.5 * (float32)view.width, (1.0 - sy) * 0.5 * (float32)view.height, z);
+}
+
+kernel(block = 128) k_splat(pos: float32*, vel: float32*, prev: float32*, ext: float32*, lut: float32*,
+                            accum: uint32*, view: View) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= EMBERS) { return; }
+  if (vel[4 * id + 3] == 0.0) { return; }
+  var p1: V3 = v3(pos[4 * id], pos[4 * id + 1], pos[4 * id + 2]);
+  var p0: V3 = v3(prev[4 * id], prev[4 * id + 1], prev[4 * id + 2]);
+  var a: V3 = project(view, p0);
+  var b: V3 = project(view, p1);
+  if (a.z < 0.2 || b.z < 0.2) { return; }
+  var to: V3 = sub3(v3(view.ox, view.oy, view.oz), p1);
+  var depth: float32 = len3(to);
+  var tau: float32 = 0.0;
+  var stride: V3 = mul3(to, 1.0 / 24.0);
+  var q: V3 = mad3(p1, stride, 0.5);
+  for s in 0..24 {
+    tau = tau + ext_at(ext, q);
+    q = add3(q, stride);
+  }
+  var transmit: float32 = expf(-tau * depth / 24.0);
+  var focal: float32 = (float32)view.height / (2.0 * view.tan_half);
+  var rp: float32 = prev[4 * id + 3] * focal / b.z;
+  var energy: float32 = 0.9 * PIF * rp * rp * transmit;
+  var c: V3 = mul3(blackbody(lut, pos[4 * id + 3]), energy);
+  var dx: float32 = b.x - a.x;
+  var dy: float32 = b.y - a.y;
+  var length: float32 = sqrtf(dx * dx + dy * dy);
+  var n: int32 = clampi((int32)(length * 1.5) + 1, 1, 128);
+  var share: float32 = 1.0 / (float32)n;
+  for s in 0..n {
+    var f: float32 = ((float32)s + 0.5) * share;
+    var x: float32 = a.x + dx * f - 0.5;
+    var y: float32 = a.y + dy * f - 0.5;
+    var fx: float32 = gfloor(x);
+    var fy: float32 = gfloor(y);
+    var ix: int32 = (int32)fx;
+    var iy: int32 = (int32)fy;
+    var tx: float32 = x - fx;
+    var ty: float32 = y - fy;
+    for corner in 0..4 {
+      var cx: int32 = ix + (corner & 1);
+      var cy: int32 = iy + (corner >> 1);
+      var wx: float32 = tx;
+      if ((corner & 1) == 0) { wx = 1.0 - tx; }
+      var wy: float32 = ty;
+      if ((corner >> 1) == 0) { wy = 1.0 - ty; }
+      var wt: float32 = share * wx * wy * EMBER_SCALE;
+      if (cx >= 0 && cy >= 0 && cx < view.width && cy < view.height && wt > 0.0) {
+        var pix: int32 = cy * view.width + cx;
+        var r: uint32 = (uint32)lo(c.x * wt, 100000000.0);
+        var g: uint32 = (uint32)lo(c.y * wt, 100000000.0);
+        var bl: uint32 = (uint32)lo(c.z * wt, 100000000.0);
+        var o0: uint32 = atomic_fetch_add(accum, 3 * pix, r, order: relaxed, scope: device);
+        var o1: uint32 = atomic_fetch_add(accum, 3 * pix + 1, g, order: relaxed, scope: device);
+        var o2: uint32 = atomic_fetch_add(accum, 3 * pix + 2, bl, order: relaxed, scope: device);
+      }
+    }
+  }
+}
+
+kernel(block = 256) k_compose(hdr: float32*, accum: uint32*, count: int32) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= count) { return; }
+  var k: float32 = 1.0 / EMBER_SCALE;
+  hdr[4 * id] = hdr[4 * id] + (float32)accum[3 * id] * k;
+  hdr[4 * id + 1] = hdr[4 * id + 1] + (float32)accum[3 * id + 1] * k;
+  hdr[4 * id + 2] = hdr[4 * id + 2] + (float32)accum[3 * id + 2] * k;
+  accum[3 * id] = (uint32)0;
+  accum[3 * id + 1] = (uint32)0;
+  accum[3 * id + 2] = (uint32)0;
+}
+
+@inline fn fetch(src: float32*, w: int32, h: int32, x: float32, y: float32) -> V3 {
+  var fx: float32 = clampf(x - 0.5, 0.0, (float32)w - 1.001);
+  var fy: float32 = clampf(y - 0.5, 0.0, (float32)h - 1.001);
+  var i: int32 = (int32)fx;
+  var j: int32 = (int32)fy;
+  var tx: float32 = fx - (float32)i;
+  var ty: float32 = fy - (float32)j;
+  var a: int32 = 4 * (j * w + i);
+  var b: int32 = a + 4 * w;
+  return v3(mixf(mixf(src[a], src[a + 4], tx), mixf(src[b], src[b + 4], tx), ty),
+            mixf(mixf(src[a + 1], src[a + 5], tx), mixf(src[b + 1], src[b + 5], tx), ty),
+            mixf(mixf(src[a + 2], src[a + 6], tx), mixf(src[b + 2], src[b + 6], tx), ty));
+}
+
+@inline fn karis(c: V3, on: int32) -> float32 {
+  if (on == 0) { return 1.0; }
+  return 1.0 / (1.0 + luma(c));
+}
+
+kernel(block = 256) k_down(src: float32*, sw: int32, sh: int32, dst: float32*, dw: int32, dh: int32, first: int32) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= dw * dh) { return; }
+  var x: int32 = id % dw;
+  var y: int32 = id / dw;
+  var cx: float32 = ((float32)x + 0.5) * (float32)sw / (float32)dw;
+  var cy: float32 = ((float32)y + 0.5) * (float32)sh / (float32)dh;
+  var a: V3 = fetch(src, sw, sh, cx - 2.0, cy - 2.0);
+  var b: V3 = fetch(src, sw, sh, cx, cy - 2.0);
+  var c: V3 = fetch(src, sw, sh, cx + 2.0, cy - 2.0);
+  var d: V3 = fetch(src, sw, sh, cx - 1.0, cy - 1.0);
+  var e: V3 = fetch(src, sw, sh, cx + 1.0, cy - 1.0);
+  var f: V3 = fetch(src, sw, sh, cx - 2.0, cy);
+  var g: V3 = fetch(src, sw, sh, cx, cy);
+  var h: V3 = fetch(src, sw, sh, cx + 2.0, cy);
+  var i: V3 = fetch(src, sw, sh, cx - 1.0, cy + 1.0);
+  var j: V3 = fetch(src, sw, sh, cx + 1.0, cy + 1.0);
+  var k: V3 = fetch(src, sw, sh, cx - 2.0, cy + 2.0);
+  var l: V3 = fetch(src, sw, sh, cx, cy + 2.0);
+  var m: V3 = fetch(src, sw, sh, cx + 2.0, cy + 2.0);
+  var g0: V3 = mul3(add3(add3(d, e), add3(i, j)), 0.25);
+  var g1: V3 = mul3(add3(add3(a, b), add3(f, g)), 0.25);
+  var g2: V3 = mul3(add3(add3(b, c), add3(g, h)), 0.25);
+  var g3: V3 = mul3(add3(add3(f, g), add3(k, l)), 0.25);
+  var g4: V3 = mul3(add3(add3(g, h), add3(l, m)), 0.25);
+  var w0: float32 = 0.5 * karis(g0, first);
+  var w1: float32 = 0.125 * karis(g1, first);
+  var w2: float32 = 0.125 * karis(g2, first);
+  var w3: float32 = 0.125 * karis(g3, first);
+  var w4: float32 = 0.125 * karis(g4, first);
+  var sum: V3 = mad3(mad3(mad3(mad3(mul3(g0, w0), g1, w1), g2, w2), g3, w3), g4, w4);
+  var o: V3 = mul3(sum, 1.0 / (w0 + w1 + w2 + w3 + w4));
+  dst[4 * id] = o.x;
+  dst[4 * id + 1] = o.y;
+  dst[4 * id + 2] = o.z;
+  dst[4 * id + 3] = 0.0;
+}
+
+@inline fn tent(src: float32*, w: int32, h: int32, x: float32, y: float32) -> V3 {
+  var c: V3 = mul3(fetch(src, w, h, x, y), 4.0);
+  c = add3(c, mul3(add3(add3(fetch(src, w, h, x - 1.0, y), fetch(src, w, h, x + 1.0, y)),
+                        add3(fetch(src, w, h, x, y - 1.0), fetch(src, w, h, x, y + 1.0))), 2.0));
+  c = add3(c, add3(add3(fetch(src, w, h, x - 1.0, y - 1.0), fetch(src, w, h, x + 1.0, y - 1.0)),
+                   add3(fetch(src, w, h, x - 1.0, y + 1.0), fetch(src, w, h, x + 1.0, y + 1.0))));
+  return mul3(c, 1.0 / 16.0);
+}
+
+kernel(block = 256) k_up(src: float32*, sw: int32, sh: int32, dst: float32*, dw: int32, dh: int32) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  if (id >= dw * dh) { return; }
+  var x: int32 = id % dw;
+  var y: int32 = id / dw;
+  var c: V3 = tent(src, sw, sh, ((float32)x + 0.5) * (float32)sw / (float32)dw,
+                   ((float32)y + 0.5) * (float32)sh / (float32)dh);
+  dst[4 * id] = dst[4 * id] + c.x;
+  dst[4 * id + 1] = dst[4 * id + 1] + c.y;
+  dst[4 * id + 2] = dst[4 * id + 2] + c.z;
+}
+
+@inline fn aces(x: float32) -> float32 {
+  return (x * (x + 0.0245786) - 0.000090537) / (x * (0.983729 * x + 0.4329510) + 0.238081);
+}
+
+@inline fn srgb(x: float32) -> float32 {
+  var c: float32 = clampf(x, 0.0, 1.0);
+  if (c <= 0.0031308) { return 12.92 * c; }
+  return 1.055 * powf_(c, 0.41666667) - 0.055;
+}
+
+kernel(block = 256) k_tonemap(hdr: float32*, bloom: float32*, bw: int32, bh: int32, out: uint32*,
+                              view: View, bloom_mix: float32, levels: int32) {
+  var id: int32 = block.x * block_dim.x + thread.x;
+  var w: int32 = view.width;
+  var h: int32 = view.height;
+  if (id >= w * h) { return; }
+  var x: int32 = id % w;
+  var y: int32 = id / w;
+  var hc: V3 = v3(hdr[4 * id], hdr[4 * id + 1], hdr[4 * id + 2]);
+  var bc: V3 = mul3(tent(bloom, bw, bh, ((float32)x + 0.5) * (float32)bw / (float32)w,
+                         ((float32)y + 0.5) * (float32)bh / (float32)h), 1.0 / (float32)levels);
+  var c: V3 = add3(mul3(hc, 1.0 - bloom_mix), mul3(bc, bloom_mix));
+  var sx: float32 = (((float32)x + 0.5) / (float32)w * 2.0 - 1.0) * view.tan_half * view.aspect;
+  var sy: float32 = (((float32)y + 0.5) / (float32)h * 2.0 - 1.0) * view.tan_half;
+  var cos2: float32 = 1.0 / (1.0 + sx * sx + sy * sy);
+  var falloff: float32 = mixf(1.0, cos2 * cos2, 0.55);
+  c = mul3(c, view.exposure * falloff);
+  var r0: float32 = 0.59719 * c.x + 0.35458 * c.y + 0.04823 * c.z;
+  var g0: float32 = 0.07600 * c.x + 0.90834 * c.y + 0.01566 * c.z;
+  var b0: float32 = 0.02840 * c.x + 0.13383 * c.y + 0.83777 * c.z;
+  r0 = aces(r0);
+  g0 = aces(g0);
+  b0 = aces(b0);
+  var r1: float32 = 1.60475 * r0 - 0.53108 * g0 - 0.07367 * b0;
+  var g1: float32 = -0.10208 * r0 + 1.10813 * g0 - 0.00605 * b0;
+  var b1: float32 = -0.00327 * r0 - 0.07276 * g0 + 1.07602 * b0;
+  var hs: uint32 = hash1((uint32)id * (uint32)1973 + (uint32)view.frame * (uint32)9277);
+  var dither: float32 = (unit(hs) + unit(hash1(hs)) - 1.0) / 255.0;
+  var r: int32 = clampi((int32)((srgb(r1) + dither) * 255.0 + 0.5), 0, 255);
+  var g: int32 = clampi((int32)((srgb(g1) + dither) * 255.0 + 0.5), 0, 255);
+  var b: int32 = clampi((int32)((srgb(b1) + dither) * 255.0 + 0.5), 0, 255);
+  out[id] = (uint32)0xFF000000 | ((uint32)r << 16) | ((uint32)g << 8) | (uint32)b;
+}
