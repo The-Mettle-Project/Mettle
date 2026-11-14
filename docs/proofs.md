@@ -220,23 +220,43 @@ power-of-two pattern allows:
 A row the solver refutes is printed with the input that breaks it.
 
 It then runs the x86-64 backend's own division lowering,
-`mir_emit_const_divmod` in `src/codegen/binary/mir_lower.c`, for every
-power-of-two divisor from 1 to 2^62, their negations, `-1` and `INT64_MIN`,
-signed and unsigned, quotient and remainder. It executes the MIR instructions
-that come out symbolically and proves each sequence computes the IR's `/` or
-`%` for every 64-bit dividend:
+`mir_emit_const_divmod` in `src/codegen/binary/mir_lower.c`, signed and
+unsigned, quotient and remainder, for every divisor from 3 to 100, every
+power of two up to 2^62, `2^k - 1` and `2^k + 1`, the powers of ten, the
+negations of all of those, and the extremes. It executes the MIR that comes
+out and proves each sequence computes the IR's `/` or `%` for every 64-bit
+dividend:
 
 ```text
-382 constant divisions lowered by mir_emit_const_divmod: 382 proved, 0 refuted, 0 not decided, 1048.7 ms
+1230 constant divisions lowered by mir_emit_const_divmod: 1230 proved, 0 refuted, 0 not decided, 14168.3 ms
 ```
 
-With the rounding bias removed from the signed power-of-two sequence, 250 of
-the 382 are refuted, each with a dividend that shows the error.
+`METTLE_PROVE_DIVISORS=N` extends the dense range to `N`.
 
-Division by other constants uses a multiply-high by a magic number. Proving
-those for all 64-bit dividends is beyond bit-blasting: the solver does not
-finish `x / 10` in 100 seconds, even for 32-bit dividends. They are checked by
-`--verify` on generated inputs.
+A power-of-two sequence is proved by the bit-vector solver. A magic-number
+sequence, a multiply-high followed by shifts and corrections, defeats
+bit-blasting: the solver does not finish `x / 10` in 100 seconds, even for
+32-bit dividends. Those go to a linear integer engine instead. Each
+multiply-high and shift becomes a quotient variable with a bounded
+remainder, each addition gets a wrap variable that is enumerated over the
+values its operand ranges allow, and a sign extraction is split into its two
+cases. A wrong result then means the claimed quotient `q` and the true one,
+fixed by `0 <= x - d q < |d|` with the sign of `x`, differ by at least one. The
+engine substitutes away every equation with a unit coefficient, eliminates the
+remaining variables by Fourier-Motzkin with exact big integers, and tightens
+each inequality to integers by its coefficients' greatest common divisor. An
+empty system is the proof.
+
+When the linear engine cannot close a case, the bit-vector solver takes it and
+looks for a counterexample. With the final shift of the unsigned magic
+sequence off by one, every affected divisor is refuted with a dividend:
+
+```text
+  REFUTED  x / 10 (unsigned): wrong at x = 882705526964617208
+```
+
+With the rounding bias removed from the signed power-of-two sequence, 250
+cases are refuted the same way.
 
 [Rewrite rules](rewrite-rules.md) are proved for every input before the
 compiler applies them, and fall back to generated inputs only when the solver
