@@ -13450,7 +13450,7 @@ try {
       "device report, PTX 8.8 for sm_121a",
       "window_sum (kernel @ line 5, block 64)",
       "lines 9 and 11 index it with values that are not constants",
-      "1 vector load replaced 4 separate loads",
+      "1 vector load in place of 4 separate loads",
       "quad_sum (4 adjacent loads from ``rows`` @ line 19): one ld.global.v4.f32",
       "pair_sum (2 adjacent loads from ``rows`` @ line 23): kept as separate loads  [vector-load-alignment]",
       "fix: declare ``align(8)`` in the pointer's type",
@@ -13465,7 +13465,7 @@ try {
       "fix: move line 64 out of the loop",
       "verified: without that line the accumulator stays in registers across the loop",
       "accumulate (tensor_mma m16n16k16 @ line 54): wmma.mma m16n16k16 f16") "PTX device report"
-  foreach ($storage in @('values: 7 in registers, 2 (in|emitted as) local memory \(52 bytes\)',
+  foreach ($storage in @('values: 2 (in|emitted as) local memory \(52 bytes\)',
                          'window_sum \(array `window` @ line 8\): (in|emitted as) local memory, 36 bytes  \[local-memory\]',
                          'window_sum \(private array `scratch` @ line 12\): (in|emitted as) local memory, 16 bytes')) {
     if ($ptx -notmatch $storage) { throw "PTX device report: nothing matches '$storage' in:`n$ptx" }
@@ -13478,7 +13478,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "--emit-metal --explain failed: $metal" }
   Assert-Report $metal @(
       "device report, Metal 3.2",
-      "values: 7 scalars, 2 arrays or records kept whole (52 bytes)",
+      "values: 2 arrays or records kept whole (52 bytes)",
       "window_sum (array ``window`` @ line 8): kept as one array, 36 bytes  [local-memory]",
       "so it is not split into scalars",
       "staged (promoted copy into workgroup memory @ line 36): 4 bytes copied with ordinary assignments",
@@ -13536,13 +13536,30 @@ try {
   $merged = (& $CompilerPath explain tests/gpu/single_build.mettle 2>$null | Out-String -Width 4096)
   Assert-Report $merged @(
       "main (dispatch ``saxpy_offset`` @ line 56): work items counted at run time, in blocks of 64 threads",
-      "optimization report, kernels on PTX",
+      "optimization report, kernels:",
       "device report, PTX",
       "device report, Metal 3.2",
-      "saxpy_offset (kernel @ line 13, block 64)") "host report with kernels"
+      "nothing to report for saxpy_offset") "host report with kernels"
+  if ($merged.Substring($merged.IndexOf("device report, PTX")) -notmatch "saxpy_offset") {
+    throw "the PTX device report does not name the kernel:`n$merged"
+  }
   if ($merged -match "mtlc_gpu_launch|mtlc_gpu_kernel_handle") { throw "the host report names launch plumbing:`n$merged" }
-  $hostPart = $merged.Substring(0, $merged.IndexOf("optimization report, kernels on"))
+  $hostPart = $merged.Substring(0, $merged.IndexOf("optimization report, kernels:"))
   if ($hostPart -match "saxpy_offset \(call to") { throw "the host report still lists the kernel as host code:`n$hostPart" }
+  if ([regex]::Matches($merged, "optimization report, kernels:").Count -ne 1) {
+    throw "the kernels' optimizer remarks print once for every target:`n$merged"
+  }
+  $fire = (& $CompilerPath explain examples/fire/fire_sim.mettle 2>$null | Out-String -Width 4096)
+  Assert-Report $fire @("k_advect_vel", "device report, PTX", "k_combust (call to ``noise3`` @ line 490): kept as a call") "a file of many kernels"
+  if ($fire -match "__inl_|ir_agg_|kept in registers") {
+    throw "the report lists values that ended in registers, or compiler-made names:`n$fire"
+  }
+  if ((Get-Command ptxas -ErrorAction SilentlyContinue) -and $fire -match "local memory") {
+    throw "the report lists local memory that ptxas gave no stack frame:`n$fire"
+  }
+  $fireDevice = $fire.Substring($fire.IndexOf("device report, PTX"))
+  $fireLines = @($fireDevice -split "`n" | Where-Object { $_.Trim() }).Count
+  if ($fireLines -gt 48) { throw "the device report takes $fireLines lines for 18 kernels:`n$fireDevice" }
   $refused = (& $CompilerPath explain tests/gpu/hardware_kernels.mettle 2>$null | Out-String -Width 4096)
   Assert-Report $refused @(
       "device report, PTX",
@@ -13554,12 +13571,31 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "mettle explain $File --keys=$Keys failed: $text" }
     return $text
   }
-  Assert-Report (Invoke-GpuScreen $kernels "8") @(
-      "8 Kernels", "Line  Kernel", "PTX 8.8 for", "Metal 3.2", "window_sum",
-      "7 in registers, 2 in local memory", "Device code  window_sum [PTX") "kernels tab"
+  $kernelsTab = Invoke-GpuScreen $kernels "8"
+  Assert-Report $kernelsTab @(
+      "8 Kernels", "Line  Kernel", "To look at", "Device functions", "Metal 3.2",
+      "Device code  window_sum [PTX", "t shows it on Metal 3.2") "kernels tab"
+  $kernelRow = '(?m)^\s+5\s+window_sum\s+2\s'
+  if (Get-Command ptxas -ErrorAction SilentlyContinue) {
+    Assert-Report $kernelsTab @("Measured by ptxas", "Registers  Warps") "measured kernels tab"
+    $kernelRow = '(?m)^\s+5\s+window_sum\s+\d+\s+\d+ of \d+\s+2\s'
+  }
+  if ([regex]::Matches($kernelsTab, $kernelRow).Count -ne 1) {
+    throw "the kernels tab does not give window_sum one row that matches '$kernelRow':`n$kernelsTab"
+  }
+  foreach ($narrow in @("120x30", "110x30")) {
+    $heading = @((Invoke-GpuScreen $kernels "8" $narrow) -split "`n" | Where-Object { $_ -match "Line  Kernel" })[0]
+    if ($heading -notmatch "To look at\s+\S\s") { throw "the kernels table does not fit its pane at ${narrow}:`n$heading" }
+  }
+  Assert-Report (Invoke-GpuScreen $kernels "8 t") @("Device code  window_sum [Metal 3.2", "t shows it on PTX") "target switch"
+  $fireOptimizer = Invoke-GpuScreen "examples/fire/fire_sim.mettle" "2" "150x60"
+  if ($fireOptimizer -match "__inl_|kept in registers") {
+    throw "the optimizer tab lists values that ended in registers:`n$fireOptimizer"
+  }
+  Assert-Report $fireOptimizer @("k_combust", "call to ``noise3``", "kept as a call") "kernel calls in optimizer"
   Assert-Report (Invoke-GpuScreen $kernels "2 / text:staged_acquire enter") @(
       "NOT promoted to asynchronous staging", "Verified", "barrier(workgroup, acquire);") "kernel remark in optimizer"
-  Assert-Report (Invoke-GpuScreen $kernels "1") @("Kernels    7 on PTX", "Kernels    7 on Metal 3.2", "Start here", "accumulate:60") "kernels in overview"
+  Assert-Report (Invoke-GpuScreen $kernels "1" "170x46") @("Kernels    7 on PTX", "and Metal 3.2, 6 to look at", "Start here", "accumulate:60") "kernels in overview"
   Assert-Report (Invoke-GpuScreen $kernels "8 d") @("d back to the detail", "ld.param") "device code view"
   Assert-Report (Invoke-GpuScreen "tests/explain_demo.mettle" "8" "140x30") @("No kernels in this file.") "empty kernels tab"
   $env:METTLE_CACHE = $savedCache

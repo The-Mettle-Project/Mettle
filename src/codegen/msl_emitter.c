@@ -1701,22 +1701,24 @@ static void report_note(MslFn *fn, const IRInstruction *in, const char *kind,
 static void report_whole_value(MslFn *fn, const IRInstruction *in,
                                const char *what, const char *kept,
                                size_t bytes) {
-  char shown[128], subject[176], headline[96], cause[300], reason[380];
-  int has_reason;
-  ir_display_name(in->dest.name, shown, sizeof(shown));
-  snprintf(subject, sizeof(subject), "%s `%s`", what, shown);
+  char subject[176], headline[96], cause[300], reason[380];
+  if (!ir_device_report_storage_reason(fn->func, in->dest.name, 1, cause,
+                                       sizeof(cause))) {
+    ir_explain_device_add(fn->func->name, IR_DEVICE_VALUES_IN_REGISTERS, 1);
+    return;
+  }
+  ir_device_report_value_subject(in->dest.name, what, subject, sizeof(subject));
   snprintf(headline, sizeof(headline), "kept as one %s, %zu bytes", kept,
            bytes);
-  has_reason = ir_device_report_storage_reason(fn->func, in->dest.name, 1,
-                                               cause, sizeof(cause));
   snprintf(reason, sizeof(reason), "%s, so it is not split into scalars",
            cause);
   ir_explain_device_add(fn->func->name, IR_DEVICE_VALUES_IN_MEMORY, 1);
   ir_explain_device_add(fn->func->name, IR_DEVICE_MEMORY_BYTES,
                         (long long)bytes);
   ir_explain_device_note(fn->func->name, in->location.line, "storage", subject,
-                         has_reason ? IR_DEVICE_MISS : IR_DEVICE_FACT, headline,
-                         has_reason ? reason : NULL, NULL, "local-memory");
+                         IR_DEVICE_MISS, headline, reason, NULL,
+                         "local-memory");
+  ir_explain_device_note_quantity("bytes", (long long)bytes);
 }
 
 static int report_declared_before(const IRFunction *func, size_t index) {

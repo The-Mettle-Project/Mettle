@@ -68,6 +68,7 @@ typedef struct {
   int columns;
   int rows;
   int tab;
+  int device;
   int focus;
   int source_view;
   int anchor;
@@ -370,6 +371,22 @@ static int ex_row_of_selected(const ExUi *ui) {
   return -1;
 }
 
+static int ex_kernels_width(const ExUi *ui) {
+  const ExTab *tab = &ui->report->tabs[EX_TAB_KERNELS];
+  int total = 3;
+  for (int c = 0; c < tab->column_count; c++) {
+    int width = ex_text_width(tab->columns[c]);
+    for (size_t i = 0; i < tab->count; i++) {
+      int w = ex_text_width(tab->entries[i].cells[c]);
+      if (w > width) {
+        width = w;
+      }
+    }
+    total += (width > 24 ? 24 : width) + 2;
+  }
+  return total;
+}
+
 static void ex_layout(ExUi *ui) {
   int body_y = 3;
   int body_h = ui->rows - 4;
@@ -389,8 +406,15 @@ static void ex_layout(ExUi *ui) {
     ui->detail_h = body_h - top - 1;
   } else {
     int left = ui->columns * 9 / 20;
+    int table = ui->tab == EX_TAB_KERNELS ? ex_kernels_width(ui) : 0;
+    if (table > ui->columns - 55) {
+      table = ui->columns - 55;
+    }
     if (left < 52) {
       left = 52;
+    }
+    if (left < table) {
+      left = table;
     }
     ui->list_x = 0;
     ui->list_y = body_y;
@@ -461,6 +485,9 @@ static const ExMachineFn *ex_entry_code(const ExUi *ui, const ExEntry *entry) {
   int best_rows = 0;
   int from;
   int to;
+  if (entry->device) {
+    return ex_report_device_code(ui->report, entry->function, ui->device);
+  }
   if (code || entry->line <= 0) {
     return code;
   }
@@ -635,6 +662,13 @@ static void ex_machine_section(ExUi *ui, const ExEntry *entry) {
     snprintf(head + n, sizeof(head) - n, ", %d vector", vector);
   }
   ex_wrap(&ui->detail, 0, width, head, EXA_BOLD, NULL, 0);
+  if (code->device && ui->report->device_count > 1) {
+    char hint[160];
+    snprintf(hint, sizeof(hint), "t shows it on %s",
+             ui->report->device_labels[(ui->device + 1) %
+                                       ui->report->device_count]);
+    ex_wrap(&ui->detail, 0, width, hint, EXA_DIM, NULL, 0);
+  }
   if (from == 0) {
     ex_wrap(&ui->detail, 0, width, "d shows every instruction beside the line "
                                    "it came from",
@@ -998,6 +1032,28 @@ static void ex_draw_tabs(ExUi *ui, ExScreen *s) {
   }
 }
 
+static void ex_fit_last_column(int *widths, int n, int heading) {
+  int need = heading < 8 ? 8 : heading;
+  int widest = 0;
+  int take;
+  for (int c = 1; c < n - 1; c++) {
+    if (widths[c] > widths[widest]) {
+      widest = c;
+    }
+  }
+  take = need - widths[n - 1];
+  if (take > widths[widest] - 8) {
+    take = widths[widest] - 8;
+  }
+  if (n > 1 && take > 0) {
+    widths[widest] -= take;
+    widths[n - 1] += take;
+  }
+  if (widths[n - 1] < 8) {
+    widths[n - 1] = 8;
+  }
+}
+
 static void ex_column_widths(const ExUi *ui, int *widths, int available) {
   const ExTab *tab = &ui->report->tabs[ui->tab];
   int n = tab->column_count;
@@ -1025,9 +1081,7 @@ static void ex_column_widths(const ExUi *ui, int *widths, int available) {
     used += widths[c] + 2;
   }
   widths[n - 1] = available - used;
-  if (widths[n - 1] < 8) {
-    widths[n - 1] = 8;
-  }
+  ex_fit_last_column(widths, n, ex_text_width(tab->columns[n - 1]));
 }
 
 static void ex_draw_entry_row(ExUi *ui, ExScreen *s, int y, const ExEntry *e,
@@ -1069,8 +1123,10 @@ static int ex_list_first(const ExUi *ui) {
 static void ex_draw_columns(ExUi *ui, ExScreen *s, int y, const int *widths) {
   const ExTab *tab = &ui->report->tabs[ui->tab];
   int x = ui->list_x + 2;
-  for (int c = 0; c < tab->column_count; c++) {
-    ex_put(s, x, y, widths[c], tab->columns[c], EXA_QUIET);
+  int end = ui->list_x + ui->list_w;
+  for (int c = 0; c < tab->column_count && x < end; c++) {
+    ex_put(s, x, y, widths[c] < end - x ? widths[c] : end - x, tab->columns[c],
+           EXA_QUIET);
     x += widths[c] + 2;
   }
 }
@@ -1277,6 +1333,7 @@ static void ex_draw_help(ExUi *ui, ExScreen *s) {
   static const char *const rows[][2] = {
       {"left right  tab", "switch tabs"},
       {"1 to 8", "jump to a tab"},
+      {"t", "a kernel's code on the other GPU target"},
       {"up down  j k", "move, or scroll the detail"},
       {"pgup pgdn  home end", "page, first, last"},
       {"enter", "open the detail, or follow a link"},
@@ -1609,6 +1666,11 @@ static void ex_key_char(ExUi *ui, unsigned code) {
     return;
   case 'e':
     ex_toggle_expanded(ui);
+    return;
+  case 't':
+    if (ui->report->device_count > 1) {
+      ui->device = (ui->device + 1) % ui->report->device_count;
+    }
     return;
   case ' ':
     ex_step(ui, ex_page(ui));

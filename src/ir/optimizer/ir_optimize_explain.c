@@ -61,6 +61,7 @@ typedef struct {
 
 static MTLC_THREAD_LOCAL char *g_explain_fragment = NULL;
 static MTLC_THREAD_LOCAL char *g_explain_fragment_label = NULL;
+static MTLC_THREAD_LOCAL size_t g_fragment_remarks_end = 0;
 static MTLC_THREAD_LOCAL char *g_explain_target = NULL;
 static MTLC_THREAD_LOCAL IRExplainChild g_children[IR_EXPLAIN_MAX_CHILDREN];
 static MTLC_THREAD_LOCAL size_t g_child_count = 0;
@@ -3904,6 +3905,7 @@ static void ir_explain_hide_empty_host(size_t start) {
 static void ir_explain_fragment_trim(size_t end) {
   if (g_explain_fragment) {
     g_report_len = end;
+    g_fragment_remarks_end = end;
   }
 }
 
@@ -4405,15 +4407,30 @@ static void ir_explain_child_failed(const IRExplainChild *child) {
   ir_explain_json_raw("}}");
 }
 
-static void ir_explain_child_splice(const IRExplainChild *child) {
-  char *text_path = ir_explain_fragment_path(child->stem, ".txt");
-  char *json_path = ir_explain_fragment_path(child->stem, ".json");
-  size_t text_length = 0, json_length = 0;
-  char *text = text_path ? ir_explain_read_whole(text_path, &text_length) : NULL;
-  char *json = json_path ? ir_explain_read_whole(json_path, &json_length) : NULL;
-  if (text) {
+static void ir_explain_child_text(const IRExplainChild *child,
+                                  const char *suffix, int *shown) {
+  char *path = ir_explain_fragment_path(child->stem, suffix);
+  size_t length = 0;
+  char *text = path ? ir_explain_read_whole(path, &length) : NULL;
+  if (text && length && !*shown) {
     ir_explain_emit("%s", text);
+    *shown = 1;
   }
+  if (path) {
+    remove(path);
+  }
+  free(text);
+  free(path);
+}
+
+static void ir_explain_child_splice(const IRExplainChild *child,
+                                    int *remarks_shown) {
+  char *json_path = ir_explain_fragment_path(child->stem, ".json");
+  size_t json_length = 0;
+  char *json = json_path ? ir_explain_read_whole(json_path, &json_length) : NULL;
+  int device_shown = 0;
+  ir_explain_child_text(child, ".remarks.txt", remarks_shown);
+  ir_explain_child_text(child, ".txt", &device_shown);
   if (json && json_length) {
     while (json_length && (json[json_length - 1] == '\n' ||
                            json[json_length - 1] == '\r')) {
@@ -4423,15 +4440,10 @@ static void ir_explain_child_splice(const IRExplainChild *child) {
   } else {
     ir_explain_json_raw("null");
   }
-  if (text_path) {
-    remove(text_path);
-  }
   if (json_path) {
     remove(json_path);
   }
-  free(text);
   free(json);
-  free(text_path);
   free(json_path);
 }
 
@@ -4439,6 +4451,7 @@ static void ir_explain_children_flush(void) {
   if (!g_child_count) {
     return;
   }
+  int remarks_shown = 0;
   ir_explain_json_raw("\"devices\":[");
   for (size_t i = 0; i < g_child_count; i++) {
     IRExplainChild *child = &g_children[i];
@@ -4446,7 +4459,7 @@ static void ir_explain_children_flush(void) {
     if (child->failure) {
       ir_explain_child_failed(child);
     } else {
-      ir_explain_child_splice(child);
+      ir_explain_child_splice(child, &remarks_shown);
     }
     free(child->stem);
     free(child->target);
@@ -4457,15 +4470,24 @@ static void ir_explain_children_flush(void) {
   g_child_count = 0;
 }
 
-static int ir_explain_write_fragment_text(void) {
-  char *path = ir_explain_fragment_path(g_explain_fragment, ".txt");
+static int ir_explain_write_fragment_part(const char *suffix, size_t from,
+                                          size_t to) {
+  char *path = ir_explain_fragment_path(g_explain_fragment, suffix);
   FILE *out = path ? fopen(path, "wb") : NULL;
   if (out) {
-    fwrite(g_report_buf, 1, g_report_len, out);
+    fwrite(g_report_buf + from, 1, to - from, out);
     fclose(out);
   }
   free(path);
   return out != NULL;
+}
+
+static int ir_explain_write_fragment_text(void) {
+  size_t split = g_fragment_remarks_end < g_report_len ? g_fragment_remarks_end
+                                                       : g_report_len;
+  int remarks = ir_explain_write_fragment_part(".remarks.txt", 0, split);
+  int device = ir_explain_write_fragment_part(".txt", split, g_report_len);
+  return remarks && device;
 }
 
 static void ir_explain_write_json(void) {
@@ -4514,7 +4536,9 @@ void ir_explain_finalize(int force_stderr) {
   if (!g_explain || !g_report_buf || g_report_len == 0) {
     return;
   }
+  size_t before_plan = g_report_len;
   ir_explain_splice_plan();
+  g_fragment_remarks_end += g_report_len - before_plan;
 
   size_t threshold = IR_EXPLAIN_STDERR_MAX_LINES;
   const char *env = getenv("METTLE_EXPLAIN_REPORT_LINES");

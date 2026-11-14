@@ -172,7 +172,8 @@ Each element of `kernels` has `fn`, `line`, `kernel` (false for a helper),
 
 | Counter | Contents |
 |---------|----------|
-| `valuesInRegisters`, `valuesInMemory`, `memoryBytes` | Locals and parameters by where they were emitted |
+| `valuesInRegisters`, `valuesInMemory`, `memoryBytes` | Locals and parameters by where they live |
+| `valuesPromoted` | Values the emitter wrote as local memory in a kernel ptxas gave no stack frame. They are counted in `valuesInRegisters` and carry no note |
 | `workgroupBytes`, `workgroupAtLaunch` | Static workgroup memory a block holds, and 1 when an arena is sized at launch |
 | `accessesNamed`, `accessesGeneric` | Loads and stores by address space |
 | `vectorGroups`, `loadsSaved` | Vector loads formed and the separate loads they replaced |
@@ -187,10 +188,15 @@ A counter is present only when it was counted or measured.
 per emitted line. `line` is the source line it came from, or 0 for code inlined
 from another file.
 
+`rows` holds only what the kernel has: a `values` row when something stayed in
+memory, a `memory` row for generic accesses or vector loads, a `workgroup
+memory` row, a `calls` row, and the measured rows.
+
 Each element of `notes` has `fn`, `line`, `kind` (`storage`, `access`,
 `vector`, `tensor`, `staging`, `tiles`, `atomic`, `control`, `numeric` or
 `specialization`), `subject`, `verdict` (`good`, `miss`, `fact` or `refused`),
-`headline`, `reason`, `fix`, `code`, `sites` and `quantities`.
+`headline`, `reason`, `fix`, `code`, `sites` and `quantities`. A `storage`
+note is written only for a value that some line keeps in memory.
 
 ```json
 {

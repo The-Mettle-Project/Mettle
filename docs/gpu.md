@@ -2125,7 +2125,7 @@ run time the driver JITs the PTX to SASS for the installed GPU.
 | `--report-occupancy` | With `--emit-ptx`, runs `ptxas -v` on the emitted module and prints each kernel's registers per thread and the occupancy ceiling they imply |
 | `--sms=N` | SM count used for the whole-card fill thresholds in that report. Defaults to asking the local driver, and the thresholds are omitted when no driver answers |
 | `--gpu-checks` | Emits the trap for each kernel-side `gpu_assert`. Without it those assertions cost nothing |
-| `--explain` | With `--emit-ptx` or `--emit-metal`, prints the device report: where each kernel's values live, what its accesses, tensor operations and staged copies became, and on PTX the registers, stack frame and occupancy `ptxas -v` measured |
+| `--explain` | With `--emit-ptx` or `--emit-metal`, prints the device report: one line per kernel with the registers, stack frame and occupancy `ptxas -v` measured on PTX, then the values that stayed in memory, the accesses through the generic path, and what its tensor operations and staged copies became |
 
 `--report-occupancy` needs `ptxas` on `PATH`, since it reads that tool's own
 register and spill accounting. The device report reads the same figures

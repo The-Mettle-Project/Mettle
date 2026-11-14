@@ -113,7 +113,8 @@ covers both halves. The host half is the program without its kernels: a
 `dispatch` shows as its own entry with the work items and blocks the compiler
 could fold, and the runtime's launch calls do not appear. The device half is
 compiled once for PTX and once for Metal, since both emitters run on any
-machine, and each kernel gets an entry per target.
+machine. The optimizer's remarks about the kernels print once, because both
+targets share that pipeline, and each target then gets a device report.
 
 ```mermaid
 flowchart LR
@@ -137,37 +138,43 @@ mettle explain tests/gpu/explain_device.mettle
 
 ```text
 -- device report, PTX 8.8 for sm_121a: explain_device.mettle -------------------
-  window_sum (kernel @ line 5, block 64)
-      \_ values: 7 in registers, 2 in local memory (52 bytes)
-      \_ memory: 6 accesses, each in a named space
-      \_ ptxas 12.9: 12 registers a thread, no spills, a 56 byte stack frame
-      \_ occupancy: all 48 warps fit on a multiprocessor
+  measured by ptxas 12.9; warps are the most that fit on one multiprocessor
+  window_sum (kernel @ line 5, block 64): 12 registers a thread, a 56 byte stack frame, all 48 warps fit
+      \_ values: 2 in local memory (52 bytes)
   window_sum (array `window` @ line 8): in local memory, 36 bytes  [local-memory]
        8 | var window: float32[9];
       \_ reason: lines 9 and 11 index it with values that are not constants, so its elements cannot each take a register
+  quad_sum (kernel @ line 17, block 32): 14 registers a thread, 24 of 48 warps fit, limited by the block size
+      \_ memory: 1 vector load in place of 4 separate loads
+  pair_sum (kernel @ line 22, block 32): 10 registers a thread, 24 of 48 warps fit, limited by the block size
   pair_sum (2 adjacent loads from `rows` @ line 23): kept as separate loads  [vector-load-alignment]
       23 | out[thread.x] = rows[0] + rows[1];
       \_ reason: the pointer's type declares no alignment, and one load of 2 elements needs 8 bytes
       \_ fix: declare `align(8)` in the pointer's type
 ```
 
-What a kernel entry holds:
+A kernel takes one line: its name, its block, and the figures `ptxas -v`
+measured for it. A second line follows only when the kernel has one of these:
 
-- **Values**: how many locals and parameters are in registers, and which arrays
-  and records were emitted as memory, each with the lines that kept it there.
-- **Memory**: how many loads and stores name their address space and how many go
-  through the generic path, and the vector loads a declared alignment formed.
+- **Values**: arrays and records that stayed in memory. Each one is then listed
+  with the lines that kept it there. A value that ends in a register is not
+  listed, whichever way the emitter wrote it: where ptxas gives the kernel no
+  stack frame, the report counts its values as register values.
+- **Memory**: loads and stores that go through the generic path, and the vector
+  loads a declared alignment formed.
 - **Workgroup memory**: the bytes a block holds, or an arena sized at launch.
 - **Calls**: the helpers that stayed device calls.
-- **Tensor operations**: the instruction each became, `mma.sync` or `wmma.mma`
-  on PTX and `simdgroup_matrix` tiles on Metal, and whether the accumulator
-  stays in registers across a chain, a loop or a region.
-- **Staging**: whether copies into workgroup memory became `cp.async`.
-- **Measured**: on PTX, the registers a thread, spill bytes, stack frame and
-  shared memory `ptxas -v` reports, and the warps that fit on a multiprocessor.
-  The storage lines are held to the stack frame: a value the report calls local
-  memory that ptxas gave no frame is reported as kept in registers by the
-  assembler.
+
+Tensor operations and staged copies are listed under their kernel with the
+instruction each became: `mma.sync` or `wmma.mma` on PTX, `simdgroup_matrix`
+tiles on Metal, `cp.async` for a staged copy. Kernels a target has nothing to
+say about share one closing line, `nothing to report for quad_sum, pair_sum`.
+
+In the viewer the Kernels tab is the same report as a table: one row per
+kernel, with the registers a thread, the warps that fit, and a count of the
+entries in the Optimizer tab that are worth a look. The Optimizer tab lists a
+kernel's missed optimizations only. A miss both targets report is one entry
+with a line for each target.
 
 A decision the optimizer declined is listed with the reason and a fix. The fix
 is printed only when applying it to a copy of the kernel makes the optimization
@@ -192,9 +199,9 @@ kernels are reported, and the refusing target shows the reason:
 
 The detail of a kernel entry shows the code the emitter wrote for the selected
 line, PTX or Metal Shading Language, and `d` opens the whole kernel with each
-source line above the device code it became. Device code carries no cycle
-cost: the driver compiles it again, so the measured figures are the ones the
-target's compiler reports.
+source line above the device code it became. `t` switches that code to the
+other target. Device code carries no cycle cost: the driver compiles it again,
+so the measured figures are the ones the target's compiler reports.
 
 The same report prints during a device build:
 
@@ -211,6 +218,7 @@ mettle --release --explain --emit-metal kernels.mettle -o kernels.metal
 - Enter: open the detail, or follow a link
 - s: the whole source file at this line
 - d: the machine code of the whole function at this line
+- t: a kernel's device code on the other GPU target
 - e: the whole function as the compiler rewrote it, with every inserted drop,
   defer and temporary marked `+`
 - Esc or Backspace: back

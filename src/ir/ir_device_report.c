@@ -241,6 +241,28 @@ int ir_device_report_storage_reason(const IRFunction *function,
   return 1;
 }
 
+int ir_device_report_value_subject(const char *name, const char *what,
+                                   char *subject, size_t size) {
+  const char *inner = NULL;
+  char shown[128];
+  if (name && strncmp(name, "__inl_", 6) == 0) {
+    for (const char *p = name; (p = strstr(p, "_local_")) != NULL; p += 7) {
+      inner = p + 7;
+    }
+    if (inner && *inner) {
+      snprintf(subject, size, "%s `%s` of an inlined call", what, inner);
+      return 1;
+    }
+  }
+  if (!name || strncmp(name, "__", 2) == 0 || strncmp(name, "ir_", 3) == 0) {
+    snprintf(subject, size, "a compiler-made %s", what);
+    return 0;
+  }
+  ir_display_name(name, shown, sizeof(shown));
+  snprintf(subject, size, "%s `%s`", what, shown);
+  return 1;
+}
+
 static const IRInstruction *device_producer(const IRFunction *function,
                                             size_t before, const char *name) {
   for (size_t i = before; i > 0; i--) {

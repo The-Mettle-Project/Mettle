@@ -6451,9 +6451,7 @@ static void compile_explain_target(const CompilerOptions *options) {
                              : options->emit_spirv ? "spirv"
                                                    : mtlc_target()->triple);
   if (options->explain_fragment) {
-    ir_explain_set_fragment(options->explain_fragment,
-                            options->emit_metal ? "kernels on Metal"
-                                                : "kernels on PTX");
+    ir_explain_set_fragment(options->explain_fragment, "kernels");
   }
 }
 

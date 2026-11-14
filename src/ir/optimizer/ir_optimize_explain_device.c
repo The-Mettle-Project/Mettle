@@ -75,7 +75,7 @@ static const char *const IR_DEVICE_COUNTER_NAMES[IR_DEVICE_COUNTER_COUNT] = {
     "callsKept",         "registers",        "spillStoreBytes",
     "spillLoadBytes",    "stackFrame",       "sharedBytes",
     "warps",             "warpLimit",        "threadWidth",
-    "maxThreads"};
+    "maxThreads",        "valuesPromoted"};
 
 static char *device_dup(const char *text) {
   size_t length;
@@ -91,22 +91,25 @@ static char *device_dup(const char *text) {
   return copy;
 }
 
+static void device_note_free(IRDeviceNote *note) {
+  free(note->kind);
+  free(note->subject);
+  free(note->headline);
+  free(note->reason);
+  free(note->fix);
+  free(note->code);
+  for (size_t q = 0; q < note->quantity_count; q++) {
+    free(note->quantities[q].name);
+  }
+}
+
 static void device_release(void) {
   for (size_t i = 0; i < g_device.function_count; i++) {
     free(g_device.functions[i].name);
     free(g_device.functions[i].limiter);
   }
   for (size_t i = 0; i < g_device.note_count; i++) {
-    IRDeviceNote *note = &g_device.notes[i];
-    free(note->kind);
-    free(note->subject);
-    free(note->headline);
-    free(note->reason);
-    free(note->fix);
-    free(note->code);
-    for (size_t q = 0; q < note->quantity_count; q++) {
-      free(note->quantities[q].name);
-    }
+    device_note_free(&g_device.notes[i]);
   }
   for (size_t i = 0; i < g_device.code_count; i++) {
     free(g_device.code[i].text);
@@ -325,6 +328,27 @@ static long long device_note_bytes(const IRDeviceNote *note) {
   return 0;
 }
 
+static void device_promote_storage(IRDeviceFunction *entry, size_t index) {
+  size_t kept = 0;
+  long long promoted = entry->counters[IR_DEVICE_VALUES_IN_MEMORY];
+  entry->counters[IR_DEVICE_VALUES_PROMOTED] = promoted;
+  entry->known[IR_DEVICE_VALUES_PROMOTED] = promoted > 0;
+  entry->counters[IR_DEVICE_VALUES_IN_REGISTERS] += promoted;
+  entry->known[IR_DEVICE_VALUES_IN_REGISTERS] = 1;
+  entry->counters[IR_DEVICE_VALUES_IN_MEMORY] = 0;
+  entry->counters[IR_DEVICE_MEMORY_BYTES] = 0;
+  for (size_t i = 0; i < g_device.note_count; i++) {
+    IRDeviceNote *note = &g_device.notes[i];
+    if (note->function == index && strcmp(note->kind, "storage") == 0) {
+      device_note_free(note);
+      continue;
+    }
+    g_device.notes[kept++] = *note;
+  }
+  g_device.note_count = kept;
+  g_device.last_note_recorded = 0;
+}
+
 void ir_explain_device_resolve_storage(const char *function) {
   size_t index = 0;
   IRDeviceFunction *entry = device_find(function, &index);
@@ -336,7 +360,11 @@ void ir_explain_device_resolve_storage(const char *function) {
   }
   frame = entry->counters[IR_DEVICE_MEASURED_STACK_FRAME];
   emitted = entry->counters[IR_DEVICE_MEMORY_BYTES];
-  if (frame != 0 && frame < emitted) {
+  if (frame == 0) {
+    device_promote_storage(entry, index);
+    return;
+  }
+  if (frame < emitted) {
     return;
   }
   for (size_t i = 0; i < g_device.note_count; i++) {
@@ -345,18 +373,8 @@ void ir_explain_device_resolve_storage(const char *function) {
     if (note->function != index || strcmp(note->kind, "storage") != 0) {
       continue;
     }
-    if (frame == 0) {
-      snprintf(headline, sizeof(headline),
-               "emitted as local memory, %lld bytes, and kept in registers by "
-               "the assembler",
-               device_note_bytes(note));
-      note->verdict = IR_DEVICE_GOOD;
-      free(note->reason);
-      note->reason = NULL;
-    } else {
-      snprintf(headline, sizeof(headline), "in local memory, %lld bytes",
-               device_note_bytes(note));
-    }
+    snprintf(headline, sizeof(headline), "in local memory, %lld bytes",
+             device_note_bytes(note));
     free(note->headline);
     note->headline = device_dup(headline);
   }
@@ -452,32 +470,22 @@ static long long device_value(const IRDeviceFunction *entry,
 
 static void device_values_row(const IRDeviceFunction *entry) {
   char row[256];
-  long long registers = device_value(entry, IR_DEVICE_VALUES_IN_REGISTERS);
   long long memory = device_value(entry, IR_DEVICE_VALUES_IN_MEMORY);
   long long bytes = device_value(entry, IR_DEVICE_MEMORY_BYTES);
   long long frame = device_value(entry, IR_DEVICE_MEASURED_STACK_FRAME);
   int measured = entry->known[IR_DEVICE_MEASURED_STACK_FRAME];
   const char *where = measured && frame >= bytes ? "in local memory"
                                                  : "emitted as local memory";
-  if (registers == 0 && memory == 0) {
+  if (memory == 0) {
     return;
   }
-  if (device_is_metal() && memory == 0) {
-    snprintf(row, sizeof(row), "values: %lld scalars", registers);
-  } else if (device_is_metal()) {
+  if (device_is_metal()) {
     snprintf(row, sizeof(row),
-             "values: %lld scalars, %lld arrays or records kept whole (%lld "
-             "bytes)",
-             registers, memory, bytes);
-  } else if (memory == 0) {
-    snprintf(row, sizeof(row), "values: %lld in registers", registers);
-  } else if (registers == 0) {
+             "values: %lld %s kept whole (%lld bytes)", memory,
+             memory == 1 ? "array or record" : "arrays or records", bytes);
+  } else {
     snprintf(row, sizeof(row), "values: %lld %s (%lld bytes)", memory, where,
              bytes);
-  } else {
-    snprintf(row, sizeof(row),
-             "values: %lld in registers, %lld %s (%lld bytes)", registers,
-             memory, where, bytes);
   }
   device_row(row);
 }
@@ -490,29 +498,20 @@ static void device_memory_row(const IRDeviceFunction *entry) {
   long long groups = device_value(entry, IR_DEVICE_VECTOR_GROUPS);
   long long saved = device_value(entry, IR_DEVICE_LOADS_SAVED);
   long long total = named + generic;
-  if (total == 0) {
+  if (generic == 0 && groups == 0) {
     return;
   }
-  if (generic == 0) {
-    used = (size_t)snprintf(row, sizeof(row), "memory: %lld %s, %s", total,
-                            total == 1 ? "access" : "accesses",
-                            total == 1 ? "in a named space"
-                                       : "each in a named space");
-  } else if (named == 0) {
-    used = (size_t)snprintf(row, sizeof(row), "memory: %lld %s, %s", total,
-                            total == 1 ? "access" : "accesses",
-                            total == 1 ? "through the generic path"
-                                       : "each through the generic path");
-  } else {
-    used = (size_t)snprintf(
-        row, sizeof(row),
-        "memory: %lld %s, %lld in a named space, %lld through the generic "
-        "path",
-        total, total == 1 ? "access" : "accesses", named, generic);
+  used = (size_t)snprintf(row, sizeof(row), "memory: ");
+  if (generic > 0) {
+    used += (size_t)snprintf(row + used, sizeof(row) - used,
+                             "%lld of %lld %s through the generic path%s",
+                             generic, total,
+                             total == 1 ? "access" : "accesses",
+                             groups > 0 ? ", " : "");
   }
   if (groups > 0 && used < sizeof(row)) {
     snprintf(row + used, sizeof(row) - used,
-             "; %lld vector %s replaced %lld separate loads", groups,
+             "%lld vector %s in place of %lld separate loads", groups,
              groups == 1 ? "load" : "loads", groups + saved);
   }
   device_row(row);
@@ -522,7 +521,8 @@ static void device_workgroup_row(const IRDeviceFunction *entry) {
   char row[200];
   long long bytes = device_value(entry, IR_DEVICE_WORKGROUP_BYTES);
   long long at_launch = device_value(entry, IR_DEVICE_WORKGROUP_LAUNCH_SIZED);
-  if (bytes == 0 && at_launch == 0) {
+  long long measured = device_value(entry, IR_DEVICE_MEASURED_SHARED_BYTES);
+  if (at_launch == 0 && (bytes == 0 || bytes == measured)) {
     return;
   }
   if (bytes > 0 && at_launch > 0) {
@@ -563,16 +563,10 @@ static void device_measured_ptx(const IRDeviceFunction *entry, char *row,
     used += (size_t)snprintf(row + used, used < size ? size - used : 0,
                              ", spills of %lld bytes stored and %lld loaded",
                              stores, loads);
-  } else {
-    used += (size_t)snprintf(row + used, used < size ? size - used : 0,
-                             ", no spills");
   }
   if (frame > 0) {
     used += (size_t)snprintf(row + used, used < size ? size - used : 0,
                              ", a %lld byte stack frame", frame);
-  } else if (device_value(entry, IR_DEVICE_MEMORY_BYTES) > 0) {
-    used += (size_t)snprintf(row + used, used < size ? size - used : 0,
-                             ", no stack frame");
   }
   if (shared > 0 && used < size) {
     snprintf(row + used, size - used, ", %lld bytes of shared memory a block",
@@ -588,12 +582,10 @@ static void device_occupancy_row(const IRDeviceFunction *entry) {
     return;
   }
   if (warps >= limit) {
-    snprintf(row, sizeof(row),
-             "occupancy: all %lld warps fit on a multiprocessor", limit);
+    snprintf(row, sizeof(row), "occupancy: all %lld warps fit", limit);
   } else {
-    snprintf(row, sizeof(row),
-             "occupancy: up to %lld of %lld warps fit on a multiprocessor%s%s",
-             warps, limit, entry->limiter ? ", limited by " : "",
+    snprintf(row, sizeof(row), "occupancy: %lld of %lld warps fit%s%s", warps,
+             limit, entry->limiter ? ", limited by " : "",
              entry->limiter ? entry->limiter : "");
   }
   device_row(row);
@@ -627,17 +619,35 @@ static void device_measured_row(const IRDeviceFunction *entry) {
   device_occupancy_row(entry);
 }
 
-static void device_collect_rows(const IRDeviceFunction *entry) {
+static size_t device_collect_rows(const IRDeviceFunction *entry) {
+  size_t counted;
   g_device_row_count = 0;
   device_values_row(entry);
   device_memory_row(entry);
   device_workgroup_row(entry);
   device_calls_row(entry);
+  counted = g_device_row_count;
   device_measured_row(entry);
+  return counted;
+}
+
+static void device_join_rows(size_t from, size_t to, int labeled,
+                             char *out, size_t size) {
+  size_t used = 0;
+  out[0] = '\0';
+  for (size_t i = from; i < to && used < size; i++) {
+    const char *colon = labeled ? NULL : strstr(g_device_rows[i], ": ");
+    used += (size_t)snprintf(out + used, size - used, "%s%s",
+                             i == from ? "" : labeled ? "; " : ", ",
+                             colon ? colon + 2 : g_device_rows[i]);
+  }
 }
 
 static void device_function_head(const IRDeviceFunction *entry) {
   char block[64] = "";
+  char measured[1024];
+  char counted[1024];
+  size_t plain = device_collect_rows(entry);
   if (entry->is_kernel && entry->block[0] > 0) {
     size_t used = (size_t)snprintf(block, sizeof(block), ", block %d",
                                    entry->block[0]);
@@ -648,15 +658,16 @@ static void device_function_head(const IRDeviceFunction *entry) {
                                "x%d", entry->block[i]);
     }
   }
-  ir_explain_emit("  %s%s%s (%s @ line %zu%s)\n",
+  device_join_rows(plain, g_device_row_count, 0, measured, sizeof(measured));
+  device_join_rows(0, plain, 1, counted, sizeof(counted));
+  ir_explain_emit("  %s%s%s (%s @ line %zu%s)%s%s\n",
                   ir_explain_style(IR_EXPLAIN_STYLE_BOLD), entry->name,
                   ir_explain_style(IR_EXPLAIN_STYLE_RESET),
                   entry->is_kernel ? "kernel" : "device function", entry->line,
-                  block);
-  device_collect_rows(entry);
-  for (size_t i = 0; i < g_device_row_count; i++) {
+                  block, measured[0] ? ": " : "", measured);
+  if (counted[0]) {
     ir_explain_emit("      %s%s %s%s\n", ir_explain_style(IR_EXPLAIN_STYLE_DIM),
-                    diag_glyphs()->elbow, g_device_rows[i],
+                    diag_glyphs()->elbow, counted,
                     ir_explain_style(IR_EXPLAIN_STYLE_RESET));
   }
 }
@@ -724,10 +735,47 @@ static void device_note_text(const IRDeviceNote *note) {
   }
 }
 
+static int device_function_quiet(size_t function) {
+  for (size_t n = 0; n < g_device.note_count; n++) {
+    if (g_device.notes[n].function == function) {
+      return 0;
+    }
+  }
+  device_collect_rows(&g_device.functions[function]);
+  return g_device_row_count == 0;
+}
+
+static void device_quiet_line(size_t count) {
+  char names[512];
+  size_t used = 0;
+  size_t shown = 0;
+  if (count == 0) {
+    return;
+  }
+  names[0] = '\0';
+  for (size_t f = 0; f < g_device.function_count && shown < 8; f++) {
+    if (device_function_quiet(f)) {
+      used += (size_t)snprintf(names + used,
+                               used < sizeof(names) ? sizeof(names) - used : 0,
+                               "%s%s", shown ? ", " : "",
+                               g_device.functions[f].name);
+      shown++;
+    }
+  }
+  if (shown < count && used < sizeof(names)) {
+    snprintf(names + used, sizeof(names) - used, " and %zu more",
+             count - shown);
+  }
+  ir_explain_emit("  %snothing to report for %s%s\n",
+                  ir_explain_style(IR_EXPLAIN_STYLE_DIM), names,
+                  ir_explain_style(IR_EXPLAIN_STYLE_RESET));
+}
+
 static void device_text(void) {
   char label[160];
   char target[96];
   size_t next = 0;
+  size_t quiet = 0;
   device_target_label(target, sizeof(target));
   snprintf(label, sizeof(label), "device report, %s", target);
   ir_explain_print_header(label);
@@ -735,12 +783,26 @@ static void device_text(void) {
     ir_explain_emit("  (no kernels in this file)\n\n");
     return;
   }
+  if (g_device.measured_by) {
+    ir_explain_emit("  %smeasured by %s%s%s\n",
+                    ir_explain_style(IR_EXPLAIN_STYLE_DIM),
+                    g_device.measured_by,
+                    device_is_metal()
+                        ? ""
+                        : "; warps are the most that fit on one multiprocessor",
+                    ir_explain_style(IR_EXPLAIN_STYLE_RESET));
+  }
   for (size_t f = 0; f < g_device.function_count; f++) {
+    if (device_function_quiet(f)) {
+      quiet++;
+      continue;
+    }
     device_function_head(&g_device.functions[f]);
     while (next < g_device.note_count && g_device.notes[next].function == f) {
       device_note_text(&g_device.notes[next++]);
     }
   }
+  device_quiet_line(quiet);
   ir_explain_emit("\n");
 }
 

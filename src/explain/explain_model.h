@@ -21,7 +21,8 @@ enum { EX_TONE_PLAIN, EX_TONE_DONE, EX_TONE_MISSED, EX_TONE_FIXABLE };
 
 enum { EXF_MISSED = 1, EXF_FIXABLE = 2 };
 
-#define EX_CELLS 4
+#define EX_CELLS 5
+#define EX_DEVICES 2
 
 typedef struct {
   char *label;
@@ -46,6 +47,7 @@ typedef struct {
   int order;
   int repeat;
   char *function;
+  int device;
 } ExEntry;
 
 typedef struct {
@@ -106,6 +108,9 @@ typedef struct {
   long long machine_total;
   ExExpandFn *expanded;
   size_t expanded_count;
+  char *device_labels[EX_DEVICES];
+  const ExJson *device_reports[EX_DEVICES];
+  int device_count;
 } ExReport;
 
 ExReport *ex_report_build(const ExJson *root, const char *source_path);
@@ -113,6 +118,8 @@ void ex_report_free(ExReport *report);
 const char *ex_report_line(const ExReport *report, int line);
 const ExMachineFn *ex_report_machine(const ExReport *report,
                                      const char *function);
+const ExMachineFn *ex_report_device_code(const ExReport *report,
+                                         const char *function, int device);
 const ExExpandFn *ex_report_expanded(const ExReport *report,
                                      const char *function);
 

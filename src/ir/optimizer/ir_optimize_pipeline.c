@@ -827,6 +827,7 @@ static void ir_explain_device_pipeline_end(const IRProgram *program,
     ir_tensor_explain_declines(program->functions[i]);
     ir_gpu_staging_explain_declines(program->functions[i]);
   }
+  ir_inline_explain_report_remaining((IRProgram *)program);
   ir_explain_set_device_functions(program, graph->reachable);
 }
 

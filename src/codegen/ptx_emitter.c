@@ -11172,24 +11172,23 @@ static void ptx_mark_line(PtxFn *fn, size_t line) {
 static void ptx_report_memory_value(PtxEmit *e, const IRInstruction *in,
                                     const char *what, int aggregate,
                                     size_t bytes) {
-  char shown[128], subject[176], headline[96], cause[300], reason[380];
-  int has_reason = 0;
+  char subject[176], headline[96], cause[300], reason[380];
   if (!e->fn.reported) return;
-  ir_display_name(in->dest.name, shown, sizeof(shown));
-  snprintf(subject, sizeof(subject), "%s `%s`", what, shown);
-  snprintf(headline, sizeof(headline), "emitted as local memory, %zu bytes",
-           bytes);
-  has_reason = ir_device_report_storage_reason(e->func, in->dest.name,
-                                               aggregate, cause, sizeof(cause));
-  snprintf(reason, sizeof(reason), "%s, so %s", cause,
-           aggregate ? "its elements cannot each take a register"
-                     : "it needs an address in memory");
   ir_explain_device_add(e->func->name, IR_DEVICE_VALUES_IN_MEMORY, 1);
   ir_explain_device_add(e->func->name, IR_DEVICE_MEMORY_BYTES,
                         (long long)bytes);
+  if (!ir_device_report_storage_reason(e->func, in->dest.name, aggregate,
+                                       cause, sizeof(cause)))
+    return;
+  ir_device_report_value_subject(in->dest.name, what, subject, sizeof(subject));
+  snprintf(headline, sizeof(headline), "emitted as local memory, %zu bytes",
+           bytes);
+  snprintf(reason, sizeof(reason), "%s, so %s", cause,
+           aggregate ? "its elements cannot each take a register"
+                     : "it needs an address in memory");
   ir_explain_device_note(e->func->name, in->location.line, "storage", subject,
-                         has_reason ? IR_DEVICE_MISS : IR_DEVICE_FACT, headline,
-                         has_reason ? reason : NULL, NULL, "local-memory");
+                         IR_DEVICE_MISS, headline, reason, NULL,
+                         "local-memory");
   ir_explain_device_note_quantity("bytes", (long long)bytes);
 }
 
