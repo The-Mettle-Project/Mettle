@@ -3312,6 +3312,12 @@ static int mir_emit_const_divmod(MirFunction *fn, MirOperand dst, MirOperand a,
   return mir_emit_remainder(fn, dst, A, Q, C);
 }
 
+int mir_probe_const_divmod(MirFunction *fn, MirVregId dst, MirVregId a,
+                           int64_t C, int uns, int mod) {
+  return mir_emit_const_divmod(fn, mir_op_vreg(dst), mir_op_vreg(a), C, uns,
+                               mod);
+}
+
 static int mir_emit_global_flush_names(MirFunction *fn, CodeGenerator *g,
                                        MirNameMap *map, const char **names,
                                        size_t count) {

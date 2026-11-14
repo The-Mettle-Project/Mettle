@@ -60,6 +60,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "codegen/binary/mir_prove.h"
 #include "ir/ir_smt.h"
 #include "ir/ir_theorem.h"
 #include "proof/smt.h"
@@ -5101,7 +5102,12 @@ int main(int argc, char *argv[]) {
       }
       printf("Peephole identities in src/ir/optimizer/ir_optimize_rewrite.c, "
              "proved against the IR semantics of src/ir/ir_interp.c:\n");
-      return ir_smt_prove_identity_table(stdout, verbose) ? 0 : 1;
+      int identities_ok = ir_smt_prove_identity_table(stdout, verbose);
+      printf("\nDivision by a constant as lowered to MIR in "
+             "src/codegen/binary/mir_lower.c, proved against the same "
+             "semantics:\n");
+      int division_ok = mir_prove_divmod_lowering(stdout, verbose);
+      return identities_ok && division_ok ? 0 : 1;
     }
     if (strcmp(argv[1], "why") == 0) {
       if (argc < 5) {
@@ -8675,6 +8681,15 @@ void print_usage(const char *program_name) {
          program_name);
   printf("       %s trace <file> <fn> [args...] Interpret a function and print a\n"
          "                           line-by-line value trace\n",
+         program_name);
+  printf("       %s prove <file> [--goals] [--interactive T]\n"
+         "                           Check every theorem and report each one\n",
+         program_name);
+  printf("       %s smt <file.smt2> [--stats]  Decide an SMT-LIB 2 problem with\n"
+         "                           checked refutations and models\n",
+         program_name);
+  printf("       %s prove-compiler           Prove the optimizer's peephole\n"
+         "                           identities against the IR semantics\n",
          program_name);
   printf("Options:\n");
   printf("  --error-format=F    Diagnostic output format: human (default) or json\n"

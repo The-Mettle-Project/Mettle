@@ -4802,6 +4802,7 @@ try {
   $out = & $CompilerPath prove-compiler --quiet 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "a peephole identity was refuted: $out" }
   if ($out -notmatch "30 identities, 570 obligations .* 0 refuted") { throw "identity proof summary changed: $out" }
+  if ($out -notmatch "382 constant divisions lowered by mir_emit_const_divmod: 382 proved, 0 refuted") { throw "division lowering proof summary changed: $out" }
   $out = & $CompilerPath smt "tests/smt_bitvector.smt2" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "mettle smt failed: $out" }
   $expected = "strength reduction\s+unsat\s+magic division without the fixup\s+sat\s+\(\(x #x6fffffff\)\)\s+read over write\s+unsat\s+uninterpreted function congruence\s+unsat\s+a satisfiable store\s+sat"

@@ -219,6 +219,25 @@ power-of-two pattern allows:
 
 A row the solver refutes is printed with the input that breaks it.
 
+It then runs the x86-64 backend's own division lowering,
+`mir_emit_const_divmod` in `src/codegen/binary/mir_lower.c`, for every
+power-of-two divisor from 1 to 2^62, their negations, `-1` and `INT64_MIN`,
+signed and unsigned, quotient and remainder. It executes the MIR instructions
+that come out symbolically and proves each sequence computes the IR's `/` or
+`%` for every 64-bit dividend:
+
+```text
+382 constant divisions lowered by mir_emit_const_divmod: 382 proved, 0 refuted, 0 not decided, 1048.7 ms
+```
+
+With the rounding bias removed from the signed power-of-two sequence, 250 of
+the 382 are refuted, each with a dividend that shows the error.
+
+Division by other constants uses a multiply-high by a magic number. Proving
+those for all 64-bit dividends is beyond bit-blasting: the solver does not
+finish `x / 10` in 100 seconds, even for 32-bit dividends. They are checked by
+`--verify` on generated inputs.
+
 [Rewrite rules](rewrite-rules.md) are proved for every input before the
 compiler applies them, and fall back to generated inputs only when the solver
 cannot model a side, such as one that computes with floats.
