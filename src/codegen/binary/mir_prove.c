@@ -1,5 +1,6 @@
 #include "codegen/binary/mir.h"
 #include "codegen/binary/mir_prove.h"
+#include "codegen/binary/strength_rules.h"
 #include "common.h"
 #include "ir/ir_smt.h"
 #include "proof/lia.h"
@@ -869,6 +870,60 @@ out:
   free(c.vals);
   lia_free(c.sys);
   return proved;
+}
+
+int mir_prove_strength_table(FILE *out, int verbose) {
+  int total = 0, proved = 0, refuted = 0;
+  double t0 = mettle_now_ms();
+  for (int uns = 0; uns < 2; uns++) {
+    for (int k = 1; k <= 62; k++) {
+      long long shapes[3] = {(long long)1 << k, ((long long)1 << k) + 1,
+                             ((long long)1 << k) - 1};
+      for (int s = 0; s < 3; s++) {
+        long long c = shapes[s];
+        CgStrengthRewrite rw;
+        if (!cg_strength_classify('*', c, uns, &rw) ||
+            (rw.kind != CG_SR_MUL_SHL && rw.kind != CG_SR_MUL_SHL_ADD &&
+             rw.kind != CG_SR_MUL_SHL_SUB)) {
+          continue;
+        }
+        total++;
+        SmtCtx *ctx = smt_ctx_new();
+        SmtTerm x = smt_var(ctx, "x", smt_bv_sort(ctx, 64));
+        SmtTerm shifted = smt_mk2(ctx, SMT_K_BVSHL, x,
+                                  smt_bv_u64(ctx, 64, (uint64_t)rw.shift));
+        SmtTerm rewritten =
+            rw.kind == CG_SR_MUL_SHL ? shifted
+            : rw.kind == CG_SR_MUL_SHL_ADD
+                ? smt_mk2(ctx, SMT_K_BVADD, shifted, x)
+                : smt_mk2(ctx, SMT_K_BVSUB, shifted, x);
+        SmtTerm claim = smt_eq(ctx, rewritten,
+                               smt_mk2(ctx, SMT_K_BVMUL, x,
+                                       smt_bv_i64(ctx, 64, c)));
+        SmtSolver *solver = NULL;
+        SmtResult r = smt_prove(ctx, claim, 1, 20000, &solver);
+        if (r == SMT_UNSAT) {
+          proved++;
+          if (verbose) {
+            fprintf(out, "  proved   x * %lld => kind %d shift %d\n", c,
+                    (int)rw.kind, rw.shift);
+          }
+        } else {
+          refuted += r == SMT_SAT;
+          fprintf(out, "  %s x * %lld => kind %d shift %d\n",
+                  r == SMT_SAT ? "REFUTED " : "open    ", c, (int)rw.kind,
+                  rw.shift);
+        }
+        smt_solver_free(solver);
+        smt_ctx_free(ctx);
+      }
+    }
+  }
+  fprintf(out,
+          "%d multiplications classified by cg_strength_classify: %d proved, "
+          "%d refuted, %.1f ms\n",
+          total, proved, refuted, mettle_now_ms() - t0);
+  return proved == total;
 }
 
 int mir_prove_divmod_lowering(FILE *out, int verbose) {

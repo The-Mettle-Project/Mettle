@@ -63,6 +63,24 @@ static long long g_apps_unverifiable = 0;
 static long long g_apps_no_input = 0;
 static long long g_apps_proved = 0;
 static long long g_apps_smt_unconfirmed = 0;
+static char g_smt_reasons[24][96];
+static long long g_smt_reason_counts[24];
+static size_t g_smt_reason_count = 0;
+
+static void irv_note_smt_reason(const char *why) {
+  char key[96];
+  snprintf(key, sizeof(key), "%s", why && why[0] ? why : "unknown");
+  for (size_t i = 0; i < g_smt_reason_count; i++) {
+    if (strcmp(g_smt_reasons[i], key) == 0) {
+      g_smt_reason_counts[i]++;
+      return;
+    }
+  }
+  if (g_smt_reason_count < 24) {
+    snprintf(g_smt_reasons[g_smt_reason_count], 96, "%s", key);
+    g_smt_reason_counts[g_smt_reason_count++] = 1;
+  }
+}
 static long long g_divergences = 0;
 static IRVQuarantine g_quarantine[IRV_MAX_QUARANTINE];
 static size_t g_quarantine_count = 0;
@@ -1636,6 +1654,9 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
     g_apps_proved++;
     return 1;
   }
+  if (smt.verdict == IR_SMT_UNKNOWN && irv_stats_enabled()) {
+    irv_note_smt_reason(smt.why);
+  }
   if (smt.verdict == IR_SMT_REFUTED) {
     IRVHarvest harvest;
     memset(&harvest, 0, sizeof(harvest));
@@ -1835,6 +1856,11 @@ void ir_verify_end_program(void) {
             "after-runs %.0f ms (%lld)\n",
             dim, reset, g_ms_snapshot, g_n_snapshot, g_n_snap_hits, g_ms_setup,
             g_ms_before, g_n_before, g_ms_after, g_n_after);
+    for (size_t i = 0; i < g_smt_reason_count; i++) {
+      fprintf(stderr, "  %ssmt skipped%s %lld: %s\n", dim, reset,
+              g_smt_reason_counts[i], g_smt_reasons[i]);
+    }
+    g_smt_reason_count = 0;
     g_ms_snapshot = g_ms_before = g_ms_after = g_ms_setup = 0;
     g_n_snapshot = g_n_before = g_n_after = g_n_snap_hits = 0;
   }
