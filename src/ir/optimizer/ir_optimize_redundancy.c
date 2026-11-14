@@ -1334,7 +1334,8 @@ static int sel_operand_matches(const IROperand *a, const IROperand *b,
   case IR_OPERAND_INT:
     return a->int_value == b->int_value;
   case IR_OPERAND_FLOAT:
-    return a->float_value == b->float_value && a->float_bits == b->float_bits;
+    return ir_float_value_identical(a->float_value, b->float_value) &&
+           a->float_bits == b->float_bits;
   default:
     return 1;
   }

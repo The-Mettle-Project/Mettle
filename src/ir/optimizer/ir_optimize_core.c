@@ -1290,7 +1290,7 @@ int ir_operand_equals(const IROperand *lhs, const IROperand *rhs) {
   case IR_OPERAND_INT:
     return lhs->int_value == rhs->int_value;
   case IR_OPERAND_FLOAT:
-    return lhs->float_value == rhs->float_value &&
+    return ir_float_value_identical(lhs->float_value, rhs->float_value) &&
            ((lhs->float_bits == 32) == (rhs->float_bits == 32));
   case IR_OPERAND_STRING: {
     size_t lhs_length = ir_operand_string_length(lhs);

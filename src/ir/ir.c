@@ -740,11 +740,16 @@ int ir_tensor_mma_desc_equal(const MtlcTensorMmaDesc *a,
          a->b_scale_values == b->b_scale_values;
 }
 
+int ir_float_value_identical(double lhs, double rhs) {
+  return memcmp(&lhs, &rhs, sizeof(double)) == 0;
+}
+
 int ir_operand_same(const IROperand *a, const IROperand *b) {
   if (!a || !b || a->kind != b->kind || a->int_value != b->int_value ||
       a->float_bits != b->float_bits)
     return 0;
-  if (a->kind == IR_OPERAND_FLOAT && a->float_value != b->float_value)
+  if (a->kind == IR_OPERAND_FLOAT &&
+      !ir_float_value_identical(a->float_value, b->float_value))
     return 0;
   if ((a->name == NULL) != (b->name == NULL)) return 0;
   return !a->name || strcmp(a->name, b->name) == 0;

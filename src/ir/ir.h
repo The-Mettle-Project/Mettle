@@ -267,6 +267,7 @@ size_t ir_tensor_scale_rows_operand_count(const MtlcTensorMmaDesc *desc);
 int ir_tensor_mma_desc_equal(const MtlcTensorMmaDesc *lhs,
                              const MtlcTensorMmaDesc *rhs);
 int ir_operand_same(const IROperand *lhs, const IROperand *rhs);
+int ir_float_value_identical(double lhs, double rhs);
 MtlcTypeKind ir_tensor_element_storage_kind(MtlcTensorElement element);
 
 typedef struct {
