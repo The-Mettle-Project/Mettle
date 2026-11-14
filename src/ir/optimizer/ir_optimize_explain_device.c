@@ -435,6 +435,11 @@ static void device_memory_row(const IRDeviceFunction *entry) {
                             total == 1 ? "access" : "accesses",
                             total == 1 ? "in a named space"
                                        : "each in a named space");
+  } else if (named == 0) {
+    used = (size_t)snprintf(row, sizeof(row), "memory: %lld %s, %s", total,
+                            total == 1 ? "access" : "accesses",
+                            total == 1 ? "through the generic path"
+                                       : "each through the generic path");
   } else {
     used = (size_t)snprintf(
         row, sizeof(row),
@@ -503,20 +508,29 @@ static void device_measured_ptx(const IRDeviceFunction *entry, char *row,
     used += (size_t)snprintf(row + used, used < size ? size - used : 0,
                              ", a %lld byte stack frame", frame);
   }
-  if (shared > 0) {
-    used += (size_t)snprintf(row + used, used < size ? size - used : 0,
-                             ", %lld bytes of shared memory a block", shared);
+  if (shared > 0 && used < size) {
+    snprintf(row + used, size - used, ", %lld bytes of shared memory a block",
+             shared);
   }
-  if (entry->known[IR_DEVICE_MEASURED_WARPS]) {
-    used += (size_t)snprintf(
-        row + used, used < size ? size - used : 0,
-        ", %lld of %lld warps resident on a multiprocessor",
-        device_value(entry, IR_DEVICE_MEASURED_WARPS),
-        device_value(entry, IR_DEVICE_MEASURED_WARP_LIMIT));
-    if (entry->limiter && used < size) {
-      snprintf(row + used, size - used, ", limited by %s", entry->limiter);
-    }
+}
+
+static void device_occupancy_row(const IRDeviceFunction *entry) {
+  char row[200];
+  long long warps = device_value(entry, IR_DEVICE_MEASURED_WARPS);
+  long long limit = device_value(entry, IR_DEVICE_MEASURED_WARP_LIMIT);
+  if (!entry->known[IR_DEVICE_MEASURED_WARPS]) {
+    return;
   }
+  if (warps >= limit) {
+    snprintf(row, sizeof(row),
+             "occupancy: all %lld warps fit on a multiprocessor", limit);
+  } else {
+    snprintf(row, sizeof(row),
+             "occupancy: up to %lld of %lld warps fit on a multiprocessor%s%s",
+             warps, limit, entry->limiter ? ", limited by " : "",
+             entry->limiter ? entry->limiter : "");
+  }
+  device_row(row);
 }
 
 static void device_measured_metal(const IRDeviceFunction *entry, char *row,
@@ -544,6 +558,7 @@ static void device_measured_row(const IRDeviceFunction *entry) {
     return;
   }
   device_row(row);
+  device_occupancy_row(entry);
 }
 
 static void device_function_head(const IRDeviceFunction *entry) {
@@ -599,7 +614,8 @@ static void device_note_text(const IRDeviceNote *note) {
   const IRDeviceFunction *entry = &g_device.functions[note->function];
   char tag[96] = "";
   char sites[48] = "";
-  if (note->code && note->verdict != IR_DEVICE_GOOD) {
+  if (note->code && (note->verdict == IR_DEVICE_MISS ||
+                     note->verdict == IR_DEVICE_REFUSED)) {
     snprintf(tag, sizeof(tag), "  %s[%s]%s",
              ir_explain_style(IR_EXPLAIN_STYLE_DIM), note->code,
              ir_explain_style(IR_EXPLAIN_STYLE_RESET));

@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "ir_optimize_explain_internal.h"
 #include "../ir_verify.h"
 #include "../ir_explain_ownership.h"
 #include "../ir_safety.h"
@@ -898,6 +899,12 @@ static int ir_optimize_portable_program_pipeline(
       !ir_inline_enforce_contracts(program)) {
     ir_optimize_note_user_error();
     ok = 0;
+  }
+
+  for (size_t i = 0; ok && gpu_only && i < program->function_count; i++) {
+    if (!graph.reachable || !graph.reachable[i]) continue;
+    ir_tensor_explain_declines(program->functions[i]);
+    ir_gpu_staging_explain_declines(program->functions[i]);
   }
 
   ir_explain_set_program(NULL);

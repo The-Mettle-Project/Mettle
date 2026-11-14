@@ -29,6 +29,7 @@
 #include "ir/ir.h"
 #include "ir/ir_lowering.h"
 #include "ir/ir_optimize.h"
+#include "ir/ir_explain_device.h"
 #include "ir/ir_explain_memory.h"
 #include "ir/ir_explain_ownership.h"
 #include "ir/ir_profile.h"
@@ -3536,11 +3537,72 @@ static int confirm_tile_residency(const IRProgram *program,
   return ok;
 }
 
-static void report_ptx_occupancy(const IRProgram *program,
-                                 const char *ptx_path, const char *arch,
-                                 int sm_count, int sm_count_is_local) {
+typedef struct {
+  char entry[256];
+  int registers;
+  int block;
+  long long shared_bytes;
+  long long spill_stores;
+  long long spill_loads;
+  long long stack_frame;
+  long long register_warp_limit;
+  long long warps_per_block;
+  long long blocks;
+  long long warps;
+  const char *limiter;
+} PtxasKernel;
+
+static int kernel_block_threads(const IRProgram *program, const char *entry) {
+  for (size_t f = 0; program && f < program->function_count; f++) {
+    const IRFunction *function = program->functions[f];
+    if (function && function->is_kernel && function->name &&
+        strcmp(function->name, entry) == 0 && function->kernel_block[0] > 0) {
+      return function->kernel_block[0] *
+             (function->kernel_block[1] > 0 ? function->kernel_block[1] : 1) *
+             (function->kernel_block[2] > 0 ? function->kernel_block[2] : 1);
+    }
+  }
+  return 0;
+}
+
+static void ptxas_resident_warps(PtxasKernel *kernel) {
+  kernel->register_warp_limit =
+      kernel->registers > 0 ? 65536ll / ((long long)kernel->registers * 32)
+                            : 48;
+  if (kernel->register_warp_limit > 48) kernel->register_warp_limit = 48;
+  kernel->warps = kernel->register_warp_limit;
+  kernel->limiter =
+      kernel->registers > 0 && kernel->register_warp_limit < 48 ? "register"
+                                                                : "";
+  if (kernel->block <= 0) return;
+  kernel->warps_per_block = (kernel->block + 31) / 32;
+  kernel->blocks = kernel->warps_per_block > 0
+                       ? kernel->register_warp_limit / kernel->warps_per_block
+                       : 0;
+  if (kernel->blocks > 24) kernel->blocks = 24;
+  if (kernel->shared_bytes > 0) {
+    long long smem_blocks = 102400ll / kernel->shared_bytes;
+    if (smem_blocks < kernel->blocks) {
+      kernel->blocks = smem_blocks;
+      kernel->limiter = "shared-memory";
+    }
+  }
+  kernel->warps = kernel->blocks * kernel->warps_per_block;
+  if (kernel->warps > 48) kernel->warps = 48;
+  if (kernel->warps < kernel->register_warp_limit && !*kernel->limiter)
+    kernel->limiter = "block";
+}
+
+static PtxasKernel *ptxas_measure(const IRProgram *program,
+                                  const char *ptx_path, const char *arch,
+                                  size_t *count, int *ran, int *status) {
   char cubin[512];
   char command[1200];
+  PtxasKernel *kernels = NULL;
+  size_t capacity = 0;
+  *count = 0;
+  *ran = 0;
+  *status = 0;
   snprintf(cubin, sizeof(cubin), "%s.occupancy.cubin", ptx_path);
   snprintf(command, sizeof(command), "ptxas -v -arch=%s \"%s\" -o \"%s\" 2>&1",
            arch ? arch : "sm_121a", ptx_path, cubin);
@@ -3550,24 +3612,15 @@ static void report_ptx_occupancy(const IRProgram *program,
   FILE *pipe = popen(command, "r");
 #endif
   if (!pipe) {
-    fprintf(stderr, "--report-occupancy: could not run ptxas\n");
-    return;
+    return NULL;
   }
-  printf("Occupancy report (%s; upper bound: 64K regs/SM, 48 warps/SM, "
-         "100KB smem/SM, allocation unit 1",
-         arch ? arch : "sm_121a");
-  if (sm_count > 0) {
-    printf("; %d SMs, %s", sm_count, sm_count_is_local ? "local GPU" : "--sms");
-  }
-  printf("):\n");
+  *ran = 1;
   char line[512];
   char entry[256] = {0};
   long long entry_smem = 0;
   long long spill_stores = 0;
   long long spill_loads = 0;
   long long stack_frame = 0;
-  int reported = 0;
-  int any_spill = 0;
   while (fgets(line, sizeof(line), pipe)) {
     char name[256];
     if (sscanf(line, " ptxas info : Compiling entry function '%255[^']'",
@@ -3600,85 +3653,151 @@ static void report_ptx_occupancy(const IRProgram *program,
     if (smem >= 0) {
       entry_smem = smem;
     }
-    long long register_warp_limit =
-        registers > 0 ? 65536ll / ((long long)registers * 32) : 48;
-    if (register_warp_limit > 48) register_warp_limit = 48;
-
-    int block = 0;
-    for (size_t f = 0; program && f < program->function_count; f++) {
-      const IRFunction *function = program->functions[f];
-      if (function && function->is_kernel && function->name &&
-          strcmp(function->name, entry) == 0 && function->kernel_block[0] > 0) {
-        block = function->kernel_block[0] *
-                (function->kernel_block[1] > 0 ? function->kernel_block[1] : 1) *
-                (function->kernel_block[2] > 0 ? function->kernel_block[2] : 1);
+    if (*count == capacity) {
+      size_t grown_capacity = capacity ? capacity * 2 : 8;
+      PtxasKernel *grown = realloc(kernels, grown_capacity * sizeof(*grown));
+      if (!grown) {
         break;
       }
+      kernels = grown;
+      capacity = grown_capacity;
     }
-
-    long long warps = register_warp_limit;
-    const char *limiter = registers > 0 && register_warp_limit < 48
-                              ? ", register-limited"
-                              : "";
-    if (block > 0) {
-      long long warps_per_block = (block + 31) / 32;
-      long long blocks = warps_per_block > 0
-                             ? register_warp_limit / warps_per_block
-                             : 0;
-      if (blocks > 24) blocks = 24;
-      if (entry_smem > 0) {
-        long long smem_blocks = 102400ll / entry_smem;
-        if (smem_blocks < blocks) {
-          blocks = smem_blocks;
-          limiter = ", shared-memory-limited";
-        }
-      }
-      warps = blocks * warps_per_block;
-      if (warps > 48) warps = 48;
-      if (warps < register_warp_limit && !*limiter) limiter = ", block-limited";
-      printf("  %s: %d registers, block %d (%lld warps/block, %lld blocks) -> "
-             "%lld/48 resident warps (%lld%%)%s",
-             entry, registers, block, warps_per_block, blocks, warps,
-             warps * 100 / 48, limiter);
-      if (sm_count > 0 && blocks > 0) {
-        printf("; full card = %lld blocks (%d SMs x %lld)",
-               (long long)sm_count * blocks, sm_count, blocks);
-      }
-    } else {
-      printf("  %s: %d registers -> %lld/48 resident warps (%lld%%)%s",
-             entry, registers, warps, warps * 100 / 48, limiter);
-      if (sm_count > 0 && warps > 0) {
-        printf("; full card = %lld warps (%d SMs x %lld)",
-               (long long)sm_count * warps, sm_count, warps);
-      }
-    }
-    if (spill_stores > 0 || spill_loads > 0) {
-      printf("; SPILLS %lld bytes stored, %lld loaded", spill_stores,
-             spill_loads);
-      any_spill = 1;
-    } else if (stack_frame > 0) {
-      printf("; %lld byte stack frame", stack_frame);
-    }
-    printf("\n");
-    reported = 1;
+    PtxasKernel *kernel = &kernels[(*count)++];
+    memset(kernel, 0, sizeof(*kernel));
+    snprintf(kernel->entry, sizeof(kernel->entry), "%s", entry);
+    kernel->registers = registers;
+    kernel->block = kernel_block_threads(program, entry);
+    kernel->shared_bytes = entry_smem;
+    kernel->spill_stores = spill_stores;
+    kernel->spill_loads = spill_loads;
+    kernel->stack_frame = stack_frame;
+    ptxas_resident_warps(kernel);
     entry[0] = '\0';
   }
 #ifdef _WIN32
-  int status = _pclose(pipe);
+  *status = _pclose(pipe);
 #else
-  int status = pclose(pipe);
+  *status = pclose(pipe);
 #endif
   remove(cubin);
+  return kernels;
+}
+
+static void report_ptx_kernel_occupancy(const PtxasKernel *kernel,
+                                        int sm_count) {
+  char limiter[40] = "";
+  if (*kernel->limiter) {
+    snprintf(limiter, sizeof(limiter), ", %s-limited", kernel->limiter);
+  }
+  if (kernel->block > 0) {
+    printf("  %s: %d registers, block %d (%lld warps/block, %lld blocks) -> "
+           "%lld/48 resident warps (%lld%%)%s",
+           kernel->entry, kernel->registers, kernel->block,
+           kernel->warps_per_block, kernel->blocks, kernel->warps,
+           kernel->warps * 100 / 48, limiter);
+    if (sm_count > 0 && kernel->blocks > 0) {
+      printf("; full card = %lld blocks (%d SMs x %lld)",
+             (long long)sm_count * kernel->blocks, sm_count, kernel->blocks);
+    }
+  } else {
+    printf("  %s: %d registers -> %lld/48 resident warps (%lld%%)%s",
+           kernel->entry, kernel->registers, kernel->warps,
+           kernel->warps * 100 / 48, limiter);
+    if (sm_count > 0 && kernel->warps > 0) {
+      printf("; full card = %lld warps (%d SMs x %lld)",
+             (long long)sm_count * kernel->warps, sm_count, kernel->warps);
+    }
+  }
+  if (kernel->spill_stores > 0 || kernel->spill_loads > 0) {
+    printf("; SPILLS %lld bytes stored, %lld loaded", kernel->spill_stores,
+           kernel->spill_loads);
+  } else if (kernel->stack_frame > 0) {
+    printf("; %lld byte stack frame", kernel->stack_frame);
+  }
+  printf("\n");
+}
+
+static void report_ptx_occupancy(const IRProgram *program,
+                                 const char *ptx_path, const char *arch,
+                                 int sm_count, int sm_count_is_local) {
+  size_t count = 0;
+  int ran = 0;
+  int status = 0;
+  int any_spill = 0;
+  PtxasKernel *kernels =
+      ptxas_measure(program, ptx_path, arch, &count, &ran, &status);
+  if (!ran) {
+    fprintf(stderr, "--report-occupancy: could not run ptxas\n");
+    return;
+  }
+  printf("Occupancy report (%s; upper bound: 64K regs/SM, 48 warps/SM, "
+         "100KB smem/SM, allocation unit 1",
+         arch ? arch : "sm_121a");
+  if (sm_count > 0) {
+    printf("; %d SMs, %s", sm_count, sm_count_is_local ? "local GPU" : "--sms");
+  }
+  printf("):\n");
+  for (size_t i = 0; i < count; i++) {
+    report_ptx_kernel_occupancy(&kernels[i], sm_count);
+    any_spill |= kernels[i].spill_stores > 0 || kernels[i].spill_loads > 0;
+  }
+  free(kernels);
   if (any_spill) {
     printf("  note: a spilling kernel pays a local-memory round trip per "
            "spilled access; that costs more than the residency above.\n");
   }
-  if (!reported) {
+  if (!count) {
     fprintf(stderr,
             "--report-occupancy: no ptxas resource report (is ptxas on PATH "
             "and the target '%s' supported?); ptxas exit %d\n",
             arch ? arch : "sm_121a", status);
   }
+}
+
+static void explain_ptx_measures(const IRProgram *program,
+                                 const char *ptx_path, const char *arch) {
+  static const struct {
+    const char *limiter;
+    const char *words;
+  } LIMITERS[] = {{"register", "registers"},
+                  {"shared-memory", "shared memory"},
+                  {"block", "the block size"}};
+  size_t count = 0;
+  int ran = 0;
+  int status = 0;
+  char tool[64];
+  PtxasKernel *kernels = NULL;
+  if (!ir_explain_device_enabled() || !gpu_detect_ptxas_version() ||
+      !gpu_detect_ptxas_supports(arch ? arch : "sm_121a")) {
+    return;
+  }
+  kernels = ptxas_measure(program, ptx_path, arch, &count, &ran, &status);
+  snprintf(tool, sizeof(tool), "ptxas %s", gpu_detect_ptxas_version());
+  if (count) {
+    ir_explain_device_measured_by(tool);
+  }
+  for (size_t i = 0; i < count; i++) {
+    const PtxasKernel *kernel = &kernels[i];
+    const char *name = kernel->entry;
+    ir_explain_device_set(name, IR_DEVICE_MEASURED_REGISTERS,
+                          kernel->registers);
+    ir_explain_device_set(name, IR_DEVICE_MEASURED_SPILL_STORES,
+                          kernel->spill_stores);
+    ir_explain_device_set(name, IR_DEVICE_MEASURED_SPILL_LOADS,
+                          kernel->spill_loads);
+    ir_explain_device_set(name, IR_DEVICE_MEASURED_STACK_FRAME,
+                          kernel->stack_frame);
+    ir_explain_device_set(name, IR_DEVICE_MEASURED_SHARED_BYTES,
+                          kernel->shared_bytes);
+    ir_explain_device_set(name, IR_DEVICE_MEASURED_WARPS, kernel->warps);
+    ir_explain_device_set(name, IR_DEVICE_MEASURED_WARP_LIMIT, 48);
+    for (size_t l = 0; l < sizeof(LIMITERS) / sizeof(LIMITERS[0]); l++) {
+      if (strcmp(kernel->limiter, LIMITERS[l].limiter) == 0) {
+        ir_explain_device_limiter(name, LIMITERS[l].words);
+      }
+    }
+  }
+  free(kernels);
 }
 
 static int detect_host_gpu_ptx_target(char *out, size_t out_size) {
@@ -6734,6 +6853,7 @@ static int compile_emit_ptx(IRProgram *ir_program, ASTNode *program,
     return 1;
   }
   if (options->explain && options->optimize) {
+    explain_ptx_measures(ir_program, output_filename, options->ptx_target);
     ir_explain_target_flush("PTX");
   }
   if (!confirm_tile_residency(ir_program, output_filename, options->ptx_target,
@@ -6741,7 +6861,7 @@ static int compile_emit_ptx(IRProgram *ir_program, ASTNode *program,
     remove(output_filename);
     return 1;
   }
-  if ((options->explain || options->report_gpu_types) &&
+  if (options->report_gpu_types && !options->explain &&
       ptx_tile_report_text()[0]) {
     printf("register tiles\n%s\n", ptx_tile_report_text());
   }

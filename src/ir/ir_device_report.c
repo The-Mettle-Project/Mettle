@@ -17,10 +17,14 @@ typedef struct {
   size_t index_lines[DEVICE_INDEX_LINES];
   size_t index_listed;
   size_t index_sites;
+  int called;
   size_t call_line;
   const char *callee;
+  int stored;
   size_t stored_line;
+  int other;
   size_t other_line;
+  int taken;
   size_t taken_line;
 } DeviceUses;
 
@@ -89,7 +93,8 @@ static void device_scan_offset(const IRInstruction *in, DeviceNames *set,
 static void device_scan_call(const IRInstruction *in, const DeviceNames *set,
                              DeviceUses *uses) {
   for (size_t a = 0; a < in->argument_count; a++) {
-    if (device_names_hold(set, &in->arguments[a]) && !uses->call_line) {
+    if (device_names_hold(set, &in->arguments[a]) && !uses->called) {
+      uses->called = 1;
       uses->call_line = in->location.line;
       uses->callee = in->text;
     }
@@ -104,7 +109,8 @@ static void device_scan_use(const IRInstruction *in, DeviceNames *set,
   case IR_OP_LOAD:
     return;
   case IR_OP_STORE:
-    if (lhs && !uses->stored_line) {
+    if (lhs && !uses->stored) {
+      uses->stored = 1;
       uses->stored_line = in->location.line;
     }
     return;
@@ -125,7 +131,8 @@ static void device_scan_use(const IRInstruction *in, DeviceNames *set,
     device_scan_offset(in, set, uses);
     return;
   }
-  if ((lhs || rhs) && !uses->other_line) {
+  if ((lhs || rhs) && !uses->other) {
+    uses->other = 1;
     uses->other_line = in->location.line;
   }
 }
@@ -143,7 +150,8 @@ static void device_collect_uses(const IRFunction *function, const char *local,
     }
     if (in->op == IR_OP_ADDRESS_OF && in->lhs.kind == IR_OPERAND_SYMBOL &&
         in->lhs.name && strcmp(in->lhs.name, local) == 0) {
-      if (!uses->taken_line) {
+      if (!uses->taken) {
+        uses->taken = 1;
         uses->taken_line = in->location.line;
       }
       device_names_add(&set, in->dest.name);
@@ -180,6 +188,20 @@ static void device_index_reason(const DeviceUses *uses, char *reason,
   }
 }
 
+static void device_cause(char *cause, size_t size, size_t line,
+                         const char *active, const char *passive,
+                         const char *callee) {
+  char target[160] = "";
+  if (callee) {
+    snprintf(target, sizeof(target), " `%s`", callee);
+  }
+  if (line) {
+    snprintf(cause, size, "line %zu %s%s", line, active, target);
+  } else {
+    snprintf(cause, size, "%s%s", passive, target);
+  }
+}
+
 int ir_device_report_storage_reason(const IRFunction *function,
                                     const char *local, int is_aggregate,
                                     char *reason, size_t size) {
@@ -195,21 +217,22 @@ int ir_device_report_storage_reason(const IRFunction *function,
   }
   device_collect_uses(function, local, &uses);
   cause[0] = '\0';
-  if (uses.call_line && uses.callee) {
+  if (uses.called && uses.callee) {
     ir_display_name(uses.callee, shown, sizeof(shown));
-    snprintf(cause, sizeof(cause), "line %zu passes its address to `%s`",
-             uses.call_line, shown);
-  } else if (uses.stored_line) {
-    snprintf(cause, sizeof(cause), "line %zu stores its address",
-             uses.stored_line);
-  } else if (uses.other_line) {
-    snprintf(cause, sizeof(cause), "line %zu uses its address as a value",
-             uses.other_line);
+    device_cause(cause, sizeof(cause), uses.call_line,
+                 "passes its address to", "its address is passed to", shown);
+  } else if (uses.stored) {
+    device_cause(cause, sizeof(cause), uses.stored_line, "stores its address",
+                 "its address is stored", NULL);
+  } else if (uses.other) {
+    device_cause(cause, sizeof(cause), uses.other_line,
+                 "uses its address as a value",
+                 "its address is used as a value", NULL);
   } else if (uses.index_listed) {
     device_index_reason(&uses, cause, sizeof(cause));
-  } else if (!is_aggregate && uses.taken_line) {
-    snprintf(cause, sizeof(cause), "line %zu takes its address",
-             uses.taken_line);
+  } else if (!is_aggregate && uses.taken) {
+    device_cause(cause, sizeof(cause), uses.taken_line, "takes its address",
+                 "its address is taken", NULL);
   }
   if (!cause[0]) {
     return 0;

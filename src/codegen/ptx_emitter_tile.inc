@@ -1318,6 +1318,16 @@ static void ptx_tile_report(PtxFn *fn, const IRFunction *func) {
             "  %s: peak %d of %d registers a work item, at line %llu\n",
             func->name ? func->name : "?", fn->tile_peak, fn->tile_budget,
             (unsigned long long)fn->tile_peak_line);
+  if (fn->reported) {
+    char headline[120];
+    snprintf(headline, sizeof(headline),
+             "peak %d of %d registers a work item, at line %llu",
+             fn->tile_peak, fn->tile_budget,
+             (unsigned long long)fn->tile_peak_line);
+    ir_explain_device_note(func->name, func->location.line, "tiles",
+                           "register tiles", IR_DEVICE_FACT, headline, NULL,
+                           NULL, "register-tiles");
+  }
   for (size_t t = 0; t < fn->tile_count; t++) {
     const PtxTile *tile = &fn->tiles[t];
     unsigned long long first = 0;
@@ -1340,6 +1350,21 @@ static void ptx_tile_report(PtxFn *fn, const IRFunction *func) {
               tile->temporary ? "(value)" : tile->name,
               tile->type && tile->type->name ? tile->type->name : "?",
               tile->count, first, last);
+    if (fn->reported) {
+      char subject[160], headline[240];
+      if (tile->temporary) {
+        snprintf(subject, sizeof(subject), "tile value");
+      } else {
+        snprintf(subject, sizeof(subject), "tile `%s`", tile->name);
+      }
+      snprintf(headline, sizeof(headline),
+               "%d registers from line %llu to line %llu, %s", tile->count,
+               first, last,
+               tile->type && tile->type->name ? tile->type->name : "?");
+      ir_explain_device_note(func->name, (size_t)first, "tiles", subject,
+                             IR_DEVICE_FACT, headline, NULL, NULL,
+                             "register-tiles");
+    }
   }
   {
     size_t scalar = 0;
@@ -1351,6 +1376,16 @@ static void ptx_tile_report(PtxFn *fn, const IRFunction *func) {
                 "    %zu of %zu intermediate tiles computed one element at a "
                 "time, no registers held\n",
                 scalar, temporaries);
+      if (fn->reported) {
+        char headline[160];
+        snprintf(headline, sizeof(headline),
+                 "%zu of %zu computed one element at a time, no registers "
+                 "held",
+                 scalar, temporaries);
+        ir_explain_device_note(func->name, func->location.line, "tiles",
+                               "intermediate tiles", IR_DEVICE_GOOD, headline,
+                               NULL, NULL, "register-tiles");
+      }
     }
   }
 }

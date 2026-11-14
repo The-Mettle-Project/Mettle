@@ -1,6 +1,8 @@
 #ifndef IR_OPTIMIZE_EXPLAIN_INTERNAL_H
 #define IR_OPTIMIZE_EXPLAIN_INTERNAL_H
 
+#include "../ir.h"
+
 #include <stddef.h>
 
 typedef enum {
@@ -20,5 +22,7 @@ void ir_explain_echo_source_range(size_t line, size_t end_line);
 char *ir_explain_text_dup(const char *s);
 void ir_explain_device_render(void);
 int ir_explain_device_has_report(void);
+void ir_tensor_explain_declines(const IRFunction *function);
+void ir_gpu_staging_explain_declines(const IRFunction *function);
 
 #endif

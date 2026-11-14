@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "ir_optimize_explain_internal.h"
 
 typedef struct {
   MtlcAddressSpace space;
@@ -488,4 +489,129 @@ int ir_promote_gpu_async_staging_pass(IRFunction *function, int *changed) {
     ir_index_vector_destroy(&stores);
   }
   return 1;
+}
+
+static int gpu_function_stages(const IRFunction *function) {
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IROpcode op = function->instructions[i].op;
+    if (op == IR_OP_ASYNC_COPY || op == IR_OP_ASYNC_COMMIT ||
+        op == IR_OP_ASYNC_WAIT)
+      return 1;
+  }
+  return 0;
+}
+
+static size_t gpu_staging_run_end(const IRFunction *function, size_t load,
+                                  size_t *pairs) {
+  size_t cursor = load;
+  *pairs = 0;
+  while (cursor < function->instruction_count &&
+         function->instructions[cursor].op == IR_OP_LOAD) {
+    size_t store = 0, next = 0;
+    if (!gpu_next_effect_boundary(function, cursor + 1, &store) ||
+        !gpu_pair_is_promotable(function, cursor, store))
+      break;
+    (*pairs)++;
+    if (!gpu_next_effect_boundary(function, store + 1, &next)) return SIZE_MAX;
+    if (function->instructions[next].op != IR_OP_LOAD) return next;
+    cursor = next;
+  }
+  return *pairs ? cursor : SIZE_MAX;
+}
+
+static int gpu_staging_forms(const IRFunction *function, size_t boundary,
+                             int fix_order) {
+  IRFunction *clone = ir_explain_clone_function(function);
+  int changed = 0;
+  int formed = 0;
+  if (!clone) return 0;
+  if (fix_order) {
+    clone->instructions[boundary].memory_order = MTLC_MEMORY_ORDER_ACQ_REL;
+  } else {
+    ir_instruction_make_nop(&clone->instructions[boundary]);
+  }
+  ir_explain_set_hypothesis(1);
+  if (ir_promote_gpu_async_staging_pass(clone, &changed))
+    formed = gpu_function_stages(clone);
+  ir_explain_set_hypothesis(0);
+  ir_function_destroy(clone);
+  return formed;
+}
+
+static int gpu_staging_interruption(const IRInstruction *in, char *out,
+                                    size_t size) {
+  char shown[128];
+  const char *callee = NULL;
+  switch (in->op) {
+  case IR_OP_STORE:
+    snprintf(out, size, "line %zu stores to memory", in->location.line);
+    return 1;
+  case IR_OP_LOAD:
+    snprintf(out, size, "line %zu loads from memory", in->location.line);
+    return 1;
+  case IR_OP_CALL:
+  case IR_OP_CALL_INDIRECT:
+    callee = in->intrinsic != MTLC_INTRINSIC_NONE
+                 ? ir_intrinsic_name(in->intrinsic)
+                 : in->text;
+    ir_display_name(callee ? callee : "a function", shown, sizeof(shown));
+    snprintf(out, size, "line %zu calls `%s`", in->location.line, shown);
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static void gpu_staging_explain_run(const IRFunction *function, size_t load,
+                                    size_t pairs, size_t boundary) {
+  const IRInstruction *next = &function->instructions[boundary];
+  char reason[320], fix[160], verified[160], what[160];
+  int weak_barrier = next->op == IR_OP_BARRIER &&
+                     next->memory_scope == MTLC_MEMORY_SCOPE_WORKGROUP &&
+                     (next->memory_regions & MTLC_MEMORY_REGION_WORKGROUP) != 0;
+  if (gpu_barrier_completes_staging(next)) return;
+  if (weak_barrier) {
+    if (!gpu_staging_forms(function, boundary, 1)) return;
+    snprintf(reason, sizeof(reason),
+             "the barrier at line %zu does not both acquire and release, and "
+             "asynchronous copies are published only by a workgroup barrier "
+             "that does",
+             next->location.line);
+    snprintf(fix, sizeof(fix), "write `barrier(workgroup, acq_rel)` at line %zu",
+             next->location.line);
+  } else {
+    if (!gpu_staging_interruption(next, what, sizeof(what)) ||
+        !gpu_staging_forms(function, boundary, 0))
+      return;
+    snprintf(reason, sizeof(reason),
+             "%s between the copies and the barrier that publishes them", what);
+    snprintf(fix, sizeof(fix), "move line %zu after the barrier",
+             next->location.line);
+  }
+  snprintf(verified, sizeof(verified),
+           "with that change the %zu %s asynchronous", pairs,
+           pairs == 1 ? "copy becomes" : "copies become");
+  ir_explain_remark(function->name, "GPU workgroup staging",
+                    function->instructions[load].location, 0,
+                    "NOT promoted to asynchronous staging", reason, fix,
+                    verified);
+  ir_explain_remark_code(weak_barrier ? "staging-barrier-order"
+                                      : "staging-interrupted");
+}
+
+void ir_gpu_staging_explain_declines(const IRFunction *function) {
+  if (!function || !function->is_kernel || !ir_explain_enabled() ||
+      gpu_function_stages(function))
+    return;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    size_t pairs = 0;
+    size_t boundary = 0;
+    if (function->instructions[i].op != IR_OP_LOAD ||
+        !ir_explain_location_enabled(&function->instructions[i].location))
+      continue;
+    boundary = gpu_staging_run_end(function, i, &pairs);
+    if (boundary == SIZE_MAX) continue;
+    gpu_staging_explain_run(function, i, pairs, boundary);
+    i = boundary;
+  }
 }

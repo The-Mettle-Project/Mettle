@@ -1633,6 +1633,29 @@ static void ptx_emit_async_copy(PtxFn *fn, const IRInstruction *in) {
   if (fn->async_guard[0]) {
     snprintf(guard, sizeof(guard), "@%s ", fn->async_guard);
   }
+  if (fn->reported) {
+    char headline[160], reason[200];
+    int native = ptx_async_copy_native(fn);
+    if (native) {
+      snprintf(headline, sizeof(headline),
+               "cp.async, %llu bytes in transactions of %llu",
+               (unsigned long long)bytes, (unsigned long long)transaction);
+    } else {
+      snprintf(headline, sizeof(headline),
+               "%llu bytes copied with ordinary loads and stores",
+               (unsigned long long)bytes);
+      snprintf(reason, sizeof(reason),
+               "cp.async needs sm_80 and PTX 7.0, and this build is sm_%d at "
+               "PTX %d.%d",
+               fn->target_arch, fn->isa_major, fn->isa_minor);
+    }
+    ir_explain_device_note_site(
+        fn->function->name, in->location.line, "staging",
+        in->async_copy_generated ? "promoted copy into workgroup memory"
+                                 : "copy into workgroup memory",
+        native ? IR_DEVICE_GOOD : IR_DEVICE_FACT, headline,
+        native ? NULL : reason, NULL, "async-copy");
+  }
   if (ptx_async_copy_native(fn)) {
     const char *cache =
         in->async_copy_cache == MTLC_ASYNC_CACHE_GLOBAL ? "cg" : "ca";
@@ -5422,6 +5445,71 @@ static int ptx_emit_wmma_tiled_store(
   return !fn->error;
 }
 
+static void ptx_report_tensor(PtxFn *fn, const IRInstruction *in,
+                              IRDeviceVerdict verdict, const char *headline,
+                              const char *reason, const char *fix,
+                              const char *code) {
+  char subject[64];
+  if (!fn->reported) return;
+  snprintf(subject, sizeof(subject), "%s m%un%uk%u",
+           in->op == IR_OP_TENSOR_MATMUL ? "tensor_matmul" : "tensor_mma",
+           (unsigned)IR_TENSOR_MMA(in).m, (unsigned)IR_TENSOR_MMA(in).n,
+           (unsigned)IR_TENSOR_MMA(in).k);
+  ir_explain_device_note(fn->function->name, in->location.line, "tensor",
+                         subject, verdict, headline, reason, fix, code);
+}
+
+static void ptx_report_tensor_instruction(PtxFn *fn, const IRInstruction *in,
+                                          const char *instruction,
+                                          const char *shape, const char *kind,
+                                          int subtiles) {
+  char headline[160];
+  if (!fn->reported) return;
+  if (subtiles > 1) {
+    snprintf(headline, sizeof(headline), "%s %s %s, %d tiles a step",
+             instruction, shape, kind, subtiles);
+  } else {
+    snprintf(headline, sizeof(headline), "%s %s %s", instruction, shape, kind);
+  }
+  ptx_report_tensor(fn, in, IR_DEVICE_GOOD, headline, NULL, NULL,
+                    "tensor-instruction");
+}
+
+static void ptx_report_tensor_resident(PtxFn *fn, const IRInstruction *in,
+                                       const char *what, int peak, int budget) {
+  char headline[160];
+  if (!fn->reported) return;
+  snprintf(headline, sizeof(headline),
+           "the accumulator stays in registers across %s, %d of a budget of "
+           "%d",
+           what, peak, budget);
+  ptx_report_tensor(fn, in, IR_DEVICE_GOOD, headline, NULL, NULL,
+                    "tensor-resident");
+}
+
+static void ptx_report_tensor_replay(PtxFn *fn, const IRInstruction *in,
+                                     const char *what, int peak, int budget) {
+  char headline[160], reason[200], fix[120];
+  if (!fn->reported) return;
+  snprintf(headline, sizeof(headline),
+           "every step of %s loads and stores the accumulator", what);
+  snprintf(reason, sizeof(reason),
+           "keeping it in registers takes %d of them, and the tensor register "
+           "budget is %d",
+           peak, budget);
+  snprintf(fix, sizeof(fix), "raise the budget with --gpu-tensor-tuple-budget=%d",
+           peak);
+  ptx_report_tensor(fn, in, IR_DEVICE_MISS, headline, reason, fix,
+                    "tensor-register-budget");
+}
+
+static const char *ptx_residency_scope_words(const IRInstruction *in) {
+  const char *name = ptx_tensor_residency_name(in->tensor_residency_scope);
+  if (name && strstr(name, "loop")) return "the loop";
+  if (name && strstr(name, "pipeline")) return "the pipeline";
+  return "the region";
+}
+
 static void ptx_emit_tensor_mma_single(PtxFn *fn, const IRInstruction *in) {
   if (ptx_tensor_uses_direct_mma(&IR_TENSOR_MMA(in))) {
     PtxMmaProfile native_profile;
@@ -5433,6 +5521,10 @@ static void ptx_emit_tensor_mma_single(PtxFn *fn, const IRInstruction *in) {
                (unsigned)IR_TENSOR_MMA(in).k, native_reason);
       return;
     }
+    ptx_report_tensor_instruction(
+        fn, in, "mma.sync", native_profile.shape,
+        ptx_mma_kind_name(&native_profile),
+        native_profile.m_tiles * native_profile.n_tiles);
     ptx_emit_tensor_mma_native_single(fn, in, &native_profile);
     return;
   }
@@ -5450,6 +5542,9 @@ static void ptx_emit_tensor_mma_single(PtxFn *fn, const IRInstruction *in) {
     fn_error(fn, "PTX stable WMMA tensor operand count is inconsistent");
     return;
   }
+  ptx_report_tensor_instruction(fn, in, "wmma.mma", profile.shape,
+                                profile.a_type,
+                                profile.m_tiles * profile.n_tiles);
   (void)ptx_emit_wmma_tiled_tile(fn, in, &profile, 0,
                                   expected_operands, -1, 1, 1);
 }
@@ -5541,9 +5636,15 @@ static void ptx_emit_tensor_residency_mma_native(
           "\t// mtlc.%s replay native-mma %s group=%u tuple_peak=%d budget=%d\n",
           residency_name, ptx_mma_kind_name(profile), group->id,
           estimated_peak, tuple_budget);
+      ptx_report_tensor_replay(fn, in, ptx_residency_scope_words(in),
+                               estimated_peak, tuple_budget);
       ptx_emit_tensor_mma_single(fn, in);
       return;
     }
+    ptx_report_tensor_instruction(fn, in, "mma.sync", profile->shape,
+                                  ptx_mma_kind_name(profile), subtile_count);
+    ptx_report_tensor_resident(fn, in, ptx_residency_scope_words(in),
+                               estimated_peak, tuple_budget);
     group->accumulator_class = PC_F32;
     group->accumulator_base = fn->count[PC_F32];
     group->accumulator_count = accumulator_count;
@@ -5725,9 +5826,15 @@ static void ptx_emit_tensor_residency_mma(PtxFn *fn,
       sb_printf(&fn->body,
                 "\t// mtlc.%s replay group=%u tuple_peak=%d budget=%d\n",
                 residency_name, group->id, estimated_peak, tuple_budget);
+      ptx_report_tensor_replay(fn, in, ptx_residency_scope_words(in),
+                               estimated_peak, tuple_budget);
       ptx_emit_tensor_mma_single(fn, in);
       return;
     }
+    ptx_report_tensor_instruction(fn, in, "wmma.mma", profile.shape,
+                                  profile.a_type, subtile_count);
+    ptx_report_tensor_resident(fn, in, ptx_residency_scope_words(in),
+                               estimated_peak, tuple_budget);
     group->accumulator_class = profile.d_class;
     group->accumulator_base = fn->count[profile.d_class];
     group->accumulator_count = accumulator_count;
@@ -6766,11 +6873,19 @@ static void ptx_emit_tensor_mma(PtxFn *fn, const IRInstruction *in) {
     int estimated_peak = accumulator_count + native_profile.a_registers +
                          native_profile.b_registers;
     if (estimated_peak <= tuple_budget) {
+      ptx_report_tensor_instruction(
+          fn, in, "mma.sync", native_profile.shape,
+          ptx_mma_kind_name(&native_profile),
+          native_profile.m_tiles * native_profile.n_tiles);
+      ptx_report_tensor_resident(fn, in, "the chain", estimated_peak,
+                                 tuple_budget);
       ptx_emit_tensor_mma_native_chain_resident(
           fn, in, &native_profile, tile_count, per_tile, tuple_budget,
           estimated_peak);
       return;
     }
+    ptx_report_tensor_replay(fn, in, "the chain", estimated_peak,
+                             tuple_budget);
     sb_printf(
         &fn->body,
         "\t// mtlc.tensor_chain replay native-mma %s tiles=%llu tuple_peak=%d budget=%d\n",
@@ -6802,10 +6917,15 @@ static void ptx_emit_tensor_mma(PtxFn *fn, const IRInstruction *in) {
                        profile.a_registers + profile.b_registers +
                        profile.c_registers;
   if (estimated_peak <= tuple_budget) {
+    ptx_report_tensor_instruction(fn, in, "wmma.mma", profile.shape,
+                                  profile.a_type, subtile_count);
+    ptx_report_tensor_resident(fn, in, "the chain", estimated_peak,
+                               tuple_budget);
     ptx_emit_tensor_mma_chain_resident(fn, in, &profile, tile_count, per_tile,
                                        tuple_budget, estimated_peak);
     return;
   }
+  ptx_report_tensor_replay(fn, in, "the chain", estimated_peak, tuple_budget);
   if (subtile_count == 1)
     sb_printf(&fn->body,
               "\t// mtlc.tensor_chain replay tiles=%llu tuple_peak=%d budget=%d\n",
@@ -7825,6 +7945,35 @@ static void ptx_emit_tensor_matmul(PtxFn *fn,
                   profile.a_registers + profile.b_registers +
                   profile.c_registers;
     if (native_peak > ptx_tensor_tuple_budget(fn)) have_native = 0;
+  }
+  if (!have_native && fn->reported) {
+    char reason[320], fix[120];
+    int over_budget = native_peak > ptx_tensor_tuple_budget(fn);
+    if (over_budget) {
+      snprintf(reason, sizeof(reason),
+               "the tensor instruction's accumulator takes %d registers, and "
+               "the tensor register budget is %d",
+               native_peak, ptx_tensor_tuple_budget(fn));
+      snprintf(fix, sizeof(fix),
+               "raise the budget with --gpu-tensor-tuple-budget=%d",
+               native_peak);
+    } else {
+      snprintf(reason, sizeof(reason), "no tensor instruction fits: %s",
+               native_reason);
+    }
+    ptx_report_tensor(fn, in, IR_DEVICE_MISS,
+                      "computed one element at a time by the whole warp",
+                      reason, over_budget ? fix : NULL, "tensor-scalar-replay");
+  } else if (fn->reported) {
+    char headline[200];
+    snprintf(headline, sizeof(headline),
+             "full tiles through %s %s %s, edge tiles one element at a time",
+             use_direct_mma ? "mma.sync" : "wmma.mma",
+             use_direct_mma ? direct_profile.shape : profile.shape,
+             use_direct_mma ? ptx_mma_kind_name(&direct_profile)
+                            : profile.a_type);
+    ptx_report_tensor(fn, in, IR_DEVICE_GOOD, headline, NULL, NULL,
+                      "tensor-instruction");
   }
   if (!have_native) {
     sb_printf(&fn->body,
@@ -9219,6 +9368,8 @@ static void ptx_emit_general_call(IRProgram *program, IRFunction *func,
                  callee ? callee : "?");
         return;
       }
+      if (fn->reported)
+        ir_explain_device_add(func->name, IR_DEVICE_CALLS_KEPT, 1);
       if (in->argument_count != callee_function->parameter_count ||
           in->argument_count != callee_symbol->param_count) {
         fn_error(fn,

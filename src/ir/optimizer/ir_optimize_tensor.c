@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "ir_optimize_explain_internal.h"
 #include "../../common.h"
 
 static size_t tensor_stride_operand_index(const MtlcTensorMmaDesc *desc,
@@ -694,4 +695,149 @@ int ir_fuse_tensor_mma_chains_pass(IRFunction *function, int *changed) {
     if (result < 0) return 0;
   }
   return 1;
+}
+
+static int tensor_step_accumulates_in_memory(const IRInstruction *step) {
+  return step->op == IR_OP_TENSOR_MMA &&
+         ir_tensor_mma_instruction_count(step) == 1 &&
+         step->tensor_residency_role == IR_TENSOR_RESIDENCY_NONE &&
+         step->argument_count >= 4 &&
+         ir_operand_equals(&step->arguments[2], &step->arguments[3]) &&
+         tensor_desc_can_accumulate(&IR_TENSOR_MMA(step));
+}
+
+static int tensor_enclosing_loop(const IRFunction *function, size_t step,
+                                 size_t *header, size_t *back_jump) {
+  for (size_t h = step; h > 0; h--) {
+    const IRInstruction *label = &function->instructions[h - 1];
+    if (label->op != IR_OP_LABEL || !label->text) continue;
+    for (size_t j = step + 1; j < function->instruction_count; j++) {
+      const IRInstruction *jump = &function->instructions[j];
+      if (jump->op == IR_OP_JUMP && jump->text &&
+          strcmp(jump->text, label->text) == 0) {
+        *header = h - 1;
+        *back_jump = j;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int tensor_blocker_words(const IRInstruction *blocker, char *out,
+                                size_t size) {
+  char shown[128];
+  const char *callee = NULL;
+  switch (blocker->op) {
+  case IR_OP_CALL:
+  case IR_OP_CALL_INDIRECT:
+    callee = blocker->intrinsic != MTLC_INTRINSIC_NONE
+                 ? ir_intrinsic_name(blocker->intrinsic)
+                 : blocker->text;
+    ir_display_name(callee ? callee : "a function", shown, sizeof(shown));
+    snprintf(out, size,
+             "line %zu calls `%s`, which could read or write the accumulator",
+             blocker->location.line, shown);
+    return 1;
+  case IR_OP_STORE:
+    snprintf(out, size,
+             "line %zu stores to memory, and that store could land in the "
+             "accumulator",
+             blocker->location.line);
+    return 1;
+  case IR_OP_LOAD:
+    snprintf(out, size,
+             "line %zu loads from memory, and that load could read the "
+             "accumulator",
+             blocker->location.line);
+    return 1;
+  case IR_OP_BARRIER:
+    snprintf(out, size,
+             "line %zu is a barrier, where other work items can read the "
+             "accumulator",
+             blocker->location.line);
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static size_t tensor_first_blocker(const IRFunction *function, size_t from,
+                                   size_t to, size_t step) {
+  for (size_t i = from; i < to; i++) {
+    const IRInstruction *in = &function->instructions[i];
+    if (i == step || tensor_loop_scalar_instruction(in) ||
+        in->op == IR_OP_BRANCH_ZERO || in->op == IR_OP_LABEL)
+      continue;
+    return i;
+  }
+  return SIZE_MAX;
+}
+
+static int tensor_forms_without(const IRFunction *function, size_t blocker,
+                                size_t step) {
+  IRFunction *clone = ir_explain_clone_function(function);
+  int changed = 0;
+  int formed = 0;
+  if (!clone) return 0;
+  ir_instruction_make_nop(&clone->instructions[blocker]);
+  ir_explain_set_hypothesis(1);
+  if (ir_fuse_tensor_mma_chains_pass(clone, &changed) &&
+      step < clone->instruction_count) {
+    const IRInstruction *after = &clone->instructions[step];
+    formed = after->op == IR_OP_NOP ||
+             after->tensor_residency_role != IR_TENSOR_RESIDENCY_NONE;
+  }
+  ir_explain_set_hypothesis(0);
+  ir_function_destroy(clone);
+  return formed;
+}
+
+static void tensor_explain_step(const IRFunction *function, size_t step) {
+  const IRInstruction *update = &function->instructions[step];
+  size_t header = 0, back_jump = 0, blocker = SIZE_MAX;
+  int in_loop = tensor_enclosing_loop(function, step, &header, &back_jump);
+  char reason[320], fix[160];
+  if (in_loop) {
+    blocker = tensor_first_blocker(function, header + 1, back_jump, step);
+  } else {
+    size_t first = step;
+    while (first > 0 &&
+           function->instructions[first - 1].op != IR_OP_TENSOR_MMA &&
+           function->instructions[first - 1].op != IR_OP_LABEL)
+      first--;
+    if (first == 0 || function->instructions[first - 1].op != IR_OP_TENSOR_MMA)
+      return;
+    blocker = tensor_first_blocker(function, first, step, step);
+  }
+  if (blocker == SIZE_MAX ||
+      !tensor_blocker_words(&function->instructions[blocker], reason,
+                            sizeof(reason)) ||
+      !tensor_forms_without(function, blocker, step))
+    return;
+  snprintf(fix, sizeof(fix),
+           in_loop ? "move line %zu out of the loop"
+                   : "move line %zu before the first step or after the last",
+           function->instructions[blocker].location.line);
+  ir_explain_remark(
+      function->name, in_loop ? "tensor MMA loop" : "tensor MMA chain",
+      update->location, 0,
+      in_loop ? "NOT resident: every pass loads and stores the accumulator"
+              : "NOT fused: this step loads and stores the accumulator",
+      reason, fix,
+      in_loop ? "without that line the accumulator stays in registers across "
+                "the loop"
+              : "without that line the steps share one accumulator in "
+                "registers");
+  ir_explain_remark_code("tensor-observable");
+}
+
+void ir_tensor_explain_declines(const IRFunction *function) {
+  if (!function || !ir_explain_enabled()) return;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    const IRInstruction *step = &function->instructions[i];
+    if (tensor_step_accumulates_in_memory(step) &&
+        ir_explain_location_enabled(&step->location))
+      tensor_explain_step(function, i);
+  }
 }
