@@ -1,0 +1,12 @@
+fn double_up(n: uint32) -> uint32 {
+    var x: uint32 = 1;
+    var i: uint32 = 0;
+    while (i < n) {
+        invariant(x <= 1000);
+        x = x * 2;
+        i = i + 1;
+    }
+    return x;
+}
+
+fn main() -> int32 { return (int32)double_up(3); }

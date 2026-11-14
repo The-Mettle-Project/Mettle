@@ -1144,6 +1144,19 @@ $cases = @(
     Args          = @()
   },
   @{
+    Name          = "loop_invariants"
+    Path          = "tests/loop_invariants.mettle"
+    ShouldSucceed = $true
+    Args          = @()
+  },
+  @{
+    Name          = "err_loop_invariant"
+    Path          = "tests/err_loop_invariant.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'invariant in `double_up` does not hold \(the invariant after an iteration\); it fails at'
+  },
+  @{
     Name          = "err_prove_statement"
     Path          = "tests/err_prove_statement.mettle"
     ShouldSucceed = $false

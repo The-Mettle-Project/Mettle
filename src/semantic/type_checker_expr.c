@@ -3454,13 +3454,18 @@ static Type *type_checker_infer_named_builtin(TypeChecker *checker,
                : NULL;
   }
 
-  if (!call->object && strcmp(call->function_name, "prove") == 0 &&
-      !symbol_table_peek(checker->symbol_table, "prove")) {
+  if (!call->object &&
+      (strcmp(call->function_name, "prove") == 0 ||
+       strcmp(call->function_name, "invariant") == 0) &&
+      !symbol_table_peek(checker->symbol_table, call->function_name)) {
+    int is_invariant = call->function_name[0] == 'i';
     if (call->argument_count != 1 || !call->arguments[0]) {
       type_checker_set_error_at_location(
           checker, expression->location,
-          "prove takes one condition, a bool the compiler proves holds "
-          "whenever the call is reached");
+          is_invariant ? "invariant takes one condition, a bool that holds "
+                         "every time the loop's test is reached"
+                       : "prove takes one condition, a bool the compiler "
+                         "proves holds whenever the call is reached");
       return NULL;
     }
     Type *condition = type_checker_infer_type(checker, call->arguments[0]);
@@ -3470,15 +3475,19 @@ static Type *type_checker_infer_named_builtin(TypeChecker *checker,
     if (condition->kind != TYPE_BOOL) {
       type_checker_set_error_at_location(
           checker, call->arguments[0]->location,
-          "prove needs a bool condition, found '%s'",
+          "%s needs a bool condition, found '%s'",
+          is_invariant ? "invariant" : "prove",
           condition->name ? condition->name : "?");
       return NULL;
     }
-    call->function_name = (char *)string_intern("__mettle_prove");
+    call->function_name = (char *)string_intern(
+        is_invariant ? "__mettle_invariant" : "__mettle_prove");
     return checker->builtin_void;
   }
 
-  if (strcmp(call->function_name, "__mettle_prove") == 0 && !call->object) {
+  if ((strcmp(call->function_name, "__mettle_prove") == 0 ||
+       strcmp(call->function_name, "__mettle_invariant") == 0) &&
+      !call->object) {
     return checker->builtin_void;
   }
 

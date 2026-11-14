@@ -1549,7 +1549,8 @@ static int ir_lower_builtin_call(IRLoweringContext *context, IRFunction *functio
     return 1;
   }
 
-  if (strcmp(call->function_name, "__mettle_prove") == 0 &&
+  if ((strcmp(call->function_name, "__mettle_prove") == 0 ||
+       strcmp(call->function_name, "__mettle_invariant") == 0) &&
       call->argument_count == 1) {
     IROperand condition = ir_operand_none();
     if (!ir_lower_expression(context, function, call->arguments[0],
@@ -1558,7 +1559,7 @@ static int ir_lower_builtin_call(IRLoweringContext *context, IRFunction *functio
     }
     IRInstruction instruction = {0};
     instruction.op = IR_OP_CALL;
-    instruction.text = (char *)"__mettle_prove";
+    instruction.text = call->function_name;
     instruction.location = expression->location;
     instruction.dest = ir_operand_none();
     instruction.arguments = &condition;

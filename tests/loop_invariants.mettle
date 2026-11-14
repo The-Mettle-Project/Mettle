@@ -1,0 +1,29 @@
+fn sum_below(n: uint64) -> uint64 {
+    var total: uint64 = 0;
+    var i: uint64 = 0;
+    while (i < n) {
+        invariant(i <= n && 2 * total == i * (i - 1));
+        total = total + i;
+        i = i + 1;
+    }
+    prove(2 * total == n * (n - 1));
+    return total;
+}
+
+fn count_down(n: int64) -> int64 {
+    var k: int64 = n;
+    var steps: int64 = 0;
+    while (k > 0) {
+        invariant(n <= 0 || (k >= 0 && k + steps == n));
+        k = k - 1;
+        steps = steps + 1;
+    }
+    prove(n <= 0 || steps == n);
+    return steps;
+}
+
+fn main() -> int32 {
+    if (sum_below(5) != 10) { return 1; }
+    if (count_down(7) != 7) { return 2; }
+    return 0;
+}

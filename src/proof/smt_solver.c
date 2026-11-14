@@ -275,7 +275,140 @@ void smt_solver_stats(const SmtSolver *s, SmtStats *stats) {
   *stats = s->stats;
 }
 
-static void build_model(SmtSolver *s, Blaster *b, SatSolver *sat, Lower *l) {
+typedef struct {
+  SmtTerm *vars;
+  SmtTerm *values;
+  uint32_t count;
+  uint32_t cap;
+} Substitutions;
+
+static void collect_conjuncts(SmtCtx *ctx, SmtTerm t, SmtTerm *out,
+                              uint32_t *n, uint32_t cap) {
+  if (*n >= cap) {
+    return;
+  }
+  if (ctx->nodes[t].kind == SMT_K_AND) {
+    collect_conjuncts(ctx, smt_arg(ctx, t, 0), out, n, cap);
+    collect_conjuncts(ctx, smt_arg(ctx, t, 1), out, n, cap);
+    return;
+  }
+  if (ctx->nodes[t].kind == SMT_K_NOT &&
+      ctx->nodes[smt_arg(ctx, t, 0)].kind == SMT_K_OR) {
+    SmtTerm inner = smt_arg(ctx, t, 0);
+    SmtTerm left = smt_not(ctx, smt_arg(ctx, inner, 0));
+    SmtTerm right = smt_not(ctx, smt_arg(ctx, inner, 1));
+    collect_conjuncts(ctx, left, out, n, cap);
+    collect_conjuncts(ctx, right, out, n, cap);
+    return;
+  }
+  out[(*n)++] = t;
+}
+
+static int bound_pair(SmtCtx *ctx, SmtTerm c, int *is_signed, SmtTerm *lo,
+                      SmtTerm *hi) {
+  const SmtNode *n = &ctx->nodes[c];
+  if (n->kind == SMT_K_BVULE || n->kind == SMT_K_BVSLE) {
+    *is_signed = n->kind == SMT_K_BVSLE;
+    *lo = smt_arg(ctx, c, 0);
+    *hi = smt_arg(ctx, c, 1);
+    return 1;
+  }
+  if (n->kind == SMT_K_NOT) {
+    SmtTerm inner = smt_arg(ctx, c, 0);
+    const SmtNode *m = &ctx->nodes[inner];
+    if (m->kind == SMT_K_BVULT || m->kind == SMT_K_BVSLT) {
+      *is_signed = m->kind == SMT_K_BVSLT;
+      *lo = smt_arg(ctx, inner, 1);
+      *hi = smt_arg(ctx, inner, 0);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static SmtTerm derive_equalities(SmtCtx *ctx, SmtTerm formula,
+                                 const SmtTerm *conj, uint32_t n) {
+  for (uint32_t i = 0; i < n; i++) {
+    int si;
+    SmtTerm lo, hi;
+    if (!bound_pair(ctx, conj[i], &si, &lo, &hi)) {
+      continue;
+    }
+    for (uint32_t j = i + 1; j < n; j++) {
+      int sj;
+      SmtTerm lo2, hi2;
+      if (bound_pair(ctx, conj[j], &sj, &lo2, &hi2) && si == sj &&
+          lo2 == hi && hi2 == lo) {
+        SmtTerm eq = smt_eq(ctx, lo, hi);
+        int present = 0;
+        for (uint32_t k = 0; k < n && !present; k++) {
+          present = conj[k] == eq;
+        }
+        if (!present) {
+          return smt_and(ctx, formula, eq);
+        }
+      }
+    }
+  }
+  return formula;
+}
+
+static SmtTerm eliminate_equalities(SmtCtx *ctx, SmtTerm formula,
+                                    Substitutions *subs) {
+  SmtTerm conj[4096];
+  for (int round = 0; round < 64; round++) {
+    uint32_t n = 0;
+    collect_conjuncts(ctx, formula, conj, &n, 4096);
+    SmtTerm derived = derive_equalities(ctx, formula, conj, n);
+    if (derived != formula) {
+      formula = derived;
+      n = 0;
+      collect_conjuncts(ctx, formula, conj, &n, 4096);
+    }
+    SmtTerm var = 0, value = 0;
+    for (uint32_t i = 0; i < n && !var; i++) {
+      SmtTerm c = conj[i];
+      const SmtNode *node = &ctx->nodes[c];
+      if (node->kind == SMT_K_VAR) {
+        var = c;
+        value = ctx->bool_true;
+      } else if (node->kind == SMT_K_NOT &&
+                 ctx->nodes[smt_arg(ctx, c, 0)].kind == SMT_K_VAR) {
+        var = smt_arg(ctx, c, 0);
+        value = ctx->bool_false;
+      } else if (node->kind == SMT_K_EQ) {
+        SmtTerm a = smt_arg(ctx, c, 0), b = smt_arg(ctx, c, 1);
+        if (smt_sort_is_array(ctx, ctx->nodes[a].sort)) {
+          continue;
+        }
+        if (ctx->nodes[a].kind == SMT_K_VAR && !smt_term_contains(ctx, b, a)) {
+          var = a;
+          value = b;
+        } else if (ctx->nodes[b].kind == SMT_K_VAR &&
+                   !smt_term_contains(ctx, a, b)) {
+          var = b;
+          value = a;
+        }
+      }
+    }
+    if (!var) {
+      break;
+    }
+    if (subs->count == subs->cap) {
+      subs->cap = subs->cap ? subs->cap * 2u : 16u;
+      subs->vars = realloc(subs->vars, subs->cap * sizeof(SmtTerm));
+      subs->values = realloc(subs->values, subs->cap * sizeof(SmtTerm));
+    }
+    subs->vars[subs->count] = var;
+    subs->values[subs->count] = value;
+    subs->count++;
+    formula = smt_subst(ctx, formula, 1, &var, &value);
+  }
+  return formula;
+}
+
+static void build_model(SmtSolver *s, Blaster *b, SatSolver *sat, Lower *l,
+                        const Substitutions *subs) {
   SmtCtx *ctx = s->ctx;
   smt_model_free(&s->model);
   smt_model_init(&s->model);
@@ -296,6 +429,15 @@ static void build_model(SmtSolver *s, Blaster *b, SatSolver *sat, Lower *l) {
       }
     }
     smt_model_set(&s->model, t, &v);
+  }
+  for (uint32_t i = subs->count; i-- > 0;) {
+    SmtEval sub;
+    smt_eval_init(&sub, ctx, &s->model);
+    SmtBits v;
+    smt_bits_zero(&v);
+    smt_eval(&sub, subs->values[i], &v);
+    smt_eval_free(&sub);
+    smt_model_set(&s->model, subs->vars[i], &v);
   }
   SmtEval e;
   smt_eval_init(&e, ctx, &s->model);
@@ -349,6 +491,7 @@ SmtResult smt_solver_check(SmtSolver *s) {
   for (uint32_t i = 0; i < s->count; i++) {
     formula = smt_and(ctx, formula, s->asserts[i]);
   }
+  Substitutions subs = {NULL, NULL, 0, 0};
   Lower l;
   memset(&l, 0, sizeof(l));
   l.ctx = ctx;
@@ -406,12 +549,12 @@ SmtResult smt_solver_check(SmtSolver *s) {
   }
   Blaster b;
   blast_init(&b, ctx, sat);
+  SmtTerm whole = smt_and(ctx, lowered, constraints);
+  whole = eliminate_equalities(ctx, whole, &subs);
   if (s->normalize) {
-    lowered = smt_normalize(ctx, lowered);
-    constraints = smt_normalize(ctx, constraints);
+    whole = smt_normalize(ctx, whole);
   }
-  blast_assert(&b, lowered);
-  blast_assert(&b, constraints);
+  blast_assert(&b, whole);
   double t1 = smt_now_seconds();
   s->stats.blast_seconds = t1 - t0;
   s->stats.gates = b.gate_count;
@@ -433,7 +576,7 @@ SmtResult smt_solver_check(SmtSolver *s) {
   s->stats.propagations = ss.propagations;
   s->stats.restarts = ss.restarts;
   if (r == SAT_RESULT_SAT) {
-    build_model(s, &b, sat, &l);
+    build_model(s, &b, sat, &l, &subs);
     if (l.abstracted) {
       s->reason = "the formula holds quantifiers, which the solver treats as "
                   "opaque atoms";
@@ -469,6 +612,8 @@ out:
   free(l.reads);
   free(l.apps);
   free(l.app_args);
+  free(subs.vars);
+  free(subs.values);
   return s->last = result;
 }
 

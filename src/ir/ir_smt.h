@@ -23,12 +23,21 @@ typedef struct {
   SmtTerm reach;
 } IRSmtCallSite;
 
+enum {
+  IR_SMT_SITE_PROVE = 0,
+  IR_SMT_SITE_INVARIANT_ENTRY = 1,
+  IR_SMT_SITE_INVARIANT_STEP = 2
+};
+
 typedef struct {
   SmtTerm reach;
   SmtTerm trap;
   SmtTerm condition;
   SourceLocation location;
+  int kind;
 } IRSmtProveSite;
+
+#define IR_SMT_INVARIANT_CALL "__mettle_invariant"
 
 typedef struct {
   SmtCtx *ctx;

@@ -88,7 +88,8 @@ static int function_has_prove_calls(const IRFunction *f) {
   for (size_t i = 0; f && i < f->instruction_count; i++) {
     const IRInstruction *insn = &f->instructions[i];
     if (insn->op == IR_OP_CALL && insn->text &&
-        strcmp(insn->text, IR_SMT_PROVE_CALL) == 0) {
+        (strcmp(insn->text, IR_SMT_PROVE_CALL) == 0 ||
+         strcmp(insn->text, IR_SMT_INVARIANT_CALL) == 0)) {
       return 1;
     }
   }
@@ -1540,10 +1541,20 @@ static int function_has_loop(const IRFunction *f) {
   return 0;
 }
 
+static void prove_site_error_as(const SourceLocation *at, const char *noun,
+                                const char *fn, const char *fmt,
+                                const char *detail);
+
 static void prove_site_error(const SourceLocation *at, const char *fn,
                              const char *fmt, const char *detail) {
-  fprintf(stderr, "%s:%zu:%zu: error: prove in `%s` ",
-          at->filename ? at->filename : "?", at->line, at->column, fn);
+  prove_site_error_as(at, "prove", fn, fmt, detail);
+}
+
+static void prove_site_error_as(const SourceLocation *at, const char *noun,
+                                const char *fn, const char *fmt,
+                                const char *detail) {
+  fprintf(stderr, "%s:%zu:%zu: error: %s in `%s` ",
+          at->filename ? at->filename : "?", at->line, at->column, noun, fn);
   fprintf(stderr, fmt, detail ? detail : "");
   fputc('\n', stderr);
 }
@@ -1578,11 +1589,12 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
     for (size_t i = 0; i < f->instruction_count; i++) {
       const IRInstruction *insn = &f->instructions[i];
       if (insn->op == IR_OP_CALL && insn->text &&
-          strcmp(insn->text, IR_SMT_PROVE_CALL) == 0) {
+          (strcmp(insn->text, IR_SMT_PROVE_CALL) == 0 ||
+           strcmp(insn->text, IR_SMT_INVARIANT_CALL) == 0)) {
         prove_site_error(&insn->location, f->name,
-                         "cannot be checked: the function %s",
+                         "cannot be checked: %s",
                          f->parameter_count > THM_MAX_VARS
-                             ? "takes more than 16 parameters"
+                             ? "the function takes more than 16 parameters"
                              : out.why);
       }
     }
@@ -1608,21 +1620,30 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
     p->file = site->location.filename;
     p->line = site->location.line;
     p->column = site->location.column;
+    static const char *const what[] = {
+        "", " (the invariant on entry to the loop)",
+        " (the invariant after an iteration)"};
+    const char *kind = what[site->kind >= 0 && site->kind <= 2 ? site->kind
+                                                                : 0];
     if (tactic_auto(p, NULL, 0, 1)) {
       if (g_options.report) {
-        fprintf(stdout, "prove in %s at line %zu: proved\n", f->name,
-                site->location.line);
+        fprintf(stdout, "%s in %s at line %zu%s: proved\n",
+                site->kind == IR_SMT_SITE_PROVE ? "prove" : "invariant",
+                f->name, site->location.line, kind);
       }
       continue;
     }
     ok = 0;
+    char fmt[200];
     if (p->last_result == SMT_SAT) {
-      prove_site_error(&site->location, f->name, "does not hold; it fails at %s",
-                       p->last_detail);
+      snprintf(fmt, sizeof(fmt), "does not hold%s; it fails at %%s", kind);
     } else {
-      prove_site_error(&site->location, f->name, "could not be proved: %s",
-                       p->last_detail);
+      snprintf(fmt, sizeof(fmt), "could not be proved%s: %%s", kind);
     }
+    prove_site_error_as(&site->location,
+                        site->kind == IR_SMT_SITE_PROVE ? "prove"
+                                                        : "invariant",
+                        f->name, fmt, p->last_detail);
     if (loops) {
       fprintf(stderr, "  note: the prover reads every loop in `%s` as "
                       "running any number of times from any state, so a "
@@ -1645,7 +1666,8 @@ static void strip_prove_calls(IRProgram *program) {
     for (size_t k = 0; f && k < f->instruction_count; k++) {
       IRInstruction *insn = &f->instructions[k];
       if (insn->op == IR_OP_CALL && insn->text &&
-          strcmp(insn->text, IR_SMT_PROVE_CALL) == 0) {
+          (strcmp(insn->text, IR_SMT_PROVE_CALL) == 0 ||
+           strcmp(insn->text, IR_SMT_INVARIANT_CALL) == 0)) {
         ir_instruction_make_nop(insn);
       }
     }

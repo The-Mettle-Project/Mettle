@@ -43,9 +43,15 @@ typedef struct {
   SmtTerm returned;
   const char *prefix;
   size_t *loop_end;
+  size_t *inv_marker;
+  size_t *inv_start;
   int failed;
   char why[192];
 } IrsEnc;
+
+static SmtTerm irs_eval_invariant(IrsEnc *e, size_t header);
+static void irs_record_site(IrsEnc *e, SmtTerm reach, SmtTerm cond,
+                            const SourceLocation *at, int kind);
 
 static uint32_t irs_hash(const char *s) {
   uint32_t h = 2166136261u;
@@ -354,6 +360,19 @@ static void irs_edge(IrsEnc *e, size_t at, const char *label, SmtTerm cond) {
   if (target <= at) {
     if (!e->frame->havoc_loops) {
       irs_fail(e, "it has a loop", NULL);
+      return;
+    }
+    if (e->inv_marker && e->inv_marker[target]) {
+      SmtTerm reach = smt_and(e->ctx, e->reach, cond);
+      if (reach != smt_false(e->ctx)) {
+        SmtTerm saved = e->reach;
+        e->reach = reach;
+        SmtTerm step = irs_eval_invariant(e, target);
+        e->reach = saved;
+        irs_record_site(e, reach, step,
+                        &e->insns[e->inv_marker[target]].location,
+                        IR_SMT_SITE_INVARIANT_STEP);
+      }
     }
     return;
   }
@@ -499,21 +518,110 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
   irs_write(e, &insn->dest, value);
 }
 
+static void irs_record_site(IrsEnc *e, SmtTerm reach, SmtTerm cond,
+                            const SourceLocation *at, int kind) {
+  IRSmtFrame *f = e->frame;
+  if (f->prove_count == f->prove_cap) {
+    f->prove_cap = f->prove_cap ? f->prove_cap * 2u : 8u;
+    f->proves = realloc(f->proves, f->prove_cap * sizeof(IRSmtProveSite));
+  }
+  IRSmtProveSite *site = &f->proves[f->prove_count++];
+  site->reach = reach;
+  site->trap = e->trap;
+  site->condition = cond;
+  site->location = *at;
+  site->kind = kind;
+}
+
+static void irs_step(IrsEnc *e, size_t pc);
+
+static SmtTerm irs_eval_invariant(IrsEnc *e, size_t header) {
+  SmtCtx *ctx = e->ctx;
+  size_t marker = e->inv_marker[header];
+  SmtTerm *saved_env = malloc((e->nvars ? e->nvars : 1u) * sizeof(SmtTerm));
+  memcpy(saved_env, e->env, e->nvars * sizeof(SmtTerm));
+  SmtTerm saved_reach = e->reach, saved_trap = e->trap;
+  IrsEdge *saved_edges = e->edges;
+  size_t saved_count = e->nedges, saved_cap = e->edge_cap;
+  e->edges = NULL;
+  e->nedges = 0;
+  e->edge_cap = 0;
+  e->reach = smt_true(ctx);
+  for (size_t pc = e->inv_start[header]; pc < marker && !e->failed; pc++) {
+    irs_step(e, pc);
+  }
+  SmtTerm value = irs_nonzero(ctx, irs_read(e, &e->insns[marker].arguments[0]));
+  for (size_t k = 0; k < e->nedges; k++) {
+    free(e->edges[k].env);
+  }
+  free(e->edges);
+  e->edges = saved_edges;
+  e->nedges = saved_count;
+  e->edge_cap = saved_cap;
+  memcpy(e->env, saved_env, e->nvars * sizeof(SmtTerm));
+  free(saved_env);
+  e->reach = saved_reach;
+  e->trap = saved_trap;
+  return value;
+}
+
+static void irs_find_invariants(IrsEnc *e) {
+  e->inv_marker = calloc(e->count ? e->count : 1u, sizeof(size_t));
+  e->inv_start = calloc(e->count ? e->count : 1u, sizeof(size_t));
+  for (size_t h = 0; h < e->count; h++) {
+    size_t end = e->loop_end[h];
+    if (end <= h) {
+      continue;
+    }
+    size_t marker = 0;
+    for (size_t pc = h + 1; pc <= end; pc++) {
+      const IRInstruction *insn = &e->insns[pc];
+      if (insn->op == IR_OP_CALL && insn->text &&
+          strcmp(insn->text, IR_SMT_INVARIANT_CALL) == 0 &&
+          insn->argument_count == 1) {
+        marker = pc;
+        break;
+      }
+    }
+    if (!marker) {
+      continue;
+    }
+    size_t start = h + 1;
+    for (size_t pc = h + 1; pc < marker; pc++) {
+      const IRInstruction *insn = &e->insns[pc];
+      if ((insn->op == IR_OP_BRANCH_ZERO || insn->op == IR_OP_BRANCH_EQ ||
+           insn->op == IR_OP_JUMP) &&
+          insn->text) {
+        size_t target = irs_label(e, insn->text);
+        if (target != (size_t)-1 && target > end) {
+          start = pc + 1;
+        }
+      }
+    }
+    for (size_t pc = start; pc < marker; pc++) {
+      const IRInstruction *insn = &e->insns[pc];
+      if (insn->dest.kind == IR_OPERAND_SYMBOL || insn->op == IR_OP_STORE) {
+        e->failed = 1;
+        snprintf(e->why, sizeof(e->why),
+                 "an invariant has to be the first statement of its loop's "
+                 "body");
+        return;
+      }
+    }
+    e->inv_marker[h] = marker;
+    e->inv_start[h] = start;
+  }
+}
+
 static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   SmtCtx *ctx = e->ctx;
+  if (insn->text && strcmp(insn->text, IR_SMT_INVARIANT_CALL) == 0) {
+    return;
+  }
   if (insn->text && strcmp(insn->text, IR_SMT_PROVE_CALL) == 0) {
-    IRSmtFrame *f = e->frame;
-    if (f->record_proves && !e->prefix && insn->argument_count == 1) {
+    if (e->frame->record_proves && !e->prefix && insn->argument_count == 1) {
       SmtTerm cond = irs_nonzero(ctx, irs_read(e, &insn->arguments[0]));
-      if (f->prove_count == f->prove_cap) {
-        f->prove_cap = f->prove_cap ? f->prove_cap * 2u : 8u;
-        f->proves = realloc(f->proves, f->prove_cap * sizeof(IRSmtProveSite));
-      }
-      IRSmtProveSite *site = &f->proves[f->prove_count++];
-      site->reach = e->reach;
-      site->trap = e->trap;
-      site->condition = cond;
-      site->location = insn->location;
+      irs_record_site(e, e->reach, cond, &insn->location, IR_SMT_SITE_PROVE);
     }
     return;
   }
@@ -603,7 +711,16 @@ static void irs_step(IrsEnc *e, size_t pc) {
     irs_merge(e, pc);
     if (e->frame->havoc_loops && e->loop_end && e->loop_end[pc] > pc &&
         e->reach != smt_false(ctx)) {
+      size_t marker = e->inv_marker ? e->inv_marker[pc] : 0;
+      if (marker) {
+        SmtTerm entry = irs_eval_invariant(e, pc);
+        irs_record_site(e, e->reach, entry, &e->insns[marker].location,
+                        IR_SMT_SITE_INVARIANT_ENTRY);
+      }
       irs_havoc_loop(e, pc, e->loop_end[pc]);
+      if (marker) {
+        e->reach = smt_and(ctx, e->reach, irs_eval_invariant(e, pc));
+      }
     }
     return;
   }
@@ -803,6 +920,9 @@ static int irs_run(IrsEnc *e) {
         e->loop_end[target] = pc;
       }
     }
+    if (e->frame->record_proves) {
+      irs_find_invariants(e);
+    }
   }
   for (size_t i = 0; i < fn->parameter_count; i++) {
     size_t id = irs_var_lookup(e, fn->parameter_names[i], 0);
@@ -876,6 +996,8 @@ int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
   free(e.buckets);
   free(e.env);
   free(e.loop_end);
+  free(e.inv_marker);
+  free(e.inv_start);
   for (size_t k = 0; k < e.nedges; k++) {
     free(e.edges[k].env);
   }

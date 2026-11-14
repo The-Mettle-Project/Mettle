@@ -89,6 +89,36 @@ on entry to a loop, every variable the loop writes may hold any value. A
 loop leaves alone. That reading covers every run the program can make, so a
 proof under it holds for the program.
 
+## Loop invariants
+
+`invariant(condition)` as the first statement of a loop body states a fact
+that holds every time the loop's test is reached. The compiler proves it
+holds when the loop is entered and that one pass through the body keeps it,
+then assumes it wherever the loop's variables are arbitrary, so it is known
+inside the body and after the loop:
+
+```mettle
+fn sum_below(n: uint64) -> uint64 {
+    var total: uint64 = 0;
+    var i: uint64 = 0;
+    while (i < n) {
+        invariant(i <= n && 2 * total == i * (i - 1));
+        total = total + i;
+        i = i + 1;
+    }
+    prove(2 * total == n * (n - 1));
+    return total;
+}
+```
+
+After the loop the prover knows `i <= n` from the invariant and `!(i < n)`
+from the test, derives `i == n`, substitutes it, and the `prove` follows. An
+invariant that the body breaks is reported with the values that break it:
+
+```text
+loop.mettle:5:18: error: invariant in `double_up` does not hold (the invariant after an iteration); it fails at n = 4294967294
+```
+
 ## How the prover sees a function
 
 A call stays a call until a tactic unfolds it. Unfolding replaces the call
@@ -195,7 +225,8 @@ and uninterpreted functions:
 flowchart LR
   T[terms] --> S[simplify while building]
   S --> A[remove arrays and functions by Ackermann expansion]
-  A --> N[normalize arithmetic to polynomials]
+  A --> E[substitute equations that define a variable]
+  E --> N[normalize arithmetic to polynomials]
   N --> B[bit-blast with shared gates]
   B --> C[CDCL SAT]
   C -- unsat --> P[replay the refutation in a DRUP checker]
