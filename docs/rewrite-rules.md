@@ -42,7 +42,15 @@ rules along, so a library can ship the identities its own functions satisfy.
 
 ## What the compiler checks
 
-Each rule is checked before it is ever applied. The compile-time interpreter
+Each rule is proved before it is ever applied. The SMT solver encodes both
+sides as bit-vector formulas over the parameters, with the semantics the
+interpreter gives the IR, and proves that they agree, trap for trap and value
+for value, on every input the `where` clause admits. See [Proofs](proofs.md).
+A refuted rule is replayed in the interpreter on the solver's input, so the
+error shows a concrete run.
+
+A side the solver cannot model, such as one that computes with floats, is
+checked on generated inputs instead. The compile-time interpreter
 runs `from` and `to` on generated inputs and compares the results, the memory
 each touched, and the calls each made to code outside the program. The inputs
 are the table the [translation validator](translation-validation.md) uses, the
@@ -113,9 +121,9 @@ The rule's parameter types must agree with the expression's. A rule over
 `--explain` accounts for every rule:
 
 ```text
-clamp_twice (rewrite rule @ line 34): rule checked
-    \_ verified: `from` and `to` agree on the 18 generated input sets that satisfy `where` (24 generated in all)
-clamp_twice (rewrite rule @ line 34): applied 1 time
+clamp_twice (rewrite rule @ line 36): rule checked
+    \_ verified: `from` and `to` agree on every input that satisfies `where`: the SMT solver refuted every disagreement (7321 clauses, 2892 lemmas checked)
+clamp_twice (rewrite rule @ line 36): applied 1 time
 use (expression @ line 43): rewritten by rule `clamp_twice`
 ```
 

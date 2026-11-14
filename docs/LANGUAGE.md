@@ -35,17 +35,18 @@ frontend, see [Writing a frontend](embedding.md).
 16. [C interoperability](c-interop.md)
 17. [Runtime model](runtime-model.md), including schedules as data
 18. [Rewrite rules](rewrite-rules.md)
-19. [Rules](rules.md)
-20. [Effects](effects.md), including which globals two threads share
+19. [Proofs](proofs.md): `theorem`, tactics, and the SMT solver
+20. [Rules](rules.md)
+21. [Effects](effects.md), including which globals two threads share
 
 ## Beyond the CPU
 
-21. [GPU offload](gpu.md)
+22. [GPU offload](gpu.md)
 
 ## Reference
 
-22. [Quick reference](quick-reference.md)
-23. [Known limitations](known-limitations.md)
+23. [Quick reference](quick-reference.md)
+24. [Known limitations](known-limitations.md)
 
 Every mechanism above reports what it spent and what it assumed: `--explain`
 carries sections for the types proven, the effects held, the rules run, and

@@ -21,6 +21,21 @@ miscompile, caught at the moment it is introduced.
 The claim "this optimization is correct" is not accepted from the optimizer on
 its own authority.
 
+A changed function whose IR is loop-free integer code is first handed to the
+SMT solver, which proves the code before and after the pass agree on every
+input: the same traps and the same return value. A proof validates the
+application without running anything, and the summary counts proofs apart
+from runs:
+
+```text
+translation validation: OK - 91 pass applications validated on 6 input sets each; 7 skipped
+  proved: 9 of the validated applications hold for every input, by SMT proof with a checked refutation
+```
+
+When the solver finds a disagreement, the interpreter runs the solver's input
+first, so a real miscompile is reported with a concrete run. Code with loops,
+memory or floats goes straight to the input sets. See [Proofs](proofs.md).
+
 ## Reference twins
 
 The same machinery checks a claim the program makes about itself. A function

@@ -63,6 +63,9 @@ frontend can drive instead. The documentation is organized the same way.
 - [Translation validation](translation-validation.md): `--verify`, which
   catches the optimizer's own bugs, and `reference` twins, which point the same
   differential at two functions the program says agree.
+- [Proofs](proofs.md): `theorem` with tactic proofs checked on every build,
+  `mettle prove`, the SMT solver behind it, `mettle smt` and
+  `mettle prove-compiler`.
 - [Rewrite rules](rewrite-rules.md): `rewrite`, identities from your own code
 - [Rules](rules.md): `@rule` over the checked program or over the machine it
   became, a property the program requires of itself, checked on every build
