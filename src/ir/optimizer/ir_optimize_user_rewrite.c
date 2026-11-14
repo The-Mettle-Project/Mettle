@@ -1,5 +1,6 @@
 #include "ir_optimize_internal.h"
 #include "../ir_interp.h"
+#include "../ir_smt.h"
 #include "../ir_verify.h"
 #include "../../common.h"
 
@@ -49,6 +50,8 @@ typedef struct {
   long guard_false;
   const char *undecided_param;
   SourceLocation location;
+  int proved;
+  IRSmtReport smt;
 } RwRule;
 
 typedef struct {
@@ -373,6 +376,22 @@ static int rw_self_check(RwRule *rule) {
   char why[192];
   char cex[288];
   char skip[160];
+  ir_smt_check_equivalence(g_program, from, from->instructions,
+                           from->instruction_count, to, to->instructions,
+                           to->instruction_count, rule->where, &rule->smt);
+  if (rule->smt.verdict == IR_SMT_PROVED) {
+    rule->proved = 1;
+    return 1;
+  }
+  int refuted = rule->smt.verdict == IR_SMT_REFUTED;
+  long long probes[sizeof(RW_INT_PROBES) / sizeof(RW_INT_PROBES[0]) + 16];
+  int probe_count = (int)(sizeof(RW_INT_PROBES) / sizeof(RW_INT_PROBES[0]));
+  memcpy(probes, RW_INT_PROBES, sizeof(RW_INT_PROBES));
+  if (refuted) {
+    for (size_t i = 0; i < rule->smt.input_count; i++) {
+      probes[probe_count++] = rule->smt.inputs[i];
+    }
+  }
   IRVerifySnapshot *before = ir_verify_snapshot_capture(from);
   if (!before) {
     rw_report_error(from, "rewrite `%s` could not be checked: its `from` side "
@@ -381,11 +400,32 @@ static int rw_self_check(RwRule *rule) {
     return 0;
   }
   IRVerifyRewriteVerdict verdict = ir_verify_check_rewrite_probed(
-      g_program, to, before, rule->where, &rule->guard_hits, RW_INT_PROBES,
-      (int)(sizeof(RW_INT_PROBES) / sizeof(RW_INT_PROBES[0])), why,
-      sizeof(why), cex, sizeof(cex), skip, sizeof(skip));
+      g_program, to, before, rule->where, &rule->guard_hits, probes,
+      probe_count, why, sizeof(why), cex, sizeof(cex), skip, sizeof(skip));
   ir_verify_snapshot_free(before);
   rule->checked_runs = ir_verify_last_input_run_count();
+  if (refuted && verdict != IR_VERIFY_REWRITE_DIVERGED) {
+    size_t at = 0;
+    cex[0] = 0;
+    for (size_t i = 0; i < rule->smt.input_count && i < from->parameter_count;
+         i++) {
+      int n = snprintf(cex + at, sizeof(cex) - at, "%s%s = %lld",
+                       i ? ", " : "", from->parameter_names[i],
+                       rule->smt.inputs[i]);
+      if (n < 0 || (size_t)n >= sizeof(cex) - at) {
+        break;
+      }
+      at += (size_t)n;
+    }
+    rw_report_error(from,
+                    "rewrite `%s` changes meaning: its `from` and `to` sides "
+                    "disagree",
+                    rule->name);
+    fprintf(stderr, "  counterexample %s\n", cex);
+    fprintf(stderr, "  found by the SMT solver; the interpreter did not "
+                    "reproduce it on its own inputs\n");
+    return 0;
+  }
   switch (verdict) {
   case IR_VERIFY_REWRITE_VALIDATED:
     return 1;
@@ -397,9 +437,17 @@ static int rw_self_check(RwRule *rule) {
                     rule->name);
     fprintf(stderr, "  counterexample %s\n", cex);
     fprintf(stderr, "  divergence: %s\n", why);
-    fprintf(stderr,
-            "  a rule is applied only after `from` and `to` agree on every "
-            "generated input; fix the rule or narrow it with `where`\n");
+    if (refuted) {
+      fprintf(stderr, "  the SMT solver refuted the rule; a rule is applied "
+                      "only after it proves `from` and `to` agree on every "
+                      "input or, where it cannot model them, after they "
+                      "agree on every generated input\n");
+    } else {
+      fprintf(stderr,
+              "  a rule is applied only after `from` and `to` agree on "
+              "every generated input; fix the rule or narrow it with "
+              "`where`\n");
+    }
     return 0;
   }
   default:
@@ -491,7 +539,15 @@ int ir_user_rewrite_begin(IRProgram *program) {
     }
     if (ir_explain_enabled()) {
       char verified[192];
-      if (rule->where) {
+      if (rule->proved) {
+        snprintf(verified, sizeof(verified),
+                 "`from` and `to` agree on every input%s: the SMT solver "
+                 "refuted every disagreement (%llu clauses, %llu lemmas "
+                 "checked)",
+                 rule->where ? " that satisfies `where`" : "",
+                 (unsigned long long)rule->smt.clauses,
+                 (unsigned long long)rule->smt.lemmas);
+      } else if (rule->where) {
         snprintf(verified, sizeof(verified),
                  "`from` and `to` agree on the %d generated input sets that "
                  "satisfy `where` (%d generated in all)",

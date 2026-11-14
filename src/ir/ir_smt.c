@@ -790,7 +790,7 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
       smt_implies(ctx, smt_not(ctx, oa.trap), smt_eq(ctx, oa.result, ob.result));
   SmtTerm claim = smt_implies(ctx, assume, smt_and(ctx, same_trap, same_value));
   SmtSolver *solver = NULL;
-  SmtResult r = smt_prove(ctx, claim, 1, 2000000, &solver);
+  SmtResult r = smt_prove(ctx, claim, 1, 10000, &solver);
   SmtStats st;
   smt_solver_stats(solver, &st);
   report->clauses = st.clauses;

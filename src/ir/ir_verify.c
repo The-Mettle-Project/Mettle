@@ -1,5 +1,6 @@
 #include "ir_verify.h"
 #include "ir_interp.h"
+#include "ir_smt.h"
 #include "../common.h"
 #include "optimizer/ir_optimize_internal.h"
 #include <math.h>
@@ -60,6 +61,8 @@ static long long g_apps_checked = 0;
 static long long g_apps_validated = 0;
 static long long g_apps_unverifiable = 0;
 static long long g_apps_no_input = 0;
+static long long g_apps_proved = 0;
+static long long g_apps_smt_unconfirmed = 0;
 static long long g_divergences = 0;
 static IRVQuarantine g_quarantine[IRV_MAX_QUARANTINE];
 static size_t g_quarantine_count = 0;
@@ -97,6 +100,8 @@ void ir_verify_begin_program(IRProgram *program) {
   g_apps_validated = 0;
   g_apps_unverifiable = 0;
   g_apps_no_input = 0;
+  g_apps_proved = 0;
+  g_apps_smt_unconfirmed = 0;
   g_divergences = 0;
   g_sabotage_fired = 0;
   for (size_t i = 0; i < g_quarantine_count; i++) {
@@ -1620,8 +1625,54 @@ int ir_verify_check_pass(IRFunction *function, IRVerifySnapshot *snapshot,
   g_apps_checked++;
 
   IRVCheckResult result;
-  switch (irv_check_function(g_program, function, snapshot, &result,
-                             irv_pass_elem_bytes(pass_name))) {
+  IRVCheckOutcome outcome;
+  IRSmtReport smt;
+  ir_smt_check_equivalence(g_program, function, snapshot->instructions,
+                           snapshot->instruction_count, function,
+                           function->instructions,
+                           function->instruction_count, NULL, &smt);
+  if (smt.verdict == IR_SMT_PROVED) {
+    g_apps_validated++;
+    g_apps_proved++;
+    return 1;
+  }
+  if (smt.verdict == IR_SMT_REFUTED) {
+    IRVHarvest harvest;
+    memset(&harvest, 0, sizeof(harvest));
+    int distinct = 0;
+    irv_harvest_stream(function->instructions, function->instruction_count,
+                       &harvest, &distinct);
+    irv_harvest_stream(snapshot->instructions, snapshot->instruction_count,
+                       &harvest, &distinct);
+    harvest.probe_start = harvest.count;
+    for (size_t i = 0; i < smt.input_count; i++) {
+      if (harvest.count < IRV_MAX_HARVEST_VALUES) {
+        harvest.values[harvest.count++] = smt.inputs[i];
+      }
+    }
+    if (function->parameter_count <= IRV_MAX_PARAMS) {
+      IRVParamInfo params[IRV_MAX_PARAMS];
+      for (size_t i = 0; i < function->parameter_count; i++) {
+        params[i] = irv_classify_param(
+            g_program,
+            function->parameter_types ? function->parameter_types[i] : NULL);
+      }
+      harvest.cross_base = 12;
+      irv_harvest_plan_cross(&harvest, params, function->parameter_count);
+    }
+    outcome = irv_check_function_ex(g_program, function, snapshot, &result,
+                                    &harvest, irv_pass_elem_bytes(pass_name),
+                                    NULL, NULL);
+    if (outcome != IRV_CHECK_DIVERGED) {
+      g_apps_smt_unconfirmed++;
+      outcome = irv_check_function(g_program, function, snapshot, &result,
+                                   irv_pass_elem_bytes(pass_name));
+    }
+  } else {
+    outcome = irv_check_function(g_program, function, snapshot, &result,
+                                 irv_pass_elem_bytes(pass_name));
+  }
+  switch (outcome) {
   case IRV_CHECK_UNVERIFIABLE:
     irv_note_skip(function, result.skip_reason);
     g_apps_unverifiable++;
@@ -1761,6 +1812,18 @@ void ir_verify_end_program(void) {
     fprintf(stderr, "; %lld skipped", g_apps_unverifiable + g_apps_no_input);
   }
   fprintf(stderr, "\n");
+  if (g_apps_proved > 0) {
+    fprintf(stderr,
+            "  %sproved%s: %lld of the validated applications hold for every "
+            "input, by SMT proof with a checked refutation\n",
+            dim, reset, g_apps_proved);
+  }
+  if (g_apps_smt_unconfirmed > 0) {
+    fprintf(stderr,
+            "  %snot reproduced%s: the SMT solver refuted %lld applications "
+            "that the interpreter then ran clean on the solver's inputs\n",
+            dim, reset, g_apps_smt_unconfirmed);
+  }
   for (size_t i = 0; i < g_skip_note_count; i++) {
     fprintf(stderr, "  %snot validated%s: %s (%s)\n", dim, reset,
             g_skip_notes[i].function_name, g_skip_notes[i].reason);
