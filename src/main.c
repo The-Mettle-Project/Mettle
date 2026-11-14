@@ -4966,6 +4966,107 @@ static int main_explain_command(int *argc, char **argv,
   return 0;
 }
 
+static int drop_subcommand_word(int argc, char *argv[]) {
+  for (int i = 1; i + 1 < argc; i++) {
+    argv[i] = argv[i + 1];
+  }
+  return argc - 1;
+}
+
+static int check_trace_arguments(int argc, char *argv[],
+                                 CompilerOptions *options) {
+  if (argc < 4) {
+    fprintf(stderr,
+            "usage: mettle check-trace <file.mettle> <trace>\n"
+            "  runs the file's `@rule` functions over `Trace` against a "
+            "run --record-trace wrote down\n");
+    return -1;
+  }
+  options->check_trace_path = argv[3];
+  argv[1] = argv[2];
+  for (int k = 4; k < argc; k++) {
+    argv[k - 2] = argv[k];
+  }
+  return argc - 2;
+}
+
+static int machine_arguments(int argc, char *argv[],
+                             CompilerOptions *options) {
+  if (strcmp(argv[1], "machine") == 0) {
+    options->machine_mode = 1;
+  } else {
+    options->emulate_mode = 1;
+  }
+  argc = drop_subcommand_word(argc, argv);
+  if (argc < 2) {
+    fprintf(stderr,
+            "usage: mettle machine <file.mettle>   prints the machine the "
+            "file describes\n"
+            "       mettle emulate <file.mettle>   assembles PROGRAM into "
+            "that machine's encoding, decodes it back, and runs it\n");
+    return -1;
+  }
+  return argc;
+}
+
+static int live_undo_main(const char *patch) {
+  LivePatchSummary summary;
+  char *live_error = NULL;
+  if (!live_build_undo(patch, &summary, &live_error)) {
+    fprintf(stderr, "Error: %s\n",
+            live_error ? live_error : "Failed to undo a live patch");
+    free(live_error);
+    return 1;
+  }
+  printf("Patch %u undoes patch %u\n", summary.patch_index, summary.undone);
+  return 0;
+}
+
+static int prove_subcommand_arguments(int argc, char *argv[]) {
+  if (argc < 3) {
+    fprintf(stderr, "usage: mettle prove <file.mettle> [--goals] "
+                    "[--interactive <theorem>]\n"
+                    "  checks every theorem in the program and reports each "
+                    "one; --goals prints\n"
+                    "  the goals after every tactic, --interactive reads more "
+                    "tactics for one\n"
+                    "  theorem from standard input\n");
+    return -1;
+  }
+  IRTheoremOptions theorem_options;
+  memset(&theorem_options, 0, sizeof(theorem_options));
+  theorem_options.report = 1;
+  theorem_options.stop_after = 1;
+  int kept = 2;
+  for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--goals") == 0) {
+      theorem_options.show_goals = 1;
+    } else if (strcmp(argv[i], "--interactive") == 0 && i + 1 < argc) {
+      theorem_options.interactive = argv[++i];
+    } else {
+      argv[kept++] = argv[i];
+    }
+  }
+  ir_theorem_set_options(&theorem_options);
+  argv[1] = argv[2];
+  return split_subcommand_flags(kept, argv, 3, NULL, &(int){0});
+}
+
+static int prove_compiler_main(int argc, char *argv[]) {
+  int verbose = argc <= 2 || strcmp(argv[2], "--quiet") != 0;
+  printf("Peephole identities in src/ir/optimizer/ir_optimize_rewrite.c, "
+         "proved against the IR semantics of src/ir/ir_interp.c:\n");
+  int identities_ok = ir_smt_prove_identity_table(stdout, verbose);
+  printf("\nDivision by a constant as lowered to MIR in "
+         "src/codegen/binary/mir_lower.c, proved against the same "
+         "semantics:\n");
+  int division_ok = mir_prove_divmod_lowering(stdout, verbose);
+  printf("\nMultiplication by a constant as classified in "
+         "src/codegen/binary/strength_rules.c:\n");
+  int strength_ok = mir_prove_strength_table(stdout, verbose);
+  return identities_ok && division_ok && strength_ok ? 0 : 1;
+}
+
 int main(int argc, char *argv[]) {
   CompilerOptions options = {0};
   g_compiler_argc = argc;
@@ -5017,47 +5118,21 @@ int main(int argc, char *argv[]) {
     }
     if (strcmp(argv[1], "expand") == 0) {
       options.expand_mode = 1;
-      for (int i = 1; i + 1 < argc; i++) {
-        argv[i] = argv[i + 1];
-      }
-      argc--;
+      argc = drop_subcommand_word(argc, argv);
       if (argc < 2) {
         fprintf(stderr, "usage: mettle expand <file.mettle>\n");
         return 1;
       }
     }
     if (strcmp(argv[1], "check-trace") == 0) {
-      if (argc < 4) {
-        fprintf(stderr,
-                "usage: mettle check-trace <file.mettle> <trace>\n"
-                "  runs the file's `@rule` functions over `Trace` against a "
-                "run --record-trace wrote down\n");
+      argc = check_trace_arguments(argc, argv, &options);
+      if (argc < 0) {
         return 1;
       }
-      options.check_trace_path = argv[3];
-      argv[1] = argv[2];
-      for (int k = 4; k < argc; k++) {
-        argv[k - 2] = argv[k];
-      }
-      argc -= 2;
     }
-    if (strcmp(argv[1], "machine") == 0 ||
-        strcmp(argv[1], "emulate") == 0) {
-      if (strcmp(argv[1], "machine") == 0) {
-        options.machine_mode = 1;
-      } else {
-        options.emulate_mode = 1;
-      }
-      for (int i = 1; i + 1 < argc; i++) {
-        argv[i] = argv[i + 1];
-      }
-      argc--;
-      if (argc < 2) {
-        fprintf(stderr,
-                "usage: mettle machine <file.mettle>   prints the machine the "
-                "file describes\n"
-                "       mettle emulate <file.mettle>   assembles PROGRAM into "
-                "that machine's encoding, decodes it back, and runs it\n");
+    if (strcmp(argv[1], "machine") == 0 || strcmp(argv[1], "emulate") == 0) {
+      argc = machine_arguments(argc, argv, &options);
+      if (argc < 0) {
         return 1;
       }
     }
@@ -5065,52 +5140,13 @@ int main(int argc, char *argv[]) {
       return smtlib_main(argc - 2, argv + 2);
     }
     if (strcmp(argv[1], "prove") == 0) {
-      if (argc < 3) {
-        fprintf(stderr,
-                "usage: mettle prove <file.mettle> [--goals] "
-                "[--interactive <theorem>]\n"
-                "  checks every theorem in the program and reports each "
-                "one; --goals prints\n"
-                "  the goals after every tactic, --interactive reads more "
-                "tactics for one\n"
-                "  theorem from standard input\n");
+      argc = prove_subcommand_arguments(argc, argv);
+      if (argc < 0) {
         return 1;
       }
-      IRTheoremOptions theorem_options;
-      memset(&theorem_options, 0, sizeof(theorem_options));
-      theorem_options.report = 1;
-      theorem_options.stop_after = 1;
-      int kept = 2;
-      for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--goals") == 0) {
-          theorem_options.show_goals = 1;
-        } else if (strcmp(argv[i], "--interactive") == 0 && i + 1 < argc) {
-          theorem_options.interactive = argv[++i];
-        } else {
-          argv[kept++] = argv[i];
-        }
-      }
-      argc = kept;
-      ir_theorem_set_options(&theorem_options);
-      argv[1] = argv[2];
-      argc = split_subcommand_flags(argc, argv, 3, NULL, &(int){0});
     }
     if (strcmp(argv[1], "prove-compiler") == 0) {
-      int verbose = argc > 2 && strcmp(argv[2], "--quiet") != 0;
-      if (argc <= 2) {
-        verbose = 1;
-      }
-      printf("Peephole identities in src/ir/optimizer/ir_optimize_rewrite.c, "
-             "proved against the IR semantics of src/ir/ir_interp.c:\n");
-      int identities_ok = ir_smt_prove_identity_table(stdout, verbose);
-      printf("\nDivision by a constant as lowered to MIR in "
-             "src/codegen/binary/mir_lower.c, proved against the same "
-             "semantics:\n");
-      int division_ok = mir_prove_divmod_lowering(stdout, verbose);
-      printf("\nMultiplication by a constant as classified in "
-             "src/codegen/binary/strength_rules.c:\n");
-      int strength_ok = mir_prove_strength_table(stdout, verbose);
-      return identities_ok && division_ok && strength_ok ? 0 : 1;
+      return prove_compiler_main(argc, argv);
     }
     if (strcmp(argv[1], "why") == 0) {
       if (argc < 5) {
@@ -5128,17 +5164,7 @@ int main(int argc, char *argv[]) {
       argc = split_subcommand_flags(argc, argv, 5, NULL, &(int){0});
     }
     if (strcmp(argv[1], "--live-undo") == 0 && argc >= 3) {
-      LivePatchSummary summary;
-      char *live_error = NULL;
-      if (!live_build_undo(argv[2], &summary, &live_error)) {
-        fprintf(stderr, "Error: %s\n",
-                live_error ? live_error : "Failed to undo a live patch");
-        free(live_error);
-        return 1;
-      }
-      printf("Patch %u undoes patch %u\n", summary.patch_index,
-             summary.undone);
-      return 0;
+      return live_undo_main(argv[2]);
     }
     if (strcmp(argv[1], "swap-check") == 0) {
       options.swap_check_mode = 1;

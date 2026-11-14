@@ -669,11 +669,8 @@ static SmtTerm smt_fold(SmtCtx *ctx, SmtKind kind, unsigned nargs,
   return smt_const_bits(ctx, ctx->sorts[sort].width, &r);
 }
 
-static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
-                                 SmtTerm *args, SmtSort sort, uint32_t p0,
-                                 uint32_t p1) {
-  SmtTerm a = nargs > 0 ? args[0] : 0;
-  SmtTerm b = nargs > 1 ? args[1] : 0;
+static SmtTerm smt_simplify_bool(SmtCtx *ctx, SmtKind kind, SmtTerm a,
+                                 SmtTerm b) {
   switch (kind) {
   case SMT_K_NOT:
     if (smt_is_true(ctx, a)) {
@@ -700,44 +697,6 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return ctx->bool_false;
     }
     return 0;
-  case SMT_K_OR:
-    if (smt_is_true(ctx, a) || smt_is_true(ctx, b)) {
-      return ctx->bool_true;
-    }
-    if (smt_is_false(ctx, a)) {
-      return b;
-    }
-    if (smt_is_false(ctx, b) || a == b) {
-      return a;
-    }
-    if (smt_is_not_of(ctx, a, b)) {
-      return ctx->bool_true;
-    }
-    for (int side = 0; side < 2; side++) {
-      SmtTerm x = side ? b : a, y = side ? a : b;
-      if (ctx->nodes[y].kind == SMT_K_OR &&
-          (smt_is_not_of(ctx, x, smt_arg(ctx, y, 0)) ||
-           smt_is_not_of(ctx, x, smt_arg(ctx, y, 1)))) {
-        return ctx->bool_true;
-      }
-    }
-    if (ctx->nodes[a].kind == SMT_K_AND && ctx->nodes[b].kind == SMT_K_AND) {
-      SmtTerm a0 = smt_arg(ctx, a, 0), a1 = smt_arg(ctx, a, 1);
-      SmtTerm b0 = smt_arg(ctx, b, 0), b1 = smt_arg(ctx, b, 1);
-      if (a0 == b0 && smt_is_not_of(ctx, a1, b1)) {
-        return a0;
-      }
-      if (a0 == b1 && smt_is_not_of(ctx, a1, b0)) {
-        return a0;
-      }
-      if (a1 == b0 && smt_is_not_of(ctx, a0, b1)) {
-        return a1;
-      }
-      if (a1 == b1 && smt_is_not_of(ctx, a0, b0)) {
-        return a1;
-      }
-    }
-    return 0;
   case SMT_K_XOR:
     if (a == b) {
       return ctx->bool_false;
@@ -758,96 +717,147 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return ctx->bool_true;
     }
     return 0;
-  case SMT_K_EQ:
-    if (a == b) {
-      return ctx->bool_true;
-    }
-    if (smt_term_is_const(ctx, a) && smt_term_is_const(ctx, b)) {
-      return ctx->bool_false;
-    }
-    for (int side = 0; side < 2; side++) {
-      SmtTerm it = side ? b : a, k = side ? a : b;
-      if (ctx->nodes[it].kind != SMT_K_ITE || !smt_is_bvconst(ctx, k)) {
-        continue;
-      }
-      SmtTerm t1 = smt_arg(ctx, it, 1), t2 = smt_arg(ctx, it, 2);
-      if (smt_is_bvconst(ctx, t1) != smt_is_bvconst(ctx, t2)) {
-        return smt_ite(ctx, smt_arg(ctx, it, 0), smt_eq(ctx, t1, k),
-                       smt_eq(ctx, t2, k));
-      }
-      if (!smt_is_bvconst(ctx, t1) || !smt_is_bvconst(ctx, t2)) {
-        continue;
-      }
-      int hit1 = t1 == k, hit2 = t2 == k;
-      SmtTerm c = smt_arg(ctx, it, 0);
-      if (hit1 && hit2) {
-        return ctx->bool_true;
-      }
-      if (hit1) {
-        return c;
-      }
-      if (hit2) {
-        return smt_not(ctx, c);
-      }
-      return ctx->bool_false;
-    }
-    if (smt_sort_is_bool(ctx, ctx->nodes[a].sort)) {
-      if (smt_is_true(ctx, a)) {
-        return b;
-      }
-      if (smt_is_true(ctx, b)) {
-        return a;
-      }
-      if (smt_is_false(ctx, a)) {
-        return smt_not(ctx, b);
-      }
-      if (smt_is_false(ctx, b)) {
-        return smt_not(ctx, a);
-      }
-      if (smt_is_not_of(ctx, a, b)) {
-        return ctx->bool_false;
-      }
-    }
-    return 0;
-  case SMT_K_ITE: {
-    SmtTerm c = args[0], x = args[1], y = args[2];
-    if (smt_is_true(ctx, c) || x == y) {
-      return x;
-    }
-    if (smt_is_false(ctx, c)) {
-      return y;
-    }
-    if (ctx->nodes[c].kind == SMT_K_NOT) {
-      return smt_ite(ctx, smt_arg(ctx, c, 0), y, x);
-    }
-    if (smt_sort_is_bool(ctx, sort)) {
-      if (smt_is_true(ctx, x) && smt_is_false(ctx, y)) {
-        return c;
-      }
-      if (smt_is_false(ctx, x) && smt_is_true(ctx, y)) {
-        return smt_not(ctx, c);
-      }
-      if (smt_is_true(ctx, x)) {
-        return smt_or(ctx, c, y);
-      }
-      if (smt_is_false(ctx, y)) {
-        return smt_and(ctx, c, x);
-      }
-      if (smt_is_false(ctx, x)) {
-        return smt_and(ctx, smt_not(ctx, c), y);
-      }
-      if (smt_is_true(ctx, y)) {
-        return smt_or(ctx, smt_not(ctx, c), x);
-      }
-    }
-    if (ctx->nodes[x].kind == SMT_K_ITE && smt_arg(ctx, x, 0) == c) {
-      return smt_ite(ctx, c, smt_arg(ctx, x, 1), y);
-    }
-    if (ctx->nodes[y].kind == SMT_K_ITE && smt_arg(ctx, y, 0) == c) {
-      return smt_ite(ctx, c, x, smt_arg(ctx, y, 2));
-    }
+  default:
     return 0;
   }
+}
+
+static SmtTerm smt_simplify_or(SmtCtx *ctx, SmtTerm a, SmtTerm b) {
+  if (smt_is_true(ctx, a) || smt_is_true(ctx, b)) {
+    return ctx->bool_true;
+  }
+  if (smt_is_false(ctx, a)) {
+    return b;
+  }
+  if (smt_is_false(ctx, b) || a == b) {
+    return a;
+  }
+  if (smt_is_not_of(ctx, a, b)) {
+    return ctx->bool_true;
+  }
+  for (int side = 0; side < 2; side++) {
+    SmtTerm x = side ? b : a, y = side ? a : b;
+    if (ctx->nodes[y].kind == SMT_K_OR &&
+        (smt_is_not_of(ctx, x, smt_arg(ctx, y, 0)) ||
+         smt_is_not_of(ctx, x, smt_arg(ctx, y, 1)))) {
+      return ctx->bool_true;
+    }
+  }
+  if (ctx->nodes[a].kind == SMT_K_AND && ctx->nodes[b].kind == SMT_K_AND) {
+    SmtTerm a0 = smt_arg(ctx, a, 0), a1 = smt_arg(ctx, a, 1);
+    SmtTerm b0 = smt_arg(ctx, b, 0), b1 = smt_arg(ctx, b, 1);
+    if (a0 == b0 && smt_is_not_of(ctx, a1, b1)) {
+      return a0;
+    }
+    if (a0 == b1 && smt_is_not_of(ctx, a1, b0)) {
+      return a0;
+    }
+    if (a1 == b0 && smt_is_not_of(ctx, a0, b1)) {
+      return a1;
+    }
+    if (a1 == b1 && smt_is_not_of(ctx, a0, b0)) {
+      return a1;
+    }
+  }
+  return 0;
+}
+
+static SmtTerm smt_simplify_eq(SmtCtx *ctx, SmtTerm a, SmtTerm b) {
+  if (a == b) {
+    return ctx->bool_true;
+  }
+  if (smt_term_is_const(ctx, a) && smt_term_is_const(ctx, b)) {
+    return ctx->bool_false;
+  }
+  for (int side = 0; side < 2; side++) {
+    SmtTerm it = side ? b : a, k = side ? a : b;
+    if (ctx->nodes[it].kind != SMT_K_ITE || !smt_is_bvconst(ctx, k)) {
+      continue;
+    }
+    SmtTerm t1 = smt_arg(ctx, it, 1), t2 = smt_arg(ctx, it, 2);
+    if (smt_is_bvconst(ctx, t1) != smt_is_bvconst(ctx, t2)) {
+      return smt_ite(ctx, smt_arg(ctx, it, 0), smt_eq(ctx, t1, k),
+                     smt_eq(ctx, t2, k));
+    }
+    if (!smt_is_bvconst(ctx, t1) || !smt_is_bvconst(ctx, t2)) {
+      continue;
+    }
+    int hit1 = t1 == k, hit2 = t2 == k;
+    SmtTerm c = smt_arg(ctx, it, 0);
+    if (hit1 && hit2) {
+      return ctx->bool_true;
+    }
+    if (hit1) {
+      return c;
+    }
+    if (hit2) {
+      return smt_not(ctx, c);
+    }
+    return ctx->bool_false;
+  }
+  if (smt_sort_is_bool(ctx, ctx->nodes[a].sort)) {
+    if (smt_is_true(ctx, a)) {
+      return b;
+    }
+    if (smt_is_true(ctx, b)) {
+      return a;
+    }
+    if (smt_is_false(ctx, a)) {
+      return smt_not(ctx, b);
+    }
+    if (smt_is_false(ctx, b)) {
+      return smt_not(ctx, a);
+    }
+    if (smt_is_not_of(ctx, a, b)) {
+      return ctx->bool_false;
+    }
+  }
+  return 0;
+}
+
+static SmtTerm smt_simplify_ite(SmtCtx *ctx, SmtSort sort, SmtTerm *args) {
+  SmtTerm c = args[0], x = args[1], y = args[2];
+  if (smt_is_true(ctx, c) || x == y) {
+    return x;
+  }
+  if (smt_is_false(ctx, c)) {
+    return y;
+  }
+  if (ctx->nodes[c].kind == SMT_K_NOT) {
+    return smt_ite(ctx, smt_arg(ctx, c, 0), y, x);
+  }
+  if (smt_sort_is_bool(ctx, sort)) {
+    if (smt_is_true(ctx, x) && smt_is_false(ctx, y)) {
+      return c;
+    }
+    if (smt_is_false(ctx, x) && smt_is_true(ctx, y)) {
+      return smt_not(ctx, c);
+    }
+    if (smt_is_true(ctx, x)) {
+      return smt_or(ctx, c, y);
+    }
+    if (smt_is_false(ctx, y)) {
+      return smt_and(ctx, c, x);
+    }
+    if (smt_is_false(ctx, x)) {
+      return smt_and(ctx, smt_not(ctx, c), y);
+    }
+    if (smt_is_true(ctx, y)) {
+      return smt_or(ctx, smt_not(ctx, c), x);
+    }
+  }
+  if (ctx->nodes[x].kind == SMT_K_ITE && smt_arg(ctx, x, 0) == c) {
+    return smt_ite(ctx, c, smt_arg(ctx, x, 1), y);
+  }
+  if (ctx->nodes[y].kind == SMT_K_ITE && smt_arg(ctx, y, 0) == c) {
+    return smt_ite(ctx, c, x, smt_arg(ctx, y, 2));
+  }
+  return 0;
+}
+
+static SmtTerm smt_simplify_bvlogic(SmtCtx *ctx, SmtKind kind, SmtSort sort,
+                                    SmtTerm a, SmtTerm b) {
+  switch (kind) {
   case SMT_K_BVNOT:
     if (ctx->nodes[a].kind == SMT_K_BVNOT) {
       return smt_arg(ctx, a, 0);
@@ -885,6 +895,14 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return a;
     }
     return 0;
+  default:
+    return 0;
+  }
+}
+
+static SmtTerm smt_simplify_bvarith(SmtCtx *ctx, SmtKind kind, SmtSort sort,
+                                    SmtTerm a, SmtTerm b) {
+  switch (kind) {
   case SMT_K_BVADD:
     if (smt_const_is_zero(ctx, a)) {
       return b;
@@ -922,6 +940,14 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return b;
     }
     return 0;
+  default:
+    return 0;
+  }
+}
+
+static SmtTerm smt_simplify_bvdiv(SmtCtx *ctx, SmtKind kind, SmtSort sort,
+                                  SmtTerm a, SmtTerm b) {
+  switch (kind) {
   case SMT_K_BVUDIV:
   case SMT_K_BVUREM: {
     unsigned w = ctx->sorts[sort].width;
@@ -978,6 +1004,14 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
     }
     return smt_ite(ctx, a_neg, smt_mk1(ctx, SMT_K_BVNEG, q_neg), q_pos);
   }
+  default:
+    return 0;
+  }
+}
+
+static SmtTerm smt_simplify_bvcompare(SmtCtx *ctx, SmtKind kind, SmtTerm a,
+                                      SmtTerm b) {
+  switch (kind) {
   case SMT_K_BVSHL:
   case SMT_K_BVLSHR:
   case SMT_K_BVASHR:
@@ -1011,6 +1045,14 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return ctx->bool_true;
     }
     return 0;
+  default:
+    return 0;
+  }
+}
+
+static SmtTerm smt_simplify_slice(SmtCtx *ctx, SmtKind kind, SmtTerm a,
+                                  SmtTerm b, uint32_t p0, uint32_t p1) {
+  switch (kind) {
   case SMT_K_EXTRACT:
     if (p1 == 0 && p0 + 1u == smt_width(ctx, a)) {
       return a;
@@ -1062,24 +1104,77 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return a;
     }
     return 0;
-  case SMT_K_SELECT:
-    if (ctx->nodes[a].kind == SMT_K_STORE) {
-      SmtTerm idx = smt_arg(ctx, a, 1);
-      if (idx == b) {
-        return smt_arg(ctx, a, 2);
-      }
-      if (smt_is_bvconst(ctx, idx) && smt_is_bvconst(ctx, b)) {
-        return smt_select(ctx, smt_arg(ctx, a, 0), b);
-      }
-      SmtTerm base_i, base_b;
-      uint64_t off_i, off_b;
-      smt_split_offset(ctx, idx, &base_i, &off_i);
-      smt_split_offset(ctx, b, &base_b, &off_b);
-      if (base_i == base_b && off_i != off_b) {
-        return smt_select(ctx, smt_arg(ctx, a, 0), b);
-      }
-    }
+  default:
     return 0;
+  }
+}
+
+static SmtTerm smt_simplify_select(SmtCtx *ctx, SmtTerm a, SmtTerm b) {
+  if (ctx->nodes[a].kind == SMT_K_STORE) {
+    SmtTerm idx = smt_arg(ctx, a, 1);
+    if (idx == b) {
+      return smt_arg(ctx, a, 2);
+    }
+    if (smt_is_bvconst(ctx, idx) && smt_is_bvconst(ctx, b)) {
+      return smt_select(ctx, smt_arg(ctx, a, 0), b);
+    }
+    SmtTerm base_i, base_b;
+    uint64_t off_i, off_b;
+    smt_split_offset(ctx, idx, &base_i, &off_i);
+    smt_split_offset(ctx, b, &base_b, &off_b);
+    if (base_i == base_b && off_i != off_b) {
+      return smt_select(ctx, smt_arg(ctx, a, 0), b);
+    }
+  }
+  return 0;
+}
+
+static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
+                                 SmtTerm *args, SmtSort sort, uint32_t p0,
+                                 uint32_t p1) {
+  SmtTerm a = nargs > 0 ? args[0] : 0;
+  SmtTerm b = nargs > 1 ? args[1] : 0;
+  switch (kind) {
+  case SMT_K_NOT:
+  case SMT_K_AND:
+  case SMT_K_XOR:
+    return smt_simplify_bool(ctx, kind, a, b);
+  case SMT_K_OR:
+    return smt_simplify_or(ctx, a, b);
+  case SMT_K_EQ:
+    return smt_simplify_eq(ctx, a, b);
+  case SMT_K_ITE:
+    return smt_simplify_ite(ctx, sort, args);
+  case SMT_K_BVNOT:
+  case SMT_K_BVNEG:
+  case SMT_K_BVAND:
+  case SMT_K_BVOR:
+  case SMT_K_BVXOR:
+    return smt_simplify_bvlogic(ctx, kind, sort, a, b);
+  case SMT_K_BVADD:
+  case SMT_K_BVSUB:
+  case SMT_K_BVMUL:
+    return smt_simplify_bvarith(ctx, kind, sort, a, b);
+  case SMT_K_BVUDIV:
+  case SMT_K_BVUREM:
+  case SMT_K_BVSDIV:
+  case SMT_K_BVSREM:
+    return smt_simplify_bvdiv(ctx, kind, sort, a, b);
+  case SMT_K_BVSHL:
+  case SMT_K_BVLSHR:
+  case SMT_K_BVASHR:
+  case SMT_K_BVULT:
+  case SMT_K_BVULE:
+  case SMT_K_BVSLT:
+  case SMT_K_BVSLE:
+    return smt_simplify_bvcompare(ctx, kind, a, b);
+  case SMT_K_EXTRACT:
+  case SMT_K_CONCAT:
+  case SMT_K_ZEXT:
+  case SMT_K_SEXT:
+    return smt_simplify_slice(ctx, kind, a, b, p0, p1);
+  case SMT_K_SELECT:
+    return smt_simplify_select(ctx, a, b);
   default:
     return 0;
   }

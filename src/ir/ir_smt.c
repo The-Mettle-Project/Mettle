@@ -1845,31 +1845,373 @@ static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
   }
 }
 
+static void irs_step_label(IrsEnc *e, size_t pc, const IRInstruction *insn) {
+  SmtCtx *ctx = e->ctx;
+  irs_merge(e, pc);
+  if (e->frame->havoc_loops && e->loop_end && e->loop_end[pc] > pc &&
+      e->reach != smt_false(ctx)) {
+    size_t marker = e->inv_marker ? e->inv_marker[pc] : 0;
+    if (marker) {
+      SmtTerm entry = irs_eval_invariant(e, pc);
+      irs_record_site(e, e->reach, entry, &e->insns[marker].location,
+                      IR_SMT_SITE_INVARIANT_ENTRY);
+    }
+    size_t loop = irs_lockstep_find(e, insn->text);
+    if (loop != (size_t)-1) {
+      irs_lockstep_visit(e, loop, 0, e->reach);
+    }
+    irs_havoc_loop(e, pc, e->loop_end[pc]);
+    if (loop != (size_t)-1) {
+      irs_lockstep_havoc(e, loop);
+    }
+    if (marker) {
+      e->reach = smt_and(ctx, e->reach, irs_eval_invariant(e, pc));
+    }
+  }
+  return;
+}
+
+static void irs_step_branch_eq(IrsEnc *e, size_t pc,
+                               const IRInstruction *insn) {
+  SmtCtx *ctx = e->ctx;
+  int fa = irs_operand_float_bits(e, &insn->lhs);
+  int fb = irs_operand_float_bits(e, &insn->rhs);
+  SmtTerm eq;
+  if (fa || fb) {
+    if ((fa && fb && fa != fb)) {
+      irs_fail(e, "a branch compares floats of two widths", NULL);
+      return;
+    }
+    int bits = fa ? fa : fb;
+    unsigned w = (unsigned)bits;
+    eq = smt_fp_eq(
+        ctx, bits == 32 ? 8 : 11, bits == 32 ? 24 : 53,
+        smt_extract(ctx, irs_read_float(e, &insn->lhs, bits), w - 1u, 0),
+        smt_extract(ctx, irs_read_float(e, &insn->rhs, bits), w - 1u, 0));
+  } else {
+    eq = smt_eq(ctx, irs_read(e, &insn->lhs), irs_read(e, &insn->rhs));
+  }
+  irs_edge(e, pc, insn->text, eq);
+  e->reach = smt_and(ctx, e->reach, smt_not(ctx, eq));
+  return;
+}
+
+static void irs_step_declare_local(IrsEnc *e, const IRInstruction *insn) {
+  if (!insn->dest.name) {
+    irs_fail(e, "a local has no name", NULL);
+    return;
+  }
+  size_t id = irs_var_lookup(e, insn->dest.name, 1);
+  int size, is_unsigned;
+  int float_bits = irs_float_bits_of_type(insn->text);
+  e->vars[id].fp = float_bits;
+  if (float_bits) {
+    size = float_bits / 8;
+    is_unsigned = 1;
+  } else if (!irs_parse_scalar(insn->text, &size, &is_unsigned)) {
+    uint64_t bytes = irs_aggregate_size(insn);
+    if (!bytes) {
+      irs_fail(e, "it declares a local of type", insn->text);
+      return;
+    }
+    SmtTerm base =
+        irs_region(e, insn->dest.name, bytes, !e->vars[id].escaped);
+    e->vars[id].addr = base;
+    e->vars[id].region_size = bytes;
+    e->vars[id].size = 8;
+    e->vars[id].is_unsigned = 1;
+    e->env[id] = base;
+    return;
+  }
+  e->vars[id].size = size;
+  e->vars[id].is_unsigned = is_unsigned;
+  if (e->vars[id].addressed) {
+    e->vars[id].addr =
+        irs_region(e, insn->dest.name, (uint64_t)size, !e->vars[id].escaped);
+    e->vars[id].region_size = (uint64_t)size;
+    e->vars[id].slot = 1;
+    return;
+  }
+  e->env[id] = irs_shared(e, "undefined", insn->dest.name);
+  return;
+}
+
+static void irs_step_assign(IrsEnc *e, const IRInstruction *insn) {
+  IrsVar *d = (insn->dest.kind == IR_OPERAND_TEMP ||
+               insn->dest.kind == IR_OPERAND_SYMBOL) &&
+                      insn->dest.name
+                  ? &e->vars[irs_var_lookup(e, insn->dest.name, 1)]
+                  : NULL;
+  if (d && ((d->addr && !d->slot) || (d->param && d->aggregate))) {
+    SmtTerm base =
+        d->addr ? d->addr : e->env[irs_var_lookup(e, insn->dest.name, 1)];
+    SmtTerm source = irs_read(e, &insn->lhs);
+    if (irs_holds_aggregate(e, &insn->lhs) || d->region_size > 8u) {
+      irs_copy_bytes(e, base, source, (long long)d->region_size);
+    } else {
+      irs_store_bytes(e, base, (int)d->region_size, source);
+    }
+    return;
+  }
+  if (d && irs_holds_aggregate(e, &insn->lhs)) {
+    d->aggregate = 1;
+  }
+  irs_write(e, &insn->dest,
+            d && d->fp ? irs_read_float(e, &insn->lhs, d->fp)
+                       : irs_read(e, &insn->lhs));
+  if (d && !d->fp) {
+    irs_mark_fp(e, &insn->dest, irs_operand_float_bits(e, &insn->lhs));
+  }
+  return;
+}
+
+static void irs_step_binary(IrsEnc *e, const IRInstruction *insn) {
+  SmtCtx *ctx = e->ctx;
+  if (!insn->text) {
+    irs_fail(e, "a binary operation has no operator", NULL);
+    return;
+  }
+  if (insn->is_float) {
+    int bits = insn->float_bits == 32 ? 32 : 64;
+    SmtTerm v = irs_float_binary(e, insn->text, bits,
+                                 irs_read_float(e, &insn->lhs, bits),
+                                 irs_read_float(e, &insn->rhs, bits));
+    if (v) {
+      irs_write(e, &insn->dest, v);
+      if (strchr("+-*/", insn->text[0]) && insn->text[1] == '\0') {
+        irs_mark_fp(e, &insn->dest, bits);
+      }
+    }
+    return;
+  }
+  SmtTerm a = irs_read(e, &insn->lhs), b = irs_read(e, &insn->rhs);
+  SmtTerm trap;
+  SmtTerm v = ir_smt_binary(ctx, insn->text, insn->is_unsigned, a, b, &trap);
+  if (!v) {
+    irs_fail(e, "it uses the operator", insn->text);
+    return;
+  }
+  irs_trap(e, trap);
+  irs_write(e, &insn->dest, v);
+  return;
+}
+
+static void irs_step_unary(IrsEnc *e, const IRInstruction *insn) {
+  SmtCtx *ctx = e->ctx;
+  if (!insn->text) {
+    irs_fail(e, "a unary operation has no operator", NULL);
+    return;
+  }
+  if (strcmp(insn->text, "f32bits") == 0 ||
+      (strcmp(insn->text, "bitsf") == 0 && insn->float_bits == 32)) {
+    SmtTerm a = irs_read_float(e, &insn->lhs, 32);
+    irs_write(e, &insn->dest,
+              irs_widen_float(ctx, smt_extract(ctx, a, 31, 0)));
+    if (strcmp(insn->text, "bitsf") == 0) {
+      irs_mark_fp(e, &insn->dest, 32);
+    }
+    return;
+  }
+  if (strcmp(insn->text, "f64bits") == 0 ||
+      strcmp(insn->text, "bitsf") == 0) {
+    irs_write(e, &insn->dest, irs_read_float(e, &insn->lhs, 64));
+    if (strcmp(insn->text, "bitsf") == 0) {
+      irs_mark_fp(e, &insn->dest, 64);
+    }
+    return;
+  }
+  if (insn->is_float) {
+    int bits = insn->float_bits == 32 ? 32 : 64;
+    SmtTerm a = irs_read_float(e, &insn->lhs, bits);
+    unsigned w = (unsigned)bits;
+    SmtTerm narrow = smt_extract(ctx, a, w - 1u, 0);
+    if (strcmp(insn->text, "-") == 0) {
+      irs_write(
+          e, &insn->dest,
+          irs_widen_float(ctx, smt_fp_neg(ctx, bits == 32 ? 8 : 11,
+                                          bits == 32 ? 24 : 53, narrow)));
+    } else if (strcmp(insn->text, "+") == 0) {
+      irs_write(e, &insn->dest, a);
+    } else if (strcmp(insn->text, "sqrt") == 0) {
+      unsigned eb = bits == 32 ? 8 : 11, sb = bits == 32 ? 24 : 53;
+      SmtTerm nan = irs_float_nan(e, "sqrt", bits, narrow, narrow);
+      irs_write(e, &insn->dest,
+                irs_widen_float(ctx, smt_fp_sqrt(ctx, eb, sb, narrow, nan)));
+    } else {
+      irs_fail(e, "it uses the float operator", insn->text);
+    }
+    irs_mark_fp(e, &insn->dest, bits);
+    return;
+  }
+  SmtTerm a = irs_read(e, &insn->lhs), v;
+  if (strcmp(insn->text, "-") == 0) {
+    v = smt_mk1(ctx, SMT_K_BVNEG, a);
+  } else if (strcmp(insn->text, "~") == 0) {
+    v = smt_mk1(ctx, SMT_K_BVNOT, a);
+  } else if (strcmp(insn->text, "!") == 0) {
+    v = irs_bool_word(ctx, smt_eq(ctx, a, smt_bv_u64(ctx, 64, 0)));
+  } else if (strcmp(insn->text, "+") == 0) {
+    v = a;
+  } else {
+    irs_fail(e, "it uses the unary operator", insn->text);
+    return;
+  }
+  irs_write(e, &insn->dest, v);
+  return;
+}
+
+static void irs_step_cast(IrsEnc *e, const IRInstruction *insn) {
+  SmtCtx *ctx = e->ctx;
+  const char *type = insn->text ? insn->text : "";
+  size_t len = strlen(type);
+  int size, is_unsigned;
+  int target_bits = irs_float_bits_of_type(type);
+  if (insn->is_float) {
+    int bits = insn->float_bits == 32 ? 32 : 64;
+    SmtTerm a = irs_read_float(e, &insn->lhs, bits);
+    SmtTerm v = irs_float_cast(e, a, bits, type, target_bits);
+    if (v) {
+      irs_write(e, &insn->dest, v);
+      irs_mark_fp(e, &insn->dest, target_bits);
+    }
+    return;
+  }
+  SmtTerm a = irs_read(e, &insn->lhs);
+  if (target_bits) {
+    unsigned eb = target_bits == 32 ? 8 : 11,
+             sb = target_bits == 32 ? 24 : 53;
+    irs_write(e, &insn->dest,
+              irs_widen_float(
+                  ctx, smt_fp_from_int(ctx, eb, sb, a, !insn->is_unsigned)));
+    irs_mark_fp(e, &insn->dest, target_bits);
+    return;
+  }
+  if ((len > 0 && type[len - 1] == '*') || strcmp(type, "cstring") == 0 ||
+      strcmp(type, "rawptr") == 0 || strncmp(type, "fn(", 3) == 0) {
+    irs_write(e, &insn->dest, a);
+    return;
+  }
+  if (strcmp(type, "bool") == 0) {
+    irs_write(e, &insn->dest, irs_bool_word(ctx, irs_nonzero(ctx, a)));
+    return;
+  }
+  if (irs_parse_scalar(type, &size, &is_unsigned)) {
+    irs_write(e, &insn->dest, ir_smt_narrow(ctx, a, size, is_unsigned));
+    return;
+  }
+  if (insn->value_type && insn->value_type->kind == MTLC_TYPE_ENUM) {
+    size_t s = insn->value_type->size;
+    int bytes = (s == 1 || s == 2 || s == 8) ? (int)s : 4;
+    irs_write(e, &insn->dest, ir_smt_narrow(ctx, a, bytes, 0));
+    return;
+  }
+  irs_fail(e, "it casts to", type);
+  return;
+}
+
+static void irs_step_select(IrsEnc *e, const IRInstruction *insn) {
+  SmtCtx *ctx = e->ctx;
+  SmtTerm truth;
+  if (insn->text && insn->argument_count > 1) {
+    int ok;
+    if (irs_operand_float_bits(e, &insn->lhs) ||
+        irs_operand_float_bits(e, &insn->arguments[1])) {
+      irs_fail(e, "a select compares floats", NULL);
+      return;
+    }
+    truth = irs_compare(ctx, insn->text, insn->is_unsigned,
+                        irs_read(e, &insn->lhs),
+                        irs_read(e, &insn->arguments[1]), &ok);
+    if (!ok) {
+      irs_fail(e, "a select compares with", insn->text);
+      return;
+    }
+  } else {
+    truth = irs_nonzero(ctx, irs_read(e, &insn->lhs));
+  }
+  if (insn->argument_count == 0) {
+    irs_fail(e, "a select has no false value", NULL);
+    return;
+  }
+  SmtTerm v = smt_ite(ctx, truth, irs_read(e, &insn->rhs),
+                      irs_read(e, &insn->arguments[0]));
+  irs_write(e, &insn->dest, v);
+  int fp = irs_operand_float_bits(e, &insn->rhs);
+  irs_mark_fp(e, &insn->dest,
+              fp ? fp : irs_operand_float_bits(e, &insn->arguments[0]));
+  return;
+}
+
+static void irs_step_load(IrsEnc *e, const IRInstruction *insn) {
+  int size = irs_access_size(e, insn);
+  if (!size) {
+    return;
+  }
+  SmtTerm addr = irs_read(e, &insn->lhs);
+  irs_trap(e, irs_access_trap(e, addr, size));
+  irs_write(
+      e, &insn->dest,
+      irs_load_bytes(e, addr, size, insn->is_unsigned || insn->is_float));
+  if (insn->is_float) {
+    irs_mark_fp(e, &insn->dest, size * 8);
+  }
+  return;
+}
+
+static void irs_step_store(IrsEnc *e, const IRInstruction *insn) {
+  if (insn->rhs.kind == IR_OPERAND_INT && !insn->is_float &&
+      (irs_holds_aggregate(e, &insn->lhs) ||
+       (insn->rhs.int_value != 1 && insn->rhs.int_value != 2 &&
+        insn->rhs.int_value != 4 && insn->rhs.int_value != 8))) {
+    SmtTerm dst = irs_read(e, &insn->dest);
+    SmtTerm src = irs_read(e, &insn->lhs);
+    irs_copy_bytes(e, dst, src, insn->rhs.int_value);
+    return;
+  }
+  int size = irs_access_size(e, insn);
+  if (!size) {
+    return;
+  }
+  SmtTerm addr = irs_read(e, &insn->dest);
+  SmtTerm value = irs_read(e, &insn->lhs);
+  irs_trap(e, irs_access_trap(e, addr, size));
+  irs_store_bytes(e, addr, size, value);
+  return;
+}
+
+static void irs_step_address_of(IrsEnc *e, const IRInstruction *insn) {
+  if (insn->lhs.kind != IR_OPERAND_SYMBOL || !insn->lhs.name) {
+    irs_fail(e, "it takes an address the encoder does not model", NULL);
+    return;
+  }
+  size_t id = irs_var_lookup(e, insn->lhs.name, 1);
+  IrsVar *v = &e->vars[id];
+  if (v->slot) {
+    irs_write(e, &insn->dest, v->addr);
+    return;
+  }
+  if ((v->addr || (v->aggregate && v->param)) && e->env[id]) {
+    irs_write(e, &insn->dest, e->env[id]);
+    return;
+  }
+  if (!v->declared && !v->param) {
+    int size, is_unsigned, fp;
+    uint64_t bytes;
+    if (irs_global_shape(e, insn->lhs.name, &size, &is_unsigned, &fp,
+                         &bytes)) {
+      irs_write(e, &insn->dest, irs_global_base(e, insn->lhs.name, bytes));
+      return;
+    }
+  }
+  irs_fail(e, "it takes the address of", insn->lhs.name);
+  return;
+}
+
 static void irs_step(IrsEnc *e, size_t pc) {
   SmtCtx *ctx = e->ctx;
   const IRInstruction *insn = &e->insns[pc];
   if (insn->op == IR_OP_LABEL) {
-    irs_merge(e, pc);
-    if (e->frame->havoc_loops && e->loop_end && e->loop_end[pc] > pc &&
-        e->reach != smt_false(ctx)) {
-      size_t marker = e->inv_marker ? e->inv_marker[pc] : 0;
-      if (marker) {
-        SmtTerm entry = irs_eval_invariant(e, pc);
-        irs_record_site(e, e->reach, entry, &e->insns[marker].location,
-                        IR_SMT_SITE_INVARIANT_ENTRY);
-      }
-      size_t loop = irs_lockstep_find(e, insn->text);
-      if (loop != (size_t)-1) {
-        irs_lockstep_visit(e, loop, 0, e->reach);
-      }
-      irs_havoc_loop(e, pc, e->loop_end[pc]);
-      if (loop != (size_t)-1) {
-        irs_lockstep_havoc(e, loop);
-      }
-      if (marker) {
-        e->reach = smt_and(ctx, e->reach, irs_eval_invariant(e, pc));
-      }
-    }
+    irs_step_label(e, pc, insn);
     return;
   }
   if (e->reach == smt_false(ctx) && insn->op != IR_OP_NOP) {
@@ -1890,264 +2232,27 @@ static void irs_step(IrsEnc *e, size_t pc) {
     e->reach = smt_and(ctx, e->reach, smt_not(ctx, zero));
     return;
   }
-  case IR_OP_BRANCH_EQ: {
-    int fa = irs_operand_float_bits(e, &insn->lhs);
-    int fb = irs_operand_float_bits(e, &insn->rhs);
-    SmtTerm eq;
-    if (fa || fb) {
-      if ((fa && fb && fa != fb)) {
-        irs_fail(e, "a branch compares floats of two widths", NULL);
-        return;
-      }
-      int bits = fa ? fa : fb;
-      unsigned w = (unsigned)bits;
-      eq = smt_fp_eq(
-          ctx, bits == 32 ? 8 : 11, bits == 32 ? 24 : 53,
-          smt_extract(ctx, irs_read_float(e, &insn->lhs, bits), w - 1u, 0),
-          smt_extract(ctx, irs_read_float(e, &insn->rhs, bits), w - 1u, 0));
-    } else {
-      eq = smt_eq(ctx, irs_read(e, &insn->lhs), irs_read(e, &insn->rhs));
-    }
-    irs_edge(e, pc, insn->text, eq);
-    e->reach = smt_and(ctx, e->reach, smt_not(ctx, eq));
+  case IR_OP_BRANCH_EQ:
+    irs_step_branch_eq(e, pc, insn);
     return;
-  }
-  case IR_OP_DECLARE_LOCAL: {
-    if (!insn->dest.name) {
-      irs_fail(e, "a local has no name", NULL);
-      return;
-    }
-    size_t id = irs_var_lookup(e, insn->dest.name, 1);
-    int size, is_unsigned;
-    int float_bits = irs_float_bits_of_type(insn->text);
-    e->vars[id].fp = float_bits;
-    if (float_bits) {
-      size = float_bits / 8;
-      is_unsigned = 1;
-    } else if (!irs_parse_scalar(insn->text, &size, &is_unsigned)) {
-      uint64_t bytes = irs_aggregate_size(insn);
-      if (!bytes) {
-        irs_fail(e, "it declares a local of type", insn->text);
-        return;
-      }
-      SmtTerm base =
-          irs_region(e, insn->dest.name, bytes, !e->vars[id].escaped);
-      e->vars[id].addr = base;
-      e->vars[id].region_size = bytes;
-      e->vars[id].size = 8;
-      e->vars[id].is_unsigned = 1;
-      e->env[id] = base;
-      return;
-    }
-    e->vars[id].size = size;
-    e->vars[id].is_unsigned = is_unsigned;
-    if (e->vars[id].addressed) {
-      e->vars[id].addr =
-          irs_region(e, insn->dest.name, (uint64_t)size, !e->vars[id].escaped);
-      e->vars[id].region_size = (uint64_t)size;
-      e->vars[id].slot = 1;
-      return;
-    }
-    e->env[id] = irs_shared(e, "undefined", insn->dest.name);
+  case IR_OP_DECLARE_LOCAL:
+    irs_step_declare_local(e, insn);
     return;
-  }
-  case IR_OP_ASSIGN: {
-    IrsVar *d = (insn->dest.kind == IR_OPERAND_TEMP ||
-                 insn->dest.kind == IR_OPERAND_SYMBOL) &&
-                        insn->dest.name
-                    ? &e->vars[irs_var_lookup(e, insn->dest.name, 1)]
-                    : NULL;
-    if (d && ((d->addr && !d->slot) || (d->param && d->aggregate))) {
-      SmtTerm base =
-          d->addr ? d->addr : e->env[irs_var_lookup(e, insn->dest.name, 1)];
-      SmtTerm source = irs_read(e, &insn->lhs);
-      if (irs_holds_aggregate(e, &insn->lhs) || d->region_size > 8u) {
-        irs_copy_bytes(e, base, source, (long long)d->region_size);
-      } else {
-        irs_store_bytes(e, base, (int)d->region_size, source);
-      }
-      return;
-    }
-    if (d && irs_holds_aggregate(e, &insn->lhs)) {
-      d->aggregate = 1;
-    }
-    irs_write(e, &insn->dest,
-              d && d->fp ? irs_read_float(e, &insn->lhs, d->fp)
-                         : irs_read(e, &insn->lhs));
-    if (d && !d->fp) {
-      irs_mark_fp(e, &insn->dest, irs_operand_float_bits(e, &insn->lhs));
-    }
+  case IR_OP_ASSIGN:
+    irs_step_assign(e, insn);
     return;
-  }
-  case IR_OP_BINARY: {
-    if (!insn->text) {
-      irs_fail(e, "a binary operation has no operator", NULL);
-      return;
-    }
-    if (insn->is_float) {
-      int bits = insn->float_bits == 32 ? 32 : 64;
-      SmtTerm v = irs_float_binary(e, insn->text, bits,
-                                   irs_read_float(e, &insn->lhs, bits),
-                                   irs_read_float(e, &insn->rhs, bits));
-      if (v) {
-        irs_write(e, &insn->dest, v);
-        if (strchr("+-*/", insn->text[0]) && insn->text[1] == '\0') {
-          irs_mark_fp(e, &insn->dest, bits);
-        }
-      }
-      return;
-    }
-    SmtTerm a = irs_read(e, &insn->lhs), b = irs_read(e, &insn->rhs);
-    SmtTerm trap;
-    SmtTerm v = ir_smt_binary(ctx, insn->text, insn->is_unsigned, a, b, &trap);
-    if (!v) {
-      irs_fail(e, "it uses the operator", insn->text);
-      return;
-    }
-    irs_trap(e, trap);
-    irs_write(e, &insn->dest, v);
+  case IR_OP_BINARY:
+    irs_step_binary(e, insn);
     return;
-  }
-  case IR_OP_UNARY: {
-    if (!insn->text) {
-      irs_fail(e, "a unary operation has no operator", NULL);
-      return;
-    }
-    if (strcmp(insn->text, "f32bits") == 0 ||
-        (strcmp(insn->text, "bitsf") == 0 && insn->float_bits == 32)) {
-      SmtTerm a = irs_read_float(e, &insn->lhs, 32);
-      irs_write(e, &insn->dest,
-                irs_widen_float(ctx, smt_extract(ctx, a, 31, 0)));
-      if (strcmp(insn->text, "bitsf") == 0) {
-        irs_mark_fp(e, &insn->dest, 32);
-      }
-      return;
-    }
-    if (strcmp(insn->text, "f64bits") == 0 ||
-        strcmp(insn->text, "bitsf") == 0) {
-      irs_write(e, &insn->dest, irs_read_float(e, &insn->lhs, 64));
-      if (strcmp(insn->text, "bitsf") == 0) {
-        irs_mark_fp(e, &insn->dest, 64);
-      }
-      return;
-    }
-    if (insn->is_float) {
-      int bits = insn->float_bits == 32 ? 32 : 64;
-      SmtTerm a = irs_read_float(e, &insn->lhs, bits);
-      unsigned w = (unsigned)bits;
-      SmtTerm narrow = smt_extract(ctx, a, w - 1u, 0);
-      if (strcmp(insn->text, "-") == 0) {
-        irs_write(
-            e, &insn->dest,
-            irs_widen_float(ctx, smt_fp_neg(ctx, bits == 32 ? 8 : 11,
-                                            bits == 32 ? 24 : 53, narrow)));
-      } else if (strcmp(insn->text, "+") == 0) {
-        irs_write(e, &insn->dest, a);
-      } else if (strcmp(insn->text, "sqrt") == 0) {
-        unsigned eb = bits == 32 ? 8 : 11, sb = bits == 32 ? 24 : 53;
-        SmtTerm nan = irs_float_nan(e, "sqrt", bits, narrow, narrow);
-        irs_write(e, &insn->dest,
-                  irs_widen_float(ctx, smt_fp_sqrt(ctx, eb, sb, narrow, nan)));
-      } else {
-        irs_fail(e, "it uses the float operator", insn->text);
-      }
-      irs_mark_fp(e, &insn->dest, bits);
-      return;
-    }
-    SmtTerm a = irs_read(e, &insn->lhs), v;
-    if (strcmp(insn->text, "-") == 0) {
-      v = smt_mk1(ctx, SMT_K_BVNEG, a);
-    } else if (strcmp(insn->text, "~") == 0) {
-      v = smt_mk1(ctx, SMT_K_BVNOT, a);
-    } else if (strcmp(insn->text, "!") == 0) {
-      v = irs_bool_word(ctx, smt_eq(ctx, a, smt_bv_u64(ctx, 64, 0)));
-    } else if (strcmp(insn->text, "+") == 0) {
-      v = a;
-    } else {
-      irs_fail(e, "it uses the unary operator", insn->text);
-      return;
-    }
-    irs_write(e, &insn->dest, v);
+  case IR_OP_UNARY:
+    irs_step_unary(e, insn);
     return;
-  }
-  case IR_OP_CAST: {
-    const char *type = insn->text ? insn->text : "";
-    size_t len = strlen(type);
-    int size, is_unsigned;
-    int target_bits = irs_float_bits_of_type(type);
-    if (insn->is_float) {
-      int bits = insn->float_bits == 32 ? 32 : 64;
-      SmtTerm a = irs_read_float(e, &insn->lhs, bits);
-      SmtTerm v = irs_float_cast(e, a, bits, type, target_bits);
-      if (v) {
-        irs_write(e, &insn->dest, v);
-        irs_mark_fp(e, &insn->dest, target_bits);
-      }
-      return;
-    }
-    SmtTerm a = irs_read(e, &insn->lhs);
-    if (target_bits) {
-      unsigned eb = target_bits == 32 ? 8 : 11,
-               sb = target_bits == 32 ? 24 : 53;
-      irs_write(e, &insn->dest,
-                irs_widen_float(
-                    ctx, smt_fp_from_int(ctx, eb, sb, a, !insn->is_unsigned)));
-      irs_mark_fp(e, &insn->dest, target_bits);
-      return;
-    }
-    if ((len > 0 && type[len - 1] == '*') || strcmp(type, "cstring") == 0 ||
-        strcmp(type, "rawptr") == 0 || strncmp(type, "fn(", 3) == 0) {
-      irs_write(e, &insn->dest, a);
-      return;
-    }
-    if (strcmp(type, "bool") == 0) {
-      irs_write(e, &insn->dest, irs_bool_word(ctx, irs_nonzero(ctx, a)));
-      return;
-    }
-    if (irs_parse_scalar(type, &size, &is_unsigned)) {
-      irs_write(e, &insn->dest, ir_smt_narrow(ctx, a, size, is_unsigned));
-      return;
-    }
-    if (insn->value_type && insn->value_type->kind == MTLC_TYPE_ENUM) {
-      size_t s = insn->value_type->size;
-      int bytes = (s == 1 || s == 2 || s == 8) ? (int)s : 4;
-      irs_write(e, &insn->dest, ir_smt_narrow(ctx, a, bytes, 0));
-      return;
-    }
-    irs_fail(e, "it casts to", type);
+  case IR_OP_CAST:
+    irs_step_cast(e, insn);
     return;
-  }
-  case IR_OP_SELECT: {
-    SmtTerm truth;
-    if (insn->text && insn->argument_count > 1) {
-      int ok;
-      if (irs_operand_float_bits(e, &insn->lhs) ||
-          irs_operand_float_bits(e, &insn->arguments[1])) {
-        irs_fail(e, "a select compares floats", NULL);
-        return;
-      }
-      truth = irs_compare(ctx, insn->text, insn->is_unsigned,
-                          irs_read(e, &insn->lhs),
-                          irs_read(e, &insn->arguments[1]), &ok);
-      if (!ok) {
-        irs_fail(e, "a select compares with", insn->text);
-        return;
-      }
-    } else {
-      truth = irs_nonzero(ctx, irs_read(e, &insn->lhs));
-    }
-    if (insn->argument_count == 0) {
-      irs_fail(e, "a select has no false value", NULL);
-      return;
-    }
-    SmtTerm v = smt_ite(ctx, truth, irs_read(e, &insn->rhs),
-                        irs_read(e, &insn->arguments[0]));
-    irs_write(e, &insn->dest, v);
-    int fp = irs_operand_float_bits(e, &insn->rhs);
-    irs_mark_fp(e, &insn->dest,
-                fp ? fp : irs_operand_float_bits(e, &insn->arguments[0]));
+  case IR_OP_SELECT:
+    irs_step_select(e, insn);
     return;
-  }
   case IR_OP_RETURN: {
     SmtTerm v = insn->lhs.kind == IR_OPERAND_NONE ? smt_bv_u64(ctx, 64, 0)
                                                   : irs_read(e, &insn->lhs);
@@ -2161,68 +2266,15 @@ static void irs_step(IrsEnc *e, size_t pc) {
   case IR_OP_CALL:
     irs_call(e, insn);
     return;
-  case IR_OP_LOAD: {
-    int size = irs_access_size(e, insn);
-    if (!size) {
-      return;
-    }
-    SmtTerm addr = irs_read(e, &insn->lhs);
-    irs_trap(e, irs_access_trap(e, addr, size));
-    irs_write(
-        e, &insn->dest,
-        irs_load_bytes(e, addr, size, insn->is_unsigned || insn->is_float));
-    if (insn->is_float) {
-      irs_mark_fp(e, &insn->dest, size * 8);
-    }
+  case IR_OP_LOAD:
+    irs_step_load(e, insn);
     return;
-  }
-  case IR_OP_STORE: {
-    if (insn->rhs.kind == IR_OPERAND_INT && !insn->is_float &&
-        (irs_holds_aggregate(e, &insn->lhs) ||
-         (insn->rhs.int_value != 1 && insn->rhs.int_value != 2 &&
-          insn->rhs.int_value != 4 && insn->rhs.int_value != 8))) {
-      SmtTerm dst = irs_read(e, &insn->dest);
-      SmtTerm src = irs_read(e, &insn->lhs);
-      irs_copy_bytes(e, dst, src, insn->rhs.int_value);
-      return;
-    }
-    int size = irs_access_size(e, insn);
-    if (!size) {
-      return;
-    }
-    SmtTerm addr = irs_read(e, &insn->dest);
-    SmtTerm value = irs_read(e, &insn->lhs);
-    irs_trap(e, irs_access_trap(e, addr, size));
-    irs_store_bytes(e, addr, size, value);
+  case IR_OP_STORE:
+    irs_step_store(e, insn);
     return;
-  }
-  case IR_OP_ADDRESS_OF: {
-    if (insn->lhs.kind != IR_OPERAND_SYMBOL || !insn->lhs.name) {
-      irs_fail(e, "it takes an address the encoder does not model", NULL);
-      return;
-    }
-    size_t id = irs_var_lookup(e, insn->lhs.name, 1);
-    IrsVar *v = &e->vars[id];
-    if (v->slot) {
-      irs_write(e, &insn->dest, v->addr);
-      return;
-    }
-    if ((v->addr || (v->aggregate && v->param)) && e->env[id]) {
-      irs_write(e, &insn->dest, e->env[id]);
-      return;
-    }
-    if (!v->declared && !v->param) {
-      int size, is_unsigned, fp;
-      uint64_t bytes;
-      if (irs_global_shape(e, insn->lhs.name, &size, &is_unsigned, &fp,
-                           &bytes)) {
-        irs_write(e, &insn->dest, irs_global_base(e, insn->lhs.name, bytes));
-        return;
-      }
-    }
-    irs_fail(e, "it takes the address of", insn->lhs.name);
+  case IR_OP_ADDRESS_OF:
+    irs_step_address_of(e, insn);
     return;
-  }
   default:
     irs_fail(e, "it uses the instruction", ir_opcode_name(insn->op));
     return;
