@@ -439,6 +439,9 @@ static int extern_performs(Ctx *ctx, EFn *efn, const char *name,
     believe_extern(name, NULL);
     return 1;
   }
+  if (ir_intrinsic_from_name(name) != MTLC_INTRINSIC_NONE) {
+    return 1;
+  }
   {
     char what[192];
     char why[320];

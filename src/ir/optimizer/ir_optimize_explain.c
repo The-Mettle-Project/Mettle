@@ -2,6 +2,7 @@
 #include "ir_optimize_explain_internal.h"
 #include "common.h"
 #include "../ir_machine.h"
+#include "../ir_explain_device.h"
 #include "../ir_explain_memory.h"
 #include "../ir_explain_ownership.h"
 #include "../ir_explain_safety.h"
@@ -49,6 +50,97 @@ static MTLC_THREAD_LOCAL int g_explain_retain_remarks = 0;
 static MTLC_THREAD_LOCAL char *g_json_buf = NULL;
 static MTLC_THREAD_LOCAL size_t g_json_len = 0;
 static MTLC_THREAD_LOCAL size_t g_json_cap = 0;
+
+#define IR_EXPLAIN_MAX_CHILDREN 4
+
+typedef struct {
+  char *stem;
+  char *target;
+  char *failure;
+} IRExplainChild;
+
+static MTLC_THREAD_LOCAL char *g_explain_fragment = NULL;
+static MTLC_THREAD_LOCAL char *g_explain_fragment_label = NULL;
+static MTLC_THREAD_LOCAL char *g_explain_target = NULL;
+static MTLC_THREAD_LOCAL IRExplainChild g_children[IR_EXPLAIN_MAX_CHILDREN];
+static MTLC_THREAD_LOCAL size_t g_child_count = 0;
+
+static char *ir_explain_copy(const char *text) {
+  size_t length = text ? strlen(text) + 1 : 0;
+  char *copy = length ? malloc(length) : NULL;
+  if (copy) {
+    memcpy(copy, text, length);
+  }
+  return copy;
+}
+
+void ir_explain_set_fragment(const char *stem, const char *label) {
+  free(g_explain_fragment);
+  free(g_explain_fragment_label);
+  g_explain_fragment = ir_explain_copy(stem);
+  g_explain_fragment_label = ir_explain_copy(label);
+}
+
+void ir_explain_set_target_name(const char *name) {
+  free(g_explain_target);
+  g_explain_target = ir_explain_copy(name);
+}
+
+static MTLC_THREAD_LOCAL int g_explain_host_empty = 0;
+static MTLC_THREAD_LOCAL char **g_device_functions = NULL;
+static MTLC_THREAD_LOCAL size_t g_device_function_count = 0;
+static MTLC_THREAD_LOCAL int g_device_filter = 0;
+
+void ir_explain_set_host_empty(int empty) { g_explain_host_empty = empty; }
+
+void ir_explain_set_device_functions(const IRProgram *program,
+                                     const unsigned char *reachable) {
+  for (size_t i = 0; i < g_device_function_count; i++) {
+    free(g_device_functions[i]);
+  }
+  free(g_device_functions);
+  g_device_functions = NULL;
+  g_device_function_count = 0;
+  g_device_filter = program && reachable;
+  if (!g_device_filter) {
+    return;
+  }
+  g_device_functions = calloc(program->function_count + 1, sizeof(char *));
+  for (size_t i = 0; g_device_functions && i < program->function_count; i++) {
+    if (reachable[i] && program->functions[i] && program->functions[i]->name) {
+      g_device_functions[g_device_function_count++] =
+          ir_explain_copy(program->functions[i]->name);
+    }
+  }
+}
+
+static int ir_explain_function_on_device(const char *name) {
+  if (!g_device_filter) {
+    return 1;
+  }
+  for (size_t i = 0; name && i < g_device_function_count; i++) {
+    if (g_device_functions[i] && strcmp(g_device_functions[i], name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_explain_skips_empty_sections(void) {
+  return g_explain_host_empty || g_explain_fragment != NULL;
+}
+
+void ir_explain_device_child(const char *stem, const char *target,
+                             const char *failure) {
+  IRExplainChild *child;
+  if (!stem || g_child_count == IR_EXPLAIN_MAX_CHILDREN) {
+    return;
+  }
+  child = &g_children[g_child_count++];
+  child->stem = ir_explain_copy(stem);
+  child->target = ir_explain_copy(target);
+  child->failure = ir_explain_copy(failure);
+}
 
 void ir_explain_set_json(int enabled) { g_explain_json = enabled; }
 void ir_explain_set_text(int enabled) { g_explain_text = enabled; }
@@ -2096,7 +2188,10 @@ void ir_explain_print_header(const char *what) {
                          ? ir_explain_path_basename(g_explain_focus_file)
                          : "<input>";
   char label[512];
-  snprintf(label, sizeof(label), "%s%s: %s%s", clr(EXPLAIN_BOLD), what, file,
+  int labeled = g_explain_fragment_label &&
+                strncmp(what, "device report", 13) != 0;
+  snprintf(label, sizeof(label), "%s%s%s%s: %s%s", clr(EXPLAIN_BOLD), what,
+           labeled ? ", " : "", labeled ? g_explain_fragment_label : "", file,
            clr(EXPLAIN_RESET));
   char line[2048];
   diag_rule_into(line, sizeof(line), 0, label, "");
@@ -2768,15 +2863,24 @@ void ir_explain_ledger_flush(void) {
     ledger_more(g_proof_total, g_proof_count);
     ir_explain_emit("\n");
   }
-  if (g_effect_total > 0) {
+  size_t effects_shown = g_effect_total;
+  if (g_device_filter) {
+    effects_shown = 0;
+    for (size_t i = 0; i < g_effect_count; i++) {
+      effects_shown += ir_explain_function_on_device(g_effects[i].a) ? 1 : 0;
+    }
+  }
+  if (effects_shown > 0) {
     ir_explain_print_header("effects held");
     ir_explain_emit("  %zu function%s an inferred effect set; every "
                     "`forbids`, `requires` and function-type clause was "
                     "checked against it\n",
-                    g_effect_total,
-                    g_effect_total == 1 ? " carries" : "s carry");
+                    effects_shown, effects_shown == 1 ? " carries" : "s carry");
     for (size_t i = 0; i < g_effect_count; i++) {
       const IRExplainLedgerRow *r = &g_effects[i];
+      if (!ir_explain_function_on_device(r->a)) {
+        continue;
+      }
       ir_explain_emit("  %s%s%s: performs %s, needs %s  %s(consumed by the "
                       "effect pass and by every @rule that reads them)%s\n",
                       clr(EXPLAIN_BOLD), r->a ? r->a : "?", clr(EXPLAIN_RESET),
@@ -2800,6 +2904,10 @@ void ir_explain_ledger_flush(void) {
     }
     ledger_more(g_ledger_rule_total, g_ledger_rule_count);
     ir_explain_emit("\n");
+  }
+  if (g_device_filter ||
+      (g_belief_total == 0 && ir_explain_skips_empty_sections())) {
+    return;
   }
   ir_explain_print_header("beliefs");
   if (g_belief_total == 0) {
@@ -3206,7 +3314,7 @@ static void ir_explain_ownership_flush(void) {
   if (g_explain_json) {
     ir_explain_ownership_json();
   }
-  if (!g_explain || g_own_count == 0) {
+  if (!g_explain || g_own_count == 0 || g_device_filter) {
     return;
   }
   ir_explain_print_header("ownership report");
@@ -3758,6 +3866,19 @@ void ir_explain_flush(void) {
     return;
   }
 
+  if (g_device_filter) {
+    size_t kept = 0;
+    for (size_t i = 0; i < g_remark_count; i++) {
+      if (!ir_explain_function_on_device(g_remarks[i].function_name)) {
+        ir_explain_remark_free_one(&g_remarks[i]);
+        continue;
+      }
+      g_remarks[kept++] = g_remarks[i];
+    }
+    g_remark_count = kept;
+  }
+
+  size_t section_start = g_report_len;
   ir_explain_print_header("optimization report");
 
   if (g_remark_count > 0) {
@@ -3772,7 +3893,10 @@ void ir_explain_flush(void) {
   ir_explain_json_raw("\"remarks\":[");
 
   size_t shown_remarks = 0;
-  if (g_remark_count == 0) {
+  if (g_remark_count == 0 && ir_explain_skips_empty_sections()) {
+    g_report_len = section_start;
+    g_plan_pending = 0;
+  } else if (g_remark_count == 0) {
     ir_explain_emit("  (no loops or calls to report)\n\n");
   } else {
     char *suppressed = calloc(g_remark_count, 1);
@@ -3919,10 +4043,14 @@ void ir_explain_flush(void) {
 
   ir_explain_tally_functions();
 
+  size_t remarks_end = g_report_len;
   ir_explain_safety_flush();
   ir_explain_memory_flush();
   ir_explain_ownership_flush();
   ir_explain_ledger_flush();
+  if (g_explain_fragment) {
+    g_report_len = remarks_end;
+  }
 }
 
 static void ir_explain_release_remarks(void) {
@@ -4111,6 +4239,112 @@ static void ir_explain_splice_plan(void) {
   }
 }
 
+static char *ir_explain_fragment_path(const char *stem, const char *suffix) {
+  size_t length = strlen(stem) + strlen(suffix) + 1;
+  char *path = malloc(length);
+  if (path) {
+    snprintf(path, length, "%s%s", stem, suffix);
+  }
+  return path;
+}
+
+static char *ir_explain_read_whole(const char *path, size_t *length) {
+  FILE *in = fopen(path, "rb");
+  long size = 0;
+  char *text = NULL;
+  *length = 0;
+  if (!in) {
+    return NULL;
+  }
+  if (fseek(in, 0, SEEK_END) == 0 && (size = ftell(in)) >= 0 &&
+      fseek(in, 0, SEEK_SET) == 0 && (text = malloc((size_t)size + 1))) {
+    *length = fread(text, 1, (size_t)size, in);
+    text[*length] = '\0';
+  }
+  fclose(in);
+  return text;
+}
+
+static void ir_explain_child_failed(const IRExplainChild *child) {
+  char label[160];
+  snprintf(label, sizeof(label), "device report, %s",
+           child->target ? child->target : "device");
+  ir_explain_print_header(label);
+  ir_explain_emit("  %sthe kernels in this file do not build for %s%s\n",
+                  clr(EXPLAIN_RED), child->target ? child->target : "it",
+                  clr(EXPLAIN_RESET));
+  ir_explain_emit("      %s%s reason: %s%s\n\n", clr(EXPLAIN_DIM),
+                  glyph_elbow(), child->failure, clr(EXPLAIN_RESET));
+  ir_explain_json_raw("{\"schema\":3,\"device\":{\"target\":");
+  ir_explain_json_str(child->target);
+  ir_explain_json_raw(",\"error\":");
+  ir_explain_json_str(child->failure);
+  ir_explain_json_raw("}}");
+}
+
+static void ir_explain_child_splice(const IRExplainChild *child) {
+  char *text_path = ir_explain_fragment_path(child->stem, ".txt");
+  char *json_path = ir_explain_fragment_path(child->stem, ".json");
+  size_t text_length = 0, json_length = 0;
+  char *text = text_path ? ir_explain_read_whole(text_path, &text_length) : NULL;
+  char *json = json_path ? ir_explain_read_whole(json_path, &json_length) : NULL;
+  if (text) {
+    ir_explain_emit("%s", text);
+  }
+  if (json && json_length) {
+    while (json_length && (json[json_length - 1] == '\n' ||
+                           json[json_length - 1] == '\r')) {
+      json[--json_length] = '\0';
+    }
+    ir_explain_json_raw("%s", json);
+  } else {
+    ir_explain_json_raw("null");
+  }
+  if (text_path) {
+    remove(text_path);
+  }
+  if (json_path) {
+    remove(json_path);
+  }
+  free(text);
+  free(json);
+  free(text_path);
+  free(json_path);
+}
+
+static void ir_explain_children_flush(void) {
+  if (!g_child_count) {
+    return;
+  }
+  ir_explain_json_raw("\"devices\":[");
+  for (size_t i = 0; i < g_child_count; i++) {
+    IRExplainChild *child = &g_children[i];
+    ir_explain_json_raw("%s", i ? "," : "");
+    if (child->failure) {
+      ir_explain_child_failed(child);
+    } else {
+      ir_explain_child_splice(child);
+    }
+    free(child->stem);
+    free(child->target);
+    free(child->failure);
+    memset(child, 0, sizeof(*child));
+  }
+  ir_explain_json_raw("],");
+  g_child_count = 0;
+}
+
+static int ir_explain_write_fragment_text(void) {
+  char *path = ir_explain_fragment_path(g_explain_fragment, ".txt");
+  FILE *out = path ? fopen(path, "wb") : NULL;
+  if (out) {
+    fwrite(g_report_buf, 1, g_report_len, out);
+    fclose(out);
+  }
+  free(path);
+  return out != NULL;
+}
+
 void ir_explain_finalize(int force_stderr) {
   if (g_explain_quiet) {
     g_report_len = 0;
@@ -4130,9 +4364,11 @@ void ir_explain_finalize(int force_stderr) {
 
   char *sidecar = NULL;
   int diverted = !g_explain_text;
-  if (g_explain_text && !force_stderr && !g_explain_stream &&
-      ir_explain_report_lines() > threshold &&
-      (sidecar = ir_explain_sidecar_path()) != NULL) {
+  if (g_explain_fragment) {
+    diverted = ir_explain_write_fragment_text() || diverted;
+  } else if (g_explain_text && !force_stderr && !g_explain_stream &&
+             ir_explain_report_lines() > threshold &&
+             (sidecar = ir_explain_sidecar_path()) != NULL) {
     FILE *out = fopen(sidecar, "wb");
     if (out) {
       diverted = ir_explain_write_plain(out);
@@ -4141,14 +4377,18 @@ void ir_explain_finalize(int force_stderr) {
   }
 
   if (g_explain_json && g_json_buf) {
-    char *json_path = ir_explain_derived_path(".explain.json");
+    char *json_path = g_explain_fragment
+                          ? ir_explain_fragment_path(g_explain_fragment, ".json")
+                          : ir_explain_derived_path(".explain.json");
     if (json_path) {
       FILE *out = fopen(json_path, "wb");
       if (out) {
         const char *source = g_explain_focus_file
                                  ? ir_explain_path_basename(g_explain_focus_file)
                                  : "";
-        fputs("{\"schema\":2,\"source\":", out);
+        fputs("{\"schema\":3,\"target\":", out);
+        ir_explain_json_file_str(out, g_explain_target);
+        fputs(",\"source\":", out);
         ir_explain_json_file_str(out, source);
         fputs(",\"path\":", out);
         ir_explain_json_file_str(out, g_explain_source_path
@@ -4206,7 +4446,7 @@ void ir_explain_finalize(int force_stderr) {
       fwrite(g_report_buf, 1, g_report_len, stream);
     }
     diag_style_output_end();
-  } else if (g_explain_text) {
+  } else if (g_explain_text && !g_explain_fragment) {
     diag_style_output_begin();
     {
       char label[64];
@@ -4603,10 +4843,13 @@ void ir_explain_backend_flush(void) {
       ok_count, g_backend_count, total_instructions, ok_instructions);
   size_t json_group_count = 0;
 
-  ir_explain_print_header("backend report");
-  if (g_backend_count == 0) {
+  int show_backend = g_backend_count > 0 || !g_explain_host_empty;
+  if (show_backend) {
+    ir_explain_print_header("backend report");
+  }
+  if (show_backend && g_backend_count == 0) {
     ir_explain_emit("  (no functions reached native codegen)\n\n");
-  } else {
+  } else if (show_backend) {
     ir_explain_emit(
         "  %zu/%zu functions reaching codegen (after inlining) compiled with "
         "the register-allocating backend\n",
@@ -4832,6 +5075,7 @@ void ir_explain_backend_flush(void) {
   g_backend_count = 0;
   g_backend_capacity = 0;
 
+  ir_explain_children_flush();
   ir_explain_finalize(0);
 }
 

@@ -22,6 +22,8 @@ void ir_explain_echo_source_range(size_t line, size_t end_line);
 char *ir_explain_text_dup(const char *s);
 void ir_explain_device_render(void);
 int ir_explain_device_has_report(void);
+void ir_explain_set_device_functions(const IRProgram *program,
+                                     const unsigned char *reachable);
 void ir_tensor_explain_declines(const IRFunction *function);
 void ir_gpu_staging_explain_declines(const IRFunction *function);
 

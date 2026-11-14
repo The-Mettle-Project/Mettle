@@ -42,6 +42,8 @@ typedef struct {
   int report_sms;
   int gpu_checks;
   int device_image;
+  const char *explain_fragment;
+  int device_report_only;
   int report_launches;
   int report_gpu_types;
   int emit_spirv;

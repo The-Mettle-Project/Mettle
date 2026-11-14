@@ -4437,6 +4437,12 @@ static DriverFlagResult parse_flag_gpu(CompilerOptions *options,
     options->gpu_checks = 1;
   } else if (strcmp(argv[i], "--device-image") == 0) {
     options->device_image = 1;
+  } else if (strncmp(argv[i], "--explain-fragment=", 19) == 0) {
+    options->explain_fragment = argv[i] + 19;
+    options->explain = 1;
+    options->explain_json = 1;
+  } else if (strcmp(argv[i], "--device-report-only") == 0) {
+    options->device_report_only = 1;
   } else if (strcmp(argv[i], "--report-launches") == 0) {
     options->report_launches = 1;
   } else if (strcmp(argv[i], "--report-gpu-types") == 0) {
@@ -6464,6 +6470,15 @@ static int compile_optimize_ir(IRProgram *ir_program, ASTNode *ast_program,
   ir_explain_set_output_path(options->output_filename);
   ir_explain_set_json(options->explain_json ? 1 : 0);
   ir_explain_set_text(options->explain_view ? 0 : 1);
+  ir_explain_set_target_name(options->emit_metal   ? "metal"
+                             : options->emit_ptx   ? "ptx"
+                             : options->emit_spirv ? "spirv"
+                                                   : mtlc_target()->triple);
+  if (options->explain_fragment) {
+    ir_explain_set_fragment(options->explain_fragment,
+                            options->emit_metal ? "kernels on Metal"
+                                                : "kernels on PTX");
+  }
   {
     static char *source_path = NULL;
     free(source_path);
@@ -6805,6 +6820,23 @@ static int compile_write_kernel_declarations(ASTNode *program,
   return write_kernel_declarations(program, decls_path, input_filename);
 }
 
+static int compile_fragment_failure(const CompilerOptions *options,
+                                    const char *message) {
+  char path[4200];
+  FILE *out = NULL;
+  if (!options->device_report_only || !options->explain_fragment) {
+    return 0;
+  }
+  snprintf(path, sizeof(path), "%s.err", options->explain_fragment);
+  out = fopen(path, "w");
+  if (!out) {
+    return 0;
+  }
+  fprintf(out, "error: %s\n", message ? message : "unknown");
+  fclose(out);
+  return 1;
+}
+
 static int compile_emit_ptx(IRProgram *ir_program, ASTNode *program,
                             CodeGenerator *code_generator,
                             const CompilerOptions *options,
@@ -6840,6 +6872,10 @@ static int compile_emit_ptx(IRProgram *ir_program, ASTNode *program,
   ok = ptx_emit_program(ir_program, code_generator, ptx_out, &ptx_options,
                         &ptx_err);
   fclose(ptx_out);
+  if (!ok && compile_fragment_failure(options, ptx_err)) {
+    free(ptx_err);
+    return 1;
+  }
   if (!ok) {
     if (ptx_err && strlen(ptx_err) > 7 && ptx_err[0] >= 'A' &&
         ptx_err[0] <= 'Z' && ptx_err[5] == ':' && ptx_err[6] == ' ') {
@@ -6952,6 +6988,11 @@ static int compile_emit_metal(IRProgram *ir_program, ASTNode *program,
   }
   ok = msl_emit_program(ir_program, metal_out, &metal_options, &metal_err);
   fclose(metal_out);
+  if (!ok && compile_fragment_failure(options, metal_err)) {
+    free(metal_err);
+    remove(output_filename);
+    return 1;
+  }
   if (!ok) {
     fprintf(stderr, "Error: Metal emission failed: %s\n  --> %s\n",
             metal_err ? metal_err : "unknown",
@@ -7936,15 +7977,74 @@ static size_t compile_device_flags(const char **out, size_t used) {
   return used;
 }
 
-static char *compile_device_image(CompileContext *ctx, int metal) {
+static int compile_argv_has_prefix(const char *prefix) {
+  for (int i = 1; i < g_compiler_argc; i++) {
+    if (strncmp(g_compiler_argv[i], prefix, strlen(prefix)) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int compile_target_is_build_host(void) {
+  return mtlc_target()->os == mtlc_target_host_os() &&
+         mtlc_target()->arch == mtlc_target_host_arch();
+}
+
+static void compile_device_failure(const char *stem, char *message,
+                                   size_t size) {
+  static const char *const LEADS[] = {"Metal emission failed: ",
+                                      "PTX emission failed: ", "]: ",
+                                      "Error: ", "error: "};
+  char path[4200];
+  char line[1024];
+  FILE *in = NULL;
+  snprintf(message, size, "the device compile failed");
+  snprintf(path, sizeof(path), "%s.err", stem);
+  in = fopen(path, "r");
+  while (in && fgets(line, sizeof(line), in)) {
+    const char *text = line;
+    size_t length = 0;
+    if (!strstr(line, "rror")) {
+      continue;
+    }
+    for (size_t i = 0; i < sizeof(LEADS) / sizeof(LEADS[0]); i++) {
+      const char *found = strstr(text, LEADS[i]);
+      if (found) {
+        text = found + strlen(LEADS[i]);
+        break;
+      }
+    }
+    while (text[length] && text[length] != '\r' && text[length] != '\n') {
+      length++;
+    }
+    snprintf(message, size, "%.*s", (int)length, text);
+    break;
+  }
+  if (in) {
+    fclose(in);
+  }
+  remove(path);
+}
+
+static char *compile_device_child(CompileContext *ctx, int metal, int report,
+                                  int report_only) {
+  const CompilerOptions *options = ctx->options;
+  const char *kind = metal ? "metal" : "ptx";
   const char **argv_list = NULL;
   char path[4096];
+  char stem[4096];
+  char fragment[4200];
   char *self = get_executable_path(g_compiler_argc ? g_compiler_argv[0] : NULL);
   char *image = NULL;
   size_t used = 0;
-  snprintf(path, sizeof(path), "%s.kernels.%s", ctx->output_filename,
-           metal ? "metal" : "ptx");
-  argv_list = calloc((size_t)g_compiler_argc + 8u, sizeof(*argv_list));
+  int status = 0;
+  snprintf(path, sizeof(path), "%s.%s-kernels.%s", ctx->output_filename, kind,
+           kind);
+  snprintf(stem, sizeof(stem), "%s.%s-kernels.fragment", ctx->output_filename,
+           kind);
+  snprintf(fragment, sizeof(fragment), "--explain-fragment=%s", stem);
+  argv_list = calloc((size_t)g_compiler_argc + 12u, sizeof(*argv_list));
   if (!self || !argv_list) {
     free(self);
     free(argv_list);
@@ -7954,16 +8054,79 @@ static char *compile_device_image(CompileContext *ctx, int metal) {
   argv_list[used++] = metal ? "--emit-metal" : "--emit-ptx";
   argv_list[used++] = "--device-image";
   used = compile_device_flags(argv_list, used);
+  if (options->release && !compile_argv_has_prefix("--release")) {
+    argv_list[used++] = "--release";
+  }
+  if (!metal && !compile_target_is_build_host() &&
+      !compile_argv_has_prefix("--gpu-arch=")) {
+    argv_list[used++] = "--gpu-arch=gb10";
+  }
+  if (report) {
+    argv_list[used++] = fragment;
+  }
+  if (report_only) {
+    argv_list[used++] = "--device-report-only";
+  }
   argv_list[used++] = ctx->input_filename;
   argv_list[used++] = "-o";
   argv_list[used++] = path;
-  if (mettle_run_process(self, argv_list) == 0) {
+  status = mettle_run_process(self, argv_list);
+  if (status == 0) {
     image = read_file(path);
   }
   remove(path);
+  if (report && status == 0) {
+    ir_explain_device_child(stem, metal ? "Metal" : "PTX", NULL);
+  } else if (report_only) {
+    char message[600];
+    compile_device_failure(stem, message, sizeof(message));
+    ir_explain_device_child(stem, metal ? "Metal" : "PTX", message);
+  }
   free(self);
   free(argv_list);
   return image;
+}
+
+static void compile_report_kernels(CompileContext *ctx, int metal) {
+  free(compile_device_child(ctx, metal, 1, 1));
+  if (ctx->options->gpu_provider == 0) {
+    free(compile_device_child(ctx, !metal, 1, 1));
+  }
+}
+
+static int compile_host_has_code(const IRProgram *program, const char *input) {
+  const char *base = input;
+  for (const char *p = input; p && *p; p++) {
+    if (*p == '/' || *p == '\\') {
+      base = p + 1;
+    }
+  }
+  for (size_t i = 0; program && i < program->function_count; i++) {
+    const IRFunction *function = program->functions[i];
+    const char *file = function ? function->location.filename : NULL;
+    const char *file_base = file;
+    for (const char *p = file; p && *p; p++) {
+      if (*p == '/' || *p == '\\') {
+        file_base = p + 1;
+      }
+    }
+    if (function && function->instruction_count > 0 && file_base && base &&
+        strcmp(file_base, base) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int compile_drop_kernels_for_report(CompileContext *ctx,
+                                           const char *register_name) {
+  if (!ir_program_embed_device_image(ctx->ir_program, NULL, 0, NULL,
+                                     register_name)) {
+    return 1;
+  }
+  ir_explain_set_host_empty(
+      !compile_host_has_code(ctx->ir_program, ctx->input_filename));
+  return COMPILE_CONTINUE;
 }
 
 static int compile_stage_embed_kernels(CompileContext *ctx) {
@@ -7971,20 +8134,31 @@ static int compile_stage_embed_kernels(CompileContext *ctx) {
   const char *register_name = "mtlc_gpu_register_module";
   int metal = options->gpu_provider == 2 ||
               (options->gpu_provider == 0 && host_target_is_macho());
+  int report = options->explain && options->optimize;
+  int view = options->explain_view || options->explain_view_text;
   char *image = NULL;
   int embedded = 0;
-  if (!options->building_executable || options->emit_ptx ||
-      options->emit_spirv || options->emit_metal || options->test_mode ||
-      !ir_program_defines_kernels(ctx->ir_program)) {
+  if (options->emit_ptx || options->emit_spirv || options->emit_metal ||
+      options->test_mode || !ir_program_defines_kernels(ctx->ir_program)) {
     return COMPILE_CONTINUE;
   }
+  if (!options->building_executable) {
+    if (!view) {
+      return COMPILE_CONTINUE;
+    }
+    compile_report_kernels(ctx, metal);
+    return compile_drop_kernels_for_report(ctx, register_name);
+  }
   if (!ir_program_can_register_device_image(ctx->ir_program, register_name)) {
+    if (report) {
+      free(compile_device_child(ctx, metal, 1, 1));
+    }
     return ir_program_embed_device_image(ctx->ir_program, NULL, 0, NULL,
                                          register_name)
                ? COMPILE_CONTINUE
                : 1;
   }
-  image = compile_device_image(ctx, metal);
+  image = compile_device_child(ctx, metal, report, 0);
   if (!image) {
     fprintf(stderr, "error: the kernels in %s did not compile for the GPU\n",
             ctx->input_filename);

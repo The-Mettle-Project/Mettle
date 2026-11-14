@@ -58,5 +58,10 @@ void ir_explain_device_code(const char *function, size_t line,
 void ir_explain_device_measured_by(const char *tool);
 size_t ir_explain_device_function_count(void);
 const char *ir_explain_device_function_name(size_t index, int *is_kernel);
+void ir_explain_set_fragment(const char *stem, const char *label);
+void ir_explain_set_target_name(const char *name);
+void ir_explain_set_host_empty(int empty);
+void ir_explain_device_child(const char *stem, const char *target,
+                             const char *failure);
 
 #endif

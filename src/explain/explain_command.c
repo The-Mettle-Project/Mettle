@@ -147,7 +147,7 @@ static ExReport *ex_load_report(const char *json_path, const char *source) {
             error);
     return NULL;
   }
-  if (ex_json_int(root, "schema", 0) != 2) {
+  if (ex_json_int(root, "schema", 0) != 3) {
     fprintf(stderr, "Error: %s was written by a different compiler; rebuild "
                     "it with --explain-json\n",
             json_path);
@@ -309,6 +309,7 @@ int mettle_explain_view(CompilerOptions *options) {
   options->explain = 1;
   options->optimize = 1;
   options->release = 1;
+  options->device_image = 1;
   options->building_executable = 0;
   options->output_filename = object;
   if (text) {

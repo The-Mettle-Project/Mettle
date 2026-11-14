@@ -906,6 +906,8 @@ static int ir_optimize_portable_program_pipeline(
     ir_tensor_explain_declines(program->functions[i]);
     ir_gpu_staging_explain_declines(program->functions[i]);
   }
+  ir_explain_set_device_functions(gpu_only ? program : NULL,
+                                  gpu_only ? graph.reachable : NULL);
 
   ir_explain_set_program(NULL);
   ir_gpu_call_graph_destroy(&graph);
