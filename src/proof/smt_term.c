@@ -702,6 +702,22 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
     if (smt_is_not_of(ctx, a, b)) {
       return ctx->bool_true;
     }
+    if (ctx->nodes[a].kind == SMT_K_AND && ctx->nodes[b].kind == SMT_K_AND) {
+      SmtTerm a0 = smt_arg(ctx, a, 0), a1 = smt_arg(ctx, a, 1);
+      SmtTerm b0 = smt_arg(ctx, b, 0), b1 = smt_arg(ctx, b, 1);
+      if (a0 == b0 && smt_is_not_of(ctx, a1, b1)) {
+        return a0;
+      }
+      if (a0 == b1 && smt_is_not_of(ctx, a1, b0)) {
+        return a0;
+      }
+      if (a1 == b0 && smt_is_not_of(ctx, a0, b1)) {
+        return a1;
+      }
+      if (a1 == b1 && smt_is_not_of(ctx, a0, b0)) {
+        return a1;
+      }
+    }
     return 0;
   case SMT_K_XOR:
     if (a == b) {
@@ -728,6 +744,28 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return ctx->bool_true;
     }
     if (smt_term_is_const(ctx, a) && smt_term_is_const(ctx, b)) {
+      return ctx->bool_false;
+    }
+    for (int side = 0; side < 2; side++) {
+      SmtTerm it = side ? b : a, k = side ? a : b;
+      if (ctx->nodes[it].kind != SMT_K_ITE || !smt_is_bvconst(ctx, k)) {
+        continue;
+      }
+      SmtTerm t1 = smt_arg(ctx, it, 1), t2 = smt_arg(ctx, it, 2);
+      if (!smt_is_bvconst(ctx, t1) || !smt_is_bvconst(ctx, t2)) {
+        continue;
+      }
+      int hit1 = t1 == k, hit2 = t2 == k;
+      SmtTerm c = smt_arg(ctx, it, 0);
+      if (hit1 && hit2) {
+        return ctx->bool_true;
+      }
+      if (hit1) {
+        return c;
+      }
+      if (hit2) {
+        return smt_not(ctx, c);
+      }
       return ctx->bool_false;
     }
     if (smt_sort_is_bool(ctx, ctx->nodes[a].sort)) {
@@ -1355,6 +1393,61 @@ static SmtTerm smt_subst_rec(SmtSubst *s, SmtTerm t) {
   }
   smt_map_put(&s->memo, t, out);
   return out;
+}
+
+typedef struct {
+  SmtCtx *ctx;
+  SmtMap pairs;
+  SmtMap memo;
+} SmtReplace;
+
+static SmtTerm smt_replace_rec(SmtReplace *r, SmtTerm t) {
+  SmtCtx *ctx = r->ctx;
+  SmtTerm hit = smt_map_get(&r->pairs, t);
+  if (hit) {
+    return hit;
+  }
+  unsigned na = ctx->nodes[t].nargs;
+  if (na == 0) {
+    return t;
+  }
+  SmtTerm cached = smt_map_get(&r->memo, t);
+  if (cached) {
+    return cached;
+  }
+  SmtTerm args[64];
+  SmtTerm *buf = na <= 64u ? args : malloc(na * sizeof(SmtTerm));
+  int changed = 0;
+  for (unsigned i = 0; i < na; i++) {
+    SmtTerm a = smt_arg(ctx, t, i);
+    buf[i] = smt_replace_rec(r, a);
+    changed |= buf[i] != a;
+  }
+  SmtTerm out = changed ? smt_rebuild(ctx, t, buf) : t;
+  if (buf != args) {
+    free(buf);
+  }
+  smt_map_put(&r->memo, t, out);
+  return out;
+}
+
+SmtTerm smt_replace(SmtCtx *ctx, SmtTerm t, unsigned n, const SmtTerm *from,
+                    const SmtTerm *to) {
+  SmtReplace r;
+  r.ctx = ctx;
+  smt_map_init(&r.pairs);
+  smt_map_init(&r.memo);
+  for (unsigned i = 0; i < n; i++) {
+    smt_map_put(&r.pairs, from[i], to[i]);
+  }
+  SmtTerm out = smt_replace_rec(&r, t);
+  smt_map_free(&r.pairs);
+  smt_map_free(&r.memo);
+  return out;
+}
+
+SmtTerm smt_term_rebuild(SmtCtx *ctx, SmtTerm t, const SmtTerm *args) {
+  return smt_rebuild(ctx, t, args);
 }
 
 SmtTerm smt_subst(SmtCtx *ctx, SmtTerm t, unsigned n, const SmtTerm *vars,

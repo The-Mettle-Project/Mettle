@@ -428,6 +428,9 @@ IRFunction *ir_lower_function(IRLoweringContext *context,
           : NULL;
   function->is_rule = function_data->is_rule;
   function->rewrite_role = function_data->rewrite_role;
+  function->theorem_script = function_data->theorem_script
+                                 ? string_intern(function_data->theorem_script)
+                                 : NULL;
   function->is_kernel = function_data->is_kernel;
   function->kernel_block[0] = function_data->kernel_block[0];
   function->kernel_block[1] = function_data->kernel_block[1];

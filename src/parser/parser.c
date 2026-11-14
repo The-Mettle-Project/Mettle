@@ -136,8 +136,7 @@ Parser *parser_create_with_error_reporter(Lexer *lexer,
   parser->comptime_depth = 0;
   parser->pending_composed_count = 0;
   parser->expression_depth = 0;
-  parser->extra_declarations[0] = NULL;
-  parser->extra_declarations[1] = NULL;
+  memset(parser->extra_declarations, 0, sizeof(parser->extra_declarations));
   parser->extra_declaration_count = 0;
   parser->next_value_scope = 0;
   parser->active_labels = NULL;
@@ -1912,6 +1911,356 @@ static ASTNode *parser_parse_rewrite_declaration(Parser *parser) {
   return from_decl;
 }
 
+typedef struct {
+  char *name;
+  char **types;
+  size_t count;
+} ParserTheoremSignature;
+
+static ParserTheoremSignature *g_theorem_signatures = NULL;
+static size_t g_theorem_signature_count = 0;
+
+static const char *parser_theorem_param_type(const char *lemma, size_t index) {
+  for (size_t i = g_theorem_signature_count; i-- > 0;) {
+    ParserTheoremSignature *sig = &g_theorem_signatures[i];
+    if (strcmp(sig->name, lemma) == 0) {
+      return index < sig->count ? sig->types[index] : NULL;
+    }
+  }
+  return NULL;
+}
+
+static void parser_remember_theorem(const char *name, char **types,
+                                    size_t count) {
+  ParserTheoremSignature *grown =
+      realloc(g_theorem_signatures,
+              (g_theorem_signature_count + 1) * sizeof(*grown));
+  if (!grown) {
+    return;
+  }
+  g_theorem_signatures = grown;
+  ParserTheoremSignature *sig = &grown[g_theorem_signature_count++];
+  sig->name = strdup(name);
+  sig->count = count;
+  sig->types = malloc((count ? count : 1) * sizeof(char *));
+  for (size_t i = 0; i < count; i++) {
+    sig->types[i] = strdup(types[i]);
+  }
+}
+
+typedef struct {
+  char *text;
+  size_t length;
+  size_t capacity;
+} ParserScript;
+
+static void parser_script_append(ParserScript *script, const char *text) {
+  size_t n = strlen(text);
+  if (script->length + n + 1 > script->capacity) {
+    size_t capacity = script->capacity ? script->capacity * 2 : 256;
+    while (capacity < script->length + n + 1) {
+      capacity *= 2;
+    }
+    char *grown = realloc(script->text, capacity);
+    if (!grown) {
+      return;
+    }
+    script->text = grown;
+    script->capacity = capacity;
+  }
+  memcpy(script->text + script->length, text, n + 1);
+  script->length += n;
+}
+
+typedef struct {
+  const char *theorem;
+  char **param_names;
+  char **param_types;
+  size_t param_count;
+  ASTNode **terms;
+  size_t term_count;
+  ParserScript script;
+} ParserTheorem;
+
+static int parser_theorem_term(Parser *parser, ParserTheorem *thm,
+                               const char *return_type, ASTNode *expr) {
+  char name[256];
+  snprintf(name, sizeof(name), "%s__%zu", thm->theorem, thm->term_count);
+  ASTNode *decl = parser_make_rewrite_side(
+      IR_THEOREM_TERM_PREFIX, name, thm->param_names, thm->param_types,
+      thm->param_count, return_type, expr, expr->location,
+      IR_THEOREM_ROLE_TERM);
+  if (!decl) {
+    ast_destroy_node(expr);
+    parser_set_error(parser, "Out of memory while building a theorem");
+    return 0;
+  }
+  ASTNode **grown =
+      realloc(thm->terms, (thm->term_count + 1) * sizeof(ASTNode *));
+  if (!grown) {
+    ast_destroy_node(decl);
+    return 0;
+  }
+  thm->terms = grown;
+  thm->terms[thm->term_count++] = decl;
+  char ref[300];
+  snprintf(ref, sizeof(ref), " %s%s", IR_THEOREM_TERM_PREFIX, name);
+  parser_script_append(&thm->script, ref);
+  return 1;
+}
+
+static int parser_tactic_word(Parser *parser, const char *word) {
+  return parser_is_identifier_like(parser->current_token.type) &&
+         parser->current_token.value &&
+         strcmp(parser->current_token.value, word) == 0;
+}
+
+static int parser_parse_tactic(Parser *parser, ParserTheorem *thm) {
+  char line[96];
+  SourceLocation at = parser_current_location(parser);
+  if (!parser_is_identifier_like(parser->current_token.type) ||
+      !parser->current_token.value) {
+    parser_set_error(parser, "Expected a tactic: smt, auto, unfold, "
+                             "induction, cases, assert, use, simp or show");
+    return 0;
+  }
+  char *tactic = strdup(parser->current_token.value);
+  snprintf(line, sizeof(line), "%zu:%zu %s", at.line, at.column, tactic);
+  parser_script_append(&thm->script, line);
+  parser_advance(parser);
+  int ok = 1;
+  if (strcmp(tactic, "smt") == 0 || strcmp(tactic, "auto") == 0 ||
+      strcmp(tactic, "simp") == 0 || strcmp(tactic, "show") == 0) {
+  } else if (strcmp(tactic, "unfold") == 0) {
+    while (parser_is_identifier_like(parser->current_token.type) &&
+           parser->current_token.value) {
+      parser_script_append(&thm->script, " ");
+      parser_script_append(&thm->script, parser->current_token.value);
+      parser_advance(parser);
+      if (parser->current_token.type != TOKEN_COMMA) {
+        break;
+      }
+      parser_advance(parser);
+    }
+  } else if (strcmp(tactic, "induction") == 0) {
+    if (!parser_is_identifier_like(parser->current_token.type) ||
+        !parser->current_token.value) {
+      parser_set_error(parser, "Expected the parameter to induct on after "
+                               "'induction'");
+      ok = 0;
+    } else {
+      parser_script_append(&thm->script, " ");
+      parser_script_append(&thm->script, parser->current_token.value);
+      parser_advance(parser);
+    }
+  } else if (strcmp(tactic, "cases") == 0 || strcmp(tactic, "assert") == 0) {
+    ASTNode *expr = parser_parse_expression(parser);
+    if (!expr) {
+      if (!parser->has_error) {
+        parser_set_error(parser, "Expected a condition after the tactic");
+      }
+      ok = 0;
+    } else {
+      ok = parser_theorem_term(parser, thm, "bool", expr);
+    }
+  } else if (strcmp(tactic, "use") == 0) {
+    if (!parser_is_identifier_like(parser->current_token.type) ||
+        !parser->current_token.value) {
+      parser_set_error(parser, "Expected a theorem name after 'use'");
+      ok = 0;
+    } else {
+      char *lemma = strdup(parser->current_token.value);
+      parser_script_append(&thm->script, " ");
+      parser_script_append(&thm->script, lemma);
+      parser_advance(parser);
+      if (!parser_expect(parser, TOKEN_LPAREN)) {
+        ok = 0;
+      }
+      size_t index = 0;
+      while (ok && parser->current_token.type != TOKEN_RPAREN) {
+        ASTNode *expr = parser_parse_expression(parser);
+        if (!expr) {
+          if (!parser->has_error) {
+            parser_set_error(parser, "Expected an argument for the theorem");
+          }
+          ok = 0;
+          break;
+        }
+        const char *type = parser_theorem_param_type(lemma, index++);
+        ok = parser_theorem_term(parser, thm, type ? type : "int64", expr);
+        if (parser->current_token.type == TOKEN_COMMA) {
+          parser_advance(parser);
+        } else if (parser->current_token.type != TOKEN_RPAREN) {
+          parser_set_error(parser, "Expected ',' or ')' in the theorem's "
+                                   "arguments");
+          ok = 0;
+        }
+      }
+      if (ok && !parser_expect(parser, TOKEN_RPAREN)) {
+        ok = 0;
+      }
+      free(lemma);
+    }
+  } else {
+    char message[160];
+    snprintf(message, sizeof(message),
+             "Unknown tactic '%s': expected smt, auto, unfold, induction, "
+             "cases, assert, use, simp or show",
+             tactic);
+    parser_set_error(parser, message);
+    ok = 0;
+  }
+  free(tactic);
+  parser_script_append(&thm->script, "\n");
+  return ok;
+}
+
+static ASTNode *parser_parse_theorem_declaration(Parser *parser) {
+  SourceLocation location = parser_current_location(parser);
+  parser_advance(parser);
+  if (parser->comptime_depth > 0) {
+    parser_set_error(parser, "A 'theorem' cannot be generated by "
+                             "'comptime for'");
+    return NULL;
+  }
+  if (!parser_is_identifier_like(parser->current_token.type)) {
+    parser_set_error(parser, "Expected a name after 'theorem'");
+    return NULL;
+  }
+  ParserTheorem thm;
+  memset(&thm, 0, sizeof(thm));
+  char *name = strdup(parser->current_token.value);
+  thm.theorem = name;
+  parser_advance(parser);
+  ASTNode *claim = NULL;
+  ASTNode *where = NULL;
+  ASTNode *claim_decl = NULL;
+  ASTNode *where_decl = NULL;
+  int ok = parser_expect(parser, TOKEN_LPAREN) &&
+           parser_parse_parameter_list(parser, &thm.param_names,
+                                       &thm.param_types, &thm.param_count) &&
+           parser_expect(parser, TOKEN_RPAREN);
+  if (ok && parser->current_token.type == TOKEN_WHERE) {
+    parser_advance(parser);
+    where = parser_parse_expression(parser);
+    if (!where) {
+      if (!parser->has_error) {
+        parser_set_error(parser, "Expected a condition after 'where'");
+      }
+      ok = 0;
+    }
+  }
+  if (ok && !parser_expect(parser, TOKEN_LBRACE)) {
+    ok = 0;
+  }
+  if (ok) {
+    while (parser->current_token.type == TOKEN_NEWLINE) {
+      parser_advance(parser);
+    }
+    claim = parser_parse_expression(parser);
+    if (!claim) {
+      if (!parser->has_error) {
+        parser_set_error(parser, "Expected the theorem's claim, a bool "
+                                 "expression, inside its braces");
+      }
+      ok = 0;
+    }
+  }
+  while (ok && (parser->current_token.type == TOKEN_SEMICOLON ||
+                parser->current_token.type == TOKEN_NEWLINE)) {
+    parser_advance(parser);
+  }
+  if (ok && !parser_expect(parser, TOKEN_RBRACE)) {
+    ok = 0;
+  }
+  if (ok) {
+    parser_remember_theorem(name, thm.param_types, thm.param_count);
+  }
+  if (ok && parser_tactic_word(parser, "by")) {
+    parser_advance(parser);
+    ok = parser_parse_tactic(parser, &thm);
+    if (ok && parser->current_token.type == TOKEN_SEMICOLON) {
+      parser_advance(parser);
+    }
+  } else if (ok && parser_tactic_word(parser, "proof")) {
+    parser_advance(parser);
+    ok = parser_expect(parser, TOKEN_LBRACE);
+    while (ok && parser->current_token.type != TOKEN_RBRACE &&
+           parser->current_token.type != TOKEN_EOF) {
+      if (parser->current_token.type == TOKEN_SEMICOLON ||
+          parser->current_token.type == TOKEN_NEWLINE) {
+        parser_advance(parser);
+        continue;
+      }
+      ok = parser_parse_tactic(parser, &thm);
+    }
+    if (ok) {
+      ok = parser_expect(parser, TOKEN_RBRACE);
+    }
+  } else if (ok) {
+    char line[64];
+    snprintf(line, sizeof(line), "%zu:%zu auto\n", location.line,
+             location.column);
+    parser_script_append(&thm.script, line);
+  }
+  if (ok) {
+    claim_decl = parser_make_rewrite_side(
+        IR_THEOREM_CLAIM_PREFIX, name, thm.param_names, thm.param_types,
+        thm.param_count, "bool", claim, location, IR_THEOREM_ROLE_CLAIM);
+    claim = NULL;
+    if (where) {
+      where_decl = parser_make_rewrite_side(
+          IR_THEOREM_WHERE_PREFIX, name, thm.param_names, thm.param_types,
+          thm.param_count, "bool", where, location, IR_THEOREM_ROLE_WHERE);
+      where = NULL;
+    }
+    if (!claim_decl || (thm.script.length == 0) ||
+        thm.term_count + 1 > sizeof(parser->extra_declarations) /
+                                 sizeof(parser->extra_declarations[0])) {
+      if (!parser->has_error) {
+        parser_set_error(parser, "A theorem's proof refers to too many "
+                                 "expressions");
+      }
+      ok = 0;
+    }
+  }
+  if (ok) {
+    ((FunctionDeclaration *)claim_decl->data)->theorem_script =
+        thm.script.text;
+    thm.script.text = NULL;
+    size_t extra = 0;
+    if (where_decl) {
+      parser->extra_declarations[extra++] = where_decl;
+      where_decl = NULL;
+    }
+    for (size_t i = 0; i < thm.term_count; i++) {
+      parser->extra_declarations[extra++] = thm.terms[i];
+      thm.terms[i] = NULL;
+    }
+    parser->extra_declaration_count = extra;
+  }
+  ast_destroy_node(claim);
+  ast_destroy_node(where);
+  ast_destroy_node(where_decl);
+  for (size_t i = 0; i < thm.term_count; i++) {
+    ast_destroy_node(thm.terms[i]);
+  }
+  free(thm.terms);
+  free(thm.script.text);
+  for (size_t i = 0; i < thm.param_count; i++) {
+    free(thm.param_names[i]);
+    free(thm.param_types[i]);
+  }
+  free(thm.param_names);
+  free(thm.param_types);
+  free(name);
+  if (!ok) {
+    ast_destroy_node(claim_decl);
+    return NULL;
+  }
+  return claim_decl;
+}
+
 ASTNode *parser_parse_declaration(Parser *parser) {
   if (!parser)
     return NULL;
@@ -1922,6 +2271,9 @@ ASTNode *parser_parse_declaration(Parser *parser) {
   }
   if (parser_at_contextual_keyword(parser, "rewrite", TOKEN_IDENTIFIER)) {
     return parser_parse_rewrite_declaration(parser);
+  }
+  if (parser_at_contextual_keyword(parser, "theorem", TOKEN_IDENTIFIER)) {
+    return parser_parse_theorem_declaration(parser);
   }
   if (parser_at_contextual_keyword(parser, "type", TOKEN_IDENTIFIER)) {
     return parser_parse_type_declaration(parser);

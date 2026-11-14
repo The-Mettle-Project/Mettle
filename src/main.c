@@ -61,6 +61,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ir/ir_smt.h"
+#include "ir/ir_theorem.h"
 #include "proof/smt.h"
 #if !defined(_WIN32) || defined(__MINGW32__)
 #include <sys/time.h>
@@ -5062,6 +5063,37 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "smt") == 0) {
       return smtlib_main(argc - 2, argv + 2);
     }
+    if (strcmp(argv[1], "prove") == 0) {
+      if (argc < 3) {
+        fprintf(stderr,
+                "usage: mettle prove <file.mettle> [--goals] "
+                "[--interactive <theorem>]\n"
+                "  checks every theorem in the program and reports each "
+                "one; --goals prints\n"
+                "  the goals after every tactic, --interactive reads more "
+                "tactics for one\n"
+                "  theorem from standard input\n");
+        return 1;
+      }
+      IRTheoremOptions theorem_options;
+      memset(&theorem_options, 0, sizeof(theorem_options));
+      theorem_options.report = 1;
+      theorem_options.stop_after = 1;
+      int kept = 2;
+      for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--goals") == 0) {
+          theorem_options.show_goals = 1;
+        } else if (strcmp(argv[i], "--interactive") == 0 && i + 1 < argc) {
+          theorem_options.interactive = argv[++i];
+        } else {
+          argv[kept++] = argv[i];
+        }
+      }
+      argc = kept;
+      ir_theorem_set_options(&theorem_options);
+      argv[1] = argv[2];
+      argc = split_subcommand_flags(argc, argv, 3, NULL, &(int){0});
+    }
     if (strcmp(argv[1], "prove-compiler") == 0) {
       int verbose = argc > 2 && strcmp(argv[2], "--quiet") != 0;
       if (argc <= 2) {
@@ -6079,6 +6111,8 @@ static void live_record_global_layouts(const IRProgram *program) {
   free(layouts);
 }
 
+static int g_theorem_status = -1;
+
 static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
                                SymbolTable *symbol_table,
                                int emit_runtime_checks, int emit_safety_checks,
@@ -6096,6 +6130,20 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
           errors_before_lowering) {
     error_reporter_print_errors(type_checker->error_reporter);
     return 0;
+  }
+  if (*out_ir_program && (ir_program_has_theorems(*out_ir_program) ||
+                          ir_theorem_stop_after())) {
+    int proved = ir_theorems_check(*out_ir_program);
+    if (ir_theorem_stop_after()) {
+      if (!ir_program_has_theorems(*out_ir_program)) {
+        printf("no theorems in this program\n");
+      }
+      g_theorem_status = proved ? 0 : 1;
+      return 0;
+    }
+    if (!proved) {
+      return 0;
+    }
   }
   if (*out_ir_program) {
     const char *const *type_names = NULL;
@@ -7690,6 +7738,9 @@ static int compile_stage_lower_ir(CompileContext *ctx) {
                               &ctx->ir_error_message);
   compiler_profile_add(&ctx->profile, PROFILE_PHASE_IR_LOWERING,
                        ctx->phase_start);
+  if (g_theorem_status >= 0) {
+    return g_theorem_status;
+  }
   if (ir_ok) {
     ownership_publish_explain();
   }

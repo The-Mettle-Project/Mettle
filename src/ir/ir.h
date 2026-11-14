@@ -25,8 +25,14 @@ enum {
   IR_REWRITE_ROLE_NONE = 0,
   IR_REWRITE_ROLE_FROM = 1,
   IR_REWRITE_ROLE_TO = 2,
-  IR_REWRITE_ROLE_WHERE = 3
+  IR_REWRITE_ROLE_WHERE = 3,
+  IR_THEOREM_ROLE_CLAIM = 4,
+  IR_THEOREM_ROLE_WHERE = 5,
+  IR_THEOREM_ROLE_TERM = 6
 };
+#define IR_THEOREM_CLAIM_PREFIX "__theorem__"
+#define IR_THEOREM_WHERE_PREFIX "__theorem_where__"
+#define IR_THEOREM_TERM_PREFIX "__theorem_term__"
 #define IR_REWRITE_FROM_PREFIX "__rewrite_from__"
 #define IR_REWRITE_TO_PREFIX "__rewrite_to__"
 #define IR_REWRITE_WHERE_PREFIX "__rewrite_where__"
@@ -347,6 +353,7 @@ typedef struct {
   int has_volatile_access;
   int is_kernel;
   int rewrite_role;
+  const char *theorem_script;
   int is_exported;
   int kernel_block[3];
   int kernel_threads_per_item;

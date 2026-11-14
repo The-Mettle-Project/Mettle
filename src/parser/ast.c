@@ -207,6 +207,8 @@ static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node
   dst->is_interrupt = src->is_interrupt;
   dst->is_rule = src->is_rule;
   dst->rewrite_role = src->rewrite_role;
+  dst->theorem_script =
+      src->theorem_script ? ast_copy_string(src->theorem_script) : NULL;
   dst->effects_with_count = src->effects_with_count;
   dst->effects_with =
       ast_copy_string_array(src->effects_with, src->effects_with_count);
@@ -1410,6 +1412,7 @@ void ast_destroy_node(ASTNode *node) {
       free(func_decl->type_params);
       free(func_decl->type_param_traits);
       free(func_decl->numerics_contract);
+      free(func_decl->theorem_script);
       for (size_t i = 0; i < func_decl->captured_count; i++) {
         ast_free_string(func_decl->captured_names[i]);
         ast_free_string(func_decl->captured_types[i]);
@@ -2097,6 +2100,7 @@ ASTNode *ast_create_function_declaration(const char *name, char **param_names,
   func_decl->tail_must_yield = 0;
   func_decl->is_test = 0;
   func_decl->numerics_contract = NULL;
+  func_decl->theorem_script = NULL;
   func_decl->is_swappable = 0;
   func_decl->is_naked = 0;
   func_decl->is_interrupt = 0;

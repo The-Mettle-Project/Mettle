@@ -93,6 +93,10 @@ static int irs_parse_scalar(const char *type, int *size, int *is_unsigned) {
   return 0;
 }
 
+int ir_smt_parse_scalar(const char *type, int *size, int *is_unsigned) {
+  return irs_parse_scalar(type, size, is_unsigned);
+}
+
 SmtTerm ir_smt_narrow(SmtCtx *ctx, SmtTerm v, int size, int is_unsigned) {
   if (size <= 0 || size >= 8) {
     return v;
@@ -431,8 +435,73 @@ static const IRFunction *irs_find_function(const IRProgram *program,
 
 static int irs_run(IrsEnc *e);
 
+SmtFunc ir_smt_value_func(SmtCtx *ctx, const char *name, size_t arity) {
+  SmtSort domain[16];
+  for (size_t i = 0; i < arity && i < 16u; i++) {
+    domain[i] = smt_bv_sort(ctx, 64);
+  }
+  return smt_func(ctx, name, (unsigned)arity, domain, smt_bv_sort(ctx, 64));
+}
+
+SmtFunc ir_smt_trap_func(SmtCtx *ctx, const char *name, size_t arity) {
+  SmtSort domain[16];
+  char trap_name[256];
+  for (size_t i = 0; i < arity && i < 16u; i++) {
+    domain[i] = smt_bv_sort(ctx, 64);
+  }
+  snprintf(trap_name, sizeof(trap_name), "%s!trap", name);
+  return smt_func(ctx, trap_name, (unsigned)arity, domain,
+                  smt_bool_sort(ctx));
+}
+
+static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
+  SmtCtx *ctx = e->ctx;
+  if (!insn->text) {
+    irs_fail(e, "a call has no target", NULL);
+    return;
+  }
+  if (insn->argument_count > 16u) {
+    irs_fail(e, "a call passes more than 16 arguments to", insn->text);
+    return;
+  }
+  const IRFunction *callee = irs_find_function(e->frame->program, insn->text);
+  if (!callee) {
+    irs_fail(e, "it calls", insn->text);
+    return;
+  }
+  SmtTerm args[16];
+  for (size_t i = 0; i < insn->argument_count; i++) {
+    args[i] = irs_read(e, &insn->arguments[i]);
+    int size = 8, is_unsigned = 0;
+    if (i < callee->parameter_count && callee->parameter_types &&
+        irs_parse_scalar(callee->parameter_types[i], &size, &is_unsigned)) {
+      args[i] = ir_smt_narrow(ctx, args[i], size, is_unsigned);
+    }
+  }
+  SmtFunc vf = ir_smt_value_func(ctx, insn->text, insn->argument_count);
+  SmtFunc tf = ir_smt_trap_func(ctx, insn->text, insn->argument_count);
+  SmtTerm value = smt_apply(ctx, vf, (unsigned)insn->argument_count, args);
+  SmtTerm trap = smt_apply(ctx, tf, (unsigned)insn->argument_count, args);
+  IRSmtFrame *f = e->frame;
+  if (f->call_count == f->call_cap) {
+    f->call_cap = f->call_cap ? f->call_cap * 2u : 16u;
+    f->calls = realloc(f->calls, f->call_cap * sizeof(IRSmtCallSite));
+  }
+  IRSmtCallSite *site = &f->calls[f->call_count++];
+  site->callee = insn->text;
+  site->arg_count = insn->argument_count;
+  memcpy(site->args, args, insn->argument_count * sizeof(SmtTerm));
+  site->reach = e->reach;
+  irs_trap(e, trap);
+  irs_write(e, &insn->dest, value);
+}
+
 static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   SmtCtx *ctx = e->ctx;
+  if (e->frame->uf_calls) {
+    irs_call_uf(e, insn);
+    return;
+  }
   const IRFunction *callee = irs_find_function(e->frame->program, insn->text);
   if (!callee || callee->instruction_count == 0) {
     irs_fail(e, "it calls", insn->text ? insn->text : "an unknown function");
@@ -720,6 +789,7 @@ void ir_smt_frame_free(IRSmtFrame *frame) {
   }
   free(frame->shared);
   free(frame->params);
+  free(frame->calls);
   memset(frame, 0, sizeof(*frame));
 }
 

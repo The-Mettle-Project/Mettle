@@ -1385,6 +1385,7 @@ IRFunction *ir_function_create(const char *name) {
   function->has_volatile_access = 0;
   function->is_kernel = 0;
   function->rewrite_role = 0;
+  function->theorem_script = NULL;
   function->effects_with = NULL;
   function->effects_with_count = 0;
   function->effects_forbids = NULL;

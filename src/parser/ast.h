@@ -177,6 +177,7 @@ typedef struct {
   int is_rule;
   char *numerics_contract;
   int rewrite_role;
+  char *theorem_script;
   char **effects_with;
   size_t effects_with_count;
   char **effects_forbids;

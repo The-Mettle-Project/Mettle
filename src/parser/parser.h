@@ -30,7 +30,7 @@ typedef struct {
   ASTNode *pending_composed_names[32];
   size_t pending_composed_count;
   int expression_depth;
-  ASTNode *extra_declarations[2];
+  ASTNode *extra_declarations[64];
   size_t extra_declaration_count;
   int next_value_scope;
   const char **active_labels;

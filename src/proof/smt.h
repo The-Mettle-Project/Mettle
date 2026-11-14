@@ -141,6 +141,9 @@ SmtFunc smt_func_lookup(const SmtCtx *ctx, const char *name);
 
 SmtTerm smt_subst(SmtCtx *ctx, SmtTerm t, unsigned n, const SmtTerm *vars,
                   const SmtTerm *values);
+SmtTerm smt_replace(SmtCtx *ctx, SmtTerm t, unsigned n, const SmtTerm *from,
+                    const SmtTerm *to);
+SmtTerm smt_term_rebuild(SmtCtx *ctx, SmtTerm t, const SmtTerm *args);
 int smt_term_contains(SmtCtx *ctx, SmtTerm t, SmtTerm sub);
 int smt_term_has_quantifier(SmtCtx *ctx, SmtTerm t);
 unsigned smt_term_free_vars(SmtCtx *ctx, SmtTerm t, SmtTerm *out,
