@@ -7,6 +7,7 @@
 #include "codegen/ptx_emitter.h"
 #include "codegen/spirv_emitter.h"
 #include "codegen/msl_emitter.h"
+#include "codegen/target.h"
 #include "ir/ir.h"
 #include "ir/ir_optimize.h"
 #include "ir/ml_opt.h"
@@ -398,27 +399,28 @@ int mtlc_apply_ml_opt(MtlcContext *ctx, MtlcModule *module,
   return ok;
 }
 
-int mtlc_emit_object(MtlcContext *ctx, MtlcModule *module, const char *path) {
-  if (!module || !module->ir || !path) {
-    mtlc_diag(ctx, MTLC_DIAG_ERROR,
-              "mtlc_emit_object: a module and an output path are required");
-    return 0;
-  }
+static int mtlc_emit_arm64_object(MtlcContext *ctx, MtlcModule *module,
+                                  const char *path) {
+  char error[512] = {0};
+  int ok;
   if (!ir_program_lower_gpu_launches(module->ir)) {
     mtlc_diag(ctx, MTLC_DIAG_ERROR, "GPU launch host lowering failed");
     return 0;
   }
-#if defined(__aarch64__) && defined(__linux__)
-  {
-    char error[512] = {0};
-    int ok = arm64_ir_write_object(module->ir, path, error, sizeof(error));
-    if (!ok) {
-      mtlc_diag(ctx, MTLC_DIAG_ERROR, "AArch64 object emission failed: %s",
-                error[0] ? error : "unknown error");
-    }
-    return ok;
+  ok = arm64_ir_write_object(module->ir, path, error, sizeof(error));
+  if (!ok) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "AArch64 object emission failed: %s",
+              error[0] ? error : "unknown error");
   }
-#else
+  return ok;
+}
+
+static int mtlc_emit_x86_object(MtlcContext *ctx, MtlcModule *module,
+                                const char *path) {
+  if (!ir_program_lower_gpu_launches(module->ir)) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR, "GPU launch host lowering failed");
+    return 0;
+  }
   CodeGenerator *gen = code_generator_create();
   if (!gen) {
     mtlc_diag(ctx, MTLC_DIAG_ERROR, "could not create the code generator");
@@ -440,7 +442,17 @@ int mtlc_emit_object(MtlcContext *ctx, MtlcModule *module, const char *path) {
   }
   code_generator_destroy(gen);
   return ok;
-#endif
+}
+
+int mtlc_emit_object(MtlcContext *ctx, MtlcModule *module, const char *path) {
+  if (!module || !module->ir || !path) {
+    mtlc_diag(ctx, MTLC_DIAG_ERROR,
+              "mtlc_emit_object: a module and an output path are required");
+    return 0;
+  }
+  return mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64
+             ? mtlc_emit_arm64_object(ctx, module, path)
+             : mtlc_emit_x86_object(ctx, module, path);
 }
 
 int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
@@ -452,20 +464,10 @@ int mtlc_emit(MtlcContext *ctx, MtlcModule *module, MtlcArch arch,
   }
   switch (arch) {
   case MTLC_ARCH_X86_64:
-    return mtlc_emit_object(ctx, module, path);
+    return mtlc_emit_x86_object(ctx, module, path);
 
-  case MTLC_ARCH_ARM64: {
-    if (!ir_program_lower_gpu_launches(module->ir)) {
-      mtlc_diag(ctx, MTLC_DIAG_ERROR, "GPU launch host lowering failed");
-      return 0;
-    }
-    char error[512] = {0};
-    int ok = arm64_ir_write_object(module->ir, path, error, sizeof(error));
-    if (!ok)
-      mtlc_diag(ctx, MTLC_DIAG_ERROR, "AArch64 object emission failed: %s",
-                error[0] ? error : "unknown error");
-    return ok;
-  }
+  case MTLC_ARCH_ARM64:
+    return mtlc_emit_arm64_object(ctx, module, path);
 
   case MTLC_ARCH_PTX: {
     FILE *out = fopen(path, "w");

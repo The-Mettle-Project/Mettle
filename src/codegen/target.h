@@ -1,5 +1,5 @@
-#ifndef MTLC_TARGET_H
-#define MTLC_TARGET_H
+#ifndef METTLE_CODEGEN_TARGET_H
+#define METTLE_CODEGEN_TARGET_H
 
 #include "binary_emitter.h"
 
@@ -57,6 +57,10 @@ int mtlc_target_syscall_max_arguments(const MtlcTarget *target);
 MtlcTargetOs mtlc_target_host_os(void);
 
 const char *mtlc_target_os_name(MtlcTargetOs os);
+
+MtlcTargetArch mtlc_target_host_arch(void);
+
+const char *mtlc_target_arch_name(MtlcTargetArch arch);
 
 #define MTLC_TARGET_DESC_MAX_REGS 16
 #define MTLC_TARGET_DESC_MAX_NAMES 8

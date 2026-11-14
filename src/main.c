@@ -4793,6 +4793,19 @@ static int mettle_check_target_options(CompilerOptions *options,
       free((void *)options->link_arguments);
       return 1;
     }
+    if (target->arch != mtlc_target_host_arch()) {
+      fprintf(stderr,
+              "Error: --build for %s needs an %s linker and runtime, and this "
+              "host is %s; emit the object with --emit-obj and link it on an "
+              "%s %s host\n",
+              target->triple, mtlc_target_arch_name(target->arch),
+              mtlc_target_arch_name(mtlc_target_host_arch()),
+              mtlc_target_arch_name(target->arch),
+              mtlc_target_os_name(target->os));
+      free((void *)options->import_directories);
+      free((void *)options->link_arguments);
+      return 1;
+    }
   }
 
   if (mtlc_target()->image_base_set && !options->flat_output) {
@@ -6158,12 +6171,11 @@ static IRGlobalIntConst *collect_global_int_consts(ASTNode *program,
 }
 
 static int compile_targets_arm64_object(const CompilerOptions *options) {
-#if defined(__aarch64__) || defined(_M_ARM64)
-  (void)options;
-  return 1;
-#else
-  return options && options->emit_arm64_obj;
-#endif
+  if (options && options->emit_arm64_obj) {
+    return 1;
+  }
+  return mtlc_target()->arch == MTLC_TARGET_ARCH_AARCH64 &&
+         !(options && options->emit_arm64);
 }
 
 static void compile_publish_optimizer_costs(void) {

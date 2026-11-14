@@ -183,6 +183,30 @@ MtlcTargetOs mtlc_target_host_os(void) {
   }
 }
 
+MtlcTargetArch mtlc_target_host_arch(void) {
+  switch (binary_target_format_host_default()) {
+  case BINARY_TARGET_FORMAT_ELF_ARM64:
+  case BINARY_TARGET_FORMAT_MACHO_ARM64:
+    return MTLC_TARGET_ARCH_AARCH64;
+  default:
+    return MTLC_TARGET_ARCH_X86_64;
+  }
+}
+
+const char *mtlc_target_arch_name(MtlcTargetArch arch) {
+  switch (arch) {
+  case MTLC_TARGET_ARCH_AARCH64:
+    return "AArch64";
+  case MTLC_TARGET_ARCH_X86_32:
+    return "x86";
+  case MTLC_TARGET_ARCH_X86_16:
+    return "8086";
+  case MTLC_TARGET_ARCH_X86_64:
+  default:
+    return "x86-64";
+  }
+}
+
 const char *mtlc_target_os_name(MtlcTargetOs os) {
   switch (os) {
   case MTLC_TARGET_OS_LINUX:
