@@ -1746,6 +1746,10 @@ $cases = @(
      Env = @{ METTLE_LINEAR_ALLOC = "1"; METTLE_REGALLOC_VERIFY = "1" }
      SkipDeterminism = $true
      SkipRunDiff = $true },
+  @{ Name = "linear_scan_param_at_first_clobber_verified"; Path = "tests/test_linear_scan_param_at_first_clobber.mettle"; ShouldSucceed = $true
+     Args = @("--release")
+     Env = @{ METTLE_LINEAR_ALLOC = "1"; METTLE_REGALLOC_VERIFY = "1" }
+     SkipDeterminism = $true },
   @{ Name = "linear_scan_param_across_first_call_verified"; Path = "tests/test_gpu_view_param.mettle"; ShouldSucceed = $true
      Args = @("-O")
      Env = @{ METTLE_LINEAR_ALLOC = "1"; METTLE_REGALLOC_VERIFY = "1" }

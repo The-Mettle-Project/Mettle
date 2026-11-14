@@ -1,0 +1,18 @@
+@noinline fn h3(p0: uint32, p1: int32, p2: int64, p3: int16, p4: int64, p5: uint8, p6: uint16, p7: uint64, p8: uint8, p9: uint64) -> uint32 {
+  var l13: int64 = (p4 % (int64)12345);
+  for i14: int64 in 1..9 {
+    l13 = ((int64)(p8));
+    if ((uint64)14274408583545673447 <= (p9 + p7)) {
+      if (p5 != (p5 - p8)) {
+        l13 = (p4 >> ((int64)(-3173076948815651463) & (int64)63));
+      }
+    }
+  }
+  return (((p0 << (p0 & (uint32)31)) - (uint32)5) & p0);
+}
+
+fn main() -> int32 {
+  var r: uint32 = h3((uint32)1, 2, (int64)3, (int16)4, (int64)5, (uint8)6, (uint16)7, (uint64)8, (uint8)9, (uint64)10);
+  if (r != (uint32)1) { return 1; }
+  return 0;
+}

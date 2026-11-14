@@ -1276,6 +1276,14 @@ static int mir_reg_clobbered_in_range(const MirFunction *fn,
   return 0;
 }
 
+static int mir_reg_clobbered_while_live(const MirFunction *fn,
+                                        const MirVreg *vr,
+                                        BinaryGpRegister reg) {
+  return mir_reg_clobbered_in_range(fn, reg,
+                                    vr->entry_live ? -1 : vr->live_start,
+                                    vr->live_end);
+}
+
 static uint32_t mir_ra_insn_busy_mask(const MirInst *in) {
   uint32_t m = 0;
   for (int r = 0; r < 16; r++) {
@@ -1550,7 +1558,7 @@ static int mir_ra_reg_busy(const MirRaFacts *facts, const MirFunction *fn,
   if (facts && facts->valid) {
     return (facts->clobbered[v] >> (unsigned)reg) & 1u;
   }
-  return mir_reg_clobbered_in_range(fn, reg, vr->live_start, vr->live_end);
+  return mir_reg_clobbered_while_live(fn, vr, reg);
 }
 
 static int mir_vreg_is_param_in_reg(const MirFunction *fn, MirVregId v,
@@ -3150,8 +3158,7 @@ int mir_regalloc(MirFunction *fn) {
       MirVreg *hv = &fn->vregs[cv->coalesce_hint];
       if (hv->in_register && hv->rclass == MIR_RC_GP &&
           hv->live_end == point && gp_held_by[hv->phys] == cv->coalesce_hint &&
-          !mir_reg_clobbered_in_range(fn, (BinaryGpRegister)hv->phys,
-                                      cv->live_start, cv->live_end)) {
+          !mir_reg_clobbered_while_live(fn, cv, (BinaryGpRegister)hv->phys)) {
         cv->phys = hv->phys;
         cv->assigned = 1;
         cv->in_register = 1;
@@ -3207,8 +3214,7 @@ int mir_regalloc(MirFunction *fn) {
             continue;
           }
           if (gp_held_by[reg] == -1 &&
-              !mir_reg_clobbered_in_range(fn, reg, cv->live_start,
-                                          cv->live_end)) {
+              !mir_reg_clobbered_while_live(fn, cv, reg)) {
             gp_held_by[reg] = cur;
             cv->assigned = 1;
             cv->in_register = 1;
@@ -3246,8 +3252,7 @@ int mir_regalloc(MirFunction *fn) {
         continue;
       }
       if (av->rclass == MIR_RC_GP &&
-          mir_reg_clobbered_in_range(fn, (BinaryGpRegister)av->phys,
-                                     cv->live_start, cv->live_end)) {
+          mir_reg_clobbered_while_live(fn, cv, (BinaryGpRegister)av->phys)) {
         continue;
       }
       int better;
