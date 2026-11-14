@@ -489,6 +489,23 @@ static const SmtBits *smt_bits_of(const SmtCtx *ctx, SmtTerm t) {
 static int smt_const_is_zero(const SmtCtx *ctx, SmtTerm t) {
   return smt_is_bvconst(ctx, t) && smt_bits_is_zero(smt_bits_of(ctx, t));
 }
+static void smt_split_offset(const SmtCtx *ctx, SmtTerm t, SmtTerm *base,
+                             uint64_t *offset) {
+  *base = t;
+  *offset = 0;
+  const SmtNode *n = &ctx->nodes[t];
+  if (n->kind != SMT_K_BVADD || n->nargs != 2 || smt_width(ctx, t) != 64) {
+    return;
+  }
+  SmtTerm x = smt_arg(ctx, t, 0), y = smt_arg(ctx, t, 1);
+  if (smt_is_bvconst(ctx, y)) {
+    *base = x;
+    *offset = smt_bits_of(ctx, y)->w[0];
+  } else if (smt_is_bvconst(ctx, x)) {
+    *base = y;
+    *offset = smt_bits_of(ctx, x)->w[0];
+  }
+}
 static int smt_const_is_one(const SmtCtx *ctx, SmtTerm t) {
   if (!smt_is_bvconst(ctx, t)) {
     return 0;
@@ -1024,6 +1041,13 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
         return smt_arg(ctx, a, 2);
       }
       if (smt_is_bvconst(ctx, idx) && smt_is_bvconst(ctx, b)) {
+        return smt_select(ctx, smt_arg(ctx, a, 0), b);
+      }
+      SmtTerm base_i, base_b;
+      uint64_t off_i, off_b;
+      smt_split_offset(ctx, idx, &base_i, &off_i);
+      smt_split_offset(ctx, b, &base_b, &off_b);
+      if (base_i == base_b && off_i != off_b) {
         return smt_select(ctx, smt_arg(ctx, a, 0), b);
       }
     }

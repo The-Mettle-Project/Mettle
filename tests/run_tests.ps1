@@ -1150,6 +1150,19 @@ $cases = @(
     Args          = @()
   },
   @{
+    Name          = "prove_memory"
+    Path          = "tests/prove_memory.mettle"
+    ShouldSucceed = $true
+    Args          = @()
+  },
+  @{
+    Name          = "err_prove_aliasing"
+    Path          = "tests/err_prove_aliasing.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'prove in `overwrite` does not hold; it fails at p = \d+, q = \d+'
+  },
+  @{
     Name          = "err_loop_invariant"
     Path          = "tests/err_loop_invariant.mettle"
     ShouldSucceed = $false

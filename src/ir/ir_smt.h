@@ -8,6 +8,7 @@ typedef struct {
   SmtTerm result;
   SmtTerm trap;
   SmtTerm returned;
+  SmtTerm memory;
   char why[192];
 } IRSmtOutcome;
 
@@ -59,6 +60,11 @@ typedef struct {
   IRSmtProveSite *proves;
   size_t prove_count;
   size_t prove_cap;
+  SmtTerm assume;
+  SmtTerm *region_base;
+  uint64_t *region_size;
+  size_t region_count;
+  size_t region_cap;
 } IRSmtFrame;
 
 #define IR_SMT_PROVE_CALL "__mettle_prove"

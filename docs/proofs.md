@@ -119,6 +119,59 @@ invariant that the body breaks is reported with the values that break it:
 loop.mettle:5:18: error: invariant in `double_up` does not hold (the invariant after an iteration); it fails at n = 4294967294
 ```
 
+## Memory
+
+Loads and stores through pointers are read against one array of bytes indexed
+by 64-bit address. A store of `n` bytes writes `n` bytes, little-endian; a load
+reads them back and sign or zero extends by the pointer's type. Two pointers
+may hold any addresses, so they may be equal or overlap by a few bytes, and a
+fact that needs them apart has to follow from the code:
+
+```mettle
+fn apart(p: int64*, q: int64*) -> int64 {
+    var gap: int64 = (int64)q - (int64)p;
+    if (gap < 8 && gap > -8) { return 1; }
+    *p = 1;
+    *q = 2;
+    prove(*p == 1);
+    return *p;
+}
+```
+
+With the test `p == q` in place of the gap, the prover finds the partial
+overlap:
+
+```text
+alias.mettle:5:10: error: prove in `overwrite` does not hold; it fails at p = 7, q = 6
+```
+
+A load or store through address zero traps, and so does one through any
+address the program does not own, which the prover does not know and treats as
+a fixed unknown set. A `prove` after an access may therefore assume the access
+succeeded. A loop that stores, and a call to a function that may store, leave
+every byte unknown afterward; a loop that only reads and a callee that only
+reads keep memory as it was. A loop invariant can restore what a storing loop
+keeps:
+
+```mettle
+fn clear_tail(a: int64*, n: int64) -> int64 {
+    if (n > 1000) { return 0; }
+    a[0] = 5;
+    var i: int64 = 1;
+    while (i < n) {
+        invariant(a[0] == 5 && i >= 1 && i <= 1000);
+        a[i] = 0;
+        i = i + 1;
+    }
+    prove(a[0] == 5);
+    return a[0];
+}
+```
+
+Without the bound on `n`, `a + 8 * i` wraps around to `a` at `i = 2^61` and the
+claim is false. The address of a local and block copies are not modeled yet; a
+function that uses them cannot be checked.
+
 ## How the prover sees a function
 
 A call stays a call until a tactic unfolds it. Unfolding replaces the call
@@ -128,9 +181,9 @@ unfolded when the prover can give it a definition:
 ```mermaid
 flowchart TD
   F[function] --> E{body encodes?}
-  E -- loops, memory, floats --> O[opaque]
+  E -- loops, floats, local addresses --> O[opaque]
   E -- yes --> R{reads only its parameters?}
-  R -- globals, uninitialized locals --> O
+  R -- globals, memory, uninitialized locals --> O
   R -- yes --> C{recursive?}
   C -- no --> D[defined]
   C -- directly --> M{a parameter decreases at every recursive call?}

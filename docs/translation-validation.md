@@ -23,7 +23,8 @@ its own authority.
 
 A changed function whose IR is loop-free integer code is first handed to the
 SMT solver, which proves the code before and after the pass agree on every
-input: the same traps and the same return value. A proof validates the
+input and every starting memory: the same traps, the same return value, and
+the same bytes at every address when the function returns. A proof validates the
 application without running anything, and the summary counts proofs apart
 from runs:
 
@@ -34,7 +35,8 @@ translation validation: OK - 91 pass applications validated on 6 input sets each
 
 When the solver finds a disagreement, the interpreter runs the solver's input
 first, so a real miscompile is reported with a concrete run. Code with loops,
-memory or floats goes straight to the input sets. See [Proofs](proofs.md).
+floats, block copies or the address of a local goes straight to the input
+sets. See [Proofs](proofs.md).
 
 ## Reference twins
 

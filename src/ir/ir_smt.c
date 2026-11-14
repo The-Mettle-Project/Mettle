@@ -13,6 +13,9 @@ typedef struct {
   int is_unsigned;
   int declared;
   int param;
+  int addressed;
+  int slot;
+  SmtTerm addr;
 } IrsVar;
 
 typedef struct {
@@ -46,6 +49,9 @@ typedef struct {
   size_t *inv_marker;
   size_t *inv_start;
   unsigned global_epoch;
+  size_t mem_id;
+  SmtTerm mem_in;
+  SmtTerm mem_out;
   int failed;
   char why[192];
 } IrsEnc;
@@ -262,7 +268,12 @@ static void irs_note_operand(IrsEnc *e, const IROperand *op) {
   }
 }
 
-static SmtTerm irs_shared(IrsEnc *e, const char *kind, const char *name) {
+static SmtSort irs_memory_sort(SmtCtx *ctx) {
+  return smt_array_sort(ctx, smt_bv_sort(ctx, 64), smt_bv_sort(ctx, 8));
+}
+
+static SmtTerm irs_shared_sorted(IrsEnc *e, const char *kind, const char *name,
+                                 SmtSort sort) {
   IRSmtFrame *f = e->frame;
   char key[256];
   snprintf(key, sizeof(key), "%s%s:%s", e->prefix ? e->prefix : "", kind,
@@ -276,11 +287,46 @@ static SmtTerm irs_shared(IrsEnc *e, const char *kind, const char *name) {
     f->shared_cap = f->shared_cap ? f->shared_cap * 2u : 32u;
     f->shared = realloc(f->shared, f->shared_cap * sizeof(IRSmtShared));
   }
-  SmtTerm t = smt_var(e->ctx, key, irs_word(e->ctx));
+  SmtTerm t = smt_var(e->ctx, key, sort);
   f->shared[f->shared_count].name = mettle_strdup(key);
   f->shared[f->shared_count].term = t;
   f->shared_count++;
   return t;
+}
+
+static SmtTerm irs_shared(IrsEnc *e, const char *kind, const char *name) {
+  return irs_shared_sorted(e, kind, name, irs_word(e->ctx));
+}
+
+static SmtTerm irs_address(SmtCtx *ctx, SmtTerm base, unsigned offset) {
+  if (offset == 0) {
+    return base;
+  }
+  return smt_mk2(ctx, SMT_K_BVADD, base, smt_bv_u64(ctx, 64, offset));
+}
+
+static SmtTerm irs_access_trap(IrsEnc *e, SmtTerm addr, int size) {
+  SmtCtx *ctx = e->ctx;
+  char name[48];
+  snprintf(name, sizeof(name), "invalid_address_%d", size);
+  SmtSort domain = irs_word(ctx);
+  SmtFunc invalid = smt_func(ctx, name, 1, &domain, smt_bool_sort(ctx));
+  return smt_or(ctx, smt_eq(ctx, addr, smt_bv_u64(ctx, 64, 0)),
+                smt_apply(ctx, invalid, 1, &addr));
+}
+
+static int irs_access_size(IrsEnc *e, const IRInstruction *insn) {
+  if (insn->is_float) {
+    irs_fail(e, "it loads or stores a float", NULL);
+    return 0;
+  }
+  if (insn->rhs.kind != IR_OPERAND_INT ||
+      (insn->rhs.int_value != 1 && insn->rhs.int_value != 2 &&
+       insn->rhs.int_value != 4 && insn->rhs.int_value != 8)) {
+    irs_fail(e, "it copies a block of memory", NULL);
+    return 0;
+  }
+  return (int)insn->rhs.int_value;
 }
 
 static SmtTerm irs_read(IrsEnc *e, const IROperand *op) {
@@ -482,6 +528,51 @@ SmtFunc ir_smt_trap_func(SmtCtx *ctx, const char *name, size_t arity) {
                   smt_bool_sort(ctx));
 }
 
+static int irs_is_trap_call(const char *name) {
+  return name && (strcmp(name, "mettle_crash_trap") == 0 ||
+                  strcmp(name, "mettle_crash_trap_ex") == 0 ||
+                  strcmp(name, "mettle_crash_panic") == 0);
+}
+
+static int irs_callee_keeps_memory(const IRFunction *callee) {
+  for (size_t i = 0; i < callee->instruction_count; i++) {
+    const IRInstruction *insn = &callee->instructions[i];
+    switch (insn->op) {
+    case IR_OP_NOP:
+    case IR_OP_LABEL:
+    case IR_OP_JUMP:
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+    case IR_OP_DECLARE_LOCAL:
+    case IR_OP_ASSIGN:
+    case IR_OP_BINARY:
+    case IR_OP_UNARY:
+    case IR_OP_CAST:
+    case IR_OP_SELECT:
+    case IR_OP_RETURN:
+    case IR_OP_LOAD:
+      break;
+    case IR_OP_CALL:
+      if (insn->text && (strcmp(insn->text, IR_SMT_PROVE_CALL) == 0 ||
+                         strcmp(insn->text, IR_SMT_INVARIANT_CALL) == 0 ||
+                         irs_is_trap_call(insn->text))) {
+        break;
+      }
+      return 0;
+    default:
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void irs_after_call_memory(IrsEnc *e, const IRFunction *callee) {
+  if (!irs_callee_keeps_memory(callee)) {
+    e->env[e->mem_id] =
+        smt_fresh(e->ctx, "memory@call", irs_memory_sort(e->ctx));
+  }
+}
+
 static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
   SmtCtx *ctx = e->ctx;
   if (!insn->text) {
@@ -517,6 +608,7 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
     irs_trap(e, trap);
     irs_write(e, &insn->dest, value);
     e->global_epoch++;
+    irs_after_call_memory(e, callee);
     return;
   }
   SmtFunc vf = ir_smt_value_func(ctx, insn->text, insn->argument_count);
@@ -535,6 +627,7 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
   irs_trap(e, trap);
   irs_write(e, &insn->dest, value);
   e->global_epoch++;
+  irs_after_call_memory(e, callee);
 }
 
 static void irs_record_site(IrsEnc *e, SmtTerm reach, SmtTerm cond,
@@ -646,6 +739,11 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
     }
     return;
   }
+  if (irs_is_trap_call(insn->text)) {
+    irs_trap(e, smt_true(ctx));
+    e->reach = smt_false(ctx);
+    return;
+  }
   if (e->frame->uf_calls) {
     irs_call_uf(e, insn);
     return;
@@ -679,6 +777,7 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   sub.insns = callee->instructions;
   sub.count = callee->instruction_count;
   sub.params = args;
+  sub.mem_in = e->env[e->mem_id];
   char prefix[160];
   snprintf(prefix, sizeof(prefix), "%s%s@%zu/", e->prefix ? e->prefix : "",
            callee->name, (size_t)(insn - e->insns));
@@ -691,6 +790,7 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   } else {
     irs_trap(e, sub.trap);
     irs_write(e, &insn->dest, sub.result);
+    e->env[e->mem_id] = sub.mem_out;
   }
   free(sub.vars);
   free(sub.buckets);
@@ -704,15 +804,26 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
 
 static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
   SmtCtx *ctx = e->ctx;
+  int calls = 0, stores = 0;
   for (size_t i = header; i <= end && i < e->count; i++) {
     if (e->insns[i].op == IR_OP_CALL && e->insns[i].text &&
         strcmp(e->insns[i].text, IR_SMT_PROVE_CALL) != 0 &&
-        strcmp(e->insns[i].text, IR_SMT_INVARIANT_CALL) != 0) {
-      e->global_epoch++;
-      break;
+        strcmp(e->insns[i].text, IR_SMT_INVARIANT_CALL) != 0 &&
+        !irs_is_trap_call(e->insns[i].text)) {
+      calls = 1;
     }
+    stores |= e->insns[i].op == IR_OP_STORE;
+  }
+  if (calls) {
+    e->global_epoch++;
+  }
+  if (calls || stores) {
+    e->env[e->mem_id] = smt_fresh(ctx, "loop:memory", irs_memory_sort(ctx));
   }
   for (size_t i = header; i <= end && i < e->count; i++) {
+    if (e->insns[i].op == IR_OP_STORE) {
+      continue;
+    }
     const IROperand *dest = &e->insns[i].dest;
     if ((dest->kind != IR_OPERAND_TEMP && dest->kind != IR_OPERAND_SYMBOL) ||
         !dest->name) {
@@ -890,6 +1001,7 @@ static void irs_step(IrsEnc *e, size_t pc) {
     SmtTerm v = insn->lhs.kind == IR_OPERAND_NONE ? smt_bv_u64(ctx, 64, 0)
                                                   : irs_read(e, &insn->lhs);
     e->result = smt_ite(ctx, e->reach, v, e->result);
+    e->mem_out = smt_ite(ctx, e->reach, e->env[e->mem_id], e->mem_out);
     e->returned = smt_or(ctx, e->returned, e->reach);
     e->reach = smt_false(ctx);
     return;
@@ -897,8 +1009,45 @@ static void irs_step(IrsEnc *e, size_t pc) {
   case IR_OP_CALL:
     irs_call(e, insn);
     return;
+  case IR_OP_LOAD: {
+    int size = irs_access_size(e, insn);
+    if (!size) {
+      return;
+    }
+    SmtTerm addr = irs_read(e, &insn->lhs);
+    SmtTerm mem = e->env[e->mem_id];
+    irs_trap(e, irs_access_trap(e, addr, size));
+    SmtTerm v = smt_select(ctx, mem, addr);
+    for (int i = 1; i < size; i++) {
+      SmtTerm byte = smt_select(ctx, mem, irs_address(ctx, addr, (unsigned)i));
+      v = smt_mk2(ctx, SMT_K_CONCAT, byte, v);
+    }
+    unsigned extra = 64u - (unsigned)size * 8u;
+    if (extra) {
+      v = insn->is_unsigned ? smt_zext(ctx, v, extra) : smt_sext(ctx, v, extra);
+    }
+    irs_write(e, &insn->dest, v);
+    return;
+  }
+  case IR_OP_STORE: {
+    int size = irs_access_size(e, insn);
+    if (!size) {
+      return;
+    }
+    SmtTerm addr = irs_read(e, &insn->dest);
+    SmtTerm value = irs_read(e, &insn->lhs);
+    irs_trap(e, irs_access_trap(e, addr, size));
+    SmtTerm mem = e->env[e->mem_id];
+    for (int i = 0; i < size; i++) {
+      SmtTerm byte = smt_extract(ctx, value, (unsigned)i * 8u + 7u,
+                                 (unsigned)i * 8u);
+      mem = smt_store(ctx, mem, irs_address(ctx, addr, (unsigned)i), byte);
+    }
+    e->env[e->mem_id] = mem;
+    return;
+  }
   default:
-    irs_fail(e, "it uses an instruction the encoder does not model", NULL);
+    irs_fail(e, "it uses the instruction", ir_opcode_name(insn->op));
     return;
   }
 }
@@ -934,7 +1083,13 @@ static int irs_run(IrsEnc *e) {
       e->vars[irs_var_lookup(e, insn->dest.name, 1)].declared = 1;
     }
   }
+  e->mem_id = irs_var_lookup(e, "\x01memory", 1);
+  e->vars[e->mem_id].declared = 1;
   e->env = calloc(e->nvars ? e->nvars : 1u, sizeof(SmtTerm));
+  e->env[e->mem_id] =
+      e->mem_in ? e->mem_in
+                : irs_shared_sorted(e, "memory", "", irs_memory_sort(ctx));
+  e->mem_out = e->env[e->mem_id];
   if (e->frame->havoc_loops && !e->prefix) {
     e->loop_end = calloc(e->count ? e->count : 1u, sizeof(size_t));
     for (size_t pc = 0; pc < e->count; pc++) {
@@ -973,6 +1128,7 @@ static int irs_run(IrsEnc *e) {
     irs_fail(e, "a jump never reaches its label", NULL);
   }
   if (!e->failed) {
+    e->mem_out = smt_ite(ctx, e->reach, e->env[e->mem_id], e->mem_out);
     e->returned = smt_or(ctx, e->returned, e->reach);
   }
   return !e->failed;
@@ -1002,6 +1158,8 @@ void ir_smt_frame_free(IRSmtFrame *frame) {
   free(frame->params);
   free(frame->calls);
   free(frame->proves);
+  free(frame->region_base);
+  free(frame->region_size);
   memset(frame, 0, sizeof(*frame));
 }
 
@@ -1020,6 +1178,7 @@ int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
   out->result = e.result;
   out->trap = e.trap;
   out->returned = e.returned;
+  out->memory = e.mem_out;
   snprintf(out->why, sizeof(out->why), "%s", e.why);
   free(e.vars);
   free(e.buckets);
@@ -1071,8 +1230,14 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
                      irs_nonzero(ctx, og.result));
   }
   SmtTerm same_trap = smt_iff(ctx, oa.trap, ob.trap);
-  SmtTerm same_value =
-      smt_implies(ctx, smt_not(ctx, oa.trap), smt_eq(ctx, oa.result, ob.result));
+  SmtTerm same_result = smt_eq(ctx, oa.result, ob.result);
+  if (oa.memory != ob.memory) {
+    SmtTerm k = smt_fresh(ctx, "address", smt_bv_sort(ctx, 64));
+    same_result = smt_and(ctx, same_result,
+                          smt_eq(ctx, smt_select(ctx, oa.memory, k),
+                                 smt_select(ctx, ob.memory, k)));
+  }
+  SmtTerm same_value = smt_implies(ctx, smt_not(ctx, oa.trap), same_result);
   SmtTerm claim = smt_implies(ctx, assume, smt_and(ctx, same_trap, same_value));
   SmtSolver *solver = NULL;
   SmtResult r = smt_prove(ctx, claim, 1, 10000, &solver);

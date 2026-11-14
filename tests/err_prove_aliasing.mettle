@@ -1,0 +1,12 @@
+fn overwrite(p: int64*, q: int64*) -> int64 {
+    if (p == q) { return 0; }
+    *p = 1;
+    *q = 2;
+    prove(*p == 1);
+    return *p;
+}
+
+fn main() -> int32 {
+    var words: int64[2];
+    return (int32)overwrite(&words[0], &words[1]) - 1;
+}
