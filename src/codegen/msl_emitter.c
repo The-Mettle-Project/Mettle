@@ -1,7 +1,10 @@
 #include "msl_emitter.h"
 #include "gpu_structure.h"
+#include "ir/ir_device_report.h"
+#include "ir/ir_explain_device.h"
 
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -158,6 +161,7 @@ typedef struct MslFn {
   size_t temp_counter;
   uint32_t *resident;
   size_t resident_count;
+  int reported;
 } MslFn;
 
 typedef struct MslSpec {
@@ -1672,6 +1676,157 @@ static void line(MslFn *fn, const char *format, ...) {
   indent(fn);
   sb_puts(&fn->out, buffer);
   sb_puts(&fn->out, "\n");
+  if (fn->reported) {
+    ir_explain_device_code(
+        fn->func->name,
+        fn->m->current ? ir_device_report_code_line(fn->func, fn->m->current)
+                       : fn->func->location.line,
+        buffer);
+  }
+}
+
+static void report_note(MslFn *fn, const IRInstruction *in, const char *kind,
+                        const char *subject, IRDeviceVerdict verdict,
+                        const char *headline, const char *reason,
+                        const char *code) {
+  if (!fn->reported) {
+    return;
+  }
+  ir_explain_device_note_site(fn->func->name,
+                              in ? in->location.line : fn->func->location.line,
+                              kind, subject, verdict, headline, reason, NULL,
+                              code);
+}
+
+static void report_whole_value(MslFn *fn, const IRInstruction *in,
+                               const char *what, const char *kept,
+                               size_t bytes) {
+  char shown[128], subject[176], headline[96], cause[300], reason[380];
+  int has_reason;
+  ir_display_name(in->dest.name, shown, sizeof(shown));
+  snprintf(subject, sizeof(subject), "%s `%s`", what, shown);
+  snprintf(headline, sizeof(headline), "kept as one %s, %zu bytes", kept,
+           bytes);
+  has_reason = ir_device_report_storage_reason(fn->func, in->dest.name, 1,
+                                               cause, sizeof(cause));
+  snprintf(reason, sizeof(reason), "%s, so it is not split into scalars",
+           cause);
+  ir_explain_device_add(fn->func->name, IR_DEVICE_VALUES_IN_MEMORY, 1);
+  ir_explain_device_add(fn->func->name, IR_DEVICE_MEMORY_BYTES,
+                        (long long)bytes);
+  ir_explain_device_note(fn->func->name, in->location.line, "storage", subject,
+                         has_reason ? IR_DEVICE_MISS : IR_DEVICE_FACT, headline,
+                         has_reason ? reason : NULL, NULL, "local-memory");
+}
+
+static int report_declared_before(const IRFunction *func, size_t index) {
+  const char *name = func->instructions[index].dest.name;
+  for (size_t i = 0; i < index; i++) {
+    const IRInstruction *in = &func->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name &&
+        strcmp(in->dest.name, name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void report_allocation(MslFn *fn, const IRInstruction *in) {
+  const char *name = fn->func->name;
+  size_t element = in->value_type && in->value_type->base_type
+                       ? mtlc_type_size(in->value_type->base_type)
+                       : 0;
+  long long count = in->rhs.kind == IR_OPERAND_INT ? in->rhs.int_value : 0;
+  if (in->address_space != MTLC_ADDRESS_SPACE_WORKGROUP) {
+    report_whole_value(fn, in, "private array", "thread array",
+                       element * (size_t)count);
+  } else if (count == 0) {
+    ir_explain_device_set(name, IR_DEVICE_WORKGROUP_LAUNCH_SIZED, 1);
+  } else {
+    ir_explain_device_add(name, IR_DEVICE_WORKGROUP_BYTES,
+                          (long long)element * count);
+  }
+}
+
+static void report_instruction(MslFn *fn, size_t index) {
+  IRFunction *func = fn->func;
+  const IRInstruction *in = &func->instructions[index];
+  const char *name = func->name;
+  switch (in->op) {
+  case IR_OP_DECLARE_LOCAL:
+    if (!in->dest.name || report_declared_before(func, index)) {
+      return;
+    }
+    if (type_is_record(in->value_type)) {
+      int array = in->value_type->kind == MTLC_TYPE_ARRAY;
+      report_whole_value(fn, in, array ? "array" : "record",
+                         array ? "array" : "record",
+                         mtlc_type_size(in->value_type));
+    } else {
+      ir_explain_device_add(name, IR_DEVICE_VALUES_IN_REGISTERS, 1);
+    }
+    return;
+  case IR_OP_ADDRESS_SPACE_ALLOC:
+    if (in->dest.name) {
+      report_allocation(fn, in);
+    }
+    return;
+  case IR_OP_LOAD:
+    if (in->lhs.kind != IR_OPERAND_STRING) {
+      ir_explain_device_add(name, IR_DEVICE_ACCESSES_NAMED, 1);
+    }
+    return;
+  case IR_OP_STORE:
+    ir_explain_device_add(name, IR_DEVICE_ACCESSES_NAMED, 1);
+    return;
+  case IR_OP_CALL:
+    if (in->intrinsic == MTLC_INTRINSIC_NONE &&
+        lookup_function(fn->m, in->text, NULL)) {
+      ir_explain_device_add(name, IR_DEVICE_CALLS_KEPT, 1);
+    }
+    return;
+  default:
+    return;
+  }
+}
+
+static void report_function(MslFn *fn) {
+  IRFunction *func = fn->func;
+  size_t before = ir_explain_device_function_count();
+  fn->reported = 0;
+  fn->m->current = NULL;
+  if (!ir_explain_device_function(func->name, func->location.filename,
+                                  func->location.line, func->is_kernel,
+                                  func->kernel_block) ||
+      ir_explain_device_function_count() == before) {
+    return;
+  }
+  fn->reported = 1;
+  for (size_t p = 0; p < func->parameter_count; p++) {
+    MslVar *var = func->parameter_names && func->parameter_names[p]
+                      ? find_var(fn, func->parameter_names[p])
+                      : NULL;
+    if (var && var->cls == MC_REC) {
+      ir_explain_device_add(func->name, IR_DEVICE_VALUES_IN_MEMORY, 1);
+      ir_explain_device_add(func->name, IR_DEVICE_MEMORY_BYTES,
+                            (long long)mtlc_type_size(var->rec));
+    } else {
+      ir_explain_device_add(func->name, IR_DEVICE_VALUES_IN_REGISTERS, 1);
+    }
+  }
+  for (size_t i = 0; i < func->instruction_count; i++) {
+    report_instruction(fn, i);
+  }
+  for (size_t i = 0; i < fn->nvars; i++) {
+    if (fn->vars[i].demoted) {
+      ir_explain_device_note_site(
+          func->name, func->location.line, "numeric", "float64 values",
+          IR_DEVICE_GOOD, "computed in float32 with the same bits",
+          "every operand is a float32 value or a literal float32 holds "
+          "exactly, and the result is only rounded back to float32",
+          NULL, "float64-narrowed");
+    }
+  }
 }
 
 static void print_float(char *out, size_t size, double value) {
@@ -2738,6 +2893,16 @@ static void emit_atomic(MslFn *fn, const IRInstruction *in) {
       return;
     }
   }
+  if (fence_before || fence_after) {
+    report_note(fn, in, "atomic", "ordered atomic", IR_DEVICE_FACT,
+                fence_before && fence_after
+                    ? "a relaxed atomic between two atomic_thread_fence calls"
+                    : fence_before
+                          ? "atomic_thread_fence before a relaxed atomic"
+                          : "a relaxed atomic before atomic_thread_fence",
+                "Metal 3.2 atomics take no memory order; 4.1 has native ones",
+                "atomic-fence");
+  }
   if (fence_before) {
     line(fn, "atomic_thread_fence(%s, memory_order_seq_cst, %s);", flags,
          scope);
@@ -3372,6 +3537,17 @@ static void emit_async_copy(MslFn *fn, const IRInstruction *in) {
   elem_size = kind_size(elem);
   pointer_expr(fn, &in->arguments[0], &ds, d, sizeof(d));
   pointer_expr(fn, &in->arguments[1], &ss, s, sizeof(s));
+  if (fn->reported) {
+    char headline[120];
+    snprintf(headline, sizeof(headline),
+             "%zu bytes copied with ordinary assignments",
+             (size_t)in->async_copy_element_count * elem_size);
+    report_note(fn, in, "staging",
+                in->async_copy_generated ? "promoted copy into workgroup memory"
+                                         : "copy into workgroup memory",
+                IR_DEVICE_FACT, headline, "Metal has no asynchronous copy",
+                "async-copy");
+  }
   if (in->async_copy_element_count <= 16) {
     for (uint32_t k = 0; k < in->async_copy_element_count; k++) {
       line(fn, "*(%s %s*)(%s + %zul) = *(%s %s*)(%s + %zul);",
@@ -3892,6 +4068,29 @@ static void emit_tensor_mma(MslFn *fn, const IRInstruction *in) {
               "and block-scaled int8 x int8/int4 exactly in scalar code",
               fn_name(fn));
     return;
+  }
+  if (fn->reported) {
+    char subject[64];
+    snprintf(subject, sizeof(subject), "tensor_mma m%un%uk%u",
+             (unsigned)desc->m, (unsigned)desc->n, (unsigned)desc->k);
+    if (native) {
+      report_note(fn, in, "tensor", subject, IR_DEVICE_GOOD,
+                  "simdgroup_matrix 8x8 tiles", NULL, "tensor-instruction");
+    } else {
+      report_note(fn, in, "tensor", subject, IR_DEVICE_FACT,
+                  "exact integer dot products in scalar code",
+                  "Apple GPUs have no integer matrix unit",
+                  "tensor-scalar");
+    }
+    if (native && tiles == 1 &&
+        (in->tensor_residency_role == IR_TENSOR_RESIDENCY_START ||
+         in->tensor_residency_role == IR_TENSOR_RESIDENCY_UPDATE) &&
+        resident_group(fn, in->tensor_residency_id)) {
+      report_note(fn, in, "tensor", subject, IR_DEVICE_GOOD,
+                  "the accumulator stays in simdgroup matrices across the "
+                  "region",
+                  NULL, "tensor-resident");
+    }
   }
   if (native) {
     line(fn, "simdgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);");
@@ -4643,6 +4842,11 @@ static void emit_body(MslFn *fn) {
   }
   if (structure.uses_exit) {
     line(fn, "int mtl_exit = 0;");
+    report_note(fn, NULL, "control", "control flow", IR_DEVICE_FACT,
+                "rebuilt with an exit variable tested after each loop",
+                "a branch leaves more than one loop at once, and Metal has no "
+                "goto",
+                "structured-exit");
   }
   declare_locals(fn);
   declare_residency(fn);
@@ -4656,6 +4860,7 @@ static void emit_helper(MslMod *m, MslSpec *spec, Sb *out) {
   helper_signature(m, spec, &signature);
   sb_free(&fn->out);
   fn->indent = 1;
+  report_function(fn);
   emit_body(fn);
   sb_printf(out, "%s {\n%s}\n\n", sb_str(&signature), sb_str(&fn->out));
   sb_free(&signature);
@@ -4750,6 +4955,7 @@ static void emit_kernel(MslMod *m, MslSpec *spec, Sb *out) {
   sb_puts(&signature, ")");
   sb_free(&fn->out);
   fn->indent = 1;
+  report_function(fn);
   for (size_t p = 0; p < func->parameter_count && !m->error; p++) {
     MslVar *var = func->parameter_names && func->parameter_names[p]
                       ? find_var(fn, func->parameter_names[p])
@@ -4994,6 +5200,10 @@ int msl_emit_program(IRProgram *program, FILE *out,
   }
   free(coherence);
   if (!m.error) {
+    char profile[32];
+    snprintf(profile, sizeof(profile), "%d.%d", m.options.version_major,
+             m.options.version_minor);
+    ir_explain_device_begin("metal", profile);
     analyze_all(&m);
   }
   for (size_t s = 0; s < m.nspecs && !m.error; s++) {
@@ -5016,6 +5226,29 @@ int msl_emit_program(IRProgram *program, FILE *out,
       sb_free(&proto);
       emit_helper(&m, spec, &helpers);
     }
+  }
+  for (size_t s = 0; s < m.nspecs && !m.error; s++) {
+    const IRFunction *func = m.specs[s].fn->func;
+    size_t copies = 0;
+    size_t first = s;
+    char headline[120];
+    for (size_t o = 0; o < m.nspecs; o++) {
+      if (m.specs[o].function_index == m.specs[s].function_index) {
+        copies++;
+        first = o < first ? o : first;
+      }
+    }
+    if (copies < 2 || first != s) {
+      continue;
+    }
+    snprintf(headline, sizeof(headline),
+             "compiled %zu times, once for each address space it is called "
+             "with",
+             copies);
+    ir_explain_device_note(func->name, func->location.line, "specialization",
+                           "helper", IR_DEVICE_FACT, headline,
+                           "Metal has no generic address space", NULL,
+                           "helper-specialized");
   }
   if (!m.error) {
     emit_prelude(&m, &prelude);

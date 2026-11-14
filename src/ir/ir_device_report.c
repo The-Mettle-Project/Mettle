@@ -237,9 +237,7 @@ int ir_device_report_storage_reason(const IRFunction *function,
   if (!cause[0]) {
     return 0;
   }
-  snprintf(reason, size, "%s, so %s", cause,
-           is_aggregate ? "its elements cannot each take a register"
-                        : "it needs an address");
+  snprintf(reason, size, "%s", cause);
   return 1;
 }
 

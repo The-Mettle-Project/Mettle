@@ -402,11 +402,18 @@ static void device_values_row(const IRDeviceFunction *entry) {
   long long registers = device_value(entry, IR_DEVICE_VALUES_IN_REGISTERS);
   long long memory = device_value(entry, IR_DEVICE_VALUES_IN_MEMORY);
   long long bytes = device_value(entry, IR_DEVICE_MEMORY_BYTES);
-  const char *where = device_is_metal() ? "thread memory" : "local memory";
+  const char *where = "local memory";
   if (registers == 0 && memory == 0) {
     return;
   }
-  if (memory == 0) {
+  if (device_is_metal() && memory == 0) {
+    snprintf(row, sizeof(row), "values: %lld scalars", registers);
+  } else if (device_is_metal()) {
+    snprintf(row, sizeof(row),
+             "values: %lld scalars, %lld arrays or records kept whole (%lld "
+             "bytes)",
+             registers, memory, bytes);
+  } else if (memory == 0) {
     snprintf(row, sizeof(row), "values: %lld in registers", registers);
   } else if (registers == 0) {
     snprintf(row, sizeof(row), "values: %lld in %s (%lld bytes)", memory, where,

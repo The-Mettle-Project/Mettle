@@ -11148,15 +11148,17 @@ static void ptx_mark_line(PtxFn *fn, size_t line) {
 static void ptx_report_memory_value(PtxEmit *e, const IRInstruction *in,
                                     const char *what, int aggregate,
                                     size_t bytes) {
-  char shown[128], subject[176], headline[96], reason[360];
+  char shown[128], subject[176], headline[96], cause[300], reason[380];
   int has_reason = 0;
   if (!e->fn.reported) return;
   ir_display_name(in->dest.name, shown, sizeof(shown));
   snprintf(subject, sizeof(subject), "%s `%s`", what, shown);
   snprintf(headline, sizeof(headline), "in local memory, %zu bytes", bytes);
   has_reason = ir_device_report_storage_reason(e->func, in->dest.name,
-                                               aggregate, reason,
-                                               sizeof(reason));
+                                               aggregate, cause, sizeof(cause));
+  snprintf(reason, sizeof(reason), "%s, so %s", cause,
+           aggregate ? "its elements cannot each take a register"
+                     : "it needs an address in memory");
   ir_explain_device_add(e->func->name, IR_DEVICE_VALUES_IN_MEMORY, 1);
   ir_explain_device_add(e->func->name, IR_DEVICE_MEMORY_BYTES,
                         (long long)bytes);
