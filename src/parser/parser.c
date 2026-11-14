@@ -2021,7 +2021,8 @@ static int parser_parse_tactic(Parser *parser, ParserTheorem *thm) {
   if (!parser_is_identifier_like(parser->current_token.type) ||
       !parser->current_token.value) {
     parser_set_error(parser, "Expected a tactic: smt, auto, unfold, "
-                             "induction, cases, assert, use, simp or show");
+                             "induction, cases, assert, use, rewrite, split, "
+                             "simp or show");
     return 0;
   }
   char *tactic = strdup(parser->current_token.value);
@@ -2030,7 +2031,8 @@ static int parser_parse_tactic(Parser *parser, ParserTheorem *thm) {
   parser_advance(parser);
   int ok = 1;
   if (strcmp(tactic, "smt") == 0 || strcmp(tactic, "auto") == 0 ||
-      strcmp(tactic, "simp") == 0 || strcmp(tactic, "show") == 0) {
+      strcmp(tactic, "simp") == 0 || strcmp(tactic, "show") == 0 ||
+      strcmp(tactic, "split") == 0) {
   } else if (strcmp(tactic, "unfold") == 0) {
     while (parser_is_identifier_like(parser->current_token.type) &&
            parser->current_token.value) {
@@ -2063,10 +2065,10 @@ static int parser_parse_tactic(Parser *parser, ParserTheorem *thm) {
     } else {
       ok = parser_theorem_term(parser, thm, "bool", expr);
     }
-  } else if (strcmp(tactic, "use") == 0) {
+  } else if (strcmp(tactic, "use") == 0 || strcmp(tactic, "rewrite") == 0) {
     if (!parser_is_identifier_like(parser->current_token.type) ||
         !parser->current_token.value) {
-      parser_set_error(parser, "Expected a theorem name after 'use'");
+      parser_set_error(parser, "Expected a theorem name after the tactic");
       ok = 0;
     } else {
       char *lemma = strdup(parser->current_token.value);
@@ -2102,10 +2104,10 @@ static int parser_parse_tactic(Parser *parser, ParserTheorem *thm) {
       free(lemma);
     }
   } else {
-    char message[160];
+    char message[200];
     snprintf(message, sizeof(message),
              "Unknown tactic '%s': expected smt, auto, unfold, induction, "
-             "cases, assert, use, simp or show",
+             "cases, assert, use, rewrite, split, simp or show",
              tactic);
     parser_set_error(parser, message);
     ok = 0;

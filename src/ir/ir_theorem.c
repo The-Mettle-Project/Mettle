@@ -1,5 +1,6 @@
 #include "ir_theorem.h"
 #include "ir_smt.h"
+#include "optimizer/ir_optimize_internal.h"
 #include "../common.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -67,6 +68,8 @@ typedef struct {
   int tactic_count;
   uint64_t smt_calls;
   uint64_t lemmas;
+  SmtResult last_result;
+  char last_detail[400];
 } Prover;
 
 static IRTheoremOptions g_options;
@@ -81,13 +84,25 @@ void ir_theorem_set_options(const IRTheoremOptions *options) {
 
 int ir_theorem_stop_after(void) { return g_options.stop_after; }
 
+static int function_has_prove_calls(const IRFunction *f) {
+  for (size_t i = 0; f && i < f->instruction_count; i++) {
+    const IRInstruction *insn = &f->instructions[i];
+    if (insn->op == IR_OP_CALL && insn->text &&
+        strcmp(insn->text, IR_SMT_PROVE_CALL) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int ir_program_has_theorems(const IRProgram *program) {
   if (!program) {
     return 0;
   }
   for (size_t i = 0; i < program->function_count; i++) {
     const IRFunction *f = program->functions[i];
-    if (f && f->rewrite_role == IR_THEOREM_ROLE_CLAIM) {
+    if (f && (f->rewrite_role == IR_THEOREM_ROLE_CLAIM ||
+              function_has_prove_calls(f))) {
       return 1;
     }
   }
@@ -984,7 +999,127 @@ static ThmEntry *thm_find(Prover *p, const char *name) {
   return NULL;
 }
 
+static int apply_induction(Prover *p, ThmGoal *g, size_t idx) {
+  SmtCtx *ctx = p->ctx;
+  ThmEntry *t = p->current;
+  int size = 8, is_unsigned = 0;
+  if (!ir_smt_parse_scalar(t->var_types[idx], &size, &is_unsigned)) {
+    return 0;
+  }
+  SmtTerm fresh[THM_MAX_VARS];
+  for (size_t v = 0; v < t->nvars; v++) {
+    char prefix[160];
+    snprintf(prefix, sizeof(prefix), "%s'", smt_term_name(ctx, t->vars[v]));
+    fresh[v] = smt_fresh(ctx, prefix, smt_bv_sort(ctx, 64));
+  }
+  unsigned nv = (unsigned)t->nvars;
+  SmtTerm premise = thm_lt(ctx, fresh[idx], t->vars[idx], size, is_unsigned);
+  for (size_t h = 0; h < g->nhyps; h++) {
+    if (smt_term_kind(ctx, g->hyps[h]) == SMT_K_FORALL) {
+      continue;
+    }
+    premise = smt_and(ctx, premise,
+                      smt_subst(ctx, g->hyps[h], nv, t->vars, fresh));
+  }
+  SmtTerm body = smt_implies(ctx, premise,
+                             smt_subst(ctx, g->concl, nv, t->vars, fresh));
+  for (size_t v = t->nvars; v-- > 0;) {
+    body = smt_forall(ctx, fresh[v], body);
+  }
+  goal_add(g, body);
+  return 1;
+}
+
+static int goal_has_induction(Prover *p, const ThmGoal *g) {
+  for (size_t h = 0; h < g->nhyps; h++) {
+    if (smt_term_kind(p->ctx, g->hyps[h]) == SMT_K_FORALL) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static size_t induction_candidates(Prover *p, const ThmGoal *g,
+                                   size_t *out, size_t cap) {
+  SmtCtx *ctx = p->ctx;
+  TermList apps = {NULL, 0, 0};
+  goal_apps(p, g, &apps, 0);
+  size_t n = 0;
+  for (size_t i = 0; i < apps.count && n < cap; i++) {
+    char name[256];
+    int is_trap;
+    if (!app_def_name(p, apps.items[i], name, sizeof(name), &is_trap)) {
+      continue;
+    }
+    ThmDef *d = def_get(p, name);
+    if (d->state != DEF_DEFINED || !d->recursive || d->measure < 0 ||
+        (unsigned)d->measure >= smt_term_nargs(ctx, apps.items[i])) {
+      continue;
+    }
+    SmtTerm arg = smt_term_arg(ctx, apps.items[i], (unsigned)d->measure);
+    for (size_t v = 0; v < p->current->nvars; v++) {
+      if (!smt_term_contains(ctx, arg, p->current->vars[v])) {
+        continue;
+      }
+      int seen = 0;
+      for (size_t k = 0; k < n; k++) {
+        seen |= out[k] == v;
+      }
+      if (!seen) {
+        out[n++] = v;
+      }
+    }
+  }
+  free(apps.items);
+  return n;
+}
+
+static int tactic_auto_once(Prover *p, char **names, size_t count,
+                            SmtAttempt *attempt);
+
 static int tactic_auto(Prover *p, char **names, size_t count, int quiet) {
+  SmtAttempt attempt;
+  ThmGoal backup;
+  goal_copy(&backup, &p->goals[0]);
+  if (tactic_auto_once(p, names, count, &attempt)) {
+    goal_free(&backup);
+    return 1;
+  }
+  if (!goal_has_induction(p, &backup)) {
+    size_t candidates[THM_MAX_VARS];
+    size_t nc = induction_candidates(p, &backup, candidates, THM_MAX_VARS);
+    for (size_t i = 0; i < nc; i++) {
+      goal_free(&p->goals[0]);
+      goal_copy(&p->goals[0], &backup);
+      SmtAttempt inner;
+      if (apply_induction(p, &p->goals[0], candidates[i]) &&
+          tactic_auto_once(p, names, count, &inner)) {
+        goal_free(&backup);
+        return 1;
+      }
+    }
+    if (nc) {
+      goal_free(&p->goals[0]);
+      goal_copy(&p->goals[0], &backup);
+    }
+  }
+  goal_free(&backup);
+  p->last_result = attempt.result;
+  snprintf(p->last_detail, sizeof(p->last_detail), "%s", attempt.detail);
+  if (!quiet) {
+    if (attempt.result == SMT_SAT) {
+      prover_error(p, "auto could not close the goal; with the definitions "
+                      "unfolded so far it fails at %s",
+                   attempt.detail);
+    } else {
+      prover_error(p, "auto could not close the goal: %s", attempt.detail);
+    }
+  }
+  return 0;
+}
+
+static int tactic_auto_once(Prover *p, char **names, size_t count,
+                            SmtAttempt *out) {
   ThmGoal *g = &p->goals[0];
   SmtAttempt attempt;
   attempt.result = SMT_UNKNOWN;
@@ -1000,21 +1135,14 @@ static int tactic_auto(Prover *p, char **names, size_t count, int quiet) {
       goal_free(g);
       memmove(&p->goals[0], &p->goals[1], (p->ngoals - 1) * sizeof(ThmGoal));
       p->ngoals--;
+      *out = attempt;
       return 1;
     }
     if (round == 1 || !goal_unfold(p, g, names, count, 2)) {
       break;
     }
   }
-  if (!quiet) {
-    if (attempt.result == SMT_SAT) {
-      prover_error(p, "auto could not close the goal; with the definitions "
-                      "unfolded so far it fails at %s",
-                   attempt.detail);
-    } else {
-      prover_error(p, "auto could not close the goal: %s", attempt.detail);
-    }
-  }
+  *out = attempt;
   return 0;
 }
 
@@ -1117,34 +1245,12 @@ static int run_tactic(Prover *p, char *line) {
       prover_error(p, "`%s` is not a parameter of the theorem", args[0]);
       return 0;
     }
-    int size = 8, is_unsigned = 0;
-    if (!ir_smt_parse_scalar(t->var_types[idx], &size, &is_unsigned)) {
+    if (!apply_induction(p, g, idx)) {
       prover_error(p, "induction needs an integer parameter, and `%s` has "
                       "type %s",
                    args[0], t->var_types[idx]);
       return 0;
     }
-    SmtTerm fresh[THM_MAX_VARS];
-    for (size_t v = 0; v < t->nvars; v++) {
-      char prefix[160];
-      snprintf(prefix, sizeof(prefix), "%s'", smt_term_name(ctx, t->vars[v]));
-      fresh[v] = smt_fresh(ctx, prefix, smt_bv_sort(ctx, 64));
-    }
-    unsigned nv = (unsigned)t->nvars;
-    SmtTerm premise = thm_lt(ctx, fresh[idx], t->vars[idx], size, is_unsigned);
-    for (size_t h = 0; h < g->nhyps; h++) {
-      if (smt_term_kind(ctx, g->hyps[h]) == SMT_K_FORALL) {
-        continue;
-      }
-      premise = smt_and(ctx, premise,
-                        smt_subst(ctx, g->hyps[h], nv, t->vars, fresh));
-    }
-    SmtTerm body = smt_implies(ctx, premise,
-                               smt_subst(ctx, g->concl, nv, t->vars, fresh));
-    for (size_t v = t->nvars; v-- > 0;) {
-      body = smt_forall(ctx, fresh[v], body);
-    }
-    goal_add(g, body);
     return 1;
   }
   if (strcmp(tactic, "cases") == 0 || strcmp(tactic, "assert") == 0) {
@@ -1170,6 +1276,108 @@ static int run_tactic(Prover *p, char *line) {
       goal_add(&two[1], c);
     }
     goals_replace_head(p, two, 2);
+    return 1;
+  }
+  if (strcmp(tactic, "split") == 0) {
+    SmtTerm left, right;
+    SmtTerm c = g->concl;
+    if (smt_term_kind(ctx, c) == SMT_K_AND) {
+      left = smt_term_arg(ctx, c, 0);
+      right = smt_term_arg(ctx, c, 1);
+    } else if (smt_term_kind(ctx, c) == SMT_K_NOT &&
+               smt_term_kind(ctx, smt_term_arg(ctx, c, 0)) == SMT_K_OR) {
+      SmtTerm o = smt_term_arg(ctx, c, 0);
+      left = smt_not(ctx, smt_term_arg(ctx, o, 0));
+      right = smt_not(ctx, smt_term_arg(ctx, o, 1));
+    } else {
+      prover_error(p, "split needs a goal that is a conjunction");
+      return 0;
+    }
+    ThmGoal two[2];
+    goal_copy(&two[0], g);
+    two[0].concl = left;
+    goal_copy(&two[1], g);
+    two[1].concl = right;
+    goals_replace_head(p, two, 2);
+    return 1;
+  }
+  if (strcmp(tactic, "rewrite") == 0) {
+    ThmEntry *lemma = nargs ? thm_find(p, args[0]) : NULL;
+    if (!lemma || lemma == p->current || !lemma->proved) {
+      prover_error(p, "rewrite needs an earlier proved theorem; `%s` is not "
+                      "one",
+                   nargs ? args[0] : "?");
+      return 0;
+    }
+    if (nargs - 1 != lemma->nvars) {
+      prover_error(p, "`%s` takes %zu arguments, given %zu", args[0],
+                   lemma->nvars, nargs - 1);
+      return 0;
+    }
+    SmtTerm values[THM_MAX_VARS];
+    for (size_t i = 0; i < lemma->nvars; i++) {
+      IRSmtOutcome o;
+      if (!encode_term_function(p, args[1 + i], &o)) {
+        return 0;
+      }
+      values[i] = o.result;
+    }
+    SmtTerm eq = lemma->statement;
+    if (smt_term_kind(ctx, eq) == SMT_K_AND) {
+      SmtTerm l = smt_term_arg(ctx, eq, 0), r = smt_term_arg(ctx, eq, 1);
+      eq = smt_term_kind(ctx, l) == SMT_K_EQ ? l : r;
+    }
+    if (smt_term_kind(ctx, eq) != SMT_K_EQ ||
+        !smt_sort_is_bv(ctx, smt_term_sort(ctx, smt_term_arg(ctx, eq, 0)))) {
+      prover_error(p, "`%s` does not state an equation", args[0]);
+      return 0;
+    }
+    unsigned nv = (unsigned)lemma->nvars;
+    SmtTerm from = smt_subst(ctx, smt_term_arg(ctx, eq, 0), nv, lemma->vars,
+                             values);
+    SmtTerm to = smt_subst(ctx, smt_term_arg(ctx, eq, 1), nv, lemma->vars,
+                           values);
+    SmtTerm fact = smt_subst(
+        ctx, smt_implies(ctx, lemma->assume, lemma->statement), nv,
+        lemma->vars, values);
+    SmtTerm side = smt_subst(ctx, lemma->assume, nv, lemma->vars, values);
+    int occurs = smt_term_contains(ctx, g->concl, from);
+    for (size_t h = 0; h < g->nhyps && !occurs; h++) {
+      occurs = smt_term_contains(ctx, g->hyps[h], from);
+    }
+    if (!occurs) {
+      SmtTerm t = from;
+      from = to;
+      to = t;
+      occurs = smt_term_contains(ctx, g->concl, from);
+      for (size_t h = 0; h < g->nhyps && !occurs; h++) {
+        occurs = smt_term_contains(ctx, g->hyps[h], from);
+      }
+    }
+    if (!occurs) {
+      prover_error(p, "neither side of `%s` at these arguments occurs in the "
+                      "goal",
+                   args[0]);
+      return 0;
+    }
+    ThmGoal two[2];
+    size_t count = 0;
+    if (side != smt_true(ctx)) {
+      goal_copy(&two[count], g);
+      two[count].concl = side;
+      count++;
+    }
+    goal_copy(&two[count], g);
+    two[count].concl = smt_replace(ctx, g->concl, 1, &from, &to);
+    for (size_t h = 0; h < two[count].nhyps; h++) {
+      if (smt_term_kind(ctx, two[count].hyps[h]) != SMT_K_FORALL) {
+        two[count].hyps[h] = smt_replace(ctx, two[count].hyps[h], 1, &from,
+                                         &to);
+      }
+    }
+    goal_add(&two[count], fact);
+    count++;
+    goals_replace_head(p, two, count);
     return 1;
   }
   if (strcmp(tactic, "use") == 0) {
@@ -1314,6 +1522,136 @@ static int prove_theorem(Prover *p, ThmEntry *t, const char *script) {
   return 1;
 }
 
+static int function_has_loop(const IRFunction *f) {
+  for (size_t i = 0; i < f->instruction_count; i++) {
+    const IRInstruction *insn = &f->instructions[i];
+    if ((insn->op != IR_OP_JUMP && insn->op != IR_OP_BRANCH_ZERO &&
+         insn->op != IR_OP_BRANCH_EQ) ||
+        !insn->text) {
+      continue;
+    }
+    for (size_t k = 0; k <= i; k++) {
+      if (f->instructions[k].op == IR_OP_LABEL && f->instructions[k].text &&
+          strcmp(f->instructions[k].text, insn->text) == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static void prove_site_error(const SourceLocation *at, const char *fn,
+                             const char *fmt, const char *detail) {
+  fprintf(stderr, "%s:%zu:%zu: error: prove in `%s` ",
+          at->filename ? at->filename : "?", at->line, at->column, fn);
+  fprintf(stderr, fmt, detail ? detail : "");
+  fputc('\n', stderr);
+}
+
+static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
+  SmtCtx *ctx = p->ctx;
+  int ok = 1;
+  ThmEntry temp;
+  memset(&temp, 0, sizeof(temp));
+  temp.name = f->name;
+  temp.claim = f;
+  temp.nvars = f->parameter_count < THM_MAX_VARS ? f->parameter_count
+                                                 : THM_MAX_VARS;
+  for (size_t v = 0; v < temp.nvars; v++) {
+    temp.vars[v] = smt_var(ctx, f->parameter_names[v], smt_bv_sort(ctx, 64));
+    temp.var_types[v] = f->parameter_types ? f->parameter_types[v] : "int64";
+  }
+  IRSmtFrame frame;
+  memset(&frame, 0, sizeof(frame));
+  frame.ctx = ctx;
+  frame.program = p->program;
+  frame.uf_calls = 1;
+  frame.havoc_loops = 1;
+  frame.record_proves = 1;
+  frame.param_count = temp.nvars;
+  frame.params = calloc(temp.nvars ? temp.nvars : 1, sizeof(SmtTerm));
+  memcpy(frame.params, temp.vars, temp.nvars * sizeof(SmtTerm));
+  IRSmtOutcome out;
+  if (f->parameter_count > THM_MAX_VARS ||
+      !ir_smt_encode(&frame, f, f->instructions, f->instruction_count,
+                     &out)) {
+    for (size_t i = 0; i < f->instruction_count; i++) {
+      const IRInstruction *insn = &f->instructions[i];
+      if (insn->op == IR_OP_CALL && insn->text &&
+          strcmp(insn->text, IR_SMT_PROVE_CALL) == 0) {
+        prove_site_error(&insn->location, f->name,
+                         "cannot be checked: the function %s",
+                         f->parameter_count > THM_MAX_VARS
+                             ? "takes more than 16 parameters"
+                             : out.why);
+      }
+    }
+    ir_smt_frame_free(&frame);
+    return 0;
+  }
+  int loops = function_has_loop(f);
+  ThmEntry *saved = p->current;
+  p->current = &temp;
+  for (size_t s = 0; s < frame.prove_count; s++) {
+    IRSmtProveSite *site = &frame.proves[s];
+    (*checked)++;
+    SmtTerm premise = smt_and(ctx, site->reach, smt_not(ctx, site->trap));
+    for (size_t i = 0; i < p->ngoals; i++) {
+      goal_free(&p->goals[i]);
+    }
+    if (p->capgoals == 0) {
+      p->capgoals = 8;
+      p->goals = malloc(p->capgoals * sizeof(ThmGoal));
+    }
+    goal_init(&p->goals[0], smt_implies(ctx, premise, site->condition));
+    p->ngoals = 1;
+    p->file = site->location.filename;
+    p->line = site->location.line;
+    p->column = site->location.column;
+    if (tactic_auto(p, NULL, 0, 1)) {
+      if (g_options.report) {
+        fprintf(stdout, "prove in %s at line %zu: proved\n", f->name,
+                site->location.line);
+      }
+      continue;
+    }
+    ok = 0;
+    if (p->last_result == SMT_SAT) {
+      prove_site_error(&site->location, f->name, "does not hold; it fails at %s",
+                       p->last_detail);
+    } else {
+      prove_site_error(&site->location, f->name, "could not be proved: %s",
+                       p->last_detail);
+    }
+    if (loops) {
+      fprintf(stderr, "  note: the prover reads every loop in `%s` as "
+                      "running any number of times from any state, so a "
+                      "fact a loop keeps has to follow from its own test\n",
+              f->name);
+    }
+  }
+  for (size_t i = 0; i < p->ngoals; i++) {
+    goal_free(&p->goals[i]);
+  }
+  p->ngoals = 0;
+  p->current = saved;
+  ir_smt_frame_free(&frame);
+  return ok;
+}
+
+static void strip_prove_calls(IRProgram *program) {
+  for (size_t i = 0; i < program->function_count; i++) {
+    IRFunction *f = program->functions[i];
+    for (size_t k = 0; f && k < f->instruction_count; k++) {
+      IRInstruction *insn = &f->instructions[k];
+      if (insn->op == IR_OP_CALL && insn->text &&
+          strcmp(insn->text, IR_SMT_PROVE_CALL) == 0) {
+        ir_instruction_make_nop(insn);
+      }
+    }
+  }
+}
+
 int ir_theorems_check(IRProgram *program) {
   if (!ir_program_has_theorems(program)) {
     return 1;
@@ -1366,11 +1704,33 @@ int ir_theorems_check(IRProgram *program) {
       p.errors++;
     }
   }
+  int sites = 0, sites_failed = 0;
+  for (size_t i = 0; i < program->function_count; i++) {
+    const IRFunction *f = program->functions[i];
+    if (!f || f->rewrite_role || !function_has_prove_calls(f)) {
+      continue;
+    }
+    int before = sites;
+    if (!check_prove_sites(&p, f, &sites)) {
+      p.errors++;
+      sites_failed++;
+    }
+    (void)before;
+  }
+  strip_prove_calls(program);
   if (g_options.report) {
-    fprintf(stdout, "%d of %d theorem%s proved; %llu refutation lemmas "
-                    "checked\n",
-            proved, total, total == 1 ? "" : "s",
-            (unsigned long long)p.lemmas);
+    if (total) {
+      fprintf(stdout, "%d of %d theorem%s proved; %llu refutation lemmas "
+                      "checked\n",
+              proved, total, total == 1 ? "" : "s",
+              (unsigned long long)p.lemmas);
+    }
+    if (sites) {
+      fprintf(stdout, "%d prove site%s checked, in %d function%s that "
+                      "failed\n",
+              sites, sites == 1 ? "" : "s", sites_failed,
+              sites_failed == 1 ? "" : "s");
+    }
   }
   for (size_t i = 0; i < p.ngoals; i++) {
     goal_free(&p.goals[i]);

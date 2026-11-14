@@ -1549,6 +1549,29 @@ static int ir_lower_builtin_call(IRLoweringContext *context, IRFunction *functio
     return 1;
   }
 
+  if (strcmp(call->function_name, "__mettle_prove") == 0 &&
+      call->argument_count == 1) {
+    IROperand condition = ir_operand_none();
+    if (!ir_lower_expression(context, function, call->arguments[0],
+                             &condition)) {
+      return 0;
+    }
+    IRInstruction instruction = {0};
+    instruction.op = IR_OP_CALL;
+    instruction.text = (char *)"__mettle_prove";
+    instruction.location = expression->location;
+    instruction.dest = ir_operand_none();
+    instruction.arguments = &condition;
+    instruction.argument_count = 1;
+    int emitted = ir_emit(context, function, &instruction);
+    ir_operand_destroy(&condition);
+    if (!emitted) {
+      return 0;
+    }
+    *out_value = ir_operand_none();
+    return 1;
+  }
+
   if (strcmp(call->function_name, "syscall") == 0) {
     if (call->argument_count == 0) {
       ir_set_error(context, "Malformed system call reached IR lowering");

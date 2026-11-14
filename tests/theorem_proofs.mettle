@@ -90,6 +90,33 @@ theorem gauss(n: uint64) {
     auto;
 }
 
+fn double(x: uint64) -> uint64 {
+    return x + x;
+}
+
+theorem double_is_shift(x: uint64) {
+    double(x) == x << 1
+} by auto;
+
+theorem quadruple(x: uint64) {
+    double(double(x)) == x << 2 && double(x) >= 0
+} proof {
+    split;
+    rewrite double_is_shift(double(x));
+    rewrite double_is_shift(x);
+    smt;
+    auto;
+}
+
+fn triangle(n: uint64) -> uint64 {
+    if (n == 0) { return 0; }
+    return triangle(n - 1) + n;
+}
+
+theorem triangle_without_a_script(n: uint64) {
+    triangle(n) * 2 == n * n + n
+} by auto;
+
 fn popcount_loop_free(x: uint32) -> uint32 {
     var a: uint32 = x - ((x >> 1) & 1431655765);
     var b: uint32 = (a & 858993459) + ((a >> 2) & 858993459);

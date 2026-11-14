@@ -24,6 +24,7 @@ checksum (loop @ line 3): vectorized -> vpsadbw, 32-wide byte sum (AVX2)
 - [GPU kernels](docs/gpu.md). A kernel is a Mettle function, compiled to PTX, SPIR-V or Metal.
 - [Explain](docs/explain.md). `--explain` reports what the compiler did with every loop and call, and what it took on trust.
 - [Rules](docs/rules.md). A rule is a function you write that runs in the compiler and can stop the build.
+- [Proofs](docs/proofs.md). A `theorem` about your functions is proved by induction, lemmas and an SMT solver on every build, and the compiler proves its own rewrites and division lowering with the same solver.
 - [Inferred lifetimes](docs/borrow-checker.md). The compiler works out ownership from the whole program. You write no annotations.
 - [Metaprogramming](docs/metaprogramming.md). Layouts, optimizer passes and register allocators are Mettle functions.
 - [Bare metal](docs/bare-metal.md). A target is described in Mettle, down to a boot sector or an instruction set you made up.

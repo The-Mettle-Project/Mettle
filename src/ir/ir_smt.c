@@ -42,6 +42,7 @@ typedef struct {
   SmtTerm trap;
   SmtTerm returned;
   const char *prefix;
+  size_t *loop_end;
   int failed;
   char why[192];
 } IrsEnc;
@@ -351,7 +352,9 @@ static void irs_edge(IrsEnc *e, size_t at, const char *label, SmtTerm cond) {
     return;
   }
   if (target <= at) {
-    irs_fail(e, "it has a loop", NULL);
+    if (!e->frame->havoc_loops) {
+      irs_fail(e, "it has a loop", NULL);
+    }
     return;
   }
   SmtTerm reach = smt_and(e->ctx, e->reach, cond);
@@ -498,6 +501,22 @@ static void irs_call_uf(IrsEnc *e, const IRInstruction *insn) {
 
 static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   SmtCtx *ctx = e->ctx;
+  if (insn->text && strcmp(insn->text, IR_SMT_PROVE_CALL) == 0) {
+    IRSmtFrame *f = e->frame;
+    if (f->record_proves && !e->prefix && insn->argument_count == 1) {
+      SmtTerm cond = irs_nonzero(ctx, irs_read(e, &insn->arguments[0]));
+      if (f->prove_count == f->prove_cap) {
+        f->prove_cap = f->prove_cap ? f->prove_cap * 2u : 8u;
+        f->proves = realloc(f->proves, f->prove_cap * sizeof(IRSmtProveSite));
+      }
+      IRSmtProveSite *site = &f->proves[f->prove_count++];
+      site->reach = e->reach;
+      site->trap = e->trap;
+      site->condition = cond;
+      site->location = insn->location;
+    }
+    return;
+  }
   if (e->frame->uf_calls) {
     irs_call_uf(e, insn);
     return;
@@ -547,10 +566,34 @@ static void irs_call(IrsEnc *e, const IRInstruction *insn) {
   free(sub.vars);
   free(sub.buckets);
   free(sub.env);
+  free(sub.loop_end);
   for (size_t k = 0; k < sub.nedges; k++) {
     free(sub.edges[k].env);
   }
   free(sub.edges);
+}
+
+static void irs_havoc_loop(IrsEnc *e, size_t header, size_t end) {
+  SmtCtx *ctx = e->ctx;
+  for (size_t i = header; i <= end && i < e->count; i++) {
+    const IROperand *dest = &e->insns[i].dest;
+    if ((dest->kind != IR_OPERAND_TEMP && dest->kind != IR_OPERAND_SYMBOL) ||
+        !dest->name) {
+      continue;
+    }
+    size_t id = irs_var_lookup(e, dest->name, 1);
+    IrsVar *v = &e->vars[id];
+    if (dest->kind == IR_OPERAND_SYMBOL && !v->declared && !v->param) {
+      irs_fail(e, "a loop writes the global", dest->name);
+      return;
+    }
+    char prefix[160];
+    snprintf(prefix, sizeof(prefix), "loop:%s", dest->name);
+    SmtTerm fresh = smt_fresh(ctx, prefix, irs_word(ctx));
+    e->env[id] = v->size > 0 && v->size < 8
+                     ? ir_smt_narrow(ctx, fresh, v->size, v->is_unsigned)
+                     : fresh;
+  }
 }
 
 static void irs_step(IrsEnc *e, size_t pc) {
@@ -558,6 +601,10 @@ static void irs_step(IrsEnc *e, size_t pc) {
   const IRInstruction *insn = &e->insns[pc];
   if (insn->op == IR_OP_LABEL) {
     irs_merge(e, pc);
+    if (e->frame->havoc_loops && e->loop_end && e->loop_end[pc] > pc &&
+        e->reach != smt_false(ctx)) {
+      irs_havoc_loop(e, pc, e->loop_end[pc]);
+    }
     return;
   }
   if (e->reach == smt_false(ctx) && insn->op != IR_OP_NOP) {
@@ -742,6 +789,21 @@ static int irs_run(IrsEnc *e) {
     }
   }
   e->env = calloc(e->nvars ? e->nvars : 1u, sizeof(SmtTerm));
+  if (e->frame->havoc_loops && !e->prefix) {
+    e->loop_end = calloc(e->count ? e->count : 1u, sizeof(size_t));
+    for (size_t pc = 0; pc < e->count; pc++) {
+      const IRInstruction *insn = &e->insns[pc];
+      if ((insn->op != IR_OP_JUMP && insn->op != IR_OP_BRANCH_ZERO &&
+           insn->op != IR_OP_BRANCH_EQ) ||
+          !insn->text) {
+        continue;
+      }
+      size_t target = irs_label(e, insn->text);
+      if (target != (size_t)-1 && target <= pc && e->loop_end[target] < pc) {
+        e->loop_end[target] = pc;
+      }
+    }
+  }
   for (size_t i = 0; i < fn->parameter_count; i++) {
     size_t id = irs_var_lookup(e, fn->parameter_names[i], 0);
     e->env[id] = ir_smt_narrow(ctx, e->params[i], e->vars[id].size,
@@ -790,6 +852,7 @@ void ir_smt_frame_free(IRSmtFrame *frame) {
   free(frame->shared);
   free(frame->params);
   free(frame->calls);
+  free(frame->proves);
   memset(frame, 0, sizeof(*frame));
 }
 
@@ -812,6 +875,7 @@ int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
   free(e.vars);
   free(e.buckets);
   free(e.env);
+  free(e.loop_end);
   for (size_t k = 0; k < e.nedges; k++) {
     free(e.edges[k].env);
   }

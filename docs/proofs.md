@@ -58,6 +58,37 @@ by zero traps and `INT64_MIN / -1` wraps.
 Theorems are checked on every build, with or without `-O`. They are dropped
 before code generation and cost nothing at run time.
 
+## prove inside a function
+
+`prove(condition)` states a fact at a point in a function body. The compiler
+proves it holds on every path that reaches the call, for every value of the
+function's parameters, and the call compiles to nothing:
+
+```mettle
+fn clamp_index(i: int64, n: int64) -> int64 {
+    if (n <= 0) { return 0; }
+    var j: int64 = i;
+    if (j < 0) { j = 0; }
+    if (j >= n) { j = n - 1; }
+    prove(j >= 0 && j < n);
+    return j;
+}
+```
+
+A `prove` that does not hold stops the build with the parameter values that
+break it:
+
+```text
+halve.mettle:3:10: error: prove in `halve` does not hold; it fails at x = 3
+```
+
+Each site is closed by `auto`, so calls are unfolded and induction is tried
+the same way. A loop is read as running any number of times from any state:
+on entry to a loop, every variable the loop writes may hold any value. A
+`prove` inside or after a loop can rely on the loop's own test and on what the
+loop leaves alone. That reading covers every run the program can make, so a
+proof under it holds for the program.
+
 ## How the prover sees a function
 
 A call stays a call until a tactic unfolds it. Unfolding replaces the call
@@ -95,7 +126,9 @@ all over the theorem's parameters. Tactics act on the first goal.
 - `smt` closes the goal if the solver proves the hypotheses imply the
   conclusion.
 - `auto` unfolds defined functions that do not recurse, tries `smt`, then
-  unfolds recursive functions one level and tries again.
+  unfolds recursive functions one level and tries again. If that fails and the
+  goal calls a recursive function whose decreasing argument mentions a
+  parameter, it tries induction on that parameter.
 - `unfold f, g` replaces every call to the named functions with their bodies,
   one level. With no names it unfolds every defined function.
 - `induction n` adds the strong induction hypothesis on parameter `n`: the
@@ -107,6 +140,11 @@ all over the theorem's parameters. Tactics act on the first goal.
   after it.
 - `use t(a, b)` adds an earlier proved theorem `t`, instantiated at the given
   arguments, as a hypothesis.
+- `rewrite t(a, b)` takes an earlier proved theorem whose claim is an
+  equation, instantiates it, and replaces its left side with its right side
+  in the goal, or the right with the left when only the right occurs. When
+  `t` has a `where` clause, the instantiated clause becomes the next goal.
+- `split` turns a goal `a && b` into two goals.
 - `simp` rewrites the goal into the normal form the solver uses.
 - `show` prints the goals.
 
@@ -176,14 +214,20 @@ SAT solver never sees it. Inside a negated equation it also writes `v` as
 `2^k * (v >> k) + (v & (2^k - 1))` when both pieces appear, which is how
 `mul_splits_low_bit` is proved without a multiplier circuit.
 
-The SAT solver uses two watched literals with blocking literals, VSIDS
-decisions with phase saving, first-UIP learning with recursive minimization,
-restarts driven by the moving average of clause quality, and clause deletion
-by literal block distance.
+The SAT solver eliminates variables by bounded resolution before the search,
+then uses two watched literals with blocking literals, VSIDS decisions with
+phase saving, first-UIP learning with recursive minimization, restarts driven
+by the moving average of clause quality, and clause deletion by literal block
+distance. A satisfying assignment is extended back over the eliminated
+variables from the clauses they removed.
 
-Every `unsat` answer is replayed through an independent DRUP checker that
-shares no code with the SAT solver. A refutation that fails the replay turns
-the answer into `unknown`. Every `sat` answer is checked by evaluating the
+Every `unsat` answer comes with a refutation: each learned clause, each
+resolvent from variable elimination and each fact derived at the top level
+is logged with the clauses it was derived from. An independent checker that
+shares no code with the SAT solver walks back from the final conflict, marks
+the clauses it depends on, and confirms each marked clause by unit
+propagation over those clauses alone. A refutation that fails the check
+turns the answer into `unknown`. Every `sat` answer is checked by evaluating the
 original assertions on the model. A wrong answer from the search therefore
 cannot reach a proof. The bit-blaster, the simplifier and the normalizer are
 checked by a differential fuzzer that compares each against the evaluator.
@@ -202,7 +246,10 @@ mettle smt --stats problem.smt2
 `assert`, `push`, `pop`, `check-sat`, `get-model`, `get-value` and `echo`, with
 the `QF_ABV` operators, indexed operators, `let` and `ite`. `--stats` prints
 the term, gate, clause and conflict counts and the time spent blasting,
-searching and checking. `--no-certify` skips the refutation check.
+searching and checking. `--no-certify` skips the refutation check and
+`--no-normalize` skips the polynomial normal form. A file ending in `.cnf`,
+or any file with `--dimacs`, is read as DIMACS CNF and handed to the SAT
+solver directly, with the same refutation check.
 
 ## The compiler proves its own rewrites
 
@@ -257,6 +304,11 @@ sequence off by one, every affected divisor is refuted with a dividend:
 
 With the rounding bias removed from the signed power-of-two sequence, 250
 cases are refuted the same way.
+
+Last, it proves the backend's strength-reduction classifier in
+`src/codegen/binary/strength_rules.c`: every multiplication by `2^k`,
+`2^k + 1` or `2^k - 1` it rewrites into a shift, a shift and add, or a shift
+and subtract equals the multiplication, signed and unsigned.
 
 [Rewrite rules](rewrite-rules.md) are proved for every input before the
 compiler applies them, and fall back to generated inputs only when the solver

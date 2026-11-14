@@ -1269,7 +1269,7 @@ static OwnCtx own_node_value_ctx(OwnWalker *w, ASTNode *node) {
 static int own_is_named_builtin(const char *name) {
   static const char *const names[] = {"sizeof",   "typeof",  "offsetof",
                                       "layoutof", "textof",  "fieldof",
-                                      "static_assert"};
+                                      "static_assert", "__mettle_prove"};
   for (size_t i = 0; name && i < sizeof(names) / sizeof(names[0]); i++) {
     if (strcmp(name, names[i]) == 0) {
       return 1;

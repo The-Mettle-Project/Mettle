@@ -3454,6 +3454,34 @@ static Type *type_checker_infer_named_builtin(TypeChecker *checker,
                : NULL;
   }
 
+  if (!call->object && strcmp(call->function_name, "prove") == 0 &&
+      !symbol_table_peek(checker->symbol_table, "prove")) {
+    if (call->argument_count != 1 || !call->arguments[0]) {
+      type_checker_set_error_at_location(
+          checker, expression->location,
+          "prove takes one condition, a bool the compiler proves holds "
+          "whenever the call is reached");
+      return NULL;
+    }
+    Type *condition = type_checker_infer_type(checker, call->arguments[0]);
+    if (!condition) {
+      return NULL;
+    }
+    if (condition->kind != TYPE_BOOL) {
+      type_checker_set_error_at_location(
+          checker, call->arguments[0]->location,
+          "prove needs a bool condition, found '%s'",
+          condition->name ? condition->name : "?");
+      return NULL;
+    }
+    call->function_name = (char *)string_intern("__mettle_prove");
+    return checker->builtin_void;
+  }
+
+  if (strcmp(call->function_name, "__mettle_prove") == 0 && !call->object) {
+    return checker->builtin_void;
+  }
+
   if (strcmp(call->function_name, "__mtl_interp") == 0) {
     return type_checker_interp_builtin(checker, call, expression);
   }

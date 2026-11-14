@@ -1,0 +1,7 @@
+fn halve(x: int32) -> int32 {
+    var h: int32 = x / 2;
+    prove(h + h == x);
+    return h;
+}
+
+fn main() -> int32 { return halve(8); }

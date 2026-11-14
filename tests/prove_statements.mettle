@@ -1,0 +1,33 @@
+fn clamp_index(i: int64, n: int64) -> int64 {
+    if (n <= 0) { return 0; }
+    var j: int64 = i;
+    if (j < 0) { j = 0; }
+    if (j >= n) { j = n - 1; }
+    prove(j >= 0 && j < n);
+    return j;
+}
+
+fn average(a: uint32, b: uint32) -> uint32 {
+    var lo: uint32 = a & b;
+    var hi: uint32 = (a ^ b) >> 1;
+    prove(lo + hi >= lo);
+    return lo + hi;
+}
+
+fn sum_below(n: int64) -> int64 {
+    var total: int64 = 0;
+    var i: int64 = 0;
+    while (i < n) {
+        prove(i < n);
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() -> int32 {
+    if (clamp_index(7, 5) != 4) { return 1; }
+    if (average(6, 10) != 8) { return 2; }
+    if (sum_below(4) != 6) { return 3; }
+    return 0;
+}

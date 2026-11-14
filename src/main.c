@@ -5107,7 +5107,10 @@ int main(int argc, char *argv[]) {
              "src/codegen/binary/mir_lower.c, proved against the same "
              "semantics:\n");
       int division_ok = mir_prove_divmod_lowering(stdout, verbose);
-      return identities_ok && division_ok ? 0 : 1;
+      printf("\nMultiplication by a constant as classified in "
+             "src/codegen/binary/strength_rules.c:\n");
+      int strength_ok = mir_prove_strength_table(stdout, verbose);
+      return identities_ok && division_ok && strength_ok ? 0 : 1;
     }
     if (strcmp(argv[1], "why") == 0) {
       if (argc < 5) {
@@ -6137,12 +6140,12 @@ static int compile_lower_to_ir(ASTNode *program, TypeChecker *type_checker,
     error_reporter_print_errors(type_checker->error_reporter);
     return 0;
   }
-  if (*out_ir_program && (ir_program_has_theorems(*out_ir_program) ||
-                          ir_theorem_stop_after())) {
+  int has_proofs = *out_ir_program && ir_program_has_theorems(*out_ir_program);
+  if (*out_ir_program && (has_proofs || ir_theorem_stop_after())) {
     int proved = ir_theorems_check(*out_ir_program);
     if (ir_theorem_stop_after()) {
-      if (!ir_program_has_theorems(*out_ir_program)) {
-        printf("no theorems in this program\n");
+      if (!has_proofs) {
+        printf("no theorems or prove calls in this program\n");
       }
       g_theorem_status = proved ? 0 : 1;
       return 0;

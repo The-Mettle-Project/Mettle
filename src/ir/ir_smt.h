@@ -24,6 +24,13 @@ typedef struct {
 } IRSmtCallSite;
 
 typedef struct {
+  SmtTerm reach;
+  SmtTerm trap;
+  SmtTerm condition;
+  SourceLocation location;
+} IRSmtProveSite;
+
+typedef struct {
   SmtCtx *ctx;
   SmtTerm *params;
   size_t param_count;
@@ -36,7 +43,14 @@ typedef struct {
   IRSmtCallSite *calls;
   size_t call_count;
   size_t call_cap;
+  int havoc_loops;
+  int record_proves;
+  IRSmtProveSite *proves;
+  size_t prove_count;
+  size_t prove_cap;
 } IRSmtFrame;
+
+#define IR_SMT_PROVE_CALL "__mettle_prove"
 
 SmtFunc ir_smt_value_func(SmtCtx *ctx, const char *name, size_t arity);
 SmtFunc ir_smt_trap_func(SmtCtx *ctx, const char *name, size_t arity);

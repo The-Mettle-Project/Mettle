@@ -1127,6 +1127,19 @@ $cases = @(
     Args          = @()
   },
   @{
+    Name          = "prove_statements"
+    Path          = "tests/prove_statements.mettle"
+    ShouldSucceed = $true
+    Args          = @()
+  },
+  @{
+    Name          = "err_prove_statement"
+    Path          = "tests/err_prove_statement.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'prove in `halve` does not hold; it fails at x = '
+  },
+  @{
     Name          = "err_theorem_counterexample"
     Path          = "tests/err_theorem_counterexample.mettle"
     ShouldSucceed = $false
@@ -4796,13 +4809,14 @@ try {
   $out = & $CompilerPath prove "tests/theorem_proofs.mettle" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "mettle prove failed: $out" }
   if ($out -notmatch "theorem gauss: proved") { throw "no report for gauss: $out" }
-  if ($out -notmatch "11 of 11 theorems proved") { throw "not every theorem proved: $out" }
+  if ($out -notmatch "14 of 14 theorems proved") { throw "not every theorem proved: $out" }
   $out = "unfold sum_to`nsmt`n" | & $CompilerPath prove "tests/theorem_proofs.mettle" --interactive gauss 2>&1 | Out-String
   if ($out -notmatch "theorem gauss, interactive") { throw "interactive mode did not start: $out" }
   $out = & $CompilerPath prove-compiler --quiet 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "a peephole identity was refuted: $out" }
   if ($out -notmatch "30 identities, 570 obligations .* 0 refuted") { throw "identity proof summary changed: $out" }
   if ($out -notmatch "1230 constant divisions lowered by mir_emit_const_divmod: 1230 proved, 0 refuted, 0 not decided") { throw "division lowering proof summary changed: $out" }
+  if ($out -notmatch "370 multiplications classified by cg_strength_classify: 370 proved, 0 refuted") { throw "strength table proof summary changed: $out" }
   $out = & $CompilerPath smt "tests/smt_bitvector.smt2" 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "mettle smt failed: $out" }
   $expected = "strength reduction\s+unsat\s+magic division without the fixup\s+sat\s+\(\(x #x6fffffff\)\)\s+read over write\s+unsat\s+uninterpreted function congruence\s+unsat\s+a satisfiable store\s+sat"
