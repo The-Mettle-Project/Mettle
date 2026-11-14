@@ -1212,7 +1212,7 @@ $cases = @(
     Path          = "tests/err_loop_invariant.mettle"
     ShouldSucceed = $false
     Args          = @()
-    Pattern       = 'invariant in `double_up` does not hold \(the invariant after an iteration\); it fails at'
+    Pattern       = 'invariant in `double_up` does not hold \(the invariant after an iteration\); it may fail at'
   },
   @{
     Name          = "err_prove_global_call"

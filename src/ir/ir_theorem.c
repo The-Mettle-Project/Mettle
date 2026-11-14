@@ -1813,7 +1813,8 @@ static int check_prove_sites(Prover *p, const IRFunction *f, int *checked) {
                "value of a global, or result of a call%%s",
                kind);
     } else if (p->last_result == SMT_SAT) {
-      snprintf(fmt, sizeof(fmt), "does not hold%s; it fails at %%s", kind);
+      snprintf(fmt, sizeof(fmt), "does not hold%s; it %s at %%s", kind,
+               loops ? "may fail" : "fails");
     } else {
       snprintf(fmt, sizeof(fmt), "could not be proved%s: %%s", kind);
     }

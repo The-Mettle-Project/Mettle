@@ -1,10 +1,12 @@
 # Proofs
 
 Mettle carries a theorem prover and an SMT solver inside the compiler. A
-`theorem` states a claim about your functions, a proof script guides the
-prover, and the build fails when a proof does not go through. The same
-solver proves the optimizer's own rewrites and checks your `rewrite` rules
-and the passes `--verify` watches.
+`theorem` states a claim about your functions, a `prove` states one at a
+point inside a function, a proof script guides the prover, and the build
+fails when a proof does not go through. Claims range over integers, pointers
+and memory, and IEEE floats. The same solver proves the optimizer's own
+rewrites and checks your `rewrite` rules and the passes `--verify` watches,
+loops and calls included.
 
 ```mettle
 fn mul_by_shifts(x: uint64, c: uint64) -> uint64 {
@@ -117,7 +119,7 @@ from the test, derives `i == n`, substitutes it, and the `prove` follows. An
 invariant that the body breaks is reported with the values that break it:
 
 ```text
-loop.mettle:5:18: error: invariant in `double_up` does not hold (the invariant after an iteration); it fails at n = 4294967294
+loop.mettle:5:18: error: invariant in `double_up` does not hold (the invariant after an iteration); it may fail at n = 4294967294
 ```
 
 Simple invariants are found without being written. For every variable the
