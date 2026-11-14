@@ -5480,7 +5480,7 @@ try {
   $flat = $out -replace ("[" + [char]13 + [char]10 + "]"), ""
   if ($flat -notmatch "shared g_world: world_add \(Sim\), world_present \(Render\), ordered by an effect both require") { throw "the shared world is not on the ledger: $out" }
   if ($flat -notmatch "deadline blend: \d+ of 1200 cycles") { throw "the blend's deadline is not on the ledger: $out" }
-  if ($flat -notmatch "schedules: 1 read as data, 3 phases, 5 functions generated") { throw "the schedule is not on the ledger: $out" }
+  if ($flat -notmatch "schedules: 1 read as data, 3 phases, 7 functions generated") { throw "the schedule is not on the ledger: $out" }
   if ($flat -notmatch "rule jobs_never_allocate: pass") { throw "the job rule did not run: $out" }
   if ($flat -notmatch "rule every_phase_has_an_entry: pass") { throw "the phase rule did not run: $out" }
   $run = & $exe 2>&1 | Out-String
@@ -5492,6 +5492,14 @@ try {
   if ($ex -notmatch "fn FRAME_thread_1") { throw "expand does not print the worker's dispatcher: $ex" }
 
   $source = Get-Content "examples/engine/engine.mettle" -Raw
+  $late = Join-Path $tmpDir "engine_late_input.mettle"
+  Set-Content -Path $late -Value ($source -replace "(?m)^fn read_input\(\) \{", "fn read_input() {`n  var spin: volatile int64 = 0;`n  while (spin < 50000000) { spin = spin + 1; }") -Encoding UTF8
+  $lateExe = Join-Path $tmpDir "engine_late_input.exe"
+  $out = & $CompilerPath --build $late -o $lateExe 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "the engine with a slow input phase failed to build: $out" }
+  $run = & $lateExe 2>&1 | Out-String
+  if ($run -notmatch "jobs 8 of 8") { throw "the simulation ran before a slow input phase finished: $run" }
+
   $cross = Join-Path $tmpDir "engine_cross.mettle"
   Set-Content -Path $cross -Value ($source -replace "(?m)^fn read_input\(\) \{", "fn read_input() {`n  world_add(1);") -Encoding UTF8
   $out = & $CompilerPath --build $cross -o (Join-Path $tmpDir "engine_cross.exe") 2>&1 | Out-String

@@ -19,8 +19,8 @@ struct Job {
 }
 
 const FRAME: Schedule[3] = [
-  { phase: "input", effect: "Input", entry: "read_input", thread: 0 },
-  { phase: "simulate", effect: "Sim", entry: "step_world", thread: 1 },
+  { phase: "input", effect: "Input", entry: "read_input", thread: 0, joins: true },
+  { phase: "simulate", effect: "Sim", entry: "step_world", thread: 1, joins: true },
   { phase: "present", effect: "Render", entry: "draw_world", thread: 0 },
 ];
 

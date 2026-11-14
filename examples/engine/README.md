@@ -44,7 +44,7 @@ mettle --build examples/engine/engine.mettle -o engine.exe --report-deadlines --
 ```text
 shared g_world: world_add (Sim), world_present (Render), ordered by an effect both require
 deadline blend: 614 of 1200 cycles, 585 to spare, proven from the cost model
-schedules: 1 read as data, 3 phases, 5 functions generated
+schedules: 1 read as data, 3 phases, 7 functions generated
 ```
 
 ## What it declines to claim
