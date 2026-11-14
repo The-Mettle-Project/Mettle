@@ -1,4 +1,6 @@
 #include "ptx_emitter.h"
+#include "ir/ir_device_report.h"
+#include "ir/ir_explain_device.h"
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
@@ -105,6 +107,9 @@ typedef struct {
   int isa_minor;
   int tensor_tuple_budget;
   int rounded_arithmetic;
+  int reported;
+  size_t *line_marks;
+  size_t line_mark_count, line_mark_capacity;
   char *error;
 } PtxFn;
 
@@ -944,13 +949,64 @@ static const MtlcType *ptx_load_pointer_type(const IRProgram *program,
   return NULL;
 }
 
+static void ptx_report_vector_subject(const IRFunction *func, size_t head,
+                                      const IROperand *base, const char *what,
+                                      size_t count, char *subject,
+                                      size_t size) {
+  const char *root = ir_device_report_address_root(func, head, base);
+  char shown[128];
+  if (root) {
+    ir_display_name(root, shown, sizeof(shown));
+    snprintf(subject, size, "%zu %s from `%s`", count, what, shown);
+  } else {
+    snprintf(subject, size, "%zu %s", count, what);
+  }
+}
+
+static void ptx_report_vector_decline(const IRFunction *func,
+                                      size_t head, const IROperand *base,
+                                      const MtlcType *pointer_type,
+                                      size_t stride, size_t found) {
+  size_t width = found >= 4 ? 4 : 2;
+  char subject[200], reason[240], fix[200];
+  ptx_report_vector_subject(func, head, base, "adjacent loads", found, subject,
+                            sizeof(subject));
+  if (pointer_type->pointee_align) {
+    snprintf(reason, sizeof(reason),
+             "the pointer's type declares %zu byte alignment, and one load of "
+             "%zu elements needs %zu",
+             pointer_type->pointee_align, width, stride * width);
+  } else {
+    snprintf(reason, sizeof(reason),
+             "the pointer's type declares no alignment, and one load of %zu "
+             "elements needs %zu bytes",
+             width, stride * width);
+  }
+  if (base && base->kind == IR_OPERAND_SYMBOL) {
+    snprintf(fix, sizeof(fix), "declare `align(%zu)` in the pointer's type",
+             stride * width);
+  } else {
+    snprintf(fix, sizeof(fix),
+             "cast the address the loads start from to a pointer type with "
+             "`align(%zu)`; the cast is accepted where the offset is proven a "
+             "multiple of %zu",
+             stride * width, stride * width);
+  }
+  ir_explain_device_note_site(func->name, func->instructions[head].location.line,
+                              "vector", subject, IR_DEVICE_MISS,
+                              "kept as separate loads", reason, fix,
+                              "vector-load-alignment");
+}
+
 static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
                                             const IRProgram *program,
                                             const IRFunction *func) {
   PtxVectorPlan *plan;
+  unsigned char *declined = NULL;
   if (!func || func->instruction_count == 0) return NULL;
   plan = calloc(func->instruction_count, sizeof(*plan));
   if (!plan) return NULL;
+  if (fn->reported) declined = calloc(func->instruction_count, 1);
   for (size_t i = 0; i < func->instruction_count; i++) {
     const IRInstruction *head = &func->instructions[i];
     const IROperand *base = NULL;
@@ -960,10 +1016,12 @@ static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
     size_t members[4];
     size_t found = 1;
     if (head->op != IR_OP_LOAD || plan[i].absorbed) continue;
+    if (declined && declined[i]) continue;
     ptx_address_parts(fn, func, i, &head->lhs, &base, &offset);
     pointer_type = ptx_load_pointer_type(program, func, base, i);
     if (!pointer_type || pointer_type->kind != MTLC_TYPE_POINTER ||
-        !pointer_type->base_type || !pointer_type->pointee_align ||
+        !pointer_type->base_type ||
+        (!pointer_type->pointee_align && !declined) ||
         !ptx_vector_element_ok(pointer_type->base_type->kind))
       continue;
     if (pointer_type->address_space != MTLC_ADDRESS_SPACE_GLOBAL &&
@@ -998,6 +1056,10 @@ static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
     } else if (found >= 2 && pointer_type->pointee_align >= stride * 2) {
       plan[i].width = 2;
     } else {
+      if (declined && found >= 2) {
+        ptx_report_vector_decline(func, i, base, pointer_type, stride, found);
+        for (size_t k = 1; k < found; k++) declined[members[k]] = 1;
+      }
       continue;
     }
     for (size_t k = 1; k < plan[i].width; k++) {
@@ -1008,6 +1070,7 @@ static PtxVectorPlan *ptx_plan_vector_loads(PtxFn *fn,
       plan[i].members[k] = members[k];
     }
   }
+  free(declined);
   return plan;
 }
 
@@ -8294,6 +8357,10 @@ int ptx_emit_program(IRProgram *program, CodeGenerator *generator, FILE *out,
     else free(asm_error);
     return 0;
   }
+  char profile[64];
+  snprintf(profile, sizeof(profile), "%d.%d for %s", isa_major, isa_minor,
+           target);
+  ir_explain_device_begin("ptx", profile);
   IRGpuCallGraph graph = {0};
   char *graph_error = NULL;
   if (!ir_program_build_gpu_call_graph(program, &graph, &graph_error)) {
@@ -8784,15 +8851,40 @@ static void ptx_emit_assign(IRProgram *program, IRFunction *func, PtxFn *fn,
   }
 }
 
+static void ptx_report_access(PtxFn *fn, const IRFunction *func, size_t index,
+                              const IROperand *address, int generic) {
+  const char *root = NULL;
+  char shown[128], subject[176];
+  if (!fn->reported) return;
+  ir_explain_device_add(func->name,
+                        generic ? IR_DEVICE_ACCESSES_GENERIC
+                                : IR_DEVICE_ACCESSES_NAMED,
+                        1);
+  if (!generic) return;
+  root = ir_device_report_address_root(func, index, address);
+  if (root) {
+    ir_display_name(root, shown, sizeof(shown));
+    snprintf(subject, sizeof(subject), "accesses through `%s`", shown);
+  } else {
+    snprintf(subject, sizeof(subject), "accesses through a computed pointer");
+  }
+  ir_explain_device_note_site(
+      func->name, func->instructions[index].location.line, "access", subject,
+      IR_DEVICE_MISS, "generic address space",
+      "nothing names the space this pointer points into, so each access "
+      "resolves it at run time",
+      "declare the space in the pointer's type: `T global*`, `T shared*` or "
+      "`T local*`",
+      "generic-access");
+}
+
 static void ptx_emit_memory(IRProgram *program, IRFunction *func, PtxFn *fn,
                         const IRInstruction *in, size_t *ii, char **error,
                         int target_arch, int returns_void, const char *ename,
                         int *handled) {
-  (void)ii;
   (void)ename;
   (void)returns_void;
   (void)target_arch;
-  (void)func;
   (void)program;
   (void)error;
   switch (in->op) {
@@ -8833,8 +8925,10 @@ static void ptx_emit_memory(IRProgram *program, IRFunction *func, PtxFn *fn,
     if (addr.address_space == MTLC_ADDRESS_SPACE_DEFAULT ||
         addr.address_space == MTLC_ADDRESS_SPACE_GENERIC) {
       g_ptx_generic_accesses++;
+      ptx_report_access(fn, func, *ii, &in->lhs, 1);
     } else {
       g_ptx_spaced_accesses++;
+      ptx_report_access(fn, func, *ii, &in->lhs, 0);
     }
     if (!space) {
       fn_error(fn, "PTX: invalid load address space %d",
@@ -8928,8 +9022,10 @@ static void ptx_emit_memory(IRProgram *program, IRFunction *func, PtxFn *fn,
     if (addr.address_space == MTLC_ADDRESS_SPACE_DEFAULT ||
         addr.address_space == MTLC_ADDRESS_SPACE_GENERIC) {
       g_ptx_generic_accesses++;
+      ptx_report_access(fn, func, *ii, &in->dest, 1);
     } else {
       g_ptx_spaced_accesses++;
+      ptx_report_access(fn, func, *ii, &in->dest, 0);
     }
     if (addr.address_space == MTLC_ADDRESS_SPACE_CONSTANT) {
       fn_error(fn, "PTX: store to constant address space");
@@ -10882,6 +10978,57 @@ static int ptx_allocation_is_valid(PtxEmit *e, const IRInstruction *in,
   return 1;
 }
 
+static void ptx_mark_line(PtxFn *fn, size_t line) {
+  if (!fn->reported) return;
+  if (fn->line_mark_count >= 2 &&
+      fn->line_marks[fn->line_mark_count - 1] == line)
+    return;
+  if (fn->line_mark_count + 2 > fn->line_mark_capacity) {
+    size_t capacity = fn->line_mark_capacity ? fn->line_mark_capacity * 2 : 64;
+    size_t *grown = realloc(fn->line_marks, capacity * sizeof(*grown));
+    if (!grown) return;
+    fn->line_marks = grown;
+    fn->line_mark_capacity = capacity;
+  }
+  fn->line_marks[fn->line_mark_count++] = fn->body.len;
+  fn->line_marks[fn->line_mark_count++] = line;
+}
+
+static void ptx_report_memory_value(PtxEmit *e, const IRInstruction *in,
+                                    const char *what, int aggregate,
+                                    size_t bytes) {
+  char shown[128], subject[176], headline[96], reason[360];
+  int has_reason = 0;
+  if (!e->fn.reported) return;
+  ir_display_name(in->dest.name, shown, sizeof(shown));
+  snprintf(subject, sizeof(subject), "%s `%s`", what, shown);
+  snprintf(headline, sizeof(headline), "in local memory, %zu bytes", bytes);
+  has_reason = ir_device_report_storage_reason(e->func, in->dest.name,
+                                               aggregate, reason,
+                                               sizeof(reason));
+  ir_explain_device_add(e->func->name, IR_DEVICE_VALUES_IN_MEMORY, 1);
+  ir_explain_device_add(e->func->name, IR_DEVICE_MEMORY_BYTES,
+                        (long long)bytes);
+  ir_explain_device_note(e->func->name, in->location.line, "storage", subject,
+                         has_reason ? IR_DEVICE_MISS : IR_DEVICE_FACT, headline,
+                         has_reason ? reason : NULL, NULL, "local-memory");
+}
+
+static void ptx_report_allocation(PtxEmit *e, const IRInstruction *in,
+                                  int is_dynamic, size_t bytes) {
+  if (!e->fn.reported) return;
+  if (in->address_space != MTLC_ADDRESS_SPACE_WORKGROUP) {
+    ptx_report_memory_value(e, in, "private array", 1, bytes);
+    return;
+  }
+  if (is_dynamic) {
+    ir_explain_device_set(e->func->name, IR_DEVICE_WORKGROUP_LAUNCH_SIZED, 1);
+    return;
+  }
+  ir_explain_device_add(e->func->name, IR_DEVICE_WORKGROUP_BYTES,
+                        (long long)bytes);
+}
+
 static void ptx_emit_allocations(PtxEmit *e) {
   IRFunction *func = e->func;
   for (size_t i = 0; i < func->instruction_count && !e->fn.error; i++) {
@@ -10915,6 +11062,7 @@ static void ptx_emit_allocations(PtxEmit *e) {
                                                                   : ".local",
                 alignment ? alignment : 1, storage, elem_size * count);
     }
+    ptx_report_allocation(e, in, is_dynamic, elem_size * count);
     pointer = descriptor_from_type(in->value_type);
     pointer.idx = new_reg(&e->fn, PC_B64);
     bind_value(&e->fn, in->dest.name, pointer);
@@ -10988,7 +11136,25 @@ static void ptx_emit_parameter_loads(PtxEmit *e) {
     } else {
       ptx_emit_scalar_parameter(e, p, d);
     }
+    if (e->fn.reported && d.mem_aggregate) {
+      ir_explain_device_add(e->func->name, IR_DEVICE_VALUES_IN_MEMORY, 1);
+      ir_explain_device_add(e->func->name, IR_DEVICE_MEMORY_BYTES,
+                            (long long)d.mem_size);
+    } else if (e->fn.reported) {
+      ir_explain_device_add(e->func->name, IR_DEVICE_VALUES_IN_REGISTERS, 1);
+    }
   }
+}
+
+static int ptx_local_declared_before(const IRFunction *func, size_t index) {
+  const char *name = func->instructions[index].dest.name;
+  for (size_t i = 0; i < index; i++) {
+    const IRInstruction *in = &func->instructions[i];
+    if (in->op == IR_OP_DECLARE_LOCAL && in->dest.name &&
+        strcmp(in->dest.name, name) == 0)
+      return 1;
+  }
+  return 0;
 }
 
 static void ptx_emit_allocation_pointers(PtxEmit *e) {
@@ -11049,8 +11215,18 @@ static void ptx_emit_locals(PtxEmit *e) {
     if (in->op != IR_OP_DECLARE_LOCAL || !in->dest.name) continue;
     if (find_binding(&e->fn, in->dest.name)) continue;
     aggregate = ptx_type_is_aggregate(in->value_type);
-    if (!aggregate && !ptx_local_address_taken(func, in->dest.name)) continue;
+    if (!aggregate && !ptx_local_address_taken(func, in->dest.name)) {
+      if (e->fn.reported && !ptx_local_declared_before(func, i))
+        ir_explain_device_add(func->name, IR_DEVICE_VALUES_IN_REGISTERS, 1);
+      continue;
+    }
     if (!ptx_local_extent(e, in, aggregate, &size, &alignment)) break;
+    ptx_report_memory_value(
+        e, in,
+        !aggregate ? "local"
+                   : in->value_type->kind == MTLC_TYPE_ARRAY ? "array"
+                                                            : "record",
+        aggregate, size);
     snprintf(raw, sizeof(raw), "%s_%s_local", e->ename, in->dest.name);
     sanitize_into(raw, storage, sizeof(storage));
     sb_printf(&e->fn.body, "\t.local .align %zu .b8 %s[%zu];\n", alignment,
@@ -11117,6 +11293,22 @@ static void ptx_emit_vector_load(PtxEmit *e, size_t ii,
   g_ptx_spaced_accesses++;
   g_ptx_vector_groups++;
   g_ptx_vector_loads_saved += width - 1;
+  if (e->fn.reported) {
+    char subject[200], headline[96], reason[120];
+    ptx_report_vector_subject(func, ii, base, "adjacent loads", width, subject,
+                              sizeof(subject));
+    snprintf(headline, sizeof(headline), "one ld%s.v%u.%s", space,
+             (unsigned)width, mem_type_suffix(elem));
+    snprintf(reason, sizeof(reason),
+             "the pointer's type declares %zu byte alignment",
+             pointer_type ? pointer_type->pointee_align : (size_t)0);
+    ir_explain_device_add(func->name, IR_DEVICE_ACCESSES_NAMED, 1);
+    ir_explain_device_add(func->name, IR_DEVICE_VECTOR_GROUPS, 1);
+    ir_explain_device_add(func->name, IR_DEVICE_LOADS_SAVED, width - 1);
+    ir_explain_device_note_site(func->name, in->location.line, "vector",
+                                subject, IR_DEVICE_GOOD, headline, reason, NULL,
+                                "vector-load");
+  }
 }
 
 static void ptx_emit_instruction(PtxEmit *e, size_t *ii, char **error,
@@ -11142,6 +11334,7 @@ static void ptx_emit_body(PtxEmit *e, char **error, int target_arch) {
     if (plan && in->op == IR_OP_LOAD && plan[ii].absorbed) {
       continue;
     }
+    ptx_mark_line(&e->fn, ir_device_report_code_line(e->func, in));
     if (plan && in->op == IR_OP_LOAD && plan[ii].width) {
       ptx_emit_vector_load(e, ii, plan);
       continue;
@@ -11157,9 +11350,35 @@ static void ptx_emit_body(PtxEmit *e, char **error, int target_arch) {
   free(plan);
 }
 
+static void ptx_report_code(PtxEmit *e) {
+  const char *text = e->fn.body.data;
+  size_t mark = 0;
+  size_t line = e->func->location.line;
+  if (!e->fn.reported || !text) return;
+  for (size_t at = 0; text[at];) {
+    size_t end = at;
+    size_t start = at;
+    size_t length = 0;
+    char row[512];
+    while (text[end] && text[end] != '\n') end++;
+    while (mark < e->fn.line_mark_count && e->fn.line_marks[mark] <= at) {
+      line = e->fn.line_marks[mark + 1];
+      mark += 2;
+    }
+    while (start < end && (text[start] == '\t' || text[start] == ' ')) start++;
+    length = end - start;
+    if (length >= sizeof(row)) length = sizeof(row) - 1;
+    memcpy(row, text + start, length);
+    row[length] = '\0';
+    if (length) ir_explain_device_code(e->func->name, line, row);
+    at = text[end] ? end + 1 : end;
+  }
+}
+
 static void ptx_emit_write(PtxEmit *e, FILE *out) {
   static const PtxClass classes[6] = {PC_PRED, PC_B16, PC_B32,
                                       PC_B64,  PC_F32, PC_F64};
+  ptx_report_code(e);
   fputs(e->sig.data, out);
   fputs("{\n", out);
   for (int c = 0; c < 6; c++) {
@@ -11194,6 +11413,7 @@ static void ptx_emit_release(PtxEmit *e) {
   free(e->fn.asm_out_cls);
   free(e->fn.asm_out_idx);
   free(e->fn.generic_names);
+  free(e->fn.line_marks);
 }
 
 static void ptx_count_one_definition(PtxFn *fn, const char *name) {
@@ -11272,6 +11492,10 @@ static void emit_function(IRProgram *program, size_t fi, CodeGenerator *gen,
   ptx_emit_return_descriptor(&e);
   sanitize_into(e.func->name ? e.func->name : "kernel", e.ename,
                 sizeof(e.ename));
+  e.fn.reported = ir_explain_device_function(
+      e.func->name, e.func->location.filename, e.func->location.line,
+      e.func->is_kernel, e.func->kernel_block);
+  ptx_mark_line(&e.fn, e.func->location.line);
 
   ptx_emit_signature(&e);
   ptx_emit_dynamic_workgroup(&e);

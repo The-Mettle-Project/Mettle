@@ -1,4 +1,5 @@
 #include "ir_optimize_internal.h"
+#include "ir_optimize_explain_internal.h"
 #include "common.h"
 #include "../ir_machine.h"
 #include "../ir_explain_memory.h"
@@ -56,7 +57,7 @@ void ir_explain_set_source_path(const char *path) {
   g_explain_source_path = path;
 }
 
-static void ir_explain_json_raw(const char *fmt, ...) {
+void ir_explain_json_raw(const char *fmt, ...) {
   va_list args;
   if (!g_explain_json) {
     return;
@@ -85,7 +86,7 @@ static void ir_explain_json_raw(const char *fmt, ...) {
   g_json_len += (size_t)needed;
 }
 
-static void ir_explain_json_str(const char *s) {
+void ir_explain_json_str(const char *s) {
   if (!g_explain_json) {
     return;
   }
@@ -137,7 +138,7 @@ static MTLC_THREAD_LOCAL char *g_report_buf = NULL;
 static MTLC_THREAD_LOCAL size_t g_report_len = 0;
 static MTLC_THREAD_LOCAL size_t g_report_cap = 0;
 
-static void ir_explain_emit(const char *fmt, ...) {
+void ir_explain_emit(const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
   int needed = vsnprintf(NULL, 0, fmt, args);
@@ -696,6 +697,12 @@ static const char *clr(const char *code) {
   return ir_explain_use_color() ? code : "";
 }
 
+const char *ir_explain_style(IRExplainStyle style) {
+  static const char *const codes[] = {EXPLAIN_RESET, EXPLAIN_BOLD, EXPLAIN_DIM,
+                                      EXPLAIN_GREEN, EXPLAIN_RED};
+  return clr(codes[style]);
+}
+
 static int ir_explain_use_unicode(void) { return diag_style_unicode(); }
 
 static const char *glyph_elbow(void) { return diag_glyphs()->elbow; }
@@ -806,7 +813,7 @@ static void ir_explain_echo_one(size_t line, size_t strip) {
                   diag_glyphs()->v, clr(EXPLAIN_RESET), painted, 10);
 }
 
-static void ir_explain_echo_source_range(size_t line, size_t end_line) {
+void ir_explain_echo_source_range(size_t line, size_t end_line) {
   ir_explain_source_load();
   if (!g_source_lines || line == 0 || line > g_source_line_count) {
     return;
@@ -847,7 +854,7 @@ static char *ir_explain_strdup(const char *s) {
   return copy;
 }
 
-static char *ir_explain_text_dup(const char *s) {
+char *ir_explain_text_dup(const char *s) {
   char *copy = ir_explain_strdup(s);
   if (!copy || ir_explain_use_unicode()) {
     return copy;
@@ -2084,7 +2091,7 @@ static void ir_explain_render_changes(void) {
   free(old);
 }
 
-static void ir_explain_print_header(const char *what) {
+void ir_explain_print_header(const char *what) {
   const char *file = g_explain_focus_file
                          ? ir_explain_path_basename(g_explain_focus_file)
                          : "<input>";
@@ -4842,11 +4849,15 @@ void ir_explain_target_flush(const char *target_name) {
   ir_explain_json_str(target);
   ir_explain_json_raw("},");
 
-  ir_explain_print_header("backend report");
-  ir_explain_emit(
-      "  target-neutral optimized IR emitted through the %s backend; "
-      "native MIR eligibility does not apply\n\n",
-      target);
+  if (ir_explain_device_has_report()) {
+    ir_explain_device_render();
+  } else {
+    ir_explain_print_header("backend report");
+    ir_explain_emit(
+        "  target-neutral optimized IR emitted through the %s backend; "
+        "native MIR eligibility does not apply\n\n",
+        target);
+  }
   ir_explain_finalize(0);
 }
 
