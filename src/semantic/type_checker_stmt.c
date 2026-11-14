@@ -1,4 +1,5 @@
 #include "type_checker_internal.h"
+#include "../ir/ir_explain_device.h"
 
 static int type_checker_push_loop_label(TypeChecker *checker,
                                         const char *label) {
@@ -81,6 +82,55 @@ static int type_checker_check_launch_controls(TypeChecker *checker,
     }
   }
   return 1;
+}
+
+static void type_checker_explain_launch(TypeChecker *checker,
+                                        ASTNode *statement,
+                                        GpuLaunchStatement *launch,
+                                        Symbol *kernel_symbol) {
+  char headline[240];
+  long long grid[3] = {0, 0, 0};
+  long long work = 0;
+  long long threads = launch->kernel_block[0] *
+                      (launch->kernel_block[1] > 0 ? launch->kernel_block[1]
+                                                   : 1) *
+                      (launch->kernel_block[2] > 0 ? launch->kernel_block[2]
+                                                   : 1);
+  long long per_item = launch->kernel_threads_per_item > 0
+                           ? launch->kernel_threads_per_item
+                           : 1;
+  long long items = threads / per_item;
+  int grid_known = 1;
+  for (size_t d = 0; d < 3; d++) {
+    if (!type_checker_eval_integer_constant(launch->grid[d], &grid[d]))
+      grid_known = 0;
+  }
+  if (launch->work && items > 0 &&
+      type_checker_eval_integer_constant(launch->work, &work)) {
+    snprintf(headline, sizeof(headline),
+             "%lld work items in %lld blocks of %lld threads", work,
+             (work + items - 1) / items, threads);
+  } else if (launch->work && threads > 0) {
+    snprintf(headline, sizeof(headline),
+             "work items counted at run time, in blocks of %lld threads",
+             threads);
+  } else if (launch->work) {
+    snprintf(headline, sizeof(headline),
+             "work items and block size both set at run time");
+  } else if (launch->grid_indirect) {
+    snprintf(headline, sizeof(headline),
+             "grid read from device memory at launch");
+  } else if (grid_known) {
+    snprintf(headline, sizeof(headline), "grid of %lld by %lld by %lld blocks",
+             grid[0], grid[1], grid[2]);
+  } else {
+    snprintf(headline, sizeof(headline), "grid computed at run time");
+  }
+  ir_explain_dispatch_note(
+      statement->location.filename, statement->location.line,
+      statement->location.column,
+      checker->current_function ? checker->current_function->name : NULL,
+      kernel_symbol ? kernel_symbol->name : NULL, headline);
 }
 
 static void type_checker_report_launch(ASTNode *statement,
@@ -366,6 +416,7 @@ static int type_checker_check_gpu_launch(TypeChecker *checker,
   if (g_report_launches) {
     type_checker_report_launch(statement, launch, kernel_symbol);
   }
+  type_checker_explain_launch(checker, statement, launch, kernel_symbol);
   return 1;
 }
 

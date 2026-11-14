@@ -61,6 +61,10 @@ const char *ir_explain_device_function_name(size_t index, int *is_kernel);
 void ir_explain_set_fragment(const char *stem, const char *label);
 void ir_explain_set_target_name(const char *name);
 void ir_explain_set_host_empty(int empty);
+void ir_explain_dispatch_set_collect(int enabled, const char *focus_file);
+void ir_explain_dispatch_note(const char *file, size_t line, size_t column,
+                              const char *function, const char *kernel,
+                              const char *headline);
 void ir_explain_device_child(const char *stem, const char *target,
                              const char *failure);
 

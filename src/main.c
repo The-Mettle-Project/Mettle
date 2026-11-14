@@ -7547,6 +7547,9 @@ static int compile_stage_type_check(CompileContext *ctx) {
   ir_explain_memory_set_collect(
       ctx->options->explain && ctx->options->optimize,
       ctx->options->explain_all ? NULL : ctx->options->input_filename);
+  ir_explain_dispatch_set_collect(
+      ctx->options->explain && ctx->options->optimize,
+      ctx->options->explain_all ? NULL : ctx->options->input_filename);
   ir_explain_ownership_set_collect(
       ctx->options->explain && ctx->options->optimize,
       ctx->options->explain_all ? NULL : ctx->options->input_filename);

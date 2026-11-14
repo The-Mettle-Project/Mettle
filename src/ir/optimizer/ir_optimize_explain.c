@@ -142,6 +142,27 @@ void ir_explain_device_child(const char *stem, const char *target,
   child->failure = ir_explain_copy(failure);
 }
 
+typedef struct {
+  char *file;
+  size_t line;
+  size_t column;
+  char *function;
+  char *kernel;
+  char *headline;
+} IRExplainDispatch;
+
+static MTLC_THREAD_LOCAL IRExplainDispatch *g_dispatches = NULL;
+static MTLC_THREAD_LOCAL size_t g_dispatch_count = 0;
+static MTLC_THREAD_LOCAL size_t g_dispatch_capacity = 0;
+static MTLC_THREAD_LOCAL int g_dispatch_collect = 0;
+static MTLC_THREAD_LOCAL char *g_dispatch_focus = NULL;
+
+void ir_explain_dispatch_set_collect(int enabled, const char *focus_file) {
+  g_dispatch_collect = enabled;
+  free(g_dispatch_focus);
+  g_dispatch_focus = ir_explain_copy(focus_file);
+}
+
 void ir_explain_set_json(int enabled) { g_explain_json = enabled; }
 void ir_explain_set_text(int enabled) { g_explain_text = enabled; }
 void ir_explain_set_stream(FILE *out) { g_explain_stream = out; }
@@ -3824,6 +3845,80 @@ static void ir_explain_passes_json(void) {
   g_pass_count = 0;
 }
 
+void ir_explain_dispatch_note(const char *file, size_t line, size_t column,
+                              const char *function, const char *kernel,
+                              const char *headline) {
+  IRExplainDispatch *note;
+  if (!g_dispatch_collect || !headline) {
+    return;
+  }
+  if (g_dispatch_focus && file &&
+      strcmp(ir_explain_path_basename(file),
+             ir_explain_path_basename(g_dispatch_focus)) != 0) {
+    return;
+  }
+  if (g_dispatch_count == g_dispatch_capacity) {
+    size_t capacity = g_dispatch_capacity ? g_dispatch_capacity * 2 : 8;
+    IRExplainDispatch *grown = realloc(g_dispatches, capacity * sizeof(*grown));
+    if (!grown) {
+      return;
+    }
+    g_dispatches = grown;
+    g_dispatch_capacity = capacity;
+  }
+  note = &g_dispatches[g_dispatch_count++];
+  note->file = ir_explain_copy(file);
+  note->line = line;
+  note->column = column;
+  note->function = ir_explain_copy(function);
+  note->kernel = ir_explain_copy(kernel);
+  note->headline = ir_explain_copy(headline);
+}
+
+static int ir_explain_remark_is_launch_call(const IRExplainRemark *r) {
+  return r->entity && strncmp(r->entity, "call to ", 8) == 0 &&
+         (strstr(r->entity, "gpu_launch") ||
+          strstr(r->entity, "gpu_kernel_handle") ||
+          strstr(r->entity, "metal_launch"));
+}
+
+static void ir_explain_drop_launch_calls(size_t line) {
+  size_t kept = 0;
+  for (size_t i = 0; i < g_remark_count; i++) {
+    if (g_remarks[i].line == line &&
+        ir_explain_remark_is_launch_call(&g_remarks[i])) {
+      ir_explain_remark_free_one(&g_remarks[i]);
+      continue;
+    }
+    g_remarks[kept++] = g_remarks[i];
+  }
+  g_remark_count = kept;
+}
+
+static void ir_explain_dispatch_remarks(void) {
+  for (size_t i = 0; i < g_dispatch_count; i++) {
+    IRExplainDispatch *note = &g_dispatches[i];
+    if (!g_device_filter) {
+      SourceLocation location = {note->line, note->column, note->file};
+      char entity[200];
+      snprintf(entity, sizeof(entity), "dispatch `%s`",
+               note->kernel ? note->kernel : "a kernel handle");
+      ir_explain_drop_launch_calls(note->line);
+      ir_explain_remark(note->function ? note->function : "?", entity,
+                        location, 1, note->headline, NULL, NULL, NULL);
+      ir_explain_remark_code("dispatch");
+    }
+    free(note->file);
+    free(note->function);
+    free(note->kernel);
+    free(note->headline);
+  }
+  free(g_dispatches);
+  g_dispatches = NULL;
+  g_dispatch_count = 0;
+  g_dispatch_capacity = 0;
+}
+
 static void ir_explain_print_remark(const IRExplainRemark *r) {
   char fn_shown[160];
   char entity_shown[224];
@@ -3877,6 +3972,7 @@ void ir_explain_flush(void) {
     }
     g_remark_count = kept;
   }
+  ir_explain_dispatch_remarks();
 
   size_t section_start = g_report_len;
   ir_explain_print_header("optimization report");
@@ -3994,6 +4090,9 @@ void ir_explain_flush(void) {
         char callee[96];
         ir_explain_entity_callee(r->entity, callee, sizeof(callee));
         ir_explain_json_remark(r, "call", callee, 1, 0, NULL,
+                               &json_remark_count);
+      } else if (r->entity && strncmp(r->entity, "dispatch ", 9) == 0) {
+        ir_explain_json_remark(r, "dispatch", NULL, 1, 0, NULL,
                                &json_remark_count);
       } else {
         ir_explain_json_remark(
