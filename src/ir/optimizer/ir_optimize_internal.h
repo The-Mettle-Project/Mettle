@@ -106,6 +106,7 @@ typedef struct {
   IROperand lhs;
   IROperand rhs;
   int is_float;
+  int is_unsigned;
   IROperand value;
   int alive;
 } IRExpressionEntry;

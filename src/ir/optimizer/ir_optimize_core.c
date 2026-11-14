@@ -1421,7 +1421,8 @@ static int ir_expression_entry_matches_instruction(
   case IR_EXPR_BINARY:
     if (instruction->op != IR_OP_BINARY || !instruction->text ||
         !entry->op_text || strcmp(entry->op_text, instruction->text) != 0 ||
-        entry->is_float != instruction->is_float) {
+        entry->is_float != instruction->is_float ||
+        entry->is_unsigned != instruction->is_unsigned) {
       return 0;
     }
     if (ir_operand_equals(&entry->lhs, &instruction->lhs) &&
@@ -1438,11 +1439,13 @@ static int ir_expression_entry_matches_instruction(
     return instruction->op == IR_OP_UNARY && instruction->text &&
            entry->op_text && strcmp(entry->op_text, instruction->text) == 0 &&
            entry->is_float == instruction->is_float &&
+           entry->is_unsigned == instruction->is_unsigned &&
            ir_operand_equals(&entry->lhs, &instruction->lhs);
   case IR_EXPR_CAST:
     return instruction->op == IR_OP_CAST && instruction->text &&
            entry->op_text && strcmp(entry->op_text, instruction->text) == 0 &&
            entry->is_float == instruction->is_float &&
+           entry->is_unsigned == instruction->is_unsigned &&
            ir_operand_equals(&entry->lhs, &instruction->lhs);
   case IR_EXPR_ADDRESS_OF:
     return instruction->op == IR_OP_ADDRESS_OF &&
@@ -1764,6 +1767,7 @@ static int ir_expression_map_store_value_for_instruction(
   entry->rhs = ir_operand_none();
   entry->value = ir_operand_none();
 
+  entry->is_unsigned = instruction->is_unsigned;
   switch (instruction->op) {
   case IR_OP_BINARY:
     entry->kind = IR_EXPR_BINARY;

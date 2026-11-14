@@ -1,0 +1,11 @@
+import "std/io";
+
+@noinline fn bits32(x: float32) -> uint32 { var y: float32 = x; return *((uint32*)&y); }
+
+fn main() -> int32 {
+  var gap: float32 = (float32)(((float64)((int8)(-1))) - ((float64)((uint64)18446744073709551615)));
+  var wide: float64 = (float64)((int64)(-1)) + (float64)((uint64)18446744073709551615);
+  var narrow: float32 = (float32)((int32)(-1)) - (float32)((uint32)4294967295);
+  println("{bits32(gap)} {wide} {narrow}");
+  return 0;
+}

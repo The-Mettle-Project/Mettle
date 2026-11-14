@@ -370,8 +370,59 @@ static void ir_symbol_value_map_invalidate_name(IRSymbolValueMap *map,
   }
 }
 
+typedef struct {
+  const IRFunction *function;
+  int kept_bits;
+} IRCpConsumer;
+
+static int ir_declared_integer_width(const char *type, int *bits_out,
+                                     int *unsigned_out);
+
+static int ir_cp_value_fits_home(const IRFunction *function, const char *type,
+                                 int bits, int is_unsigned,
+                                 const IROperand *value) {
+  if (value->kind == IR_OPERAND_INT) {
+    int shift = 64 - bits;
+    long long wrapped =
+        is_unsigned
+            ? (long long)(((unsigned long long)value->int_value << shift) >>
+                          shift)
+            : (value->int_value << shift) >> shift;
+    return wrapped == value->int_value;
+  }
+  if (value->kind == IR_OPERAND_SYMBOL && value->name) {
+    const char *source = ir_function_local_declared_type(function, value->name);
+    return source && strcmp(source, type) == 0;
+  }
+  return 0;
+}
+
+static const IROperand *ir_cp_symbol_value(const IRSymbolValueMap *symbol_map,
+                                           const IRCpConsumer *consumer,
+                                           const char *name) {
+  const IROperand *mapped = ir_temp_value_map_lookup(symbol_map, name);
+  const char *type;
+  int bits = 0;
+  int is_unsigned = 0;
+  if (!mapped || !consumer || !consumer->function) {
+    return mapped;
+  }
+  type = ir_function_local_declared_type(consumer->function, name);
+  if (!ir_declared_integer_width(type, &bits, &is_unsigned) || bits == 0) {
+    return mapped;
+  }
+  if (consumer->kept_bits > 0 && consumer->kept_bits <= bits) {
+    return mapped;
+  }
+  return ir_cp_value_fits_home(consumer->function, type, bits, is_unsigned,
+                               mapped)
+             ? mapped
+             : NULL;
+}
+
 static int ir_resolve_propagated_value(const IRTempValueMap *temp_map,
                                        const IRSymbolValueMap *symbol_map,
+                                       const IRCpConsumer *consumer,
                                        const IROperand *operand, IROperand *out,
                                        int depth) {
   if (!operand || !out) {
@@ -386,17 +437,17 @@ static int ir_resolve_propagated_value(const IRTempValueMap *temp_map,
     const IROperand *mapped =
         ir_temp_value_map_lookup(temp_map, operand->name);
     if (mapped) {
-      return ir_resolve_propagated_value(temp_map, symbol_map, mapped, out,
-                                         depth + 1);
+      return ir_resolve_propagated_value(temp_map, symbol_map, consumer, mapped,
+                                         out, depth + 1);
     }
   }
 
   if (operand->kind == IR_OPERAND_SYMBOL && operand->name && symbol_map) {
     const IROperand *mapped =
-        ir_temp_value_map_lookup(symbol_map, operand->name);
+        ir_cp_symbol_value(symbol_map, consumer, operand->name);
     if (mapped) {
-      return ir_resolve_propagated_value(temp_map, symbol_map, mapped, out,
-                                         depth + 1);
+      return ir_resolve_propagated_value(temp_map, symbol_map, consumer, mapped,
+                                         out, depth + 1);
     }
   }
 
@@ -405,6 +456,7 @@ static int ir_resolve_propagated_value(const IRTempValueMap *temp_map,
 
 static int ir_try_propagate_operand(IRTempValueMap *temp_map,
                                     IRSymbolValueMap *symbol_map,
+                                    const IRCpConsumer *consumer,
                                     IROperand *operand, int *changed) {
   if (!operand) {
     return 1;
@@ -418,8 +470,8 @@ static int ir_try_propagate_operand(IRTempValueMap *temp_map,
     }
 
     IROperand resolved = ir_operand_none();
-    if (!ir_resolve_propagated_value(temp_map, symbol_map, mapped, &resolved,
-                                     0)) {
+    if (!ir_resolve_propagated_value(temp_map, symbol_map, consumer, mapped,
+                                     &resolved, 0)) {
       return 0;
     }
 
@@ -433,14 +485,14 @@ static int ir_try_propagate_operand(IRTempValueMap *temp_map,
 
   if (operand->kind == IR_OPERAND_SYMBOL && operand->name && symbol_map) {
     const IROperand *mapped =
-        ir_temp_value_map_lookup(symbol_map, operand->name);
+        ir_cp_symbol_value(symbol_map, consumer, operand->name);
     if (!mapped) {
       return 1;
     }
 
     IROperand resolved = ir_operand_none();
-    if (!ir_resolve_propagated_value(temp_map, symbol_map, mapped, &resolved,
-                                     0)) {
+    if (!ir_resolve_propagated_value(temp_map, symbol_map, consumer, mapped,
+                                     &resolved, 0)) {
       return 0;
     }
 
@@ -455,22 +507,52 @@ static int ir_try_propagate_operand(IRTempValueMap *temp_map,
   return 1;
 }
 
-static int ir_propagate_instruction_operands(IRTempValueMap *temp_map,
+static int ir_cp_assign_kept_bits(const IRFunction *function,
+                                  const IRInstruction *instruction) {
+  int bits = 0;
+  int is_unsigned = 0;
+  if (instruction->dest.kind != IR_OPERAND_SYMBOL || !instruction->dest.name ||
+      instruction->is_float) {
+    return 0;
+  }
+  if (!ir_declared_integer_width(
+          ir_function_local_declared_type(function, instruction->dest.name),
+          &bits, &is_unsigned)) {
+    return 0;
+  }
+  return bits == 0 ? 64 : bits;
+}
+
+static int ir_cp_store_kept_bits(const IRInstruction *instruction) {
+  if (instruction->op != IR_OP_STORE ||
+      instruction->rhs.kind != IR_OPERAND_INT ||
+      instruction->rhs.int_value < 1 || instruction->rhs.int_value > 8) {
+    return 0;
+  }
+  return (int)instruction->rhs.int_value * 8;
+}
+
+static int ir_propagate_instruction_operands(const IRFunction *function,
+                                             IRTempValueMap *temp_map,
                                              IRSymbolValueMap *symbol_map,
                                              IRInstruction *instruction,
                                              int *changed) {
+  IRCpConsumer whole = {function, 0};
+  IRCpConsumer stored = {function, 0};
+  IRCpConsumer assigned = {function, 0};
   if (!instruction) {
     return 0;
   }
+  stored.kept_bits = ir_cp_store_kept_bits(instruction);
 
   switch (instruction->op) {
   case IR_OP_TILE:
-    if (!ir_try_propagate_operand(temp_map, symbol_map, &instruction->dest,
-                                  changed)) {
+    if (!ir_try_propagate_operand(temp_map, symbol_map, &whole,
+                                  &instruction->dest, changed)) {
       return 0;
     }
     for (size_t i = 0; i < instruction->argument_count; i++) {
-      if (!ir_try_propagate_operand(temp_map, symbol_map,
+      if (!ir_try_propagate_operand(temp_map, symbol_map, &whole,
                                     &instruction->arguments[i], changed)) {
         return 0;
       }
@@ -480,7 +562,7 @@ static int ir_propagate_instruction_operands(IRTempValueMap *temp_map,
   case IR_OP_ASYNC_COPY:
   case IR_OP_TENSOR_EPILOGUE:
     for (size_t i = 0; i < instruction->argument_count; i++) {
-      if (!ir_try_propagate_operand(temp_map, symbol_map,
+      if (!ir_try_propagate_operand(temp_map, symbol_map, &whole,
                                     &instruction->arguments[i], changed)) {
         return 0;
       }
@@ -492,12 +574,12 @@ static int ir_propagate_instruction_operands(IRTempValueMap *temp_map,
   case IR_OP_TENSOR_COMMIT:
   case IR_OP_TENSOR_SCALE_ROWS:
   case IR_OP_STORE:
-    if (!ir_try_propagate_operand(temp_map, symbol_map, &instruction->dest,
-                                  changed) ||
-        !ir_try_propagate_operand(temp_map, symbol_map, &instruction->lhs,
-                                  changed) ||
-        !ir_try_propagate_operand(temp_map, symbol_map, &instruction->rhs,
-                                  changed)) {
+    if (!ir_try_propagate_operand(temp_map, symbol_map, &whole,
+                                  &instruction->dest, changed) ||
+        !ir_try_propagate_operand(temp_map, symbol_map, &stored,
+                                  &instruction->lhs, changed) ||
+        !ir_try_propagate_operand(temp_map, symbol_map, &whole,
+                                  &instruction->rhs, changed)) {
       return 0;
     }
     break;
@@ -506,21 +588,25 @@ static int ir_propagate_instruction_operands(IRTempValueMap *temp_map,
     break;
 
   case IR_OP_BRANCH_ZERO:
-    if (!ir_try_propagate_operand(temp_map, NULL, &instruction->lhs, changed)) {
+    if (!ir_try_propagate_operand(temp_map, NULL, &whole, &instruction->lhs,
+                                  changed)) {
       return 0;
     }
     break;
 
   case IR_OP_BRANCH_EQ:
-    if (!ir_try_propagate_operand(temp_map, NULL, &instruction->lhs, changed) ||
-        !ir_try_propagate_operand(temp_map, NULL, &instruction->rhs, changed)) {
+    if (!ir_try_propagate_operand(temp_map, NULL, &whole, &instruction->lhs,
+                                  changed) ||
+        !ir_try_propagate_operand(temp_map, NULL, &whole, &instruction->rhs,
+                                  changed)) {
       return 0;
     }
     break;
 
   case IR_OP_ASSIGN:
-    if (!ir_try_propagate_operand(temp_map, symbol_map, &instruction->lhs,
-                                  changed)) {
+    assigned.kept_bits = ir_cp_assign_kept_bits(function, instruction);
+    if (!ir_try_propagate_operand(temp_map, symbol_map, &assigned,
+                                  &instruction->lhs, changed)) {
       return 0;
     }
     break;
@@ -534,12 +620,14 @@ static int ir_propagate_instruction_operands(IRTempValueMap *temp_map,
   case IR_OP_CALL:
   case IR_OP_CALL_INDIRECT:
   case IR_OP_RETURN:
-    if (!ir_try_propagate_operand(temp_map, NULL, &instruction->lhs, changed) ||
-        !ir_try_propagate_operand(temp_map, NULL, &instruction->rhs, changed)) {
+    if (!ir_try_propagate_operand(temp_map, NULL, &whole, &instruction->lhs,
+                                  changed) ||
+        !ir_try_propagate_operand(temp_map, NULL, &whole, &instruction->rhs,
+                                  changed)) {
       return 0;
     }
     for (size_t i = 0; i < instruction->argument_count; i++) {
-      if (!ir_try_propagate_operand(temp_map, symbol_map,
+      if (!ir_try_propagate_operand(temp_map, symbol_map, &whole,
                                     &instruction->arguments[i], changed)) {
         return 0;
       }
@@ -1060,7 +1148,8 @@ static int ir_cp_visit(IRFunction *function, IRCopyPropState *state, size_t at,
     return 0;
   }
   if (rewrite) {
-    if (!ir_propagate_instruction_operands(&state->map, &state->symbol_map,
+    if (!ir_propagate_instruction_operands(function, &state->map,
+                                           &state->symbol_map,
                                            instruction, round_changed)) {
       return 0;
     }

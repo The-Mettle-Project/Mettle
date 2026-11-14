@@ -1,0 +1,25 @@
+import "std/io";
+
+fn remainder(p0: uint16) -> uint16 {
+  var l: uint16 = (uint16)0;
+  l = (uint16)7;
+  l = (p0 - l);
+  return (((uint16)0 | l) % ((l & (uint16)63) | (uint16)1));
+}
+
+@noinline fn remainder_at(q: uint16*) -> void {
+  *q = remainder(*q);
+}
+
+fn narrow(p0: int8) -> int32 {
+  var b: int8 = (int8)0;
+  b = p0 + (int8)100;
+  return (int32)((int8)0 | b);
+}
+
+fn main() -> int32 {
+  var m: uint16 = (uint16)0;
+  remainder_at(&m);
+  println("{(int64)m} {narrow((int8)100)}");
+  return 0;
+}
