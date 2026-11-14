@@ -1,0 +1,42 @@
+fn half(x: float64) -> float64 {
+    var y: float64 = x * 0.5;
+    prove(y == x / 2.0 || x != x);
+    return y;
+}
+
+fn square_is_not_negative(x: float32) -> float32 {
+    var y: float32 = x * x;
+    prove(y >= 0.0 || x != x);
+    return y;
+}
+
+fn round_trip(n: int32) -> float64 {
+    var d: float64 = (float64)n;
+    var back: int32 = (int32)d;
+    prove(back == n);
+    return d;
+}
+
+fn clamp_unit(x: float64) -> float64 {
+    var y: float64 = x;
+    if (y < 0.0) { y = 0.0; }
+    if (y > 1.0) { y = 1.0; }
+    prove((y >= 0.0 && y <= 1.0) || x != x);
+    return y;
+}
+
+fn widen(x: float32) -> float64 {
+    var d: float64 = (float64)x;
+    var back: float32 = (float32)d;
+    prove(back == x || x != x);
+    return d;
+}
+
+fn main() -> int32 {
+    if (half(3.0) != 1.5) { return 1; }
+    if (square_is_not_negative(-2.0) != 4.0) { return 2; }
+    if (round_trip(-7) != -7.0) { return 3; }
+    if (clamp_unit(2.5) != 1.0) { return 4; }
+    if (widen(0.25) != 0.25) { return 5; }
+    return 0;
+}

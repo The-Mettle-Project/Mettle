@@ -1,0 +1,21 @@
+fn root(x: float64) -> float64 {
+    return __mtl_sqrt(x);
+}
+
+theorem half_is_divide(x: float64) {
+    x * 0.5 == x / 2.0 || x != x
+} by smt;
+
+theorem doubling(x: float32) {
+    x * 2.0 == x + x || x != x
+} by smt;
+
+theorem negation_twice(x: float64) {
+    -(-x) == x || x != x
+} by smt;
+
+theorem root_is_not_negative(x: float64) {
+    root(x) >= 0.0 || x < 0.0 || x != x
+} by auto;
+
+fn main() -> int32 { return 0; }

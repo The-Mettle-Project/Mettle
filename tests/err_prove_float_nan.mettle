@@ -1,0 +1,8 @@
+fn trunc_in_range(x: float64) -> int64 {
+    if (x < 0.0 || x > 100.0) { return 0; }
+    var i: int64 = (int64)x;
+    prove(i >= 0 && i <= 100);
+    return i;
+}
+
+fn main() -> int32 { return (int32)trunc_in_range(42.5) - 42; }

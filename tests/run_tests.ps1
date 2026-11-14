@@ -1163,6 +1163,25 @@ $cases = @(
     Pattern       = 'prove in `overwrite` does not hold; it fails at p = \d+, q = \d+'
   },
   @{
+    Name          = "prove_floats"
+    Path          = "tests/prove_floats.mettle"
+    ShouldSucceed = $true
+    Args          = @()
+  },
+  @{
+    Name          = "theorem_floats"
+    Path          = "tests/theorem_floats.mettle"
+    ShouldSucceed = $true
+    Args          = @()
+  },
+  @{
+    Name          = "err_prove_float_nan"
+    Path          = "tests/err_prove_float_nan.mettle"
+    ShouldSucceed = $false
+    Args          = @()
+    Pattern       = 'prove in `trunc_in_range` does not hold; it fails at x = -?nan'
+  },
+  @{
     Name          = "err_prove_escaped_local"
     Path          = "tests/err_prove_escaped_local.mettle"
     ShouldSucceed = $false
@@ -4889,6 +4908,10 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "mettle smt failed: $out" }
   $expected = "strength reduction\s+unsat\s+magic division without the fixup\s+sat\s+\(\(x #x6fffffff\)\)\s+read over write\s+unsat\s+uninterpreted function congruence\s+unsat\s+a satisfiable store\s+sat"
   if ($out -notmatch $expected) { throw "mettle smt answers changed: $out" }
+  $out = & $CompilerPath smt "tests/smt_float.smt2" 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "mettle smt failed on floats: $out" }
+  $expected = "doubling by multiply and by add\s+unsat\s+addition is not associative\s+sat\s+a square root is never below zero\s+unsat\s+NaN absorbs addition\s+unsat\s+zero plus its negation is positive\s+unsat"
+  if ($out -notmatch $expected) { throw "mettle smt float answers changed: $out" }
   Write-CaseResult -Name "prove_and_smt_commands" -Passed $true
 }
 catch {

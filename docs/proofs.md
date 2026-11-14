@@ -176,11 +176,13 @@ own stretch of that memory. Locals never overlap each other or address zero,
 and an access at a fixed offset inside one never traps. A call keeps the bytes
 of a local whose address the function only loads, stores, offsets and
 compares; passing the address to a call, storing it, returning it or doing
-other arithmetic with it lets any call change the local. A pointer parameter
-may still hold an address inside a local, so a fact about a local that has to
-survive a store through a parameter does not follow. Block copies, as in
-assigning one struct to another, are not modeled; a function that makes one
-cannot be checked.
+other arithmetic with it lets any call change the local. Such a local is also
+apart from every access through a pointer that was not computed from a
+local's address, so a store through a parameter leaves it alone; a program
+that reaches a local through any other pointer has a memory error.
+
+Assigning one struct to another copies its bytes, up to 256 bytes. A struct
+parameter is the address of the caller's copy.
 
 ## How the prover sees a function
 
@@ -191,7 +193,7 @@ unfolded when the prover can give it a definition:
 ```mermaid
 flowchart TD
   F[function] --> E{body encodes?}
-  E -- loops, floats, block copies --> O[opaque]
+  E -- loops, square roots, large block copies --> O[opaque]
   E -- yes --> R{reads only its parameters?}
   R -- globals, memory, uninitialized locals --> O
   R -- yes --> C{recursive?}
@@ -329,6 +331,31 @@ checked by a differential fuzzer that compares each against the evaluator.
 Quantified formulas are treated as opaque atoms. That is sound for proofs,
 and a `sat` answer on a formula that contained one is reported as `unknown`.
 
+## Floating point
+
+`float32` and `float64` values are their IEEE 754 bits. Addition,
+subtraction, multiplication, division, comparison, negation and the
+conversions to and from integers and between the two widths are built as
+bit-vector circuits in `src/proof/smt_fp.c` and round to nearest, ties to
+even. Subnormals, signed zeros and infinities follow the standard, and a
+conversion to an integer that is out of range or not a number gives
+`INT64_MIN` as the interpreter does. An operation that produces NaN gives
+some quiet NaN chosen by an unknown function of its operands, since the
+payload x86 keeps depends on operand order. When two versions of a function
+that returns a float are compared, for a rewrite rule or a pass, two NaN
+results count as equal. The circuits are checked against the host's SSE
+arithmetic on edge cases and random operands.
+
+A claim about floats has to hold for NaN too:
+
+```text
+float.mettle:4:10: error: prove in `trunc_in_range` does not hold; it fails at x = nan
+```
+
+The guard `x < 0.0 || x > 100.0` is false for NaN, so NaN reaches the
+conversion and becomes `INT64_MIN`. Square roots and half-precision values
+are not modeled yet.
+
 ## mettle smt
 
 ```bash
@@ -338,7 +365,11 @@ mettle smt --stats problem.smt2
 
 `mettle smt` reads SMT-LIB 2: `declare-const`, `declare-fun`, `define-fun`,
 `assert`, `push`, `pop`, `check-sat`, `get-model`, `get-value` and `echo`, with
-the `QF_ABV` operators, indexed operators, `let` and `ite`. `--stats` prints
+the `QF_ABV` operators, indexed operators, `let` and `ite`. It also reads
+`QF_FP` over `Float16`, `Float32` and `Float64` with the rounding mode `RNE`:
+`fp`, the special constants, `fp.add`, `fp.sub`, `fp.mul`, `fp.div`,
+`fp.sqrt`, `fp.abs`, `fp.neg`, the comparisons, the classification
+predicates and `to_fp`. `--stats` prints
 the term, gate, clause and conflict counts and the time spent blasting,
 searching and checking. `--no-certify` skips the refutation check and
 `--no-normalize` skips the polynomial normal form. A file ending in `.cnf`,
@@ -406,7 +437,7 @@ and subtract equals the multiplication, signed and unsigned.
 
 [Rewrite rules](rewrite-rules.md) are proved for every input before the
 compiler applies them, and fall back to generated inputs only when the solver
-cannot model a side, such as one that computes with floats. A rule can also
+cannot model a side, such as one that takes a square root. A rule can also
 carry a `proof` block of tactics, which makes the optimizer apply an
 identity that only an induction establishes.
 [Translation validation](translation-validation.md) proves each pass

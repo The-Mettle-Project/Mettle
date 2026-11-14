@@ -22,6 +22,7 @@ typedef struct {
   int aggregate;
   int temp;
   int mentioned;
+  int fp;
 } IrsVar;
 
 typedef struct {
@@ -71,8 +72,7 @@ static int irs_is_foreign(const IRSmtFrame *f, SmtTerm t);
 static size_t irs_lockstep_find(IrsEnc *e, const char *label);
 static void irs_apply_phis(IrsEnc *e, size_t target, const char *from,
                            SmtTerm *env);
-static void irs_lockstep_visit(IrsEnc *e, size_t loop, int back,
-                               SmtTerm reach);
+static void irs_lockstep_visit(IrsEnc *e, size_t loop, int back, SmtTerm reach);
 static void irs_record_site(IrsEnc *e, SmtTerm reach, SmtTerm cond,
                             const SourceLocation *at, int kind);
 
@@ -217,12 +217,12 @@ SmtTerm ir_smt_binary(SmtCtx *ctx, const char *op, int is_unsigned, SmtTerm a,
     return smt_ite(ctx, smt_eq(ctx, b, minus_one), special, normal);
   }
   if (strcmp(op, "&&") == 0) {
-    return irs_bool_word(ctx, smt_and(ctx, irs_nonzero(ctx, a),
-                                      irs_nonzero(ctx, b)));
+    return irs_bool_word(
+        ctx, smt_and(ctx, irs_nonzero(ctx, a), irs_nonzero(ctx, b)));
   }
   if (strcmp(op, "||") == 0) {
-    return irs_bool_word(ctx, smt_or(ctx, irs_nonzero(ctx, a),
-                                     irs_nonzero(ctx, b)));
+    return irs_bool_word(ctx,
+                         smt_or(ctx, irs_nonzero(ctx, a), irs_nonzero(ctx, b)));
   }
   int ok;
   SmtTerm c = irs_compare(ctx, op, is_unsigned, a, b, &ok);
@@ -294,8 +294,7 @@ static SmtTerm irs_shared_sorted(IrsEnc *e, const char *kind, const char *name,
                                  SmtSort sort) {
   IRSmtFrame *f = e->frame;
   char key[256];
-  snprintf(key, sizeof(key), "%s%s:%s", e->prefix ? e->prefix : "", kind,
-           name);
+  snprintf(key, sizeof(key), "%s%s:%s", e->prefix ? e->prefix : "", kind, name);
   for (size_t i = 0; i < f->shared_count; i++) {
     if (strcmp(f->shared[i].name, key) == 0) {
       return f->shared[i].term;
@@ -361,7 +360,8 @@ static size_t irs_region_of(const IRSmtFrame *f, SmtCtx *ctx, SmtTerm addr,
                             int size) {
   SmtTerm base = addr;
   uint64_t offset = 0;
-  if (smt_term_kind(ctx, addr) == SMT_K_BVADD && smt_term_nargs(ctx, addr) == 2) {
+  if (smt_term_kind(ctx, addr) == SMT_K_BVADD &&
+      smt_term_nargs(ctx, addr) == 2) {
     SmtTerm x = smt_term_arg(ctx, addr, 0), y = smt_term_arg(ctx, addr, 1);
     uint64_t w[4];
     if (smt_term_is_const(ctx, y) && smt_term_const_words(ctx, y, w)) {
@@ -407,10 +407,10 @@ static SmtTerm irs_strip_dead_stores(const IRSmtFrame *f, SmtCtx *ctx,
               ? inner
               : smt_store(ctx, inner, addr, smt_term_arg(ctx, mem, 2));
   } else if (kind == SMT_K_ITE) {
-    out = smt_ite(
-        ctx, smt_term_arg(ctx, mem, 0),
-        irs_strip_dead_stores(f, ctx, smt_term_arg(ctx, mem, 1), memo),
-        irs_strip_dead_stores(f, ctx, smt_term_arg(ctx, mem, 2), memo));
+    out =
+        smt_ite(ctx, smt_term_arg(ctx, mem, 0),
+                irs_strip_dead_stores(f, ctx, smt_term_arg(ctx, mem, 1), memo),
+                irs_strip_dead_stores(f, ctx, smt_term_arg(ctx, mem, 2), memo));
   }
   if (memo->count == memo->cap) {
     memo->cap = memo->cap ? memo->cap * 2u : 64u;
@@ -437,9 +437,35 @@ static SmtTerm irs_access_trap(IrsEnc *e, SmtTerm addr, int size) {
                 smt_apply(ctx, invalid, 1, &addr));
 }
 
+static SmtTerm irs_float_constant(SmtCtx *ctx, double value, int bits) {
+  if (bits == 32) {
+    float narrow = (float)value;
+    uint32_t raw;
+    memcpy(&raw, &narrow, sizeof(raw));
+    return smt_bv_u64(ctx, 64, raw);
+  }
+  uint64_t raw;
+  memcpy(&raw, &value, sizeof(raw));
+  return smt_bv_u64(ctx, 64, raw);
+}
+
+static int irs_float_bits_of_type(const char *type) {
+  if (!type) {
+    return 0;
+  }
+  if (strcmp(type, "float64") == 0) {
+    return 64;
+  }
+  if (strcmp(type, "float32") == 0) {
+    return 32;
+  }
+  return 0;
+}
+
 static int irs_access_size(IrsEnc *e, const IRInstruction *insn) {
-  if (insn->is_float) {
-    irs_fail(e, "it loads or stores a float", NULL);
+  if (insn->is_float && insn->rhs.kind == IR_OPERAND_INT &&
+      insn->rhs.int_value != 4 && insn->rhs.int_value != 8) {
+    irs_fail(e, "it loads or stores a half-precision float", NULL);
     return 0;
   }
   if (insn->rhs.kind != IR_OPERAND_INT ||
@@ -452,7 +478,7 @@ static int irs_access_size(IrsEnc *e, const IRInstruction *insn) {
 }
 
 static SmtTerm irs_load_bytes(IrsEnc *e, SmtTerm addr, int size,
-                               int is_unsigned) {
+                              int is_unsigned) {
   SmtCtx *ctx = e->ctx;
   SmtTerm mem = e->env[e->mem_id];
   SmtTerm v = 0;
@@ -541,8 +567,9 @@ static SmtTerm irs_region(IrsEnc *e, const char *name, uint64_t size,
   if (size > 1) {
     last = smt_mk2(ctx, SMT_K_BVADD, base, smt_bv_u64(ctx, 64, size - 1u));
   }
-  SmtTerm fact = smt_and(ctx, smt_not(ctx, smt_eq(ctx, base, smt_bv_u64(ctx, 64, 0))),
-                         smt_mk2(ctx, SMT_K_BVULE, base, last));
+  SmtTerm fact =
+      smt_and(ctx, smt_not(ctx, smt_eq(ctx, base, smt_bv_u64(ctx, 64, 0))),
+              smt_mk2(ctx, SMT_K_BVULE, base, last));
   for (size_t i = 0; i < f->region_count; i++) {
     SmtTerm other = f->region_base[i];
     SmtTerm other_last = smt_mk2(ctx, SMT_K_BVADD, other,
@@ -764,8 +791,8 @@ static SmtTerm irs_read(IrsEnc *e, const IROperand *op) {
     return irs_shared(e, "undefined", op->name);
   }
   case IR_OPERAND_FLOAT:
-    irs_fail(e, "it uses a float", NULL);
-    break;
+    return irs_float_constant(ctx, op->float_value,
+                              op->float_bits == 32 ? 32 : 64);
   case IR_OPERAND_STRING:
     irs_fail(e, "it uses a string", NULL);
     break;
@@ -801,6 +828,139 @@ static void irs_write(IrsEnc *e, const IROperand *dest, SmtTerm value) {
   e->env[id] = value;
 }
 
+static int irs_operand_float_bits(IrsEnc *e, const IROperand *op) {
+  if (op->kind == IR_OPERAND_FLOAT) {
+    return op->float_bits == 32 ? 32 : 64;
+  }
+  if ((op->kind != IR_OPERAND_TEMP && op->kind != IR_OPERAND_SYMBOL) ||
+      !op->name) {
+    return 0;
+  }
+  if (op->float_bits) {
+    return op->float_bits == 32 ? 32 : 64;
+  }
+  size_t id = irs_var_lookup(e, op->name, 0);
+  return id == (size_t)-1 ? 0 : e->vars[id].fp;
+}
+
+static void irs_mark_fp(IrsEnc *e, const IROperand *dest, int bits) {
+  if ((dest->kind == IR_OPERAND_TEMP || dest->kind == IR_OPERAND_SYMBOL) &&
+      dest->name && bits) {
+    e->vars[irs_var_lookup(e, dest->name, 1)].fp = bits;
+  }
+}
+
+static SmtTerm irs_widen_float(SmtCtx *ctx, SmtTerm narrow) {
+  unsigned w = smt_sort_width(ctx, smt_term_sort(ctx, narrow));
+  return w >= 64u ? narrow : smt_zext(ctx, narrow, 64u - w);
+}
+
+static SmtTerm irs_read_float(IrsEnc *e, const IROperand *op, int bits) {
+  if (op->kind == IR_OPERAND_FLOAT) {
+    return irs_float_constant(e->ctx, op->float_value, bits);
+  }
+  return irs_read(e, op);
+}
+
+static SmtTerm irs_float_nan(IrsEnc *e, const char *op, int bits, SmtTerm x,
+                             SmtTerm y) {
+  SmtCtx *ctx = e->ctx;
+  char name[48];
+  snprintf(name, sizeof(name), "fp.nan.%s.%d", op, bits);
+  e->frame->chose_nan = 1;
+  SmtSort word = smt_bv_sort(ctx, (unsigned)bits);
+  SmtSort domain[2] = {word, word};
+  SmtFunc f = smt_func(ctx, name, 2, domain, word);
+  SmtTerm args[2] = {x, y};
+  return smt_fp_quiet_nan(ctx, bits == 32 ? 8 : 11, bits == 32 ? 24 : 53,
+                          smt_apply(ctx, f, 2, args));
+}
+
+static SmtTerm irs_float_binary(IrsEnc *e, const char *op, int bits, SmtTerm a,
+                                SmtTerm b) {
+  SmtCtx *ctx = e->ctx;
+  unsigned eb = bits == 32 ? 8 : 11, sb = bits == 32 ? 24 : 53;
+  SmtTerm x = smt_extract(ctx, a, (unsigned)bits - 1u, 0);
+  SmtTerm y = smt_extract(ctx, b, (unsigned)bits - 1u, 0);
+  if (strcmp(op, "+") == 0) {
+    return irs_widen_float(
+        ctx,
+        smt_fp_add(ctx, eb, sb, x, y, irs_float_nan(e, "add", bits, x, y)));
+  }
+  if (strcmp(op, "-") == 0) {
+    return irs_widen_float(
+        ctx,
+        smt_fp_sub(ctx, eb, sb, x, y, irs_float_nan(e, "sub", bits, x, y)));
+  }
+  if (strcmp(op, "*") == 0) {
+    return irs_widen_float(
+        ctx,
+        smt_fp_mul(ctx, eb, sb, x, y, irs_float_nan(e, "mul", bits, x, y)));
+  }
+  if (strcmp(op, "/") == 0) {
+    return irs_widen_float(
+        ctx,
+        smt_fp_div(ctx, eb, sb, x, y, irs_float_nan(e, "div", bits, x, y)));
+  }
+  SmtTerm truth;
+  if (strcmp(op, "==") == 0) {
+    truth = smt_fp_eq(ctx, eb, sb, x, y);
+  } else if (strcmp(op, "!=") == 0) {
+    truth = smt_not(ctx, smt_fp_eq(ctx, eb, sb, x, y));
+  } else if (strcmp(op, "<") == 0) {
+    truth = smt_fp_lt(ctx, eb, sb, x, y);
+  } else if (strcmp(op, "<=") == 0) {
+    truth = smt_fp_le(ctx, eb, sb, x, y);
+  } else if (strcmp(op, ">") == 0) {
+    truth = smt_fp_lt(ctx, eb, sb, y, x);
+  } else if (strcmp(op, ">=") == 0) {
+    truth = smt_fp_le(ctx, eb, sb, y, x);
+  } else {
+    irs_fail(e, "it uses the float operator", op);
+    return 0;
+  }
+  return irs_bool_word(ctx, truth);
+}
+
+static SmtTerm irs_float_cast(IrsEnc *e, SmtTerm a, int bits, const char *type,
+                              int target_bits) {
+  SmtCtx *ctx = e->ctx;
+  unsigned eb = bits == 32 ? 8 : 11, sb = bits == 32 ? 24 : 53;
+  SmtTerm x = smt_extract(ctx, a, (unsigned)bits - 1u, 0);
+  if (target_bits == bits) {
+    return irs_widen_float(ctx, x);
+  }
+  if (target_bits) {
+    unsigned teb = target_bits == 32 ? 8 : 11,
+             tsb = target_bits == 32 ? 24 : 53;
+    char name[48];
+    snprintf(name, sizeof(name), "fp.nan.convert.%d.%d", bits, target_bits);
+    e->frame->chose_nan = 1;
+    SmtSort from = smt_bv_sort(ctx, (unsigned)bits);
+    SmtFunc f =
+        smt_func(ctx, name, 1, &from, smt_bv_sort(ctx, (unsigned)target_bits));
+    SmtTerm nan = smt_fp_quiet_nan(ctx, teb, tsb, smt_apply(ctx, f, 1, &x));
+    return irs_widen_float(ctx, smt_fp_convert(ctx, eb, sb, teb, tsb, x, nan));
+  }
+  if (strcmp(type, "bool") == 0) {
+    SmtTerm magnitude = smt_extract(ctx, x, (unsigned)bits - 2u, 0);
+    return irs_bool_word(
+        ctx, smt_not(ctx, smt_eq(ctx, magnitude,
+                                 smt_bv_u64(ctx, (unsigned)bits - 1u, 0))));
+  }
+  int size, is_unsigned;
+  size_t len = strlen(type);
+  if ((len > 0 && type[len - 1] == '*') ||
+      !irs_parse_scalar(type, &size, &is_unsigned)) {
+    irs_fail(e, "it casts a float to", type);
+    return 0;
+  }
+  SmtTerm invalid = smt_bv_u64(ctx, 64, 0x8000000000000000ull);
+  SmtTerm v =
+      smt_fp_to_int(ctx, eb, sb, x, !(size == 8 && is_unsigned), invalid);
+  return ir_smt_narrow(ctx, v, size, is_unsigned);
+}
+
 static size_t irs_label(IrsEnc *e, const char *name) {
   for (size_t i = 0; i < e->count; i++) {
     if (e->insns[i].op == IR_OP_LABEL && e->insns[i].text &&
@@ -822,8 +982,9 @@ static void irs_edge(IrsEnc *e, size_t at, const char *label, SmtTerm cond) {
     return;
   }
   if (target <= at) {
-    if (!e->frame->havoc_loops) {
-      irs_fail(e, "it has a loop", NULL);
+    if (!e->frame->havoc_loops || !e->loop_end) {
+      irs_fail(e, e->prefix ? "a callee it inlines has a loop" : "it has a loop",
+               NULL);
       return;
     }
     size_t loop = irs_lockstep_find(e, label);
@@ -874,7 +1035,7 @@ static SmtTerm irs_materialize(IrsEnc *e, size_t id, SmtTerm v) {
   IROperand op;
   memset(&op, 0, sizeof(op));
   op.kind = e->vars[id].declared || e->vars[id].param ? IR_OPERAND_TEMP
-                                                       : IR_OPERAND_SYMBOL;
+                                                      : IR_OPERAND_SYMBOL;
   op.name = (char *)e->vars[id].name;
   SmtTerm saved = e->env[id];
   e->env[id] = 0;
@@ -991,8 +1152,7 @@ SmtFunc ir_smt_trap_func(SmtCtx *ctx, const char *name, size_t arity) {
     domain[i] = smt_bv_sort(ctx, 64);
   }
   snprintf(trap_name, sizeof(trap_name), "%s!trap", name);
-  return smt_func(ctx, trap_name, (unsigned)arity, domain,
-                  smt_bool_sort(ctx));
+  return smt_func(ctx, trap_name, (unsigned)arity, domain, smt_bool_sort(ctx));
 }
 
 static int irs_is_trap_call(const char *name) {
@@ -1448,7 +1608,23 @@ static void irs_step(IrsEnc *e, size_t pc) {
     return;
   }
   case IR_OP_BRANCH_EQ: {
-    SmtTerm eq = smt_eq(ctx, irs_read(e, &insn->lhs), irs_read(e, &insn->rhs));
+    int fa = irs_operand_float_bits(e, &insn->lhs);
+    int fb = irs_operand_float_bits(e, &insn->rhs);
+    SmtTerm eq;
+    if (fa || fb) {
+      if ((fa && fb && fa != fb)) {
+        irs_fail(e, "a branch compares floats of two widths", NULL);
+        return;
+      }
+      int bits = fa ? fa : fb;
+      unsigned w = (unsigned)bits;
+      eq = smt_fp_eq(
+          ctx, bits == 32 ? 8 : 11, bits == 32 ? 24 : 53,
+          smt_extract(ctx, irs_read_float(e, &insn->lhs, bits), w - 1u, 0),
+          smt_extract(ctx, irs_read_float(e, &insn->rhs, bits), w - 1u, 0));
+    } else {
+      eq = smt_eq(ctx, irs_read(e, &insn->lhs), irs_read(e, &insn->rhs));
+    }
     irs_edge(e, pc, insn->text, eq);
     e->reach = smt_and(ctx, e->reach, smt_not(ctx, eq));
     return;
@@ -1460,7 +1636,12 @@ static void irs_step(IrsEnc *e, size_t pc) {
     }
     size_t id = irs_var_lookup(e, insn->dest.name, 1);
     int size, is_unsigned;
-    if (!irs_parse_scalar(insn->text, &size, &is_unsigned)) {
+    int float_bits = irs_float_bits_of_type(insn->text);
+    e->vars[id].fp = float_bits;
+    if (float_bits) {
+      size = float_bits / 8;
+      is_unsigned = 1;
+    } else if (!irs_parse_scalar(insn->text, &size, &is_unsigned)) {
       uint64_t bytes = irs_aggregate_size(insn);
       if (!bytes) {
         irs_fail(e, "it declares a local of type", insn->text);
@@ -1478,8 +1659,8 @@ static void irs_step(IrsEnc *e, size_t pc) {
     e->vars[id].size = size;
     e->vars[id].is_unsigned = is_unsigned;
     if (e->vars[id].addressed) {
-      e->vars[id].addr = irs_region(e, insn->dest.name, (uint64_t)size,
-                                    !e->vars[id].escaped);
+      e->vars[id].addr =
+          irs_region(e, insn->dest.name, (uint64_t)size, !e->vars[id].escaped);
       e->vars[id].region_size = (uint64_t)size;
       e->vars[id].slot = 1;
       return;
@@ -1507,12 +1688,30 @@ static void irs_step(IrsEnc *e, size_t pc) {
     if (d && irs_holds_aggregate(e, &insn->lhs)) {
       d->aggregate = 1;
     }
-    irs_write(e, &insn->dest, irs_read(e, &insn->lhs));
+    irs_write(e, &insn->dest,
+              d && d->fp ? irs_read_float(e, &insn->lhs, d->fp)
+                         : irs_read(e, &insn->lhs));
+    if (d && !d->fp) {
+      irs_mark_fp(e, &insn->dest, irs_operand_float_bits(e, &insn->lhs));
+    }
     return;
   }
   case IR_OP_BINARY: {
-    if (insn->is_float || !insn->text) {
-      irs_fail(e, "it computes with floats", NULL);
+    if (!insn->text) {
+      irs_fail(e, "a binary operation has no operator", NULL);
+      return;
+    }
+    if (insn->is_float) {
+      int bits = insn->float_bits == 32 ? 32 : 64;
+      SmtTerm v = irs_float_binary(e, insn->text, bits,
+                                   irs_read_float(e, &insn->lhs, bits),
+                                   irs_read_float(e, &insn->rhs, bits));
+      if (v) {
+        irs_write(e, &insn->dest, v);
+        if (strchr("+-*/", insn->text[0]) && insn->text[1] == '\0') {
+          irs_mark_fp(e, &insn->dest, bits);
+        }
+      }
       return;
     }
     SmtTerm a = irs_read(e, &insn->lhs), b = irs_read(e, &insn->rhs);
@@ -1527,8 +1726,49 @@ static void irs_step(IrsEnc *e, size_t pc) {
     return;
   }
   case IR_OP_UNARY: {
-    if (insn->is_float || !insn->text) {
-      irs_fail(e, "it computes with floats", NULL);
+    if (!insn->text) {
+      irs_fail(e, "a unary operation has no operator", NULL);
+      return;
+    }
+    if (strcmp(insn->text, "f32bits") == 0 ||
+        (strcmp(insn->text, "bitsf") == 0 && insn->float_bits == 32)) {
+      SmtTerm a = irs_read_float(e, &insn->lhs, 32);
+      irs_write(e, &insn->dest,
+                irs_widen_float(ctx, smt_extract(ctx, a, 31, 0)));
+      if (strcmp(insn->text, "bitsf") == 0) {
+        irs_mark_fp(e, &insn->dest, 32);
+      }
+      return;
+    }
+    if (strcmp(insn->text, "f64bits") == 0 ||
+        strcmp(insn->text, "bitsf") == 0) {
+      irs_write(e, &insn->dest, irs_read_float(e, &insn->lhs, 64));
+      if (strcmp(insn->text, "bitsf") == 0) {
+        irs_mark_fp(e, &insn->dest, 64);
+      }
+      return;
+    }
+    if (insn->is_float) {
+      int bits = insn->float_bits == 32 ? 32 : 64;
+      SmtTerm a = irs_read_float(e, &insn->lhs, bits);
+      unsigned w = (unsigned)bits;
+      SmtTerm narrow = smt_extract(ctx, a, w - 1u, 0);
+      if (strcmp(insn->text, "-") == 0) {
+        irs_write(
+            e, &insn->dest,
+            irs_widen_float(ctx, smt_fp_neg(ctx, bits == 32 ? 8 : 11,
+                                            bits == 32 ? 24 : 53, narrow)));
+      } else if (strcmp(insn->text, "+") == 0) {
+        irs_write(e, &insn->dest, a);
+      } else if (strcmp(insn->text, "sqrt") == 0) {
+        unsigned eb = bits == 32 ? 8 : 11, sb = bits == 32 ? 24 : 53;
+        SmtTerm nan = irs_float_nan(e, "sqrt", bits, narrow, narrow);
+        irs_write(e, &insn->dest,
+                  irs_widen_float(ctx, smt_fp_sqrt(ctx, eb, sb, narrow, nan)));
+      } else {
+        irs_fail(e, "it uses the float operator", insn->text);
+      }
+      irs_mark_fp(e, &insn->dest, bits);
       return;
     }
     SmtTerm a = irs_read(e, &insn->lhs), v;
@@ -1549,11 +1789,27 @@ static void irs_step(IrsEnc *e, size_t pc) {
   }
   case IR_OP_CAST: {
     const char *type = insn->text ? insn->text : "";
-    SmtTerm a = irs_read(e, &insn->lhs);
     size_t len = strlen(type);
     int size, is_unsigned;
+    int target_bits = irs_float_bits_of_type(type);
     if (insn->is_float) {
-      irs_fail(e, "it casts a float", NULL);
+      int bits = insn->float_bits == 32 ? 32 : 64;
+      SmtTerm a = irs_read_float(e, &insn->lhs, bits);
+      SmtTerm v = irs_float_cast(e, a, bits, type, target_bits);
+      if (v) {
+        irs_write(e, &insn->dest, v);
+        irs_mark_fp(e, &insn->dest, target_bits);
+      }
+      return;
+    }
+    SmtTerm a = irs_read(e, &insn->lhs);
+    if (target_bits) {
+      unsigned eb = target_bits == 32 ? 8 : 11,
+               sb = target_bits == 32 ? 24 : 53;
+      irs_write(e, &insn->dest,
+                irs_widen_float(
+                    ctx, smt_fp_from_int(ctx, eb, sb, a, !insn->is_unsigned)));
+      irs_mark_fp(e, &insn->dest, target_bits);
       return;
     }
     if ((len > 0 && type[len - 1] == '*') || strcmp(type, "cstring") == 0 ||
@@ -1582,6 +1838,11 @@ static void irs_step(IrsEnc *e, size_t pc) {
     SmtTerm truth;
     if (insn->text && insn->argument_count > 1) {
       int ok;
+      if (irs_operand_float_bits(e, &insn->lhs) ||
+          irs_operand_float_bits(e, &insn->arguments[1])) {
+        irs_fail(e, "a select compares floats", NULL);
+        return;
+      }
       truth = irs_compare(ctx, insn->text, insn->is_unsigned,
                           irs_read(e, &insn->lhs),
                           irs_read(e, &insn->arguments[1]), &ok);
@@ -1599,6 +1860,9 @@ static void irs_step(IrsEnc *e, size_t pc) {
     SmtTerm v = smt_ite(ctx, truth, irs_read(e, &insn->rhs),
                         irs_read(e, &insn->arguments[0]));
     irs_write(e, &insn->dest, v);
+    int fp = irs_operand_float_bits(e, &insn->rhs);
+    irs_mark_fp(e, &insn->dest,
+                fp ? fp : irs_operand_float_bits(e, &insn->arguments[0]));
     return;
   }
   case IR_OP_RETURN: {
@@ -1620,8 +1884,12 @@ static void irs_step(IrsEnc *e, size_t pc) {
     }
     SmtTerm addr = irs_read(e, &insn->lhs);
     irs_trap(e, irs_access_trap(e, addr, size));
-    irs_write(e, &insn->dest,
-              irs_load_bytes(e, addr, size, insn->is_unsigned));
+    irs_write(
+        e, &insn->dest,
+        irs_load_bytes(e, addr, size, insn->is_unsigned || insn->is_float));
+    if (insn->is_float) {
+      irs_mark_fp(e, &insn->dest, size * 8);
+    }
     return;
   }
   case IR_OP_STORE: {
@@ -1692,8 +1960,8 @@ static void irs_escape(IrsEnc *e, size_t origin) {
 }
 
 static int irs_flow(IrsEnc *e, const IROperand *dest, size_t origin) {
-  if (!origin || (dest->kind != IR_OPERAND_TEMP &&
-                  dest->kind != IR_OPERAND_SYMBOL) ||
+  if (!origin ||
+      (dest->kind != IR_OPERAND_TEMP && dest->kind != IR_OPERAND_SYMBOL) ||
       !dest->name) {
     return 0;
   }
@@ -1748,8 +2016,8 @@ static void irs_find_escapes(IrsEnc *e) {
         changed |= irs_flow(e, &insn->dest, irs_origin(e, &insn->lhs));
         break;
       case IR_OP_BINARY:
-        if (insn->text && (strcmp(insn->text, "+") == 0 ||
-                           strcmp(insn->text, "-") == 0)) {
+        if (insn->text &&
+            (strcmp(insn->text, "+") == 0 || strcmp(insn->text, "-") == 0)) {
           size_t a = irs_origin(e, &insn->lhs), b = irs_origin(e, &insn->rhs);
           if (a && b) {
             irs_escape(e, a);
@@ -1773,8 +2041,15 @@ static void irs_find_escapes(IrsEnc *e) {
   for (size_t i = 0; i < e->count; i++) {
     const IRInstruction *insn = &e->insns[i];
     switch (insn->op) {
+    case IR_OP_ADDRESS_OF: {
+      size_t held = irs_origin(e, &insn->lhs);
+      if (held && insn->lhs.name &&
+          held != irs_var_lookup(e, insn->lhs.name, 1) + 1u) {
+        irs_escape(e, held);
+      }
+      break;
+    }
     case IR_OP_LOAD:
-    case IR_OP_ADDRESS_OF:
     case IR_OP_DECLARE_LOCAL:
     case IR_OP_ASSIGN:
     case IR_OP_CAST:
@@ -1794,9 +2069,9 @@ static void irs_find_escapes(IrsEnc *e) {
       irs_escape(e, irs_origin(e, &insn->lhs));
       break;
     case IR_OP_BINARY:
-      if (!insn->text || (strcmp(insn->text, "+") != 0 &&
-                          strcmp(insn->text, "-") != 0 &&
-                          !irs_is_compare(insn->text))) {
+      if (!insn->text ||
+          (strcmp(insn->text, "+") != 0 && strcmp(insn->text, "-") != 0 &&
+           !irs_is_compare(insn->text))) {
         irs_escape(e, irs_origin(e, &insn->lhs));
         irs_escape(e, irs_origin(e, &insn->rhs));
       }
@@ -1835,10 +2110,14 @@ static int irs_run(IrsEnc *e) {
     size_t id = irs_var_lookup(e, fn->parameter_names[i], 1);
     int size = 8, is_unsigned = 0;
     const char *type = fn->parameter_types ? fn->parameter_types[i] : NULL;
-    if (type && !irs_parse_scalar(type, &size, &is_unsigned)) {
-      const MtlcType *pt =
-          e->frame->program ? ir_program_lookup_type(e->frame->program, type)
-                            : NULL;
+    e->vars[id].fp = irs_float_bits_of_type(type);
+    if (e->vars[id].fp) {
+      size = e->vars[id].fp / 8;
+      is_unsigned = 1;
+    } else if (type && !irs_parse_scalar(type, &size, &is_unsigned)) {
+      const MtlcType *pt = e->frame->program
+                               ? ir_program_lookup_type(e->frame->program, type)
+                               : NULL;
       if (!pt || pt->size == 0 ||
           (pt->kind != MTLC_TYPE_STRUCT && pt->kind != MTLC_TYPE_ARRAY &&
            pt->kind != MTLC_TYPE_TAGGED_ENUM)) {
@@ -1954,8 +2233,8 @@ void ir_smt_frame_init(IRSmtFrame *frame, SmtCtx *ctx, const IRFunction *fn,
   frame->ctx = ctx;
   frame->program = program;
   frame->param_count = fn ? fn->parameter_count : 0;
-  frame->params = calloc(frame->param_count ? frame->param_count : 1u,
-                         sizeof(SmtTerm));
+  frame->params =
+      calloc(frame->param_count ? frame->param_count : 1u, sizeof(SmtTerm));
   for (size_t i = 0; i < frame->param_count; i++) {
     char name[160];
     snprintf(name, sizeof(name), "%s",
@@ -1990,8 +2269,7 @@ void ir_smt_frame_free(IRSmtFrame *frame) {
 }
 
 int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
-                  const IRInstruction *insns, size_t count,
-                  IRSmtOutcome *out) {
+                  const IRInstruction *insns, size_t count, IRSmtOutcome *out) {
   IrsEnc e;
   memset(&e, 0, sizeof(e));
   e.frame = frame;
@@ -2151,8 +2429,8 @@ static SmtTerm irs_lockstep_obligations(IRSmtFrame *f) {
           if (v->side != s || v->loop != li || v->back != back) {
             continue;
           }
-          mem[s] = mem[s] ? smt_ite(ctx, v->reach, v->memory, mem[s])
-                          : v->memory;
+          mem[s] =
+              mem[s] ? smt_ite(ctx, v->reach, v->memory, mem[s]) : v->memory;
           for (size_t i = 0; i < l->name_count; i++) {
             if (!v->values[i]) {
               continue;
@@ -2188,9 +2466,9 @@ static SmtTerm irs_lockstep_obligations(IRSmtFrame *f) {
 
 void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
                               const IRInstruction *a_insns, size_t a_count,
-                              const IRFunction *b,
-                              const IRInstruction *b_insns, size_t b_count,
-                              const IRFunction *guard, IRSmtReport *report) {
+                              const IRFunction *b, const IRInstruction *b_insns,
+                              size_t b_count, const IRFunction *guard,
+                              IRSmtReport *report) {
   memset(report, 0, sizeof(*report));
   report->verdict = IR_SMT_UNKNOWN;
   if (a->parameter_count != b->parameter_count ||
@@ -2225,12 +2503,24 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
       snprintf(report->why, sizeof(report->why), "the guard: %s", og.why);
       goto done;
     }
-    assume = smt_and(ctx, smt_not(ctx, og.trap),
-                     irs_nonzero(ctx, og.result));
+    assume = smt_and(ctx, smt_not(ctx, og.trap), irs_nonzero(ctx, og.result));
   }
   assume = smt_and(ctx, assume, ir_smt_frame_assumption(&frame));
   SmtTerm same_trap = smt_iff(ctx, oa.trap, ob.trap);
   SmtTerm same_result = smt_eq(ctx, oa.result, ob.result);
+  int result_bits = irs_float_bits_of_type(a->return_type_name);
+  if (result_bits &&
+      result_bits == irs_float_bits_of_type(b->return_type_name)) {
+    unsigned w = (unsigned)result_bits;
+    unsigned eb = w == 32 ? 8 : 11, sb = w == 32 ? 24 : 53;
+    same_result =
+        smt_or(ctx, same_result,
+               smt_and(ctx,
+                       smt_fp_is_nan(ctx, eb, sb,
+                                     smt_extract(ctx, oa.result, w - 1u, 0)),
+                       smt_fp_is_nan(ctx, eb, sb,
+                                     smt_extract(ctx, ob.result, w - 1u, 0))));
+  }
   int frames_dead = !irs_returns_aggregate(a) && !irs_returns_aggregate(b);
   if (oa.memory != ob.memory && frame.region_count && frames_dead) {
     IrsMemo memo;
@@ -2251,11 +2541,10 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
                      smt_or(ctx, smt_mk2(ctx, SMT_K_BVULT, k, base),
                             smt_mk2(ctx, SMT_K_BVULT, last, k)));
     }
-    same_result = smt_and(
-        ctx, same_result,
-        smt_implies(ctx, live,
-                    smt_eq(ctx, smt_select(ctx, oa.memory, k),
-                           smt_select(ctx, ob.memory, k))));
+    same_result = smt_and(ctx, same_result,
+                          smt_implies(ctx, live,
+                                      smt_eq(ctx, smt_select(ctx, oa.memory, k),
+                                             smt_select(ctx, ob.memory, k))));
   }
   SmtTerm same_value = smt_implies(ctx, smt_not(ctx, oa.trap), same_result);
   SmtTerm claim = smt_and(ctx, same_trap, same_value);
@@ -2273,8 +2562,10 @@ void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
   if (r == SMT_UNSAT) {
     report->verdict = IR_SMT_PROVED;
   } else if (r == SMT_SAT && frame.lockstep) {
+    snprintf(report->why, sizeof(report->why), "the loops do not stay in step");
+  } else if (r == SMT_SAT && frame.chose_nan) {
     snprintf(report->why, sizeof(report->why),
-             "the loops do not stay in step");
+             "the sides may differ only in which NaN they produce");
   } else if (r == SMT_SAT) {
     report->verdict = IR_SMT_REFUTED;
     report->input_count = frame.param_count < 16u ? frame.param_count : 16u;
@@ -2389,78 +2680,78 @@ int ir_smt_prove_identity_table(FILE *out, int verbose) {
     int has_pow2 = row.a_kind == IR_IDPAT_POW2 || row.b_kind == IR_IDPAT_POW2;
     long long k_last = has_pow2 ? 62 : 1;
     for (long long kval = 1; kval <= k_last; kval++)
-    for (int sign = 0; sign < 2; sign++) {
-      for (int swapped = 0; swapped < (row.commutative ? 2 : 1); swapped++) {
-        SmtCtx *ctx = smt_ctx_new();
-        SmtSort word = smt_bv_sort(ctx, 64);
-        SmtTerm assume = smt_true(ctx);
-        SmtTerm shift = 0;
-        int var_on_left = row.a_kind == IR_IDPAT_VAR ||
-                          row.a_kind == IR_IDPAT_NONNEG ||
-                          row.b_kind != IR_IDPAT_VAR;
-        SmtTerm x = smt_var(ctx, "x", word);
-        SmtTerm av = irs_operand_for(ctx, row.a_kind, row.a_value, x, &assume,
-                                     &shift, 0, kval);
-        SmtTerm bv = irs_operand_for(ctx, row.b_kind, row.b_value, x, &assume,
-                                     &shift, 1, kval);
-        SmtTerm lhs = swapped ? bv : av;
-        SmtTerm rhs = swapped ? av : bv;
-        SmtTerm trap;
-        SmtTerm before = ir_smt_binary(ctx, row.op, sign, lhs, rhs, &trap);
-        SmtTerm var_operand = var_on_left ? av : bv;
-        SmtTerm after = 0;
-        switch (row.act_kind) {
-        case IR_IDACT_KEEP:
-          after = av;
-          break;
-        case IR_IDACT_CONST:
-          after = smt_bv_i64(ctx, 64, row.act_value);
-          break;
-        case IR_IDACT_SHL:
-          after = ir_smt_binary(ctx, "<<", sign, av, shift, NULL);
-          break;
-        case IR_IDACT_SHR:
-          after = ir_smt_binary(ctx, ">>", sign, av, shift, NULL);
-          break;
-        case IR_IDACT_AND_MASK:
-          after = smt_mk2(ctx, SMT_K_BVAND, av,
-                          smt_mk2(ctx, SMT_K_BVSUB, bv, smt_bv_u64(ctx, 64, 1)));
-          break;
-        }
-        (void)var_operand;
-        obligations++;
-        if (!before || !after) {
-          row_ok = 0;
-          snprintf(detail, sizeof(detail), "operator %s is not modelled",
-                   row.op);
-          smt_ctx_free(ctx);
-          continue;
-        }
-        SmtTerm claim = smt_implies(
-            ctx, assume,
-            smt_and(ctx, smt_not(ctx, trap), smt_eq(ctx, before, after)));
-        SmtSolver *solver = NULL;
-        SmtResult r = smt_prove(ctx, claim, 1, 500000, &solver);
-        if (r != SMT_UNSAT) {
-          row_ok = 0;
-          if (r == SMT_SAT) {
-            uint64_t w[4];
-            smt_solver_value(solver, x, w);
-            snprintf(detail, sizeof(detail),
-                     "%s, %s: fails at x = %lld%s",
-                     sign ? "unsigned" : "signed",
-                     swapped ? "operands swapped" : "as written",
-                     (long long)w[0], has_pow2 ? " for that k" : "");
-          } else {
-            snprintf(detail, sizeof(detail), "%s",
-                     smt_solver_reason(solver) ? smt_solver_reason(solver)
-                                               : "unknown");
+      for (int sign = 0; sign < 2; sign++) {
+        for (int swapped = 0; swapped < (row.commutative ? 2 : 1); swapped++) {
+          SmtCtx *ctx = smt_ctx_new();
+          SmtSort word = smt_bv_sort(ctx, 64);
+          SmtTerm assume = smt_true(ctx);
+          SmtTerm shift = 0;
+          int var_on_left = row.a_kind == IR_IDPAT_VAR ||
+                            row.a_kind == IR_IDPAT_NONNEG ||
+                            row.b_kind != IR_IDPAT_VAR;
+          SmtTerm x = smt_var(ctx, "x", word);
+          SmtTerm av = irs_operand_for(ctx, row.a_kind, row.a_value, x, &assume,
+                                       &shift, 0, kval);
+          SmtTerm bv = irs_operand_for(ctx, row.b_kind, row.b_value, x, &assume,
+                                       &shift, 1, kval);
+          SmtTerm lhs = swapped ? bv : av;
+          SmtTerm rhs = swapped ? av : bv;
+          SmtTerm trap;
+          SmtTerm before = ir_smt_binary(ctx, row.op, sign, lhs, rhs, &trap);
+          SmtTerm var_operand = var_on_left ? av : bv;
+          SmtTerm after = 0;
+          switch (row.act_kind) {
+          case IR_IDACT_KEEP:
+            after = av;
+            break;
+          case IR_IDACT_CONST:
+            after = smt_bv_i64(ctx, 64, row.act_value);
+            break;
+          case IR_IDACT_SHL:
+            after = ir_smt_binary(ctx, "<<", sign, av, shift, NULL);
+            break;
+          case IR_IDACT_SHR:
+            after = ir_smt_binary(ctx, ">>", sign, av, shift, NULL);
+            break;
+          case IR_IDACT_AND_MASK:
+            after =
+                smt_mk2(ctx, SMT_K_BVAND, av,
+                        smt_mk2(ctx, SMT_K_BVSUB, bv, smt_bv_u64(ctx, 64, 1)));
+            break;
           }
+          (void)var_operand;
+          obligations++;
+          if (!before || !after) {
+            row_ok = 0;
+            snprintf(detail, sizeof(detail), "operator %s is not modelled",
+                     row.op);
+            smt_ctx_free(ctx);
+            continue;
+          }
+          SmtTerm claim = smt_implies(
+              ctx, assume,
+              smt_and(ctx, smt_not(ctx, trap), smt_eq(ctx, before, after)));
+          SmtSolver *solver = NULL;
+          SmtResult r = smt_prove(ctx, claim, 1, 500000, &solver);
+          if (r != SMT_UNSAT) {
+            row_ok = 0;
+            if (r == SMT_SAT) {
+              uint64_t w[4];
+              smt_solver_value(solver, x, w);
+              snprintf(detail, sizeof(detail), "%s, %s: fails at x = %lld%s",
+                       sign ? "unsigned" : "signed",
+                       swapped ? "operands swapped" : "as written",
+                       (long long)w[0], has_pow2 ? " for that k" : "");
+            } else {
+              snprintf(detail, sizeof(detail), "%s",
+                       smt_solver_reason(solver) ? smt_solver_reason(solver)
+                                                 : "unknown");
+            }
+          }
+          smt_solver_free(solver);
+          smt_ctx_free(ctx);
         }
-        smt_solver_free(solver);
-        smt_ctx_free(ctx);
       }
-    }
     if (!row_ok) {
       failures++;
     }
@@ -2468,8 +2759,8 @@ int ir_smt_prove_identity_table(FILE *out, int verbose) {
       fprintf(out, "  %-8s %s %s %s  =>  %-14s %s%s%s\n",
               row_ok ? "proved" : "REFUTED", a_text, row.op, b_text,
               irs_action_text(&row, actbuf, sizeof(actbuf)),
-              row.commutative ? "(both orders) " : "",
-              row_ok ? "" : ": ", detail);
+              row.commutative ? "(both orders) " : "", row_ok ? "" : ": ",
+              detail);
     }
   }
   fprintf(out,

@@ -1,0 +1,64 @@
+import "std/io";
+
+struct Ring {
+    head: int64;
+    count: int64;
+    slots: int64[8];
+}
+
+fn push(r: Ring*, value: int64) -> bool {
+    var count: int64 = r.count;
+    if (count < 0 || count >= 8) {
+        return false;
+    }
+    var at: int64 = (r.head + count) & 7;
+    r.slots[at] = value;
+    r.count = count + 1;
+    prove(at >= 0 && at < 8);
+    prove(r.slots[at] == value && r.count == count + 1);
+    return true;
+}
+
+fn pop(r: Ring*) -> int64 {
+    var count: int64 = r.count;
+    if (count <= 0 || count > 8) {
+        return 0;
+    }
+    var at: int64 = r.head & 7;
+    var value: int64 = r.slots[at];
+    r.head = (at + 1) & 7;
+    r.count = count - 1;
+    prove(r.head >= 0 && r.head < 8 && r.count == count - 1);
+    prove(r.slots[at] == value);
+    return value;
+}
+
+fn normal(x: float64) -> bool {
+    return (x >= 1e-300 && x <= 1e300) || (x <= -1e-300 && x >= -1e300);
+}
+
+fn mean_of_two(a: float64, b: float64) -> float64 {
+    var m: float64 = a * 0.5 + b * 0.5;
+    if (normal(a) && normal(b)) {
+        prove((m >= a && m <= b) || (m >= b && m <= a));
+    }
+    return m;
+}
+
+fn main() -> int32 {
+    var ring: Ring;
+    ring.head = 6;
+    ring.count = 0;
+    var i: int64 = 0;
+    while (i < 5) {
+        push(&ring, i * 10);
+        i = i + 1;
+    }
+    var total: int64 = 0;
+    while (ring.count > 0) {
+        total = total + pop(&ring);
+    }
+    var m: float64 = mean_of_two(2.0, 5.0);
+    println("total {total} mean {m}");
+    return 0;
+}

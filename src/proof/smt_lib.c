@@ -54,6 +54,11 @@ typedef struct {
   int line;
   char error[512];
   int failed;
+  unsigned last_fp_width;
+  SmtTerm *fp_terms;
+  unsigned fp_count;
+  unsigned fp_cap;
+  SmtTerm rne;
 } SmtLib;
 
 static int g_smtlib_normalize = 1;
@@ -190,10 +195,94 @@ static int parse_uint(const Sx *s, unsigned *out) {
   return 1;
 }
 
+static int fp_format_of_width(unsigned w, unsigned *eb, unsigned *sb) {
+  switch (w) {
+  case 16:
+    *eb = 5;
+    *sb = 11;
+    return 1;
+  case 32:
+    *eb = 8;
+    *sb = 24;
+    return 1;
+  case 64:
+    *eb = 11;
+    *sb = 53;
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static int fp_width_of(unsigned eb, unsigned sb) {
+  unsigned e, s;
+  return fp_format_of_width(eb + sb, &e, &s) && e == eb && s == sb
+             ? (int)(eb + sb)
+             : 0;
+}
+
+static int fp_is_term(SmtLib *lib, SmtTerm t) {
+  for (unsigned i = 0; i < lib->fp_count; i++) {
+    if (lib->fp_terms[i] == t) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static SmtTerm fp_mark(SmtLib *lib, SmtTerm t) {
+  if (!t || fp_is_term(lib, t)) {
+    return t;
+  }
+  if (lib->fp_count == lib->fp_cap) {
+    lib->fp_cap = lib->fp_cap ? lib->fp_cap * 2u : 64u;
+    lib->fp_terms = realloc(lib->fp_terms, lib->fp_cap * sizeof(SmtTerm));
+  }
+  lib->fp_terms[lib->fp_count++] = t;
+  return t;
+}
+
+static SmtTerm fp_nan_const(SmtCtx *ctx, unsigned eb, unsigned sb) {
+  uint64_t bits = (((1ull << eb) - 1u) << (sb - 1u)) | (1ull << (sb - 2u));
+  return smt_bv_u64(ctx, eb + sb, bits);
+}
+
+static SmtTerm fp_canon(SmtLib *lib, SmtTerm t) {
+  SmtCtx *ctx = lib->ctx;
+  unsigned eb, sb;
+  if (!fp_format_of_width(smt_width(ctx, t), &eb, &sb)) {
+    return t;
+  }
+  return fp_mark(lib, smt_ite(ctx, smt_fp_is_nan(ctx, eb, sb, t),
+                              fp_nan_const(ctx, eb, sb), t));
+}
+
 static SmtSort parse_sort(SmtLib *lib, const Sx *s) {
   SmtCtx *ctx = lib->ctx;
+  lib->last_fp_width = 0;
   if (is_atom(s, "Bool")) {
     return smt_bool_sort(ctx);
+  }
+  static const struct {
+    const char *name;
+    unsigned width;
+  } fp_sorts[] = {{"Float16", 16}, {"Float32", 32}, {"Float64", 64}};
+  for (size_t i = 0; s && !s->is_list && i < 3; i++) {
+    if (strcmp(s->atom, fp_sorts[i].name) == 0) {
+      lib->last_fp_width = fp_sorts[i].width;
+      return smt_bv_sort(ctx, fp_sorts[i].width);
+    }
+  }
+  if (s && s->is_list && s->count == 4 && is_atom(s->items[0], "_") &&
+      is_atom(s->items[1], "FloatingPoint")) {
+    unsigned eb, sb;
+    if (parse_uint(s->items[2], &eb) && parse_uint(s->items[3], &sb) &&
+        fp_width_of(eb, sb)) {
+      lib->last_fp_width = eb + sb;
+      return smt_bv_sort(ctx, eb + sb);
+    }
+    lib_error(lib, s, "only Float16, Float32 and Float64 are supported", NULL);
+    return 0;
   }
   if (s && s->is_list && s->count == 3 && is_atom(s->items[0], "_") &&
       is_atom(s->items[1], "BitVec")) {
@@ -299,7 +388,7 @@ static SmtTerm parse_const(SmtLib *lib, const Sx *s) {
 static SmtTerm parse_term(SmtLib *lib, const Sx *s);
 
 static SmtTerm decimal_bv(SmtLib *lib, const Sx *s, const char *digits,
-                         unsigned width) {
+                          unsigned width) {
   SmtBits acc, ten, digit;
   smt_bits_zero(&acc);
   smt_bits_from_u64(&ten, 10, SMT_MAX_WIDTH);
@@ -385,7 +474,8 @@ static SmtTerm parse_indexed(SmtLib *lib, const Sx *head, const Sx *s,
   if (strcmp(op, "rotate_right") == 0 && has0) {
     return rotate(ctx, a, i0, 0);
   }
-  if (strcmp(op, "repeat") == 0 && has0 && i0 >= 1u && i0 * w <= SMT_MAX_WIDTH) {
+  if (strcmp(op, "repeat") == 0 && has0 && i0 >= 1u &&
+      i0 * w <= SMT_MAX_WIDTH) {
     SmtTerm out = a;
     for (unsigned k = 1; k < i0; k++) {
       out = smt_mk2(ctx, SMT_K_CONCAT, out, a);
@@ -396,8 +486,178 @@ static SmtTerm parse_indexed(SmtLib *lib, const Sx *head, const Sx *s,
   return 0;
 }
 
-static SmtTerm fold_chain(SmtLib *lib, const Sx *s, SmtKind kind,
-                          SmtTerm *args, unsigned n) {
+static int fp_operands(SmtLib *lib, const Sx *s, SmtTerm *args, unsigned n,
+                       unsigned *eb, unsigned *sb) {
+  SmtCtx *ctx = lib->ctx;
+  unsigned w = 0;
+  for (unsigned i = 0; i < n; i++) {
+    if (args[i] == lib->rne) {
+      continue;
+    }
+    if (!smt_sort_is_bv(ctx, smt_term_sort(ctx, args[i]))) {
+      lib_error(lib, s, "a floating-point operand is not a float", NULL);
+      return 0;
+    }
+    unsigned aw = smt_width(ctx, args[i]);
+    if (w && aw != w) {
+      lib_error(lib, s, "floating-point operands of two formats", NULL);
+      return 0;
+    }
+    w = aw;
+  }
+  if (!fp_format_of_width(w, eb, sb)) {
+    lib_error(lib, s, "only Float16, Float32 and Float64 are supported", NULL);
+    return 0;
+  }
+  return 1;
+}
+
+static SmtTerm fp_app(SmtLib *lib, const Sx *s, const char *op, SmtTerm *args,
+                      unsigned n) {
+  SmtCtx *ctx = lib->ctx;
+  unsigned eb, sb;
+  if (strcmp(op, "fp") == 0) {
+    if (n != 3) {
+      lib_error(lib, s, "fp takes a sign, an exponent and a significand", NULL);
+      return 0;
+    }
+    SmtTerm bits =
+        smt_mk2(ctx, SMT_K_CONCAT, smt_mk2(ctx, SMT_K_CONCAT, args[0], args[1]),
+                args[2]);
+    if (!fp_format_of_width(smt_width(ctx, bits), &eb, &sb) ||
+        smt_width(ctx, args[1]) != eb) {
+      lib_error(lib, s, "only Float16, Float32 and Float64 are supported",
+                NULL);
+      return 0;
+    }
+    return fp_canon(lib, bits);
+  }
+  int rounded = strcmp(op, "fp.add") == 0 || strcmp(op, "fp.sub") == 0 ||
+                strcmp(op, "fp.mul") == 0 || strcmp(op, "fp.div") == 0 ||
+                strcmp(op, "fp.sqrt") == 0;
+  if (rounded && (n < 2 || args[0] != lib->rne)) {
+    lib_error(lib, s, "%s needs the rounding mode RNE first", op);
+    return 0;
+  }
+  if (!fp_operands(lib, s, args, n, &eb, &sb)) {
+    return 0;
+  }
+  SmtTerm nan = fp_nan_const(ctx, eb, sb);
+  if (rounded && strcmp(op, "fp.sqrt") == 0 && n == 2) {
+    return fp_mark(lib, smt_fp_sqrt(ctx, eb, sb, args[1], nan));
+  }
+  if (rounded && n == 3) {
+    SmtTerm x = args[1], y = args[2];
+    SmtTerm r = op[3] == 'a'   ? smt_fp_add(ctx, eb, sb, x, y, nan)
+                : op[3] == 's' ? smt_fp_sub(ctx, eb, sb, x, y, nan)
+                : op[3] == 'm' ? smt_fp_mul(ctx, eb, sb, x, y, nan)
+                               : smt_fp_div(ctx, eb, sb, x, y, nan);
+    return fp_mark(lib, r);
+  }
+  if (n == 1) {
+    SmtTerm x = args[0];
+    unsigned w = eb + sb;
+    SmtTerm sign =
+        smt_eq(ctx, smt_extract(ctx, x, w - 1u, w - 1u), smt_bv_u64(ctx, 1, 1));
+    SmtTerm magnitude = smt_extract(ctx, x, w - 2u, 0);
+    SmtTerm exponent = smt_extract(ctx, x, w - 2u, sb - 1u);
+    SmtTerm ones = smt_bv_u64(ctx, eb, (1ull << eb) - 1u);
+    SmtTerm nan_x = smt_fp_is_nan(ctx, eb, sb, x);
+    if (strcmp(op, "fp.abs") == 0) {
+      return fp_mark(
+          lib, smt_mk2(ctx, SMT_K_CONCAT, smt_bv_u64(ctx, 1, 0), magnitude));
+    }
+    if (strcmp(op, "fp.neg") == 0) {
+      return fp_canon(lib, smt_fp_neg(ctx, eb, sb, x));
+    }
+    if (strcmp(op, "fp.isNaN") == 0) {
+      return nan_x;
+    }
+    if (strcmp(op, "fp.isInfinite") == 0) {
+      return smt_and(ctx, smt_eq(ctx, exponent, ones), smt_not(ctx, nan_x));
+    }
+    if (strcmp(op, "fp.isZero") == 0) {
+      return smt_eq(ctx, magnitude, smt_bv_u64(ctx, w - 1u, 0));
+    }
+    if (strcmp(op, "fp.isNormal") == 0) {
+      return smt_and(
+          ctx, smt_not(ctx, smt_eq(ctx, exponent, ones)),
+          smt_not(ctx, smt_eq(ctx, exponent, smt_bv_u64(ctx, eb, 0))));
+    }
+    if (strcmp(op, "fp.isSubnormal") == 0) {
+      return smt_and(
+          ctx, smt_eq(ctx, exponent, smt_bv_u64(ctx, eb, 0)),
+          smt_not(ctx, smt_eq(ctx, magnitude, smt_bv_u64(ctx, w - 1u, 0))));
+    }
+    if (strcmp(op, "fp.isNegative") == 0) {
+      return smt_and(ctx, sign, smt_not(ctx, nan_x));
+    }
+    if (strcmp(op, "fp.isPositive") == 0) {
+      return smt_and(ctx, smt_not(ctx, sign), smt_not(ctx, nan_x));
+    }
+  }
+  if (n >= 2) {
+    int which = strcmp(op, "fp.eq") == 0    ? 1
+                : strcmp(op, "fp.lt") == 0  ? 2
+                : strcmp(op, "fp.leq") == 0 ? 3
+                : strcmp(op, "fp.gt") == 0  ? 4
+                : strcmp(op, "fp.geq") == 0 ? 5
+                                            : 0;
+    if (which) {
+      SmtTerm out = ctx->bool_true;
+      for (unsigned i = 0; i + 1u < n; i++) {
+        SmtTerm x = args[i], y = args[i + 1u];
+        SmtTerm c = which == 1   ? smt_fp_eq(ctx, eb, sb, x, y)
+                    : which == 2 ? smt_fp_lt(ctx, eb, sb, x, y)
+                    : which == 3 ? smt_fp_le(ctx, eb, sb, x, y)
+                    : which == 4 ? smt_fp_lt(ctx, eb, sb, y, x)
+                                 : smt_fp_le(ctx, eb, sb, y, x);
+        out = smt_and(ctx, out, c);
+      }
+      return out;
+    }
+  }
+  lib_error(lib, s, "unsupported floating-point operator %s", op);
+  return 0;
+}
+
+static SmtTerm fp_to_fp(SmtLib *lib, const Sx *head, const Sx *s, SmtTerm *args,
+                        unsigned n) {
+  SmtCtx *ctx = lib->ctx;
+  unsigned eb, sb;
+  if (!parse_uint(head->items[2], &eb) || !parse_uint(head->items[3], &sb) ||
+      !fp_width_of(eb, sb)) {
+    lib_error(lib, s, "only Float16, Float32 and Float64 are supported", NULL);
+    return 0;
+  }
+  int is_unsigned = is_atom(head->items[1], "to_fp_unsigned");
+  if (n == 1 && !is_unsigned) {
+    if (smt_width(ctx, args[0]) != eb + sb) {
+      lib_error(lib, s, "to_fp of a bit-vector needs the format's width", NULL);
+      return 0;
+    }
+    return fp_canon(lib, args[0]);
+  }
+  if (n != 2 || args[0] != lib->rne ||
+      !smt_sort_is_bv(ctx, smt_term_sort(ctx, args[1]))) {
+    lib_error(lib, s, "to_fp needs the rounding mode RNE and a value", NULL);
+    return 0;
+  }
+  SmtTerm x = args[1];
+  unsigned from_eb, from_sb;
+  if (!is_unsigned && fp_is_term(lib, x) &&
+      fp_format_of_width(smt_width(ctx, x), &from_eb, &from_sb)) {
+    if (from_eb == eb && from_sb == sb) {
+      return x;
+    }
+    return fp_mark(lib, smt_fp_convert(ctx, from_eb, from_sb, eb, sb, x,
+                                       fp_nan_const(ctx, eb, sb)));
+  }
+  return fp_mark(lib, smt_fp_from_int(ctx, eb, sb, x, !is_unsigned));
+}
+
+static SmtTerm fold_chain(SmtLib *lib, const Sx *s, SmtKind kind, SmtTerm *args,
+                          unsigned n) {
   SmtCtx *ctx = lib->ctx;
   if (n < 2) {
     lib_error(lib, s, "operator needs two or more arguments", NULL);
@@ -495,6 +755,17 @@ static SmtTerm parse_app(SmtLib *lib, const Sx *s) {
     }
   }
   SmtTerm out = 0;
+  if (head->is_list && head->count == 4 && is_atom(head->items[0], "_") &&
+      (is_atom(head->items[1], "to_fp") ||
+       is_atom(head->items[1], "to_fp_unsigned"))) {
+    out = fp_to_fp(lib, head, s, args, n);
+    goto done;
+  }
+  if (!head->is_list && strncmp(head->atom, "fp", 2) == 0 &&
+      (head->atom[2] == '\0' || head->atom[2] == '.')) {
+    out = fp_app(lib, s, head->atom, args, n);
+    goto done;
+  }
   if (head->is_list) {
     if (head->count >= 3 && is_atom(head->items[0], "_")) {
       out = parse_indexed(lib, head, s, args, n);
@@ -552,11 +823,13 @@ static SmtTerm parse_app(SmtLib *lib, const Sx *s) {
   } else if (strcmp(op, "bvneg") == 0 && n == 1) {
     out = smt_mk1(ctx, SMT_K_BVNEG, args[0]);
   } else if (strcmp(op, "bvnand") == 0 && n == 2) {
-    out = smt_mk1(ctx, SMT_K_BVNOT, smt_mk2(ctx, SMT_K_BVAND, args[0], args[1]));
+    out =
+        smt_mk1(ctx, SMT_K_BVNOT, smt_mk2(ctx, SMT_K_BVAND, args[0], args[1]));
   } else if (strcmp(op, "bvnor") == 0 && n == 2) {
     out = smt_mk1(ctx, SMT_K_BVNOT, smt_mk2(ctx, SMT_K_BVOR, args[0], args[1]));
   } else if (strcmp(op, "bvxnor") == 0 && n == 2) {
-    out = smt_mk1(ctx, SMT_K_BVNOT, smt_mk2(ctx, SMT_K_BVXOR, args[0], args[1]));
+    out =
+        smt_mk1(ctx, SMT_K_BVNOT, smt_mk2(ctx, SMT_K_BVXOR, args[0], args[1]));
   } else if (strcmp(op, "bvcomp") == 0 && n == 2) {
     out = smt_ite(ctx, smt_eq(ctx, args[0], args[1]), smt_bv_u64(ctx, 1, 1),
                   smt_bv_u64(ctx, 1, 0));
@@ -618,6 +891,20 @@ static SmtTerm parse_term(SmtLib *lib, const Sx *s) {
     if (strcmp(s->atom, "false") == 0) {
       return ctx->bool_false;
     }
+    if (strcmp(s->atom, "RNE") == 0 ||
+        strcmp(s->atom, "roundNearestTiesToEven") == 0) {
+      if (!lib->rne) {
+        lib->rne = smt_var(ctx, "\x01RNE", smt_bool_sort(ctx));
+      }
+      return lib->rne;
+    }
+    if (strcmp(s->atom, "RNA") == 0 || strcmp(s->atom, "RTP") == 0 ||
+        strcmp(s->atom, "RTN") == 0 || strcmp(s->atom, "RTZ") == 0 ||
+        strncmp(s->atom, "roundToward", 11) == 0 ||
+        strcmp(s->atom, "roundNearestTiesToAway") == 0) {
+      lib_error(lib, s, "only the rounding mode RNE is supported", NULL);
+      return 0;
+    }
     if (s->atom[0] == '#') {
       return parse_const(lib, s);
     }
@@ -635,6 +922,29 @@ static SmtTerm parse_term(SmtLib *lib, const Sx *s) {
   if (s->count == 0) {
     lib_error(lib, s, "empty application", NULL);
     return 0;
+  }
+  if (s->count == 4 && is_atom(s->items[0], "_") && !s->items[1]->is_list) {
+    const char *name = s->items[1]->atom;
+    unsigned eb, sb;
+    int known = strcmp(name, "+zero") == 0 || strcmp(name, "-zero") == 0 ||
+                strcmp(name, "+oo") == 0 || strcmp(name, "-oo") == 0 ||
+                strcmp(name, "NaN") == 0;
+    if (known) {
+      if (!parse_uint(s->items[2], &eb) || !parse_uint(s->items[3], &sb) ||
+          !fp_width_of(eb, sb)) {
+        lib_error(lib, s, "only Float16, Float32 and Float64 are supported",
+                  NULL);
+        return 0;
+      }
+      if (name[0] == 'N') {
+        return fp_mark(lib, fp_nan_const(ctx, eb, sb));
+      }
+      uint64_t bits = name[1] == 'o' ? ((1ull << eb) - 1u) << (sb - 1u) : 0;
+      if (name[0] == '-') {
+        bits |= 1ull << (eb + sb - 1u);
+      }
+      return fp_mark(lib, smt_bv_u64(ctx, eb + sb, bits));
+    }
   }
   if (s->count == 3 && is_atom(s->items[0], "_") && !s->items[1]->is_list &&
       strncmp(s->items[1]->atom, "bv", 2) == 0) {
@@ -676,7 +986,8 @@ static void declare(SmtLib *lib, const Sx *s, const char *name,
     }
   }
   if (n == 0) {
-    push_binding(lib, name, smt_var(ctx, name, r));
+    SmtTerm v = smt_var(ctx, name, r);
+    push_binding(lib, name, lib->last_fp_width ? fp_canon(lib, v) : v);
     return;
   }
   smt_func(ctx, name, n, dom, r);
@@ -693,8 +1004,7 @@ static void print_stats(SmtLib *lib, SmtSolver *solver) {
           (unsigned long long)st.terms, (unsigned long long)st.gates,
           (unsigned long long)st.variables, (unsigned long long)st.clauses,
           (unsigned long long)st.conflicts, (unsigned long long)st.decisions,
-          (unsigned long long)st.propagations,
-          (unsigned long long)st.restarts,
+          (unsigned long long)st.propagations, (unsigned long long)st.restarts,
           (unsigned long long)st.lemmas_checked, st.blast_seconds,
           st.sat_seconds, st.check_seconds);
   (void)lib;
@@ -810,7 +1120,9 @@ static int run_command(SmtLib *lib, const Sx *s) {
       smt_solver_assert(solver, lib->asserts[i]);
     }
     SmtResult r = smt_solver_check(solver);
-    fputs(r == SMT_SAT ? "sat\n" : r == SMT_UNSAT ? "unsat\n" : "unknown\n",
+    fputs(r == SMT_SAT     ? "sat\n"
+          : r == SMT_UNSAT ? "unsat\n"
+                           : "unknown\n",
           lib->out);
     if (r == SMT_UNKNOWN && smt_solver_reason(solver)) {
       fprintf(stderr, "; %s\n", smt_solver_reason(solver));
@@ -839,7 +1151,12 @@ static int run_command(SmtLib *lib, const Sx *s) {
         continue;
       }
       fputs(i ? " (" : "(", lib->out);
-      smt_term_print(ctx, t, lib->out);
+      const Sx *query = s->items[1]->items[i];
+      if (query->is_list) {
+        smt_term_print(ctx, t, lib->out);
+      } else {
+        fputs(query->atom, lib->out);
+      }
       fputc(' ', lib->out);
       SmtSort sort = smt_term_sort(ctx, t);
       if (smt_sort_is_bool(ctx, sort)) {
@@ -1000,8 +1317,7 @@ static int dimacs_run(const char *src, const char *path, int certify,
             "c vars %u clauses %llu conflicts %llu decisions %llu "
             "propagations %llu restarts %llu search %.3f s\n",
             sat_var_count(sat), (unsigned long long)st.original_clauses,
-            (unsigned long long)st.conflicts,
-            (unsigned long long)st.decisions,
+            (unsigned long long)st.conflicts, (unsigned long long)st.decisions,
             (unsigned long long)st.propagations,
             (unsigned long long)st.restarts, t1 - t0);
   }
@@ -1105,6 +1421,7 @@ int smtlib_run(const char *source, const char *path, FILE *out, int certify,
   }
   free(lib.macros);
   free(lib.asserts);
+  free(lib.fp_terms);
   free(lib.frames);
   smt_ctx_free(lib.ctx);
   return status;

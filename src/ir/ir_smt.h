@@ -74,6 +74,7 @@ typedef struct {
   size_t foreign_count;
   size_t foreign_cap;
   int lockstep;
+  int chose_nan;
   unsigned encode_index;
   struct IRSmtLoop *loops;
   size_t loop_count;
@@ -110,8 +111,7 @@ void ir_smt_frame_init(IRSmtFrame *frame, SmtCtx *ctx, const IRFunction *fn,
 void ir_smt_frame_free(IRSmtFrame *frame);
 
 int ir_smt_encode(IRSmtFrame *frame, const IRFunction *fn,
-                  const IRInstruction *insns, size_t count,
-                  IRSmtOutcome *out);
+                  const IRInstruction *insns, size_t count, IRSmtOutcome *out);
 
 SmtTerm ir_smt_binary(SmtCtx *ctx, const char *op, int is_unsigned, SmtTerm a,
                       SmtTerm b, SmtTerm *trap);
@@ -119,11 +119,7 @@ SmtTerm ir_smt_binary(SmtCtx *ctx, const char *op, int is_unsigned, SmtTerm a,
 SmtTerm ir_smt_narrow(SmtCtx *ctx, SmtTerm v, int size, int is_unsigned);
 int ir_smt_parse_scalar(const char *type, int *size, int *is_unsigned);
 
-typedef enum {
-  IR_SMT_PROVED,
-  IR_SMT_REFUTED,
-  IR_SMT_UNKNOWN
-} IRSmtVerdict;
+typedef enum { IR_SMT_PROVED, IR_SMT_REFUTED, IR_SMT_UNKNOWN } IRSmtVerdict;
 
 typedef struct {
   IRSmtVerdict verdict;
@@ -138,9 +134,9 @@ typedef struct {
 
 void ir_smt_check_equivalence(const IRProgram *program, const IRFunction *a,
                               const IRInstruction *a_insns, size_t a_count,
-                              const IRFunction *b,
-                              const IRInstruction *b_insns, size_t b_count,
-                              const IRFunction *guard, IRSmtReport *report);
+                              const IRFunction *b, const IRInstruction *b_insns,
+                              size_t b_count, const IRFunction *guard,
+                              IRSmtReport *report);
 
 enum {
   IR_IDPAT_VAR,

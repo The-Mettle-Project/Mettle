@@ -100,8 +100,7 @@ SmtTerm smt_bv_words(SmtCtx *ctx, unsigned width, const uint64_t *words);
 SmtTerm smt_var(SmtCtx *ctx, const char *name, SmtSort sort);
 SmtTerm smt_fresh(SmtCtx *ctx, const char *prefix, SmtSort sort);
 
-SmtTerm smt_mk(SmtCtx *ctx, SmtKind kind, unsigned nargs,
-               const SmtTerm *args);
+SmtTerm smt_mk(SmtCtx *ctx, SmtKind kind, unsigned nargs, const SmtTerm *args);
 SmtTerm smt_mk1(SmtCtx *ctx, SmtKind kind, SmtTerm a);
 SmtTerm smt_mk2(SmtCtx *ctx, SmtKind kind, SmtTerm a, SmtTerm b);
 SmtTerm smt_not(SmtCtx *ctx, SmtTerm a);
@@ -124,6 +123,29 @@ SmtTerm smt_apply(SmtCtx *ctx, SmtFunc func, unsigned nargs,
                   const SmtTerm *args);
 SmtTerm smt_forall(SmtCtx *ctx, SmtTerm var, SmtTerm body);
 SmtTerm smt_exists(SmtCtx *ctx, SmtTerm var, SmtTerm body);
+
+SmtTerm smt_fp_quiet_nan(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm any);
+SmtTerm smt_fp_add(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x, SmtTerm y,
+                   SmtTerm nan);
+SmtTerm smt_fp_sub(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x, SmtTerm y,
+                   SmtTerm nan);
+SmtTerm smt_fp_mul(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x, SmtTerm y,
+                   SmtTerm nan);
+SmtTerm smt_fp_div(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x, SmtTerm y,
+                   SmtTerm nan);
+SmtTerm smt_fp_neg(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x);
+SmtTerm smt_fp_sqrt(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x,
+                    SmtTerm nan);
+SmtTerm smt_fp_is_nan(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x);
+SmtTerm smt_fp_eq(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x, SmtTerm y);
+SmtTerm smt_fp_lt(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x, SmtTerm y);
+SmtTerm smt_fp_le(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x, SmtTerm y);
+SmtTerm smt_fp_from_int(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm v,
+                        int is_signed);
+SmtTerm smt_fp_to_int(SmtCtx *ctx, unsigned eb, unsigned sb, SmtTerm x,
+                      int is_signed, SmtTerm invalid_value);
+SmtTerm smt_fp_convert(SmtCtx *ctx, unsigned eb, unsigned sb, unsigned to_eb,
+                       unsigned to_sb, SmtTerm x, SmtTerm nan);
 
 SmtKind smt_term_kind(const SmtCtx *ctx, SmtTerm t);
 SmtSort smt_term_sort(const SmtCtx *ctx, SmtTerm t);

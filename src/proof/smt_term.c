@@ -80,8 +80,8 @@ static uint32_t smt_intern(SmtCtx *ctx, const char *name) {
   ctx->names = smt_grow(ctx->names, sizeof(char *), &ctx->name_cap,
                         ctx->name_count + 1u);
   uint32_t cap_copy = cap_before;
-  ctx->name_hash = smt_grow(ctx->name_hash, sizeof(uint32_t), &cap_copy,
-                            ctx->name_cap);
+  ctx->name_hash =
+      smt_grow(ctx->name_hash, sizeof(uint32_t), &cap_copy, ctx->name_cap);
   uint32_t id = ctx->name_count++;
   size_t len = strlen(name);
   ctx->names[id] = malloc(len + 1u);
@@ -177,8 +177,7 @@ static SmtTerm smt_node_make(SmtCtx *ctx, uint32_t kind, uint32_t sort,
   uint32_t h = smt_node_hash(kind, sort, p0, p1, nargs, args);
   if (bits) {
     for (unsigned i = 0; i < SMT_WORDS; i++) {
-      h = (h ^ (uint32_t)bits->w[i] ^ (uint32_t)(bits->w[i] >> 32)) *
-          16777619u;
+      h = (h ^ (uint32_t)bits->w[i] ^ (uint32_t)(bits->w[i] >> 32)) * 16777619u;
     }
   }
   uint32_t slot = h & (ctx->bucket_cap - 1u);
@@ -197,8 +196,8 @@ static SmtTerm smt_node_make(SmtCtx *ctx, uint32_t kind, uint32_t sort,
     if (n->p0 != p0 || n->p1 != p1) {
       continue;
     }
-    if (nargs && memcmp(&ctx->argpool[n->args], args,
-                        nargs * sizeof(SmtTerm)) != 0) {
+    if (nargs &&
+        memcmp(&ctx->argpool[n->args], args, nargs * sizeof(SmtTerm)) != 0) {
       continue;
     }
     return id;
@@ -254,10 +253,10 @@ SmtCtx *smt_ctx_new(void) {
   ctx->func_count = 1;
   ctx->funcs = smt_grow(NULL, sizeof(SmtFuncInfo), &ctx->func_cap, 16u);
   memset(&ctx->funcs[0], 0, sizeof(SmtFuncInfo));
-  ctx->bool_true = smt_node_make(ctx, SMT_K_TRUE, ctx->sort_bool, 0, 0, 0,
-                                 NULL, NULL);
-  ctx->bool_false = smt_node_make(ctx, SMT_K_FALSE, ctx->sort_bool, 0, 0, 0,
-                                  NULL, NULL);
+  ctx->bool_true =
+      smt_node_make(ctx, SMT_K_TRUE, ctx->sort_bool, 0, 0, 0, NULL, NULL);
+  ctx->bool_false =
+      smt_node_make(ctx, SMT_K_FALSE, ctx->sort_bool, 0, 0, 0, NULL, NULL);
   return ctx;
 }
 
@@ -282,9 +281,7 @@ void smt_ctx_free(SmtCtx *ctx) {
   free(ctx);
 }
 
-void smt_ctx_set_simplify(SmtCtx *ctx, int enabled) {
-  ctx->simplify = enabled;
-}
+void smt_ctx_set_simplify(SmtCtx *ctx, int enabled) { ctx->simplify = enabled; }
 
 uint32_t smt_mark_begin(SmtCtx *ctx) {
   if (ctx->mark_cap < ctx->node_count) {
@@ -303,8 +300,8 @@ uint32_t smt_mark_begin(SmtCtx *ctx) {
 int smt_mark_test_set(SmtCtx *ctx, SmtTerm t, uint32_t stamp) {
   if (t >= ctx->mark_cap) {
     uint32_t old = ctx->mark_cap;
-    ctx->mark = smt_grow(ctx->mark, sizeof(uint32_t), &ctx->mark_cap,
-                         t + 1024u);
+    ctx->mark =
+        smt_grow(ctx->mark, sizeof(uint32_t), &ctx->mark_cap, t + 1024u);
     memset(ctx->mark + old, 0, (ctx->mark_cap - old) * sizeof(uint32_t));
   }
   if (ctx->mark[t] == stamp) {
@@ -323,8 +320,8 @@ SmtTerm smt_bool(SmtCtx *ctx, int value) {
 static SmtTerm smt_const_bits(SmtCtx *ctx, unsigned width, const SmtBits *b) {
   SmtBits v = *b;
   smt_bits_mask(&v, width);
-  return smt_node_make(ctx, SMT_K_CONST, smt_bv_sort(ctx, width), 0, 0, 0,
-                       NULL, &v);
+  return smt_node_make(ctx, SMT_K_CONST, smt_bv_sort(ctx, width), 0, 0, 0, NULL,
+                       &v);
 }
 
 SmtTerm smt_bv_u64(SmtCtx *ctx, unsigned width, uint64_t value) {
@@ -434,9 +431,9 @@ SmtFunc smt_func(SmtCtx *ctx, const char *name, unsigned nargs,
       return i;
     }
   }
-  ctx->func_domains = smt_grow(ctx->func_domains, sizeof(uint32_t),
-                               &ctx->func_domain_cap,
-                               ctx->func_domain_count + nargs + 1u);
+  ctx->func_domains =
+      smt_grow(ctx->func_domains, sizeof(uint32_t), &ctx->func_domain_cap,
+               ctx->func_domain_count + nargs + 1u);
   ctx->funcs = smt_grow(ctx->funcs, sizeof(SmtFuncInfo), &ctx->func_cap,
                         ctx->func_count + 1u);
   SmtFuncInfo *f = &ctx->funcs[ctx->func_count];
@@ -535,8 +532,7 @@ static int smt_kind_commutative(SmtKind k) {
 }
 
 static SmtSort smt_result_sort(SmtCtx *ctx, SmtKind kind, unsigned nargs,
-                               const SmtTerm *args, uint32_t p0,
-                               uint32_t p1) {
+                               const SmtTerm *args, uint32_t p0, uint32_t p1) {
   for (unsigned i = 0; i < nargs; i++) {
     if (args[i] == 0 || args[i] >= ctx->node_count) {
       smt_fail(ctx, "invalid term argument");
@@ -622,14 +618,12 @@ static SmtSort smt_result_sort(SmtCtx *ctx, SmtKind kind, unsigned nargs,
     }
     return smt_bv_sort(ctx, ctx->sorts[s0].width + p0);
   case SMT_K_SELECT:
-    if (nargs != 2 || !smt_sort_is_array(ctx, s0) ||
-        ctx->sorts[s0].a != s1) {
+    if (nargs != 2 || !smt_sort_is_array(ctx, s0) || ctx->sorts[s0].a != s1) {
       break;
     }
     return ctx->sorts[s0].b;
   case SMT_K_STORE:
-    if (nargs != 3 || !smt_sort_is_array(ctx, s0) ||
-        ctx->sorts[s0].a != s1 ||
+    if (nargs != 3 || !smt_sort_is_array(ctx, s0) || ctx->sorts[s0].a != s1 ||
         ctx->sorts[s0].b != ctx->nodes[args[2]].sort) {
       break;
     }
@@ -946,7 +940,8 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return 0;
     }
     if (kind == SMT_K_BVUDIV) {
-      return at == 0 ? a : smt_mk2(ctx, SMT_K_BVLSHR, a, smt_bv_u64(ctx, w, at));
+      return at == 0 ? a
+                     : smt_mk2(ctx, SMT_K_BVLSHR, a, smt_bv_u64(ctx, w, at));
     }
     if (at == 0) {
       return smt_bv_u64(ctx, w, 0);
@@ -972,8 +967,8 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
     SmtTerm a_neg = smt_mk2(ctx, SMT_K_BVSLT, a, zero);
     SmtTerm abs_a = smt_mk1(ctx, SMT_K_BVNEG, a);
     if (kind == SMT_K_BVSREM) {
-      SmtTerm on_neg = smt_mk1(ctx, SMT_K_BVNEG,
-                               smt_mk2(ctx, SMT_K_BVUREM, abs_a, m));
+      SmtTerm on_neg =
+          smt_mk1(ctx, SMT_K_BVNEG, smt_mk2(ctx, SMT_K_BVUREM, abs_a, m));
       return smt_ite(ctx, a_neg, on_neg, smt_mk2(ctx, SMT_K_BVUREM, a, m));
     }
     SmtTerm q_neg = smt_mk2(ctx, SMT_K_BVUDIV, abs_a, m);
@@ -995,10 +990,10 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
       return ctx->bool_false;
     }
     if (ctx->nodes[a].kind == SMT_K_BVUREM && smt_arg(ctx, a, 1) == b) {
-      return smt_not(ctx, smt_eq(ctx, b,
-                                 smt_bv_u64(ctx, ctx->sorts[ctx->nodes[b].sort]
-                                                     .width,
-                                            0)));
+      return smt_not(
+          ctx,
+          smt_eq(ctx, b,
+                 smt_bv_u64(ctx, ctx->sorts[ctx->nodes[b].sort].width, 0)));
     }
     return 0;
   case SMT_K_BVULE:
@@ -1053,10 +1048,10 @@ static SmtTerm smt_simplify_node(SmtCtx *ctx, SmtKind kind, unsigned nargs,
         if (ctx->nodes[mid].kind == SMT_K_EXTRACT &&
             smt_arg(ctx, mid, 0) == x &&
             ctx->nodes[a].p1 == ctx->nodes[mid].p0 + 1u) {
-          return smt_mk2(ctx, SMT_K_CONCAT,
-                         smt_extract(ctx, x, ctx->nodes[a].p0,
-                                     ctx->nodes[mid].p1),
-                         smt_arg(ctx, b, 1));
+          return smt_mk2(
+              ctx, SMT_K_CONCAT,
+              smt_extract(ctx, x, ctx->nodes[a].p0, ctx->nodes[mid].p1),
+              smt_arg(ctx, b, 1));
         }
       }
     }
@@ -1134,8 +1129,7 @@ static SmtTerm smt_mk_param(SmtCtx *ctx, SmtKind kind, unsigned nargs,
   return smt_node_make(ctx, kind, sort, p0, p1, nargs, args, NULL);
 }
 
-SmtTerm smt_mk(SmtCtx *ctx, SmtKind kind, unsigned nargs,
-               const SmtTerm *args) {
+SmtTerm smt_mk(SmtCtx *ctx, SmtKind kind, unsigned nargs, const SmtTerm *args) {
   return smt_mk_param(ctx, kind, nargs, args, 0, 0);
 }
 SmtTerm smt_mk1(SmtCtx *ctx, SmtKind kind, SmtTerm a) {
@@ -1209,8 +1203,7 @@ SmtTerm smt_exists(SmtCtx *ctx, SmtTerm var, SmtTerm body) {
 
 SmtTerm smt_apply(SmtCtx *ctx, SmtFunc func, unsigned nargs,
                   const SmtTerm *args) {
-  if (func == 0 || func >= ctx->func_count ||
-      ctx->funcs[func].arity != nargs) {
+  if (func == 0 || func >= ctx->func_count || ctx->funcs[func].arity != nargs) {
     smt_fail(ctx, "bad function application");
     return ctx->bool_false;
   }
@@ -1220,8 +1213,8 @@ SmtTerm smt_apply(SmtCtx *ctx, SmtFunc func, unsigned nargs,
       return ctx->bool_false;
     }
   }
-  return smt_node_make(ctx, SMT_K_APPLY, ctx->funcs[func].range, func, 0,
-                       nargs, args, NULL);
+  return smt_node_make(ctx, SMT_K_APPLY, ctx->funcs[func].range, func, 0, nargs,
+                       args, NULL);
 }
 
 void smt_map_init(SmtMap *m) {
@@ -1440,16 +1433,14 @@ static SmtTerm smt_subst_rec(SmtSubst *s, SmtTerm t) {
     } else {
       SmtTerm bound = var;
       if (capture) {
-        bound = smt_fresh(ctx, smt_term_name(ctx, var),
-                          ctx->nodes[var].sort);
+        bound = smt_fresh(ctx, smt_term_name(ctx, var), ctx->nodes[var].sort);
         vars[m] = var;
         values[m] = bound;
         m++;
       }
       int is_forall = ctx->nodes[t].kind == SMT_K_FORALL;
       SmtTerm nb = smt_subst(ctx, body, m, vars, values);
-      out = is_forall ? smt_forall(ctx, bound, nb)
-                      : smt_exists(ctx, bound, nb);
+      out = is_forall ? smt_forall(ctx, bound, nb) : smt_exists(ctx, bound, nb);
     }
   } else {
     SmtTerm args[64];
@@ -1842,8 +1833,8 @@ void smt_model_array_put(SmtArrayModel *a, const SmtBits *index,
       return;
     }
   }
-  a->entries = smt_grow(a->entries, sizeof(SmtArrayEntry), &a->cap,
-                        a->count + 1u);
+  a->entries =
+      smt_grow(a->entries, sizeof(SmtArrayEntry), &a->cap, a->count + 1u);
   a->entries[a->count].index = *index;
   a->entries[a->count].value = *value;
   a->count++;
@@ -1861,8 +1852,8 @@ void smt_model_func_put(SmtFuncModel *f, unsigned arity, const SmtBits *args,
       return;
     }
   }
-  f->entries = smt_grow(f->entries, sizeof(SmtFuncEntry), &f->cap,
-                        f->count + 1u);
+  f->entries =
+      smt_grow(f->entries, sizeof(SmtFuncEntry), &f->cap, f->count + 1u);
   SmtFuncEntry *e = &f->entries[f->count++];
   e->args = malloc((arity ? arity : 1u) * sizeof(SmtBits));
   memcpy(e->args, args, arity * sizeof(SmtBits));
@@ -2074,8 +2065,8 @@ int smt_eval(SmtEval *e, SmtTerm t, SmtBits *out) {
         bwidth = smt_width(ctx, smt_arg(ctx, t, 1));
       }
     }
-    if (!smt_bits_apply(k, &r, &a, &b, ctx->sorts[n->sort].width, n->p0,
-                        n->p1, bwidth)) {
+    if (!smt_bits_apply(k, &r, &a, &b, ctx->sorts[n->sort].width, n->p0, n->p1,
+                        bwidth)) {
       e->failed = 1;
       return 0;
     }
