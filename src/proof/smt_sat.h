@@ -29,6 +29,8 @@ typedef struct {
 
 void sat_freeze(SatSolver *s, uint32_t var);
 void sat_set_preprocess(SatSolver *s, int enabled);
+void sat_set_propagation_limit(SatSolver *s, uint64_t limit);
+int sat_propagation_limit_reached(const SatSolver *s);
 
 SatSolver *sat_new(void);
 void sat_free(SatSolver *s);
@@ -40,16 +42,17 @@ int sat_solve(SatSolver *s, uint64_t conflict_limit);
 int sat_value(const SatSolver *s, uint32_t var);
 void sat_get_stats(const SatSolver *s, SatStats *stats);
 
-typedef struct {
-  const uint32_t *originals;
-  size_t original_words;
-  const uint32_t *proof;
-  size_t proof_words;
-  uint32_t vars;
-} SatProofView;
+int sat_refutation_checked(SatSolver *s, uint64_t *lemmas_checked);
 
-void sat_proof_view(const SatSolver *s, SatProofView *view);
+enum { SAT_PROOF_ORIGINAL = 0, SAT_PROOF_LEMMA = 1, SAT_PROOF_DELETE = 2 };
 
-int sat_drup_check(const SatProofView *view, uint64_t *lemmas_checked);
+typedef struct SatChecker SatChecker;
+
+SatChecker *sat_checker_new(void);
+void sat_checker_free(SatChecker *c);
+void sat_checker_feed(SatChecker *c, const uint32_t *words, size_t count);
+int sat_checker_refuted(const SatChecker *c);
+int sat_checker_failed(const SatChecker *c);
+uint64_t sat_checker_lemmas(const SatChecker *c);
 
 #endif

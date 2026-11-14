@@ -16,8 +16,20 @@ typedef struct {
 } AppEntry;
 
 typedef struct {
+  uint64_t *keys;
+  SmtTerm *vals;
+  uint32_t cap;
+  uint32_t count;
+} PairMap;
+
+#define READ_EXPANSION_LIMIT 400000u
+#define PROPAGATIONS_PER_CONFLICT 20000u
+
+typedef struct {
   SmtCtx *ctx;
   SmtMap memo;
+  PairMap read_memo;
+  uint32_t expansions;
   ReadEntry *reads;
   uint32_t read_count;
   uint32_t read_cap;
@@ -56,12 +68,90 @@ static void lower_fail(Lower *l, const char *why) {
 
 static SmtTerm lower(Lower *l, SmtTerm t);
 
+static uint32_t pair_slot(const PairMap *m, uint64_t key) {
+  uint32_t slot = (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (m->cap - 1u);
+  while (m->keys[slot] && m->keys[slot] != key) {
+    slot = (slot + 1u) & (m->cap - 1u);
+  }
+  return slot;
+}
+
+static SmtTerm pair_get(const PairMap *m, SmtTerm a, SmtTerm b) {
+  if (!m->cap) {
+    return 0;
+  }
+  uint64_t key = ((uint64_t)a << 32) | b;
+  uint32_t slot = pair_slot(m, key);
+  return m->keys[slot] ? m->vals[slot] : 0;
+}
+
+static void pair_put(PairMap *m, SmtTerm a, SmtTerm b, SmtTerm value) {
+  if ((m->count + 1u) * 2u > m->cap) {
+    PairMap grown;
+    grown.cap = m->cap ? m->cap * 2u : 1024u;
+    grown.count = m->count;
+    grown.keys = calloc(grown.cap, sizeof(uint64_t));
+    grown.vals = calloc(grown.cap, sizeof(SmtTerm));
+    for (uint32_t i = 0; i < m->cap; i++) {
+      if (m->keys[i]) {
+        uint32_t slot = pair_slot(&grown, m->keys[i]);
+        grown.keys[slot] = m->keys[i];
+        grown.vals[slot] = m->vals[i];
+      }
+    }
+    free(m->keys);
+    free(m->vals);
+    *m = grown;
+  }
+  uint64_t key = ((uint64_t)a << 32) | b;
+  uint32_t slot = pair_slot(m, key);
+  if (!m->keys[slot]) {
+    m->keys[slot] = key;
+    m->count++;
+  }
+  m->vals[slot] = value;
+}
+
+static SmtTerm lower_read_once(Lower *l, SmtTerm array, SmtTerm index);
+
+static SmtTerm abandoned_read(Lower *l, SmtTerm array) {
+  SmtCtx *ctx = l->ctx;
+  SmtSort element = ctx->sorts[ctx->nodes[array].sort].b;
+  if (smt_sort_is_bv(ctx, element)) {
+    return smt_bv_u64(ctx, ctx->sorts[element].width, 0);
+  }
+  return ctx->bool_false;
+}
+
 static SmtTerm lower_read(Lower *l, SmtTerm array, SmtTerm index) {
+  SmtTerm known = pair_get(&l->read_memo, array, index);
+  if (known) {
+    return known;
+  }
+  if (l->failed) {
+    return abandoned_read(l, array);
+  }
+  if (++l->expansions > READ_EXPANSION_LIMIT) {
+    lower_fail(l, "the reads through array updates expand past the solver's "
+                  "size limit");
+    return abandoned_read(l, array);
+  }
+  SmtTerm out = lower_read_once(l, array, index);
+  if (!l->failed) {
+    pair_put(&l->read_memo, array, index, out);
+  }
+  return out;
+}
+
+static SmtTerm lower_read_once(Lower *l, SmtTerm array, SmtTerm index) {
   SmtCtx *ctx = l->ctx;
   const SmtNode *n = &ctx->nodes[array];
   switch (n->kind) {
   case SMT_K_STORE: {
     SmtTerm j = lower(l, smt_arg(ctx, array, 1));
+    if (smt_offsets_differ(ctx, index, j)) {
+      return lower_read(l, smt_arg(ctx, array, 0), index);
+    }
     SmtTerm v = lower(l, smt_arg(ctx, array, 2));
     SmtTerm hit = smt_eq(ctx, index, j);
     if (hit == ctx->bool_true) {
@@ -77,11 +167,6 @@ static SmtTerm lower_read(Lower *l, SmtTerm array, SmtTerm index) {
     return smt_ite(ctx, c, x, y);
   }
   case SMT_K_VAR: {
-    for (uint32_t i = 0; i < l->read_count; i++) {
-      if (l->reads[i].array == array && l->reads[i].index == index) {
-        return l->reads[i].value;
-      }
-    }
     SmtSort elem = ctx->sorts[n->sort].b;
     if (smt_sort_is_array(ctx, elem)) {
       lower_fail(l, "nested arrays are not supported");
@@ -503,7 +588,8 @@ SmtResult smt_solver_check(SmtSolver *s) {
     lowered = lower(&l, formula);
     for (uint32_t i = 0; i < l.read_count; i++) {
       for (uint32_t j = i + 1u; j < l.read_count; j++) {
-        if (l.reads[i].array != l.reads[j].array) {
+        if (l.reads[i].array != l.reads[j].array ||
+            smt_offsets_differ(ctx, l.reads[i].index, l.reads[j].index)) {
           continue;
         }
         SmtTerm same = smt_eq(ctx, l.reads[i].index, l.reads[j].index);
@@ -552,7 +638,11 @@ SmtResult smt_solver_check(SmtSolver *s) {
   SmtTerm whole = smt_and(ctx, lowered, constraints);
   whole = eliminate_equalities(ctx, whole, &subs);
   if (s->normalize) {
-    whole = smt_normalize(ctx, whole);
+    SmtTerm normal = smt_normalize(ctx, whole);
+    uint64_t plain_size = smt_circuit_size(ctx, whole);
+    if (smt_circuit_size(ctx, normal) <= plain_size + plain_size / 2u + 4096u) {
+      whole = normal;
+    }
   }
   blast_assert(&b, whole);
   double t1 = smt_now_seconds();
@@ -564,6 +654,7 @@ SmtResult smt_solver_check(SmtSolver *s) {
     sat_free(sat);
     goto out;
   }
+  sat_set_propagation_limit(sat, s->conflict_limit * PROPAGATIONS_PER_CONFLICT);
   int r = sat_solve(sat, s->conflict_limit);
   double t2 = smt_now_seconds();
   s->stats.sat_seconds = t2 - t1;
@@ -590,10 +681,8 @@ SmtResult smt_solver_check(SmtSolver *s) {
   } else if (r == SAT_RESULT_UNSAT) {
     result = SMT_UNSAT;
     if (s->certify) {
-      SatProofView view;
-      sat_proof_view(sat, &view);
       uint64_t checked = 0;
-      int ok = sat_drup_check(&view, &checked);
+      int ok = sat_refutation_checked(sat, &checked);
       s->stats.lemmas_checked = checked;
       if (!ok) {
         s->reason = "internal error: the refutation failed proof checking";
@@ -602,13 +691,18 @@ SmtResult smt_solver_check(SmtSolver *s) {
     }
     s->stats.check_seconds = smt_now_seconds() - t2;
   } else {
-    s->reason = "conflict limit reached";
+    s->reason = sat_propagation_limit_reached(sat)
+                    ? "propagation limit reached"
+                    : "conflict limit reached";
   }
   blast_free(&b);
   sat_free(sat);
 out:
   s->stats.terms = ctx->node_count;
+  s->stats.reads_expanded = l.expansions;
   smt_map_free(&l.memo);
+  free(l.read_memo.keys);
+  free(l.read_memo.vals);
   free(l.reads);
   free(l.apps);
   free(l.app_args);

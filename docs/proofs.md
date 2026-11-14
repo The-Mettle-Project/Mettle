@@ -332,7 +332,7 @@ flowchart LR
   E --> N[normalize arithmetic to polynomials]
   N --> B[bit-blast with shared gates]
   B --> C[CDCL SAT]
-  C -- unsat --> P[replay the refutation in a DRUP checker]
+  C -- unsat --> P[check each logged clause by unit propagation]
   C -- sat --> V[evaluate the assertions on the model]
 ```
 
@@ -340,31 +340,51 @@ Terms are hash-consed, so a subterm built twice is one node. The simplifier
 folds constants, applies Boolean and bit-vector identities, and turns division
 by a power of two into shifts and masks.
 
+A read through a chain of array updates becomes a chain of `ite` terms over
+index equalities, built once for each pair of array term and index. An update
+whose index is the read's base plus a different constant is skipped, since
+the two addresses cannot be equal. A call that needs more than 400,000 of
+these expansions answers `unknown`.
+
 The normalizer rewrites sums, differences, negations, shifts by constants and
 products into polynomials over Z/2^w with sorted monomials. An equation
 becomes one polynomial set to zero, with negative terms moved to the other
 side. Reassociated and strength-reduced arithmetic meets in one form, and the
 SAT solver never sees it. Inside a negated equation it also writes `v` as
 `2^k * (v >> k) + (v & (2^k - 1))` when both pieces appear, which is how
-`mul_splits_low_bit` is proved without a multiplier circuit.
+`mul_splits_low_bit` is proved without a multiplier circuit. An equation whose
+polynomial holds an `ite` with arithmetic in a branch is split into the two
+cases of the condition, and every `ite` on that condition is replaced by its
+branch inside the polynomial. A split below the first is kept only when one
+case folds to true or false. The solver uses the normalized formula when its
+estimated circuit is at most one and a half times the original's, and the
+original formula otherwise.
 
 The SAT solver eliminates variables by bounded resolution before the search,
 then uses two watched literals with blocking literals, VSIDS decisions with
 phase saving, first-UIP learning with recursive minimization, restarts driven
 by the moving average of clause quality, and clause deletion by literal block
-distance. A satisfying assignment is extended back over the eliminated
-variables from the clauses they removed.
+distance. Binary clauses propagate from the watch lists alone. A restart keeps
+the decision levels whose variables still rank above the next candidate, so
+the solver does not rebuild that part of the trail. A satisfying assignment is
+extended back over the eliminated variables from the clauses they removed.
+
+A call with a conflict limit also stops after 20,000 propagations for each
+conflict the limit allows, and reports `propagation limit reached`. The limit
+then bounds the work on a formula of any size.
 
 Every `unsat` answer comes with a refutation: each learned clause, each
 resolvent from variable elimination and each fact derived at the top level
-is logged with the clauses it was derived from. An independent checker that
-shares no code with the SAT solver walks back from the final conflict, marks
-the clauses it depends on, and confirms each marked clause by unit
-propagation over those clauses alone. A refutation that fails the check
-turns the answer into `unknown`. Every `sat` answer is checked by evaluating the
-original assertions on the model. A wrong answer from the search therefore
-cannot reach a proof. The bit-blaster, the simplifier and the normalizer are
-checked by a differential fuzzer that compares each against the evaluator.
+is logged with the clauses it was derived from, in the order unit propagation
+uses them. A checker that shares no code with the SAT solver confirms each
+logged clause by unit propagation over the clauses it names. The solver hands
+the log over in pieces of 16 MB and reports each clause it deletes, so the
+memory a refutation needs is bounded by the clauses alive at one time. A
+refutation that fails the check turns the answer into `unknown`. Every `sat`
+answer is checked by evaluating the original assertions on the model. A wrong
+answer from the search therefore cannot reach a proof. The bit-blaster, the
+simplifier and the normalizer are checked by a differential fuzzer that
+compares each against the evaluator.
 
 Quantified formulas are treated as opaque atoms. That is sound for proofs,
 and a `sat` answer on a formula that contained one is reported as `unknown`.

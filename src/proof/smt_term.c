@@ -491,7 +491,7 @@ static void smt_split_offset(const SmtCtx *ctx, SmtTerm t, SmtTerm *base,
   *base = t;
   *offset = 0;
   const SmtNode *n = &ctx->nodes[t];
-  if (n->kind != SMT_K_BVADD || n->nargs != 2 || smt_width(ctx, t) != 64) {
+  if (n->kind != SMT_K_BVADD || n->nargs != 2 || smt_width(ctx, t) > 64) {
     return;
   }
   SmtTerm x = smt_arg(ctx, t, 0), y = smt_arg(ctx, t, 1);
@@ -503,6 +503,17 @@ static void smt_split_offset(const SmtCtx *ctx, SmtTerm t, SmtTerm *base,
     *offset = smt_bits_of(ctx, x)->w[0];
   }
 }
+int smt_offsets_differ(const SmtCtx *ctx, SmtTerm a, SmtTerm b) {
+  SmtTerm base_a, base_b;
+  uint64_t offset_a, offset_b;
+  if (!smt_sort_is_bv(ctx, ctx->nodes[a].sort)) {
+    return 0;
+  }
+  smt_split_offset(ctx, a, &base_a, &offset_a);
+  smt_split_offset(ctx, b, &base_b, &offset_b);
+  return base_a == base_b && offset_a != offset_b;
+}
+
 static int smt_const_is_one(const SmtCtx *ctx, SmtTerm t) {
   if (!smt_is_bvconst(ctx, t)) {
     return 0;

@@ -1,34 +1,88 @@
 #include "smt_sat.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
-  uint32_t kind;
-  uint32_t n;
-  size_t lits;
-  uint32_t nh;
-  size_t hints;
-} ProofEntry;
-
-typedef struct {
-  const uint32_t *words;
-  ProofEntry *entries;
-  size_t count;
+struct SatChecker {
+  size_t *where;
+  size_t ids;
+  size_t where_cap;
+  uint32_t *store;
+  size_t store_size;
+  size_t store_cap;
+  size_t store_dead;
   int8_t *val;
+  size_t lit_cap;
   SatLit *trail;
   size_t trail_size;
-  size_t lit_count;
-} Checker;
+  size_t trail_cap;
+  uint64_t lemmas;
+  int failed;
+  int refuted;
+};
 
-static int lit_ok(const Checker *c, SatLit l) { return l < c->lit_count; }
+enum { VISIT_SATISFIED, VISIT_OPEN, VISIT_UNIT, VISIT_CONFLICT, VISIT_BAD };
 
-static void assign(Checker *c, SatLit l) {
+static void *checker_grow(void *ptr, size_t bytes) {
+  void *out = realloc(ptr, bytes);
+  if (!out) {
+    fprintf(stderr, "smt: out of memory while checking a refutation\n");
+    abort();
+  }
+  return out;
+}
+
+SatChecker *sat_checker_new(void) {
+  SatChecker *c = calloc(1, sizeof(SatChecker));
+  if (!c) {
+    fprintf(stderr, "smt: out of memory while checking a refutation\n");
+    abort();
+  }
+  return c;
+}
+
+void sat_checker_free(SatChecker *c) {
+  if (!c) {
+    return;
+  }
+  free(c->where);
+  free(c->store);
+  free(c->val);
+  free(c->trail);
+  free(c);
+}
+
+int sat_checker_refuted(const SatChecker *c) {
+  return c && !c->failed && c->refuted;
+}
+
+int sat_checker_failed(const SatChecker *c) { return c && c->failed; }
+
+uint64_t sat_checker_lemmas(const SatChecker *c) { return c ? c->lemmas : 0; }
+
+static void reserve_literal(SatChecker *c, SatLit l) {
+  size_t need = (size_t)(l | 1u) + 1u;
+  if (need <= c->lit_cap) {
+    return;
+  }
+  size_t cap = c->lit_cap ? c->lit_cap : 1024u;
+  while (cap < need) {
+    cap *= 2u;
+  }
+  c->val = checker_grow(c->val, cap);
+  memset(c->val + c->lit_cap, 0, cap - c->lit_cap);
+  c->lit_cap = cap;
+  c->trail = checker_grow(c->trail, (cap / 2u + 1u) * sizeof(SatLit));
+  c->trail_cap = cap / 2u + 1u;
+}
+
+static void assign(SatChecker *c, SatLit l) {
   c->val[l] = 1;
   c->val[l ^ 1u] = -1;
   c->trail[c->trail_size++] = l;
 }
 
-static void undo(Checker *c, size_t to) {
+static void undo(SatChecker *c, size_t to) {
   while (c->trail_size > to) {
     SatLit l = c->trail[--c->trail_size];
     c->val[l] = 0;
@@ -36,15 +90,92 @@ static void undo(Checker *c, size_t to) {
   }
 }
 
-static int hint_refutes(Checker *c, const ProofEntry *lemma) {
-  size_t mark = c->trail_size;
-  const uint32_t *lits = c->words + lemma->lits;
-  for (uint32_t i = 0; i < lemma->n; i++) {
-    SatLit l = lits[i];
-    if (!lit_ok(c, l)) {
-      undo(c, mark);
-      return 0;
+static void compact(SatChecker *c) {
+  size_t live = c->store_size - c->store_dead;
+  size_t cap = live + live / 2u + 1024u;
+  uint32_t *fresh = checker_grow(NULL, cap * sizeof(uint32_t));
+  size_t size = 0;
+  for (size_t id = 0; id < c->ids; id++) {
+    if (!c->where[id]) {
+      continue;
     }
+    const uint32_t *old = c->store + c->where[id] - 1u;
+    size_t words = (size_t)old[0] + 1u;
+    memcpy(fresh + size, old, words * sizeof(uint32_t));
+    c->where[id] = size + 1u;
+    size += words;
+  }
+  free(c->store);
+  c->store = fresh;
+  c->store_size = size;
+  c->store_cap = cap;
+  c->store_dead = 0;
+}
+
+static void keep_clause(SatChecker *c, const uint32_t *lits, uint32_t n) {
+  if (c->ids == c->where_cap) {
+    c->where_cap = c->where_cap ? c->where_cap * 2u : 4096u;
+    c->where = checker_grow(c->where, c->where_cap * sizeof(size_t));
+  }
+  if (c->store_size + n + 1u > c->store_cap) {
+    size_t cap = c->store_cap ? c->store_cap : 4096u;
+    while (cap < c->store_size + n + 1u) {
+      cap *= 2u;
+    }
+    c->store = checker_grow(c->store, cap * sizeof(uint32_t));
+    c->store_cap = cap;
+  }
+  c->where[c->ids++] = c->store_size + 1u;
+  c->store[c->store_size] = n;
+  memcpy(c->store + c->store_size + 1u, lits, n * sizeof(uint32_t));
+  c->store_size += (size_t)n + 1u;
+}
+
+static void drop_clause(SatChecker *c, uint32_t id) {
+  if (id == 0 || id > c->ids || !c->where[id - 1u]) {
+    return;
+  }
+  c->store_dead += (size_t)c->store[c->where[id - 1u] - 1u] + 1u;
+  c->where[id - 1u] = 0;
+  if (c->store_dead > 65536u && c->store_dead * 2u > c->store_size) {
+    compact(c);
+  }
+}
+
+static int visit(SatChecker *c, uint32_t id) {
+  if (id == 0 || id > c->ids || !c->where[id - 1u]) {
+    return VISIT_BAD;
+  }
+  const uint32_t *clause = c->store + c->where[id - 1u] - 1u;
+  uint32_t n = clause[0];
+  SatLit unit = 0;
+  uint32_t open = 0;
+  for (uint32_t k = 1; k <= n; k++) {
+    SatLit l = clause[k];
+    int8_t v = c->val[l];
+    if (v == 1) {
+      return VISIT_SATISFIED;
+    }
+    if (v == 0) {
+      if (open) {
+        return VISIT_OPEN;
+      }
+      open = 1;
+      unit = l;
+    }
+  }
+  if (!open) {
+    return VISIT_CONFLICT;
+  }
+  assign(c, unit);
+  return VISIT_UNIT;
+}
+
+static int lemma_follows(SatChecker *c, const uint32_t *lits, uint32_t n,
+                         const uint32_t *hints, uint32_t nh) {
+  size_t mark = c->trail_size;
+  for (uint32_t i = 0; i < n; i++) {
+    SatLit l = lits[i];
     if (c->val[l] == 1) {
       undo(c, mark);
       return 1;
@@ -53,161 +184,78 @@ static int hint_refutes(Checker *c, const ProofEntry *lemma) {
       assign(c, l ^ 1u);
     }
   }
-  const uint32_t *hints = c->words + lemma->hints;
-  for (int changed = 1; changed;) {
-    changed = 0;
-    for (uint32_t h = lemma->nh; h-- > 0;) {
-      uint32_t id = hints[h];
-      if (id == 0 || id > c->count) {
-        undo(c, mark);
-        return 0;
-      }
-      const ProofEntry *e = &c->entries[id - 1];
-      if (e == lemma || e > lemma) {
-        undo(c, mark);
-        return 0;
-      }
-      const uint32_t *cl = c->words + e->lits;
-      SatLit unit = 0;
-      uint32_t open = 0;
-      int satisfied = 0;
-      for (uint32_t k = 0; k < e->n && !satisfied; k++) {
-        SatLit l = cl[k];
-        if (!lit_ok(c, l)) {
-          undo(c, mark);
-          return 0;
-        }
-        if (c->val[l] == 1) {
-          satisfied = 1;
-        } else if (c->val[l] == 0) {
-          open++;
-          unit = l;
-        }
-      }
-      if (satisfied) {
-        continue;
-      }
-      if (open == 0) {
+  for (;;) {
+    int open = 0, changed = 0;
+    for (uint32_t h = 0; h < nh; h++) {
+      int r = visit(c, hints[h]);
+      if (r == VISIT_CONFLICT) {
         undo(c, mark);
         return 1;
       }
-      if (open == 1) {
-        assign(c, unit);
-        changed = 1;
+      if (r == VISIT_BAD) {
+        undo(c, mark);
+        return 0;
       }
+      open |= r == VISIT_OPEN;
+      changed |= r == VISIT_UNIT;
+    }
+    if (!open || !changed) {
+      break;
     }
   }
   undo(c, mark);
   return 0;
 }
 
-int sat_drup_check(const SatProofView *view, uint64_t *lemmas_checked) {
-  Checker c;
-  memset(&c, 0, sizeof(c));
-  c.words = view->proof;
-  c.lit_count = (size_t)view->vars * 2u;
-  size_t cap = 0;
+static void settle_unit(SatChecker *c, SatLit l) {
+  if (c->val[l] == -1) {
+    c->refuted = 1;
+  } else if (c->val[l] == 0) {
+    assign(c, l);
+  }
+}
+
+void sat_checker_feed(SatChecker *c, const uint32_t *words, size_t count) {
   size_t i = 0;
-  int ok = 1;
-  while (i < view->proof_words) {
-    if (i + 2 > view->proof_words) {
-      ok = 0;
+  while (i < count && !c->failed) {
+    if (i + 2u > count) {
+      c->failed = 1;
       break;
     }
-    ProofEntry e;
-    e.kind = view->proof[i++];
-    e.n = view->proof[i++];
-    e.lits = i;
-    i += e.n;
-    if (i >= view->proof_words) {
-      ok = 0;
-      break;
-    }
-    e.nh = view->proof[i++];
-    e.hints = i;
-    i += e.nh;
-    if (i > view->proof_words) {
-      ok = 0;
-      break;
-    }
-    if (c.count == cap) {
-      cap = cap ? cap * 2 : 1024;
-      c.entries = realloc(c.entries, cap * sizeof(ProofEntry));
-    }
-    c.entries[c.count++] = e;
-  }
-  size_t last = c.count;
-  for (size_t k = c.count; ok && k-- > 0;) {
-    if (c.entries[k].kind == 1 && c.entries[k].n == 0) {
-      last = k;
-      break;
-    }
-  }
-  if (!ok || last == c.count) {
-    free(c.entries);
-    if (lemmas_checked) {
-      *lemmas_checked = 0;
-    }
-    return 0;
-  }
-  uint8_t *needed = calloc(c.count, 1);
-  needed[last] = 1;
-  for (size_t k = 0; k < last; k++) {
-    if (c.entries[k].kind == 1 && c.entries[k].n <= 1) {
-      needed[k] = 1;
-    }
-  }
-  for (size_t k = last + 1; k-- > 0;) {
-    if (!needed[k] || c.entries[k].kind != 1) {
+    uint32_t kind = words[i++];
+    uint32_t n = words[i++];
+    if (kind == SAT_PROOF_DELETE) {
+      drop_clause(c, n);
       continue;
     }
-    const uint32_t *hints = c.words + c.entries[k].hints;
-    for (uint32_t h = 0; h < c.entries[k].nh; h++) {
-      uint32_t id = hints[h];
-      if (id >= 1 && id <= k) {
-        needed[id - 1] = 1;
+    const uint32_t *lits = words + i;
+    i += n;
+    if (i >= count) {
+      c->failed = 1;
+      break;
+    }
+    uint32_t nh = words[i++];
+    const uint32_t *hints = words + i;
+    i += nh;
+    if (i > count || kind > SAT_PROOF_LEMMA) {
+      c->failed = 1;
+      break;
+    }
+    for (uint32_t k = 0; k < n; k++) {
+      reserve_literal(c, lits[k]);
+    }
+    if (kind == SAT_PROOF_LEMMA) {
+      c->lemmas++;
+      if (!lemma_follows(c, lits, n, hints, nh)) {
+        c->failed = 1;
+        break;
       }
     }
-  }
-  c.val = calloc(c.lit_count + 2, 1);
-  c.trail = malloc((c.lit_count / 2 + 2) * sizeof(SatLit));
-  uint64_t checked = 0;
-  int refuted = 0;
-  for (size_t k = 0; k <= last && ok && !refuted; k++) {
-    ProofEntry *e = &c.entries[k];
-    const uint32_t *lits = c.words + e->lits;
-    if (e->kind == 0) {
-      if (e->n == 1 && lit_ok(&c, lits[0])) {
-        if (c.val[lits[0]] == -1) {
-          refuted = 1;
-        } else if (c.val[lits[0]] == 0) {
-          assign(&c, lits[0]);
-        }
-      }
-      continue;
-    }
-    if (!needed[k]) {
-      continue;
-    }
-    checked++;
-    if (!hint_refutes(&c, e)) {
-      ok = 0;
-      break;
-    }
-    if (e->n == 0) {
-      refuted = 1;
-    } else if (e->n == 1 && c.val[lits[0]] == 0) {
-      assign(&c, lits[0]);
-    } else if (e->n == 1 && c.val[lits[0]] == -1) {
-      refuted = 1;
+    keep_clause(c, lits, n);
+    if (n == 0) {
+      c->refuted = 1;
+    } else if (n == 1) {
+      settle_unit(c, lits[0]);
     }
   }
-  if (lemmas_checked) {
-    *lemmas_checked = checked;
-  }
-  free(needed);
-  free(c.val);
-  free(c.trail);
-  free(c.entries);
-  return ok && refuted;
 }

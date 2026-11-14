@@ -21,7 +21,7 @@ typedef struct {
 typedef struct {
   SmtCtx *ctx;
   SmtMap memo[3];
-  unsigned depth;
+  unsigned case_budget;
 } Norm;
 
 enum { POL_BOTH = 0, POL_POS = 1, POL_NEG = 2 };
@@ -120,9 +120,10 @@ static int factor_cmp(const void *a, const void *b) {
   return x < y ? -1 : x > y;
 }
 
-static void poly_mul(Poly *out, const Poly *a, const Poly *b) {
+static void poly_mul(Poly *out, const Poly *a, const Poly *b,
+                     unsigned max_products) {
   poly_init(out, a->w);
-  if (!a->ok || !b->ok || a->n * b->n > 4u) {
+  if (!a->ok || !b->ok || a->n * b->n > max_products) {
     out->ok = 0;
     return;
   }
@@ -227,7 +228,7 @@ static void poly_of(Norm *nm, SmtTerm t, Poly *p, unsigned budget) {
       *p = *pa;
       poly_scale(p, &ca);
     } else {
-      poly_mul(p, pa, pb);
+      poly_mul(p, pa, pb, 4u);
     }
     free(pa);
     free(pb);
@@ -435,36 +436,149 @@ static int split_variable(SmtCtx *ctx, Poly *p) {
   return ok;
 }
 
-static SmtTerm normalize_eq(Norm *nm, SmtTerm a, SmtTerm b, int split);
+static SmtTerm zero_test(Norm *nm, Poly *p, int split, unsigned depth);
 
-static SmtTerm lift_ite(Norm *nm, const Poly *p, SmtTerm a, SmtTerm b,
-                        int split) {
+static void poly_under(Norm *nm, const Poly *p, SmtTerm condition, int holds,
+                       Poly *out) {
   SmtCtx *ctx = nm->ctx;
-  if (nm->depth >= 3) {
-    return 0;
-  }
-  for (unsigned i = 0; i < p->n; i++) {
-    for (uint32_t f = 0; f < p->m[i].nf; f++) {
-      SmtTerm it = p->m[i].f[f];
-      if (smt_term_kind(ctx, it) != SMT_K_ITE ||
-          !smt_sort_is_bv(ctx, smt_term_sort(ctx, it))) {
-        continue;
+  Poly *product = malloc(sizeof(Poly));
+  Poly *factor = malloc(sizeof(Poly));
+  Poly *next = malloc(sizeof(Poly));
+  poly_init(out, p->w);
+  for (unsigned i = 0; i < p->n && out->ok; i++) {
+    const Mono *m = &p->m[i];
+    poly_const(product, p->w, &m->coeff);
+    for (uint32_t f = 0; f < m->nf && product->ok; f++) {
+      SmtTerm t = m->f[f];
+      if (smt_term_kind(ctx, t) == SMT_K_ITE &&
+          smt_term_arg(ctx, t, 0) == condition) {
+        poly_of(nm, smt_term_arg(ctx, t, holds ? 1 : 2), factor, 64);
+      } else {
+        poly_atom(factor, p->w, t);
       }
-      SmtTerm c = smt_term_arg(ctx, it, 0);
-      SmtTerm t = smt_term_arg(ctx, it, 1);
-      SmtTerm e = smt_term_arg(ctx, it, 2);
-      nm->depth++;
-      SmtTerm at = smt_replace(ctx, a, 1, &it, &t);
-      SmtTerm bt = smt_replace(ctx, b, 1, &it, &t);
-      SmtTerm ae = smt_replace(ctx, a, 1, &it, &e);
-      SmtTerm be = smt_replace(ctx, b, 1, &it, &e);
-      SmtTerm yes = normalize_eq(nm, at, bt, split);
-      SmtTerm no = normalize_eq(nm, ae, be, split);
-      nm->depth--;
-      return smt_ite(ctx, c, yes, no);
+      poly_mul(next, product, factor, NORM_MAX_MONOS);
+      *product = *next;
+    }
+    poly_add(out, product);
+  }
+  free(product);
+  free(factor);
+  free(next);
+}
+
+static int hides_arithmetic(SmtCtx *ctx, SmtTerm ite) {
+  for (unsigned branch = 1; branch <= 2u; branch++) {
+    SmtKind k = smt_term_kind(ctx, smt_term_arg(ctx, ite, branch));
+    if (is_arith(k) && k != SMT_K_CONST) {
+      return 1;
     }
   }
   return 0;
+}
+
+static SmtTerm split_on_condition(Norm *nm, const Poly *p, int split,
+                                  unsigned depth) {
+  SmtCtx *ctx = nm->ctx;
+  if (depth >= 3u) {
+    return 0;
+  }
+  SmtTerm tried = 0;
+  unsigned tries = 0;
+  SmtTerm out = 0;
+  Poly *yes_poly = malloc(sizeof(Poly));
+  Poly *no_poly = malloc(sizeof(Poly));
+  for (unsigned i = 0; i < p->n && !out && tries < 2u; i++) {
+    for (uint32_t f = 0; f < p->m[i].nf && !out && tries < 2u; f++) {
+      SmtTerm it = p->m[i].f[f];
+      if (smt_term_kind(ctx, it) != SMT_K_ITE || !hides_arithmetic(ctx, it)) {
+        continue;
+      }
+      SmtTerm condition = smt_term_arg(ctx, it, 0);
+      if (condition == tried) {
+        continue;
+      }
+      if (nm->case_budget == 0) {
+        tries = 2u;
+        break;
+      }
+      nm->case_budget--;
+      tried = condition;
+      tries++;
+      poly_under(nm, p, condition, 1, yes_poly);
+      poly_under(nm, p, condition, 0, no_poly);
+      SmtTerm yes = zero_test(nm, yes_poly, split, depth + 1u);
+      SmtTerm no = zero_test(nm, no_poly, split, depth + 1u);
+      if (yes && no &&
+          (depth == 0 || smt_term_is_const(ctx, yes) ||
+           smt_term_is_const(ctx, no))) {
+        out = smt_ite(ctx, condition, yes, no);
+      }
+    }
+  }
+  free(yes_poly);
+  free(no_poly);
+  return out;
+}
+
+static SmtTerm zero_test(Norm *nm, Poly *p, int split, unsigned depth) {
+  SmtCtx *ctx = nm->ctx;
+  unsigned w = p->w;
+  SmtBits c;
+  if (!p->ok) {
+    return 0;
+  }
+  if (poly_is_const(p, &c)) {
+    return smt_bool(ctx, smt_bits_is_zero(&c));
+  }
+  SmtTerm cases = split_on_condition(nm, p, split, depth);
+  if (cases) {
+    return cases;
+  }
+  if (split) {
+    Poly *saved = malloc(sizeof(Poly));
+    *saved = *p;
+    for (int round = 0; round < 4 && split_variable(ctx, p); round++) {
+    }
+    int vanished = poly_is_const(p, &c) && smt_bits_is_zero(&c);
+    if (!vanished) {
+      *p = *saved;
+    }
+    free(saved);
+    if (vanished) {
+      return ctx->bool_true;
+    }
+  }
+  SmtBits minus, constant;
+  smt_bits_ones(&minus, w);
+  smt_bits_zero(&constant);
+  unsigned j = 0;
+  for (unsigned i = 0; i < p->n; i++) {
+    if (p->m[i].nf == 0) {
+      constant = p->m[i].coeff;
+    } else {
+      p->m[j++] = p->m[i];
+    }
+  }
+  p->n = j;
+  qsort(p->m, p->n, sizeof(Mono), mono_qsort);
+  if (smt_bits_get(&p->m[0].coeff, w - 1u)) {
+    poly_scale(p, &minus);
+    smt_bits_neg(&constant, &constant, w);
+  }
+  SmtTerm pos, neg;
+  SmtBits ignored;
+  poly_split(ctx, p, &pos, &neg, &ignored);
+  if (!pos) {
+    return smt_eq(ctx, neg, smt_bv_words(ctx, w, constant.w));
+  }
+  SmtBits rhs;
+  smt_bits_neg(&rhs, &constant, w);
+  SmtTerm right = neg ? neg : smt_bv_words(ctx, w, rhs.w);
+  SmtTerm left = pos;
+  if (neg && !smt_bits_is_zero(&constant)) {
+    left = smt_mk2(ctx, SMT_K_BVADD, pos, smt_bv_words(ctx, w, constant.w));
+  }
+  return smt_eq(ctx, left, right);
 }
 
 static SmtTerm normalize_eq(Norm *nm, SmtTerm a, SmtTerm b, int split) {
@@ -478,65 +592,8 @@ static SmtTerm normalize_eq(Norm *nm, SmtTerm a, SmtTerm b, int split) {
   smt_bits_ones(&minus, w);
   poly_scale(q, &minus);
   poly_add(p, q);
-  SmtTerm out = 0;
-  if (p->ok) {
-    SmtTerm lifted = lift_ite(nm, p, a, b, split);
-    if (lifted) {
-      free(p);
-      free(q);
-      return lifted;
-    }
-  }
-  if (p->ok && split) {
-    Poly *saved = malloc(sizeof(Poly));
-    *saved = *p;
-    SmtBits zero_check;
-    for (int round = 0; round < 4 && split_variable(nm->ctx, p); round++) {
-    }
-    if (!(poly_is_const(p, &zero_check) && smt_bits_is_zero(&zero_check))) {
-      *p = *saved;
-    }
-    free(saved);
-  }
-  if (p->ok) {
-    SmtBits c;
-    if (poly_is_const(p, &c)) {
-      out = smt_bool(ctx, smt_bits_is_zero(&c));
-    } else {
-      SmtBits constant;
-      smt_bits_zero(&constant);
-      unsigned j = 0;
-      for (unsigned i = 0; i < p->n; i++) {
-        if (p->m[i].nf == 0) {
-          constant = p->m[i].coeff;
-        } else {
-          p->m[j++] = p->m[i];
-        }
-      }
-      p->n = j;
-      qsort(p->m, p->n, sizeof(Mono), mono_qsort);
-      if (smt_bits_get(&p->m[0].coeff, w - 1u)) {
-        poly_scale(p, &minus);
-        smt_bits_neg(&constant, &constant, w);
-      }
-      SmtTerm pos, neg;
-      SmtBits ignored;
-      poly_split(ctx, p, &pos, &neg, &ignored);
-      if (!pos) {
-        out = smt_eq(ctx, neg, smt_bv_words(ctx, w, constant.w));
-      } else {
-        SmtBits rhs;
-        smt_bits_neg(&rhs, &constant, w);
-        SmtTerm right = neg ? neg : smt_bv_words(ctx, w, rhs.w);
-        SmtTerm left = pos;
-        if (neg && !smt_bits_is_zero(&constant)) {
-          left = smt_mk2(ctx, SMT_K_BVADD, pos,
-                         smt_bv_words(ctx, w, constant.w));
-        }
-        out = smt_eq(ctx, left, right);
-      }
-    }
-  }
+  nm->case_budget = 12u;
+  SmtTerm out = zero_test(nm, p, split, 0);
   free(p);
   free(q);
   return out ? out : smt_eq(ctx, a, b);
@@ -614,10 +671,85 @@ static SmtTerm normalize(Norm *nm, SmtTerm t, int pol) {
   return out;
 }
 
+static uint64_t node_circuit_size(const SmtCtx *ctx, SmtTerm t) {
+  const SmtNode *n = &ctx->nodes[t];
+  uint64_t w = smt_sort_is_bv(ctx, n->sort) ? ctx->sorts[n->sort].width : 1u;
+  SmtTerm a = n->nargs > 0 ? smt_arg(ctx, t, 0) : 0;
+  SmtTerm b = n->nargs > 1 ? smt_arg(ctx, t, 1) : 0;
+  uint64_t aw = a && smt_sort_is_bv(ctx, ctx->nodes[a].sort)
+                    ? ctx->sorts[ctx->nodes[a].sort].width
+                    : 1u;
+  switch ((SmtKind)n->kind) {
+  case SMT_K_AND:
+  case SMT_K_OR:
+  case SMT_K_XOR:
+    return 1;
+  case SMT_K_ITE:
+  case SMT_K_BVAND:
+  case SMT_K_BVOR:
+  case SMT_K_BVXOR:
+    return w;
+  case SMT_K_EQ:
+    return aw + 1u;
+  case SMT_K_BVULT:
+  case SMT_K_BVULE:
+  case SMT_K_BVSLT:
+  case SMT_K_BVSLE:
+    return 2u * aw;
+  case SMT_K_BVNEG:
+  case SMT_K_BVADD:
+  case SMT_K_BVSUB:
+    return 3u * w;
+  case SMT_K_BVMUL: {
+    SmtTerm k = smt_term_is_const(ctx, a) ? a : smt_term_is_const(ctx, b) ? b : 0;
+    if (k) {
+      return 3u * w * (uint64_t)popcount_bits(&ctx->consts[ctx->nodes[k].p0]);
+    }
+    return 3u * w * w;
+  }
+  case SMT_K_BVUDIV:
+  case SMT_K_BVUREM:
+  case SMT_K_BVSDIV:
+  case SMT_K_BVSREM:
+  case SMT_K_BVSMOD:
+    return 4u * w * w;
+  case SMT_K_BVSHL:
+  case SMT_K_BVLSHR:
+  case SMT_K_BVASHR:
+    return smt_term_is_const(ctx, b) ? 0 : 9u * w;
+  default:
+    return 0;
+  }
+}
+
+uint64_t smt_circuit_size(SmtCtx *ctx, SmtTerm root) {
+  uint32_t stamp = smt_mark_begin(ctx);
+  size_t cap = 1024, n = 0;
+  SmtTerm *stack = malloc(cap * sizeof(SmtTerm));
+  uint64_t total = 0;
+  stack[n++] = root;
+  while (n) {
+    SmtTerm t = stack[--n];
+    if (smt_mark_test_set(ctx, t, stamp)) {
+      continue;
+    }
+    total += node_circuit_size(ctx, t);
+    for (unsigned i = 0; i < ctx->nodes[t].nargs; i++) {
+      if (n == cap) {
+        cap *= 2u;
+        stack = realloc(stack, cap * sizeof(SmtTerm));
+      }
+      stack[n++] = smt_arg(ctx, t, i);
+    }
+  }
+  free(stack);
+  return total;
+}
+
 SmtTerm smt_normalize(SmtCtx *ctx, SmtTerm t) {
   Norm nm;
   nm.ctx = ctx;
-  nm.depth = 0;
+  nm.case_budget = 0;
   for (int i = 0; i < 3; i++) {
     smt_map_init(&nm.memo[i]);
   }

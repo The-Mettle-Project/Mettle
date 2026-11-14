@@ -69,6 +69,7 @@ typedef struct {
   uint64_t lemmas_checked;
   uint64_t terms;
   uint64_t gates;
+  uint64_t reads_expanded;
   double blast_seconds;
   double sat_seconds;
   double check_seconds;

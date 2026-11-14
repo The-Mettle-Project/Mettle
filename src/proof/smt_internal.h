@@ -191,6 +191,9 @@ void smt_eval_reset(SmtEval *e);
 void smt_eval_free(SmtEval *e);
 int smt_eval(SmtEval *e, SmtTerm t, SmtBits *out);
 
+uint64_t smt_circuit_size(SmtCtx *ctx, SmtTerm root);
+int smt_offsets_differ(const SmtCtx *ctx, SmtTerm a, SmtTerm b);
+
 uint32_t smt_mark_begin(SmtCtx *ctx);
 int smt_mark_test_set(SmtCtx *ctx, SmtTerm t, uint32_t stamp);
 

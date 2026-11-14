@@ -1297,9 +1297,7 @@ static int dimacs_run(const char *src, const char *path, int certify,
     int ok = 1;
     uint64_t checked = 0;
     if (certify) {
-      SatProofView view;
-      sat_proof_view(sat, &view);
-      ok = sat_drup_check(&view, &checked);
+      ok = sat_refutation_checked(sat, &checked);
     }
     printf(ok ? "s UNSATISFIABLE\n" : "s UNKNOWN\nc refutation check failed\n");
     if (stats) {

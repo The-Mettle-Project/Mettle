@@ -5,6 +5,7 @@
 
 #define CREF_NONE 0xffffffffu
 #define WATCH_BINARY 0x80000000u
+#define ARENA_LIMIT 0x80000000u
 #define HEADER_WORDS 4u
 #define FLAG_LEARNT 1u
 #define FLAG_DELETED 2u
@@ -68,23 +69,40 @@ struct SatSolver {
   U32Vec elim_stack;
   int preprocess;
   int preprocessed;
+  int watched;
+  uint64_t simplify_due;
+  uint64_t propagation_limit;
+  int propagations_spent;
   uint64_t next_reduce;
   uint64_t reduce_increment;
   uint32_t simplify_trail;
   int proof_enabled;
-  U32Vec originals;
   U32Vec proof;
   U32Vec hints;
-  uint32_t *unit_id;
+  U32Vec resolved;
+  U32Vec removed;
+  uint32_t *trail_pos;
+  SatChecker *checker;
   uint32_t next_id;
   uint32_t alloc_id;
   SatStats stats;
 };
 
+enum { SEEN_NONE = 0, SEEN_SOURCE = 1, SEEN_REMOVABLE = 2, SEEN_FAILED = 3 };
+
+static void *sat_grow(void *ptr, size_t bytes) {
+  void *out = realloc(ptr, bytes);
+  if (!out) {
+    fprintf(stderr, "smt: out of memory in the SAT solver\n");
+    abort();
+  }
+  return out;
+}
+
 static void vec_push(U32Vec *v, uint32_t x) {
   if (v->count == v->cap) {
     v->cap = v->cap ? v->cap * 2u : 64u;
-    v->items = realloc(v->items, v->cap * sizeof(uint32_t));
+    v->items = sat_grow(v->items, v->cap * sizeof(uint32_t));
   }
   v->items[v->count++] = x;
 }
@@ -92,7 +110,7 @@ static void vec_push(U32Vec *v, uint32_t x) {
 static void watch_push(WatchList *w, uint32_t cref, SatLit blocker) {
   if (w->count == w->cap) {
     w->cap = w->cap ? w->cap * 2u : 4u;
-    w->items = realloc(w->items, w->cap * sizeof(Watcher));
+    w->items = sat_grow(w->items, w->cap * sizeof(Watcher));
   }
   w->items[w->count].cref = cref;
   w->items[w->count].blocker = blocker;
@@ -117,7 +135,8 @@ static inline int lit_value(const SatSolver *s, SatLit l) {
 }
 
 SatSolver *sat_new(void) {
-  SatSolver *s = calloc(1, sizeof(SatSolver));
+  SatSolver *s = sat_grow(NULL, sizeof(SatSolver));
+  memset(s, 0, sizeof(SatSolver));
   s->var_inc = 1.0;
   s->var_decay = 0.95;
   s->cla_inc = 1.0f;
@@ -155,10 +174,12 @@ void sat_free(SatSolver *s) {
   free(s->stack.items);
   free(s->to_clear.items);
   free(s->level_stamp);
-  free(s->originals.items);
   free(s->hints.items);
-  free(s->unit_id);
+  free(s->resolved.items);
+  free(s->removed.items);
+  free(s->trail_pos);
   free(s->proof.items);
+  sat_checker_free(s->checker);
   free(s);
 }
 
@@ -232,20 +253,20 @@ uint32_t sat_new_var(SatSolver *s) {
   uint32_t v = s->vars;
   if (v == s->var_cap) {
     uint32_t cap = s->var_cap ? s->var_cap * 2u : 256u;
-    s->lit_val = realloc(s->lit_val, (size_t)cap * 2u);
-    s->level = realloc(s->level, cap * sizeof(uint32_t));
-    s->reason = realloc(s->reason, cap * sizeof(uint32_t));
-    s->activity = realloc(s->activity, cap * sizeof(double));
-    s->polarity = realloc(s->polarity, cap);
-    s->unit_id = realloc(s->unit_id, cap * sizeof(uint32_t));
-    s->eliminated = realloc(s->eliminated, cap);
-    s->frozen = realloc(s->frozen, cap);
-    s->seen = realloc(s->seen, cap);
-    s->heap = realloc(s->heap, cap * sizeof(uint32_t));
-    s->heap_index = realloc(s->heap_index, cap * sizeof(int32_t));
-    s->watches = realloc(s->watches, (size_t)cap * 2u * sizeof(WatchList));
-    s->trail = realloc(s->trail, cap * sizeof(SatLit));
-    s->trail_lim = realloc(s->trail_lim, (cap + 1u) * sizeof(uint32_t));
+    s->lit_val = sat_grow(s->lit_val, (size_t)cap * 2u);
+    s->level = sat_grow(s->level, cap * sizeof(uint32_t));
+    s->reason = sat_grow(s->reason, cap * sizeof(uint32_t));
+    s->activity = sat_grow(s->activity, cap * sizeof(double));
+    s->polarity = sat_grow(s->polarity, cap);
+    s->trail_pos = sat_grow(s->trail_pos, cap * sizeof(uint32_t));
+    s->eliminated = sat_grow(s->eliminated, cap);
+    s->frozen = sat_grow(s->frozen, cap);
+    s->seen = sat_grow(s->seen, cap);
+    s->heap = sat_grow(s->heap, cap * sizeof(uint32_t));
+    s->heap_index = sat_grow(s->heap_index, cap * sizeof(int32_t));
+    s->watches = sat_grow(s->watches, (size_t)cap * 2u * sizeof(WatchList));
+    s->trail = sat_grow(s->trail, cap * sizeof(SatLit));
+    s->trail_lim = sat_grow(s->trail_lim, (cap + 1u) * sizeof(uint32_t));
     s->var_cap = cap;
   }
   s->vars++;
@@ -255,7 +276,7 @@ uint32_t sat_new_var(SatSolver *s) {
   s->reason[v] = CREF_NONE;
   s->activity[v] = 0.0;
   s->polarity[v] = 1;
-  s->unit_id[v] = 0;
+  s->trail_pos[v] = 0;
   s->eliminated[v] = 0;
   s->frozen[v] = 0;
   s->seen[v] = 0;
@@ -273,7 +294,11 @@ static uint32_t clause_alloc(SatSolver *s, const SatLit *lits, uint32_t n,
     while (cap < need) {
       cap *= 2u;
     }
-    s->arena = realloc(s->arena, cap * sizeof(uint32_t));
+    if (need > ARENA_LIMIT) {
+      fprintf(stderr, "smt: the SAT clause store passed 4 GB\n");
+      abort();
+    }
+    s->arena = sat_grow(s->arena, cap * sizeof(uint32_t));
     s->arena_cap = cap;
   }
   uint32_t c = (uint32_t)s->arena_size;
@@ -293,10 +318,48 @@ static inline uint32_t clause_id(const SatSolver *s, uint32_t c) {
 
 static void attach(SatSolver *s, uint32_t c) {
   SatLit *lits = clause_lits(s, c);
-  uint32_t n = clause_size(s, c);
-  uint32_t tag = n == 2 ? WATCH_BINARY : 0u;
+  uint32_t tag = clause_size(s, c) == 2 ? WATCH_BINARY : 0u;
   watch_push(&s->watches[lits[0]], c | tag, lits[1]);
   watch_push(&s->watches[lits[1]], c | tag, lits[0]);
+}
+
+static void attach_all(SatSolver *s) {
+  uint32_t lits = s->vars * 2u;
+  uint32_t *need = sat_grow(NULL, ((size_t)lits + 1u) * sizeof(uint32_t));
+  memset(need, 0, ((size_t)lits + 1u) * sizeof(uint32_t));
+  U32Vec *lists[2] = {&s->clauses, &s->learnts};
+  for (int l = 0; l < 2; l++) {
+    for (size_t i = 0; i < lists[l]->count; i++) {
+      SatLit *cl = clause_lits(s, lists[l]->items[i]);
+      need[cl[0]]++;
+      need[cl[1]]++;
+    }
+  }
+  for (uint32_t i = 0; i < lits; i++) {
+    WatchList *w = &s->watches[i];
+    w->count = 0;
+    if (need[i] > w->cap) {
+      w->cap = need[i] + need[i] / 4u + 2u;
+      w->items = sat_grow(w->items, w->cap * sizeof(Watcher));
+    }
+  }
+  free(need);
+  for (int l = 0; l < 2; l++) {
+    for (size_t i = 0; i < lists[l]->count; i++) {
+      attach(s, lists[l]->items[i]);
+    }
+  }
+  s->watched = 1;
+}
+
+#define PROOF_CHUNK_WORDS ((size_t)1 << 22)
+
+static void proof_flush(SatSolver *s) {
+  if (!s->checker) {
+    s->checker = sat_checker_new();
+  }
+  sat_checker_feed(s->checker, s->proof.items, s->proof.count);
+  s->proof.count = 0;
 }
 
 static uint32_t proof_entry(SatSolver *s, uint32_t kind, const SatLit *lits,
@@ -314,12 +377,22 @@ static uint32_t proof_entry(SatSolver *s, uint32_t kind, const SatLit *lits,
   for (uint32_t i = 0; i < nh; i++) {
     vec_push(&s->proof, hints[i]);
   }
+  if (s->proof.count >= PROOF_CHUNK_WORDS) {
+    proof_flush(s);
+  }
   return id;
 }
 
 static uint32_t proof_lemma(SatSolver *s, const SatLit *lits, uint32_t n,
                             const uint32_t *hints, uint32_t nh) {
-  return proof_entry(s, 1, lits, n, hints, nh);
+  return proof_entry(s, SAT_PROOF_LEMMA, lits, n, hints, nh);
+}
+
+static void proof_delete(SatSolver *s, uint32_t id) {
+  if (s->proof_enabled) {
+    vec_push(&s->proof, SAT_PROOF_DELETE);
+    vec_push(&s->proof, id);
+  }
 }
 
 static inline void enqueue(SatSolver *s, SatLit l, uint32_t reason) {
@@ -328,10 +401,11 @@ static inline void enqueue(SatSolver *s, SatLit l, uint32_t reason) {
   s->lit_val[l ^ 1u] = -1;
   s->level[v] = s->decision_level;
   s->reason[v] = reason;
+  s->trail_pos[v] = s->trail_size;
   s->trail[s->trail_size++] = l;
   if (s->decision_level == 0 && reason != CREF_NONE) {
     uint32_t hint = clause_id(s, reason);
-    s->unit_id[v] = proof_lemma(s, &l, 1, &hint, 1);
+    proof_lemma(s, &l, 1, &hint, 1);
   }
 }
 
@@ -347,7 +421,7 @@ static int lit_compare(const void *a, const void *b) {
 
 void sat_add_clause(SatSolver *s, const SatLit *in, unsigned n) {
   SatLit stack_buf[64];
-  SatLit *lits = n <= 64u ? stack_buf : malloc(n * sizeof(SatLit));
+  SatLit *lits = n <= 64u ? stack_buf : sat_grow(NULL, n * sizeof(SatLit));
   memcpy(lits, in, n * sizeof(SatLit));
   qsort(lits, n, sizeof(SatLit), lit_compare);
   unsigned m = 0;
@@ -364,7 +438,7 @@ void sat_add_clause(SatSolver *s, const SatLit *in, unsigned n) {
     lits[m++] = lits[i];
   }
   s->stats.original_clauses++;
-  uint32_t id = proof_entry(s, 0, lits, m, NULL, 0);
+  uint32_t id = proof_entry(s, SAT_PROOF_ORIGINAL, lits, m, NULL, 0);
   s->alloc_id = id;
   if (s->unsat) {
     goto done;
@@ -388,7 +462,6 @@ void sat_add_clause(SatSolver *s, const SatLit *in, unsigned n) {
     goto done;
   }
   if (m == 1) {
-    s->unit_id[SAT_VAR(lits[0])] = id;
     enqueue(s, lits[0], CREF_NONE);
     goto done;
   }
@@ -396,7 +469,9 @@ void sat_add_clause(SatSolver *s, const SatLit *in, unsigned n) {
     s->alloc_id = id;
     uint32_t c = clause_alloc(s, lits, m, 0);
     vec_push(&s->clauses, c);
-    attach(s, c);
+    if (s->watched) {
+      attach(s, c);
+    }
     if (free_count == 1) {
       enqueue(s, lits[0], c);
     }
@@ -425,10 +500,6 @@ static uint32_t propagate(SatSolver *s) {
       }
       if (w.cref & WATCH_BINARY) {
         uint32_t c = w.cref & ~WATCH_BINARY;
-        if (clause_flags(s, c) & FLAG_DELETED) {
-          i++;
-          continue;
-        }
         ws[j++] = ws[i++];
         if (bv == -1) {
           conflict = c;
@@ -522,45 +593,102 @@ static uint32_t abstract_level(const SatSolver *s, uint32_t v) {
   return 1u << (s->level[v] & 31u);
 }
 
+static void note_removed(SatSolver *s, SatLit p, uint32_t reason) {
+  if (s->proof_enabled) {
+    vec_push(&s->removed, s->trail_pos[SAT_VAR(p)]);
+    vec_push(&s->removed, clause_id(s, reason));
+  }
+}
+
 static int lit_redundant(SatSolver *s, SatLit p, uint32_t abstract_levels) {
-  size_t top = s->to_clear.count;
-  s->stack.count = 0;
-  vec_push(&s->stack, p);
-  while (s->stack.count) {
-    SatLit q = s->stack.items[--s->stack.count];
-    uint32_t c = s->reason[SAT_VAR(q)];
-    if (s->proof_enabled) {
-      vec_push(&s->hints, clause_id(s, c));
-    }
-    SatLit *lits = clause_lits(s, c);
-    uint32_t size = clause_size(s, c);
-    for (uint32_t i = 0; i < size; i++) {
-      SatLit r = lits[i];
-      uint32_t v = SAT_VAR(r);
-      if (v == SAT_VAR(q) || s->seen[v] || s->level[v] == 0) {
+  U32Vec *st = &s->stack;
+  st->count = 0;
+  uint32_t c = s->reason[SAT_VAR(p)];
+  uint32_t i = 0;
+  for (;;) {
+    if (i < clause_size(s, c)) {
+      SatLit l = clause_lits(s, c)[i++];
+      uint32_t v = SAT_VAR(l);
+      uint8_t mark = s->seen[v];
+      if (v == SAT_VAR(p) || s->level[v] == 0 || mark == SEEN_SOURCE ||
+          mark == SEEN_REMOVABLE) {
         continue;
       }
-      if (s->reason[v] != CREF_NONE &&
-          (abstract_level(s, v) & abstract_levels)) {
-        s->seen[v] = 1;
-        vec_push(&s->stack, r);
-        vec_push(&s->to_clear, r);
-      } else {
-        for (size_t k = top; k < s->to_clear.count; k++) {
-          s->seen[SAT_VAR(s->to_clear.items[k])] = 0;
+      if (s->reason[v] == CREF_NONE || mark == SEEN_FAILED ||
+          !(abstract_level(s, v) & abstract_levels)) {
+        vec_push(st, 0);
+        vec_push(st, p);
+        for (size_t k = 1; k < st->count; k += 2u) {
+          SatLit q = st->items[k];
+          if (s->seen[SAT_VAR(q)] == SEEN_NONE) {
+            s->seen[SAT_VAR(q)] = SEEN_FAILED;
+            vec_push(&s->to_clear, q);
+          }
         }
-        s->to_clear.count = top;
         return 0;
       }
+      vec_push(st, i);
+      vec_push(st, p);
+      p = l;
+      c = s->reason[v];
+      i = 0;
+      continue;
+    }
+    if (s->seen[SAT_VAR(p)] == SEEN_NONE) {
+      s->seen[SAT_VAR(p)] = SEEN_REMOVABLE;
+      vec_push(&s->to_clear, p);
+      note_removed(s, p, c);
+    }
+    if (st->count == 0) {
+      break;
+    }
+    p = st->items[--st->count];
+    i = st->items[--st->count];
+    c = s->reason[SAT_VAR(p)];
+  }
+  note_removed(s, p, c);
+  return 1;
+}
+
+static int removed_compare(const void *a, const void *b) {
+  uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+  return x < y ? -1 : x > y;
+}
+
+static void order_hints(SatSolver *s) {
+  s->hints.count = 0;
+  if (!s->proof_enabled) {
+    return;
+  }
+  size_t pairs = s->removed.count / 2u;
+  uint32_t *at = s->removed.items;
+  if (pairs > 48u) {
+    qsort(at, pairs, 2u * sizeof(uint32_t), removed_compare);
+  } else {
+    for (size_t i = 1; i < pairs; i++) {
+      uint32_t position = at[2u * i], id = at[2u * i + 1u];
+      size_t k = i;
+      while (k > 0 && at[2u * k - 2u] > position) {
+        at[2u * k] = at[2u * k - 2u];
+        at[2u * k + 1u] = at[2u * k - 1u];
+        k--;
+      }
+      at[2u * k] = position;
+      at[2u * k + 1u] = id;
     }
   }
-  return 1;
+  for (size_t k = 1; k < s->removed.count; k += 2u) {
+    vec_push(&s->hints, s->removed.items[k]);
+  }
+  for (size_t k = s->resolved.count; k-- > 0;) {
+    vec_push(&s->hints, s->resolved.items[k]);
+  }
 }
 
 static uint32_t compute_lbd(SatSolver *s, const SatLit *lits, uint32_t n) {
   if (s->level_stamp_cap <= s->decision_level) {
     uint32_t cap = s->decision_level + 64u;
-    s->level_stamp = realloc(s->level_stamp, cap * sizeof(uint32_t));
+    s->level_stamp = sat_grow(s->level_stamp, cap * sizeof(uint32_t));
     memset(s->level_stamp + s->level_stamp_cap, 0,
            (cap - s->level_stamp_cap) * sizeof(uint32_t));
     s->level_stamp_cap = cap;
@@ -587,11 +715,12 @@ static void analyze(SatSolver *s, uint32_t conflict, uint32_t *out_level,
   int have_p = 0;
   int64_t index = (int64_t)s->trail_size - 1;
   s->to_clear.count = 0;
-  s->hints.count = 0;
+  s->resolved.count = 0;
+  s->removed.count = 0;
   for (;;) {
     uint32_t c = conflict;
     if (s->proof_enabled) {
-      vec_push(&s->hints, clause_id(s, c));
+      vec_push(&s->resolved, clause_id(s, c));
     }
     if (clause_flags(s, c) & FLAG_LEARNT) {
       clause_bump(s, c);
@@ -606,7 +735,7 @@ static void analyze(SatSolver *s, uint32_t conflict, uint32_t *out_level,
       uint32_t v = SAT_VAR(q);
       if (!s->seen[v] && s->level[v] > 0) {
         var_bump(s, v);
-        s->seen[v] = 1;
+        s->seen[v] = SEEN_SOURCE;
         vec_push(&s->to_clear, q);
         if (s->level[v] >= s->decision_level) {
           path++;
@@ -643,6 +772,7 @@ static void analyze(SatSolver *s, uint32_t conflict, uint32_t *out_level,
     }
   }
   learnt->count = j;
+  order_hints(s);
   s->stats.minimized_literals += before - j;
   s->stats.learnt_literals += j;
   uint32_t level = 0;
@@ -688,13 +818,11 @@ static void backtrack(SatSolver *s, uint32_t level) {
 
 static int clause_locked(SatSolver *s, uint32_t c) {
   SatLit *lits = clause_lits(s, c);
-  uint32_t v = SAT_VAR(lits[0]);
-  if (s->reason[v] == c && lit_value(s, lits[0]) == 1) {
-    return 1;
-  }
-  if (clause_size(s, c) == 2) {
-    uint32_t v1 = SAT_VAR(lits[1]);
-    return s->reason[v1] == c && lit_value(s, lits[1]) == 1;
+  uint32_t candidates = clause_size(s, c) == 2u ? 2u : 1u;
+  for (uint32_t i = 0; i < candidates; i++) {
+    if (s->reason[SAT_VAR(lits[i])] == c && lit_value(s, lits[i]) == 1) {
+      return 1;
+    }
   }
   return 0;
 }
@@ -702,6 +830,7 @@ static int clause_locked(SatSolver *s, uint32_t c) {
 static void clause_delete(SatSolver *s, uint32_t c) {
   s->arena[c] |= FLAG_DELETED;
   s->arena_wasted += HEADER_WORDS + clause_size(s, c);
+  proof_delete(s, clause_id(s, c));
 }
 
 static SatSolver *g_sort_solver;
@@ -719,7 +848,7 @@ static int learnt_compare(const void *a, const void *b) {
 
 static void garbage_collect(SatSolver *s) {
   size_t cap = s->arena_size - s->arena_wasted + 1024u;
-  uint32_t *fresh = malloc(cap * sizeof(uint32_t));
+  uint32_t *fresh = sat_grow(NULL, cap * sizeof(uint32_t));
   size_t size = 0;
   U32Vec *lists[2] = {&s->clauses, &s->learnts};
   for (int l = 0; l < 2; l++) {
@@ -755,14 +884,7 @@ static void garbage_collect(SatSolver *s) {
   s->arena_size = size;
   s->arena_cap = cap;
   s->arena_wasted = 0;
-  for (uint32_t i = 0; i < s->vars * 2u; i++) {
-    s->watches[i].count = 0;
-  }
-  for (int l = 0; l < 2; l++) {
-    for (size_t i = 0; i < lists[l]->count; i++) {
-      attach(s, lists[l]->items[i]);
-    }
-  }
+  attach_all(s);
 }
 
 static void reduce_db(SatSolver *s) {
@@ -787,11 +909,14 @@ static void reduce_db(SatSolver *s) {
 }
 
 static void simplify_db(SatSolver *s) {
-  if (s->decision_level != 0 || s->trail_size == s->simplify_trail) {
+  if (s->decision_level != 0 || s->trail_size == s->simplify_trail ||
+      s->stats.propagations < s->simplify_due) {
     return;
   }
   s->simplify_trail = s->trail_size;
+  s->simplify_due = s->stats.propagations + s->arena_size;
   U32Vec *lists[2] = {&s->clauses, &s->learnts};
+  size_t removed = 0;
   for (int l = 0; l < 2; l++) {
     U32Vec *v = lists[l];
     size_t j = 0;
@@ -805,13 +930,14 @@ static void simplify_db(SatSolver *s) {
       }
       if (satisfied && !clause_locked(s, c)) {
         clause_delete(s, c);
+        removed++;
       } else {
         v->items[j++] = c;
       }
     }
     v->count = j;
   }
-  if (s->arena_wasted * 2u > s->arena_size) {
+  if (removed) {
     garbage_collect(s);
   }
 }
@@ -829,6 +955,26 @@ static SatLit pick_branch(SatSolver *s) {
 static int should_restart(SatSolver *s) {
   return s->conflicts_since_restart >= 50 &&
          s->ema_fast > 1.25 * s->ema_slow;
+}
+
+static uint32_t restart_level(SatSolver *s) {
+  while (s->heap_size) {
+    uint32_t v = s->heap[0];
+    if (s->lit_val[2u * v] == 0 && !s->eliminated[v]) {
+      break;
+    }
+    heap_pop(s);
+  }
+  if (!s->heap_size) {
+    return 0;
+  }
+  double next = s->activity[s->heap[0]];
+  uint32_t level = 0;
+  while (level < s->decision_level &&
+         s->activity[SAT_VAR(s->trail[s->trail_lim[level]])] > next) {
+    level++;
+  }
+  return level;
 }
 
 typedef struct {
@@ -951,21 +1097,13 @@ static int try_eliminate(SatSolver *s, Occ *o, uint32_t v, U32Vec *tmp) {
       }
       if (tmp->count == 1) {
         if (lit_value(s, tmp->items[0]) == 0) {
-          s->unit_id[SAT_VAR(tmp->items[0])] = id;
           enqueue(s, tmp->items[0], CREF_NONE);
-          uint32_t conflict = propagate(s);
-          if (conflict != CREF_NONE) {
-            s->unsat = 1;
-            proof_refute(s, conflict);
-            return 1;
-          }
         }
         continue;
       }
       s->alloc_id = id;
       uint32_t c = clause_alloc(s, tmp->items, (uint32_t)tmp->count, 0);
       vec_push(&s->clauses, c);
-      attach(s, c);
       occ_add(o, s, c);
       P = &o->occ[pos];
       N = &o->occ[neg];
@@ -998,7 +1136,8 @@ static void eliminate_variables(SatSolver *s) {
   }
   Occ o;
   o.lits = s->vars * 2u;
-  o.occ = calloc(o.lits, sizeof(U32Vec));
+  o.occ = sat_grow(NULL, o.lits * sizeof(U32Vec));
+  memset(o.occ, 0, o.lits * sizeof(U32Vec));
   o.budget = 4000000;
   for (size_t i = 0; i < s->clauses.count; i++) {
     if (clause_live(s, s->clauses.items[i])) {
@@ -1028,9 +1167,7 @@ static void eliminate_variables(SatSolver *s) {
     }
   }
   s->clauses.count = j;
-  if (s->arena_wasted * 2u > s->arena_size) {
-    garbage_collect(s);
-  }
+  garbage_collect(s);
 }
 
 static void extend_model(SatSolver *s) {
@@ -1047,7 +1184,7 @@ static void extend_model(SatSolver *s) {
   while (at < i) {
     if (nstarts == cap) {
       cap = cap ? cap * 2 : 64;
-      starts = realloc(starts, cap * sizeof(size_t));
+      starts = sat_grow(starts, cap * sizeof(size_t));
     }
     starts[nstarts++] = at;
     at += 2 + s->elim_stack.items[at + 1];
@@ -1076,11 +1213,23 @@ void sat_freeze(SatSolver *s, uint32_t var) {
 
 void sat_set_preprocess(SatSolver *s, int enabled) { s->preprocess = enabled; }
 
+void sat_set_propagation_limit(SatSolver *s, uint64_t limit) {
+  s->propagation_limit = limit;
+}
+
+int sat_propagation_limit_reached(const SatSolver *s) {
+  return s->propagations_spent;
+}
+
 int sat_solve(SatSolver *s, uint64_t conflict_limit) {
   if (s->unsat) {
     return SAT_RESULT_UNSAT;
   }
   uint64_t start_conflicts = s->stats.conflicts;
+  uint64_t start_propagations = s->stats.propagations;
+  if (!s->watched) {
+    attach_all(s);
+  }
   uint32_t first = propagate(s);
   if (first != CREF_NONE) {
     s->unsat = 1;
@@ -1118,7 +1267,6 @@ int sat_solve(SatSolver *s, uint64_t conflict_limit) {
       uint32_t id = proof_lemma(s, lits, n, s->hints.items,
                                 (uint32_t)s->hints.count);
       if (n == 1) {
-        s->unit_id[SAT_VAR(lits[0])] = id;
         enqueue(s, lits[0], CREF_NONE);
       } else {
         s->alloc_id = id;
@@ -1141,15 +1289,20 @@ int sat_solve(SatSolver *s, uint64_t conflict_limit) {
       }
       continue;
     }
-    if (conflict_limit &&
-        s->stats.conflicts - start_conflicts >= conflict_limit) {
+    int conflicts_spent =
+        conflict_limit && s->stats.conflicts - start_conflicts >= conflict_limit;
+    int propagations_spent =
+        s->propagation_limit &&
+        s->stats.propagations - start_propagations >= s->propagation_limit;
+    if (conflicts_spent || propagations_spent) {
+      s->propagations_spent = !conflicts_spent;
       backtrack(s, 0);
       return SAT_RESULT_UNKNOWN;
     }
     if (should_restart(s)) {
       s->conflicts_since_restart = 0;
       s->stats.restarts++;
-      backtrack(s, 0);
+      backtrack(s, restart_level(s));
       continue;
     }
     if (s->decision_level == 0) {
@@ -1177,10 +1330,13 @@ int sat_value(const SatSolver *s, uint32_t var) {
 
 void sat_get_stats(const SatSolver *s, SatStats *stats) { *stats = s->stats; }
 
-void sat_proof_view(const SatSolver *s, SatProofView *view) {
-  view->originals = s->originals.items;
-  view->original_words = s->originals.count;
-  view->proof = s->proof.items;
-  view->proof_words = s->proof.count;
-  view->vars = s->vars;
+int sat_refutation_checked(SatSolver *s, uint64_t *lemmas_checked) {
+  if (!s->proof_enabled) {
+    return 0;
+  }
+  proof_flush(s);
+  if (lemmas_checked) {
+    *lemmas_checked = sat_checker_lemmas(s->checker);
+  }
+  return sat_checker_refuted(s->checker);
 }
