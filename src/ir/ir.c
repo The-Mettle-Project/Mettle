@@ -3258,6 +3258,31 @@ static int ir_format_gpu_line(const IRInstruction *instruction,
   return written;
 }
 
+static long long ir_dot_i8_argument(const IRInstruction *instruction,
+                                    size_t index, long long fallback) {
+  return instruction->argument_count > index
+             ? instruction->arguments[index].int_value
+             : fallback;
+}
+
+static int ir_format_dot_i8_line(const IRInstruction *instruction,
+                                 const char *dest, const char *lhs,
+                                 const char *rhs, char *buffer,
+                                 size_t buffer_size) {
+  char len[128];
+  long long mode =
+      ir_dot_i8_argument(instruction, 1, instruction->is_unsigned ? 3 : 0);
+  ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
+                                                    : NULL,
+                    len, sizeof(len));
+  return snprintf(buffer, buffer_size,
+                  "%s = dot_i8(a=%s, b=%s, len=%s, %s * %s into %sint%lld)",
+                  dest, lhs, rhs, len, (mode & 1) ? "uint8" : "int8",
+                  (mode & 2) ? "uint8" : "int8",
+                  ir_dot_i8_argument(instruction, 3, 0) ? "u" : "",
+                  ir_dot_i8_argument(instruction, 2, 32));
+}
+
 static int ir_format_simd_int_line(const IRInstruction *instruction,
                              const char *dest, const char *lhs,
                              const char *rhs, char *buffer,
@@ -3330,15 +3355,10 @@ static int ir_format_simd_int_line(const IRInstruction *instruction,
                        dest, lhs, rhs, len);
     break;
   }
-  case IR_OP_SIMD_DOT_I8: {
-    char len[128];
-    ir_format_operand(instruction->argument_count > 0 ? &instruction->arguments[0]
-                                                      : NULL,
-                      len, sizeof(len));
-    written = snprintf(buffer, buffer_size, "%s = dot_i8(a=%s, b=%s, len=%s)",
-                       dest, lhs, rhs, len);
+  case IR_OP_SIMD_DOT_I8:
+    written = ir_format_dot_i8_line(instruction, dest, lhs, rhs, buffer,
+                                    buffer_size);
     break;
-  }
   case IR_OP_SIMD_SLP_MAC_I32:
     written = snprintf(buffer, buffer_size,
                        "slp_mac_i32(out=%s, a=%s, b=%s, K/n/aoff/boff/str/ooff)",

@@ -52,6 +52,10 @@ int wcs_avx_vpbroadcastd_ymm(BinaryCodeBuffer *b, int dst, int src_xmm);
 int wcs_avx_vpbroadcastd_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
 int wcs_avx_vbroadcastss_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
 int wcs_avx_vpmaddwd_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2);
+int wcs_avx_vpmaddubsw_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2);
+int wcs_avx_vpandn_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2);
+int wcs_avx_vpsrlw_ymm_imm(BinaryCodeBuffer *b, int dst, int src,
+                           unsigned char imm);
 int wcs_avx_vpmovsxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
 int wcs_avx_vpmovzxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);
 int wcs_avx_vpmovzxbd_xmm_mem(BinaryCodeBuffer *b, int dst, int base, int displacement);

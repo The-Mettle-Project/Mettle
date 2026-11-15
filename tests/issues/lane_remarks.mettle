@@ -16,7 +16,7 @@ fn last_positive(x: float32*, n: int64) -> float32 {
 
 fn wide_sum(k: int32*, n: int64) -> int64 {
   var s: int64 = 0;
-  for i: int64 in 0..n { s = s + (int64)k[i] * (int64)k[i]; }
+  for i: int64 in 0..n { s = s + (int64)k[i] * (int64)k[i] * (int64)k[i]; }
   return s;
 }
 

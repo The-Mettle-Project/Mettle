@@ -1302,7 +1302,9 @@ static int simd_dot_i32_prologue(CodeGenerator *generator,
          code_generator_binary_emit_operand_load(generator, context,
                                                  &instruction->arguments[0],
                                                  BINARY_GP_R8) &&
-         binary_emit_mov_reg_imm64(b, BINARY_GP_RAX, 0) &&
+         code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->dest,
+                                                 BINARY_GP_RAX) &&
          wcs_avx_vpxor_ymm(b, 2, 2, 2) && wcs_avx_vpxor_ymm(b, 5, 5, 5) &&
          binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_R8) &&
          binary_emit_shift_reg_imm8(b, 4, BINARY_GP_R11, 2) &&
@@ -1406,95 +1408,249 @@ int code_generator_binary_emit_simd_dot_i32(
                                                       BINARY_GP_RAX);
 }
 
-typedef int (*BinaryByteWiden)(BinaryCodeBuffer *, int, int, int);
-typedef int (*BinaryByteLoad)(BinaryCodeBuffer *, BinaryGpRegister,
-                              BinaryGpRegister, int);
+enum { DOT_I8_BLOCK_STEPS = 4096 };
 
-static int binary_emit_dot_i8_body(BinaryCodeBuffer *b, BinaryByteWiden widen) {
-  size_t loop_top = b->size;
-  size_t after_main = 0;
-  size_t j_back = 0;
-  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R11) ||
-      !binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R9, BINARY_GP_RCX) ||
-      !wcs_cmp_reg_imm32(b, BINARY_GP_R9, 32) ||
-      !wcs_jcc(b, 0x82 , &after_main) ||
-      !widen(b, 0, BINARY_GP_RCX, 0) || !widen(b, 1, BINARY_GP_RDX, 0) ||
-      !wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) || !wcs_avx_vpaddd_ymm(b, 2, 2, 0) ||
-      !widen(b, 0, BINARY_GP_RCX, 16) || !widen(b, 1, BINARY_GP_RDX, 16) ||
-      !wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) || !wcs_avx_vpaddd_ymm(b, 3, 3, 0) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32) ||
-      !wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, loop_top)) {
-    return 0;
-  }
-  return wcs_patch_here(b, after_main) && wcs_avx_vpaddd_ymm(b, 2, 2, 3) &&
-         wcs_avx_vextracti128(b, 3, 2, 1) && wcs_avx_vzeroupper(b) &&
-         wcs_paddd(b, 2, 3) && wcs_pshufd(b, 3, 2, 0xEE) &&
-         wcs_paddd(b, 2, 3) && wcs_pshufd(b, 3, 2, 0x55) &&
-         wcs_paddd(b, 2, 3) &&
-         binary_emit_movd_reg_xmm(b, BINARY_GP_RAX, BINARY_XMM2) &&
-         binary_emit_movsxd_rax_eax(b);
+typedef struct {
+  int a_unsigned;
+  int b_unsigned;
+  int acc_bits;
+  int acc_unsigned;
+} DotI8Shape;
+
+static int dot_i8_widen(BinaryCodeBuffer *b, int is_unsigned, int reg,
+                        BinaryGpRegister base, int disp) {
+  return is_unsigned ? wcs_avx_vpmovzxbw_ymm_mem(b, reg, base, disp)
+                     : wcs_avx_vpmovsxbw_ymm_mem(b, reg, base, disp);
 }
 
-static int binary_emit_dot_i8_tail(BinaryCodeBuffer *b,
-                                   BinaryByteLoad tail_load) {
-  size_t tail_top = b->size;
-  size_t j_done = 0;
-  size_t j_back = 0;
-  if (!binary_emit_cmp_reg_reg(b, BINARY_GP_RCX, BINARY_GP_R11) ||
-      !wcs_jcc(b, 0x83 , &j_done) ||
-      !tail_load(b, BINARY_GP_R10, BINARY_GP_RCX, 0) ||
-      !tail_load(b, BINARY_GP_R9, BINARY_GP_RDX, 0) ||
-      !binary_emit_imul_reg_reg(b, BINARY_GP_R10, BINARY_GP_R9) ||
-      !wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R10) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 1) ||
-      !wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 1) ||
-      !wcs_jcc(b, 0, &j_back) || !wcs_patch_to(b, j_back, tail_top)) {
+static int dot_i8_signed(const DotI8Shape *s) {
+  return !s->a_unsigned && !s->b_unsigned;
+}
+
+static int dot_i8_step16(BinaryCodeBuffer *b, const DotI8Shape *s, int disp,
+                         int acc) {
+  return dot_i8_widen(b, s->a_unsigned, 0, BINARY_GP_RCX, disp) &&
+         dot_i8_widen(b, s->b_unsigned, 1, BINARY_GP_RDX, disp) &&
+         wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) && wcs_avx_vpaddd_ymm(b, acc, acc, 0);
+}
+
+static int dot_i8_step32_unsigned(BinaryCodeBuffer *b) {
+  return wcs_avx_vmovdqu_ymm_mem(b, 0, BINARY_GP_RCX, 0) &&
+         wcs_avx_vmovdqu_ymm_mem(b, 1, BINARY_GP_RDX, 0) &&
+         wcs_avx_vpand_ymm(b, 2, 0, 5) && wcs_avx_vpand_ymm(b, 3, 1, 5) &&
+         wcs_avx_vpmaddwd_ymm(b, 2, 2, 3) && wcs_avx_vpaddd_ymm(b, 4, 4, 2) &&
+         wcs_avx_vpsrlw_ymm_imm(b, 0, 0, 8) &&
+         wcs_avx_vpsrlw_ymm_imm(b, 1, 1, 8) &&
+         wcs_avx_vpmaddwd_ymm(b, 0, 0, 1) && wcs_avx_vpaddd_ymm(b, 4, 4, 0);
+}
+
+static int dot_i8_step32_mixed(BinaryCodeBuffer *b, int u, int s) {
+  return wcs_avx_vmovdqu_ymm_mem(b, 0, BINARY_GP_RCX, 0) &&
+         wcs_avx_vmovdqu_ymm_mem(b, 1, BINARY_GP_RDX, 0) &&
+         wcs_avx_vpand_ymm(b, 2, u, 5) && wcs_avx_vpmaddubsw_ymm(b, 2, 2, s) &&
+         wcs_avx_vpmaddwd_ymm(b, 2, 2, 3) && wcs_avx_vpaddd_ymm(b, 4, 4, 2) &&
+         wcs_avx_vpandn_ymm(b, u, 5, u) && wcs_avx_vpmaddubsw_ymm(b, u, u, s) &&
+         wcs_avx_vpmaddwd_ymm(b, u, u, 3) && wcs_avx_vpaddd_ymm(b, 4, 4, u);
+}
+
+static int dot_i8_step32(BinaryCodeBuffer *b, const DotI8Shape *s) {
+  if (s->a_unsigned && s->b_unsigned) {
+    return dot_i8_step32_unsigned(b);
+  }
+  if (s->a_unsigned || s->b_unsigned) {
+    return dot_i8_step32_mixed(b, s->a_unsigned ? 0 : 1, s->a_unsigned ? 1 : 0);
+  }
+  return dot_i8_step16(b, s, 0, 4) && dot_i8_step16(b, s, 16, 5);
+}
+
+static int dot_i8_constants(BinaryCodeBuffer *b, const DotI8Shape *s) {
+  if (dot_i8_signed(s)) {
+    return 1;
+  }
+  if (!wcs_avx_vpcmpeqd_ymm(b, 5, 5, 5) || !wcs_avx_vpsrlw_ymm_imm(b, 5, 5, 8)) {
     return 0;
   }
-  return wcs_patch_here(b, j_done);
+  return (s->a_unsigned && s->b_unsigned) ||
+         (wcs_avx_vpcmpeqd_ymm(b, 3, 3, 3) &&
+          wcs_avx_vpsrlw_ymm_imm(b, 3, 3, 15));
+}
+
+static int dot_i8_join_lanes(BinaryCodeBuffer *b, const DotI8Shape *s) {
+  return !dot_i8_signed(s) ||
+         (wcs_avx_vpaddd_ymm(b, 4, 4, 5) && wcs_avx_vpxor_xmm(b, 5, 5, 5));
+}
+
+static int dot_i8_flush_wide(BinaryCodeBuffer *b, const DotI8Shape *s) {
+  return dot_i8_join_lanes(b, s) && wcs_avx_vextracti128(b, 1, 4, 1) &&
+         wcs_avx_vpmovsxdq_ymm_xmm(b, 0, 4) &&
+         wcs_avx_vpmovsxdq_ymm_xmm(b, 1, 1) && wcs_avx_vpaddq_ymm(b, 0, 0, 1) &&
+         wcs_avx_vextracti128(b, 1, 0, 1) && wcs_avx_vpaddq_xmm(b, 0, 0, 1) &&
+         wcs_avx_vpshufd_xmm(b, 1, 0, 0xEE) && wcs_avx_vpaddq_xmm(b, 0, 0, 1) &&
+         wcs_vex_movq_reg_xmm(b, BINARY_GP_R10, BINARY_XMM0) &&
+         wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R10) &&
+         wcs_avx_vpxor_xmm(b, 4, 4, 4);
+}
+
+static int dot_i8_flush_narrow(BinaryCodeBuffer *b, const DotI8Shape *s) {
+  return dot_i8_join_lanes(b, s) && wcs_avx_vextracti128(b, 1, 4, 1) &&
+         wcs_avx_vpaddd_xmm(b, 0, 4, 1) && wcs_avx_vpshufd_xmm(b, 1, 0, 0xEE) &&
+         wcs_avx_vpaddd_xmm(b, 0, 0, 1) && wcs_avx_vpshufd_xmm(b, 1, 0, 0x55) &&
+         wcs_avx_vpaddd_xmm(b, 0, 0, 1) &&
+         wcs_vex_movd_reg_xmm(b, BINARY_GP_R10, BINARY_XMM0) &&
+         wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R10);
+}
+
+static int dot_i8_head(BinaryCodeBuffer *b, const DotI8Shape *s) {
+  size_t j_skip = 0;
+  return wcs_avx_vpxor_xmm(b, 4, 4, 4) &&
+         (!dot_i8_signed(s) || wcs_avx_vpxor_xmm(b, 5, 5, 5)) &&
+         binary_emit_test_reg_imm32(b, BINARY_GP_R8, 16) &&
+         wcs_jcc(b, 0x84, &j_skip) && dot_i8_step16(b, s, 0, 4) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 16) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 16) &&
+         wcs_patch_here(b, j_skip);
+}
+
+static int dot_i8_vector_loop(BinaryFunctionContext *context,
+                              const DotI8Shape *s, BinaryGpRegister steps) {
+  BinaryCodeBuffer *b = &context->code;
+  size_t j_back = 0;
+  size_t top = 0;
+  context->wants_wide_loop_alignment = 1;
+  if (!binary_emit_align_code(b, BINARY_LOOP_ALIGN_BIG,
+                              BINARY_LOOP_ALIGN_BIG_MAX_PAD)) {
+    return 0;
+  }
+  top = b->size;
+  return dot_i8_step32(b, s) && wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 32) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 32) &&
+         wcs_addsub_reg_imm8(b, steps, 1, 1) && wcs_jcc(b, 0x85, &j_back) &&
+         wcs_patch_to(b, j_back, top);
+}
+
+static int dot_i8_wide_blocks(BinaryFunctionContext *context,
+                              const DotI8Shape *s, size_t j_flush) {
+  BinaryCodeBuffer *b = &context->code;
+  size_t j_block = 0;
+  size_t block_top = b->size;
+  return wcs_mov_reg_imm32(b, BINARY_GP_R11, DOT_I8_BLOCK_STEPS) &&
+         binary_emit_cmp_reg_reg(b, BINARY_GP_R9, BINARY_GP_R11) &&
+         binary_emit_cmovcc_reg_reg(b, 0x42, BINARY_GP_R11, BINARY_GP_R9) &&
+         binary_emit_alu_reg_reg(b, 0x29, BINARY_GP_R9, BINARY_GP_R11) &&
+         dot_i8_vector_loop(context, s, BINARY_GP_R11) &&
+         wcs_patch_here(b, j_flush) && dot_i8_flush_wide(b, s) &&
+         binary_emit_test_reg_reg(b, BINARY_GP_R9) &&
+         wcs_jcc(b, 0x85, &j_block) && wcs_patch_to(b, j_block, block_top);
+}
+
+static int dot_i8_blocks(BinaryFunctionContext *context, const DotI8Shape *s) {
+  BinaryCodeBuffer *b = &context->code;
+  size_t j_flush = 0;
+  if (!binary_emit_mov_reg_reg(b, BINARY_GP_R9, BINARY_GP_R8) ||
+      !binary_emit_shift_reg_imm8(b, 5, BINARY_GP_R9, 5) ||
+      !wcs_jcc(b, 0x84, &j_flush) || !dot_i8_constants(b, s)) {
+    return 0;
+  }
+  if (s->acc_bits >= 64) {
+    return dot_i8_wide_blocks(context, s, j_flush) && wcs_avx_vzeroupper(b);
+  }
+  return dot_i8_vector_loop(context, s, BINARY_GP_R9) &&
+         wcs_patch_here(b, j_flush) && dot_i8_flush_narrow(b, s) &&
+         wcs_avx_vzeroupper(b);
+}
+
+static int dot_i8_byte_load(BinaryCodeBuffer *b, int is_unsigned,
+                            BinaryGpRegister reg, BinaryGpRegister base) {
+  return is_unsigned ? binary_emit_movzx_reg_mem8(b, reg, base, 0)
+                     : binary_emit_movsx_reg_mem8(b, reg, base, 0);
+}
+
+static int dot_i8_tail(BinaryCodeBuffer *b, const DotI8Shape *s) {
+  size_t j_none = 0;
+  size_t j_back = 0;
+  size_t top = 0;
+  if (!binary_emit_and_reg_imm32(b, BINARY_GP_R8, 15) ||
+      !wcs_jcc(b, 0x84, &j_none)) {
+    return 0;
+  }
+  top = b->size;
+  return dot_i8_byte_load(b, s->a_unsigned, BINARY_GP_R10, BINARY_GP_RCX) &&
+         dot_i8_byte_load(b, s->b_unsigned, BINARY_GP_R11, BINARY_GP_RDX) &&
+         binary_emit_imul_reg_reg(b, BINARY_GP_R10, BINARY_GP_R11) &&
+         wcs_add_reg_reg64(b, BINARY_GP_RAX, BINARY_GP_R10) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_RCX, 0, 1) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_RDX, 0, 1) &&
+         wcs_addsub_reg_imm8(b, BINARY_GP_R8, 1, 1) &&
+         wcs_jcc(b, 0x85, &j_back) && wcs_patch_to(b, j_back, top) &&
+         wcs_patch_here(b, j_none);
+}
+
+static int dot_i8_wrap_total(BinaryCodeBuffer *b, const DotI8Shape *s) {
+  if (s->acc_bits >= 64) {
+    return 1;
+  }
+  return s->acc_unsigned
+             ? wcs_mov_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_RAX)
+             : binary_emit_movsxd_reg_reg32(b, BINARY_GP_RAX, BINARY_GP_RAX);
+}
+
+static int dot_i8_shape(const IRInstruction *instruction, DotI8Shape *s) {
+  const IROperand *args = instruction ? instruction->arguments : NULL;
+  if (!args || instruction->argument_count != 4 ||
+      args[1].kind != IR_OPERAND_INT || args[2].kind != IR_OPERAND_INT ||
+      args[3].kind != IR_OPERAND_INT ||
+      (args[2].int_value != 32 && args[2].int_value != 64)) {
+    return 0;
+  }
+  s->a_unsigned = (args[1].int_value & 1) != 0;
+  s->b_unsigned = (args[1].int_value & 2) != 0;
+  s->acc_bits = (int)args[2].int_value;
+  s->acc_unsigned = args[3].int_value != 0;
+  return 1;
+}
+
+static int dot_i8_operands(CodeGenerator *generator,
+                           BinaryFunctionContext *context,
+                           const IRInstruction *instruction) {
+  return code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->lhs,
+                                                 BINARY_GP_RCX) &&
+         code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->rhs,
+                                                 BINARY_GP_RDX) &&
+         code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->arguments[0],
+                                                 BINARY_GP_R8) &&
+         code_generator_binary_emit_operand_load(generator, context,
+                                                 &instruction->dest,
+                                                 BINARY_GP_RAX);
 }
 
 int code_generator_binary_emit_simd_dot_i8(CodeGenerator *generator,
                                            BinaryFunctionContext *context,
                                            const IRInstruction *instruction) {
   BinaryCodeBuffer *b = NULL;
-  BinaryByteWiden widen = NULL;
-  BinaryByteLoad tail_load = NULL;
+  DotI8Shape shape;
+  size_t j_empty = 0;
+  size_t j_short = 0;
 
-  if (!generator || !context || !instruction ||
-      instruction->argument_count != 1 || !instruction->arguments) {
+  if (!generator || !context || !dot_i8_shape(instruction, &shape)) {
     code_generator_set_error(generator, "Malformed simd_dot_i8");
     return 0;
   }
-  widen = instruction->is_unsigned ? wcs_avx_vpmovzxbw_ymm_mem
-                                   : wcs_avx_vpmovsxbw_ymm_mem;
-  tail_load = instruction->is_unsigned ? binary_emit_movzx_reg_mem8
-                                       : binary_emit_movsx_reg_mem8;
   b = &context->code;
-
-  if (!code_generator_binary_emit_operand_load(generator, context,
-                                               &instruction->lhs,
-                                               BINARY_GP_RCX) ||
-      !code_generator_binary_emit_operand_load(generator, context,
-                                               &instruction->rhs,
-                                               BINARY_GP_RDX) ||
-      !code_generator_binary_emit_operand_load(generator, context,
-                                               &instruction->arguments[0],
-                                               BINARY_GP_R8) ||
-      !wcs_avx_vpxor_ymm(b, 2, 2, 2) || !wcs_avx_vpxor_ymm(b, 3, 3, 3) ||
-      !binary_emit_mov_reg_reg(b, BINARY_GP_R11, BINARY_GP_RCX) ||
-      !wcs_add_reg_reg64(b, BINARY_GP_R11, BINARY_GP_R8)) {
+  if (!dot_i8_operands(generator, context, instruction) ||
+      !binary_emit_test_reg_reg(b, BINARY_GP_R8) ||
+      !wcs_jcc(b, 0x8E, &j_empty) || !wcs_cmp_reg_imm8(b, BINARY_GP_R8, 16) ||
+      !wcs_jcc(b, 0x82, &j_short) || !dot_i8_head(b, &shape) ||
+      !dot_i8_blocks(context, &shape) || !wcs_patch_here(b, j_short) ||
+      !dot_i8_tail(b, &shape) || !dot_i8_wrap_total(b, &shape) ||
+      !code_generator_binary_emit_destination_store(generator, context,
+                                                    &instruction->dest,
+                                                    BINARY_GP_RAX)) {
     return 0;
   }
-
-  if (!binary_emit_dot_i8_body(b, widen) ||
-      !binary_emit_dot_i8_tail(b, tail_load)) {
-    return 0;
-  }
-  return code_generator_binary_emit_destination_store(generator, context,
-                                                      &instruction->dest,
-                                                      BINARY_GP_RAX);
+  return wcs_patch_here(b, j_empty);
 }
 
 int code_generator_binary_emit_vzeroupper(BinaryCodeBuffer *b) {

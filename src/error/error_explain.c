@@ -1198,6 +1198,32 @@ static const DecisionDoc DECISIONS[] = {
      "\n"
      "Fix: declare the accumulator int64. The elements stay int32; only the\n"
      "running total widens.\n"},
+    {"byte-dot-shape", DECISION_VECTOR_REFUSAL,
+     "8-bit multiply and accumulate the byte dot kernel does not take",
+     "A loop that adds `a[i] * b[i]` over int8 or uint8 arrays becomes the\n"
+     "byte dot kernel: 32 pairs a step, any mix of signed and unsigned\n"
+     "elements, an exact 64-bit sum wrapped to an int32, uint32, int64 or\n"
+     "uint64 total. The compiler runs the loop body on all 65536 pairs of\n"
+     "bytes and takes the loop only when every iteration adds exactly the\n"
+     "product of the two elements. The remark prints one pair where it does\n"
+     "not, with the amount the loop adds and the product.\n"
+     "\n"
+     "Three things draw this remark. The multiply wraps: `a[i] * b[i]` on\n"
+     "int8 elements is an int8 product, and `(int16)a[i] * (int16)b[i]` on\n"
+     "uint8 elements passes 32767. The term carries a scale or an offset,\n"
+     "such as `a[i] * b[i] * 2`. Or the total is a float or narrower than 32\n"
+     "bits.\n"
+     "\n"
+     "Example:\n"
+     "    var total: int32 = 0;\n"
+     "    for i in 0..n {\n"
+     "        total = total + (int32)a[i] * (int32)b[i];\n"
+     "    }\n"
+     "\n"
+     "Fix: widen each element before the multiply and keep the total in an\n"
+     "integer of 32 or 64 bits. Apply a scale or an offset to the total after\n"
+     "the loop. For a float result, sum in int64 and convert once: the\n"
+     "product of two bytes is an exact integer.\n"},
     {"inlined-param-local", DECISION_VECTOR_REFUSAL,
      "An inlined parameter copy survived in the body",
      "The inliner left a `__inl_*` temporary inside the loop, and the\n"

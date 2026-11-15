@@ -12965,6 +12965,8 @@ catch {
 # the predicated-count advice asked for a spelling the reader had already used.
 $fixAdvicePairs = @(
   @{ Name = "bytesum";   Id = "byte-sum-narrow-acc" },
+  @{ Name = "bytedot";   Id = "byte-dot-shape" },
+  @{ Name = "bytefloat"; Id = "byte-dot-shape" },
   @{ Name = "i16";       Id = "int16-elements" },
   @{ Name = "i64";       Id = "int64-elements" },
   @{ Name = "dot";       Id = "dot-shape-address" },
@@ -20933,6 +20935,30 @@ $runFixtures = @(
      What = "the eight-step popcount fold fired on a value wider than a byte" },
   @{ Name = "dot_i8_signs"; Path = "tests/codegen/dot_i8_signs.mettle"
      What = "a byte dot product widened its elements the wrong way, or the int32 dot claimed a byte loop" },
+  @{ Name = "dot_i8_shapes"; Path = "tests/codegen/dot_i8_shapes.mettle"
+     What = "a byte dot product over some sign mix, total width, length or starting total gave a sum other than the one computed outside the compiler, or a loop that only resembles a dot product was fused"
+     AsmMustMatch = @(
+       @{ Fn = "ss_i32"; Pattern = "32-wide int8 dot product" },
+       @{ Fn = "ss_i64"; Pattern = "32-wide int8 dot product" },
+       @{ Fn = "uu_u32"; Pattern = "32-wide uint8 dot product" },
+       @{ Fn = "uu_u64"; Pattern = "32-wide uint8 dot product" },
+       @{ Fn = "us_i64"; Pattern = "uint8 by int8 dot product" },
+       @{ Fn = "su_i32"; Pattern = "uint8 by int8 dot product" },
+       @{ Fn = "square_u8"; Pattern = "32-wide uint8 dot product" },
+       @{ Fn = "square_s8"; Pattern = "32-wide int8 dot product" },
+       @{ Fn = "seeded"; Pattern = "32-wide int8 dot product" },
+       @{ Fn = "resign"; Pattern = "32-wide int8 dot product" },
+       @{ Fn = "narrow_product"; Pattern = "32-wide int8 dot product" },
+       @{ Fn = "const64"; Pattern = "32-wide int8 dot product" },
+       @{ Fn = "offset_bases"; Pattern = "32-wide int8 dot product" }
+     ) },
+  @{ Name = "dot_i32_shapes"; Path = "tests/codegen/dot_i32_shapes.mettle"
+     What = "an int32 dot product dropped its starting total, or a loop that only resembles a dot product was fused"
+     AsmMustMatch = @(
+       @{ Fn = "dot"; Pattern = "8-wide int32 dot product" },
+       @{ Fn = "seeded"; Pattern = "8-wide int32 dot product" },
+       @{ Fn = "square"; Pattern = "8-wide int32 dot product" }
+     ) },
   @{ Name = "induction_value_shift"; Path = "tests/codegen/induction_value_shift.mettle"
      What = "pointer induction deleted an iv-fed shift that the stored value still read" },
   @{ Name = "unsigned_fused_load"; Path = "tests/codegen/unsigned_fused_load.mettle"

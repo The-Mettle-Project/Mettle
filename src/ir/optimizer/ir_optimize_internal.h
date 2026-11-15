@@ -762,7 +762,8 @@ typedef enum {
   IR_SIMD_BAIL_LANE_OPERATION,
   IR_SIMD_BAIL_CARRIED_VALUE,
   IR_SIMD_BAIL_LANE_BUDGET,
-  IR_SIMD_BAIL_UNRECOGNIZED_SHAPE
+  IR_SIMD_BAIL_UNRECOGNIZED_SHAPE,
+  IR_SIMD_BAIL_BYTE_DOT_SHAPE
 } IRSimdBailId;
 const char *ir_simd_bail_id_name(int id);
 void ir_explain_flush(void);
@@ -842,6 +843,9 @@ int ir_outer_vectorize_pass(IRFunction *function, int *changed);
 int ir_simd_dot_float_pass(IRFunction *function, int *changed);
 int ir_simd_dot_i32_pass(IRFunction *function, int *changed);
 int ir_simd_dot_i8_pass(IRFunction *function, int *changed);
+int ir_dot_int_refusal(const IRFunction *function, size_t begin, size_t end,
+                       char *reason, size_t reason_cap, char *fix,
+                       size_t fix_cap);
 int ir_simd_slp_mac_i32_pass(IRFunction *function, int *changed);
 int ir_simd_slp_mac_i8_pass(IRFunction *function, int *changed);
 int ir_instruction_is_hoisted_null_check(const IRInstruction *insn);

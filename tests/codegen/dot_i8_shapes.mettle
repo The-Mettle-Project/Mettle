@@ -1,0 +1,301 @@
+import "std/mem";
+
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+@noinline fn ss_i32(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + (int32)a[i] * (int32)b[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn uu_i32(a: uint8*, b: uint8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) {
+    t = t + (int32)a[i] * (int32)b[i];
+    i = i + 1;
+  }
+  return (int64)t;
+}
+
+@noinline fn us_i32(a: uint8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t += (int32)a[i] * (int32)b[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn su_i32(a: int8*, b: uint8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = (int32)a[i] * (int32)b[i] + t;
+  }
+  return (int64)t;
+}
+
+@noinline fn ss_i64(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int64 = 0;
+  for i in 0..n {
+    t = t + (int64)a[i] * (int64)b[i];
+  }
+  return t;
+}
+
+@noinline fn us_i64(a: uint8*, b: int8*, n: int64) -> int64 {
+  var t: int64 = 0;
+  for i in 0..n {
+    t = t + (int64)((int32)a[i] * (int32)b[i]);
+  }
+  return t;
+}
+
+@noinline fn uu_u32(a: uint8*, b: uint8*, n: int64) -> int64 {
+  var t: uint32 = 0;
+  for i in 0..n {
+    t = t + (uint32)a[i] * (uint32)b[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn uu_u64(a: uint8*, b: uint8*, n: uint64) -> int64 {
+  var t: uint64 = 0;
+  var i: uint64 = 0;
+  while (i < n) {
+    t = t + (uint64)a[i] * (uint64)b[i];
+    i = i + 1;
+  }
+  return (int64)t;
+}
+
+@noinline fn square_u8(a: uint8*, n: int64) -> int64 {
+  var t: uint64 = 0;
+  for i in 0..n {
+    t = t + (uint64)a[i] * (uint64)a[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn square_s8(a: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    var x: int32 = (int32)a[i];
+    t = t + x * x;
+  }
+  return (int64)t;
+}
+
+@noinline fn seeded(a: int8*, b: int8*, n: int64, seed: int32) -> int64 {
+  var t: int32 = seed;
+  for i in 0..n {
+    t = t + (int32)a[i] * (int32)b[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn twice(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + (int32)a[i] * (int32)b[i];
+  }
+  for j in 0..n {
+    t = t + (int32)a[j] * (int32)b[j];
+  }
+  return (int64)t;
+}
+
+@noinline fn resign(a: uint8*, b: uint8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + (int32)(int8)a[i] * (int32)(int8)b[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn narrow_product(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + (int32)((int16)a[i] * (int16)b[i]);
+  }
+  return (int64)t;
+}
+
+@noinline fn const64(a: int8*, b: int8*) -> int64 {
+  var t: int32 = 0;
+  for i in 0..64 {
+    t = t + (int32)a[i] * (int32)b[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn offset_bases(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  var p: int8* = a + 3;
+  var q: int8* = b + 5;
+  for i in 0..n {
+    t = t + (int32)p[i] * (int32)q[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn wrap16(a: uint8*, b: uint8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + (int32)((int16)a[i] * (int16)b[i]);
+  }
+  return (int64)t;
+}
+
+@noinline fn plus1(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + ((int32)a[i] + 1) * (int32)b[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn times2(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + (int32)a[i] * (int32)b[i] * 2;
+  }
+  return (int64)t;
+}
+
+@noinline fn nocast(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  for i in 0..n {
+    t = t + a[i] * b[i];
+  }
+  return (int64)t;
+}
+
+@noinline fn carried(a: int8*, b: int8*, n: int64) -> int64 {
+  var t: int32 = 0;
+  var prev: int32 = 0;
+  for i in 0..n {
+    t = t + prev * (int32)b[i];
+    prev = (int32)a[i];
+  }
+  return (int64)t;
+}
+
+fn main() -> int32 {
+  var sa: int8[320];
+  var sb: int8[320];
+  var ua: uint8[320];
+  var ub: uint8[320];
+  for i in 0..320 {
+    sa[i] = (int8)(((i * 37 + 11) % 256) - 128);
+    sb[i] = (int8)(127 - ((i * 91 + 5) % 256));
+    ua[i] = (uint8)((i * 53 + 200) % 256);
+    ub[i] = (uint8)(255 - ((i * 17 + 3) % 256));
+  }
+  var pa: int8* = &sa[0];
+  var pb: int8* = &sb[0];
+  var qa: uint8* = &ua[0];
+  var qb: uint8* = &ub[0];
+
+  var h: int64 = 0;
+  for n in 0..321 { h = h * 1000003 + ss_i32(pa, pb, opaque((int64)n)); }
+  if (h != 9003346496093935584) { return 1; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + uu_i32(qa, qb, opaque((int64)n)); }
+  if (h != 4987164421159258912) { return 2; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + us_i32(qa, pb, opaque((int64)n)); }
+  if (h != 4257547009004430048) { return 3; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + su_i32(pa, qb, opaque((int64)n)); }
+  if (h != 0 - 7560165275997850272) { return 4; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + ss_i64(pa, pb, opaque((int64)n)); }
+  if (h != 9003346496093935584) { return 5; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + us_i64(qa, pb, opaque((int64)n)); }
+  if (h != 4257547009004430048) { return 6; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + uu_u32(qa, qb, opaque((int64)n)); }
+  if (h != 4987164421159258912) { return 7; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + uu_u64(qa, qb, (uint64)opaque((int64)n)); }
+  if (h != 4987164421159258912) { return 8; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + square_u8(qa, opaque((int64)n)); }
+  if (h != 0 - 4382056186869465248) { return 9; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + square_s8(pa, opaque((int64)n)); }
+  if (h != 0 - 7284538233765047552) { return 10; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + seeded(pa, pb, opaque((int64)n), 0 - 1234567); }
+  if (h != 0 - 3798194066732116263) { return 11; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + twice(pa, pb, opaque((int64)n)); }
+  if (h != 0 - 440051081521680448) { return 12; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + resign((uint8*)pa, (uint8*)pb, opaque((int64)n)); }
+  if (h != 9003346496093935584) { return 13; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + narrow_product(pa, pb, opaque((int64)n)); }
+  if (h != 9003346496093935584) { return 14; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + wrap16(qa, qb, opaque((int64)n)); }
+  if (h != 0 - 6925016749014512864) { return 15; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + plus1(pa, pb, opaque((int64)n)); }
+  if (h != 8874997771387184096) { return 16; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + times2(pa, pb, opaque((int64)n)); }
+  if (h != 0 - 440051081521680448) { return 17; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + nocast(pa, pb, opaque((int64)n)); }
+  if (h != 6563989954467709920) { return 18; }
+
+  h = 0;
+  for n in 0..321 { h = h * 1000003 + carried(pa, pb, opaque((int64)n)); }
+  if (h != 3204790840481769696) { return 19; }
+
+  if (const64(pa, pb) != 37056) { return 20; }
+  if (offset_bases(pa, pb, opaque(200)) != 0 - 150664) { return 21; }
+  if (seeded(pa, pb, opaque(0 - 5), 0 - 1234567) != 0 - 1234567) { return 22; }
+  if (ss_i64(pa, pb, opaque(0 - 1)) != 0) { return 23; }
+
+  var count: int64 = opaque(400053);
+  var high: uint8* = malloc(count);
+  var low: uint8* = malloc(count);
+  if (high == 0 || low == 0) { return 24; }
+  for i in 0..count {
+    high[i] = (uint8)255;
+    low[i] = (uint8)128;
+  }
+  if (uu_u64(high, high, (uint64)count) != 26013446325) { return 25; }
+  if (uu_u32(high, high, count) != 243642549) { return 26; }
+  if (uu_i32(high, high, count) != 243642549) { return 27; }
+  if (ss_i64((int8*)low, (int8*)low, count) != 6554468352) { return 28; }
+  if (ss_i32((int8*)low, (int8*)low, count) != 0 - 2035466240) { return 29; }
+  if (us_i64(high, (int8*)low, count) != 0 - 13057729920) { return 30; }
+  if (us_i32(high, (int8*)low, count) != 0 - 172828032) { return 31; }
+  if (su_i32((int8*)low, high, count) != 0 - 172828032) { return 32; }
+  free(high);
+  free(low);
+  return 0;
+}

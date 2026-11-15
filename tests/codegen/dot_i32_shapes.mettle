@@ -1,0 +1,92 @@
+@noinline fn opaque(v: int64) -> int64 { return v; }
+
+@noinline fn dot(a: int32*, b: int32*, n: int64) -> int64 {
+  var t: int64 = 0;
+  for i in 0..n {
+    t = t + (int64)a[i] * (int64)b[i];
+  }
+  return t;
+}
+
+@noinline fn seeded(a: int32*, b: int32*, n: int64, seed: int64) -> int64 {
+  var t: int64 = seed;
+  var i: int64 = 0;
+  while (i < n) {
+    t = t + (int64)a[i] * (int64)b[i];
+    i = i + 1;
+  }
+  return t;
+}
+
+@noinline fn square(a: int32*, n: int64) -> int64 {
+  var t: int64 = 0;
+  for i in 0..n {
+    t = t + (int64)a[i] * (int64)a[i];
+  }
+  return t;
+}
+
+@noinline fn twice(a: int32*, b: int32*, n: int64) -> int64 {
+  var t: int64 = 0;
+  for i in 0..n {
+    t = t + (int64)a[i] * (int64)b[i];
+  }
+  for j in 0..n {
+    t = t + (int64)a[j] * (int64)b[j];
+  }
+  return t;
+}
+
+@noinline fn plus1(a: int32*, b: int32*, n: int64) -> int64 {
+  var t: int64 = 0;
+  for i in 0..n {
+    t = t + ((int64)a[i] + 1) * (int64)b[i];
+  }
+  return t;
+}
+
+@noinline fn wrap32(a: int32*, b: int32*, n: int64) -> int64 {
+  var t: int64 = 0;
+  for i in 0..n {
+    t = t + (int64)(a[i] * b[i]);
+  }
+  return t;
+}
+
+fn main() -> int32 {
+  var x: int32[200];
+  var y: int32[200];
+  for i in 0..200 {
+    x[i] = 100000 + i * 977;
+    y[i] = 0 - 90000 + i * 1201;
+  }
+  var px: int32* = &x[0];
+  var py: int32* = &y[0];
+
+  var h: int64 = 0;
+  for n in 0..201 { h = h * 1000003 + dot(px, py, opaque((int64)n)); }
+  if (h != 0 - 7257664819866402724) { return 1; }
+
+  h = 0;
+  for n in 0..201 { h = h * 1000003 + seeded(px, py, opaque((int64)n), 987654321012); }
+  if (h != 0 - 4032704750889665392) { return 2; }
+
+  h = 0;
+  for n in 0..201 { h = h * 1000003 + square(px, opaque((int64)n)); }
+  if (h != 0 - 618329192653642404) { return 3; }
+
+  h = 0;
+  for n in 0..201 { h = h * 1000003 + twice(px, py, opaque((int64)n)); }
+  if (h != 3931414433976746168) { return 4; }
+
+  h = 0;
+  for n in 0..201 { h = h * 1000003 + plus1(px, py, opaque((int64)n)); }
+  if (h != 8845241724247958244) { return 5; }
+
+  h = 0;
+  for n in 0..201 { h = h * 1000003 + wrap32(px, py, opaque((int64)n)); }
+  if (h != 6510444152789106780) { return 6; }
+
+  if (seeded(px, py, opaque(0 - 3), 987654321012) != 987654321012) { return 7; }
+  return 0;
+}

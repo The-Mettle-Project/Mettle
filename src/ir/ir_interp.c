@@ -4267,24 +4267,27 @@ static int ii_exec_int_dot(IRInterpMachine *machine, IIFrame *frame,
         !ii_fetch(machine, frame, &insn->dest, &acc)) {
       return 0;
     }
-    unsigned int sum = 0;
+    long long mode = insn->argument_count > 1 ? insn->arguments[1].int_value
+                                              : (insn->is_unsigned ? 3 : 0);
+    int acc_size = insn->argument_count > 2
+                       ? (int)(insn->arguments[2].int_value / 8)
+                       : 4;
+    int acc_unsigned =
+        insn->argument_count > 3 && insn->arguments[3].int_value != 0;
+    unsigned long long sum = 0;
     for (long long i = 0; i < n; i++) {
       unsigned long long x, y;
       if (!ii_mem_read(machine, a + (unsigned long long)i, 1, &x) ||
           !ii_mem_read(machine, b + (unsigned long long)i, 1, &y)) {
         return 0;
       }
-      {
-        int xw = insn->is_unsigned ? (int)(unsigned char)x
-                                   : (int)(signed char)(unsigned char)x;
-        int yw = insn->is_unsigned ? (int)(unsigned char)y
-                                   : (int)(signed char)(unsigned char)y;
-        sum += (unsigned int)(xw * yw);
-      }
+      sum += (unsigned long long)(ii_narrow_int((long long)x, 1, mode & 1) *
+                                  ii_narrow_int((long long)y, 1, mode & 2));
     }
-    machine->fuel -= n;
-    IRInterpValue out =
-        ii_int_value((long long)(int)((unsigned int)ii_as_int(&acc) + sum));
+    machine->fuel -= n > 0 ? n : 0;
+    IRInterpValue out = ii_int_value(ii_narrow_int(
+        (long long)((unsigned long long)ii_as_int(&acc) + sum), acc_size,
+        acc_unsigned));
     return ii_store_dest(machine, frame, &insn->dest, &out);
   }
 

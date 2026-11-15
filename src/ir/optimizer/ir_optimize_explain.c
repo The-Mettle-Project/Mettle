@@ -5295,7 +5295,7 @@ static const char *const IR_KERNEL_DESC[IR_OP_KIND_COUNT] = {
     [IR_OP_SIMD_BYTE_MAP] = "32-wide byte map (AVX2)",
     [IR_OP_SIMD_FILL] = "16-byte splat stores (vectorized fill)",
     [IR_OP_SIMD_DOT_I32] = "vpmuldq + vpaddq, 8-wide int32 dot product into int64 (AVX2)",
-    [IR_OP_SIMD_DOT_I8] = "vpmaddwd, 16-wide int8 dot product (AVX2)",
+    [IR_OP_SIMD_DOT_I8] = "vpmaddwd, 32-wide int8 dot product, exact sum (AVX2)",
     [IR_OP_SIMD_SLP_MAC_I8] = "SLP int8 multiply-accumulate tile (AVX2)",
     [IR_OP_SIMD_SCALE_I32] = "8-wide int32 scale map (AVX2)",
     [IR_OP_SIMD_CLAMP_I32] = "vpminsd + vpmaxsd, 8-wide int32 clamp (AVX2)",
@@ -5358,12 +5358,29 @@ static int ir_explain_widened_dot_desc(const IRInstruction *ins, char *buf,
   return 1;
 }
 
+static int ir_explain_byte_dot_desc(const IRInstruction *ins, char *buf,
+                                    size_t cap) {
+  long long mode = 0;
+  if (ins->op != IR_OP_SIMD_DOT_I8 || ins->argument_count < 2) {
+    return 0;
+  }
+  mode = ins->arguments[1].int_value & 3;
+  snprintf(buf, cap, "%s, exact sum (AVX2)",
+           mode == 0   ? "vpmaddwd, 32-wide int8 dot product"
+           : mode == 3 ? "vpmaddwd on the even and the odd bytes, 32-wide "
+                         "uint8 dot product"
+                       : "vpmaddubsw + vpmaddwd, 32-wide uint8 by int8 dot "
+                         "product");
+  return 1;
+}
+
 void ir_explain_kernel_desc(const IRInstruction *ins, char *buf, size_t cap) {
   if (!ins) {
     snprintf(buf, cap, "a SIMD kernel");
     return;
   }
-  if (ir_explain_widened_dot_desc(ins, buf, cap)) {
+  if (ir_explain_widened_dot_desc(ins, buf, cap) ||
+      ir_explain_byte_dot_desc(ins, buf, cap)) {
     return;
   }
   switch (ins->op) {

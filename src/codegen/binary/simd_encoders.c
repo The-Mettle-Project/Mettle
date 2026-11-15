@@ -1061,6 +1061,23 @@ int wcs_avx_vpmaddwd_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2) {
              b, (unsigned char)(0xC0 | ((dst & 7) << 3) | (src2 & 7)));
 }
 
+int wcs_avx_vpmaddubsw_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2) {
+  return wcs_avx_0f38_ymm(b, 0x04, dst, src1, src2);
+}
+
+int wcs_avx_vpandn_ymm(BinaryCodeBuffer *b, int dst, int src1, int src2) {
+  return wcs_avx_vpd_ymm(b, 0xDF, dst, src1, src2);
+}
+
+int wcs_avx_vpsrlw_ymm_imm(BinaryCodeBuffer *b, int dst, int src,
+                           unsigned char imm) {
+  return wcs_vex3(b, 1, 1, 1, 0, 2, src, dst) &&
+         binary_code_buffer_append_u8(b, 0x71) &&
+         binary_code_buffer_append_u8(
+             b, (unsigned char)(0xC0 | (2 << 3) | (src & 7))) &&
+         binary_code_buffer_append_u8(b, imm);
+}
+
 int wcs_avx_vpmovsxbw_ymm_mem(BinaryCodeBuffer *b, int dst, int base,
                               int displacement) {
   return wcs_vex3(b, 2, 1, 1, 0, dst, base, 0) &&

@@ -25,6 +25,32 @@ fn bytesum_after(a: uint8*, n: int64) -> int64 {
   return s;
 }
 
+fn bytedot_before(a: uint8*, b: uint8*, n: int64) -> int32 {
+  var s: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) { s = s + (int32)((int16)a[i] * (int16)b[i]); i = i + 1; }
+  return s;
+}
+fn bytedot_after(a: uint8*, b: uint8*, n: int64) -> int32 {
+  var s: int32 = 0;
+  var i: int64 = 0;
+  while (i < n) { s = s + (int32)a[i] * (int32)b[i]; i = i + 1; }
+  return s;
+}
+
+fn bytefloat_before(a: int8*, b: int8*, n: int64) -> float32 {
+  var s: float32 = 0.0;
+  var i: int64 = 0;
+  while (i < n) { s = s + (float32)a[i] * (float32)b[i]; i = i + 1; }
+  return s;
+}
+fn bytefloat_after(a: int8*, b: int8*, n: int64) -> float32 {
+  var total: int64 = 0;
+  var i: int64 = 0;
+  while (i < n) { total = total + (int64)a[i] * (int64)b[i]; i = i + 1; }
+  return (float32)total;
+}
+
 // ---- int16-elements: use int32 elements and an int64 accumulator ----------
 fn i16_before(a: int16*, n: int64) -> int32 {
   var s: int32 = 0;

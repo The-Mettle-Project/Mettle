@@ -690,6 +690,7 @@ const char *ir_simd_bail_id_name(int id) {
   case IR_SIMD_BAIL_CARRIED_VALUE:       return "carried-value";
   case IR_SIMD_BAIL_LANE_BUDGET:         return "lane-budget";
   case IR_SIMD_BAIL_UNRECOGNIZED_SHAPE:  return "unrecognized-shape";
+  case IR_SIMD_BAIL_BYTE_DOT_SHAPE:      return "byte-dot-shape";
   }
   return "unknown";
 }
@@ -905,6 +906,7 @@ typedef struct {
   const char *int_accum_sym;
   int has_float_accum;
   int has_float_mul;
+  int has_int_product;
   int load_count;
   int store_count;
   int byte_store_count;
@@ -1008,6 +1010,10 @@ static void ir_simd_scan_binary(IrSimdBail *d, const IRInstruction *ins) {
   }
   if (ins->is_float && ins->text && ins->text[0] == '*' && !ins->text[1]) {
     d->has_float_mul = 1;
+  }
+  if (!ins->is_float && ins->text && ins->text[0] == '*' && !ins->text[1] &&
+      ins->lhs.kind == IR_OPERAND_TEMP && ins->rhs.kind == IR_OPERAND_TEMP) {
+    d->has_int_product = 1;
   }
   if (ins->is_float && ins->text && ins->text[0] == '+' &&
       !ins->text[1] &&
@@ -1535,8 +1541,34 @@ static int ir_simd_bail_mixed_float_widths(IrSimdBail *d) {
   return 0;
 }
 
+static int ir_simd_bail_byte_dot_shape(IrSimdBail *d) {
+  if (!d->has_byte_load) {
+    return 0;
+  }
+  if (d->has_float_mul && d->has_float_accum && d->load_count >= 2 &&
+      !d->has_f32 && !d->has_f64) {
+    snprintf(d->reason, d->reason_cap,
+             "this multiplies 8-bit elements as floats and adds each product "
+             "to a float total, and the float dot kernels read float32 or "
+             "float64 elements");
+    snprintf(d->fix, d->fix_cap,
+             "add the products to an int64 total and convert it after the "
+             "loop: `total = total + (int64)a[i] * (int64)b[i]`. The product "
+             "of two 8-bit values is an exact integer, and the byte dot "
+             "kernel adds 32 pairs a step");
+    ir_simd_diag(d, IR_SIMD_BAIL_BYTE_DOT_SHAPE);
+    return 1;
+  }
+  if (ir_dot_int_refusal(d->function, d->begin, d->end, d->reason,
+                         d->reason_cap, d->fix, d->fix_cap)) {
+    ir_simd_diag(d, IR_SIMD_BAIL_BYTE_DOT_SHAPE);
+    return 1;
+  }
+  return 0;
+}
+
 static int ir_simd_bail_byte_sum_accumulator(IrSimdBail *d) {
-  if (d->has_byte_load && d->has_int_accum) {
+  if (d->has_byte_load && d->has_int_accum && !d->has_int_product) {
     snprintf(d->reason, d->reason_cap,
              "this is a byte-sum loop, but the vpsadbw kernel accumulates "
              "into int64 and this loop's accumulator is narrower");
@@ -1624,6 +1656,9 @@ static int ir_simd_address_is_plain(const IrSimdBail *d, size_t at,
   }
   const IROperand *index =
       add->lhs.kind == IR_OPERAND_SYMBOL ? &add->rhs : &add->lhs;
+  if (ir_operand_is_symbol_named(index, iv)) {
+    return 1;
+  }
   const IRInstruction *scale =
       index->kind == IR_OPERAND_TEMP && index->name
           ? ir_find_temp_producer_before(d->function, at, index->name)
@@ -2339,6 +2374,7 @@ static const IrSimdBailRule IR_SIMD_BAIL_RULES[] = {
     ir_simd_bail_int64_elements,
     ir_simd_bail_reloaded_base,
     ir_simd_bail_mixed_float_widths,
+    ir_simd_bail_byte_dot_shape,
     ir_simd_bail_byte_sum_accumulator,
     ir_simd_bail_invariant_addend,
     ir_simd_bail_int32_sum_accumulator,

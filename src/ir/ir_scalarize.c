@@ -359,18 +359,32 @@ static void sc_int_sum(Sc *sc, const IRInstruction *insn) {
   sc_loop_end(sc, &loop, 1);
 }
 
+static const char *sc_dot_i8_total_type(const IRInstruction *insn) {
+  int wide = insn->argument_count > 2 && insn->arguments[2].int_value == 64;
+  int is_unsigned =
+      insn->argument_count > 3 && insn->arguments[3].int_value != 0;
+  if (wide) {
+    return is_unsigned ? "uint64" : "int64";
+  }
+  return is_unsigned ? "uint32" : "int32";
+}
+
 static void sc_int_dot(Sc *sc, const IRInstruction *insn) {
   int is_i8 = insn->op == IR_OP_SIMD_DOT_I8;
   long long size = is_i8 ? 1 : 4;
+  long long mode = !is_i8 ? 0
+                   : insn->argument_count > 1 ? insn->arguments[1].int_value
+                   : insn->is_unsigned ? 3
+                                       : 0;
   ScLoop loop = sc_loop(sc, &insn->arguments[0]);
   IROperand a_at = sc_address(sc, &insn->lhs, &loop.index, size);
   IROperand b_at = sc_address(sc, &insn->rhs, &loop.index, size);
-  IROperand a = sc_load(sc, &a_at, size, 0, is_i8 && insn->is_unsigned);
-  IROperand b = sc_load(sc, &b_at, size, 0, is_i8 && insn->is_unsigned);
+  IROperand a = sc_load(sc, &a_at, size, 0, (mode & 1) != 0);
+  IROperand b = sc_load(sc, &b_at, size, 0, (mode & 2) != 0);
   IROperand product = sc_op(sc, "*", &a, &b, 0);
   IROperand sum = sc_op(sc, "+", &insn->dest, &product, 0);
   if (is_i8) {
-    IROperand wrapped = sc_cast(sc, "int32", &sum);
+    IROperand wrapped = sc_cast(sc, sc_dot_i8_total_type(insn), &sum);
     sc_assign(sc, &insn->dest, &wrapped);
     ir_operand_destroy(&wrapped);
   } else {
