@@ -1,0 +1,51 @@
+var g_seen: int32 = 5;
+
+fn shl(h: uint64, l: uint64, k: int32, lo: uint64*) -> uint64 {
+  if (k <= 0) {
+    *lo = l;
+    return h;
+  }
+  *lo = l << (uint64)k;
+  return (h << (uint64)k) | (l >> (uint64)(64 - k));
+}
+
+fn pair(a: uint64, b: uint64, k: int32) -> uint64 {
+  var l: uint64 = b;
+  var h: uint64 = shl(a, l, k, &l);
+  return h * 10 + (l >> 62);
+}
+
+fn put(p: int32*, v: int32) -> int32 {
+  *p = v;
+  return 0;
+}
+
+fn bump(l: int32, lo: int32*) -> int32 {
+  var z: int32 = put(lo, l + 10);
+  return l + z;
+}
+
+fn through_pointer() -> int32 {
+  var l: int32 = 5;
+  var p: int32* = &l;
+  var h: int32 = bump(l, p);
+  return h * 100 + l;
+}
+
+fn swap_global(v: int32) -> int32 {
+  g_seen = 9;
+  return v;
+}
+
+fn main() -> int32 {
+  if (pair((uint64)1, (uint64)0x8000000000000000, 1) != (uint64)30) {
+    return 1;
+  }
+  if (through_pointer() != 515) {
+    return 2;
+  }
+  if (swap_global(g_seen) != 5 || g_seen != 9) {
+    return 3;
+  }
+  return 0;
+}
