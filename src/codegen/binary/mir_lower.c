@@ -8015,7 +8015,7 @@ static int mir_temp_read_count(const MirTempUseIndex *ix, const char *name) {
 
 static long mir_temp_def_index(const MirTempUseIndex *ix, const char *name) {
   const MirTempUse *e = mir_temp_use_find(ix, name);
-  return e ? e->def_index : -1;
+  return e && e->def_count == 1 ? e->def_index : -1;
 }
 
 static int mir_temp_reads_are_all_addresses(const MirTempUseIndex *ix,

@@ -20878,6 +20878,8 @@ $runFixtures = @(
      What = "a rep movsb aggregate copy clobbered a value the allocator kept in RCX" },
   @{ Name = "inlined_parameter_alias"; Path = "tests/codegen/inlined_parameter_alias.mettle"
      What = "an inlined by-value parameter read the caller's variable after the callee wrote it through a pointer or as a global" },
+  @{ Name = "address_fold_two_definitions"; Path = "tests/codegen/address_fold_two_definitions.mettle"
+     What = "a store through an address that each of two branches computes used the first branch's address for both" },
   @{ Name = "row_fill_offset"; Path = "tests/codegen/row_fill_offset.mettle"
      What = "a row fill applied its row offset twice, writing past the row it was given" },
   @{ Name = "const_pool_placement"; Path = "tests/codegen/const_pool_placement.mettle"
