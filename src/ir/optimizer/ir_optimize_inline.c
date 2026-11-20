@@ -918,7 +918,374 @@ static int ir_inline_value_fits_return(const IRFunction *callee,
   }
 }
 
+#define IR_INLINE_TRACKED_NAMES 32
+#define IR_INLINE_CAPTURE_DEPTH 3
+#define IR_INLINE_REACH_LIMIT 64
+
+typedef struct {
+  const char *names[IR_INLINE_TRACKED_NAMES];
+  size_t count;
+} IRInlineTracked;
+
+typedef struct {
+  const IRInstruction *items;
+  size_t count;
+} IRInlineSpan;
+
+static int ir_inline_callee_may_write(const IRFunction *callee,
+                                      const char *name) {
+  for (size_t i = 0; i < callee->instruction_count; i++) {
+    const IRInstruction *in = &callee->instructions[i];
+    switch (in->op) {
+    case IR_OP_NOP:
+    case IR_OP_LABEL:
+    case IR_OP_JUMP:
+    case IR_OP_BRANCH_ZERO:
+    case IR_OP_BRANCH_EQ:
+    case IR_OP_DECLARE_LOCAL:
+    case IR_OP_ASSIGN:
+    case IR_OP_ADDRESS_OF:
+    case IR_OP_LOAD:
+    case IR_OP_BINARY:
+    case IR_OP_UNARY:
+    case IR_OP_CAST:
+    case IR_OP_SELECT:
+    case IR_OP_PHI:
+    case IR_OP_RETURN:
+      if (name && in->dest.kind == IR_OPERAND_SYMBOL && in->dest.name &&
+          strcmp(in->dest.name, name) == 0) {
+        return 1;
+      }
+      break;
+    default:
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_inline_tracked_has(const IRInlineTracked *tracked,
+                                 const IROperand *operand) {
+  if (!operand || !operand->name || (operand->kind != IR_OPERAND_TEMP &&
+                                     operand->kind != IR_OPERAND_SYMBOL)) {
+    return 0;
+  }
+  for (size_t i = 0; i < tracked->count; i++) {
+    if (strcmp(tracked->names[i], operand->name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_inline_tracked_add(const IRProgram *program,
+                                 IRInlineTracked *tracked,
+                                 const IROperand *operand, int *grew) {
+  if (!operand || !operand->name || (operand->kind != IR_OPERAND_TEMP &&
+                                     operand->kind != IR_OPERAND_SYMBOL)) {
+    return 0;
+  }
+  if (ir_inline_tracked_has(tracked, operand)) {
+    return 1;
+  }
+  if (operand->kind == IR_OPERAND_SYMBOL) {
+    const IRModuleSymbol *symbol =
+        ir_program_lookup_symbol(program, operand->name);
+    if (symbol && symbol->kind == IR_MODSYM_VARIABLE) {
+      return 0;
+    }
+  }
+  if (tracked->count == IR_INLINE_TRACKED_NAMES) {
+    return 0;
+  }
+  tracked->names[tracked->count++] = operand->name;
+  *grew = 1;
+  return 1;
+}
+
+static int ir_inline_binary_is_compare(const char *text) {
+  static const char *const COMPARE[] = {"==", "!=", "<", "<=", ">", ">="};
+  for (size_t i = 0; text && i < sizeof(COMPARE) / sizeof(COMPARE[0]); i++) {
+    if (strcmp(text, COMPARE[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_inline_pointer_escapes(const IRProgram *program,
+                                     const IRFunction *caller,
+                                     const IRInlineSpan *spans,
+                                     size_t span_count,
+                                     IRInlineTracked *tracked,
+                                     const IRInstruction *site,
+                                     int writes_escape, int depth);
+
+static int ir_inline_call_captures(const IRProgram *program,
+                                   const IRFunction *caller,
+                                   const IRInstruction *in,
+                                   const IRInlineTracked *tracked,
+                                   int writes_escape, int depth) {
+  IRFunction *target = NULL;
+  if (depth >= IR_INLINE_CAPTURE_DEPTH || !in->text) {
+    return 1;
+  }
+  target = ir_program_find_function((IRProgram *)program, in->text);
+  if (!target || target == caller || target->instruction_count == 0 ||
+      !target->parameter_names ||
+      target->parameter_count != in->argument_count) {
+    return 1;
+  }
+  for (size_t k = 0; k < in->argument_count; k++) {
+    if (!ir_inline_tracked_has(tracked, &in->arguments[k])) {
+      continue;
+    }
+    if (!target->parameter_names[k]) {
+      return 1;
+    }
+    IRInlineTracked inner = {{0}, 0};
+    IRInlineSpan span = {target->instructions, target->instruction_count};
+    inner.names[inner.count++] = target->parameter_names[k];
+    if (ir_inline_pointer_escapes(program, caller, &span, 1, &inner, NULL,
+                                  writes_escape, depth + 1)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_inline_use_escapes(const IRProgram *program,
+                                 const IRFunction *caller,
+                                 const IRInstruction *in,
+                                 IRInlineTracked *tracked,
+                                 const IRInstruction *site, int writes_escape,
+                                 int depth, int *grew) {
+  int lhs = ir_inline_tracked_has(tracked, &in->lhs);
+  int rhs = ir_inline_tracked_has(tracked, &in->rhs);
+  int dest = ir_inline_tracked_has(tracked, &in->dest);
+  int argument = 0;
+  for (size_t k = 0; k < in->argument_count; k++) {
+    argument |= ir_inline_tracked_has(tracked, &in->arguments[k]);
+  }
+  switch (in->op) {
+  case IR_OP_NOP:
+  case IR_OP_LABEL:
+  case IR_OP_JUMP:
+  case IR_OP_DECLARE_LOCAL:
+  case IR_OP_BRANCH_ZERO:
+  case IR_OP_BRANCH_EQ:
+  case IR_OP_LOAD:
+    return 0;
+  case IR_OP_STORE:
+    return lhs || (dest && writes_escape);
+  case IR_OP_ADDRESS_OF:
+    return lhs;
+  case IR_OP_RETURN:
+    return lhs;
+  case IR_OP_ASSIGN:
+  case IR_OP_CAST:
+  case IR_OP_UNARY:
+    return lhs && !ir_inline_tracked_add(program, tracked, &in->dest, grew);
+  case IR_OP_BINARY:
+    if (!lhs && !rhs) {
+      return 0;
+    }
+    return !ir_inline_binary_is_compare(in->text) &&
+           !ir_inline_tracked_add(program, tracked, &in->dest, grew);
+  case IR_OP_CALL:
+    if (!argument) {
+      return 0;
+    }
+    return in == site || ir_inline_call_captures(program, caller, in, tracked,
+                                                 writes_escape, depth);
+  default:
+    return lhs || rhs || dest || argument;
+  }
+}
+
+static int ir_inline_pointer_escapes(const IRProgram *program,
+                                     const IRFunction *caller,
+                                     const IRInlineSpan *spans,
+                                     size_t span_count,
+                                     IRInlineTracked *tracked,
+                                     const IRInstruction *site,
+                                     int writes_escape, int depth) {
+  int grew = 1;
+  while (grew) {
+    grew = 0;
+    for (size_t s = 0; s < span_count; s++) {
+      for (size_t i = 0; i < spans[s].count; i++) {
+        if (ir_inline_use_escapes(program, caller, &spans[s].items[i], tracked,
+                                  site, writes_escape, depth, &grew)) {
+          return 1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+static int ir_inline_track_address(const IRProgram *program,
+                                   const IRInlineSpan *spans,
+                                   size_t span_count, const char *name,
+                                   IRInlineTracked *tracked, int writes,
+                                   int assigns) {
+  int grew = 0;
+  for (size_t s = 0; s < span_count; s++) {
+    for (size_t i = 0; i < spans[s].count; i++) {
+      const IRInstruction *in = &spans[s].items[i];
+      if (writes && in->op == IR_OP_INLINE_ASM) {
+        return 0;
+      }
+      if (assigns && in->op != IR_OP_DECLARE_LOCAL &&
+          ir_operand_is_symbol(&in->dest) &&
+          strcmp(in->dest.name, name) == 0) {
+        return 0;
+      }
+      if (in->op == IR_OP_ADDRESS_OF && ir_operand_is_symbol(&in->lhs) &&
+          strcmp(in->lhs.name, name) == 0 &&
+          !ir_inline_tracked_add(program, tracked, &in->dest, &grew)) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static int ir_inline_reach_assigns(const IRProgram *program,
+                                   const IRFunction *caller,
+                                   const IRFunction *callee,
+                                   const char *name) {
+  const IRFunction *queue[IR_INLINE_REACH_LIMIT];
+  size_t count = 0;
+  queue[count++] = callee;
+  for (size_t q = 0; q < count; q++) {
+    const IRFunction *fn = queue[q];
+    if (fn == caller) {
+      return 1;
+    }
+    for (size_t i = 0; i < fn->instruction_count; i++) {
+      const IRInstruction *in = &fn->instructions[i];
+      IRFunction *target = NULL;
+      size_t seen = 0;
+      if (in->op == IR_OP_CALL_INDIRECT || in->op == IR_OP_INLINE_ASM) {
+        return 1;
+      }
+      if (in->op != IR_OP_DECLARE_LOCAL && ir_operand_is_symbol(&in->dest) &&
+          strcmp(in->dest.name, name) == 0) {
+        return 1;
+      }
+      if (in->op != IR_OP_CALL) {
+        continue;
+      }
+      target = in->text ? ir_program_find_function((IRProgram *)program,
+                                                   in->text)
+                        : NULL;
+      if (!target || target->instruction_count == 0) {
+        return 1;
+      }
+      while (seen < count && queue[seen] != target) {
+        seen++;
+      }
+      if (seen < count) {
+        continue;
+      }
+      if (count == IR_INLINE_REACH_LIMIT) {
+        return 1;
+      }
+      queue[count++] = target;
+    }
+  }
+  return 0;
+}
+
+static int ir_inline_global_written(const IRProgram *program,
+                                    const IRFunction *caller,
+                                    const IRInstructionVector *emitted,
+                                    const char *name, int assigns) {
+  for (size_t f = 0; f < program->function_count; f++) {
+    const IRFunction *fn = program->functions[f];
+    IRInlineSpan spans[2];
+    size_t span_count = 1;
+    IRInlineTracked tracked = {{0}, 0};
+    if (!fn) {
+      continue;
+    }
+    spans[0].items = fn->instructions;
+    spans[0].count = fn->instruction_count;
+    if (fn == caller && emitted) {
+      spans[1].items = emitted->items;
+      spans[1].count = emitted->count;
+      span_count = 2;
+    }
+    if (!ir_inline_track_address(program, spans, span_count, name, &tracked,
+                                 1, assigns)) {
+      return 1;
+    }
+    if (tracked.count > 0 &&
+        ir_inline_pointer_escapes(program, caller, spans, span_count,
+                                  &tracked, NULL, 1, 0)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_inline_argument_stable(const IRProgram *program,
+                                     const IRFunction *caller,
+                                     const IRInstructionVector *emitted,
+                                     const IRInstruction *site,
+                                     const IRFunction *callee,
+                                     const char *name) {
+  IRInlineSpan spans[2];
+  size_t span_count = 1;
+  IRInlineTracked tracked = {{0}, 0};
+  int declared = 0;
+  if (!caller) {
+    return 0;
+  }
+  if (!ir_inline_callee_may_write(callee, name)) {
+    return 1;
+  }
+  spans[0].items = caller->instructions;
+  spans[0].count = caller->instruction_count;
+  if (emitted) {
+    spans[1].items = emitted->items;
+    spans[1].count = emitted->count;
+    span_count = 2;
+  }
+  for (size_t i = 0; i < caller->parameter_count; i++) {
+    if (caller->parameter_names && caller->parameter_names[i] &&
+        strcmp(caller->parameter_names[i], name) == 0) {
+      declared = 1;
+    }
+  }
+  for (size_t s = 0; !declared && s < span_count; s++) {
+    for (size_t i = 0; !declared && i < spans[s].count; i++) {
+      const IRInstruction *in = &spans[s].items[i];
+      declared = in->op == IR_OP_DECLARE_LOCAL &&
+                 ir_operand_is_symbol(&in->dest) &&
+                 strcmp(in->dest.name, name) == 0;
+    }
+  }
+  if (!declared) {
+    if (ir_inline_global_written(program, caller, emitted, name, 0)) {
+      return 0;
+    }
+    return !ir_inline_reach_assigns(program, caller, callee, name) ||
+           !ir_inline_global_written(program, caller, emitted, name, 1);
+  }
+  if (!ir_inline_track_address(program, spans, span_count, name, &tracked,
+                               0, 0)) {
+    return 0;
+  }
+  return tracked.count == 0 ||
+         !ir_inline_pointer_escapes(program, caller, spans, span_count,
+                                    &tracked, site, 0, 0);
+}
+
 static int ir_inline_call_instruction(const IRProgram *program,
+                                      const IRFunction *caller,
                                       IRInstructionVector *vector,
                                       const IRInstruction *call_instruction,
                                       const IRFunction *callee,
@@ -947,7 +1314,9 @@ static int ir_inline_call_instruction(const IRProgram *program,
     char *mapped = NULL;
     int add_ok = 0;
     if (argument->kind == IR_OPERAND_SYMBOL && argument->name &&
-        !ir_function_assigns_symbol(callee, parameter_name)) {
+        !ir_function_assigns_symbol(callee, parameter_name) &&
+        ir_inline_argument_stable(program, caller, vector, call_instruction,
+                                  callee, argument->name)) {
       add_ok = ir_name_map_add(&symbol_map, parameter_name, argument->name);
     } else {
       mapped = ir_make_inline_name(inline_prefix, "param", parameter_name);
@@ -1332,7 +1701,8 @@ static int ir_inline_calls_in_function(IRProgram *program, IRFunction *function,
             ir_explain_remark_trivial();
           }
         }
-        if (!ir_inline_call_instruction(program, &vector, instruction, callee,
+        if (!ir_inline_call_instruction(program, function, &vector,
+                                        instruction, callee,
                                         (*inline_counter)++)) {
           ir_instruction_vector_destroy(&vector);
           free(in_loop);
@@ -1443,7 +1813,8 @@ static int ir_inline_self_calls_once(const IRProgram *program,
     if (instruction->op == IR_OP_CALL && instruction->text &&
         strcmp(instruction->text, function->name) == 0 &&
         instruction->argument_count == function->parameter_count) {
-      if (!ir_inline_call_instruction(program, &vector, instruction, function,
+      if (!ir_inline_call_instruction(program, function, &vector, instruction,
+                                      function,
                                       (*inline_counter)++)) {
         ir_instruction_vector_destroy(&vector);
         return 0;
