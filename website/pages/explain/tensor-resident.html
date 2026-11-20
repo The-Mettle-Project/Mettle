@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tensor-resident: A tensor accumulator stays in registers across its steps | Mettle</title>
+<meta name="description" content="tensor-resident: A tensor accumulator stays in registers across its steps" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><img src="../assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<h1><span class="code">tensor-resident</span>A tensor accumulator stays in registers across its steps</h1>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
+<pre><code>mettle explain tensor-resident</code></pre>
+
+<p>Steps that accumulate into the same output would each load the accumulator from memory and store it back. Where nothing between the steps can observe the output, it is loaded once, kept in the tensor registers across the chain, the loop or the region, and stored once at the end. The report gives the registers that takes against the budget.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="local-memory.html"><span class="c">local-memory</span><span class="t">A kernel&#x27;s local was emitted as memory</span></a></li><li><a href="generic-access.html"><span class="c">generic-access</span><span class="t">A load or store goes through the generic address space</span></a></li><li><a href="vector-load.html"><span class="c">vector-load</span><span class="t">Adjacent loads became one vector load</span></a></li><li><a href="vector-load-alignment.html"><span class="c">vector-load-alignment</span><span class="t">Adjacent loads stayed separate for want of a declared alignment</span></a></li><li><a href="tensor-instruction.html"><span class="c">tensor-instruction</span><span class="t">The instruction a tensor operation became</span></a></li><li><a href="tensor-register-budget.html"><span class="c">tensor-register-budget</span><span class="t">A tensor accumulator went back to memory because of the register budget</span></a></li><li><a href="tensor-scalar-replay.html"><span class="c">tensor-scalar-replay</span><span class="t">A tensor_matmul runs one element at a time</span></a></li><li><a href="tensor-scalar.html"><span class="c">tensor-scalar</span><span class="t">A block-scaled integer tensor product runs in scalar code on Metal</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></footer>
+</body>
+</html>
