@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>callee-has-loop: The callee&#x27;s loop body is over the inline size budget | Mettle</title>
-<meta name="description" content="callee-has-loop: The callee&#x27;s loop body is over the inline size budget" />
+<title>callee-has-loop: The callee has a loop and is over the size budget for one | Mettle</title>
+<meta name="description" content="callee-has-loop: The callee has a loop and is over the size budget for one" />
 <link rel="icon" href="../favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -17,11 +17,11 @@
   <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
 </div></header>
 <main class="wrap">
-<h1><span class="code">callee-has-loop</span>The callee&#x27;s loop body is over the inline size budget</h1>
+<h1><span class="code">callee-has-loop</span>The callee has a loop and is over the size budget for one</h1>
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain callee-has-loop</code></pre>
 
-<p>A small loop-bearing callee inlines, because that is what exposes its loop to values the caller already holds in registers. Past the budget the call is noise next to the loop it reaches, and the caller growth is not repaid. The budget doubles at sites two or more loops deep.</p>
+<p>A small callee with a loop inlines, because that is what exposes its loop to values the caller already holds in registers. The budget counts the whole callee, 80 instructions, and doubles at sites two or more loops deep. Past it the call is noise next to the loop it reaches, and the caller growth is not repaid.</p>
 <p>@inline inlines it anyway. Where the loop is hot, look at its own remark first: that is usually where the time goes.</p>
 
 <h2>Related</h2>

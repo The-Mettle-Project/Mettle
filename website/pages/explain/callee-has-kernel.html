@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>callee-has-kernel: The callee&#x27;s loops became SIMD kernels | Mettle</title>
-<meta name="description" content="callee-has-kernel: The callee&#x27;s loops became SIMD kernels" />
+<title>callee-has-kernel: The callee was kept as a call and its loop became a SIMD kernel | Mettle</title>
+<meta name="description" content="callee-has-kernel: The callee was kept as a call and its loop became a SIMD kernel" />
 <link rel="icon" href="../favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -17,12 +17,12 @@
   <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
 </div></header>
 <main class="wrap">
-<h1><span class="code">callee-has-kernel</span>The callee&#x27;s loops became SIMD kernels</h1>
+<h1><span class="code">callee-has-kernel</span>The callee was kept as a call and its loop became a SIMD kernel</h1>
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain callee-has-kernel</code></pre>
 
-<p>Not a refusal to worry about. The callee&#x27;s loops vectorized, which happens after inlining runs, so the call survives to the end of the pipeline and gets reported here.</p>
-<p>The kernel runs at the same speed either way. One call to reach it is not measurable against the loop it contains.</p>
+<p>The inliner refused this call for the reason the remark gives first. Vectorization runs after inlining, and it later turned the callee&#x27;s loop into a kernel.</p>
+<p>The kernel runs at the same speed either way. One call to reach it is not measurable against the loop it contains, so the refusal costs nothing here.</p>
 
 <h2>Related</h2>
 <ul class="codelist"><li><a href="callee-no-body.html"><span class="c">callee-no-body</span><span class="t">The callee has no body to inline</span></a></li><li><a href="callee-noinline.html"><span class="c">callee-noinline</span><span class="t">The callee is marked @noinline</span></a></li><li><a href="callee-denylisted.html"><span class="c">callee-denylisted</span><span class="t">The callee is on the compiler&#x27;s inline denylist</span></a></li><li><a href="too-many-parameters.html"><span class="c">too-many-parameters</span><span class="t">The callee takes more than 16 parameters</span></a></li><li><a href="callee-parameter-names.html"><span class="c">callee-parameter-names</span><span class="t">The callee&#x27;s parameter names are unavailable</span></a></li><li><a href="callee-over-budget.html"><span class="c">callee-over-budget</span><span class="t">The callee&#x27;s body is over the inline size budget</span></a></li><li><a href="callee-call-count.html"><span class="c">callee-call-count</span><span class="t">The callee makes more calls than the inline call-count budget allows</span></a></li><li><a href="callee-inline-asm.html"><span class="c">callee-inline-asm</span><span class="t">The callee contains inline assembly</span></a></li></ul>
