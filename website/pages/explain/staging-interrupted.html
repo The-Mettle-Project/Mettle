@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>staging-interrupted: An operation sits between the staged copies and their barrier | Mettle</title>
+<meta name="description" content="staging-interrupted: An operation sits between the staged copies and their barrier" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><img src="../assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<h1><span class="code">staging-interrupted</span>An operation sits between the staged copies and their barrier</h1>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
+<pre><code>mettle explain staging-interrupted</code></pre>
+
+<p>Copies from global to workgroup memory can be issued asynchronously when nothing but register arithmetic runs between them and the barrier that publishes them. A load, a store or a call in that stretch could see workgroup memory before the copies land.</p>
+<p>Fix: move it after the barrier.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="local-memory.html"><span class="c">local-memory</span><span class="t">A kernel&#x27;s local was emitted as memory</span></a></li><li><a href="generic-access.html"><span class="c">generic-access</span><span class="t">A load or store goes through the generic address space</span></a></li><li><a href="vector-load.html"><span class="c">vector-load</span><span class="t">Adjacent loads became one vector load</span></a></li><li><a href="vector-load-alignment.html"><span class="c">vector-load-alignment</span><span class="t">Adjacent loads stayed separate for want of a declared alignment</span></a></li><li><a href="tensor-instruction.html"><span class="c">tensor-instruction</span><span class="t">The instruction a tensor operation became</span></a></li><li><a href="tensor-resident.html"><span class="c">tensor-resident</span><span class="t">A tensor accumulator stays in registers across its steps</span></a></li><li><a href="tensor-register-budget.html"><span class="c">tensor-register-budget</span><span class="t">A tensor accumulator went back to memory because of the register budget</span></a></li><li><a href="tensor-scalar-replay.html"><span class="c">tensor-scalar-replay</span><span class="t">A tensor_matmul runs one element at a time</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></footer>
+</body>
+</html>

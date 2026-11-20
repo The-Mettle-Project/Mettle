@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>control-flow: The loop body branches | Mettle</title>
-<meta name="description" content="control-flow: The loop body branches" />
+<title>control-flow: The loop body branches on data | Mettle</title>
+<meta name="description" content="control-flow: The loop body branches on data" />
 <link rel="icon" href="../favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -17,14 +17,12 @@
   <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
 </div></header>
 <main class="wrap">
-<h1><span class="code">control-flow</span>The loop body branches</h1>
+<h1><span class="code">control-flow</span>The loop body branches on data</h1>
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain control-flow</code></pre>
 
-<p>The body has a nested loop or a data-dependent <code>if</code>. Lanes execute in lockstep, so a branch that goes one way for lane 3 and the other way for lane 4 has no single instruction to be.</p>
-<p>Note the compiler already if-converts short branches into masked arithmetic where it can (see <code>if-converted</code>). This code fires when the branch was too big or too effectful for that.</p>
-<h3>Fixes</h3>
-<ul><li><p>hoist the condition out when it does not depend on the index</p></li><li><p>replace a small <code>if</code> with arithmetic: <code>x = c * a + (1 - c) * b</code></p></li><li><p>split one loop into two, each with a straight-line body</p></li></ul>
+<p>The body has a data-dependent <code>if</code>. The lane vectorizer runs an if/else as masks: both arms compute in every lane and a select keeps the right one. It takes that shape only inside a loop it can run at all, and the remark says where it stopped:</p>
+<ul><li><p>the loop test is not a signed <code>counter &lt; bound</code></p></li><li><p>the counter does not step by one as the last statement</p></li><li><p>an element is not 32 bits wide</p></li><li><p>an address is not <code>base[i]</code> with the counter as the index</p></li></ul><p>The fix line under the remark is the fix for that stop.</p>
 
 <h2>Related</h2>
 <ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li><li><a href="int16-elements.html"><span class="c">int16-elements</span><span class="t">16-bit integer elements have no kernel</span></a></li></ul>
