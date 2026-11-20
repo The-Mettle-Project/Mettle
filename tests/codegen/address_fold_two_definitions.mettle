@@ -1,0 +1,41 @@
+struct Box { small: int64[4]; count: int64; big: int64*; }
+
+var g_box: Box;
+var g_big: int64[16];
+
+fn slot(b: Box*, i: int64) -> int64* {
+  if (i < 4) {
+    return &b->small[i];
+  }
+  return &b->big[i - 4];
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  g_box.big = &g_big[0];
+  g_box.count = 12;
+  *slot(&g_box, (int64)argc + 3) = 7;
+  *slot(&g_box, (int64)argc + 1) = 5;
+  if (g_box.count != 12) {
+    return 1;
+  }
+  if (g_big[0] != 7) {
+    return 2;
+  }
+  if (g_box.small[2] != 5) {
+    return 3;
+  }
+  var total: int64 = 0;
+  for i in 0..12 {
+    *slot(&g_box, (int64)i) = 100 + (int64)i;
+  }
+  for i in 0..4 {
+    total = total + g_box.small[i];
+  }
+  for i in 0..8 {
+    total = total + g_big[i];
+  }
+  if (g_box.count != 12 || total != 1266) {
+    return 4;
+  }
+  return 0;
+}
