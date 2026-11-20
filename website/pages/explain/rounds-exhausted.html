@@ -21,8 +21,8 @@
 <p class="lede">Reported by <code>--explain</code> after a verdict.</p>
 <pre><code>mettle explain rounds-exhausted</code></pre>
 
-<p>The callee passes every check. The call site only appeared late, exposed by an earlier round of inlining, and the round limit was reached before the inliner came back to it.</p>
-<p>Fix: mark the callee @inline, which raises its priority. Deep call chains hit this most: each level of nesting costs a round.</p>
+<p>The inliner runs four rounds over the program. This call site appeared in the last of them, copied in with the body of another callee, and the inliner stopped before it came back to look at it.</p>
+<p>Deep call chains hit this: each level of nesting costs a round. No decorator changes the round count. Flattening the chain by one level, or calling the inner function directly, brings the site into reach.</p>
 
 <h2>Related</h2>
 <ul class="codelist"><li><a href="callee-no-body.html"><span class="c">callee-no-body</span><span class="t">The callee has no body to inline</span></a></li><li><a href="callee-noinline.html"><span class="c">callee-noinline</span><span class="t">The callee is marked @noinline</span></a></li><li><a href="callee-denylisted.html"><span class="c">callee-denylisted</span><span class="t">The callee is on the compiler&#x27;s inline denylist</span></a></li><li><a href="too-many-parameters.html"><span class="c">too-many-parameters</span><span class="t">The callee takes more than 16 parameters</span></a></li><li><a href="callee-parameter-names.html"><span class="c">callee-parameter-names</span><span class="t">The callee&#x27;s parameter names are unavailable</span></a></li><li><a href="callee-over-budget.html"><span class="c">callee-over-budget</span><span class="t">The callee&#x27;s body is over the inline size budget</span></a></li><li><a href="callee-call-count.html"><span class="c">callee-call-count</span><span class="t">The callee makes more calls than the inline call-count budget allows</span></a></li><li><a href="callee-inline-asm.html"><span class="c">callee-inline-asm</span><span class="t">The callee contains inline assembly</span></a></li></ul>
