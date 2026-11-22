@@ -1,0 +1,171 @@
+// Lanes between cores, for src/cores on Linux. Putting into another core's
+// node takes its gate, so both cores write the same lines. With lanes, a
+// handler's message for another core goes instead into a ring for that
+// pair of cores that only the sending core's thread writes and only the
+// receiving core's thread reads, with no lock, and the receiver moves it
+// into the mailbox when it runs.
+//
+// What a sender is told changes: ALPH_OK once the message is in the lane,
+// ALPH_FULL when the lane is full, never ALPH_GONE. A message for an actor
+// that is gone when it arrives is dropped, and one for a full mailbox waits
+// at the head of its lane, with what is behind it, until the actor has
+// room. Sends from any other thread take the gate as before.
+//
+// A board has none: an interrupt runs on the hart it stops, so a hart
+// cannot tell a core's own sends from others.
+
+import "port/port";
+import "alph/actor/actor";
+import "alph/cores/cores";
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+
+// A message in a lane, with the pid it is for.
+export struct AlphLetter {
+  to: Word;
+  msg: AlphMsg;
+}
+
+// The sender's half and the receiver's half sit on lines of their own. The
+// lane from a core to itself carries nothing; its tail is that core's idle:
+// set while it goes to sleep, when a sender must wake it.
+export struct AlphLane {
+  tail: int32;  // where the sender puts the next message
+  head_seen: int32;
+  mail: AlphLetter*;
+  room: int32;
+  sender: int32[11];
+  head: int32;  // the next message the receiver takes
+  tail_seen: int32;
+  receiver: int64[7];
+}
+
+// A read the compiler must make each time: another core writes the value.
+fn alph_look(at: int32*) -> int32 {
+  var v: volatile int32* = (volatile int32*)at;
+  return *v;
+}
+
+fn alph_lane(c: AlphCores*, from: Word, to: Word) -> AlphLane* {
+  var lanes: AlphLane* = (AlphLane*)c->ways;
+  return &lanes[from * c->count + to];
+}
+
+// The cores' cross: only the thread that runs n gets here. The exchange
+// that publishes tail is a full barrier, so either the receiver sees the
+// message or this sees it idle and wakes it through its gate.
+fn alph_lane_put(c: AlphCores*, n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  var from: Word = n->place - c->first;
+  var core: Word = (Word)(to >> ALPH_PLACE_SHIFT) - c->first;
+  var l: AlphLane* = alph_lane(c, from, core);
+  var next: int32 = l->tail + 1;
+  if (next == l->room) {
+    next = 0;
+  }
+  if (next == l->head_seen) {
+    l->head_seen = alph_look(&l->head);
+    if (next == l->head_seen) {
+      return ALPH_FULL;
+    }
+  }
+  var at: AlphLetter* = &l->mail[l->tail];
+  at->to = to;
+  at->msg = *m;
+  mettle_atomic_exchange_i32(&l->tail, next);
+  if (alph_look(&alph_lane(c, core, core)->tail) != 0) {
+    var g: AlphGate* = &c->cores[core].node.gate;
+    var was: int32 = g->enter();
+    g->wake();
+    g->leave(was);
+  }
+  return ALPH_OK;
+}
+
+// Moves what has come in one lane into the mailboxes. The letter is read
+// through volatile words so that no read of it comes before the read of
+// tail that says it is there.
+fn alph_lane_take(n: AlphNode*, l: AlphLane*) {
+  var head: int32 = l->head;
+  while (true) {
+    if (head == l->tail_seen) {
+      l->tail_seen = alph_look(&l->tail);
+      if (head == l->tail_seen) {
+        break;
+      }
+    }
+    var w: volatile Word* = (volatile Word*)&l->mail[head];
+    var m: AlphMsg = { tag: (Word)w[1], from: (Word)w[2], arg: (Word)w[3], ref: (Word)w[4] };
+    if (n->deliver((Word)w[0], &m) == ALPH_FULL) {
+      break;
+    }
+    head = head + 1;
+    if (head == l->room) {
+      head = 0;
+    }
+  }
+  if (head != l->head) {
+    mettle_atomic_exchange_i32(&l->head, head);
+  }
+}
+
+// The gate's gather, inside the gate: the core is running, so its senders
+// need not wake it.
+fn alph_lanes_gather(near: rawptr) {
+  var n: AlphNode* = (AlphNode*)near;
+  var c: AlphCores* = (AlphCores*)n->world;
+  var core: Word = n->place - c->first;
+  var idle: AlphLane* = alph_lane(c, core, core);
+  if (idle->tail != 0) {
+    mettle_atomic_exchange_i32(&idle->tail, 0);
+  }
+  for i in 0..c->count {
+    if ((Word)i != core) {
+      alph_lane_take(n, alph_lane(c, (Word)i, core));
+    }
+  }
+}
+
+// The gate's look: whether a lane into this core holds mail. Before a sleep
+// idle is set first, with a full barrier, so a message put after this look
+// meets idle and its sender wakes the core.
+fn alph_lanes_look(near: rawptr, sleeping: bool) -> bool {
+  var n: AlphNode* = (AlphNode*)near;
+  var c: AlphCores* = (AlphCores*)n->world;
+  var core: Word = n->place - c->first;
+  var idle: AlphLane* = alph_lane(c, core, core);
+  if (sleeping) {
+    mettle_atomic_exchange_i32(&idle->tail, 1);
+  }
+  var found: bool = false;
+  for i in 0..c->count {
+    var l: AlphLane* = alph_lane(c, (Word)i, core);
+    if ((Word)i != core && alph_look(&l->tail) != l->head) {
+      found = true;
+    }
+  }
+  if (found && sleeping) {
+    mettle_atomic_exchange_i32(&idle->tail, 0);
+  }
+  return found;
+}
+
+// Turns lanes on. lanes holds count * count lanes, mail count * count *
+// room letters, and a lane holds room - 1. Call it before run.
+export fn AlphCores_lanes__ptr(c: AlphCores*, lanes: AlphLane*, mail: AlphLetter*, room: Word) {
+  for i in 0..c->count * c->count {
+    lanes[i].tail = 0;
+    lanes[i].head_seen = 0;
+    lanes[i].head = 0;
+    lanes[i].tail_seen = 0;
+    lanes[i].room = (int32)room;
+    lanes[i].mail = &mail[(Word)i * room];
+  }
+  c->ways = (rawptr)lanes;
+  c->cross = &alph_lane_put;
+  for i in 0..c->count {
+    var n: AlphNode* = &c->cores[i].node;
+    n->gate.collect = &alph_lanes_gather;
+    n->gate.look = &alph_lanes_look;
+    n->gate.near = (rawptr)n;
+  }
+}

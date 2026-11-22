@@ -1,0 +1,267 @@
+// A 64-bit Linux process: any thread may send, one thread runs the actors.
+
+import "port/sys";
+
+export type Word = int64;
+export const ALPH_INDEX_BITS: Word = 24;   // 16 million actors in a node
+export const ALPH_PLACE_SHIFT: Word = 48;  // 24 bits of generation, then 15 of place
+export const ALPH_GATHER: Word = 16;  // messages a node runs between gathers while it is busy
+export const ALPH_ON_RUN: Word = 1;  // a node can be watched: see AlphNode on_run
+
+const FUTEX_WAIT: int64 = 128;  // private
+const FUTEX_WAKE: int64 = 129;
+const SPINS: int32 = 100;      // tries at the lock before giving up the CPU
+const IDLE_SPINS: int32 = 4;     // microseconds a node looks for new mail before sleeping, to begin with,
+const MOST_SPINS: int32 = 32;    // at most, for a node whose mail keeps coming just after it sleeps,
+const LEAST_SPINS: int32 = 1;    // and at least, for one whose mail does not come while it looks
+const SOON_NS: int64 = 30000;    // a sleep shorter than this was not worth its system calls,
+const LONG_NS: int64 = 200000;   // and one longer than this was
+const AWAKE: int32 = 0;
+const LOOKING: int32 = 1;  // spinning: a wake only has to change wakes
+const ASLEEP: int32 = 2;   // in the kernel: a wake is a system call
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+export struct AlphGate {
+  lock: int32;
+  wakes: int32;
+  state: int32;
+  owed: int32;  // a wake to make once the lock is free
+  collect: fn(rawptr) -> void;  // brings in mail that came another way (src/cores/lanes)
+  look: fn(rawptr, bool) -> bool;  // whether such mail is waiting; with true, before a sleep
+  near: rawptr;  // whoever set them
+  send: fn(rawptr) -> void;  // sends what was held back for this node's next look (src/link)
+  sender: rawptr;
+  unsent: int32*;    // not 0: something is held back,
+  unsent_at: Word*;  // since this many ns
+  stack: int64;      // about where the stack of the thread that runs this node is
+  spins: int32;      // how many microseconds this node looks for mail before it sleeps,
+  most: int32;       // and the most it ever does: 0 for a node that sleeps at once (AlphCores_look)
+  slept: int64;      // nanoseconds this node has slept in all: what is left of the time is how busy it is
+  // A node that waits on descriptors too (src/poll) sleeps there, where
+  // both a ready descriptor and a wake end the sleep. nap(napper, 1) is
+  // the sleep, called outside the gate. nap(napper, 0) only looks, inside
+  // the gate, and brings in what is ready. rouse(napper) ends a nap.
+  nap: fn(rawptr, int32) -> void;
+  rouse: fn(rawptr) -> void;
+  napper: rawptr;
+}
+
+export fn AlphGate_init__ptr(g: AlphGate*) {
+  g->lock = 0;
+  g->wakes = 0;
+  g->state = AWAKE;
+  g->owed = 0;
+  g->collect = 0;
+  g->look = 0;
+  g->near = 0;
+  g->send = 0;
+  g->sender = 0;
+  g->unsent = 0;
+  g->unsent_at = 0;
+  g->stack = 0;
+  g->spins = IDLE_SPINS;
+  g->most = MOST_SPINS;
+  g->slept = 0;
+  g->nap = 0;
+  g->rouse = 0;
+  g->napper = 0;
+}
+
+// Called by the node between two messages when mail is held back (the
+// node's held), inside the gate, and returns inside it. Mail for other
+// machines that was held back, to go several to
+// a datagram, is sent here: at once when the node has nothing more to run
+// (hold is false), and while it has, once the oldest has waited a
+// twentieth of a millisecond. The gate is open while it is sent.
+export fn AlphGate_pass__ptr(g: AlphGate*, was: int32, hold: bool) -> int32 {
+  if (g->send == 0 || *g->unsent == 0) {
+    return was;
+  }
+  if (hold) {
+    var ts: int64[2];
+    syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+    if ((Word)(ts[0] * 1000000000 + ts[1]) - *g->unsent_at < 50000) {
+      return was;
+    }
+  }
+  g->leave(was);
+  g->send(g->sender);
+  return g->enter();
+}
+
+// The node's thread has stopped running it: no thread is its runner now.
+export fn AlphGate_done__ptr(g: AlphGate*) {
+  g->stack = 0;
+}
+
+// Whether the calling thread is the one that runs this gate's node: its
+// stack is where that thread's was when it last passed.
+export fn AlphGate_mine__ptr(g: AlphGate*) -> bool {
+  var here: int32 = 0;
+  var apart: int64 = (int64)&here - g->stack;
+  return g->stack != 0 && apart > -65536 && apart < 65536;
+}
+
+// Called inside the gate by the node that sleeps on it. It also notes about
+// where that thread's stack is (mine), written only when it changes:
+// senders read this line of memory.
+export fn AlphGate_gather__ptr(g: AlphGate*) {
+  var here: int32 = 0;
+  if (g->stack != (int64)&here) {
+    g->stack = (int64)&here;
+  }
+  if (g->collect != 0) {
+    g->collect(g->near);
+  }
+  if (g->nap != 0) {
+    g->nap(g->napper, 0);
+  }
+}
+
+// A compare-and-swap, not an exchange: on every CPU it makes what was
+// written inside the gate visible before the lock reads as free.
+fn alph_unlock(g: AlphGate*) {
+  mettle_atomic_compare_exchange_i32(&g->lock, 0, 1);
+}
+
+// Spins, then yields: the holder may have lost its CPU.
+export fn AlphGate_enter__ptr(g: AlphGate*) -> int32 {
+  var tries: int32 = 0;
+  while (mettle_atomic_exchange_i32(&g->lock, 1) != 0) {
+    tries = tries + 1;
+    if (tries == SPINS) {
+      tries = 0;
+      syscall(ALPH_NR_SCHED_YIELD);
+    }
+  }
+  return 0;
+}
+
+export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
+  var owed: int32 = g->owed;
+  g->owed = 0;
+  alph_unlock(g);
+  if (owed != 0) {
+    if (g->rouse != 0) {
+      g->rouse(g->napper);
+    } else {
+      syscall(ALPH_NR_FUTEX, (int64)&g->wakes, FUTEX_WAKE, 1);
+    }
+  }
+}
+
+var g_stamps_per_us: int64 = 0;  // how fast the port's stamp goes, measured once
+
+// Measures the stamp against the clock over a fifth of a millisecond.
+fn alph_gate_rate() {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  var began: int64 = ts[0] * 1000000000 + ts[1];
+  var first: int64 = alph_sys_stamp();
+  var now: int64 = began;
+  while (now - began < 200000) {
+    syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+    now = ts[0] * 1000000000 + ts[1];
+  }
+  var rate: int64 = (alph_sys_stamp() - first) * 1000 / (now - began);
+  if (rate < 1) {
+    rate = 1;
+  }
+  g_stamps_per_us = rate;
+}
+
+// Mail usually comes back within microseconds, so look for a while first:
+// a sleep and its wake cost two system calls. A wake between the leave and
+// the wait changes wakes, so the wait returns. Mail that comes without a
+// wake (src/cores' lanes) is found by look, and look(true) tells its sender
+// to wake this from here on.
+//
+// How long to look is learnt, and never much longer than a sleep and its
+// wake cost, which is some tens of microseconds: looking longer than that
+// for mail spends more than the sleep it saves. A node that was woken a
+// moment after it went to sleep should have looked longer: it looks twice
+// as long next time, up to that limit. So a node that waits for answers
+// from another machine, which take tens of microseconds, stops sleeping
+// between them. One that looked in vain and then slept long looks half as
+// long next time, so a node whose mail comes now and then does not keep a
+// CPU busy between.
+export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
+  var seen: int32 = g->wakes;
+  g->state = LOOKING;
+  alph_unlock(g);
+  if (g_stamps_per_us == 0) {
+    alph_gate_rate();
+  }
+  var until: int64 = alph_sys_stamp() + (int64)g->spins * g_stamps_per_us;
+  var looks: int32 = 0;
+  while (g->most > 0) {
+    if (mettle_atomic_compare_exchange_i32(&g->wakes, seen, seen) != seen) {
+      return;
+    }
+    if (g->look != 0 && g->look(g->near, false)) {
+      return;
+    }
+    looks = looks + 1;
+    if (looks == 8) {
+      looks = 0;
+      if (alph_sys_stamp() >= until) {
+        break;
+      }
+    }
+  }
+  g->enter();
+  if (g->wakes != seen || (g->look != 0 && g->look(g->near, true))) {
+    g->leave(0);
+    return;
+  }
+  g->state = ASLEEP;
+  alph_unlock(g);
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  var began: int64 = ts[0] * 1000000000 + ts[1];
+  if (g->nap != 0) {
+    g->nap(g->napper, 1);
+    // A descriptor may have ended the nap, with no wake to say so.
+    g->enter();
+    if (g->state == ASLEEP) {
+      g->state = AWAKE;
+    }
+    alph_unlock(g);
+  } else {
+    syscall(ALPH_NR_FUTEX, (int64)&g->wakes, FUTEX_WAIT, (int64)seen, 0);
+  }
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  var slept: int64 = ts[0] * 1000000000 + ts[1] - began;
+  g->slept = g->slept + slept;
+  if (slept < SOON_NS) {
+    if (g->spins < g->most) {
+      g->spins = g->spins * 2;
+    }
+  } else if (slept > LONG_NS && g->spins > LEAST_SPINS) {
+    g->spins = g->spins / 2;
+  }
+}
+
+// Called inside the gate. Costs nothing while the node is running.
+export fn AlphGate_wake__ptr(g: AlphGate*) {
+  if (g->state != AWAKE) {
+    if (g->state == ASLEEP) {
+      g->owed = 1;
+    }
+    g->state = AWAKE;
+    mettle_atomic_exchange_i32(&g->wakes, g->wakes + 1);
+  }
+}
+
+// Sets the most microseconds a node looks for mail before it sleeps.
+export fn alph_gate_look(g: AlphGate*, most: int32) {
+  g->most = most;
+  if (g->spins > most) {
+    g->spins = most;
+  }
+  if (g->spins < 1) {
+    g->spins = 1;
+  }
+}

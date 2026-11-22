@@ -1,0 +1,179 @@
+// Many nodes, one on each core: a thread each in a Linux process, a hart
+// each on a chip with several. A core is a place: an actor
+// sends to a pid on another core the same way it sends next door, and the
+// message is put straight into that core's node.
+//
+// Like the node, this owns no memory: the caller hands it the cores, the
+// actor slots and the mailboxes, which it shares out evenly.
+
+import "port/cpu";
+import "alph/actor/actor";
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+
+// One core: its node and the thread or hart that runs it.
+export struct AlphCore {
+  node: AlphNode;
+  thread: int64;
+  self: int32;  // the thread running this core, 0 when none
+}
+
+// The cores of one machine, a node on each.
+export struct AlphCores {
+  cores: AlphCore*;
+  count: Word;
+  first: Word;  // the first core's place: the cores are first, first + 1, ...
+  far: fn(AlphCores*, Word, AlphMsg*) -> Word;
+  world: rawptr;  // whoever set far
+  // Tried first for mail between the cores, only on the thread that runs
+  // the sending node (src/cores/lanes). A board has none: ALPH_GATHER is 0
+  // there, so the test folds away.
+  cross: fn(AlphCores*, AlphNode*, Word, AlphMsg*) -> Word;
+  ways: rawptr;  // whoever set cross
+}
+
+fn alph_cores_far(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  var c: AlphCores* = (AlphCores*)n->world;
+  var core: Word = (Word)(to >> ALPH_PLACE_SHIFT) - c->first;
+  if (core >= 0 && core < c->count) {
+    if (ALPH_GATHER != 0 && c->cross != 0) {
+      var self: int32 = c->cores[n->place - c->first].self;
+      if (self != 0 && self == alph_cpu_self()) {
+        return c->cross(c, n, to, m);
+      }
+    }
+    return c->cores[core].node.put(to, m);
+  }
+  if (c->far == 0) {
+    return ALPH_GONE;
+  }
+  return c->far(c, to, m);
+}
+
+// Makes the cores some of the places of a wider world: theirs start at
+// first, and far takes the mail for the rest. Call it before the first spawn.
+export fn AlphCores_join__ptr(c: AlphCores*, first: Word, far: fn(AlphCores*, Word, AlphMsg*) -> Word, world: rawptr) {
+  c->first = first;
+  c->far = far;
+  c->world = world;
+  for i in 0..c->count {
+    c->cores[i].node.join(first + (Word)i, &alph_cores_far, (rawptr)c);
+  }
+}
+
+// actors holds count * slots actors, mail holds count * slots * room messages.
+export fn AlphCores_init__ptr(c: AlphCores*, cores: AlphCore*, count: Word, actors: AlphActor*, slots: Word,
+                              mail: AlphMsg*, room: Word) {
+  c->cores = cores;
+  c->count = count;
+  c->first = 0;
+  c->far = 0;
+  c->world = 0;
+  if (ALPH_GATHER != 0) {
+    c->cross = 0;
+  }
+  for i in 0..count {
+    var n: AlphNode* = &cores[i].node;
+    n->init(&actors[i * slots], slots, &mail[i * slots * room], room);
+    n->join((Word)i, &alph_cores_far, (rawptr)c);
+    cores[i].thread = 0;
+    if (ALPH_GATHER != 0) {
+      cores[i].self = 0;
+    }
+  }
+}
+
+// Spawns on a chosen core, counted from 0. Returns the pid, or 0 when that
+// core is full.
+export fn AlphCores_spawn_on__ptr(c: AlphCores*, core: Word, handle: fn(AlphActor*, AlphMsg*) -> Word,
+                                  state: rawptr) -> Word {
+  return c->cores[core].node.spawn(handle, state);
+}
+
+// Spawns on the core with the fewest actors. Returns the pid, or 0 when
+// every core is full.
+export fn AlphCores_spawn__ptr(c: AlphCores*, handle: fn(AlphActor*, AlphMsg*) -> Word,
+                               state: rawptr) -> Word {
+  var best: Word = 0;
+  for i in 1..c->count {
+    if (c->cores[i].node.live < c->cores[best].node.live) {
+      best = (Word)i;
+    }
+  }
+  var pid: Word = c->cores[best].node.spawn(handle, state);
+  var i: Word = 0;
+  while (pid == 0 && i < c->count) {
+    pid = c->cores[i].node.spawn(handle, state);
+    i = i + 1;
+  }
+  return pid;
+}
+
+// Whether a pid names an actor on one of these cores that is alive now.
+export fn AlphCores_alive__ptr(c: AlphCores*, pid: Word) -> bool {
+  var core: Word = (Word)(pid >> ALPH_PLACE_SHIFT) - c->first;
+  if (core < 0 || core >= c->count) {
+    return false;
+  }
+  return c->cores[core].node.alive(pid);
+}
+
+// From outside an actor.
+export fn AlphCores_send__ptr(c: AlphCores*, to: Word, tag: Word, arg: Word) -> Word {
+  return c->cores[0].node.send(to, tag, arg);
+}
+
+// The cores an actor runs among.
+export fn AlphActor_cores__ptr(a: AlphActor*) -> AlphCores* {
+  return (AlphCores*)a->node->world;
+}
+
+// self is cleared with a full barrier before the thread can end, so a later
+// thread given the same id cannot take it for its own.
+fn alph_core_main(arg: cstring) -> uint32 {
+  var core: AlphCore* = (AlphCore*)arg;
+  if (ALPH_GATHER != 0) {
+    core->self = alph_cpu_self();
+  }
+  core->node.run();
+  if (ALPH_GATHER != 0) {
+    mettle_atomic_exchange_i32(&core->self, 0);
+  }
+  return 0;
+}
+
+// Runs every core until stop: the first on this thread, the rest on their
+// own. On Linux a core keeps its thread from one run to the next, so what
+// belongs to a thread (a GPU a handler opened) lasts, and running again
+// costs a wake and not a new thread.
+export fn AlphCores_run__ptr(c: AlphCores*) {
+  for i in 1..c->count {
+    c->cores[i].thread = alph_cpu_start(i, &alph_core_main, (cstring)&c->cores[i]);
+  }
+  alph_core_main((cstring)&c->cores[0]);
+  for i in 1..c->count {
+    alph_cpu_join(c->cores[i].thread);
+  }
+}
+
+// Says how long a core with nothing to run looks for new mail before it
+// sleeps: at most this many microseconds. A core learns how long is worth
+// it, up to this. Looking saves the sleep and the wake when mail comes
+// soon, so it is quicker, and it keeps the CPU busy meanwhile. The most is
+// 32 to begin with. 0 makes a core sleep at once: the least CPU, and each
+// message that finds it asleep waits for it to wake. Linux only. Call it
+// before run.
+export fn AlphCores_look__ptr(c: AlphCores*, microseconds: Word) {
+  if (ALPH_GATHER != 0) {
+    for i in 0..c->count {
+      alph_gate_look(&c->cores[i].node.gate, (int32)microseconds);
+    }
+  }
+}
+
+// Stops every core, so run returns. Any actor or thread may call it.
+export fn AlphCores_stop__ptr(c: AlphCores*) {
+  for i in 0..c->count {
+    c->cores[i].node.stop();
+  }
+}

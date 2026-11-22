@@ -1,0 +1,8 @@
+name = alph
+version = 0.2.0
+description = Actors for Mettle that run on one core, every core, the GPU, other machines or a board
+license = Apache-2.0
+source = https://github.com/Lex-Dellimere/Alph
+compiler = 0.18.0
+platforms = linux
+require = cryptex 0.3.0

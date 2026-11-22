@@ -1,0 +1,440 @@
+// Polls: a socket or any other file descriptor sends a message when it is
+// ready. Handlers never wait: they read and write what can be done now, and
+// ask to be told when there is more.
+//
+// One thread sleeps in the kernel until something is ready and sends the
+// messages. Each asking is for one message: an actor asks again when it
+// wants the next. So a busy socket cannot flood a mailbox, and an actor
+// that is not ready for more is not told.
+//
+// A descriptor's ear is the one with its own number when that one is free,
+// so asking and forgetting take the same time however many descriptors
+// there are, as long as there are more ears than the highest descriptor.
+// With fewer, a descriptor takes any free ear and is found by looking
+// through them. Ears are set up as they are first reached, so a large array
+// costs memory only as far as the descriptors go.
+//
+// A node whose own actors hold many sockets can wait on the descriptors
+// itself (init_own). Then there is no thread between the kernel and the
+// node: when it has nothing to run it sleeps in the kernel on its
+// descriptors, and a ready one or a message from elsewhere ends the sleep.
+// While it is busy it looks at them between messages.
+//
+// Linux (epoll).
+
+import "std/thread";
+import "port/port";
+import "port/sys";
+import "alph/actor/actor";
+
+export const ALPH_READ: Word = 1;    // ready for reading, or the other side closed
+export const ALPH_WRITE: Word = 2;   // ready for writing
+export const ALPH_ERROR: Word = 4;   // the descriptor failed
+
+const EPOLL_ADD: int64 = 1;
+const EPOLL_DEL: int64 = 2;
+const EPOLL_MOD: int64 = 3;
+const EPOLLIN: uint32 = 1;
+const EPOLLOUT: uint32 = 4;
+const EPOLLERR: uint32 = 8;
+const EPOLLHUP: uint32 = 16;
+const EPOLLRDHUP: uint32 = 8192;
+const EPOLLONESHOT: uint32 = 1073741824;
+const EPOLLET: uint32 = 2147483648;
+const ROUSER: uint32 = 4294967295;  // the slot that stands for the rouser
+const EFD_NONBLOCK: int64 = 2048;
+const EEXIST: int64 = -17;
+const ENOENT: int64 = -2;
+
+// One descriptor someone asked about.
+export struct AlphEar {
+  fd: int64;     // -1 while the slot is free
+  to: Word;
+  tag: Word;
+  owed: Word;    // what was ready when its actor had no room for the word
+  turn: uint32;  // goes up each time the slot is given to a descriptor or taken back
+  after: int32;  // the next ear with word owed, -1 for the last, -2 when this one is not among them
+}
+
+// The descriptors one node is waiting on.
+export struct AlphPoll {
+  gate: AlphGate;
+  node: AlphNode*;
+  ears: AlphEar*;
+  room: Word;
+  epoll: int64;
+  thread: int64;
+  stopping: int32;
+  born: Word;    // ears set up so far: the ones from here on were never used
+  strays: Word;  // ears that hold a descriptor other than their own number
+  owing: int32;  // the first ear with word its actor had no room for, -1 for none,
+  owing_last: int32;  // and the last
+  own: Word;     // the node waits on the descriptors itself (init_own)
+  rouser: int64; // written to end the node's sleep
+  got: int64;    // events the node's sleep ended with, not yet told
+  events: AlphEpollEvent[256];
+}
+
+// Tells an ear's actor what is ready. False when the actor has no room for
+// it now: its mailbox is full, or, with a node's own poll, a quarter full,
+// so that word of descriptors never crowds out an actor's other mail.
+// Called inside the gate.
+fn alph_poll_tell(p: AlphPoll*, e: AlphEar*) -> bool {
+  var m: AlphMsg = { tag: e->tag, from: 0, arg: (Word)e->fd, ref: e->owed };
+  var out: Word = ALPH_OK;
+  var n: AlphNode* = p->node;
+  if (p->own != 0 && (Word)(e->to >> ALPH_PLACE_SHIFT) == n->place) {
+    var i: Word = (Word)(e->to & (((Word)1 << ALPH_INDEX_BITS) - 1));
+    if (i < n->slots && (Word)(n->actors[i].count * 4) >= n->room) {
+      return false;
+    }
+  }
+  if (p->own != 0) {
+    out = n->deliver(e->to, &m);  // the node's own thread, inside its gate
+  } else {
+    out = n->put(e->to, &m);
+  }
+  if (out == ALPH_FULL) {
+    return false;
+  }
+  e->owed = 0;
+  if (out == ALPH_GONE) {
+    // Its actor ended without forgetting it.
+    syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_DEL, e->fd, 0);
+    alph_poll_free(p, e);
+  }
+  return true;
+}
+
+// Puts an ear among those with word owed, at the end. Called inside the gate.
+fn alph_poll_owe(p: AlphPoll*, e: AlphEar*) {
+  var slot: int32 = (int32)(((int64)e - (int64)p->ears) / (int64)sizeof(AlphEar));
+  if (e->after != -2) {
+    return;
+  }
+  e->after = -1;
+  if (p->owing < 0) {
+    p->owing = slot;
+  } else {
+    p->ears[p->owing_last].after = slot;
+  }
+  p->owing_last = slot;
+}
+
+// Tries the ears with word owed, oldest first, until one still has no room.
+// An ear given back meanwhile owes nothing and just leaves the list.
+// Called inside the gate.
+fn alph_poll_settle(p: AlphPoll*) {
+  while (p->owing >= 0) {
+    var e: AlphEar* = &p->ears[p->owing];
+    if (e->fd >= 0 && e->owed != 0 && !alph_poll_tell(p, e)) {
+      return;
+    }
+    p->owing = e->after;
+    e->after = -2;
+  }
+}
+
+// Gives an ear back. Called inside the gate.
+fn alph_poll_free(p: AlphPoll*, e: AlphEar*) {
+  var slot: Word = (Word)(((int64)e - (int64)p->ears) / (int64)sizeof(AlphEar));
+  if ((Word)e->fd != slot) {
+    p->strays = p->strays - 1;
+  }
+  e->fd = -1;
+  e->owed = 0;
+  e->turn = e->turn + 1;
+}
+
+// The ear that holds a descriptor, or -1. Called inside the gate.
+fn alph_poll_find(p: AlphPoll*, fd: int64) -> Word {
+  if (fd >= 0 && fd < (int64)p->born && p->ears[fd].fd == fd) {
+    return (Word)fd;
+  }
+  if (p->strays > 0) {
+    for i in 0..p->born {
+      if (p->ears[i].fd == fd) {
+        return (Word)i;
+      }
+    }
+  }
+  return -1;
+}
+
+// Sets up the ears up to and with slot. Called inside the gate.
+fn alph_poll_reach(p: AlphPoll*, slot: Word) {
+  while (p->born <= slot && p->born < p->room) {
+    p->ears[p->born].fd = -1;
+    p->ears[p->born].owed = 0;
+    p->ears[p->born].turn = 0;
+    p->ears[p->born].after = -2;
+    p->born = p->born + 1;
+  }
+}
+
+// Tells the actors of the first n events. Called inside the poll's gate.
+fn alph_poll_events(p: AlphPoll*, events: AlphEpollEvent*, n: int64) {
+  for i in 0..n {
+    if (events[i].slot == ROUSER) {
+      continue;
+    }
+    var e: AlphEar* = &p->ears[(int64)events[i].slot];
+    var ready: Word = 0;
+    if ((events[i].events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) != 0) {
+      ready = (Word)(ready | ALPH_READ);
+    }
+    if ((events[i].events & EPOLLOUT) != 0) {
+      ready = (Word)(ready | ALPH_WRITE);
+    }
+    if ((events[i].events & EPOLLERR) != 0) {
+      ready = (Word)(ready | ALPH_ERROR);
+    }
+    if (e->fd >= 0 && e->turn == events[i].turn && ready != 0) {
+      e->owed = (Word)(e->owed | ready);
+      // Behind the ones already waiting, so word goes out in its order.
+      if (e->after == -2 && (p->owing >= 0 || !alph_poll_tell(p, e))) {
+        alph_poll_owe(p, e);
+      }
+    }
+  }
+  // Word an actor had no room for is tried again on every pass.
+  alph_poll_settle(p);
+}
+
+fn alph_poll_main(arg: cstring) -> uint32 {
+  var p: AlphPoll* = (AlphPoll*)arg;
+  while (p->stopping == 0) {
+    var n: int64 = alph_sys_epoll_wait(p->epoll, &p->events[0], 256, 10);
+    var was: int32 = p->gate.enter();
+    alph_poll_events(p, &p->events[0], n);
+    p->gate.leave(was);
+  }
+  return 0;
+}
+
+// The node's nap (see the port's gate). With sleep it waits in the kernel
+// until a descriptor is ready or the node is roused, outside the node's
+// gate, and keeps what it was told. Without, inside the node's gate, it
+// tells the actors: what the sleep ended with, or what is ready now.
+fn alph_poll_nap(napper: rawptr, sleep: int32) {
+  var p: AlphPoll* = (AlphPoll*)napper;
+  if (p->epoll < 0) {
+    return;
+  }
+  if (sleep != 0) {
+    p->got = alph_sys_epoll_wait(p->epoll, &p->events[0], 256, -1);
+    return;
+  }
+  // A node with nothing to run is about to sleep here, which tells it as
+  // well: only a busy one has to look.
+  if (p->got <= 0 && p->node->first != 0) {
+    p->got = alph_sys_epoll_wait(p->epoll, &p->events[0], 256, 0);
+  }
+  var n: int64 = p->got;
+  p->got = 0;
+  if (n > 0 || p->owing >= 0) {
+    var was: int32 = p->gate.enter();
+    alph_poll_events(p, &p->events[0], n);
+    p->gate.leave(was);
+  }
+}
+
+fn alph_poll_rouse(napper: rawptr) {
+  var p: AlphPoll* = (AlphPoll*)napper;
+  var one: int64 = 1;
+  syscall(ALPH_NR_WRITE, p->rouser, (int64)&one, 8);
+}
+
+// ears holds room ears: one for each descriptor asked about at a time.
+// Messages go out through node. Returns ALPH_GONE when the kernel gave no
+// epoll.
+export fn AlphPoll_init__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room: Word) -> Word {
+  var out: Word = p->init_wide(node, ears, room);
+  alph_poll_reach(p, room - 1);
+  return out;
+}
+
+// As init, for a great many descriptors: an ear is set up when it is first
+// reached, so the array costs memory only as far as the descriptors go. An
+// ear past those has no meaning yet, not even that it is free.
+export fn AlphPoll_init_wide__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room: Word) -> Word {
+  p->gate.init();
+  p->node = node;
+  p->ears = ears;
+  p->room = room;
+  p->stopping = 0;
+  p->thread = 0;
+  p->born = 0;
+  p->strays = 0;
+  p->owing = -1;
+  p->owing_last = -1;
+  p->own = 0;
+  p->rouser = -1;
+  p->got = 0;
+  p->epoll = syscall(ALPH_NR_EPOLL_CREATE1, 0);
+  if (p->epoll < 0) {
+    p->epoll = -1;
+    return ALPH_GONE;
+  }
+  p->thread = CreateThread(0, 0, &alph_poll_main, (cstring)p, 0, 0);
+  return ALPH_OK;
+}
+
+// As init_wide, with no thread: the node waits on the descriptors itself.
+// When it has nothing to run it sleeps on them, and it looks at them
+// between messages while it is busy. Only this node's own actors can be
+// told, and want and forget are for its handlers. Call it before the node
+// runs, and stop after it has stopped.
+export fn AlphPoll_init_own__ptr(p: AlphPoll*, node: AlphNode*, ears: AlphEar*, room: Word) -> Word {
+  var event: AlphEpollEvent;
+  p->gate.init();
+  p->node = node;
+  p->ears = ears;
+  p->room = room;
+  p->stopping = 0;
+  p->thread = 0;
+  p->born = 0;
+  p->strays = 0;
+  p->owing = -1;
+  p->owing_last = -1;
+  p->own = 1;
+  p->got = 0;
+  p->epoll = syscall(ALPH_NR_EPOLL_CREATE1, 0);
+  p->rouser = syscall(ALPH_NR_EVENTFD2, 0, EFD_NONBLOCK);
+  if (p->epoll < 0 || p->rouser < 0) {
+    p->epoll = -1;
+    return ALPH_GONE;
+  }
+  // Told once for each write, with nothing to read back.
+  event.events = EPOLLIN | EPOLLET;
+  event.slot = ROUSER;
+  event.turn = 0;
+  if (syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_ADD, p->rouser, (int64)&event) < 0) {
+    p->epoll = -1;
+    return ALPH_GONE;
+  }
+  node->gate.napper = (rawptr)p;
+  node->gate.rouse = &alph_poll_rouse;
+  node->gate.nap = &alph_poll_nap;
+  return ALPH_OK;
+}
+
+// Asks for one message when a descriptor is ready: for reading (ALPH_READ),
+// for writing (ALPH_WRITE) or either (both). The message has the tag given,
+// the descriptor in arg, and in ref what it is ready for, with ALPH_ERROR
+// if it failed. Ask again for the next. Returns ALPH_FULL when every ear is
+// in use, ALPH_GONE when the kernel refuses the descriptor.
+export fn AlphPoll_want__ptr(p: AlphPoll*, fd: int64, what: Word, to: Word, tag: Word) -> Word {
+  return alph_poll_ask(p, fd, what, to, tag, EPOLLONESHOT);
+}
+
+// Asks once for a message every time a descriptor becomes ready: when
+// bytes arrive on one that had none, and when one that was full can be
+// written again. There is no asking again, which saves a system call for
+// every message. The actor must then take all there is each time: read
+// until a read gives fewer bytes than it had room for, write until a write
+// takes fewer than it was given. Otherwise as want.
+export fn AlphPoll_hear__ptr(p: AlphPoll*, fd: int64, what: Word, to: Word, tag: Word) -> Word {
+  return alph_poll_ask(p, fd, what, to, tag, EPOLLET);
+}
+
+fn alph_poll_ask(p: AlphPoll*, fd: int64, what: Word, to: Word, tag: Word, how: uint32) -> Word {
+  var event: AlphEpollEvent;
+  var mine: Word = -1;
+  var out: Word = ALPH_OK;
+  var was: int32 = p->gate.enter();
+  if (p->epoll < 0) {
+    p->gate.leave(was);
+    return ALPH_GONE;
+  }
+  mine = alph_poll_find(p, fd);
+  var stray: bool = false;
+  if (mine < 0 && fd >= 0 && fd < (int64)p->room) {
+    alph_poll_reach(p, (Word)fd);
+    if (p->ears[fd].fd < 0) {
+      mine = (Word)fd;  // its own ear is free
+    }
+  }
+  if (mine < 0) {
+    // Its own ear is taken, or there is none of that number: any free one.
+    for i in 0..p->room {
+      alph_poll_reach(p, (Word)i);
+      if (p->ears[i].fd < 0) {
+        mine = (Word)i;
+        stray = true;
+        break;
+      }
+    }
+  }
+  if (mine < 0) {
+    p->gate.leave(was);
+    return ALPH_FULL;
+  }
+  var e: AlphEar* = &p->ears[mine];
+  if (e->fd != fd || e->to != to) {
+    // A new descriptor in the slot, or a new actor asking: what was ready
+    // for the last one is not theirs.
+    e->owed = 0;
+    e->turn = e->turn + 1;
+  }
+  if (e->fd != fd && stray) {
+    p->strays = p->strays + 1;
+  }
+  e->fd = fd;
+  e->to = to;
+  e->tag = tag;
+  event.events = how;
+  if ((Word)(what & ALPH_READ) != 0) {
+    event.events = event.events | EPOLLIN | EPOLLRDHUP;
+  }
+  if ((Word)(what & ALPH_WRITE) != 0) {
+    event.events = event.events | EPOLLOUT;
+  }
+  // Handed back with each event: the slot and its turn, so that word about
+  // a descriptor the slot no longer holds is dropped.
+  event.slot = (uint32)mine;
+  event.turn = e->turn;
+  var done: int64 = syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_MOD, fd, (int64)&event);
+  if (done == ENOENT) {
+    done = syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_ADD, fd, (int64)&event);
+  }
+  if (done < 0) {
+    alph_poll_free(p, e);
+    out = ALPH_GONE;
+  }
+  p->gate.leave(was);
+  return out;
+}
+
+// Stops asking about a descriptor. Do this before closing it.
+export fn AlphPoll_forget__ptr(p: AlphPoll*, fd: int64) {
+  var was: int32 = p->gate.enter();
+  var mine: Word = alph_poll_find(p, fd);
+  if (mine >= 0) {
+    if (p->epoll >= 0) {
+      syscall(ALPH_NR_EPOLL_CTL, p->epoll, EPOLL_DEL, fd, 0);
+    }
+    alph_poll_free(p, &p->ears[mine]);
+  }
+  p->gate.leave(was);
+}
+
+// No message is sent after this returns, and asking after it is refused.
+export fn AlphPoll_stop__ptr(p: AlphPoll*) {
+  if (p->epoll < 0) {
+    return;
+  }
+  p->stopping = 1;
+  if (p->own == 0) {
+    thread_join_infinite(p->thread);
+    thread_close(p->thread);
+  } else {
+    p->node->gate.nap = 0;
+    p->node->gate.rouse = 0;
+    syscall(ALPH_NR_CLOSE, p->rouser);
+  }
+  var was: int32 = p->gate.enter();
+  syscall(ALPH_NR_CLOSE, p->epoll);
+  p->epoll = -1;
+  p->gate.leave(was);
+}

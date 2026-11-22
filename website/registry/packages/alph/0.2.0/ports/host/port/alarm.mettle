@@ -1,0 +1,94 @@
+// A thread that sleeps until the time asked for, then calls ring.
+
+import "std/thread";
+import "port/port";
+import "port/sys";
+
+const CLOCK_MONOTONIC: int64 = 1;
+const FUTEX_WAIT: int64 = 128;  // private
+const FUTEX_WAKE: int64 = 129;
+
+extern fn mettle_atomic_inc_i32(target: int32*) -> int32 with none = "mettle_atomic_inc_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+export struct AlphAlarm {
+  changes: int32;  // goes up with every set and stop, so the thread looks again
+  armed: int32;
+  stopping: int32;
+  at: Word;
+  ring: fn(rawptr) -> void;
+  ctx: rawptr;
+  thread: int64;
+}
+
+// Time in ticks: here a tick is a millisecond on the monotonic clock.
+export fn alph_now() -> Word {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, CLOCK_MONOTONIC, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000 + ts[1] / 1000000);
+}
+
+// Milliseconds as ticks.
+export fn alph_ms(ms: Word) -> Word {
+  return ms;
+}
+
+// ring re-arms the alarm from what is still waiting, so clearing armed here
+// cannot lose a set made by another thread a moment before.
+fn alph_alarm_main(arg: cstring) -> uint32 {
+  var al: AlphAlarm* = (AlphAlarm*)arg;
+  var ts: int64[2];
+  while (true) {
+    var seen: int32 = mettle_atomic_compare_exchange_i32(&al->changes, 0, 0);
+    if (al->stopping != 0) {
+      return 0;
+    }
+    if (al->armed == 0) {
+      syscall(ALPH_NR_FUTEX, (int64)&al->changes, FUTEX_WAIT, (int64)seen, 0);
+      continue;
+    }
+    var wait: Word = al->at - alph_now();
+    if (wait <= 0) {
+      al->armed = 0;
+      al->ring(al->ctx);
+      continue;
+    }
+    ts[0] = (int64)(wait / 1000);
+    ts[1] = (int64)(wait % 1000) * 1000000;
+    syscall(ALPH_NR_FUTEX, (int64)&al->changes, FUTEX_WAIT, (int64)seen, (int64)&ts[0]);
+  }
+  return 0;
+}
+
+fn alph_alarm_changed(al: AlphAlarm*) {
+  mettle_atomic_inc_i32(&al->changes);
+  syscall(ALPH_NR_FUTEX, (int64)&al->changes, FUTEX_WAKE, 1);
+}
+
+export fn AlphAlarm_start__ptr(al: AlphAlarm*, ring: fn(rawptr) -> void, ctx: rawptr) {
+  al->changes = 0;
+  al->armed = 0;
+  al->stopping = 0;
+  al->ring = ring;
+  al->ctx = ctx;
+  al->thread = CreateThread(0, 0, &alph_alarm_main, (cstring)al, 0, 0);
+}
+
+// Rings once the time reaches at, at once if it already has.
+export fn AlphAlarm_set__ptr(al: AlphAlarm*, at: Word) {
+  al->at = at;
+  al->armed = 1;
+  alph_alarm_changed(al);
+}
+
+export fn AlphAlarm_clear__ptr(al: AlphAlarm*) {
+  al->armed = 0;
+}
+
+// Ends the thread. No ring is in progress once this returns.
+export fn AlphAlarm_stop__ptr(al: AlphAlarm*) {
+  al->stopping = 1;
+  alph_alarm_changed(al);
+  thread_join_infinite(al->thread);
+  thread_close(al->thread);
+}

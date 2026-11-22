@@ -1,0 +1,80 @@
+// Names: a number a program chooses, for a pid it wants found. The names
+// wait in the caller's array.
+
+import "port/port";
+import "alph/actor/actor";
+
+// One name and the pid behind it.
+export struct AlphName {
+  name: Word;
+  pid: Word;  // 0 while the slot is free
+}
+
+// The names of one machine.
+export struct AlphNames {
+  gate: AlphGate;
+  slots: AlphName*;
+  room: Word;
+}
+
+// slots holds room names.
+export fn AlphNames_init__ptr(n: AlphNames*, slots: AlphName*, room: Word) {
+  n->gate.init();
+  n->slots = slots;
+  n->room = room;
+  for i in 0..room {
+    slots[i].pid = 0;
+  }
+}
+
+// Gives a pid a name, or gives the name to another pid. Returns ALPH_FULL
+// when every name is in use.
+export fn AlphNames_set__ptr(n: AlphNames*, name: Word, pid: Word) -> Word {
+  var mine: AlphName* = 0;
+  var was: int32 = n->gate.enter();
+  for i in 0..n->room {
+    var s: AlphName* = &n->slots[i];
+    if (s->pid != 0 && s->name == name) {
+      mine = s;
+      break;
+    }
+    if (s->pid == 0 && mine == 0) {
+      mine = s;
+    }
+  }
+  if (mine != 0) {
+    mine->name = name;
+    mine->pid = pid;
+  }
+  n->gate.leave(was);
+  if (mine == 0) {
+    return ALPH_FULL;
+  }
+  return ALPH_OK;
+}
+
+// The pid with this name, or 0.
+export fn AlphNames_get__ptr(n: AlphNames*, name: Word) -> Word {
+  var pid: Word = 0;
+  var was: int32 = n->gate.enter();
+  for i in 0..n->room {
+    if (n->slots[i].pid != 0 && n->slots[i].name == name) {
+      pid = n->slots[i].pid;
+      break;
+    }
+  }
+  n->gate.leave(was);
+  return pid;
+}
+
+// Takes a name away. A name is not taken away when its actor ends: sends to
+// it are then refused as for any actor that is gone.
+export fn AlphNames_forget__ptr(n: AlphNames*, name: Word) {
+  var was: int32 = n->gate.enter();
+  for i in 0..n->room {
+    if (n->slots[i].pid != 0 && n->slots[i].name == name) {
+      n->slots[i].pid = 0;
+    }
+  }
+  n->gate.leave(was);
+}

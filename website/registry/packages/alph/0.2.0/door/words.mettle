@@ -1,0 +1,12 @@
+// What is said to a door and what it says back. They are apart from the
+// door so that a board, which is too small for a door, can still answer.
+
+import "port/port";
+
+export const ALPH_WHERE: Word = -10;  // to a door: arg is a name
+export const ALPH_HERE: Word = -11;   // from a door: arg is the pid with that name, or 0. It comes as from that actor
+
+// The pid of the door on the machine whose places start at first.
+export fn alph_door_of(first: Word) -> Word {
+  return (Word)((first << ALPH_PLACE_SHIFT) | ((Word)1 << ALPH_INDEX_BITS));
+}

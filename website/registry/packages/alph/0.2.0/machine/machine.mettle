@@ -1,0 +1,1549 @@
+// A machine: everything a Linux process needs to be one machine among
+// several, set up in one call. It is the layers put together with sizes
+// that suit most programs: up to 16 cores, 32 actors a core, 8 other
+// machines. A program that needs other sizes puts the layers together
+// itself, as this file does.
+//
+// The first core has the door, a place for each other machine that work
+// can be sent to, and the program's own first actors. Every other core
+// takes work. With a GPU, the last core is the GPU's.
+//
+// Sharing: a kind of job that is shared is done by whichever machine should
+// finish it first. Every machine runs the same program: each says how the
+// kind is done (kind) and that it is shared (share). The machine that asks
+// for work is the one that hands it out.
+//
+// A board on a serial line (src/board) shares too, and a machine has up to
+// four serial lines, a board on each. It has no door and
+// sends no beats, so the machine asks it twice a second which kinds it
+// does. A board that has not answered for two seconds is taken for lost,
+// and found again when it answers. A board gets four jobs at a time and
+// each is one word in and one word out.
+
+import "port/port";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/time/time";
+import "alph/link/link";
+import "alph/name/name";
+import "alph/life/life";
+import "alph/door/door";
+import "alph/place/place";
+import "alph/place/once";
+import "alph/batch/batch";
+import "alph/tether/tether";
+import "alph/tether/relay";
+import "alph/record/record";
+import "alph/record/file";
+import "port/alarm";
+
+const SLOTS: Word = 32;   // actors a core
+const TAKEN: Word = 32;   // jobs taken for other machines at once: two for each of 16 cores
+const ROOM: Word = 16;    // messages a mailbox
+const ALPH_ROUND: Word = -19;  // the steward's timer: ask the boards again
+const WORK_BEGIN: Word = 1;    // to the actor behind work: begin the batch
+const ALPH_TIME: Word = -26;     // one machine's timekeeper to another's: what time is it?
+const ALPH_TIME_IS: Word = -27;  // the answer: the time in arg
+const TIME_TICK: Word = 1;       // the timekeeper's timer
+const TIME_FIRST_MS: Word = 20;  // between askings while the time is being found,
+const TIME_MS: Word = 250;       // and once it is
+const ROUND_MS: Word = 500;
+const QUIET: Word = 4;         // rounds with no answer before a board is taken for lost
+const BOARD_JOBS: Word = 4;    // jobs at a board at once: half its worker's mailbox
+
+// A board this machine shares work with.
+struct AlphOnLine {
+  first: Word;
+  count: Word;      // how many places it has
+  place: Word;      // this machine's place that sends it work
+  up: Word;
+  heard: Word;      // it answered since the last round
+  quiet: Word;      // rounds since it last answered
+  workers: Word[8]; // by kind: its actor that does it, 0 for none
+  asked: Word[8];   // by kind: the ref of the question out to it
+  asked_at: Word;   // when this round's questions went, by this machine's own clock
+  ticks: Word;      // what the board's clock read in the answer its time is taken from, 0 for none yet,
+  ticks_at: Word;   // the machines' time at that moment,
+  ticks_trip: Word; // and the way there and back of that asking
+}
+
+// A job taken for another machine.
+struct AlphTaken {
+  job: AlphJob;
+  from: Word;
+  ref: Word;
+  busy: Word;
+  once: Word;   // it must not be done twice: its end is remembered
+  whole: AlphLong*;       // the long buffer its bytes came in, kept while it runs, 0 for none
+  whole_back: AlphLong*;  // and one for what it gives back, for a kind that gives much
+  bytes: uint8[1024];
+  back: uint8[1024];  // the job's out in the first 8, then the bytes it gives back
+}
+
+// What the actor that serves one shared kind knows.
+struct AlphServing {
+  machine: AlphMachine*;
+  kind: Word;
+}
+
+// One machine: its layers, what it shares, and the memory they work in.
+export struct AlphMachine {
+  cores: AlphCores;
+  link: AlphLink;
+  names: AlphNames;
+  life: AlphLife;
+  door: AlphDoor;
+  time: AlphTime;
+  places: AlphPlaces;
+  far_place: Word;   // the place that sends work to the first other machine
+  far_places: Word[8];  // and to each, in the order they were added
+  peer_count: Word;
+  steward: Word;     // the actor that finds other machines' workers
+  told: Word;        // the program's actor that hears of machines coming and going
+  served: Word;      // jobs done here for other machines
+  shared: Word[8];   // by kind: shared or not
+  asked: Word[64];   // by other machine and kind: the ref of the question to its door
+  serving: AlphServing[8];
+  taken: AlphTaken[32];
+  done: AlphOnce[8];      // by kind: what is remembered of jobs that must not be done twice
+  tether: AlphTether;     // the line to the first board on this machine's own lines,
+  more: AlphTether[3];    // and to the second, third and fourth
+  lines: Word;            // how many boards are on this machine's own lines
+  boards: AlphOnLine[4];  // the boards work is shared with
+  board_count: Word;
+  round_at: Word;         // when the boards are asked next
+  round_owed: Word;       // the word to ask them could not be sent: send it with the next message
+  board_refs: Word;       // refs for questions to boards: small, to fit the 32 bits a line carries
+  // The memory the layers work in.
+  core: AlphCore[16];
+  actors: AlphActor[512];
+  mail: AlphMsg[8192];
+  peers: AlphPeer[8];
+  parcels: AlphParcel[128];
+  name_slots: AlphName[32];
+  watches: AlphWatch[64];
+  keeps: AlphKeep[32];
+  timers: AlphTimer[32];
+  seats: AlphPlace[26];
+  gives: Word[8];         // by kind: the most bytes a job gives back (gives)
+  records: AlphRecord[16];  // by core: the last messages it ran (record)
+  recorded: Word;         // how many cores have one
+  longs: AlphLong[16];    // the link's long buffers, in the program's memory (longs)
+  worked: AlphBatch;      // the batch of the last work (work): its counts are the program's to read
+  work_actor: Word;       // the actor that hands it out
+  work_kind: Word;
+  work_total: Word;
+  work_fill: fn(AlphBatch*, AlphJob*, Word) -> void;
+  work_took: fn(AlphBatch*, AlphJob*, Word) -> void;
+  work_ctx: rawptr;
+  run: Word;              // pieces: how many go in one job,
+  run_first: Word;        // the piece the jobs of this batch start from,
+  run_total: Word;        // how many pieces there are in all,
+  run_least: Word;        // the least time one piece took when tried alone here, in ns,
+  run_least_far: Word;    // and on another machine, the way there and back included,
+  run_undone: Word;       // pieces not done,
+  run_took: fn(Word, Word, rawptr) -> void;  // and the program's function for each answer,
+  run_ctx: rawptr;        // with its own
+  run_bytes: uint8*;      // pieces with bytes: every piece's bytes one after another, 0 for none,
+  run_each: Word;         // and how many a piece has
+  rows_actor: Word;       // the actor that hands the runs out
+  rows_on: Word;          // it is at work
+  rows_out: Word;         // jobs out
+  rows_free: Word;        // slots not in use
+  rows_nudged: Word;
+  rows_from: Word[128];   // by slot: the first piece of the job it carries,
+  rows_len: Word[128];    // how many pieces,
+  rows_half: Word[128];   // and which half of the GPU's answers it has, plus one: 0 for none
+  rows_again: Word;       // runs not done, to hand out again:
+  rows_again_from: Word[130];
+  rows_again_len: Word[130];
+  rows_by: Word[3];       // pieces done each way: ALPH_CPU, ALPH_GPU, ALPH_FAR
+  gpu_outs: Word*[8];     // by kind: the program's memory for the answers of the GPU's jobs (piece_gpu),
+  gpu_room: Word[8];      // and how many fit there
+  gpu_used: Word[2];      // which half of it a job out has
+  gpu_run: Word;          // pieces the GPU's next job takes
+  outs: uint8[73728];     // what each job of several pieces gives back: 512 bytes a slot
+  timekeeper: Word;       // the actor that keeps this machine's time in step with the others' (now)
+  time_off: Word;         // what is added to this machine's own clock to give that time, in ns
+  time_trip: Word;        // the way there and back of the asking it came from, in ns: -1 before any
+  time_asked: Word;       // the ref of the asking that is out, 0 for none,
+  time_sent: Word;        // and when it went, by this machine's own clock
+  time_rounds: Word;      // askings answered
+  time_skew: Word;        // for tests: added to this machine's own clock
+  slots: AlphBatchSlot[128];  // room for the batches tied to this machine (batch)
+  slots_used: Word;
+  far_times: AlphTimes[96];  // each other machine's and board's own times, eight kinds each
+  kinds: AlphKind[8];
+}
+
+// A board stopped doing a kind, or was lost: its place no longer takes the
+// kind, and is told the worker ended so the jobs out to it go elsewhere.
+fn alph_machine_board_shut(a: AlphActor*, m: AlphMachine*, b: AlphOnLine*, kind: Word) {
+  var gone: AlphMsg = { tag: ALPH_ENDED, from: b->workers[kind], arg: ALPH_LOST, ref: 0 };
+  m->places.far_at(b->place, kind, 0);
+  b->workers[kind] = 0;
+  a->node->put(b->place, &gone);
+}
+
+// Asks a board who does each shared kind there. With none shared it is
+// still asked about one, so it is known to be there.
+fn alph_machine_round(a: AlphActor*, m: AlphMachine*, b: AlphOnLine*) {
+  if (b->heard == 0) {
+    b->quiet = b->quiet + 1;
+    if (b->quiet >= QUIET && b->up != 0) {
+      b->up = 0;
+      for k in 0..8 {
+        if (b->workers[k] != 0) {
+          alph_machine_board_shut(a, m, b, (Word)k);
+        }
+      }
+      if (m->told != 0) {
+        a->send(m->told, ALPH_DOWN, b->first);
+      }
+    }
+  } else {
+    b->quiet = 0;
+  }
+  b->heard = 0;
+  b->asked_at = alph_machine_clock(m);
+  if (b->ticks_trip > 0) {
+    b->ticks_trip = b->ticks_trip + (Word)(b->ticks_trip / 8) + 1;
+  }
+  var any: bool = false;
+  for k in 0..8 {
+    b->asked[k] = 0;
+    if (m->shared[k] != 0 || (k == 7 && !any)) {
+      any = true;
+      m->board_refs = m->board_refs + 1;
+      if (m->board_refs >= 1000000) {
+        m->board_refs = 1;
+      }
+      var ask: AlphMsg = { tag: ALPH_WHERE, from: a->pid, arg: ALPH_SHARED + (Word)k, ref: m->board_refs };
+      b->asked[k] = a->node->put(alph_door_of(b->first), &ask);
+      if (b->asked[k] == ALPH_OK) {
+        b->asked[k] = m->board_refs;
+      }
+    }
+  }
+  // Jobs out to the board are looked at here too, in case the places had
+  // no timer free for it.
+  m->places.look(a, b->place);
+}
+
+// A board's answer: whether it does the kind it was asked about, sent as
+// from the actor that does it. Any answer from a board says it is there,
+// one to an earlier round's question too: a busy board answers late.
+fn alph_machine_board_said(a: AlphActor*, m: AlphMachine*, msg: AlphMsg*) -> bool {
+  var place: Word = (Word)(msg->from >> ALPH_PLACE_SHIFT);
+  for i in 0..m->board_count {
+    var b: AlphOnLine* = &m->boards[i];
+    if (place < b->first || place >= b->first + b->count) {
+      continue;
+    }
+    b->heard = 1;
+    for k in 0..8 {
+      if (b->asked[k] != msg->ref || msg->ref <= 0) {
+        continue;
+      }
+      b->asked[k] = 0;
+      var worker: Word = 0;
+      if (msg->arg != 0 && m->shared[k] != 0) {
+        worker = msg->from;
+      }
+      var read: Word = (Word)(msg->arg & 4294967294);
+      if (read != 0) {
+        // The board's clock, read about half the way there and back ago.
+        // The answer with the shortest way is the one its time is taken
+        // from, as between machines.
+        var trip: Word = alph_machine_clock(m) - b->asked_at;
+        if (b->ticks == 0 || trip <= b->ticks_trip) {
+          b->ticks = read;
+          b->ticks_trip = trip;
+          b->ticks_at = m->now() - (Word)(trip / 2);
+        }
+      }
+      if (b->workers[k] != 0 && b->workers[k] != worker) {
+        alph_machine_board_shut(a, m, b, (Word)k);
+      }
+      if (worker != 0) {
+        // Said every round: the place may have shut the kind by itself,
+        // when the way to the board was gone for a moment.
+        b->workers[k] = worker;
+        m->places.far_at(b->place, (Word)k, worker);
+      }
+      // It is up once every question of a round is answered, so the
+      // program hears of it with all its kinds already in place.
+      var owed: bool = false;
+      for q in 0..8 {
+        if (b->asked[q] != 0) {
+          owed = true;
+        }
+      }
+      if (b->up == 0 && !owed) {
+        b->up = 1;
+        if (m->told != 0) {
+          a->send(m->told, ALPH_UP, b->first);
+        }
+      }
+      return true;
+    }
+    return true;
+  }
+  return false;
+}
+
+// Hears of machines coming and going, asks a new one's door for the worker
+// of every shared kind, and gives each one found to that machine's place.
+// It asks the boards the same on a timer.
+fn alph_machine_steward(a: AlphActor*, msg: AlphMsg*) -> Word {
+  var m: AlphMachine* = (AlphMachine*)a->state;
+  if (m->round_owed != 0 && msg->tag != ALPH_ROUND) {
+    var round: AlphMsg = { tag: ALPH_ROUND, from: a->pid, arg: 0, ref: 0 };
+    if (a->node->put(a->pid, &round) == ALPH_OK) {
+      m->round_owed = 0;
+    }
+  }
+  if (msg->tag == ALPH_ROUND) {
+    // If no timer is free the steward sends itself the word, and waits for
+    // the time here. If that cannot be sent either, it goes with the next
+    // message the steward gets.
+    if (alph_now() >= m->round_at) {
+      for i in 0..m->board_count {
+        alph_machine_round(a, m, &m->boards[i]);
+      }
+      m->round_at = alph_now() + alph_ms(ROUND_MS);
+      if (m->time.after(ROUND_MS, a->pid, ALPH_ROUND, 0) > 0) {
+        return 0;
+      }
+    }
+    m->round_owed = 0;
+    if (a->node->put(a->pid, msg) != ALPH_OK) {
+      m->round_owed = 1;
+    }
+    return 0;
+  }
+  if (msg->tag == ALPH_HERE && alph_machine_board_said(a, m, msg)) {
+    return 0;
+  }
+  if (msg->tag == ALPH_UP) {
+    var again: bool = false;
+    for i in 0..m->peer_count {
+      if (m->peers[i].first != msg->arg) {
+        continue;
+      }
+      for k in 0..8 {
+        if (m->shared[k] != 0) {
+          m->asked[i * 8 + k] = m->door.find(a, msg->arg, ALPH_SHARED + (Word)k);
+          if (m->asked[i * 8 + k] == ALPH_FULL) {
+            again = true;
+          }
+        }
+      }
+    }
+    if (again) {
+      // The way to the new machine is full for now: ask again shortly.
+      a->node->put(a->pid, msg);
+      return 0;
+    }
+  } else if (msg->tag == ALPH_HERE && msg->arg != 0) {
+    for i in 0..m->peer_count {
+      for k in 0..8 {
+        if (m->shared[k] != 0 && m->asked[i * 8 + k] == msg->ref) {
+          m->asked[i * 8 + k] = 0;
+          m->places.far_at(m->far_places[i], (Word)k, msg->arg);
+          m->door.watch(m->far_places[i], msg->arg);
+        }
+      }
+    }
+  }
+  if ((msg->tag == ALPH_UP || msg->tag == ALPH_DOWN) && m->told != 0) {
+    a->send(m->told, msg->tag, msg->arg);
+  }
+  return 0;
+}
+
+// Does one shared kind for other machines: takes a job, has this machine's
+// own places run it, and sends the answer back.
+fn alph_machine_serve(a: AlphActor*, msg: AlphMsg*) -> Word {
+  var s: AlphServing* = (AlphServing*)a->state;
+  var m: AlphMachine* = s->machine;
+  if (msg->tag == ALPH_DONE) {
+    var t: AlphTaken* = (AlphTaken*)msg->arg;  // the job is the first thing in it
+    var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: t->job.out, ref: t->ref };
+    var sent: Word = ALPH_OK;
+    // Noted once: this message comes round again when the answer could
+    // not be sent, and by then a copy sent again may have been begun.
+    if (t->once == 1 && t->job.status == ALPH_OK) {
+      m->done[s->kind].done(t->from, t->ref, t->job.out);
+    } else if (t->once == 1) {
+      m->done[s->kind].undo(t->from, t->ref);  // not done: a copy sent again may be
+    }
+    if (t->once == 1) {
+      t->once = 2;
+    }
+    if (t->job.status != ALPH_OK) {
+      answer.tag = ALPH_REFUSED;
+      answer.arg = t->job.status;  // full for now, or gone: no place here can run it
+      sent = a->node->put(t->from, &answer);
+    } else if (t->job.back_count > 0 && t->once == 0) {  // a job done at most once gives no bytes back
+      var back: uint8* = &t->back[0];
+      if (t->whole_back != 0) {
+        back = t->whole_back->bytes;
+      }
+      for i in 0..8 {
+        back[i] = (uint8)(((int64)t->job.out >> ((int64)i * 8)) & 255);
+      }
+      if (t->job.back_count > ALPH_BACK_BYTES) {
+        t->whole_back->count = t->job.back_count + 8;
+        sent = m->link.send_long(a->pid, t->from, ALPH_WORKED_LONG, t->ref, t->whole_back);
+        if (sent == ALPH_OK) {
+          t->whole_back = 0;  // the link's now
+        }
+      } else {
+        sent = m->link.send_bytes(a->pid, t->from, ALPH_WORKED_BYTES, t->ref, back, t->job.back_count + 8);
+      }
+    } else {
+      sent = a->node->put(t->from, &answer);
+    }
+    if (sent == ALPH_FULL && a->node->put(a->pid, msg) == ALPH_OK) {
+      return 0;  // the way back is full for now: the answer is tried again
+    }
+    if (t->whole != 0) {
+      m->link.free(t->whole);
+      t->whole = 0;
+    }
+    if (t->whole_back != 0) {
+      m->link.free(t->whole_back);
+      t->whole_back = 0;
+    }
+    t->busy = 0;
+    return 0;
+  }
+  if (msg->tag == ALPH_HELLO) {
+    if (m->done[s->kind].hello(msg->from, msg->ref)) {
+      var hello: AlphMsg = { tag: ALPH_HELLO, from: a->pid, arg: 0, ref: msg->ref };
+      a->node->put(msg->from, &hello);
+    }
+    return 0;
+  }
+  var once: Word = 0;
+  if (msg->tag == ALPH_WORK_ONCE) {
+    // A job that must not be done twice: one sent again is answered from
+    // what is remembered, and one from an asker not known here is refused
+    // as lost, so that asker knows it cannot tell.
+    var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: 0, ref: msg->ref };
+    var seen: Word = m->done[s->kind].seen(msg->from, msg->ref, &answer.arg);
+    if (seen == ALPH_ONCE_STRANGER) {
+      answer.tag = ALPH_REFUSED;
+      answer.arg = ALPH_LOST;
+    }
+    if (seen == ALPH_ONCE_STRANGER || seen == ALPH_ONCE_DONE) {
+      a->node->put(msg->from, &answer);
+    }
+    if (seen != ALPH_ONCE_RUN) {
+      return 0;
+    }
+    once = 1;
+  } else if (msg->tag != ALPH_WORK && msg->tag != ALPH_WORK_BYTES && msg->tag != ALPH_WORK_LONG) {
+    return 0;
+  }
+  var parcel: AlphParcel* = 0;
+  if (msg->tag == ALPH_WORK_BYTES) {
+    parcel = (AlphParcel*)msg->arg;
+  }
+  var whole: AlphLong* = 0;
+  var whole_back: AlphLong* = 0;
+  var taken: bool = false;
+  var why: Word = ALPH_FULL;
+  var room: bool = true;
+  // A job from a board on this machine's own line is placed as this
+  // machine's own would be, and may go on to another machine. One from
+  // another machine stays here, so that no job goes round, and is refused
+  // if this machine has no way to do the kind itself.
+  var from_board: bool = false;
+  var asker_place: Word = (Word)(msg->from >> ALPH_PLACE_SHIFT);
+  for i in 0..m->board_count {
+    if (asker_place >= m->boards[i].first && asker_place < m->boards[i].first + m->boards[i].count) {
+      from_board = true;
+    }
+  }
+  if (!from_board && m->kinds[s->kind].cpu == 0 && m->kinds[s->kind].gpu == 0) {
+    why = ALPH_GONE;
+    room = false;
+  }
+  if (msg->tag == ALPH_WORK_LONG) {
+    whole = (AlphLong*)msg->arg;
+    if (whole == 0) {
+      why = ALPH_BIG;  // its bytes did not fit a long buffer here
+      room = false;
+    }
+  }
+  if (room && m->gives[s->kind] > ALPH_BACK_BYTES) {
+    // A kind that gives much back: the job gets a long buffer to put it in.
+    if (m->link.long_room == 0 || m->gives[s->kind] + 8 > m->longs[0].room) {
+      why = ALPH_GONE;  // no long buffer here holds that much: this machine cannot do the kind for others
+      room = false;
+    } else {
+      whole_back = m->link.long();
+      room = whole_back != 0;
+    }
+  }
+  for i in 0..TAKEN {
+    if (!room) {
+      break;
+    }
+    var t: AlphTaken* = &m->taken[i];
+    if (t->busy == 0) {
+      t->job.kind = s->kind;
+      t->job.size = 1;
+      t->job.home = ALPH_NOWHERE;
+      t->job.stay = 1;  // it came from another machine: it is not sent on
+      if (from_board) {
+        t->job.stay = 0;
+      }
+      t->job.in = msg->arg;
+      t->job.data = 0;
+      t->job.bytes = 0;
+      t->job.count = 0;
+      t->job.back = &t->back[8];
+      t->job.back_room = ALPH_BACK_BYTES;
+      t->job.back_count = 0;
+      if (parcel != 0) {
+        for at in 0..parcel->count {
+          t->bytes[at] = parcel->bytes[at];
+        }
+        t->job.in = parcel->word;
+        t->job.data = (rawptr)&t->bytes[0];
+        t->job.bytes = &t->bytes[0];
+        t->job.count = parcel->count;
+      }
+      if (whole != 0) {
+        t->job.in = whole->word;
+        t->job.data = (rawptr)whole->bytes;
+        t->job.bytes = whole->bytes;
+        t->job.count = whole->count;
+      }
+      if (whole_back != 0) {
+        t->job.back = whole_back->bytes + 8;
+        t->job.back_room = m->gives[s->kind];
+      }
+      t->whole = 0;
+      t->whole_back = 0;
+      t->from = msg->from;
+      t->ref = msg->ref;
+      t->once = once;
+      why = m->places.ask(a, &t->job);
+      if (why > 0) {
+        if (once != 0) {
+          m->done[s->kind].begin(msg->from, msg->ref);
+        }
+        t->busy = 1;
+        t->whole = whole;
+        t->whole_back = whole_back;
+        taken = true;
+        m->served = m->served + 1;
+      }
+      break;
+    }
+  }
+  if (parcel != 0) {
+    m->link.release(parcel);
+  }
+  if (!taken && whole != 0) {
+    m->link.free(whole);
+  }
+  if (!taken && whole_back != 0) {
+    m->link.free(whole_back);
+  }
+  if (!taken) {
+    var refusal: AlphMsg = { tag: ALPH_REFUSED, from: a->pid, arg: why, ref: msg->ref };
+    a->node->put(msg->from, &refusal);
+  }
+  return 0;
+}
+
+// Sets the machine up with `cores` cores (1 to 16), its places starting at
+// `first`. With gpu, the last core is the GPU's place and takes no other
+// work. Call it before anything else.
+export fn AlphMachine_init__ptr(m: AlphMachine*, cores: Word, first: Word, gpu: bool) {
+  var n: Word = cores;
+  if (n < 1) {
+    n = 1;
+  }
+  if (n > 16) {
+    n = 16;
+  }
+  m->told = 0;
+  m->served = 0;
+  m->rows_actor = 0;
+  m->rows_on = 0;
+  for k in 0..8 {
+    m->gpu_outs[k] = 0;
+    m->gpu_room[k] = 0;
+  }
+  m->recorded = 0;
+  m->slots_used = 0;
+  m->work_actor = 0;
+  for k in 0..8 {
+    m->gives[k] = 0;
+  }
+  m->peer_count = 0;
+  m->board_count = 0;
+  m->round_at = 0;
+  m->lines = 0;
+  m->round_owed = 0;
+  m->board_refs = 0;
+  m->far_place = 0;
+  for k in 0..8 {
+    m->shared[k] = 0;
+    m->far_places[k] = 0;
+    m->serving[k].machine = 0;
+  }
+  for i in 0..64 {
+    m->asked[i] = 0;
+  }
+  for i in 0..TAKEN {
+    m->taken[i].whole = 0;
+    m->taken[i].whole_back = 0;
+    m->taken[i].busy = 0;
+  }
+  m->cores.init(&m->core[0], n, &m->actors[0], SLOTS, &m->mail[0], ROOM);
+  m->link.init(&m->cores, first, &m->peers[0], 8);
+  m->link.parcels(&m->parcels[0], 128);
+  m->names.init(&m->name_slots[0], 32);
+  m->life.init(&m->cores, &m->watches[0], 64, &m->keeps[0], 32);
+  m->door.init(&m->cores, &m->link, &m->names, &m->life);
+  m->steward = m->cores.spawn_on(0, &alph_machine_steward, (rawptr)m);
+  m->door.tell(m->steward);
+  m->time.init(&m->core[0].node, &m->timers[0], 32);
+  m->timekeeper = m->cores.spawn_on(0, &alph_machine_timekeeper, (rawptr)m);
+  m->time_off = 0;
+  m->time_trip = -1;
+  m->time_asked = 0;
+  m->time_rounds = 0;
+  m->time_skew = 0;
+  m->places.init(&m->seats[0], 26, &m->kinds[0], 8);
+  m->places.clock(&m->time);
+  m->places.net(&m->link);
+  var workers: Word = n;
+  if (gpu && n > 1) {
+    workers = n - 1;
+    m->places.on_core(&m->cores, n - 1, ALPH_GPU);
+  }
+  if (workers == 1) {
+    m->places.on_core(&m->cores, 0, ALPH_CPU);  // one core: it takes the work too
+  }
+  for i in 1..workers {
+    m->places.on_core(&m->cores, (Word)i, ALPH_CPU);
+  }
+}
+
+// Another machine: where its places start, how many it has, and where it
+// listens. It gets a place of its own here, which work for it goes through.
+// Returns ALPH_FULL after eight.
+export fn AlphMachine_peer__ptr(m: AlphMachine*, first: Word, count: Word, ip: uint32, port: int64) -> Word {
+  if (m->peer_count >= 8 || m->link.peer(first, count, ip, port) != ALPH_OK) {
+    return ALPH_FULL;
+  }
+  m->far_places[m->peer_count] = m->places.on_core(&m->cores, 0, ALPH_FAR);
+  m->places.own(m->far_places[m->peer_count], &m->far_times[m->peer_count * 8], 8);
+  var wide: Word = count;
+  if (wide > 1) {
+    wide = wide - 1;  // its first core hands the work out
+  }
+  m->places.wide(m->far_places[m->peer_count], wide);
+  if (m->peer_count == 0) {
+    m->far_place = m->far_places[0];
+  }
+  m->peer_count = m->peer_count + 1;
+  return ALPH_OK;
+}
+
+// A board this machine shares work with: its places are first, first + 1, ...
+fn alph_machine_board(m: AlphMachine*, first: Word, count: Word) -> Word {
+  if (m->board_count >= 4) {
+    return ALPH_FULL;
+  }
+  var b: AlphOnLine* = &m->boards[m->board_count];
+  b->first = first;
+  b->count = count;
+  b->up = 0;
+  b->heard = 0;
+  b->quiet = 0;
+  b->asked_at = 0;
+  b->ticks = 0;
+  b->ticks_at = 0;
+  b->ticks_trip = 0;
+  for k in 0..8 {
+    b->workers[k] = 0;
+    b->asked[k] = 0;
+  }
+  b->place = m->places.on_core(&m->cores, 0, ALPH_FAR);
+  if (b->place == 0) {
+    return ALPH_FULL;
+  }
+  m->places.limit(b->place, BOARD_JOBS);
+  m->places.own(b->place, &m->far_times[(8 + m->board_count) * 8], 8);
+  m->board_count = m->board_count + 1;
+  if (m->board_count == 1) {
+    var round: AlphMsg = { tag: ALPH_ROUND, from: m->steward, arg: 0, ref: 0 };
+    m->cores.cores[0].node.put(m->steward, &round);
+  }
+  // A board asks this machine for work, and the machine places it as its
+  // own: a kind it only sends is taken from a board all the same.
+  for k in 0..8 {
+    if (m->shared[k] != 0) {
+      alph_machine_serves(m, (Word)k);
+    }
+  }
+  return ALPH_OK;
+}
+
+// The actor that takes jobs of a shared kind from others, made once.
+fn alph_machine_serves(m: AlphMachine*, kind: Word) -> Word {
+  if (m->serving[kind].machine != 0) {
+    return ALPH_OK;
+  }
+  m->serving[kind].kind = kind;
+  m->done[kind].init();
+  var pid: Word = m->cores.spawn_on(0, &alph_machine_serve, (rawptr)&m->serving[kind]);
+  if (pid == 0) {
+    return ALPH_FULL;
+  }
+  m->serving[kind].machine = m;
+  return m->names.set(ALPH_SHARED + kind, pid);
+}
+
+// A board on one of this machine's serial lines (src/board): where its
+// places start and how many it has. This machine passes the board's mail
+// on, so the other machines and its other boards reach it too. Give the
+// port the line's descriptor first (alph_line_open): the board is on the
+// line opened last. Call it before start and run, once for each board, up
+// to four. Returns ALPH_FULL when there is no room for it.
+export fn AlphMachine_board__ptr(m: AlphMachine*, first: Word, count: Word) -> Word {
+  if (m->lines >= 4) {
+    return ALPH_FULL;
+  }
+  var out: Word = alph_machine_board(m, first, count);
+  if (out == ALPH_OK) {
+    m->line(m->lines)->relay(&m->link, first, count);
+    m->lines = m->lines + 1;
+  }
+  return out;
+}
+
+// The line to the n-th board added with board, counted from 0: for making
+// it sure (AlphTether_sure), say. 0 when n is not 0 to 3.
+export fn AlphMachine_line__ptr(m: AlphMachine*, n: Word) -> AlphTether* {
+  if (n == 0) {
+    return &m->tether;
+  }
+  if (n < 0 || n > 3) {
+    return 0;
+  }
+  return &m->more[n - 1];
+}
+
+// A board on another machine's serial line: peer is where that machine's
+// places start, and it must be a peer already. Returns ALPH_GONE when it
+// is not, ALPH_FULL when there is no room for the board.
+export fn AlphMachine_beyond__ptr(m: AlphMachine*, peer: Word, first: Word, count: Word) -> Word {
+  if (m->link.through(peer, first, count) != ALPH_OK) {
+    return ALPH_GONE;
+  }
+  return alph_machine_board(m, first, count);
+}
+
+// Says how a kind of job (0 to 7) is done on a core and on the GPU, 0 for a
+// way it does not have.
+export fn AlphMachine_kind__ptr(m: AlphMachine*, kind: Word, cpu: fn(AlphJob*) -> Word, gpu: fn(AlphJob*) -> Word) {
+  if (kind >= 0 && kind < 8) {
+    m->places.kind(kind, cpu, gpu);
+  }
+}
+
+// Shares a kind with the other machines: this machine does it for them, and
+// its own jobs of the kind may go to them. Call it after kind, on every
+// machine that should take part. A machine with no way of its own to do
+// the kind (kind was given 0 and 0) only sends it: that is how work only a
+// board can do, such as moving an arm, is asked for here. A job a board on
+// this machine's line asks for is placed as this machine's own, on its
+// cores, its GPU or another machine, so a board reaches all of them. Only jobs with no
+// home (a word in, or bytes) leave a machine. Returns ALPH_FULL when the
+// first core has no room for one more actor, ALPH_GONE for a kind that is
+// not 0 to 7.
+export fn AlphMachine_share__ptr(m: AlphMachine*, kind: Word) -> Word {
+  if (kind < 0 || kind >= 8) {
+    return ALPH_GONE;
+  }
+  m->shared[kind] = 1;
+  if (m->kinds[kind].cpu == 0 && m->kinds[kind].gpu == 0 && m->board_count == 0) {
+    return ALPH_OK;
+  }
+  return alph_machine_serves(m, kind);
+}
+
+// Gives the machine long buffers, so that a job for another machine can
+// carry more bytes than a parcel holds, and give more back: `count` of
+// them (up to 16), each of `each` bytes, in `memory`, which must hold
+// count times each. A job's bytes, or what it gives back and eight bytes
+// more, must fit one. Half are kept for what arrives. Call it on every
+// machine, before start.
+export fn AlphMachine_longs__ptr(m: AlphMachine*, memory: uint8*, each: Word, count: Word) {
+  var n: Word = count;
+  if (n > 16) {
+    n = 16;
+  }
+  m->link.longs(&m->longs[0], n, memory, each);
+}
+
+// Says that a job of this kind (0 to 7) gives back up to `bytes` bytes.
+// Needed only for more than ALPH_BACK_BYTES: a job taken for another
+// machine then gets a long buffer to put them in (see longs). Call it on
+// every machine.
+export fn AlphMachine_gives__ptr(m: AlphMachine*, kind: Word, bytes: Word) {
+  if (kind >= 0 && kind < 8) {
+    m->gives[kind] = bytes;
+  }
+}
+
+// Ties a batch to this machine, in place of the batch's own init, with
+// room for two pieces out for each core at work here and on the machines
+// it was given, for what each board holds, and for sixteen answers on
+// their way. Call it after the last peer
+// and board. The machine has room for 128
+// pieces out over all its batches: a batch that finds less left than it
+// could use takes what there is, or keeps its own sixteen.
+export fn AlphMachine_batch__ptr(m: AlphMachine*, b: AlphBatch*) {
+  b->init(&m->places);
+  var room: Word = ROOM;  // answers on their way hold a slot each: a mailbox of them
+  for i in 0..m->places.count {
+    room = room + (Word)(m->seats[i].wide * 2);
+    if (m->seats[i].wide == 0) {
+      room = room + m->seats[i].limit;  // a board: what it holds at once
+    }
+  }
+  if (room > 128 - m->slots_used) {
+    room = 128 - m->slots_used;
+  }
+  if (room > 16) {
+    b->wide(&m->slots[m->slots_used], room);
+    m->slots_used = m->slots_used + room;
+  }
+}
+
+// Says that a job of this kind (0 to 7) is never done twice, whatever is
+// lost on the way: see AlphPlaces_once. Call it after kind, on every
+// machine. A piece whose worker was lost comes back with the status
+// ALPH_LOST.
+export fn AlphMachine_once__ptr(m: AlphMachine*, kind: Word) {
+  if (kind >= 0 && kind < 8) {
+    m->places.once(kind);
+  }
+}
+
+// The program's actor that is told ALPH_UP and ALPH_DOWN as other machines
+// come and go.
+export fn AlphMachine_tell__ptr(m: AlphMachine*, pid: Word) {
+  m->told = pid;
+}
+
+// Listens on a port and joins the other machines. Returns ALPH_GONE when
+// the port cannot be had. A machine with no peers need not call it.
+export fn AlphMachine_start__ptr(m: AlphMachine*, port: int64) -> Word {
+  var out: Word = m->link.start(port);
+  if (out == ALPH_OK && m->peer_count > 0) {
+    m->cores.send(m->timekeeper, TIME_TICK, 0);
+  }
+  return out;
+}
+
+// Tells the records what time it is, so their entries can be read in the
+// machines' time.
+fn alph_machine_recorded(m: AlphMachine*) {
+  if (m->recorded == 0) {
+    return;
+  }
+  var stamp: Word = alph_record_stamp();
+  var now: Word = m->now();
+  for i in 0..m->recorded {
+    m->records[i].at(stamp, now);
+  }
+}
+
+// Keeps a record of the last messages every core ran, with their times
+// (src/record), in the program's memory: a file's (alph_record_file) to
+// have it when the program is gone. Call it after init and before run.
+// Returns how many messages are kept for each core, 0 when the memory is
+// too small. To print the last 20:
+// alph_record_show(&m.records[0], m.recorded, 20).
+export fn AlphMachine_record__ptr(m: AlphMachine*, memory: uint8*, bytes: Word) -> Word {
+  var n: Word = m->cores.count;
+  var room: Word = alph_records_init(&m->records[0], n, memory, bytes);
+  if (room == 0) {
+    return 0;
+  }
+  var per_ms: Word = alph_record_per_ms();
+  for i in 0..n {
+    m->records[i].timed(&alph_record_stamp, per_ms);
+    m->records[i].on(&m->core[i].node);
+  }
+  m->recorded = n;
+  alph_machine_recorded(m);
+  return room;
+}
+
+fn alph_machine_clock(m: AlphMachine*) -> Word {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]) + m->time_skew;
+}
+
+// The time the machines agree on, in nanoseconds. Every machine follows
+// the one with the lowest places among those it reaches, so all of them
+// read about the same time at the same moment: within the way to that
+// machine and back, which apart says. Use it to stamp what one machine
+// measures so that another can order it, or to act at the same moment on
+// several. It can step by that much when a better asking comes in. A
+// machine with no peers reads its own clock.
+export fn AlphMachine_now__ptr(m: AlphMachine*) -> Word {
+  return alph_machine_clock(m) + m->time_off;
+}
+
+// The machines' time (now) at which a board's clock read `ticks`: a stamp
+// the board took with its alph_now and sent along with what it measured.
+// The board must have set its clock (AlphBoard's clock) and be on this
+// machine's own line, with its first place `first`. A board's tick is
+// 1,024 microseconds, so this is good to a millisecond or two, and to the
+// way to the board and back. Returns -1 while the board's clock has not
+// been heard.
+export fn AlphMachine_board_now__ptr(m: AlphMachine*, first: Word, ticks: Word) -> Word {
+  for i in 0..m->board_count {
+    var b: AlphOnLine* = &m->boards[i];
+    if (b->first == first && b->ticks != 0) {
+      // The board counts in 32 bits and goes round every 50 days: the
+      // stamp is taken as the one nearest the last reading.
+      var since: int64 = (int64)(int32)((int64)ticks - (int64)b->ticks);
+      return b->ticks_at + (Word)(since * 1024000);
+    }
+  }
+  return -1;
+}
+
+// How far now may be from the time of the machine this one follows, in
+// nanoseconds: half the way there and back of the asking it was set from.
+// 0 on the machine the others follow, and -1 on one that has not heard
+// from it yet.
+export fn AlphMachine_apart__ptr(m: AlphMachine*) -> Word {
+  if (m->time_trip < 0) {
+    for i in 0..m->peer_count {
+      if (m->peers[i].first < m->link.cores->first && m->link.reaches(m->peers[i].first)) {
+        return -1;
+      }
+    }
+    return 0;
+  }
+  return (Word)(m->time_trip / 2);
+}
+
+// Keeps this machine's time in step. On its timer it asks the machine with
+// the lowest places it reaches, if those are lower than its own, what time
+// it is. The answer is that machine's time when it answered. Half the way
+// there and back has passed since, so the time now is the answer plus
+// that, and the asking with the shortest way is the one to trust: its
+// answer was least in doubt. An older asking's way is counted an eighth
+// longer each round, so a clock that drifts is followed. The machine the
+// others follow asks nobody. If it is lost, the next lowest goes on from
+// the time it had, so the time does not jump.
+fn alph_machine_timekeeper(a: AlphActor*, msg: AlphMsg*) -> Word {
+  var m: AlphMachine* = (AlphMachine*)a->state;
+  if (msg->tag == ALPH_TIME) {
+    a->reply(msg, ALPH_TIME_IS, m->now());
+    return 0;
+  }
+  if (msg->tag == ALPH_TIME_IS) {
+    if (msg->ref != m->time_asked || m->time_asked == 0) {
+      return 0;  // the answer to an asking given up
+    }
+    var here: Word = alph_machine_clock(m);
+    var trip: Word = here - m->time_sent;
+    m->time_asked = 0;
+    m->time_rounds = m->time_rounds + 1;
+    if (m->time_trip < 0 || trip <= m->time_trip) {
+      m->time_trip = trip;
+      m->time_off = msg->arg + (Word)(trip / 2) - here;
+    }
+    return 0;
+  }
+  if (msg->tag != TIME_TICK) {
+    return 0;
+  }
+  alph_machine_recorded(m);
+  var mine: Word = m->link.cores->first;
+  var lead: Word = mine;
+  for i in 0..m->peer_count {
+    if (m->peers[i].first < lead && m->link.reaches(m->peers[i].first)) {
+      lead = m->peers[i].first;
+    }
+  }
+  if (lead != mine) {
+    if (m->time_trip > 0) {
+      m->time_trip = m->time_trip + (Word)(m->time_trip / 8) + 1;
+    }
+    m->time_sent = alph_machine_clock(m);
+    m->time_asked = a->ask((Word)(a->pid - ((mine - lead) << ALPH_PLACE_SHIFT)), ALPH_TIME, 0);
+    if (m->time_asked < 0) {
+      m->time_asked = 0;
+    }
+  }
+  var wait: Word = TIME_MS;
+  if (m->time_rounds < 8) {
+    wait = TIME_FIRST_MS;
+  }
+  m->time.after(wait, a->pid, TIME_TICK, 0);
+  return 0;
+}
+
+// The actor behind work: begins the batch, takes its answers, and stops
+// the cores when all are back.
+fn alph_machine_work(a: AlphActor*, msg: AlphMsg*) -> Word {
+  var m: AlphMachine* = (AlphMachine*)a->state;
+  if (msg->tag == WORK_BEGIN) {
+    m->worked.begin(a, m->work_kind, m->work_total, m->work_fill, m->work_took, m->work_ctx);
+  } else if (!m->worked.took(a, msg)) {
+    return 0;
+  }
+  if (m->worked.over()) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+// Does `total` pieces of a kind of work and returns when every one is
+// answered: the short way to use a batch. fill and took are a batch's (see
+// AlphBatch_begin), and so is ctx. fill may be 0 when a piece needs only
+// its number, which is the job's in. It runs the cores on this thread, so
+// call it from the program's main thread, after kind, the peers and start,
+// and not from an actor. It can be called again for more work. Returns
+// how many pieces were not done: those no place could run and those lost
+// with their worker. m->worked is the batch, for its counts by way.
+export fn AlphMachine_work__ptr(m: AlphMachine*, kind: Word, total: Word,
+                                fill: fn(AlphBatch*, AlphJob*, Word) -> void,
+                                took: fn(AlphBatch*, AlphJob*, Word) -> void, ctx: rawptr) -> Word {
+  if (m->work_actor == 0) {
+    m->batch(&m->worked);
+    m->work_actor = m->cores.spawn_on(0, &alph_machine_work, (rawptr)m);
+    if (m->work_actor == 0) {
+      return total;
+    }
+  }
+  m->work_kind = kind;
+  m->work_total = total;
+  m->work_fill = fill;
+  m->work_took = took;
+  m->work_ctx = ctx;
+  if (m->cores.send(m->work_actor, WORK_BEGIN, 0) != ALPH_OK) {
+    return total;
+  }
+  m->cores.run();
+  return m->worked.gone + m->worked.lost;
+}
+
+// How one piece of each kind is done, for piece and pieces. One table for
+// the process: every machine in it runs the same program.
+struct AlphPiece {
+  run: fn(Word) -> Word;
+  with: fn(Word, uint8*, Word) -> Word;  // when every piece has bytes of its own
+  gpu: fn(Word, uint8*, Word, Word, Word*) -> Word;  // a run of them on the GPU, 0 for none
+}
+
+var g_piece: AlphPiece[8];
+
+const RUN_SHIFT: Word = 40;        // a job's in: the first piece below this bit, how many above it
+const RUN_MOST: Word = 64;         // the most pieces in one job: their answers are 8 bytes each
+const RUN_NS: Word = 250000;       // the work a job should hold, so that handing it out costs little
+const RUN_TRIED: Word = 32;        // pieces done alone first, to time one
+const GPU_FIRST: Word = 256;       // pieces in the GPU's first job,
+const GPU_NS: Word = 1000000;      // doubled while a job takes it less than this
+const ROWS_MORE: Word = 2;         // to the actor that hands the runs out: try again
+
+// The same for pieces with bytes: the job's bytes are its pieces' bytes one
+// after another, the same number for each.
+fn alph_machine_pieces_of(job: AlphJob*, with: fn(Word, uint8*, Word) -> Word, first: Word, count: Word) -> Word {
+  if (job->bytes == 0 || job->count <= 0) {
+    return 1;
+  }
+  if (count <= 0) {
+    job->out = with(first, job->bytes, job->count);
+    return 0;
+  }
+  var each: Word = (Word)(job->count / count);
+  if (job->back == 0 || job->back_room < (Word)(count * 8) || (Word)(each * count) != job->count) {
+    return 1;
+  }
+  for i in 0..count {
+    var out: int64 = (int64)with(first + (Word)i, job->bytes + (Word)((Word)i * each), each);
+    for b in 0..8 {
+      job->back[(Word)i * 8 + (Word)b] = (uint8)((out >> ((int64)b * 8)) & 255);
+    }
+  }
+  job->back_count = (Word)(count * 8);
+  job->out = count;
+  return 0;
+}
+
+// The job behind piece_gpu: the same pieces, done all at once by the
+// program's function for the GPU.
+fn alph_machine_pieces_gpu(job: AlphJob*) -> Word {
+  var f: fn(Word, uint8*, Word, Word, Word*) -> Word = g_piece[job->kind].gpu;
+  var count: Word = (Word)(job->in >> RUN_SHIFT);
+  var first: Word = (Word)(job->in - (count << RUN_SHIFT));
+  if (f == 0) {
+    return 1;
+  }
+  if (count <= 0) {
+    var one: Word = 0;
+    if (f(first, job->bytes, job->count, 1, &one) != 0) {
+      return 1;
+    }
+    job->out = one;
+    return 0;
+  }
+  if (job->back == 0 || job->back_room < (Word)(count * 8)) {
+    return 1;
+  }
+  if (f(first, job->bytes, (Word)(job->count / count), count, (Word*)job->back) != 0) {
+    return 1;
+  }
+  job->back_count = (Word)(count * 8);
+  job->out = count;
+  return 0;
+}
+
+// The job behind piece: one piece when the in is its number alone, which
+// is also what a board is asked, and a run of them when a count is above
+// it. A run's answers go back as bytes, 8 a piece.
+fn alph_machine_pieces(job: AlphJob*) -> Word {
+  var f: fn(Word) -> Word = g_piece[job->kind].run;
+  var with: fn(Word, uint8*, Word) -> Word = g_piece[job->kind].with;
+  var count: Word = (Word)(job->in >> RUN_SHIFT);
+  var first: Word = (Word)(job->in - (count << RUN_SHIFT));
+  if (with != 0) {
+    return alph_machine_pieces_of(job, with, first, count);
+  }
+  if (f == 0) {
+    return 1;
+  }
+  if (count <= 0) {
+    job->out = f(job->in);
+    return 0;
+  }
+  if (job->back == 0 || job->back_room < (Word)(count * 8)) {
+    return 1;
+  }
+  for i in 0..count {
+    var out: int64 = (int64)f(first + (Word)i);
+    for b in 0..8 {
+      job->back[(Word)i * 8 + (Word)b] = (uint8)((out >> ((int64)b * 8)) & 255);
+    }
+  }
+  job->back_count = (Word)(count * 8);
+  job->out = count;
+  return 0;
+}
+
+// Says how one piece of a kind (0 to 7) is done: a function from a number
+// to a number, with nothing else going in or out, so it can run on any
+// core of any machine. It takes the place of kind for such work, and
+// pieces then hands the work out. A board shares the same function with
+// AlphBoard_share. Call it on every machine, then share.
+export fn AlphMachine_piece__ptr(m: AlphMachine*, kind: Word, run: fn(Word) -> Word) {
+  if (kind >= 0 && kind < 8) {
+    g_piece[kind].run = run;
+    g_piece[kind].with = 0;
+    g_piece[kind].gpu = 0;
+    m->places.kind(kind, &alph_machine_pieces, 0);
+  }
+}
+
+// As piece, for work where every piece has bytes of its own: a record, a
+// packet, a row. The function is given the piece's number, its bytes and
+// how many they are, and returns a number. It must read nothing else, so
+// it can run on any core of any machine. pieces_of then hands the work
+// out. Call it on every machine, then share.
+export fn AlphMachine_piece_of__ptr(m: AlphMachine*, kind: Word, run: fn(Word, uint8*, Word) -> Word) {
+  if (kind >= 0 && kind < 8) {
+    g_piece[kind].run = 0;
+    g_piece[kind].with = run;
+    g_piece[kind].gpu = 0;
+    m->places.kind(kind, &alph_machine_pieces, 0);
+  }
+}
+
+// Says how pieces of a kind set up with piece or piece_of are done on the
+// GPU, many at once: run(first, bytes, each, count, outs) does pieces
+// first to first + count - 1 and puts what each gives in outs. bytes is
+// the first one's and each how many a piece has, both 0 for a kind with no
+// bytes. It returns 0, or non-zero when there is no GPU, after which the
+// GPU is not tried again. It runs on the GPU's own core, which the machine
+// has when init was told so. outs is the program's memory for the answers
+// of the GPU's jobs, with room for `room` of them: two jobs share it, so
+// one job is at most half of it. The GPU is given much bigger jobs than a
+// core, since starting one costs it the same for one piece as for
+// thousands. Call it after piece or piece_of.
+export fn AlphMachine_piece_gpu__ptr(m: AlphMachine*, kind: Word, run: fn(Word, uint8*, Word, Word, Word*) -> Word,
+                                     outs: Word*, room: Word) {
+  if (kind >= 0 && kind < 8) {
+    g_piece[kind].gpu = run;
+    m->gpu_outs[kind] = outs;
+    m->gpu_room[kind] = room;
+    m->places.kind(kind, &alph_machine_pieces, &alph_machine_pieces_gpu);
+    m->places.fit(kind, &alph_machine_rows_fit, (rawptr)m);
+  }
+}
+
+// A place was picked for a job of pieces. When it is the GPU, the job
+// takes the pieces after its own too, as many as the GPU's jobs now hold,
+// and its answers go into the program's memory.
+fn alph_machine_rows_fit(job: AlphJob*, way: Word, ctx: rawptr) {
+  var m: AlphMachine* = (AlphMachine*)ctx;
+  var off: int64 = (int64)job - (int64)m->worked.slots;
+  if (way != ALPH_GPU || m->rows_on == 0 || off < 0 || off >= (int64)m->worked.room * (int64)sizeof(AlphBatchSlot)) {
+    return;
+  }
+  var slot: Word = (Word)(off / (int64)sizeof(AlphBatchSlot));
+  var room: Word = (Word)(m->gpu_room[job->kind] / 2);
+  var from: Word = m->rows_from[slot];
+  var len: Word = m->rows_len[slot];
+  var half: Word = 0;
+  if (m->gpu_used[0] != 0) {
+    half = 1;
+  }
+  if (m->gpu_outs[job->kind] == 0 || len > room || m->gpu_used[half] != 0) {
+    return;
+  }
+  var want: Word = m->gpu_run;
+  if (want > room) {
+    want = room;
+  }
+  if (want > m->run_total - from) {
+    want = m->run_total - from;
+  }
+  if (from + len == m->run_first && want > len) {
+    m->run_first = from + want;  // its pieces were the last handed out: it takes the ones after them
+    len = want;
+  }
+  m->gpu_used[half] = 1;
+  m->rows_half[slot] = half + 1;
+  m->rows_len[slot] = len;
+  job->in = (Word)(from + (len << RUN_SHIFT));
+  if (m->run_bytes != 0) {
+    job->count = (Word)(len * m->run_each);
+  }
+  job->back = (uint8*)(m->gpu_outs[job->kind] + (Word)(half * room));
+  job->back_room = (Word)(room * 8);
+}
+
+// Hands out runs of pieces while there are slots and places for them: the
+// runs not done first, then the next pieces.
+fn alph_machine_rows_more(a: AlphActor*, m: AlphMachine*) {
+  var b: AlphBatch* = &m->worked;
+  while (m->rows_free > 0) {
+    var from: Word = 0;
+    var len: Word = 0;
+    if (m->rows_again > 0) {
+      var top: Word = m->rows_again - 1;
+      from = m->rows_again_from[top];
+      len = m->rows_again_len[top];
+      if (len > m->run) {
+        // A job of the GPU's that was not done: back in runs a core takes.
+        m->rows_again_from[top] = from + m->run;
+        m->rows_again_len[top] = len - m->run;
+        len = m->run;
+      } else {
+        m->rows_again = top;
+      }
+    } else if (m->run_first < m->run_total) {
+      from = m->run_first;
+      len = m->run_total - from;
+      if (len > m->run) {
+        len = m->run;
+      }
+      m->run_first = from + len;
+    } else {
+      break;
+    }
+    var slot: Word = b->slots[m->rows_free - 1].free;
+    var job: AlphJob* = &b->slots[slot].job;
+    job->kind = m->work_kind;
+    job->size = len;
+    job->home = ALPH_NOWHERE;
+    job->data = 0;
+    job->stay = 0;
+    job->in = from;
+    job->bytes = 0;
+    job->count = 0;
+    job->back = 0;
+    job->back_room = 0;
+    job->back_count = 0;
+    if (m->run_bytes != 0) {
+      job->bytes = m->run_bytes + (Word)(from * m->run_each);
+      job->count = (Word)(len * m->run_each);
+    }
+    if (m->run > 1) {
+      job->in = (Word)(from + (len << RUN_SHIFT));
+      job->back = &m->outs[slot * 512];
+      job->back_room = 512;
+    }
+    m->rows_from[slot] = from;
+    m->rows_len[slot] = len;
+    m->rows_half[slot] = 0;
+    var asked: Word = m->places.offer(a, job);
+    if (asked > 0) {
+      m->rows_free = m->rows_free - 1;
+      m->rows_out = m->rows_out + 1;
+      continue;
+    }
+    if (m->rows_half[slot] != 0) {
+      m->gpu_used[m->rows_half[slot] - 1] = 0;
+    }
+    if (asked == ALPH_GONE) {
+      m->run_undone = m->run_undone + m->rows_len[slot];  // no place can do the kind
+      b->gone = b->gone + 1;
+      continue;
+    }
+    // No place has room now: the run waits. With jobs out, the next answer
+    // tries again. With none out the actor is sent a word to, two
+    // milliseconds on, so it does not spin.
+    m->rows_again_from[m->rows_again] = m->rows_from[slot];
+    m->rows_again_len[m->rows_again] = m->rows_len[slot];
+    m->rows_again = m->rows_again + 1;
+    if (m->rows_out == 0 && m->rows_nudged == 0) {
+      if (m->time.after(2, a->pid, ROWS_MORE, 0) > 0 || a->send(a->pid, ROWS_MORE, 0) == ALPH_OK) {
+        m->rows_nudged = 1;
+      }
+    }
+    return;
+  }
+}
+
+// A job of pieces is back: each piece's answer goes to the program, or the
+// run is handed out again.
+fn alph_machine_rows_took(m: AlphMachine*, job: AlphJob*) {
+  var b: AlphBatch* = &m->worked;
+  var slot: Word = alph_machine_run_slot(m, job);
+  var from: Word = m->rows_from[slot];
+  var len: Word = m->rows_len[slot];
+  var count: Word = (Word)(job->in >> RUN_SHIFT);
+  m->rows_out = m->rows_out - 1;
+  b->slots[m->rows_free].free = slot;
+  m->rows_free = m->rows_free + 1;
+  if (job->status == ALPH_LOST || (job->status == ALPH_OK && count > 0 && job->back_count != (Word)(len * 8))) {
+    m->run_undone = m->run_undone + len;
+    b->lost = b->lost + 1;
+  } else if (job->status != ALPH_OK) {
+    m->rows_again_from[m->rows_again] = from;
+    m->rows_again_len[m->rows_again] = len;
+    m->rows_again = m->rows_again + 1;
+  } else {
+    b->by_way[job->way] = b->by_way[job->way] + 1;
+    b->total = b->total + 1;
+    m->rows_by[job->way] = m->rows_by[job->way] + len;
+    if (count <= 0) {
+      m->run_took(from, job->out, m->run_ctx);
+    }
+    for i in 0..count {
+      var out: int64 = 0;
+      for byte in 0..8 {
+        out = out | ((int64)job->back[(Word)i * 8 + (Word)byte] << ((int64)byte * 8));
+      }
+      m->run_took(from + (Word)i, (Word)out, m->run_ctx);
+    }
+    // The GPU's jobs grow while one is done quickly: starting one costs
+    // the same however many pieces it holds.
+    if (job->way == ALPH_GPU && len >= m->gpu_run && job->ns < GPU_NS && m->gpu_run < m->gpu_room[job->kind]) {
+      m->gpu_run = m->gpu_run * 2;
+    }
+  }
+  if (m->rows_half[slot] != 0) {
+    m->gpu_used[m->rows_half[slot] - 1] = 0;
+    m->rows_half[slot] = 0;
+  }
+}
+
+// The actor that hands out runs of pieces: it begins, takes each job
+// back, and stops the cores when every piece is answered.
+fn alph_machine_rows(a: AlphActor*, msg: AlphMsg*) -> Word {
+  var m: AlphMachine* = (AlphMachine*)a->state;
+  if (msg->tag == ALPH_DONE) {
+    alph_machine_rows_took(m, (AlphJob*)msg->arg);
+  } else if (msg->tag == ROWS_MORE) {
+    m->rows_nudged = 0;
+  } else if (msg->tag != WORK_BEGIN) {
+    return 0;
+  }
+  alph_machine_rows_more(a, m);
+  if (m->rows_out == 0 && m->rows_again == 0 && m->run_first >= m->run_total) {
+    a->cores()->stop();
+  }
+  return 0;
+}
+
+// Hands out the pieces from run_first on, in runs, and returns when all
+// are answered.
+fn alph_machine_rows_all(m: AlphMachine*, kind: Word) {
+  var b: AlphBatch* = &m->worked;
+  if (m->rows_actor == 0) {
+    m->rows_actor = m->cores.spawn_on(0, &alph_machine_rows, (rawptr)m);
+  }
+  if (m->rows_actor == 0 || b->room > 128) {
+    m->run_undone = m->run_undone + m->run_total - m->run_first;
+    return;
+  }
+  m->work_kind = kind;
+  m->rows_out = 0;
+  m->rows_again = 0;
+  m->rows_nudged = 0;
+  m->rows_free = b->room;
+  for i in 0..b->room {
+    b->slots[i].free = (Word)i;
+  }
+  m->gpu_used[0] = 0;
+  m->gpu_used[1] = 0;
+  m->gpu_run = GPU_FIRST;
+  for i in 0..3 {
+    b->by_way[i] = 0;
+    m->rows_by[i] = 0;
+  }
+  b->total = 0;
+  b->gone = 0;
+  b->lost = 0;
+  m->rows_on = 1;
+  if (m->cores.send(m->rows_actor, WORK_BEGIN, 0) != ALPH_OK) {
+    m->run_undone = m->run_undone + m->run_total - m->run_first;
+  } else {
+    m->cores.run();
+  }
+  m->rows_on = 0;
+}
+
+fn alph_machine_run_slot(m: AlphMachine*, job: AlphJob*) -> Word {
+  return (Word)(((int64)job - (int64)m->worked.slots) / (int64)sizeof(AlphBatchSlot));
+}
+
+// The first pieces go one to a job, through a batch, to time one.
+fn alph_machine_run_fill(b: AlphBatch*, job: AlphJob*, at: Word) {
+  var m: AlphMachine* = (AlphMachine*)b->ctx;
+  if (m->run_bytes != 0) {
+    job->bytes = m->run_bytes + (Word)(at * m->run_each);
+    job->count = m->run_each;
+  }
+}
+
+fn alph_machine_run_took(b: AlphBatch*, job: AlphJob*, at: Word) {
+  var m: AlphMachine* = (AlphMachine*)b->ctx;
+  if (job->status != ALPH_OK) {
+    m->run_undone = m->run_undone + 1;
+    return;
+  }
+  if (job->way == ALPH_CPU && (m->run_least == 0 || job->ns < m->run_least)) {
+    m->run_least = job->ns;
+  }
+  if (job->way == ALPH_FAR && (m->run_least_far == 0 || job->ns < m->run_least_far)) {
+    m->run_least_far = job->ns;
+  }
+  m->run_took(at, job->out, m->run_ctx);
+}
+
+// Does pieces 0 to total - 1 of a kind set up with piece, and returns when
+// all are answered. took is called with each piece's number, what it gave,
+// and ctx. Pieces of little work are handed out several to a job, so that
+// handing out costs little beside the work: the first few are done alone
+// to time one, and the rest go in jobs of about a quarter of a millisecond
+// of work, up to 64 pieces. A GPU set up with piece_gpu gets much bigger
+// jobs. Call it as work is called. Returns how many pieces were not done.
+// Afterwards m->rows_by says how many pieces each way did (ALPH_CPU,
+// ALPH_GPU, ALPH_FAR), the first few aside.
+export fn AlphMachine_pieces__ptr(m: AlphMachine*, kind: Word, total: Word,
+                                  took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word {
+  m->run_bytes = 0;
+  m->run_each = 0;
+  return alph_machine_run_all(m, kind, total, took, ctx);
+}
+
+// As pieces, for a kind set up with piece_of. bytes holds every piece's
+// bytes one after another, `each` of them for a piece: piece i's start at
+// i times each. They must stay as they are until this returns. Pieces go
+// several to a job as with pieces, and a job for another machine holds no
+// more of them than fit one message with bytes (ALPH_PARCEL_BYTES), so
+// pieces of more bytes than that go one to a job and need long buffers
+// (longs) to leave this machine.
+export fn AlphMachine_pieces_of__ptr(m: AlphMachine*, kind: Word, total: Word, bytes: uint8*, each: Word,
+                                     took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word {
+  if (bytes == 0 || each <= 0) {
+    return total;
+  }
+  m->run_bytes = bytes;
+  m->run_each = each;
+  return alph_machine_run_all(m, kind, total, took, ctx);
+}
+
+fn alph_machine_run_all(m: AlphMachine*, kind: Word, total: Word,
+                        took: fn(Word, Word, rawptr) -> void, ctx: rawptr) -> Word {
+  var tried: Word = total;
+  if (tried > RUN_TRIED) {
+    tried = RUN_TRIED;
+  }
+  m->run_took = took;
+  m->run_ctx = ctx;
+  m->run_total = total;
+  m->run_undone = 0;
+  m->run_least = 0;
+  m->run_least_far = 0;
+  m->run_first = 0;
+  m->run = 1;
+  m->work(kind, tried, &alph_machine_run_fill, &alph_machine_run_took, (rawptr)m);
+  if (tried == total) {
+    return m->run_undone;
+  }
+  // A board takes one piece at a time, and a job done at most once gives
+  // no bytes back: with either, a job stays one piece.
+  if (m->run_least == 0) {
+    m->run_least = m->run_least_far;  // no way here: timed with the way to another machine
+  }
+  if (m->run_least > 0 && m->board_count == 0 && kind >= 0 && kind < 8 && m->kinds[kind].once == 0) {
+    m->run = (Word)(RUN_NS / m->run_least);
+    if (m->run > RUN_MOST) {
+      m->run = RUN_MOST;
+    }
+    if (m->run_each > 0 && m->peer_count > 0 && (Word)(m->run * m->run_each) > ALPH_PARCEL_BYTES) {
+      m->run = (Word)(ALPH_PARCEL_BYTES / m->run_each);
+    }
+    if (m->run < 1) {
+      m->run = 1;
+    }
+  }
+  m->run_first = tried;
+  alph_machine_rows_all(m, kind);
+  return m->run_undone;
+}
+
+// Runs the cores until stop, the first on this thread.
+export fn AlphMachine_run__ptr(m: AlphMachine*) {
+  m->cores.run();
+}
+
+// Stops the cores, so run returns. Any actor or thread may call it.
+export fn AlphMachine_stop__ptr(m: AlphMachine*) {
+  m->cores.stop();
+}
+
+// Ends the timers and leaves the other machines. Call it after run has
+// returned.
+export fn AlphMachine_shut__ptr(m: AlphMachine*) {
+  m->time.stop();
+  if (m->link.port != 0) {
+    m->link.stop();
+    m->link.close();
+  }
+}

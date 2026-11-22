@@ -1,0 +1,84 @@
+// Other programs: start one, and have a descriptor that is ready for
+// reading when it has ended. With src/poll that is a message, like any
+// other descriptor.
+
+import "port/sys";
+
+const P_PIDFD: int64 = 3;
+const WNOHANG: int64 = 1;
+const WEXITED: int64 = 4;
+const CLD_EXITED: int32 = 1;
+
+export const ALPH_RUNNING: int64 = -1;  // the program has not ended yet
+export const ALPH_NO_PROGRAM: int64 = -2;  // the program could not be started
+
+var g_envp: cstring* = 0;
+
+// The environment programs are started with: what main was given, as
+// argv + argc + 1. Without it they get only a PATH.
+export fn alph_proc_env(envp: cstring*) {
+  g_envp = envp;
+}
+
+// Starts a command, run by /bin/sh -c. Returns a descriptor that is ready
+// for reading once the program has ended, or ALPH_NO_PROGRAM when it could
+// not be started. Close the descriptor when its result has been read.
+export fn alph_proc_start(command: cstring) -> int64 {
+  var argv: cstring[4];
+  var envp: cstring[2];
+  argv[0] = "sh";
+  argv[1] = "-c";
+  argv[2] = command;
+  argv[3] = 0;
+  envp[0] = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  envp[1] = 0;
+  var env: cstring* = g_envp;
+  if (env == 0) {
+    env = &envp[0];
+  }
+  var pid: int64 = alph_sys_fork();
+  if (pid == 0) {
+    // The new process: nothing but becoming the program.
+    syscall(ALPH_NR_EXECVE, (int64)"/bin/sh", (int64)&argv[0], (int64)env);
+    syscall(ALPH_NR_EXIT_GROUP, 127);
+  }
+  if (pid < 0) {
+    return ALPH_NO_PROGRAM;
+  }
+  var fd: int64 = syscall(ALPH_NR_PIDFD_OPEN, pid, 0);
+  if (fd < 0) {
+    return ALPH_NO_PROGRAM;
+  }
+  return fd;
+}
+
+fn alph_proc_ended(fd: int64, options: int64) -> int64 {
+  var info: int32[32];
+  for i in 0..32 {
+    info[i] = 0;
+  }
+  if (syscall(ALPH_NR_WAITID, P_PIDFD, fd, (int64)&info[0], options, 0) < 0) {
+    return ALPH_NO_PROGRAM;
+  }
+  if (info[4] == 0) {
+    return ALPH_RUNNING;  // si_pid: nobody has ended
+  }
+  if (info[2] == CLD_EXITED) {
+    return (int64)info[6];  // si_status is the exit status
+  }
+  return 128 + (int64)info[6];  // or the signal
+}
+
+// How a program ended: its exit status (0 to 255), or 128 plus the signal
+// that ended it. ALPH_RUNNING while it has not ended. Call it once per
+// program: it also lets the system forget the program.
+export fn alph_proc_result(fd: int64) -> int64 {
+  return alph_proc_ended(fd, WEXITED | WNOHANG);
+}
+
+// Waits for a program to end and returns how it did, as alph_proc_result
+// does. For a thread whose work is to run the program, not for a handler
+// that others wait behind.
+export fn alph_proc_wait(fd: int64) -> int64 {
+  return alph_proc_ended(fd, WEXITED);
+}

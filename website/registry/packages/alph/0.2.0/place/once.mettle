@@ -1,0 +1,164 @@
+// What a worker remembers so that a job is never done twice. An asker
+// that wants that sends its jobs as ALPH_WORK_ONCE and says ALPH_HELLO
+// first. The worker keeps, for each of eight askers, the last four jobs it
+// did for it and what each gave. A job sent again is answered from that
+// memory and not done again.
+//
+// A ref is a run of jobs and a number in it: the run in the high bits, the
+// number in the low twelve. A hello starts a new run and wipes what was
+// remembered of that asker. A job of any other run is a stranger's: the
+// worker says it does not know it, and the asker then counts the job as
+// lost (done or not, it cannot tell) and says hello again. A ref at or
+// under the floor is an old copy and is dropped.
+//
+// Checked by exploring every order of loss, delay, restart and reboot for
+// small sizes. It holds as long as the way between the two delivers no
+// message twice, which the link and the tether do not.
+
+import "port/port";
+
+export const ALPH_ONCE_RUN: Word = 0;       // new: do it, then call done or undo
+export const ALPH_ONCE_DONE: Word = 1;      // done before: answer again with what it gave
+export const ALPH_ONCE_BUSY: Word = 2;      // being done now: say nothing, the answer is coming
+export const ALPH_ONCE_OLD: Word = 3;       // an old copy: say nothing
+export const ALPH_ONCE_STRANGER: Word = 4;  // not of this asker's run: refuse with ALPH_LOST
+const RUN_BITS: Word = 12;
+
+// What one worker remembers: eight askers, and four jobs for each.
+export struct AlphOnce {
+  asker: Word[8];   // who, 0 for a free row
+  floor: Word[8];   // refs at or under it are old
+  last: Word[8];    // when the row was last used: the least is given up for a ninth asker
+  ref: Word[32];    // four for each asker, 0 for none
+  out: Word[32];
+  busy: Word[32];
+  clock: Word;
+}
+
+// Forgets everything: no asker is known.
+export fn AlphOnce_init__ptr(o: AlphOnce*) {
+  o->clock = 0;
+  for i in 0..8 {
+    o->asker[i] = 0;
+  }
+}
+
+@noinline fn alph_once_row(o: AlphOnce*, from: Word) -> Word {
+  for i in 0..8 {
+    if (o->asker[i] == from) {
+      o->clock = o->clock + 1;
+      o->last[i] = o->clock;
+      return (Word)i;
+    }
+  }
+  return -1;
+}
+
+// An asker's hello: a new run of refs starts at h, and what was remembered
+// of that asker is forgotten. With eight askers known already, the one
+// heard from longest ago is given up, unless a job of its is being done
+// right now. Returns false when no row can be had: the hello is then not
+// answered, and the asker says it again.
+export fn AlphOnce_hello__ptr(o: AlphOnce*, from: Word, h: Word) -> bool {
+  var row: Word = alph_once_row(o, from);
+  if (row < 0) {
+    for i in 0..8 {
+      var working: bool = false;
+      for j in 0..4 {
+        if (o->asker[i] != 0 && o->ref[(Word)i * 4 + (Word)j] != 0 && o->busy[(Word)i * 4 + (Word)j] != 0) {
+          working = true;
+        }
+      }
+      if (o->asker[i] == 0) {
+        row = (Word)i;
+        break;
+      }
+      if (!working && (row < 0 || o->last[i] < o->last[row])) {
+        row = (Word)i;
+      }
+    }
+    if (row < 0) {
+      return false;
+    }
+    o->asker[row] = from;
+    o->clock = o->clock + 1;
+    o->last[row] = o->clock;
+  }
+  o->floor[row] = h;
+  for i in 0..4 {
+    o->ref[row * 4 + (Word)i] = 0;
+  }
+  return true;
+}
+
+// What to do with a job: one of the ALPH_ONCE values. For ALPH_ONCE_DONE
+// *out is what the job gave when it was done.
+export fn AlphOnce_seen__ptr(o: AlphOnce*, from: Word, ref: Word, out: Word*) -> Word {
+  var row: Word = alph_once_row(o, from);
+  if (row < 0 || (Word)(ref >> RUN_BITS) != (Word)(o->floor[row] >> RUN_BITS)) {
+    return ALPH_ONCE_STRANGER;
+  }
+  if (ref <= o->floor[row]) {
+    return ALPH_ONCE_OLD;
+  }
+  for i in 0..4 {
+    var at: Word = row * 4 + (Word)i;
+    if (o->ref[at] == ref) {
+      if (o->busy[at] != 0) {
+        return ALPH_ONCE_BUSY;
+      }
+      *out = o->out[at];
+      return ALPH_ONCE_DONE;
+    }
+  }
+  return ALPH_ONCE_RUN;
+}
+
+// Remembers a job as being done. If that makes five for its asker, the
+// oldest is forgotten and the floor moves up to it. Call it only after
+// seen said ALPH_ONCE_RUN.
+export fn AlphOnce_begin__ptr(o: AlphOnce*, from: Word, ref: Word) {
+  var row: Word = alph_once_row(o, from);
+  if (row < 0) {
+    return;
+  }
+  var at: Word = row * 4;
+  for i in 0..4 {
+    var here: Word = row * 4 + (Word)i;
+    if (o->ref[here] == 0) {
+      at = here;
+      break;
+    }
+    if (o->ref[here] < o->ref[at]) {
+      at = here;
+    }
+  }
+  if (o->ref[at] != 0) {
+    o->floor[row] = o->ref[at];
+  }
+  o->ref[at] = ref;
+  o->busy[at] = 1;
+  o->out[at] = 0;
+}
+
+// The job is done and gave out.
+export fn AlphOnce_done__ptr(o: AlphOnce*, from: Word, ref: Word, out: Word) {
+  var row: Word = alph_once_row(o, from);
+  for i in 0..4 {
+    if (row >= 0 && o->ref[row * 4 + (Word)i] == ref) {
+      o->out[row * 4 + (Word)i] = out;
+      o->busy[row * 4 + (Word)i] = 0;
+    }
+  }
+}
+
+// The job was not done after all (no room for it): it is forgotten, so a
+// copy sent again may be done.
+export fn AlphOnce_undo__ptr(o: AlphOnce*, from: Word, ref: Word) {
+  var row: Word = alph_once_row(o, from);
+  for i in 0..4 {
+    if (row >= 0 && o->ref[row * 4 + (Word)i] == ref) {
+      o->ref[row * 4 + (Word)i] = 0;
+    }
+  }
+}

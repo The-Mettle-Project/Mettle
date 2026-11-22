@@ -1,0 +1,95 @@
+// Prints what records hold.
+
+import "std/io";
+import "port/port";
+import "alph/record/record";
+
+fn alph_record_pid(pid: Word) {
+  if (pid == 0) {
+    print("-");
+    return;
+  }
+  var slot: Word = (Word)(pid & (((Word)1 << ALPH_INDEX_BITS) - 1));
+  var turn: Word = (Word)((pid >> ALPH_INDEX_BITS) & (((Word)1 << (ALPH_PLACE_SHIFT - ALPH_INDEX_BITS)) - 1));
+  print("{(Word)(pid >> ALPH_PLACE_SHIFT)}:{slot}.{turn}");
+}
+
+// Prints the last `most` messages of count records, oldest first, one to a
+// line: when it ran, in microseconds before the last one, the actor it was
+// for as place:slot.turn, its tag, arg and ref, and who sent it. Records
+// with clocks are read as one, in the order things ran. Without clocks
+// they are printed one after another. Up to 64 records.
+export fn alph_record_show(r: AlphRecord*, records: Word, most: Word) {
+  var count: Word = records;
+  if (count > 64) {
+    count = 64;
+  }
+  var left: Word[64];
+  var total: Word = 0;
+  var timed: bool = true;
+  var last: Word = 0;
+  var any: bool = false;
+  for i in 0..count {
+    left[i] = r[i].held();
+    if (left[i] > most) {
+      left[i] = most;
+    }
+    total = total + left[i];
+    if (r[i].head->per_ms == 0) {
+      timed = false;
+    }
+  }
+  if (timed) {
+    for i in 0..count {
+      if (left[i] > 0) {
+        var t: Word = r[i].when(r[i].back(0));
+        if (!any || t > last) {
+          last = t;
+          any = true;
+        }
+      }
+    }
+  }
+  var skip: Word = 0;
+  if (timed && total > most) {
+    skip = total - most;
+  }
+  while (total > 0) {
+    var pick: Word = -1;
+    var first: Word = 0;
+    for i in 0..count {
+      if (left[i] > 0) {
+        var t: Word = 0;
+        if (timed) {
+          t = r[i].when(r[i].back(left[i] - 1));
+        }
+        if (pick < 0 || t < first) {
+          pick = (Word)i;
+          first = t;
+        }
+      }
+    }
+    var s: AlphSeen* = r[pick].back(left[pick] - 1);
+    left[pick] = left[pick] - 1;
+    total = total - 1;
+    if (skip > 0) {
+      skip = skip - 1;
+      continue;
+    }
+    if (timed) {
+      var ago: Word = last - first;
+      var part: Word = (Word)(ago % 1000);
+      var zeros: string = "";
+      if (part < 10) {
+        zeros = "00";
+      } else if (part < 100) {
+        zeros = "0";
+      }
+      print("-{(Word)(ago / 1000)}.{zeros}{part} us  ");
+    }
+    alph_record_pid(s->to);
+    print("  tag {s->tag}  arg {s->arg}  ref {s->ref}  from ");
+    alph_record_pid(s->from);
+    println("");
+  }
+}

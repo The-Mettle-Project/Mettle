@@ -1,0 +1,158 @@
+// A board: what a microcontroller needs to be one machine among several,
+// set up in one call. It is a node, the line to the machine at the other
+// end, and an actor for each kind of work it does for the others.
+//
+// A kind here is a function from one word to one word. The bigger machines
+// find out by asking that the board does it (see AlphMachine_board), and
+// from then on the board is one more place their work can go.
+//
+// A board asks for work too (ask): the machine at the other end of the
+// line does the kind, whether that is a computer or another board. So two
+// boards on one line share work with no bigger machine at all.
+//
+// The board runs one job at a time, and nothing else while it does. A
+// machine that hears nothing from it for two seconds takes it for lost, so
+// a job should take well under that.
+//
+// A board that stamps what it measures sets b->clock to its port's
+// alph_now. Its door then says what the clock reads each time it is asked,
+// and the machine at the other end can turn a stamp of the board's into
+// the time all the machines share (AlphMachine_board_now).
+//
+// A machine that shares work with a board asks its door something twice a
+// second. b->heard goes up each time, so a board that moves something
+// looks at it on a timer of its own: if it has not gone up for a second
+// or two, the machine is gone or the line is cut, and the board stops
+// safely.
+//
+// Sizes: 12 actors, 8 messages a mailbox, 8 kinds. A program that needs
+// others puts the node and the tether together itself, as this file does.
+
+import "port/port";
+import "alph/actor/actor";
+import "alph/tether/tether";
+import "alph/door/words";
+import "alph/place/words";
+
+const SLOTS: Word = 12;
+const ROOM: Word = 8;
+
+struct AlphBoardKind {
+  board: AlphBoard*;
+  run: fn(Word) -> Word;
+}
+
+// A board: its node, its line, what it shares, and the memory they work in.
+export struct AlphBoard {
+  node: AlphNode;
+  tether: AlphTether;
+  served: Word;       // jobs done for other machines
+  heard: Word;        // goes up each time a machine asks this board's door anything
+  workers: Word[8];   // by kind: the actor that does it, 0 for none
+  helpers: Word[8];   // by kind: the actor down the line that does it, 0 while not known
+  door: Word;
+  clock: fn() -> Word;  // the board's own clock, 0 for none: set it to alph_now and a machine can read the board's stamps
+  kinds: AlphBoardKind[8];
+  actors: AlphActor[12];
+  mail: AlphMsg[96];
+}
+
+// Stands where a machine's door does and answers one question: who does a
+// shared kind here. A pid inside a message does not cross the line whole,
+// so the answer is sent as from the worker itself.
+fn alph_board_door(a: AlphActor*, m: AlphMsg*) -> Word {
+  var b: AlphBoard* = (AlphBoard*)a->state;
+  b->heard = b->heard + 1;
+  if (m->tag == ALPH_HERE && m->arg != 0 && m->ref >= 1 && m->ref <= 8) {
+    b->helpers[m->ref - 1] = m->from;  // the answer to ask's question
+  }
+  if (m->tag != ALPH_WHERE) {
+    return 0;
+  }
+  var answer: AlphMsg = { tag: ALPH_HERE, from: a->pid, arg: 0, ref: m->ref };
+  var kind: Word = m->arg - ALPH_SHARED;
+  if (kind >= 0 && kind < 8 && b->workers[kind] != 0) {
+    answer.from = b->workers[kind];
+    answer.arg = 1;
+    if (b->clock != 0) {
+      answer.arg = (Word)(b->clock() | 1);  // and what its clock says, which is how a machine follows it
+    }
+  }
+  a->node->put(m->from, &answer);
+  return 0;
+}
+
+fn alph_board_serve(a: AlphActor*, m: AlphMsg*) -> Word {
+  var k: AlphBoardKind* = (AlphBoardKind*)a->state;
+  if (m->tag != ALPH_WORK) {
+    return 0;
+  }
+  var run: fn(Word) -> Word = k->run;
+  var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: run(m->arg), ref: m->ref };
+  k->board->served = k->board->served + 1;
+  a->node->put(m->from, &answer);
+  return 0;
+}
+
+// Sets the board up as place `place`, tied by the port's line to a machine
+// whose places are first, first + 1, ... Call it before anything else. The
+// program's own actors are spawned on b->node.
+export fn AlphBoard_init__ptr(b: AlphBoard*, place: Word, first: Word, count: Word) {
+  b->clock = 0;
+  b->served = 0;
+  b->heard = 0;
+  for k in 0..8 {
+    b->workers[k] = 0;
+    b->helpers[k] = 0;
+  }
+  b->node.init(&b->actors[0], SLOTS, &b->mail[0], ROOM);
+  b->tether.init(&b->node, place, first, count);
+  b->door = b->node.spawn(&alph_board_door, (rawptr)b);
+}
+
+// Does a kind of work (0 to 7) for the other machines: run is given a
+// job's in and returns its out. Returns ALPH_OK, ALPH_FULL when there is
+// no actor left for it, ALPH_GONE for a kind that is not 0 to 7 or is
+// shared already.
+export fn AlphBoard_share__ptr(b: AlphBoard*, kind: Word, run: fn(Word) -> Word) -> Word {
+  if (kind < 0 || kind >= 8 || b->workers[kind] != 0) {
+    return ALPH_GONE;
+  }
+  b->kinds[kind].board = b;
+  b->kinds[kind].run = run;
+  var pid: Word = b->node.spawn(&alph_board_serve, (rawptr)&b->kinds[kind]);
+  if (pid == 0) {
+    return ALPH_FULL;
+  }
+  b->workers[kind] = pid;
+  return ALPH_OK;
+}
+
+// Asks the machine at the other end of the line to do a job of a kind it
+// shares. The answer comes to `a` as ALPH_WORKED with the job's out in arg
+// and the ref this returns, or as ALPH_REFUSED when that machine cannot
+// take it. Returns ALPH_FULL while the board does not know yet who does
+// the kind there: it has asked, so ask again shortly. Returns ALPH_GONE
+// for a kind that is not 0 to 7. The line sends nothing again, so a
+// program that must have its answer asks once more when none has come.
+export fn AlphBoard_ask__ptr(b: AlphBoard*, a: AlphActor*, kind: Word, in: Word) -> Word {
+  if (kind < 0 || kind >= 8) {
+    return ALPH_GONE;
+  }
+  if (b->helpers[kind] == 0) {
+    var where_is: AlphMsg = { tag: ALPH_WHERE, from: b->door, arg: ALPH_SHARED + kind, ref: kind + 1 };
+    b->node.put(alph_door_of(b->tether.first), &where_is);
+    return ALPH_FULL;
+  }
+  return a->ask(b->helpers[kind], ALPH_WORK, in);
+}
+
+// Runs the board until stop.
+export fn AlphBoard_run__ptr(b: AlphBoard*) {
+  b->node.run();
+}
+
+// Stops the board, so run returns.
+export fn AlphBoard_stop__ptr(b: AlphBoard*) {
+  b->node.stop();
+}

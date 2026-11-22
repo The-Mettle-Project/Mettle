@@ -1,0 +1,51 @@
+// The other harts of the chip, for src/cores: core i runs on hart i. Each
+// started hart gets a stack of 4 KiB from here.
+
+const HARTS: int32 = 4;
+const STACK: int32 = 4096;
+
+var g_run: (fn(cstring) -> uint32)[4];
+var g_arg: cstring[4];
+var g_done: int32[4];
+var g_stacks: int64[2048];
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+fn alph_cpu_entry(hart: int32) {
+  var run: fn(cstring) -> uint32 = g_run[hart];
+  var ended: uint32 = run(g_arg[hart]);
+  mettle_atomic_exchange_i32(&g_done[hart], 1);
+}
+
+// Starts run(arg) on hart `index`. Returns a handle for alph_cpu_join, or
+// -1 when the chip has no such hart.
+export fn alph_cpu_start(index: int32, run: fn(cstring) -> uint32, arg: cstring) -> int64 {
+  if (index <= 0 || index >= HARTS || index >= mettle_board_hart_count()) {
+    return -1;
+  }
+  var top: int32 = (int32)&g_stacks[0] + (index + 1) * STACK;
+  top = top - top % 16;
+  g_run[index] = run;
+  g_arg[index] = arg;
+  g_done[index] = 0;
+  if (mettle_board_hart_start(index, &alph_cpu_entry, (uint8*)top) != 0) {
+    return -1;
+  }
+  return (int64)index;
+}
+
+// Waits until what a hart was started on has returned.
+export fn alph_cpu_join(handle: int64) {
+  if (handle <= 0) {
+    return;
+  }
+  while (mettle_atomic_compare_exchange_i32(&g_done[(int32)handle], 0, 0) == 0) {
+  }
+}
+
+// 0: an interrupt runs on the hart it stops, so the hart is not enough to
+// tell a core's own sends from others, and lanes are not used.
+export fn alph_cpu_self() -> int32 {
+  return 0;
+}

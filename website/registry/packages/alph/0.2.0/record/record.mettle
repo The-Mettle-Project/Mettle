@@ -1,0 +1,205 @@
+// A record of the last messages a node ran, for after something went wrong.
+//
+// Each message is written down just before its handler runs: who it was
+// for and its four words. The record holds the last ones and forgets the
+// oldest. When an actor crashes, the newest entry is the message that did
+// it, and the ones before it are what led there.
+//
+// The memory is the caller's. It begins with a few words that say how to
+// read the rest, so memory that outlives the program (a file:
+// src/record/file) can be read by another program afterwards.
+//
+// A record can have a clock. Then every entry says when it ran, and
+// several records (one for each core, or for each machine) can be read as
+// one, in the order things happened.
+//
+// A record costs a node about 3 ns a message, and what its clock costs. It
+// needs a port with ALPH_ON_RUN, which a board's port leaves out.
+
+import "port/port";
+import "alph/actor/actor";
+
+const MARK: Word = 0x616c7068;
+
+// One message that was run.
+export struct AlphSeen {
+  to: Word;
+  tag: Word;
+  from: Word;
+  arg: Word;
+  ref: Word;
+  at: Word;  // when, by the record's clock; 0 without one
+}
+
+// What a record's memory begins with.
+export struct AlphRecordHead {
+  mark: Word;
+  room: Word;   // entries it holds, a power of two
+  count: Word;  // messages recorded since it was set up
+  place: Word;  // the node's place
+  per_ms: Word; // the clock's steps in a millisecond; 0 with no clock
+  stamp: Word;  // the clock read this
+  now: Word;    // when the time was this, in nanoseconds
+  spare: Word;
+}
+
+export struct AlphRecord {
+  head: AlphRecordHead*;
+  seen: AlphSeen*;
+  mask: Word;
+  clock: fn() -> Word;
+}
+
+fn alph_record_seen(n: AlphNode*, a: AlphActor*, m: AlphMsg*) {
+  var r: AlphRecord* = (AlphRecord*)n->seer;
+  var h: AlphRecordHead* = r->head;
+  var s: AlphSeen* = &r->seen[h->count & r->mask];
+  s->to = a->pid;
+  s->tag = m->tag;
+  s->from = m->from;
+  s->arg = m->arg;
+  s->ref = m->ref;
+  if (r->clock != 0) {
+    s->at = r->clock();
+  }
+  h->count = h->count + 1;
+}
+
+// Sets up an empty record in memory of that many bytes. Returns how many
+// messages it holds: the largest power of two that fits, at 48 bytes each
+// after the first 64. 0 when not even one fits: such a record is not to
+// be read.
+export fn AlphRecord_init__ptr(r: AlphRecord*, memory: uint8*, bytes: Word) -> Word {
+  var room: Word = 0;
+  var fits: Word = (Word)((bytes - (Word)sizeof(AlphRecordHead)) / (Word)sizeof(AlphSeen));
+  if (fits >= 1) {
+    room = 1;
+    while (room * 2 <= fits) {
+      room = room * 2;
+    }
+  }
+  r->head = (AlphRecordHead*)memory;
+  r->seen = (AlphSeen*)&memory[sizeof(AlphRecordHead)];
+  r->mask = room - 1;
+  r->clock = 0;
+  if (room != 0) {
+    r->head->room = room;
+    r->head->count = 0;
+    r->head->place = 0;
+    r->head->per_ms = 0;
+    r->head->stamp = 0;
+    r->head->now = 0;
+    for i in 0..room {
+      r->seen[i].at = 0;
+    }
+    r->head->mark = MARK;
+  }
+  return room;
+}
+
+// Reads a record that is already in memory: one another program left in a
+// file, or this one before it was started again. Returns how many messages
+// it holds, or -1 when the memory is not a record.
+export fn AlphRecord_open__ptr(r: AlphRecord*, memory: uint8*, bytes: Word) -> Word {
+  r->head = (AlphRecordHead*)memory;
+  r->seen = (AlphSeen*)&memory[sizeof(AlphRecordHead)];
+  r->clock = 0;
+  r->mask = 0;
+  if (bytes < (Word)sizeof(AlphRecordHead) || r->head->mark != MARK) {
+    return -1;
+  }
+  var room: Word = r->head->room;
+  if (room < 1 || (Word)(room & (room - 1)) != 0 ||
+      room > (Word)((bytes - (Word)sizeof(AlphRecordHead)) / (Word)sizeof(AlphSeen))) {
+    return -1;
+  }
+  r->mask = room - 1;
+  return r->held();
+}
+
+// Has every entry stamped with what clock returns, which goes up by per_ms
+// in a millisecond. The clock is called once a message, so its cost is the
+// record's.
+export fn AlphRecord_timed__ptr(r: AlphRecord*, clock: fn() -> Word, per_ms: Word) {
+  r->clock = clock;
+  r->head->per_ms = per_ms;
+}
+
+// Says what time it was, in nanoseconds, when the clock read stamp. Say it
+// again whenever the time is known better: when reads from then on.
+export fn AlphRecord_at__ptr(r: AlphRecord*, stamp: Word, now: Word) {
+  r->head->stamp = stamp;
+  r->head->now = now;
+}
+
+// When an entry ran, in nanoseconds of the time given with at. Only for a
+// record with a clock.
+export fn AlphRecord_when__ptr(r: AlphRecord*, s: AlphSeen*) -> Word {
+  var h: AlphRecordHead* = r->head;
+  var d: Word = s->at - h->stamp;
+  return h->now + (Word)(d / h->per_ms) * 1000000 + (Word)((Word)(d % h->per_ms) * 1000000 / h->per_ms);
+}
+
+// How many bytes of its memory the record uses: where the next one starts
+// when several lie one after another.
+export fn AlphRecord_bytes__ptr(r: AlphRecord*) -> Word {
+  return (Word)sizeof(AlphRecordHead) + (r->mask + 1) * (Word)sizeof(AlphSeen);
+}
+
+// Starts recording what a node runs. Call it before the node runs. A node
+// has one record. A record that holds nothing records nothing.
+export fn AlphRecord_on__ptr(r: AlphRecord*, n: AlphNode*) {
+  if (r->mask < 0) {
+    return;
+  }
+  r->head->place = n->place;
+  n->on_run(&alph_record_seen, (rawptr)r);
+}
+
+// How many messages the record holds now.
+export fn AlphRecord_held__ptr(r: AlphRecord*) -> Word {
+  if (r->head->count > r->mask) {
+    return r->mask + 1;
+  }
+  return r->head->count;
+}
+
+// How many messages were recorded since it was set up, the forgotten ones
+// too.
+export fn AlphRecord_count__ptr(r: AlphRecord*) -> Word {
+  return r->head->count;
+}
+
+// The message run `back` messages before the last one: 0 is the last. back
+// must be less than held.
+export fn AlphRecord_back__ptr(r: AlphRecord*, back: Word) -> AlphSeen* {
+  var i: Word = (Word)((r->head->count - 1 - back) & r->mask);
+  return &r->seen[i];
+}
+
+// Sets up count records one after another in memory of that many bytes,
+// each with the same room. Returns the room, 0 when the memory is too
+// small.
+export fn alph_records_init(r: AlphRecord*, count: Word, memory: uint8*, bytes: Word) -> Word {
+  var room: Word = r[0].init(memory, (Word)(bytes / count));
+  if (room == 0) {
+    return 0;
+  }
+  var each: Word = r[0].bytes();
+  for i in 1..count {
+    r[i].init(&memory[i * each], each);
+  }
+  return room;
+}
+
+// Reads the records that lie one after another in memory, up to most of
+// them. Returns how many there are.
+export fn alph_records_open(r: AlphRecord*, most: Word, memory: uint8*, bytes: Word) -> Word {
+  var count: Word = 0;
+  var at: Word = 0;
+  while (count < most && r[count].open(&memory[at], bytes - at) >= 0) {
+    at = at + r[count].bytes();
+    count = count + 1;
+  }
+  return count;
+}

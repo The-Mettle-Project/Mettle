@@ -1,0 +1,56 @@
+// A serial device as a line of bytes: a board's UART on /dev/ttyACM0 or
+// /dev/ttyUSB0, say. The device is set to carry bytes as they are (eight
+// bits, no parity, one stop bit, nothing translated, no flow control) at
+// the speed asked for. Give the descriptor to alph_line_open.
+
+import "port/sys";
+
+const O_RDWR: int64 = 2;
+const O_NOCTTY: int64 = 256;
+const TCGETS2: int64 = 2150388778;
+const TCSETS2: int64 = 1076646955;
+const CS8: uint32 = 48;
+const CREAD: uint32 = 128;
+const CLOCAL: uint32 = 2048;
+const BOTHER: uint32 = 4096;  // the speed is the number given, not one from a table
+const VTIME: int32 = 5;
+const VMIN: int32 = 6;
+
+// The kernel's own shape for a terminal's settings.
+struct Termios {
+  iflag: uint32;
+  oflag: uint32;
+  cflag: uint32;
+  lflag: uint32;
+  line: uint8;
+  cc: uint8[19];
+  ispeed: uint32;
+  ospeed: uint32;
+}
+
+// Opens a serial device at `baud` bits a second. Returns its descriptor, or
+// a negative number when it cannot be opened or set.
+export fn alph_serial_open(path: cstring, baud: int64) -> int64 {
+  var fd: int64 = alph_sys_open(path, O_RDWR | O_NOCTTY, 0);
+  if (fd < 0) {
+    return fd;
+  }
+  var t: Termios;
+  var out: int64 = syscall(ALPH_NR_IOCTL, fd, TCGETS2, (int64)&t);
+  if (out >= 0) {
+    t.iflag = 0;
+    t.oflag = 0;
+    t.lflag = 0;
+    t.cflag = CS8 | CREAD | CLOCAL | BOTHER;
+    t.ispeed = (uint32)baud;
+    t.ospeed = (uint32)baud;
+    t.cc[VMIN] = 1;   // a read waits for one byte,
+    t.cc[VTIME] = 0;  // however long that takes
+    out = syscall(ALPH_NR_IOCTL, fd, TCSETS2, (int64)&t);
+  }
+  if (out < 0) {
+    syscall(ALPH_NR_CLOSE, fd);
+    return out;
+  }
+  return fd;
+}

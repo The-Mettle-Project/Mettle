@@ -1,0 +1,149 @@
+// TCP over IPv4 without waiting: every call returns at once.
+
+import "port/sys";
+
+const AF_INET: int64 = 2;
+const SOCK_STREAM: int64 = 1;
+const SOCK_NONBLOCK: int64 = 2048;
+const SOL_SOCKET: int64 = 1;
+const SO_REUSEADDR: int64 = 2;
+const SO_ERROR: int64 = 4;
+const IPPROTO_TCP: int64 = 6;
+const TCP_NODELAY: int64 = 1;
+const EAGAIN: int64 = -11;
+const EINPROGRESS: int64 = -115;
+const EINTR: int64 = -4;
+const ENOTSOCK: int64 = -88;
+const MSG_NOSIGNAL: int64 = 16384;
+
+export const ALPH_LATER: int64 = -1;   // nothing now: ask to be told when the socket is ready
+export const ALPH_BROKEN: int64 = -2;  // the connection failed or is not there
+
+fn alph_net_address(out: uint8*, ip: uint32, port: int64) {
+  for i in 0..16 {
+    out[i] = 0;
+  }
+  out[0] = (uint8)AF_INET;
+  out[2] = (uint8)((port >> 8) & 255);
+  out[3] = (uint8)(port & 255);
+  out[4] = (uint8)((ip >> 24) & 255);
+  out[5] = (uint8)((ip >> 16) & 255);
+  out[6] = (uint8)((ip >> 8) & 255);
+  out[7] = (uint8)(ip & 255);
+}
+
+// A socket that takes connections on a port. Returns it, or ALPH_BROKEN
+// when the port cannot be had.
+export fn alph_tcp_listen(port: int64) -> int64 {
+  return alph_tcp_listen_on(0, port, 128);
+}
+
+// The same on one address of this machine (a.b.c.d as one number, 0 for
+// all of them), with room for `waiting` connections not yet accepted. Port
+// 0 takes any free port: alph_tcp_port says which.
+export fn alph_tcp_listen_on(ip: uint32, port: int64, waiting: int64) -> int64 {
+  var address: uint8[16];
+  var one: int32 = 1;
+  var fd: int64 = syscall(ALPH_NR_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (fd < 0) {
+    return ALPH_BROKEN;
+  }
+  syscall(ALPH_NR_SETSOCKOPT, fd, SOL_SOCKET, SO_REUSEADDR, (int64)&one, 4);
+  alph_net_address(&address[0], ip, port);
+  if (syscall(ALPH_NR_BIND, fd, (int64)&address[0], 16) < 0 || syscall(ALPH_NR_LISTEN, fd, waiting) < 0) {
+    syscall(ALPH_NR_CLOSE, fd);
+    return ALPH_BROKEN;
+  }
+  return fd;
+}
+
+// The port a socket is on, or ALPH_BROKEN.
+export fn alph_tcp_port(fd: int64) -> int64 {
+  var address: uint8[16];
+  var size: int32 = 16;
+  if (syscall(ALPH_NR_GETSOCKNAME, fd, (int64)&address[0], (int64)&size) < 0) {
+    return ALPH_BROKEN;
+  }
+  return (int64)address[2] * 256 + (int64)address[3];
+}
+
+// The next connection waiting on a listening socket. Returns it, ALPH_LATER
+// when none is waiting, or ALPH_BROKEN.
+export fn alph_tcp_accept(listener: int64) -> int64 {
+  var one: int32 = 1;
+  var fd: int64 = syscall(ALPH_NR_ACCEPT4, listener, 0, 0, SOCK_NONBLOCK);
+  if (fd == EAGAIN || fd == EINTR) {
+    return ALPH_LATER;
+  }
+  if (fd < 0) {
+    return ALPH_BROKEN;
+  }
+  syscall(ALPH_NR_SETSOCKOPT, fd, IPPROTO_TCP, TCP_NODELAY, (int64)&one, 4);
+  return fd;
+}
+
+// Starts a connection to a.b.c.d (as one number) and a port. Returns the
+// socket: it is connected once it is ready for writing and alph_tcp_failed
+// says it did not fail. ALPH_BROKEN when it could not start.
+export fn alph_tcp_connect(ip: uint32, port: int64) -> int64 {
+  var address: uint8[16];
+  var one: int32 = 1;
+  var fd: int64 = syscall(ALPH_NR_SOCKET, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (fd < 0) {
+    return ALPH_BROKEN;
+  }
+  syscall(ALPH_NR_SETSOCKOPT, fd, IPPROTO_TCP, TCP_NODELAY, (int64)&one, 4);
+  alph_net_address(&address[0], ip, port);
+  var out: int64 = syscall(ALPH_NR_CONNECT, fd, (int64)&address[0], 16);
+  if (out < 0 && out != EINPROGRESS) {
+    syscall(ALPH_NR_CLOSE, fd);
+    return ALPH_BROKEN;
+  }
+  return fd;
+}
+
+// Whether a socket's connection has failed.
+export fn alph_tcp_failed(fd: int64) -> bool {
+  var error: int32 = 0;
+  var size: int32 = 4;
+  if (syscall(ALPH_NR_GETSOCKOPT, fd, SOL_SOCKET, SO_ERROR, (int64)&error, (int64)&size) < 0) {
+    return true;
+  }
+  return error != 0;
+}
+
+// Reads what is there, up to room bytes. Returns how many, 0 when the other
+// side has closed, ALPH_LATER when nothing is there yet, or ALPH_BROKEN.
+export fn alph_read(fd: int64, bytes: uint8*, room: int64) -> int64 {
+  var got: int64 = syscall(ALPH_NR_READ, fd, (int64)bytes, room);
+  if (got == EAGAIN || got == EINTR) {
+    return ALPH_LATER;
+  }
+  if (got < 0) {
+    return ALPH_BROKEN;
+  }
+  return got;
+}
+
+// Writes as much as fits now. Returns how many bytes were taken, which may
+// be fewer than count, ALPH_LATER when none can be taken yet, or ALPH_BROKEN.
+export fn alph_write(fd: int64, bytes: uint8*, count: int64) -> int64 {
+  // As a send that raises no signal: a plain write to a socket whose other
+  // side is gone would end the process with SIGPIPE.
+  var put: int64 = syscall(ALPH_NR_SENDTO, fd, (int64)bytes, count, MSG_NOSIGNAL, 0, 0);
+  if (put == ENOTSOCK) {
+    put = syscall(ALPH_NR_WRITE, fd, (int64)bytes, count);
+  }
+  if (put == EAGAIN || put == EINTR) {
+    return ALPH_LATER;
+  }
+  if (put < 0) {
+    return ALPH_BROKEN;
+  }
+  return put;
+}
+
+// Closes a descriptor.
+export fn alph_close(fd: int64) {
+  syscall(ALPH_NR_CLOSE, fd);
+}

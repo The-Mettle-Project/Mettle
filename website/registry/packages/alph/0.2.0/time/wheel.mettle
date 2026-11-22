@@ -1,0 +1,278 @@
+// Timers for programs with thousands of them: a timer wheel. It behaves as
+// AlphTime does, but setting and cancelling a timer take the same time
+// however many wait.
+//
+// The wheel is a ring of spokes, one per tick, that goes round every
+// spoke_count ticks. A timer waits in the spoke of the tick it is due in,
+// in a list threaded through the timers themselves. When the alarm rings
+// the wheel steps tick by tick from where it stopped up to now, and in each
+// spoke sends the timers due by then. A timer due a turn or more later
+// shares the spoke and stays. Free timers wait on a list of their own.
+//
+// A timer's ref says which slot it is in, so cancel goes straight to it.
+//
+// Limits: a turn of the wheel should be longer than most delays, or the
+// alarm rings once a turn for a far timer and sends nothing. A ring more
+// than a whole turn late sends what is that overdue with its spoke, so
+// among those the soonest may not go first.
+
+import "port/port";
+import "port/alarm";
+import "alph/actor/actor";
+
+const NONE: Word = -1;
+
+// One timer on the wheel: the message it will send, when, and its
+// neighbours in its spoke.
+export struct AlphWheelTimer {
+  at: Word;    // in the port's ticks
+  to: Word;
+  tag: Word;
+  arg: Word;
+  ref: Word;   // 0 while the slot is free
+  next: Word;  // slot indexes; a spoke's list is a ring, so its first's prev is its last
+  prev: Word;
+}
+
+// A timer wheel: the timers and the spokes they wait in.
+export struct AlphWheel {
+  gate: AlphGate;
+  alarm: AlphAlarm;
+  node: AlphNode*;
+  slots: AlphWheelTimer*;
+  room: Word;
+  spokes: Word*;
+  mask: Word;
+  free: Word;
+  waiting: Word;
+  done: Word;     // the last tick whose spoke was sent
+  armed: Word;
+  next: Word;     // the tick the alarm is set for, while armed
+  serial: Word;
+  serials: Word;  // serial stays below this, so a ref never overflows
+}
+
+// Adds slot i at the end of the ring whose first is at *head.
+fn alph_wheel_append(w: AlphWheel*, head: Word*, i: Word) {
+  var x: AlphWheelTimer* = &w->slots[i];
+  if (*head == NONE) {
+    *head = i;
+    x->next = i;
+    x->prev = i;
+    return;
+  }
+  var first: AlphWheelTimer* = &w->slots[*head];
+  var last: Word = first->prev;
+  x->next = *head;
+  x->prev = last;
+  w->slots[last].next = i;
+  first->prev = i;
+}
+
+// Doubly linked, so cancel takes a timer out without walking its spoke:
+// a busy spoke can hold hundreds.
+fn alph_wheel_unlink(w: AlphWheel*, i: Word) {
+  var x: AlphWheelTimer* = &w->slots[i];
+  var head: Word* = &w->spokes[(Word)(x->at & w->mask)];
+  if (x->next == i) {
+    *head = NONE;
+    return;
+  }
+  w->slots[x->prev].next = x->next;
+  w->slots[x->next].prev = x->prev;
+  if (*head == i) {
+    *head = x->next;
+  }
+}
+
+fn alph_wheel_free(w: AlphWheel*, i: Word) {
+  w->slots[i].ref = 0;
+  w->slots[i].next = w->free;
+  w->free = i;
+  w->waiting = w->waiting - 1;
+}
+
+fn alph_wheel_empty(w: AlphWheel*) {
+  for i in 0..(w->mask + 1) {
+    w->spokes[i] = NONE;
+  }
+  w->free = NONE;
+  var i: Word = w->room;
+  while (i > 0) {
+    i = i - 1;
+    w->slots[i].ref = 0;
+    w->slots[i].next = w->free;
+    w->free = i;
+  }
+  w->waiting = 0;
+  w->armed = 0;
+}
+
+// Sets the alarm for the next tick whose spoke holds a timer, or clears it.
+fn alph_wheel_rearm(w: AlphWheel*) {
+  if (w->waiting == 0) {
+    w->armed = 0;
+    w->alarm.clear();
+    return;
+  }
+  var t: Word = w->done;
+  while (true) {
+    t = t + 1;
+    if (w->spokes[(Word)(t & w->mask)] != NONE) {
+      break;
+    }
+  }
+  w->armed = 1;
+  w->next = t;
+  w->alarm.set(t);
+}
+
+// The alarm rang: steps from the last tick sent up to now. Tick by tick
+// sends the soonest first; each spoke's list is in the order its timers
+// were set, so equal deadlines go in that order. A timer whose actor's
+// mailbox is full is tried again a tick later, before the timers due then.
+// The gate is held for the whole ring, so the retried ones can wait on a
+// list of their own and still be cancelled.
+fn alph_wheel_ring(ctx: rawptr) {
+  var w: AlphWheel* = (AlphWheel*)ctx;
+  var was: int32 = w->gate.enter();
+  var now: Word = alph_now();
+  if ((Word)(now - w->done) > w->mask + 1) {
+    w->done = now - (w->mask + 1);
+  }
+  var again: Word = NONE;
+  while ((Word)(now - w->done) > 0) {
+    w->done = w->done + 1;
+    var head: Word* = &w->spokes[(Word)(w->done & w->mask)];
+    if (*head == NONE) {
+      continue;
+    }
+    var last: Word = w->slots[*head].prev;
+    var i: Word = *head;
+    while (true) {
+      var x: AlphWheelTimer* = &w->slots[i];
+      var after: Word = x->next;
+      if ((Word)(x->at - w->done) <= 0) {
+        alph_wheel_unlink(w, i);
+        var m: AlphMsg = { tag: x->tag, from: 0, arg: x->arg, ref: x->ref };
+        if (w->node->put(x->to, &m) == ALPH_FULL) {
+          x->at = now + 1;
+          alph_wheel_append(w, &again, i);
+        } else {
+          alph_wheel_free(w, i);
+        }
+      }
+      if (i == last) {
+        break;
+      }
+      i = after;
+    }
+  }
+  if (again != NONE) {
+    // Splice the retried ones in front of the spoke for now + 1.
+    var head: Word* = &w->spokes[(Word)((now + 1) & w->mask)];
+    if (*head != NONE) {
+      var a_last: Word = w->slots[again].prev;
+      var h_last: Word = w->slots[*head].prev;
+      w->slots[a_last].next = *head;
+      w->slots[*head].prev = a_last;
+      w->slots[h_last].next = again;
+      w->slots[again].prev = h_last;
+    }
+    *head = again;
+  }
+  alph_wheel_rearm(w);
+  w->gate.leave(was);
+}
+
+// timers holds room timers. spokes holds spoke_count list heads, at least
+// one; a count that is not a power of two is rounded down to one. Messages
+// go out through node.
+export fn AlphWheel_init__ptr(w: AlphWheel*, node: AlphNode*, timers: AlphWheelTimer*, room: Word,
+    spokes: Word*, spoke_count: Word) {
+  w->gate.init();
+  w->node = node;
+  w->slots = timers;
+  w->room = room;
+  w->spokes = spokes;
+  var n: Word = 1;
+  while (n <= spoke_count - n) {
+    n = n + n;
+  }
+  w->mask = n - 1;
+  var top: Word = 1;
+  while (top + top + 1 > 0 && (Word)((top + top + 1) * room) / room == top + top + 1) {
+    top = top + top;
+  }
+  w->serials = top;
+  w->serial = 0;
+  w->done = alph_now();
+  alph_wheel_empty(w);
+  w->alarm.start(&alph_wheel_ring, (rawptr)w);
+}
+
+// Sends tag and arg to an actor ms milliseconds from now: never sooner, and
+// up to a tick later. The message carries the ref this returns (above 0)
+// and comes from pid 0. Returns ALPH_FULL when every timer is in use.
+export fn AlphWheel_after__ptr(w: AlphWheel*, ms: Word, to: Word, tag: Word, arg: Word) -> Word {
+  var was: int32 = w->gate.enter();
+  var i: Word = w->free;
+  if (i == NONE) {
+    w->gate.leave(was);
+    return ALPH_FULL;
+  }
+  var now: Word = alph_now();
+  if (w->waiting == 0) {
+    w->done = now;  // nothing to catch up on after a quiet spell
+  }
+  var x: AlphWheelTimer* = &w->slots[i];
+  w->free = x->next;
+  w->waiting = w->waiting + 1;
+  w->serial = w->serial + 1;
+  if (w->serial >= w->serials) {
+    w->serial = 0;
+  }
+  x->at = now + alph_ms(ms);
+  if (ms > 0) {
+    x->at = x->at + 1;  // the tick now is partly gone: never early
+  }
+  if ((Word)(x->at - w->done) <= 0) {
+    x->at = w->done + 1;  // that spoke was sent already
+  }
+  x->to = to;
+  x->tag = tag;
+  x->arg = arg;
+  x->ref = (Word)(w->serial * w->room) + i + 1;
+  alph_wheel_append(w, &w->spokes[(Word)(x->at & w->mask)], i);
+  if (w->armed == 0 || (Word)(x->at - w->next) < 0) {
+    w->armed = 1;
+    w->next = x->at;
+    w->alarm.set(x->at);
+  }
+  var out: Word = x->ref;
+  w->gate.leave(was);
+  return out;
+}
+
+// Takes a timer back. ALPH_GONE when its message was already sent.
+export fn AlphWheel_cancel__ptr(w: AlphWheel*, ref: Word) -> Word {
+  if (ref <= 0) {
+    return ALPH_GONE;
+  }
+  var i: Word = (Word)((ref - 1) % w->room);
+  var out: Word = ALPH_GONE;
+  var was: int32 = w->gate.enter();
+  if (w->slots[i].ref == ref) {
+    alph_wheel_unlink(w, i);
+    alph_wheel_free(w, i);
+    out = ALPH_OK;
+  }
+  w->gate.leave(was);
+  return out;
+}
+
+// No timer's message is sent after this returns. Waiting timers are dropped.
+export fn AlphWheel_stop__ptr(w: AlphWheel*) {
+  w->alarm.stop();
+  alph_wheel_empty(w);
+}

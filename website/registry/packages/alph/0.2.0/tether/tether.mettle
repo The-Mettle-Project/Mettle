@@ -1,0 +1,611 @@
+// A tether: a node tied to one other machine by a line of bytes, such as a
+// board's serial port. It is the small way for a microcontroller to be a
+// place among bigger machines: no numbering, no beats, nothing sent again.
+// A message goes over once, and a byte lost on the line loses it, unless
+// both ends make the line sure (see sure below).
+//
+// A message is nine numbers on the line, a sum of two bytes, then a byte
+// that marks its end. The numbers are the three parts of the pid it is
+// for, the three of the pid it is from, and its tag, arg and ref. Each
+// goes in as few bytes as it needs, seven bits to a byte, so a message is
+// most often 11 to 14 bytes and at most 47: a serial line is slow, and
+// most of these numbers are small. tag, arg and ref cross as 32 bits each,
+// so a bigger machine's larger numbers are cut short, and a number below 0
+// is as short as one above it.
+//
+// The pids go as their parts because a 32-bit board and a 64-bit server
+// pack them differently. A pid too big for this machine's word cannot be
+// held here, so its message is dropped: an actor on a bigger machine talks
+// to a board if its place is below 256, its slot below 1,024 and its
+// generation below 8,192, which holds for actors spawned at the start.
+//
+// A board has one line, and so one tether. A Linux process has up to four
+// lines (see the host port's line file), each with a tether of its own.
+
+import "port/port";
+import "port/line";
+import "alph/actor/actor";
+
+const END: int32 = 192;      // ends a message on the line
+const ESC: int32 = 219;      // the next byte stands for an END or an ESC in the message
+const ESC_END: int32 = 220;
+const ESC_ESC: int32 = 221;
+const MOST: Word = 47;       // the longest message: nine numbers of five bytes and the sum
+const LEAST: Word = 11;      // the shortest
+
+// On a sure line every message is sent as two frames: a header of 7 bytes,
+// then the message as above, which is never as short as that. The header is its kind, the message's number,
+// how far the sender has the other side's messages, the sender's life and
+// the life it knows the other side by, then their sum in two bytes of 7
+// bits. Each byte is below 128, so none needs an escape. Numbers go round
+// at 128. A header goes alone to say how far, or to ask for again what is
+// not yet had (CHASE).
+const HEAD: Word = 7;
+const ACK: Word = 0;
+const CHASE: Word = 1;
+const MSG: Word = 2;
+const OWE_ACK: Word = 1;
+const OWE_CHASE: Word = 2;  // shifted down, it is the kind CHASE
+
+// A message on a sure line until the other side has it.
+export struct AlphKept {
+  to: Word;
+  m: AlphMsg;
+}
+
+// One end of a line: the node it serves and the message being taken off the line.
+export struct AlphTether {
+  node: AlphNode*;
+  first: Word;    // the other machine's places are first, first + 1, ...
+  count: Word;
+  have: Word;
+  escaped: Word;
+  dropped: Word;  // messages that came in damaged, or with a pid too big for here
+  relay: Word;    // mail off the line for places other than this node's is passed on
+  line: Word;     // which of the port's lines this is: 0 on a board
+  full: Word;     // the last message off the line found its actor's mailbox full
+  sure: AlphSure*;  // what makes the line sure, 0 when it is not
+  frame: uint8[48];
+}
+
+// What a sure line keeps. A tether that is not sure has none of it, and
+// is not one byte bigger.
+export struct AlphSure {
+  t: AlphTether*;
+  kept: AlphKept*;
+  room: Word;
+  held: Word;     // messages kept
+  posted: Word;   // of those, how many are on the line since they were last asked for again
+  acked: Word;    // the other side has every message up to this number
+  got: Word;      // every message from it up to this number was taken
+  life: Word;     // this run, 0 until a sound header is heard
+  their: Word;    // the other side's run, 0 while it has none
+  owe: Word;      // a header to send alone
+  stale: Word;    // ticks since the other side last said it has more
+  again: Word;    // ticks to wait for that before sending again
+  quiet: Word;    // ticks since a message came in its turn
+  ask: Word;      // ticks to wait for one before asking
+  gap: Word;      // one came early, and the other side was asked to send again
+  helper: Word;   // the actor that writes on the line
+  next: Word;     // 128 and its number while a message's header has come
+  gate: AlphGate;
+  frames: Word;   // the test knobs' random number
+  resent: Word;   // messages sent again
+  lose: Word;     // for tests: about one frame in so many is not sent
+  damage: Word;   // for tests: about one frame in so many has a byte changed
+}
+
+
+// Writes a number seven bits to a byte, the least first, every byte but
+// the last with its top bit set. Only its low 32 bits go. Returns how many
+// bytes that was.
+@noinline fn alph_tether_small(out: uint8*, value: Word) -> Word {
+  var v: Word = value;
+  var n: Word = 0;
+  while (true) {
+    var low: Word = (Word)(v & 127);
+    v = (Word)((v >> 7) & 33554431);  // what is left of 32 bits
+    if (v == 0) {
+      out[n] = (uint8)low;
+      return n + 1;
+    }
+    out[n] = (uint8)(low | 128);
+    n = n + 1;
+  }
+  return n;
+}
+
+// Reads such a number at *at and moves *at past it, or past end when the
+// number does not end in time.
+@noinline fn alph_tether_big(from: uint8*, at: Word*, end: Word) -> Word {
+  var v: Word = 0;
+  var shift: Word = 0;
+  while (*at < end && shift <= 28) {
+    var b: Word = (Word)from[*at];
+    *at = *at + 1;
+    v = (Word)(v | ((Word)(b & 127) << shift));
+    if (b < 128) {
+      return v;
+    }
+    shift = shift + 7;
+  }
+  *at = end + 1;
+  return 0;
+}
+
+// A number that may be below 0 as one that is small when it is near 0:
+// twice it, and for one below 0 every bit of that turned.
+@noinline fn alph_tether_fold(value: Word) -> Word {
+  var z: Word = (Word)(value << 1);
+  if ((Word)((value >> 31) & 1) != 0) {
+    z = (Word)(-z - 1);
+  }
+  return z;
+}
+
+@noinline fn alph_tether_unfold(z: Word) -> Word {
+  var value: Word = (Word)((z >> 1) & 2147483647);
+  if ((Word)(z & 1) != 0) {
+    value = (Word)(-value - 1);
+  }
+  return value;
+}
+
+// A frame's sum: each byte times its place.
+@noinline fn alph_sure_sum(f: uint8*, count: Word) -> Word {
+  var sum: Word = 0;
+  for i in 0..count {
+    sum = (Word)((sum + (Word)f[i] * ((Word)i + 1)) & 65535);
+  }
+  return sum;
+}
+
+// Writes a pid's three parts. Returns how many bytes that was.
+@noinline fn alph_tether_pack(out: uint8*, pid: Word) -> Word {
+  var gens: Word = (Word)(((Word)1 << (ALPH_PLACE_SHIFT - ALPH_INDEX_BITS)) - 1);
+  var slots: Word = (Word)(((Word)1 << ALPH_INDEX_BITS) - 1);
+  var n: Word = alph_tether_small(out, (Word)(pid >> ALPH_PLACE_SHIFT));
+  n = n + alph_tether_small(&out[n], (Word)((pid >> ALPH_INDEX_BITS) & gens));
+  return n + alph_tether_small(&out[n], (Word)(pid & slots));
+}
+
+// Reads a pid's three parts at *at. Returns -1 when they do not fit a pid
+// here.
+@noinline fn alph_tether_unpack(from: uint8*, at: Word*, end: Word) -> Word {
+  var place: Word = alph_tether_big(from, at, end);
+  var gen: Word = alph_tether_big(from, at, end);
+  var slot: Word = alph_tether_big(from, at, end);
+  if (gen < 0 || slot < 0 || (Word)(gen >> (ALPH_PLACE_SHIFT - ALPH_INDEX_BITS)) != 0 || (Word)(slot >> ALPH_INDEX_BITS) != 0) {
+    return -1;
+  }
+  var pid: Word = (Word)((place << ALPH_PLACE_SHIFT) | (gen << ALPH_INDEX_BITS) | slot);
+  if (pid < 0 || (Word)(pid >> ALPH_PLACE_SHIFT) != place) {
+    return -1;
+  }
+  return pid;
+}
+
+fn alph_tether_byte(byte: int32) {
+  if (byte == END) {
+    alph_line_put((uint8)ESC);
+    alph_line_put((uint8)ESC_END);
+  } else if (byte == ESC) {
+    alph_line_put((uint8)ESC);
+    alph_line_put((uint8)ESC_ESC);
+  } else {
+    alph_line_put((uint8)byte);
+  }
+}
+
+// Puts a message on the line, whoever it is for.
+export fn AlphTether_send__ptr(t: AlphTether*, to: Word, m: AlphMsg*) -> Word {
+  var out: uint8[47];
+  var n: Word = alph_tether_pack(&out[0], to);
+  n = n + alph_tether_pack(&out[n], m->from);
+  n = n + alph_tether_small(&out[n], alph_tether_fold(m->tag));
+  n = n + alph_tether_small(&out[n], alph_tether_fold(m->arg));
+  n = n + alph_tether_small(&out[n], alph_tether_fold(m->ref));
+  var sum: Word = alph_sure_sum(&out[0], n);
+  out[n] = (uint8)(sum & 255);
+  out[n + 1] = (uint8)(sum >> 8);
+  // One message at a time on the line. The line has a lock of its own and
+  // not the node's gate: a slow line must not stop the node, and the two
+  // machines must each go on reading while they write.
+  alph_line_use(t->line);
+  for i in 0..(n + 2) {
+    alph_tether_byte((int32)out[i]);
+  }
+  alph_line_put((uint8)END);
+  alph_line_flush();
+  alph_line_unlock();
+  return ALPH_OK;
+}
+
+// Mail for a place on the other machine.
+fn alph_tether_far(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  var t: AlphTether* = (AlphTether*)n->world;
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  if (place < t->first || place >= t->first + t->count) {
+    return ALPH_GONE;
+  }
+  return t->send(to, m);
+}
+
+// The line's bytes come here one at a time.
+fn alph_tether_take(ctx: rawptr, byte: int32) {
+  var t: AlphTether* = (AlphTether*)ctx;
+  if (byte != END) {
+    var b: int32 = byte;
+    if (t->escaped != 0) {
+      t->escaped = 0;
+      if (b == ESC_END) {
+        b = END;
+      } else {
+        b = ESC;
+      }
+    } else if (b == ESC) {
+      t->escaped = 1;
+      return;
+    }
+    // A message too long is counted as far as one past its length, so a
+    // line that never ends one cannot run the count round.
+    if (t->have < MOST) {
+      t->frame[t->have] = (uint8)b;
+    }
+    if (t->have <= MOST) {
+      t->have = t->have + 1;
+    }
+    return;
+  }
+  var had: Word = t->have;
+  t->have = 0;
+  t->escaped = 0;
+  if (had == 0) {
+    return;  // an END with nothing before it only clears the line
+  }
+  var f: uint8* = &t->frame[0];
+  var end: Word = had - 2;
+  var whole: bool = had >= LEAST && had <= MOST
+      && (Word)((Word)f[end] | ((Word)f[end + 1] << 8)) == alph_sure_sum(f, end);
+  var at: Word = 0;
+  var to: Word = -1;
+  var from: Word = -1;
+  var m: AlphMsg;
+  if (whole) {
+    to = alph_tether_unpack(f, &at, end);
+    from = alph_tether_unpack(f, &at, end);
+    m.tag = alph_tether_unfold(alph_tether_big(f, &at, end));
+    m.arg = alph_tether_unfold(alph_tether_big(f, &at, end));
+    m.ref = alph_tether_unfold(alph_tether_big(f, &at, end));
+    m.from = from;
+    whole = at == end;  // nine numbers, and nothing after them
+  }
+  // For this node, or, on a machine that passes mail on, for anywhere but
+  // back down the line.
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  var mine: bool = place == t->node->place;
+  if (t->relay != 0 && to >= 0) {
+    mine = place < t->first || place >= t->first + t->count;
+  }
+  if (!whole || to < 0 || from < 0 || !mine) {
+    t->dropped = t->dropped + 1;
+    return;
+  }
+  t->full = 0;
+  if (t->node->put(to, &m) == ALPH_FULL) {
+    t->full = 1;
+  }
+}
+
+// Starts the line for a node that is already placed: mail off the line is
+// put through it. The other machine's places are first, first + 1, ...
+// Whether mail is passed on (relay) is left as it was set.
+export fn AlphTether_open__ptr(t: AlphTether*, node: AlphNode*, first: Word, count: Word) {
+  t->node = node;
+  t->first = first;
+  t->count = count;
+  t->have = 0;
+  t->escaped = 0;
+  t->dropped = 0;
+  t->sure = 0;
+  t->line = alph_line_which();
+  alph_line_use(t->line);
+  alph_line_put((uint8)END);
+  alph_line_flush();
+  alph_line_start(&alph_tether_take, (rawptr)t);
+  alph_line_unlock();
+}
+
+// Ties a node to the machine at the other end of the port's line. The node
+// is place `place`. The other machine's places are first, first + 1, ...
+// Call it before the first spawn.
+export fn AlphTether_init__ptr(t: AlphTether*, node: AlphNode*, place: Word, first: Word, count: Word) {
+  node->join(place, &alph_tether_far, (rawptr)t);
+  t->relay = 0;
+  t->open(node, first, count);
+}
+
+// Has the helper send what is owed. The line's bytes come in an interrupt
+// on a board, which must not write: a message may be half on the line. A
+// helper whose mailbox is full will look anyway.
+fn alph_sure_wake(s: AlphSure*) {
+  var m: AlphMsg;
+  s->t->node->put(s->helper, &m);
+}
+
+// The one actor that writes on a sure line: the kept messages not yet on
+// it, then a header that is owed, one frame at a time. The test knobs act
+// here.
+fn alph_sure_helper(a: AlphActor*, m: AlphMsg*) -> Word {
+  var s: AlphSure* = (AlphSure*)a->state;
+  while (true) {
+    var out: uint8[7];
+    var at: AlphKept* = 0;
+    var was: int32 = s->gate.enter();
+    out[0] = (uint8)(s->owe >> 1);
+    out[1] = 0;
+    if (s->posted < s->held) {
+      // Read after the gate is left. An ack may free its place by then and
+      // a new message take it, but then the other side has this number
+      // already, and drops what comes with it.
+      at = &s->kept[(Word)((s->acked + s->posted + 1) & (s->room - 1))];
+      out[0] = (uint8)MSG;
+      out[1] = (uint8)((s->acked + s->posted + 1) & 127);
+      s->posted = s->posted + 1;
+      s->owe = (Word)(s->owe & OWE_CHASE);  // the message's header says how far
+    } else if (s->owe != 0) {
+      s->owe = 0;
+    } else {
+      s->gate.leave(was);
+      return 0;
+    }
+    out[2] = (uint8)s->got;
+    out[3] = (uint8)s->life;
+    out[4] = (uint8)s->their;
+    s->gate.leave(was);
+    var sum: Word = alph_sure_sum(&out[0], 5);
+    out[5] = (uint8)(sum & 127);
+    out[6] = (uint8)(sum >> 7);
+    // The knobs choose by a cheap random number, so what they drop cannot
+    // keep step with what is sent again.
+    s->frames = (Word)(s->frames * 1103515245 + 12345);
+    var n: Word = (Word)((s->frames >> 16) & 32767);
+    if (s->damage != 0 && (Word)(n % s->damage) == 0) {
+      out[2] = out[2] + 1;
+    }
+    if (s->lose == 0 || (Word)(n % s->lose) != 0) {
+      alph_line_use(s->t->line);
+      for i in 0..7 {
+        alph_line_put(out[i]);
+      }
+      alph_line_put((uint8)END);
+      alph_line_flush();
+      alph_line_unlock();
+      if (at != 0) {
+        s->t->send(at->to, &at->m);
+      }
+    }
+  }
+  return 0;
+}
+
+// A sound header. A board has no clock that differs from one start to the
+// next, so a new run takes for its life one the other side does not know
+// it by: one more than the life the first header it hears names.
+fn alph_sure_heard(s: AlphSure*, f: uint8*) {
+  var to: Word = (Word)f[4];
+  var was: int32 = s->gate.enter();
+  if (s->life == 0) {
+    s->life = (Word)((to & 63) + 1);
+  }
+  if ((Word)f[3] != s->their) {
+    // A new run of the other side: what was kept for the old one is
+    // dropped, and both sides number from the start.
+    if (s->their != 0) {
+      s->held = 0;
+      s->posted = 0;
+      s->acked = 0;
+      s->got = 0;
+    }
+    s->their = (Word)f[3];
+  }
+  if (to != s->life) {
+    // It does not know this run yet: nothing it says is taken, and it is
+    // told.
+    s->owe = (Word)(s->owe | OWE_ACK);
+  } else {
+    var had: Word = (Word)(((Word)f[2] - s->acked) & 127);
+    if (had != 0 && had <= s->held) {
+      s->acked = (Word)f[2];
+      s->held = s->held - had;
+      s->posted = s->posted - had;
+      if (s->posted < 0) {
+        s->posted = 0;
+      }
+      s->stale = 0;
+    }
+    if ((Word)f[0] == MSG) {
+      s->next = (Word)f[1] + 128;
+    } else if ((Word)f[0] == CHASE) {
+      s->resent = s->resent + s->posted;
+      s->posted = 0;
+    }
+  }
+  s->gate.leave(was);
+}
+
+// The line's bytes on a sure line. They gather as on any line, and a frame
+// is looked at when it ends.
+fn alph_sure_take(ctx: rawptr, byte: int32) {
+  var s: AlphSure* = (AlphSure*)ctx;
+  var t: AlphTether* = s->t;
+  if (byte != END) {
+    alph_tether_take((rawptr)t, byte);
+    return;
+  }
+  var had: Word = t->have;
+  var next: Word = s->next;
+  var f: uint8* = &t->frame[0];
+  s->next = 0;
+  t->have = 0;
+  t->escaped = 0;
+  var bits: Word = 8;
+  if (had == HEAD) {
+    bits = 7;
+  }
+  var sound: bool = had >= HEAD && had <= MOST
+      && (Word)((Word)f[had - 2] | ((Word)f[had - 1] << bits)) == alph_sure_sum(f, had - 2);
+  if (sound && had == HEAD) {
+    alph_sure_heard(s, f);
+  } else if (sound && had >= LEAST && next != 0) {
+    // A message after its header: taken if it is the next in turn, and
+    // said to be had either way. One that comes early says one before it
+    // was lost: the other side is asked for them again, once until the
+    // gap is filled.
+    // It is put in its actor's mailbox before it is said to be had. If
+    // the mailbox is full it is not had: it will be sent again, and by
+    // then there may be room. So a full mailbox loses nothing.
+    var ahead: Word = (Word)((next - s->got - 1) & 127);
+    t->full = 0;
+    if (ahead == 0) {
+      t->have = had;
+      alph_tether_take((rawptr)t, END);
+    }
+    var was: int32 = s->gate.enter();
+    s->owe = (Word)(s->owe | OWE_ACK);
+    if (ahead == 0 && t->full == 0) {
+      s->got = (Word)(next & 127);
+      s->quiet = 0;
+      s->gap = 0;
+    } else if (ahead != 0 && ahead < 64 && s->gap == 0) {
+      s->gap = 1;
+      s->owe = (Word)(OWE_ACK | OWE_CHASE);
+    }
+    s->gate.leave(was);
+  } else {
+    if (had != 0) {
+      t->dropped = t->dropped + 1;
+    }
+    return;
+  }
+  alph_sure_wake(s);
+}
+
+// Sends a message on a sure line: it is kept until the other side says it
+// has it, and sent again until then. Returns ALPH_FULL when room messages
+// are kept already, so the sender can try again later. On a line that is
+// not sure it is send.
+export fn AlphTether_keep__ptr(t: AlphTether*, to: Word, m: AlphMsg*) -> Word {
+  var s: AlphSure* = t->sure;
+  if (s == 0) {
+    return t->send(to, m);
+  }
+  var was: int32 = s->gate.enter();
+  if (s->held >= s->room) {
+    s->gate.leave(was);
+    return ALPH_FULL;
+  }
+  s->held = s->held + 1;
+  var at: AlphKept* = &s->kept[(Word)((s->acked + s->held) & (s->room - 1))];
+  at->to = to;
+  at->m.tag = m->tag;
+  at->m.from = m->from;
+  at->m.arg = m->arg;
+  at->m.ref = m->ref;
+  s->gate.leave(was);
+  alph_sure_wake(s);
+  return ALPH_OK;
+}
+
+// Mail for a place on the other machine, on a sure line.
+fn alph_sure_far(n: AlphNode*, to: Word, m: AlphMsg*) -> Word {
+  var t: AlphTether* = (AlphTether*)n->world;
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  if (place < t->first || place >= t->first + t->count) {
+    return ALPH_GONE;
+  }
+  return t->keep(to, m);
+}
+
+// Twice as long, up to 8 ticks.
+fn alph_sure_longer(ticks: Word) -> Word {
+  if (ticks < 8) {
+    return (Word)(ticks * 2);
+  }
+  return ticks;
+}
+
+// The line's clock: at least one side of a sure line calls it now and then,
+// from a timer, about as often as a message goes there and back (20 to 100
+// ms on a serial line). Kept messages the other side has not said it has
+// for more than a tick are sent again. When nothing came in its turn from
+// the other side for more than a tick, it is asked to send again what this
+// side has not said it has. Each time that brings nothing, the next waits
+// twice as long, up to 8 ticks, unless messages came early: then one is
+// surely missing. On a line that is not sure it does nothing.
+export fn AlphTether_tick__ptr(t: AlphTether*) {
+  var s: AlphSure* = t->sure;
+  if (s == 0) {
+    return;
+  }
+  var was: int32 = s->gate.enter();
+  if (s->stale == 0) {
+    s->again = 1;
+  }
+  s->stale = s->stale + 1;
+  if (s->held == 0) {
+    s->stale = 0;
+  }
+  if (s->stale > s->again) {
+    s->resent = s->resent + s->posted;
+    s->posted = 0;
+    s->stale = 1;
+    s->again = alph_sure_longer(s->again);
+  }
+  if (s->quiet == 0 || s->gap != 0) {
+    s->ask = 1;
+  }
+  s->quiet = s->quiet + 1;
+  if (s->quiet > s->ask) {
+    s->owe = (Word)(s->owe | OWE_CHASE);
+    s->quiet = 1;
+    s->ask = alph_sure_longer(s->ask);
+  }
+  s->gap = 0;  // one more early message may ask again
+  s->gate.leave(was);
+  alph_sure_wake(s);
+}
+
+// Makes the line sure: each message arrives once and in the order it was
+// sent while both ends are up, and what is lost or damaged on the line is
+// sent again. Both ends call it, after init or relay, and at least one
+// calls tick. s is new (all 0) and holds what the line keeps. kept holds
+// the messages the other side does not yet have: room of them, 1, 2, 4 and
+// so on up to 64 (another room is taken as the one below it). A send while
+// all are kept is refused with ALPH_FULL. A side that starts again is a
+// new run: what was kept for its last run is dropped, and the two start
+// numbering again by themselves. It takes one actor of the node. Returns
+// ALPH_FULL when no actor is left.
+export fn AlphTether_sure__ptr(t: AlphTether*, s: AlphSure*, kept: AlphKept*, room: Word) -> Word {
+  s->helper = t->node->spawn(&alph_sure_helper, (rawptr)s);
+  if (s->helper == 0) {
+    return ALPH_FULL;
+  }
+  s->gate.init();
+  s->t = t;
+  s->kept = kept;
+  s->room = 64;
+  while (s->room > room) {
+    s->room = (Word)(s->room >> 1);
+  }
+  s->owe = OWE_CHASE;  // says this run is here
+  t->sure = s;
+  if (t->relay == 0) {
+    t->node->far = &alph_sure_far;
+  }
+  alph_line_use(t->line);
+  alph_line_start(&alph_sure_take, (rawptr)s);
+  alph_line_unlock();
+  alph_sure_wake(s);
+  return ALPH_OK;
+}

@@ -1,0 +1,46 @@
+// One hart, no OS: a microcontroller. The gate masks interrupts.
+
+export type Word = int32;
+export const ALPH_INDEX_BITS: Word = 10;   // 1,024 actors in a node
+export const ALPH_PLACE_SHIFT: Word = 23;  // 13 bits of generation, then 8 of place
+export const ALPH_GATHER: Word = 0;  // no mail comes but through put
+export const ALPH_ON_RUN: Word = 0;  // no on_run: it would cost every image 64 bytes
+
+export struct AlphGate {
+  unused: int32;
+}
+
+export fn AlphGate_init__ptr(g: AlphGate*) {
+}
+
+export fn AlphGate_enter__ptr(g: AlphGate*) -> int32 {
+  return mettle_irq_disable();
+}
+
+export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
+  mettle_irq_restore(was);
+}
+
+// wfi wakes on a pending interrupt even while masked, so nothing is missed.
+export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
+  mettle_irq_wait();
+  mettle_irq_restore(was);
+}
+
+export fn AlphGate_wake__ptr(g: AlphGate*) {
+}
+
+export fn AlphGate_gather__ptr(g: AlphGate*) {
+}
+
+export fn AlphGate_done__ptr(g: AlphGate*) {
+}
+
+// Nothing is held back on a board.
+export fn AlphGate_pass__ptr(g: AlphGate*, was: int32, hold: bool) -> int32 {
+  return was;
+}
+
+// A board's node does not look before it sleeps.
+export fn alph_gate_look(g: AlphGate*, most: int32) {
+}

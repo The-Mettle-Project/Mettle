@@ -1,0 +1,284 @@
+// alph/core/mailbox: messages, and the bounded mailbox that holds them.
+//
+// The mailbox is a chain of small segments, as in crossbeam's SegQueue:
+// senders claim a position with one CAS, the single receiver reads in order,
+// and a segment is linked when the last one fills. An idle actor holds one
+// segment of ALPH_SEG cells; a busy one reuses a spare instead of allocating.
+// Messages from one sender arrive in the order they were sent. A mailbox
+// holding its limit refuses the message instead of growing, so overload
+// shows up at the sender as ALPH_FULL rather than as memory growth.
+
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+
+// Payloads up to this many bytes travel inside the message. Larger ones cost
+// one allocation and are freed after the handler returns.
+export const ALPH_INLINE: int64 = 40;
+
+// A message, as a handler receives it. Read the fields directly:
+//
+//   tag    what the message means. Tags below ALPH_TAG_USER (100) belong to
+//          the runtime; pick your own from ALPH_TAG_USER up
+//   from   the sender's pid, or 0 when sent from outside the node
+//   to     the receiver's pid
+//   ref    the request this message answers (replies, DOWN, TIMEOUT), else 0
+//   arg    one word of data; the exit reason on EXIT and DOWN
+//   size   payload bytes, 0 when there is none
+//
+// The payload is read with alph_msg_value or alph_msg_bytes. It is valid
+// until the handler returns; copy what you keep.
+export struct AlphMsg {
+  tag: int64;
+  from: int64;
+  to: int64;
+  ref: int64;
+  arg: int64;
+  flags: int64;
+  size: int64;
+  heap: int64;      // payload address when size > ALPH_INLINE, else 0
+  data: uint8[40];  // payload when size <= ALPH_INLINE
+}
+
+// Copies the payload into *out when it holds exactly one T.
+//
+//   m    the message
+//   out  where the T goes
+//
+// Returns false, leaving *out alone, when the payload is not sizeof(T)
+// bytes: usually a tag sent with a different type than the receiver expects.
+// Thread: the handler that received m.
+export fn alph_msg_value<T>(m: AlphMsg*, out: T*) -> bool {
+  if (m->size != (int64)sizeof(T)) {
+    return false;
+  }
+  memcpy((rawptr)out, alph_msg_bytes(m, (int64*)0), m->size);
+  return true;
+}
+
+// The payload's address. If size is not 0, *size receives its length in
+// bytes. Returns the address even for an empty payload; check the size.
+// Thread: the handler that received m.
+export fn alph_msg_bytes(m: AlphMsg*, size: int64*) -> rawptr {
+  if (size != 0) {
+    *size = m->size;
+  }
+  if (m->heap != 0) {
+    return (rawptr)m->heap;
+  }
+  return (rawptr)&m->data[0];
+}
+
+// ---- the mailbox: used by alph/core/node ----------------------------------
+
+const ALPH_SEG: int64 = 8;  // cells per segment
+const ALPH_LAP: int64 = 9;  // positions per segment: its cells, then an end mark
+
+struct AlphCell {
+  seq: int64;  // 1 once a sender wrote msg, 0 while free
+  at: int64;   // when it was sent (ns), while the mailbox stamps; else 0
+  msg: AlphMsg;
+}
+
+struct AlphSeg {
+  next: int64;  // the segment after this one, linked before its last cell is written
+  pad: int64;
+  cells: AlphCell[8];  // ALPH_SEG
+}
+
+// A bounded multi-producer, single-consumer queue of messages. Internal to
+// the runtime; actors never touch it.
+//
+// Positions only grow. Position pos is cell pos % ALPH_LAP of its segment;
+// the last position of each lap is an end mark no message uses: a sender
+// that finds enq there waits until the segment that claimed the last cell
+// has linked the next one.
+export struct AlphMailbox {
+  head: int64;   // the segment the receiver reads
+  limit: int64;  // messages it holds before senders are refused
+  spare: int64;  // an emptied segment kept for reuse, or 0
+  stamp: int64;  // 1: senders note when each message was sent (alph_mailbox_stamp)
+  // enq and tail are written by every sender, deq by the receiver for every
+  // message. On one cache line, each write would take the line from the
+  // other side; the padding keeps them 64 bytes apart.
+  pad_a: int64[8];
+  enq: int64;    // next position to claim; senders
+  tail: int64;   // the segment holding position enq; senders
+  pad_b: int64[8];
+  deq: int64;    // next position to read; the receiver
+  pad_c: int64[8];
+}
+
+fn alph_seg_cell(seg: int64, at: int64) -> AlphCell* {
+  return (AlphCell*)(seg + 16 + at * (int64)sizeof(AlphCell));
+}
+
+// Messages sent before position pos: every position but the end marks.
+fn alph_mb_count(pos: int64) -> int64 {
+  return pos - pos / ALPH_LAP;
+}
+
+// A cleared segment: the spare when there is one, else a new one.
+fn alph_seg_take(mb: AlphMailbox*) -> int64 {
+  var seg: int64 = alph_atomic_swap(&mb->spare, 0);
+  if (seg != 0) {
+    return seg;
+  }
+  return (int64)calloc(1, (int64)sizeof(AlphSeg));
+}
+
+// Keeps a cleared segment as the spare, or frees it when there is one.
+fn alph_seg_keep(mb: AlphMailbox*, seg: int64) {
+  if (seg != 0 && alph_atomic_cas(&mb->spare, 0, seg) != 0) {
+    free((rawptr)seg);
+  }
+}
+
+// Prepares an empty mailbox that holds up to limit messages. Returns false
+// when out of memory. Thread: any, before the mailbox is used.
+export fn alph_mailbox_init(mb: AlphMailbox*, limit: int64) -> bool {
+  var seg: int64 = (int64)calloc(1, (int64)sizeof(AlphSeg));
+  if (seg == 0) {
+    return false;
+  }
+  mb->head = seg;
+  mb->tail = seg;
+  mb->spare = 0;
+  mb->limit = limit;
+  mb->enq = 0;
+  mb->deq = 0;
+  return true;
+}
+
+// Sets how many messages the mailbox holds before senders are refused.
+// Messages already in it stay. Thread: any.
+export fn alph_mailbox_set_limit(mb: AlphMailbox*, limit: int64) {
+  alph_atomic_store(&mb->limit, limit);
+}
+
+// Messages waiting, roughly: senders may be mid-way. Thread: any.
+export fn alph_mailbox_count(mb: AlphMailbox*) -> int64 {
+  var n: int64 = alph_mb_count(alph_atomic_load(&mb->enq)) - alph_mb_count(alph_atomic_load(&mb->deq));
+  if (n < 0) {
+    return 0;
+  }
+  return n;
+}
+
+// Copies *m into the mailbox. Returns false when it holds its limit, or
+// when a new segment was needed and memory ran out. Thread: any.
+export fn alph_mailbox_push(mb: AlphMailbox*, m: AlphMsg*) -> bool {
+  return alph_mailbox_put(mb, m, true, 0);
+}
+
+// As alph_mailbox_push, noting at (monotonic ns, above 0) instead of now as
+// the time m was sent, while the mailbox stamps: the time its request
+// really arrived, before it waited elsewhere. Thread: any.
+export fn alph_mailbox_push_at(mb: AlphMailbox*, m: AlphMsg*, at: int64) -> bool {
+  return alph_mailbox_put(mb, m, true, at);
+}
+
+// As alph_mailbox_push, but past the limit too: for messages the receiver
+// asked for, such as replies, which its own outstanding requests already
+// bound. Returns false only when memory runs out. Thread: any.
+export fn alph_mailbox_push_any(mb: AlphMailbox*, m: AlphMsg*) -> bool {
+  return alph_mailbox_put(mb, m, false, 0);
+}
+
+fn alph_mailbox_put(mb: AlphMailbox*, m: AlphMsg*, limited: bool, sent_at: int64) -> bool {
+  var fresh: int64 = 0;  // the next segment, when this sender may link it
+  while (true) {
+    var pos: int64 = alph_atomic_load(&mb->enq);
+    var at: int64 = pos % ALPH_LAP;
+    if (at == ALPH_SEG) {
+      alph_cpu_relax();  // the end mark: the next segment is being linked
+      continue;
+    }
+    if (limited && alph_mb_count(pos) - alph_mb_count(alph_atomic_load(&mb->deq)) >= alph_atomic_load(&mb->limit)) {
+      alph_seg_keep(mb, fresh);
+      return false;
+    }
+    // Read after enq: the tail changes only once enq has reached the end
+    // mark, so if the CAS below succeeds, seg holds pos.
+    var seg: int64 = alph_atomic_load(&mb->tail);
+    if (at + 1 == ALPH_SEG && fresh == 0) {
+      // Whoever claims the last cell links the next segment; have it ready
+      // first, so a failed allocation fails only this send.
+      fresh = alph_seg_take(mb);
+      if (fresh == 0) {
+        return false;
+      }
+    }
+    if (alph_atomic_cas(&mb->enq, pos, pos + 1) == pos) {
+      if (at + 1 == ALPH_SEG) {
+        // Link the next segment before writing the cell: the receiver
+        // follows next once it has read this one.
+        alph_atomic_store(&mb->tail, fresh);
+        alph_atomic_add(&mb->enq, 1);  // past the end mark
+        alph_atomic_store(&((AlphSeg*)seg)->next, fresh);
+        fresh = 0;
+      }
+      var cell: AlphCell* = alph_seg_cell(seg, at);
+      cell->msg = *m;
+      cell->at = 0;
+      if (alph_atomic_load(&mb->stamp) != 0) {
+        if (sent_at > 0) {
+          cell->at = sent_at;
+        } else {
+          cell->at = alph_now_ns();
+        }
+      }
+      alph_atomic_store(&cell->seq, 1);
+      alph_seg_keep(mb, fresh);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Makes senders note when each message was sent (on true), so the receiver
+// can see how long it waited (alph_mailbox_pop_at). Costs a clock read per
+// send. Thread: any.
+export fn alph_mailbox_stamp(mb: AlphMailbox*, on: bool) {
+  if (on) {
+    alph_atomic_store(&mb->stamp, 1);
+  } else {
+    alph_atomic_store(&mb->stamp, 0);
+  }
+}
+
+// Moves the oldest message into *out. Returns false when there is none, or
+// when the oldest is still being written by its sender.
+// Thread: the mailbox's one consumer.
+export fn alph_mailbox_pop(mb: AlphMailbox*, out: AlphMsg*) -> bool {
+  var at: int64 = 0;
+  return alph_mailbox_pop_at(mb, out, &at);
+}
+
+// As alph_mailbox_pop, and stores in *sent_at when the message was sent (ns), or
+// 0 when the mailbox was not stamping then. Thread: the mailbox's one
+// consumer.
+export fn alph_mailbox_pop_at(mb: AlphMailbox*, out: AlphMsg*, sent_at: int64*) -> bool {
+  var pos: int64 = mb->deq;
+  var at: int64 = pos % ALPH_LAP;
+  var seg: int64 = mb->head;
+  var cell: AlphCell* = alph_seg_cell(seg, at);
+  if (alph_atomic_load(&cell->seq) != 1) {
+    return false;
+  }
+  *out = cell->msg;
+  *sent_at = cell->at;
+  cell->seq = 0;
+  if (at + 1 == ALPH_SEG) {
+    // Its last cell: every sender that claimed a cell here has written it,
+    // and the one that wrote this cell linked next first.
+    var next: int64 = alph_atomic_load(&((AlphSeg*)seg)->next);
+    mb->head = next;
+    ((AlphSeg*)seg)->next = 0;
+    alph_seg_keep(mb, seg);
+    alph_atomic_store(&mb->deq, pos + 2);
+  } else {
+    alph_atomic_store(&mb->deq, pos + 1);
+  }
+  return true;
+}

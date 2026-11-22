@@ -1,0 +1,33 @@
+// What a board needs before alph runs on it. Call it first in main. Other
+// boards have their own in their port's folder, so a program is the same
+// source on each.
+
+// Does what this board needs before anything else. Call it first in main.
+export fn alph_board_start() {
+  mettle_board_trap_install();
+}
+
+var g_fresh_waited: int32 = 0;
+
+fn alph_board_step() -> Word {
+  var low: uint32 = *(volatile uint32*)1052672;   // 0x101000: reading it holds the high half
+  var high: uint32 = *(volatile uint32*)1052676;
+  return (Word)(((high << 5) | (low >> 27)) & 262143);
+}
+
+// A number this board has not given before, for work that must be done at
+// most once (alph/board/asks). QEMU's virt board has a clock that goes on
+// while the board is restarted: this is its time in steps of 134 ms. The
+// first call after a start waits for the next step, at most that long, so
+// the number is one the board cannot have given before it was restarted.
+export fn alph_board_fresh() -> Word {
+  var now: Word = alph_board_step();
+  if (g_fresh_waited == 0) {
+    g_fresh_waited = 1;
+    var first: Word = now;
+    while (now == first) {
+      now = alph_board_step();
+    }
+  }
+  return now;
+}

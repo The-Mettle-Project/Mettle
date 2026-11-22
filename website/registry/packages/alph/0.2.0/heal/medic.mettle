@@ -1,0 +1,182 @@
+// alph/heal/medic: proactive healing.
+//
+// Passive healing is a supervisor: the actor crashes, exits, and is started
+// again with a new pid. Proactive healing is a medic: a small actor attached
+// to a bigger one. When the bigger one crashes, the runtime holds it in place
+// (same pid, links, monitors and mailbox; new messages still queue) and the
+// medic's repair function sees the crash reason, the state as the crash left
+// it, and the message being handled. It answers with one of:
+//
+//   ALPH_HEAL_RESUME  go on with the state as repaired; drop that message
+//   ALPH_HEAL_RETRY   go on, and handle that message again
+//   ALPH_HEAL_RESET   start over from the state the actor had when the medic
+//                     was attached; INIT runs again
+//   ALPH_HEAL_FAIL    give up: the actor exits and its supervisor takes over
+//
+// Nobody else sees a repaired crash. More than max_repairs within period_ms
+// counts as ALPH_HEAL_FAIL. If the medic itself dies, the actor runs on
+// without one, and its next crash is handled passively.
+//
+// Attach from the actor's INIT handler, so a restarted actor gets a medic
+// too:
+//
+//   fn repair(ctx: AlphCtx*, r: AlphRepair*) -> int64 {
+//     var a: Account* = (Account*)r->state;
+//     if (a->balance < 0) { a->balance = a->last_good; return ALPH_HEAL_RESUME; }
+//     return ALPH_HEAL_FAIL;
+//   }
+//
+//   var spec: AlphMedicSpec;
+//   alph_medic_init(&spec, &repair);
+//   alph_attach_medic(ctx, &spec);
+
+import "std/mem";
+import "alph/sys/clock";
+import "alph/core/mailbox";
+import "alph/core/node";
+
+// What a repair function returns.
+export const ALPH_HEAL_RESUME: int64 = 0;
+export const ALPH_HEAL_RETRY: int64 = 1;
+export const ALPH_HEAL_RESET: int64 = 2;
+export const ALPH_HEAL_FAIL: int64 = 3;
+
+const ALPH_HEAL_RING: int64 = 64;
+
+// What a repair function is given about one crash.
+//
+//   patient     the crashed actor's pid
+//   reason      why it crashed; ALPH_CRASHED
+//   state       its state block as the crash left it; repair may change it
+//   state_size  the block's size
+//   message     the message it was handling (tag, from, arg, payload);
+//               read the payload with alph_msg_value or alph_msg_bytes
+//   repairs     repairs within the current period, this one included
+//
+// Everything here is valid only during the repair call.
+export struct AlphRepair {
+  patient: int64;
+  reason: int64;
+  state: rawptr;
+  state_size: int64;
+  message: AlphMsg*;
+  repairs: int64;
+}
+
+// A medic's definition. Fill it with alph_medic_init, then change:
+//
+//   max_repairs  repairs allowed within period_ms; one more counts as
+//                ALPH_HEAL_FAIL. Default 3 (at most 63)
+//   period_ms    default 10000
+//
+// repair is the function the medic calls on each crash. It runs in the
+// medic, so it may use ctx to send messages; it must return one of the
+// ALPH_HEAL_ values, and anything else counts as ALPH_HEAL_FAIL.
+export struct AlphMedicSpec {
+  max_repairs: int64;
+  period_ms: int64;
+  repair: fn(AlphCtx*, AlphRepair*) -> int64 with alloc, syscall, asm;
+}
+
+struct AlphMedic {
+  spec: AlphMedicSpec;
+  patient: int64;
+  times: int64[64];
+  count: int64;
+  reset_size: int64;
+  // reset_size bytes of the patient's state at attach time follow
+}
+
+// Fills spec with the defaults (3 repairs per 10000 ms) and the repair
+// function. Thread: any.
+export fn alph_medic_init(spec: AlphMedicSpec*,
+                          repair: fn(AlphCtx*, AlphRepair*) -> int64 with alloc, syscall, asm) {
+  spec->max_repairs = 3;
+  spec->period_ms = 10000;
+  spec->repair = repair;
+}
+
+// Records a repair. Returns the repairs within the period, this one included.
+fn alph_medic_note(md: AlphMedic*) -> int64 {
+  var now: int64 = alph_now_ms();
+  md->times[md->count % ALPH_HEAL_RING] = now;
+  md->count = md->count + 1;
+  var kept: int64 = md->count;
+  if (kept > ALPH_HEAL_RING) {
+    kept = ALPH_HEAL_RING;
+  }
+  var recent: int64 = 0;
+  for k: int64 in 0..kept {
+    if (now - md->times[k] < md->spec.period_ms) {
+      recent = recent + 1;
+    }
+  }
+  return recent;
+}
+
+// Asks the repair function about one crash and carries out its answer.
+fn alph_medic_repair(ctx: AlphCtx*, md: AlphMedic*, reason: int64) {
+  var r: AlphRepair;
+  r.patient = md->patient;
+  r.reason = reason;
+  r.state = alph_patient_state(ctx, md->patient, &r.state_size);
+  r.message = alph_patient_message(ctx, md->patient);
+  r.repairs = alph_medic_note(md);
+  var decision: int64 = ALPH_HEAL_FAIL;
+  if (r.repairs <= md->spec.max_repairs) {
+    decision = md->spec.repair(ctx, &r);
+  }
+  if (decision == ALPH_HEAL_RESUME) {
+    alph_patient_resume(ctx, md->patient, false);
+  } else if (decision == ALPH_HEAL_RETRY) {
+    alph_patient_resume(ctx, md->patient, true);
+  } else if (decision == ALPH_HEAL_RESET) {
+    var image: rawptr = (rawptr)((int64)md + (int64)sizeof(AlphMedic));
+    alph_patient_reset(ctx, md->patient, image, md->reset_size);
+  } else {
+    alph_patient_fail(ctx, md->patient, reason);
+  }
+}
+
+fn alph_medic_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var md: AlphMedic* = (AlphMedic*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_monitor(ctx, md->patient);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN && m->from == md->patient) {
+    // The patient is gone for good; so is its medic.
+    return alph_stop(ctx, ALPH_NORMAL);
+  }
+  if (m->tag == ALPH_TAG_CRASHED && m->from == md->patient) {
+    alph_medic_repair(ctx, md, m->arg);
+  }
+  return ALPH_CONTINUE;
+}
+
+// Attaches a medic to the calling actor. The actor's state right now becomes
+// the state ALPH_HEAL_RESET returns to, so attach at the end of INIT. While
+// a medic is alive, attaching again keeps it: a reset actor runs INIT again
+// without gaining a second medic.
+//
+//   spec  from alph_medic_init; copied
+//
+// Returns the medic's pid, or 0 when the node is full or out of memory.
+// Thread: the actor's own handler.
+export fn alph_attach_medic(ctx: AlphCtx*, spec: AlphMedicSpec*) -> int64 {
+  var total: int64 = (int64)sizeof(AlphMedic) + ctx->state_size;
+  var md: AlphMedic* = (AlphMedic*)malloc(total);
+  if (md == 0) {
+    return 0;
+  }
+  memset((rawptr)md, 0, (int64)sizeof(AlphMedic));
+  md->spec = *spec;
+  md->patient = ctx->self;
+  md->reset_size = ctx->state_size;
+  if (ctx->state_size > 0) {
+    memcpy((rawptr)((int64)md + (int64)sizeof(AlphMedic)), ctx->state, ctx->state_size);
+  }
+  var medic: int64 = alph_spawn_medic(ctx, (rawptr)md, total, &alph_medic_handle);
+  free((rawptr)md);
+  return medic;
+}

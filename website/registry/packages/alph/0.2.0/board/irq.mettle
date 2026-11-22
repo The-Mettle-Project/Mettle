@@ -1,0 +1,75 @@
+// Interrupts as messages, on a board. A source of external interrupts (a
+// pin, a sensor that has a reading, a counter that wrapped) is given an
+// actor and a tag: each interrupt sends that actor one message, with the
+// source in arg and how many there have been in ref. The handler then runs
+// like any other, outside the interrupt, so it may take its time.
+//
+// A device that keeps asking until it is answered has to be quieted in the
+// interrupt itself, or the interrupt comes again at once: give a function
+// for that. It runs in the interrupt and should do nothing else.
+//
+// If the actor's mailbox is full the message is lost and the count still
+// goes up, so the actor sees from ref that it missed some.
+
+import "port/port";
+import "port/line";
+import "alph/actor/actor";
+
+// One source: who is told, and how.
+export struct AlphIrq {
+  source: Word;
+  to: Word;
+  tag: Word;
+  count: Word;
+  quiet: fn(Word) -> void;
+}
+
+var g_node: AlphNode* = 0;
+var g_irqs: AlphIrq* = 0;
+var g_room: Word = 0;
+var g_count: Word = 0;
+
+fn alph_irq_trap(source: int32) {
+  for i in 0..g_count {
+    var q: AlphIrq* = &g_irqs[i];
+    if (q->source == (Word)source) {
+      var quiet: fn(Word) -> void = q->quiet;
+      if (quiet != 0) {
+        quiet(q->source);
+      }
+      q->count = q->count + 1;
+      var m: AlphMsg = { tag: q->tag, from: 0, arg: q->source, ref: q->count };
+      g_node->put(q->to, &m);
+    }
+  }
+}
+
+// Gives the interrupts their node and the memory for `room` sources. Call
+// it once, before the first on.
+export fn alph_irqs(node: AlphNode*, irqs: AlphIrq*, room: Word) {
+  g_node = node;
+  g_irqs = irqs;
+  g_room = room;
+  g_count = 0;
+  alph_board_others(&alph_irq_trap);
+}
+
+// From now on each interrupt from `source` sends `to` a message with this
+// tag. quiet, if not 0, is called in the interrupt first, to stop the
+// device asking. Returns ALPH_OK, or ALPH_FULL when every source is taken.
+export fn alph_irq(source: Word, to: Word, tag: Word, quiet: fn(Word) -> void) -> Word {
+  if (g_count >= g_room) {
+    return ALPH_FULL;
+  }
+  var was: int32 = mettle_irq_disable();
+  var q: AlphIrq* = &g_irqs[g_count];
+  q->source = source;
+  q->to = to;
+  q->tag = tag;
+  q->count = 0;
+  q->quiet = quiet;
+  g_count = g_count + 1;
+  mettle_irq_restore(was);
+  mettle_board_irq_enable((int32)source);
+  return ALPH_OK;
+}
