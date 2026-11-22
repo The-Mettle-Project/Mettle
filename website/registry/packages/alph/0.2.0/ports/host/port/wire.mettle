@@ -1,0 +1,104 @@
+// Datagrams between machines: UDP over IPv4.
+
+import "port/sys";
+
+const AF_INET: int64 = 2;
+const SOCK_DGRAM: int64 = 2;
+const SOL_SOCKET: int64 = 1;
+const SO_RCVTIMEO: int64 = 20;
+
+// A UDP socket.
+export struct AlphWire {
+  fd: int64;
+}
+
+// The address a.b.c.d as one number.
+export fn alph_ip4(a: int64, b: int64, c: int64, d: int64) -> uint32 {
+  return (uint32)((a << 24) | (b << 16) | (c << 8) | d);
+}
+
+fn alph_wire_address(out: uint8*, ip: uint32, port: int64) {
+  for i in 0..16 {
+    out[i] = 0;
+  }
+  out[0] = (uint8)AF_INET;
+  out[2] = (uint8)((port >> 8) & 255);
+  out[3] = (uint8)(port & 255);
+  out[4] = (uint8)((ip >> 24) & 255);
+  out[5] = (uint8)((ip >> 16) & 255);
+  out[6] = (uint8)((ip >> 8) & 255);
+  out[7] = (uint8)(ip & 255);
+}
+
+// Listens on a port. recv gives up after wait_ms with nothing. False when
+// the port cannot be had.
+export fn AlphWire_open__ptr(w: AlphWire*, port: int64, wait_ms: int64) -> bool {
+  var address: uint8[16];
+  var wait: int64[2];
+  w->fd = syscall(ALPH_NR_SOCKET, AF_INET, SOCK_DGRAM, 0);
+  if (w->fd < 0) {
+    return false;
+  }
+  wait[0] = wait_ms / 1000;
+  wait[1] = (wait_ms % 1000) * 1000;
+  syscall(ALPH_NR_SETSOCKOPT, w->fd, SOL_SOCKET, SO_RCVTIMEO, (int64)&wait[0], 16);
+  alph_wire_address(&address[0], 0, port);
+  if (syscall(ALPH_NR_BIND, w->fd, (int64)&address[0], 16) < 0) {
+    syscall(ALPH_NR_CLOSE, w->fd);
+    w->fd = -1;
+    return false;
+  }
+  return true;
+}
+
+// Any thread may send. False when the datagram could not go out.
+export fn AlphWire_send__ptr(w: AlphWire*, ip: uint32, port: int64, bytes: uint8*, count: int64) -> bool {
+  var address: uint8[16];
+  alph_wire_address(&address[0], ip, port);
+  return syscall(ALPH_NR_SENDTO, w->fd, (int64)bytes, count, 0, (int64)&address[0], 16) == count;
+}
+
+// The next datagram, and who sent it. Returns its length, or 0 when none
+// came in time.
+export fn AlphWire_recv__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint32*, port: int64*) -> int64 {
+  var address: uint8[16];
+  var size: int32 = 16;
+  var got: int64 = syscall(ALPH_NR_RECVFROM, w->fd, (int64)bytes, room, 0, (int64)&address[0], (int64)&size);
+  if (got <= 0) {
+    return 0;
+  }
+  *port = ((int64)address[2] << 8) | (int64)address[3];
+  *ip = alph_ip4((int64)address[4], (int64)address[5], (int64)address[6], (int64)address[7]);
+  return got;
+}
+
+// The next datagram if one is here already, without waiting. Returns its
+// length, or 0 for none.
+export fn AlphWire_recv_now__ptr(w: AlphWire*, bytes: uint8*, room: int64, ip: uint32*, port: int64*) -> int64 {
+  var address: uint8[16];
+  var size: int32 = 16;
+  var got: int64 = syscall(ALPH_NR_RECVFROM, w->fd, (int64)bytes, room, 64, (int64)&address[0], (int64)&size);  // 64: do not wait
+  if (got <= 0) {
+    return 0;
+  }
+  *port = ((int64)address[2] << 8) | (int64)address[3];
+  *ip = alph_ip4((int64)address[4], (int64)address[5], (int64)address[6], (int64)address[7]);
+  return got;
+}
+
+// Waits until a datagram is here, and no longer than `ns` nanoseconds.
+export fn AlphWire_wait__ptr(w: AlphWire*, ns: int64) {
+  var fd: int32[2];    // the kernel's pollfd: the descriptor, then what is asked and what is so
+  var most: int64[2];
+  fd[0] = (int32)w->fd;
+  fd[1] = 1;           // data to read
+  most[0] = ns / 1000000000;
+  most[1] = ns % 1000000000;
+  syscall(ALPH_NR_PPOLL, (int64)&fd[0], 1, (int64)&most[0], 0, 0);
+}
+
+// Closes the socket.
+export fn AlphWire_close__ptr(w: AlphWire*) {
+  syscall(ALPH_NR_CLOSE, w->fd);
+  w->fd = -1;
+}

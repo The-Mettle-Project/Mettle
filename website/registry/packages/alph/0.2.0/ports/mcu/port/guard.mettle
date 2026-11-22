@@ -1,0 +1,23 @@
+// No guard on a microcontroller: a crash is the board's trap, and the
+// program's own mettle_trap decides what happens.
+
+export struct AlphGuard {
+  unused: int32;
+}
+
+export fn AlphGuard_open__ptr(g: AlphGuard*) -> bool {
+  return true;
+}
+
+export fn AlphGuard_close__ptr(g: AlphGuard*) {
+}
+
+export fn AlphGuard_arm__ptr(g: AlphGuard*) {
+}
+
+export fn AlphGuard_disarm__ptr(g: AlphGuard*) {
+}
+
+export fn AlphGuard_save__ptr(g: AlphGuard*) -> int64 {
+  return 0;
+}

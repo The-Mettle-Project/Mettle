@@ -1,0 +1,85 @@
+// Linux system calls on 64-bit ARM: their numbers, from the kernel's
+// generic table, and the calls this CPU makes in another shape than
+// x86-64. It has no open, fork or epoll_wait: they are openat, clone and
+// epoll_pwait here.
+
+export const ALPH_NR_READ: int64 = 63;
+export const ALPH_NR_WRITE: int64 = 64;
+export const ALPH_NR_CLOSE: int64 = 57;
+export const ALPH_NR_LSEEK: int64 = 62;
+export const ALPH_NR_MMAP: int64 = 222;
+export const ALPH_NR_IOCTL: int64 = 29;
+export const ALPH_NR_SCHED_YIELD: int64 = 124;
+export const ALPH_NR_GETPID: int64 = 172;
+export const ALPH_NR_NANOSLEEP: int64 = 101;
+export const ALPH_NR_PPOLL: int64 = 73;
+export const ALPH_NR_SOCKET: int64 = 198;
+export const ALPH_NR_CONNECT: int64 = 203;
+export const ALPH_NR_SENDTO: int64 = 206;
+export const ALPH_NR_RECVFROM: int64 = 207;
+export const ALPH_NR_BIND: int64 = 200;
+export const ALPH_NR_GETSOCKNAME: int64 = 204;
+export const ALPH_NR_LISTEN: int64 = 201;
+export const ALPH_NR_SOCKETPAIR: int64 = 199;
+export const ALPH_NR_SETSOCKOPT: int64 = 208;
+export const ALPH_NR_GETSOCKOPT: int64 = 209;
+export const ALPH_NR_EXECVE: int64 = 221;
+export const ALPH_NR_FCNTL: int64 = 25;
+export const ALPH_NR_FTRUNCATE: int64 = 46;
+export const ALPH_NR_FUTEX: int64 = 98;
+export const ALPH_NR_SCHED_GETAFFINITY: int64 = 123;
+export const ALPH_NR_CLOCK_GETTIME: int64 = 113;
+export const ALPH_NR_EXIT_GROUP: int64 = 94;
+export const ALPH_NR_KILL: int64 = 129;
+export const ALPH_NR_EPOLL_CTL: int64 = 21;
+export const ALPH_NR_WAITID: int64 = 95;
+export const ALPH_NR_ACCEPT4: int64 = 242;
+export const ALPH_NR_EVENTFD2: int64 = 19;
+export const ALPH_NR_EPOLL_CREATE1: int64 = 20;
+export const ALPH_NR_PIPE2: int64 = 59;
+export const ALPH_NR_PIDFD_OPEN: int64 = 434;
+
+const NR_OPENAT: int64 = 56;
+const NR_CLONE: int64 = 220;
+const NR_UNLINKAT: int64 = 35;
+const NR_EPOLL_PWAIT: int64 = 22;
+const AT_FDCWD: int64 = -100;
+const SIGCHLD: int64 = 17;
+
+// The kernel's epoll record. Here it is not packed: the 8 bytes it hands
+// back start at byte 8, so the record is 16 bytes.
+export struct AlphEpollEvent {
+  events: uint32;
+  pad: uint32;
+  slot: uint32;
+  turn: uint32;
+}
+
+// Opens a file by its path. Returns the descriptor or -errno.
+export fn alph_sys_open(path: cstring, flags: int64, mode: int64) -> int64 {
+  return syscall(NR_OPENAT, AT_FDCWD, (int64)path, flags, mode);
+}
+
+// A copy of this process. Returns 0 in the copy, its pid in the caller,
+// or -errno.
+export fn alph_sys_fork() -> int64 {
+  return syscall(NR_CLONE, SIGCHLD, 0, 0, 0, 0);
+}
+
+// Waits up to ms milliseconds for events on an epoll. Returns how many.
+export fn alph_sys_epoll_wait(epoll: int64, events: AlphEpollEvent*, room: int64, ms: int64) -> int64 {
+  return syscall(NR_EPOLL_PWAIT, epoll, (int64)events, room, ms, 0, 8);
+}
+
+// Removes a file by its path. Returns 0 or -errno.
+export fn alph_sys_unlink(path: cstring) -> int64 {
+  return syscall(NR_UNLINKAT, AT_FDCWD, (int64)path, 0);
+}
+
+// A count that goes up as time passes: here the clock in nanoseconds,
+// which is a system call. How fast it goes is for the caller to measure.
+export fn alph_sys_stamp() -> int64 {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  return ts[0] * 1000000000 + ts[1];
+}

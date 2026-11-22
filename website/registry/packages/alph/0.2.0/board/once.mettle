@@ -1,0 +1,73 @@
+// A kind of work a board does at most once, whatever is lost on the way:
+// work that changes something, such as moving an arm. It is apart from
+// alph/board/board so that a board with no such kind pays nothing for it.
+//
+// The board remembers the last jobs it did for each asker (alph/place/once
+// says how). A job sent again is answered from that memory and not done
+// again. A job from an asker the board does not know, because the board
+// was restarted since, is refused as lost: that asker then knows it cannot
+// tell whether the job was done.
+
+import "port/port";
+import "alph/actor/actor";
+import "alph/board/board";
+import "alph/place/words";
+import "alph/place/once";
+
+// One such kind: how it is done and what is remembered. The program hands
+// it in.
+export struct AlphBoardOnce {
+  board: AlphBoard*;
+  run: fn(Word) -> Word;
+  memory: AlphOnce;
+}
+
+fn alph_board_serve_once(a: AlphActor*, m: AlphMsg*) -> Word {
+  var k: AlphBoardOnce* = (AlphBoardOnce*)a->state;
+  var run: fn(Word) -> Word = k->run;
+  var answer: AlphMsg = { tag: ALPH_WORKED, from: a->pid, arg: 0, ref: m->ref };
+  if (m->tag == ALPH_HELLO) {
+    if (!k->memory.hello(m->from, m->ref)) {
+      return 0;
+    }
+    answer.tag = ALPH_HELLO;
+  } else if (m->tag == ALPH_WORK_ONCE) {
+    var seen: Word = k->memory.seen(m->from, m->ref, &answer.arg);
+    if (seen == ALPH_ONCE_STRANGER) {
+      answer.tag = ALPH_REFUSED;
+      answer.arg = ALPH_LOST;
+    } else if (seen == ALPH_ONCE_RUN) {
+      k->memory.begin(m->from, m->ref);
+      answer.arg = run(m->arg);
+      k->memory.done(m->from, m->ref, answer.arg);
+      k->board->served = k->board->served + 1;
+    } else if (seen != ALPH_ONCE_DONE) {
+      return 0;
+    }
+  } else {
+    return 0;
+  }
+  a->node->put(m->from, &answer);
+  return 0;
+}
+
+// Does a kind of work (0 to 7) for the other machines, each job at most
+// once: run is given a job's in and returns its out, and `once` is the
+// memory for it. The machines must ask for the kind the same way
+// (AlphMachine_once). Returns ALPH_OK, ALPH_FULL when there is no actor
+// left for it, ALPH_GONE for a kind that is not 0 to 7 or is shared
+// already.
+export fn AlphBoard_share_once__ptr(b: AlphBoard*, kind: Word, run: fn(Word) -> Word, once: AlphBoardOnce*) -> Word {
+  if (kind < 0 || kind >= 8 || b->workers[kind] != 0) {
+    return ALPH_GONE;
+  }
+  once->board = b;
+  once->run = run;
+  once->memory.init();
+  var pid: Word = b->node.spawn(&alph_board_serve_once, (rawptr)once);
+  if (pid == 0) {
+    return ALPH_FULL;
+  }
+  b->workers[kind] = pid;
+  return ALPH_OK;
+}

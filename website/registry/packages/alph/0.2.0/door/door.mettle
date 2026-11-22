@@ -1,0 +1,135 @@
+// The door: the first actor of a machine, at a pid any other machine can
+// work out. Through it an actor finds another machine's actors by name and
+// watches them, with nothing but messages.
+//
+// Finding: find asks a machine's door for the pid behind a name, and the
+// answer is an ALPH_HERE message.
+//
+// Watching: watch works for an actor anywhere. For one on another machine
+// the door there keeps the watch and tells this door when the actor ends,
+// and if that machine is lost first, the actor has ended with ALPH_LOST.
+
+import "port/port";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+import "alph/name/name";
+import "alph/life/life";
+import "alph/door/words";
+
+const ALPH_WATCH: Word = -12;         // door to door: watch the actor in arg for me, under this ref
+
+// A machine's door and the layers it answers from.
+export struct AlphDoor {
+  cores: AlphCores*;
+  link: AlphLink*;
+  names: AlphNames*;
+  life: AlphLife*;
+  pid: Word;
+  tell: Word;  // the actor that hears of machines coming and going, 0 for none
+}
+
+fn alph_door_run(a: AlphActor*, m: AlphMsg*) -> Word {
+  var d: AlphDoor* = (AlphDoor*)a->state;
+  // An answer that cannot be sent yet (the way to that machine is full) is
+  // not dropped: the door sends itself the request and answers it later.
+  if (m->tag == ALPH_WHERE) {
+    // The answer is sent as from the actor found, when there is one. A
+    // board cannot read a pid out of arg (a message's arg crosses its line
+    // as 32 bits), but who a message is from always crosses whole.
+    var here: AlphMsg = { tag: ALPH_HERE, from: a->pid, arg: d->names->get(m->arg), ref: m->ref };
+    if (here.arg != 0) {
+      here.from = here.arg;
+    }
+    if (a->node->put(m->from, &here) == ALPH_FULL) {
+      a->node->put(a->pid, m);
+    }
+  } else if (m->tag == ALPH_WATCH) {
+    var out: Word = d->life->watch_as(m->from, m->arg, m->ref);
+    if (out != ALPH_OK) {
+      var gone: AlphMsg = { tag: ALPH_ENDED, from: m->arg, arg: out, ref: m->ref };
+      if (a->node->put(m->from, &gone) == ALPH_FULL) {
+        a->node->put(a->pid, m);
+      }
+    }
+  } else if (m->tag == ALPH_ENDED) {
+    // Only another machine's door speaks for an actor that ended there.
+    if (d->link->first_of((Word)(m->from >> ALPH_PLACE_SHIFT)) != d->cores->first) {
+      d->life->ended_far(m->from, m->ref, m->arg);
+    }
+  } else if (m->tag == ALPH_DOWN || m->tag == ALPH_UP) {
+    if (m->tag == ALPH_DOWN) {
+      d->life->lost(m->arg, d->link->count_of(m->arg));
+    }
+    // The link says it once. If the actor to tell has no room, the door
+    // sends itself the same word and tries again.
+    if (d->tell != 0 && a->send(d->tell, m->tag, m->arg) == ALPH_FULL) {
+      a->node->put(a->pid, m);
+    }
+  }
+  return 0;
+}
+
+// Opens this machine's door. It must be the first actor spawned on the
+// cores, after the link, the names and the lives are set up and before the
+// link starts. Returns its pid, or ALPH_GONE when it was not the first.
+export fn AlphDoor_init__ptr(d: AlphDoor*, cores: AlphCores*, link: AlphLink*, names: AlphNames*, life: AlphLife*) -> Word {
+  d->cores = cores;
+  d->link = link;
+  d->names = names;
+  d->life = life;
+  d->tell = 0;
+  d->pid = 0;
+  if (cores->cores[0].node.live != 0) {
+    return ALPH_GONE;
+  }
+  d->pid = cores->spawn_on(0, &alph_door_run, (rawptr)d);
+  if (d->pid != alph_door_of(cores->first)) {
+    return ALPH_GONE;
+  }
+  link->watch(d->pid);
+  return d->pid;
+}
+
+// The actor sent ALPH_UP and ALPH_DOWN as machines come and go.
+export fn AlphDoor_tell__ptr(d: AlphDoor*, pid: Word) {
+  d->tell = pid;
+}
+
+// Asks the machine that has a place for the pid behind a name. The answer
+// is ALPH_HERE with the ref this returns: arg is the pid, 0 when that
+// machine has no such name. Returns ALPH_GONE when no machine has the
+// place or it cannot be reached.
+export fn AlphDoor_find__ptr(d: AlphDoor*, a: AlphActor*, place: Word, name: Word) -> Word {
+  var first: Word = d->link->first_of(place);
+  if (first < 0) {
+    return ALPH_GONE;
+  }
+  return a->ask(alph_door_of(first), ALPH_WHERE, name);
+}
+
+// Has watcher sent ALPH_ENDED when target ends, wherever target is.
+// Returns the watch's ref, ALPH_FULL when every watch is in use or the way
+// to the target's machine is full for now, ALPH_GONE when the target is
+// gone or its machine cannot be reached. A target on
+// another machine that was already gone there is told as an end, with the
+// reason ALPH_GONE, and one that machine has no watch left for with the
+// reason ALPH_FULL.
+export fn AlphDoor_watch__ptr(d: AlphDoor*, watcher: Word, target: Word) -> Word {
+  var ref: Word = d->life->watch(watcher, target);
+  var first: Word = d->link->first_of((Word)(target >> ALPH_PLACE_SHIFT));
+  if (ref <= 0 || first == d->cores->first) {
+    return ref;
+  }
+  var out: Word = ALPH_GONE;
+  if (first >= 0) {
+    var ask: AlphMsg = { tag: ALPH_WATCH, from: d->pid, arg: target, ref: ref };
+    out = d->cores->cores[0].node.put(alph_door_of(first), &ask);
+  }
+  if (out != ALPH_OK && d->life->unwatch(ref) == ALPH_OK) {
+    return out;
+  }
+  // Asked for, or already told: the machine was lost in between and the
+  // watcher has its ALPH_ENDED.
+  return ref;
+}

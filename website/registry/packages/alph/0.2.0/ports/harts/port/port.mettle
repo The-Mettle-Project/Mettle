@@ -1,0 +1,94 @@
+// Several harts, no OS: a microcontroller with more than one core. Build
+// with -I ports/harts -I ports/mcu: this folder has what differs when there
+// is more than one hart, and the rest is the one-hart port's.
+//
+// The gate is a lock as well as interrupts off, since another hart is not
+// kept out by this hart's interrupts. A hart with nothing to do sleeps in
+// wfi, and the hart that gives it work wakes it with its software interrupt.
+
+export type Word = int32;
+export const ALPH_INDEX_BITS: Word = 10;   // 1,024 actors in a node
+export const ALPH_PLACE_SHIFT: Word = 23;  // 13 bits of generation, then 8 of place
+export const ALPH_GATHER: Word = 0;  // no mail comes but through put
+export const ALPH_ON_RUN: Word = 0;  // no on_run: it would cost every image 64 bytes
+
+const SOFTWARE: uint64 = 8;       // the software interrupt's bit in mie
+const WAKE_BASE: int32 = 33554432;  // the CLINT: one word a hart, at 0x2000000
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+export struct AlphGate {
+  lock: int32;
+  asleep: int32;
+  hart: int32;  // the hart that sleeps on this gate
+}
+
+// Sets or clears the word that holds a hart's software interrupt.
+fn alph_hart_poke(hart: int32, value: uint32) {
+  var word: volatile uint32* = (volatile uint32*)(WAKE_BASE + 4 * hart);
+  *word = value;
+}
+
+export fn AlphGate_init__ptr(g: AlphGate*) {
+  g->lock = 0;
+  g->asleep = 0;
+  g->hart = 0;
+}
+
+export fn AlphGate_enter__ptr(g: AlphGate*) -> int32 {
+  var was: int32 = mettle_irq_disable();
+  while (mettle_atomic_exchange_i32(&g->lock, 1) != 0) {
+  }
+  return was;
+}
+
+export fn AlphGate_leave__ptr(g: AlphGate*, was: int32) {
+  mettle_atomic_compare_exchange_i32(&g->lock, 0, 1);
+  mettle_irq_restore(was);
+}
+
+// wfi returns on an interrupt that is pending even while interrupts are
+// off, so a wake that comes between the unlock and the wfi is not missed:
+// it is still pending. The message a wake is for was queued before the
+// wake, and the queue is looked at again after this returns.
+export fn AlphGate_sleep__ptr(g: AlphGate*, was: int32) {
+  var hart: int32 = (int32)mettle_csr_mhartid();
+  g->hart = hart;
+  g->asleep = 1;
+  mettle_atomic_compare_exchange_i32(&g->lock, 0, 1);
+  mettle_csr_set_mie(SOFTWARE);
+  mettle_irq_wait();
+  g->asleep = 0;
+  alph_hart_poke(hart, 0);
+  mettle_irq_restore(was);
+}
+
+// Called inside the gate.
+export fn AlphGate_wake__ptr(g: AlphGate*) {
+  if (g->asleep != 0) {
+    g->asleep = 0;
+    alph_hart_poke(g->hart, 1);
+  }
+}
+
+export fn AlphGate_gather__ptr(g: AlphGate*) {
+}
+
+export fn AlphGate_done__ptr(g: AlphGate*) {
+}
+
+// Nothing is held back on a board.
+export fn AlphGate_pass__ptr(g: AlphGate*, was: int32, hold: bool) -> int32 {
+  return was;
+}
+
+// A wake that arrives while its hart is awake with interrupts on: nothing
+// to do but take it back.
+@interrupt fn mettle_trap_software() {
+  alph_hart_poke((int32)mettle_csr_mhartid(), 0);
+}
+
+// A board's node does not look before it sleeps.
+export fn alph_gate_look(g: AlphGate*, most: int32) {
+}

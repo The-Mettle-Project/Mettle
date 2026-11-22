@@ -1,0 +1,131 @@
+// alph/sys/thread: threads that survive their own crashes.
+//
+// Each thread gets a guard page at the bottom of its stack, its own alternate
+// signal stack, and a recovery registration covering its stack. A stack
+// overflow then faults on the guard page, the fault handler runs on the
+// alternate stack, and alph/sys/recover can resume the thread. The node runs
+// one of these per scheduler.
+
+import "std/thread";
+import "alph/sys/atomic";
+import "alph/sys/linux";
+import "alph/sys/recover";
+
+const ALPH_ALTSTACK_SIZE: int64 = 65536;
+const ALPH_MIN_STACK: int64 = 65536;
+
+// A thread started by alph_thread_start. Keep it alive and in place until
+// alph_thread_join returns; the thread reads and writes it.
+//
+//   result   what body returned, valid after alph_thread_join
+//   recover  the thread's recovery registration, for alph_recover_save
+export struct AlphThread {
+  body: fn(int64) -> int64;
+  arg: int64;
+  stack_size: int64;
+  guard: int64;
+  altstack: int64;
+  result: int64;
+  recover: AlphRecover;
+}
+
+fn alph_thread_protect(page: int64, prot: int64) -> int64 {
+  return syscall(ALPH_SYS_MPROTECT, page, ALPH_PAGE_SIZE, prot);
+}
+
+fn alph_thread_sigaltstack(sp: int64, flags: int64, size: int64) -> int64 {
+  // struct stack_t { void *ss_sp; int ss_flags; size_t ss_size; }
+  var ss: int64[3];
+  ss[0] = sp;
+  ss[1] = flags;
+  ss[2] = size;
+  return syscall(ALPH_SYS_SIGALTSTACK, (int64)&ss[0], 0);
+}
+
+fn alph_thread_main(raw: cstring) -> uint32 {
+  var t: AlphThread* = (AlphThread*)raw;
+  // The runtime starts the thread at the top of a stack_size block, so a
+  // local's address is within a few hundred bytes of that top.
+  var top: int64 = (int64)&t;
+  var base: int64 = top - t->stack_size;
+  t->guard = (base + 2 * ALPH_PAGE_SIZE) & -ALPH_PAGE_SIZE;
+  alph_thread_protect(t->guard, ALPH_PROT_NONE);
+
+  t->altstack = syscall(ALPH_SYS_MMAP, 0, ALPH_ALTSTACK_SIZE, ALPH_PROT_READ_WRITE,
+                        ALPH_MAP_PRIVATE_ANONYMOUS, -1, 0);
+  if (t->altstack > 0) {
+    alph_thread_sigaltstack(t->altstack, 0, ALPH_ALTSTACK_SIZE);
+  }
+
+  // The range starts below the guard page so an overflow fault still matches.
+  alph_recover_register(&t->recover, t->guard - ALPH_PAGE_SIZE, top + ALPH_PAGE_SIZE);
+  t->result = t->body(t->arg);
+  alph_recover_unregister(&t->recover);
+
+  if (t->altstack > 0) {
+    alph_thread_sigaltstack(0, ALPH_SS_DISABLE, 0);
+    syscall(ALPH_SYS_MUNMAP, t->altstack, ALPH_ALTSTACK_SIZE);
+  }
+  alph_thread_protect(t->guard, ALPH_PROT_READ_WRITE);
+  return 0;
+}
+
+// Starts body(arg) on a new thread.
+//
+//   t           storage for the thread; it belongs to the thread until joined
+//   body        the thread's work; its return value lands in t->result
+//   arg         passed to body
+//   stack_size  bytes of stack, at least 64 KiB (smaller values are raised)
+//
+// Returns the thread's handle, or 0 when it could not start. Keep the handle:
+// the thread owns t, so the handle is what the caller holds on to.
+// Thread: any.
+export fn alph_thread_start(t: AlphThread*, body: fn(int64) -> int64, arg: int64,
+                            stack_size: int64) -> int64 {
+  t->body = body;
+  t->arg = arg;
+  t->stack_size = stack_size;
+  if (t->stack_size < ALPH_MIN_STACK) {
+    t->stack_size = ALPH_MIN_STACK;
+  }
+  t->result = 0;
+  return CreateThread(0, (uint64)t->stack_size, &alph_thread_main, (cstring)t, 0, 0);
+}
+
+// Waits for a thread to finish and returns what its body returned.
+//
+//   handle  from alph_thread_start
+//   t       the same storage given to alph_thread_start
+//
+// Thread: any thread except the one being joined.
+export fn alph_thread_join(handle: int64, t: AlphThread*) -> int64 {
+  thread_join_infinite(handle);
+  thread_close(handle);
+  return t->result;
+}
+
+// The number of CPUs this process may run on, at least 1. The node uses it
+// as the default scheduler count.
+// Thread: any.
+export fn alph_cpu_count() -> int64 {
+  var mask: int64[16];
+  for i: int64 in 0..16 {
+    mask[i] = 0;
+  }
+  var bytes: int64 = syscall(ALPH_SYS_SCHED_GETAFFINITY, 0, 128, (int64)&mask[0]);
+  if (bytes <= 0) {
+    return 1;
+  }
+  var count: int64 = 0;
+  for i: int64 in 0..bytes / 8 {
+    var word: int64 = mask[i];
+    while (word != 0) {
+      word = word & (word - 1);
+      count = count + 1;
+    }
+  }
+  if (count < 1) {
+    return 1;
+  }
+  return count;
+}

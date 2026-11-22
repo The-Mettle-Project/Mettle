@@ -1,0 +1,128 @@
+// Seals: a link only the holders of one key can read or speak on.
+//
+// Every machine of the network is given the same 32-byte key. Each datagram
+// is encrypted and signed with it (XChaCha20-Poly1305), under a number used
+// once: the sender's first place, when the sender's run began, a count that
+// goes up with every datagram, and four random bytes drawn when it began.
+// A datagram made without the key, changed on the way, or played again is
+// dropped, and so is everything from a run earlier than the latest heard.
+//
+// What it does not give: one key for all means any holder can speak as any
+// machine, and someone who gets the key later can read what they recorded
+// before. A machine whose clock was set back before a restart is taken for
+// an earlier run and not heard until its clock has passed its last start.
+// Sizes, timing and who talks to whom are not hidden.
+//
+// This is its own layer so that a program that does not seal its link does
+// not need the crypto package.
+
+import "cryptex/cryptex";
+import "port/port";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+
+const HEAD: int64 = 24;  // place 4, run 8, count 8, salt 4: sent in the clear, and the number used once
+const TAG: int64 = 16;
+
+// A sealed link's key and its count of datagrams sent.
+export struct AlphSeal {
+  key: CrKey32;
+  salt: uint8[4];
+  link: AlphLink*;
+  lock: int32;
+  count: int64;
+}
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+fn alph_seal_put(out: uint8*, value: int64, bytes: int64) {
+  for i in 0..bytes {
+    out[i] = (uint8)((value >> ((int64)i * 8)) & 255);
+  }
+}
+
+fn alph_seal_get(from: uint8*, bytes: int64) -> int64 {
+  var value: int64 = 0;
+  for i in 0..bytes {
+    value = value | ((int64)from[i] << ((int64)i * 8));
+  }
+  return value;
+}
+
+// Returns the sealed length, 0 when it could not be sealed.
+fn alph_seal_seal(ctx: rawptr, out: uint8*, plain: uint8*, count: int64) -> int64 {
+  var s: AlphSeal* = (AlphSeal*)ctx;
+  var nonce: CrNonce24;
+  var sealed: int64 = 0;
+  while (mettle_atomic_exchange_i32(&s->lock, 1) != 0) {
+  }
+  s->count = s->count + 1;
+  var mine: int64 = s->count;
+  mettle_atomic_compare_exchange_i32(&s->lock, 0, 1);
+  alph_seal_put(&out[0], (int64)s->link->cores->first, 4);
+  alph_seal_put(&out[4], (int64)s->link->born, 8);
+  alph_seal_put(&out[12], mine, 8);
+  for i in 0..4 {
+    out[20 + i] = s->salt[i];
+  }
+  for i in 0..24 {
+    nonce.b[i] = out[i];
+  }
+  if (cr_aead_encrypt(&out[HEAD], count + TAG, &sealed, plain, count, &out[0], HEAD, &nonce, &s->key) != CR_OK) {
+    return 0;
+  }
+  return HEAD + sealed;
+}
+
+// Returns the plain length, 0 when the datagram was not sealed with the key.
+fn alph_seal_open(ctx: rawptr, out: uint8*, sealed: uint8*, count: int64, place: uint32*, born: Word*,
+                  which: Word*) -> int64 {
+  var s: AlphSeal* = (AlphSeal*)ctx;
+  var nonce: CrNonce24;
+  var plain: int64 = 0;
+  if (count < HEAD + TAG) {
+    return 0;
+  }
+  for i in 0..24 {
+    nonce.b[i] = sealed[i];
+  }
+  if (cr_aead_decrypt(out, ALPH_DATAGRAM, &plain, &sealed[HEAD], count - HEAD, &sealed[0], HEAD, &nonce, &s->key) != CR_OK) {
+    return 0;
+  }
+  *place = (uint32)alph_seal_get(&sealed[0], 4);
+  *born = (Word)alph_seal_get(&sealed[4], 8);
+  *which = (Word)alph_seal_get(&sealed[12], 8);
+  if (*which <= 0 || *born <= 0) {
+    return 0;
+  }
+  return plain;
+}
+
+// Seals a link with a key of 32 bytes. Call it once, after the link's init
+// and before its start. Returns ALPH_GONE when the link is sealed already
+// or the system gave no random bytes.
+export fn AlphSeal_init__ptr(s: AlphSeal*, link: AlphLink*, key: uint8*) -> Word {
+  if (link->sealer != 0) {
+    return ALPH_GONE;
+  }
+  for i in 0..32 {
+    s->key.b[i] = key[i];
+  }
+  s->link = link;
+  s->lock = 0;
+  s->count = 0;
+  if (cr_random_bytes(&s->salt[0], 4) != CR_OK) {
+    return ALPH_GONE;
+  }
+  link->seal = &alph_seal_seal;
+  link->open = &alph_seal_open;
+  link->sealer = (rawptr)s;
+  return ALPH_OK;
+}
+
+// A datagram sealed as this machine would seal it: for tests.
+export fn AlphSeal_make__ptr(s: AlphSeal*, out: uint8*, plain: uint8*, count: int64) -> int64 {
+  return alph_seal_seal((rawptr)s, out, plain, count);
+}

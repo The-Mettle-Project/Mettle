@@ -1,0 +1,105 @@
+// Threads, for src/cores: each core after the first runs on its own.
+//
+// A core keeps its thread from one run to the next: the thread waits
+// between runs and is not ended. So what belongs to a thread (a GPU a
+// handler opened) lasts, and running again costs a wake, not a new thread.
+
+import "std/thread";
+import "port/sys";
+
+const FUTEX_WAIT: int64 = 128;  // private
+const FUTEX_WAKE: int64 = 129;
+const KEPT: int32 = 64;         // threads kept: a core past these gets a new thread each run
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+// A kept thread: whose it is, what it runs next, and two words it and its
+// starter wait on.
+struct AlphKept {
+  arg: cstring;  // what it was first started on: a core is known by it
+  run: fn(cstring) -> uint32;
+  go: int32;     // 1: there is a run to do
+  done: int32;   // 1: the run has returned
+  busy: int32;   // started and not yet joined
+  used: int32;
+}
+
+var g_kept: AlphKept[64];
+var g_kept_lock: int32 = 0;
+
+fn alph_cpu_kept(arg: cstring) -> uint32 {
+  var k: AlphKept* = (AlphKept*)arg;
+  while (true) {
+    while (mettle_atomic_compare_exchange_i32(&k->go, 0, 1) != 1) {
+      syscall(ALPH_NR_FUTEX, (int64)&k->go, FUTEX_WAIT, 0, 0);
+    }
+    k->run(k->arg);
+    mettle_atomic_exchange_i32(&k->done, 1);
+    syscall(ALPH_NR_FUTEX, (int64)&k->done, FUTEX_WAKE, 1);
+  }
+  return 0;
+}
+
+// Starts run(arg) on a thread of its own: the one that ran this arg
+// before, if there is one. Returns a handle for alph_cpu_join.
+export fn alph_cpu_start(index: int32, run: fn(cstring) -> uint32, arg: cstring) -> int64 {
+  var mine: int32 = -1;
+  var fresh: bool = false;
+  while (mettle_atomic_exchange_i32(&g_kept_lock, 1) != 0) {
+  }
+  for i in 0..KEPT {
+    if (g_kept[i].used != 0 && g_kept[i].arg == arg && g_kept[i].busy == 0) {
+      mine = i;
+      break;
+    }
+  }
+  if (mine < 0) {
+    for i in 0..KEPT {
+      if (g_kept[i].used == 0) {
+        mine = i;
+        fresh = true;
+        g_kept[i].used = 1;
+        g_kept[i].arg = arg;
+        break;
+      }
+    }
+  }
+  if (mine >= 0) {
+    g_kept[mine].busy = 1;
+  }
+  mettle_atomic_exchange_i32(&g_kept_lock, 0);
+  if (mine < 0) {
+    return CreateThread(0, 0, run, arg, 0, 0);
+  }
+  var k: AlphKept* = &g_kept[mine];
+  k->run = run;
+  mettle_atomic_exchange_i32(&k->done, 0);
+  mettle_atomic_exchange_i32(&k->go, 1);
+  if (fresh) {
+    thread_close(CreateThread(0, 0, &alph_cpu_kept, (cstring)k, 0, 0));
+  } else {
+    syscall(ALPH_NR_FUTEX, (int64)&k->go, FUTEX_WAKE, 1);
+  }
+  return (int64)(0 - mine - 2);
+}
+
+// Waits until what a thread was started on has returned.
+export fn alph_cpu_join(handle: int64) {
+  if (handle > -2) {
+    thread_join_infinite(handle);
+    thread_close(handle);
+    return;
+  }
+  var k: AlphKept* = &g_kept[(int32)(0 - handle - 2)];
+  while (mettle_atomic_compare_exchange_i32(&k->done, 0, 0) == 0) {
+    syscall(ALPH_NR_FUTEX, (int64)&k->done, FUTEX_WAIT, 0, 0);
+  }
+  mettle_atomic_exchange_i32(&k->busy, 0);
+}
+
+// The calling thread's id, never 0: a core knows by it that a send comes
+// from its own thread.
+export fn alph_cpu_self() -> int32 {
+  return (int32)GetCurrentThreadId();
+}

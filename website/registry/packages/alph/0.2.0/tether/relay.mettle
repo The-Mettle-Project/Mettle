@@ -1,0 +1,151 @@
+// A relay: a machine on the link that has a board on its serial line and
+// passes mail both ways, so any machine of the network reaches the board's
+// actors by pid and the board reaches theirs. The other machines are told
+// the board's places are reached through this one (AlphLink_through).
+//
+// Mail for the board waits in a short queue that a thread of its own writes
+// to the line. So a slow line holds up neither the link, which must go on
+// saying this machine is alive, nor the actors that send. When 64 messages
+// are waiting, a sender gets ALPH_FULL and mail passed on from another
+// machine is dropped.
+//
+// Made sure after relay (AlphTether_sure), the line is ticked by that
+// thread, so the program has nothing more to do.
+//
+// The board has no door: its actors are reached by pid, not found by name
+// or watched from other machines.
+//
+// Linux only, since the link is. A process has up to four relays, one for
+// each of its lines: open a line, then relay its board, then the next.
+
+import "std/thread";
+import "port/port";
+import "port/sys";
+import "port/alarm";
+import "alph/actor/actor";
+import "alph/cores/cores";
+import "alph/link/link";
+import "alph/tether/tether";
+
+const FUTEX_WAIT: int64 = 128;  // private
+const FUTEX_WAKE: int64 = 129;
+const ROOM: int32 = 64;
+const TICK_MS: Word = 50;  // how often the line is ticked
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+extern fn mettle_atomic_inc_i32(target: int32*) -> int32 with none = "mettle_atomic_inc_i32";
+
+struct Waiting {
+  to: Word;
+  m: AlphMsg;
+}
+
+// One board's way out: its tether and the mail waiting to be written.
+struct Relay {
+  tether: AlphTether*;
+  first: int32;
+  count: int32;
+  lock: int32;
+  news: int32;  // goes up with every message queued, so the writer looks again
+  waiting: Waiting[64];
+}
+
+var g_relays: Relay[4];
+var g_relay_count: int32 = 0;
+
+// Writes one board's queue to its line, and sleeps when it is empty. It
+// also ticks the tether, which does nothing unless the line is sure. A
+// message a sure line cannot keep yet waits here until it can.
+fn alph_relay_main(arg: cstring) -> uint32 {
+  var r: Relay* = (Relay*)arg;
+  var next: Waiting;
+  var have: bool = false;
+  var ticked: Word = alph_now();
+  var nap: int64[2];
+  while (true) {
+    var seen: int32 = mettle_atomic_compare_exchange_i32(&r->news, 0, 0);
+    if ((Word)(alph_now() - ticked) >= alph_ms(TICK_MS)) {
+      ticked = alph_now();
+      r->tether->tick();
+    }
+    if (!have) {
+      while (mettle_atomic_exchange_i32(&r->lock, 1) != 0) {
+      }
+      if (r->count > 0) {
+        next = r->waiting[r->first];
+        r->first = (r->first + 1) % ROOM;
+        r->count = r->count - 1;
+        have = true;
+      }
+      mettle_atomic_compare_exchange_i32(&r->lock, 0, 1);
+    }
+    if (have && r->tether->keep(next.to, &next.m) == ALPH_OK) {
+      have = false;
+    } else {
+      nap[0] = 0;
+      nap[1] = (int64)TICK_MS * 1000000;
+      if (have) {
+        nap[1] = 2000000;
+      }
+      syscall(ALPH_NR_FUTEX, (int64)&r->news, FUTEX_WAIT, (int64)seen, (int64)&nap[0]);
+    }
+  }
+  return 0;
+}
+
+// Mail for a place the link does not know: the board that has it, if one does.
+fn alph_relay_beyond(l: AlphLink*, to: Word, m: AlphMsg*) -> Word {
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  var out: Word = ALPH_FULL;
+  var r: Relay* = 0;
+  for i in 0..g_relay_count {
+    var t: AlphTether* = g_relays[i].tether;
+    if (place >= t->first && place < t->first + t->count) {
+      r = &g_relays[i];
+    }
+  }
+  if (r == 0) {
+    return ALPH_GONE;
+  }
+  while (mettle_atomic_exchange_i32(&r->lock, 1) != 0) {
+  }
+  if (r->count < ROOM) {
+    var at: int32 = (r->first + r->count) % ROOM;
+    r->waiting[at].to = to;
+    r->waiting[at].m = *m;
+    r->count = r->count + 1;
+    out = ALPH_OK;
+  } else {
+    r->tether->dropped = r->tether->dropped + 1;
+  }
+  mettle_atomic_compare_exchange_i32(&r->lock, 0, 1);
+  if (out == ALPH_OK) {
+    mettle_atomic_inc_i32(&r->news);
+    syscall(ALPH_NR_FUTEX, (int64)&r->news, FUTEX_WAKE, 1);
+  }
+  return out;
+}
+
+// Puts a board on this machine's line behind its link. The board's places
+// are first, first + 1, ... Call it after the link's init and before its
+// start, with the line's descriptor just given to the port (alph_line_open):
+// the board is on the line opened last. A fifth board is not taken.
+export fn AlphTether_relay__ptr(t: AlphTether*, link: AlphLink*, first: Word, count: Word) {
+  if (g_relay_count >= 4) {
+    return;
+  }
+  var r: Relay* = &g_relays[g_relay_count];
+  r->tether = t;
+  r->first = 0;
+  r->count = 0;
+  r->lock = 0;
+  r->news = 0;
+  // Set before the line is opened: its thread may take a message at once.
+  t->relay = 1;
+  link->beyond = &alph_relay_beyond;
+  link->beyond_ctx = 0;
+  t->open(&link->cores->cores[0].node, first, count);
+  g_relay_count = g_relay_count + 1;
+  CreateThread(0, 0, &alph_relay_main, (cstring)r, 0, 0);
+}

@@ -1,0 +1,93 @@
+// alph/work/agent: state behind an actor, like Elixir's Agent.
+//
+// An agent holds one block of state. Others read it with alph_agent_get, or
+// change it by sending a function that runs inside the agent, one at a
+// time, so no lock is needed. Put it under a supervisor with
+// alph_sup_add_bytes(spec, state, size, &alph_agent_handle).
+//
+//   fn add(state: rawptr, size: int64, arg: int64) -> int64 ... {
+//     *(int64*)state = *(int64*)state + arg;
+//     return *(int64*)state;
+//   }
+//   var counter: int64 = alph_spawn_agent(ctx, ALPH_LINK, (rawptr)&zero, 8);
+//   alph_agent_update(ctx, counter, 5, 1000, &add);
+//   ... ALPH_TAG_AGENT_DONE: m->arg is the new count
+
+import "std/mem";
+import "alph/core/mailbox";
+import "alph/core/node";
+
+// The answer to alph_agent_get: the payload is a copy of the state.
+export const ALPH_TAG_AGENT_STATE: int64 = 55;
+
+// The answer to alph_agent_update: arg = what the function returned.
+export const ALPH_TAG_AGENT_DONE: int64 = 56;
+
+const ALPH_TAG_AGENT_GET: int64 = 57;
+const ALPH_TAG_AGENT_UPDATE: int64 = 58;
+const ALPH_TAG_AGENT_CAST: int64 = 59;
+
+// A function to run inside the agent, and its argument.
+struct AlphAgentOp {
+  f: fn(rawptr, int64, int64) -> int64 with alloc, syscall, asm;
+  arg: int64;
+}
+
+// An agent's handler, for starting one where a handler is asked for, such
+// as under a supervisor; its state is the agent's state.
+// Thread: the runtime calls it.
+export fn alph_agent_handle(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag == ALPH_TAG_AGENT_GET) {
+    alph_reply_bytes(ctx, m, ALPH_TAG_AGENT_STATE, ctx->state, ctx->state_size);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_AGENT_UPDATE || m->tag == ALPH_TAG_AGENT_CAST) {
+    var op: AlphAgentOp;
+    if (!alph_msg_value<AlphAgentOp>(m, &op)) {
+      return ALPH_CONTINUE;
+    }
+    var result: int64 = op.f(ctx->state, ctx->state_size, op.arg);
+    if (m->tag == ALPH_TAG_AGENT_UPDATE) {
+      alph_reply(ctx, m, ALPH_TAG_AGENT_DONE, result);
+    }
+  }
+  return ALPH_CONTINUE;
+}
+
+// Spawns an agent whose state starts as a copy of size bytes at state.
+//
+//   flags  as alph_spawn: ALPH_LINK to stop it with the caller
+//
+// Returns its pid, or 0 when the node is full or out of memory.
+// Thread: a handler.
+export fn alph_spawn_agent(ctx: AlphCtx*, flags: int64, state: rawptr, size: int64) -> int64 {
+  return alph_spawn_bytes(ctx, flags, state, size, &alph_agent_handle);
+}
+
+// Asks agent for a copy of its state. The answer is ALPH_TAG_AGENT_STATE
+// with the copy as payload. Returns as alph_request. Thread: a handler.
+export fn alph_agent_get(ctx: AlphCtx*, agent: int64, timeout_ms: int64) -> int64 {
+  return alph_request(ctx, agent, ALPH_TAG_AGENT_GET, 0, timeout_ms);
+}
+
+// Runs f(state, size, arg) inside agent; f may change the state in place.
+// The answer is ALPH_TAG_AGENT_DONE with what f returned. If f crashes, the
+// agent crashes and the answer is ALPH_TAG_DOWN. Returns as alph_request.
+// Thread: a handler.
+export fn alph_agent_update(ctx: AlphCtx*, agent: int64, arg: int64, timeout_ms: int64,
+                            f: fn(rawptr, int64, int64) -> int64 with alloc, syscall, asm) -> int64 {
+  var op: AlphAgentOp;
+  op.f = f;
+  op.arg = arg;
+  return alph_request_value<AlphAgentOp>(ctx, agent, ALPH_TAG_AGENT_UPDATE, &op, timeout_ms);
+}
+
+// As alph_agent_update with no answer. Returns as alph_send.
+// Thread: a handler.
+export fn alph_agent_cast(ctx: AlphCtx*, agent: int64, arg: int64,
+                          f: fn(rawptr, int64, int64) -> int64 with alloc, syscall, asm) -> int64 {
+  var op: AlphAgentOp;
+  op.f = f;
+  op.arg = arg;
+  return alph_send_value<AlphAgentOp>(ctx, agent, ALPH_TAG_AGENT_CAST, &op);
+}

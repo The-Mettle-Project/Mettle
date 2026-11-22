@@ -1,0 +1,69 @@
+// What a record takes from Linux: a file for its memory, so that what it
+// holds is still there when the program is gone, however it went, and the
+// CPU's count of cycles for its clock.
+//
+// A file under /dev/shm is in memory only: it costs no disk, and lasts
+// until the machine restarts.
+
+import "port/port";
+import "port/sys";
+
+const O_RDWR: int64 = 2;
+const O_CREAT: int64 = 64;
+const SEEK_END: int64 = 2;
+const READ_WRITE: int64 = 3;
+const MAP_SHARED: int64 = 1;
+
+// Opens a file as memory, making it when it is not there. With bytes above
+// 0 the file is made that long. With 0 it is taken as long as it is, to
+// read what another program left. Returns the memory and puts its length
+// in *length, or returns 0 when the file cannot be opened.
+export fn alph_record_file(path: cstring, bytes: Word, length: Word*) -> uint8* {
+  var fd: int64 = alph_sys_open(path, O_RDWR | O_CREAT, 420);
+  if (fd < 0) {
+    return 0;
+  }
+  var size: int64 = (int64)bytes;
+  if (size > 0) {
+    if (syscall(ALPH_NR_FTRUNCATE, fd, size) < 0) {
+      size = 0;
+    }
+  } else {
+    size = syscall(ALPH_NR_LSEEK, fd, 0, SEEK_END);
+  }
+  var at: int64 = -1;
+  if (size > 0) {
+    at = syscall(ALPH_NR_MMAP, 0, size, READ_WRITE, MAP_SHARED, fd, 0);
+  }
+  syscall(ALPH_NR_CLOSE, fd);
+  if (at < 0 && at > -4096) {
+    return 0;
+  }
+  *length = (Word)size;
+  return (uint8*)at;
+}
+
+// A clock for a record: the CPU's count.
+export fn alph_record_stamp() -> Word {
+  return (Word)alph_sys_stamp();
+}
+
+fn alph_record_ns() -> int64 {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  return ts[0] * 1000000000 + ts[1];
+}
+
+// How far that clock goes in a millisecond. It sleeps two milliseconds to
+// measure it.
+export fn alph_record_per_ms() -> Word {
+  var ts: int64[2];
+  ts[0] = 0;
+  ts[1] = 2000000;
+  var ns: int64 = alph_record_ns();
+  var stamp: int64 = alph_sys_stamp();
+  syscall(ALPH_NR_NANOSLEEP, (int64)&ts[0], 0);
+  stamp = alph_sys_stamp() - stamp;
+  ns = alph_record_ns() - ns;
+  return (Word)(stamp * 1000 / (ns / 1000));
+}

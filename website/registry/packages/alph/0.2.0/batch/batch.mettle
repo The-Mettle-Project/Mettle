@@ -1,0 +1,228 @@
+// A batch: one kind of work in many pieces. The batch hands the pieces to
+// the places, takes each answer, asks again for a piece that could not be
+// placed, and says when all are back. It is what a program would otherwise
+// write around the places every time.
+//
+// A piece goes out only when a place can start it soon (offer), so the
+// batch finds by itself how many to have out: about two for each core at
+// work, here or on another machine. It has room for sixteen out at once.
+// With more cores than about eight in all, give it more room (wide).
+//
+// An actor owns a batch. It begins it, and passes it every message it gets:
+// took says whether the message was the batch's.
+
+import "port/port";
+import "alph/actor/actor";
+import "alph/place/place";
+
+const ALPH_BATCH_MORE: Word = -16;  // from a batch's actor to itself: try the pieces that were refused
+const OUT: Word = 16;               // pieces out at once
+
+// Room for one piece that is out: its job, and three words the batch keeps
+// its lists in.
+export struct AlphBatchSlot {
+  job: AlphJob;
+  piece: Word;  // the piece the job carries
+  free: Word;   // a list of slots not in use,
+  again: Word;  // and one of pieces to hand out again
+}
+
+// One batch, and the sixteen slots its pieces go out in.
+export struct AlphBatch {
+  places: AlphPlaces*;
+  kind: Word;
+  total: Word;
+  next: Word;        // the next piece not yet handed out
+  back: Word;        // pieces answered
+  gone: Word;        // of those, pieces no place could run,
+  lost: Word;        // and pieces done at most once whose worker was lost: done or not, no one can say
+  out: Word;         // pieces handed out and not yet answered
+  by_way: Word[3];   // how many each way did: ALPH_CPU, ALPH_GPU, ALPH_FAR
+  fill: fn(AlphBatch*, AlphJob*, Word) -> void;
+  each: fn(AlphBatch*, AlphJob*, Word) -> void;  // called with every answer
+  ctx: rawptr;       // the program's own
+  nudged: Word;
+  begun: Word;
+  again_count: Word;
+  free_count: Word;
+  slots: AlphBatchSlot*;  // its own, or the room the program gave (wide)
+  room: Word;
+  own: AlphBatchSlot[16];
+}
+
+// Ties a batch to the places its pieces will go to. Call it once, before begin.
+export fn AlphBatch_init__ptr(b: AlphBatch*, places: AlphPlaces*) {
+  b->places = places;
+  b->total = 0;
+  b->next = 0;
+  b->back = 0;
+  b->out = 0;
+  b->begun = 0;
+  b->slots = &b->own[0];
+  b->room = OUT;
+}
+
+// Gives a batch room for `count` pieces out at once, in place of its own
+// sixteen: about two for each core at work on all the machines is enough.
+// Call it after init, while no batch is running.
+export fn AlphBatch_wide__ptr(b: AlphBatch*, slots: AlphBatchSlot*, count: Word) {
+  if (b->out == 0 && count > 0) {
+    b->slots = slots;
+    b->room = count;
+  }
+}
+
+// Hands out as many pieces as there are jobs for.
+fn alph_batch_more(b: AlphBatch*, a: AlphActor*) {
+  while (b->free_count > 0 && (b->again_count > 0 || b->next < b->total)) {
+    var i: Word = b->next;
+    var retried: bool = b->again_count > 0;
+    if (retried) {
+      i = b->slots[b->again_count - 1].again;
+    }
+    var slot: Word = b->slots[b->free_count - 1].free;
+    var job: AlphJob* = &b->slots[slot].job;
+    job->kind = b->kind;
+    job->size = 1;
+    job->home = ALPH_NOWHERE;
+    job->data = 0;
+    job->in = i;
+    job->bytes = 0;
+    job->count = 0;
+    job->back = 0;
+    job->back_room = 0;
+    job->back_count = 0;
+    job->stay = 0;
+    if (b->fill != 0) {
+      b->fill(b, job, i);
+    }
+    var asked: Word = b->places->offer(a, job);
+    if (asked == ALPH_GONE) {
+      // No place can run this kind at all: the piece is answered as it is,
+      // with that as its status.
+      job->status = ALPH_GONE;
+      b->gone = b->gone + 1;
+      b->back = b->back + 1;
+      if (retried) {
+        b->again_count = b->again_count - 1;
+      } else {
+        b->next = b->next + 1;
+      }
+      b->each(b, job, i);
+      continue;
+    }
+    if (asked < 0) {
+      // No place has room now. With pieces out, the next answer tries
+      // again. With none out, the actor is sent a word to: two
+      // milliseconds on if the places have a clock, so a batch waiting
+      // for a place at its limit does not spin, and at once if not.
+      if (b->out == 0 && b->nudged == 0) {
+        var clock: AlphTime* = b->places->time;
+        if (clock != 0 && clock->after(2, a->pid, ALPH_BATCH_MORE, 0) > 0) {
+          b->nudged = 1;
+        } else if (a->send(a->pid, ALPH_BATCH_MORE, 0) == ALPH_OK) {
+          b->nudged = 1;
+        }
+      }
+      return;
+    }
+    b->slots[slot].piece = i;
+    b->free_count = b->free_count - 1;
+    b->out = b->out + 1;
+    if (retried) {
+      b->again_count = b->again_count - 1;
+    } else {
+      b->next = b->next + 1;
+    }
+  }
+}
+
+// Starts handing out `total` pieces of a kind. fill is called for each
+// piece before it goes out, with the job and the piece's number (0 to
+// total - 1): it sets what the job needs (size, in, data, bytes, back,
+// home; the job starts with size 1, in the piece's number and no home). It
+// may be 0 when that start is all a piece needs. took is
+// called with each piece's finished job: its status is ALPH_OK, ALPH_GONE
+// for a piece no place could run, or ALPH_LOST for a piece of a kind done
+// at most once whose worker was lost. ctx is the program's own, in
+// b->ctx. Call it from the actor that will get the answers. Returns
+// ALPH_OK, or ALPH_FULL when pieces of the batch before are still out: a
+// batch is begun again only once it is over.
+export fn AlphBatch_begin__ptr(b: AlphBatch*, a: AlphActor*, kind: Word, total: Word,
+                               fill: fn(AlphBatch*, AlphJob*, Word) -> void,
+                               took: fn(AlphBatch*, AlphJob*, Word) -> void, ctx: rawptr) -> Word {
+  if (b->out != 0) {
+    return ALPH_FULL;
+  }
+  b->begun = 1;
+  b->kind = kind;
+  b->total = total;
+  b->next = 0;
+  b->back = 0;
+  b->gone = 0;
+  b->lost = 0;
+  b->out = 0;
+  b->fill = fill;
+  b->each = took;
+  b->ctx = ctx;
+  b->nudged = 0;
+  b->again_count = 0;
+  b->free_count = b->room;
+  for i in 0..b->room {
+    b->slots[i].free = (Word)i;
+  }
+  for i in 0..3 {
+    b->by_way[i] = 0;
+  }
+  alph_batch_more(b, a);
+  return ALPH_OK;
+}
+
+// Give the batch every message its actor gets. Returns true when the
+// message was the batch's: an answer, which it has passed to took, or its
+// own word to itself.
+export fn AlphBatch_took__ptr(b: AlphBatch*, a: AlphActor*, m: AlphMsg*) -> bool {
+  if (m->tag == ALPH_BATCH_MORE) {
+    b->nudged = 0;
+    alph_batch_more(b, a);
+    return true;
+  }
+  if (b->begun != 0 && b->out == 0 && b->nudged == 0) {
+    alph_batch_more(b, a);  // nothing is out and no word is on its way: try now
+  }
+  if (m->tag != ALPH_DONE) {
+    return false;
+  }
+  var job: AlphJob* = (AlphJob*)m->arg;
+  var off: int64 = (int64)job - (int64)b->slots;
+  if (off < 0 || off >= (int64)b->room * (int64)sizeof(AlphBatchSlot)) {
+    return false;  // some other job of the actor's
+  }
+  var slot: Word = (Word)(off / (int64)sizeof(AlphBatchSlot));
+  var piece: Word = b->slots[slot].piece;
+  b->out = b->out - 1;
+  b->slots[b->free_count].free = slot;
+  b->free_count = b->free_count + 1;
+  if (job->status == ALPH_OK) {
+    b->back = b->back + 1;
+    b->by_way[job->way] = b->by_way[job->way] + 1;
+    b->each(b, job, piece);
+  } else if (job->status == ALPH_LOST) {
+    // It may have been done: it is not handed out again. The program is
+    // told, and decides.
+    b->back = b->back + 1;
+    b->lost = b->lost + 1;
+    b->each(b, job, piece);
+  } else {
+    b->slots[b->again_count].again = piece;  // not done: it goes out again
+    b->again_count = b->again_count + 1;
+  }
+  alph_batch_more(b, a);
+  return true;
+}
+
+// Whether every piece of a batch that was begun has been answered. A batch
+// of no pieces is over at once.
+export fn AlphBatch_over__ptr(b: AlphBatch*) -> bool {
+  return b->begun != 0 && b->back == b->total;
+}

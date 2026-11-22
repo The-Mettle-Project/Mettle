@@ -1,0 +1,50 @@
+// The board's one timer. Its interrupt calls ring. The program installs the
+// traps and turns interrupts on, as for any other interrupt.
+
+import "port/port";
+
+var g_ring: fn(rawptr) -> void;
+var g_ctx: rawptr;
+
+export struct AlphAlarm {
+  unused: int32;
+}
+
+// Time in ticks of 1,024 microseconds: a shift, where milliseconds would be
+// a 64-bit division on a 32-bit CPU. A 32-bit count goes round every 50
+// days, so times are compared by their difference. Kept out of line: the
+// 64-bit shift is many instructions on a 32-bit CPU, and it is called from
+// many places.
+@noinline export fn alph_now() -> Word {
+  return (Word)(mettle_board_time_us() >> 10);
+}
+
+// Milliseconds as ticks: ms less 3/128 of it, which is 1000/1024 to 4 parts
+// in 100,000. Written so that no step overflows.
+export fn alph_ms(ms: Word) -> Word {
+  return ms - (Word)((ms >> 7) * 3) - (Word)(((ms & 127) * 3) >> 7);
+}
+
+export fn AlphAlarm_start__ptr(al: AlphAlarm*, ring: fn(rawptr) -> void, ctx: rawptr) {
+  g_ring = ring;
+  g_ctx = ctx;
+}
+
+// Rings once the time reaches at, at once if it already has.
+export fn AlphAlarm_set__ptr(al: AlphAlarm*, at: Word) {
+  var now: int64 = mettle_board_time_us();
+  var ticks: Word = at - (Word)(now >> 10);
+  mettle_board_timer_at(now + ((int64)ticks << 10));
+}
+
+export fn AlphAlarm_clear__ptr(al: AlphAlarm*) {
+  mettle_board_timer_cancel();
+}
+
+export fn AlphAlarm_stop__ptr(al: AlphAlarm*) {
+  mettle_board_timer_cancel();
+}
+
+@interrupt fn mettle_trap_timer() {
+  g_ring(g_ctx);
+}

@@ -1,0 +1,335 @@
+// alph/work/pool: a pool of threads for blocking work.
+//
+// A handler must not block, so blocking work (file IO, a blocking client,
+// a long hash) goes to a pool: a dispatcher actor and N ALPH_BOUND worker
+// actors, each on a thread of its own. alph_offload sends one job, a
+// function and its input; the answer comes back as a message, like the
+// reply to a request:
+//
+//   ALPH_TAG_DONE    arg = the work function's return, payload = the bytes
+//                    it put in its AlphOut
+//   ALPH_TAG_FAILED  arg = the reason the job ended without a result:
+//                    ALPH_CRASHED for a trap, the reason given to
+//                    alph_exit_now, or ALPH_FULL when the pool's queue was
+//                    full
+//
+// or, as for any request, ALPH_TAG_DOWN (the pool is gone) or
+// ALPH_TAG_TIMEOUT. A job that times out still runs to the end; its result
+// is dropped. A worker that crashes or exits is replaced.
+//
+//   fn hash_file(input: rawptr, size: int64, out: AlphOut*) -> int64 { ... }
+//   var pool: int64 = alph_spawn_pool(ctx, 4, 1024);
+//   var ref: int64 = alph_offload(ctx, pool, path, path_len, 5000, &hash_file);
+
+import "std/mem";
+import "alph/sys/atomic";
+import "alph/sys/clock";
+import "alph/core/mailbox";
+import "alph/core/node";
+
+// The answers to alph_offload, described at the top of this module.
+export const ALPH_TAG_DONE: int64 = 15;
+export const ALPH_TAG_FAILED: int64 = 16;
+
+const ALPH_TAG_POOL_JOB: int64 = 17;    // dispatcher -> worker: one job
+const ALPH_TAG_POOL_READY: int64 = 18;  // worker -> dispatcher: job finished
+
+// Where a work function puts its result bytes. Fill it with alph_out_bytes;
+// its fields are the runtime's own.
+export struct AlphOut {
+  ctx: AlphCtx*;
+  data: int64;
+  len: int64;
+  cap: int64;
+}
+
+// A job as it travels: the requester's address and the work, then the
+// input bytes.
+struct AlphJob {
+  from: int64;
+  ref: int64;
+  work: fn(rawptr, int64, AlphOut*) -> int64 with alloc, syscall, asm;
+  size: int64;
+}
+
+struct AlphPoolWorker {
+  pid: int64;
+  job: rawptr;   // the job it runs (a copy in the dispatcher's heap), or 0 when idle
+}
+
+struct AlphPoolState {
+  workers: int64;     // AlphPoolWorker array in the dispatcher's heap
+  count: int64;
+  queue: int64;       // ring of waiting jobs (rawptr each) in the dispatcher's heap
+  queue_cap: int64;
+  queue_head: int64;
+  queue_len: int64;
+}
+
+// Appends size bytes at data to out. Returns false when the worker's heap
+// is full (heap_limit); out keeps what it had. Thread: the work function
+// that got out.
+export fn alph_out_bytes(out: AlphOut*, data: rawptr, size: int64) -> bool {
+  if (out->len + size > out->cap) {
+    var cap: int64 = out->cap * 2;
+    if (cap < out->len + size) {
+      cap = out->len + size;
+    }
+    if (cap < 64) {
+      cap = 64;
+    }
+    var grown: rawptr = alph_realloc(out->ctx, (rawptr)out->data, cap);
+    if (grown == 0) {
+      return false;
+    }
+    out->data = (int64)grown;
+    out->cap = cap;
+  }
+  memcpy((rawptr)(out->data + out->len), data, size);
+  out->len = out->len + size;
+  return true;
+}
+
+// ---- worker ----------------------------------------------------------------
+
+fn alph_pool_worker(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  if (m->tag != ALPH_TAG_POOL_JOB) {
+    return ALPH_CONTINUE;
+  }
+  var size: int64 = 0;
+  var job: AlphJob* = (AlphJob*)alph_msg_bytes(m, &size);
+  var out: AlphOut;
+  out.ctx = ctx;
+  out.data = 0;
+  out.len = 0;
+  out.cap = 0;
+  var result: int64 = job->work((rawptr)((int64)job + (int64)sizeof(AlphJob)), job->size, &out);
+  var request: AlphMsg;
+  memset((rawptr)&request, 0, (int64)sizeof(AlphMsg));
+  request.from = job->from;
+  request.ref = job->ref;
+  // READY goes first, so a requester that sends its next job on DONE finds
+  // this worker free. It must not be lost, or the pool shrinks for good;
+  // this actor has its own thread, so it may wait for room.
+  var dispatcher: int64 = alph_parent(ctx);
+  var nap: int64 = 0;
+  while (alph_send(ctx, dispatcher, ALPH_TAG_POOL_READY, 0) == ALPH_FULL) {
+    alph_futex_wait(&nap, 0, 1000000);
+  }
+  alph_reply_full(ctx, &request, ALPH_TAG_DONE, result, (rawptr)out.data, out.len);
+  if (out.data != 0) {
+    alph_free(ctx, (rawptr)out.data);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- dispatcher ------------------------------------------------------------
+
+fn alph_pool_at(st: AlphPoolState*, i: int64) -> AlphPoolWorker* {
+  return (AlphPoolWorker*)(st->workers + i * (int64)sizeof(AlphPoolWorker));
+}
+
+fn alph_pool_slot(st: AlphPoolState*, i: int64) -> int64* {
+  return (int64*)(st->queue + ((st->queue_head + i) % st->queue_cap) * 8);
+}
+
+// Answers a job that will get no result.
+fn alph_pool_fail(ctx: AlphCtx*, job: AlphJob*, reason: int64) {
+  var request: AlphMsg;
+  memset((rawptr)&request, 0, (int64)sizeof(AlphMsg));
+  request.from = job->from;
+  request.ref = job->ref;
+  alph_reply(ctx, &request, ALPH_TAG_FAILED, reason);
+}
+
+// Gives job to worker w. Returns false when the worker is gone.
+fn alph_pool_run(ctx: AlphCtx*, w: AlphPoolWorker*, job: rawptr) -> bool {
+  var j: AlphJob* = (AlphJob*)job;
+  w->job = job;
+  return alph_send_bytes(ctx, w->pid, ALPH_TAG_POOL_JOB, job,
+                         (int64)sizeof(AlphJob) + j->size) == ALPH_SENT;
+}
+
+fn alph_pool_idle(st: AlphPoolState*) -> int64 {
+  for i: int64 in 0..st->count {
+    var w: AlphPoolWorker* = alph_pool_at(st, i);
+    if (w->pid != 0 && w->job == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+fn alph_pool_job(ctx: AlphCtx*, st: AlphPoolState*, m: AlphMsg*) {
+  var size: int64 = 0;
+  var data: rawptr = alph_msg_bytes(m, &size);
+  var copy: rawptr = alph_alloc(ctx, size);
+  if (copy == 0) {
+    var j: AlphJob* = (AlphJob*)data;
+    j->from = m->from;
+    j->ref = m->ref;
+    alph_pool_fail(ctx, j, ALPH_FULL);
+    return;
+  }
+  memcpy(copy, data, size);
+  var job: AlphJob* = (AlphJob*)copy;
+  job->from = m->from;
+  job->ref = m->ref;
+  var i: int64 = alph_pool_idle(st);
+  if (i >= 0 && alph_pool_run(ctx, alph_pool_at(st, i), copy)) {
+    return;
+  }
+  if (i >= 0) {
+    alph_pool_at(st, i)->job = (rawptr)0;  // gone; its EXIT replaces it
+  }
+  if (st->queue_len == st->queue_cap) {
+    alph_pool_fail(ctx, job, ALPH_FULL);
+    alph_free(ctx, copy);
+    return;
+  }
+  *alph_pool_slot(st, st->queue_len) = (int64)copy;
+  st->queue_len = st->queue_len + 1;
+}
+
+// Worker w is free: gives it the oldest waiting job.
+fn alph_pool_next(ctx: AlphCtx*, st: AlphPoolState*, w: AlphPoolWorker*) {
+  w->job = (rawptr)0;
+  if (st->queue_len > 0 && w->pid != 0) {
+    var job: rawptr = (rawptr)*alph_pool_slot(st, 0);
+    st->queue_head = (st->queue_head + 1) % st->queue_cap;
+    st->queue_len = st->queue_len - 1;
+    alph_pool_run(ctx, w, job);
+  }
+}
+
+fn alph_pool_find(st: AlphPoolState*, pid: int64) -> int64 {
+  if (pid == 0) {
+    return -1;
+  }
+  for i: int64 in 0..st->count {
+    if (alph_pool_at(st, i)->pid == pid) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+fn alph_pool_dispatch(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var st: AlphPoolState* = (AlphPoolState*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    var workers: int64 = st->count;
+    st->workers = (int64)alph_alloc(ctx, workers * (int64)sizeof(AlphPoolWorker));
+    st->queue = (int64)alph_alloc(ctx, st->queue_cap * 8);
+    if (st->workers == 0 || st->queue == 0) {
+      return alph_stop(ctx, ALPH_SHUTDOWN);
+    }
+    for i: int64 in 0..workers {
+      var w: AlphPoolWorker* = alph_pool_at(st, i);
+      w->pid = alph_spawn(ctx, ALPH_LINK | ALPH_BOUND, &alph_pool_worker);
+      w->job = (rawptr)0;
+      if (w->pid == 0) {
+        return alph_stop(ctx, ALPH_SHUTDOWN);
+      }
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_POOL_JOB) {
+    alph_pool_job(ctx, st, m);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_POOL_READY) {
+    var i: int64 = alph_pool_find(st, m->from);
+    if (i >= 0) {
+      var w: AlphPoolWorker* = alph_pool_at(st, i);
+      if (w->job != 0) {
+        alph_free(ctx, w->job);
+      }
+      alph_pool_next(ctx, st, w);
+    }
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_EXIT) {
+    var i: int64 = alph_pool_find(st, m->from);
+    if (i < 0) {
+      if (m->from == alph_parent(ctx) || m->from == 0) {
+        return alph_stop(ctx, m->arg);  // workers are linked and go too
+      }
+      return ALPH_CONTINUE;
+    }
+    // A job ended its worker: answer it, then put a new worker in place.
+    var w: AlphPoolWorker* = alph_pool_at(st, i);
+    if (w->job != 0) {
+      alph_pool_fail(ctx, (AlphJob*)w->job, m->arg);
+      alph_free(ctx, w->job);
+      w->job = (rawptr)0;
+    }
+    w->pid = alph_spawn(ctx, ALPH_LINK | ALPH_BOUND, &alph_pool_worker);
+    alph_pool_next(ctx, st, w);
+  }
+  return ALPH_CONTINUE;
+}
+
+fn alph_pool_init(st: AlphPoolState*, workers: int64, queue: int64) -> bool {
+  if (workers < 1 || queue < 1) {
+    return false;
+  }
+  memset((rawptr)st, 0, (int64)sizeof(AlphPoolState));
+  st->count = workers;
+  st->queue_cap = queue;
+  return true;
+}
+
+// Spawns a pool linked to the calling actor, which becomes its parent: if
+// the parent exits, the pool and its workers exit too.
+//
+//   workers  threads, each running one job at a time (at least 1)
+//   queue    jobs that may wait for a free worker; past it a job fails
+//            with ALPH_FULL (at least 1)
+//
+// Returns the pool's pid, or 0 when the arguments are out of range or the
+// node is full. Thread: a handler. Outside the node, use
+// alph_node_spawn_pool.
+export fn alph_spawn_pool(ctx: AlphCtx*, workers: int64, queue: int64) -> int64 {
+  var st: AlphPoolState;
+  if (!alph_pool_init(&st, workers, queue)) {
+    return 0;
+  }
+  return alph_spawn_value<AlphPoolState>(ctx, ALPH_LINK, &st, &alph_pool_dispatch);
+}
+
+// Spawns a top-level pool with no parent. Stop it with
+// alph_node_exit_signal(node, pid, ALPH_SHUTDOWN). Otherwise as
+// alph_spawn_pool. Thread: any.
+export fn alph_node_spawn_pool(node: AlphNode*, workers: int64, queue: int64) -> int64 {
+  var st: AlphPoolState;
+  if (!alph_pool_init(&st, workers, queue)) {
+    return 0;
+  }
+  return alph_node_spawn_value<AlphPoolState>(node, 0, &st, &alph_pool_dispatch);
+}
+
+// Sends a job to pool: work(copy of input, size, out) runs on a worker
+// thread, where it may block. The input is size bytes, copied. The answer
+// carries the returned ref; it is described at the top of this module.
+// work must not keep pointers into its input or out after it returns.
+//
+// Returns the ref, or ALPH_FULL or ALPH_NOMEM when the job was not sent
+// (the pool's mailbox is full, or no memory). Thread: a handler.
+export fn alph_offload(ctx: AlphCtx*, pool: int64, input: rawptr, size: int64, timeout_ms: int64,
+                       work: fn(rawptr, int64, AlphOut*) -> int64 with alloc, syscall, asm) -> int64 {
+  var total: int64 = (int64)sizeof(AlphJob) + size;
+  var block: rawptr = alph_scratch(ctx, total);
+  if (block == 0) {
+    return ALPH_NOMEM;
+  }
+  var job: AlphJob* = (AlphJob*)block;
+  job->from = 0;
+  job->ref = 0;
+  job->work = work;
+  job->size = size;
+  if (size > 0) {
+    memcpy((rawptr)((int64)block + (int64)sizeof(AlphJob)), input, size);
+  }
+  return alph_request_bytes(ctx, pool, ALPH_TAG_POOL_JOB, block, total, timeout_ms);
+}

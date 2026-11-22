@@ -1,0 +1,153 @@
+// Timers: a message sent later. Time stays out of the core, because a timer
+// is one more thing that sends messages.
+//
+// The timers wait in the caller's array. The port's alarm rings when the
+// soonest is due: the board's timer interrupt on a microcontroller, a
+// sleeping thread on Linux.
+//
+// Setting, cancelling and sending a timer each look at every slot. That is
+// the smallest code and right for tens of timers, not for thousands.
+
+import "port/port";
+import "port/alarm";
+import "alph/actor/actor";
+
+// One timer: the message it will send and when.
+export struct AlphTimer {
+  at: Word;   // in the port's ticks
+  to: Word;
+  tag: Word;
+  arg: Word;
+  ref: Word;  // 0 while the slot is free
+}
+
+// The timers of one node.
+export struct AlphTime {
+  gate: AlphGate;
+  alarm: AlphAlarm;
+  node: AlphNode*;
+  slots: AlphTimer*;
+  room: Word;
+  refs: Word;
+}
+
+// The waiting timer due first, the one set first among equals. Times are
+// compared by their difference, so a clock that goes round is fine while no
+// timer waits longer than half its range (25 days in 32 bits).
+fn alph_time_soonest(t: AlphTime*) -> AlphTimer* {
+  var best: AlphTimer* = 0;
+  for i in 0..t->room {
+    var x: AlphTimer* = &t->slots[i];
+    if (x->ref == 0) {
+      continue;
+    }
+    if (best != 0) {
+      var later: Word = x->at - best->at;
+      if (later > 0 || (later == 0 && (Word)(x->ref - best->ref) > 0)) {
+        continue;
+      }
+    }
+    best = x;
+  }
+  return best;
+}
+
+// The alarm rang: sends what is due, soonest first, then sets the alarm for
+// the next. A timer whose actor's mailbox is full is tried again a tick later.
+fn alph_time_ring(ctx: rawptr) {
+  var t: AlphTime* = (AlphTime*)ctx;
+  while (true) {
+    var was: int32 = t->gate.enter();
+    var x: AlphTimer* = alph_time_soonest(t);
+    var now: Word = alph_now();
+    if (x == 0) {
+      t->alarm.clear();
+      t->gate.leave(was);
+      return;
+    }
+    if ((Word)(x->at - now) > 0) {
+      t->alarm.set(x->at);
+      t->gate.leave(was);
+      return;
+    }
+    var m: AlphMsg = { tag: x->tag, from: 0, arg: x->arg, ref: x->ref };
+    if (t->node->put(x->to, &m) == ALPH_FULL) {
+      x->at = now + 1;
+    } else {
+      x->ref = 0;
+    }
+    t->gate.leave(was);
+  }
+}
+
+// timers holds room timers. Messages go out through node.
+export fn AlphTime_init__ptr(t: AlphTime*, node: AlphNode*, timers: AlphTimer*, room: Word) {
+  t->gate.init();
+  t->node = node;
+  t->slots = timers;
+  t->room = room;
+  t->refs = 0;
+  for i in 0..room {
+    timers[i].ref = 0;
+  }
+  t->alarm.start(&alph_time_ring, (rawptr)t);
+}
+
+// Sends tag and arg to an actor ms milliseconds from now: never sooner, and
+// up to a tick later. The message
+// carries the ref this returns (above 0) and comes from pid 0. Returns
+// ALPH_FULL when every timer is in use.
+export fn AlphTime_after__ptr(t: AlphTime*, ms: Word, to: Word, tag: Word, arg: Word) -> Word {
+  var out: Word = ALPH_FULL;
+  var was: int32 = t->gate.enter();
+  for i in 0..t->room {
+    var x: AlphTimer* = &t->slots[i];
+    if (x->ref == 0) {
+      t->refs = t->refs + 1;
+      if (t->refs <= 0) {
+        t->refs = 1;
+      }
+      x->at = alph_now() + alph_ms(ms);
+      if (ms > 0) {
+        x->at = x->at + 1;  // the tick now is partly gone: never early
+      }
+      x->to = to;
+      x->tag = tag;
+      x->arg = arg;
+      x->ref = t->refs;
+      if (alph_time_soonest(t) == x) {
+        t->alarm.set(x->at);
+      }
+      out = x->ref;
+      break;
+    }
+  }
+  t->gate.leave(was);
+  return out;
+}
+
+// Takes a timer back. ALPH_GONE when its message was already sent.
+export fn AlphTime_cancel__ptr(t: AlphTime*, ref: Word) -> Word {
+  var out: Word = ALPH_GONE;
+  if (ref <= 0) {
+    return out;
+  }
+  var was: int32 = t->gate.enter();
+  for i in 0..t->room {
+    if (t->slots[i].ref == ref) {
+      t->slots[i].ref = 0;
+      out = ALPH_OK;
+      break;
+    }
+  }
+  t->gate.leave(was);
+  return out;
+}
+
+// No timer's message is sent after this returns. Waiting timers are dropped.
+export fn AlphTime_stop__ptr(t: AlphTime*) {
+  t->alarm.stop();
+  for i in 0..t->room {
+    t->slots[i].ref = 0;
+  }
+}

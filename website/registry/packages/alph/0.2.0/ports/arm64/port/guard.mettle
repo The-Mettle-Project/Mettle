@@ -1,0 +1,24 @@
+// No guard on 64-bit ARM yet: saving a place to resume needs inline
+// assembly, and Mettle's AArch64 backend has none. A handler that crashes
+// ends the process here, as it would with no guard at all.
+
+export struct AlphGuard {
+  unused: int32;
+}
+
+export fn AlphGuard_open__ptr(g: AlphGuard*) -> bool {
+  return true;
+}
+
+export fn AlphGuard_close__ptr(g: AlphGuard*) {
+}
+
+export fn AlphGuard_arm__ptr(g: AlphGuard*) {
+}
+
+export fn AlphGuard_disarm__ptr(g: AlphGuard*) {
+}
+
+export fn AlphGuard_save__ptr(g: AlphGuard*) -> int64 {
+  return 0;
+}

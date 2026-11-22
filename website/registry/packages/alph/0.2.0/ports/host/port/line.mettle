@@ -1,0 +1,154 @@
+// A line of bytes to one other machine: any descriptor that carries bytes
+// both ways, such as a serial port or a TCP connection. A thread reads it
+// and hands each byte that arrives to take. A process has up to four
+// lines. Each is opened, then set up, before the next is opened. A sender
+// takes a line with alph_line_use for one whole message and gives it back
+// with alph_line_unlock, so two senders' bytes do not mix. Each line has a
+// lock of its own, and a write never waits: a line whose other end has
+// stopped reading loses what does not fit, and holds up no other line.
+// The calls that name no line work on the line the calling thread holds.
+
+import "std/thread";
+import "port/sys";
+import "port/port";
+
+const MSG_NOSIGNAL: int64 = 16384;
+const EINTR: int64 = -4;
+const ENOTSOCK: int64 = -88;
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+const MSG_DONTWAIT: int64 = 64;
+const EAGAIN: int64 = -11;
+
+struct Line {
+  fd: int64;
+  take: fn(rawptr, int32) -> void;
+  ctx: rawptr;
+  have: int64;
+  started: int32;
+  lock: int32;
+  holder: int32;  // the thread that has taken the line, 0 for none
+  out: uint8[128];
+}
+
+var g_lines: Line[4];
+var g_count: int32 = 0;
+var g_setup: int32 = 0;  // the line opened last
+var g_lock: int32 = 0;   // held while a line is added
+
+// Adds a line: the descriptor it is. It must wait when read (not be set
+// non-blocking). The line stays the one being set up (alph_line_which)
+// until the next is opened. A fifth takes the fourth's place.
+export fn alph_line_open(fd: int64) {
+  while (mettle_atomic_exchange_i32(&g_lock, 1) != 0) {
+  }
+  if (g_count < 4) {
+    g_count = g_count + 1;
+  }
+  g_setup = g_count - 1;
+  g_lines[g_setup].fd = fd;
+  g_lines[g_setup].have = 0;
+  mettle_atomic_compare_exchange_i32(&g_lock, 0, 1);
+}
+
+// Which line was opened last: 0 for the first.
+export fn alph_line_which() -> Word {
+  return (Word)g_setup;
+}
+
+fn alph_line_main(arg: cstring) -> uint32 {
+  var l: Line* = (Line*)arg;
+  var bytes: uint8[256];
+  while (true) {
+    var got: int64 = syscall(ALPH_NR_READ, l->fd, (int64)&bytes[0], 256);
+    if (got <= 0) {
+      return 0;  // the other end is gone
+    }
+    for i in 0..got {
+      l->take(l->ctx, (int32)bytes[i]);
+    }
+  }
+  return 0;
+}
+
+// The line the calling thread holds, or the one opened last when it holds
+// none (a program with one line that takes no lock).
+fn alph_line_held() -> Line* {
+  var me: int32 = (int32)GetCurrentThreadId();
+  for i in 0..g_count {
+    if (g_lines[i].holder == me) {
+      return &g_lines[i];
+    }
+  }
+  return &g_lines[g_setup];
+}
+
+// Takes a line for one whole message. Give it back with alph_line_unlock.
+export fn alph_line_use(line: Word) {
+  var l: Line* = &g_lines[line];
+  while (mettle_atomic_exchange_i32(&l->lock, 1) != 0) {
+  }
+  l->holder = (int32)GetCurrentThreadId();
+}
+
+// Takes the line opened last: for a program with one line.
+export fn alph_line_lock() {
+  alph_line_use((Word)g_setup);
+}
+
+// Lets the next sender have the line this thread holds.
+export fn alph_line_unlock() {
+  var l: Line* = alph_line_held();
+  l->holder = 0;
+  mettle_atomic_compare_exchange_i32(&l->lock, 0, 1);
+}
+
+// Says where the bytes that arrive on the line go, and starts reading it.
+// Called again, it only changes where they go: one thread reads a line.
+export fn alph_line_start(take: fn(rawptr, int32) -> void, ctx: rawptr) {
+  var l: Line* = alph_line_held();
+  l->ctx = ctx;
+  l->take = take;
+  if (l->started == 0) {
+    l->started = 1;
+    CreateThread(0, 0, &alph_line_main, (cstring)l, 0, 0);
+  }
+}
+
+// Puts one byte on the line. It goes out at the next flush, or when 128 are waiting.
+export fn alph_line_put(byte: uint8) {
+  var l: Line* = alph_line_held();
+  if (l->have == 128) {
+    alph_line_send(l);
+  }
+  l->out[l->have] = byte;
+  l->have = l->have + 1;
+}
+
+// Sends what was put. It does not wait: if the other end is gone, or has
+// stopped reading and the way to it is full, the rest is dropped.
+export fn alph_line_flush() {
+  alph_line_send(alph_line_held());
+}
+
+fn alph_line_send(l: Line*) {
+  var sent: int64 = 0;
+  while (sent < l->have) {
+    // As a send that raises no signal: a plain write to a connection whose
+    // other end is gone would end the process with SIGPIPE.
+    var put: int64 = syscall(ALPH_NR_SENDTO, l->fd, (int64)&l->out[sent], l->have - sent, MSG_NOSIGNAL | MSG_DONTWAIT, 0, 0);
+    if (put == ENOTSOCK) {
+      put = syscall(ALPH_NR_WRITE, l->fd, (int64)&l->out[sent], l->have - sent);
+    }
+    if (put == EINTR) {
+      continue;
+    }
+    if (put <= 0) {
+      break;
+    }
+    sent = sent + put;
+  }
+  l->have = 0;
+}

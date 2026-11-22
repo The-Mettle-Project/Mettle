@@ -1,0 +1,291 @@
+// Lives: what happens when an actor ends.
+//
+// A handler that returns non-zero ends its actor, and what it returned is
+// the reason: ALPH_END for an actor that is finished, anything else for one
+// that failed.
+//
+// Watching: an actor that watches another is sent ALPH_ENDED when it ends,
+// with the reason. Watching one that is already gone says so at once.
+//
+// Keeping: a kept actor that fails is not ended. Its state is set up again
+// and it goes on, with the same pid and the mail it had, so nothing that
+// knows it has to learn a new pid. After its last allowed restart it ends
+// like any other.
+//
+// The memory is the caller's, as everywhere: an array of watches and an
+// array of keeps.
+
+import "port/port";
+import "alph/actor/actor";
+import "alph/cores/cores";
+
+export const ALPH_ENDED: Word = -7;  // to a watcher: from is the actor, arg the reason, ref the watch
+
+// One watch: who is told when which actor ends.
+export struct AlphWatch {
+  ref: Word;      // 0 while the slot is free
+  watcher: Word;
+  target: Word;
+  owed: Word;     // the target ended and the watcher's mailbox was full
+  reason: Word;
+  far: Word;      // made for a watcher on another machine, with its ref
+}
+
+// One kept actor: how its state is set up again and how many restarts it has left.
+export struct AlphKeep {
+  pid: Word;      // 0 while the slot is free
+  reset: fn(rawptr) -> void;
+  left: Word;     // restarts still allowed
+  restarts: Word;
+}
+
+// The watches and the kept actors of one set of cores.
+export struct AlphLife {
+  gate: AlphGate;
+  cores: AlphCores*;
+  watches: AlphWatch*;
+  watch_room: Word;
+  keeps: AlphKeep*;
+  keep_room: Word;
+  refs: Word;
+}
+
+// Tells a watcher. False when its mailbox is full.
+fn alph_life_tell(l: AlphLife*, w: AlphWatch*) -> bool {
+  var m: AlphMsg = { tag: ALPH_ENDED, from: w->target, arg: w->reason, ref: w->ref };
+  return l->cores->cores[0].node.put(w->watcher, &m) != ALPH_FULL;
+}
+
+// Tells every watcher that is still owed word because its mailbox was full.
+// alph calls it whenever something ends or is watched. Nothing calls it
+// when the mailbox empties, so a program that fills its watchers' mailboxes
+// calls it now and then.
+export fn AlphLife_settle__ptr(l: AlphLife*) {
+  var was: int32 = l->gate.enter();
+  for i in 0..l->watch_room {
+    var w: AlphWatch* = &l->watches[i];
+    if (w->ref != 0 && w->owed != 0 && alph_life_tell(l, w)) {
+      w->ref = 0;
+    }
+  }
+  l->gate.leave(was);
+}
+
+fn alph_life_ended(n: AlphNode*, a: AlphActor*, reason: Word) -> Word {
+  var l: AlphLife* = (AlphLife*)n->life;
+  var kept: Word = 0;
+  var reset: fn(rawptr) -> void = 0;
+  var was: int32 = l->gate.enter();
+  for i in 0..l->keep_room {
+    var k: AlphKeep* = &l->keeps[i];
+    if (k->pid == a->pid) {
+      if (reason != ALPH_END && k->left > 0) {
+        k->left = k->left - 1;
+        k->restarts = k->restarts + 1;
+        reset = k->reset;
+        kept = 1;
+      } else {
+        k->pid = 0;
+      }
+      break;
+    }
+  }
+  if (kept == 0) {
+    // Gone before anyone is told, and inside the gate, so a watch made at
+    // this moment either is in the table already or finds it gone.
+    n->bury(a);
+    for i in 0..l->watch_room {
+      var w: AlphWatch* = &l->watches[i];
+      if (w->ref == 0) {
+        continue;
+      }
+      if (w->watcher == a->pid) {
+        w->ref = 0;
+      } else if (w->target == a->pid && w->owed == 0) {
+        w->owed = 1;
+        w->reason = reason;
+      }
+    }
+  }
+  l->gate.leave(was);
+  if (kept != 0) {
+    reset(a->state);
+  } else {
+    l->settle();
+  }
+  return kept;
+}
+
+// watches holds watch_room watches, keeps holds keep_room keeps. Call it
+// after the cores are set up and before they run.
+export fn AlphLife_init__ptr(l: AlphLife*, cores: AlphCores*, watches: AlphWatch*, watch_room: Word, keeps: AlphKeep*,
+                             keep_room: Word) {
+  l->gate.init();
+  l->cores = cores;
+  l->watches = watches;
+  l->watch_room = watch_room;
+  l->keeps = keeps;
+  l->keep_room = keep_room;
+  l->refs = 0;
+  for i in 0..watch_room {
+    watches[i].ref = 0;
+  }
+  for i in 0..keep_room {
+    keeps[i].pid = 0;
+  }
+  for i in 0..cores->count {
+    cores->cores[i].node.on_end(&alph_life_ended, (rawptr)l);
+  }
+}
+
+// Has watcher sent ALPH_ENDED when target ends. Returns the watch's ref
+// (above 0), ALPH_GONE when the target is already gone, ALPH_FULL when
+// every watch is in use. A target on another machine cannot be checked: it
+// is watched, and ends for its watchers when its machine is lost.
+export fn AlphLife_watch__ptr(l: AlphLife*, watcher: Word, target: Word) -> Word {
+  var out: Word = ALPH_FULL;
+  var core: Word = (Word)(target >> ALPH_PLACE_SHIFT) - l->cores->first;
+  var was: int32 = l->gate.enter();
+  if (core >= 0 && core < l->cores->count && !l->cores->alive(target)) {
+    out = ALPH_GONE;
+  } else {
+    for i in 0..l->watch_room {
+      var w: AlphWatch* = &l->watches[i];
+      if (w->ref == 0) {
+        l->refs = l->refs + 1;
+        if (l->refs <= 0) {
+          l->refs = 1;
+        }
+        w->watcher = watcher;
+        w->target = target;
+        w->owed = 0;
+        w->reason = 0;
+        w->far = 0;
+        w->ref = l->refs;
+        out = w->ref;
+        break;
+      }
+    }
+  }
+  l->gate.leave(was);
+  l->settle();
+  return out;
+}
+
+// A watch made for a watcher on another machine, under the ref that
+// machine chose: its door asks for it. Returns ALPH_OK, ALPH_GONE when the
+// target is already gone, ALPH_FULL when every watch is in use.
+export fn AlphLife_watch_as__ptr(l: AlphLife*, watcher: Word, target: Word, ref: Word) -> Word {
+  var out: Word = ALPH_FULL;
+  var was: int32 = l->gate.enter();
+  if (!l->cores->alive(target)) {
+    out = ALPH_GONE;
+  } else {
+    for i in 0..l->watch_room {
+      var w: AlphWatch* = &l->watches[i];
+      if (w->ref == 0) {
+        w->watcher = watcher;
+        w->target = target;
+        w->owed = 0;
+        w->reason = 0;
+        w->far = 1;
+        w->ref = ref;
+        out = ALPH_OK;
+        break;
+      }
+    }
+  }
+  l->gate.leave(was);
+  return out;
+}
+
+// An actor watched on another machine ended there: its door says so.
+export fn AlphLife_ended_far__ptr(l: AlphLife*, target: Word, ref: Word, reason: Word) {
+  var was: int32 = l->gate.enter();
+  for i in 0..l->watch_room {
+    var w: AlphWatch* = &l->watches[i];
+    if (w->ref == ref && w->target == target && w->far == 0 && w->owed == 0) {
+      w->owed = 1;
+      w->reason = reason;
+    }
+  }
+  l->gate.leave(was);
+  l->settle();
+}
+
+// Stops watching. ALPH_GONE when the watch is over or its message is on
+// the way.
+export fn AlphLife_unwatch__ptr(l: AlphLife*, ref: Word) -> Word {
+  var out: Word = ALPH_GONE;
+  if (ref <= 0) {
+    return out;
+  }
+  var was: int32 = l->gate.enter();
+  for i in 0..l->watch_room {
+    if (l->watches[i].ref == ref && l->watches[i].owed == 0 && l->watches[i].far == 0) {
+      l->watches[i].ref = 0;
+      out = ALPH_OK;
+      break;
+    }
+  }
+  l->gate.leave(was);
+  return out;
+}
+
+// Keeps an actor: when its handler fails, reset is called on its state and
+// it goes on, up to times times. Keeping it again sets times anew. Returns
+// ALPH_FULL when every keep is in use, ALPH_GONE when the actor is not on
+// these cores or not alive.
+export fn AlphLife_keep__ptr(l: AlphLife*, pid: Word, reset: fn(rawptr) -> void, times: Word) -> Word {
+  var out: Word = ALPH_FULL;
+  var mine: AlphKeep* = 0;
+  var was: int32 = l->gate.enter();
+  if (!l->cores->alive(pid)) {
+    out = ALPH_GONE;
+  } else {
+    for i in 0..l->keep_room {
+      var k: AlphKeep* = &l->keeps[i];
+      if (k->pid == pid) {
+        mine = k;
+        break;
+      }
+      if (k->pid == 0 && mine == 0) {
+        mine = k;
+      }
+    }
+    if (mine != 0) {
+      if (mine->pid != pid) {
+        mine->restarts = 0;
+      }
+      mine->pid = pid;
+      mine->reset = reset;
+      mine->left = times;
+      out = ALPH_OK;
+    }
+  }
+  l->gate.leave(was);
+  return out;
+}
+
+// A machine was lost: every actor watched on its places has ended, with the
+// reason ALPH_LOST, and the watches kept here for its watchers are over. first and count are the machine's places, as a link's
+// ALPH_DOWN gives them.
+export fn AlphLife_lost__ptr(l: AlphLife*, first: Word, count: Word) {
+  var was: int32 = l->gate.enter();
+  for i in 0..l->watch_room {
+    var w: AlphWatch* = &l->watches[i];
+    var place: Word = (Word)(w->target >> ALPH_PLACE_SHIFT);
+    var from: Word = (Word)(w->watcher >> ALPH_PLACE_SHIFT);
+    if (w->ref == 0) {
+      continue;
+    }
+    if (w->far != 0 && from >= first && from < first + count) {
+      w->ref = 0;  // a watch kept here for a watcher on the lost machine
+    } else if (w->owed == 0 && place >= first && place < first + count) {
+      w->owed = 1;
+      w->reason = ALPH_LOST;
+    }
+  }
+  l->gate.leave(was);
+  l->settle();
+}

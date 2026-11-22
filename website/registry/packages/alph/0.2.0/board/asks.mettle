@@ -1,0 +1,210 @@
+// A board asks for work that must be done at most once: work that changes
+// something, such as moving an arm. This is the asker's side of what
+// alph/place/once describes, small enough for a board. It is apart from
+// alph/board/board so that a board that asks for no such work pays nothing
+// for it.
+//
+// One AlphBoardAsks is one kind, asked of the machine at the other end of
+// the line by one actor. That machine shares the kind as done at most once
+// (AlphBoard_share_once on a board, AlphMachine_once on a computer).
+//
+// The actor asks, gives took every message it gets, and calls tick from a
+// timer of its own a few times a second: the line sends nothing again,
+// tick does. A job ends in one of three ways, which took tells: ALPH_OK
+// with what it gave, ALPH_FULL or ALPH_GONE when it was not done and will
+// not be, or ALPH_LOST when the worker was restarted or given up. Done or
+// not, no one can say then, and the program decides what that means.
+//
+// Every start of the board must use numbers it never used before, or a
+// copy of an old job still on its way could be taken for a new one. So a
+// run of numbers begins with one the board's port says is fresh
+// (alph_board_fresh): the time of a clock that goes on while the board is
+// restarted, or random bits from the chip.
+
+import "port/port";
+import "port/board";
+import "alph/actor/actor";
+import "alph/board/board";
+import "alph/door/words";
+import "alph/place/words";
+
+const ONCE: Word = 1073741824;
+const LAST: Word = 4095;  // a run's last number: a new run starts before it
+const OUT: Word = 4;      // such jobs out at once: what the worker remembers of an asker
+
+// One kind asked for at most once, and the jobs out.
+export struct AlphBoardAsks {
+  board: AlphBoard*;
+  kind: Word;
+  known: Word;      // 0 the worker must be said hello to, 1 hello sent, 2 it answered
+  run: Word;        // the run of numbers the last hello started
+  hello: Word;      // that hello's ref
+  last: Word;       // the last ref given out
+  ref: Word[4];     // jobs out: the ref of each, 0 for none,
+  in: Word[4];      // what it was given,
+  resent: Word[4];  // and whether it went out a second time
+  told: Word;       // what took last had to tell: how many jobs ended,
+  told_ref: Word[4];     // the ref of each,
+  told_status: Word[4];  // how it ended,
+  told_out: Word[4];     // and what it gave, when it was done
+}
+
+// Sets up one kind (0 to 7) to ask of the machine at the other end of b's line.
+export fn AlphBoardAsks_init__ptr(s: AlphBoardAsks*, b: AlphBoard*, kind: Word) {
+  s->board = b;
+  s->kind = kind;
+  s->known = 0;
+  s->run = -1;
+  s->hello = 0;
+  s->last = 0;
+  s->told = 0;
+  for i in 0..4 {
+    s->ref[i] = 0;
+  }
+}
+
+// Says hello: a new run of numbers starts, and the worker forgets the old.
+fn alph_asks_greet(s: AlphBoardAsks*, a: AlphActor*) {
+  var run: Word = (Word)(alph_board_fresh() & 262143);
+  if (run == s->run) {
+    return;  // not fresh yet: the next try will be
+  }
+  var h: Word = (Word)(ONCE | (run << 12));
+  var hello: AlphMsg = { tag: ALPH_HELLO, from: a->pid, arg: 0, ref: h };
+  s->run = run;
+  s->hello = h;
+  s->last = h;
+  s->known = 1;
+  a->node->put(s->board->helpers[s->kind], &hello);
+}
+
+fn alph_asks_tell(s: AlphBoardAsks*, at: Word, status: Word, out: Word) {
+  s->told_ref[s->told] = s->ref[at];
+  s->told_status[s->told] = status;
+  s->told_out[s->told] = out;
+  s->told = s->told + 1;
+  s->ref[at] = 0;
+}
+
+// Asks for one job with `in`. Always from the same actor: the worker knows
+// the jobs by who asks. Returns the job's ref, which took tells the end of.
+// Returns ALPH_FULL when it cannot go out yet: the board does not know who
+// does the kind, or the worker has not answered a hello, or four jobs are
+// out. Ask again shortly then: after the next tick or the next answer.
+export fn AlphBoardAsks_ask__ptr(s: AlphBoardAsks*, a: AlphActor*, in: Word) -> Word {
+  var b: AlphBoard* = s->board;
+  var to: Word = b->helpers[s->kind];
+  if (to == 0) {
+    var where_is: AlphMsg = { tag: ALPH_WHERE, from: b->door, arg: ALPH_SHARED + s->kind, ref: s->kind + 1 };
+    b->node.put(alph_door_of(b->tether.first), &where_is);
+    return ALPH_FULL;
+  }
+  var least: Word = 0;
+  var free: Word = -1;
+  for i in 0..4 {
+    if (s->ref[i] == 0) {
+      free = (Word)i;
+    } else if (least == 0 || s->ref[i] < least) {
+      least = s->ref[i];
+    }
+  }
+  var next: Word = s->last + 1;
+  if (s->known != 2 || (Word)(next & LAST) == LAST) {
+    if (s->known != 1 && least == 0) {
+      alph_asks_greet(s, a);
+    }
+    return ALPH_FULL;
+  }
+  if (free < 0 || (least != 0 && next - least >= OUT)) {
+    return ALPH_FULL;
+  }
+  var work: AlphMsg = { tag: ALPH_WORK_ONCE, from: a->pid, arg: in, ref: next };
+  s->last = next;
+  s->ref[free] = next;
+  s->in[free] = in;
+  s->resent[free] = 0;
+  a->node->put(to, &work);
+  return next;
+}
+
+// Give it every message the actor gets. Returns how many jobs that message
+// ended, 0 for most: s->told_ref, told_status and told_out say which, how
+// and with what, until the next call. A job ends as ALPH_OK with its out,
+// as ALPH_FULL or ALPH_GONE when the worker did not take it and will not
+// (ask for it again, or do without), or as ALPH_LOST.
+export fn AlphBoardAsks_took__ptr(s: AlphBoardAsks*, a: AlphActor*, m: AlphMsg*) -> Word {
+  s->told = 0;
+  if (m->from == 0 || m->from != s->board->helpers[s->kind]) {
+    return 0;
+  }
+  if (m->tag == ALPH_HELLO) {
+    if (s->known == 1 && m->ref == s->hello) {
+      s->known = 2;
+    }
+    return 0;
+  }
+  if (m->tag != ALPH_WORKED && m->tag != ALPH_REFUSED) {
+    return 0;
+  }
+  var at: Word = -1;
+  for i in 0..4 {
+    if (s->ref[i] != 0 && s->ref[i] == m->ref) {
+      at = (Word)i;
+    }
+  }
+  if (at < 0) {
+    return 0;  // an old copy's answer
+  }
+  if (m->tag == ALPH_WORKED) {
+    alph_asks_tell(s, at, ALPH_OK, m->arg);
+  } else if (m->arg == ALPH_LOST) {
+    // The worker does not know this run: it was restarted. Nothing out to
+    // it can be told done or not.
+    s->lost();
+  } else if (s->resent[at] == 0) {
+    alph_asks_tell(s, at, m->arg, 0);
+  } else if (m->arg != ALPH_FULL) {
+    // It will never do the kind again, and this job went out more than
+    // once: another copy may have been taken.
+    alph_asks_tell(s, at, ALPH_LOST, 0);
+  }
+  // Refused as full after a second sending: only an answer settles it.
+  return s->told;
+}
+
+// Call it a few times a second, and no more often than a job takes four
+// times over: every job out is sent again with the same ref, which the
+// worker answers from memory if it has done it, and a hello with no answer
+// is said again.
+export fn AlphBoardAsks_tick__ptr(s: AlphBoardAsks*, a: AlphActor*) {
+  var to: Word = s->board->helpers[s->kind];
+  var open: bool = false;
+  if (to == 0) {
+    return;
+  }
+  for i in 0..4 {
+    if (s->ref[i] != 0) {
+      var again: AlphMsg = { tag: ALPH_WORK_ONCE, from: a->pid, arg: s->in[i], ref: s->ref[i] };
+      a->node->put(to, &again);
+      s->resent[i] = 1;
+      open = true;
+    }
+  }
+  if (s->known == 1 && !open) {
+    alph_asks_greet(s, a);
+  }
+}
+
+// The program's own word that the worker is gone, when it has a way to
+// know: every job out ends as ALPH_LOST, told as took tells, and the next
+// ask says hello again. Returns how many jobs that was.
+export fn AlphBoardAsks_lost__ptr(s: AlphBoardAsks*) -> Word {
+  s->told = 0;
+  for i in 0..4 {
+    if (s->ref[i] != 0) {
+      alph_asks_tell(s, (Word)i, ALPH_LOST, 0);
+    }
+  }
+  s->known = 0;
+  return s->told;
+}

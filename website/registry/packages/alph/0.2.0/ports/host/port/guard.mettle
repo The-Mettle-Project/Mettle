@@ -1,0 +1,133 @@
+// A guard brings a thread back when a handler crashes: a trap the compiler
+// put in (a bad index, a division by zero, a null pointer) or a fault signal
+// such as SIGSEGV. The crash ends the handler, not the process.
+//
+// Mettle's runtime asks a hook where to resume before it ends the process.
+// A guard is a saved place to resume: the registers a function must keep,
+// the stack pointer and the return address, like setjmp. Build with -s:
+// without it a trap is an inline exit that never reaches the hook.
+
+extern fn mettle_crash_set_live_recovery(point: int64, wait: int64, jump: int64) with none;
+extern fn mettle_crash_set_quiet_recovery(on: int32) with none;
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+extern fn mettle_atomic_compare_exchange_i32(target: int32*, exchange: int32, comparand: int32) -> int32 with none = "mettle_atomic_compare_exchange_i32";
+
+const GUARDS: int64 = 64;
+const BELOW: int64 = 1048576;  // how much deeper the stack may be when it crashes
+const ABOVE: int64 = 65536;
+
+export struct AlphGuard {
+  // rbx, rbp, two unused, r12, r13, r14, r15, rsp, rip: the order the
+  // runtime's signal path restores them in.
+  regs: int64[10];
+  lo: int64;      // the thread's stack, as far as a crash is looked for
+  hi: int64;
+  armed: int64;
+  crashes: int64;
+}
+
+var g_guards: int64[64];
+var g_guard_lock: int32 = 0;
+var g_guard_hooked: int32 = 0;
+
+// Saves where to resume. Returns 0 now, and 1 a second time when a crash
+// comes back here. The frame that calls it must still be running then.
+@naked export fn AlphGuard_save__ptr(g: AlphGuard*) -> int64 {
+  asm {
+    mov [rdi], rbx
+    mov [rdi + 8], rbp
+    mov [rdi + 32], r12
+    mov [rdi + 40], r13
+    mov [rdi + 48], r14
+    mov [rdi + 56], r15
+    lea r10, [rsp + 8]
+    mov [rdi + 64], r10
+    mov r10, [rsp]
+    mov [rdi + 72], r10
+    xor eax, eax
+    ret
+  }
+}
+
+@naked fn alph_guard_resume(regs: int64) {
+  asm {
+    mov rax, rdi
+    mov rbx, [rax]
+    mov rbp, [rax + 8]
+    mov r12, [rax + 32]
+    mov r13, [rax + 40]
+    mov r14, [rax + 48]
+    mov r15, [rax + 56]
+    mov rsp, [rax + 64]
+    mov r10, [rax + 72]
+    mov rax, 1
+    jmp r10
+  }
+}
+
+// The runtime calls these three on a crash. The first runs inside a signal
+// handler, so it only reads: it finds the armed guard of the thread whose
+// stack holds the address.
+fn alph_guard_point(stack: int64) -> int64 {
+  for i in 0..GUARDS {
+    var g: AlphGuard* = (AlphGuard*)g_guards[i];
+    if (g != 0 && g->armed != 0 && stack >= g->lo && stack < g->hi) {
+      return (int64)g;
+    }
+  }
+  return 0;
+}
+
+fn alph_guard_wait(slot: int64) -> int64 {
+  var g: AlphGuard* = (AlphGuard*)slot;
+  g->armed = 0;
+  g->crashes = g->crashes + 1;
+  return 1;
+}
+
+fn alph_guard_jump(slot: int64) {
+  alph_guard_resume(slot);
+}
+
+// Makes g the calling thread's guard. False when 64 threads have one.
+export fn AlphGuard_open__ptr(g: AlphGuard*) -> bool {
+  var here: int64 = 0;
+  var found: bool = false;
+  g->lo = (int64)&here - BELOW;
+  g->hi = (int64)&here + ABOVE;
+  g->armed = 0;
+  g->crashes = 0;
+  if (mettle_atomic_compare_exchange_i32(&g_guard_hooked, 1, 0) == 0) {
+    mettle_crash_set_live_recovery((int64)&alph_guard_point, (int64)&alph_guard_wait, (int64)&alph_guard_jump);
+    mettle_crash_set_quiet_recovery(1);
+  }
+  while (mettle_atomic_exchange_i32(&g_guard_lock, 1) != 0) {
+  }
+  for i in 0..GUARDS {
+    if (g_guards[i] == 0) {
+      g_guards[i] = (int64)g;
+      found = true;
+      break;
+    }
+  }
+  mettle_atomic_compare_exchange_i32(&g_guard_lock, 0, 1);
+  return found;
+}
+
+export fn AlphGuard_close__ptr(g: AlphGuard*) {
+  g->armed = 0;
+  for i in 0..GUARDS {
+    if (g_guards[i] == (int64)g) {
+      g_guards[i] = 0;
+    }
+  }
+}
+
+// From here a crash on this thread resumes at the last save.
+export fn AlphGuard_arm__ptr(g: AlphGuard*) {
+  g->armed = 1;
+}
+
+export fn AlphGuard_disarm__ptr(g: AlphGuard*) {
+  g->armed = 0;
+}

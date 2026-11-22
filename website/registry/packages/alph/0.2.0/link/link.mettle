@@ -1,0 +1,1530 @@
+// Links: other machines as places. Each machine owns a run of place
+// numbers, so a pid says which machine its actor is on, and an actor sends
+// to it the way it sends next door.
+//
+// A message crosses in one datagram. Messages to a machine are numbered,
+// the machine says how far it has them, and what it has not got in a
+// twenty-fifth of a second is sent again: so between two machines messages
+// arrive once and in the order they were sent, for as long as both are up.
+// A message for an actor whose mailbox is full is not taken: it is sent
+// again, and what is behind it waits, so a full mailbox slows a sender down
+// and loses nothing. An actor that has had no room for half a second is
+// not reading: its message is then dropped, so it cannot hold up the rest.
+// Every machine tells its peers it is alive 20 times a second.
+// One that stays quiet for half a second is down: sends to it return
+// ALPH_GONE and the watcher is told. If it was only out of reach, what was
+// on its way is sent again when it is back. A machine that was restarted is
+// a new one, with a new life: what was on its way to the old one is lost,
+// and mail meant for the old one is not handed to the new.
+//
+// A message can carry bytes: up to 1,024 of them, in a parcel. They cross
+// with the same numbering as every other message, so they too arrive once
+// and in order. The parcels are the caller's memory: a pool the link is
+// given. A parcel that arrives belongs to the actor it was sent to, which
+// gives it back with release when it has read it.
+//
+// More bytes than that go as a long message, if the link is given long
+// buffers (longs): it is cut into pieces of 1,024 bytes that cross like
+// any other message, and put together again at the other end in a long
+// buffer of that machine. The actor gets the whole at once, and gives the
+// buffer back with free. A long message takes its place among the others
+// when its last piece goes, so a short message sent after it can arrive
+// before it. One on its way to or from a machine that goes down is given
+// up, and its buffers are free again at once.
+//
+// A message that arrives too early shows that the one before it was lost.
+// The sender is told at once and sends again from there, so a loss costs
+// one round trip and not the wait of a clock.
+//
+// A link is in the clear unless it is sealed: see src/seal.
+
+import "std/thread";
+import "port/port";
+import "port/sys";
+import "port/alarm";
+import "port/wire";
+import "alph/actor/actor";
+import "alph/cores/cores";
+
+extern fn mettle_atomic_exchange_i32(target: int32*, value: int32) -> int32 with none = "mettle_atomic_exchange_i32";
+
+export const ALPH_UP: Word = -4;    // to the watcher: arg is the first place of a machine now reachable
+export const ALPH_DOWN: Word = -5;  // to the watcher: arg is the first place of a machine now lost
+const MAGIC: uint32 = 1095520328;   // "ALPH"
+const BEAT: uint32 = 1;
+const MAIL: uint32 = 2;
+const PARCEL: uint32 = 3;   // mail with bytes after it: `unused` says how many
+const WAIT: uint32 = 4;     // a beat that says the next message found no room: send it again soon
+const PART: uint32 = 5;     // bytes of a long message: `unused` says how many, arg where they go, ref how many in all
+const LONG: uint32 = 6;     // the mail that ends a long message: `unused` says how many bytes it had, arg is the word that goes with them
+const MISSED: uint32 = 7;   // a beat that says a message did not arrive: send again from the one after ack, now
+const VOID: uint32 = 8;     // what is left of a piece of a long message that was given up: taken, and nothing done
+const SOON_MS: Word = 5;
+const BUNDLE: uint32 = 13;        // messages without bytes that fit one datagram
+const WARM_NS: Word = 50000;      // how long after a datagram the next is looked for without sleeping
+const HURRY_NS: Word = 100000;    // the first wait before sending again what found a mailbox full,
+const HURRY_MOST: Word = 4000000; // and the longest, each wait twice the one before
+const BEAT_MS: Word = 50;
+const DOWN_MS: Word = 500;
+const BEAT_BYTES: int64 = 24;
+const MAIL_BYTES: int64 = 80;
+const WINDOW: uint32 = 64;   // messages to one machine that may be waiting for its word
+const AGAIN_MS: Word = 40;   // how long that word is waited for before sending again
+const ACK_EVERY: Word = 16;  // messages taken before saying so at once
+// The most bytes one message can carry.
+export const ALPH_PARCEL_BYTES: Word = 1024;
+export const ALPH_DATAGRAM: int64 = 1104;  // the most a datagram holds before it is sealed
+export const ALPH_BIG: Word = -25;  // more bytes than a long buffer holds
+
+// Bytes that travel with a message.
+export struct AlphParcel {
+  count: Word;  // how many of the bytes are in use
+  used: Word;   // taken from the pool
+  bytes: uint8[1024];
+  word: Word;   // a word that came with the bytes (send_with), 0 for none
+}
+
+// The bytes of a long message, and while it is on its way out, the message.
+export struct AlphLong {
+  count: Word;   // how many of the bytes are in use
+  room: Word;    // how many fit
+  used: Word;    // taken from the pool
+  bytes: uint8*;
+  to: Word;
+  from: Word;
+  tag: Word;
+  ref: Word;
+  at: Word;      // how many bytes have gone
+  next: AlphLong*;
+  word: Word;    // a word that goes with the bytes: set it before send_long, read it at the other end
+}
+
+// A pid on the wire is its three parts, because machines of different word
+// sizes pack them differently. The first six fields are a beat.
+struct AlphPacket {
+  magic: uint32;
+  kind: uint32;
+  from_place: uint32;  // the sender's first place
+  from_life: uint32;
+  to_life: uint32;
+  ack: uint32;         // the sender has every message up to this one
+  seq: uint32;         // this message's number
+  to_place: uint32;
+  to_gen: uint32;
+  to_index: uint32;
+  src_place: uint32;
+  src_gen: uint32;
+  src_index: uint32;
+  unused: uint32;
+  tag: int64;
+  arg: int64;
+  ref: int64;
+}
+
+// Another machine: its places, its address, and how far the messages to
+// it and from it have got.
+export struct AlphPeer {
+  first: Word;   // its places are first, first + 1, ...
+  count: Word;
+  more_first: Word;  // places reached through it, such as a board on its serial line
+  more_count: Word;
+  ip: uint32;
+  port: int64;
+  life: uint32;  // which run of that machine this is, 0 before it is heard
+  alive: Word;
+  told: Word;    // the watcher was told it is up,
+  told_life: uint32;  // and this was its life then
+  seen: Word;
+  gate: AlphGate;     // what follows is shared by senders and the link's thread
+  sent: uint32;       // the number of the last message sent to it
+  acked: uint32;      // it has every message up to this one
+  heard: Word;        // on a sealed link: the count of the last datagram taken from it,
+  newest: Word;       // and when the latest run of it ever heard began, so nothing recorded can be played again
+  got: uint32;        // every message from it up to this one was taken
+  owed: Word;         // messages taken since it was last told so
+  waiting_since: Word;
+  wired: uint32;      // the last message put on the wire: later ones are held back for a moment
+  missed: uint32;     // the message last said to be missing: said once, then left to the sender's clock
+  hurry: Word;        // when, in ns, to send again what found a mailbox full, 0 for not waiting
+  hurry_wait: Word;   // how long that wait is now
+  stuck: uint32;      // the message being refused because its actor has no room,
+  stuck_at: Word;     // and since when
+  again_ms: Word;     // how long its word is waited for before sending again
+  window: AlphPacket[64];  // the messages it has not yet said it has
+  held: AlphParcel*[64];   // and the bytes of those that carry any
+  part: uint8*[64];        // or, for a piece of a long message, where its bytes are,
+  ends: AlphLong*[64];     // and for the mail that ends one, the long to give back
+  longs: AlphLong*;        // long messages waiting to go, the next first
+  longs_last: AlphLong*;
+  filling: AlphLong*;      // a long message arriving
+  skipping: Word;          // one is arriving that cannot be taken: its bytes are dropped
+}
+
+// This machine's link to the others.
+export struct AlphLink {
+  wire: AlphWire;
+  cores: AlphCores*;
+  peers: AlphPeer*;
+  room: Word;
+  count: Word;
+  life: uint32;   // this run: the low half of born, never 0
+  born: Word;     // when this run began, in milliseconds
+  watcher: Word;
+  thread: int64;
+  stopping: int32;
+  port: int64;    // the port the wire is open on, 0 when it is not
+  resent: Word;   // messages sent again
+  lose: Word;     // for tests: one in so many messages is not sent the first time
+  lost: Word;
+  deaf: Word;     // for tests: hears nothing while this is set
+  // A sealed link: seal turns a datagram into one only the holders of the
+  // key can read or make, open turns it back and says who sent it and which
+  // datagram of theirs it is. Set by src/seal. 0 for a link in the clear.
+  seal: fn(rawptr, uint8*, uint8*, int64) -> int64;
+  open: fn(rawptr, uint8*, uint8*, int64, uint32*, Word*, Word*) -> int64;
+  sealer: rawptr;
+  refused: Word;  // datagrams not sealed with the key, or already heard
+  full: Word;     // messages left to be sent again because their actor had no room,
+  shed: Word;     // and messages dropped because it had none for half a second
+  // Mail for a place that is neither on these cores nor a peer's goes to
+  // beyond, if it is set: a board on this machine's serial line, say.
+  beyond: fn(AlphLink*, Word, AlphMsg*) -> Word;
+  beyond_ctx: rawptr;
+  parcels: AlphParcel*;
+  parcel_room: Word;
+  parcel_free: Word;  // how many are free,
+  parcel_next: Word;  // and where the search for one starts
+  parcel_gate: AlphGate;
+  longs: AlphLong*;
+  long_room: Word;
+  skipped: Word;  // long messages that arrived with no long buffer big enough here
+  unsent: int32;  // not 0: short messages are held back, to go several to a datagram
+  unsent_at: Word;  // since this many ns
+  shared: Word;   // messages that went in a datagram with others
+}
+
+fn alph_link_ns() -> Word {
+  var ts: int64[2];
+  syscall(ALPH_NR_CLOCK_GETTIME, 1, (int64)&ts[0]);
+  return (Word)(ts[0] * 1000000000 + ts[1]);
+}
+
+// Sends a datagram to a peer, sealed if the link is.
+fn alph_link_out(l: AlphLink*, p: AlphPeer*, bytes: uint8*, count: int64) {
+  if (l->seal == 0) {
+    l->wire.send(p->ip, p->port, bytes, count);
+    return;
+  }
+  var sealed: uint8[1200];
+  var n: int64 = l->seal(l->sealer, &sealed[0], bytes, count);
+  if (n > 0) {
+    l->wire.send(p->ip, p->port, &sealed[0], n);
+  }
+}
+
+// A parcel from the pool, or 0 when no more than `keep` are free. What is
+// sent keeps half the pool free for what arrives: two machines that each
+// filled their pools with their own unanswered bytes could never take the
+// other's, and so never answer.
+fn alph_link_parcel(l: AlphLink*, keep: Word) -> AlphParcel* {
+  var mine: AlphParcel* = 0;
+  var was: int32 = l->parcel_gate.enter();
+  if (l->parcel_free > keep) {
+    // The search starts after the one taken last, so it is short while
+    // some are free.
+    var at: Word = l->parcel_next;
+    for i in 0..l->parcel_room {
+      if (at >= l->parcel_room) {
+        at = 0;
+      }
+      if (l->parcels[at].used == 0) {
+        mine = &l->parcels[at];
+        break;
+      }
+      at = at + 1;
+    }
+    if (mine != 0) {
+      mine->used = 1;
+      mine->word = 0;
+      l->parcel_free = l->parcel_free - 1;
+      l->parcel_next = at + 1;
+    }
+  }
+  l->parcel_gate.leave(was);
+  return mine;
+}
+
+// Gives a parcel back to the pool. The actor a parcel was sent to calls
+// this when it has read it, on the link of its own machine. A machine whose
+// actors keep every parcel can take no more bytes, and since messages
+// arrive in order, nothing else from that sender either until one is given
+// back.
+export fn AlphLink_release__ptr(l: AlphLink*, parcel: AlphParcel*) {
+  var was: int32 = l->parcel_gate.enter();
+  if (parcel->used != 0) {
+    parcel->used = 0;
+    l->parcel_free = l->parcel_free + 1;
+  }
+  l->parcel_gate.leave(was);
+}
+
+// A long buffer from the pool, or 0 when no more than `keep` are free.
+fn alph_link_long(l: AlphLink*, keep: Word) -> AlphLong* {
+  var mine: AlphLong* = 0;
+  var free: Word = 0;
+  var was: int32 = l->parcel_gate.enter();
+  for i in 0..l->long_room {
+    if (l->longs[i].used == 0) {
+      free = free + 1;
+      if (mine == 0) {
+        mine = &l->longs[i];
+      }
+    }
+  }
+  if (free <= keep) {
+    mine = 0;
+  }
+  if (mine != 0) {
+    mine->used = 1;
+    mine->count = 0;
+    mine->word = 0;
+  }
+  l->parcel_gate.leave(was);
+  return mine;
+}
+
+// Gives a long buffer back to the pool. The actor a long message was sent
+// to calls it when it has read the bytes, and so does a program that took
+// a buffer (long) and did not send it.
+export fn AlphLink_free__ptr(l: AlphLink*, buffer: AlphLong*) {
+  var was: int32 = l->parcel_gate.enter();
+  buffer->used = 0;
+  l->parcel_gate.leave(was);
+}
+
+// Sends a numbered message to a peer, with its bytes if it has any: a
+// parcel's, or those of a piece of a long message.
+fn alph_link_post(l: AlphLink*, p: AlphPeer*, k: AlphPacket*, parcel: AlphParcel*) {
+  var bytes: uint8* = p->part[k->seq % WINDOW];
+  if (parcel != 0) {
+    bytes = &parcel->bytes[0];
+  }
+  if (bytes == 0 || (k->kind != PARCEL && k->kind != PART)) {
+    alph_link_out(l, p, (uint8*)k, MAIL_BYTES);
+    return;
+  }
+  var whole: uint8[1104];
+  var head: uint8* = (uint8*)k;
+  for i in 0..MAIL_BYTES {
+    whole[i] = head[i];
+  }
+  for i in 0..k->unused {
+    whole[MAIL_BYTES + (int64)i] = bytes[i];
+  }
+  alph_link_out(l, p, &whole[0], MAIL_BYTES + (int64)k->unused);
+}
+
+// Puts messages first to last of a peer's window on the wire, in order.
+// Those without bytes go several to a datagram, as many as fit. One with
+// bytes goes alone. With fresh, this is their first sending. Called inside
+// the peer's gate.
+fn alph_link_wire(l: AlphLink*, p: AlphPeer*, first: uint32, last: uint32, fresh: bool) {
+  var room: int64[138];
+  var whole: uint8* = (uint8*)&room[0];
+  var filled: int64 = 0;
+  var seq: uint32 = first;
+  while ((int32)(last - seq) >= 0) {
+    var k: AlphPacket* = &p->window[seq % WINDOW];
+    var skip: bool = false;
+    k->ack = p->got;
+    k->to_life = p->life;
+    if (fresh) {
+      l->lost = l->lost + 1;
+      skip = l->lose != 0 && l->lost % l->lose == 0;
+    } else {
+      l->resent = l->resent + 1;
+    }
+    if (!skip && (k->kind == PARCEL || k->kind == PART)) {
+      if (filled > 0) {
+        alph_link_out(l, p, whole, filled);
+        filled = 0;
+      }
+      alph_link_post(l, p, k, p->held[seq % WINDOW]);
+    } else if (!skip) {
+      var head: uint8* = (uint8*)k;
+      for i in 0..MAIL_BYTES {
+        whole[filled + (int64)i] = head[i];
+      }
+      if (filled > 0) {
+        l->shared = l->shared + 1;
+      }
+      filled = filled + MAIL_BYTES;
+      if (filled + MAIL_BYTES > ALPH_DATAGRAM) {
+        alph_link_out(l, p, whole, filled);
+        filled = 0;
+      }
+    }
+    seq = seq + 1;
+  }
+  if (filled > 0) {
+    alph_link_out(l, p, whole, filled);
+  }
+  p->owed = 0;
+}
+
+// Sends as much of the long messages waiting for a peer as may be sent
+// now. Their pieces leave a quarter of the window to other messages, which
+// would otherwise wait for as long as a long message takes. Called inside
+// the peer's gate.
+fn alph_link_push(l: AlphLink*, p: AlphPeer*) {
+  while (p->longs != 0 && p->alive != 0 && p->sent - p->acked < WINDOW - WINDOW / 4) {
+    var g: AlphLong* = p->longs;
+    p->sent = p->sent + 1;
+    var at: uint32 = p->sent % WINDOW;
+    var k: AlphPacket* = &p->window[at];
+    p->held[at] = 0;
+    p->part[at] = 0;
+    p->ends[at] = 0;
+    k->magic = MAGIC;
+    k->from_place = (uint32)l->cores->first;
+    k->from_life = l->life;
+    k->to_life = p->life;
+    k->ack = p->got;
+    k->seq = p->sent;
+    k->to_place = alph_pid_place(g->to);
+    k->to_gen = alph_pid_gen(g->to);
+    k->to_index = alph_pid_index(g->to);
+    k->src_place = alph_pid_place(g->from);
+    k->src_gen = alph_pid_gen(g->from);
+    k->src_index = alph_pid_index(g->from);
+    k->tag = (int64)g->tag;
+    if (g->at < g->count) {
+      var n: Word = g->count - g->at;
+      if (n > ALPH_PARCEL_BYTES) {
+        n = ALPH_PARCEL_BYTES;
+      }
+      k->kind = PART;
+      k->unused = (uint32)n;
+      k->arg = (int64)g->at;
+      k->ref = (int64)g->count;
+      p->part[at] = g->bytes + g->at;
+      g->at = g->at + n;
+    } else {
+      k->kind = LONG;
+      k->unused = (uint32)g->count;
+      k->arg = (int64)g->word;
+      k->ref = (int64)g->ref;
+      p->ends[at] = g;
+      p->longs = g->next;
+    }
+    p->owed = 0;
+    if (p->sent - p->acked == 1) {
+      p->waiting_since = alph_now();
+    }
+  }
+  if (p->wired != p->sent) {
+    alph_link_wire(l, p, p->wired + 1, p->sent, true);
+    p->wired = p->sent;
+  }
+}
+
+// Starts the numbering with a peer afresh, because it is a new run of its
+// machine or this is a new run of ours: both sides see that and start
+// again together. A peer that only went quiet for a while keeps its
+// numbers, and what was waiting for it is sent again when it is back.
+fn alph_link_fresh(l: AlphLink*, p: AlphPeer*, life: uint32) {
+  var was: int32 = p->gate.enter();
+  p->life = life;
+  p->sent = 0;
+  p->acked = 0;
+  p->got = 0;
+  p->owed = 0;
+  p->wired = 0;
+  p->missed = 0;
+  p->hurry = 0;
+  p->hurry_wait = HURRY_NS;
+  p->again_ms = AGAIN_MS;
+  for i in 0..64 {
+    if (p->held[i] != 0) {
+      l->release(p->held[i]);
+      p->held[i] = 0;
+    }
+    if (p->ends[i] != 0) {
+      l->free(p->ends[i]);
+      p->ends[i] = 0;
+    }
+    p->part[i] = 0;
+  }
+  // Long messages on their way to the old run, or from it, are lost with it.
+  while (p->longs != 0) {
+    var g: AlphLong* = p->longs;
+    p->longs = g->next;
+    l->free(g);
+  }
+  if (p->filling != 0) {
+    l->free(p->filling);
+    p->filling = 0;
+  }
+  p->skipping = 0;
+  p->gate.leave(was);
+}
+
+fn alph_link_peer(l: AlphLink*, place: Word) -> AlphPeer* {
+  for i in 0..l->count {
+    var p: AlphPeer* = &l->peers[i];
+    if (place >= p->first && place < p->first + p->count) {
+      return p;
+    }
+    if (place >= p->more_first && place < p->more_first + p->more_count) {
+      return p;
+    }
+  }
+  return 0;
+}
+
+fn alph_pid_place(pid: Word) -> uint32 {
+  return (uint32)(pid >> ALPH_PLACE_SHIFT);
+}
+
+fn alph_pid_gen(pid: Word) -> uint32 {
+  return (uint32)((pid >> ALPH_INDEX_BITS) & ((1 << (ALPH_PLACE_SHIFT - ALPH_INDEX_BITS)) - 1));
+}
+
+fn alph_pid_index(pid: Word) -> uint32 {
+  return (uint32)(pid & ((1 << ALPH_INDEX_BITS) - 1));
+}
+
+fn alph_pid_of(place: uint32, gen: uint32, index: uint32) -> Word {
+  return (Word)(((int64)place << ALPH_PLACE_SHIFT) | ((int64)gen << ALPH_INDEX_BITS) | (int64)index);
+}
+
+// Whether three parts off the wire fit a pid here. One that does not would
+// spill into its neighbour and name some other actor.
+fn alph_pid_fits(place: uint32, gen: uint32, index: uint32) -> bool {
+  return (int64)place < ((int64)1 << (62 - (int64)ALPH_PLACE_SHIFT)) * 2
+      && (int64)gen < ((int64)1 << (int64)(ALPH_PLACE_SHIFT - ALPH_INDEX_BITS))
+      && (int64)index < ((int64)1 << (int64)ALPH_INDEX_BITS);
+}
+
+// Numbers a message for a peer, keeps it until the peer says it has it, and
+// sends it. ALPH_FULL when too many messages to that machine are still
+// waiting for its word, or there is no parcel left for its bytes.
+fn alph_link_send(l: AlphLink*, p: AlphPeer*, to: Word, m: AlphMsg*, bytes: uint8*, count: Word) -> Word {
+  var parcel: AlphParcel* = 0;
+  if (count > 0) {
+    parcel = alph_link_parcel(l, (Word)(l->parcel_room / 2));
+    if (parcel == 0) {
+      return ALPH_FULL;
+    }
+    parcel->count = count;
+    for i in 0..count {
+      parcel->bytes[i] = bytes[i];
+    }
+  }
+  var was: int32 = p->gate.enter();
+  var out: Word = ALPH_OK;
+  if (p->alive == 0) {
+    out = ALPH_GONE;
+  } else if (p->sent - p->acked >= WINDOW) {
+    out = ALPH_FULL;
+  }
+  if (out != ALPH_OK) {
+    p->gate.leave(was);
+    if (parcel != 0) {
+      l->release(parcel);
+    }
+    return out;
+  }
+  p->sent = p->sent + 1;
+  var k: AlphPacket* = &p->window[p->sent % WINDOW];
+  p->held[p->sent % WINDOW] = parcel;
+  p->part[p->sent % WINDOW] = 0;
+  p->ends[p->sent % WINDOW] = 0;
+  k->magic = MAGIC;
+  k->kind = MAIL;
+  k->unused = 0;
+  if (parcel != 0) {
+    k->kind = PARCEL;
+    k->unused = (uint32)count;
+  }
+  k->from_place = (uint32)l->cores->first;
+  k->from_life = l->life;
+  k->to_life = p->life;
+  k->ack = p->got;
+  k->seq = p->sent;
+  k->to_place = alph_pid_place(to);
+  k->to_gen = alph_pid_gen(to);
+  k->to_index = alph_pid_index(to);
+  k->src_place = alph_pid_place(m->from);
+  k->src_gen = alph_pid_gen(m->from);
+  k->src_index = alph_pid_index(m->from);
+  k->tag = (int64)m->tag;
+  k->arg = (int64)m->arg;
+  k->ref = (int64)m->ref;
+  p->owed = 0;
+  if (p->sent - p->acked == 1) {
+    p->waiting_since = alph_now();
+  }
+  // A short message from an actor is held back until its node next looks
+  // for mail, a moment from now, so that what the node sends meanwhile
+  // goes with it in one datagram. Thirteen fill one, and go at once.
+  // Everything else goes now, inside the gate, so messages reach the wire
+  // in their order.
+  if (parcel == 0 && p->sent - p->wired < BUNDLE && alph_link_runs(l)) {
+    if (l->unsent == 0) {
+      l->unsent_at = alph_link_ns();
+      l->unsent = 1;
+    }
+  } else {
+    alph_link_wire(l, p, p->wired + 1, p->sent, true);
+    p->wired = p->sent;
+  }
+  p->gate.leave(was);
+  return ALPH_OK;
+}
+
+// Whether the calling thread runs one of this machine's nodes: then that
+// node will send what is held back when it next looks for mail.
+fn alph_link_runs(l: AlphLink*) -> bool {
+  for i in 0..l->cores->count {
+    if (l->cores->cores[i].node.gate.mine()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Sends what is held back for every peer. A node calls it when it next
+// looks for mail, and the link's own thread within a few milliseconds if
+// no node did. A handler that runs long and wants what it sent to leave
+// before it returns calls it itself.
+export fn AlphLink_flush__ptr(l: AlphLink*) {
+  mettle_atomic_exchange_i32(&l->unsent, 0);
+  for i in 0..l->count {
+    var p: AlphPeer* = &l->peers[i];
+    var was: int32 = p->gate.enter();
+    if (p->wired != p->sent) {
+      alph_link_wire(l, p, p->wired + 1, p->sent, true);
+      p->wired = p->sent;
+    }
+    p->gate.leave(was);
+  }
+}
+
+fn alph_link_pass(near: rawptr) {
+  var l: AlphLink* = (AlphLink*)near;
+  l->flush();
+}
+
+// Mail for a place that is not on this machine.
+fn alph_link_far(c: AlphCores*, to: Word, m: AlphMsg*) -> Word {
+  var l: AlphLink* = (AlphLink*)c->world;
+  var p: AlphPeer* = alph_link_peer(l, (Word)(to >> ALPH_PLACE_SHIFT));
+  if (p == 0 && l->beyond != 0) {
+    return l->beyond(l, to, m);
+  }
+  if (p == 0 || p->alive == 0) {
+    return ALPH_GONE;
+  }
+  return alph_link_send(l, p, to, m, 0, 0);
+}
+
+// Tells a peer this machine is alive and how far it has the peer's messages.
+fn alph_link_say_as(l: AlphLink*, p: AlphPeer*, kind: uint32) {
+  var k: AlphPacket;
+  k.magic = MAGIC;
+  k.kind = kind;
+  k.from_place = (uint32)l->cores->first;
+  k.from_life = l->life;
+  k.to_life = p->life;
+  // Sent inside the gate, as every datagram to a peer is: on a sealed link
+  // they must reach the wire in the order they were sealed.
+  var was: int32 = p->gate.enter();
+  k.ack = p->got;
+  p->owed = 0;
+  alph_link_out(l, p, (uint8*)&k, BEAT_BYTES);
+  p->gate.leave(was);
+}
+
+fn alph_link_say(l: AlphLink*, p: AlphPeer*) {
+  alph_link_say_as(l, p, BEAT);
+}
+
+// Brings the watcher up to date: down for a machine it thinks is up that is
+// lost or has become a new one, then up for one that is reachable. A full
+// mailbox is tried again next beat.
+fn alph_link_tell(l: AlphLink*, p: AlphPeer*) {
+  if (p->told != 0 && (p->alive == 0 || p->told_life != p->life)) {
+    if (l->watcher != 0 && l->cores->send(l->watcher, ALPH_DOWN, p->first) == ALPH_FULL) {
+      return;
+    }
+    p->told = 0;
+  }
+  if (p->told == 0 && p->alive != 0) {
+    if (l->watcher != 0 && l->cores->send(l->watcher, ALPH_UP, p->first) == ALPH_FULL) {
+      return;
+    }
+    p->told = 1;
+    p->told_life = p->life;
+  }
+}
+
+// Sends again everything a peer has not said it has. Called inside its gate.
+fn alph_link_again(l: AlphLink*, p: AlphPeer*) {
+  alph_link_wire(l, p, p->acked + 1, p->sent, false);
+  p->wired = p->sent;
+  p->waiting_since = alph_now();
+}
+
+// Whether a datagram on a sealed link is new. Each datagram of a run is
+// taken once, and no run before the latest one heard is taken at all: what
+// was recorded cannot be played again. k is its first message.
+fn alph_link_new(l: AlphLink*, k: AlphPacket*, got: int64, born: Word, count: Word) -> bool {
+  if (got < BEAT_BYTES || k->magic != MAGIC) {
+    return false;
+  }
+  var p: AlphPeer* = alph_link_peer(l, (Word)(int64)k->from_place);
+  if (p == 0 || p->first != (Word)(int64)k->from_place) {
+    return false;
+  }
+  if (p->heard != 0 && (born < p->newest || (born == p->newest && count <= p->heard))) {
+    l->refused = l->refused + 1;
+    return false;
+  }
+  p->newest = born;
+  p->heard = count;
+  return true;
+}
+
+fn alph_link_heard(l: AlphLink*, k: AlphPacket*, got: int64) {
+  if (got < BEAT_BYTES || k->magic != MAGIC) {
+    return;
+  }
+  var p: AlphPeer* = alph_link_peer(l, (Word)(int64)k->from_place);
+  if (p == 0 || p->first != (Word)(int64)k->from_place) {
+    return;
+  }
+  // A life is the time its machine started, so a later one is newer. Mail
+  // still on its way from the run before must not bring that run back.
+  if (p->alive != 0 && k->from_life != p->life && (int32)(k->from_life - p->life) < 0) {
+    return;
+  }
+  if (p->life != k->from_life) {
+    alph_link_fresh(l, p, k->from_life);
+  }
+  if (k->to_life != l->life) {
+    // It has not heard this run of ours yet, or this was said to an earlier
+    // one. Its run is noted, so our next beat names it, but it does not
+    // count as alive until it answers this run: something recorded before
+    // we started cannot do that.
+    return;
+  }
+  p->seen = alph_now();
+  p->alive = 1;
+  alph_link_tell(l, p);
+  var was: int32 = p->gate.enter();
+  if ((int32)(k->ack - p->acked) > 0 && (int32)(p->sent - k->ack) >= 0) {
+    // It has them: their bytes go back to the pool.
+    while (p->acked != k->ack) {
+      p->acked = p->acked + 1;
+      if (p->held[p->acked % WINDOW] != 0) {
+        l->release(p->held[p->acked % WINDOW]);
+        p->held[p->acked % WINDOW] = 0;
+      }
+      if (p->ends[p->acked % WINDOW] != 0) {
+        l->free(p->ends[p->acked % WINDOW]);  // the whole long message has arrived
+        p->ends[p->acked % WINDOW] = 0;
+      }
+      p->part[p->acked % WINDOW] = 0;
+    }
+    p->waiting_since = alph_now();
+    p->again_ms = AGAIN_MS;
+    p->hurry = 0;
+    p->hurry_wait = HURRY_NS;
+    alph_link_push(l, p);
+  }
+  if (k->kind == MISSED && k->ack == p->acked && p->sent != p->acked) {
+    // A message after the last one it has did not arrive, and it has
+    // dropped what came behind: all of it is sent again now, not when the
+    // clock says so.
+    alph_link_again(l, p);
+  }
+  if (k->kind == WAIT && p->hurry == 0 && p->sent != p->acked) {
+    // The next message found its actor's mailbox full, most often for a
+    // moment: the actor was asleep and is awake now. It is sent again a
+    // tenth of a millisecond on, and if it is refused again each wait is
+    // twice the one before.
+    p->hurry = alph_link_ns() + p->hurry_wait;
+    if (p->hurry_wait < HURRY_MOST) {
+      p->hurry_wait = (Word)(p->hurry_wait * 2);
+    }
+  }
+  if (k->kind == WAIT && p->again_ms == AGAIN_MS) {
+    // The next message found its actor's mailbox full. It is sent again
+    // soon, and if it is refused again the wait doubles as for any other.
+    p->waiting_since = alph_now();
+    p->again_ms = SOON_MS;
+  }
+  p->gate.leave(was);
+  if ((k->kind != MAIL && k->kind != PARCEL && k->kind != PART && k->kind != LONG && k->kind != VOID) || got < MAIL_BYTES) {
+    return;
+  }
+  if ((k->kind == PARCEL || k->kind == PART) && ((Word)(int64)k->unused > ALPH_PARCEL_BYTES || k->unused == 0 || got < MAIL_BYTES + (int64)k->unused)) {
+    return;
+  }
+  if (k->seq != p->got + 1) {
+    // One again, or one too early. The next chase says where we are: once,
+    // however many of these come. One too early means the one before it
+    // was lost: the sender is told at once, the first time.
+    var tell: bool = false;
+    was = p->gate.enter();
+    if (p->owed == 0) {
+      p->owed = 1;
+    }
+    if ((int32)(k->seq - p->got) > 1 && p->missed != p->got + 1) {
+      p->missed = p->got + 1;
+      tell = true;
+    }
+    p->gate.leave(was);
+    if (tell) {
+      alph_link_say_as(l, p, MISSED);
+    }
+    return;
+  }
+  if (k->kind == VOID) {
+    // The sender gave a long message up: what has arrived of it goes too.
+    if (p->filling != 0) {
+      l->free(p->filling);
+      p->filling = 0;
+    }
+    p->skipping = 1;
+    was = p->gate.enter();
+    p->got = k->seq;
+    p->owed = p->owed + 1;
+    p->gate.leave(was);
+    return;
+  }
+  if (k->kind == PART) {
+    // A piece of a long message. The first piece takes a long buffer. With
+    // none free it is not taken, and is sent again, as bytes with no
+    // parcel are. With none big enough here the pieces are taken and
+    // dropped, and the mail that ends them arrives with no bytes.
+    var n: Word = (Word)(int64)k->unused;
+    if (k->arg == 0) {
+      if (p->filling != 0) {
+        l->free(p->filling);
+        p->filling = 0;
+      }
+      p->skipping = 0;
+      if (l->long_room == 0 || (Word)k->ref > l->longs[0].room) {
+        p->skipping = 1;
+      } else {
+        p->filling = alph_link_long(l, 0);
+        if (p->filling == 0) {
+          was = p->gate.enter();
+          if (p->owed == 0) {
+            p->owed = 1;
+          }
+          p->gate.leave(was);
+          return;
+        }
+      }
+    }
+    var g: AlphLong* = p->filling;
+    if (g != 0 && (Word)k->arg == g->count && g->count + n <= g->room) {
+      var piece: uint8* = (uint8*)k + MAIL_BYTES;
+      for i in 0..n {
+        g->bytes[g->count + (Word)i] = piece[i];
+      }
+      g->count = g->count + n;
+    } else if (g != 0) {
+      l->free(g);  // a piece is missing: the whole is dropped
+      p->filling = 0;
+      p->skipping = 1;
+    }
+    was = p->gate.enter();
+    p->got = k->seq;
+    p->owed = p->owed + 1;
+    var pieces: Word = p->owed;
+    p->gate.leave(was);
+    if (pieces >= ACK_EVERY) {
+      alph_link_say(l, p);
+    }
+    return;
+  }
+  var whole_long: AlphLong* = 0;
+  if (k->kind == LONG) {
+    whole_long = p->filling;
+    if (whole_long != 0 && whole_long->count != (Word)(int64)k->unused) {
+      l->free(whole_long);
+      p->filling = 0;
+      whole_long = 0;
+    }
+    if (whole_long == 0) {
+      l->skipped = l->skipped + 1;
+    }
+  }
+  // Bytes need a parcel to arrive in. With none free the message is not
+  // taken: it is sent again, and by then one may have been given back.
+  // A machine given no parcels at all can never take one, so there the
+  // message is taken and its bytes dropped, and nothing waits behind it.
+  var parcel: AlphParcel* = 0;
+  var bytes_dropped: bool = k->kind == PARCEL && l->parcel_room == 0;
+  if (k->kind == PARCEL && !bytes_dropped) {
+    parcel = alph_link_parcel(l, 0);
+    if (parcel == 0) {
+      was = p->gate.enter();
+      if (p->owed == 0) {
+        p->owed = 1;
+      }
+      p->gate.leave(was);
+      return;
+    }
+    var payload: uint8* = (uint8*)k + MAIL_BYTES;
+    parcel->word = (Word)k->arg;
+    parcel->count = (Word)(int64)k->unused;
+    for i in 0..parcel->count {
+      parcel->bytes[i] = payload[i];
+    }
+  }
+  // It is taken unless the actor it is for has no room: then, like bytes
+  // with no parcel, it is left to be sent again, and what is behind it
+  // waits with it. So a full mailbox slows a sender down and loses
+  // nothing. One that cannot be delivered at all (no such actor, or pids
+  // that do not fit a word here) is taken and dropped, so it does not hold
+  // up the ones behind it.
+  var full: bool = false;
+  if (!bytes_dropped && alph_pid_fits(k->to_place, k->to_gen, k->to_index) && alph_pid_fits(k->src_place, k->src_gen, k->src_index)) {
+    var m: AlphMsg = { tag: (Word)k->tag, from: alph_pid_of(k->src_place, k->src_gen, k->src_index), arg: (Word)k->arg,
+                       ref: (Word)k->ref };
+    var to: Word = alph_pid_of(k->to_place, k->to_gen, k->to_index);
+    var core: Word = (Word)(int64)k->to_place - l->cores->first;
+    if (parcel != 0) {
+      m.arg = (Word)(int64)parcel;  // the actor reads the bytes and gives the parcel back
+    }
+    if (k->kind == LONG) {
+      m.arg = (Word)(int64)whole_long;  // the same with a long buffer, or 0: it was too long for this machine
+      if (whole_long != 0) {
+        whole_long->word = (Word)k->arg;
+      }
+    }
+    if (core >= 0 && core < l->cores->count) {
+      var put: Word = l->cores->cores[core].node.put(to, &m);
+      if (put == ALPH_OK) {
+        parcel = 0;
+        if (k->kind == LONG) {
+          p->filling = 0;  // the actor has it now
+          whole_long = 0;
+        }
+      }
+      full = put == ALPH_FULL;
+    } else if (parcel == 0 && l->beyond != 0 && alph_link_peer(l, (Word)(int64)k->to_place) == 0) {
+      // Passed on, to a board on our line. If the board's queue is full
+      // the message is dropped there: a board that has stopped must not
+      // hold up this machine's mail.
+      l->beyond(l, to, &m);
+    }
+  }
+  if (parcel != 0) {
+    l->release(parcel);  // nobody took it
+  }
+  was = p->gate.enter();
+  if (full) {
+    // Not for ever: an actor with no room for half a second is not
+    // reading, and one such actor must not hold up everything else its
+    // machine is sent. Its message is then taken and dropped.
+    if (p->stuck != k->seq) {
+      p->stuck = k->seq;
+      p->stuck_at = alph_now();
+    }
+    if ((Word)(alph_now() - p->stuck_at) <= alph_ms(DOWN_MS)) {
+      l->full = l->full + 1;
+      p->gate.leave(was);
+      alph_link_say_as(l, p, WAIT);
+      return;
+    }
+    l->shed = l->shed + 1;
+  }
+  if (whole_long != 0) {
+    l->free(whole_long);  // nobody took it
+    p->filling = 0;
+  }
+  p->got = k->seq;
+  p->owed = p->owed + 1;
+  var owed: Word = p->owed;
+  p->gate.leave(was);
+  if (owed >= ACK_EVERY) {
+    alph_link_say(l, p);
+  }
+}
+
+// Sends again what a peer has not said it has, when that has waited long
+// enough, and says what is owed.
+fn alph_link_chase(l: AlphLink*, p: AlphPeer*) {
+  var now: Word = alph_now();
+  var owed: Word = 0;
+  var was: int32 = p->gate.enter();
+  if (p->alive != 0 && p->sent != p->acked && (Word)(now - p->waiting_since) >= alph_ms(p->again_ms)) {
+    alph_link_again(l, p);
+    p->waiting_since = now;
+    p->owed = 0;
+    // Sent again with no word since: wait twice as long next time, up to
+    // a second. A peer that cannot take more just now is not flooded.
+    p->again_ms = p->again_ms * 2;
+    if (p->again_ms > 1000) {
+      p->again_ms = 1000;
+    }
+  }
+  if (p->alive != 0 && p->longs != 0) {
+    alph_link_push(l, p);  // one that found the peer down for a moment, or the window full
+  }
+  owed = p->owed;
+  p->gate.leave(was);
+  if (owed > 0) {
+    alph_link_say(l, p);
+  }
+}
+
+// A peer went down: the long messages on their way to it and from it are
+// given up, so their buffers do not wait for a machine that may never be
+// back. What is in the window of them becomes void, which the peer takes
+// and ignores if it does come back. Short messages wait as before.
+fn alph_link_give_up(l: AlphLink*, p: AlphPeer*) {
+  var was: int32 = p->gate.enter();
+  var begun: bool = false;  // the peer may have pieces of one that will now never end
+  var seq: uint32 = p->acked + 1;
+  while ((int32)(p->sent - seq) >= 0) {
+    var at: uint32 = seq % WINDOW;
+    if (p->part[at] != 0 || p->ends[at] != 0) {
+      p->window[at].kind = VOID;
+      p->window[at].unused = 0;
+      p->part[at] = 0;
+      if (p->ends[at] != 0) {
+        l->free(p->ends[at]);
+        p->ends[at] = 0;
+      }
+    }
+    seq = seq + 1;
+  }
+  while (p->longs != 0) {
+    var g: AlphLong* = p->longs;
+    if (g->at > 0) {
+      begun = true;
+    }
+    p->longs = g->next;
+    l->free(g);
+  }
+  if (begun && p->sent - p->acked < WINDOW) {
+    // One more, after every piece it may have taken, so that it lets go
+    // of them when it is back. It goes out with what is sent again.
+    p->sent = p->sent + 1;
+    var last: uint32 = p->sent % WINDOW;
+    var k: AlphPacket* = &p->window[last];
+    p->held[last] = 0;
+    p->part[last] = 0;
+    p->ends[last] = 0;
+    k->magic = MAGIC;
+    k->kind = VOID;
+    k->unused = 0;
+    k->from_place = (uint32)l->cores->first;
+    k->from_life = l->life;
+    k->to_life = p->life;
+    k->ack = p->got;
+    k->seq = p->sent;
+    k->to_place = 0;
+    k->to_gen = 0;
+    k->to_index = 0;
+    k->src_place = 0;
+    k->src_gen = 0;
+    k->src_index = 0;
+    k->tag = 0;
+    k->arg = 0;
+    k->ref = 0;
+    if (p->sent - p->acked == 1) {
+      p->waiting_since = alph_now();
+    }
+  }
+  p->gate.leave(was);
+  if (p->filling != 0) {
+    l->free(p->filling);
+    p->filling = 0;
+    p->skipping = 1;
+  }
+}
+
+fn alph_link_beat(l: AlphLink*) {
+  var now: Word = alph_now();
+  for i in 0..l->count {
+    var p: AlphPeer* = &l->peers[i];
+    alph_link_say(l, p);
+    if (p->alive != 0 && (Word)(now - p->seen) > alph_ms(DOWN_MS)) {
+      p->alive = 0;
+      alph_link_give_up(l, p);
+    }
+    alph_link_tell(l, p);
+  }
+}
+
+fn alph_link_main(arg: cstring) -> uint32 {
+  var l: AlphLink* = (AlphLink*)arg;
+  var room: int64[138];  // 1,104 bytes, where a packet's words fall on their boundaries
+  var whole: uint8* = (uint8*)&room[0];
+  var raw: uint8[1200];
+  var k: AlphPacket* = (AlphPacket*)&room[0];
+  var ip: uint32 = 0;
+  var port: int64 = 0;
+  var beat: Word = alph_now() - alph_ms(BEAT_MS);
+  var chase: Word = alph_now();
+  var warm: Word = 0;  // when the last datagram came, in ns
+  while (l->stopping == 0) {
+    var got: int64 = 0;
+    var count: Word = 0;
+    var born: Word = 0;
+    // With a message waiting to be sent again in a moment, what has come
+    // is taken, and if nothing has, the link waits for a datagram no longer
+    // than until that moment.
+    var hurry: Word = 0;
+    for i in 0..l->count {
+      if (l->peers[i].hurry != 0 && (hurry == 0 || l->peers[i].hurry < hurry)) {
+        hurry = l->peers[i].hurry;
+      }
+    }
+    if (hurry != 0) {
+      if (l->open == 0) {
+        got = l->wire.recv_now(whole, ALPH_DATAGRAM, &ip, &port);
+      } else {
+        got = l->wire.recv_now(&raw[0], 1200, &ip, &port);
+      }
+      if (got == 0) {
+        var now_ns: Word = alph_link_ns();
+        var next: Word = 0;  // when the next of them is due
+        for i in 0..l->count {
+          var late: AlphPeer* = &l->peers[i];
+          var was: int32 = late->gate.enter();
+          if (late->hurry != 0 && now_ns >= late->hurry) {
+            late->hurry = 0;
+            if (late->alive != 0 && late->sent != late->acked) {
+              alph_link_again(l, late);
+            }
+          } else if (late->hurry != 0 && (next == 0 || late->hurry < next)) {
+            next = late->hurry;
+          }
+          late->gate.leave(was);
+        }
+        if (next != 0) {
+          // Until then, or until a datagram comes: no looking in between.
+          var wait: Word = next - now_ns;
+          if (wait > HURRY_MOST) {
+            wait = HURRY_MOST;
+          }
+          l->wire.wait((int64)wait);
+        }
+        count = -1;  // not a quiet moment: the chase keeps its own pace
+      }
+    } else if ((Word)(alph_link_ns() - warm) < WARM_NS) {
+      // A datagram came a moment ago, and the next most often follows at
+      // once: an answer to what was just sent, or the rest of a burst.
+      // Looking for it costs less than sleeping and being woken.
+      if (l->open == 0) {
+        got = l->wire.recv_now(whole, ALPH_DATAGRAM, &ip, &port);
+      } else {
+        got = l->wire.recv_now(&raw[0], 1200, &ip, &port);
+      }
+      if (got == 0) {
+        count = -1;
+      }
+    } else if (l->open == 0) {
+      got = l->wire.recv(whole, ALPH_DATAGRAM, &ip, &port);
+    } else {
+      got = l->wire.recv(&raw[0], 1200, &ip, &port);
+    }
+    if (got > 0) {
+      warm = alph_link_ns();
+    }
+    if (l->open != 0) {
+      if (got > 0) {
+        var place: uint32 = 0;
+        got = l->open(l->sealer, whole, &raw[0], got, &place, &born, &count);
+        // The sender named outside the seal must be the one named inside.
+        if (got < BEAT_BYTES || place != k->from_place || (uint32)(born & 4294967295) != k->from_life) {
+          l->refused = l->refused + 1;
+          got = 0;
+          count = -1;
+        }
+      }
+    }
+    if (got > 0 && l->deaf == 0) {
+      // A datagram is one message, or several without bytes one after
+      // another, all from one run of one machine to this run of ours. On
+      // a sealed link born is when the sender's run began and count is
+      // which datagram of that run this is: one played again is dropped
+      // whole.
+      var at: int64 = 0;
+      if (l->open != 0 && !alph_link_new(l, k, got, born, count)) {
+        at = got;
+      }
+      while (at + BEAT_BYTES <= got) {
+        var one: AlphPacket* = (AlphPacket*)(whole + at);
+        var size: int64 = got - at;
+        if (at != 0 && (one->from_place != k->from_place || one->from_life != k->from_life || one->to_life != k->to_life)) {
+          break;
+        }
+        if (size > MAIL_BYTES && one->magic == MAGIC && (one->kind == MAIL || one->kind == LONG || one->kind == VOID)) {
+          size = MAIL_BYTES;
+        }
+        alph_link_heard(l, one, size);
+        at = at + size;
+      }
+      if (l->unsent != 0 && (Word)(alph_link_ns() - l->unsent_at) > 1000000) {
+        l->flush();  // no node has looked for a millisecond
+      }
+    } else if (l->unsent != 0) {
+      l->flush();
+    }
+    if ((got == 0 && count == 0) || (Word)(alph_now() - chase) >= alph_ms(5)) {
+      chase = alph_now();
+      for i in 0..l->count {
+        alph_link_chase(l, &l->peers[i]);
+      }
+    }
+    if ((Word)(alph_now() - beat) >= alph_ms(BEAT_MS)) {
+      beat = alph_now();
+      alph_link_beat(l);
+    }
+  }
+  return 0;
+}
+
+// Makes the cores one machine among several. Its places start at first.
+// peers holds room peers. Call it before the first spawn.
+export fn AlphLink_init__ptr(l: AlphLink*, cores: AlphCores*, first: Word, peers: AlphPeer*, room: Word) {
+  l->cores = cores;
+  l->peers = peers;
+  l->room = room;
+  l->count = 0;
+  l->life = 0;
+  l->born = 0;
+  l->watcher = 0;
+  l->thread = 0;
+  l->stopping = 0;
+  l->port = 0;
+  l->resent = 0;
+  l->lose = 0;
+  l->lost = 0;
+  l->deaf = 0;
+  l->beyond = 0;
+  l->beyond_ctx = 0;
+  l->parcels = 0;
+  l->parcel_room = 0;
+  l->parcel_free = 0;
+  l->parcel_next = 0;
+  l->longs = 0;
+  l->long_room = 0;
+  l->skipped = 0;
+  l->unsent = 0;
+  l->unsent_at = 0;
+  l->shared = 0;
+  l->parcel_gate.init();
+  l->seal = 0;
+  l->open = 0;
+  l->sealer = 0;
+  l->refused = 0;
+  l->full = 0;
+  l->shed = 0;
+  cores->join(first, &alph_link_far, (rawptr)l);
+}
+
+// Another machine: where its places start, how many it has, and where it
+// listens. Returns ALPH_FULL when there is no room for it.
+export fn AlphLink_peer__ptr(l: AlphLink*, first: Word, count: Word, ip: uint32, port: int64) -> Word {
+  if (l->count == l->room) {
+    return ALPH_FULL;
+  }
+  var p: AlphPeer* = &l->peers[l->count];
+  p->first = first;
+  p->count = count;
+  p->more_first = 0;
+  p->more_count = 0;
+  p->ip = ip;
+  p->port = port;
+  p->life = 0;
+  p->alive = 0;
+  p->told = 0;
+  p->told_life = 0;
+  p->seen = 0;
+  p->gate.init();
+  p->heard = 0;
+  p->newest = 0;
+  for i in 0..64 {
+    p->held[i] = 0;
+    p->ends[i] = 0;
+    p->part[i] = 0;
+  }
+  p->longs = 0;
+  p->longs_last = 0;
+  p->filling = 0;
+  p->skipping = 0;
+  alph_link_fresh(l, p, 0);
+  l->count = l->count + 1;
+  return ALPH_OK;
+}
+
+// Gives the link its parcels: room of them. Without any, no message can
+// carry bytes. Call it before start.
+export fn AlphLink_parcels__ptr(l: AlphLink*, parcels: AlphParcel*, room: Word) {
+  l->parcels = parcels;
+  l->parcel_room = room;
+  l->parcel_free = room;
+  l->parcel_next = 0;
+  for i in 0..room {
+    parcels[i].used = 0;
+  }
+}
+
+// Sends a message with bytes, up to ALPH_PARCEL_BYTES of them, to an actor
+// on this machine or another. The actor gets the message with a parcel in
+// arg ((AlphParcel*)m->arg): it reads the bytes and gives the parcel back
+// with release. from and ref are what the message carries. Returns ALPH_OK,
+// ALPH_FULL when too few parcels are free (half the pool is kept for what
+// arrives) or too much is waiting for that machine, ALPH_GONE when the
+// actor or its machine cannot be reached or the bytes are too many.
+export fn AlphLink_send_bytes__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, bytes: uint8*, count: Word) -> Word {
+  return alph_link_bytes(l, from, to, tag, ref, 0, bytes, count);
+}
+
+fn alph_link_bytes(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, word: Word, bytes: uint8*, count: Word) -> Word {
+  var m: AlphMsg = { tag: tag, from: from, arg: word, ref: ref };
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  var core: Word = place - l->cores->first;
+  if (count <= 0 || count > ALPH_PARCEL_BYTES) {
+    return ALPH_GONE;
+  }
+  if (core >= 0 && core < l->cores->count) {
+    var parcel: AlphParcel* = alph_link_parcel(l, (Word)(l->parcel_room / 2));
+    if (parcel == 0) {
+      return ALPH_FULL;
+    }
+    parcel->count = count;
+    parcel->word = word;
+    for i in 0..count {
+      parcel->bytes[i] = bytes[i];
+    }
+    m.arg = (Word)(int64)parcel;
+    var out: Word = l->cores->cores[core].node.put(to, &m);
+    if (out != ALPH_OK) {
+      l->release(parcel);
+    }
+    return out;
+  }
+  var p: AlphPeer* = alph_link_peer(l, place);
+  if (p == 0 || p->alive == 0 || place < p->first || place >= p->first + p->count) {
+    return ALPH_GONE;  // or a board behind that machine: a board's line carries no bytes
+  }
+  return alph_link_send(l, p, to, &m, bytes, count);
+}
+
+// Gives the link its long buffers: room of them, each of `each` bytes, in
+// `memory`, which must hold room times each. Without any, no message
+// carries more than ALPH_PARCEL_BYTES, and a longer one from another
+// machine arrives with no bytes. Call it before start.
+export fn AlphLink_longs__ptr(l: AlphLink*, longs: AlphLong*, room: Word, memory: uint8*, each: Word) {
+  l->longs = longs;
+  l->long_room = room;
+  for i in 0..room {
+    longs[i].used = 0;
+    longs[i].count = 0;
+    longs[i].room = each;
+    longs[i].bytes = memory + (Word)(i * each);
+  }
+}
+
+// A long buffer to fill and send (send_long), or 0 when too few are free:
+// half the pool is kept for what arrives. Put the bytes in ->bytes, up to
+// ->room of them, and how many in ->count. Give it back with free if it is
+// not sent after all.
+export fn AlphLink_long__ptr(l: AlphLink*) -> AlphLong* {
+  return alph_link_long(l, (Word)(l->long_room / 2));
+}
+
+// Sends a message with the bytes of a long buffer to an actor on another
+// machine. The actor gets the message with a long buffer of its own
+// machine in arg ((AlphLong*)m->arg), reads ->count bytes at ->bytes and
+// gives it back with free. arg is 0 when that machine has no long buffer
+// big enough. From ALPH_OK on the buffer is the link's, which gives it
+// back when the whole has arrived. Returns ALPH_GONE, with the buffer
+// still the caller's, when the actor's machine cannot be reached.
+export fn AlphLink_send_long__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, buffer: AlphLong*) -> Word {
+  var place: Word = (Word)(to >> ALPH_PLACE_SHIFT);
+  var p: AlphPeer* = alph_link_peer(l, place);
+  if (p == 0 || place < p->first || place >= p->first + p->count) {
+    return ALPH_GONE;
+  }
+  buffer->to = to;
+  buffer->from = from;
+  buffer->tag = tag;
+  buffer->ref = ref;
+  buffer->at = 0;
+  buffer->next = 0;
+  var was: int32 = p->gate.enter();
+  var out: Word = ALPH_GONE;
+  if (p->alive != 0) {
+    if (p->longs == 0) {
+      p->longs = buffer;
+    } else {
+      p->longs_last->next = buffer;
+    }
+    p->longs_last = buffer;
+    alph_link_push(l, p);
+    out = ALPH_OK;
+  }
+  p->gate.leave(was);
+  return out;
+}
+
+// Sends a message with any number of bytes: in a parcel when they fit one
+// (send_bytes), in a long buffer when not, into which they are copied
+// here. Returns as send_bytes does, and ALPH_BIG when this machine has no
+// long buffer that holds them.
+export fn AlphLink_send_much__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, bytes: uint8*, count: Word) -> Word {
+  return l->send_with(from, to, tag, ref, 0, bytes, count);
+}
+
+// As send_much, with a word that goes with the bytes: the actor reads it
+// from the parcel's or the long buffer's ->word.
+export fn AlphLink_send_with__ptr(l: AlphLink*, from: Word, to: Word, tag: Word, ref: Word, word: Word, bytes: uint8*, count: Word) -> Word {
+  if (count <= ALPH_PARCEL_BYTES) {
+    return alph_link_bytes(l, from, to, tag, ref, word, bytes, count);
+  }
+  if (l->long_room == 0 || count > l->longs[0].room) {
+    return ALPH_BIG;
+  }
+  var buffer: AlphLong* = l->long();
+  if (buffer == 0) {
+    return ALPH_FULL;
+  }
+  for i in 0..count {
+    buffer->bytes[i] = bytes[i];
+  }
+  buffer->count = count;
+  buffer->word = word;
+  var out: Word = l->send_long(from, to, tag, ref, buffer);
+  if (out != ALPH_OK) {
+    l->free(buffer);
+  }
+  return out;
+}
+
+// Says that places first, first + 1, ... are reached through the peer whose
+// own places start at peer: a board on that machine's serial line, which it
+// passes mail on to. Returns ALPH_GONE when there is no such peer.
+export fn AlphLink_through__ptr(l: AlphLink*, peer: Word, first: Word, count: Word) -> Word {
+  for i in 0..l->count {
+    if (l->peers[i].first == peer) {
+      l->peers[i].more_first = first;
+      l->peers[i].more_count = count;
+      return ALPH_OK;
+    }
+  }
+  return ALPH_GONE;
+}
+
+// The actor told when a machine becomes reachable (ALPH_UP) or is lost
+// (ALPH_DOWN). Set it before start.
+export fn AlphLink_watch__ptr(l: AlphLink*, pid: Word) {
+  l->watcher = pid;
+}
+
+// Listens on a port and starts telling the peers this machine is alive.
+// Add the peers first. Returns ALPH_GONE when the port cannot be had.
+export fn AlphLink_start__ptr(l: AlphLink*, port: int64) -> Word {
+  var ts: int64[2];
+  if (l->port != port) {
+    l->close();
+    if (!l->wire.open(port, 10)) {
+      return ALPH_GONE;
+    }
+    l->port = port;
+  }
+  // This run's life: the time now in milliseconds, so a later run has a
+  // later life, and never 0.
+  syscall(ALPH_NR_CLOCK_GETTIME, 0, (int64)&ts[0]);
+  l->born = (Word)(ts[0] * 1000 + ts[1] / 1000000);
+  if ((Word)(l->born & 4294967295) == 0) {
+    l->born = l->born + 1;
+  }
+  l->life = (uint32)(l->born & 4294967295);
+  l->stopping = 0;
+  for i in 0..l->cores->count {
+    var g: AlphGate* = &l->cores->cores[i].node.gate;
+    l->cores->cores[i].node.held = &l->unsent;
+    g->sender = (rawptr)l;
+    g->unsent = &l->unsent;
+    g->unsent_at = &l->unsent_at;
+    g->send = &alph_link_pass;
+  }
+  l->thread = CreateThread(0, 0, &alph_link_main, (cstring)l, 0, 0);
+  return ALPH_OK;
+}
+
+// The first place of the machine a place is on, this machine included, or
+// -1 when no machine has it.
+export fn AlphLink_first_of__ptr(l: AlphLink*, place: Word) -> Word {
+  if (place >= l->cores->first && place < l->cores->first + l->cores->count) {
+    return l->cores->first;
+  }
+  // Only a machine's own places: a board reached through one is not that
+  // machine, and has no door.
+  for i in 0..l->count {
+    var p: AlphPeer* = &l->peers[i];
+    if (place >= p->first && place < p->first + p->count) {
+      return p->first;
+    }
+  }
+  return -1;
+}
+
+// How many places the machine starting at first has, 0 when there is none.
+export fn AlphLink_count_of__ptr(l: AlphLink*, first: Word) -> Word {
+  var p: AlphPeer* = alph_link_peer(l, first);
+  if (p == 0) {
+    return 0;
+  }
+  return p->count;
+}
+
+// Whether a place on another machine can be reached now.
+export fn AlphLink_reaches__ptr(l: AlphLink*, place: Word) -> bool {
+  var p: AlphPeer* = alph_link_peer(l, place);
+  return p != 0 && p->alive != 0;
+}
+
+// Goes quiet. To its peers this machine is down half a second later. The
+// port stays open, because an actor may be in the middle of a send: start
+// uses it again, close gives it up.
+export fn AlphLink_stop__ptr(l: AlphLink*) {
+  if (l->thread == 0) {
+    return;  // not started, or stopped already
+  }
+  l->flush();  // what was held back still goes
+  for i in 0..l->count {
+    l->peers[i].alive = 0;
+  }
+  l->stopping = 1;
+  thread_join_infinite(l->thread);
+  thread_close(l->thread);
+  l->thread = 0;
+  for i in 0..l->count {
+    l->peers[i].alive = 0;
+    l->peers[i].told = 0;
+    alph_link_fresh(l, &l->peers[i], 0);
+  }
+}
+
+// Gives the port up. Only once nothing can send: after stop, with the
+// cores stopped too.
+export fn AlphLink_close__ptr(l: AlphLink*) {
+  if (l->port != 0) {
+    l->wire.close();
+    l->port = 0;
+  }
+}

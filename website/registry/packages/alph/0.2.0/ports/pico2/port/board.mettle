@@ -1,0 +1,33 @@
+// A Raspberry Pi Pico 2, on its RISC-V cores. Build with
+// -I ports/pico2 -I ports/mcu --board pico2: this folder has what differs
+// on this board, and the rest is the one-hart port's.
+
+// What the board needs before alph runs on it: its clocks, timer and UART0
+// come out of reset in pico2_init, and the traps go to one handler for
+// each cause. The console sends every byte as it is (no carriage return
+// before a line feed), because the console is also the line to another
+// machine. UART0 is GP0 out and GP1 in, at 115200 baud. Call it first in
+// main.
+export fn alph_board_start() {
+  pico2_init();
+  mettle_board_trap_install();
+  pico2_console_raw(true);
+}
+
+// A number this board has most likely not given before, for work that must
+// be done at most once (alph/board/asks): 18 random bits from the chip's
+// ring oscillator (ROSC RANDOMBIT, 0x400e8020). The oscillator is slower
+// than the core, so readings one after another are alike: each bit here is
+// 64 readings folded into one. Not yet run on a real board.
+export fn alph_board_fresh() -> Word {
+  var bit: volatile uint32* = (volatile uint32*)1074692128;
+  var out: Word = 0;
+  for i in 0..18 {
+    var folded: uint32 = 0;
+    for j in 0..64 {
+      folded = folded ^ (*bit & 1);
+    }
+    out = (Word)((out << 1) | (Word)folded);
+  }
+  return out;
+}

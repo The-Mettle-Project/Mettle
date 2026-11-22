@@ -1,0 +1,16 @@
+// What a machine that hands out work and a worker on another machine say
+// to each other. They are apart from the places so that a board, which is
+// too small for the places, can still be a worker.
+
+import "port/port";
+
+export const ALPH_WORK: Word = -13;        // to a worker on another machine: arg is the job's in
+export const ALPH_WORKED: Word = -14;      // its answer: arg is the job's out, with the same ref
+export const ALPH_WORK_BYTES: Word = -17;  // as ALPH_WORK, for a job with bytes: arg is a parcel
+export const ALPH_WORKED_BYTES: Word = -20; // as ALPH_WORKED, for a job that gives bytes back: arg is a parcel, its first 8 bytes the job's out
+export const ALPH_REFUSED: Word = -18;     // a worker's answer when it cannot take the job: arg is ALPH_FULL for now, ALPH_GONE for never
+export const ALPH_WORK_ONCE: Word = -21;   // as ALPH_WORK, for a job that must not be done twice (see alph/place/once)
+export const ALPH_HELLO: Word = -22;       // to a worker before the first ALPH_WORK_ONCE: a new run of refs starts at ref. It answers the same back
+export const ALPH_WORK_LONG: Word = -23;   // as ALPH_WORK_BYTES, for more bytes than a parcel holds: arg is a long buffer, or 0 when they did not fit there
+export const ALPH_WORKED_LONG: Word = -24; // as ALPH_WORKED_BYTES, the same way
+export const ALPH_SHARED: Word = 1073741824;  // the name of the worker for a shared kind is this plus the kind
