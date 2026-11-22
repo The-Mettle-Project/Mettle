@@ -389,6 +389,7 @@ typedef enum {
 static volatile LONG g_active = 0;
 static DWORD g_main_thread = 0;
 static HANDLE g_pipe = INVALID_HANDLE_VALUE;
+static HANDLE g_pipe_in = INVALID_HANDLE_VALUE;
 static HANDLE g_reader_thread = 0;
 
 static DbgFrame *g_stack = NULL;
@@ -973,7 +974,7 @@ static DWORD WINAPI dbg_reader_main(LPVOID unused) {
   for (;;) {
     DWORD avail = 0;
     DWORD bytes_read = 0;
-    if (!PeekNamedPipe(g_pipe, NULL, 0, NULL, &avail, NULL)) {
+    if (!PeekNamedPipe(g_pipe_in, NULL, 0, NULL, &avail, NULL)) {
       EnterCriticalSection(&g_lock);
       InterlockedExchange(&g_active, 0);
       g_mode = DBG_RUN;
@@ -988,7 +989,7 @@ static DWORD WINAPI dbg_reader_main(LPVOID unused) {
     if (avail > (DWORD)(sizeof(buffer) - buffered - 1)) {
       avail = (DWORD)(sizeof(buffer) - buffered - 1);
     }
-    if (!ReadFile(g_pipe, buffer + buffered, avail, &bytes_read, NULL) ||
+    if (!ReadFile(g_pipe_in, buffer + buffered, avail, &bytes_read, NULL) ||
         bytes_read == 0) {
       EnterCriticalSection(&g_lock);
       InterlockedExchange(&g_active, 0);
@@ -1152,6 +1153,17 @@ static LONG WINAPI dbg_vectored_handler(EXCEPTION_POINTERS *info) {
 
 #endif
 
+static void dbg_close_pipes(void) {
+  if (g_pipe_in != INVALID_HANDLE_VALUE && g_pipe_in != g_pipe) {
+    CloseHandle(g_pipe_in);
+  }
+  if (g_pipe != INVALID_HANDLE_VALUE) {
+    CloseHandle(g_pipe);
+  }
+  g_pipe_in = INVALID_HANDLE_VALUE;
+  g_pipe = INVALID_HANDLE_VALUE;
+}
+
 static void dbg_try_init(void) {
   char pipe_name[512];
   DWORD got = GetEnvironmentVariableA("METTLE_DBG_PIPE", pipe_name,
@@ -1165,14 +1177,28 @@ static void dbg_try_init(void) {
   if (g_pipe == INVALID_HANDLE_VALUE) {
     return;
   }
+#if defined(_WIN32) || defined(_WIN64)
+  g_pipe_in = g_pipe;
+#else
+  if (got + 4 > sizeof(pipe_name)) {
+    dbg_close_pipes();
+    return;
+  }
+  memcpy(pipe_name + got, ".in", 4);
+  g_pipe_in = CreateFileA(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                          OPEN_EXISTING, 0, NULL);
+  if (g_pipe_in == INVALID_HANDLE_VALUE) {
+    dbg_close_pipes();
+    return;
+  }
+#endif
 
   g_stack = calloc(DBG_MAX_STACK, sizeof(DbgFrame));
   g_locals = calloc(DBG_MAX_LOCALS, sizeof(DbgLocal));
   g_cmd_queue = calloc(DBG_CMD_QUEUE, DBG_LINE_MAX);
   g_breakpoints = calloc(DBG_MAX_BREAKPOINTS, sizeof(DbgBreakpoint));
   if (!g_stack || !g_locals || !g_cmd_queue || !g_breakpoints) {
-    CloseHandle(g_pipe);
-    g_pipe = INVALID_HANDLE_VALUE;
+    dbg_close_pipes();
     return;
   }
 
@@ -1183,8 +1209,7 @@ static void dbg_try_init(void) {
 
   g_reader_thread = CreateThread(NULL, 0, dbg_reader_main, NULL, 0, NULL);
   if (!g_reader_thread) {
-    CloseHandle(g_pipe);
-    g_pipe = INVALID_HANDLE_VALUE;
+    dbg_close_pipes();
     return;
   }
 #if defined(_WIN32) || defined(_WIN64)

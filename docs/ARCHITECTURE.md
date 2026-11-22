@@ -368,7 +368,10 @@ model, recovered loops, and register lifetimes.
 
 `ir_debug_hooks.c` instruments for the interactive debugger. The runtime side
 speaks over a named pipe and a DAP adapter drives it, so source-level
-debugging needs no gdb, no PDB, and no DWARF consumer.
+debugging needs no gdb, no PDB, and no DWARF consumer. `METTLE_DBG_PIPE` names
+the pipe. On Linux and macOS a FIFO carries one direction, so the runtime
+writes to the FIFO that variable names and reads the adapter's commands from a
+second FIFO with `.in` added to the name.
 
 ## See also
 

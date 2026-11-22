@@ -10131,9 +10131,12 @@ catch {
 }
 
 # The transport itself: with an adapter listening on METTLE_DBG_PIPE, the
-# runtime has to announce itself and hand over the file and function tables.
-# Windows carries it over a named pipe and POSIX over a FIFO, so the check
-# stands up whichever the platform uses and reads the announcement back.
+# runtime has to announce itself and hand over the file and function tables,
+# and then take the adapter's commands. Windows carries both ways over one
+# named pipe. POSIX uses two FIFOs, METTLE_DBG_PIPE for what the runtime says
+# and the same name with ".in" for the commands, so the check stands up
+# whichever the platform uses, reads the announcement back, and on POSIX
+# sees the program run to its end once told to continue.
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
@@ -10176,18 +10179,18 @@ try {
     }
   }
   else {
-    # bash drives the FIFO: the shell can hold both ends open, which the
-    # runtime needs so its own open does not see EOF.
+    # bash drives the FIFOs. It opens the commands FIFO read-write, so the
+    # open returns before the runtime has opened its end.
     $script = Join-Path $tmpDir "debug_transport.sh"
     @'
 set -u
 exe="$1"; work="$2"
 fifo="$work/dbg.fifo"
 out="$work/announced.txt"
-rm -f "$fifo"; : > "$out"; mkfifo "$fifo"
+rm -f "$fifo" "$fifo.in"; : > "$out"; mkfifo "$fifo" "$fifo.in"
 ( timeout 40 cat "$fifo" > "$out" ) &
 drain=$!
-exec 8> "$fifo"
+exec 8<> "$fifo.in"
 METTLE_DBG_PIPE="$fifo" "$exe" > "$work/prog.txt" 2>&1 &
 prog=$!
 await() {
@@ -10218,6 +10221,14 @@ exit 0
     & bash $script $dbgExe $tmpDir 2>&1 | Out-Null
     $announcedPath = Join-Path $tmpDir "announced.txt"
     $announced = if (Test-Path $announcedPath) { Get-Content $announcedPath -Raw } else { "" }
+    $progPath = Join-Path $tmpDir "prog.txt"
+    $progOut = if (Test-Path $progPath) { Get-Content $progPath -Raw } else { "" }
+    if ($announced -match 'continue|detach') {
+      throw "the adapter read back its own commands: $announced"
+    }
+    if ($progOut -notmatch 'total=60') {
+      throw "the runtime never took the adapter's continue: $progOut"
+    }
   }
 
   if ($announced -notmatch 'hello') {
