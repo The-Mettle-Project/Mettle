@@ -10130,13 +10130,8 @@ catch {
   Write-CaseResult -Name "debug_hooks_standalone" -Passed $false -Reason $_.Exception.Message
 }
 
-# The transport itself: with an adapter listening on METTLE_DBG_PIPE, the
-# runtime has to announce itself and hand over the file and function tables,
-# and then take the adapter's commands. Windows carries both ways over one
-# named pipe. POSIX uses two FIFOs, METTLE_DBG_PIPE for what the runtime says
-# and the same name with ".in" for the commands, so the check stands up
-# whichever the platform uses, reads the announcement back, and on POSIX
-# sees the program run to its end once told to continue.
+# the runtime announces itself on METTLE_DBG_PIPE and takes commands back:
+# one named pipe on windows, a second fifo with ".in" on posix
 $total++
 try {
   if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
@@ -10179,8 +10174,6 @@ try {
     }
   }
   else {
-    # bash drives the FIFOs. It opens the commands FIFO read-write, so the
-    # open returns before the runtime has opened its end.
     $script = Join-Path $tmpDir "debug_transport.sh"
     @'
 set -u
@@ -10190,6 +10183,7 @@ out="$work/announced.txt"
 rm -f "$fifo" "$fifo.in"; : > "$out"; mkfifo "$fifo" "$fifo.in"
 ( timeout 40 cat "$fifo" > "$out" ) &
 drain=$!
+# read-write, so the open does not wait for the runtime
 exec 8<> "$fifo.in"
 METTLE_DBG_PIPE="$fifo" "$exe" > "$work/prog.txt" 2>&1 &
 prog=$!
@@ -10222,7 +10216,8 @@ exit 0
     $announcedPath = Join-Path $tmpDir "announced.txt"
     $announced = if (Test-Path $announcedPath) { Get-Content $announcedPath -Raw } else { "" }
     $progPath = Join-Path $tmpDir "prog.txt"
-    $progOut = if (Test-Path $progPath) { Get-Content $progPath -Raw } else { "" }
+    $progOut = ""
+    if (Test-Path $progPath) { $progOut = Get-Content $progPath -Raw }
     if ($announced -match 'continue|detach') {
       throw "the adapter read back its own commands: $announced"
     }
