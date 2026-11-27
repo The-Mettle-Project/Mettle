@@ -470,7 +470,10 @@ typedef struct {
   const ImportResolverOptions *options;
   NameRewrite *carried_rewrites;
   size_t carried_rewrite_count;
+  char *namespace_scope;
 } ImportContext;
+
+static unsigned g_namespace_scope_counter = 0;
 
 typedef struct {
   char *alias;
@@ -599,6 +602,19 @@ static int import_context_init_child(ImportContext *child,
     return 0;
   }
 
+  const char *outer = parent->namespace_scope ? parent->namespace_scope : "";
+  size_t scope_length = strlen(outer) + 24;
+  child->namespace_scope = malloc(scope_length);
+  if (!child->namespace_scope) {
+    free_string_array(child->active_files, child->active_count);
+    free_string_array(child->import_chain, child->chain_depth);
+    memset(child, 0, sizeof(*child));
+    child->reporter = parent->reporter;
+    child->options = parent->options;
+    return 0;
+  }
+  snprintf(child->namespace_scope, scope_length, "%s/%u", outer,
+           ++g_namespace_scope_counter);
   return 1;
 }
 
@@ -613,6 +629,7 @@ static void import_context_destroy(ImportContext *ctx) {
   free_string_array(ctx->active_files, ctx->active_count);
   free_string_array(ctx->import_chain, ctx->chain_depth);
   free_name_rewrites(ctx->carried_rewrites, ctx->carried_rewrite_count);
+  free(ctx->namespace_scope);
   memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -2527,6 +2544,57 @@ static size_t g_privatized_module_capacity = 0;
 static char **g_namespaced_modules = NULL;
 static size_t g_namespaced_module_count = 0;
 static size_t g_namespaced_module_capacity = 0;
+
+static int path_set_add(char ***paths, size_t *count, size_t *capacity,
+                        const char *path);
+static int path_set_contains(char **paths, size_t count, const char *path);
+
+static char *namespaced_module_key(const char *scope, size_t scope_length,
+                                   const char *path, const char *alias) {
+  size_t key_length = scope_length + strlen(path) + strlen(alias) + 3;
+  char *key = malloc(key_length);
+  if (key) {
+    snprintf(key, key_length, "%.*s|%s|%s", (int)scope_length, scope, path,
+             alias);
+  }
+  return key;
+}
+
+static int namespaced_import_visible(const char *scope, const char *path,
+                                     const char *alias) {
+  size_t length = strlen(scope);
+  for (;;) {
+    char *key = namespaced_module_key(scope, length, path, alias);
+    int found = key && path_set_contains(g_namespaced_modules,
+                                         g_namespaced_module_count, key);
+    free(key);
+    if (found) {
+      return 1;
+    }
+    while (length > 0 && scope[length - 1] != '/') {
+      length--;
+    }
+    if (length == 0) {
+      return 0;
+    }
+    length--;
+  }
+}
+
+static int note_namespaced_import(const char *scope, const char *path,
+                                  const char *alias) {
+  const char *own = scope ? scope : "";
+  if (namespaced_import_visible(own, path, alias)) {
+    return 1;
+  }
+  char *key = namespaced_module_key(own, strlen(own), path, alias);
+  if (key) {
+    path_set_add(&g_namespaced_modules, &g_namespaced_module_count,
+                 &g_namespaced_module_capacity, key);
+    free(key);
+  }
+  return 0;
+}
 
 static void import_path_cache_reset(void) {
   free_string_array(g_namespaced_modules, g_namespaced_module_count);
@@ -4494,21 +4562,8 @@ static ASTNode *process_imports_recursive(ImportContext *ctx, ASTNode *program,
 
           int repeated_alias = 0;
           if (import_succeeded && import_decl->namespace_alias) {
-            size_t key_length =
-                strlen(full_path) + strlen(import_decl->namespace_alias) + 2;
-            char *key = malloc(key_length);
-            if (key) {
-              snprintf(key, key_length, "%s|%s", full_path,
-                       import_decl->namespace_alias);
-              if (path_set_contains(g_namespaced_modules,
-                                    g_namespaced_module_count, key)) {
-                repeated_alias = 1;
-              } else {
-                path_set_add(&g_namespaced_modules, &g_namespaced_module_count,
-                             &g_namespaced_module_capacity, key);
-              }
-              free(key);
-            }
+            repeated_alias = note_namespaced_import(
+                ctx->namespace_scope, full_path, import_decl->namespace_alias);
           }
 
           size_t declarations_before_import = new_declaration_count;
@@ -4758,6 +4813,7 @@ static int resolve_imports_keeping(ASTNode *program, const char *base_path,
   ctx.options = options;
   ctx.carried_rewrites = NULL;
   ctx.carried_rewrite_count = 0;
+  ctx.namespace_scope = NULL;
 
   char *abs_base = canonicalize_path(base_path);
   if (abs_base) {

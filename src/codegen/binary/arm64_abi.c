@@ -142,20 +142,18 @@ int arm64_compute_arg_layout_packed(const int *is_float,
 
   for (int i = 0; i < count; i++) {
     Arm64ArgLocation *loc = &out[i];
-    if (is_float[i]) {
-      if (vec_used < abi->vec_arg_count) {
-        loc->kind = ARM64_ARG_IN_VEC_REGISTER;
-        loc->reg = abi->vec_arg_regs[vec_used++];
-        loc->stack_offset = 0;
-        continue;
-      }
-    } else {
-      if (gp_used < abi->gp_arg_count) {
-        loc->kind = ARM64_ARG_IN_GP_REGISTER;
-        loc->reg = abi->gp_arg_regs[gp_used++];
-        loc->stack_offset = 0;
-        continue;
-      }
+    int in_registers = !(stack_sizes && stack_sizes[i] < 0);
+    if (in_registers && is_float[i] && vec_used < abi->vec_arg_count) {
+      loc->kind = ARM64_ARG_IN_VEC_REGISTER;
+      loc->reg = abi->vec_arg_regs[vec_used++];
+      loc->stack_offset = 0;
+      continue;
+    }
+    if (in_registers && !is_float[i] && gp_used < abi->gp_arg_count) {
+      loc->kind = ARM64_ARG_IN_GP_REGISTER;
+      loc->reg = abi->gp_arg_regs[gp_used++];
+      loc->stack_offset = 0;
+      continue;
     }
     {
       int size = stack_sizes ? stack_sizes[i] : abi->stack_slot_bytes;

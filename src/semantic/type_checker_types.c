@@ -907,6 +907,19 @@ Type *type_checker_parse_pointer_type(TypeChecker *checker,
   return current;
 }
 
+static void trim_span(const char *text, size_t *start, size_t *end) {
+  while (*start < *end && isspace((unsigned char)text[*start])) {
+    (*start)++;
+  }
+  while (*end > *start && isspace((unsigned char)text[*end - 1])) {
+    (*end)--;
+  }
+}
+
+static int c_variadic_marker(const char *param, int is_last, size_t index) {
+  return is_last && index > 0 && strcmp(param, "..") == 0;
+}
+
 Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
                                                       const char *name) {
   if (!checker || !name) {
@@ -952,6 +965,7 @@ Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
 
   Type **param_types = NULL;
   size_t param_count = 0;
+  int c_variadic = 0;
   char *params_copy = NULL;
 
   if (params_len > 0) {
@@ -1040,12 +1054,7 @@ Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
 
       size_t start = param_start;
       size_t end = i;
-      while (start < end && isspace((unsigned char)params_copy[start])) {
-        start++;
-      }
-      while (end > start && isspace((unsigned char)params_copy[end - 1])) {
-        end--;
-      }
+      trim_span(params_copy, &start, &end);
       if (end <= start) {
         free(params_copy);
         free(param_types);
@@ -1054,6 +1063,13 @@ Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
 
       char saved = params_copy[end];
       params_copy[end] = '\0';
+      if (c_variadic_marker(params_copy + start, is_end, param_idx)) {
+        params_copy[end] = saved;
+        c_variadic = 1;
+        param_count--;
+        param_start = i + 1;
+        continue;
+      }
       Type *param_type =
           type_checker_get_type_by_name(checker, params_copy + start);
       params_copy[end] = saved;
@@ -1093,14 +1109,7 @@ Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
   size_t return_end = effect_clauses
                           ? (size_t)(effect_clauses - return_type_start)
                           : strlen(return_copy);
-  while (return_start < return_end &&
-         isspace((unsigned char)return_copy[return_start])) {
-    return_start++;
-  }
-  while (return_end > return_start &&
-         isspace((unsigned char)return_copy[return_end - 1])) {
-    return_end--;
-  }
+  trim_span(return_copy, &return_start, &return_end);
   if (return_end <= return_start) {
     free(params_copy);
     free(param_types);
@@ -1126,6 +1135,7 @@ Type *type_checker_parse_function_pointer_type(TypeChecker *checker,
   if (!fp_type) {
     return NULL;
   }
+  fp_type->fn_c_variadic = c_variadic;
   if (effect_clauses &&
       !type_checker_fn_type_apply_effect_clauses(checker, fp_type,
                                                  effect_clauses)) {
@@ -1204,7 +1214,8 @@ int type_checker_fn_signatures_equal(const Type *lhs, const Type *rhs) {
       rhs->kind != TYPE_FUNCTION_POINTER) {
     return 0;
   }
-  if (lhs->fn_param_count != rhs->fn_param_count) {
+  if (lhs->fn_param_count != rhs->fn_param_count ||
+      lhs->fn_c_variadic != rhs->fn_c_variadic) {
     return 0;
   }
   if (!type_checker_types_equal(lhs->fn_return_type, rhs->fn_return_type)) {
@@ -2065,29 +2076,41 @@ int type_checker_is_cast_valid(Type *from, Type *to) {
   return 0;
 }
 
-static int type_checker_pointer_conversion_allowed(Type *dest_type,
-                                                   Type *src_type) {
-  if (type_checker_is_cstring_type(dest_type) &&
-      src_type->kind == TYPE_STRING) {
+static int type_checker_string_to_bytes(Type *dest_type, Type *src_type) {
+  if (src_type->kind != TYPE_STRING) {
+    return 0;
+  }
+  if (type_checker_is_cstring_type(dest_type)) {
     return 1;
   }
+  const char *base = dest_type->kind == TYPE_POINTER && dest_type->base_type
+                         ? dest_type->base_type->name
+                         : NULL;
+  return base && (strcmp(base, "int8") == 0 || strcmp(base, "uint8") == 0);
+}
 
-  if (dest_type->kind == TYPE_SLICE && src_type->kind == TYPE_ARRAY &&
-      dest_type->base_type &&
-      dest_type->device_space == DEVICE_SPACE_NONE &&
-      dest_type->declared_align == 0) {
-    Type *inner = src_type;
-    size_t rank = type_view_rank(dest_type);
-    for (size_t level = 0; level < rank; level++) {
-      if (!inner || inner->kind != TYPE_ARRAY) {
-        inner = NULL;
-        break;
-      }
-      inner = inner->base_type;
+static int type_checker_array_to_view(Type *dest_type, Type *src_type) {
+  if (dest_type->kind != TYPE_SLICE || src_type->kind != TYPE_ARRAY ||
+      !dest_type->base_type || dest_type->device_space != DEVICE_SPACE_NONE ||
+      dest_type->declared_align != 0) {
+    return 0;
+  }
+  Type *inner = src_type;
+  size_t rank = type_view_rank(dest_type);
+  for (size_t level = 0; level < rank; level++) {
+    if (!inner || inner->kind != TYPE_ARRAY) {
+      return 0;
     }
-    if (inner && type_checker_types_equal(dest_type->base_type, inner)) {
-      return 1;
-    }
+    inner = inner->base_type;
+  }
+  return inner && type_checker_types_equal(dest_type->base_type, inner);
+}
+
+static int type_checker_pointer_conversion_allowed(Type *dest_type,
+                                                   Type *src_type) {
+  if (type_checker_string_to_bytes(dest_type, src_type) ||
+      type_checker_array_to_view(dest_type, src_type)) {
+    return 1;
   }
 
   if (type_checker_is_rawptr_type(dest_type) &&
@@ -2240,7 +2263,7 @@ static int type_checker_expression_is_destination_width(TypeChecker *checker,
     }
     if (strcmp(unary->operator, "-") != 0 && strcmp(unary->operator, "+") != 0 &&
         strcmp(unary->operator, "~") != 0) {
-      return 0;
+      break;
     }
     return type_checker_expression_is_destination_width(checker, dest_type,
                                                         unary->operand,

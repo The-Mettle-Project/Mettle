@@ -1,0 +1,13 @@
+import "std/io";
+
+fn main() -> int32 {
+  var b: uint8 = 250;
+  var p: uint8* = &b;
+  *p += 10;
+  var x: uint8 = *p + 1;
+  var bytes: uint8[2] = [1, 2];
+  var q: uint8* = &bytes[0];
+  *q <<= 7;
+  println("{b} {x} {bytes[0]}");
+  return 0;
+}

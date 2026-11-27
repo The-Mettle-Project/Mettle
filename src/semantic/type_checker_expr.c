@@ -2731,6 +2731,8 @@ static Type *type_checker_infer_identifier(TypeChecker *checker,
             "Failed to create function pointer type for '%s'", id->name);
         return NULL;
       }
+      fn_pointer->fn_c_variadic = symbol->data.function.is_c_variadic &&
+                                  !symbol->data.function.is_variadic;
       return fn_pointer;
     }
     if (type_is_comptime_only(symbol->type)) {
@@ -3001,6 +3003,8 @@ static Type *type_checker_infer_address_of(TypeChecker *checker,
               "Failed to create function pointer type");
           return NULL;
         }
+        fp_type->fn_c_variadic = sym->data.function.is_c_variadic &&
+                                 !sym->data.function.is_variadic;
         return fp_type;
       }
     }
@@ -3523,6 +3527,10 @@ static Type *type_checker_infer_named_builtin(TypeChecker *checker,
   return NULL;
 }
 
+static int type_checker_check_c_variadic_argument(TypeChecker *checker,
+                                                  CallExpression *call,
+                                                  size_t index);
+
 static Type *type_checker_infer_fn_pointer_call(TypeChecker *checker,
                                                 ASTNode *expression,
                                                 CallExpression *call,
@@ -3537,17 +3545,26 @@ if ((func_symbol->kind == SYMBOL_VARIABLE ||
   Type *fp_type = func_symbol->type;
   call->callee_closure_env = fp_type->closure_env;
   call->effect_signature = fp_type->fn_effect_signature;
-  if (call->argument_count != fp_type->fn_param_count) {
+  size_t fixed = fp_type->fn_param_count;
+  int c_variadic = fp_type->fn_c_variadic;
+  if (c_variadic ? call->argument_count < fixed
+                 : call->argument_count != fixed) {
     char error_msg[512];
     snprintf(error_msg, sizeof(error_msg),
-             "Function pointer expects %llu arguments, got %llu",
-             (unsigned long long)fp_type->fn_param_count,
+             "Function pointer expects %s%llu arguments, got %llu",
+             c_variadic ? "at least " : "", (unsigned long long)fixed,
              (unsigned long long)call->argument_count);
     type_checker_set_error_at_location(checker, expression->location,
                                        error_msg);
     return NULL;
   }
-  for (size_t i = 0; i < call->argument_count; i++) {
+  call->c_variadic_fixed = c_variadic ? (int)fixed + 1 : 0;
+  for (size_t i = fixed; c_variadic && i < call->argument_count; i++) {
+    if (!type_checker_check_c_variadic_argument(checker, call, i)) {
+      return NULL;
+    }
+  }
+  for (size_t i = 0; i < fixed; i++) {
     Type *arg_type = type_checker_infer_type(checker, call->arguments[i]);
     if (!arg_type)
       return NULL;
@@ -3718,16 +3735,174 @@ static int type_checker_check_gathered_arguments(TypeChecker *checker,
   return 1;
 }
 
+static int type_checker_c_variadic_scalar(const Type *type) {
+  switch (type->kind) {
+  case TYPE_INT8:
+  case TYPE_INT16:
+  case TYPE_INT32:
+  case TYPE_INT64:
+  case TYPE_UINT8:
+  case TYPE_UINT16:
+  case TYPE_UINT32:
+  case TYPE_UINT64:
+  case TYPE_FLOAT32:
+  case TYPE_FLOAT64:
+  case TYPE_BOOL:
+  case TYPE_CHAR:
+  case TYPE_POINTER:
+  case TYPE_FUNCTION_POINTER:
+  case TYPE_ENUM:
+  case TYPE_STRING:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static const char *type_checker_c_variadic_promotion(const Type *type) {
+  switch (type->kind) {
+  case TYPE_INT8:
+  case TYPE_INT16:
+  case TYPE_UINT8:
+  case TYPE_UINT16:
+  case TYPE_BOOL:
+  case TYPE_CHAR:
+  case TYPE_ENUM:
+    return "int32";
+  case TYPE_FLOAT32:
+    return "float64";
+  case TYPE_STRING:
+    return "cstring";
+  default:
+    return NULL;
+  }
+}
+
+static ASTNode *type_checker_wrap_cast(const char *type_name, ASTNode *inner) {
+  return inner ? ast_create_cast_expression(type_name, inner, inner->location) : NULL;
+}
+
+static int type_checker_is_slot_cast(ASTNode *arg) {
+  if (!arg || arg->type != AST_CAST_EXPRESSION) {
+    return 0;
+  }
+  CastExpression *cast = (CastExpression *)arg->data;
+  return cast && cast->type_name && strcmp(cast->type_name, "uint64") == 0 &&
+         arg->resolved_type && arg->resolved_type->kind == TYPE_UINT64;
+}
+
+static ASTNode *type_checker_c_slot_value(ASTNode *arg, Type *type) {
+  switch (type->kind) {
+  case TYPE_FLOAT32:
+  case TYPE_FLOAT64: {
+    ASTNode *wide = type->kind == TYPE_FLOAT32 ? type_checker_wrap_cast("float64", arg) : arg;
+    ASTNode **args = malloc(sizeof(ASTNode *));
+    if (!args || !wide) {
+      return NULL;
+    }
+    args[0] = wide;
+    return type_checker_wrap_cast(
+        "uint64", ast_create_call_expression("__mtl_f64_bits", args, 1, arg->location));
+  }
+  case TYPE_STRING:
+    return type_checker_wrap_cast("uint64", type_checker_wrap_cast("cstring", arg));
+  case TYPE_UINT8:
+  case TYPE_UINT16:
+  case TYPE_UINT32:
+  case TYPE_POINTER:
+  case TYPE_FUNCTION_POINTER:
+    return type_checker_wrap_cast("uint64", arg);
+  case TYPE_UINT64:
+    return arg;
+  default:
+    return type_checker_wrap_cast("uint64", type_checker_wrap_cast("int64", arg));
+  }
+}
+
+static int type_checker_check_c_variadic_argument(TypeChecker *checker,
+                                                  CallExpression *call,
+                                                  size_t index);
+
+static ASTNode *type_checker_c_slot(TypeChecker *checker, ASTNode *arg) {
+  if (type_checker_is_slot_cast(arg)) {
+    return arg;
+  }
+  CallExpression probe = {0};
+  ASTNode *one[1] = {arg};
+  probe.arguments = one;
+  probe.argument_count = 1;
+  if (!type_checker_check_c_variadic_argument(checker, &probe, 0)) {
+    return NULL;
+  }
+  ASTNode *checked = one[0];
+  Type *type = type_checker_infer_type(checker, checked);
+  if (!type) {
+    return NULL;
+  }
+  ASTNode *slot = type_checker_c_slot_value(checked, type);
+  if (slot && !type_checker_infer_type(checker, slot)) {
+    return NULL;
+  }
+  return slot;
+}
+
+static int type_checker_check_c_variadic_argument(TypeChecker *checker,
+                                                  CallExpression *call,
+                                                  size_t index) {
+  ASTNode *arg = call->arguments[index];
+  Type *arg_type = type_checker_infer_type(checker, arg);
+  if (!arg_type) {
+    return 0;
+  }
+  if (type_checker_c_variadic_scalar(arg_type) &&
+      !(arg_type->kind == TYPE_FUNCTION_POINTER && arg_type->closure_env) &&
+      !(arg_type->kind == TYPE_STRING && arg->type != AST_STRING_LITERAL)) {
+    const char *promoted = type_checker_c_variadic_promotion(arg_type);
+    if (!promoted) {
+      return 1;
+    }
+    ASTNode *cast = ast_create_cast_expression(promoted, arg, arg->location);
+    if (!cast) {
+      return 0;
+    }
+    call->arguments[index] = cast;
+    return type_checker_infer_type(checker, cast) != NULL;
+  }
+  char room[160];
+  type_checker_set_error_at_location(
+      checker, arg->location,
+      "a C variadic argument passes a number, a pointer or a string literal; "
+      "this one is '%s'",
+      type_checker_spell_type(arg_type, room, sizeof(room)));
+  checker->has_error = 1;
+  return 0;
+}
+
 static int type_checker_check_call_arguments(TypeChecker *checker,
                                              ASTNode *expression,
                                              CallExpression *call,
                                              Symbol *func_symbol) {
 if (func_symbol->data.function.is_variadic &&
+    func_symbol->data.function.is_c_variadic &&
+    func_symbol->data.function.parameter_count > 0) {
+  size_t fixed = func_symbol->data.function.parameter_count - 1;
+  for (size_t i = fixed; i < call->argument_count; i++) {
+    ASTNode *slot = type_checker_c_slot(checker, call->arguments[i]);
+    if (!slot) {
+      return 0;
+    }
+    call->arguments[i] = slot;
+  }
+}
+if (func_symbol->data.function.is_variadic &&
     func_symbol->data.function.parameter_count > 0) {
   return type_checker_check_gathered_arguments(checker, expression, call,
                                                func_symbol);
 }
-if (call->argument_count != func_symbol->data.function.parameter_count) {
+int c_variadic = func_symbol->data.function.is_c_variadic;
+size_t fixed_count = func_symbol->data.function.parameter_count;
+if (c_variadic ? call->argument_count < fixed_count
+               : call->argument_count != fixed_count) {
   char error_msg[512];
   snprintf(error_msg, sizeof(error_msg),
            "Function '%s' expects %llu arguments, got %llu",
@@ -3757,7 +3932,13 @@ if (call->argument_count != func_symbol->data.function.parameter_count) {
   return 0;
 }
 
-for (size_t i = 0; i < call->argument_count; i++) {
+for (size_t i = fixed_count; c_variadic && i < call->argument_count; i++) {
+  if (!type_checker_check_c_variadic_argument(checker, call, i)) {
+    return 0;
+  }
+}
+
+for (size_t i = 0; i < fixed_count; i++) {
   checker->aggregate_target_type =
       func_symbol->data.function.parameter_types[i];
   Type *arg_type = type_checker_infer_type(checker, call->arguments[i]);
@@ -4133,6 +4314,8 @@ static Type *type_checker_infer_indirect_call(TypeChecker *checker,
               "Failed to create function pointer type");
           return NULL;
         }
+        func_type->fn_c_variadic = sym->data.function.is_c_variadic &&
+                                   !sym->data.function.is_variadic;
       }
     }
 
@@ -4144,18 +4327,30 @@ static Type *type_checker_infer_indirect_call(TypeChecker *checker,
     }
     fp_call->effect_signature = func_type->fn_effect_signature;
 
-    if (fp_call->argument_count != func_type->fn_param_count) {
+    size_t fixed = func_type->fn_param_count;
+    int c_variadic = func_type->fn_c_variadic;
+    if (c_variadic ? fp_call->argument_count < fixed
+                   : fp_call->argument_count != fixed) {
       char error_msg[512];
       snprintf(error_msg, sizeof(error_msg),
-               "Function pointer expects %llu arguments, got %llu",
-               (unsigned long long)func_type->fn_param_count,
+               "Function pointer expects %s%llu arguments, got %llu",
+               c_variadic ? "at least " : "", (unsigned long long)fixed,
                (unsigned long long)fp_call->argument_count);
       type_checker_set_error_at_location(checker, expression->location,
                                          error_msg);
       return NULL;
     }
 
-    for (size_t i = 0; i < fp_call->argument_count; i++) {
+    for (size_t i = fixed; c_variadic && i < fp_call->argument_count; i++) {
+      CallExpression probe = {0};
+      probe.arguments = fp_call->arguments;
+      probe.argument_count = fp_call->argument_count;
+      if (!type_checker_check_c_variadic_argument(checker, &probe, i)) {
+        return NULL;
+      }
+    }
+
+    for (size_t i = 0; i < fixed; i++) {
       Type *arg_type = type_checker_infer_type(checker, fp_call->arguments[i]);
       if (!arg_type) {
         return NULL;

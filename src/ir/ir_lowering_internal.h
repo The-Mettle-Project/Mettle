@@ -128,6 +128,7 @@ int ir_emit_unroll_marker(IRLoweringContext *context, IRFunction *function,
 
 int ir_type_is_cstring(Type *type);
 int ir_type_is_rawptr(Type *type);
+int ir_type_is_byte_pointer(Type *type);
 
 int ir_expression_is_string(IRLoweringContext *context,
                                    ASTNode *expression);

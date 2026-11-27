@@ -1,0 +1,17 @@
+import "std/io";
+
+var calls: int32 = 0;
+
+fn bump() { calls = calls + 1; }
+
+fn twice() { calls = calls + 2; }
+
+fn main() -> int32 {
+  var table: (fn() -> void)[2] = [&bump, &twice];
+  for i: int32 in 0..2 {
+    table[i]();
+  }
+  defer table[0]();
+  println("{calls}");
+  return 0;
+}

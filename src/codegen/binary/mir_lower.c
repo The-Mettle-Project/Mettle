@@ -1720,12 +1720,21 @@ static int mir_call_is_supported(CodeGenerator *g,
     }
     hidden = 1;
   }
-  if (callee->data.function.parameter_count != in->argument_count) {
+  size_t fixed = callee->data.function.parameter_count;
+  int c_variadic = callee->data.function.is_c_variadic;
+  if (c_variadic ? in->argument_count < fixed : fixed != in->argument_count) {
     mir_call_trace_named("arity_mismatch", in->text);
     return 0;
   }
   abi = code_generator_binary_active_abi();
   for (size_t a = 0; a < in->argument_count; a++) {
+    if (a >= fixed) {
+      if (!mir_arg_kind_is_value(&in->arguments[a], 1, 1)) {
+        mir_call_trace("variadic_arg_operand_kind");
+        return 0;
+      }
+      continue;
+    }
     if (!mir_known_arg_is_supported(
             g, ir_function, &in->arguments[a],
             callee->data.function.parameter_types
@@ -4480,6 +4489,24 @@ static int mir_return_literal_is_canonical(const MirFunction *fn,
   return v >= 0 && v < (1ll << bits);
 }
 
+static int mir_home_volatile_local(MirFunction *fn, CodeGenerator *g,
+                                   BinaryFunctionContext *ctx, MirNameMap *map,
+                                   const IRInstruction *in) {
+  if (!in->is_volatile || in->dest.kind != IR_OPERAND_SYMBOL) {
+    return 1;
+  }
+  MirOperand v = mir_value_operand(fn, g, ctx, map, &in->dest);
+  if (v.kind != MIR_OPK_VREG) {
+    return 1;
+  }
+  int size = in->value_type ? (int)code_generator_abi_type_size(in->value_type) : 8;
+  fn->vregs[v.vreg].address_taken = 1;
+  if (fn->vregs[v.vreg].home_bytes < (size < 8 ? 8 : size)) {
+    fn->vregs[v.vreg].home_bytes = size < 8 ? 8 : size;
+  }
+  return 1;
+}
+
 static int mir_lower_control(MirFunction *fn, CodeGenerator *g,
                         BinaryFunctionContext *ctx, MirNameMap *map,
                         const IRInstruction *in,
@@ -4491,8 +4518,9 @@ static int mir_lower_control(MirFunction *fn, CodeGenerator *g,
   *handled = 1;
   switch (in->op) {
   case IR_OP_NOP:
-  case IR_OP_DECLARE_LOCAL:
     return 1;
+  case IR_OP_DECLARE_LOCAL:
+    return mir_home_volatile_local(fn, g, ctx, map, in);
 
   case IR_OP_LABEL:
     return mir_emit1(fn, MIR_LABEL, mir_op_label(in->text), mir_op_none(),
@@ -5683,7 +5711,13 @@ typedef struct {
   const size_t *first_slot;
   const BinarySysvAggregate *sysv;
   const MirVregId *agg_base;
+  const int *float_bits_in_gp;
 } MirCallArgs;
+
+static MirOperand mir_float_bits_operand(MirFunction *fn, CodeGenerator *g,
+                                         BinaryFunctionContext *ctx,
+                                         MirNameMap *map,
+                                         const IROperand *arg);
 
 static int mir_sysv_arg_is_packed_value(CodeGenerator *g,
                                         const IRInstruction *in, size_t a) {
@@ -5945,7 +5979,7 @@ static int mir_marshal_stack_args(const MirCallArgs *c) {
     int slot = abi->shadow_space_size + locs[s].stack_offset;
     if (indirect_off[a] < 0 && arg_is_float[s]) {
       MtlcType *fpt = (call_callee && call_callee->kind == CG_SYM_FUNCTION &&
-                       call_callee->data.function.parameter_types)
+                       call_callee->data.function.parameter_types && a < call_callee->data.function.parameter_count)
                           ? call_callee->data.function.parameter_types[a]
                           : NULL;
       int pfb = fpt ? code_generator_binary_resolved_type_float_bits(fpt)
@@ -5961,7 +5995,12 @@ static int mir_marshal_stack_args(const MirCallArgs *c) {
       continue;
     }
     MirOperand val;
-    if (indirect_off[a] >= 0) {
+    if (c->float_bits_in_gp && c->float_bits_in_gp[s]) {
+      val = mir_float_bits_operand(fn, g, ctx, map, &in->arguments[a]);
+      if (val.kind == MIR_OPK_NONE) {
+        return 0;
+      }
+    } else if (indirect_off[a] >= 0) {
       MirVregId t = mir_new_vreg(fn, MIR_RC_GP, 8);
       if (t == MIR_VREG_NONE ||
           !mir_emit1(fn, MIR_LEA_OUTARG, mir_op_vreg(t),
@@ -6033,6 +6072,15 @@ static int mir_marshal_gp_args(const MirCallArgs *c) {
       continue;
     }
     BinaryGpRegister reg = locs[s].gp_register;
+    if (c->float_bits_in_gp && c->float_bits_in_gp[s]) {
+      MirOperand bits = mir_float_bits_operand(fn, g, ctx, map, &in->arguments[a]);
+      if (bits.kind == MIR_OPK_NONE ||
+          !mir_emit1(fn, MIR_MOV, mir_op_phys(reg, MIR_RC_GP), bits,
+                     mir_op_none(), 8, 0, 0)) {
+        return 0;
+      }
+      continue;
+    }
     if (indirect_off[a] >= 0) {
       if (!mir_emit1(fn, MIR_LEA_OUTARG, mir_op_phys(reg, MIR_RC_GP),
                      mir_op_imm(indirect_off[a]), mir_op_none(), 8, 0, 0)) {
@@ -6109,7 +6157,7 @@ static int mir_marshal_xmm_args(const MirCallArgs *c) {
     fn->has_xmm_arg_call = 1;
     BinaryXmmRegister xreg = locs[s].xmm_register;
     MtlcType *pt = (call_callee && call_callee->kind == CG_SYM_FUNCTION &&
-                call_callee->data.function.parameter_types)
+                call_callee->data.function.parameter_types && a < call_callee->data.function.parameter_count)
                    ? call_callee->data.function.parameter_types[a]
                    : NULL;
     int pfb = pt ? code_generator_binary_resolved_type_float_bits(pt)
@@ -6150,7 +6198,7 @@ static int mir_copy_indirect_args(MirFunction *fn, CodeGenerator *g,
   for (size_t a = 0; a < in->argument_count; a++) {
     indirect_off[a] = -1;
     MtlcType *pt = (call_callee && call_callee->kind == CG_SYM_FUNCTION &&
-                call_callee->data.function.parameter_types)
+                call_callee->data.function.parameter_types && a < call_callee->data.function.parameter_count)
                    ? call_callee->data.function.parameter_types[a]
                    : NULL;
     BinarySysvAggregate sysv_probe;
@@ -6362,8 +6410,11 @@ typedef struct {
   BinarySysvAggregate sysv[MIR_MAX_PARAMS];
   MirVregId agg_base[MIR_MAX_PARAMS];
   BinaryArgLocation locs[MIR_PARAM_SLOTS];
+  int float_bits_in_gp[MIR_PARAM_SLOTS];
   size_t slot_count;
   int stack_bytes;
+  int c_variadic;
+  int xmm_used;
 } MirCallLayout;
 
 static int mir_call_declare_external(MirFunction *fn, CodeGenerator *g,
@@ -6400,12 +6451,38 @@ static int mir_call_argument_is_float(CodeGenerator *g, const IRFunction *irf,
           mir_temp_is_float(g, (IRFunction *)irf, arg->name, 0));
 }
 
+static MirOperand mir_float_bits_operand(MirFunction *fn, CodeGenerator *g,
+                                         BinaryFunctionContext *ctx,
+                                         MirNameMap *map,
+                                         const IROperand *arg) {
+  MirOperand val = coerce_float_operand(fn, g, ctx, map, arg, 8);
+  MirVregId x = mir_new_vreg(fn, MIR_RC_XMM, 8);
+  MirVregId bits = mir_new_vreg(fn, MIR_RC_GP, 8);
+  if (val.kind == MIR_OPK_NONE || x == MIR_VREG_NONE || bits == MIR_VREG_NONE ||
+      !mir_emit_fmov(fn, mir_op_vreg(x), val, 8) ||
+      !mir_emit1(fn, MIR_MOVD_TO_GP, mir_op_vreg(bits), mir_op_vreg(x),
+                 mir_op_none(), 8, 0, 0)) {
+    fn->has_error = 1;
+    return mir_op_none();
+  }
+  return mir_op_vreg(bits);
+}
+
 static int mir_call_plan_arguments(MirFunction *fn, CodeGenerator *g,
                                    const IRInstruction *in,
                                    const BinaryAbi *abi, int hidden,
                                    MirCallLayout *layout) {
   size_t ints = (size_t)hidden;
   size_t sses = 0;
+  const CgSym *callee =
+      g->ir_program ? code_generator_lookup_symbol(g, in->text) : NULL;
+  int direct_variadic = callee && callee->kind == CG_SYM_FUNCTION &&
+                        callee->data.function.is_c_variadic;
+  int indirect_variadic = in->op == IR_OP_CALL_INDIRECT && in->c_variadic_fixed > 0;
+  layout->c_variadic = direct_variadic || indirect_variadic;
+  size_t fixed = direct_variadic     ? callee->data.function.parameter_count
+                 : indirect_variadic ? (size_t)(in->c_variadic_fixed - 1)
+                                     : (size_t)-1;
   layout->slot_count = (size_t)hidden;
   for (size_t a = 0; a < in->argument_count; a++) {
     size_t slot = layout->slot_count;
@@ -6456,6 +6533,11 @@ static int mir_call_plan_arguments(MirFunction *fn, CodeGenerator *g,
     }
     layout->arg_is_float[slot] =
         mir_call_argument_is_float(g, fn->ir_function, in, a);
+    if (layout->arg_is_float[slot] && a >= fixed &&
+        !abi->counts_classes_separately) {
+      layout->arg_is_float[slot] = 0;
+      layout->float_bits_in_gp[slot] = 1;
+    }
     if (layout->arg_is_float[slot]) {
       if (sses < abi->float_param_count) {
         sses++;
@@ -6471,6 +6553,11 @@ static int mir_call_plan_arguments(MirFunction *fn, CodeGenerator *g,
           layout->slot_count, layout->locs, &layout->stack_bytes)) {
     fn->has_error = 1;
     return 0;
+  }
+  for (size_t s = 0; s < layout->slot_count; s++) {
+    if (layout->locs[s].kind == BINARY_ARG_IN_XMM_REGISTER) {
+      layout->xmm_used++;
+    }
   }
   if (layout->stack_bytes > fn->outgoing_stack_bytes) {
     fn->outgoing_stack_bytes = layout->stack_bytes;
@@ -6813,12 +6900,18 @@ static int mir_lower_call(MirFunction *fn, CodeGenerator *g,
   args.first_slot = layout.first_slot;
   args.sysv = layout.sysv;
   args.agg_base = layout.agg_base;
+  args.float_bits_in_gp = layout.float_bits_in_gp;
   if (!mir_marshal_stack_args(&args) || !mir_marshal_gp_args(&args) ||
       !mir_marshal_xmm_args(&args)) {
     return 0;
   }
   if (ret_indirect &&
       !mir_call_hidden_return_pointer(fn, g, ctx, map, in, abi)) {
+    return 0;
+  }
+  if (layout.c_variadic && abi->counts_classes_separately &&
+      !mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP),
+                 mir_op_imm(layout.xmm_used), mir_op_none(), 8, 0, 0)) {
     return 0;
   }
 
@@ -6838,6 +6931,10 @@ static int mir_untyped_float_bits(CodeGenerator *g, const IRFunction *irf,
   return (bits == 32 || bits == 64) ? bits : 64;
 }
 
+static MtlcType *mir_indirect_param_type(const MtlcType *ft, size_t a) {
+  return ft && ft->fn_param_types && a < ft->fn_param_count ? ft->fn_param_types[a] : NULL;
+}
+
 static int mir_marshal_indirect_stack(MirFunction *fn, CodeGenerator *g,
                              BinaryFunctionContext *ctx, MirNameMap *map,
                              const IRInstruction *in, const MtlcType *ft,
@@ -6855,8 +6952,7 @@ static int mir_marshal_indirect_stack(MirFunction *fn, CodeGenerator *g,
     }
     int slot = abi->shadow_space_size + locs[a].stack_offset;
     if (arg_is_float[a]) {
-      MtlcType *fpt =
-          (ft && ft->fn_param_types) ? ft->fn_param_types[a] : NULL;
+      MtlcType *fpt = mir_indirect_param_type(ft, a);
       int pfb = fpt ? code_generator_binary_resolved_type_float_bits(fpt)
                     : mir_untyped_float_bits(g, irf, &in->arguments[a]);
       if (pfb != 32 && pfb != 64) {
@@ -6902,13 +6998,9 @@ static int mir_marshal_indirect_gp(MirFunction *fn, CodeGenerator *g,
                              const IRInstruction *in, const MtlcType *ft,
                              const BinaryAbi *abi,
                              const BinaryArgLocation *locs,
-                             const int *arg_is_float,
+                             const int *float_bits_in_gp,
                              const int *indirect_off) {
   (void)ft;
-  (void)arg_is_float;
-  (void)g;
-  (void)ctx;
-  (void)map;
   (void)abi;
   for (size_t a = 0; a < in->argument_count; a++) {
     if (locs[a].kind != BINARY_ARG_IN_GP_REGISTER) {
@@ -6930,8 +7022,11 @@ static int mir_marshal_indirect_gp(MirFunction *fn, CodeGenerator *g,
       }
       continue;
     }
-    MirOperand arg = mir_call_arg_operand(fn, g, ctx, map, &in->arguments[a]);
-    if (!mir_emit1(fn, MIR_MOV, mir_op_phys(reg, MIR_RC_GP), arg,
+    MirOperand arg = float_bits_in_gp[a]
+                         ? mir_float_bits_operand(fn, g, ctx, map, &in->arguments[a])
+                         : mir_call_arg_operand(fn, g, ctx, map, &in->arguments[a]);
+    if (arg.kind == MIR_OPK_NONE ||
+        !mir_emit1(fn, MIR_MOV, mir_op_phys(reg, MIR_RC_GP), arg,
                    mir_op_none(), 8, 0, 0)) {
       return 0;
     }
@@ -6959,8 +7054,7 @@ static int mir_marshal_indirect_xmm(MirFunction *fn, CodeGenerator *g,
     }
     fn->has_xmm_arg_call = 1;
     BinaryXmmRegister xreg = locs[a].xmm_register;
-    MtlcType *pt =
-        (ft && ft->fn_param_types) ? ft->fn_param_types[a] : NULL;
+    MtlcType *pt = mir_indirect_param_type(ft, a);
     int pfb = pt ? code_generator_binary_resolved_type_float_bits(pt)
                  : mir_untyped_float_bits(g, irf, &in->arguments[a]);
     if (pfb != 32 && pfb != 64) {
@@ -6987,19 +7081,25 @@ static int mir_indirect_plan_arguments(MirFunction *fn, CodeGenerator *g,
                                        const IRFunction *irf,
                                        const IRInstruction *in, const MtlcType *ft,
                                        const BinaryAbi *abi, int *arg_is_float,
-                                       int *indirect_off,
+                                       int *variadic_gp, int *indirect_off,
                                        BinaryArgLocation *locs) {
   int stack_bytes = 0;
+  size_t fixed = in->c_variadic_fixed > 0 ? (size_t)(in->c_variadic_fixed - 1) : (size_t)-1;
 
   for (size_t a = 0; a < in->argument_count; a++) {
-    MtlcType *pt = (ft && ft->fn_param_types) ? ft->fn_param_types[a] : NULL;
+    MtlcType *pt = mir_indirect_param_type(ft, a);
     const IROperand *arg = &in->arguments[a];
     indirect_off[a] = -1;
+    variadic_gp[a] = 0;
     arg_is_float[a] =
-        ft ? code_generator_binary_resolved_type_float_bits(pt) != 0
+        pt ? code_generator_binary_resolved_type_float_bits(pt) != 0
            : (mir_arg_float_bits(g, irf, arg) != 0 ||
               (arg->kind == IR_OPERAND_TEMP &&
                mir_temp_is_float(g, (IRFunction *)irf, arg->name, 0)));
+    if (arg_is_float[a] && a >= fixed && !abi->counts_classes_separately) {
+      arg_is_float[a] = 0;
+      variadic_gp[a] = 1;
+    }
   }
   if (in->argument_count > 0 &&
       !code_generator_binary_compute_arg_layout(abi, arg_is_float,
@@ -7065,6 +7165,20 @@ static int mir_indirect_scalar_result(MirFunction *fn, CodeGenerator *g,
                    mir_op_none(), 8, 0, 0);
 }
 
+static int mir_indirect_variadic_count(MirFunction *fn, const IRInstruction *in,
+                                       const BinaryAbi *abi,
+                                       const BinaryArgLocation *locs) {
+  if (in->c_variadic_fixed <= 0 || !abi->counts_classes_separately) {
+    return 1;
+  }
+  int xmm_used = 0;
+  for (size_t a = 0; a < in->argument_count; a++) {
+    xmm_used += locs[a].kind == BINARY_ARG_IN_XMM_REGISTER;
+  }
+  return mir_emit1(fn, MIR_MOV, mir_op_phys(BINARY_GP_RAX, MIR_RC_GP),
+                   mir_op_imm(xmm_used), mir_op_none(), 8, 0, 0);
+}
+
 static int mir_lower_call_indirect(MirFunction *fn, CodeGenerator *g,
                                    BinaryFunctionContext *ctx,
                                    MirNameMap *map, const IRInstruction *in,
@@ -7073,6 +7187,8 @@ static int mir_lower_call_indirect(MirFunction *fn, CodeGenerator *g,
   const IRFunction *irf = mir_returning_ir_function(g, ctx);
   const BinaryAbi *abi = code_generator_binary_active_abi();
   int arg_is_float[MIR_MAX_PARAMS] = {0};
+  int variadic_gp[MIR_MAX_PARAMS] = {0};
+  int float_value[MIR_MAX_PARAMS] = {0};
   int indirect_off[MIR_MAX_PARAMS];
   BinaryArgLocation locs[MIR_MAX_PARAMS];
   MirOperand callee;
@@ -7096,8 +7212,11 @@ static int mir_lower_call_indirect(MirFunction *fn, CodeGenerator *g,
     return 0;
   }
   if (!mir_indirect_plan_arguments(fn, g, irf, in, ft, abi, arg_is_float,
-                                   indirect_off, locs)) {
+                                   variadic_gp, indirect_off, locs)) {
     return 0;
+  }
+  for (size_t a = 0; a < in->argument_count; a++) {
+    float_value[a] = arg_is_float[a] || variadic_gp[a];
   }
   if (!ft && !mir_copy_untyped_aggregate_args(fn, g, ctx, map, irf, in,
                                               indirect_off)) {
@@ -7105,11 +7224,12 @@ static int mir_lower_call_indirect(MirFunction *fn, CodeGenerator *g,
   }
   callee = mir_value_operand(fn, g, ctx, map, &in->lhs);
   if (!mir_marshal_indirect_stack(fn, g, ctx, map, in, ft, abi, locs,
-                                  arg_is_float, indirect_off) ||
+                                  float_value, indirect_off) ||
       !mir_marshal_indirect_gp(fn, g, ctx, map, in, ft, abi, locs,
-                               arg_is_float, indirect_off) ||
+                               variadic_gp, indirect_off) ||
       !mir_marshal_indirect_xmm(fn, g, ctx, map, in, ft, abi, locs,
                                 arg_is_float, indirect_off) ||
+      !mir_indirect_variadic_count(fn, in, abi, locs) ||
       !mir_emit1(fn, MIR_CALL_INDIRECT, mir_op_none(), callee, mir_op_none(),
                  8, 0, 0)) {
     return 0;

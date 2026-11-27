@@ -778,6 +778,9 @@ static int ir_lower_var_declaration(IRLoweringContext *context, IRFunction *func
   local.text = (char *)ir_backend_type_name(declaration->type_name);
   ir_note_declared_type_facts(declaration, decl_type);
   local.value_type = mtlc_type_from_frontend(decl_type);
+  local.is_volatile = (decl_type && decl_type->is_volatile) ||
+                      (declaration->type_name &&
+                       strncmp(declaration->type_name, "volatile ", 9) == 0);
   if (declaration->address_space != AST_ADDRESS_SPACE_DEFAULT &&
       !ir_lower_address_space_local(context, declaration, decl_type, &local)) {
     return 0;

@@ -22951,6 +22951,11 @@ $issueRegressions = @(
   @{ Name = "signed_shift_unsigned_count"; Entry = "tests/issues/signed_shift_unsigned_count.mettle"; Args = @(); Expect = @("shift bad 0") },
   @{ Name = "signed_shift_unsigned_count_release"; Entry = "tests/issues/signed_shift_unsigned_count.mettle"; Args = @("--release"); Expect = @("shift bad 0") },
   @{ Name = "signed_shift_unsigned_count_interp"; Command = @("test", "tests/issues/signed_shift_unsigned_count.mettle"); Refuse = @("failed"); Expect = @("1 passed") },
+  @{ Name = "struct_order_pointer_cycle"; Entry = "tests/issues/struct_order_pointer_cycle.mettle"; Args = @(); Expect = @("24 5") },
+  @{ Name = "call_through_array_element"; Entry = "tests/issues/call_through_array_element.mettle"; Args = @(); Expect = @("3") },
+  @{ Name = "c_variadic_pointer"; Entry = "tests/issues/c_variadic_pointer.mettle"; Args = @(); Expect = @("1.500000 7 ok 2.250000", "1 0.500000 1.500000 2.500000 3.500000 4.500000", "0.25|9 6") },
+  @{ Name = "empty_struct_global"; Entry = "tests/issues/empty_struct_global.mettle"; Args = @(); Expect = @("true 3") },
+  @{ Name = "deref_keeps_destination_width"; Entry = "tests/issues/deref_keeps_destination_width.mettle"; Args = @(); Expect = @("4 5 128") },
   @{ Name = "err_mixed_width_bitwise"; Command = @("--build", "tests/issues/err_mixed_width_bitwise.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Narrowing conversion from 'int64' to 'int32' needs a cast") }
 )
 foreach ($case in $issueRegressions) {

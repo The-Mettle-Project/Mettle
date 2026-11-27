@@ -1,0 +1,15 @@
+extern fn printf(format: int8*, ..) -> int32;
+extern fn snprintf(out: int8*, size: uint64, format: int8*, ..) -> int32;
+
+fn main() -> int32 {
+  var print: fn(int8*, ..) -> int32 = &printf;
+  var format: fn(int8*, uint64, int8*, ..) -> int32 = &snprintf;
+  var half: float32 = 2.25;
+  var wide: float64 = 1.5;
+  print("%f %d %s %f\n", wide, 7, "ok", half);
+  print("%d %f %f %f %f %f\n", 1, 0.5, 1.5, 2.5, 3.5, 4.5);
+  var buf: int8[32];
+  var n: int32 = format(&buf[0], 32, "%.2f|%d", 0.25, 9);
+  print("%s %d\n", &buf[0], n);
+  return 0;
+}

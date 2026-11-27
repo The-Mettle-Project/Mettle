@@ -134,7 +134,8 @@ static int symbol_table_types_compatible(const Type *lhs, const Type *rhs) {
 
   switch (lhs->kind) {
   case TYPE_FUNCTION_POINTER:
-    if (lhs->fn_param_count != rhs->fn_param_count) {
+    if (lhs->fn_param_count != rhs->fn_param_count ||
+        lhs->fn_c_variadic != rhs->fn_c_variadic) {
       return 0;
     }
     if (!symbol_table_types_compatible(lhs->fn_return_type,

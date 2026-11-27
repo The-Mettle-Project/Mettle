@@ -99,6 +99,7 @@ typedef struct Type {
   size_t view_extents[4];
   struct Type **fn_param_types;
   size_t fn_param_count;
+  int fn_c_variadic;
   struct Type *fn_return_type;
   struct Type *closure_env;
   const char **fn_effects;
@@ -230,6 +231,7 @@ typedef struct Symbol {
       size_t parameter_count;
       Type *return_type;
       int is_variadic;
+      int is_c_variadic;
     } function;
     struct {
       long long value;

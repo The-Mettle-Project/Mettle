@@ -228,6 +228,7 @@ typedef struct {
   unsigned char column_base;
   const char *expansion_note;
   const char *effect_signature;
+  int c_variadic_fixed;
 } IRInstruction;
 
 enum {
@@ -417,6 +418,7 @@ typedef struct {
   MtlcType *return_type;
   MtlcType **param_types;
   size_t param_count;
+  int is_c_variadic;
   void *codegen_view;
 } IRModuleSymbol;
 

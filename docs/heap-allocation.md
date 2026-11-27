@@ -22,7 +22,7 @@ are the only three:
 |-------------------------|--------------------------|
 | The value must outlive the function | The frame is gone at `return` |
 | The size is not known while compiling | An array size must be a constant |
-| The value is large | The stack has a fixed ceiling, under 1 MB |
+| The value is large | The stack stops at 8 MB |
 
 Everything else belongs on the stack. It is faster, it needs no null check,
 and there is nothing to free.

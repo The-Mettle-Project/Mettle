@@ -187,6 +187,7 @@ typedef struct {
   char **effects_provides;
   size_t effects_provides_count;
   int is_variadic;
+  int is_c_variadic;
   int simd_mode;
   char **captured_names;
   char **captured_types;
@@ -353,6 +354,7 @@ typedef struct {
   int is_function_reference;
   char *written_name;
   int is_indirect_call;
+  int c_variadic_fixed;
   struct Type *callee_closure_env;
   const char *effect_signature;
   int is_gpu_index;

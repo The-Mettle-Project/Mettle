@@ -440,6 +440,28 @@ static int type_text_float_bits(const char *t) {
   return type_text_base_is(t, "float32") ? 32 : 64;
 }
 
+static int darwin_packs_stack_args(void);
+
+static void darwin_variadic_on_stack(const IRProgram *program, const IRInstruction *call,
+                                     int *stack_sizes, int count) {
+  if (!darwin_packs_stack_args()) {
+    return;
+  }
+  int fixed = -1;
+  if (call->op == IR_OP_CALL_INDIRECT && call->c_variadic_fixed > 0) {
+    fixed = call->c_variadic_fixed - 1;
+  } else if (call->op == IR_OP_CALL && call->text) {
+    const IRModuleSymbol *callee = ir_program_lookup_symbol(program, call->text);
+    fixed = callee && callee->is_c_variadic ? (int)callee->param_count : -1;
+  }
+  if (fixed < 0) {
+    return;
+  }
+  for (int k = fixed; k < count; k++) {
+    stack_sizes[k] = -1;
+  }
+}
+
 static int darwin_packs_stack_args(void) {
   return mtlc_target()->os == MTLC_TARGET_OS_MACOS;
 }
@@ -1778,6 +1800,7 @@ static int max_outgoing_stack(Arm64Emit *e, const IRFunction *fn,
       stack_sizes[k] =
           stack_size_of_type(call_arg_type(program, call, (size_t)k));
     }
+    darwin_variadic_on_stack(program, call, stack_sizes, count);
     int bytes = 0;
     if (!arm64_compute_arg_layout_packed(is_float, stack_sizes, count,
                                          locations, &bytes)) {
@@ -2077,6 +2100,7 @@ static int emit_call_arguments(Arm64Emit *e, SlotMap *slots,
     is_float[k] = call_arg_is_float(prog, in, (size_t)k, fs);
     stack_sizes[k] = stack_size_of_type(call_arg_type(prog, in, (size_t)k));
   }
+  darwin_variadic_on_stack(prog, in, stack_sizes, count);
   if (!arm64_compute_arg_layout_packed(is_float, stack_sizes, count, locations,
                                        NULL)) {
     arm64_fail(e, "cannot lay out the %d arguments of '%s' under AAPCS64",

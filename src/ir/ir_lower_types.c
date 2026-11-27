@@ -17,10 +17,17 @@ int ir_expression_is_string(IRLoweringContext *context,
   return type && type->kind == TYPE_STRING;
 }
 
+int ir_type_is_byte_pointer(Type *type) {
+  Type *base = type && type->kind == TYPE_POINTER ? type->base_type : NULL;
+  return base && base->name &&
+         (strcmp(base->name, "int8") == 0 || strcmp(base->name, "uint8") == 0);
+}
+
 int ir_should_coerce_string_to_cstring(IRLoweringContext *context,
                                               Type *target_type,
                                               ASTNode *value_expression) {
-  return (ir_type_is_cstring(target_type) || ir_type_is_rawptr(target_type)) &&
+  return (ir_type_is_cstring(target_type) || ir_type_is_rawptr(target_type) ||
+          ir_type_is_byte_pointer(target_type)) &&
          ir_expression_is_string(context, value_expression);
 }
 

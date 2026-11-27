@@ -489,6 +489,7 @@ static void populate_function_symbol(IRProgram *program,
   params = build_param_types(s, &pc);
   entry.param_types = params;
   entry.param_count = pc;
+  entry.is_c_variadic = fd->is_c_variadic && fd->is_extern && !entry.has_body;
   char clause[512];
   clause[0] = '\0';
   if (fd->effects_with_count > 0) {

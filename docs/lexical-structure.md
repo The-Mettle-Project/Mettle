@@ -126,8 +126,8 @@ var f: float32 = (float32)3.14;
 ## Character literals
 
 A single character in single quotes has type `char`, which is one byte. The
-escapes are `\n`, `\t`, `\r`, `\`, `\'`, and `\0`. Any other escape is an
-error.
+escapes are `\n`, `\t`, `\r`, `\`, `\'`, `\0`, and `\x` followed by two hex
+digits for any byte, as in `'\x7f'`. Any other escape is an error.
 
 ```mettle
 var c: char = 'h';
@@ -137,8 +137,9 @@ var nl: char = '\n';
 ## String literals
 
 Text in double quotes has type `string`. The escapes are `\n`, `\t`, `\r`,
-`\`, `\"`, and `\0`. Any other escape is an error, as it is in a
-character literal.
+`\`, `\"`, `\0`, and `\xHH` for one byte, so `"a\xC3\xA9"` is `a` followed by
+the two bytes of `é`. Any other escape is an error, as it is in a character
+literal.
 
 Every string literal is scanned for interpolation. `{expr}` splices the value
 of `expr` into the text, and `{{` writes one literal `{`:

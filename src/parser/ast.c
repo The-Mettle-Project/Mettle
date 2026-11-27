@@ -222,6 +222,7 @@ static ASTNode *ast_clone_method_declaration(ASTNode *clone, const ASTNode *node
   dst->effects_provides = ast_copy_string_array(src->effects_provides,
                                                 src->effects_provides_count);
   dst->is_variadic = src->is_variadic;
+  dst->is_c_variadic = src->is_c_variadic;
   dst->simd_mode = src->simd_mode;
   dst->captured_count = src->captured_count;
   dst->captured_names =
@@ -389,6 +390,7 @@ static ASTNode *ast_clone_function_call(ASTNode *clone, const ASTNode *node) {
   dst->is_function_reference = src->is_function_reference;
   dst->written_name = ast_intern_string(src->written_name);
   dst->is_indirect_call = src->is_indirect_call;
+  dst->c_variadic_fixed = src->c_variadic_fixed;
   dst->callee_closure_env = src->callee_closure_env;
   dst->effect_signature = src->effect_signature;
   dst->object = src->object ? ast_clone_node(src->object) : NULL;

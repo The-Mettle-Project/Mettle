@@ -1653,6 +1653,7 @@ int ir_function_insert_instruction(IRFunction *function, size_t index,
   slot->alias_class = instruction->alias_class;
   slot->expansion_note = instruction->expansion_note;
   slot->effect_signature = instruction->effect_signature;
+  slot->c_variadic_fixed = instruction->c_variadic_fixed;
   slot->ast_ref = instruction->ast_ref;
   slot->value_type = instruction->value_type;
   slot->dest = ir_operand_clone(&instruction->dest);

@@ -21,6 +21,7 @@ typedef struct {
   char previous_token_text[PARSER_PREV_TEXT_MAX];
   int brace_depth;
   const char *group_context;
+  int params_c_variadic;
   int recover_at_body_brace;
   int saw_lexical_error;
   const char *source_filename;

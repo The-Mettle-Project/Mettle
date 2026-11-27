@@ -435,6 +435,7 @@ int type_checker_register_function_signature(TypeChecker *checker,
   func_symbol->data.function.parameter_types = param_types;
   func_symbol->data.function.return_type = return_type;
   func_symbol->data.function.is_variadic = func_decl->is_variadic;
+  func_symbol->data.function.is_c_variadic = func_decl->is_c_variadic;
   func_symbol->is_kernel = func_decl->is_kernel;
   func_symbol->is_rule = func_decl->is_rule || func_decl->meta_role;
   func_symbol->is_noreturn = func_decl->is_noreturn;
@@ -661,12 +662,72 @@ static int type_checker_report_type_cycles(TypeChecker *checker,
   return ok;
 }
 
+static int type_decl_waits_on(const ASTNode *decl, const char *name,
+                              int by_value_only) {
+  return by_value_only ? type_decl_holds_by_value(decl, name)
+                       : type_decl_refers_to(decl, name);
+}
+
+static int type_decl_waiting(Program *prog, const char *pending, size_t i,
+                             int by_value_only) {
+  ASTNode *decl = prog->declarations[i];
+  const char *self = type_decl_name(decl);
+  for (size_t j = 0; j < prog->declaration_count; j++) {
+    const char *other;
+    if (j == i || !pending[j]) {
+      continue;
+    }
+    other = type_decl_name(prog->declarations[j]);
+    if (other && (!self || strcmp(other, self) != 0) &&
+        type_decl_waits_on(decl, other, by_value_only)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int type_checker_settle_one(TypeChecker *checker, ASTNode *decl) {
+  ComptimeDeclScope expansion;
+  int ok;
+  decl->type_registered = 1;
+  type_checker_enter_expansion_decl(checker, decl, &expansion);
+  ok = decl->type == AST_TYPE_DECLARATION
+           ? type_checker_process_type_declaration(checker, decl)
+           : decl->type == AST_STRUCT_DECLARATION
+                 ? type_checker_process_struct_declaration(checker, decl)
+                 : type_checker_process_enum_declaration(checker, decl);
+  type_checker_leave_expansion_decl(checker, &expansion);
+  return ok;
+}
+
+static void type_checker_settle_types(TypeChecker *checker, Program *prog,
+                                      char *pending, size_t *remaining,
+                                      int by_value_only, int *ok) {
+  while (*remaining > 0) {
+    size_t settled = 0;
+    for (size_t i = 0; i < prog->declaration_count; i++) {
+      if (!pending[i] || type_decl_waiting(prog, pending, i, by_value_only)) {
+        continue;
+      }
+      pending[i] = 0;
+      (*remaining)--;
+      settled++;
+      if (!type_checker_settle_one(checker, prog->declarations[i])) {
+        *ok = 0;
+      }
+    }
+    if (settled == 0) {
+      return;
+    }
+  }
+}
+
 static int type_checker_register_types(TypeChecker *checker, Program *prog,
                                        int generated_only) {
   int ok = 1;
   char *pending = calloc(prog->declaration_count, 1);
   size_t remaining = 0;
-  size_t i, j;
+  size_t i;
 
   for (i = 0; i < prog->declaration_count; i++) {
     ASTNode *decl = prog->declarations[i];
@@ -689,53 +750,15 @@ static int type_checker_register_types(TypeChecker *checker, Program *prog,
     type_checker_leave_expansion_decl(checker, &expansion);
   }
 
-  while (pending && remaining > 0) {
-    size_t settled = 0;
-    for (i = 0; i < prog->declaration_count; i++) {
-      ASTNode *decl;
-      ComptimeDeclScope expansion;
-      const char *self;
-      int waiting = 0;
-      if (!pending[i]) {
-        continue;
-      }
-      decl = prog->declarations[i];
-      self = type_decl_name(decl);
-      for (j = 0; j < prog->declaration_count && !waiting; j++) {
-        const char *other;
-        if (j == i || !pending[j]) {
-          continue;
-        }
-        other = type_decl_name(prog->declarations[j]);
-        if (other && (!self || strcmp(other, self) != 0) &&
-            type_decl_refers_to(decl, other)) {
-          waiting = 1;
-        }
-      }
-      if (waiting) {
-        continue;
-      }
-      pending[i] = 0;
-      remaining--;
-      settled++;
-      decl->type_registered = 1;
-      type_checker_enter_expansion_decl(checker, decl, &expansion);
-      if (decl->type == AST_TYPE_DECLARATION
-              ? !type_checker_process_type_declaration(checker, decl)
-              : decl->type == AST_STRUCT_DECLARATION
-                    ? !type_checker_process_struct_declaration(checker, decl)
-                    : !type_checker_process_enum_declaration(checker, decl)) {
-        ok = 0;
-      }
-      type_checker_leave_expansion_decl(checker, &expansion);
+  if (pending) {
+    type_checker_settle_types(checker, prog, pending, &remaining, 0, &ok);
+  }
+  if (pending && remaining > 0) {
+    if (!type_checker_report_type_cycles(checker, prog, pending,
+                                         &remaining)) {
+      ok = 0;
     }
-    if (settled == 0) {
-      if (!type_checker_report_type_cycles(checker, prog, pending,
-                                           &remaining)) {
-        ok = 0;
-      }
-      break;
-    }
+    type_checker_settle_types(checker, prog, pending, &remaining, 1, &ok);
   }
 
   for (i = 0; i < prog->declaration_count; i++) {

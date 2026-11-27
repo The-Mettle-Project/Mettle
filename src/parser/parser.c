@@ -3798,7 +3798,19 @@ static char *parser_parse_function_pointer_type(Parser *parser,
       params_buf[params_len] = '\0';
     }
     first = 0;
-    param = parser_parse_type_annotation(parser);
+    if (parser->current_token.type == TOKEN_DOT_DOT && params_len > 0 &&
+        !is_closure_fn) {
+      parser_advance(parser);
+      if (parser->current_token.type != TOKEN_RPAREN) {
+        parser_set_error(parser, "'..' ends a function type's parameters: it "
+                                 "stands for the C variadic arguments");
+        free(params_buf);
+        return NULL;
+      }
+      param = strdup("..");
+    } else {
+      param = parser_parse_type_annotation(parser);
+    }
     if (!param) {
       if (!parser->has_error)
         parser_set_error(parser,
@@ -4548,6 +4560,25 @@ static char **parser_parse_multi_return_types(Parser *parser,
     *out_count = 0;
     return NULL;
   }
+  if (*out_count == 1 && (parser->current_token.type == TOKEN_MULTIPLY ||
+                          parser->current_token.type == TOKEN_LBRACKET)) {
+    size_t len = strlen(types[0]) + 3;
+    char *grouped = malloc(len);
+    if (!grouped) {
+      parser_free_string_array(types, *out_count);
+      return NULL;
+    }
+    snprintf(grouped, len, "(%s)", types[0]);
+    free(types[0]);
+    grouped = parser_parse_pointer_suffix(parser, grouped);
+    types[0] = grouped ? parser_parse_array_suffix(parser, grouped) : NULL;
+    if (!types[0]) {
+      free(types);
+      *out_count = 0;
+      return NULL;
+    }
+    return types;
+  }
   if (*out_count < 2) {
     parser_set_error(parser, "Multiple return types require at least two types");
     parser_free_string_array(types, *out_count);
@@ -4568,6 +4599,21 @@ static char *parser_make_multi_return_name(const char *function_name) {
     snprintf(name, length, "%s%s", prefix, function_name);
   }
   return name;
+}
+
+static char *parser_grouped_return_name(char ***types, size_t *count,
+                                        const char *function_name) {
+  if (!*types) {
+    return NULL;
+  }
+  if (*count != 1) {
+    return parser_make_multi_return_name(function_name);
+  }
+  char *single = (*types)[0];
+  free(*types);
+  *types = NULL;
+  *count = 0;
+  return single;
 }
 
 static ASTNode *parser_parse_expression_body(Parser *parser) {
@@ -6544,9 +6590,19 @@ static int parser_parse_parameter_list(Parser *parser, char ***out_names,
   char **param_types = NULL;
   size_t param_count = 0;
   parser->group_context = "parameter list";
+  parser->params_c_variadic = 0;
 
   if (parser->current_token.type != TOKEN_RPAREN) {
     do {
+      if (parser->current_token.type == TOKEN_DOT_DOT && param_count > 0) {
+        parser_advance(parser);
+        parser->params_c_variadic = 1;
+        if (parser->current_token.type != TOKEN_RPAREN) {
+          parser_set_error(parser, "'..' ends a parameter list: it stands for the C variadic arguments");
+          goto fail;
+        }
+        break;
+      }
       if (!parser_is_identifier_like(parser->current_token.type)) {
         if (parser->current_token.type == TOKEN_RPAREN && param_count > 0)
           parser_set_error_with_suggestion(
@@ -6566,6 +6622,18 @@ static int parser_parse_parameter_list(Parser *parser, char ***out_names,
       if (!parser_expect(parser, TOKEN_COLON)) {
         free(param_names[param_count]);
         goto fail;
+      }
+
+      if (parser->current_token.type == TOKEN_DOT_DOT) {
+        parser_advance(parser);
+        param_types[param_count] = strdup("uint64[..]");
+        param_count++;
+        parser->params_c_variadic = 1;
+        if (parser->current_token.type != TOKEN_RPAREN) {
+          parser_set_error(parser, "'name: ..' ends a parameter list: it gathers the C variadic arguments");
+          goto fail;
+        }
+        break;
       }
 
       param_types[param_count] = parser_parse_type_annotation(parser);
@@ -6777,6 +6845,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
     free(func_name);
     return NULL;
   }
+  int c_variadic = parser->params_c_variadic;
 
   if (!parser_expect(parser, TOKEN_RPAREN)) {
     for (size_t i = 0; i < param_count; i++) {
@@ -6801,9 +6870,8 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
 
     if (parser->current_token.type == TOKEN_LPAREN) {
       return_types = parser_parse_multi_return_types(parser, &return_type_count);
-      return_type = return_types
-                        ? parser_make_multi_return_name(func_name)
-                        : NULL;
+      return_type = parser_grouped_return_name(&return_types,
+                                               &return_type_count, func_name);
     } else {
       return_type = parser_parse_type_annotation(parser);
     }
@@ -7079,6 +7147,7 @@ ASTNode *parser_parse_function_declaration(Parser *parser) {
   parser_free_effect_clauses(&effect_clauses);
   if (func_decl && func_decl->data) {
     FunctionDeclaration *func_data = (FunctionDeclaration *)func_decl->data;
+    func_data->is_c_variadic = c_variadic;
     func_data->tail_must_yield = must_yield;
     func_data->deadline_cycles = deadline_cycles;
     func_data->has_deadline = has_deadline;

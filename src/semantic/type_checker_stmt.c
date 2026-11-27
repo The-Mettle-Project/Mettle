@@ -1952,6 +1952,9 @@ static int type_checker_check_continue(TypeChecker *checker, ASTNode *statement)
     return 1;
 }
 
+static int type_checker_report_no_effect(TypeChecker *checker,
+                                         ASTNode *statement);
+
 static int type_checker_check_statement_body(TypeChecker *checker,
                                              ASTNode *statement) {
   switch (statement->type) {
@@ -1975,7 +1978,8 @@ static int type_checker_check_statement_body(TypeChecker *checker,
   case AST_ASSIGNMENT:
     return type_checker_process_declaration(checker, statement);
 
-  case AST_FUNCTION_CALL: {
+  case AST_FUNCTION_CALL:
+  case AST_FUNC_PTR_CALL: {
     Type *return_type = type_checker_infer_type(checker, statement);
     if (!return_type) {
       return 0;
@@ -2047,64 +2051,68 @@ static int type_checker_check_statement_body(TypeChecker *checker,
   case AST_PROGRAM:
     return type_checker_check_block(checker, statement);
 
-  default: {
-    const char *shape = "expression";
-    const char *why = "its value goes nowhere";
-    switch (statement->type) {
-    case AST_BINARY_EXPRESSION:
-      shape = "arithmetic or comparison";
-      why = "it computes a value and drops it";
-      break;
-    case AST_UNARY_EXPRESSION:
-      shape = "unary expression";
-      why = "it computes a value and drops it";
-      break;
-    case AST_IDENTIFIER:
-      shape = "name on its own";
-      why = "reading a name does nothing";
-      break;
-    case AST_NUMBER_LITERAL:
-    case AST_STRING_LITERAL:
-    case AST_AGGREGATE_LITERAL:
-      shape = "literal on its own";
-      why = "it computes a value and drops it";
-      break;
-    case AST_MEMBER_ACCESS:
-      shape = "field read";
-      why = "it computes a value and drops it";
-      break;
-    case AST_INDEX_EXPRESSION:
-      shape = "index read";
-      why = "it computes a value and drops it";
-      break;
-    case AST_CAST_EXPRESSION:
-      shape = "cast";
-      why = "it computes a value and drops it";
-      break;
-    case AST_NEW_EXPRESSION:
-      shape = "allocation";
-      why = "the memory it returns is lost at once";
-      break;
-    case AST_LAMBDA_EXPRESSION:
-      shape = "function literal";
-      why = "nothing holds it and nothing calls it";
-      break;
-    default:
-      break;
-    }
-    char message[256];
-    snprintf(message, sizeof(message), "This %s is not a statement: %s%s", shape,
-             why,
-             checker->value_frame_count > 0
-                 ? "; to make it the value here, write it last with no ';'"
-                 : "");
-    type_checker_set_error_at_location(checker, statement->location, message);
-    if (checker->error_reporter)
-      error_reporter_set_last_label(
-          checker->error_reporter, "this line has no effect");
-    return 0;
+  default:
+    return type_checker_report_no_effect(checker, statement);
   }
+}
+
+static int type_checker_report_no_effect(TypeChecker *checker,
+                                         ASTNode *statement) {
+  const char *shape = "expression";
+  const char *why = "its value goes nowhere";
+  switch (statement->type) {
+  case AST_BINARY_EXPRESSION:
+    shape = "arithmetic or comparison";
+    why = "it computes a value and drops it";
+    break;
+  case AST_UNARY_EXPRESSION:
+    shape = "unary expression";
+    why = "it computes a value and drops it";
+    break;
+  case AST_IDENTIFIER:
+    shape = "name on its own";
+    why = "reading a name does nothing";
+    break;
+  case AST_NUMBER_LITERAL:
+  case AST_STRING_LITERAL:
+  case AST_AGGREGATE_LITERAL:
+    shape = "literal on its own";
+    why = "it computes a value and drops it";
+    break;
+  case AST_MEMBER_ACCESS:
+    shape = "field read";
+    why = "it computes a value and drops it";
+    break;
+  case AST_INDEX_EXPRESSION:
+    shape = "index read";
+    why = "it computes a value and drops it";
+    break;
+  case AST_CAST_EXPRESSION:
+    shape = "cast";
+    why = "it computes a value and drops it";
+    break;
+  case AST_NEW_EXPRESSION:
+    shape = "allocation";
+    why = "the memory it returns is lost at once";
+    break;
+  case AST_LAMBDA_EXPRESSION:
+    shape = "function literal";
+    why = "nothing holds it and nothing calls it";
+    break;
+  default:
+    break;
   }
+  char message[256];
+  snprintf(message, sizeof(message), "This %s is not a statement: %s%s", shape,
+           why,
+           checker->value_frame_count > 0
+               ? "; to make it the value here, write it last with no ';'"
+               : "");
+  type_checker_set_error_at_location(checker, statement->location, message);
+  if (checker->error_reporter)
+    error_reporter_set_last_label(checker->error_reporter,
+                                  "this line has no effect");
+  return 0;
 }
 
 static int type_checker_check_defer_statement(TypeChecker *checker,
@@ -2125,6 +2133,7 @@ static int type_checker_check_defer_statement(TypeChecker *checker,
 
   switch (defer_stmt->statement->type) {
   case AST_FUNCTION_CALL:
+  case AST_FUNC_PTR_CALL:
   case AST_ASSIGNMENT:
   case AST_PROGRAM:
     break;

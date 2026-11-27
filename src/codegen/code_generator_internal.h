@@ -26,6 +26,7 @@ typedef struct {
       const MtlcType *return_type;
       MtlcType **parameter_types;
       size_t parameter_count;
+      int is_c_variadic;
     } function;
     struct {
       long long value;

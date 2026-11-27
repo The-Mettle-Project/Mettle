@@ -1,0 +1,14 @@
+import "std/io";
+
+struct Empty {}
+
+var first: Empty;
+var second: Empty;
+var after: int32 = 3;
+
+fn main() -> int32 {
+  var a: uint64 = (uint64)&first;
+  var b: uint64 = (uint64)&second;
+  println("{a != b} {after}");
+  return 0;
+}

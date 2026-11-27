@@ -221,6 +221,67 @@ static void ir_mark_volatile_global_accesses(IRProgram *program) {
   }
 }
 
+static int ir_names_local(const IROperand *operand, char **names, size_t count) {
+  if (!operand || operand->kind != IR_OPERAND_SYMBOL || !operand->name) {
+    return 0;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (strcmp(names[i], operand->name) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int ir_touches_locals(const IRInstruction *instruction, char **names, size_t count) {
+  if (ir_names_local(&instruction->dest, names, count) ||
+      ir_names_local(&instruction->lhs, names, count) ||
+      ir_names_local(&instruction->rhs, names, count)) {
+    return 1;
+  }
+  for (size_t a = 0; a < instruction->argument_count; a++) {
+    if (ir_names_local(&instruction->arguments[a], names, count)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void ir_mark_volatile_local_accesses(IRFunction *function) {
+  size_t count = 0;
+  char **names = NULL;
+  for (size_t i = 0; i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    if (instruction->op != IR_OP_DECLARE_LOCAL || !instruction->is_volatile ||
+        !instruction->dest.name) {
+      continue;
+    }
+    char **grown = realloc(names, (count + 1) * sizeof(char *));
+    if (!grown) {
+      free(names);
+      return;
+    }
+    names = grown;
+    names[count++] = instruction->dest.name;
+  }
+  for (size_t i = 0; count && i < function->instruction_count; i++) {
+    IRInstruction *instruction = &function->instructions[i];
+    if (ir_touches_locals(instruction, names, count)) {
+      instruction->is_volatile = 1;
+      function->has_volatile_access = 1;
+    }
+  }
+  free(names);
+}
+
+static void ir_mark_volatile_locals(IRProgram *program) {
+  for (size_t f = 0; program && f < program->function_count; f++) {
+    if (program->functions[f]) {
+      ir_mark_volatile_local_accesses(program->functions[f]);
+    }
+  }
+}
+
 IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
                             SymbolTable *symbol_table, char **error_message,
                             int emit_runtime_checks, int emit_safety_checks) {
@@ -314,6 +375,7 @@ IRProgram *ir_lower_program(ASTNode *program, TypeChecker *type_checker,
   ir_mark_host_twins(ir_program);
   ir_lower_live_register_symbols(&context, ir_program);
   ir_mark_volatile_global_accesses(ir_program);
+  ir_mark_volatile_locals(ir_program);
   if (context.emitted_task_check &&
       !ir_program_lookup_symbol(ir_program, "mettle_safety_task_capture_check")) {
     IRModuleSymbol entry;

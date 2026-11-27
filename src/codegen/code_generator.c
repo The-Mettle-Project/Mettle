@@ -111,6 +111,7 @@ const CgSym *code_generator_lookup_symbol(CodeGenerator *generator,
       v->data.function.return_type = m->return_type;
       v->data.function.parameter_types = m->param_types;
       v->data.function.parameter_count = m->param_count;
+      v->data.function.is_c_variadic = m->is_c_variadic;
     } else if (m->kind == IR_MODSYM_CONSTANT) {
       v->data.constant.value = m->const_value;
     }

@@ -406,6 +406,8 @@ int ir_emit_local_declaration(IRLoweringContext *context,
     Type *resolved = ir_resolve_named_type(context, type_name);
     if (resolved) {
       local.value_type = mtlc_type_from_frontend(resolved);
+      local.is_volatile = resolved->is_volatile ||
+                          strncmp(type_name, "volatile ", 9) == 0;
     }
   }
   if (!local.dest.name) {

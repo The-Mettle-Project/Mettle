@@ -28,6 +28,56 @@ Parameter and return types must match what the other side declares. The
 convention comes from the target: the Microsoft ABI on Windows x86-64, System
 V on Linux x86-64, AAPCS64 on Linux AArch64.
 
+## C variadic functions
+
+`..` after the last fixed parameter declares a C variadic function:
+
+```mettle
+extern fn printf(format: cstring, ..) -> int32;
+
+printf("%d items, %.1f%% full, %s\n", count, ratio * 100.0, label);
+```
+
+Each extra argument is a number, a pointer, a `bool`, a `char` or a string
+literal. The call applies C's default promotions: integers narrower than 32
+bits become `int32`, `float32` becomes `float64`, a string literal passes its
+bytes. On Windows a floating argument goes in the integer register for its
+slot, and on Linux x86-64 `AL` carries the count of vector registers used, as
+the callee expects.
+
+A function type that ends in `..` points at a C variadic function, and a call
+through it follows the same rules:
+
+```mettle
+var emit: fn(rawptr, cstring, ..) -> int32 = &fprintf;
+emit(libc.stderr(), "%d of %d\n", done, total);
+```
+
+The address of a function declared with `..` has that type. The address of a
+Mettle function that takes `name: ..` does not, because its arguments travel
+as slots.
+
+A Mettle function takes variadic arguments with `name: ..`. Inside the body
+`name` is a `uint64[]`, one slot per argument, and `std/c` reads it as a C
+`va_list`:
+
+```mettle
+import "std/c" as libc;
+
+fn sum(count: int32, va: ..) -> float64 {
+  var ap: libc.VaList = libc.va_start(va);
+  var total: float64 = 0.0;
+  for i: int32 in 0..count {
+    total = total + libc.va_double(&ap);
+  }
+  return total;
+}
+```
+
+`sum(3, 1.5, 2.0, 0.25)` passes the same way as a C call. `libc.va_native(&ap)`
+hands the arguments to a C function that takes a `va_list`, such as
+`vfprintf`.
+
 ## What a name can resolve to
 
 `extern` declares a name; it does not conjure one. Nothing checks at compile

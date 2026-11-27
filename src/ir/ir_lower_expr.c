@@ -854,6 +854,11 @@ static int ir_lower_call_through_env(IRLoweringContext *context, IRFunction *fun
   if (is_func_ptr_var) {
     instruction.op = IR_OP_CALL_INDIRECT;
     instruction.effect_signature = call->effect_signature;
+    if (call->c_variadic_fixed > 0) {
+      instruction.c_variadic_fixed =
+          call->c_variadic_fixed +
+          (int)(emitted_argument_count - call->argument_count);
+    }
     instruction.argument_types = ir_indirect_slot_types(
         call->arguments, call->argument_count,
         emitted_argument_count - call->argument_count);
@@ -3418,6 +3423,14 @@ static int ir_coerce_func_ptr_argument(IRLoweringContext *context,
                                              argument->location);
 }
 
+static int ir_c_variadic_fixed(const Type *func_type, size_t prefixed) {
+  if (!func_type || func_type->kind != TYPE_FUNCTION_POINTER ||
+      !func_type->fn_c_variadic) {
+    return 0;
+  }
+  return (int)(func_type->fn_param_count + prefixed) + 1;
+}
+
 static int ir_lower_func_ptr_call(IRLoweringContext *context,
                        IRFunction *function, ASTNode *expression,
                        IROperand *out_value) {
@@ -3581,6 +3594,8 @@ static int ir_lower_func_ptr_call(IRLoweringContext *context,
   instruction.argument_types = ir_indirect_slot_types(
       fp_call->arguments, fp_call->argument_count,
       emitted_argument_count - fp_call->argument_count);
+  instruction.c_variadic_fixed = ir_c_variadic_fixed(
+      func_type, emitted_argument_count - fp_call->argument_count);
 
   if (!ir_emit(context, function, &instruction)) {
     free(instruction.argument_types);

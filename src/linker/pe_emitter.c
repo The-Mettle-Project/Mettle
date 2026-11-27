@@ -1772,7 +1772,7 @@ static int pe_write_headers(FILE *file, const PeSectionLayout *layouts,
       !pe_write_u32(file, size_of_image) ||
       !pe_write_u32(file, size_of_headers) || !pe_write_u32(file, 0u) ||
       !pe_write_u16(file, subsystem) || !pe_write_u16(file, 0u) ||
-      !pe_write_u64(file, 0x100000u) || !pe_write_u64(file, 0x1000u) ||
+      !pe_write_u64(file, 0x800000u) || !pe_write_u64(file, 0x1000u) ||
       !pe_write_u64(file, 0x100000u) || !pe_write_u64(file, 0x1000u) ||
       !pe_write_u32(file, 0u) ||
       !pe_write_u32(file, PE_DATA_DIRECTORY_COUNT)) {

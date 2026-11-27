@@ -1,0 +1,20 @@
+import "std/io";
+
+struct Node {
+  common: Common;
+}
+
+struct Common {
+  chain: Node*;
+  kind: Node*;
+  bits: uint32;
+}
+
+fn main() -> int32 {
+  var n: Node;
+  n.common.chain = 0;
+  n.common.kind = 0;
+  n.common.bits = 5;
+  println("{sizeof(Node)} {n.common.bits}");
+  return 0;
+}

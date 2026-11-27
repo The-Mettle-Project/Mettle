@@ -376,6 +376,13 @@ static int code_generator_binary_emit_global_aggregate_image(
   return 1;
 }
 
+static size_t global_aggregate_storage(const MtlcType *type,
+                                       const IRModuleSymbol *sym) {
+  int empty_struct = type->kind == MTLC_TYPE_STRUCT && type->field_count == 0;
+  int bare = !sym->has_initializer && !sym->has_unfoldable_initializer;
+  return type->size == 0 && empty_struct && bare ? 1 : type->size;
+}
+
 int code_generator_emit_binary_global_variable(CodeGenerator *generator,
                                                       const IRModuleSymbol *sym) {
   BinaryEmitter *emitter = NULL;
@@ -432,7 +439,7 @@ int code_generator_emit_binary_global_variable(CodeGenerator *generator,
 
   if (type->kind == MTLC_TYPE_STRUCT || type->kind == MTLC_TYPE_ARRAY ||
       type->kind == MTLC_TYPE_TAGGED_ENUM) {
-    size_t aggregate_size = type->size;
+    size_t aggregate_size = global_aggregate_storage(type, sym);
     size_t aggregate_alignment = type->alignment ? type->alignment : 8;
     size_t aggregate_section = 0;
     size_t aggregate_offset = 0;

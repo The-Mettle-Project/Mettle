@@ -210,6 +210,10 @@ static size_t type_checker_spell_function(const Type *type, char *room,
       }
     }
   }
+  const char *tail = type->fn_c_variadic ? ", .." : "";
+  for (const char *c = tail; *c && used + 1 < room_size; c++) {
+    room[used++] = *c;
+  }
   const char *mid = ") -> ";
   for (const char *c = mid; *c && used + 1 < room_size; c++) {
     room[used++] = *c;

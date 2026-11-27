@@ -315,6 +315,8 @@ static Token lexer_skip_block_comment(Lexer *lexer) {
   return lexer_next_token(lexer);
 }
 
+static int lexer_hex_escape(Lexer *lexer);
+
 static Token lexer_lex_char_literal(Lexer *lexer) {
   Token token = {TOKEN_EOF, NULL, {NULL, 0}, lexer->line, lexer->column, 0};
   size_t literal_start = lexer->position;
@@ -359,6 +361,15 @@ static Token lexer_lex_char_literal(Lexer *lexer) {
     case '0':
       value = '\0';
       break;
+    case 'x':
+      value = lexer_hex_escape(lexer);
+      if (value >= 0) {
+        break;
+      }
+      token.type = TOKEN_ERROR;
+      token.value = strdup("Invalid character escape sequence");
+      lexer_set_error(lexer, token.value);
+      return token;
     default:
       token.type = TOKEN_ERROR;
       token.value = strdup("Invalid character escape sequence");
@@ -821,6 +832,35 @@ static size_t lexer_interp_skip_string(const char *text, size_t length,
   return at < length ? at + 1 : length;
 }
 
+static int lexer_hex_digit(char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  }
+  if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+static int lexer_hex_escape(Lexer *lexer) {
+  int value = 0;
+  int digits = 0;
+  while (digits < 2 && lexer->position + 1 < lexer->length) {
+    int d = lexer_hex_digit(lexer->source[lexer->position + 1]);
+    if (d < 0) {
+      break;
+    }
+    value = value * 16 + d;
+    lexer->position++;
+    lexer->column++;
+    digits++;
+  }
+  return digits ? value : -1;
+}
+
 static int lexer_read_string_body(Lexer *lexer, char *buffer,
                                   size_t *buffer_pos_out,
                                   int interpolation_aware, int *bad_escape) {
@@ -887,6 +927,17 @@ static int lexer_read_string_body(Lexer *lexer, char *buffer,
       case '0':
         buffer[buffer_pos++] = '\0';
         break;
+      case 'x': {
+        int hex = lexer_hex_escape(lexer);
+        if (hex < 0) {
+          if (bad_escape && *bad_escape == 0) {
+            *bad_escape = 'x';
+          }
+          break;
+        }
+        buffer[buffer_pos++] = (char)hex;
+        break;
+      }
       default:
         if (bad_escape && *bad_escape == 0) {
           *bad_escape = (unsigned char)escape_char;

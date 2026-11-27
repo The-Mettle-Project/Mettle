@@ -332,7 +332,13 @@ static int aggregate_fold_scalar(TypeChecker *checker, ASTNode *element,
                                  AggregateImage *out) {
   unsigned char *at = out->image + offset;
 
-  if (type->kind == TYPE_STRING || type_checker_is_cstring_type(type)) {
+  int byte_pointer = type->kind == TYPE_POINTER && type->base_type &&
+                     type->base_type->name &&
+                     (strcmp(type->base_type->name, "int8") == 0 ||
+                      strcmp(type->base_type->name, "uint8") == 0) &&
+                     element->type == AST_STRING_LITERAL;
+  if (type->kind == TYPE_STRING || type_checker_is_cstring_type(type) ||
+      byte_pointer) {
     if (element->type != AST_STRING_LITERAL) {
       return aggregate_image_add_runtime_store(out, offset, element, type);
     }
