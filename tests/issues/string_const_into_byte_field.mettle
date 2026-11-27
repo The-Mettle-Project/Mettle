@@ -1,0 +1,19 @@
+import "std/io";
+
+const NAME: string = "store";
+
+struct Config {
+  capacity: int32;
+  label: int8*;
+  tag: uint8*;
+}
+
+extern fn strlen(text: int8*) -> uint64;
+
+fn main() -> int32 {
+  var local: Config = { capacity: 3, label: NAME, tag: "t" };
+  var later: Config;
+  later.label = NAME;
+  println("{local.capacity} {strlen(local.label)} {strlen(later.label)} {local.tag[0]}");
+  return 0;
+}

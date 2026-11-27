@@ -5449,13 +5449,20 @@ static void parser_discard_saved_state(ParserSavedState *state) {
   free(state->error_message);
 }
 
+static int parser_type_wraps_group(const char *type_name) {
+  size_t n = strlen(type_name);
+  return type_name[0] == '(' && n > 0 &&
+         (type_name[n - 1] == '*' || type_name[n - 1] == ']');
+}
+
 ASTNode *parser_parse_cast_expression(Parser *parser) {
   if (!parser || parser->current_token.type != TOKEN_LPAREN)
     return NULL;
 
+  int grouped = parser->peek_token.type == TOKEN_LPAREN;
   if (!parser_is_type_keyword(parser->peek_token.type) &&
       !parser_is_identifier_like(parser->peek_token.type) &&
-      parser->peek_token.type != TOKEN_FN) {
+      parser->peek_token.type != TOKEN_FN && !grouped) {
     return NULL;
   }
 
@@ -5473,7 +5480,8 @@ ASTNode *parser_parse_cast_expression(Parser *parser) {
 
   char *type_name = parser_parse_type_annotation(parser);
   if (!type_name || parser->has_error ||
-      parser->current_token.type != TOKEN_RPAREN) {
+      parser->current_token.type != TOKEN_RPAREN ||
+      (grouped && !parser_type_wraps_group(type_name))) {
     free(type_name);
     parser_restore_state(parser, &saved);
     parser_discard_saved_state(&saved);

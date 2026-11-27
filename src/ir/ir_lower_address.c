@@ -153,6 +153,13 @@ static int ir_emit_aggregate_runtime_stores(IRLoweringContext *context,
       ir_operand_destroy(&value);
       return 0;
     }
+    if (ir_should_coerce_string_to_cstring(context, element_type,
+                                           entry->element) &&
+        !ir_coerce_string_operand_to_cstring(context, function, &value,
+                                             entry->element->location)) {
+      ir_operand_destroy(&value);
+      return 0;
+    }
     if (ir_should_build_slice_from_array(element_type, entry->element) &&
         !ir_build_slice_operand_from_array(
             context, function, &value, entry->element->resolved_type,

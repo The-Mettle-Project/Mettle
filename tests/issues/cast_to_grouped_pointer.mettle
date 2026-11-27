@@ -1,0 +1,20 @@
+import "std/io";
+
+struct Node {
+  value: int32;
+}
+
+fn read(n: Node*) -> int32 { return n->value; }
+
+fn main() -> int32 {
+  var f: fn(Node*) -> int32 = &read;
+  var slot: rawptr = (rawptr)&f;
+  var g: fn(Node*) -> int32 = *((fn(Node*) -> int32)*)slot;
+  var rows: int32[4] = [1, 2, 3, 4];
+  var row: (int32[2])* = ((int32[2])*)&rows[2];
+  var n: Node;
+  n.value = 7;
+  var twice: int32 = ((g(&n))) * 2;
+  println("{g(&n)} {(*row)[1]} {twice}");
+  return 0;
+}

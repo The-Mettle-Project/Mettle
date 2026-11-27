@@ -2224,21 +2224,24 @@ static int type_checker_expression_is_destination_width(TypeChecker *checker,
   if (!checker || !dest_type || !expression || depth > 32) {
     return 0;
   }
-
-  switch (expression->type) {
-  case AST_NUMBER_LITERAL: {
+  long long value = 0;
+  if (expression->type == AST_NUMBER_LITERAL) {
     NumberLiteral *literal = (NumberLiteral *)expression->data;
-    long long value = 0;
     if (!literal || literal->is_float) {
       return 0;
     }
-    if (!type_checker_eval_integer_constant_with_checker(checker, expression,
-                                                         &value)) {
-      return 0;
-    }
+  }
+  if (expression->resolved_type &&
+      type_checker_is_integer_type(expression->resolved_type) &&
+      type_checker_eval_integer_constant_with_checker(checker, expression,
+                                                      &value)) {
     return type_checker_constant_fits_type(dest_type, expression->resolved_type,
                                            value);
   }
+
+  switch (expression->type) {
+  case AST_NUMBER_LITERAL:
+    return 0;
 
   case AST_BINARY_EXPRESSION: {
     BinaryExpression *binary = (BinaryExpression *)expression->data;

@@ -532,12 +532,7 @@ int type_checker_check_if_statement(TypeChecker *checker,
           "Out of memory while analyzing variable initialization flow");
       return 0;
     }
-    if (if_stmt->else_branch) {
-      memset(joined, 1, init_snapshot_count * sizeof(unsigned char));
-    } else {
-      memcpy(joined, init_snapshot,
-             init_snapshot_count * sizeof(unsigned char));
-    }
+    memset(joined, 1, init_snapshot_count * sizeof(unsigned char));
   }
 
   void *join = checker->joinable == statement
@@ -569,6 +564,7 @@ int type_checker_check_if_statement(TypeChecker *checker,
   size_t prefix_arms = 0;
   size_t prefix_pushes = 0;
   int prefix_valid = 0;
+  unsigned char *chain = NULL;
   for (size_t i = 0; i < if_stmt->else_if_count; i++) {
     Type *elif_cond_type =
         type_checker_infer_type(checker, if_stmt->else_ifs[i].condition);
@@ -584,6 +580,9 @@ int type_checker_check_if_statement(TypeChecker *checker,
           elif_cond_type->name);
       elif_ok = 0;
     }
+    size_t chain_count = 0;
+    free(chain);
+    chain = type_checker_init_tracker_capture(checker, &chain_count);
     if (elif_ok && if_stmt->else_ifs[i].body) {
       size_t guard_depth = type_checker_guard_depth(checker);
       if (prefix_valid && prefix_arms == i &&
@@ -615,14 +614,16 @@ int type_checker_check_if_statement(TypeChecker *checker,
       type_checker_join_arm(checker, join, NULL);
     }
     if (!elif_ok) {
+      free(chain);
       free(joined);
       free(init_snapshot);
       return 0;
     }
     type_checker_if_join_arm(checker, joined, init_snapshot_count,
                              if_stmt->else_ifs[i].body);
-    type_checker_init_tracker_restore(checker, init_snapshot,
-                                      init_snapshot_count);
+    type_checker_init_tracker_restore(
+        checker, chain ? chain : init_snapshot,
+        chain ? chain_count : init_snapshot_count);
   }
 
   if (if_stmt->else_branch) {
@@ -637,13 +638,16 @@ int type_checker_check_if_statement(TypeChecker *checker,
     else_ok = type_checker_check_statement(checker, if_stmt->else_branch);
     type_checker_pop_guards(checker, guard_depth);
     if (!else_ok) {
+      free(chain);
       free(joined);
       free(init_snapshot);
       return 0;
     }
   }
+  free(chain);
   type_checker_if_join_arm(checker, joined, init_snapshot_count,
-                           if_stmt->else_branch);
+                           if_stmt->else_branch ? if_stmt->else_branch
+                                                : statement);
   type_checker_init_tracker_restore(checker, init_snapshot,
                                     init_snapshot_count);
   if (joined) {

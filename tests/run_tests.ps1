@@ -22956,6 +22956,11 @@ $issueRegressions = @(
   @{ Name = "c_variadic_pointer"; Entry = "tests/issues/c_variadic_pointer.mettle"; Args = @(); Expect = @("1.500000 7 ok 2.250000", "1 0.500000 1.500000 2.500000 3.500000 4.500000", "0.25|9 6") },
   @{ Name = "empty_struct_global"; Entry = "tests/issues/empty_struct_global.mettle"; Args = @(); Expect = @("true 3") },
   @{ Name = "deref_keeps_destination_width"; Entry = "tests/issues/deref_keeps_destination_width.mettle"; Args = @(); Expect = @("4 5 128") },
+  @{ Name = "else_if_condition_initializes"; Entry = "tests/issues/else_if_condition_initializes.mettle"; Args = @(); Expect = @("7 2 14") },
+  @{ Name = "cast_to_grouped_pointer"; Entry = "tests/issues/cast_to_grouped_pointer.mettle"; Args = @(); Expect = @("7 4 14") },
+  @{ Name = "sizeof_keeps_destination_width"; Entry = "tests/issues/sizeof_keeps_destination_width.mettle"; Args = @(); Expect = @("22 48 7") },
+  @{ Name = "sizeof_private_pointer"; Entry = "tests/issues/sizeof_private_pointer/main.mettle"; Args = @(); Expect = @("40") },
+  @{ Name = "string_const_into_byte_field"; Entry = "tests/issues/string_const_into_byte_field.mettle"; Args = @(); Expect = @("3 5 5 116") },
   @{ Name = "err_mixed_width_bitwise"; Command = @("--build", "tests/issues/err_mixed_width_bitwise.mettle", "-o", ".tmp/issue_err.exe"); Expect = @("Narrowing conversion from 'int64' to 'int32' needs a cast") }
 )
 foreach ($case in $issueRegressions) {

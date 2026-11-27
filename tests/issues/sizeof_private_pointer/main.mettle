@@ -1,0 +1,7 @@
+import "std/io";
+import "lib/cells";
+
+fn main() -> int32 {
+  println("{cells_bytes(3)}");
+  return 0;
+}

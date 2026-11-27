@@ -1722,6 +1722,23 @@ static int rewrite_member_names(ASTNode *node, const NameRewrite *rewrites,
                                 binding_count, scope);
 }
 
+static int rewrite_identifier_name(Identifier *identifier,
+                                   const NameRewrite *rewrites,
+                                   size_t rewrite_count,
+                                   const NamespaceBinding *bindings,
+                                   size_t binding_count,
+                                   RewriteScope *scope) {
+  if (!identifier || !identifier->name ||
+      scope_contains(scope, identifier->name)) {
+    return 1;
+  }
+  if (strpbrk(identifier->name, "*[(")) {
+    return rewrite_type_string_in_place(&identifier->name, rewrites,
+                                        rewrite_count, bindings, binding_count);
+  }
+  return rename_string_if_needed(&identifier->name, rewrites, rewrite_count);
+}
+
 static int rewrite_call_names(ASTNode *node, const NameRewrite *rewrites,
                               size_t rewrite_count,
                               const NamespaceBinding *bindings,
@@ -1845,14 +1862,10 @@ static int rewrite_call_names(ASTNode *node, const NameRewrite *rewrites,
     }
     return 1;
 
-  case AST_IDENTIFIER: {
-    Identifier *identifier = (Identifier *)node->data;
-    if (!identifier || !identifier->name ||
-        scope_contains(scope, identifier->name)) {
-      return 1;
-    }
-    return rename_string_if_needed(&identifier->name, rewrites, rewrite_count);
-  }
+  case AST_IDENTIFIER:
+    return rewrite_identifier_name((Identifier *)node->data, rewrites,
+                                   rewrite_count, bindings, binding_count,
+                                   scope);
 
   default:
     break;
@@ -3071,6 +3084,18 @@ static void collect_assembly_identifiers(const char *assembly, char ***names,
 static void collect_dependency_names(ASTNode *node, char ***names,
                                      size_t *count, size_t *capacity);
 
+static void collect_identifier_dependency(Identifier *id, char ***names,
+                                          size_t *count, size_t *capacity) {
+  if (!id || !id->name || id->name[0] == '\0') {
+    return;
+  }
+  if (strpbrk(id->name, "*[(")) {
+    collect_type_name_dependencies(id->name, names, count, capacity);
+    return;
+  }
+  (void)path_set_add(names, count, capacity, id->name);
+}
+
 static void collect_call_dependency_names(CallExpression *call, char ***names,
                                           size_t *count, size_t *capacity) {
   if (!call) {
@@ -3117,13 +3142,10 @@ static void collect_dependency_names(ASTNode *node, char ***names,
     }
     return;
   }
-  case AST_IDENTIFIER: {
-    Identifier *id = (Identifier *)node->data;
-    if (id && id->name && id->name[0] != '\0') {
-      (void)path_set_add(names, count, capacity, id->name);
-    }
+  case AST_IDENTIFIER:
+    collect_identifier_dependency((Identifier *)node->data, names, count,
+                                  capacity);
     return;
-  }
   case AST_LAMBDA_EXPRESSION:
   case AST_FUNCTION_DECLARATION:
   case AST_METHOD_DECLARATION:

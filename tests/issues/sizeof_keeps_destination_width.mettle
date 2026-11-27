@@ -1,0 +1,17 @@
+import "std/io";
+
+struct Pair {
+  a: int64;
+  b: int64;
+}
+
+fn take(n: uint64) -> uint64 { return n; }
+
+fn main() -> int32 {
+  var count: int32 = 3;
+  var bytes: uint64 = take(sizeof(Pair) + (uint64)count + 3);
+  var total: uint64 = take((uint64)count * sizeof(Pair));
+  var small: uint8 = (uint8)count + sizeof(int32);
+  println("{bytes} {total} {small}");
+  return 0;
+}

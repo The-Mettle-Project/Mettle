@@ -1,0 +1,8 @@
+struct Cell {
+  next: Cell*;
+  value: int64;
+}
+
+export fn cells_bytes(n: int64) -> int64 {
+  return n * sizeof(Cell*) + sizeof(Cell);
+}
