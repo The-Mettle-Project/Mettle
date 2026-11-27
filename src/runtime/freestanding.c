@@ -20,6 +20,7 @@ typedef __builtin_va_list mt_va_list;
 
 MT_NORETURN void abort(void);
 MT_NORETURN void _exit(int status);
+void mt_run_atexit(void);
 int isspace(int character);
 int tolower(int character);
 void *malloc(mt_size size);
@@ -57,12 +58,15 @@ typedef struct MtFile {
   unsigned char *write_buffer;
   int write_fill;
   struct MtFile *next_open;
+  int pushback;
 } MtFile;
 
 #define MT_FILE_READ 1u
 #define MT_FILE_WRITE 2u
 #define MT_FILE_BUFFERED 4u
 #define MT_FILE_WRITE_BUFFERED 8u
+#define MT_FILE_EOF 16u
+#define MT_FILE_ERROR 32u
 #define MT_FILE_STANDARD 0x80000000u
 #define MT_FILE_BUFFER_BYTES 8192
 #define MT_FILE_WRITE_BUFFER_BYTES 65536
@@ -2080,7 +2084,7 @@ void *fopen(const char *path, const char *mode) {
   if (handle == MT_INVALID_HANDLE) {
     return MT_NULL;
   }
-  MtFile *file = (MtFile *)malloc(sizeof(MtFile));
+  MtFile *file = (MtFile *)calloc(1, sizeof(MtFile));
   if (!file) {
     CloseHandle(handle);
     return MT_NULL;
@@ -2232,6 +2236,7 @@ int mettle_rt_getmainargs(int *argc_out, char ***argv_out) {
 }
 
 MT_NORETURN void exit(int status) {
+  mt_run_atexit();
   mt_flush_open_streams();
   ExitProcess((mt_u32)status);
 }
@@ -2376,7 +2381,7 @@ void *popen(const char *command, const char *mode) {
 
   mt_size command_size = sizeof(prefix) + strlen(command);
   command_line = (char *)malloc(command_size);
-  file = (MtFile *)malloc(sizeof(MtFile));
+  file = (MtFile *)calloc(1, sizeof(MtFile));
   if (!command_line || !file) {
     free(command_line);
     free(file);
@@ -4500,7 +4505,7 @@ void *fopen(const char *path, const char *mode) {
   if (fd < 0) {
     return MT_NULL;
   }
-  MtFile *file = (MtFile *)malloc(sizeof(MtFile));
+  MtFile *file = (MtFile *)calloc(1, sizeof(MtFile));
   if (!file) {
     close(fd);
     return MT_NULL;
@@ -5456,6 +5461,7 @@ MT_NORETURN void _exit(int status) {
 #else
 
 MT_NORETURN void exit(int status) {
+  mt_run_atexit();
   mt_flush_open_streams();
   mt_syscall6(MT_SYS_EXIT_GROUP, status, 0, 0, 0, 0, 0);
   mt_syscall6(MT_SYS_EXIT, status, 0, 0, 0, 0, 0);
@@ -5553,7 +5559,7 @@ void *popen(const char *command, const char *mode) {
   if (pid < 0) {
     return MT_NULL;
   }
-  MtFile *file = (MtFile *)malloc(sizeof(MtFile));
+  MtFile *file = (MtFile *)calloc(1, sizeof(MtFile));
   if (!file) {
     close(descriptor);
     (void)mt_hosted_wait_process(pid, MT_NULL);
@@ -5674,7 +5680,7 @@ void *popen(const char *command, const char *mode) {
     _exit(127);
   }
   close(descriptors[1]);
-  MtFile *file = (MtFile *)malloc(sizeof(MtFile));
+  MtFile *file = (MtFile *)calloc(1, sizeof(MtFile));
   if (!file) {
     close(descriptors[0]);
     return MT_NULL;
@@ -5750,7 +5756,37 @@ int system(const char *command) {
 
 #define MT_FILE_BUFFER_BYPASS (MT_FILE_BUFFER_BYTES / 2)
 
+static mt_ssize mt_stream_read_raw(MtFile *file, void *buffer, mt_size bytes);
+
 static mt_ssize mt_stream_read(MtFile *file, void *buffer, mt_size bytes) {
+  unsigned char *out = (unsigned char *)buffer;
+  mt_ssize got;
+  if (bytes == 0) {
+    return 0;
+  }
+  if (file->pushback) {
+    out[0] = (unsigned char)(file->pushback - 1);
+    file->pushback = 0;
+    if (bytes == 1) {
+      return 1;
+    }
+    got = mt_stream_read_raw(file, out + 1, bytes - 1);
+    if (got <= 0) {
+      file->flags |= got < 0 ? MT_FILE_ERROR : MT_FILE_EOF;
+      return 1;
+    }
+    return got + 1;
+  }
+  got = mt_stream_read_raw(file, buffer, bytes);
+  if (got < 0) {
+    file->flags |= MT_FILE_ERROR;
+  } else if (got == 0 || ((file->flags & MT_FILE_BUFFERED) && (mt_size)got < bytes)) {
+    file->flags |= MT_FILE_EOF;
+  }
+  return got;
+}
+
+static mt_ssize mt_stream_read_raw(MtFile *file, void *buffer, mt_size bytes) {
   unsigned char *out = (unsigned char *)buffer;
   mt_size done = 0;
 
@@ -5910,12 +5946,14 @@ static void mt_flush_open_streams(void) {
 }
 
 static mt_size mt_stream_pending(const MtFile *file) {
-  return (mt_size)(file->read_fill - file->read_pos);
+  return (mt_size)(file->read_fill - file->read_pos) + (file->pushback ? 1u : 0u);
 }
 
 static void mt_stream_discard(MtFile *file) {
   file->read_fill = 0;
   file->read_pos = 0;
+  file->pushback = 0;
+  file->flags &= ~(MT_FILE_EOF | MT_FILE_ERROR);
 }
 
 mt_size fread(void *buffer, mt_size size, mt_size count, void *stream) {
@@ -5960,10 +5998,9 @@ int putchar(int character) {
   return mt_stream_write((MtFile *)stdout, &byte, 1) == 1 ? character : -1;
 }
 
-int getchar(void) {
-  mt_u8 byte = 0;
-  return mt_file_read((MtFile *)stdin, &byte, 1) == 1 ? (int)byte : -1;
-}
+int fgetc(void *stream);
+
+int getchar(void) { return fgetc(stdin); }
 
 char *fgets(char *buffer, int size, void *stream) {
   int used = 0;
@@ -5996,14 +6033,77 @@ int fflush(void *stream) {
   return mt_stream_flush((MtFile *)stream);
 }
 
+mt_i64 _ftelli64(void *stream);
+int _fseeki64(void *stream, mt_i64 offset, int origin);
+char *strerror(int error);
+
 int ferror(void *stream) {
-  (void)stream;
-  return 0;
+  return stream && (((MtFile *)stream)->flags & MT_FILE_ERROR) ? 1 : 0;
+}
+
+int feof(void *stream) {
+  return stream && (((MtFile *)stream)->flags & MT_FILE_EOF) ? 1 : 0;
+}
+
+void clearerr(void *stream) {
+  if (stream) {
+    ((MtFile *)stream)->flags &= ~(MT_FILE_EOF | MT_FILE_ERROR);
+  }
+}
+
+int fgetc(void *stream) {
+  mt_u8 byte = 0;
+  if (!stream) {
+    return -1;
+  }
+  return mt_stream_read((MtFile *)stream, &byte, 1) == 1 ? (int)byte : -1;
+}
+
+int getc(void *stream) { return fgetc(stream); }
+
+int ungetc(int character, void *stream) {
+  MtFile *file = (MtFile *)stream;
+  if (!file || character == -1 || file->pushback) {
+    return -1;
+  }
+  file->pushback = (character & 0xff) + 1;
+  file->flags &= ~MT_FILE_EOF;
+  return character & 0xff;
 }
 
 int fputc(int character, void *stream) {
   mt_u8 byte = (mt_u8)character;
   return mt_stream_write((MtFile *)stream, &byte, 1) == 1 ? character : -1;
+}
+
+int putc(int character, void *stream) { return fputc(character, stream); }
+
+void setbuf(void *stream, char *buffer) {
+  (void)stream;
+  (void)buffer;
+}
+
+int fgetpos(void *stream, mt_i64 *position) {
+  mt_i64 at = _ftelli64(stream);
+  if (at < 0 || !position) {
+    return -1;
+  }
+  *position = at;
+  return 0;
+}
+
+int fsetpos(void *stream, const mt_i64 *position) {
+  return position ? _fseeki64(stream, *position, 0) : -1;
+}
+
+void perror(const char *prefix) {
+  void *err = stderr;
+  if (prefix && *prefix) {
+    fputs(prefix, err);
+    fputs(": ", err);
+  }
+  fputs(strerror(mt_errno_value), err);
+  fputc('\n', err);
 }
 
 int fseek(void *stream, long offset, int origin) {
@@ -7040,82 +7140,6 @@ static int mt_double_special(double value, char *out, int upper,
   return 3;
 }
 
-static double mt_decimal_round(int precision) {
-  double round = 0.5;
-  while (precision-- > 0) {
-    round *= 0.1;
-  }
-  return round;
-}
-
-static mt_size mt_float_fixed(char *out, double value, int precision) {
-  if (precision < 0) {
-    precision = 6;
-  }
-  if (precision > 30) {
-    precision = 30;
-  }
-  value += mt_decimal_round(precision);
-  mt_u64 whole = (mt_u64)value;
-  double fraction = value - (double)whole;
-  mt_size used = mt_unsigned_text(out, whole, 10, 0);
-  if (precision > 0) {
-    out[used++] = '.';
-    for (int i = 0; i < precision; i++) {
-      fraction *= 10.0;
-      int digit = (int)fraction;
-      if (digit < 0) {
-        digit = 0;
-      } else if (digit > 9) {
-        digit = 9;
-      }
-      out[used++] = (char)('0' + digit);
-      fraction -= digit;
-    }
-  }
-  return used;
-}
-
-static int mt_float_exponent(double *value) {
-  int exponent = 0;
-  if (*value != 0.0) {
-    while (*value >= 10.0 && exponent < 400) {
-      *value *= 0.1;
-      exponent++;
-    }
-    while (*value < 1.0 && exponent > -400) {
-      *value *= 10.0;
-      exponent--;
-    }
-  }
-  return exponent;
-}
-
-static mt_size mt_float_exponential(char *out, double value, int precision,
-                                    int upper) {
-  int exponent = mt_float_exponent(&value);
-  if (precision < 0) {
-    precision = 6;
-  }
-  if (value + mt_decimal_round(precision) >= 10.0) {
-    value *= 0.1;
-    exponent++;
-  }
-  mt_size used = mt_float_fixed(out, value, precision);
-  out[used++] = upper ? 'E' : 'e';
-  out[used++] = exponent < 0 ? '-' : '+';
-  if (exponent < 0) {
-    exponent = -exponent;
-  }
-  char digits[16];
-  mt_size digit_count = mt_unsigned_text(digits, (mt_u64)exponent, 10, 0);
-  if (digit_count < 2) {
-    out[used++] = '0';
-  }
-  memcpy(out + used, digits, digit_count);
-  return used + digit_count;
-}
-
 static mt_size mt_trim_float(char *text, mt_size length) {
   mt_size exponent = length;
   for (mt_size i = 0; i < length; i++) {
@@ -7123,6 +7147,15 @@ static mt_size mt_trim_float(char *text, mt_size length) {
       exponent = i;
       break;
     }
+  }
+  int has_point = 0;
+  for (mt_size i = 0; i < exponent; i++) {
+    if (text[i] == '.') {
+      has_point = 1;
+    }
+  }
+  if (!has_point) {
+    return length;
   }
   mt_size end = exponent;
   while (end && text[end - 1] == '0') {
@@ -7138,6 +7171,215 @@ static mt_size mt_trim_float(char *text, mt_size length) {
   return end;
 }
 
+#define MT_EXACT_LIMBS 96
+#define MT_EXACT_DIGITS 864
+#define MT_FLOAT_TEXT_BYTES 1600
+#define MT_FLOAT_MAX_PRECISION 1100
+
+typedef struct MtExact {
+  char digits[MT_EXACT_DIGITS];
+  int count;
+  int point;
+} MtExact;
+
+static void mt_big_mul(mt_u32 *limbs, int *count, mt_u32 factor) {
+  mt_u64 carry = 0;
+  for (int i = 0; i < *count; i++) {
+    mt_u64 product = (mt_u64)limbs[i] * factor + carry;
+    limbs[i] = (mt_u32)(product % 1000000000u);
+    carry = product / 1000000000u;
+  }
+  while (carry) {
+    limbs[(*count)++] = (mt_u32)(carry % 1000000000u);
+    carry /= 1000000000u;
+  }
+}
+
+static void mt_big_digits(const mt_u32 *limbs, int count, MtExact *x) {
+  char limb_text[10];
+  x->count = 0;
+  for (int i = count - 1; i >= 0; i--) {
+    mt_u32 v = limbs[i];
+    for (int d = 8; d >= 0; d--) {
+      limb_text[d] = (char)('0' + v % 10);
+      v /= 10;
+    }
+    int start = 0;
+    if (i == count - 1) {
+      while (start < 8 && limb_text[start] == '0') {
+        start++;
+      }
+    }
+    for (int d = start; d < 9; d++) {
+      x->digits[x->count++] = limb_text[d];
+    }
+  }
+}
+
+static void mt_exact_decimal(double value, MtExact *x) {
+  mt_u64 bits;
+  memcpy(&bits, &value, sizeof(bits));
+  int biased = (int)((bits >> 52) & 0x7ff);
+  mt_u64 mantissa = bits & 0xfffffffffffffull;
+  int exponent = biased ? biased - 1075 : -1074;
+  if (biased) {
+    mantissa |= 1ull << 52;
+  }
+  if (mantissa == 0) {
+    x->digits[0] = '0';
+    x->count = 1;
+    x->point = 1;
+    return;
+  }
+  mt_u32 limbs[MT_EXACT_LIMBS];
+  int count = 0;
+  while (mantissa) {
+    limbs[count++] = (mt_u32)(mantissa % 1000000000u);
+    mantissa /= 1000000000u;
+  }
+  for (int e = exponent; e > 0; e -= e >= 29 ? 29 : e) {
+    mt_big_mul(limbs, &count, 1u << (e >= 29 ? 29 : e));
+  }
+  for (int e = -exponent; e > 0; e -= e >= 13 ? 13 : e) {
+    mt_u32 factor = 1;
+    for (int i = 0; i < (e >= 13 ? 13 : e); i++) {
+      factor *= 5;
+    }
+    mt_big_mul(limbs, &count, factor);
+  }
+  mt_big_digits(limbs, count, x);
+  x->point = x->count + (exponent < 0 ? exponent : 0);
+  while (x->count > 1 && x->digits[x->count - 1] == '0') {
+    x->count--;
+  }
+}
+
+static int mt_exact_round_up(const MtExact *x, int keep) {
+  if (keep < 0 || keep >= x->count) {
+    return 0;
+  }
+  char next = x->digits[keep];
+  if (next != '5') {
+    return next > '5';
+  }
+  for (int i = keep + 1; i < x->count; i++) {
+    if (x->digits[i] != '0') {
+      return 1;
+    }
+  }
+  return keep > 0 && ((x->digits[keep - 1] - '0') & 1);
+}
+
+static void mt_exact_round(MtExact *x, int keep) {
+  if (keep >= x->count) {
+    return;
+  }
+  if (keep < 0) {
+    x->digits[0] = '0';
+    x->count = 1;
+    return;
+  }
+  int up = mt_exact_round_up(x, keep);
+  x->count = keep;
+  for (int i = keep - 1; up && i >= 0; i--) {
+    if (x->digits[i] == '9') {
+      x->digits[i] = '0';
+    } else {
+      x->digits[i]++;
+      up = 0;
+    }
+  }
+  if (up) {
+    memmove(x->digits + 1, x->digits, (mt_size)x->count);
+    x->digits[0] = '1';
+    x->count++;
+    x->point++;
+  }
+  if (x->count == 0) {
+    x->digits[0] = '0';
+    x->count = 1;
+  }
+}
+
+static char mt_exact_digit(const MtExact *x, int index) {
+  return index >= 0 && index < x->count ? x->digits[index] : '0';
+}
+
+static mt_size mt_exact_fixed(char *out, MtExact x, int precision) {
+  int keep = x.point + precision;
+  int zero = x.count == 1 && x.digits[0] == '0';
+  if (!zero && keep <= 0) {
+    int up = keep == 0 && mt_exact_round_up(&x, 0) && x.digits[0] >= '5';
+    x.digits[0] = up ? '1' : '0';
+    x.count = 1;
+    x.point = up ? 1 - precision : 1;
+    zero = !up;
+  } else {
+    mt_exact_round(&x, keep);
+  }
+  if (zero) {
+    x.point = 1;
+  }
+  mt_size used = 0;
+  int whole = x.point > 0 ? x.point : 1;
+  for (int i = 0; i < whole; i++) {
+    out[used++] = x.point > 0 ? mt_exact_digit(&x, i) : '0';
+  }
+  if (precision > 0) {
+    out[used++] = '.';
+    for (int i = 0; i < precision; i++) {
+      out[used++] = mt_exact_digit(&x, x.point + i);
+    }
+  }
+  return used;
+}
+
+static mt_size mt_exact_exponential(char *out, MtExact x, int precision, int upper) {
+  int zero = x.count == 1 && x.digits[0] == '0';
+  mt_exact_round(&x, precision + 1);
+  mt_size used = 0;
+  out[used++] = x.digits[0];
+  if (precision > 0) {
+    out[used++] = '.';
+    for (int i = 1; i <= precision; i++) {
+      out[used++] = mt_exact_digit(&x, i);
+    }
+  }
+  int exponent = zero ? 0 : x.point - 1;
+  out[used++] = upper ? 'E' : 'e';
+  out[used++] = exponent < 0 ? '-' : '+';
+  if (exponent < 0) {
+    exponent = -exponent;
+  }
+  if (exponent < 10) {
+    out[used++] = '0';
+  }
+  char digits[8];
+  mt_size n = mt_unsigned_text(digits, (mt_u64)exponent, 10, 0);
+  memcpy(out + used, digits, n);
+  return used + n;
+}
+
+static mt_size mt_exact_general(char *out, MtExact x, int precision, int alternate, int upper) {
+  if (precision < 0) {
+    precision = 6;
+  }
+  if (precision == 0) {
+    precision = 1;
+  }
+  int zero = x.count == 1 && x.digits[0] == '0';
+  MtExact rounded = x;
+  mt_exact_round(&rounded, precision);
+  int exponent = zero ? 0 : rounded.point - 1;
+  mt_size length;
+  if (exponent < -4 || exponent >= precision) {
+    length = mt_exact_exponential(out, x, precision - 1, upper);
+  } else {
+    length = mt_exact_fixed(out, x, precision - 1 - exponent);
+  }
+  return alternate ? length : mt_trim_float(out, length);
+}
+
 static mt_size mt_float_text(char *out, double value, char spec,
                              int precision, int alternate, int *negative) {
   int upper = spec == 'F' || spec == 'E' || spec == 'G';
@@ -7148,33 +7390,53 @@ static mt_size mt_float_text(char *out, double value, char spec,
   if (*negative) {
     value = -value;
   }
-  double normalized = value;
-  int exponent = mt_float_exponent(&normalized);
-  mt_size length;
-  if (spec == 'e' || spec == 'E') {
-    length = mt_float_exponential(out, value, precision, upper);
-  } else if (spec == 'g' || spec == 'G') {
-    if (precision < 0) {
-      precision = 6;
-    }
-    if (precision == 0) {
-      precision = 1;
-    }
-    if (exponent < -4 || exponent >= precision) {
-      length = mt_float_exponential(out, value, precision - 1, upper);
-    } else {
-      int places = precision - exponent - 1;
-      length = mt_float_fixed(out, value, places > 0 ? places : 0);
-    }
-    if (!alternate) {
-      length = mt_trim_float(out, length);
-    }
-  } else if (exponent > 18) {
-    length = mt_float_exponential(out, value, precision, upper);
-  } else {
-    length = mt_float_fixed(out, value, precision);
+  if (precision > MT_FLOAT_MAX_PRECISION) {
+    precision = MT_FLOAT_MAX_PRECISION;
   }
-  return length;
+  MtExact x;
+  mt_exact_decimal(value, &x);
+  if (spec == 'e' || spec == 'E') {
+    return mt_exact_exponential(out, x, precision < 0 ? 6 : precision, upper);
+  }
+  if (spec == 'g' || spec == 'G') {
+    return mt_exact_general(out, x, precision, alternate, upper);
+  }
+  return mt_exact_fixed(out, x, precision < 0 ? 6 : precision);
+}
+
+static mt_size mt_number_prefix(char *prefix, char sign, int radix, int upper) {
+  mt_size n = 0;
+  if (sign) {
+    prefix[n++] = sign;
+  }
+  if (radix == 16) {
+    prefix[n++] = '0';
+    prefix[n++] = upper ? 'X' : 'x';
+  } else if (radix == 8) {
+    prefix[n++] = '0';
+  }
+  return n;
+}
+
+static int mt_pointer_style(mt_u64 value, int *precision, int *upper, int *prefix) {
+#if defined(_WIN32)
+  (void)value;
+  *prefix = 0;
+  *upper = 1;
+  *precision = *precision < 16 ? 16 : *precision;
+  return 0;
+#elif defined(__linux__)
+  (void)precision;
+  (void)upper;
+  (void)prefix;
+  return value == 0;
+#else
+  (void)value;
+  (void)precision;
+  (void)upper;
+  (void)prefix;
+  return 0;
+#endif
 }
 
 int vsnprintf(char *buffer, mt_size capacity, const char *format,
@@ -7277,27 +7539,26 @@ int vsnprintf(char *buffer, mt_size capacity, const char *format,
                               : (mt_u64)__builtin_va_arg(arguments, unsigned int);
       }
       unsigned base = spec == 'o' ? 8u : (spec == 'x' || spec == 'X' || spec == 'p') ? 16u : 10u;
+      int pointer_prefix = spec == 'p';
+      int upper = spec == 'X';
+      if (spec == 'p' && mt_pointer_style(value, &precision, &upper, &pointer_prefix)) {
+        mt_format_field(&out, "", 0, "(nil)", 5, width, -1, left, 0);
+        continue;
+      }
       char number[64];
       mt_size number_length = (precision == 0 && value == 0)
                                   ? 0
-                                  : mt_unsigned_text(number, value, base, spec == 'X');
+                                  : mt_unsigned_text(number, value, base, upper);
       char prefix[3];
-      mt_size prefix_length = 0;
-      if (negative) prefix[prefix_length++] = '-';
-      else if (is_signed && plus) prefix[prefix_length++] = '+';
-      else if (is_signed && space) prefix[prefix_length++] = ' ';
-      if (spec == 'p' || (alternate && value && base == 16)) {
-        prefix[prefix_length++] = '0';
-        prefix[prefix_length++] = spec == 'X' ? 'X' : 'x';
-      } else if (alternate && value && base == 8) {
-        prefix[prefix_length++] = '0';
-      }
+      char sign = negative ? '-' : !is_signed ? 0 : plus ? '+' : space ? ' ' : 0;
+      int radix = pointer_prefix || (alternate && value) ? (int)base : 0;
+      mt_size prefix_length = mt_number_prefix(prefix, sign, radix, spec == 'X');
       mt_format_field(&out, prefix, prefix_length, number, number_length, width,
                       precision, left, zero && precision < 0);
     } else if (spec == 'f' || spec == 'F' || spec == 'e' || spec == 'E' ||
                spec == 'g' || spec == 'G') {
       double value = __builtin_va_arg(arguments, double);
-      char number[128];
+      char number[MT_FLOAT_TEXT_BYTES];
       int negative = 0;
       mt_size number_length = mt_float_text(number, value, spec, precision,
                                              alternate, &negative);
@@ -7390,150 +7651,376 @@ static int mt_scan_contains(const char *begin, const char *end, int invert,
   return invert ? !found : found;
 }
 
-int vsscanf(const char *input, const char *format, mt_va_list arguments) {
-  const char *cursor = input;
-  int assigned = 0;
-  while (*format) {
-    if (isspace((mt_u8)*format)) {
-      while (isspace((mt_u8)*format)) format++;
-      while (isspace((mt_u8)*cursor)) cursor++;
-      continue;
-    }
-    if (*format != '%') {
-      if (*cursor != *format) break;
-      cursor++;
-      format++;
-      continue;
-    }
+typedef struct MtScanSource {
+  const char *text;
+  MtFile *stream;
+  mt_size consumed;
+  int peeked;
+  int has_peek;
+} MtScanSource;
+
+static int mt_scan_peek(MtScanSource *src) {
+  if (src->has_peek) {
+    return src->peeked;
+  }
+  int c;
+  if (src->text) {
+    c = src->text[src->consumed] ? (mt_u8)src->text[src->consumed] : -1;
+  } else {
+    mt_u8 byte = 0;
+    c = mt_stream_read(src->stream, &byte, 1) == 1 ? (int)byte : -1;
+  }
+  src->peeked = c;
+  src->has_peek = 1;
+  return c;
+}
+
+static void mt_scan_take(MtScanSource *src) {
+  if (src->has_peek && src->peeked >= 0) {
+    src->consumed++;
+  }
+  src->has_peek = 0;
+}
+
+static void mt_scan_finish(MtScanSource *src) {
+  if (src->stream && src->has_peek && src->peeked >= 0) {
+    src->stream->pushback = src->peeked + 1;
+    src->stream->flags &= ~MT_FILE_EOF;
+  }
+  src->has_peek = 0;
+}
+
+static void mt_scan_skip_space(MtScanSource *src) {
+  while (mt_scan_peek(src) >= 0 && isspace(mt_scan_peek(src))) {
+    mt_scan_take(src);
+  }
+}
+
+typedef struct MtScanSpec {
+  int suppress;
+  int width;
+  int length;
+  char spec;
+  const char *set;
+  const char *set_end;
+  int invert;
+} MtScanSpec;
+
+static const char *mt_scan_parse_spec(const char *format, MtScanSpec *s) {
+  s->suppress = 0;
+  s->width = 0;
+  s->length = 0;
+  if (*format == '*') {
+    s->suppress = 1;
     format++;
-    if (*format == '%') {
-      if (*cursor != '%') break;
-      cursor++;
+  }
+  while (*format >= '0' && *format <= '9') {
+    s->width = s->width * 10 + (*format++ - '0');
+  }
+  if (*format == 'h') {
+    format++;
+    s->length = *format == 'h' ? (format++, -2) : -1;
+  } else if (*format == 'l') {
+    format++;
+    s->length = *format == 'l' ? (format++, 2) : 1;
+  } else if (*format == 'L' || *format == 'q' || *format == 'j' || *format == 'z' || *format == 't') {
+    s->length = *format == 'L' ? 3 : 2;
+    format++;
+  }
+  s->spec = *format ? *format++ : 0;
+  if (s->spec == '[') {
+    s->invert = *format == '^' ? (format++, 1) : 0;
+    s->set = format;
+    if (*format == ']') {
       format++;
-      continue;
     }
-    int suppress = 0;
-    if (*format == '*') {
-      suppress = 1;
+    while (*format && *format != ']') {
       format++;
     }
-    int width = 0;
-    while (*format >= '0' && *format <= '9') {
-      width = width * 10 + (*format++ - '0');
-    }
-    int length = 0;
-    if (*format == 'h') {
+    s->set_end = format;
+    if (*format == ']') {
       format++;
-      length = *format == 'h' ? (format++, -2) : -1;
-    } else if (*format == 'l') {
-      format++;
-      length = *format == 'l' ? (format++, 2) : 1;
-    } else if (*format == 'z' || *format == 't' || *format == 'j') {
-      format++;
-      length = 2;
-    }
-    char spec = *format ? *format++ : 0;
-    if (spec != 'c' && spec != '[' && spec != 'n') {
-      while (isspace((mt_u8)*cursor)) cursor++;
-    }
-    if (spec == 'n') {
-      if (!suppress) {
-        mt_size count = (mt_size)(cursor - input);
-        if (length >= 2) *__builtin_va_arg(arguments, mt_i64 *) = (mt_i64)count;
-        else if (length == 1) *__builtin_va_arg(arguments, long *) = (long)count;
-        else *__builtin_va_arg(arguments, int *) = (int)count;
-      }
-      continue;
-    }
-    if (spec == 's' || spec == 'c') {
-      int limit = width ? width : (spec == 'c' ? 1 : 0x7fffffff);
-      const char *start = cursor;
-      while (*cursor && limit > 0 && (spec == 'c' || !isspace((mt_u8)*cursor))) {
-        cursor++;
-        limit--;
-      }
-      if (cursor == start) break;
-      if (!suppress) {
-        char *out = __builtin_va_arg(arguments, char *);
-        mt_size count = (mt_size)(cursor - start);
-        memcpy(out, start, count);
-        if (spec == 's') out[count] = 0;
-        assigned++;
-      }
-    } else if (spec == '[') {
-      int invert = 0;
-      if (*format == '^') {
-        invert = 1;
-        format++;
-      }
-      const char *set = format;
-      if (*format == ']') format++;
-      while (*format && *format != ']') format++;
-      const char *set_end = format;
-      if (*format == ']') format++;
-      int limit = width ? width : 0x7fffffff;
-      const char *start = cursor;
-      while (*cursor && limit-- > 0 &&
-             mt_scan_contains(set, set_end, invert, *cursor)) cursor++;
-      if (cursor == start) break;
-      if (!suppress) {
-        char *out = __builtin_va_arg(arguments, char *);
-        mt_size count = (mt_size)(cursor - start);
-        memcpy(out, start, count);
-        out[count] = 0;
-        assigned++;
-      }
-    } else if (spec == 'd' || spec == 'i' || spec == 'u' || spec == 'x' || spec == 'X' || spec == 'o') {
-      const char *start = cursor;
-      int negative = 0;
-      if ((*cursor == '-' || *cursor == '+') && (!width || cursor - start < width)) {
-        negative = *cursor++ == '-';
-      }
-      unsigned base = spec == 'o' ? 8u : (spec == 'x' || spec == 'X') ? 16u : 10u;
-      if (spec == 'i') base = 0;
-      if ((base == 0 || base == 16) && cursor[0] == '0' &&
-          (cursor[1] == 'x' || cursor[1] == 'X')) {
-        cursor += 2;
-        base = 16;
-      } else if (base == 0) {
-        base = cursor[0] == '0' ? 8u : 10u;
-      }
-      mt_u64 value = 0;
-      int digits = 0;
-      while (*cursor && (!width || cursor - start < width)) {
-        int digit = mt_digit_value(*cursor);
-        if (digit < 0 || (unsigned)digit >= base) break;
-        value = value * base + (unsigned)digit;
-        cursor++;
-        digits++;
-      }
-      if (!digits) {
-        cursor = start;
-        break;
-      }
-      if (!suppress) {
-        if (spec == 'd' || spec == 'i') {
-          mt_i64 signed_value = negative ? -(mt_i64)value : (mt_i64)value;
-          if (length >= 2) *__builtin_va_arg(arguments, mt_i64 *) = signed_value;
-          else if (length == 1) *__builtin_va_arg(arguments, long *) = (long)signed_value;
-          else if (length == -1) *__builtin_va_arg(arguments, short *) = (short)signed_value;
-          else if (length == -2) *__builtin_va_arg(arguments, signed char *) = (signed char)signed_value;
-          else *__builtin_va_arg(arguments, int *) = (int)signed_value;
-        } else {
-          if (negative) value = (mt_u64)(-(mt_i64)value);
-          if (length >= 2) *__builtin_va_arg(arguments, mt_u64 *) = value;
-          else if (length == 1) *__builtin_va_arg(arguments, unsigned long *) = (unsigned long)value;
-          else if (length == -1) *__builtin_va_arg(arguments, unsigned short *) = (unsigned short)value;
-          else if (length == -2) *__builtin_va_arg(arguments, unsigned char *) = (unsigned char)value;
-          else *__builtin_va_arg(arguments, unsigned int *) = (unsigned int)value;
-        }
-        assigned++;
-      }
-    } else {
-      break;
     }
   }
+  return format;
+}
+
+static void mt_scan_store_int(MtScanSpec *s, mt_va_list *ap, mt_u64 value, int is_signed) {
+  if (s->length >= 2) {
+    *__builtin_va_arg(*ap, mt_u64 *) = value;
+  } else if (s->length == 1) {
+    *__builtin_va_arg(*ap, unsigned long *) = (unsigned long)value;
+  } else if (s->length == -1) {
+    *__builtin_va_arg(*ap, unsigned short *) = (unsigned short)value;
+  } else if (s->length == -2) {
+    *__builtin_va_arg(*ap, unsigned char *) = (unsigned char)value;
+  } else {
+    *__builtin_va_arg(*ap, unsigned int *) = (unsigned int)value;
+  }
+  (void)is_signed;
+}
+
+static int mt_scan_int(MtScanSource *src, MtScanSpec *s, mt_va_list *ap) {
+  int limit = s->width ? s->width : 0x7fffffff;
+  int negative = 0;
+  int c = mt_scan_peek(src);
+  if ((c == '-' || c == '+') && limit > 0) {
+    negative = c == '-';
+    mt_scan_take(src);
+    limit--;
+  }
+  unsigned base = s->spec == 'o' ? 8u : (s->spec == 'x' || s->spec == 'X' || s->spec == 'p') ? 16u
+                  : s->spec == 'i' ? 0u : 10u;
+  int digits = 0;
+  if ((base == 0 || base == 16) && limit > 0 && mt_scan_peek(src) == '0') {
+    mt_scan_take(src);
+    limit--;
+    digits = 1;
+    c = mt_scan_peek(src);
+    if (limit > 0 && (c == 'x' || c == 'X')) {
+      mt_scan_take(src);
+      limit--;
+      base = 16;
+      digits = 0;
+    } else if (base == 0) {
+      base = 8;
+    }
+  }
+  if (base == 0) {
+    base = 10;
+  }
+  mt_u64 value = 0;
+  while (limit > 0) {
+    int d = mt_scan_peek(src) >= 0 ? mt_digit_value((char)mt_scan_peek(src)) : -1;
+    if (d < 0 || (unsigned)d >= base) {
+      break;
+    }
+    value = value * base + (unsigned)d;
+    mt_scan_take(src);
+    limit--;
+    digits++;
+  }
+  if (!digits) {
+    return 0;
+  }
+  if (negative) {
+    value = (mt_u64)(-(mt_i64)value);
+  }
+  if (!s->suppress && s->spec == 'p') {
+    *__builtin_va_arg(*ap, void **) = (void *)(mt_size)value;
+  } else if (!s->suppress) {
+    mt_scan_store_int(s, ap, value, s->spec == 'd' || s->spec == 'i');
+  }
+  return 1;
+}
+
+static int mt_scan_float_char(int c, int at, char *buf, int *seen_exp, int *seen_dot) {
+  if (c >= '0' && c <= '9') {
+    return 1;
+  }
+  if ((c == '+' || c == '-') && (at == 0 || buf[at - 1] == 'e' || buf[at - 1] == 'E')) {
+    return 1;
+  }
+  if (c == '.' && !*seen_dot && !*seen_exp) {
+    *seen_dot = 1;
+    return 1;
+  }
+  if ((c == 'e' || c == 'E') && !*seen_exp && at > 0) {
+    *seen_exp = 1;
+    return 1;
+  }
+  return 0;
+}
+
+static int mt_scan_float(MtScanSource *src, MtScanSpec *s, mt_va_list *ap) {
+  char buf[128];
+  int n = 0;
+  int limit = s->width ? s->width : 127;
+  int seen_exp = 0, seen_dot = 0;
+  while (n < limit && n < 127) {
+    int c = mt_scan_peek(src);
+    if (c < 0 || !mt_scan_float_char(c, n, buf, &seen_exp, &seen_dot)) {
+      break;
+    }
+    buf[n++] = (char)c;
+    mt_scan_take(src);
+  }
+  buf[n] = 0;
+  if (n == 0 || (n == 1 && (buf[0] == '+' || buf[0] == '-' || buf[0] == '.'))) {
+    return 0;
+  }
+  double value = strtod(buf, MT_NULL);
+  if (!s->suppress) {
+    if (s->length >= 1) {
+      *__builtin_va_arg(*ap, double *) = value;
+    } else {
+      *__builtin_va_arg(*ap, float *) = (float)value;
+    }
+  }
+  return 1;
+}
+
+static int mt_scan_chars(MtScanSource *src, MtScanSpec *s, mt_va_list *ap) {
+  int limit = s->width ? s->width : (s->spec == 'c' ? 1 : 0x7fffffff);
+  char *out = s->suppress ? MT_NULL : __builtin_va_arg(*ap, char *);
+  int count = 0;
+  while (limit > 0) {
+    int c = mt_scan_peek(src);
+    if (c < 0) {
+      break;
+    }
+    if (s->spec == 's' && isspace(c)) {
+      break;
+    }
+    if (s->spec == '[' && !mt_scan_contains(s->set, s->set_end, s->invert, (char)c)) {
+      break;
+    }
+    if (out) {
+      out[count] = (char)c;
+    }
+    count++;
+    limit--;
+    mt_scan_take(src);
+  }
+  if (count == 0) {
+    return 0;
+  }
+  if (out && s->spec != 'c') {
+    out[count] = 0;
+  }
+  return 1;
+}
+
+static int mt_scan_store_count(MtScanSource *src, MtScanSpec *s, mt_va_list *ap) {
+  if (!s->suppress) {
+    mt_scan_store_int(s, ap, (mt_u64)src->consumed, 1);
+  }
+  return 1;
+}
+
+static int mt_scan_one(MtScanSource *src, MtScanSpec *s, mt_va_list *ap) {
+  if (s->spec != 'c' && s->spec != '[' && s->spec != 'n') {
+    mt_scan_skip_space(src);
+  }
+  switch (s->spec) {
+  case 'n':
+    return mt_scan_store_count(src, s, ap);
+  case 's':
+  case 'c':
+  case '[':
+    return mt_scan_chars(src, s, ap);
+  case 'd':
+  case 'i':
+  case 'u':
+  case 'x':
+  case 'X':
+  case 'o':
+  case 'p':
+    return mt_scan_int(src, s, ap);
+  case 'f':
+  case 'F':
+  case 'e':
+  case 'E':
+  case 'g':
+  case 'G':
+  case 'a':
+  case 'A':
+    return mt_scan_float(src, s, ap);
+  default:
+    return 0;
+  }
+}
+
+static int mt_scan_literal(MtScanSource *src, char want) {
+  if (mt_scan_peek(src) != (mt_u8)want) {
+    return 0;
+  }
+  mt_scan_take(src);
+  return 1;
+}
+
+static int mt_scan_engine(MtScanSource *src, const char *format, mt_va_list arguments) {
+  int assigned = 0;
+  int matched_any = 0;
+  int input_failure = 0;
+  mt_va_list ap;
+  __builtin_va_copy(ap, arguments);
+  while (*format) {
+    if (isspace((mt_u8)*format)) {
+      while (isspace((mt_u8)*format)) {
+        format++;
+      }
+      mt_scan_skip_space(src);
+      continue;
+    }
+    if (*format != '%' || format[1] == '%') {
+      format += *format == '%' ? 1 : 0;
+      if (*format == '%') {
+        mt_scan_skip_space(src);
+      }
+      if (!mt_scan_literal(src, *format)) {
+        break;
+      }
+      format++;
+      matched_any = 1;
+      continue;
+    }
+    MtScanSpec spec;
+    format = mt_scan_parse_spec(format + 1, &spec);
+    if (spec.spec != 'n') {
+      if (spec.spec != 'c' && spec.spec != '[') {
+        mt_scan_skip_space(src);
+      }
+      if (mt_scan_peek(src) < 0) {
+        input_failure = 1;
+        break;
+      }
+    }
+    if (!mt_scan_one(src, &spec, &ap)) {
+      break;
+    }
+    matched_any = 1;
+    if (!spec.suppress && spec.spec != 'n') {
+      assigned++;
+    }
+  }
+  __builtin_va_end(ap);
+  mt_scan_finish(src);
+  if (input_failure && assigned == 0 && !matched_any) {
+    return -1;
+  }
   return assigned;
+}
+
+int vsscanf(const char *input, const char *format, mt_va_list arguments) {
+  MtScanSource src = {input, MT_NULL, 0, 0, 0};
+  return mt_scan_engine(&src, format, arguments);
+}
+
+int vfscanf(void *stream, const char *format, mt_va_list arguments) {
+  MtScanSource src = {MT_NULL, (MtFile *)stream, 0, 0, 0};
+  if (!stream) {
+    return -1;
+  }
+  return mt_scan_engine(&src, format, arguments);
+}
+
+int vscanf(const char *format, mt_va_list arguments) { return vfscanf(stdin, format, arguments); }
+
+int fscanf(void *stream, const char *format, ...) {
+  mt_va_list arguments;
+  __builtin_va_start(arguments, format);
+  int result = vfscanf(stream, format, arguments);
+  __builtin_va_end(arguments);
+  return result;
+}
+
+int scanf(const char *format, ...) {
+  mt_va_list arguments;
+  __builtin_va_start(arguments, format);
+  int result = vfscanf(stdin, format, arguments);
+  __builtin_va_end(arguments);
+  return result;
 }
 
 int sscanf(const char *input, const char *format, ...) {
@@ -7747,3 +8234,738 @@ mt_i128 __modti3(mt_i128 numerator, mt_i128 denominator) {
 MT_NORETURN void abort(void) { exit(134); }
 
 void __stack_chk_fail(void) { abort(); }
+
+long strtol(const char *text, char **end, int base) {
+  mt_i64 value = strtoll(text, end, base);
+  if (sizeof(long) == 4 && (value > 2147483647LL || value < -2147483647LL - 1)) {
+    mt_errno_value = 34;
+    return value > 0 ? 2147483647L : -2147483647L - 1;
+  }
+  return (long)value;
+}
+
+float strtof(const char *text, char **end) { return (float)strtod(text, end); }
+
+double strtold(const char *text, char **end) { return strtod(text, end); }
+
+mt_i64 strtoimax(const char *text, char **end, int base) { return strtoll(text, end, base); }
+
+mt_u64 strtoumax(const char *text, char **end, int base) { return strtoull(text, end, base); }
+
+int abs(int n) { return n < 0 ? -n : n; }
+
+long labs(long n) { return n < 0 ? -n : n; }
+
+mt_i64 llabs(mt_i64 n) { return n < 0 ? -n : n; }
+
+mt_i64 imaxabs(mt_i64 n) { return n < 0 ? -n : n; }
+
+typedef struct {
+  int quot;
+  int rem;
+} mt_div_t;
+
+typedef struct {
+  long quot;
+  long rem;
+} mt_ldiv_t;
+
+typedef struct {
+  mt_i64 quot;
+  mt_i64 rem;
+} mt_lldiv_t;
+
+mt_div_t div(int numerator, int denominator) {
+  mt_div_t r = {numerator / denominator, numerator % denominator};
+  return r;
+}
+
+mt_ldiv_t ldiv(long numerator, long denominator) {
+  mt_ldiv_t r = {numerator / denominator, numerator % denominator};
+  return r;
+}
+
+mt_lldiv_t lldiv(mt_i64 numerator, mt_i64 denominator) {
+  mt_lldiv_t r = {numerator / denominator, numerator % denominator};
+  return r;
+}
+
+static void (*mt_atexit_table[64])(void);
+static int mt_atexit_count;
+
+int atexit(void (*function)(void)) {
+  if (!function || mt_atexit_count >= 64) {
+    return -1;
+  }
+  mt_atexit_table[mt_atexit_count++] = function;
+  return 0;
+}
+
+void mt_run_atexit(void) {
+  while (mt_atexit_count > 0) {
+    void (*function)(void) = mt_atexit_table[--mt_atexit_count];
+    function();
+  }
+}
+
+void *aligned_alloc(mt_size alignment, mt_size size) {
+  if (alignment > 16) {
+    mt_errno_value = 22;
+    return MT_NULL;
+  }
+  return malloc(size ? size : 1);
+}
+
+int mblen(const char *s, mt_size n) {
+  if (!s || n == 0) {
+    return 0;
+  }
+  mt_u8 c = (mt_u8)s[0];
+  if (c == 0) {
+    return 0;
+  }
+  int len = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : -1;
+  return (mt_size)len > n ? -1 : len;
+}
+
+char *strncat(char *dest, const char *src, mt_size n) {
+  char *out = dest + strlen(dest);
+  while (n-- > 0 && *src) {
+    *out++ = *src++;
+  }
+  *out = 0;
+  return dest;
+}
+
+int strcoll(const char *a, const char *b) { return strcmp(a, b); }
+
+mt_size strxfrm(char *dest, const char *src, mt_size n) {
+  mt_size len = strlen(src);
+  if (n > 0) {
+    mt_size copy = len < n - 1 ? len : n - 1;
+    memcpy(dest, src, copy);
+    dest[copy] = 0;
+  }
+  return len;
+}
+
+mt_size strspn(const char *s, const char *accept) {
+  mt_size i = 0;
+  while (s[i] && strchr(accept, s[i])) {
+    i++;
+  }
+  return i;
+}
+
+mt_size strcspn(const char *s, const char *reject) {
+  mt_size i = 0;
+  while (s[i] && !strchr(reject, s[i])) {
+    i++;
+  }
+  return i;
+}
+
+mt_size strnlen(const char *s, mt_size n) {
+  mt_size i = 0;
+  while (i < n && s[i]) {
+    i++;
+  }
+  return i;
+}
+
+char *strndup(const char *s, mt_size n) {
+  mt_size len = strnlen(s, n);
+  char *out = (char *)malloc(len + 1);
+  if (out) {
+    memcpy(out, s, len);
+    out[len] = 0;
+  }
+  return out;
+}
+
+int strncasecmp(const char *a, const char *b, mt_size n) {
+  for (mt_size i = 0; i < n; i++) {
+    int ca = tolower((mt_u8)a[i]);
+    int cb = tolower((mt_u8)b[i]);
+    if (ca != cb || ca == 0) {
+      return ca - cb;
+    }
+  }
+  return 0;
+}
+
+int isblank(int c) { return c == ' ' || c == '\t'; }
+
+int vprintf(const char *format, mt_va_list arguments) { return vfprintf(stdout, format, arguments); }
+
+int vsprintf(char *buffer, const char *format, mt_va_list arguments) {
+  return vsnprintf(buffer, (mt_size)0x7fffffff, format, arguments);
+}
+
+typedef struct MtTm {
+  int tm_sec;
+  int tm_min;
+  int tm_hour;
+  int tm_mday;
+  int tm_mon;
+  int tm_year;
+  int tm_wday;
+  int tm_yday;
+  int tm_isdst;
+} MtTm;
+
+mt_i64 time(mt_i64 *out) {
+  mt_i64 value[2] = {0, 0};
+  mt_i64 seconds = gettimeofday(value, MT_NULL) == 0 ? value[0] : -1;
+  if (out) {
+    *out = seconds;
+  }
+  return seconds;
+}
+
+double difftime(mt_i64 end, mt_i64 start) { return (double)(end - start); }
+
+static mt_i64 mt_days_from_civil(mt_i64 y, int m, int d) {
+  y -= m <= 2;
+  mt_i64 era = (y >= 0 ? y : y - 399) / 400;
+  mt_i64 yoe = y - era * 400;
+  mt_i64 doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  mt_i64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+static void mt_civil_from_days(mt_i64 z, mt_i64 *y, int *m, int *d) {
+  z += 719468;
+  mt_i64 era = (z >= 0 ? z : z - 146096) / 146097;
+  mt_i64 doe = z - era * 146097;
+  mt_i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  mt_i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  mt_i64 mp = (5 * doy + 2) / 153;
+  *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+  *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+  *y = yoe + era * 400 + (*m <= 2);
+}
+
+static int mt_is_leap(mt_i64 y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+
+static MtTm mt_tm_buffer;
+
+MtTm *gmtime(const mt_i64 *t) {
+  if (!t) {
+    return MT_NULL;
+  }
+  mt_i64 secs = *t;
+  mt_i64 days = secs >= 0 ? secs / 86400 : (secs - 86399) / 86400;
+  mt_i64 rem = secs - days * 86400;
+  mt_i64 y;
+  int m, d;
+  mt_civil_from_days(days, &y, &m, &d);
+  MtTm *tm = &mt_tm_buffer;
+  tm->tm_sec = (int)(rem % 60);
+  tm->tm_min = (int)(rem / 60 % 60);
+  tm->tm_hour = (int)(rem / 3600);
+  tm->tm_mday = d;
+  tm->tm_mon = m - 1;
+  tm->tm_year = (int)(y - 1900);
+  tm->tm_wday = (int)((days % 7 + 11) % 7);
+  tm->tm_yday = (int)(days - mt_days_from_civil(y, 1, 1));
+  tm->tm_isdst = 0;
+  return tm;
+}
+
+MtTm *localtime(const mt_i64 *t) { return gmtime(t); }
+
+mt_i64 mktime(MtTm *tm) {
+  mt_i64 year = tm->tm_year + 1900 + tm->tm_mon / 12;
+  int mon = tm->tm_mon % 12;
+  if (mon < 0) {
+    mon += 12;
+    year--;
+  }
+  mt_i64 days = mt_days_from_civil(year, mon + 1, 1) + tm->tm_mday - 1;
+  mt_i64 secs = days * 86400 + (mt_i64)tm->tm_hour * 3600 + (mt_i64)tm->tm_min * 60 + tm->tm_sec;
+  MtTm *norm = gmtime(&secs);
+  *tm = *norm;
+  return secs;
+}
+
+static const char *mt_day_names[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+static const char *mt_month_names[] = {"January", "February", "March",     "April",   "May",      "June",
+                                       "July",    "August",   "September", "October", "November", "December"};
+
+static mt_size mt_put_text(char *out, mt_size at, mt_size cap, const char *text) {
+  while (*text) {
+    if (at + 1 < cap) {
+      out[at] = *text;
+    }
+    at++;
+    text++;
+  }
+  return at;
+}
+
+static mt_size mt_put_number(char *out, mt_size at, mt_size cap, mt_i64 value, int width, char pad) {
+  char digits[24];
+  int n = 0;
+  int negative = value < 0;
+  mt_u64 v = negative ? (mt_u64)(-value) : (mt_u64)value;
+  do {
+    digits[n++] = (char)('0' + v % 10);
+    v /= 10;
+  } while (v);
+  if (negative) {
+    at = mt_put_text(out, at, cap, "-");
+  }
+  for (int i = n; i < width; i++) {
+    char p[2] = {pad, 0};
+    at = mt_put_text(out, at, cap, p);
+  }
+  while (n > 0) {
+    char c[2] = {digits[--n], 0};
+    at = mt_put_text(out, at, cap, c);
+  }
+  return at;
+}
+
+static mt_size mt_strftime_short(char *out, mt_size at, mt_size cap, const char *name) {
+  char three[4] = {name[0], name[1], name[2], 0};
+  return mt_put_text(out, at, cap, three);
+}
+
+static mt_size mt_strftime_composite(char *out, mt_size at, mt_size cap, char spec, const MtTm *tm);
+
+static mt_size mt_strftime_one(char *out, mt_size at, mt_size cap, char spec, const MtTm *tm) {
+  int hour12 = tm->tm_hour % 12 == 0 ? 12 : tm->tm_hour % 12;
+  switch (spec) {
+  case 'a':
+    return mt_strftime_short(out, at, cap, mt_day_names[tm->tm_wday % 7]);
+  case 'A':
+    return mt_put_text(out, at, cap, mt_day_names[tm->tm_wday % 7]);
+  case 'b':
+  case 'h':
+    return mt_strftime_short(out, at, cap, mt_month_names[tm->tm_mon % 12]);
+  case 'B':
+    return mt_put_text(out, at, cap, mt_month_names[tm->tm_mon % 12]);
+  case 'd':
+    return mt_put_number(out, at, cap, tm->tm_mday, 2, '0');
+  case 'e':
+    return mt_put_number(out, at, cap, tm->tm_mday, 2, ' ');
+  case 'H':
+    return mt_put_number(out, at, cap, tm->tm_hour, 2, '0');
+  case 'I':
+    return mt_put_number(out, at, cap, hour12, 2, '0');
+  case 'j':
+    return mt_put_number(out, at, cap, tm->tm_yday + 1, 3, '0');
+  case 'm':
+    return mt_put_number(out, at, cap, tm->tm_mon + 1, 2, '0');
+  case 'M':
+    return mt_put_number(out, at, cap, tm->tm_min, 2, '0');
+  case 'p':
+    return mt_put_text(out, at, cap, tm->tm_hour < 12 ? "AM" : "PM");
+  case 'S':
+    return mt_put_number(out, at, cap, tm->tm_sec, 2, '0');
+  case 'w':
+    return mt_put_number(out, at, cap, tm->tm_wday, 1, '0');
+  case 'y':
+    return mt_put_number(out, at, cap, (tm->tm_year + 1900) % 100, 2, '0');
+  case 'Y':
+    return mt_put_number(out, at, cap, tm->tm_year + 1900, 1, '0');
+  case 'Z':
+    return mt_put_text(out, at, cap, "UTC");
+  case 'z':
+    return mt_put_text(out, at, cap, "+0000");
+  case 'n':
+    return mt_put_text(out, at, cap, "\n");
+  case 't':
+    return mt_put_text(out, at, cap, "\t");
+  case '%':
+    return mt_put_text(out, at, cap, "%");
+  default:
+    return mt_strftime_composite(out, at, cap, spec, tm);
+  }
+}
+
+static mt_size mt_strftime_composite(char *out, mt_size at, mt_size cap, char spec, const MtTm *tm) {
+  const char *pattern = spec == 'c' ? "a b e H:M:S Y" : spec == 'D' || spec == 'x' ? "m/d/y"
+                        : spec == 'F' ? "Y-m-d" : spec == 'T' || spec == 'X' ? "H:M:S"
+                        : spec == 'R' ? "H:M" : spec == 'r' ? "I:M:S p" : MT_NULL;
+  if (!pattern) {
+    char raw[3] = {'%', spec, 0};
+    return mt_put_text(out, at, cap, raw);
+  }
+  for (const char *p = pattern; *p; p++) {
+    if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) {
+      at = mt_strftime_one(out, at, cap, *p, tm);
+    } else {
+      char c[2] = {*p, 0};
+      at = mt_put_text(out, at, cap, c);
+    }
+  }
+  return at;
+}
+
+mt_size strftime(char *out, mt_size cap, const char *format, const MtTm *tm) {
+  mt_size at = 0;
+  for (const char *p = format; *p; p++) {
+    if (*p != '%' || !p[1]) {
+      char c[2] = {*p, 0};
+      at = mt_put_text(out, at, cap, c);
+      continue;
+    }
+    p++;
+    while (*p == 'E' || *p == 'O' || *p == '-' || *p == '_' || *p == '0') {
+      p++;
+    }
+    at = mt_strftime_one(out, at, cap, *p, tm);
+  }
+  if (at >= cap) {
+    if (cap) {
+      out[0] = 0;
+    }
+    return 0;
+  }
+  out[at] = 0;
+  return at;
+}
+
+static char mt_asctime_buffer[32];
+
+char *asctime(const MtTm *tm) {
+  strftime(mt_asctime_buffer, sizeof(mt_asctime_buffer), "%a %b %e %H:%M:%S %Y\n", tm);
+  return mt_asctime_buffer;
+}
+
+char *ctime(const mt_i64 *t) { return asctime(localtime(t)); }
+
+typedef void (*mt_signal_handler)(int);
+
+static mt_signal_handler mt_signal_table[32];
+
+mt_signal_handler signal(int sig, mt_signal_handler handler) {
+  if (sig < 0 || sig >= 32) {
+    mt_errno_value = 22;
+    return (mt_signal_handler)(mt_size)-1;
+  }
+  mt_signal_handler old = mt_signal_table[sig];
+  mt_signal_table[sig] = handler;
+  return old;
+}
+
+int raise(int sig) {
+  if (sig < 0 || sig >= 32) {
+    return -1;
+  }
+  mt_signal_handler handler = mt_signal_table[sig];
+  if (handler == (mt_signal_handler)(mt_size)1) {
+    return 0;
+  }
+  if (!handler) {
+    exit(128 + sig);
+  }
+  mt_signal_table[sig] = MT_NULL;
+  handler(sig);
+  return 0;
+}
+
+typedef struct MtLconv {
+  char *decimal_point;
+  char *thousands_sep;
+  char *grouping;
+  char *int_curr_symbol;
+  char *currency_symbol;
+  char *mon_decimal_point;
+  char *mon_thousands_sep;
+  char *mon_grouping;
+  char *positive_sign;
+  char *negative_sign;
+  char frac[8];
+} MtLconv;
+
+static MtLconv mt_c_locale = {".", "", "", "", "", "", "", "", "", "", {127, 127, 127, 127, 127, 127, 127, 127}};
+
+char *setlocale(int category, const char *locale) {
+  (void)category;
+  if (!locale || !*locale || strcmp(locale, "C") == 0 || strcmp(locale, "POSIX") == 0) {
+    return (char *)"C";
+  }
+  return MT_NULL;
+}
+
+MtLconv *localeconv(void) { return &mt_c_locale; }
+
+#if defined(_WIN32)
+typedef unsigned short mt_wchar;
+#else
+typedef int mt_wchar;
+#endif
+
+mt_size wcslen(const mt_wchar *s) {
+  mt_size n = 0;
+  while (s[n]) {
+    n++;
+  }
+  return n;
+}
+
+mt_wchar *wcscpy(mt_wchar *dest, const mt_wchar *src) {
+  mt_size i = 0;
+  do {
+    dest[i] = src[i];
+  } while (src[i++]);
+  return dest;
+}
+
+int wcscmp(const mt_wchar *a, const mt_wchar *b) {
+  while (*a && *a == *b) {
+    a++;
+    b++;
+  }
+  return *a < *b ? -1 : *a > *b ? 1 : 0;
+}
+
+int wcsncmp(const mt_wchar *a, const mt_wchar *b, mt_size n) {
+  for (mt_size i = 0; i < n; i++) {
+    if (a[i] != b[i]) {
+      return a[i] < b[i] ? -1 : 1;
+    }
+    if (!a[i]) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+mt_wchar *wcsncpy(mt_wchar *dest, const mt_wchar *src, mt_size n) {
+  mt_size i = 0;
+  for (; i < n && src[i]; i++) {
+    dest[i] = src[i];
+  }
+  for (; i < n; i++) {
+    dest[i] = 0;
+  }
+  return dest;
+}
+
+mt_wchar *wcscat(mt_wchar *dest, const mt_wchar *src) {
+  wcscpy(dest + wcslen(dest), src);
+  return dest;
+}
+
+mt_wchar *wcsncat(mt_wchar *dest, const mt_wchar *src, mt_size n) {
+  mt_wchar *end = dest + wcslen(dest);
+  mt_size i = 0;
+  for (; i < n && src[i]; i++) {
+    end[i] = src[i];
+  }
+  end[i] = 0;
+  return dest;
+}
+
+mt_wchar *wcschr(const mt_wchar *s, mt_wchar c) {
+  for (;; s++) {
+    if (*s == c) {
+      return (mt_wchar *)s;
+    }
+    if (!*s) {
+      return MT_NULL;
+    }
+  }
+}
+
+mt_wchar *wcsrchr(const mt_wchar *s, mt_wchar c) {
+  const mt_wchar *last = MT_NULL;
+  for (;; s++) {
+    if (*s == c) {
+      last = s;
+    }
+    if (!*s) {
+      return (mt_wchar *)last;
+    }
+  }
+}
+
+mt_wchar *wcsstr(const mt_wchar *haystack, const mt_wchar *needle) {
+  mt_size n = wcslen(needle);
+  for (; *haystack; haystack++) {
+    if (wcsncmp(haystack, needle, n) == 0) {
+      return (mt_wchar *)haystack;
+    }
+  }
+  return n == 0 ? (mt_wchar *)haystack : MT_NULL;
+}
+
+mt_wchar *wmemcpy(mt_wchar *dest, const mt_wchar *src, mt_size n) {
+  for (mt_size i = 0; i < n; i++) {
+    dest[i] = src[i];
+  }
+  return dest;
+}
+
+mt_wchar *wmemmove(mt_wchar *dest, const mt_wchar *src, mt_size n) {
+  if (dest < src) {
+    return wmemcpy(dest, src, n);
+  }
+  for (mt_size i = n; i > 0; i--) {
+    dest[i - 1] = src[i - 1];
+  }
+  return dest;
+}
+
+mt_wchar *wmemset(mt_wchar *dest, mt_wchar c, mt_size n) {
+  for (mt_size i = 0; i < n; i++) {
+    dest[i] = c;
+  }
+  return dest;
+}
+
+int wmemcmp(const mt_wchar *a, const mt_wchar *b, mt_size n) {
+  for (mt_size i = 0; i < n; i++) {
+    if (a[i] != b[i]) {
+      return a[i] < b[i] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+mt_wchar *wmemchr(const mt_wchar *s, mt_wchar c, mt_size n) {
+  for (mt_size i = 0; i < n; i++) {
+    if (s[i] == c) {
+      return (mt_wchar *)(s + i);
+    }
+  }
+  return MT_NULL;
+}
+
+#if defined(__x86_64__) && defined(_WIN32)
+__asm__(".text\n"
+        ".globl mettle_setjmp\n"
+        ".def mettle_setjmp; .scl 2; .type 32; .endef\n"
+        "mettle_setjmp:\n"
+        "  movq %rbx, 0(%rcx)\n"
+        "  movq %rbp, 8(%rcx)\n"
+        "  movq %rdi, 16(%rcx)\n"
+        "  movq %rsi, 24(%rcx)\n"
+        "  movq %r12, 32(%rcx)\n"
+        "  movq %r13, 40(%rcx)\n"
+        "  movq %r14, 48(%rcx)\n"
+        "  movq %r15, 56(%rcx)\n"
+        "  leaq 8(%rsp), %rdx\n"
+        "  movq %rdx, 64(%rcx)\n"
+        "  movq (%rsp), %rdx\n"
+        "  movq %rdx, 72(%rcx)\n"
+        "  movdqu %xmm6, 80(%rcx)\n"
+        "  movdqu %xmm7, 96(%rcx)\n"
+        "  movdqu %xmm8, 112(%rcx)\n"
+        "  movdqu %xmm9, 128(%rcx)\n"
+        "  movdqu %xmm10, 144(%rcx)\n"
+        "  movdqu %xmm11, 160(%rcx)\n"
+        "  movdqu %xmm12, 176(%rcx)\n"
+        "  movdqu %xmm13, 192(%rcx)\n"
+        "  movdqu %xmm14, 208(%rcx)\n"
+        "  movdqu %xmm15, 224(%rcx)\n"
+        "  xorl %eax, %eax\n"
+        "  ret\n"
+        ".globl mettle_longjmp\n"
+        ".def mettle_longjmp; .scl 2; .type 32; .endef\n"
+        "mettle_longjmp:\n"
+        "  movl %edx, %eax\n"
+        "  testl %eax, %eax\n"
+        "  jnz 1f\n"
+        "  movl $1, %eax\n"
+        "1:\n"
+        "  movq 0(%rcx), %rbx\n"
+        "  movq 8(%rcx), %rbp\n"
+        "  movq 16(%rcx), %rdi\n"
+        "  movq 24(%rcx), %rsi\n"
+        "  movq 32(%rcx), %r12\n"
+        "  movq 40(%rcx), %r13\n"
+        "  movq 48(%rcx), %r14\n"
+        "  movq 56(%rcx), %r15\n"
+        "  movdqu 80(%rcx), %xmm6\n"
+        "  movdqu 96(%rcx), %xmm7\n"
+        "  movdqu 112(%rcx), %xmm8\n"
+        "  movdqu 128(%rcx), %xmm9\n"
+        "  movdqu 144(%rcx), %xmm10\n"
+        "  movdqu 160(%rcx), %xmm11\n"
+        "  movdqu 176(%rcx), %xmm12\n"
+        "  movdqu 192(%rcx), %xmm13\n"
+        "  movdqu 208(%rcx), %xmm14\n"
+        "  movdqu 224(%rcx), %xmm15\n"
+        "  movq 64(%rcx), %rsp\n"
+        "  jmpq *72(%rcx)\n");
+#elif defined(__x86_64__)
+__asm__(".text\n"
+        ".globl mettle_setjmp\n"
+        ".type mettle_setjmp,@function\n"
+        "mettle_setjmp:\n"
+        "  movq %rbx, 0(%rdi)\n"
+        "  movq %rbp, 8(%rdi)\n"
+        "  movq %r12, 16(%rdi)\n"
+        "  movq %r13, 24(%rdi)\n"
+        "  movq %r14, 32(%rdi)\n"
+        "  movq %r15, 40(%rdi)\n"
+        "  leaq 8(%rsp), %rdx\n"
+        "  movq %rdx, 48(%rdi)\n"
+        "  movq (%rsp), %rdx\n"
+        "  movq %rdx, 56(%rdi)\n"
+        "  xorl %eax, %eax\n"
+        "  ret\n"
+        ".globl mettle_longjmp\n"
+        ".type mettle_longjmp,@function\n"
+        "mettle_longjmp:\n"
+        "  movl %esi, %eax\n"
+        "  testl %eax, %eax\n"
+        "  jnz 1f\n"
+        "  movl $1, %eax\n"
+        "1:\n"
+        "  movq 0(%rdi), %rbx\n"
+        "  movq 8(%rdi), %rbp\n"
+        "  movq 16(%rdi), %r12\n"
+        "  movq 24(%rdi), %r13\n"
+        "  movq 32(%rdi), %r14\n"
+        "  movq 40(%rdi), %r15\n"
+        "  movq 48(%rdi), %rsp\n"
+        "  jmpq *56(%rdi)\n");
+#elif defined(__aarch64__)
+#if defined(__APPLE__)
+#define MT_ASM_SYM(name) "_" name
+#else
+#define MT_ASM_SYM(name) name
+#endif
+__asm__(".text\n"
+        ".globl " MT_ASM_SYM("mettle_setjmp") "\n"
+        ".p2align 2\n"
+        MT_ASM_SYM("mettle_setjmp") ":\n"
+        "  stp x19, x20, [x0, #0]\n"
+        "  stp x21, x22, [x0, #16]\n"
+        "  stp x23, x24, [x0, #32]\n"
+        "  stp x25, x26, [x0, #48]\n"
+        "  stp x27, x28, [x0, #64]\n"
+        "  stp x29, x30, [x0, #80]\n"
+        "  mov x2, sp\n"
+        "  str x2, [x0, #96]\n"
+        "  stp d8, d9, [x0, #104]\n"
+        "  stp d10, d11, [x0, #120]\n"
+        "  stp d12, d13, [x0, #136]\n"
+        "  stp d14, d15, [x0, #152]\n"
+        "  mov w0, #0\n"
+        "  ret\n"
+        ".globl " MT_ASM_SYM("mettle_longjmp") "\n"
+        ".p2align 2\n"
+        MT_ASM_SYM("mettle_longjmp") ":\n"
+        "  ldp x19, x20, [x0, #0]\n"
+        "  ldp x21, x22, [x0, #16]\n"
+        "  ldp x23, x24, [x0, #32]\n"
+        "  ldp x25, x26, [x0, #48]\n"
+        "  ldp x27, x28, [x0, #64]\n"
+        "  ldp x29, x30, [x0, #80]\n"
+        "  ldr x2, [x0, #96]\n"
+        "  mov sp, x2\n"
+        "  ldp d8, d9, [x0, #104]\n"
+        "  ldp d10, d11, [x0, #120]\n"
+        "  ldp d12, d13, [x0, #136]\n"
+        "  ldp d14, d15, [x0, #152]\n"
+        "  cmp w1, #0\n"
+        "  csinc w0, w1, wzr, ne\n"
+        "  br x30\n");
+#endif
