@@ -49,6 +49,7 @@
 #include "ir/ir_twins.h"
 #include "ir/ir_machine.h"
 #include "pkg.h"
+#include "translate/translate.h"
 #include "run.h"
 #include "explain/explain_command.h"
 #include "tune.h"
@@ -5049,6 +5050,10 @@ static int run_tool_subcommand(int argc, char **argv, int *exit_code) {
   }
   if (strcmp(argv[1], "live") == 0) {
     *exit_code = mettle_live_main(argc, argv);
+    return 1;
+  }
+  if (strcmp(argv[1], "translate") == 0) {
+    *exit_code = mettle_translate_main(argc, argv);
     return 1;
   }
   if (strcmp(argv[1], "run") == 0) {

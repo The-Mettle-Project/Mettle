@@ -1,0 +1,6 @@
+export struct VaList {
+  slots: uint64*;
+  count: int64;
+  index: int64;
+  native: uint64[4];
+}

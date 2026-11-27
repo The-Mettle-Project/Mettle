@@ -1,0 +1,2 @@
+import "std/c_va_sysv" if x86_64;
+import "std/c_va_slots" if aarch64;

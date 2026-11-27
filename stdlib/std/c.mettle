@@ -1,0 +1,264 @@
+import "std/c_types";
+import "std/c_va";
+import "std/math" as math;
+
+extern fn crt_vfprintf(stream: rawptr, format: int8*, args: rawptr) -> int32 = "vfprintf";
+extern fn crt_vsnprintf(buffer: int8*, size: uint64, format: int8*, args: rawptr) -> int32 = "vsnprintf";
+extern fn crt_vsprintf(buffer: int8*, format: int8*, args: rawptr) -> int32 = "vsprintf";
+extern fn crt_vsscanf(input: int8*, format: int8*, args: rawptr) -> int32 = "vsscanf";
+extern fn crt_vfscanf(stream: rawptr, format: int8*, args: rawptr) -> int32 = "vfscanf";
+extern fn crt_stream(index: int32) -> rawptr = "__acrt_iob_func";
+extern fn crt_fputs(text: int8*, stream: rawptr) -> int32 = "fputs";
+extern fn crt_fflush(stream: rawptr) -> int32 = "fflush";
+extern fn crt_abort() = "abort";
+extern fn crt_malloc(size: uint64) -> rawptr = "malloc";
+extern fn crt_free(p: rawptr) = "free";
+
+export fn stdin() -> rawptr { return crt_stream(0); }
+export fn stdout() -> rawptr { return crt_stream(1); }
+export fn stderr() -> rawptr { return crt_stream(2); }
+
+export fn va_start(args: uint64[]) -> VaList {
+  var ap: VaList;
+  ap.slots = args.data;
+  ap.count = args.length;
+  ap.index = 0;
+  return ap;
+}
+
+export fn va_next(ap: VaList*) -> uint64 {
+  if (ap->index >= ap->count) {
+    return 0;
+  }
+  var value: uint64 = ap->slots[ap->index];
+  ap->index = ap->index + 1;
+  return value;
+}
+
+export fn va_double(ap: VaList*) -> float64 {
+  var bits: uint64 = va_next(ap);
+  return *(float64*)&bits;
+}
+
+export fn f64_bits(value: float64) -> uint64 {
+  return *(uint64*)&value;
+}
+
+export fn printf(format: int8*, args: uint64[..]) -> int32 {
+  var ap: VaList = va_start(args);
+  return crt_vfprintf(stdout(), format, va_native(&ap));
+}
+
+export fn fprintf(stream: rawptr, format: int8*, args: uint64[..]) -> int32 {
+  var ap: VaList = va_start(args);
+  return crt_vfprintf(stream, format, va_native(&ap));
+}
+
+export fn sprintf(buffer: int8*, format: int8*, args: uint64[..]) -> int32 {
+  var ap: VaList = va_start(args);
+  return crt_vsprintf(buffer, format, va_native(&ap));
+}
+
+export fn snprintf(buffer: int8*, size: uint64, format: int8*, args: uint64[..]) -> int32 {
+  var ap: VaList = va_start(args);
+  return crt_vsnprintf(buffer, size, format, va_native(&ap));
+}
+
+export fn sscanf(input: int8*, format: int8*, args: uint64[..]) -> int32 {
+  var ap: VaList = va_start(args);
+  return crt_vsscanf(input, format, va_native(&ap));
+}
+
+export fn fscanf(stream: rawptr, format: int8*, args: uint64[..]) -> int32 {
+  var ap: VaList = va_start(args);
+  return crt_vfscanf(stream, format, va_native(&ap));
+}
+
+export fn scanf(format: int8*, args: uint64[..]) -> int32 {
+  var ap: VaList = va_start(args);
+  return crt_vfscanf(stdin(), format, va_native(&ap));
+}
+
+@noreturn export fn assert_fail(expr: int8*, file: int8*, line: int32) {
+  crt_fflush(stdout());
+  var err: rawptr = stderr();
+  fprintf(err, "%s:%d: assertion failed: %s\n", (uint64)file, (uint64)(int64)line, (uint64)expr);
+  crt_abort();
+  while (true) { }
+}
+
+@noreturn export fn trap() {
+  crt_fflush(stdout());
+  crt_abort();
+  while (true) { }
+}
+
+export fn vla_alloc(size: uint64) -> rawptr {
+  return crt_malloc(if (size == 0) 1 else size);
+}
+
+export fn vla_free(p: rawptr) {
+  crt_free(p);
+}
+
+export fn sqrt(x: float64) -> float64 { return math.sqrt(x); }
+
+export fn isnan(x: float64) -> int32 { return math.is_nan(x); }
+export fn isinf(x: float64) -> int32 { return if (math.is_inf(x) != 0) (if (x > 0.0) 1 else -1) else 0; }
+export fn isfinite(x: float64) -> int32 { return math.is_finite(x); }
+export fn signbit(x: float64) -> int32 { return math.signbit(x); }
+
+export fn fpclassify(x: float64) -> int32 {
+  if (math.is_nan(x) != 0) { return 0; }
+  if (math.is_inf(x) != 0) { return 1; }
+  if (x == 0.0) { return 2; }
+  var bits: uint64 = f64_bits(x);
+  if (((bits >> 52) & 0x7ff) == 0) { return 3; }
+  return 4;
+}
+
+export fn modf(x: float64, integral: float64*) -> float64 {
+  var whole: float64 = math.trunc(x);
+  *integral = whole;
+  if (math.is_inf(x) != 0) { return math.copysign(0.0, x); }
+  return math.copysign(x - whole, x);
+}
+
+export fn fdim(x: float64, y: float64) -> float64 {
+  if (math.is_nan(x) != 0 || math.is_nan(y) != 0) { return x + y; }
+  return if (x > y) x - y else 0.0;
+}
+
+export fn rint(x: float64) -> float64 {
+  if (math.is_finite(x) == 0) { return x; }
+  var r: float64 = math.floor(x + 0.5);
+  if (r - x == 0.5 && math.fmod(r, 2.0) != 0.0) { r = r - 1.0; }
+  if (r == 0.0) { return math.copysign(0.0, x); }
+  return r;
+}
+
+export fn lround(x: float64) -> int64 { return (int64)math.round(x); }
+export fn llround(x: float64) -> int64 { return (int64)math.round(x); }
+export fn lrint(x: float64) -> int64 { return (int64)rint(x); }
+
+export fn remainder(x: float64, y: float64) -> float64 {
+  return x - rint(x / y) * y;
+}
+
+export fn ilogb(x: float64) -> int32 {
+  if (x == 0.0) { return -2147483647 - 1; }
+  if (math.is_finite(x) == 0) { return 2147483647; }
+  var e: int32 = 0;
+  math.frexp(x, &e);
+  return e - 1;
+}
+
+export fn logb(x: float64) -> float64 {
+  if (x == 0.0) { return 0.0 - math.INF(); }
+  if (math.is_finite(x) == 0) { return math.fabs(x); }
+  return (float64)ilogb(x);
+}
+
+export fn nextafter(x: float64, y: float64) -> float64 {
+  if (math.is_nan(x) != 0 || math.is_nan(y) != 0) { return x + y; }
+  if (x == y) { return y; }
+  var bits: uint64 = f64_bits(x);
+  if (x == 0.0) {
+    bits = 1;
+    if (y < 0.0) { bits = bits | 0x8000000000000000; }
+  } else if ((x < y) == (x > 0.0)) {
+    bits = bits + 1;
+  } else {
+    bits = bits - 1;
+  }
+  return *(float64*)&bits;
+}
+
+export fn fabsf(x: float32) -> float32 { return (float32)math.fabs((float64)x); }
+export fn floorf(x: float32) -> float32 { return (float32)math.floor((float64)x); }
+export fn ceilf(x: float32) -> float32 { return (float32)math.ceil((float64)x); }
+export fn roundf(x: float32) -> float32 { return (float32)math.round((float64)x); }
+export fn truncf(x: float32) -> float32 { return (float32)math.trunc((float64)x); }
+export fn fmodf(x: float32, y: float32) -> float32 { return (float32)math.fmod((float64)x, (float64)y); }
+export fn atan2f(y: float32, x: float32) -> float32 { return (float32)math.atan2((float64)y, (float64)x); }
+export fn atanf(x: float32) -> float32 { return (float32)math.atan((float64)x); }
+export fn asinf(x: float32) -> float32 { return (float32)math.asin((float64)x); }
+export fn acosf(x: float32) -> float32 { return (float32)math.acos((float64)x); }
+export fn log10f(x: float32) -> float32 { return (float32)math.log10((float64)x); }
+export fn log2f(x: float32) -> float32 { return (float32)math.log2((float64)x); }
+export fn exp2f(x: float32) -> float32 { return (float32)math.exp2((float64)x); }
+export fn hypotf(x: float32, y: float32) -> float32 { return (float32)math.hypot((float64)x, (float64)y); }
+export fn fminf(x: float32, y: float32) -> float32 { return (float32)math.fmin((float64)x, (float64)y); }
+export fn fmaxf(x: float32, y: float32) -> float32 { return (float32)math.fmax((float64)x, (float64)y); }
+export fn copysignf(x: float32, y: float32) -> float32 { return (float32)math.copysign((float64)x, (float64)y); }
+export fn ldexpf(x: float32, n: int32) -> float32 { return (float32)math.ldexp((float64)x, n); }
+export fn cbrtf(x: float32) -> float32 { return (float32)math.cbrt((float64)x); }
+
+export fn popcount32(x: uint32) -> int32 {
+  var n: int32 = 0;
+  var v: uint32 = x;
+  while (v != 0) {
+    v = v & (v - 1);
+    n++;
+  }
+  return n;
+}
+
+export fn popcount64(x: uint64) -> int32 {
+  return popcount32((uint32)x) + popcount32((uint32)(x >> 32));
+}
+
+export fn clz32(x: uint32) -> int32 {
+  var n: int32 = 0;
+  var v: uint32 = x;
+  if (v == 0) { return 32; }
+  while ((v & 0x80000000) == 0) {
+    v = v << 1;
+    n++;
+  }
+  return n;
+}
+
+export fn clz64(x: uint64) -> int32 {
+  var high: uint32 = (uint32)(x >> 32);
+  if (high != 0) { return clz32(high); }
+  return 32 + clz32((uint32)x);
+}
+
+export fn ctz32(x: uint32) -> int32 {
+  var n: int32 = 0;
+  var v: uint32 = x;
+  if (v == 0) { return 32; }
+  while ((v & 1) == 0) {
+    v = v >> 1;
+    n++;
+  }
+  return n;
+}
+
+export fn ctz64(x: uint64) -> int32 {
+  var low: uint32 = (uint32)x;
+  if (low != 0) { return ctz32(low); }
+  return 32 + ctz32((uint32)(x >> 32));
+}
+
+export fn ffs32(x: int32) -> int32 {
+  if (x == 0) { return 0; }
+  return ctz32((uint32)x) + 1;
+}
+
+export fn parity32(x: uint32) -> int32 { return popcount32(x) & 1; }
+
+export fn bswap16(x: uint16) -> uint16 {
+  return (uint16)(((uint32)x >> 8) | (((uint32)x & 0xff) << 8));
+}
+
+export fn bswap32(x: uint32) -> uint32 {
+  return ((x & 0xff) << 24) | ((x & 0xff00) << 8) | ((x >> 8) & 0xff00) | (x >> 24);
+}
+
+export fn bswap64(x: uint64) -> uint64 {
+  return ((uint64)bswap32((uint32)x) << 32) | (uint64)bswap32((uint32)(x >> 32));
+}
+
+export fn abs32(x: int32) -> int32 { return if (x < 0) 0 - x else x; }

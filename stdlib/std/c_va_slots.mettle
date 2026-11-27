@@ -1,0 +1,5 @@
+import "std/c_types";
+
+export fn va_native(ap: VaList*) -> rawptr {
+  return (rawptr)(ap->slots + ap->index);
+}

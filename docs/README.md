@@ -53,7 +53,9 @@ frontend can drive instead. The documentation is organized the same way.
   instruction set, a chosen link address, 16-bit code, and one table of what
   was proven on which machine.
 - [C interoperability](c-interop.md): calling out, being called, the struct
-  ABI, and `syscall`.
+  ABI, C variadic functions, and `syscall`.
+- [Translating C](translate.md): `mettle translate`, which turns C99 source
+  into Mettle source.
 - [Shared libraries](shared-libraries.md): binding a `.so`, emitting one, and
   what the ELF linker refuses.
 
