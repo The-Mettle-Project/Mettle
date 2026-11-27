@@ -1,0 +1,1216 @@
+import "std/mem";
+import "std/math";
+import "./tensor";
+import "./kernels";
+import "./graph";
+
+export const RECALL_EPS = 1.0e-6;
+
+struct RecallJob {
+  kv: float32*;
+  q: float32*;
+  gate: float32*;
+  out: float32*;
+  norms: float32*;
+  powers: float32*;
+  dout: float32*;
+  dkv: float32*;
+  dq: float32*;
+  dgate: float32*;
+  seed: float32*;
+  left: float32*;
+  states: float32*;
+  taps: float32*;
+  batch: int64;
+  time: int64;
+  width: int64;
+  heads: int64;
+  chunk: int64;
+  span: int64;
+}
+
+export fn recall_powers(dev: Device*, keeps: float64*, heads: int64, chunk: int64, chunks: int64) -> float32* {
+  var count: int64 = heads * (chunk + 1 + chunks);
+  var host: float32* = (float32*)malloc(count * 4);
+  var far: float32* = host + heads * (chunk + 1);
+  for h: int64 in 0..heads {
+    for p: int64 in 0..chunk + 1 { host[h * (chunk + 1) + p] = (float32)pow(keeps[h], (float64)p); }
+    for p: int64 in 0..chunks { far[h * chunks + p] = (float32)pow(keeps[h], (float64)(p * chunk)); }
+  }
+  if (dev == 0) { return host; }
+  var there: float32* = (float32*)dev->alloc(count * 4);
+  dev->put((rawptr)there, (rawptr)host, count * 4);
+  free((rawptr)host);
+  return there;
+}
+
+fn recall_load(j: RecallJob*, b: int64, h: int64, kn: float32*, qn: float32*, v: float32*, vg: float32*, fresh: bool) {
+  var d: int64 = j->width / j->heads;
+  var c: int64 = j->width;
+  var rows: int64 = j->batch * j->time * j->heads;
+  for t: int64 in 0..j->time {
+    var row: int64 = b * j->time + t;
+    var at: int64 = row * j->heads + h;
+    var key: float32* = j->kv + row * 2 * c + h * d;
+    var ask: float32* = j->q + row * c + h * d;
+    if (fresh) {
+      j->norms[at] = (float32)(1.0 / sqrt((float64)dot_f32(key, key, d) / (float64)d + RECALL_EPS));
+      j->norms[rows + at] = (float32)(1.0 / sqrt((float64)dot_f32(ask, ask, d) / (float64)d + RECALL_EPS));
+      j->norms[2 * rows + at] = if j->gate == 0 { (float32)1.0 } else { (float32)(1.0 / (1.0 + exp(-(float64)j->gate[at]))) };
+    }
+    var rk: float32 = j->norms[at];
+    var rq: float32 = j->norms[rows + at];
+    var rate: float32 = j->norms[2 * rows + at];
+    for e: int64 in 0..d {
+      kn[t * d + e] = key[e] * rk;
+      qn[t * d + e] = ask[e] * rq;
+      v[t * d + e] = key[c + e];
+      vg[t * d + e] = key[c + e] * rate;
+    }
+  }
+}
+
+@noinline fn recall_forward_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RecallJob* = (RecallJob*)ctx;
+  var t_len: int64 = j->time;
+  var d: int64 = j->width / j->heads;
+  var shrink: float32 = (float32)(1.0 / sqrt((float64)d));
+  var scratch: float32* = (float32*)malloc((4 * t_len * d + d * d) * 4);
+  var kn: float32* = scratch;
+  var qn: float32* = kn + t_len * d;
+  var v: float32* = qn + t_len * d;
+  var vg: float32* = v + t_len * d;
+  var store: float32* = vg + t_len * d;
+  for task: int64 in lo..hi {
+    var b: int64 = task / j->heads;
+    var h: int64 = task - b * j->heads;
+    var keep: float32 = j->powers[h * (j->chunk + 1) + 1];
+    recall_load(j, b, h, kn, qn, v, vg, true);
+    if (j->seed != 0) { copy_f32(store, j->seed + task * d * d, d * d); } else { zero_f32(store, d * d); }
+    for t: int64 in 0..t_len {
+      var o: float32* = j->out + (b * t_len + t) * j->width + h * d;
+      for e: int64 in 0..d {
+        var row: float32* = store + e * d;
+        scale_f32(row, keep, d);
+        axpy_f32(row, shrink * vg[t * d + e], kn + t * d, d);
+        o[e] = dot_f32(row, qn + t * d, d);
+      }
+    }
+    if (j->left != 0) { copy_f32(j->left + task * d * d, store, d * d); }
+  }
+  free((rawptr)scratch);
+  return 0;
+}
+
+@noinline fn recall_backward_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RecallJob* = (RecallJob*)ctx;
+  var t_len: int64 = j->time;
+  var c: int64 = j->width;
+  var d: int64 = c / j->heads;
+  var rows: int64 = j->batch * t_len * j->heads;
+  var shrink: float32 = (float32)(1.0 / sqrt((float64)d));
+  var scratch: float32* = (float32*)malloc(7 * t_len * d * 4);
+  var kn: float32* = scratch;
+  var qn: float32* = kn + t_len * d;
+  var v: float32* = qn + t_len * d;
+  var vg: float32* = v + t_len * d;
+  var dkn: float32* = vg + t_len * d;
+  var dqn: float32* = dkn + t_len * d;
+  var dvg: float32* = dqn + t_len * d;
+  for task: int64 in lo..hi {
+    var b: int64 = task / j->heads;
+    var h: int64 = task - b * j->heads;
+    var keep: float32 = j->powers[h * (j->chunk + 1) + 1];
+    recall_load(j, b, h, kn, qn, v, vg, false);
+    zero_f32(dkn, 3 * t_len * d);
+    for t: int64 in 0..t_len {
+      var dy: float32* = j->dout + (b * t_len + t) * c + h * d;
+      var weight: float32 = shrink;
+      var from: int64 = t;
+      while (from >= 0) {
+        var hit: float32 = dot_f32(qn + t * d, kn + from * d, d) * weight;
+        var pull: float32 = dot_f32(dy, vg + from * d, d) * weight;
+        axpy_f32(dvg + from * d, hit, dy, d);
+        axpy_f32(dqn + t * d, pull, kn + from * d, d);
+        axpy_f32(dkn + from * d, pull, qn + t * d, d);
+        weight = weight * keep;
+        from = from - 1;
+      }
+      if (j->seed != 0) {
+        for e: int64 in 0..d { axpy_f32(dqn + t * d, dy[e] * weight / shrink, j->seed + task * d * d + e * d, d); }
+      }
+    }
+    for t: int64 in 0..t_len {
+      var row: int64 = b * t_len + t;
+      var at: int64 = row * j->heads + h;
+      var rk: float32 = j->norms[at];
+      var rq: float32 = j->norms[rows + at];
+      var rate: float32 = j->norms[2 * rows + at];
+      var mean_k: float32 = dot_f32(dkn + t * d, kn + t * d, d) / (float32)d;
+      var mean_q: float32 = dot_f32(dqn + t * d, qn + t * d, d) / (float32)d;
+      if (j->dkv != 0) {
+        var out: float32* = j->dkv + row * 2 * c + h * d;
+        for e: int64 in 0..d {
+          out[e] = out[e] + rk * (dkn[t * d + e] - kn[t * d + e] * mean_k);
+          out[c + e] = out[c + e] + dvg[t * d + e] * rate;
+        }
+      }
+      if (j->dq != 0) {
+        var out: float32* = j->dq + row * c + h * d;
+        for e: int64 in 0..d { out[e] = out[e] + rq * (dqn[t * d + e] - qn[t * d + e] * mean_q); }
+      }
+      if (j->dgate != 0) {
+        j->dgate[at] = j->dgate[at] + rate * ((float32)1.0 - rate) * dot_f32(dvg + t * d, v + t * d, d);
+      }
+    }
+  }
+  free((rawptr)scratch);
+  return 0;
+}
+
+fn exact_load(j: RecallJob*, b: int64, h: int64, kn: float32*, qn: float32*, v: float32*, fresh: bool) {
+  var d: int64 = j->width / j->heads;
+  var c: int64 = j->width;
+  var rows: int64 = j->batch * j->time * j->heads;
+  var shrink: float32 = (float32)(1.0 / sqrt((float64)d));
+  for t: int64 in 0..j->time {
+    var row: int64 = b * j->time + t;
+    var at: int64 = row * j->heads + h;
+    var key: float32* = j->kv + row * 2 * c + h * d;
+    var ask: float32* = j->q + row * c + h * d;
+    if (fresh) {
+      j->norms[at] = (float32)(1.0 / sqrt((float64)dot_f32(key, key, d) / (float64)d + RECALL_EPS));
+      j->norms[rows + at] = (float32)(1.0 / sqrt((float64)dot_f32(ask, ask, d) / (float64)d + RECALL_EPS));
+      j->norms[2 * rows + at] = if j->gate == 0 { (float32)1.0 } else { (float32)(1.0 / (1.0 + exp(-(float64)j->gate[at]))) };
+    }
+    var rk: float32 = j->norms[at] * shrink;
+    var rq: float32 = j->norms[rows + at];
+    for e: int64 in 0..d {
+      kn[t * d + e] = key[e] * rk;
+      qn[t * d + e] = ask[e] * rq;
+      v[t * d + e] = key[c + e];
+    }
+  }
+}
+
+fn exact_step(store: float32*, next: float32*, k: float32*, v: float32*, rate: float32, keep: float32, d: int64) {
+  for e: int64 in 0..d {
+    var row: float32* = store + e * d;
+    var out: float32* = next + e * d;
+    var wrote: float32 = rate * (v[e] - keep * dot_f32(row, k, d));
+    for i: int64 in 0..d { out[i] = keep * row[i] + wrote * k[i]; }
+  }
+}
+
+@noinline fn exact_forward_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RecallJob* = (RecallJob*)ctx;
+  var t_len: int64 = j->time;
+  var d: int64 = j->width / j->heads;
+  var rows: int64 = j->batch * t_len * j->heads;
+  var scratch: float32* = (float32*)malloc((3 * t_len * d + d * d) * 4);
+  var kn: float32* = scratch;
+  var qn: float32* = kn + t_len * d;
+  var v: float32* = qn + t_len * d;
+  var store: float32* = v + t_len * d;
+  for task: int64 in lo..hi {
+    var b: int64 = task / j->heads;
+    var h: int64 = task - b * j->heads;
+    var keep: float32 = j->powers[h * (j->chunk + 1) + 1];
+    exact_load(j, b, h, kn, qn, v, true);
+    if (j->seed != 0) { copy_f32(store, j->seed + task * d * d, d * d); } else { zero_f32(store, d * d); }
+    if (j->states != 0) { copy_f32(j->states + task * d * d, store, d * d); }
+    for t: int64 in 0..t_len {
+      var rate: float32 = j->norms[2 * rows + (b * t_len + t) * j->heads + h];
+      exact_step(store, store, kn + t * d, v + t * d, rate, keep, d);
+      var o: float32* = j->out + (b * t_len + t) * j->width + h * d;
+      for e: int64 in 0..d { o[e] = dot_f32(store + e * d, qn + t * d, d); }
+      if (j->states != 0 && (t + 1) % j->span == 0) { copy_f32(j->states + ((t + 1) / j->span * j->batch * j->heads + task) * d * d, store, d * d); }
+    }
+    if (j->left != 0) { copy_f32(j->left + task * d * d, store, d * d); }
+  }
+  free((rawptr)scratch);
+  return 0;
+}
+
+@noinline fn exact_backward_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RecallJob* = (RecallJob*)ctx;
+  var t_len: int64 = j->time;
+  var c: int64 = j->width;
+  var d: int64 = c / j->heads;
+  var dd: int64 = d * d;
+  var rows: int64 = j->batch * t_len * j->heads;
+  var shrink: float32 = (float32)(1.0 / sqrt((float64)d));
+  var scratch: float32* = (float32*)malloc((3 * t_len * d + (t_len + 2) * dd + 6 * d) * 4);
+  var kn: float32* = scratch;
+  var qn: float32* = kn + t_len * d;
+  var v: float32* = qn + t_len * d;
+  var states: float32* = v + t_len * d;
+  var pull: float32* = states + (t_len + 1) * dd;
+  var du: float32* = pull + dd;
+  var de: float32* = du + d;
+  var dk: float32* = de + d;
+  var dq: float32* = dk + d;
+  var wrote: float32* = dq + d;
+  var gap: float32* = wrote + d;
+  for task: int64 in lo..hi {
+    var b: int64 = task / j->heads;
+    var h: int64 = task - b * j->heads;
+    var keep: float32 = j->powers[h * (j->chunk + 1) + 1];
+    exact_load(j, b, h, kn, qn, v, false);
+    if (j->seed != 0) { copy_f32(states, j->seed + task * dd, dd); } else { zero_f32(states, dd); }
+    for t: int64 in 0..t_len {
+      var rate: float32 = j->norms[2 * rows + (b * t_len + t) * j->heads + h];
+      exact_step(states + t * dd, states + (t + 1) * dd, kn + t * d, v + t * d, rate, keep, d);
+    }
+    zero_f32(pull, dd);
+    var t: int64 = t_len - 1;
+    while (t >= 0) {
+      var row: int64 = b * t_len + t;
+      var at: int64 = row * j->heads + h;
+      var rk: float32 = j->norms[at] * shrink;
+      var rq: float32 = j->norms[rows + at];
+      var rate: float32 = j->norms[2 * rows + at];
+      var before: float32* = states + t * dd;
+      var after: float32* = states + (t + 1) * dd;
+      var k: float32* = kn + t * d;
+      var q: float32* = qn + t * d;
+      var dy: float32* = j->dout + row * c + h * d;
+      if (j->taps != 0 && (t + 1) % j->span == 0) { axpy_f32(pull, 1.0, j->taps + ((t + 1) / j->span * j->batch * j->heads + task) * dd, dd); }
+      zero_f32(dq, d);
+      zero_f32(dk, d);
+      var gain: float32 = 0.0;
+      for e: int64 in 0..d {
+        axpy_f32(pull + e * d, dy[e], q, d);
+        axpy_f32(dq, dy[e], after + e * d, d);
+      }
+      for e: int64 in 0..d {
+        gap[e] = v[t * d + e] - keep * dot_f32(before + e * d, k, d);
+        wrote[e] = rate * gap[e];
+        du[e] = dot_f32(pull + e * d, k, d);
+        de[e] = -rate * keep * du[e];
+        gain = gain + du[e] * gap[e];
+      }
+      for e: int64 in 0..d {
+        axpy_f32(dk, wrote[e], pull + e * d, d);
+        axpy_f32(dk, de[e], before + e * d, d);
+      }
+      for e: int64 in 0..d {
+        var line: float32* = pull + e * d;
+        scale_f32(line, keep, d);
+        axpy_f32(line, de[e], k, d);
+      }
+      var lean_k: float32 = dot_f32(dk, k, d);
+      var mean_q: float32 = dot_f32(dq, q, d) / (float32)d;
+      if (j->dkv != 0) {
+        var out: float32* = j->dkv + row * 2 * c + h * d;
+        for e: int64 in 0..d {
+          out[e] = out[e] + rk * (dk[e] - k[e] * lean_k);
+          out[c + e] = out[c + e] + rate * du[e];
+        }
+      }
+      if (j->dq != 0) {
+        var out: float32* = j->dq + row * c + h * d;
+        for e: int64 in 0..d { out[e] = out[e] + rq * (dq[e] - q[e] * mean_q); }
+      }
+      if (j->dgate != 0) { j->dgate[at] = j->dgate[at] + rate * ((float32)1.0 - rate) * gain; }
+      t = t - 1;
+    }
+  }
+  free((rawptr)scratch);
+  return 0;
+}
+
+fn recall_job(g: Graph*, id: int32) -> RecallJob {
+  var node: Node* = g->node(id);
+  var s: Shape = node->value.shape;
+  var j: RecallJob;
+  j.kv = g->data(node->a);
+  j.q = g->data(node->b);
+  j.gate = if node->c >= 0 { g->data(node->c) } else { (float32*)0 };
+  j.out = g->data(id);
+  j.norms = node->saved;
+  j.powers = (float32*)node->ext;
+  j.dout = node->grad;
+  j.dkv = (float32*)0;
+  j.dq = (float32*)0;
+  j.dgate = (float32*)0;
+  j.seed = (float32*)node->i3;
+  j.left = (float32*)node->i4;
+  j.states = if node->i5 != 0 { node->saved2 } else { (float32*)0 };
+  j.taps = (float32*)node->i5;
+  j.batch = s.dims[0];
+  j.time = s.dims[1];
+  j.width = s.dims[2];
+  j.heads = node->i0;
+  j.chunk = node->i1;
+  j.span = recall_span(node);
+  return j;
+}
+
+fn recall_span(node: Node*) -> int64 {
+  return if node->ints != 0 { (int64)node->ints[0] } else { node->i1 };
+}
+
+fn recall_push(op: int32, kv: Var, q: Var, gate: int32, heads: int64, chunk: int64, powers: float32*, from: float32*, into: float32*, span: int64) -> Var {
+  var g: Graph* = kv.g;
+  var s: Shape = q.shape();
+  var ks: Shape = kv.shape();
+  if (s.rank != 3 || ks.rank != 3 || ks.dims[0] != s.dims[0] || ks.dims[1] != s.dims[1] || ks.dims[2] != 2 * s.dims[2]) {
+    mmll_fail("recall takes keys and values as [batch, time, 2 * width] and queries as [batch, time, width], got {ks.text()} and {s.text()}");
+  }
+  var c: int64 = s.dims[2];
+  if (heads < 1 || c % heads != 0) { mmll_fail("width {c} does not split into {heads} heads"); }
+  if (chunk < 1 || s.dims[1] % chunk != 0) { mmll_fail("{s.dims[1]} tokens do not split into chunks of {chunk}"); }
+  if (span > 0 && chunk % span != 0) { mmll_fail("chunks of {chunk} tokens do not split into blocks of {span}"); }
+  if (gate >= 0) {
+    var gs: Shape = g->nodes[gate].value.shape;
+    if (gs.rank != 3 || gs.dims[0] != s.dims[0] || gs.dims[1] != s.dims[1] || gs.dims[2] != heads) {
+      mmll_fail("recall takes gates as [batch, time, {heads}], got {gs.text()}");
+    }
+  }
+  var id: int32 = g->push(op, kv.id, q.id, gate, s);
+  var node: Node* = g->node(id);
+  node->i0 = heads;
+  node->i1 = chunk;
+  node->ext = (rawptr)powers;
+  node->i3 = (int64)from;
+  node->i4 = (int64)into;
+  node->saved = g->floats(3 * s.dims[0] * s.dims[1] * heads);
+  if (span > 0) {
+    var held: int64 = (s.dims[1] / span + 1) * s.dims[0] * c * c / heads;
+    node->ints = g->ints(1);
+    node->ints[0] = (int32)span;
+    node->i5 = (int64)g->zeros_raw(held);
+    if (g->dev == 0) { node->saved2 = g->zeros_raw(held); }
+    g->grad_of(id);
+  }
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var j: RecallJob = recall_job(g, id);
+  if (op == OP_RECALL_EXACT) {
+    run_parallel(&exact_forward_tasks, (rawptr)&j, j.batch * heads, j.time * c * c / heads * 2);
+  } else {
+    run_parallel(&recall_forward_tasks, (rawptr)&j, j.batch * heads, j.time * c * 8);
+  }
+  return { g: g, id: id };
+}
+
+export fn recall(kv: Var, q: Var, gate: Var, heads: int64, chunk: int64, powers: float32*) -> Var {
+  return recall_push(OP_RECALL, kv, q, gate.id, heads, chunk, powers, (float32*)0, (float32*)0, 0);
+}
+
+export fn recall_ungated(kv: Var, q: Var, heads: int64, chunk: int64, powers: float32*) -> Var {
+  return recall_push(OP_RECALL, kv, q, -1, heads, chunk, powers, (float32*)0, (float32*)0, 0);
+}
+
+export fn recall_exact(kv: Var, q: Var, gate: Var, heads: int64, chunk: int64, powers: float32*) -> Var {
+  return recall_push(OP_RECALL_EXACT, kv, q, gate.id, heads, chunk, powers, (float32*)0, (float32*)0, 0);
+}
+
+export fn recall_tapped(kv: Var, q: Var, gate: Var, heads: int64, chunk: int64, span: int64, powers: float32*) -> Var {
+  return recall_tapped_carried(kv, q, gate, heads, chunk, span, powers, (float32*)0, (float32*)0);
+}
+
+export fn recall_tapped_carried(kv: Var, q: Var, gate: Var, heads: int64, chunk: int64, span: int64, powers: float32*, from: float32*, into: float32*) -> Var {
+  if (span < 1) { mmll_fail("recall_tapped keeps its memory every {span} tokens"); }
+  return recall_push(OP_RECALL_EXACT, kv, q, gate.id, heads, chunk, powers, from, into, span);
+}
+
+export fn recall_exact_ungated(kv: Var, q: Var, heads: int64, chunk: int64, powers: float32*) -> Var {
+  return recall_push(OP_RECALL_EXACT, kv, q, -1, heads, chunk, powers, (float32*)0, (float32*)0, 0);
+}
+
+export fn recall_carried(kv: Var, q: Var, gate: Var, heads: int64, chunk: int64, powers: float32*, exact: bool, from: float32*, into: float32*) -> Var {
+  return recall_push(if exact { OP_RECALL_EXACT } else { OP_RECALL }, kv, q, gate.id, heads, chunk, powers, from, into, 0);
+}
+
+export fn no_gate(g: Graph*) -> Var {
+  return { g: g, id: -1 };
+}
+
+export fn backward_recall(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var j: RecallJob = recall_job(g, id);
+  if (g->nodes[node->a].requires) { j.dkv = g->grad_of(node->a); }
+  if (g->nodes[node->b].requires) { j.dq = g->grad_of(node->b); }
+  if (node->c >= 0 && g->nodes[node->c].requires) { j.dgate = g->grad_of(node->c); }
+  if (node->op == OP_RECALL_EXACT) {
+    run_parallel(&exact_backward_tasks, (rawptr)&j, j.batch * j.heads, j.time * j.width * j.width / j.heads * 6);
+    return;
+  }
+  run_parallel(&recall_backward_tasks, (rawptr)&j, j.batch * j.heads, j.time * j.time * j.width / j.heads * 4);
+}
+
+struct MingleJob {
+  p: float32*;
+  out: float32*;
+  dout: float32*;
+  dp: float32*;
+  batch: int64;
+  rooms: int64;
+  width: int64;
+  heads: int64;
+}
+
+fn mingle_load(j: MingleJob*, b: int64, h: int64, kn: float32*, qn: float32*, scales: float32*) {
+  var c: int64 = j->width;
+  var d: int64 = c / j->heads;
+  var shrink: float64 = 1.0 / sqrt((float64)d);
+  for i: int64 in 0..j->rooms {
+    var key: float32* = j->p + (b * j->rooms + i) * 3 * c + h * d;
+    var ask: float32* = key + 2 * c;
+    var rk: float32 = (float32)(shrink / sqrt((float64)dot_f32(key, key, d) / (float64)d + RECALL_EPS));
+    var rq: float32 = (float32)(1.0 / sqrt((float64)dot_f32(ask, ask, d) / (float64)d + RECALL_EPS));
+    scales[2 * i] = rk;
+    scales[2 * i + 1] = rq;
+    for e: int64 in 0..d {
+      kn[i * d + e] = key[e] * rk;
+      qn[i * d + e] = ask[e] * rq;
+    }
+  }
+}
+
+@noinline fn mingle_forward_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: MingleJob* = (MingleJob*)ctx;
+  var n: int64 = j->rooms;
+  var c: int64 = j->width;
+  var d: int64 = c / j->heads;
+  var scratch: float32* = (float32*)malloc((2 * n * d + 2 * n) * 4);
+  var kn: float32* = scratch;
+  var qn: float32* = kn + n * d;
+  var scales: float32* = qn + n * d;
+  for task: int64 in lo..hi {
+    var b: int64 = task / j->heads;
+    var h: int64 = task - b * j->heads;
+    mingle_load(j, b, h, kn, qn, scales);
+    for i: int64 in 0..n {
+      var o: float32* = j->out + (b * n + i) * c + h * d;
+      zero_f32(o, d);
+      for from: int64 in 0..n {
+        axpy_f32(o, dot_f32(qn + i * d, kn + from * d, d) / (float32)n, j->p + (b * n + from) * 3 * c + c + h * d, d);
+      }
+    }
+  }
+  free((rawptr)scratch);
+  return 0;
+}
+
+@noinline fn mingle_backward_tasks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: MingleJob* = (MingleJob*)ctx;
+  var n: int64 = j->rooms;
+  var c: int64 = j->width;
+  var d: int64 = c / j->heads;
+  var scratch: float32* = (float32*)malloc((4 * n * d + 2 * n) * 4);
+  var kn: float32* = scratch;
+  var qn: float32* = kn + n * d;
+  var dkn: float32* = qn + n * d;
+  var dqn: float32* = dkn + n * d;
+  var scales: float32* = dqn + n * d;
+  for task: int64 in lo..hi {
+    var b: int64 = task / j->heads;
+    var h: int64 = task - b * j->heads;
+    mingle_load(j, b, h, kn, qn, scales);
+    zero_f32(dkn, 2 * n * d);
+    for i: int64 in 0..n {
+      var dy: float32* = j->dout + (b * n + i) * c + h * d;
+      for from: int64 in 0..n {
+        var slot: int64 = (b * n + from) * 3 * c + c + h * d;
+        var pull: float32 = dot_f32(dy, j->p + slot, d) / (float32)n;
+        axpy_f32(j->dp + slot, dot_f32(qn + i * d, kn + from * d, d) / (float32)n, dy, d);
+        axpy_f32(dqn + i * d, pull, kn + from * d, d);
+        axpy_f32(dkn + from * d, pull, qn + i * d, d);
+      }
+    }
+    for i: int64 in 0..n {
+      var out: float32* = j->dp + (b * n + i) * 3 * c + h * d;
+      var lean: float32 = dot_f32(dkn + i * d, kn + i * d, d);
+      var mean: float32 = dot_f32(dqn + i * d, qn + i * d, d) / (float32)d;
+      for e: int64 in 0..d {
+        out[e] = out[e] + scales[2 * i] * (dkn[i * d + e] - kn[i * d + e] * lean);
+        out[2 * c + e] = out[2 * c + e] + scales[2 * i + 1] * (dqn[i * d + e] - qn[i * d + e] * mean);
+      }
+    }
+  }
+  free((rawptr)scratch);
+  return 0;
+}
+
+export fn mingle(p: Var, heads: int64) -> Var {
+  var g: Graph* = p.g;
+  var s: Shape = p.shape();
+  if (s.rank != 3 || s.dims[2] % 3 != 0) { mmll_fail("mingle takes keys, values and queries as [batch, rooms, 3 * width], got {s.text()}"); }
+  var c: int64 = s.dims[2] / 3;
+  if (heads < 1 || c % heads != 0) { mmll_fail("width {c} does not split into {heads} heads"); }
+  var id: int32 = g->push(OP_MINGLE, p.id, -1, -1, shape(s.dims[0], s.dims[1], c));
+  g->node(id)->i0 = heads;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var j: MingleJob = { p: g->data(p.id), out: g->data(id), dout: (float32*)0, dp: (float32*)0, batch: s.dims[0], rooms: s.dims[1], width: c, heads: heads };
+  run_parallel(&mingle_forward_tasks, (rawptr)&j, j.batch * heads, j.rooms * j.rooms * c / heads * 2);
+  return { g: g, id: id };
+}
+
+export fn backward_mingle(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  if (!g->nodes[node->a].requires) { return; }
+  var s: Shape = node->value.shape;
+  var j: MingleJob = { p: g->data(node->a), out: g->data(id), dout: node->grad, dp: g->grad_of(node->a), batch: s.dims[0], rooms: s.dims[1], width: s.dims[2], heads: node->i0 };
+  run_parallel(&mingle_backward_tasks, (rawptr)&j, j.batch * j.heads, j.rooms * j.rooms * j.width / j.heads * 6);
+}
+
+export struct Thinking {
+  pack: Var;
+  proj: Var;
+  fc: Var;
+  out: Var;
+  gate: Var;
+  bias: Var;
+  seek: Var;
+  fetch: Var;
+}
+
+struct Thought {
+  here: float32*;
+  packed: float32*;
+  hn: float32*;
+  mn: float32*;
+  pre: float32*;
+  act: float32*;
+  sum: float32*;
+  amt: float32*;
+  rstd: float32*;
+  qn: float32*;
+  qr: float32*;
+  fnorm: float32*;
+}
+
+struct Foresight {
+  x: float32*;
+  h: float32*;
+  hg: float32*;
+  gn: float32*;
+  tn: float32*;
+  rstd: float32*;
+}
+
+fn rms_rows(y: float32*, x: float32*, rstd: float32*, rows: int64, cols: int64) {
+  rms_rows_eps(y, x, rstd, rows, cols, RECALL_EPS);
+}
+
+fn rms_rows_eps(y: float32*, x: float32*, rstd: float32*, rows: int64, cols: int64, eps: float64) {
+  for r: int64 in 0..rows {
+    var from: float32* = x + r * cols;
+    var rs: float32 = (float32)(1.0 / sqrt((float64)dot_f32(from, from, cols) / (float64)cols + eps));
+    rstd[r] = rs;
+    for i: int64 in 0..cols { y[r * cols + i] = from[i] * rs; }
+  }
+}
+
+fn rms_rows_back(dx: float32*, dy: float32*, y: float32*, rstd: float32*, rows: int64, cols: int64) {
+  for r: int64 in 0..rows {
+    var lean: float32 = dot_f32(dy + r * cols, y + r * cols, cols) / (float32)cols;
+    for i: int64 in 0..cols {
+      var at: int64 = r * cols + i;
+      dx[at] = dx[at] + rstd[r] * (dy[at] - y[at] * lean);
+    }
+  }
+}
+
+fn dense_back(dx: float32*, dw: float32*, dy: float32*, x: float32*, weight: float32*, rows: int64, outs: int64, ins: int64) {
+  gemm_nn(rows, ins, outs, dy, outs, weight, ins, dx, ins, true);
+  for r: int64 in 0..rows {
+    for o: int64 in 0..outs { axpy_f32(dw + o * ins, dy[r * outs + o], x + r * ins, ins); }
+  }
+}
+
+fn gelu_rows(y: float32*, x: float32*, n: int64) {
+  var k2: float32 = -1.5957691216057308;
+  var c: float32 = 0.044715;
+  var one: float32 = 1.0;
+  for i: int64 in 0..n {
+    var v: float32 = x[i];
+    y[i] = v / (one + exp_f32(k2 * (v + c * v * v * v)));
+  }
+}
+
+fn gelu_rows_back(dx: float32*, dy: float32*, x: float32*, n: int64) {
+  var k2: float32 = -1.5957691216057308;
+  var c: float32 = 0.044715;
+  var c3: float32 = 0.134145;
+  var one: float32 = 1.0;
+  for i: int64 in 0..n {
+    var v: float32 = x[i];
+    var s: float32 = one / (one + exp_f32(k2 * (v + c * v * v * v)));
+    dx[i] = dy[i] * (s - k2 * v * s * (one - s) * (one + c3 * v * v));
+  }
+}
+
+export fn residual(x: Var, h: Var, weight: Var, eps: float64) -> Var {
+  var g: Graph* = x.g;
+  var sx: Shape = x.shape();
+  var n: int64 = sx.last();
+  var k: int64 = h.shape().last();
+  var rows: int64 = sx.size() / n;
+  if (h.size() != rows * k || weight.size() != n * k) { mmll_fail("residual takes x of {sx.text()}, h of {h.shape().text()} and a weight of {n} by {k}, got {weight.shape().text()}"); }
+  var id: int32 = g->push(OP_RESIDUAL, x.id, h.id, weight.id, sx);
+  var node: Node* = g->node(id);
+  node->f0 = (float32)eps;
+  node->saved = g->floats(rows);
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var hn: float32* = (float32*)malloc(rows * k * 4);
+  rms_rows_eps(hn, g->data(h.id), node->saved, rows, k, eps);
+  copy_f32(node->value.data, g->data(x.id), rows * n);
+  gemm_nt(rows, n, k, hn, k, g->data(weight.id), k, node->value.data, n, true);
+  free((rawptr)hn);
+  return { g: g, id: id };
+}
+
+export fn backward_residual(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var sx: Shape = node->value.shape;
+  var n: int64 = sx.last();
+  var k: int64 = g->nodes[node->b].value.shape.last();
+  var rows: int64 = sx.size() / n;
+  var dy: float32* = node->grad;
+  if (g->nodes[node->a].requires) { add_into_f32(g->grad_of(node->a), dy, rows * n); }
+  var wants_h: bool = g->nodes[node->b].requires;
+  var wants_w: bool = g->nodes[node->c].requires;
+  if (!wants_h && !wants_w) { return; }
+  var hn: float32* = (float32*)malloc((2 * rows * k + rows + n * k) * 4);
+  var dhn: float32* = hn + rows * k;
+  var rstd: float32* = dhn + rows * k;
+  var spill: float32* = rstd + rows;
+  rms_rows_eps(hn, g->data(node->b), rstd, rows, k, (float64)node->f0);
+  zero_f32(dhn, rows * k);
+  zero_f32(spill, n * k);
+  dense_back(dhn, if wants_w { g->grad_of(node->c) } else { spill }, dy, hn, g->data(node->c), rows, n, k);
+  if (wants_h) { rms_rows_back(g->grad_of(node->b), dhn, hn, node->saved, rows, k); }
+  free((rawptr)hn);
+}
+
+export fn feed(x: Var, fc: Var, out: Var, eps: float64) -> Var {
+  var g: Graph* = x.g;
+  var sx: Shape = x.shape();
+  var w: int64 = sx.last();
+  var hid: int64 = fc.shape().dims[0];
+  var rows: int64 = sx.size() / w;
+  if (fc.size() != hid * w || out.size() != w * hid) { mmll_fail("feed takes weights of {hid} by {w} and {w} by {hid}, got {fc.shape().text()} and {out.shape().text()}"); }
+  var id: int32 = g->push(OP_FEED, x.id, fc.id, out.id, sx);
+  var node: Node* = g->node(id);
+  node->f0 = (float32)eps;
+  node->saved = g->floats(rows);
+  node->saved2 = g->floats(rows * hid);
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var xn: float32* = (float32*)malloc((rows * w + rows * hid) * 4);
+  var act: float32* = xn + rows * w;
+  rms_rows_eps(xn, g->data(x.id), node->saved, rows, w, eps);
+  gemm_nt(rows, hid, w, xn, w, g->data(fc.id), w, node->saved2, hid, false);
+  gelu_rows(act, node->saved2, rows * hid);
+  copy_f32(node->value.data, g->data(x.id), rows * w);
+  gemm_nt(rows, w, hid, act, hid, g->data(out.id), hid, node->value.data, w, true);
+  free((rawptr)xn);
+  return { g: g, id: id };
+}
+
+export fn backward_feed(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var sx: Shape = node->value.shape;
+  var w: int64 = sx.last();
+  var hid: int64 = g->nodes[node->b].value.shape.dims[0];
+  var rows: int64 = sx.size() / w;
+  var dy: float32* = node->grad;
+  var wants_x: bool = g->nodes[node->a].requires;
+  if (wants_x) { add_into_f32(g->grad_of(node->a), dy, rows * w); }
+  var xn: float32* = (float32*)malloc((2 * rows * w + 3 * rows * hid + rows + 2 * w * hid) * 4);
+  var dxn: float32* = xn + rows * w;
+  var act: float32* = dxn + rows * w;
+  var dact: float32* = act + rows * hid;
+  var dpre: float32* = dact + rows * hid;
+  var rstd: float32* = dpre + rows * hid;
+  var spill_out: float32* = rstd + rows;
+  var spill_fc: float32* = spill_out + w * hid;
+  rms_rows_eps(xn, g->data(node->a), rstd, rows, w, (float64)node->f0);
+  gelu_rows(act, node->saved2, rows * hid);
+  zero_f32(dxn, rows * w);
+  zero_f32(dact, rows * hid);
+  zero_f32(spill_out, 2 * w * hid);
+  dense_back(dact, if g->nodes[node->c].requires { g->grad_of(node->c) } else { spill_out }, dy, act, g->data(node->c), rows, w, hid);
+  gelu_rows_back(dpre, dact, node->saved2, rows * hid);
+  dense_back(dxn, if g->nodes[node->b].requires { g->grad_of(node->b) } else { spill_fc }, dpre, xn, g->data(node->b), rows, hid, w);
+  if (wants_x) { rms_rows_back(g->grad_of(node->a), dxn, xn, node->saved, rows, w); }
+  free((rawptr)xn);
+}
+
+fn look_forward(g: Graph*, node: Node*, k: Thought*, told: float32*) {
+  var s: Shape = node->value.shape;
+  var batch: int64 = s.dims[0];
+  var count: int64 = s.dims[1];
+  var w: int64 = s.dims[2];
+  var rows: int64 = batch * count;
+  var h: int64 = node->i0;
+  var d: int64 = w / h;
+  var states: float32* = g->nodes[(int32)node->i3].saved2 + node->i4 * batch * h * d * d;
+  var sq: float32* = (float32*)malloc(2 * rows * w * 4);
+  var found: float32* = sq + rows * w;
+  k->qn = g->floats(rows * w);
+  k->qr = g->floats(rows * h);
+  k->fnorm = g->floats(rows * w);
+  gemm_nt(rows, w, w, k->here, w, g->data(node->ints[6]), w, sq, w, false);
+  for b: int64 in 0..batch {
+    for room: int64 in 0..count {
+      for head: int64 in 0..h {
+        var at: int64 = (b * count + room) * w + head * d;
+        var rs: float32 = (float32)(1.0 / sqrt((float64)dot_f32(sq + at, sq + at, d) / (float64)d + RECALL_EPS));
+        k->qr[(b * count + room) * h + head] = rs;
+        for i: int64 in 0..d { k->qn[at + i] = sq[at + i] * rs; }
+        var store: float32* = states + (b * h + head) * d * d;
+        for e: int64 in 0..d { found[at + e] = dot_f32(store + e * d, k->qn + at, d); }
+      }
+    }
+  }
+  rms_rows(k->fnorm, found, k->rstd + 3 * rows, rows, w);
+  gemm_nt(rows, w, w, k->fnorm, w, g->data(node->ints[7]), w, told, w, true);
+  free((rawptr)sq);
+}
+
+fn look_backward(g: Graph*, node: Node*, k: Thought*, dtold: float32*, dhere: float32*) {
+  var s: Shape = node->value.shape;
+  var batch: int64 = s.dims[0];
+  var count: int64 = s.dims[1];
+  var w: int64 = s.dims[2];
+  var rows: int64 = batch * count;
+  var h: int64 = node->i0;
+  var d: int64 = w / h;
+  var dd: int64 = d * d;
+  var grid: Node* = g->node((int32)node->i3);
+  var states: float32* = grid->saved2 + node->i4 * batch * h * dd;
+  var taps: float32* = if grid->requires { (float32*)grid->i5 + node->i4 * batch * h * dd } else { (float32*)0 };
+  var dfn: float32* = (float32*)calloc(3 * rows * w + d, 4);
+  var dfound: float32* = dfn + rows * w;
+  var dsq: float32* = dfound + rows * w;
+  var pull: float32* = dsq + rows * w;
+  dense_back(dfn, g->grad_of(node->ints[7]), dtold, k->fnorm, g->data(node->ints[7]), rows, w, w);
+  rms_rows_back(dfound, dfn, k->fnorm, k->rstd + 3 * rows, rows, w);
+  for b: int64 in 0..batch {
+    for room: int64 in 0..count {
+      for head: int64 in 0..h {
+        var at: int64 = (b * count + room) * w + head * d;
+        var qn: float32* = k->qn + at;
+        var store: float32* = states + (b * h + head) * dd;
+        zero_f32(pull, d);
+        for e: int64 in 0..d {
+          axpy_f32(pull, dfound[at + e], store + e * d, d);
+          if (taps != 0) { axpy_f32(taps + (b * h + head) * dd + e * d, dfound[at + e], qn, d); }
+        }
+        var rs: float32 = k->qr[(b * count + room) * h + head];
+        var lean: float32 = dot_f32(pull, qn, d) / (float32)d;
+        for i: int64 in 0..d { dsq[at + i] = rs * (pull[i] - qn[i] * lean); }
+      }
+    }
+  }
+  dense_back(dhere, g->grad_of(node->ints[6]), dsq, k->here, g->data(node->ints[6]), rows, w, w);
+  free((rawptr)dfn);
+}
+
+fn ponder_forward(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var s: Shape = node->value.shape;
+  var rows: int64 = s.dims[0] * s.dims[1];
+  var w: int64 = s.dims[2];
+  var all: int64 = rows * w;
+  var hid: int64 = g->nodes[node->ints[2]].value.shape.dims[0];
+  var k: Thought* = (Thought*)g->host_alloc(sizeof(Thought));
+  node->i2 = (int64)k;
+  k->here = g->floats(all);
+  k->packed = g->floats(3 * all);
+  k->hn = g->floats(all);
+  k->mn = g->floats(all);
+  k->pre = g->floats(rows * hid);
+  k->act = g->floats(rows * hid);
+  k->sum = g->floats(all);
+  k->amt = g->floats(rows);
+  k->rstd = g->floats(4 * rows);
+  var rooms: float32* = g->data(node->a);
+  var seats: float32* = g->data(node->b);
+  var heard: float32* = (float32*)malloc(3 * all * 4);
+  var told: float32* = heard + all;
+  var worked: float32* = told + all;
+  for i: int64 in 0..all { told[i] = rooms[i] + seats[i]; }
+  rms_rows(k->here, told, k->rstd, rows, w);
+  if (node->ints[THINKING_WEIGHTS] >= 0) { add_into_f32(k->here, g->data(node->ints[THINKING_WEIGHTS]), all); }
+  gemm_nt(rows, 3 * w, w, k->here, w, g->data(node->ints[0]), w, k->packed, 3 * w, false);
+  var j: MingleJob = { p: k->packed, out: heard, dout: (float32*)0, dp: (float32*)0, batch: s.dims[0], rooms: s.dims[1], width: w, heads: node->i0 };
+  run_parallel(&mingle_forward_tasks, (rawptr)&j, j.batch * j.heads, j.rooms * j.rooms * w / j.heads * 2);
+  rms_rows(k->hn, heard, k->rstd + rows, rows, w);
+  gemm_nt(rows, w, w, k->hn, w, g->data(node->ints[1]), w, told, w, false);
+  if (node->i3 >= 0) { look_forward(g, node, k, told); }
+  for i: int64 in 0..all { worked[i] = rooms[i] + told[i]; }
+  rms_rows(k->mn, worked, k->rstd + 2 * rows, rows, w);
+  gemm_nt(rows, hid, w, k->mn, w, g->data(node->ints[2]), w, k->pre, hid, false);
+  gelu_rows(k->act, k->pre, rows * hid);
+  gemm_nt(rows, w, hid, k->act, hid, g->data(node->ints[3]), hid, worked, w, false);
+  var gate: float32* = g->data(node->ints[4]);
+  var bias: float32* = g->data(node->ints[5]);
+  var out: float32* = node->value.data;
+  for r: int64 in 0..rows {
+    var share: float32 = sigmoid_f32(dot_f32(k->here + r * w, gate, w) + bias[0]);
+    k->amt[r] = share;
+    for i: int64 in 0..w {
+      var at: int64 = r * w + i;
+      var both: float32 = told[at] + worked[at];
+      k->sum[at] = both;
+      out[at] = rooms[at] + both * share;
+    }
+  }
+  free((rawptr)heard);
+}
+
+export fn backward_ponder(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var s: Shape = node->value.shape;
+  var rows: int64 = s.dims[0] * s.dims[1];
+  var w: int64 = s.dims[2];
+  var all: int64 = rows * w;
+  var hid: int64 = g->nodes[node->ints[2]].value.shape.dims[0];
+  var k: Thought* = (Thought*)node->i2;
+  var dout: float32* = node->grad;
+  var drooms: float32* = if g->nodes[node->a].requires { g->grad_of(node->a) } else { (float32*)0 };
+  var dseats: float32* = if g->nodes[node->b].requires { g->grad_of(node->b) } else { (float32*)0 };
+  var dsum: float32* = (float32*)calloc(9 * all + 2 * rows * hid + rows, 4);
+  var dtold: float32* = dsum + all;
+  var dmn: float32* = dtold + all;
+  var dhn: float32* = dmn + all;
+  var dheard: float32* = dhn + all;
+  var dhere: float32* = dheard + all;
+  var dp: float32* = dhere + all;
+  var dact: float32* = dp + 3 * all;
+  var dpre: float32* = dact + rows * hid;
+  var dz: float32* = dpre + rows * hid;
+  var one: float32 = 1.0;
+  for r: int64 in 0..rows {
+    var share: float32 = k->amt[r];
+    var pull: float32 = 0.0;
+    for i: int64 in 0..w {
+      var at: int64 = r * w + i;
+      pull = pull + dout[at] * k->sum[at];
+      dsum[at] = dout[at] * share;
+      if (drooms != 0) { drooms[at] = drooms[at] + dout[at]; }
+    }
+    dz[r] = pull * share * (one - share);
+  }
+  var gate: float32* = g->data(node->ints[4]);
+  var dgate: float32* = g->grad_of(node->ints[4]);
+  var dbias: float32* = g->grad_of(node->ints[5]);
+  for r: int64 in 0..rows {
+    axpy_f32(dgate, dz[r], k->here + r * w, w);
+    axpy_f32(dhere + r * w, dz[r], gate, w);
+    dbias[0] = dbias[0] + dz[r];
+  }
+  dense_back(dact, g->grad_of(node->ints[3]), dsum, k->act, g->data(node->ints[3]), rows, w, hid);
+  gelu_rows_back(dpre, dact, k->pre, rows * hid);
+  dense_back(dmn, g->grad_of(node->ints[2]), dpre, k->mn, g->data(node->ints[2]), rows, hid, w);
+  rms_rows_back(dtold, dmn, k->mn, k->rstd + 2 * rows, rows, w);
+  for i: int64 in 0..all {
+    if (drooms != 0) { drooms[i] = drooms[i] + dtold[i]; }
+    dtold[i] = dtold[i] + dsum[i];
+  }
+  if (node->i3 >= 0) { look_backward(g, node, k, dtold, dhere); }
+  dense_back(dhn, g->grad_of(node->ints[1]), dtold, k->hn, g->data(node->ints[1]), rows, w, w);
+  rms_rows_back(dheard, dhn, k->hn, k->rstd + rows, rows, w);
+  var j: MingleJob = { p: k->packed, out: (float32*)0, dout: dheard, dp: dp, batch: s.dims[0], rooms: s.dims[1], width: w, heads: node->i0 };
+  run_parallel(&mingle_backward_tasks, (rawptr)&j, j.batch * j.heads, j.rooms * j.rooms * w / j.heads * 6);
+  dense_back(dhere, g->grad_of(node->ints[0]), dp, k->here, g->data(node->ints[0]), rows, 3 * w, w);
+  zero_f32(dmn, all);
+  var heed: int32 = node->ints[THINKING_WEIGHTS];
+  var level: float32* = k->here;
+  if (heed >= 0) {
+    if (g->nodes[heed].requires) { add_into_f32(g->grad_of(heed), dhere, all); }
+    var added: float32* = g->data(heed);
+    for i: int64 in 0..all { dheard[i] = k->here[i] - added[i]; }
+    level = dheard;
+  }
+  rms_rows_back(dmn, dhere, level, k->rstd, rows, w);
+  for i: int64 in 0..all {
+    if (drooms != 0) { drooms[i] = drooms[i] + dmn[i]; }
+    if (dseats != 0) { dseats[i] = dseats[i] + dmn[i]; }
+  }
+  free((rawptr)dsum);
+}
+
+export const THINKING_WEIGHTS = 8;
+
+fn thinking_ids(g: Graph*, k: Thinking, w: int64) -> int32* {
+  var hid: int64 = k.fc.shape().dims[0];
+  if (k.pack.size() != 3 * w * w || k.proj.size() != w * w || k.fc.size() != hid * w || k.out.size() != w * hid || k.gate.size() != w || k.bias.size() != 1) {
+    mmll_fail("the weights of ponder do not fit a width of {w}");
+  }
+  if ((k.seek.id >= 0) != (k.fetch.id >= 0)) { mmll_fail("ponder takes both seek and fetch weights or neither"); }
+  if (k.seek.id >= 0 && (k.seek.size() != w * w || k.fetch.size() != w * w)) { mmll_fail("the lookup weights of ponder do not fit a width of {w}"); }
+  var ids: int32* = g->ints(THINKING_WEIGHTS);
+  ids[0] = k.pack.id;
+  ids[1] = k.proj.id;
+  ids[2] = k.fc.id;
+  ids[3] = k.out.id;
+  ids[4] = k.gate.id;
+  ids[5] = k.bias.id;
+  ids[6] = k.seek.id;
+  ids[7] = k.fetch.id;
+  return ids;
+}
+
+fn weights_require(g: Graph*, ids: int32*) -> bool {
+  if (!g->record) { return false; }
+  for i: int64 in 0..THINKING_WEIGHTS {
+    if (ids[i] >= 0 && g->nodes[ids[i]].requires) { return true; }
+  }
+  return false;
+}
+
+fn ponder_push(rooms: Var, seats: Var, heed: Var, ids: int32*, book: int32, slot: int64, heads: int64, grid: int32, block: int64, value: float32*, slope: float32*) -> Var {
+  var g: Graph* = rooms.g;
+  var s: Shape = rooms.shape();
+  if (s.rank != 3 || !seats.shape().equal(s)) { mmll_fail("ponder takes rooms and seats as [batch, rooms, width], got {s.text()} and {seats.shape().text()}"); }
+  if (heed.id >= 0 && !heed.shape().equal(s)) { mmll_fail("ponder takes what each room heeds as {s.text()}, got {heed.shape().text()}"); }
+  if (heads < 1 || s.dims[2] % heads != 0) { mmll_fail("width {s.dims[2]} does not split into {heads} heads"); }
+  if (grid >= 0) {
+    var source: Node* = g->node(grid);
+    var gs: Shape = source->value.shape;
+    if (source->op != OP_RECALL_EXACT || source->i5 == 0) { mmll_fail("ponder looks up the result of recall_tapped"); }
+    if (ids[6] < 0) { mmll_fail("ponder needs seek and fetch weights to look up a memory"); }
+    if (gs.dims[0] != s.dims[0] || gs.dims[2] != s.dims[2] || source->i0 != heads) { mmll_fail("rooms of {s.text()} in {heads} heads cannot look up a memory of {gs.text()} in {source->i0} heads"); }
+    var blocks: int64 = gs.dims[1] / recall_span(source);
+    if (block < 0 || block >= blocks) { mmll_fail("block {block} is outside a memory of {blocks} blocks"); }
+  }
+  var id: int32 = g->push_onto(OP_PONDER, rooms.id, seats.id, book, s, value);
+  var node: Node* = g->node(id);
+  node->i0 = heads;
+  node->i1 = slot;
+  node->i3 = (int64)grid;
+  node->i4 = block;
+  var own: int32* = g->ints(THINKING_WEIGHTS + 1);
+  for i: int64 in 0..THINKING_WEIGHTS { own[i] = ids[i]; }
+  own[THINKING_WEIGHTS] = heed.id;
+  node->ints = own;
+  if (grid >= 0 && g->record && g->nodes[grid].requires) { node->requires = true; }
+  if (heed.id >= 0 && g->record && g->nodes[heed.id].requires) { node->requires = true; }
+  if (weights_require(g, ids)) { node->requires = true; }
+  if (slope != 0) { node->grad = slope; }
+  if (!g->forward_on_device(id)) { ponder_forward(g, id); }
+  return { g: g, id: id };
+}
+
+export fn ponder_into(rooms: Var, seats: Var, k: Thinking, heads: int64, value: float32*, slope: float32*) -> Var {
+  return ponder_push(rooms, seats, no_gate(rooms.g), thinking_ids(rooms.g, k, rooms.shape().last()), -1, 0, heads, -1, 0, value, slope);
+}
+
+export fn ponder(rooms: Var, seats: Var, k: Thinking, heads: int64) -> Var {
+  return ponder_into(rooms, seats, k, heads, (float32*)0, (float32*)0);
+}
+
+export fn ponder_with(rooms: Var, seats: Var, heed: Var, k: Thinking, heads: int64, grid: Var, block: int64) -> Var {
+  return ponder_push(rooms, seats, heed, thinking_ids(rooms.g, k, rooms.shape().last()), -1, 0, heads, grid.id, block, (float32*)0, (float32*)0);
+}
+
+export fn ponder_book(g: Graph*, k: Thinking, heads: int64, rows: int64, slots: int64) -> Var {
+  var w: int64 = k.proj.shape().dims[0];
+  var ids: int32* = thinking_ids(g, k, w);
+  var id: int32 = g->push(OP_PONDER_SUM, -1, -1, -1, shape(1));
+  var node: Node* = g->node(id);
+  node->ints = ids;
+  node->i0 = heads;
+  node->i1 = slots;
+  node->i3 = rows;
+  node->i4 = w;
+  node->requires = weights_require(g, ids);
+  node->grad = g->floats(1);
+  if (!g->forward_on_device(id)) { node->value.data[0] = 0.0; }
+  return { g: g, id: id };
+}
+
+export fn ponder_in(book: Var, rooms: Var, seats: Var, heed: Var, grid: Var, block: int64, slot: int64, value: float32*, slope: float32*) -> Var {
+  var node: Node* = book.g->node(book.id);
+  var s: Shape = rooms.shape();
+  if (node->op != OP_PONDER_SUM) { mmll_fail("ponder_in takes the result of ponder_book"); }
+  if (slot < 0 || slot >= node->i1) { mmll_fail("round {slot} does not fit a book of {node->i1}"); }
+  if (s.rank != 3 || s.dims[0] * s.dims[1] != node->i3 || s.dims[2] != node->i4) { mmll_fail("rooms of {s.text()} do not fit a book of {node->i3} rows of {node->i4}"); }
+  return ponder_push(rooms, seats, heed, node->ints, book.id, slot, node->i0, grid.id, block, value, slope);
+}
+
+fn foresee_forward(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var ts: Shape = g->nodes[node->a].value.shape;
+  var ss: Shape = g->nodes[node->b].value.shape;
+  var w: int64 = ss.last();
+  var unit: int64 = ss.size();
+  var hid: int64 = g->nodes[node->c].value.shape.dims[0];
+  var rounds: int64 = ts.dims[1];
+  var slots: int64 = (ts.dims[0] - node->i5) * rounds;
+  var rows: int64 = slots * unit / w;
+  var all: int64 = rows * w;
+  var k: Foresight* = (Foresight*)g->host_alloc(sizeof(Foresight));
+  node->i2 = (int64)k;
+  k->x = g->floats(all);
+  k->h = g->floats(rows * hid);
+  k->hg = g->floats(rows * hid);
+  k->gn = g->floats(all);
+  k->tn = g->floats(all);
+  k->rstd = g->floats(2 * rows);
+  var trace: float32* = g->data(node->a);
+  var seats: float32* = g->data(node->b);
+  var scratch: float32* = (float32*)malloc((all + rows) * 4);
+  for i: int64 in 0..all { scratch[i] = trace[i] + seats[i % unit]; }
+  rms_rows(k->x, scratch, k->rstd, rows, w);
+  gemm_nt(rows, hid, w, k->x, w, g->data(node->c), w, k->h, hid, false);
+  gelu_rows(k->hg, k->h, rows * hid);
+  gemm_nt(rows, w, hid, k->hg, hid, g->data(node->ints[0]), hid, scratch, w, false);
+  rms_rows(k->gn, scratch, k->rstd + rows, rows, w);
+  for slot: int64 in 0..slots {
+    var at: int64 = (slot / rounds + node->i5) * rounds + rounds - 1;
+    rms_rows(k->tn + slot * unit, trace + at * unit, scratch + all, unit / w, w);
+  }
+  var total: float64 = 0.0;
+  for i: int64 in 0..all {
+    var d: float64 = (float64)k->gn[i] - (float64)k->tn[i];
+    total = total + d * d;
+  }
+  node->value.data[0] = (float32)(total * (float64)node->f0);
+  free((rawptr)scratch);
+}
+
+export fn backward_foresee(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var ts: Shape = g->nodes[node->a].value.shape;
+  var ss: Shape = g->nodes[node->b].value.shape;
+  var w: int64 = ss.last();
+  var unit: int64 = ss.size();
+  var hid: int64 = g->nodes[node->c].value.shape.dims[0];
+  var slots: int64 = (ts.dims[0] - node->i5) * ts.dims[1];
+  var rows: int64 = slots * unit / w;
+  var all: int64 = rows * w;
+  var k: Foresight* = (Foresight*)node->i2;
+  var by: float32 = node->grad[0] * (node->f0 + node->f0);
+  var dgn: float32* = (float32*)calloc(3 * all + 2 * rows * hid, 4);
+  var dguess: float32* = dgn + all;
+  var dx: float32* = dguess + all;
+  var dhg: float32* = dx + all;
+  var dh: float32* = dhg + rows * hid;
+  for i: int64 in 0..all { dgn[i] = (k->gn[i] - k->tn[i]) * by; }
+  rms_rows_back(dguess, dgn, k->gn, k->rstd + rows, rows, w);
+  dense_back(dhg, g->grad_of(node->ints[0]), dguess, k->hg, g->data(node->ints[0]), rows, w, hid);
+  gelu_rows_back(dh, dhg, k->h, rows * hid);
+  dense_back(dx, g->grad_of(node->c), dh, k->x, g->data(node->c), rows, hid, w);
+  zero_f32(dgn, all);
+  rms_rows_back(dgn, dx, k->x, k->rstd, rows, w);
+  if (g->nodes[node->a].requires) {
+    var dtrace: float32* = g->grad_of(node->a);
+    for i: int64 in 0..all { dtrace[i] = dtrace[i] + dgn[i]; }
+  }
+  if (g->nodes[node->b].requires) {
+    var dseats: float32* = g->grad_of(node->b);
+    for i: int64 in 0..all { dseats[i % unit] = dseats[i % unit] + dgn[i]; }
+  }
+  free((rawptr)dgn);
+}
+
+export fn foresee(trace: Var, seats: Var, fore: Var, tell: Var, ahead: int64, scale: float64) -> Var {
+  var g: Graph* = trace.g;
+  var ts: Shape = trace.shape();
+  var ss: Shape = seats.shape();
+  var w: int64 = ss.last();
+  var unit: int64 = ss.size();
+  if (ts.rank != 4 || ts.dims[3] != w || ts.dims[2] * w != unit) {
+    mmll_fail("foresee takes a trace as [spans, rounds, rows, width] and seats of rows * width values, got {ts.text()} and {ss.text()}");
+  }
+  if (ahead < 1 || ahead >= ts.dims[0]) { mmll_fail("foresee looks {ahead} spans ahead in a trace of {ts.dims[0]}"); }
+  var hid: int64 = fore.shape().dims[0];
+  if (fore.size() != hid * w || tell.size() != w * hid) { mmll_fail("the weights of foresee do not fit a width of {w}"); }
+  var id: int32 = g->push(OP_FORESEE, trace.id, seats.id, fore.id, shape(1));
+  var ids: int32* = g->ints(1);
+  ids[0] = tell.id;
+  var node: Node* = g->node(id);
+  node->ints = ids;
+  node->i5 = ahead;
+  node->f0 = (float32)(scale / (float64)unit);
+  if (g->record && g->nodes[tell.id].requires) { node->requires = true; }
+  if (!g->forward_on_device(id)) { foresee_forward(g, id); }
+  return { g: g, id: id };
+}
+
+fn consult_forward(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var s: Shape = node->value.shape;
+  var rooms: int64 = s.dims[1];
+  var w: int64 = s.dims[2];
+  var h: int64 = node->i0;
+  var d: int64 = w / h;
+  var dd: int64 = d * d;
+  var q: float32* = g->data(node->a);
+  var states: float32* = g->nodes[node->b].saved2 + node->i1 * s.dims[0] * h * dd;
+  var out: float32* = node->value.data;
+  for b: int64 in 0..s.dims[0] {
+    for room: int64 in 0..rooms {
+      for head: int64 in 0..h {
+        var at: int64 = (b * rooms + room) * w + head * d;
+        var rs: float32 = (float32)(1.0 / sqrt((float64)dot_f32(q + at, q + at, d) / (float64)d + RECALL_EPS));
+        node->saved2[(b * rooms + room) * h + head] = rs;
+        for i: int64 in 0..d { node->saved[at + i] = q[at + i] * rs; }
+        var store: float32* = states + (b * h + head) * dd;
+        for e: int64 in 0..d { out[at + e] = dot_f32(store + e * d, node->saved + at, d); }
+      }
+    }
+  }
+}
+
+export fn backward_consult(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var s: Shape = node->value.shape;
+  var rooms: int64 = s.dims[1];
+  var w: int64 = s.dims[2];
+  var h: int64 = node->i0;
+  var d: int64 = w / h;
+  var dd: int64 = d * d;
+  var grid: Node* = g->node(node->b);
+  var states: float32* = grid->saved2 + node->i1 * s.dims[0] * h * dd;
+  var taps: float32* = if grid->requires { (float32*)grid->i5 + node->i1 * s.dims[0] * h * dd } else { (float32*)0 };
+  var dq: float32* = if g->nodes[node->a].requires { g->grad_of(node->a) } else { (float32*)0 };
+  var dout: float32* = node->grad;
+  var pull: float32* = (float32*)malloc(d * 4);
+  for b: int64 in 0..s.dims[0] {
+    for room: int64 in 0..rooms {
+      for head: int64 in 0..h {
+        var at: int64 = (b * rooms + room) * w + head * d;
+        var qn: float32* = node->saved + at;
+        var store: float32* = states + (b * h + head) * dd;
+        zero_f32(pull, d);
+        for e: int64 in 0..d {
+          axpy_f32(pull, dout[at + e], store + e * d, d);
+          if (taps != 0) { axpy_f32(taps + (b * h + head) * dd + e * d, dout[at + e], qn, d); }
+        }
+        if (dq != 0) {
+          var rs: float32 = node->saved2[(b * rooms + room) * h + head];
+          var lean: float32 = dot_f32(pull, qn, d) / (float32)d;
+          for i: int64 in 0..d { dq[at + i] = dq[at + i] + rs * (pull[i] - qn[i] * lean); }
+        }
+      }
+    }
+  }
+  free((rawptr)pull);
+}
+
+export fn consult(grid: Var, block: int64, q: Var) -> Var {
+  var g: Graph* = q.g;
+  var s: Shape = q.shape();
+  var source: Node* = g->node(grid.id);
+  if (source->op != OP_RECALL_EXACT || source->i5 == 0) { mmll_fail("consult takes the result of recall_tapped"); }
+  var gs: Shape = source->value.shape;
+  if (s.rank != 3 || s.dims[0] != gs.dims[0] || s.dims[2] != gs.dims[2]) { mmll_fail("consult takes queries as [batch, count, width] for a memory of {gs.text()}, got {s.text()}"); }
+  var blocks: int64 = gs.dims[1] / recall_span(source);
+  if (block < 0 || block >= blocks) { mmll_fail("block {block} is outside a memory of {blocks} blocks"); }
+  var heads: int64 = source->i0;
+  var id: int32 = g->push(OP_CONSULT, q.id, grid.id, -1, s);
+  var node: Node* = g->node(id);
+  node->i0 = heads;
+  node->i1 = block;
+  node->saved = g->floats(s.size());
+  node->saved2 = g->floats(s.dims[0] * s.dims[1] * heads);
+  if (!g->forward_on_device(id)) { consult_forward(g, id); }
+  return { g: g, id: id };
+}

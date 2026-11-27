@@ -1,0 +1,519 @@
+import "std/mem";
+import "./tensor";
+import "./kernels";
+import "./graph";
+import "./ops_elementwise";
+import "./ops_shape";
+import "./ops_matmul";
+import "./ops_nn";
+
+export const FUSED_SIDE = 48;
+
+fn fused_ready(g: Graph*, side: int64) -> bool {
+  return g->on_device() && side <= FUSED_SIDE && !g->plain;
+}
+
+fn sharpened(x: Var) -> Var {
+  var keen: Var = x.square();
+  return keen.div(keen.sum_axis(1, true));
+}
+
+export fn scale_by(x: Var, by: Var) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  if (by.size() != 1 || s.rank != 2 || s.dims[1] != 1) { mmll_fail("scale_by needs [n, 1] and one value, got {s.text()} and {by.shape().text()}"); }
+  if (!g->on_device() || g->plain) { return x.matmul(by.view(1, 1)); }
+  var id: int32 = g->push(OP_SCALE_BY, x.id, by.id, -1, s);
+  g->forward_on_device(id);
+  return { g: g, id: id };
+}
+
+fn spread_of(g: Graph*, batch: int64, vocab: int64, slots: int32*) -> float32* {
+  var out: float32* = (float32*)g->host_alloc(batch * vocab * 4);
+  for r: int64 in 0..batch {
+    var taken: int64 = 0;
+    for s: int64 in 0..vocab {
+      if (slots[r * vocab + s] >= 0) { taken = taken + 1; }
+    }
+    var share: float32 = (float32)(1.0 / (float64)(if taken < 1 { 1 } else { taken }));
+    for s: int64 in 0..vocab { out[r * vocab + s] = if slots[r * vocab + s] >= 0 { share } else { (float32)0.0 }; }
+  }
+  return out;
+}
+
+fn on_device(g: Graph*, host: float32*, n: int64) -> float32* {
+  if (!g->on_device()) { return host; }
+  var p: float32* = g->floats(n);
+  g->dev->put((rawptr)p, (rawptr)host, n * 4);
+  return p;
+}
+
+export fn fallback(g: Graph*, batch: int64, vocab: int64, slots: int32*) -> Var {
+  return g->input(tensor_view(spread_of(g, batch, vocab, slots), shape(batch, 1, vocab)));
+}
+
+export fn chain_join(rules: Var, at: int32*) -> Var {
+  var g: Graph* = rules.g;
+  var s: Shape = rules.shape();
+  if (s.rank != 3 || s.dims[1] != s.dims[2]) { mmll_fail("chain_join needs [rows, side, side], got {s.text()}"); }
+  var rows: int64 = s.dims[0];
+  var side: int64 = s.dims[1];
+  for r: int64 in 0..rows {
+    if (at[r] < 0 || (int64)at[r] >= rows) { mmll_fail("chain_join row {at[r]} is outside {rows}"); }
+  }
+  if (!fused_ready(g, side)) {
+    var far: Var = gather_rows(rules.view(rows, side * side), at, shape(rows, side * side)).view(rows, side, side);
+    return sharpened(rules.matmul(far));
+  }
+  var id: int32 = g->push(OP_JOIN, rules.id, -1, -1, s);
+  g->nodes[id].ints = g->index_from(at, rows);
+  if (g->nodes[id].requires) { g->nodes[id].ext = (rawptr)rows_by_id(g, at, rows, rows); }
+  g->forward_on_device(id);
+  return { g: g, id: id };
+}
+
+export fn chain_rules(tables: Var, choice: Var, unseen: Var) -> Var {
+  var g: Graph* = tables.g;
+  var s: Shape = tables.shape();
+  if (s.rank != 3 || s.dims[1] != s.dims[2]) { mmll_fail("chain_rules needs [rows, letters, letters], got {s.text()}"); }
+  var rows: int64 = s.dims[0];
+  var letters: int64 = s.dims[1];
+  var states: int64 = letters + 1;
+  if (choice.size() != rows * 3) { mmll_fail("chain_rules needs three choices a row, got {choice.shape().text()}"); }
+  if (unseen.size() != 1) { mmll_fail("chain_rules needs one unseen value, got {unseen.shape().text()}"); }
+  if (!fused_ready(g, states)) {
+    var floor: Var = unseen.view(1, 1);
+    var fore: Var = tables.div(tables.sum_axis(1, true).add(floor));
+    var hind: Var = tables.div(tables.sum_axis(2, true).add(floor)).transpose(1, 2);
+    var edge: Tensor = tensor_view((float32*)g->host_alloc(rows * states * 4), shape(rows, states, 1));
+    var unit: Tensor = tensor_view((float32*)g->host_alloc(rows * states * states * 4), shape(rows, 1, states * states));
+    for r: int64 in 0..rows {
+      for i: int64 in 0..states { edge.data[r * states + i] = if i == letters { (float32)1.0 } else { (float32)0.0 }; }
+      for i: int64 in 0..states * states { unit.data[r * states * states + i] = if i / states == i % states { (float32)1.0 } else { (float32)0.0 }; }
+    }
+    var sink: Var = g->input(edge);
+    var forth: Var = sharpened(concat(concat(fore, fore.sum_axis(1, true).neg().shift(1.0), 1), sink, 2));
+    var reverse: Var = sharpened(concat(concat(hind, hind.sum_axis(1, true).neg().shift(1.0), 1), sink, 2));
+    var kinds: Var = concat(concat(g->input(unit), forth.view(rows, 1, states * states), 1), reverse.view(rows, 1, states * states), 1);
+    return choice.view(rows, 1, 3).matmul(kinds).view(rows, states, states);
+  }
+  var id: int32 = g->push(OP_RULES, tables.id, choice.id, unseen.id, shape(rows, states, states));
+  g->forward_on_device(id);
+  return { g: g, id: id };
+}
+
+export struct SolvePlan {
+  batch: int64;
+  time: int64;
+  stride: int64;
+  marks: int64;
+  reach: int64;
+  letters: int64;
+  vocab: int64;
+  rows: int64;
+  plain: int32*;
+  sorts: int32*;
+  slots: int32*;
+  syms: int32*;
+  spots: int32*;
+  dplain: int32*;
+  dsorts: int32*;
+  dorder: int32*;
+  dslots: int32*;
+  dsyms: int32*;
+  spread: float32*;
+  dspread: float32*;
+  wired: bool;
+  fall: Var;
+  awake: Var;
+  needed: Var;
+  late: Var;
+  wide: Var;
+}
+
+export fn solve_plan(g: Graph*, batch: int64, time: int64, stride: int64, reach: int64, letters: int64, vocab: int64, plain: int32*, sorts: int32*, slots: int32*) -> SolvePlan* {
+  var p: SolvePlan* = (SolvePlan*)g->host_alloc(sizeof(SolvePlan));
+  memset((rawptr)p, 0, sizeof(SolvePlan));
+  var rows: int64 = batch * time;
+  p->batch = batch;
+  p->time = time;
+  p->stride = stride;
+  p->marks = time / stride;
+  p->reach = reach;
+  p->letters = letters;
+  p->vocab = vocab;
+  p->rows = rows;
+  p->plain = plain;
+  p->sorts = sorts;
+  p->slots = slots;
+  p->syms = g->ints(batch * letters);
+  p->spots = g->ints(rows);
+  for i: int64 in 0..batch * letters { p->syms[i] = (int32)(0 - 1); }
+  for r: int64 in 0..batch {
+    for s: int64 in 0..vocab {
+      var c: int32 = slots[r * vocab + s];
+      if (c >= 0) { p->syms[r * letters + (int64)c] = (int32)s; }
+    }
+  }
+  for i: int64 in 0..rows { p->spots[i] = (int32)((i / time) * p->marks + (i % time) / stride); }
+  p->spread = spread_of(g, batch, vocab, slots);
+  p->dspread = on_device(g, p->spread, batch * vocab);
+  if (g->on_device()) {
+    p->dplain = g->index_from(plain, rows * reach);
+    p->dsorts = g->index_from(sorts, rows);
+    p->dorder = rows_by_id(g, sorts, rows, batch * letters + 1);
+    p->dslots = g->index_from(slots, batch * vocab);
+    p->dsyms = g->index_from(p->syms, batch * letters);
+  }
+  return p;
+}
+
+fn solve_fused(g: Graph*, p: SolvePlan*) -> bool {
+  return fused_ready(g, p->letters + 1) && p->reach <= FUSED_SIDE;
+}
+
+fn host_tensor(g: Graph*, s: Shape) -> Tensor {
+  var t: Tensor = tensor_view((float32*)g->host_alloc(s.size() * 4), s);
+  for i: int64 in 0..s.size() { t.data[i] = (float32)0.0; }
+  return t;
+}
+
+fn solve_wire(g: Graph*, p: SolvePlan*) {
+  if (p->wired) { return; }
+  p->wired = true;
+  var rows: int64 = p->rows;
+  var awake: Tensor = host_tensor(g, shape(rows, p->marks, p->reach));
+  var needed: Tensor = host_tensor(g, shape(rows, p->marks, 1));
+  var late: Tensor = host_tensor(g, shape(rows, p->stride, p->letters));
+  var wide: Tensor = host_tensor(g, shape(p->batch, p->letters, p->vocab));
+  var none: int32 = (int32)(p->batch * p->letters);
+  for i: int64 in 0..rows {
+    var pos: int64 = i % p->time;
+    for m: int64 in 0..p->marks {
+      if (pos < m * p->stride) {
+        for o: int64 in 0..p->reach { awake.data[(i * p->marks + m) * p->reach + o] = (float32)1.0; }
+      }
+      if (m >= pos / p->stride) { needed.data[i * p->marks + m] = (float32)1.0; }
+    }
+    if (p->sorts[i] == none) { continue; }
+    var c: int64 = (int64)p->sorts[i] % p->letters;
+    for later: int64 in pos + 1..(pos / p->stride + 1) * p->stride {
+      late.data[((i - pos + later) * p->stride + pos % p->stride) * p->letters + c] = (float32)1.0;
+    }
+  }
+  for i: int64 in 0..p->batch * p->letters {
+    if (p->syms[i] >= 0) { wide.data[i * p->vocab + (int64)p->syms[i]] = (float32)1.0; }
+  }
+  p->awake = g->input(awake);
+  p->fall = g->input(tensor_view(p->spread, shape(p->batch, 1, p->vocab)));
+  p->needed = g->input(needed);
+  p->late = g->input(late);
+  p->wide = g->input(wide);
+}
+
+fn lent_keys(p: SolvePlan*, beliefs: Var, bid: Var) -> Var {
+  var lent: Var = p->awake.mul(bid.view(p->rows, 1, 1));
+  return spread_last(beliefs.view(p->rows, p->marks, p->reach).mul(lent), p->plain, p->letters);
+}
+
+fn fused_node(g: Graph*, op: int32, a: int32, b: int32, c: int32, s: Shape, p: SolvePlan*) -> Var {
+  var id: int32 = g->push(op, a, b, c, s);
+  g->nodes[id].ext = (rawptr)p;
+  return { g: g, id: id };
+}
+
+export fn solve_table(p: SolvePlan*, beliefs: Var, bid: Var) -> Var {
+  var g: Graph* = beliefs.g;
+  var b: int64 = p->batch;
+  var l: int64 = p->letters;
+  if (!solve_fused(g, p)) {
+    solve_wire(g, p);
+    var keys: Var = lent_keys(p, beliefs, bid);
+    var real: Var = fold_rows(keys.view(p->rows, p->marks * l), p->sorts, b * l + 1).slice(0, 0, b * l).view(b, l, p->marks, l);
+    return concat(real, real.sum_axis(1, true), 1);
+  }
+  var out: Var = fused_node(g, OP_SOLVE_TABLE, beliefs.id, bid.id, -1, shape(b, l + 1, p->marks, l), p);
+  g->nodes[out.id].saved = g->floats(p->rows * p->marks * l);
+  g->forward_on_device(out.id);
+  return out;
+}
+
+export fn solve_proof(p: SolvePlan*, table: Var, beliefs: Var, bid: Var, terms: Var) -> Var {
+  var g: Graph* = beliefs.g;
+  var b: int64 = p->batch;
+  var l: int64 = p->letters;
+  var rows: int64 = p->rows;
+  if (!solve_fused(g, p)) {
+    solve_wire(g, p);
+    var keys: Var = lent_keys(p, beliefs, bid);
+    var flat: Var = concat(table.slice(1, 0, l).view(b * l, p->marks * l), g->full(shape(1, p->marks * l), 0.0), 0);
+    var mapped: Var = gather_rows(flat, p->sorts, shape(rows, p->marks * l)).view(rows, p->marks, l);
+    var filled: Var = table.slice(1, l, 1);
+    var row: Var = terms.view(1, terms.size());
+    var hits: Var = take_last(mapped.sub(keys), p->plain, p->reach).relu().add(row.slice(1, 0, 1)).log();
+    var mass: Var = take_last(filled.sub(keys.view(b, p->time, p->marks, l)).view(rows, p->marks, l), p->plain, p->reach).relu().add(row.slice(1, 1, 1)).log();
+    return hits.sub(mass).mul(p->awake);
+  }
+  var out: Var = fused_node(g, OP_SOLVE_PROOF, table.id, beliefs.id, bid.id, shape(rows, p->marks, p->reach), p);
+  g->nodes[out.id].i5 = (int64)terms.id;
+  var from: Node* = g->node(table.id);
+  if (from->op == OP_SOLVE_TABLE && from->a == beliefs.id && from->b == bid.id) {
+    g->nodes[out.id].saved = from->saved;
+  } else {
+    g->nodes[out.id].saved = g->floats(rows * p->marks * l);
+    g->nodes[out.id].i4 = 1;
+  }
+  if (g->record && g->nodes[terms.id].requires) { g->nodes[out.id].requires = true; }
+  g->forward_on_device(out.id);
+  return out;
+}
+
+export fn solve_beliefs(p: SolvePlan*, lift: Var, spot: Var) -> Var {
+  var g: Graph* = spot.g;
+  var rows: int64 = p->rows;
+  if (!solve_fused(g, p)) {
+    solve_wire(g, p);
+    var wide: Var = g->full(shape(rows, p->marks, 1), 1.0).matmul(spot.view(rows, 1, p->reach));
+    if (lift.id >= 0) { wide = wide.add(lift.view(rows, p->marks, p->reach)); }
+    return wide.softmax().mul(p->needed);
+  }
+  var out: Var = fused_node(g, OP_SOLVE_BELIEFS, lift.id, spot.id, -1, shape(rows, p->marks, p->reach), p);
+  g->forward_on_device(out.id);
+  return out;
+}
+
+export fn solve_first(p: SolvePlan*, spot: Var) -> Var {
+  var none: Var = { g: spot.g, id: -1 };
+  return solve_beliefs(p, none, spot);
+}
+
+export fn solve_tables(p: SolvePlan*, table: Var, mine: Var, bid: Var) -> Var {
+  var g: Graph* = table.g;
+  var b: int64 = p->batch;
+  var l: int64 = p->letters;
+  var rows: int64 = p->rows;
+  if (!solve_fused(g, p)) {
+    solve_wire(g, p);
+    var lended: Var = gather_rows(spread_last(mine.view(rows, 1, p->reach), p->plain, l).mul(bid.view(rows, 1, 1)).view(b * p->marks, p->stride * l), p->spots, shape(rows, p->stride * l)).view(rows, p->stride, l);
+    var base: Var = gather_rows(table.slice(1, 0, l).transpose(1, 2).view(b * p->marks, l * l), p->spots, shape(rows, l * l)).view(rows, l, l);
+    return base.add(p->late.transpose(1, 2).matmul(lended));
+  }
+  var out: Var = fused_node(g, OP_SOLVE_TABLES, table.id, mine.id, bid.id, shape(rows, l, l), p);
+  g->forward_on_device(out.id);
+  return out;
+}
+
+export fn solve_guess(p: SolvePlan*, tables: Var, mine: Var, terms: Var) -> Var {
+  var g: Graph* = tables.g;
+  var rows: int64 = p->rows;
+  if (!solve_fused(g, p)) {
+    solve_wire(g, p);
+    var doubt: Var = terms.view(1, terms.size()).slice(1, 1, 1);
+    var cast: Var = take_last(tables, p->plain, p->reach).transpose(1, 2).view(p->batch, p->time * p->reach, p->letters).matmul_exact(p->wide).view(rows, p->reach, p->vocab);
+    var total: Var = cast.sum_axis(2, true).add(doubt);
+    var held: Var = mine.view(rows, 1, p->reach);
+    var floor: Var = p->fall.view(p->batch * p->vocab, 1).matmul(doubt).view(p->batch, 1, p->vocab);
+    var lifted: Var = cast.view(p->batch, p->time * p->reach, p->vocab).add(floor).view(rows, p->reach, p->vocab);
+    return concat(held.matmul(cast.div(total)), held.matmul(lifted.div(total)), 1);
+  }
+  var out: Var = fused_node(g, OP_SOLVE_GUESS, tables.id, mine.id, terms.id, shape(rows, 2, p->vocab), p);
+  g->forward_on_device(out.id);
+  return out;
+}
+
+export struct RoundPlan {
+  batch: int64;
+  time: int64;
+  vocab: int64;
+  letters: int64;
+  experts: int64;
+  rows: int64;
+  counted: int64;
+  coach: float64;
+  slack: float64;
+  slots: int32*;
+  nexts: int32*;
+  targets: int32*;
+  dslots: int32*;
+  dsyms: int32*;
+  dnexts: int32*;
+  dtargets: int32*;
+  spread: float32*;
+  dspread: float32*;
+  wired: bool;
+  fall: Var;
+  wide: Var;
+  hot: Var;
+  open: Var;
+}
+
+export fn round_plan(g: Graph*, batch: int64, time: int64, vocab: int64, letters: int64, experts: int64, slots: int32*, nexts: int32*, targets: int32*, coach: float64, slack: float64) -> RoundPlan* {
+  var p: RoundPlan* = (RoundPlan*)g->host_alloc(sizeof(RoundPlan));
+  memset((rawptr)p, 0, sizeof(RoundPlan));
+  var rows: int64 = batch * time;
+  p->batch = batch;
+  p->time = time;
+  p->vocab = vocab;
+  p->letters = letters;
+  p->experts = experts;
+  p->rows = rows;
+  p->coach = coach;
+  p->slack = slack;
+  p->slots = slots;
+  p->nexts = nexts;
+  p->targets = targets;
+  p->spread = spread_of(g, batch, vocab, slots);
+  p->dspread = on_device(g, p->spread, batch * vocab);
+  for i: int64 in 0..rows {
+    if (targets[i] >= 0) { p->counted = p->counted + 1; }
+    if ((int64)targets[i] >= vocab) { mmll_fail("target {targets[i]} is outside {vocab} classes"); }
+  }
+  if (g->on_device()) {
+    var syms: int32* = g->ints(batch * letters);
+    for i: int64 in 0..batch * letters { syms[i] = (int32)(0 - 1); }
+    for r: int64 in 0..batch {
+      for s: int64 in 0..vocab {
+        var c: int32 = slots[r * vocab + s];
+        if (c >= 0) { syms[r * letters + (int64)c] = (int32)s; }
+      }
+    }
+    p->dslots = g->index_from(slots, batch * vocab);
+    p->dsyms = g->index_from(syms, batch * letters);
+    p->dnexts = g->index_from(nexts, rows);
+    p->dtargets = g->index_from(targets, rows);
+  }
+  return p;
+}
+
+fn round_wire(g: Graph*, p: RoundPlan*) {
+  if (p->wired) { return; }
+  p->wired = true;
+  var wide: Tensor = host_tensor(g, shape(p->batch, p->letters, p->vocab));
+  var hot: Tensor = host_tensor(g, shape(p->rows, 1, p->vocab));
+  var open: Tensor = host_tensor(g, shape(p->batch, p->time, 1));
+  for r: int64 in 0..p->batch {
+    for s: int64 in 0..p->vocab {
+      var c: int32 = p->slots[r * p->vocab + s];
+      if (c >= 0) { wide.data[(r * p->letters + (int64)c) * p->vocab + s] = (float32)1.0; }
+    }
+  }
+  for i: int64 in 0..p->rows {
+    if (p->nexts[i] < 0) { continue; }
+    hot.data[i * p->vocab + (int64)p->nexts[i]] = (float32)1.0;
+    open.data[i] = (float32)1.0;
+  }
+  p->fall = g->input(tensor_view(p->spread, shape(p->batch, 1, p->vocab)));
+  p->wide = g->input(wide);
+  p->hot = g->input(hot);
+  p->open = g->input(open);
+}
+
+fn certainty(sure: Var, slack: float64) -> Var {
+  return sure.shift(slack).log().sub(sure.neg().shift(1.0 + slack).log());
+}
+
+export fn chain_round(p: RoundPlan*, rules: Var, resting: Var, at: int32*, base: Var, floor: Var, lean: Var, king: Var, heed: Var) -> Var {
+  var g: Graph* = rules.g;
+  var b: int64 = p->batch;
+  var t: int64 = p->time;
+  var v: int64 = p->vocab;
+  var e: int64 = p->experts;
+  var rows: int64 = p->rows;
+  var states: int64 = p->letters + 1;
+  if (!fused_ready(g, states)) {
+    round_wire(g, p);
+    var far: Var = gather_rows(resting.view(rows, states), at, shape(rows, states)).view(rows, states, 1);
+    var raw: Var = rules.matmul(far).view(b, t, states).slice(2, 0, p->letters).matmul_exact(p->wide).view(rows, 1, v);
+    var total: Var = raw.sum_axis(2, true);
+    var reply: Var = raw.add(total.neg().shift(1.0).view(b, t, 1).matmul(p->fall).view(rows, 1, v));
+    var fit: Var = reply.mul(p->hot).sum_axis(2, false).shift(0.02).log().view(b, t, 1).mul(p->open);
+    var merit: Var = certainty(total, p->slack).view(rows, 1).matmul(heed.view(1, 1)).view(b, t, 1);
+    var last: Var = lean.view(b, t, 1).add(king.matmul(fit)).add(merit);
+    var share: Var = concat(floor.view(b, t, e - 1), last, 2).softmax();
+    var odds: Var = share.view(rows, 1, e).matmul(concat(base.view(rows, e - 1, v), reply, 1)).view(b, t, v);
+    var loss: Var = cross_entropy(odds.shift(1.0e-6).log(), p->targets, 0.0).view(1);
+    return loss.add(cross_entropy(reply.view(b, t, v).shift(1.0e-6).log(), p->targets, 0.0).view(1).scale(p->coach));
+  }
+  var id: int32 = g->push(OP_ROUND, rules.id, resting.id, base.id, shape(1));
+  var n: Node* = g->node(id);
+  n->i0 = (int64)floor.id;
+  n->i1 = (int64)lean.id;
+  n->i2 = (int64)king.id;
+  n->i3 = (int64)heed.id;
+  n->ext = (rawptr)p;
+  n->ints = g->index_from(at, rows);
+  n->saved = g->floats(rows * (v + e + 4));
+  if (g->record && (g->nodes[floor.id].requires || g->nodes[lean.id].requires || g->nodes[king.id].requires || g->nodes[heed.id].requires)) { n->requires = true; }
+  if (n->requires) { g->nodes[id].i4 = (int64)rows_by_id(g, at, rows, rows); }
+  g->forward_on_device(id);
+  return { g: g, id: id };
+}
+
+export fn chain_anchor(resting: Var, rests: Var, looks: Var, time: int64) -> Var {
+  var g: Graph* = resting.g;
+  var s: Shape = resting.shape();
+  if (s.rank != 2 || rests.size() != s.dims[0] || looks.size() % s.dims[0] != 0) { mmll_fail("chain_anchor needs [rows, side] states, got {s.text()}"); }
+  var rows: int64 = s.dims[0];
+  var side: int64 = s.dims[1];
+  var reach: int64 = looks.size() / rows;
+  if (!g->on_device() || g->plain) {
+    var diag: Tensor = host_tensor(g, shape(rows, 1, time));
+    var shift: Tensor = host_tensor(g, shape(rows, reach, time));
+    for i: int64 in 0..rows {
+      var at: int64 = i % time;
+      diag.data[i * time + at] = (float32)1.0;
+      for o: int64 in 0..reach { shift.data[(i * reach + o) * time + (if at > o { at - o - 1 } else { at })] = (float32)1.0; }
+    }
+    var held: Var = rests.view(rows, 1, 1);
+    var anchor: Var = held.matmul(g->input(diag)).add(held.neg().shift(1.0).matmul(looks.view(rows, 1, reach).matmul(g->input(shift))));
+    return anchor.view(rows / time, time, time).matmul(resting.view(rows / time, time, side)).view(rows, side);
+  }
+  var id: int32 = g->push(OP_ANCHOR, resting.id, rests.id, looks.id, s);
+  g->nodes[id].i0 = time;
+  g->forward_on_device(id);
+  return { g: g, id: id };
+}
+
+export fn count_picks(g: Graph*, picks: int32*, sample: int64, out: Shape) -> Var {
+  var cells: int64 = out.rows();
+  var vocab: int64 = out.last();
+  var id: int32 = g->push(OP_TALLY, -1, -1, -1, out);
+  g->nodes[id].ints = g->index_from(picks, cells * sample);
+  g->nodes[id].i0 = sample;
+  if (g->on_device()) {
+    g->forward_on_device(id);
+    return { g: g, id: id };
+  }
+  var dst: float32* = g->data(id);
+  for c: int64 in 0..cells {
+    var row: float32* = dst + c * vocab;
+    for v: int64 in 0..vocab { row[v] = (float32)0.0; }
+    var n: int64 = 0;
+    for j: int64 in 0..sample {
+      if (picks[c * sample + j] >= 0) { n = n + 1; }
+    }
+    for j: int64 in 0..sample {
+      var p: int64 = (int64)picks[c * sample + j];
+      if (p >= 0) { row[p] = row[p] + (float32)(1.0 / (float64)n); }
+    }
+  }
+  return { g: g, id: id };
+}
+
+export fn pick_at(x: Var, ids: int32*) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  if (s.rank != 3) { mmll_fail("pick_at needs [rows, group, width], got {s.text()}"); }
+  if (!g->on_device() || g->plain) {
+    var mask: Tensor = host_tensor(g, shape(s.dims[0], 1, s.dims[2]));
+    for r: int64 in 0..s.dims[0] {
+      if (ids[r] >= 0) { mask.data[r * s.dims[2] + (int64)ids[r]] = (float32)1.0; }
+    }
+    return x.mul(g->input(mask)).sum_axis(2, false);
+  }
+  var id: int32 = g->push(OP_PICK, x.id, -1, -1, shape(s.dims[0], s.dims[1]));
+  g->nodes[id].ints = g->index_from(ids, s.dims[0]);
+  g->nodes[id].i0 = s.dims[1];
+  g->forward_on_device(id);
+  return { g: g, id: id };
+}

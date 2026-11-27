@@ -9,10 +9,11 @@ import "./ops_matmul";
 import "./ops_nn";
 import "./ops_conv";
 import "./ops_attention";
+import "./ops_recall";
 
 fn backward_node(g: Graph*, id: int32) {
   var op: int32 = g->nodes[id].op;
-  if (op == OP_LEAF || op == OP_RESHAPE) { return; }
+  if (op == OP_LEAF || op == OP_RESHAPE || op == OP_PONDER_SUM) { return; }
   if (op >= OP_ADD && op <= OP_DIV) { backward_binary(g, id); return; }
   if (op >= OP_ADD_SCALAR && op <= OP_SQUARE) { backward_unary(g, id); return; }
   if (op >= OP_SUM_ALL && op <= OP_MAX) { backward_reduce(g, id); return; }
@@ -28,8 +29,21 @@ fn backward_node(g: Graph*, id: int32) {
   if (op == OP_LAYER_NORM || op == OP_RMS_NORM) { backward_norm(g, id); return; }
   if (op == OP_DROPOUT) { backward_dropout(g, id); return; }
   if (op == OP_GATHER_ROWS) { backward_gather_rows(g, id); return; }
+  if (op == OP_FOLD) { backward_fold(g, id); return; }
+  if (op == OP_TAKE) { backward_take(g, id); return; }
+  if (op == OP_SPREAD) { backward_spread(g, id); return; }
   if (op == OP_ATTENTION) { backward_attention(g, id); return; }
   if (op == OP_QK_ROPE) { backward_qk_rope(g, id); return; }
+  if (op == OP_RECALL || op == OP_RECALL_EXACT) { backward_recall(g, id); return; }
+  if (op == OP_MINGLE) { backward_mingle(g, id); return; }
+  if (op == OP_PONDER) { backward_ponder(g, id); return; }
+  if (op == OP_FORESEE) { backward_foresee(g, id); return; }
+  if (op == OP_CONSULT) { backward_consult(g, id); return; }
+  if (op == OP_ADD_MUL) { backward_add_mul(g, id); return; }
+  if (op == OP_RESIDUAL) { backward_residual(g, id); return; }
+  if (op == OP_FEED) { backward_feed(g, id); return; }
+  if (op == OP_PAIR) { backward_pair(g, id); return; }
+  if (op == OP_MIX) { backward_mix(g, id); return; }
   if (op == OP_CONV2D) { backward_conv2d(g, id); return; }
   if (op == OP_MAX_POOL2D || op == OP_AVG_POOL2D) { backward_pool(g, id); return; }
   if (op == OP_BATCH_NORM) { backward_batch_norm(g, id); return; }
@@ -88,6 +102,7 @@ fn run_backward(g: Graph*, from: int32) {
         backward_any(g, id);
       }
     }
+    g->release_grad(id);
     id = id - 1;
   }
 }

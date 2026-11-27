@@ -3,6 +3,133 @@ import "./tensor";
 import "./kernels";
 import "./graph";
 
+export fn pair(now: Var, first: Var) -> Var {
+  var g: Graph* = now.g;
+  var s: Shape = now.shape();
+  if (s.rank != 3) { mmll_fail("pair takes [batch, time, width], got {s.text()}"); }
+  var b: int64 = s.dims[0];
+  var t: int64 = s.dims[1];
+  var w: int64 = s.dims[2];
+  if (first.id >= 0 && first.size() != b * w) { mmll_fail("pair takes a first row of {b} by {w}, got {first.shape().text()}"); }
+  var id: int32 = g->push(OP_PAIR, now.id, first.id, -1, shape(b, t, 2 * w));
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var out: float32* = g->data(id);
+  var x: float32* = g->data(now.id);
+  var head: float32* = if first.id >= 0 { g->data(first.id) } else { (float32*)0 };
+  for r: int64 in 0..b {
+    for at: int64 in 0..t {
+      var row: float32* = out + (r * t + at) * 2 * w;
+      for c: int64 in 0..w {
+        row[c] = x[(r * t + at) * w + c];
+        row[w + c] = if at > 0 { x[(r * t + at - 1) * w + c] } else { if head != 0 { head[r * w + c] } else { (float32)0.0 } };
+      }
+    }
+  }
+  return { g: g, id: id };
+}
+
+export fn mix_rows(weights: Var, stack: Var, rows: int64, picks: int64, k: int64, w: int64) -> Var {
+  return mix_parts(weights, stack, k, no_part(weights.g), rows, picks, w);
+}
+
+fn no_part(g: Graph*) -> Var {
+  return { g: g, id: -1 };
+}
+
+export fn mix_parts(weights: Var, first: Var, head: int64, second: Var, rows: int64, picks: int64, w: int64) -> Var {
+  var g: Graph* = weights.g;
+  var k: int64 = weights.size() / (rows * picks);
+  if (weights.size() != rows * picks * k) { mmll_fail("mix takes {rows} by {picks} rows of weights, got {weights.shape().text()}"); }
+  if (first.size() != rows * head * w) { mmll_fail("mix takes {rows} by {head} by {w} first rows, got {first.shape().text()}"); }
+  if (second.id >= 0 && second.size() != rows * (k - head) * w) { mmll_fail("mix takes {rows} by {k - head} by {w} second rows, got {second.shape().text()}"); }
+  if (second.id < 0 && head != k) { mmll_fail("mix with one stack needs {k} rows each, got {head}"); }
+  var id: int32 = g->push(OP_MIX, weights.id, first.id, second.id, shape(rows, picks, w));
+  g->nodes[id].i0 = head;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var out: float32* = g->data(id);
+  var a: float32* = g->data(weights.id);
+  var x: float32* = g->data(first.id);
+  var y: float32* = if second.id >= 0 { g->data(second.id) } else { (float32*)0 };
+  for r: int64 in 0..rows {
+    for p: int64 in 0..picks {
+      for c: int64 in 0..w {
+        var sum: float32 = (float32)0.0;
+        for j: int64 in 0..k {
+          var src: float32 = if j < head { x[(r * head + j) * w + c] } else { y[(r * (k - head) + j - head) * w + c] };
+          sum = sum + a[(r * picks + p) * k + j] * src;
+        }
+        out[(r * picks + p) * w + c] = sum;
+      }
+    }
+  }
+  return { g: g, id: id };
+}
+
+export fn backward_mix(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var s: Shape = node->value.shape;
+  var rows: int64 = s.dims[0];
+  var picks: int64 = s.dims[1];
+  var w: int64 = s.dims[2];
+  var k: int64 = g->nodes[node->a].value.shape.size() / (rows * picks);
+  var head: int64 = if node->c >= 0 { node->i0 } else { k };
+  var dy: float32* = node->grad;
+  var a: float32* = g->data(node->a);
+  var x: float32* = g->data(node->b);
+  var y: float32* = if node->c >= 0 { g->data(node->c) } else { (float32*)0 };
+  var dx: float32* = if g->nodes[node->b].requires { g->grad_of(node->b) } else { (float32*)0 };
+  var dz: float32* = if node->c >= 0 && g->nodes[node->c].requires { g->grad_of(node->c) } else { (float32*)0 };
+  var da: float32* = if g->nodes[node->a].requires { g->grad_of(node->a) } else { (float32*)0 };
+  for r: int64 in 0..rows {
+    for p: int64 in 0..picks {
+      for j: int64 in 0..k {
+        var at: int64 = (r * picks + p) * k + j;
+        var sum: float32 = (float32)0.0;
+        for c: int64 in 0..w {
+          var g_out: float32 = dy[(r * picks + p) * w + c];
+          if (j < head) {
+            var spot: int64 = (r * head + j) * w + c;
+            sum = sum + g_out * x[spot];
+            if (dx != (float32*)0) { dx[spot] = dx[spot] + a[at] * g_out; }
+          } else {
+            var spot: int64 = (r * (k - head) + j - head) * w + c;
+            sum = sum + g_out * y[spot];
+            if (dz != (float32*)0) { dz[spot] = dz[spot] + a[at] * g_out; }
+          }
+        }
+        if (da != (float32*)0) { da[at] = da[at] + sum; }
+      }
+    }
+  }
+}
+
+export fn backward_pair(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var s: Shape = node->value.shape;
+  var b: int64 = s.dims[0];
+  var t: int64 = s.dims[1];
+  var w: int64 = s.dims[2] / 2;
+  var dy: float32* = node->grad;
+  if (g->nodes[node->a].requires) {
+    var dx: float32* = g->grad_of(node->a);
+    for r: int64 in 0..b {
+      for at: int64 in 0..t {
+        for c: int64 in 0..w {
+          var v: float32 = dy[(r * t + at) * 2 * w + c];
+          if (at + 1 < t) { v = v + dy[(r * t + at + 1) * 2 * w + w + c]; }
+          dx[(r * t + at) * w + c] = dx[(r * t + at) * w + c] + v;
+        }
+      }
+    }
+  }
+  if (node->b >= 0 && g->nodes[node->b].requires) {
+    var dh: float32* = g->grad_of(node->b);
+    for r: int64 in 0..b {
+      for c: int64 in 0..w { dh[r * w + c] = dh[r * w + c] + dy[r * t * 2 * w + w + c]; }
+    }
+  }
+}
+
 export fn split_axis(s: Shape, axis: int32, outer: int64*, len: int64*, inner: int64*) {
   var a: int32 = s.axis(axis);
   var o: int64 = 1;

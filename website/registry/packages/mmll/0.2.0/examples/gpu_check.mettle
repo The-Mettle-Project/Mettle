@@ -104,10 +104,25 @@ fn three(name: string, build: fn(Graph*, Var*) -> Var, a: Shape, b: Shape, d: Sh
   return c;
 }
 
+fn four(name: string, build: fn(Graph*, Var*) -> Var, a: Shape, b: Shape, d: Shape, e: Shape) -> Case {
+  var c: Case = three(name, build, a, b, d);
+  c.shapes[3] = e;
+  c.count = 4;
+  return c;
+}
+
+fn loose(c: Case) -> Case {
+  var out: Case = c;
+  out.positive = true;
+  out.tolerance = 1.0e-3;
+  return out;
+}
+
 fn b_add(g: Graph*, v: Var*) -> Var { return v[0].add(v[1]); }
 fn b_sub(g: Graph*, v: Var*) -> Var { return v[0].sub(v[1]); }
 fn b_mul(g: Graph*, v: Var*) -> Var { return v[0].mul(v[1]); }
 fn b_div(g: Graph*, v: Var*) -> Var { return v[0].div(v[1].abs().shift(0.5)); }
+fn b_add_mul(g: Graph*, v: Var*) -> Var { return add_mul(v[0], v[1], v[2]); }
 fn u_neg(g: Graph*, v: Var*) -> Var { return v[0].neg(); }
 fn u_exp(g: Graph*, v: Var*) -> Var { return v[0].exp(); }
 fn u_log(g: Graph*, v: Var*) -> Var { return v[0].log(); }
@@ -160,6 +175,415 @@ fn n_embed(g: Graph*, v: Var*) -> Var {
   return embedding(v[0], ids, 4, 6);
 }
 
+fn n_take(g: Graph*, v: Var*) -> Var {
+  var ids: int32* = g->ints(30);
+  for i in 0..30 { ids[i] = (int32)((i * 7) % 12); }
+  return take_last(v[0], ids, 5);
+}
+
+fn n_spread(g: Graph*, v: Var*) -> Var {
+  var ids: int32* = g->ints(30);
+  for i in 0..30 { ids[i] = (int32)((i * 5) % 9); }
+  return spread_last(v[0], ids, 8);
+}
+
+fn n_fold(g: Graph*, v: Var*) -> Var {
+  var ids: int32* = g->ints(20);
+  for i in 0..20 { ids[i] = (int32)((i * 3) % 7); }
+  return fold_rows(v[0], ids, 7);
+}
+
+fn f_join(g: Graph*, v: Var*) -> Var {
+  var at: int32* = g->ints(40);
+  for i in 0..40 { at[i] = (int32)((i * 3 + 1) % 17); }
+  at[5] = 5;
+  return chain_join(v[0], at);
+}
+
+fn f_join_twice(g: Graph*, v: Var*) -> Var {
+  var at: int32* = g->ints(80);
+  for i in 0..40 {
+    at[i] = (int32)((i * 3 + 1) % 17);
+    at[40 + i] = at[(int64)at[i]];
+  }
+  return chain_join(chain_join(v[0], at), at + 40).add(v[0]);
+}
+
+fn f_rules(g: Graph*, v: Var*) -> Var {
+  return chain_rules(v[0], v[1], v[2]);
+}
+
+fn f_rules_join(g: Graph*, v: Var*) -> Var {
+  var at: int32* = g->ints(40);
+  for i in 0..40 { at[i] = (int32)((i * 3 + 1) % 17); }
+  return chain_join(chain_rules(v[0], v[1], v[2]), at);
+}
+
+fn solving(g: Graph*) -> SolvePlan* {
+  var batch: int64 = 3;
+  var time: int64 = 24;
+  var reach: int64 = 6;
+  var letters: int64 = 7;
+  var vocab: int64 = 11;
+  var rows: int64 = batch * time;
+  var ids: int32* = g->ints(rows);
+  var plain: int32* = g->ints(rows * reach);
+  var sorts: int32* = g->ints(rows);
+  var slots: int32* = g->ints(batch * vocab);
+  for i: int64 in 0..rows { ids[i] = (int32)((i * i * 7 + i * 3 + i / 5) % vocab); }
+  for r: int64 in 0..batch {
+    var taken: int64 = 0;
+    for s: int64 in 0..vocab { slots[r * vocab + s] = (int32)(0 - 1); }
+    for i: int64 in 0..time {
+      var symbol: int64 = (int64)ids[r * time + i];
+      if (slots[r * vocab + symbol] < 0 && taken < letters) {
+        slots[r * vocab + symbol] = (int32)taken;
+        taken = taken + 1;
+      }
+    }
+    for i: int64 in 0..time {
+      for o: int64 in 0..reach {
+        var held: int32 = if i >= o { slots[r * vocab + (int64)ids[r * time + i - o]] } else { (int32)(0 - 1) };
+        plain[(r * time + i) * reach + o] = if held >= 0 { held } else { (int32)letters };
+      }
+      var comes: int32 = if i + 1 < time { slots[r * vocab + (int64)ids[r * time + i + 1]] } else { (int32)(0 - 1) };
+      sorts[r * time + i] = if comes >= 0 { (int32)(r * letters) + comes } else { (int32)(batch * letters) };
+    }
+  }
+  return solve_plan(g, batch, time, 4, reach, letters, vocab, plain, sorts, slots);
+}
+
+fn f_solve_table(g: Graph*, v: Var*) -> Var {
+  return solve_table(solving(g), v[0], v[1]);
+}
+
+fn f_solve_proof(g: Graph*, v: Var*) -> Var {
+  var p: SolvePlan* = solving(g);
+  return solve_proof(p, solve_table(p, v[0], v[1]), v[0], v[1], v[2]);
+}
+
+fn f_solve_proof_alone(g: Graph*, v: Var*) -> Var {
+  var p: SolvePlan* = solving(g);
+  return solve_proof(p, v[0], v[1], v[2], v[3]);
+}
+
+fn f_solve_beliefs(g: Graph*, v: Var*) -> Var {
+  return solve_beliefs(solving(g), v[0], v[1]);
+}
+
+fn f_solve_first(g: Graph*, v: Var*) -> Var {
+  return solve_first(solving(g), v[0]);
+}
+
+fn f_solve_tables(g: Graph*, v: Var*) -> Var {
+  return solve_tables(solving(g), v[0], v[1], v[2]);
+}
+
+fn f_solve_guess(g: Graph*, v: Var*) -> Var {
+  return solve_guess(solving(g), v[0], v[1], v[2]);
+}
+
+fn f_solve_all(g: Graph*, v: Var*) -> Var {
+  var p: SolvePlan* = solving(g);
+  var beliefs: Var = solve_first(p, v[0]);
+  var table: Var = solve_table(p, beliefs, v[1]);
+  for sweep in 0..2 {
+    var proof: Var = solve_proof(p, table, beliefs, v[1], v[2]);
+    beliefs = solve_beliefs(p, proof.scale(0.3), v[0]);
+    table = solve_table(p, beliefs, v[1]);
+  }
+  var owns: int32* = g->ints(72);
+  for i: int64 in 0..72 { owns[i] = (int32)(i * 6 + (i % 24) / 4); }
+  var mine: Var = gather_rows(beliefs.view(72 * 6, 6), owns, shape(72, 6));
+  return solve_guess(p, solve_tables(p, table, mine, v[1]), mine, v[2]);
+}
+
+fn f_round(g: Graph*, v: Var*) -> Var {
+  var batch: int64 = 2;
+  var time: int64 = 12;
+  var vocab: int64 = 11;
+  var letters: int64 = 7;
+  var rows: int64 = batch * time;
+  var ids: int32* = g->ints(rows);
+  var slots: int32* = g->ints(batch * vocab);
+  var nexts: int32* = g->ints(rows);
+  var targets: int32* = g->ints(rows);
+  var at: int32* = g->ints(rows);
+  for i: int64 in 0..rows { ids[i] = (int32)((i * i * 7 + i * 3 + i / 5) % vocab); }
+  for r: int64 in 0..batch {
+    var taken: int64 = 0;
+    for s: int64 in 0..vocab { slots[r * vocab + s] = (int32)(0 - 1); }
+    for i: int64 in 0..time {
+      var symbol: int64 = (int64)ids[r * time + i];
+      if (slots[r * vocab + symbol] < 0 && taken < letters) {
+        slots[r * vocab + symbol] = (int32)taken;
+        taken = taken + 1;
+      }
+    }
+  }
+  for i: int64 in 0..rows {
+    nexts[i] = if i % time + 1 < time { ids[i + 1] } else { (int32)(0 - 1) };
+    targets[i] = if i % 5 == 2 { (int32)(0 - 1) } else { ids[(i + 1) % rows] };
+    at[i] = if i % time > 2 { (int32)(i - 2) } else { (int32)i };
+  }
+  var p: RoundPlan* = round_plan(g, batch, time, vocab, letters, 3, slots, nexts, targets, 0.5, 0.001);
+  var keen: Var = v[0].square();
+  var rules: Var = keen.div(keen.sum_axis(1, true));
+  var floor: Var = v[3].slice(0, 0, rows * 2).view(rows, 2);
+  var lean: Var = v[3].slice(0, rows * 2, rows).view(rows, 1);
+  var king: Var = v[3].slice(0, rows * 3, batch * time * time).view(batch, time, time);
+  var heed: Var = v[3].slice(0, rows * 3 + batch * time * time, 1).view(1, 1);
+  return chain_round(p, rules, v[1].softmax(), at, v[2].softmax(), floor, lean, king, heed);
+}
+
+fn f_scale_by(g: Graph*, v: Var*) -> Var { return scale_by(v[0], v[1]).add(scale_by(v[0].scale(0.5), v[1])); }
+
+fn f_pick(g: Graph*, v: Var*) -> Var {
+  var ids: int32* = g->ints(6);
+  for r: int64 in 0..6 { ids[r] = (int32)((r * 5 + 1) % 7); }
+  ids[4] = 0 - 1;
+  return pick_at(v[0], ids);
+}
+
+fn f_anchor(g: Graph*, v: Var*) -> Var { return chain_anchor(v[0], v[1].sigmoid(), v[2].softmax(), 12); }
+
+fn m_matmul_exact(g: Graph*, v: Var*) -> Var { return v[0].matmul_exact(v[1]); }
+
+fn n_fold_twice(g: Graph*, v: Var*) -> Var {
+  var ids: int32* = g->ints(20);
+  for i in 0..20 { ids[i] = (int32)((i * 3) % 7); }
+  return fold_rows(v[0], ids, 7).add(fold_rows(v[0].scale(0.5), ids, 7));
+}
+
+fn part(x: Var, at: int64*, rows: int64, cols: int64) -> Var {
+  var piece: Var = x.slice(0, at[0], rows * cols).view(rows, cols);
+  at[0] = at[0] + rows * cols;
+  return piece;
+}
+
+fn thinking_of(x: Var, at: int64*, w: int64, hid: int64) -> Thinking {
+  var k: Thinking;
+  k.pack = part(x, at, 3 * w, w);
+  k.proj = part(x, at, w, w);
+  k.fc = part(x, at, hid, w);
+  k.out = part(x, at, w, hid);
+  k.gate = part(x, at, 1, w);
+  k.bias = part(x, at, 1, 1);
+  k.seek = no_gate(x.g);
+  k.fetch = no_gate(x.g);
+  return k;
+}
+
+fn looking_of(x: Var, at: int64*, w: int64, hid: int64) -> Thinking {
+  var k: Thinking = thinking_of(x, at, w, hid);
+  k.seek = part(x, at, w, w);
+  k.fetch = part(x, at, w, w);
+  return k;
+}
+
+fn ponder_of(x: Var, batch: int64, rooms: int64, w: int64, hid: int64, heads: int64) -> Var {
+  var at: int64 = 0;
+  var held: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var seats: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  return ponder(held, seats, thinking_of(x, &at, w, hid), heads);
+}
+
+fn foresee_of(x: Var, spans: int64, rounds: int64, rows: int64, w: int64, hid: int64) -> Var {
+  var at: int64 = spans * rounds * rows * w;
+  var trace: Var = x.slice(0, 0, at).view(spans, rounds, rows, w);
+  var seats: Var = part(x, &at, rows, w);
+  var fore: Var = part(x, &at, hid, w);
+  var tell: Var = part(x, &at, w, hid);
+  return foresee(trace, seats, fore, tell, 1, 0.5);
+}
+fn ponder_twice(x: Var, batch: int64, rooms: int64, w: int64, hid: int64, heads: int64) -> Var {
+  var at: int64 = 0;
+  var held: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var seats: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var book: Var = ponder_book(x.g, thinking_of(x, &at, w, hid), heads, batch * rooms, 2);
+  var first: Var = ponder_in(book, held, seats, no_gate(x.g), no_gate(x.g), 0, 0, (float32*)0, (float32*)0);
+  return ponder_in(book, first, seats, no_gate(x.g), no_gate(x.g), 0, 1, (float32*)0, (float32*)0);
+}
+
+fn ponder_pair(x: Var, batch: int64, rooms: int64, w: int64, hid: int64, heads: int64) -> Var {
+  var at: int64 = 0;
+  var held: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var seats: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var book: Var = ponder_book(x.g, thinking_of(x, &at, w, hid), heads, batch * rooms, 2);
+  return ponder_in(book, held, seats, no_gate(x.g), no_gate(x.g), 0, 0, (float32*)0, (float32*)0).add(ponder_in(book, seats, held, no_gate(x.g), no_gate(x.g), 0, 1, (float32*)0, (float32*)0));
+}
+
+fn a_ponder_pair_wide(g: Graph*, v: Var*) -> Var { return ponder_pair(v[0], 2, 32, 256, 512, 4); }
+
+fn ponder_thrice(x: Var, batch: int64, rooms: int64, w: int64, hid: int64, heads: int64) -> Var {
+  var at: int64 = 0;
+  var held: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var seats: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var book: Var = ponder_book(x.g, thinking_of(x, &at, w, hid), heads, batch * rooms, 3);
+  var first: Var = ponder_in(book, held, seats, no_gate(x.g), no_gate(x.g), 0, 0, (float32*)0, (float32*)0);
+  var second: Var = ponder_in(book, first, seats, no_gate(x.g), no_gate(x.g), 0, 1, (float32*)0, (float32*)0);
+  return ponder_in(book, second, seats, no_gate(x.g), no_gate(x.g), 0, 2, (float32*)0, (float32*)0);
+}
+
+fn ponder_unused(x: Var, batch: int64, rooms: int64, w: int64, hid: int64, heads: int64) -> Var {
+  var at: int64 = 0;
+  var held: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var seats: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var book: Var = ponder_book(x.g, thinking_of(x, &at, w, hid), heads, batch * rooms, 2);
+  var _spent: Var = ponder_in(book, held, seats, no_gate(x.g), no_gate(x.g), 0, 0, (float32*)0, (float32*)0);
+  return ponder_in(book, seats, held, no_gate(x.g), no_gate(x.g), 0, 1, (float32*)0, (float32*)0);
+}
+
+fn a_ponder_groups(g: Graph*, v: Var*) -> Var { return ponder_thrice(v[0], 65, 32, 64, 128, 1); }
+fn a_ponder_unused(g: Graph*, v: Var*) -> Var { return ponder_unused(v[0], 65, 32, 64, 128, 1); }
+fn grid_of(g: Graph*, x: Var, at: int64*, batch: int64, time: int64, w: int64, heads: int64, chunk: int64, span: int64) -> Var {
+  var kv: Var = part(x, at, batch * time, 2 * w).view(batch, time, 2 * w);
+  var q: Var = part(x, at, batch * time, w).view(batch, time, w);
+  var gate: Var = part(x, at, batch * time, heads).view(batch, time, heads);
+  return recall_tapped(kv, q, gate, heads, chunk, span, powers_for(g, heads, chunk, time / chunk));
+}
+
+fn consult_of(g: Graph*, x: Var, batch: int64, time: int64, w: int64, heads: int64, chunk: int64, span: int64, count: int64, first: int64, second: int64) -> Var {
+  var at: int64 = 0;
+  var grid: Var = grid_of(g, x, &at, batch, time, w, heads, chunk, span);
+  var asked: Var = part(x, &at, batch * count, w).view(batch, count, w);
+  return consult(grid, first, asked).add(consult(grid, second, asked)).add(grid.slice(1, time - count, count));
+}
+
+fn ponder_look(g: Graph*, x: Var, batch: int64, rooms: int64, w: int64, hid: int64, heads: int64, time: int64, chunk: int64, booked: bool, heeds: bool) -> Var {
+  var at: int64 = 0;
+  var grid: Var = grid_of(g, x, &at, batch, time, w, heads, chunk, 8);
+  var held: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var seats: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var heed: Var = if heeds { part(x, &at, batch * rooms, w).view(batch, rooms, w) } else { no_gate(g) };
+  var k: Thinking = looking_of(x, &at, w, hid);
+  var tail: Var = grid.slice(1, time - rooms, rooms);
+  if (!booked) { return ponder_with(held, seats, heed, k, heads, grid, time / 8 - 3).add(tail); }
+  var book: Var = ponder_book(g, k, heads, batch * rooms, 2);
+  var first: Var = ponder_in(book, held, seats, heed, grid, time / 8 - 3, 0, (float32*)0, (float32*)0);
+  return ponder_in(book, first, seats, heed, grid, 1, 1, (float32*)0, (float32*)0).add(tail);
+}
+
+fn a_consult(g: Graph*, v: Var*) -> Var { return consult_of(g, v[0], 1, 6, 4, 2, 2, 2, 2, 2, 1); }
+fn a_consult_wide(g: Graph*, v: Var*) -> Var { return consult_of(g, v[0], 2, 64, 256, 4, 8, 8, 32, 5, 2); }
+fn a_consult_long(g: Graph*, v: Var*) -> Var { return consult_of(g, v[0], 2, 128, 256, 4, 64, 8, 32, 13, 2); }
+fn a_consult_spans(g: Graph*, v: Var*) -> Var { return consult_of(g, v[0], 1, 12, 8, 2, 6, 2, 2, 4, 1); }
+fn a_ponder_look(g: Graph*, v: Var*) -> Var { return ponder_look(g, v[0], 2, 32, 256, 512, 4, 128, 64, false, false); }
+fn a_ponder_look_book(g: Graph*, v: Var*) -> Var { return ponder_look(g, v[0], 2, 32, 256, 512, 4, 128, 64, true, false); }
+fn a_ponder_look_heed(g: Graph*, v: Var*) -> Var { return ponder_look(g, v[0], 2, 32, 256, 512, 4, 128, 64, false, true); }
+fn a_ponder_look_book_heed(g: Graph*, v: Var*) -> Var { return ponder_look(g, v[0], 2, 32, 256, 512, 4, 128, 64, true, true); }
+
+fn heed_of(x: Var, batch: int64, rooms: int64, w: int64, hid: int64, heads: int64) -> Var {
+  var at: int64 = 0;
+  var held: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var seats: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var heed: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  return ponder_with(held, seats, heed, thinking_of(x, &at, w, hid), heads, no_gate(x.g), 0);
+}
+
+fn heed_twice(x: Var, batch: int64, rooms: int64, w: int64, hid: int64, heads: int64) -> Var {
+  var at: int64 = 0;
+  var held: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var seats: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var heed: Var = part(x, &at, batch * rooms, w).view(batch, rooms, w);
+  var book: Var = ponder_book(x.g, thinking_of(x, &at, w, hid), heads, batch * rooms, 2);
+  var first: Var = ponder_in(book, held, seats, heed, no_gate(x.g), 0, 0, (float32*)0, (float32*)0);
+  return ponder_in(book, first, seats, heed.scale(0.5), no_gate(x.g), 0, 1, (float32*)0, (float32*)0);
+}
+
+fn a_ponder_heed(g: Graph*, v: Var*) -> Var { return heed_of(v[0], 2, 3, 8, 12, 2); }
+fn a_ponder_heed_wide(g: Graph*, v: Var*) -> Var { return heed_of(v[0], 2, 32, 256, 512, 4); }
+fn a_ponder_heed_book(g: Graph*, v: Var*) -> Var { return heed_twice(v[0], 2, 32, 256, 512, 4); }
+
+fn tapped_split(g: Graph*, v: Var*, heads: int64, chunk: int64, span: int64) -> Var {
+  var s: Shape = v[1].shape();
+  var half: int64 = s.dims[1] / 2;
+  var d: int64 = s.dims[2] / heads;
+  var between: float32* = room_for(g, s.dims[0] * heads * d * d);
+  var table: float32* = powers_for(g, heads, chunk, half / chunk);
+  var first: Var = recall_tapped_carried(v[0].slice(1, 0, half), v[1].slice(1, 0, half), v[2].slice(1, 0, half), heads, chunk, span, table, (float32*)0, between);
+  var second: Var = recall_tapped_carried(v[0].slice(1, half, half), v[1].slice(1, half, half), v[2].slice(1, half, half), heads, chunk, span, table, between, (float32*)0);
+  var asked: Var = v[1].slice(1, 0, 3);
+  return concat(concat(first, second, 1), consult(second, 0, asked).add(consult(second, 1, asked)), 1);
+}
+
+fn a_tapped_split(g: Graph*, v: Var*) -> Var { return tapped_split(g, v, 2, 8, 4); }
+fn a_tapped_split_64(g: Graph*, v: Var*) -> Var { return tapped_split(g, v, 4, 64, 8); }
+fn a_ponder(g: Graph*, v: Var*) -> Var { return ponder_of(v[0], 2, 3, 8, 12, 2); }
+fn a_ponder_book(g: Graph*, v: Var*) -> Var { return ponder_twice(v[0], 2, 3, 8, 12, 2); }
+fn a_ponder_book_wide(g: Graph*, v: Var*) -> Var { return ponder_twice(v[0], 2, 32, 256, 512, 4); }
+fn a_ponder_wide(g: Graph*, v: Var*) -> Var { return ponder_of(v[0], 2, 32, 256, 512, 4); }
+fn a_foresee(g: Graph*, v: Var*) -> Var { return foresee_of(v[0], 3, 2, 6, 8, 12); }
+fn a_foresee_wide(g: Graph*, v: Var*) -> Var { return foresee_of(v[0], 4, 2, 64, 256, 512); }
+fn a_foresee_slices(g: Graph*, v: Var*) -> Var { return foresee_of(v[0], 9, 2, 1024, 64, 128); }
+
+fn residual_of(x: Var, rows: int64, n: int64, k: int64) -> Var {
+  var at: int64 = 0;
+  var base: Var = part(x, &at, rows, n);
+  var h: Var = part(x, &at, rows, k);
+  return residual(base, h, part(x, &at, n, k), 1.0e-6);
+}
+
+fn feed_of(x: Var, rows: int64, w: int64, hid: int64) -> Var {
+  var at: int64 = 0;
+  var base: Var = part(x, &at, rows, w);
+  var fc: Var = part(x, &at, hid, w);
+  return feed(base, fc, part(x, &at, w, hid), 1.0e-6);
+}
+
+fn a_pair(g: Graph*, v: Var*) -> Var { return pair(v[0].slice(0, 0, 1176).view(3, 7, 56), v[0].slice(0, 1176, 168).view(3, 1, 56)); }
+fn a_pair_bare(g: Graph*, v: Var*) -> Var { return pair(v[0].view(3, 7, 56), no_gate(g)); }
+fn a_residual(g: Graph*, v: Var*) -> Var { return residual_of(v[0], 37, 24, 40); }
+fn a_residual_wide(g: Graph*, v: Var*) -> Var { return residual_of(v[0], 256, 128, 256); }
+fn a_feed(g: Graph*, v: Var*) -> Var { return feed_of(v[0], 37, 24, 60); }
+fn a_feed_wide(g: Graph*, v: Var*) -> Var { return feed_of(v[0], 256, 128, 320); }
+fn powers_for(g: Graph*, heads: int64, chunk: int64, chunks: int64) -> float32* {
+  var keeps: float64[4] = [0.84, 0.98, 1.0, 0.9];
+  var made: float32* = recall_powers((Device*)0, &keeps[0], heads, chunk, chunks);
+  var count: int64 = heads * (chunk + 1 + chunks);
+  var held: float32* = if g->on_device() { g->floats(count) } else { (float32*)g->host_alloc(count * 4) };
+  if (g->on_device()) {
+    g->dev->put((rawptr)held, (rawptr)made, count * 4);
+  } else {
+    for i: int64 in 0..count { held[i] = made[i]; }
+  }
+  free((rawptr)made);
+  return held;
+}
+
+fn a_recall_whole(g: Graph*, v: Var*) -> Var { return recall(v[0], v[1], v[2], 3, 10, powers_for(g, 3, 10, 1)); }
+fn a_recall_chunks(g: Graph*, v: Var*) -> Var { return recall(v[0], v[1], v[2], 2, 4, powers_for(g, 2, 4, 3)); }
+fn a_recall_ungated(g: Graph*, v: Var*) -> Var { return recall_ungated(v[0], v[1], 4, 5, powers_for(g, 4, 5, 3)); }
+fn a_exact_whole(g: Graph*, v: Var*) -> Var { return recall_exact(v[0], v[1], v[2], 3, 10, powers_for(g, 3, 10, 1)); }
+fn a_exact_chunks(g: Graph*, v: Var*) -> Var { return recall_exact(v[0], v[1], v[2], 2, 4, powers_for(g, 2, 4, 3)); }
+fn a_exact_ungated(g: Graph*, v: Var*) -> Var { return recall_exact_ungated(v[0], v[1], 4, 5, powers_for(g, 4, 5, 3)); }
+fn a_exact_64(g: Graph*, v: Var*) -> Var { return recall_exact(v[0], v[1], v[2], 2, 64, powers_for(g, 2, 64, 4)); }
+fn a_exact_128(g: Graph*, v: Var*) -> Var { return recall_exact(v[0], v[1], v[2], 2, 128, powers_for(g, 2, 128, 2)); }
+fn room_for(g: Graph*, count: int64) -> float32* {
+  return if g->on_device() { g->floats(count) } else { (float32*)g->host_alloc(count * 4) };
+}
+
+fn split(g: Graph*, v: Var*, heads: int64, chunk: int64, exact: bool) -> Var {
+  var s: Shape = v[1].shape();
+  var half: int64 = s.dims[1] / 2;
+  var d: int64 = s.dims[2] / heads;
+  var between: float32* = room_for(g, s.dims[0] * heads * d * d);
+  var table: float32* = powers_for(g, heads, chunk, half / chunk);
+  var first: Var = recall_carried(v[0].slice(1, 0, half), v[1].slice(1, 0, half), v[2].slice(1, 0, half), heads, chunk, table, exact, (float32*)0, between);
+  var second: Var = recall_carried(v[0].slice(1, half, half), v[1].slice(1, half, half), v[2].slice(1, half, half), heads, chunk, table, exact, between, (float32*)0);
+  return concat(first, second, 1);
+}
+
+fn a_split_small(g: Graph*, v: Var*) -> Var { return split(g, v, 2, 4, false); }
+fn a_split_whole(g: Graph*, v: Var*) -> Var { return split(g, v, 2, 8, false); }
+fn a_split_exact(g: Graph*, v: Var*) -> Var { return split(g, v, 2, 4, true); }
+fn a_split_exact_whole(g: Graph*, v: Var*) -> Var { return split(g, v, 2, 8, true); }
+fn a_split_64(g: Graph*, v: Var*) -> Var { return split(g, v, 2, 64, false); }
+fn a_split_exact_64(g: Graph*, v: Var*) -> Var { return split(g, v, 2, 64, true); }
+fn a_mingle(g: Graph*, v: Var*) -> Var { return mingle(v[0], 2); }
+fn a_mingle_64(g: Graph*, v: Var*) -> Var { return mingle(v[0], 4); }
+fn a_recall_64(g: Graph*, v: Var*) -> Var { return recall(v[0], v[1], v[2], 2, 128, powers_for(g, 2, 128, 2)); }
+fn a_recall_64_long(g: Graph*, v: Var*) -> Var { return recall(v[0], v[1], v[2], 4, 64, powers_for(g, 4, 64, 6)); }
 fn a_attention(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 4, true, 0.2); }
 fn a_attention_full(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, false, 0.0); }
 fn a_flash_causal(g: Graph*, v: Var*) -> Var { return self_attention(v[0], 2, true, 0.2); }
@@ -180,9 +604,30 @@ fn c_batch_norm(g: Graph*, v: Var*) -> Var {
   return batch_norm(v[0], v[1], v[2], (float32*)0, (float32*)0, 0.1, 1.0e-5);
 }
 
+fn fused_cases(cases: Case*, first: int32) -> int32 {
+  var n: int32 = first;
+  cases[n] = loose(one("chain_join", &f_join, shape(40, 33, 33))); n = n + 1;
+  cases[n] = loose(one("chain_join twice", &f_join_twice, shape(40, 33, 33))); n = n + 1;
+  cases[n] = loose(three("chain_rules", &f_rules, shape(40, 32, 32), shape(40, 1, 3), shape(1, 1))); n = n + 1;
+  cases[n] = loose(three("chain_rules into a join", &f_rules_join, shape(40, 32, 32), shape(40, 1, 3), shape(1, 1))); n = n + 1;
+  cases[n] = loose(two("solve_table", &f_solve_table, shape(72, 6, 6), shape(72))); n = n + 1;
+  cases[n] = loose(three("solve_proof after a table", &f_solve_proof, shape(72, 6, 6), shape(72), shape(1, 5))); n = n + 1;
+  cases[n] = loose(four("solve_proof", &f_solve_proof_alone, shape(3, 8, 6, 7), shape(72, 6, 6), shape(72), shape(1, 5))); n = n + 1;
+  cases[n] = two("solve_beliefs", &f_solve_beliefs, shape(72, 6, 6), shape(72, 6)); n = n + 1;
+  cases[n] = one("solve_first", &f_solve_first, shape(72, 6)); n = n + 1;
+  cases[n] = loose(three("solve_tables", &f_solve_tables, shape(3, 8, 6, 7), shape(72, 6), shape(72))); n = n + 1;
+  cases[n] = loose(three("solve_guess", &f_solve_guess, shape(72, 7, 7), shape(72, 6), shape(1, 5))); n = n + 1;
+  cases[n] = loose(three("solve chain of ops", &f_solve_all, shape(72, 6), shape(72), shape(1, 5))); n = n + 1;
+  cases[n] = loose(four("chain_round", &f_round, shape(24, 8, 8), shape(24, 8), shape(24, 2, 11), shape(361))); n = n + 1;
+  cases[n] = two("scale_by", &f_scale_by, shape(700, 1), shape(1, 1)); n = n + 1;
+  cases[n] = three("chain_anchor", &f_anchor, shape(24, 8), shape(24), shape(24, 5)); n = n + 1;
+  cases[n] = one("take_at", &f_pick, shape(6, 3, 7)); n = n + 1;
+  return n;
+}
+
 fn main() -> int32 {
   var dev: Device* = gpu_device();
-  var cases: Case[96];
+  var cases: Case[192];
   var n: int32 = 0;
   cases[n] = two("add", &b_add, shape(4, 5, 6), shape(4, 5, 6)); n = n + 1;
   cases[n] = two("sub broadcast", &b_sub, shape(4, 5, 6), shape(5, 6)); n = n + 1;
@@ -190,6 +635,7 @@ fn main() -> int32 {
   cases[n] = two("div broadcast", &b_div, shape(3, 1, 7), shape(5, 1)); n = n + 1;
   cases[n] = two("add rows of a bias", &b_add, shape(700, 70), shape(70)); n = n + 1;
   cases[n] = two("add one value", &b_add, shape(9, 13), shape(1)); n = n + 1;
+  cases[n] = three("add_mul", &b_add_mul, shape(4, 1, 32, 70), shape(4, 1, 32, 70), shape(4, 1, 32, 70)); n = n + 1;
   cases[n] = two("sub positions", &b_sub, shape(6, 40, 24), shape(1, 40, 24)); n = n + 1;
   cases[n] = one("neg", &u_neg, shape(300)); n = n + 1;
   cases[n] = one("exp", &u_exp, shape(300)); n = n + 1;
@@ -225,6 +671,11 @@ fn main() -> int32 {
   cases[n] = one("slice", &s_slice, shape(3, 8, 4)); n = n + 1;
   cases[n] = two("concat", &s_concat, shape(3, 2, 4), shape(3, 5, 4)); n = n + 1;
   cases[n] = one("view", &s_view, shape(3, 4, 5)); n = n + 1;
+  cases[n] = one("take_last", &n_take, shape(6, 4, 11)); n = n + 1;
+  cases[n] = one("spread_last", &n_spread, shape(6, 4, 5)); n = n + 1;
+  cases[n] = one("fold_rows", &n_fold, shape(20, 9)); n = n + 1;
+  cases[n] = one("fold_rows twice", &n_fold_twice, shape(20, 9)); n = n + 1;
+  n = fused_cases(&cases[0], n);
   cases[n] = two("matmul", &m_matmul, shape(37, 29), shape(29, 41)); n = n + 1;
   cases[n] = two("matmul batched", &m_matmul, shape(3, 37, 29), shape(3, 29, 41)); n = n + 1;
   cases[n] = two("matmul rows", &m_matmul, shape(3, 37, 29), shape(29, 41)); n = n + 1;
@@ -256,7 +707,53 @@ fn main() -> int32 {
   cases[n] = one("flash 64 one head", &a_flash_one, shape(2, 130, 192)); n = n + 1;
   cases[n] = one("qk_norm_rope", &a_rope, shape(2, 11, 144)); n = n + 1;
   cases[n] = one("qk_norm_rope offset", &a_rope_offset, shape(5, 96)); n = n + 1;
-  cases[n] = one("qk_norm_rope attention", &a_rope_attention, shape(2, 70, 384)); n = n + 1;  cases[n] = three("conv2d", &c_conv, shape(2, 3, 9, 8), shape(5, 3, 3, 3), shape(5)); n = n + 1;
+  cases[n] = one("qk_norm_rope attention", &a_rope_attention, shape(2, 70, 384)); n = n + 1;
+  cases[n] = three("recall one chunk", &a_recall_whole, shape(2, 10, 48), shape(2, 10, 24), shape(2, 10, 3)); n = n + 1;
+  cases[n] = three("recall three chunks", &a_recall_chunks, shape(2, 12, 32), shape(2, 12, 16), shape(2, 12, 2)); n = n + 1;
+  cases[n] = two("recall ungated", &a_recall_ungated, shape(1, 15, 96), shape(1, 15, 48)); n = n + 1;
+  cases[n] = three("recall 64 wide", &a_recall_64, shape(2, 256, 256), shape(2, 256, 128), shape(2, 256, 2)); n = n + 1;
+  cases[n] = three("recall_exact one chunk", &a_exact_whole, shape(2, 10, 48), shape(2, 10, 24), shape(2, 10, 3)); n = n + 1;
+  cases[n] = three("recall_exact three chunks", &a_exact_chunks, shape(2, 12, 32), shape(2, 12, 16), shape(2, 12, 2)); n = n + 1;
+  cases[n] = two("recall_exact ungated", &a_exact_ungated, shape(1, 15, 96), shape(1, 15, 48)); n = n + 1;
+  cases[n] = three("recall_exact 64 wide", &a_exact_64, shape(2, 256, 256), shape(2, 256, 128), shape(2, 256, 2)); n = n + 1;
+  cases[n] = three("recall_exact 128 wide", &a_exact_128, shape(1, 256, 512), shape(1, 256, 256), shape(1, 256, 2)); n = n + 1;
+  cases[n] = three("recall carried", &a_split_small, shape(2, 16, 32), shape(2, 16, 16), shape(2, 16, 2)); n = n + 1;
+  cases[n] = three("recall carried one chunk", &a_split_whole, shape(2, 16, 32), shape(2, 16, 16), shape(2, 16, 2)); n = n + 1;
+  cases[n] = three("recall_exact carried", &a_split_exact, shape(2, 16, 32), shape(2, 16, 16), shape(2, 16, 2)); n = n + 1;
+  cases[n] = three("recall_exact carried one chunk", &a_split_exact_whole, shape(2, 16, 32), shape(2, 16, 16), shape(2, 16, 2)); n = n + 1;
+  cases[n] = three("recall carried 64 wide", &a_split_64, shape(2, 256, 256), shape(2, 256, 128), shape(2, 256, 2)); n = n + 1;
+  cases[n] = three("recall_exact carried 64 wide", &a_split_exact_64, shape(2, 256, 256), shape(2, 256, 128), shape(2, 256, 2)); n = n + 1;
+  cases[n] = one("mingle", &a_mingle, shape(2, 5, 48)); n = n + 1;
+  cases[n] = one("mingle 32 rooms 64 wide", &a_mingle_64, shape(2, 32, 768)); n = n + 1;
+  cases[n] = one("ponder", &a_ponder, shape(553)); n = n + 1;
+  cases[n] = one("ponder 32 rooms 256 wide", &a_ponder_wide, shape(557313)); n = n + 1;
+  cases[n] = one("ponder twice with a book", &a_ponder_book, shape(553)); n = n + 1;
+  cases[n] = one("ponder twice with a book 256 wide", &a_ponder_book_wide, shape(557313)); n = n + 1;
+  cases[n] = one("ponder three times in a book of two groups", &a_ponder_groups, shape(299073)); n = n + 1;
+  cases[n] = one("ponder in a book with a round that gets no gradient", &a_ponder_unused, shape(299073)); n = n + 1;
+  cases[n] = one("consult", &a_consult, shape(92)); n = n + 1;
+  cases[n] = one("consult 8 blocks 256 wide", &a_consult_wide, shape(115200)); n = n + 1;
+  cases[n] = one("consult blocks of 2 in chunks of 6", &a_consult_spans, shape(328)); n = n + 1;
+  cases[n] = one("consult blocks of 8 in chunks of 64", &a_consult_long, shape(214016)); n = n + 1;
+  cases[n] = one("ponder looking up a memory", &a_ponder_look, shape(886017)); n = n + 1;
+  cases[n] = one("ponder twice with a book looking up a memory", &a_ponder_look_book, shape(886017)); n = n + 1;
+  cases[n] = one("ponder heeding", &a_ponder_heed, shape(601)); n = n + 1;
+  cases[n] = one("ponder heeding 32 rooms 256 wide", &a_ponder_heed_wide, shape(573697)); n = n + 1;
+  cases[n] = one("ponder twice with a book heeding", &a_ponder_heed_book, shape(573697)); n = n + 1;
+  cases[n] = one("ponder heeding and looking up a memory", &a_ponder_look_heed, shape(902401)); n = n + 1;
+  cases[n] = one("ponder twice with a book heeding and looking up a memory", &a_ponder_look_book_heed, shape(902401)); n = n + 1;
+  cases[n] = three("consult a carried memory", &a_tapped_split, shape(2, 32, 32), shape(2, 32, 16), shape(2, 32, 2)); n = n + 1;
+  cases[n] = three("consult a carried memory 64 wide", &a_tapped_split_64, shape(2, 256, 512), shape(2, 256, 256), shape(2, 256, 4)); n = n + 1;
+  cases[n] = one("foresee", &a_foresee, shape(528)); n = n + 1;
+  cases[n] = one("foresee 256 wide", &a_foresee_wide, shape(409600)); n = n + 1;
+  cases[n] = one("foresee in two slices", &a_foresee_slices, shape(1261568)); n = n + 1;
+  cases[n] = one("pair", &a_pair, shape(1344)); n = n + 1;
+  cases[n] = one("pair with a zero first row", &a_pair_bare, shape(1176)); n = n + 1;
+  cases[n] = one("residual", &a_residual, shape(3328)); n = n + 1;
+  cases[n] = one("residual 128 wide", &a_residual_wide, shape(131072)); n = n + 1;
+  cases[n] = one("feed", &a_feed, shape(3768)); n = n + 1;
+  cases[n] = one("feed 128 wide", &a_feed_wide, shape(114688)); n = n + 1;
+  cases[n] = three("conv2d", &c_conv, shape(2, 3, 9, 8), shape(5, 3, 3, 3), shape(5)); n = n + 1;
   cases[n] = three("conv2d dilated", &c_conv_dilated, shape(2, 3, 9, 8), shape(4, 3, 3, 3), shape(4)); n = n + 1;
   cases[n] = one("max_pool2d", &c_max_pool, shape(2, 3, 9, 8)); n = n + 1;
   cases[n] = one("avg_pool2d", &c_avg_pool, shape(2, 3, 8, 8)); n = n + 1;
@@ -266,7 +763,7 @@ fn main() -> int32 {
     if (!check(dev, cases[i])) { failed = failed + 1; }
   }
   println("{n - failed} of {n} ops agree");
-  var half: Case[16];
+  var half: Case[32];
   var h: int32 = 0;
   half[h] = three("bf16 linear", &m_linear, shape(2, 128, 384), shape(256, 384), shape(256)); h = h + 1;
   half[h] = two("bf16 linear nobias", &m_linear_nobias, shape(512, 256), shape(384, 256)); h = h + 1;
@@ -282,6 +779,23 @@ fn main() -> int32 {
   half[h] = one("bf16 attention 32 long", &a_tc_full, shape(1, 300, 192)); h = h + 1;
   half[h] = one("bf16 attention rope 64", &a_rope_attention, shape(2, 150, 384)); h = h + 1;
   half[h] = one("bf16 attention rope 32", &a_rope_32, shape(2, 77, 384)); h = h + 1;
+  half[h] = three("bf16 recall 64", &a_recall_64, shape(2, 256, 256), shape(2, 256, 128), shape(2, 256, 2)); h = h + 1;
+  half[h] = three("bf16 recall 64 six chunks", &a_recall_64_long, shape(1, 384, 512), shape(1, 384, 256), shape(1, 384, 4)); h = h + 1;
+  half[h] = three("bf16 recall_exact 64", &a_exact_64, shape(2, 256, 256), shape(2, 256, 128), shape(2, 256, 2)); h = h + 1;
+  half[h] = three("bf16 recall_exact 128", &a_exact_128, shape(1, 256, 512), shape(1, 256, 256), shape(1, 256, 2)); h = h + 1;
+  half[h] = three("bf16 recall carried 64", &a_split_64, shape(2, 256, 256), shape(2, 256, 128), shape(2, 256, 2)); h = h + 1;
+  half[h] = three("bf16 recall_exact carried 64", &a_split_exact_64, shape(2, 256, 256), shape(2, 256, 128), shape(2, 256, 2)); h = h + 1;
+  half[h] = one("bf16 mingle 32 rooms", &a_mingle_64, shape(2, 32, 768)); h = h + 1;
+  half[h] = one("bf16 mingle 64 rooms", &a_mingle_64, shape(1, 64, 768)); h = h + 1;
+  half[h] = one("bf16 ponder 32 rooms", &a_ponder_wide, shape(557313)); h = h + 1;
+  half[h] = one("bf16 ponder two rounds in a book", &a_ponder_pair_wide, shape(557313)); h = h + 1;
+  half[h] = one("bf16 consult 8 blocks", &a_consult_wide, shape(115200)); h = h + 1;
+  half[h] = one("bf16 consult blocks of 8 in chunks of 64", &a_consult_long, shape(214016)); h = h + 1;
+  half[h] = one("bf16 ponder looking up a memory", &a_ponder_look, shape(886017)); h = h + 1;
+  half[h] = one("bf16 ponder twice with a book looking up a memory", &a_ponder_look_book, shape(886017)); h = h + 1;
+  half[h] = one("bf16 foresee 256 wide", &a_foresee_wide, shape(409600)); h = h + 1;
+  half[h] = one("bf16 residual 128 wide", &a_residual_wide, shape(131072)); h = h + 1;
+  half[h] = one("bf16 feed 128 wide", &a_feed_wide, shape(114688)); h = h + 1;
   gpu_matmul(dev, MATMUL_BF16);
   var half_failed: int32 = 0;
   for i in 0..h {
@@ -289,6 +803,8 @@ fn main() -> int32 {
     c.tolerance = 2.0e-2;
     if (!check(dev, c)) { half_failed = half_failed + 1; }
   }
+  if (!check(dev, two("matmul_exact in bf16 mode", &m_matmul_exact, shape(3, 128, 256), shape(3, 256, 128)))) { half_failed = half_failed + 1; }
+  if (!check(dev, two("matmul_exact rows in bf16 mode", &m_matmul_exact, shape(256, 128), shape(128, 192)))) { half_failed = half_failed + 1; }
   gpu_matmul(dev, MATMUL_FP32);
   println("{h - half_failed} of {h} bf16 ops agree");
   return failed + half_failed;

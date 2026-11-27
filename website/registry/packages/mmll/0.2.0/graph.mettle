@@ -51,10 +51,39 @@ export const OP_GATHER_ROWS = 73;
 export const OP_ATTENTION = 74;
 export const OP_CACHED_ATTENTION = 75;
 export const OP_QK_ROPE = 76;
+export const OP_RECALL = 77;
+export const OP_RECALL_EXACT = 78;
+export const OP_MINGLE = 79;
 export const OP_CONV2D = 80;
 export const OP_MAX_POOL2D = 81;
 export const OP_AVG_POOL2D = 82;
 export const OP_BATCH_NORM = 83;
+export const OP_PONDER = 84;
+export const OP_FORESEE = 85;
+export const OP_PONDER_SUM = 86;
+export const OP_CONSULT = 87;
+export const OP_ADD_MUL = 88;
+export const OP_RESIDUAL = 89;
+export const OP_FEED = 90;
+export const OP_PAIR = 91;
+export const OP_MIX = 92;
+export const OP_FOLD = 93;
+export const OP_TAKE = 94;
+export const OP_SPREAD = 95;
+export const OP_JOIN = 96;
+export const OP_RULES = 97;
+export const OP_SOLVE_TABLE = 98;
+export const OP_SOLVE_PROOF = 99;
+export const OP_SOLVE_BELIEFS = 100;
+export const OP_SOLVE_TABLES = 101;
+export const OP_SOLVE_GUESS = 102;
+export const OP_ROUND = 103;
+export const OP_SCALE_BY = 104;
+export const OP_ANCHOR = 105;
+export const OP_TALLY = 106;
+export const OP_PICK = 107;
+
+export const ARENA_STEP = 536870912;
 
 export const PARAM_WEIGHT = 0;
 export const PARAM_BUFFER = 1;
@@ -205,6 +234,14 @@ export struct Node {
   saved2: float32*;
   ints: int32*;
   ext: rawptr;
+  owned: bool;
+}
+
+export struct Spares {
+  sizes: int64*;
+  blocks: float32**;
+  count: int32;
+  capacity: int32;
 }
 
 export struct Graph {
@@ -217,12 +254,14 @@ export struct Graph {
   training: bool;
   rng: Rng;
   profiling: bool;
+  plain: bool;
   last_op: int32;
   last_mark: int64;
-  forward_ns: int64[96];
-  backward_ns: int64[96];
-  calls: int64[96];
+  forward_ns: int64[128];
+  backward_ns: int64[128];
+  calls: int64[128];
   dev: Device*;
+  spares: Spares;
 }
 
 export fn op_name(op: int32) -> string {
@@ -274,10 +313,38 @@ export fn op_name(op: int32) -> string {
     case 73: { return "gather_rows"; }
     case 74: { return "self_attention"; }
     case 75: { return "cached_attention"; }
+    case 76: { return "qk_norm_rope"; }
+    case 77: { return "recall"; }
+    case 78: { return "recall_exact"; }
+    case 79: { return "mingle"; }
     case 80: { return "conv2d"; }
     case 81: { return "max_pool2d"; }
     case 82: { return "avg_pool2d"; }
     case 83: { return "batch_norm"; }
+    case 84: { return "ponder"; }
+    case 85: { return "foresee"; }
+    case 86: { return "ponder_sum"; }
+    case 87: { return "consult"; }
+    case 88: { return "add_mul"; }
+    case 89: { return "residual"; }
+    case 90: { return "feed"; }
+    case 91: { return "pair"; }
+    case 92: { return "mix"; }
+    case 93: { return "fold_rows"; }
+    case 94: { return "take_last"; }
+    case 95: { return "spread_last"; }
+    case 96: { return "chain_join"; }
+    case 97: { return "chain_rules"; }
+    case 98: { return "solve_table"; }
+    case 99: { return "solve_proof"; }
+    case 100: { return "solve_beliefs"; }
+    case 101: { return "solve_tables"; }
+    case 102: { return "solve_guess"; }
+    case 103: { return "chain_round"; }
+    case 104: { return "scale_by"; }
+    case 105: { return "chain_anchor"; }
+    case 106: { return "tally"; }
+    case 107: { return "take_at"; }
     default: { return "op"; }
   }
   return "op";
@@ -296,7 +363,7 @@ fn profile_mark(g: Graph*, next_op: int32) {
 export fn Graph_profile__ptr(g: Graph*, on: bool) {
   g->profiling = on;
   g->last_op = -1;
-  for i in 0..96 {
+  for i in 0..128 {
     g->forward_ns[i] = 0;
     g->backward_ns[i] = 0;
     g->calls[i] = 0;
@@ -314,13 +381,13 @@ export fn Graph_profile_backward__ptr(g: Graph*, op: int32, ns: int64) {
 export fn Graph_profile_report__ptr(g: Graph*) -> string {
   g->profile_close();
   var total: int64 = 0;
-  for i in 0..96 { total = total + g->forward_ns[i] + g->backward_ns[i]; }
+  for i in 0..128 { total = total + g->forward_ns[i] + g->backward_ns[i]; }
   var text: string = "op                  calls   forward ms  backward ms   share\n";
-  var order: int32[96];
-  for i in 0..96 { order[i] = i; }
-  for i in 0..96 {
+  var order: int32[128];
+  for i in 0..128 { order[i] = i; }
+  for i in 0..128 {
     var best: int32 = i;
-    for j in i + 1..96 {
+    for j in i + 1..128 {
       var tj: int64 = g->forward_ns[order[j]] + g->backward_ns[order[j]];
       var tb: int64 = g->forward_ns[order[best]] + g->backward_ns[order[best]];
       if (tj > tb) { best = j; }
@@ -329,7 +396,7 @@ export fn Graph_profile_report__ptr(g: Graph*) -> string {
     order[i] = order[best];
     order[best] = keep;
   }
-  for k in 0..96 {
+  for k in 0..128 {
     var i: int32 = order[k];
     var spent: int64 = g->forward_ns[i] + g->backward_ns[i];
     if (spent == 0 && g->calls[i] == 0) { continue; }
@@ -579,6 +646,8 @@ export fn graph_free(g: Graph*) {
   arena_drop(&g->host, (Device*)0);
   arena_drop(&g->device, g->dev);
   if (g->nodes != 0) { free((rawptr)g->nodes); }
+  if (g->spares.sizes != 0) { free((rawptr)g->spares.sizes); }
+  if (g->spares.blocks != 0) { free((rawptr)g->spares.blocks); }
   free((rawptr)g);
 }
 
@@ -634,6 +703,7 @@ fn arena_take(a: Bump*, dev: Device*, bytes: int64) -> rawptr {
       a->spent = a->spent + a->used;
     }
     var size: int64 = a->size * 2;
+    if (size > ARENA_STEP) { size = ARENA_STEP; }
     if (size < 1048576) { size = 1048576; }
     if (size < want) { size = (want + 65535) / 65536 * 65536; }
     a->block = arena_block(dev, size);
@@ -655,6 +725,7 @@ export fn Graph_reset__ptr(g: Graph*) {
   arena_rewind(&g->host, (Device*)0);
   arena_rewind(&g->device, g->dev);
   g->count = 0;
+  g->spares.count = 0;
 }
 
 export fn Graph_seed__ptr(g: Graph*, seed: uint64) {
@@ -715,6 +786,10 @@ fn leaf_data(g: Graph*, t: Tensor) -> float32* {
 }
 
 export fn Graph_push__ptr(g: Graph*, op: int32, a: int32, b: int32, c: int32, s: Shape) -> int32 {
+  return g->push_onto(op, a, b, c, s, (float32*)0);
+}
+
+export fn Graph_push_onto__ptr(g: Graph*, op: int32, a: int32, b: int32, c: int32, s: Shape, data: float32*) -> int32 {
   if (g->count == g->capacity) {
     var cap: int32 = if (g->capacity == 0) 256 else g->capacity * 2;
     var grown: Node* = (Node*)realloc((rawptr)g->nodes, (int64)cap * sizeof(Node));
@@ -742,7 +817,9 @@ export fn Graph_push__ptr(g: Graph*, op: int32, a: int32, b: int32, c: int32, s:
     if (c >= 0 && g->nodes[c].requires) { requires = true; }
   }
   n->requires = requires;
-  if (op != OP_LEAF && op != OP_RESHAPE) {
+  if (data != 0) {
+    n->value.data = data;
+  } else if (op != OP_LEAF && op != OP_RESHAPE) {
     var size: int64 = s.size();
     n->value.data = (float32*)g->alloc(if (size < 1) 4 else size * 4);
   }
@@ -835,9 +912,44 @@ export fn Graph_grad_of__ptr(g: Graph*, id: int32) -> float32* {
     return n->grad;
   }
   var size: int64 = n->value.shape.size();
-  var p: float32* = g->zeros_raw(if (size < 1) 1 else size);
+  var p: float32* = g->grad_space(if (size < 1) 1 else size, true);
   g->nodes[id].grad = p;
+  g->nodes[id].owned = true;
   return p;
+}
+
+export fn Graph_grad_space__ptr(g: Graph*, n: int64, zero: bool) -> float32* {
+  var pool: Spares* = &g->spares;
+  for i in 0..pool->count {
+    if (pool->sizes[i] != n) { continue; }
+    var p: float32* = pool->blocks[i];
+    pool->count = pool->count - 1;
+    pool->sizes[i] = pool->sizes[pool->count];
+    pool->blocks[i] = pool->blocks[pool->count];
+    if (zero) {
+      if (g->dev != 0) { g->dev->fill(p, 0.0, n); } else { zero_f32(p, n); }
+    }
+    return p;
+  }
+  return if zero { g->zeros_raw(n) } else { g->floats(n) };
+}
+
+export fn Graph_release_grad__ptr(g: Graph*, id: int32) {
+  var n: Node* = &g->nodes[id];
+  if (!n->owned || n->grad == 0 || n->op == OP_LEAF) { return; }
+  var pool: Spares* = &g->spares;
+  if (pool->count == pool->capacity) {
+    var cap: int32 = if (pool->capacity == 0) 64 else pool->capacity * 2;
+    pool->sizes = (int64*)realloc((rawptr)pool->sizes, (int64)cap * 8);
+    pool->blocks = (float32**)realloc((rawptr)pool->blocks, (int64)cap * 8);
+    pool->capacity = cap;
+  }
+  var size: int64 = n->value.shape.size();
+  pool->sizes[pool->count] = if (size < 1) 1 else size;
+  pool->blocks[pool->count] = n->grad;
+  pool->count = pool->count + 1;
+  n->grad = (float32*)0;
+  n->owned = false;
 }
 
 export struct GradSlot {
@@ -851,8 +963,9 @@ export fn Graph_grad_take__ptr(g: Graph*, id: int32) -> GradSlot {
     return { data: g->grad_of(id), fresh: false };
   }
   var size: int64 = n->value.shape.size();
-  var p: float32* = g->floats(if (size < 1) 1 else size);
+  var p: float32* = g->grad_space(if (size < 1) 1 else size, false);
   g->nodes[id].grad = p;
+  g->nodes[id].owned = true;
   return { data: p, fresh: true };
 }
 

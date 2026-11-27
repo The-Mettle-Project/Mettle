@@ -133,6 +133,69 @@ Functions:
   unit root mean square and rotates its pairs by position, starting at
   `offset`; values pass through. It goes between the packed projection and
   `self_attention`.
+- `recall(kv, q, gate, heads, chunk, powers)` runs a decaying key to value
+  memory over time. `kv` packs keys and values as `[batch, time, 2 * width]`,
+  `q` is `[batch, time, width]` and `gate` is `[batch, time, heads]`. Each head
+  holds a matrix `S`. At every token it sets
+  `S = keep * S + sigmoid(gate) * value * key' / sqrt(head width)` and returns
+  `S * query`, with the key and query of each head scaled to unit root mean
+  square. `recall_ungated` leaves the gate out. `recall_powers(dev, keeps,
+  heads, chunk, chunks)` builds the table of each head's `keep` raised to the
+  powers the op needs; build it once and pass it to every call. On the CPU the
+  op runs the recurrence as written. On the GPU it splits time into pieces of
+  `chunk` tokens, takes products inside a piece and carries `S` between
+  pieces, so memory and time grow with `time * chunk`.
+- `recall_exact(kv, q, gate, heads, chunk, powers)` is `recall` with a write
+  that corrects itself. With `k` the key scaled to unit length and `r` the
+  gate, it sets `S = keep * S + r * (value - keep * S * k) * k'`, so a key
+  written again with `r = 1` returns its new value and nothing of the old
+  one. On the GPU each piece inverts one triangular matrix per head and
+  applies it with the tensor core product, forward and backward.
+  `recall_exact_ungated` leaves the gate out.
+- `mingle(p, heads)` lets a set of vectors exchange through one shared memory.
+  `p` packs a key, a value and a query for each vector as
+  `[batch, count, 3 * width]`. Per head, every vector writes `value * key'`
+  into one matrix and every vector reads it with its query, so each receives
+  the mean over all of `(query . key) * value`, with keys scaled to unit
+  length and queries to unit root mean square. The result is
+  `[batch, count, width]` and does not depend on the order of the vectors.
+- `ponder(rooms, seats, weights, heads)` runs one round of exchange and
+  update over a set of vectors as a single op. With `here = rms(rooms + seats)`,
+  it computes `told = proj(rms(mingle(pack(here))))`,
+  `worked = out(gelu(fc(rms(rooms + told))))` and
+  `amount = sigmoid(gate(here) + bias)`, and returns
+  `rooms + (told + worked) * amount`. `weights` is a `Thinking` of six Vars:
+  `pack` `[3 * width, width]`, `proj` `[width, width]`, `fc`
+  `[hidden, width]`, `out` `[width, hidden]`, `gate` `[1, width]` and `bias`
+  `[1]`. On the GPU a round is 13 kernel launches forward and 21 backward, and
+  it keeps seven buffers of the size of `rooms` and two of the hidden size for
+  the backward pass, none when the graph records no gradient. `ponder_into`
+  also takes a buffer for the result and one for its gradient, so a caller
+  can lay the rounds of a sequence side by side.
+- `ponder_with(rooms, seats, weights, heads, heard)` adds `heard`, a tensor of
+  the shape of `rooms`, to what each vector received from the exchange before
+  the update. `ponder_in` takes the same input.
+- `recall_tapped(kv, q, gate, heads, chunk, powers)` is `recall_exact` that
+  also keeps the state of the memory at the start of every piece, and
+  `consult(memory, block, queries)` reads that state. `queries` is
+  `[batch, count, width]`; each head's part is scaled to unit root mean square
+  and multiplied by the state at the start of piece `block`. Gradients reach
+  the queries and, through the state, the keys, values and gates that were
+  written before that piece.
+- `ponder_book(g, weights, heads, rows, slots)` and
+  `ponder_in(book, rooms, seats, slot, value, slope)` run many rounds that
+  share one set of weights. Each round keeps its inputs and its gradients in
+  the book at its slot, and the weight gradients of all rounds come from one
+  product per weight when the backward pass reaches the book. Create the book
+  before the first round. A round in a book is 13 launches forward and 16
+  backward on the GPU; on the CPU it is the same as `ponder`.
+- `foresee(trace, seats, fore, tell, ahead, scale)` is a look-ahead loss over
+  a whole sequence of rounds in one op. `trace` holds the result of every
+  round as `[spans, rounds, rows, width]`. For each round in the first
+  `spans - ahead` spans it predicts
+  `rms(tell(gelu(fore(rms(trace + seats)))))` and takes the mean squared
+  difference to `rms` of the last round `ahead` spans later, held constant.
+  The result is `scale` times the sum over rounds.
 - `conv2d(x, weight, bias, stride, pad)`, `conv2d_nobias`, `conv2d_dilated`,
   `max_pool2d(x, size, stride, pad)`, `avg_pool2d`, `global_avg_pool`
 - `dropout(x, p)`, `embedding(table, ids, dims...)`, `gather_rows(table, ids, shape)`
@@ -251,17 +314,20 @@ Muon and the rotary layers were checked the same way: a GPT trained with Muon
 from one safetensors file gives the loss PyTorch gives to five digits for ten
 steps, and after three hundred steps it sits between two PyTorch runs of the
 same model, whose own difference comes from summation order. `mettle test`
-gradchecks `qk_norm_rope` and checks that five Newton-Schulz steps leave
-rows close to orthonormal.
+gradchecks `qk_norm_rope`, `recall`, `recall_exact`, `mingle`, `ponder`, `foresee` and `consult`, checks that `ponder` and `foresee` equal the same maths built from generic ops in value and in gradient, checks that
+`mingle` equals the same exchange built from generic ops, checks that a key
+written three times through `recall_exact` returns its last value, checks that `recall` equals the same
+memory built from `matmul_t`, `mul` and `matmul`, and checks that five
+Newton-Schulz steps leave rows close to orthonormal.
 
-`examples/gpu_check.mettle` runs 70 ops on the GPU and on the CPU from the same
+`examples/gpu_check.mettle` runs 96 ops on the GPU and on the CPU from the same
 inputs and compares values and input gradients. All agree within 3e-6 relative;
 a float32 sum of 70,000 values on the GPU against the CPU's float64 one is
 within 1e-4. Eight AdamW steps of a GPT with dropout and clipping give the same
 loss to 1e-6 on both, and forty cached generation steps give logits within 3e-7
-and the same greedy tokens. Nine more cases run the tensor core products and
-attention, at sequence lengths that are not multiples of 64, against the CPU's
-float32: all within 0.6% of the largest value, which is what rounding the
+and the same greedy tokens. Twenty-seven more cases run the tensor core products,
+attention, `recall`, `mingle`, `ponder` and `foresee`, at sequence lengths that are not multiples of 64, against the CPU's
+float32: all within 1.2% of the largest value, which is what rounding the
 inputs to bfloat16 costs. Thirty Muon steps of a GPT with rotary attention give
 the same loss to six digits on the CPU and on the GPU in float32.
 

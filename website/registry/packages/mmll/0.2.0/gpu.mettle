@@ -8,6 +8,7 @@ import "./ops_elementwise";
 import "./ops_shape";
 import "./ops_matmul";
 import "./ops_nn";
+import "./ops_fused";
 
 struct Gemm {
   a: float32*;
@@ -238,6 +239,26 @@ fn drop_bits(key: uint64, index: int64) -> uint64 {
   return (z ^ (z >> (uint64)31)) >> (uint64)11;
 }
 
+kernel(block = 256) k_normal_rows(dst: float32*, seeds: int32*, count: int64, width: int64, scale: float32) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (e < count * width) {
+    var at: int64 = e / width;
+    var seed: int32 = seeds[at];
+    var v: float32 = z32();
+    if (seed != 0) {
+      var key: uint64 = (uint64)seed * (uint64)0xD1B54A32D192ED03;
+      var a: uint64 = drop_bits(key, (e - at * width) * 2);
+      var b: uint64 = drop_bits(key, (e - at * width) * 2 + 1);
+      var u1: float32 = ((float32)(a >> (uint64)29) + (float32)0.5) / (float32)16777216.0;
+      var u2: float32 = (float32)(b >> (uint64)29) / (float32)16777216.0;
+      v = scale * sqrtf((float32)-2.0 * logf(u1)) * cosf((float32)6.2831853 * u2);
+    }
+    dst[e] = v;
+    e = e + step;
+  }
+}
+
 kernel(block = 256) k_fill(p: float32*, value: float32, n: int64) {
   var i: int64 = (int64)block.x * 256 + (int64)thread.x;
   var step: int64 = (int64)grid_dim.x * 256;
@@ -373,6 +394,8 @@ kernel(block = 256) k_partials(x: float32*, y: float32*, mode: int32, n: int64, 
     } else if (mode == 2) {
       var d: float32 = v - y[i];
       acc = acc + d * d;
+    } else if (mode == 4) {
+      acc = acc + v * y[i];
     } else {
       var m: float32 = z32();
       if (v > z32()) { m = v; }
@@ -2343,10 +2366,19 @@ struct GpuState {
   matmul: int32;
   dev: Device*;
   scratch: Graph*;
+  narrow: bool;
 }
 
 export fn gpu_matmul(dev: Device*, mode: int32) {
   state_of(dev->state)->matmul = mode;
+}
+
+export fn gpu_normal_rows(dev: Device*, dst: float32*, seeds: int32*, count: int64, width: int64, scale: float64) {
+  dispatch k_normal_rows[spread(state_of(dev->state), count * width), 256](dst, seeds, count, width, (float32)scale);
+}
+
+export fn gpu_tiles(dev: Device*, narrow: bool) {
+  state_of(dev->state)->narrow = narrow;
 }
 
 fn state_of(p: rawptr) -> GpuState* {
@@ -2543,6 +2575,7 @@ struct GemmShape {
   sb_inner: int64;
   sc_outer: int64;
   sc_inner: int64;
+  exact: bool;
 }
 
 fn gemm_shape(a: float32*, b: float32*, c: float32*, m: int64, n: int64, k: int64, lda: int64, ldb: int64, ldc: int64, ta: bool, tb: bool, accumulate: bool) -> GemmShape {
@@ -2560,6 +2593,7 @@ fn gemm_shape(a: float32*, b: float32*, c: float32*, m: int64, n: int64, k: int6
   s.tb = tb;
   s.accumulate = accumulate;
   s.alpha = 1.0;
+  s.exact = false;
   s.bias = (float32*)0;
   s.outer = 1;
   s.inner = 1;
@@ -2609,9 +2643,10 @@ fn tensor_launch(form: int32, gx: int32, gy: int32, gz: int32, q: GemmShape, c: 
 fn run_tensor(s: GpuState*, g: Graph*, q: GemmShape) -> bool {
   if (s->matmul != MATMUL_BF16) { return false; }
   if (q.m % 64 != 0 || q.n % 64 != 0 || q.k % 32 != 0 || q.k <= 0) { return false; }
-  var tile: int64 = if q.m % 128 == 0 && q.n % 128 == 0 { (int64)128 } else { (int64)64 };
-  var shift: int32 = if tile == 128 { 0 } else { 7 };
   if (q.ta && q.tb) { return false; }
+  var tile: int64 = if q.m % 128 == 0 && q.n % 128 == 0 { (int64)128 } else { (int64)64 };
+  if (tile == 128 && s->narrow && (q.m / 128) * (q.n / 128) * q.outer * q.inner < (int64)s->sms) { tile = 64; }
+  var shift: int32 = if tile == 128 { 0 } else { 7 };
   if (q.lda % 4 != 0 || q.ldb % 4 != 0 || !aligned16(q.a) || !aligned16(q.b)) { return false; }
   if (q.outer > 1 && q.inner > 1) { return false; }
   if (q.bias != 0 && q.accumulate) { return false; }
@@ -2653,7 +2688,7 @@ fn run_tensor(s: GpuState*, g: Graph*, q: GemmShape) -> bool {
 
 fn run_gemm(s: GpuState*, g: Graph*, q: GemmShape) {
   if (q.m <= 0 || q.n <= 0) { return; }
-  if (run_tensor(s, g, q)) { return; }
+  if (!q.exact && run_tensor(s, g, q)) { return; }
   var p: Gemm;
   p.a = q.a;
   p.b = q.b;
@@ -2910,7 +2945,8 @@ fn back_transpose(s: GpuState*, g: Graph*, id: int32) {
   if (!g->nodes[n->a].requires) { return; }
   var ys: Shape = n->value.shape;
   var p: Bcast = permute_record(ys, (int32)n->i0, (int32)n->i1);
-  dispatch k_permute[cover(ys.size()), 256](g->grad_of(n->a), n->grad, p, 1);
+  var slot: GradSlot = g->grad_take(n->a);
+  dispatch k_permute[cover(ys.size()), 256](slot.data, n->grad, p, if slot.fresh { 0 } else { 1 });
 }
 
 fn fwd_slice(s: GpuState*, g: Graph*, id: int32) {
@@ -2959,11 +2995,40 @@ fn back_concat(s: GpuState*, g: Graph*, id: int32) {
   var lb: int64 = g->nodes[n->b].value.shape.dims[(int32)n->i0];
   var row: int64 = (la + lb) * inner;
   if (g->nodes[n->a].requires) {
-    dispatch k_blocks[spread(s, outer * la * inner), 256](g->grad_of(n->a), n->grad, outer, la * inner, la * inner, row, 1);
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_blocks[spread(s, outer * la * inner), 256](slot.data, n->grad, outer, la * inner, la * inner, row, if slot.fresh { 0 } else { 1 });
   }
   if (g->nodes[n->b].requires) {
-    dispatch k_blocks[spread(s, outer * lb * inner), 256](g->grad_of(n->b), n->grad + la * inner, outer, lb * inner, lb * inner, row, 1);
+    var slot: GradSlot = g->grad_take(n->b);
+    dispatch k_blocks[spread(s, outer * lb * inner), 256](slot.data, n->grad + la * inner, outer, lb * inner, lb * inner, row, if slot.fresh { 0 } else { 1 });
   }
+}
+
+kernel(block = 256) k_small_mm(c: float32*, a: float32*, b: float32*, z: int64, m: int64, n: int64, k: int64, ta: int32, tb: int32, add: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var plane: int64 = m * n;
+  var rise: int64 = if ta != 0 { m } else { 1 };
+  var run: int64 = if tb != 0 { 1 } else { n };
+  while (i < z * plane) {
+    var q: int64 = i / plane;
+    var rc: int64 = i - q * plane;
+    var r: int64 = rc / n;
+    var col: int64 = rc - r * n;
+    var pa: float32* = if ta != 0 { a + q * k * m + r } else { a + (q * m + r) * k };
+    var pb: float32* = if tb != 0 { b + (q * n + col) * k } else { b + q * k * n + col };
+    var sum: float32 = z32();
+    for j: int64 in 0..k { sum = sum + pa[j * rise] * pb[j * run]; }
+    if (add != 0) { c[i] = c[i] + sum; } else { c[i] = sum; }
+    i = i + step;
+  }
+}
+
+const SMALL_MM: int64 = 100000000;
+const SMALL_ONE: int64 = 200000;
+
+fn small_mm(s: GpuState*, c: float32*, a: float32*, b: float32*, z: int64, m: int64, n: int64, k: int64, ta: bool, tb: bool, add: bool) {
+  dispatch k_small_mm[spread(s, z * m * n), 256](c, a, b, z, m, n, k, if ta { 1 } else { 0 }, if tb { 1 } else { 0 }, if add { 1 } else { 0 });
 }
 
 fn fwd_matmul(s: GpuState*, g: Graph*, id: int32) {
@@ -2977,7 +3042,13 @@ fn fwd_matmul(s: GpuState*, g: Graph*, id: int32) {
   var ldb: int64 = if trans_b { k } else { cols };
   if (n->i0 == 0) {
     var rows: int64 = sa.size() / (if (k < 1) 1 else k);
-    run_gemm(s, g, gemm_shape(g->data(n->a), g->data(n->b), n->value.data, rows, cols, k, k, ldb, cols, false, trans_b, false));
+    var flat: GemmShape = gemm_shape(g->data(n->a), g->data(n->b), n->value.data, rows, cols, k, k, ldb, cols, false, trans_b, false);
+    flat.exact = n->i2 != 0;
+    run_gemm(s, g, flat);
+    return;
+  }
+  if (batch_of(sa) * m * cols * k <= SMALL_MM && m * cols * k <= SMALL_ONE) {
+    small_mm(s, n->value.data, g->data(n->a), g->data(n->b), batch_of(sa), m, cols, k, false, trans_b, false);
     return;
   }
   var q: GemmShape = gemm_shape(g->data(n->a), g->data(n->b), n->value.data, m, cols, k, k, ldb, cols, false, trans_b, false);
@@ -2985,6 +3056,7 @@ fn fwd_matmul(s: GpuState*, g: Graph*, id: int32) {
   q.sa_inner = m * k;
   q.sb_inner = k * cols;
   q.sc_inner = m * cols;
+  q.exact = n->i2 != 0;
   run_gemm(s, g, q);
 }
 
@@ -3002,6 +3074,21 @@ fn back_matmul(s: GpuState*, g: Graph*, id: int32) {
   var pa: float32* = g->data(n->a);
   var pb: float32* = g->data(n->b);
   var dc: float32* = n->grad;
+  if (batched && z * rows * cols * k <= SMALL_MM && rows * cols * k <= SMALL_ONE) {
+    if (g->nodes[n->a].requires) {
+      var slot: GradSlot = g->grad_take(n->a);
+      small_mm(s, slot.data, dc, pb, z, rows, k, cols, false, !trans_b, !slot.fresh);
+    }
+    if (g->nodes[n->b].requires) {
+      var slot: GradSlot = g->grad_take(n->b);
+      if (trans_b) {
+        small_mm(s, slot.data, dc, pa, z, cols, k, rows, true, false, !slot.fresh);
+      } else {
+        small_mm(s, slot.data, pa, dc, z, k, cols, rows, true, false, !slot.fresh);
+      }
+    }
+    return;
+  }
   if (g->nodes[n->a].requires) {
     var slot: GradSlot = g->grad_take(n->a);
     var q: GemmShape = if trans_b {
@@ -3013,6 +3100,7 @@ fn back_matmul(s: GpuState*, g: Graph*, id: int32) {
     q.sa_inner = rows * cols;
     q.sb_inner = k * cols;
     q.sc_inner = rows * k;
+    q.exact = n->i2 != 0;
     run_gemm(s, g, q);
   }
   if (g->nodes[n->b].requires) {
@@ -3026,6 +3114,7 @@ fn back_matmul(s: GpuState*, g: Graph*, id: int32) {
     q.sa_inner = if trans_b { rows * cols } else { rows * k };
     q.sb_inner = if trans_b { rows * k } else { rows * cols };
     q.sc_inner = k * cols;
+    q.exact = n->i2 != 0;
     run_gemm(s, g, q);
   }
 }
@@ -3179,6 +3268,93 @@ fn back_dropout(s: GpuState*, g: Graph*, id: int32) {
   var n: Node* = g->node(id);
   if (!g->nodes[n->a].requires) { return; }
   drop_into(s, g->grad_of(n->a), n->grad, n->value.shape.size(), (uint64)n->i0, n->f0, true);
+}
+
+kernel(block = 256) k_take_last(dst: float32*, x: float32*, ids: int32*, rows: int64, m: int64, l: int64, picks: int64, add: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < rows * m * picks) {
+    var k: int64 = i % picks;
+    var rj: int64 = i / picks;
+    var at: int64 = (int64)ids[(rj / m) * picks + k];
+    var v: float32 = z32();
+    if (at < l) { v = x[rj * l + at]; }
+    if (add != 0) { dst[i] = dst[i] + v; } else { dst[i] = v; }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_spread_last(dst: float32*, x: float32*, ids: int32*, rows: int64, m: int64, l: int64, picks: int64, add: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < rows * m * l) {
+    var at: int64 = i % l;
+    var rj: int64 = i / l;
+    var base: int64 = (rj / m) * picks;
+    var sum: float32 = z32();
+    for k: int64 in 0..picks {
+      if ((int64)ids[base + k] == at) { sum = sum + x[rj * picks + k]; }
+    }
+    if (add != 0) { dst[i] = dst[i] + sum; } else { dst[i] = sum; }
+    i = i + step;
+  }
+}
+
+fn fwd_take(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sx: Shape = g->nodes[n->a].value.shape;
+  var picks: int64 = n->value.shape.last();
+  dispatch k_take_last[spread(s, n->value.shape.size()), 256](n->value.data, g->data(n->a), n->ints, sx.dims[0], sx.dims[1], sx.dims[2], picks, 0);
+}
+
+fn back_take(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var sx: Shape = g->nodes[n->a].value.shape;
+  var picks: int64 = n->value.shape.last();
+  var slot: GradSlot = g->grad_take(n->a);
+  dispatch k_spread_last[spread(s, sx.size()), 256](slot.data, n->grad, n->ints, sx.dims[0], sx.dims[1], sx.dims[2], picks, if slot.fresh { 0 } else { 1 });
+}
+
+fn fwd_spread(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sx: Shape = g->nodes[n->a].value.shape;
+  var width: int64 = n->value.shape.last();
+  dispatch k_spread_last[spread(s, n->value.shape.size()), 256](n->value.data, g->data(n->a), n->ints, sx.dims[0], sx.dims[1], width, sx.dims[2], 0);
+}
+
+fn back_spread(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var sx: Shape = g->nodes[n->a].value.shape;
+  var width: int64 = n->value.shape.last();
+  var slot: GradSlot = g->grad_take(n->a);
+  dispatch k_take_last[spread(s, sx.size()), 256](slot.data, n->grad, n->ints, sx.dims[0], sx.dims[1], width, sx.dims[2], if slot.fresh { 0 } else { 1 });
+}
+
+fn fwd_fold(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var width: int64 = n->value.shape.last();
+  var classes: int64 = n->value.shape.dims[0];
+  var count: int64 = g->nodes[n->a].value.shape.dims[0];
+  var order: int32* = (int32*)n->ext;
+  g->dev->fill(n->value.data, 0.0, classes * width);
+  dispatch k_scatter[spread(s, classes * width), 256](n->value.data, g->data(n->a), order, order + count, classes, width);
+}
+
+fn back_fold(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var width: int64 = n->value.shape.last();
+  var count: int64 = g->nodes[n->a].value.shape.dims[0];
+  var slot: GradSlot = g->grad_take(n->a);
+  if (slot.fresh) {
+    dispatch k_gather[spread(s, count * width), 256](slot.data, n->grad, n->ints, count, width);
+    return;
+  }
+  var held: float32* = g->floats(count * width);
+  dispatch k_gather[spread(s, count * width), 256](held, n->grad, n->ints, count, width);
+  dispatch k_add[spread(s, count * width), 256](slot.data, held, (float32)1.0, count * width);
 }
 
 fn fwd_gather(s: GpuState*, g: Graph*, id: int32) {
@@ -3372,6 +3548,1959 @@ fn fwd_cached_attention(s: GpuState*, g: Graph*, id: int32) {
   dispatch k_decode[(int32)heads, 128](g->data(n->a), (float32*)n->ext, n->saved, n->value.data, n->saved2, (int32)n->i1, (int32)width, (int32)heads, scale);
 }
 
+kernel(block = 256) k_recall_prep(kn: float32*, qn: float32*, vg: float32*, norms: float32*, kv: float32*, q: float32*, gate: float32*, rows: int64, chunk: int64, width: int32, heads: int32, gated: int32) {
+  var w: int64 = (int64)block.x * 8 + (int64)(thread.x / 32);
+  var lane: int32 = (int32)subgroup_local_id();
+  var total: int64 = rows * (int64)heads;
+  if (w >= total) { return; }
+  var r: int64 = w / (int64)heads;
+  var h: int32 = (int32)(w - r * (int64)heads);
+  var d: int32 = width / heads;
+  var key: int64 = r * (int64)(2 * width) + (int64)(h * d);
+  var ask: int64 = r * (int64)width + (int64)(h * d);
+  var flat: int64 = (((r / chunk) * (int64)heads + (int64)h) * chunk + r % chunk) * (int64)d;
+  var sk: float32 = z32();
+  var sq: float32 = z32();
+  var i: int32 = lane;
+  while (i < d) {
+    var a: float32 = kv[key + (int64)i];
+    var b: float32 = q[ask + (int64)i];
+    sk = sk + a * a;
+    sq = sq + b * b;
+    i = i + 32;
+  }
+  var rk: float32 = rsqrtf(subgroup_reduce_add(sk) / (float32)d + (float32)1.0e-6);
+  var rq: float32 = rsqrtf(subgroup_reduce_add(sq) / (float32)d + (float32)1.0e-6);
+  var rate: float32 = one32();
+  if (gated != 0) { rate = one32() / (one32() + expf(-gate[w])); }
+  if (lane == 0) {
+    norms[w] = rk;
+    norms[total + w] = rq;
+    norms[2 * total + w] = rate;
+  }
+  i = lane;
+  while (i < d) {
+    kn[flat + (int64)i] = kv[key + (int64)i] * rk;
+    qn[flat + (int64)i] = q[ask + (int64)i] * rq;
+    vg[flat + (int64)i] = kv[key + (int64)(width + i)] * rate;
+    i = i + 32;
+  }
+}
+
+kernel(block = 256) k_recall_fade(scores: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, shrink: float32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var from: int64 = id % chunk;
+    var to: int64 = (id / chunk) % chunk;
+    var h: int64 = (id / (chunk * chunk)) % heads;
+    if (from > to) {
+      scores[id] = z32();
+    } else {
+      scores[id] = scores[id] * shrink * powers[h * (chunk + 1) + to - from];
+    }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_recall_rows(dst: float32*, src: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, dim: int64, tail: int32, scale: float32, accumulate: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var row: int64 = id / dim;
+    var at: int64 = row % chunk;
+    var h: int64 = (row / chunk) % heads;
+    var power: int64 = at + 1;
+    if (tail != 0) { power = chunk - 1 - at; }
+    var v: float32 = src[id] * scale * powers[h * (chunk + 1) + power];
+    if (accumulate != 0) { dst[id] = dst[id] + v; } else { dst[id] = v; }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_recall_chain(dst: float32*, src: float32*, far: float32*, count: int64, chunks: int64, heads: int64, plane: int64, back: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var span: int64 = heads * plane;
+  while (id < count) {
+    var h: int64 = (id / plane) % heads;
+    var c: int64 = (id / span) % chunks;
+    var base: int64 = id - c * span;
+    var acc: float32 = z32();
+    if (back == 0) {
+      var from: int64 = 0;
+      while (from < c) {
+        acc = acc + far[h * chunks + c - 1 - from] * src[base + from * span];
+        from = from + 1;
+      }
+    } else {
+      var to: int64 = c + 1;
+      while (to < chunks) {
+        acc = acc + far[h * chunks + to - 1 - c] * src[base + to * span];
+        to = to + 1;
+      }
+    }
+    dst[id] = acc;
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_recall_move(flat: float32*, wide: float32*, count: int64, chunk: int64, width: int64, heads: int64, to_flat: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var d: int64 = width / heads;
+  while (id < count) {
+    var r: int64 = id / width;
+    var col: int64 = id - r * width;
+    var h: int64 = col / d;
+    var at: int64 = (((r / chunk) * heads + h) * chunk + r % chunk) * d + col - h * d;
+    if (to_flat != 0) { flat[at] = wide[id]; } else { wide[id] = flat[at]; }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_recall_back(dkv: float32*, dq: float32*, dgate: float32*, dkn: float32*, dqn: float32*, dvg: float32*, kn: float32*, qn: float32*, kv: float32*, norms: float32*, rows: int64, chunk: int64, width: int32, heads: int32, wants: int32) {
+  var w: int64 = (int64)block.x * 8 + (int64)(thread.x / 32);
+  var lane: int32 = (int32)subgroup_local_id();
+  var total: int64 = rows * (int64)heads;
+  if (w >= total) { return; }
+  var r: int64 = w / (int64)heads;
+  var h: int32 = (int32)(w - r * (int64)heads);
+  var d: int32 = width / heads;
+  var key: int64 = r * (int64)(2 * width) + (int64)(h * d);
+  var ask: int64 = r * (int64)width + (int64)(h * d);
+  var flat: int64 = (((r / chunk) * (int64)heads + (int64)h) * chunk + r % chunk) * (int64)d;
+  var dk: float32 = z32();
+  var dqs: float32 = z32();
+  var dg: float32 = z32();
+  var i: int32 = lane;
+  while (i < d) {
+    var at: int64 = flat + (int64)i;
+    dk = dk + dkn[at] * kn[at];
+    dqs = dqs + dqn[at] * qn[at];
+    dg = dg + dvg[at] * kv[key + (int64)(width + i)];
+    i = i + 32;
+  }
+  var mean_k: float32 = subgroup_reduce_add(dk) / (float32)d;
+  var mean_q: float32 = subgroup_reduce_add(dqs) / (float32)d;
+  var pull: float32 = subgroup_reduce_add(dg);
+  var rk: float32 = norms[w];
+  var rq: float32 = norms[total + w];
+  var rate: float32 = norms[2 * total + w];
+  if ((wants & 4) != 0 && lane == 0) { dgate[w] = dgate[w] + rate * (one32() - rate) * pull; }
+  i = lane;
+  while (i < d) {
+    var at: int64 = flat + (int64)i;
+    if ((wants & 1) != 0) {
+      var k0: int64 = key + (int64)i;
+      var v0: int64 = key + (int64)(width + i);
+      dkv[k0] = dkv[k0] + rk * (dkn[at] - kn[at] * mean_k);
+      dkv[v0] = dkv[v0] + dvg[at] * rate;
+    }
+    if ((wants & 2) != 0) {
+      var q0: int64 = ask + (int64)i;
+      dq[q0] = dq[q0] + rq * (dqn[at] - qn[at] * mean_q);
+    }
+    i = i + 32;
+  }
+}
+
+kernel(block = 256) k_recall_seed(state: float32*, seed: float32*, far: float32*, count: int64, chunks: int64, heads: int64, plane: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var span: int64 = heads * plane;
+  while (id < count) {
+    var h: int64 = (id / plane) % heads;
+    var c: int64 = (id / span) % chunks;
+    var b: int64 = id / (chunks * span);
+    state[id] = state[id] + far[h * chunks + c] * seed[(b * heads + h) * plane + id % plane];
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_recall_last(into: float32*, state: float32*, wrote: float32*, powers: float32*, count: int64, chunks: int64, heads: int64, chunk: int64, plane: int64, linked: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var h: int64 = (id / plane) % heads;
+    var b: int64 = id / (heads * plane);
+    var src: int64 = ((b * chunks + chunks - 1) * heads + h) * plane + id % plane;
+    var v: float32 = wrote[src];
+    if (linked != 0) { v = v + powers[h * (chunk + 1) + chunk] * state[src]; }
+    into[id] = v;
+    id = id + step;
+  }
+}
+
+struct RecallParts {
+  kn: float32*;
+  qn: float32*;
+  vg: float32*;
+  scores: float32*;
+  found: float32*;
+  spare: float32*;
+  state: float32*;
+}
+
+fn fwd_recall(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var rows: int64 = sh.dims[0] * sh.dims[1];
+  var width: int64 = sh.dims[2];
+  var heads: int64 = n->i0;
+  var chunk: int64 = n->i1;
+  var d: int64 = width / heads;
+  var chunks: int64 = sh.dims[1] / chunk;
+  var groups: int64 = sh.dims[0] * chunks * heads;
+  var nd: int64 = chunk * d;
+  var nn: int64 = chunk * chunk;
+  var dd: int64 = d * d;
+  var all: int64 = rows * width;
+  var shrink: float32 = (float32)(1.0 / sqrt((float64)d));
+  var powers: float32* = (float32*)n->ext;
+  var p: RecallParts* = (RecallParts*)g->host_alloc(sizeof(RecallParts));
+  p->kn = g->floats(all);
+  p->qn = g->floats(all);
+  p->vg = g->floats(all);
+  p->scores = g->floats(groups * nn);
+  p->found = g->floats(all);
+  var seed: float32* = (float32*)n->i3;
+  var into: float32* = (float32*)n->i4;
+  var linked: bool = chunks > 1 || seed != 0;
+  p->spare = if linked || into != 0 { g->floats(all) } else { (float32*)0 };
+  p->state = if linked { g->floats(groups * dd) } else { (float32*)0 };
+  n->i2 = (int64)p;
+  var gate: float32* = if n->c >= 0 { g->data(n->c) } else { (float32*)0 };
+  dispatch k_recall_prep[row_blocks(rows * heads), 256](p->kn, p->qn, p->vg, n->saved, g->data(n->a), g->data(n->b), gate, rows, chunk, (int32)width, (int32)heads, if n->c >= 0 { 1 } else { 0 });
+  run_gemm(s, g, batched(p->qn, p->kn, p->scores, chunk, chunk, d, d, d, false, true, false, groups, nd, nd, nn));
+  dispatch k_recall_fade[spread(s, groups * nn), 256](p->scores, powers, groups * nn, heads, chunk, shrink);
+  run_gemm(s, g, batched(p->scores, p->vg, p->found, chunk, d, chunk, chunk, d, false, false, false, groups, nn, nd, nd));
+  if (linked || into != 0) {
+    var far: float32* = powers + heads * (chunk + 1);
+    var wrote: float32* = g->floats(groups * dd);
+    dispatch k_recall_rows[spread(s, all), 256](p->spare, p->vg, powers, all, heads, chunk, d, 1, shrink, 0);
+    run_gemm(s, g, batched(p->spare, p->kn, wrote, d, d, chunk, d, d, true, false, false, groups, nd, nd, dd));
+    if (linked) {
+      dispatch k_recall_chain[spread(s, groups * dd), 256](p->state, wrote, far, groups * dd, chunks, heads, dd, 0);
+      if (seed != 0) { dispatch k_recall_seed[spread(s, groups * dd), 256](p->state, seed, far, groups * dd, chunks, heads, dd); }
+    }
+    if (into != 0) { dispatch k_recall_last[spread(s, sh.dims[0] * heads * dd), 256](into, p->state, wrote, powers, sh.dims[0] * heads * dd, chunks, heads, chunk, dd, if linked { 1 } else { 0 }); }
+    if (linked) {
+      dispatch k_recall_rows[spread(s, all), 256](p->spare, p->qn, powers, all, heads, chunk, d, 0, one32(), 0);
+      run_gemm(s, g, batched(p->spare, p->state, p->found, chunk, d, d, d, d, false, true, true, groups, nd, dd, nd));
+    }
+  }
+  dispatch k_recall_move[spread(s, all), 256](p->found, n->value.data, all, chunk, width, heads, 0);
+}
+
+fn back_recall(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var rows: int64 = sh.dims[0] * sh.dims[1];
+  var width: int64 = sh.dims[2];
+  var heads: int64 = n->i0;
+  var chunk: int64 = n->i1;
+  var d: int64 = width / heads;
+  var chunks: int64 = sh.dims[1] / chunk;
+  var groups: int64 = sh.dims[0] * chunks * heads;
+  var nd: int64 = chunk * d;
+  var nn: int64 = chunk * chunk;
+  var dd: int64 = d * d;
+  var all: int64 = rows * width;
+  var shrink: float32 = (float32)(1.0 / sqrt((float64)d));
+  var powers: float32* = (float32*)n->ext;
+  var p: RecallParts* = (RecallParts*)n->i2;
+  var dvg: float32* = g->floats(all);
+  var dqn: float32* = g->floats(all);
+  var dkn: float32* = g->floats(all);
+  dispatch k_recall_move[spread(s, all), 256](p->found, n->grad, all, chunk, width, heads, 1);
+  run_gemm(s, g, batched(p->scores, p->found, dvg, chunk, d, chunk, chunk, d, true, false, false, groups, nn, nd, nd));
+  run_gemm(s, g, batched(p->found, p->vg, p->scores, chunk, chunk, d, d, d, false, true, false, groups, nd, nd, nn));
+  dispatch k_recall_fade[spread(s, groups * nn), 256](p->scores, powers, groups * nn, heads, chunk, shrink);
+  run_gemm(s, g, batched(p->scores, p->kn, dqn, chunk, d, chunk, chunk, d, false, false, false, groups, nn, nd, nd));
+  run_gemm(s, g, batched(p->scores, p->qn, dkn, chunk, d, chunk, chunk, d, true, false, false, groups, nn, nd, nd));
+  if (chunks > 1 || n->i3 != 0) {
+    var dstate: float32* = g->floats(groups * dd);
+    var dwrote: float32* = g->floats(groups * dd);
+    dispatch k_recall_rows[spread(s, all), 256](p->spare, p->found, powers, all, heads, chunk, d, 0, one32(), 0);
+    run_gemm(s, g, batched(p->spare, p->state, dqn, chunk, d, d, d, d, false, false, true, groups, nd, dd, nd));
+    run_gemm(s, g, batched(p->spare, p->qn, dstate, d, d, chunk, d, d, true, false, false, groups, nd, nd, dd));
+    dispatch k_recall_chain[spread(s, groups * dd), 256](dwrote, dstate, powers + heads * (chunk + 1), groups * dd, chunks, heads, dd, 1);
+    dispatch k_recall_rows[spread(s, all), 256](p->spare, p->vg, powers, all, heads, chunk, d, 1, shrink, 0);
+    run_gemm(s, g, batched(p->spare, dwrote, dkn, chunk, d, d, d, d, false, false, true, groups, nd, dd, nd));
+    run_gemm(s, g, batched(p->kn, dwrote, p->spare, chunk, d, d, d, d, false, true, false, groups, nd, dd, nd));
+    dispatch k_recall_rows[spread(s, all), 256](dvg, p->spare, powers, all, heads, chunk, d, 1, shrink, 1);
+  }
+  var wants: int32 = 0;
+  var dkv: float32* = (float32*)0;
+  var dq: float32* = (float32*)0;
+  var dgate: float32* = (float32*)0;
+  if (g->nodes[n->a].requires) {
+    dkv = g->grad_of(n->a);
+    wants = wants | 1;
+  }
+  if (g->nodes[n->b].requires) {
+    dq = g->grad_of(n->b);
+    wants = wants | 2;
+  }
+  if (n->c >= 0 && g->nodes[n->c].requires) {
+    dgate = g->grad_of(n->c);
+    wants = wants | 4;
+  }
+  dispatch k_recall_back[row_blocks(rows * heads), 256](dkv, dq, dgate, dkn, dqn, dvg, p->kn, p->qn, g->data(n->a), n->saved, rows, chunk, (int32)width, (int32)heads, wants);
+}
+kernel(block = 256) k_exact_prep(kn: float32*, qn: float32*, v: float32*, rates: float32*, norms: float32*, kv: float32*, q: float32*, gate: float32*, rows: int64, time: int64, chunk: int64, width: int32, heads: int32, gated: int32, kv_stride: int64, q_stride: int64) {
+  var w: int64 = (int64)block.x * 8 + (int64)(thread.x / 32);
+  var lane: int32 = (int32)subgroup_local_id();
+  var total: int64 = rows * (int64)heads;
+  if (w >= total) { return; }
+  var r: int64 = w / (int64)heads;
+  var h: int32 = (int32)(w - r * (int64)heads);
+  var d: int32 = width / heads;
+  var key: int64 = r * kv_stride + (int64)(h * d);
+  var ask: int64 = r * q_stride + (int64)(h * d);
+  var b: int64 = r / time;
+  var t: int64 = r - b * time;
+  var row: int64 = (((t / chunk) * (rows / time) + b) * (int64)heads + (int64)h) * chunk + t % chunk;
+  var flat: int64 = row * (int64)d;
+  var sk: float32 = z32();
+  var sq: float32 = z32();
+  var i: int32 = lane;
+  while (i < d) {
+    var a: float32 = kv[key + (int64)i];
+    var c: float32 = q[ask + (int64)i];
+    sk = sk + a * a;
+    sq = sq + c * c;
+    i = i + 32;
+  }
+  var rk: float32 = rsqrtf(subgroup_reduce_add(sk) / (float32)d + (float32)1.0e-6);
+  var rq: float32 = rsqrtf(subgroup_reduce_add(sq) / (float32)d + (float32)1.0e-6);
+  var unit: float32 = rk * rsqrtf((float32)d);
+  var rate: float32 = one32();
+  if (gated != 0) { rate = one32() / (one32() + expf(-gate[w])); }
+  if (lane == 0) {
+    norms[w] = rk;
+    norms[total + w] = rq;
+    norms[2 * total + w] = rate;
+    rates[row] = rate;
+  }
+  i = lane;
+  while (i < d) {
+    kn[flat + (int64)i] = kv[key + (int64)i] * unit;
+    qn[flat + (int64)i] = q[ask + (int64)i] * rq;
+    v[flat + (int64)i] = kv[key + (int64)(width + i)];
+    i = i + 32;
+  }
+}
+
+kernel(block = 256) k_exact_lower(lower: float32*, powers: float32*, count: int64, heads: int64, chunk: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var from: int64 = id % chunk;
+    var to: int64 = (id / chunk) % chunk;
+    var h: int64 = (id / (chunk * chunk)) % heads;
+    if (from >= to) {
+      lower[id] = z32();
+    } else {
+      lower[id] = lower[id] * powers[h * (chunk + 1) + to - from];
+    }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_exact_gap(gap: float32*, wrote: float32*, v: float32*, pulled: float32*, rates: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, dim: int64, first: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var row: int64 = id / dim;
+    var at: int64 = row % chunk;
+    var h: int64 = (row / chunk) % heads;
+    var z: float32 = v[id];
+    if (first == 0) { z = z - powers[h * (chunk + 1) + at + 1] * pulled[id]; }
+    gap[id] = z;
+    wrote[id] = rates[row] * z;
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_exact_carried(dst: float32*, x: float32*, rates: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, dim: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var row: int64 = id / dim;
+    var at: int64 = row % chunk;
+    var h: int64 = (row / chunk) % heads;
+    dst[id] = rates[row] * powers[h * (chunk + 1) + at + 1] * x[id];
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_exact_decay(next: float32*, state: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, plane: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var h: int64 = (id / plane) % heads;
+    next[id] = next[id] + powers[h * (chunk + 1) + chunk] * state[id];
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_exact_pull(p: float32*, lower: float32*, rates: float32*, drate: float32*, x: float32*, gap: float32*, powers: float32*, rows: int64, heads: int64, chunk: int64, dim: int64) {
+  var row: int64 = (int64)block.x * 256 + (int64)thread.x;
+  if (row >= rows) { return; }
+  var to: int64 = row % chunk;
+  var h: int64 = (row / chunk) % heads;
+  var line: int64 = row * chunk;
+  var rate: float32 = rates[row];
+  var acc: float32 = z32();
+  var j: int64 = 0;
+  while (j < chunk) {
+    if (j < to) {
+      acc = acc - p[line + j] * lower[line + j];
+      p[line + j] = -p[line + j] * rate * powers[h * (chunk + 1) + to - j];
+    } else {
+      p[line + j] = z32();
+    }
+    j = j + 1;
+  }
+  var e: int64 = 0;
+  while (e < dim) {
+    acc = acc + x[row * dim + e] * gap[row * dim + e];
+    e = e + 1;
+  }
+  drate[row] = acc;
+}
+
+kernel(block = 256) k_exact_move(flat: float32*, wide: float32*, count: int64, time: int64, chunk: int64, width: int64, heads: int64, to_flat: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var d: int64 = width / heads;
+  var batch: int64 = count / (time * width);
+  while (id < count) {
+    var r: int64 = id / width;
+    var col: int64 = id - r * width;
+    var h: int64 = col / d;
+    var b: int64 = r / time;
+    var t: int64 = r - b * time;
+    var at: int64 = ((((t / chunk) * batch + b) * heads + h) * chunk + t % chunk) * d + col - h * d;
+    if (to_flat != 0) { flat[at] = wide[id]; } else { wide[id] = flat[at]; }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_exact_back(dkv: float32*, dq: float32*, dgate: float32*, dkn: float32*, dqn: float32*, x: float32*, drate: float32*, kn: float32*, qn: float32*, norms: float32*, rows: int64, time: int64, chunk: int64, width: int32, heads: int32, wants: int32, kv_stride: int64, q_stride: int64) {
+  var w: int64 = (int64)block.x * 8 + (int64)(thread.x / 32);
+  var lane: int32 = (int32)subgroup_local_id();
+  var total: int64 = rows * (int64)heads;
+  if (w >= total) { return; }
+  var r: int64 = w / (int64)heads;
+  var h: int32 = (int32)(w - r * (int64)heads);
+  var d: int32 = width / heads;
+  var key: int64 = r * kv_stride + (int64)(h * d);
+  var ask: int64 = r * q_stride + (int64)(h * d);
+  var b: int64 = r / time;
+  var t: int64 = r - b * time;
+  var row: int64 = (((t / chunk) * (rows / time) + b) * (int64)heads + (int64)h) * chunk + t % chunk;
+  var flat: int64 = row * (int64)d;
+  var dk: float32 = z32();
+  var dqs: float32 = z32();
+  var i: int32 = lane;
+  while (i < d) {
+    var at: int64 = flat + (int64)i;
+    dk = dk + dkn[at] * kn[at];
+    dqs = dqs + dqn[at] * qn[at];
+    i = i + 32;
+  }
+  var lean: float32 = subgroup_reduce_add(dk);
+  var mean_q: float32 = subgroup_reduce_add(dqs) / (float32)d;
+  var rk: float32 = norms[w] * rsqrtf((float32)d);
+  var rq: float32 = norms[total + w];
+  var rate: float32 = norms[2 * total + w];
+  if ((wants & 4) != 0 && lane == 0) {
+    var before: float32 = z32();
+    if ((wants & 16) == 0) { before = dgate[w]; }
+    dgate[w] = before + rate * (one32() - rate) * drate[row];
+  }
+  i = lane;
+  while (i < d) {
+    var at: int64 = flat + (int64)i;
+    var old_k: float32 = z32();
+    var old_v: float32 = z32();
+    var old_q: float32 = z32();
+    if ((wants & 1) != 0) {
+      var k0: int64 = key + (int64)i;
+      var v0: int64 = key + (int64)(width + i);
+      if ((wants & 8) == 0) {
+        old_k = dkv[k0];
+        old_v = dkv[v0];
+      }
+      dkv[k0] = old_k + rk * (dkn[at] - kn[at] * lean);
+      dkv[v0] = old_v + rate * x[at];
+    }
+    if ((wants & 2) != 0) {
+      var q0: int64 = ask + (int64)i;
+      if ((wants & 32) == 0) { old_q = dq[q0]; }
+      dq[q0] = old_q + rq * (dqn[at] - qn[at] * mean_q);
+    }
+    i = i + 32;
+  }
+}
+
+kernel(block = 256) k_span_rows(dst: float32*, src: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, span: int64, dim: int64, accumulate: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var row: int64 = id / dim;
+    var at: int64 = row % chunk;
+    var h: int64 = (row / chunk) % heads;
+    var v: float32 = src[id] * powers[h * (chunk + 1) + span - 1 - at % span];
+    if (accumulate != 0) { dst[id] = dst[id] + v; } else { dst[id] = v; }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_span_scan(blocks: float32*, start: float32*, end: float32*, deltas: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, span: int64, subs: int64, plane: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var group: int64 = id / plane;
+    var e: int64 = id - group * plane;
+    var keep: float32 = powers[(group % heads) * (chunk + 1) + span];
+    var acc: float32 = start[id];
+    var m: int64 = 0;
+    while (m < subs) {
+      acc = keep * acc + deltas[(group * subs + m) * plane + e];
+      blocks[(m + 1) * count + id] = acc;
+      m = m + 1;
+    }
+    end[id] = acc;
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_span_back_scan(held: float32*, later: float32*, taps: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, span: int64, subs: int64, plane: int64, last: int32) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var group: int64 = id / plane;
+    var e: int64 = id - group * plane;
+    var keep: float32 = powers[(group % heads) * (chunk + 1) + span];
+    var acc: float32 = z32();
+    if (last != 0) { acc = taps[subs * count + id]; } else { acc = later[id]; }
+    held[(group * subs + subs - 1) * plane + e] = acc;
+    var m: int64 = subs - 2;
+    while (m >= 0) {
+      acc = taps[(m + 1) * count + id] + keep * acc;
+      held[(group * subs + m) * plane + e] = acc;
+      m = m - 1;
+    }
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_span_decay(next: float32*, held: float32*, taps: float32*, powers: float32*, count: int64, heads: int64, chunk: int64, span: int64, subs: int64, plane: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (id < count) {
+    var group: int64 = id / plane;
+    next[id] = next[id] + powers[(group % heads) * (chunk + 1) + span] * held[group * subs * plane + id - group * plane] + taps[id];
+    id = id + step;
+  }
+}
+
+kernel(block = 256) k_exact_inverse(inverse: float32*, lower: float32*, rates: float32*, groups: int64, chunk: int64) {
+  var id: int64 = (int64)block.x * 256 + (int64)thread.x;
+  if (id >= groups * chunk) { return; }
+  var group: int64 = id / chunk;
+  var col: int64 = id - group * chunk;
+  var inv: float32* = inverse + group * chunk * chunk;
+  var tri: float32* = lower + group * chunk * chunk;
+  var rate: float32* = rates + group * chunk;
+  var i: int64 = 0;
+  while (i < col) {
+    inv[i * chunk + col] = z32();
+    i = i + 1;
+  }
+  inv[col * chunk + col] = one32();
+  i = col + 1;
+  while (i < chunk) {
+    var acc: float32 = z32();
+    var l: int64 = col;
+    while (l < i) {
+      acc = acc + tri[i * chunk + l] * inv[l * chunk + col];
+      l = l + 1;
+    }
+    inv[i * chunk + col] = -rate[i] * acc;
+    i = i + 1;
+  }
+}
+
+struct ExactParts {
+  inverse: float32*;
+  kn: float32*;
+  qn: float32*;
+  v: float32*;
+  gap: float32*;
+  wrote: float32*;
+  rates: float32*;
+  lower: float32*;
+  scores: float32*;
+  states: float32*;
+  starts: float32*;
+}
+
+fn minus(q: GemmShape) -> GemmShape {
+  var r: GemmShape = q;
+  r.alpha = -one32();
+  return r;
+}
+
+fn fwd_exact(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var time: int64 = sh.dims[1];
+  var rows: int64 = sh.dims[0] * time;
+  var width: int64 = sh.dims[2];
+  var heads: int64 = n->i0;
+  var chunk: int64 = n->i1;
+  var d: int64 = width / heads;
+  var chunks: int64 = time / chunk;
+  var groups: int64 = sh.dims[0] * heads;
+  var nd: int64 = chunk * d;
+  var nn: int64 = chunk * chunk;
+  var dd: int64 = d * d;
+  var gnd: int64 = groups * nd;
+  var gnn: int64 = groups * nn;
+  var gdd: int64 = groups * dd;
+  var all: int64 = rows * width;
+  var every: int64 = chunks * groups;
+  var powers: float32* = (float32*)n->ext;
+  var tapped: bool = n->i5 != 0;
+  var span: int64 = if tapped { (int64)n->ints[0] } else { chunk };
+  var subs: int64 = chunk / span;
+  var stride: int64 = subs * gdd;
+  var t: Graph* = spare(s);
+  var p: ExactParts* = (ExactParts*)g->host_alloc(sizeof(ExactParts));
+  n->i2 = (int64)p;
+  p->kn = g->floats(all);
+  p->qn = g->floats(all);
+  p->v = t->floats(all);
+  p->gap = g->floats(all);
+  p->wrote = g->floats(all);
+  p->rates = g->floats(rows * heads);
+  p->lower = g->floats(chunks * gnn);
+  p->scores = g->floats(chunks * gnn);
+  p->inverse = g->floats(chunks * gnn);
+  p->states = g->floats((chunks * subs + 1) * gdd);
+  p->starts = if tapped { g->floats((chunks + 1) * gdd) } else { p->states };
+  var found: float32* = t->floats(all);
+  var spare_rows: float32* = t->floats(gnd);
+  var rhs: float32* = t->floats(gnd);
+  var deltas: float32* = if tapped { t->floats(groups * subs * dd) } else { (float32*)0 };
+  var seed: float32* = (float32*)n->i3;
+  var into: float32* = (float32*)n->i4;
+  if (seed != 0) { dispatch k_scaled[spread(s, gdd), 256](p->starts, seed, one32(), gdd); }
+  if (tapped) {
+    if (seed != 0) {
+      dispatch k_scaled[spread(s, gdd), 256](p->states, seed, one32(), gdd);
+    } else {
+      s->dev->fill(p->states, 0.0, gdd);
+      s->dev->fill(p->starts, 0.0, gdd);
+    }
+  }
+  var gate: float32* = if n->c >= 0 { g->data(n->c) } else { (float32*)0 };
+  dispatch k_exact_prep[row_blocks(rows * heads), 256](p->kn, p->qn, p->v, p->rates, n->saved, g->data(n->a), g->data(n->b), gate, rows, time, chunk, (int32)width, (int32)heads, if n->c >= 0 { 1 } else { 0 }, 2 * width, width);
+  run_gemm(s, t, batched(p->kn, p->kn, p->lower, chunk, chunk, d, d, d, false, true, false, every, nd, nd, nn));
+  dispatch k_exact_lower[spread(s, chunks * gnn), 256](p->lower, powers, chunks * gnn, heads, chunk);
+  dispatch k_exact_inverse[cover(every * chunk), 256](p->inverse, p->lower, p->rates, every, chunk);
+  run_gemm(s, t, batched(p->qn, p->kn, p->scores, chunk, chunk, d, d, d, false, true, false, every, nd, nd, nn));
+  dispatch k_recall_fade[spread(s, chunks * gnn), 256](p->scores, powers, chunks * gnn, heads, chunk, one32());
+  for c: int64 in 0..chunks {
+    var k: float32* = p->kn + c * gnd;
+    var u: float32* = p->wrote + c * gnd;
+    var rate: float32* = p->rates + c * groups * chunk;
+    var state: float32* = p->starts + c * gdd;
+    var fed: bool = c > 0 || seed != 0;
+    if (fed) { run_gemm(s, t, batched(k, state, spare_rows, chunk, d, d, d, d, false, true, false, groups, nd, dd, nd)); }
+    dispatch k_exact_gap[spread(s, gnd), 256](p->gap + c * gnd, rhs, p->v + c * gnd, spare_rows, rate, powers, gnd, heads, chunk, d, if fed { 0 } else { 1 });
+    run_gemm(s, t, batched(p->inverse + c * gnn, rhs, u, chunk, d, chunk, chunk, d, false, false, false, groups, nn, nd, nd));
+    if (tapped) {
+      dispatch k_span_rows[spread(s, gnd), 256](spare_rows, u, powers, gnd, heads, chunk, span, d, 0);
+      run_gemm(s, t, batched(spare_rows, k, deltas, d, d, span, d, d, true, false, false, groups * subs, span * d, span * d, dd));
+      dispatch k_span_scan[spread(s, gdd), 256](p->states + c * stride, state, state + gdd, deltas, powers, gdd, heads, chunk, span, subs, dd);
+    } else if (c + 1 < chunks || into != 0) {
+      dispatch k_recall_rows[spread(s, gnd), 256](spare_rows, u, powers, gnd, heads, chunk, d, 1, one32(), 0);
+      run_gemm(s, t, batched(spare_rows, k, state + gdd, d, d, chunk, d, d, true, false, false, groups, nd, nd, dd));
+      if (fed) { dispatch k_exact_decay[spread(s, gdd), 256](state + gdd, state, powers, gdd, heads, chunk, dd); }
+    }
+  }
+  run_gemm(s, t, batched(p->scores, p->wrote, found, chunk, d, chunk, chunk, d, false, false, false, every, nn, nd, nd));
+  var first: int64 = if seed != 0 { 0 } else { 1 };
+  if (chunks > first) {
+    var fed_groups: int64 = (chunks - first) * groups;
+    var faded: float32* = t->floats(fed_groups * nd);
+    dispatch k_recall_rows[spread(s, fed_groups * nd), 256](faded, p->qn + first * gnd, powers, fed_groups * nd, heads, chunk, d, 0, one32(), 0);
+    run_gemm(s, t, batched(faded, p->starts + first * gdd, found + first * gnd, chunk, d, d, d, d, false, true, true, fed_groups, nd, dd, nd));
+  }
+  if (into != 0) { dispatch k_scaled[spread(s, gdd), 256](into, p->starts + chunks * gdd, one32(), gdd); }
+  dispatch k_exact_move[spread(s, all), 256](found, n->value.data, all, time, chunk, width, heads, 0);
+}
+
+fn back_exact(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var time: int64 = sh.dims[1];
+  var rows: int64 = sh.dims[0] * time;
+  var width: int64 = sh.dims[2];
+  var heads: int64 = n->i0;
+  var chunk: int64 = n->i1;
+  var d: int64 = width / heads;
+  var chunks: int64 = time / chunk;
+  var groups: int64 = sh.dims[0] * heads;
+  var nd: int64 = chunk * d;
+  var nn: int64 = chunk * chunk;
+  var dd: int64 = d * d;
+  var gnd: int64 = groups * nd;
+  var gnn: int64 = groups * nn;
+  var gdd: int64 = groups * dd;
+  var all: int64 = rows * width;
+  var every: int64 = chunks * groups;
+  var powers: float32* = (float32*)n->ext;
+  var p: ExactParts* = (ExactParts*)n->i2;
+  var tapped: bool = n->i5 != 0;
+  var span: int64 = if tapped { (int64)n->ints[0] } else { chunk };
+  var subs: int64 = chunk / span;
+  var stride: int64 = subs * gdd;
+  var taps: float32* = (float32*)n->i5;
+  var seeded: bool = n->i3 != 0;
+  var t: Graph* = spare(s);
+  var dkn: float32* = t->zeros_raw(all);
+  var dqn: float32* = t->zeros_raw(all);
+  var dout: float32* = t->floats(all);
+  var solved: float32* = t->floats(all);
+  var raw: float32* = t->floats(all);
+  var faded: float32* = t->floats(all);
+  var tails: float32* = t->floats(all);
+  var drate: float32* = t->floats(rows * heads);
+  var slope: float32* = t->floats((chunks + 1) * gdd);
+  var spare_rows: float32* = t->floats(gnd);
+  var held: float32* = if tapped { t->floats(every * subs * dd) } else { (float32*)0 };
+  var first: int64 = if seeded { 0 } else { 1 };
+  var fed_groups: int64 = (chunks - first) * groups;
+  dispatch k_exact_move[spread(s, all), 256](dout, n->grad, all, time, chunk, width, heads, 1);
+  run_gemm(s, t, batched(p->scores, dout, raw, chunk, d, chunk, chunk, d, true, false, false, every, nn, nd, nd));
+  run_gemm(s, t, batched(dout, p->wrote, p->scores, chunk, chunk, d, d, d, false, true, false, every, nd, nd, nn));
+  dispatch k_recall_fade[spread(s, chunks * gnn), 256](p->scores, powers, chunks * gnn, heads, chunk, one32());
+  run_gemm(s, t, batched(p->scores, p->kn, dqn, chunk, d, chunk, chunk, d, false, false, true, every, nn, nd, nd));
+  run_gemm(s, t, batched(p->scores, p->qn, dkn, chunk, d, chunk, chunk, d, true, false, true, every, nn, nd, nd));
+  if (fed_groups > 0) {
+    dispatch k_recall_rows[spread(s, fed_groups * nd), 256](faded + first * gnd, dout + first * gnd, powers, fed_groups * nd, heads, chunk, d, 0, one32(), 0);
+    run_gemm(s, t, batched(faded + first * gnd, p->qn + first * gnd, slope + first * gdd, d, d, chunk, d, d, true, false, false, fed_groups, nd, nd, dd));
+  }
+  var c: int64 = chunks - 1;
+  while (c >= 0) {
+    var k: float32* = p->kn + c * gnd;
+    var x: float32* = solved + c * gnd;
+    var pulled: float32* = raw + c * gnd;
+    var rate: float32* = p->rates + c * groups * chunk;
+    var later: float32* = slope + (c + 1) * gdd;
+    var sooner: float32* = slope + c * gdd;
+    var hc: float32* = if tapped { held + c * groups * subs * dd } else { (float32*)0 };
+    var last: bool = c + 1 == chunks;
+    var fed: bool = c > 0 || seeded;
+    if (tapped) {
+      dispatch k_span_back_scan[spread(s, gdd), 256](hc, later, taps + c * stride, powers, gdd, heads, chunk, span, subs, dd, if last { 1 } else { 0 });
+      run_gemm(s, t, batched(k, hc, spare_rows, span, d, d, d, d, false, true, false, groups * subs, span * d, dd, span * d));
+      dispatch k_span_rows[spread(s, gnd), 256](pulled, spare_rows, powers, gnd, heads, chunk, span, d, 1);
+    } else if (!last) {
+      run_gemm(s, t, batched(k, later, spare_rows, chunk, d, d, d, d, false, true, false, groups, nd, dd, nd));
+      dispatch k_recall_rows[spread(s, gnd), 256](pulled, spare_rows, powers, gnd, heads, chunk, d, 1, one32(), 1);
+    }
+    run_gemm(s, t, batched(p->inverse + c * gnn, pulled, x, chunk, d, chunk, chunk, d, true, false, false, groups, nn, nd, nd));
+    if (fed) {
+      if (tapped) {
+        dispatch k_span_decay[spread(s, gdd), 256](sooner, hc, taps + c * stride, powers, gdd, heads, chunk, span, subs, dd);
+      } else if (!last) {
+        dispatch k_exact_decay[spread(s, gdd), 256](sooner, later, powers, gdd, heads, chunk, dd);
+      }
+      dispatch k_exact_carried[spread(s, gnd), 256](pulled, x, rate, powers, gnd, heads, chunk, d);
+      run_gemm(s, t, minus(batched(pulled, k, sooner, d, d, chunk, d, d, true, false, true, groups, nd, nd, dd)));
+    }
+    c = c - 1;
+  }
+  if (tapped) {
+    dispatch k_span_rows[spread(s, all), 256](tails, p->wrote, powers, all, heads, chunk, span, d, 0);
+    run_gemm(s, t, batched(tails, held, dkn, span, d, d, d, d, false, false, true, every * subs, span * d, dd, span * d));
+  } else if (chunks > 1) {
+    dispatch k_recall_rows[spread(s, (chunks - 1) * gnd), 256](tails, p->wrote, powers, (chunks - 1) * gnd, heads, chunk, d, 1, one32(), 0);
+    run_gemm(s, t, batched(tails, slope + gdd, dkn, chunk, d, d, d, d, false, false, true, (chunks - 1) * groups, nd, dd, nd));
+  }
+  if (fed_groups > 0) {
+    run_gemm(s, t, batched(faded + first * gnd, p->starts + first * gdd, dqn + first * gnd, chunk, d, d, d, d, false, false, true, fed_groups, nd, dd, nd));
+    run_gemm(s, t, minus(batched(raw + first * gnd, p->starts + first * gdd, dkn + first * gnd, chunk, d, d, d, d, false, false, true, fed_groups, nd, dd, nd)));
+  }
+  run_gemm(s, t, batched(solved, p->wrote, p->scores, chunk, chunk, d, d, d, false, true, false, every, nd, nd, nn));
+  dispatch k_exact_pull[cover(every * chunk), 256](p->scores, p->lower, p->rates, drate, solved, p->gap, powers, every * chunk, heads, chunk, d);
+  run_gemm(s, t, batched(p->scores, p->kn, dkn, chunk, d, chunk, chunk, d, false, false, true, every, nn, nd, nd));
+  run_gemm(s, t, batched(p->scores, p->kn, dkn, chunk, d, chunk, chunk, d, true, false, true, every, nn, nd, nd));
+  var wants: int32 = 0;
+  var dkv: float32* = (float32*)0;
+  var dq: float32* = (float32*)0;
+  var dgate: float32* = (float32*)0;
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dkv = slot.data;
+    wants = wants | (if slot.fresh { 9 } else { 1 });
+  }
+  if (g->nodes[n->b].requires) {
+    var slot: GradSlot = g->grad_take(n->b);
+    dq = slot.data;
+    wants = wants | (if slot.fresh { 34 } else { 2 });
+  }
+  if (n->c >= 0 && g->nodes[n->c].requires) {
+    var slot: GradSlot = g->grad_take(n->c);
+    dgate = slot.data;
+    wants = wants | (if slot.fresh { 20 } else { 4 });
+  }
+  dispatch k_exact_back[row_blocks(rows * heads), 256](dkv, dq, dgate, dkn, dqn, solved, drate, p->kn, p->qn, n->saved, rows, time, chunk, (int32)width, (int32)heads, wants, 2 * width, width);
+}
+
+struct MingleParts {
+  kn: float32*;
+  qn: float32*;
+  v: float32*;
+  scores: float32*;
+  norms: float32*;
+}
+
+fn scaled_by(q: GemmShape, alpha: float32) -> GemmShape {
+  var r: GemmShape = q;
+  r.alpha = alpha;
+  return r;
+}
+
+fn spare(s: GpuState*) -> Graph* {
+  if (s->scratch == 0) { s->scratch = graph_on(s->dev); }
+  s->scratch->reset();
+  return s->scratch;
+}
+
+fn mingle_fwd(s: GpuState*, g: Graph*, t: Graph*, p: MingleParts*, packed: float32*, stride: int64, out: float32*, batch: int64, rooms: int64, width: int64, heads: int64) {
+  var rows: int64 = batch * rooms;
+  var d: int64 = width / heads;
+  var groups: int64 = batch * heads;
+  var nd: int64 = rooms * d;
+  var nn: int64 = rooms * rooms;
+  var all: int64 = rows * width;
+  p->kn = g->floats(all);
+  p->qn = g->floats(all);
+  p->v = g->floats(all);
+  p->scores = g->floats(groups * nn);
+  p->norms = g->floats(4 * rows * heads);
+  var found: float32* = t->floats(all);
+  dispatch k_exact_prep[row_blocks(rows * heads), 256](p->kn, p->qn, p->v, p->norms + 3 * rows * heads, p->norms, packed, packed + 2 * width, (float32*)0, rows, rooms, rooms, (int32)width, (int32)heads, 0, stride, stride);
+  run_gemm(s, t, batched(p->qn, p->kn, p->scores, rooms, rooms, d, d, d, false, true, false, groups, nd, nd, nn));
+  run_gemm(s, t, scaled_by(batched(p->scores, p->v, found, rooms, d, rooms, rooms, d, false, false, false, groups, nn, nd, nd), one32() / (float32)rooms));
+  dispatch k_exact_move[spread(s, all), 256](found, out, all, rooms, rooms, width, heads, 0);
+}
+
+fn mingle_back(s: GpuState*, t: Graph*, p: MingleParts*, dout: float32*, dp: float32*, stride: int64, batch: int64, rooms: int64, width: int64, heads: int64, wants: int32) {
+  var rows: int64 = batch * rooms;
+  var d: int64 = width / heads;
+  var groups: int64 = batch * heads;
+  var nd: int64 = rooms * d;
+  var nn: int64 = rooms * rooms;
+  var all: int64 = rows * width;
+  var share: float32 = one32() / (float32)rooms;
+  var found: float32* = t->floats(all);
+  var dv: float32* = t->floats(all);
+  var dqn: float32* = t->floats(all);
+  var dkn: float32* = t->floats(all);
+  dispatch k_exact_move[spread(s, all), 256](found, dout, all, rooms, rooms, width, heads, 1);
+  run_gemm(s, t, scaled_by(batched(p->scores, found, dv, rooms, d, rooms, rooms, d, true, false, false, groups, nn, nd, nd), share));
+  run_gemm(s, t, scaled_by(batched(found, p->v, p->scores, rooms, rooms, d, d, d, false, true, false, groups, nd, nd, nn), share));
+  run_gemm(s, t, batched(p->scores, p->kn, dqn, rooms, d, rooms, rooms, d, false, false, false, groups, nn, nd, nd));
+  run_gemm(s, t, batched(p->scores, p->qn, dkn, rooms, d, rooms, rooms, d, true, false, false, groups, nn, nd, nd));
+  dispatch k_exact_back[row_blocks(rows * heads), 256](dp, dp + 2 * width, (float32*)0, dkn, dqn, dv, p->norms, p->kn, p->qn, p->norms, rows, rooms, rooms, (int32)width, (int32)heads, wants, stride, stride);
+}
+
+fn fwd_mingle(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var p: MingleParts* = (MingleParts*)g->host_alloc(sizeof(MingleParts));
+  n->i2 = (int64)p;
+  mingle_fwd(s, g, spare(s), p, g->data(n->a), 3 * sh.dims[2], n->value.data, sh.dims[0], sh.dims[1], sh.dims[2], n->i0);
+}
+
+fn back_mingle(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var sh: Shape = n->value.shape;
+  mingle_back(s, spare(s), (MingleParts*)n->i2, n->grad, g->grad_of(n->a), 3 * sh.dims[2], sh.dims[0], sh.dims[1], sh.dims[2], n->i0, 3);
+}
+
+kernel(block = 256) k_think_open(y: float32*, rstd: float32*, amt: float32*, a: float32*, b: float32*, heed: float32*, gate: float32*, bias: float32*, rows: int32, cols: int32, eps: float32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var q: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    var x: float32 = a[base + (int64)c] + b[base + (int64)c];
+    q = q + x * x;
+    c = c + 32;
+  }
+  var rs: float32 = rsqrtf(subgroup_reduce_add(q) / (float32)cols + eps);
+  var gated: bool = gate != (float32*)0;
+  var heeded: bool = heed != (float32*)0;
+  var hit: float32 = z32();
+  c = lane;
+  while (c < cols) {
+    var v: float32 = (a[base + (int64)c] + b[base + (int64)c]) * rs;
+    if (heeded) { v = v + heed[base + (int64)c]; }
+    y[base + (int64)c] = v;
+    if (gated) { hit = hit + v * gate[c]; }
+    c = c + 32;
+  }
+  var z: float32 = subgroup_reduce_add(hit);
+  if (lane == 0) {
+    rstd[row] = rs;
+    if (gated) { amt[row] = d_sigmoid(z + bias[0]); }
+  }
+}
+
+kernel(block = 256) k_think_close(out: float32*, sum: float32*, rooms: float32*, told: float32*, worked: float32*, amt: float32*, n: int64, cols: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    var both: float32 = told[i] + worked[i];
+    sum[i] = both;
+    out[i] = rooms[i] + both * amt[i / cols];
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_think_close_back(dsum: float32*, dz: float32*, drooms: float32*, dout: float32*, sum: float32*, amt: float32*, rows: int32, cols: int32, wants: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var share: float32 = amt[row];
+  var acc: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    var d: float32 = dout[at];
+    acc = acc + d * sum[at];
+    dsum[at] = d * share;
+    if (wants != 0) { drooms[at] = drooms[at] + d; }
+    c = c + 32;
+  }
+  var total: float32 = subgroup_reduce_add(acc);
+  if (lane == 0) { dz[row] = total * share * (one32() - share); }
+}
+
+kernel(block = 256) k_think_mid_back(drooms: float32*, dtold: float32*, dmn: float32*, dsum: float32*, mn: float32*, rstd: float32*, rows: int32, cols: int32, wants: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var rs: float32 = rstd[row];
+  var acc: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    acc = acc + dmn[at] * mn[at];
+    c = c + 32;
+  }
+  var lean: float32 = subgroup_reduce_add(acc) / (float32)cols;
+  c = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    var d: float32 = rs * (dmn[at] - mn[at] * lean);
+    if (wants != 0) { drooms[at] = drooms[at] + d; }
+    dtold[at] = d + dsum[at];
+    c = c + 32;
+  }
+}
+
+kernel(block = 256) k_think_open_back(drooms: float32*, dseats: float32*, dheed: float32*, dhere: float32*, dz: float32*, gate: float32*, here: float32*, heed: float32*, rstd: float32*, rows: int32, cols: int32, wants: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var rs: float32 = rstd[row];
+  var pull: float32 = dz[row];
+  var heeded: bool = heed != (float32*)0;
+  var acc: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    var y: float32 = here[at];
+    if (heeded) { y = y - heed[at]; }
+    acc = acc + (dhere[at] + pull * gate[c]) * y;
+    c = c + 32;
+  }
+  var lean: float32 = subgroup_reduce_add(acc) / (float32)cols;
+  c = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    var full: float32 = dhere[at] + pull * gate[c];
+    var y: float32 = here[at];
+    if (heeded) { y = y - heed[at]; }
+    var d: float32 = rs * (full - y * lean);
+    if ((wants & 1) != 0) { drooms[at] = drooms[at] + d; }
+    if ((wants & 2) != 0) { dseats[at] = dseats[at] + d; }
+    if ((wants & 4) != 0) { dheed[at] = dheed[at] + full; }
+    c = c + 32;
+  }
+}
+
+kernel(block = 256) k_rms_back(dx: float32*, dy: float32*, y: float32*, rstd: float32*, rows: int32, cols: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var base: int64 = (int64)row * (int64)cols;
+  var rs: float32 = rstd[row];
+  var acc: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    acc = acc + dy[at] * y[at];
+    c = c + 32;
+  }
+  var lean: float32 = subgroup_reduce_add(acc) / (float32)cols;
+  c = lane;
+  while (c < cols) {
+    var at: int64 = base + (int64)c;
+    dx[at] = rs * (dy[at] - y[at] * lean);
+    c = c + 32;
+  }
+}
+
+kernel(block = 256) k_period_add(out: float32*, a: float32*, b: float32*, n: int64, period: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    out[i] = a[i] + b[i % period];
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_period_sum(dst: float32*, src: float32*, period: int64, times: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < period) {
+    var acc: float32 = z32();
+    var k: int64 = 0;
+    while (k < times) {
+      acc = acc + src[k * period + i];
+      k = k + 1;
+    }
+    dst[i] = dst[i] + acc;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_foresee_pick(dst: float32*, trace: float32*, n: int64, rounds: int64, ahead: int64, unit: int64, first: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    var local: int64 = i / unit;
+    var slot: int64 = first + local;
+    var at: int64 = (slot / rounds + ahead) * rounds + rounds - 1;
+    dst[i] = trace[at * unit + i - local * unit];
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_foresee_slope(d: float32*, a: float32*, b: float32*, lead: float32*, scale: float32, n: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var by: float32 = lead[0] * scale;
+  while (i < n) {
+    d[i] = (a[i] - b[i]) * by;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_think_consult(found: float32*, qn: float32*, qr: float32*, sq: float32*, stride: int64, states: float32*, count: int32, width: int32, heads: int32, eps: float32) {
+  workgroup var st: float32[4160];
+  var group: int32 = block.x;
+  var b: int32 = group / heads;
+  var h: int32 = group - b * heads;
+  var d: int32 = width / heads;
+  var pad: int32 = d + 1;
+  var base: int64 = (int64)group * (int64)(d * d);
+  var fill: int32 = thread.x;
+  while (fill < d * d) {
+    var line_at: int32 = fill / d;
+    st[line_at * pad + fill - line_at * d] = states[base + (int64)fill];
+    fill = fill + 256;
+  }
+  barrier();
+  var lane: int32 = (int32)subgroup_local_id();
+  var warp: int32 = thread.x / 32;
+  var first: int32 = 0;
+  while (first < count) {
+    var r: int32 = first + warp;
+    if (r < count) {
+      var row: int64 = (int64)b * (int64)count + (int64)r;
+      var line: int64 = row * (int64)width + (int64)(h * d);
+      var ask: int64 = row * stride + (int64)(h * d);
+      var lo: float32 = z32();
+      var hi: float32 = z32();
+      if (lane < d) { lo = sq[ask + (int64)lane]; }
+      if (lane + 32 < d) { hi = sq[ask + (int64)(lane + 32)]; }
+      var rs: float32 = rsqrtf(subgroup_reduce_add(lo * lo + hi * hi) / (float32)d + eps);
+      lo = lo * rs;
+      hi = hi * rs;
+      if (lane < d) { qn[ask + (int64)lane] = lo; }
+      if (lane + 32 < d) { qn[ask + (int64)(lane + 32)] = hi; }
+      if (lane == 0) { qr[((int64)b * (int64)count + (int64)r) * (int64)heads + (int64)h] = rs; }
+      var out_lo: float32 = z32();
+      var out_hi: float32 = z32();
+      var f: int32 = 0;
+      while (f < d) {
+        var pick: float32 = hi;
+        if (f < 32) { pick = lo; }
+        var v: float32 = subgroup_broadcast(pick, (uint32)(f % 32));
+        if (lane < d) { out_lo = out_lo + st[lane * pad + f] * v; }
+        if (lane + 32 < d) { out_hi = out_hi + st[(lane + 32) * pad + f] * v; }
+        f = f + 1;
+      }
+      if (lane < d) { found[line + (int64)lane] = out_lo; }
+      if (lane + 32 < d) { found[line + (int64)(lane + 32)] = out_hi; }
+    }
+    first = first + 8;
+  }
+}
+
+kernel(block = 256) k_think_consult_back(dsq: float32*, taps: float32*, dfound: float32*, qn: float32*, stride: int64, qr: float32*, states: float32*, count: int32, width: int32, heads: int32) {
+  workgroup var st: float32[4160];
+  var group: int32 = block.x;
+  var b: int32 = group / heads;
+  var h: int32 = group - b * heads;
+  var d: int32 = width / heads;
+  var pad: int32 = d + 1;
+  var base: int64 = (int64)group * (int64)(d * d);
+  var fill: int32 = thread.x;
+  while (fill < d * d) {
+    var line_at: int32 = fill / d;
+    st[line_at * pad + fill - line_at * d] = states[base + (int64)fill];
+    fill = fill + 256;
+  }
+  barrier();
+  var lane: int32 = (int32)subgroup_local_id();
+  var warp: int32 = thread.x / 32;
+  var first: int32 = 0;
+  while (first < count) {
+    var r: int32 = first + warp;
+    if (r < count) {
+      var row: int64 = (int64)b * (int64)count + (int64)r;
+      var line: int64 = row * (int64)width + (int64)(h * d);
+      var ask: int64 = row * stride + (int64)(h * d);
+      var g_lo: float32 = z32();
+      var g_hi: float32 = z32();
+      var q_lo: float32 = z32();
+      var q_hi: float32 = z32();
+      if (lane < d) {
+        g_lo = dfound[line + (int64)lane];
+        q_lo = qn[ask + (int64)lane];
+      }
+      if (lane + 32 < d) {
+        g_hi = dfound[line + (int64)(lane + 32)];
+        q_hi = qn[ask + (int64)(lane + 32)];
+      }
+      var pull_lo: float32 = z32();
+      var pull_hi: float32 = z32();
+      var src: int32 = 0;
+      while (src < d) {
+        var pick: float32 = g_hi;
+        if (src < 32) { pick = g_lo; }
+        var v: float32 = subgroup_broadcast(pick, (uint32)(src % 32));
+        if (lane < d) { pull_lo = pull_lo + st[src * pad + lane] * v; }
+        if (lane + 32 < d) { pull_hi = pull_hi + st[src * pad + lane + 32] * v; }
+        src = src + 1;
+      }
+      var lean: float32 = subgroup_reduce_add(pull_lo * q_lo + pull_hi * q_hi) / (float32)d;
+      var rs: float32 = qr[((int64)b * (int64)count + (int64)r) * (int64)heads + (int64)h];
+      if (lane < d) { dsq[ask + (int64)lane] = rs * (pull_lo - q_lo * lean); }
+      if (lane + 32 < d) { dsq[ask + (int64)(lane + 32)] = rs * (pull_hi - q_hi * lean); }
+    }
+    first = first + 8;
+  }
+  if (taps != (float32*)0) {
+    var cell: int32 = thread.x;
+    while (cell < d * d) {
+      var row: int32 = cell / d;
+      var col: int32 = cell - row * d;
+      var acc: float32 = z32();
+      var room: int32 = 0;
+      while (room < count) {
+        var at: int64 = (int64)b * (int64)count + (int64)room;
+        acc = acc + dfound[at * (int64)width + (int64)(h * d + row)] * qn[at * stride + (int64)(h * d + col)];
+        room = room + 1;
+      }
+      taps[base + (int64)cell] = taps[base + (int64)cell] + acc;
+      cell = cell + 256;
+    }
+  }
+}
+
+kernel(block = 256) k_think_mingle(out: float32*, packed: float32*, stride: int64, count: int32, width: int32, heads: int32, eps: float32) {
+  workgroup var kn: float32[2080];
+  workgroup var qn: float32[2080];
+  workgroup var vs: float32[2080];
+  workgroup var sc: float32[1056];
+  var group: int32 = block.x;
+  var b: int32 = group / heads;
+  var h: int32 = group - b * heads;
+  var d: int32 = width / heads;
+  var pad: int32 = d + 1;
+  var lane: int32 = (int32)subgroup_local_id();
+  var warp: int32 = thread.x / 32;
+  var shrink: float32 = rsqrtf((float32)d);
+  var first: int32 = 0;
+  while (first < count) {
+    var r: int32 = first + warp;
+    if (r < count) {
+      var line: int64 = ((int64)b * (int64)count + (int64)r) * stride + (int64)(h * d);
+      var k_lo: float32 = z32();
+      var k_hi: float32 = z32();
+      var q_lo: float32 = z32();
+      var q_hi: float32 = z32();
+      if (lane < d) {
+        k_lo = packed[line + (int64)lane];
+        q_lo = packed[line + (int64)(2 * width + lane)];
+        vs[r * pad + lane] = packed[line + (int64)(width + lane)];
+      }
+      if (lane + 32 < d) {
+        k_hi = packed[line + (int64)(lane + 32)];
+        q_hi = packed[line + (int64)(2 * width + lane + 32)];
+        vs[r * pad + lane + 32] = packed[line + (int64)(width + lane + 32)];
+      }
+      var rk: float32 = shrink * rsqrtf(subgroup_reduce_add(k_lo * k_lo + k_hi * k_hi) / (float32)d + eps);
+      var rq: float32 = rsqrtf(subgroup_reduce_add(q_lo * q_lo + q_hi * q_hi) / (float32)d + eps);
+      if (lane < d) {
+        kn[r * pad + lane] = k_lo * rk;
+        qn[r * pad + lane] = q_lo * rq;
+      }
+      if (lane + 32 < d) {
+        kn[r * pad + lane + 32] = k_hi * rk;
+        qn[r * pad + lane + 32] = q_hi * rq;
+      }
+    }
+    first = first + 8;
+  }
+  barrier();
+  var cell: int32 = thread.x;
+  while (cell < count * count) {
+    var i: int32 = cell / count;
+    var j: int32 = cell - i * count;
+    var acc: float32 = z32();
+    var f: int32 = 0;
+    while (f < d) {
+      acc = acc + qn[i * pad + f] * kn[j * pad + f];
+      f = f + 1;
+    }
+    sc[i * 33 + j] = acc;
+    cell = cell + 256;
+  }
+  barrier();
+  var share: float32 = one32() / (float32)count;
+  var row: int32 = warp;
+  while (row < count) {
+    var line: int64 = ((int64)b * (int64)count + (int64)row) * (int64)width + (int64)(h * d);
+    var lo: float32 = z32();
+    var hi: float32 = z32();
+    var j: int32 = 0;
+    while (j < count) {
+      var weight: float32 = sc[row * 33 + j];
+      if (lane < d) { lo = lo + weight * vs[j * pad + lane]; }
+      if (lane + 32 < d) { hi = hi + weight * vs[j * pad + lane + 32]; }
+      j = j + 1;
+    }
+    if (lane < d) { out[line + (int64)lane] = lo * share; }
+    if (lane + 32 < d) { out[line + (int64)(lane + 32)] = hi * share; }
+    row = row + 8;
+  }
+}
+
+kernel(block = 256) k_think_mingle_back(dp: float32*, dout: float32*, packed: float32*, stride: int64, count: int32, width: int32, heads: int32, eps: float32) {
+  workgroup var kn: float32[2080];
+  workgroup var qn: float32[2080];
+  workgroup var vs: float32[2080];
+  workgroup var go: float32[2080];
+  workgroup var sc: float32[1056];
+  workgroup var ds: float32[1056];
+  workgroup var scales: float32[64];
+  var group: int32 = block.x;
+  var b: int32 = group / heads;
+  var h: int32 = group - b * heads;
+  var d: int32 = width / heads;
+  var pad: int32 = d + 1;
+  var lane: int32 = (int32)subgroup_local_id();
+  var warp: int32 = thread.x / 32;
+  var shrink: float32 = rsqrtf((float32)d);
+  var share: float32 = one32() / (float32)count;
+  var first: int32 = 0;
+  while (first < count) {
+    var r: int32 = first + warp;
+    if (r < count) {
+      var line: int64 = ((int64)b * (int64)count + (int64)r) * stride + (int64)(h * d);
+      var wide: int64 = ((int64)b * (int64)count + (int64)r) * (int64)width + (int64)(h * d);
+      var k_lo: float32 = z32();
+      var k_hi: float32 = z32();
+      var q_lo: float32 = z32();
+      var q_hi: float32 = z32();
+      if (lane < d) {
+        k_lo = packed[line + (int64)lane];
+        q_lo = packed[line + (int64)(2 * width + lane)];
+        vs[r * pad + lane] = packed[line + (int64)(width + lane)];
+        go[r * pad + lane] = dout[wide + (int64)lane];
+      }
+      if (lane + 32 < d) {
+        k_hi = packed[line + (int64)(lane + 32)];
+        q_hi = packed[line + (int64)(2 * width + lane + 32)];
+        vs[r * pad + lane + 32] = packed[line + (int64)(width + lane + 32)];
+        go[r * pad + lane + 32] = dout[wide + (int64)(lane + 32)];
+      }
+      var rk: float32 = shrink * rsqrtf(subgroup_reduce_add(k_lo * k_lo + k_hi * k_hi) / (float32)d + eps);
+      var rq: float32 = rsqrtf(subgroup_reduce_add(q_lo * q_lo + q_hi * q_hi) / (float32)d + eps);
+      if (lane == 0) {
+        scales[2 * r] = rk;
+        scales[2 * r + 1] = rq;
+      }
+      if (lane < d) {
+        kn[r * pad + lane] = k_lo * rk;
+        qn[r * pad + lane] = q_lo * rq;
+      }
+      if (lane + 32 < d) {
+        kn[r * pad + lane + 32] = k_hi * rk;
+        qn[r * pad + lane + 32] = q_hi * rq;
+      }
+    }
+    first = first + 8;
+  }
+  barrier();
+  var cell: int32 = thread.x;
+  while (cell < count * count) {
+    var i: int32 = cell / count;
+    var j: int32 = cell - i * count;
+    var hit: float32 = z32();
+    var pull: float32 = z32();
+    var f: int32 = 0;
+    while (f < d) {
+      hit = hit + qn[i * pad + f] * kn[j * pad + f];
+      pull = pull + go[i * pad + f] * vs[j * pad + f];
+      f = f + 1;
+    }
+    sc[i * 33 + j] = hit;
+    ds[i * 33 + j] = pull * share;
+    cell = cell + 256;
+  }
+  barrier();
+  first = 0;
+  while (first < count) {
+    var r: int32 = first + warp;
+    if (r < count) {
+      var line: int64 = ((int64)b * (int64)count + (int64)r) * stride + (int64)(h * d);
+      var dv_lo: float32 = z32();
+      var dv_hi: float32 = z32();
+      var dk_lo: float32 = z32();
+      var dk_hi: float32 = z32();
+      var dq_lo: float32 = z32();
+      var dq_hi: float32 = z32();
+      var other: int32 = 0;
+      while (other < count) {
+        var into: float32 = sc[other * 33 + r];
+        var back: float32 = ds[other * 33 + r];
+        var ahead: float32 = ds[r * 33 + other];
+        if (lane < d) {
+          dv_lo = dv_lo + into * go[other * pad + lane];
+          dk_lo = dk_lo + back * qn[other * pad + lane];
+          dq_lo = dq_lo + ahead * kn[other * pad + lane];
+        }
+        if (lane + 32 < d) {
+          dv_hi = dv_hi + into * go[other * pad + lane + 32];
+          dk_hi = dk_hi + back * qn[other * pad + lane + 32];
+          dq_hi = dq_hi + ahead * kn[other * pad + lane + 32];
+        }
+        other = other + 1;
+      }
+      var k_lo: float32 = z32();
+      var k_hi: float32 = z32();
+      var q_lo: float32 = z32();
+      var q_hi: float32 = z32();
+      if (lane < d) {
+        k_lo = kn[r * pad + lane];
+        q_lo = qn[r * pad + lane];
+      }
+      if (lane + 32 < d) {
+        k_hi = kn[r * pad + lane + 32];
+        q_hi = qn[r * pad + lane + 32];
+      }
+      var lean: float32 = subgroup_reduce_add(dk_lo * k_lo + dk_hi * k_hi);
+      var mean: float32 = subgroup_reduce_add(dq_lo * q_lo + dq_hi * q_hi) / (float32)d;
+      var rk: float32 = scales[2 * r];
+      var rq: float32 = scales[2 * r + 1];
+      if (lane < d) {
+        dp[line + (int64)lane] = rk * (dk_lo - k_lo * lean);
+        dp[line + (int64)(width + lane)] = dv_lo * share;
+        dp[line + (int64)(2 * width + lane)] = rq * (dq_lo - q_lo * mean);
+      }
+      if (lane + 32 < d) {
+        dp[line + (int64)(lane + 32)] = rk * (dk_hi - k_hi * lean);
+        dp[line + (int64)(width + lane + 32)] = dv_hi * share;
+        dp[line + (int64)(2 * width + lane + 32)] = rq * (dq_hi - q_hi * mean);
+      }
+    }
+    first = first + 8;
+  }
+}
+
+fn small_mingle(count: int64, width: int64, heads: int64) -> bool {
+  return count <= 32 && width / heads <= 64;
+}
+
+struct PonderParts {
+  here: float32*;
+  cat: float32*;
+  mn: float32*;
+  pre: float32*;
+  act: float32*;
+  sum: float32*;
+  amt: float32*;
+  rstd: float32*;
+  qr: float32*;
+  packed: float32*;
+  w1: float32*;
+  w2: float32*;
+  mix: MingleParts;
+}
+
+struct PonderBook {
+  here: float32*;
+  cat: float32*;
+  mn: float32*;
+  pre: float32*;
+  w1: float32*;
+  w2: float32*;
+  dp: float32*;
+  dtold: float32*;
+  dpre: float32*;
+  dsum: float32*;
+  dz: float32*;
+  group: int64;
+  done: int64*;
+  seen: bool*;
+}
+
+const BOOK_ROWS: int64 = 4096;
+
+kernel(block = 256) k_side_by_side(dst: float32*, left: float32*, right: float32*, rows: int64, cols: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var both: int64 = 2 * cols;
+  while (i < rows * both) {
+    var r: int64 = i / both;
+    var j: int64 = i - r * both;
+    if (j < cols) { dst[i] = left[r * cols + j]; } else { dst[i] = right[r * cols + j - cols]; }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_rows_rms(y: float32*, ldy: int64, x: float32*, ldx: int64, rstd: float32*, rows: int32, cols: int32, eps: float32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var from: int64 = (int64)row * ldx;
+  var into: int64 = (int64)row * ldy;
+  var q: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    var v: float32 = x[from + (int64)c];
+    q = q + v * v;
+    c = c + 32;
+  }
+  var rs: float32 = rsqrtf(subgroup_reduce_add(q) * (one32() / (float32)cols) + eps);
+  if (lane == 0) { rstd[row] = rs; }
+  c = lane;
+  while (c < cols) {
+    y[into + (int64)c] = x[from + (int64)c] * rs;
+    c = c + 32;
+  }
+}
+
+kernel(block = 256) k_rows_rms_back(dx: float32*, dy: float32*, ldy: int64, y: float32*, rstd: float32*, rows: int32, cols: int32) {
+  var row: int32 = block.x * 8 + thread.x / 32;
+  var lane: int32 = (int32)subgroup_local_id();
+  if (row >= rows) { return; }
+  var from: int64 = (int64)row * ldy;
+  var into: int64 = (int64)row * (int64)cols;
+  var rs: float32 = rstd[row];
+  var acc: float32 = z32();
+  var c: int32 = lane;
+  while (c < cols) {
+    acc = acc + dy[from + (int64)c] * y[from + (int64)c];
+    c = c + 32;
+  }
+  var lean: float32 = subgroup_reduce_add(acc) / (float32)cols;
+  c = lane;
+  while (c < cols) {
+    dx[into + (int64)c] = rs * (dy[from + (int64)c] - y[from + (int64)c] * lean);
+    c = c + 32;
+  }
+}
+
+fn lead_of(n: Node*, w: int64) -> int64 {
+  return if n->ints[6] >= 0 { 4 * w } else { 3 * w };
+}
+
+fn wide_of(n: Node*, w: int64) -> int64 {
+  return if n->ints[6] >= 0 { 2 * w } else { w };
+}
+
+fn stage_thinking(s: GpuState*, g: Graph*, n: Node*, into: Graph*, w: int64, w1: float32**, w2: float32**) {
+  if (n->ints[6] < 0) {
+    *w1 = g->data(n->ints[0]);
+    *w2 = g->data(n->ints[1]);
+    return;
+  }
+  var ww: int64 = w * w;
+  var first: float32* = into->floats(4 * ww);
+  var second: float32* = into->floats(2 * ww);
+  dispatch k_scaled[spread(s, 3 * ww), 256](first, g->data(n->ints[0]), one32(), 3 * ww);
+  dispatch k_scaled[spread(s, ww), 256](first + 3 * ww, g->data(n->ints[6]), one32(), ww);
+  dispatch k_side_by_side[spread(s, 2 * ww), 256](second, g->data(n->ints[1]), g->data(n->ints[7]), w, w);
+  *w1 = first;
+  *w2 = second;
+}
+
+fn fwd_ponder_sum(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var slots: int64 = n->i1;
+  var each: int64 = n->i3;
+  var rows: int64 = slots * each;
+  var w: int64 = n->i4;
+  var hid: int64 = g->nodes[n->ints[2]].value.shape.dims[0];
+  var lead: int64 = lead_of(n, w);
+  var wide: int64 = wide_of(n, w);
+  var book: PonderBook* = (PonderBook*)g->host_alloc(sizeof(PonderBook));
+  n->i2 = (int64)book;
+  book->here = g->floats(rows * w);
+  book->cat = g->floats(rows * wide);
+  book->mn = g->floats(rows * w);
+  book->pre = g->floats(rows * hid);
+  stage_thinking(s, g, n, g, w, &book->w1, &book->w2);
+  if (!n->requires) { return; }
+  var group: int64 = (BOOK_ROWS + each - 1) / each;
+  if (group > slots) { group = slots; }
+  book->group = group;
+  var held: int64 = group * each;
+  book->dp = g->floats(held * lead);
+  book->dtold = g->floats(held * w);
+  book->dpre = g->floats(held * hid);
+  book->dsum = g->floats(held * w);
+  book->dz = g->floats(held);
+  var parts: int64 = (slots + group - 1) / group;
+  book->done = (int64*)g->host_alloc(parts * 8);
+  book->seen = (bool*)g->host_alloc(slots);
+  for i: int64 in 0..parts { book->done[i] = 0; }
+  for i: int64 in 0..slots { book->seen[i] = false; }
+}
+
+fn book_size(n: Node*, book: PonderBook*, part: int64) -> int64 {
+  var left: int64 = n->i1 - part * book->group;
+  return if left < book->group { left } else { book->group };
+}
+
+fn thinking_grads(s: GpuState*, g: Graph*, t: Graph*, ids: int32*, rows: int64, w: int64, hid: int64, here: float32*, cat: float32*, mn: float32*, pre: float32*, dp: float32*, dtold: float32*, dpre: float32*, dsum: float32*, dz: float32*) {
+  var looks: bool = ids[6] >= 0;
+  var lead: int64 = if looks { 4 * w } else { 3 * w };
+  var wide: int64 = if looks { 2 * w } else { w };
+  var act: float32* = t->floats(rows * hid);
+  dispatch k_unary[spread(s, rows * hid), 256](17, act, pre, z32(), z32(), rows * hid);
+  run_gemm(s, t, gemm_shape(dsum, act, g->grad_of(ids[3]), w, hid, rows, w, hid, hid, true, false, true));
+  run_gemm(s, t, gemm_shape(dpre, mn, g->grad_of(ids[2]), hid, w, rows, hid, w, w, true, false, true));
+  run_gemm(s, t, gemm_shape(dtold, cat, g->grad_of(ids[1]), w, w, rows, w, wide, w, true, false, true));
+  run_gemm(s, t, gemm_shape(dp, here, g->grad_of(ids[0]), 3 * w, w, rows, lead, w, w, true, false, true));
+  run_gemm(s, t, gemm_shape(dz, here, g->grad_of(ids[4]), 1, w, rows, 1, w, w, true, false, true));
+  sum_into(s, g->grad_of(ids[5]), dz, (float32*)0, 0, rows, one32(), true);
+  if (looks) {
+    run_gemm(s, t, gemm_shape(dp + 3 * w, here, g->grad_of(ids[6]), w, w, rows, lead, w, w, true, false, true));
+    run_gemm(s, t, gemm_shape(dtold, cat + w, g->grad_of(ids[7]), w, w, rows, w, wide, w, true, false, true));
+  }
+}
+
+fn book_flush(s: GpuState*, g: Graph*, n: Node*, t: Graph*, part: int64) {
+  var book: PonderBook* = (PonderBook*)n->i2;
+  var each: int64 = n->i3;
+  var w: int64 = n->i4;
+  var hid: int64 = g->nodes[n->ints[2]].value.shape.dims[0];
+  var lead: int64 = lead_of(n, w);
+  var wide: int64 = wide_of(n, w);
+  var first: int64 = part * book->group;
+  var count: int64 = book_size(n, book, part);
+  var base: int64 = first * each;
+  for slot: int64 in first..first + count {
+    if (book->seen[slot]) { continue; }
+    var at: int64 = (slot - first) * each;
+    s->dev->fill(book->dp + at * lead, 0.0, each * lead);
+    s->dev->fill(book->dtold + at * w, 0.0, each * w);
+    s->dev->fill(book->dpre + at * hid, 0.0, each * hid);
+    s->dev->fill(book->dsum + at * w, 0.0, each * w);
+    s->dev->fill(book->dz + at, 0.0, each);
+  }
+  thinking_grads(s, g, t, n->ints, count * each, w, hid, book->here + base * w, book->cat + base * wide, book->mn + base * w, book->pre + base * hid, book->dp, book->dtold, book->dpre, book->dsum, book->dz);
+}
+
+fn back_ponder_sum(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var book: PonderBook* = (PonderBook*)n->i2;
+  var parts: int64 = (n->i1 + book->group - 1) / book->group;
+  var t: Graph* = spare(s);
+  for part: int64 in 0..parts {
+    if (book->done[part] > 0 && book->done[part] < book_size(n, book, part)) { book_flush(s, g, n, t, part); }
+  }
+}
+
+fn grid_states(g: Graph*, n: Node*, groups: int64, plane: int64) -> float32* {
+  return ((ExactParts*)g->nodes[(int32)n->i3].i2)->states + n->i4 * groups * plane;
+}
+
+fn fwd_ponder(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var batch: int64 = sh.dims[0];
+  var count: int64 = sh.dims[1];
+  var w: int64 = sh.dims[2];
+  var rows: int64 = batch * count;
+  var all: int64 = rows * w;
+  var hid: int64 = g->nodes[n->ints[2]].value.shape.dims[0];
+  var heads: int64 = n->i0;
+  var eps: float32 = (float32)1.0e-6;
+  var size: int32 = (int32)rows;
+  var cols: int32 = (int32)w;
+  var lead: int64 = lead_of(n, w);
+  var wide: int64 = wide_of(n, w);
+  var looks: bool = n->i3 >= 0;
+  var small: bool = small_mingle(count, w, heads);
+  var t: Graph* = spare(s);
+  var kept: Graph* = if n->requires { g } else { t };
+  var p: PonderParts* = (PonderParts*)g->host_alloc(sizeof(PonderParts));
+  n->i2 = (int64)p;
+  if (n->c >= 0) {
+    var book: PonderBook* = (PonderBook*)g->nodes[n->c].i2;
+    var at: int64 = n->i1 * rows;
+    p->here = book->here + at * w;
+    p->cat = book->cat + at * wide;
+    p->mn = book->mn + at * w;
+    p->pre = book->pre + at * hid;
+    p->act = t->floats(rows * hid);
+    p->w1 = book->w1;
+    p->w2 = book->w2;
+  } else {
+    p->here = kept->floats(all);
+    p->cat = kept->floats(rows * wide);
+    p->mn = kept->floats(all);
+    p->pre = kept->floats(rows * hid);
+    p->act = kept->floats(rows * hid);
+    stage_thinking(s, g, n, kept, w, &p->w1, &p->w2);
+  }
+  p->sum = kept->floats(all);
+  p->amt = kept->floats(rows);
+  p->rstd = kept->floats(4 * rows);
+  p->packed = if small || looks { kept->floats(rows * lead) } else { t->floats(rows * lead) };
+  var heard: float32* = t->floats(all);
+  var told: float32* = t->floats(all);
+  var worked: float32* = t->floats(all);
+  var rooms: float32* = g->data(n->a);
+  var heed: float32* = if n->ints[8] >= 0 { g->data(n->ints[8]) } else { (float32*)0 };
+  dispatch k_think_open[row_blocks(rows), 256](p->here, p->rstd, p->amt, rooms, g->data(n->b), heed, g->data(n->ints[4]), g->data(n->ints[5]), size, cols, eps);
+  run_gemm(s, t, gemm_shape(p->here, p->w1, p->packed, rows, lead, w, w, w, lead, false, true, false));
+  if (small) {
+    dispatch k_think_mingle[(int32)(batch * heads), 256](heard, p->packed, lead, (int32)count, cols, (int32)heads, eps);
+  } else {
+    mingle_fwd(s, kept, t, &p->mix, p->packed, lead, heard, batch, count, w, heads);
+  }
+  dispatch k_rows_rms[row_blocks(rows), 256](p->cat, wide, heard, w, p->rstd + rows, size, cols, eps);
+  if (looks) {
+    var d: int64 = w / heads;
+    if (d > 64) { mmll_fail("lookups on the GPU take heads of at most 64 values, got {d}"); }
+    var groups: int64 = batch * heads;
+    var found: float32* = t->floats(all);
+    p->qr = kept->floats(rows * heads);
+    dispatch k_think_consult[(int32)groups, 256](found, p->packed + 3 * w, p->qr, p->packed + 3 * w, lead, grid_states(g, n, groups, d * d), (int32)count, cols, (int32)heads, eps);
+    dispatch k_rows_rms[row_blocks(rows), 256](p->cat + w, wide, found, w, p->rstd + 3 * rows, size, cols, eps);
+  }
+  run_gemm(s, t, gemm_shape(p->cat, p->w2, told, rows, w, wide, wide, wide, w, false, true, false));
+  dispatch k_think_open[row_blocks(rows), 256](p->mn, p->rstd + 2 * rows, (float32*)0, rooms, told, (float32*)0, (float32*)0, (float32*)0, size, cols, eps);
+  run_gemm(s, t, gemm_shape(p->mn, g->data(n->ints[2]), p->pre, rows, hid, w, w, w, hid, false, true, false));
+  dispatch k_unary[spread(s, rows * hid), 256](17, p->act, p->pre, z32(), z32(), rows * hid);
+  run_gemm(s, t, gemm_shape(p->act, g->data(n->ints[3]), worked, rows, w, hid, hid, hid, w, false, true, false));
+  dispatch k_think_close[spread(s, all), 256](n->value.data, p->sum, rooms, told, worked, p->amt, all, w);
+}
+
+fn back_ponder(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var batch: int64 = sh.dims[0];
+  var count: int64 = sh.dims[1];
+  var w: int64 = sh.dims[2];
+  var rows: int64 = batch * count;
+  var all: int64 = rows * w;
+  var hid: int64 = g->nodes[n->ints[2]].value.shape.dims[0];
+  var heads: int64 = n->i0;
+  var size: int32 = (int32)rows;
+  var cols: int32 = (int32)w;
+  var lead: int64 = lead_of(n, w);
+  var wide: int64 = wide_of(n, w);
+  var looks: bool = n->i3 >= 0;
+  var p: PonderParts* = (PonderParts*)n->i2;
+  var t: Graph* = spare(s);
+  var wants: int32 = 0;
+  var drooms: float32* = (float32*)0;
+  var dseats: float32* = (float32*)0;
+  if (g->nodes[n->a].requires) {
+    wants = wants + 1;
+    drooms = g->grad_of(n->a);
+  }
+  if (g->nodes[n->b].requires) {
+    wants = wants + 2;
+    dseats = g->grad_of(n->b);
+  }
+  var heed: float32* = (float32*)0;
+  var dheed: float32* = (float32*)0;
+  if (n->ints[8] >= 0) {
+    heed = g->data(n->ints[8]);
+    if (g->nodes[n->ints[8]].requires) {
+      wants = wants + 4;
+      dheed = g->grad_of(n->ints[8]);
+    }
+  }
+  var booked: bool = n->c >= 0;
+  var dsum: float32* = (float32*)0;
+  var dz: float32* = (float32*)0;
+  var dpre: float32* = (float32*)0;
+  var dtold: float32* = (float32*)0;
+  var dp: float32* = (float32*)0;
+  if (booked) {
+    var book: PonderBook* = (PonderBook*)g->nodes[n->c].i2;
+    var at: int64 = (n->i1 % book->group) * rows;
+    dsum = book->dsum + at * w;
+    dz = book->dz + at;
+    dpre = book->dpre + at * hid;
+    dtold = book->dtold + at * w;
+    dp = book->dp + at * lead;
+  } else {
+    dsum = t->floats(all);
+    dz = t->floats(rows);
+    dpre = t->floats(rows * hid);
+    dtold = t->floats(all);
+    dp = t->floats(rows * lead);
+  }
+  var dact: float32* = t->floats(rows * hid);
+  var dmn: float32* = t->floats(all);
+  var dcat: float32* = t->floats(rows * wide);
+  var dheard: float32* = t->floats(all);
+  var dhere: float32* = t->floats(all);
+  dispatch k_think_close_back[row_blocks(rows), 256](dsum, dz, drooms, n->grad, p->sum, p->amt, size, cols, wants & 1);
+  run_gemm(s, t, gemm_shape(dsum, g->data(n->ints[3]), dact, rows, hid, w, w, hid, hid, false, false, false));
+  dispatch k_unary_back[spread(s, rows * hid), 256](17, dpre, dact, p->pre, p->pre, z32(), z32(), rows * hid, 1);
+  run_gemm(s, t, gemm_shape(dpre, g->data(n->ints[2]), dmn, rows, w, hid, hid, w, w, false, false, false));
+  dispatch k_think_mid_back[row_blocks(rows), 256](drooms, dtold, dmn, dsum, p->mn, p->rstd + 2 * rows, size, cols, wants & 1);
+  run_gemm(s, t, gemm_shape(dtold, p->w2, dcat, rows, wide, w, w, wide, wide, false, false, false));
+  if (looks) {
+    var d: int64 = w / heads;
+    var groups: int64 = batch * heads;
+    var grid: Node* = g->node((int32)n->i3);
+    var dfound: float32* = t->floats(all);
+    dispatch k_rows_rms_back[row_blocks(rows), 256](dfound, dcat + w, wide, p->cat + w, p->rstd + 3 * rows, size, cols);
+    var taps: float32* = if grid->requires { (float32*)grid->i5 + n->i4 * groups * d * d } else { (float32*)0 };
+    dispatch k_think_consult_back[(int32)groups, 256](dp + 3 * w, taps, dfound, p->packed + 3 * w, lead, p->qr, grid_states(g, n, groups, d * d), (int32)count, cols, (int32)heads);
+  }
+  dispatch k_rows_rms_back[row_blocks(rows), 256](dheard, dcat, wide, p->cat, p->rstd + rows, size, cols);
+  if (small_mingle(count, w, heads)) {
+    dispatch k_think_mingle_back[(int32)(batch * heads), 256](dp, dheard, p->packed, lead, (int32)count, cols, (int32)heads, (float32)1.0e-6);
+  } else {
+    mingle_back(s, t, &p->mix, dheard, dp, lead, batch, count, w, heads, 43);
+  }
+  run_gemm(s, t, gemm_shape(dp, p->w1, dhere, rows, w, lead, lead, w, w, false, false, false));
+  if (!booked) { thinking_grads(s, g, t, n->ints, rows, w, hid, p->here, p->cat, p->mn, p->pre, dp, dtold, dpre, dsum, dz); }
+  dispatch k_think_open_back[row_blocks(rows), 256](drooms, dseats, dheed, dhere, dz, g->data(n->ints[4]), p->here, heed, p->rstd, size, cols, wants);
+  if (booked) {
+    var owner: Node* = g->node(n->c);
+    var book: PonderBook* = (PonderBook*)owner->i2;
+    var part: int64 = n->i1 / book->group;
+    book->seen[n->i1] = true;
+    book->done[part] = book->done[part] + 1;
+    if (book->done[part] == book_size(owner, book, part)) { book_flush(s, g, owner, t, part); }
+  }
+}
+
+fn fwd_consult(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var count: int64 = sh.dims[1];
+  var w: int64 = sh.dims[2];
+  var heads: int64 = n->i0;
+  var d: int64 = w / heads;
+  var rows: int64 = sh.dims[0] * count;
+  var all: int64 = rows * w;
+  var groups: int64 = sh.dims[0] * heads;
+  var t: Graph* = spare(s);
+  var state: float32* = ((ExactParts*)g->nodes[n->b].i2)->states + n->i1 * groups * d * d;
+  var mean: float32* = t->floats(rows * heads);
+  var flat: float32* = t->floats(all);
+  var found: float32* = t->floats(all);
+  dispatch k_norm[row_blocks(rows * heads), 256](1, n->saved, g->data(n->a), (float32*)0, (float32*)0, mean, n->saved2, (int32)(rows * heads), (int32)d, (float32)1.0e-6);
+  dispatch k_exact_move[spread(s, all), 256](flat, n->saved, all, count, count, w, heads, 1);
+  run_gemm(s, t, batched(flat, state, found, count, d, d, d, d, false, true, false, groups, count * d, d * d, count * d));
+  dispatch k_exact_move[spread(s, all), 256](found, n->value.data, all, count, count, w, heads, 0);
+}
+
+fn back_consult(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var count: int64 = sh.dims[1];
+  var w: int64 = sh.dims[2];
+  var heads: int64 = n->i0;
+  var d: int64 = w / heads;
+  var rows: int64 = sh.dims[0] * count;
+  var all: int64 = rows * w;
+  var groups: int64 = sh.dims[0] * heads;
+  var t: Graph* = spare(s);
+  var grid: Node* = g->node(n->b);
+  var state: float32* = ((ExactParts*)grid->i2)->states + n->i1 * groups * d * d;
+  var flat: float32* = t->floats(all);
+  var dflat: float32* = t->floats(all);
+  dispatch k_exact_move[spread(s, all), 256](dflat, n->grad, all, count, count, w, heads, 1);
+  if (grid->requires) {
+    dispatch k_exact_move[spread(s, all), 256](flat, n->saved, all, count, count, w, heads, 1);
+    run_gemm(s, t, batched(dflat, flat, (float32*)grid->i5 + n->i1 * groups * d * d, d, d, count, d, d, true, false, true, groups, count * d, count * d, d * d));
+  }
+  if (!g->nodes[n->a].requires) { return; }
+  var pulled: float32* = t->floats(all);
+  var wide: float32* = t->floats(all);
+  var raw: float32* = t->floats(all);
+  run_gemm(s, t, batched(dflat, state, pulled, count, d, d, d, d, false, false, false, groups, count * d, d * d, count * d));
+  dispatch k_exact_move[spread(s, all), 256](pulled, wide, all, count, count, w, heads, 0);
+  dispatch k_rms_back[row_blocks(rows * heads), 256](raw, wide, n->saved, n->saved2, (int32)(rows * heads), (int32)d);
+  dispatch k_add[spread(s, all), 256](g->grad_of(n->a), raw, one32(), all);
+}
+
+struct ForeseeParts {
+  x: float32*;
+  h: float32*;
+  gn: float32*;
+  tn: float32*;
+  rstd: float32*;
+}
+
+const FORESEE_ROWS: int64 = 8192;
+
+fn foresee_slab(slots: int64, per: int64) -> int64 {
+  var slab: int64 = FORESEE_ROWS / per;
+  if (slab < 1) { slab = 1; }
+  return if slab > slots { slots } else { slab };
+}
+
+fn fwd_foresee(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var ts: Shape = g->nodes[n->a].value.shape;
+  var ss: Shape = g->nodes[n->b].value.shape;
+  var w: int64 = ss.last();
+  var unit: int64 = ss.size();
+  var per: int64 = unit / w;
+  var hid: int64 = g->nodes[n->c].value.shape.dims[0];
+  var rounds: int64 = ts.dims[1];
+  var slots: int64 = (ts.dims[0] - n->i5) * rounds;
+  var rows: int64 = slots * per;
+  var all: int64 = rows * w;
+  var eps: float32 = (float32)1.0e-6;
+  var cols: int32 = (int32)w;
+  var t: Graph* = spare(s);
+  var p: ForeseeParts* = (ForeseeParts*)g->host_alloc(sizeof(ForeseeParts));
+  n->i2 = (int64)p;
+  p->x = g->floats(all);
+  p->h = g->floats(rows * hid);
+  p->gn = g->floats(all);
+  p->tn = g->floats(all);
+  p->rstd = g->floats(2 * rows);
+  var slab: int64 = foresee_slab(slots, per);
+  var mean: float32* = t->floats(slab * per);
+  var unused: float32* = t->floats(slab * per);
+  var xin: float32* = t->floats(slab * unit);
+  var hg: float32* = t->floats(slab * per * hid);
+  var guess: float32* = t->floats(slab * unit);
+  var tin: float32* = t->floats(slab * unit);
+  var trace: float32* = g->data(n->a);
+  var first: int64 = 0;
+  while (first < slots) {
+    var count: int64 = if slots - first < slab { slots - first } else { slab };
+    var r0: int64 = first * per;
+    var nrow: int64 = count * per;
+    var at: int64 = first * unit;
+    var size: int32 = (int32)nrow;
+    dispatch k_period_add[spread(s, count * unit), 256](xin, trace + at, g->data(n->b), count * unit, unit);
+    dispatch k_norm[row_blocks(nrow), 256](1, p->x + at, xin, (float32*)0, (float32*)0, mean, p->rstd + r0, size, cols, eps);
+    run_gemm(s, t, gemm_shape(p->x + at, g->data(n->c), p->h + r0 * hid, nrow, hid, w, w, w, hid, false, true, false));
+    dispatch k_unary[spread(s, nrow * hid), 256](17, hg, p->h + r0 * hid, z32(), z32(), nrow * hid);
+    run_gemm(s, t, gemm_shape(hg, g->data(n->ints[0]), guess, nrow, w, hid, hid, hid, w, false, true, false));
+    dispatch k_norm[row_blocks(nrow), 256](1, p->gn + at, guess, (float32*)0, (float32*)0, mean, p->rstd + rows + r0, size, cols, eps);
+    dispatch k_foresee_pick[spread(s, count * unit), 256](tin, trace, count * unit, rounds, n->i5, unit, first);
+    dispatch k_norm[row_blocks(nrow), 256](1, p->tn + at, tin, (float32*)0, (float32*)0, mean, unused, size, cols, eps);
+    sum_into(s, n->value.data, p->gn + at, p->tn + at, 2, count * unit, n->f0, first > 0);
+    first = first + count;
+  }
+}
+
+fn back_foresee(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var ts: Shape = g->nodes[n->a].value.shape;
+  var ss: Shape = g->nodes[n->b].value.shape;
+  var w: int64 = ss.last();
+  var unit: int64 = ss.size();
+  var per: int64 = unit / w;
+  var hid: int64 = g->nodes[n->c].value.shape.dims[0];
+  var slots: int64 = (ts.dims[0] - n->i5) * ts.dims[1];
+  var rows: int64 = slots * per;
+  var cols: int32 = (int32)w;
+  var p: ForeseeParts* = (ForeseeParts*)n->i2;
+  var t: Graph* = spare(s);
+  var slab: int64 = foresee_slab(slots, per);
+  var dgn: float32* = t->floats(slab * unit);
+  var dguess: float32* = t->floats(slab * unit);
+  var hg: float32* = t->floats(slab * per * hid);
+  var dhg: float32* = t->floats(slab * per * hid);
+  var dh: float32* = t->floats(slab * per * hid);
+  var dx: float32* = t->floats(slab * unit);
+  var first: int64 = 0;
+  while (first < slots) {
+    var count: int64 = if slots - first < slab { slots - first } else { slab };
+    var r0: int64 = first * per;
+    var nrow: int64 = count * per;
+    var at: int64 = first * unit;
+    var size: int32 = (int32)nrow;
+    var h: float32* = p->h + r0 * hid;
+    dispatch k_foresee_slope[spread(s, count * unit), 256](dgn, p->gn + at, p->tn + at, n->grad, n->f0 + n->f0, count * unit);
+    dispatch k_rms_back[row_blocks(nrow), 256](dguess, dgn, p->gn + at, p->rstd + rows + r0, size, cols);
+    dispatch k_unary[spread(s, nrow * hid), 256](17, hg, h, z32(), z32(), nrow * hid);
+    run_gemm(s, t, gemm_shape(dguess, hg, g->grad_of(n->ints[0]), w, hid, nrow, w, hid, hid, true, false, true));
+    run_gemm(s, t, gemm_shape(dguess, g->data(n->ints[0]), dhg, nrow, hid, w, w, hid, hid, false, false, false));
+    dispatch k_unary_back[spread(s, nrow * hid), 256](17, dh, dhg, h, h, z32(), z32(), nrow * hid, 1);
+    run_gemm(s, t, gemm_shape(dh, p->x + at, g->grad_of(n->c), hid, w, nrow, hid, w, w, true, false, true));
+    run_gemm(s, t, gemm_shape(dh, g->data(n->c), dx, nrow, w, hid, hid, w, w, false, false, false));
+    dispatch k_rms_back[row_blocks(nrow), 256](dgn, dx, p->x + at, p->rstd + r0, size, cols);
+    if (g->nodes[n->a].requires) { dispatch k_add[spread(s, count * unit), 256](g->grad_of(n->a) + at, dgn, one32(), count * unit); }
+    if (g->nodes[n->b].requires) { dispatch k_period_sum[spread(s, unit), 256](g->grad_of(n->b), dgn, unit, count); }
+    first = first + count;
+  }
+}
 fn conv_record(g: Graph*, n: Node*) -> Conv {
   var sx: Shape = g->nodes[n->a].value.shape;
   var sw: Shape = g->nodes[n->b].value.shape;
@@ -3478,6 +5607,2097 @@ fn back_batch_norm(s: GpuState*, g: Graph*, id: int32) {
   dispatch k_batch_norm_back[(int32)c, 256](dx, dgamma, dbeta, n->grad, g->data(n->a), g->data(n->b), n->saved, n->saved2, (int32)sh.dims[0], (int32)c, (int32)n->i1, (int32)n->i0);
 }
 
+kernel(block = 256) k_add_mul(out: float32*, a: float32*, b: float32*, c: float32*, n: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    out[i] = (a[i] + b[i]) * c[i];
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_add_mul_back(da: float32*, db: float32*, dc: float32*, dy: float32*, a: float32*, b: float32*, c: float32*, n: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < n) {
+    var slope: float32 = dy[i];
+    if (da != (float32*)0) { da[i] = da[i] + slope * c[i]; }
+    if (db != (float32*)0) { db[i] = db[i] + slope * c[i]; }
+    if (dc != (float32*)0) { dc[i] = dc[i] + slope * (a[i] + b[i]); }
+    i = i + step;
+  }
+}
+
+fn fwd_add_mul(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var size: int64 = n->value.shape.size();
+  dispatch k_add_mul[spread(s, size), 256](n->value.data, g->data(n->a), g->data(n->b), g->data(n->c), size);
+}
+
+fn back_add_mul(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var size: int64 = n->value.shape.size();
+  var da: float32* = if g->nodes[n->a].requires { g->grad_of(n->a) } else { (float32*)0 };
+  var db: float32* = if g->nodes[n->b].requires { g->grad_of(n->b) } else { (float32*)0 };
+  var dc: float32* = if g->nodes[n->c].requires { g->grad_of(n->c) } else { (float32*)0 };
+  dispatch k_add_mul_back[spread(s, size), 256](da, db, dc, n->grad, g->data(n->a), g->data(n->b), g->data(n->c), size);
+}
+
+kernel(block = 256) k_pairing(out: float32*, x: float32*, head: float32*, b: int64, t: int64, w: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var both: int64 = 2 * w;
+  while (i < b * t * both) {
+    var row: int64 = i / both;
+    var c: int64 = i - row * both;
+    var at: int64 = row % t;
+    if (c < w) {
+      out[i] = x[row * w + c];
+    } else if (at > 0) {
+      out[i] = x[(row - 1) * w + c - w];
+    } else if (head != (float32*)0) {
+      out[i] = head[(row / t) * w + c - w];
+    } else {
+      out[i] = z32();
+    }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_pairing_back(dx: float32*, dy: float32*, b: int64, t: int64, w: int64, fresh: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < b * t * w) {
+    var row: int64 = i / w;
+    var c: int64 = i - row * w;
+    var v: float32 = dy[row * 2 * w + c];
+    if (row % t + 1 < t) { v = v + dy[(row + 1) * 2 * w + w + c]; }
+    if (fresh != 0) { dx[i] = v; } else { dx[i] = dx[i] + v; }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_pairing_head(dh: float32*, dy: float32*, b: int64, t: int64, w: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < b * w) {
+    var r: int64 = i / w;
+    dh[i] = dh[i] + dy[r * t * 2 * w + w + i - r * w];
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_mix(out: float32*, a: float32*, x: float32*, y: float32*, rows: int64, picks: int64, k: int64, first: int64, w: int64) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var second: int64 = k - first;
+  while (i < rows * picks * w) {
+    var c: int64 = i % w;
+    var rp: int64 = i / w;
+    var r: int64 = rp / picks;
+    var sum: float32 = z32();
+    for j: int64 in 0..first { sum = sum + a[rp * k + j] * x[(r * first + j) * w + c]; }
+    for j: int64 in 0..second { sum = sum + a[rp * k + first + j] * y[(r * second + j) * w + c]; }
+    out[i] = sum;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_mix_back_x(dx: float32*, a: float32*, dy: float32*, rows: int64, picks: int64, k: int64, lo: int64, part: int64, w: int64, fresh: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < rows * part * w) {
+    var c: int64 = i % w;
+    var rj: int64 = i / w;
+    var r: int64 = rj / part;
+    var j: int64 = rj - r * part;
+    var sum: float32 = z32();
+    for p: int64 in 0..picks { sum = sum + a[(r * picks + p) * k + lo + j] * dy[(r * picks + p) * w + c]; }
+    if (fresh != 0) { dx[i] = sum; } else { dx[i] = dx[i] + sum; }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_mix_back_a(da: float32*, x: float32*, y: float32*, dy: float32*, rows: int64, picks: int64, k: int64, first: int64, w: int64, fresh: int32) {
+  var at: int64 = (int64)block.x * 8 + (int64)(thread.x / 32);
+  var lane: int64 = (int64)subgroup_local_id();
+  if (at >= rows * picks * k) { return; }
+  var j: int64 = at % k;
+  var rp: int64 = at / k;
+  var r: int64 = rp / picks;
+  var src: float32* = if j < first { x + (r * first + j) * w } else { y + (r * (k - first) + j - first) * w };
+  var sum: float32 = z32();
+  var c: int64 = lane;
+  while (c < w) {
+    sum = sum + dy[rp * w + c] * src[c];
+    c = c + 32;
+  }
+  var total: float32 = subgroup_reduce_add(sum);
+  if (lane == 0) {
+    if (fresh != 0) { da[at] = total; } else { da[at] = da[at] + total; }
+  }
+}
+
+fn mix_first(g: Graph*, n: Node*, k: int64) -> int64 {
+  return if n->c >= 0 { n->i0 } else { k };
+}
+
+fn fwd_mix(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var rows: int64 = sh.dims[0];
+  var picks: int64 = sh.dims[1];
+  var w: int64 = sh.dims[2];
+  var k: int64 = g->nodes[n->a].value.shape.size() / (rows * picks);
+  var first: int64 = mix_first(g, n, k);
+  var y: float32* = if n->c >= 0 { g->data(n->c) } else { (float32*)0 };
+  dispatch k_mix[spread(s, sh.size()), 256](n->value.data, g->data(n->a), g->data(n->b), y, rows, picks, k, first, w);
+}
+
+fn back_mix(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var rows: int64 = sh.dims[0];
+  var picks: int64 = sh.dims[1];
+  var w: int64 = sh.dims[2];
+  var k: int64 = g->nodes[n->a].value.shape.size() / (rows * picks);
+  var first: int64 = mix_first(g, n, k);
+  var y: float32* = if n->c >= 0 { g->data(n->c) } else { (float32*)0 };
+  if (g->nodes[n->b].requires) {
+    var slot: GradSlot = g->grad_take(n->b);
+    dispatch k_mix_back_x[spread(s, rows * first * w), 256](slot.data, g->data(n->a), n->grad, rows, picks, k, 0, first, w, if slot.fresh { 1 } else { 0 });
+  }
+  if (n->c >= 0 && g->nodes[n->c].requires) {
+    var slot: GradSlot = g->grad_take(n->c);
+    dispatch k_mix_back_x[spread(s, rows * (k - first) * w), 256](slot.data, g->data(n->a), n->grad, rows, picks, k, first, k - first, w, if slot.fresh { 1 } else { 0 });
+  }
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_mix_back_a[(int32)((rows * picks * k + 7) / 8), 256](slot.data, g->data(n->b), y, n->grad, rows, picks, k, first, w, if slot.fresh { 1 } else { 0 });
+  }
+}
+
+fn fwd_pair(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var head: float32* = if n->b >= 0 { g->data(n->b) } else { (float32*)0 };
+  dispatch k_pairing[spread(s, sh.size()), 256](n->value.data, g->data(n->a), head, sh.dims[0], sh.dims[1], sh.dims[2] / 2);
+}
+
+fn back_pair(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var b: int64 = sh.dims[0];
+  var t: int64 = sh.dims[1];
+  var w: int64 = sh.dims[2] / 2;
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_pairing_back[spread(s, b * t * w), 256](slot.data, n->grad, b, t, w, if slot.fresh { 1 } else { 0 });
+  }
+  if (n->b >= 0 && g->nodes[n->b].requires) { dispatch k_pairing_head[spread(s, b * w), 256](g->grad_of(n->b), n->grad, b, t, w); }
+}
+
+fn fwd_residual(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sx: Shape = n->value.shape;
+  var cols: int64 = sx.last();
+  var k: int64 = g->nodes[n->b].value.shape.last();
+  var rows: int64 = sx.size() / cols;
+  var t: Graph* = spare(s);
+  var hn: float32* = t->floats(rows * k);
+  var mean: float32* = t->floats(rows);
+  dispatch k_norm[row_blocks(rows), 256](1, hn, g->data(n->b), (float32*)0, (float32*)0, mean, n->saved, (int32)rows, (int32)k, n->f0);
+  dispatch k_scaled[spread(s, rows * cols), 256](n->value.data, g->data(n->a), one32(), rows * cols);
+  run_gemm(s, t, gemm_shape(hn, g->data(n->c), n->value.data, rows, cols, k, k, k, cols, false, true, true));
+}
+
+fn take_slope(s: GpuState*, g: Graph*, id: int32, dy: float32*, count: int64) {
+  var slot: GradSlot = g->grad_take(id);
+  if (slot.fresh) {
+    dispatch k_scaled[spread(s, count), 256](slot.data, dy, one32(), count);
+  } else {
+    dispatch k_add[spread(s, count), 256](slot.data, dy, one32(), count);
+  }
+}
+
+fn back_residual(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sx: Shape = n->value.shape;
+  var cols: int64 = sx.last();
+  var k: int64 = g->nodes[n->b].value.shape.last();
+  var rows: int64 = sx.size() / cols;
+  var dy: float32* = n->grad;
+  if (g->nodes[n->a].requires) { take_slope(s, g, n->a, dy, rows * cols); }
+  var wants_h: bool = g->nodes[n->b].requires;
+  var wants_w: bool = g->nodes[n->c].requires;
+  if (!wants_h && !wants_w) { return; }
+  var t: Graph* = spare(s);
+  var hn: float32* = t->floats(rows * k);
+  var mean: float32* = t->floats(rows);
+  var rstd: float32* = t->floats(rows);
+  if (wants_w) {
+    dispatch k_norm[row_blocks(rows), 256](1, hn, g->data(n->b), (float32*)0, (float32*)0, mean, rstd, (int32)rows, (int32)k, n->f0);
+    var wslot: GradSlot = g->grad_take(n->c);
+    run_gemm(s, t, gemm_shape(dy, hn, wslot.data, cols, k, rows, cols, k, k, true, false, !wslot.fresh));
+  }
+  if (wants_h) {
+    var dhn: float32* = t->floats(rows * k);
+    run_gemm(s, t, gemm_shape(dy, g->data(n->c), dhn, rows, k, cols, cols, k, k, false, false, false));
+    var hslot: GradSlot = g->grad_take(n->b);
+    dispatch k_norm_back[row_blocks(rows), 256](1, hslot.data, dhn, g->data(n->b), (float32*)0, mean, n->saved, (int32)rows, (int32)k, if hslot.fresh { 1 } else { 0 });
+  }
+}
+
+fn fwd_feed(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sx: Shape = n->value.shape;
+  var w: int64 = sx.last();
+  var hid: int64 = g->nodes[n->b].value.shape.dims[0];
+  var rows: int64 = sx.size() / w;
+  var t: Graph* = spare(s);
+  var xn: float32* = t->floats(rows * w);
+  var act: float32* = t->floats(rows * hid);
+  var mean: float32* = t->floats(rows);
+  dispatch k_norm[row_blocks(rows), 256](1, xn, g->data(n->a), (float32*)0, (float32*)0, mean, n->saved, (int32)rows, (int32)w, n->f0);
+  run_gemm(s, t, gemm_shape(xn, g->data(n->b), n->saved2, rows, hid, w, w, w, hid, false, true, false));
+  dispatch k_unary[spread(s, rows * hid), 256](17, act, n->saved2, z32(), z32(), rows * hid);
+  dispatch k_scaled[spread(s, rows * w), 256](n->value.data, g->data(n->a), one32(), rows * w);
+  run_gemm(s, t, gemm_shape(act, g->data(n->c), n->value.data, rows, w, hid, hid, hid, w, false, true, true));
+}
+
+fn back_feed(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sx: Shape = n->value.shape;
+  var w: int64 = sx.last();
+  var hid: int64 = g->nodes[n->b].value.shape.dims[0];
+  var rows: int64 = sx.size() / w;
+  var dy: float32* = n->grad;
+  var wants_x: bool = g->nodes[n->a].requires;
+  if (wants_x) { take_slope(s, g, n->a, dy, rows * w); }
+  var t: Graph* = spare(s);
+  var xn: float32* = t->floats(rows * w);
+  var act: float32* = t->floats(rows * hid);
+  var dact: float32* = t->floats(rows * hid);
+  var dpre: float32* = t->floats(rows * hid);
+  var mean: float32* = t->floats(rows);
+  var rstd: float32* = t->floats(rows);
+  dispatch k_norm[row_blocks(rows), 256](1, xn, g->data(n->a), (float32*)0, (float32*)0, mean, rstd, (int32)rows, (int32)w, n->f0);
+  dispatch k_unary[spread(s, rows * hid), 256](17, act, n->saved2, z32(), z32(), rows * hid);
+  if (g->nodes[n->c].requires) {
+    var oslot: GradSlot = g->grad_take(n->c);
+    run_gemm(s, t, gemm_shape(dy, act, oslot.data, w, hid, rows, w, hid, hid, true, false, !oslot.fresh));
+  }
+  run_gemm(s, t, gemm_shape(dy, g->data(n->c), dact, rows, hid, w, w, hid, hid, false, false, false));
+  dispatch k_unary_back[spread(s, rows * hid), 256](17, dpre, dact, n->saved2, n->saved2, z32(), z32(), rows * hid, 1);
+  if (g->nodes[n->b].requires) {
+    var fslot: GradSlot = g->grad_take(n->b);
+    run_gemm(s, t, gemm_shape(dpre, xn, fslot.data, hid, w, rows, hid, w, w, true, false, !fslot.fresh));
+  }
+  if (wants_x) {
+    var dxn: float32* = t->floats(rows * w);
+    run_gemm(s, t, gemm_shape(dpre, g->data(n->b), dxn, rows, w, hid, hid, w, w, false, false, false));
+    dispatch k_norm_back[row_blocks(rows), 256](1, g->grad_of(n->a), dxn, g->data(n->a), (float32*)0, mean, n->saved, (int32)rows, (int32)w, 0);
+  }
+}
+
+const FUSED_TILE: int32 = 2304;
+const FUSED_EDGE: int32 = 48;
+
+kernel(block = 256) k_join(out: float32*, rules: float32*, at: int32*, side: int32) {
+  workgroup var as: float32[FUSED_TILE];
+  workgroup var bs: float32[FUSED_TILE];
+  workgroup var cs: float32[FUSED_TILE];
+  workgroup var ls: float32[FUSED_EDGE];
+  var t: int32 = thread.x;
+  var row: int64 = (int64)block.x;
+  var plane: int32 = side * side;
+  var a: float32* = rules + row * (int64)plane;
+  var b: float32* = rules + (int64)at[row] * (int64)plane;
+  var i: int32 = t;
+  while (i < plane) {
+    as[i] = a[i];
+    bs[i] = b[i];
+    i = i + 256;
+  }
+  barrier(workgroup, acq_rel);
+  i = t;
+  while (i < plane) {
+    var r: int32 = i / side;
+    var c: int32 = i - r * side;
+    var sum: float32 = z32();
+    for j in 0..side { sum = sum + as[r * side + j] * bs[j * side + c]; }
+    cs[i] = sum * sum;
+    i = i + 256;
+  }
+  barrier(workgroup, acq_rel);
+  if (t < side) {
+    var total: float32 = z32();
+    for r in 0..side { total = total + cs[r * side + t]; }
+    ls[t] = total;
+  }
+  barrier(workgroup, acq_rel);
+  var o: float32* = out + row * (int64)plane;
+  i = t;
+  while (i < plane) {
+    o[i] = cs[i] / ls[i % side];
+    i = i + 256;
+  }
+}
+
+kernel(block = 256) k_join_back(da: float32*, db: float32*, dy: float32*, rules: float32*, at: int32*, side: int32, fresh: int32) {
+  workgroup var as: float32[FUSED_TILE];
+  workgroup var bs: float32[FUSED_TILE];
+  workgroup var cs: float32[FUSED_TILE];
+  workgroup var ls: float32[FUSED_EDGE];
+  workgroup var ds: float32[FUSED_EDGE];
+  var t: int32 = thread.x;
+  var row: int64 = (int64)block.x;
+  var plane: int32 = side * side;
+  var a: float32* = rules + row * (int64)plane;
+  var b: float32* = rules + (int64)at[row] * (int64)plane;
+  var d: float32* = dy + row * (int64)plane;
+  var i: int32 = t;
+  while (i < plane) {
+    as[i] = a[i];
+    bs[i] = b[i];
+    i = i + 256;
+  }
+  barrier(workgroup, acq_rel);
+  i = t;
+  while (i < plane) {
+    var r: int32 = i / side;
+    var c: int32 = i - r * side;
+    var sum: float32 = z32();
+    for j in 0..side { sum = sum + as[r * side + j] * bs[j * side + c]; }
+    cs[i] = sum;
+    i = i + 256;
+  }
+  barrier(workgroup, acq_rel);
+  if (t < side) {
+    var total: float32 = z32();
+    var dot: float32 = z32();
+    for r in 0..side {
+      var c: float32 = cs[r * side + t];
+      total = total + c * c;
+      dot = dot + d[r * side + t] * c * c;
+    }
+    ls[t] = total;
+    ds[t] = dot / total;
+  }
+  barrier(workgroup, acq_rel);
+  i = t;
+  while (i < plane) {
+    var c: int32 = i % side;
+    cs[i] = (float32)2.0 * cs[i] * (d[i] - ds[c]) / ls[c];
+    i = i + 256;
+  }
+  barrier(workgroup, acq_rel);
+  var ga: float32* = da + row * (int64)plane;
+  var gb: float32* = db + row * (int64)plane;
+  i = t;
+  while (i < plane) {
+    var r: int32 = i / side;
+    var j: int32 = i - r * side;
+    var left: float32 = z32();
+    var right: float32 = z32();
+    for q in 0..side {
+      left = left + cs[r * side + q] * bs[j * side + q];
+      right = right + as[q * side + r] * cs[q * side + j];
+    }
+    if (fresh != 0) { ga[i] = left; } else { ga[i] = ga[i] + left; }
+    gb[i] = right;
+    i = i + 256;
+  }
+}
+
+kernel(block = 256) k_rules(out: float32*, tables: float32*, choice: float32*, unseen: float32*, letters: int32) {
+  workgroup var ts: float32[FUSED_TILE];
+  workgroup var icol: float32[FUSED_EDGE];
+  workgroup var irow: float32[FUSED_EDGE];
+  workgroup var iqf: float32[FUSED_EDGE];
+  workgroup var iqr: float32[FUSED_EDGE];
+  workgroup var pf: float32[FUSED_EDGE];
+  workgroup var pr: float32[FUSED_EDGE];
+  var t: int32 = thread.x;
+  var row: int64 = (int64)block.x;
+  var side: int32 = letters + 1;
+  var flat: int32 = letters * letters;
+  var plane: int32 = side * side;
+  var u: float32 = unseen[0];
+  var src: float32* = tables + row * (int64)flat;
+  var i: int32 = t;
+  while (i < flat) {
+    ts[i] = src[i];
+    i = i + 256;
+  }
+  barrier(workgroup, acq_rel);
+  if (t < letters) {
+    var down: float32 = z32();
+    var along: float32 = z32();
+    for r in 0..letters {
+      down = down + ts[r * letters + t];
+      along = along + ts[t * letters + r];
+    }
+    var ic: float32 = one32() / (down + u);
+    var ir: float32 = one32() / (along + u);
+    var sum_f: float32 = z32();
+    var sq_f: float32 = z32();
+    var sum_r: float32 = z32();
+    var sq_r: float32 = z32();
+    for r in 0..letters {
+      var x: float32 = ts[r * letters + t] * ic;
+      var h: float32 = ts[t * letters + r] * ir;
+      sum_f = sum_f + x;
+      sq_f = sq_f + x * x;
+      sum_r = sum_r + h;
+      sq_r = sq_r + h * h;
+    }
+    var pad_f: float32 = one32() - sum_f;
+    var pad_r: float32 = one32() - sum_r;
+    icol[t] = ic;
+    irow[t] = ir;
+    pf[t] = pad_f;
+    pr[t] = pad_r;
+    iqf[t] = one32() / (sq_f + pad_f * pad_f);
+    iqr[t] = one32() / (sq_r + pad_r * pad_r);
+  }
+  barrier(workgroup, acq_rel);
+  var c0: float32 = choice[row * 3];
+  var c1: float32 = choice[row * 3 + 1];
+  var c2: float32 = choice[row * 3 + 2];
+  var o: float32* = out + row * (int64)plane;
+  i = t;
+  while (i < plane) {
+    var r: int32 = i / side;
+    var c: int32 = i - r * side;
+    var v: float32 = z32();
+    if (c == letters) {
+      if (r == letters) { v = c1 + c2; }
+    } else {
+      var x: float32 = pf[c];
+      var h: float32 = pr[c];
+      if (r < letters) {
+        x = ts[r * letters + c] * icol[c];
+        h = ts[c * letters + r] * irow[c];
+      }
+      v = c1 * x * x * iqf[c] + c2 * h * h * iqr[c];
+    }
+    if (r == c) { v = v + c0; }
+    o[i] = v;
+    i = i + 256;
+  }
+}
+
+kernel(block = 256) k_rules_back(dt: float32*, dc: float32*, du: float32*, dy: float32*, tables: float32*, choice: float32*, unseen: float32*, letters: int32, fresh_t: int32, fresh_c: int32) {
+  workgroup var ts: float32[FUSED_TILE];
+  workgroup var icol: float32[FUSED_EDGE];
+  workgroup var irow: float32[FUSED_EDGE];
+  workgroup var iqf: float32[FUSED_EDGE];
+  workgroup var iqr: float32[FUSED_EDGE];
+  workgroup var dotf: float32[FUSED_EDGE];
+  workgroup var dotr: float32[FUSED_EDGE];
+  workgroup var padf: float32[FUSED_EDGE];
+  workgroup var padr: float32[FUSED_EDGE];
+  workgroup var slopef: float32[FUSED_EDGE];
+  workgroup var sloper: float32[FUSED_EDGE];
+  workgroup var w0: float32[FUSED_EDGE];
+  workgroup var w1: float32[FUSED_EDGE];
+  workgroup var w2: float32[FUSED_EDGE];
+  var t: int32 = thread.x;
+  var row: int64 = (int64)block.x;
+  var side: int32 = letters + 1;
+  var flat: int32 = letters * letters;
+  var plane: int32 = side * side;
+  var u: float32 = unseen[0];
+  var src: float32* = tables + row * (int64)flat;
+  var d: float32* = dy + row * (int64)plane;
+  var c1: float32 = choice[row * 3 + 1];
+  var c2: float32 = choice[row * 3 + 2];
+  var two: float32 = (float32)2.0;
+  var i: int32 = t;
+  while (i < flat) {
+    ts[i] = src[i];
+    i = i + 256;
+  }
+  barrier(workgroup, acq_rel);
+  if (t < side) {
+    var g0: float32 = d[t * side + t];
+    var g1: float32 = z32();
+    var g2: float32 = z32();
+    if (t == letters) {
+      g1 = g0;
+      g2 = g0;
+    } else {
+      var down: float32 = z32();
+      var along: float32 = z32();
+      for r in 0..letters {
+        down = down + ts[r * letters + t];
+        along = along + ts[t * letters + r];
+      }
+      var ic: float32 = one32() / (down + u);
+      var ir: float32 = one32() / (along + u);
+      var sum_f: float32 = z32();
+      var sq_f: float32 = z32();
+      var u_f: float32 = z32();
+      var sum_r: float32 = z32();
+      var sq_r: float32 = z32();
+      var u_r: float32 = z32();
+      for r in 0..letters {
+        var x: float32 = ts[r * letters + t] * ic;
+        var h: float32 = ts[t * letters + r] * ir;
+        var dv: float32 = d[r * side + t];
+        sum_f = sum_f + x;
+        sq_f = sq_f + x * x;
+        u_f = u_f + dv * x * x;
+        sum_r = sum_r + h;
+        sq_r = sq_r + h * h;
+        u_r = u_r + dv * h * h;
+      }
+      var dl: float32 = d[letters * side + t];
+      var pad_f: float32 = one32() - sum_f;
+      var pad_r: float32 = one32() - sum_r;
+      var iq_f: float32 = one32() / (sq_f + pad_f * pad_f);
+      var iq_r: float32 = one32() / (sq_r + pad_r * pad_r);
+      g1 = (u_f + dl * pad_f * pad_f) * iq_f;
+      g2 = (u_r + dl * pad_r * pad_r) * iq_r;
+      var dot_f: float32 = c1 * g1;
+      var dot_r: float32 = c2 * g2;
+      var dpad_f: float32 = two * pad_f * (c1 * dl - dot_f) * iq_f;
+      var dpad_r: float32 = two * pad_r * (c2 * dl - dot_r) * iq_r;
+      icol[t] = ic;
+      irow[t] = ir;
+      iqf[t] = iq_f;
+      iqr[t] = iq_r;
+      dotf[t] = dot_f;
+      dotr[t] = dot_r;
+      padf[t] = dpad_f;
+      padr[t] = dpad_r;
+      slopef[t] = -(two * iq_f * (c1 * u_f - dot_f * sq_f) - dpad_f * sum_f) * ic;
+      sloper[t] = -(two * iq_r * (c2 * u_r - dot_r * sq_r) - dpad_r * sum_r) * ir;
+    }
+    w0[t] = g0;
+    w1[t] = g1;
+    w2[t] = g2;
+  }
+  barrier(workgroup, acq_rel);
+  if (t == 0) {
+    var s0: float32 = z32();
+    var s1: float32 = z32();
+    var s2: float32 = z32();
+    var su: float32 = z32();
+    for q in 0..side {
+      s0 = s0 + w0[q];
+      s1 = s1 + w1[q];
+      s2 = s2 + w2[q];
+    }
+    for q in 0..letters { su = su + slopef[q] + sloper[q]; }
+    if (fresh_c != 0) {
+      dc[row * 3] = s0;
+      dc[row * 3 + 1] = s1;
+      dc[row * 3 + 2] = s2;
+    } else {
+      dc[row * 3] = dc[row * 3] + s0;
+      dc[row * 3 + 1] = dc[row * 3 + 1] + s1;
+      dc[row * 3 + 2] = dc[row * 3 + 2] + s2;
+    }
+    du[row] = su;
+  }
+  var gt: float32* = dt + row * (int64)flat;
+  i = t;
+  while (i < flat) {
+    var a: int32 = i / letters;
+    var b: int32 = i - a * letters;
+    var x: float32 = ts[i] * icol[b];
+    var h: float32 = ts[i] * irow[a];
+    var via_f: float32 = (two * x * (c1 * d[a * side + b] - dotf[b]) * iqf[b] - padf[b]) * icol[b] + slopef[b];
+    var via_r: float32 = (two * h * (c2 * d[b * side + a] - dotr[a]) * iqr[a] - padr[a]) * irow[a] + sloper[a];
+    if (fresh_t != 0) { gt[i] = via_f + via_r; } else { gt[i] = gt[i] + via_f + via_r; }
+    i = i + 256;
+  }
+}
+
+const JOIN_AREA: int32 = 3888;
+const JOIN_ROOM: int32 = 1296;
+
+kernel(block = 256) k_join3(out: float32*, rules: float32*, at: int32*, side: int32, rows: int32) {
+  workgroup var as: float32[JOIN_AREA];
+  workgroup var bs: float32[JOIN_AREA];
+  workgroup var cs: float32[JOIN_AREA];
+  workgroup var ls: float32[108];
+  var t: int32 = thread.x;
+  var first: int32 = block.x * 3;
+  var plane: int32 = side * side;
+  var i: int32 = t;
+  while (i < 3 * plane) {
+    var mat: int32 = i / plane;
+    var e: int32 = i - mat * plane;
+    var row: int32 = first + mat;
+    var av: float32 = z32();
+    var bv: float32 = z32();
+    if (row < rows) {
+      av = rules[(int64)row * (int64)plane + (int64)e];
+      bv = rules[(int64)at[row] * (int64)plane + (int64)e];
+    }
+    as[mat * JOIN_ROOM + e] = av;
+    bs[mat * JOIN_ROOM + e] = bv;
+    i = i + 256;
+  }
+  barrier(workgroup, acq_rel);
+  var which: int32 = t / 81;
+  var tile: int32 = t - which * 81;
+  if (which < 3) {
+    var r0: int32 = (tile / 9) * 4;
+    var c0: int32 = (tile - (tile / 9) * 9) * 4;
+    var base: int32 = which * JOIN_ROOM;
+    var acc: float32[16];
+    var ra: int32[4];
+    var cb: int32[4];
+    var av: float32[4];
+    var bv: float32[4];
+    comptime for k in 0..16 { acc[k] = z32(); }
+    comptime for x in 0..4 {
+      ra[x] = r0 + x;
+      cb[x] = c0 + x;
+      if (ra[x] >= side) { ra[x] = side - 1; }
+      if (cb[x] >= side) { cb[x] = side - 1; }
+      ra[x] = base + ra[x] * side;
+      cb[x] = base + cb[x];
+    }
+    for j in 0..side {
+      comptime for x in 0..4 {
+        av[x] = as[ra[x] + j];
+        bv[x] = bs[cb[x] + j * side];
+      }
+      comptime for x in 0..4 {
+        comptime for y in 0..4 { acc[x * 4 + y] = acc[x * 4 + y] + av[x] * bv[y]; }
+      }
+    }
+    comptime for x in 0..4 {
+      comptime for y in 0..4 {
+        if (r0 + x < side && c0 + y < side) { cs[base + (r0 + x) * side + c0 + y] = acc[x * 4 + y] * acc[x * 4 + y]; }
+      }
+    }
+  }
+  barrier(workgroup, acq_rel);
+  if (t < 3 * side) {
+    var m2: int32 = t / side;
+    var col: int32 = t - m2 * side;
+    var total: float32 = z32();
+    for r in 0..side { total = total + cs[m2 * JOIN_ROOM + r * side + col]; }
+    ls[m2 * 36 + col] = total;
+  }
+  barrier(workgroup, acq_rel);
+  i = t;
+  while (i < 3 * plane) {
+    var mat: int32 = i / plane;
+    var e: int32 = i - mat * plane;
+    var row: int32 = first + mat;
+    if (row < rows) { out[(int64)row * (int64)plane + (int64)e] = cs[mat * JOIN_ROOM + e] / ls[mat * 36 + e % side]; }
+    i = i + 256;
+  }
+}
+
+kernel(block = 256) k_round_vec(vecs: float32*, rules: float32*, resting: float32*, q: Round) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var side: int64 = (int64)q.side;
+  var total: int64 = (int64)q.batch * (int64)q.time * side;
+  while (e < total) {
+    var i: int64 = e / side;
+    var rule: float32* = rules + e * side;
+    var far: float32* = resting + (int64)q.at[i] * side;
+    var sum: float32 = z32();
+    for y: int64 in 0..side { sum = sum + rule[y] * far[y]; }
+    vecs[e] = sum;
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_round_slopes(dv: float32*, dr: float32*, dzs: float32*, dtot: float32*, keep: float32*, king: float32*, q: Round) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var side: int64 = (int64)q.side;
+  var letters: int64 = side - 1;
+  var vocab: int64 = (int64)q.vocab;
+  var time: int64 = (int64)q.time;
+  var rows: int64 = (int64)q.batch * time;
+  while (i < rows) {
+    var r: int64 = i / time;
+    var pos: int64 = i - r * time;
+    var syms: int32* = q.syms + r * letters;
+    var slopes: float32* = dr + i * vocab;
+    var acc: float32 = z32();
+    for s: int64 in 0..vocab { acc = acc + slopes[s] * q.spread[r * vocab + s]; }
+    var back: float32 = z32();
+    for j: int64 in 0..time { back = back + king[(r * time + j) * time + pos] * dzs[r * time + j]; }
+    var nx: int32 = q.nexts[i];
+    var extra: float32 = z32();
+    if (nx >= 0) {
+      extra = back / (keep[i * vocab + (int64)nx] + (float32)0.02);
+      acc = acc + extra * q.spread[r * vocab + (int64)nx];
+    }
+    var dtotal: float32 = dtot[i] - acc;
+    for x: int64 in 0..letters {
+      var sym: int32 = syms[x];
+      var v: float32 = z32();
+      if (sym >= 0) {
+        v = slopes[sym] + dtotal;
+        if (sym == nx) { v = v + extra; }
+      }
+      dv[i * side + x] = v;
+    }
+    dv[i * side + letters] = z32();
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_round_far(dfar: float32*, rules: float32*, dv: float32*, q: Round) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var side: int64 = (int64)q.side;
+  var total: int64 = (int64)q.batch * (int64)q.time * side;
+  while (e < total) {
+    var i: int64 = e / side;
+    var y: int64 = e - i * side;
+    var rule: float32* = rules + i * side * side + y;
+    var slope: float32* = dv + i * side;
+    var sum: float32 = z32();
+    for x: int64 in 0..side { sum = sum + rule[x * side] * slope[x]; }
+    dfar[e] = sum;
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_round_rules_back(drules: float32*, dv: float32*, resting: float32*, q: Round, fresh: int32) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var side: int64 = (int64)q.side;
+  var total: int64 = (int64)q.batch * (int64)q.time * side * side;
+  while (e < total) {
+    var ix: int64 = e / side;
+    var i: int64 = ix / side;
+    var v: float32 = dv[ix] * resting[(int64)q.at[i] * side + e - ix * side];
+    if (fresh != 0) { drules[e] = v; } else { drules[e] = drules[e] + v; }
+    e = e + step;
+  }
+}
+
+fn fwd_join(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  if (sh.dims[1] <= 36) {
+    dispatch k_join3[(int32)((sh.dims[0] + 2) / 3), 256](n->value.data, g->data(n->a), n->ints, (int32)sh.dims[1], (int32)sh.dims[0]);
+    return;
+  }
+  dispatch k_join[(int32)sh.dims[0], 256](n->value.data, g->data(n->a), n->ints, (int32)sh.dims[1]);
+}
+
+fn back_join(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var sh: Shape = n->value.shape;
+  var rows: int64 = sh.dims[0];
+  var plane: int64 = sh.dims[1] * sh.dims[2];
+  var far: float32* = g->floats(rows * plane);
+  var slot: GradSlot = g->grad_take(n->a);
+  dispatch k_join_back[(int32)rows, 256](slot.data, far, n->grad, g->data(n->a), n->ints, (int32)sh.dims[1], if slot.fresh { 1 } else { 0 });
+  var order: int32* = (int32*)n->ext;
+  dispatch k_scatter[spread(s, rows * plane), 256](slot.data, far, order, order + rows, rows, plane);
+}
+
+fn fwd_rules(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  dispatch k_rules[(int32)sh.dims[0], 256](n->value.data, g->data(n->a), g->data(n->b), g->data(n->c), (int32)(sh.dims[1] - 1));
+}
+
+fn back_rules(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var sh: Shape = n->value.shape;
+  var rows: int64 = sh.dims[0];
+  var letters: int64 = sh.dims[1] - 1;
+  var wants_t: bool = g->nodes[n->a].requires;
+  var wants_c: bool = g->nodes[n->b].requires;
+  var wants_u: bool = g->nodes[n->c].requires;
+  var gt: float32* = g->floats(rows * letters * letters);
+  var gc: float32* = g->floats(rows * 3);
+  var fresh_t: int32 = 1;
+  var fresh_c: int32 = 1;
+  if (wants_t) {
+    var slot: GradSlot = g->grad_take(n->a);
+    gt = slot.data;
+    fresh_t = if slot.fresh { 1 } else { 0 };
+  }
+  if (wants_c) {
+    var slot: GradSlot = g->grad_take(n->b);
+    gc = slot.data;
+    fresh_c = if slot.fresh { 1 } else { 0 };
+  }
+  var gu: float32* = g->floats(rows);
+  dispatch k_rules_back[(int32)rows, 256](gt, gc, gu, n->grad, g->data(n->a), g->data(n->b), g->data(n->c), (int32)letters, fresh_t, fresh_c);
+  if (wants_u) { sum_into(s, g->grad_of(n->c), gu, (float32*)0, 0, rows, (float32)1.0, true); }
+}
+
+struct Solve {
+  plain: int32*;
+  sorts: int32*;
+  order: int32*;
+  starts: int32*;
+  slots: int32*;
+  syms: int32*;
+  spread: float32*;
+  batch: int32;
+  time: int32;
+  stride: int32;
+  marks: int32;
+  reach: int32;
+  letters: int32;
+  vocab: int32;
+}
+
+fn solve_of(p: SolvePlan*) -> Solve {
+  var q: Solve = { plain: p->dplain, sorts: p->dsorts, order: p->dorder, starts: p->dorder + p->rows, slots: p->dslots, syms: p->dsyms, spread: p->dspread, batch: (int32)p->batch, time: (int32)p->time, stride: (int32)p->stride, marks: (int32)p->marks, reach: (int32)p->reach, letters: (int32)p->letters, vocab: (int32)p->vocab };
+  return q;
+}
+
+kernel(block = 256) k_solve_keys(keys: float32*, bel: float32*, bid: float32*, q: Solve) {
+  var g: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var reach: int64 = (int64)q.reach;
+  var time: int64 = (int64)q.time;
+  var total: int64 = (int64)q.batch * time * marks;
+  while (g < total) {
+    var m: int64 = g % marks;
+    var i: int64 = g / marks;
+    if (i % time < m * (int64)q.stride) {
+      var row: float32* = keys + g * letters;
+      var lend: float32 = bid[i];
+      for a: int64 in 0..letters { row[a] = z32(); }
+      for o: int64 in 0..reach {
+        var a: int64 = (int64)q.plain[i * reach + o];
+        if (a < letters) { row[a] = row[a] + bel[g * reach + o] * lend; }
+      }
+    }
+    g = g + step;
+  }
+}
+
+fn classed(q: Solve, x: float32*, e: int64) -> float32 {
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var time: int64 = (int64)q.time;
+  var a: int64 = e % letters;
+  var e1: int64 = e / letters;
+  var m: int64 = e1 % marks;
+  var e2: int64 = e1 / marks;
+  var c: int64 = e2 % (letters + 1);
+  var r: int64 = e2 / (letters + 1);
+  var limit: int64 = m * (int64)q.stride;
+  var sum: float32 = z32();
+  if (c < letters) {
+    var k: int32 = q.starts[r * letters + c];
+    var end: int32 = q.starts[r * letters + c + 1];
+    while (k < end) {
+      var i: int64 = (int64)q.order[k];
+      if (i - r * time < limit) { sum = sum + x[(i * marks + m) * letters + a]; }
+      k = k + 1;
+    }
+  }
+  return sum;
+}
+
+kernel(block = 256) k_solve_table(out: float32*, keys: float32*, q: Solve) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var time: int64 = (int64)q.time;
+  var none: int32 = q.batch * q.letters;
+  var total: int64 = (int64)q.batch * (letters + 1) * marks * letters;
+  while (e < total) {
+    var sum: float32 = classed(q, keys, e);
+    var c: int64 = (e / (letters * marks)) % (letters + 1);
+    if (c == letters) {
+      var a: int64 = e % letters;
+      var m: int64 = (e / letters) % marks;
+      var r: int64 = e / (letters * marks * (letters + 1));
+      for pos: int64 in 0..m * (int64)q.stride {
+        var i: int64 = r * time + pos;
+        if (q.sorts[i] != none) { sum = sum + keys[(i * marks + m) * letters + a]; }
+      }
+    }
+    out[e] = sum;
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_solve_table_back(dbel: float32*, part: float32*, dt: float32*, bel: float32*, bid: float32*, q: Solve, wants_bel: int32, fresh_bel: int32) {
+  var g: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var reach: int64 = (int64)q.reach;
+  var time: int64 = (int64)q.time;
+  var none: int32 = q.batch * q.letters;
+  var total: int64 = (int64)q.batch * time * marks;
+  while (g < total) {
+    var m: int64 = g % marks;
+    var i: int64 = g / marks;
+    var r: int64 = i / time;
+    var cls: int32 = q.sorts[i];
+    var live: bool = i - r * time < m * (int64)q.stride && cls != none;
+    var mine: float32* = dt + ((r * (letters + 1) + (int64)cls - r * letters) * marks + m) * letters;
+    var all: float32* = dt + ((r * (letters + 1) + letters) * marks + m) * letters;
+    var lend: float32 = bid[i];
+    var gain: float32 = z32();
+    for o: int64 in 0..reach {
+      var a: int64 = (int64)q.plain[i * reach + o];
+      var slope: float32 = z32();
+      if (live && a < letters) { slope = mine[a] + all[a]; }
+      var at: int64 = g * reach + o;
+      gain = gain + bel[at] * slope;
+      if (wants_bel != 0) {
+        if (fresh_bel != 0) { dbel[at] = slope * lend; } else { dbel[at] = dbel[at] + slope * lend; }
+      }
+    }
+    part[g] = gain;
+    g = g + step;
+  }
+}
+
+kernel(block = 256) k_fold_marks(dst: float32*, part: float32*, rows: int64, marks: int64, fresh: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < rows) {
+    var sum: float32 = z32();
+    for m: int64 in 0..marks { sum = sum + part[i * marks + m]; }
+    if (fresh != 0) { dst[i] = sum; } else { dst[i] = dst[i] + sum; }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_solve_proof(out: float32*, table: float32*, keys: float32*, terms: float32*, q: Solve) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var reach: int64 = (int64)q.reach;
+  var time: int64 = (int64)q.time;
+  var none: int32 = q.batch * q.letters;
+  var total: int64 = (int64)q.batch * time * marks * reach;
+  var unseen: float32 = terms[0];
+  var doubt: float32 = terms[1];
+  while (e < total) {
+    var o: int64 = e % reach;
+    var im: int64 = e / reach;
+    var m: int64 = im % marks;
+    var i: int64 = im / marks;
+    var r: int64 = i / time;
+    var v: float32 = z32();
+    if (i - r * time < m * (int64)q.stride) {
+      var a: int64 = (int64)q.plain[i * reach + o];
+      var hit: float32 = z32();
+      var all: float32 = z32();
+      if (a < letters) {
+        var own: float32 = keys[im * letters + a];
+        var cls: int32 = q.sorts[i];
+        if (cls != none) { hit = table[((r * (letters + 1) + (int64)cls - r * letters) * marks + m) * letters + a]; }
+        hit = hit - own;
+        all = table[((r * (letters + 1) + letters) * marks + m) * letters + a] - own;
+      }
+      if (hit < z32()) { hit = z32(); }
+      if (all < z32()) { all = z32(); }
+      v = logf(hit + unseen) - logf(all + doubt);
+    }
+    out[e] = v;
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_solve_proof_back(hk: float32*, fk: float32*, pu: float32*, pd: float32*, dy: float32*, table: float32*, keys: float32*, terms: float32*, q: Solve) {
+  workgroup var lanes: float32[256];
+  workgroup var lanes2: float32[256];
+  var t: int32 = thread.x;
+  var g: int64 = (int64)block.x * 256 + (int64)t;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var reach: int64 = (int64)q.reach;
+  var time: int64 = (int64)q.time;
+  var none: int32 = q.batch * q.letters;
+  var total: int64 = (int64)q.batch * time * marks;
+  var unseen: float32 = terms[0];
+  var doubt: float32 = terms[1];
+  var acc_u: float32 = z32();
+  var acc_d: float32 = z32();
+  while (g < total) {
+    var m: int64 = g % marks;
+    var i: int64 = g / marks;
+    var r: int64 = i / time;
+    var hrow: float32* = hk + g * letters;
+    var frow: float32* = fk + g * letters;
+    for a: int64 in 0..letters {
+      hrow[a] = z32();
+      frow[a] = z32();
+    }
+    if (i - r * time < m * (int64)q.stride) {
+      var cls: int32 = q.sorts[i];
+      var mine: float32* = table + ((r * (letters + 1) + (int64)cls - r * letters) * marks + m) * letters;
+      var whole: float32* = table + ((r * (letters + 1) + letters) * marks + m) * letters;
+      for o: int64 in 0..reach {
+        var a: int64 = (int64)q.plain[i * reach + o];
+        var hit: float32 = z32();
+        var all: float32 = z32();
+        if (a < letters) {
+          var own: float32 = keys[g * letters + a];
+          if (cls != none) { hit = mine[a]; }
+          hit = hit - own;
+          all = whole[a] - own;
+        }
+        var d: float32 = dy[g * reach + o];
+        var up: float32 = d / (unseen + (if hit > z32() { hit } else { z32() }));
+        var down: float32 = d / (doubt + (if all > z32() { all } else { z32() }));
+        acc_u = acc_u + up;
+        acc_d = acc_d - down;
+        if (hit > z32()) { hrow[a] = hrow[a] + up; }
+        if (all > z32()) { frow[a] = frow[a] - down; }
+      }
+    }
+    g = g + step;
+  }
+  lanes[t] = acc_u;
+  lanes2[t] = acc_d;
+  barrier(workgroup, acq_rel);
+  var width: int32 = 128;
+  while (width > 0) {
+    if (t < width) {
+      lanes[t] = lanes[t] + lanes[t + width];
+      lanes2[t] = lanes2[t] + lanes2[t + width];
+    }
+    barrier(workgroup, acq_rel);
+    width = width / 2;
+  }
+  if (t == 0) {
+    pu[block.x] = lanes[0];
+    pd[block.x] = lanes2[0];
+  }
+}
+
+kernel(block = 256) k_solve_proof_table(dt: float32*, hk: float32*, fk: float32*, q: Solve, fresh: int32) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var time: int64 = (int64)q.time;
+  var total: int64 = (int64)q.batch * (letters + 1) * marks * letters;
+  while (e < total) {
+    var sum: float32 = classed(q, hk, e);
+    var c: int64 = (e / (letters * marks)) % (letters + 1);
+    if (c == letters) {
+      var a: int64 = e % letters;
+      var m: int64 = (e / letters) % marks;
+      var r: int64 = e / (letters * marks * (letters + 1));
+      for pos: int64 in 0..m * (int64)q.stride { sum = sum + fk[((r * time + pos) * marks + m) * letters + a]; }
+    }
+    if (fresh != 0) { dt[e] = sum; } else { dt[e] = dt[e] + sum; }
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_solve_proof_own(dbel: float32*, part: float32*, hk: float32*, fk: float32*, bel: float32*, bid: float32*, q: Solve, wants_bel: int32, fresh_bel: int32) {
+  var g: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var reach: int64 = (int64)q.reach;
+  var time: int64 = (int64)q.time;
+  var total: int64 = (int64)q.batch * time * marks;
+  while (g < total) {
+    var m: int64 = g % marks;
+    var i: int64 = g / marks;
+    var live: bool = i % time < m * (int64)q.stride;
+    var lend: float32 = bid[i];
+    var gain: float32 = z32();
+    for o: int64 in 0..reach {
+      var a: int64 = (int64)q.plain[i * reach + o];
+      var slope: float32 = z32();
+      if (live && a < letters) { slope = -(hk[g * letters + a] + fk[g * letters + a]); }
+      var at: int64 = g * reach + o;
+      gain = gain + bel[at] * slope;
+      if (wants_bel != 0) {
+        if (fresh_bel != 0) { dbel[at] = slope * lend; } else { dbel[at] = dbel[at] + slope * lend; }
+      }
+    }
+    part[g] = gain;
+    g = g + step;
+  }
+}
+
+kernel(block = 256) k_solve_beliefs(out: float32*, lift: float32*, spot: float32*, q: Solve, lifted: int32) {
+  var g: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var marks: int64 = (int64)q.marks;
+  var reach: int64 = (int64)q.reach;
+  var time: int64 = (int64)q.time;
+  var total: int64 = (int64)q.batch * time * marks;
+  while (g < total) {
+    var m: int64 = g % marks;
+    var i: int64 = g / marks;
+    var base: int64 = g * reach;
+    if (m < (i % time) / (int64)q.stride) {
+      for o: int64 in 0..reach { out[base + o] = z32(); }
+    } else {
+      var best: float32 = (float32)-3.0e38;
+      for o: int64 in 0..reach {
+        var v: float32 = spot[i * reach + o];
+        if (lifted != 0) { v = v + lift[base + o]; }
+        if (v > best) { best = v; }
+      }
+      var sum: float32 = z32();
+      for o: int64 in 0..reach {
+        var v: float32 = spot[i * reach + o];
+        if (lifted != 0) { v = v + lift[base + o]; }
+        sum = sum + expf(v - best);
+      }
+      var inv: float32 = one32() / sum;
+      for o: int64 in 0..reach {
+        var v: float32 = spot[i * reach + o];
+        if (lifted != 0) { v = v + lift[base + o]; }
+        out[base + o] = expf(v - best) * inv;
+      }
+    }
+    g = g + step;
+  }
+}
+
+kernel(block = 256) k_solve_beliefs_back(zs: float32*, dlift: float32*, dy: float32*, y: float32*, q: Solve, wants_lift: int32, fresh_lift: int32) {
+  var g: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var reach: int64 = (int64)q.reach;
+  var total: int64 = (int64)q.batch * (int64)q.time * (int64)q.marks;
+  while (g < total) {
+    var base: int64 = g * reach;
+    var dot: float32 = z32();
+    for o: int64 in 0..reach { dot = dot + dy[base + o] * y[base + o]; }
+    for o: int64 in 0..reach {
+      var z: float32 = y[base + o] * (dy[base + o] - dot);
+      zs[base + o] = z;
+      if (wants_lift != 0) {
+        if (fresh_lift != 0) { dlift[base + o] = z; } else { dlift[base + o] = dlift[base + o] + z; }
+      }
+    }
+    g = g + step;
+  }
+}
+
+kernel(block = 256) k_solve_beliefs_spot(dspot: float32*, zs: float32*, q: Solve, fresh: int32) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var marks: int64 = (int64)q.marks;
+  var reach: int64 = (int64)q.reach;
+  var total: int64 = (int64)q.batch * (int64)q.time * reach;
+  while (e < total) {
+    var o: int64 = e % reach;
+    var i: int64 = e / reach;
+    var sum: float32 = z32();
+    for m: int64 in 0..marks { sum = sum + zs[(i * marks + m) * reach + o]; }
+    if (fresh != 0) { dspot[e] = sum; } else { dspot[e] = dspot[e] + sum; }
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_solve_lone(keys: float32*, mine: float32*, bid: float32*, q: Solve) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var reach: int64 = (int64)q.reach;
+  var rows: int64 = (int64)q.batch * (int64)q.time;
+  while (i < rows) {
+    var row: float32* = keys + i * letters;
+    var lend: float32 = bid[i];
+    for a: int64 in 0..letters { row[a] = z32(); }
+    for o: int64 in 0..reach {
+      var a: int64 = (int64)q.plain[i * reach + o];
+      if (a < letters) { row[a] = row[a] + mine[i * reach + o] * lend; }
+    }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_solve_tables(out: float32*, table: float32*, keys: float32*, q: Solve) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var time: int64 = (int64)q.time;
+  var none: int32 = q.batch * q.letters;
+  var total: int64 = (int64)q.batch * time * letters;
+  while (e < total) {
+    var a: int64 = e % letters;
+    var i: int64 = e / letters;
+    var r: int64 = i / time;
+    var pos: int64 = i - r * time;
+    var m: int64 = pos / (int64)q.stride;
+    var dst: float32* = out + i * letters * letters + a;
+    var src: float32* = table + (r * (letters + 1) * marks + m) * letters + a;
+    for c: int64 in 0..letters { dst[c * letters] = src[c * marks * letters]; }
+    for j: int64 in m * (int64)q.stride..pos {
+      var row: int64 = r * time + j;
+      var cls: int32 = q.sorts[row];
+      if (cls != none) {
+        var c: int64 = (int64)cls - r * letters;
+        dst[c * letters] = dst[c * letters] + keys[row * letters + a];
+      }
+    }
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_solve_tables_table(dt: float32*, dy: float32*, q: Solve, fresh: int32) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var marks: int64 = (int64)q.marks;
+  var time: int64 = (int64)q.time;
+  var stride: int64 = (int64)q.stride;
+  var total: int64 = (int64)q.batch * (letters + 1) * marks * letters;
+  while (e < total) {
+    var a: int64 = e % letters;
+    var e1: int64 = e / letters;
+    var m: int64 = e1 % marks;
+    var e2: int64 = e1 / marks;
+    var c: int64 = e2 % (letters + 1);
+    var r: int64 = e2 / (letters + 1);
+    var sum: float32 = z32();
+    if (c < letters) {
+      for j: int64 in 0..stride { sum = sum + dy[((r * time + m * stride + j) * letters + c) * letters + a]; }
+    }
+    if (fresh != 0) { dt[e] = sum; } else { dt[e] = dt[e] + sum; }
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_solve_tables_mine(dmine: float32*, dbid: float32*, dy: float32*, mine: float32*, bid: float32*, q: Solve, wants_mine: int32, fresh_mine: int32, wants_bid: int32, fresh_bid: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var letters: int64 = (int64)q.letters;
+  var reach: int64 = (int64)q.reach;
+  var time: int64 = (int64)q.time;
+  var stride: int64 = (int64)q.stride;
+  var none: int32 = q.batch * q.letters;
+  var rows: int64 = (int64)q.batch * time;
+  while (i < rows) {
+    var r: int64 = i / time;
+    var pos: int64 = i - r * time;
+    var cls: int32 = q.sorts[i];
+    var c: int64 = (int64)cls - r * letters;
+    var end: int64 = (pos / stride + 1) * stride;
+    var lend: float32 = bid[i];
+    var gain: float32 = z32();
+    for o: int64 in 0..reach {
+      var a: int64 = (int64)q.plain[i * reach + o];
+      var slope: float32 = z32();
+      if (cls != none && a < letters) {
+        for later: int64 in pos + 1..end { slope = slope + dy[((r * time + later) * letters + c) * letters + a]; }
+      }
+      gain = gain + mine[i * reach + o] * slope;
+      if (wants_mine != 0) {
+        if (fresh_mine != 0) { dmine[i * reach + o] = slope * lend; } else { dmine[i * reach + o] = dmine[i * reach + o] + slope * lend; }
+      }
+    }
+    if (wants_bid != 0) {
+      if (fresh_bid != 0) { dbid[i] = gain; } else { dbid[i] = dbid[i] + gain; }
+    }
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_solve_guess(out: float32*, tables: float32*, mine: float32*, terms: float32*, q: Solve) {
+  workgroup var sums: float32[FUSED_EDGE];
+  workgroup var wm: float32[FUSED_EDGE];
+  var t: int32 = thread.x;
+  var i: int64 = (int64)block.x;
+  var letters: int32 = q.letters;
+  var reach: int32 = q.reach;
+  var vocab: int32 = q.vocab;
+  var r: int64 = i / (int64)q.time;
+  var doubt: float32 = terms[1];
+  var tab: float32* = tables + i * (int64)(letters * letters);
+  var keys: int32* = q.plain + i * (int64)reach;
+  var syms: int32* = q.syms + r * (int64)letters;
+  if (t < letters) {
+    var total: float32 = z32();
+    for c in 0..letters {
+      if (syms[c] >= 0) { total = total + tab[c * letters + t]; }
+    }
+    sums[t] = total;
+  }
+  barrier(workgroup, acq_rel);
+  if (t < reach) {
+    var a: int32 = keys[t];
+    var total: float32 = z32();
+    if (a < letters) { total = sums[a]; }
+    wm[t] = mine[i * (int64)reach + (int64)t] / (total + doubt);
+  }
+  barrier(workgroup, acq_rel);
+  var o1: float32* = out + i * (int64)(2 * vocab);
+  var s: int32 = t;
+  while (s < vocab) {
+    var c: int32 = q.slots[r * (int64)vocab + (int64)s];
+    var even: float32 = doubt * q.spread[r * (int64)vocab + (int64)s];
+    var plainly: float32 = z32();
+    var guessed: float32 = z32();
+    for o in 0..reach {
+      var a: int32 = keys[o];
+      var v: float32 = z32();
+      if (c >= 0 && a < letters) { v = tab[c * letters + a]; }
+      plainly = plainly + wm[o] * v;
+      guessed = guessed + wm[o] * (v + even);
+    }
+    o1[s] = plainly;
+    o1[vocab + s] = guessed;
+    s = s + 256;
+  }
+}
+
+kernel(block = 256) k_solve_guess_back(dtab: float32*, dmine: float32*, dd: float32*, dy: float32*, tables: float32*, mine: float32*, terms: float32*, q: Solve, fresh_tab: int32, fresh_mine: int32) {
+  workgroup var sums: float32[FUSED_EDGE];
+  workgroup var ec: float32[FUSED_EDGE];
+  workgroup var wm: float32[FUSED_EDGE];
+  workgroup var drop: float32[FUSED_EDGE];
+  workgroup var part: float32[FUSED_EDGE];
+  workgroup var lanes: float32[256];
+  var t: int32 = thread.x;
+  var i: int64 = (int64)block.x;
+  var letters: int32 = q.letters;
+  var reach: int32 = q.reach;
+  var vocab: int32 = q.vocab;
+  var r: int64 = i / (int64)q.time;
+  var doubt: float32 = terms[1];
+  var tab: float32* = tables + i * (int64)(letters * letters);
+  var keys: int32* = q.plain + i * (int64)reach;
+  var syms: int32* = q.syms + r * (int64)letters;
+  var d: float32* = dy + i * (int64)(2 * vocab);
+  if (t < letters) {
+    var total: float32 = z32();
+    for c in 0..letters {
+      if (syms[c] >= 0) { total = total + tab[c * letters + t]; }
+    }
+    sums[t] = total;
+    var both: float32 = z32();
+    if (syms[t] >= 0) { both = d[syms[t]] + d[vocab + syms[t]]; }
+    ec[t] = both;
+  }
+  var acc: float32 = z32();
+  var s: int32 = t;
+  while (s < vocab) {
+    acc = acc + d[vocab + s] * q.spread[r * (int64)vocab + (int64)s];
+    s = s + 256;
+  }
+  lanes[t] = acc;
+  barrier(workgroup, acq_rel);
+  var width: int32 = 128;
+  while (width > 0) {
+    if (t < width) { lanes[t] = lanes[t] + lanes[t + width]; }
+    barrier(workgroup, acq_rel);
+    width = width / 2;
+  }
+  var even: float32 = lanes[0] * doubt;
+  if (t < reach) {
+    var a: int32 = keys[t];
+    var total: float32 = z32();
+    var pull: float32 = even;
+    if (a < letters) {
+      total = sums[a];
+      for c in 0..letters {
+        if (syms[c] >= 0) { pull = pull + ec[c] * tab[c * letters + a]; }
+      }
+    }
+    var inv: float32 = one32() / (total + doubt);
+    var held: float32 = mine[i * (int64)reach + (int64)t];
+    wm[t] = held * inv;
+    drop[t] = held * pull * inv * inv;
+    part[t] = held * (lanes[0] * inv - pull * inv * inv);
+    var at: int64 = i * (int64)reach + (int64)t;
+    if (fresh_mine != 0) { dmine[at] = pull * inv; } else { dmine[at] = dmine[at] + pull * inv; }
+  }
+  barrier(workgroup, acq_rel);
+  if (t == 0) {
+    var total: float32 = z32();
+    for o in 0..reach { total = total + part[o]; }
+    dd[i] = total;
+  }
+  var gt: float32* = dtab + i * (int64)(letters * letters);
+  var e: int32 = t;
+  while (e < letters * letters) {
+    var c: int32 = e / letters;
+    var a: int32 = e - c * letters;
+    var sum: float32 = z32();
+    if (syms[c] >= 0) {
+      for o in 0..reach {
+        if (keys[o] == a) { sum = sum + wm[o] * ec[c] - drop[o]; }
+      }
+    }
+    if (fresh_tab != 0) { gt[e] = sum; } else { gt[e] = gt[e] + sum; }
+    e = e + 256;
+  }
+}
+
+kernel(block = 256) k_scale_by(out: float32*, x: float32*, s: float32*, n: int64, accumulate: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var by: float32 = s[0];
+  while (i < n) {
+    if (accumulate != 0) { out[i] = out[i] + x[i] * by; } else { out[i] = x[i] * by; }
+    i = i + step;
+  }
+}
+
+fn fwd_scale_by(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var size: int64 = n->value.shape.size();
+  dispatch k_scale_by[spread(s, size), 256](n->value.data, g->data(n->a), g->data(n->b), size, 0);
+}
+
+fn back_scale_by(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var size: int64 = n->value.shape.size();
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_scale_by[spread(s, size), 256](slot.data, n->grad, g->data(n->b), size, if slot.fresh { 0 } else { 1 });
+  }
+  if (g->nodes[n->b].requires) { sum_into(s, g->grad_of(n->b), n->grad, g->data(n->a), 4, size, (float32)1.0, true); }
+}
+
+fn fwd_solve_table(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var q: Solve = solve_of(p);
+  dispatch k_solve_keys[spread(s, p->rows * p->marks), 256](n->saved, g->data(n->a), g->data(n->b), q);
+  dispatch k_solve_table[spread(s, n->value.shape.size()), 256](n->value.data, n->saved, q);
+}
+
+fn back_solve_table(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var wants_bel: bool = g->nodes[n->a].requires;
+  var dbel: float32* = (float32*)0;
+  var fresh_bel: int32 = 0;
+  if (wants_bel) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dbel = slot.data;
+    fresh_bel = if slot.fresh { 1 } else { 0 };
+  }
+  var part: float32* = g->floats(p->rows * p->marks);
+  dispatch k_solve_table_back[spread(s, p->rows * p->marks), 256](dbel, part, n->grad, g->data(n->a), g->data(n->b), solve_of(p), if wants_bel { 1 } else { 0 }, fresh_bel);
+  if (g->nodes[n->b].requires) {
+    var slot: GradSlot = g->grad_take(n->b);
+    dispatch k_fold_marks[spread(s, p->rows), 256](slot.data, part, p->rows, p->marks, if slot.fresh { 1 } else { 0 });
+  }
+}
+
+fn fwd_solve_proof(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var q: Solve = solve_of(p);
+  if (n->i4 != 0) { dispatch k_solve_keys[spread(s, p->rows * p->marks), 256](n->saved, g->data(n->b), g->data(n->c), q); }
+  dispatch k_solve_proof[spread(s, n->value.shape.size()), 256](n->value.data, g->data(n->a), n->saved, g->data((int32)n->i5), q);
+}
+
+fn back_solve_proof(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var q: Solve = solve_of(p);
+  var groups: int64 = p->rows * p->marks;
+  var terms: int32 = (int32)n->i5;
+  var hk: float32* = g->floats(groups * p->letters);
+  var fk: float32* = g->floats(groups * p->letters);
+  var blocks: int32 = spread(s, groups);
+  var pu: float32* = g->floats(blocks);
+  var pd: float32* = g->floats(blocks);
+  dispatch k_solve_proof_back[blocks, 256](hk, fk, pu, pd, n->grad, g->data(n->a), n->saved, g->data(terms), q);
+  if (g->nodes[terms].requires) {
+    var dterms: float32* = g->grad_of(terms);
+    dispatch k_total[1, 256](pu, blocks, dterms, (float32)1.0, 1);
+    dispatch k_total[1, 256](pd, blocks, dterms + 1, (float32)1.0, 1);
+  }
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_solve_proof_table[spread(s, g->nodes[n->a].value.shape.size()), 256](slot.data, hk, fk, q, if slot.fresh { 1 } else { 0 });
+  }
+  var wants_bel: bool = g->nodes[n->b].requires;
+  var wants_bid: bool = g->nodes[n->c].requires;
+  if (!wants_bel && !wants_bid) { return; }
+  var dbel: float32* = (float32*)0;
+  var fresh_bel: int32 = 0;
+  if (wants_bel) {
+    var slot: GradSlot = g->grad_take(n->b);
+    dbel = slot.data;
+    fresh_bel = if slot.fresh { 1 } else { 0 };
+  }
+  var part: float32* = g->floats(groups);
+  dispatch k_solve_proof_own[spread(s, groups), 256](dbel, part, hk, fk, g->data(n->b), g->data(n->c), q, if wants_bel { 1 } else { 0 }, fresh_bel);
+  if (wants_bid) {
+    var slot: GradSlot = g->grad_take(n->c);
+    dispatch k_fold_marks[spread(s, p->rows), 256](slot.data, part, p->rows, p->marks, if slot.fresh { 1 } else { 0 });
+  }
+}
+
+fn fwd_solve_beliefs(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var lift: float32* = if n->a >= 0 { g->data(n->a) } else { (float32*)0 };
+  dispatch k_solve_beliefs[spread(s, p->rows * p->marks), 256](n->value.data, lift, g->data(n->b), solve_of(p), if n->a >= 0 { 1 } else { 0 });
+}
+
+fn back_solve_beliefs(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var q: Solve = solve_of(p);
+  var zs: float32* = g->floats(n->value.shape.size());
+  var wants_lift: bool = n->a >= 0 && g->nodes[n->a].requires;
+  var dlift: float32* = (float32*)0;
+  var fresh_lift: int32 = 0;
+  if (wants_lift) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dlift = slot.data;
+    fresh_lift = if slot.fresh { 1 } else { 0 };
+  }
+  dispatch k_solve_beliefs_back[spread(s, p->rows * p->marks), 256](zs, dlift, n->grad, n->value.data, q, if wants_lift { 1 } else { 0 }, fresh_lift);
+  if (g->nodes[n->b].requires) {
+    var slot: GradSlot = g->grad_take(n->b);
+    dispatch k_solve_beliefs_spot[spread(s, p->rows * p->reach), 256](slot.data, zs, q, if slot.fresh { 1 } else { 0 });
+  }
+}
+
+fn fwd_solve_tables(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var q: Solve = solve_of(p);
+  var keys: float32* = g->floats(p->rows * p->letters);
+  dispatch k_solve_lone[spread(s, p->rows), 256](keys, g->data(n->b), g->data(n->c), q);
+  dispatch k_solve_tables[spread(s, p->rows * p->letters), 256](n->value.data, g->data(n->a), keys, q);
+}
+
+fn back_solve_tables(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var q: Solve = solve_of(p);
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_solve_tables_table[spread(s, g->nodes[n->a].value.shape.size()), 256](slot.data, n->grad, q, if slot.fresh { 1 } else { 0 });
+  }
+  var wants_mine: bool = g->nodes[n->b].requires;
+  var wants_bid: bool = g->nodes[n->c].requires;
+  if (!wants_mine && !wants_bid) { return; }
+  var dmine: float32* = (float32*)0;
+  var dbid: float32* = (float32*)0;
+  var fresh_mine: int32 = 0;
+  var fresh_bid: int32 = 0;
+  if (wants_mine) {
+    var slot: GradSlot = g->grad_take(n->b);
+    dmine = slot.data;
+    fresh_mine = if slot.fresh { 1 } else { 0 };
+  }
+  if (wants_bid) {
+    var slot: GradSlot = g->grad_take(n->c);
+    dbid = slot.data;
+    fresh_bid = if slot.fresh { 1 } else { 0 };
+  }
+  dispatch k_solve_tables_mine[spread(s, p->rows), 256](dmine, dbid, n->grad, g->data(n->b), g->data(n->c), q, if wants_mine { 1 } else { 0 }, fresh_mine, if wants_bid { 1 } else { 0 }, fresh_bid);
+}
+
+fn fwd_solve_guess(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  dispatch k_solve_guess[(int32)p->rows, 256](n->value.data, g->data(n->a), g->data(n->b), g->data(n->c), solve_of(p));
+}
+
+fn back_solve_guess(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: SolvePlan* = (SolvePlan*)n->ext;
+  var dtab: float32* = g->floats(p->rows * p->letters * p->letters);
+  var dmine: float32* = g->floats(p->rows * p->reach);
+  var fresh_tab: int32 = 1;
+  var fresh_mine: int32 = 1;
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dtab = slot.data;
+    fresh_tab = if slot.fresh { 1 } else { 0 };
+  }
+  if (g->nodes[n->b].requires) {
+    var slot: GradSlot = g->grad_take(n->b);
+    dmine = slot.data;
+    fresh_mine = if slot.fresh { 1 } else { 0 };
+  }
+  var dd: float32* = g->floats(p->rows);
+  dispatch k_solve_guess_back[(int32)p->rows, 256](dtab, dmine, dd, n->grad, g->data(n->a), g->data(n->b), g->data(n->c), solve_of(p), fresh_tab, fresh_mine);
+  if (g->nodes[n->c].requires) { sum_into(s, g->grad_of(n->c) + 1, dd, (float32*)0, 0, p->rows, (float32)1.0, true); }
+}
+
+struct Round {
+  slots: int32*;
+  syms: int32*;
+  nexts: int32*;
+  targets: int32*;
+  at: int32*;
+  spread: float32*;
+  batch: int32;
+  time: int32;
+  vocab: int32;
+  side: int32;
+  experts: int32;
+  counted: int32;
+  coach: float32;
+  slack: float32;
+}
+
+fn round_of(n: Node*) -> Round {
+  var p: RoundPlan* = (RoundPlan*)n->ext;
+  var counted: int64 = if p->counted < 1 { 1 } else { p->counted };
+  var q: Round = { slots: p->dslots, syms: p->dsyms, nexts: p->dnexts, targets: p->dtargets, at: n->ints, spread: p->dspread, batch: (int32)p->batch, time: (int32)p->time, vocab: (int32)p->vocab, side: (int32)(p->letters + 1), experts: (int32)p->experts, counted: (int32)counted, coach: (float32)p->coach, slack: (float32)p->slack };
+  return q;
+}
+
+kernel(block = 256) k_round_reply(keep: float32*, vecs: float32*, q: Round) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var side: int64 = (int64)q.side;
+  var letters: int64 = side - 1;
+  var vocab: int64 = (int64)q.vocab;
+  var rows: int64 = (int64)q.batch * (int64)q.time;
+  while (i < rows) {
+    var r: int64 = i / (int64)q.time;
+    var vec: float32* = vecs + i * side;
+    var slots: int32* = q.slots + r * vocab;
+    var syms: int32* = q.syms + r * letters;
+    var total: float32 = z32();
+    for c: int64 in 0..letters {
+      if (syms[c] >= 0) { total = total + vec[c]; }
+    }
+    var spare: float32 = one32() - total;
+    for s: int64 in 0..vocab {
+      var c: int32 = slots[s];
+      var v: float32 = spare * q.spread[r * vocab + s];
+      if (c >= 0) { v = v + vec[c]; }
+      keep[i * vocab + s] = v;
+    }
+    var nx: int32 = q.nexts[i];
+    var fit: float32 = z32();
+    if (nx >= 0) { fit = logf(keep[i * vocab + (int64)nx] + (float32)0.02); }
+    keep[rows * vocab + i] = total;
+    keep[rows * vocab + rows + i] = fit;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_round_mix(losses: float32*, keep: float32*, base: float32*, floor: float32*, lean: float32*, king: float32*, heed: float32*, q: Round) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var time: int64 = (int64)q.time;
+  var vocab: int64 = (int64)q.vocab;
+  var rest: int64 = (int64)q.experts - 1;
+  var rows: int64 = (int64)q.batch * time;
+  var tots: float32* = keep + rows * vocab;
+  var fits: float32* = tots + rows;
+  var zs: float32* = fits + rows;
+  var shares: float32* = zs + rows * 2;
+  var eps: float32 = (float32)1.0e-6;
+  while (i < rows) {
+    var r: int64 = i / time;
+    var score: float32 = z32();
+    for j: int64 in 0..time { score = score + king[i * time + j] * fits[r * time + j]; }
+    var total: float32 = tots[i];
+    var last: float32 = lean[i] + score + (logf(total + q.slack) - logf(one32() - total + q.slack)) * heed[0];
+    var best: float32 = last;
+    for x: int64 in 0..rest {
+      if (floor[i * rest + x] > best) { best = floor[i * rest + x]; }
+    }
+    var denom: float32 = expf(last - best);
+    for x: int64 in 0..rest { denom = denom + expf(floor[i * rest + x] - best); }
+    var share: float32* = shares + i * (rest + 1);
+    for x: int64 in 0..rest { share[x] = expf(floor[i * rest + x] - best) / denom; }
+    share[rest] = expf(last - best) / denom;
+    var goal: int64 = (int64)q.targets[i];
+    var z: float32 = z32();
+    var zc: float32 = z32();
+    var hit: float32 = z32();
+    var hitc: float32 = z32();
+    for s: int64 in 0..vocab {
+      var rp: float32 = keep[i * vocab + s];
+      var od: float32 = share[rest] * rp;
+      for x: int64 in 0..rest { od = od + share[x] * base[(i * rest + x) * vocab + s]; }
+      z = z + od + eps;
+      zc = zc + rp + eps;
+      if (s == goal) {
+        hit = od;
+        hitc = rp;
+      }
+    }
+    zs[i * 2] = z;
+    zs[i * 2 + 1] = zc;
+    var loss: float32 = z32();
+    if (goal >= 0) { loss = logf(z) - logf(hit + eps) + q.coach * (logf(zc) - logf(hitc + eps)); }
+    losses[i] = loss;
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_round_mix_back(dbase: float32*, dfloor: float32*, dlean: float32*, dsh: float32*, dr: float32*, dzs: float32*, dtot: float32*, dheed: float32*, dloss: float32*, keep: float32*, base: float32*, heed: float32*, q: Round, mode: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var time: int64 = (int64)q.time;
+  var vocab: int64 = (int64)q.vocab;
+  var rest: int64 = (int64)q.experts - 1;
+  var rows: int64 = (int64)q.batch * time;
+  var tots: float32* = keep + rows * vocab;
+  var zs: float32* = tots + rows * 2;
+  var shares: float32* = zs + rows * 2;
+  var eps: float32 = (float32)1.0e-6;
+  var wants_base: bool = (mode & 1) != 0;
+  var fresh_base: bool = (mode & 2) != 0;
+  var wants_floor: bool = (mode & 4) != 0;
+  var fresh_floor: bool = (mode & 8) != 0;
+  var wants_lean: bool = (mode & 16) != 0;
+  var fresh_lean: bool = (mode & 32) != 0;
+  while (i < rows) {
+    var goal: int64 = (int64)q.targets[i];
+    var scale: float32 = z32();
+    if (goal >= 0) { scale = dloss[0] / (float32)q.counted; }
+    var share: float32* = shares + i * (rest + 1);
+    var slope: float32* = dsh + i * (rest + 1);
+    for x: int64 in 0..rest + 1 { slope[x] = z32(); }
+    for s: int64 in 0..vocab {
+      var rp: float32 = keep[i * vocab + s];
+      var od: float32 = share[rest] * rp;
+      for x: int64 in 0..rest { od = od + share[x] * base[(i * rest + x) * vocab + s]; }
+      var dod: float32 = scale / zs[i * 2];
+      var drc: float32 = scale * q.coach / zs[i * 2 + 1];
+      if (s == goal) {
+        dod = dod - scale / (od + eps);
+        drc = drc - scale * q.coach / (rp + eps);
+      }
+      for x: int64 in 0..rest {
+        var at: int64 = (i * rest + x) * vocab + s;
+        slope[x] = slope[x] + dod * base[at];
+        if (wants_base) {
+          if (fresh_base) { dbase[at] = share[x] * dod; } else { dbase[at] = dbase[at] + share[x] * dod; }
+        }
+      }
+      slope[rest] = slope[rest] + dod * rp;
+      dr[i * vocab + s] = share[rest] * dod + drc;
+    }
+    var dot: float32 = z32();
+    for x: int64 in 0..rest + 1 { dot = dot + slope[x] * share[x]; }
+    if (wants_floor) {
+      for x: int64 in 0..rest {
+        var v: float32 = share[x] * (slope[x] - dot);
+        if (fresh_floor) { dfloor[i * rest + x] = v; } else { dfloor[i * rest + x] = dfloor[i * rest + x] + v; }
+      }
+    }
+    var dz: float32 = share[rest] * (slope[rest] - dot);
+    if (wants_lean) {
+      if (fresh_lean) { dlean[i] = dz; } else { dlean[i] = dlean[i] + dz; }
+    }
+    dzs[i] = dz;
+    var total: float32 = tots[i];
+    dheed[i] = dz * (logf(total + q.slack) - logf(one32() - total + q.slack));
+    dtot[i] = dz * heed[0] * (one32() / (total + q.slack) + one32() / (one32() - total + q.slack));
+    i = i + step;
+  }
+}
+
+kernel(block = 256) k_round_king(dking: float32*, dzs: float32*, keep: float32*, q: Round, fresh: int32) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  var time: int64 = (int64)q.time;
+  var rows: int64 = (int64)q.batch * time;
+  var fits: float32* = keep + rows * (int64)q.vocab + rows;
+  while (e < rows * time) {
+    var i: int64 = e / time;
+    var j: int64 = e - i * time;
+    var v: float32 = dzs[i] * fits[(i / time) * time + j];
+    if (fresh != 0) { dking[e] = v; } else { dking[e] = dking[e] + v; }
+    e = e + step;
+  }
+}
+
+fn fwd_round(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: RoundPlan* = (RoundPlan*)n->ext;
+  var q: Round = round_of(n);
+  var side: int64 = p->letters + 1;
+  var vecs: float32* = g->floats(p->rows * side);
+  dispatch k_round_vec[spread(s, p->rows * side), 256](vecs, g->data(n->a), g->data(n->b), q);
+  dispatch k_round_reply[spread(s, p->rows), 256](n->saved, vecs, q);
+  var losses: float32* = g->floats(p->rows);
+  dispatch k_round_mix[spread(s, p->rows), 256](losses, n->saved, g->data(n->c), g->data((int32)n->i0), g->data((int32)n->i1), g->data((int32)n->i2), g->data((int32)n->i3), q);
+  sum_into(s, n->value.data, losses, (float32*)0, 0, p->rows, (float32)(1.0 / (float64)q.counted), false);
+}
+
+fn back_round(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var p: RoundPlan* = (RoundPlan*)n->ext;
+  var q: Round = round_of(n);
+  var rows: int64 = p->rows;
+  var side: int64 = p->letters + 1;
+  var floor: int32 = (int32)n->i0;
+  var lean: int32 = (int32)n->i1;
+  var king: int32 = (int32)n->i2;
+  var heed: int32 = (int32)n->i3;
+  var dsh: float32* = g->floats(rows * p->experts);
+  var dr: float32* = g->floats(rows * p->vocab);
+  var dzs: float32* = g->floats(rows);
+  var dtot: float32* = g->floats(rows);
+  var dheed: float32* = g->floats(rows);
+  var dv: float32* = g->floats(rows * side);
+  var dbase: float32* = (float32*)0;
+  var dfloor: float32* = (float32*)0;
+  var dlean: float32* = (float32*)0;
+  var mode: int32 = 0;
+  if (g->nodes[n->c].requires) {
+    var slot: GradSlot = g->grad_take(n->c);
+    dbase = slot.data;
+    mode = mode | 1 | (if slot.fresh { 2 } else { 0 });
+  }
+  if (g->nodes[floor].requires) {
+    var slot: GradSlot = g->grad_take(floor);
+    dfloor = slot.data;
+    mode = mode | 4 | (if slot.fresh { 8 } else { 0 });
+  }
+  if (g->nodes[lean].requires) {
+    var slot: GradSlot = g->grad_take(lean);
+    dlean = slot.data;
+    mode = mode | 16 | (if slot.fresh { 32 } else { 0 });
+  }
+  dispatch k_round_mix_back[spread(s, rows), 256](dbase, dfloor, dlean, dsh, dr, dzs, dtot, dheed, n->grad, n->saved, g->data(n->c), g->data(heed), q, mode);
+  if (g->nodes[king].requires) {
+    var slot: GradSlot = g->grad_take(king);
+    dispatch k_round_king[spread(s, rows * p->time), 256](slot.data, dzs, n->saved, q, if slot.fresh { 1 } else { 0 });
+  }
+  dispatch k_round_slopes[spread(s, rows), 256](dv, dr, dzs, dtot, n->saved, g->data(king), q);
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_round_rules_back[spread(s, rows * side * side), 256](slot.data, dv, g->data(n->b), q, if slot.fresh { 1 } else { 0 });
+  }
+  if (g->nodes[n->b].requires) {
+    var dfar: float32* = g->floats(rows * side);
+    dispatch k_round_far[spread(s, rows * side), 256](dfar, g->data(n->a), dv, q);
+    var order: int32* = (int32*)n->i4;
+    dispatch k_scatter[spread(s, rows * side), 256](g->grad_of(n->b), dfar, order, order + rows, rows, side);
+  }
+  if (g->nodes[heed].requires) { sum_into(s, g->grad_of(heed), dheed, (float32*)0, 0, rows, (float32)1.0, true); }
+}
+
+struct Anchor {
+  rows: int64;
+  time: int64;
+  reach: int64;
+  side: int64;
+}
+
+kernel(block = 256) k_anchor(out: float32*, resting: float32*, rests: float32*, looks: float32*, q: Anchor) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (e < q.rows * q.side) {
+    var i: int64 = e / q.side;
+    var s: int64 = e - i * q.side;
+    var pos: int64 = i % q.time;
+    var sum: float32 = z32();
+    for o: int64 in 0..q.reach {
+      var src: int64 = if pos > o { i - o - 1 } else { i };
+      sum = sum + looks[i * q.reach + o] * resting[src * q.side + s];
+    }
+    var held: float32 = rests[i];
+    out[e] = held * resting[e] + (one32() - held) * sum;
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_anchor_resting(dresting: float32*, dy: float32*, rests: float32*, looks: float32*, q: Anchor, fresh: int32) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (e < q.rows * q.side) {
+    var j: int64 = e / q.side;
+    var s: int64 = e - j * q.side;
+    var pos: int64 = j % q.time;
+    var tail: float32 = z32();
+    for o: int64 in pos..q.reach { tail = tail + looks[j * q.reach + o]; }
+    var held: float32 = rests[j];
+    var v: float32 = dy[e] * (held + (one32() - held) * tail);
+    for o: int64 in 0..q.reach {
+      if (pos + o + 1 < q.time) {
+        var i: int64 = j + o + 1;
+        v = v + (one32() - rests[i]) * looks[i * q.reach + o] * dy[i * q.side + s];
+      }
+    }
+    if (fresh != 0) { dresting[e] = v; } else { dresting[e] = dresting[e] + v; }
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_anchor_looks(dlooks: float32*, part: float32*, dy: float32*, resting: float32*, rests: float32*, looks: float32*, q: Anchor, wants: int32, fresh: int32) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (e < q.rows * q.reach) {
+    var i: int64 = e / q.reach;
+    var o: int64 = e - i * q.reach;
+    var src: int64 = if i % q.time > o { i - o - 1 } else { i };
+    var dot: float32 = z32();
+    for s: int64 in 0..q.side { dot = dot + dy[i * q.side + s] * resting[src * q.side + s]; }
+    part[e] = looks[e] * dot;
+    if (wants != 0) {
+      var v: float32 = (one32() - rests[i]) * dot;
+      if (fresh != 0) { dlooks[e] = v; } else { dlooks[e] = dlooks[e] + v; }
+    }
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_anchor_rests(drests: float32*, part: float32*, dy: float32*, resting: float32*, q: Anchor, fresh: int32) {
+  var i: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (i < q.rows) {
+    var v: float32 = z32();
+    for s: int64 in 0..q.side { v = v + dy[i * q.side + s] * resting[i * q.side + s]; }
+    for o: int64 in 0..q.reach { v = v - part[i * q.reach + o]; }
+    if (fresh != 0) { drests[i] = v; } else { drests[i] = drests[i] + v; }
+    i = i + step;
+  }
+}
+
+fn anchor_of(g: Graph*, n: Node*) -> Anchor {
+  var sh: Shape = n->value.shape;
+  var q: Anchor = { rows: sh.dims[0], time: n->i0, reach: g->nodes[n->c].value.shape.size() / sh.dims[0], side: sh.dims[1] };
+  return q;
+}
+
+fn fwd_anchor(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var q: Anchor = anchor_of(g, n);
+  dispatch k_anchor[spread(s, q.rows * q.side), 256](n->value.data, g->data(n->a), g->data(n->b), g->data(n->c), q);
+}
+
+fn back_anchor(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var q: Anchor = anchor_of(g, n);
+  if (g->nodes[n->a].requires) {
+    var slot: GradSlot = g->grad_take(n->a);
+    dispatch k_anchor_resting[spread(s, q.rows * q.side), 256](slot.data, n->grad, g->data(n->b), g->data(n->c), q, if slot.fresh { 1 } else { 0 });
+  }
+  var wants_rests: bool = g->nodes[n->b].requires;
+  var wants_looks: bool = g->nodes[n->c].requires;
+  if (!wants_rests && !wants_looks) { return; }
+  var part: float32* = g->floats(q.rows * q.reach);
+  var dlooks: float32* = (float32*)0;
+  var fresh: int32 = 0;
+  if (wants_looks) {
+    var slot: GradSlot = g->grad_take(n->c);
+    dlooks = slot.data;
+    fresh = if slot.fresh { 1 } else { 0 };
+  }
+  dispatch k_anchor_looks[spread(s, q.rows * q.reach), 256](dlooks, part, n->grad, g->data(n->a), g->data(n->b), g->data(n->c), q, if wants_looks { 1 } else { 0 }, fresh);
+  if (wants_rests) {
+    var slot: GradSlot = g->grad_take(n->b);
+    dispatch k_anchor_rests[spread(s, q.rows), 256](slot.data, part, n->grad, g->data(n->a), q, if slot.fresh { 1 } else { 0 });
+  }
+}
+
+struct Tally {
+  cells: int64;
+  sample: int64;
+  vocab: int64;
+}
+
+kernel(block = 256) k_tally(out: float32*, picks: int32*, q: Tally) {
+  var c: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (c < q.cells) {
+    var row: float32* = out + c * q.vocab;
+    for v: int64 in 0..q.vocab { row[v] = z32(); }
+    var n: int64 = 0;
+    for j: int64 in 0..q.sample {
+      if (picks[c * q.sample + j] >= 0) { n = n + 1; }
+    }
+    if (n > 0) {
+      var each: float32 = one32() / (float32)n;
+      for j: int64 in 0..q.sample {
+        var p: int64 = (int64)picks[c * q.sample + j];
+        if (p >= 0) { row[p] = row[p] + each; }
+      }
+    }
+    c = c + step;
+  }
+}
+
+fn fwd_tally(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var q: Tally = { cells: n->value.shape.rows(), sample: n->i0, vocab: n->value.shape.last() };
+  dispatch k_tally[spread(s, q.cells), 256](n->value.data, n->ints, q);
+}
+
+struct Pick {
+  cells: int64;
+  group: int64;
+  vocab: int64;
+}
+
+kernel(block = 256) k_pick(out: float32*, x: float32*, ids: int32*, q: Pick) {
+  var c: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (c < q.cells) {
+    var id: int64 = (int64)ids[c / q.group];
+    out[c] = if id >= 0 { x[c * q.vocab + id] } else { z32() };
+    c = c + step;
+  }
+}
+
+kernel(block = 256) k_pick_fill(dx: float32*, dy: float32*, ids: int32*, q: Pick) {
+  var e: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (e < q.cells * q.vocab) {
+    var c: int64 = e / q.vocab;
+    var id: int64 = (int64)ids[c / q.group];
+    dx[e] = if e - c * q.vocab == id { dy[c] } else { z32() };
+    e = e + step;
+  }
+}
+
+kernel(block = 256) k_pick_add(dx: float32*, dy: float32*, ids: int32*, q: Pick) {
+  var c: int64 = (int64)block.x * 256 + (int64)thread.x;
+  var step: int64 = (int64)grid_dim.x * 256;
+  while (c < q.cells) {
+    var id: int64 = (int64)ids[c / q.group];
+    if (id >= 0) { dx[c * q.vocab + id] = dx[c * q.vocab + id] + dy[c]; }
+    c = c + step;
+  }
+}
+
+fn pick_of(g: Graph*, n: Node*) -> Pick {
+  var q: Pick = { cells: n->value.shape.size(), group: n->i0, vocab: g->nodes[n->a].value.shape.last() };
+  return q;
+}
+
+fn fwd_pick(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  var q: Pick = pick_of(g, n);
+  dispatch k_pick[spread(s, q.cells), 256](n->value.data, g->data(n->a), n->ints, q);
+}
+
+fn back_pick(s: GpuState*, g: Graph*, id: int32) {
+  var n: Node* = g->node(id);
+  if (!g->nodes[n->a].requires) { return; }
+  var q: Pick = pick_of(g, n);
+  var slot: GradSlot = g->grad_take(n->a);
+  if (slot.fresh) {
+    dispatch k_pick_fill[spread(s, q.cells * q.vocab), 256](slot.data, n->grad, n->ints, q);
+  } else {
+    dispatch k_pick_add[spread(s, q.cells), 256](slot.data, n->grad, n->ints, q);
+  }
+}
+
 fn gpu_forward(state: rawptr, g: Graph*, id: int32) {
   var s: GpuState* = state_of(state);
   var op: int32 = g->nodes[id].op;
@@ -3495,8 +7715,35 @@ fn gpu_forward(state: rawptr, g: Graph*, id: int32) {
   if (op == OP_LAYER_NORM || op == OP_RMS_NORM) { fwd_norm(s, g, id); return; }
   if (op == OP_DROPOUT) { fwd_dropout(s, g, id); return; }
   if (op == OP_GATHER_ROWS) { fwd_gather(s, g, id); return; }
+  if (op == OP_FOLD) { fwd_fold(s, g, id); return; }
+  if (op == OP_TAKE) { fwd_take(s, g, id); return; }
+  if (op == OP_SPREAD) { fwd_spread(s, g, id); return; }
   if (op == OP_ATTENTION) { fwd_attention(s, g, id); return; }
   if (op == OP_CACHED_ATTENTION) { fwd_cached_attention(s, g, id); return; }
+  if (op == OP_RECALL) { fwd_recall(s, g, id); return; }
+  if (op == OP_RECALL_EXACT) { fwd_exact(s, g, id); return; }
+  if (op == OP_MINGLE) { fwd_mingle(s, g, id); return; }
+  if (op == OP_PONDER) { fwd_ponder(s, g, id); return; }
+  if (op == OP_PONDER_SUM) { fwd_ponder_sum(s, g, id); return; }
+  if (op == OP_FORESEE) { fwd_foresee(s, g, id); return; }
+  if (op == OP_CONSULT) { fwd_consult(s, g, id); return; }
+  if (op == OP_ADD_MUL) { fwd_add_mul(s, g, id); return; }
+  if (op == OP_RESIDUAL) { fwd_residual(s, g, id); return; }
+  if (op == OP_FEED) { fwd_feed(s, g, id); return; }
+  if (op == OP_PAIR) { fwd_pair(s, g, id); return; }
+  if (op == OP_MIX) { fwd_mix(s, g, id); return; }
+  if (op == OP_JOIN) { fwd_join(s, g, id); return; }
+  if (op == OP_RULES) { fwd_rules(s, g, id); return; }
+  if (op == OP_ROUND) { fwd_round(s, g, id); return; }
+  if (op == OP_SCALE_BY) { fwd_scale_by(s, g, id); return; }
+  if (op == OP_ANCHOR) { fwd_anchor(s, g, id); return; }
+  if (op == OP_TALLY) { fwd_tally(s, g, id); return; }
+  if (op == OP_PICK) { fwd_pick(s, g, id); return; }
+  if (op == OP_SOLVE_TABLE) { fwd_solve_table(s, g, id); return; }
+  if (op == OP_SOLVE_PROOF) { fwd_solve_proof(s, g, id); return; }
+  if (op == OP_SOLVE_BELIEFS) { fwd_solve_beliefs(s, g, id); return; }
+  if (op == OP_SOLVE_TABLES) { fwd_solve_tables(s, g, id); return; }
+  if (op == OP_SOLVE_GUESS) { fwd_solve_guess(s, g, id); return; }
   if (op == OP_QK_ROPE) {
     var n: Node* = g->node(id);
     var sh: Shape = n->value.shape;
@@ -3529,7 +7776,33 @@ fn gpu_backward(state: rawptr, g: Graph*, id: int32) {
   if (op == OP_LAYER_NORM || op == OP_RMS_NORM) { back_norm(s, g, id); return; }
   if (op == OP_DROPOUT) { back_dropout(s, g, id); return; }
   if (op == OP_GATHER_ROWS) { back_gather(s, g, id); return; }
+  if (op == OP_FOLD) { back_fold(s, g, id); return; }
+  if (op == OP_TAKE) { back_take(s, g, id); return; }
+  if (op == OP_SPREAD) { back_spread(s, g, id); return; }
   if (op == OP_ATTENTION) { back_attention(s, g, id); return; }
+  if (op == OP_RECALL) { back_recall(s, g, id); return; }
+  if (op == OP_RECALL_EXACT) { back_exact(s, g, id); return; }
+  if (op == OP_MINGLE) { back_mingle(s, g, id); return; }
+  if (op == OP_PONDER) { back_ponder(s, g, id); return; }
+  if (op == OP_PONDER_SUM) { back_ponder_sum(s, g, id); return; }
+  if (op == OP_FORESEE) { back_foresee(s, g, id); return; }
+  if (op == OP_CONSULT) { back_consult(s, g, id); return; }
+  if (op == OP_ADD_MUL) { back_add_mul(s, g, id); return; }
+  if (op == OP_RESIDUAL) { back_residual(s, g, id); return; }
+  if (op == OP_FEED) { back_feed(s, g, id); return; }
+  if (op == OP_PAIR) { back_pair(s, g, id); return; }
+  if (op == OP_MIX) { back_mix(s, g, id); return; }
+  if (op == OP_JOIN) { back_join(s, g, id); return; }
+  if (op == OP_RULES) { back_rules(s, g, id); return; }
+  if (op == OP_ROUND) { back_round(s, g, id); return; }
+  if (op == OP_SCALE_BY) { back_scale_by(s, g, id); return; }
+  if (op == OP_ANCHOR) { back_anchor(s, g, id); return; }
+  if (op == OP_PICK) { back_pick(s, g, id); return; }
+  if (op == OP_SOLVE_TABLE) { back_solve_table(s, g, id); return; }
+  if (op == OP_SOLVE_PROOF) { back_solve_proof(s, g, id); return; }
+  if (op == OP_SOLVE_BELIEFS) { back_solve_beliefs(s, g, id); return; }
+  if (op == OP_SOLVE_TABLES) { back_solve_tables(s, g, id); return; }
+  if (op == OP_SOLVE_GUESS) { back_solve_guess(s, g, id); return; }
   if (op == OP_QK_ROPE) {
     var n: Node* = g->node(id);
     if (!g->nodes[n->a].requires) { return; }
