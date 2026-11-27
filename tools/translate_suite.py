@@ -32,12 +32,22 @@ def normalize(text):
     return text.replace("\r\n", "\n")
 
 
+def translate(source, work):
+    if os.path.isdir(source):
+        files = sorted(os.path.join(source, f) for f in os.listdir(source) if f.endswith(".c"))
+        code, _, err = run([METTLE, "translate"] + files + ["-o", work], work, 120)
+        return code, err, os.path.join(work, "main.mettle"), os.path.join(source, "expected")
+    name = os.path.splitext(os.path.basename(source))[0]
+    out = os.path.join(work, name + ".mettle")
+    code, _, err = run([METTLE, "translate", source, "-o", out], work, 120)
+    return code, err, out, source + ".expected"
+
+
 def check(source, keep):
     name = os.path.splitext(os.path.basename(source))[0]
     work = os.path.join(SCRATCH, name)
     os.makedirs(work, exist_ok=True)
-    out = os.path.join(work, name + ".mettle")
-    code, _, err = run([METTLE, "translate", source, "-o", out], work, 120)
+    code, err, out, expected_path = translate(source, work)
     if code != 0:
         return "translate", first_error(err)
     binary = os.path.join(work, name + EXE)
@@ -45,7 +55,6 @@ def check(source, keep):
     if code != 0 or not os.path.exists(binary):
         return "compile", first_error(stdout + err)
     code, stdout, _ = run([binary], work, 60)
-    expected_path = source + ".expected"
     if code != 0:
         return "run", "exit %d" % code
     if os.path.exists(expected_path):
@@ -59,10 +68,13 @@ def check(source, keep):
 def collect(paths):
     sources = []
     for path in [os.path.abspath(p) for p in paths]:
-        if os.path.isdir(path):
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, "main.c")):
+            sources.append(path)
+        elif os.path.isdir(path):
             for entry in sorted(os.listdir(path)):
-                if entry.endswith(".c"):
-                    sources.append(os.path.join(path, entry))
+                full = os.path.join(path, entry)
+                if entry.endswith(".c") or os.path.exists(os.path.join(full, "main.c")):
+                    sources.append(full)
         else:
             sources.append(path)
     return sources

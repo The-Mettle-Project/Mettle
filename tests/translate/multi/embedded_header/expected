@@ -1,0 +1,6 @@
+store open 0 mode 1
+put 10 -> 0
+put 20 -> 0
+put 30 -> 0
+put 40 -> 5
+sum 60 mode 2 full 5

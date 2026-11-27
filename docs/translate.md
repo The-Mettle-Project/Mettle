@@ -35,6 +35,12 @@ flowchart LR
 - A module imports the modules whose names it uses. A function declared in one
   file and defined in another is called directly, and a global defined in
   several files as a tentative definition is defined once.
+- Two files that each spell out the same struct, with the same tag and layout,
+  share one Mettle struct, and a struct one file only declares takes the
+  definition another file gives it. The same holds for a macro constant or an
+  enum constant with the same name and value. This is how SQLite's
+  amalgamation, which carries all of sqlite3.h inside sqlite3.c, links with a
+  program that includes sqlite3.h.
 - When globals need code to set them up, each module gets an `init_<module>`
   function and `main` calls them first.
 
@@ -214,6 +220,17 @@ The headers in `stdlib/c/include` declare what the owned runtime provides:
 stdio, stdlib, string, ctype, time, setjmp, signal and locale. The
 double-precision functions in `math.h` call `std/math`. `stdin`, `stdout` and
 `stderr` become `libc.stdin()` and the like.
+
+There is no `windows.h`, `unistd.h` or `pthread.h`. A library with its own
+operating-system layer needs a build that leaves that layer out. SQLite builds
+with `-DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION`,
+and the program registers its own VFS in `sqlite3_os_init`:
+
+```bash
+mettle translate -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=0 \
+  -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_TEMP_STORE=3 sqlite3.c app.c -o out
+mettle --build out/app.mettle
+```
 
 ## What does not translate
 

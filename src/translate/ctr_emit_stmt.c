@@ -394,7 +394,7 @@ static void emit_cond_stmt(CtrNode *node) {
     return;
   }
   if (node->op == 1) {
-    ctr_open("if (%s) {", ctr_format("!(%s)", ctr_cond_text(node->cond)));
+    ctr_open("if (%s) {", ctr_negated_cond_text(node->cond));
     ctr_emit_expr_stmt(node->els);
     ctr_close();
     return;
@@ -495,7 +495,7 @@ static void emit_expr_stmt_inner(CtrNode *node) {
       emit_discard(node->lhs);
       return;
     }
-    ctr_open(node->kind == ND_LOGAND ? "if (%s) {" : "if (!(%s)) {", ctr_cond_text(node->lhs));
+    ctr_open("if (%s) {", node->kind == ND_LOGAND ? ctr_cond_text(node->lhs) : ctr_negated_cond_text(node->lhs));
     ctr_emit_expr_stmt(node->rhs);
     ctr_close();
     return;
@@ -682,7 +682,7 @@ static void emit_do(CtrNode *node) {
   if (is_const_false(node->cond)) {
     ctr_line("break;");
   } else if (!ends_with_jump(node->then) || node->has_continue) {
-    ctr_open("if (!(%s)) {", ctr_cond_text(node->cond));
+    ctr_open("if (%s) {", ctr_negated_cond_text(node->cond));
     ctr_line("break;");
     ctr_close();
   }
@@ -1221,7 +1221,7 @@ static void collect_incdec(CtrNode *n, IncList *list) {
     return;
   }
   if (is_incdec(n)) {
-    if (plain_local(n->lhs) && list->count < 32) {
+    if (plain_local(n->lhs) && !n->print_plain && list->count < 32) {
       list->items[list->count++] = n;
     }
     return;

@@ -171,6 +171,8 @@ static int64_t wrap_value(int64_t v, CtrType *to) {
   return (int64_t)u;
 }
 
+static int is_pure_literal(CtrNode *n);
+
 static char *narrow_text(CtrNode *n, CtrType *to, int prec) {
   CtrNode *s = strip_macro(n);
   if (s->kind == ND_NUM && !s->is_float_lit) {
@@ -179,6 +181,18 @@ static char *narrow_text(CtrNode *n, CtrType *to, int prec) {
     num.ty = to;
     if (num.ival != s->ival) {
       num.spelling = NULL;
+    }
+    char *t = ctr_literal_text(&num, to);
+    return num.ival < 0 ? paren(t, prec, PREC_UNARY + 1) : t;
+  }
+  int64_t folded;
+  if (is_pure_literal(s) && ctr_try_eval(s, &folded)) {
+    CtrNode num = {0};
+    num.kind = ND_NUM;
+    num.ival = wrap_value(folded, to);
+    num.ty = to;
+    if (s->kind == ND_BITNOT && to->is_unsigned) {
+      num.spelling = ctr_format("0x%llX", (unsigned long long)num.ival);
     }
     char *t = ctr_literal_text(&num, to);
     return num.ival < 0 ? paren(t, prec, PREC_UNARY + 1) : t;
@@ -219,6 +233,9 @@ static char *function_address(CtrObj *f) {
 
 static char *decay_text(CtrNode *inner, CtrType *to, int bare) {
   CtrNode *s = strip_macro(inner);
+  while (s->kind == ND_MACRO) {
+    s = s->lhs;
+  }
   if (s->kind == ND_STR && s->str_ty->base->size == 1) {
     char *lit = ctr_string_literal_text(s->str, s->str_len, 1);
     if (inner != s && s->str_len > 0) {
@@ -268,7 +285,7 @@ static int is_pure_literal(CtrNode *n) {
   if (n->kind == ND_NEG || n->kind == ND_POS || n->kind == ND_BITNOT) {
     return is_pure_literal(n->lhs);
   }
-  if (n->kind == ND_CAST && n->implicit) {
+  if (n->kind == ND_CAST && (n->implicit || ctr_is_integer(n->ty))) {
     return is_pure_literal(n->lhs);
   }
   return 0;
@@ -447,6 +464,40 @@ char *ctr_cond_text(CtrNode *node) {
   return to_bool_text(node);
 }
 
+static CtrNodeKind flipped_comparison(CtrNodeKind k) {
+  switch (k) {
+  case ND_EQ:
+    return ND_NE;
+  case ND_NE:
+    return ND_EQ;
+  case ND_LT:
+    return ND_GE;
+  case ND_LE:
+    return ND_GT;
+  case ND_GT:
+    return ND_LE;
+  case ND_GE:
+    return ND_LT;
+  default:
+    return k;
+  }
+}
+
+char *ctr_negated_cond_text(CtrNode *node) {
+  CtrNode *s = strip_macro(node);
+  CtrNodeKind flip = flipped_comparison(s->kind);
+  int exact = s->kind == ND_EQ || s->kind == ND_NE || (s->lhs && !ctr_is_flonum(s->lhs->ty));
+  if (flip != s->kind && exact) {
+    CtrNode flipped = *s;
+    flipped.kind = flip;
+    return ctr_cond_text(&flipped);
+  }
+  if (s->kind == ND_NOT) {
+    return ctr_cond_text(s->lhs);
+  }
+  return ctr_format("!(%s)", ctr_cond_text(node));
+}
+
 static int bool_prec(CtrNode *node) {
   CtrNode *s = strip_macro(node);
   if (is_bool_node(s)) {
@@ -498,6 +549,9 @@ static char *pointer_diff(CtrNode *node, int prec) {
 
 static int is_literal(CtrNode *n) {
   n = strip_macro(n);
+  if (n->kind == ND_SIZEOF || n->kind == ND_ALIGNOF) {
+    return n->ival >= 0;
+  }
   return n->kind == ND_NUM && !n->is_float_lit && !(n->var && n->var->is_enum_const);
 }
 
@@ -513,7 +567,7 @@ static CtrNode *widening_source(CtrNode *n, CtrType *t) {
   if (from->size < t->size && (from->is_unsigned || !t->is_unsigned)) {
     return in;
   }
-  if (from->size == t->size) {
+  if (from->size == t->size && from->is_unsigned == t->is_unsigned) {
     return in;
   }
   return n;
@@ -528,11 +582,13 @@ static int literal_fits(CtrNode *lit, CtrNode *other) {
   return is_literal(lit) && ctr_is_integer(other->ty) && other->ty->kind != TY_BOOL && fits(s->ival, other->ty);
 }
 
+static int unsigned_operand(CtrNode *n) { return is_literal(n) || n->ty->is_unsigned || n->ty->kind == TY_PTR; }
+
 static int unsigned_mix_ok(CtrNode *a, CtrNode *b, CtrType *t) {
   if (!t->is_unsigned) {
     return 1;
   }
-  return ctr_same_mettle_type(a->ty, t) || ctr_same_mettle_type(b->ty, t);
+  return unsigned_operand(a) && unsigned_operand(b);
 }
 
 static void operand_pair(CtrType *t, CtrNode **lhs, CtrNode **rhs) {
@@ -710,7 +766,7 @@ static char *assign_value(CtrNode *node, int prec) {
   CtrNode *lhs = node->lhs;
   if (lvalue_is_simple(lhs) || is_bitfield(lhs)) {
     SideEffectArg a = {node, 1};
-    return paren(stmt_block_text(emit_side_effect, &a, read_back(lhs, node->ty)), prec, PREC_POSTFIX);
+    return paren(stmt_block_text(emit_side_effect, &a, read_back(lhs, node->ty)), prec, PREC_BLOCK);
   }
   CtrObj *pointer = ctr_alloc(sizeof(CtrObj));
   pointer->name = ctr_new_temp("at");
@@ -727,7 +783,7 @@ static char *assign_value(CtrNode *node, int prec) {
   *through = *node;
   through->lhs = target;
   AssignThrough a = {node, pointer->name, through};
-  return paren(stmt_block_text(emit_assign_through, &a, read_back(target, node->ty)), prec, PREC_POSTFIX);
+  return paren(stmt_block_text(emit_assign_through, &a, read_back(target, node->ty)), prec, PREC_BLOCK);
 }
 
 static char *incdec_value(CtrNode *node, int prec) {
@@ -735,7 +791,7 @@ static char *incdec_value(CtrNode *node, int prec) {
   int post = node->kind == ND_POSTINC || node->kind == ND_POSTDEC;
   SideEffectArg a = {node, 1};
   if (!post) {
-    return paren(stmt_block_text(emit_side_effect, &a, read_back(lhs, lhs->ty)), prec, PREC_POSTFIX);
+    return paren(stmt_block_text(emit_side_effect, &a, read_back(lhs, lhs->ty)), prec, PREC_BLOCK);
   }
   char *t = ctr_new_temp("old");
   CtrBuf b = {0};
@@ -743,7 +799,7 @@ static char *incdec_value(CtrNode *node, int prec) {
   char *stmt = stmt_block_text(emit_side_effect, &a, NULL);
   ctr_buf_put(&b, stmt);
   ctr_buf_printf(&b, " %s }", t);
-  return paren(ctr_buf_take(&b), prec, PREC_POSTFIX);
+  return paren(ctr_buf_take(&b), prec, PREC_BLOCK);
 }
 
 static char *cond_expr_text(CtrNode *node, int prec) {
@@ -754,7 +810,7 @@ static char *cond_expr_text(CtrNode *node, int prec) {
   }
   if (node->ty->kind == TY_VOID) {
     SideEffectArg a = {node, 0};
-    return paren(stmt_block_text(emit_side_effect, &a, NULL), prec, PREC_POSTFIX);
+    return paren(stmt_block_text(emit_side_effect, &a, NULL), prec, PREC_BLOCK);
   }
   if (node->op == 1) {
     char *t = ctr_new_temp("cv");
@@ -780,7 +836,7 @@ static char *comma_text(CtrNode *node, int prec) {
     ctr_buf_put(&b, stmt_block_text(emit_side_effect, &r, NULL));
     return ctr_buf_take(&b);
   }
-  return paren(stmt_block_text(emit_side_effect, &a, tail), prec, PREC_POSTFIX);
+  return paren(stmt_block_text(emit_side_effect, &a, tail), prec, PREC_BLOCK);
 }
 
 static int is_union_member(CtrNode *n) {
@@ -806,9 +862,9 @@ static char *union_member_text(CtrNode *node, int prec) {
   }
   char *t;
   if (mem->offset) {
-    t = ctr_format("(*(%s*)((uint8*)%s + %d))", ctr_type_text(mem->ty), paren(addr, PREC_UNARY, PREC_UNARY), mem->offset);
+    t = ctr_format("(*(%s)((uint8*)%s + %d))", ctr_type_text(ctr_pointer_to(mem->ty)), paren(addr, PREC_UNARY, PREC_UNARY), mem->offset);
   } else {
-    t = ctr_format("(*(%s*)%s)", ctr_type_text(mem->ty), paren(addr, PREC_UNARY, PREC_UNARY));
+    t = ctr_format("(*(%s)%s)", ctr_type_text(ctr_pointer_to(mem->ty)), paren(addr, PREC_UNARY, PREC_UNARY));
   }
   return paren(t, prec, PREC_POSTFIX);
 }
@@ -871,6 +927,13 @@ static char *addr_text(CtrNode *node, int prec) {
   if (vla_row(in->ty)) {
     return expr(in, prec);
   }
+  if (in->kind == ND_INDEX && is_null_constant(strip_macro(in->lhs))) {
+    char *offset = ctr_value_text(in->rhs, ctr_ty_ullong, PREC_MUL);
+    if (in->ty->size != 1) {
+      offset = ctr_format("%s * %d", offset, in->ty->size);
+    }
+    return paren(ctr_format("(%s)(%s)", ctr_type_text(node->ty), offset), prec, PREC_UNARY);
+  }
   if (is_union_member(in)) {
     char *addr = member_base_address(in->lhs);
     char *t = in->member->offset ? ctr_format("(%s)((uint8*)%s + %d)", ctr_type_text(node->ty), paren(addr, PREC_UNARY, PREC_UNARY), in->member->offset)
@@ -918,10 +981,29 @@ static int indexes_past_trailing_array(CtrNode *base, CtrNode *index) {
   return !ctr_try_eval(index, &v) || v != 0;
 }
 
+static CtrNode *string_base(CtrNode *base) {
+  CtrNode *s = base;
+  while (s->kind == ND_MACRO || (s->kind == ND_CAST && s->implicit)) {
+    s = s->lhs;
+  }
+  if (s->kind != ND_STR || s->str_ty->base->size != 1) {
+    return NULL;
+  }
+  while (base->kind == ND_CAST && base->implicit) {
+    base = base->lhs;
+  }
+  return base;
+}
+
 static char *index_text(CtrNode *node, int prec) {
   (void)prec;
   CtrNode *base = node->lhs;
   char *idx = expr(node->rhs, PREC_LOWEST);
+  CtrNode *str = string_base(base);
+  if (str) {
+    const char *bytes = ctr_type_text(ctr_pointer_to(ctr_ty_char));
+    return ctr_format("((%s)%s)[%s]", bytes, decay_text(str, ctr_pointer_to(ctr_ty_char), 1), idx);
+  }
   if (vla_indexed(base)) {
     char *flat = expr(base, PREC_ADD);
     if (node->ty->kind == TY_VLA || node->ty->kind == TY_ARRAY) {
@@ -1029,6 +1111,9 @@ static char *c_vararg_text(CtrNode *arg) {
   ctr_em->bare_node = arg;
   char *t = expr(arg, PREC_LOWEST);
   ctr_em->bare_node = saved;
+  if (string_base(arg) && t[0] != '"') {
+    return ctr_format("(%s)%s", ctr_type_text(ctr_pointer_to(ctr_ty_char)), t);
+  }
   return t;
 }
 
@@ -1097,7 +1182,7 @@ static char *va_text(CtrNode *node, int prec) {
     return d;
   }
   if (t->kind == TY_STRUCT || t->kind == TY_UNION) {
-    return ctr_format("*(%s*)libc.va_next(&%s)", ctr_type_text(t), ap);
+    return ctr_format("*(%s)libc.va_next(&%s)", ctr_type_text(ctr_pointer_to(t)), ap);
   }
   if (ctr_same_mettle_type(t, ctr_ty_ullong)) {
     return ctr_format("libc.va_next(&%s)", ap);
@@ -1203,7 +1288,7 @@ static char *stmt_expr_text(CtrNode *node, int prec) {
   if (node->ty->kind != TY_VOID && last && last->kind == ND_EXPR_STMT) {
     tail = expr(last->lhs, PREC_LOWEST);
   }
-  return paren(stmt_block_text(emit_stmt_expr_body, node, tail), prec, PREC_POSTFIX);
+  return paren(stmt_block_text(emit_stmt_expr_body, node, tail), prec, PREC_BLOCK);
 }
 
 static char *macro_text(CtrNode *node, int prec) {

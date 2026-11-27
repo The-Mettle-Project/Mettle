@@ -29,6 +29,7 @@ typedef enum {
   PREC_ADD = 10,
   PREC_MUL = 11,
   PREC_UNARY = 12,
+  PREC_BLOCK = 12,
   PREC_POSTFIX = 13
 } CtrPrec;
 
@@ -38,6 +39,7 @@ const char *ctr_mettle_name_of(CtrObj *obj);
 const char *ctr_claim_name(const char *base);
 void ctr_use_module(CtrModule *home);
 const char *ctr_wide_string_name(CtrNode *str);
+char *ctr_negated_cond_text(CtrNode *node);
 const char *ctr_struct_name(CtrStructDecl *decl);
 const char *ctr_member_name(CtrMember *mem);
 const char *ctr_type_text(CtrType *ty);

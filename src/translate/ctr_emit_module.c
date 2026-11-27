@@ -204,13 +204,13 @@ static void assign_homes(CtrProgram *prog) {
   for (int i = 0; i < prog->enum_consts.len; i++) {
     CtrObj *ec = prog->enum_consts.items[i];
     if (!ec->is_system) {
-      ec->home = module_of_token(ec->tok);
+      ec->home = ec->same_as ? ec->same_as->home : module_of_token(ec->tok);
     }
   }
   for (int i = 0; i < prog->macros.len; i++) {
     CtrMacro *m = prog->macros.items[i];
     if (m->recovered) {
-      m->home = module_of_file(m->file);
+      m->home = m->same_as ? m->same_as->home : module_of_file(m->file);
     }
   }
 }
@@ -452,6 +452,8 @@ static void emit_externs(CtrUnit *unit) {
   }
 }
 
+static const char *shared_prefix(CtrModule *mod) { return multi_module() && mod->is_unit ? "export " : ""; }
+
 static const char *macro_value_text(CtrMacro *m) {
   CtrType *ty = m->value_type;
   if (m->value_expr->kind == ND_STR) {
@@ -485,7 +487,8 @@ static void emit_macro_consts(CtrProgram *prog) {
     m->emitted = 1;
     ctr_em->mod = m->home;
     const char *t = m->value_expr->kind == ND_STR ? "string" : ctr_type_text(m->value_type);
-    add_item(m->home, m->def_tok, ctr_format("const %s: %s = %s;\n", m->mettle_name, t, macro_value_text(m)));
+    add_item(m->home, m->def_tok,
+             ctr_format("%sconst %s: %s = %s;\n", shared_prefix(m->home), m->mettle_name, t, macro_value_text(m)));
   }
 }
 
@@ -495,7 +498,9 @@ static void emit_enum_consts(CtrProgram *prog) {
     if (ec->is_system || !ec->mettle_name || ec->emitted) {
       continue;
     }
-    add_item(ec->home, ec->tok, ctr_format("const %s: int32 = %lld;\n", ec->mettle_name, (long long)ec->enum_value));
+    add_item(ec->home, ec->tok,
+             ctr_format("%sconst %s: int32 = %lld;\n", shared_prefix(ec->home), ec->mettle_name,
+                        (long long)ec->enum_value));
   }
 }
 
@@ -518,6 +523,7 @@ static void emit_structs(CtrProgram *prog) {
       changed = 1;
       ctr_em->mod = decl->home;
       CtrBuf b = {0};
+      ctr_buf_put(&b, shared_prefix(decl->home));
       ctr_emit_struct(&b, decl);
       add_item(decl->home, decl->tok, ctr_buf_take(&b));
     }

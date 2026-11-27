@@ -232,6 +232,7 @@ struct CtrObj {
   CtrType *ty;
   CtrToken *tok;
   struct CtrModule *home;
+  CtrObj *same_as;
   int skip_emit;
   int is_local;
   int is_static;
@@ -404,6 +405,7 @@ typedef struct CtrMacroArg {
 struct CtrMacro {
   const char *name;
   struct CtrModule *home;
+  CtrMacro *same_as;
   int is_objlike;
   CtrMacroArg *params;
   const char *va_args_name;

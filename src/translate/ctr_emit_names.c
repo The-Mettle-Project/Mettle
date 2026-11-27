@@ -110,15 +110,62 @@ static const char *location_key(CtrToken *tok) {
                     use->file ? use->file->key : "?", use->line, use->col);
 }
 
+static void type_signature(CtrBuf *b, CtrType *t, int depth) {
+  ctr_buf_printf(b, "%d.%d.%d", t->kind, t->size, t->is_unsigned);
+  if (t->sdecl && t->sdecl->tag) {
+    ctr_buf_printf(b, ".%s", t->sdecl->tag);
+  } else if (t->base && depth < 4) {
+    ctr_buf_putc(b, '(');
+    type_signature(b, t->base, depth + 1);
+    ctr_buf_putc(b, ')');
+  }
+}
+
+static const char *layout_key(CtrStructDecl *decl) {
+  CtrBuf b = {0};
+  ctr_buf_printf(&b, "%s|%d|%d|%d", struct_base_name(decl), decl->is_union, decl->size, decl->align);
+  for (CtrMember *m = decl->members; m; m = m->next) {
+    ctr_buf_printf(&b, "|%s:%d:%d:%d:", m->name ? ctr_token_text(m->name) : "", m->offset, m->bit_width,
+                   m->bit_offset);
+    type_signature(&b, m->ty, 0);
+  }
+  return ctr_buf_take(&b);
+}
+
+static void complete_forward_structs(CtrProgram *prog) {
+  CtrMap by_tag = {0};
+  for (int i = 0; i < prog->structs.len; i++) {
+    CtrStructDecl *decl = prog->structs.items[i];
+    const char *key = decl->tag ? ctr_format("%s:%d", decl->tag, decl->is_union) : NULL;
+    if (key && decl->complete && !decl->canonical && !ctr_map_get(&by_tag, key)) {
+      ctr_map_put(&by_tag, key, decl);
+    }
+  }
+  for (int i = 0; i < prog->structs.len; i++) {
+    CtrStructDecl *decl = prog->structs.items[i];
+    const char *key = decl->tag ? ctr_format("%s:%d", decl->tag, decl->is_union) : NULL;
+    CtrStructDecl *full = key && !decl->complete ? ctr_map_get(&by_tag, key) : NULL;
+    if (full) {
+      decl->canonical = full;
+      decl->mettle_name = full->mettle_name;
+    }
+  }
+}
+
 static void name_structs(CtrProgram *prog) {
   CtrMap seen = {0};
+  CtrMap layouts = {0};
   for (int i = 0; i < prog->structs.len; i++) {
     CtrStructDecl *decl = prog->structs.items[i];
     if (!decl->complete) {
       continue;
     }
     const char *key = decl->tok ? ctr_format("%s:%d", location_key(decl->tok), decl->is_union) : NULL;
+    const char *layout = layout_key(decl);
     CtrStructDecl *first = key ? ctr_map_get(&seen, key) : NULL;
+    if (!first && prog->units.len > 1) {
+      first = ctr_map_get(&layouts, layout);
+    }
     if (first) {
       decl->canonical = first;
       decl->mettle_name = first->mettle_name;
@@ -128,6 +175,10 @@ static void name_structs(CtrProgram *prog) {
     if (key) {
       ctr_map_put(&seen, key, decl);
     }
+    ctr_map_put(&layouts, layout, decl);
+  }
+  if (prog->units.len > 1) {
+    complete_forward_structs(prog);
   }
 }
 
@@ -139,9 +190,17 @@ static void name_enum_consts(CtrProgram *prog) {
       continue;
     }
     const char *key = location_key(ec->tok);
+    const char *value = ctr_format("enum %s=%lld", ec->name, (long long)ec->enum_value);
     CtrObj *first = key ? ctr_map_get(&seen, key) : NULL;
+    if (!first && prog->units.len > 1) {
+      first = ctr_map_get(&seen, value);
+    }
+    if (!first) {
+      ctr_map_put(&seen, value, ec);
+    }
     if (first) {
       ec->mettle_name = first->mettle_name;
+      ec->same_as = first;
       ec->emitted = 1;
       continue;
     }
@@ -233,6 +292,24 @@ void ctr_prepare_names(CtrProgram *prog) {
   name_members(prog);
 }
 
+static const char *macro_value_key(CtrMacro *m) {
+  CtrNode *v = m->value_expr;
+  if (v->kind == ND_STR) {
+    CtrBuf b = {0};
+    ctr_buf_printf(&b, "macro %s=s", m->name);
+    for (int i = 0; i < v->str_len; i++) {
+      ctr_buf_printf(&b, "%02x", (unsigned char)v->str[i]);
+    }
+    return ctr_buf_take(&b);
+  }
+  if (ctr_is_flonum(m->value_type)) {
+    return ctr_format("macro %s=f%d:%a", m->name, m->value_type->size, ctr_eval_double(v));
+  }
+  int64_t n = 0;
+  ctr_try_eval(v, &n);
+  return ctr_format("macro %s=i%d%d:%lld", m->name, m->value_type->size, m->value_type->is_unsigned, (long long)n);
+}
+
 void ctr_claim_macro_names(CtrProgram *prog) {
   CtrMap seen = {0};
   for (int i = 0; i < prog->macros.len; i++) {
@@ -242,9 +319,17 @@ void ctr_claim_macro_names(CtrProgram *prog) {
     }
     m->recovered = 1;
     const char *key = m->def_tok ? location_key(m->def_tok) : NULL;
+    const char *value = macro_value_key(m);
     CtrMacro *first = key ? ctr_map_get(&seen, key) : NULL;
+    if (!first && prog->units.len > 1) {
+      first = ctr_map_get(&seen, value);
+    }
+    if (!first) {
+      ctr_map_put(&seen, value, m);
+    }
     if (first) {
       m->mettle_name = first->mettle_name;
+      m->same_as = first;
       m->emitted = 1;
       continue;
     }
@@ -352,7 +437,14 @@ const char *ctr_scalar_type(CtrType *ty) {
 }
 
 int ctr_is_opaque_struct(CtrType *ty) {
-  return (ty->kind == TY_STRUCT || ty->kind == TY_UNION) && (!ty->sdecl || !ty->sdecl->complete);
+  if (ty->kind != TY_STRUCT && ty->kind != TY_UNION) {
+    return 0;
+  }
+  CtrStructDecl *decl = ty->sdecl;
+  if (decl && !decl->complete && decl->canonical) {
+    decl = decl->canonical;
+  }
+  return !decl || !decl->complete;
 }
 
 int ctr_is_va_list(CtrType *ty) {
