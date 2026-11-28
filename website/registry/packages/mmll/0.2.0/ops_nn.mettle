@@ -659,7 +659,7 @@ export fn gather_rows(table: Var, ids: int32*, out: Shape) -> Var {
   return { g: g, id: id };
 }
 
-export fn rows_by_id(g: Graph*, ids: int32*, count: int64, vocab: int64) -> int32* {
+fn rows_by_id(g: Graph*, ids: int32*, count: int64, vocab: int64) -> int32* {
   var host: int32* = g->ints(count + vocab + 1);
   var starts: int32* = host + count;
   for v: int64 in 0..vocab + 1 { starts[v] = 0; }
@@ -673,139 +673,6 @@ export fn rows_by_id(g: Graph*, ids: int32*, count: int64, vocab: int64) -> int3
     fill[v] = fill[v] + 1;
   }
   return g->index_from(host, count + vocab + 1);
-}
-
-export fn fold_rows(x: Var, ids: int32*, classes: int64) -> Var {
-  var g: Graph* = x.g;
-  var sx: Shape = x.shape();
-  if (sx.rank != 2) { mmll_fail("fold_rows needs [rows, width] rows, got {sx.text()}"); }
-  var count: int64 = sx.dims[0];
-  var width: int64 = sx.dims[1];
-  for r: int64 in 0..count {
-    var at: int32 = ids[r];
-    if (at < 0 || (int64)at >= classes) { mmll_fail("class {at} is outside {classes}"); }
-  }
-  var id: int32 = g->push(OP_FOLD, x.id, -1, -1, shape(classes, width));
-  g->nodes[id].ints = g->index_from(ids, count);
-  if (g->on_device()) {
-    g->nodes[id].ext = (rawptr)rows_by_id(g, ids, count, classes);
-    g->forward_on_device(id);
-    return { g: g, id: id };
-  }
-  var src: float32* = g->data(x.id);
-  var dst: float32* = g->data(id);
-  fill_f32(dst, 0.0, classes * width);
-  for r: int64 in 0..count { add_into_f32(dst + (int64)ids[r] * width, src + r * width, width); }
-  return { g: g, id: id };
-}
-
-export fn backward_fold(g: Graph*, id: int32) {
-  var n: Node* = g->node(id);
-  if (!g->nodes[n->a].requires) { return; }
-  var width: int64 = n->value.shape.last();
-  var count: int64 = g->nodes[n->a].value.shape.dims[0];
-  var ids: int32* = n->ints;
-  var dy: float32* = n->grad;
-  var dx: float32* = g->grad_of(n->a);
-  for r: int64 in 0..count { add_into_f32(dx + r * width, dy + (int64)ids[r] * width, width); }
-}
-
-fn checked_picks(ids: int32*, count: int64, most: int64, what: string) {
-  for i: int64 in 0..count {
-    var at: int32 = ids[i];
-    if (at < 0 || (int64)at > most) { mmll_fail("{what} index {at} is outside 0 to {most}"); }
-  }
-}
-
-export fn take_last(x: Var, ids: int32*, picks: int64) -> Var {
-  var g: Graph* = x.g;
-  var sx: Shape = x.shape();
-  if (sx.rank != 3) { mmll_fail("take_last needs [rows, groups, width], got {sx.text()}"); }
-  var rows: int64 = sx.dims[0];
-  var m: int64 = sx.dims[1];
-  var l: int64 = sx.dims[2];
-  checked_picks(ids, rows * picks, l, "take_last");
-  var id: int32 = g->push(OP_TAKE, x.id, -1, -1, shape(rows, m, picks));
-  g->nodes[id].ints = g->index_from(ids, rows * picks);
-  if (g->forward_on_device(id)) { return { g: g, id: id }; }
-  var src: float32* = g->data(x.id);
-  var dst: float32* = g->data(id);
-  for r: int64 in 0..rows {
-    for j: int64 in 0..m {
-      for k: int64 in 0..picks {
-        var at: int64 = (int64)ids[r * picks + k];
-        dst[(r * m + j) * picks + k] = if at < l { src[(r * m + j) * l + at] } else { (float32)0.0 };
-      }
-    }
-  }
-  return { g: g, id: id };
-}
-
-export fn backward_take(g: Graph*, id: int32) {
-  var n: Node* = g->node(id);
-  if (!g->nodes[n->a].requires) { return; }
-  var sx: Shape = g->nodes[n->a].value.shape;
-  var rows: int64 = sx.dims[0];
-  var m: int64 = sx.dims[1];
-  var l: int64 = sx.dims[2];
-  var picks: int64 = n->value.shape.last();
-  var ids: int32* = n->ints;
-  var dy: float32* = n->grad;
-  var dx: float32* = g->grad_of(n->a);
-  for r: int64 in 0..rows {
-    for j: int64 in 0..m {
-      for k: int64 in 0..picks {
-        var at: int64 = (int64)ids[r * picks + k];
-        if (at < l) { dx[(r * m + j) * l + at] = dx[(r * m + j) * l + at] + dy[(r * m + j) * picks + k]; }
-      }
-    }
-  }
-}
-
-export fn spread_last(x: Var, ids: int32*, width: int64) -> Var {
-  var g: Graph* = x.g;
-  var sx: Shape = x.shape();
-  if (sx.rank != 3) { mmll_fail("spread_last needs [rows, groups, picks], got {sx.text()}"); }
-  var rows: int64 = sx.dims[0];
-  var m: int64 = sx.dims[1];
-  var picks: int64 = sx.dims[2];
-  checked_picks(ids, rows * picks, width, "spread_last");
-  var id: int32 = g->push(OP_SPREAD, x.id, -1, -1, shape(rows, m, width));
-  g->nodes[id].ints = g->index_from(ids, rows * picks);
-  if (g->forward_on_device(id)) { return { g: g, id: id }; }
-  var src: float32* = g->data(x.id);
-  var dst: float32* = g->data(id);
-  fill_f32(dst, 0.0, rows * m * width);
-  for r: int64 in 0..rows {
-    for j: int64 in 0..m {
-      for k: int64 in 0..picks {
-        var at: int64 = (int64)ids[r * picks + k];
-        if (at < width) { dst[(r * m + j) * width + at] = dst[(r * m + j) * width + at] + src[(r * m + j) * picks + k]; }
-      }
-    }
-  }
-  return { g: g, id: id };
-}
-
-export fn backward_spread(g: Graph*, id: int32) {
-  var n: Node* = g->node(id);
-  if (!g->nodes[n->a].requires) { return; }
-  var sx: Shape = g->nodes[n->a].value.shape;
-  var rows: int64 = sx.dims[0];
-  var m: int64 = sx.dims[1];
-  var picks: int64 = sx.dims[2];
-  var width: int64 = n->value.shape.last();
-  var ids: int32* = n->ints;
-  var dy: float32* = n->grad;
-  var dx: float32* = g->grad_of(n->a);
-  for r: int64 in 0..rows {
-    for j: int64 in 0..m {
-      for k: int64 in 0..picks {
-        var at: int64 = (int64)ids[r * picks + k];
-        if (at < width) { dx[(r * m + j) * picks + k] = dx[(r * m + j) * picks + k] + dy[(r * m + j) * width + at]; }
-      }
-    }
-  }
 }
 
 export fn embedding(table: Var, ids: int32*, dims: int64[..]) -> Var {

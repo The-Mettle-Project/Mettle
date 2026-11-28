@@ -1,0 +1,462 @@
+import "std/mem";
+import "std/conv";
+import "std/core";
+import "json";
+import "./tensor";
+import "./kernels";
+import "./graph";
+import "./data";
+
+export const DTYPE_F32 = 0;
+export const DTYPE_F16 = 1;
+export const DTYPE_BF16 = 2;
+export const DTYPE_F64 = 3;
+
+export struct SafeEntry {
+  name_at: int64;
+  name_length: int64;
+  dtype: int32;
+  shape: Shape;
+  begin: int64;
+  end: int64;
+}
+
+export struct SafeFile {
+  bytes: Bytes;
+  owned: bool;
+  data_start: int64;
+  entries: SafeEntry*;
+  count: int32;
+  names: uint8*;
+  names_length: int64;
+  names_capacity: int64;
+}
+
+struct Sink {
+  data: uint8*;
+  length: int64;
+  capacity: int64;
+}
+
+fn sink_reserve(s: Sink*, extra: int64) {
+  if (s->length + extra <= s->capacity) { return; }
+  var cap: int64 = if (s->capacity < 256) 256 else s->capacity;
+  while (cap < s->length + extra) { cap = cap * 2; }
+  s->data = (uint8*)realloc((rawptr)s->data, cap);
+  if (s->data == 0) { mmll_fail("out of memory writing a checkpoint"); }
+  s->capacity = cap;
+}
+
+fn sink_byte(s: Sink*, b: uint8) {
+  sink_reserve(s, 1);
+  s->data[s->length] = b;
+  s->length = s->length + 1;
+}
+
+fn sink_text(s: Sink*, t: string) {
+  sink_reserve(s, (int64)t.length);
+  for i in 0..t.length { s->data[s->length + (int64)i] = (uint8)t.chars[i]; }
+  s->length = s->length + (int64)t.length;
+}
+
+fn sink_json_string(s: Sink*, t: string) {
+  sink_byte(s, 34);
+  for i in 0..t.length {
+    var c: uint8 = (uint8)t.chars[i];
+    if (c == 34 || c == 92) {
+      sink_byte(s, 92);
+      sink_byte(s, c);
+    } else if (c < 32) {
+      var hex: string = "0123456789abcdef";
+      sink_text(s, "\\u00");
+      sink_byte(s, (uint8)hex.chars[c >> 4]);
+      sink_byte(s, (uint8)hex.chars[c & 15]);
+    } else {
+      sink_byte(s, c);
+    }
+  }
+  sink_byte(s, 34);
+}
+
+export fn safetensors_encode(ps: Params*) -> Bytes {
+  ps->fetch();
+  var header: Sink;
+  sink_text(&header, "{{\"__metadata__\":{{\"format\":\"pt\",\"writer\":\"mmll\"}");
+  var offset: int64 = 0;
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    var s: Shape = p->value.shape;
+    var bytes: int64 = s.size() * 4;
+    sink_byte(&header, 44);
+    sink_json_string(&header, p->name);
+    sink_text(&header, ":{{\"dtype\":\"F32\",\"shape\":[");
+    for d in 0..s.rank {
+      if (d > 0) { sink_byte(&header, 44); }
+      sink_text(&header, "{s.dims[d]}");
+    }
+    sink_text(&header, "],\"data_offsets\":[{offset},{offset + bytes}]}");
+    offset = offset + bytes;
+  }
+  sink_byte(&header, 125);
+  while (header.length % 8 != 0) { sink_byte(&header, 32); }
+  var total: int64 = 8 + header.length + offset;
+  var out: uint8* = (uint8*)malloc(total);
+  if (out == 0) { mmll_fail("out of memory for a {total} byte checkpoint"); }
+  var n: uint64 = (uint64)header.length;
+  for b in 0..8 { out[b] = (uint8)((n >> (uint64)(8 * b)) & (uint64)255); }
+  memcpy((rawptr)(out + 8), (rawptr)header.data, header.length);
+  var at: int64 = 8 + header.length;
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    var bytes: int64 = p->value.shape.size() * 4;
+    memcpy((rawptr)(out + at), (rawptr)p->value.data, bytes);
+    at = at + bytes;
+  }
+  free((rawptr)header.data);
+  return { data: out, length: total };
+}
+
+export fn save_safetensors(ps: Params*, path: string) -> Result<int64, string> {
+  var b: Bytes = safetensors_encode(ps);
+  var r: Result<int64, string> = write_file(path, b.data, b.length);
+  bytes_free(&b);
+  return r;
+}
+
+fn dtype_of(reader: JsonReader*) -> int32 {
+  if (json_text_is(reader, "F32")) { return DTYPE_F32; }
+  if (json_text_is(reader, "F16")) { return DTYPE_F16; }
+  if (json_text_is(reader, "BF16")) { return DTYPE_BF16; }
+  if (json_text_is(reader, "F64")) { return DTYPE_F64; }
+  return -1;
+}
+
+fn dtype_bytes(dtype: int32) -> int64 {
+  if (dtype == DTYPE_F32) { return 4; }
+  if (dtype == DTYPE_F64) { return 8; }
+  return 2;
+}
+
+fn keep_name(f: SafeFile*, reader: JsonReader*, e: SafeEntry*) {
+  var n: int64 = json_string_length(reader);
+  if (f->names_length + n > f->names_capacity) {
+    var cap: int64 = if (f->names_capacity < 1024) 1024 else f->names_capacity;
+    while (cap < f->names_length + n) { cap = cap * 2; }
+    f->names = (uint8*)realloc((rawptr)f->names, cap);
+    f->names_capacity = cap;
+  }
+  json_string_copy(reader, f->names + f->names_length, n);
+  e->name_at = f->names_length;
+  e->name_length = n;
+  f->names_length = f->names_length + n;
+}
+
+export fn SafeFile_name__ptr(f: SafeFile*, index: int32) -> string {
+  var e: SafeEntry* = &f->entries[index];
+  return str_from_bytes((cstring)(f->names + e->name_at), e->name_length);
+}
+
+fn parse_entry(reader: JsonReader*, e: SafeEntry*) -> string {
+  if (json_next(reader) != JSON_OBJECT_START) { return "an entry is not an object"; }
+  e->dtype = -2;
+  e->begin = -1;
+  e->end = -1;
+  e->shape.rank = -1;
+  var ev: int32 = json_next(reader);
+  while (ev == JSON_KEY) {
+    if (json_text_is(reader, "dtype")) {
+      if (json_next(reader) != JSON_STRING) { return "dtype is not a string"; }
+      e->dtype = dtype_of(reader);
+      if (e->dtype < 0) { return "dtype is not F32, F16, BF16 or F64"; }
+    } else if (json_text_is(reader, "shape")) {
+      if (json_next(reader) != JSON_ARRAY_START) { return "shape is not an array"; }
+      e->shape.rank = 0;
+      var item: int32 = json_next(reader);
+      while (item == JSON_NUMBER) {
+        if (e->shape.rank == MAX_RANK) { return "shape has more than 6 dimensions"; }
+        var d: int64 = 0;
+        if (!json_read_int64(reader, &d) || d < 0) { return "shape holds a bad dimension"; }
+        e->shape.dims[e->shape.rank] = d;
+        e->shape.rank = e->shape.rank + 1;
+        item = json_next(reader);
+      }
+      if (item != JSON_ARRAY_END) { return "shape is malformed"; }
+    } else if (json_text_is(reader, "data_offsets")) {
+      if (json_next(reader) != JSON_ARRAY_START) { return "data_offsets is not an array"; }
+      if (json_next(reader) != JSON_NUMBER || !json_read_int64(reader, &e->begin)) { return "data_offsets is malformed"; }
+      if (json_next(reader) != JSON_NUMBER || !json_read_int64(reader, &e->end)) { return "data_offsets is malformed"; }
+      if (json_next(reader) != JSON_ARRAY_END) { return "data_offsets holds more than two numbers"; }
+    } else {
+      var skipped: int32 = json_next(reader);
+      if (skipped == JSON_OBJECT_START || skipped == JSON_ARRAY_START) { json_skip(reader); }
+    }
+    ev = json_next(reader);
+  }
+  if (ev != JSON_OBJECT_END) { return "an entry is malformed"; }
+  if (e->dtype < 0 || e->shape.rank < 0 || e->begin < 0 || e->end < e->begin) { return "an entry lacks dtype, shape or data_offsets"; }
+  if (e->end - e->begin != e->shape.size() * dtype_bytes(e->dtype)) { return "data_offsets do not match the shape"; }
+  return "";
+}
+
+export fn safetensors_parse(b: Bytes, owned: bool) -> Result<SafeFile*, string> {
+  if (b.length < 8) { return Err("too short for a safetensors file"); }
+  var n: uint64 = 0;
+  for i in 0..8 { n = n | ((uint64)b.data[i] << (uint64)(8 * i)); }
+  var header_len: int64 = (int64)n;
+  if (header_len < 2 || header_len > b.length - 8) { return Err("the header length {header_len} does not fit the file"); }
+  var text: string = str_from_bytes((cstring)(b.data + 8), header_len);
+  var reader: JsonReader;
+  json_begin(&reader, text);
+  if (json_next(&reader) != JSON_OBJECT_START) { return Err("the header is not a JSON object"); }
+  var f: SafeFile* = new SafeFile;
+  f->bytes = b;
+  f->owned = owned;
+  f->data_start = 8 + header_len;
+  var capacity: int32 = 0;
+  var ev: int32 = json_next(&reader);
+  while (ev == JSON_KEY) {
+    if (json_text_is(&reader, "__metadata__")) {
+      var skipped: int32 = json_next(&reader);
+      if (skipped == JSON_OBJECT_START || skipped == JSON_ARRAY_START) { json_skip(&reader); }
+      ev = json_next(&reader);
+      continue;
+    }
+    if (f->count == capacity) {
+      capacity = if (capacity == 0) 16 else capacity * 2;
+      f->entries = (SafeEntry*)realloc((rawptr)f->entries, (int64)capacity * sizeof(SafeEntry));
+    }
+    var e: SafeEntry* = &f->entries[f->count];
+    memset((rawptr)e, 0, sizeof(SafeEntry));
+    keep_name(f, &reader, e);
+    f->count = f->count + 1;
+    var problem: string = parse_entry(&reader, e);
+    if (problem.length > 0) {
+      var why: string = "tensor '{f->name(f->count - 1)}': {problem}";
+      f->owned = false;
+      safe_file_free(f);
+      return Err(why);
+    }
+    if (f->data_start + e->end > b.length) {
+      var why: string = "tensor '{f->name(f->count - 1)}' runs past the end of the file";
+      f->owned = false;
+      safe_file_free(f);
+      return Err(why);
+    }
+    ev = json_next(&reader);
+  }
+  if (ev != JSON_OBJECT_END) {
+    f->owned = false;
+    safe_file_free(f);
+    return Err("the header is not valid JSON near byte {json_error_offset(&reader)}");
+  }
+  return Ok(f);
+}
+
+export fn safetensors_open(path: string) -> Result<SafeFile*, string> {
+  match (read_file(path)) {
+    case Ok(b): {
+      match (safetensors_parse(b, true)) {
+        case Ok(f): { return Ok(f); }
+        case Err(e): {
+          var copy: Bytes = b;
+          bytes_free(&copy);
+          return Err("{path}: {e}");
+        }
+      }
+    }
+    case Err(e): { return Err(e); }
+  }
+  return Err("unreachable");
+}
+
+export fn safe_file_free(f: SafeFile*) {
+  if (f->entries != 0) { free((rawptr)f->entries); }
+  if (f->names != 0) { free((rawptr)f->names); }
+  if (f->owned) { bytes_free(&f->bytes); }
+  free((rawptr)f);
+}
+
+export fn SafeFile_find__ptr(f: SafeFile*, name: string) -> int32 {
+  for i in 0..f->count {
+    var e: SafeEntry* = &f->entries[i];
+    if (e->name_length != (int64)name.length) { continue; }
+    if (mem_equal((cstring)(f->names + e->name_at), name.chars, e->name_length) == 1) { return i; }
+  }
+  return -1;
+}
+
+fn half_to_float(h: uint32) -> float32 {
+  var sign: uint32 = (h & (uint32)0x8000) << (uint32)16;
+  var exponent: uint32 = (h >> (uint32)10) & (uint32)31;
+  var mantissa: uint32 = h & (uint32)1023;
+  var bits: uint32 = 0;
+  if (exponent == (uint32)0) {
+    if (mantissa == (uint32)0) {
+      bits = sign;
+    } else {
+      var e: uint32 = 113;
+      while ((mantissa & (uint32)1024) == (uint32)0) {
+        mantissa = mantissa << (uint32)1;
+        e = e - (uint32)1;
+      }
+      mantissa = mantissa & (uint32)1023;
+      bits = sign | (e << (uint32)23) | (mantissa << (uint32)13);
+    }
+  } else if (exponent == (uint32)31) {
+    bits = sign | (uint32)0x7F800000 | (mantissa << (uint32)13);
+  } else {
+    bits = sign | ((exponent + (uint32)112) << (uint32)23) | (mantissa << (uint32)13);
+  }
+  return *(float32*)&bits;
+}
+
+export fn SafeFile_read__ptr(f: SafeFile*, index: int32, dst: float32*) {
+  var e: SafeEntry* = &f->entries[index];
+  var src: uint8* = f->bytes.data + f->data_start + e->begin;
+  var n: int64 = e->shape.size();
+  if (e->dtype == DTYPE_F32) {
+    memcpy((rawptr)dst, (rawptr)src, n * 4);
+    return;
+  }
+  if (e->dtype == DTYPE_F64) {
+    for i: int64 in 0..n {
+      var v: float64 = 0.0;
+      memcpy((rawptr)&v, (rawptr)(src + i * 8), 8);
+      dst[i] = (float32)v;
+    }
+    return;
+  }
+  for i: int64 in 0..n {
+    var h: uint32 = (uint32)src[i * 2] | ((uint32)src[i * 2 + 1] << (uint32)8);
+    if (e->dtype == DTYPE_BF16) {
+      var bits: uint32 = h << (uint32)16;
+      dst[i] = *(float32*)&bits;
+    } else {
+      dst[i] = half_to_float(h);
+    }
+  }
+}
+
+export fn safetensors_load(ps: Params*, f: SafeFile*, strict: bool) -> Result<int32, string> {
+  var loaded: int32 = 0;
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    var at: int32 = f->find(p->name);
+    if (at < 0) {
+      if (strict) { return Err("the checkpoint has no tensor '{p->name}'"); }
+      continue;
+    }
+    var e: SafeEntry* = &f->entries[at];
+    if (e->shape.size() != p->value.shape.size() || (strict && !e->shape.equal(p->value.shape))) {
+      return Err("'{p->name}' is {e->shape.text()} in the checkpoint and {p->value.shape.text()} in the model");
+    }
+    f->read(at, p->value.data);
+    if (ps->dev != 0) { ps->dev->put((rawptr)p->dvalue, (rawptr)p->value.data, p->value.shape.size() * 4); }
+    loaded = loaded + 1;
+  }
+  if (strict && loaded != f->count) {
+    for k in 0..f->count {
+      var name: string = f->name(k);
+      if (ps->find(name) == 0) { return Err("the model has no parameter '{name}'"); }
+    }
+  }
+  return Ok(loaded);
+}
+
+export fn load_safetensors(ps: Params*, path: string, strict: bool) -> Result<int32, string> {
+  match (safetensors_open(path)) {
+    case Ok(f): {
+      var r: Result<int32, string> = safetensors_load(ps, f, strict);
+      safe_file_free(f);
+      return r;
+    }
+    case Err(e): { return Err(e); }
+  }
+  return Err("unreachable");
+}
+
+@test fn safetensors_round_trip() -> int32 {
+  var a: Params* = params_new();
+  var w: Param* = a->add("blocks.0.attn \"q\"", shape(2, 3), PARAM_WEIGHT, true);
+  var b: Param* = a->add("bias", shape(3), PARAM_WEIGHT, false);
+  var m: Param* = a->add("bn.running_mean", shape(1), PARAM_BUFFER, false);
+  for i in 0..6 { w->value.data[i] = (float32)i * (float32)0.5; }
+  for i in 0..3 { b->value.data[i] = (float32)-1.0 - (float32)i; }
+  m->value.data[0] = 7.25;
+  var bytes: Bytes = safetensors_encode(a);
+  var c: Params* = params_new();
+  var w2: Param* = c->add("blocks.0.attn \"q\"", shape(2, 3), PARAM_WEIGHT, true);
+  var b2: Param* = c->add("bias", shape(3), PARAM_WEIGHT, false);
+  var m2: Param* = c->add("bn.running_mean", shape(1), PARAM_BUFFER, false);
+  var code: int32 = 0;
+  match (safetensors_parse(bytes, false)) {
+    case Ok(f): {
+      if (f->count != 3) { code = 1; }
+      if ((f->data_start % 8) != 0) { code = 2; }
+      match (safetensors_load(c, f, true)) {
+        case Ok(n): { if (n != 3) { code = 3; } }
+        case Err(e): { code = 4; }
+      }
+      safe_file_free(f);
+    }
+    case Err(e): { code = 5; }
+  }
+  for i in 0..6 {
+    if (w2->value.data[i] != w->value.data[i]) { code = 6; }
+  }
+  if (b2->value.data[2] != (float32)-3.0 || m2->value.data[0] != (float32)7.25) { code = 7; }
+  bytes_free(&bytes);
+  params_free(a);
+  params_free(c);
+  return code;
+}
+
+@test fn safetensors_reads_half_precision() -> int32 {
+  var header: string = "{{\"x\":{{\"dtype\":\"F16\",\"shape\":[3],\"data_offsets\":[0,6]},\"y\":{{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[6,8]}}  ";
+  var total: int64 = 8 + (int64)header.length + 8;
+  var buf: uint8* = (uint8*)malloc(total);
+  var hl: int64 = (int64)header.length;
+  for i in 0..8 { buf[i] = (uint8)((hl >> (int64)(8 * i)) & 255); }
+  for i in 0..header.length { buf[8 + (int64)i] = (uint8)header.chars[i]; }
+  var d: uint8* = buf + 8 + hl;
+  d[0] = 0;
+  d[1] = 60;
+  d[2] = 0;
+  d[3] = 192;
+  d[4] = 1;
+  d[5] = 0;
+  d[6] = 192;
+  d[7] = 63;
+  var code: int32 = 0;
+  match (safetensors_parse({ data: buf, length: total }, false)) {
+    case Ok(f): {
+      var out: float32[3];
+      f->read(0, &out[0]);
+      if (out[0] != (float32)1.0 || out[1] != (float32)-2.0) { code = 1; }
+      if (out[2] != (float32)5.9604644775390625e-8) { code = 2; }
+      var y: float32[1];
+      f->read(1, &y[0]);
+      if (y[0] != (float32)1.5) { code = 3; }
+      safe_file_free(f);
+    }
+    case Err(e): { code = 4; }
+  }
+  free((rawptr)buf);
+  return code;
+}
+
+@test fn safetensors_refuses_bad_headers() -> int32 {
+  var header: string = "{{\"x\":{{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,8]}}";
+  var total: int64 = 8 + (int64)header.length + 8;
+  var buf: uint8* = (uint8*)calloc(1, total);
+  var hl: int64 = (int64)header.length;
+  for i in 0..8 { buf[i] = (uint8)((hl >> (int64)(8 * i)) & 255); }
+  for i in 0..header.length { buf[8 + (int64)i] = (uint8)header.chars[i]; }
+  var code: int32 = 1;
+  match (safetensors_parse({ data: buf, length: total }, false)) {
+    case Ok(f): { safe_file_free(f); }
+    case Err(e): { code = 0; }
+  }
+  free((rawptr)buf);
+  return code;
+}

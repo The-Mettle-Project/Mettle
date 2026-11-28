@@ -1,0 +1,551 @@
+import "std/mem";
+import "./tensor";
+import "./kernels";
+import "./graph";
+
+struct ConvGeom {
+  n: int64;
+  c: int64;
+  h: int64;
+  w: int64;
+  o: int64;
+  kh: int64;
+  kw: int64;
+  oh: int64;
+  ow: int64;
+  stride: int64;
+  pad: int64;
+  dilation: int64;
+  x: float32*;
+  rows: float32*;
+  dx: float32*;
+}
+
+fn conv_out(size: int64, k: int64, stride: int64, pad: int64, dilation: int64) -> int64 {
+  return (size + 2 * pad - dilation * (k - 1) - 1) / stride + 1;
+}
+
+fn first_inside(k_offset: int64, stride: int64, pad: int64, limit: int64, count: int64) -> int64 {
+  var o: int64 = 0;
+  while (o < count && o * stride - pad + k_offset < 0) { o = o + 1; }
+  return o;
+}
+
+fn last_inside(k_offset: int64, stride: int64, pad: int64, limit: int64, count: int64) -> int64 {
+  var o: int64 = count;
+  while (o > 0 && (o - 1) * stride - pad + k_offset >= limit) { o = o - 1; }
+  return o;
+}
+
+@noinline fn im2col_images(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var q: ConvGeom* = (ConvGeom*)ctx;
+  var p_count: int64 = q->oh * q->ow;
+  var ld: int64 = q->n * p_count;
+  for img: int64 in lo..hi {
+    var src: float32* = q->x + img * q->c * q->h * q->w;
+    var r: int64 = 0;
+    for ch: int64 in 0..q->c {
+      var plane: float32* = src + ch * q->h * q->w;
+      for ky: int64 in 0..q->kh {
+        var dy: int64 = ky * q->dilation;
+        var y0: int64 = first_inside(dy, q->stride, q->pad, q->h, q->oh);
+        var y1: int64 = last_inside(dy, q->stride, q->pad, q->h, q->oh);
+        for kx: int64 in 0..q->kw {
+          var dx: int64 = kx * q->dilation;
+          var x0: int64 = first_inside(dx, q->stride, q->pad, q->w, q->ow);
+          var x1: int64 = last_inside(dx, q->stride, q->pad, q->w, q->ow);
+          var dst: float32* = q->rows + r * ld + img * p_count;
+          if (y0 >= y1 || x0 >= x1) {
+            zero_f32(dst, p_count);
+          } else {
+            if (y0 > 0) { zero_f32(dst, y0 * q->ow); }
+            for oy: int64 in y0..y1 {
+              var line: float32* = dst + oy * q->ow;
+              var srow: float32* = plane + (oy * q->stride - q->pad + dy) * q->w - q->pad + dx;
+              if (x0 > 0) { zero_f32(line, x0); }
+              if (q->stride == 1) {
+                copy_f32(line + x0, srow + x0, x1 - x0);
+              } else {
+                for ox: int64 in x0..x1 { line[ox] = srow[ox * q->stride]; }
+              }
+              if (x1 < q->ow) { zero_f32(line + x1, q->ow - x1); }
+            }
+            if (y1 < q->oh) { zero_f32(dst + y1 * q->ow, (q->oh - y1) * q->ow); }
+          }
+          r = r + 1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+@noinline fn col2im_images(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var q: ConvGeom* = (ConvGeom*)ctx;
+  var p_count: int64 = q->oh * q->ow;
+  var ld: int64 = q->n * p_count;
+  for img: int64 in lo..hi {
+    var dst: float32* = q->dx + img * q->c * q->h * q->w;
+    var r: int64 = 0;
+    for ch: int64 in 0..q->c {
+      var plane: float32* = dst + ch * q->h * q->w;
+      for ky: int64 in 0..q->kh {
+        var dy: int64 = ky * q->dilation;
+        var y0: int64 = first_inside(dy, q->stride, q->pad, q->h, q->oh);
+        var y1: int64 = last_inside(dy, q->stride, q->pad, q->h, q->oh);
+        for kx: int64 in 0..q->kw {
+          var dx: int64 = kx * q->dilation;
+          var x0: int64 = first_inside(dx, q->stride, q->pad, q->w, q->ow);
+          var x1: int64 = last_inside(dx, q->stride, q->pad, q->w, q->ow);
+          var src: float32* = q->rows + r * ld + img * p_count;
+          for oy: int64 in y0..y1 {
+            var line: float32* = src + oy * q->ow;
+            var drow: float32* = plane + (oy * q->stride - q->pad + dy) * q->w - q->pad + dx;
+            if (q->stride == 1) {
+              add_into_f32(drow + x0, line + x0, x1 - x0);
+            } else {
+              for ox: int64 in x0..x1 { drow[ox * q->stride] = drow[ox * q->stride] + line[ox]; }
+            }
+          }
+          r = r + 1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+fn geom_of(g: Graph*, node: Node*) -> ConvGeom* {
+  var sx: Shape = g->nodes[node->a].value.shape;
+  var sw: Shape = g->nodes[node->b].value.shape;
+  var q: ConvGeom* = new ConvGeom;
+  q->n = sx.dims[0];
+  q->c = sx.dims[1];
+  q->h = sx.dims[2];
+  q->w = sx.dims[3];
+  q->o = sw.dims[0];
+  q->kh = sw.dims[2];
+  q->kw = sw.dims[3];
+  q->stride = node->i0;
+  q->pad = node->i1;
+  q->dilation = node->i2;
+  q->oh = node->value.shape.dims[2];
+  q->ow = node->value.shape.dims[3];
+  return q;
+}
+
+fn conv_any(x: Var, w: Var, bias_id: int32, stride: int64, pad: int64, dilation: int64) -> Var {
+  var g: Graph* = x.g;
+  var sx: Shape = x.shape();
+  var sw: Shape = w.shape();
+  if (sx.rank != 4) { mmll_fail("conv2d input is [batch, channels, height, width], got {sx.text()}"); }
+  if (sw.rank != 4) { mmll_fail("conv2d weight is [out, in, kh, kw], got {sw.text()}"); }
+  if (sw.dims[1] != sx.dims[1]) { mmll_fail("conv2d of {sx.text()} by {sw.text()}: channels differ"); }
+  if (stride < 1 || dilation < 1 || pad < 0) { mmll_fail("conv2d stride and dilation must be at least 1, padding at least 0"); }
+  var oh: int64 = conv_out(sx.dims[2], sw.dims[2], stride, pad, dilation);
+  var ow: int64 = conv_out(sx.dims[3], sw.dims[3], stride, pad, dilation);
+  if (oh < 1 || ow < 1) { mmll_fail("conv2d of {sx.text()} by {sw.text()} leaves no output"); }
+  var id: int32 = g->push(OP_CONV2D, x.id, w.id, bias_id, shape(sx.dims[0], sw.dims[0], oh, ow));
+  var node: Node* = g->node(id);
+  node->i0 = stride;
+  node->i1 = pad;
+  node->i2 = dilation;
+  var q: ConvGeom* = geom_of(g, node);
+  var ckk: int64 = q->c * q->kh * q->kw;
+  var p_count: int64 = oh * ow;
+  q->x = g->data(x.id);
+  q->rows = g->floats(q->n * p_count * ckk);
+  g->nodes[id].saved = q->rows;
+  if (g->forward_on_device(id)) {
+    free((rawptr)q);
+    return { g: g, id: id };
+  }
+  run_parallel(&im2col_images, (rawptr)q, q->n, p_count * ckk);
+  var out: float32* = g->data(id);
+  gemm_nn_batched(q->n, q->o, p_count, ckk, g->data(w.id), ckk, 0, q->rows, q->n * p_count, p_count, out, p_count, q->o * p_count, false);
+  if (bias_id >= 0) {
+    var b: float32* = g->data(bias_id);
+    for img: int64 in 0..q->n {
+      for o: int64 in 0..q->o {
+        var plane: float32* = out + (img * q->o + o) * p_count;
+        var bv: float32 = b[o];
+        for i: int64 in 0..p_count { plane[i] = plane[i] + bv; }
+      }
+    }
+  }
+  g->nodes[id].saved = q->rows;
+  free((rawptr)q);
+  return { g: g, id: id };
+}
+
+export fn conv2d(x: Var, w: Var, bias: Var, stride: int64, pad: int64) -> Var {
+  return conv_any(x, w, bias.id, stride, pad, 1);
+}
+
+export fn conv2d_nobias(x: Var, w: Var, stride: int64, pad: int64) -> Var {
+  return conv_any(x, w, -1, stride, pad, 1);
+}
+
+export fn conv2d_dilated(x: Var, w: Var, bias: Var, stride: int64, pad: int64, dilation: int64) -> Var {
+  return conv_any(x, w, bias.id, stride, pad, dilation);
+}
+
+export fn backward_conv2d(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var q: ConvGeom* = geom_of(g, node);
+  var ckk: int64 = q->c * q->kh * q->kw;
+  var p_count: int64 = q->oh * q->ow;
+  var dout: float32* = node->grad;
+  var cols: float32* = node->saved;
+  var ix: int32 = node->a;
+  var iw: int32 = node->b;
+  var ib: int32 = node->c;
+  var np: int64 = q->n * p_count;
+  var dout_t: float32* = g->floats(q->o * np);
+  for o: int64 in 0..q->o {
+    for img: int64 in 0..q->n {
+      copy_f32(dout_t + o * np + img * p_count, dout + (img * q->o + o) * p_count, p_count);
+    }
+  }
+  if (g->nodes[iw].requires) {
+    gemm_nt(q->o, ckk, np, dout_t, np, cols, np, g->grad_of(iw), ckk, true);
+  }
+  if (ib >= 0 && g->nodes[ib].requires) {
+    var db: float32* = g->grad_of(ib);
+    for img: int64 in 0..q->n {
+      for o: int64 in 0..q->o {
+        db[o] = db[o] + sum_f32(dout + (img * q->o + o) * p_count, p_count);
+      }
+    }
+  }
+  if (g->nodes[ix].requires) {
+    var wt: float32* = g->floats(ckk * q->o);
+    transpose_f32(g->data(iw), q->o, ckk, wt);
+    var dcols: float32* = g->floats(ckk * np);
+    gemm_nn(ckk, np, q->o, wt, q->o, dout_t, np, dcols, np, false);
+    q->rows = dcols;
+    q->dx = g->grad_of(ix);
+    run_parallel(&col2im_images, (rawptr)q, q->n, p_count * ckk);
+  }
+  free((rawptr)q);
+}
+
+struct PoolJob {
+  x: float32*;
+  y: float32*;
+  dy: float32*;
+  dx: float32*;
+  arg: int32*;
+  h: int64;
+  w: int64;
+  oh: int64;
+  ow: int64;
+  k: int64;
+  stride: int64;
+  pad: int64;
+  max: bool;
+  backward: bool;
+}
+
+@noinline fn pool_planes(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: PoolJob* = (PoolJob*)ctx;
+  var in_plane: int64 = j->h * j->w;
+  var out_plane: int64 = j->oh * j->ow;
+  var area: float32 = (float32)(1.0 / (float64)(j->k * j->k));
+  for plane: int64 in lo..hi {
+    var x: float32* = j->x + plane * in_plane;
+    for oy: int64 in 0..j->oh {
+      for ox: int64 in 0..j->ow {
+        var at: int64 = plane * out_plane + oy * j->ow + ox;
+        var y0: int64 = oy * j->stride - j->pad;
+        var x0: int64 = ox * j->stride - j->pad;
+        if (j->max) {
+          if (j->backward) {
+            var src: int64 = (int64)j->arg[at];
+            if (src >= 0) {
+              var d: float32* = j->dx + plane * in_plane;
+              d[src] = d[src] + j->dy[at];
+            }
+            continue;
+          }
+          var best: float32 = 0.0;
+          var best_at: int32 = -1;
+          for ky: int64 in 0..j->k {
+            var iy: int64 = y0 + ky;
+            if (iy < 0 || iy >= j->h) { continue; }
+            for kx: int64 in 0..j->k {
+              var ix: int64 = x0 + kx;
+              if (ix < 0 || ix >= j->w) { continue; }
+              var v: float32 = x[iy * j->w + ix];
+              if (best_at < 0 || v > best) {
+                best = v;
+                best_at = (int32)(iy * j->w + ix);
+              }
+            }
+          }
+          j->y[at] = best;
+          j->arg[at] = best_at;
+        } else {
+          if (j->backward) {
+            var d: float32* = j->dx + plane * in_plane;
+            var share: float32 = j->dy[at] * area;
+            for ky: int64 in 0..j->k {
+              var iy: int64 = y0 + ky;
+              if (iy < 0 || iy >= j->h) { continue; }
+              for kx: int64 in 0..j->k {
+                var ix: int64 = x0 + kx;
+                if (ix < 0 || ix >= j->w) { continue; }
+                d[iy * j->w + ix] = d[iy * j->w + ix] + share;
+              }
+            }
+            continue;
+          }
+          var total: float32 = 0.0;
+          for ky: int64 in 0..j->k {
+            var iy: int64 = y0 + ky;
+            if (iy < 0 || iy >= j->h) { continue; }
+            for kx: int64 in 0..j->k {
+              var ix: int64 = x0 + kx;
+              if (ix < 0 || ix >= j->w) { continue; }
+              total = total + x[iy * j->w + ix];
+            }
+          }
+          j->y[at] = total * area;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+fn pool_any(x: Var, k: int64, stride: int64, pad: int64, max: bool) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  if (s.rank != 4) { mmll_fail("pooling input is [batch, channels, height, width], got {s.text()}"); }
+  if (k < 1 || stride < 1 || pad < 0 || pad * 2 > k) { mmll_fail("pooling needs k >= 1, stride >= 1 and padding at most half the window"); }
+  var oh: int64 = (s.dims[2] + 2 * pad - k) / stride + 1;
+  var ow: int64 = (s.dims[3] + 2 * pad - k) / stride + 1;
+  if (oh < 1 || ow < 1) { mmll_fail("pooling {s.text()} with a window of {k} leaves no output"); }
+  var op: int32 = if (max) OP_MAX_POOL2D else OP_AVG_POOL2D;
+  var id: int32 = g->push(op, x.id, -1, -1, shape(s.dims[0], s.dims[1], oh, ow));
+  var node: Node* = g->node(id);
+  node->i0 = k;
+  node->i1 = stride;
+  node->i2 = pad;
+  var planes: int64 = s.dims[0] * s.dims[1];
+  if (max) { g->nodes[id].ints = g->index(planes * oh * ow); }
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var j: PoolJob* = new PoolJob;
+  j->x = g->data(x.id);
+  j->y = g->data(id);
+  j->h = s.dims[2];
+  j->w = s.dims[3];
+  j->oh = oh;
+  j->ow = ow;
+  j->k = k;
+  j->stride = stride;
+  j->pad = pad;
+  j->max = max;
+  j->arg = g->nodes[id].ints;
+  run_parallel(&pool_planes, (rawptr)j, planes, oh * ow * k * k);
+  free((rawptr)j);
+  return { g: g, id: id };
+}
+
+export fn max_pool2d(x: Var, k: int64, stride: int64, pad: int64) -> Var { return pool_any(x, k, stride, pad, true); }
+export fn avg_pool2d(x: Var, k: int64, stride: int64, pad: int64) -> Var { return pool_any(x, k, stride, pad, false); }
+
+export fn backward_pool(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  if (!g->nodes[node->a].requires) { return; }
+  var s: Shape = g->nodes[node->a].value.shape;
+  var j: PoolJob* = new PoolJob;
+  j->dy = node->grad;
+  j->dx = g->grad_of(node->a);
+  j->arg = node->ints;
+  j->h = s.dims[2];
+  j->w = s.dims[3];
+  j->oh = node->value.shape.dims[2];
+  j->ow = node->value.shape.dims[3];
+  j->k = node->i0;
+  j->stride = node->i1;
+  j->pad = node->i2;
+  j->max = node->op == OP_MAX_POOL2D;
+  j->backward = true;
+  run_parallel(&pool_planes, (rawptr)j, s.dims[0] * s.dims[1], j->oh * j->ow * j->k * j->k);
+  free((rawptr)j);
+}
+
+export fn global_avg_pool(x: Var) -> Var {
+  var s: Shape = x.shape();
+  if (s.rank != 4) { mmll_fail("global_avg_pool input is [batch, channels, height, width], got {s.text()}"); }
+  return x.view(s.dims[0], s.dims[1], s.dims[2] * s.dims[3]).mean_axis(-1, false);
+}
+
+struct NormJob {
+  x: float32*;
+  y: float32*;
+  dy: float32*;
+  dx: float32*;
+  gamma: float32*;
+  beta: float32*;
+  mean: float32*;
+  rstd: float32*;
+  run_mean: float32*;
+  run_var: float32*;
+  dgamma: float32*;
+  dbeta: float32*;
+  n: int64;
+  c: int64;
+  spatial: int64;
+  eps: float32;
+  momentum: float32;
+  training: bool;
+  backward: bool;
+}
+
+@noinline fn batch_norm_channels(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: NormJob* = (NormJob*)ctx;
+  var count: float64 = (float64)(j->n * j->spatial);
+  var one: float32 = 1.0;
+  for ch: int64 in lo..hi {
+    var gm: float32 = if j->gamma == 0 { one } else { j->gamma[ch] };
+    if (!j->backward) {
+      var mu: float32 = 0.0;
+      var rs: float32 = 0.0;
+      if (j->training) {
+        var total: float64 = 0.0;
+        for img: int64 in 0..j->n {
+          total = total + (float64)sum_f32(j->x + (img * j->c + ch) * j->spatial, j->spatial);
+        }
+        var mean: float64 = total / count;
+        var squares: float64 = 0.0;
+        for img: int64 in 0..j->n {
+          var p: float32* = j->x + (img * j->c + ch) * j->spatial;
+          for i: int64 in 0..j->spatial {
+            var d: float64 = (float64)p[i] - mean;
+            squares = squares + d * d;
+          }
+        }
+        var variance: float64 = squares / count;
+        mu = (float32)mean;
+        rs = rsqrt_f32((float32)variance + j->eps);
+        if (j->run_mean != 0) {
+          var m: float32 = j->momentum;
+          var unbiased: float64 = if count > 1.0 { variance * count / (count - 1.0) } else { variance };
+          j->run_mean[ch] = (one - m) * j->run_mean[ch] + m * mu;
+          j->run_var[ch] = (one - m) * j->run_var[ch] + m * (float32)unbiased;
+        }
+      } else {
+        mu = j->run_mean[ch];
+        rs = rsqrt_f32(j->run_var[ch] + j->eps);
+      }
+      j->mean[ch] = mu;
+      j->rstd[ch] = rs;
+      var bt: float32 = if j->beta == 0 { (float32)0.0 } else { j->beta[ch] };
+      for img: int64 in 0..j->n {
+        var p: float32* = j->x + (img * j->c + ch) * j->spatial;
+        var q: float32* = j->y + (img * j->c + ch) * j->spatial;
+        for i: int64 in 0..j->spatial { q[i] = (p[i] - mu) * rs * gm + bt; }
+      }
+      continue;
+    }
+    var mu: float32 = j->mean[ch];
+    var rs: float32 = j->rstd[ch];
+    var sum_dy: float64 = 0.0;
+    var sum_dy_xh: float64 = 0.0;
+    for img: int64 in 0..j->n {
+      var p: float32* = j->x + (img * j->c + ch) * j->spatial;
+      var d: float32* = j->dy + (img * j->c + ch) * j->spatial;
+      for i: int64 in 0..j->spatial {
+        sum_dy = sum_dy + (float64)d[i];
+        sum_dy_xh = sum_dy_xh + (float64)(d[i] * (p[i] - mu) * rs);
+      }
+    }
+    if (j->dgamma != 0) { j->dgamma[ch] = j->dgamma[ch] + (float32)sum_dy_xh; }
+    if (j->dbeta != 0) { j->dbeta[ch] = j->dbeta[ch] + (float32)sum_dy; }
+    if (j->dx == 0) { continue; }
+    var mean_dy: float32 = (float32)(sum_dy / count);
+    var mean_dy_xh: float32 = (float32)(sum_dy_xh / count);
+    for img: int64 in 0..j->n {
+      var p: float32* = j->x + (img * j->c + ch) * j->spatial;
+      var d: float32* = j->dy + (img * j->c + ch) * j->spatial;
+      var o: float32* = j->dx + (img * j->c + ch) * j->spatial;
+      if (j->training) {
+        for i: int64 in 0..j->spatial {
+          var xh: float32 = (p[i] - mu) * rs;
+          o[i] = o[i] + gm * rs * (d[i] - mean_dy - xh * mean_dy_xh);
+        }
+      } else {
+        for i: int64 in 0..j->spatial { o[i] = o[i] + gm * rs * d[i]; }
+      }
+    }
+  }
+  return 0;
+}
+
+export fn batch_norm(x: Var, gamma: Var, beta: Var, running_mean: float32*, running_var: float32*, momentum: float64, eps: float64) -> Var {
+  var g: Graph* = x.g;
+  var s: Shape = x.shape();
+  if (s.rank < 2) { mmll_fail("batch_norm input is [batch, channels, ...], got {s.text()}"); }
+  var c: int64 = s.dims[1];
+  if (gamma.size() != c || beta.size() != c) { mmll_fail("batch_norm over {c} channels needs {c} scales and shifts"); }
+  if (!g->training && (running_mean == 0 || running_var == 0)) {
+    mmll_fail("batch_norm in evaluation needs running statistics");
+  }
+  var spatial: int64 = 1;
+  for i in 2..s.rank { spatial = spatial * s.dims[i]; }
+  var id: int32 = g->push(OP_BATCH_NORM, x.id, gamma.id, beta.id, s);
+  var node: Node* = g->node(id);
+  node->saved = g->floats(c);
+  node->saved2 = g->floats(c);
+  node->i0 = if (g->training) 1 else 0;
+  node->i1 = spatial;
+  node->i2 = (int64)running_mean;
+  node->i3 = (int64)running_var;
+  node->f0 = (float32)eps;
+  node->f1 = (float32)momentum;
+  if (g->forward_on_device(id)) { return { g: g, id: id }; }
+  var j: NormJob* = new NormJob;
+  j->x = g->data(x.id);
+  j->y = g->data(id);
+  j->gamma = g->data(gamma.id);
+  j->beta = g->data(beta.id);
+  j->mean = node->saved;
+  j->rstd = node->saved2;
+  j->run_mean = running_mean;
+  j->run_var = running_var;
+  j->n = s.dims[0];
+  j->c = c;
+  j->spatial = spatial;
+  j->eps = (float32)eps;
+  j->momentum = (float32)momentum;
+  j->training = g->training;
+  run_parallel(&batch_norm_channels, (rawptr)j, c, s.size() / (if (c < 1) 1 else c) * 3);
+  free((rawptr)j);
+  return { g: g, id: id };
+}
+
+export fn backward_batch_norm(g: Graph*, id: int32) {
+  var node: Node* = g->node(id);
+  var s: Shape = node->value.shape;
+  var ix: int32 = node->a;
+  var ig: int32 = node->b;
+  var ib: int32 = node->c;
+  var j: NormJob* = new NormJob;
+  j->x = g->data(ix);
+  j->dy = node->grad;
+  j->dx = if g->nodes[ix].requires { g->grad_of(ix) } else { (float32*)0 };
+  j->gamma = g->data(ig);
+  j->dgamma = if g->nodes[ig].requires { g->grad_of(ig) } else { (float32*)0 };
+  j->dbeta = if g->nodes[ib].requires { g->grad_of(ib) } else { (float32*)0 };
+  j->mean = node->saved;
+  j->rstd = node->saved2;
+  j->n = s.dims[0];
+  j->c = s.dims[1];
+  j->spatial = node->i1;
+  j->training = node->i0 == 1;
+  j->backward = true;
+  run_parallel(&batch_norm_channels, (rawptr)j, j->c, s.size() / (if (j->c < 1) 1 else j->c) * 4);
+  free((rawptr)j);
+}

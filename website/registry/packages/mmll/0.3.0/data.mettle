@@ -1,0 +1,345 @@
+import "std/mem";
+import "std/file";
+import "std/core";
+import "./tensor";
+import "./kernels";
+
+export struct Bytes {
+  data: uint8*;
+  length: int64;
+}
+
+export fn bytes_free(b: Bytes*) {
+  if (b->data != 0) { free((rawptr)b->data); }
+  b->data = (uint8*)0;
+  b->length = 0;
+}
+
+export fn read_file(path: string) -> Result<Bytes, string> {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return Err("cannot open {path}"); }
+  var size: int64 = file_size(fd);
+  if (size < 0) {
+    file_close(fd);
+    return Err("cannot size {path}");
+  }
+  var data: uint8* = (uint8*)malloc(if (size < 1) 1 else size);
+  if (data == 0) {
+    file_close(fd);
+    return Err("out of memory reading {path}");
+  }
+  var at: int64 = 0;
+  while (at < size) {
+    var want: int64 = size - at;
+    if (want > 1073741824) { want = 1073741824; }
+    var got: int64 = file_read_at(fd, data + at, want, at);
+    if (got <= 0) {
+      free((rawptr)data);
+      file_close(fd);
+      return Err("short read on {path}");
+    }
+    at = at + got;
+  }
+  file_close(fd);
+  return Ok({ data: data, length: size });
+}
+
+export fn write_file(path: string, data: uint8*, length: int64) -> Result<int64, string> {
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return Err("cannot create {path}"); }
+  var at: int64 = 0;
+  while (at < length) {
+    var want: int64 = length - at;
+    if (want > 1073741824) { want = 1073741824; }
+    var put: int64 = file_write_at(fd, data + at, want, at);
+    if (put <= 0) {
+      file_close(fd);
+      return Err("short write on {path}");
+    }
+    at = at + put;
+  }
+  file_close(fd);
+  return Ok(length);
+}
+
+fn be32(p: uint8*) -> int64 {
+  return ((int64)p[0] << 24) | ((int64)p[1] << 16) | ((int64)p[2] << 8) | (int64)p[3];
+}
+
+export struct Labels {
+  data: int32*;
+  count: int64;
+}
+
+export fn labels_free(l: Labels*) {
+  if (l->data != 0) { free((rawptr)l->data); }
+  l->data = (int32*)0;
+  l->count = 0;
+}
+
+fn idx_header(b: Bytes, rank: int32*, dims: int64*) -> Result<int64, string> {
+  if (b.length < 4 || b.data[0] != 0 || b.data[1] != 0) { return Err("not an IDX file"); }
+  if (b.data[2] != 8) { return Err("IDX element type {b.data[2]} is not unsigned bytes"); }
+  var r: int32 = (int32)b.data[3];
+  if (r < 1 || r > 5) { return Err("IDX rank {r} is unsupported"); }
+  if (b.length < 4 + 4 * (int64)r) { return Err("IDX header is cut short"); }
+  var count: int64 = 1;
+  for i in 0..r {
+    dims[i] = be32(b.data + 4 + 4 * (int64)i);
+    count = count * dims[i];
+  }
+  var offset: int64 = 4 + 4 * (int64)r;
+  if (b.length - offset < count) { return Err("IDX data is cut short"); }
+  *rank = r;
+  return Ok(offset);
+}
+
+export fn idx_images(path: string) -> Result<Tensor, string> {
+  var file: Bytes;
+  match (read_file(path)) {
+    case Ok(b): { file = b; }
+    case Err(e): { return Err(e); }
+  }
+  var rank: int32 = 0;
+  var dims: int64[6];
+  var offset: int64 = 0;
+  match (idx_header(file, &rank, &dims[0])) {
+    case Ok(o): { offset = o; }
+    case Err(e): {
+      bytes_free(&file);
+      return Err("{path}: {e}");
+    }
+  }
+  var s: Shape;
+  if (rank == 3) {
+    s = shape(dims[0], 1, dims[1], dims[2]);
+  } else {
+    s.rank = rank;
+    for i in 0..rank { s.dims[i] = dims[i]; }
+  }
+  var t: Tensor = tensor_new(s);
+  var n: int64 = s.size();
+  var scale: float32 = (float32)(1.0 / 255.0);
+  for i: int64 in 0..n { t.data[i] = (float32)file.data[offset + i] * scale; }
+  bytes_free(&file);
+  return Ok(t);
+}
+
+export fn idx_labels(path: string) -> Result<Labels, string> {
+  var file: Bytes;
+  match (read_file(path)) {
+    case Ok(b): { file = b; }
+    case Err(e): { return Err(e); }
+  }
+  var rank: int32 = 0;
+  var dims: int64[6];
+  var offset: int64 = 0;
+  match (idx_header(file, &rank, &dims[0])) {
+    case Ok(o): { offset = o; }
+    case Err(e): {
+      bytes_free(&file);
+      return Err("{path}: {e}");
+    }
+  }
+  if (rank != 1) {
+    bytes_free(&file);
+    return Err("{path}: labels are rank 1, this file is rank {rank}");
+  }
+  var out: int32* = (int32*)malloc(if (dims[0] < 1) 4 else dims[0] * 4);
+  for i: int64 in 0..dims[0] { out[i] = (int32)file.data[offset + i]; }
+  bytes_free(&file);
+  return Ok({ data: out, count: dims[0] });
+}
+
+export struct Batches {
+  order: int64*;
+  count: int64;
+  size: int64;
+  at: int64;
+  taken: int64;
+  rng: Rng;
+  shuffle: bool;
+  drop_last: bool;
+  epoch: int64;
+}
+
+export fn make_batches(count: int64, size: int64, shuffle: bool, seed: uint64) -> Batches* {
+  if (count < 1 || size < 1) { mmll_fail("batches need at least one example and a size of at least one"); }
+  var b: Batches* = new Batches;
+  b->order = (int64*)malloc(count * 8);
+  for i: int64 in 0..count { b->order[i] = i; }
+  b->count = count;
+  b->size = size;
+  b->shuffle = shuffle;
+  b->rng = rng_new(seed);
+  if (shuffle) { shuffle_order(b); }
+  return b;
+}
+
+fn shuffle_order(b: Batches*) {
+  var r: Rng* = &b->rng;
+  var i: int64 = b->count - 1;
+  while (i > 0) {
+    var j: int64 = r->below(i + 1);
+    var keep: int64 = b->order[i];
+    b->order[i] = b->order[j];
+    b->order[j] = keep;
+    i = i - 1;
+  }
+}
+
+export fn batches_free(b: Batches*) {
+  if (b->order != 0) { free((rawptr)b->order); }
+  free((rawptr)b);
+}
+
+export fn Batches_next__ptr(b: Batches*) -> int64 {
+  if (b->at >= b->count || (b->drop_last && b->count - b->at < b->size)) {
+    b->at = 0;
+    b->epoch = b->epoch + 1;
+    if (b->shuffle) { shuffle_order(b); }
+    b->taken = 0;
+    return 0;
+  }
+  var n: int64 = b->count - b->at;
+  if (n > b->size) { n = b->size; }
+  b->taken = n;
+  b->at = b->at + n;
+  return n;
+}
+
+export fn Batches_index__ptr(b: Batches*, slot: int64) -> int64 {
+  return b->order[b->at - b->taken + slot];
+}
+
+export fn Batches_take_rows__ptr(b: Batches*, src: Tensor, dst: float32*) {
+  var width: int64 = src.shape.size() / (if (src.shape.dims[0] < 1) 1 else src.shape.dims[0]);
+  for slot: int64 in 0..b->taken {
+    copy_f32(dst + slot * width, src.data + b->index(slot) * width, width);
+  }
+}
+
+export fn Batches_take_labels__ptr(b: Batches*, labels: int32*, dst: int32*) {
+  for slot: int64 in 0..b->taken { dst[slot] = labels[b->index(slot)]; }
+}
+
+export struct ByteVocab {
+  to_id: int32[256];
+  to_byte: uint8[256];
+  size: int32;
+}
+
+export fn byte_vocab(text: Bytes) -> ByteVocab {
+  var v: ByteVocab;
+  var seen: bool[256];
+  for i: int64 in 0..text.length { seen[text.data[i]] = true; }
+  for c in 0..256 {
+    v.to_id[c] = -1;
+    if (seen[c]) {
+      v.to_id[c] = v.size;
+      v.to_byte[v.size] = (uint8)c;
+      v.size = v.size + 1;
+    }
+  }
+  return v;
+}
+
+export fn ByteVocab_encode(v: ByteVocab, text: Bytes, out: int32*) -> int64 {
+  var n: int64 = 0;
+  for i: int64 in 0..text.length {
+    var id: int32 = v.to_id[text.data[i]];
+    if (id >= 0) {
+      out[n] = id;
+      n = n + 1;
+    }
+  }
+  return n;
+}
+
+export fn ByteVocab_byte(v: ByteVocab, id: int32) -> uint8 {
+  return v.to_byte[id];
+}
+
+export fn ByteVocab_id(v: ByteVocab, byte: uint8) -> int32 {
+  return v.to_id[byte];
+}
+
+export fn sample_windows(tokens: int32*, count: int64, batch: int64, length: int64, rng: Rng*, x: int32*, y: int32*) {
+  if (count <= length + 1) { mmll_fail("a corpus of {count} tokens is too short for windows of {length}"); }
+  for b: int64 in 0..batch {
+    var start: int64 = rng->below(count - length - 1);
+    for t: int64 in 0..length {
+      x[b * length + t] = tokens[start + t];
+      y[b * length + t] = tokens[start + t + 1];
+    }
+  }
+}
+
+export fn argmax_rows(t: Tensor, out: int32*) {
+  var cols: int64 = t.shape.last();
+  var rows: int64 = t.shape.rows();
+  for r: int64 in 0..rows {
+    var p: float32* = t.data + r * cols;
+    var best: float32 = p[0];
+    var at: int32 = 0;
+    for c: int64 in 1..cols {
+      if (p[c] > best) {
+        best = p[c];
+        at = (int32)c;
+      }
+    }
+    out[r] = at;
+  }
+}
+
+export fn count_correct(t: Tensor, labels: int32*) -> int64 {
+  var cols: int64 = t.shape.last();
+  var rows: int64 = t.shape.rows();
+  var hits: int64 = 0;
+  for r: int64 in 0..rows {
+    var p: float32* = t.data + r * cols;
+    var best: float32 = p[0];
+    var at: int32 = 0;
+    for c: int64 in 1..cols {
+      if (p[c] > best) {
+        best = p[c];
+        at = (int32)c;
+      }
+    }
+    if (at == labels[r]) { hits = hits + 1; }
+  }
+  return hits;
+}
+
+@test fn batches_cover_every_example_once() -> int32 {
+  var b: Batches* = make_batches(10, 4, true, 7);
+  var seen: int32[10];
+  var sizes: int64 = 0;
+  var n: int64 = b->next();
+  while (n > 0) {
+    for s: int64 in 0..n { seen[b->index(s)] = seen[b->index(s)] + 1; }
+    sizes = sizes + 1;
+    n = b->next();
+  }
+  for i in 0..10 {
+    if (seen[i] != 1) { return 1; }
+  }
+  if (sizes != 3 || b->epoch != 1) { return 2; }
+  batches_free(b);
+  return 0;
+}
+
+@test fn byte_vocab_round_trips() -> int32 {
+  var text: string = "hello, world";
+  var bytes: Bytes = { data: (uint8*)text.chars, length: (int64)text.length };
+  var v: ByteVocab = byte_vocab(bytes);
+  if (v.size != 9) { return 1; }
+  var ids: int32[12];
+  var n: int64 = v.encode(bytes, &ids[0]);
+  if (n != 12) { return 2; }
+  for i in 0..12 {
+    if (v.byte(ids[i]) != text.chars[i]) { return 3; }
+    if (v.id((uint8)text.chars[i]) != ids[i]) { return 4; }
+  }
+  return 0;
+}

@@ -1,0 +1,517 @@
+import "std/mem";
+import "std/math";
+import "std/io";
+import "std/process";
+import "./kernels";
+
+export const MAX_RANK = 6;
+
+@noreturn export fn mmll_fail(why: string) {
+  println_err("mmll: {why}");
+  exit(1);
+}
+
+export struct Shape {
+  dims: int64[6];
+  rank: int32;
+}
+
+export struct Tensor {
+  data: float32*;
+  shape: Shape;
+}
+
+export fn shape(dims: int64[..]) -> Shape {
+  var s: Shape;
+  if (dims.length > MAX_RANK) {
+    mmll_fail("a shape has at most 6 dimensions");
+  }
+  s.rank = (int32)dims.length;
+  for i in 0..dims.length {
+    if (dims[i] < 0) { mmll_fail("a dimension cannot be negative"); }
+    s.dims[i] = dims[i];
+  }
+  return s;
+}
+
+export fn shape_scalar() -> Shape {
+  var s: Shape;
+  return s;
+}
+
+export fn Shape_size(s: Shape) -> int64 {
+  var n: int64 = 1;
+  for i in 0..s.rank { n = n * s.dims[i]; }
+  return n;
+}
+
+export fn Shape_axis(s: Shape, axis: int32) -> int32 {
+  var a: int32 = if (axis < 0) axis + s.rank else axis;
+  if (a < 0 || a >= s.rank) {
+    mmll_fail("axis {axis} is outside a rank {s.rank} shape");
+  }
+  return a;
+}
+
+export fn Shape_dim(s: Shape, axis: int32) -> int64 {
+  return s.dims[s.axis(axis)];
+}
+
+export fn Shape_last(s: Shape) -> int64 {
+  if (s.rank == 0) { return 1; }
+  return s.dims[s.rank - 1];
+}
+
+export fn Shape_rows(s: Shape) -> int64 {
+  var last: int64 = s.last();
+  if (last == 0) { return 0; }
+  return s.size() / last;
+}
+
+export fn Shape_equal(a: Shape, b: Shape) -> bool {
+  if (a.rank != b.rank) { return false; }
+  for i in 0..a.rank {
+    if (a.dims[i] != b.dims[i]) { return false; }
+  }
+  return true;
+}
+
+export fn Shape_with(s: Shape, axis: int32, value: int64) -> Shape {
+  var out: Shape = s;
+  out.dims[s.axis(axis)] = value;
+  return out;
+}
+
+export fn Shape_without(s: Shape, axis: int32) -> Shape {
+  var a: int32 = s.axis(axis);
+  var out: Shape;
+  out.rank = s.rank - 1;
+  var at: int32 = 0;
+  for i in 0..s.rank {
+    if (i != a) {
+      out.dims[at] = s.dims[i];
+      at = at + 1;
+    }
+  }
+  return out;
+}
+
+export fn Shape_text(s: Shape) -> string {
+  var text: string = "[";
+  for i in 0..s.rank {
+    if (i > 0) { text = "{text}, {s.dims[i]}"; } else { text = "{text}{s.dims[i]}"; }
+  }
+  return "{text}]";
+}
+
+export fn tensor_new(s: Shape) -> Tensor {
+  var n: int64 = s.size();
+  var bytes: int64 = if (n < 1) 4 else n * 4;
+  var p: float32* = (float32*)calloc(1, bytes);
+  if (p == 0) { mmll_fail("out of memory for a tensor of {n} values"); }
+  return { data: p, shape: s };
+}
+
+export fn tensor_from(values: float32[], s: Shape) -> Tensor {
+  if ((int64)values.length != s.size()) {
+    mmll_fail("{values.length} values do not fill a {s.text()} tensor");
+  }
+  var t: Tensor = tensor_new(s);
+  for i in 0..values.length { t.data[i] = values[i]; }
+  return t;
+}
+
+export fn tensor_view(data: float32*, s: Shape) -> Tensor {
+  return { data: data, shape: s };
+}
+
+export fn tensor_free(t: Tensor*) {
+  if (t->data != 0) { free((rawptr)t->data); }
+  t->data = (float32*)0;
+}
+
+export fn Tensor_size(t: Tensor) -> int64 {
+  return t.shape.size();
+}
+
+export fn Tensor_at(t: Tensor, i: int64) -> float32 {
+  return t.data[i];
+}
+
+export fn Tensor_fill(t: Tensor, value: float32) {
+  fill_f32(t.data, value, t.shape.size());
+}
+
+export fn Tensor_copy_from(t: Tensor, src: Tensor) {
+  if (t.shape.size() != src.shape.size()) {
+    mmll_fail("cannot copy {src.shape.text()} into {t.shape.text()}");
+  }
+  copy_f32(t.data, src.data, t.shape.size());
+}
+
+export fn Tensor_reshaped(t: Tensor, s: Shape) -> Tensor {
+  if (s.size() != t.shape.size()) {
+    mmll_fail("cannot view {t.shape.text()} as {s.text()}");
+  }
+  return { data: t.data, shape: s };
+}
+
+export fn Tensor_clone(t: Tensor) -> Tensor {
+  var out: Tensor = tensor_new(t.shape);
+  copy_f32(out.data, t.data, t.shape.size());
+  return out;
+}
+
+export struct Rng {
+  s0: uint64;
+  s1: uint64;
+  s2: uint64;
+  s3: uint64;
+  spare: float64;
+  has_spare: bool;
+}
+
+fn splitmix(state: uint64*) -> uint64 {
+  *state = *state + (uint64)0x9E3779B97F4A7C15;
+  var z: uint64 = *state;
+  z = (z ^ (z >> (uint64)30)) * (uint64)0xBF58476D1CE4E5B9;
+  z = (z ^ (z >> (uint64)27)) * (uint64)0x94D049BB133111EB;
+  return z ^ (z >> (uint64)31);
+}
+
+export fn rng_new(seed: uint64) -> Rng {
+  var st: uint64 = seed;
+  var r: Rng;
+  r.s0 = splitmix(&st);
+  r.s1 = splitmix(&st);
+  r.s2 = splitmix(&st);
+  r.s3 = splitmix(&st);
+  r.has_spare = false;
+  return r;
+}
+
+fn rotl(x: uint64, k: uint64) -> uint64 {
+  return (x << k) | (x >> ((uint64)64 - k));
+}
+
+export fn Rng_next__ptr(r: Rng*) -> uint64 {
+  var result: uint64 = rotl(r->s1 * (uint64)5, (uint64)7) * (uint64)9;
+  var t: uint64 = r->s1 << (uint64)17;
+  r->s2 = r->s2 ^ r->s0;
+  r->s3 = r->s3 ^ r->s1;
+  r->s1 = r->s1 ^ r->s2;
+  r->s0 = r->s0 ^ r->s3;
+  r->s2 = r->s2 ^ t;
+  r->s3 = rotl(r->s3, (uint64)45);
+  return result;
+}
+
+export fn Rng_uniform__ptr(r: Rng*) -> float64 {
+  return (float64)(r->next() >> (uint64)11) * 1.1102230246251565e-16;
+}
+
+export fn Rng_below__ptr(r: Rng*, n: int64) -> int64 {
+  if (n <= 1) { return 0; }
+  var bound: uint64 = (uint64)n;
+  var threshold: uint64 = ((uint64)0 - bound) % bound;
+  var x: uint64 = r->next();
+  while (x < threshold) { x = r->next(); }
+  return (int64)(x % bound);
+}
+
+export fn Rng_normal__ptr(r: Rng*) -> float64 {
+  if (r->has_spare) {
+    r->has_spare = false;
+    return r->spare;
+  }
+  var u: float64 = r->uniform();
+  while (u <= 0.0) { u = r->uniform(); }
+  var v: float64 = r->uniform();
+  var radius: float64 = sqrt(-2.0 * log(u));
+  var angle: float64 = 6.283185307179586 * v;
+  r->spare = radius * sin(angle);
+  r->has_spare = true;
+  return radius * cos(angle);
+}
+
+export fn Rng_fork__ptr(r: Rng*) -> Rng {
+  return rng_new(r->next());
+}
+
+export fn tensor_normal(t: Tensor, rng: Rng*, mean: float64, std: float64) {
+  var n: int64 = t.shape.size();
+  for i: int64 in 0..n { t.data[i] = (float32)(mean + std * rng->normal()); }
+}
+
+export fn tensor_uniform(t: Tensor, rng: Rng*, lo: float64, hi: float64) {
+  var n: int64 = t.shape.size();
+  for i: int64 in 0..n { t.data[i] = (float32)(lo + (hi - lo) * rng->uniform()); }
+}
+
+export fn tensor_truncated_normal(t: Tensor, rng: Rng*, mean: float64, std: float64, limit: float64) {
+  var n: int64 = t.shape.size();
+  for i: int64 in 0..n {
+    var z: float64 = rng->normal();
+    while (z < -limit || z > limit) { z = rng->normal(); }
+    t.data[i] = (float32)(mean + std * z);
+  }
+}
+
+export fn f32_bits_of(x: float32) -> int32 {
+  return *(int32*)&x;
+}
+
+export fn f32_of_bits(b: int32) -> float32 {
+  return *(float32*)&b;
+}
+
+export fn rsqrt_f32(x: float32) -> float32 {
+  var half: float32 = 0.5;
+  var three_halves: float32 = 1.5;
+  var i: int32 = *(int32*)&x;
+  i = 1597463007 - (i >> 1);
+  var y: float32 = *(float32*)&i;
+  var hx: float32 = x * half;
+  y = y * (three_halves - hx * y * y);
+  y = y * (three_halves - hx * y * y);
+  y = y * (three_halves - hx * y * y);
+  return y;
+}
+
+export fn sqrt_f32(x: float32) -> float32 {
+  var zero: float32 = 0.0;
+  if (x <= zero) { return zero; }
+  var y: float32 = x * rsqrt_f32(x);
+  var half: float32 = 0.5;
+  return y + half * (x - y * y) / y;
+}
+
+export fn exp_f32(x: float32) -> float32 {
+  var lo: float32 = -87.3;
+  var hi: float32 = 88.72;
+  var t: float32 = x;
+  if (t < lo) { return 0.0; }
+  if (t > hi) { return f32_of_bits(2139095040); }
+  var l2e: float32 = 1.44269504;
+  var bias: float32 = 12582912.0;
+  var c1: float32 = 0.693359375;
+  var c2: float32 = -2.12194440e-4;
+  var p0: float32 = 1.9875691500e-4;
+  var p1: float32 = 1.3981999507e-3;
+  var p2: float32 = 8.3334519073e-3;
+  var p3: float32 = 4.1665795894e-2;
+  var p4: float32 = 1.6666665459e-1;
+  var p5: float32 = 5.0000001201e-1;
+  var one: float32 = 1.0;
+  var kb: float32 = t * l2e + bias;
+  var k: float32 = kb - bias;
+  var r: float32 = t - k * c1 - k * c2;
+  var p: float32 = ((((p0 * r + p1) * r + p2) * r + p3) * r + p4) * r + p5;
+  var q: float32 = p * r * r + r + one;
+  var bits: int32 = (*(int32*)&kb - 1262485504 + 127) << 23;
+  return q * *(float32*)&bits;
+}
+
+export fn log_f32(x: float32) -> float32 {
+  var zero: float32 = 0.0;
+  var bits: int32 = *(int32*)&x;
+  if (x <= zero) {
+    if (x == zero) { return f32_of_bits(-8388608); }
+    return f32_of_bits(2143289344);
+  }
+  if (bits >= 2139095040) { return x; }
+  var extra: int32 = 0;
+  if (bits < 8388608) {
+    var scaled: float32 = x * (float32)8388608.0;
+    bits = *(int32*)&scaled;
+    extra = -23;
+  }
+  var e: int32 = ((bits >> 23) & 255) - 126 + extra;
+  var mbits: int32 = (bits & -2139095041) | 1056964608;
+  var m: float32 = *(float32*)&mbits;
+  var one: float32 = 1.0;
+  var root_half: float32 = 0.707106781186547524;
+  if (m < root_half) {
+    e = e - 1;
+    m = m + m - one;
+  } else {
+    m = m - one;
+  }
+  var z: float32 = m * m;
+  var c0: float32 = 7.0376836292e-2;
+  var c1: float32 = -1.1514610310e-1;
+  var c2: float32 = 1.1676998740e-1;
+  var c3: float32 = -1.2420140846e-1;
+  var c4: float32 = 1.4249322787e-1;
+  var c5: float32 = -1.6668057665e-1;
+  var c6: float32 = 2.0000714765e-1;
+  var c7: float32 = -2.4999993993e-1;
+  var c8: float32 = 3.3333331174e-1;
+  var y: float32 = ((((((((c0 * m + c1) * m + c2) * m + c3) * m + c4) * m + c5) * m + c6) * m + c7) * m + c8) * m * z;
+  var fe: float32 = (float32)e;
+  var lo: float32 = -2.12194440e-4;
+  var hi: float32 = 0.693359375;
+  var half: float32 = 0.5;
+  y = y + lo * fe;
+  y = y - half * z;
+  return m + y + hi * fe;
+}
+
+export fn tanh_f32(x: float32) -> float32 {
+  var one: float32 = 1.0;
+  var two: float32 = 2.0;
+  var zero: float32 = 0.0;
+  var negative: bool = x < zero;
+  var a: float32 = if negative { -x } else { x };
+  if (a < (float32)0.625) {
+    var z: float32 = x * x;
+    var c0: float32 = -5.70498872745e-3;
+    var c1: float32 = 2.06390887954e-2;
+    var c2: float32 = -5.37397155531e-2;
+    var c3: float32 = 1.33314422036e-1;
+    var c4: float32 = -3.33332819422e-1;
+    return ((((c0 * z + c1) * z + c2) * z + c3) * z + c4) * z * x + x;
+  }
+  if (a > (float32)9.0) { return if negative { -one } else { one }; }
+  var y: float32 = one - two / (exp_f32(two * a) + one);
+  return if negative { -y } else { y };
+}
+
+export fn sigmoid_f32(x: float32) -> float32 {
+  var one: float32 = 1.0;
+  var zero: float32 = 0.0;
+  if (x >= zero) {
+    return one / (one + exp_f32(-x));
+  }
+  var e: float32 = exp_f32(x);
+  return e / (one + e);
+}
+
+export fn erf_f32(x: float32) -> float32 {
+  var zero: float32 = 0.0;
+  var one: float32 = 1.0;
+  var negative: bool = x < zero;
+  var a: float32 = if negative { -x } else { x };
+  if (a < (float32)0.5) {
+    var z: float32 = x * x;
+    var k1: float32 = -0.333333333333;
+    var k2: float32 = 0.1;
+    var k3: float32 = -0.0238095238095;
+    var k4: float32 = 0.00462962962963;
+    var k5: float32 = -0.000757575757576;
+    var k6: float32 = 0.000106837606838;
+    var two_over_root_pi: float32 = 1.1283791670955126;
+    return two_over_root_pi * x * (((((((k6 * z + k5) * z + k4) * z + k3) * z + k2) * z + k1) * z) + one);
+  }
+  if (a > (float32)4.0) { return if negative { -one } else { one }; }
+  var half: float32 = 0.5;
+  var t: float32 = one / (one + half * a);
+  var d0: float32 = -1.26551223;
+  var d1: float32 = 1.00002368;
+  var d2: float32 = 0.37409196;
+  var d3: float32 = 0.09678418;
+  var d4: float32 = -0.18628806;
+  var d5: float32 = 0.27886807;
+  var d6: float32 = -1.13520398;
+  var d7: float32 = 1.48851587;
+  var d8: float32 = -0.82215223;
+  var d9: float32 = 0.17087277;
+  var poly: float32 = d1 + t * (d2 + t * (d3 + t * (d4 + t * (d5 + t * (d6 + t * (d7 + t * (d8 + t * d9)))))));
+  var y: float32 = one - t * exp_f32(-a * a + d0 + t * poly);
+  return if negative { -y } else { y };
+}
+
+@test fn shape_basics() -> int32 {
+  var s: Shape = shape(2, 3, 4);
+  if (s.size() != 24) { return 1; }
+  if (s.dim(-1) != 4 || s.dim(0) != 2) { return 2; }
+  if (s.rows() != 6) { return 3; }
+  var w: Shape = s.without(1);
+  if (w.rank != 2 || w.dims[1] != 4) { return 4; }
+  if (s.text() != "[2, 3, 4]") { return 5; }
+  if (!s.equal(shape(2, 3, 4)) || s.equal(shape(2, 3))) { return 6; }
+  return 0;
+}
+
+@test fn rng_is_deterministic() -> int32 {
+  var ra: Rng = rng_new(42);
+  var rb: Rng = rng_new(42);
+  var a: Rng* = &ra;
+  var b: Rng* = &rb;
+  for i in 0..100 {
+    if (a->next() != b->next()) { return 1; }
+  }
+  var below: int64 = a->below(10);
+  if (below < 0 || below >= 10) { return 2; }
+  var u: float64 = a->uniform();
+  if (u < 0.0 || u >= 1.0) { return 3; }
+  var total: float64 = 0.0;
+  var squares: float64 = 0.0;
+  for i in 0..4000 {
+    var z: float64 = a->normal();
+    total = total + z;
+    squares = squares + z * z;
+  }
+  var mean: float64 = total / 4000.0;
+  var variance: float64 = squares / 4000.0 - mean * mean;
+  if (mean > 0.06 || mean < -0.06) { return 4; }
+  if (variance < 0.9 || variance > 1.1) { return 5; }
+  return 0;
+}
+
+fn rel_err(got: float32, want: float64) -> float64 {
+  var d: float64 = (float64)got - want;
+  if (d < 0.0) { d = -d; }
+  var w: float64 = if want < 0.0 { -want } else { want };
+  if (w < 1.0e-30) { return d; }
+  return d / w;
+}
+
+@test fn float32_math_is_accurate() -> int32 {
+  var x: float64 = -86.0;
+  while (x < 88.0) {
+    if (rel_err(exp_f32((float32)x), exp((float64)(float32)x)) > 3.0e-7) { return 1; }
+    x = x + 0.731;
+  }
+  var y: float64 = 1.0e-6;
+  while (y < 1.0e6) {
+    if (rel_err(sqrt_f32((float32)y), sqrt((float64)(float32)y)) > 1.2e-7) { return 2; }
+    y = y * 1.37;
+  }
+  var z: float64 = -5.0;
+  while (z < 5.0) {
+    if (rel_err(tanh_f32((float32)z), tanh((float64)(float32)z)) > 1.0e-6) { return 3; }
+    var e: float64 = (float64)erf_f32((float32)z);
+    var d: float64 = e - erf_reference((float64)(float32)z);
+    if (d > 2.0e-7 || d < -2.0e-7) { return 4; }
+    z = z + 0.0371;
+  }
+  var w: float64 = 1.0e-40;
+  while (w < 1.0e30) {
+    var lw: float64 = log((float64)(float32)w);
+    var got: float64 = (float64)log_f32((float32)w);
+    var err: float64 = got - lw;
+    if (err < 0.0) { err = -err; }
+    var scale: float64 = if lw < 0.0 { -lw } else { lw };
+    if (scale < 1.0) { scale = 1.0; }
+    if (err > 2.5e-7 * scale) { return 7; }
+    w = w * 1.913;
+  }
+  if (exp_f32((float32)-100.0) != 0.0) { return 5; }
+  if (sqrt_f32((float32)0.0) != 0.0) { return 6; }
+  return 0;
+}
+
+fn erf_reference(x: float64) -> float64 {
+  var sum: float64 = 0.0;
+  var term: float64 = x;
+  var n: int32 = 0;
+  while (n < 200) {
+    var add: float64 = term / (float64)(2 * n + 1);
+    sum = sum + add;
+    if (add < 1.0e-18 && add > -1.0e-18) { break; }
+    n = n + 1;
+    term = -term * x * x / (float64)n;
+  }
+  return 1.1283791670955126 * sum;
+}

@@ -498,42 +498,6 @@ export fn backward_binary(g: Graph*, id: int32) {
   }
 }
 
-export fn add_mul(a: Var, b: Var, c: Var) -> Var {
-  var g: Graph* = a.g;
-  var s: Shape = a.shape();
-  var n: int64 = s.size();
-  if (b.size() != n || c.size() != n) { mmll_fail("add_mul takes three tensors of one size, got {s.text()}, {b.shape().text()} and {c.shape().text()}"); }
-  var id: int32 = g->push(OP_ADD_MUL, a.id, b.id, c.id, s);
-  if (g->forward_on_device(id)) { return { g: g, id: id }; }
-  var out: float32* = g->data(id);
-  var pa: float32* = g->data(a.id);
-  var pb: float32* = g->data(b.id);
-  var pc: float32* = g->data(c.id);
-  for i: int64 in 0..n { out[i] = (pa[i] + pb[i]) * pc[i]; }
-  return { g: g, id: id };
-}
-
-export fn backward_add_mul(g: Graph*, id: int32) {
-  var node: Node* = g->node(id);
-  var n: int64 = node->value.shape.size();
-  var dy: float32* = node->grad;
-  var pa: float32* = g->data(node->a);
-  var pb: float32* = g->data(node->b);
-  var pc: float32* = g->data(node->c);
-  if (g->nodes[node->a].requires) {
-    var da: float32* = g->grad_of(node->a);
-    for i: int64 in 0..n { da[i] = da[i] + dy[i] * pc[i]; }
-  }
-  if (g->nodes[node->b].requires) {
-    var db: float32* = g->grad_of(node->b);
-    for i: int64 in 0..n { db[i] = db[i] + dy[i] * pc[i]; }
-  }
-  if (g->nodes[node->c].requires) {
-    var dc: float32* = g->grad_of(node->c);
-    for i: int64 in 0..n { dc[i] = dc[i] + dy[i] * (pa[i] + pb[i]); }
-  }
-}
-
 export fn Var_add(a: Var, b: Var) -> Var { return binary(a, b, OP_ADD); }
 export fn Var_sub(a: Var, b: Var) -> Var { return binary(a, b, OP_SUB); }
 export fn Var_mul(a: Var, b: Var) -> Var { return binary(a, b, OP_MUL); }

@@ -9,7 +9,7 @@ export fn batch_of(s: Shape) -> int64 {
   return z;
 }
 
-fn matmul_any(a: Var, b: Var, trans_b: bool, exact: bool) -> Var {
+fn matmul_any(a: Var, b: Var, trans_b: bool) -> Var {
   var g: Graph* = a.g;
   var sa: Shape = a.shape();
   var sb: Shape = b.shape();
@@ -35,7 +35,6 @@ fn matmul_any(a: Var, b: Var, trans_b: bool, exact: bool) -> Var {
   var op: int32 = if (trans_b) OP_MATMUL_NT else OP_MATMUL;
   var id: int32 = g->push(op, a.id, b.id, -1, out);
   g->nodes[id].i0 = if (batched) 1 else 0;
-  g->nodes[id].i2 = if (exact) 1 else 0;
   if (g->forward_on_device(id)) { return { g: g, id: id }; }
   var pa: float32* = g->data(a.id);
   var pb: float32* = g->data(b.id);
@@ -62,9 +61,8 @@ fn matmul_any(a: Var, b: Var, trans_b: bool, exact: bool) -> Var {
   return { g: g, id: id };
 }
 
-export fn Var_matmul(a: Var, b: Var) -> Var { return matmul_any(a, b, false, false); }
-export fn Var_matmul_t(a: Var, b: Var) -> Var { return matmul_any(a, b, true, false); }
-export fn Var_matmul_exact(a: Var, b: Var) -> Var { return matmul_any(a, b, false, true); }
+export fn Var_matmul(a: Var, b: Var) -> Var { return matmul_any(a, b, false); }
+export fn Var_matmul_t(a: Var, b: Var) -> Var { return matmul_any(a, b, true); }
 
 export fn backward_matmul(g: Graph*, id: int32) {
   var node: Node* = g->node(id);

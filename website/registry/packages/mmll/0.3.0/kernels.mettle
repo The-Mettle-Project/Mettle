@@ -1,0 +1,513 @@
+import "std/mem";
+import "std/parallel";
+
+export const INLINE_WORK = 262144;
+
+export fn dot_f32(a: float32*, b: float32*, n: int64) -> float32 {
+  var s: float32 = 0.0;
+  for i: int64 in 0..n { s = s + a[i] * b[i]; }
+  return s;
+}
+
+export fn sum_f32(a: float32*, n: int64) -> float32 {
+  var s: float32 = 0.0;
+  for i: int64 in 0..n { s = s + a[i]; }
+  return s;
+}
+
+export fn axpy_f32(y: float32*, alpha: float32, x: float32*, n: int64) {
+  for i: int64 in 0..n { y[i] = y[i] + alpha * x[i]; }
+}
+
+export fn scale_f32(y: float32*, alpha: float32, n: int64) {
+  for i: int64 in 0..n { y[i] = y[i] * alpha; }
+}
+
+export fn add_into_f32(y: float32*, x: float32*, n: int64) {
+  for i: int64 in 0..n { y[i] = y[i] + x[i]; }
+}
+
+export fn copy_f32(dst: float32*, src: float32*, n: int64) {
+  memcpy((rawptr)dst, (rawptr)src, n * 4);
+}
+
+export fn zero_f32(dst: float32*, n: int64) {
+  memset((rawptr)dst, 0, n * 4);
+}
+
+export fn fill_f32(dst: float32*, value: float32, n: int64) {
+  for i: int64 in 0..n { dst[i] = value; }
+}
+
+export fn run_parallel(body: fn(rawptr, int64, int64) -> int32, ctx: rawptr, count: int64, work_per_item: int64) {
+  if (count <= 0) { return; }
+  var per: int64 = if (work_per_item < 1) 1 else work_per_item;
+  if (count * per < INLINE_WORK || count == 1) {
+    body(ctx, 0, count);
+    return;
+  }
+  var chunk: int64 = INLINE_WORK / 4 / per;
+  if (chunk < 1) { chunk = 1; }
+  parallel_range(body, ctx, 0, count, chunk);
+}
+
+struct GemmJob {
+  m: int64;
+  n: int64;
+  k: int64;
+  a: float32*;
+  lda: int64;
+  b: float32*;
+  ldb: int64;
+  c: float32*;
+  ldc: int64;
+  accumulate: bool;
+  mb: int64;
+  nb: int64;
+  kc: int64;
+  tiles_m: int64;
+  tiles_n: int64;
+  stride_a: int64;
+  stride_b: int64;
+  stride_c: int64;
+}
+
+fn dot_4x2(a0: float32*, a1: float32*, a2: float32*, a3: float32*, b0: float32*, b1: float32*, n: int64, out: float32*) {
+  var s00: float32 = 0.0;
+  var s01: float32 = 0.0;
+  var s10: float32 = 0.0;
+  var s11: float32 = 0.0;
+  var s20: float32 = 0.0;
+  var s21: float32 = 0.0;
+  var s30: float32 = 0.0;
+  var s31: float32 = 0.0;
+  for p: int64 in 0..n {
+    var x0: float32 = a0[p];
+    var x1: float32 = a1[p];
+    var x2: float32 = a2[p];
+    var x3: float32 = a3[p];
+    var y0: float32 = b0[p];
+    var y1: float32 = b1[p];
+    s00 = s00 + x0 * y0;
+    s01 = s01 + x0 * y1;
+    s10 = s10 + x1 * y0;
+    s11 = s11 + x1 * y1;
+    s20 = s20 + x2 * y0;
+    s21 = s21 + x2 * y1;
+    s30 = s30 + x3 * y0;
+    s31 = s31 + x3 * y1;
+  }
+  out[0] = s00;
+  out[1] = s01;
+  out[2] = s10;
+  out[3] = s11;
+  out[4] = s20;
+  out[5] = s21;
+  out[6] = s30;
+  out[7] = s31;
+}
+
+fn dot_4x1(a0: float32*, a1: float32*, a2: float32*, a3: float32*, b0: float32*, n: int64, out: float32*) {
+  var s0: float32 = 0.0;
+  var s1: float32 = 0.0;
+  var s2: float32 = 0.0;
+  var s3: float32 = 0.0;
+  for p: int64 in 0..n {
+    var y0: float32 = b0[p];
+    s0 = s0 + a0[p] * y0;
+    s1 = s1 + a1[p] * y0;
+    s2 = s2 + a2[p] * y0;
+    s3 = s3 + a3[p] * y0;
+  }
+  out[0] = s0;
+  out[1] = s1;
+  out[2] = s2;
+  out[3] = s3;
+}
+
+fn dot_1x4(a0: float32*, b0: float32*, b1: float32*, b2: float32*, b3: float32*, n: int64, out: float32*) {
+  var s0: float32 = 0.0;
+  var s1: float32 = 0.0;
+  var s2: float32 = 0.0;
+  var s3: float32 = 0.0;
+  for p: int64 in 0..n {
+    var x0: float32 = a0[p];
+    s0 = s0 + x0 * b0[p];
+    s1 = s1 + x0 * b1[p];
+    s2 = s2 + x0 * b2[p];
+    s3 = s3 + x0 * b3[p];
+  }
+  out[0] = s0;
+  out[1] = s1;
+  out[2] = s2;
+  out[3] = s3;
+}
+
+fn put(c: float32*, value: float32, accumulate: bool) {
+  c[0] = if accumulate { c[0] + value } else { value };
+}
+
+fn gemm_nt_block(a: float32*, lda: int64, b: float32*, ldb: int64, c: float32*, ldc: int64, i0: int64, i1: int64, j0: int64, j1: int64, k: int64, acc: bool) {
+    var out: float32[8];
+    var i: int64 = i0;
+    while (i + 4 <= i1) {
+      var a0: float32* = a + i * lda;
+      var a1: float32* = a0 + lda;
+      var a2: float32* = a1 + lda;
+      var a3: float32* = a2 + lda;
+      var c0: float32* = c + i * ldc;
+      var c1: float32* = c0 + ldc;
+      var c2: float32* = c1 + ldc;
+      var c3: float32* = c2 + ldc;
+      var j: int64 = j0;
+      while (j + 2 <= j1) {
+        var b0: float32* = b + j * ldb;
+        dot_4x2(a0, a1, a2, a3, b0, b0 + ldb, k, &out[0]);
+        put(c0 + j, out[0], acc);
+        put(c0 + j + 1, out[1], acc);
+        put(c1 + j, out[2], acc);
+        put(c1 + j + 1, out[3], acc);
+        put(c2 + j, out[4], acc);
+        put(c2 + j + 1, out[5], acc);
+        put(c3 + j, out[6], acc);
+        put(c3 + j + 1, out[7], acc);
+        j = j + 2;
+      }
+      if (j < j1) {
+        dot_4x1(a0, a1, a2, a3, b + j * ldb, k, &out[0]);
+        put(c0 + j, out[0], acc);
+        put(c1 + j, out[1], acc);
+        put(c2 + j, out[2], acc);
+        put(c3 + j, out[3], acc);
+      }
+      i = i + 4;
+    }
+    while (i < i1) {
+      var arow: float32* = a + i * lda;
+      var crow: float32* = c + i * ldc;
+      var j: int64 = j0;
+      while (j + 4 <= j1) {
+        var b0: float32* = b + j * ldb;
+        var b1: float32* = b0 + ldb;
+        var b2: float32* = b1 + ldb;
+        dot_1x4(arow, b0, b1, b2, b2 + ldb, k, &out[0]);
+        put(crow + j, out[0], acc);
+        put(crow + j + 1, out[1], acc);
+        put(crow + j + 2, out[2], acc);
+        put(crow + j + 3, out[3], acc);
+        j = j + 4;
+      }
+      while (j < j1) {
+        put(crow + j, dot_f32(arow, b + j * ldb, k), acc);
+        j = j + 1;
+      }
+      i = i + 1;
+    }
+}
+
+@noinline fn gemm_nt_tiles(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var g: GemmJob* = (GemmJob*)ctx;
+  var per_batch: int64 = g->tiles_m * g->tiles_n;
+  for t: int64 in lo..hi {
+    var batch: int64 = t / per_batch;
+    var rest: int64 = t - batch * per_batch;
+    var jt: int64 = rest / g->tiles_m;
+    var it: int64 = rest - jt * g->tiles_m;
+    var i0: int64 = it * g->mb;
+    var i1: int64 = i0 + g->mb;
+    if (i1 > g->m) { i1 = g->m; }
+    var j0: int64 = jt * g->nb;
+    var j1: int64 = j0 + g->nb;
+    if (j1 > g->n) { j1 = g->n; }
+    var a: float32* = g->a + batch * g->stride_a;
+    var b: float32* = g->b + batch * g->stride_b;
+    var c: float32* = g->c + batch * g->stride_c;
+    var kb: int64 = 0;
+    while (kb < g->k) {
+      var klen: int64 = g->k - kb;
+      if (klen > g->kc) { klen = g->kc; }
+      gemm_nt_block(a + kb, g->lda, b + kb, g->ldb, c, g->ldc, i0, i1, j0, j1, klen, g->accumulate || kb > 0);
+      kb = kb + klen;
+    }
+  }
+  return 0;
+}
+
+export fn gemm_nt_batched(batch: int64, m: int64, n: int64, k: int64, a: float32*, lda: int64, stride_a: int64, b: float32*, ldb: int64, stride_b: int64, c: float32*, ldc: int64, stride_c: int64, accumulate: bool) {
+  if (batch <= 0 || m <= 0 || n <= 0) { return; }
+  if (k <= 0) {
+    if (!accumulate) {
+      for z: int64 in 0..batch {
+        for i: int64 in 0..m { zero_f32(c + z * stride_c + i * ldc, n); }
+      }
+    }
+    return;
+  }
+  var g: GemmJob* = new GemmJob;
+  g->m = m;
+  g->n = n;
+  g->k = k;
+  g->a = a;
+  g->lda = lda;
+  g->b = b;
+  g->ldb = ldb;
+  g->c = c;
+  g->ldc = ldc;
+  g->accumulate = accumulate;
+  g->stride_a = stride_a;
+  g->stride_b = stride_b;
+  g->stride_c = stride_c;
+  var kc: int64 = if k > 768 { 512 } else { k };
+  var nb: int64 = 65536 / kc;
+  if (nb < 4) { nb = 4; }
+  if (nb > n) { nb = n; }
+  var mb: int64 = 16;
+  if (mb > m) { mb = m; }
+  g->mb = mb;
+  g->nb = nb;
+  g->kc = kc;
+  g->tiles_m = (m + mb - 1) / mb;
+  g->tiles_n = (n + nb - 1) / nb;
+  run_parallel(&gemm_nt_tiles, (rawptr)g, batch * g->tiles_m * g->tiles_n, mb * nb * k);
+  free((rawptr)g);
+}
+
+export fn gemm_nt(m: int64, n: int64, k: int64, a: float32*, lda: int64, b: float32*, ldb: int64, c: float32*, ldc: int64, accumulate: bool) {
+  gemm_nt_batched(1, m, n, k, a, lda, 0, b, ldb, 0, c, ldc, 0, accumulate);
+}
+
+struct GemmNnJob {
+  m: int64;
+  n: int64;
+  k: int64;
+  a: float32*;
+  lda: int64;
+  b: float32*;
+  ldb: int64;
+  c: float32*;
+  ldc: int64;
+  accumulate: bool;
+  mb: int64;
+  nb: int64;
+  tiles_m: int64;
+  tiles_n: int64;
+  stride_a: int64;
+  stride_b: int64;
+  stride_c: int64;
+}
+
+@noinline fn gemm_nn_tiles(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var g: GemmNnJob* = (GemmNnJob*)ctx;
+  var per_batch: int64 = g->tiles_m * g->tiles_n;
+  for t: int64 in lo..hi {
+    var batch: int64 = t / per_batch;
+    var rest: int64 = t - batch * per_batch;
+    var it: int64 = rest / g->tiles_n;
+    var jt: int64 = rest - it * g->tiles_n;
+    var i0: int64 = it * g->mb;
+    var i1: int64 = i0 + g->mb;
+    if (i1 > g->m) { i1 = g->m; }
+    var j0: int64 = jt * g->nb;
+    var width: int64 = g->nb;
+    if (j0 + width > g->n) { width = g->n - j0; }
+    var a: float32* = g->a + batch * g->stride_a;
+    var b: float32* = g->b + batch * g->stride_b + j0;
+    var c: float32* = g->c + batch * g->stride_c + j0;
+    for i: int64 in i0..i1 {
+      var crow: float32* = c + i * g->ldc;
+      var arow: float32* = a + i * g->lda;
+      if (!g->accumulate) { zero_f32(crow, width); }
+      for p: int64 in 0..g->k {
+        axpy_f32(crow, arow[p], b + p * g->ldb, width);
+      }
+    }
+  }
+  return 0;
+}
+
+export fn gemm_nn_batched(batch: int64, m: int64, n: int64, k: int64, a: float32*, lda: int64, stride_a: int64, b: float32*, ldb: int64, stride_b: int64, c: float32*, ldc: int64, stride_c: int64, accumulate: bool) {
+  if (batch <= 0 || m <= 0 || n <= 0) { return; }
+  var g: GemmNnJob* = new GemmNnJob;
+  g->m = m;
+  g->n = n;
+  g->k = k;
+  g->a = a;
+  g->lda = lda;
+  g->b = b;
+  g->ldb = ldb;
+  g->c = c;
+  g->ldc = ldc;
+  g->accumulate = accumulate;
+  g->stride_a = stride_a;
+  g->stride_b = stride_b;
+  g->stride_c = stride_c;
+  var nb: int64 = 512;
+  if (nb > n) { nb = n; }
+  var mb: int64 = 8;
+  if (mb > m) { mb = m; }
+  g->mb = mb;
+  g->nb = nb;
+  g->tiles_m = (m + mb - 1) / mb;
+  g->tiles_n = (n + nb - 1) / nb;
+  run_parallel(&gemm_nn_tiles, (rawptr)g, batch * g->tiles_m * g->tiles_n, mb * nb * (if (k < 1) 1 else k));
+  free((rawptr)g);
+}
+
+export fn gemm_nn(m: int64, n: int64, k: int64, a: float32*, lda: int64, b: float32*, ldb: int64, c: float32*, ldc: int64, accumulate: bool) {
+  gemm_nn_batched(1, m, n, k, a, lda, 0, b, ldb, 0, c, ldc, 0, accumulate);
+}
+
+struct TransposeJob {
+  src: float32*;
+  dst: float32*;
+  rows: int64;
+  cols: int64;
+  stride_src: int64;
+  stride_dst: int64;
+  blocks_r: int64;
+}
+
+@noinline fn transpose_blocks(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var t: TransposeJob* = (TransposeJob*)ctx;
+  var rows: int64 = t->rows;
+  var cols: int64 = t->cols;
+  for task: int64 in lo..hi {
+    var z: int64 = task / t->blocks_r;
+    var br: int64 = task - z * t->blocks_r;
+    var src: float32* = t->src + z * t->stride_src;
+    var dst: float32* = t->dst + z * t->stride_dst;
+    var i0: int64 = br * 32;
+    var i1: int64 = i0 + 32;
+    if (i1 > rows) { i1 = rows; }
+    var j0: int64 = 0;
+    while (j0 < cols) {
+      var j1: int64 = j0 + 32;
+      if (j1 > cols) { j1 = cols; }
+      for i: int64 in i0..i1 {
+        var srow: float32* = src + i * cols;
+        for j: int64 in j0..j1 { dst[j * rows + i] = srow[j]; }
+      }
+      j0 = j1;
+    }
+  }
+  return 0;
+}
+
+export fn transpose_batched(batch: int64, src: float32*, rows: int64, cols: int64, dst: float32*) {
+  if (batch <= 0 || rows <= 0 || cols <= 0) { return; }
+  var t: TransposeJob* = new TransposeJob;
+  t->src = src;
+  t->dst = dst;
+  t->rows = rows;
+  t->cols = cols;
+  t->stride_src = rows * cols;
+  t->stride_dst = rows * cols;
+  t->blocks_r = (rows + 31) / 32;
+  run_parallel(&transpose_blocks, (rawptr)t, batch * t->blocks_r, 32 * cols * 4);
+  free((rawptr)t);
+}
+
+export fn transpose_f32(src: float32*, rows: int64, cols: int64, dst: float32*) {
+  transpose_batched(1, src, rows, cols, dst);
+}
+
+struct RowsJob {
+  dst: float32*;
+  src: float32*;
+  partial: float32*;
+  rows: int64;
+  cols: int64;
+}
+
+const ROW_BLOCK = 64;
+
+@noinline fn bias_rows(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RowsJob* = (RowsJob*)ctx;
+  for b: int64 in lo..hi {
+    var r0: int64 = b * ROW_BLOCK;
+    var r1: int64 = r0 + ROW_BLOCK;
+    if (r1 > j->rows) { r1 = j->rows; }
+    for r: int64 in r0..r1 { add_into_f32(j->dst + r * j->cols, j->src, j->cols); }
+  }
+  return 0;
+}
+
+export fn add_bias_rows(dst: float32*, bias: float32*, rows: int64, cols: int64) {
+  var j: RowsJob* = new RowsJob;
+  j->dst = dst;
+  j->src = bias;
+  j->rows = rows;
+  j->cols = cols;
+  run_parallel(&bias_rows, (rawptr)j, (rows + ROW_BLOCK - 1) / ROW_BLOCK, ROW_BLOCK * cols);
+  free((rawptr)j);
+}
+
+@noinline fn partial_column_sums(ctx: rawptr, lo: int64, hi: int64) -> int32 {
+  var j: RowsJob* = (RowsJob*)ctx;
+  for b: int64 in lo..hi {
+    var r0: int64 = b * ROW_BLOCK;
+    var r1: int64 = r0 + ROW_BLOCK;
+    if (r1 > j->rows) { r1 = j->rows; }
+    var acc: float32* = j->partial + b * j->cols;
+    zero_f32(acc, j->cols);
+    for r: int64 in r0..r1 { add_into_f32(acc, j->src + r * j->cols, j->cols); }
+  }
+  return 0;
+}
+
+export fn column_sums_into(dst: float32*, src: float32*, rows: int64, cols: int64) {
+  if (rows <= 0 || cols <= 0) { return; }
+  var blocks: int64 = (rows + ROW_BLOCK - 1) / ROW_BLOCK;
+  var j: RowsJob* = new RowsJob;
+  j->src = src;
+  j->rows = rows;
+  j->cols = cols;
+  j->partial = (float32*)malloc(blocks * cols * 4);
+  run_parallel(&partial_column_sums, (rawptr)j, blocks, ROW_BLOCK * cols);
+  for b: int64 in 0..blocks { add_into_f32(dst, j->partial + b * cols, cols); }
+  free((rawptr)j->partial);
+  free((rawptr)j);
+}
+
+@test fn gemm_nt_matches_naive() -> int32 {
+  var m: int64 = 5;
+  var n: int64 = 7;
+  var k: int64 = 9;
+  var a: float32* = (float32*)malloc(m * k * 4);
+  var b: float32* = (float32*)malloc(n * k * 4);
+  var c: float32* = (float32*)malloc(m * n * 4);
+  for i: int64 in 0..m * k { a[i] = (float32)((i * 7) % 11) - 5.0; }
+  for i: int64 in 0..n * k { b[i] = (float32)((i * 5) % 13) - 6.0; }
+  for i: int64 in 0..m * n { c[i] = 1.0; }
+  gemm_nt(m, n, k, a, k, b, k, c, n, true);
+  var bad: int32 = 0;
+  for i: int64 in 0..m {
+    for j: int64 in 0..n {
+      var s: float32 = 1.0;
+      for p: int64 in 0..k { s = s + a[i * k + p] * b[j * k + p]; }
+      if (s != c[i * n + j]) { bad = bad + 1; }
+    }
+  }
+  free((rawptr)a);
+  free((rawptr)b);
+  free((rawptr)c);
+  return bad;
+}
+
+@test fn transpose_round_trip() -> int32 {
+  var rows: int64 = 37;
+  var cols: int64 = 41;
+  var a: float32* = (float32*)malloc(rows * cols * 4);
+  var t: float32* = (float32*)malloc(rows * cols * 4);
+  for i: int64 in 0..rows * cols { a[i] = (float32)i; }
+  transpose_f32(a, rows, cols, t);
+  var bad: int32 = 0;
+  for i: int64 in 0..rows {
+    for j: int64 in 0..cols {
+      if (t[j * rows + i] != a[i * cols + j]) { bad = bad + 1; }
+    }
+  }
+  free((rawptr)a);
+  free((rawptr)t);
+  return bad;
+}

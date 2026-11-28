@@ -1,0 +1,28 @@
+import "std/io";
+import "../mmll";
+
+fn main() -> int32 {
+  var rng: Rng = rng_new(1);
+  var ps: Params* = params_new();
+  var hidden: Linear = make_linear(ps, "hidden", 2, 8, true, &rng);
+  var out: Linear = make_linear(ps, "out", 8, 1, true, &rng);
+  var opt: Optimizer* = adam(ps, 0.05, 0.9, 0.999, 1.0e-8, 0.0);
+  var g: Graph* = graph_new();
+  var inputs: float32[8] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
+  var targets: float32[4] = [0.0, 1.0, 1.0, 0.0];
+  for step in 0..300 {
+    g->reset();
+    var x: Var = g->values(inputs, shape(4, 2));
+    var y: Var = g->values(targets, shape(4, 1));
+    var loss: Var = bce_with_logits(out.forward(hidden.forward(x).tanh()), y);
+    loss.backward();
+    opt->step();
+    opt->zero_grad();
+    if (step % 100 == 99) { println("step {step + 1}: loss {loss.item()}"); }
+  }
+  g->reset();
+  g->record = false;
+  var p: Var = out.forward(hidden.forward(g->values(inputs, shape(4, 2))).tanh()).sigmoid();
+  println("0 xor 0 = {p.data()[0]}, 0 xor 1 = {p.data()[1]}, 1 xor 0 = {p.data()[2]}, 1 xor 1 = {p.data()[3]}");
+  return 0;
+}

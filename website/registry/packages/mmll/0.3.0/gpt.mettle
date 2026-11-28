@@ -1,0 +1,252 @@
+import "std/mem";
+import "std/math";
+import "./tensor";
+import "./kernels";
+import "./graph";
+import "./ops_elementwise";
+import "./ops_shape";
+import "./ops_matmul";
+import "./ops_nn";
+import "./ops_attention";
+import "./nn";
+
+export struct GptConfig {
+  vocab: int64;
+  context: int64;
+  width: int64;
+  heads: int64;
+  layers: int64;
+  dropout: float64;
+  tied: bool;
+  rope: bool;
+  no_bias: bool;
+}
+
+export struct Gpt {
+  config: GptConfig;
+  tok: Embedding;
+  pos: Embedding;
+  blocks: Block*;
+  ln_f: LayerNorm;
+  head: Linear;
+}
+
+export fn make_gpt(ps: Params*, c: GptConfig, rng: Rng*) -> Gpt {
+  var m: Gpt;
+  m.config = c;
+  m.tok = make_embedding(ps, "tok", c.vocab, c.width, rng);
+  if (!c.rope) { m.pos = make_embedding(ps, "pos", c.context, c.width, rng); }
+  m.blocks = (Block*)malloc(c.layers * sizeof(Block));
+  for i: int64 in 0..c.layers {
+    m.blocks[i] = make_block_with(ps, "blocks.{i}", c.width, c.heads, c.dropout, !c.no_bias, rng);
+    m.blocks[i].attn.rope = c.rope;
+  }
+  m.ln_f = make_layer_norm(ps, "ln_f", c.width, 1.0e-5);
+  if (!c.tied) {
+    m.head = make_linear(ps, "head", c.width, c.vocab, false, rng);
+    m.head.weight->ortho = 0;
+  }
+  var residual_std: float64 = 0.02 / sqrt(2.0 * (float64)c.layers);
+  for i in 0..ps->count {
+    var p: Param* = ps->items[i];
+    if (p->kind != PARAM_WEIGHT) { continue; }
+    if (p->value.shape.rank >= 2) {
+      var proj: bool = ends_with(p->name, ".attn.proj.weight") || ends_with(p->name, ".mlp.proj.weight");
+      init_normal(p, rng, if proj { residual_std } else { 0.02 });
+    } else if (ends_with(p->name, ".bias")) {
+      init_constant(p, 0.0);
+    }
+  }
+  return m;
+}
+
+fn ends_with(text: string, tail: string) -> bool {
+  if (tail.length > text.length) { return false; }
+  var off: int64 = (int64)text.length - (int64)tail.length;
+  for i in 0..tail.length {
+    if (text[off + (int64)i] != tail[i]) { return false; }
+  }
+  return true;
+}
+
+export fn gpt_free(m: Gpt*) {
+  if (m->blocks != 0) { free((rawptr)m->blocks); }
+  m->blocks = (Block*)0;
+}
+
+export fn Gpt_forward(m: Gpt, g: Graph*, ids: int32*, batch: int64, time: int64) -> Var {
+  if (time > m.config.context) { mmll_fail("a sequence of {time} is longer than the context of {m.config.context}"); }
+  var x: Var = m.tok.lookup(g, ids, batch, time);
+  if (!m.config.rope) {
+    var positions: int32* = g->ints(time);
+    for t: int64 in 0..time { positions[t] = (int32)t; }
+    x = x.add(m.pos.lookup(g, positions, time));
+  }
+  x = dropout(x, m.config.dropout);
+  for i: int64 in 0..m.config.layers { x = m.blocks[i].forward(x); }
+  x = m.ln_f.forward(x);
+  if (m.config.tied) { return linear_nobias(x, g->param(m.tok.table)); }
+  return m.head.forward(x);
+}
+
+export fn Gpt_loss(m: Gpt, g: Graph*, ids: int32*, targets: int32*, batch: int64, time: int64) -> Var {
+  return cross_entropy(m.forward(g, ids, batch, time), targets, 0.0);
+}
+
+export struct GptCache {
+  keys: float32*;
+  values: float32*;
+  length: int64;
+  logits: float32*;
+  dev: Device*;
+}
+
+export fn gpt_cache_new(m: Gpt) -> GptCache {
+  return gpt_cache_on(m, (Device*)0);
+}
+
+export fn gpt_cache_on(m: Gpt, dev: Device*) -> GptCache {
+  var c: GptCache;
+  var per: int64 = m.config.layers * m.config.context * m.config.width;
+  c.dev = dev;
+  c.length = 0;
+  c.logits = (float32*)calloc(1, m.config.vocab * 4);
+  if (dev != 0) {
+    c.keys = (float32*)dev->alloc(per * 4);
+    c.values = (float32*)dev->alloc(per * 4);
+    dev->fill(c.keys, 0.0, per);
+    dev->fill(c.values, 0.0, per);
+  } else {
+    c.keys = (float32*)calloc(1, per * 4);
+    c.values = (float32*)calloc(1, per * 4);
+  }
+  return c;
+}
+
+export fn gpt_cache_free(c: GptCache*) {
+  if (c->dev != 0) {
+    c->dev->free((rawptr)c->keys);
+    c->dev->free((rawptr)c->values);
+  } else {
+    free((rawptr)c->keys);
+    free((rawptr)c->values);
+  }
+  free((rawptr)c->logits);
+}
+
+export fn Gpt_step(m: Gpt, g: Graph*, cache: GptCache*, token: int32) -> Tensor {
+  var cfg: GptConfig = m.config;
+  var pos: int64 = cache->length;
+  if (pos >= cfg.context) { mmll_fail("the cache is full at {cfg.context} tokens"); }
+  if (cache->dev != g->dev) { mmll_fail("the cache and the graph live on different devices"); }
+  var record: bool = g->record;
+  var training: bool = g->training;
+  g->record = false;
+  g->training = false;
+  var tok_id: int32* = g->ints(1);
+  tok_id[0] = token;
+  var x: Var = m.tok.lookup(g, tok_id, 1);
+  if (!cfg.rope) {
+    var pos_id: int32* = g->ints(1);
+    pos_id[0] = (int32)pos;
+    x = x.add(m.pos.lookup(g, pos_id, 1));
+  }
+  for layer: int64 in 0..cfg.layers {
+    var b: Block = m.blocks[layer];
+    var qkv: Var = b.attn.qkv.forward(b.ln1.forward(x));
+    if (cfg.rope) { qkv = qk_norm_rope(qkv, cfg.heads, 10000.0, pos); }
+    var base: int64 = layer * cfg.context * cfg.width;
+    var mixed: Var = cached_attention(qkv, cache->keys + base, cache->values + base, pos, cfg.heads);
+    x = x.add(b.attn.proj.forward(mixed));
+    x = x.add(b.mlp.forward(b.ln2.forward(x)));
+  }
+  x = m.ln_f.forward(x);
+  var logits: Var = if cfg.tied { linear_nobias(x, g->param(m.tok.table)) } else { m.head.forward(x) };
+  cache->length = pos + 1;
+  g->record = record;
+  g->training = training;
+  if (g->on_device()) {
+    g->dev->get((rawptr)cache->logits, (rawptr)logits.data(), cfg.vocab * 4);
+  } else {
+    copy_f32(cache->logits, logits.data(), cfg.vocab);
+  }
+  return tensor_view(cache->logits, shape(1, cfg.vocab));
+}
+
+export fn sample_logits(logits: float32*, count: int64, temperature: float64, top_k: int64, rng: Rng*) -> int32 {
+  if (temperature <= 0.0) {
+    var best: int32 = 0;
+    for i: int64 in 1..count {
+      if (logits[i] > logits[best]) { best = (int32)i; }
+    }
+    return best;
+  }
+  var probs: float32* = (float32*)malloc(count * 4);
+  var cutoff: float32 = 0.0;
+  var use_cut: bool = top_k > 0 && top_k < count;
+  if (use_cut) {
+    var sorted: float32* = (float32*)malloc(count * 4);
+    copy_f32(sorted, logits, count);
+    var k: int64 = 0;
+    while (k < top_k) {
+      var at: int64 = k;
+      for i: int64 in k + 1..count {
+        if (sorted[i] > sorted[at]) { at = i; }
+      }
+      var keep: float32 = sorted[k];
+      sorted[k] = sorted[at];
+      sorted[at] = keep;
+      k = k + 1;
+    }
+    cutoff = sorted[top_k - 1];
+    free((rawptr)sorted);
+  }
+  var best: float32 = logits[0];
+  for i: int64 in 1..count {
+    if (logits[i] > best) { best = logits[i]; }
+  }
+  var total: float64 = 0.0;
+  var inv_t: float32 = (float32)(1.0 / temperature);
+  for i: int64 in 0..count {
+    if (use_cut && logits[i] < cutoff) {
+      probs[i] = 0.0;
+      continue;
+    }
+    var e: float32 = exp_f32((logits[i] - best) * inv_t);
+    probs[i] = e;
+    total = total + (float64)e;
+  }
+  var pick: float64 = rng->uniform() * total;
+  var chosen: int32 = 0;
+  var run: float64 = 0.0;
+  for i: int64 in 0..count {
+    run = run + (float64)probs[i];
+    if (probs[i] > (float32)0.0) { chosen = (int32)i; }
+    if (run > pick) { break; }
+  }
+  free((rawptr)probs);
+  return chosen;
+}
+
+export fn Gpt_generate(m: Gpt, g: Graph*, prompt: int32*, prompt_length: int64, out: int32*, count: int64, temperature: float64, top_k: int64, rng: Rng*) -> int64 {
+  if (prompt_length < 1) { mmll_fail("generation needs at least one prompt token"); }
+  var cache: GptCache = gpt_cache_on(m, g->dev);
+  var limit: int64 = m.config.context;
+  var made: int64 = 0;
+  var logits: Tensor;
+  for i: int64 in 0..prompt_length {
+    if (cache.length >= limit) { break; }
+    g->reset();
+    logits = m.step(g, &cache, prompt[i]);
+  }
+  while (made < count && cache.length < limit) {
+    var next: int32 = sample_logits(logits.data, m.config.vocab, temperature, top_k, rng);
+    out[made] = next;
+    made = made + 1;
+    if (cache.length >= limit) { break; }
+    g->reset();
+    logits = m.step(g, &cache, next);
+  }
+  gpt_cache_free(&cache);
+  return made;
+}
