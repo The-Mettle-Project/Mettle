@@ -14385,6 +14385,27 @@ catch {
   Write-CaseResult -Name "owned_directory" -Passed $false -Reason $_.Exception.Message
 }
 
+$total++
+try {
+  if (-not (Test-CaseIsMine)) { throw $script:ShardSkip }
+  foreach ($strtoMode in @("debug", "release")) {
+    $strtoExe = Join-Path $tmpDir "strto_conformance_$strtoMode.exe"
+    $strtoArgs = @("--build", "tests/test_strto_conformance.mettle", "-o", $strtoExe)
+    if ($strtoMode -eq "release") { $strtoArgs = @("--release") + $strtoArgs }
+    $strtoBuild = & $CompilerPath @strtoArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "strto conformance $strtoMode build failed: $strtoBuild" }
+    $strtoOut = & $strtoExe 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $strtoOut -notmatch "STRTO OK") {
+      throw "the owned strtoll and strtoull broke a C99 rule in $strtoMode`n$strtoOut"
+    }
+  }
+  Write-CaseResult -Name "owned_strto_conformance" -Passed $true
+}
+catch {
+  $failed++
+  Write-CaseResult -Name "owned_strto_conformance" -Passed $false -Reason $_.Exception.Message
+}
+
 # Internal linker kernel32 atomics test: std/thread uses exported Interlocked* names
 $total++
 try {

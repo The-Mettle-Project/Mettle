@@ -127,7 +127,6 @@ float mtlc_host_tanhf(float);
 int *mtlc_host_errno_location(void);
 
 #include <locale.h>
-#include <signal.h>
 #include <wchar.h>
 
 __attribute__((noreturn)) void mtlc_host_exit(int);

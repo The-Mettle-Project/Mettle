@@ -79,6 +79,11 @@ static MtFile mt_stderr_file = {2, MT_FILE_STANDARD | MT_FILE_WRITE, 0, 0, 0, 0,
 #define mt_errno_value (*mt_hosted_errno_location())
 #elif defined(_WIN32) || defined(MT_SHARED_RUNTIME)
 static int mt_errno_value;
+#elif defined(__linux__) && !defined(MTLC_HOST_PREFIX_H)
+#define MT_ERRNO_FOLLOWS_GLIBC 1
+static __thread int mt_own_errno;
+static int *mt_errno_slot(void);
+#define mt_errno_value (*mt_errno_slot())
 #else
 static __thread int mt_errno_value;
 #endif
@@ -4933,6 +4938,29 @@ static int mt_glibc_threads(void) {
   return state == 1;
 }
 
+#if defined(MT_ERRNO_FOLLOWS_GLIBC)
+typedef int *(*MtGlibcErrnoLocation)(void);
+static MtGlibcErrnoLocation mt_glibc_errno_location;
+static volatile int mt_glibc_errno_state;
+
+static int *mt_errno_slot(void) {
+  int state = __atomic_load_n(&mt_glibc_errno_state, __ATOMIC_ACQUIRE);
+  if (state == 1) return mt_glibc_errno_location();
+  if (state == 2 || !mt_elf_headers) return &mt_own_errno;
+  const MtLinkMap *libc = mt_glibc_find_libc();
+  MtGlibcErrnoLocation location =
+      libc ? (MtGlibcErrnoLocation)mt_glibc_lookup(libc, "__errno_location")
+           : MT_NULL;
+  if (location) {
+    int *slot = location();
+    *slot = mt_own_errno;
+    mt_glibc_errno_location = location;
+  }
+  __atomic_store_n(&mt_glibc_errno_state, location ? 1 : 2, __ATOMIC_RELEASE);
+  return location ? location() : &mt_own_errno;
+}
+#endif
+
 static void *mt_glibc_thread_entry(void *raw) {
   MtThread *thread = (MtThread *)raw;
   mt_stack_high = __builtin_frame_address(0);
@@ -6471,50 +6499,90 @@ static int mt_digit_value(char c) {
   return -1;
 }
 
-mt_u64 strtoull(const char *text, char **end, int base) {
+static mt_u64 mt_strto_magnitude(const char *text, char **end, int base,
+                                 int *negative_out, int *overflow_out) {
+  const char *cursor = text;
   mt_u64 value = 0;
-  while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
-    text++;
+  int any = 0;
+  *negative_out = 0;
+  *overflow_out = 0;
+  while (*cursor == ' ' || (*cursor >= '\t' && *cursor <= '\r')) {
+    cursor++;
   }
-  if (*text == '+') {
-    text++;
+  if (*cursor == '-' || *cursor == '+') {
+    *negative_out = *cursor++ == '-';
   }
-  if ((base == 0 || base == 16) && text[0] == '0' &&
-      (text[1] == 'x' || text[1] == 'X')) {
+  if ((base == 0 || base == 16) && cursor[0] == '0' &&
+      (cursor[1] == 'x' || cursor[1] == 'X') &&
+      mt_digit_value(cursor[2]) >= 0 && mt_digit_value(cursor[2]) < 16) {
     base = 16;
-    text += 2;
+    cursor += 2;
   } else if (base == 0) {
-    base = text[0] == '0' ? 8 : 10;
+    base = cursor[0] == '0' ? 8 : 10;
   }
-  const char *start = text;
-  for (;;) {
-    int digit = mt_digit_value(*text);
+  if (base < 2 || base > 36) {
+    if (end) {
+      *end = (char *)text;
+    }
+    mt_errno_value = 22;
+    return 0;
+  }
+  for (;; cursor++) {
+    int digit = mt_digit_value(*cursor);
     if (digit < 0 || digit >= base) {
       break;
     }
-    value = value * (mt_u64)base + (mt_u64)digit;
-    text++;
+    any = 1;
+    if (*overflow_out) {
+      continue;
+    }
+    if (value > (~(mt_u64)0 - (mt_u64)digit) / (mt_u64)base) {
+      *overflow_out = 1;
+    } else {
+      value = value * (mt_u64)base + (mt_u64)digit;
+    }
   }
   if (end) {
-    *end = (char *)(text == start ? start : text);
+    *end = (char *)(any ? cursor : text);
   }
   return value;
 }
 
+static mt_u64 mt_strto_unsigned(const char *text, char **end, int base,
+                                mt_u64 max) {
+  int negative = 0;
+  int overflow = 0;
+  mt_u64 value = mt_strto_magnitude(text, end, base, &negative, &overflow);
+  if (overflow || value > max) {
+    mt_errno_value = 34;
+    return max;
+  }
+  return negative ? (0 - value) & max : value;
+}
+
+static mt_i64 mt_strto_signed(const char *text, char **end, int base,
+                              mt_u64 max) {
+  int negative = 0;
+  int overflow = 0;
+  mt_u64 value = mt_strto_magnitude(text, end, base, &negative, &overflow);
+  if (overflow || value > max + (mt_u64)negative) {
+    mt_errno_value = 34;
+    return negative ? -(mt_i64)max - 1 : (mt_i64)max;
+  }
+  return negative ? (mt_i64)(0 - value) : (mt_i64)value;
+}
+
+mt_u64 strtoull(const char *text, char **end, int base) {
+  return mt_strto_unsigned(text, end, base, ~(mt_u64)0);
+}
+
 mt_u64 strtoul(const char *text, char **end, int base) {
-  return strtoull(text, end, base);
+  return mt_strto_unsigned(text, end, base,
+                           sizeof(long) == 4 ? 0xFFFFFFFFull : ~(mt_u64)0);
 }
 
 mt_i64 strtoll(const char *text, char **end, int base) {
-  int negative = 0;
-  while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
-    text++;
-  }
-  if (*text == '-' || *text == '+') {
-    negative = *text++ == '-';
-  }
-  mt_u64 value = strtoull(text, end, base);
-  return negative ? -(mt_i64)value : (mt_i64)value;
+  return mt_strto_signed(text, end, base, 0x7FFFFFFFFFFFFFFFull);
 }
 
 mt_i64 _strtoi64(const char *text, char **end, int base) {
@@ -8236,12 +8304,9 @@ MT_NORETURN void abort(void) { exit(134); }
 void __stack_chk_fail(void) { abort(); }
 
 long strtol(const char *text, char **end, int base) {
-  mt_i64 value = strtoll(text, end, base);
-  if (sizeof(long) == 4 && (value > 2147483647LL || value < -2147483647LL - 1)) {
-    mt_errno_value = 34;
-    return value > 0 ? 2147483647L : -2147483647L - 1;
-  }
-  return (long)value;
+  return (long)mt_strto_signed(text, end, base,
+                               sizeof(long) == 4 ? 0x7FFFFFFFull
+                                                 : 0x7FFFFFFFFFFFFFFFull);
 }
 
 float strtof(const char *text, char **end) { return (float)strtod(text, end); }

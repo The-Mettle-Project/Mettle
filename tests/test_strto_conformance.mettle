@@ -1,0 +1,66 @@
+import "std/io";
+
+extern fn c_strtoll(text: cstring, end: cstring*, base: int32) -> int64 = "strtoll";
+extern fn c_strtoull(text: cstring, end: cstring*, base: int32) -> uint64 = "strtoull";
+extern fn c_errno() -> int32* = "mettle_errno_location";
+
+var g_failures: int32 = 0;
+
+fn check_signed(text: string, base: int32, value: int64, errno: int32, consumed: int64) {
+  var end: cstring = 0;
+  *c_errno() = 0;
+  var got: int64 = c_strtoll((cstring)text.chars, &end, base);
+  var got_errno: int32 = *c_errno();
+  var got_consumed: int64 = (int64)end - (int64)text.chars;
+  if (got != value || got_errno != errno || got_consumed != consumed) {
+    println("strtoll(\"{text}\", {base}): got {got} errno {got_errno} consumed {got_consumed}, want {value} errno {errno} consumed {consumed}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn check_unsigned(text: string, base: int32, value: uint64, errno: int32, consumed: int64) {
+  var end: cstring = 0;
+  *c_errno() = 0;
+  var got: uint64 = c_strtoull((cstring)text.chars, &end, base);
+  var got_errno: int32 = *c_errno();
+  var got_consumed: int64 = (int64)end - (int64)text.chars;
+  if (got != value || got_errno != errno || got_consumed != consumed) {
+    println("strtoull(\"{text}\", {base}): got {got} errno {got_errno} consumed {got_consumed}, want {value} errno {errno} consumed {consumed}");
+    g_failures = g_failures + 1;
+  }
+}
+
+fn main() -> int32 {
+  var int64_min: int64 = -9223372036854775807 - 1;
+  var uint64_max: uint64 = (uint64)0 - (uint64)1;
+  check_signed("99999999999999999999", 10, 9223372036854775807, 34, 20);
+  check_signed("9223372036854775807", 10, 9223372036854775807, 0, 19);
+  check_signed("9223372036854775808", 10, 9223372036854775807, 34, 19);
+  check_signed("-9223372036854775808", 10, int64_min, 0, 20);
+  check_signed("-9223372036854775809", 10, int64_min, 34, 20);
+  check_signed("  +42xyz", 10, 42, 0, 5);
+  check_signed("\t\r\n-7", 10, -7, 0, 5);
+  check_signed("xyz", 10, 0, 0, 0);
+  check_signed("  -", 10, 0, 0, 0);
+  check_signed("0x", 16, 0, 0, 1);
+  check_signed("0xg", 0, 0, 0, 1);
+  check_signed("0x1F", 0, 31, 0, 4);
+  check_signed("0X1f", 16, 31, 0, 4);
+  check_signed("077", 0, 63, 0, 3);
+  check_signed("089", 0, 0, 0, 1);
+  check_signed("zz", 36, 1295, 0, 2);
+  check_signed("12", 1, 0, 22, 0);
+  check_signed("12", 37, 0, 22, 0);
+  check_unsigned("18446744073709551615", 10, uint64_max, 0, 20);
+  check_unsigned("18446744073709551616", 10, uint64_max, 34, 20);
+  check_unsigned("-1", 10, uint64_max, 0, 2);
+  check_unsigned("-18446744073709551616", 10, uint64_max, 34, 21);
+  check_unsigned("ffffffffffffffff", 16, uint64_max, 0, 16);
+  check_unsigned("10000000000000000", 16, uint64_max, 34, 17);
+  if (g_failures != 0) {
+    println("STRTO FAIL: {g_failures}");
+    return 1;
+  }
+  println("STRTO OK");
+  return 0;
+}
