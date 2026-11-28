@@ -26,7 +26,7 @@ fn main() -> int32 {
   if (early_e != 0 && early_e != 1) { return 5; }
   if (gpu_stream_sync(s) != 0) { return 6; }
   if (gpu_stream_done(s) != 1 || gpu_event_done(e) != 1) { return 7; }
-  println("gpu query: early stream={early} event={early_e}");
+  println("gpu query: early answers in range, done after sync");
   gpu_event_destroy(e);
   gpu_free(dev);
   free(host);

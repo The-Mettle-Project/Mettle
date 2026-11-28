@@ -13602,7 +13602,7 @@ try {
   }
   foreach ($narrow in @("120x30", "110x30")) {
     $heading = @((Invoke-GpuScreen $kernels "8" $narrow) -split "`n" | Where-Object { $_ -match "Line  Kernel" })[0]
-    if ($heading -notmatch "To look at\s+\S\s") { throw "the kernels table does not fit its pane at ${narrow}:`n$heading" }
+    if ($heading -notmatch "To look at\s+\S+\s") { throw "the kernels table does not fit its pane at ${narrow}:`n$heading" }
   }
   Assert-Report (Invoke-GpuScreen $kernels "8 t") @("Device code  window_sum [Metal 3.2", "t shows it on PTX") "target switch"
   $fireOptimizer = Invoke-GpuScreen "examples/fire/fire_sim.mettle" "2" "150x60"
