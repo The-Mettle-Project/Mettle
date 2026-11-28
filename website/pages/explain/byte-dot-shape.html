@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>byte-dot-shape: 8-bit multiply and accumulate the byte dot kernel does not take | Mettle</title>
+<meta name="description" content="byte-dot-shape: 8-bit multiply and accumulate the byte dot kernel does not take" />
+<link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../assets/doc.css" />
+</head>
+<body>
+<header class="bar"><div class="wrap">
+  <a class="brand" href="../index.html"><img src="../assets/mark.svg" alt="" width="22" height="22" />Mettle</a>
+  <nav><a href="../index.html">Home</a><a href="../internals.html">Internals</a><a href="../reading-diagnostics.html">Diagnostics</a><a href="../reading-the-report.html">The report</a><a href="index.html" aria-current="page">Codes</a></nav>
+</div></header>
+<main class="wrap">
+<h1><span class="code">byte-dot-shape</span>8-bit multiply and accumulate the byte dot kernel does not take</h1>
+<p class="lede">Reported by <code>--explain</code> after a verdict.</p>
+<pre><code>mettle explain byte-dot-shape</code></pre>
+
+<p>A loop that adds <code>a[i] * b[i]</code> over int8 or uint8 arrays becomes the byte dot kernel: 32 pairs a step, any mix of signed and unsigned elements, an exact 64-bit sum wrapped to an int32, uint32, int64 or uint64 total. The compiler runs the loop body on all 65536 pairs of bytes and takes the loop only when every iteration adds exactly the product of the two elements. The remark prints one pair where it does not, with the amount the loop adds and the product.</p>
+<p>Three things draw this remark. The multiply wraps: <code>a[i] * b[i]</code> on int8 elements is an int8 product, and <code>(int16)a[i] * (int16)b[i]</code> on uint8 elements passes 32767. The term carries a scale or an offset, such as <code>a[i] * b[i] * 2</code>. Or the total is a float or narrower than 32 bits.</p>
+<h3>Example</h3>
+<pre><code>var total: int32 = 0;
+for i in 0..n {
+    total = total + (int32)a[i] * (int32)b[i];
+}</code></pre>
+<p>Fix: widen each element before the multiply and keep the total in an integer of 32 or 64 bits. Apply a scale or an offset to the total after the loop. For a float result, sum in int64 and convert once: the product of two bytes is an exact integer.</p>
+
+<h2>Related</h2>
+<ul class="codelist"><li><a href="call-in-body.html"><span class="c">call-in-body</span><span class="t">The loop body calls a function</span></a></li><li><a href="extern-call-in-body.html"><span class="c">extern-call-in-body</span><span class="t">The loop body calls an external function</span></a></li><li><a href="memory-safety-in-body.html"><span class="c">memory-safety-in-body</span><span class="t">The loop retains a memory safety operation</span></a></li><li><a href="indirect-call.html"><span class="c">indirect-call</span><span class="t">The loop body calls through a function pointer</span></a></li><li><a href="alloc-in-body.html"><span class="c">alloc-in-body</span><span class="t">The loop body allocates</span></a></li><li><a href="inline-asm.html"><span class="c">inline-asm</span><span class="t">The loop body contains inline assembly</span></a></li><li><a href="control-flow.html"><span class="c">control-flow</span><span class="t">The loop body branches on data</span></a></li><li><a href="early-exit.html"><span class="c">early-exit</span><span class="t">The loop can leave before its trip count</span></a></li></ul>
+
+</main>
+<footer class="foot"><div class="wrap">
+  <span>Generated from <code>src/error/error_explain.c</code>.</span>
+  <span class="sp"><a href="https://github.com/suidvandiewereld/Mettle">GitHub</a></span>
+</div></footer>
+</body>
+</html>

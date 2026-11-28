@@ -22,7 +22,7 @@
 <pre><code>mettle explain G0002</code></pre>
 
 <p>The tiles fit the compiler&#x27;s own budget, and when ptxas is on PATH the build also assembles the module and reads what the assembler did. It spilled this kernel: its tiles plus everything else live beside them did not fit. The build fails, because a tile that does not stay in registers is not what the program asked for.</p>
-<p>Without ptxas on PATH the build says the tiles are unconfirmed and goes on, so the gap is stated.</p>
+<p>Without ptxas on PATH the build says the tiles are unconfirmed and goes on, so the gap is stated. Kernels are optimized whenever one holds a tile, with or without -O, so this is not a debug build&#x27;s extra values.</p>
 <p>Fix: shrink a tile or what is live beside it.</p>
 
 <h2>Related</h2>
